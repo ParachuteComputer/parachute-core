@@ -241,6 +241,9 @@ switch (command) {
   case "create":
     await cmdCreate(cmdArgs);
     break;
+  case "packs":
+    await cmdPacks(cmdArgs);
+    break;
   case "add-pack":
     await cmdAddPack(cmdArgs);
     break;
@@ -5027,6 +5030,10 @@ async function cmdAddPack(args: string[]) {
   }
 
   const pack = getSeedPack(packName);
+  if (!pack && (packName.includes("/") || existsSync(packName) || /\.(yaml|json)$/.test(packName))) {
+    await cmdPacks(["add", packName, "--vault", vaultName]);
+    return;
+  }
   if (!pack) {
     console.error(`Unknown pack: "${packName}"`);
     printPacks();
@@ -5064,12 +5071,43 @@ async function cmdAddPack(args: string[]) {
     if (message.includes("SQLITE_BUSY") || (err as { code?: string })?.code === "SQLITE_BUSY") {
       console.error(
         `error: the vault database is busy (a running daemon holds the write lock). ` +
-          `add-pack is idempotent — re-run it, or stop the daemon first with: parachute stop vault`,
+          `add-pack is idempotent — re-run it after the current write finishes`,
       );
     } else {
       console.error(`error: failed to apply pack "${pack.name}": ${message}`);
     }
     process.exit(1);
+  }
+}
+
+/** Lifecycle state and a process lock live alongside this vault's DB. */
+async function cmdPacks(args: string[]) {
+  const positional: string[] = [];
+  let vault = "default";
+  try {
+    for (let i = 0; i < args.length; i++) {
+      if (args[i] === "--vault") { vault = args[++i] ?? ""; if (!vault) throw new Error("--vault requires a value"); }
+      else if (args[i]!.startsWith("--")) throw new Error(`Unknown option: ${args[i]}`);
+      else positional.push(args[i]!);
+    }
+    const [verb, source] = positional;
+    if (!["add", "list", "remove"].includes(verb ?? "") || positional.length !== (verb === "list" ? 1 : 2))
+      throw new Error("Usage: parachute-vault packs add <file|dir|URL> | list | remove <id> [--vault <name>]");
+    if (!readVaultConfig(vault)) throw new Error(`Vault "${vault}" not found`);
+    const { loadManifest, installPack, listPacks, removePack, migratePackState } = await import("./external-packs.ts");
+    const dir = migratePackState(vaultDir(vault));
+    mkdirSync(dir, { recursive: true });
+    if (verb === "list") { console.log(JSON.stringify(listPacks(dir), null, 2)); return; }
+    const manifest = verb === "add" ? await loadManifest(source!) : undefined;
+    const lock = join(dir, ".lock");
+    try { mkdirSync(lock); } catch { throw new Error(`Pack operation locked: ${lock}. If the prior process died, remove this empty directory and retry.`); }
+    try {
+      const store = getVaultStore(vault);
+      const lines = manifest ? await installPack(store, dir, manifest) : await removePack(store, dir, source!);
+      console.log(lines.join("\n"));
+    } finally { rmSync(lock, { recursive: true }); }
+  } catch (error) {
+    console.error(`error: ${(error as Error).message}`); process.exitCode = 1;
   }
 }
 
@@ -5138,7 +5176,8 @@ Vaults:
                                            opt-in upgrade). --no-mirror creates a bare vault with no mirror config.
                                            Operators can flip the server-wide default with 'default_mirror: off' in
                                            config.yaml (recommended for cloud / disk-constrained boxes).
-  parachute-vault add-pack <pack> [--vault <name>]
+  parachute-vault packs add <file|dir|URL> | list | remove <id> [--vault <name>]
+  parachute-vault add-pack <pack|manifest> [--vault <name>]
                                            Add a named seed pack (starter notes + tags) to a vault
                                            (default vault: "default"). Run with no arguments to list
                                            the available packs. New vaults seed the "welcome" +
