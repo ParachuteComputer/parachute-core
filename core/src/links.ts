@@ -385,10 +385,12 @@ export interface TraversalNode {
 export function traverseLinks(
   db: Database,
   noteId: string,
-  opts?: { max_depth?: number; relationship?: string; isTraversable?: (noteId: string) => boolean },
+  opts?: { max_depth?: number; relationship?: string; direction?: "outbound" | "inbound" | "both"; isTraversable?: (noteId: string) => boolean },
 ): TraversalNode[] {
   const maxDepth = opts?.max_depth ?? 2;
   const relFilter = opts?.relationship;
+  const direction = opts?.direction ?? "both";
+  if (!["outbound", "inbound", "both"].includes(direction)) throw new Error("Invalid traversal direction");
   const isTraversable = opts?.isTraversable;
   const visited = new Set<string>([noteId]);
   const results: TraversalNode[] = [];
@@ -400,7 +402,9 @@ export function traverseLinks(
     for (const currentId of frontier) {
       // Outbound links
       let outbound: LinkRow[];
-      if (relFilter) {
+      if (direction === "inbound") {
+        outbound = [];
+      } else if (relFilter) {
         outbound = db.prepare(
           "SELECT * FROM links WHERE source_id = ? AND relationship = ?",
         ).all(currentId, relFilter) as LinkRow[];
@@ -429,7 +433,9 @@ export function traverseLinks(
 
       // Inbound links
       let inbound: LinkRow[];
-      if (relFilter) {
+      if (direction === "outbound") {
+        inbound = [];
+      } else if (relFilter) {
         inbound = db.prepare(
           "SELECT * FROM links WHERE target_id = ? AND relationship = ?",
         ).all(currentId, relFilter) as LinkRow[];
@@ -467,6 +473,62 @@ export function traverseLinks(
   }
 
   return results;
+}
+
+export interface NearSpec {
+  depth?: number;
+  relationship?: string;
+  direction?: "outbound" | "inbound" | "both";
+  /** Optional second hop: re-walk from every note in the first neighborhood. */
+  then?: { depth?: number; relationship?: string; direction?: "outbound" | "inbound" | "both" };
+}
+
+const NEAR_DIRECTIONS = ["inbound", "outbound", "both"];
+
+/** Returns an error message for a malformed `near` spec, else null. */
+export function validateNearSpec(near: NearSpec): string | null {
+  if (near.direction !== undefined && !NEAR_DIRECTIONS.includes(near.direction)) return "Invalid near.direction";
+  if (near.then !== undefined) {
+    if (typeof near.then !== "object" || near.then === null || Array.isArray(near.then)) return "Invalid near.then";
+    if (near.then.direction !== undefined && !NEAR_DIRECTIONS.includes(near.then.direction)) return "Invalid near.then.direction";
+  }
+  return null;
+}
+
+/**
+ * Resolve a `near` spec to the set of allowed note ids. Without `then`: the
+ * anchor plus its directed neighborhood (depth capped at 5). With `then`: the
+ * first neighborhood (anchor included) is the frontier of a second directed
+ * walk; the result is the notes that second walk reaches (so "tasks whose
+ * `node` points into the subtree"). `isTraversable` (tag-scope wall) applies
+ * at every hop of both walks. Cycles are harmless: each walk has a visited set.
+ */
+export function resolveNearScope(
+  db: Database,
+  anchorId: string,
+  near: NearSpec,
+  isTraversable?: (noteId: string) => boolean,
+): Set<string> {
+  const first = new Set<string>([
+    anchorId,
+    ...traverseLinks(db, anchorId, {
+      max_depth: Math.min(near.depth ?? 2, 5),
+      relationship: near.relationship,
+      direction: near.direction,
+      isTraversable,
+    }).map((t) => t.noteId),
+  ]);
+  if (!near.then) return first;
+  const second = new Set<string>();
+  for (const id of first) {
+    for (const t of traverseLinks(db, id, {
+      max_depth: Math.min(near.then.depth ?? 1, 5),
+      relationship: near.then.relationship,
+      direction: near.then.direction,
+      isTraversable,
+    })) second.add(t.noteId);
+  }
+  return second;
 }
 
 /** Hydrated find-path result — see `hydratePathResult` for field semantics. */

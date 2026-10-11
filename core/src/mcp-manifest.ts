@@ -73,7 +73,7 @@ Response shape (vault#550 — three variants, pick by what you passed):
 - Warnings present (e.g. an unrecognized \`tag\`) and NOT in cursor mode: \`{notes: [...], warnings: [...]}\`. Cursor mode + warnings compose: \`{notes, next_cursor, warnings}\`. Absent \`warnings\` key means nothing to flag — don't assume its presence either way.
 - \`aggregate\` mode: \`[{group, value}]\` — a rollup row per group, NOT notes. See \`aggregate\` below.
 
-\`aggregate\` (count/sum, optional group_by): pass \`aggregate: {op, group_by?, field?}\` to get counts/sums instead of note rows. \`{op: "count"}\` with no \`group_by\` is the filtered total — one row \`[{group: null, value: N}]\` (vault#626). Grouped examples: "how many notes per status" (\`{group_by: "status", op: "count"}\`) or "total amount per category" (\`{group_by: "category", op: "sum", field: "amount"}\`). Every other filter (\`tag\`, \`metadata\`, date range, ...) narrows the input set FIRST, exactly like a normal query. \`group_by\` is either \"tag\" (group by tag membership) or an indexed metadata field; omit it on \`count\` for the total. \`op: "sum"\` requires both \`group_by\` and \`field\` (indexed NUMERIC). Mutually exclusive with \`search\`/\`near\`/\`cursor\`/\`semantic\`.
+\`aggregate\` (count/sum, optional group_by): pass \`aggregate: {op, group_by?, field?}\` to get counts/sums instead of note rows. \`{op: "count"}\` with no \`group_by\` is the filtered total — one row \`[{group: null, value: N}]\` (vault#626). Grouped examples: "how many notes per status" (\`{group_by: "status", op: "count"}\`) or "total amount per category" (\`{group_by: "category", op: "sum", field: "amount"}\`). Every other filter (\`tag\`, \`metadata\`, date range, ...) narrows the input set FIRST, exactly like a normal query. \`group_by\` is either \"tag\" (group by tag membership) or an indexed metadata field; omit it on \`count\` for the total. \`op: "sum"\` requires both \`group_by\` and \`field\` (indexed NUMERIC). Mutually exclusive with \`search\`/\`cursor\`/\`semantic\`; composes with \`near\` (the neighborhood id set scopes the rollup before every other filter, complete — never LIMIT-truncated). Subtree rollup in ONE request: \`{tag:"task", metadata:{state:"open"}, near:{note_id:X, relationship:"parent", direction:"inbound", depth:5, then:{relationship:"node", direction:"inbound"}}, aggregate:{group_by:"owner", op:"count"}}\`.
 
 \`search\` is literal-by-default (vault#551): your text is escaped and phrase-quoted before it reaches FTS5, so ordinary punctuation ("didn't", "eleven-day", "18.6") is matched as literal content instead of being parsed as query syntax (a bare hyphen used to mean NOT; an apostrophe or decimal point used to break the parse and silently return \`[]\`). Pass \`search_mode: "advanced"\` to opt back into raw FTS5 syntax (AND/OR/NOT, manual phrase quoting, prefix \`*\`) — a malformed advanced query now throws a structured error instead of silently returning \`[]\`. \`sort\` is honored under \`search\` too: omit it for relevance ranking (default), or pass "asc"/"desc" to order by \`created_at\` instead.
 
@@ -196,7 +196,7 @@ Response shape (vault#550 — three variants, pick by what you passed):
               field: { type: "string", description: "Required when `op` is \"sum\"; ignored for \"count\". Must be an indexed metadata field with a numeric storage type (declared `type: \"integer\"` or `type: \"boolean\"` — the only indexable numeric shapes; a bare `type: \"number\"` field is never indexed and a TEXT-backed field can't be summed)." },
             },
             required: ["op"],
-            description: "Aggregation / rollup mode. Every OTHER filter above (tag, metadata, date range, write-attribution, ...) is applied FIRST, exactly as a normal query would; the matching notes are then grouped and the response becomes `[{group, value}]` instead of note rows — one row per group, `value` is the count/sum. Omit `group_by` with `op: \"count\"` for a filtered total (`[{group: null, value: N}]`, including `value: 0` on an empty match). A note whose group_by value is absent collects into one `{group: null, value: ...}` row rather than being dropped. Mutually exclusive with `search`, `near`, `cursor`, and `semantic` (a rollup has no pagination/ranking/graph-neighborhood shape). Tag-scoped sessions see the SAME visibility enforcement as every other read — the rollup is computed only over notes the token can see.",
+            description: "Aggregation / rollup mode. Every OTHER filter above (tag, metadata, date range, write-attribution, ...) is applied FIRST, exactly as a normal query would; the matching notes are then grouped and the response becomes `[{group, value}]` instead of note rows — one row per group, `value` is the count/sum. Omit `group_by` with `op: \"count\"` for a filtered total (`[{group: null, value: N}]`, including `value: 0` on an empty match). A note whose group_by value is absent collects into one `{group: null, value: ...}` row rather than being dropped. Mutually exclusive with `search`, `cursor`, and `semantic`; composes with `near` (neighborhood ids scope the rollup first; see `near`). Tag-scoped sessions see the SAME visibility enforcement as every other read — the rollup is computed only over notes the token can see.",
           },
           near: {
             type: "object",
@@ -204,9 +204,19 @@ Response shape (vault#550 — three variants, pick by what you passed):
               note_id: { type: "string", description: "Anchor note ID, path, or (fallback) H1 title" },
               depth: { type: "number", description: "Max hops from anchor (default 2, max 5)" },
               relationship: { type: "string", description: "Only follow links with this relationship" },
+              direction: { type: "string", enum: ["inbound", "outbound", "both"], description: "both (default) | inbound = notes that link TO the current note (e.g. children via parent) | outbound = notes the current note links to" },
+              then: {
+                type: "object",
+                properties: {
+                  depth: { type: "number", description: "Max hops for the second walk (default 1, max 5)" },
+                  relationship: { type: "string", description: "Only follow links with this relationship in the second walk" },
+                  direction: { type: "string", enum: ["inbound", "outbound", "both"], description: "Direction of the second walk (default both)" },
+                },
+                description: "Optional second hop: walk again from EVERY note in the first neighborhood (anchor included); the result is the notes the second walk reaches (anchor/subtree excluded unless re-reached). E.g. first walk = node subtree via parent/inbound, then = tasks whose `node` link points into it (relationship node, direction inbound). Tag-scope wall applies at every hop of both walks.",
+              },
             },
             required: ["note_id"],
-            description: "Scope results to notes within N hops of an anchor note",
+            description: "Scope results to notes within N hops of an anchor note. Composes with `aggregate` (rollup over the neighborhood). A tag-scoped token cannot anchor on a note it cannot see.",
           },
           versions: {
             type: "object",
@@ -549,6 +559,7 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
                 indexed: { type: "boolean", description: "When true, a generated column + index are maintained on notes.metadata.<field>, making it queryable via metadata operator objects and order_by. Global: all tags declaring the field must agree on both type and indexed. Only string/integer/boolean/reference/date are indexable. Indexed ⇒ a type-mismatched write is HARD-REJECTED (schema_validation), not just warned — vault#553." },
                 strict: { type: "boolean", description: "vault#299. Default false (advisory). When true, ALL of this field's declared constraints (type + enum + required + cardinality) are ENFORCED — a violating write is rejected with a schema_validation error, not just warned. All-or-nothing per field; free-form fields on a strict tag simply leave strict off. Note: `indexed: true` fields enforce their TYPE constraint regardless of this flag (vault#553)." },
                 required: { type: "boolean", description: "vault#299. The field must be present + non-null on a note with this tag. Advisory unless `strict: true`." },
+                target_tags: { type: "array", items: { type: "string" }, description: "`reference` fields only. Opt-in target-type check: the referenced note must carry one of these tags (or a subtype via parent_names). Mismatch → `target_tag_mismatch` warning (advisory) or schema_validation rejection when `strict: true`. A value that does not resolve to a note yet → advisory `unresolved_reference` only (never rejected; the queued forward-ref still backfills)." },
                 cardinality: { type: "string", enum: ["one", "many"], description: "vault#299. 'one' (scalar, default) or 'many' (array). Advisory unless `strict: true`." },
               },
               required: ["type"],

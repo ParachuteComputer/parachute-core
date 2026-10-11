@@ -612,6 +612,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
     metadata?: Record<string, unknown>;
   }): void => {
     enforceStrictWrite(store, shape, {
+      isVisible: expandVisibility,
       bypass: strictBypass,
       onBypass: onStrictBypass
         ? (violations) =>
@@ -751,7 +752,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
               path: note.path,
               tags: note.tags,
               metadata: note.metadata as Record<string, unknown> | undefined,
-            });
+            }, expandVisibility ? { isVisible: expandVisibility } : undefined);
             if (status) result.validation_status = status;
           }
           if (expandCtx && includeContent && typeof result.content === "string") {
@@ -799,16 +800,12 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
         // in depth), but the wall makes it redundant for `near[]`.
         let nearScope: Set<string> | null = null;
         if (params.near) {
-          const near = params.near as { note_id: string; depth?: number; relationship?: string };
+          const near = params.near as { note_id: string } & linkOps.NearSpec;
+          const nearErr = linkOps.validateNearSpec(near);
+          if (nearErr) return { error: nearErr, error_type: "invalid_query" };
           const anchor = resolveNote(db, near.note_id);
           if (!anchor) return { error: "Anchor note not found", error_type: "not_found", note_id: near.note_id };
-          const depth = Math.min(near.depth ?? 2, 5);
-          const traversed = linkOps.traverseLinks(db, anchor.id, {
-            max_depth: depth,
-            relationship: near.relationship,
-            isTraversable: nearTraversable,
-          });
-          nearScope = new Set([anchor.id, ...traversed.map((t) => t.noteId)]);
+          nearScope = linkOps.resolveNearScope(db, anchor.id, near, nearTraversable);
         }
 
         // --- Cursor mode (vault#313) ---
@@ -857,7 +854,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
         }
 
         // --- Aggregation / rollup mode (top new-feature ask from a UX round) ---
-        // Mutually exclusive with `search`/`near`/`cursor`/`semantic` — a rollup returns
+        // Mutually exclusive with `search`/`cursor`/`semantic` (it composes with `near`) — a rollup returns
         // one row per group, not a paginated / graph-scoped / ranked note
         // list — so reject those combos loudly before touching the DB.
         if (params.aggregate) {
@@ -866,13 +863,6 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
               `aggregate is incompatible with full-text search — pick one.`,
               "INVALID_QUERY",
               { error_type: "invalid_query", field: "aggregate", hint: "drop `search` when using `aggregate`" },
-            );
-          }
-          if (params.near) {
-            throw new QueryError(
-              `aggregate is incompatible with near (graph neighborhood).`,
-              "INVALID_QUERY",
-              { error_type: "invalid_query", field: "aggregate", hint: "drop `near` when using `aggregate`" },
             );
           }
           if (typeof params.cursor === "string") {
@@ -910,6 +900,9 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           const aggExcludeTagsRaw = params.exclude_tags ?? params.excludeTags ?? params.exclude_tag;
           const aggExcludeTags = normalizeTags(aggExcludeTagsRaw);
           const aggFilterOpts: QueryOpts = {
+            // near (+ optional `then`) → id set, pushed into SQL before every
+            // other filter; the rollup spans the whole set (no LIMIT).
+            ids: nearScope ? [...nearScope] : undefined,
             tags: aggTags,
             tagMatch: (params.tag_match as "all" | "any") ?? (aggTags && aggTags.length > 1 ? "any" : undefined),
             expand,
@@ -1328,7 +1321,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
                 path: n.path,
                 tags: n.tags,
                 metadata: n.metadata as Record<string, unknown> | undefined,
-              }),
+              }, expandVisibility ? { isVisible: expandVisibility } : undefined),
             ]),
           );
           for (const n of output as any[]) {
@@ -1759,7 +1752,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
         // `if_exists` actually engaged — the default "error" path's response
         // shape is untouched.
         const final = refreshed.map((n) => {
-          const validated = attachValidationStatus(store, db, n);
+          const validated = attachValidationStatus(store, db, n, expandVisibility);
           const warnings = linkWarningsByNote.get(n.id);
           const existed = existedMap.get(n.id);
           let out: Note & { warnings?: QueryWarning[]; existed?: boolean } = validated;
@@ -2291,7 +2284,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
         // branch.
         const includeContent = params.include_content !== false;
         const final = updated.map((n) => {
-          const validated = attachValidationStatus(store, db, n);
+          const validated = attachValidationStatus(store, db, n, expandVisibility);
           const created = createdIds.has(n.id);
           // Echo hydrated links when this note was flagged for it (mutated
           // its links or `include_links` was set). Additive key, present only
@@ -3071,9 +3064,9 @@ export function defaultForField(field: { default?: unknown }): unknown {
 export function enforceStrictWrite(
   store: Store,
   shape: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown> },
-  opts?: { bypass?: boolean; onBypass?: (violations: ValidationWarning[]) => void },
+  opts?: { bypass?: boolean; onBypass?: (violations: ValidationWarning[]) => void; isVisible?: (note: Note) => boolean },
 ): ValidationWarning[] {
-  const status = store.validateNoteAgainstSchemas(shape);
+  const status = store.validateNoteAgainstSchemas(shape, opts?.isVisible ? { isVisible: opts.isVisible } : undefined);
   const violations = strictViolations(status);
   if (violations.length === 0) return [];
   if (opts?.bypass !== true) throw new SchemaValidationError(violations);
@@ -3081,14 +3074,14 @@ export function enforceStrictWrite(
   return violations;
 }
 
-export function attachValidationStatus(store: Store, _db: Database, note: Note): Note {
+export function attachValidationStatus(store: Store, _db: Database, note: Note, isVisible?: (note: Note) => boolean): Note {
   // Short-circuit cheaply: when no tag declares fields, the resolver
   // returns null without us paying a re-read of the note.
   const status = store.validateNoteAgainstSchemas({
     path: note.path,
     tags: note.tags,
     metadata: note.metadata as Record<string, unknown> | undefined,
-  });
+  }, isVisible ? { isVisible } : undefined);
   if (!status) return note;
   return { ...note, validation_status: status } as Note & { validation_status: typeof status };
 }

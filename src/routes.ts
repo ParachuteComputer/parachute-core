@@ -131,6 +131,8 @@ export type WriteCtx = {
   bypassStrict?: boolean;
 };
 
+const vis = (t: TagScopeCtx) => { const v = buildExpandVisibility(t.allowed, t.raw); return v ? { isVisible: v } : undefined; };
+
 const NO_WRITE_CTX: WriteCtx = { actor: null, via: null };
 
 /**
@@ -144,8 +146,10 @@ function gateStrictWrite(
   store: Store,
   writeCtx: WriteCtx,
   shape: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown> },
+  tagScope: TagScopeCtx = NO_TAG_SCOPE,
 ): void {
   enforceStrictWrite(store, shape, {
+    isVisible: buildExpandVisibility(tagScope.allowed, tagScope.raw),
     bypass: writeCtx.bypassStrict === true,
     onBypass: (violations: ValidationWarning[]) => {
       logStrictBypass({
@@ -1903,12 +1907,71 @@ async function handleNotesInner(
         );
       }
 
+      // Resolve the neighborhood before ordering and pagination.
+      const nearNoteId = parseQuery(url, "near[note_id]");
+      if (!nearNoteId) {
+        const orphan = ["near[then][relationship]", "near[then][direction]", "near[then][depth]"].find((k) => parseQuery(url, k) !== null);
+        if (orphan) {
+          return json({
+            error: `${orphan} requires near[note_id] — the second hop needs a first-hop anchor.`,
+            code: "INVALID_QUERY",
+            error_type: "invalid_query",
+            field: "near",
+            hint: "pass near[note_id]=<anchor> or drop near[then][...]",
+          }, 400);
+        }
+      }
+      if (nearNoteId) {
+        const anchor = await resolveNote(store, nearNoteId);
+        if (!anchor) return json({ error: "Anchor note not found", error_type: "not_found", note_id: nearNoteId }, 404);
+        // Tag-scope: anchor must itself be visible to this token.
+        if (!noteWithinTagScope(anchor, tagScope.allowed, tagScope.raw)) {
+          return json({ error: "Anchor note not found", error_type: "not_found", note_id: nearNoteId }, 404);
+        }
+        const nearSpec: linkOps.NearSpec = {
+          depth: parseInt10(parseQuery(url, "near[depth]")) ?? undefined,
+          relationship: parseQuery(url, "near[relationship]") ?? undefined,
+          direction: (parseQuery(url, "near[direction]") ?? "both") as linkOps.NearSpec["direction"],
+        };
+        const thenRel = parseQuery(url, "near[then][relationship]");
+        const thenDir = parseQuery(url, "near[then][direction]");
+        const thenDepth = parseInt10(parseQuery(url, "near[then][depth]"));
+        if (thenRel !== null || thenDir !== null || thenDepth != null) {
+          nearSpec.then = {
+            relationship: thenRel ?? undefined,
+            direction: (thenDir ?? "both") as linkOps.NearSpec["direction"],
+            depth: thenDepth ?? undefined,
+          };
+        }
+        const nearErr = linkOps.validateNearSpec(nearSpec);
+        if (nearErr) return json({ error: nearErr, code: "INVALID_QUERY", error_type: "invalid_query", field: "near" }, 400);
+        // Tag-scope policy for `near[]` (vault#439 — hop-guard, symmetric with
+        // find-path): for a tag-scoped token the BFS refuses to traverse
+        // THROUGH out-of-scope notes — scope is a wall, not a sieve. So a token
+        // scoped to ["work"] can't reach an in-scope note at depth 2 via a
+        // #personal intermediary at depth 1; that note is simply unreachable.
+        // The `filterNotesByTagScope` pass below still runs (defense in depth),
+        // but the wall makes it redundant for the `near[]` result set.
+        // Unscoped tokens (`tagScope.raw === null`) install no predicate → the
+        // FULL graph is walked exactly as before, behavior unchanged.
+        const isTraversable = tagScope.raw
+          ? (id: string) =>
+              noteWithinTagScope(
+                { id, tags: getNoteTags(db, id) } as Note,
+                tagScope.allowed,
+                tagScope.raw,
+              )
+          : undefined;
+        queryOpts.ids = [...linkOps.resolveNearScope(db, anchor.id, nearSpec, isTraversable)];
+      }
+
       // Aggregation / rollup mode (top new-feature ask from a UX round).
-      // Mutually exclusive with cursor/near — a rollup returns one row per
-      // group, not a paginated/graph-scoped note list — so reject those
-      // combos loudly before touching the DB, then short-circuit: none of
-      // the normal-query output machinery below (expand, include_links,
-      // metadata filtering, ...) applies to rollup rows.
+      // Mutually exclusive with cursor/search/semantic — a rollup returns one
+      // row per group, not a paginated note list — so reject those
+      // combos loudly before touching the DB. It composes with `near`: the
+      // neighborhood id set scopes the rollup (vault#779). After the rollup we
+      // short-circuit: none of the normal-query output machinery below
+      // (expand, include_links, metadata filtering, ...) applies to rollup rows.
       const aggregateParsed = parseAggregateParam(url);
       if (aggregateParsed.error) return aggregateParsed.error;
       if (aggregateParsed.aggregate) {
@@ -1920,18 +1983,6 @@ async function handleNotesInner(
               error_type: "invalid_query",
               field: "aggregate",
               hint: "drop `cursor` when using `aggregate`",
-            },
-            400,
-          );
-        }
-        if (nearNoteIdEarly) {
-          return json(
-            {
-              error: "aggregate is incompatible with near (graph neighborhood).",
-              code: "INVALID_QUERY",
-              error_type: "invalid_query",
-              field: "aggregate",
-              hint: "drop `near` when using `aggregate`",
             },
             400,
           );
@@ -2078,7 +2129,7 @@ async function handleNotesInner(
         throw e;
       }
       // Truncation-honesty (vault contracts-brief V1.3): captured BEFORE
-      // near/tag-scope filtering, which can only shrink the set further —
+      // tag-scope filtering, which can only shrink the set further —
       // this reflects whether the underlying store query actually hit its
       // `limit` (i.e. there may be more rows the caller never saw). Cursor
       // mode is exempt — it already carries `next_cursor` as the honest
@@ -2087,39 +2138,6 @@ async function handleNotesInner(
       // paging, not hitting an accidental full default page.
       if (!cursorMode && queryOpts.offset === undefined && results.length === queryOpts.limit) {
         queryWarnings.push(truncatedResultsWarning(queryOpts.limit));
-      }
-
-      // Near-scope filter (graph neighborhood)
-      const nearNoteId = parseQuery(url, "near[note_id]");
-      if (nearNoteId) {
-        const anchor = await resolveNote(store, nearNoteId);
-        if (!anchor) return json({ error: "Anchor note not found", error_type: "not_found", note_id: nearNoteId }, 404);
-        // Tag-scope: anchor must itself be visible to this token.
-        if (!noteWithinTagScope(anchor, tagScope.allowed, tagScope.raw)) {
-          return json({ error: "Anchor note not found", error_type: "not_found", note_id: nearNoteId }, 404);
-        }
-        const depth = Math.min(parseInt10(parseQuery(url, "near[depth]")) ?? 2, 5);
-        const relationship = parseQuery(url, "near[relationship]") ?? undefined;
-        // Tag-scope policy for `near[]` (vault#439 — hop-guard, symmetric with
-        // find-path): for a tag-scoped token the BFS refuses to traverse
-        // THROUGH out-of-scope notes — scope is a wall, not a sieve. So a token
-        // scoped to ["work"] can't reach an in-scope note at depth 2 via a
-        // #personal intermediary at depth 1; that note is simply unreachable.
-        // The `filterNotesByTagScope` pass below still runs (defense in depth),
-        // but the wall makes it redundant for the `near[]` result set.
-        // Unscoped tokens (`tagScope.raw === null`) install no predicate → the
-        // FULL graph is walked exactly as before, behavior unchanged.
-        const isTraversable = tagScope.raw
-          ? (id: string) =>
-              noteWithinTagScope(
-                { id, tags: getNoteTags(db, id) } as Note,
-                tagScope.allowed,
-                tagScope.raw,
-              )
-          : undefined;
-        const traversed = linkOps.traverseLinks(db, anchor.id, { max_depth: depth, relationship, isTraversable });
-        const nearScope = new Set([anchor.id, ...traversed.map((t) => t.noteId)]);
-        results = results.filter((n) => nearScope.has(n.id));
       }
 
       // Tag-scope: drop any result outside the allowlist before shaping
@@ -2202,7 +2220,7 @@ async function handleNotesInner(
                 path: n.path,
                 tags: n.tags,
                 metadata: n.metadata as Record<string, unknown> | undefined,
-              }),
+              }, vis(tagScope)),
               tagScope.allowed,
               tagScope.raw,
             ),
@@ -2453,7 +2471,7 @@ async function handleNotesInner(
         const incomingTags: string[] = item.tags ?? [];
         const projectedTags = new Set<string>([...(existingNote.tags ?? []), ...incomingTags]);
         const projectedMetadata = updates.metadata ?? ((existingNote.metadata as Record<string, unknown>) ?? {});
-        gateStrictWrite(store, writeCtx, { path: existingNote.path, tags: [...projectedTags], metadata: projectedMetadata });
+        gateStrictWrite(store, writeCtx, { path: existingNote.path, tags: [...projectedTags], metadata: projectedMetadata }, tagScope);
 
         // vault#555 fix 2 (W8 fix-2 bug class, generalist must-fix): gate the
         // core UPDATE on the tag/link mutation too, not just `updates` — a
@@ -2542,7 +2560,7 @@ async function handleNotesInner(
             path: item.path,
             tags: item.tags,
             metadata: item.metadata,
-          });
+          }, tagScope);
           let note: Note;
           try {
             note = await store.createNote(item.content ?? "", {
@@ -2697,7 +2715,7 @@ async function handleNotesInner(
       // attached ONLY for items whose `if_exists` actually engaged — the
       // default "error" path's response shape is untouched.
       const final = refreshed.map((n) => {
-        const validated = attachValidationStatus(store, db, n);
+        const validated = attachValidationStatus(store, db, n, buildExpandVisibility(tagScope.allowed, tagScope.raw));
         const warnings = narrowWriteWarnings(db, linkWarningsByNote.get(n.id) ?? [], tagScope);
         const existed = existedMap.get(n.id);
         let out: any = validated;
@@ -3008,12 +3026,12 @@ async function handleNotesInner(
         gateStrictWrite(store, writeCtx, {
           path: note ? note.path : latestTombstone(db, id)?.path,
           tags: note?.tags ?? [], metadata: version.metadata,
-        });
+        }, tagScope);
         const restored = await store.restoreNoteVersion(id, storageIndex, {
           actor: writeCtx.actor, via: writeCtx.via,
           ...(body.if_updated_at !== undefined ? { if_updated_at: body.if_updated_at as string } : {}),
         });
-        let validated: any = attachValidationStatus(store, db, restored);
+        let validated: any = attachValidationStatus(store, db, restored, buildExpandVisibility(tagScope.allowed, tagScope.raw));
         validated = scrubNoteTagsByScope(validated, tagScope.allowed, tagScope.raw);
         if (validated.validation_status) {
           const vs = scrubValidationStatusByScope(validated.validation_status, tagScope.allowed, tagScope.raw);
@@ -3061,7 +3079,7 @@ async function handleNotesInner(
           path: note.path,
           tags: note.tags,
           metadata: note.metadata as Record<string, unknown> | undefined,
-        }),
+        }, vis(tagScope)),
         tagScope.allowed,
         tagScope.raw,
       );
@@ -3149,7 +3167,7 @@ async function handleNotesInner(
             path: createOpts.path ?? undefined,
             tags: createOpts.tags,
             metadata: createOpts.metadata,
-          });
+          }, tagScope);
           const created = await store.createNote(content, createOpts);
           if (tagsArr.length > 0) {
             await applySchemaDefaults(store, db, [created.id], tagsArr);
@@ -3194,7 +3212,7 @@ async function handleNotesInner(
           const scopedCreateWarnings = narrowWriteWarnings(db, createWarnings, tagScope);
           const final = await store.getNote(created.id);
           if (!final) return json({ error: "Note disappeared", error_type: "internal_error" }, 500);
-          let validated: any = attachValidationStatus(store, db, final);
+          let validated: any = attachValidationStatus(store, db, final, buildExpandVisibility(tagScope.allowed, tagScope.raw));
           if (scopedCreateWarnings.length > 0) validated.warnings = scopedCreateWarnings;
           // Tag-scope (vault#568): scrub the echoed note so create-then-read
           // returns the SAME shape. A scoped token may legitimately attach an
@@ -3435,7 +3453,7 @@ async function handleNotesInner(
         const projectedMeta = stBody !== undefined
           ? { ...baseMeta, [stBody.field as string]: stBody.to }
           : baseMeta;
-        gateStrictWrite(store, writeCtx, { path: note.path, tags: [...projectedTags], metadata: projectedMeta });
+        gateStrictWrite(store, writeCtx, { path: note.path, tags: [...projectedTags], metadata: projectedMeta }, tagScope);
       }
 
       // vault#555 fix 2 — tag and link mutations must bump `updated_at` too,
@@ -3516,7 +3534,7 @@ async function handleNotesInner(
       if (contentChanged) {
         linkWarnings.push(...getContentWikilinkWarnings(db, note.id, updatedNote.content));
       }
-      let validated: any = attachValidationStatus(store, db, updatedNote);
+      let validated: any = attachValidationStatus(store, db, updatedNote, buildExpandVisibility(tagScope.allowed, tagScope.raw));
       // Tag-scope (vault#568): the update response echoes the STORED note, so
       // without this a scoped caller could recover a co-tagged note's full tag
       // set with a no-op PATCH — the read-path scrub would be trivially

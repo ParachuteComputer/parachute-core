@@ -196,7 +196,7 @@ describe("MCP query-notes aggregate — count without group_by (vault#626)", () 
   });
 });
 
-describe("MCP query-notes aggregate — mutual exclusivity with search/near/cursor", () => {
+describe("MCP query-notes aggregate — mutual exclusivity with search/cursor (composes with near)", () => {
   test("aggregate + search is rejected", async () => {
     seedVault("journal");
     const tool = await queryNotesTool("journal", null);
@@ -213,14 +213,12 @@ describe("MCP query-notes aggregate — mutual exclusivity with search/near/curs
     ).rejects.toThrow();
   });
 
-  test("aggregate + near is rejected", async () => {
+  test("aggregate + near composes (anchor + neighborhood id set)", async () => {
     seedVault("journal");
     const store = getVaultStore("journal");
     const anchor = await store.createNote("anchor");
     const tool = await queryNotesTool("journal", null);
-    await expect(
-      tool.execute({ near: { note_id: anchor.id }, aggregate: { group_by: "tag", op: "count" } }),
-    ).rejects.toThrow();
+    expect(await tool.execute({ near: { note_id: anchor.id }, aggregate: { op: "count" } })).toEqual([{ group: null, value: 1 }]);
   });
 });
 

@@ -667,7 +667,7 @@ export interface Store {
   batchUntag(noteIds: string[], tags: string[]): Promise<number>;
 
   // Deeper link queries
-  traverseLinks(noteId: string, opts?: { max_depth?: number; relationship?: string }): Promise<{ noteId: string; depth: number; relationship: string; direction: "outbound" | "inbound" }[]>;
+  traverseLinks(noteId: string, opts?: { max_depth?: number; relationship?: string; direction?: "outbound" | "inbound" | "both" }): Promise<{ noteId: string; depth: number; relationship: string; direction: "outbound" | "inbound" }[]>;
   findPath(sourceId: string, targetId: string, opts?: { max_depth?: number }): Promise<FindPathResult | null>;
 
   // Tag schemas — schema-only facade (description + fields). Back-compat
@@ -745,7 +745,7 @@ export interface Store {
   // `_default` is the implicit universal parent. Returns null when no
   // ancestor declares any fields. The underlying resolver is in-memory after
   // the first lazy load.
-  validateNoteAgainstSchemas(note: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown> }): ValidationStatus | null;
+  validateNoteAgainstSchemas(note: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown> }, opts?: { isVisible?: (note: Note) => boolean }): ValidationStatus | null;
 
   // Attachments
   addAttachment(noteId: string, path: string, mimeType: string, metadata?: Record<string, unknown>): Promise<Attachment>;

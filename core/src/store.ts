@@ -30,7 +30,9 @@ import {
   noteResolutionKeys,
   pathResolutionKeys,
   requeueInboundWikilinksForDelete,
+  resolveLinkTargetDetailed,
 } from "./wikilinks.js";
+import { normalizePath } from "./paths.js";
 import { chunkForInClause } from "./sql-in.js";
 import { timestampToMs } from "./cursor.js";
 import { afterCommit, transaction } from "./txn.js";
@@ -107,9 +109,23 @@ export class BunSqliteStore implements Store {
   // parent_names, schema validation via `fields`. Null means "not yet
   // loaded or invalidated"; the next read rebuilds. We invalidate
   // synchronously inside the writers that mutate the source rows so reads
-  // after writes always see the post-write state.
+  // after writes always see the post-write state. External commits are
+  // detected via SQLite data_version at each accessor.
   private _tagHierarchy: TagHierarchy | null = null;
   private _schemaConfig: ResolvedSchemas | null = null;
+  private configDataVersion: number | undefined;
+
+  /** SQLite data_version changes on commits by OTHER connections (e.g. CLI
+   * pack installation). Check at both cache accessors so validation, defaults,
+   * reference fields and scope/hierarchy expansion see external writes too.
+   * Local writers keep their existing synchronous invalidation. */
+  private refreshExternalConfigWrites(): void {
+    const { data_version } = this.db.query("PRAGMA data_version").get() as { data_version: number };
+    if (this.configDataVersion !== data_version) {
+      this.rebuildConfigCaches();
+      this.configDataVersion = data_version;
+    }
+  }
 
   /**
    * The active `EmbeddingProvider` (EXPERIMENTAL — semantic search MVP),
@@ -169,6 +185,7 @@ export class BunSqliteStore implements Store {
    * object as READ-ONLY — it's the shared cache, invalidated by writers.
    */
   getTagHierarchy(): TagHierarchy {
+    this.refreshExternalConfigWrites();
     if (!this._tagHierarchy) this._tagHierarchy = loadTagHierarchy(this.db);
     return this._tagHierarchy;
   }
@@ -178,6 +195,7 @@ export class BunSqliteStore implements Store {
    * the tag hierarchy cache.
    */
   private getSchemaConfig(): ResolvedSchemas {
+    this.refreshExternalConfigWrites();
     if (!this._schemaConfig) this._schemaConfig = loadSchemaConfig(this.db);
     return this._schemaConfig;
   }
@@ -188,8 +206,25 @@ export class BunSqliteStore implements Store {
    * layer can surface `validation_status` on create/update responses
    * without re-importing the config loader.
    */
-  validateNoteAgainstSchemas(note: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown> }): ValidationStatus | null {
-    return runValidateNote(this.getSchemaConfig(), note);
+  validateNoteAgainstSchemas(
+    note: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown> },
+    opts?: { isVisible?: (note: Note) => boolean },
+  ): ValidationStatus | null {
+    return runValidateNote(this.getSchemaConfig(), note, (value) => {
+      // Same id → path/basename/title resolution the reference auto-link uses.
+      const hit = resolveLinkTargetDetailed(this.db, value);
+      if (!hit.resolved || !hit.note_id) return { status: "unresolved" };
+      // Tag-scoped caller: a target it cannot see is indistinguishable from a
+      // missing one (no tag/existence oracle for invisible notes).
+      if (opts?.isVisible) {
+        const target = noteOps.getNote(this.db, hit.note_id);
+        if (!target || !opts.isVisible(target)) return { status: "unresolved" };
+      }
+      const rows = this.db
+        .prepare("SELECT tag_name FROM note_tags WHERE note_id = ?")
+        .all(hit.note_id) as { tag_name: string }[];
+      return { status: "resolved", tags: rows.map((r) => r.tag_name) };
+    });
   }
 
   /**
@@ -681,6 +716,9 @@ export class BunSqliteStore implements Store {
         if (cascadePlan && oldPath && oldPath !== note.path) {
           this.cascadeRename(cascadePlan, note, oldPath, { actor: updates.actor ?? null, via: updates.via ?? null });
         }
+        if (oldPath && oldPath !== note.path) {
+          this.repairReferenceFieldPaths(note, oldPath, { actor: updates.actor ?? null, via: updates.via ?? null });
+        }
         resolveUnresolvedWikilinks(this.db, note.path, id);
         // vault#581 — a rename is one of the two ways an ambiguity stops being
         // ambiguous (the other is a delete). Sweep the OLD path's keys as well
@@ -827,6 +865,72 @@ export class BunSqliteStore implements Store {
         syncWikilinks(this.db, sourceId, updated);
         refreshCompactState(this.db, sourceId);
       }
+    }
+  }
+
+  /**
+   * Rename repair for `type: "reference"` metadata values. The reference
+   * field's graph edge survives a repath (it targets the note id), but the
+   * metadata STRING that names the note by path would go stale and miss
+   * `metadata: {field: {in: [...paths]}}` queries. For every non-wikilink
+   * edge targeting the renamed note whose relationship is a field declared
+   * `type: "reference"` on a tag the source carries, rewrite scalar / array
+   * elements equal to the old path (normalised, case-insensitive) to the new
+   * path. Ids and titles are left alone. Same policy as `cascadeRename`: a
+   * store-level index repair with no tag-scope filtering, version-captured
+   * (`cascade-rename`), attributed, and bumping `updated_at`. Runs in the
+   * caller's transaction; the indexed generated columns recompute from the
+   * metadata JSON on write.
+   */
+  private repairReferenceFieldPaths(note: Note, oldPath: string, attr: { actor: string | null; via: string | null }): void {
+    if (!note.path) return;
+    const oldKey = normalizePath(oldPath)?.toLowerCase();
+    if (!oldKey) return;
+    const rows = this.db.prepare(
+      "SELECT DISTINCT source_id, relationship FROM links WHERE target_id = ? AND relationship != 'wikilink' AND source_id != ?",
+    ).all(note.id, note.id) as { source_id: string; relationship: string }[];
+    if (rows.length === 0) return;
+
+    const fieldsBySource = new Map<string, Set<string>>();
+    for (const r of rows) {
+      let set = fieldsBySource.get(r.source_id);
+      if (!set) fieldsBySource.set(r.source_id, (set = new Set()));
+      set.add(r.relationship);
+    }
+
+    const matches = (v: unknown): boolean =>
+      typeof v === "string" && normalizePath(v)?.toLowerCase() === oldKey;
+
+    for (const [sourceId, relationships] of fieldsBySource) {
+      const source = noteOps.getNote(this.db, sourceId);
+      if (!source?.metadata) continue;
+      const resolution = resolveNoteSchemas(this.getSchemaConfig(), { tags: source.tags ?? [] });
+      if (resolution.mergedFields.size === 0) continue;
+      // Skip sources whose tags declare no reference fields at all.
+      if (![...relationships].some((f) => resolution.mergedFields.get(f)?.spec.type === "reference")) continue;
+
+      let next: Record<string, unknown> | undefined;
+      for (const field of relationships) {
+        if (resolution.mergedFields.get(field)?.spec.type !== "reference") continue;
+        const value = source.metadata[field];
+        let repaired: unknown = value;
+        if (Array.isArray(value)) {
+          if (!value.some(matches)) continue;
+          repaired = value.map((v) => (matches(v) ? note.path : v));
+        } else if (matches(value)) {
+          repaired = note.path;
+        } else {
+          continue;
+        }
+        next ??= { ...source.metadata };
+        next[field] = repaired;
+      }
+      if (!next) continue;
+
+      const prior = readPriorNoteRow(this.db, sourceId);
+      if (prior) captureVersion(this.db, prior, { ...attr, op: "cascade-rename", policy: this.historyPolicy });
+      noteOps.updateNote(this.db, sourceId, { metadata: next, actor: attr.actor, via: attr.via });
+      refreshCompactState(this.db, sourceId);
     }
   }
 
@@ -1288,7 +1392,7 @@ export class BunSqliteStore implements Store {
 
   // ---- Deeper Link Queries ----
 
-  async traverseLinks(noteId: string, opts?: { max_depth?: number; relationship?: string }) {
+  async traverseLinks(noteId: string, opts?: { max_depth?: number; relationship?: string; direction?: "outbound" | "inbound" | "both" }) {
     return linkOps.traverseLinks(this.db, noteId, opts);
   }
 
