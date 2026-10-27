@@ -1,0 +1,121 @@
+diff --git i/src/auth.ts w/src/auth.ts
+index 4e967f0..a51c963 100644
+--- i/src/auth.ts
++++ w/src/auth.ts
+@@ -567,6 +567,9 @@ const warnedBadPubkeys = new Set<string>();
+ function parseScopedTagsFromPermissions(
+   permissions: Record<string, unknown> | undefined,
+ ): string[] | null {
++  // fix 14: fail closed on any restriction key this vault doesn't enforce.
++  const unknownKeys = permissions ? Object.keys(permissions).filter((k) => k !== "scoped_tags" && k !== "principal_pubkey") : [];
++  if (unknownKeys.length) throw new MalformedScopedTagsError(`hub JWT permissions carries unknown key(s) ${unknownKeys.join(", ")}`);
+   if (!permissions || !("scoped_tags" in permissions)) return null;
+   const raw = permissions.scoped_tags;
+   if (raw === null || raw === undefined) return null; // explicit "unscoped"
+diff --git i/src/mcp-tools.ts w/src/mcp-tools.ts
+index 4c69871..18187b9 100644
+--- i/src/mcp-tools.ts
++++ w/src/mcp-tools.ts
+@@ -842,7 +842,7 @@ function applyTagScopeWrappers(
+       const removed = new Set<string>((item as any).tags?.remove ?? []);
+       const projected = new Set<string>((existing.tags ?? []).filter((t) => !removed.has(t)));
+       for (const t of ((item as any).tags?.add ?? []) as string[]) projected.add(t);
+-      if (!tagsWithinScope([...projected], allowed, rawTags)) {
++      if (!tagsWithinScope([...projected], allowed, rawTags, ((item as any).tags?.add ?? []) as string[])) {
+         return forbidden("update-note: post-update tag set must satisfy the token's allowlist");
+       }
+     }
+diff --git i/src/routes.ts w/src/routes.ts
+index 98a1e80..4d6699a 100644
+--- i/src/routes.ts
++++ w/src/routes.ts
+@@ -3251,7 +3251,7 @@ async function handleNotesInner(
+         const removed = new Set<string>((body.tags?.remove as string[] | undefined) ?? []);
+         const projected = new Set<string>((note.tags ?? []).filter((t) => !removed.has(t)));
+         for (const t of (body.tags?.add as string[] | undefined) ?? []) projected.add(t);
+-        if (!tagsWithinScope([...projected], tagScope.allowed, tagScope.raw)) {
++        if (!tagsWithinScope([...projected], tagScope.allowed, tagScope.raw, (body.tags?.add as string[] | undefined) ?? [])) {
+           return tagScopeForbidden(tagScope.raw ?? []);
+         }
+       }
+@@ -4620,9 +4620,10 @@ function isNotePublished(note: { tags?: string[]; metadata?: unknown }, publishe
+ export async function handleViewNote(
+   store: Store,
+   idOrPath: string,
+-  options: { authenticated?: boolean; publishedTag?: string } = {},
++  options: { authenticated?: boolean; publishedTag?: string; visible?: (note: Note) => boolean } = {},
+ ): Promise<Response> {
+-  const { authenticated = false, publishedTag = "publish" } = options;
++  const { publishedTag = "publish" } = options;
++  let authenticated = options.authenticated ?? false;
+   let note: Note | null;
+   try {
+     note = await resolveNote(store, idOrPath);
+@@ -4639,6 +4640,7 @@ export async function handleViewNote(
+   if (!note) {
+     return new Response("Not Found", { status: 404, headers: { "Content-Type": "text/plain" } });
+   }
++  if (authenticated && options.visible && !options.visible(note)) authenticated = false; // fix 5
+   if (!authenticated && !isNotePublished(note, publishedTag)) {
+     return new Response("Not Found", { status: 404, headers: { "Content-Type": "text/plain" } });
+   }
+diff --git i/src/routing.ts w/src/routing.ts
+index c9842a5..eec9617 100644
+--- i/src/routing.ts
++++ w/src/routing.ts
+@@ -90,7 +90,7 @@ import {
+   type WriteCtx,
+ } from "./routes.ts";
+ import { handleTriggers } from "./triggers-api.ts";
+-import { expandTokenTagScope, scopedStatsFilter } from "./tag-scope.ts";
++import { expandTokenTagScope, noteWithinTagScope, scopedStatsFilter } from "./tag-scope.ts";
+ import {
+   handleProtectedResource,
+   handleRootProtectedResource,
+@@ -524,8 +524,18 @@ export async function route(
+   if (vaultViewMatch && req.method === "GET") {
+     const store = getVaultStore(vaultName);
+     const authenticated = await isViewAuthenticated(req, vaultConfig);
++    // fix 5: a tag-scoped pass sees through /view only what it sees through the API.
++    let visible: ((n: any) => boolean) | undefined;
++    if (authenticated) {
++      const auth = await authenticateVaultRequest(req, vaultConfig);
++      if (!("error" in auth) && auth.scoped_tags) {
++        const scope = await expandTokenTagScope(store, auth.scoped_tags);
++        visible = (n) => noteWithinTagScope(n, scope, auth.scoped_tags);
++      }
++    }
+     return handleViewNote(store, decodeURIComponent(vaultViewMatch[1]!), {
+       authenticated,
++      visible,
+       publishedTag: vaultConfig.published_tag,
+     });
+   }
+diff --git i/src/tag-scope.ts w/src/tag-scope.ts
+index dbd4444..4069ffb 100644
+--- i/src/tag-scope.ts
++++ w/src/tag-scope.ts
+@@ -383,16 +383,19 @@ export function tagsWithinScope(
+   tags: string[] | undefined,
+   allowed: Set<string> | null,
+   rawRoots: string[] | null,
++  added: string[] = tags ?? [],
+ ): boolean {
+   if (rawRoots === null) return true;
+   if (scopeDeniesAll(allowed)) return false;
+   if (!tags || tags.length === 0) return false;
+-  for (const t of tags) {
++  // fix 6/15: every tag the write ADDS must itself be in scope and not private; the result needs one in scope.
++  const inScope = (t: string) => {
++    if ((allowed as TagScopeSet | null)?.privateTags?.has(t)) return false;
+     if (allowed && allowed.has(t)) return true;
+     const root = t.split("/")[0];
+-    if (root && rawRoots.includes(root)) return true;
+-  }
+-  return false;
++    return !!root && rawRoots.includes(root);
++  };
++  return added.every(inScope) && tags.some(inScope);
+ }
+ 
+ /**

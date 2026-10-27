@@ -1,0 +1,24 @@
+diff --git i/src/commands/serve.ts w/src/commands/serve.ts
+index 2932f60..be3e26f 100644
+--- i/src/commands/serve.ts
++++ w/src/commands/serve.ts
+@@ -626,6 +626,7 @@ export async function serve(opts: ServeOpts = {}): Promise<{
+ 
+   const envPort = parsePort(env.PORT);
+   const port = opts.port ?? envPort ?? DEFAULT_PORT;
++  process.env.PARACHUTE_HUB_JWKS_ORIGIN ??= `http://127.0.0.1:${port}`; // fix 1 (flip): the vault child fetches keys from this hub
+   // Containers default to 0.0.0.0 so the platform's HTTP forwarder can
+   // reach us; the `--hostname` flag / PARACHUTE_BIND_HOST is the escape
+   // hatch for setups that want loopback-only inside a sidecar.
+diff --git i/src/hub-issuer.ts w/src/hub-issuer.ts
+index 2331754..73a82f6 100644
+--- i/src/hub-issuer.ts
++++ w/src/hub-issuer.ts
+@@ -16,6 +16,7 @@ import { deriveHubOrigin } from "./hub-origin.ts";
+  * resource server's strict check even when scopes match.
+  */
+ export function resolveHubIssuer(override: string | undefined, configDir: string): string {
++  override ??= process.env.PARACHUTE_HUB_ORIGIN; // fix 1 (flip): the env names the issuer
+   if (override) {
+     const fromOverride = deriveHubOrigin({ override });
+     if (fromOverride) return fromOverride;

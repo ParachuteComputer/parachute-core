@@ -7,64 +7,7 @@ import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { ensureRepos } from "./services.ts";
 import pins from "../pins.json";
-
-interface Mutant {
-  name: string;
-  why: string;
-  file: string;
-  find: string;
-  replace: string;
-  suite: string; // the contract file expected to catch it
-  catches: string[]; // contracts (test-name substrings) that must go red; another red test doesn't count
-}
-
-export const MUTANTS: Mutant[] = [
-  {
-    name: "scope-leak",
-    why: "a tag-scoped pass is treated as unscoped on single-note reads",
-    file: "src/tag-scope.ts",
-    find: "  rawRoots: string[] | null,\n): boolean {\n  if (rawRoots === null) return true;\n  if (scopeDeniesAll(allowed)) return false;\n  if (!note.tags",
-    replace: "  rawRoots: string[] | null,\n): boolean {\n  if (rawRoots === null || rawRoots.length > 0) return true;\n  if (scopeDeniesAll(allowed)) return false;\n  if (!note.tags",
-    suite: "suites/today/access.test.ts",
-    catches: ["a scoped pass sees exactly the notes under its tags", "cannot change or delete a note it cannot see"],
-  },
-  {
-    name: "untagged-leak",
-    why: "notes with no tags become visible to every scoped pass",
-    file: "src/tag-scope.ts",
-    find: "  if (!note.tags || note.tags.length === 0) return false;\n  let admitted = false;",
-    replace: "  if (!note.tags || note.tags.length === 0) return true;\n  let admitted = false;",
-    suite: "suites/today/access.test.ts",
-    catches: ["a scoped pass sees exactly the notes under its tags"],
-  },
-  {
-    name: "no-history",
-    why: "changes stop keeping the version before them",
-    file: "core/src/history.ts",
-    find: "  if (!opts.policy.enabled) return;",
-    replace: "  if (!opts.policy.enabled || true) return;",
-    suite: "suites/today/links-search-history.test.ts",
-    catches: ["each change keeps the version before it", "an old version can be restored"],
-  },
-  {
-    name: "stale-write",
-    why: "an update made from an old version silently wins instead of being refused",
-    file: "core/src/notes.ts",
-    find: '    sql += " AND updated_at IS ?";\n    values.push(updates.if_updated_at);',
-    replace: '    sql += " AND (updated_at IS ? OR 1)";\n    values.push(updates.if_updated_at);',
-    suite: "suites/today/notes.test.ts",
-    catches: ["a stale one is refused"],
-  },
-  {
-    name: "wrong-resource",
-    why: "the vault advertises a resource URL that isn't its MCP endpoint, so consumer apps can't bind tokens to it",
-    file: "src/oauth-discovery.ts",
-    find: "    resource: `${base}${prefix}/mcp`,",
-    replace: "    resource: `${base}${prefix}`,",
-    suite: "suites/today/consumer-connector.test.ts",
-    catches: ["the app connects from nothing but the MCP URL"],
-  },
-];
+import { MUTANTS } from "./mutants.ts";
 
 async function run(cmd: string[], opts: { cwd: string; env?: Record<string, string> }) {
   const p = Bun.spawn(cmd, { cwd: opts.cwd, env: { ...process.env, ...opts.env }, stdout: "pipe", stderr: "pipe" });
@@ -105,11 +48,11 @@ for (const m of MUTANTS.filter((m) => only.length === 0 || only.includes(m.name)
     const add = await run(["git", "worktree", "add", "--detach", "--quiet", tree, pins.vault.commit], { cwd: repos.vault });
     if (add.code !== 0) throw new Error(`git worktree add failed: ${add.out}`);
     symlinkSync(join(repos.vault, "node_modules"), join(tree, "node_modules"));
-    const path = join(tree, m.file);
+    const path = join(tree, m.file!);
     const src = readFileSync(path, "utf8");
-    const hits = src.split(m.find).length - 1;
+    const hits = src.split(m.find!).length - 1;
     if (hits !== 1) throw new Error(`mutant ${m.name}: expected the target text once in ${m.file}, found ${hits}`);
-    writeFileSync(path, src.replace(m.find, m.replace));
+    writeFileSync(path, src.replace(m.find!, m.replace!));
 
     child = Bun.spawn(["bun", "run", "harness/run.ts", m.suite], {
       cwd: contracts,

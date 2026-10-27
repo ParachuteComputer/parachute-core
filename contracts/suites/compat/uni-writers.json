@@ -1,0 +1,1129 @@
+{
+  "about": "Every client of uni's live hub (:1939) and vault (:1940), rebuilt read-only on 2026-10-27 from `systemctl --user list-units`, ~/.config/systemd/user/*.{service,timer}, Hermes cron jobs and grep of the code they run. Call shapes only: no tokens, no hostnames (the tailnet origin is <tailnet-origin>), no note content. PLAN §8.1. uni.test.ts runs one probe per client (the `probe` field names the test).",
+  "auth_kinds": {
+    "bearer-script-pass": "Authorization: Bearer <hub JWT>, scope vault:<vault>:write, long-lived, issuer the old tailnet origin (kept valid by the hub unit's t137-legacy-iss drop-in). Read from ~/.config/parachute-script-tokens.json, key mcpServers.<entry>.headers.Authorization (entries parachute-uni, parachute-civics, parachute-<vault>), or a file named by UNI_VAULT_TOKEN_FILE. Kind inferred from docs; the file was not opened.",
+    "bearer-admin-pass": "Authorization: Bearer <hub JWT> with vault:<vault>:admin, for tag-schema writes (uni-cal migrate-schema, admin_token_file).",
+    "nip98": "Authorization: Nostr <event>, kind 27235, tags u/method/nonce/payload, signed per request with a key linked to a hub user. Hits the hub's account door (POST /mcp), whose vault tools take a `vault` argument.",
+    "ticket": "No Authorization: a single-use upload ticket URL /vault/<vault>/tickets/<id>, minted by request-attachment-upload.",
+    "sqlite-readonly": "Opens <PARACHUTE_HOME>/vault/data/<vault>/vault.db (or hub.db) read-only with sqlite, no HTTP.",
+    "none": "No credential."
+  },
+  "bases": {
+    "vault-direct": "http://127.0.0.1:1940/vault/<vault>/api",
+    "hub-loopback-mcp": "http://127.0.0.1:1939/mcp",
+    "tailnet-mcp": "https://<tailnet-origin>/mcp (Tailscale Serve → 127.0.0.1:1939, with X-Forwarded-Proto/For and Tailscale-User-Login)",
+    "tailnet-ticket": "https://<tailnet-origin>/vault/<vault>/tickets/<id>"
+  },
+  "clients": [
+    {
+      "name": "hermes-mcp",
+      "transport": "mcp",
+      "base": "hub-loopback-mcp; the techne profile uses tailnet-mcp",
+      "auth": {
+        "kind": "nip98",
+        "encoding": "standard base64 (bridge dist/nip98.js:46)",
+        "key_from": "PARACHUTE_NSEC_FILE"
+      },
+      "calls": [
+        {
+          "mcp": "initialize"
+        },
+        {
+          "mcp": "tools/list"
+        },
+        {
+          "mcp": "query-notes",
+          "args": [
+            "vault",
+            "id",
+            "include_content",
+            "tag",
+            "path_prefix",
+            "search",
+            "limit"
+          ]
+        },
+        {
+          "mcp": "create-note",
+          "args": [
+            "vault",
+            "path",
+            "content",
+            "tags",
+            "metadata"
+          ]
+        },
+        {
+          "mcp": "update-note",
+          "args": [
+            "vault",
+            "id",
+            "content",
+            "metadata",
+            "tags",
+            "if_updated_at",
+            "append"
+          ]
+        }
+      ],
+      "probe": "Hermes"
+    },
+    {
+      "name": "uni-app",
+      "transport": "mcp + ticket",
+      "base": "tailnet-mcp (two tailnet names, fails over between them)",
+      "auth": {
+        "kind": "nip98",
+        "encoding": "base64url, no padding (parachute.rs:55-76)",
+        "key_from": "the device's Buzz key"
+      },
+      "calls": [
+        {
+          "mcp": "create-note",
+          "args": [
+            "vault",
+            "content",
+            "path",
+            "tags:[journal]",
+            "metadata{source,client,entry_id}",
+            "if_exists:ignore",
+            "created_at"
+          ]
+        },
+        {
+          "mcp": "query-notes",
+          "args": [
+            "vault",
+            "tag",
+            "include_content",
+            "include_metadata",
+            "limit<=200",
+            "sort:asc",
+            "offset",
+            "id",
+            "include_links",
+            "path_prefix",
+            "search",
+            "content_length"
+          ]
+        },
+        {
+          "mcp": "update-note",
+          "args": [
+            "vault",
+            "id",
+            "include_content:false",
+            "if_updated_at",
+            "state_transition{field,from,to}",
+            "metadata",
+            "content",
+            "force"
+          ]
+        },
+        {
+          "mcp": "list-vaults"
+        },
+        {
+          "mcp": "request-attachment-upload",
+          "args": [
+            "vault",
+            "note",
+            "filename",
+            "mime_type",
+            "size_bytes",
+            "transcribe:true"
+          ]
+        },
+        {
+          "method": "PUT",
+          "path": "/vault/<vault>/tickets/<id>",
+          "auth": "ticket",
+          "note": "the ticket's url re-rooted on the origin the app reached; any other path is refused (parachute.rs:1470-1482)"
+        }
+      ],
+      "reads": [
+        "result.content[].text as JSON",
+        "result.isError",
+        "a 401 body containing 'not linked' = unlinked key"
+      ],
+      "probe": "the Uni app"
+    },
+    {
+      "name": "uni-tasks",
+      "transport": "rest",
+      "base": "vault-direct (UNI_VAULT_API)",
+      "auth": {
+        "kind": "bearer-script-pass",
+        "token_from": "UNI_VAULT_TOKEN_FILE, else tokens file entry parachute-uni"
+      },
+      "calls": [
+        {
+          "method": "GET",
+          "path": "/notes",
+          "query": [
+            "tag=task",
+            "metadata=<JSON operator filter>",
+            "include_content=true|false",
+            "limit=200",
+            "offset=N"
+          ]
+        },
+        {
+          "method": "GET",
+          "path": "/notes",
+          "query": [
+            "path_prefix=<path>",
+            "include_content=true|false"
+          ]
+        },
+        {
+          "method": "GET",
+          "path": "/notes",
+          "query": [
+            "tag=node",
+            "include_links=true"
+          ]
+        },
+        {
+          "method": "GET",
+          "path": "/notes",
+          "query": [
+            "search=<terms>",
+            "limit=25",
+            "include_content=false"
+          ]
+        },
+        {
+          "method": "GET",
+          "path": "/notes/<id>"
+        },
+        {
+          "method": "GET",
+          "path": "/notes/<id>/versions",
+          "reads": [
+            "versions[].version_ix"
+          ]
+        },
+        {
+          "method": "GET",
+          "path": "/tags",
+          "query": [
+            "include_schema=true"
+          ]
+        },
+        {
+          "method": "POST",
+          "path": "/notes",
+          "body": [
+            "path",
+            "content",
+            "tags",
+            "metadata"
+          ],
+          "handles": {
+            "409": "retry with a path suffix"
+          }
+        },
+        {
+          "method": "PATCH",
+          "path": "/notes/<id>",
+          "body": [
+            "metadata|content",
+            "if_updated_at"
+          ],
+          "handles": {
+            "409": "re-read and retry, or exit 3",
+            "412": "same"
+          }
+        },
+        {
+          "method": "PATCH",
+          "path": "/notes/<id>",
+          "body": [
+            "force:true",
+            "metadata"
+          ]
+        }
+      ],
+      "reads": [
+        "bare array from GET /notes (also accepts {notes})",
+        "id",
+        "path",
+        "tags",
+        "metadata",
+        "content",
+        "updatedAt",
+        "createdAt"
+      ],
+      "probe": "uni-tasks"
+    },
+    {
+      "name": "tasks-mirror",
+      "transport": "rest",
+      "base": "vault-direct",
+      "auth": {
+        "kind": "bearer-script-pass",
+        "token_from": "as uni-tasks"
+      },
+      "calls": [
+        {
+          "method": "GET",
+          "path": "/notes",
+          "query": [
+            "tag=task",
+            "metadata=<filter>",
+            "include_content=true|false"
+          ]
+        },
+        {
+          "method": "PATCH",
+          "path": "/notes/<id>",
+          "body": [
+            "metadata{content_hash,generated_by,generated_at}",
+            "if_updated_at"
+          ],
+          "handles": {
+            "409": "re-read and retry"
+          }
+        }
+      ],
+      "probe": "tasks-mirror"
+    },
+    {
+      "name": "mts",
+      "transport": "rest",
+      "base": "vault-direct",
+      "auth": {
+        "kind": "bearer-script-pass",
+        "token_from": "as uni-tasks"
+      },
+      "calls": [
+        {
+          "method": "POST",
+          "path": "/notes",
+          "body": [
+            "path",
+            "content",
+            "tags"
+          ]
+        },
+        {
+          "method": "PATCH",
+          "path": "/notes/<id>",
+          "body": [
+            "content",
+            "metadata{claude_accounts}",
+            "if_updated_at"
+          ],
+          "handles": {
+            "409": "re-read"
+          }
+        },
+        {
+          "method": "PATCH",
+          "path": "/notes/<id>",
+          "body": [
+            "force:true",
+            "metadata"
+          ]
+        }
+      ],
+      "probe": "mts"
+    },
+    {
+      "name": "uni-publish",
+      "transport": "rest",
+      "base": "vault-direct",
+      "auth": {
+        "kind": "bearer-script-pass",
+        "token_from": "as uni-tasks"
+      },
+      "calls": [
+        {
+          "method": "GET",
+          "path": "/notes",
+          "query": [
+            "tag=published"
+          ],
+          "reads": [
+            "metadata.sha256"
+          ]
+        },
+        {
+          "method": "POST",
+          "path": "/notes",
+          "body": [
+            "path:Published/<date> <title>",
+            "content",
+            "tags:[published]",
+            "metadata{node,url,sha256,bytes,mime,kind,published,source_name,task}"
+          ],
+          "handles": {
+            "409": "retry with a suffix"
+          }
+        }
+      ],
+      "reads": [
+        "id",
+        "path"
+      ],
+      "probe": "uni-publish"
+    },
+    {
+      "name": "intake-importer",
+      "transport": "rest",
+      "base": "vault-direct (UNI_VAULT_API)",
+      "auth": {
+        "kind": "bearer-script-pass",
+        "token_from": "UNI_VAULT_TOKEN_FILE, else parachute-uni"
+      },
+      "calls": [
+        {
+          "method": "GET",
+          "path": "/notes",
+          "query": [
+            "tag=person|intake",
+            "include_content=true",
+            "limit=50",
+            "meta[email]=<v> | meta[submission_id]=<v>"
+          ]
+        },
+        {
+          "method": "GET",
+          "path": "/notes/<id>"
+        },
+        {
+          "method": "GET",
+          "path": "/notes/<id>/attachments",
+          "reads": [
+            "metadata.segment_index"
+          ]
+        },
+        {
+          "method": "POST",
+          "path": "/notes",
+          "body": [
+            "path",
+            "tags",
+            "content",
+            "metadata"
+          ],
+          "handles": {
+            "409": "next numbered path"
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/storage/upload",
+          "body": [
+            "multipart file"
+          ],
+          "reads": [
+            "path"
+          ]
+        },
+        {
+          "method": "POST",
+          "path": "/notes/<id>/attachments",
+          "body": [
+            "path",
+            "mimeType",
+            "transcribe:true",
+            "segment_index"
+          ]
+        },
+        {
+          "method": "PATCH",
+          "path": "/notes/<id>",
+          "body": [
+            "metadata",
+            "if_updated_at"
+          ]
+        },
+        {
+          "method": "PATCH",
+          "path": "/notes/<id>",
+          "body": [
+            "append"
+          ]
+        }
+      ],
+      "probe": "intake importer"
+    },
+    {
+      "name": "uni-calendar",
+      "transport": "rest",
+      "base": "vault-direct",
+      "auth": {
+        "kind": "bearer-script-pass",
+        "token_from": "parachute-uni"
+      },
+      "calls": [
+        {
+          "method": "GET",
+          "path": "/notes",
+          "query": [
+            "tag=event",
+            "include_content=true",
+            "limit=200",
+            "offset=N"
+          ],
+          "reads": [
+            "array (or {notes})"
+          ]
+        }
+      ],
+      "probe": "uni-calendar"
+    },
+    {
+      "name": "the-door",
+      "transport": "rest",
+      "base": "vault-direct (config `hub`, path /vault/<vault>/api)",
+      "auth": {
+        "kind": "bearer-script-pass",
+        "token_from": "config token_file; migrate-schema uses admin_token_file (bearer-admin-pass)"
+      },
+      "calls": [
+        {
+          "method": "GET",
+          "path": "/notes",
+          "query": [
+            "tag=event",
+            "path_prefix=<root>",
+            "limit=200",
+            "cursor=<c>",
+            "include_content=true",
+            "meta[last_op]",
+            "meta[uid][eq]",
+            "meta[link]",
+            "meta[idempotency_key]"
+          ],
+          "reads": [
+            "{notes, next_cursor}"
+          ]
+        },
+        {
+          "method": "GET",
+          "path": "/notes/<urlencoded id or path>",
+          "handles": {
+            "404": "None"
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/notes",
+          "body": [
+            "id",
+            "path",
+            "content",
+            "tags",
+            "metadata"
+          ],
+          "handles": {
+            "409": "error_type path_conflict → suffix"
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/notes",
+          "body": [
+            "notes:[...] (batch, one transaction)"
+          ]
+        },
+        {
+          "method": "PATCH",
+          "path": "/notes/<id>",
+          "body": [
+            "metadata",
+            "content",
+            "if_updated_at",
+            "path",
+            "tags{add,remove}"
+          ],
+          "handles": {
+            "409": "re-read"
+          }
+        },
+        {
+          "method": "DELETE",
+          "path": "/notes/<id>"
+        },
+        {
+          "method": "GET",
+          "path": "/tags",
+          "query": [
+            "include_schema=true"
+          ]
+        },
+        {
+          "method": "GET",
+          "path": "/tags/<name>"
+        },
+        {
+          "method": "PUT",
+          "path": "/tags/<name>",
+          "auth": "bearer-admin-pass"
+        }
+      ],
+      "probe": "the door"
+    },
+    {
+      "name": "marker-sweep",
+      "transport": "rest",
+      "base": "vault-direct",
+      "auth": {
+        "kind": "bearer-script-pass",
+        "token_from": "as uni-tasks"
+      },
+      "calls": [
+        {
+          "method": "GET",
+          "path": "/notes",
+          "query": [
+            "tag=task",
+            "include_content=true"
+          ]
+        },
+        {
+          "cli": "tasks.py set T-NN --state done --guard; tasks.py handback (writes go through uni-tasks)"
+        }
+      ],
+      "probe": "marker-sweep"
+    },
+    {
+      "name": "civics-ingest",
+      "transport": "rest",
+      "base": "vault-direct, vault civics",
+      "auth": {
+        "kind": "bearer-script-pass",
+        "token_from": "parachute-civics"
+      },
+      "calls": [
+        {
+          "method": "GET",
+          "path": "/notes",
+          "query": [
+            "tag=<t>",
+            "limit=200",
+            "offset=N",
+            "include_content=true|false"
+          ]
+        },
+        {
+          "method": "GET",
+          "path": "/notes/<id>"
+        },
+        {
+          "method": "POST",
+          "path": "/notes",
+          "body": [
+            "path",
+            "content",
+            "tags",
+            "metadata",
+            "links:[{target,relationship}]"
+          ],
+          "handles": {
+            "409": "path suffix"
+          }
+        },
+        {
+          "method": "PATCH",
+          "path": "/notes/<id>",
+          "body": [
+            "force:true",
+            "content",
+            "metadata",
+            "tags{add}",
+            "links{add,remove}"
+          ]
+        }
+      ],
+      "reads": [
+        "id",
+        "metadata"
+      ],
+      "probe": "civics-ingest"
+    },
+    {
+      "name": "kirtan-sync",
+      "transport": "rest",
+      "base": "vault-direct",
+      "auth": {
+        "kind": "bearer-script-pass",
+        "token_from": "parachute-uni"
+      },
+      "calls": [
+        {
+          "method": "GET",
+          "path": "/notes/<fixed note id>"
+        }
+      ],
+      "probe": "kirtan-sync"
+    },
+    {
+      "name": "uni-nightly",
+      "transport": "mcp (node bridge `cli.js call <tool> --args - --hub <url>`)",
+      "base": "tailnet-mcp (NIGHTLY_HUB); vaults NIGHTLY_VAULTS",
+      "auth": {
+        "kind": "nip98",
+        "encoding": "standard base64 (bridge)",
+        "key_from": "PARACHUTE_NSEC_FILE"
+      },
+      "calls": [
+        {
+          "mcp": "query-notes",
+          "args": [
+            "vault",
+            "aggregate{op:count}",
+            "limit",
+            "offset",
+            "id",
+            "include_content",
+            "path",
+            "exclude_tags",
+            "exclude_path_prefix"
+          ]
+        },
+        {
+          "mcp": "doctor",
+          "args": [
+            "vault"
+          ]
+        },
+        {
+          "mcp": "update-note",
+          "args": [
+            "vault",
+            "id",
+            "tags{add|remove}",
+            "content",
+            "metadata",
+            "append",
+            "if_updated_at",
+            "include_content:false"
+          ]
+        },
+        {
+          "mcp": "create-note",
+          "args": [
+            "vault",
+            "path",
+            "content",
+            "tags:[system]",
+            "metadata"
+          ]
+        }
+      ],
+      "reads": [
+        "{results:[{vault, notes|result|note|data|error}]}",
+        "updatedAt",
+        "id"
+      ],
+      "probe": "uni-nightly"
+    },
+    {
+      "name": "uni-digest",
+      "transport": "rest",
+      "base": "vault-direct",
+      "auth": {
+        "kind": "bearer-script-pass",
+        "token_from": "as uni-tasks"
+      },
+      "calls": [
+        {
+          "method": "GET",
+          "path": "/notes",
+          "query": [
+            "tag=node"
+          ]
+        },
+        {
+          "method": "GET",
+          "path": "/notes",
+          "query": [
+            "tag=task",
+            "include_content=false",
+            "cursor=<c, empty at start>",
+            "limit=200"
+          ],
+          "reads": [
+            "{notes, next_cursor}"
+          ],
+          "handles": {
+            "400": "code starting 'cursor' = invalid cursor"
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/notes",
+          "query": [
+            "tag=task",
+            "include_content=false",
+            "meta[updated_at][gte]=<ISO>"
+          ]
+        }
+      ],
+      "probe": "uni-digest"
+    },
+    {
+      "name": "call-capture",
+      "transport": "rest",
+      "base": "vault-direct (CALL_CAPTURE_VAULT_BASE)",
+      "auth": {
+        "kind": "bearer-script-pass",
+        "token_from": "PARACHUTE_TOKENS_FILE entry parachute-<vault>"
+      },
+      "calls": [
+        {
+          "method": "POST",
+          "path": "/notes",
+          "body": [
+            "path",
+            "content",
+            "tags",
+            "metadata"
+          ],
+          "handles": {
+            "409": "retry on path clash"
+          }
+        },
+        {
+          "method": "PATCH",
+          "path": "/notes/<id>",
+          "body": [
+            "append"
+          ]
+        },
+        {
+          "method": "PATCH",
+          "path": "/notes/<id>",
+          "body": [
+            "metadata",
+            "force:true"
+          ]
+        },
+        {
+          "method": "GET",
+          "path": "/notes/<id>"
+        }
+      ],
+      "probe": "call-capture"
+    },
+    {
+      "name": "uni-mail-needs-aaron",
+      "transport": "cli (no vault call of its own)",
+      "base": "through uni-tasks",
+      "auth": {
+        "kind": "bearer-script-pass",
+        "token_from": "inherited by tasks.py"
+      },
+      "calls": [
+        {
+          "cli": "tasks.py new → POST /notes (task); tasks.py set --state done → PATCH /notes/<id> {metadata, if_updated_at}"
+        }
+      ],
+      "probe": "uni-mail-needs-aaron"
+    },
+    {
+      "name": "uni-areas-proto",
+      "transport": "rest",
+      "base": "vault-direct",
+      "auth": {
+        "kind": "bearer-script-pass",
+        "token_from": "parachute-uni"
+      },
+      "calls": [
+        {
+          "method": "GET",
+          "path": "/notes",
+          "query": [
+            "tag=<x> | path=<exact>",
+            "include_content=true",
+            "limit=200"
+          ],
+          "reads": [
+            "[0] of the array"
+          ]
+        }
+      ],
+      "probe": "uni-areas-proto"
+    },
+    {
+      "name": "pacer",
+      "transport": "rest",
+      "base": "vault-direct",
+      "auth": {
+        "kind": "bearer-script-pass",
+        "token_from": "as uni-tasks"
+      },
+      "calls": [
+        {
+          "method": "GET",
+          "path": "/notes",
+          "query": [
+            "tag=task",
+            "metadata={\"state\":{\"in\":[...]}}",
+            "include_content=false"
+          ]
+        }
+      ],
+      "probe": "pacer"
+    },
+    {
+      "name": "loops",
+      "transport": "rest + cli",
+      "base": "vault-direct",
+      "auth": {
+        "kind": "bearer-script-pass",
+        "token_from": "as uni-tasks"
+      },
+      "calls": [
+        {
+          "method": "GET",
+          "path": "/notes",
+          "query": [
+            "tag=task",
+            "metadata=<filter>",
+            "include_content=false"
+          ]
+        },
+        {
+          "method": "GET",
+          "path": "/notes",
+          "query": [
+            "path_prefix=Areas/<name>",
+            "include_content=true|false"
+          ]
+        },
+        {
+          "method": "POST",
+          "path": "/notes",
+          "body": [
+            "path",
+            "content",
+            "tags:[push-plan]"
+          ]
+        },
+        {
+          "method": "PATCH",
+          "path": "/notes/<id>",
+          "body": [
+            "content",
+            "if_updated_at"
+          ]
+        },
+        {
+          "cli": "tasks.py set --next"
+        }
+      ],
+      "probe": "loops"
+    },
+    {
+      "name": "backup-jobs",
+      "transport": "sqlite",
+      "base": "<PARACHUTE_HOME>/vault/data/<vault>/vault.db and <PARACHUTE_HOME>/hub.db, plus rsync of assets/",
+      "auth": {
+        "kind": "sqlite-readonly"
+      },
+      "calls": [
+        {
+          "sqlite": "open vault.db read-only, sqlite backup() to a snapshot (backup_restore.py)"
+        },
+        {
+          "sqlite": "sqlite3 -readonly hub.db .backup <file> (uni_backup.sh)"
+        }
+      ],
+      "probe": "backup jobs"
+    },
+    {
+      "name": "fireflies-ingest",
+      "extra": "found by grep; not in PLAN §8.1",
+      "transport": "rest",
+      "base": "vault-direct (PARACHUTE_VAULT_BASE)",
+      "auth": {
+        "kind": "bearer-script-pass",
+        "token_from": "PARACHUTE_TOKENS_FILE entry parachute-uni"
+      },
+      "calls": [
+        {
+          "method": "GET",
+          "path": "/notes",
+          "query": [
+            "metadata={\"fireflies_id\":{\"exists\":true}}",
+            "tag=meeting",
+            "offset"
+          ]
+        },
+        {
+          "method": "POST",
+          "path": "/notes",
+          "body": [
+            "notes:[{path,content,tags,metadata,created_at,if_exists:update}]"
+          ]
+        },
+        {
+          "method": "PATCH",
+          "path": "/notes/<id>",
+          "body": [
+            "metadata",
+            "content",
+            "if_updated_at"
+          ]
+        }
+      ],
+      "probe": "extra clients"
+    },
+    {
+      "name": "sources-digest",
+      "extra": "found by grep; not in PLAN §8.1",
+      "transport": "rest + sqlite",
+      "base": "vault-direct",
+      "auth": {
+        "kind": "bearer-script-pass",
+        "token_from": "parachute-uni"
+      },
+      "calls": [
+        {
+          "method": "GET",
+          "path": "/notes",
+          "query": [
+            "tag=source"
+          ]
+        },
+        {
+          "method": "POST",
+          "path": "/notes",
+          "body": [
+            "path",
+            "content",
+            "tags",
+            "metadata",
+            "if_exists:update"
+          ]
+        },
+        {
+          "sqlite": "read-only select on another vault's vault.db"
+        }
+      ],
+      "probe": "extra clients"
+    },
+    {
+      "name": "area-briefs",
+      "extra": "found by grep; not in PLAN §8.1",
+      "transport": "rest",
+      "base": "vault-direct (AREA_BRIEFS_API)",
+      "auth": {
+        "kind": "bearer-script-pass",
+        "token_from": "parachute-uni"
+      },
+      "calls": [
+        {
+          "method": "GET",
+          "path": "/notes",
+          "query": [
+            "tag=<t>",
+            "sort=desc",
+            "limit=N",
+            "include_content=true",
+            "search=<kw>"
+          ]
+        },
+        {
+          "method": "GET",
+          "path": "/notes/<path>",
+          "query": [
+            "include_content=true|false"
+          ],
+          "handles": {
+            "404": "None"
+          }
+        },
+        {
+          "method": "PATCH",
+          "path": "/notes/<id>",
+          "body": [
+            "content",
+            "tags{add}",
+            "metadata",
+            "force:true"
+          ]
+        },
+        {
+          "method": "POST",
+          "path": "/notes",
+          "body": [
+            "path",
+            "content",
+            "tags",
+            "metadata"
+          ]
+        }
+      ],
+      "probe": "extra clients"
+    },
+    {
+      "name": "journal-sweeps",
+      "extra": "found by grep; not in PLAN §8.1",
+      "transport": "rest + sqlite",
+      "base": "vault-direct; vault.db read-only",
+      "auth": {
+        "kind": "bearer-script-pass",
+        "token_from": "parachute-uni"
+      },
+      "calls": [
+        {
+          "sqlite": "select id, path from notes where ... (read-only)"
+        },
+        {
+          "method": "GET",
+          "path": "/notes/<id>",
+          "query": [
+            "include_content=false"
+          ]
+        },
+        {
+          "method": "PATCH",
+          "path": "/notes/<id>",
+          "body": [
+            "tags{add:[journal],remove:[capture]}",
+            "path",
+            "if_updated_at"
+          ],
+          "handles": {
+            "409": "retry up to 3 times"
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/notes",
+          "query": [
+            "tag=journal",
+            "meta[created_at][gte]",
+            "meta[created_at][lt]",
+            "sort=asc",
+            "include_content=true",
+            "limit=40"
+          ]
+        }
+      ],
+      "probe": "extra clients"
+    },
+    {
+      "name": "stack-update",
+      "extra": "found by grep; not in PLAN §8.1",
+      "transport": "http",
+      "base": "http://127.0.0.1:1939",
+      "auth": {
+        "kind": "none"
+      },
+      "calls": [
+        {
+          "method": "GET",
+          "path": "/health"
+        }
+      ],
+      "probe": "extra clients"
+    }
+  ]
+}

@@ -1,5 +1,11 @@
-# Runs the contract suite against today's hub and vault at the commits in contracts/pins.json.
-# Everything is local to the runner: a throwaway hub and vault on random ports in a temp home.
+# The contract suites (contracts/README.md).
+#   today      today's contracts against the pinned hub and vault (the reference for today's behaviour)
+#   candidate  every suite against the candidate this job builds, launched the way a user launches it, in a
+#              private network + PID namespace; the run must report the hash the build produced (PLAN §7.2)
+#   prism      Benjamin's compatibility suite, unchanged, against the same build (the Nov 9 gate, PLAN §3.1)
+#   mutants    the contracts must catch each mutant, on the pinned vault and on rebuilt candidates; each flip
+#              must turn its red contracts green
+# Everything is local to the runner: throwaway homes, random ports, no live service.
 name: contracts
 
 on:
@@ -11,6 +17,9 @@ on:
 concurrency:
   group: contracts-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  BUN_VERSION: "1.4"
 
 jobs:
   today:
@@ -24,8 +33,15 @@ jobs:
       - uses: actions/checkout@v6
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4
-      - name: cache the pinned vault + hub checkouts
+          bun-version: ${{ env.BUN_VERSION }}
+      - &sandbox
+        name: allow the sandbox (unprivileged user namespaces; nftables and lsof)
+        working-directory: .
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo apt-get update -qq && sudo apt-get install -y -qq nftables lsof iproute2 >/dev/null
+      - &repos
+        name: cache the pinned vault + hub checkouts
         uses: actions/cache@v4
         with:
           path: contracts/.cache/repos
@@ -36,14 +52,13 @@ jobs:
         run: bun run today
       - name: v1 contracts (marked failing until built)
         run: bun run v1
-      - name: harness self-tests (origin guard, cleanup, pinned checkouts)
+      - name: harness self-tests (origin guard, cleanup, pinned checkouts, candidate adapter, sandbox)
         run: bun run selftest
 
-  mutants:
-    name: mutants (the contracts must catch each)
+  candidate:
+    name: every suite on the candidate build
     runs-on: ubuntu-latest
-    needs: today
-    timeout-minutes: 25
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: contracts
@@ -51,10 +66,86 @@ jobs:
       - uses: actions/checkout@v6
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4
-      - uses: actions/cache@v4
-        with:
-          path: contracts/.cache/repos
-          key: repos-${{ hashFiles('contracts/pins.json') }}-bun1.4
+          bun-version: ${{ env.BUN_VERSION }}
+      - *sandbox
+      - *repos
       - run: bun install --frozen-lockfile
-      - run: bun run mutants
+      - name: build the candidate
+        id: build
+        run: bun run build:stock --out "$RUNNER_TEMP/candidate"
+      - name: the contracts, against exactly that build
+        env:
+          CANDIDATE_DIR: ${{ steps.build.outputs.dir }}
+          CANDIDATE_SHA256: ${{ steps.build.outputs.sha256 }}
+        run: bun run candidate -- --v1 2>&1 | tee "$RUNNER_TEMP/candidate.log"; test "${PIPESTATUS[0]}" -eq 0
+        shell: bash
+      - name: the run reported the hash this job built, before and after
+        shell: bash
+        run: |
+          grep -qx "\[candidate\] sha256 ${{ steps.build.outputs.sha256 }}" "$RUNNER_TEMP/candidate.log"
+          grep -q "^\[candidate\] unchanged after the run: sha256 ${{ steps.build.outputs.sha256 }}$" "$RUNNER_TEMP/candidate.log"
+
+  prism:
+    name: Benjamin's compatibility suite on the candidate build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - *sandbox
+      - *repos
+      - run: bun install --frozen-lockfile
+      - name: build the candidate
+        id: build
+        run: bun run build:stock --out "$RUNNER_TEMP/candidate"
+      - name: his suite, unchanged (expected FAILs listed in prism-compat-expected.json until slice 1)
+        env:
+          CANDIDATE_DIR: ${{ steps.build.outputs.dir }}
+          CANDIDATE_SHA256: ${{ steps.build.outputs.sha256 }}
+        run: bun run prism-compat
+
+  mutants:
+    name: mutants on the pinned vault (the contracts must catch each)
+    runs-on: ubuntu-latest
+    needs: [today]
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - *sandbox
+      - *repos
+      - run: bun install --frozen-lockfile
+      - name: on the pinned vault
+        run: bun run mutants
+
+  mutants-candidate:
+    name: mutants and flips on rebuilt candidates
+    runs-on: ubuntu-latest
+    needs: [candidate]
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - *sandbox
+      - *repos
+      - run: bun install --frozen-lockfile
+      - name: each mutant caught, each flip flipped
+        run: bun run mutants:candidate

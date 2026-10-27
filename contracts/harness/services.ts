@@ -22,9 +22,14 @@ export interface Services {
   vaultDirect: string; // http://127.0.0.1:<vault port>/vault/<name>, bypassing the hub
   vaultViaHub: string; // <hub>/vault/<name>
   operatorToken: string; // VAULT_AUTH_TOKEN: full access, this throwaway vault only
+  /** Who history says the operator is: "operator" for VAULT_AUTH_TOKEN; a candidate's admin pass names its user. */
+  operatorActor?: string;
   admin: { username: string; password: string };
   hubRepo: string;
   home: string; // the throwaway PARACHUTE_HOME
+  /** Candidate runs: the real `parachute` CLI and its environment, used instead of `bun src/cli.ts` in hubRepo. */
+  cli?: string[];
+  cliEnv?: Record<string, string>;
 }
 
 // Ports are drawn from 47000-49499, so these can't come up; the guard stays in case the range ever changes.
@@ -205,9 +210,9 @@ export interface Running {
 
 /** Run the throwaway hub's own CLI against the throwaway home. */
 export async function hubCli(s: Services, args: string[]): Promise<string> {
-  const p = Bun.spawn(["bun", "src/cli.ts", ...args], {
-    cwd: s.hubRepo,
-    env: { PATH: process.env.PATH ?? "", HOME: s.home.replace(/\/\.parachute$/, ""), PARACHUTE_HOME: s.home, PARACHUTE_HUB_ORIGIN: s.hub },
+  const p = Bun.spawn(s.cli ? [...s.cli, ...args] : ["bun", "src/cli.ts", ...args], {
+    cwd: s.cli ? s.home.replace(/\/\.parachute$/, "") : s.hubRepo,
+    env: s.cliEnv ?? { PATH: process.env.PATH ?? "", HOME: s.home.replace(/\/\.parachute$/, ""), PARACHUTE_HOME: s.home, PARACHUTE_HUB_ORIGIN: s.hub },
     stdout: "pipe",
     stderr: "pipe",
   });

@@ -1,6 +1,7 @@
 // What every contract file shares: where the services are, a small REST client, made-up test data.
 // Contracts only speak HTTP and MCP. Nothing here imports vault or hub code.
 import { readFileSync } from "node:fs";
+import { test } from "bun:test";
 import { randomBytes } from "node:crypto";
 import { mintToken, type Services } from "../harness/services.ts";
 import { allowOrigins, safeFetch } from "../harness/guard.ts";
@@ -108,4 +109,50 @@ export async function mcp(url: string, token: string) {
     },
     close: () => client.close(),
   };
+}
+
+// ── v0.8 contracts that today's code fails ──────────────────────────────────────────────────────────────────
+
+/** Fail with a reason a red contract can be matched on. Prefer this to a bare expect() in `red` contracts. */
+export function must(ok: unknown, reason: string): asserts ok {
+  if (!ok) throw new Error(reason);
+}
+
+/**
+ * A contract v0.8 must meet and today's code doesn't, red for a stated reason.
+ *
+ * It passes only while the body fails with an error matching `reason`. If the body passes, it fails ("now green":
+ * the lane that made it pass removes `red` in the same pull request). If the body fails for another reason (a broken
+ * setup, a different bug), it fails too, so an expected failure can't hide one. In a release run
+ * (CONTRACT_RELEASE=1) every `red` contract runs as a plain test: release suites can't contain expected failures.
+ * RED_SHOW=1 also runs them plainly, to read why each fails.
+ */
+export function red(
+  name: string,
+  opts: { reason: RegExp; lane: string },
+  fn: () => Promise<unknown> | unknown,
+  timeout?: number,
+): void {
+  const label = `${name} [red today; lane ${opts.lane}]`;
+  if (process.env.CONTRACT_RELEASE === "1" || process.env.RED_SHOW === "1") {
+    test(label, fn as any, timeout);
+    return;
+  }
+  test(
+    label,
+    async () => {
+      let err: unknown = null;
+      try {
+        await fn();
+      } catch (e) {
+        err = e ?? new Error("thrown: " + String(e));
+      }
+      if (!err) throw new Error(`now green: "${name}" passes. Remove red() and move it on (lane ${opts.lane}).`);
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!opts.reason.test(msg)) {
+        throw new Error(`red for the wrong reason: expected ${opts.reason}, got: ${msg.slice(0, 1200)}`);
+      }
+    },
+    timeout,
+  );
 }

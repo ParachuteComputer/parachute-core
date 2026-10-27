@@ -119,6 +119,6 @@ describe("history", () => {
     const versions = (await api.get(`/notes/${note.id}/versions`)).body.versions;
     // Each saved version records who replaced it: the person replaced "a", then the operator replaced "bb".
     const replacedBy = Object.fromEntries(versions.map((v: any) => [v.content_len, v.actor]));
-    expect(replacedBy).toEqual({ 1: person, 2: "operator" });
+    expect(replacedBy).toEqual({ 1: person, 2: services().operatorActor ?? "operator" });
   });
 });

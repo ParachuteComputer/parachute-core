@@ -1,0 +1,71 @@
+diff --git i/src/api-mint-token.ts w/src/api-mint-token.ts
+index 791279a..e076437 100644
+--- i/src/api-mint-token.ts
++++ w/src/api-mint-token.ts
+@@ -162,6 +162,7 @@ export async function handleApiMintToken(req: Request, deps: ApiMintTokenDeps):
+   // 2. Bearer validation (signature, issuer, expiry, revocation).
+   let bearerSub: string;
+   let bearerScopes: string[];
++  let bearerPermissions: Record<string, unknown> | undefined;
+   try {
+     const validated = await validateAccessToken(
+       deps.db,
+@@ -173,6 +174,8 @@ export async function handleApiMintToken(req: Request, deps: ApiMintTokenDeps):
+       return jsonError(401, "unauthenticated", "bearer token has no sub claim");
+     }
+     bearerSub = sub;
++    const bp = (validated.payload as { permissions?: unknown }).permissions;
++    bearerPermissions = bp && typeof bp === "object" && !Array.isArray(bp) ? (bp as Record<string, unknown>) : undefined;
+     bearerScopes =
+       typeof validated.payload.scope === "string"
+         ? validated.payload.scope.split(/\s+/).filter((s) => s.length > 0)
+@@ -449,8 +452,20 @@ export async function handleApiMintToken(req: Request, deps: ApiMintTokenDeps):
+       return jsonError(400, "invalid_request", "permissions must be a JSON object");
+     }
+     permissionsClaim = body.permissions as Record<string, unknown>;
++    // fix 14: only the keys the vault enforces.
++    const unknownKeys = Object.keys(permissionsClaim).filter((k) => k !== "scoped_tags" && k !== "principal_pubkey");
++    if (unknownKeys.length) return jsonError(400, "invalid_request", `unknown permission key(s): ${unknownKeys.join(", ")}`);
+     permissionsCanonical = JSON.stringify(permissionsClaim);
+   }
++  // fix 13: never wider than the minter, tags included.
++  const minterTags = bearerPermissions?.scoped_tags;
++  if (Array.isArray(minterTags) && minterTags.length > 0) {
++    const asked = permissionsClaim?.scoped_tags;
++    const within = (t: unknown) => typeof t === "string" && minterTags.some((m) => t === m || t.startsWith(`${m}/`));
++    if (!Array.isArray(asked) || asked.length === 0 || !asked.every(within)) {
++      return jsonError(400, "invalid_scope", "a tag-scoped minter may only mint passes within its own tags");
++    }
++  }
+ 
+   // Derive the `vault_scope` pin. Collect the set of vault names `<N>` from
+   // every requested `vault:<N>:<verb>` scope that was authorized via a
+diff --git i/src/commands/auth.ts w/src/commands/auth.ts
+index 5d7b0d6..b7f9fca 100644
+--- i/src/commands/auth.ts
++++ w/src/commands/auth.ts
+@@ -1243,6 +1243,11 @@ async function runMintToken(args: readonly string[], deps: AuthDeps): Promise<nu
+         );
+         return 1;
+       }
++      const unknownKeys = Object.keys(parsed).filter((k) => k !== "scoped_tags" && k !== "principal_pubkey");
++      if (unknownKeys.length) {
++        console.error(`parachute auth mint-token: --permissions has unknown key(s) ${unknownKeys.join(", ")}; only scoped_tags and principal_pubkey are enforced`);
++        return 1;
++      }
+       permissions = JSON.stringify(parsed);
+     } catch (err) {
+       const msg = err instanceof Error ? err.message : String(err);
+diff --git i/src/commands/serve.ts w/src/commands/serve.ts
+index 2932f60..14ea30d 100644
+--- i/src/commands/serve.ts
++++ w/src/commands/serve.ts
+@@ -629,7 +629,7 @@ export async function serve(opts: ServeOpts = {}): Promise<{
+   // Containers default to 0.0.0.0 so the platform's HTTP forwarder can
+   // reach us; the `--hostname` flag / PARACHUTE_BIND_HOST is the escape
+   // hatch for setups that want loopback-only inside a sidecar.
+-  const hostname = env.PARACHUTE_BIND_HOST || "0.0.0.0";
++  const hostname = env.PARACHUTE_BIND_HOST || "127.0.0.1"; // fix 2: loopback by default
+ 
+   // Ensure the well-known dir exists, and (re)write the static hub.html so `/`
+   // serves something coherent on a fresh disk (the dynamic path through
