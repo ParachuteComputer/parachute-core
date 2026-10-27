@@ -15,6 +15,11 @@ bun run v1           # the v1 contracts: decided behaviour that today's code lac
 bun run mutants      # break today's vault five ways and check the contracts catch each one
 bun run selftest     # the harness's own safety checks (below)
 bun run typecheck
+
+bun run build:stock      # build today's code as a candidate (.cache/candidate-stock)
+bun run candidate        # every suite against that candidate, in a sandbox (below)
+bun run prism-compat     # Benjamin's compatibility suite against the candidate
+bun run mutants:candidate  # mutants and flips on rebuilt candidates
 ```
 
 `bun run today -- suites/today/notes.test.ts` runs one file. `--keep` keeps the temp home afterwards. The first
@@ -54,6 +59,57 @@ What keeps a run away from the live install, each held by a test in `harness/sel
 
 To run the contracts against something else (a build of this repo, a cloud deployment), write a services file in
 the `Services` shape and run `CONTRACT_SERVICES=<file> bun test ./suites/today`.
+
+## The candidate (v0.8)
+
+The pinned run above helps the code under test: it writes `hub/run/hub.port` and `vault/config.yaml`, starts the hub
+with its supervisor off and the vault by hand. That hides exactly the issuer, supervisor and process-model bugs v0.8
+changes. So v0.8's suites run against **the candidate**: a built `parachute`, launched the way a user launches it.
+
+- **A candidate** is a folder with `bin/parachute`, `bin/parachute-vault` and `CANDIDATE.json` (what it is, and a
+  sha256 of every other file). Until lane A1 moves the code in, `bun run build:stock` builds today's hub and vault
+  from `pins.json` into that layout. A1's build will write the same manifest with profile `v0.8`.
+- **`bun run candidate`** (`harness/run-candidate.ts`) refuses a candidate whose bytes don't match its manifest, or
+  `CANDIDATE_SHA256` (CI passes the hash its build step produced). Then it starts a box: `parachute-vault create`, then
+  `parachute serve` on a random port with the hub supervising its vault. An admin pass is minted with the real CLI.
+  It checks that every listening socket belongs to a process started from the candidate folder. It prints the hash,
+  the source, the process model (as built and as seen) and any workaround, and hashes the candidate again after the
+  run. The stock profile needs two workarounds, both fix 1, printed every run: it writes `hub/run/hub.port`, and it sets
+  `PARACHUTE_HUB_JWKS_ORIGIN` (a hub-started vault otherwise looks for keys on :1939). A `v0.8` candidate may need none.
+- **The sandbox** (`harness/sandbox.ts`): every candidate run re-executes itself under `unshare` in its own network
+  and PID namespace. Today's box puts its vault on :1940 whatever the hub's port, and a box like uni has its live
+  vault there. Inside, only loopback exists, plus a dummy interface holding the default route. An nftables counter
+  counts every packet that tries to leave (`outboundPackets()`). The guard still refuses 1939–1946. On Ubuntu 24.04
+  runners, CI turns off AppArmor's unprivileged user-namespace restriction first.
+- **Suites that start the candidate themselves** (`embedded/`, `lifecycle/`) use `suites/candidate-lib.ts`:
+  `newHome()`, `cli()`, `start()`, `listeners()`, `outboundPackets()`.
+
+### Red today: `red()`
+
+v0.8's contracts are written before the code, so most are red on today's code. `red(name, {reason, lane}, fn)`
+(`suites/lib.ts`) wraps such a contract:
+- it passes only while the body fails with an error matching `reason`;
+- if the body passes, it fails with `now green`, and the lane that made it pass removes `red()` in the same PR;
+- if the body fails for another reason, it fails too, so a broken setup can't pass as an expected failure;
+- with `CONTRACT_RELEASE=1` it is a plain test, because release suites can't contain expected failures;
+- `RED_SHOW=1` runs them plainly, to read why each fails.
+
+Use `must(cond, "reason")` so the reason can be matched.
+
+### Benjamin's suite
+
+`bun run prism-compat` runs Prism's `scripts/parachute-compat/run.mjs` unchanged against the candidate, inside the
+sandbox. It is fetched at the commit in `pins.json` and never copied here (it is his code, under his licence). It is
+the Nov 9 gate: 0 FAIL from slice 1 on. Until then, each FAIL today's code gets is listed in
+`prism-compat-expected.json` with its reason and lane. The run fails on any FAIL that isn't listed, and on any listed
+one that now passes.
+
+### Mutants and flips on the candidate
+
+`bun run mutants:candidate` applies each mutant to the pinned source, rebuilds the candidate, and requires the named
+contracts to go red (`harness/mutants.ts`). **Flips** go the other way: a small fix to today's code that must turn
+named `red()` contracts "now green". A contract that is red today and green under the fix has a red/green proof
+that it tests the fix.
 
 ## The contracts
 
