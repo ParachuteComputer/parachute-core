@@ -36,8 +36,12 @@ export interface CandidateManifest {
 /** What a suite needs to start the candidate itself (embedded/, lifecycle/): written to CONTRACT_CANDIDATE. */
 export interface CandidateInfo {
   dir: string;
-  bin: string; // <dir>/bin/parachute
-  vaultBin: string; // <dir>/bin/parachute-vault
+  /** What suites run: a launcher in the scratch folder that records its pid in `launchLog`, then execs
+   *  <dir>/bin/parachute (or parachute-vault). The pid stays the same, so the watcher knows what was launched as the
+   *  candidate even if it execs into something else (watchAttribution). */
+  bin: string;
+  vaultBin: string;
+  launchLog: string;
   runtimeDir: string; // a folder holding only `bun`, for PATH
   scratch: string; // where suites make throwaway homes
   /** Today's stock 0.7 build, for "the old programs" (takeover, identity, rollback to stock): the candidate itself
@@ -391,6 +395,21 @@ export async function startCandidateBox(info: CandidateInfo, opts: { keep?: bool
   }
 }
 
+/** Launchers for bin/parachute and bin/parachute-vault that record their pid before exec (see CandidateInfo.bin). */
+export function makeLaunchers(dir: string, scratch: string): { bin: string; vaultBin: string; launchLog: string } {
+  const launchDir = join(scratch, "launch");
+  mkdirSync(launchDir, { recursive: true });
+  const launchLog = join(scratch, "launches");
+  writeFileSync(launchLog, "");
+  const q = (x: string) => `'${x.replace(/'/g, `'\\''`)}'`;
+  const make = (name: string) => {
+    const at = join(launchDir, name);
+    writeFileSync(at, `#!/bin/sh\necho $$ >> ${q(launchLog)}\nexec ${q(join(dir, "bin", name))} "$@"\n`, { mode: 0o755 });
+    return at;
+  };
+  return { bin: make("parachute"), vaultBin: make("parachute-vault"), launchLog };
+}
+
 /** Make the CandidateInfo for a loaded candidate: a scratch folder and a runtime folder holding only Bun. */
 export function prepareInfo(dir: string, manifest: CandidateManifest, sha256: string): CandidateInfo {
   const scratch = mkdtempSync(join(process.env.TMPDIR ?? tmpdir(), "pcore-candidate-"));
@@ -399,10 +418,10 @@ export function prepareInfo(dir: string, manifest: CandidateManifest, sha256: st
   // Only Bun: the folder it usually lives in (~/.bun/bin) also holds a globally installed `parachute`.
   symlinkSync(process.execPath, join(runtimeDir, "bun"));
   const d = resolve(dir);
+  const launch = makeLaunchers(d, scratch);
   return {
     dir: d,
-    bin: join(d, "bin", "parachute"),
-    vaultBin: join(d, "bin", "parachute-vault"),
+    ...launch,
     runtimeDir,
     scratch,
     oldStockDir: resolve(process.env.OLD_STOCK_DIR ?? (manifest.profile === "stock-0.7" ? d : join(import.meta.dir, "..", ".cache", "candidate-stock"))),
@@ -439,9 +458,11 @@ function listeningInodesOf(pid: number, cache: Map<string, Set<string>>): Set<st
 
 /**
  * Watches the sandbox while the suites run. Any process that holds a listening socket and comes from a launch of the
- * candidate must itself be the candidate (`notCandidate`). A launch is a process run from the candidate folder, or
- * one running in the candidate's environment (its bin/ on PATH, as candidateEnv() sets and children inherit), or a
- * descendant of either. So a candidate that hands its work to code outside its folder (a global install found
+ * candidate must itself be the candidate (`notCandidate`). A launch is a pid the launchers recorded (so a launch that
+ * execs into other code, with whatever environment, is still known), a process run from the candidate folder, one
+ * running in the candidate's environment (its bin/ on PATH, as candidateEnv() sets and children inherit), or a
+ * descendant of any of these seen while its parent lived. What it can't see: a launch that forks, exits, and leaves
+ * a child with a cleaned environment before the first sample; the sandbox, not this watcher, is the safety boundary. So a candidate that hands its work to code outside its folder (a global install found
  * on PATH, say) is caught whichever suite started it. It samples every 250 ms, so a listener that lives for less than
  * that can go unseen.
  */
@@ -451,6 +472,11 @@ export function watchAttribution(info: CandidateInfo): { stop(): string[] } {
   const inside = (f: string) => f === dir || f.startsWith(dir + "/");
   const problems = new Set<string>();
   const launches = new Set<number>(); // remembered across samples: a launcher may exec into something else
+  const registered = () => {
+    try {
+      for (const l of readFileSync(info.launchLog, "utf8").split("\n")) if (/^\d+$/.test(l)) launches.add(Number(l));
+    } catch {}
+  };
   const candidatePath = (pid: number) => {
     try {
       const path = readFileSync(`/proc/${pid}/environ`, "utf8").split("\0").find((e) => e.startsWith("PATH="));
@@ -460,6 +486,7 @@ export function watchAttribution(info: CandidateInfo): { stop(): string[] } {
     }
   };
   const scan = () => {
+    registered();
     const procs = new Map<number, { ppid: number; launch: boolean; facts: ProcFacts | null }>();
     for (const name of readdirSync("/proc")) {
       if (!/^\d+$/.test(name)) continue;

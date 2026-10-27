@@ -506,13 +506,15 @@ function stopScenario(label: string, fault: (box: Box, s: Serve) => Promise<void
       // goes after the fault; whichever get 201 must survive too.
       const holding = await holdWrites(box, 5);
       await fault(box, s);
-      const inFlight = await holding.release();
-      acked.push(...inFlight.acked);
+      // The deadline runs from the fault, while the held writes finish: draining them doesn't buy serve more time.
       const deadline = opts.deadline ?? 10_000;
       // Under a parent, `s` is the parent (now dead); serve's status comes from its observer.
-      const exit = s.status
-        ? (await until(() => s.status!() !== undefined, deadline, 100)) ? s.status()! : null
-        : await exitWithin(s, deadline);
+      const exited = s.status
+        ? until(() => s.status!() !== undefined, deadline, 100).then((ok) => (ok ? s.status!()! : null))
+        : exitWithin(s, deadline);
+      const inFlight = await holding.release();
+      acked.push(...inFlight.acked);
+      const exit = await exited;
       const running = exit === null ? [`serve still running ${deadline / 1000} s after ${label}`] : await leftRunning(box);
       const disk = exit === null ? [] : leftOnDisk(box);
       for (const p of box.processes()) process.kill(p.pid, "SIGKILL"); // whatever is left, so the restart is fair

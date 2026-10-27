@@ -99,7 +99,7 @@ describe("sandbox", () => {
 });
 
 describe("attribution during a run", () => {
-  test("a listener a candidate launch hands off to outside the candidate is flagged; one inside is not", async () => {
+  test("a listener a candidate launch hands off to outside the candidate is flagged, even with a cleaned environment; one inside is not", async () => {
     const p = Bun.spawn(["bun", join(import.meta.dir, "attribution-probe.ts")], { stdout: "pipe", stderr: "pipe", env: { ...process.env, PCORE_SANDBOX: "" } });
     const [out, err, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
     expect(code, err).toBe(0);
@@ -107,5 +107,7 @@ describe("attribution during a run", () => {
     expect(r.inside).toEqual([]);
     expect(r.handOff.length).toBe(1);
     expect(r.handOff[0]).toMatch(/outside the candidate/);
+    expect(r.cleanHandOff.length).toBe(1);
+    expect(r.cleanHandOff[0]).toMatch(/outside the candidate/);
   }, 30_000);
 });
