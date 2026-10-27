@@ -1,0 +1,12 @@
+{
+  "name": "@openparachute/cli",
+  "version": "0.8.0-dev.0",
+  "description": "The parachute-core command: one entry for the hub's and the vault's commands.",
+  "private": true,
+  "type": "module",
+  "license": "AGPL-3.0-or-later",
+  "dependencies": {
+    "@openparachute/hub": "workspace:*",
+    "@openparachute/vault": "workspace:*"
+  }
+}

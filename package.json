@@ -1,0 +1,23 @@
+{
+  "name": "@openparachute/core",
+  "version": "0.8.0-dev.0",
+  "description": "Parachute: one program for the vault and the hub. Command: parachute-core.",
+  "private": true,
+  "type": "module",
+  "license": "AGPL-3.0-or-later",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ParachuteComputer/parachute-core.git"
+  },
+  "workspaces": ["packages/cli", "packages/vault", "packages/hub", "packages/hub/packages/*"],
+  "bin": {
+    "parachute-core": "packages/cli/bin/parachute-core"
+  },
+  "trustedDependencies": ["onnxruntime-node", "protobufjs"],
+  "scripts": {
+    "prepare": "bun run build",
+    "build": "bun run --cwd packages/hub build:packages && bun run --cwd packages/hub/packages/scope-guard build",
+    "candidate": "bun run --cwd contracts build:core",
+    "test:cli": "bun test ./packages/cli"
+  }
+}

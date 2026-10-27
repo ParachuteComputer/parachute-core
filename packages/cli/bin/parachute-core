@@ -1,0 +1,5 @@
+#!/bin/sh
+# `parachute-core` (packages/cli/src/dispatch.ts), run with the Bun on PATH. This folder goes first on PATH, so the vault
+# the hub starts (`parachute-vault serve`) and every other command the hub runs by name is this install's own.
+here="$(dirname "$(readlink -f "$0")")"
+PATH="$here:$PATH" exec bun "$here/../src/parachute-core.ts" "$@"

@@ -1,0 +1,4 @@
+[install]
+# Hoisted, as the vault's own repo installed (a single package). The isolated layout Bun uses for workspaces would
+# hide any dependency the vault or hub uses without declaring it; that is a change for later, not for the move.
+linker = "hoisted"
