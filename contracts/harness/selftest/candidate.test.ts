@@ -49,6 +49,11 @@ describe("candidate adapter", () => {
       expect((await loadCandidate(d, oldStockWant())).sha256).toBe(own);
       process.env.OLD_STOCK_SHA256 = "1".repeat(64);
       await expect(loadCandidate(d, oldStockWant())).rejects.toThrow(/but this CI build produced/);
+      // A local run with only the candidate's hash set: the old programs are checked against their manifest.
+      delete process.env.OLD_STOCK_SHA256;
+      expect((await loadCandidate(d, oldStockWant())).sha256).toBe(own);
+      // The candidate under test still gets CANDIDATE_SHA256 when no hash is passed.
+      await expect(loadCandidate(d)).rejects.toThrow(/but this CI build produced/);
     } finally {
       delete process.env.CANDIDATE_SHA256;
       delete process.env.OLD_STOCK_SHA256;

@@ -16,8 +16,8 @@ const DEPARTURES: Record<string, string> = {
   "packages/vault/bun.lock: otpauth@9.5.0": "one otpauth for both: the hub's 9.5.1 (a patch release; ^9.5.0 accepts it)",
   "packages/vault/bun.lock: @noble/hashes@2.0.1": "otpauth 9.5.1 pins @noble/hashes 2.2.0 exactly, and the hub's @noble/curves pins 2.3.0",
   "packages/vault/bun.lock: @emnapi/runtime@1.11.2": "the hub's 1.10.0: a WebAssembly runtime only the wasm builds of native packages load",
-  "packages/hub/bun.lock: @types/bun@1.3.12": "types only (the vault's 1.3.11)",
-  "packages/hub/bun.lock: bun-types@1.3.12": "types only (the vault's 1.3.11)",
+  "packages/hub/bun.lock: @types/bun@1.3.12": "types only: the hub asks for \"latest\", which resolves to 1.4.4 at the root (the vault keeps its 1.3.11, nested)",
+  "packages/hub/bun.lock: bun-types@1.3.12": "types only: 1.4.4, with @types/bun",
   "packages/hub/bun.lock: @types/node@25.6.0": "types only (the vault's 25.5.0)",
   "packages/hub/bun.lock: undici-types@7.19.2": "types only (the vault's 7.18.2)",
 };
