@@ -1,0 +1,1783 @@
+/**
+ * Branded HTML templates for the OAuth login + consent + error screens.
+ *
+ * Pulled out of `oauth-handlers.ts` so the handlers stay focused on protocol
+ * logic and the templates stay focused on presentation. Pure functions —
+ * no DB access, no side channels.
+ *
+ * Design choices:
+ *   - **No external font CDN.** OAuth screens see who's logging in and what
+ *     they're authorizing; loading fonts from Google would leak that to a
+ *     third party. We use system-font fallbacks that approximate the
+ *     parachute.computer brand (Instrument Serif → Georgia for headings,
+ *     DM Sans → -apple-system for body, ui-monospace for `<code>`).
+ *   - **Inline CSS in `<style>`.** Single-file delivery; no extra round-trip
+ *     for a stylesheet, no caching headaches when the hub is bound to a
+ *     loopback origin.
+ *   - **Scope explanations come from `scope-explanations.ts`.** First-party
+ *     scopes get a one-sentence operator-facing label; admin scopes get a
+ *     red border so the operator looks twice. Unknown scopes (third-party
+ *     module scopes that the hub doesn't know about) render verbatim.
+ *   - **No JavaScript.** Entirely form-based. Submit is the only interaction.
+ */
+import { WORDMARK_TEXT, brandMarkSvg } from "./brand.ts";
+import { renderCsrfHiddenInput } from "./csrf.ts";
+import { NOSTR_LOGIN_STYLES, renderNostrKeyDoor } from "./nostr-login-ui.ts";
+import { type ScopeExplanation, explainScope, riskForExplanation } from "./scope-explanations.ts";
+
+/** Brand palette — kept in sync with parachute.computer/style.css. */
+const PALETTE = {
+  bg: "#faf8f4",
+  bgSoft: "#f3f0ea",
+  fg: "#2c2a26",
+  fgMuted: "#6b6860",
+  fgDim: "#9a9690",
+  accent: "#4a7c59",
+  accentHover: "#3d6849",
+  accentSoft: "rgba(74, 124, 89, 0.08)",
+  border: "#e4e0d8",
+  borderLight: "#ece9e2",
+  cardBg: "#ffffff",
+  danger: "#a3392b",
+  dangerSoft: "rgba(163, 57, 43, 0.08)",
+  // Amber for "full control of ONE vault" — previously this rendered in
+  // `danger` red, the same as account-wide authority, so the consent screen
+  // gave its loudest signal to the scope most integrations legitimately need.
+  // When everything urgent is red, nothing is.
+  caution: "#8a6414",
+  cautionSoft: "rgba(138, 100, 20, 0.09)",
+} as const;
+
+const FONT_SERIF = `Georgia, "Times New Roman", serif`;
+const FONT_SANS = `-apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif`;
+const FONT_MONO = `ui-monospace, "SF Mono", Menlo, Monaco, "Cascadia Mono", monospace`;
+
+export function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+export interface AuthorizeFormParams {
+  clientId: string;
+  redirectUri: string;
+  responseType: string;
+  scope: string;
+  codeChallenge: string;
+  codeChallengeMethod: string;
+  state: string | null;
+  /**
+   * RFC 8707 resource indicator. Carried through the login → consent →
+   * form-post round-trip so the resource-bound vault narrowing survives a
+   * sign-in redirect. Null when the client sent no `resource` param.
+   */
+  resource: string | null;
+}
+
+export interface LoginViewProps {
+  params: AuthorizeFormParams;
+  errorMessage?: string;
+  csrfToken: string;
+}
+
+export interface ConsentViewProps {
+  params: AuthorizeFormParams;
+  clientName: string;
+  clientId: string;
+  scopes: string[];
+  csrfToken: string;
+  /**
+   * Set when the request includes one or more unnamed `vault:<verb>` scopes.
+   * The consent screen renders a vault selector; on submit, the picked vault
+   * narrows every unnamed scope to `vault:<picked>:<verb>` (Q1 of the
+   * vault-config-and-scopes design — force the picker, don't default).
+   */
+  vaultPicker?: VaultPicker;
+  /**
+   * Named-vault display: substitute unnamed `vault:<verb>` rows with
+   * `vault:<displayVault>:<verb>` in the rendered scope list so the user
+   * sees the scope shape that will actually be minted into the token. The
+   * raw `scopes` value still drives the form-roundtrip; this only changes
+   * what the operator reads.
+   *
+   * - Non-admin user (assigned_vault set): pass the assigned vault name so
+   *   the row reads `vault:my-vault:read`.
+   * - Admin user with a single vault available + the picker pre-checks the
+   *   first option: pass that name so the displayed scope matches what the
+   *   default-Approve will mint.
+   * - Admin user with multiple vaults / no obvious default: pass `null` (or
+   *   omit) and the row renders as `vault:<TBD>:read` with a tooltip
+   *   pointing at the picker. Same explanation either way.
+   *
+   * Closes the "raw scope display" leg of the approval-UX bug — silent
+   * narrowing at mint surprised operators who thought they were granting
+   * vault-wide access. Now they see the named form on the consent screen
+   * itself.
+   */
+  displayVault?: string | null;
+  /**
+   * Multi-user Phase 1 (hub#284): set when the signed-in user's
+   * `assigned_vault` no longer matches a vault registered on this hub.
+   * The hub-side fallout of an admin removing / renaming a vault that's
+   * still pinned to one or more users — the user's locked picker would
+   * otherwise post the stale name and the server-side defense at
+   * `handleConsentSubmit` rejects it with a generic "Unknown vault" 400
+   * that doesn't tell the user what to do next.
+   *
+   * Renders a warning banner above the scope list explaining the state +
+   * pointing the user at admin remediation, and the picker section
+   * substitutes the no-vaults-available shape (`availableVaults: []`,
+   * `lockedVault: undefined`) so the form gracefully rejects an Approve
+   * click instead of silently submitting the missing vault name.
+   */
+  staleAssignedVault?: string;
+  /**
+   * Set when `staleAssignedVault` is set AND the requested scope depends
+   * on a vault (unnamed `vault:<verb>` that needs the picker, or a named
+   * `vault:<staleAssignedVault>:<verb>` requested by the client). When
+   * true, the Approve button renders disabled — the user can't validly
+   * mint a token against a vault that doesn't exist. When the banner
+   * fires for a non-vault-scoped request (e.g. consenting to
+   * `scribe:transcribe` while assignment is stale), this stays false and
+   * the user can still proceed.
+   */
+  blockApproveForStaleAssignment?: boolean;
+  /**
+   * Multi-user (hub#431): false when the signed-in user can't authorize this
+   * request at all — a non-admin with zero assigned vaults requesting a vault
+   * scope (named or unnamed). The POST handler already 400s this case ("No
+   * vaults assigned"); this flag lets the consent screen render Approve
+   * disabled + show explanatory copy instead of an enabled button that lands
+   * the user on an error page. Defaults to authorizable when omitted.
+   */
+  userCanAuthorizeRequest?: boolean;
+  /**
+   * Scopes the consenting user MAY grant beyond what the client requested,
+   * already capped to their authority by `grantableExtraScopes`. Rendered as
+   * an opt-in checklist so a user can grant access the client didn't know to
+   * ask for — notably `account:self:*`, which no third-party client requests
+   * but an operator may well want to delegate. Empty/absent → section hidden.
+   */
+  grantableExtras?: readonly string[];
+  /**
+   * hub#314 — same-hub vs external trust marker. True when the requesting
+   * client was registered through this hub's own flow / first-party install
+   * (`OAuthClient.sameHub` — bearer `hub:admin` OR session-cookie +
+   * same-origin DCR). False for a third-party Dynamic Client Registration
+   * (an external app, e.g. Claude.ai, that self-registered). Drives a small
+   * trust badge in the consent card header so the operator knows the trust
+   * level of the app they're approving before they click Approve.
+   *
+   * Omitted / undefined → no badge (provenance unknown; only the GET-handler
+   * call site, which always has the client row, populates it). Provenance is
+   * a clean DB-backed signal — see the `same_hub` column on `clients` and the
+   * `consentProps` call site in `oauth-handlers.ts`.
+   */
+  sameHub?: boolean;
+}
+
+/**
+ * Radio value for "all assigned vaults". Colon is outside
+ * `VAULT_NAME_CHARSET_RE` (`[a-z0-9_-]+`), so this cannot collide with a
+ * vault name. Underscores alone would not be a safe sentinel — `__account__`
+ * is a legal vault name.
+ */
+export const VAULT_PICK_ACCOUNT = ":account:";
+
+export interface VaultPicker {
+  /** Verbs (`read`, `write`, `admin`) requested in unnamed shape. */
+  unnamedVerbs: string[];
+  /** Vault names registered on this host. Empty → caller can't approve. */
+  availableVaults: string[];
+  /**
+   * Multi-user Phase 1 (design 2026-05-20-multi-user-phase-1.md, decision-pin
+   * "consent picker for non-admin users"): set when the signed-in user has a
+   * non-null `assigned_vault`. The picker renders the vault name as a
+   * read-only label with an admin-managed note instead of the free dropdown
+   * — the user can't choose a different vault. The form still POSTs the
+   * locked value via `vault_pick` so the server-side defense in
+   * `handleConsentSubmit` (which refuses mints whose picked vault disagrees
+   * with the user's `assigned_vault`) sees an unambiguous value.
+   *
+   * Admin users (assigned_vault === null) leave this undefined and see the
+   * full dropdown — existing behavior.
+   */
+  lockedVault?: string;
+  /**
+   * Phase 2 PR 2 reviewer fold: set when the empty `availableVaults` is the
+   * "non-admin user has no vault assignments yet" shape (not "no vaults
+   * exist on the hub"). Swaps the picker empty-state copy from the admin-
+   * remediation hint (`parachute-vault create ...`) to a user-facing
+   * "ask your admin to assign you a vault" message. Only meaningful when
+   * `availableVaults.length === 0`.
+   */
+  emptyReason?: "no-assignments" | "no-vaults-on-hub";
+}
+
+export interface ErrorViewProps {
+  title: string;
+  message: string;
+  status: number;
+}
+
+/**
+ * Props for the "App not yet approved" view rendered when an unapproved
+ * client lands on `/oauth/authorize`. Two-branch UI:
+ *
+ *   - Authenticated admin (operator session present + same-origin) — render
+ *     the inline approve form (closes #208). One click flips the client to
+ *     `approved` and re-enters the OAuth flow at consent.
+ *   - Unauthenticated viewer — render TWO CTAs (no terminal mention):
+ *       1. Primary: "Sign in as admin to approve" → links to
+ *          `/login?next=<loginNextUrl>`. When the page was rendered in
+ *          response to an `/oauth/authorize?...` request, `loginNextUrl`
+ *          is that same authorize URL (pathname+search) so the operator
+ *          lands BACK on the OAuth flow after sign-in — now authenticated,
+ *          they see the inline "Approve" form, click once,
+ *          and the OAuth flow resumes through consent → redirect_uri.
+ *          Without this, post-login the operator lands on the SPA approve
+ *          page, which approves the client but discards the original
+ *          authorize URL and its params — Claude is never told, the user
+ *          retries, and the prompt loop never closes (the bug Aaron hit
+ *          via Claude.ai MCP on the Render deploy).
+ *
+ *          Callers that don't pass `loginNextUrl` (the deep-link share-
+ *          page entry point, or hand-crafted callers) fall back to the
+ *          legacy SPA approve path; that's still useful for the
+ *          "share with another admin" case, just not for resuming an
+ *          in-flight OAuth flow.
+ *       2. Secondary: a fully-qualified shareable deep link to
+ *          `<hub_origin>/admin/approve-client/<client_id>` with a copy
+ *          button — the operator can send it to whoever runs the hub.
+ *          This deep link intentionally stays SPA-routed (it has no
+ *          authorize-URL context to preserve — the recipient isn't in
+ *          an OAuth flow).
+ *
+ *   The CLI fallback (`parachute auth approve-client <id>`) was retired —
+ *   the web path is the path now. Operators who want the CLI still have it
+ *   in the shell; we no longer point new users there from the browser.
+ */
+export interface ApprovePendingViewProps {
+  /** Display name to show — falls back to client_id when no name was supplied at DCR. */
+  clientName: string;
+  clientId: string;
+  redirectUris: string[];
+  /** Scopes parsed from the original `/oauth/authorize?scope=` query param. */
+  requestedScopes: string[];
+  /**
+   * Vault hint from the original `/oauth/authorize?vault=<name>` query param,
+   * passed by Notes' VaultPopover (notes#115) when kicking the OAuth flow for
+   * a specific vault. Rendered alongside scopes so the operator can tell
+   * which vault they're approving access for on a multi-vault hub (closes
+   * #244). Single-vault hubs leave this absent and the section omits.
+   */
+  requestedVault?: string;
+  /**
+   * Fully-qualified hub origin used to build the shareable approval
+   * deep-link in the unauthenticated branch. Required because the link
+   * the operator copies needs to work when opened in a different browser
+   * session — only the absolute URL gets that.
+   */
+  hubOrigin: string;
+  /**
+   * When set, render the inline approve form. The form posts to
+   * `/oauth/authorize/approve` with the CSRF token + a `return_to` URL the
+   * server will redirect to after the approve commits — the original
+   * `/oauth/authorize?...` URL so the OAuth flow re-enters with the now-
+   * approved client and lands on the consent screen.
+   *
+   * Deny path (closes hub#390): the same form also surfaces a Deny button.
+   * `redirectUri` + `state` are plumbed through as hidden inputs so the deny
+   * handler can construct an RFC 6749 §4.1.2.1 error redirect back to the
+   * calling client (`<redirect_uri>?error=access_denied&state=<state>`).
+   * `redirectUri` is required because deny must signal back to the client;
+   * `state` may be undefined (OAuth clients sometimes omit it).
+   */
+  approveForm?: {
+    csrfToken: string;
+    returnTo: string;
+    redirectUri: string;
+    state?: string;
+  };
+  /**
+   * Same-origin hub-relative URL (path + search) to send the operator to
+   * after they sign in via the unauthenticated "Sign in as admin to
+   * approve" CTA. When this page is rendered in response to an
+   * `/oauth/authorize?...` GET, the caller should pass that authorize
+   * URL here so post-login the operator lands BACK on the OAuth flow
+   * (now authenticated → sees inline approve form → one click → consent →
+   * redirect_uri callback). Omitted → CTA falls back to the legacy
+   * `/login?next=/admin/approve-client/<id>` path which dead-ends the
+   * OAuth flow at the SPA approve page (kept only for back-compat with
+   * non-authorize callers).
+   *
+   * The path is validated server-side at `/login` via `safeNext`
+   * (`src/admin-handlers.ts`), which only honors hub-relative paths
+   * starting with `/` and excluding `//` — so an attacker-controlled
+   * authorize URL can't be wielded for open-redirect.
+   */
+  loginNextUrl?: string;
+}
+
+export function renderLogin(props: LoginViewProps): string {
+  const { params, errorMessage, csrfToken } = props;
+  const error = errorMessage ? `<p class="error-banner">${escapeHtml(errorMessage)}</p>` : "";
+  const body = `
+    <div class="card">
+      <div class="card-header">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">${brandMarkSvg(20, "oauth")}</span>
+          <span class="brand-name">${WORDMARK_TEXT}</span>
+        </div>
+        <h1>Sign in</h1>
+        <p class="subtitle">to continue to your hub</p>
+      </div>
+      ${error}
+      <form method="POST" action="/oauth/authorize" class="auth-form">
+        <input type="hidden" name="__action" value="login" />
+        ${renderCsrfHiddenInput(csrfToken)}
+        ${renderHiddenInputs(params)}
+        <label class="field">
+          <span class="field-label">Username</span>
+          <input type="text" name="username" autocomplete="username" autofocus required />
+        </label>
+        <label class="field">
+          <span class="field-label">Password</span>
+          <input type="password" name="password" autocomplete="current-password" required />
+        </label>
+        <button type="submit" class="btn btn-primary">Sign in</button>
+      </form>
+      ${renderNostrKeyDoor()}
+    </div>`;
+  return baseDocument("Sign in to Parachute Hub", body);
+}
+
+export function renderConsent(props: ConsentViewProps): string {
+  const {
+    params,
+    clientName,
+    clientId,
+    scopes,
+    vaultPicker,
+    csrfToken,
+    displayVault,
+    staleAssignedVault,
+    blockApproveForStaleAssignment,
+    userCanAuthorizeRequest,
+    grantableExtras,
+    sameHub,
+  } = props;
+  // Substitute unnamed `vault:<verb>` rows with the resolved named form so
+  // the operator sees the scope shape that will appear in the token. Raw
+  // `scopes` keeps the wire form for the hidden form fields; only what's
+  // rendered changes. See `ConsentViewProps.displayVault`.
+  const seenScopeKeys = new Set<string>();
+  const uniqueScopes = scopes.filter((scope) => {
+    const key = canonicalConsentScope(scope, displayVault);
+    if (seenScopeKeys.has(key)) return false;
+    seenScopeKeys.add(key);
+    return true;
+  });
+  const displayedScopes = uniqueScopes.map((scope) => canonicalConsentScope(scope, displayVault));
+  const scopeRows =
+    displayedScopes.length === 0
+      ? // A client may legally omit `scope` (RFC 6749 §3.3), and MCP clients
+        // often do. Approving that used to mint a ZERO-SCOPE token: a
+        // credential that looks like success and can do nothing. Say what's
+        // actually happening and point at the checklist below, which is the
+        // only way this flow can produce a useful token.
+        `<li class="scope scope-empty">This app didn't ask for any specific access. Choose what to grant below — without a selection its token won't be able to do anything.</li>`
+      : uniqueScopes.map((wire, i) => renderScopeRow(wire, displayedScopes[i] ?? wire)).join("\n");
+  const extrasSection = renderGrantableExtras(grantableExtras ?? [], displayedScopes.length === 0);
+  const pickerSection = vaultPicker ? renderVaultPicker(vaultPicker) : "";
+  // Approve is disabled when the picker can't yield a valid vault. The
+  // empty-vault branch (no vaults registered) is the original case. A
+  // locked-vault picker (multi-user Phase 1) always has a valid value via
+  // the hidden input, so Approve stays enabled.
+  //
+  // Stale-assignment case (hub#284): the user's assigned_vault no longer
+  // exists in services.json, so even though the GET handler resolved
+  // `assignedVault` for the session user, we deliberately omit `lockedVault`
+  // from the picker and present `availableVaults: []` instead — the user
+  // can't validly Approve without admin remediation. Disabling Approve
+  // matches the empty-vault posture so a form submit never sends a vault
+  // name that the server-side defense would reject as Unknown vault.
+  // `blockApproveForStaleAssignment` is set by the handler only when the
+  // requested scope actually depends on a vault — non-vault flows (e.g.
+  // `scribe:transcribe` only) keep Approve enabled so the user can still
+  // proceed despite the informational banner.
+  // Zero-vault non-admin requesting a vault scope (hub#431): the POST handler
+  // refuses with 400 "No vaults assigned", so render Approve disabled rather
+  // than leading the user to click into an error page.
+  const cannotAuthorize = userCanAuthorizeRequest === false;
+  const approveDisabled =
+    (vaultPicker &&
+      vaultPicker.lockedVault === undefined &&
+      vaultPicker.availableVaults.length === 0) ||
+    blockApproveForStaleAssignment === true ||
+    cannotAuthorize
+      ? " disabled"
+      : "";
+  // Banner copy (hub#284). Worded to the *user* — "ask the admin" framing
+  // matches the user-facing tone of the rest of the consent screen. The
+  // vault name is HTML-escaped before insertion; the issue's pinned scope is
+  // a user-actionable message rather than the pre-rc.11 generic 400.
+  const staleBanner =
+    staleAssignedVault !== undefined
+      ? `<p class="stale-assignment-banner" role="alert">
+            <strong>Your assigned vault was removed.</strong>
+            The vault <code>${escapeHtml(staleAssignedVault)}</code> is no longer
+            registered on this hub. Ask the hub admin to reassign you to an
+            existing vault via <code>/admin/users</code>, then try signing in
+            again.
+          </p>`
+      : "";
+  // No-vaults-assigned banner (hub#431). Shown when a non-admin with zero
+  // assigned vaults requests a vault scope — Approve is disabled above, this
+  // explains why and points at admin remediation.
+  const noVaultsBanner = cannotAuthorize
+    ? `<p class="stale-assignment-banner" role="alert">
+            <strong>You have no assigned vaults.</strong>
+            Ask the hub admin to assign you a vault via <code>/admin/users</code>
+            before authorizing vault access.
+          </p>`
+    : "";
+  // hub#314 — same-hub vs external trust marker. `sameHub === true` means the
+  // client was registered through this hub's own flow (first-party / operator-
+  // authenticated DCR); `false` means a third-party app self-registered via
+  // public Dynamic Client Registration. `undefined` → no badge (provenance
+  // unknown to the caller). The badge sits in the header so the operator sees
+  // the trust level before reading the scope list.
+  const trustMarker =
+    sameHub === undefined
+      ? ""
+      : sameHub
+        ? `<p class="trust-marker trust-marker-same-hub">
+            <span class="badge badge-trust-same-hub">First-party</span>
+            <span class="trust-marker-text">Registered through this hub.</span>
+          </p>`
+        : `<p class="trust-marker trust-marker-external">
+            <span class="badge badge-trust-external">External</span>
+            <span class="trust-marker-text">A third-party app that registered itself. Approve only if you recognise it.</span>
+          </p>`;
+  const body = `
+    <div class="card">
+      <div class="card-header">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">${brandMarkSvg(20, "oauth")}</span>
+          <span class="brand-name">${WORDMARK_TEXT}</span>
+        </div>
+        <h1>Approve <span class="client-name">${escapeHtml(clientName)}</span>?</h1>
+        <p class="subtitle">
+          This app is requesting access to your Parachute account.
+        </p>
+        ${trustMarker}
+        <p class="client-meta">
+          <span class="client-meta-label">client_id</span>
+          <code>${escapeHtml(clientId)}</code>
+        </p>
+      </div>
+      ${staleBanner}
+      ${noVaultsBanner}
+      <section class="scopes">
+        <h2 class="scopes-title">Permissions requested</h2>
+        <ul class="scope-list">${scopeRows}</ul>
+      </section>
+      <form method="POST" action="/oauth/authorize" class="auth-form consent-form">
+        <input type="hidden" name="__action" value="consent" />
+        ${renderCsrfHiddenInput(csrfToken)}
+        ${renderHiddenInputs(params)}
+        ${pickerSection}
+        ${extrasSection}
+        <div class="button-row">
+          <button type="submit" name="approve" value="yes" class="btn btn-primary"${approveDisabled}>Approve</button>
+          <button type="submit" name="approve" value="no" class="btn btn-secondary">Deny</button>
+        </div>
+      </form>
+    </div>`;
+  return baseDocument(`Approve ${clientName}`, body);
+}
+
+function renderAccountVaultOption(checked: boolean): string {
+  return `
+            <label class="vault-option vault-option-account">
+              <input type="radio" name="vault_pick" value="${escapeHtml(VAULT_PICK_ACCOUNT)}"${checked ? " checked" : ""} required data-testid="vault-pick-account" />
+              <span class="vault-option-name">All assigned vaults</span>
+            </label>`;
+}
+
+function renderVaultNameOption(name: string, checked: boolean): string {
+  return `
+            <label class="vault-option">
+              <input type="radio" name="vault_pick" value="${escapeHtml(name)}"${checked ? " checked" : ""} required />
+              <span class="vault-option-name"><code>${escapeHtml(name)}</code></span>
+            </label>`;
+}
+
+function renderVaultPicker(picker: VaultPicker): string {
+  const verbList = picker.unnamedVerbs.map((v) => `<code>vault:${escapeHtml(v)}</code>`).join(", ");
+
+  // Multi-user Phase 1: non-admin users with exactly one assigned vault
+  // used to see a locked hidden input. The picker now also offers
+  // "All assigned vaults" (mints `account:vaults`); the assigned vault
+  // stays the default so a friend who just hits Approve still grants
+  // the narrower scope. The form still posts via `vault_pick`.
+  if (picker.lockedVault !== undefined) {
+    const locked = escapeHtml(picker.lockedVault);
+    return `
+        <section class="vault-picker vault-picker-locked">
+          <h2 class="scopes-title">Vault</h2>
+          <p class="picker-help">
+            ${verbList} apply to the vault you select, or to all assigned vaults.
+          </p>
+          <div class="vault-options">
+            <label class="vault-option">
+              <input type="radio" name="vault_pick" value="${locked}" checked required />
+              <span class="vault-option-name"><code>${locked}</code></span>
+              <span class="vault-locked-badge">Assigned</span>
+            </label>
+            ${renderAccountVaultOption(false)}
+          </div>
+          <p class="vault-locked-note">
+            Assigned vault is the default (admin-managed). All assigned vaults
+            covers every vault this account can access.
+          </p>
+        </section>`;
+  }
+
+  if (picker.availableVaults.length === 0) {
+    // Phase 2 PR 2 reviewer fold: differentiate "no vaults on the hub"
+    // (admin-fixable) from "non-admin user has no vault assignments yet"
+    // (user has to wait for an admin to assign them). Default to the
+    // admin-remediation copy when unset — preserves Phase 1 behavior.
+    const noAssignments = picker.emptyReason === "no-assignments";
+    const helpHtml = noAssignments
+      ? `${verbList} need to be bound to a specific vault, but you have no vaults assigned on this hub yet. Ask the hub admin to assign you a vault via <code>/admin/users</code>, then try again.`
+      : `${verbList} need to be bound to a specific vault, but no vaults exist on this host yet. Create one with <code>parachute-vault create &lt;name&gt;</code> and try again.`;
+    return `
+        <section class="vault-picker vault-picker-empty">
+          <h2 class="scopes-title">Pick a vault</h2>
+          <p class="picker-help">
+            ${helpHtml}
+          </p>
+        </section>`;
+  }
+  // Free picker (admin, or friend with 2+ assigned vaults): whole-account
+  // is the default. Catalog-copy of root PRM still asks unnamed `vault:*`;
+  // the picker is the XOR, not a second advertised scope family.
+  const options = [
+    renderAccountVaultOption(true),
+    ...picker.availableVaults.map((name) => renderVaultNameOption(name, false)),
+  ].join("");
+  return `
+        <section class="vault-picker">
+          <h2 class="scopes-title">Pick a vault</h2>
+          <p class="picker-help">
+            ${verbList} apply to the vault you select, or to all assigned vaults.
+          </p>
+          <div class="vault-options">${options}
+          </div>
+        </section>`;
+}
+
+/**
+ * "App not yet approved" page (#74). Two branches:
+ *
+ *   - **Authenticated operator with same-origin posture** (#208): render the
+ *     inline approve form so one click flips the client to `approved` and
+ *     re-enters the OAuth flow at consent.
+ *   - **Unauthenticated viewer** (Issue 1 in the approval-UX PR): render a
+ *     primary "Sign in as admin to approve" CTA wired to
+ *     `/login?next=/admin/approve-client/<id>` so the admin lands directly
+ *     on the approval page after sign-in, plus a secondary shareable
+ *     deep-link section (fully-qualified `<hub_origin>/admin/approve-client/<id>`
+ *     in a code block + Copy-to-clipboard button). The pre-rc.19 CLI hint
+ *     ("ask the operator to run `parachute auth approve-client <id>`") was
+ *     retired — the web path is the path now. CLI is still available for
+ *     terminal-first operators who already know it; we just stop pointing
+ *     new users there from a browser they're already in.
+ */
+export function renderApprovePending(props: ApprovePendingViewProps): string {
+  const {
+    clientName,
+    clientId,
+    redirectUris,
+    requestedScopes,
+    requestedVault,
+    hubOrigin,
+    approveForm,
+    loginNextUrl,
+  } = props;
+  const redirectList = redirectUris.map((u) => `<li><code>${escapeHtml(u)}</code></li>`).join("");
+  // Substitute unnamed `vault:<verb>` rows with the wildcard display form
+  // (`vault:*:<verb>`) so the operator sees the shape that will appear in
+  // the token after consent narrows the scope to a specific vault. At
+  // approve time no vault has been picked yet — the SPA's
+  // `/admin/approve-client/<id>` view uses the same wildcard treatment
+  // (see `resolveScopeForDisplay` in `web/ui/src/routes/ApproveClient.tsx`).
+  const displayedScopes = requestedScopes.map((s) => canonicalConsentScope(s, "*"));
+  const scopeRows =
+    displayedScopes.length === 0
+      ? `<li class="scope scope-empty">No scopes requested — the app gets a session token only.</li>`
+      : requestedScopes
+          .map((wire, i) => renderScopeRow(wire, displayedScopes[i] ?? wire))
+          .join("\n");
+  // Wildcard explanation: surface the "the asterisk means the vault is
+  // picked later" hint below the scope list when at least one row carries
+  // `vault:*:<verb>`. Mirrors the SPA's inline note on
+  // `/admin/approve-client/<id>`. Omitted when no scope renders with `*`
+  // (all scopes are either non-vault or already-named).
+  const wildcardNote = displayedScopes.some((s) => /^vault:\*:(read|write|admin)$/.test(s))
+    ? `
+        <p class="scope-wildcard-note">
+          <code>*</code> — a specific vault is selected during sign-in via the consent
+          picker (or the user's assigned vault for multi-user setups). The
+          <code>*</code> shows the unbound shape.
+        </p>`
+    : "";
+  // Vault hint (closes #244): Notes' VaultPopover (notes#115) passes
+  // `vault=<name>` on `/oauth/authorize` for per-vault grants. Surface it
+  // alongside scopes so a multi-vault operator can tell which vault they're
+  // approving for. Missing on single-vault hubs / pre-vault-popover clients —
+  // section omits when absent.
+  const vaultRow = requestedVault
+    ? `
+        <p class="approve-meta-row">
+          <span class="approve-meta-label">vault</span>
+          <code class="approve-meta-value">${escapeHtml(requestedVault)}</code>
+        </p>`
+    : "";
+  const formSection = approveForm
+    ? `
+      <form method="POST" action="/oauth/authorize/approve" class="auth-form approve-form">
+        ${renderCsrfHiddenInput(approveForm.csrfToken)}
+        <input type="hidden" name="client_id" value="${escapeHtml(clientId)}" />
+        <input type="hidden" name="return_to" value="${escapeHtml(approveForm.returnTo)}" />
+        <input type="hidden" name="redirect_uri" value="${escapeHtml(approveForm.redirectUri)}" />
+        ${approveForm.state !== undefined ? `<input type="hidden" name="state" value="${escapeHtml(approveForm.state)}" />` : ""}
+        <div class="approve-actions">
+          <button type="submit" name="decision" value="approve" class="btn btn-primary">Approve</button>
+          <button type="submit" name="decision" value="deny" class="btn btn-secondary">Deny</button>
+        </div>
+      </form>`
+    : renderUnauthenticatedApproveCtas(hubOrigin, clientId, loginNextUrl);
+  const body = `
+    <div class="card">
+      <div class="card-header">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">${brandMarkSvg(20, "oauth")}</span>
+          <span class="brand-name">${WORDMARK_TEXT}</span>
+        </div>
+        <h1>App not yet approved</h1>
+        <p class="subtitle">
+          ${escapeHtml(clientName)} is registered with this hub but hasn't been approved yet.
+          Review the details below before approving.
+        </p>
+      </div>
+      <section class="approve-meta">
+        <h2 class="scopes-title">Application</h2>
+        <p class="approve-meta-row">
+          <span class="approve-meta-label">name</span>
+          <code class="approve-meta-value">${escapeHtml(clientName)}</code>
+        </p>
+        <p class="approve-meta-row">
+          <span class="approve-meta-label">client_id</span>
+          <code class="approve-meta-value">${escapeHtml(clientId)}</code>
+        </p>${vaultRow}
+        <div class="approve-meta-row approve-meta-row-block">
+          <span class="approve-meta-label">redirect_uris</span>
+          <ul class="approve-redirect-list">${redirectList}</ul>
+        </div>
+      </section>
+      <section class="scopes">
+        <h2 class="scopes-title">Permissions requested</h2>
+        <ul class="scope-list">${scopeRows}</ul>${wildcardNote}
+      </section>
+      ${formSection}
+    </div>`;
+  return baseDocument("App not yet approved", body);
+}
+
+/**
+ * Unauthenticated branch of `renderApprovePending`. Two CTAs:
+ *
+ *   1. Primary: "Sign in as admin to approve" → links to
+ *      `/login?next=<loginNextUrl>`. When `loginNextUrl` is provided,
+ *      that's the URL the operator lands on after sign-in — for the
+ *      OAuth-flow entry point that's the original `/oauth/authorize?...`
+ *      URL, so the operator resumes the in-flight OAuth flow (now
+ *      authenticated → inline approve form → consent → redirect_uri)
+ *      instead of dead-ending at the SPA approve page with the OAuth
+ *      params discarded. When `loginNextUrl` is absent, fall back to
+ *      `/admin/approve-client/<id>` (the legacy SPA path) — useful for
+ *      non-authorize entry points where there's no OAuth flow to resume.
+ *   2. Secondary: a fully-qualified shareable deep-link to
+ *      `<hub_origin>/admin/approve-client/<client_id>` with a Copy button
+ *      so the operator can send it to whoever runs the hub. This stays
+ *      SPA-routed because the recipient isn't in an OAuth flow — the
+ *      deep-link is for the share-with-another-admin case where there's
+ *      no in-flight authorize URL context to preserve.
+ *
+ * Inline JS is scoped to the Copy button only — `navigator.clipboard.writeText`
+ * with a brief "Copied!" affordance. The button degrades gracefully when
+ * scripting is unavailable (the URL is still selectable + copyable from the
+ * `<code>` block via the OS clipboard).
+ */
+function renderUnauthenticatedApproveCtas(
+  hubOrigin: string,
+  clientId: string,
+  loginNextUrl?: string,
+): string {
+  const approvalPath = `/admin/approve-client/${encodeURIComponent(clientId)}`;
+  // Prefer the caller-supplied loginNextUrl (the original authorize URL when
+  // this page was rendered for an OAuth-flow GET) so post-login resumes the
+  // flow. Fall back to the SPA approve path for entry points that don't have
+  // an authorize URL to resume. `/login`'s `safeNext` (admin-handlers.ts)
+  // gates the redirect target to hub-relative paths only — open-redirect is
+  // not reachable here regardless of caller.
+  const loginNext = loginNextUrl ?? approvalPath;
+  const loginHref = `/login?next=${encodeURIComponent(loginNext)}`;
+  const trimmedOrigin = hubOrigin.replace(/\/+$/, "");
+  const deepLink = `${trimmedOrigin}${approvalPath}`;
+  return `
+      <div class="approve-actions">
+        <a href="${escapeHtml(loginHref)}" class="btn btn-primary approve-signin-cta">
+          Sign in as admin to approve
+        </a>
+      </div>
+      <section class="approve-share">
+        <h2 class="scopes-title">Or send this link to your hub admin</h2>
+        <p class="approve-share-help">
+          Anyone with admin access on this hub can open the link below to approve the app.
+        </p>
+        <div class="approve-share-row">
+          <code class="approve-share-link" id="approve-share-link">${escapeHtml(deepLink)}</code>
+          <button
+            type="button"
+            class="btn btn-secondary approve-share-copy"
+            id="approve-share-copy"
+            data-link="${escapeHtml(deepLink)}"
+          >Copy link</button>
+        </div>
+      </section>
+      <script>
+        (function () {
+          var btn = document.getElementById('approve-share-copy');
+          if (!btn) return;
+          var defaultLabel = btn.textContent;
+          btn.addEventListener('click', function () {
+            var link = btn.dataset.link || '';
+            var done = function (ok) {
+              btn.textContent = ok ? 'Copied!' : 'Copy failed';
+              setTimeout(function () { btn.textContent = defaultLabel; }, 1600);
+            };
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+              navigator.clipboard.writeText(link).then(function () { done(true); }, function () { done(false); });
+            } else {
+              // Fallback for browsers without async clipboard (older Safari,
+              // sandboxed iframes). Select the code block so the user can
+              // hit cmd/ctrl-C to copy manually.
+              try {
+                var range = document.createRange();
+                range.selectNode(document.getElementById('approve-share-link'));
+                var sel = window.getSelection();
+                if (sel) { sel.removeAllRanges(); sel.addRange(range); }
+                done(true);
+              } catch (e) {
+                done(false);
+              }
+            }
+          });
+        })();
+      </script>`;
+}
+
+/**
+ * Normalize an unnamed `vault:<verb>` scope to the resolved named form
+ * (`vault:<displayVault>:<verb>`) so consent / approval screens render
+ * what'll actually appear in the token rather than the raw OAuth request.
+ *
+ *   - `displayVault === undefined` → no substitution (keep input as-is).
+ *     Use this when the caller doesn't know what vault will be picked yet
+ *     and prefers the raw OAuth form. (Currently unused; reserved for the
+ *     pre-narrowing approve flow where the vault isn't known until consent.)
+ *   - `displayVault === null` → render with a `<TBD>` placeholder. Used on
+ *     the admin consent screen when the picker hasn't been touched yet, and
+ *     on the operator approval page where the vault is selected at the
+ *     per-user sign-in step, not at approve time.
+ *   - `displayVault === "*"` → render with a literal asterisk placeholder
+ *     (`vault:*:verb`). Used on the server-rendered approve-pending page
+ *     and the SPA's `/admin/approve-client/<id>` view: at approve time the
+ *     vault isn't bound yet (no consent picker has run), so the asterisk
+ *     signals "wildcard — a specific vault is selected later in the flow."
+ *     Callers that render this form should also surface the inline
+ *     explanation below the scope list (see `renderApprovePending`).
+ *   - `displayVault === "name"` → render as `vault:name:verb` literally.
+ *
+ * The supported unnamed verbs are `read`, `write`, and `admin`. Non-vault
+ * scopes pass through untouched. Already-named `vault:<x>:<verb>`
+ * scopes also pass through — the OAuth request already specified a vault,
+ * so there's nothing to resolve.
+ */
+export function canonicalConsentScope(
+  scope: string,
+  displayVault: string | null | undefined,
+): string {
+  if (displayVault === undefined) return scope;
+  const parts = scope.split(":");
+  if (parts.length !== 2 || parts[0] !== "vault") return scope;
+  const verb = parts[1];
+  if (verb !== "read" && verb !== "write" && verb !== "admin") return scope;
+  const vaultLabel = displayVault === null ? "<TBD>" : displayVault;
+  return `vault:${vaultLabel}:${verb}`;
+}
+
+/** Backwards-compatible name for the shared consent-scope normalizer. */
+export const substituteVaultDisplay = canonicalConsentScope;
+
+export function renderError(props: ErrorViewProps): string {
+  const body = `
+    <div class="card">
+      <div class="card-header">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">${brandMarkSvg(20, "oauth")}</span>
+          <span class="brand-name">${WORDMARK_TEXT}</span>
+        </div>
+        <h1 class="error-title">${escapeHtml(props.title)}</h1>
+        <p class="subtitle">${escapeHtml(props.message)}</p>
+      </div>
+      <p class="error-help">
+        If you reached this from a third-party app, the app's OAuth configuration
+        may be wrong. You can safely close this window.
+      </p>
+    </div>`;
+  return baseDocument(props.title, body);
+}
+
+/**
+ * Generic "Not found" page rendered when no other route matches. Replaces
+ * the `new Response("not found", { status: 404 })` plaintext fallback
+ * (closes hub#392) with a branded HTML page that:
+ *
+ *   1. Tells the operator they took a wrong turn (vs. "the hub is broken").
+ *   2. Offers one clear CTA back to the hub home.
+ *
+ * Status code stays 404 — no soft-redirect to `/`. The Response is built
+ * by the caller in `hub-server.ts`; this function returns only the HTML
+ * body so a future caller can use it from other 404 surfaces (per-vault
+ * 404, per-module 404) without going through Response construction here.
+ */
+export function renderNotFoundPage(pathname: string): string {
+  const body = `
+    <div class="card">
+      <div class="card-header">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">${brandMarkSvg(20, "not-found")}</span>
+          <span class="brand-name">${WORDMARK_TEXT}</span>
+        </div>
+        <h1 class="error-title">Not found</h1>
+        <p class="subtitle">
+          We don't have anything at <code>${escapeHtml(pathname)}</code>. The link
+          may have changed, or the page never existed.
+        </p>
+      </div>
+      <p class="error-help">
+        <a href="/" class="btn btn-primary">Go to hub home</a>
+      </p>
+    </div>`;
+  return baseDocument("Not found", body);
+}
+
+export interface UnknownClientViewProps {
+  /** The unknown client_id the request carried. Surfaced verbatim for debugging. */
+  clientId: string;
+  /**
+   * The redirect_uri the request carried, when present + parseable as
+   * `<one-of-our-bound-origins>/<path>`. Triggers the inline "Reset
+   * connection" affordance: the page emits a tiny JS snippet that clears
+   * the requesting SPA's DCR localStorage cache (any key prefixed
+   * `lens:dcr:`) on our own origin, then navigates to the redirect_uri's
+   * mount path so the SPA picks up a fresh DCR.
+   *
+   * Set to `null` when the redirect_uri is missing, malformed, or points
+   * at an origin we don't serve — those reach a third-party SPA we can't
+   * safely interact with from our DOM and we fall back to the static
+   * error variant.
+   */
+  selfOriginRedirectPath: string | null;
+}
+
+/**
+ * "Unknown application" page rendered when `/oauth/authorize` receives a
+ * `client_id` that's not in the hub's `clients` table. The single most-
+ * reported cause is a stale localStorage entry on the SPA side: the
+ * operator wiped `~/.parachute/hub.db` between testing iterations, but the
+ * browser still holds the old hub's DCR-cached client_id and keeps using
+ * it. The hub's behaviour is correct (reject unknown client_id, never
+ * grant an authorize request against an unregistered client) but the
+ * operator is stranded — they need to clear the SPA's cache and the SPA
+ * has no signal to do that on its own.
+ *
+ * Recovery affordance: when the redirect_uri points at an origin the hub
+ * itself serves (any entry in `hubBoundOrigins`), the page renders a
+ * "Reset connection" button. The button runs an inline JS snippet that
+ * clears every `lens:dcr:*` key from localStorage on the hub's own origin
+ * — since Notes (and any future Parachute SPA) is mounted at the hub's
+ * origin, they share localStorage with this error page — then navigates
+ * back to the redirect_uri's mount path. The SPA loads fresh, finds no
+ * cached client_id, and runs a brand-new DCR against the current hub.
+ *
+ * `lens:dcr:` is intentionally hardcoded: Notes' storage layer uses that
+ * prefix (see `parachute-notes/src/lib/vault/storage.ts`'s `DCR_PREFIX`).
+ * Future SPAs that follow the same hub-origin-mounted shape would need
+ * their prefix added here, or we extend the snippet to clear any key
+ * matching `.*:dcr:.*`. Today it's just Notes.
+ *
+ * No JS used outside the optional reset button — the static parts stay
+ * form-free + accessible to readers/screen-readers without script.
+ */
+export function renderUnknownClient(props: UnknownClientViewProps): string {
+  const safeClientId = escapeHtml(props.clientId);
+  const resetSection =
+    props.selfOriginRedirectPath !== null
+      ? `
+      <p>Most often this means the app's local connection state was saved
+        against a previous installation of this hub. Resetting the
+        connection clears the stale state and lets the app register
+        afresh.</p>
+      <div class="unknown-client-actions">
+        <button type="button" class="btn btn-primary" id="unknown-client-reset"
+          data-target="${escapeHtml(props.selfOriginRedirectPath)}">Reset connection &amp; reload</button>
+      </div>
+      <p class="fine">If the button doesn't help, clear site data for this
+        hub in your browser and reload the app.</p>
+      <script>
+        (function () {
+          var btn = document.getElementById('unknown-client-reset');
+          if (!btn) return;
+          btn.addEventListener('click', function () {
+            try {
+              // Notes (and other Parachute SPAs mounted at this hub's
+              // origin) cache DCR client_ids under the 'lens:dcr:' key
+              // prefix. Clear them all — a stale entry against a wiped
+              // hub.db is the canonical cause of this error.
+              var keys = [];
+              for (var i = 0; i < localStorage.length; i++) {
+                var k = localStorage.key(i);
+                if (k && k.indexOf('lens:dcr:') === 0) keys.push(k);
+              }
+              keys.forEach(function (k) { localStorage.removeItem(k); });
+            } catch (e) {
+              // localStorage may be unavailable (private mode, sandbox).
+              // The redirect still happens — the SPA will try DCR again
+              // and either succeed or surface its own diagnostic.
+            }
+            var target = btn.dataset.target || '/';
+            window.location.assign(target);
+          });
+        })();
+      </script>`
+      : `
+      <p class="error-help">
+        If you reached this from a third-party app, the app's OAuth
+        configuration may be wrong. You can safely close this window.
+      </p>`;
+  const body = `
+    <div class="card">
+      <div class="card-header">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">${brandMarkSvg(20, "oauth")}</span>
+          <span class="brand-name">${WORDMARK_TEXT}</span>
+        </div>
+        <h1 class="error-title">Unknown application</h1>
+        <p class="subtitle">
+          This <code>client_id</code> is not registered with this hub:
+          <code>${safeClientId}</code>.
+        </p>
+      </div>
+      ${resetSection}
+    </div>`;
+  return baseDocument("Unknown application", body);
+}
+
+/**
+ * One consent row.
+ *
+ * Takes the WIRE scope and the DISPLAY scope separately, and that separation is
+ * load-bearing. The checkbox `value` must be the wire form, because
+ * `handleConsentSubmit` filters the requested set — which is wire-form — against
+ * what the browser posts. Posting the display form (`vault:unforced:read`
+ * against a requested `vault:read`) intersects to nothing, so every unnamed
+ * vault scope is silently dropped and the user gets `access_denied` for a
+ * consent they actually granted. Shipped that way in #804; the render test
+ * missed it by omitting `displayVault`, so no substitution occurred and the two
+ * forms happened to coincide.
+ */
+function renderScopeRow(scope: string, displayScope: string = scope): string {
+  // Special-case the `<TBD>` placeholder substituted by `canonicalConsentScope`
+  // when the consent picker hasn't bound a vault yet — `explainScope` doesn't
+  // match it because `<` / `>` aren't in the vault-name charset, but the
+  // canonical verb-form does. Look up by the unnamed verb form so the
+  // explanation + level styling are still correct.
+  const tbdMatch = displayScope.match(/^vault:<TBD>:(read|write|admin)$/);
+  const lookup = tbdMatch ? `vault:${tbdMatch[1]}` : displayScope;
+  const explanation = explainScope(lookup);
+  if (!explanation) {
+    // `risk-elevated`, not neutral: an unexplained scope is what
+    // `forcesExplicitConsent` fails closed on, so the row the user reads should
+    // carry the same posture the gate does.
+    return `<li class="scope scope-unknown risk-elevated">
+      <code class="scope-name">${escapeHtml(displayScope)}</code>
+      <span class="scope-label scope-label-muted">Defined by the requesting app — no built-in description.</span>
+    </li>`;
+  }
+  const risk = riskForExplanation(explanation);
+  // Two classes: `scope-<level>` keeps every existing style working, and
+  // `risk-<tier>` carries the colour. They're separate because a scope's verb
+  // and its blast radius aren't the same axis — `vault:<name>:admin` and
+  // `account:self:admin` share a level and differ enormously in consequence.
+  const cls = `scope scope-${explanation.level} risk-${risk}`;
+  const badge = badgeForLevel(explanation);
+  // Pending-vault hint surfaces the silent-narrowing semantics for admin
+  // operators who land on the consent screen before touching the picker.
+  // Once they pick, the form submission narrows the scope to the chosen
+  // vault — the rendered placeholder reflects that the vault is still
+  // open at this moment in the flow.
+  const pendingNote = tbdMatch
+    ? `<span class="scope-pending-note">A specific vault is picked below before approving.</span>`
+    : "";
+  // An account-wide scope gets an explicit consequence line, not just a colour.
+  // Colour alone is invisible to a screen reader and to anyone who doesn't
+  // know the convention, and this is the decision most worth slowing down.
+  const riskNote = accountWideRiskNote(lookup, risk);
+  // One checkbox per requested scope — granular consent. Pre-checked for
+  // ordinary scopes (the app asked for them and approving is the common case),
+  // but a `high` tier scope starts UNCHECKED: account-wide authority should be
+  // something a user reaches for deliberately, not something they inherit by
+  // clicking Approve on a list an app composed.
+  const preChecked = risk === "high" ? "" : " checked";
+  return `<li class="${cls}">
+      <label class="scope-choice">
+        <input type="checkbox" name="granted_scope" value="${escapeHtml(scope)}"${preChecked} />
+        <span class="scope-choice-body">
+          <span class="scope-head">
+            <code class="scope-name">${escapeHtml(displayScope)}</code>
+            ${badge}
+          </span>
+          <span class="scope-label">${escapeHtml(explanation.label)}</span>
+          ${riskNote}
+          ${pendingNote}
+        </span>
+      </label>
+    </li>`;
+}
+
+/**
+ * The "additional access" checklist — scopes the user may grant beyond what the
+ * client asked for.
+ *
+ * Collapsed by default when the client DID request scopes: the common case is
+ * approving what was asked, and an expanded list of extra permissions invites
+ * absent-minded ticking. Expanded when the client requested nothing, because
+ * then it's the only path to a token that works.
+ *
+ * Unchecked by default in both cases — always. A pre-ticked permission is not
+ * consent, and that matters most for the `high` tier this section exists to
+ * make reachable.
+ */
+function renderGrantableExtras(extras: readonly string[], expanded: boolean): string {
+  if (extras.length === 0) return "";
+  const rows = extras
+    .map((scope) => {
+      const e = explainScope(scope);
+      // Unknown scopes fail CLOSED here, matching the gate. `forcesExplicitConsent`
+      // treats a scope with no explanation as consent-forcing precisely because
+      // the hub cannot vouch for its blast radius; rendering that same scope as
+      // `risk-low` told the user the opposite of what the gate believes, in the
+      // one place a user acts on the information. Unknown is not low — it is
+      // unassessed, and unassessed is shown as elevated.
+      const risk = e ? riskForExplanation(e) : "elevated";
+      const label = e ? e.label : "Defined by the requesting app — no built-in description.";
+      const badge = e ? badgeForLevel(e) : "";
+      return `<li class="scope risk-${risk} extra-scope">
+          <label class="extra-scope-label">
+            <input type="checkbox" name="extra_scope" value="${escapeHtml(scope)}" />
+            <span class="extra-scope-body">
+              <span class="scope-head">
+                <code class="scope-name">${escapeHtml(scope)}</code>
+                ${badge}
+              </span>
+              <span class="scope-label">${escapeHtml(label)}</span>
+              ${accountWideRiskNote(scope, risk)}
+            </span>
+          </label>
+        </li>`;
+    })
+    .join("\n");
+  return `<details class="extras" ${expanded ? "open" : ""}>
+      <summary class="extras-summary">Grant additional access${expanded ? "" : " (optional)"}</summary>
+      <p class="extras-note">The app didn't request these. Only grant what you actually want it to have.</p>
+      <ul class="scopes-list">${rows}</ul>
+    </details>`;
+}
+
+/**
+ * The account-wide consequence line — stated in words, because colour alone is
+ * invisible to a screen reader and to anyone who doesn't know the convention.
+ *
+ * Fires for `high` (as it always has) AND for an `elevated` `account:*` scope.
+ * Without the second case `account:self:write` rendered identically to
+ * `vault:work:write` — same `write` badge, same absence of a consequence line —
+ * even though one reaches a single vault and the other reaches every vault in
+ * the account. The two texts differ because the consequences differ: the
+ * elevated tier explicitly CANNOT mint credentials that outlive the app's
+ * access (that is what its label promises), so it must not borrow the `high`
+ * tier's warning about tokens that keep working after you disconnect.
+ *
+ * Deliberately NOT extended to the `badge-danger` "account-wide" badge: danger
+ * red is reserved for the `high` tier so red keeps meaning exactly one thing
+ * (see the `.badge-danger` note in the stylesheet).
+ */
+function accountWideRiskNote(scope: string, risk: "low" | "elevated" | "high"): string {
+  if (risk === "high") {
+    return `<span class="scope-risk-note"><strong>Account-wide.</strong> This is not limited to one vault, and tokens this app creates keep working even after you disconnect it.</span>`;
+  }
+  if (risk === "elevated" && scope.startsWith("account:")) {
+    return `<span class="scope-risk-note"><strong>Account-wide.</strong> This is not limited to one vault — it reaches every vault in this account, including ones created later.</span>`;
+  }
+  return "";
+}
+
+function badgeForLevel(explanation: ScopeExplanation): string {
+  // A high-risk scope is badged for its BLAST RADIUS, not its verb: "admin"
+  // next to `account:self:admin` reads like the vault-admin row two lines up,
+  // which is the confusion this whole tier exists to prevent.
+  if (riskForExplanation(explanation) === "high") {
+    return `<span class="badge badge-danger">account-wide</span>`;
+  }
+  switch (explanation.level) {
+    case "admin":
+      return `<span class="badge badge-admin">admin</span>`;
+    case "write":
+      return `<span class="badge badge-write">write</span>`;
+    case "send":
+      return `<span class="badge badge-send">send</span>`;
+    case "read":
+      return `<span class="badge badge-read">read</span>`;
+  }
+}
+
+export function renderHiddenInputs(p: AuthorizeFormParams): string {
+  const fields: [string, string][] = [
+    ["client_id", p.clientId],
+    ["redirect_uri", p.redirectUri],
+    ["response_type", p.responseType],
+    ["scope", p.scope],
+    ["code_challenge", p.codeChallenge],
+    ["code_challenge_method", p.codeChallengeMethod],
+  ];
+  if (p.state) fields.push(["state", p.state]);
+  // RFC 8707 resource indicator — round-tripped through the consent form so
+  // the resource-bound vault narrowing survives the POST (the consent submit
+  // path re-derives the bound vault from it).
+  if (p.resource) fields.push(["resource", p.resource]);
+  return fields
+    .map(([k, v]) => `<input type="hidden" name="${k}" value="${escapeHtml(v)}" />`)
+    .join("\n        ");
+}
+
+function baseDocument(title: string, body: string): string {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>${escapeHtml(title)}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="referrer" content="no-referrer" />
+  <style>${STYLES}</style>
+</head>
+<body>
+  <main>
+${body}
+  </main>
+</body>
+</html>`;
+}
+
+const STYLES = `
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: ${FONT_SANS};
+    background: ${PALETTE.bg};
+    color: ${PALETTE.fg};
+    line-height: 1.55;
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+  main {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    padding: 1.5rem;
+  }
+  .card {
+    width: 100%;
+    max-width: 30rem;
+    background: ${PALETTE.cardBg};
+    border: 1px solid ${PALETTE.border};
+    border-radius: 12px;
+    padding: 2rem 1.75rem;
+    box-shadow: 0 1px 2px rgba(44, 42, 38, 0.04), 0 8px 24px rgba(44, 42, 38, 0.06);
+  }
+  .card-header { margin-bottom: 1.5rem; }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    color: ${PALETTE.accent};
+    font-weight: 500;
+    font-size: 0.95rem;
+    margin-bottom: 1.25rem;
+  }
+  .brand-mark { display: inline-flex; line-height: 0; }
+  .brand-mark svg { width: 20px; height: 20px; }
+  .brand-name { letter-spacing: 0.01em; }
+  h1 {
+    font-family: ${FONT_SERIF};
+    font-weight: 400;
+    font-size: 1.75rem;
+    line-height: 1.2;
+    margin: 0 0 0.4rem;
+    color: ${PALETTE.fg};
+  }
+  h1 .client-name {
+    font-style: italic;
+    color: ${PALETTE.accent};
+  }
+  .subtitle {
+    margin: 0;
+    color: ${PALETTE.fgMuted};
+    font-size: 0.95rem;
+  }
+  .client-meta {
+    margin: 0.75rem 0 0;
+    font-size: 0.8rem;
+    color: ${PALETTE.fgDim};
+    display: flex;
+    gap: 0.4rem;
+    align-items: baseline;
+    flex-wrap: wrap;
+  }
+  .client-meta-label { text-transform: uppercase; letter-spacing: 0.05em; }
+  .client-meta code {
+    font-family: ${FONT_MONO};
+    font-size: 0.78rem;
+    background: ${PALETTE.bgSoft};
+    padding: 0.1rem 0.4rem;
+    border-radius: 4px;
+    color: ${PALETTE.fgMuted};
+    word-break: break-all;
+  }
+
+  .auth-form { display: flex; flex-direction: column; gap: 0.9rem; }
+  .field { display: flex; flex-direction: column; gap: 0.35rem; }
+  .field-label {
+    font-size: 0.85rem;
+    font-weight: 500;
+    color: ${PALETTE.fgMuted};
+    letter-spacing: 0.01em;
+  }
+  input[type=text], input[type=password] {
+    font: inherit;
+    width: 100%;
+    padding: 0.6rem 0.75rem;
+    border: 1px solid ${PALETTE.border};
+    border-radius: 6px;
+    background: ${PALETTE.bg};
+    color: ${PALETTE.fg};
+    transition: border-color 0.15s ease, background 0.15s ease;
+  }
+  input[type=text]:focus, input[type=password]:focus {
+    outline: none;
+    border-color: ${PALETTE.accent};
+    background: ${PALETTE.cardBg};
+    box-shadow: 0 0 0 3px ${PALETTE.accentSoft};
+  }
+
+  .btn {
+    font: inherit;
+    font-weight: 500;
+    padding: 0.65rem 1.25rem;
+    border-radius: 6px;
+    border: 1px solid transparent;
+    cursor: pointer;
+    transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+    min-height: 2.5rem;
+    /* When the .btn class is applied to an anchor (e.g. the 404 page's
+     * "Go to hub home" link), suppress the default anchor underline +
+     * make it a layout block so padding behaves consistently with the
+     * <button> variant. Without this, anchor-buttons render with an
+     * underlined label which looks broken. */
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    text-decoration: none;
+  }
+  a.btn:hover { text-decoration: none; }
+  .btn-primary {
+    background: ${PALETTE.accent};
+    color: ${PALETTE.cardBg};
+    margin-top: 0.4rem;
+  }
+  .btn-primary:hover { background: ${PALETTE.accentHover}; }
+  .btn-secondary {
+    background: ${PALETTE.cardBg};
+    color: ${PALETTE.fgMuted};
+    border-color: ${PALETTE.border};
+  }
+  .btn-secondary:hover {
+    color: ${PALETTE.fg};
+    border-color: ${PALETTE.fgDim};
+  }
+  .button-row {
+    display: flex;
+    gap: 0.6rem;
+    margin-top: 0.5rem;
+  }
+  .button-row .btn { flex: 1; }
+  .consent-form { gap: 0; }
+
+  .error-banner {
+    background: ${PALETTE.dangerSoft};
+    border: 1px solid ${PALETTE.danger};
+    border-radius: 6px;
+    color: ${PALETTE.danger};
+    padding: 0.6rem 0.8rem;
+    margin: 0 0 1rem;
+    font-size: 0.9rem;
+  }
+  /* hub#284 — surfaces "your assigned vault was removed" above the
+     consent scope list. Same shape as error-banner but slightly more
+     room for the multi-sentence remediation copy. */
+  .stale-assignment-banner {
+    background: ${PALETTE.dangerSoft};
+    border: 1px solid ${PALETTE.danger};
+    border-radius: 6px;
+    color: ${PALETTE.danger};
+    padding: 0.75rem 0.9rem;
+    margin: 0 0 1.25rem;
+    font-size: 0.9rem;
+    line-height: 1.45;
+  }
+  .stale-assignment-banner strong { display: block; margin-bottom: 0.25rem; }
+  .stale-assignment-banner code {
+    background: rgba(0, 0, 0, 0.04);
+    padding: 0.05rem 0.3rem;
+    border-radius: 3px;
+  }
+  .error-title { color: ${PALETTE.danger}; }
+  .error-help {
+    margin-top: 1.5rem;
+    padding-top: 1.25rem;
+    border-top: 1px solid ${PALETTE.borderLight};
+    color: ${PALETTE.fgMuted};
+    font-size: 0.88rem;
+  }
+  .unknown-client-actions {
+    margin: 1.25rem 0 0.5rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+  .fine {
+    color: ${PALETTE.fgMuted};
+    font-size: 0.85rem;
+  }
+
+  .scopes { margin: 0 0 1.5rem; }
+  .scopes-title {
+    font-family: ${FONT_SANS};
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: ${PALETTE.fgMuted};
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin: 0 0 0.6rem;
+  }
+  .scope-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+  .scope {
+    border: 1px solid ${PALETTE.border};
+    border-radius: 6px;
+    padding: 0.6rem 0.75rem;
+    background: ${PALETTE.bg};
+  }
+  .scope-empty {
+    color: ${PALETTE.fgMuted};
+    font-size: 0.9rem;
+    background: ${PALETTE.bgSoft};
+    border-style: dashed;
+  }
+  .scope-head {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.2rem;
+    flex-wrap: wrap;
+  }
+  .scope-name {
+    font-family: ${FONT_MONO};
+    font-size: 0.85rem;
+    color: ${PALETTE.fg};
+  }
+  .scope-label {
+    font-size: 0.88rem;
+    color: ${PALETTE.fgMuted};
+    display: block;
+  }
+  .scope-label-muted { color: ${PALETTE.fgDim}; font-style: italic; }
+  /* Risk tiers carry the colour. .scope-admin matches the elevated tier, so
+     the two can never disagree about how one vault's admin looks. */
+  .scope-admin {
+    border-color: ${PALETTE.caution};
+    background: ${PALETTE.cautionSoft};
+  }
+  .scope-admin .scope-name { color: ${PALETTE.caution}; }
+
+  .risk-elevated {
+    border-color: ${PALETTE.caution};
+    background: ${PALETTE.cautionSoft};
+  }
+  .risk-elevated .scope-name { color: ${PALETTE.caution}; }
+
+  /* Account-wide: red, a heavier border, and a spelled-out consequence. */
+  .risk-high {
+    border-color: ${PALETTE.danger};
+    border-left-width: 4px;
+    background: ${PALETTE.dangerSoft};
+  }
+  .risk-high .scope-name { color: ${PALETTE.danger}; }
+  .scope-choice {
+    display: flex;
+    gap: 0.6rem;
+    align-items: flex-start;
+    cursor: pointer;
+  }
+  .scope-choice input { margin-top: 0.3rem; flex: none; }
+  .scope-choice-body { display: block; }
+
+  .extras {
+    margin: 0 0 1.25rem;
+    border: 1px solid ${PALETTE.borderLight};
+    border-radius: 6px;
+    padding: 0.6rem 0.8rem;
+    background: ${PALETTE.bgSoft};
+  }
+  .extras-summary {
+    cursor: pointer;
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: ${PALETTE.fgMuted};
+  }
+  .extras-note {
+    margin: 0.5rem 0 0.6rem;
+    font-size: 0.85rem;
+    color: ${PALETTE.fgMuted};
+  }
+  .extra-scope-label {
+    display: flex;
+    gap: 0.6rem;
+    align-items: flex-start;
+    cursor: pointer;
+  }
+  .extra-scope-label input { margin-top: 0.3rem; flex: none; }
+  .extra-scope-body { display: block; }
+
+  .scope-risk-note {
+    display: block;
+    margin-top: 0.35rem;
+    font-size: 0.85em;
+    color: ${PALETTE.danger};
+  }
+
+  .vault-picker {
+    margin: 0 0 1.25rem;
+    padding: 0.75rem 0.85rem;
+    border: 1px solid ${PALETTE.borderLight};
+    border-radius: 6px;
+    background: ${PALETTE.bgSoft};
+  }
+  .vault-picker .scopes-title { margin-bottom: 0.4rem; }
+  .picker-help {
+    margin: 0 0 0.6rem;
+    font-size: 0.88rem;
+    color: ${PALETTE.fgMuted};
+  }
+  .picker-help code {
+    font-family: ${FONT_MONO};
+    font-size: 0.82rem;
+    background: ${PALETTE.cardBg};
+    padding: 0.05rem 0.35rem;
+    border-radius: 4px;
+    color: ${PALETTE.fg};
+  }
+  .vault-options {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+  }
+  .vault-option {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.45rem 0.6rem;
+    border: 1px solid ${PALETTE.border};
+    border-radius: 6px;
+    background: ${PALETTE.cardBg};
+    cursor: pointer;
+    transition: border-color 0.15s ease, background 0.15s ease;
+  }
+  .vault-option:hover { border-color: ${PALETTE.accent}; }
+  .vault-option input[type=radio]:focus { outline: 2px solid ${PALETTE.accent}; outline-offset: 2px; }
+  .vault-option-name code {
+    font-family: ${FONT_MONO};
+    font-size: 0.88rem;
+    color: ${PALETTE.fg};
+  }
+  .vault-option-account .vault-option-name {
+    font-weight: 600;
+  }
+  .vault-option .vault-locked-badge { margin-left: auto; }
+  .vault-picker-empty .picker-help { color: ${PALETTE.danger}; }
+  .vault-picker-empty .picker-help code { color: ${PALETTE.fg}; }
+  .vault-picker-locked .picker-help { color: ${PALETTE.fgMuted}; }
+  .vault-locked-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 0.6rem;
+    border: 1px solid ${PALETTE.border};
+    border-radius: 6px;
+    background: ${PALETTE.cardBg};
+    margin: 0.25rem 0 0.5rem;
+  }
+  .vault-locked-name {
+    font-family: ${FONT_MONO};
+    font-size: 0.9rem;
+    color: ${PALETTE.fg};
+    flex: 1;
+  }
+  .vault-locked-badge {
+    display: inline-block;
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-weight: 600;
+    padding: 0.1rem 0.5rem;
+    border-radius: 999px;
+    background: ${PALETTE.accentSoft};
+    color: ${PALETTE.accent};
+  }
+  .vault-locked-note {
+    margin: 0;
+    font-size: 0.82rem;
+    color: ${PALETTE.fgDim};
+    font-style: italic;
+  }
+
+  .approve-meta {
+    margin: 0 0 1.25rem;
+    padding: 0.75rem 0.85rem;
+    border: 1px solid ${PALETTE.borderLight};
+    border-radius: 6px;
+    background: ${PALETTE.bgSoft};
+  }
+  .approve-meta .scopes-title { margin-bottom: 0.5rem; }
+  .approve-meta-row {
+    margin: 0 0 0.4rem;
+    display: flex;
+    gap: 0.5rem;
+    align-items: baseline;
+    flex-wrap: wrap;
+  }
+  .approve-meta-row:last-child { margin-bottom: 0; }
+  .approve-meta-row-block { flex-direction: column; gap: 0.25rem; }
+  .approve-meta-label {
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-size: 0.7rem;
+    color: ${PALETTE.fgDim};
+  }
+  .approve-meta-value {
+    font-family: ${FONT_MONO};
+    font-size: 0.82rem;
+    background: ${PALETTE.cardBg};
+    padding: 0.1rem 0.4rem;
+    border-radius: 4px;
+    color: ${PALETTE.fg};
+    word-break: break-all;
+  }
+  .approve-redirect-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+  .approve-redirect-list li code {
+    font-family: ${FONT_MONO};
+    font-size: 0.82rem;
+    background: ${PALETTE.cardBg};
+    padding: 0.1rem 0.4rem;
+    border-radius: 4px;
+    color: ${PALETTE.fg};
+    word-break: break-all;
+  }
+  .approve-form { gap: 0; }
+  .approve-actions {
+    margin-top: 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+  .approve-signin-cta {
+    display: inline-block;
+    text-align: center;
+    text-decoration: none;
+    line-height: 1.4;
+  }
+  .approve-signin-cta:hover {
+    background: ${PALETTE.accentHover};
+    color: ${PALETTE.cardBg};
+  }
+  .approve-share {
+    margin-top: 1.5rem;
+    padding-top: 1.25rem;
+    border-top: 1px solid ${PALETTE.borderLight};
+  }
+  .approve-share-help {
+    margin: 0 0 0.6rem;
+    color: ${PALETTE.fgMuted};
+    font-size: 0.88rem;
+  }
+  .approve-share-row {
+    display: flex;
+    gap: 0.5rem;
+    align-items: stretch;
+    flex-wrap: wrap;
+  }
+  .approve-share-link {
+    flex: 1;
+    min-width: 0;
+    font-family: ${FONT_MONO};
+    font-size: 0.82rem;
+    background: ${PALETTE.bgSoft};
+    padding: 0.55rem 0.65rem;
+    border-radius: 6px;
+    color: ${PALETTE.fg};
+    word-break: break-all;
+    border: 1px solid ${PALETTE.border};
+  }
+  .approve-share-copy {
+    flex-shrink: 0;
+    min-height: 0;
+    padding: 0.5rem 0.9rem;
+    font-size: 0.85rem;
+  }
+  .scope-pending-note {
+    display: block;
+    margin-top: 0.25rem;
+    font-size: 0.78rem;
+    color: ${PALETTE.fgDim};
+    font-style: italic;
+  }
+  .scope-wildcard-note {
+    margin: 0.6rem 0 0;
+    font-size: 0.82rem;
+    color: ${PALETTE.fgDim};
+    font-style: italic;
+    line-height: 1.45;
+  }
+  .scope-wildcard-note code {
+    font-family: ${FONT_MONO};
+    font-style: normal;
+    background: ${PALETTE.bgSoft};
+    padding: 0.05rem 0.3rem;
+    border-radius: 4px;
+    color: ${PALETTE.fgMuted};
+  }
+  .badge {
+    display: inline-block;
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-weight: 600;
+    padding: 0.1rem 0.45rem;
+    border-radius: 999px;
+    line-height: 1.4;
+  }
+  .badge-read { background: ${PALETTE.bgSoft}; color: ${PALETTE.fgMuted}; }
+  .badge-write { background: ${PALETTE.accentSoft}; color: ${PALETTE.accent}; }
+  .badge-send { background: ${PALETTE.accentSoft}; color: ${PALETTE.accent}; }
+  /* admin = full control of ONE vault → caution amber. Account-wide authority
+     is the only thing that gets danger red, so red keeps meaning one thing. */
+  .badge-admin { background: ${PALETTE.caution}; color: ${PALETTE.cardBg}; }
+  .badge-danger {
+    background: ${PALETTE.danger};
+    color: ${PALETTE.cardBg};
+    text-transform: none;
+  }
+
+  /* hub#314 — same-hub vs external trust marker on the consent header. The
+     first-party badge uses the accent (calm/trusted); external uses the danger
+     tint so a third-party DCR client stands out without being alarmist. */
+  .trust-marker {
+    display: flex;
+    align-items: baseline;
+    gap: 0.45rem;
+    flex-wrap: wrap;
+    margin: 0.75rem 0 0;
+    font-size: 0.85rem;
+    color: ${PALETTE.fgMuted};
+  }
+  .trust-marker-text { flex: 1; min-width: 12rem; }
+  .badge-trust-same-hub { background: ${PALETTE.accentSoft}; color: ${PALETTE.accent}; }
+  .badge-trust-external { background: ${PALETTE.dangerSoft}; color: ${PALETTE.danger}; }
+
+  @media (max-width: 480px) {
+    main { padding: 0.75rem; }
+    .card { padding: 1.5rem 1.25rem; border-radius: 10px; }
+    h1 { font-size: 1.5rem; }
+    .button-row { flex-direction: column; }
+  }
+
+  @media (prefers-color-scheme: dark) {
+    body { background: #1a1815; color: #e8e4dc; }
+    .card { background: #25221d; border-color: #3a362f; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3); }
+    h1 { color: #f0ece4; }
+    .subtitle, .field-label { color: #a8a29a; }
+    input[type=text], input[type=password] { background: #1f1c18; border-color: #3a362f; color: #e8e4dc; }
+    input[type=text]:focus, input[type=password]:focus { background: #25221d; }
+    .scope { background: #1f1c18; border-color: #3a362f; }
+    .scope-name { color: #e8e4dc; }
+    .client-meta code { background: #1f1c18; color: #a8a29a; }
+    .btn-secondary { background: #25221d; border-color: #3a362f; color: #a8a29a; }
+    .btn-secondary:hover { color: #e8e4dc; border-color: #6b6860; }
+    .error-help { border-color: #3a362f; color: #a8a29a; }
+    .scope-empty { background: #1a1815; }
+  }
+${NOSTR_LOGIN_STYLES}
+`;

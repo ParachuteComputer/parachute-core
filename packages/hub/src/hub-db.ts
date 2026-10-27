@@ -1,0 +1,957 @@
+/**
+ * Hub-local SQLite database. Opens `~/.parachute/hub.db` (overridable via
+ * `$PARACHUTE_HOME`). Holds everything the hub owns as the ecosystem's OAuth
+ * issuer — signing keys (v1), users + opaque refresh tokens (v2), OAuth
+ * clients + auth-codes + grants + browser sessions (v3), TOTP 2FA
+ * enrollment on the users row (v11, hub#473), and one-time invite links
+ * (v12, the `invites` table; v13 adds the pre-named `username` column;
+ * v14 adds refresh-token rotation grace; v15 generalizes invites into
+ * multi-use public-signup links + email-as-username + the `vault_caps`
+ * per-vault storage-cap table), and Nostr-pubkey ↔ user linkage plus the
+ * additive `tokens.subject_pubkey` attribution snapshot (v17, hub#833
+ * phase 1), the durable attribution proof archive (v18, hub#860), and a
+ * live `tokens.user_id` backfill where `subject` already equals a
+ * `users.id` (v19, hub#833 per-account mint), stored hub roles on the users
+ * row (v20, hub#881), the additive `tokens.revoked_by` /
+ * `tokens.revoked_via` revocation-actor columns (v21, hub#931), grant
+ * attribution on `user_vaults` (v22), and the `channel_vaults` binding
+ * table that attaches a Buzz channel to a vault (v23, design
+ * "Channel-attached vaults — membership becomes access").
+ *
+ * Each open() runs `migrate()` to bring the schema up to date. A
+ * `schema_version` table records every applied migration so re-opens are
+ * cheap and idempotent. Migrations are append-only — never edit a prior
+ * entry; add a new one with a higher number.
+ */
+import { Database } from "bun:sqlite";
+import { mkdirSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { CONFIG_DIR } from "./config.ts";
+
+export function hubDbPath(configDir: string = CONFIG_DIR): string {
+  return join(configDir, "hub.db");
+}
+
+interface Migration {
+  version: number;
+  sql: string;
+}
+
+const MIGRATIONS: readonly Migration[] = [
+  {
+    version: 1,
+    sql: `
+      CREATE TABLE signing_keys (
+        kid TEXT PRIMARY KEY,
+        public_key_pem TEXT NOT NULL,
+        private_key_pem TEXT NOT NULL,
+        algorithm TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        retired_at TEXT
+      );
+      CREATE INDEX signing_keys_active ON signing_keys (retired_at)
+        WHERE retired_at IS NULL;
+    `,
+  },
+  {
+    version: 2,
+    sql: `
+      CREATE TABLE users (
+        id TEXT PRIMARY KEY,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE tokens (
+        jti TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES users(id),
+        client_id TEXT NOT NULL,
+        scopes TEXT NOT NULL,
+        refresh_token_hash TEXT,
+        expires_at TEXT NOT NULL,
+        revoked_at TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX tokens_user ON tokens (user_id);
+      CREATE INDEX tokens_active_refresh ON tokens (refresh_token_hash)
+        WHERE refresh_token_hash IS NOT NULL AND revoked_at IS NULL;
+    `,
+  },
+  {
+    version: 3,
+    sql: `
+      CREATE TABLE clients (
+        client_id TEXT PRIMARY KEY,
+        client_secret_hash TEXT,
+        redirect_uris TEXT NOT NULL,
+        scopes TEXT NOT NULL,
+        client_name TEXT,
+        registered_at TEXT NOT NULL
+      );
+      CREATE TABLE auth_codes (
+        code TEXT PRIMARY KEY,
+        client_id TEXT NOT NULL REFERENCES clients(client_id),
+        user_id TEXT NOT NULL REFERENCES users(id),
+        redirect_uri TEXT NOT NULL,
+        scopes TEXT NOT NULL,
+        code_challenge TEXT NOT NULL,
+        code_challenge_method TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        used_at TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE grants (
+        user_id TEXT NOT NULL REFERENCES users(id),
+        client_id TEXT NOT NULL REFERENCES clients(client_id),
+        scopes TEXT NOT NULL,
+        granted_at TEXT NOT NULL,
+        PRIMARY KEY (user_id, client_id)
+      );
+      CREATE TABLE sessions (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES users(id),
+        expires_at TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX sessions_user ON sessions (user_id);
+    `,
+  },
+  {
+    version: 4,
+    sql: `
+      -- DCR approval gate (closes #74). Public DCR was unauthenticated before
+      -- this migration; pre-existing rows are grandfathered as 'approved' so
+      -- already-trusted clients keep working. New rows default to 'pending'
+      -- unless the registrant authenticates with an operator token carrying
+      -- hub:admin scope.
+      ALTER TABLE clients ADD COLUMN status TEXT NOT NULL DEFAULT 'pending';
+      UPDATE clients SET status = 'approved';
+      CREATE INDEX clients_status ON clients (status);
+    `,
+  },
+  {
+    version: 5,
+    sql: `
+      -- Refresh-token rotation + replay detection (closes #73). Each chain
+      -- of rotated refresh tokens shares a family_id; replaying a revoked
+      -- refresh token in a family signals theft and revokes every row in
+      -- that family (RFC 6819 §5.2.2.3). Pre-existing rows are backfilled
+      -- with their own jti as the family — grandfathered as singletons so
+      -- in-flight tokens keep working without spurious family revocation.
+      ALTER TABLE tokens ADD COLUMN family_id TEXT;
+      UPDATE tokens SET family_id = jti WHERE family_id IS NULL;
+      CREATE INDEX tokens_family ON tokens (family_id) WHERE family_id IS NOT NULL;
+    `,
+  },
+  {
+    version: 6,
+    sql: `
+      -- Token registry generalization (closes hub#212 Phase 1). Until v6 the
+      -- tokens table only held OAuth refresh tokens; v6 generalizes it to a
+      -- single registry across every issued JWT class (refresh, access,
+      -- operator, mint-token). Three structural changes:
+      --
+      --   1. user_id becomes NULLABLE. OAuth-issued rows still set it to the
+      --      caller's user (canonical identity field). CLI-minted /
+      --      operator-minted rows leave user_id NULL and put the operator/
+      --      service name in the new \`subject\` column.
+      --   2. Three new columns: \`permissions\` (JSON, custom claim per
+      --      auth-architecture-shape.md §11.3), \`created_via\` (provenance
+      --      tag: oauth_refresh / cli_mint / operator_mint), \`subject\`
+      --      (non-user identity for service / operator mints).
+      --   3. Existing rows backfill \`created_via='oauth_refresh'\` because
+      --      the table was OAuth-refresh-only before v6.
+      --
+      -- SQLite has no ALTER COLUMN to drop NOT NULL, so we use the
+      -- recreate-and-rename pattern. Inside the migration transaction the
+      -- whole swap is atomic; concurrent reads (there are none — hub is
+      -- single-writer) wouldn't see a half-state. FKs from tokens → users
+      -- stay enforced for non-NULL user_id values; nothing references
+      -- tokens, so the drop is safe.
+      CREATE TABLE tokens_new (
+        jti TEXT PRIMARY KEY,
+        user_id TEXT REFERENCES users(id),
+        client_id TEXT NOT NULL,
+        scopes TEXT NOT NULL,
+        refresh_token_hash TEXT,
+        family_id TEXT,
+        expires_at TEXT NOT NULL,
+        revoked_at TEXT,
+        created_at TEXT NOT NULL,
+        permissions TEXT,
+        created_via TEXT NOT NULL DEFAULT 'oauth_refresh',
+        subject TEXT
+      );
+      INSERT INTO tokens_new (
+        jti, user_id, client_id, scopes, refresh_token_hash, family_id,
+        expires_at, revoked_at, created_at,
+        permissions, created_via, subject
+      )
+      SELECT
+        jti, user_id, client_id, scopes, refresh_token_hash, family_id,
+        expires_at, revoked_at, created_at,
+        NULL, 'oauth_refresh', NULL
+      FROM tokens;
+      DROP TABLE tokens;
+      ALTER TABLE tokens_new RENAME TO tokens;
+      -- Recreate indexes (DROP TABLE took them with it).
+      CREATE INDEX tokens_user ON tokens (user_id) WHERE user_id IS NOT NULL;
+      CREATE INDEX tokens_active_refresh ON tokens (refresh_token_hash)
+        WHERE refresh_token_hash IS NOT NULL AND revoked_at IS NULL;
+      CREATE INDEX tokens_family ON tokens (family_id) WHERE family_id IS NOT NULL;
+      -- New: revocation list endpoint queries on (revoked_at, expires_at).
+      CREATE INDEX tokens_revoked ON tokens (revoked_at)
+        WHERE revoked_at IS NOT NULL;
+      -- Subject lookup for non-user mints (operator name, service name).
+      CREATE INDEX tokens_subject ON tokens (subject) WHERE subject IS NOT NULL;
+    `,
+  },
+  {
+    version: 7,
+    sql: `
+      -- Hub-level key/value settings (hub#268). Used by:
+      --   * setup_expose_mode — operator's "how will this hub be reached?"
+      --     choice from the first-boot wizard expose step. Values:
+      --     'localhost' | 'tailnet' | 'public'.
+      --   * pending_first_client_auto_approve_until — ISO-8601 timestamp
+      --     set when the wizard finishes; first OAuth client registration
+      --     within the window is auto-approved + the row cleared (single
+      --     use). Absent / past-due means the standard pending-approval
+      --     flow applies.
+      --
+      -- Single-row-per-key schema. updated_at lets us age out stale
+      -- entries if a future pattern needs it; nothing currently relies on
+      -- it. Bare KV — no audit log, no history — these are hub-local
+      -- operator preferences, not user-facing data.
+      CREATE TABLE hub_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `,
+  },
+  {
+    version: 8,
+    sql: `
+      -- Multi-user Phase 1 (hub#252, design 2026-05-20-multi-user-phase-1.md).
+      -- Two columns on \`users\`:
+      --
+      --   * password_changed (INTEGER 0/1) — tracks whether a user has
+      --     changed their password since account creation. The admin-creates-
+      --     user flow (PR 2) lands new accounts with 0; the user's forced
+      --     change-password flow (PR 3) flips it to 1. SQLite has no native
+      --     BOOL, so 0/1 + a TS helper in users.ts handles the translation.
+      --   * assigned_vault (TEXT, nullable) — the vault instance name the
+      --     user is pinned to (Phase 1 is single-vault-per-user). NULL means
+      --     "no per-vault restriction" — the wizard's first admin and any
+      --     other admin-role user. The OAuth issuer (PR 4) reads this at
+      --     mint time to narrow the token's vault scope. No FK: vault names
+      --     resolve through services.json, not a DB row.
+      --
+      -- Backfill: every existing user pre-dates this migration. The only
+      -- accounts that could exist are the wizard's first admin (chose their
+      -- own password via the wizard form) or env-seeded admins (operator
+      -- baked the password into PARACHUTE_INITIAL_ADMIN_PASSWORD). Both
+      -- already-chosen-by-the-account-holder paths, so flip every existing
+      -- row to password_changed=1 — no spurious force-change on first sign-
+      -- in for already-bootstrapped hubs.
+      ALTER TABLE users ADD COLUMN password_changed INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE users ADD COLUMN assigned_vault TEXT;
+      UPDATE users SET password_changed = 1;
+    `,
+  },
+  {
+    version: 9,
+    sql: `
+      -- Same-hub DCR auto-trust (hub#312, design-doc parachute-app §6).
+      -- One column on \`clients\`:
+      --
+      --   * same_hub (INTEGER 0/1) — true when the DCR caller authenticated
+      --     as the operator (bearer hub:admin OR session-cookie+same-origin),
+      --     so the resulting client is "owned by this hub". The /oauth/
+      --     authorize consent gate skips the consent screen for same_hub
+      --     clients requesting only non-admin scopes — the operator who
+      --     registered the client IS the implicit consent, and a repeated
+      --     click per UI install is friction without security value.
+      --
+      -- External DCR (no auth, or post-#268 wizard-window approve) lands
+      -- same_hub=0 and requires explicit consent regardless of scope. The
+      -- first-client wizard-window (hub#268) auto-APPROVES but is NOT same-
+      -- hub: the operator deliberately ran the wizard, but the registrant
+      -- (a third-party app from a friend's hub, browser, install script)
+      -- is external. Approval ≠ ownership.
+      --
+      -- Backfill: every existing row pre-dates this migration. The safe
+      -- default is same_hub=0 — pre-existing clients keep showing consent.
+      -- Operators who want to upgrade an existing client to same-hub trust
+      -- can do so via a future admin action (out of scope for this PR; the
+      -- SPA's existing approve-client view doesn't currently surface
+      -- same_hub).
+      ALTER TABLE clients ADD COLUMN same_hub INTEGER NOT NULL DEFAULT 0;
+      UPDATE clients SET same_hub = 0;
+    `,
+  },
+  {
+    version: 10,
+    sql: `
+      -- Multi-user Phase 2 PR 2 (hub#252 follow-up, design
+      -- 2026-05-20-multi-user-phase-1.md §Phase 2). Lifts the single
+      -- \`users.assigned_vault TEXT\` column into a many-to-many
+      -- \`user_vaults\` table so one user can have access to multiple
+      -- vaults (e.g. a personal vault + a family-shared vault).
+      --
+      -- Schema:
+      --   * (user_id, vault_name) composite PK — one row per (user, vault).
+      --     ON DELETE CASCADE on user_id so user deletion drops the
+      --     assignments without us having to clean up manually.
+      --   * \`role\` TEXT DEFAULT 'write' — reserved for forward-compat per-
+      --     vault role granularity. Phase 1 had no role model; this column
+      --     gives later PRs a column to land scope-narrowing in without a
+      --     second migration. All backfilled rows default to 'write'.
+      --   * index on \`vault_name\` for the inverse lookup ("who has access
+      --     to vault X?") — useful when admin removes a vault and we want
+      --     to warn about pinned users.
+      --
+      -- Backfill: every existing row in \`users\` with a non-null
+      -- \`assigned_vault\` becomes a single (user_id, vault_name) row in
+      -- \`user_vaults\`. Rows with NULL \`assigned_vault\` (admin posture)
+      -- get no \`user_vaults\` entry — they remain "no narrowing" per
+      -- vaultScopeForUser semantics. After backfill the \`assigned_vault\`
+      -- column is dropped.
+      CREATE TABLE user_vaults (
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        vault_name TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'write',
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (user_id, vault_name)
+      );
+      CREATE INDEX user_vaults_vault ON user_vaults (vault_name);
+      INSERT INTO user_vaults (user_id, vault_name, role, created_at)
+      SELECT id, assigned_vault, 'write', created_at
+      FROM users
+      WHERE assigned_vault IS NOT NULL;
+      ALTER TABLE users DROP COLUMN assigned_vault;
+    `,
+  },
+  {
+    version: 11,
+    sql: `
+      -- Real TOTP 2FA at the hub login layer (hub#473). Three nullable
+      -- columns on \`users\`:
+      --
+      --   * totp_secret (TEXT, nullable) — the base32-encoded RFC 6238 TOTP
+      --     secret. NULL means "2FA not enrolled" — the canonical "is 2FA on
+      --     for this user?" signal. Stored as the plaintext base32 string
+      --     (not encrypted at rest): hub.db already holds the argon2id
+      --     password hashes AND the OAuth signing private keys in plaintext
+      --     PEM (signing_keys.private_key_pem), so the TOTP secret sits at
+      --     the same operator-local trust boundary — encrypting one column
+      --     while leaving the signing key in the clear would be security
+      --     theatre. A future at-rest-encryption pass (hub#474 follow-up)
+      --     would cover all three (password hashes are already one-way; the
+      --     signing key + TOTP secret are the recoverable secrets).
+      --   * totp_backup_codes (TEXT, nullable) — JSON array of argon2id-HASHED
+      --     single-use recovery codes. Same hash family as passwords
+      --     (@node-rs/argon2). Plaintext codes are shown to the user exactly
+      --     once at enrollment and never stored. A code is removed from the
+      --     array when consumed. NULL / "[]" means "no backup codes left."
+      --   * totp_enrolled_at (TEXT, nullable) — ISO-8601 timestamp of the
+      --     last successful enrollment. NULL until first enroll; informational
+      --     (admin UI / account page "2FA enabled since …").
+      --
+      -- Backfill: every existing user pre-dates this migration and gets NULL
+      -- for all three — i.e. "2FA not enrolled." Their /login flow stays
+      -- password-only (the login handler only requires a TOTP step when
+      -- totp_secret IS NOT NULL), so existing operators keep signing in
+      -- exactly as before. No backfill UPDATE needed — the column default is
+      -- NULL.
+      ALTER TABLE users ADD COLUMN totp_secret TEXT;
+      ALTER TABLE users ADD COLUMN totp_backup_codes TEXT;
+      ALTER TABLE users ADD COLUMN totp_enrolled_at TEXT;
+    `,
+  },
+  {
+    version: 12,
+    sql: `
+      -- One-time, expiring invite links (design
+      -- 2026-06-04-individual-users-and-vault-operations.md §7). An admin
+      -- generates a link; the recipient opens it, picks a username +
+      -- password, and gets their OWN freshly-provisioned vault as owner.
+      --
+      -- The row stores sha256(token), NOT the raw token. Invites are
+      -- longer-lived than the 60s OAuth auth-codes (default 7-day expiry),
+      -- so a DB read must not be enough to replay the link — the raw token
+      -- is emitted exactly once at creation and never persisted, exactly
+      -- like the bootstrap token. Lookup hashes the URL token and selects
+      -- by the hash; the hash is the primary key.
+      --
+      -- Columns:
+      --   * token (TEXT PK)        — sha256(raw token), hex. Never the raw value.
+      --   * created_by (TEXT)      — admin user id that issued the invite
+      --                              (FK users.id; ON DELETE SET NULL so
+      --                              deleting the issuer doesn't orphan-block
+      --                              the audit row).
+      --   * vault_name (TEXT)      — nullable. When set, the invite pins the
+      --                              vault name (redeemer can't squat names).
+      --                              When NULL + provision_vault=1 the redeemer
+      --                              names their own vault at redeem time.
+      --   * role (TEXT DEFAULT 'write') — the user_vaults role the redeemed
+      --                              user gets on their vault. 'write' = owner
+      --                              (full vault admin per vaultVerbsForRole).
+      --                              Carried so the shared-into-existing-vault
+      --                              case is a later policy change, not a
+      --                              migration.
+      --   * provision_vault (INTEGER) — 1 = provision a NEW vault for the
+      --                              redeemer (the primary flow); 0 = account
+      --                              only / assign an existing vault.
+      --   * default_mirror (TEXT)  — nullable; wires the §3 default-mirror knob
+      --                              ('internal' | 'off') through to the
+      --                              provisioned vault. NULL = vault's own
+      --                              default.
+      --   * expires_at (TEXT)      — ISO-8601; redeem rejects past this.
+      --   * used_at (TEXT)         — ISO-8601 stamp set at redeem. Single-use:
+      --                              a second redeem sees this set and is
+      --                              rejected. Stamped only AFTER the user row
+      --                              commits, so a createUser failure leaves
+      --                              the invite re-usable.
+      --   * redeemed_user_id (TEXT) — the user id the invite created (FK
+      --                              users.id; ON DELETE SET NULL).
+      --   * revoked_at (TEXT)      — ISO-8601 stamp when the admin revokes the
+      --                              invite before redemption.
+      --   * created_at (TEXT)      — ISO-8601.
+      --
+      -- No backfill — no invites pre-date this migration.
+      CREATE TABLE invites (
+        token TEXT PRIMARY KEY,
+        created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+        vault_name TEXT,
+        role TEXT NOT NULL DEFAULT 'write',
+        provision_vault INTEGER NOT NULL DEFAULT 1,
+        default_mirror TEXT,
+        expires_at TEXT NOT NULL,
+        used_at TEXT,
+        redeemed_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+        revoked_at TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX invites_created_at ON invites (created_at);
+    `,
+  },
+  {
+    version: 13,
+    sql: `
+      -- Pre-named invites (Adam/Jonathan scenario). Adds an optional
+      -- \`username\` column to \`invites\`: when set, the invite pre-names
+      -- the account the redeemer gets — the redemption form shows the name
+      -- read-only and the redeem handler ENFORCES it (the form's username
+      -- field is ignored). NULL = the redeemer picks their own username
+      -- (every pre-v13 invite, and the default for new ones).
+      --
+      -- Enforced (not just pre-filled) because a pre-named invite is a
+      -- *named deliverable*: the admin mints "Jonathan's link" and hands it
+      -- to Jonathan; if the redeemer could pick a different name, the
+      -- link's identity binding would be decorative — the admin's audit
+      -- expectation ("this link = jonathan") and any vault assignment
+      -- story told against that name would silently break.
+      --
+      -- Stored as plain TEXT (already-validated lowercase [a-z0-9_-], the
+      -- users.username vocabulary). Mint-time validation rejects names
+      -- taken by an existing user or reserved by another pending invite;
+      -- the redeem path re-checks authoritatively. No backfill — every
+      -- existing invite predates pre-naming and keeps NULL.
+      ALTER TABLE invites ADD COLUMN username TEXT;
+    `,
+  },
+  {
+    version: 14,
+    sql: `
+      -- Refresh-token rotation grace window (hub#685). Records the successor
+      -- a refresh-token row rotated INTO, so the refresh handler can tell the
+      -- *immediately-previous* token (the single benign concurrent/retried
+      -- refresh a multi-tab / bfcache / network-retry client legitimately
+      -- presents) apart from a genuine replay of an older ancestor (theft).
+      --
+      -- \`rotated_to\` is the jti of the row minted when this row rotated. NULL
+      -- on every row that has not (yet) rotated: live tokens, revoked-by-
+      -- /oauth/revoke tokens, revoked-by-family-sweep tokens, and every
+      -- pre-v14 row (no backfill — pre-v14 rotations left no successor link,
+      -- so they fall through to the zero-tolerance theft path exactly as
+      -- before; the grace window only ever helps rows minted post-v14).
+      --
+      -- The successor link is the ONLY structural ordering signal we need:
+      -- created_at alone can't distinguish the direct predecessor from an
+      -- older ancestor under burst issuance (ties), and the grace decision is
+      -- security-load-bearing, so it must be exact, not heuristic.
+      ALTER TABLE tokens ADD COLUMN rotated_to TEXT;
+    `,
+  },
+  {
+    version: 15,
+    sql: `
+      -- Multi-use public signup links + email-as-username + per-vault caps
+      -- (DEMO-PREP-2026-06-25 Workstream B: B1 multi-use invite, B2 email
+      -- capture, B4 public signup page; the cap value is persisted now so
+      -- B3's vault-side enforcement — a separate Phase-2 PR — can read it).
+      --
+      -- (1) FOUR columns on \`invites\` generalize the single-use link into a
+      --     multi-use, capped one. Backwards compatible: every pre-v15 invite
+      --     redeems exactly as before because the defaults reproduce the old
+      --     single-use semantics.
+      --
+      --   * max_uses (INTEGER NOT NULL DEFAULT 1) — how many accounts ONE link
+      --     may create. DEFAULT 1 = the historical single-use invite, so every
+      --     pre-v15 row and every default-shaped new row stays single-use. A
+      --     public signup link mints with a higher value (e.g. 25 demo seats).
+      --   * used_count (INTEGER NOT NULL DEFAULT 0) — how many accounts the link
+      --     HAS created. Redeem refuses once used_count >= max_uses. Replaces
+      --     the boolean used_at as the exhaustion signal for multi-use links;
+      --     used_at is RETAINED (stamped on the FIRST redeem) so legacy
+      --     single-use lookups + the admin list's "redeemed" status keep
+      --     working unchanged.
+      --   * email (TEXT, nullable) — the redeemer's email captured at signup
+      --     as the contactable identity (B2). NULL on every pre-v15 invite and
+      --     on admin-issued links that don't collect email; set per-redemption
+      --     for public-signup links. Stored so the operator can reach signups.
+      --     (One link → many signups means one invite row can't hold every
+      --     redeemer's email; this column holds the MOST-RECENT redeemer's
+      --     email for a single-use link, and the per-account email lives on the
+      --     users row — see (3). For multi-use the canonical per-user email is
+      --     users.email.)
+      --   * vault_cap_bytes (INTEGER, nullable) — the per-vault storage cap to
+      --     STAMP onto each vault this link provisions (B4). NULL on every
+      --     pre-v15 invite + admin-issued links that don't set a cap (those
+      --     provision uncapped, the historical behavior); set to ~1 GB on a
+      --     public-signup link so each provisioned vault gets a vault_caps row
+      --     for the Phase-2 enforcement PR to read. The cap travels on the
+      --     invite (not a server-wide default) so different links can carry
+      --     different caps.
+      --
+      -- (2) ONE column on \`users\`: email-as-contactable-identity (B2). The
+      --     username stays the login + URL identity ([a-z0-9_-]); email is the
+      --     separate contact field the operator sees + uses to reach a signup.
+      --     Nullable: every pre-v15 account (wizard admin, env-seeded admin,
+      --     pre-named friend invites) predates email capture and keeps NULL.
+      --     NOT UNIQUE — two people behind one shared mailbox, or an operator
+      --     re-using their address across test accounts, shouldn't be blocked
+      --     at the schema. Validation (format) happens at the API/redeem edge.
+      --
+      -- (3) NEW \`vault_caps\` table — the per-vault storage cap, persisted at
+      --     provision time (B4: "persist a per-vault cap value at provision
+      --     time EVEN THOUGH vault-side enforcement lands in a separate
+      --     Phase-2 PR — at minimum store the cap so the later PR can read +
+      --     enforce it"). Keyed by vault_name (the same instance-name space
+      --     used across services.json / user_vaults / invites.vault_name; no
+      --     FK — vault names resolve through services.json, not a DB row, the
+      --     established pattern). cap_bytes is the byte ceiling (default
+      --     ~1 GB stamped by the public-signup flow), guarded by a
+      --     CHECK (cap_bytes > 0) so a direct DB write can't seed a 0/negative
+      --     cap the Phase-2 reader would misinterpret. No backfill — existing
+      --     vaults have no cap row, which the Phase-2 enforcement reads as
+      --     "uncapped" (only vaults provisioned through a capped signup get a
+      --     row).
+      ALTER TABLE invites ADD COLUMN max_uses INTEGER NOT NULL DEFAULT 1;
+      ALTER TABLE invites ADD COLUMN used_count INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE invites ADD COLUMN email TEXT;
+      ALTER TABLE invites ADD COLUMN vault_cap_bytes INTEGER;
+      ALTER TABLE users ADD COLUMN email TEXT;
+      CREATE TABLE vault_caps (
+        vault_name TEXT PRIMARY KEY,
+        -- CHECK (cap_bytes > 0): guard against a 0/negative cap from a direct
+        -- DB write making the Phase-2 enforcement reader treat the vault as
+        -- "0-byte ceiling" (everything over cap) or nonsense. The mint + redeem
+        -- paths already validate positivity; this is the at-rest backstop.
+        cap_bytes INTEGER NOT NULL CHECK (cap_bytes > 0),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `,
+  },
+  {
+    version: 16,
+    sql: `
+      -- Index tokens by client_id for the OAuth client GC reaper (#640). The
+      -- reaper's gate runs a correlated NOT EXISTS (SELECT 1 FROM tokens WHERE
+      -- client_id = ? AND ...) per candidate client; tokens previously had no
+      -- client_id index (only user_id / refresh_token_hash / family_id /
+      -- revoked_at / subject), so each check was a full tokens-table walk. Under
+      -- the DCR reconnect churn this GC targets — thousands of dead token rows
+      -- accumulating before a sweep — that is O(total tokens) per client. This
+      -- makes it O(tokens for that client). IF NOT EXISTS so re-opens are inert.
+      CREATE INDEX IF NOT EXISTS tokens_client ON tokens (client_id);
+    `,
+  },
+  {
+    version: 17,
+    sql: `
+      -- Nostr-pubkey ↔ hub-user linkage + verifiable write attribution
+      -- (hub#833 phase 1; team-vault design
+      -- "2026-08-22 Multi-user Parachute — draft for reaction" §3 phase 1a/1b).
+      --
+      -- Deliberately NO new principal entity. The design's §2.1 finding is
+      -- that the hub already has \`users\` and that \`users.id\` is what every
+      -- minted token's \`sub\` carries — so a linked key hangs off the users
+      -- row that already exists, and \`sub\` semantics are untouched.
+      --
+      -- (1) \`user_pubkeys\` — the link itself, one row per (verified) key.
+      --
+      --   * pubkey (TEXT PK) — 32-byte x-only secp256k1 key, LOWERCASE hex
+      --     (64 chars), the NIP-01 canonical spelling. PRIMARY KEY, so a key
+      --     names AT MOST ONE user hub-wide. That is a security property, not
+      --     a convenience: if two users could both claim one key, attribution
+      --     resolved through that key would be ambiguous, and the second
+      --     claimant could launder writes as the first. A second claim is
+      --     refused (the API returns a generic conflict that does NOT reveal
+      --     who holds it — no cross-account existence oracle).
+      --   * user_id — ON DELETE CASCADE. A deleted account's links go with
+      --     it; already-written \`tokens.subject_pubkey\` history does not
+      --     (see (3)).
+      --   * label — optional operator-chosen nickname ("laptop", "phone").
+      --     Free text, length-capped at the API edge, never interpreted.
+      --   * proof_event / proof_event_id — the VERBATIM signed NIP-01 event
+      --     that proved possession, stored so the proof stays independently
+      --     re-verifiable after the fact: a third party can re-serialize the
+      --     event, recompute the id, and check the BIP-340 signature without
+      --     trusting the hub's say-so. This is the whole difference between
+      --     "the hub asserts alice holds this key" and "here is alice's
+      --     signature saying so." Bounded at the API edge (content ≤1 KiB,
+      --     ≤20 tags) so the column can't be stuffed.
+      --   * linked_at — FIRST successful link (never rewritten on re-verify).
+      --   * last_verified_at — most recent successful proof.
+      --
+      -- (2) \`pubkey_challenges\` — replay protection for the ceremony.
+      --
+      --   The row stores sha256(challenge), NEVER the raw value, matching the
+      --   \`invites\` precedent (migration v12): a DB read must not be enough
+      --   to complete a ceremony. Each row is bound to the issuing user, is
+      --   single-use (consumed_at stamped inside the same transaction as the
+      --   link insert, so two concurrent verifies of one challenge can't both
+      --   land), and expires. Nothing in the schema is user-supplied.
+      --
+      -- (3) ONE additive column on \`tokens\`: \`subject_pubkey\`.
+      --
+      --   The mint-time SNAPSHOT of the primary key linked to the row's
+      --   principal. Nullable, no default, no backfill — every pre-v17 row
+      --   and every mint by a principal with no linked key keeps NULL, the
+      --   same "we don't fabricate attribution we don't have" posture
+      --   vault#298 took with its four \`notes\` columns.
+      --
+      --   It is a SNAPSHOT on purpose. Unlinking a key (e.g. after a
+      --   compromise) removes it from \`user_pubkeys\` and from live
+      --   resolution, but does NOT rewrite registry rows: an audit record
+      --   states what was true when the token was minted. The two reads
+      --   answer different questions — "which key does this account hold
+      --   now?" (user_pubkeys) vs "which key was this credential minted
+      --   under?" (tokens.subject_pubkey).
+      --
+      --   NOT authorization: nothing in the hub grants any authority from a
+      --   linked key. \`sub\` remains the only principal the scope checks read.
+      CREATE TABLE user_pubkeys (
+        pubkey TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        label TEXT,
+        proof_event TEXT NOT NULL,
+        proof_event_id TEXT NOT NULL,
+        linked_at TEXT NOT NULL,
+        last_verified_at TEXT NOT NULL
+      );
+      CREATE INDEX user_pubkeys_user ON user_pubkeys (user_id, linked_at, pubkey);
+      CREATE TABLE pubkey_challenges (
+        challenge_hash TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        expires_at TEXT NOT NULL,
+        consumed_at TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX pubkey_challenges_expiry ON pubkey_challenges (expires_at);
+      ALTER TABLE tokens ADD COLUMN subject_pubkey TEXT;
+      CREATE INDEX tokens_subject_pubkey ON tokens (subject_pubkey)
+        WHERE subject_pubkey IS NOT NULL;
+    `,
+  },
+  {
+    version: 18,
+    sql: `
+      -- Preserve the signed possession proof independently of the LIVE
+      -- user_pubkeys link (hub#860). Unlinking a key or deleting its user must
+      -- not make an already-written tokens.subject_pubkey snapshot impossible
+      -- to verify later. No FK to users/user_pubkeys on purpose: this is an
+      -- durable audit store, keyed by the stable subject string that JWTs
+      -- and downstream attribution rows already carry plus the pubkey.
+      CREATE TABLE attribution_proofs (
+        subject TEXT NOT NULL,
+        pubkey TEXT NOT NULL,
+        label TEXT,
+        proof_event TEXT NOT NULL,
+        proof_event_id TEXT NOT NULL,
+        linked_at TEXT NOT NULL,
+        last_verified_at TEXT NOT NULL,
+        PRIMARY KEY (subject, pubkey)
+      );
+      CREATE INDEX attribution_proofs_pubkey ON attribution_proofs (pubkey);
+
+      -- Every proof that is still live at migration time is already verified;
+      -- preserve it before any later unlink/account-delete can cascade the
+      -- source row away. Historical proofs deleted before v18 cannot be
+      -- reconstructed and are intentionally not fabricated.
+      INSERT INTO attribution_proofs
+        (subject, pubkey, label, proof_event, proof_event_id, linked_at, last_verified_at)
+      SELECT user_id, pubkey, label, proof_event, proof_event_id, linked_at, last_verified_at
+      FROM user_pubkeys;
+    `,
+  },
+  {
+    version: 19,
+    sql: `
+      -- Backfill tokens.user_id where subject already is a users.id (hub#833).
+      -- Person-mints going forward always set user_id; this recovers live
+      -- rows whose subject was the account id. Leave the rest grandfathered
+      -- (operator/service labels, friend-named strings). Do not rewrite
+      -- already-issued JWTs — they expire / rotate.
+      UPDATE tokens
+         SET user_id = subject
+       WHERE user_id IS NULL
+         AND subject IS NOT NULL
+         AND EXISTS (SELECT 1 FROM users WHERE id = tokens.subject);
+    `,
+  },
+  {
+    version: 20,
+    sql: `
+      -- Multi-admin hub roles (hub#881). Until now "hub admin" was a
+      -- POSITION, not a property: \`getFirstAdminId\` = the earliest
+      -- \`users\` row by created_at. That made the admin unique by
+      -- construction and unpromotable. One column on \`users\` lifts it
+      -- into a stored role:
+      --
+      --   * hub_role (TEXT NOT NULL DEFAULT 'user') — 'admin' | 'user'.
+      --     'admin' means hub-wide administrator: unrestricted vault
+      --     posture (\`vaultScopeForUser\` returns \`[]\`), may mint the
+      --     host-admin bearer, may reach /admin/*. TEXT rather than an
+      --     INTEGER flag so a third role can land without a migration.
+      --     No CHECK constraint: \`isHubAdmin\` fails closed on any
+      --     value it doesn't recognise, which is the same defense
+      --     \`vaultVerbsForRole\` already applies to user_vaults.role.
+      --
+      -- Backfill: exactly the pre-v20 definition of "the admin" — the
+      -- earliest-created row — so every already-bootstrapped hub keeps
+      -- the same single admin it had before this migration, and every
+      -- other existing account keeps the 'user' default. An empty users
+      -- table (pre-wizard) updates zero rows; \`createUser\` stamps
+      -- 'admin' on the first account it creates.
+      --
+      -- NOT NULL DEFAULT 'user' is the fail-closed direction: a row
+      -- written by code that doesn't know about this column lands as a
+      -- non-admin rather than as an administrator.
+      ALTER TABLE users ADD COLUMN hub_role TEXT NOT NULL DEFAULT 'user';
+      UPDATE users
+         SET hub_role = 'admin'
+       WHERE id = (SELECT id FROM users ORDER BY created_at ASC LIMIT 1);
+    `,
+  },
+  {
+    version: 21,
+    sql: `
+      -- Who revoked this token, and over which surface (hub#931). Before
+      -- this migration a revoked row recorded only \`revoked_at\`, so a
+      -- credential that died mid-upgrade left NO trace of the actor — the
+      -- CLI path in particular wrote nothing anywhere.
+      --
+      --   * revoked_by (TEXT) — the actor. HTTP records the bearer's
+      --     \`sub\`; the CLI records \`cli:<unix user>\`.
+      --   * revoked_via (TEXT) — 'cli' | 'http'. TEXT, not a flag, so a
+      --     third surface can land without a migration.
+      --
+      -- Both nullable with NO backfill and NO default: every pre-v21 row,
+      -- and every revoke by an internal sweep that names no actor
+      -- (\`revokeTokensNamingVault\`, refresh rotation), keeps NULL. Same
+      -- posture as \`tokens.subject_pubkey\` (v17) — we do not fabricate
+      -- attribution we never had. NULL means "unrecorded", not "nobody".
+      ALTER TABLE tokens ADD COLUMN revoked_by TEXT;
+      ALTER TABLE tokens ADD COLUMN revoked_via TEXT;
+    `,
+  },
+  {
+    version: 22,
+    sql: `
+      -- Grant attribution on \`user_vaults\` (hub lockdown). Until now a row
+      -- said WHO HAS access and nothing about WHO GAVE IT: an operator
+      -- looking at an unexpected assignment had no way to tell whether the
+      -- owner made it, a write-role assignee re-granted it, or it arrived
+      -- through the admin API. Three nullable columns, no backfill:
+      --
+      --   * granted_by_user_id (TEXT NULL) — the hub account that granted.
+      --   * granted_by_pubkey  (TEXT NULL) — the Nostr key that SIGNED the
+      --     granting request, when there was one (NIP-98 only). Several
+      --     agents with their own keys routinely link to one hub user, so
+      --     the user id alone cannot name the actor; this can.
+      --   * granted_via        (TEXT NULL) — 'mcp' | 'cli' | 'api'. No CHECK
+      --     constraint: this is an attribution label, never an authority
+      --     input, so an unrecognised value is a display concern, not a
+      --     privilege one.
+      --
+      -- Deliberately NO backfill. Every pre-existing row was written before
+      -- the hub recorded a grantor, so any value we invented here would be a
+      -- fabricated audit trail. NULL reads as "unknown", which is true.
+      -- \`doctor\`'s grants-attributed check therefore only looks at rows
+      -- created AFTER this migration's applied_at.
+      --
+      -- Nullable rather than NOT NULL DEFAULT: a writer that doesn't know
+      -- about these columns should leave "unknown", not claim an actor.
+      ALTER TABLE user_vaults ADD COLUMN granted_by_user_id TEXT;
+      ALTER TABLE user_vaults ADD COLUMN granted_by_pubkey TEXT;
+      ALTER TABLE user_vaults ADD COLUMN granted_via TEXT;
+    `,
+  },
+  {
+    version: 23,
+    sql: `
+      -- Channel-attached vaults, PR 1 (design "Channel-attached vaults —
+      -- membership becomes access", §1). Binds ONE Buzz channel to ONE
+      -- Parachute vault so a later reconciler can turn channel membership
+      -- into \`user_vaults\` rows. This PR ships the binding only: no
+      -- roster fetch, no grants, no reconciler.
+      --
+      -- Schema:
+      --   * (relay_host, channel_id) composite PK — one binding per channel.
+      --     A vault MAY back several channels, so there is no UNIQUE on
+      --     \`vault\`; the index below serves the inverse lookup ("which
+      --     channels point at vault X?"), the same shape
+      --     \`user_vaults_vault\` (v10) serves.
+      --   * relay_host — stored LOWER-CASED and scheme-less, matching
+      --     \`relayHostOf\` in parachute-surface's parachute-mcp
+      --     (packages/parachute-mcp/src/channel.ts). Hostnames are
+      --     case-insensitive but the vault PATHS derived from them are not,
+      --     so a case difference would fork one channel into two bindings.
+      --   * vault — a vault INSTANCE NAME, same name space as
+      --     \`user_vaults.vault_name\` / services.json / \`invites.vault_name\`.
+      --     No FK: there is no vaults table on the hub (names resolve
+      --     through services.json), the established hub pattern.
+      --   * mode — 'sync' | 'frozen'. TEXT with a 'sync' default rather than
+      --     a flag so a third mode can land without a migration, and NO
+      --     CHECK constraint: the same fail-closed-at-the-reader posture
+      --     \`vaultVerbsForRole\` takes on \`user_vaults.role\` (v10) and
+      --     \`isHubAdmin\` takes on \`users.hub_role\` (v20). 'frozen' means
+      --     "keep the grants you have, stop syncing" — the answer to the
+      --     relay-unreachable question in the design.
+      --   * relay_self_pubkey — the relay's NIP-11 \`self\` key, pinned
+      --     trust-on-first-use so PR 4 can verify the signature on the kind
+      --     39002 roster it fetches. NULL until a roster fetch exists.
+      --   * synced_at — last successful roster sync (PR 5). NULL means
+      --     "never synced", which is every row this PR writes; \`doctor\`
+      --     renders it so a stale binding is visible rather than silent.
+      --
+      -- No backfill: the table is new and nothing else writes a binding.
+      CREATE TABLE channel_vaults (
+        relay_host TEXT NOT NULL,
+        channel_id TEXT NOT NULL,
+        vault TEXT NOT NULL,
+        mode TEXT NOT NULL DEFAULT 'sync',
+        relay_self_pubkey TEXT,
+        synced_at TEXT,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (relay_host, channel_id)
+      );
+      CREATE INDEX channel_vaults_vault ON channel_vaults (vault);
+    `,
+  },
+  {
+    version: 24,
+    sql: `
+      -- Channel-attached vaults, PR 5: make a FROZEN binding legible.
+      --
+      -- The design's answer to "relay unreachable: freeze or drop?" is
+      -- freeze — the reconciler leaves every \`user_vaults\` row alone and
+      -- leaves \`synced_at\` stale. That is the right behaviour and the
+      -- WORST possible failure to diagnose: a hub whose roster stopped
+      -- updating looks exactly like a hub whose roster stopped changing.
+      -- \`synced_at\` alone says "not recently", never "and here is why".
+      --
+      --   * last_error (TEXT NULL) — the most recent \`RosterFailure\`
+      --     reason word (\`relay_unreachable\`, \`relay_rejected\`,
+      --     \`relay_key_changed\`, …). The REASON only: no response body,
+      --     no URL, no key material. Cleared to NULL on the next success,
+      --     so a non-NULL value always means "the last attempt failed".
+      --   * last_attempt_at (TEXT NULL) — when that attempt ran. Paired
+      --     with \`synced_at\`, the two answer "how long has this been
+      --     broken" without a log dig: attempting-but-failing shows a
+      --     fresh \`last_attempt_at\` against a stale \`synced_at\`.
+      --
+      -- Diagnostics, never authority: nothing reads either column to
+      -- decide what to grant. Writing them on a failed poll is therefore
+      -- NOT a violation of "on failure, touch nothing" — the invariant
+      -- that matters is that no grant row moves and \`synced_at\` does not
+      -- advance, and both hold.
+      --
+      -- Nullable, no backfill, no default: a pre-v24 binding never had an
+      -- attempt recorded, and NULL honestly says so.
+      ALTER TABLE channel_vaults ADD COLUMN last_error TEXT;
+      ALTER TABLE channel_vaults ADD COLUMN last_attempt_at TEXT;
+    `,
+  },
+];
+
+/**
+ * How long a write waits for another connection's lock before giving up
+ * (hub#861). SQLite — and therefore `bun:sqlite` — defaults `busy_timeout` to
+ * **0**, which means the very first `SQLITE_BUSY` fails the statement
+ * immediately. WAL keeps readers out of the way, but it still allows only one
+ * writer at a time, and the hub has several: the server's request handlers,
+ * the CLI running against the same `hub.db`, and background sweeps. With a
+ * zero timeout, a transaction that merely overlapped another writer's
+ * millisecond-long commit surfaced as a user-visible failure — on the pubkey
+ * linkage path, a spuriously-rejected `/verify` that also burned the
+ * single-use challenge, which is the shape hub#861 reported.
+ *
+ * Five seconds is the widely-used SQLite default-ish value: long enough that
+ * ordinary contention is invisible, short enough that a genuinely stuck writer
+ * still returns an error instead of hanging a request forever.
+ *
+ * The busy handler only helps where a lock is acquired outright, not where a
+ * transaction upgrades from read to write (SQLite returns `SQLITE_BUSY`
+ * immediately there, by design, to avoid deadlock). The hub's contended write
+ * transactions take their write lock on the first statement, so they get the
+ * wait.
+ */
+export const HUB_DB_BUSY_TIMEOUT_MS = 5000;
+
+/**
+ * Migration that added `user_vaults.granted_by_user_id` / `granted_by_pubkey`
+ * / `granted_via`. `doctor`'s `grants-attributed` check reads this version's
+ * `schema_version.applied_at` to know which rows COULD have carried a grantor
+ * — rows older than it are unattributed because the hub wasn't recording yet,
+ * which is not a finding.
+ */
+export const GRANT_ATTRIBUTION_MIGRATION = 22;
+
+export function openHubDb(path: string = hubDbPath()): Database {
+  mkdirSync(dirname(path), { recursive: true });
+  const db = new Database(path);
+  db.exec("PRAGMA journal_mode = WAL");
+  db.exec("PRAGMA foreign_keys = ON");
+  db.exec(`PRAGMA busy_timeout = ${HUB_DB_BUSY_TIMEOUT_MS}`);
+  migrate(db);
+  return db;
+}
+
+export function migrate(db: Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS schema_version (
+      version INTEGER PRIMARY KEY,
+      applied_at TEXT NOT NULL
+    );
+  `);
+  const applied = new Set<number>(
+    (db.query("SELECT version FROM schema_version").all() as { version: number }[]).map(
+      (r) => r.version,
+    ),
+  );
+  const insert = db.prepare("INSERT INTO schema_version (version, applied_at) VALUES (?, ?)");
+  for (const m of MIGRATIONS) {
+    if (applied.has(m.version)) continue;
+    db.transaction(() => {
+      db.exec(m.sql);
+      insert.run(m.version, new Date().toISOString());
+    })();
+  }
+}

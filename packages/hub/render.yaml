@@ -1,0 +1,112 @@
+# Render Blueprint for self-hosting @openparachute/hub.
+#
+# Layout: one `web` service (the hub HTTP server) backed by a persistent
+# disk at /parachute. Notes is served by hub via the `notes-serve.ts`
+# shim once installed — no separate Render service for it. Vault gets its
+# own Render Blueprint (separate repo).
+#
+# To use: connect a fresh Render account to a fork of this repo and click
+# "New Blueprint" → point at this file. Render will provision the
+# service + disk and start the build. After deploy, open Render Logs and
+# search for `parachute-bootstrap-` to find your one-time admin setup
+# token, then visit `/admin/setup` and paste it in.
+#
+# Custom domains: add the domain on the Render service page, then set
+# PARACHUTE_HUB_ORIGIN to `https://<your-domain>`. The OAuth issuer claim
+# is baked from this value, so issued tokens are only valid against the
+# canonical origin.
+
+services:
+  - type: web
+    name: parachute-hub
+    runtime: docker
+    # Starter plan ($7/mo) required: persistent disks are NOT available on Render's free tier.
+    # Render auto-resizes plans online if you need to upgrade later.
+    plan: starter
+    # Health check at /health — implemented at the very top of hub's
+    # request dispatch so a wedged DB or busted services.json can't
+    # cascade into a Render restart loop.
+    healthCheckPath: /health
+    autoDeploy: true
+    disk:
+      name: parachute-home
+      mountPath: /parachute
+      # 1 GiB covers the hub.db + per-vault data for a single operator.
+      # Bump in the Render dashboard if you're hosting multiple
+      # high-traffic vaults; Render resizes online (no redeploy).
+      sizeGB: 1
+    envVars:
+      # The persistent disk mount. Hub honors this for `~/.parachute/`,
+      # so hub.db, services.json, well-known/, and per-service dirs all
+      # land on the persistent volume rather than the ephemeral
+      # container filesystem.
+      - key: PARACHUTE_HOME
+        value: /parachute
+
+      # Container listens on whatever port Render injects via $PORT.
+      # Render's HTTP forwarder maps the public 443 → this port.
+      - key: PORT
+        value: 1939
+
+      # Bind to all interfaces inside the container so Render's HTTP
+      # forwarder can reach us — the on-box `parachute expose` default
+      # of 127.0.0.1 only works behind a same-host reverse proxy.
+      - key: PARACHUTE_BIND_HOST
+        value: 0.0.0.0
+
+      # Pin Bun's global-install root to the persistent disk so modules
+      # installed at runtime via /admin/modules (hub#260) survive
+      # container restarts. `bun add @openparachute/<svc>` resolves the
+      # package to `$BUN_INSTALL/install/global/node_modules/<pkg>`;
+      # module discovery in src/install-source.ts honors this env var,
+      # so the supervisor finds installed children at the new path.
+      # Without this, bun installs to its per-user prefix on the
+      # ephemeral image layer and every redeploy nukes user-installed
+      # modules.
+      - key: BUN_INSTALL
+        value: /parachute/modules
+
+      # BUN_INSTALL_BIN — where bun puts binary symlinks during
+      # `bun add -g`. Bun's BUN_INSTALL only controls PACKAGE location;
+      # bin symlinks default to /usr/local/bin/ (system path, not
+      # writable by the non-root `bun` user). Pinning to
+      # /parachute/modules/bin makes installs land on the persistent
+      # disk + survive container restarts. Without this, every
+      # `bun add -g` fails with EACCES at symlinkat() to /usr/local/bin/.
+      # The Dockerfile also extends PATH to include this dir so hub +
+      # child processes resolve the installed binaries. See hub#349.
+      - key: BUN_INSTALL_BIN
+        value: /parachute/modules/bin
+
+      # Modules installed via admin SPA cascade to this channel by
+      # default. `latest` is the right default for most operators
+      # (stable releases of vault / app / scribe / runner). Flip to
+      # `rc` in your Render dashboard if you want the rc cascade
+      # (pre-release modules; useful for dev/testing). Per-call
+      # `--channel` and `--tag` still override on the install command.
+      # (hub#337, hub#347)
+      - key: PARACHUTE_INSTALL_CHANNEL
+        value: latest
+
+      # PARACHUTE_HUB_ORIGIN — only set if attaching a custom domain. Hub
+      # auto-derives the OAuth issuer from the incoming request origin when
+      # unset, which is the right answer for the Render-assigned
+      # *.onrender.com URL. Set this manually in the Render dashboard's
+      # Environment tab if you're using a custom domain (and update it BEFORE
+      # issuing OAuth tokens to clients — tokens are tied to the issuer claim).
+
+      # Admin setup: hub generates a one-time bootstrap token on first
+      # boot (printed prominently to logs). Visit /admin/setup, paste
+      # the token, create your admin account. No env-var passwords in
+      # the Render dashboard by default — cleaner secret hygiene.
+      #
+      # Operators who need env-var-driven setup (CI, scripted deploys,
+      # etc.) can still add `PARACHUTE_INITIAL_ADMIN_USERNAME` +
+      # `PARACHUTE_INITIAL_ADMIN_PASSWORD` env vars manually in the
+      # Render dashboard. Hub honors them when present (per the
+      # `seedInitialAdminIfNeeded` code path in src/commands/serve.ts).
+
+      # Run with a sensible Node-style production hint. Bun honors this
+      # for any libraries that branch on NODE_ENV.
+      - key: NODE_ENV
+        value: production

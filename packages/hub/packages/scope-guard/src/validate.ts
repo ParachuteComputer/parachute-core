@@ -1,0 +1,765 @@
+import { type JWTPayload, jwtVerify } from "jose";
+import {
+  type JwksGetter,
+  type JwksOptions,
+  forceReloadJwks,
+  getOrCreateJwksGetter,
+  resetCache,
+} from "./jwks.js";
+import { parseScopes } from "./parse.js";
+import {
+  type RevocationCache,
+  type RevocationFetcher,
+  createRevocationCache,
+} from "./revocation-cache.js";
+
+/**
+ * Hub-issued JWT validation, factored out of vault/scribe/parachute-agent's
+ * near-identical implementations.
+ *
+ * Trust model:
+ *   - The hub origin is the trust pin. `iss` MUST equal it; without that
+ *     check, anyone could mint a token against any RSA key and pass JWKS
+ *     verification (jose verifies the signature, not who issued the token).
+ *     With `allowedIssuers`, the pin widens from a single origin to a
+ *     hub-CONTROLLED SET of the hub's own legitimate origins (one box reached
+ *     via several URLs — loopback ∪ sslip.io ∪ custom domain). This is still a
+ *     pin against the hub's origins, NOT a relaxation: the signature verify
+ *     runs first and proves only this hub minted the token; the set never
+ *     includes an unvalidated request Host. See `allowedIssuers` jsdoc.
+ *   - JWKS is fetched from `<jwksOrigin>/.well-known/jwks.json`, defaulting
+ *     to the same `hubOrigin` used for the `iss` pin. Co-located resource
+ *     servers can override `jwksOrigin` (e.g. loopback) to read their hub's
+ *     keys without egressing through a public tunnel (vault#464), while still
+ *     validating `iss` against the public origin.
+ *   - `aud` is strict-checked against `expectedAudience` when supplied —
+ *     this is the resource-server backstop for per-resource binding.
+ *
+ * Scope-shape policy (e.g. "no broad `vault:<verb>` from hub JWTs") is
+ * enforced one layer up by the consumer — this function stays focused on
+ * JWT-level concerns and is generic across all Parachute resource servers.
+ */
+
+/**
+ * Default min-interval between *forced* JWKS reloads on rotation-class
+ * verification failures. 10s — long enough that a flood of bad-signature
+ * tokens can't drive a refetch storm against the hub, short enough that a
+ * genuine same-kid rotation / DB restore recovers near-immediately rather
+ * than waiting out the 5-min `cacheMaxAge`.
+ */
+const DEFAULT_JWKS_RELOAD_MIN_INTERVAL_MS = 10_000;
+
+/** Surface of claims returned to callers. Everything else is dropped. */
+export interface HubJwtClaims {
+  /** Subject — operator's stable id. */
+  sub: string;
+  /** Parsed `scope` claim (whitespace-separated → array). */
+  scopes: string[];
+  /**
+   * Representative audience. When `expectedAudience` is supplied and
+   * matches, this is that exact value. Otherwise it's the first array
+   * element (or the string itself if `aud` was a single string), or
+   * `undefined` if no `aud` claim was present.
+   */
+  aud: string | undefined;
+  /** Token id. Surfaced for logging / future revocation lookups. */
+  jti: string | undefined;
+  /** Client id from the `client_id` claim, if present. */
+  clientId: string | undefined;
+  /**
+   * Parsed `vault_scope` claim (the multi-user Phase 1 per-user vault pin —
+   * see [`2026-05-20-multi-user-phase-1.md`](https://parachute.computer/design/2026-05-20-multi-user-phase-1/)).
+   *
+   * Semantics:
+   *   - **Non-empty list** (e.g. `["aaron"]`) — the user is pinned to these
+   *     vault instances. Resource servers (vault, notes, scribe) refuse
+   *     requests against any other vault.
+   *   - **Empty list `[]`** — no per-user vault restriction. Admin tokens
+   *     and any pre-PR-4 hub-issued token surface as `[]`.
+   *
+   * Always present (defaults to `[]` when the claim is absent or malformed)
+   * so consumers can call `enforceVaultScope(claims, name)` without
+   * distinguishing "absent" from "empty." Hub mints non-array values
+   * never — but malformed input is treated as `[]` (no restriction)
+   * rather than throwing, since the upstream scope strings still pin
+   * the resource. The defense-in-depth check via `vault_scope` is
+   * additive, not the sole gate.
+   */
+  vaultScope: string[];
+  /**
+   * Raw `permissions` claim from the validated JWT payload, surfaced
+   * verbatim. scope-guard does NOT interpret it — it parses-and-passes the
+   * object so resource servers can read their own permission shapes without
+   * re-decoding the token. e.g. vault reads `permissions.scoped_tags` for
+   * tag-scoping; scope-guard knows nothing of `scoped_tags` semantics.
+   *
+   * Present only when the validated payload carries a non-null plain object
+   * under `permissions`. Absent or non-object (string / number / array)
+   * surfaces as `undefined` — distinct from an empty object `{}` so consumers
+   * can tell "no permissions claim" from "permissions claim with no entries."
+   */
+  permissions?: Record<string, unknown>;
+}
+
+/** Reasons a hub JWT may fail validation. Each maps to a `HubJwtError.code`. */
+export type HubJwtErrorCode =
+  | "signature"
+  | "issuer"
+  | "expired"
+  | "kid"
+  | "jwks"
+  | "audience"
+  | "shape"
+  /**
+   * The token's `jti` is in the hub's revocation list. The token has been
+   * intentionally retired by the operator (compromise cleanup, key rotation,
+   * etc.) — distinct from "we couldn't load the list," which is `revocation_unavailable`.
+   */
+  | "revoked"
+  /**
+   * Couldn't load the revocation list and have no last-good cache yet, so we
+   * fail-closed and reject. Operationally distinct from `revoked`: the token
+   * may be perfectly valid; the AS side has a problem (hub down, cold start,
+   * network blip). Operators chasing a regression need this discrimination
+   * at the moment of failure rather than seeing every cold-cache 401 look
+   * like an intentional revocation.
+   */
+  | "revocation_unavailable";
+
+/**
+ * Single error class for all validation failures. Branch on `code` rather
+ * than catching a subclass — services format their error responses anyway,
+ * and a flat error keeps consumer code simple.
+ */
+export class HubJwtError extends Error {
+  override name = "HubJwtError";
+  readonly code: HubJwtErrorCode;
+
+  constructor(code: HubJwtErrorCode, message: string) {
+    super(message);
+    this.code = code;
+  }
+}
+
+export interface CreateScopeGuardOptions {
+  /**
+   * The hub's origin. Either a literal string or a resolver function — the
+   * function form lets consumers layer their own env-var precedence (e.g.
+   * parachute-agent's `PARACHUTE_AGENT_HUB_ORIGIN` over
+   * `PARACHUTE_HUB_ORIGIN`). Trailing slashes are stripped so the canonical
+   * form matches what the hub mints.
+   */
+  hubOrigin: string | (() => string);
+
+  /**
+   * The SET of additional origins to accept in the token's `iss` claim,
+   * beyond `hubOrigin`. **Optional and purely additive** — when omitted (the
+   * default), the `iss` check is byte-identical to before this seam existed:
+   * exact match against the single resolved `hubOrigin`.
+   *
+   * Motivation (multi-origin iss-set, onboarding-streamline 2026-06-25): one
+   * box reachable on several URLs at once (loopback + `<ip>.sslip.io` + a
+   * custom domain behind Caddy) mints tokens whose `iss` is whichever origin
+   * the request arrived on. The hub's signing KEY is stable and
+   * origin-independent — the only thing the origin drives is the `iss` string —
+   * so a token minted under URL-A must validate when the resource is reached
+   * via URL-B on the SAME box. jose's `issuer` option already accepts
+   * `string | string[]`; this option supplies the extra members of that set.
+   *
+   * SECURITY INVARIANT (load-bearing — do not loosen): the values returned
+   * here MUST be the hub's own legitimate origins ONLY — i.e. the output of
+   * the hub's `buildHubBoundOrigins` (configured issuer ∪ loopback aliases ∪
+   * expose-state public origin ∪ platform origin), published to the resource
+   * server out-of-band (env / config) by the HUB/OPERATOR. They must NEVER
+   * derive from an unvalidated request `Host` / `X-Forwarded-Host`. Accepting
+   * `iss ∈ this-set` is safe ONLY because the JWKS signature verify
+   * (`jwtVerify`, which runs FIRST and unconditionally) already proves THIS
+   * hub minted the token. The set is a belt-and-suspenders allowlist layered
+   * on top of the signature gate, never a substitute for it. A token signed by
+   * a foreign key fails the signature step regardless of its `iss`.
+   *
+   * Shape: a resolver function returning the set, re-evaluated per call so an
+   * operator widening the box's origins (a new domain via the env var) is
+   * picked up without a resource-server restart. The resolved `hubOrigin` is
+   * always added to whatever this returns, so a caller need not (but may)
+   * include it. Empty / undefined → identical to omitting the option (single
+   * `hubOrigin` only). Trailing slashes are stripped; malformed entries are
+   * dropped.
+   */
+  allowedIssuers?: () => readonly string[] | undefined;
+
+  /**
+   * Origin to FETCH the JWKS from, when it must differ from the `hubOrigin`
+   * used to validate the token's `iss`. Same shape as `hubOrigin` — a literal
+   * string or a resolver function — and re-evaluated per call so env changes
+   * are picked up without a restart. Trailing slashes are stripped.
+   *
+   * **Defaults to `hubOrigin` when omitted** — existing callers (scribe,
+   * paraclaw, and vault until it opts in) are completely unaffected: the JWKS
+   * is fetched from the same origin the `iss` is validated against, exactly as
+   * before this seam existed.
+   *
+   * Motivation (vault#464): on a co-located deploy (hub + vault on one box),
+   * `parachute expose` pins `hubOrigin` to the PUBLIC Cloudflare FQDN so the
+   * token's `iss` claim matches what the hub mints. But fetching JWKS from that
+   * public origin hairpins out through the tunnel and back to the same box —
+   * slow on a real VPS, a hard timeout under Docker NAT-loopback. The fix is to
+   * keep validating `iss` against the public origin while fetching the keys
+   * from the LOCAL hub (loopback). The consumer passes
+   * `jwksOrigin: () => "http://127.0.0.1:1939"` (or its internal override) and
+   * leaves `hubOrigin` as the public FQDN.
+   *
+   * The JWKS cache is keyed on the fetch origin (this value), so a
+   * public-`iss` + loopback-`jwksOrigin` guard caches under the loopback key —
+   * the iss-pin and the fetch-origin are fully decoupled.
+   *
+   * If an explicit `jwksGetter` is also supplied, that getter owns the fetch
+   * path and `jwksOrigin` has no effect (the getter is used verbatim).
+   */
+  jwksOrigin?: string | (() => string);
+
+  /**
+   * Accept hub-signed JWTs that lack the `jti` claim entirely. **Default
+   * `false` — strict rejection** (per hub#218 hardening). Operators with
+   * pre-Phase-1 legacy tokens (issued before the token-registry contract
+   * stamped `jti` on every mint) can set this to `true` during a
+   * transition window; the validate path logs a warning via
+   * `missingJtiLogger` (when supplied) but accepts the token.
+   *
+   * Trust framing: rejection is the right default because revocation
+   * cannot be enforced on tokens we can't index. A jti-less hub-signed
+   * JWT is an anomaly — either a pre-registry mint that should have
+   * aged out, or a forged token from an attacker who got a signing key
+   * but skipped the registry path. Operators who explicitly know they
+   * still have legacy tokens in flight can opt out; everyone else gets
+   * the security floor.
+   */
+  allowMissingJti?: boolean;
+
+  /**
+   * Logger called when a jti-less token is accepted under
+   * `allowMissingJti: true`. Lets operators monitor the legacy-token
+   * decay curve before flipping the opt-out back off. Defaults to a
+   * no-op when omitted — callers who want observability supply their
+   * service's structured logger here.
+   */
+  missingJtiLogger?: (info: { sub: string; aud: string | undefined; iat?: number }) => void;
+
+  /** Optional JWKS cache tuning. Defaults: 5min cacheMaxAge, 30s cooldown. */
+  jwks?: JwksOptions;
+
+  /**
+   * Minimum interval (ms) between *forced* JWKS reloads on rotation-class
+   * verification failures. Defaults to 10s.
+   *
+   * On a verification failure classified as `signature` / `kid` / `jwks`
+   * (the rotation-recoverable classes), `validateHubJwt` force-reloads the
+   * JWKS once and retries — this recovers from same-kid rotation,
+   * no-kid-multi-key, and within-`cacheMaxAge` staleness, which jose's own
+   * reactive reload can't reach. Because the forced reload bypasses jose's
+   * `cooldownDuration`, an unthrottled retry would let a flood of
+   * genuinely-bad-signature tokens drive a refetch storm against the hub.
+   * This min-interval gates the forced reload per guard: within the window,
+   * the retry is skipped and the original failure is surfaced as-is (the same
+   * behavior as before this hardening landed). Tests use a small value plus
+   * `jwksReloadNow` to exercise the window deterministically.
+   */
+  jwksReloadMinIntervalMs?: number;
+
+  /**
+   * Test seam for time used by the forced-reload throttle. Defaults to
+   * `Date.now`. Mirrors `revocationNow` — override to drive the throttle
+   * window deterministically without sleeping.
+   */
+  jwksReloadNow?: () => number;
+
+  /**
+   * Inject a JWKS getter directly. When provided, the lib uses it verbatim
+   * and does NOT consult the cache or `jwks` options. Tests use this to
+   * point at a fake JWKS endpoint without needing to register the origin
+   * with jose's remote-fetcher; non-default JWKS topologies (e.g. local
+   * static keys) can use it to bypass the network entirely.
+   */
+  jwksGetter?: JwksGetter;
+
+  /**
+   * Origin the revocation list is FETCHED from — the exact sibling of
+   * `jwksOrigin`, and for the exact same reason.
+   *
+   * **Defaults to `jwksOrigin` when that is supplied, else to `hubOrigin`.**
+   *
+   * Motivation (the bug this option exists to close): `jwksOrigin` landed in
+   * vault#464 because a co-located resource server must not fetch keys from
+   * the PUBLIC hub FQDN — that hairpins out and back to the same box, which
+   * is slow on a VPS and a hard failure under Docker NAT-loopback or a
+   * tailnet whose MagicDNS the box itself can't resolve. The revocation
+   * fetch has the identical topology and did NOT get the identical fix: it
+   * stayed pinned to the canonical `hubOrigin`.
+   *
+   * The consequence was worse than the JWKS case, because revocation
+   * **fails closed** on a cold cache. A box that couldn't reach its own
+   * public FQDN rejected *every* hub-issued JWT with
+   * `revocation_unavailable` — a fully bricked resource server, presenting
+   * to the operator as a 401 that downstream UIs render as "you're not
+   * signed in." Signing in again could never help.
+   *
+   * Defaulting to `jwksOrigin` means any consumer that already opted into
+   * the loopback JWKS fetch (vault does) is fixed without a code change on
+   * their side; the two fetches now travel the same path by construction,
+   * which is the property that was missing. Consumers with a genuinely
+   * split topology can still set this explicitly.
+   */
+  revocationOrigin?: string | (() => string);
+
+  /**
+   * Inject a revocation-list fetcher. Tests use this to drive list contents
+   * (revoked / clear / failure) deterministically without needing a real
+   * `<origin>/.well-known/parachute-revocation.json` endpoint. Production
+   * uses the default fetcher (`globalThis.fetch` against the revocation
+   * origin).
+   */
+  revocationFetcher?: RevocationFetcher;
+
+  /**
+   * Called when a revocation-list fetch fails. See
+   * `CreateRevocationCacheOptions.onFetchError` — defaults to a throttled
+   * `console.warn` on the fail-CLOSED case (which means this resource server
+   * is rejecting 100% of hub tokens and an operator needs to know).
+   */
+  revocationOnFetchError?: (info: {
+    origin: string;
+    fatal: boolean;
+    error: unknown;
+  }) => void;
+
+  /**
+   * Override the revocation cache TTL (ms). Tests use small values to
+   * exercise stale/refresh paths without sleeping. Defaults to 60s, matching
+   * hub's published `Cache-Control: max-age=60` on the revocation endpoint.
+   */
+  revocationTtlMs?: number;
+
+  /**
+   * Test seam for time used inside the revocation cache. Defaults to
+   * `Date.now`. Override to drive freshness windows deterministically.
+   */
+  revocationNow?: () => number;
+}
+
+export interface ValidateHubJwtOptions {
+  /**
+   * If set, strict-check the JWT `aud` claim against this exact value.
+   * Used by per-resource auth paths: each request derives the expected
+   * audience (e.g. `vault.work`) and rejects tokens stamped for a
+   * different resource. Pass `null` (or omit) to skip.
+   *
+   * The audience strict-check is the resource-server backstop. Even if
+   * scope narrowing slips upstream, `aud=vault.work` cannot reach
+   * `/vault/personal/*` because the audience-mismatch reject fires first.
+   */
+  expectedAudience?: string | null;
+}
+
+export interface ScopeGuard {
+  /**
+   * Verify a presented JWT. Returns surfaced claims on success; throws
+   * `HubJwtError` (with a `code`) on any failure.
+   */
+  validateHubJwt(token: string, opts?: ValidateHubJwtOptions): Promise<HubJwtClaims>;
+
+  /**
+   * Drop the cached JWKS getter for this guard's origin. Tests use this to
+   * switch fake JWKS endpoints between cases; production callers shouldn't
+   * need it. Key rotation is handled at validate time: jose's getter reacts
+   * to an *unknown kid* on its own (rate-limited by `cooldownDuration`), and
+   * `validateHubJwt` covers the remaining cases (same-kid rotation,
+   * no-kid-multi-key, within-`cacheMaxAge` staleness) by force-reloading the
+   * JWKS and retrying once on a rotation-class failure. `cacheMaxAge` is only
+   * the periodic refresh ceiling, not a reaction to verification failures.
+   */
+  resetJwksCache(): void;
+
+  /**
+   * Drop this guard's revocation-list cache. Tests use this to start cases
+   * from a clean fail-closed state; production callers shouldn't need it
+   * (the cache refreshes itself on TTL expiry).
+   */
+  resetRevocationCache(): void;
+}
+
+function resolveOrigin(input: string | (() => string)): string {
+  const raw = typeof input === "function" ? input() : input;
+  return raw.replace(/\/$/, "");
+}
+
+/**
+ * Build a scope guard bound to a hub origin. The guard holds the JWKS
+ * getter, so the cache lives across requests — instantiate once per process
+ * and reuse.
+ */
+export function createScopeGuard(opts: CreateScopeGuardOptions): ScopeGuard {
+  const {
+    hubOrigin,
+    allowedIssuers,
+    jwksOrigin,
+    revocationOrigin,
+    jwks: jwksOpts,
+    jwksGetter: injected,
+    allowMissingJti = false,
+    missingJtiLogger,
+  } = opts;
+
+  // The origin the JWKS is FETCHED from. Defaults to `hubOrigin` (zero change
+  // for existing callers) — when supplied, it decouples the fetch origin from
+  // the `iss`-validation origin so a co-located RS can read keys from loopback
+  // while accepting a public `iss` (vault#464). Both resolvers are re-evaluated
+  // per request, so env changes propagate without a restart.
+  const jwksOriginInput = jwksOrigin ?? hubOrigin;
+
+  // The origin the REVOCATION LIST is fetched from. Follows `jwksOrigin` by
+  // default, falling back to `hubOrigin` — see the `revocationOrigin` jsdoc.
+  // The short version: this fetch has the same co-located-hairpin problem
+  // vault#464 fixed for JWKS, but it fails CLOSED, so getting it wrong bricks
+  // the resource server rather than merely slowing it down. Chaining the
+  // default off `jwksOrigin` means a consumer can't fix one and silently
+  // leave the other pointed at an unreachable public FQDN.
+  const revocationOriginInput = revocationOrigin ?? jwksOriginInput;
+
+  const reloadMinIntervalMs = opts.jwksReloadMinIntervalMs ?? DEFAULT_JWKS_RELOAD_MIN_INTERVAL_MS;
+  const reloadNow = opts.jwksReloadNow ?? (() => Date.now());
+  // Timestamp of the last *forced* JWKS reload for this guard. Drives the
+  // throttle: a forced reload is only issued when at least
+  // `reloadMinIntervalMs` has elapsed since the previous one. Persists across
+  // requests (the guard is one-per-process), so a flood of bad-signature
+  // tokens can drive at most one refetch per window.
+  let lastForcedReloadAt: number | undefined;
+
+  function pickGetter(origin: string): JwksGetter {
+    if (injected) return injected;
+    return getOrCreateJwksGetter(origin, jwksOpts);
+  }
+
+  // One revocation cache per guard, lazily bound to whatever the origin
+  // resolves to on first use. The hubOrigin resolver may layer env-var
+  // precedence (per CreateScopeGuardOptions); we honour that by binding the
+  // cache to the resolved value the first time it's needed and rebuilding
+  // if the origin ever changes (rare in practice — process-stable).
+  let revocation: { origin: string; cache: RevocationCache } | undefined;
+  function pickRevocationCache(origin: string): RevocationCache {
+    if (revocation && revocation.origin === origin) return revocation.cache;
+    const cache = createRevocationCache({
+      origin,
+      fetcher: opts.revocationFetcher,
+      ttlMs: opts.revocationTtlMs,
+      now: opts.revocationNow,
+      onFetchError: opts.revocationOnFetchError,
+    });
+    revocation = { origin, cache };
+    return cache;
+  }
+
+  /** Wrap a jose error in our taxonomy. `never`-typed so callers can use it
+   * as the throwing tail of a try/catch without TS losing definite-assignment
+   * narrowing on the value they were trying to compute. */
+  function throwWrapped(err: unknown): never {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new HubJwtError(classifyJoseError(err), `hub JWT verification failed: ${msg}`);
+  }
+
+  /**
+   * Throttle gate for forced reloads. Returns true (and records the time)
+   * only when at least `reloadMinIntervalMs` has elapsed since the previous
+   * forced reload. A non-positive interval disables throttling (always allow)
+   * — convenient for tests that want every failure to trigger a reload.
+   *
+   * The slot is consumed per *attempt*, before `forceReloadJwks` reports
+   * whether the getter actually had a `.reload` to call. For a bare
+   * test-injected getter (no `.reload`) that means a slot is burned without a
+   * reload firing — harmless, because every production getter comes from
+   * `createRemoteJWKSet`, which always exposes `.reload`. Keeping the
+   * `hasReload` check inside `jwks.ts` (rather than pre-gating here) is the
+   * deliberate seam: validate.ts stays ignorant of getter internals.
+   */
+  function shouldForceReload(): boolean {
+    const t = reloadNow();
+    if (
+      reloadMinIntervalMs > 0 &&
+      lastForcedReloadAt !== undefined &&
+      t - lastForcedReloadAt < reloadMinIntervalMs
+    ) {
+      return false;
+    }
+    lastForcedReloadAt = t;
+    return true;
+  }
+
+  /**
+   * Resolve the accepted-`iss` value passed to jose's `issuer` option.
+   *
+   * Default (no `allowedIssuers`): the single canonical `origin` — byte-
+   * identical exact-match behavior to before the multi-origin seam existed.
+   *
+   * With `allowedIssuers`: the UNION of `origin` and the (sanitized) extra
+   * origins, deduped, returned as a `string[]`. jose accepts `string[]` for
+   * `issuer` and passes a token whose `iss` matches ANY member — this is the
+   * "same box, two URLs" tolerance. The canonical `origin` is always present
+   * so a single-member set behaves exactly like the default.
+   *
+   * SECURITY: this set is the hub's own legitimate-origin allowlist (see
+   * `allowedIssuers` jsdoc). The signature verify in `jwtVerify` runs FIRST
+   * and proves provenance unconditionally; widening the accepted `iss` from
+   * one string to this hub-controlled set never accepts a foreign-key token.
+   */
+  function resolveAcceptedIssuers(origin: string): string | string[] {
+    if (!allowedIssuers) return origin;
+    const extra = allowedIssuers();
+    if (!extra || extra.length === 0) return origin;
+    const set = new Set<string>([origin]);
+    for (const raw of extra) {
+      if (typeof raw !== "string") continue;
+      const trimmed = raw.replace(/\/$/, "");
+      if (trimmed.length > 0) set.add(trimmed);
+    }
+    // A single-member set collapses to the bare string so the
+    // default/single-origin path stays observably identical (jose treats
+    // `string` and `[string]` the same, but the string form keeps the
+    // configured-shape obvious in logs / tests).
+    return set.size === 1 ? origin : Array.from(set);
+  }
+
+  /**
+   * Verify the JWT signature + issuer, with a force-reload-and-retry-once on
+   * rotation-class failures. Returns the verified payload or throws a wrapped
+   * `HubJwtError`. See the inline comment for the recovery rationale.
+   *
+   * `acceptedIssuers` is what jose checks `iss` against — a single string
+   * (default / single-origin) or a string[] (the multi-origin set). jose
+   * passes a token whose `iss` matches any member.
+   */
+  async function verifyWithRotationRetry(
+    token: string,
+    acceptedIssuers: string | string[],
+    getter: JwksGetter,
+  ): Promise<JWTPayload> {
+    try {
+      const verified = await jwtVerify(token, getter, { issuer: acceptedIssuers });
+      return verified.payload;
+    } catch (err) {
+      const code = classifyJoseError(err);
+
+      // Rotation-class recovery: a `signature` / `kid` / `jwks` failure can
+      // mean our cached JWKS is stale relative to the hub's current signing
+      // key (same-kid rotation, no-kid-multi-key, or within-`cacheMaxAge`
+      // staleness — cases jose's reactive reload can't reach). Force a
+      // re-fetch and retry exactly once. `expired` / `issuer` are token-level
+      // facts a fresh JWKS can never fix, so they never trigger a reload. The
+      // throttle bounds forced reloads to one per `reloadMinIntervalMs` so a
+      // flood of genuinely-bad-signature tokens can't drive a refetch storm;
+      // within the window (or with an injected getter that has no `.reload`)
+      // we surface the original failure unchanged.
+      if (code === "signature" || code === "kid" || code === "jwks") {
+        if (shouldForceReload()) {
+          const reloaded = await forceReloadJwks(getter);
+          if (reloaded) {
+            // The retry's outcome — success OR error — is final and flows
+            // through the same classify-and-wrap. No second reload.
+            try {
+              const verified = await jwtVerify(token, getter, { issuer: acceptedIssuers });
+              return verified.payload;
+            } catch (retryErr) {
+              throwWrapped(retryErr);
+            }
+          }
+        }
+      }
+      throwWrapped(err);
+    }
+  }
+
+  return {
+    async validateHubJwt(token, validateOpts = {}) {
+      // `origin` is the CANONICAL hub origin. It pins (a) the revocation-list
+      // endpoint, which lives on the canonical issuer, and (b) the default
+      // JWKS-fetch origin. `acceptedIssuers` is what the token's `iss` is
+      // checked against — `origin` alone by default, or the multi-origin SET
+      // (origin ∪ the hub's other legitimate origins) when `allowedIssuers` is
+      // supplied. `jwksFetchOrigin` is where the keys are fetched — identical
+      // to `origin` unless the caller supplied `jwksOrigin`. All resolved per
+      // call so env changes propagate without a restart.
+      const origin = resolveOrigin(hubOrigin);
+      const acceptedIssuers = resolveAcceptedIssuers(origin);
+      const jwksFetchOrigin = resolveOrigin(jwksOriginInput);
+      const getter = pickGetter(jwksFetchOrigin);
+
+      const payload: JWTPayload = await verifyWithRotationRetry(token, acceptedIssuers, getter);
+
+      if (typeof payload.sub !== "string" || payload.sub.length === 0) {
+        throw new HubJwtError("shape", "hub JWT missing required `sub` claim");
+      }
+
+      // RFC 7519 §4.1.3: `aud` may be a string OR an array of strings. We
+      // unify into an array internally and check membership; the value
+      // surfaced to callers collapses to a single representative — the
+      // matched expectation when supplied, else the first array element.
+      const audRaw = payload.aud;
+      const auds: string[] =
+        typeof audRaw === "string"
+          ? [audRaw]
+          : Array.isArray(audRaw)
+            ? audRaw.filter((a): a is string => typeof a === "string")
+            : [];
+
+      if (validateOpts.expectedAudience != null) {
+        if (!auds.includes(validateOpts.expectedAudience)) {
+          const got = auds.length === 0 ? "(missing)" : auds.join(", ");
+          throw new HubJwtError(
+            "audience",
+            `hub JWT audience mismatch: expected "${validateOpts.expectedAudience}", got "${got}"`,
+          );
+        }
+      }
+      const aud: string | undefined =
+        validateOpts.expectedAudience != null ? validateOpts.expectedAudience : auds[0];
+
+      const scopeRaw = (payload as { scope?: unknown }).scope;
+      const scopes = typeof scopeRaw === "string" ? parseScopes(scopeRaw) : [];
+
+      // jti presence is required by default (hub#218 hardening). The hub
+      // token-registry contract (introduced in hub#212 Phase 1) stamps `jti`
+      // on every issued JWT; a hub-signed token lacking the claim is an
+      // anomaly — either a pre-registry mint that should have aged out, or
+      // a forgery from an attacker who got a signing key but skipped the
+      // registry path. Revocation can't be enforced on tokens we can't
+      // index, so the strict default rejects them.
+      //
+      // Operators with legitimate pre-Phase-1 tokens still in flight can
+      // opt out via `allowMissingJti: true`, in which case the missing
+      // claim is logged (when `missingJtiLogger` is supplied) and the
+      // token is accepted. The opt-out is a transition aid, not a steady
+      // state.
+      //
+      // Placement: after signature + iss + sub + audience (so we don't
+      // surface a jti-shape error on a malformed/forged token whose
+      // signature already failed), but before the revocation lookup
+      // (which depends on jti existing).
+      const jtiRaw = payload.jti;
+      const jti = typeof jtiRaw === "string" && jtiRaw.length > 0 ? jtiRaw : undefined;
+      if (jti === undefined) {
+        if (!allowMissingJti) {
+          throw new HubJwtError("shape", "hub JWT missing required `jti` claim");
+        }
+        // Opt-out path: token is accepted but logged so operators can
+        // monitor the legacy-token decay curve.
+        missingJtiLogger?.({
+          sub: payload.sub,
+          aud,
+          iat: typeof payload.iat === "number" ? payload.iat : undefined,
+        });
+      }
+      const clientIdRaw = (payload as { client_id?: unknown }).client_id;
+      const clientId = typeof clientIdRaw === "string" ? clientIdRaw : undefined;
+
+      // vault_scope: multi-user Phase 1 per-user vault pin (see HubJwtClaims
+      // jsdoc for full semantics). Non-array / missing / malformed values
+      // collapse to `[]` — the "no per-user restriction" sentinel. Pre-PR-4
+      // tokens lack the claim entirely; they're treated as admin-equivalent
+      // for vault-pin purposes (the upstream scope strings still pin the
+      // resource). This is the "fail-open at THIS layer, fail-closed at the
+      // scope-string layer" choice: vault_scope is defense-in-depth, not
+      // the primary gate.
+      const vaultScopeRaw = (payload as { vault_scope?: unknown }).vault_scope;
+      const vaultScope: string[] = Array.isArray(vaultScopeRaw)
+        ? vaultScopeRaw.filter((s): s is string => typeof s === "string")
+        : [];
+
+      // permissions: raw passthrough of the consumer-interpreted permissions
+      // object (e.g. vault's `scoped_tags`). scope-guard surfaces it verbatim
+      // without knowing its shape. Only a non-null plain object is surfaced;
+      // absent / null / non-object (string, number, array) leaves it
+      // `undefined` so "no claim" stays distinguishable from `{}`. Mirrors
+      // the defensive style of vaultScope above — malformed input is tolerated
+      // (left undefined), never thrown on.
+      const permissionsRaw = (payload as { permissions?: unknown }).permissions;
+      const permissions: Record<string, unknown> | undefined =
+        typeof permissionsRaw === "object" &&
+        permissionsRaw !== null &&
+        !Array.isArray(permissionsRaw)
+          ? (permissionsRaw as Record<string, unknown>)
+          : undefined;
+
+      // Revocation enforcement runs LAST — only consulted if the JWT is
+      // otherwise valid. Cheaper checks (signature, iss, aud, expiry,
+      // jti-presence) reject first, so a bad signature never costs a
+      // network roundtrip. A token with no jti claim can't appear on any
+      // revocation list (lists are keyed by jti); under the strict default
+      // the jti-presence check above already rejected, so we only reach
+      // here with a defined jti. Under the `allowMissingJti: true` opt-out
+      // we may have undefined jti — those tokens skip the lookup entirely
+      // since revocation can't be enforced without an index key.
+      if (jti !== undefined) {
+        const cache = pickRevocationCache(resolveOrigin(revocationOriginInput));
+        const outcome = await cache.check(jti);
+        if (outcome === "revoked") {
+          // Surface the jti in the error message for operator audit visibility.
+          // Consumers translate this to a generic 401 for the unauthenticated
+          // caller; the jti is a server-side log artifact, not a response body.
+          throw new HubJwtError(
+            "revoked",
+            `hub JWT revoked: jti "${jti}" is in the revocation list`,
+          );
+        }
+        if (outcome === "unknown") {
+          throw new HubJwtError(
+            "revocation_unavailable",
+            "hub JWT cannot be validated: revocation list unavailable (no last-good cache)",
+          );
+        }
+      }
+
+      return { sub: payload.sub, scopes, aud, jti, clientId, vaultScope, permissions };
+    },
+
+    resetJwksCache() {
+      if (injected) return; // injected getter has no cache we own
+      // The cache is keyed on the FETCH origin, so reset under the jwksOrigin
+      // (which defaults to hubOrigin). Re-resolve per call to match the key
+      // a concurrent env change would have written under.
+      resetCache(resolveOrigin(jwksOriginInput));
+    },
+
+    resetRevocationCache() {
+      if (revocation) revocation.cache.reset();
+      revocation = undefined;
+    },
+  };
+}
+
+/**
+ * Translate a jose error into our coarse `code` taxonomy. jose uses string
+ * `name`s like `JWTExpired`, `JWTClaimValidationFailed`, `JWSSignatureVerificationFailed`,
+ * `JWKSNoMatchingKey`. Anything we can't classify is bucketed as `signature`
+ * — a conservative default since the wrapped message still surfaces.
+ */
+function classifyJoseError(err: unknown): HubJwtErrorCode {
+  if (!(err instanceof Error)) return "signature";
+  const name = err.name;
+  if (name === "JWTExpired") return "expired";
+  if (name === "JWKSNoMatchingKey") return "kid";
+  if (name === "JWKSInvalid" || name === "JWKSTimeout" || name === "JWKSMultipleMatchingKeys") {
+    return "jwks";
+  }
+  if (name === "JWTClaimValidationFailed") {
+    // jose throws this for issuer/audience claim mismatches. We only
+    // configure `issuer` on jwtVerify, so map to `issuer`. Audience handling
+    // is done by us, not jose, and surfaces as `audience`.
+    return "issuer";
+  }
+  // Low-level fetch failures surface as TypeError when JWKS is unreachable.
+  if (name === "TypeError") return "jwks";
+  // Generic `JOSEError` for non-200 JWKS HTTP responses (e.g. 503). The
+  // typed JWKS* subclasses cover the structural cases above; HTTP-level
+  // failures fall through to the base class with a "JSON Web Key Set HTTP
+  // response" message.
+  if (name === "JOSEError" && /JSON Web Key Set/i.test(err.message)) return "jwks";
+  return "signature";
+}

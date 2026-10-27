@@ -1,0 +1,3571 @@
+/**
+ * Native OAuth handlers for the hub. Each handler is a pure function over
+ * `(db, req)` returning a `Response` — no global state, no side channels —
+ * so the test harness can drive the full OAuth dance without standing up
+ * `Bun.serve` or going near the network.
+ *
+ * Endpoints implemented:
+ *   - GET  /.well-known/oauth-authorization-server  (RFC 8414 metadata)
+ *   - GET  /oauth/authorize                          (login → consent → code)
+ *   - POST /oauth/authorize                          (form posts: login + consent)
+ *   - POST /oauth/authorize/approve                  (operator-driven inline DCR approval, #208)
+ *   - POST /oauth/token                              (grant_type=authorization_code | refresh_token)
+ *   - POST /oauth/register                           (RFC 7591 DCR)
+ *   - POST /oauth/revoke                             (RFC 7009 token revocation)
+ *
+ * `client_credentials` is intentionally unimplemented — it's not in the
+ * launch surface (no machine-to-machine clients yet); the token endpoint
+ * stubs it with `unsupported_grant_type`.
+ *
+ * HTML for login + consent + error views lives in `oauth-ui.ts` so the
+ * handlers stay focused on protocol logic and the templates stay focused
+ * on presentation.
+ */
+import type { Database } from "bun:sqlite";
+import {
+  ACCOUNT_VAULTS_UNNARROWED,
+  accountVaultsScope,
+  isRequestableAccountScope,
+} from "@openparachute/door-contract";
+import { AdminAuthError, adminAuthErrorResponse, requireScope } from "./admin-auth.ts";
+import { recordLoginUnlock } from "./admin-lock.ts";
+import { renderTotpChallenge } from "./admin-login-ui.ts";
+import {
+  AuthCodeExpiredError,
+  AuthCodeNotFoundError,
+  AuthCodePkceMismatchError,
+  AuthCodeRedirectMismatchError,
+  AuthCodeUsedError,
+  issueAuthCode,
+  redeemAuthCode,
+} from "./auth-codes.ts";
+import {
+  type ClientStatus,
+  type OAuthClient,
+  type RegisteredClient,
+  approveClient,
+  expandRedirectUrisForHubOrigins,
+  getClient,
+  isValidRedirectUri,
+  registerClient,
+  requireRegisteredRedirectUri,
+  verifyClientSecret,
+} from "./clients.ts";
+import { CSRF_FIELD_NAME, ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
+import {
+  findGrant,
+  isCoveredByGrant,
+  isCoveredByGrantForClientName,
+  recordGrant,
+} from "./grants.ts";
+import { consumeFirstClientAutoApproveWindow } from "./hub-settings.ts";
+import { VAULT_VERBS, inferAudience } from "./jwt-audience.ts";
+import {
+  ACCESS_TOKEN_TTL_SECONDS,
+  REFRESH_GRACE_MS,
+  RefreshTokenInsertError,
+  type RefreshTokenRow,
+  VaultNameReservedError,
+  findRefreshToken,
+  findTokenRowByJti,
+  linkRotation,
+  liveFamilyRefreshRows,
+  revokeFamily,
+  signAccessToken,
+  signRefreshToken,
+} from "./jwt-sign.ts";
+import {
+  type AuthorizeFormParams,
+  VAULT_PICK_ACCOUNT,
+  canonicalConsentScope,
+  renderApprovePending,
+  renderConsent,
+  renderError,
+  renderLogin,
+  renderUnknownClient,
+} from "./oauth-ui.ts";
+import { isSameOriginRequest } from "./origin-check.ts";
+import { buildPendingLoginCookie, createPendingLogin } from "./pending-login.ts";
+import {
+  authIpCeilingRateLimiter,
+  clientIpFromRequest,
+  compositeKey,
+  loginRateLimiter,
+} from "./rate-limit.ts";
+import { isHttpsRequest } from "./request-protocol.ts";
+import {
+  isRootMcpResource,
+  narrowResourceVaultScopes,
+  narrowRootMcpScopes,
+  resolveResourceVault,
+  resolveRootMcpTokenAudience,
+} from "./resource-binding.ts";
+import {
+  ACCOUNT_SELF_ADMIN_SCOPE,
+  ACCOUNT_SELF_READ_SCOPE,
+  ACCOUNT_SELF_WRITE_SCOPE,
+  forcesExplicitConsent,
+  isNonRequestableScope,
+  isRequestableScope,
+} from "./scope-explanations.ts";
+import { findUnknownScopes, loadDeclaredScopes } from "./scope-registry.ts";
+import { shortNameForManifest } from "./service-spec.ts";
+import {
+  type ServicesManifest,
+  // Hot-path OAuth flows use the lenient reader so a single malformed
+  // services.json row (e.g. from a buggy module install) doesn't crash
+  // the entire OAuth dispatch. See hub#406.
+  readManifestLenient as readServicesManifest,
+} from "./services-manifest.ts";
+import {
+  SESSION_TTL_MS,
+  buildSessionCookie,
+  createSession,
+  findActiveSession,
+  findSession,
+  parseSessionCookie,
+} from "./sessions.ts";
+import { isTotpEnrolled } from "./two-factor-store.ts";
+import {
+  getUserById,
+  getUserByUsername,
+  isHubAdmin,
+  vaultVerbsForUserVault,
+  verifyPassword,
+} from "./users.ts";
+import { listVaultNames } from "./vault-names.ts";
+import { isVaultEntry, shortName, vaultInstanceNameFor } from "./well-known.ts";
+
+/** Verbs whose unnamed `vault:<verb>` form needs picker disambiguation. */
+function unnamedVaultVerbs(scopes: string[]): string[] {
+  const verbs: string[] = [];
+  for (const s of scopes) {
+    const parts = s.split(":");
+    const verb = parts[1];
+    if (parts.length === 2 && parts[0] === "vault" && verb && VAULT_VERBS.has(verb)) {
+      verbs.push(verb);
+    }
+  }
+  return verbs;
+}
+
+/** Rewrite each unnamed `vault:<verb>` to `vault:<picked>:<verb>`. */
+function narrowVaultScopes(scopes: string[], pickedVault: string): string[] {
+  return scopes.map((s) => {
+    const parts = s.split(":");
+    const verb = parts[1];
+    if (parts.length === 2 && parts[0] === "vault" && verb && VAULT_VERBS.has(verb)) {
+      return `vault:${pickedVault}:${verb}`;
+    }
+    return s;
+  });
+}
+
+function isUnnamedVaultScope(scope: string): boolean {
+  const parts = scope.split(":");
+  const verb = parts[1];
+  return parts.length === 2 && parts[0] === "vault" && !!verb && VAULT_VERBS.has(verb);
+}
+
+/**
+ * XOR rewrite: unnamed `vault:<verb>` becomes the account-MCP connection
+ * grant. Named vault scopes stay put here; the `:account:` picker path
+ * drops them after this rewrite so they cannot combine-refuse. Same-
+ * audience `account:self:{read,write,admin}` extras ride through.
+ */
+function replaceUnnamedVaultScopesWithAccountVaults(scopes: readonly string[]): string[] {
+  const rest = scopes.filter((s) => !isUnnamedVaultScope(s));
+  return [...new Set([...rest, ACCOUNT_VAULTS_UNNARROWED])];
+}
+
+/**
+ * A prior `account:vaults` / `account:self:vaults` grant covers a later
+ * unnamed `vault:<verb>` request at root `/mcp`. Without this, skip-consent
+ * refuses unnamed verbs forever (they never match the stored bound form)
+ * and the picker re-prompts on every catalog-copy reconnect.
+ *
+ * Does NOT change `isCoveredByGrant` — that helper stays exact-match (plus
+ * the account-vaults equivalent pair) so trust-by-client_name cannot record
+ * unnamed verbs onto a fresh client_id.
+ */
+function accountGrantCoversUnnamedAtRoot(
+  db: Database,
+  userId: string,
+  clientId: string,
+  requestedScopes: readonly string[],
+): boolean {
+  if (unnamedVaultVerbs([...requestedScopes]).length === 0) return false;
+  const grant = findGrant(db, userId, clientId);
+  if (!grant) return false;
+  const granted = new Set(grant.scopes);
+  if (!granted.has(ACCOUNT_VAULTS_UNNARROWED) && !granted.has(accountVaultsScope("self"))) {
+    return false;
+  }
+  for (const s of requestedScopes) {
+    if (isUnnamedVaultScope(s)) continue;
+    if (s === ACCOUNT_VAULTS_UNNARROWED || s === accountVaultsScope("self")) continue;
+    if (!granted.has(s)) return false;
+  }
+  return true;
+}
+
+/**
+ * Derive the `vault_scope` claim value for a given hub user. Multi-user
+ * Phase 2 PR 2 (design 2026-05-20-multi-user-phase-1.md §Phase 2 —
+ * many-to-many membership via the `user_vaults` table).
+ *
+ *   - `userId` resolves to no row → `[]`. Defensive: the caller already
+ *     validated the user existed (auth-code redemption / refresh row's
+ *     user_id), but a delete-between-mint-and-now race shouldn't 500.
+ *     Empty is the safe sentinel — the scope-bearing `scope` claim is
+ *     still the gate.
+ *   - Hub admin → `[]`. Admin posture is unrestricted by design (see
+ *     `isHubAdmin`; ANY account with `hub_role = 'admin'`, not just the
+ *     first — hub#881). The consent picker is the source of truth and
+ *     the scope-guard reads an empty `vault_scope` claim as "no
+ *     narrowing" — first admin can request scope against any vault.
+ *   - Non-admin user → the list of vault names from `user_vaults`. The
+ *     scope-guard at vault/notes/scribe enforces that the user can
+ *     only request scope against vaults in their list (Phase 1 pinned
+ *     to a single vault; Phase 2 lifts that to N). A non-admin with
+ *     zero assignments returns `[]` — distinct semantics from the
+ *     admin's `[]` because the consent picker plus the picked-must-
+ *     match-assignment defense in `handleConsentSubmit` enforces that
+ *     non-admin tokens carry a non-empty `vault_scope`.
+ *
+ * Always returns an array (never undefined) so the JWT carries the claim
+ * unconditionally — readers don't have to distinguish "absent" from "empty."
+ */
+export function vaultScopeForUser(db: Database, userId: string): string[] {
+  if (isHubAdmin(db, userId)) return [];
+  const user = getUserById(db, userId);
+  if (!user) return [];
+  return [...user.assignedVaults];
+}
+
+export interface OAuthDeps {
+  /** Hub origin used for `iss`, `authorization_endpoint`, etc. */
+  issuer: string;
+  /** Override the clock for deterministic tests. */
+  now?: () => Date;
+  /**
+   * Resolve the declared-scope set the issuer is willing to sign. Production
+   * walks `services.json` + each module's `.parachute/module.json`
+   * `scopes.defines` and unions with `FIRST_PARTY_SCOPES`. Tests inject a
+   * pinned set so the gate is deterministic without a fixture services.json.
+   * See cli#71 + `oauth-scopes.md`.
+   */
+  loadDeclaredScopes?: () => ReadonlySet<string>;
+  /**
+   * Resolve the installed-services manifest used to populate the `services`
+   * catalog in /oauth/token responses (cli#81). Production reads
+   * `~/.parachute/services.json`; tests inject a fixture.
+   */
+  loadServicesManifest?: () => ServicesManifest;
+  /**
+   * Set of origins (`scheme://host:port`) the hub considers itself bound to.
+   * Drives the same-origin defense on cookie-based POST endpoints: a request
+   * whose Origin/Referer matches any bound origin is accepted; everything
+   * else is rejected as cross-origin. Production wires this from
+   * `buildHubBoundOrigins` with the hub's port + expose-state hostname so
+   * loopback + tailnet + funnel access all work without restarting hub
+   * after `parachute expose`. Tests inject deterministic sets. When absent,
+   * the gate falls back to `[issuer]` — pre-#245 behavior — so callers that
+   * don't yet thread this through stay correct on a single-origin hub.
+   */
+  hubBoundOrigins?: () => readonly string[];
+}
+
+export interface ServicesCatalogEntry {
+  url: string;
+  version: string;
+}
+
+export type ServicesCatalog = Record<string, ServicesCatalogEntry>;
+
+/**
+ * Build the `services` map embedded in /oauth/token responses. Each entry maps
+ * a short service name (`vault`, `scribe`, `notes`, …) to its absolute URL +
+ * version, so OAuth clients don't have to re-probe `/.well-known/parachute.json`
+ * to know where vault lives.
+ *
+ * URL source: `entry.paths[*]` from services.json verbatim — never hardcode
+ * `/vault/default`. Users who installed with `parachute install vault
+ * --vault-name work` have `paths: ["/vault/work"]` in their manifest, and the
+ * catalog URL must follow that. The custom-vault-name regression test in
+ * oauth-handlers.test.ts pins this for single-vault.
+ *
+ * Filtering: only services for which the token has at least one scope are
+ * included. A scope `vault:read` admits the `vault` service; a token with only
+ * `scribe:transcribe` gets a catalog with no vault entry. The check is on the
+ * audience prefix (`<aud>:<verb>`) — same shape `inferAudience` uses.
+ *
+ * Multi-vault (closes #247): emits per-vault keys `vault:<name>` alongside
+ * the collapsed `vault` key. A scope `vault:boulder:write` admits only
+ * boulder → emits `vault:boulder` (and the legacy `vault` key, pointing at
+ * boulder so it resolves consistently). A broad scope `vault:read` admits
+ * every vault on the hub → emits `vault:<name>` for each vault path plus
+ * the legacy `vault` key (pointing at `entry.paths[0]` of the first vault,
+ * unchanged from Phase 1). Notes' OAuthCallback (notes#115 ships the
+ * picker; per-vault consumer change is the post-#247 Notes-side PR) reads
+ * `services["vault:<name>"]` so it stops collapsing multi-vault grants
+ * onto a single VaultRecord URL.
+ *
+ * Pre-popover clients still see `services.vault` and behave unchanged —
+ * that key never goes away. Per-vault keys are additive.
+ */
+export function buildServicesCatalog(
+  manifest: ServicesManifest,
+  issuer: string,
+  scopes: readonly string[],
+): ServicesCatalog {
+  // Two scope-derived sets:
+  //   - audiences: bare service prefix (`vault`, `scribe`) → admits the
+  //     collapsed key + every per-vault key.
+  //   - namedVaults: per-vault narrowed scopes (`vault:<name>:<verb>`) →
+  //     admits only `vault:<name>` and the collapsed `vault`.
+  //
+  // A token with both `vault:read` and `vault:boulder:write` should land in
+  // the "any vault" bucket — the bare scope is permissive, the named one
+  // is informational. Detect this via the bare-prefix presence; the named
+  // scope's per-vault narrowing still works for clients that prefer it.
+  const audiences = new Set<string>();
+  const namedVaults = new Set<string>();
+  for (const s of scopes) {
+    const parts = s.split(":");
+    if (
+      parts.length === 3 &&
+      parts[0] === "vault" &&
+      parts[1] &&
+      parts[2] &&
+      VAULT_VERBS.has(parts[2])
+    ) {
+      namedVaults.add(parts[1]);
+      audiences.add("vault");
+      continue;
+    }
+    const colon = s.indexOf(":");
+    if (colon > 0) audiences.add(s.slice(0, colon));
+  }
+  const broadVaultScope =
+    audiences.has("vault") &&
+    scopes.some((s) => {
+      const parts = s.split(":");
+      return (
+        parts.length === 2 &&
+        parts[0] === "vault" &&
+        parts[1] !== undefined &&
+        VAULT_VERBS.has(parts[1])
+      );
+    });
+
+  // Count total admitted vault paths across the manifest. Per-vault keys
+  // are only worth emitting when there are >1 admitted vaults to
+  // disambiguate (or when the token's own scopes are per-vault narrowed —
+  // a per-vault scope is an explicit consumer signal that the per-vault
+  // key matters even on a single-vault hub). The check is on admitted
+  // paths, not raw vault rows: a broad token on a multi-path vault row
+  // sees N paths; a per-vault token sees only its own.
+  let admittedVaultPathCount = 0;
+  if (audiences.has("vault")) {
+    for (const entry of manifest.services) {
+      if (!isVaultEntry(entry)) continue;
+      // #478: an empty-paths vault row is "installed but no servable instance"
+      // — skip it so it never counts toward (or, below, fabricates) a phantom
+      // vault. Mirrors the continue in well-known.ts / admin-vaults.ts.
+      if (entry.paths.length === 0) continue;
+      for (const path of entry.paths) {
+        const instance = vaultInstanceNameFor(entry.name, path);
+        if (broadVaultScope || namedVaults.has(instance)) admittedVaultPathCount++;
+      }
+    }
+  }
+  const emitPerVaultKeys = admittedVaultPathCount > 1 || namedVaults.size > 0;
+
+  const base = issuer.replace(/\/$/, "");
+  const catalog: ServicesCatalog = {};
+  for (const entry of manifest.services) {
+    if (isVaultEntry(entry)) {
+      if (!audiences.has("vault")) continue;
+      // #478: an empty-paths vault row is "installed but no servable instance"
+      // — skip it so the catalog never offers a phantom `vault` / `vault:default`
+      // entry pointing at root before any vault exists. Mirrors well-known.ts /
+      // admin-vaults.ts / vault-names.ts.
+      if (entry.paths.length === 0) continue;
+      // Walk every path the row exposes. Real multi-vault on the hub is a
+      // single `parachute-vault` row with N paths (one per vault instance);
+      // legacy per-vault rows (`parachute-vault-<name>`) are handled by the
+      // same loop because each contributes one path.
+      for (const path of entry.paths) {
+        const instance = vaultInstanceNameFor(entry.name, path);
+        const admit = broadVaultScope || namedVaults.has(instance);
+        if (!admit) continue;
+        if (emitPerVaultKeys) {
+          const perVaultKey = `vault:${instance}`;
+          if (!catalog[perVaultKey]) {
+            catalog[perVaultKey] = { url: `${base}${path}`, version: entry.version };
+          }
+        }
+        // Collapsed `vault` key stays for backwards compat. First admitted
+        // vault wins (deterministic — `entry.paths[0]` for a broad scope,
+        // or the only admitted instance for a per-vault scope).
+        if (!catalog.vault) {
+          catalog.vault = { url: `${base}${path}`, version: entry.version };
+        }
+      }
+      continue;
+    }
+    const key = shortName(entry.name);
+    if (!audiences.has(key)) continue;
+    if (catalog[key]) continue;
+    const path = entry.paths[0] ?? "/";
+    catalog[key] = { url: `${base}${path}`, version: entry.version };
+  }
+  return catalog;
+}
+
+// --- helpers ---------------------------------------------------------------
+
+function jsonResponse(body: unknown, status = 200, extra: Record<string, string> = {}): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json", ...extra },
+  });
+}
+
+function htmlResponse(body: string, status = 200, extra: Record<string, string> = {}): Response {
+  return new Response(body, {
+    status,
+    headers: { "content-type": "text/html; charset=utf-8", ...extra },
+  });
+}
+
+function redirectResponse(location: string, extra: Record<string, string> = {}): Response {
+  return new Response(null, { status: 302, headers: { location, ...extra } });
+}
+
+function htmlError(title: string, message: string, status: number): Response {
+  return htmlResponse(renderError({ title, message, status }), status);
+}
+
+function oauthErrorRedirect(
+  redirectUri: string,
+  error: string,
+  description: string,
+  state: string | null,
+): Response {
+  const u = new URL(redirectUri);
+  u.searchParams.set("error", error);
+  u.searchParams.set("error_description", description);
+  if (state) u.searchParams.set("state", state);
+  return redirectResponse(u.toString());
+}
+
+// --- /.well-known/oauth-protected-resource ---------------------------------
+
+/**
+ * RFC 9728 (April 2025) — OAuth 2.0 Protected Resource Metadata. The
+ * resource-server-side companion to `authorizationServerMetadata`. MCP
+ * clients (since the 2025-06-18 spec draft) probe this endpoint to
+ * discover which authorization server signs tokens for the resource,
+ * which scopes the resource accepts, and how tokens are presented.
+ *
+ * Hub-as-resource posture: hub itself is the protected resource. The
+ * authorization server is also hub (the issuer). The advertised scopes
+ * mirror `authorizationServerMetadata.scopes_supported` — same set, same
+ * filtering (operator-only scopes hidden per RFC 8414 §2 framing).
+ *
+ * Per-vault metadata could also live at
+ * `/vault/<name>/.well-known/oauth-protected-resource` to scope the
+ * advertised resource indicator and scope subset to one vault. Deferred
+ * until an MCP client actually probes that path — today the spec
+ * accepts the hub-level form for the resource indicator.
+ *
+ * Closes hub#393.
+ */
+
+/**
+ * Optional first-party modules whose scopes `FIRST_PARTY_SCOPES` carries
+ * statically (it's `Object.keys(SCOPE_EXPLANATIONS)`), paired with the module
+ * SHORT name that means "installed." Vault + hub are core and always
+ * advertised; these are the modules a hub may not have.
+ *
+ * Keyed on the SHORT name (resolved from each services.json row via
+ * `shortNameForManifest`) rather than the raw manifest name so a row written
+ * under a legacy manifest name still counts as installed — e.g. an un-upgraded
+ */
+const OPTIONAL_MODULE_SCOPES: ReadonlyArray<readonly [prefix: string, short: string]> = [
+  ["scribe:", "scribe"],
+  ["surface:", "surface"],
+];
+
+/**
+ * The scope set to advertise in `scopes_supported` (RFC 8414 + RFC 9728): the
+ * requestable declared scopes, minus any OPTIONAL module's scopes when that
+ * module isn't installed.
+ *
+ * Why: `FIRST_PARTY_SCOPES` is static, so a vault-only hub still advertised
+ * `scribe:*` + `agent:send`. Discovery clients list the advertised catalog
+ * verbatim — claude.ai's connector UI showed a friend connecting ONE vault a
+ * request for Scribe + Agent access the hub can't even honor. So advertise an
+ * optional module's scopes only when its service is present in services.json.
+ * (Trims the ADVERTISEMENT only; issuance/validation still use the full
+ * `loadDeclaredScopes` set, and the per-vault PRM stays vault-narrowed.)
+ */
+function advertisedScopes(declared: ReadonlySet<string>, manifest: ServicesManifest): string[] {
+  const installedShorts = new Set(
+    manifest.services.map((s) => shortNameForManifest(s.name) ?? s.name),
+  );
+  return (
+    Array.from(declared)
+      .filter(isRequestableScope)
+      // REQUESTABLE is not the same as ADVERTISED, and conflating them was a
+      // mistake. Advertising a scope tells every discovery client "ask for this"
+      // — and clients routinely request the whole advertised catalog. With
+      // `account:self:*` in the list, a plain note-taking integration asked for
+      // PERMANENT DELETE over every vault, so the scariest grant on the box
+      // became the default ask. Observed live: a consent screen listing six
+      // scopes topped by account-wide admin, for a client that only wanted to
+      // read and write notes.
+      //
+      // Account scopes stay fully requestable — a client that genuinely manages
+      // vaults asks for them explicitly and the consent screen renders them at
+      // risk tier "high". They just aren't in the menu that teaches clients what
+      // to ask for. Discovery advertises the ordinary surface; account-wide
+      // authority is opt-in by intent, not by catalog-copying.
+      .filter((scope) => !scope.toLowerCase().startsWith("account:"))
+      .filter((scope) => {
+        for (const [prefix, short] of OPTIONAL_MODULE_SCOPES) {
+          if (scope.startsWith(prefix) && !installedShorts.has(short)) return false;
+        }
+        return true;
+      })
+  );
+}
+
+/**
+ * RFC 9728 PRM for the ROOT `/mcp` resource, authored HERE rather than
+ * forwarded from the vault daemon (hub#789).
+ *
+ * Root `/mcp` is a HUB resource — hub owns the endpoint, the issuer, and the
+ * scope registry. Until now hub proxied this document straight from the vault
+ * daemon, which meant the metadata describing a hub resource was written by a
+ * service that doesn't know hub's scope set. Two consequences, both observed
+ * live:
+ *
+ *   - **`vault:admin` was missing.** Vault's root PRM hard-codes
+ *     `[read, write]` on the reasoning that "admin is an operator concern, not
+ *     something the consent picker offers". That reasoning predates the
+ *     2026-05-29 single-consent change, which made per-vault
+ *     `vault:<name>:admin` genuinely requestable through public consent
+ *     (capped to the consenting user's own authority at the mint
+ *     choke-point). So the issuer would happily grant admin — the
+ *     advertisement was the only thing withholding it, and a spec-following
+ *     client reads the advertisement and requests exactly what it lists.
+ *     Admin is what MCP clients need to manage tag schemas, so the gap made a
+ *     core workflow unreachable over MCP.
+ *
+ *   - **Hub-level scopes now have an explicit door boundary.** The root PRM
+ *     starts from hub's authoritative requestable/module-installed catalog,
+ *     then filters to vault scopes. `account:vaults` is requestable at this
+ *     door (`narrowRootMcpScopes` keeps it) but is NOT advertised here: a
+ *     spec-following client copies the whole catalog, and combining
+ *     `account:vaults` with vault scopes is refused. Advertise it on
+ *     `/account/mcp`'s PRM; request it explicitly at root `/mcp`.
+ *     `scribe:*` / `agent:send` / `hub:admin` stay dropped.
+ *
+ * Both documents start from `advertisedScopes`. The root document then applies
+ * `narrowRootMcpScopes`, which still drops `account:vaults` out of this
+ * advertisement because `advertisedScopes` already stripped `account:*`.
+ */
+export function rootMcpProtectedResourceMetadata(deps: OAuthDeps): Response {
+  const iss = deps.issuer;
+  const declared = (deps.loadDeclaredScopes ?? loadDeclaredScopes)();
+  return jsonResponse({
+    // The resource is the root MCP endpoint, not the origin — that's what
+    // distinguishes this document from the bare PRM, and what the client
+    // matches against the endpoint it got the 401 from.
+    resource: `${iss}/mcp`,
+    authorization_servers: [iss],
+    scopes_supported: narrowRootMcpScopes(
+      advertisedScopes(declared, (deps.loadServicesManifest ?? readServicesManifest)()),
+    ),
+    bearer_methods_supported: ["header"],
+    resource_documentation: "https://parachute.computer",
+  });
+}
+
+export function protectedResourceMetadata(deps: OAuthDeps): Response {
+  const iss = deps.issuer;
+  const declared = (deps.loadDeclaredScopes ?? loadDeclaredScopes)();
+  return jsonResponse({
+    resource: iss,
+    authorization_servers: [iss],
+    scopes_supported: advertisedScopes(
+      declared,
+      (deps.loadServicesManifest ?? readServicesManifest)(),
+    ),
+    bearer_methods_supported: ["header"],
+    resource_documentation: "https://parachute.computer",
+    // Intentional omission: `resource_signing_alg_values_supported` +
+    // `signed_metadata`. Hub serves the resource metadata document
+    // unsigned today — MCP clients that probe for a signed metadata
+    // JWT will fall back to verifying the resource via the
+    // authorization-server's JWKS-signed access tokens. When the signed
+    // metadata path lands here (likely once a downstream MCP client
+    // requires it for offline verification), add the alg list + the
+    // `signed_metadata` JWT alongside.
+  });
+}
+
+// --- /.well-known/oauth-authorization-server -------------------------------
+
+export function authorizationServerMetadata(deps: OAuthDeps): Response {
+  const iss = deps.issuer;
+  // Advertise the full declared-scope set — FIRST_PARTY ∪ each registered
+  // module's `scopes.defines` — so standards-following clients discover
+  // third-party scopes (e.g. parachute-agent's `agent:*`) the same way they discover
+  // first-party ones. The token-issuance path already consults
+  // `loadDeclaredScopes` (see #90); metadata had to follow or the issuer's
+  // public advertisement would be a strict subset of what it'll actually
+  // sign. Closes #91.
+  const declared = (deps.loadDeclaredScopes ?? loadDeclaredScopes)();
+  return jsonResponse({
+    issuer: iss,
+    authorization_endpoint: `${iss}/oauth/authorize`,
+    token_endpoint: `${iss}/oauth/token`,
+    registration_endpoint: `${iss}/oauth/register`,
+    revocation_endpoint: `${iss}/oauth/revoke`,
+    jwks_uri: `${iss}/.well-known/jwks.json`,
+    response_types_supported: ["code"],
+    grant_types_supported: ["authorization_code", "refresh_token"],
+    code_challenge_methods_supported: ["S256"],
+    token_endpoint_auth_methods_supported: ["none", "client_secret_post"],
+    // Operator-only scopes (NON_REQUESTABLE_SCOPES) are intentionally absent
+    // — RFC 8414 §2 frames `scopes_supported` as "the OAuth 2.0 [...] scope
+    // values that this authorization server supports" for clients to request.
+    // Advertising what we always reject would mislead clients.
+    scopes_supported: advertisedScopes(
+      declared,
+      (deps.loadServicesManifest ?? readServicesManifest)(),
+    ),
+  });
+}
+
+/** Find any requested scopes that the public flow refuses to mint. */
+function findNonRequestableScopes(scopes: readonly string[]): string[] {
+  return scopes.filter(isNonRequestableScope);
+}
+
+/** Every `vault:<name>:<verb>` name actually present in `scopes` (verb ∈ VAULT_VERBS). */
+function namedVaultScopeNames(scopes: readonly string[]): Set<string> {
+  const out = new Set<string>();
+  for (const s of scopes) {
+    const parts = s.split(":");
+    if (
+      parts.length === 3 &&
+      parts[0] === "vault" &&
+      parts[1] &&
+      parts[2] &&
+      VAULT_VERBS.has(parts[2])
+    ) {
+      out.add(parts[1]);
+    }
+  }
+  return out;
+}
+
+/** The one vault named by the granted scopes, or nothing when absent/ambiguous. */
+function singleVaultName(scopes: readonly string[]): string | undefined {
+  const names = [...namedVaultScopeNames(scopes)];
+  return names.length === 1 ? names[0] : undefined;
+}
+
+function invalidTargetResponse(resource: string): Response {
+  return jsonResponse(
+    {
+      error: "invalid_target",
+      error_description: `resource "${resource}" does not match the resource this token was granted for`,
+    },
+    400,
+  );
+}
+
+/**
+ * RFC 8707 §2.2 resource validation + audience resolution at /oauth/token.
+ * `requestResource` is optional; absent → return `fallbackAudience`
+ * UNCHANGED (today's `inferAudience` behavior, byte-for-byte — no client
+ * that never sends `resource` observes any difference).
+ *
+ * When present, it must resolve (via `resolveResourceVault` /
+ * `isRootMcpResource`, the SAME shape-recognition the authorize side uses)
+ * to a resource this token can actually serve:
+ *   - names a specific vault → that vault's name must be among
+ *     `grantedVaultNames`; audience becomes `vault.<name>` EXPLICITLY
+ *     (this is the "override inferAudience" the design calls for: a grant
+ *     can legally carry more than one named vault scope — a client can ask
+ *     for e.g. `vault:read` bound to one resource while also naming another
+ *     vault's scope explicitly — and inferAudience's first-scope-wins scan
+ *     can't tell which one the CALLER wants THIS token bound to; an explicit
+ *     `resource` disambiguates).
+ *   - names the vault-agnostic root door → vault-named grants stay on
+ *     `fallbackAudience` (`vault.<name>`); an account-vaults-only grant
+ *     (no named vault, `inferAudience` → `"account"`) mints `aud=account`.
+ *     Empty/foreign grants still reject.
+ *   - resolves to neither (off-origin, malformed, non-MCP path, or a vault
+ *     name not in `grantedVaultNames`) → reject.
+ */
+function resolveTokenResourceAudience(
+  requestResource: string | null,
+  grantedVaultNames: ReadonlySet<string>,
+  boundOrigins: readonly string[],
+  fallbackAudience: string,
+): { audience: string } | { errorResponse: Response } {
+  if (!requestResource) return { audience: fallbackAudience };
+  const boundVault = resolveResourceVault(requestResource, boundOrigins);
+  if (boundVault) {
+    if (!grantedVaultNames.has(boundVault)) {
+      return { errorResponse: invalidTargetResponse(requestResource) };
+    }
+    return { audience: `vault.${boundVault}` };
+  }
+  if (isRootMcpResource(requestResource, boundOrigins)) {
+    const audience = resolveRootMcpTokenAudience(grantedVaultNames, fallbackAudience);
+    if (audience === null) return { errorResponse: invalidTargetResponse(requestResource) };
+    return { audience };
+  }
+  return { errorResponse: invalidTargetResponse(requestResource) };
+}
+
+// --- /oauth/authorize ------------------------------------------------------
+
+function parseAuthorizeFormParams(url: URL): AuthorizeFormParams | { error: string } {
+  const required = (k: string) => {
+    const v = url.searchParams.get(k);
+    return v && v.length > 0 ? v : null;
+  };
+  const clientId = required("client_id");
+  const redirectUri = required("redirect_uri");
+  const responseType = required("response_type");
+  const scope = url.searchParams.get("scope") ?? "";
+  const codeChallenge = required("code_challenge");
+  const codeChallengeMethod = required("code_challenge_method");
+  if (!clientId) return { error: "missing client_id" };
+  if (!redirectUri) return { error: "missing redirect_uri" };
+  if (!responseType) return { error: "missing response_type" };
+  if (!codeChallenge) return { error: "missing code_challenge" };
+  if (!codeChallengeMethod) return { error: "missing code_challenge_method" };
+  return {
+    clientId,
+    redirectUri,
+    responseType,
+    scope,
+    codeChallenge,
+    codeChallengeMethod,
+    state: url.searchParams.get("state"),
+    // RFC 8707 resource indicator (optional). When present and resolvable to
+    // a per-vault MCP resource, drives the narrow-consent + named-scope path.
+    resource: url.searchParams.get("resource"),
+  };
+}
+
+/**
+ * "App not yet approved" page (#74) for /oauth/authorize. When the request
+ * carries a valid operator session AND a same-origin Origin/Referer, render
+ * the inline approve form (#208) so one click flips the client to `approved`
+ * and the OAuth flow re-enters at consent. Otherwise render the unauth CTAs
+ * (Sign-in primary + shareable deep link secondary; the CLI fallback was
+ * retired in rc.19).
+ *
+ * The session-bound approve gate mirrors the same-origin DCR auto-approve
+ * gate on `/oauth/register` (#199, #200): valid session cookie + matching
+ * Origin/Referer = trusted operator action. Cross-origin or session-less
+ * GETs see the unauth CTA; the button never renders for them, so the POST
+ * handler can't be tricked into approving via a hand-crafted form either
+ * (CSRF token won't match).
+ *
+ * BOTH branches plumb the original `/oauth/authorize?...` URL into the
+ * rendered page so the OAuth flow can resume after the operator's action:
+ *
+ *   - Authed branch: form's `return_to` is the authorize URL; the approve
+ *     POST handler 302s there after flipping status (open-redirect defense
+ *     in the POST handler validates `return_to` is hub-relative).
+ *   - Unauth branch: CTA's `next` is the authorize URL; `/login` 302s there
+ *     after sign-in (`safeNext` in admin-handlers.ts gates the target to
+ *     hub-relative paths). The operator lands back on this same page,
+ *     now authenticated → enters the authed branch above → one-click
+ *     approve resumes the OAuth flow.
+ *
+ * Pre-fix the unauth CTA pointed at `/admin/approve-client/<id>` (the SPA
+ * approve page) — which approves the client but discards the in-flight
+ * authorize URL, so the calling app (e.g. Claude MCP via Claude.ai) is
+ * never told and the user loops on retry. Caught when Aaron hit it on the
+ * Render deploy via Claude.ai's MCP connector.
+ */
+function pendingClientResponse(
+  db: Database,
+  req: Request,
+  client: OAuthClient,
+  authorizeUrl: URL,
+  deps: OAuthDeps,
+): Response {
+  const requestedScopes = (authorizeUrl.searchParams.get("scope") ?? "")
+    .split(" ")
+    .filter((s) => s.length > 0);
+  // Vault hint (closes #244): Notes' VaultPopover (notes#115) sets this on
+  // the authorize URL when kicking OAuth for a specific vault. Empty-string
+  // values normalize to undefined so the approve UI omits the row rather
+  // than rendering a blank vault label.
+  const vaultParam = authorizeUrl.searchParams.get("vault");
+  const requestedVault = vaultParam && vaultParam.length > 0 ? vaultParam : undefined;
+  const session = findActiveSession(db, req, deps.now ?? (() => new Date()));
+  const sameOrigin = isSameOriginRequest(req, resolveBoundOrigins(deps));
+
+  // Trust-by-client_name auto-approve (closes hub#409). When the requesting
+  // user has previously approved a client with the SAME client_name AND the
+  // current request's scopes are covered by that prior grant, auto-promote
+  // this pending client to approved + carry on as if status had been
+  // approved from the start.
+  //
+  // Motivation: CLI MCP clients (Claude Code et al.) re-DCR each session,
+  // each landing a fresh client_id. Strict (user, client_id) approval forces
+  // the operator to click Approve every single time even though they
+  // already approved the same client by name on every prior session. Aaron
+  // 2026-05-26: "once we've approved something like claude once it should
+  // not need admin approval every other time."
+  //
+  // Constraints (security guardrails kept):
+  //   1. Requires an active operator session — anonymous DCR can't ride
+  //      another operator's prior trust.
+  //   2. Requires same-origin — defends against an attacker registering a
+  //      malicious "claude-code" client on a different hub and tricking
+  //      the operator into authorizing it.
+  //   3. Requires a non-empty client_name — DCR allows omitting it, in
+  //      which case the prior-grant lookup has nothing to match against.
+  //   4. Requires scope coverage — a strict superset (the new request asks
+  //      for scopes the prior grant didn't cover) falls through to the
+  //      approve-pending screen so the operator explicitly approves the
+  //      addition.
+  //   5. Low-risk scopes only — any scope with elevated/high blast-radius risk
+  //      requires explicit per-session consent, even when its verb is merely
+  //      `write` (for example, account:self:write). Unknown scopes also fail
+  //      closed through `forcesExplicitConsent` until they have a known risk
+  //      classification.
+  if (
+    session &&
+    sameOrigin &&
+    client.clientName &&
+    requestedScopes.length > 0 &&
+    !requestedScopes.some(forcesExplicitConsent) &&
+    isCoveredByGrantForClientName(db, session.userId, client.clientName, requestedScopes)
+  ) {
+    console.log(
+      `[oauth] auto-approved pending client by prior client_name trust client_id=${client.clientId} client_name=${JSON.stringify(client.clientName)} user_id=${session.userId} scopes=${requestedScopes.join(" ")} (hub#409)`,
+    );
+    approveClient(db, client.clientId);
+    // Re-record the grant for this fresh client_id so the standard
+    // (user, client_id) consent-skip path also fires on the IMMEDIATE
+    // continuation below — without this, the very next /oauth/authorize
+    // dispatch would re-enter the "is grant covered?" check against the
+    // new client_id, find nothing (we matched by name, not id), and
+    // render the consent screen anyway.
+    recordGrant(db, session.userId, client.clientId, requestedScopes, deps.now?.() ?? new Date());
+    // Fall through to the standard approved-client flow: re-fetch the
+    // refreshed row + let handleAuthorizeGet continue past the
+    // status-check + into the consent-skip / same-hub auto-trust path.
+    const refreshed = getClient(db, client.clientId);
+    if (refreshed && refreshed.status === "approved") {
+      return handleAuthorizeGet(db, req, deps);
+    }
+    // If for some reason the refresh failed, fall through to render the
+    // approve-pending page (defensive — should never happen given the
+    // approveClient call just above).
+  }
+  const csrf = ensureCsrfToken(req);
+  const extra: Record<string, string> = csrf.setCookie ? { "set-cookie": csrf.setCookie } : {};
+  // Hub-relative URL of the original `/oauth/authorize?...` request. Used in
+  // BOTH branches so the post-approve path (authed: form's `return_to`) and
+  // the post-login path (unauthed: CTA's `next`) round-trip the operator
+  // back to the same OAuth flow. Without `loginNextUrl` on the unauth
+  // branch, the operator post-login would land on the SPA approve page
+  // with no knowledge of the in-flight authorize URL — the SPA approves
+  // the client but the OAuth flow never completes, the calling app (e.g.
+  // Claude MCP) is never told, and the user loops on retry. Fix lands the
+  // unauth flow on the same authorize URL, post-login the operator hits
+  // the authed branch's inline approve form, and the flow resumes.
+  const returnTo = `${authorizeUrl.pathname}${authorizeUrl.search}`;
+  if (session && sameOrigin) {
+    // Plumb redirect_uri + state for the Deny path (hub#390): an operator
+    // who clicks Deny gets routed back to the client's redirect_uri with
+    // an RFC 6749 §4.1.2.1 error response. redirect_uri is required by
+    // the spec on /oauth/authorize so it's reliably present; state is
+    // optional per the spec, so undefined-passes-through.
+    //
+    // We round-trip both values through hidden form inputs rather than
+    // re-parsing them from `return_to` in the handler. Reason: keeps the
+    // handler stateless about authorize-URL shape — it just reads the
+    // form. State is also not stored server-side (it never was; OAuth
+    // state lives in the query string by design).
+    const requestRedirectUri = authorizeUrl.searchParams.get("redirect_uri") ?? "";
+    const requestState = authorizeUrl.searchParams.get("state") ?? undefined;
+    return htmlResponse(
+      renderApprovePending({
+        clientName: client.clientName ?? client.clientId,
+        clientId: client.clientId,
+        redirectUris: client.redirectUris,
+        requestedScopes,
+        ...(requestedVault !== undefined && { requestedVault }),
+        hubOrigin: deps.issuer,
+        approveForm: {
+          csrfToken: csrf.token,
+          returnTo,
+          redirectUri: requestRedirectUri,
+          ...(requestState !== undefined && { state: requestState }),
+        },
+        loginNextUrl: returnTo,
+      }),
+      403,
+      extra,
+    );
+  }
+  return htmlResponse(
+    renderApprovePending({
+      clientName: client.clientName ?? client.clientId,
+      clientId: client.clientId,
+      redirectUris: client.redirectUris,
+      requestedScopes,
+      ...(requestedVault !== undefined && { requestedVault }),
+      hubOrigin: deps.issuer,
+      loginNextUrl: returnTo,
+    }),
+    403,
+    extra,
+  );
+}
+
+/**
+ * JSON response for pending clients hitting /oauth/token. Carries two
+ * actionability hints alongside the OAuth error so consumers (Notes, future
+ * cross-origin SPAs) can surface an inline approval path instead of dead-
+ * ending on a CLI message:
+ *
+ *   - `approve_url` — hub-served SPA route the operator can open in a
+ *     browser to approve the client in one click. Same-origin to the hub.
+ *   - `cli_alternative` — the `parachute auth approve-client <id>` shell
+ *     command, retained for terminal-first operators or scripted flows.
+ *
+ * Spec note: the OAuth error class stays `invalid_client` per RFC 6749 §5.2
+ * — "this client cannot use this endpoint right now" is the semantic match.
+ * `access_denied` is reserved for /authorize "user said no" flows; using it
+ * here would conflate two distinct error families and break clients doing
+ * strict spec-shaped handling. The extra fields are spec-permitted
+ * extensions ("other parameters").
+ */
+/**
+ * Render the "Unknown application" page surfaced by /oauth/authorize when
+ * `getClient(db, clientId)` returns null. Promotes the recovery affordance
+ * (a "Reset connection" button that clears `lens:dcr:*` localStorage on the
+ * hub's own origin) when the request's redirect_uri points at one of the
+ * hub's bound origins — that's the Notes-mounted-at-hub-origin case where
+ * we can safely run inline JS against the SPA's storage.
+ *
+ * Root-cause shape (rc.11 fresh-machine connect bug): an operator who wipes
+ * `~/.parachute/hub.db` between testing iterations strands their browser's
+ * cached client_id, and the SPA has no signal to clear it without
+ * operator action. The hub-side fix is to give the operator one click on
+ * the error page. See `renderUnknownClient` in oauth-ui.ts for the full
+ * design + the localStorage key the snippet clears.
+ *
+ * Cross-origin SPA redirect_uris fall back to the static error variant —
+ * we can't reach a third-party SPA's storage from this page. Malformed
+ * redirect_uris likewise fall back (we never trust an unparsed URL).
+ */
+function unknownClientResponse(
+  clientId: string,
+  redirectUri: string | null,
+  deps: OAuthDeps,
+): Response {
+  const selfOriginRedirectPath = resolveSelfOriginRedirectPath(redirectUri, deps);
+  return htmlResponse(
+    renderUnknownClient({
+      clientId,
+      selfOriginRedirectPath,
+    }),
+    400,
+  );
+}
+
+/**
+ * Parse a redirect_uri and return its pathname iff its origin is one the
+ * hub serves itself (any entry in `hubBoundOrigins`). Returns null when
+ * the URL is missing, malformed, or points at a non-hub origin — the
+ * caller falls back to a static error in those cases. The pathname is
+ * what the "Reset connection" button navigates to after clearing the
+ * SPA's cached client_id; e.g. for `http://localhost:1939/notes/oauth/callback`
+ * we return `/notes/oauth/callback`. The SPA then routes that internally
+ * (Notes' /oauth/callback handler harmlessly errors on missing code +
+ * state, and the user gets dropped onto the connect screen for a fresh
+ * DCR — that's the recovery path).
+ *
+ * Pathname-only (not the full URL) is deliberate: same-origin navigation
+ * is trivially safe, and we don't want to surface a redirect that
+ * leaves the hub's origin even when the redirect_uri claims it. If a
+ * future SPA needs different recovery semantics, this is the seam.
+ */
+function resolveSelfOriginRedirectPath(redirectUri: string | null, deps: OAuthDeps): string | null {
+  if (!redirectUri) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(redirectUri);
+  } catch {
+    return null;
+  }
+  const bound = resolveBoundOrigins(deps);
+  if (!bound.includes(parsed.origin)) return null;
+  return parsed.pathname || "/";
+}
+
+function pendingClientJson(clientId: string, issuer: string): Response {
+  const base = issuer.replace(/\/$/, "");
+  return jsonResponse(
+    {
+      error: "invalid_client",
+      error_description: "client is registered but has not been approved by the hub operator (#74)",
+      approve_url: `${base}/admin/approve-client/${encodeURIComponent(clientId)}`,
+      cli_alternative: `parachute auth approve-client ${clientId}`,
+    },
+    401,
+  );
+}
+
+/**
+ * GET /oauth/authorize — entrypoint. Validates client + redirect_uri, then
+ * either renders the login form (no session) or the consent screen (session
+ * present). All authorize-time params are echoed back via hidden inputs so
+ * the form POST keeps the binding intact.
+ *
+ * ## Silent-approve flow (skip-consent gate, hub#75, hub#236)
+ *
+ * Cross-surface session smoothness ("first Notes use prompts for consent;
+ * subsequent uses are seamless") rides on a single gate further down in
+ * this function. The end-to-end flow:
+ *
+ *   1. **First use.** A client lands on `/oauth/authorize` with scope `S`.
+ *      The user has a session but no prior `grants` row for this
+ *      (user, client) pair. `isCoveredByGrant` returns false; the gate
+ *      falls through; the consent screen renders. User clicks approve →
+ *      `handleAuthorizePost` records a `grants` row keyed on
+ *      (user_id, client_id) with the approved scopes, then mints the
+ *      auth code.
+ *   2. **Subsequent use, same scopes.** Same client lands on
+ *      `/oauth/authorize` with scope `S` again. `isCoveredByGrant` finds
+ *      the row and returns true. The gate fires: auth code minted
+ *      directly via `issueAuthCodeRedirect`; no consent screen renders;
+ *      operator sees a silent redirect. This is the seamless second-use
+ *      experience.
+ *   3. **Subsequent use, subset.** Client asks for scope `S' ⊂ S`. The
+ *      grant covers every requested scope; gate fires.
+ *   4. **Subsequent use, novel scope.** Client asks for scope `S''`
+ *      where `S'' ⊄ S` (a strict superset, or any new scope). The grant
+ *      doesn't cover the new ask; gate falls through; consent re-renders
+ *      with the new scope explicit. User must approve to extend the grant.
+ *   5. **Grant revoked.** Operator revokes via `/admin/permissions` or
+ *      `parachute auth revoke-grant`. The next /authorize re-renders
+ *      consent — already-minted refresh tokens keep working until they
+ *      expire (or are revoked separately via `/oauth/revoke`).
+ *
+ * Two important constraints on the gate itself:
+ *
+ *   - **Unnamed vault verbs (`vault:read`) always render consent.** The
+ *     vault-picker UI is the only path that binds an unnamed scope to a
+ *     specific vault (grants store narrowed `vault:<name>:<verb>`, so
+ *     `vault:read` never matches a stored grant literally). Re-flowing
+ *     with `vault:read` must always show the picker even if any prior
+ *     grant exists.
+ *   - **Client re-registration breaks the grant link.** Dynamic Client
+ *     Registration mints a fresh `client_id` each time; grants are keyed
+ *     on `(user_id, client_id)` so a re-registered client looks brand-
+ *     new and re-prompts for consent. (Intentional: the operator should
+ *     re-consent to an app whose registration was destroyed and re-made
+ *     — that's a stronger signal of "this is the same app I trusted"
+ *     than the redirect URI alone.)
+ *
+ * The full grant-scope subset semantics live in `grants.ts`
+ * `isCoveredByGrant`; the gate itself is the if-block below the
+ * "Skip-consent gate" comment in this function.
+ *
+ * Pinned by the regression test "first-use consent → silent-approve →
+ * novel scope re-prompts" in `oauth-handlers.test.ts` (hub#236), plus
+ * the per-branch tests in the same describe block (subset / superset /
+ * revoke / unnamed-vault / re-registered-client).
+ */
+export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps): Response {
+  const url = new URL(req.url);
+  const parsed = parseAuthorizeFormParams(url);
+  if ("error" in parsed) {
+    return htmlError("Invalid authorization request", parsed.error, 400);
+  }
+  // NOTE: response_type / code_challenge_method validation is DELIBERATELY
+  // deferred until after the (client_id, redirect_uri) pair is confirmed
+  // registered (below, just past `requireRegisteredRedirectUri`). RFC 6749
+  // §4.1.2.1: when the redirect_uri can't be validated against the client,
+  // errors MUST be shown to the user — NOT redirected to the supplied URI.
+  // Redirecting here (pre-validation) on a crafted redirect_uri is an open
+  // redirect (hub#570). Once the pair is validated, redirecting these errors
+  // back to the now-trusted URI is spec-correct.
+  let client = getClient(db, parsed.clientId);
+  if (!client) {
+    // Can't safely redirect — we don't trust the redirect_uri until we've
+    // matched it against a registered client. Render an HTML error that
+    // promotes a one-click recovery when the redirect_uri points at one
+    // of our own origins (the canonical fresh-machine repro: an operator
+    // wiped hub.db, the SPA still holds the old client_id in
+    // localStorage, the recovery is "clear that key and reload the SPA").
+    return unknownClientResponse(parsed.clientId, parsed.redirectUri, deps);
+  }
+
+  // RFC 8707 resource binding. When the client named a per-vault MCP resource
+  // (`<origin>/vault/<name>/mcp` or its PRM URL), narrow the requested scopes
+  // to that vault BEFORE the pending/consent branches below, so EVERY
+  // downstream consumer sees the narrowed set:
+  //
+  //   1. The consent screen — and the session-less "App not yet approved"
+  //      page (`pendingClientResponse`) — shows ONLY that vault's scopes
+  //      instead of the whole-hub catalog. Narrowing DROPS non-vault scopes
+  //      (`scribe:*`, `agent:send`, `hub:admin`) outright: the token this
+  //      flow mints is stamped `aud=vault.<name>`, so they're unusable inside
+  //      it and only inflate the consent surface — the exact "scary consent"
+  //      a friend hit connecting Claude to ONE vault (scribe isn't even
+  //      installed; `agent:send` is meaningless to them).
+  //   2. The minted token carries the named scope, so `inferAudience` stamps
+  //      `aud=vault.<name>` and a current-line vault accepts it (an unnamed
+  //      `vault:read` token is rejected by `findBroadVaultScopes`).
+  //   3. The trust-by-client_name coverage checks (the auto-approve branch
+  //      below + the one inside `pendingClientResponse`) compare the narrowed
+  //      request against the narrowed prior grant. Before this ran early they
+  //      compared the RAW whole-hub request against a vault-only grant, never
+  //      matched, and re-prompted consent every session for a client the
+  //      operator had already approved.
+  //
+  // We rewrite both `parsed.scope` (consent/grant/mint read it) AND the `url`
+  // scope param (`pendingClientResponse` + its login round-trip read it off
+  // the URL) so the two never diverge. Re-entry after login re-narrows
+  // idempotently (no foreign scopes left to drop).
+  //
+  // The ROOT `/mcp` door takes the same treatment minus the naming. Vault
+  // grants still pick a vault at consent; `account:vaults` is the other
+  // legitimate root resource and mints `aud=account` (no picker). Foreign
+  // scopes are unusable in either token. Without this branch the root door
+  // was the one place the whole-hub catalog still reached consent.
+  //
+  // No resource, or one that isn't an MCP resource we front (off-origin,
+  // malformed, non-vault path) → neither branch fires and the flow is
+  // byte-for-byte the pre-#461 behavior (manual picker, etc.).
+  let rootNarrowedToEmpty = false;
+  const boundOrigins = resolveBoundOrigins(deps);
+  const boundVault = resolveResourceVault(parsed.resource, boundOrigins);
+  if (boundVault) {
+    parsed.scope = narrowResourceVaultScopes(
+      parsed.scope.split(" ").filter((s) => s.length > 0),
+      boundVault,
+    ).join(" ");
+    url.searchParams.set("scope", parsed.scope);
+  } else if (isRootMcpResource(parsed.resource, boundOrigins)) {
+    const preNarrow = parsed.scope.split(" ").filter((s) => s.length > 0);
+    const narrowed = narrowRootMcpScopes(preNarrow);
+    rootNarrowedToEmpty = preNarrow.length > 0 && narrowed.length === 0;
+    parsed.scope = narrowed.join(" ");
+    url.searchParams.set("scope", parsed.scope);
+  }
+
+  // Validate the FULL request BEFORE any state mutation (the pending-client
+  // auto-approve below calls `approveClient`). Two reasons, both #570:
+  //
+  //   1. RFC 6749 §4.1.2.1 — an unvalidated redirect_uri error is shown to
+  //      the user, never redirected. `requireRegisteredRedirectUri` first
+  //      confirms the (client_id, redirect_uri) pair is registered; only then
+  //      may we redirect the protocol errors (response_type / PKCE) to it.
+  //   2. We must not permanently promote a pending client to `approved` for a
+  //      request we're about to reject. Pre-fix the redirect-uri + protocol
+  //      checks sat BELOW the auto-approve block, so a malformed request
+  //      (bad response_type / PKCE) against a registered-but-pending client
+  //      mutated the DB before validation ever ran (#570 reviewer fold).
+  //
+  // So: redirect_uri registration → response_type → PKCE, all ahead of the
+  // pending-client auto-approve.
+  try {
+    requireRegisteredRedirectUri(client, parsed.redirectUri);
+  } catch {
+    return htmlError(
+      "Redirect mismatch",
+      "The redirect_uri does not match any URI registered for this app.",
+      400,
+    );
+  }
+  // The pair is confirmed registered, so redirecting these protocol errors to
+  // it is spec-correct (RFC 6749 §4.1.2.1).
+  if (parsed.responseType !== "code") {
+    return oauthErrorRedirect(
+      parsed.redirectUri,
+      "unsupported_response_type",
+      "only response_type=code is supported",
+      parsed.state,
+    );
+  }
+  if (parsed.codeChallengeMethod !== "S256") {
+    return oauthErrorRedirect(
+      parsed.redirectUri,
+      "invalid_request",
+      "PKCE S256 is required",
+      parsed.state,
+    );
+  }
+
+  if (rootNarrowedToEmpty) {
+    return oauthErrorRedirect(
+      parsed.redirectUri,
+      "invalid_scope",
+      "none of the requested scopes are usable at the root MCP resource",
+      parsed.state,
+    );
+  }
+
+  if (client.status !== "approved") {
+    // Single-consent change (2026-05-29): the separate operator "approve this
+    // client" gate is retired — the user's OAuth consent IS the authorization.
+    // A request carrying a valid session auto-approves the pending client and
+    // FALLS THROUGH into the normal consent path below (resource-narrow →
+    // non-requestable gate → skip-consent / same-hub → consent render). A
+    // session-less request still renders the unauth "App not yet approved"
+    // page (`pendingClientResponse`), whose sign-in CTA (`loginNextUrl`)
+    // round-trips back to this authorize URL; after login the user re-enters
+    // WITH a session → hits this auto-approve branch → consent.
+    //
+    // We resolve the session via the same `parseSessionCookie` + `findSession`
+    // pair the consent path uses below (not `findActiveSession`) so the
+    // auto-approve predicate and the consent render agree on session identity.
+    const earlySessionId = parseSessionCookie(req.headers.get("cookie"));
+    const earlySession = earlySessionId ? findSession(db, earlySessionId) : null;
+    if (!earlySession) {
+      return pendingClientResponse(db, req, client, url, deps);
+    }
+    console.log(
+      `[oauth] auto-approved client on user consent (single-consent) client_id=${client.clientId} user_id=${earlySession.userId} (2026-05-29)`,
+    );
+    approveClient(db, client.clientId);
+
+    // Trust-by-client_name carry-over (hub#409, preserved through the
+    // single-consent change). Notes/Claude DCR a fresh client_id per session;
+    // when the user has a prior grant under the SAME client_name that covers
+    // the requested scopes, re-link must stay SILENT. The skip-consent gate
+    // below keys on (user, client_id) and the fresh client_id has no grant
+    // yet — so we re-record that prior coverage onto the fresh client_id here.
+    // The mint downstream goes through `issueAuthCodeRedirect`, which caps to
+    // held authority, so this carry-over can never silently re-grant an
+    // un-held verb. Guarded identically to the in-`pendingClientResponse`
+    // block: same-origin + non-empty client_name + low-risk requested scopes
+    // (`forcesExplicitConsent` is risk-based, not verb-based) + prior-grant
+    // coverage. When it doesn't apply, fall through to the consent render (the
+    // single-consent payoff: one consent screen, then silent).
+    const earlyRequested = parsed.scope.split(" ").filter((s) => s.length > 0);
+    if (
+      isSameOriginRequest(req, resolveBoundOrigins(deps)) &&
+      client.clientName &&
+      earlyRequested.length > 0 &&
+      !earlyRequested.some(forcesExplicitConsent) &&
+      isCoveredByGrantForClientName(db, earlySession.userId, client.clientName, earlyRequested)
+    ) {
+      console.log(
+        `[oauth] carried prior client_name trust onto fresh client_id=${client.clientId} client_name=${JSON.stringify(client.clientName)} user_id=${earlySession.userId} scopes=${earlyRequested.join(" ")} (hub#409)`,
+      );
+      recordGrant(
+        db,
+        earlySession.userId,
+        client.clientId,
+        earlyRequested,
+        deps.now?.() ?? new Date(),
+      );
+    }
+
+    // Re-fetch so `client.status` reflects `approved` for the rest of this
+    // function (the same-hub gate and consent props read `client`). Fall
+    // through on success; if the refresh somehow failed, render the unauth
+    // pending page defensively (should never happen given approveClient).
+    const refreshed = getClient(db, client.clientId);
+    if (!refreshed || refreshed.status !== "approved") {
+      return pendingClientResponse(db, req, client, url, deps);
+    }
+    client = refreshed;
+  }
+
+  // Operator-only scope gate (#96). Reject any request that names a scope
+  // we'll never mint via this flow — `parachute:host:admin` and friends.
+  // Per RFC 6749 §4.1.2.1, errors that aren't redirect-uri-related are
+  // delivered by redirect with `error=invalid_scope`.
+  const requestedScopes = parsed.scope.split(" ").filter((s) => s.length > 0);
+  if (accountVaultsCombinedWithOtherScopes(requestedScopes)) {
+    return oauthErrorRedirect(
+      parsed.redirectUri,
+      "invalid_scope",
+      "account:vaults cannot be combined with other scopes",
+      parsed.state,
+    );
+  }
+  const blocked = findNonRequestableScopes(requestedScopes);
+  if (blocked.length > 0) {
+    return oauthErrorRedirect(
+      parsed.redirectUri,
+      "invalid_scope",
+      `requested scopes are not available via the public authorization endpoint: ${blocked.join(", ")}`,
+      parsed.state,
+    );
+  }
+
+  const sessionId = parseSessionCookie(req.headers.get("cookie"));
+  const session = sessionId ? findSession(db, sessionId) : null;
+  const csrf = ensureCsrfToken(req);
+  const extra: Record<string, string> = csrf.setCookie ? { "set-cookie": csrf.setCookie } : {};
+  if (!session) {
+    return htmlResponse(renderLogin({ params: parsed, csrfToken: csrf.token }), 200, extra);
+  }
+
+  // Multi-user Phase 2 PR 2: non-admin users see the picker narrowed to
+  // their assigned vault list — they can't pick a vault they don't own.
+  // First admin (admin posture) sees the full dropdown of every vault on
+  // the hub.
+  //
+  // Two shapes for non-admin users emerge:
+  //   - exactly one assigned vault → picker renders locked to that name
+  //     (same shape as Phase 1; smallest diff for the common case).
+  //   - two or more assigned vaults → picker renders a free dropdown
+  //     filtered to those names — user picks one per consent.
+  //
+  // Defensive null-coalesce: the session points at a deleted user
+  // shouldn't 500; treat as admin posture (the broader scope-validation
+  // gate will catch any actual privilege issue).
+  //
+  // Resolved here (before the fast-paths) because the stale-assignment
+  // predicate below — which gates both skip-consent (#75) and same-hub
+  // auto-trust (hub#312) — needs both the user's assignment AND the live
+  // vault list. Keeping the manifest read in the hot path is the price of
+  // closing the silent-mint-on-stale-vault gap; the read is one JSON parse
+  // off-disk per /authorize.
+  const user = getUserById(db, session.userId);
+  const userIsAdmin = isHubAdmin(db, session.userId);
+  // Non-admin user's assigned vaults; admin posture (or no row) → empty.
+  const assignedVaults: string[] = userIsAdmin ? [] : (user?.assignedVaults ?? []);
+  const manifest = (deps.loadServicesManifest ?? readServicesManifest)();
+  const vaultNames = listVaultNames(manifest);
+
+  // Stale-assignment predicate (hub#284, generalized in Phase 2 PR 2 from
+  // single-vault to N-vault). For a non-admin user, "stale" means at
+  // least one of their assigned vaults no longer exists in services.json
+  // AND no vault in their list still exists — i.e. they have *zero*
+  // valid vaults to consent against. The banner surfaces this state with
+  // an admin-remediation hint instead of silently minting a token
+  // against a missing vault. If at least one of their vaults still
+  // exists, the consent flow proceeds normally — the missing ones drop
+  // out of the picker without ceremony.
+  //
+  // Admin users are never stale (they aren't pinned to any vault list).
+  const remainingValidVaults = assignedVaults.filter((v) => vaultNames.includes(v));
+  const hasStaleAssignment = assignedVaults.length > 0 && remainingValidVaults.length === 0;
+
+  // Skip-consent gate (#75). If the user has previously granted every
+  // requested scope to this client, mint the auth code immediately. Three
+  // important constraints:
+  //   - Unnamed vault verbs (`vault:read`) need the picker even if a prior
+  //     *named-vault* grant exists, because the operator's vault choice isn't
+  //     recorded literally — grants store narrowed `vault:<name>:<verb>`
+  //     scopes, so a fresh unnamed request never matches. Exception: a prior
+  //     `account:self:vaults` grant covers unnamed-at-root (rewrite at skip
+  //     to the bound connection grant). Same-hub auto-trust does not get
+  //     that rewrite.
+  //   - The grant covers `requestedScopes` exactly when every requested
+  //     scope appears in the stored set. A strict superset (client wants
+  //     something new) falls through to the consent screen.
+  //   - Stale-assignment (above) also forces the consent render so the
+  //     banner explains the broken state rather than silently minting a
+  //     token against the missing vault.
+  //   - The user is admin OR has at least one assigned vault (hub#429
+  //     reviewer fold, follow-up). A zero-vault non-admin whose prior
+  //     grants survived a `setUserVaults(_, [])` admin action would
+  //     otherwise silently re-mint a token against the now-revoked
+  //     vault assignment — the grants table has no FK cascade from
+  //     `user_vaults`, so deleting assignments doesn't revoke grants.
+  //     Same privesc shape as the same-hub auto-trust gate below;
+  //     identical guard (`userHasVaultPosture`). Force fall-through to
+  //     the consent render where the zero-vault gate in
+  //     `handleConsentSubmit` also refuses (defense in depth). This
+  //     also transitively defends the trust-by-client_name auto-
+  //     promote path (~line 554) which recursively re-enters
+  //     `handleAuthorizeGet` after promoting the pending client.
+  const hasUnnamedVault = unnamedVaultVerbs(requestedScopes).length > 0;
+  const userHasVaultPosture = userIsAdmin || assignedVaults.length > 0;
+  // Unnamed `vault:<verb>` still needs the picker on first contact — except
+  // when a prior whole-account grant already covers this client. Then skip
+  // and mint `account:vaults` (bound at the choke-point) instead of
+  // re-prompting forever. Same-hub auto-trust below does NOT get this
+  // rewrite: silently upgrading unnamed `vault:read` to whole-account on
+  // first contact is the privilege-creep that path exists to prevent.
+  const unnamedCoveredByAccountGrant = accountGrantCoversUnnamedAtRoot(
+    db,
+    session.userId,
+    client.clientId,
+    requestedScopes,
+  );
+  if (
+    !hasStaleAssignment &&
+    userHasVaultPosture &&
+    ((!hasUnnamedVault && isCoveredByGrant(db, session.userId, client.clientId, requestedScopes)) ||
+      unnamedCoveredByAccountGrant)
+  ) {
+    const mintScopes = unnamedCoveredByAccountGrant
+      ? replaceUnnamedVaultScopesWithAccountVaults(requestedScopes)
+      : requestedScopes;
+    console.log(
+      `consent skipped: existing grant covers requested scope client_id=${client.clientId} user_id=${session.userId} scopes=${mintScopes.join(" ")}`,
+    );
+    return issueAuthCodeRedirect(db, parsed, mintScopes, session.userId, deps);
+  }
+
+  // -------------------------------------------------------------------------
+  // HUB/CLOUD DRIFT #2 — consent-shortcut surface at /oauth/authorize.
+  // Cloud twin: `workers/identity/src/oauth-authorize.ts`.
+  //
+  // The same-hub auto-trust gate (#312) and the trust-by-client_name carry-over
+  // (#409, in `pendingClientResponse` and the early block above) are hub-only
+  // self-host / single-operator shortcuts: they exist because the operator who
+  // installed the app IS the account. Cloud has neither TRUSTED-CLIENT
+  // shortcut.
+  //
+  // That is narrower than "cloud always shows a consent screen", and the
+  // difference matters. Cloud keeps the ordinary prior-grant skip-consent gate
+  // (`oauth-authorize.ts:293` — `isCoveredByGrant` covers the request, so it
+  // mints through `issueAuthCodeRedirect`), exactly as the hub does a few lines
+  // above this comment. What cloud lacks is any way to skip consent for a
+  // client the user has NEVER granted to. The hub-only shortcuts are dangerous
+  // precisely because they are first-contact trust; the prior-grant skip is
+  // shared, and rests on a consent screen the user already saw for those
+  // scopes.
+  //
+  // Be precise about which half is missing, because it decides who inherits
+  // this bug:
+  //
+  //   - Client-name trust: absent from cloud outright. Cloud's `grants.ts`
+  //     keys every lookup on (user_id, client_id) — `findGrant`,
+  //     `isCoveredByGrant`, `revokeGrant` all take a `clientId` and there is
+  //     no name-based path to carry a grant onto a different client_id.
+  //   - Same-hub: cloud DOES have the `same_hub` MARKER. It is a column
+  //     (`migrations/0001_init.sql`), it is set at DCR when a same-origin
+  //     request carries a valid operator session (`oauth-register.ts` →
+  //     `status = "approved"`, `sameHub = true`), it is persisted and read
+  //     back by `clients.ts`, and it is echoed in the DCR 201 body. What
+  //     cloud lacks is the CONSUMER: `oauth-authorize.ts` never consults it,
+  //     so the marker is inert there today.
+  //
+  // Consequence for `forcesExplicitConsent`: it has no cloud counterpart to
+  // keep in step. It is a hub-side compensating control for hub-only
+  // shortcuts, not half of a two-door contract, so a change here does NOT
+  // imply a matching cloud change.
+  //
+  // But the same-hub asymmetry is dormant, not structural: the marker cloud
+  // would need is already populated on live rows. If cloud ever wires
+  // `same_hub` to a consent shortcut, it inherits THIS defect on day one
+  // rather than having to build its way into it, and it must port this risk
+  // gate in the same change — not the `scopeIsAdmin` verb test this replaced.
+  //
+  // Same-hub auto-trust gate (hub#312, parachute-app design §6). When the
+  // DCR registrant authenticated as the operator (bearer hub:admin OR
+  // session-cookie + same-origin), the resulting client is "owned by this
+  // hub" — the operator who installed the app IS the implicit consent for
+  // each UI the app registers. Skip the consent screen and mint the auth
+  // code immediately, but only when:
+  //
+  //   1. The client is marked same_hub=true in the DB (set at DCR time).
+  //   2. Every requested scope is low-risk. Elevated/high-risk scopes require
+  //      explicit consent even when their verb is `write`; account-wide
+  //      `account:self:write` is the motivating example. Unknown scopes also
+  //      force consent through `forcesExplicitConsent`.
+  //   3. No unnamed vault verbs are requested — those need the picker to
+  //      narrow `vault:<verb>` → `vault:<name>:<verb>` before mint.
+  //   4. The user's assigned_vaults list is not stale (hub#284 reviewer
+  //      fold) — otherwise the same-hub gate would silently mint a token
+  //      for a removed vault before the consent-render path's stale
+  //      detection ever runs.
+  //   5. The user is admin OR has at least one assigned vault (Phase 2
+  //      PR 2 reviewer fold). A zero-vault non-admin has
+  //      `hasStaleAssignment=false` (length===0 short-circuits the stale
+  //      predicate above) and would otherwise sail through the auto-
+  //      trust gate. The resulting `vault_scope: []` claim is the admin
+  //      "unrestricted" sentinel — minting it for a non-admin grants
+  //      hub-wide vault access. Force fall-through to the consent
+  //      render where the zero-vault gate in `handleConsentSubmit` also
+  //      refuses (defense in depth).
+  //
+  // The grant is also recorded so subsequent flows with the same scopes
+  // hit the standard skip-consent gate above. Logged so an operator
+  // auditing "who did this" can trace it back to a same-hub DCR.
+  const hasExplicitConsentScope = requestedScopes.some(forcesExplicitConsent);
+  if (
+    client.sameHub &&
+    !hasExplicitConsentScope &&
+    !hasUnnamedVault &&
+    !hasStaleAssignment &&
+    userHasVaultPosture
+  ) {
+    console.log(
+      `[oauth] auto-approved same-hub client client_id=${client.clientId} user_id=${session.userId} scopes=${requestedScopes.join(" ")} (hub#312)`,
+    );
+    // The grant is recorded INSIDE issueAuthCodeRedirect with the CAPPED
+    // scopes (single choke-point, single source of truth) so the next
+    // /authorize for this (user, client, scopes) hits the standard
+    // skip-consent path (#75) — and can never replay an un-held verb. The
+    // `hasExplicitConsentScope` above already keeps elevated/high-risk scopes
+    // off this path (they fall through to consent), so the cap is a no-op here
+    // for the common case, but it still runs unconditionally for defense in
+    // depth.
+    return issueAuthCodeRedirect(db, parsed, requestedScopes, session.userId, deps);
+  }
+
+  return htmlResponse(
+    renderConsent(
+      consentProps(
+        client,
+        parsed,
+        vaultNames,
+        csrf.token,
+        assignedVaults,
+        userIsAdmin,
+        grantableExtraScopes(db, session.userId, {
+          userIsAdmin,
+          requested: parsed.scope.split(" ").filter((s) => s.length > 0),
+          vaultName: assignedVaults.length === 1 ? assignedVaults[0] : undefined,
+        }),
+      ),
+    ),
+    200,
+    extra,
+  );
+}
+
+/**
+ * Anti-privilege-escalation cap (THE security crux of the single-consent
+ * change, 2026-05-29). A user may only delegate authority they themselves
+ * hold: the OAuth consent that authorizes a client must never grant a named
+ * vault verb the consenting user doesn't actually hold on that vault.
+ *
+ * For each scope shaped `vault:<name>:<verb>` (verb ∈ VAULT_VERBS) when the
+ * user is NOT the hub owner, the verb is admitted only if it appears in
+ * `vaultVerbsForUserVault(db, userId, name)` (the verbs the user holds on
+ * that vault, derived from their `user_vaults` role). Otherwise the scope is
+ * DROPPED. Non-vault scopes and unnamed `vault:<verb>` (which never reach
+ * mint without picker-narrowing) pass through untouched.
+ *
+ * A hub admin (`isHubAdmin`) bypasses the cap entirely — they hold admin on
+ * every vault by construction (admin posture is the unrestricted sentinel;
+ * see `vaultScopeForUser`). Owner=isHubAdmin is the post-#881 definition of
+ * "holds admin everywhere"; revisit when multi-admin lands.
+ *
+ * Security argument (documented at the call site too):
+ *   - The authority source of truth today is `isHubAdmin` for owner-wide
+ *     authority and `user_vaults.role` (via `vaultVerbsForRole`) for assigned
+ *     users.
+ *   - `vaultVerbsForRole` maps write→[read,write,admin] (2026-05-30: any
+ *     assigned user holds FULL vault authority, incl. admin), read→[read],
+ *     unknown→[]. This helper reads the held verb set and admits ONLY held
+ *     verbs — no hardcoded allow/deny of admin. So an assigned user gets
+ *     `vault:<their-vault>:admin`, while a user gets NOTHING for a vault they
+ *     aren't assigned (held=null → every verb dropped). The cap is the
+ *     forward-compatible single source: it admitted admin automatically the
+ *     moment the role mapping changed — no edit here was needed.
+ *   - Applied inside `issueAuthCodeRedirect` (the single choke-point ALL mint
+ *     paths funnel through: consent-submit, skip-consent, and same-hub
+ *     auto-trust), the CAPPED set is what gets both recorded (`recordGrant`)
+ *     and minted (`issueAuthCode`). No mint path can bypass it, and a later
+ *     skip-consent flow can never replay an un-held admin verb because it was
+ *     never recorded.
+ */
+function bindAccountVaultsScopes(scopes: readonly string[]): string[] {
+  return scopes.map((s) => (s === ACCOUNT_VAULTS_UNNARROWED ? accountVaultsScope("self") : s));
+}
+
+function isAccountVaultsConnectionScope(scope: string): boolean {
+  return scope === ACCOUNT_VAULTS_UNNARROWED || scope === accountVaultsScope("self");
+}
+
+function isAccountSelfRestScope(scope: string): boolean {
+  return (
+    scope === ACCOUNT_SELF_READ_SCOPE ||
+    scope === ACCOUNT_SELF_WRITE_SCOPE ||
+    scope === ACCOUNT_SELF_ADMIN_SCOPE
+  );
+}
+
+/** Same `aud=account` companions of the connection grant. RFC 8707 forbids
+ * mixing vault-audience scopes with `account:vaults`; it does not forbid
+ * `account:self:{read,write,admin}` — they share the account audience. */
+function isAccountAudienceCompanion(scope: string): boolean {
+  return isAccountVaultsConnectionScope(scope) || isAccountSelfRestScope(scope);
+}
+
+function isNamedVaultScope(scope: string): boolean {
+  const parts = scope.split(":");
+  const name = parts[1];
+  const verb = parts[2];
+  return parts.length === 3 && parts[0] === "vault" && !!name && !!verb && VAULT_VERBS.has(verb);
+}
+
+function accountVaultsCombinedWithOtherScopes(scopes: readonly string[]): boolean {
+  const has = scopes.some(isAccountVaultsConnectionScope);
+  if (!has) return false;
+  return scopes.some((s) => !isAccountAudienceCompanion(s));
+}
+
+function capScopesToUserAuthority(
+  db: Database,
+  userId: string,
+  scopes: readonly string[],
+  opts: { userIsAdmin: boolean },
+): string[] {
+  if (opts.userIsAdmin) return [...scopes];
+  return scopes.filter((s) => {
+    // Account scopes are ACCOUNT-WIDE, and on self-host the account IS the box
+    // (`account-api.ts`: "operator ≡ account ≡ box… the operator owns every
+    // vault, so the ownership gate the cloud twin runs per-vault is trivially
+    // satisfied here"). So `account:self:admin` reaches every vault with no
+    // per-vault gate behind it.
+    //
+    // That makes it the one scope a non-admin must never be able to consent
+    // into: an assigned user holding exactly one vault could otherwise walk
+    // the public OAuth flow and mint a token with authority over ALL of them.
+    // The vault-verb branch below can't catch it — it only inspects
+    // `vault:<name>:<verb>` and passes everything else through — so it needs
+    // its own rule, here, at the same choke-point every mint path funnels
+    // through.
+    //
+    // Admins are unaffected: they returned above, and on self-host the admin
+    // IS the account holder, so they're delegating authority they actually
+    // have.
+    // Account scopes are ACCOUNT-WIDE, and on self-host the account IS the
+    // box. `account:self:{read,write,admin}` must never be consentable by a
+    // non-owner. The one exception is the account-MCP connection grant —
+    // 2-part `account:vaults` or 3-part `account:<id>:vaults` — which
+    // account-MCP intersects with the caller's assignment (`resolveCoverage`).
+    // Reuse `isRequestableAccountScope` rather than re-deriving the shape:
+    // that helper deliberately excludes the 4-part consent-narrowed form
+    // (`account:<id>:vaults:<vault>`), so a client cannot pre-narrow itself
+    // by asking for it here.
+    //
+    // Exact-lowercase: casing variants (`Account:vaults`) fail closed, same
+    // as the door-contract. Detect the family case-insensitively so
+    // `ACCOUNT:self:admin` is still dropped rather than passing through to
+    // the vault-verb branch.
+    if (s.toLowerCase().startsWith("account:")) return isRequestableAccountScope(s);
+    const parts = s.split(":");
+    if (parts.length !== 3 || parts[0] !== "vault") return true; // non-named — pass through
+    const name = parts[1];
+    const verb = parts[2];
+    if (name === undefined || verb === undefined || !VAULT_VERBS.has(verb)) return true;
+    // Named vault verb requested by a non-owner: admit only if the user holds
+    // it. `vaultVerbsForUserVault` returns null for an unassigned vault (drop)
+    // or the held verb list — a `write` role holds [read, write, admin], a
+    // `read` role holds [read] (see `vaultVerbsForRole`).
+    const held = vaultVerbsForUserVault(db, userId, name);
+    return held !== null && (held as readonly string[]).includes(verb);
+  });
+}
+
+/**
+ * The scopes this user could ADD to what the client asked for — the menu behind
+ * the consent screen's "additional access" section.
+ *
+ * ## Why the consent screen offers anything at all
+ *
+ * Consent used to be approve/deny on exactly the client's request, which left
+ * two dead ends. A client that requests NOTHING (scope omitted — legal in RFC
+ * 6749, and common among MCP clients) got a zero-scope token: a credential that
+ * looks like success and can do nothing. And a client that doesn't know to ask
+ * for `account:self:*` made that authority unreachable through OAuth entirely,
+ * no matter who was consenting.
+ *
+ * So the user picks. There's precedent — the vault verb radio picker already
+ * lets an owner grant a level the client didn't request.
+ *
+ * ## The menu IS the cap
+ *
+ * Built by running the full candidate set through `capScopesToUserAuthority`,
+ * the same function the mint choke-point uses, rather than by re-deriving "what
+ * may this user grant". Two different answers to that question would eventually
+ * disagree, and the failure mode of disagreement is offering a checkbox that
+ * escalates — or one that silently does nothing when ticked.
+ *
+ * Nothing here is trusted at submit time regardless: the choke-point re-caps
+ * whatever comes back, so a hand-crafted form gains nothing.
+ */
+export function grantableExtraScopes(
+  db: Database,
+  userId: string,
+  opts: { userIsAdmin: boolean; requested: readonly string[]; vaultName?: string | undefined },
+): string[] {
+  const v = opts.vaultName;
+  // The picker is the only path to `account:vaults`. Offering it as an extra
+  // next to the client's vault scopes hits `accountVaultsCombinedWithOtherScopes`
+  // at mint — a checkbox that looks grantable and then bounces the whole
+  // authorize. When the client already asked for the connection grant,
+  // vault extras are still that landmine (cross-audience), but the REST
+  // ladder is the same `aud=account` and is what "plus account access" means.
+  const restLadder = [ACCOUNT_SELF_READ_SCOPE, ACCOUNT_SELF_WRITE_SCOPE, ACCOUNT_SELF_ADMIN_SCOPE];
+  if (opts.requested.some(isAccountVaultsConnectionScope)) {
+    const already = new Set(opts.requested);
+    return capScopesToUserAuthority(
+      db,
+      userId,
+      restLadder.filter((c) => !already.has(c)),
+      { userIsAdmin: opts.userIsAdmin },
+    );
+  }
+  const candidates = [
+    ...(v
+      ? [`vault:${v}:read`, `vault:${v}:write`, `vault:${v}:admin`]
+      : ["vault:read", "vault:write", "vault:admin"]),
+    ...restLadder,
+  ];
+
+  // Compare both naming shapes in one canonical key space. When an admin's
+  // candidate list is unnamed but the request was already narrowed to a
+  // named vault, include that requested name as a display context too; the
+  // shared normalizer then maps the unnamed candidate to the same key. When a
+  // vault name is resolved, the ordinary context handles the reverse case
+  // (unnamed request versus named candidate).
+  const comparisonVaults: Array<string | undefined> = [v];
+  for (const requested of opts.requested) {
+    const parts = requested.split(":");
+    const requestedVault = parts.length === 3 && parts[0] === "vault" ? parts[1] : undefined;
+    if (requestedVault !== undefined && !comparisonVaults.includes(requestedVault)) {
+      comparisonVaults.push(requestedVault);
+    }
+  }
+  const canonicalKeys = (scope: string): string[] =>
+    comparisonVaults.map((displayVault) => canonicalConsentScope(scope, displayVault));
+  const already = new Set(opts.requested.flatMap(canonicalKeys));
+  return capScopesToUserAuthority(
+    db,
+    userId,
+    candidates.filter((candidate) => canonicalKeys(candidate).every((key) => !already.has(key))),
+    { userIsAdmin: opts.userIsAdmin },
+  );
+}
+
+/**
+ * Mint an auth code and redirect to the client's redirect_uri. The SINGLE
+ * mint choke-point — shared by the consent-submit path (`handleConsentSubmit`),
+ * the skip-consent path (#75), and the same-hub auto-trust path (hub#312) in
+ * `handleAuthorizeGet`. Caller is responsible for having already validated the
+ * client + redirect_uri and for having narrowed unnamed `vault:<verb>` scopes
+ * to their named form (so the cap below sees final shapes).
+ *
+ * This is the single choke-point for two responsibilities, so NO mint path can
+ * bypass them:
+ *   1. Anti-privilege-escalation cap (`capScopesToUserAuthority`): a non-owner
+ *      can only delegate vault verbs they hold; un-held verbs (notably admin)
+ *      are dropped. An admin-only request from a non-owner caps to EMPTY → we
+ *      refuse with `invalid_scope` rather than mint a zero-scope token. EVERY
+ *      auth code is minted through here, so the cap runs before every mint —
+ *      even when a stale `grants` row already lists an un-held admin verb (the
+ *      cap, not the grant lookup, is what blocks the mint).
+ *   2. Grant recording (`recordGrant`) with the CAPPED scopes for THIS mint —
+ *      so a later skip-consent flow re-entering with the same (user, client)
+ *      can never replay an un-held verb. UNION semantics make this idempotent.
+ *
+ * Not the ONLY `recordGrant` call in this module, though: two other guarded
+ * fast-path records exist — the trust-by-client_name auto-promote in
+ * `pendingClientResponse` (~L585) and the auto-approve carry-over in
+ * `handleAuthorizeGet` (~L895). Both are gated by
+ * `!some(forcesExplicitConsent)`, so neither can record an elevated/high-risk
+ * scope without explicit consent, and any mint they unlock still flows back
+ * through this function's cap. So the invariant "no trusted-client shortcut
+ * silently records a non-low-risk scope" holds across all paths.
+ */
+function issueAuthCodeRedirect(
+  db: Database,
+  params: AuthorizeFormParams,
+  scopes: string[],
+  userId: string,
+  deps: OAuthDeps,
+): Response {
+  // Anti-privesc cap at the single choke-point. Runs AFTER any narrowing the
+  // callers did (unnamed `vault:admin` → `vault:<picked>:admin`), so it sees
+  // the final named shapes. Hub admin (isHubAdmin) bypasses — holds admin
+  // everywhere by construction.
+  const userIsAdmin = isHubAdmin(db, userId);
+  // RFC 9728 walk: PRM advertises un-narrowed `account:vaults`; the token
+  // must carry the id-bound blanket `account:self:vaults`. Bind here at the
+  // single mint choke-point so skip-consent and form-consent cannot diverge.
+  const boundScopes = bindAccountVaultsScopes(scopes);
+  if (accountVaultsCombinedWithOtherScopes(boundScopes)) {
+    return oauthErrorRedirect(
+      params.redirectUri,
+      "invalid_scope",
+      "account:vaults cannot be combined with other scopes",
+      params.state,
+    );
+  }
+  const cappedScopes = capScopesToUserAuthority(db, userId, boundScopes, { userIsAdmin });
+  // Dedup HERE, after the cap, at the single mint choke-point every path funnels
+  // through — so the auth-code row, the JWT `scope` claim, the refresh row, the
+  // token response, and the recorded grant all carry the same set.
+  //
+  // Three requested verbs that converge on one string used to stay three
+  // strings: nothing on this path deduped (map → map → filter). A token reading
+  // `vault:x:admin vault:x:admin vault:x:admin` is cosmetic, but it made the
+  // scope claim hard to read and trivially wrong-looking in a bug report.
+  //
+  // After the cap, never before: deduping the pre-cap set would change what the
+  // cap sees and could mask a dropped verb.
+  const dedupedScopes = [...new Set(cappedScopes)];
+
+  // Drop-not-refuse UX, with one hard floor: if capping leaves an EMPTY set
+  // (e.g. a non-owner requested ONLY `vault:<name>:admin`, which they don't
+  // hold), never mint a zero-scope token — refuse with a clear invalid_scope.
+  // A request that started empty (no scopes at all) is a separate, legitimate
+  // "session token only" case the consent UI supports, so we only refuse when
+  // the cap itself removed every scope.
+  if (cappedScopes.length === 0 && scopes.length > 0) {
+    return oauthErrorRedirect(
+      params.redirectUri,
+      "invalid_scope",
+      "You can grant only the access you hold on this vault; an admin grant requires hub-owner authority.",
+      params.state,
+    );
+  }
+
+  // Record the grant with the CAPPED scopes (single source of truth) so
+  // skip-consent re-entry can never widen back to an un-held verb.
+  recordGrant(db, userId, params.clientId, dedupedScopes, deps.now?.() ?? new Date());
+
+  const code = issueAuthCode(db, {
+    clientId: params.clientId,
+    userId,
+    redirectUri: params.redirectUri,
+    scopes: dedupedScopes,
+    codeChallenge: params.codeChallenge,
+    codeChallengeMethod: params.codeChallengeMethod,
+    now: deps.now,
+  });
+  const u = new URL(params.redirectUri);
+  u.searchParams.set("code", code.code);
+  if (params.state) u.searchParams.set("state", params.state);
+  return redirectResponse(u.toString());
+}
+
+/**
+ * POST /oauth/authorize — handles two distinct submissions:
+ *   - login form: `__action=login` with username + password. On success,
+ *     create a session, set the cookie, redirect back to GET /oauth/authorize
+ *     so the user lands on the consent screen.
+ *   - consent submission: `__action=consent` with `approve=yes|no`. On
+ *     approve, mint an auth code and redirect to the client's redirect_uri.
+ *     On deny, redirect with `error=access_denied`.
+ */
+export async function handleAuthorizePost(
+  db: Database,
+  req: Request,
+  deps: OAuthDeps,
+): Promise<Response> {
+  const form = await req.formData();
+  const formCsrf = form.get(CSRF_FIELD_NAME);
+  if (!verifyCsrfToken(req, typeof formCsrf === "string" ? formCsrf : null)) {
+    // Same response shape for missing-cookie, missing-form-field, and mismatch
+    // — we don't want to leak which side failed. The browser can recover by
+    // GETting /oauth/authorize again, which mints a fresh cookie + token.
+    return htmlError(
+      "Invalid form submission",
+      "The form's CSRF token did not match. Reload the page and try again.",
+      400,
+    );
+  }
+  // Token is already verified above; reuse the form value for re-rendering
+  // any error views so the next submit keeps the same cookie/form pairing.
+  const csrfToken = typeof formCsrf === "string" ? formCsrf : "";
+  const action = String(form.get("__action") ?? "");
+  if (action === "login") return await handleLoginSubmit(db, req, form, deps, csrfToken);
+  if (action === "consent") return await handleConsentSubmit(db, req, form, deps, csrfToken);
+  return htmlError("Invalid form submission", "Unknown form action.", 400);
+}
+
+async function handleLoginSubmit(
+  db: Database,
+  req: Request,
+  form: Awaited<ReturnType<Request["formData"]>>,
+  deps: OAuthDeps,
+  csrfToken: string,
+): Promise<Response> {
+  const username = String(form.get("username") ?? "");
+  const password = String(form.get("password") ?? "");
+  const params = paramsFromForm(form);
+  // Rate-limit gate — AFTER CSRF (verified by the `handleAuthorizePost` caller)
+  // and BEFORE the credential check. This `/oauth/authorize` password door had
+  // NO rate-limit before; without it an attacker got an unbounded brute-force
+  // channel that bypassed `/login`'s floor entirely. Two tiers, reusing the
+  // SAME `loginRateLimiter` instance + the SAME `compositeKey(ip, username)`
+  // scheme as `/login`, so the two password doors share ONE per-account bucket
+  // (an attacker can't get 5 tries at `/login` PLUS another 5 here). The coarse
+  // per-IP CEILING backstops username-rotation; the per-(ip,username) FLOOR is
+  // the brute-force floor.
+  const clientIp = clientIpFromRequest(req);
+  const now = deps.now ? deps.now() : new Date();
+  const ceiling = authIpCeilingRateLimiter.checkAndRecord(clientIp, now);
+  const floor = loginRateLimiter.checkAndRecord(compositeKey(clientIp, username), now);
+  if (!ceiling.allowed || !floor.allowed) {
+    const retryAfterSeconds = Math.max(
+      ceiling.allowed ? 0 : (ceiling.retryAfterSeconds ?? 1),
+      floor.allowed ? 0 : (floor.retryAfterSeconds ?? 1),
+    );
+    return htmlResponse(
+      renderLogin({
+        params,
+        csrfToken,
+        errorMessage: `Too many login attempts. Try again in ${retryAfterSeconds} seconds.`,
+      }),
+      429,
+      { "retry-after": String(retryAfterSeconds) },
+    );
+  }
+  if (!username || !password) {
+    return htmlResponse(
+      renderLogin({ params, csrfToken, errorMessage: "Username and password are required." }),
+      400,
+    );
+  }
+  const user = getUserByUsername(db, username);
+  if (!user) {
+    return htmlResponse(
+      renderLogin({ params, csrfToken, errorMessage: "Invalid credentials." }),
+      401,
+    );
+  }
+  const ok = await verifyPassword(user, password);
+  if (!ok) {
+    return htmlResponse(
+      renderLogin({ params, csrfToken, errorMessage: "Invalid credentials." }),
+      401,
+    );
+  }
+
+  // Where to land after a successful sign-in: back at GET /oauth/authorize
+  // with the original query string so the user resumes the OAuth flow on the
+  // consent screen with full params re-validated.
+  const authorizeReturnUrl = buildAuthorizeReturnUrl(params);
+
+  // 2FA gate (hub#473 — security fix). The OAuth login POST is the MORE-common
+  // sign-in path (every OAuth client: vault, notes-ui, `parachute auth login`).
+  // It must enforce the second factor exactly like `/login` does: after the
+  // password verifies, if the user has TOTP enrolled, do NOT mint a session.
+  // Stash a pending-login whose `next` is the FULL /oauth/authorize return URL
+  // (so the post-TOTP redirect resumes the OAuth flow), and render the TOTP
+  // challenge. The challenge form posts to `/login/2fa` — the shared
+  // completion path (`handleAdminLoginTotpPost`) — which verifies the factor,
+  // mints the session, and 302s to the stored `next`. The pending-login cookie
+  // is scoped `Path=/login`, so it rides the `/login/2fa` POST. Without this
+  // gate a 2FA-enrolled user could obtain a full session with password ONLY.
+  if (isTotpEnrolled(db, user.id)) {
+    const pendingToken = createPendingLogin(user.id, authorizeReturnUrl);
+    return htmlResponse(renderTotpChallenge({ next: authorizeReturnUrl, csrfToken }), 200, {
+      "set-cookie": buildPendingLoginCookie(pendingToken, req),
+    });
+  }
+
+  const session = createSession(db, { userId: user.id });
+  recordLoginUnlock(db, session.id);
+  const cookie = buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000), {
+    secure: isHttpsRequest(req),
+  });
+  return redirectResponse(authorizeReturnUrl, { "set-cookie": cookie });
+}
+
+/**
+ * Build the `/oauth/authorize?...` return URL (path + query, same-origin) that
+ * a successful sign-in redirects back to so the OAuth flow resumes on the
+ * consent screen. Shared by the password-only path and the post-TOTP path
+ * (the latter via the pending-login's `next`).
+ */
+function buildAuthorizeReturnUrl(params: AuthorizeFormParams): string {
+  const u = new URL("/oauth/authorize", "http://placeholder");
+  for (const [k, v] of Object.entries(authorizeParamsToQuery(params))) {
+    u.searchParams.set(k, v);
+  }
+  return `${u.pathname}${u.search}`;
+}
+
+async function handleConsentSubmit(
+  db: Database,
+  req: Request,
+  form: Awaited<ReturnType<Request["formData"]>>,
+  deps: OAuthDeps,
+  csrfToken: string,
+): Promise<Response> {
+  const params = paramsFromForm(form);
+  // RFC 8707 resource binding — defense-in-depth (mirror of the GET handler).
+  // The consent form's hidden inputs already carry the narrowed named scopes
+  // (the GET handler rewrote `parsed.scope` before rendering), but a hand-
+  // crafted POST could re-supply an unnamed `vault:read` alongside the
+  // `resource` field. Re-narrow here so the minted token is always named +
+  // correctly-audienced regardless of what the form body claims. Same
+  // semantics as the GET path: only when `resource` resolves to one of our
+  // MCP resources — per-vault (narrow + name) or root (drop foreign scopes,
+  // picker still names); no-op otherwise (manual-pick path unchanged).
+  let rootNarrowedToEmpty = false;
+  const boundOrigins = resolveBoundOrigins(deps);
+  const boundVault = resolveResourceVault(params.resource, boundOrigins);
+  if (boundVault) {
+    params.scope = narrowResourceVaultScopes(
+      params.scope.split(" ").filter((s) => s.length > 0),
+      boundVault,
+    ).join(" ");
+  } else if (isRootMcpResource(params.resource, boundOrigins)) {
+    const preNarrow = params.scope.split(" ").filter((s) => s.length > 0);
+    const narrowed = narrowRootMcpScopes(preNarrow);
+    rootNarrowedToEmpty = preNarrow.length > 0 && narrowed.length === 0;
+    params.scope = narrowed.join(" ");
+  }
+  const approve = String(form.get("approve") ?? "") === "yes";
+  const sessionId = parseSessionCookie(req.headers.get("cookie"));
+  const session = sessionId ? findSession(db, sessionId) : null;
+  if (!session) {
+    // Session expired between login and consent submit. Send back to login.
+    return htmlResponse(
+      renderLogin({
+        params,
+        csrfToken,
+        errorMessage: "Your session expired — please sign in again.",
+      }),
+      401,
+    );
+  }
+  const client = getClient(db, params.clientId);
+  if (!client) {
+    // Same shape as the GET handler — see the comment there. Reaching
+    // this branch on the consent POST means the client_id was deleted
+    // between render and submit (vanishingly rare) or the form was
+    // hand-crafted; the recovery affordance is still the right answer
+    // for both cases.
+    return unknownClientResponse(params.clientId, params.redirectUri, deps);
+  }
+  if (client.status !== "approved") {
+    // Defensive: consent only renders for approved clients, so a non-approved
+    // status here means the row was unapproved between render and submit (or
+    // the form was hand-crafted). The approve UI requires a known authorize
+    // URL to round-trip via `return_to`, which we don't reconstruct here —
+    // surface the static error pointing at the web approval path (the
+    // canonical recovery post-#277; rc.19 retired the CLI mention from
+    // every browser-visible surface so the path advertised here matches
+    // what the unauth GET-on-pending page now shows).
+    return htmlError(
+      "App not yet approved",
+      `This client_id is registered but has not been approved. Sign in as admin and approve at /admin/approve-client/${client.clientId}, or send the link to your hub operator.`,
+      403,
+    );
+  }
+  try {
+    requireRegisteredRedirectUri(client, params.redirectUri);
+  } catch {
+    return htmlError(
+      "Redirect mismatch",
+      "The redirect_uri does not match any URI registered for this app.",
+      400,
+    );
+  }
+  if (rootNarrowedToEmpty) {
+    return oauthErrorRedirect(
+      params.redirectUri,
+      "invalid_scope",
+      "none of the requested scopes are usable at the root MCP resource",
+      params.state,
+    );
+  }
+  if (!approve) {
+    return oauthErrorRedirect(
+      params.redirectUri,
+      "access_denied",
+      "user denied the authorization request",
+      params.state,
+    );
+  }
+  let scopes = params.scope.split(" ").filter((s) => s.length > 0);
+  // Scopes the USER ticked in the "additional access" section — access the
+  // client didn't request but the consenting user chose to grant. Unioned in
+  // here so everything downstream (the non-requestable check just below, the
+  // named-scope narrowing, and the cap at the mint choke-point) treats them
+  // exactly like requested scopes. They get no special trust: a hand-crafted
+  // POST can name anything it likes and `capScopesToUserAuthority` still drops
+  // whatever the user doesn't hold.
+  const extraScopes = form
+    .getAll("extra_scope")
+    .map((v) => String(v))
+    .filter((v) => v.length > 0);
+
+  // Per-scope consent (granular approval). The consent screen renders one
+  // checkbox per REQUESTED scope, so a user can approve the notes access an
+  // app needs while declining the account-wide admin it also asked for —
+  // rather than facing an all-or-nothing choice that pushes people to approve
+  // things they don't want.
+  //
+  // Squarely within OAuth: RFC 6749 §3.3 says the AS MAY issue a token with a
+  // narrower scope than requested, and the token response's `scope` tells the
+  // client what it actually got. Google, GitHub and Slack all ship this.
+  //
+  // Back-compatible by construction: `granted_scope` fields are only honoured
+  // when the form supplies at least one. A programmatic POST (or an older
+  // cached consent page) that omits them entirely keeps the previous
+  // approve-everything-requested behaviour, so no existing flow breaks.
+  const grantedFields = form
+    .getAll("granted_scope")
+    .map((v) => String(v))
+    .filter((v) => v.length > 0);
+  if (grantedFields.length > 0) {
+    const kept = new Set(grantedFields);
+    scopes = scopes.filter((sc) => kept.has(sc));
+  }
+
+  if (extraScopes.length > 0) {
+    scopes = [...new Set([...scopes, ...extraScopes])];
+  }
+  params.scope = scopes.join(" ");
+
+  // Declining everything is a real choice, but it must not mint an empty
+  // token: a zero-scope credential looks like success and can do nothing,
+  // which is the failure mode this whole area keeps producing. Treat it as
+  // the denial it is, using the OAuth error the client already handles.
+  if (approve && scopes.length === 0) {
+    return oauthErrorRedirect(
+      params.redirectUri,
+      "access_denied",
+      "No permissions were granted — every requested scope was declined.",
+      params.state,
+    );
+  }
+  // Defense-in-depth (#96). The GET handler already rejects non-requestable
+  // scopes before consent renders, but a hand-crafted POST could carry one
+  // anyway — block it here too.
+  const blockedHere = findNonRequestableScopes(scopes);
+  if (blockedHere.length > 0) {
+    return oauthErrorRedirect(
+      params.redirectUri,
+      "invalid_scope",
+      `requested scopes are not available via the public authorization endpoint: ${blockedHere.join(", ")}`,
+      params.state,
+    );
+  }
+  // Multi-user Phase 2 PR 2: non-admin users are pinned to a list of one
+  // or more vaults via `user_vaults`. The consent screen renders the
+  // picker narrowed to that list and any named scopes (`vault:<name>:
+  // <verb>`) requested by the client must target a vault in the list.
+  // The server-side defense here refuses any mint where the user's
+  // submission disagrees, so a hand-crafted POST or a misbehaving SPA
+  // can't bypass the narrowing. First admin (admin posture) keeps the
+  // existing picker-as-source-of-truth behavior (empty `assignedVaults`).
+  const userIsAdmin = isHubAdmin(db, session.userId);
+  const sessionUser = getUserById(db, session.userId);
+  const assignedVaults: string[] = userIsAdmin ? [] : (sessionUser?.assignedVaults ?? []);
+  const isPinned = assignedVaults.length > 0;
+  // By design: the resource-bound re-narrow above does NOT check the bound
+  // vault exists in services.json for the admin path — admin (isPinned=false)
+  // can already consent to any vault via the manual picker, so the asymmetry
+  // (named-scope mint against a possibly-missing vault) is deliberate, not an
+  // oversight. Non-admins still hit the assignment + stale-vault defenses below.
+
+  // Zero-vault non-admin gate (Phase 2 PR 2 reviewer fold). A non-admin
+  // user with no `user_vaults` rows is a known-but-not-yet-assigned
+  // posture — they can sign in to /account/, change their password, and
+  // see the home page, but they have no vaults to authorize against.
+  // Block any vault-scoped consent at the submit boundary so an OAuth
+  // client can't trick them into minting a token: an empty `vault_scope`
+  // claim is the admin "unrestricted" sentinel (see `vaultScopeForUser`),
+  // and we must keep that sentinel reserved for true admins. Non-vault
+  // scopes (`scribe:transcribe`, etc.) still consent normally — only
+  // `vault:...` scopes are gated here. The defense pairs with the GET-
+  // path same-hub-auto-trust gate below (which falls through to the
+  // consent render that would otherwise show the picker).
+  if (!userIsAdmin && assignedVaults.length === 0) {
+    const submittedScopes = params.scope.split(" ").filter((s) => s.length > 0);
+    const hasVaultScope = submittedScopes.some((s) => {
+      if (s === "vault:read" || s === "vault:write" || s === "vault:admin") return true;
+      const parts = s.split(":");
+      return parts.length === 3 && parts[0] === "vault" && parts[2] && VAULT_VERBS.has(parts[2]);
+    });
+    if (hasVaultScope) {
+      return htmlError(
+        "No vaults assigned",
+        "vault_scope_mismatch: you have no assigned vaults on this hub yet, so you can't authorize an app for vault access. Ask the hub admin to assign you at least one vault via /admin/users, then try again.",
+        400,
+      );
+    }
+  }
+
+  // Vault picker (Q1 of the vault-config-and-scopes design): an unnamed
+  // `vault:<verb>` scope is ambiguous about which vault it grants access to.
+  // Force the operator to pick before the JWT is minted, then rewrite the
+  // unnamed scope to `vault:<picked>:<verb>` so vault's strict per-resource
+  // enforcement (Phase 1) sees a name it can match against the URL.
+  const unnamedVerbs = unnamedVaultVerbs(scopes);
+  if (unnamedVerbs.length > 0) {
+    const pickedVault = String(form.get("vault_pick") ?? "").trim();
+    if (!pickedVault) {
+      return htmlError(
+        "Pick a vault",
+        "This app requested vault access without naming a vault. Pick which vault to grant access to and try again.",
+        400,
+      );
+    }
+    if (pickedVault === VAULT_PICK_ACCOUNT) {
+      // Whole-account sentinel. Not a vault name (colon is outside the
+      // charset). A zero-vault non-admin cannot mint this — they have
+      // nothing to cover. Friends with assignments can: account-MCP
+      // intersects Bearer coverage with assignment.
+      if (!userIsAdmin && assignedVaults.length === 0) {
+        return htmlError(
+          "No vaults assigned",
+          "vault_scope_mismatch: you have no assigned vaults on this hub yet, so you can't authorize an app for vault access. Ask the hub admin to assign you at least one vault via /admin/users, then try again.",
+          400,
+        );
+      }
+      scopes = replaceUnnamedVaultScopesWithAccountVaults(scopes).filter(
+        (s) => !isNamedVaultScope(s),
+      );
+    } else {
+      const manifest = (deps.loadServicesManifest ?? readServicesManifest)();
+      const validNames = listVaultNames(manifest);
+      if (!validNames.includes(pickedVault)) {
+        // Stale-assignment branch (hub#284, generalized Phase 2 PR 2). The
+        // user is consenting via an assignment that points at a vault no
+        // longer in services.json. The new copy names the actual condition
+        // (assignment removed) and points at the admin remediation surface.
+        //
+        // The check fires when the picked vault is in the user's assigned
+        // list — narrows the special-case to the "user is consenting via
+        // a now-stale assignment" shape rather than swallowing every
+        // Unknown-vault. A hand-crafted POST naming a never-existed vault
+        // still hits the generic branch.
+        if (isPinned && assignedVaults.includes(pickedVault)) {
+          return htmlError(
+            "Assigned vault was removed",
+            `Your assigned vault "${pickedVault}" is no longer registered on this hub. Ask the hub admin to reassign you to an existing vault via /admin/users, then try again.`,
+            400,
+          );
+        }
+        return htmlError(
+          "Unknown vault",
+          `vault "${pickedVault}" is not registered on this host.`,
+          400,
+        );
+      }
+      // Server-side defense: non-admin user submitted a vault that's not in
+      // their assigned list. The picker rendered as narrowed, so a UI-path
+      // user couldn't reach this — but a hand-crafted form bypassing the
+      // narrowed input lands here. Refuse the mint instead of silently
+      // overwriting; the explicit error tells the operator the assignment
+      // is load-bearing.
+      if (isPinned && !assignedVaults.includes(pickedVault)) {
+        return htmlError(
+          "Vault assignment mismatch",
+          `vault_scope_mismatch: the picked vault "${pickedVault}" is not in your vault assignment. Ask the hub admin to update your assignment, or pick a vault shown on the consent screen.`,
+          400,
+        );
+      }
+      // hub#689's owner verb-widening selector is GONE (retired 2026-07-30).
+      //
+      // It was one radio applied to every requested verb, so a multi-verb request
+      // could not survive it: `vault:read vault:write vault:admin` with the
+      // selector's admin default rewrote to `vault:admin` three times. Observed
+      // live by an external team — a read-only research agent was simply not
+      // expressible, because both agents got admin or neither ran.
+      //
+      // Worse, it now CONTRADICTS per-scope consent (#804): a user unchecks
+      // write and admin, and this block rewrote their surviving `vault:read`
+      // back to admin. The checkboxes said read-only; the token said admin.
+      //
+      // Both of the selector's jobs are covered elsewhere now:
+      //   - downgrade → uncheck the scope row (per-scope consent)
+      //   - upgrade   → tick it in the additional-access list, which
+      //                 `grantableExtraScopes` builds through the SAME cap the
+      //                 mint uses, so it can't offer more than the user holds
+      //
+      // A stale `verb_select` from a cached consent page is now simply ignored,
+      // which fails NARROWER — it mints what was requested and checked. That's
+      // the safe direction for an unread field.
+      scopes = narrowVaultScopes(scopes, pickedVault);
+    }
+  }
+
+  // Server-side defense for named-vault scopes (`vault:<name>:<verb>`) too.
+  // A non-admin user can't request scope against any vault outside their
+  // assignment list — same invariant as the picker check above, applied
+  // to scopes that arrived already-named (e.g. a client that knows the
+  // user's vault and asked for `vault:bob:read` directly). Admin posture
+  // (`isPinned === false`) skips this check.
+  if (isPinned) {
+    const mismatched: string[] = [];
+    for (const s of scopes) {
+      const parts = s.split(":");
+      if (
+        parts.length === 3 &&
+        parts[0] === "vault" &&
+        parts[1] &&
+        parts[2] &&
+        VAULT_VERBS.has(parts[2]) &&
+        !assignedVaults.includes(parts[1])
+      ) {
+        mismatched.push(s);
+      }
+    }
+    if (mismatched.length > 0) {
+      return htmlError(
+        "Vault assignment mismatch",
+        `vault_scope_mismatch: requested scopes ${mismatched.join(", ")} target a vault outside your assignment.`,
+        400,
+      );
+    }
+
+    // Stale-assignment defense (hub#284, generalized Phase 2 PR 2). A
+    // named scope shaped `vault:<assigned>:<verb>` passes the mismatch
+    // check above but points at a vault that no longer exists in
+    // services.json. Minting a token here would silently issue scope
+    // against a vault the resource server can't find — the user thinks
+    // consent succeeded but the subsequent API calls fail with no
+    // actionable signal. Refuse the mint and surface the same admin-
+    // remediation hint the GET path's banner uses.
+    const namedStaleScopes: string[] = [];
+    for (const s of scopes) {
+      const parts = s.split(":");
+      if (
+        parts.length === 3 &&
+        parts[0] === "vault" &&
+        parts[1] !== undefined &&
+        parts[2] &&
+        VAULT_VERBS.has(parts[2]) &&
+        assignedVaults.includes(parts[1])
+      ) {
+        namedStaleScopes.push(s);
+      }
+    }
+    if (namedStaleScopes.length > 0) {
+      // Only consult the manifest when there's something to check — keeps
+      // the no-vault-scope hot path off-disk for the common admin flows.
+      const manifest = (deps.loadServicesManifest ?? readServicesManifest)();
+      const validNames = listVaultNames(manifest);
+      // Collect the stale vault names embedded in the named scopes.
+      const staleNames = new Set<string>();
+      for (const s of namedStaleScopes) {
+        const parts = s.split(":");
+        if (parts[1] !== undefined && !validNames.includes(parts[1])) {
+          staleNames.add(parts[1]);
+        }
+      }
+      if (staleNames.size > 0) {
+        const exemplar = [...staleNames][0];
+        return htmlError(
+          "Assigned vault was removed",
+          `Your assigned vault "${exemplar}" is no longer registered on this hub. Ask the hub admin to reassign you to an existing vault via /admin/users, then try again.`,
+          400,
+        );
+      }
+    }
+  }
+
+  // The grant is recorded (or extended) INSIDE issueAuthCodeRedirect with the
+  // CAPPED scopes — the single mint choke-point owns both the anti-privesc cap
+  // and the recordGrant so no path can record an un-held verb. UNION semantics
+  // there mean a subset re-flow still matches a prior grant, and an admin-only
+  // request from a non-owner caps to empty → refused (no zero-scope token).
+  // (#75 skip-consent depends on this recording.)
+  return issueAuthCodeRedirect(db, params, scopes, session.userId, deps);
+}
+
+/**
+ * POST /oauth/authorize/approve — operator-driven inline approval of a
+ * pending DCR client (closes #208). The cross-origin SPA case the
+ * same-origin DCR auto-approve (#199, #200) doesn't cover: an SPA on a
+ * different origin can't ride the cookie path during DCR, so its
+ * freshly-registered client_id lands `pending` and the operator hits
+ * "App not yet approved" on /oauth/authorize. This endpoint flips that
+ * client to `approved` in one click and redirects back into the OAuth flow.
+ *
+ * Three-belt security model. All three must pass:
+ *
+ *   1. Valid CSRF token (double-submit cookie). Defends against a malicious
+ *      cross-origin POST that rides the session cookie's SameSite=Lax.
+ *      Token was minted at GET render time and embedded in the form.
+ *   2. Active operator session (`findActiveSession`). The operator must be
+ *      logged into this hub from the browser submitting the form — no
+ *      session means no operator authority to approve anything.
+ *   3. Origin/Referer matches a hub-bound origin (`isSameOriginRequest`).
+ *      Same shape as the DCR auto-approve gate (#199, #200, #245): a same-
+ *      origin POST proves the form was rendered by *this hub*, not a forged
+ *      page. Bound origins include issuer + loopback + tailnet hostname
+ *      (#245); pre-#245 was issuer-only and rejected legitimate operator
+ *      paths from loopback / tailnet.
+ *
+ * `return_to` validation: the form embeds the original authorize URL so
+ * the post-approve redirect lands the operator back on `/oauth/authorize`
+ * with the now-approved client. We refuse anything that doesn't start with
+ * `/oauth/authorize?` — open-redirect defense, plus a hand-crafted form
+ * trying to use this endpoint as a generic redirect-after-approve gadget
+ * shouldn't succeed at smuggling an off-path target.
+ */
+export async function handleApproveClientPost(
+  db: Database,
+  req: Request,
+  deps: OAuthDeps,
+): Promise<Response> {
+  const form = await req.formData();
+  const formCsrf = form.get(CSRF_FIELD_NAME);
+  if (!verifyCsrfToken(req, typeof formCsrf === "string" ? formCsrf : null)) {
+    return htmlError(
+      "Invalid form submission",
+      "The form's CSRF token did not match. Reload the page and try again.",
+      403,
+    );
+  }
+  const session = findActiveSession(db, req, deps.now ?? (() => new Date()));
+  if (!session) {
+    return htmlError(
+      "Sign in required",
+      "You must be signed in to this hub to approve an app. Sign in and try again.",
+      401,
+    );
+  }
+  const bound = resolveBoundOrigins(deps);
+  if (!isSameOriginRequest(req, bound)) {
+    // Diagnostic: log the headers we saw + the bound set so an operator
+    // chasing a rejection on a real deploy can see exactly what didn't
+    // match. The same-origin check is the most opaque CSRF gate — without
+    // this log, a misconfigured hub_settings.hub_origin or a proxy
+    // stripping Origin/Referer produces a flat 403 with no way to debug.
+    // Headers logged are non-sensitive (Origin/Referer/Host are public);
+    // the bound set is hub's own configuration. Body content not logged.
+    console.warn(
+      `[oauth] approve POST same-origin check failed. headers: origin=${JSON.stringify(req.headers.get("origin"))} referer=${JSON.stringify(req.headers.get("referer"))} host=${JSON.stringify(req.headers.get("host"))} xff-host=${JSON.stringify(req.headers.get("x-forwarded-host"))} xff-proto=${JSON.stringify(req.headers.get("x-forwarded-proto"))}. bound origins: ${JSON.stringify(bound)}`,
+    );
+    return htmlError(
+      "Cross-origin request rejected",
+      "The approve form must be submitted from this hub's own origin.",
+      403,
+    );
+  }
+  const clientId = String(form.get("client_id") ?? "");
+  if (!clientId) {
+    return htmlError("Invalid form submission", "Missing client_id.", 400);
+  }
+  const client = getClient(db, clientId);
+  if (!client) {
+    return htmlError("Unknown application", "This client_id is not registered with this hub.", 404);
+  }
+
+  // Deny branch (hub#390): RFC 6749 §4.1.2.1 — when the resource owner
+  // denies an access request, the AS bounces back to the client's
+  // redirect_uri with `error=access_denied` (+ original state). Validate
+  // redirect_uri against the client's registered URIs to prevent open
+  // redirect via a hand-crafted form; refuse with 400 if it doesn't match.
+  // Deny does NOT mutate the client row — the client stays `pending` and
+  // the operator can revisit later from /admin/permissions or re-trigger
+  // OAuth from the calling app.
+  //
+  // The decision default is `"approve"` — that covers both back-compat
+  // (older forms that don't carry the field at all) AND any unexpected
+  // value (e.g. `decision="garbage"`). The reasoning: only the literal
+  // string `"deny"` triggers the destructive-from-the-client's-perspective
+  // path; everything else is treated as the safe, prior behavior. A user
+  // can't accidentally land on the error redirect by clicking a malformed
+  // button.
+  const decision = String(form.get("decision") ?? "approve");
+  if (decision === "deny") {
+    const denyRedirectUri = String(form.get("redirect_uri") ?? "");
+    if (!denyRedirectUri || !client.redirectUris.includes(denyRedirectUri)) {
+      return htmlError(
+        "Invalid form submission",
+        "The redirect_uri does not match any URI registered for this app.",
+        400,
+      );
+    }
+    const stateRaw = form.get("state");
+    const denyState = typeof stateRaw === "string" && stateRaw.length > 0 ? stateRaw : undefined;
+    // `new URL()` could in principle throw if a legacy code path bypassed
+    // `isValidRedirectUri` at registration and wrote a non-http(s) URI.
+    // Current DCR enforces validity at write time, so this catch is
+    // belt-and-suspenders, but cost is near-zero.
+    let target: URL;
+    try {
+      target = new URL(denyRedirectUri);
+    } catch {
+      return htmlError(
+        "Invalid form submission",
+        "The registered redirect_uri for this app is not a valid URL.",
+        400,
+      );
+    }
+    target.searchParams.set("error", "access_denied");
+    target.searchParams.set("error_description", "The user denied the authorization request.");
+    if (denyState !== undefined) target.searchParams.set("state", denyState);
+    return redirectResponse(target.toString());
+  }
+
+  // Approve branch (default — also the back-compat path for any form that
+  // doesn't carry an explicit `decision` field). Validate return_to BEFORE
+  // the DB mutation: if an authenticated operator submits a hand-crafted
+  // form with a bad return_to, we refuse without committing the client to
+  // `approved`. Practical risk is low (all three belts already passed),
+  // but ordering matters — validate, then mutate.
+  const returnTo = String(form.get("return_to") ?? "");
+  if (!isSafeAuthorizeReturnTo(returnTo)) {
+    return htmlError(
+      "Invalid form submission",
+      "The return_to value is not a hub-relative /oauth/authorize URL.",
+      400,
+    );
+  }
+  approveClient(db, clientId);
+  return redirectResponse(returnTo);
+}
+
+/**
+ * The load-bearing open-redirect guard, shared by every hub `return_to` gate.
+ * A safe hub-relative target is a SINGLE-slash root-relative path: same-origin
+ * to the hub, no scheme, no `//host` scheme-relative escape. Empty string is
+ * rejected.
+ *
+ * This is the same-origin core that `isSafeAuthorizeReturnTo` (OAuth-resume)
+ * builds on, and that broader same-origin gates (the agent-grant OAuth
+ * callback's `returnTo`) reuse directly — they need to return the operator to
+ * a `/admin/...` page, not specifically `/oauth/authorize`. Single source of
+ * truth for "is this an open redirect?" — do NOT reimplement the
+ * `startsWith("/") && !startsWith("//")` check elsewhere.
+ */
+export function isSafeHubReturnTo(value: string): boolean {
+  if (!value) return false;
+  // Reject scheme-relative ("//evil.example/foo") and absolute URLs. Only
+  // single-slash root-relative paths are allowed.
+  if (!value.startsWith("/") || value.startsWith("//")) return false;
+  // Reject `..` traversal sequences — literal AND percent-encoded (`%2e%2e`),
+  // since redirectToReturn's `new URL()` parse decodes them before emitting the
+  // path. They stay same-origin but a target that walks the path tree is never a
+  // legitimate return-to and lets a crafted value reach an unexpected hub path.
+  // (`/oauth/authorize?…` callers never carry `..`, so this is free for them.)
+  if (value.includes("..")) return false;
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(value);
+  } catch {
+    return false; // malformed percent-encoding → reject rather than guess
+  }
+  return !decoded.includes("..");
+}
+
+/**
+ * Validate a form-submitted `return_to` value. Must be a hub-relative URL
+ * (no scheme, no double-slash) targeting `/oauth/authorize` with a query
+ * string — anything else is either an open-redirect attempt or a misuse of
+ * the endpoint. Empty string is rejected (the form always supplies one).
+ *
+ * Exported so the SPA approve-client endpoint (`handleApproveClient` in
+ * admin-clients.ts) can apply the same gate when echoing a `return_to` back
+ * to the caller — workstream D. Single helper = single shape of "what's a
+ * valid OAuth-resume target?" for the whole hub.
+ */
+export function isSafeAuthorizeReturnTo(value: string): boolean {
+  // Same-origin open-redirect guard first (shared single source of truth)…
+  if (!isSafeHubReturnTo(value)) return false;
+  // …then the authorize-specific path constraint: the OAuth flow re-enters
+  // via GET /oauth/authorize?<original-params>; anything off-path is a misuse.
+  return value.startsWith("/oauth/authorize?");
+}
+
+function paramsFromForm(form: Awaited<ReturnType<Request["formData"]>>): AuthorizeFormParams {
+  return {
+    clientId: String(form.get("client_id") ?? ""),
+    redirectUri: String(form.get("redirect_uri") ?? ""),
+    responseType: String(form.get("response_type") ?? "code"),
+    scope: String(form.get("scope") ?? ""),
+    codeChallenge: String(form.get("code_challenge") ?? ""),
+    codeChallengeMethod: String(form.get("code_challenge_method") ?? "S256"),
+    state: (form.get("state") as string | null) ?? null,
+    resource: (form.get("resource") as string | null) ?? null,
+  };
+}
+
+function authorizeParamsToQuery(p: AuthorizeFormParams): Record<string, string> {
+  const q: Record<string, string> = {
+    client_id: p.clientId,
+    redirect_uri: p.redirectUri,
+    response_type: p.responseType,
+    scope: p.scope,
+    code_challenge: p.codeChallenge,
+    code_challenge_method: p.codeChallengeMethod,
+  };
+  if (p.state) q.state = p.state;
+  // Round-trip the RFC 8707 resource indicator through the login redirect so
+  // the resource-bound narrowing survives a sign-in (it re-enters GET
+  // /oauth/authorize with the original params).
+  if (p.resource) q.resource = p.resource;
+  return q;
+}
+
+// --- /oauth/token ----------------------------------------------------------
+
+/**
+ * Extract a presented client_secret from either the `Authorization: Basic`
+ * header (RFC 6749 §2.3.1 preferred) or the form-body `client_secret`. If
+ * both are present, the header wins — the spec says clients SHOULD use one
+ * mechanism per request; when they don't, picking deterministically (header
+ * = the more-secure form, harder to log accidentally than a body field)
+ * keeps the auth gate predictable.
+ *
+ * Returns `{ clientId, clientSecret }` so callers can cross-check the body's
+ * `client_id` against the header's. RFC §2.3.1 doesn't explicitly require
+ * matching, but a mismatch is a client bug we shouldn't paper over.
+ *
+ * Returns null secret when no credential was presented at all.
+ */
+function extractClientCredentials(
+  req: Request,
+  form: Awaited<ReturnType<Request["formData"]>>,
+): { headerClientId: string | null; clientSecret: string | null } {
+  const auth = req.headers.get("authorization");
+  // RFC 7235 §2.1 — auth-scheme is case-insensitive ("Basic" / "basic" / "BASIC").
+  if (auth && /^basic\s+/i.test(auth)) {
+    try {
+      const decoded = atob(auth.replace(/^basic\s+/i, "").trim());
+      const colon = decoded.indexOf(":");
+      if (colon >= 0) {
+        // RFC 6749 §2.3.1 mandates form-encoding the basic-auth values
+        // (because client_id may legitimately contain `:`). Decode them
+        // back so a client that registered the spec-correct way works.
+        const headerClientId = decodeURIComponent(decoded.slice(0, colon));
+        const clientSecret = decodeURIComponent(decoded.slice(colon + 1));
+        return { headerClientId, clientSecret };
+      }
+    } catch {
+      // Malformed base64 → treat as no header credential, fall through to
+      // form body. The auth gate will reject if the client is confidential
+      // and didn't also send a body secret.
+    }
+  }
+  const bodySecret = form.get("client_secret");
+  return {
+    headerClientId: null,
+    clientSecret: typeof bodySecret === "string" && bodySecret.length > 0 ? bodySecret : null,
+  };
+}
+
+/**
+ * 401 response shape for token-endpoint client-auth failures. WWW-Authenticate
+ * declares Basic per RFC 6749 §5.2 + RFC 7235 — it tells a compliant client
+ * "this endpoint accepts Basic auth" so it can retry with credentials.
+ */
+function clientAuthFailure(description: string): Response {
+  return jsonResponse({ error: "invalid_client", error_description: description }, 401, {
+    "www-authenticate": 'Basic realm="hub"',
+  });
+}
+
+/**
+ * Gate the per-grant handlers behind RFC 6749 §3.2.1 client authentication.
+ * Public clients (clientSecretHash == null) pass through unchanged — PKCE
+ * already binds their auth-code redemption. Confidential clients must
+ * present a matching client_secret via Basic header or form body.
+ *
+ * Returns null on success; a 401 Response on failure for the caller to
+ * return directly.
+ */
+function authenticateClient(
+  client: OAuthClient,
+  req: Request,
+  form: Awaited<ReturnType<Request["formData"]>>,
+  bodyClientId: string,
+): Response | null {
+  if (!client.clientSecretHash) return null; // public client: no secret required
+  const { headerClientId, clientSecret } = extractClientCredentials(req, form);
+  if (!clientSecret) {
+    return clientAuthFailure("client_secret required for confidential client");
+  }
+  // If the Basic header was used, its client_id must match the body's —
+  // RFC 6749 §3.2.1 says the auth identifies the client; a body claiming
+  // a different client_id is a bug or an attempt to confuse the gate.
+  if (headerClientId !== null && headerClientId !== bodyClientId) {
+    return clientAuthFailure("authorization header client_id does not match request body");
+  }
+  if (!verifyClientSecret(client, clientSecret)) {
+    return clientAuthFailure("client_secret mismatch");
+  }
+  return null;
+}
+
+/**
+ * POST /oauth/token — supports `authorization_code` + `refresh_token`.
+ * Confidential clients (registered with a client_secret) must authenticate
+ * via the Authorization: Basic header or a form-body `client_secret` per
+ * RFC 6749 §2.3.1; public clients (PKCE-only) need no client_secret because
+ * PKCE already binds the redemption. Errors return the RFC 6749 §5.2 shape:
+ * 400/401 + `{error, error_description}`.
+ */
+export async function handleToken(db: Database, req: Request, deps: OAuthDeps): Promise<Response> {
+  const form = await req.formData();
+  const grantType = String(form.get("grant_type") ?? "");
+  if (grantType === "authorization_code")
+    return await handleTokenAuthorizationCode(db, req, form, deps);
+  if (grantType === "refresh_token") return await handleTokenRefresh(db, req, form, deps);
+  return jsonResponse(
+    {
+      error: "unsupported_grant_type",
+      error_description: `grant_type "${grantType}" is not supported`,
+    },
+    400,
+  );
+}
+
+async function handleTokenAuthorizationCode(
+  db: Database,
+  req: Request,
+  form: Awaited<ReturnType<Request["formData"]>>,
+  deps: OAuthDeps,
+): Promise<Response> {
+  const code = String(form.get("code") ?? "");
+  const clientId = String(form.get("client_id") ?? "");
+  const redirectUri = String(form.get("redirect_uri") ?? "");
+  const codeVerifier = String(form.get("code_verifier") ?? "");
+  if (!code || !clientId || !redirectUri || !codeVerifier) {
+    return jsonResponse(
+      { error: "invalid_request", error_description: "missing required parameter" },
+      400,
+    );
+  }
+  const client = getClient(db, clientId);
+  if (!client) {
+    return jsonResponse({ error: "invalid_client", error_description: "unknown client_id" }, 401);
+  }
+  if (client.status !== "approved") return pendingClientJson(client.clientId, deps.issuer);
+  const authFailure = authenticateClient(client, req, form, clientId);
+  if (authFailure) return authFailure;
+  let redeemed: ReturnType<typeof redeemAuthCode>;
+  try {
+    redeemed = redeemAuthCode(db, { code, clientId, redirectUri, codeVerifier, now: deps.now });
+  } catch (err) {
+    return mapAuthCodeError(err);
+  }
+  // Scope-validation gate (cli#71). Reject any requested scope that the
+  // issuer never declared — `FIRST_PARTY_SCOPES` ∪ each module's `module.json`
+  // `scopes.defines`. Per RFC 6749 §5.2: `error: "invalid_scope"`. We add
+  // `invalid_scopes: [...]` as an extension field so clients can report the
+  // exact culprits without re-parsing the description string.
+  const declared = (deps.loadDeclaredScopes ?? loadDeclaredScopes)();
+  const unknown = findUnknownScopes(redeemed.scopes, declared);
+  if (unknown.length > 0) {
+    return jsonResponse(
+      {
+        error: "invalid_scope",
+        error_description: `unknown scopes: ${unknown.join(", ")}`,
+        invalid_scopes: unknown,
+      },
+      400,
+    );
+  }
+  const requestResource = (form.get("resource") as string | null) ?? null;
+  const audienceResolution = resolveTokenResourceAudience(
+    requestResource,
+    namedVaultScopeNames(redeemed.scopes),
+    resolveBoundOrigins(deps),
+    inferAudience(redeemed.scopes),
+  );
+  if ("errorResponse" in audienceResolution) return audienceResolution.errorResponse;
+  const audience = audienceResolution.audience;
+  try {
+    const access = await signAccessToken(db, {
+      sub: redeemed.userId,
+      scopes: redeemed.scopes,
+      audience,
+      clientId: redeemed.clientId,
+      issuer: deps.issuer,
+      // vault_scope claim — Phase 2 per-user vault pin (Phase 1 had a single
+      // `assigned_vault` column; Phase 2 PR 2 generalized to `assigned_vaults`
+      // via `user_vaults`). Non-empty list for non-admin users with at least
+      // one assigned vault; empty for first-admin (unrestricted sentinel).
+      // Zero-vault non-admin is also empty by `vaultScopeForUser`, but the
+      // OAuth flow refuses to mint a vault-scoped token for them upstream
+      // (see the zero-vault gate in `handleConsentSubmit` + the same-hub
+      // auto-trust posture check), so we never reach here with that user
+      // posture. The narrowing in `handleConsentSubmit` already rewrote
+      // `vault:<verb>` → `vault:<assigned>:<verb>`, so the auth code's
+      // scopes are pre-aligned; this claim is the explicit "owned vaults"
+      // signal PR 5 consumes downstream.
+      vaultScope: vaultScopeForUser(db, redeemed.userId),
+      now: deps.now,
+    });
+    // Phase 1 (#212) registry exemption: code-grant access tokens piggyback
+    // on the paired refresh token's `tokens` row (they share `jti` by
+    // design). We don't write a separate access-token row — revocation acts
+    // on the shared jti / family, and the 15-min access TTL bounds the
+    // window before per-jti re-validation is needed. A separate per-jti
+    // access-token row would double registry write volume on every OAuth
+    // grant + every refresh rotation; not worth the trade today.
+    const refresh = signRefreshToken(db, {
+      jti: access.jti,
+      userId: redeemed.userId,
+      clientId: redeemed.clientId,
+      scopes: redeemed.scopes,
+      now: deps.now,
+    });
+    const services = buildServicesCatalog(
+      (deps.loadServicesManifest ?? readServicesManifest)(),
+      deps.issuer,
+      redeemed.scopes,
+    );
+    const vault = singleVaultName(redeemed.scopes);
+    return jsonResponse({
+      access_token: access.token,
+      token_type: "Bearer",
+      expires_in: ACCESS_TOKEN_TTL_SECONDS,
+      refresh_token: refresh.token,
+      scope: redeemed.scopes.join(" "),
+      ...(vault ? { vault } : {}),
+      services,
+    });
+  } catch (err) {
+    if (err instanceof VaultNameReservedError)
+      return jsonResponse({ error: "invalid_grant", error_description: err.message }, 400);
+    throw err;
+  }
+}
+
+async function handleTokenRefresh(
+  db: Database,
+  req: Request,
+  form: Awaited<ReturnType<Request["formData"]>>,
+  deps: OAuthDeps,
+): Promise<Response> {
+  const refreshToken = String(form.get("refresh_token") ?? "");
+  const clientId = String(form.get("client_id") ?? "");
+  const requestResource = (form.get("resource") as string | null) ?? null;
+  if (!refreshToken || !clientId) {
+    return jsonResponse(
+      { error: "invalid_request", error_description: "missing required parameter" },
+      400,
+    );
+  }
+  const client = getClient(db, clientId);
+  if (!client) {
+    return jsonResponse({ error: "invalid_client", error_description: "unknown client_id" }, 401);
+  }
+  if (client.status !== "approved") return pendingClientJson(client.clientId, deps.issuer);
+  const authFailure = authenticateClient(client, req, form, clientId);
+  if (authFailure) return authFailure;
+  const row = findRefreshToken(db, refreshToken);
+  if (!row) {
+    return jsonResponse(
+      { error: "invalid_grant", error_description: "refresh_token not found" },
+      400,
+    );
+  }
+  if (row.clientId !== clientId) {
+    return jsonResponse({ error: "invalid_grant", error_description: "client_id mismatch" }, 400);
+  }
+  // Refresh-token rows always have a non-null user_id (the caller's hub
+  // user). Post-v6 the column is nullable to accommodate non-OAuth mints
+  // (operator/cli mints), but those rows have no `refresh_token_hash` so
+  // `findRefreshToken` can't return them. Defensive: surface a clean
+  // invalid_grant if a hand-crafted row shows up here without a user.
+  if (!row.userId) {
+    return jsonResponse(
+      { error: "invalid_grant", error_description: "refresh_token has no associated user" },
+      400,
+    );
+  }
+  const refreshUserId: string = row.userId;
+  const now = deps.now?.() ?? new Date();
+  if (row.revokedAt) {
+    // Replay of an already-rotated refresh token. Per RFC 6819 §5.2.2.3 the
+    // working assumption is theft — the legitimate client received a new
+    // refresh token at the prior rotation, so anyone presenting the old one
+    // either lost a race or stole it (the case we must defend against).
+    //
+    // ONE-GENERATION GRACE WINDOW (hub#685). Benign concurrent/retried
+    // refreshes — a multi-tab SPA, a bfcache/stale-tab resume, a network
+    // retry — legitimately present the *just-rotated* token a moment after
+    // it rotated. To avoid forcing those real clients to re-login, we let
+    // through the SINGLE immediately-previous token, and ONLY it, for
+    // ~REFRESH_GRACE_MS. The grace case rotates the live tip and converges
+    // the replaying client onto the current token; it does NOT mint a
+    // second live token into a forked lineage.
+    //
+    // The window is narrow ON PURPOSE — both conditions must hold:
+    //   (a) WINDOW: this row was revoked within the last REFRESH_GRACE_MS.
+    //   (b) IMMEDIATE-PREDECESSOR: this row's recorded successor (rotated_to)
+    //       IS the family's single live refresh row. That proves it's the
+    //       direct parent of the current tip — not an older ancestor (whose
+    //       successor is itself revoked) and not a sibling fork.
+    //
+    // HARD SECURITY INVARIANT: anything outside (a)∧(b) — an OLDER/ancestor
+    // token, any replay past the window, a family with zero or multiple live
+    // tips (already a theft-revoked or forked family) — falls through to the
+    // unchanged zero-tolerance path: revokeFamily + invalid_grant. The grace
+    // window NEVER tolerates more than the one immediate predecessor, and
+    // never beyond REFRESH_GRACE_MS.
+    const live = liveFamilyRefreshRows(db, row.familyId, now);
+    const revokedAtMs = new Date(row.revokedAt).getTime();
+    const withinWindow =
+      now.getTime() - revokedAtMs <= REFRESH_GRACE_MS && now.getTime() >= revokedAtMs;
+    const tip = live.length === 1 ? live[0]! : null;
+    const isImmediatePredecessor =
+      tip !== null && row.rotatedTo !== null && row.rotatedTo === tip.jti;
+    if (withinWindow && isImmediatePredecessor && tip) {
+      // Benign replay of the immediate predecessor. Rotate the live tip and
+      // hand the client the new pair — it converges on the current lineage
+      // (single live token preserved), no family revocation. Equivalent to
+      // what the client would have received had it presented the tip itself.
+      return await rotateAndRespond(db, tip, deps, now, requestResource);
+    }
+    // Genuine theft (or a too-late replay): revoke every descendant so the
+    // attacker can't keep refreshing, and force re-authorization.
+    revokeFamily(db, row.familyId, now);
+    return jsonResponse(
+      { error: "invalid_grant", error_description: "refresh_token revoked" },
+      400,
+    );
+  }
+  if (now.getTime() > new Date(row.expiresAt).getTime()) {
+    return jsonResponse(
+      { error: "invalid_grant", error_description: "refresh_token expired" },
+      400,
+    );
+  }
+  return await rotateAndRespond(db, row, deps, now, requestResource);
+}
+
+/**
+ * Rotate a single live refresh-token row: revoke it, mint + insert a new
+ * access + refresh pair bound to the same family, and link old→new
+ * (`rotated_to`) so a future grace-window check can identify the direct
+ * predecessor (hub#685). Returns the spec-shaped token response.
+ *
+ * Both call sites pass a row that is live at the moment of the call: the
+ * normal path passes the presented (non-revoked) token; the grace path
+ * passes the family's single live tip. Used for both so the benign-replay
+ * client receives exactly what a direct refresh of the tip would yield.
+ */
+async function rotateAndRespond(
+  db: Database,
+  row: RefreshTokenRow,
+  deps: OAuthDeps,
+  now: Date,
+  requestResource: string | null,
+): Promise<Response> {
+  const refreshUserId = row.userId ?? "";
+  // Mint the access token *before* opening the rotation transaction. JWT
+  // signing is async (jose returns a Promise) and bun:sqlite's
+  // `db.transaction()` is sync — running async work inside the closure
+  // would silently break atomicity. Once we have the JWT, the UPDATE
+  // (revoke old) + INSERT (mint new refresh row) + link (rotated_to) commit
+  // or roll back as a unit, so a mid-rotation crash can't
+  // dead-old-without-replacement (#107).
+  // A refresh row has no separate authorization artifact to consult. Its
+  // final named vault scopes are the resource binding already baked into the
+  // grant, so resource validation derives from the row itself.
+  const audienceResolution = resolveTokenResourceAudience(
+    requestResource,
+    namedVaultScopeNames(row.scopes),
+    resolveBoundOrigins(deps),
+    inferAudience(row.scopes),
+  );
+  if ("errorResponse" in audienceResolution) return audienceResolution.errorResponse;
+  const audience = audienceResolution.audience;
+  try {
+    const access = await signAccessToken(db, {
+      sub: refreshUserId,
+      scopes: row.scopes,
+      audience,
+      clientId: row.clientId,
+      issuer: deps.issuer,
+      // vault_scope claim — re-derived from the user's *current*
+      // `assigned_vaults` at refresh time (not snapshotted onto the refresh-
+      // token row). An admin who changes a user's vault assignments between
+      // mint and refresh sees the new value on the next refresh; existing
+      // access tokens carry their original claim until their 15-minute TTL
+      // elapses. Same posture as the design's "OAuth issuer reads
+      // `assigned_vaults` at mint time, not at session-creation time" pin.
+      vaultScope: vaultScopeForUser(db, refreshUserId),
+      now: deps.now,
+    });
+    let refresh: ReturnType<typeof signRefreshToken>;
+    try {
+      refresh = db.transaction(() => {
+        db.prepare("UPDATE tokens SET revoked_at = ? WHERE jti = ?").run(
+          now.toISOString(),
+          row.jti,
+        );
+        const minted = signRefreshToken(db, {
+          jti: access.jti,
+          userId: refreshUserId,
+          clientId: row.clientId,
+          scopes: row.scopes,
+          familyId: row.familyId,
+          now: deps.now,
+        });
+        // Link old→new so the grace-window check (hub#685) can tell the
+        // immediate predecessor apart from an older ancestor on replay.
+        linkRotation(db, row.jti, access.jti);
+        return minted;
+      })();
+    } catch (err) {
+      // Concurrent rotation: a sibling refresh of the same row already
+      // committed and ours collides on the `tokens.jti` PRIMARY KEY (or any
+      // other INSERT-time DB error). Surface a clean `invalid_grant` 400 —
+      // RFC 6749 §5.2 — instead of letting the SQLite error bubble as a 500
+      // (#108). The transaction is already rolled back at this point, so
+      // the row's revoked_at is unchanged for the losing request.
+      if (err instanceof RefreshTokenInsertError) {
+        return jsonResponse(
+          { error: "invalid_grant", error_description: "refresh_token rotation conflict" },
+          400,
+        );
+      }
+      throw err;
+    }
+    const services = buildServicesCatalog(
+      (deps.loadServicesManifest ?? readServicesManifest)(),
+      deps.issuer,
+      row.scopes,
+    );
+    const vault = singleVaultName(row.scopes);
+    return jsonResponse({
+      access_token: access.token,
+      token_type: "Bearer",
+      expires_in: ACCESS_TOKEN_TTL_SECONDS,
+      refresh_token: refresh.token,
+      scope: row.scopes.join(" "),
+      ...(vault ? { vault } : {}),
+      services,
+    });
+  } catch (err) {
+    if (err instanceof VaultNameReservedError)
+      return jsonResponse({ error: "invalid_grant", error_description: err.message }, 400);
+    throw err;
+  }
+}
+
+// --- /oauth/revoke ---------------------------------------------------------
+
+/**
+ * POST /oauth/revoke — RFC 7009 token revocation.
+ *
+ * Accepts `token` + optional `token_type_hint` (`refresh_token` or
+ * `access_token`) form-encoded. Authenticates the client (confidential
+ * clients via `client_secret`; public clients pass through with PKCE-style
+ * client_id-only auth, same gate as the token endpoint).
+ *
+ * Lookup strategy: try the refresh-token-hash first when the hint is
+ * `refresh_token` or absent (the common case — clients usually revoke
+ * refresh tokens), then fall back to JWT decode + jti lookup for access
+ * tokens. JWT decode here is unverified-decode of the payload only; we
+ * just need the jti to find the row. A signature check would be
+ * ceremonial — if the row exists we own it; if it doesn't, we return 200
+ * anyway per spec.
+ *
+ * Response: 200 with empty body on success OR when the token is unknown
+ * (RFC 7009 §2.2 — "the authorization server responds with HTTP status
+ * code 200 [...] or if the client submitted an invalid token"). We
+ * intentionally don't surface "found vs not-found" so a caller probing
+ * with random strings can't enumerate live tokens.
+ *
+ * Closes #73.
+ */
+export async function handleRevoke(
+  db: Database,
+  req: Request,
+  _deps: OAuthDeps,
+): Promise<Response> {
+  const form = await req.formData();
+  const token = String(form.get("token") ?? "");
+  const hint = String(form.get("token_type_hint") ?? "");
+  const bodyClientId = String(form.get("client_id") ?? "");
+  if (!token || !bodyClientId) {
+    return jsonResponse(
+      { error: "invalid_request", error_description: "missing required parameter" },
+      400,
+    );
+  }
+  const client = getClient(db, bodyClientId);
+  if (!client) {
+    return jsonResponse({ error: "invalid_client", error_description: "unknown client_id" }, 401);
+  }
+  const authFailure = authenticateClient(client, req, form, bodyClientId);
+  if (authFailure) return authFailure;
+
+  // Lookup. Hint is advisory per RFC 7009 §2.1 — clients that get it wrong
+  // still expect revocation to succeed, so we always try both shapes.
+  const now = new Date();
+  let row = hint === "access_token" ? null : findRefreshToken(db, token);
+  if (!row) {
+    const jti = unverifiedJtiOf(token);
+    if (jti) row = findTokenRowByJti(db, jti);
+    if (!row && hint === "access_token" && !row) {
+      // hint said access_token but the JWT didn't decode; check
+      // refresh-token shape as a last resort.
+      row = findRefreshToken(db, token);
+    }
+  }
+  if (row && row.clientId !== client.clientId) {
+    // RFC 7009 §2.1: revocation must be authenticated to the same client
+    // the token was issued to. A different client presenting a valid
+    // token is invalid_grant; we collapse it to 200 to avoid existence
+    // disclosure to unrelated clients.
+    return new Response(null, { status: 200 });
+  }
+  if (row && !row.revokedAt) {
+    db.prepare("UPDATE tokens SET revoked_at = ? WHERE jti = ?").run(now.toISOString(), row.jti);
+  }
+  return new Response(null, { status: 200 });
+}
+
+/**
+ * Best-effort jti extraction for revocation lookup. Not signature-checked —
+ * we only need the claim to find a row. If the row doesn't exist or the
+ * client doesn't own it, the caller bails out anyway.
+ */
+function unverifiedJtiOf(token: string): string | null {
+  const parts = token.split(".");
+  if (parts.length !== 3) return null;
+  const payload = parts[1];
+  if (!payload) return null;
+  try {
+    const json = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as {
+      jti?: unknown;
+    };
+    return typeof json.jti === "string" ? json.jti : null;
+  } catch {
+    return null;
+  }
+}
+
+function mapAuthCodeError(err: unknown): Response {
+  if (err instanceof AuthCodeNotFoundError) {
+    return jsonResponse({ error: "invalid_grant", error_description: "code not found" }, 400);
+  }
+  if (err instanceof AuthCodeExpiredError) {
+    return jsonResponse({ error: "invalid_grant", error_description: "code expired" }, 400);
+  }
+  if (err instanceof AuthCodeUsedError) {
+    return jsonResponse(
+      { error: "invalid_grant", error_description: "code already redeemed" },
+      400,
+    );
+  }
+  if (err instanceof AuthCodePkceMismatchError) {
+    return jsonResponse(
+      { error: "invalid_grant", error_description: "code_verifier mismatch" },
+      400,
+    );
+  }
+  if (err instanceof AuthCodeRedirectMismatchError) {
+    return jsonResponse(
+      { error: "invalid_grant", error_description: "redirect_uri mismatch" },
+      400,
+    );
+  }
+  const msg = err instanceof Error ? err.message : String(err);
+  return jsonResponse({ error: "server_error", error_description: msg }, 500);
+}
+
+// --- /oauth/register -------------------------------------------------------
+
+interface RegisterRequestBody {
+  redirect_uris?: string[];
+  scope?: string;
+  client_name?: string;
+  token_endpoint_auth_method?: string;
+}
+
+/**
+ * Resolve the hub-bound origin set for a given `OAuthDeps`. Pre-#245 this
+ * was implicit (just `deps.issuer`); post-#245 callers can thread a richer
+ * set through `deps.hubBoundOrigins` so loopback + tailnet + funnel access
+ * all match. Fallback to `[issuer]` keeps callers that haven't migrated
+ * correct on single-origin hubs.
+ */
+function resolveBoundOrigins(deps: OAuthDeps): readonly string[] {
+  if (deps.hubBoundOrigins) return deps.hubBoundOrigins();
+  return [deps.issuer];
+}
+
+/**
+ * POST /oauth/register — RFC 7591 Dynamic Client Registration.
+ *
+ * Approval gate (closes #74). New rows land as `pending` by default and
+ * cannot participate in OAuth flows until an operator runs
+ * `parachute auth approve-client <id>`. Two bypass paths:
+ *
+ * 1. **Operator-bearer** (#74). `Authorization: Bearer <operator-token>` whose
+ *    token carries the `hub:admin` scope — the install-time path used by
+ *    first-party modules so `parachute install vault` can self-register
+ *    without a human follow-up.
+ * 2. **Operator-session** (#199). A valid `parachute_hub_session` cookie
+ *    plus a same-origin `Origin`/`Referer` header. The browser path: an
+ *    operator hitting their own SPA from their own browser is by definition
+ *    operator-authenticated, so re-requiring approval is friction without
+ *    benefit. CSRF defense is `isSameOriginRequest` + the cookie's
+ *    `SameSite=Lax` attribute.
+ *
+ * If a bearer is presented but invalid or insufficient, we reject with the
+ * RFC 6750 shape rather than silently downgrading to the public path: a
+ * caller who tried to authenticate but failed wants to know why, not get
+ * `pending` back and wonder why their module can't OAuth.
+ *
+ * Access-control matrix (status):
+ *   no auth                       → pending
+ *   bearer (hub:admin)            → approved (#74)
+ *   bearer (other scope)          → 403 insufficient_scope
+ *   bearer (malformed)            → 401 invalid_token
+ *   session cookie + same-origin  → approved (#199)
+ *   session cookie + cross-origin → pending (CSRF defense)
+ *   session cookie + no Origin/Referer → pending
+ *   expired/unknown session       → pending
+ *
+ * Same-hub marker (closes hub#312). Orthogonal to status — the marker
+ * records "was this client registered BY this hub's operator". Wired here:
+ *
+ *   bearer (hub:admin)            → same_hub=true
+ *   session cookie + same-origin  → same_hub=true
+ *   first-client wizard window    → same_hub=false (auto-approved, but the
+ *                                   registrant is external — wizard window
+ *                                   approves, doesn't claim ownership)
+ *   anything else                 → same_hub=false
+ *
+ * The same_hub marker drives the consent-screen auto-trust path at
+ * `/oauth/authorize` for low-risk scopes (parachute-app design §6); elevated
+ * and high-risk scopes still require explicit consent.
+ */
+export async function handleRegister(
+  db: Database,
+  req: Request,
+  deps: OAuthDeps,
+): Promise<Response> {
+  let body: RegisterRequestBody;
+  try {
+    body = (await req.json()) as RegisterRequestBody;
+  } catch {
+    return jsonResponse(
+      { error: "invalid_client_metadata", error_description: "body must be JSON" },
+      400,
+    );
+  }
+  const redirectUris = Array.isArray(body.redirect_uris) ? body.redirect_uris : [];
+  if (redirectUris.length === 0) {
+    return jsonResponse(
+      {
+        error: "invalid_redirect_uri",
+        error_description: "redirect_uris is required and must be non-empty",
+      },
+      400,
+    );
+  }
+  for (const uri of redirectUris) {
+    if (typeof uri !== "string" || !isValidRedirectUri(uri)) {
+      return jsonResponse(
+        { error: "invalid_redirect_uri", error_description: `invalid redirect_uri "${uri}"` },
+        400,
+      );
+    }
+  }
+  // Operator-bearer auto-approve. No header → public DCR path (status=pending).
+  // Header present → must validate as a hub:admin operator token; any failure
+  // is surfaced (don't silently fall through to pending).
+  //
+  // Both operator-authenticated paths (bearer + session-cookie) also mark
+  // same_hub=true so the consent-screen gate at /oauth/authorize can auto-
+  // trust the client for low-risk scopes (hub#312).
+  let status: ClientStatus = "pending";
+  let sameHub = false;
+  if (req.headers.get("authorization")) {
+    try {
+      // Validate the operator bearer's `iss` against the SET of origins the
+      // hub answers on (`deps.hubBoundOrigins` — loopback ∪ expose-state ∪
+      // platform ∪ per-request issuer), not just the single per-request
+      // `issuer`, so a host-admin credential minted under a still-valid prior
+      // origin keeps auto-approving across an origin switch (hub#516 parity).
+      // Falls back to `[deps.issuer]` when no set getter is wired (tests).
+      await requireScope(db, req, "hub:admin", deps.hubBoundOrigins?.() ?? deps.issuer);
+      status = "approved";
+      sameHub = true;
+    } catch (err) {
+      if (err instanceof AdminAuthError) return adminAuthErrorResponse(err);
+      throw err;
+    }
+  }
+  // Operator-session auto-approve (closes #199). The browser path:
+  // operator-authenticated SPA on the hub's own origin can self-register a
+  // client without dropping to a terminal. Two gates: (1) a live (un-expired)
+  // session row keyed by the cookie, (2) Origin/Referer matches the issuer
+  // origin so a cross-site forgery can't ride the cookie. Quietly stays
+  // `pending` on any failure — unlike the bearer path, we don't surface an
+  // error, because absence of session/origin is the *normal* unauthenticated
+  // public-DCR shape.
+  if (status === "pending") {
+    const session = findActiveSession(db, req, deps.now ?? (() => new Date()));
+    if (session && isSameOriginRequest(req, resolveBoundOrigins(deps))) {
+      status = "approved";
+      sameHub = true;
+    }
+  }
+  // First-client auto-approve window (hub#268 Item 3). The wizard's expose
+  // step opens a 60-minute window where the very next registration is
+  // auto-approved. Single-use — the consume call clears the row on
+  // success, so client #2 falls through to the standard pending-approval
+  // flow. Logged so an operator chasing odd behavior can see it fired
+  // and which client got the free pass.
+  //
+  // Wizard-window approval does NOT set same_hub=true. The window says
+  // "approve the next external client" — the registrant is still external
+  // (a browser, a third-party app, an install script). Approval ≠
+  // ownership; the operator deliberately ran the wizard but didn't
+  // register-as-themselves the way the bearer/session paths do.
+  let autoApprovedByWizardWindow = false;
+  if (status === "pending") {
+    if (consumeFirstClientAutoApproveWindow(db, deps.now ?? (() => new Date()))) {
+      status = "approved";
+      autoApprovedByWizardWindow = true;
+    }
+  }
+  const confidential = body.token_endpoint_auth_method === "client_secret_post";
+  const scopes = (body.scope ?? "").split(" ").filter((s) => s.length > 0);
+  // Cross-hub-origin expansion (surface#118). A hub-served module (surface,
+  // notes) registers at install time knowing only the loopback hub origin;
+  // once exposed, the browser computes its redirect_uri from the PUBLIC hub
+  // origin, which strict authorize-time matching would reject. We expand each
+  // submitted URI rooted at one of THIS hub's known origins onto every other
+  // known hub origin, so a loopback-registered hub-served client is valid on
+  // the public origin too. FOREIGN-origin redirect_uris (a separate-origin
+  // surface on its own domain) are stored verbatim — never expanded onto hub
+  // origins, never dropped — preserving the strict anti-open-redirect
+  // invariant. Authorize-time matching stays exact-match
+  // (`requireRegisteredRedirectUri`); this only ever ADDS correct hub-origin
+  // URIs the operator already controls.
+  const expandedRedirectUris = expandRedirectUrisForHubOrigins(
+    redirectUris,
+    resolveBoundOrigins(deps),
+  );
+  let registered: RegisteredClient;
+  try {
+    registered = registerClient(db, {
+      redirectUris: expandedRedirectUris,
+      scopes,
+      clientName: body.client_name,
+      confidential,
+      status,
+      sameHub,
+      now: deps.now,
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return jsonResponse({ error: "invalid_client_metadata", error_description: msg }, 400);
+  }
+  if (autoApprovedByWizardWindow) {
+    console.log(
+      `[oauth] auto-approved first client clientId=${registered.client.clientId} within wizard window (hub#268 Item 3)`,
+    );
+  }
+  if (sameHub) {
+    console.log(
+      `[oauth] same-hub DCR registration clientId=${registered.client.clientId} (hub#312)`,
+    );
+  }
+  const respBody: Record<string, unknown> = {
+    client_id: registered.client.clientId,
+    redirect_uris: registered.client.redirectUris,
+    grant_types: ["authorization_code", "refresh_token"],
+    response_types: ["code"],
+    token_endpoint_auth_method: confidential ? "client_secret_post" : "none",
+    client_id_issued_at: Math.floor(new Date(registered.client.registeredAt).getTime() / 1000),
+    status: registered.client.status,
+    same_hub: registered.client.sameHub,
+  };
+  if (registered.client.scopes.length > 0) respBody.scope = registered.client.scopes.join(" ");
+  if (registered.client.clientName) respBody.client_name = registered.client.clientName;
+  if (registered.clientSecret) respBody.client_secret = registered.clientSecret;
+  return jsonResponse(respBody, 201);
+}
+
+function consentProps(
+  client: OAuthClient,
+  params: AuthorizeFormParams,
+  vaultNames: string[],
+  csrfToken: string,
+  assignedVaults: readonly string[],
+  userIsAdmin: boolean,
+  // The additional-access menu, already capped to this user's authority.
+  // Passed IN rather than computed here because it needs the db + userId,
+  // which this pure props builder deliberately doesn't take.
+  grantableExtras: readonly string[] = [],
+) {
+  const requestedScopes = params.scope.split(" ").filter((s) => s.length > 0);
+  const unnamedVerbs = unnamedVaultVerbs(requestedScopes);
+  // Zero-vault non-admin can't authorize a vault-scoped request (hub#431).
+  // The POST handler already 400s this case ("No vaults assigned"); this
+  // flag lets the consent screen render Approve disabled + explain why,
+  // instead of showing an enabled button that lands the user on an error.
+  // Mirrors the vault-scope detection in `handleConsentSubmit`'s zero-vault
+  // gate. Non-vault scopes (`scribe:transcribe`, etc.) stay authorizable.
+  const requestsVaultScope = requestedScopes.some((s) => {
+    if (s === "vault:read" || s === "vault:write" || s === "vault:admin") return true;
+    const parts = s.split(":");
+    return (
+      parts.length === 3 &&
+      parts[0] === "vault" &&
+      parts[2] !== undefined &&
+      VAULT_VERBS.has(parts[2])
+    );
+  });
+  const userCanAuthorizeRequest = userIsAdmin || assignedVaults.length > 0 || !requestsVaultScope;
+  // Multi-user Phase 2 PR 2 stale-assignment branch (hub#284 generalized
+  // from one vault to N). A non-admin user whose entire vault list has
+  // been removed from services.json — admin removed / renamed the vaults
+  // without reassigning. The banner surfaces this state with an admin-
+  // remediation hint instead of silently minting against a missing vault.
+  //
+  // The user-facing surface is "your assigned vault(s) were removed" —
+  // the banner names the first stale vault as the canonical example. The
+  // exact list is unimportant for the recovery path (operator goes to
+  // /admin/users either way), and pluralizing the banner copy doesn't
+  // change the action.
+  //
+  // Security posture: we deliberately do NOT relax the picked-must-be-in-
+  // assigned-list check. Stale-assignment is admin-remediated.
+  const remainingValidAssigned = assignedVaults.filter((v) => vaultNames.includes(v));
+  const hasStaleAssignment = assignedVaults.length > 0 && remainingValidAssigned.length === 0;
+  const staleAssignedVault =
+    hasStaleAssignment && assignedVaults[0] !== undefined ? assignedVaults[0] : undefined;
+  // A named scope like `vault:<old>:<verb>` requested by the client where
+  // <old> is one of the user's stale vaults. The server-side named-scope
+  // defense allows this through because the scope matches an assigned
+  // vault, but the token it mints would point at a vault that no longer
+  // exists. Gate Approve on this case too so the user doesn't burn a
+  // consent into a token that fails at the resource server.
+  const hasNamedStaleVaultScope =
+    hasStaleAssignment &&
+    requestedScopes.some((s) => {
+      const parts = s.split(":");
+      if (
+        parts.length !== 3 ||
+        parts[0] !== "vault" ||
+        parts[1] === undefined ||
+        parts[2] === undefined ||
+        !VAULT_VERBS.has(parts[2])
+      ) {
+        return false;
+      }
+      // Named for one of the user's vaults — and given hasStaleAssignment,
+      // none of the user's vaults exist on this hub, so this scope points
+      // at a stale name.
+      return assignedVaults.includes(parts[1]);
+    });
+
+  // Multi-user Phase 2 PR 2: non-admin users see the picker narrowed to
+  // their assigned vault list. Four shapes emerge:
+  //
+  //   - Single assigned vault (still valid) → render locked to that name
+  //     (same shape as Phase 1).
+  //   - Two-or-more assigned vaults → render a dropdown filtered to the
+  //     user's list. Same control as the admin dropdown but narrowed.
+  //   - Stale-assigned (all vaults gone) → render no-vaults-available so
+  //     the form gracefully rejects an Approve click instead of silently
+  //     submitting a missing name.
+  //   - First admin (admin posture, empty `assignedVaults`) → full hub-
+  //     wide dropdown of every vault on the hub.
+  //   - Zero-vault non-admin (Phase 2 PR 2 reviewer fold) → no-vaults-
+  //     available so the form gracefully rejects an Approve click. The
+  //     prior shape rendered the full hub-wide list for non-admins with
+  //     zero assignments, which let them pick a vault they had no
+  //     business consenting to. The consent-submit gate refuses any
+  //     vault-scoped POST from a zero-vault non-admin (defense in depth);
+  //     this branch keeps the picker UI honest.
+  let vaultPicker: VaultPickerProps | undefined;
+  if (unnamedVerbs.length > 0) {
+    if (hasStaleAssignment) {
+      vaultPicker = { unnamedVerbs, availableVaults: [] };
+    } else if (remainingValidAssigned.length === 1) {
+      const only = remainingValidAssigned[0];
+      if (only !== undefined) {
+        vaultPicker = { unnamedVerbs, availableVaults: [only], lockedVault: only };
+      }
+    } else if (remainingValidAssigned.length > 1) {
+      vaultPicker = { unnamedVerbs, availableVaults: remainingValidAssigned };
+    } else if (userIsAdmin) {
+      // Admin posture (no assignments) → full hub-wide list.
+      vaultPicker = { unnamedVerbs, availableVaults: vaultNames };
+    } else {
+      // Zero-vault non-admin → no-vaults-available picker with the
+      // "ask your admin to assign you" copy. The Approve button renders
+      // disabled (same shape as the empty-services-json case) so the
+      // form can't post a hand-picked name. The consent-submit gate
+      // refuses any vault-scoped POST from this user too (defense in
+      // depth — see `handleConsentSubmit`).
+      vaultPicker = { unnamedVerbs, availableVaults: [], emptyReason: "no-assignments" };
+    }
+  }
+  // Named-scope display: substitute unnamed `vault:<verb>` rows with the
+  // resolved form the operator will actually consent to.
+  //   - Non-admin with exactly one valid assigned vault → render that name.
+  //   - Stale-assigned → null; the row carries the `<TBD>` placeholder.
+  //     The banner explains why a name isn't bound.
+  //   - Non-admin with multiple assigned vaults → null sentinel (the user
+  //     hasn't picked yet).
+  //   - Admin with exactly one vault available → render that name.
+  //   - Admin with multiple / no vaults → null sentinel.
+  let displayVault: string | null = null;
+  if (!hasStaleAssignment && remainingValidAssigned.length === 1) {
+    const only = remainingValidAssigned[0];
+    if (only !== undefined) displayVault = only;
+  }
+  // Admin (free picker) defaults to whole-account, not the first vault —
+  // do not substitute unnamed rows as `vault:<that-vault>:<verb>` or the
+  // consent screen would lie about what Approve mints. Multi-vault already
+  // used the `<TBD>` placeholder; single-vault admin now does too.
+  // Keep the first wire value for each display-normalized scope. Resource
+  // narrowing can produce the same named value from distinct requested forms,
+  // and the consent page should offer one row/checkbox for that permission.
+  const seenScopeKeys = new Set<string>();
+  const scopes = requestedScopes.filter((scope) => {
+    const key = canonicalConsentScope(scope, displayVault);
+    if (seenScopeKeys.has(key)) return false;
+    seenScopeKeys.add(key);
+    return true;
+  });
+  return {
+    params,
+    clientId: client.clientId,
+    clientName: client.clientName ?? client.clientId,
+    scopes,
+    csrfToken,
+    vaultPicker,
+    displayVault,
+    staleAssignedVault,
+    // Approve stays enabled for non-vault scopes even when assigned_vault
+    // is stale — the user can still consent to e.g. `scribe:transcribe`
+    // without a working vault. Disable only when the requested scope
+    // depends on a vault (unnamed verb that needs the picker, or a named
+    // verb against the stale assignment).
+    blockApproveForStaleAssignment:
+      staleAssignedVault !== undefined && (unnamedVerbs.length > 0 || hasNamedStaleVaultScope),
+    userCanAuthorizeRequest,
+    // hub#314 — surface the client's provenance (same-hub first-party vs
+    // external third-party DCR) so the operator sees the trust level on the
+    // consent screen. Clean DB-backed signal: the `same_hub` column written
+    // at DCR time (bearer hub:admin / same-origin session → true).
+    sameHub: client.sameHub,
+    grantableExtras,
+  };
+}
+
+interface VaultPickerProps {
+  unnamedVerbs: string[];
+  availableVaults: string[];
+  lockedVault?: string;
+  emptyReason?: "no-assignments" | "no-vaults-on-hub";
+}

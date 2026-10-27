@@ -1,0 +1,41 @@
+# PR verification gate — catches type and hub unit-test regressions before
+# they can merge. Keep the package-build steps in sync with release.yml's
+# `test` job.
+
+name: PR verify
+
+on:
+  pull_request:
+    branches: [main, next]
+
+jobs:
+  typecheck-unit-tests:
+    name: typecheck + unit tests
+    runs-on: ubuntu-latest
+    # Bun's per-test watchdog below names a stalled test. This outer bound also
+    # catches runner/runtime deadlocks where Bun cannot fire that watchdog.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4
+      - name: install deps
+        run: bun install --frozen-lockfile
+      - name: build depcheck
+        # hub's `tsc` typecheck resolves `@openparachute/depcheck`'s types from
+        # its built `dist/index.d.ts`. The workspace install doesn't build it
+        # (no prepare hook), so build it explicitly before typecheck. At
+        # runtime hub resolves depcheck via the `bun`→src export condition, so
+        # this is only needed for the type-level resolution.
+        run: bun run --cwd packages/depcheck build
+      - name: build door-contract
+        # Same reason as depcheck: hub's `tsc` typecheck + the door-contract
+        # parity test resolve `@openparachute/door-contract` from its built
+        # `dist/`. The frozen-lockfile install doesn't build it, so build it
+        # explicitly before typecheck + tests.
+        run: bun run --cwd packages/door-contract build
+      - name: typecheck
+        run: bun run typecheck
+      - name: hub tests
+        run: bun test --timeout 30000 ./src

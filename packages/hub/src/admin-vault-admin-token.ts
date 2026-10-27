@@ -1,0 +1,135 @@
+/**
+ * `GET /admin/vault-admin-token/<name>` — exchange a valid admin session
+ * cookie for a short-lived JWT carrying `vault:<name>:admin`.
+ *
+ * Why this exists: the per-vault admin SPA (vault#216 / vault PR #219) needs
+ * a Bearer to call vault-internal admin endpoints (token mint/revoke,
+ * config edits). `vault:<name>:admin` is non-requestable from the public
+ * `/oauth/authorize` flow (`scope-explanations.ts:isNonRequestableScope`)
+ * — only the local session-cookie path can mint it.
+ *
+ * The minted JWT is handed to the vault SPA via a URL fragment on redirect
+ * (`<vault-url><managementUrl>#token=<jwt>`). Vault's admin SPA bootstraps
+ * by reading `location.hash`, stashing the token in module-scoped state,
+ * and replaceState-ing the fragment off the URL.
+ *
+ * Validation: `<name>` must match a vault instance currently in services.json.
+ * That keeps a forged URL from minting `vault:does-not-exist:admin` and
+ * masking a typo as a real (but unusable) credential. Resolved via the
+ * already-built well-known doc — same source of truth the SPA's vault list
+ * reads.
+ *
+ * Admin gate: the session must belong to a hub admin (`users.hub_role =
+ * 'admin'` — see `users.ts:isHubAdmin`; a hub may have several since hub#881).
+ * Friends pinned to a vault use the OAuth flow to get vault:<name>:read/write
+ * for their assigned vault; they don't get vault admin via this endpoint.
+ */
+import type { Database } from "bun:sqlite";
+import { lockedResponse, requireUnlocked } from "./admin-lock.ts";
+import { signAccessToken } from "./jwt-sign.ts";
+import { findSession, parseSessionCookie } from "./sessions.ts";
+import { isHubAdmin } from "./users.ts";
+import { VAULT_NAME_CHARSET_RE } from "./vault-name.ts";
+
+/** Short TTL — matches host-admin-token. SPA re-fetches on near-expiry. */
+export const VAULT_ADMIN_TOKEN_TTL_SECONDS = 10 * 60;
+const VAULT_ADMIN_CLIENT_ID = "parachute-hub-spa";
+
+/**
+ * Lowercase-only vault-name charset (item I) — single source of truth in
+ * vault-name.ts, matching vault's init. Keeps URL-injection out AND closes the
+ * case-drift class (an uppercased name minting `vault.<Name>` audience that
+ * vault's lowercase URL-derived name would never validate).
+ */
+const VAULT_NAME_RE = VAULT_NAME_CHARSET_RE;
+
+export interface MintVaultAdminTokenDeps {
+  db: Database;
+  /** Hub origin — written into JWT `iss`. */
+  issuer: string;
+  /** Names of currently-installed vault instances; the request name must be in this set. */
+  knownVaultNames: ReadonlySet<string>;
+}
+
+export async function handleVaultAdminToken(
+  req: Request,
+  vaultName: string,
+  deps: MintVaultAdminTokenDeps,
+): Promise<Response> {
+  if (req.method !== "GET") {
+    return jsonError(405, "method_not_allowed", "use GET");
+  }
+  if (!VAULT_NAME_RE.test(vaultName)) {
+    return jsonError(400, "invalid_request", `vault name "${vaultName}" is not a valid identifier`);
+  }
+  if (!deps.knownVaultNames.has(vaultName)) {
+    return jsonError(404, "not_found", `no vault named "${vaultName}" in this hub`);
+  }
+  const sid = parseSessionCookie(req.headers.get("cookie"));
+  const session = sid ? findSession(deps.db, sid) : null;
+  if (!session || !sid) {
+    return jsonError(401, "unauthenticated", "no admin session — sign in at /login first");
+  }
+  // Multi-user Phase 1 privesc gate (mirrors host-admin-token). vault:<name>:admin
+  // is the per-vault operator scope used by the vault admin SPA — friends pinned
+  // to a vault get vault:<name>:read/write via OAuth, never admin. Without this
+  // gate, any signed-in friend can mint a vault admin token for any vault.
+  if (!isHubAdmin(deps.db, session.userId)) {
+    return jsonError(
+      403,
+      "not_admin",
+      "vault admin token mint is restricted to the hub admin — your account home is at /account/",
+    );
+  }
+  // Admin screen-lock gate (see admin-host-admin-token.ts). A locked admin
+  // session can't mint a vault admin Bearer, so the vault admin SPA fails
+  // closed until the operator unlocks. Off by default.
+  if (!requireUnlocked(deps.db, sid).ok) {
+    return lockedResponse();
+  }
+  const scope = `vault:${vaultName}:admin`;
+  // Per-vault audience: vault validates the JWT's `aud` claim against
+  // `vault.<name>` derived from its own URL-bound config (vault src/auth.ts
+  // line ~167 — `expectedAudience: vault.${vaultConfig.name}`). Same shape
+  // as `inferAudience` in oauth-handlers.ts for the public OAuth flow, so
+  // hub-minted and OAuth-minted tokens are indistinguishable to vault. A
+  // single `audience: "hub"` constant here was wrong end-to-end and broke
+  // every Manage-button click against the vault SPA (PR #173 follow-up).
+  const audience = `vault.${vaultName}`;
+  const minted = await signAccessToken(deps.db, {
+    sub: session.userId,
+    scopes: [scope],
+    audience,
+    clientId: VAULT_ADMIN_CLIENT_ID,
+    issuer: deps.issuer,
+    ttlSeconds: VAULT_ADMIN_TOKEN_TTL_SECONDS,
+    // The session-cookie path mints a per-vault admin Bearer for an operator
+    // who is already authenticated as an admin (post-#199 SPA path). The
+    // token names exactly one vault in its `scope`; the `vault_scope` claim
+    // mirrors that so PR 5's scope-guard side sees the same explicit pin
+    // (rather than the empty-admin sentinel that would otherwise undermine
+    // the per-vault narrowing).
+    vaultScope: [vaultName],
+  });
+  return new Response(
+    JSON.stringify({
+      token: minted.token,
+      expires_at: minted.expiresAt,
+      scopes: [scope],
+    }),
+    {
+      status: 200,
+      headers: {
+        "content-type": "application/json",
+        "cache-control": "no-store",
+      },
+    },
+  );
+}
+
+function jsonError(status: number, error: string, description: string): Response {
+  return new Response(JSON.stringify({ error, error_description: description }), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}

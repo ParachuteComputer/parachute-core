@@ -1,0 +1,412 @@
+/**
+ * Grants — record of "user U has approved scope-set S for client C".
+ *
+ * Closes #75. The OAuth consent screen is UX, not protocol — RFC 6749 §3
+ * doesn't mandate it. Once a user has approved a set of scopes for a given
+ * client, re-running the same flow with the same (or a subset of) scopes
+ * shouldn't show consent again. Token-endpoint scope validation still gates
+ * actual issuance, so this is purely about not re-asking the human.
+ *
+ * Storage: one row per (user_id, client_id) in the `grants` table (created
+ * in hub-db migration v3). The `scopes` column is a space-separated set of
+ * every scope the user has ever approved for this client — recording is
+ * UNION semantics, not overwrite. That way, a user who approved [a, b, c]
+ * once and later approves only [a, b] for an incremental flow doesn't lose
+ * their c grant; the next flow asking [a, c] still skips consent.
+ *
+ * Skip rule: a flow may skip consent iff every requested scope is already
+ * in the grant's set. A strict superset (the client wants something new)
+ * shows the consent screen with the full requested set so the user is
+ * approving the new addition explicitly. A strict subset skips.
+ *
+ * Re-registered clients have a fresh client_id, so grants are not carried
+ * across — a re-registered app must earn consent again. That's by design:
+ * if the client_id changed, the operator can't tell from the URL whether
+ * it's the same app or an impostor.
+ */
+
+import type { Database } from "bun:sqlite";
+import { ACCOUNT_VAULTS_UNNARROWED, accountVaultsScope } from "@openparachute/door-contract";
+import { renameVaultScopes, vaultScopeName } from "./scope-explanations.ts";
+
+const HUB_ACCOUNT_VAULTS_BOUND = accountVaultsScope("self");
+
+/**
+ * `account:vaults` (PRM request form) and `account:self:vaults` (consent-bound
+ * mint form) are the same grant. Skip-consent used to exact-match, so an MCP
+ * client that re-requests the advertised un-narrowed string after a bound
+ * mint would re-consent every time (hub#883 review nit).
+ */
+function accountVaultsEquivalents(scope: string): readonly string[] {
+  if (scope === ACCOUNT_VAULTS_UNNARROWED) return [scope, HUB_ACCOUNT_VAULTS_BOUND];
+  if (scope === HUB_ACCOUNT_VAULTS_BOUND) return [scope, ACCOUNT_VAULTS_UNNARROWED];
+  return [scope];
+}
+
+function requestedCoveredByGranted(
+  granted: ReadonlySet<string>,
+  requested: readonly string[],
+): boolean {
+  for (const s of requested) {
+    if (!accountVaultsEquivalents(s).some((eq) => granted.has(eq))) return false;
+  }
+  return true;
+}
+
+export interface Grant {
+  userId: string;
+  clientId: string;
+  scopes: string[];
+  grantedAt: string;
+}
+
+interface GrantRow {
+  user_id: string;
+  client_id: string;
+  scopes: string;
+  granted_at: string;
+}
+
+function rowToGrant(row: GrantRow): Grant {
+  return {
+    userId: row.user_id,
+    clientId: row.client_id,
+    scopes: row.scopes.split(" ").filter((s) => s.length > 0),
+    grantedAt: row.granted_at,
+  };
+}
+
+/** Look up the grant for (user, client). Returns null when none exists. */
+export function findGrant(db: Database, userId: string, clientId: string): Grant | null {
+  const row = db
+    .prepare(
+      "SELECT user_id, client_id, scopes, granted_at FROM grants WHERE user_id = ? AND client_id = ?",
+    )
+    .get(userId, clientId) as GrantRow | undefined;
+  return row ? rowToGrant(row) : null;
+}
+
+/**
+ * Record a consent approval. Merges `newScopes` into any existing grant for
+ * (user, client) — UNION semantics — and bumps `granted_at` to `now`. Empty
+ * `newScopes` is a no-op (we don't want to insert empty rows).
+ */
+export function recordGrant(
+  db: Database,
+  userId: string,
+  clientId: string,
+  newScopes: readonly string[],
+  now: Date = new Date(),
+): Grant {
+  // Wrapped in a transaction so the read-merge-write is atomic. Without
+  // this, two concurrent consents for the same (user, client) could both
+  // SELECT the same prior row and then race to INSERT OR REPLACE, with the
+  // later writer's UNION missing scopes the earlier writer added.
+  return db.transaction(() => {
+    const existing = findGrant(db, userId, clientId);
+    const merged = new Set<string>(existing?.scopes ?? []);
+    for (const s of newScopes) {
+      if (s.length > 0) merged.add(s);
+    }
+    const scopes = Array.from(merged).sort();
+    const grantedAt = now.toISOString();
+    db.prepare(
+      `INSERT OR REPLACE INTO grants (user_id, client_id, scopes, granted_at)
+       VALUES (?, ?, ?, ?)`,
+    ).run(userId, clientId, scopes.join(" "), grantedAt);
+    return { userId, clientId, scopes, grantedAt };
+  })();
+}
+
+/**
+ * Test whether `requestedScopes` is fully covered by the existing grant —
+ * the rule for skipping the consent screen. Returns false when:
+ *   - no grant exists for (user, client), or
+ *   - any requested scope is missing from the grant's set, or
+ *   - `requestedScopes` is empty (we don't auto-approve "ask for nothing"
+ *     flows; they're almost certainly client bugs and showing consent will
+ *     surface that to the operator).
+ */
+export function isCoveredByGrant(
+  db: Database,
+  userId: string,
+  clientId: string,
+  requestedScopes: readonly string[],
+): boolean {
+  if (requestedScopes.length === 0) return false;
+  const grant = findGrant(db, userId, clientId);
+  if (!grant) return false;
+  const granted = new Set(grant.scopes);
+  return requestedCoveredByGranted(granted, requestedScopes);
+}
+
+/**
+ * Find the most-recent grant for a user across any client matching the
+ * given client_name. Used to support "trust an app by name" — once a
+ * user approves a `client_name` like `"claude-code"`, future DCRs with
+ * the same name auto-trust without re-asking. Returns null when no
+ * grant exists for any client of this name.
+ *
+ * Why: CLI MCP clients (Claude Code et al.) re-DCR on every `mcp add`
+ * (or every session), each landing a fresh `client_id`. Strict
+ * (user, client_id) grants force re-approval every time even though
+ * the operator has approved the same app many times before. Matching
+ * by client_name reflects the operator's actual mental model — "I
+ * approved Claude" — not the protocol's mental model — "I approved
+ * this specific client_id."
+ *
+ * Tradeoff: an attacker who can register a client with a known-trusted
+ * name (e.g. `"claude-code"`) gets auto-trust on first authorize. The
+ * defenses we kept:
+ *   1. Admin-scope flows still show consent (handled by the caller,
+ *      not this helper).
+ *   2. The audit log records each auto-trust event with both client_ids
+ *      (the original trusted one + the freshly auto-trusted one).
+ *   3. The Permissions admin SPA shows trusted client_names so the
+ *      operator can revoke trust by name.
+ *
+ * Closes hub#409 (Aaron 2026-05-26: "asking for approval every time…
+ * once we've approved something like Claude once it should not need
+ * admin approval every other time").
+ */
+export function findGrantByClientName(
+  db: Database,
+  userId: string,
+  clientName: string,
+): Grant | null {
+  if (!clientName) return null;
+  const row = db
+    .prepare(
+      `SELECT g.user_id, g.client_id, g.scopes, g.granted_at
+       FROM grants g
+       JOIN clients c ON g.client_id = c.client_id
+       WHERE g.user_id = ? AND c.client_name = ?
+       ORDER BY g.granted_at DESC
+       LIMIT 1`,
+    )
+    .get(userId, clientName) as GrantRow | undefined;
+  return row ? rowToGrant(row) : null;
+}
+
+/**
+ * Test whether `requestedScopes` is covered by ANY grant for the given
+ * client_name + user. The client_name-keyed counterpart to
+ * `isCoveredByGrant`. Used by /oauth/authorize to skip BOTH the
+ * approve-pending screen + the consent screen when the operator has
+ * previously approved a same-named client with sufficient scopes.
+ */
+export function isCoveredByGrantForClientName(
+  db: Database,
+  userId: string,
+  clientName: string,
+  requestedScopes: readonly string[],
+): boolean {
+  if (requestedScopes.length === 0) return false;
+  const grant = findGrantByClientName(db, userId, clientName);
+  if (!grant) return false;
+  const granted = new Set(grant.scopes);
+  return requestedCoveredByGranted(granted, requestedScopes);
+}
+
+const VAULT_SCOPE_PREFIX_RE = /^vault:([^:]+):/;
+
+/**
+ * Fixed `client_id`s the hub mints for its OWN first-party browser surfaces.
+ * A grant carrying one of these is a browser sign-in (the operator opened the
+ * admin SPA, the account-home friend surface, etc.) — NOT "the operator
+ * connected an AI to their vault." See `userHasExternalAiGrant` (hub#583).
+ *
+ *   - `parachute-hub-spa`   — hub admin SPA + vault admin SPA mints
+ *     (`admin-host-admin-token.ts`, `admin-vault-admin-token.ts`,
+ *     `account-vault-admin-token.ts`).
+ *   - `parachute-account`   — account-home friend-vault token mints
+ *     (`account-vault-token.ts`).
+ */
+const FIRST_PARTY_BROWSER_CLIENT_IDS = new Set(["parachute-hub-spa", "parachute-account"]);
+
+/**
+ * `client_name`s of first-party browser SPAs that register dynamically via DCR
+ * (so their `client_id` is generated per-registration and can't be enumerated).
+ * Notes registers with `client_name: "Notes"` (the @openparachute/notes-ui PWA
+ * signing into a vault). Matched case-insensitively. See hub#583.
+ */
+const FIRST_PARTY_BROWSER_CLIENT_NAMES = new Set(["notes"]);
+
+/**
+ * True when a grant belongs to one of the hub's own first-party browser
+ * surfaces (admin SPA, account home, Notes PWA) rather than an external AI/MCP
+ * client (Claude, Cursor, …). Used to keep a browser sign-in from
+ * false-positiving the "you've connected your AI" onboarding signal (hub#583).
+ *
+ * Discriminates two ways because first-party surfaces register two ways: the
+ * hub-minted SPAs use fixed `client_id`s; DCR-registered SPAs (Notes) get a
+ * generated id but a stable `client_name`.
+ */
+export function isFirstPartyBrowserClient(
+  clientId: string,
+  clientName: string | null | undefined,
+): boolean {
+  if (FIRST_PARTY_BROWSER_CLIENT_IDS.has(clientId)) return true;
+  if (clientName && FIRST_PARTY_BROWSER_CLIENT_NAMES.has(clientName.trim().toLowerCase())) {
+    return true;
+  }
+  return false;
+}
+
+interface GrantWithClientNameRow extends GrantRow {
+  client_name: string | null;
+}
+
+/**
+ * True when the user has approved at least one EXTERNAL AI/MCP client (Claude,
+ * Cursor, etc.) whose granted scopes touch `vaultName` — i.e. "has this person
+ * actually wired up an AI to this vault yet?" (hub#583).
+ *
+ * Stricter than {@link userHasVaultGrant}: it excludes grants from the hub's
+ * own first-party browser surfaces (admin SPA, account home, Notes PWA). Those
+ * are OAuth clients too — signing into Notes writes a vault-scoped grant — so
+ * the coarse "any vault grant" signal lit up the `/account/` onboarding
+ * checklist's "✓ You're connected" line even when no AI was ever connected.
+ * This is the detection the checklist should use.
+ *
+ * Trade-off: this fetches ALL of the user's grants (joined to `clients` for
+ * `client_name`) and filters in JS, rather than pushing the first-party
+ * exclusion into a WHERE clause. Fine at current scale — a user has a handful
+ * of grants, and the scope/client-name discrimination is awkward to express in
+ * SQL (scopes are a space-joined column, first-party names are an in-process
+ * set). If the grants table grows large per-user, add an index on
+ * `grants(user_id)` (already the PK prefix) and consider a `client_name`-aware
+ * WHERE filter.
+ */
+export function userHasExternalAiGrant(db: Database, userId: string, vaultName: string): boolean {
+  const rows = db
+    .prepare(
+      `SELECT g.user_id, g.client_id, g.scopes, g.granted_at, c.client_name
+         FROM grants g
+         LEFT JOIN clients c ON g.client_id = c.client_id
+        WHERE g.user_id = ?`,
+    )
+    .all(userId) as GrantWithClientNameRow[];
+  for (const row of rows) {
+    if (isFirstPartyBrowserClient(row.client_id, row.client_name)) continue;
+    const scopes = row.scopes.split(" ").filter((s) => s.length > 0);
+    for (const s of scopes) {
+      const m = s.match(VAULT_SCOPE_PREFIX_RE);
+      if (m && m[1] === vaultName) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * True when the user has approved at least one OAuth client whose granted
+ * scopes touch `vaultName` (any `vault:<name>:<verb>` scope). This is the
+ * "has this person actually connected an AI to this vault yet?" signal — the
+ * `/account/` onboarding checklist uses it to mark the "Connect your AI" step
+ * done (a grant row only lands once the user has clicked through the consent
+ * screen for a client wired to this vault).
+ *
+ * Mirrors the per-grant vault filter in `admin-grants.ts`; kept here so the
+ * detection lives next to the rest of the grants helpers and can be unit-tested
+ * without the admin route harness.
+ */
+export function userHasVaultGrant(db: Database, userId: string, vaultName: string): boolean {
+  const grants = listGrantsForUser(db, userId);
+  for (const g of grants) {
+    for (const s of g.scopes) {
+      const m = s.match(VAULT_SCOPE_PREFIX_RE);
+      if (m && m[1] === vaultName) return true;
+    }
+  }
+  return false;
+}
+
+/** All grants for a user, ordered most-recent first. Used by `parachute auth list-grants`. */
+export function listGrantsForUser(db: Database, userId: string): Grant[] {
+  const rows = db
+    .prepare(
+      "SELECT user_id, client_id, scopes, granted_at FROM grants WHERE user_id = ? ORDER BY granted_at DESC",
+    )
+    .all(userId) as GrantRow[];
+  return rows.map(rowToGrant);
+}
+
+/**
+ * Delete a grant. Returns true when a row was removed; false when no grant
+ * existed for (user, client). Note this does not revoke existing tokens —
+ * an operator who wants to revoke active sessions runs `/oauth/revoke` (or
+ * its CLI wrapper) separately. Removing the grant only forces the next
+ * /oauth/authorize flow to show consent again.
+ */
+export function revokeGrant(db: Database, userId: string, clientId: string): boolean {
+  const res = db
+    .prepare("DELETE FROM grants WHERE user_id = ? AND client_id = ?")
+    .run(userId, clientId);
+  return res.changes > 0;
+}
+
+/** Rename the exact vault reference; called inside the rename transaction. */
+export function renameGrantsForVault(db: Database, oldName: string, newName: string): number {
+  const rows = db.prepare("SELECT user_id, client_id, scopes FROM grants").all() as GrantRow[];
+  let count = 0;
+  for (const row of rows) {
+    const scopes = renameVaultScopes(row.scopes, oldName, newName);
+    if (scopes === row.scopes) continue;
+    db.prepare("UPDATE grants SET scopes = ? WHERE user_id = ? AND client_id = ?").run(
+      scopes,
+      row.user_id,
+      row.client_id,
+    );
+    count++;
+  }
+  return count;
+}
+
+/**
+ * Vault-delete cascade step (B1, 2026-06-09 hub-module-boundary): REWRITE
+ * every grant whose scope list names the deleted vault, removing the
+ * `vault:<name>:<verb>` entries; DROP the row only when the rewrite leaves
+ * it empty.
+ *
+ * Rewrite-not-drop matters: a grant row is keyed (user, client) and its
+ * scope set spans every vault the user ever approved for that client —
+ * dropping the whole row over a single vault would silently revoke the
+ * client's consent on the user's OTHER vaults (over-revocation).
+ *
+ * Matching is the exact `vaultScopeName` segment comparison (regex on the
+ * `vault:<name>:<read|write|admin>` shape), never SQL LIKE — `_` in a vault
+ * name is a LIKE wildcard. Unnamed scopes (`vault:read`) and non-vault
+ * scopes are preserved.
+ */
+export function rewriteGrantsRemovingVault(
+  db: Database,
+  vaultName: string,
+): { rewritten: number; dropped: number } {
+  return db.transaction(() => {
+    const rows = db
+      .prepare("SELECT user_id, client_id, scopes, granted_at FROM grants")
+      .all() as GrantRow[];
+    let rewritten = 0;
+    let dropped = 0;
+    for (const row of rows) {
+      const scopes = row.scopes.split(" ").filter((s) => s.length > 0);
+      const kept = scopes.filter((s) => vaultScopeName(s) !== vaultName);
+      if (kept.length === scopes.length) continue; // doesn't name the vault
+      if (kept.length === 0) {
+        db.prepare("DELETE FROM grants WHERE user_id = ? AND client_id = ?").run(
+          row.user_id,
+          row.client_id,
+        );
+        dropped++;
+      } else {
+        db.prepare("UPDATE grants SET scopes = ? WHERE user_id = ? AND client_id = ?").run(
+          kept.join(" "),
+          row.user_id,
+          row.client_id,
+        );
+        rewritten++;
+      }
+    }
+    return { rewritten, dropped };
+  })();
+}

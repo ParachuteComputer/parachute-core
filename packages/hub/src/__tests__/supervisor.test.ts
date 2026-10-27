@@ -1,0 +1,1709 @@
+import { describe, expect, test } from "bun:test";
+import { Socket } from "node:net";
+import {
+  type KillFn,
+  type SpawnRequest,
+  type SupervisedProc,
+  Supervisor,
+  defaultKillGroup,
+} from "../supervisor.ts";
+
+/**
+ * A `killFn` stub that records every (pid, signal) it receives and forwards
+ * the signal to the matching fake proc's own `kill` (so fakes that model
+ * "only SIGKILL terminates me" still work). Mirrors how production's
+ * `defaultKillGroup` would signal the process group, but stays in-process +
+ * deterministic. Tests assert on `.calls` to prove a group send (negative
+ * pid) happened. `register` wires a fake's pid → its `kill`.
+ */
+function makeKillRecorder(): {
+  killFn: KillFn;
+  calls: Array<{ pid: number; signal: NodeJS.Signals | number }>;
+  register: (proc: FakeProc) => void;
+} {
+  const calls: Array<{ pid: number; signal: NodeJS.Signals | number }> = [];
+  const byPid = new Map<number, FakeProc>();
+  return {
+    calls,
+    register: (proc) => byPid.set(proc.pid, proc),
+    killFn: (pid, signal) => {
+      calls.push({ pid, signal });
+      // Production signals the group via the negative pid; the supervisor
+      // passes the positive leader pid, so map back to the fake by |pid|.
+      byPid.get(Math.abs(pid))?.kill(signal);
+    },
+  };
+}
+
+/**
+ * Fake subprocess with controllable exited promise + injectable stdout
+ * / stderr. The test drives `resolveExit(code)` to simulate the child
+ * exiting (clean or crash) and `emit(stream, bytes)` to push log
+ * output through the line-buffered tap.
+ */
+interface FakeProc extends SupervisedProc {
+  resolveExit(code: number | null): void;
+  emitStdout(chunk: string): void;
+  emitStderr(chunk: string): void;
+  closeStreams(): void;
+  killed: boolean;
+  killSignal?: NodeJS.Signals | number;
+}
+
+function makeFakeProc(pid: number): FakeProc {
+  let resolveExit!: (code: number | null) => void;
+  const exited = new Promise<number | null>((resolve) => {
+    resolveExit = resolve;
+  });
+
+  const stdoutController = makeStreamController();
+  const stderrController = makeStreamController();
+
+  return {
+    pid,
+    exited,
+    stdout: stdoutController.stream,
+    stderr: stderrController.stream,
+    kill(signal) {
+      this.killed = true;
+      this.killSignal = signal;
+    },
+    killed: false,
+    resolveExit: (code) => resolveExit(code),
+    emitStdout: (chunk) => stdoutController.push(chunk),
+    emitStderr: (chunk) => stderrController.push(chunk),
+    closeStreams: () => {
+      stdoutController.close();
+      stderrController.close();
+    },
+  };
+}
+
+function makeStreamController(): {
+  stream: ReadableStream<Uint8Array>;
+  push: (s: string) => void;
+  close: () => void;
+} {
+  let controller: ReadableStreamDefaultController<Uint8Array>;
+  const stream = new ReadableStream<Uint8Array>({
+    start(c) {
+      controller = c;
+    },
+  });
+  const enc = new TextEncoder();
+  return {
+    stream,
+    push: (s) => controller.enqueue(enc.encode(s)),
+    close: () => {
+      try {
+        controller.close();
+      } catch {
+        // already closed
+      }
+    },
+  };
+}
+
+/**
+ * Programmable spawner. Hand it a queue of FakeProc instances, one per
+ * expected spawn call (or one shared if every spawn uses the same
+ * fake). Tests drive lifecycle by calling resolveExit on the returned
+ * proc.
+ */
+function makeQueueSpawner(): {
+  spawn: (req: SpawnRequest) => SupervisedProc;
+  enqueue: (proc: FakeProc) => void;
+  calls: SpawnRequest[];
+} {
+  const queue: FakeProc[] = [];
+  const calls: SpawnRequest[] = [];
+  return {
+    enqueue: (proc) => queue.push(proc),
+    calls,
+    spawn: (req) => {
+      calls.push(req);
+      const next = queue.shift();
+      if (!next) throw new Error(`unexpected spawn for ${req.short}`);
+      return next;
+    },
+  };
+}
+
+function tick(ms = 10): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * No-op kill seam for tests that exercise `stop()`/`restart()` only as
+ * lifecycle cleanup and don't assert on the signal. Keeps the default
+ * `defaultKillGroup` (which calls the real `process.kill`) from firing a
+ * signal at a fake pid that could collide with a real process on the host.
+ */
+const noopKill: KillFn = () => {};
+
+describe("Supervisor.start + status transitions", () => {
+  test("transitions starting → running after spawn", async () => {
+    const proc = makeFakeProc(123);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(proc);
+    const sup = new Supervisor({ spawnFn: spawner.spawn, killFn: noopKill });
+
+    const state = await sup.start({ short: "vault", cmd: ["bun", "vault.ts"] });
+    expect(state.status).toBe("running");
+    expect(state.pid).toBe(123);
+    expect(state.startedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(spawner.calls).toHaveLength(1);
+    expect(spawner.calls[0]?.short).toBe("vault");
+
+    // Cleanup: resolve the exited promise so the watcher doesn't dangle.
+    proc.closeStreams();
+    sup.stop("vault");
+    proc.resolveExit(0);
+  });
+
+  test("is idempotent on a running module — second start returns existing state", async () => {
+    const proc = makeFakeProc(123);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(proc);
+    const sup = new Supervisor({ spawnFn: spawner.spawn, killFn: noopKill });
+
+    await sup.start({ short: "vault", cmd: ["bun", "vault.ts"] });
+    await sup.start({ short: "vault", cmd: ["bun", "vault.ts"] });
+    // Only one spawn — the second start short-circuited.
+    expect(spawner.calls).toHaveLength(1);
+
+    proc.closeStreams();
+    sup.stop("vault");
+    proc.resolveExit(0);
+  });
+});
+
+describe("Supervisor port-squatter detection (#580 item 4)", () => {
+  test("foreign pid on the module port → port_squatter error, no spawn", async () => {
+    const spawner = makeQueueSpawner();
+    // Note: NOTHING enqueued — if `start` tried to spawn, the spawner throws.
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      // A rogue pid 1921 holds :1940; it is NOT one of our children.
+      pidOnPort: (port) => (port === 1940 ? 1921 : undefined),
+      ownerOfPid: (pid) => (pid === 1921 ? "bun /x/vault/src/server.ts" : undefined),
+    });
+
+    const state = await sup.start({
+      short: "vault",
+      cmd: ["bun", "vault.ts"],
+      env: { PORT: "1940" },
+    });
+
+    // No spawn attempted (spawner.calls empty), module is `crashed` with the
+    // structured, actionable squatter error.
+    expect(spawner.calls).toHaveLength(0);
+    expect(state.status).toBe("crashed");
+    expect(state.pid).toBeUndefined();
+    expect(state.startError?.error_type).toBe("port_squatter");
+    expect(state.startError?.error_description).toContain("port 1940 is held by pid 1921");
+    expect(state.startError?.error_description).toContain("bun /x/vault/src/server.ts");
+    expect(state.startError?.error_description).toContain("kill 1921 && parachute start vault");
+  });
+
+  test("squatter message omits cmdline when ownerOfPid can't read it", async () => {
+    const spawner = makeQueueSpawner();
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      pidOnPort: () => 4242,
+      ownerOfPid: () => undefined,
+    });
+
+    const state = await sup.start({
+      short: "vault",
+      cmd: ["bun", "vault.ts"],
+      env: { PORT: "1940" },
+    });
+    expect(state.startError?.error_type).toBe("port_squatter");
+    expect(state.startError?.error_description).toContain("port 1940 is held by pid 4242");
+    expect(state.startError?.error_description).toContain("kill 4242 && parachute start vault");
+    // No parenthetical cmdline.
+    expect(state.startError?.error_description).not.toContain("(");
+  });
+
+  test("free port → no squatter error, module spawns normally", async () => {
+    const proc = makeFakeProc(500);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(proc);
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      pidOnPort: () => undefined, // port free / detection unavailable
+    });
+
+    const state = await sup.start({
+      short: "vault",
+      cmd: ["bun", "vault.ts"],
+      env: { PORT: "1940" },
+    });
+    expect(spawner.calls).toHaveLength(1);
+    expect(state.status).toBe("running");
+    expect(state.startError).toBeUndefined();
+
+    proc.closeStreams();
+    sup.stop("vault");
+    proc.resolveExit(0);
+  });
+
+  test("port held by one of OUR OWN children is not a squatter", async () => {
+    // vault is up on pid 700 holding :1940; starting a sibling (scribe) that
+    // somehow reports the same holder pid must NOT be flagged — the holder is
+    // a supervised child, not a foreign rogue.
+    const vaultProc = makeFakeProc(700);
+    const scribeProc = makeFakeProc(701);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(vaultProc);
+    spawner.enqueue(scribeProc);
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      // vault's port (1940) is free so vault spawns (pid 700). scribe's port
+      // (1943) then reports vault's pid 700 as the holder — a supervised child,
+      // NOT a foreign rogue, so scribe must still spawn.
+      pidOnPort: (port) => (port === 1943 ? 700 : undefined),
+    });
+
+    await sup.start({ short: "vault", cmd: ["bun", "vault.ts"], env: { PORT: "1940" } });
+    const scribe = await sup.start({
+      short: "scribe",
+      cmd: ["bun", "scribe.ts"],
+      env: { PORT: "1943" },
+    });
+    // scribe spawned (no false-positive squatter); both children spawned.
+    expect(spawner.calls).toHaveLength(2);
+    expect(scribe.status).toBe("running");
+    expect(scribe.startError).toBeUndefined();
+
+    vaultProc.closeStreams();
+    scribeProc.closeStreams();
+    sup.stop("vault");
+    sup.stop("scribe");
+    vaultProc.resolveExit(0);
+    scribeProc.resolveExit(0);
+  });
+
+  test("a CRASHED child's stale pid does NOT vouch for a port holder (N1 liveness)", async () => {
+    // vault spawns (pid 800), then crashes for good (maxRestarts: 1). Its entry
+    // keeps `proc.pid === 800` (never cleared on exit) but status is `crashed`.
+    // A fresh `start` where pid 800 now holds :1940 must be flagged as a
+    // SQUATTER — the stale pid of a dead child must not excuse the holder.
+    const first = makeFakeProc(800);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(first);
+    let portHeld = false;
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      maxRestarts: 1,
+      restartDelayMs: 0,
+      sleep: () => Promise.resolve(),
+      // Free before the crash; pid 800 "holds" :1940 after we flip portHeld.
+      pidOnPort: (port) => (portHeld && port === 1940 ? 800 : undefined),
+      ownerOfPid: () => "bun /x/vault/src/server.ts",
+    });
+
+    await sup.start({ short: "vault", cmd: ["bun", "vault.ts"], env: { PORT: "1940" } });
+    // Crash past the budget → status `crashed`, entry.proc.pid still 800.
+    first.closeStreams();
+    first.resolveExit(1);
+    await tick();
+    expect(sup.get("vault")?.status).toBe("crashed");
+
+    // Now pid 800 holds the port. A re-start must NOT treat 800 as "ours".
+    portHeld = true;
+    const restarted = await sup.start({
+      short: "vault",
+      cmd: ["bun", "vault.ts"],
+      env: { PORT: "1940" },
+    });
+    expect(restarted.status).toBe("crashed");
+    expect(restarted.startError?.error_type).toBe("port_squatter");
+    expect(restarted.startError?.error_description).toContain("port 1940 is held by pid 800");
+    // No second spawn — the squatter check aborted before re-spawning.
+    expect(spawner.calls).toHaveLength(1);
+  });
+
+  test("no declared PORT → squatter check skipped (request without env.PORT)", async () => {
+    const proc = makeFakeProc(900);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(proc);
+    let probed = false;
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      pidOnPort: () => {
+        probed = true;
+        return 1;
+      },
+    });
+
+    const state = await sup.start({ short: "vault", cmd: ["bun", "vault.ts"] });
+    // No PORT in the request → we never probe a port, and the module spawns.
+    expect(probed).toBe(false);
+    expect(state.status).toBe("running");
+
+    proc.closeStreams();
+    sup.stop("vault");
+    proc.resolveExit(0);
+  });
+
+  test("stub-spawner path defaults to no squatter (existing fake-proc tests unaffected)", async () => {
+    const proc = makeFakeProc(123);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(proc);
+    // No pidOnPort injected → on the stub-spawner (test) path it defaults to
+    // "no squatter", so a request carrying a PORT still spawns.
+    const sup = new Supervisor({ spawnFn: spawner.spawn, killFn: noopKill });
+    const state = await sup.start({
+      short: "vault",
+      cmd: ["bun", "vault.ts"],
+      env: { PORT: "1940" },
+    });
+    expect(spawner.calls).toHaveLength(1);
+    expect(state.status).toBe("running");
+
+    proc.closeStreams();
+    sup.stop("vault");
+    proc.resolveExit(0);
+  });
+});
+
+describe("Supervisor restart-on-crash", () => {
+  test("restarts a crashed module within the budget", async () => {
+    const first = makeFakeProc(101);
+    const second = makeFakeProc(102);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(first);
+    spawner.enqueue(second);
+
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      restartDelayMs: 0,
+      sleep: () => Promise.resolve(),
+    });
+    await sup.start({ short: "vault", cmd: ["bun", "vault.ts"] });
+
+    // First child crashes.
+    first.closeStreams();
+    first.resolveExit(1);
+    // Let the handleExit microtask run + the spawn happen.
+    await tick();
+
+    expect(spawner.calls).toHaveLength(2);
+    const state = sup.get("vault");
+    expect(state?.status).toBe("running");
+    expect(state?.pid).toBe(102);
+    expect(state?.restartsInWindow).toBe(1);
+    expect(state?.lastExitCode).toBe(1);
+
+    second.closeStreams();
+    sup.stop("vault");
+    second.resolveExit(0);
+  });
+
+  test("gives up after maxRestarts crashes in window, marks crashed", async () => {
+    const procs = Array.from({ length: 3 }, (_, i) => makeFakeProc(200 + i));
+    const spawner = makeQueueSpawner();
+    for (const p of procs) spawner.enqueue(p);
+
+    const outputs: string[] = [];
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      maxRestarts: 3,
+      restartDelayMs: 0,
+      sleep: () => Promise.resolve(),
+      output: (line) => outputs.push(line),
+    });
+    await sup.start({ short: "vault", cmd: ["bun", "vault.ts"] });
+
+    // Crash 3 times in quick succession.
+    for (const p of procs) {
+      p.closeStreams();
+      p.resolveExit(2);
+      await tick();
+    }
+
+    const state = sup.get("vault");
+    expect(state?.status).toBe("crashed");
+    expect(state?.restartsInWindow).toBe(3);
+    expect(spawner.calls).toHaveLength(3); // initial + 2 restarts; 3rd crash trips the budget.
+    expect(outputs.some((l) => l.includes("giving up"))).toBe(true);
+  });
+
+  test("crashes outside the window drop off and budget resets", async () => {
+    const procs = Array.from({ length: 3 }, (_, i) => makeFakeProc(300 + i));
+    const spawner = makeQueueSpawner();
+    for (const p of procs) spawner.enqueue(p);
+
+    let nowVal = 1_000_000;
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      maxRestarts: 2,
+      restartWindowMs: 5_000,
+      restartDelayMs: 0,
+      sleep: () => Promise.resolve(),
+      now: () => nowVal,
+    });
+    await sup.start({ short: "vault", cmd: ["bun", "vault.ts"] });
+
+    // First crash at t=0.
+    procs[0]?.closeStreams();
+    procs[0]?.resolveExit(1);
+    await tick();
+    expect(sup.get("vault")?.restartsInWindow).toBe(1);
+
+    // Advance past the window; the first crash falls out before the
+    // second is counted.
+    nowVal += 10_000;
+    procs[1]?.closeStreams();
+    procs[1]?.resolveExit(1);
+    await tick();
+    // Budget reset — this crash is alone in its window.
+    expect(sup.get("vault")?.restartsInWindow).toBe(1);
+    expect(sup.get("vault")?.status).toBe("running");
+
+    procs[2]?.closeStreams();
+    sup.stop("vault");
+    procs[2]?.resolveExit(0);
+  });
+});
+
+describe("Supervisor crash-restart port reclamation (#522 / #582)", () => {
+  // A killFn that records its (pid, signal) calls so a test can prove an
+  // adopt-kill happened (or didn't). Does NOT forward to a fake — these tests
+  // drive the orphan's "death" by flipping the injected pidOnPort.
+  function recordingKill(): { killFn: KillFn; calls: Array<{ pid: number; signal: unknown }> } {
+    const calls: Array<{ pid: number; signal: unknown }> = [];
+    return { calls, killFn: (pid, signal) => calls.push({ pid, signal }) };
+  }
+
+  test("attributable orphan + kill frees the port → adopt-kill then respawn", async () => {
+    const first = makeFakeProc(900);
+    const second = makeFakeProc(901);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(first);
+    spawner.enqueue(second);
+    // The orphan (pid 5000) holds :1940 right after the crash; the SIGTERM
+    // adopt-kill frees it — model that by clearing the holder inside the kill
+    // stub (so the SIGKILL-escalation re-probe sees a freed port).
+    const calls: Array<{ pid: number; signal: unknown }> = [];
+    let holder: number | undefined = undefined;
+    const killFn: KillFn = (pid, signal) => {
+      calls.push({ pid, signal });
+      if (pid === 5000 && signal === "SIGTERM") holder = undefined; // the orphan died
+    };
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn,
+      restartDelayMs: 0,
+      sleep: () => Promise.resolve(),
+      pidOnPort: (port) => (port === 1940 ? holder : undefined),
+      // Attributable PER-MODULE: the cmdline carries THIS module's start binary
+      // (`parachute-vault`), not just a bare `parachute` marker.
+      ownerOfPid: (pid) => (pid === 5000 ? "parachute-vault serve" : undefined),
+    });
+
+    await sup.start({ short: "vault", cmd: ["parachute-vault", "serve"], env: { PORT: "1940" } });
+    // Orphan grabs the port, then the child crashes. `handleExit` detects the
+    // attributable orphan + adopt-kills it (the stub clears `holder`), then
+    // falls through to a normal restart that re-spawns onto the freed port.
+    holder = 5000;
+    first.closeStreams();
+    first.resolveExit(1);
+    await tick();
+
+    // The orphan got SIGTERM'd, and the module respawned onto the freed port.
+    expect(calls.some((c) => c.pid === 5000 && c.signal === "SIGTERM")).toBe(true);
+    expect(spawner.calls).toHaveLength(2);
+    const state = sup.get("vault");
+    expect(state?.status).toBe("running");
+    expect(state?.pid).toBe(901);
+    // It WAS counted as a normal restart (the module did crash + we reclaimed).
+    expect(state?.restartsInWindow).toBe(1);
+
+    second.closeStreams();
+    sup.stop("vault");
+    second.resolveExit(0);
+  });
+
+  test("attributable orphan + kill fails (ESRCH) → respawn still attempted", async () => {
+    const first = makeFakeProc(910);
+    const second = makeFakeProc(911);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(first);
+    spawner.enqueue(second);
+    // killFn throws ESRCH (the orphan vanished between probe + signal) — the
+    // adopt-kill swallows it and the respawn proceeds best-effort.
+    const killFn: KillFn = () => {
+      const err = new Error("no such process") as NodeJS.ErrnoException;
+      err.code = "ESRCH";
+      throw err;
+    };
+    // Port free at the initial start; the orphan appears only after the crash.
+    let holder: number | undefined = undefined;
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn,
+      restartDelayMs: 0,
+      sleep: () => Promise.resolve(),
+      // Holder present at crash time; the (failed) kill doesn't change it here,
+      // but the respawn is still attempted — that's the invariant under test.
+      pidOnPort: (port) => (port === 1940 ? holder : undefined),
+      // Attributable per-module: cmdline carries this module's start binary.
+      ownerOfPid: () => "parachute-vault serve",
+    });
+
+    await sup.start({ short: "vault", cmd: ["parachute-vault", "serve"], env: { PORT: "1940" } });
+    holder = 5001;
+    first.closeStreams();
+    first.resolveExit(1);
+    await tick();
+
+    // Respawn was attempted despite the kill throwing ESRCH (best-effort).
+    expect(spawner.calls).toHaveLength(2);
+    const state = sup.get("vault");
+    expect(state?.status).toBe("running");
+
+    second.closeStreams();
+    sup.stop("vault");
+    second.resolveExit(0);
+  });
+
+  test("foreign holder with readable cmdline → port_squatter error, no kill, no budget tick", async () => {
+    const first = makeFakeProc(920);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(first); // ONLY one proc — a respawn would throw "unexpected spawn".
+    const kill = recordingKill();
+    let holder: number | undefined = undefined; // free at start; orphan after crash.
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: kill.killFn,
+      restartDelayMs: 0,
+      sleep: () => Promise.resolve(),
+      pidOnPort: (port) => (port === 1940 ? holder : undefined),
+      // NOT attributable: an operator's unrelated dev server (no `parachute-vault`
+      // marker in its cmdline).
+      ownerOfPid: (pid) => (pid === 6000 ? "node /home/op/my-app/server.js" : undefined),
+    });
+
+    await sup.start({ short: "vault", cmd: ["parachute-vault", "serve"], env: { PORT: "1940" } });
+    holder = 6000;
+    first.closeStreams();
+    first.resolveExit(1);
+    await tick();
+
+    const state = sup.get("vault");
+    expect(state?.status).toBe("crashed");
+    expect(state?.startError?.error_type).toBe("port_squatter");
+    expect(state?.startError?.error_description).toContain("port 1940 is held by pid 6000");
+    // No kill (foreign process), no respawn, and the crash budget was NOT
+    // ticked (the module didn't crash — a foreign process is blocking its port).
+    expect(kill.calls).toHaveLength(0);
+    expect(spawner.calls).toHaveLength(1);
+    expect(state?.restartsInWindow).toBe(0);
+  });
+
+  test("foreign holder with UNREADABLE cmdline → port_squatter error, no kill, no budget tick", async () => {
+    const first = makeFakeProc(930);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(first); // only one — no respawn expected.
+    const kill = recordingKill();
+    let holder: number | undefined = undefined; // free at start; orphan after crash.
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: kill.killFn,
+      restartDelayMs: 0,
+      sleep: () => Promise.resolve(),
+      pidOnPort: (port) => (port === 1940 ? holder : undefined),
+      // Unreadable cmdline + a non-matching pid → NOT attributable (never kill).
+      ownerOfPid: () => undefined,
+    });
+
+    await sup.start({ short: "vault", cmd: ["parachute-vault", "serve"], env: { PORT: "1940" } });
+    holder = 7000;
+    first.closeStreams();
+    first.resolveExit(1);
+    await tick();
+
+    const state = sup.get("vault");
+    expect(state?.status).toBe("crashed");
+    expect(state?.startError?.error_type).toBe("port_squatter");
+    expect(kill.calls).toHaveLength(0);
+    expect(spawner.calls).toHaveLength(1);
+    expect(state?.restartsInWindow).toBe(0);
+  });
+
+  test("no squatter after a crash → normal restart (unchanged behavior)", async () => {
+    const first = makeFakeProc(940);
+    const second = makeFakeProc(941);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(first);
+    spawner.enqueue(second);
+    const kill = recordingKill();
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: kill.killFn,
+      restartDelayMs: 0,
+      sleep: () => Promise.resolve(),
+      // Port free at crash time (no squatter).
+      pidOnPort: () => undefined,
+      ownerOfPid: () => undefined,
+    });
+
+    await sup.start({ short: "vault", cmd: ["bun", "vault.ts"], env: { PORT: "1940" } });
+    first.closeStreams();
+    first.resolveExit(1);
+    await tick();
+
+    expect(kill.calls).toHaveLength(0);
+    expect(spawner.calls).toHaveLength(2);
+    const state = sup.get("vault");
+    expect(state?.status).toBe("running");
+    expect(state?.restartsInWindow).toBe(1);
+
+    second.closeStreams();
+    sup.stop("vault");
+    second.resolveExit(0);
+  });
+
+  test('reclaimPolicy "prompt" → never adopt-kills, surfaces even an attributable orphan', async () => {
+    const first = makeFakeProc(950);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(first); // only one — prompt halts, no respawn.
+    const kill = recordingKill();
+    let holder: number | undefined = undefined; // free at start; orphan after crash.
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: kill.killFn,
+      restartDelayMs: 0,
+      sleep: () => Promise.resolve(),
+      reclaimPolicy: "prompt",
+      pidOnPort: (port) => (port === 1940 ? holder : undefined),
+      // Attributable per-module (parachute-vault marker) — but "prompt" still refuses to kill.
+      ownerOfPid: () => "parachute-vault serve",
+    });
+
+    await sup.start({ short: "vault", cmd: ["parachute-vault", "serve"], env: { PORT: "1940" } });
+    holder = 8000;
+    first.closeStreams();
+    first.resolveExit(1);
+    await tick();
+
+    const state = sup.get("vault");
+    expect(state?.status).toBe("crashed");
+    expect(state?.startError?.error_type).toBe("port_squatter");
+    expect(kill.calls).toHaveLength(0); // prompt never kills
+    expect(spawner.calls).toHaveLength(1);
+    expect(state?.restartsInWindow).toBe(0);
+  });
+
+  test("foreign SIBLING parachute module on the port → NOT adopt-killed, port_squatter error (per-module attribution, #601 review)", async () => {
+    // The cross-module-kill hazard the per-module attribution closes: vault's
+    // crash-restart finds its port held by a SCRIBE orphan (a genuine parachute
+    // process — its cmdline carries `parachute` AND scribe's own binary — but
+    // NOT vault's). The broad `parachute` marker would have adopt-KILLED scribe;
+    // the per-module marker (`parachute-vault`) does not match scribe's cmdline,
+    // so scribe is "not attributable" → surfaced, never killed.
+    const first = makeFakeProc(960);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(first); // only one — a kill+respawn would consume a second.
+    const kill = recordingKill();
+    let holder: number | undefined = undefined; // free at start; sibling after crash.
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: kill.killFn,
+      restartDelayMs: 0,
+      sleep: () => Promise.resolve(),
+      pidOnPort: (port) => (port === 1940 ? holder : undefined),
+      // A real parachute process — but it's SCRIBE, not vault. Carries the broad
+      // `parachute` marker (and `parachute-scribe`) yet NOT `parachute-vault`.
+      ownerOfPid: (pid) => (pid === 9000 ? "parachute-scribe serve" : undefined),
+    });
+
+    await sup.start({ short: "vault", cmd: ["parachute-vault", "serve"], env: { PORT: "1940" } });
+    holder = 9000;
+    first.closeStreams();
+    first.resolveExit(1);
+    await tick();
+
+    const state = sup.get("vault");
+    // The sibling was NOT killed (per-module marker mismatch), surfaced instead.
+    expect(kill.calls).toHaveLength(0);
+    expect(spawner.calls).toHaveLength(1); // no respawn — halted, no port reclaim
+    expect(state?.status).toBe("crashed");
+    expect(state?.startError?.error_type).toBe("port_squatter");
+    expect(state?.startError?.error_description).toContain("port 1940 is held by pid 9000");
+    // Sanity: the sibling WOULD have matched the broad `parachute` marker —
+    // proving the per-module marker is what spared it.
+    expect("parachute-scribe serve").toContain("parachute");
+  });
+
+  test("generic-runtime startCmd (bun server.ts): a FOREIGN bun on the port is NOT over-attributed (#601 re-review)", async () => {
+    // A custom operator startCmd whose cmd[0] is a generic runtime (`bun`). The
+    // marker must NOT be "bun" (that would adopt-KILL any bun process on the
+    // port) — it falls through to the module-specific cwd (the installDir). A
+    // foreign bun process with a DIFFERENT cwd in its cmdline is then NOT
+    // attributable → surfaced, never killed.
+    const first = makeFakeProc(970);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(first); // only one — no kill+respawn expected.
+    const kill = recordingKill();
+    let holder: number | undefined = undefined;
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: kill.killFn,
+      restartDelayMs: 0,
+      sleep: () => Promise.resolve(),
+      pidOnPort: (port) => (port === 1940 ? holder : undefined),
+      // A foreign bun process — its cmdline carries `bun` (which WOULD match a
+      // naive cmd[0] marker) but NOT vault's installDir.
+      ownerOfPid: (pid) => (pid === 9100 ? "bun /home/op/other-project/server.ts" : undefined),
+    });
+
+    await sup.start({
+      short: "vault",
+      cmd: ["bun", "server.ts"],
+      cwd: "/x/.parachute/vault",
+      env: { PORT: "1940" },
+    });
+    holder = 9100;
+    first.closeStreams();
+    first.resolveExit(1);
+    await tick();
+
+    const state = sup.get("vault");
+    // Not over-attributed: no kill, no respawn — surfaced as a squatter.
+    expect(kill.calls).toHaveLength(0);
+    expect(spawner.calls).toHaveLength(1);
+    expect(state?.status).toBe("crashed");
+    expect(state?.startError?.error_type).toBe("port_squatter");
+    // Sanity: the foreign cmdline WOULD have matched a naive "bun" marker —
+    // proving the generic-runtime fall-through to the cwd marker is what spared it.
+    expect("bun /home/op/other-project/server.ts").toContain("bun");
+  });
+
+  test("generic-runtime startCmd: a GENUINE prior instance (same installDir cwd) IS adopted (positive control)", async () => {
+    // The other side of the fall-through: with cmd[0]=`bun`, the marker is the
+    // module's cwd (`/x/.parachute/vault`). A genuine prior vault instance was
+    // launched from that installDir, so its cmdline carries the path → it IS
+    // attributable and gets adopt-killed.
+    const first = makeFakeProc(980);
+    const second = makeFakeProc(981);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(first);
+    spawner.enqueue(second);
+    const calls: Array<{ pid: number; signal: unknown }> = [];
+    let holder: number | undefined = undefined;
+    const killFn: KillFn = (pid, signal) => {
+      calls.push({ pid, signal });
+      if (pid === 9200 && signal === "SIGTERM") holder = undefined; // orphan died
+    };
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn,
+      restartDelayMs: 0,
+      sleep: () => Promise.resolve(),
+      pidOnPort: (port) => (port === 1940 ? holder : undefined),
+      // Genuine prior vault instance — launched from vault's installDir, so the
+      // cwd marker appears in its cmdline.
+      ownerOfPid: (pid) => (pid === 9200 ? "bun /x/.parachute/vault/server.ts" : undefined),
+    });
+
+    await sup.start({
+      short: "vault",
+      cmd: ["bun", "server.ts"],
+      cwd: "/x/.parachute/vault",
+      env: { PORT: "1940" },
+    });
+    holder = 9200;
+    first.closeStreams();
+    first.resolveExit(1);
+    await tick();
+
+    // Adopted: SIGTERM'd the genuine prior instance, then respawned.
+    expect(calls.some((c) => c.pid === 9200 && c.signal === "SIGTERM")).toBe(true);
+    expect(spawner.calls).toHaveLength(2);
+    expect(sup.get("vault")?.status).toBe("running");
+
+    second.closeStreams();
+    sup.stop("vault");
+    second.resolveExit(0);
+  });
+});
+
+describe("Supervisor.stop", () => {
+  test("operator stop is not a crash — does not restart", async () => {
+    const proc = makeFakeProc(101);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(proc);
+    const killer = makeKillRecorder();
+    killer.register(proc);
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: killer.killFn,
+      restartDelayMs: 0,
+      sleep: () => Promise.resolve(),
+    });
+    await sup.start({ short: "vault", cmd: ["bun", "vault.ts"] });
+
+    // stop() now awaits proc.exited (with SIGKILL escalation on
+    // timeout) — kick it off, observe the SIGTERM landed, then
+    // resolve exited so the await completes.
+    const stopPromise = sup.stop("vault");
+    expect(proc.killed).toBe(true);
+    expect(proc.killSignal).toBe("SIGTERM");
+    // The signal is sent through the group-aware killFn seam (hub#88), with
+    // the child's leader pid.
+    expect(killer.calls).toEqual([{ pid: 101, signal: "SIGTERM" }]);
+
+    proc.closeStreams();
+    proc.resolveExit(0);
+    await stopPromise;
+
+    // No second spawn — stop is an intentional exit.
+    expect(spawner.calls).toHaveLength(1);
+    expect(sup.get("vault")?.status).toBe("stopped");
+  });
+
+  test("escalates to SIGKILL when child ignores SIGTERM past killTimeoutMs", async () => {
+    // Child that refuses to exit on SIGTERM. The fake records every
+    // signal it receives; the supervisor should send SIGTERM,
+    // observe no exit, then send SIGKILL after the timeout.
+    const proc = makeFakeProc(101);
+    const signals: (NodeJS.Signals | number | undefined)[] = [];
+    proc.kill = (signal) => {
+      signals.push(signal);
+      // Only SIGKILL actually terminates this fake child — SIGTERM
+      // gets logged and ignored, simulating the wedged-module shape.
+      if (signal === "SIGKILL") proc.resolveExit(null);
+    };
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(proc);
+    const killer = makeKillRecorder();
+    killer.register(proc);
+    const outputs: string[] = [];
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: killer.killFn,
+      restartDelayMs: 0,
+      sleep: () => Promise.resolve(),
+      killTimeoutMs: 5, // Short timeout so the test doesn't pause for 5s.
+      output: (line) => outputs.push(line),
+    });
+    await sup.start({ short: "vault", cmd: ["bun", "vault.ts"] });
+
+    proc.closeStreams();
+    await sup.stop("vault");
+
+    // SIGTERM first, then SIGKILL after the timeout — both via the group-aware
+    // killFn seam with the leader pid.
+    expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(killer.calls).toEqual([
+      { pid: 101, signal: "SIGTERM" },
+      { pid: 101, signal: "SIGKILL" },
+    ]);
+    expect(outputs.some((l) => l.includes("escalating to SIGKILL"))).toBe(true);
+    expect(sup.get("vault")?.status).toBe("stopped");
+  });
+
+  test("stop awaits child exit before returning (no SIGKILL needed)", async () => {
+    // Well-behaved child: exits ~10ms after SIGTERM. stop() should
+    // return only after the exit promise resolves, not immediately
+    // post-SIGTERM. This is the log-flush guarantee that motivated
+    // the await in the first place (hub#263).
+    const proc = makeFakeProc(101);
+    proc.kill = (signal) => {
+      signals.push(signal);
+      // Simulate the child taking a few ms to flush + exit.
+      setTimeout(() => proc.resolveExit(0), 5);
+    };
+    const signals: (NodeJS.Signals | number | undefined)[] = [];
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(proc);
+    const killer = makeKillRecorder();
+    killer.register(proc);
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: killer.killFn,
+      restartDelayMs: 0,
+      sleep: () => Promise.resolve(),
+      killTimeoutMs: 1000, // Plenty of headroom for the 5ms simulated exit.
+    });
+    await sup.start({ short: "vault", cmd: ["bun", "vault.ts"] });
+
+    proc.closeStreams();
+    let exitObservedBeforeReturn = false;
+    void proc.exited.then(() => {
+      exitObservedBeforeReturn = true;
+    });
+    await sup.stop("vault");
+
+    // The exited-resolver awaited the same promise stop() did; if
+    // stop returned without awaiting, this flag could still be false.
+    // (Both promise chains fire from the same resolveExit call.
+    // Microtask ordering guarantees they both run before await returns.)
+    expect(exitObservedBeforeReturn).toBe(true);
+    expect(signals).toEqual(["SIGTERM"]);
+    expect(killer.calls).toEqual([{ pid: 101, signal: "SIGTERM" }]);
+    expect(sup.get("vault")?.status).toBe("stopped");
+  });
+});
+
+describe("Supervisor process-group reaping (hub#88 — EADDRINUSE-on-restart regression)", () => {
+  /** Grab a free loopback port by opening + immediately closing a server. */
+  async function freeEphemeralPort(): Promise<number> {
+    const probe = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("x") });
+    // `port` is `number | undefined` in Bun's types, but a live Bun.serve()
+    // always has a bound port — assert it so the test stays type-clean.
+    const port = probe.port as number;
+    probe.stop(true);
+    return port;
+  }
+
+  /** Connect-probe loopback:port — true if something is accepting. */
+  function portListening(port: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      const socket = new Socket();
+      let settled = false;
+      const done = (v: boolean) => {
+        if (settled) return;
+        settled = true;
+        socket.destroy();
+        resolve(v);
+      };
+      socket.setTimeout(500);
+      socket.once("connect", () => done(true));
+      socket.once("timeout", () => done(false));
+      socket.once("error", () => done(false));
+      socket.connect(port, "127.0.0.1");
+    });
+  }
+
+  /** Poll until `pred()` is true or the deadline passes. Returns the outcome. */
+  async function waitFor(pred: () => Promise<boolean>, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (await pred()) return true;
+      await tick(25);
+    }
+    return pred();
+  }
+
+  test("stop signals the whole process group, not just the leader (deterministic seam check)", async () => {
+    // The load-bearing contract: the supervisor hands `killFn` the child's
+    // LEADER pid, and production's `defaultKillGroup` translates that into a
+    // group send (`process.kill(-pid)`). A faithful stub records what `killFn`
+    // received; we assert the supervisor signalled with the leader pid so the
+    // group (wrapper + grandchildren) is reaped together. This is the
+    // deterministic counterpart to the real-process round-trip below.
+    const leader = makeFakeProc(4242);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(leader);
+    const killer = makeKillRecorder();
+    killer.register(leader);
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: killer.killFn,
+      restartDelayMs: 0,
+      sleep: () => Promise.resolve(),
+    });
+    await sup.start({ short: "wrapped", cmd: ["sh", "-c", "tsx server.ts"] });
+
+    const stopP = sup.stop("wrapped");
+    leader.closeStreams();
+    leader.resolveExit(0);
+    await stopP;
+
+    // killFn received the LEADER pid (4242) — production's defaultKillGroup
+    // turns this into `process.kill(-4242)`, reaping the wrapper's whole group
+    // incl. the tsx grandchild that would otherwise hold the port (hub#88).
+    expect(killer.calls).toEqual([{ pid: 4242, signal: "SIGTERM" }]);
+  });
+
+  test("defaultKillGroup sends to the negative (group) pid, falling back to bare pid on ESRCH", () => {
+    // Drive the real defaultKillGroup against a stubbed process.kill so we can
+    // assert the group-vs-bare-pid syscall shape without signalling anything.
+    const realKill = process.kill;
+    const calls: Array<{ pid: number; signal: string | number }> = [];
+    try {
+      // Case 1: group send succeeds → only the negative-pid call happens.
+      (process as { kill: typeof process.kill }).kill = ((
+        pid: number,
+        signal?: string | number,
+      ) => {
+        calls.push({ pid, signal: signal ?? 0 });
+        return true;
+      }) as typeof process.kill;
+      defaultKillGroup(555, "SIGTERM");
+      expect(calls).toEqual([{ pid: -555, signal: "SIGTERM" }]);
+
+      // Case 2: group send throws ESRCH (no group / pre-detached child) →
+      // fall back to a bare-pid send. Mirrors lifecycle.defaultKill.
+      calls.length = 0;
+      (process as { kill: typeof process.kill }).kill = ((
+        pid: number,
+        signal?: string | number,
+      ) => {
+        calls.push({ pid, signal: signal ?? 0 });
+        if (pid < 0) {
+          const err = new Error("no such process") as NodeJS.ErrnoException;
+          err.code = "ESRCH";
+          throw err;
+        }
+        return true;
+      }) as typeof process.kill;
+      defaultKillGroup(777, "SIGKILL");
+      expect(calls).toEqual([
+        { pid: -777, signal: "SIGKILL" },
+        { pid: 777, signal: "SIGKILL" },
+      ]);
+
+      // Case 3: a non-ESRCH error propagates (we never swallow EPERM etc.).
+      (process as { kill: typeof process.kill }).kill = (() => {
+        const err = new Error("operation not permitted") as NodeJS.ErrnoException;
+        err.code = "EPERM";
+        throw err;
+      }) as typeof process.kill;
+      expect(() => defaultKillGroup(888, "SIGTERM")).toThrow("operation not permitted");
+    } finally {
+      process.kill = realKill;
+    }
+  });
+
+  test("a wrapped startCmd's grandchild is reaped on restart → fresh spawn re-binds the same port (no EADDRINUSE)", async () => {
+    const port = await freeEphemeralPort();
+    // Wrapper (the leader the supervisor spawns) backgrounds a *grandchild*
+    // bun listener that holds the port, then `wait`s on it. Pre-hub#88, the
+    // supervisor killed only the leader (`sh`) — the bun grandchild kept the
+    // socket, so the restart's fresh spawn hit EADDRINUSE. With group-spawn
+    // (`detached: true`) + group-kill (`defaultKillGroup`), the whole group
+    // dies and the port frees.
+    const listener = [
+      "bun",
+      "-e",
+      `Bun.serve({ port: ${port}, hostname: "127.0.0.1", fetch: () => new Response("ok") }); setInterval(() => {}, 1e9);`,
+    ];
+    const wrapper = ["sh", "-c", `${listener.map((a) => `'${a}'`).join(" ")} & wait`];
+
+    // Real spawnFn + real defaultKillGroup (no seams) — this is the whole point.
+    const sup = new Supervisor({ restartDelayMs: 50 });
+    try {
+      await sup.start({ short: "wrapped", cmd: wrapper });
+
+      // Grandchild binds the port.
+      expect(await waitFor(() => portListening(port), 8000)).toBe(true);
+
+      // Restart: stop (group-kill reaps the grandchild) → wait for the port
+      // to FREE → fresh spawn re-binds it. If the grandchild leaked, the
+      // fresh listener would EADDRINUSE-crash and the port would either stay
+      // held by the orphan or flap — the round-trip below would fail.
+      const restarted = await sup.restart("wrapped");
+      expect(restarted?.status).toBe("running");
+
+      // The port answers again under the fresh spawn — proves no EADDRINUSE.
+      expect(await waitFor(() => portListening(port), 8000)).toBe(true);
+
+      // The discriminating signal: after a final stop, the port FREES. If the
+      // group-kill failed to reach the bun grandchild, an orphan would keep
+      // the socket and this would never go quiet.
+      await sup.stop("wrapped");
+      expect(await waitFor(async () => !(await portListening(port)), 8000)).toBe(true);
+    } finally {
+      await sup.stop("wrapped").catch(() => {});
+    }
+  }, 20_000);
+});
+
+describe("Supervisor.restart", () => {
+  test("stops the current process and spawns fresh", async () => {
+    const first = makeFakeProc(101);
+    const second = makeFakeProc(102);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(first);
+    spawner.enqueue(second);
+
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      restartDelayMs: 0,
+      sleep: () => Promise.resolve(),
+    });
+    await sup.start({ short: "vault", cmd: ["bun", "vault.ts"] });
+
+    // Kick off restart; we need to resolve the first proc's exited so
+    // the awaitable in restart() doesn't hang.
+    const restartPromise = sup.restart("vault");
+    first.closeStreams();
+    first.resolveExit(0);
+    const state = await restartPromise;
+
+    expect(state?.status).toBe("running");
+    expect(state?.pid).toBe(102);
+    expect(spawner.calls).toHaveLength(2);
+
+    second.closeStreams();
+    sup.stop("vault");
+    second.resolveExit(0);
+  });
+
+  test("replays entry.req when no nextReq is supplied", async () => {
+    const first = makeFakeProc(101);
+    const second = makeFakeProc(102);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(first);
+    spawner.enqueue(second);
+
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      restartDelayMs: 0,
+      sleep: () => Promise.resolve(),
+    });
+    await sup.start({
+      short: "vault",
+      cmd: ["bun", "vault.ts"],
+      env: { PARACHUTE_HUB_ORIGIN: "https://origin.example" },
+    });
+
+    const restartPromise = sup.restart("vault");
+    first.closeStreams();
+    first.resolveExit(0);
+    await restartPromise;
+
+    // No nextReq → the re-spawn replays the original env (legacy behavior).
+    expect(spawner.calls[1]?.env?.PARACHUTE_HUB_ORIGIN).toBe("https://origin.example");
+    expect(spawner.calls[1]?.cmd).toEqual(["bun", "vault.ts"]);
+
+    second.closeStreams();
+    sup.stop("vault");
+    second.resolveExit(0);
+  });
+
+  test("nextReq re-spawns with the refreshed req AND propagates to crash-restart (hub#532)", async () => {
+    const first = makeFakeProc(101);
+    const second = makeFakeProc(102); // restart re-spawn
+    const third = makeFakeProc(103); // crash-restart respawn
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(first);
+    spawner.enqueue(second);
+    spawner.enqueue(third);
+
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      restartDelayMs: 0,
+      sleep: () => Promise.resolve(),
+    });
+    // First start with the OLD origin.
+    await sup.start({
+      short: "vault",
+      cmd: ["bun", "vault.ts"],
+      env: { PARACHUTE_HUB_ORIGIN: "https://old.example" },
+    });
+
+    // Restart WITH a refreshed req carrying the NEW origin.
+    const restartPromise = sup.restart("vault", {
+      short: "vault",
+      cmd: ["bun", "vault.ts"],
+      env: { PARACHUTE_HUB_ORIGIN: "https://new.example" },
+    });
+    first.closeStreams();
+    first.resolveExit(0);
+    await restartPromise;
+
+    // The restart re-spawn carries the NEW origin.
+    expect(spawner.calls[1]?.env?.PARACHUTE_HUB_ORIGIN).toBe("https://new.example");
+
+    // Now crash the restart-spawned child (resolveExit with a non-stop code).
+    // handleExit → spawnAndWatch replays entry.req, which `start` stored from
+    // the refreshed nextReq — so the crash-restart ALSO carries the new origin.
+    second.closeStreams();
+    second.resolveExit(1);
+    await tick(20);
+
+    expect(spawner.calls).toHaveLength(3);
+    expect(spawner.calls[2]?.env?.PARACHUTE_HUB_ORIGIN).toBe("https://new.example");
+
+    third.closeStreams();
+    sup.stop("vault");
+    third.resolveExit(0);
+  });
+
+  test("throws when nextReq.short mismatches the restarted short (state-corruption guard)", async () => {
+    const proc = makeFakeProc(101);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(proc);
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      restartDelayMs: 0,
+      sleep: () => Promise.resolve(),
+    });
+    await sup.start({ short: "vault", cmd: ["bun", "vault.ts"] });
+
+    // A nextReq for a DIFFERENT short would re-register under the wrong map key.
+    await expect(
+      sup.restart("vault", { short: "scribe", cmd: ["bun", "scribe.ts"] }),
+    ).rejects.toThrow(/nextReq\.short is "scribe"/);
+    // The original entry is untouched — no spurious stop/respawn happened.
+    expect(spawner.calls).toHaveLength(1);
+
+    proc.closeStreams();
+    sup.stop("vault");
+    proc.resolveExit(0);
+  });
+});
+
+describe("Supervisor output multiplexing", () => {
+  test("prefixes child stdout lines with [short]", async () => {
+    const proc = makeFakeProc(101);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(proc);
+    const outputs: string[] = [];
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      output: (line) => outputs.push(line),
+    });
+    await sup.start({ short: "vault", cmd: ["bun", "vault.ts"] });
+
+    proc.emitStdout("listening on 1940\n");
+    proc.emitStdout("ready\n");
+    // Allow the async stream reader to flush.
+    await tick(20);
+
+    expect(outputs).toContain("[vault] listening on 1940\n");
+    expect(outputs).toContain("[vault] ready\n");
+
+    proc.closeStreams();
+    sup.stop("vault");
+    proc.resolveExit(0);
+  });
+
+  test("line-buffers split chunks so partial lines don't break the prefix", async () => {
+    const proc = makeFakeProc(101);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(proc);
+    const outputs: string[] = [];
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      output: (line) => outputs.push(line),
+    });
+    await sup.start({ short: "scribe", cmd: ["bun", "scribe.ts"] });
+
+    // Single line arriving in two chunks should still be one prefixed
+    // line — not "[scribe] listening" + "[scribe]  on 3200\n".
+    proc.emitStdout("listening");
+    await tick(10);
+    proc.emitStdout(" on 3200\n");
+    await tick(20);
+
+    expect(outputs).toContain("[scribe] listening on 3200\n");
+
+    proc.closeStreams();
+    sup.stop("scribe");
+    proc.resolveExit(0);
+  });
+
+  test("multiple children interleave without prefix collisions", async () => {
+    const vault = makeFakeProc(101);
+    const scribe = makeFakeProc(102);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(vault);
+    spawner.enqueue(scribe);
+    const outputs: string[] = [];
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      output: (line) => outputs.push(line),
+    });
+    await sup.start({ short: "vault", cmd: ["bun", "vault.ts"] });
+    await sup.start({ short: "scribe", cmd: ["bun", "scribe.ts"] });
+
+    vault.emitStdout("vault-line-1\n");
+    scribe.emitStdout("scribe-line-1\n");
+    vault.emitStderr("vault-err\n");
+    await tick(20);
+
+    expect(outputs).toContain("[vault] vault-line-1\n");
+    expect(outputs).toContain("[scribe] scribe-line-1\n");
+    expect(outputs).toContain("[vault] vault-err\n");
+
+    vault.closeStreams();
+    scribe.closeStreams();
+    sup.stop("vault");
+    sup.stop("scribe");
+    vault.resolveExit(0);
+    scribe.resolveExit(0);
+  });
+});
+
+describe("Supervisor per-module log ring buffer (§6.5)", () => {
+  test("replays output emitted BEFORE the reader connects (boot/crash-line capture)", async () => {
+    const proc = makeFakeProc(101);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(proc);
+    const sup = new Supervisor({ spawnFn: spawner.spawn, killFn: noopKill });
+    await sup.start({ short: "vault", cmd: ["bun", "vault.ts"] });
+
+    // Lines arrive (incl. a "crash cause") BEFORE anyone taps the logs.
+    proc.emitStdout("booting vault\n");
+    proc.emitStderr("FATAL: port already in use\n");
+    await tick(20);
+
+    // Reader connects AFTER the fact — the buffer must still have them.
+    const logs = sup.logs("vault");
+    expect(logs).toEqual(["[vault] booting vault\n", "[vault] FATAL: port already in use\n"]);
+
+    proc.closeStreams();
+    sup.stop("vault");
+    proc.resolveExit(0);
+  });
+
+  test("buffer is bounded — oldest lines drop once the byte cap is exceeded", async () => {
+    const proc = makeFakeProc(101);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(proc);
+    // Tiny cap so a handful of lines overflows it. Each prefixed line below is
+    // well over a few bytes, so the cap evicts oldest-first.
+    const sup = new Supervisor({ spawnFn: spawner.spawn, killFn: noopKill, logBufferBytes: 40 });
+    await sup.start({ short: "vault", cmd: ["bun", "vault.ts"] });
+
+    proc.emitStdout("line-1\n");
+    proc.emitStdout("line-2\n");
+    proc.emitStdout("line-3\n");
+    proc.emitStdout("line-4\n");
+    await tick(20);
+
+    const logs = sup.logs("vault") ?? [];
+    // The oldest line(s) were evicted; the newest survives.
+    expect(logs.at(-1)).toBe("[vault] line-4\n");
+    expect(logs).not.toContain("[vault] line-1\n");
+    // Total buffered bytes stay at/under the cap (modulo the always-kept tail).
+    const totalBytes = logs.reduce((n, l) => n + Buffer.byteLength(l), 0);
+    expect(totalBytes).toBeLessThanOrEqual(40);
+
+    proc.closeStreams();
+    sup.stop("vault");
+    proc.resolveExit(0);
+  });
+
+  test("logs() returns undefined for a not-supervised module (404 contract)", () => {
+    const sup = new Supervisor({ spawnFn: () => makeFakeProc(0), killFn: noopKill });
+    expect(sup.logs("nope")).toBeUndefined();
+  });
+
+  test("buffer survives a crash-respawn so the crash cause stays replayable", async () => {
+    const first = makeFakeProc(101);
+    const second = makeFakeProc(102);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(first);
+    spawner.enqueue(second);
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      restartDelayMs: 0,
+      sleep: () => Promise.resolve(),
+    });
+    await sup.start({ short: "vault", cmd: ["bun", "vault.ts"] });
+
+    first.emitStderr("crash cause: boom\n");
+    await tick(20);
+    // Crash → supervisor respawns within budget (reuses the same entry/buffer).
+    first.closeStreams();
+    first.resolveExit(1);
+    await tick();
+
+    second.emitStdout("recovered\n");
+    await tick(20);
+
+    const logs = sup.logs("vault") ?? [];
+    // Both the pre-crash cause and the post-respawn line are present.
+    expect(logs).toContain("[vault] crash cause: boom\n");
+    expect(logs).toContain("[vault] recovered\n");
+
+    second.closeStreams();
+    sup.stop("vault");
+    second.resolveExit(0);
+  });
+});
+
+describe("Supervisor port-readiness + structured start-error (§6.5)", () => {
+  const reqWithPort = (short: string, port: number): SpawnRequest => ({
+    short,
+    cmd: ["parachute-vault", "serve"],
+    env: { PORT: String(port) },
+  });
+
+  test("(a) module that never binds its port → started-but-unbound start-error, status stays running", async () => {
+    const proc = makeFakeProc(101);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(proc);
+    // portListening always false → the readiness gate times out. Short window +
+    // instant sleep so the test doesn't actually wait.
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      portListening: async () => false,
+      startReadyMs: 50,
+      startReadyPollMs: 5,
+      sleep: () => Promise.resolve(),
+    });
+    const state = await sup.start(reqWithPort("vault", 1940));
+
+    // Process IS up (we don't break the running enum — proxy-state/SPA read it)...
+    expect(state.status).toBe("running");
+    // ...but the structured start-error explains it's not actually listening.
+    expect(state.startError?.error_type).toBe("started_but_unbound");
+    expect(state.startError?.error_description).toContain("1940");
+    expect(state.startError?.at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+
+    proc.closeStreams();
+    sup.stop("vault");
+    proc.resolveExit(0);
+  });
+
+  test("(b) module that binds promptly → no start-error, clean running", async () => {
+    const proc = makeFakeProc(102);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(proc);
+    let probes = 0;
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      // First probe says "not yet", second says "bound" — exercises the poll
+      // loop rather than an instant hit.
+      portListening: async () => ++probes >= 2,
+      startReadyMs: 1000,
+      startReadyPollMs: 5,
+      sleep: () => Promise.resolve(),
+    });
+    const state = await sup.start(reqWithPort("vault", 1940));
+
+    expect(state.status).toBe("running");
+    expect(state.startError).toBeUndefined();
+    expect(probes).toBeGreaterThanOrEqual(2);
+
+    proc.closeStreams();
+    sup.stop("vault");
+    proc.resolveExit(0);
+  });
+
+  test("(b2) late bind AFTER the window → the background watch clears the started-but-unbound note", async () => {
+    // Heavy modules (vault — SQLite + git mirror + well-known init) routinely
+    // bind a moment after the readiness window. Pre-fix, the note recorded at
+    // window-elapse stuck for the module's whole lifetime and `parachute
+    // status` showed a perpetual "failed to start" on a healthy module.
+    const proc = makeFakeProc(103);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(proc);
+    let bound = false;
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      portListening: async () => bound,
+      startReadyMs: 30,
+      startReadyPollMs: 5,
+      lateBindWatchMs: 2_000,
+      lateBindPollMs: 5,
+      sleep: () => Promise.resolve(),
+    });
+    const state = await sup.start(reqWithPort("vault", 1940));
+    // Window elapsed unbound → note recorded (status stays running)…
+    expect(state.startError?.error_type).toBe("started_but_unbound");
+
+    // …then the port binds late. The watch must clear the note.
+    bound = true;
+    let cleared = false;
+    const deadline = Date.now() + 1_500;
+    while (Date.now() < deadline) {
+      if (sup.list()[0]?.startError === undefined) {
+        cleared = true;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(cleared).toBe(true);
+    expect(sup.list()[0]?.status).toBe("running");
+
+    proc.closeStreams();
+    sup.stop("vault");
+    proc.resolveExit(0);
+  });
+
+  test("(b3) never binds → the watch gives up at its deadline and the note persists", async () => {
+    // A genuinely-unbound module must KEEP its diagnostic — the watch is a
+    // bounded grace window, not an eraser.
+    const proc = makeFakeProc(104);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(proc);
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      portListening: async () => false,
+      startReadyMs: 20,
+      startReadyPollMs: 5,
+      lateBindWatchMs: 40,
+      lateBindPollMs: 5,
+      sleep: () => Promise.resolve(),
+    });
+    const state = await sup.start(reqWithPort("vault", 1940));
+    expect(state.startError?.error_type).toBe("started_but_unbound");
+
+    // Let the 40ms watch budget expire; the note must remain.
+    await new Promise((r) => setTimeout(r, 120));
+    expect(sup.list()[0]?.startError?.error_type).toBe("started_but_unbound");
+
+    proc.closeStreams();
+    sup.stop("vault");
+    proc.resolveExit(0);
+  });
+
+  test("(c) preflight MissingDependencyError → structured start-error, NO spawn", async () => {
+    const spawner = makeQueueSpawner();
+    // No proc enqueued — if start() tried to spawn, the queue spawner throws.
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      which: () => null, // binary not resolvable → preflight throws
+      portListening: async () => true,
+      startReadyMs: 50,
+      sleep: () => Promise.resolve(),
+    });
+    const state = await sup.start(reqWithPort("vault", 1940));
+
+    // Doomed spawn aborted: status crashed, structured missing-dependency error.
+    expect(state.status).toBe("crashed");
+    expect(state.startError?.error_type).toBe("missing_dependency");
+    expect(state.startError?.binary).toBe("parachute-vault");
+    // Crucially, the supervisor never called the spawner.
+    expect(spawner.calls).toHaveLength(0);
+  });
+
+  test("(#634) preflight non-executable binary → non_executable start-error, NO spawn", async () => {
+    const spawner = makeQueueSpawner();
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      // `which` requires X_OK so it returns null for a 100644 bin...
+      which: () => null,
+      // ...but the secondary probe finds it present-but-non-executable.
+      findNonExecutable: () => "/x/vault/bin/parachute-vault",
+      portListening: async () => true,
+      startReadyMs: 50,
+      sleep: () => Promise.resolve(),
+    });
+    const state = await sup.start(reqWithPort("vault", 1940));
+
+    expect(state.status).toBe("crashed");
+    expect(state.startError?.error_type).toBe("non_executable");
+    expect(state.startError?.error_description).toContain(
+      "but is not executable — run chmod +x /x/vault/bin/parachute-vault",
+    );
+    // No misleading "not installed" install card, and never spawned.
+    expect(state.startError?.binary).toBe("parachute-vault");
+    expect(spawner.calls).toHaveLength(0);
+  });
+
+  test("a clean re-start clears a prior started-but-unbound start-error", async () => {
+    const first = makeFakeProc(201);
+    const second = makeFakeProc(202);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(first);
+    spawner.enqueue(second);
+    let bound = false;
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      portListening: async () => bound,
+      startReadyMs: 30,
+      startReadyPollMs: 5,
+      sleep: () => Promise.resolve(),
+    });
+
+    // First start never binds → start-error recorded.
+    const s1 = await sup.start(reqWithPort("vault", 1940));
+    expect(s1.startError?.error_type).toBe("started_but_unbound");
+
+    // Restart with the port now binding → the stale error clears.
+    bound = true;
+    const restartP = sup.restart("vault");
+    first.closeStreams();
+    first.resolveExit(0);
+    const s2 = await restartP;
+    expect(s2?.status).toBe("running");
+    expect(s2?.startError).toBeUndefined();
+
+    second.closeStreams();
+    sup.stop("vault");
+    second.resolveExit(0);
+  });
+
+  test("readiness gate is skipped when the request carries no PORT", async () => {
+    const proc = makeFakeProc(101);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(proc);
+    let probed = false;
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      portListening: async () => {
+        probed = true;
+        return false;
+      },
+      startReadyMs: 1000,
+      sleep: () => Promise.resolve(),
+    });
+    // No env.PORT → nothing to probe; start returns running, no error, no probe.
+    const state = await sup.start({ short: "cli-only", cmd: ["parachute-vault", "serve"] });
+    expect(state.status).toBe("running");
+    expect(state.startError).toBeUndefined();
+    expect(probed).toBe(false);
+
+    proc.closeStreams();
+    sup.stop("cli-only");
+    proc.resolveExit(0);
+  });
+});
+
+describe("Supervisor.list + get", () => {
+  test("list returns snapshot of all supervised modules", async () => {
+    const vault = makeFakeProc(101);
+    const scribe = makeFakeProc(102);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(vault);
+    spawner.enqueue(scribe);
+    const sup = new Supervisor({ spawnFn: spawner.spawn, killFn: noopKill });
+
+    await sup.start({ short: "vault", cmd: ["bun", "vault.ts"] });
+    await sup.start({ short: "scribe", cmd: ["bun", "scribe.ts"] });
+
+    const states = sup.list();
+    expect(states).toHaveLength(2);
+    const shorts = states.map((s) => s.short).sort();
+    expect(shorts).toEqual(["scribe", "vault"]);
+
+    vault.closeStreams();
+    scribe.closeStreams();
+    sup.stop("vault");
+    sup.stop("scribe");
+    vault.resolveExit(0);
+    scribe.resolveExit(0);
+  });
+
+  test("get returns undefined for an unknown module", () => {
+    const sup = new Supervisor({ spawnFn: () => makeFakeProc(0) });
+    expect(sup.get("nothing")).toBeUndefined();
+  });
+});

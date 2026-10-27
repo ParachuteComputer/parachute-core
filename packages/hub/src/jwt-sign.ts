@@ -1,0 +1,902 @@
+/**
+ * JWT issuance + verification for hub-issued access tokens, plus opaque
+ * refresh-token minting that records hashes in the `tokens` table.
+ *
+ * Three pieces, deliberately separable:
+ *   - `signAccessToken(db, opts)` — pure JWT signing. Looks up the active
+ *     signing key from `signing_keys`, signs an RS256 JWT, returns the
+ *     compact serialization plus jti + computed expiry. Does NOT write to
+ *     `tokens` — the caller chooses whether to persist (PR (c) will).
+ *   - `signRefreshToken(db, opts)` — generates an opaque hex token,
+ *     SHA-256-hashes it, and inserts a `tokens` row. Returns the plaintext
+ *     to hand to the client; the hash is what we'll compare on refresh.
+ *   - `validateAccessToken(db, token)` — verifies the JWT signature against
+ *     active + recently-retired keys (whatever's currently in JWKS), checks
+ *     expiry. Read-only.
+ *
+ * Sliding refresh: PR (c) will rotate the row on a successful refresh; this
+ * PR just sets up the storage shape. 30-day expiry is the *initial* TTL.
+ */
+import type { Database } from "bun:sqlite";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import {
+  type JWTPayload,
+  SignJWT,
+  decodeProtectedHeader,
+  importPKCS8,
+  importSPKI,
+  jwtVerify,
+} from "jose";
+import { attributionPubkey } from "./pubkey-links.ts";
+import { renameVaultScopes, vaultScopeName } from "./scope-explanations.ts";
+import { getActiveSigningKey, getAllPublicKeys } from "./signing-keys.ts";
+import { vaultRenameReservedUntil } from "./vault-rename-guard.ts";
+
+export const ACCESS_TOKEN_TTL_SECONDS = 15 * 60;
+export const REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+/**
+ * One-generation rotation grace window (hub#685). When a presented refresh
+ * token has already been rotated (revoked), a refresh of the *immediately-
+ * previous* token within this window is treated as a benign concurrent /
+ * retried refresh (multi-tab SPA, bfcache/stale-tab resume, a network retry)
+ * rather than theft — it converges the client on the live tip instead of
+ * revoking the whole family. The window is deliberately short: it tolerates
+ * the brief overlap of a real client racing itself, NOT a delayed replay.
+ * Genuine theft (an OLDER ancestor, or ANY replay past the window) still
+ * revokes the family per RFC 6819 §5.2.2.3. See `handleTokenRefresh`.
+ */
+export const REFRESH_GRACE_MS = 30_000;
+export const SIGNING_ALGORITHM = "RS256";
+
+export interface SignAccessTokenOpts {
+  /** Subject — the user id. */
+  sub: string;
+  scopes: string[];
+  /** Module short name (vault, notes, …) or "hub" — sets `aud`. */
+  audience: string;
+  clientId: string;
+  /**
+   * Hub origin — sets the `iss` claim. Required: every consumer (vault,
+   * scribe, agent) validates `iss`, and a missing claim is rejected. Callers
+   * derive this via `deriveHubOrigin()` or thread it from `OAuthDeps.issuer`
+   * (the per-request origin from `resolveIssuer`).
+   *
+   * Multi-origin iss-set (onboarding-streamline 2026-06-25): consumers no
+   * longer pin `iss` to a SINGLE `PARACHUTE_HUB_ORIGIN`. The hub publishes the
+   * SET of origins it legitimately answers on via `PARACHUTE_HUB_ORIGINS`
+   * (`buildHubBoundOrigins` — issuer ∪ loopback ∪ expose-state ∪ platform),
+   * and a scope-guard ≥0.5.0 consumer accepts `iss` ∈ that set. So a token
+   * minted here with one URL of a multi-URL box validates when the resource is
+   * reached via another URL of the SAME box. Mint stays per-request as-is: the
+   * canonical configured origin (the intended Caddy/zero-SSH deploy) is minted
+   * on every request AND is a member of the published set, so mint and validate
+   * already align — no clamp needed here.
+   */
+  issuer: string;
+  /**
+   * Per-user vault pin — the multi-user Phase 1 (design
+   * [`2026-05-20-multi-user-phase-1.md`](https://parachute.computer/design/2026-05-20-multi-user-phase-1/))
+   * vault_scope claim. Non-empty for non-admin users (a single-element list
+   * naming their `assigned_vault`); empty `[]` for admin users (the "no
+   * per-user vault restriction" sentinel — admins can request any vault on
+   * the hub via the consent picker). Always emitted as a claim — defaults
+   * to `[]` when callers omit — so a downstream consumer (PR 5's
+   * scope-guard at vault / notes / scribe) can unambiguously read it
+   * without distinguishing "absent" from "empty." Phase 1 always has
+   * length ≤1; the list shape carries Phase 2 multi-vault forward without
+   * a wire-shape change.
+   */
+  vaultScope?: string[];
+  /** Override the jti (defaults to random base64url(16)). Used by tests. */
+  jti?: string;
+  /**
+   * Override the default 15-minute access-token TTL. Long-lived tokens
+   * (operator-token, ~90d) pass an explicit value here.
+   */
+  ttlSeconds?: number;
+  now?: () => Date;
+  /**
+   * Extra JWT claims merged into the payload. Used by operator-token to embed
+   * `pa_scope_set` (which scope-set the token was minted under) so an
+   * auto-rotation can preserve the operator's chosen narrowing across mints.
+   * Reserved claims (`scope`, `client_id`, `sub`, `iss`, `iat`, `exp`, `aud`,
+   * `jti`, `vault_scope`) are owned by this function and overwritten if
+   * passed here.
+   */
+  extraClaims?: Record<string, unknown>;
+}
+
+export interface SignedAccessToken {
+  token: string;
+  jti: string;
+  expiresAt: string;
+}
+
+export async function signAccessToken(
+  db: Database,
+  opts: SignAccessTokenOpts,
+): Promise<SignedAccessToken> {
+  const key = getActiveSigningKey(db);
+  const priv = await importPKCS8(key.privateKeyPem, SIGNING_ALGORITHM);
+  const jti = opts.jti ?? randomBytes(16).toString("base64url");
+  const nowMs = (opts.now?.() ?? new Date()).getTime();
+  const iat = Math.floor(nowMs / 1000);
+  const exp = iat + (opts.ttlSeconds ?? ACCESS_TOKEN_TTL_SECONDS);
+  const token = await new SignJWT({
+    ...(opts.extraClaims ?? {}),
+    scope: opts.scopes.join(" "),
+    client_id: opts.clientId,
+    vault_scope: opts.vaultScope ?? [],
+  })
+    .setProtectedHeader({ alg: SIGNING_ALGORITHM, kid: key.kid })
+    .setSubject(opts.sub)
+    .setIssuer(opts.issuer)
+    .setIssuedAt(iat)
+    .setExpirationTime(exp)
+    .setAudience(opts.audience)
+    .setJti(jti)
+    .sign(priv);
+  assertVaultNamesAvailable(db, opts.scopes, opts.now?.() ?? new Date());
+  return { token, jti, expiresAt: new Date(exp * 1000).toISOString() };
+}
+
+export interface SignRefreshTokenOpts {
+  /** Shared with the access token's jti — keys the `tokens` row. */
+  jti: string;
+  userId: string;
+  clientId: string;
+  scopes: string[];
+  /**
+   * Shared identifier across a chain of rotated refresh tokens. Initial
+   * issuance (auth-code grant) omits this — a fresh family is minted.
+   * Rotation (refresh_token grant) passes the prior row's family_id so
+   * replay detection can revoke every descendant in one query (#73).
+   */
+  familyId?: string;
+  now?: () => Date;
+}
+
+/**
+ * Provenance of a `tokens` row — which mint path wrote it. Drives the
+ * unified token registry semantics introduced in v6 (hub#212 Phase 1):
+ * one table for refresh tokens, one for CLI-minted access tokens, one
+ * for operator tokens. Different mint paths = different rows; revocation
+ * lookup + revocation list are uniform across all of them.
+ *
+ * `connection_provision` — long-lived tokens the Connections engine mints
+ * when provisioning a connection (the webhook bearer + the channel reply
+ * token). Registered so connection teardown can revoke them
+ * (hub-module-boundary charter, registered-mint rule).
+ *
+ * `connection_credential` — standing tag-scoped vault credentials minted by
+ * a `kind: "credential"` connection (H4, surface-runtime design). Registered
+ * for the same reason; renewal revokes the prior jti and registers the new
+ * one, so exactly one live row exists per credential connection.
+ */
+export type TokenCreatedVia =
+  | "oauth_refresh"
+  | "cli_mint"
+  | "operator_mint"
+  | "connection_provision"
+  | "connection_credential"
+  // Agent-connector grants (Phase 4b-1) — a vault token the hub mints when the
+  // operator approves an agent's `vault:<name>:<verb>` connection grant. Stored
+  // in the agent-grants store; registered here so revoke can drop it.
+  | "agent_grant"
+  // Surface DEPLOY tokens (Surface Git Transport Phase 3a) — a long-lived,
+  // scoped, revocable `surface:<name>:<read|write>` token an operator mints for
+  // an EXTERNAL/remote git client (a `claude -p` agent or any box) to push/pull
+  // a surface's hub-hosted repo. The PAT-equivalent: distinct from `agent_grant`
+  // (in-framework, approval-gated, per-turn-injected) and `cli_mint` (generic),
+  // so `parachute surface token list` can show exactly these. Registered here so
+  // `surface token revoke` (and the revocation list) can drop it.
+  | "surface_token"
+  // Create-time vault handoff (hub#846 + hub#848) — the bounded
+  // `vault:<name>:{admin|read,write}` credential a create door hands its
+  // caller in the 201, on BOTH doors: host-admin `POST /vaults`
+  // (`admin-vaults.ts`) and account `POST /account/vaults`
+  // (`account-api.ts`). Distinct from `cli_mint` on purpose: these rows are
+  // hub-SIGNED at the moment of provisioning, not minted through the CLI /
+  // `POST /api/auth/mint-token` path, and hub#846's review flagged that
+  // labelling them `cli_mint` misattributes them in registry forensics —
+  // exactly backwards, since the whole point of both fixes is that the CLI
+  // bootstrap token never leaves the hub.
+  | "vault_create_handoff";
+
+export interface SignedRefreshToken {
+  /** Opaque token to return to the client. NOT recoverable from the DB. */
+  token: string;
+  /** SHA-256 hex digest of `token`, stored in `tokens.refresh_token_hash`. */
+  refreshTokenHash: string;
+  /** Family identifier (new UUID for initial issuance, inherited on rotation). */
+  familyId: string;
+  expiresAt: string;
+}
+
+/**
+ * Thrown when the `tokens` row INSERT fails — most plausibly a UNIQUE jti
+ * collision caused by a concurrent rotation racing on the same prior refresh
+ * token. Callers in the OAuth grant path catch this and surface a clean
+ * `invalid_grant` 400 instead of letting the SQLite error bubble as a 500
+ * (#108).
+ */
+export class RefreshTokenInsertError extends Error {
+  override name = "RefreshTokenInsertError";
+  override cause: unknown;
+  constructor(message: string, cause: unknown) {
+    super(message);
+    this.cause = cause;
+  }
+}
+
+/**
+ * Person-mint CAS miss (hub#833): `INSERT ... SELECT ... FROM users WHERE id = ?`
+ * matched zero rows, so the target account was deleted (or password-reset,
+ * when `userUpdatedAt` is pinned) during the crypto await. The mint handler
+ * must NOT return the signed JWT — a signed-but-unregistered token leaks
+ * because `validateAccessToken` still treats a missing registry row as valid.
+ */
+export class TokenMintPrincipalGoneError extends Error {
+  override name = "TokenMintPrincipalGoneError";
+}
+
+export function signRefreshToken(db: Database, opts: SignRefreshTokenOpts): SignedRefreshToken {
+  assertVaultNamesAvailable(db, opts.scopes, opts.now?.() ?? new Date());
+  const token = randomBytes(32).toString("base64url");
+  const refreshTokenHash = createHash("sha256").update(token).digest("hex");
+  const now = opts.now?.() ?? new Date();
+  const expiresAt = new Date(now.getTime() + REFRESH_TOKEN_TTL_MS).toISOString();
+  const familyId = opts.familyId ?? randomUUID();
+  // Phase-1b attribution snapshot (hub#833). Additive: NULL when the user has
+  // no linked key, which is every user until they run the linkage ceremony.
+  // Resolved at INSERT time so the row records what was true when the
+  // credential was minted; a later unlink does not rewrite it.
+  const subjectPubkey = attributionPubkey(db, { userId: opts.userId });
+  try {
+    db.prepare(
+      `INSERT INTO tokens (jti, user_id, client_id, scopes, refresh_token_hash, family_id, expires_at, created_at, created_via, subject_pubkey)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'oauth_refresh', ?)`,
+    ).run(
+      opts.jti,
+      opts.userId,
+      opts.clientId,
+      opts.scopes.join(" "),
+      refreshTokenHash,
+      familyId,
+      expiresAt,
+      now.toISOString(),
+      subjectPubkey,
+    );
+  } catch (err) {
+    throw new RefreshTokenInsertError(
+      `failed to insert refresh token row: ${err instanceof Error ? err.message : String(err)}`,
+      err,
+    );
+  }
+  return { token, refreshTokenHash, familyId, expiresAt };
+}
+
+export interface RecordTokenMintOpts {
+  /** Same as the issued JWT's jti — keys the row. */
+  jti: string;
+  /** Provenance tag — drives admin UI grouping and the registry semantics. */
+  createdVia: Exclude<TokenCreatedVia, "oauth_refresh">;
+  /** Subject identity for non-user mints. Operator-mint rows pass "operator"; service-mint rows pass the service short name. */
+  subject: string;
+  /** Optional user_id when the mint was performed against a hub user (the mint-token CLI flow defaults to the operator's user). NULL for purely service-tied mints. */
+  userId?: string;
+  clientId: string;
+  scopes: string[];
+  /** ISO-8601 expiry. Same value as the JWT's `exp`. */
+  expiresAt: string;
+  /** Optional JSON-encoded permissions claim (per auth-architecture-shape.md §11.3). */
+  permissions?: string;
+  /**
+   * Phase-1b attribution snapshot (hub#833) — the Nostr pubkey to stamp on
+   * the registry row alongside the existing `sub`/`subject`.
+   *
+   * **Omit it.** Left `undefined`, the row is stamped automatically by
+   * resolving the mint's principal (`userId`, else `subject`) through
+   * `user_pubkeys`, so every mint path picks attribution up with no call-site
+   * churn and no chance of one path forgetting. Pass `null` to opt a specific
+   * mint OUT of the snapshot; pass a string only if you have already resolved
+   * it and want to avoid the lookup.
+   *
+   * This never affects the token itself — no claim, no scope, no authority.
+   * It is a column on the audit row.
+   */
+  subjectPubkey?: string | null;
+  now?: () => Date;
+  /**
+   * Person-mint CAS pin (hub#833). When set with `userId`, the insert is
+   * `INSERT ... SELECT ... FROM users WHERE id = ? AND updated_at = ?`.
+   * Zero rows — account deleted, or `resetUserPassword` racing the crypto
+   * await (it bumps `updated_at`) — throws `TokenMintPrincipalGoneError`.
+   * Omit on service mints (`userId` unset) and on callers that only need
+   * the existence check.
+   */
+  userUpdatedAt?: string;
+}
+
+/**
+ * Write a `tokens` row for a non-OAuth-refresh mint. The OAuth refresh
+ * path goes through `signRefreshToken` (which already inserts); this path
+ * is for CLI mint-token, the new POST /api/auth/mint-token endpoint, and
+ * operator-token mints (rotate-operator + the auto-rotation helper from
+ * #213).
+ *
+ * Every issued JWT must have a row in this table going forward — that's
+ * the contract the revocation list endpoint depends on. Pre-Phase-1
+ * tokens (already issued before this migration) are unregistered but
+ * harmless: they expire on their own (15-min access tokens drained
+ * within the hour; 365d operator tokens cap at their original expiry,
+ * with the new 90d auto-rotation taking over once an operator runs the
+ * CLI again).
+ */
+export function recordTokenMint(db: Database, opts: RecordTokenMintOpts): void {
+  const now = opts.now?.() ?? new Date();
+  // Phase-1b attribution snapshot (hub#833). `undefined` → resolve from the
+  // mint's principal; `null` → explicit opt-out. See `subjectPubkey`'s doc.
+  const subjectPubkey =
+    opts.subjectPubkey !== undefined
+      ? opts.subjectPubkey
+      : attributionPubkey(db, { userId: opts.userId, subject: opts.subject });
+  const createdAt = now.toISOString();
+  const scopes = opts.scopes.join(" ");
+  try {
+    if (opts.userId) {
+      // Person-mint CAS (hub#833): the user row must still exist at INSERT.
+      // Pin `updated_at` when the caller snapshotted it before `signAccessToken`
+      // so a password-reset racing the crypto await also misses.
+      const pinUpdatedAt = opts.userUpdatedAt !== undefined;
+      const sql = pinUpdatedAt
+        ? `INSERT INTO tokens (
+             jti, user_id, client_id, scopes, expires_at, created_at,
+             permissions, created_via, subject, subject_pubkey
+           )
+           SELECT ?, u.id, ?, ?, ?, ?, ?, ?, ?, ?
+           FROM users u WHERE u.id = ? AND u.updated_at = ?`
+        : `INSERT INTO tokens (
+             jti, user_id, client_id, scopes, expires_at, created_at,
+             permissions, created_via, subject, subject_pubkey
+           )
+           SELECT ?, u.id, ?, ?, ?, ?, ?, ?, ?, ?
+           FROM users u WHERE u.id = ?`;
+      const args: (string | null)[] = [
+        opts.jti,
+        opts.clientId,
+        scopes,
+        opts.expiresAt,
+        createdAt,
+        opts.permissions ?? null,
+        opts.createdVia,
+        opts.subject,
+        subjectPubkey,
+        opts.userId,
+      ];
+      if (pinUpdatedAt) args.push(opts.userUpdatedAt ?? null);
+      const result = db.prepare(sql).run(...args);
+      if (Number(result.changes) === 0) {
+        throw new TokenMintPrincipalGoneError(
+          `account ${opts.userId} no longer exists (or was reset) at mint insert; refusing to register jti=${opts.jti}`,
+        );
+      }
+      return;
+    }
+    db.prepare(
+      `INSERT INTO tokens (
+        jti, user_id, client_id, scopes, expires_at, created_at,
+        permissions, created_via, subject, subject_pubkey
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      opts.jti,
+      null,
+      opts.clientId,
+      scopes,
+      opts.expiresAt,
+      createdAt,
+      opts.permissions ?? null,
+      opts.createdVia,
+      opts.subject,
+      subjectPubkey,
+    );
+  } catch (err) {
+    if (err instanceof TokenMintPrincipalGoneError) throw err;
+    throw new RefreshTokenInsertError(
+      `failed to insert token registry row (jti=${opts.jti}, created_via=${opts.createdVia}): ${err instanceof Error ? err.message : String(err)}`,
+      err,
+    );
+  }
+}
+
+/** Surface a revoke arrived over. Stored verbatim in `tokens.revoked_via`. */
+export type RevokedVia = "cli" | "http";
+
+/**
+ * Who asked for a revoke, and over which surface (hub#931). Optional
+ * everywhere: an internal sweep (`revokeTokensNamingVault`, refresh-token
+ * rotation) names no actor and leaves both columns NULL rather than
+ * inventing one.
+ */
+export interface RevokeActor {
+  /** HTTP: the bearer's `sub`. CLI: `cli:<unix user>`. */
+  by: string;
+  via: RevokedVia;
+}
+
+/**
+ * Mark a `tokens` row revoked by jti. Idempotent: a row already revoked
+ * keeps its existing `revoked_at`. Returns true when a row was updated
+ * (was un-revoked before), false when no row matches or the row was
+ * already revoked. Used by the new admin revoke path, the operator-mint
+ * rotation cleanup, and any future explicit-revoke surface.
+ *
+ * `actor` records WHO revoked and over which surface (hub#931). Omitted →
+ * both columns stay NULL, which reads as "unrecorded", not "nobody".
+ */
+export function revokeTokenByJti(
+  db: Database,
+  jti: string,
+  now: Date,
+  actor?: RevokeActor,
+): boolean {
+  const res = db
+    .prepare(
+      "UPDATE tokens SET revoked_at = ?, revoked_by = ?, revoked_via = ? WHERE jti = ? AND revoked_at IS NULL",
+    )
+    .run(now.toISOString(), actor?.by ?? null, actor?.via ?? null, jti);
+  return Number(res.changes) > 0;
+}
+
+/** JWTs are immutable. Preserve refresh hashes/families; only future refreshes
+ * get the renamed scopes/audience. Unrefreshable mints must be re-minted.
+ * A separate name-reuse tombstone covers outstanding access JWTs, including
+ * unregistered short-lived mints, without revoking the shared refresh jti. */
+export function renameTokensForVault(
+  db: Database,
+  oldName: string,
+  newName: string,
+  now: Date,
+): { rescoped: number; revoked: string[] } {
+  const rows = db
+    .query<{ jti: string; scopes: string; refresh_token_hash: string | null }, []>(
+      "SELECT jti, scopes, refresh_token_hash FROM tokens WHERE revoked_at IS NULL",
+    )
+    .all();
+  const result = { rescoped: 0, revoked: [] as string[] };
+  for (const row of rows) {
+    const scopes = renameVaultScopes(row.scopes, oldName, newName);
+    if (scopes === row.scopes) continue;
+    if (row.refresh_token_hash !== null) {
+      db.prepare("UPDATE tokens SET scopes = ? WHERE jti = ?").run(scopes, row.jti);
+      result.rescoped++;
+    } else if (revokeTokenByJti(db, row.jti, now)) result.revoked.push(row.jti);
+  }
+  return result;
+}
+
+/**
+ * Revoke every un-revoked tokens row whose recorded scopes NAME the given
+ * vault (`vault:<name>:<verb>`) — the B1 vault-delete registry sweep
+ * (2026-06-09 hub-module-boundary migration, lifecycle symmetry).
+ *
+ * Matching is EXACT scope-segment comparison via `vaultScopeName` — NEVER
+ * SQL `LIKE`: `_` in a vault name is a LIKE single-char wildcard, so a
+ * `LIKE '%vault:my_vault:%'` sweep for vault `my_vault` would also revoke
+ * `myxvault`-scoped tokens. We read candidate rows and match in JS instead.
+ * Unnamed scopes (`vault:read`) don't name an instance and are untouched.
+ *
+ * Returns the number of rows newly revoked. Idempotent (already-revoked
+ * rows are filtered by the WHERE and by `revokeTokenByJti`).
+ */
+export function revokeTokensNamingVault(db: Database, vaultName: string, now: Date): number {
+  const rows = db
+    .query<{ jti: string; scopes: string }, []>(
+      "SELECT jti, scopes FROM tokens WHERE revoked_at IS NULL",
+    )
+    .all();
+  let revoked = 0;
+  for (const row of rows) {
+    const scopes = row.scopes.split(" ").filter((s) => s.length > 0);
+    if (scopes.some((s) => vaultScopeName(s) === vaultName)) {
+      if (revokeTokenByJti(db, row.jti, now)) revoked++;
+    }
+  }
+  return revoked;
+}
+
+/**
+ * Snapshot of currently-revoked-and-not-yet-expired jtis. Powers the
+ * `/.well-known/parachute-revocation.json` endpoint. Already-expired jtis
+ * are filtered out (no need to advertise the obvious — every consumer
+ * checks `exp` itself; the revocation list exists for *unexpired*
+ * tokens whose validity got cut short).
+ */
+export function listActiveRevocations(db: Database, now: Date): string[] {
+  const rows = db
+    .query<{ jti: string }, [string]>(
+      "SELECT jti FROM tokens WHERE revoked_at IS NOT NULL AND expires_at > ? ORDER BY jti",
+    )
+    .all(now.toISOString());
+  return rows.map((r) => r.jti);
+}
+
+/**
+ * Filter for `listTokens`. `revoked` defaults to "all"; `subject` matches
+ * either the OAuth `user_id` or the non-OAuth `subject` column (so the
+ * caller doesn't need to know which mint path created the row to filter
+ * by identity); `createdVia` narrows by mint provenance (OAuth refresh,
+ * operator-token mint, CLI / api-mint-token).
+ */
+export interface ListTokensFilter {
+  revoked?: "true" | "false" | "all";
+  subject?: string;
+  createdVia?: TokenCreatedVia;
+  /** Exact match on `tokens.user_id`. Self-service account list uses this. */
+  userId?: string;
+}
+
+/**
+ * Cursor-paginated list of `tokens` rows. Powers `GET /api/auth/tokens` and
+ * the future admin UI's list view.
+ *
+ * Order is `created_at DESC, jti DESC` (newest-first; jti tiebreaks for
+ * the rare case where two rows share a created_at, which can happen in
+ * tests or under burst issuance). The cursor is an opaque base64 of the
+ * `(created_at, jti)` composite from the previous page's last row;
+ * pagination resumes "strictly older than that pair." Page size is a
+ * hardcoded 50 — see in-function comment on the `limit` constant.
+ *
+ * Returns the page rows plus a `nextCursor` if more rows exist (we
+ * fetch `limit + 1` and detect the trailing row, avoiding a second
+ * round-trip just to ask "is there more?").
+ */
+export interface ListTokensPage {
+  rows: RefreshTokenRow[];
+  nextCursor: string | null;
+}
+
+/** Page size. Hardcoded for now — see comment in `listTokens`. */
+const LIST_TOKENS_PAGE_SIZE = 50;
+
+export function listTokens(
+  db: Database,
+  opts: { filter?: ListTokensFilter; cursor?: string | null } = {},
+): ListTokensPage {
+  // Page size is intentionally a hardcoded constant rather than an opt. The
+  // sole consumer (admin UI list view) doesn't need configurable pagination,
+  // and adding the seam invites consumers to pass arbitrary values that we'd
+  // then have to clamp + validate. When a real second consumer surfaces
+  // (e.g. a CLI `auth list-tokens` command), wire `?limit=N` then.
+  const limit = LIST_TOKENS_PAGE_SIZE;
+  const filter = opts.filter ?? {};
+
+  // Cursor decode. Malformed cursors are treated as "no cursor" rather
+  // than 400ing — the SPA may pass a stale cursor across reloads, and a
+  // silent reset to page 1 is the friendliest fallback. (If we ever need
+  // strict cursor validation for security reasons, this is the seam.)
+  let cursorCreatedAt: string | undefined;
+  let cursorJti: string | undefined;
+  if (opts.cursor) {
+    try {
+      const decoded = JSON.parse(Buffer.from(opts.cursor, "base64").toString("utf8")) as {
+        created_at?: unknown;
+        jti?: unknown;
+      };
+      if (typeof decoded.created_at === "string" && typeof decoded.jti === "string") {
+        cursorCreatedAt = decoded.created_at;
+        cursorJti = decoded.jti;
+      }
+    } catch {
+      // ignore — silent reset to page 1
+    }
+  }
+
+  const wheres: string[] = [];
+  const params: (string | number)[] = [];
+  if (filter.revoked === "true") {
+    wheres.push("revoked_at IS NOT NULL");
+  } else if (filter.revoked === "false") {
+    wheres.push("revoked_at IS NULL");
+  }
+  if (typeof filter.subject === "string" && filter.subject.length > 0) {
+    wheres.push("(user_id = ? OR subject = ?)");
+    params.push(filter.subject, filter.subject);
+  }
+  if (typeof filter.userId === "string" && filter.userId.length > 0) {
+    wheres.push("user_id = ?");
+    params.push(filter.userId);
+  }
+  if (filter.createdVia) {
+    wheres.push("created_via = ?");
+    params.push(filter.createdVia);
+  }
+  if (cursorCreatedAt !== undefined && cursorJti !== undefined) {
+    // "strictly older than (cursor.created_at, cursor.jti)" under the
+    // composite ORDER BY created_at DESC, jti DESC. SQLite supports
+    // tuple comparison via parens.
+    wheres.push("(created_at, jti) < (?, ?)");
+    params.push(cursorCreatedAt, cursorJti);
+  }
+
+  const whereSql = wheres.length > 0 ? `WHERE ${wheres.join(" AND ")}` : "";
+  const sql = `SELECT * FROM tokens ${whereSql} ORDER BY created_at DESC, jti DESC LIMIT ?`;
+  params.push(limit + 1); // fetch one extra to detect "more pages"
+
+  const rows = db.query<TokenRowDb, (string | number)[]>(sql).all(...params);
+  const hasMore = rows.length > limit;
+  const pageRows = (hasMore ? rows.slice(0, limit) : rows).map(rowToRefreshToken);
+
+  let nextCursor: string | null = null;
+  if (hasMore && pageRows.length > 0) {
+    const last = pageRows[pageRows.length - 1]!;
+    nextCursor = Buffer.from(
+      JSON.stringify({ created_at: last.createdAt, jti: last.jti }),
+      "utf8",
+    ).toString("base64");
+  }
+
+  return { rows: pageRows, nextCursor };
+}
+
+export interface ValidatedAccessToken {
+  payload: JWTPayload;
+  kid: string;
+}
+
+/**
+ * Verifies a JWT against the kid declared in its protected header, looking
+ * up the matching key from `signing_keys`. Active + recently-retired keys
+ * (whatever's in JWKS) are accepted; older retired keys throw. Expiry is
+ * checked by `jose` automatically.
+ *
+ * Pass `expectedIssuer` to enforce that the JWT's `iss` claim matches what
+ * this hub advertises — the same check vault performs against its own
+ * `PARACHUTE_HUB_ORIGIN`. Defense in depth: tokens forged or replayed from
+ * a different issuer get rejected at validation as well as issuance.
+ *
+ * `expectedIssuer` accepts a single string OR a SET of allowed issuers
+ * (`readonly string[]`), handed straight to jose's `issuer` option (which
+ * accepts `string | string[]`): the `iss` claim must equal the string, or be
+ * a member of the set. The set form is for the hub's own self-issued
+ * credentials, whose `iss` may be ANY origin the hub legitimately answers on
+ * (loopback ∪ expose-state ∪ platform ∪ per-request issuer — see
+ * `buildHubBoundOrigins`), so an origin switch doesn't reject a credential
+ * minted under a still-valid prior origin. SECURITY: this is ONLY an additive
+ * membership relaxation on `iss`. jose verifies the JWS signature against the
+ * hub's own public key FIRST and UNCONDITIONALLY — only tokens this hub
+ * minted can verify — before the `iss` claim is ever compared to the set. The
+ * set must come only from `buildHubBoundOrigins` (the hub's own origins),
+ * never a raw request Host. An empty/omitted value skips the `iss` check
+ * (signature-only); a single string is byte-identical to the prior behavior.
+ */
+export async function validateAccessToken(
+  db: Database,
+  token: string,
+  expectedIssuer?: string | readonly string[],
+): Promise<ValidatedAccessToken> {
+  const header = decodeProtectedHeader(token);
+  const kid = header.kid;
+  if (!kid) throw new Error("validateAccessToken: token missing kid header");
+  const match = getAllPublicKeys(db).find((k) => k.kid === kid);
+  if (!match) throw new Error(`validateAccessToken: unknown or expired kid ${kid}`);
+  const pub = await importSPKI(match.publicKeyPem, SIGNING_ALGORITHM);
+  // `undefined` → no `iss` pin (signature-only, the internal-caller default).
+  // A string or a non-empty set is handed straight to jose, which checks
+  // membership AFTER the signature verify above. An empty array is passed
+  // through too and so fails closed (no `iss` can match) — same posture as
+  // `validateHostAdminToken`; callers offering an empty origin set get a
+  // rejection, not a silent widening.
+  const issuerOption =
+    expectedIssuer === undefined ? undefined : { issuer: expectedIssuer as string | string[] };
+  const { payload } = await jwtVerify(token, pub, issuerOption);
+  // RFC 7009 revocation enforcement (#73). OAuth-issued tokens carry a
+  // tokens row keyed by jti; if that row is marked revoked, the JWT is
+  // dead even though its signature + expiry are still valid. Tokens that
+  // never had a row (operator tokens, ad-hoc internal mints) bypass this
+  // check — they're not part of the OAuth grant lifecycle.
+  if (typeof payload.jti === "string") {
+    const row = findTokenRowByJti(db, payload.jti);
+    if (row?.revokedAt) throw new Error("validateAccessToken: token has been revoked");
+  }
+  return { payload, kid };
+}
+
+/**
+ * Convenience for the `tokens` row matching a presented refresh token. Hash
+ * the plaintext, look up by hash, return the row if it exists. The caller
+ * decides what to do with `revokedAt` — the rotation path treats a revoked
+ * row as theft (RFC 6819 §5.2.2.3).
+ */
+/**
+ * Generic shape of a `tokens` row, post-v6. Covers OAuth refresh tokens
+ * (`createdVia === "oauth_refresh"`, `userId` set, `subject` null) and
+ * the new non-OAuth mint paths (`createdVia === "cli_mint" |
+ * "operator_mint"`, may have `userId` set if minted against a hub user,
+ * `subject` always set to the operator/service name).
+ *
+ * `identity` is the canonical "who is this token for" — `userId ??
+ * subject`. Use it when you don't care about the OAuth-vs-non distinction.
+ */
+export interface RefreshTokenRow {
+  jti: string;
+  /**
+   * Hub user id when the row was OAuth-issued or minted against a hub
+   * user. Null for service-tied mints (where `subject` carries the
+   * service name).
+   */
+  userId: string | null;
+  /**
+   * Non-user subject: operator name, service short name, agent id. Null
+   * for OAuth refresh-token rows (those use `userId` directly).
+   */
+  subject: string | null;
+  clientId: string;
+  scopes: string[];
+  /** Family identifier — shared across rotated descendants (#73). */
+  familyId: string;
+  expiresAt: string;
+  revokedAt: string | null;
+  createdAt: string;
+  /** Provenance tag — drives admin UI grouping. v6 onward this is set on every row. */
+  createdVia: TokenCreatedVia;
+  /** JSON-encoded fine-grained constraints (auth-architecture-shape.md §11.3). */
+  permissions: string | null;
+  /**
+   * jti of the refresh-token row this row rotated INTO (set by
+   * `linkRotation` inside the rotation transaction). NULL until this row
+   * rotates, and NULL on every pre-v14 row. Powers the one-generation
+   * rotation grace window (hub#685): only the row whose `rotatedTo` is the
+   * family's single live tip is the benign immediate-predecessor.
+   */
+  rotatedTo: string | null;
+  /**
+   * Phase-1b attribution snapshot (hub#833, migration v17) — the Nostr pubkey
+   * the row's principal had proved possession of AT MINT TIME. NULL on every
+   * pre-v17 row and on every mint by a principal with no linked key.
+   *
+   * A SNAPSHOT, not a live join: unlinking a key removes it from
+   * `user_pubkeys` and from live resolution but leaves this column alone, so
+   * the audit row keeps stating what was true. Carries no authority.
+   */
+  subjectPubkey: string | null;
+  /**
+   * Actor recorded at revoke time (hub#931). HTTP records the bearer's
+   * `sub`; the CLI records `cli:<unix user>`. NULL on every pre-v21 row and
+   * on every actor-less internal sweep — "unrecorded", not "nobody".
+   */
+  revokedBy: string | null;
+  /** Surface the revoke arrived over — `cli` | `http`. NULL as above. */
+  revokedVia: string | null;
+}
+
+/**
+ * Convenience: returns the canonical identity string for a tokens row,
+ * collapsing the OAuth-vs-non-OAuth distinction. OAuth rows return
+ * `userId`; CLI/operator-minted rows return `subject`. At least one is
+ * always set post-v6.
+ */
+export function tokenRowIdentity(row: RefreshTokenRow): string {
+  return row.userId ?? row.subject ?? "";
+}
+
+interface TokenRowDb {
+  jti: string;
+  user_id: string | null;
+  client_id: string;
+  scopes: string;
+  family_id: string | null;
+  expires_at: string;
+  revoked_at: string | null;
+  created_at: string;
+  permissions: string | null;
+  created_via: string;
+  subject: string | null;
+  rotated_to: string | null;
+  subject_pubkey: string | null;
+  revoked_by: string | null;
+  revoked_via: string | null;
+}
+
+function rowToRefreshToken(row: TokenRowDb): RefreshTokenRow {
+  return {
+    jti: row.jti,
+    userId: row.user_id,
+    subject: row.subject,
+    clientId: row.client_id,
+    scopes: row.scopes.split(" ").filter((s) => s.length > 0),
+    familyId: row.family_id ?? row.jti,
+    expiresAt: row.expires_at,
+    revokedAt: row.revoked_at,
+    createdAt: row.created_at,
+    createdVia: (row.created_via as TokenCreatedVia) ?? "oauth_refresh",
+    permissions: row.permissions,
+    rotatedTo: row.rotated_to ?? null,
+    subjectPubkey: row.subject_pubkey ?? null,
+    revokedBy: row.revoked_by ?? null,
+    revokedVia: row.revoked_via ?? null,
+  };
+}
+
+export function findRefreshToken(db: Database, plaintext: string): RefreshTokenRow | null {
+  const refreshTokenHash = createHash("sha256").update(plaintext).digest("hex");
+  const row = db
+    .query<TokenRowDb, [string]>("SELECT * FROM tokens WHERE refresh_token_hash = ? LIMIT 1")
+    .get(refreshTokenHash);
+  return row ? rowToRefreshToken(row) : null;
+}
+
+/** Look up a tokens row by jti. Used by the revocation endpoint to find an
+ * access-token row from its JWT jti claim, and by validateAccessToken to
+ * honor revoked_at. */
+export function findTokenRowByJti(db: Database, jti: string): RefreshTokenRow | null {
+  const row = db.query<TokenRowDb, [string]>("SELECT * FROM tokens WHERE jti = ? LIMIT 1").get(jti);
+  return row ? rowToRefreshToken(row) : null;
+}
+
+/**
+ * Revoke every row in a refresh-token family. Called by the refresh handler
+ * when an already-revoked refresh token is presented again — the spec-defined
+ * theft signal (RFC 6819 §5.2.2.3). Idempotent: rows already revoked keep
+ * their existing revoked_at.
+ */
+export function revokeFamily(db: Database, familyId: string, now: Date): number {
+  const res = db
+    .prepare("UPDATE tokens SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL")
+    .run(now.toISOString(), familyId);
+  return Number(res.changes);
+}
+
+/**
+ * Record that `predecessorJti` rotated INTO `successorJti`. Called INSIDE the
+ * rotation transaction (alongside the revoke-old + insert-new) so the
+ * successor link, the predecessor's `revoked_at`, and the new row commit or
+ * roll back as a unit. Powers the one-generation rotation grace window
+ * (hub#685): a benign concurrent/retried refresh of the immediate
+ * predecessor can be told apart from a genuine replay of an older ancestor.
+ */
+export function linkRotation(db: Database, predecessorJti: string, successorJti: string): void {
+  db.prepare("UPDATE tokens SET rotated_to = ? WHERE jti = ?").run(successorJti, predecessorJti);
+}
+
+/**
+ * The live (un-revoked AND un-expired) refresh-token rows in a family as of
+ * `now`. The grace window asks "is there exactly one live tip, and is the
+ * presented (revoked) row its direct predecessor?" — so callers inspect this
+ * set. Two filters matter:
+ *   - `refresh_token_hash IS NOT NULL` — the family can also contain
+ *     access-token rows sharing the jti/family, irrelevant to rotation lineage.
+ *   - `expires_at > now` — an expired-but-not-revoked tip is not a valid
+ *     rotation target, so the grace path must never rotate into it. Keeping
+ *     "live" exhaustive here means the single caller doesn't re-check expiry.
+ */
+export function liveFamilyRefreshRows(
+  db: Database,
+  familyId: string,
+  now: Date,
+): RefreshTokenRow[] {
+  const rows = db
+    .query<TokenRowDb, [string, string]>(
+      "SELECT * FROM tokens WHERE family_id = ? AND revoked_at IS NULL AND refresh_token_hash IS NOT NULL AND expires_at > ?",
+    )
+    .all(familyId, now.toISOString());
+  return rows.map(rowToRefreshToken);
+}
+
+export class VaultNameReservedError extends Error {
+  constructor(name: string) {
+    super(`vault "${name}" was renamed; obtain scopes for its new name`);
+    this.name = "VaultNameReservedError";
+  }
+}
+
+/** Prevent a mint already in flight during rename from persisting a stale
+ * refresh family, or a stale client from minting into a reserved old name. */
+function assertVaultNamesAvailable(db: Database, scopes: string[], now: Date): void {
+  for (const scope of scopes) {
+    const name = vaultScopeName(scope);
+    if (name && vaultRenameReservedUntil(db, name, now)) {
+      throw new VaultNameReservedError(name);
+    }
+  }
+}
