@@ -4,6 +4,7 @@
 // The newer home is made with today's CLI, then the schema marker both databases use (a `schema_version` table:
 // vault core/src/schema.ts:421,762, SCHEMA_VERSION 32; hub src/hub-db.ts:939-955, 24 migrations) gets one more
 // row, on the throwaway copy. Today nothing checks it: the vault re-stamps its own version and carries on.
+// The home is always compared, whatever the exit; today the box servers' red reasons name the exact files they add.
 // Lane B turns these green.
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
@@ -38,15 +39,20 @@ async function makeHome(withVault: boolean) {
 
 const vaultDb = (home: string) => join(home, "vault", "data", VAULT, "vault.db");
 
-/** Run a long-running command against the home; it must exit 6 within 20 s and change nothing under the home. */
+/**
+ * Run a command against the home; it must exit 6 within 20 s and change nothing under the home. The home is always
+ * compared, whatever the exit, and a changed home fails first with its own message ("the home changed"), so a
+ * process that both misbehaves and corrupts the home can't pass as a known exit failure.
+ */
 async function refuses(home: string, label: string, args: string[], opts: { vault?: boolean; env?: Record<string, string> } = {}) {
   const before = snapshot(home);
   const s = start(home, args, opts);
   const code = await exitWithin(s, 20_000);
   await s.stop("SIGKILL", 2000);
-  must(code === 6, `${label}: ${code === null ? "still running after 20 s" : `exit ${code}`}, want 6: ${tail(s.log(), 400)}`);
+  const exit = code === null ? "still running after 20 s" : `exit ${code}`;
   const changed = diff(before, snapshot(home));
-  must(changed.length === 0, `${label}: the home changed: ${changed.slice(0, 8).join(", ")}`);
+  must(changed.length === 0, `${label}: the home changed (${exit}): ${changed.slice(0, 8).join(", ")}`);
+  must(code === 6, `${label}: ${exit}, want 6: ${tail(s.log(), 400)}`);
 }
 
 describe("embedded/newer-data", () => {
@@ -58,20 +64,29 @@ describe("embedded/newer-data", () => {
   });
 
   red(
-    "serve --embedded and bootstrap --embedded on a newer vault.db exit 6 and leave the home byte-identical",
-    { reason: /serve --embedded: exit 1, want 6: .*unexpected argument "--embedded"/s, lane: "B" },
+    "serve --embedded on a newer vault.db exits 6 and leaves the home byte-identical",
+    { reason: /^serve --embedded: exit 1, want 6: .*unexpected argument "--embedded"/s, lane: "B" },
     async () => {
       const home = await makeHome(true);
       raiseSchema(vaultDb(home));
       const [h, v] = await ports(2);
       await refuses(home, "serve --embedded", ["serve", "--embedded", "--listen", `127.0.0.1:${h}`, "--vault-listen", `127.0.0.1:${v}`]);
+    },
+  );
+
+  red(
+    "bootstrap --embedded on a newer vault.db exits 6 and leaves the home byte-identical",
+    { reason: /^bootstrap --embedded: exit 1, want 6: .*unknown command "bootstrap"/s, lane: "B" },
+    async () => {
+      const home = await makeHome(true);
+      raiseSchema(vaultDb(home));
       await refuses(home, "bootstrap --embedded", ["bootstrap", "--embedded", "--vault", VAULT, "--json"]);
     },
   );
 
   red(
     "serve --embedded on a newer hub.db exits 6 and leaves the home byte-identical",
-    { reason: /serve --embedded: exit 1, want 6: .*unexpected argument "--embedded"/s, lane: "B" },
+    { reason: /^serve --embedded: exit 1, want 6: .*unexpected argument "--embedded"/s, lane: "B" },
     async () => {
       const home = await makeHome(true);
       raiseSchema(join(home, "hub.db"));
@@ -82,7 +97,9 @@ describe("embedded/newer-data", () => {
 
   red(
     "box: parachute-vault serve on a newer vault.db exits 6 and leaves the home byte-identical",
-    { reason: /parachute-vault serve: still running after 20 s, want 6/, lane: "B" },
+    // Today the vault carries on serving the newer vault.db and writes to it; that exact change (its WAL files, and
+    // nothing else) is the known failure. Any other change, or another exit, is red for the wrong reason.
+    { reason: /^parachute-vault serve: the home changed \(still running after 20 s\): \+ vault\/data\/older\/vault\.db-shm, \+ vault\/data\/older\/vault\.db-wal$/, lane: "B" },
     async () => {
       const home = await makeHome(true);
       raiseSchema(vaultDb(home));
@@ -92,7 +109,9 @@ describe("embedded/newer-data", () => {
 
   red(
     "box: parachute serve on a newer hub.db exits 6 and leaves the home byte-identical",
-    { reason: /parachute serve: still running after 20 s, want 6/, lane: "B" },
+    // Today the hub carries on serving the newer hub.db and writes to the home; that exact set of changes is the
+    // known failure. Any other change (hub.db itself rewritten, say), or another exit, is red for the wrong reason.
+    { reason: /^parachute serve: the home changed \(still running after 20 s\): \+ hub-instance\.json, \+ hub\.db-shm, \+ hub\.db-wal, \+ well-known, \+ well-known\/hub\.html$/, lane: "B" },
     async () => {
       const home = await makeHome(false); // no vault row, so the hub supervises nothing
       raiseSchema(join(home, "hub.db"));

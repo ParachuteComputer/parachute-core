@@ -222,15 +222,25 @@ describe("compat/uni: REST clients (Bearer script pass)", () => {
     const bad = await get("/notes", { tag: "task", include_content: "false", cursor: "not-a-cursor", limit: "200" });
     expect(bad.status).toBe(400);
     expect(String(bad.body.code)).toStartWith("cursor");
-    const since = await get("/notes", { tag: "task", include_content: "false", "meta[updated_at][gte]": "2000-01-01T00:00:00Z", path_prefix: `${R}/Tasks` });
-    expect(since.status).toBe(200);
-    expect(since.body.length).toBeGreaterThan(0);
+    // "What changed since <stamp>": two tasks, the second written after the first; the filter must cut between them.
+    const older = await seed({ path: `${R}/Digest/older`, content: "x", tags: ["task"], metadata: { state: "open" } });
+    await Bun.sleep(20);
+    const newer = await seed({ path: `${R}/Digest/newer`, content: "y", tags: ["task"], metadata: { state: "open" } });
+    expect(newer.updatedAt > older.updatedAt).toBe(true);
+    const since = (gte: string) => get("/notes", { tag: "task", include_content: "false", "meta[updated_at][gte]": gte, path_prefix: `${R}/Digest` });
+    const all = await since("2000-01-01T00:00:00Z");
+    expect(all.status).toBe(200);
+    expect(all.body.map((n: any) => n.id).sort()).toEqual([older.id, newer.id].sort());
+    expect((await since(newer.updatedAt)).body.map((n: any) => n.id)).toEqual([newer.id]);
   });
 
   test("pacer: a read-only query (metadata filter, include_content=false) is a flat array without content", async () => {
-    const r = await get("/notes", { tag: "task", metadata: JSON.stringify({ state: { in: ["open", "doing", "waiting"] } }), include_content: "false", path_prefix: `${R}/Tasks` });
+    for (const state of ["open", "doing", "waiting", "done", "dropped"]) {
+      await seed({ path: `${R}/Pacer/${state}`, content: `a made-up ${state} task`, tags: ["task"], metadata: { state } });
+    }
+    const r = await get("/notes", { tag: "task", metadata: JSON.stringify({ state: { in: ["open", "doing", "waiting"] } }), include_content: "false", path_prefix: `${R}/Pacer` });
     expect(r.status).toBe(200);
-    expect(r.body.length).toBeGreaterThan(0);
+    expect(r.body.map((n: any) => n.path).sort()).toEqual([`${R}/Pacer/doing`, `${R}/Pacer/open`, `${R}/Pacer/waiting`]);
     for (const n of r.body) expect(n.content ?? "").toBe("");
   });
 
@@ -295,8 +305,8 @@ describe("compat/uni: REST clients (Bearer script pass)", () => {
     const p1 = await get("/notes", { tag: "event", include_content: "true", limit: "1", offset: "1", path_prefix: `${R}/Calendar` });
     expect(p0.body.length).toBe(1);
     expect(p1.body.length).toBe(1);
-    expect(p0.body[0].id).not.toBe(p1.body[0].id);
-    expect(p0.body[0].content).toBeString();
+    const paged = [...p0.body, ...p1.body].map((n: any) => [n.path, n.content]).sort();
+    expect(paged).toEqual([[`${R}/Calendar/e1`, "made-up event"], [`${R}/Calendar/e2`, "another event"]]);
   });
 
   test("the door: cursor pages {notes,next_cursor}, meta[uid][eq], batch POST, PATCH tags{add,remove}, 409 path_conflict, DELETE, PUT /tags with admin", async () => {
@@ -326,6 +336,8 @@ describe("compat/uni: REST clients (Bearer script pass)", () => {
     expect(schema.status).toBe(200);
     const read = await api.get(`/tags?include_schema=true`);
     expect(read.status).toBe(200);
+    const event = read.body.find((t: any) => t.name === "event");
+    expect(event?.fields?.uid).toMatchObject({ type: "string", indexed: true }); // declared in beforeAll
   });
 
   test("civics-ingest: POST with links[{target,relationship}], then PATCH {force, tags{add}, links{add,remove}} → 200", async () => {
@@ -374,11 +386,21 @@ describe("compat/uni: REST clients (Bearer script pass)", () => {
     const src = { path: `${R}/Sources/digest`, content: "week 1", tags: ["source"], metadata: { week: 1 }, if_exists: "update" };
     expect((await api.post("/notes", src)).status).toBeLessThan(300);
     expect((await api.post("/notes", { ...src, content: "week 2" })).status).toBeLessThan(300);
-    // area-briefs: newest first, keyword search, GET by path.
+    // area-briefs: newest first, keyword search, GET by path. Five more meetings, written out of date order, so that
+    // with the fireflies one there are six: newest-first with limit 5 is the five newest, newest first, and neither
+    // the default (oldest first) nor write order gives that answer.
+    const days = ["04", "02", "06", "03", "05"];
+    await api.post("/notes", { notes: days.map((d) => ({ path: `${R}/Meetings/Made up 10-${d}`, content: `meeting on 10-${d}`, tags: ["meeting"], created_at: `2026-10-${d}T15:00:00Z` })) });
     const desc = await get("/notes", { tag: "meeting", sort: "desc", limit: "5", include_content: "true", path_prefix: `${R}/Meetings` });
     expect(desc.status).toBe(200);
-    const found = await get("/notes", { search: "week", path_prefix: `${R}/Sources` });
+    expect(desc.body.map((n: any) => n.content)).toEqual(["06", "05", "04", "03", "02"].map((d) => `meeting on 10-${d}`));
+    // Keyword search: two notes hold the word, two don't.
+    await seed({ path: `${R}/Sources/monthly`, content: "a month of made-up sources", tags: ["source"] });
+    await seed({ path: `${R}/Sources/daily`, content: "nothing to see", tags: ["source"] });
+    await seed({ path: `${R}/Sources/weekly roundup`, content: "this week in made-up sources", tags: ["source"] });
+    const found = await get("/notes", { tag: "source", search: "week", include_content: "true", path_prefix: `${R}/Sources` });
     expect(found.status).toBe(200);
+    expect(found.body.map((n: any) => [n.path, n.content]).sort()).toEqual([[`${R}/Sources/digest`, "week 2"], [`${R}/Sources/weekly roundup`, "this week in made-up sources"]]);
     const byPath = await api.get(`/notes/${enc(`${R}/Sources/digest`)}?include_content=true`);
     expect(byPath.status).toBe(200);
     expect(byPath.body.content).toBe("week 2");
@@ -503,6 +525,10 @@ describe("compat/uni: the box", () => {
     copy.close();
     const hb = Bun.spawnSync(["sqlite3", "-readonly", join(s.home, "hub.db"), `.backup '${out}.hub'`]);
     expect(hb.exitCode).toBe(0);
+    const hubCopy = new Database(`${out}.hub`, { readonly: true });
+    expect(hubCopy.query("PRAGMA integrity_check").get()).toEqual({ integrity_check: "ok" });
+    expect((hubCopy.query("SELECT COUNT(*) AS n FROM signing_keys").get() as { n: number }).n).toBeGreaterThan(0);
+    hubCopy.close();
   });
 
   test("exactly one process holds the running box's vault.db, and it is the vault", () => {
