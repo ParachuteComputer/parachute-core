@@ -329,10 +329,10 @@ test("P18 MCP protects the new object result from out-of-scope disclosure", asyn
   expect(emptyDenied).not.toHaveProperty("versions");
   expect(JSON.stringify(emptyDenied)).not.toContain("EMPTY_SECRET_SENTINEL");
   await store.deleteNote(y.id);
-  for (const tags of [["journal"], null])
-    await expect(
-      query(tags)({ versions: { note_id: y.id } }),
-    ).rejects.toMatchObject({ error_type: "not_found" });
+  // Unscoped: core's not_found. Scoped: the same answer a hidden note gets, so
+  // a scoped caller can't tell a deleted note from a hidden one.
+  await expect(query(null)({ versions: { note_id: y.id } })).rejects.toMatchObject({ error_type: "not_found" });
+  expect(await query(["journal"])({ versions: { note_id: y.id } })).toEqual({ error: "Note not found", error_type: "not_found", id: y.id });
 });
 test("P18h missing versions do not disclose a scoped-out path's canonical id", async () => {
   const ref = "private/history-target";

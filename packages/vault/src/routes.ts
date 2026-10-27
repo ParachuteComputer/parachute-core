@@ -58,7 +58,7 @@ import {
   contentRangeRequiresContent,
   type ContentRange,
 } from "../core/src/content-range.ts";
-import { attachValidationStatus, enforceStrictWrite, applySchemaDefaults } from "../core/src/mcp.ts";
+import { attachValidationStatus, enforceStrictWrite, applySchemaDefaults, resolveVisibleNote } from "../core/src/mcp.ts";
 import {
   BLOCKED_ATTACHMENT_EXTENSIONS,
   ATTACHMENT_MIME_TYPES,
@@ -1342,7 +1342,14 @@ function parseExpandParams(
  * published.test.ts) that only implements `getNote`/`getNoteByPath`; this
  * fallback must never turn that into a crash.
  */
-async function resolveNote(store: Store, idOrPath: string): Promise<Note | null> {
+async function resolveNote(
+  store: Store,
+  idOrPath: string,
+  visible?: (note: Note) => boolean,
+): Promise<Note | null> {
+  // A caller who sees only some notes resolves among those alone: a hidden
+  // note never shadows, blocks or names itself in a visible lookup.
+  if (visible && store.db) return resolveVisibleNote(store.db, idOrPath, visible);
   const byId = await store.getNote(idOrPath);
   if (byId) return byId;
   const extMatch = idOrPath.match(/^(.*)\.([a-z0-9]{1,16})$/i);
@@ -1431,6 +1438,8 @@ async function handleNotesInner(
   tagScope: TagScopeCtx = NO_TAG_SCOPE,
   writeCtx: WriteCtx = NO_WRITE_CTX,
 ): Promise<Response> {
+  // Path resolution sees only what the pass can read (an ambiguous path never names a hidden note).
+  const scopeVisible = buildExpandVisibility(tagScope.allowed, tagScope.raw);
   const url = new URL(req.url);
   const method = req.method;
   const db = store.db;
@@ -1444,7 +1453,7 @@ async function handleNotesInner(
 
       // Single note by id/path
       if (id) {
-        const note = await resolveNote(store, id);
+        const note = await resolveNote(store, id, scopeVisible);
         if (!note) return json({ error: "Note not found", error_type: "not_found", id }, 404);
         // Tag-scope: a token can't see what its allowlist excludes. Surface
         // as 404 (not 403) — the existence of the note is itself information
@@ -1925,7 +1934,7 @@ async function handleNotesInner(
         }
       }
       if (nearNoteId) {
-        const anchor = await resolveNote(store, nearNoteId);
+        const anchor = await resolveNote(store, nearNoteId, scopeVisible);
         if (!anchor) return json({ error: "Anchor note not found", error_type: "not_found", note_id: nearNoteId }, 404);
         // Tag-scope: anchor must itself be visible to this token.
         if (!noteWithinTagScope(anchor, tagScope.allowed, tagScope.raw)) {
@@ -2772,7 +2781,7 @@ async function handleNotesInner(
   // Attachments sub-routes (keep as-is — Daily needs them)
   if (sub === "/attachments") {
     if (method === "POST") {
-      const note = await resolveNote(store, idOrPath);
+      const note = await resolveNote(store, idOrPath, scopeVisible);
       if (!note) return json({ error: "Not found", error_type: "not_found" }, 404);
       if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
         return json({ error: "Not found", error_type: "not_found" }, 404);
@@ -2897,7 +2906,7 @@ async function handleNotesInner(
       return json(attachment, 201);
     }
     if (method === "GET") {
-      const note = await resolveNote(store, idOrPath);
+      const note = await resolveNote(store, idOrPath, scopeVisible);
       if (!note) return json({ error: "Not found", error_type: "not_found" }, 404);
       if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
         return json({ error: "Not found", error_type: "not_found" }, 404);
@@ -2911,7 +2920,7 @@ async function handleNotesInner(
   if (attMatch) {
     const attId = decodeURIComponent(attMatch[1]!);
     if (method === "DELETE") {
-      const note = await resolveNote(store, idOrPath);
+      const note = await resolveNote(store, idOrPath, scopeVisible);
       if (!note) return json({ error: "Not found", error_type: "not_found" }, 404);
       if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
         return json({ error: "Not found", error_type: "not_found" }, 404);
@@ -2956,7 +2965,7 @@ async function handleNotesInner(
   if (sub === "/retry-transcription") {
     if (method !== "POST") return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
     if (!vault) return json({ error: "Vault context required", error_type: "invalid_request" }, 400);
-    const note = await resolveNote(store, idOrPath);
+    const note = await resolveNote(store, idOrPath, scopeVisible);
     if (!note) return json({ error: "Not found", error_type: "not_found" }, 404);
     if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
       return json({ error: "Not found", error_type: "not_found" }, 404);
@@ -2967,7 +2976,7 @@ async function handleNotesInner(
   const verMatch = sub.match(/^\/versions\/([^/]+)$/);
   const importMatch = sub.match(/^\/imports\/([^/]+)$/);
   if (sub === "/versions" || verMatch || importMatch || sub === "/restore") {
-    const note = await resolveNote(store, idOrPath);
+    const note = await resolveNote(store, idOrPath, scopeVisible);
     if (note && !noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
       return json({ error: "Not found", error_type: "not_found" }, 404);
     }
@@ -3056,7 +3065,7 @@ async function handleNotesInner(
 
   // GET /notes/:idOrPath — single note
   if (method === "GET") {
-    const note = await resolveNote(store, idOrPath);
+    const note = await resolveNote(store, idOrPath, scopeVisible);
     if (!note) return json({ error: "Not found", error_type: "not_found" }, 404);
     if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
       return json({ error: "Not found", error_type: "not_found" }, 404);
@@ -3123,7 +3132,7 @@ async function handleNotesInner(
       if (!parsedBody.ok) return parsedBody.response;
       const body = parsedBody.body as any;
       if (body.if_updated_at !== undefined && !isValidIfUpdatedAt(body.if_updated_at)) return invalidIfUpdatedAtResponse();
-      const note = await resolveNote(store, idOrPath);
+      const note = await resolveNote(store, idOrPath, scopeVisible);
       if (!note) {
         // vault#309 — `if_missing: "create"` turns this PATCH into a
         // create using the same payload. POST /notes is the canonical
@@ -3593,7 +3602,7 @@ async function handleNotesInner(
 
   // DELETE /notes/:idOrPath — vault:write (no admin gate; consistent with verbForMethod)
   if (method === "DELETE") {
-    const note = await resolveNote(store, idOrPath);
+    const note = await resolveNote(store, idOrPath, scopeVisible);
     if (!note) return json({ error: "Not found", error_type: "not_found" }, 404);
     // Tag-scope: can't delete what you can't read. 404 (not 403) for the
     // same no-leak reason as the read paths.
@@ -4198,12 +4207,12 @@ export async function handleFindPath(
 
   const db = store.db;
   try {
-    const sourceNote = await resolveNote(store, source);
+    const sourceNote = await resolveNote(store, source, buildExpandVisibility(tagScope.allowed, tagScope.raw));
     if (!sourceNote) return json({ error: `Note not found: "${source}"`, error_type: "not_found", note_id: source }, 404);
     if (!noteWithinTagScope(sourceNote, tagScope.allowed, tagScope.raw)) {
       return json({ error: `Note not found: "${source}"`, error_type: "not_found", note_id: source }, 404);
     }
-    const targetNote = await resolveNote(store, target);
+    const targetNote = await resolveNote(store, target, buildExpandVisibility(tagScope.allowed, tagScope.raw));
     if (!targetNote) return json({ error: `Note not found: "${target}"`, error_type: "not_found", note_id: target }, 404);
     if (!noteWithinTagScope(targetNote, tagScope.allowed, tagScope.raw)) {
       return json({ error: `Note not found: "${target}"`, error_type: "not_found", note_id: target }, 404);
@@ -4626,7 +4635,9 @@ export async function handleViewNote(
   const { publishedTag = "publish", visible } = options;
   let note: Note | null;
   try {
-    note = await resolveNote(store, idOrPath);
+    // Ambiguity resolves among the notes this reader may see (published, or
+    // readable by its pass), so a hidden note's id never appears in a 409.
+    note = await resolveNote(store, idOrPath, (n) => isNotePublished(n, publishedTag) || ((options.authenticated ?? false) && (!visible || visible(n))));
   } catch (e: any) {
     // vault#331 N1 — surface AmbiguousPathError as 409. The HTML view
     // route doesn't otherwise return JSON, but the structured body is

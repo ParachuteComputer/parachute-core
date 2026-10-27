@@ -185,7 +185,8 @@ function requireNoteReference(value: unknown): string {
  * match required. Same [[wikilink]] semantics as `resolveWikilink`; exact
  * id/path always wins first.
  */
-export function resolveNote(db: Database, idOrPath: string): Note | null {
+export function resolveNote(db: Database, idOrPath: string, visible?: (note: Note) => boolean): Note | null {
+  if (visible) return resolveVisibleNote(db, idOrPath, visible);
   // Try ID match first (fast, indexed)
   const byId = noteOps.getNote(db, idOrPath);
   if (byId) return byId;
@@ -204,8 +205,42 @@ export function resolveNote(db: Database, idOrPath: string): Note | null {
   return noteOps.getNoteByTitle(db, idOrPath);
 }
 
-function requireNote(db: Database, idOrPath: string): Note {
-  const note = resolveNote(db, idOrPath);
+/**
+ * `resolveNote` for a caller who sees only the notes `visible` admits (a
+ * tag-scoped pass, an anonymous /view). Each step treats a note it can't see
+ * as absent and moves on, so a hidden note changes nothing about how a
+ * reference resolves: not by an ambiguity error (its id, extension or the
+ * count), not by shadowing a visible path or title, not by a 404 where a
+ * visible note would have been found. Ambiguity is decided among visible
+ * candidates only.
+ */
+export function resolveVisibleNote(db: Database, idOrPath: string, visible: (note: Note) => boolean): Note | null {
+  const seen = (n: Note | null) => (n && visible(n) ? n : null);
+  const byId = seen(noteOps.getNote(db, idOrPath));
+  if (byId) return byId;
+  const extMatch = idOrPath.match(/^(.*)\.([a-z0-9]{1,16})$/i);
+  const visibleOf = (ids: string[]) => ids.map((id) => noteOps.getNote(db, id)).filter((n): n is Note => !!n && visible(n));
+  if (extMatch) {
+    // Paths compare case-insensitively, so `report.md` may match a hidden
+    // `Report.md` row too: filter every candidate, never pick one first.
+    const rows = db.prepare(
+      "SELECT id FROM notes WHERE path = ? COLLATE NOCASE AND LOWER(extension) = ? ORDER BY rowid",
+    ).all(extMatch[1]!, extMatch[2]!.toLowerCase()) as { id: string }[];
+    const explicit = visibleOf(rows.map((r) => r.id))[0];
+    if (explicit) return explicit;
+  }
+  const atPath = (db.prepare("SELECT id FROM notes WHERE path = ? COLLATE NOCASE").all(idOrPath) as { id: string }[]).map((r) => r.id);
+  const byPath = visibleOf(atPath);
+  if (byPath.length === 1) return byPath[0]!;
+  if (byPath.length > 1) {
+    throw new noteOps.AmbiguousPathError(idOrPath, byPath.map((n) => ({ id: n.id, extension: n.extension ?? "md" })));
+  }
+  const byTitle = visibleOf(noteOps.findNotesByTitle(db, idOrPath).map((m) => m.id));
+  return byTitle.length === 1 ? byTitle[0]! : null;
+}
+
+function requireNote(db: Database, idOrPath: string, visible?: (note: Note) => boolean): Note {
+  const note = resolveNote(db, idOrPath, visible);
   if (!note) {
     throw structuredError(`Note not found: "${idOrPath}"`, { error_type: "not_found", field: "id" });
   }
@@ -491,6 +526,12 @@ export interface GenerateMcpToolsOpts {
    */
   aggregateVisibility?: (note: Note) => boolean;
   /**
+   * `resolveVisibility` is an OPTIONAL per-note predicate for resolving an
+   * id/path/title reference (`resolveVisibleNote`): notes it rejects are
+   * treated as absent. Omitted (unscoped) → plain `resolveNote`.
+   */
+  resolveVisibility?: (note: Note) => boolean;
+  /**
    * `searchVisibility` is an OPTIONAL per-note predicate for `query-notes`'s
    * full-text `search`: matches are ranked and limited over only the notes it
    * accepts, so a scoped answer doesn't depend on notes the caller can't see
@@ -594,6 +635,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
   const ifExistsVisible = opts?.ifExistsVisible;
   const aggregateVisibility = opts?.aggregateVisibility;
   const searchVisibility = opts?.searchVisibility;
+  const resolveVisibility = opts?.resolveVisibility;
   const ambiguityVisible = opts?.ambiguityVisible;
   // Write-attribution (vault#298) — captured once at tool-generation time
   // (a fresh tool set is generated per MCP request, so this is request-scoped)
@@ -710,7 +752,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           }
           const v = params.versions as { note_id: string; version_ix?: number; origin?: unknown; import_ix?: unknown; limit?: number; offset?: number };
           const selector = parseHistorySelector(v);
-          const note = requireNote(db, requireNoteReference(v.note_id));
+          const note = requireNote(db, requireNoteReference(v.note_id), resolveVisibility);
           if (selector && "import_ix" in selector) {
             const version = getImportedVersion(db, note.id, selector.import_ix);
             if (!version) return { error: "Imported version not found", error_type: "not_found", id: v.note_id, ...selector };
@@ -737,7 +779,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           });
         }
         if (params.id) {
-          const note = resolveNote(db, params.id as string);
+          const note = resolveNote(db, params.id as string, resolveVisibility);
           if (!note) return { error: "Note not found", error_type: "not_found", id: params.id };
           const includeContent = params.include_content !== false; // default true for single
           // Range params are meaningless on a content-less shape — error
@@ -811,7 +853,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           const near = params.near as { note_id: string } & linkOps.NearSpec;
           const nearErr = linkOps.validateNearSpec(near);
           if (nearErr) return { error: nearErr, error_type: "invalid_query" };
-          const anchor = resolveNote(db, near.note_id);
+          const anchor = resolveNote(db, near.note_id, resolveVisibility);
           if (!anchor) return { error: "Anchor note not found", error_type: "not_found", note_id: near.note_id };
           nearScope = linkOps.resolveNearScope(db, anchor.id, near, nearTraversable);
         }
@@ -1878,7 +1920,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             // existing `requireNote` behavior (throw "Note not found").
             // vault#309.
             const idOrPath = requireNoteReference(item.id);
-            const resolved = resolveNote(db, idOrPath);
+            const resolved = resolveNote(db, idOrPath, resolveVisibility);
             if (!resolved) {
               if (item.if_missing === "create") {
                 // Treat the update payload as a create payload. Minimum:
@@ -2329,7 +2371,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
     {
       name: "delete-note",
       execute: async (params) => {
-        const note = requireNote(db, requireNoteReference(params.id));
+        const note = requireNote(db, requireNoteReference(params.id), resolveVisibility);
         await store.deleteNote(note.id, { actor: writeActor, via: writeVia });
         return { deleted: true, id: note.id };
       },
@@ -2598,8 +2640,8 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
     {
       name: "find-path",
       execute: (params) => {
-        const source = requireNote(db, params.source as string);
-        const target = requireNote(db, params.target as string);
+        const source = requireNote(db, params.source as string, resolveVisibility);
+        const target = requireNote(db, params.target as string, resolveVisibility);
         return linkOps.findPath(db, source.id, target.id, {
           max_depth: Math.min((params.max_depth as number) ?? 5, 10),
         });
@@ -2707,7 +2749,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             );
           }
 
-          const note = requireNote(db, noteRef);
+          const note = requireNote(db, noteRef, resolveVisibility);
           if (ticketSeam.noteVisible && !(await ticketSeam.noteVisible(note))) {
             // Uniform not_found — a tag-scoped caller learns nothing about
             // an out-of-scope note's existence (same posture as every other
