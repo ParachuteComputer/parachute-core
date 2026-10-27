@@ -1,0 +1,5 @@
+{
+  "comment": "Today's code the `today` contracts run against. Bump a pin in its own pull request, with the suite's output.",
+  "vault": { "repo": "https://github.com/ParachuteComputer/parachute-vault.git", "commit": "42fbf93" },
+  "hub": { "repo": "https://github.com/ParachuteComputer/parachute-hub.git", "commit": "53d327b" }
+}
