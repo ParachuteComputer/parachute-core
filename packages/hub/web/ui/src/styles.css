@@ -1,0 +1,1806 @@
+/*
+ * Brand tokens lifted from src/oauth-ui.ts + src/admin-login-ui.ts so the
+ * SPA stays visually continuous with the password-login → consent flow the
+ * operator will have just walked through. Don't drift these without
+ * updating both server-rendered surfaces.
+ */
+:root {
+  --bg: #faf8f4;
+  --bg-soft: #f3f0ea;
+  --fg: #2c2a26;
+  --fg-muted: #6b6860;
+  --fg-dim: #9a9690;
+  --accent: #4a7c59;
+  --accent-soft: rgba(74, 124, 89, 0.08);
+  --accent-hover: #3d6849;
+  --border: #e4e0d8;
+  --border-light: #ece9e2;
+  --card-bg: #ffffff;
+  --error: #a3392b;
+  --error-soft: rgba(163, 57, 43, 0.08);
+  --warn: #b08023;
+  --warn-soft: rgba(176, 128, 35, 0.08);
+  --success: #3d6849;
+  --success-soft: rgba(61, 104, 73, 0.08);
+  --font-serif: Georgia, "Times New Roman", serif;
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Monaco, "Cascadia Mono", monospace;
+  font-family: var(--font-sans);
+}
+
+* {
+  box-sizing: border-box;
+}
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--fg);
+}
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+a:hover {
+  text-decoration: underline;
+}
+
+button {
+  font: inherit;
+  background: var(--accent);
+  color: white;
+  border: 0;
+  border-radius: 6px;
+  padding: 0.55rem 1.1rem;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+button:hover {
+  background: var(--accent-hover);
+}
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+button.secondary {
+  background: white;
+  color: var(--fg);
+  border: 1px solid var(--border);
+}
+button.secondary:hover {
+  background: var(--bg-soft);
+}
+
+input,
+select,
+textarea {
+  font: inherit;
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.55rem 0.75rem;
+  color: var(--fg);
+}
+input:focus,
+select:focus,
+textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+code {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  background: var(--bg-soft);
+  padding: 0.1em 0.3em;
+  border-radius: 3px;
+}
+
+.page {
+  max-width: 880px;
+  margin: 0 auto;
+  padding: 1.5rem 1.5rem 6rem;
+}
+
+.nav {
+  display: flex;
+  /* Wrap on narrow viewports so the nav reflows instead of forcing
+     horizontal overflow on the document. At 375 px the document was
+     measuring 787 px — every nav child (10 links + brand + auth) lined
+     up in a single flex row whose intrinsic min-content width exceeded
+     the viewport. `.page`'s `max-width: 880px` doesn't help here:
+     max-width caps the box's layout size but does not prevent overflow
+     from a flex row's intrinsic content width. Only `flex-wrap`,
+     `overflow: hidden`, or `min-width: 0` on flex children can. We pick
+     `flex-wrap: wrap` because the nav reflowing naturally on narrow
+     viewports is the desired UX. Closes hub#391. */
+  flex-wrap: wrap;
+  /* Tighter vertical gap (row-gap 0.6rem) than horizontal (column-gap
+     1rem) so a wrapped second/third row reads as continuation, not a
+     new section. */
+  gap: 0.6rem 1rem;
+  align-items: center;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 2rem;
+}
+.nav .brand {
+  font-weight: 600;
+  font-family: var(--font-serif);
+  font-size: 1.15rem;
+  margin-right: auto;
+  /* Brand-mark SVG sits to the left of the wordmark + subtitle. flex
+   * lets the wordmark + subtitle inherit the brand's color, while the
+   * mark uses currentColor to follow. */
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  color: var(--accent);
+  text-decoration: none;
+}
+.nav .brand:hover {
+  color: var(--accent-hover);
+  text-decoration: none;
+}
+.nav .brand-mark-icon {
+  flex-shrink: 0;
+  /* `line-height: 0` cancels the inline-block ghost-baseline that
+   * would otherwise inflate the flex row's height. Don't remove —
+   * the SVG renders fine without it but the brand link grows by ~4px. */
+  line-height: 0;
+}
+.nav .brand-wordmark {
+  color: var(--fg);
+  letter-spacing: -0.005em;
+}
+.nav .brand .sub {
+  color: var(--fg-dim);
+  font-size: 0.78rem;
+  font-weight: 400;
+  margin-left: 0.4rem;
+  font-family: var(--font-sans);
+}
+.nav a {
+  color: var(--fg-muted);
+  font-size: 0.95rem;
+}
+.nav a:hover {
+  text-decoration: none;
+  color: var(--fg);
+}
+/* Active section indicator (NavLink). The current section reads accent +
+   carries an underline so the operator sees where they are at a glance —
+   pairs with the aria-current="page" the NavLink sets for assistive tech. */
+.nav a.nav-link-active {
+  color: var(--accent);
+  font-weight: 500;
+  text-decoration: underline;
+  text-underline-offset: 0.3em;
+  text-decoration-thickness: 2px;
+}
+/* Visual grouping between nav sections — vault provisioning, host admin,
+   top-level discovery. Subtle 1px vertical line; flex layout takes care
+   of spacing via the parent `.nav { gap: 1rem }`. */
+.nav .nav-divider {
+  display: inline-block;
+  width: 1px;
+  height: 1.1em;
+  background: var(--border);
+  align-self: center;
+}
+
+/* Installed-services quick-access dropdown in the nav (hub#342).
+   Native <details>/<summary> for the toggle behavior, absolute-
+   positioned panel so the dropdown doesn't push siblings around when
+   open. summary triangle is suppressed for visual parity with the
+   other nav items. */
+.nav .nav-dropdown {
+  position: relative;
+}
+.nav .nav-dropdown-summary {
+  list-style: none;
+  cursor: pointer;
+  color: var(--fg-muted);
+  font-size: 0.95rem;
+  user-select: none;
+}
+.nav .nav-dropdown-summary::-webkit-details-marker {
+  display: none;
+}
+.nav .nav-dropdown-summary:hover {
+  color: var(--fg);
+}
+.nav .nav-dropdown[open] > .nav-dropdown-summary {
+  color: var(--fg);
+}
+.nav .nav-dropdown-summary::after {
+  content: " \25BE"; /* ▾ */
+  font-size: 0.7em;
+  color: var(--fg-dim);
+}
+.nav .nav-dropdown-panel {
+  position: absolute;
+  top: calc(100% + 0.4rem);
+  left: 0;
+  z-index: 10;
+  min-width: 12rem;
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+  padding: 0.4rem 0;
+  display: flex;
+  flex-direction: column;
+}
+.nav .nav-dropdown-item {
+  padding: 0.4rem 0.85rem;
+  color: var(--fg);
+  font-size: 0.9rem;
+  text-decoration: none;
+}
+.nav .nav-dropdown-item:hover {
+  background: var(--bg-soft);
+  color: var(--fg);
+  text-decoration: none;
+}
+.nav .nav-dropdown-item-disabled {
+  color: var(--fg-dim);
+  cursor: not-allowed;
+}
+.nav .nav-dropdown-item-disabled:hover {
+  background: transparent;
+  color: var(--fg-dim);
+}
+
+/* SPA auth indicator — "Signed in as <name> · Sign out" or "Sign in".
+   Sits in the nav, after brand's margin-right:auto pushes everything
+   right. The brand keeps the layout balance; auth lands in the
+   right-aligned cluster with Vaults/Permissions/Tokens/Discovery.
+   Sign-out button is styled as an inline text link so the visual
+   weight matches the surrounding muted "Signed in as <name>" text. */
+.nav .auth-spa {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+}
+.nav .auth-spa strong {
+  font-weight: 600;
+  color: var(--fg);
+}
+.nav .auth-spa-signout {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent);
+  font: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
+}
+.nav .auth-spa-signout:hover:not(:disabled) {
+  color: var(--accent-hover);
+}
+.nav .auth-spa-signout:disabled {
+  color: var(--fg-dim);
+  cursor: not-allowed;
+}
+
+/* Heading hierarchy.
+ *
+ *   h1 — page title. Serif (matches oauth-ui.ts's baseDocument), generous
+ *        line-height. Used once per route as the canonical "you are on the
+ *        X page" landmark. Screen readers + keyboard users (Tab + H
+ *        navigation) rely on it.
+ *   h2 — section / list title within a page. Sans, slightly smaller.
+ *   h3 — sub-section within a card.
+ */
+h1 {
+  margin: 0 0 0.5rem;
+  font-family: var(--font-serif);
+  font-size: 1.85rem;
+  font-weight: 400;
+  letter-spacing: -0.01em;
+  line-height: 1.2;
+  color: var(--fg);
+}
+h2 {
+  margin: 0 0 1rem;
+  font-size: 1.4rem;
+  font-weight: 500;
+}
+
+.muted {
+  color: var(--fg-muted);
+  font-size: 0.92rem;
+}
+.dim {
+  color: var(--fg-dim);
+  font-size: 0.85rem;
+}
+
+.error-banner {
+  background: var(--error-soft);
+  border: 1px solid var(--error);
+  color: var(--error);
+  padding: 0.75rem 1rem;
+  border-radius: 8px;
+  margin-bottom: 1rem;
+  font-size: 0.9rem;
+}
+.warn-banner {
+  background: var(--warn-soft);
+  border: 1px solid var(--warn);
+  color: var(--warn);
+  padding: 0.75rem 1rem;
+  border-radius: 8px;
+  margin-bottom: 1rem;
+  font-size: 0.9rem;
+}
+
+.empty {
+  padding: 3rem 1.5rem;
+  text-align: center;
+  color: var(--fg-muted);
+  background: var(--bg-soft);
+  border-radius: 10px;
+}
+
+/* Loading state — subtle ellipsis pulse so "Loading…" feels alive
+ * without being noisy. Used everywhere `<p className="muted">Loading…</p>`
+ * appears today. Applied via the existing `.muted` class as a sibling
+ * condition would be intrusive; instead any element containing "Loading…"
+ * (we detect via [data-loading="true"] when authors want it) pulses.
+ *
+ * Default cadence: 1.4s breath. Subtle enough to recede if the load
+ * finishes within 100–200ms; recognizable on slow connections. */
+@keyframes pc-loading-pulse {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+[data-loading="true"] {
+  animation: pc-loading-pulse 1.4s ease-in-out infinite;
+}
+
+/* Table row hover — subtle warm-cream tint so admin tables feel
+ * navigable rather than static. Matches the .module-row hover affordance
+ * (lines ~799) so the visual language is consistent across SPA list
+ * shapes (rows of cards AND rows of cells). */
+.user-table tbody tr,
+.tokens-table tbody tr,
+.channel-table tbody tr {
+  transition: background-color 0.12s ease;
+}
+.user-table tbody tr:hover,
+.tokens-table tbody tr:hover,
+.channel-table tbody tr:hover {
+  background: var(--bg-soft);
+}
+
+/* List content entrance — fade-up so freshly-loaded routes feel
+ * settled rather than slammed. Mirrors the hub home's `.card` fade.
+ * Apply via `[data-route-content]` on the root of any route's main
+ * area (opt-in — tests / specific routes can omit if they care about
+ * deterministic paint timing). */
+@keyframes pc-route-fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+[data-route-content] {
+  animation: pc-route-fade-up 0.32s ease forwards;
+}
+/* Respect users who prefer no motion. */
+@media (prefers-reduced-motion: reduce) {
+  [data-loading="true"],
+  [data-route-content] {
+    animation: none;
+  }
+}
+
+/* Mobile-safe table container — wraps a wide table so the document doesn't
+ * overflow on narrow viewports. Tables with more columns than fit at 375 px
+ * (e.g. /admin/users with 5 cols) would otherwise force horizontal scroll on
+ * the entire document. With this wrapper, the table scrolls within its own
+ * bounded container; the rest of the page stays inside the viewport.
+ *
+ * Apply by wrapping any admin table: `<div className="table-scroll"><table>…`.
+ * Closes hub#398. */
+.table-scroll {
+  overflow-x: auto;
+  /* Smooth momentum scroll on iOS Safari. */
+  -webkit-overflow-scrolling: touch;
+  /* Render a subtle inner shadow at the right edge when content overflows
+   * so the user has a visual cue that there's more to see. Modern browsers
+   * support background-attachment: local; older fall back to no shadow.
+   * The cream gradient matches the page background. */
+  background:
+    linear-gradient(to right, var(--card-bg), var(--card-bg)) left center / 20px 100% no-repeat,
+    linear-gradient(to right, rgba(44, 42, 38, 0.08), rgba(44, 42, 38, 0)) left center / 8px 100% no-repeat,
+    linear-gradient(to left, var(--card-bg), var(--card-bg)) right center / 20px 100% no-repeat,
+    linear-gradient(to left, rgba(44, 42, 38, 0.08), rgba(44, 42, 38, 0)) right center / 8px 100% no-repeat;
+  background-attachment: local, scroll, local, scroll;
+}
+.table-scroll > table {
+  /* The table itself should take its intrinsic width — the container
+   * handles overflow. width: 100% would shrink columns and break layout. */
+  min-width: 100%;
+}
+.empty-rich {
+  text-align: left;
+  padding: 2rem 1.75rem;
+  background: white;
+  border: 1px solid var(--border);
+}
+.empty-rich .empty-headline {
+  font-size: 1.05rem;
+  color: var(--fg);
+  margin: 0 0 0.5rem;
+  font-weight: 500;
+}
+
+.list-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+.list-header h1,
+.list-header h2 {
+  margin: 0;
+}
+
+.tag {
+  display: inline-block;
+  padding: 0.1em 0.55em;
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-radius: 4px;
+  font-size: 0.78rem;
+  font-weight: 500;
+}
+.tag.muted {
+  background: var(--bg-soft);
+  color: var(--fg-muted);
+}
+
+/* Source chips on the /admin/tokens row — distinguish OAuth refresh
+   tokens from operator mints from CLI mints at a glance. Subtle,
+   palette-aligned; the chip is for orientation, not visual weight.
+   Built on the existing `.tag` base via a `source-<kind>` modifier. */
+.tag.source-oauth {
+  background: rgba(74, 124, 198, 0.12); /* subtle blue */
+  color: #3b6aa6;
+}
+.tag.source-operator {
+  background: rgba(198, 152, 74, 0.14); /* subtle gold */
+  color: #8a5e1f;
+}
+.tag.source-cli {
+  background: rgba(74, 124, 89, 0.14); /* sage — close to .tag accent base */
+  color: #2f5a3f;
+}
+.tag.source-unknown {
+  background: var(--bg-soft);
+  color: var(--fg-muted);
+}
+@media (prefers-color-scheme: dark) {
+  .tag.source-oauth {
+    background: rgba(122, 156, 220, 0.14);
+    color: #9bb6d8;
+  }
+  .tag.source-operator {
+    background: rgba(220, 180, 110, 0.14);
+    color: #d4b27a;
+  }
+  .tag.source-cli {
+    background: rgba(122, 176, 138, 0.14);
+    color: #8fc49e;
+  }
+  .tag.source-unknown {
+    /* Future-proof fallback for any created_via value the SPA's switch
+       doesn't yet know. Mirrors `.tag.muted` in dark mode — same
+       relationship to the page background as the light-mode rule above. */
+    background: rgba(232, 228, 220, 0.06);
+    color: #a8a49a;
+  }
+}
+
+.vault-row {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.85rem 1rem;
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-bottom: 0.5rem;
+  text-decoration: none;
+  color: inherit;
+  transition: border-color 0.15s ease;
+}
+.vault-row:hover {
+  border-color: var(--accent);
+  text-decoration: none;
+}
+.vault-row .body {
+  flex: 1;
+  min-width: 0;
+}
+.vault-row .name {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+.vault-row .name code {
+  font-size: 0.95em;
+}
+.vault-row .url {
+  margin-top: 0.25rem;
+  word-break: break-all;
+}
+.vault-row .chev {
+  color: var(--fg-dim);
+  font-size: 1.2rem;
+}
+/* Groups a vault row with its (optionally expanded) MCP-connect card so
+ * the card reads as belonging to the row above it. */
+.vault-row-group {
+  margin-bottom: 0.5rem;
+}
+.vault-row-group .vault-row {
+  margin-bottom: 0;
+}
+.vault-row-actions {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+/*
+ * Per-vault "MCP connection" card (the SPA twin of setup-wizard.ts
+ * renderMcpTile). Surfaced inline under a vault row in the legacy Vaults
+ * list (McpConnectCard.tsx — its NewVault created-view consumer left with
+ * B5 of the 2026-06-09 hub-module-boundary migration). The endpoint +
+ * command codeboxes reuse the `.token-box` shape from the mint banner so
+ * copy affordances read consistently across the SPA.
+ */
+.mcp-connect-card {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.1rem 1.25rem;
+  margin: 0 0 0.5rem;
+}
+.mcp-connect-card-embedded {
+  background: white;
+  margin-bottom: 0;
+}
+.mcp-connect-card h3 {
+  margin: 0 0 0.4rem;
+  font-size: 1rem;
+}
+.mcp-connect-card > p {
+  margin-top: 0;
+}
+.mcp-connect-card .token-box {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0.35rem 0 0.25rem;
+}
+.mcp-connect-card .token-box code {
+  flex: 1;
+  font-size: 0.85rem;
+  padding: 0.55rem 0.7rem;
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  word-break: break-all;
+  user-select: all;
+}
+.mcp-field {
+  margin-top: 0.9rem;
+}
+.mcp-field-label {
+  display: block;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--fg-muted);
+}
+.mcp-field .dim {
+  margin: 0.3rem 0 0;
+}
+.mcp-token-path {
+  margin-top: 1rem;
+  border-top: 1px solid var(--border);
+  padding-top: 0.75rem;
+}
+.mcp-token-path > summary {
+  cursor: pointer;
+  font-size: 0.9rem;
+  color: var(--fg-muted);
+}
+.mcp-token-path > summary:hover {
+  color: var(--accent);
+}
+.mcp-token-path .mint-banner {
+  margin-top: 0.75rem;
+  margin-bottom: 0;
+}
+.mcp-docs-link {
+  margin: 0.9rem 0 0;
+}
+
+form .row {
+  margin-bottom: 1rem;
+}
+form label {
+  display: block;
+  font-size: 0.9rem;
+  color: var(--fg-muted);
+  margin-bottom: 0.3rem;
+  font-weight: 500;
+}
+form input[type="text"] {
+  width: 100%;
+}
+form .actions {
+  display: flex;
+  gap: 0.6rem;
+  align-items: center;
+  margin-top: 1rem;
+}
+form .field-hint {
+  margin-top: 0.35rem;
+  font-size: 0.82rem;
+  color: var(--fg-dim);
+}
+form .field-error {
+  margin-top: 0.35rem;
+  font-size: 0.85rem;
+  color: var(--error);
+}
+
+.section {
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1.25rem 1.5rem;
+  margin-bottom: 1.5rem;
+}
+
+/* Mint banner — single-emit token reveal. */
+.mint-banner {
+  background: var(--success-soft);
+  border: 1px solid var(--success);
+  border-radius: 10px;
+  padding: 1.25rem 1.5rem;
+  margin-bottom: 1.5rem;
+}
+.mint-banner h3 {
+  margin: 0 0 0.5rem;
+  font-size: 1rem;
+  color: var(--success);
+}
+.mint-banner .token-box {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0.85rem 0 0.5rem;
+}
+.mint-banner code {
+  flex: 1;
+  font-size: 0.9rem;
+  padding: 0.6rem 0.75rem;
+  background: white;
+  border: 1px solid var(--border);
+  word-break: break-all;
+  user-select: all;
+}
+.mint-banner .warn {
+  margin: 0.75rem 0 0;
+  font-size: 0.85rem;
+  color: var(--warn);
+}
+.mint-banner .actions {
+  margin-top: 1rem;
+  display: flex;
+  gap: 0.5rem;
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: 8.5rem 1fr;
+  gap: 0.5rem 1rem;
+  font-size: 0.92rem;
+}
+.kv > div:nth-child(odd) {
+  color: var(--fg-muted);
+}
+.kv code {
+  word-break: break-all;
+}
+
+/* Channel toggle (hub#275) — hub-wide install channel picker on /admin/modules. */
+.channel-toggle {
+  margin: 1.25rem 0 1.5rem;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--border, #ddd);
+  border-radius: 6px;
+  background: var(--bg-soft, #fafafa);
+}
+.channel-toggle legend {
+  padding: 0 0.25rem;
+  font-weight: 600;
+  font-size: 0.95rem;
+}
+.channel-toggle label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-right: 1.5rem;
+  cursor: pointer;
+  font-size: 0.95rem;
+}
+.channel-toggle label input[type="radio"]:disabled + * {
+  opacity: 0.5;
+}
+.channel-toggle code {
+  font-size: 0.85em;
+}
+.channel-toggle p.muted {
+  margin: 0.4rem 0 0;
+  font-size: 0.85rem;
+}
+
+/*
+ * /admin/modules — two-section layout (hub#260 closeout).
+ *
+ * Installed modules sit on top in `.modules-installed`; the
+ * "Install a module" catalog sits below in `.modules-installable`.
+ * Each section gets a small top-margin and a sub-heading; the empty
+ * states are inline muted prose, not the page-level `.empty` block
+ * (that's the route-level error / loading affordance).
+ */
+.modules-installed,
+.modules-installable {
+  margin-top: 1.75rem;
+}
+.modules-installed > h2,
+.modules-installable > h2 {
+  font-size: 1.15rem;
+  font-weight: 600;
+  margin: 0 0 0.75rem;
+  color: var(--fg);
+}
+.modules-installed > p.muted,
+.modules-installable > p.muted {
+  margin: 0 0 0.5rem;
+}
+
+/*
+ * Experimental tier (2026-06-09 modular-UI architecture). Exploration modules
+ * (channel / runner / …) are grouped + de-emphasized below the core surface —
+ * NEVER hidden. The wrapper drops opacity slightly and adds a top rule so the
+ * boundary reads as "still here, just not the headline." Hover restores full
+ * opacity so the group is fully usable.
+ */
+.modules-experimental {
+  margin-top: 1.25rem;
+  padding-top: 0.75rem;
+  border-top: 1px dashed var(--border, #d0d0d0);
+  opacity: 0.78;
+  transition: opacity 0.15s ease;
+}
+.modules-experimental:hover,
+.modules-experimental:focus-within {
+  opacity: 1;
+}
+.experimental-heading {
+  font-size: 0.95rem;
+  font-weight: 600;
+  margin: 0 0 0.6rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.experimental-heading > span.muted {
+  text-transform: none;
+  letter-spacing: normal;
+  font-weight: 400;
+}
+
+/*
+ * Deprecated tier (2026-06-25). Modules retained for back-compat (notes-daemon
+ * / runner) — shown only when already installed so an operator can manage /
+ * uninstall them; NOT offered on a fresh install. De-emphasized a touch further
+ * than experimental (lower base opacity) to read as "legacy, not the path
+ * forward." Same hover-restores-full-opacity affordance.
+ */
+.modules-deprecated {
+  margin-top: 1.25rem;
+  padding-top: 0.75rem;
+  border-top: 1px dashed var(--border, #d0d0d0);
+  opacity: 0.65;
+  transition: opacity 0.15s ease;
+}
+.modules-deprecated:hover,
+.modules-deprecated:focus-within {
+  opacity: 1;
+}
+.deprecated-heading {
+  font-size: 0.95rem;
+  font-weight: 600;
+  margin: 0 0 0.6rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.deprecated-heading > span.muted {
+  text-transform: none;
+  letter-spacing: normal;
+  font-weight: 400;
+}
+
+/*
+ * "Install a module" catalog row — visually lighter than the heavier
+ * `.module-row` (no status badge, no meta grid, just name + tagline +
+ * package + Install). The card lays out as body+actions side by side
+ * on wide viewports and stacks on narrow ones.
+ */
+.install-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+.install-card {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+  padding: 0.85rem 1rem;
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  transition: border-color 0.15s ease;
+}
+.install-card:hover {
+  border-color: var(--accent);
+}
+.install-card-body {
+  flex: 1 1 0;
+  min-width: 0;
+}
+.install-card-body h3 {
+  margin: 0 0 0.2rem;
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--fg);
+}
+.install-card-body .tagline {
+  margin: 0 0 0.35rem;
+  color: var(--fg-muted);
+  font-size: 0.92rem;
+}
+.install-card-meta {
+  margin: 0;
+  font-size: 0.82rem;
+}
+.install-card-actions {
+  flex: 0 0 auto;
+}
+.install-card .error {
+  flex-basis: 100%;
+  margin-top: 0.5rem;
+  color: var(--error);
+  font-size: 0.85rem;
+}
+
+/*
+ * Upgrade-hub card (design 2026-06-01 §5.3 / D4). Reuses the `.install-card`
+ * shape but sits at the top of /admin/modules as the host's own upgrade
+ * affordance. A subtle accent left-border marks it as the host (not a module
+ * row). The status line (upgrading / success / timeout / redeploy) wraps full
+ * width below the body via the existing `.warn-banner` / `.error-banner`.
+ */
+.hub-upgrade-card {
+  border-left: 3px solid var(--accent);
+  margin-top: 1.25rem;
+}
+.hub-upgrade-card .warn-banner,
+.hub-upgrade-card .error-banner {
+  flex-basis: 100%;
+  margin: 0.5rem 0 0;
+  font-size: 0.85rem;
+}
+
+/*
+ * "Configure" link styled to match sibling action buttons on
+ * `.module-row .actions`. React-router's <Link> renders an <a>, so
+ * default `a` styles take over without these overrides — we want it
+ * to look like a button next to Restart / Upgrade / Uninstall.
+ */
+.module-row .actions .btn,
+a.btn {
+  display: inline-block;
+  font: inherit;
+  background: var(--accent);
+  color: white;
+  border: 0;
+  border-radius: 6px;
+  padding: 0.55rem 1.1rem;
+  cursor: pointer;
+  transition: background 0.15s ease;
+  text-decoration: none;
+}
+.module-row .actions .btn:hover,
+a.btn:hover {
+  background: var(--accent-hover);
+  text-decoration: none;
+}
+
+/*
+ * Hosted-UI sub-units rendered under a `.module-row` (hub#313 / #315).
+ *
+ * `<details className="module-uis">` is the operator-collapsible
+ * wrapper; the `<ul className="ui-sub-units">` inside it lays each
+ * sub-unit out as a single icon + body + status row. Indented from the
+ * parent module row so the operator reads it as "stuff this module
+ * hosts" rather than as a peer module. Status badges reuse the same
+ * `.status status-<state>` shape as the supervisor badge on
+ * `.module-row` — colors are sourced from the existing accent / warn /
+ * fg-muted tokens so the palette stays continuous.
+ */
+.module-uis {
+  margin: 0.5rem 0 0;
+  padding: 0.5rem 0 0;
+  border-top: 1px solid var(--border-light);
+}
+.module-uis > summary {
+  cursor: pointer;
+  font-size: 0.88rem;
+  color: var(--fg-muted);
+  font-weight: 500;
+  padding: 0.15rem 0;
+  list-style: revert; /* keep native disclosure triangle */
+}
+.module-uis > summary:hover {
+  color: var(--fg);
+}
+.ui-sub-units {
+  list-style: none;
+  padding: 0;
+  margin: 0.5rem 0 0 1.1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+.ui-sub-unit {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.5rem 0.75rem;
+  background: var(--bg-soft);
+  border: 1px solid var(--border-light);
+  border-radius: 6px;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+.ui-sub-unit:hover {
+  border-color: var(--accent);
+  background: white;
+}
+.ui-icon {
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  border-radius: 4px;
+  object-fit: contain;
+}
+.ui-sub-unit-body {
+  flex: 1 1 0;
+  min-width: 0;
+}
+.ui-sub-unit-link {
+  color: var(--fg);
+  font-size: 0.95rem;
+  text-decoration: none;
+}
+.ui-sub-unit-link:hover {
+  color: var(--accent);
+  text-decoration: underline;
+}
+.ui-sub-unit-link strong {
+  font-weight: 600;
+}
+.ui-sub-unit .tagline {
+  margin: 0.2rem 0 0;
+  font-size: 0.82rem;
+  color: var(--fg-muted);
+}
+
+/*
+ * Generic `.status` badge + per-state colors. Used by both the
+ * `.module-row` supervisor badge and by `.ui-sub-unit` (hub#313).
+ * Shape mirrors `.tag` — small inline-block pill, palette-aligned.
+ * Defaults to muted gray; per-state classes override only color +
+ * background so adding a new state is a one-rule extension.
+ */
+.status {
+  flex: 0 0 auto;
+  display: inline-block;
+  padding: 0.1em 0.55em;
+  background: var(--bg-soft);
+  color: var(--fg-muted);
+  border-radius: 4px;
+  font-size: 0.78rem;
+  font-weight: 500;
+  white-space: nowrap;
+}
+/*
+ * Four canonical status classes per design-system.md §6 (workstream F).
+ * Shared across the module-row supervisor badge, sub-unit badges, and
+ * any future status surface (e.g. expose-state, vault sync).
+ */
+.status-active {
+  background: var(--success-soft);
+  color: var(--success);
+}
+.status-pending {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+.status-inactive {
+  background: var(--bg-soft);
+  color: var(--fg-dim);
+}
+.status-failing {
+  background: var(--error-soft);
+  color: var(--error);
+}
+/*
+ * `.status-absent` is the catch-all for rows with no supervisor state at
+ * all (uninstalled / unsupervised modules). Pre-F the code emitted
+ * `status-${supervisor_status ?? "absent"}` but no CSS rule backed it;
+ * this rule replaces the unstyled fallback with a muted shape consistent
+ * with `.status-inactive`. Used by `statusBadge` in Modules.tsx.
+ */
+.status-absent {
+  background: var(--bg-soft);
+  color: var(--fg-dim);
+}
+/*
+ * Invite-link statuses (design §7). `pending` reuses `.status-pending`
+ * above. `redeemed` is a successful terminal state (success palette);
+ * `expired` + `revoked` are muted terminal states.
+ */
+.status-redeemed {
+  background: var(--success-soft);
+  color: var(--success);
+}
+.status-expired {
+  background: var(--bg-soft);
+  color: var(--fg-dim);
+}
+.status-revoked {
+  background: var(--bg-soft);
+  color: var(--fg-dim);
+}
+/*
+ * Agent-connector grant statuses (4b-1). `pending` reuses `.status-pending`;
+ * `approved` is the success terminal state; `revoked` reuses the muted rule
+ * above. `.error-inline` is the per-row action error beside the Approve/Revoke
+ * buttons in the Grants view.
+ */
+.status-approved {
+  background: var(--success-soft);
+  color: var(--success);
+}
+.error-inline {
+  color: var(--error);
+  font-size: 0.85rem;
+}
+
+/*
+ * Back-compat aliases for the pre-F vocabulary. Modules / SDKs that
+ * render the legacy class names (`status-pending-oauth`, `status-disabled`)
+ * continue to paint correctly for one release window after workstream F
+ * lands; retire after the next rc chain when downstream consumers have
+ * had time to migrate. See design-system.md §6 "CSS classes + colors".
+ */
+.status-pending-oauth {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+.status-disabled {
+  background: var(--bg-soft);
+  color: var(--fg-dim);
+}
+
+/*
+ * Visually-hidden utility for screen-reader-only text. Used by the
+ * first-admin disabled-Delete button on /admin/users to wire
+ * `aria-describedby` to an explanation that's invisible to sighted
+ * users but exposed to assistive tech (where `title` on a disabled
+ * button is unreliable). Standard WAI-ARIA shape — clip path keeps
+ * the element off-screen but in the accessibility tree.
+ */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Hub version + uptime footer badge (hub#348). Persistent, low-noise:
+   muted single line at the bottom of the SPA page, click expands a
+   detail panel inline (no portal, no overlay). Sits in `.page`'s
+   bottom padding (`6rem`) so longer detail panels don't overlap the
+   primary content. */
+.hub-version-badge {
+  margin-top: 3rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border-light);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.75rem;
+  color: var(--fg-muted);
+  font-size: 0.8rem;
+}
+.hub-version-badge-summary {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  color: var(--fg-muted);
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+  border-radius: 4px;
+}
+.hub-version-badge-summary:hover {
+  color: var(--fg);
+  background: transparent;
+}
+.hub-version-badge-summary strong {
+  color: var(--fg);
+  font-weight: 600;
+}
+.hub-version-badge-source {
+  font-variant: small-caps;
+  letter-spacing: 0.04em;
+}
+.hub-version-badge-panel {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.85rem 1rem;
+  font-size: 0.85rem;
+  color: var(--fg);
+  width: 100%;
+  max-width: 28rem;
+}
+.hub-version-badge-panel dl {
+  margin: 0 0 0.75rem;
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.3rem 0.85rem;
+}
+.hub-version-badge-panel dt {
+  color: var(--fg-muted);
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding-top: 0.1rem;
+}
+.hub-version-badge-panel dd {
+  margin: 0;
+  color: var(--fg);
+  word-break: break-all;
+}
+.hub-version-badge-refresh {
+  font-size: 0.8rem;
+  padding: 0.35rem 0.85rem;
+}
+
+/* Missing-dependency install card (MissingDependencyCard.tsx). Rendered in
+   the Modules operations banner when an install/op fails because a required
+   external binary isn't on PATH. Leans on the existing error/warn tokens so
+   it reads as "actionable problem" without a new palette. */
+.depcard-wrap {
+  margin-top: 0.6rem;
+}
+.depcard {
+  border: 1px solid var(--warn);
+  background: var(--warn-soft);
+  border-radius: 8px;
+  padding: 0.9rem 1rem;
+}
+.depcard-heading {
+  margin: 0 0 0.25rem;
+  font-size: 1rem;
+}
+.depcard-why {
+  margin: 0 0 0.75rem;
+  font-size: 0.9rem;
+}
+.depcard-installs-label {
+  margin: 0 0 0.4rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+.depcard-install {
+  margin-bottom: 0.55rem;
+}
+.depcard-install.preferred .depcard-os {
+  color: var(--accent);
+  font-weight: 600;
+}
+.depcard-os {
+  display: block;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--fg-muted);
+  margin-bottom: 0.2rem;
+}
+.depcard-cmd {
+  display: flex;
+  align-items: stretch;
+  gap: 0.4rem;
+}
+.depcard-cmd-text {
+  flex: 1;
+  margin: 0;
+  padding: 0.45rem 0.6rem;
+  background: var(--card-bg, #fff);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 0.82rem;
+  white-space: pre-wrap;
+  overflow-x: auto;
+}
+.depcard-copy {
+  flex: 0 0 auto;
+  font-size: 0.8rem;
+  padding: 0.35rem 0.7rem;
+  align-self: flex-start;
+}
+.depcard-docs {
+  margin: 0.5rem 0 0.4rem;
+  font-size: 0.88rem;
+}
+.depcard-hint {
+  margin: 0;
+  font-size: 0.82rem;
+}
+.depcard-fallback {
+  color: var(--error);
+  font-size: 0.9rem;
+}
+
+/* ---------------------------------------------------------------------------
+ * Admin Home / Overview (admin-shell IA, R1).
+ *
+ * The single orientation landing at /admin. Three clearly-separated groups —
+ * Administer (hub-native, in-shell), Modules (module-owned admin, off-shell),
+ * Your surfaces (module-owned user UIs, off-shell). The hub-native ↔ module-
+ * owned boundary is the core clarity fix: hub cards read as plain in-shell
+ * links; module/surface cards carry the `↗` external mark + an owner caption.
+ * ------------------------------------------------------------------------- */
+.admin-home > .muted {
+  margin-bottom: 1.75rem;
+}
+
+.home-group {
+  margin-bottom: 2.25rem;
+}
+.home-group-head {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  margin-bottom: 0.25rem;
+}
+.home-group-head h2 {
+  margin: 0;
+  font-size: 1.25rem;
+}
+.home-group-sub {
+  margin: 0 0 1rem;
+}
+
+/* Group tag — telegraphs whether a group is hub-native or module-owned, the
+   same hub-vs-module axis the cards carry. Built on the `.tag` base palette. */
+.home-group-tag {
+  display: inline-block;
+  padding: 0.1em 0.55em;
+  border-radius: 4px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+.home-group-tag-hub {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.home-group-tag-module {
+  background: var(--bg-soft);
+  color: var(--fg-muted);
+}
+
+.home-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 0.85rem;
+}
+
+.home-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  padding: 0.95rem 1.1rem;
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  text-decoration: none;
+  color: inherit;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.12s ease;
+}
+.home-card:hover {
+  text-decoration: none;
+  border-color: var(--accent);
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.05);
+  transform: translateY(-1px);
+}
+/* Module-owned cards (admin + surface) sit on the soft background so the
+   off-shell group reads as visually distinct from the in-shell hub cards. */
+.home-card-module,
+.home-card-surface {
+  background: var(--bg-soft);
+}
+.home-card-disabled {
+  cursor: default;
+  opacity: 0.65;
+}
+.home-card-disabled:hover {
+  border-color: var(--border);
+  box-shadow: none;
+  transform: none;
+}
+
+.home-card-title {
+  font-weight: 600;
+  font-size: 1rem;
+  color: var(--fg);
+}
+.home-card-desc {
+  font-size: 0.86rem;
+  color: var(--fg-muted);
+  line-height: 1.4;
+}
+/* Owner caption — "opens <module>'s own admin". The explicit hub-vs-module
+   boundary label, paired with the `↗` mark in the title. */
+.home-card-owner {
+  margin-top: 0.15rem;
+  font-size: 0.76rem;
+  color: var(--accent);
+  font-weight: 500;
+}
+.home-card-owner-empty {
+  color: var(--fg-dim);
+  font-weight: 400;
+}
+
+/* External-surface mark — the `↗` that flags "this leaves the hub shell". */
+.ext-mark {
+  font-size: 0.85em;
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* -------------------------------------------------------------------------
+ * Admin screen-lock (optional idle PIN lock).
+ *
+ * The lock screen replaces the whole admin shell when the session is locked —
+ * a single lock over everything (phone-style), not per-action gating. Tokens
+ * are lifted from the brand palette so it stays continuous with the login →
+ * consent → admin flow the operator just walked through.
+ * ---------------------------------------------------------------------------*/
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.lock-screen {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+  padding: 1.5rem;
+}
+
+.lock-card {
+  width: 100%;
+  max-width: 22rem;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 0.35rem;
+  padding: 2rem 1.75rem;
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+}
+
+.lock-brand-mark {
+  margin-bottom: 0.4rem;
+}
+
+.lock-title {
+  font-size: 1.2rem;
+  margin: 0;
+}
+
+.lock-sub {
+  margin: 0 0 0.6rem;
+  font-size: 0.9rem;
+}
+
+.lock-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  width: 100%;
+}
+
+.lock-pin-input {
+  width: 100%;
+  text-align: center;
+  letter-spacing: 0.45em;
+  font-size: 1.3rem;
+  padding: 0.7rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+.lock-pin-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.lock-error {
+  margin-top: 0.6rem;
+  color: var(--error);
+  font-size: 0.88rem;
+}
+
+/* Settings: admin-lock block. */
+.lock-settings-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.7rem;
+  max-width: 28rem;
+}
+
+.lock-settings-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  font-size: 0.9rem;
+}
+
+.lock-status-pill {
+  display: inline-block;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 500;
+}
+
+.lock-status-on {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.lock-status-off {
+  background: var(--bg-soft);
+  color: var(--fg-muted);
+}
+
+/* One-time 2FA backup codes (My account page). Monospace grid for legibility. */
+.backup-codes {
+  list-style: none;
+  padding: 0;
+  margin: 0.5rem 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(8rem, 1fr));
+  gap: 0.35rem;
+}
+
+.backup-codes li code {
+  font-size: 0.95rem;
+  letter-spacing: 0.02em;
+}
+
+/* ---------------------------------------------------------------------------
+ * /admin/account — summary-first disclosure cards + the key-link stepper
+ * (hub#880).
+ *
+ * Before this the page was four full-weight `<section>`s stacked into one long
+ * settings dump: password, 2FA, a paginated token list, keys. The card shell
+ * below collapses each to a single row — title on the left, one-line status on
+ * the right — so the whole account posture reads at a glance and only the
+ * section you're actually working in is expanded.
+ *
+ * Everything here is built from the existing tokens (`--accent`, `--bg-soft`,
+ * `--border`, …). No new palette; these surfaces stay continuous with the
+ * server-rendered login/consent flow.
+ * ------------------------------------------------------------------------- */
+.account-page > .muted {
+  margin-bottom: 1.5rem;
+}
+
+.account-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.account-card {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.account-card.is-open {
+  border-color: var(--accent);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.04);
+}
+
+/* The heading is a real <h2> so heading navigation still lands on each
+   section; the button inside it carries the disclosure semantics. Reset the
+   global h2 margins/size — the card header is a control, not a title block. */
+.account-card-heading {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 500;
+}
+.account-card-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  width: 100%;
+  background: transparent;
+  color: var(--fg);
+  border: 0;
+  border-radius: 0;
+  padding: 0.9rem 1.25rem;
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+}
+.account-card-toggle:hover {
+  background: var(--bg-soft);
+}
+.account-card-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.account-card-chevron {
+  flex: 0 0 auto;
+  color: var(--fg-dim);
+  font-size: 0.8rem;
+  line-height: 1;
+  width: 0.8rem;
+}
+.account-card-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 1.05rem;
+  font-weight: 600;
+}
+/* The one-line status: "3 API tokens", "1 linked key", or a status pill. */
+.account-card-summary {
+  flex: 0 0 auto;
+  color: var(--fg-muted);
+  font-size: 0.86rem;
+  font-weight: 400;
+  text-align: right;
+}
+.account-card-body {
+  padding: 1rem 1.25rem 1.25rem;
+  border-top: 1px solid var(--border-light);
+}
+.account-card-body > p:first-child {
+  margin-top: 0;
+}
+.account-card-body h3 {
+  margin: 0 0 0.5rem;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+/* Stacked form fields inside a card. `form label` is already block-level with
+   a muted caption; this just gives the fields breathing room and keeps text
+   inputs from running the full 880px page width. */
+.account-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+  max-width: 30rem;
+  margin-top: 0.75rem;
+}
+.account-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  margin-bottom: 0;
+}
+.account-form .actions {
+  margin-top: 0.25rem;
+}
+.account-event-input {
+  width: 100%;
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+}
+
+/* Secondary disclosure inside a card — the token mint form, the
+   "paste manually" path. Styled as a quiet text toggle, not a button, so it
+   doesn't compete with the primary action beside it. */
+.account-subsection {
+  margin: 1rem 0;
+}
+button.account-disclosure {
+  background: transparent;
+  border: 0;
+  padding: 0.2rem 0;
+  color: var(--accent);
+  font-size: 0.9rem;
+  font-weight: 500;
+  border-radius: 4px;
+}
+button.account-disclosure:hover {
+  background: transparent;
+  color: var(--accent-hover);
+  text-decoration: underline;
+}
+button.account-disclosure:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* -------------------------------------------------------------------------
+ * Nostr key-link stepper.
+ *
+ * Three numbered steps — get the statement, sign it, confirm — so the
+ * ceremony reads as a guided flow rather than a developer form with a JSON
+ * textarea. The indicator is an <ol> (the steps are genuinely ordered) and the
+ * active step carries `aria-current="step"`.
+ * ----------------------------------------------------------------------- */
+.link-flow {
+  margin: 1rem 0;
+}
+.link-steps {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 1.1rem;
+  margin: 0 0 1rem;
+  padding: 0;
+}
+.link-step {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.86rem;
+  color: var(--fg-dim);
+}
+.link-step-num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.4rem;
+  height: 1.4rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-soft);
+  color: var(--fg-dim);
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+.link-step-done {
+  color: var(--fg-muted);
+}
+.link-step-done .link-step-num {
+  background: var(--success-soft);
+  border-color: var(--success);
+  color: var(--success);
+}
+.link-step-current {
+  color: var(--fg);
+  font-weight: 600;
+}
+.link-step-current .link-step-num {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: white;
+}
+
+.link-panel {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.1rem 1.25rem;
+}
+.link-panel > p:first-of-type {
+  margin-top: 0;
+}
+
+/* The hub's one-time challenge sentence. Deliberately prominent — it is the
+   thing the operator is being asked to vouch for, and a signer that shows
+   event content will show them exactly this text. */
+.statement-box {
+  margin: 0.85rem 0;
+  padding: 0.85rem 1rem;
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  font-family: var(--font-serif);
+  font-size: 1rem;
+  line-height: 1.5;
+  color: var(--fg);
+}
+.statement-box code {
+  background: transparent;
+  padding: 0;
+  font-family: inherit;
+  font-size: inherit;
+}
+
+/* Inline form / action error. Every SPA route already emits
+   `<div className="error">` (Account, Settings, Modules) but no rule ever
+   backed it, so failures rendered as plain body text. */
+.error {
+  margin-top: 0.6rem;
+  color: var(--error);
+  font-size: 0.9rem;
+}

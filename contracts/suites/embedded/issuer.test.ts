@@ -7,8 +7,10 @@
 //   - box mode too: a vault the hub starts must verify that hub's tokens on a non-default hub port without
 //     PARACHUTE_HUB_JWKS_ORIGIN (today it fetches keys from :1939, vault src/hub-jwt.ts:23,63). Found while wiring
 //     the candidate adapter, which needs that variable as a workaround (harness/candidate.ts).
-// Today the CLI takes the issuer from expose-state, then hub.port, then :1939 (hub src/hub-issuer.ts:18-30) and
-// ignores PARACHUTE_HUB_ORIGIN. Lane C turns these green.
+// Stock 0.7 takes the issuer from expose-state, then hub.port, then :1939 (hub src/hub-issuer.ts:18-30) and ignores
+// PARACHUTE_HUB_ORIGIN. Lane A1 took fix 1's two lines into the moved hub (PARACHUTE_HUB_ORIGIN names the issuer;
+// serve points its vault child's key fetch at itself), so the CLI and box tests are green on the core build. The
+// embedded tests are lane C's, which also replaces those environment variables with values passed in (PLAN §2.2).
 import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -32,9 +34,8 @@ describe("embedded/issuer", () => {
     expect(operatorIss(home)).toStartWith("http://");
   });
 
-  red(
+  test(
     "with PARACHUTE_HUB_ORIGIN set, rotate-operator and mint-token sign with exactly that iss, and no hub.port is read or written",
-    { reason: /iss is http:\/\/127\.0\.0\.1:1939, want http:\/\/127\.0\.0\.1:\d+/, lane: "C" },
     async () => {
       const home = newHome("iss");
       const origin = `http://127.0.0.1:${await freePort()}`;
@@ -135,9 +136,8 @@ describe("embedded/issuer", () => {
     },
   );
 
-  red(
+  test(
     "box: on a non-default hub port with only PARACHUTE_HUB_ORIGIN set (no hub.port, no JWKS env), the CLI's tokens verify at the vault the hub started",
-    { reason: /iss is http:\/\/127\.0\.0\.1:1939, want http:\/\/127\.0\.0\.1:\d+/, lane: "C" },
     async () => {
       const r = await inOwnNetwork("box-issuer.run.ts", { hubPortFile: false });
       must(!r.hubPortFile, "hub/run/hub.port was written");
@@ -146,9 +146,8 @@ describe("embedded/issuer", () => {
     },
   );
 
-  red(
+  test(
     "box: a vault the hub starts verifies that hub's tokens on a non-default hub port without PARACHUTE_HUB_JWKS_ORIGIN",
-    { reason: /the vault refused a token its own hub signed: HTTP 401/, lane: "C" },
     async () => {
       // hub.port is written so today's CLI signs with the right iss; what's left is where the vault gets the keys.
       const r = await inOwnNetwork("box-issuer.run.ts", { hubPortFile: true });

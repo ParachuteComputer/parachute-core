@@ -1,0 +1,714 @@
+import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { CANONICAL_TAGLINE, WORDMARK_TEXT, brandMarkSvg } from "./brand.ts";
+import { CONFIG_DIR } from "./config.ts";
+import { CSRF_FIELD_NAME } from "./csrf.ts";
+
+/**
+ * Hub page served at `/` when the node is exposed.
+ *
+ * The page is split into two sections, organized by **ownership**:
+ *
+ *   - **Services** — surfaces provided by the modules running on this
+ *     hub. Browse notes (the Notes PWA); transcribe audio (Scribe);
+ *     administer a vault (Vault admin SPA); run agents (Agent). Each
+ *     entry points at the service's own UI; the service owns what's
+ *     behind the link (use, config, admin — whatever it chooses to
+ *     surface). Entries are dynamic, derived from
+ *     `/.well-known/parachute.json`; only installed services show up.
+ *     Vault declares `uiUrl` per workstream C (patterns#96, 2026-05-25)
+ *     — the earlier "vault has no tile because content browses via
+ *     Notes" rule split: Notes covers end-user content browsing; the
+ *     vault tile covers operator admin (per-vault tokens, config, MCP).
+ *     Both deserve discovery presence.
+ *
+ *   - **Admin** — hub-owned admin surfaces for cross-cutting host
+ *     concerns. Always visible: even with zero vaults installed, an
+ *     operator may want to provision the first one. Three entries:
+ *     Vaults (provisioning), Permissions (OAuth consent grants), Tokens
+ *     (registry mint/list/revoke).
+ *
+ * The Services-vs-Admin axis is ownership, not function: services-owned
+ * UIs vs hub-owned UIs. The first cut framed it as "Use vs Admin" but
+ * that broke down once you noticed real services have UIs that mix use,
+ * config, and admin together — the cleaner cut is who's hosting the UI.
+ *
+ * The file stays self-contained (inline CSS + JS, no external assets) so
+ * `tailscale serve` can mount it directly from disk with `--set-path=/`.
+ */
+
+export const HUB_PATH = join(CONFIG_DIR, "well-known", "hub.html");
+export const HUB_MOUNT = "/";
+
+export interface RenderHubSession {
+  /** displayName from /api/me semantics — username today, profile field later. */
+  displayName: string;
+  /** Per-session CSRF token; embedded in the inline sign-out form. */
+  csrfToken: string;
+}
+
+export interface RenderHubOpts {
+  /**
+   * When set, renders "Signed in as <displayName>" + an inline sign-out
+   * form. When omitted (or null), renders a "Sign in" link. Pass through
+   * from `findActiveSession` + `ensureCsrfToken` in the hub-server `/`
+   * handler — the static-disk write path (`writeHubFile`) emits the
+   * signed-out shape, since that file gets served only when the
+   * dynamic path can't (`!getDb`).
+   */
+  session?: RenderHubSession | null;
+}
+
+export function renderHub(opts: RenderHubOpts = {}): string {
+  return buildHtml(opts);
+}
+
+/**
+ * Write the static signed-out HTML to disk. Used by `parachute expose` so
+ * `tailscale serve --set-path=/` has a file to back. The dynamic
+ * session-aware path runs through `hub-server.ts`'s `/` handler whenever
+ * a DB is configured; this disk file is the fallback when it isn't.
+ */
+export function writeHubFile(path: string = HUB_PATH): string {
+  if (!existsSync(dirname(path))) {
+    mkdirSync(dirname(path), { recursive: true });
+  }
+  const html = renderHub();
+  const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
+  writeFileSync(tmp, html);
+  renameSync(tmp, path);
+  return path;
+}
+
+function buildHtml({ session }: RenderHubOpts): string {
+  const authBlock = session
+    ? renderSignedIn(session.displayName, session.csrfToken)
+    : renderSignedOut();
+  // Gate the verbose discovery sections (Get started / Services / Admin)
+  // and their data-loading script on auth state. A signed-out visitor sees
+  // a clean, minimal landing — brand + tagline + a clear "Sign in" call —
+  // not the hub's service catalog, vault listings, or admin links. The
+  // detail un-gates the moment they sign in (the server already knows auth
+  // state from the session cookie, so this stays a no-JS-required,
+  // session-aware render). Operator feedback from a live multi-user deploy:
+  // the signed-out page exposed too much to anonymous visitors.
+  const body = session ? SIGNED_IN_BODY : SIGNED_OUT_BODY;
+  const script = session ? DISCOVERY_SCRIPT : "";
+  return HTML_TEMPLATE.replace("<!--AUTH-INDICATOR-->", authBlock)
+    .replace("<!--DISCOVERY-BODY-->", body)
+    .replace("<!--DISCOVERY-SCRIPT-->", script);
+}
+
+function renderSignedIn(displayName: string, csrfToken: string): string {
+  // Inline POST form so sign-out works without JS. Submit button is
+  // styled as a text link via `.auth-signout` so the visual weight
+  // matches the surrounding "Signed in as <name>" text.
+  //
+  // The "Account" link is the single breadcrumb to `/account/` — the
+  // self-service home where any signed-in user (admin or invited
+  // member) can change their password, see their vault, and sign out.
+  // Without it, a friend who's been handed credentials has no way to
+  // discover the change-password surface after the first-login prompt.
+  return `<div class="auth-indicator">
+      <span class="muted">Signed in as <strong>${escapeHtml(displayName)}</strong></span>
+      <a href="/account/" class="auth-account">Account</a>
+      <form method="POST" action="/logout" class="auth-signout-form">
+        <input type="hidden" name="${CSRF_FIELD_NAME}" value="${escapeAttr(csrfToken)}" />
+        <button type="submit" class="auth-signout">Sign out</button>
+      </form>
+    </div>`;
+}
+
+function renderSignedOut(): string {
+  return `<div class="auth-indicator">
+      <a href="/login?next=/" class="auth-signin">Sign in</a>
+    </div>`;
+}
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function escapeAttr(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+}
+
+const HTML_TEMPLATE = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Parachute</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ctext y='26' font-size='26'%3E\u{1FA82}%3C/text%3E%3C/svg%3E" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=DM+Sans:wght@400;500;600&display=swap" />
+<style>
+  :root {
+    --bg: #faf8f4;
+    --bg-soft: #f3f0ea;
+    --fg: #2c2a26;
+    --fg-muted: #6b6860;
+    --fg-dim: #9a9690;
+    --accent: #4a7c59;
+    --accent-soft: rgba(74, 124, 89, 0.08);
+    --accent-hover: #3d6849;
+    --accent-light: #6a9b77;
+    --border: #e4e0d8;
+    --card-bg: #ffffff;
+    --serif: 'Instrument Serif', Georgia, serif;
+    --sans: 'DM Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1a1917;
+      --bg-soft: #24221f;
+      --fg: #e8e4dc;
+      --fg-muted: #a8a49a;
+      --fg-dim: #6b6860;
+      --accent: #7ab08a;
+      --accent-soft: rgba(122, 176, 138, 0.1);
+      --accent-hover: #8fc49e;
+      --accent-light: #8fc49e;
+      --border: #3a3733;
+      --card-bg: #24221f;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--sans);
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    min-height: 100vh;
+  }
+  main {
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 4rem 1.5rem 6rem;
+  }
+  header {
+    text-align: center;
+    margin-bottom: 3.5rem;
+    position: relative;
+  }
+  /* Auth indicator: small text + sign-in/out affordance, top-right of the
+     header. Doesn't crowd the centered title; falls below the title on
+     narrow viewports via the media query at the bottom of this stylesheet. */
+  .auth-indicator {
+    position: absolute;
+    top: 0;
+    right: 0;
+    display: inline-flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    font-size: 0.85rem;
+    color: var(--fg-muted);
+  }
+  .auth-indicator .muted {
+    color: var(--fg-muted);
+  }
+  .auth-indicator strong {
+    font-weight: 600;
+    color: var(--fg);
+  }
+  .auth-signout-form {
+    margin: 0;
+    display: inline;
+  }
+  .auth-signout, .auth-signin, .auth-account {
+    background: none;
+    border: none;
+    padding: 0;
+    color: var(--accent);
+    font: inherit;
+    cursor: pointer;
+    text-decoration: underline;
+    text-decoration-thickness: 1px;
+    text-underline-offset: 2px;
+  }
+  .auth-signout:hover, .auth-signin:hover, .auth-account:hover {
+    color: var(--accent-hover);
+  }
+  a.auth-signin, a.auth-account {
+    /* Anchor needs explicit reset since the a element has its own
+       color/decoration. */
+    border-bottom: none;
+  }
+  .brand-mark {
+    display: inline-flex;
+    color: var(--accent);
+    margin: 0 0 1.25rem;
+  }
+  .brand-mark svg {
+    width: clamp(48px, 7vw, 64px);
+    height: auto;
+  }
+  h1 {
+    font-family: var(--serif);
+    font-weight: 400;
+    font-size: clamp(2.75rem, 6vw, 4rem);
+    line-height: 1.05;
+    margin: 0 0 0.75rem;
+    letter-spacing: -0.01em;
+  }
+  .tagline {
+    color: var(--fg-muted);
+    font-size: 1.1rem;
+    line-height: 1.5;
+    margin: 0;
+    max-width: 28rem;
+  }
+  .section {
+    margin-bottom: 3rem;
+  }
+  .section h2 {
+    font-family: var(--serif);
+    font-weight: 400;
+    font-size: 1.5rem;
+    color: var(--fg);
+    margin: 0 0 0.4rem;
+    letter-spacing: -0.005em;
+  }
+  .section .section-sub {
+    color: var(--fg-muted);
+    font-size: 0.92rem;
+    margin: 0 0 1.25rem;
+  }
+  /* Signed-out landing: a single centered "Sign in" call under the brand.
+     Minimal by design — the service catalog + admin surfaces stay hidden
+     until the visitor authenticates. */
+  .signed-out-cta {
+    text-align: center;
+    margin-bottom: 0;
+  }
+  .signed-out-lede {
+    color: var(--fg-muted);
+    font-size: 1.05rem;
+    margin: 0 0 1.5rem;
+  }
+  .btn-signin {
+    display: inline-block;
+    background: var(--accent);
+    color: var(--card-bg);
+    font-family: var(--sans);
+    font-size: 1rem;
+    font-weight: 500;
+    text-decoration: none;
+    padding: 0.65rem 1.6rem;
+    border-radius: 8px;
+    transition: background 0.15s ease, transform 0.15s ease;
+  }
+  .btn-signin:hover {
+    background: var(--accent-hover);
+    transform: translateY(-1px);
+  }
+  .grid {
+    display: grid;
+    gap: 1.25rem;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  }
+  .card {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.5rem;
+    text-decoration: none;
+    color: inherit;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+    opacity: 0;
+    animation: fadeUp 0.4s ease forwards;
+  }
+  .card:nth-child(1) { animation-delay: 0.02s; }
+  .card:nth-child(2) { animation-delay: 0.06s; }
+  .card:nth-child(3) { animation-delay: 0.1s; }
+  .card:nth-child(4) { animation-delay: 0.14s; }
+  .card:hover {
+    border-color: var(--accent-light);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.06);
+    transform: translateY(-2px);
+  }
+  .card-title {
+    font-family: var(--serif);
+    font-size: 1.4rem;
+    font-weight: 400;
+    margin: 0;
+    line-height: 1.1;
+    color: var(--fg);
+  }
+  .card-desc {
+    color: var(--fg-muted);
+    font-size: 0.92rem;
+    margin: 0;
+    flex-grow: 1;
+  }
+  .card-meta {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-top: 0.5rem;
+    font-size: 0.8rem;
+    color: var(--fg-dim);
+  }
+  .path {
+    font-family: ui-monospace, 'SF Mono', Monaco, monospace;
+    color: var(--fg-muted);
+  }
+  .arrow {
+    color: var(--accent);
+    font-weight: 500;
+  }
+  .empty, .error {
+    text-align: center;
+    color: var(--fg-muted);
+    padding: 1.5rem 1rem;
+    border: 1px dashed var(--border);
+    border-radius: 12px;
+  }
+  .empty code, .error code {
+    font-family: ui-monospace, 'SF Mono', Monaco, monospace;
+    background: var(--bg-soft);
+    padding: 0.1rem 0.4rem;
+    border-radius: 4px;
+    color: var(--accent);
+  }
+  footer {
+    text-align: center;
+    margin-top: 4rem;
+    color: var(--fg-dim);
+    font-size: 0.85rem;
+  }
+  footer a {
+    color: var(--fg-muted);
+    text-decoration: none;
+    border-bottom: 1px solid var(--border);
+  }
+  footer a:hover {
+    color: var(--accent);
+    border-bottom-color: var(--accent-light);
+  }
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(8px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  @media (max-width: 640px) {
+    main { padding: 2.5rem 1rem 4rem; }
+    .card { padding: 1.25rem; }
+    /* Auth indicator drops below the title on narrow viewports so the
+       header doesn't crowd. */
+    header { padding-top: 1.75rem; }
+    .auth-indicator { font-size: 0.8rem; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <!--AUTH-INDICATOR-->
+    <span class="brand-mark" aria-hidden="true">${brandMarkSvg(56, "hub-home")}</span>
+    <h1>${WORDMARK_TEXT}</h1>
+    <p class="tagline">${CANONICAL_TAGLINE}</p>
+  </header>
+<!--DISCOVERY-BODY-->
+  <footer>
+    <a href="/.well-known/parachute.json">discovery</a>
+  </footer>
+</main>
+<!--DISCOVERY-SCRIPT-->
+</body>
+</html>
+`;
+
+// The verbose discovery body — the service catalog, admin surfaces, and the
+// "Get started" CTA. Rendered ONLY for a signed-in visitor (`buildHtml`
+// selects this vs SIGNED_OUT_BODY on `session`). Anonymous visitors get the
+// slim landing below instead, so the hub's internal surface isn't exposed
+// pre-auth.
+const SIGNED_IN_BODY = `
+  <section class="section" id="get-started-section" hidden>
+    <h2>Get started</h2>
+    <p class="section-sub">Jump straight into what you came here for.</p>
+    <div class="grid" id="get-started-grid"></div>
+  </section>
+
+  <section class="section" id="services-section">
+    <h2>Services</h2>
+    <p class="section-sub">Surfaces provided by services running on this hub.</p>
+    <div class="grid" id="services-grid" aria-live="polite">
+      <div class="empty" id="services-loading">Loading…</div>
+    </div>
+  </section>
+
+  <section class="section" id="admin-section">
+    <h2>Admin</h2>
+    <p class="section-sub">Manage this hub — vaults, permissions, tokens.</p>
+    <div class="grid" id="admin-grid"></div>
+  </section>
+`;
+
+// The slim signed-out landing. Brand + tagline (in the header above) plus a
+// single clear "Sign in" call — no service catalog, no vault listings, no
+// admin links. Keep it tasteful and minimal; the detail un-gates on sign-in.
+const SIGNED_OUT_BODY = `
+  <section class="section signed-out-cta" id="signed-out-cta">
+    <p class="signed-out-lede">Sign in to reach your vault and the services on this hub.</p>
+    <a href="/login?next=/" class="btn-signin" data-testid="signed-out-signin">Sign in →</a>
+  </section>
+`;
+
+// The data-loading script for the signed-in discovery body. Emitted only
+// when signed in (the signed-out body has nothing for it to populate).
+const DISCOVERY_SCRIPT = `<script>
+(async () => {
+  const servicesGrid = document.getElementById('services-grid');
+  const adminGrid = document.getElementById('admin-grid');
+  const getStartedSection = document.getElementById('get-started-section');
+  const getStartedGrid = document.getElementById('get-started-grid');
+
+  // Services entries are now data-driven from /.well-known/parachute.json.
+  // Each services[] row carries (since hub#... — Phase D consumer side):
+  //   - displayName: human label (sourced from module.json:displayName).
+  //   - uiUrl: where the user-facing UI lives (sourced from module.json:uiUrl).
+  //     A row WITHOUT uiUrl declines to render a tile — the module is
+  //     either API-only (vault, scribe-without-UI) or surfaces its UI
+  //     through a sibling (vault → Notes).
+  // The previous SERVICE_LABELS / SERVICE_ORDER / isVaultName hardcoding
+  // is retired: vault has no uiUrl, so the "skip vault" rule emerges
+  // from data rather than a name check; ordering is alphabetical-by-
+  // displayName per docs/contracts/module-json-extensibility.md.
+
+  // Admin entries: always visible. Even a fresh hub with zero vaults wants
+  // the operator to find /admin/vaults. Hardcoded — they live in the
+  // hub-served SPA, not in services.json.
+  const ADMIN_ENTRIES = [
+    { title: 'Vaults', desc: 'Create and manage vaults on this hub.', href: '/admin/vaults' },
+    { title: 'Permissions', desc: 'OAuth consent grants per app.', href: '/admin/permissions' },
+    { title: 'Tokens', desc: 'Mint and revoke access tokens.', href: '/admin/tokens' },
+  ];
+
+  function shortName(manifestName) {
+    return manifestName.replace(/^parachute-/, '');
+  }
+
+  function renderTile({ title, desc, href }) {
+    const a = document.createElement('a');
+    a.className = 'card';
+    a.href = href;
+
+    const t = document.createElement('h3');
+    t.className = 'card-title';
+    t.textContent = title;
+    a.appendChild(t);
+
+    if (desc) {
+      const d = document.createElement('p');
+      d.className = 'card-desc';
+      d.textContent = desc;
+      a.appendChild(d);
+    }
+
+    const meta = document.createElement('div');
+    meta.className = 'card-meta';
+    const path = document.createElement('span');
+    path.className = 'path';
+    path.textContent = href;
+    const arrow = document.createElement('span');
+    arrow.className = 'arrow';
+    arrow.textContent = '→';
+    meta.appendChild(path);
+    meta.appendChild(arrow);
+    a.appendChild(meta);
+
+    return a;
+  }
+
+  function renderAdmin() {
+    adminGrid.innerHTML = '';
+    for (const entry of ADMIN_ENTRIES) {
+      adminGrid.appendChild(renderTile(entry));
+    }
+  }
+
+  /**
+   * Render the "Get started" section (hub#342) above the Services grid.
+   *
+   * Driven by the uis[] sub-unit arrays the well-known doc already carries
+   * (W2-12 — retires the hardcoded "Open Notes" → /surface/notes/ tile):
+   * one tile per ACTIVE uis[] entry across every services[] row, each
+   * carrying its own displayName + tagline + mount path. Under the app's
+   * notes→parachute surface-identity rename this stays correct whichever
+   * mount an install serves — an existing notes-ui install renders its
+   * "notes" entry at /surface/notes, a post-rename install renders its
+   * "parachute" entry at /surface/parachute, no hub-side name knowledge
+   * required. Entries named "parachute" / "notes" sort first (they're the
+   * end-user "browse my content" CTA — the audience that needs the
+   * strongest above-the-fold prompt); the rest follow alphabetically.
+   *
+   * Legacy fallback: a surface-host row that predates uis{}
+   * self-registration carries no uis[] even while it serves notes-ui at
+   * /surface/notes (the hub proxies /surface/* blind — mounts are
+   * surface-host's on-disk state, not the manifest's). When no uis[]
+   * entries exist anywhere but parachute-surface IS installed, keep
+   * rendering the pre-W2-12 "Open Notes" tile so those installs' discovery
+   * page is untouched. The fallback dies naturally the first time the
+   * surface-host re-registers with uis{}.
+   *
+   * The earlier "Browse Vault" tile retired in workstream C (2026-05-25)
+   * once vault declared uiUrl in its module.json (per patterns#96) — vault
+   * instances render in the Services grid below.
+   *
+   * If nothing qualifies (fresh install pre-wizard, no app) the section
+   * stays hidden. Not driven by /api/modules because discovery is unauth —
+   * the services list from /.well-known/parachute.json is sufficient (it
+   * carries the uis[] fan-out, no Bearer required).
+   */
+  function renderGetStarted(services) {
+    if (!getStartedGrid || !getStartedSection) return;
+    const uiEntries = [];
+    const seenPaths = new Set();
+    for (const svc of services) {
+      if (!svc || !Array.isArray(svc.uis)) continue;
+      for (const ui of svc.uis) {
+        if (!ui || typeof ui.path !== 'string' || ui.path === '') continue;
+        // Absent status means active (services-manifest.ts UiSubUnitStatus).
+        if (ui.status && ui.status !== 'active') continue;
+        // Multi-path parent rows repeat the same uis[] on every path —
+        // de-duplicate by mount (well-known.ts's documented consumer duty).
+        if (seenPaths.has(ui.path)) continue;
+        seenPaths.add(ui.path);
+        uiEntries.push(ui);
+      }
+    }
+    const rank = (ui) => (ui.name === 'parachute' ? 0 : ui.name === 'notes' ? 1 : 2);
+    uiEntries.sort(
+      (a, b) =>
+        rank(a) - rank(b) ||
+        (a.displayName || a.name || '').localeCompare(b.displayName || b.name || ''),
+    );
+    const tiles = uiEntries.map((ui) => ({
+      title: ui.displayName || ui.name || ui.path,
+      desc: ui.tagline || '',
+      // Trailing slash keeps relative asset URLs resolving under the mount
+      // (same reason the retired hardcode pointed at /surface/notes/).
+      href: ui.path.endsWith('/') ? ui.path : ui.path + '/',
+    }));
+    if (tiles.length === 0) {
+      // Legacy fallback (see docstring): pre-uis surface-host installs.
+      const hasSurface = services.some((s) => s && s.name === 'parachute-surface');
+      if (hasSurface) {
+        tiles.push({
+          title: 'Open Notes',
+          desc: 'Browse + capture in the Notes app — reads from your vault.',
+          href: '/surface/notes/',
+        });
+      }
+    }
+    if (tiles.length === 0) {
+      getStartedSection.setAttribute('hidden', '');
+      return;
+    }
+    getStartedSection.removeAttribute('hidden');
+    getStartedGrid.innerHTML = '';
+    for (const tile of tiles) getStartedGrid.appendChild(renderTile(tile));
+  }
+
+  function renderServices(services) {
+    // Render one tile per service that declares a uiUrl. Entries without
+    // uiUrl are intentionally omitted — API-only modules with no
+    // operator surface. The shortName-collapse below picks the first row
+    // per service short-name; for multi-instance services, this matters
+    // only when the services.json entry name is shared across instances.
+    //
+    // Today: vault registers as parachute-vault with multiple paths[] —
+    // shortName is "vault", one tile points at the first instance's admin.
+    // Same effective behavior the retired hardcoded "Browse Vault" tile
+    // had (workstream C, 2026-05-25).
+    //
+    // If a future multi-vault setup ever uses distinct entry names per
+    // instance (e.g. parachute-vault-default, parachute-vault-techne),
+    // the shortName collapse will yield "vault-default" and "vault-techne"
+    // and the operator gets one tile per named vault automatically — no
+    // disambiguation code needed.
+    const byShort = new Map();
+    for (const svc of services) {
+      if (!svc || !svc.uiUrl) continue;
+      const key = shortName(svc.name);
+      if (byShort.has(key)) continue;
+      byShort.set(key, {
+        title: svc.displayName || key,
+        desc: svc.tagline || '',
+        href: svc.uiUrl,
+      });
+    }
+
+    // Alphabetical-by-displayName per docs/contracts/module-json-extensibility.md.
+    // Stable for shared-prefix labels (Notes, Notes-Lite would sort that way).
+    const tiles = Array.from(byShort.values()).sort((a, b) =>
+      a.title.localeCompare(b.title),
+    );
+
+    servicesGrid.innerHTML = '';
+    if (tiles.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'empty';
+      empty.innerHTML =
+        'No services with a UI declared yet. Modules surface their UIs by ' +
+        'declaring <code>uiUrl</code> in <code>module.json</code> ' +
+        '(see parachute-hub/docs/contracts/module-json-extensibility.md).';
+      servicesGrid.appendChild(empty);
+      return;
+    }
+    for (const tile of tiles) servicesGrid.appendChild(renderTile(tile));
+  }
+
+  // Admin section is static — render synchronously so the operator sees it
+  // even if the well-known fetch is slow or fails.
+  renderAdmin();
+
+  // Fetch services and render. cache 'no-store' on the fetch matters
+  // here: without it, the browser's HTTP cache returns the stale
+  // services list the next time the operator clicks back to / after
+  // installing a module via /admin/modules. Server-side also sets
+  // cache-control no-store on the well-known doc; belt-and-suspenders
+  // since older browsers (and some intermediaries) ignore one or the
+  // other (hub#268 Item 1).
+  async function loadServices() {
+    try {
+      const wk = await fetch('/.well-known/parachute.json', {
+        credentials: 'omit',
+        cache: 'no-store',
+      });
+      if (!wk.ok) throw new Error('well-known fetch failed: ' + wk.status);
+      const doc = await wk.json();
+      const services = Array.isArray(doc.services) ? doc.services : [];
+      renderGetStarted(services);
+      renderServices(services);
+    } catch (err) {
+      servicesGrid.innerHTML = '<div class="error">Could not load services: ' +
+        (err && err.message ? err.message : String(err)) + '</div>';
+    }
+  }
+
+  // Re-fetch on pageshow (covers the bfcache-restore path: when an
+  // operator clicks back from /admin/modules to / the browser may
+  // restore the prior DOM without re-running the IIFE, leaving stale
+  // tiles). The event's persisted flag is the bfcache discriminator —
+  // true when the page was rehydrated from cache, false on a fresh
+  // load. On fresh load the initial loadServices() below already ran,
+  // so we only re-fetch when persisted is true.
+  window.addEventListener('pageshow', (e) => {
+    if (e.persisted) void loadServices();
+  });
+
+  void loadServices();
+})();
+</script>`;

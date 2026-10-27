@@ -1,0 +1,254 @@
+# @openparachute/door-contract
+
+## 0.7.0
+
+The account-door scope ladder gains an additive middle rung for
+create/configure authority: `admin ⊇ write ⊇ read`. Existing `read` and `admin`
+scope strings retain their meanings, and an existing admin token still satisfies
+the narrower write and read requirements.
+
+- In `scopes.ts`, adds `AccountVerb = "read" | "write" | "admin"`, the
+  corresponding `ACCOUNT_VERB_RANK` entries, and the re-exported
+  `ACCOUNT_SELF_WRITE_SCOPE` (`account:self:write`).
+- `hasAccountScope` now implements the three-rung inheritance: `admin` satisfies
+  `write` and `read`, while `write` satisfies `read`.
+- In `account-contract.ts`, changes `POST /account/vaults` and
+  `PUT /account/vaults/<name>/caps` from minimum scope `admin` to `write`.
+
+The grammar addition is backward-compatible for callers using scope semantics:
+old `read` and `admin` grants continue to work, and `write` is newly accepted
+for the two create/configure routes. It is a deliberate wire-metadata behavior
+change for consumers that inspect `ACCOUNT_ROUTES` literally — a check for
+`scope === "admin"` on either route now sees `"write"` and must be updated.
+
+**Door drift this bump opens.** The self-host hub implements the new rung
+(`WRITE_SCOPES` in `src/account-api.ts`). The cloud door does NOT yet, but the
+drift is only on ONE of the two re-tiered routes:
+
+- `POST /account/vaults` — real drift. Cloud's `handleAccountVaultCreate` still
+  calls `requireAccount(db, req, deps, "admin")`
+  (`workers/identity/src/account-api.ts`), so an `account:<id>:write` bearer is
+  refused there even though `ACCOUNT_ROUTES` now advertises `write`. Cloud is
+  the side that must catch up.
+- `PUT /account/vaults/<name>/caps` — NOT drift. Cloud has no caps handler to
+  re-tier: its identity worker mounts exactly four `/account/vaults*` routes
+  (list, create, `<name>/token`, delete), and both caps routes are already
+  marked `optional: true` / hub-only in `account-contract.ts` because cloud's
+  caps are plan-derived. A write bearer there gets 404 from a door cloud never
+  mounted, not 403 from a stricter gate. Re-tiering this route is a hub-local
+  change with no cloud counterpart.
+
+`hasAccountScope` itself needs no cloud change because cloud imports it from
+this package.
+
+## 0.6.1
+
+Fail-closed hardening of the composed account-scope grammar (unified `/mcp` —
+MCP Phase 2 PR1, hub #765 findings 1/3/4). Purely additive: every currently-valid
+composed / legacy form still parses byte-identically; this bump only NEWLY rejects
+malformed inputs that the Phase-1 grammar let through. No change to
+`isRequestableAccountScope` (composed forms stay non-requestable; consent is their
+sole author).
+
+- **Finding 1 — builders validate their slots and THROW.** The composed-scope
+  builders (`composedWildcardVaultsScope`, `composedVaultScope`,
+  `composedVaultCreateScope`, `composedModuleScope`) now reject any interpolated
+  `id` / `vault` / `module` slot that is empty, the wildcard sentinel `*`,
+  contains a `:`, or contains WHITESPACE — any would inject extra scope segments
+  or forge a wildcard grant a user never consented to (whitespace splits the
+  space-delimited OAuth `scope` claim on the wire into a fragment that can
+  re-parse as a valid grant, so it must fail closed at build too). A malformed
+  slot throws a clear `Error` at build time, so it can never be minted. Wildcard
+  authority is expressed ONLY by the dedicated `composedWildcardVaultsScope`
+  builder, never by passing `*` as a name.
+- **Finding 4 — the parser rejects `*` as a module name.** `parseComposedAccountScope`
+  now returns `null` for `account:<id>:mod:*:<verb>` (previously it parsed as a
+  literal `*` module), mirroring the vault slot's existing `*`-fails-closed rule.
+  Fail-closed: an unrecognized form is denied downstream.
+- **Finding 3 — doc fix.** Corrected the §1.4 guardrail comment that mislabeled
+  the cross-account mint gate as "the hub's" — it is the CLOUD door's mint gate
+  (`parachute-cloud workers/identity/src/oauth-token.ts`, `denyForeignAccountMint`).
+
+## 0.6.0
+
+The COMPOSED account-scope grammar (unified `/mcp` — Phase 1). The ratified
+unified-MCP design collapses the per-resource MCP endpoints into ONE `/mcp`
+gateway whose OAuth consent composes a single grant across the account, its
+vaults, the "create vaults" capability, and future modules; the whole composed
+grant rides one `aud="account"` token that the gateway decomposes per-call into
+60s single-audience mints. Because the gateway owns decomposition, ALL composed
+vault/module authority is encoded INSIDE the `account:` namespace (never a raw
+`vault:<name>:<verb>`, which `inferAudience` would stamp as a vault audience and
+route around the gateway).
+
+This bump only DEFINES + PARSES the grammar — nothing emits or mints these forms
+yet; consent, minting, and the gateway are LATER phases that consume this
+vocabulary. Purely additive: new exports only, zero change to any existing
+signature or behavior, and every new form is NON-REQUESTABLE (consent is the sole
+author — `isRequestableAccountScope` is unchanged and refuses all of them).
+
+New granted forms (all consent-authored, none requestable):
+
+- `account:<id>:vaults:*:<verb>` — WILDCARD vault grant (every owned vault at
+  `<verb>`; `*` can never collide with a vault name — the vault-name charset
+  excludes `*`).
+- `account:<id>:vaults:<vault>:<verb>` — per-vault 5-part grant at a verb.
+- `account:<id>:vault-create` — the "create new vaults" capability (a distinct
+  3-part verb-slot, NOT a member of the `vaults` family).
+- `account:<id>:mod:<module>:<verb>` — module grant (future modules).
+
+`<verb>` is the three-rung vault/module ladder `read|write|admin` (distinct from
+the two-rung account ladder `read|admin`). The LEGACY Wave A forms keep their
+exact frozen meaning — `account:<id>:vaults` (blanket) and
+`account:<id>:vaults:<vault>` (4-part narrowed) parse identically; existing
+tokens + refresh families are untouched.
+
+New in `scopes.ts` (re-exported from the package root):
+
+- `ComposedVaultVerb` + `COMPOSED_VERB_RANK` (`admin ⊇ write ⊇ read`) +
+  `isComposedVaultVerb` + `composedVerbSatisfies(granted, required)` — the verb
+  ladder + the "requiredVerb ≤ grantedVerb" helper the later mint phase uses.
+- Segment/sentinel constants (`COMPOSED_VAULTS_WILDCARD`,
+  `COMPOSED_VAULTS_SEGMENT`, `COMPOSED_VAULT_CREATE_VERB`,
+  `COMPOSED_MODULE_SEGMENT`) + builders (`composedWildcardVaultsScope`,
+  `composedVaultScope`, `composedVaultCreateScope`, `composedModuleScope`).
+- `ComposedAccountScope` + `parseComposedAccountScope(scope)` — a fail-closed,
+  discriminated-union recognizer that is deliberately a SUPERSET (covers the new
+  composed families AND the legacy Wave A forms) so ONE pass extracts `<id>` from
+  every `account:`-namespaced grant. §1.4 rationale: the hub's cross-account mint
+  gate id-checks only the forms its parser recognizes — a form parsing to `null`
+  would SKIP the id check; recognizing every family here means that when a later
+  phase makes them mintable, the gate already extracts (and can reject) a
+  foreign-id composed scope. `*` is ONLY ever the wildcard sentinel — never a
+  concrete vault name.
+- `ComposedAccountCoverage` + `composedAccountGrant(grantedScopes, accountId)` —
+  the coverage deriver over the verb-carrying composed forms: `wildcard` (highest
+  wildcard verb, or null), `vaults` (Map name→highest verb), `create` (boolean),
+  `modules` (Map module→highest verb). Foreign-id scopes ignored; the verb-less
+  legacy forms are NOT folded in (they remain `accountVaultsGrant`'s domain — Wave
+  A semantics untouched).
+
+The existing Wave A surface (`isRequestableAccountScope`, `parseAccountVaultsScope`,
+`accountVaultsGrant`) and the account read/admin ladder are unchanged.
+
+## 0.5.0
+
+The `account:<id>:vaults` scope grammar (Wave A PR1) — the foundation the cloud
+Wave A PRs consume as a pinned dependency (a cloud pin-bump follows). Wave A is
+an account-level MCP connection (list-vaults + create-vault + query-across-vaults)
+opened by a NEW narrow requestable scope, the SINGLE deliberate exception to the
+account wall. Purely additive: new exports + one optional descriptor field, zero
+change to any existing signature or behavior.
+
+New in `scopes.ts` (re-exported from the package root):
+
+- `isRequestableAccountScope(scope)` — the account wall stays closed except for
+  the account-vaults connection scope. `account:vaults` (un-narrowed, the
+  PRM-advertised request form) and `account:<id>:vaults` (consent-bound blanket)
+  are requestable; `account:<id>:{admin,read}`, `account:admin`, `account:read`,
+  and the 4-part `account:<id>:vaults:<vault>` (consent-narrowed — consent
+  narrows, a client can't pre-narrow itself) are NOT. Exact-lowercase; casing
+  variants fail closed.
+- `ACCOUNT_VAULTS_VERB` (`"vaults"`), `ACCOUNT_VAULTS_UNNARROWED`
+  (`"account:vaults"`), and `accountVaultsScope(id)` → `account:<id>:vaults`.
+- `parseAccountVaultsScope(scope)` — 3-part → `{ id, vault: null }` (blanket),
+  4-part → `{ id, vault }` (narrowed), else `null` (fail-closed on empty id/vault
+  or extra parts).
+- `accountVaultsGrant(grantedScopes, accountId)` — the coverage-set deriver:
+  `{ blanket: true }` when a bare 3-part scope for this id is present (blanket
+  always wins), else `{ vaults: [...] }` (the de-duped set of narrowed vault
+  names for this id), else `null`. Foreign-id scopes are ignored.
+
+The narrowing rides the SCOPE STRING (a set of 4-part scopes), NOT a side
+`vault_scope` claim — a vault_scope wouldn't survive token refresh, whereas the
+scope string does. The existing `account:<id>:<verb>` grammar
+(`parseAccountScope` / `hasAccountScope` / `NON_REQUESTABLE_SCOPES`) and the REST
+read/admin ladder are untouched.
+
+`ParachuteAccountDescriptor` gains an optional `account_mcp_endpoint?: string` —
+the account-MCP endpoint a client opens against the `account:<id>:vaults` scope.
+Unset today (no door advertises it yet; `checkAccountDescriptor` does not require
+it). This bump does NOT flip the `auth` field required — that flip stays gated on
+both doors serving it (its own later PR), out of scope for this additive change.
+
+## 0.4.0
+
+The auth block + the session/token wire canon (hub-parity P0). `signup_path` and
+`app_client_id` on `ParachuteAccountDescriptor` move from required to OPTIONAL
+(a door advertises each only when it applies — hub's `signup_path` only while an
+active public invite exists (Q2), a door with no reserved native client omits
+`app_client_id`); `checkAccountDescriptor` validates both only when present. Adds
+`AccountAuthDescriptor` (`methods`, `signin_path`) + optional `auth` on the
+descriptor — drives the app's front-door branch (magic-link form vs a
+ceremony-hop to the door's own sign-in page); optional in 0.4.0 so cloud@main
+keeps typechecking pre-P3, required from 0.5.0. `AccountRoute` gains
+`optional?: boolean`; `GET /account` and the `/account/vaults/<name>/caps`
+routes are now marked optional in `ACCOUNT_ROUTES` (hub-only — cloud routes
+`GET /account` to its SPA shell and derives caps from plan, not a per-vault
+knob). New wire types written down once from the app's pinned shapes:
+`AccountSessionResponse` (`GET /account/session`), `AccountTokenMintResponse`
+(`POST /account/token`), `VaultTokenMintResponse`
+(`POST /account/vaults/<name>/token`) — each with a matching `check*`
+conformance helper. `ACCOUNT_ERROR_CODES` pins the shared `/account/*` error
+vocabulary both doors already mirror. New `vault-scopes.ts`:
+`validateVaultScopes(requested, vaultName)`, the ONE shared scope-shape
+validator replacing hub's `parseScopesBody` scope logic and cloud's local
+`validateVaultScopes` (cross-repo derived-key lesson) — absent/null/empty
+requests default to `vault:<name>:{read,write}`, every entry must be exactly
+`vault:<name>:{read|write|admin}`, results are de-duplicated. Additive to the
+type surface; no existing call signature changes.
+
+Review-fold (P0 review):
+- `validateVaultScopes` now returns `{ ok: false; reason: "invalid_request" |
+  "invalid_scope" }` on rejection (was a bare `{ ok: false }`) — the `reason`
+  carries the door's wire error code so a door adopting the shared validator
+  (P2/P3) keeps its exact HTTP error without re-deriving the split
+  (`invalid_request` = non-array / non-string entry; `invalid_scope` =
+  well-formed string naming the wrong resource/vault/verb, matching hub's
+  `parseScopesBody`). New `VaultScopesReason` type. Nothing consumes the
+  validator yet, so this is pure additive design.
+- `ACCOUNT_ERROR_CODES` was born incomplete; added the codes both doors already
+  emit but the pin missed: `account_suspended`, `not_found` (cloud),
+  `method_not_allowed`, `server_error` (hub). Now the real union.
+- Hardened the new conformance checkers: `checkAccountSessionResponse` requires
+  `email`/`username` to be a string when present (not merely present);
+  `checkVaultTokenMintResponse` requires the `vault:<name>` services entry to
+  carry a string `url`; `isParseableTimestamp` now enforces true ISO-8601
+  (rejecting `Date.parse`-lenient locale strings like `"January 1, 2026"`).
+
+## 0.3.0
+
+Adds the optional `vault_url_template` field to `ParachuteAccountDescriptor` — a
+`{name}`-placeholder template a client substitutes to preview a vault's address
+pre-creation, door-agnostically (cloud has both path + subdomain forms, so only
+the door can render the right one). `checkAccountDescriptor` validates it only
+when present (must be a string containing `{name}`). Additive; no breaking change.
+
+## 0.2.0
+
+C4 (Parachute App campaign, parachute-cloud#116) — the account-door descriptor.
+Extends `ParachuteAccountDescriptor` (served at `GET /.well-known/parachute-account`)
+with `signup_path`, `app_client_id`, `capabilities` (`AccountCapabilities`), and
+`plans` (`AccountPlanSummary[]`) so a client learns where to sign up, which
+first-party client to use, what the door can do, and its plan ladder without
+hardcoding. Adds the `checkAccountDescriptor(actual, {issuer, door})` conformance
+helper (mirrors `checkAuthorizationServerMetadata`) so both doors' descriptors
+are pinned. Additive; no breaking changes.
+
+## 0.1.0
+
+Initial extraction (Cloud+Hub shared-core campaign, parachute-cloud#116,
+Phase A). The shared OAuth-issuer + `/account/*` door contract, previously
+duplicated across the self-host hub and the hosted cloud:
+
+- token wire constants (`ACCESS_TOKEN_TTL_SECONDS`, `REFRESH_TOKEN_TTL_MS`,
+  `REFRESH_GRACE_MS`, `TOKEN_TYPE`, `SIGNING_ALG`) + `AccessTokenClaims` /
+  `TokenResponse` types;
+- the `account:<id>:<verb>` scope grammar + `hasAccountScope`;
+- RFC 8414 / 9728 discovery-doc vectors;
+- the `/account/*` route table + request/response types;
+- the shared conformance corpus (`check*` helpers).
+
+Consumed test-only by the hub in this release (drift-detector parity test);
+runtime adoption in both doors + cloud conformance-suite adoption follow in
+Phase B.

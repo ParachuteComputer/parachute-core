@@ -1,0 +1,308 @@
+/**
+ * Container-mode module boot helpers, separated from `serve.ts` so
+ * tests can drive the supervisor wiring without standing up
+ * `Bun.serve`.
+ *
+ * `bootSupervisedModules` reads services.json, resolves each
+ * first-party module's `startCmd` from `SERVICE_SPECS`, and calls
+ * `Supervisor.start` for each. Third-party modules with `installDir`
+ * but no first-party fallback are also picked up via the same
+ * `getSpecFromInstallDir` path that `commands/lifecycle.ts` uses, so
+ * a hub-installed `@third-party/foo` boots the same way `vault` does.
+ *
+ * Idempotent: re-calling boot when modules are already running is a
+ * no-op (supervisor's own idempotent `start`). Missing-startCmd rows
+ * are logged + skipped, not fatal — the operator may have installed a
+ * module that doesn't expose a daemon (e.g. CLI-only).
+ */
+
+import { join } from "node:path";
+import { readEnvFileValues } from "../env-file.ts";
+import { HUB_ORIGINS_ENV, HUB_ORIGIN_ENV } from "../hub-origin.ts";
+import { ModuleManifestError } from "../module-manifest.ts";
+import {
+  type ServiceSpec,
+  canonicalPortForManifest,
+  getSpec,
+  getSpecFromInstallDir,
+  shortNameForManifest,
+} from "../service-spec.ts";
+import { type ServiceEntry, readManifestLenient, upsertService } from "../services-manifest.ts";
+import { enrichedPath } from "../spawn-path.ts";
+import type { Supervisor } from "../supervisor.ts";
+import { buildHubOriginsEnvValue } from "../vault-hub-origin-env.ts";
+
+export interface BootOpts {
+  /** Path to services.json. */
+  readonly manifestPath: string;
+  /** Config dir ($PARACHUTE_HOME). Used to read per-module .env. */
+  readonly configDir: string;
+  /** Canonical OAuth issuer / hub origin. Forwarded to child env as PARACHUTE_HUB_ORIGIN. */
+  readonly hubOrigin?: string;
+  /** Logger seam. */
+  readonly log?: (line: string) => void;
+}
+
+export interface BootedModule {
+  readonly short: string;
+  readonly entryName: string;
+  readonly status: "started" | "skipped";
+  readonly reason?: string;
+}
+
+export interface SpawnReqShape {
+  short: string;
+  cmd: readonly string[];
+  cwd?: string;
+  env?: Record<string, string>;
+}
+
+export interface BuildSpawnRequestOpts {
+  /** Config dir ($PARACHUTE_HOME). Used to read the module's per-service `.env`. */
+  readonly configDir: string;
+  /** Canonical hub origin → child env `PARACHUTE_HUB_ORIGIN`. Skipped when absent. */
+  readonly hubOrigin?: string;
+  /**
+   * Extra env merged on top of the derived env (PORT / .env / HUB_ORIGIN).
+   * Wins over all of them. Used by the API `start` handler's test seam +
+   * first-boot vault-name pass-through (`spawnEnv`). Empty/absent on the
+   * boot path.
+   */
+  readonly extraEnv?: Record<string, string>;
+}
+
+/**
+ * Snap a fixed-port first-party module's services.json `port` back to its
+ * compiled-in canonical value when it has DRIFTED, and persist the correction.
+ * Returns the entry to spawn with — reconciled when a drift was repaired, the
+ * original otherwise.
+ *
+ * Why (channel#41): the hub is the port authority, and a first-party module
+ * with a compiled-in canonical port (`canonicalPortForManifest` ≠ undefined —
+ * vault / scribe / surface / agent / notes / runner) has exactly ONE correct
+ * port: its canonical one. The injected `PORT`, the supervisor's readiness
+ * probe, and the reverse-proxy target are ALL derived from the services.json
+ * row's `port`. So once a transiently-wrong port lands in that row (the agent
+ * row — then named channel — was observed live carrying `19415` instead of
+ * `1941`), it self-perpetuates:
+ * the supervisor probes/proxies the wrong port forever and `/agent/*` routes
+ * to a dead port. The canonical port is authoritative, so we reconcile the row
+ * before spawn rather than honoring the drift.
+ *
+ * Safety for the other fixed-port modules (vault / scribe / surface): the
+ * canonical value is exactly what each ALREADY self-registers, so on the
+ * common path `entry.port === canonical` and this is a no-op. There is no
+ * legitimate "first-party module intentionally on a non-canonical port" case —
+ * install-time `assignPort` only walks off canonical on a genuine collision,
+ * and that's a same-range fallback for a DIFFERENT module, never a steady state
+ * for the canonical owner. If another row genuinely already owns the canonical
+ * port we DON'T rewrite (it would trip the write-side duplicate-port guard and
+ * isn't ours to take) — we leave the drift in place and let the supervisor's
+ * port-squatter detection surface it. Third-party modules (no canonical) are
+ * never touched.
+ */
+export function reconcilePortToCanonical(
+  entry: ServiceEntry,
+  manifestPath: string,
+  log: (line: string) => void = () => {},
+): ServiceEntry {
+  const canonical = canonicalPortForManifest(entry.name);
+  if (canonical === undefined || entry.port === canonical) return entry;
+
+  // Don't steal a canonical port another row legitimately holds — that would
+  // trip `upsertService`'s duplicate-port guard. Re-read live so we see the
+  // current on-disk state (another module may have just registered).
+  const others = readManifestLenient(manifestPath).services.filter((s) => s.name !== entry.name);
+  if (others.some((s) => s.port === canonical)) {
+    log(
+      `[supervisor] ${entry.name}: services.json port ${entry.port} ≠ canonical ${canonical}, ` +
+        `but ${canonical} is held by another row — not reconciling; surfacing the drift.`,
+    );
+    return entry;
+  }
+
+  const reconciled: ServiceEntry = { ...entry, port: canonical };
+  try {
+    upsertService(reconciled, manifestPath);
+    log(
+      `[supervisor] ${entry.name}: reconciled drifted services.json port ${entry.port} → canonical ${canonical} (channel#41).`,
+    );
+    return reconciled;
+  } catch (err) {
+    // Best-effort: a failed reconcile must not block the boot. The write can
+    // fail for an I/O reason (permissions, races against an external writer) OR
+    // because `upsertService`'s duplicate-port guard tripped — e.g. another row
+    // raced onto the canonical port between the check above and this write.
+    // Either way, spawn with the canonical port in-memory so at least the child
+    // binds + the probe checks the right port this run; the proxy still reads
+    // the (stale) row until the next reconcile succeeds.
+    log(
+      `[supervisor] ${entry.name}: could not reconcile services.json port to canonical (${entry.port} → ${canonical}; write failed or canonical held): ${err} — spawning with canonical in-memory.`,
+    );
+    return reconciled;
+  }
+}
+
+/**
+ * Build the `Supervisor.start` request for a single module, identically on
+ * both the serve-boot path and the `POST /api/modules/:short/start` handler.
+ *
+ * Env layering (later wins):
+ *   1. `PORT` from the services.json `entry.port` — overrides hub's own PORT
+ *      so supervised children honor their canonical port assignment
+ *      (hub#356/#357). This is authoritative and is NOT overridable by a
+ *      `.env` `PORT` (see below) — services.json is the single source of truth
+ *      for the port (scribe#41 4-tier ladder; hub#206).
+ *   2. per-service `.env` at `<configDir>/<short>/.env` — operator-configured
+ *      values (e.g. scribe provider keys) merge on top. A `PORT` key here is
+ *      dropped: a stale pre-#206 `.env` `PORT` must not shadow `entry.port`
+ *      (hub#537 — a leftover scribe `PORT=1944` ≠ services.json `1943` leaked
+ *      into the injected PORT and broke the supervisor's readiness probe).
+ *   3. `PARACHUTE_HUB_ORIGIN` = `opts.hubOrigin` — anchors the child's `iss`
+ *      expectation to the value hub mints with (hub#365).
+ *   4. `opts.extraEnv` — test seam / first-boot pass-through; wins last.
+ *
+ * `cwd` is set to `entry.installDir` when present (third-party modules ship
+ * relative startCmds that need it; first-party fallbacks use absolute / PATH
+ * binaries so cwd is a no-op there).
+ */
+export function buildModuleSpawnRequest(
+  short: string,
+  entry: ServiceEntry,
+  cmd: readonly string[],
+  opts: BuildSpawnRequestOpts,
+): SpawnReqShape {
+  const fileEnv = readEnvFileValues(join(opts.configDir, short, ".env"));
+  // Drop a `PORT` from the per-service .env: services.json `entry.port` is the
+  // canonical port and must win (scribe#41 ladder; hub#206). A stale pre-#206
+  // `.env` PORT (e.g. scribe's `1944` vs services.json `1943`) would otherwise
+  // leak into the injected PORT and the supervisor's readiness probe would
+  // check the wrong port → false `started_but_unbound` (hub#537). The module's
+  // own resolvePort ladder already prefers services.json, so this keeps the
+  // injected PORT + probe in agreement with what the child actually binds.
+  const { PORT: _staleEnvPort, ...fileEnvSansPort } = fileEnv;
+  // PATH enrichment (hub launchd-PATH regression): the hub unit bakes a minimal
+  // PATH and `Bun.spawn` defaults to empty env, so without this the child only
+  // ever sees the unit's PATH — which omits `$HOME/.local/bin` (scribe's
+  // `parakeet-mlx`) + the Homebrew bin (`ffmpeg`), killing transcription on
+  // canonical installs. `enrichedPath` appends those dirs (when they exist) to
+  // the inherited PATH; inherited entries keep their order. A per-service `.env`
+  // PATH (operator intent) still wins via the spread below. See `spawn-path.ts`.
+  // The API-start path builds its own env — see `api-modules-ops.ts`
+  // `spawnSupervised`, which calls `enrichedPath()` too (keep the two in sync).
+  // `process.env.PATH` may ALREADY be enriched by serve startup (serve.ts);
+  // re-enriching here is a harmless no-op — `enrichedPath` is idempotent
+  // (dedupe + append-only), so double-enrichment can't duplicate or reorder.
+  const env: Record<string, string> = {
+    PATH: enrichedPath(),
+    PORT: String(entry.port),
+    ...fileEnvSansPort,
+  };
+  if (opts.hubOrigin) {
+    env[HUB_ORIGIN_ENV] = opts.hubOrigin;
+    // Multi-origin iss-set (onboarding-streamline 2026-06-25): alongside the
+    // single canonical origin, inject the SET of origins this hub legitimately
+    // answers on (issuer ∪ loopback aliases ∪ expose-state ∪ platform). A
+    // resource server on scope-guard ≥0.5.0 widens its accepted-`iss` check to
+    // this set, so a token minted under one URL of a multi-URL box validates
+    // when the resource is reached via another URL of the SAME box. SECURITY:
+    // the set is hub-controlled config/disk state only, NEVER a request Host —
+    // see `buildHubOriginsEnvValue`. The single `PARACHUTE_HUB_ORIGIN` above
+    // stays for back-compat with older scope-guard.
+    const originsValue = buildHubOriginsEnvValue(opts.configDir, opts.hubOrigin);
+    if (originsValue) env[HUB_ORIGINS_ENV] = originsValue;
+  }
+  if (opts.extraEnv) Object.assign(env, opts.extraEnv);
+
+  const req: SpawnReqShape = { short, cmd };
+  if (entry.installDir) req.cwd = entry.installDir;
+  if (Object.keys(env).length > 0) req.env = env;
+  return req;
+}
+
+/**
+ * Walk services.json, spawn every manageable module via the
+ * supervisor. Returns a per-module decision log so the caller can
+ * surface a startup summary.
+ */
+export async function bootSupervisedModules(
+  supervisor: Supervisor,
+  opts: BootOpts,
+): Promise<BootedModule[]> {
+  const log = opts.log ?? (() => {});
+  // Lenient: a single bad row shouldn't prevent the supervisor from booting
+  // the rest of the services. The container deploy hot path depends on this —
+  // we'd rather have N-1 modules up + one warning than zero modules up.
+  const manifest = readManifestLenient(opts.manifestPath);
+  const results: BootedModule[] = [];
+
+  for (const entry of manifest.services) {
+    const short = shortNameForManifest(entry.name) ?? entry.name;
+    const spec = await resolveSpec(short, entry);
+    if (!spec) {
+      // Row exists but no first-party fallback and no installDir-derived
+      // manifest. `parachute start` would print the same hint; the
+      // container path just logs + carries on.
+      log(`[supervisor] ${short}: no startCmd resolvable (services.json entry exists, no spec).`);
+      results.push({
+        short,
+        entryName: entry.name,
+        status: "skipped",
+        reason: "no-spec",
+      });
+      continue;
+    }
+
+    // Snap a drifted fixed-port row back to canonical before we derive PORT /
+    // probe / proxy from it (channel#41). No-op on the common path where the
+    // module already sits on its canonical port.
+    const spawnEntry = reconcilePortToCanonical(entry, opts.manifestPath, log);
+
+    const cmd = spec.startCmd?.(spawnEntry);
+    if (!cmd || cmd.length === 0) {
+      log(`[supervisor] ${short}: spec resolved but no startCmd — skipping (CLI-only module).`);
+      results.push({
+        short,
+        entryName: entry.name,
+        status: "skipped",
+        reason: "no-start-cmd",
+      });
+      continue;
+    }
+
+    // PORT override (hub#357 — third spawn site missed by hub#356), per-service
+    // .env merge, and PARACHUTE_HUB_ORIGIN propagation (hub#365) all live in the
+    // shared `buildModuleSpawnRequest` so the `POST /api/modules/:short/start`
+    // handler builds an identical request (design 2026-06-01 §3.3).
+    const req = buildModuleSpawnRequest(short, spawnEntry, cmd, {
+      configDir: opts.configDir,
+      ...(opts.hubOrigin !== undefined ? { hubOrigin: opts.hubOrigin } : {}),
+    });
+
+    // Serial await, not Promise.all: `supervisor.start` now carries a bounded
+    // post-spawn port-readiness gate (DEFAULT_START_READY_MS), so boot latency
+    // is the SUM of each slow-binding module's gate wait before `Bun.serve`
+    // comes up. Intentional — sequential boot keeps the start-error/install-card
+    // surface ordered and avoids a thundering-herd of port probes. Don't switch
+    // to `Promise.all` without accounting for the gate (it'd overlap the waits
+    // but also fire N concurrent readiness probes mid-boot).
+    await supervisor.start(req);
+    log(`[supervisor] ${short}: started (cmd=${cmd.join(" ")}).`);
+    results.push({ short, entryName: entry.name, status: "started" });
+  }
+
+  return results;
+}
+
+async function resolveSpec(short: string, entry: ServiceEntry): Promise<ServiceSpec | undefined> {
+  const firstParty = getSpec(short);
+  if (firstParty) return firstParty;
+  if (!entry.installDir) return undefined;
+  try {
+    const spec = await getSpecFromInstallDir(entry.installDir, entry.name);
+    return spec ?? undefined;
+  } catch (err) {
+    if (err instanceof ModuleManifestError) return undefined;
+    throw err;
+  }
+}

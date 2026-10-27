@@ -1,0 +1,815 @@
+import { describe, test, expect } from "bun:test";
+import { statSync, readFileSync } from "fs";
+import { join } from "path";
+import {
+  writeVaultConfig,
+  vaultDir,
+  readVaultConfig,
+  writeGlobalConfig,
+  readGlobalConfig,
+  writeEnvFile,
+  generateApiKey,
+  hashKey,
+  verifyKey,
+} from "./config.ts";
+import type { VaultConfig } from "./config.ts";
+
+describe("config", () => {
+  test("generates and verifies API keys", () => {
+    const { fullKey, keyId } = generateApiKey();
+    expect(fullKey).toMatch(/^pvk_/);
+    expect(keyId).toMatch(/^k_/);
+
+    const hash = hashKey(fullKey);
+    expect(hash).toMatch(/^sha256:/);
+    expect(verifyKey(fullKey, hash)).toBe(true);
+    expect(verifyKey("wrong_key_here_1234567890123456", hash)).toBe(false);
+  });
+
+  test("round-trips vault config", () => {
+    const config: VaultConfig = {
+      name: "testvault",
+      description: "A test vault for testing",
+      api_keys: [
+        {
+          id: "k_abc123",
+          label: "default",
+          scope: "write",
+          key_hash: "sha256:fakehash",
+          created_at: "2026-01-01T00:00:00.000Z",
+        },
+      ],
+      created_at: "2026-01-01T00:00:00.000Z",
+    };
+
+    writeVaultConfig(config);
+
+    const loaded = readVaultConfig("testvault");
+    expect(loaded).not.toBeNull();
+    expect(loaded!.name).toBe("testvault");
+    expect(loaded!.description).toBe("A test vault for testing");
+    expect(loaded!.api_keys.length).toBe(1);
+    expect(loaded!.api_keys[0].id).toBe("k_abc123");
+  });
+
+  test("round-trips tag_schemas in vault config", () => {
+    const config: VaultConfig = {
+      name: "testvault",
+      api_keys: [
+        {
+          id: "k_abc123",
+          label: "default",
+          scope: "write",
+          key_hash: "sha256:fakehash",
+          created_at: "2026-01-01T00:00:00.000Z",
+        },
+      ],
+      created_at: "2026-01-01T00:00:00.000Z",
+      tag_schemas: {
+        person: {
+          description: "A person in Aaron's life",
+          fields: {
+            first_appeared: {
+              type: "string",
+              description: "When this person first appeared",
+            },
+            relationship: {
+              type: "string",
+              description: "How they relate to Aaron",
+            },
+          },
+        },
+        project: {
+          description: "A project",
+          fields: {
+            status: {
+              type: "string",
+              enum: ["active", "completed", "abandoned"],
+              description: "Current project status",
+            },
+          },
+        },
+        "summary/monthly": {
+          description: "Monthly summary note",
+        },
+      },
+    };
+
+    writeVaultConfig(config);
+
+    const loaded = readVaultConfig("testvault");
+    expect(loaded).not.toBeNull();
+    expect(loaded!.tag_schemas).toBeDefined();
+
+    const person = loaded!.tag_schemas!.person;
+    expect(person.description).toBe("A person in Aaron's life");
+    expect(person.fields!.first_appeared.type).toBe("string");
+    expect(person.fields!.first_appeared.description).toBe("When this person first appeared");
+    expect(person.fields!.relationship.type).toBe("string");
+
+    const project = loaded!.tag_schemas!.project;
+    expect(project.fields!.status.enum).toEqual(["active", "completed", "abandoned"]);
+
+    const monthly = loaded!.tag_schemas!["summary/monthly"];
+    expect(monthly.description).toBe("Monthly summary note");
+    expect(monthly.fields).toBeUndefined();
+  });
+
+  test("vault config without tag_schemas loads cleanly", () => {
+    const config: VaultConfig = {
+      name: "testvault",
+      api_keys: [],
+      created_at: "2026-01-01T00:00:00.000Z",
+    };
+
+    writeVaultConfig(config);
+
+    const loaded = readVaultConfig("testvault");
+    expect(loaded).not.toBeNull();
+    expect(loaded!.tag_schemas).toBeUndefined();
+  });
+
+  test("round-trips vault config transcription.context", () => {
+    const config: VaultConfig = {
+      name: "testvault",
+      api_keys: [],
+      created_at: "2026-01-01T00:00:00.000Z",
+      transcription: {
+        context: [
+          { tag: "person", include_metadata: ["summary", "aliases"] },
+          { tag: "project", exclude_tag: "archived", include_metadata: ["summary"] },
+        ],
+      },
+    };
+
+    writeVaultConfig(config);
+
+    const loaded = readVaultConfig("testvault");
+    expect(loaded).not.toBeNull();
+    expect(loaded!.transcription?.context).toBeDefined();
+    expect(loaded!.transcription!.context!.length).toBe(2);
+    expect(loaded!.transcription!.context![0]).toEqual({
+      tag: "person",
+      include_metadata: ["summary", "aliases"],
+    });
+    expect(loaded!.transcription!.context![1]).toEqual({
+      tag: "project",
+      exclude_tag: "archived",
+      include_metadata: ["summary"],
+    });
+  });
+
+  test("vault config without transcription.context loads cleanly", () => {
+    const config: VaultConfig = {
+      name: "testvault",
+      api_keys: [],
+      created_at: "2026-01-01T00:00:00.000Z",
+    };
+    writeVaultConfig(config);
+    const loaded = readVaultConfig("testvault");
+    expect(loaded!.transcription).toBeUndefined();
+  });
+
+  test("round-trips per-vault auto_transcribe.enabled (true + false)", () => {
+    // The PATCH /api/vault handler persists the per-vault toggle via
+    // writeVaultConfig; confirm it survives a read-back — this is the exact
+    // field shouldAutoTranscribe reads per-vault (per-vault → global → true).
+    const base: VaultConfig = {
+      name: "testvault",
+      api_keys: [],
+      created_at: "2026-01-01T00:00:00.000Z",
+    };
+
+    writeVaultConfig({ ...base, auto_transcribe: { enabled: true } });
+    expect(readVaultConfig("testvault")!.auto_transcribe?.enabled).toBe(true);
+
+    writeVaultConfig({ ...base, auto_transcribe: { enabled: false } });
+    expect(readVaultConfig("testvault")!.auto_transcribe?.enabled).toBe(false);
+  });
+
+  test("vault config without auto_transcribe loads as undefined (falls back to global)", () => {
+    const config: VaultConfig = {
+      name: "testvault",
+      api_keys: [],
+      created_at: "2026-01-01T00:00:00.000Z",
+    };
+    writeVaultConfig(config);
+    expect(readVaultConfig("testvault")!.auto_transcribe).toBeUndefined();
+  });
+
+  test("round-trips discovery: enabled|disabled", () => {
+    // Default: absent means enabled (endpoint serves names).
+    writeGlobalConfig({ port: 1940 });
+    expect(readGlobalConfig().discovery).toBeUndefined();
+
+    // Explicit enabled.
+    writeGlobalConfig({ port: 1940, discovery: "enabled" });
+    expect(readGlobalConfig().discovery).toBe("enabled");
+
+    // Explicit disabled — this is the opt-out flag operators set when they
+    // don't want /vaults/list to reveal vault names publicly.
+    writeGlobalConfig({ port: 1940, discovery: "disabled" });
+    expect(readGlobalConfig().discovery).toBe("disabled");
+  });
+
+  test("global api_keys round-trip scope: read|write and default missing scope to write", () => {
+    // Regression for the silent privilege-escalation bug: the global YAML
+    // parser used to drop the `scope` field, leaving `globalKey.scope`
+    // undefined. Auth then resolved any non-"read" value to "full", so a
+    // user-authored `scope: read` global key would silently get full access.
+    writeGlobalConfig({
+      port: 1940,
+      api_keys: [
+        { id: "k_r", label: "reader", scope: "read", key_hash: "sha256:r", created_at: "2026-01-01T00:00:00.000Z" },
+        { id: "k_w", label: "writer", scope: "write", key_hash: "sha256:w", created_at: "2026-01-01T00:00:00.000Z" },
+      ],
+    });
+    const loaded = readGlobalConfig();
+    expect(loaded.api_keys?.find((k) => k.id === "k_r")?.scope).toBe("read");
+    expect(loaded.api_keys?.find((k) => k.id === "k_w")?.scope).toBe("write");
+
+    // Missing-scope branch: a hand-edited config.yaml entry without a
+    // `scope:` line must default to "write" (matches vault-level parser
+    // and the historical behavior the writer round-trips).
+    const fs = require("fs");
+    const path = `${process.env.PARACHUTE_HOME}/vault/config.yaml`;
+    fs.writeFileSync(
+      path,
+      `port: 1940\napi_keys:\n  - id: k_legacy\n    label: legacy\n    key_hash: sha256:legacy\n    created_at: "2026-01-01T00:00:00.000Z"\n`,
+    );
+    const reloaded = readGlobalConfig();
+    expect(reloaded.api_keys?.find((k) => k.id === "k_legacy")?.scope).toBe("write");
+  });
+
+  // ----- vault#234: anchored api_keys field regexes ----------------------
+  // The api_keys field regexes (label/scope/key_hash/created_at/last_used_at)
+  // used to be unanchored, so a COMMENTED `# scope: read` line matched, and a
+  // value-less `scope: ` (trailing space) captured the NEXT field's token
+  // (`key_hash`). The writer never emits either shape — only hand-editing
+  // reaches these branches — but a malformed scope could silently mis-scope a
+  // key. The regexes are now line-anchored + horizontal-whitespace-bounded.
+
+  test("vault#234: commented `# scope:` line is ignored, scope falls back to default", () => {
+    const fs = require("fs");
+    const path = join(process.env.PARACHUTE_HOME!, "vault", "data", "mv234", "vault.yaml");
+    fs.mkdirSync(join(process.env.PARACHUTE_HOME!, "vault", "data", "mv234"), { recursive: true });
+    // The only `scope:` line is commented out; the parser must NOT pick it up.
+    fs.writeFileSync(
+      path,
+      `name: mv234\ncreated_at: "2026-01-01T00:00:00.000Z"\napi_keys:\n  - id: k_cmt\n    label: commented\n    # scope: read\n    key_hash: sha256:cmt\n    created_at: "2026-01-01T00:00:00.000Z"\n`,
+    );
+    const loaded = readVaultConfig("mv234");
+    const key = loaded!.api_keys.find((k) => k.id === "k_cmt");
+    expect(key).toBeDefined();
+    // Commented scope ignored → default "write", NOT "read".
+    expect(key!.scope).toBe("write");
+    expect(key!.key_hash).toBe("sha256:cmt");
+  });
+
+  test("vault#234: value-less `scope: ` (trailing space) does NOT capture the next field", () => {
+    const fs = require("fs");
+    const path = join(process.env.PARACHUTE_HOME!, "vault", "data", "mv234b", "vault.yaml");
+    fs.mkdirSync(join(process.env.PARACHUTE_HOME!, "vault", "data", "mv234b"), { recursive: true });
+    // `scope: ` has a trailing space and no value; the OLD regex skipped the
+    // newline and captured `sha256:trailing` (the key_hash) as the scope.
+    fs.writeFileSync(
+      path,
+      `name: mv234b\ncreated_at: "2026-01-01T00:00:00.000Z"\napi_keys:\n  - id: k_trail\n    label: trailing\n    scope: \n    key_hash: sha256:trailing\n    created_at: "2026-01-01T00:00:00.000Z"\n`,
+    );
+    const loaded = readVaultConfig("mv234b");
+    const key = loaded!.api_keys.find((k) => k.id === "k_trail");
+    expect(key).toBeDefined();
+    // The hash must NOT have been borrowed as the scope.
+    expect(key!.scope).not.toBe("sha256:trailing");
+    expect(key!.scope).toBe("write"); // default
+    // And the real key_hash is still parsed correctly.
+    expect(key!.key_hash).toBe("sha256:trailing");
+  });
+
+  test("vault#234: a valid `scope: read` still parses (positive control, both parsers)", () => {
+    const fs = require("fs");
+    // Vault-level parser.
+    const vpath = join(process.env.PARACHUTE_HOME!, "vault", "data", "mv234c", "vault.yaml");
+    fs.mkdirSync(join(process.env.PARACHUTE_HOME!, "vault", "data", "mv234c"), { recursive: true });
+    fs.writeFileSync(
+      vpath,
+      `name: mv234c\ncreated_at: "2026-01-01T00:00:00.000Z"\napi_keys:\n  - id: k_v\n    label: reader\n    scope: read\n    key_hash: sha256:v\n    created_at: "2026-01-01T00:00:00.000Z"\n`,
+    );
+    expect(readVaultConfig("mv234c")!.api_keys.find((k) => k.id === "k_v")?.scope).toBe("read");
+
+    // Global parser, same grammar.
+    const gpath = join(process.env.PARACHUTE_HOME!, "vault", "config.yaml");
+    fs.writeFileSync(
+      gpath,
+      `port: 1940\napi_keys:\n  - id: k_g\n    label: reader\n    # scope: write\n    scope: read\n    key_hash: sha256:g\n    created_at: "2026-01-01T00:00:00.000Z"\n`,
+    );
+    // The commented `# scope: write` is skipped; the real `scope: read` wins.
+    expect(readGlobalConfig().api_keys?.find((k) => k.id === "k_g")?.scope).toBe("read");
+  });
+
+  test("writeEnvFile writes .env at 0600 (SCRIBE_AUTH_TOKEN secrecy)", () => {
+    // Regression for vault#354 reviewer finding: the .env holds
+    // SCRIBE_AUTH_TOKEN (the vault↔scribe loopback bearer). On a
+    // shared-user machine or a Docker image with a loose umask, a
+    // world-readable .env would leak the bearer to any local process.
+    //
+    // Resolve the path dynamically from PARACHUTE_HOME (not the
+    // module-load-time `ENV_PATH` constant) so this test is robust to
+    // earlier tests in the suite that mutate PARACHUTE_HOME — writeEnvFile
+    // itself resolves the path dynamically via `envFilePath()`.
+    const envPath = join(process.env.PARACHUTE_HOME!, "vault", ".env");
+    writeEnvFile({ SCRIBE_AUTH_TOKEN: "test-bearer-do-not-leak", PORT: "1940" });
+    const mode = statSync(envPath).mode & 0o777;
+    expect(mode).toBe(0o600);
+
+    // Existing-file branch: writeFileSync's `mode` only applies on
+    // create, so the defensive chmodSync must downgrade an existing
+    // (e.g. 0644-from-an-older-version) .env to 0600 on the next write.
+    writeEnvFile({ SCRIBE_AUTH_TOKEN: "rotated", PORT: "1940" });
+    const mode2 = statSync(envPath).mode & 0o777;
+    expect(mode2).toBe(0o600);
+  });
+
+  test("round-trips autostart: true|false (#113)", () => {
+    // Default: absent means autostart-on (init registers the daemon).
+    writeGlobalConfig({ port: 1940 });
+    expect(readGlobalConfig().autostart).toBeUndefined();
+
+    // Explicit true (e.g., user re-enabled after disabling).
+    writeGlobalConfig({ port: 1940, autostart: true });
+    expect(readGlobalConfig().autostart).toBe(true);
+
+    // Explicit false — the opt-out signal init writes when --no-autostart is
+    // passed. Daemon registration is then skipped on this and future inits.
+    writeGlobalConfig({ port: 1940, autostart: false });
+    expect(readGlobalConfig().autostart).toBe(false);
+  });
+
+  test("round-trips embeddings_enabled: true|false (semantic-search opt-in, 0.7.3)", () => {
+    // Absent means off — semantic search is opt-in as of 0.7.3. The key is
+    // only persisted when explicitly set (the self-host settings toggle).
+    writeGlobalConfig({ port: 1940 });
+    expect(readGlobalConfig().embeddings_enabled).toBeUndefined();
+
+    // Explicit true — the operator turned semantic search on without editing
+    // the env file; getSharedEmbeddingProvider threads this in as the default.
+    writeGlobalConfig({ port: 1940, embeddings_enabled: true });
+    expect(readGlobalConfig().embeddings_enabled).toBe(true);
+
+    // Explicit false — persisted opt-out (distinct from absent for clarity).
+    writeGlobalConfig({ port: 1940, embeddings_enabled: false });
+    expect(readGlobalConfig().embeddings_enabled).toBe(false);
+  });
+
+  test("round-trips default_mirror: internal|off", () => {
+    // Absent: createVault falls back to the in-code default ("internal" —
+    // backup-on-by-default). The knob is only persisted when explicitly set.
+    writeGlobalConfig({ port: 1940 });
+    expect(readGlobalConfig().default_mirror).toBeUndefined();
+
+    // Explicit internal — new vaults get the History-preset local git mirror.
+    writeGlobalConfig({ port: 1940, default_mirror: "internal" });
+    expect(readGlobalConfig().default_mirror).toBe("internal");
+
+    // Explicit off — the opt-out operators set on git-less / disk-constrained
+    // / cloud boxes so new vaults are created with no mirror config.
+    writeGlobalConfig({ port: 1940, default_mirror: "off" });
+    expect(readGlobalConfig().default_mirror).toBe("off");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Backup config — round-trip through writeGlobalConfig + readGlobalConfig
+// ---------------------------------------------------------------------------
+
+import { describe as describe2, test as test2, expect as expect2, beforeEach, afterEach } from "bun:test";
+import { mkdtempSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
+
+describe2("backup config round-trip", () => {
+  // We can't just call writeGlobalConfig / readGlobalConfig like above: they
+  // write into CONFIG_DIR, which is derived from PARACHUTE_HOME at import
+  // time. So we spawn a child process with an isolated PARACHUTE_HOME to
+  // test the full read/write cycle, matching the pattern in doctor.test.ts.
+  let dir: string;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "backup-cfg-")); });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  test2("writes and reads a backup section with tiered retention + local dest", async () => {
+    // Child script writes a config, re-reads it, and prints the normalized
+    // result. This exercises the full YAML round-trip without mocking.
+    const script = `
+      process.env.PARACHUTE_HOME = ${JSON.stringify(dir)};
+      const { writeGlobalConfig, readGlobalConfig } = await import(${JSON.stringify(join(import.meta.dir, "config.ts"))});
+      writeGlobalConfig({
+        port: 1940,
+        default_vault: "default",
+        backup: {
+          schedule: "daily",
+          retention: { daily: 7, weekly: 4, monthly: 12, yearly: null },
+          destinations: [{ kind: "local", path: "~/parachute-backups" }],
+        },
+      });
+      const read = readGlobalConfig();
+      console.log(JSON.stringify(read.backup));
+    `;
+    const proc = Bun.spawnSync({
+      cmd: ["bun", "-e", script],
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const stdout = new TextDecoder().decode(proc.stdout);
+    const stderr = new TextDecoder().decode(proc.stderr);
+    expect2(proc.exitCode, stderr).toBe(0);
+
+    const parsed = JSON.parse(stdout.trim());
+    expect2(parsed.schedule).toBe("daily");
+    expect2(parsed.retention).toEqual({ daily: 7, weekly: 4, monthly: 12, yearly: null });
+    expect2(parsed.destinations.length).toBe(1);
+    expect2(parsed.destinations[0].kind).toBe("local");
+    expect2(parsed.destinations[0].path).toBe("~/parachute-backups");
+  });
+
+  test2("retention defaults when the user omits the retention block entirely", async () => {
+    // A backup: with schedule only (no retention block) should pick up the
+    // shipped defaults: 7/4/12/null.
+    const script = `
+      process.env.PARACHUTE_HOME = ${JSON.stringify(dir)};
+      const fs = await import("fs");
+      const path = await import("path");
+      const vaultHome = path.join(${JSON.stringify(dir)}, "vault");
+      fs.mkdirSync(vaultHome, { recursive: true });
+      fs.writeFileSync(path.join(vaultHome, "config.yaml"),
+        "port: 1940\\nbackup:\\n  schedule: daily\\n  destinations: []\\n");
+      const { readGlobalConfig } = await import(${JSON.stringify(join(import.meta.dir, "config.ts"))});
+      console.log(JSON.stringify(readGlobalConfig().backup));
+    `;
+    const proc = Bun.spawnSync({ cmd: ["bun", "-e", script], stdout: "pipe", stderr: "pipe" });
+    const out = new TextDecoder().decode(proc.stdout);
+    expect2(proc.exitCode, new TextDecoder().decode(proc.stderr)).toBe(0);
+    const parsed = JSON.parse(out.trim());
+    expect2(parsed.retention).toEqual({ daily: 7, weekly: 4, monthly: 12, yearly: null });
+  });
+
+  test2("partial retention block: unspecified tiers default to 0 (explicit > merged)", async () => {
+    // If the user supplies a retention block with only `daily: 3`, the
+    // remaining tiers read as 0 rather than merging with shipped defaults.
+    // Predictable: what you write is what you get.
+    const script = `
+      process.env.PARACHUTE_HOME = ${JSON.stringify(dir)};
+      const fs = await import("fs");
+      const path = await import("path");
+      const vaultHome = path.join(${JSON.stringify(dir)}, "vault");
+      fs.mkdirSync(vaultHome, { recursive: true });
+      fs.writeFileSync(path.join(vaultHome, "config.yaml"),
+        "port: 1940\\nbackup:\\n  schedule: daily\\n  retention:\\n    daily: 3\\n  destinations: []\\n");
+      const { readGlobalConfig } = await import(${JSON.stringify(join(import.meta.dir, "config.ts"))});
+      console.log(JSON.stringify(readGlobalConfig().backup));
+    `;
+    const proc = Bun.spawnSync({ cmd: ["bun", "-e", script], stdout: "pipe", stderr: "pipe" });
+    const out = new TextDecoder().decode(proc.stdout);
+    expect2(proc.exitCode, new TextDecoder().decode(proc.stderr)).toBe(0);
+    const parsed = JSON.parse(out.trim());
+    expect2(parsed.retention.daily).toBe(3);
+    expect2(parsed.retention.weekly).toBe(0);
+    expect2(parsed.retention.monthly).toBe(0);
+    // yearly stays at 0 because the user didn't say null.
+    expect2(parsed.retention.yearly).toBe(0);
+  });
+
+  test2("yearly: null round-trips through write/read as JSON null", async () => {
+    const script = `
+      process.env.PARACHUTE_HOME = ${JSON.stringify(dir)};
+      const { writeGlobalConfig, readGlobalConfig } = await import(${JSON.stringify(join(import.meta.dir, "config.ts"))});
+      writeGlobalConfig({
+        port: 1940,
+        backup: {
+          schedule: "manual",
+          retention: { daily: 0, weekly: 0, monthly: 0, yearly: null },
+          destinations: [],
+        },
+      });
+      console.log(JSON.stringify(readGlobalConfig().backup));
+    `;
+    const proc = Bun.spawnSync({ cmd: ["bun", "-e", script], stdout: "pipe", stderr: "pipe" });
+    const out = new TextDecoder().decode(proc.stdout);
+    expect2(proc.exitCode).toBe(0);
+    const parsed = JSON.parse(out.trim());
+    expect2(parsed.retention.yearly).toBeNull();
+  });
+
+  test2("config without a backup section reads back with backup === undefined", async () => {
+    const script = `
+      process.env.PARACHUTE_HOME = ${JSON.stringify(dir)};
+      const { writeGlobalConfig, readGlobalConfig } = await import(${JSON.stringify(join(import.meta.dir, "config.ts"))});
+      writeGlobalConfig({ port: 1940, default_vault: "default" });
+      const read = readGlobalConfig();
+      console.log(JSON.stringify({ backup: read.backup ?? null }));
+    `;
+    const proc = Bun.spawnSync({ cmd: ["bun", "-e", script], stdout: "pipe", stderr: "pipe" });
+    const out = new TextDecoder().decode(proc.stdout);
+    expect2(proc.exitCode).toBe(0);
+    const parsed = JSON.parse(out.trim());
+    expect2(parsed.backup).toBeNull();
+  });
+
+  test2("empty destinations round-trips as empty list (not missing key)", async () => {
+    const script = `
+      process.env.PARACHUTE_HOME = ${JSON.stringify(dir)};
+      const { writeGlobalConfig, readGlobalConfig } = await import(${JSON.stringify(join(import.meta.dir, "config.ts"))});
+      writeGlobalConfig({
+        port: 1940,
+        backup: {
+          schedule: "manual",
+          retention: { daily: 7, weekly: 4, monthly: 12, yearly: null },
+          destinations: [],
+        },
+      });
+      const read = readGlobalConfig();
+      console.log(JSON.stringify(read.backup));
+    `;
+    const proc = Bun.spawnSync({ cmd: ["bun", "-e", script], stdout: "pipe", stderr: "pipe" });
+    const out = new TextDecoder().decode(proc.stdout);
+    expect2(proc.exitCode).toBe(0);
+    const parsed = JSON.parse(out.trim());
+    expect2(parsed.schedule).toBe("manual");
+    expect2(parsed.destinations).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Legacy layout migration — pre-0.3 installs put vault files at the
+// ecosystem root; on startup we move them into vault/.
+// ---------------------------------------------------------------------------
+
+describe2("migrateFromLegacyLayout", () => {
+  let dir: string;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "parachute-migrate-")); });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  test2("fresh install with no legacy files is a no-op and creates data/ + logs/", async () => {
+    const script = `
+      process.env.PARACHUTE_HOME = ${JSON.stringify(dir)};
+      const fs = await import("fs");
+      const path = await import("path");
+      const { ensureConfigDirSync } = await import(${JSON.stringify(join(import.meta.dir, "config.ts"))});
+      ensureConfigDirSync();
+      const vaultHome = path.join(${JSON.stringify(dir)}, "vault");
+      console.log(JSON.stringify({
+        vaultHomeExists: fs.existsSync(vaultHome),
+        dataExists: fs.existsSync(path.join(vaultHome, "data")),
+        logsExists: fs.existsSync(path.join(vaultHome, "logs")),
+        legacyVaultsDirExists: fs.existsSync(path.join(vaultHome, "vaults")),
+        rootEnvExists: fs.existsSync(path.join(${JSON.stringify(dir)}, ".env")),
+      }));
+    `;
+    const proc = Bun.spawnSync({ cmd: ["bun", "-e", script], stdout: "pipe", stderr: "pipe" });
+    const stderr = new TextDecoder().decode(proc.stderr);
+    expect2(proc.exitCode, stderr).toBe(0);
+    const parsed = JSON.parse(new TextDecoder().decode(proc.stdout).trim());
+    expect2(parsed.vaultHomeExists).toBe(true);
+    expect2(parsed.dataExists).toBe(true);
+    expect2(parsed.logsExists).toBe(true);
+    expect2(parsed.legacyVaultsDirExists).toBe(false);
+    expect2(parsed.rootEnvExists).toBe(false);
+  });
+
+  test2("moves legacy root files into vault/ (vaults → data/, logs → logs/)", async () => {
+    const script = `
+      process.env.PARACHUTE_HOME = ${JSON.stringify(dir)};
+      const fs = await import("fs");
+      const path = await import("path");
+      const root = ${JSON.stringify(dir)};
+      fs.mkdirSync(root, { recursive: true });
+      fs.writeFileSync(path.join(root, ".env"), "PORT=1940\\n");
+      fs.writeFileSync(path.join(root, "config.yaml"), "port: 1940\\n");
+      fs.writeFileSync(path.join(root, "vault.log"), "log\\n");
+      fs.writeFileSync(path.join(root, "vault.err"), "err\\n");
+      fs.writeFileSync(path.join(root, "start.sh"), "#!/bin/bash\\n");
+      fs.writeFileSync(path.join(root, "server-path"), "/repo/src/server.ts\\n");
+      fs.mkdirSync(path.join(root, "vaults", "default"), { recursive: true });
+      fs.writeFileSync(path.join(root, "vaults", "default", "vault.yaml"), "name: default\\napi_keys: []\\n");
+      const { ensureConfigDirSync } = await import(${JSON.stringify(join(import.meta.dir, "config.ts"))});
+      ensureConfigDirSync();
+      const vaultHome = path.join(root, "vault");
+      console.log(JSON.stringify({
+        env: fs.readFileSync(path.join(vaultHome, ".env"), "utf-8"),
+        config: fs.readFileSync(path.join(vaultHome, "config.yaml"), "utf-8"),
+        start: fs.readFileSync(path.join(vaultHome, "start.sh"), "utf-8"),
+        serverPath: fs.readFileSync(path.join(vaultHome, "server-path"), "utf-8"),
+        vaultYaml: fs.readFileSync(path.join(vaultHome, "data", "default", "vault.yaml"), "utf-8"),
+        log: fs.readFileSync(path.join(vaultHome, "logs", "vault.log"), "utf-8"),
+        err: fs.readFileSync(path.join(vaultHome, "logs", "vault.err"), "utf-8"),
+        legacyEnv: fs.existsSync(path.join(root, ".env")),
+        legacyVaults: fs.existsSync(path.join(root, "vaults")),
+        legacyVaultLog: fs.existsSync(path.join(root, "vault.log")),
+        legacyVaultErr: fs.existsSync(path.join(root, "vault.err")),
+      }));
+    `;
+    const proc = Bun.spawnSync({ cmd: ["bun", "-e", script], stdout: "pipe", stderr: "pipe" });
+    const stderr = new TextDecoder().decode(proc.stderr);
+    expect2(proc.exitCode, stderr).toBe(0);
+    const parsed = JSON.parse(new TextDecoder().decode(proc.stdout).trim());
+    expect2(parsed.env).toContain("PORT=1940");
+    expect2(parsed.config).toContain("port: 1940");
+    expect2(parsed.start).toContain("#!/bin/bash");
+    expect2(parsed.serverPath).toContain("/repo/src/server.ts");
+    expect2(parsed.vaultYaml).toContain("name: default");
+    expect2(parsed.log).toContain("log");
+    expect2(parsed.err).toContain("err");
+    // Legacy paths should be gone after the move.
+    expect2(parsed.legacyEnv).toBe(false);
+    expect2(parsed.legacyVaults).toBe(false);
+    expect2(parsed.legacyVaultLog).toBe(false);
+    expect2(parsed.legacyVaultErr).toBe(false);
+  });
+
+  test2("double-migration is idempotent", async () => {
+    const script = `
+      process.env.PARACHUTE_HOME = ${JSON.stringify(dir)};
+      const fs = await import("fs");
+      const path = await import("path");
+      const root = ${JSON.stringify(dir)};
+      fs.writeFileSync(path.join(root, ".env"), "PORT=1940\\n");
+      const { ensureConfigDirSync } = await import(${JSON.stringify(join(import.meta.dir, "config.ts"))});
+      ensureConfigDirSync();
+      // Second call: no legacy paths left, nothing to do.
+      ensureConfigDirSync();
+      console.log(JSON.stringify({
+        envInVault: fs.readFileSync(path.join(root, "vault", ".env"), "utf-8"),
+        rootEnv: fs.existsSync(path.join(root, ".env")),
+      }));
+    `;
+    const proc = Bun.spawnSync({ cmd: ["bun", "-e", script], stdout: "pipe", stderr: "pipe" });
+    const stderr = new TextDecoder().decode(proc.stderr);
+    expect2(proc.exitCode, stderr).toBe(0);
+    const parsed = JSON.parse(new TextDecoder().decode(proc.stdout).trim());
+    expect2(parsed.envInVault).toContain("PORT=1940");
+    expect2(parsed.rootEnv).toBe(false);
+  });
+
+  test2("0.3 install: vault/vaults/ → vault/data/, vault/{vault.log,vault.err} → vault/logs/", async () => {
+    // Users who installed on 0.3 (post-PR-8 but pre-filesystem-hygiene)
+    // have vault state under `vault/` with the old internal names.
+    const script = `
+      process.env.PARACHUTE_HOME = ${JSON.stringify(dir)};
+      const fs = await import("fs");
+      const path = await import("path");
+      const vaultHome = path.join(${JSON.stringify(dir)}, "vault");
+      fs.mkdirSync(path.join(vaultHome, "vaults", "work"), { recursive: true });
+      fs.writeFileSync(path.join(vaultHome, "vaults", "work", "vault.yaml"), "name: work\\napi_keys: []\\n");
+      fs.writeFileSync(path.join(vaultHome, "vault.log"), "daemon-stdout\\n");
+      fs.writeFileSync(path.join(vaultHome, "vault.err"), "daemon-stderr\\n");
+      const { ensureConfigDirSync } = await import(${JSON.stringify(join(import.meta.dir, "config.ts"))});
+      ensureConfigDirSync();
+      console.log(JSON.stringify({
+        vaultYaml: fs.readFileSync(path.join(vaultHome, "data", "work", "vault.yaml"), "utf-8"),
+        log: fs.readFileSync(path.join(vaultHome, "logs", "vault.log"), "utf-8"),
+        err: fs.readFileSync(path.join(vaultHome, "logs", "vault.err"), "utf-8"),
+        legacyVaultsDir: fs.existsSync(path.join(vaultHome, "vaults")),
+        legacyLog: fs.existsSync(path.join(vaultHome, "vault.log")),
+        legacyErr: fs.existsSync(path.join(vaultHome, "vault.err")),
+      }));
+    `;
+    const proc = Bun.spawnSync({ cmd: ["bun", "-e", script], stdout: "pipe", stderr: "pipe" });
+    const stderr = new TextDecoder().decode(proc.stderr);
+    expect2(proc.exitCode, stderr).toBe(0);
+    const parsed = JSON.parse(new TextDecoder().decode(proc.stdout).trim());
+    expect2(parsed.vaultYaml).toContain("name: work");
+    expect2(parsed.log).toContain("daemon-stdout");
+    expect2(parsed.err).toContain("daemon-stderr");
+    expect2(parsed.legacyVaultsDir).toBe(false);
+    expect2(parsed.legacyLog).toBe(false);
+    expect2(parsed.legacyErr).toBe(false);
+  });
+
+  test2("0.3 internal migration: both vault/vaults/ and vault/data/ exist — data/ wins, vaults/ preserved", async () => {
+    const script = `
+      process.env.PARACHUTE_HOME = ${JSON.stringify(dir)};
+      const fs = await import("fs");
+      const path = await import("path");
+      const vaultHome = path.join(${JSON.stringify(dir)}, "vault");
+      // Both layouts present with distinct marker content — migration
+      // must NOT overwrite data/ (user may have manually staged it).
+      fs.mkdirSync(path.join(vaultHome, "vaults"), { recursive: true });
+      fs.writeFileSync(path.join(vaultHome, "vaults", "MARKER_LEGACY"), "legacy\\n");
+      fs.mkdirSync(path.join(vaultHome, "data"), { recursive: true });
+      fs.writeFileSync(path.join(vaultHome, "data", "MARKER_CURRENT"), "current\\n");
+      const { ensureConfigDirSync } = await import(${JSON.stringify(join(import.meta.dir, "config.ts"))});
+      ensureConfigDirSync();
+      console.log(JSON.stringify({
+        dataMarker: fs.existsSync(path.join(vaultHome, "data", "MARKER_CURRENT")),
+        legacyMarker: fs.existsSync(path.join(vaultHome, "vaults", "MARKER_LEGACY")),
+        dataOverwrittenByLegacy: fs.existsSync(path.join(vaultHome, "data", "MARKER_LEGACY")),
+      }));
+    `;
+    const proc = Bun.spawnSync({ cmd: ["bun", "-e", script], stdout: "pipe", stderr: "pipe" });
+    const stderr = new TextDecoder().decode(proc.stderr);
+    expect2(proc.exitCode, stderr).toBe(0);
+    const parsed = JSON.parse(new TextDecoder().decode(proc.stdout).trim());
+    expect2(parsed.dataMarker).toBe(true); // data/ untouched
+    expect2(parsed.legacyMarker).toBe(true); // vaults/ untouched, for user to inspect
+    expect2(parsed.dataOverwrittenByLegacy).toBe(false);
+    // Warning surfaces on stderr so the user sees it.
+    expect2(stderr).toContain("both");
+    expect2(stderr).toContain("vaults");
+    expect2(stderr).toContain("data");
+  });
+
+  test2("0.3 internal migration: idempotent — second boot is a no-op", async () => {
+    const script = `
+      process.env.PARACHUTE_HOME = ${JSON.stringify(dir)};
+      const fs = await import("fs");
+      const path = await import("path");
+      const vaultHome = path.join(${JSON.stringify(dir)}, "vault");
+      fs.mkdirSync(path.join(vaultHome, "vaults", "journal"), { recursive: true });
+      fs.writeFileSync(path.join(vaultHome, "vaults", "journal", "vault.yaml"), "name: journal\\n");
+      const { ensureConfigDirSync } = await import(${JSON.stringify(join(import.meta.dir, "config.ts"))});
+      ensureConfigDirSync();
+      ensureConfigDirSync(); // second boot — no-op.
+      console.log(JSON.stringify({
+        vaultYaml: fs.readFileSync(path.join(vaultHome, "data", "journal", "vault.yaml"), "utf-8"),
+        legacyVaultsDir: fs.existsSync(path.join(vaultHome, "vaults")),
+      }));
+    `;
+    const proc = Bun.spawnSync({ cmd: ["bun", "-e", script], stdout: "pipe", stderr: "pipe" });
+    const stderr = new TextDecoder().decode(proc.stderr);
+    expect2(proc.exitCode, stderr).toBe(0);
+    const parsed = JSON.parse(new TextDecoder().decode(proc.stdout).trim());
+    expect2(parsed.vaultYaml).toContain("name: journal");
+    expect2(parsed.legacyVaultsDir).toBe(false);
+  });
+
+  test2("leaves legacy in place when target already exists (no overwrite)", async () => {
+    const script = `
+      process.env.PARACHUTE_HOME = ${JSON.stringify(dir)};
+      const fs = await import("fs");
+      const path = await import("path");
+      const root = ${JSON.stringify(dir)};
+      const vaultHome = path.join(root, "vault");
+      fs.mkdirSync(vaultHome, { recursive: true });
+      fs.writeFileSync(path.join(root, ".env"), "LEGACY\\n");
+      fs.writeFileSync(path.join(vaultHome, ".env"), "CURRENT\\n");
+      const { ensureConfigDirSync } = await import(${JSON.stringify(join(import.meta.dir, "config.ts"))});
+      ensureConfigDirSync();
+      console.log(JSON.stringify({
+        vaultEnv: fs.readFileSync(path.join(vaultHome, ".env"), "utf-8"),
+        legacyEnv: fs.existsSync(path.join(root, ".env"))
+          ? fs.readFileSync(path.join(root, ".env"), "utf-8")
+          : null,
+      }));
+    `;
+    const proc = Bun.spawnSync({ cmd: ["bun", "-e", script], stdout: "pipe", stderr: "pipe" });
+    const stderr = new TextDecoder().decode(proc.stderr);
+    expect2(proc.exitCode, stderr).toBe(0);
+    const parsed = JSON.parse(new TextDecoder().decode(proc.stdout).trim());
+    // Target wins; legacy file is left alone for the user to investigate.
+    expect2(parsed.vaultEnv).toBe("CURRENT\n");
+    expect2(parsed.legacyEnv).toBe("LEGACY\n");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// formatMigrationFailure: the warn-line the migration catches emit. EXDEV
+// (cross-device rename) is hard to simulate in a test — PARACHUTE_HOME
+// straddling a mount is the real trigger — but we can at least verify the
+// helper attaches the "mount boundary" hint when the error code matches,
+// so users debugging a Docker/multi-disk layout get a meaningful message
+// instead of "failed to migrate X → Y: EXDEV: cross-device link not permitted".
+// ---------------------------------------------------------------------------
+
+import { formatMigrationFailure } from "./config.ts";
+
+describe("formatMigrationFailure", () => {
+  test("EXDEV errors get a mount-boundary hint and note legacy fallback", () => {
+    const err = Object.assign(new Error("EXDEV: cross-device link not permitted"), {
+      code: "EXDEV",
+    });
+    const msg = formatMigrationFailure("/src/path", "/dst/path", err);
+    expect(msg).toContain("mount boundary");
+    expect(msg).toContain("EXDEV");
+    expect(msg).toContain("legacy layout");
+    expect(msg).toContain("/src/path");
+    expect(msg).toContain("/dst/path");
+  });
+
+  test("non-EXDEV errors fall back to the raw message", () => {
+    const err = Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
+    const msg = formatMigrationFailure("/src/path", "/dst/path", err);
+    expect(msg).toContain("EACCES: permission denied");
+    expect(msg).not.toContain("mount boundary");
+  });
+
+  test("non-Error values are stringified safely", () => {
+    const msg = formatMigrationFailure("/src", "/dst", "weird string");
+    expect(msg).toContain("weird string");
+    expect(msg).not.toContain("mount boundary");
+  });
+});
+
+test("name-only YAML update preserves CRLF and indented name text", () => {
+  const source = "name: before\r\ndescription: |\r\n  name: keep\r\nfuture: value\r\n";
+  writeVaultConfig({ name: "crlf-rename", description: "", api_keys: [], created_at: "now" }, source);
+  expect(readFileSync(join(vaultDir("crlf-rename"), "vault.yaml"), "utf8")).toBe(source.replace("name: before", "name: crlf-rename"));
+});

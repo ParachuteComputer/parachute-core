@@ -1,0 +1,1993 @@
+/**
+ * Configuration management for Parachute Vault.
+ *
+ * Directory layout:
+ *   ~/.parachute/                 — ecosystem root (shared with sibling services)
+ *     services.json               — CLI-owned manifest (services-manifest.ts)
+ *     well-known/                 — CLI-owned (.well-known serving)
+ *     vault/                      — everything vault owns
+ *       .env
+ *       config.yaml               — global server config
+ *       start.sh / server-path    — daemon wrapper + pointer (daemon.ts)
+ *       logs/
+ *         vault.log / vault.err   — daemon stdout/stderr (matches
+ *                                   `~/.parachute/<svc>/logs/<svc>.log` — the
+ *                                   CLI lifecycle convention from PR #83)
+ *       data/                     — per-vault SQLite data (Postgres-style:
+ *                                   named `data/` rather than `vaults/` so it
+ *                                   doesn't read as doubled)
+ *         {name}/
+ *           vault.db              — SQLite database
+ *           vault.yaml            — per-vault config (description, api_keys, …)
+ *           assets/               — per-vault attachments
+ *
+ * Pre-0.3 installs put vault state directly under `~/.parachute/`; on startup
+ * we auto-migrate those paths into `vault/` (see `migrateFromLegacyLayout`).
+ * Pre-filesystem-hygiene 0.3 installs put per-vault state under
+ * `vault/vaults/` and daemon logs flat in `vault/`; those are moved into
+ * `data/` and `logs/` by `migrateVaultInternalLayout` on startup.
+ */
+
+import { homedir } from "os";
+import { join } from "path";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync, renameSync } from "fs";
+import crypto from "node:crypto";
+
+import {
+  // vault#400: only the PARSE side is used here now — to detect a legacy
+  // server-wide `mirror:` block so the boot migration can relocate it to the
+  // owning vault's per-vault file. `writeGlobalConfig` no longer serializes a
+  // mirror block (per-vault writes live in `mirror-config.ts`).
+  parseMirrorConfig as parseMirrorSectionFromYaml,
+  type MirrorConfig as MirrorConfigType,
+} from "./mirror-config.ts";
+
+// ---------------------------------------------------------------------------
+// Paths
+//
+// Historical note: the exported `CONFIG_DIR`, `DATA_DIR`, etc. used to be
+// `const` captured at module load. That made tests flaky: anything setting
+// `process.env.PARACHUTE_HOME` after import would be ignored, and when `bun
+// test` shares one process across files, whichever test loaded first froze
+// the path for the rest. Internal read/write now go through the `*Path()`
+// getters so `PARACHUTE_HOME` is re-read per call. The top-level constants
+// are kept for backward-compat (other modules import them) and reflect the
+// value at load time.
+//
+// `configDirPath()` is the ecosystem root — shared with sibling services
+// (channel, scribe, …) and with the CLI's `services.json` + `well-known/`.
+// `vaultHomePath()` is the vault-scoped subdir; all vault-owned files live
+// under it.
+// ---------------------------------------------------------------------------
+
+function configDirPath(): string {
+  const fromEnv = process.env.PARACHUTE_HOME;
+  if (fromEnv) return fromEnv;
+  // Second layer of the test-isolation defense (`core/src/test-preload.ts` is
+  // the first). The preload is loaded by `bunfig.toml`, which Bun reads
+  // relative to the *cwd* — run `bun test path/to/parachute-vault/src/...`
+  // from a parent directory and the preload silently never loads, leaving
+  // every unset-PARACHUTE_HOME test writing real vaults into the developer's
+  // live install. `bun test` sets NODE_ENV=test, so the ambiguity is
+  // detectable here, at the one function that resolves the root. Deliberately
+  // narrow: only the *unset* case throws. Tests legitimately point
+  // PARACHUTE_HOME at a sandbox whose HOME is that same sandbox (init.test.ts
+  // does exactly this), so an equality check against `~/.parachute` would fire
+  // on correct code.
+  //
+  // This is reachable in SHIPPED code, not just in this repo's suite: the
+  // package ships source (`bin` points at `src/cli.ts`, no bundler) and
+  // `CONFIG_DIR` below is evaluated at module load, so an end user whose
+  // vitest/jest integration test shells out to the CLI hits it — those runners
+  // set NODE_ENV=test too. The message has to serve that reader as well as a
+  // contributor. The escape hatch needs no new env var: the guard only fires
+  // when PARACHUTE_HOME is UNSET, so setting it — to a sandbox, or to the real
+  // `~/.parachute` if that is genuinely what the test wants — is both the fix
+  // and the statement of intent.
+  if (process.env.NODE_ENV === "test") {
+    throw new Error(
+      "[parachute-vault] NODE_ENV=test and PARACHUTE_HOME is unset — refusing to default " +
+        "to the live install at ~/.parachute, because a test run that writes there creates " +
+        "real vaults in a real install. Set PARACHUTE_HOME explicitly for this process: a " +
+        "temp dir to keep the test hermetic, or ~/.parachute if you truly mean the live " +
+        "install. (Contributors to parachute-vault: running `bun test` from the repo root " +
+        "sets it for you via bunfig.toml's preload.)",
+    );
+  }
+  return join(homedir(), ".parachute");
+}
+
+function vaultHomePath(): string {
+  return join(configDirPath(), "vault");
+}
+
+function dataDirPath(): string {
+  return join(vaultHomePath(), "data");
+}
+
+function logsDirPath(): string {
+  return join(vaultHomePath(), "logs");
+}
+
+function globalConfigPath(): string {
+  return join(vaultHomePath(), "config.yaml");
+}
+
+function envFilePath(): string {
+  return join(vaultHomePath(), ".env");
+}
+
+export const CONFIG_DIR = configDirPath();
+export const VAULT_HOME = join(CONFIG_DIR, "vault");
+export const DATA_DIR = join(VAULT_HOME, "data");
+export const LOGS_DIR = join(VAULT_HOME, "logs");
+export const GLOBAL_CONFIG_PATH = join(VAULT_HOME, "config.yaml");
+export const ENV_PATH = join(VAULT_HOME, ".env");
+export const LOG_PATH = join(LOGS_DIR, "vault.log");
+export const ERR_PATH = join(LOGS_DIR, "vault.err");
+export const DEFAULT_PORT = 1940;
+export const ASSETS_DIR = join(VAULT_HOME, "assets");
+
+// Filesystem sentinel for graceful shutdown. `parachute-vault stop` writes
+// this file; the running server polls for it and exits cleanly when it
+// appears. Resolved per-call so PARACHUTE_HOME overrides (tests, Docker)
+// match between writer and reader.
+export function stopSignalPath(): string {
+  return join(vaultHomePath(), "stop.signal");
+}
+
+export function vaultDir(name: string): string {
+  return join(dataDirPath(), name);
+}
+
+export function vaultDbPath(name: string): string {
+  return join(vaultDir(name), "vault.db");
+}
+
+export function vaultConfigPath(name: string): string {
+  return join(vaultDir(name), "vault.yaml");
+}
+
+/**
+ * Per-vault attachments directory: `<vaultDir>/assets`, or the `ASSETS_DIR`
+ * env override when set (single-assets-root deployments). Lives here next to
+ * the other path helpers — neutral ground that both `routes.ts` (upload/serve)
+ * and `usage.ts` (footprint dir-walk) import without a cycle. `routes.ts`
+ * re-exports it for the existing callers (mirror-deps, server, triggers, …).
+ */
+export function assetsDir(name: string): string {
+  return process.env.ASSETS_DIR ?? join(vaultDir(name), "assets");
+}
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+export type KeyScope = "read" | "write";
+
+export interface StoredKey {
+  id: string;
+  label: string;
+  key_hash: string;
+  scope: KeyScope;
+  created_at: string;
+  last_used_at?: string;
+}
+
+export interface TagFieldSchema {
+  type: string;
+  description?: string;
+  enum?: string[];
+}
+
+export interface TagSchema {
+  description?: string;
+  fields?: Record<string, TagFieldSchema>;
+}
+
+export interface VaultConfig {
+  name: string;
+  description?: string | null;
+  api_keys: StoredKey[];
+  created_at: string;
+  tag_schemas?: Record<string, TagSchema>;
+  /** Tag name that marks a note as publicly viewable. Default: "published". */
+  published_tag?: string;
+  /**
+   * Private tags (vault#766). A note carrying any of these tags (or a
+   * descendant) is invisible to every tag-SCOPED token that does not name
+   * the tag, or an ancestor, in its own `scoped_tags`. Deny wins over allow:
+   * a note tagged `project` + `capture` stays hidden from a `project`-scoped
+   * token when `capture` is private. Unscoped tokens are unaffected.
+   */
+  private_tags?: string[];
+  /**
+   * Set by the parser when a `private_tags:` key IS present but could not be
+   * read as a tag list (vault#766 fail-closed). Tag-scoped tokens then see no
+   * notes at all in this vault until the key is fixed — see
+   * `expandTokenTagScope`. Never serialized; the original text rides
+   * `private_tags_raw` so a config round-trip can't silently erase the key.
+   */
+  private_tags_error?: string;
+  /** Verbatim `private_tags` block when it failed to parse (re-emitted on write). */
+  private_tags_raw?: string;
+  /**
+   * What to do with the audio file on disk once the worker is done with it.
+   * - `"keep"` (default): leave the file on disk.
+   * - `"until_transcribed"`: unlink once the transcript lands successfully;
+   *   on failure the file is kept so the user can retry or re-upload.
+   * - `"never"`: unlink whenever the worker reaches a terminal state
+   *   (`done` OR `failed`). Audio is discarded even if transcription
+   *   failed — users who opt in accept that losing a bad transcription
+   *   also loses the source audio.
+   *
+   * In every mode the attachment row (including any stored transcript) is
+   * preserved; only the file on disk is affected.
+   */
+  audio_retention?: "keep" | "until_transcribed" | "never";
+  /**
+   * Transcription worker settings for this vault. Today only `context` is
+   * honored — a list of context predicates the worker attaches to each
+   * transcription POST so scribe sees person/project context alongside the
+   * audio. Same shape as triggers' `action.include_context`.
+   */
+  transcription?: {
+    context?: TriggerIncludeContext[];
+  };
+  /**
+   * Per-vault auto-transcribe override (vault#353 follow-up). When set, this
+   * vault's value takes precedence over the server-wide
+   * `GlobalConfig.auto_transcribe.enabled`. Resolution at the decision point
+   * (`shouldAutoTranscribe`) is **per-vault → global → true**: a vault that
+   * sets `enabled` here uses it; a vault that leaves it unset falls back to
+   * the global toggle, which itself defaults ON.
+   *
+   * This is what makes scribe's "link to vault X" genuinely per-vault —
+   * `PATCH /vault/X/api/vault {auto_transcribe:{enabled:true}}` flips only
+   * vault X, never the whole server. URL + bearer are still resolved per-
+   * process (services.json / SCRIBE_AUTH_TOKEN); only the on/off toggle is
+   * per-vault.
+   */
+  auto_transcribe?: {
+    enabled?: boolean;
+  };
+  /** Note history policy; read once when the vault store opens (vault#524). */
+  history?: {
+    enabled?: boolean;
+    min_versions?: number;
+    max_versions?: number;
+    max_age_days?: number;
+    deleted_retention_days?: number | null;
+    /** Defaults: enabled=true, ratio=3, min=10, run=24, bytes=8 MiB, budget=250ms, notes=50. */
+    compact_enabled?: boolean;
+    compact_ratio?: number;
+    compact_min_versions?: number;
+    compact_run_length?: number;
+    max_bytes_per_note?: number | null;
+    compact_budget_ms?: number;
+    compact_max_notes?: number;
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Trigger configuration
+// ---------------------------------------------------------------------------
+
+export interface TriggerWhen {
+  /** Note must have ALL of these tags. */
+  tags?: string[];
+  /** If true, note.content must be non-empty. If false, must be empty. */
+  has_content?: boolean;
+  /** Note.metadata must NOT have any of these keys set (non-null). */
+  missing_metadata?: string[];
+  /** Note.metadata must have ALL of these keys set (non-null). */
+  has_metadata?: string[];
+  /**
+   * Value-matched metadata predicate (vault#299 Part B). A map of
+   * field → operator-object, evaluated against the note's live metadata with
+   * the SAME operators as `query-notes` (eq/ne/gt/gte/lt/lte/in/not_in/exists)
+   * via the shared `matchesOperator` engine. ALL entries must match (AND).
+   * Lets a trigger fire only on a specific transition — e.g.
+   * `metadata: { state: { eq: "published" } }` fires when a note reaches
+   * `published`, not on every edit. Combines with the presence/tag/content
+   * filters above (all must hold).
+   */
+  metadata?: Record<string, Record<string, unknown>>;
+}
+
+/**
+ * How the trigger sends data to the webhook.
+ *
+ * - `"json"` (default): POST `{ trigger, event, note }` as JSON. Response is
+ *   the standard webhook response `{ content?, metadata?, attachments? }`.
+ * - `"attachment"`: Read the first audio attachment from the vault assets dir,
+ *   POST it as multipart/form-data (`file` field). Response is `{ text }`.
+ *   Used for Whisper-compatible transcription services.
+ * - `"content"`: POST `{ model?, voice?, input: note.content }` as JSON.
+ *   Response is binary audio bytes. Used for OpenAI-compatible TTS services.
+ */
+export type TriggerSendMode = "json" | "attachment" | "content";
+
+/**
+ * A single `include_context` entry — a query over the vault whose matching
+ * notes are serialized as context entries and included alongside the primary
+ * webhook payload. See `src/context.ts` for the fetch + serialization rules.
+ */
+export interface TriggerIncludeContext {
+  /** Tag the note must carry. Required. */
+  tag: string;
+  /** If set, notes also carrying this tag are excluded. */
+  exclude_tag?: string;
+  /** Metadata keys to surface on each resulting entry. */
+  include_metadata?: string[];
+}
+
+export interface TriggerAction {
+  /** URL to POST the webhook payload to. */
+  webhook: string;
+  /** Timeout in ms for the webhook call. Default 60000. */
+  timeout?: number;
+  /** How to send data to the webhook. Default "json". */
+  send?: TriggerSendMode;
+  /**
+   * If present, the trigger pre-fetches the matching vault notes at fire
+   * time and attaches them as a `context` JSON part (send=attachment) or a
+   * top-level `context` field (send=json). send=content ignores this.
+   */
+  include_context?: TriggerIncludeContext[];
+  /**
+   * Optional webhook auth. When `auth.bearer` is set, the trigger sends
+   * `Authorization: Bearer <bearer>` on the webhook POST — the JWT path that
+   * retires the shared `?secret=` query param. Back-compat: a webhook URL
+   * carrying its own `?secret=` still works; `auth` is purely additive.
+   * Runtime triggers (registered via the /api/triggers REST surface) are the
+   * primary users; config.yaml triggers may also carry it.
+   */
+  auth?: TriggerAuth;
+}
+
+export interface TriggerAuth {
+  /** Bearer token (typically a hub-issued JWT) for the webhook Authorization header. */
+  bearer?: string;
+}
+
+export interface TriggerConfig {
+  /** Human-readable name, also used as the metadata prefix for markers. */
+  name: string;
+  /** Which hook events to listen for. Default ["created", "updated"]. */
+  events?: Array<"created" | "updated">;
+  /** Predicate — all conditions must be true. */
+  when: TriggerWhen;
+  /** What to do when the predicate matches. */
+  action: TriggerAction;
+}
+
+export interface GlobalConfig {
+  port: number;
+  default_vault?: string;
+  api_keys?: StoredKey[];
+  triggers?: TriggerConfig[];
+  /** Bcrypt hash of the vault owner's password for OAuth consent. */
+  owner_password_hash?: string;
+  /** Base32-encoded TOTP secret for 2FA on OAuth consent. */
+  totp_secret?: string;
+  /** Bcrypt hashes of single-use backup codes for 2FA recovery. */
+  backup_codes?: string[];
+  /**
+   * Controls the public `GET /vaults/list` endpoint.
+   * - `"enabled"` (default): returns vault names (no other metadata).
+   * - `"disabled"`: returns 404, hiding vault existence from unauthenticated
+   *   callers.
+   */
+  discovery?: "enabled" | "disabled";
+  /**
+   * Whether `parachute-vault init` registers the daemon with launchd / systemd
+   * (which then auto-starts on boot AND auto-restarts on crash). Defaults to
+   * `true` (preserve historical behavior). When `false`, init skips daemon
+   * registration AND removes any prior registration — for CI, dev sandboxes,
+   * Docker/K8s setups, or environments where another supervisor manages the
+   * process. The user is expected to run `parachute-vault serve` manually or
+   * point their own supervisor at it.
+   */
+  autostart?: boolean;
+  /**
+   * Boot auto-create marker (2026-06-09 hub-module-boundary migration, the
+   * vault wave's `cmdRemove` improvement). Server boot auto-creates a
+   * `default` vault when `listVaults()` is empty — the Docker / hub-install
+   * first-run path. When the operator EXPLICITLY deletes their last vault
+   * via `parachute-vault remove`, that auto-create would silently resurrect
+   * a fresh `default` (with fresh credentials) on the next boot. `cmdRemove`
+   * writes `auto_create: false` when it removes the last vault; boot skips
+   * the auto-create while the marker is present. Fresh installs (no
+   * config.yaml at all) never carry the marker, so the Docker first-run
+   * behavior is preserved. See `bootAutoCreateAllowed`.
+   */
+  auto_create?: boolean;
+  /** Backup configuration: schedule, retention, destinations. */
+  backup?: BackupConfig;
+  /**
+   * Persistent vault-managed mirror configuration (vault-sync Phase A1).
+   * Unset when the operator has never touched the mirror block; defaults to
+   * `enabled: false` semantics in that case. When `enabled: true`, the
+   * vault server bootstraps and optionally watches a git mirror at the
+   * resolved path. See `./mirror-config.ts`.
+   */
+  mirror?: MirrorConfigType;
+  /**
+   * Server-wide DEFAULT for newly created vaults' backup posture. Decides
+   * whether `createVault` writes the History-preset internal mirror
+   * (local git backup of the markdown projection) at create time.
+   *
+   *   - `"internal"` (default) — new vaults get a local git mirror enabled
+   *     out of the box (backup-on-by-default). The History preset:
+   *     `{enabled:true, location:internal, sync_mode:events, auto_commit:true,
+   *     auto_push:false}`. GitHub off-site backup remains an opt-in upgrade.
+   *   - `"off"` — new vaults are created with no mirror config (the historical
+   *     pre-default behavior). The escape hatch for git-less / disk-constrained
+   *     boxes and cloud deploys, where doubling disk per vault is unwanted.
+   *     Cloud / container deploys SHOULD set this to `off`.
+   *
+   * Create-time ONLY — this knob does NOT retroactively enable mirrors on
+   * already-created vaults (that would ~double disk across every existing
+   * vault). Existing-vault opt-in is a separate, deliberate follow-up.
+   *
+   * The container/cloud first-boot auto-create path in `server.ts` does NOT
+   * funnel through `createVault`, so it is unaffected by this knob and stays
+   * mirror-off regardless — matching the recommended cloud posture.
+   */
+  default_mirror?: "internal" | "off";
+  /**
+   * Auto-transcribe configuration for the vault↔scribe handoff (vault#353,
+   * design 2026-05-21 Part 2). When `enabled: true` AND scribe is discoverable
+   * (`services.json` or `SCRIBE_URL` env), audio attachments uploaded to any
+   * vault are automatically sent to scribe and the resulting transcript lands
+   * as a sibling `<attachment-path>.transcript.md` note.
+   *
+   * URL + bearer are not stored here — URL is resolved per-process from
+   * `services.json` via `scribe-discovery.ts`, and bearer comes from the
+   * `SCRIBE_AUTH_TOKEN` env var (persisted in `~/.parachute/vault/.env`).
+   * The schema's `autoTranscribe.scribeUrl` / `autoTranscribe.scribeBearer`
+   * fields are projection of those resolved values (readOnly / writeOnly),
+   * not separate storage.
+   */
+  auto_transcribe?: {
+    /** Master toggle. Default false; the worker is a no-op when unset. */
+    enabled?: boolean;
+  };
+  /**
+   * Semantic-search opt-in (0.7.3, Aaron-ratified). Semantic search is OFF
+   * by default; set this to `true` to build the embedding provider and turn
+   * on embed-on-write + the backfill sweep. This is the persisted,
+   * settings-surface-friendly toggle a self-host operator flips without
+   * editing the env file. The `EMBEDDINGS_ENABLED` env var is the low-level
+   * OVERRIDE (`true`/`1` forces on, `false`/`0` forces off, anything else
+   * defers here) — see `src/embedding/select.ts`'s `resolveEmbeddingsEnabled`.
+   * Unset ⇒ off. Takes effect on server (re)start, since the process shares
+   * one embedding provider resolved at boot.
+   */
+  embeddings_enabled?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Backup configuration
+// ---------------------------------------------------------------------------
+
+export type BackupSchedule = "hourly" | "daily" | "weekly" | "manual";
+
+/**
+ * Discriminated union over destination kinds. For the MVP we ship `local`
+ * only; `s3`, `rsync`, and `cloud` kinds will be added as additional variants
+ * without breaking existing configs. Unknown kinds are preserved verbatim so
+ * a forward-rolled config edited by a newer CLI isn't silently downgraded by
+ * an older CLI rewriting the file.
+ */
+export interface LocalBackupDestination {
+  kind: "local";
+  /** Absolute or `~/`-prefixed path. `~/` is expanded at use-time. */
+  path: string;
+}
+
+export type BackupDestination = LocalBackupDestination;
+
+/**
+ * Tiered (grandfather-father-son) retention policy. After each backup we keep
+ * the union of four tier queries:
+ *
+ *   daily   — the N most recent snapshots (unconditionally).
+ *   weekly  — one snapshot per ISO week, for the N most recent such weeks.
+ *   monthly — one snapshot per calendar month, for the N most recent months.
+ *   yearly  — one snapshot per calendar year; `null` means keep every year
+ *             (never prune by age — the long-tail archive).
+ *
+ * A tier set to 0 is disabled (it contributes no keepers, but the other tiers
+ * still apply). All bucketing uses the local timezone so calendar alignment
+ * matches the user's expectations, not UTC.
+ */
+export interface RetentionPolicy {
+  /** Keep the last N daily snapshots. 0 disables the daily tier. */
+  daily: number;
+  /** Keep the last snapshot from each of the last N ISO weeks. 0 disables. */
+  weekly: number;
+  /** Keep the last snapshot from each of the last N months. 0 disables. */
+  monthly: number;
+  /**
+   * Keep the last snapshot from each of the last N years. `null` or `undefined`
+   * means unbounded — keep one snapshot per year, forever, across the full
+   * history. 0 disables the yearly tier entirely.
+   */
+  yearly: number | null;
+}
+
+export interface BackupConfig {
+  /** How often the scheduler fires. "manual" = scheduler is not registered. */
+  schedule: BackupSchedule;
+  /** Tiered retention policy — grandfather/father/son. */
+  retention: RetentionPolicy;
+  /** Pluggable destinations. Runs in order; a destination error logs + continues. */
+  destinations: BackupDestination[];
+}
+
+export function defaultRetentionPolicy(): RetentionPolicy {
+  // Defaults balance "I want to roll back yesterday's accidental delete"
+  // against "my iCloud folder shouldn't blow up in a year." The yearly tier
+  // is unbounded by default — the whole point of the tiered policy is that
+  // one-per-year is cheap forever.
+  return { daily: 7, weekly: 4, monthly: 12, yearly: null };
+}
+
+export function defaultBackupConfig(): BackupConfig {
+  return {
+    schedule: "manual",
+    retention: defaultRetentionPolicy(),
+    destinations: [],
+  };
+}
+
+// ---------------------------------------------------------------------------
+// YAML helpers (minimal, no deps)
+// ---------------------------------------------------------------------------
+
+function serializeVaultConfig(config: VaultConfig): string {
+  const lines: string[] = [];
+  lines.push(`name: ${config.name}`);
+  // vault#669: only serialize a real string. A non-string that slipped
+  // past a write door used to throw here (`description.split is not a
+  // function`) and 500 the request; the doors now reject that shape, and
+  // this is the persist-time backstop so a poisoned in-memory config
+  // cannot crash the write path either. Falsy / non-string omits the
+  // field, which is how a `null` description clears.
+  if (typeof config.description === "string" && config.description.length > 0) {
+    lines.push(`description: |`);
+    for (const line of config.description.split("\n")) {
+      lines.push(`  ${line}`);
+    }
+  }
+  lines.push(`created_at: "${config.created_at}"`);
+  if (config.published_tag) {
+    lines.push(`published_tag: ${config.published_tag}`);
+  }
+  if (config.audio_retention) {
+    lines.push(`audio_retention: ${config.audio_retention}`);
+  }
+  if (config.private_tags_raw) {
+    // Unparseable key (fail-closed): keep the operator's text verbatim so
+    // writing some other field doesn't drop the key and fail OPEN.
+    lines.push(config.private_tags_raw.replace(/\n+$/, ""));
+  } else if (config.private_tags && config.private_tags.length > 0) {
+    lines.push("private_tags:");
+    for (const t of config.private_tags) lines.push(`  - ${t}`);
+  }
+
+  // Per-vault history policy: serialize only explicitly configured fields.
+  if (config.history) {
+    lines.push("history:");
+    for (const key of ["enabled", "min_versions", "max_versions", "max_age_days", "deleted_retention_days", "compact_enabled", "compact_ratio", "compact_min_versions", "compact_run_length", "max_bytes_per_note", "compact_budget_ms", "compact_max_notes"] as const) {
+      if (config.history[key] !== undefined) lines.push(`  ${key}: ${config.history[key]}`);
+    }
+  }
+  // Per-vault auto-transcribe override. Serialized as a nested block so future
+  // fields can grow under it (mirrors the GlobalConfig shape). Only emitted
+  // when `enabled` is explicitly set — an unset vault falls back to global.
+  if (config.auto_transcribe?.enabled !== undefined) {
+    lines.push("auto_transcribe:");
+    lines.push(`  enabled: ${config.auto_transcribe.enabled}`);
+  }
+
+  if (config.transcription?.context?.length) {
+    lines.push("transcription:");
+    lines.push("  context:");
+    for (const entry of config.transcription.context) {
+      lines.push(`    - tag: ${entry.tag}`);
+      if (entry.exclude_tag) {
+        lines.push(`      exclude_tag: ${entry.exclude_tag}`);
+      }
+      if (entry.include_metadata?.length) {
+        lines.push(`      include_metadata: [${entry.include_metadata.map((v) => `"${v}"`).join(", ")}]`);
+      }
+    }
+  }
+
+  lines.push("api_keys:");
+  for (const key of config.api_keys) {
+    lines.push(`  - id: ${key.id}`);
+    lines.push(`    label: ${key.label}`);
+    lines.push(`    scope: ${key.scope ?? "write"}`);
+    lines.push(`    key_hash: ${key.key_hash}`);
+    lines.push(`    created_at: "${key.created_at}"`);
+    if (key.last_used_at) {
+      lines.push(`    last_used_at: "${key.last_used_at}"`);
+    }
+  }
+
+  if (config.tag_schemas && Object.keys(config.tag_schemas).length > 0) {
+    lines.push("tag_schemas:");
+    for (const [tag, schema] of Object.entries(config.tag_schemas)) {
+      lines.push(`  ${tag}:`);
+      if (schema.description) {
+        lines.push(`    description: "${schema.description}"`);
+      }
+      if (schema.fields && Object.keys(schema.fields).length > 0) {
+        lines.push("    fields:");
+        for (const [field, fieldSchema] of Object.entries(schema.fields)) {
+          lines.push(`      ${field}:`);
+          lines.push(`        type: ${fieldSchema.type}`);
+          if (fieldSchema.description) {
+            lines.push(`        description: "${fieldSchema.description}"`);
+          }
+          if (fieldSchema.enum) {
+            lines.push(`        enum: [${fieldSchema.enum.map((v) => `"${v}"`).join(", ")}]`);
+          }
+        }
+      }
+    }
+  }
+
+  return lines.join("\n") + "\n";
+}
+
+/** Result of reading the `private_tags` key out of vault.yaml text. */
+export type PrivateTagsParse =
+  | { kind: "absent" }
+  | { kind: "ok"; tags: string[] }
+  | { kind: "invalid"; reason: string; raw: string };
+
+/** A bare tag token: no whitespace, quotes, YAML flow punctuation or `#`. */
+const PRIVATE_TAG_TOKEN = /^[^\s"'#,\[\]{}]+$/;
+
+function unquotePrivateTag(s: string): string | null {
+  let t = s.trim();
+  if (t.length >= 2 && ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'")))) {
+    t = t.slice(1, -1).trim();
+  }
+  return PRIVATE_TAG_TOKEN.test(t) ? t : null;
+}
+
+/** Strip a YAML end-of-line comment (` # …`) that sits outside quotes. */
+function stripYamlComment(s: string): string {
+  let quote: string | null = null;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i]!;
+    if (quote) {
+      if (c === quote) quote = null;
+    } else if (c === '"' || c === "'") {
+      quote = c;
+    } else if (c === "#" && (i === 0 || /\s/.test(s[i - 1]!))) {
+      return s.slice(0, i);
+    }
+  }
+  return s;
+}
+
+/**
+ * Parse `private_tags` (vault#766) out of vault.yaml text.
+ *
+ * Accepted shapes (each with optional trailing `# comment`s):
+ *   private_tags: [capture, "transcript"]      flow list
+ *   private_tags:                              block list (items indented,
+ *     - capture                                or at column 0 — both are
+ *     - transcript                             valid YAML)
+ *   private_tags: capture                      scalar → one-element list
+ *   private_tags: []   /  private_tags:       explicit empty / YAML null
+ *
+ * FAIL-CLOSED contract: when the key is present but ANY part of its value
+ * can't be read as a tag list (a duplicate key, an unterminated flow list,
+ * a block line that isn't `- <tag>`, a tag with spaces or YAML punctuation),
+ * this returns `invalid` rather than dropping to `[]`. `expandTokenTagScope`
+ * turns `invalid` into "this vault shows NO notes to tag-scoped tokens" —
+ * a typo in the confidentiality list must never expose what it lists.
+ */
+export function parsePrivateTags(yaml: string): PrivateTagsParse {
+  const lines = yaml.split(/\r?\n/);
+  const keyLines: { l: string; i: number }[] = [];
+  let oddIndex = -1;
+  let inBlockScalar = false;
+  for (const [i, l] of lines.entries()) {
+    // Indented text in a top-level literal/folded scalar is content, not
+    // a config key (notably descriptions written by serializeVaultConfig).
+    if (inBlockScalar && (l.trim() === "" || /^\s/.test(l))) continue;
+    inBlockScalar = /^[^\s:#][^:]*:[ \t]*[|>](?:[1-9][+-]?|[+-][1-9]?)?[ \t]*(?:#.*)?$/.test(l);
+    if (/^(?:private_tags|"private_tags"|'private_tags')\s*:/.test(l)) keyLines.push({ l, i });
+    if (oddIndex === -1 && /^\s*["']?private_tags["']?\s*:/.test(l)) oddIndex = i;
+  }
+  const first = keyLines[0];
+  if (!first) {
+    if (oddIndex === -1) return { kind: "absent" };
+    // Indented keys cannot be safely moved out of their parent. The writer
+    // refuses these; nested keys are ignored when a column-0 key exists.
+    return { kind: "invalid", reason: "private_tags key is indented or quoted", raw: "" };
+  }
+  // Preserve every key's block in file order so a config write cannot turn
+  // duplicate keys into a single valid key and fail open.
+  const blocks = keyLines.map(({ l, i }) => {
+    const block: string[] = [l];
+    for (let j = i + 1; j < lines.length; j++) {
+      const next = lines[j]!;
+      if (next.trim() === "" || /^\s/.test(next) || /^-(\s|$)/.test(next) || /^#/.test(next)) block.push(next);
+      else break;
+    }
+    while (block.length > 1 && block[block.length - 1]!.trim() === "") block.pop();
+    return block;
+  });
+  const block = blocks[0]!;
+  const raw = blocks.map((b) => b.join("\n")).join("\n");
+  const invalid = (reason: string): PrivateTagsParse => ({ kind: "invalid", reason, raw });
+  if (keyLines.length > 1) return invalid("private_tags key appears more than once");
+  if (!/^private_tags\s*:/.test(first.l)) return invalid("private_tags key is indented or quoted");
+
+  const inline = stripYamlComment(first.l.replace(/^private_tags\s*:/, "")).trim();
+  const rest = block.slice(1).map((l) => stripYamlComment(l)).filter((l) => l.trim() !== "");
+
+  if (inline.length > 0) {
+    if (rest.length > 0) return invalid("private_tags has both an inline value and indented lines");
+    if (inline.startsWith("[")) {
+      if (!inline.endsWith("]")) return invalid("private_tags flow list is not closed on the same line");
+      const body = inline.slice(1, -1).trim();
+      if (body === "") return { kind: "ok", tags: [] };
+      const tags: string[] = [];
+      for (const part of body.split(",")) {
+        const t = unquotePrivateTag(part);
+        if (t === null) return invalid(`private_tags entry ${JSON.stringify(part.trim())} is not a tag name`);
+        tags.push(t);
+      }
+      return { kind: "ok", tags };
+    }
+    if (inline === "~" || inline === "null") return { kind: "ok", tags: [] };
+    const t = unquotePrivateTag(inline);
+    if (t === null) return invalid(`private_tags value ${JSON.stringify(inline)} is not a tag name or list`);
+    return { kind: "ok", tags: [t] };
+  }
+
+  const tags: string[] = [];
+  for (const l of rest) {
+    const m = l.match(/^\s*-\s+(.*)$/) ?? l.match(/^\s*-()$/);
+    if (!m) return invalid(`private_tags line ${JSON.stringify(l.trim())} is not a "- <tag>" list item`);
+    const t = unquotePrivateTag(m[1] ?? "");
+    if (t === null) return invalid(`private_tags item ${JSON.stringify(l.trim())} is not a tag name`);
+    tags.push(t);
+  }
+  return { kind: "ok", tags };
+}
+
+/**
+ * Read a vault's `private_tags` for enforcement (vault#766). Unlike
+ * `readVaultConfig`, this never swallows errors into "no config": a missing
+ * vault.yaml is `absent` (nothing configured), but a file that exists and
+ * can't be read or parsed is `invalid` so scoped reads fail closed.
+ */
+export function readPrivateTagsConfig(name: string): PrivateTagsParse {
+  const configPath = vaultConfigPath(name);
+  let text: string;
+  try {
+    if (!existsSync(configPath)) return { kind: "absent" };
+    text = readFileSync(configPath, "utf-8");
+  } catch (err) {
+    return { kind: "invalid", reason: `vault.yaml could not be read: ${(err as Error)?.message ?? String(err)}`, raw: "" };
+  }
+  try {
+    return parsePrivateTags(text);
+  } catch (err) {
+    return { kind: "invalid", reason: `vault.yaml could not be parsed: ${(err as Error)?.message ?? String(err)}`, raw: "" };
+  }
+}
+
+function parseVaultConfig(yaml: string, name: string): VaultConfig {
+  const config: VaultConfig = {
+    name,
+    api_keys: [],
+    created_at: new Date().toISOString(),
+  };
+
+  const nameMatch = yaml.match(/^name:\s*(.+)/m);
+  if (nameMatch) config.name = nameMatch[1]!.trim();
+
+  const createdMatch = yaml.match(/^created_at:\s*"?([^"\n]+)"?/m);
+  if (createdMatch) config.created_at = createdMatch[1]!;
+
+  const pubTagMatch = yaml.match(/^published_tag:\s*(\S+)/m);
+  if (pubTagMatch) config.published_tag = pubTagMatch[1]!;
+
+  // private_tags (vault#766) — see parsePrivateTags for the grammar and the
+  // fail-closed contract.
+  const priv = parsePrivateTags(yaml);
+  if (priv.kind === "ok") config.private_tags = priv.tags;
+  else if (priv.kind === "invalid") {
+    config.private_tags_error = priv.reason;
+    config.private_tags_raw = priv.raw;
+  }
+
+  const retentionMatch = yaml.match(/^audio_retention:\s*(\S+)/m);
+  if (retentionMatch) {
+    const v = retentionMatch[1];
+    if (v === "keep" || v === "until_transcribed" || v === "never") config.audio_retention = v;
+  }
+
+  // Parse description (block scalar)
+  const descMatch = yaml.match(/^description:\s*\|\s*\n((?:\s{2}.+\n?)+)/m);
+  if (descMatch) {
+    config.description = descMatch[1]!
+      .split("\n")
+      .map((l) => l.replace(/^\s{2}/, ""))
+      .join("\n")
+      .trim();
+  } else {
+    const descSimple = yaml.match(/^description:\s*(.+)/m);
+    if (descSimple) config.description = descSimple[1]!.trim().replace(/^"(.*)"$/, "$1");
+  }
+
+  // Parse api_keys
+  //
+  // Accepted grammar (vault#234): each `id:` block is the writer's output —
+  // one field per line, indented two spaces under the `- id:` list item:
+  //
+  //     - id: <id>
+  //       label: <label>            # free text to end of line
+  //       scope: <scope>            # single token (read|write|admin|…)
+  //       key_hash: <hash>          # single token
+  //       created_at: "<iso>"       # quoted or bare, no embedded newline
+  //       last_used_at: "<iso>"
+  //
+  // Each field regex is line-anchored (`^...`, `m` flag) so a COMMENTED line
+  // (`# scope: read`) never matches — the line must begin with optional
+  // leading whitespace then the bare key. The value matcher uses horizontal
+  // whitespace only (`[^\S\r\n]*`, never `\s*`) after the colon so a
+  // value-less field (`scope: ` with a trailing space) can't skip the newline
+  // and capture the NEXT field's value. A missing optional field falls back to
+  // its default rather than borrowing a neighbor's token.
+  const keyBlocks = yaml.split(/\n\s+-\s+id:\s+/).slice(1);
+  for (const block of keyBlocks) {
+    const idMatch = block.match(/^(\S+)/);
+    const labelMatch = block.match(/^[^\S\r\n]*label:[^\S\r\n]*(.+)/m);
+    const scopeMatch = block.match(/^[^\S\r\n]*scope:[^\S\r\n]*(\S+)/m);
+    const hashMatch = block.match(/^[^\S\r\n]*key_hash:[^\S\r\n]*(\S+)/m);
+    const createdAtMatch = block.match(/^[^\S\r\n]*created_at:[^\S\r\n]*"?([^"\n]+?)"?\s*$/m);
+    const lastUsedMatch = block.match(/^[^\S\r\n]*last_used_at:[^\S\r\n]*"?([^"\n]+?)"?\s*$/m);
+
+    if (idMatch && hashMatch) {
+      config.api_keys.push({
+        id: idMatch[1]!,
+        label: (labelMatch?.[1] ?? "default").trim(),
+        scope: (scopeMatch?.[1] as KeyScope) ?? "write",
+        key_hash: hashMatch[1]!,
+        created_at: createdAtMatch?.[1] ?? new Date().toISOString(),
+        last_used_at: lastUsedMatch?.[1],
+      });
+    }
+  }
+
+  // Parse tag_schemas
+  config.tag_schemas = parseTagSchemas(yaml);
+
+  // Parse transcription.context (same shape as triggers' include_context)
+  const transcriptionContext = parseTranscriptionContext(yaml);
+  if (transcriptionContext) {
+    config.transcription = { context: transcriptionContext };
+  }
+
+  // Parse the per-vault auto_transcribe block — currently single boolean
+  // `enabled`. Nested 2-space-indent block (mirrors the GlobalConfig parser)
+  // so future fields can grow under it without breaking the regex.
+  const autoTranscribeStart = yaml.match(/^auto_transcribe:\s*$/m);
+  if (autoTranscribeStart) {
+    const after = yaml.slice((autoTranscribeStart.index ?? 0) + autoTranscribeStart[0].length);
+    for (const line of after.split("\n")) {
+      if (line.match(/^\S/) && line.trim().length > 0) break; // next top-level key
+      const m = line.match(/^\s+enabled:\s*(true|false)/);
+      if (m) {
+        config.auto_transcribe = { enabled: m[1]! === "true" };
+        break;
+      }
+    }
+  }
+
+  const historyStart = yaml.match(/^history:\s*$/m);
+  if (historyStart) {
+    const after = yaml.slice((historyStart.index ?? 0) + historyStart[0].length);
+    config.history = {};
+    for (const line of after.split("\n")) {
+      if (line.match(/^\S/) && line.trim().length > 0) break;
+      const enabled = line.match(/^\s+(enabled|compact_enabled):\s*(true|false)\s*$/);
+      if (enabled) config.history[enabled[1] as "enabled" | "compact_enabled"] = enabled[2] === "true";
+      const number = line.match(/^\s+(min_versions|max_versions|max_age_days|compact_min_versions|compact_run_length|compact_budget_ms|compact_max_notes):\s*(\d+)\s*$/);
+      if (number) config.history[number[1] as "min_versions" | "max_versions" | "max_age_days" | "compact_min_versions" | "compact_run_length" | "compact_budget_ms" | "compact_max_notes"] = Number(number[2]);
+      const ratio = line.match(/^\s+compact_ratio:\s*(\d+(?:\.\d+)?)\s*$/);
+      if (ratio) config.history.compact_ratio = Number(ratio[1]);
+      const bytes = line.match(/^\s+max_bytes_per_note:\s*(null|\d+)\s*$/);
+      if (bytes) config.history.max_bytes_per_note = bytes[1] === "null" ? null : Number(bytes[1]);
+      const deleted = line.match(/^\s+deleted_retention_days:\s*(null|\d+)\s*$/);
+      if (deleted) config.history.deleted_retention_days = deleted[1] === "null" ? null : Number(deleted[1]);
+    }
+  }
+
+  return config;
+}
+
+/**
+ * Parse the `transcription: { context: [...] }` section from vault.yaml.
+ * Shape matches triggers' `action.include_context` so callers can reuse the
+ * same `ContextPredicate` helpers from src/context.ts.
+ */
+function parseTranscriptionContext(yaml: string): TriggerIncludeContext[] | undefined {
+  const startMatch = yaml.match(/^transcription:\s*$/m);
+  if (!startMatch) return undefined;
+
+  const startIdx = (startMatch.index ?? 0) + startMatch[0].length;
+  const lines = yaml.slice(startIdx).split("\n");
+
+  const entries: TriggerIncludeContext[] = [];
+  let inContext = false;
+  let current: TriggerIncludeContext | null = null;
+
+  const pushCurrent = () => {
+    if (current && current.tag) entries.push(current);
+    current = null;
+  };
+
+  for (const line of lines) {
+    // Stop at next top-level key.
+    if (line.match(/^\S/) && line.trim().length > 0) break;
+    if (line.trim().length === 0) continue;
+
+    const trimmed = line.trim();
+
+    if (trimmed === "context:") { inContext = true; continue; }
+    if (!inContext) continue;
+
+    const itemStart = trimmed.match(/^-\s+(\w+):\s*(.*)$/);
+    if (itemStart) {
+      pushCurrent();
+      current = { tag: "" };
+      applyContextField(current, itemStart[1]!, itemStart[2]!);
+      continue;
+    }
+    const fieldMatch = trimmed.match(/^(\w+):\s*(.*)$/);
+    if (fieldMatch && current) {
+      applyContextField(current, fieldMatch[1]!, fieldMatch[2]!);
+      continue;
+    }
+  }
+
+  pushCurrent();
+  return entries.length > 0 ? entries : undefined;
+}
+
+/**
+ * Parse the tag_schemas section from vault.yaml.
+ * Uses line-by-line indent tracking since the main parser is hand-rolled.
+ */
+function parseTagSchemas(yaml: string): Record<string, TagSchema> | undefined {
+  const startMatch = yaml.match(/^tag_schemas:\s*$/m);
+  if (!startMatch) return undefined;
+
+  const startIdx = (startMatch.index ?? 0) + startMatch[0].length;
+  const lines = yaml.slice(startIdx).split("\n");
+
+  const schemas: Record<string, TagSchema> = {};
+  let currentTag: string | null = null;
+  let currentField: string | null = null;
+
+  for (const line of lines) {
+    // Stop at next top-level key (no indent)
+    if (line.match(/^\S/) && line.trim().length > 0) break;
+    if (line.trim().length === 0) continue;
+
+    const indent = line.match(/^(\s*)/)?.[1]?.length ?? 0;
+
+    if (indent === 2) {
+      // Tag name (e.g., "  person:")
+      const tagMatch = line.match(/^\s{2}(\S+):\s*$/);
+      if (tagMatch) {
+        currentTag = tagMatch[1]!;
+        currentField = null;
+        schemas[currentTag] = {};
+      }
+    } else if (indent === 4 && currentTag) {
+      // Tag-level property (description, fields:)
+      const schema = schemas[currentTag]!;
+      const descMatch = line.match(/^\s{4}description:\s*"?([^"]*)"?\s*$/);
+      if (descMatch) {
+        schema.description = descMatch[1]!;
+        continue;
+      }
+      const fieldsMatch = line.match(/^\s{4}fields:\s*$/);
+      if (fieldsMatch) {
+        schema.fields = schema.fields ?? {};
+        currentField = null;
+      }
+    } else if (indent === 6 && currentTag && schemas[currentTag]?.fields !== undefined) {
+      // Field name (e.g., "      first_appeared:")
+      const fieldMatch = line.match(/^\s{6}(\S+):\s*$/);
+      if (fieldMatch) {
+        currentField = fieldMatch[1]!;
+        schemas[currentTag]!.fields![currentField] = { type: "string" };
+      }
+    } else if (indent === 8 && currentTag && currentField && schemas[currentTag]?.fields) {
+      // Field property (type, description, enum)
+      const field = schemas[currentTag]!.fields![currentField]!;
+      const typeMatch = line.match(/^\s{8}type:\s*(\S+)/);
+      if (typeMatch) {
+        field.type = typeMatch[1]!;
+        continue;
+      }
+      const fdescMatch = line.match(/^\s{8}description:\s*"?([^"]*)"?\s*$/);
+      if (fdescMatch) {
+        field.description = fdescMatch[1]!;
+        continue;
+      }
+      const enumMatch = line.match(/^\s{8}enum:\s*\[([^\]]*)\]/);
+      if (enumMatch) {
+        field.enum = enumMatch[1]!
+          .split(",")
+          .map((s) => s.trim().replace(/^"(.*)"$/, "$1"));
+      }
+    }
+  }
+
+  return Object.keys(schemas).length > 0 ? schemas : undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Trigger YAML parsing
+// ---------------------------------------------------------------------------
+
+function parseYamlList(val: string): string[] {
+  // Parse "[a, b, c]" → ["a", "b", "c"]
+  const inner = val.replace(/^\[/, "").replace(/\]$/, "");
+  return inner.split(",").map((s) => s.trim().replace(/^"(.*)"$/, "$1")).filter(Boolean);
+}
+
+/**
+ * Apply a single "key: value" line to the include_context item being built.
+ * Shared between triggers and vault-config transcription.context (same shape).
+ */
+function applyContextField(
+  item: TriggerIncludeContext,
+  key: string,
+  raw: string,
+): void {
+  const value = raw.trim();
+  if (key === "tag") { item.tag = value.replace(/^"(.*)"$/, "$1"); return; }
+  if (key === "exclude_tag") { item.exclude_tag = value.replace(/^"(.*)"$/, "$1"); return; }
+  if (key === "include_metadata") {
+    const listMatch = value.match(/^\[([^\]]*)\]/);
+    if (listMatch) item.include_metadata = parseYamlList(listMatch[1]!);
+    return;
+  }
+}
+
+function parseTriggers(yaml: string): TriggerConfig[] | undefined {
+  const startMatch = yaml.match(/^triggers:\s*$/m);
+  if (!startMatch) return undefined;
+
+  const startIdx = (startMatch.index ?? 0) + startMatch[0].length;
+  const lines = yaml.slice(startIdx).split("\n");
+
+  const triggers: TriggerConfig[] = [];
+  let current: Partial<TriggerConfig> | null = null;
+  // Track which section we're in by the last seen section header
+  let section: "top" | "when" | "action" | "include_context" = "top";
+  // When inside include_context, track the item currently being parsed.
+  let currentContext: TriggerIncludeContext | null = null;
+
+  const pushContextItem = () => {
+    if (currentContext && current?.action) {
+      current.action.include_context = current.action.include_context ?? [];
+      current.action.include_context.push(currentContext);
+    }
+    currentContext = null;
+  };
+
+  for (const line of lines) {
+    // Stop at next top-level key
+    if (line.match(/^\S/) && line.trim().length > 0) break;
+    if (line.trim().length === 0) continue;
+
+    const trimmed = line.trim();
+
+    // New trigger item: "- name: ..."
+    const nameMatch = trimmed.match(/^-\s+name:\s*(.+)/);
+    if (nameMatch) {
+      pushContextItem();
+      if (current?.name) {
+        if (current.action?.webhook) {
+          triggers.push(current as TriggerConfig);
+        } else {
+          console.warn(`[config] trigger "${current.name}" has no webhook URL — skipping`);
+        }
+      }
+      current = { name: nameMatch[1]!.trim(), when: {}, action: undefined as unknown as TriggerAction };
+      section = "top";
+      continue;
+    }
+
+    if (!current) continue;
+
+    // Section headers — detect by key name regardless of indent
+    if (trimmed === "when:") { pushContextItem(); section = "when"; continue; }
+    if (trimmed === "action:") { pushContextItem(); section = "action"; continue; }
+    if (trimmed === "include_context:") {
+      // Entering the nested list under action:.
+      if (!current.action) current.action = { webhook: "" } as TriggerAction;
+      current.action.include_context = current.action.include_context ?? [];
+      section = "include_context";
+      currentContext = null;
+      continue;
+    }
+
+    // Top-level trigger field
+    const eventsMatch = trimmed.match(/^events:\s*\[([^\]]*)\]/);
+    if (eventsMatch) {
+      current.events = parseYamlList(eventsMatch[1]!) as Array<"created" | "updated">;
+      continue;
+    }
+
+    // When fields
+    if (section === "when") {
+      const tagsMatch = trimmed.match(/^tags:\s*\[([^\]]*)\]/);
+      if (tagsMatch) { current.when!.tags = parseYamlList(tagsMatch[1]!); continue; }
+      const hasContentMatch = trimmed.match(/^has_content:\s*(true|false)/);
+      if (hasContentMatch) { current.when!.has_content = hasContentMatch[1] === "true"; continue; }
+      const missingMetaMatch = trimmed.match(/^missing_metadata:\s*\[([^\]]*)\]/);
+      if (missingMetaMatch) { current.when!.missing_metadata = parseYamlList(missingMetaMatch[1]!); continue; }
+      const hasMetaMatch = trimmed.match(/^has_metadata:\s*\[([^\]]*)\]/);
+      if (hasMetaMatch) { current.when!.has_metadata = parseYamlList(hasMetaMatch[1]!); continue; }
+    }
+
+    // Action fields
+    if (section === "action") {
+      const webhookMatch = trimmed.match(/^webhook:\s*(.+)/);
+      if (webhookMatch) {
+        current.action = { ...(current.action ?? {}), webhook: webhookMatch[1]!.trim() } as TriggerAction;
+        continue;
+      }
+      const timeoutMatch = trimmed.match(/^timeout:\s*(\d+)/);
+      if (timeoutMatch && current.action) {
+        current.action.timeout = parseInt(timeoutMatch[1]!, 10);
+        continue;
+      }
+      const sendMatch = trimmed.match(/^send:\s*(\S+)/);
+      if (sendMatch && current.action) {
+        current.action.send = sendMatch[1]! as TriggerAction["send"];
+        continue;
+      }
+    }
+
+    // include_context list items: "- tag: X" starts a new item; subsequent
+    // indented lines set fields on it.
+    if (section === "include_context") {
+      const itemStart = trimmed.match(/^-\s+(\w+):\s*(.*)$/);
+      if (itemStart) {
+        pushContextItem();
+        currentContext = { tag: "" };
+        applyContextField(currentContext, itemStart[1]!, itemStart[2]!);
+        continue;
+      }
+      const fieldMatch = trimmed.match(/^(\w+):\s*(.*)$/);
+      if (fieldMatch && currentContext) {
+        applyContextField(currentContext, fieldMatch[1]!, fieldMatch[2]!);
+        continue;
+      }
+    }
+  }
+
+  pushContextItem();
+
+  // Push the last trigger
+  if (current?.name) {
+    if (current.action?.webhook) {
+      triggers.push(current as TriggerConfig);
+    } else {
+      console.warn(`[config] trigger "${current.name}" has no webhook URL — skipping`);
+    }
+  }
+
+  return triggers.length > 0 ? triggers : undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Backup YAML parsing / serialization
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse the `backup:` section. Returns undefined if no section is present so
+ * callers can tell "user hasn't configured backups" apart from "user asked
+ * for the default (schedule: manual, empty destinations)."
+ *
+ * Shape:
+ *   backup:
+ *     schedule: daily
+ *     retention:
+ *       daily: 7
+ *       weekly: 4
+ *       monthly: 12
+ *       yearly: null       # or omit for unbounded; 0 disables the tier
+ *     destinations:
+ *       - kind: local
+ *         path: ~/Library/Mobile Documents/com~apple~CloudDocs/parachute-backups
+ */
+function parseBackup(yaml: string): BackupConfig | undefined {
+  const startMatch = yaml.match(/^backup:\s*$/m);
+  if (!startMatch) return undefined;
+
+  const startIdx = (startMatch.index ?? 0) + startMatch[0].length;
+  const lines = yaml.slice(startIdx).split("\n");
+
+  const backup: BackupConfig = defaultBackupConfig();
+  let section: "top" | "retention" | "destinations" = "top";
+  let currentDest: Partial<BackupDestination> & { kind?: string } = {};
+  let hasDest = false;
+  // Track whether the user supplied a retention block at all. If they did,
+  // we start from a clean slate (all tiers default 0, yearly null) so that
+  // an explicit partial policy overrides defaults rather than merging with
+  // them — predictable semantics beat magical merging.
+  let retentionSeen = false;
+
+  const pushDest = () => {
+    if (!hasDest) return;
+    // For the MVP we only ship `local`. Unknown/malformed destination kinds
+    // are skipped rather than rejected: a forward-rolled config authored by
+    // a newer CLI mustn't break backup for the features this CLI does
+    // understand. The backup command itself warns about skipped kinds.
+    if (currentDest.kind === "local" && typeof currentDest.path === "string") {
+      backup.destinations.push({ kind: "local", path: currentDest.path });
+    }
+    currentDest = {};
+    hasDest = false;
+  };
+
+  for (const line of lines) {
+    // Stop at next top-level key.
+    if (line.match(/^\S/) && line.trim().length > 0) break;
+    if (line.trim().length === 0) continue;
+
+    const trimmed = line.trim();
+
+    // A 2-space-indented line starting a new sub-section closes the previous
+    // section. The only 2-space keys under `backup:` today are `schedule`,
+    // `retention`, and `destinations`, so we key off indent depth here.
+    const indent = line.match(/^ */)?.[0].length ?? 0;
+
+    if (indent === 2) {
+      if (/^retention:\s*$/.test(trimmed)) {
+        section = "retention";
+        retentionSeen = true;
+        // Zero-out tiers so partially specified blocks don't silently merge
+        // with defaults in surprising ways.
+        backup.retention = { daily: 0, weekly: 0, monthly: 0, yearly: 0 };
+        continue;
+      }
+      if (/^destinations:\s*$/.test(trimmed)) {
+        pushDest();
+        section = "destinations";
+        continue;
+      }
+      // Any other 2-space top field terminates the current sub-section.
+      if (section !== "top") {
+        pushDest();
+        section = "top";
+      }
+    }
+
+    if (section === "top" && indent === 2) {
+      const schedMatch = trimmed.match(/^schedule:\s*(\S+)/);
+      if (schedMatch) {
+        const v = schedMatch[1];
+        if (v === "hourly" || v === "daily" || v === "weekly" || v === "manual") {
+          backup.schedule = v;
+        }
+        continue;
+      }
+    }
+
+    if (section === "retention" && indent === 4) {
+      const tierMatch = trimmed.match(/^(daily|weekly|monthly|yearly):\s*(\S+)/);
+      if (tierMatch) {
+        const tier = tierMatch[1] as keyof RetentionPolicy;
+        const raw = tierMatch[2]!.trim();
+        // "null" / "~" / "unbounded" all mean "keep every year" for the
+        // yearly tier. For the other tiers they'd be meaningless; we
+        // silently treat them as disabled (0) rather than erroring.
+        if (raw === "null" || raw === "~" || raw === "unbounded") {
+          if (tier === "yearly") backup.retention.yearly = null;
+          // Other tiers stay at 0.
+          continue;
+        }
+        const n = parseInt(raw, 10);
+        if (Number.isFinite(n) && n >= 0) {
+          backup.retention[tier] = n as never;
+        }
+        continue;
+      }
+    }
+
+    if (section === "destinations") {
+      // Start of a new list item: "- kind: local" or just "- kind:"
+      const itemMatch = trimmed.match(/^-\s+(\w+):\s*(.*)$/);
+      if (itemMatch) {
+        pushDest();
+        hasDest = true;
+        currentDest = {};
+        (currentDest as Record<string, string>)[itemMatch[1]!] = itemMatch[2]!.trim();
+        continue;
+      }
+      // Continuation line inside the current list item.
+      const fieldMatch = trimmed.match(/^(\w+):\s*(.*)$/);
+      if (fieldMatch && hasDest) {
+        (currentDest as Record<string, string>)[fieldMatch[1]!] = fieldMatch[2]!.trim();
+        continue;
+      }
+    }
+  }
+  pushDest();
+
+  // If the user left retention out entirely, fall back to the shipped default.
+  if (!retentionSeen) {
+    backup.retention = defaultRetentionPolicy();
+  }
+
+  return backup;
+}
+
+function serializeBackup(backup: BackupConfig): string[] {
+  const lines: string[] = [];
+  lines.push("backup:");
+  lines.push(`  schedule: ${backup.schedule}`);
+  lines.push("  retention:");
+  lines.push(`    daily: ${backup.retention.daily}`);
+  lines.push(`    weekly: ${backup.retention.weekly}`);
+  lines.push(`    monthly: ${backup.retention.monthly}`);
+  // `null` is serialized as the YAML literal `null` so round-trips preserve
+  // "unbounded." Numbers render as-is, including 0 (disabled).
+  lines.push(`    yearly: ${backup.retention.yearly === null ? "null" : backup.retention.yearly}`);
+  if (backup.destinations.length > 0) {
+    lines.push("  destinations:");
+    for (const dest of backup.destinations) {
+      lines.push(`    - kind: ${dest.kind}`);
+      // Paths may contain ~, spaces, and `.` — the whole line being on its
+      // own key line means we don't need to quote unless the value begins
+      // with a YAML-special character. Quoting defensively keeps the
+      // hand-rolled parser happy under future path-with-colons pressure.
+      if ("path" in dest) {
+        const needsQuote = /[:#]/.test(dest.path);
+        lines.push(`      path: ${needsQuote ? `"${dest.path}"` : dest.path}`);
+      }
+    }
+  } else {
+    lines.push("  destinations: []");
+  }
+  return lines;
+}
+
+// ---------------------------------------------------------------------------
+// Directory management
+// ---------------------------------------------------------------------------
+
+export function ensureConfigDirSync(): void {
+  mkdirSync(configDirPath(), { recursive: true });
+  migrateFromLegacyLayout();
+  mkdirSync(vaultHomePath(), { recursive: true });
+  migrateVaultInternalLayout();
+  mkdirSync(dataDirPath(), { recursive: true });
+  mkdirSync(logsDirPath(), { recursive: true });
+}
+
+/**
+ * Move vault-owned state from the legacy root layout (`~/.parachute/.env`,
+ * `~/.parachute/vaults/`, …) into `~/.parachute/vault/`. Fresh installs see
+ * nothing to migrate and exit quickly; double-calls are a no-op.
+ *
+ * Per-path move policy: if a legacy path exists AND the target under `vault/`
+ * does not, rename the legacy path into place. If both exist, the target
+ * wins — we don't overwrite a user's manually-migrated state — and the
+ * legacy path is left alone with a warning logged. Each moved path is
+ * announced on stdout so users notice when vault relocates their files.
+ */
+export function migrateFromLegacyLayout(): void {
+  const root = configDirPath();
+  const dest = vaultHomePath();
+
+  // Pre-0.3 installs targeted flat names at root (`vaults`, `vault.log`);
+  // we now land those directly under their current canonical subdirs
+  // (`data/`, `logs/`) so upgrading users skip the intermediate shape that
+  // `migrateVaultInternalLayout` would otherwise correct on a second pass.
+  const candidates: Array<[string, string]> = [
+    [".env", ".env"],
+    ["config.yaml", "config.yaml"],
+    ["vault.log", "logs/vault.log"],
+    ["vault.err", "logs/vault.err"],
+    ["start.sh", "start.sh"],
+    ["server-path", "server-path"],
+    ["vaults", "data"],
+    ["assets", "assets"],
+  ];
+
+  const present: Array<[string, string]> = [];
+  for (const [from, to] of candidates) {
+    const src = join(root, from);
+    if (existsSync(src)) present.push([from, to]);
+  }
+  if (present.length === 0) return;
+
+  mkdirSync(dest, { recursive: true });
+
+  const moved: string[] = [];
+  const skipped: string[] = [];
+  for (const [from, to] of present) {
+    const src = join(root, from);
+    const dst = join(dest, to);
+    if (existsSync(dst)) {
+      skipped.push(from);
+      continue;
+    }
+    // Target may live in a subdir (logs/, data/); ensure parent exists
+    // before renameSync, which is strict about target parent existence.
+    const parent = join(dst, "..");
+    mkdirSync(parent, { recursive: true });
+    try {
+      renameSync(src, dst);
+      moved.push(from);
+    } catch (err) {
+      console.warn(formatMigrationFailure(src, dst, err));
+    }
+  }
+
+  // Log to stderr — migration is operational/audit output, and keeping
+  // stdout clean lets callers that pipe stdout (the CLI, spawned child
+  // processes, JSON-consuming shells) run without interference.
+  if (moved.length > 0) {
+    console.error(
+      `[parachute-vault] migrated to new layout: moved ${moved.map((p) => join(root, p)).join(", ")} → ${dest}/`,
+    );
+  }
+  if (skipped.length > 0) {
+    console.error(
+      `[parachute-vault] left legacy paths in place (target already exists under vault/): ${skipped.map((p) => join(root, p)).join(", ")}. Remove the legacy copies once you've confirmed the vault/ copies are current.`,
+    );
+  }
+}
+
+/**
+ * Format a migration-rename failure warning. If the underlying error is
+ * EXDEV (cross-device rename — `PARACHUTE_HOME` straddles a mount, a common
+ * shape in Docker with bind-mounts or multi-disk dev setups), the raw error
+ * message is opaque. Surface the likely cause and note that vault continues
+ * on the legacy layout rather than exiting.
+ */
+export function formatMigrationFailure(src: string, dst: string, err: unknown): string {
+  const msg = err instanceof Error ? err.message : String(err);
+  const code = err instanceof Error ? (err as NodeJS.ErrnoException).code : undefined;
+  if (code === "EXDEV") {
+    return `[parachute-vault] migration failed for ${src} → ${dst}: likely because PARACHUTE_HOME crosses a mount boundary (EXDEV). Vault will continue on the legacy layout; move the file manually to complete the upgrade.`;
+  }
+  return `[parachute-vault] failed to migrate ${src} → ${dst}: ${msg}`;
+}
+
+/**
+ * Tidies the layout *inside* `vault/` for installs upgrading across the
+ * filesystem-hygiene refactor:
+ *
+ *   vault/vaults/   → vault/data/         (matches Postgres/Redis convention;
+ *                                          avoids the doubled "vault/vaults")
+ *   vault/vault.log → vault/logs/vault.log
+ *   vault/vault.err → vault/logs/vault.err
+ *
+ * Same target-wins, idempotent, rename-only policy as
+ * `migrateFromLegacyLayout`. Runs every boot — once the moves have
+ * happened, subsequent calls are pure existence checks that exit fast.
+ *
+ * If `vault/` doesn't exist yet (never booted before), this returns
+ * immediately — `ensureConfigDirSync` creates the fresh layout right after.
+ */
+export function migrateVaultInternalLayout(): void {
+  const vaultHome = vaultHomePath();
+  if (!existsSync(vaultHome)) return;
+
+  // vault/vaults/ → vault/data/
+  const legacyData = join(vaultHome, "vaults");
+  const newData = dataDirPath();
+  if (existsSync(legacyData)) {
+    if (existsSync(newData)) {
+      console.error(
+        `[parachute-vault] both ${legacyData}/ and ${newData}/ exist — using data/, leaving vaults/ in place. Remove the legacy copy once you've confirmed data/ is current.`,
+      );
+    } else {
+      try {
+        renameSync(legacyData, newData);
+        console.error(`[parachute-vault] migrated ${legacyData}/ → ${newData}/`);
+      } catch (err) {
+        console.warn(formatMigrationFailure(`${legacyData}/`, `${newData}/`, err));
+      }
+    }
+  }
+
+  // vault/{vault.log,vault.err} → vault/logs/{vault.log,vault.err}
+  const logsDir = logsDirPath();
+  const logsMoved: string[] = [];
+  const logsSkipped: string[] = [];
+  for (const name of ["vault.log", "vault.err"]) {
+    const src = join(vaultHome, name);
+    if (!existsSync(src)) continue;
+    const dst = join(logsDir, name);
+    if (existsSync(dst)) {
+      logsSkipped.push(name);
+      continue;
+    }
+    mkdirSync(logsDir, { recursive: true });
+    try {
+      renameSync(src, dst);
+      logsMoved.push(name);
+    } catch (err) {
+      console.warn(formatMigrationFailure(src, dst, err));
+    }
+  }
+  if (logsMoved.length > 0) {
+    console.error(
+      `[parachute-vault] migrated ${logsMoved.map((n) => join(vaultHome, n)).join(", ")} → ${logsDir}/`,
+    );
+  }
+  if (logsSkipped.length > 0) {
+    console.error(
+      `[parachute-vault] left legacy log files in place (target already exists under logs/): ${logsSkipped.map((n) => join(vaultHome, n)).join(", ")}.`,
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Global config
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether server boot may auto-create the first vault when none exist.
+ *
+ * Only the explicit `auto_create: false` marker (written by `cmdRemove`
+ * when it deletes the LAST vault) blocks the auto-create. A fresh install
+ * has no config.yaml — `readGlobalConfig()` returns defaults with
+ * `auto_create` unset — so Docker / hub-install first-run still
+ * auto-creates `default`. Pure + exported so the boot gate is testable
+ * without booting a server.
+ */
+export function bootAutoCreateAllowed(config: Pick<GlobalConfig, "auto_create">): boolean {
+  return config.auto_create !== false;
+}
+
+export function readGlobalConfig(): GlobalConfig {
+  try {
+    const gcPath = globalConfigPath();
+    if (existsSync(gcPath)) {
+      const yaml = readFileSync(gcPath, "utf-8");
+      const portMatch = yaml.match(/^port:\s*(\d+)/m);
+      const defaultVaultMatch = yaml.match(/^default_vault:\s*(\S+)/m);
+      const passwordHashMatch = yaml.match(/^owner_password_hash:\s*"([^"]+)"/m);
+      const totpSecretMatch = yaml.match(/^totp_secret:\s*"([^"]+)"/m);
+      const discoveryMatch = yaml.match(/^discovery:\s*(enabled|disabled)/m);
+      const autostartMatch = yaml.match(/^autostart:\s*(true|false)/m);
+      const autoCreateMatch = yaml.match(/^auto_create:\s*(true|false)/m);
+      const embeddingsEnabledMatch = yaml.match(/^embeddings_enabled:\s*(true|false)/m);
+      const defaultMirrorMatch = yaml.match(/^default_mirror:\s*(internal|off)/m);
+      // auto_transcribe block — currently single boolean `enabled` (vault#353).
+      // Parsed as a nested 2-space-indent block so future fields can grow under
+      // it without breaking the regex; only `enabled` is read for v0.6.
+      const autoTranscribeStart = yaml.match(/^auto_transcribe:\s*$/m);
+      let autoTranscribeEnabled: boolean | undefined;
+      if (autoTranscribeStart) {
+        const after = yaml.slice((autoTranscribeStart.index ?? 0) + autoTranscribeStart[0].length);
+        for (const line of after.split("\n")) {
+          if (line.match(/^\S/) && line.trim().length > 0) break; // next top-level key
+          const m = line.match(/^\s+enabled:\s*(true|false)/);
+          if (m) {
+            autoTranscribeEnabled = m[1]! === "true";
+            break;
+          }
+        }
+      }
+      const config: GlobalConfig = {
+        port: portMatch ? parseInt(portMatch[1]!, 10) : DEFAULT_PORT,
+        default_vault: defaultVaultMatch?.[1],
+        owner_password_hash: passwordHashMatch?.[1],
+        totp_secret: totpSecretMatch?.[1],
+      };
+      if (discoveryMatch) {
+        config.discovery = discoveryMatch[1]! as "enabled" | "disabled";
+      }
+      if (autostartMatch) {
+        config.autostart = autostartMatch[1]! === "true";
+      }
+      if (autoCreateMatch) {
+        config.auto_create = autoCreateMatch[1]! === "true";
+      }
+      if (embeddingsEnabledMatch) {
+        config.embeddings_enabled = embeddingsEnabledMatch[1]! === "true";
+      }
+      if (defaultMirrorMatch) {
+        config.default_mirror = defaultMirrorMatch[1]! as "internal" | "off";
+      }
+      if (autoTranscribeEnabled !== undefined) {
+        config.auto_transcribe = { enabled: autoTranscribeEnabled };
+      }
+
+      // Parse backup_codes: a YAML list of quoted bcrypt hashes under
+      //   backup_codes:
+      //     - "hash1"
+      //     - "hash2"
+      const backupStart = yaml.match(/^backup_codes:\s*$/m);
+      if (backupStart) {
+        const after = yaml.slice((backupStart.index ?? 0) + backupStart[0].length);
+        const lines = after.split("\n");
+        const codes: string[] = [];
+        for (const line of lines) {
+          if (line.match(/^\S/) && line.trim().length > 0) break; // next top-level key
+          const m = line.match(/^\s+-\s+"([^"]+)"/);
+          if (m) codes.push(m[1]!);
+        }
+        if (codes.length > 0) config.backup_codes = codes;
+      }
+
+      // Parse global api_keys
+      // Same line-anchored grammar as the vault-level parser above (vault#234)
+      // — commented lines don't match; a value-less field can't capture the
+      // next field's token across the newline.
+      const keyBlocks = yaml.split(/\n\s+-\s+id:\s+/).slice(1);
+      if (keyBlocks.length > 0) {
+        config.api_keys = [];
+        for (const block of keyBlocks) {
+          const idMatch = block.match(/^(\S+)/);
+          const labelMatch = block.match(/^[^\S\r\n]*label:[^\S\r\n]*(.+)/m);
+          const scopeMatch = block.match(/^[^\S\r\n]*scope:[^\S\r\n]*(\S+)/m);
+          const hashMatch = block.match(/^[^\S\r\n]*key_hash:[^\S\r\n]*(\S+)/m);
+          const createdAtMatch = block.match(/^[^\S\r\n]*created_at:[^\S\r\n]*"?([^"\n]+?)"?\s*$/m);
+          const lastUsedMatch = block.match(/^[^\S\r\n]*last_used_at:[^\S\r\n]*"?([^"\n]+?)"?\s*$/m);
+          if (idMatch && hashMatch) {
+            config.api_keys.push({
+              id: idMatch[1]!,
+              label: (labelMatch?.[1] ?? "default").trim(),
+              scope: (scopeMatch?.[1] as KeyScope) ?? "write",
+              key_hash: hashMatch[1]!,
+              created_at: createdAtMatch?.[1] ?? new Date().toISOString(),
+              last_used_at: lastUsedMatch?.[1],
+            });
+          }
+        }
+      }
+
+      // Parse triggers
+      config.triggers = parseTriggers(yaml);
+
+      // Parse backup section
+      config.backup = parseBackup(yaml);
+
+      // Parse mirror section (vault-sync Phase A1). Imported lazily via a
+      // narrow helper to keep config.ts free of a top-level cycle into the
+      // mirror module — `mirror-config.ts` imports `vaultDir` from here.
+      const mirror = parseMirrorSectionFromYaml(yaml);
+      if (mirror) config.mirror = mirror;
+
+      return config;
+    }
+  } catch {}
+  return { port: DEFAULT_PORT };
+}
+
+export function writeGlobalConfig(config: GlobalConfig): void {
+  ensureConfigDirSync();
+  const lines = [`port: ${config.port}`];
+  if (config.default_vault) lines.push(`default_vault: ${config.default_vault}`);
+  if (config.discovery) lines.push(`discovery: ${config.discovery}`);
+  if (config.autostart !== undefined) lines.push(`autostart: ${config.autostart}`);
+  if (config.auto_create !== undefined) lines.push(`auto_create: ${config.auto_create}`);
+  if (config.embeddings_enabled !== undefined) lines.push(`embeddings_enabled: ${config.embeddings_enabled}`);
+  if (config.default_mirror) lines.push(`default_mirror: ${config.default_mirror}`);
+  if (config.owner_password_hash) {
+    lines.push(`owner_password_hash: "${config.owner_password_hash}"`);
+  }
+  if (config.totp_secret) {
+    lines.push(`totp_secret: "${config.totp_secret}"`);
+  }
+  if (config.backup_codes && config.backup_codes.length > 0) {
+    lines.push("backup_codes:");
+    for (const hash of config.backup_codes) {
+      lines.push(`  - "${hash}"`);
+    }
+  }
+
+  if (config.api_keys && config.api_keys.length > 0) {
+    lines.push("api_keys:");
+    for (const key of config.api_keys) {
+      lines.push(`  - id: ${key.id}`);
+      lines.push(`    label: ${key.label}`);
+      lines.push(`    scope: ${key.scope ?? "write"}`);
+      lines.push(`    key_hash: ${key.key_hash}`);
+      lines.push(`    created_at: "${key.created_at}"`);
+      if (key.last_used_at) {
+        lines.push(`    last_used_at: "${key.last_used_at}"`);
+      }
+    }
+  }
+
+  if (config.triggers && config.triggers.length > 0) {
+    lines.push("triggers:");
+    for (const trigger of config.triggers) {
+      lines.push(`  - name: ${trigger.name}`);
+      if (trigger.events) {
+        lines.push(`    events: [${trigger.events.join(", ")}]`);
+      }
+      lines.push("    when:");
+      if (trigger.when.tags?.length) {
+        lines.push(`      tags: [${trigger.when.tags.join(", ")}]`);
+      }
+      if (trigger.when.has_content !== undefined) {
+        lines.push(`      has_content: ${trigger.when.has_content}`);
+      }
+      if (trigger.when.missing_metadata?.length) {
+        lines.push(`      missing_metadata: [${trigger.when.missing_metadata.join(", ")}]`);
+      }
+      if (trigger.when.has_metadata?.length) {
+        lines.push(`      has_metadata: [${trigger.when.has_metadata.join(", ")}]`);
+      }
+      lines.push("    action:");
+      lines.push(`      webhook: ${trigger.action.webhook}`);
+      if (trigger.action.send && trigger.action.send !== "json") {
+        lines.push(`      send: ${trigger.action.send}`);
+      }
+      if (trigger.action.timeout) {
+        lines.push(`      timeout: ${trigger.action.timeout}`);
+      }
+      if (trigger.action.include_context?.length) {
+        lines.push("      include_context:");
+        for (const entry of trigger.action.include_context) {
+          lines.push(`        - tag: ${entry.tag}`);
+          if (entry.exclude_tag) {
+            lines.push(`          exclude_tag: ${entry.exclude_tag}`);
+          }
+          if (entry.include_metadata?.length) {
+            lines.push(`          include_metadata: [${entry.include_metadata.map((v) => `"${v}"`).join(", ")}]`);
+          }
+        }
+      }
+    }
+  }
+
+  if (config.backup) {
+    lines.push(...serializeBackup(config.backup));
+  }
+
+  // vault#400: mirror config is now PER-VAULT (`data/<vault>/mirror-config.yaml`),
+  // not a server-wide block here. `writeGlobalConfig` deliberately does NOT
+  // re-emit a `mirror:` block — doing so would resurrect the legacy
+  // server-wide config the boot migration just commented out, re-introducing
+  // the "same remote on every vault page" bug. `readGlobalConfig` still parses
+  // a legacy block (below) so the one-time migration can detect + relocate it.
+  // `serializeMirrorSection` remains used by the per-vault writer in
+  // `mirror-config.ts`.
+
+  if (config.auto_transcribe) {
+    lines.push("auto_transcribe:");
+    if (config.auto_transcribe.enabled !== undefined) {
+      lines.push(`  enabled: ${config.auto_transcribe.enabled}`);
+    }
+  }
+
+  // 0600 — owner read/write only. This file may contain the bcrypt password
+  // hash and plaintext TOTP secret; it must not be world- or group-readable.
+  writeFileSync(globalConfigPath(), lines.join("\n") + "\n", { mode: 0o600 });
+  // writeFileSync's `mode` only applies on file creation, so chmod an existing
+  // file explicitly in case it was written by an older version at 0644.
+  try { chmodSync(globalConfigPath(), 0o600); } catch {}
+}
+
+// ---------------------------------------------------------------------------
+// Vault config
+// ---------------------------------------------------------------------------
+
+export function readVaultConfig(name: string): VaultConfig | null {
+  const configPath = vaultConfigPath(name);
+  try {
+    if (existsSync(configPath)) {
+      return parseVaultConfig(readFileSync(configPath, "utf-8"), name);
+    }
+  } catch {}
+  return null;
+}
+
+export class UnreadablePrivateTagsError extends Error {
+  constructor() {
+    super("vault.yaml has an unreadable private_tags key; fix it by hand before editing this vault's config");
+    this.name = "UnreadablePrivateTagsError";
+  }
+}
+
+export function writeVaultConfig(config: VaultConfig, nameOnlySource?: string): void {
+  // Name-only mode re-emits the original YAML verbatim (only `name:` changes),
+  // so an unreadable private_tags key survives untouched; only a full
+  // reserialization could drop it.
+  if (nameOnlySource === undefined && config.private_tags_error && !config.private_tags_raw) {
+    throw new UnreadablePrivateTagsError();
+  }
+  const dir = vaultDir(config.name);
+  mkdirSync(dir, { recursive: true });
+  const configPath = vaultConfigPath(config.name);
+  // Rename changes only identity. Preserve even unknown fields and raw YAML
+  // (including private_tags) that this version's serializer cannot round-trip.
+  const yaml = nameOnlySource === undefined ? serializeVaultConfig(config)
+    : /^name:[^\r\n]*/m.test(nameOnlySource)
+      ? nameOnlySource.replace(/^name:[^\r\n]*/m, `name: ${config.name}`)
+      : `name: ${config.name}\n${nameOnlySource}`;
+  writeFileSync(configPath, yaml);
+}
+
+// ---------------------------------------------------------------------------
+// Key operations
+// ---------------------------------------------------------------------------
+
+export function hashKey(key: string): string {
+  return "sha256:" + crypto.createHash("sha256").update(key).digest("hex");
+}
+
+export function verifyKey(providedKey: string, storedHash: string): boolean {
+  const computed = hashKey(providedKey);
+  if (computed.length !== storedHash.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(computed), Buffer.from(storedHash));
+}
+
+export function generateApiKey(): { fullKey: string; keyId: string } {
+  const random = crypto.randomBytes(32).toString("base64url").slice(0, 32);
+  return {
+    fullKey: `pvk_${random}`,
+    keyId: `k_${random.slice(0, 12)}`,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Environment file (~/.parachute/vault/.env)
+// ---------------------------------------------------------------------------
+
+/**
+ * Read the .env file as key-value pairs.
+ */
+export function readEnvFile(): Record<string, string> {
+  const env: Record<string, string> = {};
+  try {
+    const p = envFilePath();
+    if (!existsSync(p)) return env;
+    const content = readFileSync(p, "utf-8");
+    for (const line of content.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      const eqIdx = trimmed.indexOf("=");
+      if (eqIdx === -1) continue;
+      const key = trimmed.slice(0, eqIdx).trim();
+      let val = trimmed.slice(eqIdx + 1).trim();
+      // Strip surrounding quotes
+      if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+        val = val.slice(1, -1);
+      }
+      env[key] = val;
+    }
+  } catch {}
+  return env;
+}
+
+/**
+ * Write the .env file from key-value pairs.
+ */
+export function writeEnvFile(env: Record<string, string>): void {
+  ensureConfigDirSync();
+  const lines: string[] = [
+    "# Parachute Vault configuration",
+    "# Managed by: parachute-vault config",
+    "",
+  ];
+  for (const [key, val] of Object.entries(env)) {
+    if (val.includes(" ") || val.includes('"')) {
+      lines.push(`${key}="${val}"`);
+    } else {
+      lines.push(`${key}=${val}`);
+    }
+  }
+  // 0600 — owner read/write only. This file holds SCRIBE_AUTH_TOKEN (the
+  // vault↔scribe loopback bearer) and any other secrets the operator drops
+  // in via `parachute-vault config set`. It must not be world- or
+  // group-readable on shared-user machines or Docker images with a loose
+  // umask. Mirrors the writeGlobalConfig pattern above.
+  writeFileSync(envFilePath(), lines.join("\n") + "\n", { mode: 0o600 });
+  // writeFileSync's `mode` only applies on file creation, so chmod an existing
+  // file explicitly in case it was written by an older version at 0644.
+  try { chmodSync(envFilePath(), 0o600); } catch {}
+}
+
+/**
+ * Set a single env var in the .env file.
+ */
+export function setEnvVar(key: string, value: string): void {
+  const env = readEnvFile();
+  env[key] = value;
+  writeEnvFile(env);
+}
+
+/**
+ * Remove an env var from the .env file.
+ */
+export function unsetEnvVar(key: string): void {
+  const env = readEnvFile();
+  delete env[key];
+  writeEnvFile(env);
+}
+
+/**
+ * Load .env file into process.env (for server startup).
+ */
+export function loadEnvFile(): void {
+  const env = readEnvFile();
+  for (const [key, val] of Object.entries(env)) {
+    if (process.env[key] === undefined) {
+      process.env[key] = val;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Vault listing
+// ---------------------------------------------------------------------------
+
+export function listVaults(): string[] {
+  try {
+    const dir = dataDirPath();
+    if (!existsSync(dir)) return [];
+    const entries = Bun.spawnSync(["ls", dir]).stdout.toString().trim();
+    if (!entries) return [];
+    return entries.split("\n").filter((name) => {
+      return existsSync(vaultConfigPath(name));
+    });
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Resolve the vault that tooling-level defaults (e.g. the `parachute-vault`
+ * MCP entry the CLI writes into `~/.claude.json`) should target. HTTP routing
+ * is vault-scoped — `/vault/<name>/...` is the only URL shape — so this helper
+ * is no longer on the request path; it just picks the one vault the CLI wires
+ * up by default.
+ *
+ * Resolution order:
+ *  1. If `default_vault` is set in config.yaml AND that vault exists → use it.
+ *  2. Else if exactly one vault exists → use that vault regardless of its name.
+ *  3. Otherwise → return `null` (multi-vault deployment with no/bad default;
+ *     the caller should surface an explicit error rather than guess).
+ *
+ * Notes:
+ *  - If `default_vault` points to a deleted vault, step 2 still kicks in so
+ *    operators aren't stranded after `vault remove`.
+ *  - The name "default" has no special meaning here; it's just whatever
+ *    `vault init` happens to create on first run.
+ */
+export function resolveDefaultVault(): string | null {
+  const globalConfig = readGlobalConfig();
+  const vaults = listVaults();
+  if (globalConfig.default_vault && vaults.includes(globalConfig.default_vault)) {
+    return globalConfig.default_vault;
+  }
+  if (vaults.length === 1) {
+    return vaults[0]!;
+  }
+  return null;
+}

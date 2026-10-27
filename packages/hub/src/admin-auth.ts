@@ -1,0 +1,246 @@
+/**
+ * Bearer-token auth for hub-native admin endpoints (POST /vaults, future
+ * `/admin/*` routes). The hub validates its own JWTs against local signing
+ * keys — no JWKS round-trip — and asserts the presented token carries the
+ * required scope.
+ *
+ * Why this exists: until now the hub has been a *pure issuer* with no
+ * authenticated endpoints of its own. Phase 1 of the vault-config-and-scopes
+ * design adds POST /vaults, which mints+config-writes through privileged
+ * code paths. That call needs an admin scope, and its first reader is
+ * `parachute:host:admin` (the cross-vault provisioning capability).
+ *
+ * Errors are HTTP-shaped: `AdminAuthError(status, message)` so the route
+ * handler can `throw` and the boundary translates straight to a Response.
+ */
+import type { Database } from "bun:sqlite";
+import { validateAccessToken } from "./jwt-sign.ts";
+import { authenticateNostrRequest, isNostrAuthorization } from "./nostr-http-auth.ts";
+
+export interface AdminAuthContext {
+  /** JWT `sub` — the hub user id. */
+  sub: string;
+  /** Parsed `scope` claim. */
+  scopes: string[];
+  /** `client_id` claim, if present (operator token vs OAuth client). */
+  clientId: string | undefined;
+  /** `aud` claim, if present. Surfaced for logs / future cross-aud rules. */
+  audience: string | undefined;
+}
+
+export class AdminAuthError extends Error {
+  override name = "AdminAuthError";
+  status: number;
+  /**
+   * The scope the caller needed, when the failure was an insufficient-scope
+   * 403. Rendered as the RFC 6750 §3 `scope` parameter on the
+   * `WWW-Authenticate` challenge — the field spec-following clients actually
+   * parse, as opposed to `error_description`, which is prose for humans.
+   *
+   * This is the standard discovery path for a scope that isn't advertised.
+   * Parachute deliberately keeps `account:*` out of `scopes_supported` (RFC
+   * 8414 §2 and RFC 9728 §2 both say a server MAY do exactly that, and MCP's
+   * 2025-11-25 authorization spec goes further — `scopes_supported` is meant
+   * to be the MINIMAL set, with more obtained through step-up). The cost was
+   * that an unattended agent had no mechanical way to learn those scopes
+   * exist. Naming the scope in the challenge closes that: attempt the
+   * operation, get a 403 that says which scope to ask for, step up.
+   *
+   * Same shape `git-transport.ts` already emits — this brings the account
+   * surface in line with in-repo precedent.
+   */
+  requiredScope: string | undefined;
+  constructor(status: number, message: string, requiredScope?: string) {
+    super(message);
+    this.status = status;
+    this.requiredScope = requiredScope;
+  }
+}
+
+/**
+ * Pull a Bearer token from `Authorization: Bearer <token>`. Throws
+ * `AdminAuthError(401)` when missing / malformed. Match is case-insensitive
+ * on the scheme (some clients send "bearer" lowercase) but the token itself
+ * is the raw JWT string.
+ */
+export function extractBearerToken(req: Request): string {
+  const header = req.headers.get("authorization");
+  if (!header) {
+    throw new AdminAuthError(401, "missing Authorization header");
+  }
+  const match = header.match(/^Bearer\s+(.+)$/i);
+  if (!match || !match[1]) {
+    throw new AdminAuthError(401, "Authorization header must be 'Bearer <token>'");
+  }
+  return match[1].trim();
+}
+
+/**
+ * Validate a presented bearer token against the hub's local signing keys
+ * and check it carries `requiredScope`. Returns surfaced claims on success;
+ * throws `AdminAuthError` (401 or 403) otherwise.
+ *
+ * `expectedIssuer` is the hub's own origin(s) — the same value(s) baked into
+ * tokens we sign. Pass a single string for a single-origin hub, or the SET of
+ * origins the hub legitimately answers on (`buildHubBoundOrigins`: loopback ∪
+ * expose-state ∪ platform ∪ per-request issuer) so a credential minted under
+ * a still-valid prior origin keeps validating across an origin switch — the
+ * same multi-origin posture the OAuth path and `validateHostAdminToken`
+ * already use. Defense in depth: even though we can only verify our own keys,
+ * the `iss`-∈-set reject keeps cross-issuer confusion impossible. SECURITY:
+ * the set is ONLY an additive `iss` membership relaxation — `validateAccessToken`
+ * verifies the signature against the hub's own key FIRST, so only tokens this
+ * hub minted ever reach the `iss` check; never pass a raw request Host, only a
+ * `buildHubBoundOrigins`-derived set.
+ */
+export function nostrAutoProvisionEnabled(): boolean {
+  const v = process.env.PARACHUTE_NOSTR_AUTO_PROVISION;
+  return v === "1" || v === "true" || v === "yes";
+}
+
+/**
+ * An authenticated caller, before any scope assertion. {@link requireScope} is
+ * this plus a scope check; endpoints that gate on "is anyone at all" rather
+ * than on a capability use it directly.
+ */
+export interface AuthenticatedContext extends AdminAuthContext {
+  /**
+   * True when the caller is a hub admin authenticated over NIP-98, whose
+   * `scopes` are deliberately EMPTY (`principalFromUser` gives an admin no
+   * per-vault scopes — an admin's posture is "no narrowing", not "no access").
+   * A scope check must treat this as satisfying anything; a bare
+   * authentication check ignores it.
+   */
+  unrestricted: boolean;
+}
+
+/**
+ * Authenticate a request — NIP-98 `Authorization: Nostr` or a hub-issued
+ * Bearer — WITHOUT asserting any scope. Throws `AdminAuthError(401)` when the
+ * caller cannot be identified.
+ *
+ * Split out of {@link requireScope} for read-only endpoints whose answer is not
+ * a secret and whose gate is only "an identified principal asked" — e.g.
+ * `GET /api/channel-vault`, which returns a vault NAME (every read of the vault
+ * itself is separately ACL'd). Never use this where the answer varies with, or
+ * discloses, another principal's data.
+ */
+export async function requireAuthenticated(
+  db: Database,
+  req: Request,
+  expectedIssuer: string | readonly string[],
+): Promise<AuthenticatedContext> {
+  if (isNostrAuthorization(req)) {
+    let body = new Uint8Array();
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      body = new Uint8Array(await req.clone().arrayBuffer());
+    }
+    try {
+      const principal = await authenticateNostrRequest(db, req, {
+        autoProvision: nostrAutoProvisionEnabled(),
+        body,
+      });
+      return {
+        sub: principal.userId,
+        scopes: principal.scopes,
+        clientId: `nostr:${principal.pubkey}`,
+        audience: undefined,
+        unrestricted: principal.isHubAdmin,
+      };
+    } catch (err) {
+      if (err instanceof AdminAuthError) throw err;
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new AdminAuthError(401, msg);
+    }
+  }
+
+  const token = extractBearerToken(req);
+
+  let validated: Awaited<ReturnType<typeof validateAccessToken>>;
+  try {
+    validated = await validateAccessToken(db, token, expectedIssuer);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new AdminAuthError(401, `invalid token: ${msg}`);
+  }
+
+  const sub = typeof validated.payload.sub === "string" ? validated.payload.sub : null;
+  if (!sub) throw new AdminAuthError(401, "token missing required `sub` claim");
+
+  const scopeClaim = (validated.payload as { scope?: unknown }).scope;
+  const scopes =
+    typeof scopeClaim === "string" ? scopeClaim.split(/\s+/).filter((s) => s.length > 0) : [];
+
+  const clientIdRaw = (validated.payload as { client_id?: unknown }).client_id;
+  const clientId = typeof clientIdRaw === "string" ? clientIdRaw : undefined;
+  const aud = typeof validated.payload.aud === "string" ? validated.payload.aud : undefined;
+
+  return { sub, scopes, clientId, audience: aud, unrestricted: false };
+}
+
+export async function requireScope(
+  db: Database,
+  req: Request,
+  requiredScope: string,
+  expectedIssuer: string | readonly string[],
+): Promise<AdminAuthContext> {
+  const ctx = await requireAuthenticated(db, req, expectedIssuer);
+  // A NIP-98 hub admin carries no scopes by construction; it satisfies every
+  // requirement and reports the scope it was asked for, exactly as before the
+  // authenticate/authorize split.
+  if (ctx.unrestricted) {
+    return {
+      sub: ctx.sub,
+      scopes: [requiredScope],
+      clientId: ctx.clientId,
+      audience: ctx.audience,
+    };
+  }
+  if (!ctx.scopes.includes(requiredScope)) {
+    throw new AdminAuthError(403, `token missing required scope: ${requiredScope}`, requiredScope);
+  }
+  return { sub: ctx.sub, scopes: ctx.scopes, clientId: ctx.clientId, audience: ctx.audience };
+}
+
+/**
+ * Translate an AdminAuthError to an RFC-6750-style JSON Response.
+ * Convenience for route handlers that want to do
+ * `try { ctx = await requireScope(...) } catch (err) { return adminAuthErrorResponse(err); }`.
+ */
+/**
+ * Build the `WWW-Authenticate` challenge, including the RFC 6750 §3 `scope`
+ * parameter when we know which scope was missing.
+ *
+ * Quoted-string values can't contain a raw `"`, so the description is
+ * sanitised; the scope token is emitted verbatim because scope values are
+ * already constrained to a safe charset.
+ */
+function buildChallenge(err: AdminAuthError): string {
+  const code = err.status === 403 ? "insufficient_scope" : "invalid_token";
+  const parts = [`Bearer error="${code}"`, `error_description="${err.message.replace(/"/g, "'")}"`];
+  if (err.status === 403 && err.requiredScope) parts.push(`scope="${err.requiredScope}"`);
+  return parts.join(", ");
+}
+
+export function adminAuthErrorResponse(err: unknown): Response {
+  if (err instanceof AdminAuthError) {
+    return new Response(
+      JSON.stringify({
+        error: err.status === 403 ? "insufficient_scope" : "invalid_token",
+        error_description: err.message,
+      }),
+      {
+        status: err.status,
+        headers: {
+          "content-type": "application/json",
+          "www-authenticate": buildChallenge(err),
+        },
+      },
+    );
+  }
+  const msg = err instanceof Error ? err.message : String(err);
+  return new Response(JSON.stringify({ error: "server_error", error_description: msg }), {
+    status: 500,
+    headers: { "content-type": "application/json" },
+  });
+}

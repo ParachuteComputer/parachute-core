@@ -1,0 +1,206 @@
+# Release workflow — publishes on merge to `next` or `main`, and on an
+# explicit tag push.
+#
+# ## Why `next` was added (2026-08-29, parachute-hub#911's sibling)
+#
+# Same bottleneck hub had: an rc cut needed a version-bump PR into `next`,
+# then a SECOND `next`→`main` PR just to fire this trigger. Adding `next`
+# here removes that hop for rc's. `decidePublish()` in `scripts/release-plan.ts`
+# takes the trigger branch and refuses to publish a stable (non-`-rc.`)
+# unless that trigger is a branch push of `main`. A tag push of a stable is
+# also refused — a write token can push a tag; it cannot merge to `main`.
+# `main` is unchanged — still publishes rc OR stable, exactly as before, so
+# stable promotion still needs its own PR to `main` (RELEASING.md). Rc
+# tag-pushes still override the registry guards.
+#
+# ## Why this changed (2026-07-29)
+#
+# This used to be tag-only: merge the PR, then remember to `git tag && git
+# push`. The tag push was the release signal. In practice the remembering is
+# the weak link — four PRs merged in one session with no tags pushed, so
+# nothing published, and the operator only discovered it when asking why their
+# box didn't have the changes. A release step that is easy to forget is a
+# release step that gets forgotten.
+#
+# Governance rule 2 already requires that every code-touching PR bump `version`
+# in package.json. So **package.json's version IS the per-PR release intent** —
+# the tag was a second, manual, forgettable copy of a decision the PR had
+# already made. This workflow acts on the version directly.
+#
+# ## The trap this deliberately avoids
+#
+# The obvious alternative — a workflow that pushes a tag on merge, letting the
+# existing tag trigger fire — does NOT work. Per GitHub's documented rule,
+# "events triggered by the GITHUB_TOKEN will not create a new workflow run"
+# (only workflow_dispatch and repository_dispatch are exceptions). You would
+# get tags with no releases. Collapsing tag-and-publish into ONE workflow
+# sidesteps the recursion problem entirely: nothing needs to trigger anything.
+#
+# ## Safety properties
+#
+#   - **Idempotent.** Publishing is skipped when that exact version already
+#     exists on npm. Re-running, a revert, or a merge that didn't bump the
+#     version is a no-op — it cannot double-publish.
+#   - **Gated.** The full typecheck + test suite must pass first, unchanged.
+#   - **`next` and `main` only.** Other branches never publish. `next` is
+#     further restricted to rc versions only (see `plan` job). A tag push
+#     of a stable is also skipped — stables publish from `main` only.
+#   - **rc vs stable stays a human decision.** The dist-tag is derived from the
+#     version string, so promoting to `latest` still requires someone to
+#     deliberately drop the `-rc.N` suffix in a PR.
+#   - The tag is still created, as a RECORD of what shipped. Nothing triggers
+#     off it any more, so GITHUB_TOKEN pushing it is fine.
+#
+# The manual **rc** tag path still works — push `v0.7.5-rc.4` and it
+# publishes exactly as before. Useful for re-releasing an rc, or for a
+# version that landed before this workflow existed. A tag push of a
+# stable (`vX.Y.Z` with no `-rc.`) is skipped.
+#
+# ## Operator setup (one-time, unchanged)
+#
+#   - npmjs.com → package @openparachute/vault → Settings → Trusted Publishers
+#     → GitHub Actions: org=ParachuteComputer, repo=parachute-vault,
+#       workflow=release.yml, environment=(blank)
+#   - No NPM_TOKEN secret — OIDC Trusted Publishing.
+#
+#   NOTE: the trusted-publisher rule is pinned to the WORKFLOW FILENAME. That
+#   is why this logic lives in release.yml rather than a new file — a separate
+#   workflow would fail to publish with a 403 no matter how correct it was.
+
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+      - next
+    # paths has no effect on tag pushes (GitHub only evaluates it for
+    # branch pushes), so the manual re-tag/re-release path below is
+    # unaffected by this filter.
+    paths:
+      - 'package.json'
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+'
+  # Manual re-run, e.g. after a transient npm failure.
+  workflow_dispatch:
+
+concurrency:
+  # Don't let two releases race. Keyed on ref so a tag push and a main push
+  # don't block each other spuriously.
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Decide whether there is anything to publish, BEFORE spending a test run.
+  #
+  # The decision lives in `scripts/release-plan.ts` (unit-tested — the
+  # previous inline shell treated a package-level 404 the same as a
+  # version-level 404, which is the surface#220 / hub#930 / app#189
+  # first-publish hole). `--tag-push` on tag triggers, same as hub/app:
+  # without it a deliberate rc re-release is skipped as already-published.
+  # ---------------------------------------------------------------------------
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.decide.outputs.version }}
+      should_publish: ${{ steps.decide.outputs.should_publish }}
+      dist_tag: ${{ steps.decide.outputs.dist_tag }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4
+      - id: decide
+        name: compare package.json version against npm
+        run: |
+          set -euo pipefail
+          # Keep the tag↔package.json identity check the shell had: a
+          # mistagged vX.Y.Z that doesn't match package.json must fail
+          # closed, not publish whatever happens to be in package.json.
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            VERSION=$(bun -e "console.log(require('./package.json').version)")
+            TAG_VERSION="${GITHUB_REF_NAME#v}"
+            if [ "$VERSION" != "$TAG_VERSION" ]; then
+              echo "::error::package.json version ($VERSION) doesn't match tag ($TAG_VERSION)"
+              exit 1
+            fi
+          fi
+          bun scripts/release-plan.ts . @openparachute/vault ${{ github.ref_type == 'tag' && '--tag-push' || '' }}
+
+  test:
+    name: test
+    needs: plan
+    if: needs.plan.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4
+      - name: install deps
+        run: bun install --frozen-lockfile
+      - name: typecheck
+        run: bun run typecheck
+      - name: vault tests
+        # Matches package.json "test" script (bun test ./src/). The core/
+        # suite runs under vitest and is exercised separately in normal
+        # dev (see CLAUDE.md "Running"); the release gate stays on the
+        # canonical bun:test surface that covers the server + CLI.
+        run: bun test ./src/
+
+  publish-npm:
+    name: publish to npm
+    needs: [plan, test]
+    if: needs.plan.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      # `contents: write` so the post-publish tag can be pushed. Nothing
+      # triggers off that tag — it's a record — so GITHUB_TOKEN is fine.
+      contents: write
+      # Required for npm provenance attestation + Trusted Publishing OIDC.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4
+      - uses: actions/setup-node@v6
+        with:
+          # Node 24 ships npm 11.5+ which has Trusted Publishing OIDC
+          # support built in. Node 20 LTS only has npm 10 and would
+          # silently fall back to token auth (failing without NPM_TOKEN).
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+      - name: install deps
+        run: bun install --frozen-lockfile
+      - name: publish
+        # Trusted Publishing: npm verifies the OIDC token from this workflow
+        # against the package's configured trusted publisher rule
+        # (org=ParachuteComputer, repo=parachute-vault, workflow=release.yml).
+        # No NPM_TOKEN secret needed; `id-token: write` above makes the OIDC
+        # token available to the npm CLI.
+        run: |
+          echo "publishing @openparachute/vault@${{ needs.plan.outputs.version }} with dist-tag=${{ needs.plan.outputs.dist_tag }}"
+          npm publish --tag "${{ needs.plan.outputs.dist_tag }}" --access public --provenance
+
+      - name: tag the released commit
+        # A RECORD of what shipped, not a trigger. Best-effort by design: a
+        # failure here must not fail a release that already succeeded on npm.
+        # The artifact is published; re-running would just hit the idempotency
+        # check in `plan` and do nothing.
+        if: github.ref_type != 'tag'
+        continue-on-error: true
+        run: |
+          TAG="v${{ needs.plan.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "tag $TAG already exists — leaving it alone"
+          else
+            git tag "$TAG"
+            git push origin "$TAG"
+            echo "tagged $TAG"
+          fi

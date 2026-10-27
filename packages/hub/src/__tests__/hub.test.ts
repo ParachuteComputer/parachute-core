@@ -1,0 +1,359 @@
+import { describe, expect, test } from "bun:test";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { renderHub, writeHubFile } from "../hub.ts";
+
+describe("renderHub", () => {
+  // The verbose discovery body (Get started / Services / Admin) + its
+  // data-loading script render only for a signed-in visitor (the signed-out
+  // landing is slimmed — see the "signed-out slimming" describe block below).
+  // Assertions about that verbose body therefore run against a signed-in
+  // render; assertions about the page shell (doctype, styles, brand) hold for
+  // both and use whichever render is convenient.
+  const html = renderHub({
+    session: { displayName: "operator", csrfToken: "csrf-shell" },
+  });
+
+  test("is a self-contained HTML document with inline styles and script", () => {
+    expect(html).toStartWith("<!doctype html>");
+    expect(html).toContain("<style>");
+    expect(html).toContain("<script>");
+  });
+
+  test("inline <script> body parses as valid JS (regression: hub#366)", () => {
+    // The script lives inside HTML_TEMPLATE — a backtick template literal.
+    // Backslash escapes inside the template silently mangle regex literals:
+    // `/\/+$/` written in the source becomes `//+$/` in the served HTML,
+    // which JS parses as the start of a line comment, killing the entire
+    // IIFE. Every section that renders inside that IIFE (Get started,
+    // Services, Admin) then never paints.
+    //
+    // Content assertions don't catch this — they pass on the broken
+    // string. A parse-check via `new Function(body)` does: it parses
+    // (no execution, no DOM needed) and throws SyntaxError on the bad
+    // regex. Wrap in a try/catch so future template-escaping regressions
+    // surface here with a clear message rather than as a runtime mystery.
+    const m = html.match(/<script>([\s\S]*?)<\/script>/);
+    const scriptBody = m?.[1];
+    expect(scriptBody).toBeDefined();
+    expect(() => new Function(scriptBody as string)).not.toThrow();
+  });
+
+  test("fetches /.well-known/parachute.json for the Use section", () => {
+    expect(html).toContain("/.well-known/parachute.json");
+    expect(html).toContain("doc.services");
+  });
+
+  test("uses parachute.computer sage palette and serif/sans fonts", () => {
+    expect(html).toContain("#4a7c59");
+    expect(html).toContain("#faf8f4");
+    expect(html).toContain("Instrument Serif");
+    expect(html).toContain("DM Sans");
+  });
+
+  test("supports prefers-color-scheme dark", () => {
+    expect(html).toContain("prefers-color-scheme: dark");
+  });
+
+  test("renders the canonical brand mark + wordmark + tagline in the header", () => {
+    // The brand mark is the shared SVG from src/brand.ts, rendered with the
+    // `hub-home` clipPath id suffix to keep it namespaced from the chrome
+    // strip's own mark (which uses `chrome-1`).
+    expect(html).toContain("pc-brand-mark-clip-hub-home");
+    // Wordmark string lives in src/brand.ts as the canonical form.
+    expect(html).toContain("<h1>Parachute</h1>");
+    // Canonical tagline (picked 2026-05-25). If this fails, src/brand.ts
+    // CANONICAL_TAGLINE drifted from what the home actually renders.
+    expect(html).toContain("Truly personal computing. Your knowledge belongs with you.");
+  });
+
+  test("renders two sections: Services and Admin, each with its own heading + grid", () => {
+    expect(html).toContain('id="services-section"');
+    expect(html).toContain('id="admin-section"');
+    expect(html).toContain('id="services-grid"');
+    expect(html).toContain('id="admin-grid"');
+    expect(html).toContain("<h2>Services</h2>");
+    expect(html).toContain("<h2>Admin</h2>");
+  });
+
+  test("Services section sub-text frames the section as service-owned surfaces", () => {
+    // Services-vs-Admin axis is OWNERSHIP (services own their UIs vs
+    // hub owns host admin), not function. The sub-text reflects that —
+    // earlier "Browse, transcribe, and run" framing put it on the
+    // function axis, which broke down once you noticed services have
+    // UIs that mix use / config / admin.
+    expect(html).toContain("Surfaces provided by services");
+  });
+
+  test("Services tiles are data-driven from each service's uiUrl + displayName", () => {
+    // Phase D consumer-side: SERVICE_LABELS / SERVICE_ORDER hardcoding
+    // retired. Each well-known services[] row carries displayName + uiUrl
+    // (sourced from module.json via hub-server's loadServiceUiMetadata);
+    // tiles render directly from those.
+    expect(html).toContain("svc.uiUrl");
+    expect(html).toContain("svc.displayName");
+    // No more hardcoded short→label map.
+    expect(html).not.toContain("'Notes', desc:");
+    expect(html).not.toContain("['notes', 'scribe', 'agent']");
+  });
+
+  test("Services skip rule emerges from data, not name-checks (any service without uiUrl skipped)", () => {
+    // The previous `isVaultName` hardcoded skip is gone — vault now
+    // declares uiUrl per workstream C (patterns#96), so it renders too;
+    // API-only modules (current or future) without uiUrl get omitted
+    // for free under the same data-driven rule.
+    expect(html).toContain("if (!svc || !svc.uiUrl) continue;");
+    // The function definition is gone (the comment may still mention the
+    // name as historical context — we only care about the active code).
+    expect(html).not.toContain("function isVaultName");
+  });
+
+  test("Services tiles sort alphabetically by displayName", () => {
+    // Per the module-json-extensibility pattern doc — default ordering
+    // until a `displayOrder` field surfaces. localeCompare keeps the
+    // ordering stable across locales for ASCII labels.
+    expect(html).toContain("a.title.localeCompare(b.title)");
+  });
+
+  test("Admin section is hardcoded (always visible) with three entries", () => {
+    expect(html).toContain("ADMIN_ENTRIES");
+    expect(html).toContain("/admin/vaults");
+    expect(html).toContain("/admin/permissions");
+    expect(html).toContain("/admin/tokens");
+  });
+
+  test("Admin section renders synchronously (does not depend on the well-known fetch)", () => {
+    // Even if the fetch is slow or fails, the operator should see Admin
+    // surfaces — they may be the reason the operator landed on /.
+    expect(html).toContain("renderAdmin();");
+    expect(html).toContain("Admin section is static");
+  });
+
+  test("Services section empty state guides operators to declare uiUrl", () => {
+    // Empty state under Phase D means "no installed service has declared
+    // uiUrl yet" — different shape from pre-D ("none installed at all").
+    // Hint points at the pattern doc since the fix is in module.json,
+    // not at install time.
+    expect(html).toContain("No services with a UI declared yet");
+    expect(html).toContain("module-json-extensibility");
+  });
+
+  test("Use section error state surfaces the underlying message", () => {
+    expect(html).toContain("Could not load services");
+  });
+
+  test("discovery page fetches with cache: 'no-store' (hub#268 Item 1)", () => {
+    // Without `cache: 'no-store'` the browser's HTTP cache can return
+    // a stale services list when the operator clicks back to / after
+    // installing a module via /admin/modules. Server-side also sets
+    // cache-control: no-store on the well-known doc.
+    expect(html).toContain("cache: 'no-store'");
+  });
+
+  test("discovery page re-fetches on bfcache restore via pageshow (hub#268 Item 1)", () => {
+    // When the operator clicks back from /admin/modules to / the
+    // browser may restore the prior DOM without re-running the IIFE.
+    // The pageshow handler re-runs loadServices() when the page was
+    // restored from cache (`e.persisted === true`).
+    expect(html).toContain("addEventListener('pageshow'");
+    expect(html).toContain("e.persisted");
+  });
+
+  test("does not retain the old aggregate-by-module-type code", () => {
+    // The Vault collapse + per-module aggregation pattern is gone — Use
+    // entries are direct service-path → label lookups; Admin is hardcoded.
+    expect(html).not.toContain("aggregate(services, vaults)");
+    expect(html).not.toContain("MODULE_LABELS");
+    expect(html).not.toContain("renderConfigField");
+    expect(html).not.toContain("kind-badge");
+  });
+
+  test("default render (no session) emits the 'Sign in' affordance", () => {
+    const out = renderHub();
+    expect(out).toContain('class="auth-indicator"');
+    expect(out).toContain("Sign in");
+    expect(out).toContain('href="/login?next=/"');
+    // No POST form, no CSRF input — those only appear when signed in.
+    expect(out).not.toContain('action="/logout"');
+    expect(out).not.toContain("__csrf");
+  });
+});
+
+describe("renderHub — signed-out slimming (operator feedback)", () => {
+  // A signed-out visitor should see a clean, minimal landing: brand +
+  // tagline (in the header) + a single clear "Sign in" call. The hub's
+  // internal detail — the service catalog, vault listings, admin surfaces,
+  // and the well-known-driven loading script — must NOT render until the
+  // visitor authenticates. The signed-in render is unchanged.
+  const signedOut = renderHub();
+  const signedIn = renderHub({
+    session: { displayName: "operator", csrfToken: "csrf-xyz" },
+  });
+
+  test("signed-out: brand wordmark + tagline still render (the slim landing keeps the brand)", () => {
+    expect(signedOut).toContain("<h1>Parachute</h1>");
+    expect(signedOut).toContain("Truly personal computing. Your knowledge belongs with you.");
+  });
+
+  test("signed-out: a clear 'Sign in' call is the primary affordance", () => {
+    expect(signedOut).toContain('data-testid="signed-out-signin"');
+    expect(signedOut).toContain('href="/login?next=/"');
+    expect(signedOut).toContain("Sign in");
+  });
+
+  test("signed-out: the verbose Services / Admin / Get started sections are absent", () => {
+    expect(signedOut).not.toContain('id="services-section"');
+    expect(signedOut).not.toContain('id="admin-section"');
+    expect(signedOut).not.toContain('id="get-started-section"');
+    expect(signedOut).not.toContain("<h2>Services</h2>");
+    expect(signedOut).not.toContain("<h2>Admin</h2>");
+    // Admin links / token surface must not be exposed pre-auth.
+    expect(signedOut).not.toContain("/admin/vaults");
+    expect(signedOut).not.toContain("/admin/tokens");
+  });
+
+  test("signed-out: the well-known service-catalog loading script is not emitted", () => {
+    // No data-driven discovery body to populate when signed out → no script.
+    // (The brand mark is an inline SVG, not a <script>; assert on the IIFE's
+    // load function rather than a blanket "no <script>".) The footer's
+    // public "discovery" anchor → /.well-known/parachute.json stays — it's a
+    // plain link, not the catalog-fetching script — so assert on the fetch
+    // call + the loader function, not the URL string.
+    expect(signedOut).not.toContain("loadServices");
+    expect(signedOut).not.toContain("renderServices");
+    expect(signedOut).not.toContain("fetch('/.well-known/parachute.json'");
+    expect(signedOut).not.toContain("<script>");
+  });
+
+  test("signed-in: the verbose sections + loading script DO render (signed-in view unchanged)", () => {
+    expect(signedIn).toContain('id="services-section"');
+    expect(signedIn).toContain('id="admin-section"');
+    expect(signedIn).toContain('id="get-started-section"');
+    expect(signedIn).toContain("/admin/vaults");
+    expect(signedIn).toContain("/.well-known/parachute.json");
+    expect(signedIn).toContain("loadServices");
+    // And the signed-out lede / standalone Sign-in CTA is gone (the
+    // auth-indicator carries sign-out instead).
+    expect(signedIn).not.toContain('data-testid="signed-out-signin"');
+  });
+});
+
+describe("renderHub — Get started tiles are uis[]-driven (W2-12)", () => {
+  // The tile logic runs client-side inside the discovery IIFE; these pins
+  // assert the emitted script's SHAPE (the JS-parses check above guards its
+  // validity). The section is uis[]-driven — one tile per active uis[]
+  // sub-unit, whichever mount identity (/surface/notes or
+  // /surface/parachute) an install serves — with the pre-W2-12 hardcoded
+  // "Open Notes" tile demoted to a fallback for surface-host rows that
+  // predate uis{} self-registration.
+  const html = renderHub({
+    session: { displayName: "operator", csrfToken: "csrf-w212" },
+  });
+
+  test("the discovery script iterates uis[] sub-units", () => {
+    expect(html).toContain("svc.uis");
+    // Inactive sub-units are skipped; absent status counts as active.
+    expect(html).toContain("ui.status");
+  });
+
+  test("the legacy 'Open Notes' hardcode survives only as the no-uis fallback", () => {
+    // Still present (pre-uis surface-host installs keep their CTA) …
+    expect(html).toContain("Open Notes");
+    expect(html).toContain("'/surface/notes/'");
+    // … but no longer keyed on the bare presence of parachute-surface as
+    // the PRIMARY path: the uis[] loop renders first, the hasSurface check
+    // only backstops an empty tile list.
+    expect(html).toContain("Legacy fallback");
+  });
+});
+
+describe("renderHub — signed-in indicator (rc.13)", () => {
+  test("session user → 'Signed in as <name>' + inline POST form with CSRF", () => {
+    const html = renderHub({
+      session: { displayName: "aaron", csrfToken: "csrf-token-xyz" },
+    });
+    expect(html).toContain('class="auth-indicator"');
+    expect(html).toContain("Signed in as");
+    expect(html).toContain("aaron");
+    // Inline POST form for sign-out — CSRF token embedded as the
+    // existing `__csrf` field name (matches /logout's expectations).
+    expect(html).toContain('method="POST" action="/logout"');
+    expect(html).toContain('name="__csrf"');
+    expect(html).toContain('value="csrf-token-xyz"');
+    expect(html).toContain("Sign out");
+    // No "Sign in" affordance when signed in.
+    expect(html).not.toContain('href="/login?next=/"');
+  });
+
+  test("signed-in indicator carries an Account breadcrumb to /account/", () => {
+    // Onboarding discoverability: a signed-in friend needs a single link
+    // to the self-service /account/ home (change password, their vault).
+    // Applies to admins too — harmless for them.
+    const html = renderHub({
+      session: { displayName: "aaron", csrfToken: "csrf-token-xyz" },
+    });
+    expect(html).toContain('href="/account/"');
+    expect(html).toContain("Account");
+  });
+
+  test("displayName with HTML special chars is escaped", () => {
+    // Username field allows alphanumerics historically, but the
+    // displayName field on the wire is forward-compatible with profile
+    // names that may contain &, <, >. Escape at render time.
+    const html = renderHub({
+      session: { displayName: "<aaron>&friends", csrfToken: "tok" },
+    });
+    expect(html).toContain("&lt;aaron&gt;&amp;friends");
+    expect(html).not.toContain("<aaron>&friends");
+  });
+
+  test("CSRF token with HTML special chars is escaped in the value attribute", () => {
+    const html = renderHub({
+      session: { displayName: "aaron", csrfToken: 'token"with"quotes' },
+    });
+    expect(html).toContain('value="token&quot;with&quot;quotes"');
+  });
+});
+
+describe("writeHubFile", () => {
+  test("writes the rendered HTML to the given path, creating parent dirs", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pcli-hub-"));
+    try {
+      const path = join(dir, "well-known", "hub.html");
+      const written = writeHubFile(path);
+      expect(written).toBe(path);
+      expect(existsSync(path)).toBe(true);
+      const content = readFileSync(path, "utf8");
+      expect(content).toBe(renderHub());
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // hub#171: serve regenerates hub.html on EVERY start (the `!existsSync`
+  // guard in commands/serve.ts was dropped), so writeHubFile must be safe to
+  // call when the file already exists and must overwrite stale content with
+  // a fresh render from current code — otherwise an upgrade serves the old
+  // page until an unrelated `parachute expose` re-runs.
+  test("overwrites a pre-existing stale hub.html with a fresh render (hub#171)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pcli-hub-"));
+    try {
+      const path = join(dir, "well-known", "hub.html");
+      // First write creates the well-known dir + a real file; then plant
+      // stale content to simulate an old hub.html left over from a prior code
+      // version after `git pull` + `parachute restart hub`.
+      writeHubFile(path);
+      writeFileSync(path, "<!-- stale pre-upgrade hub.html -->");
+      expect(readFileSync(path, "utf8")).toContain("stale");
+
+      const written = writeHubFile(path);
+      expect(written).toBe(path);
+      const content = readFileSync(path, "utf8");
+      expect(content).not.toContain("stale");
+      expect(content).toBe(renderHub());
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

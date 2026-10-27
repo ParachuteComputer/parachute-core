@@ -1,0 +1,231 @@
+import { describe, it, expect } from "bun:test";
+import { Database } from "bun:sqlite";
+import { handleViewNote } from "./routes.ts";
+import { SqliteStore } from "../core/src/store.ts";
+
+// Redirect URL builder — mirrors the logic in server.ts
+function buildRedirectUrl(reqUrl: string, noteId: string, prefix = ""): string {
+  const dest = new URL(`${prefix}/view/${noteId}`, reqUrl);
+  dest.search = new URL(reqUrl).search;
+  return dest.toString();
+}
+
+describe("/public → /view redirect", () => {
+  it("preserves query params including ?key=", () => {
+    const url = buildRedirectUrl("http://localhost:1940/public/abc?key=pvk_secret", "abc");
+    expect(url).toBe("http://localhost:1940/view/abc?key=pvk_secret");
+  });
+
+  it("works without query params", () => {
+    const url = buildRedirectUrl("http://localhost:1940/public/abc", "abc");
+    expect(url).toBe("http://localhost:1940/view/abc");
+  });
+
+  it("preserves multiple query params", () => {
+    const url = buildRedirectUrl("http://localhost:1940/public/abc?key=pvk_x&format=html", "abc");
+    expect(url).toBe("http://localhost:1940/view/abc?key=pvk_x&format=html");
+  });
+
+  it("works for vault-scoped paths", () => {
+    const url = buildRedirectUrl("http://localhost:1940/vault/work/public/abc?key=pvk_x", "abc", "/vault/work");
+    expect(url).toBe("http://localhost:1940/vault/work/view/abc?key=pvk_x");
+  });
+});
+
+// Minimal Store stub — only getNote is needed
+function makeStore(notes: Record<string, { content: string; tags?: string[]; metadata?: Record<string, unknown>; path?: string }>) {
+  return {
+    getNote(id: string) {
+      const n = notes[id];
+      if (!n) return null;
+      return {
+        id,
+        content: n.content,
+        tags: n.tags ?? [],
+        metadata: n.metadata ?? {},
+        path: n.path,
+        createdAt: "2025-01-01T00:00:00Z",
+        updatedAt: "2025-01-01T00:00:00Z",
+      };
+    },
+    getNoteByPath(path: string) {
+      for (const [id, n] of Object.entries(notes)) {
+        if (n.path?.toLowerCase() === path.toLowerCase()) {
+          return this.getNote(id);
+        }
+      }
+      return null;
+    },
+  } as any;
+}
+
+describe("handleViewNote", async () => {
+  it("returns 404 for non-existent note", async () => {
+    const store = makeStore({});
+    const resp = await handleViewNote(store, "missing");
+    expect(resp.status).toBe(404);
+  });
+
+  it("returns 404 for note without publish tag (unauthenticated)", async () => {
+    const store = makeStore({
+      "n1": { content: "hello", tags: ["other"] },
+    });
+    const resp = await handleViewNote(store, "n1");
+    expect(resp.status).toBe(404);
+  });
+
+  it("serves note with publish tag as HTML", async () => {
+    const store = makeStore({
+      "n1": { content: "# Hello\n\nWorld", tags: ["publish"], path: "Blog/My Post.md" },
+    });
+    const resp = await handleViewNote(store, "n1");
+    expect(resp.status).toBe(200);
+    expect(resp.headers.get("Content-Type")).toBe("text/html; charset=utf-8");
+
+    const html = await resp.text();
+    expect(html).toContain("<title>My Post</title>");
+    expect(html).toContain("<h1>Hello</h1>");
+    expect(html).toContain("<p>World</p>");
+  });
+
+  it("serves note with metadata.published=true", async () => {
+    const store = makeStore({
+      "n2": { content: "Content here", metadata: { published: true } },
+    });
+    const resp = await handleViewNote(store, "n2");
+    expect(resp.status).toBe(200);
+    const html = await resp.text();
+    expect(html).toContain("<p>Content here</p>");
+  });
+
+  it("renders markdown features correctly", async () => {
+    const store = makeStore({
+      "n3": {
+        content: "**bold** and *italic* and `code`\n\n- item 1\n- item 2\n\n```\ncode block\n```\n\n[link](https://example.com)",
+        tags: ["publish"],
+      },
+    });
+    const resp = await handleViewNote(store, "n3");
+    const html = await resp.text();
+    expect(html).toContain("<strong>bold</strong>");
+    expect(html).toContain("<em>italic</em>");
+    expect(html).toContain("<li>item 1</li>");
+    expect(html).toContain("<li>item 2</li>");
+    expect(html).toContain("<pre><code>");
+    expect(html).toContain('href="https://example.com"');
+  });
+
+  it("escapes HTML in note content", async () => {
+    const store = makeStore({
+      "n4": { content: "<script>alert('xss')</script>", tags: ["publish"] },
+    });
+    const resp = await handleViewNote(store, "n4");
+    const html = await resp.text();
+    expect(html).not.toContain("<script>");
+    expect(html).toContain("&lt;script&gt;");
+  });
+
+  it("strips javascript: URI links to prevent XSS", async () => {
+    const store = makeStore({
+      "n6": { content: "[click me](javascript:alert(1))", tags: ["publish"] },
+    });
+    const resp = await handleViewNote(store, "n6");
+    const html = await resp.text();
+    expect(html).not.toContain("javascript:");
+    expect(html).toContain("click me");
+    expect(html).not.toContain("<a ");
+  });
+
+  it("strips data: URI links to prevent XSS", async () => {
+    const store = makeStore({
+      "n7": { content: "[click](data:text/html;base64,PHNjcmlwdD4=)", tags: ["publish"] },
+    });
+    const resp = await handleViewNote(store, "n7");
+    const html = await resp.text();
+    expect(html).not.toContain("data:");
+    expect(html).toContain("click");
+  });
+
+  it("allows safe http/https/mailto links", async () => {
+    const store = makeStore({
+      "n8": { content: "[site](https://example.com) and [mail](mailto:a@b.com)", tags: ["publish"] },
+    });
+    const resp = await handleViewNote(store, "n8");
+    const html = await resp.text();
+    expect(html).toContain('href="https://example.com"');
+    expect(html).toContain('href="mailto:a@b.com"');
+  });
+
+  it("supports dark mode via media query", async () => {
+    const store = makeStore({
+      "n5": { content: "test", tags: ["publish"] },
+    });
+    const resp = await handleViewNote(store, "n5");
+    const html = await resp.text();
+    expect(html).toContain("prefers-color-scheme: dark");
+  });
+
+  // CSP header
+  it("includes Content-Security-Policy header", async () => {
+    const store = makeStore({
+      "n1": { content: "test", tags: ["publish"] },
+    });
+    const resp = await handleViewNote(store, "n1");
+    const csp = resp.headers.get("Content-Security-Policy");
+    expect(csp).toContain("script-src 'none'");
+    expect(csp).toContain("default-src 'self'");
+  });
+
+  // Auth-aware behavior
+  it("serves any note when authenticated", async () => {
+    const store = makeStore({
+      "private": { content: "secret stuff", tags: ["internal"] },
+    });
+    const resp = await handleViewNote(store, "private", { authenticated: true });
+    expect(resp.status).toBe(200);
+    const html = await resp.text();
+    expect(html).toContain("<p>secret stuff</p>");
+  });
+
+  it("returns 404 for unpublished note when not authenticated", async () => {
+    const store = makeStore({
+      "private": { content: "secret stuff", tags: ["internal"] },
+    });
+    const resp = await handleViewNote(store, "private");
+    expect(resp.status).toBe(404);
+  });
+
+  // Custom published tag
+  it("uses custom published_tag from config", async () => {
+    const store = makeStore({
+      "n1": { content: "public content", tags: ["public"] },
+    });
+    const resp = await handleViewNote(store, "n1", { publishedTag: "public" });
+    expect(resp.status).toBe(200);
+    const html = await resp.text();
+    expect(html).toContain("<p>public content</p>");
+  });
+
+  it("rejects note with default tag when custom tag is configured", async () => {
+    const store = makeStore({
+      "n1": { content: "content", tags: ["publish"] },
+    });
+    const resp = await handleViewNote(store, "n1", { publishedTag: "public" });
+    expect(resp.status).toBe(404);
+  });
+
+  it("returns 409 ambiguous_path when bare path resolves to multiple notes (vault#331 N1)", async () => {
+    // Real SqliteStore so the v18 composite (path, extension) uniqueness
+    // index lets two notes coexist at the same path with different
+    // extensions — the scenario AmbiguousPathError is built for.
+    const store = new SqliteStore(new Database(":memory:"));
+    await store.createNote("# md", { id: "vn-md", path: "Foo", tags: ["publish"] });
+    await store.createNote("a,b\n1,2", { id: "vn-csv", path: "Foo", extension: "csv", tags: ["publish"] });
+    const resp = await handleViewNote(store, "Foo", { authenticated: true });
+    expect(resp.status).toBe(409);
+    const body = await resp.json() as any;
+    expect(body.error_type).toBe("ambiguous_path");
+    expect(body.path).toBe("Foo");
+    expect(body.candidates).toHaveLength(2);
+  });
+});

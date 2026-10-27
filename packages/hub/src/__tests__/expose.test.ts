@@ -1,0 +1,1707 @@
+import { describe, expect, test } from "bun:test";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { ExposeSupervisorOpts } from "../commands/expose-supervisor.ts";
+import { exposePublic, exposeTailnet } from "../commands/expose.ts";
+import { readEnvFileValues } from "../env-file.ts";
+import { readExposeState, writeExposeState } from "../expose-state.ts";
+import type { EnsureHubUnitOpts } from "../hub-unit.ts";
+import { type ModuleOp, ModuleOpHttpError } from "../module-ops-client.ts";
+import { upsertService } from "../services-manifest.ts";
+import type { Runner } from "../tailscale/run.ts";
+
+interface Harness {
+  dir: string;
+  manifestPath: string;
+  statePath: string;
+  wellKnownPath: string;
+  hubPath: string;
+  wellKnownDir: string;
+  configDir: string;
+  cleanup: () => void;
+}
+
+function makeHarness(): Harness {
+  const dir = mkdtempSync(join(tmpdir(), "pcli-expose-"));
+  return {
+    dir,
+    manifestPath: join(dir, "services.json"),
+    statePath: join(dir, "expose-state.json"),
+    wellKnownPath: join(dir, "well-known", "parachute.json"),
+    hubPath: join(dir, "well-known", "hub.html"),
+    wellKnownDir: join(dir, "well-known"),
+    configDir: dir,
+    cleanup: () => rmSync(dir, { recursive: true, force: true }),
+  };
+}
+
+function makeRunner(): { runner: Runner; calls: string[][] } {
+  const calls: string[][] = [];
+  const runner: Runner = async (cmd) => {
+    calls.push([...cmd]);
+    if (cmd[0] === "tailscale" && cmd[1] === "version") {
+      return { code: 0, stdout: "1.96.4\n", stderr: "" };
+    }
+    if (cmd[0] === "tailscale" && cmd[1] === "status" && cmd[2] === "--json") {
+      return {
+        code: 0,
+        stdout: JSON.stringify({ Self: { DNSName: "parachute.taildf9ce2.ts.net." } }),
+        stderr: "",
+      };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  return { runner, calls };
+}
+
+/**
+ * A minimal expose `supervisor` seam that forces the unit-installed arm with a
+ * benign `ensureHubUnit → already-up` + no-op `driveModuleOp` / self-heal. Most
+ * expose tests just need the hub-bringup to succeed so they can assert the
+ * tailscale plan / expose-state / well-known behavior; this stub provides that
+ * without a real launchd/systemd or hub. (Phase 5b retired the detached hub
+ * spawner that the old `makeHubSpawner` / `hubEnsureOpts` stubs simulated.)
+ */
+function supervisorUp(): ExposeSupervisorOpts {
+  return makeExposeSupervisorStub().opts;
+}
+
+function seedServices(path: string): void {
+  upsertService(
+    {
+      name: "parachute-vault",
+      port: 1940,
+      paths: ["/vault/default"],
+      health: "/vault/default/health",
+      version: "0.2.4",
+    },
+    path,
+  );
+  upsertService(
+    {
+      name: "parachute-notes",
+      port: 5173,
+      paths: ["/notes"],
+      health: "/notes/health",
+      version: "0.0.1",
+    },
+    path,
+  );
+}
+
+/** Default probe for tests: every service is up (nobody wants dead-service warnings polluting unrelated assertions). */
+const allServicesUp = async () => true;
+
+describe("expose tailnet up", () => {
+  test("emits exactly one catchall mount: / → http://127.0.0.1:<hubPort>/", async () => {
+    // Single-rule symmetry with cloudflare ingress (#178). Hub does all
+    // internal dispatch (UI, OAuth, well-known, vault SPA + per-vault proxy,
+    // generic /<svc>/* services dispatch) so the tailscale plan stays at
+    // one mount regardless of how many services are installed.
+    const h = makeHarness();
+    try {
+      seedServices(h.manifestPath);
+      const { runner, calls } = makeRunner();
+      const logs: string[] = [];
+      const code = await exposeTailnet("up", {
+        runner,
+        manifestPath: h.manifestPath,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        configDir: h.configDir,
+        supervisor: supervisorUp(),
+        servicePortProbe: allServicesUp,
+        log: (l) => logs.push(l),
+      });
+      expect(code).toBe(0);
+
+      const serveCalls = calls.filter(
+        (c) => c[0] === "tailscale" && c[1] === "serve" && c.includes("--bg"),
+      );
+      // Exactly one bringup: `/ → http://127.0.0.1:<hubPort>/`.
+      expect(serveCalls).toHaveLength(1);
+      // Tailnet mode never uses funnel — neither the old flag nor the new subcommand.
+      expect(serveCalls.every((c) => !c.includes("--funnel"))).toBe(true);
+      expect(calls.every((c) => c[1] !== "funnel")).toBe(true);
+
+      const mounts = serveCalls.map((c) => c.find((a) => a.startsWith("--set-path=")));
+      expect(mounts).toEqual(["--set-path=/"]);
+
+      // Hub catchall target is the hub loopback root with trailing slash so
+      // tailscale's strip-then-forward is a no-op (mount and target match
+      // byte-for-byte).
+      const hubCall = serveCalls[0] ?? [];
+      expect(hubCall[hubCall.length - 1]).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/$/);
+
+      expect(existsSync(h.wellKnownPath)).toBe(true);
+      expect(existsSync(h.hubPath)).toBe(true);
+      const wk = JSON.parse(await Bun.file(h.wellKnownPath).text());
+      expect(wk.vaults).toHaveLength(1);
+
+      const state = readExposeState(h.statePath);
+      expect(state?.layer).toBe("tailnet");
+      expect(state?.mode).toBe("path");
+      expect(state?.entries).toHaveLength(1);
+      expect(state?.entries[0]?.mount).toBe("/");
+      expect(state?.entries[0]?.kind).toBe("proxy");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("ensures the hub UNIT (not a detached spawn) before exposing", async () => {
+    // Phase 5b: "ensure the hub" = ensure the hub UNIT is up (§4.3a). The old
+    // detached `bun hub-server.ts --port …` spawn is retired — its bringup is now
+    // init's `installAndStartHubUnit` (asserted in init.test.ts / hub-unit.test.ts).
+    // Here we just confirm expose drives the unit-ensure seam, then proceeds.
+    const h = makeHarness();
+    try {
+      seedServices(h.manifestPath);
+      const { runner } = makeRunner();
+      const sup = makeExposeSupervisorStub();
+      const logs: string[] = [];
+      const code = await exposeTailnet("up", {
+        runner,
+        manifestPath: h.manifestPath,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        configDir: h.configDir,
+        supervisor: sup.opts,
+        servicePortProbe: allServicesUp,
+        log: (l) => logs.push(l),
+      });
+      expect(code).toBe(0);
+      expect(sup.ensureCalls).toHaveLength(1);
+      expect(logs.join("\n")).toMatch(/hub unit up/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("hub catchall target ends in `/` so tailscale strip-then-forward is a no-op", async () => {
+    // Aaron hit ERR_TOO_MANY_REDIRECTS on /notes/ pre-collapse because
+    // tailscale strips the prefix and Vite (base=/notes) redirects back to
+    // /notes/. Mount and target byte-equal breaks that loop. Now that there's
+    // one catchall, the same rule applies to the hub root: `/ → http://…/`.
+    const h = makeHarness();
+    try {
+      upsertService(
+        {
+          name: "parachute-notes",
+          port: 5173,
+          paths: ["/notes/"],
+          health: "/notes/health",
+          version: "0.0.1",
+        },
+        h.manifestPath,
+      );
+      const { runner, calls } = makeRunner();
+      const code = await exposeTailnet("up", {
+        runner,
+        manifestPath: h.manifestPath,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        configDir: h.configDir,
+        supervisor: supervisorUp(),
+        servicePortProbe: allServicesUp,
+        log: () => {},
+      });
+      expect(code).toBe(0);
+      const serveCalls = calls.filter(
+        (c) => c[0] === "tailscale" && c[1] === "serve" && c.includes("--bg"),
+      );
+      expect(serveCalls).toHaveLength(1);
+      const call = serveCalls[0] ?? [];
+      expect(call).toContain("--set-path=/");
+      expect(call[call.length - 1]).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/$/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("legacy paths:[/] entry warns operator (no rewrite — hub dispatches per request)", async () => {
+    // Pre-collapse this remapped to /<shortname>; now the hub does dispatch
+    // per services.json, so a paths:["/"] entry would still collide with the
+    // hub UI but the failure surface is hub-side, not tailscale-plan-side.
+    // Keep the warn so operators know to re-install.
+    const h = makeHarness();
+    try {
+      upsertService(
+        { name: "parachute-vault", port: 1940, paths: ["/"], health: "/health", version: "0.2.4" },
+        h.manifestPath,
+      );
+      const { runner, calls } = makeRunner();
+      const logs: string[] = [];
+      const code = await exposeTailnet("up", {
+        runner,
+        manifestPath: h.manifestPath,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        configDir: h.configDir,
+        supervisor: supervisorUp(),
+        servicePortProbe: allServicesUp,
+        log: (l) => logs.push(l),
+      });
+      expect(code).toBe(0);
+
+      // Plan is still exactly one catchall regardless of the legacy entry.
+      const serveCalls = calls.filter(
+        (c) => c[0] === "tailscale" && c[1] === "serve" && c.includes("--bg"),
+      );
+      expect(serveCalls).toHaveLength(1);
+      expect(serveCalls[0]).toContain("--set-path=/");
+
+      expect(logs.join("\n")).toMatch(/parachute-vault claims "\/"; hub page lives there/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("empty manifest exits 1 with hint", async () => {
+    const h = makeHarness();
+    try {
+      const { runner } = makeRunner();
+      const logs: string[] = [];
+      const code = await exposeTailnet("up", {
+        runner,
+        manifestPath: h.manifestPath,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        configDir: h.configDir,
+        supervisor: supervisorUp(),
+        servicePortProbe: allServicesUp,
+        log: (l) => logs.push(l),
+      });
+      expect(code).toBe(1);
+      expect(logs.join("\n")).toMatch(/No services installed/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("missing tailscale exits 1 with install hint", async () => {
+    const h = makeHarness();
+    try {
+      seedServices(h.manifestPath);
+      const runner: Runner = async () => {
+        throw new Error("spawn tailscale ENOENT");
+      };
+      const logs: string[] = [];
+      const code = await exposeTailnet("up", {
+        runner,
+        manifestPath: h.manifestPath,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        configDir: h.configDir,
+        supervisor: supervisorUp(),
+        servicePortProbe: allServicesUp,
+        log: (l) => logs.push(l),
+      });
+      expect(code).toBe(1);
+      expect(logs.join("\n")).toMatch(/tailscale is not installed/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("idempotent re-run: tears down prior state first", async () => {
+    const h = makeHarness();
+    try {
+      seedServices(h.manifestPath);
+      writeExposeState(
+        {
+          version: 1,
+          layer: "tailnet",
+          mode: "path",
+          canonicalFqdn: "parachute.taildf9ce2.ts.net",
+          port: 443,
+          funnel: false,
+          entries: [
+            {
+              kind: "proxy",
+              mount: "/old-service",
+              target: "http://127.0.0.1:9999",
+              service: "parachute-old",
+            },
+          ],
+        },
+        h.statePath,
+      );
+      const { runner, calls } = makeRunner();
+      const code = await exposeTailnet("up", {
+        runner,
+        manifestPath: h.manifestPath,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        configDir: h.configDir,
+        supervisor: supervisorUp(),
+        servicePortProbe: allServicesUp,
+        log: () => {},
+      });
+      expect(code).toBe(0);
+      const offs = calls.filter((c) => c[c.length - 1] === "off");
+      expect(offs).toHaveLength(1);
+      expect(offs[0]).toContain("--set-path=/old-service");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("warns (but still exposes) when a service port isn't responding", async () => {
+    // Aaron hit this: vault was quietly stopped, `parachute expose tailnet`
+    // happily proxied /vault/default to a dead port, every request 502'd.
+    // Now we probe and warn — but don't fail, so users can stand up layers
+    // before starting services if they want.
+    const h = makeHarness();
+    try {
+      seedServices(h.manifestPath);
+      const { runner, calls } = makeRunner();
+      const logs: string[] = [];
+      const code = await exposeTailnet("up", {
+        runner,
+        manifestPath: h.manifestPath,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        configDir: h.configDir,
+        supervisor: supervisorUp(),
+        // vault is up; notes is down.
+        servicePortProbe: async (port) => port === 1940,
+        log: (l) => logs.push(l),
+      });
+      expect(code).toBe(0);
+      const joined = logs.join("\n");
+      expect(joined).toMatch(/parachute-notes \(port 5173\) is not responding/);
+      expect(joined).toMatch(/parachute start notes/);
+      expect(joined).not.toMatch(/parachute-vault.*not responding/);
+      // Bringup still happened — single hub catchall regardless of which
+      // services responded to the probe.
+      const serveCalls = calls.filter(
+        (c) => c[0] === "tailscale" && c[1] === "serve" && c.includes("--bg"),
+      );
+      expect(serveCalls).toHaveLength(1);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("bringup failure propagates exit code", async () => {
+    const h = makeHarness();
+    try {
+      seedServices(h.manifestPath);
+      const runner: Runner = async (cmd) => {
+        if (cmd[1] === "version") return { code: 0, stdout: "", stderr: "" };
+        if (cmd[1] === "status") {
+          return {
+            code: 0,
+            stdout: JSON.stringify({ Self: { DNSName: "parachute.taildf9ce2.ts.net." } }),
+            stderr: "",
+          };
+        }
+        if (cmd[1] === "serve" && cmd.includes("--bg")) {
+          return { code: 2, stdout: "", stderr: "port 443 already in use" };
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      };
+      const logs: string[] = [];
+      const code = await exposeTailnet("up", {
+        runner,
+        manifestPath: h.manifestPath,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        configDir: h.configDir,
+        supervisor: supervisorUp(),
+        servicePortProbe: allServicesUp,
+        log: (l) => logs.push(l),
+      });
+      expect(code).toBe(2);
+      expect(logs.join("\n")).toMatch(/Bringup failed/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("hub catchall serves OAuth + well-known internally — no separate mount per endpoint", async () => {
+    // OAuth (hub IS the IdP) and well-known (parachute.json + JWKS +
+    // oauth-authorization-server metadata) are dispatched by the hub from
+    // the single catchall. State + bringup carry exactly one entry.
+    const h = makeHarness();
+    try {
+      seedServices(h.manifestPath);
+      const { runner, calls } = makeRunner();
+      const code = await exposeTailnet("up", {
+        runner,
+        manifestPath: h.manifestPath,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        configDir: h.configDir,
+        supervisor: supervisorUp(),
+        servicePortProbe: allServicesUp,
+        log: () => {},
+      });
+      expect(code).toBe(0);
+
+      const serveCalls = calls.filter(
+        (c) => c[0] === "tailscale" && c[1] === "serve" && c.includes("--bg"),
+      );
+      // Single catchall — no per-endpoint OAuth or well-known mounts.
+      expect(serveCalls).toHaveLength(1);
+      const mounts = serveCalls.map((c) => c.find((a) => a.startsWith("--set-path=")));
+      expect(mounts).toEqual(["--set-path=/"]);
+
+      const state = readExposeState(h.statePath);
+      expect(state?.hubOrigin).toBe("https://parachute.taildf9ce2.ts.net");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("plan is one catchall regardless of which services are installed", async () => {
+    // Pre-collapse this varied: with vault installed we got more mounts than
+    // without. Now the count is constant — the hub dispatches from
+    // services.json per request, so the tailscale plan doesn't enumerate.
+    const h = makeHarness();
+    try {
+      upsertService(
+        {
+          name: "parachute-notes",
+          port: 5173,
+          paths: ["/notes"],
+          health: "/notes/health",
+          version: "0.0.1",
+        },
+        h.manifestPath,
+      );
+      const { runner, calls } = makeRunner();
+      const code = await exposeTailnet("up", {
+        runner,
+        manifestPath: h.manifestPath,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        configDir: h.configDir,
+        supervisor: supervisorUp(),
+        servicePortProbe: allServicesUp,
+        log: () => {},
+      });
+      expect(code).toBe(0);
+
+      const serveCalls = calls.filter(
+        (c) => c[0] === "tailscale" && c[1] === "serve" && c.includes("--bg"),
+      );
+      expect(serveCalls).toHaveLength(1);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("--hub-origin override wins over derived origin and lands in state", async () => {
+    const h = makeHarness();
+    try {
+      seedServices(h.manifestPath);
+      const { runner } = makeRunner();
+      const code = await exposeTailnet("up", {
+        runner,
+        manifestPath: h.manifestPath,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        configDir: h.configDir,
+        supervisor: supervisorUp(),
+        servicePortProbe: allServicesUp,
+        hubOrigin: "https://hub.example.com/",
+        log: () => {},
+      });
+      expect(code).toBe(0);
+      const state = readExposeState(h.statePath);
+      // Trailing slash stripped by deriveHubOrigin.
+      expect(state?.hubOrigin).toBe("https://hub.example.com");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  // 2FA warning is public-layer only (#186). Tailnet ingress is
+  // tailscale-authed at the proxy, so /admin/login isn't on the open
+  // internet — the warning is moot here even when 2FA is unset.
+  test("tailnet bringup does NOT fire the 2FA warning even when not enrolled", async () => {
+    const h = makeHarness();
+    try {
+      seedServices(h.manifestPath);
+      const { runner } = makeRunner();
+      const logs: string[] = [];
+      const code = await exposeTailnet("up", {
+        runner,
+        manifestPath: h.manifestPath,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        configDir: h.configDir,
+        supervisor: supervisorUp(),
+        servicePortProbe: allServicesUp,
+        log: (l) => logs.push(l),
+        vaultAuthStatus: {
+          hasOwnerPassword: false,
+          hasTotp: false,
+          tokenCount: 0,
+          vaultNames: [],
+        },
+      });
+      expect(code).toBe(0);
+      expect(logs.join("\n")).not.toContain(
+        "Strongly recommended: turn on two-factor authentication",
+      );
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe("expose tailnet off", () => {
+  test("no-op when no prior state", async () => {
+    const h = makeHarness();
+    try {
+      const { runner, calls } = makeRunner();
+      const logs: string[] = [];
+      const code = await exposeTailnet("off", {
+        runner,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        configDir: h.configDir,
+        log: (l) => logs.push(l),
+      });
+      expect(code).toBe(0);
+      expect(calls).toHaveLength(0);
+      expect(logs.join("\n")).toMatch(/Nothing to tear down/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("tears down every tracked entry + clears state, leaves the hub running (D3)", async () => {
+    const h = makeHarness();
+    try {
+      writeExposeState(
+        {
+          version: 1,
+          layer: "tailnet",
+          mode: "path",
+          canonicalFqdn: "parachute.taildf9ce2.ts.net",
+          port: 443,
+          funnel: false,
+          entries: [
+            {
+              kind: "proxy",
+              mount: "/",
+              target: "http://127.0.0.1:1939",
+              service: "hub",
+            },
+            {
+              kind: "proxy",
+              mount: "/.well-known/parachute.json",
+              target: "http://127.0.0.1:1939/.well-known/parachute.json",
+              service: "well-known",
+            },
+          ],
+        },
+        h.statePath,
+      );
+      await Bun.write(h.wellKnownPath, "{}\n");
+      await Bun.write(h.hubPath, "<html/>\n");
+      const { runner, calls } = makeRunner();
+      const logs: string[] = [];
+      const code = await exposeTailnet("off", {
+        runner,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        configDir: h.configDir,
+        log: (l) => logs.push(l),
+      });
+      expect(code).toBe(0);
+      expect(calls.every((c) => c[c.length - 1] === "off")).toBe(true);
+      expect(calls).toHaveLength(2);
+      expect(existsSync(h.statePath)).toBe(false);
+      expect(existsSync(h.wellKnownPath)).toBe(false);
+      expect(existsSync(h.hubPath)).toBe(false);
+      // D3 (Phase 5b): the hub is a persistent platform unit — `expose off` tears
+      // down only the exposure and leaves the hub running. No "hub stopped" line.
+      expect(logs.join("\n")).not.toMatch(/hub stopped/);
+      expect(logs.join("\n")).toMatch(/exposure removed/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("clears the persisted PARACHUTE_HUB_ORIGIN from vault/.env on teardown", async () => {
+    // OAuth issuer-mismatch fix: `expose up` persisted the public origin into
+    // vault/.env so the daemon validates `iss` against it. With exposure gone,
+    // a local-only hub mints loopback-`iss` tokens, so a stale public origin
+    // left in `.env` would itself cause the mismatch on the next daemon boot.
+    // Tearing it down reverts vault to its loopback default.
+    const h = makeHarness();
+    try {
+      writeExposeState(
+        {
+          version: 1,
+          layer: "tailnet",
+          mode: "path",
+          canonicalFqdn: "parachute.taildf9ce2.ts.net",
+          port: 443,
+          funnel: false,
+          entries: [{ kind: "proxy", mount: "/", target: "http://127.0.0.1:1939", service: "hub" }],
+          hubOrigin: "https://parachute.taildf9ce2.ts.net",
+        },
+        h.statePath,
+      );
+      mkdirSync(join(h.configDir, "vault"), { recursive: true });
+      writeFileSync(
+        join(h.configDir, "vault", ".env"),
+        "SCRIBE_AUTH_TOKEN=secret\nPARACHUTE_HUB_ORIGIN=https://parachute.taildf9ce2.ts.net\n",
+      );
+      const { runner } = makeRunner();
+      const code = await exposeTailnet("off", {
+        runner,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        configDir: h.configDir,
+        skipHub: true,
+        log: () => {},
+      });
+      expect(code).toBe(0);
+      const values = readEnvFileValues(join(h.configDir, "vault", ".env"));
+      expect(values.PARACHUTE_HUB_ORIGIN).toBeUndefined();
+      // Sibling keys preserved.
+      expect(values.SCRIBE_AUTH_TOKEN).toBe("secret");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("leaves state in place on teardown failure", async () => {
+    const h = makeHarness();
+    try {
+      writeExposeState(
+        {
+          version: 1,
+          layer: "tailnet",
+          mode: "path",
+          canonicalFqdn: "parachute.taildf9ce2.ts.net",
+          port: 443,
+          funnel: false,
+          entries: [
+            {
+              kind: "proxy",
+              mount: "/",
+              target: "http://127.0.0.1:1940",
+              service: "parachute-vault",
+            },
+          ],
+        },
+        h.statePath,
+      );
+      const runner: Runner = async () => ({ code: 5, stdout: "", stderr: "tailscale blew up" });
+      const logs: string[] = [];
+      const code = await exposeTailnet("off", {
+        runner,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        configDir: h.configDir,
+        log: (l) => logs.push(l),
+      });
+      expect(code).toBe(5);
+      expect(existsSync(h.statePath)).toBe(true);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("tailnet off does not tear down public exposure or stop the hub", async () => {
+    const h = makeHarness();
+    try {
+      writeExposeState(
+        {
+          version: 1,
+          layer: "public",
+          mode: "path",
+          canonicalFqdn: "parachute.taildf9ce2.ts.net",
+          port: 443,
+          funnel: true,
+          entries: [
+            {
+              kind: "proxy",
+              mount: "/",
+              target: "http://127.0.0.1:1939",
+              service: "hub",
+            },
+          ],
+        },
+        h.statePath,
+      );
+      const { runner, calls } = makeRunner();
+      const logs: string[] = [];
+      const code = await exposeTailnet("off", {
+        runner,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        configDir: h.configDir,
+        log: (l) => logs.push(l),
+      });
+      expect(code).toBe(0);
+      expect(calls).toHaveLength(0);
+      expect(existsSync(h.statePath)).toBe(true);
+      expect(logs.join("\n")).toMatch(/Current exposure is Public/);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe("expose public up", () => {
+  test("routes every bringup through `tailscale funnel` and records layer=public", async () => {
+    const h = makeHarness();
+    try {
+      seedServices(h.manifestPath);
+      const { runner, calls } = makeRunner();
+      const logs: string[] = [];
+      const code = await exposePublic("up", {
+        runner,
+        manifestPath: h.manifestPath,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        configDir: h.configDir,
+        supervisor: supervisorUp(),
+        servicePortProbe: allServicesUp,
+        log: (l) => logs.push(l),
+      });
+      expect(code).toBe(0);
+
+      // Modern tailscale (1.82+) rejects `serve --funnel`; public mode must use
+      // the `funnel` subcommand instead.
+      const funnelCalls = calls.filter(
+        (c) => c[0] === "tailscale" && c[1] === "funnel" && c.includes("--bg"),
+      );
+      // Single hub catchall — public mode shape now matches tailnet (#178
+      // landed the cloudflare-side single-rule; this closes tailnet).
+      expect(funnelCalls).toHaveLength(1);
+      // Never emit the legacy `serve --funnel` shape.
+      expect(calls.every((c) => !c.includes("--funnel"))).toBe(true);
+      expect(calls.every((c) => !(c[1] === "serve" && c.includes("--bg")))).toBe(true);
+
+      const state = readExposeState(h.statePath);
+      expect(state?.layer).toBe("public");
+      expect(state?.funnel).toBe(true);
+      expect(state?.entries).toHaveLength(1);
+
+      expect(logs.join("\n")).toMatch(/Public exposure active/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("switching from public to tailnet tears prior state down via `tailscale funnel … off`", async () => {
+    const h = makeHarness();
+    try {
+      seedServices(h.manifestPath);
+      writeExposeState(
+        {
+          version: 1,
+          layer: "public",
+          mode: "path",
+          canonicalFqdn: "parachute.taildf9ce2.ts.net",
+          port: 443,
+          funnel: true,
+          entries: [
+            {
+              kind: "proxy",
+              mount: "/vault/default",
+              target: "http://127.0.0.1:1940/vault/default",
+              service: "parachute-vault",
+            },
+          ],
+        },
+        h.statePath,
+      );
+      const { runner, calls } = makeRunner();
+      const code = await exposeTailnet("up", {
+        runner,
+        manifestPath: h.manifestPath,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        configDir: h.configDir,
+        supervisor: supervisorUp(),
+        servicePortProbe: allServicesUp,
+        log: () => {},
+      });
+      expect(code).toBe(0);
+      // Prior was public → teardown must use `tailscale funnel … off`,
+      // not `tailscale serve … off` (which wouldn't drop the funnel entry on 1.82+).
+      const offs = calls.filter((c) => c[c.length - 1] === "off");
+      expect(offs).toHaveLength(1);
+      expect(offs[0]?.[1]).toBe("funnel");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("switching from tailnet to public tears down prior state first", async () => {
+    const h = makeHarness();
+    try {
+      seedServices(h.manifestPath);
+      writeExposeState(
+        {
+          version: 1,
+          layer: "tailnet",
+          mode: "path",
+          canonicalFqdn: "parachute.taildf9ce2.ts.net",
+          port: 443,
+          funnel: false,
+          entries: [
+            {
+              kind: "proxy",
+              mount: "/",
+              target: "http://127.0.0.1:1940",
+              service: "parachute-vault",
+            },
+          ],
+        },
+        h.statePath,
+      );
+      const { runner, calls } = makeRunner();
+      const code = await exposePublic("up", {
+        runner,
+        manifestPath: h.manifestPath,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        configDir: h.configDir,
+        supervisor: supervisorUp(),
+        servicePortProbe: allServicesUp,
+        log: () => {},
+      });
+      expect(code).toBe(0);
+      const offs = calls.filter((c) => c[c.length - 1] === "off");
+      expect(offs).toHaveLength(1);
+      const state = readExposeState(h.statePath);
+      expect(state?.layer).toBe("public");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  // 2FA-enrollment warning (#186). Funnel exposure makes /admin/login
+  // reachable on the open internet just like cloudflare; the warning lives in
+  // a shared helper (`expose-2fa-warning.ts`) wired into both paths.
+  test("2FA not enrolled → warning fires on the public layer", async () => {
+    const h = makeHarness();
+    try {
+      seedServices(h.manifestPath);
+      const { runner } = makeRunner();
+      const logs: string[] = [];
+      const code = await exposePublic("up", {
+        runner,
+        manifestPath: h.manifestPath,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        configDir: h.configDir,
+        supervisor: supervisorUp(),
+        servicePortProbe: allServicesUp,
+        log: (l) => logs.push(l),
+        vaultAuthStatus: {
+          hasOwnerPassword: true,
+          hasTotp: false,
+          tokenCount: 0,
+          vaultNames: ["default"],
+        },
+      });
+      expect(code).toBe(0);
+      const joined = logs.join("\n");
+      // hub#473: real hub-login 2FA. The recommendation now leads with the
+      // friendly "strongly recommended" framing and the real `parachute auth
+      // 2fa enroll` path.
+      expect(joined).toContain("Strongly recommended: turn on two-factor authentication");
+      expect(joined).toContain("parachute auth 2fa enroll");
+      // /login pointer uses the canonical https://<fqdn> origin.
+      expect(joined).toContain("https://parachute.taildf9ce2.ts.net/login");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("2FA enrolled → warning suppressed on the public layer", async () => {
+    const h = makeHarness();
+    try {
+      seedServices(h.manifestPath);
+      const { runner } = makeRunner();
+      const logs: string[] = [];
+      const code = await exposePublic("up", {
+        runner,
+        manifestPath: h.manifestPath,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        configDir: h.configDir,
+        supervisor: supervisorUp(),
+        servicePortProbe: allServicesUp,
+        log: (l) => logs.push(l),
+        vaultAuthStatus: {
+          hasOwnerPassword: true,
+          hasTotp: true,
+          tokenCount: 1,
+          vaultNames: ["default"],
+        },
+      });
+      expect(code).toBe(0);
+      expect(logs.join("\n")).not.toContain(
+        "Strongly recommended: turn on two-factor authentication",
+      );
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe("expose public off", () => {
+  test("tears down public exposure via `tailscale funnel … off` and clears state", async () => {
+    const h = makeHarness();
+    try {
+      writeExposeState(
+        {
+          version: 1,
+          layer: "public",
+          mode: "path",
+          canonicalFqdn: "parachute.taildf9ce2.ts.net",
+          port: 443,
+          funnel: true,
+          entries: [
+            {
+              kind: "proxy",
+              mount: "/",
+              target: "http://127.0.0.1:1939",
+              service: "hub",
+            },
+          ],
+        },
+        h.statePath,
+      );
+      const { runner, calls } = makeRunner();
+      const code = await exposePublic("off", {
+        runner,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        configDir: h.configDir,
+        log: () => {},
+      });
+      expect(code).toBe(0);
+      // Public teardown must use the funnel subcommand, matching bringup.
+      const offCalls = calls.filter((c) => c[c.length - 1] === "off");
+      expect(offCalls.length).toBeGreaterThan(0);
+      expect(offCalls.every((c) => c[1] === "funnel")).toBe(true);
+      expect(existsSync(h.statePath)).toBe(false);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("public off does not tear down tailnet exposure", async () => {
+    const h = makeHarness();
+    try {
+      writeExposeState(
+        {
+          version: 1,
+          layer: "tailnet",
+          mode: "path",
+          canonicalFqdn: "parachute.taildf9ce2.ts.net",
+          port: 443,
+          funnel: false,
+          entries: [
+            {
+              kind: "proxy",
+              mount: "/",
+              target: "http://127.0.0.1:1940",
+              service: "parachute-vault",
+            },
+          ],
+        },
+        h.statePath,
+      );
+      const { runner, calls } = makeRunner();
+      const logs: string[] = [];
+      const code = await exposePublic("off", {
+        runner,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        configDir: h.configDir,
+        log: (l) => logs.push(l),
+      });
+      expect(code).toBe(0);
+      expect(calls).toHaveLength(0);
+      expect(existsSync(h.statePath)).toBe(true);
+      expect(logs.join("\n")).toMatch(/Current exposure is Tailnet/);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe("expose plan is layer-agnostic — gating moved to hub", () => {
+  // Pre-collapse the tailscale plan partitioned services by publicExposure
+  // and withheld loopback/auth-required entries. Now the plan is always one
+  // catchall to the hub, which gates per request via `effectivePublicExposure`
+  // + `layerOf` (see hub-server.ts). These tests confirm the plan stays
+  // single-rule regardless of services' exposure declarations; per-request
+  // gating is exercised in hub-server.test.ts.
+
+  test("plan stays one catchall when a loopback-only service is installed", async () => {
+    // Pre-collapse, scribe (publicExposure: "loopback") was withheld from the
+    // plan with an operator-visible warning. Now scribe is on the plan via
+    // the hub catchall — the hub returns 404 to non-loopback callers per
+    // hub-server's `proxyToService` layer-gate. Plan stays one mount.
+    const h = makeHarness();
+    try {
+      upsertService(
+        {
+          name: "parachute-vault",
+          port: 1940,
+          paths: ["/vault/default"],
+          health: "/vault/default/health",
+          version: "0.2.4",
+          publicExposure: "allowed",
+        },
+        h.manifestPath,
+      );
+      upsertService(
+        {
+          name: "parachute-scribe",
+          port: 1943,
+          paths: ["/scribe"],
+          health: "/scribe/health",
+          version: "0.1.0",
+          publicExposure: "loopback",
+        },
+        h.manifestPath,
+      );
+      const { runner, calls } = makeRunner();
+      const code = await exposeTailnet("up", {
+        runner,
+        manifestPath: h.manifestPath,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        configDir: h.configDir,
+        supervisor: supervisorUp(),
+        servicePortProbe: allServicesUp,
+        log: () => {},
+      });
+      expect(code).toBe(0);
+      const serveCalls = calls.filter(
+        (c) => c[0] === "tailscale" && c[1] === "serve" && c.includes("--bg"),
+      );
+      expect(serveCalls).toHaveLength(1);
+      expect(serveCalls[0]).toContain("--set-path=/");
+
+      // State carries one entry — hub catchall. No /scribe or /vault/* in state.
+      const state = readExposeState(h.statePath);
+      expect(state?.entries).toHaveLength(1);
+      expect(state?.entries[0]?.mount).toBe("/");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("plan stays one catchall regardless of mix of publicExposure values", async () => {
+    // Mix: allowed, loopback, auth-required, and absent. Plan is one mount.
+    const h = makeHarness();
+    try {
+      seedServices(h.manifestPath); // vault + notes
+      upsertService(
+        {
+          name: "parachute-channel",
+          port: 1941,
+          paths: ["/channel"],
+          health: "/channel/health",
+          version: "0.1.0",
+          publicExposure: "auth-required",
+        },
+        h.manifestPath,
+      );
+      upsertService(
+        {
+          name: "parachute-scribe",
+          port: 1943,
+          paths: ["/scribe"],
+          health: "/scribe/health",
+          version: "0.1.0",
+          // publicExposure intentionally absent — exercises spec-derived default
+        },
+        h.manifestPath,
+      );
+      const { runner, calls } = makeRunner();
+      const code = await exposeTailnet("up", {
+        runner,
+        manifestPath: h.manifestPath,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        configDir: h.configDir,
+        supervisor: supervisorUp(),
+        servicePortProbe: allServicesUp,
+        log: () => {},
+      });
+      expect(code).toBe(0);
+      const serveCalls = calls.filter(
+        (c) => c[0] === "tailscale" && c[1] === "serve" && c.includes("--bg"),
+      );
+      expect(serveCalls).toHaveLength(1);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe("expose auto-restart of hub-dependent services", () => {
+  // Launch-day bug (2026-04-23): `expose public` updated hubOrigin in
+  // expose-state.json, but a vault already running kept its stale
+  // PARACHUTE_HUB_ORIGIN in memory, so the OAuth issuer didn't match what
+  // clients saw and claude.ai MCP failed to reach the server. Auto-restart the
+  // service so it picks up the new origin.
+  //
+  // Phase 5b: the restart goes through the running supervisor
+  // (`driveModuleOp("vault", "restart")`), NOT a pidfile-gated detached
+  // `lifecycle.restart`. So the restart is unconditional (the supervisor decides
+  // whether the module is live); the old "skips when not running / stale pidfile"
+  // cases no longer apply — a not-supervised vault surfaces as a 404 the helper
+  // treats as "nothing to restart" (asserted in the Phase 4 dual-dispatch suite).
+  test("restarts vault via the supervisor after expose", async () => {
+    const h = makeHarness();
+    try {
+      seedServices(h.manifestPath);
+      const { runner } = makeRunner();
+      const sup = makeExposeSupervisorStub();
+      const code = await exposePublic("up", {
+        runner,
+        manifestPath: h.manifestPath,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        configDir: h.configDir,
+        supervisor: sup.opts,
+        servicePortProbe: allServicesUp,
+        log: () => {},
+      });
+      expect(code).toBe(0);
+      expect(sup.driveCalls).toEqual([{ short: "vault", op: "restart" }]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("restart failure logs a warning but expose still succeeds", async () => {
+    const h = makeHarness();
+    try {
+      seedServices(h.manifestPath);
+      const { runner } = makeRunner();
+      // A non-404 module-op error → surfaced as a warning, non-zero rcode mapped
+      // to a warn-and-continue (expose still exits 0).
+      const sup = makeExposeSupervisorStub({
+        driveThrows: () => new ModuleOpHttpError(500, "internal", "vault restart blew up"),
+      });
+      const logs: string[] = [];
+      const code = await exposePublic("up", {
+        runner,
+        manifestPath: h.manifestPath,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        configDir: h.configDir,
+        supervisor: sup.opts,
+        servicePortProbe: allServicesUp,
+        log: (l) => logs.push(l),
+      });
+      expect(code).toBe(0);
+      expect(logs.join("\n")).toMatch(/vault restart failed/);
+      expect(logs.join("\n")).toMatch(/parachute restart vault/);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe("expose teardown tolerance for already-gone entries", () => {
+  // Launch-day bug (2026-04-23): Aaron ran `tailscale funnel reset` while
+  // debugging, then re-ran `parachute expose public`. expose-state.json still
+  // recorded 8 entries; the CLI tried to tear them down; tailscale returned
+  // `error: failed to remove web serve: handler does not exist` for each; the
+  // CLI aborted and never got to bringup. Tailscale's `off` is idempotent
+  // from the user's perspective — if the handler is already gone, that's the
+  // outcome we wanted.
+  function makePublicPriorState(statePath: string, entryCount: number): void {
+    const entries = Array.from({ length: entryCount }, (_, i) => ({
+      kind: "proxy" as const,
+      mount: `/svc${i}`,
+      target: `http://127.0.0.1:${2000 + i}`,
+      service: `parachute-svc${i}`,
+    }));
+    writeExposeState(
+      {
+        version: 1,
+        layer: "public",
+        mode: "path",
+        canonicalFqdn: "parachute.taildf9ce2.ts.net",
+        port: 443,
+        funnel: true,
+        entries,
+      },
+      statePath,
+    );
+  }
+
+  test("exposeOff treats 'handler does not exist' as success and clears state", async () => {
+    const h = makeHarness();
+    try {
+      makePublicPriorState(h.statePath, 3);
+      const runner: Runner = async (cmd) => {
+        if (cmd[cmd.length - 1] === "off") {
+          return {
+            code: 1,
+            stdout: "",
+            stderr: "error: failed to remove web serve: handler does not exist",
+          };
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      };
+      const logs: string[] = [];
+      const code = await exposePublic("off", {
+        runner,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        configDir: h.configDir,
+        log: (l) => logs.push(l),
+      });
+      expect(code).toBe(0);
+      expect(existsSync(h.statePath)).toBe(false);
+      const joined = logs.join("\n");
+      expect(joined).toMatch(/already gone/);
+      expect(joined).toMatch(/✓ Public \(Funnel\) exposure removed/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("exposeOff handles a mix of clean and already-gone entries", async () => {
+    const h = makeHarness();
+    try {
+      makePublicPriorState(h.statePath, 3);
+      let i = 0;
+      const runner: Runner = async (cmd) => {
+        if (cmd[cmd.length - 1] === "off") {
+          const idx = i++;
+          if (idx === 1) {
+            return {
+              code: 1,
+              stdout: "",
+              stderr: "error: failed to remove web serve: listener does not exist",
+            };
+          }
+          return { code: 0, stdout: "", stderr: "" };
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      };
+      const code = await exposePublic("off", {
+        runner,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        configDir: h.configDir,
+        log: () => {},
+      });
+      expect(code).toBe(0);
+      expect(existsSync(h.statePath)).toBe(false);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("exposeOff still aborts on a real (non-already-gone) error", async () => {
+    const h = makeHarness();
+    try {
+      makePublicPriorState(h.statePath, 2);
+      const runner: Runner = async (cmd) => {
+        if (cmd[cmd.length - 1] === "off") {
+          return {
+            code: 1,
+            stdout: "",
+            stderr: "failed to connect to tailscaled: is it running?",
+          };
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      };
+      const logs: string[] = [];
+      const code = await exposePublic("off", {
+        runner,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        configDir: h.configDir,
+        log: (l) => logs.push(l),
+      });
+      expect(code).toBe(1);
+      expect(existsSync(h.statePath)).toBe(true);
+      expect(logs.join("\n")).toMatch(/Teardown failed/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("exposeUp tolerates already-gone prior entries and proceeds to bringup", async () => {
+    // Aaron's exact repro: prior expose-state lingered after an external
+    // `tailscale funnel reset`, re-running `parachute expose public` aborted
+    // because every teardown said "handler does not exist".
+    const h = makeHarness();
+    try {
+      seedServices(h.manifestPath);
+      makePublicPriorState(h.statePath, 2);
+      const bringupCalls: string[][] = [];
+      const runner: Runner = async (cmd) => {
+        if (cmd[0] === "tailscale" && cmd[1] === "version") {
+          return { code: 0, stdout: "1.96.5\n", stderr: "" };
+        }
+        if (cmd[0] === "tailscale" && cmd[1] === "status" && cmd[2] === "--json") {
+          return {
+            code: 0,
+            stdout: JSON.stringify({ Self: { DNSName: "parachute.taildf9ce2.ts.net." } }),
+            stderr: "",
+          };
+        }
+        if (cmd[cmd.length - 1] === "off") {
+          return {
+            code: 1,
+            stdout: "",
+            stderr: "error: failed to remove web serve: handler does not exist",
+          };
+        }
+        if (cmd.includes("--bg")) {
+          bringupCalls.push([...cmd]);
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      };
+      const code = await exposePublic("up", {
+        runner,
+        manifestPath: h.manifestPath,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        configDir: h.configDir,
+        supervisor: supervisorUp(),
+        servicePortProbe: allServicesUp,
+        log: () => {},
+      });
+      expect(code).toBe(0);
+      expect(bringupCalls.length).toBeGreaterThan(0);
+      const state = readExposeState(h.statePath);
+      expect(state?.layer).toBe("public");
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe("expose: vault routing fully internal to hub", () => {
+  // Pre-#144: one tailscale mount per vault path. #144 collapsed those to a
+  // single `/vault/ → hub` mount. This PR collapses one step further: vault
+  // routing is just a slice of the hub catchall now. Hub's `proxyToVault`
+  // (in hub-server.ts) still dispatches per services.json on each request,
+  // so `parachute vault create <name>` is reachable without re-expose; the
+  // tailscale plan just no longer carries a vault-specific entry.
+
+  test("single vault, single path → still one catchall, no /vault/* tailscale rule", async () => {
+    const h = makeHarness();
+    try {
+      upsertService(
+        {
+          name: "parachute-vault",
+          port: 1940,
+          paths: ["/vault/default"],
+          health: "/vault/default/health",
+          version: "0.4.0",
+        },
+        h.manifestPath,
+      );
+      const { runner, calls } = makeRunner();
+      const code = await exposeTailnet("up", {
+        runner,
+        manifestPath: h.manifestPath,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        configDir: h.configDir,
+        supervisor: supervisorUp(),
+        servicePortProbe: allServicesUp,
+        log: () => {},
+      });
+      expect(code).toBe(0);
+      const mounts = calls
+        .filter((c) => c[0] === "tailscale" && c[1] === "serve" && c.includes("--bg"))
+        .map((c) => c.find((a) => a.startsWith("--set-path=")));
+      expect(mounts).toEqual(["--set-path=/"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("multiple separate vault ServiceEntries → still one catchall", async () => {
+    // Pathological but representable: a second parachute-vault-archive
+    // alongside the bare parachute-vault. Both reachable via the hub
+    // catchall; hub picks the backend per request.
+    const h = makeHarness();
+    try {
+      upsertService(
+        {
+          name: "parachute-vault",
+          port: 1940,
+          paths: ["/vault/default"],
+          health: "/vault/default/health",
+          version: "0.4.0",
+        },
+        h.manifestPath,
+      );
+      upsertService(
+        {
+          name: "parachute-vault-archive",
+          port: 1941,
+          paths: ["/vault/archive"],
+          health: "/vault/archive/health",
+          version: "0.4.0",
+        },
+        h.manifestPath,
+      );
+      const { runner, calls } = makeRunner();
+      const code = await exposeTailnet("up", {
+        runner,
+        manifestPath: h.manifestPath,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        configDir: h.configDir,
+        supervisor: supervisorUp(),
+        servicePortProbe: allServicesUp,
+        log: () => {},
+      });
+      expect(code).toBe(0);
+      const mounts = calls
+        .filter((c) => c[0] === "tailscale" && c[1] === "serve" && c.includes("--bg"))
+        .map((c) => c.find((a) => a.startsWith("--set-path=")));
+      expect(mounts).toEqual(["--set-path=/"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 4 dual-dispatch (design §4.3): when a hub UNIT is installed, `expose`
+// ensures the hub UNIT (not a detached spawn), the post-expose vault restart
+// drives the running Supervisor over the loopback module-ops API (firing the
+// operator-token + vault `.env` self-heal), and `expose off` leaves the hub
+// RUNNING (D3 — a managed hub with Restart=always/KeepAlive would just respawn
+// a stopped one). The no-unit arm keeps today's behavior unchanged.
+// ---------------------------------------------------------------------------
+
+interface ExposeSupervisorStub {
+  opts: ExposeSupervisorOpts;
+  ensureCalls: Array<{ port?: number }>;
+  driveCalls: Array<{ short: string; op: ModuleOp }>;
+  selfHealCalls: Array<{ issuer: string }>;
+}
+
+/**
+ * Build an expose `supervisor` seam that forces the unit-installed arm and
+ * records the `ensureHubUnit` / `driveModuleOp` / operator-token-self-heal
+ * calls. `driveThrows` makes a module-op throw a chosen error; `ensureOutcome`
+ * controls the ensure-hub result.
+ */
+function makeExposeSupervisorStub(opts?: {
+  ensureOutcome?: "already-up" | "started" | "no-unit" | "no-manager" | "timeout" | "start-failed";
+  ensurePort?: number;
+  driveThrows?: (short: string, op: ModuleOp) => unknown;
+}): ExposeSupervisorStub {
+  const ensureCalls: Array<{ port?: number }> = [];
+  const driveCalls: Array<{ short: string; op: ModuleOp }> = [];
+  const selfHealCalls: Array<{ issuer: string }> = [];
+  return {
+    ensureCalls,
+    driveCalls,
+    selfHealCalls,
+    opts: {
+      // openDb is opened+closed around the drive/self-heal — hand back a no-op closer.
+      openDb: () => ({ close() {} }) as unknown as import("bun:sqlite").Database,
+      ensureHubUnit: async (o: EnsureHubUnitOpts) => {
+        ensureCalls.push({ port: o.port });
+        return {
+          outcome: opts?.ensureOutcome ?? "already-up",
+          port: opts?.ensurePort ?? o.port ?? 1939,
+          messages: [],
+        };
+      },
+      driveModuleOp: async (short, op) => {
+        driveCalls.push({ short, op });
+        if (opts?.driveThrows) throw opts.driveThrows(short, op);
+        return { status: 200, body: { short, state: { status: "running" } } };
+      },
+      selfHealOperatorTokenIssuer: async (_db, o) => {
+        selfHealCalls.push({ issuer: o.issuer });
+        return { kind: "fresh" };
+      },
+    },
+  };
+}
+
+describe("Phase 4 expose dual-dispatch — unit-managed", () => {
+  test("expose up unit-managed → ensureHubUnit (not detached spawn) + driveModuleOp(restart) for vault", async () => {
+    const h = makeHarness();
+    try {
+      seedServices(h.manifestPath);
+      const { runner } = makeRunner();
+      const sup = makeExposeSupervisorStub();
+      const logs: string[] = [];
+      const code = await exposeTailnet("up", {
+        runner,
+        manifestPath: h.manifestPath,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        configDir: h.configDir,
+        servicePortProbe: allServicesUp,
+        supervisor: sup.opts,
+        log: (l) => logs.push(l),
+      });
+      expect(code).toBe(0);
+      // Ensured the hub UNIT (the detached hub spawner was never invoked).
+      expect(sup.ensureCalls).toHaveLength(1);
+      // Post-expose vault restart drove the supervisor, not lifecycle.restart.
+      expect(sup.driveCalls).toEqual([{ short: "vault", op: "restart" }]);
+      // The operator-token issuer self-heal fired toward the public origin.
+      expect(sup.selfHealCalls).toHaveLength(1);
+      expect(sup.selfHealCalls[0]?.issuer).toMatch(/^https:\/\//);
+      expect(logs.join("\n")).toMatch(/hub unit up/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("expose up unit-managed: ensureHubUnit failure aborts before exposing", async () => {
+    const h = makeHarness();
+    try {
+      seedServices(h.manifestPath);
+      const { runner, calls } = makeRunner();
+      const sup = makeExposeSupervisorStub({ ensureOutcome: "no-manager" });
+      const code = await exposeTailnet("up", {
+        runner,
+        manifestPath: h.manifestPath,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        configDir: h.configDir,
+        servicePortProbe: allServicesUp,
+        supervisor: sup.opts,
+        log: () => {},
+      });
+      expect(code).toBe(1);
+      // Never ran the tailscale bringup — we bailed on the failed ensure.
+      expect(calls.filter((c) => c[0] === "tailscale" && c[1] === "serve")).toHaveLength(0);
+      expect(sup.driveCalls).toHaveLength(0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("expose up unit-managed: a not_supervised vault (404) is not a failure", async () => {
+    const h = makeHarness();
+    try {
+      seedServices(h.manifestPath);
+      const { runner } = makeRunner();
+      const sup = makeExposeSupervisorStub({
+        driveThrows: () => new ModuleOpHttpError(404, "not_supervised", "vault is not supervised"),
+      });
+      const code = await exposeTailnet("up", {
+        runner,
+        manifestPath: h.manifestPath,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        configDir: h.configDir,
+        servicePortProbe: allServicesUp,
+        supervisor: sup.opts,
+        log: () => {},
+      });
+      expect(code).toBe(0);
+      expect(sup.driveCalls).toEqual([{ short: "vault", op: "restart" }]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("expose off unit-managed → exposure torn down, hub NOT stopped, no 'hub stopped' line", async () => {
+    const h = makeHarness();
+    try {
+      writeExposeState(
+        {
+          version: 1,
+          layer: "tailnet",
+          mode: "path",
+          canonicalFqdn: "parachute.taildf9ce2.ts.net",
+          port: 443,
+          funnel: false,
+          entries: [{ kind: "proxy", mount: "/", target: "http://127.0.0.1:1939", service: "hub" }],
+        },
+        h.statePath,
+      );
+      const { runner, calls } = makeRunner();
+      const sup = makeExposeSupervisorStub();
+      const logs: string[] = [];
+      const code = await exposeTailnet("off", {
+        runner,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        configDir: h.configDir,
+        supervisor: sup.opts,
+        log: (l) => logs.push(l),
+      });
+      expect(code).toBe(0);
+      // The exposure layer was torn down…
+      expect(calls.every((c) => c[c.length - 1] === "off" || c[1] === "version")).toBe(true);
+      expect(existsSync(h.statePath)).toBe(false);
+      // …but the hub was left running: no stop, no "hub stopped" line.
+      expect(logs.join("\n")).not.toMatch(/hub stopped/);
+      expect(logs.join("\n")).toMatch(/exposure removed/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  // The "expose off NO unit → hub stopped (detached arm)" test was removed: Phase
+  // 5b retired the detached arm, so `expose off` NEVER stops the hub (D3). The
+  // "exposure torn down, hub NOT stopped" invariant is the test above + the
+  // "leaves the hub running (D3)" test in the `expose tailnet off` suite.
+});

@@ -1,5 +1,5 @@
 {
-  "comment": "FAILs Benjamin's suite (harness/prism-compat.ts) reports on today's code, each with why and the lane that fixes it. Empty from slice 1 on (PLAN \u00a76): the Nov 9 gate is 0 FAIL.",
+  "comment": "FAILs Benjamin's suite (harness/prism-compat.ts) reports on today's code, each with why and the lane that fixes it. Empty from slice 1 on (PLAN §6): the Nov 9 gate is 0 FAIL. E6 and the CLI issuer check pass from lane A1 on (fix 1's two lines in the moved hub); E6 also needs lsof on the machine to see the listeners, which CI installs.",
   "fails": [
     {
       "check": "E2",
@@ -10,16 +10,6 @@
       "check": "isolation: Parachute files written to the children's HOME (outside PARACHUTE_HOME, E2)",
       "reason": "same as E2",
       "lane": "D"
-    },
-    {
-      "check": "E6",
-      "reason": "the CLI signs with the issuer from hub/run/hub.port or :1939, not PARACHUTE_HUB_ORIGIN (fix 1)",
-      "lane": "C"
-    },
-    {
-      "check": "tokens: CLI issuer follows PARACHUTE_HUB_ORIGIN (operator.token iss)",
-      "reason": "fix 1",
-      "lane": "C"
     },
     {
       "check": "E8",

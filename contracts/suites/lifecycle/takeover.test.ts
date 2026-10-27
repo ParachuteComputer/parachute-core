@@ -18,8 +18,9 @@
 // proven by rehearsal/adam on a copy of the real backup, not in CI. Exit 8 (a failed post-start check) has no
 // black-box trigger here either.
 //
-// All red today: the candidate has no bin/parachute-core. The setup test is green and proves the old install and
-// stock home are real (the old `parachute` from the fake global install serves the notes).
+// All red: on the stock build there is no bin/parachute-core; on the core build (lane A1) there is no `takeover`
+// command yet, and serve starts on a home the old programs own. The setup test is green and proves the old install
+// and stock home are real (the old `parachute` from the fake global install serves the notes).
 import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -46,7 +47,10 @@ import {
   type StockHome,
 } from "./_takeover-lib.ts";
 
-const NO_CORE = /no bin\/parachute-core in the candidate/;
+// What the core build says while there is no takeover yet (lane E): the command is unknown, and serve starts on a
+// home the old programs own instead of refusing it.
+const NO_TAKEOVER = /unknown command "takeover"/;
+const SERVE_TAKES_HOME = /serve started on a home the old programs still own/;
 const HUB_UNIT = "parachute-hub.service";
 const VAULT_UNIT = "parachute-vault.service";
 
@@ -144,7 +148,7 @@ describe("takeover: setup", () => {
 });
 
 describe("takeover", () => {
-  red("detection: --dry-run --json reports the old hub and vault, both units, the vaults with note counts and schemas, no migrations, a code-only rollback", { reason: NO_CORE, lane: "E" }, async () => {
+  red("detection: --dry-run --json reports the old hub and vault, both units, the vaults with note counts and schemas, no migrations, a code-only rollback", { reason: NO_TAKEOVER, lane: "E" }, async () => {
     const stock = await oldStock();
     const { m, s, noteCount } = await oldMachine("tk-detect");
     const vaultSchema = schemaOf(vaultDb(m, s));
@@ -169,7 +173,7 @@ describe("takeover", () => {
     expect(Array.isArray(rep.plan) && rep.plan.length > 0).toBe(true);
   }, 120_000);
 
-  red("a dry run changes nothing and says in plain words what it found", { reason: NO_CORE, lane: "E" }, async () => {
+  red("a dry run changes nothing and says in plain words what it found", { reason: NO_TAKEOVER, lane: "E" }, async () => {
     const { m, s, noteCount } = await oldMachine("tk-dry");
     const old = await oldStock();
     const before = await snapshot(m);
@@ -186,24 +190,25 @@ describe("takeover", () => {
     expect(existsSync(join(m.user, "parachute-takeover"))).toBe(false);
   }, 120_000);
 
-  red("an unknown flag exits 2 and changes nothing", { reason: NO_CORE, lane: "E" }, async () => {
+  red("an unknown flag exits 2 and changes nothing", { reason: NO_TAKEOVER, lane: "E" }, async () => {
     const { m } = await oldMachine("tk-flags");
     const before = await snapshot(m);
     const r = await core(m, ["takeover", "--home", m.home, "--yes", "--no-such-flag"]);
-    expect(r.code).toBe(2);
+    must(r.code === 2, `takeover with an unknown flag exited ${r.code}, want 2: ${r.stderr.slice(-600)}`);
     expect(await snapshot(m)).toEqual(before);
   }, 120_000);
 
-  red("serve refuses a home the old programs still own: exit 7, and it says to run takeover", { reason: NO_CORE, lane: "E" }, async () => {
+  red("serve refuses a home the old programs still own: exit 7, and it says to run takeover", { reason: SERVE_TAKES_HOME, lane: "E" }, async () => {
     const { m, s } = await oldMachine("tk-serve7");
     const before = await snapshot(m);
     const r = await m.run([requireCore(m.info), "serve"], { env: s.serveEnv, timeoutMs: 30_000 });
-    expect(r.code).toBe(7);
+    must(r.code !== 137, "serve started on a home the old programs still own (still running after 30 s)");
+    must(r.code === 7, `serve on a home the old programs still own exited ${r.code}, want 7: ${r.stderr.slice(-600)}`);
     expect(r.stdout + r.stderr).toMatch(/parachute-core takeover/);
     expect(await snapshot(m)).toEqual(before);
   }, 120_000);
 
-  red("takeover backs up the home first: the manifest's sha256 of each file equals the file before takeover", { reason: NO_CORE, lane: "E" }, async () => {
+  red("takeover backs up the home first: the manifest's sha256 of each file equals the file before takeover", { reason: NO_TAKEOVER, lane: "E" }, async () => {
     const { m } = await oldMachine("tk-backup");
     const pre = fileHashes(m.home);
     const r = await core(m, ["takeover", "--home", m.home, "--yes", "--json"]);
@@ -222,7 +227,7 @@ describe("takeover", () => {
     for (const [path, sha] of manifest) expect({ path, inBackup: copies.has(sha) }).toEqual({ path, inBackup: true });
   }, 120_000);
 
-  red("takeover refuses while an old process holds the database: exit 7 names its pid, and nothing changes", { reason: NO_CORE, lane: "E" }, async () => {
+  red("takeover refuses while an old process holds the database: exit 7 names its pid, and nothing changes", { reason: NO_TAKEOVER, lane: "E" }, async () => {
     const { m, s } = await oldMachine("tk-held");
     const box = await startOldBox(m, s); // the old stock serve, from the global install, left running
     const held = holders(vaultDb(m, s));
@@ -230,7 +235,7 @@ describe("takeover", () => {
     const pid = held[0]!.pid;
     const before = await snapshot(m, true);
     const r = await core(m, ["takeover", "--home", m.home, "--yes", "--json"]);
-    expect(r.code).toBe(7);
+    must(r.code === 7, `takeover while an old process holds the data exited ${r.code}, want 7: ${r.stderr.slice(-600)}`);
     expect(r.stdout + r.stderr).toMatch(new RegExp(`\\b${pid}\\b`));
     // Nothing changed: the home, the old install, the unit files, the units end as they were; no backup folder.
     expect(await snapshot(m, true)).toEqual(before);
@@ -240,7 +245,7 @@ describe("takeover", () => {
     expect((await readNotes(s.origin, s.vaultName, s.readPass)).status).toBe(200);
   }, 120_000);
 
-  red("after takeover: old units stopped and disabled, old install untouched, core serves the same notes, an old pass verifies, schemas unchanged", { reason: NO_CORE, lane: "E" }, async () => {
+  red("after takeover: old units stopped and disabled, old install untouched, core serves the same notes, an old pass verifies, schemas unchanged", { reason: NO_TAKEOVER, lane: "E" }, async () => {
     const { m, s } = await oldMachine("tk-after");
     const box = await startOldBox(m, s);
     const notesBefore = (await readNotes(s.origin, s.vaultName, s.readPass)).notes;
@@ -276,7 +281,7 @@ describe("takeover", () => {
     expect(schemaOf(hubDb(m))).toBe(hubSchema);
   }, 120_000);
 
-  red("rollback: a note written under core reads and updates under the old programs", { reason: NO_CORE, lane: "E" }, async () => {
+  red("rollback: a note written under core reads and updates under the old programs", { reason: NO_TAKEOVER, lane: "E" }, async () => {
     const { m, s } = await oldMachine("tk-rollback");
     const before = await snapshot(m);
     const t = await core(m, ["takeover", "--home", m.home, "--yes", "--json"]);

@@ -1,0 +1,2019 @@
+/**
+ * `parachute auth` — ecosystem-level identity commands.
+ *
+ * Hub-local subcommands (write to `~/.parachute/hub.db`):
+ *   - `rotate-key` — rotate the JWT signing keypair.
+ *   - `set-password` — create or update the hub user's password. *NEW in
+ *     0.3.1-rc.2*: this used to forward to `parachute-vault set-password`.
+ *     The hub now owns identity, so set-password writes to `users` in
+ *     hub.db. The OAuth endpoints still proxy to vault until PR (c) cuts
+ *     them over — until then, your vault password is what the OAuth flow
+ *     sees, while `set-password` seeds the hub-side user that PR (c) will
+ *     start validating against.
+ *   - `list-users` — show accounts in `users`.
+ *
+ * Vault-forwarded subcommands (still implemented in `parachute-vault`):
+ *   - (none currently). `2fa` used to forward here, but the legacy
+ *     `parachute-vault 2fa` stub writes vault YAML that does NOT gate hub
+ *     `/login`. As of hub#473 `parachute auth 2fa` is the REAL hub-login TOTP
+ *     surface: it reads/writes the hub.db `users` TOTP columns and gates
+ *     `/login`. Subcommands: `status`, `enroll` (CLI text enroll — prints the
+ *     otpauth:// URI + base32 secret for manual authenticator entry, then
+ *     prompts for the confirm code), `disenroll`. The browser path lives at
+ *     `<hub-origin>/account/2fa` (QR + backup codes).
+ */
+
+import { appendFileSync } from "node:fs";
+import { userInfo } from "node:os";
+import { createInterface } from "node:readline/promises";
+import {
+  DEFAULT_REAP_AGE_MS,
+  type ReapableClient,
+  approveClient,
+  deleteClient,
+  findReapableClients,
+  getClient,
+  listClientsByStatus,
+  reapClient,
+} from "../clients.ts";
+import { CONFIG_DIR } from "../config.ts";
+import { GrantError, parseGrantPubkey } from "../grant-access.ts";
+import { listGrantsForUser, revokeGrant } from "../grants.ts";
+import { HUB_SVC } from "../hub-control.ts";
+import { openHubDb } from "../hub-db.ts";
+import { resolveHubIssuer } from "../hub-issuer.ts";
+import { inferAudience } from "../jwt-audience.ts";
+import {
+  type RevokeActor,
+  TokenMintPrincipalGoneError,
+  findTokenRowByJti,
+  recordTokenMint,
+  revokeTokenByJti,
+  signAccessToken,
+  tokenRowIdentity,
+} from "../jwt-sign.ts";
+import {
+  OPERATOR_TOKEN_CLIENT_ID,
+  OPERATOR_TOKEN_SCOPE_SET_NAMES,
+  type OperatorScopeSet,
+  OperatorTokenExpiredError,
+  isOperatorScopeSet,
+  issueOperatorToken,
+  liveOperatorTokenRevokeRefusal,
+  readOperatorTokenJti,
+  useOperatorTokenWithAutoRotate,
+} from "../operator-token.ts";
+import { logPath as hubLogPath } from "../process-state.ts";
+import { bindPubkeyOperatorAttested, findPubkeyLink } from "../pubkey-links.ts";
+import { isNonRequestableScope } from "../scope-explanations.ts";
+import { rotateSigningKey } from "../signing-keys.ts";
+import { generateTotpSecret, otpauthUrlFor, verifyTotpCode } from "../totp.ts";
+import {
+  clearEnrollment,
+  getTotpState,
+  isTotpEnrolled,
+  persistEnrollment,
+} from "../two-factor-store.ts";
+import {
+  InvalidUsernameError,
+  SingleUserModeError,
+  UsernameTakenError,
+  createUser,
+  getUserById,
+  getUserByUsername,
+  listUsers,
+  resolveUser,
+  setPassword,
+  userCount,
+} from "../users.ts";
+
+export interface Runner {
+  run(cmd: readonly string[]): Promise<number>;
+}
+
+export const defaultRunner: Runner = {
+  async run(cmd) {
+    // Inherit env so the child (e.g. parachute-vault subprocess) sees PATH,
+    // HOME, PARACHUTE_HOME, etc. Bun.spawn defaults to empty env — see
+    // api-modules-ops.ts:defaultRun.
+    const proc = Bun.spawn([...cmd], {
+      stdio: ["inherit", "inherit", "inherit"],
+      env: process.env,
+    });
+    return await proc.exited;
+  },
+};
+
+const VAULT_FORWARDED_SUBCOMMANDS = new Set<string>([]);
+const HUB_LOCAL_SUBCOMMANDS = new Set([
+  "rotate-key",
+  "2fa",
+  "set-password",
+  "list-users",
+  "link-pubkey",
+  "rotate-operator",
+  "mint-token",
+  "revoke-token",
+  "pending-clients",
+  "approve-client",
+  "revoke-client",
+  "reap-clients",
+  "list-grants",
+  "revoke-grant",
+]);
+
+export function authHelp(): string {
+  return `parachute auth — ecosystem identity commands (password + two-factor authentication)
+
+Usage:
+  parachute auth set-password [--username <name>] [--password <pw>] [--allow-multi]
+                                       Create or update the hub user's password
+  parachute auth list-users            Show registered hub accounts
+  parachute auth link-pubkey --user <name> <pubkey>
+                                       Bind a Nostr pubkey to an existing hub
+                                       user (operator-attested; no SPA ceremony).
+                                       pubkey is 64-char lowercase hex or npub1…
+  parachute auth 2fa [status]          Show hub-login 2FA (TOTP) status
+  parachute auth 2fa enroll [--username <name>]
+                                       Enroll TOTP for hub login (prints the
+                                       otpauth:// URI + base32 secret for manual
+                                       authenticator entry, then prompts for a
+                                       confirm code; prints backup codes once)
+  parachute auth 2fa disenroll [--username <name>]
+                                       Turn off hub-login 2FA for the account
+  parachute auth rotate-key            Rotate the hub's JWT signing key
+  parachute auth rotate-operator [--scope-set <set>]
+                                       Mint a fresh ~/.parachute/operator.token
+                                       (set = install|start|expose|auth|vault|admin,
+                                       default admin)
+  parachute auth mint-token --scope <scope> [--aud <aud>]
+                                            [--ephemeral | --expires-in <seconds>]
+                                            [--label <label>] [--user <username|id>]
+                                            [--service <name>] [--permissions <json>]
+                                       Mint a scope-narrow JWT. Person-mint
+                                       JWT sub is the hub account id (stdout =
+                                       JWT). --label is the display label
+                                       (tokens.subject). --user (operator)
+                                       mints as that account. --service mints
+                                       a non-account principal. --sub is the
+                                       deprecated alias of --label (or --user
+                                       when the value matches an account).
+                                       --ephemeral = short-lived (1h); default
+                                       lifetime is 90d. --ttl is the deprecated
+                                       lifetime alias.
+  parachute auth revoke-token <jti>    Mark a registry-row token revoked
+                                       by jti. Idempotent: a re-revoke
+                                       prints the existing revoked_at and
+                                       exits 0. Refuses the live
+                                       operator.token jti unless
+                                       --break-glass is passed.
+  parachute auth pending-clients       List OAuth clients awaiting approval
+  parachute auth approve-client <id>   Approve a pending OAuth client
+  parachute auth revoke-client <id>    Deregister (delete) an OAuth client,
+                                       cascading its grants + auth codes
+                                       (RFC 7592 deregistration)
+  parachute auth reap-clients [--older-than <days>] [--apply] [--json]
+                                       Garbage-collect abandoned/dead OAuth
+                                       clients (DCR reconnect churn). Dry-run
+                                       by default — lists what WOULD be reaped
+                                       and deletes nothing; pass --apply to
+                                       actually delete.
+  parachute auth list-grants [--username <name>]
+                                       Show OAuth scope grants on record
+  parachute auth revoke-grant <client_id> [--username <name>]
+                                       Forget a granted scope-set so the next
+                                       OAuth flow re-prompts for consent
+
+set-password and list-users are hub-local — they read/write
+~/.parachute/hub.db. set-password is interactive by default (prompts for
+the password twice with hidden input). For scripted use, pass
+\`--password <pw>\` and (for first-run setup) \`--username <name>\`.
+
+The default username on first run is "owner" — override with --username.
+Single-user mode is the default; pass --allow-multi to add additional
+accounts beyond the first.
+
+2fa is real hub-login TOTP (hub#473). It reads/writes the hub.db \`users\` TOTP
+columns and gates \`/login\`: once enrolled, signing in requires a 6-digit code
+from your authenticator app (or a single-use backup code) after your password.
+
+\`parachute auth 2fa enroll\` is headless-friendly — it prints the \`otpauth://\`
+URI and the base32 secret as text so you can type them into an authenticator
+manually (no QR scan needed on a server), then prompts for the current 6-digit
+code to confirm. On success it prints 10 single-use backup codes ONCE — save
+them. The browser path (\`<hub-origin>/account/2fa\`) shows a scannable QR code.
+
+\`parachute auth 2fa disenroll\` clears the TOTP secret + backup codes.
+
+In single-user mode both default to the only hub account; pass --username to
+target a specific account when more than one exists.
+
+rotate-key generates a fresh RSA-2048 keypair and retires the previous
+one. The retired key keeps appearing in /.well-known/jwks.json for 24
+hours so cached client copies keep validating until their TTL expires.
+
+rotate-operator mints a fresh long-lived operator token at
+~/.parachute/operator.token (mode 0600). Local CLI tools read this file
+as their bearer when calling on-box services. set-password also writes
+the file on first-run / password reset. Default lifetime is 90d (was
+365d through 0.5.7); CLI flows that read the token within 7d of expiry
+auto-rotate it in place, so weekly users never see an expiry surprise.
+
+--scope-set chooses how broad the new token is:
+  install  — install/upgrade modules (vault:read for new-vault discovery)
+  start    — lifecycle modules (start/stop/restart/status)
+  expose   — bring tailnet / public exposure layers up and down
+  auth     — mint hub-issued tokens, manage user accounts
+  vault    — administer vaults (create / configure / delete)
+  admin    — superset of all above; pre-#213 default and current default
+
+Phase 1 of #213 ships the vocabulary + flag; Phase 2 (separate follow-up)
+wires per-command enforcement so an \`install\`-only token can't, say, run
+\`parachute expose public\`. Until then, --scope-set is a tool the cautious
+operator can opt into without breaking anyone.
+
+mint-token issues a single scope-narrow JWT against the operator's
+identity, signed with the same key as OAuth-issued tokens. Pipeable:
+\`parachute auth mint-token --scope scribe:transcribe | pbcopy\`. The
+audience defaults via the same inference rule the OAuth flow uses
+(named \`vault:<name>:<verb>\` → \`vault.<name>\`, otherwise the first
+colon-prefixed scope's namespace, fallback \`hub\`). Lifetime defaults
+to 90d, caps at 365d.
+
+--ephemeral mints a short-lived (1h) token — the right default for
+scripting, where the credential only needs to outlive the script run.
+Prefer it over a long-lived token for one-off automation:
+\`parachute auth mint-token --scope vault:default:read --ephemeral\`.
+Mutually exclusive with --expires-in / --ttl.
+
+--scope accepts space-separated multi-scope (e.g.
+\`--scope "vault:default:read agent:wovenboulder:invoke"\`).
+
+--expires-in is the canonical lifetime flag — integer seconds (e.g.
+\`--expires-in 86400\` for 1 day). The legacy \`--ttl\` flag accepts a
+duration suffix (\`90d\` / \`24h\` / \`30m\` / \`60s\`) and is supported as
+a deprecated alias; passing it emits a one-line stderr deprecation
+notice. \`--ttl\` will be removed in a future release.
+
+--permissions accepts a JSON object encoding fine-grained constraints
+beyond OAuth scope (e.g.
+\`--permissions '{"vault":{"default":{"write_tags":["health"]}}}'\`).
+Carried in the JWT as the \`permissions\` claim per the convergence
+section of the auth-architecture research doc.
+
+Every mint writes a row to the hub's token registry (one source of
+truth for revocation, admin UI introspection). Requires a valid
+~/.parachute/operator.token (run \`parachute auth set-password\` or
+\`rotate-operator\` first).
+
+revoke-token flips \`revoked_at\` on a registry row by jti. The
+revocation list endpoint
+(\`/.well-known/parachute-revocation.json\`) picks the change up on
+its next 60s poll; resource servers (vault / scribe / agent) on
+scope-guard 0.2.0+ then reject the JWT. Idempotent: re-revoking an
+already-revoked jti prints the existing revoked_at and exits 0.
+Requires \`parachute:host:auth\` on the operator token (the \`auth\`
+or \`admin\` scope-set). It REFUSES to revoke the jti currently in
+~/.parachute/operator.token — that credential is what module-ops
+(start/stop/restart/upgrade) authenticates with, so revoking it takes
+the box's lifecycle verbs down. Rotate first (\`rotate-operator\`), or
+pass \`--break-glass\` if killing it is the actual intent. Every revoke
+records the actor (\`revoked_by\` = \`cli:<unix user>\`, \`revoked_via\`
+= \`cli\`) on the registry row.
+
+pending-clients + approve-client gate /oauth/register against operator
+approval (closes #74). Self-served DCR registrations land as 'pending'
+and cannot OAuth until you run \`parachute auth approve-client <id>\`.
+First-party install flows that present \`Authorization: Bearer
+<operator-token>\` with \`hub:admin\` scope land as 'approved' immediately.
+
+reap-clients garbage-collects abandoned/dead OAuth clients (closes #640).
+DCR churn — Notes/Claude mint a FRESH client_id per reconnect — accumulates
+dead \`clients\` rows in the operator's hub.db. reap-clients deletes only the
+PROVABLY-DEAD ones: a client is reapable iff it has ZERO grants (no standing
+consent), ZERO live tokens (none unexpired+unrevoked), ZERO in-flight auth
+codes, AND was registered more than --older-than days ago (default 30). A
+client with a live grant, a live token, or an in-flight code is NEVER touched.
+
+Dry-run by DEFAULT: prints the clients that WOULD be reaped and deletes
+nothing — review before deleting. Pass \`--apply\` to actually delete them
+(grants + auth codes + dead tokens cascade). \`--older-than <days>\` tunes the
+age floor; \`--json\` emits machine-readable output.
+
+list-grants + revoke-grant manage the OAuth consent skip-list (closes
+#75). When you approve a scope-set on the consent screen, the hub
+records it so re-running the same flow goes straight to the auth-code
+redirect — no second consent prompt for scopes you've already approved.
+revoke-grant deletes the row so the next flow shows consent again.
+Existing access tokens are NOT touched by revoke-grant; use
+\`/oauth/revoke\` (or wait for them to expire) to terminate live sessions.
+`;
+}
+
+export interface AuthDeps {
+  runner?: Runner;
+  rotateKey?: () => { kid: string; createdAt: string };
+  /** Read a hidden password from the terminal. Tests inject a fixed answer. */
+  readPassword?: (prompt: string) => Promise<string>;
+  /** Read a non-hidden line — username, confirmations, etc. */
+  readLine?: (prompt: string) => Promise<string>;
+  /** Whether stdin+stdout are a TTY. Tests force false. */
+  isInteractive?: () => boolean;
+  /** Override the hub-db path. Tests point at a tmp dir. */
+  dbPath?: string;
+  /**
+   * Override the directory where `operator.token` is written. Defaults to
+   * `configDir()` (i.e. `~/.parachute/`). Tests point at a tmp dir.
+   */
+  configDir?: string;
+  /**
+   * Override the hub origin written into the operator token's `iss` claim.
+   * When unset, derived from `expose-state.json` → hub.port → canonical
+   * `http://127.0.0.1:1939`, mirroring the resolution `parachute start` uses
+   * for `PARACHUTE_HUB_ORIGIN` so the token's iss matches what services see.
+   */
+  hubOrigin?: string;
+  /**
+   * Test seam (hub#833): runs after `signAccessToken` and before
+   * `recordTokenMint` on `mint-token`. Production omits it.
+   */
+  afterSign?: (ctx: { token: string; jti: string; userId: string | null }) => void | Promise<void>;
+}
+
+function defaultRotateKey(): { kid: string; createdAt: string } {
+  const db = openHubDb();
+  try {
+    const k = rotateSigningKey(db);
+    return { kid: k.kid, createdAt: k.createdAt };
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Hidden-input password read using stdin raw mode. Hand-rolled rather than
+ * pulling in a prompt library — the surface is small (Enter/Backspace/Ctrl-C)
+ * and adding a transitive dep just to hide echo is overkill.
+ */
+async function defaultReadPassword(prompt: string): Promise<string> {
+  process.stdout.write(prompt);
+  return new Promise<string>((resolve, reject) => {
+    const stdin = process.stdin;
+    let buf = "";
+    const teardown = () => {
+      stdin.setRawMode(false);
+      stdin.pause();
+      stdin.removeListener("data", onData);
+    };
+    const onData = (chunk: Buffer) => {
+      const ch = chunk.toString("utf8");
+      for (const c of ch) {
+        if (c === "\n" || c === "\r" || c === "\u0004") {
+          teardown();
+          process.stdout.write("\n");
+          resolve(buf);
+          return;
+        }
+        if (c === "\u0003") {
+          teardown();
+          process.stdout.write("\n");
+          reject(new Error("interrupted"));
+          return;
+        }
+        if (c === "\u007f" || c === "\b") {
+          buf = buf.slice(0, -1);
+          continue;
+        }
+        buf += c;
+      }
+    };
+    stdin.setRawMode(true);
+    stdin.resume();
+    stdin.on("data", onData);
+  });
+}
+
+async function defaultReadLine(prompt: string): Promise<string> {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    return await rl.question(prompt);
+  } finally {
+    rl.close();
+  }
+}
+
+function defaultIsInteractive(): boolean {
+  return Boolean(process.stdin.isTTY && process.stdout.isTTY);
+}
+
+interface ParsedFlags {
+  username?: string;
+  password?: string;
+  allowMulti: boolean;
+  error?: string;
+}
+
+function parseSetPasswordFlags(args: readonly string[]): ParsedFlags {
+  let username: string | undefined;
+  let password: string | undefined;
+  let allowMulti = false;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--username") {
+      const v = args[++i];
+      if (!v) return { allowMulti, error: "--username requires a value" };
+      username = v;
+    } else if (a?.startsWith("--username=")) {
+      username = a.slice("--username=".length);
+      if (!username) return { allowMulti, error: "--username requires a value" };
+    } else if (a === "--password") {
+      const v = args[++i];
+      if (!v) return { allowMulti, error: "--password requires a value" };
+      password = v;
+    } else if (a?.startsWith("--password=")) {
+      password = a.slice("--password=".length);
+      if (!password) return { allowMulti, error: "--password requires a value" };
+    } else if (a === "--allow-multi") {
+      allowMulti = true;
+    } else {
+      return { allowMulti, error: `unknown flag "${a}"` };
+    }
+  }
+  return { username, password, allowMulti };
+}
+
+async function runSetPassword(args: readonly string[], deps: AuthDeps): Promise<number> {
+  const flags = parseSetPasswordFlags(args);
+  if (flags.error) {
+    console.error(`parachute auth set-password: ${flags.error}`);
+    return 1;
+  }
+  const isInteractive = (deps.isInteractive ?? defaultIsInteractive)();
+  const readPassword = deps.readPassword ?? defaultReadPassword;
+  const readLine = deps.readLine ?? defaultReadLine;
+
+  const db = deps.dbPath ? openHubDb(deps.dbPath) : openHubDb();
+  try {
+    const existing = listUsers(db);
+    const existingUser = existing[0];
+    const targetUsername = flags.username ?? existingUser?.username ?? "owner";
+
+    let password = flags.password;
+    if (!password) {
+      if (!isInteractive) {
+        console.error(
+          "parachute auth set-password: --password is required when stdin is not a TTY",
+        );
+        return 1;
+      }
+      const p1 = await readPassword(`Password for "${targetUsername}": `);
+      if (p1.length === 0) {
+        console.error("password cannot be empty");
+        return 1;
+      }
+      const p2 = await readPassword("Confirm password: ");
+      if (p1 !== p2) {
+        console.error("passwords did not match");
+        return 1;
+      }
+      password = p1;
+    }
+
+    if (existingUser) {
+      // Update path. If --username supplied AND it doesn't match, that's
+      // ambiguous: are they renaming or addressing a new user? In single-user
+      // mode we refuse rather than guessing.
+      if (flags.username && flags.username !== existingUser.username && !flags.allowMulti) {
+        console.error(
+          `a user named "${existingUser.username}" already exists. To create another, pass --allow-multi.`,
+        );
+        return 1;
+      }
+      const target =
+        flags.username && flags.username !== existingUser.username && flags.allowMulti
+          ? null
+          : existingUser;
+      if (target) {
+        await setPassword(db, target.id, password);
+        console.log(`Updated password for "${target.username}".`);
+        const issued = await issueOperatorToken(db, target.id, {
+          dir: deps.configDir,
+          issuer: resolveHubIssuer(deps.hubOrigin, deps.configDir ?? CONFIG_DIR),
+        });
+        console.log(`Refreshed operator token at ${issued.path}.`);
+        return 0;
+      }
+    }
+
+    // Create path (no user exists yet, or --allow-multi for an additional one).
+    if (existing.length > 0 && !flags.allowMulti) {
+      // Should be unreachable given the existingUser branch above, but keep
+      // the explicit guard so a future refactor can't quietly drop it.
+      console.error("a user already exists; pass --allow-multi to create another");
+      return 1;
+    }
+
+    // For first-run interactive without an explicit --username, confirm.
+    if (existing.length === 0 && !flags.username && isInteractive) {
+      const answer = (await readLine(`Create the first hub user named "owner"? [Y/n] `)).trim();
+      if (answer.length > 0 && !/^y(es)?$/i.test(answer)) {
+        console.error("aborted; pass --username <name> to choose a different name");
+        return 1;
+      }
+    }
+
+    try {
+      // `passwordChanged: true` matches the wizard + env-seed paths: the
+      // CLI user typed their password at the prompt above (or supplied
+      // it via --password), so they don't need PR 3's force-change-on-
+      // first-sign-in redirect. Same reasoning as
+      // `seedInitialAdminIfNeeded` and `handleSetupAccountPost`.
+      const u = await createUser(db, targetUsername, password, {
+        allowMulti: flags.allowMulti,
+        passwordChanged: true,
+      });
+      console.log(`Created hub user "${u.username}" (id=${u.id}).`);
+      const issued = await issueOperatorToken(db, u.id, {
+        dir: deps.configDir,
+        issuer: resolveHubIssuer(deps.hubOrigin, deps.configDir ?? CONFIG_DIR),
+      });
+      console.log(`Wrote operator token to ${issued.path} (mode 0600).`);
+      return 0;
+    } catch (err) {
+      if (err instanceof SingleUserModeError) {
+        console.error(err.message);
+        return 1;
+      }
+      if (err instanceof UsernameTakenError) {
+        console.error(err.message);
+        return 1;
+      }
+      if (err instanceof InvalidUsernameError) {
+        console.error(err.message);
+        return 1;
+      }
+      throw err;
+    }
+  } finally {
+    db.close();
+  }
+}
+
+interface RotateOperatorFlags {
+  scopeSet?: OperatorScopeSet;
+  error?: string;
+}
+
+function parseRotateOperatorFlags(args: readonly string[]): RotateOperatorFlags {
+  let scopeSet: OperatorScopeSet | undefined;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--scope-set") {
+      const v = args[++i];
+      if (!v) return { error: "--scope-set requires a value" };
+      if (!isOperatorScopeSet(v)) {
+        return {
+          error: `--scope-set must be one of ${OPERATOR_TOKEN_SCOPE_SET_NAMES.join("|")}, got "${v}"`,
+        };
+      }
+      scopeSet = v;
+    } else if (a?.startsWith("--scope-set=")) {
+      const v = a.slice("--scope-set=".length);
+      if (!v) return { error: "--scope-set requires a value" };
+      if (!isOperatorScopeSet(v)) {
+        return {
+          error: `--scope-set must be one of ${OPERATOR_TOKEN_SCOPE_SET_NAMES.join("|")}, got "${v}"`,
+        };
+      }
+      scopeSet = v;
+    } else {
+      return { error: `unknown flag "${a}"` };
+    }
+  }
+  return scopeSet !== undefined ? { scopeSet } : {};
+}
+
+async function runRotateOperator(args: readonly string[], deps: AuthDeps): Promise<number> {
+  const flags = parseRotateOperatorFlags(args);
+  if (flags.error) {
+    console.error(`parachute auth rotate-operator: ${flags.error}`);
+    return 1;
+  }
+  const db = deps.dbPath ? openHubDb(deps.dbPath) : openHubDb();
+  try {
+    const users = listUsers(db);
+    const owner = users[0];
+    if (!owner) {
+      console.error(
+        "no hub users yet — run `parachute auth set-password` to create the first one before issuing an operator token",
+      );
+      return 1;
+    }
+    const issued = await issueOperatorToken(db, owner.id, {
+      dir: deps.configDir,
+      issuer: resolveHubIssuer(deps.hubOrigin, deps.configDir ?? CONFIG_DIR),
+      ...(flags.scopeSet !== undefined ? { scopeSet: flags.scopeSet } : {}),
+    });
+    console.log("Rotated operator token.");
+    console.log(`  user:       ${owner.username}`);
+    console.log(`  scope_set:  ${issued.scopeSet}`);
+    console.log(`  path:       ${issued.path}`);
+    console.log(`  expires_at: ${issued.expiresAt}`);
+    console.log(
+      "Previous tokens stay valid until they expire — the hub does not revoke them. Treat operator.token like an SSH key.",
+    );
+    return 0;
+  } finally {
+    db.close();
+  }
+}
+
+function runPendingClients(deps: AuthDeps): number {
+  const db = deps.dbPath ? openHubDb(deps.dbPath) : openHubDb();
+  try {
+    const pending = listClientsByStatus(db, "pending");
+    if (pending.length === 0) {
+      console.log("(no pending OAuth clients)");
+      return 0;
+    }
+    console.log("CLIENT_ID                              NAME                 REGISTERED");
+    for (const c of pending) {
+      const id = c.clientId.padEnd(36).slice(0, 36);
+      const name = (c.clientName ?? "").padEnd(20).slice(0, 20);
+      console.log(`${id}  ${name} ${c.registeredAt}`);
+    }
+    return 0;
+  } finally {
+    db.close();
+  }
+}
+
+function runApproveClient(args: readonly string[], deps: AuthDeps): number {
+  const clientId = args[0];
+  if (!clientId) {
+    console.error("parachute auth approve-client: missing client_id argument");
+    console.error("usage: parachute auth approve-client <client_id>");
+    return 1;
+  }
+  const db = deps.dbPath ? openHubDb(deps.dbPath) : openHubDb();
+  try {
+    const ok = approveClient(db, clientId);
+    if (!ok) {
+      console.error(`no OAuth client registered with client_id "${clientId}"`);
+      return 1;
+    }
+    console.log(`Approved OAuth client "${clientId}".`);
+    return 0;
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * `parachute auth revoke-client <id>` — RFC 7592 deregistration from the
+ * terminal. The CLI complement to the `DELETE /oauth/clients/<id>` route
+ * parachute-surface fires automatically; an operator runs this to clean up
+ * an orphaned / stale client by hand (closes hub#640). Calls the
+ * `deleteClient` cascade helper directly (same db, no round-trip through the
+ * HTTP route) and emits the same `client deleted:` audit line the route does
+ * so browser-driven and terminal-driven deletions are uniformly greppable in
+ * hub.log. `remover_sub=cli` distinguishes the terminal path (which has no
+ * authenticated JWT subject) from the route's `remover_sub=<jwt sub>`.
+ */
+function runRevokeClient(args: readonly string[], deps: AuthDeps): number {
+  const clientId = args[0];
+  if (!clientId) {
+    console.error("parachute auth revoke-client: missing client_id argument");
+    console.error("usage: parachute auth revoke-client <client_id>");
+    return 1;
+  }
+  const db = deps.dbPath ? openHubDb(deps.dbPath) : openHubDb();
+  try {
+    // Read the name before deleting so the audit line + confirmation can
+    // carry it. getClient also gives us the "exists?" answer for the 404 path.
+    const before = getClient(db, clientId);
+    const removed = deleteClient(db, clientId);
+    if (!removed) {
+      console.error(`no OAuth client registered with client_id "${clientId}"`);
+      return 1;
+    }
+    console.log(
+      `client deleted: client_id=${clientId} client_name=${before?.clientName ?? ""} remover_sub=cli`,
+    );
+    console.log(`Deregistered OAuth client "${clientId}" (grants + auth codes cascaded).`);
+    return 0;
+  } finally {
+    db.close();
+  }
+}
+
+interface ReapClientsFlags {
+  /** Age floor in days. Defaults to DEFAULT_REAP_AGE_MS / day. */
+  olderThanDays?: number;
+  /** --apply: actually delete. Without it, dry-run (default). */
+  apply: boolean;
+  /** --json: machine-readable output. */
+  json: boolean;
+  error?: string;
+}
+
+function parseReapClientsFlags(args: readonly string[]): ReapClientsFlags {
+  let olderThanDays: number | undefined;
+  let apply = false;
+  let json = false;
+  const parseDays = (raw: string | undefined): number | undefined | "error" => {
+    if (!raw) return "error";
+    // Whole, positive day count. Reject 0 / negatives / non-integers — an
+    // --older-than 0 would reap freshly-registered clients (the exact thing
+    // condition 4 of the gate exists to prevent).
+    if (!/^\d+$/.test(raw)) return "error";
+    const n = Number.parseInt(raw, 10);
+    if (!Number.isFinite(n) || n <= 0) return "error";
+    return n;
+  };
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--older-than") {
+      const parsed = parseDays(args[++i]);
+      if (parsed === "error")
+        return { apply, json, error: "--older-than requires a positive integer (days)" };
+      olderThanDays = parsed;
+    } else if (a?.startsWith("--older-than=")) {
+      const parsed = parseDays(a.slice("--older-than=".length));
+      if (parsed === "error")
+        return { apply, json, error: "--older-than requires a positive integer (days)" };
+      olderThanDays = parsed;
+    } else if (a === "--apply") {
+      apply = true;
+    } else if (a === "--json") {
+      json = true;
+    } else {
+      return { apply, json, error: `unknown flag "${a}"` };
+    }
+  }
+  return olderThanDays !== undefined ? { olderThanDays, apply, json } : { apply, json };
+}
+
+/**
+ * `parachute auth reap-clients` — garbage-collect abandoned/dead OAuth clients
+ * (closes hub#640). DCR churn (Notes/Claude mint a fresh client_id per
+ * reconnect) accumulates dead `clients` rows; this reaps the PROVABLY-DEAD
+ * ones via the conservative `findReapableClients` gate (zero grants, zero live
+ * tokens, zero in-flight auth_codes, older than the age floor).
+ *
+ * DRY-RUN BY DEFAULT — the load-bearing safety choice. A reaper that deletes a
+ * live client breaks a user's active connection, so the default run only
+ * REPORTS what it would delete and touches nothing; `--apply` performs the
+ * deletion. The same `findReapableClients` snapshot drives both the dry-run
+ * listing and the --apply loop, so what's printed is exactly what gets reaped.
+ */
+function runReapClients(args: readonly string[], deps: AuthDeps): number {
+  const flags = parseReapClientsFlags(args);
+  if (flags.error) {
+    console.error(`parachute auth reap-clients: ${flags.error}`);
+    console.error("usage: parachute auth reap-clients [--older-than <days>] [--apply] [--json]");
+    return 1;
+  }
+  const olderThanMs =
+    flags.olderThanDays !== undefined
+      ? flags.olderThanDays * 24 * 60 * 60 * 1000
+      : DEFAULT_REAP_AGE_MS;
+  const olderThanDays = olderThanMs / (24 * 60 * 60 * 1000);
+
+  const db = deps.dbPath ? openHubDb(deps.dbPath) : openHubDb();
+  try {
+    const reapable = findReapableClients(db, { olderThanMs });
+
+    if (flags.json) {
+      // Machine-readable: the candidate set + whether we actually deleted.
+      // In --apply mode each row carries `reaped: true` after deletion. Audit
+      // lines route to stderr so stdout stays pure JSON for piping into `jq`.
+      const deleted = flags.apply ? applyReap(db, reapable, console.error) : [];
+      console.log(
+        JSON.stringify(
+          {
+            applied: flags.apply,
+            olderThanDays,
+            count: reapable.length,
+            clients: reapable.map((c) => ({
+              clientId: c.clientId,
+              clientName: c.clientName,
+              registeredAt: c.registeredAt,
+              status: c.status,
+              ageDays: c.ageDays,
+              ...(flags.apply ? { reaped: deleted.includes(c.clientId) } : {}),
+            })),
+          },
+          null,
+          2,
+        ),
+      );
+      return 0;
+    }
+
+    if (reapable.length === 0) {
+      console.log("No abandoned clients to reap.");
+      return 0;
+    }
+
+    printReapTable(reapable);
+
+    if (!flags.apply) {
+      const plural = reapable.length === 1 ? "client" : "clients";
+      console.log("");
+      console.log(
+        `Dry run — nothing deleted. Run with --apply to delete ${reapable.length} ${plural}.`,
+      );
+      return 0;
+    }
+
+    const deleted = applyReap(db, reapable);
+    console.log("");
+    const plural = deleted.length === 1 ? "client" : "clients";
+    console.log(
+      `Reaped ${deleted.length} abandoned OAuth ${plural} (grants + auth codes + dead tokens cascaded).`,
+    );
+    return 0;
+  } finally {
+    db.close();
+  }
+}
+
+/** Print the dry-run / apply table of reapable clients. */
+function printReapTable(reapable: readonly ReapableClient[]): void {
+  console.log(
+    "CLIENT_ID                              NAME                 STATUS    AGE_DAYS  REGISTERED",
+  );
+  for (const c of reapable) {
+    const id = c.clientId.padEnd(36).slice(0, 36);
+    const name = (c.clientName ?? "").padEnd(20).slice(0, 20);
+    const status = c.status.padEnd(8).slice(0, 8);
+    const age = String(c.ageDays).padStart(8);
+    console.log(`${id}  ${name} ${status}  ${age}  ${c.registeredAt}`);
+  }
+}
+
+/**
+ * Delete each reapable client via `reapClient`, emitting one audit line per
+ * deletion (`client reaped:` — greppable in hub.log alongside `client
+ * deleted:` from the manual revoke path). Returns the client_ids actually
+ * removed. Callers pass ONLY the `findReapableClients` output, so every id
+ * here has already cleared the safety gate.
+ *
+ * `audit` is the sink for the per-deletion lines — `console.log` for the human
+ * table path, `console.error` for `--json` (keeps stdout pure JSON for `jq`).
+ */
+function applyReap(
+  db: ReturnType<typeof openHubDb>,
+  reapable: readonly ReapableClient[],
+  audit: (line: string) => void = console.log,
+): string[] {
+  const deleted: string[] = [];
+  for (const c of reapable) {
+    if (reapClient(db, c.clientId)) {
+      deleted.push(c.clientId);
+      audit(
+        `client reaped: client_id=${c.clientId} client_name=${c.clientName ?? ""} age_days=${c.ageDays} status=${c.status}`,
+      );
+    }
+  }
+  return deleted;
+}
+
+interface UsernameFlag {
+  username?: string;
+  rest: string[];
+  error?: string;
+}
+
+function extractUsernameFlag(args: readonly string[]): UsernameFlag {
+  let username: string | undefined;
+  const rest: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--username") {
+      const v = args[++i];
+      if (!v) return { rest, error: "--username requires a value" };
+      username = v;
+    } else if (a?.startsWith("--username=")) {
+      username = a.slice("--username=".length);
+      if (!username) return { rest, error: "--username requires a value" };
+    } else if (a !== undefined) {
+      rest.push(a);
+    }
+  }
+  return { username, rest };
+}
+
+/**
+ * Resolve the user a grant subcommand operates on. Default is "the only hub
+ * user" (single-user mode); --username is required when multiple users exist.
+ */
+function resolveTargetUser(
+  db: ReturnType<typeof openHubDb>,
+  flagUsername: string | undefined,
+  cmd: string,
+): { id: string; username: string } | { error: string } {
+  if (flagUsername) {
+    const u = getUserByUsername(db, flagUsername);
+    if (!u) return { error: `no hub user named "${flagUsername}"` };
+    return { id: u.id, username: u.username };
+  }
+  const users = listUsers(db);
+  if (users.length === 0)
+    return { error: "no hub users yet — run `parachute auth set-password` first" };
+  if (users.length > 1) {
+    return {
+      error: `multiple hub users exist; pass --username <name> to ${cmd} a specific user's grant`,
+    };
+  }
+  const only = users[0]!;
+  return { id: only.id, username: only.username };
+}
+
+function runListGrants(args: readonly string[], deps: AuthDeps): number {
+  const flag = extractUsernameFlag(args);
+  if (flag.error) {
+    console.error(`parachute auth list-grants: ${flag.error}`);
+    return 1;
+  }
+  if (flag.rest.length > 0) {
+    console.error(`parachute auth list-grants: unexpected argument "${flag.rest[0]}"`);
+    console.error("usage: parachute auth list-grants [--username <name>]");
+    return 1;
+  }
+  const db = deps.dbPath ? openHubDb(deps.dbPath) : openHubDb();
+  try {
+    const target = resolveTargetUser(db, flag.username, "list");
+    if ("error" in target) {
+      console.error(`parachute auth list-grants: ${target.error}`);
+      return 1;
+    }
+    const grants = listGrantsForUser(db, target.id);
+    if (grants.length === 0) {
+      console.log(`(no OAuth grants on record for "${target.username}")`);
+      return 0;
+    }
+    console.log(`OAuth grants for "${target.username}":`);
+    console.log(
+      "CLIENT_ID                              NAME                 GRANTED_AT                SCOPES",
+    );
+    for (const g of grants) {
+      const client = getClient(db, g.clientId);
+      const id = g.clientId.padEnd(36).slice(0, 36);
+      const name = (client?.clientName ?? "").padEnd(20).slice(0, 20);
+      const at = g.grantedAt.padEnd(24).slice(0, 24);
+      console.log(`${id}  ${name} ${at}  ${g.scopes.join(" ")}`);
+    }
+    return 0;
+  } finally {
+    db.close();
+  }
+}
+
+function runRevokeGrant(args: readonly string[], deps: AuthDeps): number {
+  const flag = extractUsernameFlag(args);
+  if (flag.error) {
+    console.error(`parachute auth revoke-grant: ${flag.error}`);
+    return 1;
+  }
+  const clientId = flag.rest[0];
+  if (!clientId) {
+    console.error("parachute auth revoke-grant: missing client_id argument");
+    console.error("usage: parachute auth revoke-grant <client_id> [--username <name>]");
+    return 1;
+  }
+  if (flag.rest.length > 1) {
+    console.error(`parachute auth revoke-grant: unexpected argument "${flag.rest[1]}"`);
+    return 1;
+  }
+  const db = deps.dbPath ? openHubDb(deps.dbPath) : openHubDb();
+  try {
+    const target = resolveTargetUser(db, flag.username, "revoke");
+    if ("error" in target) {
+      console.error(`parachute auth revoke-grant: ${target.error}`);
+      return 1;
+    }
+    const removed = revokeGrant(db, target.id, clientId);
+    if (!removed) {
+      console.error(`no grant on record for "${target.username}" → "${clientId}"`);
+      return 1;
+    }
+    console.log(`Revoked OAuth grant: "${target.username}" → "${clientId}".`);
+    console.log(
+      "Existing access tokens are unaffected — they expire on their own. The next /oauth/authorize for this client will re-prompt for consent.",
+    );
+    return 0;
+  } finally {
+    db.close();
+  }
+}
+
+interface MintTokenFlags {
+  scope?: string;
+  aud?: string;
+  ttl?: string;
+  expiresIn?: string;
+  /** @deprecated Use --label or --user. */
+  sub?: string;
+  label?: string;
+  user?: string;
+  service?: string;
+  permissions?: string;
+  /** True when --ttl was used (deprecated alias). Triggers a one-line stderr warning. */
+  ttlDeprecationSeen?: boolean;
+  /** --ephemeral: short-lived token (EPHEMERAL_TTL_SECONDS), the scripting default. */
+  ephemeral?: boolean;
+  error?: string;
+}
+
+function parseMintTokenFlags(args: readonly string[]): MintTokenFlags {
+  let scope: string | undefined;
+  let aud: string | undefined;
+  let ttl: string | undefined;
+  let expiresIn: string | undefined;
+  let sub: string | undefined;
+  let label: string | undefined;
+  let user: string | undefined;
+  let service: string | undefined;
+  let permissions: string | undefined;
+  let ttlDeprecationSeen = false;
+  let ephemeral = false;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--scope") {
+      const v = args[++i];
+      if (!v) return { error: "--scope requires a value" };
+      scope = v;
+    } else if (a?.startsWith("--scope=")) {
+      scope = a.slice("--scope=".length);
+      if (!scope) return { error: "--scope requires a value" };
+    } else if (a === "--aud") {
+      const v = args[++i];
+      if (!v) return { error: "--aud requires a value" };
+      aud = v;
+    } else if (a?.startsWith("--aud=")) {
+      aud = a.slice("--aud=".length);
+      if (!aud) return { error: "--aud requires a value" };
+    } else if (a === "--ttl") {
+      const v = args[++i];
+      if (!v) return { error: "--ttl requires a value" };
+      ttl = v;
+      ttlDeprecationSeen = true;
+    } else if (a?.startsWith("--ttl=")) {
+      ttl = a.slice("--ttl=".length);
+      if (!ttl) return { error: "--ttl requires a value" };
+      ttlDeprecationSeen = true;
+    } else if (a === "--expires-in") {
+      const v = args[++i];
+      if (!v) return { error: "--expires-in requires a value" };
+      expiresIn = v;
+    } else if (a?.startsWith("--expires-in=")) {
+      expiresIn = a.slice("--expires-in=".length);
+      if (!expiresIn) return { error: "--expires-in requires a value" };
+    } else if (a === "--sub") {
+      const v = args[++i];
+      if (!v) return { error: "--sub requires a value" };
+      sub = v;
+    } else if (a?.startsWith("--sub=")) {
+      sub = a.slice("--sub=".length);
+      if (!sub) return { error: "--sub requires a value" };
+    } else if (a === "--label") {
+      const v = args[++i];
+      if (!v) return { error: "--label requires a value" };
+      label = v;
+    } else if (a?.startsWith("--label=")) {
+      label = a.slice("--label=".length);
+      if (!label) return { error: "--label requires a value" };
+    } else if (a === "--user") {
+      const v = args[++i];
+      if (!v) return { error: "--user requires a value" };
+      user = v;
+    } else if (a?.startsWith("--user=")) {
+      user = a.slice("--user=".length);
+      if (!user) return { error: "--user requires a value" };
+    } else if (a === "--service") {
+      const v = args[++i];
+      if (!v) return { error: "--service requires a value" };
+      service = v;
+    } else if (a?.startsWith("--service=")) {
+      service = a.slice("--service=".length);
+      if (!service) return { error: "--service requires a value" };
+    } else if (a === "--permissions") {
+      const v = args[++i];
+      if (!v) return { error: "--permissions requires a value" };
+      permissions = v;
+    } else if (a?.startsWith("--permissions=")) {
+      permissions = a.slice("--permissions=".length);
+      if (!permissions) return { error: "--permissions requires a value" };
+    } else if (a === "--ephemeral") {
+      ephemeral = true;
+    } else {
+      return { error: `unknown flag "${a}"` };
+    }
+  }
+  if (ttl !== undefined && expiresIn !== undefined) {
+    return { error: "pass --expires-in OR --ttl, not both (--ttl is the deprecated alias)" };
+  }
+  if (ephemeral && (ttl !== undefined || expiresIn !== undefined)) {
+    return {
+      error: "pass --ephemeral OR an explicit lifetime (--expires-in/--ttl), not both",
+    };
+  }
+  if (user !== undefined && service !== undefined) {
+    return { error: "pass --user OR --service, not both" };
+  }
+  if (sub !== undefined && (label !== undefined || user !== undefined || service !== undefined)) {
+    return {
+      error:
+        "--sub is deprecated; pass --user, --label, or --service instead (not together with --sub)",
+    };
+  }
+  return {
+    scope,
+    aud,
+    ttl,
+    expiresIn,
+    sub,
+    label,
+    user,
+    service,
+    permissions,
+    ttlDeprecationSeen,
+    ephemeral,
+  };
+}
+
+const MINT_TOKEN_TTL_DEFAULT_SECONDS = 90 * 24 * 60 * 60;
+const MINT_TOKEN_TTL_MAX_SECONDS = 365 * 24 * 60 * 60;
+// --ephemeral: short-lived token for scripting, where the credential only needs
+// to outlive the script run. 1h is long enough to mint → iterate → run, short
+// enough that a leaked scripting token isn't a standing liability like the 90d
+// default would be.
+const EPHEMERAL_TTL_SECONDS = 60 * 60;
+
+/**
+ * Parse a Go-ish duration string: integer + one of d/h/m/s. Caps at 365d.
+ * `90d` → 7776000. Used by the deprecated --ttl alias. The canonical
+ * --expires-in flag takes a raw integer seconds value (per OAuth's
+ * `expires_in` claim semantics — see `parseExpiresIn`).
+ */
+function parseTtl(input: string): { seconds: number } | { error: string } {
+  const m = /^(\d+)(d|h|m|s)$/.exec(input);
+  if (!m) return { error: `invalid --ttl "${input}" — expected e.g. 90d, 24h, 30m, 60s` };
+  const n = Number.parseInt(m[1]!, 10);
+  if (!Number.isFinite(n) || n <= 0) return { error: `invalid --ttl "${input}" — must be > 0` };
+  const unit = m[2]!;
+  const mult = unit === "d" ? 86400 : unit === "h" ? 3600 : unit === "m" ? 60 : 1;
+  const seconds = n * mult;
+  if (seconds > MINT_TOKEN_TTL_MAX_SECONDS) {
+    return { error: `--ttl "${input}" exceeds 365d cap` };
+  }
+  return { seconds };
+}
+
+/**
+ * Parse the canonical --expires-in flag value as an integer seconds count.
+ * Matches OAuth's `expires_in` claim semantics — the JWT `exp` is
+ * `iat + expires_in`. Caps at 365d like the deprecated --ttl path.
+ */
+function parseExpiresIn(input: string): { seconds: number } | { error: string } {
+  if (!/^\d+$/.test(input)) {
+    return {
+      error: `invalid --expires-in "${input}" — expected an integer seconds count (e.g. 86400 = 1 day)`,
+    };
+  }
+  const seconds = Number.parseInt(input, 10);
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return { error: `invalid --expires-in "${input}" — must be > 0` };
+  }
+  if (seconds > MINT_TOKEN_TTL_MAX_SECONDS) {
+    return {
+      error: `--expires-in "${input}" exceeds 365d cap (${MINT_TOKEN_TTL_MAX_SECONDS} seconds)`,
+    };
+  }
+  return { seconds };
+}
+
+async function runMintToken(args: readonly string[], deps: AuthDeps): Promise<number> {
+  const flags = parseMintTokenFlags(args);
+  if (flags.error) {
+    console.error(`parachute auth mint-token: ${flags.error}`);
+    return 1;
+  }
+  if (!flags.scope) {
+    console.error("parachute auth mint-token: --scope is required");
+    console.error(
+      "usage: parachute auth mint-token --scope <scope> [--aud <aud>] [--ephemeral | --expires-in <seconds>] [--label <label>] [--user <username|id>] [--service <name>] [--permissions <json>]",
+    );
+    return 1;
+  }
+
+  const scopes = flags.scope.split(/\s+/).filter((s) => s.length > 0);
+  if (scopes.length === 0) {
+    console.error("parachute auth mint-token: --scope must contain at least one scope");
+    return 1;
+  }
+
+  // Privilege-diffusion guard: mint paths cannot themselves mint tokens
+  // carrying non-requestable scopes (parachute:host:admin, the host:*
+  // narrow scopes, vault:<name>:admin). Holder of `parachute:host:auth`
+  // can mint vault/scribe/agent verb scopes for downstream services, but
+  // cannot mint another `:auth` (or any other non-requestable) without
+  // forced re-auth via the operator.token rotation path. Same set the
+  // public OAuth flow already rejects.
+  const blocked = scopes.filter((s) => isNonRequestableScope(s));
+  if (blocked.length > 0) {
+    console.error(
+      `parachute auth mint-token: scope ${blocked.join(", ")} is not requestable via mint-token; use OAuth flow or operator rotation`,
+    );
+    return 1;
+  }
+
+  let permissions: string | undefined;
+  if (flags.permissions !== undefined) {
+    try {
+      // Parse to validate well-formedness — round-trip through JSON.stringify
+      // so we hand the JWT a canonicalized payload (no operator-introduced
+      // whitespace, no comments, no trailing commas).
+      const parsed = JSON.parse(flags.permissions) as unknown;
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        console.error(
+          'parachute auth mint-token: --permissions must be a JSON object (e.g. \'{"vault":{"default":{"write_tags":["health"]}}}\')',
+        );
+        return 1;
+      }
+      permissions = JSON.stringify(parsed);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`parachute auth mint-token: --permissions is not valid JSON — ${msg}`);
+      return 1;
+    }
+  }
+
+  let ttlSeconds = MINT_TOKEN_TTL_DEFAULT_SECONDS;
+  if (flags.ephemeral) {
+    // Short-lived scripting default — takes precedence (the parse layer already
+    // rejected --ephemeral alongside an explicit --expires-in/--ttl).
+    ttlSeconds = EPHEMERAL_TTL_SECONDS;
+  } else if (flags.expiresIn) {
+    const parsed = parseExpiresIn(flags.expiresIn);
+    if ("error" in parsed) {
+      console.error(`parachute auth mint-token: ${parsed.error}`);
+      return 1;
+    }
+    ttlSeconds = parsed.seconds;
+  } else if (flags.ttl) {
+    const parsed = parseTtl(flags.ttl);
+    if ("error" in parsed) {
+      console.error(`parachute auth mint-token: ${parsed.error}`);
+      return 1;
+    }
+    ttlSeconds = parsed.seconds;
+  }
+  if (flags.ttlDeprecationSeen) {
+    console.error(
+      "parachute auth mint-token: --ttl is deprecated; use --expires-in <seconds> instead (will be removed in a future release)",
+    );
+  }
+
+  const configDir = deps.configDir ?? CONFIG_DIR;
+  const issuer = resolveHubIssuer(deps.hubOrigin, configDir);
+
+  const db = deps.dbPath ? openHubDb(deps.dbPath) : openHubDb();
+  try {
+    let used: Awaited<ReturnType<typeof useOperatorTokenWithAutoRotate>>;
+    try {
+      used = await useOperatorTokenWithAutoRotate(db, { configDir, issuer });
+    } catch (err) {
+      if (err instanceof OperatorTokenExpiredError) {
+        console.error(`parachute auth mint-token: ${err.message}`);
+        return 1;
+      }
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`parachute auth mint-token: operator token invalid — ${msg}`);
+      console.error(
+        "run `parachute auth rotate-operator` to mint a fresh one, or check that the hub origin matches",
+      );
+      return 1;
+    }
+    if (!used) {
+      console.error(
+        "parachute auth mint-token: no operator token found at ~/.parachute/operator.token",
+      );
+      console.error(
+        "run `parachute auth set-password` (first run) or `parachute auth rotate-operator` to mint one",
+      );
+      return 1;
+    }
+    if (used.rotated) {
+      console.error(
+        `parachute auth mint-token: operator token within 7d of expiry — auto-rotated to ${used.rotated.expiresAt} (scope_set=${used.rotated.scopeSet})`,
+      );
+    }
+    const operatorSub = used.payload.sub;
+    if (typeof operatorSub !== "string" || operatorSub.length === 0) {
+      console.error("parachute auth mint-token: operator token has no sub claim");
+      return 1;
+    }
+    // Scope gate: a valid signature + non-expired JWT at this path is not
+    // sufficient — the token must carry mint-token authority. Without this,
+    // a narrowly-scoped JWT stashed at ~/.parachute/operator.token would be
+    // treated as operator-bearer and mint arbitrary tokens (privilege
+    // escalation: narrow → arbitrary). Only set-password and rotate-operator
+    // legitimately write to this path.
+    //
+    // Gate is `parachute:host:auth` (was `hub:admin` through 0.5.8-rc.4 — see
+    // hub#222). Both the `admin` scope-set (which includes `:host:auth` as a
+    // superset) and the `auth` scope-set (which IS `:host:auth`) qualify; the
+    // `auth` scope-set was always meant to gate auth surfaces per the #214
+    // design, but the CLI mint-token gate was historically narrower than the
+    // HTTP equivalent. This brings the two surfaces into alignment.
+    const tokenScope =
+      typeof used.payload.scope === "string"
+        ? used.payload.scope.split(/\s+/).filter((s) => s.length > 0)
+        : [];
+    if (!tokenScope.includes("parachute:host:auth")) {
+      console.error("parachute auth mint-token: operator token lacks parachute:host:auth scope");
+      console.error(
+        "narrowed scope-sets without `auth` (install/start/expose/vault) can't mint follow-on tokens — run `parachute auth rotate-operator --scope-set auth` (or `admin`) for a token that can",
+      );
+      return 1;
+    }
+
+    const audience = flags.aud ?? inferAudience(scopes);
+    const permissionsClaim = permissions !== undefined ? JSON.parse(permissions) : undefined;
+
+    let asUser = flags.user;
+    const asService = flags.service;
+    let asLabel = flags.label;
+    if (flags.sub) {
+      const matched = resolveUser(db, flags.sub);
+      if (matched) {
+        console.error(
+          "parachute auth mint-token: --sub is deprecated; treating as --user because it matches a hub account. JWT sub is the account id.",
+        );
+        asUser = matched.id;
+      } else {
+        console.error(
+          "parachute auth mint-token: --sub is deprecated; treating as --label. JWT sub stays the bearer account id.",
+        );
+        asLabel = flags.sub;
+      }
+    }
+
+    let jwtSub: string;
+    let mintUserId: string | null = null;
+    let mintUserUpdatedAt: string | undefined;
+    let subjectLabel: string;
+    if (asService) {
+      jwtSub = asService;
+      subjectLabel = asLabel ?? asService;
+    } else if (asUser) {
+      const target = resolveUser(db, asUser);
+      if (!target) {
+        console.error(`parachute auth mint-token: no hub account matching --user "${asUser}"`);
+        return 1;
+      }
+      jwtSub = target.id;
+      mintUserId = target.id;
+      mintUserUpdatedAt = target.updatedAt;
+      subjectLabel = asLabel ?? target.id;
+    } else {
+      const bearerUser = getUserById(db, operatorSub);
+      if (!bearerUser) {
+        console.error(
+          "parachute auth mint-token: operator token sub is not a hub user; person-mint requires a users.id principal",
+        );
+        return 1;
+      }
+      jwtSub = bearerUser.id;
+      mintUserId = bearerUser.id;
+      mintUserUpdatedAt = bearerUser.updatedAt;
+      subjectLabel = asLabel ?? bearerUser.id;
+    }
+
+    const minted = await signAccessToken(db, {
+      sub: jwtSub,
+      scopes,
+      audience,
+      clientId: OPERATOR_TOKEN_CLIENT_ID,
+      issuer,
+      ttlSeconds,
+      vaultScope: [], // CLI-mint tokens are operator-scoped; no per-user vault pin
+      ...(permissionsClaim !== undefined ? { extraClaims: { permissions: permissionsClaim } } : {}),
+    });
+
+    if (deps.afterSign) {
+      await deps.afterSign({ token: minted.token, jti: minted.jti, userId: mintUserId });
+    }
+
+    // Write a registry row (hub#212 Phase 1 / hub#833). Person-mint JWT
+    // sub is users.id and user_id is set; tokens.subject is the display
+    // label. Service mints leave user_id NULL. The JWT is its own access
+    // token, so refresh_token_hash + family_id stay NULL.
+    try {
+      recordTokenMint(db, {
+        jti: minted.jti,
+        createdVia: "cli_mint",
+        subject: subjectLabel,
+        ...(mintUserId
+          ? {
+              userId: mintUserId,
+              ...(mintUserUpdatedAt ? { userUpdatedAt: mintUserUpdatedAt } : {}),
+            }
+          : {}),
+        clientId: OPERATOR_TOKEN_CLIENT_ID,
+        scopes,
+        expiresAt: minted.expiresAt,
+        ...(permissions !== undefined ? { permissions } : {}),
+      });
+    } catch (err) {
+      if (err instanceof TokenMintPrincipalGoneError) {
+        console.error(`parachute auth mint-token: ${err.message}`);
+        return 1;
+      }
+      throw err;
+    }
+
+    console.log(minted.token);
+    return 0;
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * The unix account running the CLI — the `revoked_by` discriminator for the
+ * CLI path. `userInfo()` can throw on a host with no passwd entry for the
+ * uid (some container images); an unknown actor is still better than a
+ * failed revoke, so fall back to a literal.
+ */
+function osUserName(): string {
+  try {
+    return userInfo().username || "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+/**
+ * Append one audit line to the hub log. Best-effort by design: the file may
+ * not exist (hub never started here) and a failed append must never fail an
+ * already-committed revoke. O_APPEND, so interleaving with a live hub
+ * process's own writes is safe.
+ */
+function appendHubAuditLine(configDir: string, line: string): void {
+  try {
+    appendFileSync(hubLogPath(HUB_SVC, configDir), `${new Date().toISOString()} ${line}\n`);
+  } catch {
+    // Best-effort — see above.
+  }
+}
+
+/**
+ * `--break-glass` — the ONLY flag `revoke-token` accepts. It waives the
+ * live-operator-token guard (hub#931) and nothing else; every other check
+ * (scope gate, row existence, idempotency) still runs.
+ */
+const REVOKE_TOKEN_BREAK_GLASS_FLAG = "--break-glass";
+
+async function runRevokeToken(args: readonly string[], deps: AuthDeps): Promise<number> {
+  // Single positional: the jti. One flag: --break-glass. (If we grow more —
+  // say, --reason for an audit string — they can join here without
+  // disrupting the positional contract.)
+  const positionals = args.filter((a) => !a.startsWith("--"));
+  const flags = args.filter((a) => a.startsWith("--"));
+  const breakGlass = flags.includes(REVOKE_TOKEN_BREAK_GLASS_FLAG);
+  const unknownFlags = flags.filter((f) => f !== REVOKE_TOKEN_BREAK_GLASS_FLAG);
+  if (unknownFlags.length > 0) {
+    console.error(
+      `parachute auth revoke-token: unexpected flag "${unknownFlags[0]}" (this command takes a jti positional and ${REVOKE_TOKEN_BREAK_GLASS_FLAG})`,
+    );
+    return 1;
+  }
+  if (positionals.length === 0) {
+    console.error("parachute auth revoke-token: missing jti argument");
+    console.error("usage: parachute auth revoke-token <jti> [--break-glass]");
+    return 1;
+  }
+  if (positionals.length > 1) {
+    console.error(
+      `parachute auth revoke-token: unexpected argument "${positionals[1]}" (only one jti at a time)`,
+    );
+    return 1;
+  }
+  const jti = positionals[0]!;
+
+  const configDir = deps.configDir ?? CONFIG_DIR;
+  const issuer = resolveHubIssuer(deps.hubOrigin, configDir);
+
+  const db = deps.dbPath ? openHubDb(deps.dbPath) : openHubDb();
+  try {
+    let used: Awaited<ReturnType<typeof useOperatorTokenWithAutoRotate>>;
+    try {
+      used = await useOperatorTokenWithAutoRotate(db, { configDir, issuer });
+    } catch (err) {
+      if (err instanceof OperatorTokenExpiredError) {
+        console.error(`parachute auth revoke-token: ${err.message}`);
+        return 1;
+      }
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`parachute auth revoke-token: operator token invalid — ${msg}`);
+      console.error(
+        "run `parachute auth rotate-operator` to mint a fresh one, or check that the hub origin matches",
+      );
+      return 1;
+    }
+    if (!used) {
+      console.error(
+        "parachute auth revoke-token: no operator token found at ~/.parachute/operator.token",
+      );
+      console.error(
+        "run `parachute auth set-password` (first run) or `parachute auth rotate-operator` to mint one",
+      );
+      return 1;
+    }
+    if (used.rotated) {
+      console.error(
+        `parachute auth revoke-token: operator token within 7d of expiry — auto-rotated to ${used.rotated.expiresAt} (scope_set=${used.rotated.scopeSet})`,
+      );
+    }
+    // Scope gate: same as the HTTP /api/auth/revoke-token endpoint will use
+    // (and the same as /api/auth/mint-token uses today). Mirrors the
+    // privilege-shape of mint — both surfaces hand the operator power that
+    // a narrow non-auth scope-set token shouldn't carry. The `auth`
+    // scope-set covers this; so does `admin` (superset).
+    const tokenScope =
+      typeof used.payload.scope === "string"
+        ? used.payload.scope.split(/\s+/).filter((s) => s.length > 0)
+        : [];
+    if (!tokenScope.includes("parachute:host:auth")) {
+      console.error("parachute auth revoke-token: operator token lacks parachute:host:auth scope");
+      console.error(
+        "narrowed scope-sets without `auth` (install/start/expose/vault) can't revoke tokens — run `parachute auth rotate-operator --scope-set auth` (or `admin`) for a token that can",
+      );
+      return 1;
+    }
+
+    const row = findTokenRowByJti(db, jti);
+    if (!row) {
+      console.error(`parachute auth revoke-token: no token with jti ${jti} found in registry`);
+      return 1;
+    }
+    if (row.revokedAt) {
+      // Idempotent re-revoke. Surface the existing timestamp so an operator
+      // who's not sure whether the previous attempt landed gets a clear
+      // confirmation it did.
+      console.log(`already revoked at ${row.revokedAt}: jti=${jti}`);
+      return 0;
+    }
+    // Live-operator-token guard (hub#931). The jti sitting in
+    // operator.token is what module-ops authenticates with; revoking it
+    // 401s every start/stop/restart/upgrade on the box while `doctor` and
+    // the file itself still look fine. Refuse by default and NAME the
+    // reason; --break-glass is there for the case where killing a leaked
+    // operator credential IS the intent. Ordered AFTER the already-revoked
+    // short-circuit — matching the HTTP path — because a row that is
+    // already revoked has nothing left to protect.
+    if (!breakGlass && jti === readOperatorTokenJti(configDir)) {
+      console.error(
+        `parachute auth revoke-token: ${liveOperatorTokenRevokeRefusal(jti, configDir)}`,
+      );
+      console.error(
+        `pass ${REVOKE_TOKEN_BREAK_GLASS_FLAG} if revoking the live operator credential is what you actually want`,
+      );
+      return 1;
+    }
+    // Actor for the registry row + the audit line. The CLI has no bearer
+    // `sub` of its own worth recording (the operator token's sub is the
+    // hub owner on every box), so the useful discriminator is which unix
+    // account ran the command.
+    const actor: RevokeActor = { by: `cli:${osUserName()}`, via: "cli" };
+    const ok = revokeTokenByJti(db, jti, new Date(), actor);
+    if (!ok) {
+      // Race: row existed, then disappeared or got revoked between our
+      // lookups. Surface as not-found rather than silently succeeding —
+      // the operator should know nothing changed under their hand.
+      console.error(
+        `parachute auth revoke-token: jti ${jti} could not be revoked (race or concurrent change)`,
+      );
+      return 1;
+    }
+    // Use the canonical `tokenRowIdentity` helper rather than reading
+    // userId/subject inline. The label is `identity=` (not `subject=`)
+    // because for OAuth-issued rows `userId` is the user UUID and the
+    // `subject` column is NULL; calling that field "subject" in the
+    // output would mislabel the UUID for any operator grepping on it.
+    // `identity=` matches what the helper returns regardless of row type.
+    console.log(
+      `revoked: jti=${jti}, identity=${tokenRowIdentity(row)}, scope=${row.scopes.join(" ") || "(none)"}, revoked_by=${actor.by}`,
+    );
+    // Audit line in the same `key=value` shape the HTTP path emits, appended
+    // to hub.log so "who revoked this" is greppable in ONE place regardless
+    // of which surface did it (hub#931 — the CLI path previously left no
+    // trace anywhere). Best-effort: the hub may never have run on this box,
+    // and a failed audit append must not fail a completed revoke.
+    appendHubAuditLine(
+      configDir,
+      `token revoked: jti=${jti} identity=${tokenRowIdentity(row)} revoked_by=${actor.by} revoked_via=${actor.via}${breakGlass ? " break_glass=1" : ""}`,
+    );
+    return 0;
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Real hub-login TOTP 2FA CLI (hub#473). `parachute auth 2fa [status|enroll|
+ * disenroll]`. Reads/writes the hub.db `users` TOTP columns — the same store
+ * the `/login` flow and `/account/2fa` browser surface use, so a CLI enroll
+ * gates the exposed hub login exactly like the browser one.
+ *
+ * Headless-first by design: `enroll` prints the `otpauth://` URI + base32
+ * secret as text so the operator can type them into an authenticator app
+ * manually (no QR scan on a server), then prompts for the current code to
+ * confirm before persisting. Browser enroll (QR) lives at
+ * `<hub-origin>/account/2fa`.
+ */
+async function run2fa(args: readonly string[], deps: AuthDeps): Promise<number> {
+  const flag = extractUsernameFlag(args);
+  if (flag.error) {
+    console.error(`parachute auth 2fa: ${flag.error}`);
+    return 1;
+  }
+  const sub = flag.rest[0] ?? "status";
+  if (flag.rest.length > 1) {
+    console.error(`parachute auth 2fa: unexpected argument "${flag.rest[1]}"`);
+    console.error("usage: parachute auth 2fa [status|enroll|disenroll] [--username <name>]");
+    return 1;
+  }
+  if (sub !== "status" && sub !== "enroll" && sub !== "disenroll") {
+    console.error(`parachute auth 2fa: unknown subcommand "${sub}"`);
+    console.error("usage: parachute auth 2fa [status|enroll|disenroll] [--username <name>]");
+    return 1;
+  }
+
+  const db = deps.dbPath ? openHubDb(deps.dbPath) : openHubDb();
+  try {
+    const target = resolveTargetUser(db, flag.username, sub);
+    if ("error" in target) {
+      console.error(`parachute auth 2fa: ${target.error}`);
+      return 1;
+    }
+
+    if (sub === "status") {
+      const state = getTotpState(db, target.id);
+      if (state.secret) {
+        console.log(`Two-factor authentication: ON for "${target.username}".`);
+        if (state.enrolledAt) console.log(`  enrolled_at:   ${state.enrolledAt}`);
+        console.log(`  backup_codes:  ${state.backupCodes.length} remaining`);
+      } else {
+        console.log(`Two-factor authentication: OFF for "${target.username}".`);
+        console.log("Run `parachute auth 2fa enroll` to turn it on.");
+      }
+      return 0;
+    }
+
+    if (sub === "disenroll") {
+      if (!isTotpEnrolled(db, target.id)) {
+        console.log(`Two-factor authentication is already off for "${target.username}".`);
+        return 0;
+      }
+      clearEnrollment(db, target.id);
+      console.log(`Turned off two-factor authentication for "${target.username}".`);
+      return 0;
+    }
+
+    // sub === "enroll"
+    if (isTotpEnrolled(db, target.id)) {
+      console.error(
+        `parachute auth 2fa: two-factor is already enabled for "${target.username}". Run \`parachute auth 2fa disenroll\` first to re-enroll.`,
+      );
+      return 1;
+    }
+    const isInteractive = (deps.isInteractive ?? defaultIsInteractive)();
+    if (!isInteractive) {
+      console.error(
+        "parachute auth 2fa enroll: a TTY is required to confirm the enrollment code (run it interactively)",
+      );
+      return 1;
+    }
+    const readLine = deps.readLine ?? defaultReadLine;
+
+    const { secret } = generateTotpSecret(target.username);
+    const otpauthUrl = otpauthUrlFor(secret, target.username);
+    console.log(`Enrolling two-factor authentication for "${target.username}".`);
+    console.log("");
+    console.log("Add this account to your authenticator app. Either scan the otpauth URL");
+    console.log("(paste it into a QR generator), or enter the secret key manually:");
+    console.log("");
+    console.log(`  otpauth URL:  ${otpauthUrl}`);
+    console.log(`  secret key:   ${secret}`);
+    console.log("");
+    const code = (await readLine("Enter the 6-digit code from your app to confirm: ")).trim();
+    if (!verifyTotpCode(secret, code)) {
+      console.error(
+        "parachute auth 2fa enroll: that code didn't match — nothing was saved. Check your device clock and try again.",
+      );
+      return 1;
+    }
+    const result = await persistEnrollment(db, target.id, secret);
+    console.log("");
+    console.log("✓ Two-factor authentication is now ON for hub login.");
+    console.log("");
+    console.log("Save these backup codes — each works once if you lose your authenticator:");
+    console.log("");
+    for (const c of result.backupCodes) console.log(`  ${c}`);
+    console.log("");
+    console.log("They are shown only once. Store them somewhere safe.");
+    return 0;
+  } finally {
+    db.close();
+  }
+}
+
+interface LinkPubkeyFlags {
+  user?: string;
+  pubkey?: string;
+  error?: string;
+}
+
+function parseLinkPubkeyFlags(args: readonly string[]): LinkPubkeyFlags {
+  let user: string | undefined;
+  const rest: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--user") {
+      const v = args[++i];
+      if (!v) return { error: "--user requires a value" };
+      user = v;
+    } else if (a?.startsWith("--user=")) {
+      user = a.slice("--user=".length);
+      if (!user) return { error: "--user requires a value" };
+    } else if (a === "--username") {
+      const v = args[++i];
+      if (!v) return { error: "--username requires a value" };
+      user = v;
+    } else if (a?.startsWith("--username=")) {
+      user = a.slice("--username=".length);
+      if (!user) return { error: "--username requires a value" };
+    } else if (a !== undefined) {
+      rest.push(a);
+    }
+  }
+  if (rest.length === 0) return { user, error: "missing pubkey argument" };
+  if (rest.length > 1) return { user, error: `unexpected argument "${rest[1]}"` };
+  return { user, pubkey: rest[0] };
+}
+
+/**
+ * `parachute auth link-pubkey --user owner <hex|npub>` — operator bind.
+ *
+ * On-box privilege: the operator asserts this key belongs to this hub user.
+ * No NIP-07 ceremony, no possession proof. That is the point — agents cannot
+ * click the Account SPA, and the 5-minute challenge expires unconsumed.
+ *
+ * The key argument goes through `parseGrantPubkey`, the same operator-facing
+ * edge `grant-access` uses (hub#936), so an operator can paste the `npub1…`
+ * spelling Buzz and every other client shows them. Decoding is not a
+ * credential: the authority here is the on-box privilege, unchanged.
+ */
+function runLinkPubkey(args: readonly string[], deps: AuthDeps): number {
+  const flags = parseLinkPubkeyFlags(args);
+  if (flags.error) {
+    console.error(`parachute auth link-pubkey: ${flags.error}`);
+    console.error("usage: parachute auth link-pubkey --user <username|id> <pubkey-hex|npub>");
+    return 1;
+  }
+  if (!flags.user) {
+    console.error("parachute auth link-pubkey: --user is required");
+    console.error("usage: parachute auth link-pubkey --user <username|id> <pubkey-hex|npub>");
+    return 1;
+  }
+  let pubkey: string;
+  try {
+    // Same operator-facing edge as `grant-access` (hub#936): hex passes
+    // through, `npub1…` is decoded, everything else — including uppercase
+    // hex — is refused.
+    pubkey = parseGrantPubkey(flags.pubkey ?? "");
+  } catch (err) {
+    const msg = err instanceof GrantError ? err.message : String(err);
+    console.error(`parachute auth link-pubkey: ${msg}`);
+    return 1;
+  }
+  const db = deps.dbPath ? openHubDb(deps.dbPath) : openHubDb();
+  try {
+    const target = resolveUser(db, flags.user);
+    if (!target) {
+      console.error(`parachute auth link-pubkey: no hub user "${flags.user}"`);
+      return 1;
+    }
+    const existing = findPubkeyLink(db, pubkey);
+    if (existing && existing.userId !== target.id) {
+      console.error("parachute auth link-pubkey: that pubkey is already bound to another user");
+      return 1;
+    }
+    const bound = bindPubkeyOperatorAttested(db, {
+      userId: target.id,
+      pubkey,
+      label: "operator",
+    });
+    if (!bound.ok) {
+      if (bound.reason === "too_many_pubkeys") {
+        console.error(
+          "parachute auth link-pubkey: this user already has the maximum number of linked keys",
+        );
+        return 1;
+      }
+      console.error("parachute auth link-pubkey: that pubkey is already bound to another user");
+      return 1;
+    }
+    console.log(
+      bound.relinked
+        ? `Relinked pubkey ${pubkey} to "${target.username}" (${target.id}).`
+        : `Linked pubkey ${pubkey} to "${target.username}" (${target.id}).`,
+    );
+    return 0;
+  } finally {
+    db.close();
+  }
+}
+
+function runListUsers(deps: AuthDeps): number {
+  const db = deps.dbPath ? openHubDb(deps.dbPath) : openHubDb();
+  try {
+    const users = listUsers(db);
+    if (users.length === 0) {
+      console.log("(no hub users yet — run `parachute auth set-password` to create the first one)");
+      return 0;
+    }
+    console.log("USERNAME           ID                                    CREATED");
+    for (const u of users) {
+      const username = u.username.padEnd(18).slice(0, 18);
+      const id = u.id.padEnd(36).slice(0, 36);
+      console.log(`${username} ${id}  ${u.createdAt}`);
+    }
+    return 0;
+  } finally {
+    db.close();
+  }
+}
+
+export async function auth(args: readonly string[], deps: AuthDeps | Runner = {}): Promise<number> {
+  // Back-compat shim: callers used to pass a Runner directly. Detect that
+  // shape (a `run` method) and lift it into the new deps bag.
+  const normalized: AuthDeps =
+    typeof (deps as Runner).run === "function" ? { runner: deps as Runner } : (deps as AuthDeps);
+  const runner = normalized.runner ?? defaultRunner;
+  const rotateKey = normalized.rotateKey ?? defaultRotateKey;
+
+  const sub = args[0];
+  if (sub === undefined || sub === "--help" || sub === "-h" || sub === "help") {
+    console.log(authHelp());
+    return 0;
+  }
+
+  if (HUB_LOCAL_SUBCOMMANDS.has(sub)) {
+    if (sub === "rotate-key") {
+      try {
+        const { kid, createdAt } = rotateKey();
+        console.log("Rotated hub signing key.");
+        console.log(`  kid:        ${kid}`);
+        console.log(`  created_at: ${createdAt}`);
+        console.log("Previous key keeps validating tokens for 24h via /.well-known/jwks.json.");
+        return 0;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`parachute auth rotate-key: ${msg}`);
+        return 1;
+      }
+    }
+    if (sub === "set-password") {
+      try {
+        return await runSetPassword(args.slice(1), normalized);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`parachute auth set-password: ${msg}`);
+        return 1;
+      }
+    }
+    if (sub === "2fa") {
+      try {
+        return await run2fa(args.slice(1), normalized);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`parachute auth 2fa: ${msg}`);
+        return 1;
+      }
+    }
+    if (sub === "list-users") {
+      return runListUsers(normalized);
+    }
+    if (sub === "link-pubkey") {
+      try {
+        return runLinkPubkey(args.slice(1), normalized);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`parachute auth link-pubkey: ${msg}`);
+        return 1;
+      }
+    }
+    if (sub === "rotate-operator") {
+      try {
+        return await runRotateOperator(args.slice(1), normalized);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`parachute auth rotate-operator: ${msg}`);
+        return 1;
+      }
+    }
+    if (sub === "mint-token") {
+      try {
+        return await runMintToken(args.slice(1), normalized);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`parachute auth mint-token: ${msg}`);
+        return 1;
+      }
+    }
+    if (sub === "revoke-token") {
+      try {
+        return await runRevokeToken(args.slice(1), normalized);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`parachute auth revoke-token: ${msg}`);
+        return 1;
+      }
+    }
+    if (sub === "pending-clients") {
+      try {
+        return runPendingClients(normalized);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`parachute auth pending-clients: ${msg}`);
+        return 1;
+      }
+    }
+    if (sub === "approve-client") {
+      try {
+        return runApproveClient(args.slice(1), normalized);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`parachute auth approve-client: ${msg}`);
+        return 1;
+      }
+    }
+    if (sub === "revoke-client") {
+      try {
+        return runRevokeClient(args.slice(1), normalized);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`parachute auth revoke-client: ${msg}`);
+        return 1;
+      }
+    }
+    if (sub === "reap-clients") {
+      try {
+        return runReapClients(args.slice(1), normalized);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`parachute auth reap-clients: ${msg}`);
+        return 1;
+      }
+    }
+    if (sub === "list-grants") {
+      try {
+        return runListGrants(args.slice(1), normalized);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`parachute auth list-grants: ${msg}`);
+        return 1;
+      }
+    }
+    if (sub === "revoke-grant") {
+      try {
+        return runRevokeGrant(args.slice(1), normalized);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`parachute auth revoke-grant: ${msg}`);
+        return 1;
+      }
+    }
+  }
+
+  // No subcommands forward to parachute-vault anymore (VAULT_FORWARDED_SUBCOMMANDS
+  // is empty — `2fa` is now hub-local + honest, see #473). Anything that fell
+  // through every hub-local handler above is unknown.
+  if (VAULT_FORWARDED_SUBCOMMANDS.has(sub)) {
+    // Defensive: if a future subcommand is added back to the forward set, route
+    // it. Currently unreachable (the set is empty).
+    return await runner.run(["parachute-vault", ...args]);
+  }
+  console.error(`parachute auth: unknown subcommand "${sub}"`);
+  console.error("run `parachute auth --help` for usage");
+  return 1;
+}
+
+// Re-exported so `users.ts` consumers can preserve the named-export.
+export { getUserByUsername };

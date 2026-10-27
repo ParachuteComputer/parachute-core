@@ -1,0 +1,816 @@
+/*
+ * Brand tokens lifted from hub's web/ui styles so vault's admin SPA stays
+ * visually continuous with the rest of the Parachute admin surface (the
+ * operator may bounce between hub and vault admin pages in one session).
+ * Don't drift these without updating hub's tokens too.
+ */
+:root {
+  --bg: #faf8f4;
+  --bg-soft: #f3f0ea;
+  --fg: #2c2a26;
+  --fg-muted: #6b6860;
+  --fg-dim: #9a9690;
+  --accent: #4a7c59;
+  --accent-soft: rgba(74, 124, 89, 0.08);
+  --accent-hover: #3d6849;
+  --border: #e4e0d8;
+  --border-light: #ece9e2;
+  --card-bg: #ffffff;
+  --error: #a3392b;
+  --error-soft: rgba(163, 57, 43, 0.08);
+  --warn: #b08023;
+  --warn-soft: rgba(176, 128, 35, 0.08);
+  --success: #3d6849;
+  --success-soft: rgba(61, 104, 73, 0.08);
+  --font-serif: Georgia, "Times New Roman", serif;
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Monaco, "Cascadia Mono", monospace;
+  font-family: var(--font-sans);
+}
+
+* {
+  box-sizing: border-box;
+}
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--fg);
+}
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+a:hover {
+  text-decoration: underline;
+}
+
+code {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  background: var(--bg-soft);
+  padding: 0.1em 0.3em;
+  border-radius: 3px;
+}
+
+.page {
+  max-width: 880px;
+  margin: 0 auto;
+  padding: 1.5rem 1.5rem 6rem;
+}
+
+.nav {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 2rem;
+}
+.nav .brand {
+  font-weight: 600;
+  font-family: var(--font-serif);
+  font-size: 1.15rem;
+  margin-right: auto;
+}
+.nav .brand .sub {
+  color: var(--fg-dim);
+  font-size: 0.78rem;
+  font-weight: 400;
+  margin-left: 0.4rem;
+  font-family: var(--font-sans);
+}
+.nav a {
+  color: var(--fg-muted);
+  font-size: 0.95rem;
+}
+.nav a:hover {
+  text-decoration: none;
+  color: var(--fg);
+}
+
+h2 {
+  margin: 0 0 1rem;
+  font-size: 1.4rem;
+  font-weight: 500;
+}
+
+.muted {
+  color: var(--fg-muted);
+  font-size: 0.92rem;
+}
+.dim {
+  color: var(--fg-dim);
+  font-size: 0.85rem;
+}
+
+.error-banner {
+  background: var(--error-soft);
+  border: 1px solid var(--error);
+  color: var(--error);
+  padding: 0.75rem 1rem;
+  border-radius: 8px;
+  margin-bottom: 1rem;
+  font-size: 0.9rem;
+}
+.warn-banner {
+  background: var(--warn-soft);
+  border: 1px solid var(--warn);
+  color: var(--warn);
+  padding: 0.75rem 1rem;
+  border-radius: 8px;
+  margin-bottom: 1rem;
+  font-size: 0.9rem;
+}
+
+.empty {
+  padding: 3rem 1.5rem;
+  text-align: center;
+  color: var(--fg-muted);
+  background: var(--bg-soft);
+  border-radius: 10px;
+}
+
+.list-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+.list-header h2 {
+  margin: 0;
+}
+
+.vault-row {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.85rem 1rem;
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-bottom: 0.5rem;
+  text-decoration: none;
+  color: inherit;
+  transition: border-color 0.15s ease;
+}
+.vault-row:hover {
+  border-color: var(--accent);
+  text-decoration: none;
+}
+.vault-row .body {
+  flex: 1;
+  min-width: 0;
+}
+.vault-row .name {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+.vault-row .name code {
+  font-size: 0.95em;
+}
+.vault-row .chev {
+  color: var(--fg-dim);
+  font-size: 1.2rem;
+}
+
+/* Multi-vault home (B3): rows carry action buttons plus an optional inline
+   confirm / cascade-summary block beneath them. Mirrors hub's VaultsList
+   row shapes so the operator sees one visual language across both. */
+.vault-row-group {
+  margin-bottom: 0.5rem;
+}
+.vault-row-group .vault-row {
+  margin-bottom: 0;
+}
+.vault-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-shrink: 0;
+}
+.vault-usage {
+  font-size: 0.85rem;
+}
+.field-error {
+  color: #b3402a;
+  font-size: 0.85rem;
+  margin-top: 0.35rem;
+}
+
+.section {
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1.25rem 1.5rem;
+  margin-bottom: 1.5rem;
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: 8.5rem 1fr;
+  gap: 0.5rem 1rem;
+  font-size: 0.92rem;
+}
+.kv > div:nth-child(odd) {
+  color: var(--fg-muted);
+}
+.kv code {
+  word-break: break-all;
+}
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr));
+  gap: 1rem;
+  font-size: 0.92rem;
+}
+.stat {
+  background: var(--bg-soft);
+  border-radius: 8px;
+  padding: 0.85rem 1rem;
+}
+.stat .label {
+  color: var(--fg-muted);
+  font-size: 0.82rem;
+  margin-bottom: 0.2rem;
+}
+.stat .value {
+  font-size: 1.4rem;
+  font-weight: 500;
+  font-family: var(--font-mono);
+}
+
+button {
+  font: inherit;
+  background: var(--accent);
+  color: white;
+  border: 0;
+  border-radius: 6px;
+  padding: 0.55rem 1.1rem;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+button:hover {
+  background: var(--accent-hover);
+}
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+button.secondary {
+  background: white;
+  color: var(--fg);
+  border: 1px solid var(--border);
+}
+button.secondary:hover {
+  background: var(--bg-soft);
+}
+
+input,
+select {
+  font: inherit;
+  background: white;
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.5rem 0.7rem;
+  width: 100%;
+  max-width: 28rem;
+}
+input:focus,
+select:focus {
+  outline: 2px solid var(--accent-soft);
+  border-color: var(--accent);
+}
+
+.form-row {
+  margin-bottom: 1rem;
+}
+.form-row label {
+  display: block;
+  font-size: 0.88rem;
+  color: var(--fg-muted);
+  margin-bottom: 0.3rem;
+}
+
+.actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+
+.manage-list {
+  margin: 0;
+  padding-left: 1.1rem;
+  font-size: 0.95rem;
+}
+.manage-list li {
+  margin-bottom: 0.4rem;
+}
+
+.mint-banner {
+  background: var(--success-soft);
+  border: 1px solid var(--success);
+  border-radius: 10px;
+  padding: 1.25rem 1.5rem;
+  margin-bottom: 1.5rem;
+}
+.mint-banner h3 {
+  margin: 0 0 0.5rem;
+  font-size: 1rem;
+  color: var(--success);
+}
+.mint-banner .token-box {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0.85rem 0 0.5rem;
+}
+.mint-banner code {
+  flex: 1;
+  font-size: 0.9rem;
+  padding: 0.6rem 0.75rem;
+  background: white;
+  border: 1px solid var(--border);
+  word-break: break-all;
+  user-select: all;
+}
+.mint-banner .warn {
+  margin: 0.75rem 0 0;
+  font-size: 0.85rem;
+  color: var(--warn);
+}
+.mint-banner .actions {
+  margin-top: 1rem;
+}
+
+/*
+ * "Connect to your AI" card (McpConnectCard). Ported from hub's
+ * web/ui/src/styles.css .mcp-* tokens so the affordance reads identically
+ * across hub + vault admin surfaces. VaultDetail wraps the card in a
+ * `.section` (which already paints the white card chrome), so the card itself
+ * is chrome-less here — no border/background of its own.
+ */
+.mcp-connect-card h3 {
+  margin: 0 0 0.4rem;
+  font-size: 1rem;
+  font-weight: 500;
+}
+.mcp-connect-card > p {
+  margin-top: 0;
+}
+/* `.token-box` is scoped under .mcp-connect-card so the existing
+ * `.mint-banner .token-box` usages (VaultTokens / MultiVaultHome) are
+ * untouched — no new global `.token-box` rule. The `.mcp-field*` /
+ * `.mcp-docs-link` rules below ARE global (no current collisions; matches how
+ * hub's own styles.css treats these same class names). */
+.mcp-connect-card .token-box {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0.35rem 0 0.25rem;
+}
+.mcp-connect-card .token-box code {
+  flex: 1;
+  font-size: 0.85rem;
+  padding: 0.55rem 0.7rem;
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  word-break: break-all;
+  user-select: all;
+}
+.mcp-field {
+  margin-top: 0.9rem;
+}
+.mcp-field-label {
+  display: block;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--fg-muted);
+}
+.mcp-field .dim {
+  margin: 0.3rem 0 0;
+}
+.mcp-docs-link {
+  margin: 0.9rem 0 0;
+}
+
+.token-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.token-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 1rem;
+  padding: 0.85rem 1rem;
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.token-row .body {
+  flex: 1;
+  min-width: 0;
+}
+.token-row .name {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.3rem;
+}
+.token-row .meta {
+  font-size: 0.85rem;
+  margin-bottom: 0.2rem;
+}
+.token-row .actions {
+  margin-top: 0;
+  flex-shrink: 0;
+}
+.scope-tag {
+  font-size: 0.78rem;
+  padding: 0.1em 0.4em;
+  margin-right: 0.3em;
+}
+.tag-pill {
+  background: var(--accent-soft, rgba(120, 120, 200, 0.12));
+}
+.tag-picker {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 0.8rem;
+  margin-top: 0.35rem;
+  max-height: 9rem;
+  overflow-y: auto;
+  padding: 0.4rem 0.5rem;
+  border: 1px solid var(--border, #d8d8de);
+  border-radius: 4px;
+}
+.tag-checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.85rem;
+  cursor: pointer;
+  user-select: none;
+}
+.tag-checkbox input[type="checkbox"] {
+  margin: 0;
+}
+
+/*
+ * Mirror screen: preset cards (three clickable shapes per the
+ * vault-as-git-projection design doc) + radio rows for location.
+ * Tone-matched to the .stat cards above so the visual rhythm of the
+ * admin SPA stays calm — operators bounce between these screens in
+ * one session.
+ */
+.preset-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+  gap: 0.75rem;
+  margin-top: 0.35rem;
+}
+.preset-card {
+  background: var(--bg-soft);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.85rem 1rem;
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+.preset-card:hover {
+  border-color: var(--accent);
+  background: white;
+}
+.preset-card:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.preset-card strong {
+  font-size: 0.95rem;
+  font-weight: 500;
+}
+.preset-card .dim {
+  font-size: 0.8rem;
+  line-height: 1.35;
+}
+
+.radio-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.35rem;
+  font-size: 0.92rem;
+  cursor: pointer;
+}
+.radio-row input[type="radio"] {
+  margin: 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Git remote credentials UI — banner variants + OAuth/PAT modals.
+ * ------------------------------------------------------------------------- */
+
+.info-banner {
+  background: var(--accent-soft);
+  border: 1px solid var(--accent);
+  color: var(--accent-hover);
+  padding: 0.75rem 1rem;
+  border-radius: 8px;
+  margin-bottom: 1rem;
+  font-size: 0.9rem;
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+  padding: 1rem;
+}
+
+.modal {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 1.5rem;
+  width: min(520px, 100%);
+  max-height: 90vh;
+  overflow-y: auto;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
+}
+
+.device-code-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 0.75rem 0;
+}
+
+.device-code {
+  font-size: 1.4rem;
+  letter-spacing: 0.1em;
+  padding: 0.6rem 1rem;
+  background: var(--bg-soft);
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  user-select: all;
+  flex: 1;
+  text-align: center;
+}
+
+.repo-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  max-height: 260px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.4rem;
+  background: var(--bg-soft);
+}
+
+.repo-row {
+  background: var(--bg);
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 0.55rem 0.75rem;
+  font-size: 0.92rem;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  cursor: pointer;
+  text-align: left;
+  color: inherit;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+.repo-row:hover {
+  border-color: var(--accent);
+  background: white;
+}
+.repo-row:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+
+/* ===========================================================================
+ * Schema editor (vault#283) — tag list + per-tag fields editor + previews.
+ * =========================================================================== */
+
+.schema-layout {
+  display: grid;
+  grid-template-columns: minmax(180px, 240px) 1fr;
+  gap: 1.25rem;
+  align-items: start;
+}
+@media (max-width: 720px) {
+  .schema-layout {
+    grid-template-columns: 1fr;
+  }
+}
+
+.schema-taglist {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.5rem;
+  background: var(--bg-soft);
+  max-height: 70vh;
+  overflow-y: auto;
+}
+.tag-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+.tag-list-item {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  align-items: flex-start;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  padding: 0.4rem 0.5rem;
+  cursor: pointer;
+  text-align: left;
+  color: inherit;
+  font: inherit;
+}
+.tag-list-item:hover {
+  background: white;
+  border-color: var(--border);
+}
+.tag-list-item.selected {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+.tag-list-item .tag-name {
+  font-size: 0.9rem;
+}
+.tag-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  align-items: center;
+}
+
+.badge {
+  display: inline-block;
+  font-size: 0.7rem;
+  line-height: 1.4;
+  padding: 0 0.4rem;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  border: 1px solid var(--accent);
+}
+.badge-strict {
+  background: var(--error-soft);
+  color: var(--error);
+  border-color: var(--error);
+}
+
+.schema-detail {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1rem 1.25rem;
+  min-width: 0;
+}
+
+.schema-fields,
+.schema-parents {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.75rem;
+  margin: 1rem 0;
+}
+.schema-fields legend,
+.schema-parents legend {
+  font-weight: 600;
+  font-size: 0.9rem;
+  padding: 0 0.4rem;
+}
+
+.field-row {
+  border-bottom: 1px solid var(--border-light);
+  padding: 0.5rem 0;
+}
+.field-row:last-of-type {
+  border-bottom: none;
+}
+.field-row-main {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+.field-name-input {
+  flex: 1 1 140px;
+  min-width: 120px;
+}
+.field-row-main select {
+  flex: 0 0 auto;
+  width: auto;
+}
+.field-flag {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.85rem;
+  white-space: nowrap;
+}
+.field-flag input {
+  width: auto;
+  margin: 0;
+}
+.field-remove {
+  padding: 0.2rem 0.5rem;
+  line-height: 1;
+}
+.field-row-extra {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.4rem;
+}
+.field-enum-input,
+.field-desc-input {
+  flex: 1 1 200px;
+  min-width: 160px;
+}
+.field-codeclarers {
+  margin: 0.35rem 0 0;
+}
+.field-codeclarers code {
+  margin-left: 0.25rem;
+}
+
+.parent-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+.parent-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.15rem 0.55rem;
+  font-size: 0.85rem;
+}
+.parent-chip input {
+  width: auto;
+  margin: 0;
+}
+
+.schema-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.88rem;
+}
+.schema-table th,
+.schema-table td {
+  text-align: left;
+  padding: 0.3rem 0.5rem;
+  border-bottom: 1px solid var(--border-light);
+}
+.schema-table th {
+  font-weight: 600;
+  color: var(--fg-muted);
+}
+.schema-table td code {
+  margin-right: 0.3rem;
+}
+.schema-table .tag-self {
+  background: var(--accent-soft);
+  border-radius: 4px;
+  padding: 0 0.2rem;
+}
+.schema-table .row-this-tag td {
+  background: var(--accent-soft);
+}

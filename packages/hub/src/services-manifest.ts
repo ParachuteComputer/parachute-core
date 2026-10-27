@@ -1,0 +1,1034 @@
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+import { SERVICES_MANIFEST_PATH } from "./config.ts";
+import { RETIRED_MODULES } from "./service-spec.ts";
+
+/**
+ * Whether the service is safe to mount on public-facing expose layers.
+ *
+ *   "allowed"       mount on every layer (tailnet + public). Use when the
+ *                   service gates its own endpoints with auth.
+ *   "loopback"      never mount on tailnet/funnel — only reachable at
+ *                   http://127.0.0.1:<port>. For internal services that
+ *                   shouldn't leave the box.
+ *   "auth-required" the service wants auth but isn't guaranteed to have it
+ *                   configured (e.g., scribe without SCRIBE_AUTH_TOKEN set).
+ *                   At launch this is treated the same as "loopback"; future
+ *                   work can flip to "allowed" once the service reports its
+ *                   auth state over `/.parachute/info`.
+ *
+ * Absent field: the CLI derives a safe default from the service's ServiceSpec
+ * (services with extras.hasAuth === false → "auth-required"; everything
+ * else → "allowed"). Unknown services default to "allowed" for back-compat.
+ */
+export type PublicExposure = "allowed" | "loopback" | "auth-required";
+
+/**
+ * Visible-to-discovery state of a UI sub-unit. Aligns with the four-state
+ * supervisor vocabulary in [docs/contracts/design-system.md
+ * §6](../docs/contracts/design-system.md) (workstream F).
+ * Absent → hub treats the sub-unit as "active" (the discovery default).
+ *
+ *   "active"   — UI is installed, OAuth client is approved, ready to serve.
+ *   "pending"  — UI is installed but needs operator action (OAuth approval,
+ *                config) before it can run. Discovery renders the row but
+ *                signals "not yet usable."
+ *   "inactive" — Operator-disabled. Renders greyed-out; no link.
+ *   "failing"  — UI is installed but the latest health probe failed. Discovery
+ *                renders the row with an error treatment.
+ *
+ * Back-compat aliases accepted on read for one release window (workstream F
+ * landing — retire after the next rc chain): `pending-oauth` → `pending`,
+ * `disabled` → `inactive`. Aliases are normalized to the canonical value on
+ * `readManifest` so downstream emit surfaces (well-known, /api/modules)
+ * always see the new vocabulary. The wire shape emits the canonical value;
+ * parachute-app + other consumers should accept both during the alias
+ * window and pin to the canonical going forward.
+ */
+export type UiSubUnitStatus = "active" | "pending" | "inactive" | "failing";
+
+/**
+ * Old-vocabulary alias values still accepted on read for back-compat with
+ * services that haven't yet caught up to workstream F. Normalized to the
+ * canonical `UiSubUnitStatus` on read.
+ */
+const UI_SUB_UNIT_STATUS_ALIASES: Record<string, UiSubUnitStatus> = {
+  "pending-oauth": "pending",
+  disabled: "inactive",
+};
+
+const UI_SUB_UNIT_STATUS_CANONICAL: readonly UiSubUnitStatus[] = [
+  "active",
+  "pending",
+  "inactive",
+  "failing",
+];
+
+function normalizeUiSubUnitStatus(value: string): UiSubUnitStatus | undefined {
+  if ((UI_SUB_UNIT_STATUS_CANONICAL as readonly string[]).includes(value)) {
+    return value as UiSubUnitStatus;
+  }
+  return UI_SUB_UNIT_STATUS_ALIASES[value];
+}
+
+/**
+ * Who may load a UI sub-unit through the hub proxy (H3, surface-runtime
+ * design §12 — fixes parachute-surface#88, where `public` was declared but
+ * never enforced):
+ *
+ *   "public"    — anyone; no hub identity required (chrome strip off — H5).
+ *   "hub-users" — a valid hub session cookie OR a hub-issued Bearer whose
+ *                 scopes satisfy the surface's `scopes_required` (the OR
+ *                 keeps installed PWAs working). THE DEFAULT when absent.
+ *   "operator"  — the first-admin session only.
+ *   "surface"   — the surface backend owns admission END-TO-END; the hub
+ *                 proxy passes every request through (backed surfaces —
+ *                 kit-authenticated via @openparachute/surface-server: hub
+ *                 JWTs / capability links / anon, deny-by-default). Chrome
+ *                 strip off like `public` — capability-link invitees are
+ *                 NOT hub users.
+ *
+ * Enforced at the hub proxy BEFORE forwarding (`src/audience-gate.ts`).
+ * Legacy boolean `public` on the wire is accepted one alias window:
+ * `public: true` → `"public"`, `public: false` → default. Fail-closed: an
+ * unrecognized `audience` value rejects the row (the lenient manifest read
+ * then drops it — unroutable beats accidentally public). Version-skew
+ * corollary: a surface declaring `audience: "surface"` registered against a
+ * hub OLDER than this value's introduction gets its row rejected by that
+ * same fail-closed rule — the mount 404s until the hub is upgraded. The
+ * surface-side meta-schema ships the value with a hub-version requirement
+ * note for exactly this reason.
+ */
+export type UiAudience = "public" | "hub-users" | "operator" | "surface";
+
+const UI_AUDIENCE_VALUES: readonly UiAudience[] = ["public", "hub-users", "operator", "surface"];
+
+/**
+ * A sub-unit beneath a module — used today by parachute-app to surface each
+ * hosted UI as its own discoverable row under the App module, and the shape
+ * vault is expected to adopt in a follow-up so per-vault display metadata
+ * (icon, tagline) can ride alongside the mount path.
+ *
+ * Per parachute-app design doc §12, the canonical shape for parachute-app's
+ * services.json row mirrors vault's multi-instance pattern but carries
+ * display metadata per instance. Today vault encodes instances as flat
+ * `paths: ["/vault/default", "/vault/work"]`; the discovery surface only
+ * sees the path. With `uis`, each sub-unit can ride its own displayName,
+ * tagline, iconUrl, and OAuth client id without the parent module forging
+ * a fake services.json row per UI.
+ *
+ * `oauthClientId` is the load-bearing field for app's "install-once,
+ * multi-vault" pattern (design doc §6 ¶219): each UI gets its own OAuth
+ * client at install time, the operator sees that id verbatim on the
+ * approval surface, and revoking the client retires the UI's access in
+ * one shot without touching its siblings.
+ *
+ * Backwards-compat: this is purely additive. Modules that don't use `uis`
+ * (vault, scribe, notes today) continue to render as flat rows;
+ * the field is optional throughout the read + write paths.
+ */
+export interface UiSubUnit {
+  /** Human-readable name for the discovery row (e.g. "Gitcoin Brain"). */
+  displayName: string;
+  /** One-line subtitle, same shape as `ServiceEntry.tagline`. */
+  tagline?: string;
+  /**
+   * Path under the hub origin where this sub-unit is mounted (e.g.
+   * `/app/gitcoin-brain`). Must start with `/` — same shape rule as
+   * `ServiceEntry.paths[]`.
+   */
+  path: string;
+  /**
+   * Absolute URL or path to an icon (svg / png). Discovery renders this as
+   * the sub-unit's tile glyph; absent → hub falls back to a generic
+   * placeholder. Path-relative URLs are resolved against the hub origin
+   * the same way `uiUrl` is in `well-known.ts`.
+   */
+  iconUrl?: string;
+  /**
+   * Optional version stamp. Each UI iterates independently of its parent
+   * module — Gitcoin Brain at 0.3.1 + Unforced Brain at 0.2.0 ride on the
+   * same parachute-app process. Surfaced on the admin SPA row so operators
+   * can spot a drift.
+   */
+  version?: string;
+  /**
+   * OAuth client id minted at UI install time. Hub doesn't validate this
+   * shape (the OAuth server already does); it round-trips verbatim so the
+   * admin SPA can render the per-UI approval status without re-resolving
+   * from `/api/oauth/clients/<id>`.
+   */
+  oauthClientId?: string;
+  /** UI sub-unit lifecycle state. Absent → discovery treats as "active". */
+  status?: UiSubUnitStatus;
+  /**
+   * Audience exposure (H3). Absent → "hub-users". The legacy boolean
+   * `public` field is normalized into this on read (true → "public") for
+   * one alias window. See {@link UiAudience}.
+   */
+  audience?: UiAudience;
+  /**
+   * OAuth scopes the UI declares as required (surface-host stamps these from
+   * the surface's meta.json `scopes_required`, e.g. `["vault:*:read"]` —
+   * `*` is a single-segment wildcard). The audience gate's Bearer branch
+   * checks a presented token's scopes against these. Snake_case to match
+   * the wire shape surface already writes.
+   */
+  scopes_required?: string[];
+}
+
+export interface ServiceEntry {
+  name: string;
+  port: number;
+  paths: string[];
+  health: string;
+  version: string;
+  /** Human-readable name for the hub page. Falls back to the short manifest name. */
+  displayName?: string;
+  /** One-line subtitle for the hub page card. */
+  tagline?: string;
+  /** Opt-in or opt-out of public-facing expose layers. See PublicExposure. */
+  publicExposure?: PublicExposure;
+  /**
+   * Absolute path to the installed package directory. Set at install time
+   * for both npm-installed (`bunGlobalPrefixes()/<package>`) and local-path
+   * installs (`<absPath>`); first-party fallbacks may leave it absent.
+   *
+   * Lifecycle (`parachute start`) reads `<installDir>/.parachute/module.json`
+   * to recover startCmd for third-party modules whose spec isn't in
+   * FIRST_PARTY_FALLBACKS, and spawns with `cwd: installDir` so manifests
+   * can use clean relative paths in their `startCmd`.
+   */
+  installDir?: string;
+  /**
+   * When `true`, the hub's `/<svc>/*` proxy strips the matched mount prefix
+   * before forwarding so the backend sees a bare path (e.g. `/health` rather
+   * than `/scribe/health`). Default `false` keeps the prefix intact, which
+   * matches what notes / agent / vault expect today.
+   *
+   * Per-module rather than uniform because conventions differ:
+   *   - bundle-serve.ts strips internally via `--mount`; expects the prefix.
+   *   - parachute-agent reads PARACHUTE_AGENT_WEB_MOUNT and strips itself.
+   *   - parachute-vault routes by `/vault/<name>/...` and expects the prefix.
+   *   - parachute-scribe serves bare paths (`/health`, `/v1/...`); the proxy
+   *     must strip. Eventually scribe should accept its own `--mount` flag
+   *     and join the always-prefixed convention; until then this opt-in
+   *     bridges the gap. Tracked in parachute-scribe (separate issue).
+   */
+  stripPrefix?: boolean;
+  /**
+   * When `true`, the module's daemon accepts WebSocket upgrades and the hub's
+   * Bun-native upgrade bridge (H1, surface-runtime design) will forward
+   * `Upgrade: websocket` requests on this module's mounts to it. DENY BY
+   * DEFAULT: absent/false means an upgrade request to this mount is refused
+   * (426) without ever reaching the daemon. Modules declare this on their
+   * `.parachute/module.json` (the install-time contract) and carry it onto
+   * their self-registered services.json row; the hub honors either source.
+   */
+  websocket?: boolean;
+  /**
+   * Sub-units hosted under this module — parachute-app's bag of UIs, and
+   * the shape vault is expected to adopt for per-instance metadata in a
+   * follow-up. Empty or absent → flat row, the legacy shape. See
+   * `UiSubUnit` above + parachute-app design doc §12 for the canonical
+   * usage. Keys are short slugs (`gitcoin-brain`, `default`); the slug
+   * carries no semantic meaning beyond being a stable identity for the
+   * row across renders.
+   *
+   * Discovery surfaces (`/.well-known/parachute.json`, admin SPA Modules
+   * view) render each entry as a discoverable sub-row under the parent
+   * module — same UX shape as vault's per-instance paths today, only
+   * with display metadata attached.
+   */
+  uis?: Record<string, UiSubUnit>;
+  /**
+   * Last `parachute start` failure that's still actionable, persisted so a
+   * *subsequent* `parachute status` (a separate invocation that only reads
+   * this manifest) + the admin SPA can surface it. Today the only writer is
+   * the lifecycle start preflight when a startCmd binary is missing from PATH
+   * (`@openparachute/depcheck` `MissingDependencyError.toWire()`): the row
+   * shows "failed to start — <binary> not installed" with the install info
+   * instead of a bare orphan-timeout. Cleared on the next successful start.
+   *
+   * Stored as the structured `missing_dependency` wire so the SPA can render
+   * the dedicated install card; `parachute status` reads `error_description`.
+   * Validated as a pass-through object (shape owned by depcheck) rather than
+   * re-typed field-by-field here.
+   */
+  lastStartError?: ServiceEntryStartError;
+}
+
+/**
+ * Persisted start-failure detail on a ServiceEntry. Mirrors depcheck's
+ * `MissingDependencyWire` for the missing-dependency case; `error_type` is
+ * left open so a future non-dependency start failure could reuse the field.
+ */
+export interface ServiceEntryStartError {
+  error_type: string;
+  error_description: string;
+  /** Present for `error_type: "missing_dependency"`. */
+  binary?: string;
+  why?: string | null;
+  docs_url?: string | null;
+  install?: { darwin?: string; linux?: string; generic?: string };
+  sysadmin_hint?: string;
+  /** ISO timestamp of when the failure was recorded. */
+  at?: string;
+}
+
+export interface ServicesManifest {
+  services: ServiceEntry[];
+}
+
+export class ServicesManifestError extends Error {
+  override name = "ServicesManifestError";
+}
+
+const EMPTY: ServicesManifest = { services: [] };
+
+function validateEntry(raw: unknown, where: string): ServiceEntry {
+  if (!raw || typeof raw !== "object") {
+    throw new ServicesManifestError(`${where}: expected object, got ${typeof raw}`);
+  }
+  const e = raw as Record<string, unknown>;
+  const name = e.name;
+  const port = e.port;
+  const paths = e.paths;
+  const health = e.health;
+  const version = e.version;
+  if (typeof name !== "string" || name.length === 0) {
+    throw new ServicesManifestError(`${where}: "name" must be a non-empty string`);
+  }
+  if (typeof port !== "number" || !Number.isInteger(port) || port <= 0 || port > 65535) {
+    throw new ServicesManifestError(`${where}: "port" must be an integer 1..65535`);
+  }
+  if (!Array.isArray(paths) || paths.some((p) => typeof p !== "string")) {
+    throw new ServicesManifestError(`${where}: "paths" must be an array of strings`);
+  }
+  if (typeof health !== "string" || !health.startsWith("/")) {
+    throw new ServicesManifestError(`${where}: "health" must be a path starting with "/"`);
+  }
+  if (typeof version !== "string") {
+    throw new ServicesManifestError(`${where}: "version" must be a string`);
+  }
+  const displayName = e.displayName;
+  const tagline = e.tagline;
+  const publicExposure = e.publicExposure;
+  const installDir = e.installDir;
+  if (displayName !== undefined && typeof displayName !== "string") {
+    throw new ServicesManifestError(`${where}: "displayName" must be a string if present`);
+  }
+  if (tagline !== undefined && typeof tagline !== "string") {
+    throw new ServicesManifestError(`${where}: "tagline" must be a string if present`);
+  }
+  if (
+    publicExposure !== undefined &&
+    publicExposure !== "allowed" &&
+    publicExposure !== "loopback" &&
+    publicExposure !== "auth-required"
+  ) {
+    throw new ServicesManifestError(
+      `${where}: "publicExposure" must be "allowed" | "loopback" | "auth-required" if present`,
+    );
+  }
+  if (installDir !== undefined && (typeof installDir !== "string" || installDir.length === 0)) {
+    throw new ServicesManifestError(`${where}: "installDir" must be a non-empty string if present`);
+  }
+  const stripPrefix = e.stripPrefix;
+  if (stripPrefix !== undefined && typeof stripPrefix !== "boolean") {
+    throw new ServicesManifestError(`${where}: "stripPrefix" must be a boolean if present`);
+  }
+  const websocket = e.websocket;
+  if (websocket !== undefined && typeof websocket !== "boolean") {
+    throw new ServicesManifestError(`${where}: "websocket" must be a boolean if present`);
+  }
+  const uis = e.uis;
+  const validatedUis = validateUis(uis, where);
+  const validatedStartError = validateStartError(e.lastStartError, where);
+  const entry: ServiceEntry = { name, port, paths: paths as string[], health, version };
+  if (displayName !== undefined) entry.displayName = displayName;
+  if (tagline !== undefined) entry.tagline = tagline;
+  if (publicExposure !== undefined) entry.publicExposure = publicExposure as PublicExposure;
+  if (installDir !== undefined) entry.installDir = installDir;
+  if (stripPrefix !== undefined) entry.stripPrefix = stripPrefix;
+  if (websocket !== undefined) entry.websocket = websocket;
+  if (validatedUis !== undefined) entry.uis = validatedUis;
+  if (validatedStartError !== undefined) entry.lastStartError = validatedStartError;
+  return entry;
+}
+
+/**
+ * Validate the optional `lastStartError` field. `undefined` round-trips
+ * unchanged. A present value must be an object carrying the two required
+ * string fields (`error_type`, `error_description`); the remaining fields
+ * (the missing-dependency detail) pass through with light type-narrowing so
+ * the SPA install card has them, but we never hard-fail an otherwise-valid
+ * row on a malformed start-error — it's diagnostic metadata, not a contract
+ * field. A malformed value is dropped rather than thrown.
+ */
+function validateStartError(raw: unknown, _where: string): ServiceEntryStartError | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.error_type !== "string" || typeof r.error_description !== "string") {
+    return undefined;
+  }
+  const out: ServiceEntryStartError = {
+    error_type: r.error_type,
+    error_description: r.error_description,
+  };
+  if (typeof r.binary === "string") out.binary = r.binary;
+  if (typeof r.why === "string" || r.why === null) out.why = r.why as string | null;
+  if (typeof r.docs_url === "string" || r.docs_url === null) {
+    out.docs_url = r.docs_url as string | null;
+  }
+  if (r.install && typeof r.install === "object" && !Array.isArray(r.install)) {
+    const ins = r.install as Record<string, unknown>;
+    const install: { darwin?: string; linux?: string; generic?: string } = {};
+    if (typeof ins.darwin === "string") install.darwin = ins.darwin;
+    if (typeof ins.linux === "string") install.linux = ins.linux;
+    if (typeof ins.generic === "string") install.generic = ins.generic;
+    out.install = install;
+  }
+  if (typeof r.sysadmin_hint === "string") out.sysadmin_hint = r.sysadmin_hint;
+  if (typeof r.at === "string") out.at = r.at;
+  return out;
+}
+
+/**
+ * Validate the optional `uis` map on a ServiceEntry. `undefined` round-trips
+ * unchanged (the field is optional); a present map must be a plain object
+ * keyed by string with each value satisfying `UiSubUnit`.
+ *
+ * Each sub-unit is validated against the same shape `UiSubUnit` declares:
+ * `displayName` + `path` required, everything else optional with type-narrow
+ * checks. Errors carry the parent entry's `where` context plus the offending
+ * sub-unit key so an operator scanning logs knows exactly which row to
+ * reconcile.
+ */
+function validateUis(raw: unknown, where: string): Record<string, UiSubUnit> | undefined {
+  if (raw === undefined) return undefined;
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new ServicesManifestError(`${where}: "uis" must be an object map if present`);
+  }
+  const out: Record<string, UiSubUnit> = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof key !== "string" || key.length === 0) {
+      throw new ServicesManifestError(`${where}: "uis" keys must be non-empty strings`);
+    }
+    out[key] = validateUiSubUnit(value, `${where} uis[${JSON.stringify(key)}]`);
+  }
+  return out;
+}
+
+function validateUiSubUnit(raw: unknown, where: string): UiSubUnit {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new ServicesManifestError(`${where}: expected object, got ${typeof raw}`);
+  }
+  const u = raw as Record<string, unknown>;
+  const displayName = u.displayName;
+  const path = u.path;
+  if (typeof displayName !== "string" || displayName.length === 0) {
+    throw new ServicesManifestError(`${where}: "displayName" must be a non-empty string`);
+  }
+  if (typeof path !== "string" || !path.startsWith("/")) {
+    throw new ServicesManifestError(`${where}: "path" must be a path starting with "/"`);
+  }
+  const tagline = u.tagline;
+  const iconUrl = u.iconUrl;
+  const version = u.version;
+  const oauthClientId = u.oauthClientId;
+  const status = u.status;
+  if (tagline !== undefined && typeof tagline !== "string") {
+    throw new ServicesManifestError(`${where}: "tagline" must be a string if present`);
+  }
+  if (iconUrl !== undefined && typeof iconUrl !== "string") {
+    throw new ServicesManifestError(`${where}: "iconUrl" must be a string if present`);
+  }
+  if (version !== undefined && typeof version !== "string") {
+    throw new ServicesManifestError(`${where}: "version" must be a string if present`);
+  }
+  if (oauthClientId !== undefined && typeof oauthClientId !== "string") {
+    throw new ServicesManifestError(`${where}: "oauthClientId" must be a string if present`);
+  }
+  let normalizedStatus: UiSubUnitStatus | undefined;
+  if (status !== undefined) {
+    if (typeof status !== "string") {
+      throw new ServicesManifestError(
+        `${where}: "status" must be "active" | "pending" | "inactive" | "failing" if present`,
+      );
+    }
+    const norm = normalizeUiSubUnitStatus(status);
+    if (norm === undefined) {
+      throw new ServicesManifestError(
+        `${where}: "status" must be "active" | "pending" | "inactive" | "failing" if present (got ${JSON.stringify(status)})`,
+      );
+    }
+    normalizedStatus = norm;
+  }
+  // Audience (H3). Explicit `audience` wins; the legacy boolean `public` is
+  // accepted as an alias for one release window (true → "public"; false →
+  // the default, i.e. no field). FAIL-CLOSED on malformed values: throwing
+  // here makes the lenient manifest read drop the whole row — an unroutable
+  // surface beats one that silently falls open to the wrong audience.
+  let audience: UiAudience | undefined;
+  if (u.audience !== undefined) {
+    if (
+      typeof u.audience !== "string" ||
+      !(UI_AUDIENCE_VALUES as readonly string[]).includes(u.audience)
+    ) {
+      throw new ServicesManifestError(
+        `${where}: "audience" must be "public" | "hub-users" | "operator" | "surface" if present (got ${JSON.stringify(u.audience)})`,
+      );
+    }
+    audience = u.audience as UiAudience;
+  } else if (u.public !== undefined) {
+    if (typeof u.public !== "boolean") {
+      throw new ServicesManifestError(`${where}: legacy "public" must be a boolean if present`);
+    }
+    if (u.public) audience = "public";
+  }
+  let scopesRequired: string[] | undefined;
+  if (u.scopes_required !== undefined) {
+    if (
+      !Array.isArray(u.scopes_required) ||
+      u.scopes_required.some((s) => typeof s !== "string" || s.length === 0)
+    ) {
+      throw new ServicesManifestError(
+        `${where}: "scopes_required" must be an array of non-empty strings if present`,
+      );
+    }
+    scopesRequired = u.scopes_required as string[];
+  }
+  const out: UiSubUnit = { displayName, path };
+  if (tagline !== undefined) out.tagline = tagline;
+  if (iconUrl !== undefined) out.iconUrl = iconUrl;
+  if (version !== undefined) out.version = version;
+  if (oauthClientId !== undefined) out.oauthClientId = oauthClientId;
+  if (normalizedStatus !== undefined) out.status = normalizedStatus;
+  if (audience !== undefined) out.audience = audience;
+  if (scopesRequired !== undefined) out.scopes_required = scopesRequired;
+  return out;
+}
+
+/**
+ * Vault is a multi-instance service: one parachute-vault process serves
+ * every vault on a single port at distinct mount paths (`/vault/default`,
+ * `/vault/techne`, …). Every multi-vault row carries a `parachute-vault*`
+ * name. Sharing a port between vault rows is intentional and not a
+ * collision; sharing a port between two non-vault services (or between a
+ * vault and a non-vault) is.
+ *
+ * Inlined rather than imported from `well-known.ts` to keep the parser
+ * self-contained — well-known.ts already imports from this file.
+ */
+function isVaultName(name: string): boolean {
+  return name === "parachute-vault" || name.startsWith("parachute-vault-");
+}
+
+/**
+ * Reject manifests where two distinct services share a port. Without this
+ * gate, both services land in services.json, the OS lets only one bind,
+ * and the hub reverse-proxy quietly routes everyone to whichever service
+ * won the race. That's exactly how parachute-hub#195 (scribe + agent both
+ * at 1944) produced a silent /agent → scribe miswire. The underlying
+ * overwrite bugs are fixed in parachute-scribe#41 + parachute-agent#146;
+ * this is the hub-side gate so the same class can't recur silently.
+ *
+ * Multi-vault is the deliberate exception: one parachute-vault process
+ * serves N vault instances on a single port at distinct mount paths, so
+ * multiple `parachute-vault*` rows sharing a port is intentional, not a
+ * collision. The check fires only when the conflicting names aren't
+ * both vault rows.
+ *
+ * Pulled out of `validateManifest` so the write side (`upsertService`) can
+ * apply the same gate after merging without re-validating every entry's
+ * shape — the merged manifest's entries are already typed `ServiceEntry`,
+ * but a duplicate-port collision is a property of the merged set, not of
+ * any individual entry. Read-side path runs this after `validateEntry`
+ * across the array; write-side path runs this on the post-merge entries.
+ * Both surface the same `ServicesManifestError` shape.
+ */
+function assertNoDuplicatePorts(entries: ServiceEntry[], where: string): void {
+  const portsSeen = new Map<number, string>();
+  for (const entry of entries) {
+    const prev = portsSeen.get(entry.port);
+    if (prev !== undefined && !(isVaultName(prev) && isVaultName(entry.name))) {
+      throw new ServicesManifestError(
+        `${where}: duplicate port ${entry.port} — claimed by both "${prev}" and "${entry.name}". Edit services.json to give each service a unique port.`,
+      );
+    }
+    if (prev === undefined) portsSeen.set(entry.port, entry.name);
+  }
+}
+
+function validateManifest(raw: unknown, where: string): ServicesManifest {
+  if (!raw || typeof raw !== "object") {
+    throw new ServicesManifestError(`${where}: root must be an object`);
+  }
+  const services = (raw as Record<string, unknown>).services;
+  if (!Array.isArray(services)) {
+    throw new ServicesManifestError(`${where}: "services" must be an array`);
+  }
+  const entries = services.map((s, i) => validateEntry(s, `${where} services[${i}]`));
+  assertNoDuplicatePorts(entries, where);
+  return { services: entries };
+}
+
+/**
+ * Lenient counterpart to `readManifest` — used by hub's hot-path service
+ * routing (`proxyToService`). The strict `readManifest` throws when ANY
+ * entry fails validation; an entire bad row (e.g. an installed module
+ * that wrote `port: 0` to its services.json row before the module's
+ * own selfRegister gained validation) takes down ALL routing because
+ * the routing call site catches the throw and returns 500.
+ *
+ * This lenient reader:
+ *   - parses the file the same way (JSON parse + cleanup passes)
+ *   - validates each entry independently
+ *   - skips entries that fail validation, logging a warning per skip
+ *   - returns the validated remainder
+ *
+ * The trade-off: strict callers (admin SPA write paths, init flows,
+ * tests) keep the throw — they want bugs surfaced immediately. The
+ * routing path uses this so a single bad row doesn't cascade into
+ * "the whole hub appears broken to users." Operators see the rest
+ * of their services keep working + a warning in the logs pointing at
+ * the offending entry.
+ *
+ * Caught 2026-05-26 (hub#406) when @openparachute/app@0.2.0-rc.4 wrote
+ * a row with `name: "app"` (instead of `parachute-app`) + `port: 0`
+ * (instead of bound port). Hub's routing throw on services.json read
+ * meant every request to every service 500'd — not just app — because
+ * one row's bad shape took out the whole manifest read.
+ *
+ * One behavioral difference from strict `readManifest`: this function
+ * does NOT write cleanup mutations back to disk. The bad row persists
+ * on disk until a write-path call (upsertService, etc.) exercises the
+ * strict path. That's intentional — a hot-path read should not mutate
+ * state — but worth knowing: a fix upstream (e.g. app@rc.13 overwriting
+ * the bad row on its next selfRegister) is what finally clears it.
+ */
+export function readManifestLenient(
+  path: string = SERVICES_MANIFEST_PATH,
+  log: { warn?: (msg: string) => void } = console,
+): ServicesManifest {
+  if (!existsSync(path)) return { services: [] };
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(path, "utf8"));
+  } catch (err) {
+    log.warn?.(
+      `[services-manifest] failed to parse ${path}: ${err instanceof Error ? err.message : String(err)} — treating as empty`,
+    );
+    return { services: [] };
+  }
+  const healed = healStaleUiHostAppRows(raw, path);
+  const afterRetired = dropRetiredModuleRows(healed.raw, path);
+  const cleaned = dropLegacyShortNameRows(afterRetired.raw, path);
+  // `typeof null === "object"` in JS, so the `!cleaned.raw` part of this
+  // guard is load-bearing for the null case — not a typo or redundancy.
+  if (!cleaned.raw || typeof cleaned.raw !== "object") return { services: [] };
+  const services = (cleaned.raw as Record<string, unknown>).services;
+  if (!Array.isArray(services)) return { services: [] };
+  const valid: ServiceEntry[] = [];
+  for (let i = 0; i < services.length; i++) {
+    try {
+      valid.push(validateEntry(services[i], `${path} services[${i}]`));
+    } catch (err) {
+      log.warn?.(
+        `[services-manifest] skipping bad entry: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+  // Best-effort duplicate-port detection — log + drop the duplicate
+  // rather than throw. Mirrors the strict `assertNoDuplicatePorts`'s
+  // vault-on-vault exception: multiple parachute-vault-<name> rows
+  // legitimately share port 1940 because they're all served by the
+  // single vault module process.
+  const portsSeen = new Map<number, string>();
+  const dedup: ServiceEntry[] = [];
+  for (const e of valid) {
+    const prev = portsSeen.get(e.port);
+    if (prev !== undefined && !(isVaultName(prev) && isVaultName(e.name))) {
+      log.warn?.(
+        `[services-manifest] dropping duplicate-port entry: name=${JSON.stringify(e.name)} port=${e.port} (already claimed by ${JSON.stringify(prev)})`,
+      );
+      continue;
+    }
+    if (prev === undefined) portsSeen.set(e.port, e.name);
+    dedup.push(e);
+  }
+  return { services: dedup };
+}
+
+export function readManifest(path: string = SERVICES_MANIFEST_PATH): ServicesManifest {
+  if (!existsSync(path)) return { services: [] };
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(path, "utf8"));
+  } catch (err) {
+    throw new ServicesManifestError(
+      `failed to parse ${path}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  // Row-heal + retired-module + legacy short-name cleanup all run BEFORE shape
+  // validation because the bugs they heal (rows that conflict on port with
+  // a current row) would otherwise throw inside `validateManifest`'s
+  // duplicate-port gate. Order matters:
+  //   1. `healStaleUiHostAppRows` FIRST — a pre-rename operator can carry BOTH
+  //      a `parachute-app` AND an `app` stale row (2026-05-22 double-write
+  //      reproducer); dropping by OLD-UI-host shape here clears both, whereas
+  //      `dropLegacyShortNameRows` would keep the `parachute-app` half. Runs
+  //      ahead of the retired-module pass too (the `app`/`parachute-app`
+  //      RETIRED_MODULES entries were removed in hub-parity P5 — the names are
+  //      the NEW app's now — so this shape-gated heal is their replacement).
+  //   2. `dropRetiredModuleRows` — drop genuinely-retired rows so their
+  //      absence can unmask a `parachute-<X>` ↔ `<X>` pair underneath that
+  //   3. `dropLegacyShortNameRows` then handles.
+  // Each pass mutates the raw JSON object's `services` array; we re-validate
+  // against the cleaned shape. See the three helpers for the full discipline.
+  const healed = healStaleUiHostAppRows(raw, path);
+  const afterRetired = dropRetiredModuleRows(healed.raw, path);
+  const cleaned = dropLegacyShortNameRows(afterRetired.raw, path);
+  const validated = validateManifest(cleaned.raw, path);
+  const changed = healed.changed || afterRetired.changed || cleaned.changed;
+  if (changed) writeManifest(validated, path);
+  return validated;
+}
+
+/**
+ * Drop rows whose `name` matches a registered retired module (see
+ * `RETIRED_MODULES` in `service-spec.ts`). Retirement is unconditional —
+ * unlike `dropLegacyShortNameRows`, which only fires when a same-port
+ * manifestName twin is present, this pass drops a retired row whether or
+ * not anything else collides with it. The row is stale by definition: the
+ * module's npm package and daemon are no longer first-party, and leaving
+ * the row in place either (a) routes operators to a no-longer-supported
+ * binary or (b) blocks a current module from claiming the port the retired
+ * row squats on (Aaron's 2026-05-22 reproducer: stale `agent` row at 1946
+ * collided with `parachute-app` self-registering at 1946).
+ *
+ * Per-row stderr warning is operator-actionable: cites the retirement date,
+ * names the replacement module (if any), and includes a one-line shell
+ * snippet for stopping the still-running daemon process. The row reappears
+ * on the next read if the daemon is still up (its self-register writes
+ * back the same name), so the warning steers operators to fully retire
+ * the legacy process, not just hand-edit the file.
+ *
+ * Operates on raw JSON rather than validated entries so a retired row that
+ * shares a port with a current row doesn't trip `validateManifest`'s
+ * duplicate-port gate before this helper runs. Closes hub#334.
+ */
+function dropRetiredModuleRows(raw: unknown, where: string): { raw: unknown; changed: boolean } {
+  if (!raw || typeof raw !== "object") return { raw, changed: false };
+  const services = (raw as Record<string, unknown>).services;
+  if (!Array.isArray(services)) return { raw, changed: false };
+
+  type Dropped = { name: string; retiredAt: string; replacement?: string };
+  const dropped: Dropped[] = [];
+  const nextServices = services.filter((row) => {
+    if (!row || typeof row !== "object") return true;
+    const name = (row as Record<string, unknown>).name;
+    if (typeof name !== "string") return true;
+    // `claw` is too generic to reserve globally, but the historical Agent row
+    // had a structural identity: name=claw mounted at /claw. Retire only that
+    // shape; an unrelated third-party `claw` on another mount remains valid.
+    const paths = (row as Record<string, unknown>).paths;
+    const retiredClawShape = name === "claw" && Array.isArray(paths) && paths[0] === "/claw";
+    const retired = RETIRED_MODULES[name] ?? (retiredClawShape ? RETIRED_MODULES.agent : undefined);
+    if (retired === undefined) return true;
+    dropped.push({ name, retiredAt: retired.retiredAt, replacement: retired.replacement });
+    return false;
+  });
+
+  if (dropped.length === 0) return { raw, changed: false };
+
+  for (const d of dropped) {
+    const replacementLine = d.replacement ? ` Replacement: ${d.replacement}.` : "";
+    console.error(
+      `${where}: dropped stale row for retired module '${d.name}' (retired ${d.retiredAt}).${replacementLine} If the ${d.name} daemon is still running, stop it (e.g. \`ps aux | grep ${d.name}\` then \`kill <pid>\`).`,
+    );
+  }
+
+  return {
+    raw: { ...(raw as Record<string, unknown>), services: nextServices },
+    changed: true,
+  };
+}
+
+/**
+ * Heal stale OLD-UI-host `app`/`parachute-app` rows on load (hub-parity P5,
+ * 2026-07-11).
+ *
+ * Context: the name `parachute-app` originally belonged to the UI-host module
+ * that renamed to `parachute-surface` on 2026-05-27 (patterns#102). Its
+ * retirement used to be handled by a `RETIRED_MODULES` entry that
+ * `dropRetiredModuleRows` GC'd unconditionally. Hub-parity P5 REUSES the
+ * `parachute-app` manifestName (+ the bare `app` short) for a genuinely NEW,
+ * unrelated module — the super-surface front door — so that retirement entry
+ * had to be removed (keeping it would GC the new module's own row on every
+ * read). This heal is the surgically narrow replacement for the ONE case the
+ * removed retirement still needs to cover: an operator upgrading DIRECTLY from
+ * a pre-rename release (~0.5.13-stable) who skipped every intermediate boot
+ * that would have GC'd their stale row. Without a heal, that stale row would:
+ *   - crash-loop on boot — `reconcilePortToCanonical` rewrites its port to
+ *     1944, then the supervisor spawns the app static-serve shim against a
+ *     `@openparachute/app` that isn't installed → exit 1 → a
+ *     forever-restarting "app" unit the operator never installed;
+ *   - hijack `/surface/*` if a real `parachute-surface` row is also present
+ *     (both claim `/surface`);
+ *   - and, after `parachute install app`, keep its stale `/surface` mount so
+ *     the app serves under `/surface` while the install's `root_redirect=/app/`
+ *     points the front page at a 404.
+ *
+ * Discriminant (structural — pinned against the OLD-UI-host row shape verified
+ * in `git show origin/main`'s retired-`app` + legacy-short-name test fixtures:
+ * `port: 1946`, `paths: ["/surface"]`, `health: "/surface/..."`):
+ *   - `name` is exactly `"app"` or `"parachute-app"`, AND
+ *   - it is NOT the NEW app's own row (the new app mounts at `/app` — never
+ *     healed regardless of port), AND
+ *   - it carries the OLD-UI-host signature: `paths[0]` is `/surface`-rooted OR
+ *     `port === 1946` (the old canonical slot; now `parachute-surface`'s).
+ *
+ * The NEW app row (`paths: ["/app"]`, port 1944) is structurally disjoint on
+ * BOTH clauses, so it is always left intact. Matches `dropRetiredModuleRows`'s
+ * behavior: a plain DROP + a stderr warning steering the operator to
+ * `parachute install surface` (the same replacement the retirement named).
+ *
+ * Operates on raw JSON (before `validateManifest`) because a stale row can
+ * collide on port 1946 with a real `parachute-surface` row and would otherwise
+ * trip the duplicate-port gate before this heal runs. Runs FIRST in the load
+ * pipeline (ahead of `dropRetiredModuleRows` / `dropLegacyShortNameRows`): a
+ * pre-rename operator can carry BOTH a `parachute-app` and an `app` stale row
+ * (the 2026-05-22 double-write reproducer) — dropping by shape here clears
+ * both, whereas `dropLegacyShortNameRows` would keep the `parachute-app` half.
+ */
+function healStaleUiHostAppRows(raw: unknown, where: string): { raw: unknown; changed: boolean } {
+  if (!raw || typeof raw !== "object") return { raw, changed: false };
+  const services = (raw as Record<string, unknown>).services;
+  if (!Array.isArray(services)) return { raw, changed: false };
+
+  const dropped: string[] = [];
+  const nextServices = services.filter((row) => {
+    if (!row || typeof row !== "object") return true;
+    const rec = row as Record<string, unknown>;
+    const name = rec.name;
+    if (name !== "app" && name !== "parachute-app") return true;
+    const paths = rec.paths;
+    const first = Array.isArray(paths) && typeof paths[0] === "string" ? paths[0] : undefined;
+    // NEW super-surface app mounts at `/app` (port 1944) — never heal it,
+    // whatever its port happens to be after a reconcile/collision walk.
+    if (first === "/app" || first?.startsWith("/app/")) return true;
+    const port = rec.port;
+    const oldSurfaceMount = first === "/surface" || first?.startsWith("/surface/") === true;
+    const oldCanonicalPort = port === 1946;
+    if (!oldSurfaceMount && !oldCanonicalPort) return true;
+    dropped.push(String(name));
+    return false;
+  });
+
+  if (dropped.length === 0) return { raw, changed: false };
+
+  for (const name of dropped) {
+    console.error(
+      `${where}: dropped stale pre-rename '${name}' row (the OLD UI-host module, renamed to parachute-surface 2026-05-27). The name now belongs to the new Parachute app (mount /app, port 1944). If an old daemon is still running, stop it; install the current UI host with \`parachute install surface\`.`,
+    );
+  }
+
+  return {
+    raw: { ...(raw as Record<string, unknown>), services: nextServices },
+    changed: true,
+  };
+}
+
+/**
+ * Drop legacy short-name rows when a same-module manifestName row exists
+ * on the same port. Handles the duplicate-row class introduced when a
+ * module's self-register wrote `name: "<short>"` (e.g. `"app"`) while
+ * hub's install path stamped `name: "parachute-<short>"` (the canonical
+ * manifestName key). The two rows shared a port and tripped the
+ * duplicate-port read gate, leaving operators with an unbootable
+ * services.json until they edited by hand. Aaron hit this on 2026-05-22
+ * with `parachute-app` + `app` after parachute-app#13 + parachute-runner#4
+ * had already fixed the upstream self-register writes; this gate cleans
+ * up legacy state on operators who had already booted the bad code path.
+ *
+ * Detection is structural — no module registry import needed:
+ *   - two rows share a port (NOT the multi-vault carve-out)
+ *   - one row's name matches `parachute-<X>`
+ *   - the other row's name matches `<X>` (same `<X>`)
+ *
+ * When that shape is present, drop the short-named row + log a warning
+ * to stderr so operators see the auto-cleanup the next time they read
+ * services.json (via any CLI command that touches the file). The
+ * manifestName row wins — it carries the hub-stamped fields (installDir,
+ * version after self-register's first overwrite) operators care about.
+ *
+ * Returns the (possibly mutated) raw object + a `changed` flag so the
+ * caller can re-write services.json with the cleaned shape. Operates on
+ * raw JSON rather than validated entries because the duplicate-port row
+ * pair would otherwise throw during validation before this helper had a
+ * chance to run.
+ */
+function dropLegacyShortNameRows(raw: unknown, where: string): { raw: unknown; changed: boolean } {
+  if (!raw || typeof raw !== "object") return { raw, changed: false };
+  const services = (raw as Record<string, unknown>).services;
+  if (!Array.isArray(services)) return { raw, changed: false };
+
+  // Build a port → [rows] index to spot same-port pairs. We only care
+  // about rows that parse to the minimal `{ name, port }` shape — anything
+  // else fails downstream validation anyway and isn't part of the bug
+  // class.
+  type Probe = { name: string; port: number; index: number };
+  const byPort = new Map<number, Probe[]>();
+  services.forEach((row, index) => {
+    if (!row || typeof row !== "object") return;
+    const name = (row as Record<string, unknown>).name;
+    const port = (row as Record<string, unknown>).port;
+    if (typeof name !== "string" || typeof port !== "number") return;
+    const bucket = byPort.get(port) ?? [];
+    bucket.push({ name, port, index });
+    byPort.set(port, bucket);
+  });
+
+  const dropIndices = new Set<number>();
+  for (const bucket of byPort.values()) {
+    if (bucket.length < 2) continue;
+    for (const a of bucket) {
+      for (const b of bucket) {
+        if (a.index === b.index) continue;
+        // a is the "short" candidate, b is the "manifestName" candidate.
+        // The shape rule: b.name === `parachute-${a.name}` and a is not
+        // itself a `parachute-…` name. Both halves matter: without the
+        // second check, `parachute-vault` paired with `parachute-parachute-vault`
+        // would drop the real vault row (no such pair exists today, but
+        // the shape rule keeps the heuristic narrow on principle).
+        if (a.name.startsWith("parachute-")) continue;
+        if (b.name !== `parachute-${a.name}`) continue;
+        dropIndices.add(a.index);
+      }
+    }
+  }
+
+  if (dropIndices.size === 0) return { raw, changed: false };
+
+  const dropped: string[] = [];
+  const nextServices = services.filter((row, index) => {
+    if (!dropIndices.has(index)) return true;
+    if (row && typeof row === "object") {
+      const name = (row as Record<string, unknown>).name;
+      if (typeof name === "string") dropped.push(name);
+    }
+    return false;
+  });
+
+  console.error(
+    `${where}: dropped legacy short-name row(s) [${dropped.join(", ")}] in favor of same-port manifestName row(s). This is the parachute-app#13 / parachute-runner#4 self-register fixup. See parachute-hub/docs/contracts/services-json-row-conventions.md.`,
+  );
+
+  return {
+    raw: { ...(raw as Record<string, unknown>), services: nextServices },
+    changed: true,
+  };
+}
+
+export function writeManifest(
+  manifest: ServicesManifest,
+  path: string = SERVICES_MANIFEST_PATH,
+): void {
+  mkdirSync(dirname(path), { recursive: true });
+  const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
+  writeFileSync(tmp, `${JSON.stringify(manifest, null, 2)}\n`);
+  renameSync(tmp, path);
+}
+
+export function upsertService(
+  entry: ServiceEntry,
+  path: string = SERVICES_MANIFEST_PATH,
+): ServicesManifest {
+  validateEntry(entry, "entry");
+  const current = existsSync(path) ? readManifest(path) : structuredClone(EMPTY);
+  const idx = current.services.findIndex((s) => s.name === entry.name);
+  if (idx >= 0) {
+    current.services[idx] = entry;
+  } else {
+    current.services.push(entry);
+  }
+  // Symmetric port-collision gate (closes hub#205). Read-time validation
+  // (`validateManifest` → `assertNoDuplicatePorts`) catches duplicates the
+  // next time `services.json` is read, but without this write-side check the
+  // bad state lives on disk for that window. A buggy service boot calling
+  // `upsertService({ name: "agent", port: 1944 })` while scribe is already
+  // at 1944 would otherwise succeed and corrupt the manifest. Same
+  // multi-vault carve-out as the read path.
+  assertNoDuplicatePorts(current.services, path);
+  writeManifest(current, path);
+  return current;
+}
+
+export function removeService(
+  name: string,
+  path: string = SERVICES_MANIFEST_PATH,
+): ServicesManifest {
+  if (!existsSync(path)) return structuredClone(EMPTY);
+  const current = readManifest(path);
+  const next: ServicesManifest = {
+    services: current.services.filter((s) => s.name !== name),
+  };
+  writeManifest(next, path);
+  return next;
+}
+
+export function findService(
+  name: string,
+  path: string = SERVICES_MANIFEST_PATH,
+): ServiceEntry | undefined {
+  if (!existsSync(path)) return undefined;
+  // Lenient read on this read-side helper too — see hub#406. Without
+  // this, every caller that uses findService to check "is X installed?"
+  // crashes when ANY other row in services.json is malformed. Caught
+  // 2026-05-26 when /admin/setup's `isModuleInstalled(vault, ...)` call
+  // still 500'd after the bulk lenient-sweep because findService was
+  // missed.
+  return readManifestLenient(path).services.find((s) => s.name === name);
+}
+
+/**
+ * Persist a `lastStartError` onto the named row so a later `parachute status`
+ * + the admin SPA surface it. No-op if the row isn't present (e.g. a service
+ * that failed to start before its first self-registration wrote a row — the
+ * inline `parachute start` message already told the operator). Lenient read
+ * so a malformed sibling row doesn't block recording an unrelated failure.
+ */
+export function recordStartError(
+  name: string,
+  err: ServiceEntryStartError,
+  path: string = SERVICES_MANIFEST_PATH,
+): void {
+  if (!existsSync(path)) return;
+  const current = readManifestLenient(path);
+  const idx = current.services.findIndex((s) => s.name === name);
+  if (idx < 0) return;
+  const row = current.services[idx];
+  if (!row) return;
+  current.services[idx] = {
+    ...row,
+    lastStartError: { ...err, at: err.at ?? new Date().toISOString() },
+  };
+  writeManifest(current, path);
+}
+
+/** Clear a row's persisted `lastStartError` (called on a successful start).
+ * No-op when the row is absent or already clean. */
+export function clearStartError(name: string, path: string = SERVICES_MANIFEST_PATH): void {
+  if (!existsSync(path)) return;
+  const current = readManifestLenient(path);
+  const idx = current.services.findIndex((s) => s.name === name);
+  if (idx < 0) return;
+  const row = current.services[idx];
+  if (!row || row.lastStartError === undefined) return;
+  const { lastStartError: _drop, ...rest } = row;
+  current.services[idx] = rest;
+  writeManifest(current, path);
+}

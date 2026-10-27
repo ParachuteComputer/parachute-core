@@ -1,0 +1,1006 @@
+# Parachute Vault
+
+**Parachute Vault is a self-hosted knowledge graph that any AI can read and write, over the open [MCP](https://modelcontextprotocol.io) protocol.** Your notes, tags, links, and attachments live on your machine — in plain SQLite databases under `~/.parachute/`, not in a vendor's cloud.
+
+Today it works with **Claude Code, Codex, Goose, OpenCode, and any other local MCP client** — same endpoint, your vault. Claude Code auto-wires on install; for the rest, point them at `http://127.0.0.1:1940/vault/default/mcp`.
+
+Web AI connectors — **claude.ai**, **ChatGPT**, and **Gemini** — are coming in the next few weeks. Switch tools, keep your knowledge. No vendor lock-in, no re-import step when the next model lands.
+
+## Quick start
+
+Requires [Bun](https://bun.sh) (`curl -fsSL https://bun.sh/install | bash`) and macOS 13+ or Linux. No root needed — see [Requirements](#requirements) below for specifics.
+
+```bash
+# Install globally (registers the `parachute` CLI)
+bun add -g @openparachute/vault
+parachute-vault init
+
+# Or clone and run directly
+git clone https://github.com/ParachuteComputer/parachute-vault
+cd parachute-vault
+bun install
+bun src/cli.ts vault init
+```
+
+`vault init` creates a vault, starts a background daemon (launchd on Mac, systemd on Linux), and prints how to connect your AI — the web setup wizard URL, your vault's connector URL (`http://127.0.0.1:1940/vault/default/mcp`), and a ready-to-paste `claude mcp add` command. It does **not** write any client config for you by default. Pass `--configure-claude-code` if you want init to add the Claude Code MCP entry; pass `--token` if you also need a header-auth API token for non-OAuth clients (Codex, Goose, OpenCode, Cursor, Zed, Cline, scripts, `curl`). OAuth-capable clients just need the connector URL and sign in on first connect.
+
+For remote access from Claude Desktop or mobile apps, see [Deployment](#deployment) below.
+
+## What you get
+
+A server on port 1940 with:
+
+- **MCP** — tools for AI agents (notes, tags, graph, vault info, attachments)
+- **REST API** — Full CRUD for notes, tags, links, full-text search
+- **Wikilink auto-linking** — `[[wikilinks]]` in note content automatically create links in the graph
+- **Obsidian import/export** — Bidirectional interop with Obsidian vaults
+- **Webhook triggers** — Config-driven webhooks that fire on note mutations matching tag/metadata predicates
+- **View endpoint** — Serve notes as clean HTML pages (public or authenticated)
+
+Each vault is its own SQLite database. Run multiple vaults on one server.
+
+## What `vault init` does
+
+A mental model for "where is my data?" and "what can I poke at?" after the one-command setup.
+
+### On disk — `~/.parachute/`
+
+```
+~/.parachute/               # ecosystem root — shared with sibling services
+  services.json             # CLI-owned manifest (used by the dispatcher for
+                            # discovery + routing across Parachute services)
+  well-known/               # CLI-owned (.well-known serving)
+  vault/                    # everything vault owns
+    config.yaml             # global config — port, default_vault, owner password
+                            # hash, TOTP secret, backup-codes hashes, backup
+                            # schedule. 0600.
+    .env                    # runtime env vars (PORT=1940 by default; any webhook
+                            # API keys you add later). Sourced by the daemon wrapper.
+    vault.log               # stdout of the running daemon (tail via `parachute-vault logs`)
+    vault.err               # stderr of the running daemon
+    server-path             # text file: absolute path to the repo's src/server.ts —
+                            # how the daemon wrapper finds the source after you move it
+    start.sh                # the wrapper launchd/systemd execs. Knows the absolute
+                            # path to `bun` so a later PATH change doesn't break the daemon
+    assets/                 # legacy top-level uploads dir (attachments now land per-vault)
+    vaults/                 # one subdirectory per vault
+      default/
+        vault.db            # the SQLite database — notes, tags, links, attachments,
+                            # per-vault tokens, tag schemas (oauth_clients +
+                            # oauth_codes tables persist post-workstream-E but
+                            # are vestigial — no issuer writes to them anymore)
+        vault.db-wal        # WAL journal (write-ahead log) — transient, recreated
+                            # on demand. Carries pending writes between checkpoints.
+        vault.db-shm        # WAL shared-memory index — transient, recreated on demand.
+        vault.yaml          # per-vault config — description (sent as MCP session
+                            # instruction), published_tag override, legacy api_keys
+        assets/             # per-vault uploaded attachments (audio, images)
+```
+
+`~/.parachute/` itself is the ecosystem root shared across sibling services — `services.json` and `well-known/` live at the root and are managed by the top-level CLI. Everything vault owns is scoped under `~/.parachute/vault/`. Pre-0.3 installs kept vault state directly at the root; any legacy paths still there are auto-migrated into `vault/` on first post-upgrade run (see CHANGELOG).
+
+`config.yaml` is the one file written at 0600 because it holds the bcrypt owner-password hash and the plaintext TOTP secret (legacy fields kept for hub's expose-posture-check; the standalone consent flow they used to gate was retired in 0.4.x — workstream E). `.env` is written with your umask default (typically 0644); if you add webhook API keys there, tighten the mode yourself. SQLite DBs follow your umask.
+
+The vault SQLite database runs in **WAL** (write-ahead logging) journal mode for multi-process concurrent access — the daemon, CLI tools, and out-of-process consumers (e.g. `parachute-runner` polling `tag:job`) can read concurrently while the daemon writes, without lock contention. WAL adds two sidecar files alongside `vault.db`: `vault.db-wal` (the journal) and `vault.db-shm` (shared-memory index). Both are recreated on demand; **don't back them up separately** — `parachute-vault backup` snapshots only `vault.db` via `VACUUM INTO`, which produces a consistent full-DB copy without needing the sidecars. If you copy a vault by hand, `vault.db` alone is sufficient on a checkpointed database; if you must capture an in-flight write, copy all three files. If WAL can't be enabled (NFS, some FUSE / Docker volume drivers don't support the `-shm` region), vault logs `[vault] WAL mode could not be enabled` on startup and falls back to the legacy single-writer mode.
+
+### Registered externally
+
+- **macOS**: a launchd user agent labelled `computer.parachute.vault` (plus `computer.parachute.vault.backup` if you ran `vault backup --schedule`).
+- **Linux + systemd**: a user service named `parachute-vault.service` (managed via `systemctl --user`).
+- **Neither of the above**: `vault init` prints a reminder to start the server yourself (`bun src/server.ts` or Docker). No service registration.
+
+The daemon binds `0.0.0.0:1940` (or whatever you set in `PORT`) and serves REST, MCP, and OAuth-discovery routes (the issuer itself lives on the hub — see "OAuth lives on the hub" below). `parachute-vault status` is the fast check; `parachute-vault url` prints just the URL for use in scripts.
+
+### `~/.claude.json`
+
+When you opt in (`--configure-claude-code`), `vault init` adds one entry — `mcpServers["parachute-vault"]` — pointing at `http://127.0.0.1:<port>/vault/<default-vault>/mcp`. By default that entry uses OAuth (browser sign-in on first connect); add `--token` and init bakes a scope-narrow `Authorization: Bearer <hub-jwt>` header instead (a hub-minted JWT — vault#282 Stage 2). Next Claude Code session picks it up. See [Connecting a client](#connecting-a-client) for rotating that token or pointing it elsewhere.
+
+### Your API token
+
+`vault init` asks two explicit questions: (1) write the Claude Code MCP entry in `~/.claude.json`? (2) also mint + surface a header-auth API token so you can paste it into non-OAuth MCP clients (Codex, Goose, OpenCode, Cursor, Zed, Cline), scripts, or `curl`? **Both default no** — init's job is to get you to the web wizard and print the connector URL + a paste-ready `claude mcp add` command, not to write client config behind your back. Opt in with `--configure-claude-code` (alias `--mcp`) and/or `--token`; `--no-mcp` / `--no-token` are the explicit opt-outs for non-interactive installs.
+
+If you said yes to (2), the hub-issued JWT is printed prominently at the end — it's the same token baked into `~/.claude.json` (if you also said yes to (1)). It's not stored anywhere retrievable — save it if you need it for `curl`, cron, or any other script. Lost it? Mint a fresh one with `parachute auth mint-token --scope vault:<name>:<verb>` (or rewire an MCP client with `parachute-vault mcp-install`, or use the admin SPA Tokens page). As of vault 0.5.0 (vault#282 Stage 2) vault no longer mints its own `pvt_*` tokens — minting is the hub's job.
+
+### OAuth lives on the hub
+
+Vault is OAuth resource-server-only. The authorization flow — DCR, consent page, code-for-token exchange — lives on the [hub](https://github.com/ParachuteComputer/parachute-hub). Install it once you want browser-based clients (Claude Desktop, Parachute Daily, etc.) to connect:
+
+```bash
+parachute install hub
+```
+
+The hub fronts every vault on the host with a single consent surface, signs JWTs that vault validates against the hub's JWKS, and renders the operator UI. Vault still serves OAuth discovery (`/.well-known/oauth-*`) but the metadata documents forward clients to the hub. See [`docs/auth-model.md`](docs/auth-model.md) for the validation contract.
+
+> Vault shipped its own standalone OAuth issuer through 0.4.7. It was retired in 0.4.x — workstream E. If you're upgrading from a standalone-vault posture, see [`UPGRADING.md`](UPGRADING.md#workstream-e--standalone-oauth-retired).
+
+## Connecting a client
+
+Two ways to authenticate — pick based on the client, not the deployment:
+
+| Path | When to use | User action |
+|---|---|---|
+| **OAuth 2.1 + PKCE (browser flow, via hub)** | Claude Desktop, Parachute Daily, any third-party MCP client set up interactively | Click "Add integration", enter the vault MCP URL, a browser opens to the **hub's** consent page, sign in with hub credentials, done — no token ever touches your clipboard |
+| **Bearer token (hub JWT)** | Claude Code (auto-wired by `vault init`), CLI scripts, cron jobs, any non-interactive caller | `curl -H "Authorization: Bearer <hub-jwt>"` — mint one with `parachute-vault mcp-install` (MCP clients) or `parachute auth mint-token --scope vault:<name>:<verb>` (scripts) |
+
+As of 0.5.0 (vault#282 Stage 2) vault is a **pure hub resource-server**: both paths use a hub-signed JWT that vault validates against the hub's JWKS. (The OAuth path is the interactive browser handshake; the bearer path mints the same kind of JWT non-interactively.) The old vault-local `pvt_*` opaque token was dropped — vault no longer mints or accepts it. The server-wide `VAULT_AUTH_TOKEN` operator bearer remains for the no-granular-auth / cross-container path.
+
+### Claude Code
+
+`vault init` does **not** touch `~/.claude.json` by default — connecting is self-serve (paste the `claude mcp add` command init prints, or add the connector in your client). To have init write the entry for you, pass `--configure-claude-code`. The entry it writes uses OAuth by default (browser sign-in on first connect); add `--token` and it bakes a scope-narrow hub-minted JWT instead:
+
+```json
+{
+  "mcpServers": {
+    "parachute-vault": {
+      "type": "http",
+      "url": "http://127.0.0.1:1940/vault/{name}/mcp",
+      "headers": { "Authorization": "Bearer <hub-jwt>" }
+    }
+  }
+}
+```
+
+Where `{name}` is `default` on a fresh install, or whatever vault you pointed `vault init` at. **With `--configure-claude-code --token`, the first MCP call needs no browser handoff** — Claude Code uses the baked-in token and the vault's tools show up in your next session. Without `--token`, the opted-in entry uses OAuth and Claude Code does a one-time browser sign-in on first connect. This is a deliberate trade: OAuth-first by default (no long-lived token sitting in a dotfile), with the baked-token path one flag away for an owner wiring their own machine.
+
+To re-point Claude Code at a different vault, change `default_vault` in `~/.parachute/vault/config.yaml` and re-run `parachute-vault init --configure-claude-code` (add `--token` to bake a fresh token). To rotate the token only, run `parachute-vault mcp-install` (defaults to `--mint`, which mints a fresh scope-narrow hub JWT via `~/.parachute/operator.token` and writes it into `~/.claude.json` with an `Authorization: Bearer …` header). See the [cookbook](#install-vault-mcp-into-a-client-config) section below for the full flag surface — token paste, scope narrowing, project-level install, multi-vault.
+
+### Claude Desktop (OAuth)
+
+For Claude Desktop — or any install where the server is on a different machine from the client — use the browser-based OAuth flow. **The flow runs against the hub**, not vault, so make sure you've run `parachute install hub` first:
+
+1. Claude Desktop → Settings → Integrations → Add MCP server.
+2. Enter the URL: `https://vault.yourdomain.com/vault/{name}/mcp` (replace `{name}` with your vault name — e.g. `default`). **Do not paste a bearer token** — leave the auth field empty.
+3. The MCP client discovers vault's protected-resource metadata at `/vault/{name}/.well-known/oauth-protected-resource`, which names the **hub** as the authorization server. It then drives the OAuth flow against the hub: DCR, browser-opened consent page, code exchange.
+4. Sign in to the hub with your hub credentials, pick a scope (`full` or `read`), click Authorize.
+5. Browser redirects back. The connection is live. The client now holds a hub-signed JWT scoped to this vault.
+
+If you'd rather skip the browser flow — e.g. you're scripting the setup — Claude Desktop also accepts a bearer token via the integration's auth header field. Mint a hub JWT with `parachute auth mint-token --scope vault:<name>:<verb>` (or the admin SPA Tokens page), or reuse the one from `vault init` if you still have it. This is the "manual bearer" fallback; the OAuth browser flow is the recommended path.
+
+### Parachute Daily (mobile)
+
+Daily uses the same OAuth flow (hub-fronted). On first launch: enter the server URL, pick the vault from the drop-down (populated from the public `GET /vaults/list` endpoint), tap **Connect to Vault**. The consent handoff runs in your phone's browser against the hub, then redirects back to the app via the `parachute://oauth/callback` deep link. The app stores the hub-signed JWT in platform secure storage.
+
+### Multi-vault
+
+One server, many vaults. Each vault is its own SQLite DB with its own MCP endpoint, its own OAuth, and its own tokens.
+
+```bash
+parachute-vault create work     # new vault named "work"
+parachute-vault list            # show all vaults on this server
+parachute-vault remove work --yes
+```
+
+**The default vault is managed for you.** `vault init` creates `default` on first install and records it as `default_vault` in `~/.parachute/config.yaml`. `vault create <name>` promotes the newly-created vault to default when no default exists or when the configured default points at a missing vault. `vault remove <name>` promotes the sole survivor when you delete the default and one vault remains; if multiple remain after removing the default, it clears the setting and tells you to edit `config.yaml` yourself. There is no `vault set-default` subcommand — to point the server at a different existing vault, edit the `default_vault:` line in `~/.parachute/config.yaml` and `parachute-vault restart`.
+
+**URL shape.** Every vault-touching route lives under `/vault/{name}/...`: `/vault/{name}/mcp`, `/vault/{name}/api/notes`, `/vault/{name}/view/{id}`, `/vault/{name}/.well-known/oauth-*` (discovery forwarders). There is no unscoped fallback — pick the vault in the URL even if you only have one. OAuth tokens are scoped to the vault named in the audience claim (`aud=vault.<name>`); cross-vault substitution is rejected at the auth layer.
+
+**Listing vaults from a client.** The authenticated `GET /vaults` endpoint returns full vault metadata. The public `GET /vaults/list` endpoint returns names only, no metadata, no auth required — this is what Parachute Daily's vault picker calls before the user authenticates. Operators who want to hide the vault list from unauthenticated callers can set `discovery: disabled` in `~/.parachute/vault/config.yaml` to make `/vaults/list` return 404.
+
+## CLI
+
+```bash
+# Setup
+parachute-vault init                       # one-command setup (idempotent — safe to re-run)
+parachute-vault status                     # check what's running
+parachute-vault doctor                     # diagnose install/config issues (see Troubleshooting)
+parachute-vault url                        # print the local server URL (for scripts)
+parachute --version                        # print the installed version (aliases: -v, version)
+parachute-vault uninstall                  # remove daemon + MCP entry; keeps user data
+parachute-vault uninstall --wipe           # ...and also remove vaults, .env, config.yaml, logs
+parachute-vault uninstall --yes --wipe     # scripted destructive wipe (prints an audit line)
+
+# Vaults
+parachute-vault create work                # create a new vault
+parachute-vault list                       # list all vaults (alias: `ls`)
+parachute-vault remove work --yes          # delete a vault (alias: `rm`)
+parachute-vault mcp-install                # (re)write the MCP client entry; defaults to --mint (hub-issued JWT) at local scope
+parachute-vault mcp-install --token <t>    # paste an existing bearer (hub JWT or VAULT_AUTH_TOKEN) instead of minting
+parachute-vault mcp-install --install-scope user      # write ~/.claude.json top-level (every project)
+parachute-vault mcp-install --install-scope local     # write ~/.claude.json projects[<cwd>] (this directory only — default)
+parachute-vault mcp-install --install-scope project   # write ./.mcp.json (checked into the repo)
+parachute-vault mcp-install --vault work   # target the "work" vault (keyed as parachute-vault-work)
+parachute-vault mcp-install --dry-run      # describe the write without touching disk or the hub
+parachute-vault mcp-config gitcoin         # emit JSON for `claude -p --mcp-config "$(...)"`
+parachute-vault mcp-config gitcoin --env-vars   # template form with ${PARACHUTE_HUB_URL}/${PARACHUTE_VAULT_TOKEN}
+
+# OAuth — owner password + 2FA (legacy, no longer wired up)
+# vault's standalone OAuth consent page was retired in 0.4.x (workstream E);
+# OAuth now runs on the hub. These commands still write to config.yaml for
+# hub's `expose public` posture-check (which reads the same fields), but
+# they don't gate any consent flow inside vault. Set hub credentials with
+# `parachute auth set-password` instead.
+parachute-vault set-password               # set/change owner password (legacy YAML field)
+parachute-vault set-password --clear       # remove the owner password
+parachute-vault 2fa status                 # show 2FA state + remaining backup codes
+parachute-vault 2fa enroll                 # enroll TOTP (shows QR + prints one-time backup codes)
+parachute-vault 2fa disable                # disable 2FA
+parachute-vault 2fa backup-codes           # regenerate backup codes
+
+# Tokens — vault#282 Stage 2: vault no longer mints its own tokens. Mint a
+# hub JWT with `parachute-vault mcp-install` (MCP clients) or
+# `parachute auth mint-token --scope vault:<name>:<verb>` (scripts).
+parachute-vault tokens                     # list any vestigial pre-0.5.0 token rows (all vaults)
+parachute-vault tokens revoke <token-id>   # revoke a vestigial row (default vault; add --vault to target)
+
+# Obsidian
+parachute-vault import ~/Obsidian/MyVault              # import into default vault
+parachute-vault import ~/Obsidian/Work --vault work    # import into a specific vault
+parachute-vault import <path> --dry-run                # preview without importing
+parachute-vault export ./output --vault work           # export a specific vault
+
+# Config
+parachute-vault config                     # show current configuration
+parachute-vault config set KEY value       # set an env var (e.g. PORT=1940)
+parachute-vault config unset KEY           # remove an env var
+parachute-vault restart                    # apply config changes (bounces the daemon)
+# Env vars live in ~/.parachute/vault/.env. Notable ones:
+#   PORT                          — server port (default 1940)
+#   PARACHUTE_GITHUB_CLIENT_ID +
+#   PARACHUTE_GITHUB_APP_SLUG     — bring-your-own GitHub App for the mirror
+#                                   "Back up to GitHub" flow (defaults to the
+#                                   shared Parachute app). Set BOTH or NEITHER:
+#                                   the pair must name the same app — mixing
+#                                   apps breaks the install probe.
+
+# Server
+parachute-vault serve                      # run the server in the foreground (no daemon)
+parachute-vault logs                       # stream vault.log + vault.err (tail -f)
+
+# Backup
+parachute-vault backup                         # one-shot backup to configured destinations
+parachute-vault backup --schedule daily        # hourly | daily | weekly | manual (macOS launchd)
+parachute-vault backup status                  # schedule, last run, destinations, next run
+```
+
+## MCP tools (13 core, + attachments + admin)
+
+**Notes**: `query-notes` (universal read — single by ID/path, filter, search, graph neighborhood), `create-note` (single or batch), `update-note` (single or batch — content, tags, links, metadata), `delete-note`
+**Tags**: `list-tags` (with optional schema detail), `update-tag` (upsert description + schema fields), `delete-tag`, `rename-tag`, `merge-tags`
+**Graph**: `find-path` (BFS between two notes)
+**Vault**: `vault-info` (get/update description + stats)
+**Admin**: `prune-schema`, `doctor` (taxonomy/metadata integrity scan), `manage-token`
+**Attachments** (2, present when the door wires an attachment-ticket provider — always true on this server): `request-attachment-upload`, `request-attachment-download` — mint a short-lived, single-use ticket a runtime's shell spends directly at `/vault/{name}/tickets/{id}`; bytes never pass through the tool call. See [`docs/HTTP_API.md`](./docs/HTTP_API.md#attachment-tickets-vault611--wave-1-bun-only).
+
+### Vault descriptions
+
+Each vault teaches AI agents how to use it:
+
+```yaml
+# ~/.parachute/vault/vaults/default/vault.yaml
+name: default
+description: |
+  Personal knowledge vault. Tags in use: daily, voice, reader, project.
+  Use lowercase tags. Tag every note. Read before writing to avoid duplicates.
+```
+
+Sent as the MCP server instruction at session start.
+
+### Schema enforcement & state machines (vault#299)
+
+Tag-field schemas (`update-tag`'s `fields`) are **advisory by default** — a violating write succeeds and the response carries `validation_status` warnings the agent can self-correct on. That's right for organic single-vault use. Once a vault has multiple writers (humans + agents), opt individual fields into **strict** enforcement:
+
+```yaml
+tag: concept-seed
+fields:
+  state:    { type: string, enum: [idea, drafted, scripted, produced, published, killed], strict: true }
+  title:    { type: string, required: true, strict: true }
+  owners:   { type: array,  cardinality: many, strict: true }
+  priority: { type: number }   # advisory (default)
+  notes:    { type: string }   # advisory — free-form stays free-form
+```
+
+`strict: true` flips **all** of that field's declared constraints together — `type` + `enum` + `required` + `cardinality` — from warnings to hard write rejections (all-or-nothing per field). A violating create/update is rejected with a single `schema_validation` error carrying **every** per-field violation (MCP `data.error_type: "schema_validation"` / HTTP 422), and nothing is written. Strictness is **per-field**, so a free-form `notes` field stays advisory on an otherwise-strict tag. Declared strict fields surface in `vault-info` and the connect-time brief so an agent knows the contract before writing.
+
+**Migration bypass.** A token holding the `vault:migrate` scope (broad) or `vault:<name>:migrate` (narrowed) skips strict enforcement — for backfilling/migrating existing non-conforming notes. It's an orthogonal capability (an `admin` token does **not** bypass unless it also holds `migrate`), and every bypassed write is logged to the daemon's structured log (`[schema-bypass] {...}` with the actor/via and waived violations) for later audit.
+
+**Compare-and-set state transitions.** Advance a state machine race-safely in one round trip instead of read → check → conditional update. `update-note`'s `state_transition: { field, from, to }` atomically sets `field` to `to` **only if** it currently equals `from`; otherwise it's rejected with a distinct `transition_conflict` error. A **missing field** counts as a conflict; pass `from: null` to match a field that is absent or explicitly null. A **transition-only** update needs no `if_updated_at`/`force` — the compare-and-set IS the precondition. Combinable with other field updates in the same call (they land in the same atomic UPDATE), but a combined call still needs `if_updated_at`/`force` for the *other* fields — the CAS only guards the transitioned field, not the rest of the merge.
+
+```jsonc
+// advance a seed from idea → drafted, race-safely
+update-note { "id": "Seeds/my-idea", "state_transition": { "field": "state", "from": "idea", "to": "drafted" } }
+```
+
+## Features
+
+### Wikilink auto-linking
+
+`[[wikilinks]]` in note content automatically create links in the graph. Supports aliases (`[[Name|display]]`), anchors (`[[Note#Section]]`), and embeds (`![[Image]]`). Unresolved links auto-resolve when the target note is created later.
+
+### Obsidian import/export
+
+```bash
+parachute-vault create research
+parachute-vault import ~/Obsidian/Research --vault research
+parachute-vault export ./output --vault research
+```
+
+Imports: frontmatter → metadata, `#tags` → tags table, `[[wikilinks]]` → links table, file paths → note.path. Skips duplicates.
+
+### Path conventions
+
+Note paths work like Obsidian file paths (`Projects/Parachute/README`). Normalized, unique, case-insensitive resolution. Renaming a note's path updates `[[wikilinks]]` in other notes.
+
+### Webhook triggers
+
+Declarative config-driven webhooks that fire when a note mutation matches a predicate. Configured in `~/.parachute/vault/config.yaml`:
+
+```yaml
+triggers:
+  - name: scribe
+    events: [created, updated]
+    when:
+      tags: [voice]
+      has_content: false
+      missing_metadata: [transcribed_at]
+    action:
+      webhook: http://localhost:3200/v1/audio/transcriptions
+      send: attachment
+      timeout: 120000
+
+  - name: narrate
+    events: [created, updated]
+    when:
+      tags: [reader]
+      has_content: true
+      missing_metadata: [audio_rendered_at]
+    action:
+      webhook: http://localhost:3100/v1/audio/speech
+      send: content
+```
+
+**Predicate fields**: `tags` (all must match), `has_content` (true/false), `missing_metadata` (keys that must be absent), `has_metadata` (keys that must be present), and `metadata` (value-matched — a field → operator-object map using the same operators as `query-notes`: `eq/ne/gt/gte/lt/lte/in/not_in/exists`). All predicate fields are ANDed. Value-matching lets a trigger fire on a specific transition rather than every edit (vault#299):
+
+```yaml
+  - name: announce-published
+    events: [updated]
+    when:
+      tags: [piece]
+      metadata:
+        state: { eq: published }     # fire only when state reaches "published"
+      missing_metadata: [announced_at]
+    action:
+      webhook: https://example.com/announce
+```
+
+**Two-phase markers**: On match, the trigger sets `<name>_pending_at` metadata before calling the webhook, then replaces it with `<name>_rendered_at` on success. This prevents re-entry and concurrent runs.
+
+#### Send modes
+
+| Mode | Request format | Response format | Use case |
+|---|---|---|---|
+| `json` (default) | POST `{ trigger, event, note }` as JSON | `{ content?, metadata?, attachments?, skipped_reason? }` | General-purpose webhooks |
+| `attachment` | POST first audio attachment as multipart/form-data (Whisper API format) | `{ text }` — written to note.content | Transcription (e.g., scribe on :3200) |
+| `content` | POST `{ input: note.content, model, voice }` as JSON (OpenAI TTS format) | Binary audio — saved as attachment | Text-to-speech (e.g., narrate on :3100) |
+
+**Example flow — voice note transcription:**
+1. Daily app uploads audio via `POST /api/storage/upload`, creates note tagged `voice` with no content
+2. Trigger `scribe` matches (tag=voice, has_content=false, missing transcribed_at)
+3. Vault reads the audio file from its assets dir, POSTs it to scribe as multipart/form-data
+4. Scribe returns `{ text: "transcribed text..." }`
+5. Vault writes text to note.content and sets `scribe_rendered_at` metadata
+
+**Example flow — text-to-speech:**
+1. A note tagged `reader` is created with text content
+2. Trigger `narrate` matches (tag=reader, has_content=true, missing audio_rendered_at)
+3. Vault POSTs `{ input: note.content }` to narrate
+4. Narrate returns audio bytes
+5. Vault saves the audio as an attachment and sets `narrate_rendered_at` metadata
+
+Webhook servers (scribe, narrate) are stateless — they don't need vault's API key.
+
+### On-upload transcription
+
+Two paths feed the same transcription worker; they differ in how the
+result surfaces.
+
+**Auto-transcribe (vault#353).** When the operator flips
+`auto_transcribe.enabled: true` in vault's config AND scribe is
+reachable (registered in `~/.parachute/services.json`, or pointed at
+via `SCRIBE_URL`), any audio attachment uploaded to the vault is
+automatically queued for transcription. The worker writes a sibling
+`<attachment-path>.transcript.md` note with the transcript text +
+frontmatter linking back to the audio (`transcript_of`,
+`transcript_status`, `transcript_duration_ms`, etc.). Failures land as
+the same note with `transcript_status: failed` and the cause in
+`transcript_error`; the original audio is preserved. Operators can
+retry a failed transcript via `POST /vault/<name>/api/notes/<note-id>/retry-transcription`.
+
+**Explicit `transcribe: true` (legacy, Lens flow).** Callers that already
+know at upload time that an audio file should be transcribed pass
+`transcribe: true` to `POST /api/notes/{id}/attachments`. The vault
+stamps the attachment with `transcribe_status: "pending"` and the note
+with `transcribe_stub: true`. The worker replaces the literal
+`_Transcript pending._` placeholder in the note body with the transcript
+on success (or the whole body if no placeholder is present).
+
+Service discovery is automatic — when scribe lands in
+`~/.parachute/services.json` (the canonical hub-maintained registry),
+vault picks up its URL on next restart. The `SCRIBE_URL` env var still
+wins when set. The shared bearer for vault→scribe auth is generated
+once at first boot and persisted to `~/.parachute/vault/.env` as
+`SCRIBE_AUTH_TOKEN`; mirror that value into scribe's
+`SCRIBE_AUTH_TOKEN` env so scribe accepts the Authorization header.
+
+The worker POSTs audio as multipart to
+`${SCRIBE_URL}/v1/audio/transcriptions` and expects `{ text: string }`
+back. On success it records `transcript` + `transcribe_done_at` +
+`transcribe_duration_ms` on the attachment row regardless of the
+result-surface path. Failures retry with exponential backoff up to three
+attempts before flipping `transcribe_status` to `"failed"`; 4xx
+responses carrying `error_code` (e.g. `missing_provider`) are treated as
+terminal on the first failure.
+
+Per-vault `audio_retention` controls what happens to the audio file on disk once the worker reaches a terminal state. It's readable and mutable at runtime via `GET` / `PATCH /api/vault` (under `config.audio_retention`), or by hand-editing `vault.yaml`.
+
+- `keep` (default) — leave the file on disk indefinitely.
+- `until_transcribed` — unlink on successful transcription; on failure the file is kept so you can retry or re-upload.
+- `never` — unlink on any terminal state, **including failure**. Users who opt in accept that losing a bad transcription also loses the source audio. The file stays during mid-queue retries so in-flight attempts still have something to send.
+
+In every mode the attachment row (and any stored transcript) is preserved; only the file on disk is affected.
+
+### Backing up your vault
+
+Your vault is just SQLite DBs + a handful of YAML files under `~/.parachute/vault/`. `parachute-vault backup` snapshots everything into a single timestamped tarball, for a one-shot or a scheduled run.
+
+```bash
+parachute-vault backup                         # one-shot — snapshot + ship to destinations
+parachute-vault backup --schedule daily        # register a launchd agent (macOS)
+parachute-vault backup --schedule manual       # stop scheduled backups
+parachute-vault backup status                  # schedule, last run, destinations, next run
+```
+
+Configure destinations in `~/.parachute/vault/config.yaml`:
+
+```yaml
+backup:
+  schedule: daily       # hourly | daily | weekly | manual
+  retention:
+    daily: 7            # last 7 daily snapshots
+    weekly: 4           # last-of-week for 4 weeks
+    monthly: 12         # last-of-month for 12 months
+    yearly: null        # last-of-year, unbounded (null = keep every year forever)
+  destinations:
+    - kind: local
+      path: ~/Library/Mobile Documents/com~apple~CloudDocs/parachute-backups
+```
+
+**Retention is tiered** (grandfather / father / son). After each run, the pruner keeps the union of four tiers:
+
+| Tier    | What it keeps                                          |
+|---------|--------------------------------------------------------|
+| daily   | The N most recent snapshots.                           |
+| weekly  | The last snapshot of each of the last N ISO weeks.     |
+| monthly | The last snapshot of each of the last N calendar months.|
+| yearly  | The last snapshot of each year — `null` means unbounded.|
+
+A snapshot that qualifies for multiple tiers is kept once. Set any tier to `0` to disable it; sparse data (days without a backup) just means some tiers contribute nothing that day. Bucketing uses your local timezone, so calendars line up with what you see, not UTC.
+
+**What's in a snapshot**: atomic `VACUUM INTO` copies of every `vaults/<name>/vault.db`, your `config.yaml`, and each vault's `vault.yaml`, bundled as `parachute-backup-<timestamp>.tar.gz`. Safe under concurrent reads/writes — no need to stop the daemon.
+
+**Restore**: extract the tarball into a fresh `~/.parachute/vault/` and run `parachute-vault init` to re-register the daemon. The DBs and configs drop in place; you don't need any special restore command (for now — a dedicated `vault restore` is coming soon).
+
+Destination kinds shipping in this release: `local` (any filesystem path — including iCloud Drive, a mounted external disk, or an rsync/Syncthing-backed folder). `s3`, `rsync`, and `cloud` destinations are planned but not yet implemented.
+
+On Linux, scheduled runs via systemd timers are a follow-up; for now `parachute-vault backup` works on Linux but you'll need to wire the cron yourself.
+
+### View endpoint
+
+Serve notes as clean HTML pages at `/view/:noteId`:
+
+- **Without auth**: only serves notes tagged `published` (or with `metadata.published: true`). Returns 404 for unpublished notes.
+- **With auth**: serves any note. Pass your token via `Authorization: Bearer <hub-jwt>` header or `?key=<hub-jwt>` query param.
+- **Custom tag**: set `published_tag` in vault.yaml to use a different tag name (default: `publish`).
+
+```yaml
+# ~/.parachute/vault/vaults/default/vault.yaml
+published_tag: public
+```
+
+## REST API
+
+Every vault-touching path is scoped under `/vault/{name}/` — substitute your vault name (e.g. `default`) for `{name}`:
+
+```
+GET/POST       /vault/{name}/api/notes                           query or create notes
+GET/PATCH/DEL  /vault/{name}/api/notes/:idOrPath                  read, update, delete a single note
+GET/POST       /vault/{name}/api/notes/:id/attachments            list or add attachments
+GET            /vault/{name}/api/tags                             list tags (?include_schema=true for schemas)
+GET/PUT/DEL    /vault/{name}/api/tags/:name                       get, update, or delete a tag
+POST           /vault/{name}/api/tags/:name/rename                atomic rename (409 if target_exists)
+POST           /vault/{name}/api/tags/merge                       atomic multi-source merge into a target tag
+GET            /vault/{name}/api/find-path?source=...&target=...  shortest path between two notes
+GET/PATCH      /vault/{name}/api/vault                            vault info (get or update description)
+POST           /vault/{name}/api/storage/upload                   upload file (audio/image)
+GET            /vault/{name}/api/storage/:path                    download file
+POST           /vault/{name}/mcp                                  MCP endpoint (per-vault session)
+*              /vault/{name}/oauth/{register,authorize,token}     OAuth 2.1 + PKCE flow
+*              /vault/{name}/.well-known/oauth-*                  RFC 8414 / RFC 9728 discovery
+GET            /vault/{name}/view/:idOrPath                       render note as HTML (public or auth)
+GET            /vaults                                            authenticated: full metadata
+GET            /vaults/list                                       public: vault names only (unless discovery: disabled)
+GET            /health                                            health check
+```
+
+## Common queries / cookbook
+
+Patterns that fall out of vault's read and write surfaces. All examples assume your vault is reachable at `http://localhost:1940` and your token is in `$VAULT_TOKEN`. MCP-side examples are how the same operation looks via the tool layer (Claude Code, Claude Desktop, Daily). Each recipe answers a question consumers have asked while building against vault — see [vault#285](https://github.com/ParachuteComputer/parachute-vault/issues/285) for the field-input thread these distilled from.
+
+### Fetch every note under a path subtree
+
+For an SSG or wiki rendering a section of the vault. `path_prefix` matches against the normalized path string — no `.md`, no trailing slash.
+
+```bash
+curl -H "Authorization: Bearer $VAULT_TOKEN" \
+  "http://localhost:1940/vault/default/api/notes?path_prefix=Boulder%20Civics/City%20Council/&include_content=true"
+```
+
+```jsonc
+// MCP
+{ "name": "query-notes", "arguments": { "path_prefix": "Boulder Civics/City Council/", "include_content": true } }
+```
+
+### Sort by a metadata field
+
+Sort by something other than `created_at`. The field must be declared `indexed: true` in some tag schema first — that's what materializes the backing generated column + B-tree index. The "tag authorizes the index" pattern lives in [`core/src/indexed-fields.ts`](./core/src/indexed-fields.ts).
+
+```bash
+curl -H "Authorization: Bearer $VAULT_TOKEN" \
+  "http://localhost:1940/vault/default/api/notes?order_by=meeting_date&sort=desc&include_content=true"
+```
+
+Declare the index via `update-tag`:
+
+```jsonc
+{ "name": "update-tag", "arguments": {
+    "tag": "meeting",
+    "fields": { "meeting_date": { "type": "string", "indexed": true } }
+} }
+```
+
+### Return previews instead of full bodies
+
+Listing pages don't need the whole note. By default `GET /notes` returns the lean shape — 120-char whitespace-collapsed `preview`, `byteSize`, and the usual metadata — with no `content`. Single-note `GET /notes/:id` still returns full content by default; pass `include_content=false` to drop it.
+
+```bash
+curl -H "Authorization: Bearer $VAULT_TOKEN" \
+  "http://localhost:1940/vault/default/api/notes?path_prefix=Posts/"
+# → [{ id, path, byteSize, preview, tags, metadata, ... }, ...]
+```
+
+Caller-tunable preview length is a future enhancement — file an issue if 120 chars isn't enough.
+
+### Read a large note in chunks (content range)
+
+A 100KB+ transcript won't fit in one MCP response. Pass `content_offset` / `content_length` (UTF-8 bytes) for a bounded read — the response carries the slice plus `content_total_length` and `content_next_offset` (`null` when complete). Loop, feeding `content_next_offset` back in as `content_offset`; concatenating the slices reconstructs the content byte-for-byte. Slices end on a codepoint boundary within the budget (never over `content_length`, at most 3 bytes under).
+
+```bash
+curl -H "Authorization: Bearer $VAULT_TOKEN" \
+  "http://localhost:1940/vault/default/api/notes/Meetings%2F2026-06-09?content_offset=0&content_length=65536"
+# → { ..., "content": "<first ≤64KB>", "content_total_length": 118034, "content_next_offset": 65530 }
+```
+
+```jsonc
+// MCP — same params on query-notes; works per-note on lists with include_content: true
+{ "name": "query-notes", "arguments": { "id": "Meetings/2026-06-09", "content_offset": 0, "content_length": 65536 } }
+```
+
+Range params require content in the response — with `include_content=false` (or a list query left on its lean default) they error rather than silently no-op. Full semantics in [docs/HTTP_API.md](./docs/HTTP_API.md) ("Content range — bounded reads for large notes").
+
+### Incremental rebuilds: "what changed since X"
+
+The SSG / sync pattern. Bracket-style is the query-string date filter. (The flat `date_field` / `date_from` / `date_to` params were removed in 0.6.4 — vault#288 — and are now ignored.)
+
+```bash
+# Bracket-style (the query-string date filter)
+curl -H "Authorization: Bearer $VAULT_TOKEN" \
+  "http://localhost:1940/vault/default/api/notes?meta[updated_at][gte]=2026-04-01T00:00:00Z"
+```
+
+```jsonc
+// MCP — `date_filter` accepts created_at, updated_at, or any indexed metadata field.
+{ "name": "query-notes", "arguments": { "date_filter": { "field": "updated_at", "from": "2026-04-01T00:00:00Z" } } }
+```
+
+Only `gte` and `lt` are accepted on `created_at` / `updated_at` (other operators reject with `INVALID_QUERY` — these bracket forms route to the real-column `dateFilter`, not the full metadata operator set, so the half-open `[from, to)` shape is the only expressible range). The full operator set in the next recipe applies to *metadata* fields only.
+
+### Filter by metadata values (bracket style)
+
+Equality on any metadata field works with no setup:
+
+```bash
+curl -H "Authorization: Bearer $VAULT_TOKEN" \
+  "http://localhost:1940/vault/default/api/notes?meta[meeting-type]=study-session&include_content=true"
+```
+
+Range, `in`, `not_in`, and `exists` operators require the field to be declared `indexed: true` (same gate as `order_by`):
+
+```bash
+# Range — both bounds AND together on one field
+"…/notes?meta[date][gte]=2026-01-01&meta[date][lt]=2026-04-01"
+
+# Membership — `[]` array form OR comma-separated; same result.
+"…/notes?meta[status][in][]=active&meta[status][in][]=exploring"
+"…/notes?meta[status][in]=active,exploring"
+
+# Presence check
+"…/notes?meta[deadline][exists]=true"
+```
+
+Supported operators: `eq` (default when no operator given), `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `not_in`, `exists`. Multiple `meta[…]` filters AND together. Bracket-style and shorthand on the same field in one request reject loudly — pick one form.
+
+### Edit one line in a large note (without re-sending the whole body)
+
+`content_edit` does surgical find-and-replace. Payload is the changed text, not the whole note. `old_text` must occur exactly once; multiple matches or zero matches reject with a "re-read and retry" error.
+
+```jsonc
+// MCP
+{ "name": "update-note", "arguments": {
+    "id": "notes/decisions",
+    "content_edit": {
+      "old_text": "Status: pending",
+      "new_text": "Status: shipped (2026-05-10)"
+    },
+    "if_updated_at": "2026-05-10T12:34:56.789Z"
+} }
+```
+
+```bash
+# REST equivalent
+curl -X PATCH -H "Authorization: Bearer $VAULT_TOKEN" -H "Content-Type: application/json" \
+  -d '{"content_edit":{"old_text":"Status: pending","new_text":"Status: shipped (2026-05-10)"},"if_updated_at":"…"}' \
+  "http://localhost:1940/vault/default/api/notes/notes/decisions"
+```
+
+Set `include_content: false` on the request to cut the response cost too — you get back the lean `NoteIndex` shape instead of the full updated note.
+
+### Append to a note (no concurrency ceremony)
+
+Atomic at the SQL layer: two concurrent appends both land in some order, never clobber. Append-only and prepend-only updates are exempt from the `if_updated_at` precondition that other mutations require — the SQL-atomic concatenation can't lose data on a stale read, so the precondition would be ceremony for no benefit. Underlying mechanic in [`core/src/notes.ts:295-322`](./core/src/notes.ts).
+
+```jsonc
+{ "name": "update-note", "arguments": { "id": "notes/journal/2026-05-10", "append": "\n\nEvening note: …" } }
+```
+
+`prepend` is frontmatter-aware: if the note opens with YAML frontmatter, the prepended text is automatically injected *after* the closing `---` fence so parsers that expect frontmatter at byte 0 still find it. Detection is done in the same SQL UPDATE expression, so atomicity is preserved.
+
+### CI / public access via Tailscale Funnel
+
+The shortest path to a public HTTPS URL for a vault you control — useful for SSG rebuilds running on GitHub Actions, Vercel, or any runner that isn't on your tailnet. See [Remote access via Tailscale Funnel](#remote-access-via-tailscale-funnel) below for the full setup.
+
+### Install vault MCP into a client config
+
+Bare `parachute-vault mcp-install` from a terminal **walks you through a short contextual conversation** — picks defaults informed by your environment (how many vaults you have, whether the hub is reachable, whether you're in a project directory, whether vault is already installed somewhere), shows the JSON shape it will write before doing anything, and asks before each non-obvious choice. The patterns below are the non-interactive shapes — pass any flag (`--mint`, `--token`, `--scope`, `--install-scope`, `--vault`) and the walkthrough is skipped.
+
+#### Install scopes
+
+`--install-scope` accepts three values, matching Claude Code's own `claude mcp add --scope`:
+
+| Scope | Where the entry lives | Visibility |
+|---|---|---|
+| `local` *(default)* | `~/.claude.json` under `projects[<absolute-cwd>].mcpServers` | private to your machine, scoped to this directory |
+| `user` | `~/.claude.json` top-level `mcpServers` | every project, every directory on this machine |
+| `project` | `<cwd>/.mcp.json` | checked into the repo, shared with anyone who clones it |
+
+The default is **`local`** — Claude Code only loads the entry when launched from the directory you ran the install from. Pick `user` for a global install (every project sees the vault); pick `project` to commit the entry to the repo so collaborators get it on `git pull`.
+
+#### Cookbook
+
+```bash
+# 1. Default — mint a scope-narrow hub JWT (vault:<vault>:read) via your
+#    operator token; write it into ~/.claude.json under projects[<cwd>]
+#    (local scope, this directory only). Requires:
+#      - ~/.parachute/operator.token (run `parachute auth rotate-operator` if missing)
+#      - PARACHUTE_HUB_ORIGIN set OR an active `parachute expose` session
+parachute-vault mcp-install --mint
+
+# 2. Global install — write the entry at top-level ~/.claude.json so
+#    Claude Code loads it from every project, every directory.
+parachute-vault mcp-install --install-scope user
+
+# 3. Project-level install — write ./.mcp.json (committed to the repo,
+#    shared with the team). Pair with --scope vault:write when the
+#    project actually mutates the vault.
+parachute-vault mcp-install --install-scope project --scope vault:write
+
+# 4. Paste an existing bearer — useful when you already have a hub JWT in
+#    hand, or want to re-use the VAULT_AUTH_TOKEN operator bearer / a
+#    long-lived JWT from another machine. Skips the mint step entirely.
+#    (vault#282 Stage 2 removed the --legacy-pat pvt_* path — without a hub,
+#    paste a bearer here or set VAULT_AUTH_TOKEN.)
+parachute-vault mcp-install --token <hub-jwt-or-operator-bearer>
+```
+
+**Multi-vault.** `--vault <name>` targets a specific vault and writes the entry under `parachute-vault-<name>` so multiple vaults coexist. Without `--vault`, the singular `parachute-vault` slot is used and one install clobbers another — that's intentional for the common single-vault case.
+
+**Dry-run.** `parachute-vault mcp-install --dry-run` prints the write that would happen — target file, install scope, entry key, URL, auth mode — without touching disk or hitting the hub. Useful for probing the command's effect; in particular, `--help` no longer creates an empty `projects[<cwd>]` entry as a side effect, but `--dry-run` is the deliberate "tell me what you'd do" path.
+
+**Doctor.** `parachute-vault doctor` checks `~/.claude.json` (both top-level and `projects[<cwd>]`) and `./.mcp.json`, and reports which one holds the entry, plus port-match and reachability of the MCP URL.
+
+#### Headless flows — `claude -p` runners (`mcp-config`)
+
+`mcp-install` writes a persistent entry into a Claude Code config file. That's the right shape for interactive sessions, but it has two sharp edges for headless runners that spawn `claude -p` against a vault:
+
+1. **Local-scope MCP entries don't propagate to `claude -p` subprocesses.** A project-scoped install under `projects[<cwd>].mcpServers` is visible to an *interactive* `claude` launched from that directory, but a `claude -p` invocation spawned by a Python script — even from the same directory, even with `--setting-sources user,project,local` — doesn't pick it up. Use `--install-scope user` for scripts, cron jobs, and runners; the local default is fine for interactive sessions.
+2. **`--mcp-config` JSON is per-runner boilerplate.** Some runners prefer to inline the MCP config rather than mutate the user's Claude Code state. `parachute-vault mcp-config <vault-name>` emits exactly the JSON shape `--mcp-config` consumes:
+
+```bash
+# Mint a vault-scoped hub JWT first (parachute auth mint-token --scope
+# vault:gitcoin:read), then:
+export PARACHUTE_VAULT_TOKEN=<hub-jwt>
+claude -p --mcp-config "$(parachute-vault mcp-config gitcoin)" \
+          --strict-mcp-config \
+          "Summarize the latest notes under projects/gitcoin"
+
+# Or commit a template and expand at use-time:
+parachute-vault mcp-config gitcoin --env-vars > .claude/mcp-gitcoin.json
+# ...then later, when invoking claude:
+export PARACHUTE_HUB_URL=http://127.0.0.1:1940
+export PARACHUTE_VAULT_TOKEN=<hub-jwt>
+claude -p --mcp-config "$(envsubst < .claude/mcp-gitcoin.json)" \
+          --strict-mcp-config ...
+```
+
+**Note on `--env-vars` expansion.** The file-save pattern requires the caller to expand `${...}` placeholders at use-time (e.g. via `envsubst`, available on most Linux distros and via `brew install gettext` on macOS). Bare `$(cat .claude/mcp-gitcoin.json)` feeds literal `${PARACHUTE_HUB_URL}` strings into `claude -p` — the shell only expands placeholders inside the command-substitution *source*, not inside the *captured output*. `claude -p` itself doesn't expand `${...}` either, so the substitution has to happen between the file and the command.
+
+Flags: `--token <bearer>` (alternative to `PARACHUTE_VAULT_TOKEN`); `--base-url <url>` (override the auto-detected origin, useful for tailnet-exposed hubs: `--base-url https://hub.tail.ts.net`); `--env-vars` (emit the template form with `${PARACHUTE_HUB_URL}` and `${PARACHUTE_VAULT_TOKEN}` placeholders, safe to commit). With no token and no `--env-vars`, the command exits 1 with a clear error — runners get a fail-fast.
+
+## Data model
+
+```
+notes       (id, content, path, metadata, created_at, updated_at)
+tags        (name)
+note_tags   (note_id, tag_name)
+links       (source_id, target_id, relationship, metadata, created_at)
+attachments (id, note_id, path, mime_type, metadata, created_at)
+```
+
+Metadata is a JSON column. Vaults start blank — no predefined tags or schema.
+
+## Auth
+
+**All API and MCP requests require a valid API key.** No exceptions — localhost gets no special treatment.
+
+For wiring up an AI client (Claude Code, Claude Desktop, Parachute Daily), see [Connecting a client](#connecting-a-client) above. This section covers token-level details: how to pass a key, how to manage tokens, and which endpoints are public by design (`/health`, `/vaults/list`, published notes at `/vault/{name}/view/:id`).
+
+### Passing the key
+
+As of 0.5.0 (vault#282 Stage 2) vault accepts these bearers at every authenticated endpoint:
+
+- **Hub-issued JWT** (`eyJ...`) — the user-credential path; what OAuth issues and what `parachute-vault mcp-install` / `parachute auth mint-token` produce. Audience-bound to `vault.<name>`, scope-narrowed (`vault:<name>:<verb>`).
+- **`VAULT_AUTH_TOKEN`** — the server-wide operator bearer (env var; full-admin against any vault on the server).
+- **`pvk_...`** — legacy global API keys from `config.yaml` / per-vault `vault.yaml` (still honored for existing deployments).
+
+The old vault-local `pvt_*` opaque token was **dropped at 0.5.0** — vault no longer mints or accepts it.
+
+```bash
+# Header (preferred)
+curl -H "Authorization: Bearer <hub-jwt>" http://localhost:1940/vault/default/api/notes
+
+# Alternative header
+curl -H "X-API-Key: <hub-jwt>" http://localhost:1940/vault/default/api/notes
+
+# Query param (for /view endpoint only — convenient for browsers)
+curl http://localhost:1940/vault/default/view/noteId?key=<hub-jwt>
+```
+
+### Token management
+
+Tokens are hub-issued JWTs (vault#282 Stage 2 — vault no longer mints its own).
+Mint and revoke happen on the hub:
+
+```bash
+parachute-vault mcp-install --scope vault:write   # mint + wire a hub JWT into an MCP client
+parachute auth mint-token --scope vault:<name>:<verb>   # mint a scoped JWT for scripts
+parachute auth tokens                              # list / revoke hub JWTs (hub registry)
+```
+
+Two permission levels carry through the JWT scope verb:
+
+| Verb | Can do |
+|---|---|
+| `admin` / `write` → `full` | Everything (CRUD + delete + token management) |
+| `read` | Query, list, find-path, vault-info only |
+
+`parachute-vault tokens list` / `tokens revoke` remain only to clean up any
+vestigial pre-0.5.0 rows. Legacy `pvk_...` keys from config.yaml still work at
+runtime; the `vault keys` CLI commands were removed long ago.
+
+### Public endpoints
+
+Three endpoints work without auth:
+- `GET /health` — returns `{ status: "ok" }` (no sensitive data)
+- `GET /vaults/list` — vault names only (set `discovery: disabled` in `config.yaml` to hide)
+- `GET /vault/{name}/view/:noteId` — serves published notes only (returns 404 for unpublished)
+
+## Network security
+
+Vault runs HTTP on localhost. This is intentional — TLS is handled by the access layer. **Never expose port 1940 directly to the internet without TLS.**
+
+All API and MCP requests require an API key. There is no localhost bypass.
+
+For remote access, always use a TLS-terminating proxy:
+
+| Access path | API key security | Safe? |
+|---|---|---|
+| localhost (same machine) | Never leaves machine | Yes |
+| Tailnet (Tailscale VPN) | WireGuard encrypted | Yes |
+| Tailscale Funnel (public HTTPS) | HTTPS at edge, WireGuard to machine | Yes |
+| Cloudflare Tunnel (public HTTPS) | HTTPS at edge, local socket to machine | Yes |
+| Direct LAN IP (no TLS) | Plaintext on WiFi | Avoid |
+| Direct internet (no TLS) | Plaintext on internet | Never do this |
+
+## Troubleshooting
+
+### `parachute-vault doctor` is your first stop
+
+`doctor` inspects the install and prints one line per check with a status (`✓` pass, `!` warn, `✗` fail) and, when relevant, a suggested fix. It exits 1 on any `fail` and 0 otherwise. Run it any time something feels off.
+
+The checks, in the order they're emitted:
+
+| Check | What it verifies | Typical fix when failing |
+|---|---|---|
+| server-path pointer | `~/.parachute/vault/server-path` exists, is non-empty, and points at a `src/server.ts` that actually exists. This is where the stale-path failure after a repo move shows up first. | `parachute-vault init` from the current repo location. |
+| wrapper script | `~/.parachute/vault/start.sh` exists. Without it, launchd / systemd has nothing to exec. | `parachute-vault init`. |
+| launchd agent (macOS) / systemd service (Linux) | The daemon is registered and loaded/active. On Linux without systemd, the check is silently skipped. | `parachute-vault restart` or re-run `vault init`. |
+| bun on PATH | `bun` is resolvable via your shell's PATH. Not required once the daemon is installed (`start.sh` embeds an absolute bun path at init time) but missing bun is the #1 first-time-user failure. | `curl -fsSL https://bun.sh/install \| bash` and restart the shell. |
+| MCP entry in `~/.claude.json` | An entry is present. When it is, two follow-ups: the URL's port matches the running vault's port, and the MCP URL is reachable over HTTP (any response — even 401 — counts as reachable). | `parachute-vault mcp-install` to rewrite the entry, or `parachute-vault restart` if the daemon is down. |
+| port `1940` availability | Probes via `lsof` / `ss` and classifies: free, held by our daemon (pass), held by a foreign process (warn), or unknown (tool unavailable → check silently omitted). | Stop the conflicting process, or set a different `PORT` in `~/.parachute/vault/.env` and re-run `vault init`. |
+| backup agent (macOS, only when `backup.schedule != manual`) | The scheduled-backup launchd agent is loaded. | `parachute-vault backup --schedule <hourly\|daily\|weekly>` to reinstall the agent. |
+| backup destinations (only when `backup.schedule != manual`) | At least one destination is configured; each configured destination is writable. | Edit `~/.parachute/vault/config.yaml` under `backup.destinations`, or fix the path's permissions. |
+
+### Common failure modes
+
+- **Daemon won't start after a port change.** `~/.parachute/vault/.env` has the new `PORT=...` but the daemon is still trying to bind the old one, or something else already holds the new port. `parachute-vault doctor` surfaces both conditions. Fix the holder (or pick a different port) and `parachute-vault restart`.
+- **MCP entry is stale after moving the repo.** launchd/systemd keeps pointing at the old path. `doctor` flags this as a failed `server.ts at pointer target` check; `parachute-vault init` from the new location rewrites the pointer, wrapper, and daemon registration.
+- **Claude Code shows no vault tools.** Check in order: (1) is the daemon up (`parachute-vault status`)? (2) does `~/.claude.json` have a `parachute-vault` entry with both `url` and a valid `Authorization` header? (3) does the URL's vault name match an existing vault? `parachute-vault doctor` catches the first two. A missing or stale `Authorization` header after a bare `vault mcp-install` is the usual culprit for #2 — see the Claude Code section of [Connecting a client](#connecting-a-client) for how to rewrite it.
+- **Claude Desktop / Daily won't connect via OAuth.** Check the hub is installed and running (`parachute status hub`) — OAuth runs there, not on vault. If you're upgrading from a standalone-vault install where vault used to render its own consent page, run `parachute install hub` to bring up the issuer. See [`UPGRADING.md`](UPGRADING.md#workstream-e--standalone-oauth-retired).
+- **Scheduled backups aren't running.** On macOS: `doctor` flags `backup agent: not loaded` when `schedule` isn't `manual` but the launchd agent is missing — rerun `parachute-vault backup --schedule <freq>` to reinstall it. On Linux: systemd-timer support for backup isn't shipped yet, so `--schedule daily` silently skips the scheduler. Run `parachute-vault backup` from cron (or similar) until that lands.
+- **Manual `curl` against `/vault/<name>/mcp` returns `406 Not Acceptable`.** The MCP HTTP transport requires both `application/json` and `text/event-stream` in the `Accept` header (it negotiates between the JSON response and the SSE streaming variant). Claude Code's `--mcp-config` http transport sets this automatically — the symptom only shows up when you probe the endpoint by hand. The fix:
+
+  ```bash
+  curl -H 'Accept: application/json, text/event-stream' \
+       -H "Authorization: Bearer $VAULT_TOKEN" \
+       http://127.0.0.1:1940/vault/default/mcp
+  ```
+
+  Both media types are needed; omitting either is what triggers the 406.
+
+### Getting help
+
+If `doctor` is all-green but something still isn't working, capture the output alongside `parachute-vault status` and open an issue at <https://github.com/ParachuteComputer/parachute-vault/issues>. Redact tokens from any logs before attaching.
+
+## Deployment
+
+### Remote access via Cloudflare Tunnel (free)
+
+Your vault needs a public HTTPS URL for Claude Desktop and mobile apps. [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) provides one for free.
+
+```bash
+# Install: Mac
+brew install cloudflared
+# Install: Linux
+curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o cloudflared.deb && sudo dpkg -i cloudflared.deb
+
+# Quick tunnel (temporary, for testing)
+cloudflared tunnel --url http://localhost:1940
+
+# Permanent tunnel (production)
+cloudflared tunnel login
+cloudflared tunnel create vault
+cloudflared tunnel route dns vault vault.yourdomain.com
+
+# Write config (required for background service)
+sudo mkdir -p /etc/cloudflared
+sudo tee /etc/cloudflared/config.yml << EOF
+tunnel: $(cloudflared tunnel list -o json | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+credentials-file: $HOME/.cloudflared/$(cloudflared tunnel list -o json | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4).json
+
+ingress:
+  - hostname: vault.yourdomain.com
+    service: http://localhost:1940
+  - service: http_status:404
+EOF
+
+# Run as background service
+sudo cloudflared service install
+sudo systemctl start cloudflared
+```
+
+Then point any client at `https://vault.yourdomain.com/vault/{name}/mcp`. See [Connecting a client → Claude Desktop (OAuth)](#claude-desktop-oauth) — the flow is identical to the local case once the URL is remote; the browser-based OAuth handshake makes the connection without pasting a bearer token.
+
+### Remote access via Tailscale Funnel
+
+If you're already on [Tailscale](https://tailscale.com), Funnel is the shortest path to a public HTTPS URL — no custom domain, no reverse-proxy config, no cert management. Good for a single-user vault or a vault shared with a handful of people; the edge has bandwidth and connection-count caps, so not suited to heavy traffic.
+
+Prerequisites: Tailscale v1.52 or later (earlier versions use a two-command `tailscale serve` + `tailscale funnel on` form that is now deprecated), the tailnet must have MagicDNS and HTTPS enabled in the admin console, and the `funnel` node attribute must be granted in your ACLs. The CLI adds the ACL entry on first use if you're the tailnet owner.
+
+Expose the vault:
+
+```bash
+# One command — Tailscale provisions the HTTPS cert, updates the ACL if needed,
+# and registers a persistent funnel that survives reboots.
+tailscale funnel --bg --https=443 localhost:1940
+
+# See what's being served and on which tailnet hostname
+tailscale funnel status
+
+# Take it down later
+tailscale funnel --https=443 localhost:1940 off
+# ...or nuke the whole funnel config
+tailscale funnel reset
+```
+
+The resulting URL is `https://<your-device>.<your-tailnet>.ts.net/` — `tailscale funnel status` prints it verbatim. You can also use ports `8443` or `10000` via `--https=<port>`; no other public ports are available to Funnel.
+
+Point any MCP client at the Tailscale URL:
+- Claude Desktop → Settings → Integrations → Add MCP → `https://<your-device>.<your-tailnet>.ts.net/vault/{name}/mcp` (leave the Authorization field empty; the OAuth flow will handle it — see [Connecting a client](#connecting-a-client)).
+- Parachute Daily → enter the base URL `https://<your-device>.<your-tailnet>.ts.net`, pick the vault, tap Connect.
+
+**Cloudflare vs Tailscale, at a glance.** Pick Cloudflare when you want a custom domain, bandwidth headroom for heavier traffic, or to share the vault with people who aren't on your tailnet. Pick Tailscale when you're already running it, you're fine with a `*.ts.net` URL, and you want the setup to fit in two commands.
+
+### Docker
+
+```bash
+cp .env.example .env   # edit with your config
+docker compose up -d
+```
+
+Set `PARACHUTE_VAULT_NAME` to auto-create a first vault on startup (name: lowercase alphanumeric + hyphens or underscores, 2–32 chars). Without it the server boots with zero vaults — create one explicitly via the admin wizard, `parachute init --vault-name <name>`, or `parachute-vault create <name>`.
+
+### Cloud platforms
+
+#### A VPS — the tested path
+
+The current self-host story is a **bun-native install on a plain
+Ubuntu/Debian box**: create the box, open a root shell, paste one line.
+See <https://parachute.computer/start/>, which walks it click by click
+for DigitalOcean and works the same on Hetzner, EC2, or a machine in
+your closet. That's the path the project tests and supports.
+
+The PaaS Blueprints below still work and stay in tree for operators who
+want them, but they're a **legacy** shape — reach for them only if you
+specifically want that platform's ergonomics.
+
+#### Render — standalone vault (legacy)
+
+The `render.yaml` Blueprint at the repo root deploys vault as its own
+Render web service, separate from hub — useful when you want vault on
+its own container (separate scaling, isolated logs, vault-only deploy
+without a hub). If you're not sure, use the VPS path above. The
+Blueprint stays in tree because some operators specifically want this
+shape (vault#341).
+
+Set `PARACHUTE_VAULT_NAME` to auto-create a first vault on startup (name:
+lowercase alphanumeric + hyphens or underscores, 2–32 chars). Without it
+the server boots with zero vaults — create one explicitly via the admin
+wizard, `parachute init --vault-name <name>`, or `parachute-vault create
+<name>`.
+
+#### Other platforms
+
+**Railway** ($5/mo) — Deploy from GitHub, persistent volume, public URL.
+**Fly.io** ($3-5/mo) — `fly launch --copy-config && fly volumes create vault_data --size 1 && fly deploy`
+
+### Data packs
+
+Install external tags, fields and starter notes with `parachute-vault packs add
+<file|dir|URL>`, inspect them with `packs list`, and unregister them with
+`packs remove <id>`. `add-pack <path>` remains an alias; built-in pack names
+still work. A running daemon picks up schema changes automatically. See
+[external packs](docs/external-packs.md) for manifests, migration and ownership.
+
+## Requirements
+
+- **Bun** — `curl -fsSL https://bun.sh/install | bash` ([bun.sh](https://bun.sh)).
+- **macOS 13+** (launchd user agent) **or Linux** (systemd user service; other init systems work if you start the server yourself).
+- **No root / sudo required** — `vault init` writes to your user home (`~/.parachute/`) and registers the daemon in your user scope only. Never touches system paths or global services.
+- **Not supported on Windows natively.** WSL2 hasn't been tested; file an issue if you try it and want it to work.
+- Optional, for remote access: [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) (Cloudflare Tunnel) or [Tailscale](https://tailscale.com) — see [Deployment](#deployment).
+
+## License
+
+AGPL-3.0
+
+### Importing legacy git history
+
+`parachute-vault history-import plan` reports a local mirror archive's recoverable history and retention effects. The offline `prepare`, `apply`, and `retire` commands import it without rewriting live notes, preserve the static archive, and prevent retired mirrors from restarting. See [the cutover and recovery procedure](UPGRADING.md#git-history-import-schema-v30--v31). Audited duplicate trees can use explicit `--selections` on plan/prepare; apply uses the embedded manifest, and unresolved notes stay quarantined. Nothing imports or retires automatically on upgrade.

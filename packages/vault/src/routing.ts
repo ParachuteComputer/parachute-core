@@ -1,0 +1,1205 @@
+/**
+ * HTTP request router for the multi-vault server.
+ *
+ * Per-vault resources live under `/vault/<name>/...` — a request names the
+ * vault it targets in the URL. The one exception is the canonical root `/mcp`
+ * endpoint (U1), which is vault-AGNOSTIC: the vault is derived from the token,
+ * not the URL. A fresh install creates a vault named `default`, so
+ * `/vault/default/...` is the baseline URL for single-vault deployments.
+ *
+ * Dispatch shape:
+ *
+ *   /.well-known/parachute.json        — NOT served here (CLI owns it at
+ *                                        origin root; vault never handles it)
+ *   /.well-known/oauth-protected-resource/mcp
+ *                                      — root-endpoint PRM (RFC 9728) for the
+ *                                        canonical `/mcp` below (U1)
+ *   /mcp[/*]                           — canonical root MCP endpoint; the vault
+ *                                        is DERIVED FROM THE TOKEN, then the
+ *                                        request re-dispatches through the same
+ *                                        per-vault machinery (U1)
+ *   /health                            — liveness ping, vault names leaked
+ *                                        only to authenticated callers
+ *   /vaults/list                       — public vault-name discovery (can be
+ *                                        disabled globally via config)
+ *   /vaults                            — authenticated vault metadata list
+ *   /vault/admin[/*]                   — daemon-level multi-vault admin SPA
+ *                                        (B3; `admin` is a reserved vault
+ *                                        name, dispatched BEFORE per-vault)
+ *   /vault/<name>/.well-known/oauth-*  — discovery forwarder; metadata names
+ *                                        the hub as the authorization server
+ *                                        (vault is resource-server only)
+ *   /vault/<name>/mcp[/*]              — MCP endpoint (Bearer auth); the
+ *                                        URL-addressed twin of root `/mcp`,
+ *                                        untouched and permanent
+ *   /vault/<name>/view/<idOrPath>      — auth-aware HTML view
+ *   /vault/<name>/public/<noteId>      — legacy alias → /view redirect
+ *   /vault/<name>                      — vault metadata + stats (auth)
+ *   /vault/<name>/api/...              — REST surface (auth)
+ *
+ * The root `/mcp` here is NOT the old unscoped compat prefix (that pre-0.5.0
+ * `/mcp` — an alias for a single default vault — is gone). It's the token-
+ * derived door: same auth machinery as the per-vault endpoint, reached without
+ * the client having to know the vault's URL name. There is still deliberately
+ * no compat for the old `/api/*`, `/oauth/*`, `/view/*`, or `/vaults/<name>/*`
+ * prefixes; clients using those must re-authenticate and point at the new URLs.
+ *
+ * **No standalone OAuth issuer.** vault does not mint OAuth tokens or
+ * render a consent UI. Hub is the issuer; vault validates hub-signed
+ * JWTs (see `auth.ts` + `hub-jwt.ts`). The discovery endpoints above are
+ * forwarders that point clients at the hub. The standalone surface that
+ * lived in `src/oauth.ts` was retired in vault#366 (workstream E of the
+ * UX audit, 2026-05-25).
+ */
+
+import pkg from "../package.json" with { type: "json" };
+import type { VaultConfig } from "./config.ts";
+import {
+  readVaultConfig,
+  readGlobalConfig,
+  writeVaultConfig,
+  listVaults,
+} from "./config.ts";
+import {
+  authenticateVaultRequest,
+  authenticateGlobalRequest,
+  deriveVaultFromToken,
+  extractApiKey,
+} from "./auth.ts";
+import { hasScopeForVault, hasMigrateScopeForVault, SCOPE_ADMIN, SCOPE_READ, scopeForMethod, verbForMethod } from "./scopes.ts";
+import { getVaultStore } from "./vault-store.ts";
+import { handleScopedMcp } from "./mcp-http.ts";
+import {
+  defaultAdminSpaDistDir,
+  isAdminSpaPath,
+  isDaemonAdminSpaPath,
+  serveAdminSpa,
+  serveDaemonAdminSpa,
+} from "./admin-spa.ts";
+import {
+  handleNotes,
+  handleTags,
+  handleFindPath,
+  handleVault,
+  handleUnresolvedWikilinks,
+  handleStorage,
+  handleViewNote,
+  handleDoctor,
+  handleHistoryCompact,
+  type TagScopeCtx,
+  type WriteCtx,
+} from "./routes.ts";
+import { handleTriggers } from "./triggers-api.ts";
+import { expandTokenTagScope, scopedStatsFilter } from "./tag-scope.ts";
+import {
+  handleProtectedResource,
+  handleRootProtectedResource,
+  handleAuthorizationServer,
+  getBaseUrl,
+} from "./oauth-discovery.ts";
+import { handleConfigSchema, handleConfig } from "./module-config.ts";
+import { buildAuthStatus } from "./auth-status.ts";
+import {
+  handleAuthDelete,
+  handleAuthGet,
+  handleAuthGithubCreateRepo,
+  handleAuthGithubDeviceCode,
+  handleAuthGithubInstallations,
+  handleAuthGithubPoll,
+  handleAuthGithubRepos,
+  handleAuthGithubSelectRepo,
+  handleAuthPat,
+  handleMirrorGet,
+  handleMirrorHistory,
+  handleMirrorHistoryShow,
+  handleMirrorImport,
+  handleMirrorImportStatus,
+  handleMirrorPushNow,
+  handleMirrorPut,
+  handleMirrorRunNow,
+} from "./mirror-routes.ts";
+import { handleEmbeddingsGet, handleEmbeddingsPut } from "./embeddings-routes.ts";
+import {
+  handleTranscriptionGet,
+  handleTranscriptionPut,
+} from "./transcription-routes.ts";
+import { getMirrorManager } from "./mirror-registry.ts";
+import { buildUsageReport } from "./usage.ts";
+import { handleTicketSpend } from "./attachment-tickets.ts";
+
+/**
+ * Decorate a 401 response from the MCP endpoint with the RFC 9728 challenge
+ * header pointing at the matching protected-resource metadata document.
+ *
+ * An MCP-capable OAuth client that receives a plain 401 has no structured way
+ * to discover which authorization server to use; the `WWW-Authenticate`
+ * header names the metadata document for the exact endpoint they hit.
+ */
+function mcpWwwAuthenticate(req: Request, vaultName: string): string {
+  const base = getBaseUrl(req);
+  return `Bearer resource_metadata="${base}/vault/${vaultName}/.well-known/oauth-protected-resource"`;
+}
+
+/**
+ * Clone a 401 Response and attach the `WWW-Authenticate` challenge header.
+ * The auth module returns a fully-baked `Response`, and headers on a consumed
+ * `Response` can't be mutated in place; cloning is the cheap path.
+ */
+async function withMcpChallenge(
+  res: Response,
+  req: Request,
+  vaultName: string,
+): Promise<Response> {
+  if (res.status !== 401) return res;
+  const body = await res.text();
+  const headers = new Headers(res.headers);
+  headers.set("WWW-Authenticate", mcpWwwAuthenticate(req, vaultName));
+  return new Response(body, { status: 401, headers });
+}
+
+/**
+ * 401 + RFC 9728 challenge for the canonical ROOT `/mcp` endpoint (U1), when
+ * the token is absent / invalid / names no single vault. Mirrors
+ * `withMcpChallenge` but points at the ROOT protected-resource metadata
+ * (`/.well-known/oauth-protected-resource/mcp`) rather than a vault-scoped one,
+ * since the root resource is vault-agnostic. A spec-following MCP client
+ * follows this pointer to the root PRM, discovers the hub, and requests the
+ * un-narrowed scopes the hub's consent picker narrows to a chosen vault.
+ */
+function rootMcpChallenge(req: Request): Response {
+  const base = getBaseUrl(req);
+  return Response.json(
+    { error: "Unauthorized", message: "API key required" },
+    {
+      status: 401,
+      headers: {
+        "WWW-Authenticate": `Bearer resource_metadata="${base}/.well-known/oauth-protected-resource/mcp"`,
+      },
+    },
+  );
+}
+
+/**
+ * Shared scoped-MCP dispatch tail used by BOTH the URL-addressed per-vault
+ * endpoint (`/vault/<name>/mcp`) and the token-derived root endpoint (`/mcp`,
+ * U1). Runs the FULL per-vault auth machinery via `authenticateVaultRequest`
+ * (audience strict-check, `vault_scope` pin, broad-scope rejection, tag-scope
+ * parse) and, on success, hands off to `handleScopedMcp`. A 401 is decorated
+ * with the per-vault RFC 9728 challenge. Because both entry points funnel
+ * through this one function, a root request behaves byte-identically to the
+ * same token at the per-vault URL — and, for the root, the re-validation here
+ * is the authoritative gate: a derivation that named the wrong vault fails the
+ * audience strict-check, it never bypasses it.
+ */
+async function dispatchScopedMcp(
+  req: Request,
+  vaultName: string,
+  vaultConfig: VaultConfig,
+): Promise<Response> {
+  const auth = await authenticateVaultRequest(req, vaultConfig);
+  if ("error" in auth) return withMcpChallenge(auth.error, req, vaultName);
+  // Thread the RAW caller bearer (the exact credential the session presented)
+  // into the MCP layer so the manage-token tool can forward it to hub's
+  // mint-token attenuation proxy (vault#403, MGT). Only the raw validated
+  // bearer — never a fabricated one. extractApiKey returns the same value
+  // `authenticateVaultRequest` validated above; non-forwardable credentials
+  // (env-var secret, legacy pvt_*) are handled by manage-token itself (it only
+  // forwards JWT-shaped bearers).
+  const callerBearer = extractApiKey(req);
+  return handleScopedMcp(req, vaultName, auth, callerBearer);
+}
+
+/**
+ * Check if a /view request has a valid API key (header or ?key= query param).
+ * Returns true if authenticated, false if not. Never rejects — unauthenticated
+ * requests still get public notes.
+ */
+async function isViewAuthenticated(
+  req: Request,
+  vaultConfig: VaultConfig | null,
+): Promise<boolean> {
+  if (!vaultConfig) return false;
+  const key = extractApiKey(req);
+  if (!key) return false;
+  const auth = await authenticateVaultRequest(req, vaultConfig);
+  return !("error" in auth);
+}
+
+/**
+ * Public service-info card for the CLI hub page. The CLI fetches this from
+ * every service registered in `~/.parachute/well-known/parachute.json` and
+ * renders each as a tile — services own their display story, CLI is a dumb
+ * aggregator. No auth, no PII, CORS `*` so the hub can call us cross-origin.
+ */
+function handleParachuteInfo(vaultName: string): Response {
+  const body = {
+    name: "parachute-vault",
+    displayName: "Vault",
+    tagline: "Agent-native knowledge graph — notes, tags, links, attachments over REST + MCP",
+    version: pkg.version,
+    iconUrl: `/vault/${vaultName}/.parachute/icon.svg`,
+  };
+  // `kind` was previously emitted here (and matched module.json) to let the
+  // hub branch its card rendering on api vs ui. Retired per hub#330 — the hub
+  // now infers presentation from the response shape itself. Companion to
+  // vault#359 (manifest drop); closes part of hub#340.
+  return Response.json(body, {
+    headers: { "Access-Control-Allow-Origin": "*" },
+  });
+}
+
+/**
+ * Placeholder monogram icon for the hub tile. Kept inline so the endpoint
+ * has zero filesystem dependency — the CLI can render a card even on a
+ * pristine install where no assets have been written out yet.
+ */
+const PARACHUTE_ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><circle cx="32" cy="32" r="30" fill="#879B7E"/><text x="32" y="43" text-anchor="middle" font-family="system-ui,sans-serif" font-size="32" font-weight="600" fill="#FAFAF7">V</text></svg>`;
+
+function handleParachuteIcon(): Response {
+  return new Response(PARACHUTE_ICON_SVG, {
+    headers: {
+      "Content-Type": "image/svg+xml",
+      // Defense-in-depth: the payload is a static inline SVG with no
+      // script/foreignObject, but older Edge/IE have been known to sniff
+      // image/svg+xml as HTML under certain conditions. nosniff pins the
+      // declared type and takes the sniff path off the table entirely.
+      "X-Content-Type-Options": "nosniff",
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": "public, max-age=3600",
+    },
+  });
+}
+
+/**
+ * Filter a server-wide vault-name list for a caller's per-vault binding
+ * (vault#259). `vaultName === null` is the operator / admin-channel caller
+ * (server-wide VAULT_AUTH_TOKEN or legacy cross-vault config.yaml key) — they
+ * keep the FULL list. A non-null binding reduces the list to just that vault
+ * (empty if the bound vault isn't in the listing). Pure + exported so the
+ * policy is unit-testable independent of the auth path. See the `/vaults`
+ * handler for the full rationale.
+ */
+export function filterVaultListForBinding(
+  names: string[],
+  vaultName: string | null,
+): string[] {
+  if (vaultName === null) return names;
+  return names.filter((name) => name === vaultName);
+}
+
+export async function route(
+  req: Request,
+  path: string,
+): Promise<Response> {
+  // ---------------------------------------------------------------------
+  // OAuth discovery — RFC 8414 §3.1 / RFC 9728 §3 path-insertion form.
+  //
+  // For a resource at `/vault/<name>/mcp`, the spec-mandated metadata URLs
+  // are
+  //
+  //   /.well-known/oauth-authorization-server/vault/<name>[/mcp]
+  //   /.well-known/oauth-protected-resource/vault/<name>[/mcp]
+  //
+  // (path-insertion — `.well-known` goes ABOVE the issuer path), not the
+  // path-append shape `/vault/<name>/.well-known/<type>` served further
+  // down. Strict clients — Claude Code's MCP SDK, and any RFC 8414-
+  // conformant MCP client — only probe the path-insertion form; without
+  // these routes they 404 on discovery and can't authenticate.
+  //
+  // Both shapes return byte-identical JSON via the shared handlers. The
+  // path-append branch lives inside the per-vault block alongside the
+  // rest of `/vault/<name>/*` routing. PR #124 originally shipped this
+  // for the `/vaults/<name>/` URL shape; PR #138 migrated URLs to
+  // `/vault/<name>/` and dropped the insertion routes — this restores
+  // them for the new URL shape.
+  // ---------------------------------------------------------------------
+  const protectedResourceInsert = path.match(
+    /^\/\.well-known\/oauth-protected-resource\/vault\/([^/]+)(?:\/mcp)?$/,
+  );
+  if (protectedResourceInsert) {
+    const vaultName = protectedResourceInsert[1]!;
+    if (!readVaultConfig(vaultName)) {
+      return Response.json({ error: "Vault not found", vault: vaultName }, { status: 404 });
+    }
+    return handleProtectedResource(req, vaultName);
+  }
+  const authServerInsert = path.match(
+    /^\/\.well-known\/oauth-authorization-server\/vault\/([^/]+)(?:\/mcp)?$/,
+  );
+  if (authServerInsert) {
+    const vaultName = authServerInsert[1]!;
+    if (!readVaultConfig(vaultName)) {
+      return Response.json({ error: "Vault not found", vault: vaultName }, { status: 404 });
+    }
+    return handleAuthorizationServer(req, vaultName);
+  }
+
+  // Root-endpoint protected-resource metadata (RFC 9728 §3.1 path-insertion)
+  // for the canonical `/mcp` endpoint (U1). The root resource is vault-
+  // agnostic — the target vault is derived from the token, not the URL — so
+  // this document carries no vault name and advertises the un-narrowed
+  // `vault:read` / `vault:write` scopes; the hub's consent picker narrows them
+  // to a chosen vault at authorization time. Distinct from the per-vault
+  // insertion shapes above (which require a `/vault/<name>` segment), so there
+  // is no overlap. The `rootMcpChallenge` 401 points clients here.
+  if (path === "/.well-known/oauth-protected-resource/mcp") {
+    return handleRootProtectedResource(req);
+  }
+
+  // ---------------------------------------------------------------------
+  // Cross-vault / origin-root endpoints
+  // ---------------------------------------------------------------------
+
+  if (path === "/health") {
+    const auth = await authenticateGlobalRequest(req);
+    if ("error" in auth) {
+      return Response.json({ status: "ok" });
+    }
+    return Response.json({ status: "ok", vaults: listVaults() });
+  }
+
+  // Public vault-name discovery. Lets unauthenticated clients (e.g. the
+  // Daily vault-picker dropdown before OAuth) know which vault to target.
+  // Operators who want to hide vault existence can set `discovery: disabled`
+  // in ~/.parachute/vault/config.yaml — the endpoint then returns 404.
+  if (path === "/vaults/list" && req.method === "GET") {
+    const globalConfig = readGlobalConfig();
+    if (globalConfig.discovery === "disabled") {
+      return Response.json({ error: "Not found" }, { status: 404 });
+    }
+    return Response.json({ vaults: listVaults() });
+  }
+
+  // Public auth-state probe. Tells a first-contact client whether the
+  // server has any vaults yet, which bearer formats it accepts, and
+  // whether owner-password / TOTP / tokens are configured. Replaces
+  // hub's out-of-process filesystem snoop (parachute-hub#86 follow-up).
+  // No auth, GET-only, no token counts — `hasTokens` is a yes/no signal
+  // only, with `null` for "DB read failed."
+  //
+  // Gated on `discovery: disabled` like /vaults/list — both leak vault
+  // existence (the `vaults` array names them), so an operator who hides
+  // one wants both hidden (#191).
+  if (path === "/auth/status" && req.method === "GET") {
+    if (readGlobalConfig().discovery === "disabled") {
+      return Response.json({ error: "Not found" }, { status: 404 });
+    }
+    return Response.json(buildAuthStatus(), {
+      headers: { "Access-Control-Allow-Origin": "*" },
+    });
+  }
+
+  // Daemon-level multi-vault admin SPA — `/vault/admin[/*]` (B3 of the
+  // 2026-06-09 hub-module-boundary migration). The vault MODULE's own home
+  // surface: list / create / delete vaults, deep-link into each instance's
+  // per-vault admin. Same static bundle as the per-vault mount below —
+  // `web/ui/src/lib/mount.ts` detects the basename at runtime.
+  //
+  // MUST dispatch BEFORE `isAdminSpaPath`: the per-vault regex also matches
+  // `/vault/admin/admin` (capturing name="admin"), which must NOT boot
+  // per-vault mode — `admin` is a reserved vault name (B2) and this mount is
+  // daemon-owned. Hub#637's `/vault/admin` route forwards the FULL path here
+  // (no stripPrefix on vault's services row). A pre-reservation squatter
+  // vault named "admin" is fully shadowed by this branch — server boot
+  // warns with the recovery procedure (see vault-name.ts).
+  if (isDaemonAdminSpaPath(path)) {
+    if (req.method !== "GET") {
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+    return serveDaemonAdminSpa(defaultAdminSpaDistDir(), path);
+  }
+
+  // Admin SPA — per-vault at `/vault/<name>/admin/*` (vault#252). Static-
+  // file serving only (index.html + Vite asset bundle); no auth at this
+  // seam since the bundle reveals nothing privileged. The SPA's data
+  // fetches land on existing per-vault routes that enforce
+  // `vault:<name>:read` / `:admin`. GET-only — POSTs to `.../admin/*` aren't
+  // a thing the SPA bundle exposes; rejecting them here keeps surprises
+  // out. Must fire BEFORE the per-vault dispatch below or the auth wall
+  // there would short-circuit the static-asset response.
+  if (isAdminSpaPath(path)) {
+    if (req.method !== "GET") {
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+    return serveAdminSpa(defaultAdminSpaDistDir(), path);
+  }
+
+  // Authenticated vault metadata list.
+  //
+  // Vault-binding filter (vault#259, info-leak follow-up): `/vaults` is a
+  // cross-vault DISCOVERY endpoint, not a single-vault operational one (unlike
+  // /mcp, which legitimately routes a vault-bound token back into its own
+  // vault). A caller bound to one vault shouldn't learn that OTHER vaults exist
+  // on this server. So when the authenticated caller carries a per-vault
+  // binding (`auth.vault_name !== null`), the listing is reduced to just that
+  // vault. Operator / admin-channel callers — the server-wide VAULT_AUTH_TOKEN
+  // and legacy cross-vault config.yaml keys — have `vault_name === null` and
+  // keep the full listing (they're explicitly the cross-vault management
+  // channel). `authenticateGlobalRequest` already 401s hub JWTs here, so the
+  // only callers that reach this point today are operator-channel
+  // (`vault_name === null`); this filter is the security-correct shape for any
+  // future vault-bound credential that becomes accepted on this surface.
+  if (path === "/vaults" && req.method === "GET") {
+    const auth = await authenticateGlobalRequest(req);
+    if ("error" in auth) return auth.error;
+    const names = filterVaultListForBinding(listVaults(), auth.vault_name);
+    const vaults = names.map((name) => {
+      const config = readVaultConfig(name);
+      return {
+        name,
+        description: config?.description,
+        created_at: config?.created_at,
+      };
+    });
+    return Response.json({ vaults });
+  }
+
+  // ---------------------------------------------------------------------
+  // Canonical root MCP endpoint — token-derived vault dispatch (U1).
+  //
+  // `POST /mcp` (plus the GET/DELETE the streamable-HTTP transport uses, and
+  // the `/mcp/*` subpaths) is the vault-AGNOSTIC entry point: the target vault
+  // is derived from the TOKEN, not the URL. We validate the bearer with the
+  // same scope-guard trust kernel the per-vault path uses, read the vault name
+  // from the token's claims, then RE-DISPATCH through the identical per-vault
+  // machinery (`dispatchScopedMcp` → `authenticateVaultRequest` →
+  // `handleScopedMcp`). The re-dispatch re-validates WITH the audience pin, so
+  // a bad derivation fails the inner check rather than bypassing it (defense in
+  // depth). The legacy URL-addressed `/vault/<name>/mcp` is untouched and lives
+  // forever.
+  //
+  // No / invalid / unnameable token → 401 whose `WWW-Authenticate` points at
+  // the ROOT PRM (`/.well-known/oauth-protected-resource/mcp`), so a spec-
+  // following MCP client discovers the hub and requests the un-narrowed scopes
+  // its consent picker narrows to a chosen vault.
+  if (path === "/mcp" || path.startsWith("/mcp/")) {
+    const derived = await deriveVaultFromToken(req);
+    if ("error" in derived) {
+      return rootMcpChallenge(req);
+    }
+    const vaultConfig = readVaultConfig(derived.vaultName);
+    if (!vaultConfig) {
+      // A validly-signed hub token naming a vault that isn't on THIS server.
+      // Mirror the per-vault 404 (`/vault/<name>/mcp` on a missing vault) — the
+      // holder knows which vault their token targets; nothing is leaked to an
+      // anonymous caller (they never validate a token to reach here).
+      return Response.json(
+        { error: "Vault not found", vault: derived.vaultName },
+        { status: 404 },
+      );
+    }
+    return dispatchScopedMcp(req, derived.vaultName, vaultConfig);
+  }
+
+  // ---------------------------------------------------------------------
+  // Per-vault routing: /vault/<name>/...
+  // ---------------------------------------------------------------------
+
+  const vaultMatch = path.match(/^\/vault\/([^/]+)(\/.*)?$/);
+  if (!vaultMatch) {
+    return Response.json({ error: "Not found" }, { status: 404 });
+  }
+
+  const vaultName = vaultMatch[1]!;
+  const subpath = vaultMatch[2] ?? "";
+
+  const vaultConfig = readVaultConfig(vaultName);
+  if (!vaultConfig) {
+    return Response.json({ error: "Vault not found", vault: vaultName }, { status: 404 });
+  }
+
+  // Legacy-style /public/:noteId → /view/:noteId redirect (kept as a
+  // convenience for published-note URLs that predate the /view/ path).
+  const vaultPublicMatch = subpath.match(/^\/public\/([^/]+)$/);
+  if (vaultPublicMatch && req.method === "GET") {
+    const dest = new URL(`/vault/${vaultName}/view/${vaultPublicMatch[1]!}`, req.url);
+    dest.search = new URL(req.url).search;
+    return Response.redirect(dest.toString(), 301);
+  }
+
+  // View endpoint — auth-aware HTML renderer. Unauthenticated requests
+  // still serve public notes; a valid API key via header or ?key= query
+  // parameter unlocks private notes.
+  const vaultViewMatch = subpath.match(/^\/view\/(.+)$/);
+  if (vaultViewMatch && req.method === "GET") {
+    const store = getVaultStore(vaultName);
+    const authenticated = await isViewAuthenticated(req, vaultConfig);
+    return handleViewNote(store, decodeURIComponent(vaultViewMatch[1]!), {
+      authenticated,
+      publishedTag: vaultConfig.published_tag,
+    });
+  }
+
+  // The legacy `/oauth/{register,authorize,token}` flow on vault was retired
+  // when the standalone OAuth issuer was removed (vault#366, workstream E of
+  // the UX audit). Hub is the issuer now; vault is resource-server only. A
+  // request landing here is from a client that hasn't been re-pointed at the
+  // hub yet — surface a clear 410 Gone with a discovery pointer so the client
+  // (or its operator) knows where the authorization server moved.
+  if (subpath === "/oauth/register" || subpath === "/oauth/authorize" || subpath === "/oauth/token") {
+    const base = getBaseUrl(req);
+    return Response.json(
+      {
+        error: "oauth_endpoint_removed",
+        error_description:
+          "Vault no longer hosts an OAuth issuer. The hub is the authorization server. " +
+          "Discover its endpoints via the protected-resource metadata.",
+        protected_resource_metadata:
+          `${base}/vault/${vaultName}/.well-known/oauth-protected-resource`,
+      },
+      { status: 410 },
+    );
+  }
+
+  // Parachute service-info + icon (no auth, CORS *). The CLI hub page at
+  // the ecosystem root reads `~/.parachute/well-known/parachute.json`,
+  // fans out to each service's `/.parachute/info`, and renders a card per
+  // response. Keeping display copy here means the hub never needs a vault
+  // release to pick up wording changes.
+  if (subpath === "/.parachute/info" || subpath === "/.parachute/icon.svg") {
+    if (req.method !== "GET") {
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+    return subpath === "/.parachute/info"
+      ? handleParachuteInfo(vaultName)
+      : handleParachuteIcon();
+  }
+
+  // Module configuration endpoints (Phase 2 of the module architecture).
+  // Schema is always public — hub reads it to render the config form, no
+  // secrets involved. Current values require `vault:admin` as of Phase 3.
+  if (subpath === "/.parachute/config/schema") {
+    if (req.method !== "GET") {
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+    return handleConfigSchema();
+  }
+  if (subpath === "/.parachute/config") {
+    if (req.method !== "GET") {
+      // PUT lands in a future phase — return 405 so clients that already speak
+      // the full contract discover the gap rather than silently succeeding.
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+    // Admin-gated: the current config includes things that aren't user data
+    // (worker intervals, TTLs, retention policy) but are still configuration
+    // an attacker could use to map the deployment. `vault:admin` keeps the
+    // hub's loopback workflow intact while locking out read-only tokens.
+    const configAuth = await authenticateVaultRequest(req, vaultConfig);
+    if ("error" in configAuth) return configAuth.error;
+    if (!hasScopeForVault(configAuth.scopes, vaultName, "admin")) {
+      return Response.json(
+        {
+          error: "Forbidden",
+          error_type: "insufficient_scope",
+          message: `This endpoint requires the '${SCOPE_ADMIN}' scope (or '${SCOPE_ADMIN.replace("vault:", `vault:${vaultName}:`)}').`,
+          required_scope: SCOPE_ADMIN,
+          granted_scopes: configAuth.scopes,
+        },
+        { status: 403 },
+      );
+    }
+    const globalConfig = readGlobalConfig();
+    return handleConfig(vaultConfig, globalConfig);
+  }
+
+  // OAuth discovery (no auth). The protected-resource metadata advertises
+  // this vault's MCP endpoint and names the vault's authorization server;
+  // the authorization-server metadata returns endpoints scoped to
+  // `/vault/<name>/oauth/*`. Together they keep RFC 9728 → RFC 8414
+  // discovery coherent for a single vault.
+  if (subpath === "/.well-known/oauth-protected-resource") {
+    return handleProtectedResource(req, vaultName);
+  }
+  if (subpath === "/.well-known/oauth-authorization-server") {
+    return handleAuthorizationServer(req, vaultName);
+  }
+
+  // Attachment ticket spend (attachment-tickets design, Wave 1) — no auth
+  // beyond the ticket itself; the ticket IS the credential (single-use,
+  // short TTL, scoped to exactly one upload slot or one attachment's
+  // bytes). Deliberately placed BEFORE `authenticateVaultRequest` below —
+  // a bearer-less runtime (a bare `curl`) must be able to spend a ticket
+  // without ever holding this vault's API key. The path segment
+  // (`/tickets/<id>`) is outside the authed `/api` tree and outside
+  // `/mcp` on purpose — see `request-attachment-upload`/`-download`
+  // (core/src/mcp.ts) for where tickets are minted.
+  const vaultTicketMatch = subpath.match(/^\/tickets\/([^/]+)$/);
+  if (vaultTicketMatch) {
+    const ticketId = decodeURIComponent(vaultTicketMatch[1]!);
+    const store = getVaultStore(vaultName);
+    return handleTicketSpend(req, ticketId, vaultName, store);
+  }
+
+  // MCP (per-vault, single-vault session) — the URL names the vault. Shares
+  // the exact dispatch tail with the token-derived root `/mcp` (U1), so both
+  // behave identically. Handled BEFORE the shared authenticated-surface auth
+  // below because `dispatchScopedMcp` owns its own auth + 401 challenge; a
+  // non-MCP 401 further down never carries the RFC 9728 challenge (it's
+  // MCP-only).
+  if (subpath === "/mcp" || subpath.startsWith("/mcp/")) {
+    return dispatchScopedMcp(req, vaultName, vaultConfig);
+  }
+
+  // ---------------------------------------------------------------------
+  // Authenticated surface
+  // ---------------------------------------------------------------------
+
+  const store = getVaultStore(vaultName);
+  const auth = await authenticateVaultRequest(req, vaultConfig);
+  if ("error" in auth) {
+    return auth.error;
+  }
+
+  // Bare `/vault/<name>` — single-vault root. Returns name, description,
+  // createdAt, and stats. One round trip for a viz landing page.
+  if (subpath === "" || subpath === "/") {
+    if (req.method !== "GET") {
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+    // vault#766: a scoped caller's stats exclude notes a private tag hides.
+    const stats = await store.getVaultStats(
+      scopedStatsFilter(store, await expandTokenTagScope(store, auth.scoped_tags)),
+    );
+    return Response.json({
+      name: vaultName,
+      description: vaultConfig.description,
+      createdAt: vaultConfig.created_at,
+      stats,
+    });
+  }
+
+  // /.parachute/usage — per-vault data-footprint report ("how big is this
+  // vault"). READ-scoped, deliberately: a vault's own user must be able to
+  // see their own vault's size, and the operator (who holds broad/admin)
+  // inherits read. This mirrors the bare-root stats precedent above (also
+  // read-gated by the method) — same data-disclosure class (counts + sizes,
+  // no note content). The expensive part (two dir-walks) is TTL-cached inside
+  // usage.ts; `?fresh=1` bypasses the cache. Hub-side aggregation/UI is a
+  // separate follow-up; this endpoint is the load-bearing primitive.
+  if (subpath === "/.parachute/usage") {
+    if (req.method !== "GET") {
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+    if (!hasScopeForVault(auth.scopes, vaultName, "read")) {
+      return Response.json(
+        {
+          error: "Forbidden",
+          error_type: "insufficient_scope",
+          message: `This endpoint requires the '${SCOPE_READ}' scope (or '${SCOPE_READ.replace("vault:", `vault:${vaultName}:`)}').`,
+          required_scope: SCOPE_READ,
+          granted_scopes: auth.scopes,
+        },
+        { status: 403 },
+      );
+    }
+    const fresh = new URL(req.url).searchParams.get("fresh") === "1";
+    const stats = await store.getVaultStats(
+      scopedStatsFilter(store, await expandTokenTagScope(store, auth.scoped_tags)),
+    );
+    return Response.json(buildUsageReport(vaultName, stats, { fresh }));
+  }
+
+  // /.parachute/embeddings — Admin-gated read+write of the semantic-search
+  // (embeddings) opt-in toggle. The 0.7.3 fast-follow: gives the admin SPA a
+  // real toggle over the persisted `embeddings_enabled` config.yaml setting so
+  // an operator flips semantic search on from the UI instead of hand-editing
+  // config or setting an env var. Host-global setting (affects every vault),
+  // reached through the same per-vault admin surface as the other settings
+  // pages. Activation is restart-to-apply — the endpoint persists the setting
+  // and reports `restart_required`; see embeddings-routes.ts for why the boot-
+  // captured provider isn't hot-reconfigured.
+  if (subpath === "/.parachute/embeddings") {
+    if (!hasScopeForVault(auth.scopes, vaultName, "admin")) {
+      return Response.json(
+        {
+          error: "Forbidden",
+          error_type: "insufficient_scope",
+          message: `This endpoint requires the '${SCOPE_ADMIN}' scope (or '${SCOPE_ADMIN.replace("vault:", `vault:${vaultName}:`)}').`,
+          required_scope: SCOPE_ADMIN,
+          granted_scopes: auth.scopes,
+        },
+        { status: 403 },
+      );
+    }
+    if (req.method === "GET") return handleEmbeddingsGet();
+    if (req.method === "PUT") return handleEmbeddingsPut(req);
+    return Response.json({ error: "Method not allowed" }, { status: 405 });
+  }
+
+  // /.parachute/transcription — Admin-gated read+write of the transcription
+  // setup. Mirrors the embeddings toggle's shape (persist a preference, report
+  // `restart_required`) but answers a harder question: transcription can be
+  // "configured" and still not work, because it needs a binary and a model on
+  // disk that no config file can promise are there.
+  //
+  // So GET reports readiness with the missing PIECE named, the paths searched,
+  // and the exact command that fixes it. That's the gap this closes: a box
+  // could accept audio for weeks and transcribe nothing, with the only evidence
+  // a boot log line the operator scrolled past (vault#643).
+  //
+  // PUT persists provider/model only — installing downloads hundreds of MB and
+  // shells brew/tar, which belongs in the CLI with a progress bar, not in a
+  // request a browser tab can abandon. See transcription-routes.ts.
+  if (subpath === "/.parachute/transcription") {
+    if (!hasScopeForVault(auth.scopes, vaultName, "admin")) {
+      return Response.json(
+        {
+          error: "Forbidden",
+          error_type: "insufficient_scope",
+          message: `This endpoint requires the '${SCOPE_ADMIN}' scope (or '${SCOPE_ADMIN.replace("vault:", `vault:${vaultName}:`)}').`,
+          required_scope: SCOPE_ADMIN,
+          granted_scopes: auth.scopes,
+        },
+        { status: 403 },
+      );
+    }
+    if (req.method === "GET") return handleTranscriptionGet();
+    if (req.method === "PUT") return handleTranscriptionPut(req);
+    return Response.json({ error: "Method not allowed" }, { status: 405 });
+  }
+
+  // The per-vault `/tokens` REST surface (pvt_* mint/list/revoke) was removed
+  // at 0.5.0 (vault#282 Stage 2 — vault is a pure hub resource-server). Hub
+  // JWTs are minted via hub's registry (`/api/auth/mint-token`); a `/tokens`
+  // request now falls through to the catch-all 404 below.
+
+  // /.parachute/mirror — Admin-gated read+write of THIS vault's persistent
+  // mirror config + runtime status. Per-vault (vault#400): the manager is
+  // resolved by the URL's vault name, so each vault's mirror page reflects
+  // its own config + git remote. Lives under `.parachute/` (alongside
+  // info/icon/config) rather than `admin/` because `/vault/<name>/admin/*`
+  // is reserved for the admin SPA's static-file mount; the API surface goes
+  // under `.parachute/` by the module-protocol convention.
+  if (subpath === "/.parachute/mirror") {
+    if (!hasScopeForVault(auth.scopes, vaultName, "admin")) {
+      return Response.json(
+        {
+          error: "Forbidden",
+          error_type: "insufficient_scope",
+          message: `This endpoint requires the '${SCOPE_ADMIN}' scope (or '${SCOPE_ADMIN.replace("vault:", `vault:${vaultName}:`)}').`,
+          required_scope: SCOPE_ADMIN,
+          granted_scopes: auth.scopes,
+        },
+        { status: 403 },
+      );
+    }
+    // vault#400: resolve the manager for THIS vault (from the URL). The
+    // registry lazily builds one (via the boot-installed factory) for any
+    // existing vault — including a non-default vault or one configured at
+    // runtime — so the handler operates on the right vault's config + status
+    // + git remote, never the default vault's.
+    const manager = getMirrorManager(vaultName);
+    if (!manager) {
+      // Null only when boot hasn't installed the factory yet (startup race
+      // or boot failure). Surface a clear 503 rather than a JSON null so the
+      // operator + the hub SPA know it's a service-state issue, not a
+      // misconfig on their end.
+      return Response.json(
+        {
+          error: "Mirror manager not initialized",
+          message:
+            "The vault server hasn't wired the mirror manager registry yet (boot hasn't finished, or it failed). Check logs for [mirror] entries.",
+        },
+        { status: 503 },
+      );
+    }
+    if (req.method === "GET") return handleMirrorGet(manager);
+    if (req.method === "PUT") return handleMirrorPut(req, manager);
+    return Response.json({ error: "Method not allowed" }, { status: 405 });
+  }
+
+  // /.parachute/mirror/run-now — fire a one-shot export+commit+push pass.
+  // Same admin gate as the GET/PUT above; same manager presence check.
+  // POST-only — a GET would imply "read the result of running" which
+  // isn't the verb (the rolling status is already available on the
+  // parent GET endpoint).
+  if (subpath === "/.parachute/mirror/run-now") {
+    if (!hasScopeForVault(auth.scopes, vaultName, "admin")) {
+      return Response.json(
+        {
+          error: "Forbidden",
+          error_type: "insufficient_scope",
+          message: `This endpoint requires the '${SCOPE_ADMIN}' scope (or '${SCOPE_ADMIN.replace("vault:", `vault:${vaultName}:`)}').`,
+          required_scope: SCOPE_ADMIN,
+          granted_scopes: auth.scopes,
+        },
+        { status: 403 },
+      );
+    }
+    const manager = getMirrorManager(vaultName);
+    if (!manager) {
+      return Response.json(
+        {
+          error: "Mirror manager not initialized",
+          message:
+            "The vault server hasn't wired the mirror manager registry yet (boot hasn't finished, or it failed). Check logs for [mirror] entries.",
+        },
+        { status: 503 },
+      );
+    }
+    if (req.method === "POST") return handleMirrorRunNow(manager);
+    return Response.json({ error: "Method not allowed" }, { status: 405 });
+  }
+
+  // /.parachute/mirror/push-now — fire `git push` against committed state.
+  // Cut 6 of vault#392. Same admin gate + manager check as run-now;
+  // POST-only. Distinguished from /run-now in that this skips export +
+  // commit, only pushes — for "did my credentials actually work?" flow.
+  if (subpath === "/.parachute/mirror/push-now") {
+    if (!hasScopeForVault(auth.scopes, vaultName, "admin")) {
+      return Response.json(
+        {
+          error: "Forbidden",
+          error_type: "insufficient_scope",
+          message: `This endpoint requires the '${SCOPE_ADMIN}' scope (or '${SCOPE_ADMIN.replace("vault:", `vault:${vaultName}:`)}').`,
+          required_scope: SCOPE_ADMIN,
+          granted_scopes: auth.scopes,
+        },
+        { status: 403 },
+      );
+    }
+    const manager = getMirrorManager(vaultName);
+    if (!manager) {
+      return Response.json(
+        {
+          error: "Mirror manager not initialized",
+          message:
+            "The vault server hasn't wired the mirror manager registry yet (boot hasn't finished, or it failed). Check logs for [mirror] entries.",
+        },
+        { status: 503 },
+      );
+    }
+    if (req.method === "POST") return handleMirrorPushNow(manager);
+    return Response.json({ error: "Method not allowed" }, { status: 405 });
+  }
+
+  // /.parachute/mirror/history — surface the mirror's git commit history
+  // (vault#300). The vault is already git-backed (one file per note), so
+  // `git log` IS a tamper-evident write history; this read path exposes it.
+  // Admin-gated (it's an ops/forensics surface, not a content read) — same
+  // gate + manager check as the sibling mirror routes. GET-only.
+  //   /history       — full mirror history (?path=<note> scopes to one note,
+  //                    ?limit=<n> caps the count)
+  //   /history/show  — `git show <sha>:<path>.md` to read a past revision
+  if (
+    subpath === "/.parachute/mirror/history" ||
+    subpath === "/.parachute/mirror/history/show"
+  ) {
+    if (!hasScopeForVault(auth.scopes, vaultName, "admin")) {
+      return Response.json(
+        {
+          error: "Forbidden",
+          error_type: "insufficient_scope",
+          message: `This endpoint requires the '${SCOPE_ADMIN}' scope (or '${SCOPE_ADMIN.replace("vault:", `vault:${vaultName}:`)}').`,
+          required_scope: SCOPE_ADMIN,
+          granted_scopes: auth.scopes,
+        },
+        { status: 403 },
+      );
+    }
+    const manager = getMirrorManager(vaultName);
+    if (!manager) {
+      return Response.json(
+        {
+          error: "Mirror manager not initialized",
+          message:
+            "The vault server hasn't wired the mirror manager registry yet (boot hasn't finished, or it failed). Check logs for [mirror] entries.",
+        },
+        { status: 503 },
+      );
+    }
+    if (req.method !== "GET") {
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+    if (subpath === "/.parachute/mirror/history/show") {
+      return handleMirrorHistoryShow(req, manager);
+    }
+    return handleMirrorHistory(req, manager);
+  }
+
+  // /.parachute/mirror/import       — POST: start a clone+import job (202).
+  // /.parachute/mirror/import/<id>  — GET:  poll that job.
+  //
+  // Admin-gated. Async since vault#640 — the synchronous shape couldn't
+  // survive hub's 255s proxy idleTimeout, which is what capped imports at a
+  // vault-sized demo. See mirror-routes.ts:handleMirrorImport for the
+  // request/response shape + error map. Symmetric counterpart to the
+  // export-to-git flow vault#382 + vault#384 shipped.
+  if (
+    subpath === "/.parachute/mirror/import" ||
+    subpath.startsWith("/.parachute/mirror/import/")
+  ) {
+    if (!hasScopeForVault(auth.scopes, vaultName, "admin")) {
+      return Response.json(
+        {
+          error: "Forbidden",
+          error_type: "insufficient_scope",
+          message: `This endpoint requires the '${SCOPE_ADMIN}' scope (or '${SCOPE_ADMIN.replace("vault:", `vault:${vaultName}:`)}').`,
+          required_scope: SCOPE_ADMIN,
+          granted_scopes: auth.scopes,
+        },
+        { status: 403 },
+      );
+    }
+    if (subpath === "/.parachute/mirror/import") {
+      if (req.method !== "POST") {
+        return Response.json({ error: "Method not allowed" }, { status: 405 });
+      }
+      return handleMirrorImport(req, vaultName);
+    }
+    if (req.method !== "GET") {
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+    const jobId = decodeURIComponent(
+      subpath.slice("/.parachute/mirror/import/".length),
+    );
+    return handleMirrorImportStatus(vaultName, jobId);
+  }
+
+  // /.parachute/mirror/auth/* — UI-configurable git push credentials.
+  // GitHub OAuth Device Flow + PAT fallback. All admin-gated; the
+  // routes themselves don't carry secrets in their responses
+  // (mirror-routes.ts redacts via sanitizeCredentials).
+  if (subpath.startsWith("/.parachute/mirror/auth")) {
+    if (!hasScopeForVault(auth.scopes, vaultName, "admin")) {
+      return Response.json(
+        {
+          error: "Forbidden",
+          error_type: "insufficient_scope",
+          message: `This endpoint requires the '${SCOPE_ADMIN}' scope (or '${SCOPE_ADMIN.replace("vault:", `vault:${vaultName}:`)}').`,
+          required_scope: SCOPE_ADMIN,
+          granted_scopes: auth.scopes,
+        },
+        { status: 403 },
+      );
+    }
+    const manager = getMirrorManager(vaultName);
+    if (!manager) {
+      return Response.json(
+        {
+          error: "Mirror manager not initialized",
+          message:
+            "The vault server hasn't wired the mirror manager registry yet (boot hasn't finished, or it failed). Check logs for [mirror] entries.",
+        },
+        { status: 503 },
+      );
+    }
+
+    if (subpath === "/.parachute/mirror/auth") {
+      if (req.method === "GET") return handleAuthGet(manager);
+      if (req.method === "DELETE") return handleAuthDelete(manager);
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+    if (subpath === "/.parachute/mirror/auth/github/device-code") {
+      if (req.method === "POST") return handleAuthGithubDeviceCode();
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+    if (subpath === "/.parachute/mirror/auth/github/poll") {
+      if (req.method === "POST") return handleAuthGithubPoll(req, manager);
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+    if (subpath === "/.parachute/mirror/auth/github/installations") {
+      // Install state (vault#480) — which app, installed-anywhere?, install
+      // link, per-account installations. Explicitly-network (probes GitHub);
+      // the offline status read stays on GET /.parachute/mirror/auth.
+      if (req.method === "GET") return handleAuthGithubInstallations(manager);
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+    if (subpath === "/.parachute/mirror/auth/github/repos") {
+      if (req.method === "GET") return handleAuthGithubRepos(manager);
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+    if (subpath === "/.parachute/mirror/auth/github/create-repo") {
+      if (req.method === "POST") return handleAuthGithubCreateRepo(req, manager);
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+    if (subpath === "/.parachute/mirror/auth/github/select-repo") {
+      if (req.method === "POST") return handleAuthGithubSelectRepo(req, manager);
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+    if (subpath === "/.parachute/mirror/auth/pat") {
+      if (req.method === "POST") return handleAuthPat(req, manager);
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+    return Response.json({ error: "Not found" }, { status: 404 });
+  }
+
+  const apiMatch = subpath.match(/^\/api(\/.*)?$/);
+  if (!apiMatch) {
+    return Response.json({ error: "Not found" }, { status: 404 });
+  }
+
+  // /api/triggers — runtime trigger-registration API. Dispatched BEFORE the
+  // generic method→verb scope gate below because it's ADMIN-scoped on EVERY
+  // method (a webhook trigger exfiltrates note data; even GET is admin). The
+  // gate lives inside `handleTriggers`. Subpath is everything after
+  // `/api/triggers`. See src/triggers-api.ts.
+  {
+    const triggersPath = apiMatch[1] ?? "";
+    if (triggersPath === "/triggers" || triggersPath.startsWith("/triggers/")) {
+      return handleTriggers(req, store, triggersPath.slice("/triggers".length), vaultName, auth);
+    }
+  }
+
+  // /api/doctor — read-only taxonomy/metadata integrity scan (vault#552).
+  // Same "dispatch before the generic read/write gate" shape as /triggers
+  // above — dispatched early because it's GET-only and doesn't otherwise
+  // fall under the generic verb→scope gate's method-based default.
+  //
+  // Tier: `read` (was `admin` — re-tiered to match the MCP `doctor` tool's
+  // own read/write/admin re-tier, vault#570-adjacent scope-completion pass:
+  // doctor never mutates and is ALREADY tag-scope-restricted via
+  // `doctorTagScope` below, so read-scoped monitoring/tending callers need
+  // to be able to run it without an admin credential over EITHER door. A
+  // `vault:read` token can now call `GET /api/doctor` (previously
+  // `Forbidden`) — matching MCP's `doctor` tool exactly, closing the
+  // REST/MCP divergence the scope re-tier PR left as a known gap.
+  if (apiMatch[1] === "/doctor") {
+    if (req.method !== "GET") {
+      return Response.json({ error: "Method not allowed", error_type: "method_not_allowed" }, { status: 405 });
+    }
+    if (!hasScopeForVault(auth.scopes, vaultName, "read")) {
+      return Response.json(
+        {
+          error: "Forbidden",
+          error_type: "insufficient_scope",
+          message: `This endpoint requires the '${SCOPE_READ}' scope (or '${SCOPE_READ.replace("vault:", `vault:${vaultName}:`)}').`,
+          required_scope: SCOPE_READ,
+          granted_scopes: auth.scopes,
+        },
+        { status: 403 },
+      );
+    }
+    const doctorTagScope: TagScopeCtx = {
+      allowed: await expandTokenTagScope(store, auth.scoped_tags),
+      raw: auth.scoped_tags,
+    };
+    return handleDoctor(req, store, doctorTagScope);
+  }
+
+  // REST API — scope gate. GET/HEAD/OPTIONS → vault:read,
+  // POST/PATCH/PUT/DELETE → vault:write. Inheritance (admin ⊇ write ⊇ read)
+  // and the broad-vs-narrowed shape (`vault:<verb>` from pvt_*, or
+  // `vault:<vaultName>:<verb>` from hub JWTs) are handled by
+  // `hasScopeForVault`.
+  //
+  // Read-only POST carve-out (vault#283): the conformance check is a POST
+  // (it carries a proposed-fields body) but mutates nothing — it counts
+  // notes. Gate it on `read`, not `write`, so a read-scoped caller can
+  // preview a schema tightening without holding a write credential.
+  const apiSubpath = apiMatch[1] ?? "";
+  const isReadOnlyPost =
+    req.method === "POST" && /^\/tags\/[^/]+\/conformance$/.test(apiSubpath);
+  // Tag-schema/taxonomy mutation carve-out — mirrors the MCP-side
+  // update-tag/delete-tag/rename-tag/merge-tags re-tier (write → admin):
+  // these tools define a tag's SCHEMA or restructure the tag graph across
+  // every note carrying it — structure, not content — the same distinction
+  // that keeps `create-note`/`update-note`/`delete-note` at `write` while
+  // moving these to `admin`. Before this fix, the REST door only required
+  // `vault:write` here — a gap between doors (a `vault:write` token could
+  // rename/merge/delete/update a tag over REST while MCP already refused
+  // it). Matches PUT/DELETE `/tags/:name` (update-tag / delete-tag), POST
+  // `/tags/merge` (merge-tags), and POST `/tags/:name/rename` (rename-tag).
+  // Deliberately does NOT match `/tags/:name/conformance` (2 path segments,
+  // not 1 — see `isReadOnlyPost` above for that endpoint's own, lower tier)
+  // or plain GET `/tags[/:name]` (read, unaffected).
+  const isTagSchemaMutation =
+    ((req.method === "PUT" || req.method === "DELETE") && /^\/tags\/[^/]+$/.test(apiSubpath)) ||
+    (req.method === "POST" &&
+      (apiSubpath === "/tags/merge" || /^\/tags\/[^/]+\/rename$/.test(apiSubpath)));
+  // Erasing note history is irreversible and requires admin (vault#524).
+  const isNoteHistoryErase = req.method === "DELETE" && /^\/notes\/[^/]+\/versions$/.test(apiSubpath);
+  const isHistoryCompact = req.method === "POST" && apiSubpath === "/history/compact";
+  const requiredVerb = isReadOnlyPost ? "read" : (isTagSchemaMutation || isNoteHistoryErase || isHistoryCompact) ? "admin" : verbForMethod(req.method);
+  if (!hasScopeForVault(auth.scopes, vaultName, requiredVerb)) {
+    const requiredApiScope = isReadOnlyPost
+      ? SCOPE_READ
+      : (isTagSchemaMutation || isNoteHistoryErase || isHistoryCompact)
+        ? SCOPE_ADMIN
+        : scopeForMethod(req.method);
+    return Response.json(
+      {
+        error: "Forbidden",
+        error_type: "insufficient_scope",
+        message: `This endpoint requires the '${requiredApiScope}' scope (or '${requiredApiScope.replace("vault:", `vault:${vaultName}:`)}').`,
+        required_scope: requiredApiScope,
+        granted_scopes: auth.scopes,
+      },
+      { status: 403 },
+    );
+  }
+
+  const apiPath = apiMatch[1] ?? "";
+
+  // Tag-scoped tokens (docs/contracts/tag-scoped-tokens.md): expand the token's
+  // root-tag allowlist into `{root} ∪ descendants(root)` once per request,
+  // so handlers can intersect against the note's tag set without re-walking
+  // the `_tags/<name>` hierarchy on every check. `tagScope.allowed` is null
+  // for unscoped tokens — the no-op fast path leaves the pre-tag-scope
+  // behavior identical.
+  const tagScope: TagScopeCtx = {
+    allowed: await expandTokenTagScope(store, auth.scoped_tags),
+    raw: auth.scoped_tags,
+  };
+
+  // Write-attribution context (vault#298). `auth.actor` is the principal;
+  // `auth.via` is the credential class (`api` for hub JWTs + legacy keys,
+  // `operator` for the env-var bearer, `nostr:<pubkey>` when the hub stamped a
+  // NIP-98 signing key — vault#698). The REST surface IS the `api` channel, so
+  // no refinement is needed here — the base via stands (the MCP handler is the
+  // one that refines to `mcp`, via `refineMcpVia`). That gives the REST door
+  // signer attribution for free and symmetric with MCP: `nostr:<pubkey>` is
+  // already the base value, so it lands in `created_via`/`last_updated_via`
+  // unchanged. Pinned by src/attribution-threading.test.ts. Threaded only into
+  // the write handler.
+  // Migration-bypass (vault#299): a `vault:migrate`-scoped caller may write
+  // notes that violate `strict:true` field constraints (for backfill /
+  // migration). Every bypassed write is logged. Orthogonal to read/write/admin
+  // — an admin token does NOT bypass unless it also holds `migrate`.
+  const writeCtx: WriteCtx = {
+    actor: auth.actor,
+    via: auth.via,
+    bypassStrict: hasMigrateScopeForVault(auth.scopes, vaultName),
+  };
+
+  if (apiPath.startsWith("/notes")) return handleNotes(req, store, apiPath.slice(6), vaultName, tagScope, writeCtx);
+  // Live-query SSE transport REMOVED (WS-hibernation migration Phase 5). The
+  // WebSocket binding (an `Upgrade: websocket` GET /subscribe, handled in
+  // server.ts before this pipeline) is now the SOLE live transport; polling
+  // GET /notes is the client floor beneath it. A non-WS GET /subscribe — a
+  // straggler on a cached pre-WS notes-ui bundle — gets a clean 410 Gone
+  // pointing at the WS binding so its consumer degrades to polling gracefully;
+  // NEVER a 500 or an unhandled path.
+  // Not method-gated: a POST here is still a straggler on the removed SSE
+  // transport, not a missing verb on a live resource, so 410 (not 405).
+  if (apiPath === "/subscribe") {
+    return Response.json(
+      {
+        error:
+          "The live-query SSE transport has been removed. Reconnect with an `Upgrade: websocket` request to GET /api/subscribe, or poll GET /notes.",
+        code: "SSE_TRANSPORT_REMOVED",
+      },
+      { status: 410 },
+    );
+  }
+  if (apiPath.startsWith("/tags")) return handleTags(req, store, apiPath.slice(5), tagScope, writeCtx);
+  if (isHistoryCompact) return handleHistoryCompact(req, store, tagScope);
+  if (apiPath === "/find-path") return handleFindPath(req, store, tagScope);
+  if (apiPath === "/vault") {
+    return handleVault(
+      req,
+      store,
+      vaultConfig,
+      () => {
+        writeVaultConfig(vaultConfig);
+      },
+      undefined, // resolveCapability — keep the production default
+      tagScope,
+    );
+  }
+  if (apiPath === "/unresolved-wikilinks") return handleUnresolvedWikilinks(req, store, tagScope);
+  if (apiPath.startsWith("/storage")) return handleStorage(req, apiPath.slice(8), vaultName, store, tagScope);
+  if (apiPath === "/health") return Response.json({ status: "ok", vault: vaultName });
+
+  return Response.json({ error: "Not found" }, { status: 404 });
+}

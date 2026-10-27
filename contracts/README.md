@@ -67,15 +67,20 @@ with its supervisor off and the vault by hand. That hides exactly the issuer, su
 changes. So v0.8's suites run against **the candidate**: a built `parachute`, launched the way a user launches it.
 
 - **A candidate** is a folder with `bin/parachute`, `bin/parachute-vault` and `CANDIDATE.json` (what it is, and a
-  sha256 of every other file). Until lane A1 moves the code in, `bun run build:stock` builds today's hub and vault
-  from `pins.json` into that layout. A1's build will write the same manifest with profile `v0.8`.
+  sha256 of every other file). `bun run build:core` builds this repo's workspace that way, with profile `v0.8`:
+  `bin/parachute-core` and its two aliases, `lib/` (the workspace, installed from the root `bun.lock`) and a
+  `package.json` naming `@openparachute/core`. It is what `bun run candidate` and `prism-compat` run by default.
+  `bun run build:stock` builds today's hub and vault from `pins.json` into the same layout (profile `stock-0.7`);
+  the suites that need the old programs (takeover, identity, rollback) find it in `.cache/candidate-stock`, or at
+  `OLD_STOCK_DIR`.
 - **`bun run candidate`** (`harness/run-candidate.ts`) refuses a candidate whose bytes don't match its manifest, or
   `CANDIDATE_SHA256` (CI passes the hash its build step produced). Then it starts a box: `parachute-vault create`, then
   `parachute serve` on a random port with the hub supervising its vault. An admin pass is minted with the real CLI.
   It checks that every listening socket belongs to a process started from the candidate folder. It prints the hash,
   the source, the process model (as built and as seen) and any workaround, and hashes the candidate again after the
   run. The stock profile needs two workarounds, both fix 1, printed every run: it writes `hub/run/hub.port`, and it sets
-  `PARACHUTE_HUB_JWKS_ORIGIN` (a hub-started vault otherwise looks for keys on :1939). A `v0.8` candidate may need none.
+  `PARACHUTE_HUB_JWKS_ORIGIN` (a hub-started vault otherwise looks for keys on :1939). A `v0.8` candidate may need none,
+  and the core build needs none: fix 1's first half is in `packages/hub`.
 - **The sandbox** (`harness/sandbox.ts`): every candidate run re-executes itself under `unshare` in its own network
   and PID namespace. Today's box puts its vault on :1940 whatever the hub's port, and a box like uni has its live
   vault there. Inside, only loopback exists, plus a dummy interface holding the default route. An nftables counter
@@ -106,8 +111,9 @@ one that now passes.
 
 ### Mutants and flips on the candidate
 
-`bun run mutants:candidate` applies each mutant to the pinned source, rebuilds the candidate, and requires the named
-contracts to go red (`harness/mutants.ts`). **Flips** go the other way: a small fix to today's code that must turn
+`bun run mutants:candidate` copies the workspace once, applies each mutant to `packages/vault`, `packages/hub` or
+`packages/cli` in a copy, rebuilds the core candidate, and requires the named contracts to go red
+(`harness/mutants.ts`). **Flips** go the other way: a small fix to today's code that must turn
 named `red()` contracts "now green". A contract that is red today and green under the fix has a red/green proof
 that it tests the fix.
 
@@ -123,10 +129,10 @@ that it tests the fix.
 | `compat/prism.test.ts` | **What Prism relies on**, from its code: passes as it mints them, its JWT check, REST shapes and 409/428s, tag-schema rights, MCP tools per scope against its allowlists, revocation. Green today; must stay green. Candidate only. |
 | `compat/uni.test.ts` | **One probe per client of uni's box** (`uni-writers.json`: call shapes only), NIP-98 in both shapes, single-use events and tickets, one process per `vault.db`, config files unchanged across a restart. Green today. Candidate only. |
 | `safety/*.test.ts` | **Fixes 2, 5–8, 13–15** (PLAN §5): loopback by default, `/view` scope, scoped writes add no outside or private tag, deletes only to subscribers who could see the note, search scores leak nothing, a mint never widens, unknown permission keys refused. Red today; each moves to `today/` when fixed. |
-| `embedded/*.test.ts` | **Embedded mode for Prism** (PLAN §3): serve, issuer (fix 1), JSON outputs, newer data (fix 4), modes (fix 3), bootstrap, refusals, ready and stop, offline (outbound trap), rollback to stock, hostile local callers. Red today. |
+| `embedded/*.test.ts` | **Embedded mode for Prism** (PLAN §3): serve, issuer (fix 1), JSON outputs, newer data (fix 4), modes (fix 3), bootstrap, refusals, ready and stop, offline (outbound trap), rollback to stock, hostile local callers. Red today, except issuer's CLI and box tests and `version --json` (green on the core build). |
 | `lifecycle/shutdown.test.ts` | **One shutdown coordinator** (PLAN §2.2, §7.4): every stop path keeps acknowledged writes, checkpoints the WAL, closes every port and removes its run files. |
 | `lifecycle/takeover.test.ts` | **First-run takeover** (PLAN §8.0): detect, dry run, backup, refuse while an old process holds the data, pause old units, same data, rollback. Red today. |
-| `lifecycle/identity.test.ts` | **The new name** (PLAN §2.5): `@openparachute/core` / `parachute-core`; installing it leaves the old global packages byte-identical. Red today. |
+| `lifecycle/identity.test.ts` | **The new name** (PLAN §2.5): `@openparachute/core` / `parachute-core`, with `parachute` and `parachute-vault` as aliases; the vault serve starts is core's own even with the old one first on PATH (green on the core build); installing it leaves the old global packages byte-identical (red until lane D). |
 | `v1/sharing.test.ts` | Grants (who × what × how much). A pass alone grants nothing. Grants add up. Private notes are the exception inside a shared page. Revoking takes effect at once. |
 | `v1/connector-attribution.test.ts` | When an app writes for a person, the note names both. |
 

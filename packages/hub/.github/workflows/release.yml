@@ -1,0 +1,576 @@
+# Release workflow — triggered by a merge to `next` or `main` (hub#790, and
+# the `next` trigger added when the rc cut stopped needing a `next`→`main`
+# hop of its own), or by pushing a semver tag.
+#
+# This workflow publishes FOUR packages on different tag namespaces:
+#
+#   - @openparachute/hub            ← tag prefix `v...`              (e.g. v0.5.13-rc.33)
+#   - @openparachute/scope-guard    ← tag prefix `scope-guard-v...`   (e.g. scope-guard-v0.4.0-rc.2)
+#   - @openparachute/depcheck       ← tag prefix `depcheck-v...`      (e.g. depcheck-v0.1.0-rc.1)
+#   - @openparachute/door-contract  ← tag prefix `door-contract-v...` (e.g. door-contract-v0.6.0)
+#
+# All packages have npm Trusted Publisher rules pointing at this workflow
+# file. On a tag push the jobs below gate on the tag prefix so only one package
+# publishes; on a merge each job gates on its own `plan` output, so a merge can
+# publish several packages at once. Independent release cadences either way;
+# hub doesn't have to bump when scope-guard / depcheck / door-contract ship and
+# vice versa.
+#
+# Tag conventions (matches governance rule 2, https://github.com/ParachuteComputer/parachute-workspace/blob/main/docs/process/governance.md):
+#   - rc:     v<X>.<Y>.<Z>-rc.<N>   (e.g. v0.5.13-rc.33)
+#                                    (scope-guard-v0.4.0-rc.2)
+#                                    (depcheck-v0.1.0-rc.1)
+#                                    (door-contract-v0.6.0-rc.1)
+#   - stable: v<X>.<Y>.<Z>          (e.g. v0.5.13)
+#                                    (scope-guard-v0.4.0)
+#                                    (depcheck-v0.1.0)
+#                                    (door-contract-v0.6.0)
+#
+# Release flow (publish-on-merge — the tag path below still works, see `plan`):
+#   1. Cutting an rc: open a release PR bumping `version` to an `-rc.N`
+#      shape, targeting `next` directly — no `next`→`main` hop needed just
+#      to publish an rc. Promoting to stable: same shape, but the PR targets
+#      `main` and drops the `-rc.N` suffix; `plan` refuses it unless npm
+#      already has that core version as an rc AND the diff from that rc tag
+#      is version/changelog/lockfile only (RELEASING.md).
+#   2. Merge it. That IS the release signal — `plan` compares each
+#      package.json against npm and publishes what's new.
+#   3. CI runs tests once (workspace-wide), then publishes whichever packages
+#      `plan` selected. Hub also publishes a container image to ghcr.io, tagged
+#      from the published VERSION (`:vX.Y.Z` + `:rc`/`:stable` + `:latest`) —
+#      not from the ref, which on a merge run is just the branch name
+#      (`next` or `main`), never a version (hub#829).
+#   4. `tag-record` pushes `vX.Y.Z` afterwards as a RECORD of what shipped.
+#      Nothing needs to be tagged by hand.
+#
+# Operator setup (one-time) — see RELEASING.md:
+#   - npm Trusted Publisher rules: one per package (hub, scope-guard, depcheck,
+#     door-contract). All rules point at: org=ParachuteComputer,
+#     repo=parachute-hub, workflow=release.yml, env blank.
+#   - ghcr.io needs no secret (uses the runner's GITHUB_TOKEN).
+
+name: Release
+
+on:
+  push:
+    # hub#790: publish-on-merge. See the `plan` job for why the tag was
+    # replaced as the release SIGNAL (it's still honoured, and still cut as a
+    # record).
+    #
+    # `next` publishes rc's directly (no more next→main hop just to cut an
+    # rc). `decidePublish` is idempotent on an already-published version,
+    # refuses to move a dist-tag backwards, refuses a `latest` publish unless
+    # npm already has a matching `-rc.*` and the diff is a pure suffix-drop,
+    # AND refuses a stable unless the trigger is a branch push of `main`.
+    # Matching-rc + suffix-drop alone is not enough: after an rc lands on
+    # `next`, a version/changelog-only promotion PR targeting `next` would
+    # pass those two and publish `@latest`. The `paths` filter below means
+    # an ordinary feature merge (no version bump) never even runs this
+    # workflow a second time — `pr-verify.yml` already tested it before merge.
+    #
+    # CHANGELOG.md is in the filter because a promotion merge can leave
+    # package.json byte-identical to main's tip: hub#926 re-promoted a
+    # version main already carried (0.7.18, from the refused #917 cut), so
+    # only the changelog differed and Release never fired. Every release
+    # cut touches the changelog; ordinary feature merges don't.
+    branches:
+      - main
+      - next
+    paths:
+      - 'package.json'
+      - 'CHANGELOG.md'
+      - 'packages/scope-guard/package.json'
+      - 'packages/scope-guard/CHANGELOG.md'
+      - 'packages/depcheck/package.json'
+      - 'packages/door-contract/package.json'
+      - 'packages/door-contract/CHANGELOG.md'
+    tags:
+      # Hub release tags
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+'
+      # scope-guard release tags
+      - 'scope-guard-v[0-9]+.[0-9]+.[0-9]+'
+      - 'scope-guard-v[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+'
+      # depcheck release tags
+      - 'depcheck-v[0-9]+.[0-9]+.[0-9]+'
+      - 'depcheck-v[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+'
+      # door-contract release tags
+      - 'door-contract-v[0-9]+.[0-9]+.[0-9]+'
+      - 'door-contract-v[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+'
+
+concurrency:
+  # Don't let two releases race on the same tag.
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # What, if anything, needs publishing.
+  #
+  # hub#790: releasing used to require remembering `git tag && git push` after
+  # every merge. The remembering is the weak link — several PRs merged in one
+  # session with no tags, so nothing published and nobody noticed until an
+  # operator asked why their box was stale.
+  #
+  # Governance rule 2 already requires every code-touching PR to bump `version`,
+  # so package.json IS the per-PR release intent; the tag was a second, manual
+  # copy of a decision the PR already made. The decision logic lives in
+  # `scripts/release-plan.ts` (unit-tested — release logic that can
+  # double-publish or drop a release shouldn't be untested shell in a `run:`).
+  #
+  # Note the tag-push path: an explicit **rc** tag still publishes, and
+  # passes `--tag-push` so `decidePublish`'s tag short-circuit overrides the
+  # registry refuse-guards (an ambiguous registry response, an
+  # older-than-published rc) — because an rc tag is a human saying "release
+  # this rc". hub#841. A tag push of a stable is refused; stables publish
+  # from `main` only. A write token can push a tag; it cannot merge to `main`.
+  # ---------------------------------------------------------------------------
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    outputs:
+      hub: ${{ steps.hub.outputs.should_publish }}
+      # The version being shipped, independent of the ref. `publish-image`
+      # derives every image tag from this (hub#829) — on a merge-triggered run
+      # `github.ref_name` is `main`, so a ref-derived tag has no version in it.
+      hub_version: ${{ steps.hub.outputs.version }}
+      scope_guard: ${{ steps.scope_guard.outputs.should_publish }}
+      depcheck: ${{ steps.depcheck.outputs.should_publish }}
+      door_contract: ${{ steps.door_contract.outputs.should_publish }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # The drift advisory in release-plan.ts asks git "what's on main that
+          # no published version contains?" — a `<tag>..HEAD` range. A bare
+          # checkout fetches `--depth=1 --no-tags`, where that range exits 128
+          # ("unknown revision") and the advisory reported nothing, forever
+          # (hub#830). Indistinguishable from "everything is shipped", which is
+          # the exact confusion it was added to end.
+          #
+          # Only this job needs history; every other job's checkout stays
+          # shallow.
+          fetch-depth: 0
+          # Redundant alongside fetch-depth: 0 today, deliberate anyway: it
+          # states the dependency, so narrowing the depth later can't silently
+          # take the tags away again.
+          fetch-tags: true
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4
+      - id: hub
+        run: bun scripts/release-plan.ts . @openparachute/hub ${{ github.ref_type == 'tag' && '--tag-push' || '' }}
+      - id: scope_guard
+        run: bun scripts/release-plan.ts packages/scope-guard @openparachute/scope-guard ${{ github.ref_type == 'tag' && '--tag-push' || '' }}
+      - id: depcheck
+        run: bun scripts/release-plan.ts packages/depcheck @openparachute/depcheck ${{ github.ref_type == 'tag' && '--tag-push' || '' }}
+      - id: door_contract
+        run: bun scripts/release-plan.ts packages/door-contract @openparachute/door-contract ${{ github.ref_type == 'tag' && '--tag-push' || '' }}
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    # Keep the release gate bounded the same way as PR verification.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4
+      - name: install deps
+        run: bun install --frozen-lockfile
+      - name: build depcheck
+        # hub's `tsc` typecheck resolves `@openparachute/depcheck`'s types from
+        # its built `dist/index.d.ts`. The workspace install doesn't build it
+        # (no prepare hook), so build it explicitly before typecheck. At
+        # runtime hub resolves depcheck via the `bun`→src export condition, so
+        # this is only needed for the type-level resolution.
+        run: bun run --cwd packages/depcheck build
+      - name: build door-contract
+        # Same reason as depcheck: hub's `tsc` typecheck + the door-contract
+        # parity test resolve `@openparachute/door-contract` from its built
+        # `dist/`. The frozen-lockfile install doesn't build it, so build it
+        # explicitly before typecheck + tests.
+        run: bun run --cwd packages/door-contract build
+      - name: typecheck
+        run: bun run typecheck
+      - name: hub tests
+        run: bun test --timeout 30000 ./src
+      - name: scope-guard tests
+        # Run both suites regardless of tag prefix — small extra cost (~1s)
+        # for the safety of catching scope-guard regressions before
+        # publishing scope-guard.
+        run: bun test ./packages/scope-guard/src
+      - name: depcheck tests
+        # Same rationale — depcheck is consumed by hub, so a regression here
+        # would break hub too. Cheap to run on every tag.
+        run: bun test ./packages/depcheck/src
+      - name: door-contract tests
+        # The shared OAuth-issuer + /account/* contract corpus (consumed
+        # test-only by hub's door-contract-parity suite; the hosted cloud door
+        # adopts it in Phase B). Cheap; gates the contract on every tag.
+        run: bun test ./packages/door-contract/src
+
+  publish-hub-npm:
+    name: publish hub to npm
+    needs: [plan, test]
+    # Hub-only: skip on scope-guard / depcheck / door-contract tags (a `v*` tag is hub's).
+    # Plan is consulted on tag pushes too — a tag is not a bypass of the
+    # stable-from-main gate. The prefix clause still stops a scope-guard
+    # tag from also publishing hub (all four plan steps run --tag-push).
+    if: ${{ needs.plan.outputs.hub == 'true' && (github.ref_type != 'tag' || (!startsWith(github.ref_name, 'scope-guard-') && !startsWith(github.ref_name, 'depcheck-') && !startsWith(github.ref_name, 'door-contract-'))) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Required for npm provenance attestation.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4
+      - uses: actions/setup-node@v6
+        with:
+          # Node 24 ships npm 11.5+ which has Trusted Publishing OIDC
+          # support built in. Node 20 LTS only has npm 10 and would
+          # silently fall back to token auth (failing without NPM_TOKEN).
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+      - name: install deps
+        run: bun install --frozen-lockfile
+      - name: verify package.json version matches tag
+        # Tag path only — on a branch push the version comes FROM
+        # package.json, so there is nothing to drift against.
+        if: github.ref_type == 'tag'
+        # Defense against tag-vs-package.json drift. If they don't match,
+        # we'd publish under the wrong version.
+        run: |
+          PKG_VERSION=$(bun -e "console.log(require('./package.json').version)")
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::package.json version ($PKG_VERSION) doesn't match tag ($TAG_VERSION)"
+            exit 1
+          fi
+      - name: publish
+        # Trusted Publishing: npm verifies the OIDC token from this workflow
+        # against the package's configured trusted publisher rule
+        # (org=ParachuteComputer, repo=parachute-hub, workflow=release.yml).
+        # No NPM_TOKEN secret needed; `id-token: write` permission above
+        # makes the OIDC token available to npm CLI.
+        #
+        # `npm publish` runs the `prepack` script in package.json, which
+        # already does `bun run build:spa` — so web/ui/dist is built
+        # before the tarball is assembled. No explicit build step needed.
+        run: |
+          # Detect rc vs stable from tag name. Tag pattern in `on:` above
+          # enforces the shape, so this is just disambiguation.
+          # dist-tag comes from the VERSION BEING PUBLISHED, not from the ref.
+          # This used to read GITHUB_REF_NAME, which on a merge-triggered run is
+          # "main" — matching no rc pattern, so every publish-on-merge landed on
+          # `latest`. hub 0.7.9-rc.3 became @latest that way (hub#792). The
+          # package's own version is the only honest source here.
+          PKG_VERSION=$(bun -e "console.log(require('${{ github.workspace }}/package.json').version)")
+          case "$PKG_VERSION" in
+            *-rc.*) DIST_TAG=rc ;;
+            *)      DIST_TAG=latest ;;
+          esac
+          echo "publishing with dist-tag=$DIST_TAG"
+          npm publish --tag "$DIST_TAG" --access public --provenance
+
+  publish-scope-guard-npm:
+    name: publish scope-guard to npm
+    needs: [plan, test]
+    # scope-guard-only: skip on hub (`v*`) tags. Plan is consulted on tag
+    # pushes too — a tag is not a bypass of the stable-from-main gate.
+    if: ${{ needs.plan.outputs.scope_guard == 'true' && (github.ref_type != 'tag' || startsWith(github.ref_name, 'scope-guard-')) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        # All shell steps default to the scope-guard package dir. Steps
+        # that need to run from the repo root explicitly override
+        # `working-directory: ${{ github.workspace }}` (e.g. the workspace
+        # install below).
+        working-directory: packages/scope-guard
+    steps:
+      - uses: actions/checkout@v6
+        # checkout has no working-directory option; runs from repo root.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+      - name: install deps
+        # Install at workspace root so hoisted deps resolve. Override the
+        # job's default working-directory.
+        working-directory: ${{ github.workspace }}
+        run: bun install --frozen-lockfile
+      - name: verify package.json version matches tag
+        # Tag path only — on a branch push the version comes FROM
+        # package.json, so there is nothing to drift against.
+        if: github.ref_type == 'tag'
+        run: |
+          PKG_VERSION=$(bun -e "console.log(require('./package.json').version)")
+          # Strip the `scope-guard-v` prefix from the tag.
+          TAG_VERSION="${GITHUB_REF_NAME#scope-guard-v}"
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::packages/scope-guard/package.json version ($PKG_VERSION) doesn't match tag ($TAG_VERSION)"
+            exit 1
+          fi
+      - name: publish
+        run: |
+          # dist-tag comes from the VERSION BEING PUBLISHED, not from the ref.
+          # This used to read GITHUB_REF_NAME, which on a merge-triggered run is
+          # "main" — matching no rc pattern, so every publish-on-merge landed on
+          # `latest`. hub 0.7.9-rc.3 became @latest that way (hub#792). The
+          # package's own version is the only honest source here.
+          PKG_VERSION=$(bun -e "console.log(require('${{ github.workspace }}/packages/scope-guard/package.json').version)")
+          case "$PKG_VERSION" in
+            *-rc.*) DIST_TAG=rc ;;
+            *)      DIST_TAG=latest ;;
+          esac
+          echo "publishing @openparachute/scope-guard with dist-tag=$DIST_TAG"
+          npm publish --tag "$DIST_TAG" --access public --provenance
+
+  publish-depcheck-npm:
+    name: publish depcheck to npm
+    needs: [plan, test]
+    # depcheck-only: skip on hub (`v*`) + scope-guard tags. Plan is consulted
+    # on tag pushes too — a tag is not a bypass of the stable-from-main gate.
+    if: ${{ needs.plan.outputs.depcheck == 'true' && (github.ref_type != 'tag' || startsWith(github.ref_name, 'depcheck-')) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        # All shell steps default to the depcheck package dir. Steps that need
+        # to run from the repo root explicitly override
+        # `working-directory: ${{ github.workspace }}`.
+        working-directory: packages/depcheck
+    steps:
+      - uses: actions/checkout@v6
+        # checkout has no working-directory option; runs from repo root.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+      - name: install deps
+        # Install at workspace root so hoisted deps resolve.
+        working-directory: ${{ github.workspace }}
+        run: bun install --frozen-lockfile
+      - name: verify package.json version matches tag
+        # Tag path only — on a branch push the version comes FROM
+        # package.json, so there is nothing to drift against.
+        if: github.ref_type == 'tag'
+        run: |
+          PKG_VERSION=$(bun -e "console.log(require('./package.json').version)")
+          # Strip the `depcheck-v` prefix from the tag.
+          TAG_VERSION="${GITHUB_REF_NAME#depcheck-v}"
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::packages/depcheck/package.json version ($PKG_VERSION) doesn't match tag ($TAG_VERSION)"
+            exit 1
+          fi
+      - name: publish
+        # prepublishOnly runs `bun run build` (tsc → dist/) before the tarball
+        # is assembled, so the published package ships compiled JS + d.ts.
+        run: |
+          # dist-tag comes from the VERSION BEING PUBLISHED, not from the ref.
+          # This used to read GITHUB_REF_NAME, which on a merge-triggered run is
+          # "main" — matching no rc pattern, so every publish-on-merge landed on
+          # `latest`. hub 0.7.9-rc.3 became @latest that way (hub#792). The
+          # package's own version is the only honest source here.
+          PKG_VERSION=$(bun -e "console.log(require('${{ github.workspace }}/packages/depcheck/package.json').version)")
+          case "$PKG_VERSION" in
+            *-rc.*) DIST_TAG=rc ;;
+            *)      DIST_TAG=latest ;;
+          esac
+          echo "publishing @openparachute/depcheck with dist-tag=$DIST_TAG"
+          npm publish --tag "$DIST_TAG" --access public --provenance
+
+  publish-door-contract-npm:
+    name: publish door-contract to npm
+    needs: [plan, test]
+    # door-contract-only: skip on hub (`v*`) + scope-guard + depcheck tags.
+    # Plan is consulted on tag pushes too — a tag is not a bypass of the
+    # stable-from-main gate.
+    if: ${{ needs.plan.outputs.door_contract == 'true' && (github.ref_type != 'tag' || startsWith(github.ref_name, 'door-contract-')) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        # All shell steps default to the door-contract package dir. Steps that
+        # need to run from the repo root explicitly override
+        # `working-directory: ${{ github.workspace }}`.
+        working-directory: packages/door-contract
+    steps:
+      - uses: actions/checkout@v6
+        # checkout has no working-directory option; runs from repo root.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+      - name: install deps
+        # Install at workspace root so hoisted deps resolve.
+        working-directory: ${{ github.workspace }}
+        run: bun install --frozen-lockfile
+      - name: verify package.json version matches tag
+        # Tag path only — on a branch push the version comes FROM
+        # package.json, so there is nothing to drift against.
+        if: github.ref_type == 'tag'
+        run: |
+          PKG_VERSION=$(bun -e "console.log(require('./package.json').version)")
+          # Strip the `door-contract-v` prefix from the tag.
+          TAG_VERSION="${GITHUB_REF_NAME#door-contract-v}"
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::packages/door-contract/package.json version ($PKG_VERSION) doesn't match tag ($TAG_VERSION)"
+            exit 1
+          fi
+      - name: publish
+        # prepublishOnly runs `bun run build` (tsc → dist/) before the tarball
+        # is assembled, so the published package ships compiled JS + d.ts.
+        run: |
+          # dist-tag comes from the VERSION BEING PUBLISHED, not from the ref.
+          # This used to read GITHUB_REF_NAME, which on a merge-triggered run is
+          # "main" — matching no rc pattern, so every publish-on-merge landed on
+          # `latest`. hub 0.7.9-rc.3 became @latest that way (hub#792). The
+          # package's own version is the only honest source here.
+          PKG_VERSION=$(bun -e "console.log(require('${{ github.workspace }}/packages/door-contract/package.json').version)")
+          case "$PKG_VERSION" in
+            *-rc.*) DIST_TAG=rc ;;
+            *)      DIST_TAG=latest ;;
+          esac
+          echo "publishing @openparachute/door-contract with dist-tag=$DIST_TAG"
+          npm publish --tag "$DIST_TAG" --access public --provenance
+
+  publish-image:
+    name: publish to ghcr.io
+    needs: [plan, test]
+    # Hub-only: scope-guard / depcheck / door-contract don't ship a container image.
+    # Plan is consulted on tag pushes too — a tag is not a bypass of the
+    # stable-from-main gate (same shape as publish-hub-npm).
+    if: ${{ needs.plan.outputs.hub == 'true' && (github.ref_type != 'tag' || (!startsWith(github.ref_name, 'scope-guard-') && !startsWith(github.ref_name, 'depcheck-') && !startsWith(github.ref_name, 'door-contract-'))) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Required for ghcr.io push via GITHUB_TOKEN.
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: guard against an empty version
+        # `plan` always emits `version` (release-plan.ts reads it straight out
+        # of package.json), but an empty one here would silently push `:v` and
+        # a `latest`/`stable` with no versioned peer — exactly the failure mode
+        # hub#829 is about. Fail loudly instead.
+        run: |
+          if [ -z "${{ needs.plan.outputs.hub_version }}" ]; then
+            echo "::error::plan job emitted no hub version — refusing to push untagged images"
+            exit 1
+          fi
+      - name: derive tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          # Image name MUST be lowercase per OCI convention. The org slug
+          # ParachuteComputer is mixed-case on github, hence the explicit
+          # lowercase here.
+          images: ghcr.io/parachutecomputer/parachute-hub
+          # Every tag comes from the VERSION BEING PUBLISHED, never from the
+          # ref — the same lesson as the npm dist-tag fix (hub#792). This used
+          # to be `type=ref,event=tag`, which on a merge-triggered run
+          # (`github.ref_name` == `main`) emitted no version tag at all: the
+          # 0.7.13 merge run pushed `:stable` alone, and its `:v0.7.13` /
+          # `:latest` existed only because someone also pushed a tag by hand.
+          # With the manual tag step gone from release PRs, that left RELEASING.md's
+          # `docker pull …:vX.Y.Z` verify/rollback steps pointing at nothing (hub#829).
+          # Naming the version first also fixes the OCI `image.version` label,
+          # which metadata-action takes from the first tag (it read `stable`).
+          tags: |
+            type=raw,value=v${{ needs.plan.outputs.hub_version }}
+            type=raw,value=rc,enable=${{ contains(needs.plan.outputs.hub_version, '-rc.') }}
+            type=raw,value=stable,enable=${{ !contains(needs.plan.outputs.hub_version, '-rc.') }}
+            type=raw,value=latest,enable=${{ !contains(needs.plan.outputs.hub_version, '-rc.') }}
+          # `latest` is declared explicitly above, so turn off metadata-action's
+          # automatic one: `latest=auto` only fires for `type=ref,event=tag` /
+          # `type=semver`, i.e. tag runs only, which is the second half of
+          # hub#829 (`:latest` stuck at 0.7.13 once merges became the trigger).
+          flavor: |
+            latest=false
+      - name: build + push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Single-arch is fine for now — Render runs linux/amd64. Add
+          # linux/arm64 later if cloud targets need it.
+          platforms: linux/amd64
+          # Layer cache via GitHub Actions cache so subsequent builds are
+          # fast (typically ~30s warm vs ~3min cold).
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ---------------------------------------------------------------------------
+  # Record what shipped as git tags.
+  #
+  # A RECORD, not a trigger — nothing fires off these, which is exactly why
+  # GITHUB_TOKEN pushing them is fine (a token-pushed tag can't start a
+  # workflow, and here it doesn't need to). `always()` with per-package result
+  # checks so one package's publish failure doesn't suppress the others' tags.
+  # ---------------------------------------------------------------------------
+  tag-record:
+    name: tag what shipped
+    needs: [plan, publish-hub-npm, publish-scope-guard-npm, publish-depcheck-npm, publish-door-contract-npm]
+    if: ${{ always() && github.ref_type != 'tag' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # The "already exists" dedupe below rev-parses the tag; a shallow
+          # tagless clone can't see pre-existing remote tags, so the push gets
+          # rejected and swallowed by continue-on-error. Same fix as `plan`'s
+          # checkout (and surface#216).
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4
+      - name: tag published packages
+        continue-on-error: true
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          tag_if() {  # <prefix> <dir> <published?>
+            [ "$3" = "success" ] || return 0
+            V=$(bun -e "console.log(require('./$2/package.json').version)")
+            T="$1$V"
+            if git rev-parse "$T" >/dev/null 2>&1; then
+              echo "$T already exists"
+            else
+              git tag "$T" && git push origin "$T" && echo "tagged $T"
+            fi
+          }
+          tag_if "v"              "."                      "${{ needs.publish-hub-npm.result }}"
+          tag_if "scope-guard-v"  "packages/scope-guard"   "${{ needs.publish-scope-guard-npm.result }}"
+          tag_if "depcheck-v"     "packages/depcheck"      "${{ needs.publish-depcheck-npm.result }}"
+          tag_if "door-contract-v" "packages/door-contract" "${{ needs.publish-door-contract-npm.result }}"

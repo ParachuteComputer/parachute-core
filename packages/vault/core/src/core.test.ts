@@ -1,0 +1,9552 @@
+import { describe, it, expect, beforeEach } from "bun:test";
+import { Database } from "bun:sqlite";
+import { SqliteStore } from "./store.js";
+import { generateMcpTools } from "./mcp.js";
+import { initSchema } from "./schema.js";
+import { decodeCursor, timestampToMs } from "./cursor.js";
+import { traverseLinks } from "./links.js";
+import * as indexedFieldOps from "./indexed-fields.js";
+import { resolveLinkTarget } from "./wikilinks.js";
+import { generateUlid, ULID_REGEX } from "./ulid.js";
+import { getVaultMap, extractH1Title, findNotesByTitle, getNoteByTitle, validatePath, PathValidationError } from "./notes.js";
+import { transactionAsync } from "./txn.js";
+
+let store: SqliteStore;
+let db: Database;
+
+beforeEach(() => {
+  db = new Database(":memory:");
+  store = new SqliteStore(db);
+});
+
+// ---- Notes CRUD ----
+
+describe("notes", async () => {
+  it("creates a note", async () => {
+    const note = await store.createNote("Morning walk");
+    expect(note.content).toBe("Morning walk");
+    expect(note.id).toBeTruthy();
+    expect(note.createdAt).toBeTruthy();
+  });
+
+  it("creates a note with custom id", async () => {
+    const note = await store.createNote("Test", { id: "custom-id" });
+    expect(note.id).toBe("custom-id");
+  });
+
+  it("creates a note with path", async () => {
+    const note = await store.createNote("# Grocery List", { path: "Grocery List" });
+    expect(note.path).toBe("Grocery List");
+  });
+
+  it("creates a note with tags", async () => {
+    const note = await store.createNote("Voice memo", { tags: ["daily", "voice"] });
+    expect(note.tags).toContain("daily");
+    expect(note.tags).toContain("voice");
+  });
+
+  it("gets a note by id", async () => {
+    const created = await store.createNote("Test");
+    const found = await store.getNote(created.id);
+    expect(found).toBeTruthy();
+    expect(found!.id).toBe(created.id);
+    expect(found!.content).toBe("Test");
+  });
+
+  it("returns null for missing note", async () => {
+    expect(await store.getNote("nonexistent")).toBeNull();
+  });
+
+  it("updates note content", async () => {
+    const note = await store.createNote("Original");
+    const updated = await store.updateNote(note.id, { content: "Updated" });
+    expect(updated.content).toBe("Updated");
+    expect(updated.updatedAt).toBeTruthy();
+  });
+
+  it("rolls back the note row when wikilink re-indexing fails mid-update", async () => {
+    const source = await store.createNote("before", { path: "Source" });
+    await store.createNote("target", { path: "Target" });
+    db.exec(`
+      CREATE TRIGGER fail_link_insert
+      BEFORE INSERT ON links
+      BEGIN
+        SELECT RAISE(ABORT, 'forced mid-update failure');
+      END;
+    `);
+
+    await expect(
+      store.updateNote(source.id, { content: "after [[Target]]" }),
+    ).rejects.toThrow("forced mid-update failure");
+
+    const unchanged = await store.getNote(source.id);
+    expect(unchanged?.content).toBe("before");
+    expect(unchanged?.updatedAt).toBe(source.updatedAt);
+    expect(await store.getLinks(source.id)).toEqual([]);
+  });
+
+  it("does not dispatch update hooks for an outer batch that rolls back", async () => {
+    const first = await store.createNote("first");
+    const second = await store.createNote("second");
+    const fired: string[] = [];
+    store.hooks.onNote({
+      event: "updated",
+      handler: (note) => { fired.push(note.id); },
+    });
+
+    await expect(transactionAsync(db, async () => {
+      await store.updateNote(first.id, { content: "changed first" });
+      await store.updateNote(second.id, { content: "changed second" });
+      throw new Error("forced outer rollback");
+    })).rejects.toThrow("forced outer rollback");
+    // Let any incorrectly queued dispatches reach the registry before drain.
+    await Promise.resolve();
+    await Promise.resolve();
+    await store.hooks.drain();
+
+    expect(fired).toEqual([]);
+    expect((await store.getNote(first.id))?.content).toBe("first");
+    expect((await store.getNote(second.id))?.content).toBe("second");
+  });
+
+  it("updates note path", async () => {
+    const note = await store.createNote("Test");
+    const updated = await store.updateNote(note.id, { path: "Notes/Test" });
+    expect(updated.path).toBe("Notes/Test");
+  });
+
+  it("updates created_at", async () => {
+    const note = await store.createNote("Test");
+    const newDate = "2025-01-15T12:00:00.000Z";
+    const updated = await store.updateNote(note.id, { created_at: newDate });
+    expect(updated.createdAt).toBe(newDate);
+    expect(updated.content).toBe("Test"); // content unchanged
+    // updated_at is bumped to "now" by the update path. Can't strictly
+    // differ from note.updatedAt (same-ms collision possible) but must be
+    // monotonically non-decreasing from the prior value.
+    expect(updated.updatedAt).toBeTruthy();
+    expect(updated.updatedAt! >= note.updatedAt!).toBe(true);
+  });
+
+  it("updates metadata and created_at together", async () => {
+    const note = await store.createNote("Test");
+    const newDate = "2025-06-30T23:59:59.000Z";
+    const meta = { source: "import", version: 2 };
+    const updated = await store.updateNote(note.id, { metadata: meta, created_at: newDate });
+    expect(updated.createdAt).toBe(newDate);
+    expect(updated.metadata).toEqual(meta);
+    expect(updated.content).toBe("Test");
+  });
+
+  it("leaves created_at unchanged when not provided", async () => {
+    const note = await store.createNote("Test");
+    const updated = await store.updateNote(note.id, { content: "Updated" });
+    expect(updated.createdAt).toBe(note.createdAt);
+  });
+
+  it("sets updatedAt === createdAt on insert", async () => {
+    const note = await store.createNote("Fresh");
+    expect(note.updatedAt).toBe(note.createdAt);
+    const fetched = (await store.getNote(note.id))!;
+    expect(fetched.updatedAt).toBe(fetched.createdAt);
+  });
+
+  it("create-insert updatedAt respects an explicit created_at", async () => {
+    const note = await store.createNote("Imported", {
+      created_at: "2024-02-14T09:30:00.000Z",
+    });
+    expect(note.createdAt).toBe("2024-02-14T09:30:00.000Z");
+    expect(note.updatedAt).toBe("2024-02-14T09:30:00.000Z");
+  });
+
+  it("fresh note: if_updated_at with createdAt as the token succeeds", async () => {
+    // Regression guard: clients that pass `updatedAt ?? createdAt` as the
+    // OC token used to hit a CONFLICT on the very first edit because stored
+    // `updated_at` was NULL. Insert-time backfill removes that class of
+    // spurious conflict.
+    const note = await store.createNote("First");
+    const updated = await store.updateNote(note.id, {
+      content: "Second",
+      if_updated_at: note.createdAt,
+    });
+    expect(updated.content).toBe("Second");
+    expect(updated.updatedAt).toBeTruthy();
+    expect(updated.updatedAt).not.toBe(note.createdAt);
+  });
+
+  it("deletes a note", async () => {
+    const note = await store.createNote("Delete me");
+    await store.deleteNote(note.id);
+    expect(await store.getNote(note.id)).toBeNull();
+  });
+
+  it("cascade deletes tags and links", async () => {
+    await store.createNote("A", { id: "a", tags: ["daily"] });
+    await store.createNote("B", { id: "b" });
+    await store.createLink("a", "b", "mentions");
+
+    await store.deleteNote("a");
+    expect(await store.getLinks("b")).toHaveLength(0);
+  });
+
+  // ---- PathConflictError: typed 409 on duplicate path (#126) ----
+
+  it("createNote throws PathConflictError when path is taken (#126)", async () => {
+    await store.createNote("First", { path: "Inbox/note" });
+    let caught: any;
+    try {
+      await store.createNote("Second", { path: "Inbox/note" });
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeTruthy();
+    expect(caught.code).toBe("PATH_CONFLICT");
+    expect(caught.path).toBe("Inbox/note");
+  });
+
+  it("createNote on path collision does not insert the second note (#126)", async () => {
+    await store.createNote("First", { id: "a", path: "Inbox/note" });
+    try {
+      await store.createNote("Second", { id: "b", path: "Inbox/note" });
+    } catch {}
+    expect(await store.getNote("b")).toBeNull();
+  });
+
+  it("updateNote throws PathConflictError when renaming onto an existing path (#126)", async () => {
+    const a = await store.createNote("First", { path: "a" });
+    await store.createNote("Second", { path: "b" });
+    let caught: any;
+    try {
+      await store.updateNote(a.id, { path: "b", if_updated_at: a.createdAt });
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeTruthy();
+    expect(caught.code).toBe("PATH_CONFLICT");
+    expect(caught.path).toBe("b");
+  });
+
+  it("updateNote with no path collision still succeeds (#126 — no false positives)", async () => {
+    const a = await store.createNote("First", { path: "a" });
+    await store.createNote("Second", { path: "b" });
+    const updated = await store.updateNote(a.id, { path: "c", if_updated_at: a.createdAt });
+    expect(updated.path).toBe("c");
+  });
+
+  it("updateNote with no path field is unaffected by the path-conflict guard (#126)", async () => {
+    const a = await store.createNote("First", { path: "a" });
+    const updated = await store.updateNote(a.id, { content: "edited", if_updated_at: a.createdAt });
+    expect(updated.content).toBe("edited");
+    expect(updated.path).toBe("a");
+  });
+
+  // -------------------------------------------------------------------------
+  // Empty content is a valid state (vault#323)
+  // -------------------------------------------------------------------------
+  // Skeleton notes, drafts saved before content, organizing-only notes,
+  // capture-then-fill flows. The earlier #213 guard rejected `content +
+  // path both absent` — we no longer enforce it because real vaults
+  // legitimately carry such rows and the round-trip import has to accept
+  // them.
+
+  it("createNote accepts empty content with no path", async () => {
+    const n = await store.createNote("");
+    expect(n.content).toBe("");
+    expect(n.path).toBeUndefined();
+  });
+
+  it("createNote accepts whitespace-only content with no path", async () => {
+    const n = await store.createNote("   ");
+    expect(n.content).toBe("   ");
+  });
+
+  it("createNote empty-content note is queryable + survives round-trip", async () => {
+    const created = await store.createNote("", { metadata: { kind: "skeleton" } });
+    const fetched = await store.getNote(created.id);
+    expect(fetched).not.toBeNull();
+    expect(fetched!.content).toBe("");
+    expect(fetched!.metadata).toMatchObject({ kind: "skeleton" });
+  });
+
+  it("createNote accepts content-only (un-pathed jot)", async () => {
+    const n = await store.createNote("just a jot");
+    expect(n.content).toBe("just a jot");
+    expect(n.path).toBeUndefined();
+  });
+
+  it("createNote accepts path-only (wikilink placeholder / _schemas/* shape)", async () => {
+    const n = await store.createNote("", { path: "wiki/placeholder" });
+    expect(n.content).toBe("");
+    expect(n.path).toBe("wiki/placeholder");
+  });
+
+  it("updateNote allows clearing both content and path", async () => {
+    const n = await store.createNote("body", { path: "p" });
+    const updated = await store.updateNote(n.id, {
+      content: "",
+      path: "",
+      if_updated_at: n.createdAt,
+    });
+    expect(updated.content).toBe("");
+    expect(updated.path).toBeUndefined();
+  });
+
+  it("updateNote allows clearing content when path is already null", async () => {
+    const n = await store.createNote("body");
+    const updated = await store.updateNote(n.id, {
+      content: "",
+      if_updated_at: n.createdAt,
+    });
+    expect(updated.content).toBe("");
+  });
+
+  it("updateNote allows clearing content when path is set (or being set)", async () => {
+    const n = await store.createNote("body", { path: "p" });
+    const updated = await store.updateNote(n.id, { content: "", if_updated_at: n.createdAt });
+    expect(updated.content).toBe("");
+    expect(updated.path).toBe("p");
+  });
+
+  it("updateNote with metadata-only update against a (legacy) empty row passes", async () => {
+    // Tag/metadata-only updates don't touch content or path, so they don't
+    // trigger the new guard — important so any pre-existing empty rows
+    // (from before #213) can still be cleaned up via metadata operations.
+    const n = await store.createNote("seed", { path: "x" });
+    // Simulate a legacy row by directly clearing content via SQL (bypasses
+    // the guard); this mirrors what an old data row could look like.
+    db.prepare("UPDATE notes SET content = '', path = NULL WHERE id = ?").run(n.id);
+    const updated = await store.updateNote(n.id, {
+      metadata: { tag: "cleanup" },
+      if_updated_at: n.createdAt,
+    });
+    expect(updated.metadata).toMatchObject({ tag: "cleanup" });
+  });
+});
+
+// ---- Backfill migration: legacy rows with NULL updated_at ----
+
+describe("updated_at backfill on init", async () => {
+  it("backfills updated_at = created_at for pre-existing NULL rows", () => {
+    const raw = new Database(":memory:");
+    initSchema(raw); // create tables
+
+    // Simulate a legacy row (pre-fix insert path left updated_at NULL).
+    raw.prepare(
+      "INSERT INTO notes (id, content, created_at, updated_at) VALUES (?, ?, ?, ?)",
+    ).run("legacy", "old", "2024-01-01T00:00:00.000Z", null);
+    const before = raw.prepare("SELECT updated_at FROM notes WHERE id = ?").get("legacy") as {
+      updated_at: string | null;
+    };
+    expect(before.updated_at).toBeNull();
+
+    // Re-run init: migration should backfill without touching the row otherwise.
+    initSchema(raw);
+    const after = raw.prepare("SELECT created_at, updated_at FROM notes WHERE id = ?").get(
+      "legacy",
+    ) as { created_at: string; updated_at: string };
+    expect(after.updated_at).toBe(after.created_at);
+    expect(after.created_at).toBe("2024-01-01T00:00:00.000Z");
+  });
+
+  it("leaves rows whose updated_at is already set untouched", () => {
+    const raw = new Database(":memory:");
+    initSchema(raw);
+
+    raw.prepare(
+      "INSERT INTO notes (id, content, created_at, updated_at) VALUES (?, ?, ?, ?)",
+    ).run("edited", "content", "2024-01-01T00:00:00.000Z", "2024-06-15T12:00:00.000Z");
+
+    initSchema(raw); // migration is idempotent
+
+    const row = raw.prepare("SELECT created_at, updated_at FROM notes WHERE id = ?").get(
+      "edited",
+    ) as { created_at: string; updated_at: string };
+    expect(row.created_at).toBe("2024-01-01T00:00:00.000Z");
+    expect(row.updated_at).toBe("2024-06-15T12:00:00.000Z");
+  });
+
+  it("is a no-op for a fresh vault with zero notes", () => {
+    const raw = new Database(":memory:");
+    initSchema(raw);
+    initSchema(raw);
+    const count = raw.prepare("SELECT COUNT(*) as c FROM notes").get() as { c: number };
+    expect(count.c).toBe(0);
+  });
+});
+
+// ---- Extension (vault#328 Phase 1: DB + Store) ----
+//
+// Three pinned behaviors:
+//   1. Migrations and inserts default to "md" — every existing row keeps
+//      its meaning after the v17 → v18 ALTER TABLE.
+//   2. Explicit extension on createNote persists end-to-end.
+//   3. queryNotes filters by extension (single string + array shapes).
+
+describe("notes.extension (vault#328)", async () => {
+  it("defaults to 'md' when not specified on createNote", async () => {
+    const note = await store.createNote("hello world");
+    expect(note.extension).toBe("md");
+    const fetched = await store.getNote(note.id);
+    expect(fetched!.extension).toBe("md");
+  });
+
+  it("persists explicit extension on createNote", async () => {
+    const note = await store.createNote("month,income\n2026-01,12000", {
+      path: "Tabular/budget",
+      extension: "csv",
+    });
+    expect(note.extension).toBe("csv");
+    const fetched = await store.getNote(note.id);
+    expect(fetched!.extension).toBe("csv");
+  });
+
+  it("backfills 'md' on existing rows after v17 → v18 migration", () => {
+    // Build a v17-shape vault by hand: create the notes table WITHOUT the
+    // `extension` column, insert a row, then run initSchema and assert
+    // the migration backfills "md".
+    const raw = new Database(":memory:");
+    raw.exec(`
+      CREATE TABLE notes (
+        id TEXT PRIMARY KEY,
+        content TEXT DEFAULT '',
+        path TEXT,
+        metadata TEXT DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        updated_at TEXT
+      )
+    `);
+    raw.prepare(
+      "INSERT INTO notes (id, content, created_at, updated_at) VALUES (?, ?, ?, ?)",
+    ).run("legacy", "old content", "2024-01-01T00:00:00.000Z", "2024-01-01T00:00:00.000Z");
+
+    initSchema(raw); // applies v18 ALTER TABLE
+
+    const row = raw.prepare("SELECT extension FROM notes WHERE id = ?").get("legacy") as {
+      extension: string;
+    };
+    expect(row.extension).toBe("md");
+  });
+
+  it("updateNote changes extension on existing note", async () => {
+    const note = await store.createNote("hello", { path: "Foo" });
+    expect(note.extension).toBe("md");
+    const updated = await store.updateNote(note.id, { extension: "mdx" });
+    expect(updated.extension).toBe("mdx");
+    const fetched = await store.getNote(note.id);
+    expect(fetched!.extension).toBe("mdx");
+  });
+
+  it("queryNotes filters by extension (single string)", async () => {
+    await store.createNote("md note A", { path: "a", extension: "md" });
+    await store.createNote("csv note", { path: "b", extension: "csv" });
+    await store.createNote("md note B", { path: "c" }); // default md
+    const csv = await store.queryNotes({ extension: "csv" });
+    expect(csv).toHaveLength(1);
+    expect(csv[0]!.path).toBe("b");
+    const md = await store.queryNotes({ extension: "md" });
+    expect(md).toHaveLength(2);
+    expect(md.map((n) => n.path).sort()).toEqual(["a", "c"]);
+  });
+
+  it("queryNotes filters by extension (array — IN clause)", async () => {
+    await store.createNote("md note", { path: "a" });
+    await store.createNote("csv note", { path: "b", extension: "csv" });
+    await store.createNote("yaml note", { path: "c", extension: "yaml" });
+    await store.createNote("json note", { path: "d", extension: "json" });
+    const results = await store.queryNotes({ extension: ["csv", "yaml", "json"] });
+    expect(results).toHaveLength(3);
+    const paths = results.map((n) => n.path).sort();
+    expect(paths).toEqual(["b", "c", "d"]);
+  });
+
+  it("queryNotes extension filter is case-insensitive", async () => {
+    await store.createNote("csv note", { path: "b", extension: "csv" });
+    // Caller-supplied case shouldn't matter — stored as "csv", looked up as "CSV".
+    const results = await store.queryNotes({ extension: "CSV" });
+    expect(results).toHaveLength(1);
+  });
+
+  it("updateNote extension-only collision throws PathConflictError (vault#329 F1)", async () => {
+    // Two notes share `Foo` differing only by extension — legal under
+    // v18's composite (path, extension) uniqueness. Flip the md note's
+    // extension to "csv": that would collide with the existing csv
+    // row. The catch in updateNote must surface PATH_CONFLICT (not a
+    // raw SQLiteError) since the composite index fires UNIQUE on
+    // extension-only updates just like it does on path-only updates.
+    const md = await store.createNote("# md note", { path: "Foo", id: "foo-md" });
+    await store.createNote("a,b\n1,2", { path: "Foo", extension: "csv", id: "foo-csv" });
+    expect(
+      store.updateNote(md.id, { extension: "csv" }),
+    ).rejects.toMatchObject({ code: "PATH_CONFLICT", path: "Foo" });
+  });
+
+  it("getNoteByPath throws AmbiguousPathError when path matches multiple extensions (vault#330 S1)", async () => {
+    await store.createNote("# md", { path: "Foo", id: "foo-md" });
+    await store.createNote("a,b\n1,2", { path: "Foo", extension: "csv", id: "foo-csv" });
+    expect(store.getNoteByPath("Foo")).rejects.toMatchObject({
+      code: "AMBIGUOUS_PATH",
+      path: "Foo",
+    });
+  });
+
+  it("getNoteByPath returns the right note when extension is passed (vault#330 S1)", async () => {
+    await store.createNote("# md", { path: "Foo", id: "foo-md" });
+    await store.createNote("a,b\n1,2", { path: "Foo", extension: "csv", id: "foo-csv" });
+    const md = await store.getNoteByPath("Foo", "md");
+    const csv = await store.getNoteByPath("Foo", "csv");
+    expect(md!.id).toBe("foo-md");
+    expect(csv!.id).toBe("foo-csv");
+  });
+
+  it("getNoteByPath returns single match unchanged when no ambiguity (vault#330 S1 back-compat)", async () => {
+    await store.createNote("# only", { path: "Foo", id: "only" });
+    const note = await store.getNoteByPath("Foo");
+    expect(note!.id).toBe("only");
+  });
+
+  it("getNoteByPath returns null for unknown path (vault#330 S1 back-compat)", async () => {
+    const note = await store.getNoteByPath("DoesNotExist");
+    expect(note).toBeNull();
+  });
+});
+
+// ---- Title fallback (extractH1Title / findNotesByTitle / getNoteByTitle) ----
+
+describe("extractH1Title", () => {
+  it("extracts the first level-1 heading", () => {
+    expect(extractH1Title("# My Title\n\nBody text.")).toBe("My Title");
+  });
+
+  it("finds the H1 even when it isn't the first line", () => {
+    expect(extractH1Title("---\nid: x\n---\n\n# My Title\n\nBody.")).toBe("My Title");
+  });
+
+  it("trims surrounding whitespace", () => {
+    expect(extractH1Title("#   Spaced Out   \nBody.")).toBe("Spaced Out");
+  });
+
+  it("does not match a level-2+ heading", () => {
+    expect(extractH1Title("## Not H1\n\nBody.")).toBeNull();
+  });
+
+  it("returns null when there is no heading", () => {
+    expect(extractH1Title("Just a paragraph, no heading.")).toBeNull();
+  });
+
+  it("returns null when the heading marker has no space", () => {
+    expect(extractH1Title("#NoSpace\n\nBody.")).toBeNull();
+  });
+
+  it("returns null for a blank heading", () => {
+    expect(extractH1Title("#   \nBody.")).toBeNull();
+  });
+});
+
+describe("findNotesByTitle / getNoteByTitle", async () => {
+  it("finds a single note by its H1 title", async () => {
+    const note = await store.createNote("# Weekly Review\n\nBody.", { path: "Inbox/a1" });
+    const matches = findNotesByTitle(db, "Weekly Review");
+    expect(matches).toHaveLength(1);
+    expect(matches[0]!.id).toBe(note.id);
+
+    const found = getNoteByTitle(db, "Weekly Review");
+    expect(found?.id).toBe(note.id);
+  });
+
+  it("matches case-insensitively", async () => {
+    const note = await store.createNote("# Weekly Review\n\nBody.", { path: "Inbox/a2" });
+    expect(getNoteByTitle(db, "weekly review")?.id).toBe(note.id);
+  });
+
+  it("returns no match (not throw) when 2+ notes share a title — ambiguous", async () => {
+    await store.createNote("# Shared\n\nA.", { path: "Inbox/b1" });
+    await store.createNote("# Shared\n\nB.", { path: "Inbox/b2" });
+    expect(findNotesByTitle(db, "Shared")).toHaveLength(2);
+    expect(getNoteByTitle(db, "Shared")).toBeNull();
+  });
+
+  it("returns null for an unknown title", async () => {
+    expect(getNoteByTitle(db, "Nothing Like This")).toBeNull();
+  });
+});
+
+// ---- Tags ----
+
+describe("tags", async () => {
+  it("starts with no tags", async () => {
+    const tags = await store.listTags();
+    expect(tags).toHaveLength(0);
+  });
+
+  it("tags a note", async () => {
+    const note = await store.createNote("Test");
+    await store.tagNote(note.id, ["daily", "voice"]);
+    const found = await store.getNote(note.id);
+    expect(found!.tags).toContain("daily");
+    expect(found!.tags).toContain("voice");
+  });
+
+  it("untags a note", async () => {
+    const note = await store.createNote("Test", { tags: ["daily", "voice"] });
+    await store.untagNote(note.id, ["voice"]);
+    const found = await store.getNote(note.id);
+    expect(found!.tags).toContain("daily");
+    expect(found!.tags).not.toContain("voice");
+  });
+
+  it("creates tags automatically", async () => {
+    const note = await store.createNote("Test");
+    await store.tagNote(note.id, ["custom-tag"]);
+    const tags = await store.listTags();
+    expect(tags.some((t) => t.name === "custom-tag")).toBe(true);
+  });
+
+  it("counts tag usage", async () => {
+    await store.createNote("A", { tags: ["daily"] });
+    await store.createNote("B", { tags: ["daily"] });
+    await store.createNote("C", { tags: ["doc"] });
+
+    const tags = await store.listTags();
+    const daily = tags.find((t) => t.name === "daily");
+    expect(daily!.count).toBe(2);
+  });
+
+  it("tagging is idempotent", async () => {
+    const note = await store.createNote("Test", { tags: ["daily"] });
+    await store.tagNote(note.id, ["daily"]); // duplicate
+    const found = await store.getNote(note.id);
+    expect(found!.tags!.filter((t) => t === "daily")).toHaveLength(1);
+  });
+});
+
+// ---- Tag rename + merge ----
+
+describe("renameTag", async () => {
+  it("retags every note and drops the old tag", async () => {
+    const n1 = await store.createNote("A", { tags: ["voice"] });
+    const n2 = await store.createNote("B", { tags: ["voice", "keeper"] });
+
+    const result = await store.renameTag("voice", "memo");
+    expect(result).toMatchObject({ renamed: 2, sub_tags_renamed: 0 });
+
+    expect((await store.getNote(n1.id))!.tags).toEqual(["memo"]);
+    expect((await store.getNote(n2.id))!.tags?.sort()).toEqual(["keeper", "memo"]);
+    const tags = await store.listTags();
+    expect(tags.some((t) => t.name === "voice")).toBe(false);
+    expect(tags.find((t) => t.name === "memo")!.count).toBe(2);
+  });
+
+  it("carries the schema row onto the new tag name", async () => {
+    await store.createNote("A", { tags: ["voice"] });
+    await store.upsertTagSchema("voice", {
+      description: "Voice memos",
+      fields: { transcribed: { type: "boolean" } },
+    });
+
+    await store.renameTag("voice", "memo");
+
+    expect(await store.getTagSchema("voice")).toBeNull();
+    const schema = await store.getTagSchema("memo");
+    expect(schema?.description).toBe("Voice memos");
+    expect(schema?.fields?.transcribed.type).toBe("boolean");
+  });
+
+  it("renames an unused tag (zero notes)", async () => {
+    await store.createNote("A", { tags: ["doomed"] });
+    await store.untagNote((await store.queryNotes({}))[0].id, ["doomed"]);
+
+    const result = await store.renameTag("doomed", "archived");
+    expect(result).toMatchObject({ renamed: 0, sub_tags_renamed: 0 });
+    const tags = await store.listTags();
+    expect(tags.some((t) => t.name === "doomed")).toBe(false);
+    expect(tags.some((t) => t.name === "archived")).toBe(true);
+  });
+
+  it("returns target_exists without mutating when new_name already in use", async () => {
+    await store.createNote("A", { tags: ["old"] });
+    await store.createNote("B", { tags: ["new"] });
+
+    const result = await store.renameTag("old", "new");
+    expect(result).toMatchObject({ error: "target_exists", conflicting: ["new"] });
+
+    // No bleed — both tags still present with their original counts.
+    const tags = await store.listTags();
+    expect(tags.find((t) => t.name === "old")!.count).toBe(1);
+    expect(tags.find((t) => t.name === "new")!.count).toBe(1);
+  });
+
+  it("returns not_found when source tag does not exist", async () => {
+    const result = await store.renameTag("nope", "something");
+    expect(result).toEqual({ error: "not_found" });
+  });
+
+  it("same-name rename is a no-op on an existing tag", async () => {
+    await store.createNote("A", { tags: ["voice"] });
+    const result = await store.renameTag("voice", "voice");
+    expect(result).toMatchObject({ renamed: 0, sub_tags_renamed: 0 });
+    expect((await store.listTags()).find((t) => t.name === "voice")!.count).toBe(1);
+  });
+});
+
+// ---- Tag rename cascade (vault#240 + #247) ----
+
+describe("renameTag cascade (vault#240 + #247)", async () => {
+  it("1. rewrites note bodies with #tag references", async () => {
+    const note = await store.createNote(
+      "Today's #task is important. Also see #task/work and the #other tag.",
+      { tags: ["task"] },
+    );
+
+    const result = await store.renameTag("task", "todo");
+    expect(result).toMatchObject({ renamed: 1, notes_rewritten: 1 });
+
+    const fresh = await store.getNote(note.id);
+    expect(fresh!.content).toContain("#todo");
+    expect(fresh!.content).not.toContain("#task ");
+    expect(fresh!.content).toContain("#other"); // untouched
+  });
+
+  // vault#555 fix 2 — a rename cascade's inline content rewrite is a real
+  // persisted-state change; `updated_at` must move or a cursor/sync-poll
+  // loop never sees the rewritten note.
+  it("1b. content rewrite bumps updated_at (vault#555) AND updated_at_ms (vault#586)", async () => {
+    const note = await store.createNote("Today's #task is important.", { tags: ["task"] });
+    const before = note.updatedAt;
+    const msOf = (id: string) =>
+      (db.prepare("SELECT updated_at_ms FROM notes WHERE id = ?").get(id) as { updated_at_ms: number })
+        .updated_at_ms;
+    const beforeMs = msOf(note.id);
+    await new Promise((r) => setTimeout(r, 5));
+
+    await store.renameTag("task", "todo");
+
+    const fresh = await store.getNote(note.id);
+    expect(fresh!.content).toContain("#todo");
+    expect(fresh!.updatedAt).not.toBe(before);
+    expect(new Date(fresh!.updatedAt) > new Date(before)).toBe(true);
+    // vault#586: the integer keyset key must move in lockstep with updated_at —
+    // else a cursor sync-poll never surfaces the rewritten note. Pins the
+    // renameTag content-cascade ms hunk (a revert leaves ms stale → RED).
+    const afterMs = msOf(note.id);
+    expect(afterMs).toBeGreaterThan(beforeMs);
+    expect(afterMs).toBe(Date.parse(fresh!.updatedAt!));
+  });
+
+  it("2. cascades sub-tags recursively (task → todo, task/work → todo/work, task/work/client → todo/work/client)", async () => {
+    await store.createNote("a", { tags: ["task"] });
+    await store.createNote("b", { tags: ["task/work"] });
+    await store.createNote("c", { tags: ["task/work/client"] });
+
+    const result = await store.renameTag("task", "todo");
+    expect(result).toMatchObject({ renamed: 3, sub_tags_renamed: 2 });
+
+    const tags = (await store.listTags()).map((t) => t.name).sort();
+    expect(tags).toContain("todo");
+    expect(tags).toContain("todo/work");
+    expect(tags).toContain("todo/work/client");
+    expect(tags.some((t) => t.startsWith("task"))).toBe(false);
+  });
+
+  it("3. rewrites parent_names refs in OTHER tag rows (closes #247)", async () => {
+    await store.upsertTagRecord("task", { description: "tasks" });
+    await store.upsertTagRecord("voice", {
+      parent_names: ["manual", "task"],
+    });
+
+    const result = await store.renameTag("task", "todo");
+    expect(result).toMatchObject({ renamed: 0, parent_refs_updated: 1 });
+
+    const voice = await store.getTagRecord("voice");
+    expect(voice?.parent_names).toEqual(["manual", "todo"]);
+  });
+
+  it("4. rewrites tokens.scoped_tags JSON arrays", async () => {
+    await store.upsertTagRecord("task", {});
+    await store.upsertTagRecord("project", {});
+
+    const now = new Date().toISOString();
+    db.prepare(
+      `INSERT INTO tokens (token_hash, label, permission, scopes, scoped_tags, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run("h_one", "tok-1", "full", "vault:read", JSON.stringify(["task"]), now);
+    db.prepare(
+      `INSERT INTO tokens (token_hash, label, permission, scopes, scoped_tags, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run("h_two", "tok-2", "full", "vault:read", JSON.stringify(["project"]), now);
+
+    const result = await store.renameTag("task", "todo");
+    expect(result).toMatchObject({ tokens_updated: 1 });
+
+    const refreshed = db
+      .prepare("SELECT token_hash, scoped_tags FROM tokens ORDER BY token_hash")
+      .all() as { token_hash: string; scoped_tags: string }[];
+    expect(JSON.parse(refreshed[0]!.scoped_tags)).toEqual(["todo"]);
+    // Untouched.
+    expect(JSON.parse(refreshed[1]!.scoped_tags)).toEqual(["project"]);
+  });
+
+  it("5. rewrites #tag and [[_tags/...]] references in note bodies (incl. sub-tags)", async () => {
+    await store.upsertTagRecord("task/work", {});
+    await store.upsertTagRecord("task", {});
+    const a = await store.createNote(
+      "#task is important #task/work and a wikilink: [[_tags/task]]",
+      { tags: ["task"] },
+    );
+
+    const result = await store.renameTag("task", "todo");
+    expect(result.renamed).toBeGreaterThan(0);
+    if ("notes_rewritten" in result) expect(result.notes_rewritten).toBe(1);
+
+    const fresh = await store.getNote(a.id);
+    expect(fresh!.content).toContain("#todo is important");
+    expect(fresh!.content).toContain("#todo/work");
+    expect(fresh!.content).toContain("[[_tags/todo]]");
+    expect(fresh!.content).not.toContain("#task ");
+    expect(fresh!.content).not.toContain("[[_tags/task]");
+  });
+
+  it("6. pre-flight collision aborts without mutation when target exists", async () => {
+    await store.createNote("t", { tags: ["task"] });
+    await store.createNote("p", { tags: ["project"] });
+
+    const result = await store.renameTag("task", "project");
+    expect(result).toMatchObject({ error: "target_exists", conflicting: ["project"] });
+
+    // Both tags still present, untouched counts.
+    const tags = await store.listTags();
+    expect(tags.find((t) => t.name === "task")?.count).toBe(1);
+    expect(tags.find((t) => t.name === "project")?.count).toBe(1);
+  });
+
+  it("7. transactional rollback leaves the original state intact on mid-cascade failure", async () => {
+    await store.createNote("a", { tags: ["task"] });
+    await store.createNote("b", { tags: ["task/work"] });
+
+    // Inject failure: drop the tags table mid-transaction by intercepting
+    // the JSON cascade pass. Easiest reliable hook: corrupt the
+    // tokens.scoped_tags column with a value that will fail the JSON
+    // cascade's UPDATE (use a token_hash that violates a constraint when
+    // the cascade rewrites it). Simpler: spy on noteOps via monkey-patch.
+    //
+    // We use the simplest reliable approach: a row lock conflict. Two
+    // statements writing the same row in a deferred transaction would
+    // require two connections; instead we drop a required table at the
+    // SQL layer to force a SQL error on a downstream UPDATE inside the
+    // cascade. Restore after the test.
+    const originalDeleteTag = (db as any).prepare;
+    let dropOnce = false;
+    (db as any).prepare = function (sql: string) {
+      // Force the tag-row pass to fail on the DELETE step by dropping
+      // the tags table out from under it after the first INSERT.
+      if (!dropOnce && sql.startsWith("DELETE FROM tags WHERE name = ?")) {
+        dropOnce = true;
+        const stmt = originalDeleteTag.call(this, sql);
+        const wrapped = {
+          run: (...args: any[]) => {
+            (db as any).prepare = originalDeleteTag;
+            throw new Error("synthetic mid-cascade failure");
+          },
+        };
+        return wrapped;
+      }
+      return originalDeleteTag.call(this, sql);
+    };
+
+    let threw = false;
+    try {
+      await store.renameTag("task", "todo");
+    } catch {
+      threw = true;
+    }
+    (db as any).prepare = originalDeleteTag;
+    expect(threw).toBe(true);
+
+    // Original state intact: task tags still present, todo absent.
+    const tags = (await store.listTags()).map((t) => t.name);
+    expect(tags).toContain("task");
+    expect(tags).toContain("task/work");
+    expect(tags).not.toContain("todo");
+    expect(tags).not.toContain("todo/work");
+  });
+
+  it("8. invalidates hierarchy + schema caches after rename", async () => {
+    await store.upsertTagRecord("task", {
+      fields: { status: { type: "string" } },
+    });
+    await store.upsertTagRecord("task/work", { parent_names: ["task"] });
+    await store.createNote("a", { tags: ["task/work"] });
+
+    // Prime the caches by querying via the hierarchy-aware path.
+    await store.queryNotes({ tags: ["task"] });
+
+    await store.renameTag("task", "todo");
+
+    // queryNotes via the new tag must find the note that's now tagged
+    // todo/work (descendant of todo via parent_names rewrite).
+    const found = await store.queryNotes({ tags: ["todo"] });
+    expect(found.length).toBe(1);
+
+    // validateNoteAgainstSchemas must surface fields under the new tag —
+    // proves the schema-config cache was busted (otherwise the resolver
+    // would still be keyed on `task`).
+    const status = store.validateNoteAgainstSchemas({
+      tags: ["todo"],
+      metadata: { status: 123 },
+    });
+    expect(status?.warnings.some((w) => w.reason === "type_mismatch")).toBe(true);
+  });
+
+  it("9. self-rename is a structured no-op when the source exists", async () => {
+    await store.createNote("a", { tags: ["task"] });
+    const result = await store.renameTag("task", "task");
+    expect(result).toMatchObject({ renamed: 0, sub_tags_renamed: 0 });
+    expect((await store.listTags()).find((t) => t.name === "task")?.count).toBe(1);
+  });
+
+  it("10. preserves transitive inheritance through the cascade (manual extends note; voice extends manual; renaming manual → instruction keeps voice's effective fields)", async () => {
+    await store.upsertTagRecord("note", {
+      fields: { topic: { type: "string" } },
+    });
+    await store.upsertTagRecord("manual", {
+      fields: { author: { type: "string" } },
+      parent_names: ["note"],
+    });
+    await store.upsertTagRecord("voice", {
+      parent_names: ["manual"],
+    });
+
+    const result = await store.renameTag("manual", "instruction");
+    expect(result.renamed).toBe(0); // no notes
+    if ("parent_refs_updated" in result) expect(result.parent_refs_updated).toBe(1);
+
+    // Voice's parent_names now references `instruction` (the renamed parent).
+    const voice = await store.getTagRecord("voice");
+    expect(voice?.parent_names).toEqual(["instruction"]);
+
+    // Voice's effective fields still inherit through instruction → note.
+    const status = store.validateNoteAgainstSchemas({
+      tags: ["voice"],
+      metadata: { topic: 123, author: "ok" },
+    });
+    expect(status?.warnings.some((w) => w.field === "topic" && w.reason === "type_mismatch")).toBe(
+      true,
+    );
+  });
+
+  it("11. rewrites indexed_fields.declarer_tags JSON arrays (#275 fold N3)", async () => {
+    // Drive through the update-tag MCP tool — it owns indexed-field
+    // lifecycle (see mcp.ts §update-tag); store.upsertTagRecord does
+    // not populate the `indexed_fields` table.
+    const tools = generateMcpTools(store);
+    const updateTag = tools.find((t) => t.name === "update-tag")!;
+    await updateTag.execute({
+      tag: "task",
+      fields: { status: { type: "string", indexed: true } },
+    });
+    await updateTag.execute({
+      tag: "project",
+      fields: { status: { type: "string", indexed: true } },
+    });
+
+    const beforeRow = db
+      .prepare("SELECT declarer_tags FROM indexed_fields WHERE field = ?")
+      .get("status") as { declarer_tags: string };
+    expect(JSON.parse(beforeRow.declarer_tags).sort()).toEqual(["project", "task"]);
+
+    const result = await store.renameTag("task", "todo");
+    expect(result).toMatchObject({ indexed_field_declarers_updated: 1 });
+
+    const afterRow = db
+      .prepare("SELECT declarer_tags FROM indexed_fields WHERE field = ?")
+      .get("status") as { declarer_tags: string };
+    const declarers = JSON.parse(afterRow.declarer_tags) as string[];
+    expect(declarers).toContain("todo");
+    expect(declarers).toContain("project");
+    expect(declarers).not.toContain("task");
+  });
+
+  it("12. rewrites `_tags/<path>` config-note paths via rewriteTagConfigPath (#275 fold N3)", async () => {
+    await store.upsertTagRecord("old", {});
+    const root = await store.createNote("root config", { path: "_tags/old" });
+    const sub = await store.createNote("sub config", { path: "_tags/old/nested/leaf" });
+
+    const result = await store.renameTag("old", "new");
+    expect(result).toMatchObject({ paths_renamed: 2 });
+
+    const rootFresh = await store.getNote(root.id);
+    expect(rootFresh?.path).toBe("_tags/new");
+
+    const subFresh = await store.getNote(sub.id);
+    expect(subFresh?.path).toBe("_tags/new/nested/leaf");
+  });
+
+  it("14. sub-tag discovery escapes LIKE wildcards — `task_` rename doesn't pull `taskX/sub` into the cascade (#275 re-review)", async () => {
+    // Pre-fold: the discovery query was `LIKE 'task_/%'` which matches
+    // `taskX/sub` because `_` is a single-char wildcard. `taskX/sub`
+    // would then enter `renames` and get rewritten to `<new>/sub` — a
+    // write the caller never asked for.
+    await store.upsertTagRecord("task_", {});
+    await store.upsertTagRecord("taskX/sub", {});
+    const stray = await store.createNote("stray", { tags: ["taskX/sub"] });
+
+    const result = await store.renameTag("task_", "todo_");
+    // Only the actual root rename — no spurious sub-tag pulled in.
+    expect(result).toMatchObject({ sub_tags_renamed: 0 });
+
+    expect(await store.getTagRecord("task_")).toBeNull();
+    expect(await store.getTagRecord("todo_")).toBeTruthy();
+
+    // `taskX/sub` is untouched: row still present, the note tagged with
+    // it still carries the original tag.
+    expect(await store.getTagRecord("taskX/sub")).toBeTruthy();
+    expect((await store.getNote(stray.id))!.tags).toEqual(["taskX/sub"]);
+  });
+
+  it("13. LIKE wildcard escape — a tag literally named `task_` doesn't false-match `taskX` (#275 fold N1)", async () => {
+    // `task_` and `taskX` are unrelated tags. Pre-fold N1 the LIKE
+    // pre-filter would have considered `taskX` rows as candidates for
+    // `task_`'s rewrite (LIKE `%"task_"%` matches `"taskX"` in JSON
+    // because `_` is a single-char wildcard). The cascade's downstream
+    // remapJsonArray would have rejected the row, so no data
+    // corruption — but the wasted scan + bad hygiene is what fold N1
+    // closes. This test pins the behavior end-to-end.
+    await store.upsertTagRecord("task_", {});
+    await store.upsertTagRecord("taskX", {});
+    await store.upsertTagRecord("voice", {
+      parent_names: ["taskX"],
+    });
+
+    await store.renameTag("task_", "renamed_task");
+
+    // taskX-rooted parent_names must be untouched — the escape stops
+    // taskX from being a candidate for the `task_` rewrite.
+    const voice = await store.getTagRecord("voice");
+    expect(voice?.parent_names).toEqual(["taskX"]);
+    // Sanity: the actual rename did happen.
+    expect(await store.getTagRecord("task_")).toBeNull();
+    expect(await store.getTagRecord("renamed_task")).toBeTruthy();
+  });
+});
+
+describe("mergeTags", async () => {
+  it("retags every note from every source onto target and drops sources", async () => {
+    const n1 = await store.createNote("A", { tags: ["v1"] });
+    const n2 = await store.createNote("B", { tags: ["v2"] });
+    const n3 = await store.createNote("C", { tags: ["v1", "v2"] });
+
+    const result = await store.mergeTags(["v1", "v2"], "voice");
+    expect(result.target).toBe("voice");
+    expect(result.merged).toEqual({ v1: 2, v2: 2 });
+
+    expect((await store.getNote(n1.id))!.tags).toEqual(["voice"]);
+    expect((await store.getNote(n2.id))!.tags).toEqual(["voice"]);
+    expect((await store.getNote(n3.id))!.tags).toEqual(["voice"]);
+    const tags = await store.listTags();
+    expect(tags.some((t) => t.name === "v1")).toBe(false);
+    expect(tags.some((t) => t.name === "v2")).toBe(false);
+    expect(tags.find((t) => t.name === "voice")!.count).toBe(3);
+  });
+
+  it("creates target if it does not exist", async () => {
+    await store.createNote("A", { tags: ["old"] });
+    const result = await store.mergeTags(["old"], "brand-new");
+    expect(result).toEqual({ merged: { old: 1 }, target: "brand-new" });
+    expect((await store.listTags()).find((t) => t.name === "brand-new")!.count).toBe(1);
+  });
+
+  it("leaves target's schema intact; drops sources' schemas", async () => {
+    await store.createNote("A", { tags: ["v1"] });
+    await store.createNote("B", { tags: ["voice"] });
+    await store.upsertTagSchema("v1", { description: "legacy" });
+    await store.upsertTagSchema("voice", { description: "the keeper" });
+
+    await store.mergeTags(["v1"], "voice");
+
+    expect(await store.getTagSchema("v1")).toBeNull();
+    expect((await store.getTagSchema("voice"))!.description).toBe("the keeper");
+  });
+
+  it("dedups duplicate sources in the request", async () => {
+    await store.createNote("A", { tags: ["v1"] });
+    const result = await store.mergeTags(["v1", "v1"], "voice");
+    // A duplicated source counts once — not twice.
+    expect(result.merged).toEqual({ v1: 1 });
+  });
+
+  it("silently skips target when it appears in sources", async () => {
+    await store.createNote("A", { tags: ["v1", "voice"] });
+    const result = await store.mergeTags(["v1", "voice"], "voice");
+    // voice is target; it should drop out of sources, not be deleted.
+    expect(result.merged).toEqual({ v1: 1 });
+    expect((await store.listTags()).some((t) => t.name === "voice")).toBe(true);
+  });
+
+  it("records 0 for sources that do not exist", async () => {
+    await store.createNote("A", { tags: ["real"] });
+    const result = await store.mergeTags(["real", "ghost"], "voice");
+    expect(result.merged).toEqual({ real: 1, ghost: 0 });
+  });
+
+  it("is idempotent on notes that already have the target tag", async () => {
+    // Both source and target tags present on the same note. Merge must not
+    // blow up on the INSERT OR IGNORE into note_tags.
+    const note = await store.createNote("A", { tags: ["v1", "voice"] });
+    const result = await store.mergeTags(["v1"], "voice");
+    expect(result.merged).toEqual({ v1: 1 });
+    expect((await store.getNote(note.id))!.tags).toEqual(["voice"]);
+  });
+
+  it("bumps updated_at on notes whose tags actually changed (vault#567)", async () => {
+    const affected = await store.createNote("A", { tags: ["v1"] });
+    const both = await store.createNote("B", { tags: ["v1", "voice"] });
+    const untouched = await store.createNote("C", { tags: ["voice"] });
+    const unrelated = await store.createNote("D", { tags: ["other"] });
+    const affectedAt = affected.updatedAt;
+    const bothAt = both.updatedAt;
+    const untouchedAt = untouched.updatedAt;
+    const unrelatedAt = unrelated.updatedAt;
+
+    // Wall-clock ISO timestamps are millisecond-resolution; wait so the
+    // bump cannot collide with the create timestamp.
+    await Bun.sleep(5);
+    await store.mergeTags(["v1"], "voice");
+
+    const affectedAfter = (await store.getNote(affected.id))!;
+    const bothAfter = (await store.getNote(both.id))!;
+    const untouchedAfter = (await store.getNote(untouched.id))!;
+    const unrelatedAfter = (await store.getNote(unrelated.id))!;
+    expect(affectedAfter.updatedAt > affectedAt).toBe(true);
+    expect(bothAfter.updatedAt > bothAt).toBe(true);
+    expect(untouchedAfter.updatedAt).toBe(untouchedAt);
+    expect(unrelatedAfter.updatedAt).toBe(unrelatedAt);
+    expect(affectedAfter.tags).toEqual(["voice"]);
+    expect(bothAfter.tags).toEqual(["voice"]);
+  });
+});
+
+// ---- Vault Stats ----
+
+describe("vault stats", async () => {
+  it("handles empty vault gracefully", async () => {
+    const stats = await store.getVaultStats();
+    expect(stats.totalNotes).toBe(0);
+    expect(stats.earliestNote).toBeNull();
+    expect(stats.latestNote).toBeNull();
+    expect(stats.notesByMonth).toEqual([]);
+    expect(stats.topTags).toEqual([]);
+    expect(stats.tagCount).toBe(0);
+    expect(stats.linkCount).toBe(0);
+    expect(stats.contentBytes).toBe(0);
+  });
+
+  it("contentBytes sums ASCII content as raw byte length", async () => {
+    // "hello" = 5 bytes, "world!" = 6 bytes — for pure ASCII, bytes == chars.
+    await store.createNote("hello");
+    await store.createNote("world!");
+    const stats = await store.getVaultStats();
+    expect(stats.contentBytes).toBe(11);
+  });
+
+  it("contentBytes counts UTF-8 BYTES, not characters (multibyte)", async () => {
+    // The whole point of CAST(content AS BLOB): SQLite's bare LENGTH() would
+    // return the CHARACTER count, undercounting multibyte content.
+    //   - "é"  is U+00E9 → 2 bytes in UTF-8 (1 char)
+    //   - "你好" is 2 CJK chars → 6 bytes (3 bytes each)
+    //   - "😀" is 1 grapheme / 2 UTF-16 code units → 4 bytes in UTF-8
+    const content = "é你好😀";
+    const expectedBytes = Buffer.byteLength(content, "utf8"); // 2 + 6 + 4 = 12
+    expect(expectedBytes).toBe(12);
+    // And it's strictly MORE than the JS character count — proves we're not
+    // accidentally counting chars.
+    expect(expectedBytes).toBeGreaterThan([...content].length);
+
+    await store.createNote(content);
+    const stats = await store.getVaultStats();
+    expect(stats.contentBytes).toBe(expectedBytes);
+  });
+
+  it("counts total notes and tagCount", async () => {
+    await store.createNote("A", { tags: ["daily", "voice"] });
+    await store.createNote("B", { tags: ["daily"] });
+    await store.createNote("C");
+
+    const stats = await store.getVaultStats();
+    expect(stats.totalNotes).toBe(3);
+    expect(stats.tagCount).toBe(2); // "daily" and "voice"
+  });
+
+  it("reports earliest and latest notes correctly", async () => {
+    await store.createNote("oldest", { id: "n1", created_at: "2025-01-15T10:00:00.000Z" });
+    await store.createNote("middle", { id: "n2", created_at: "2025-06-20T10:00:00.000Z" });
+    await store.createNote("newest", { id: "n3", created_at: "2026-03-01T10:00:00.000Z" });
+
+    const stats = await store.getVaultStats();
+    expect(stats.earliestNote).toEqual({ id: "n1", createdAt: "2025-01-15T10:00:00.000Z" });
+    expect(stats.latestNote).toEqual({ id: "n3", createdAt: "2026-03-01T10:00:00.000Z" });
+  });
+
+  it("groups notes by month across all present months", async () => {
+    await store.createNote("a", { created_at: "2025-02-28T12:00:00.000Z" });
+    await store.createNote("b", { created_at: "2025-03-01T08:00:00.000Z" });
+    await store.createNote("c", { created_at: "2025-03-15T09:00:00.000Z" });
+    await store.createNote("d", { created_at: "2025-03-20T11:00:00.000Z" });
+    await store.createNote("e", { created_at: "2026-01-10T10:00:00.000Z" });
+
+    const stats = await store.getVaultStats();
+    expect(stats.notesByMonth).toEqual([
+      { month: "2025-02", count: 1 },
+      { month: "2025-03", count: 3 },
+      { month: "2026-01", count: 1 },
+    ]);
+  });
+
+  it("returns topTags ordered by count desc, capped", async () => {
+    // Create notes with varying tag frequencies
+    for (let i = 0; i < 5; i++) await store.createNote(`captured-${i}`, { tags: ["captured"] });
+    for (let i = 0; i < 3; i++) await store.createNote(`reader-${i}`, { tags: ["reader"] });
+    await store.createNote("one", { tags: ["rare"] });
+
+    const stats = await store.getVaultStats();
+    expect(stats.topTags[0]).toEqual({ tag: "captured", count: 5 });
+    expect(stats.topTags[1]).toEqual({ tag: "reader", count: 3 });
+    expect(stats.topTags[2]).toEqual({ tag: "rare", count: 1 });
+  });
+
+  it("caps topTags at the requested limit", async () => {
+    // 25 distinct tags, one per note
+    for (let i = 0; i < 25; i++) {
+      await store.createNote(`n-${i}`, { tags: [`tag-${String(i).padStart(2, "0")}`] });
+    }
+    const stats = await store.getVaultStats({ topTagsLimit: 20 });
+    expect(stats.topTags).toHaveLength(20);
+    expect(stats.tagCount).toBe(25);
+  });
+
+  it("response shape is complete", async () => {
+    await store.createNote("hello", { tags: ["a"] });
+    const stats = await store.getVaultStats();
+    expect(stats).toHaveProperty("totalNotes");
+    expect(stats).toHaveProperty("earliestNote");
+    expect(stats).toHaveProperty("latestNote");
+    expect(stats).toHaveProperty("notesByMonth");
+    expect(stats).toHaveProperty("topTags");
+    expect(stats).toHaveProperty("tagCount");
+    expect(stats).toHaveProperty("linkCount");
+    expect(stats).toHaveProperty("contentBytes");
+  });
+
+  it("counts resolved wikilinks in linkCount", async () => {
+    await store.createNote("Target A", { path: "alpha" });
+    await store.createNote("Target B", { path: "beta" });
+    await store.createNote("Refs both [[alpha]] and [[beta]]", { path: "hub" });
+    await store.createNote("Refs alpha only [[alpha]]", { path: "solo" });
+
+    const stats = await store.getVaultStats();
+    expect(stats.linkCount).toBe(3);
+  });
+
+  it("getVaultStats returns correct stats", async () => {
+    await store.createNote("one", { tags: ["x"], created_at: "2025-05-01T00:00:00.000Z" });
+    await store.createNote("two", { tags: ["x", "y"], created_at: "2025-06-01T00:00:00.000Z" });
+
+    const result = await store.getVaultStats();
+    expect(result.totalNotes).toBe(2);
+    expect(result.tagCount).toBe(2);
+    expect(result.attachmentCount).toBe(0);
+    expect(result.topTags[0].tag).toBe("x");
+    expect(result.topTags[0].count).toBe(2);
+    expect(result.notesByMonth).toHaveLength(2);
+    expect(result.earliestNote!.createdAt).toBe("2025-05-01T00:00:00.000Z");
+    expect(result.latestNote!.createdAt).toBe("2025-06-01T00:00:00.000Z");
+  });
+
+  it("getVaultStats counts attachments", async () => {
+    const n1 = await store.createNote("one");
+    const n2 = await store.createNote("two");
+    await store.addAttachment(n1.id, "/tmp/a1.mp3", "audio/mp3");
+    await store.addAttachment(n1.id, "/tmp/i1.png", "image/png");
+    await store.addAttachment(n2.id, "/tmp/a2.mp3", "audio/mp3");
+
+    const result = await store.getVaultStats();
+    expect(result.attachmentCount).toBe(3);
+  });
+});
+
+// ---- Vault Map (front-door structural orientation) ----
+
+describe("vault map", async () => {
+  it("handles an empty vault gracefully", async () => {
+    const map = getVaultMap(db);
+    expect(map.total_notes).toBe(0);
+    expect(map.tags).toEqual([]);
+    expect(map.path_buckets).toEqual([]);
+    expect(map.unfiled_notes).toBe(0);
+  });
+
+  it("counts total notes, tag membership, and top-level path buckets", async () => {
+    await store.createNote("a", { tags: ["person"], path: "People/Alice" });
+    await store.createNote("b", { tags: ["person"], path: "People/Bob" });
+    await store.createNote("c", { tags: ["project"], path: "Projects/Acme" });
+    await store.createNote("d", { tags: ["project", "person"] }); // no path
+
+    const map = getVaultMap(db);
+    expect(map.total_notes).toBe(4);
+
+    const tagByName = Object.fromEntries(map.tags.map((t) => [t.name, t.count]));
+    expect(tagByName.person).toBe(3);
+    expect(tagByName.project).toBe(2);
+
+    const bucketByName = Object.fromEntries(map.path_buckets.map((b) => [b.name, b.count]));
+    expect(bucketByName.People).toBe(2);
+    expect(bucketByName.Projects).toBe(1);
+
+    expect(map.unfiled_notes).toBe(1);
+    // Invariant: unfiled + every bucket's count == total_notes (a note has at
+    // most one path, so buckets + unfiled partition the vault exactly).
+    const bucketSum = map.path_buckets.reduce((sum, b) => sum + b.count, 0);
+    expect(bucketSum + map.unfiled_notes).toBe(map.total_notes);
+  });
+
+  it("buckets a top-level (no-slash) path under its own full name", async () => {
+    await store.createNote("solo", { path: "Welcome" });
+    const map = getVaultMap(db);
+    expect(map.path_buckets).toEqual([{ name: "Welcome", count: 1 }]);
+    expect(map.unfiled_notes).toBe(0);
+  });
+
+  it("tags are sorted by count desc, then name asc", async () => {
+    for (let i = 0; i < 3; i++) await store.createNote(`m-${i}`, { tags: ["popular"] });
+    await store.createNote("z", { tags: ["zzz-rare"] });
+    await store.createNote("a", { tags: ["aaa-rare"] });
+
+    const map = getVaultMap(db);
+    expect(map.tags).toEqual([
+      { name: "popular", count: 3 },
+      { name: "aaa-rare", count: 1 },
+      { name: "zzz-rare", count: 1 },
+    ]);
+  });
+
+  describe("tagFilter (scope-aware path)", () => {
+    it("omitting tagFilter computes the vault-wide map (unchanged default)", async () => {
+      await store.createNote("a", { tags: ["work"], path: "Work/One" });
+      await store.createNote("b", { tags: ["personal"], path: "Personal/Two" });
+
+      const map = getVaultMap(db);
+      expect(map.total_notes).toBe(2);
+      expect(map.tags.map((t) => t.name).sort()).toEqual(["personal", "work"]);
+      expect(map.path_buckets.map((b) => b.name).sort()).toEqual(["Personal", "Work"]);
+    });
+
+    it("an empty tagFilter array means nothing is in scope — all-zero map, NOT the full vault", async () => {
+      await store.createNote("a", { tags: ["work"], path: "Work/One" });
+
+      const map = getVaultMap(db, { tagFilter: [] });
+      expect(map).toEqual({ total_notes: 0, tags: [], path_buckets: [], unfiled_notes: 0 });
+    });
+
+    it("a non-empty tagFilter restricts every count to notes reachable through that tag set", async () => {
+      await store.createNote("a", { tags: ["work"], path: "Work/One" });
+      await store.createNote("b", { tags: ["work", "urgent"], path: "Work/Two" });
+      await store.createNote("c", { tags: ["personal"], path: "Personal/Three" });
+      await store.createNote("d", { tags: ["personal"] }); // no path
+
+      const map = getVaultMap(db, { tagFilter: ["work", "urgent"] });
+      expect(map.total_notes).toBe(2); // a, b — "personal" notes excluded
+      expect(map.tags).toEqual([
+        { name: "work", count: 2 },
+        { name: "urgent", count: 1 },
+      ]);
+      expect(map.path_buckets).toEqual([{ name: "Work", count: 2 }]);
+      expect(map.unfiled_notes).toBe(0);
+    });
+
+    it("a note carrying both an in-scope and out-of-scope tag is counted once, not double", async () => {
+      await store.createNote("a", { tags: ["work", "personal"], path: "Work/One" });
+
+      const map = getVaultMap(db, { tagFilter: ["work"] });
+      expect(map.total_notes).toBe(1);
+      expect(map.path_buckets).toEqual([{ name: "Work", count: 1 }]);
+      // "personal" is out of scope — must not leak into the tags list.
+      expect(map.tags.map((t) => t.name)).not.toContain("personal");
+    });
+
+    it("scoped unfiled_notes counts only in-scope path-less notes", async () => {
+      await store.createNote("a", { tags: ["work"] }); // no path, in scope
+      await store.createNote("b", { tags: ["personal"] }); // no path, out of scope
+
+      const map = getVaultMap(db, { tagFilter: ["work"] });
+      expect(map.unfiled_notes).toBe(1);
+      expect(map.total_notes).toBe(1);
+    });
+  });
+});
+
+// ---- Query ----
+
+describe("queryNotes", async () => {
+  it("queries by tag", async () => {
+    await store.createNote("Daily 1", { tags: ["daily"] });
+    await store.createNote("Doc 1", { tags: ["doc"] });
+
+    const results = await store.queryNotes({ tags: ["daily"] });
+    expect(results).toHaveLength(1);
+    expect(results[0].content).toBe("Daily 1");
+  });
+
+  it("queries by multiple tags (AND)", async () => {
+    await store.createNote("Voice daily", { tags: ["daily", "voice"] });
+    await store.createNote("Text daily", { tags: ["daily"] });
+
+    const results = await store.queryNotes({ tags: ["daily", "voice"] });
+    expect(results).toHaveLength(1);
+    expect(results[0].content).toBe("Voice daily");
+  });
+
+  it("queries by multiple tags (OR)", async () => {
+    await store.createNote("Voice daily", { tags: ["daily", "voice"] });
+    await store.createNote("Text daily", { tags: ["daily"] });
+    await store.createNote("A doc", { tags: ["doc"] });
+
+    const results = await store.queryNotes({ tags: ["voice", "doc"], tagMatch: "any" });
+    expect(results).toHaveLength(2);
+    const contents = results.map((n) => n.content).sort();
+    expect(contents).toEqual(["A doc", "Voice daily"]);
+  });
+
+  it("excludes tags", async () => {
+    await store.createNote("Active", { tags: ["digest"] });
+    await store.createNote("Archived", { tags: ["digest", "archived"] });
+
+    const results = await store.queryNotes({ tags: ["digest"], excludeTags: ["archived"] });
+    expect(results).toHaveLength(1);
+    expect(results[0].content).toBe("Active");
+  });
+
+  it("filters by date range", async () => {
+    await store.createNote("Test");
+    const results = await store.queryNotes({
+      dateFrom: new Date(Date.now() - 60000).toISOString(),
+      dateTo: new Date(Date.now() + 60000).toISOString(),
+    });
+    expect(results.length).toBeGreaterThan(0);
+  });
+
+  // ---- Generalized date_filter (vault#215) ----
+  //
+  // The legacy `dateFrom` / `dateTo` always filter on `n.created_at` (vault
+  // ingestion time). The new `dateFilter: { field, from, to }` shape lets a
+  // caller filter on any *content* date — an email's received date, a
+  // meeting's scheduled date — by pointing `field` at an indexed metadata
+  // field. `field` defaults to `created_at`, in which case the SQL is
+  // identical to the legacy path.
+  describe("dateFilter (generalized)", () => {
+    async function declareEmailDate() {
+      const { declareField } = await import("./indexed-fields.js");
+      declareField(db, "email_date", "TEXT", "email");
+    }
+
+    it("dateFilter with no field defaults to created_at (matches the legacy shorthand)", async () => {
+      await store.createNote("A", { created_at: "2026-01-15T00:00:00.000Z" });
+      await store.createNote("B", { created_at: "2026-02-15T00:00:00.000Z" });
+      await store.createNote("C", { created_at: "2026-03-15T00:00:00.000Z" });
+
+      const results = await store.queryNotes({
+        dateFilter: { from: "2026-02-01", to: "2026-03-01" },
+      });
+      expect(results.map((n) => n.content)).toEqual(["B"]);
+    });
+
+    it("dateFilter on an indexed metadata field filters on content date, not ingestion date", async () => {
+      await declareEmailDate();
+      // Ingestion order doesn't match email_date order — that's the whole
+      // point: the bug was that `dateFrom` returned rows by ingestion time.
+      await store.createNote("recently-synced old email", {
+        metadata: { email_date: "2025-12-01T00:00:00.000Z" },
+      });
+      await store.createNote("recently-synced new email", {
+        metadata: { email_date: "2026-04-25T00:00:00.000Z" },
+      });
+      await store.createNote("recently-synced ancient", {
+        metadata: { email_date: "2024-08-15T00:00:00.000Z" },
+      });
+
+      const results = await store.queryNotes({
+        dateFilter: { field: "email_date", from: "2026-04-01", to: "2026-05-01" },
+      });
+      expect(results.map((n) => n.content)).toEqual(["recently-synced new email"]);
+    });
+
+    it("dateFilter on a non-indexed field rejects with FIELD_NOT_INDEXED", async () => {
+      await store.createNote("X", { metadata: { meeting_date: "2026-04-25T00:00:00.000Z" } });
+      // Note: not declared via declareField, so the field has no generated
+      // column. The error mirrors the metadata-operator + order_by gate.
+      try {
+        await store.queryNotes({
+          dateFilter: { field: "meeting_date", from: "2026-04-01" },
+        });
+        throw new Error("expected QueryError");
+      } catch (err: any) {
+        expect(err.name).toBe("QueryError");
+        expect(err.code).toBe("FIELD_NOT_INDEXED");
+        expect(err.message).toContain("meeting_date");
+      }
+    });
+
+    it("dateFilter combined with top-level dateFrom rejects with INVALID_QUERY", async () => {
+      await declareEmailDate();
+      try {
+        await store.queryNotes({
+          dateFrom: "2026-01-01",
+          dateFilter: { field: "email_date", from: "2026-04-01" },
+        });
+        throw new Error("expected QueryError");
+      } catch (err: any) {
+        expect(err.name).toBe("QueryError");
+        expect(err.code).toBe("INVALID_QUERY");
+        expect(err.message).toMatch(/cannot combine/i);
+      }
+    });
+
+    it("dateFilter with only `from` is open-ended on the upper bound", async () => {
+      await declareEmailDate();
+      await store.createNote("old", { metadata: { email_date: "2025-01-01T00:00:00.000Z" } });
+      await store.createNote("middle", { metadata: { email_date: "2026-04-15T00:00:00.000Z" } });
+      await store.createNote("new", { metadata: { email_date: "2026-05-01T00:00:00.000Z" } });
+
+      const results = await store.queryNotes({
+        dateFilter: { field: "email_date", from: "2026-04-01" },
+      });
+      expect(results.map((n) => n.content).sort()).toEqual(["middle", "new"]);
+    });
+
+    it("dateFilter with explicit field='created_at' routes to the legacy SQL path", async () => {
+      // The implicit-default case is covered above; this asserts the explicit
+      // form behaves identically — no indexed-field gate, same n.created_at SQL.
+      await store.createNote("A", { created_at: "2026-01-15T00:00:00.000Z" });
+      await store.createNote("B", { created_at: "2026-02-15T00:00:00.000Z" });
+      await store.createNote("C", { created_at: "2026-03-15T00:00:00.000Z" });
+
+      const results = await store.queryNotes({
+        dateFilter: { field: "created_at", from: "2026-02-01", to: "2026-03-01" },
+      });
+      expect(results.map((n) => n.content)).toEqual(["B"]);
+    });
+
+    it("query-notes accepts date_filter on an indexed metadata field (vault#215)", async () => {
+      await declareEmailDate();
+      await store.createNote("old email", {
+        metadata: { email_date: "2025-12-01T00:00:00.000Z" },
+      });
+      await store.createNote("recent email", {
+        metadata: { email_date: "2026-04-25T00:00:00.000Z" },
+      });
+
+      const tools = generateMcpTools(store);
+      const query = tools.find((t) => t.name === "query-notes")!;
+      const results = await query.execute({
+        date_filter: { field: "email_date", from: "2026-04-01", to: "2026-05-01" },
+        include_content: true,
+      }) as any[];
+      expect(results.map((n) => n.content)).toEqual(["recent email"]);
+    });
+
+    // ---- `date` field type (vault#date-field-type) ----
+    //
+    // Same date_filter machinery as `email_date` above, but declared via a
+    // real tag schema (`type: "date", indexed: true`) rather than raw
+    // `declareField`, and mixing both accepted ISO forms (bare date + full
+    // RFC3339 timestamp) in one vault.
+    it("date_filter works on a schema-declared, indexed `date` field, accepting both ISO forms", async () => {
+      const tools = generateMcpTools(store);
+      // Indexed-field reconciliation (declareField → generated column + index)
+      // runs through the `update-tag` tool / `store.upsertTagRecord` — the
+      // legacy `store.upsertTagSchema` facade writes description+fields only
+      // and does NOT create the backing column. See store.ts's upsertTagRecord.
+      const updateTag = tools.find((t) => t.name === "update-tag")!;
+      await updateTag.execute({
+        tag: "meeting",
+        fields: { meeting_date: { type: "date", indexed: true } },
+      });
+      await store.createNote("too early", { tags: ["meeting"], metadata: { meeting_date: "2025-12-01" } });
+      await store.createNote("in window (date-only)", { tags: ["meeting"], metadata: { meeting_date: "2026-04-15" } });
+      await store.createNote("in window (full timestamp)", {
+        tags: ["meeting"],
+        metadata: { meeting_date: "2026-04-25T09:00:00.000Z" },
+      });
+      await store.createNote("too late", { tags: ["meeting"], metadata: { meeting_date: "2026-06-01" } });
+
+      const query = tools.find((t) => t.name === "query-notes")!;
+      const results = await query.execute({
+        date_filter: { field: "meeting_date", from: "2026-04-01", to: "2026-05-01" },
+        include_content: true,
+      }) as any[];
+      expect(results.map((n) => n.content).sort()).toEqual([
+        "in window (date-only)",
+        "in window (full timestamp)",
+      ]);
+    });
+
+    // ---- updated_at filter (vault#285 friction point 1.5) ----
+    //
+    // Incremental-rebuild flows ask "what changed since X." Like `created_at`,
+    // `updated_at` is a real column on `notes` (no indexed-field gate), but
+    // it tracks the *last write* rather than ingestion time. SSGs paginate
+    // against it; sync clients use it as a high-watermark cursor.
+    it("dateFilter on updated_at routes to the n.updated_at column (vault#285 1.5)", async () => {
+      // Two notes; only one is later modified. The filter should pick up the
+      // modification time, not the original creation time.
+      const a = await store.createNote("untouched", { created_at: "2026-01-15T00:00:00.000Z" });
+      const b = await store.createNote("modified-later", { created_at: "2026-01-20T00:00:00.000Z" });
+      // Mutate b to bump its updated_at into a window that excludes a.
+      await store.updateNote(b.id, { append: " edit" });
+
+      // Pin each note's updated_at deterministically so the assertion isn't
+      // racing real wall-clock writes from the test harness. Mirror
+      // production (vault#586): EVERY write maintains `updated_at_ms` in
+      // lockstep with `updated_at` — the vault#585 fix compares the ms
+      // mirror, not the TEXT column, so a raw pin that only touched the
+      // TEXT column would silently stop affecting this filter.
+      db.prepare("UPDATE notes SET updated_at = ?, updated_at_ms = ? WHERE id = ?")
+        .run("2026-01-15T00:00:00.000Z", Date.parse("2026-01-15T00:00:00.000Z"), a.id);
+      db.prepare("UPDATE notes SET updated_at = ?, updated_at_ms = ? WHERE id = ?")
+        .run("2026-04-25T00:00:00.000Z", Date.parse("2026-04-25T00:00:00.000Z"), b.id);
+
+      const results = await store.queryNotes({
+        dateFilter: { field: "updated_at", from: "2026-04-01" },
+      });
+      expect(results.map((n) => n.content)).toEqual(["modified-later edit"]);
+    });
+
+    it("dateFilter on updated_at requires no indexed-field declaration", async () => {
+      // `updated_at` is a recognized real column — must not hit the
+      // requireIndexedField gate that fires for arbitrary metadata fields.
+      await store.createNote("x");
+      // Should not throw.
+      const results = await store.queryNotes({
+        dateFilter: { field: "updated_at", from: "1970-01-01" },
+      });
+      expect(Array.isArray(results)).toBe(true);
+    });
+
+    it("dateFilter on updated_at honors the upper-bound exclusive `to`", async () => {
+      const a = await store.createNote("inside-window");
+      const b = await store.createNote("after-window");
+      db.prepare("UPDATE notes SET updated_at = ?, updated_at_ms = ? WHERE id = ?")
+        .run("2026-04-25T00:00:00.000Z", Date.parse("2026-04-25T00:00:00.000Z"), a.id);
+      db.prepare("UPDATE notes SET updated_at = ?, updated_at_ms = ? WHERE id = ?")
+        .run("2026-05-15T00:00:00.000Z", Date.parse("2026-05-15T00:00:00.000Z"), b.id);
+
+      const results = await store.queryNotes({
+        dateFilter: { field: "updated_at", from: "2026-04-01", to: "2026-05-01" },
+      });
+      expect(results.map((n) => n.content)).toEqual(["inside-window"]);
+    });
+
+    // ---- vault#585: date_filter on updated_at compares the ms mirror ----
+    //
+    // Simulates a post-vault#586-migration vault: `updated_at_ms` is
+    // correctly backfilled from the non-canonical stored `updated_at` TEXT
+    // via `timestampToMs` (exactly what `migrateToV26` does on import), but
+    // the TEXT column itself stays non-canonical — import stores frontmatter
+    // timestamps VERBATIM. Before vault#585, `date_filter` on `updated_at`
+    // still compared the RAW TEXT column lexicographically — wrong on these
+    // non-canonical forms even though the correct ms value already sat in
+    // `updated_at_ms`.
+    function pinNonCanonicalUpdatedAt(id: string, rawTimestamp: string) {
+      const ms = timestampToMs(rawTimestamp);
+      if (ms === null) throw new Error(`test fixture bug: unparseable timestamp ${rawTimestamp}`);
+      db.prepare("UPDATE notes SET updated_at = ?, updated_at_ms = ? WHERE id = ?")
+        .run(rawTimestamp, ms, id);
+    }
+
+    it("dateFilter `from` on updated_at is correct against a space-form non-canonical timestamp (vault#585)", async () => {
+      // "2024-11-02 14:30:00" (space separator, no zone) is UTC-correct
+      // 14:30 on Nov 2 per timestampToMs — 4.5 hours AFTER the 10:00 bound,
+      // so it MUST be included. Lexicographic TEXT comparison disagrees:
+      // the space (0x20) sorts BEFORE 'T' (0x54), so the space-form string
+      // compares as LESS than the canonical `T`-separated bound on the same
+      // calendar day — the old TEXT-compare code wrongly EXCLUDED it.
+      const included = await store.createNote("space-form, after bound");
+      pinNonCanonicalUpdatedAt(included.id, "2024-11-02 14:30:00");
+      const excluded = await store.createNote("canonical, before bound");
+      pinNonCanonicalUpdatedAt(excluded.id, "2024-11-01T00:00:00.000Z");
+
+      const results = await store.queryNotes({
+        dateFilter: { field: "updated_at", from: "2024-11-02T10:00:00.000Z" },
+      });
+      expect(results.map((n) => n.content)).toEqual(["space-form, after bound"]);
+    });
+
+    it("dateFilter `to` on updated_at is correct against an offset non-canonical timestamp (vault#585)", async () => {
+      // "2024-11-02T21:00:00+13:00" is UTC-correct 08:00 on Nov 2 per
+      // timestampToMs (21:00 minus the 13-hour offset) — BEFORE the 10:00
+      // bound, so it MUST be included (`to` is the exclusive-upper `<`).
+      // Lexicographic TEXT comparison disagrees: the wall-clock hour "21"
+      // sorts AFTER the bound's "10" as a plain string, so the old
+      // TEXT-compare code wrongly EXCLUDED it.
+      const included = await store.createNote("offset, actually before bound");
+      pinNonCanonicalUpdatedAt(included.id, "2024-11-02T21:00:00+13:00");
+      const excluded = await store.createNote("canonical, after bound");
+      pinNonCanonicalUpdatedAt(excluded.id, "2024-11-02T15:00:00.000Z");
+
+      const results = await store.queryNotes({
+        dateFilter: { field: "updated_at", to: "2024-11-02T10:00:00.000Z" },
+      });
+      expect(results.map((n) => n.content)).toEqual(["offset, actually before bound"]);
+    });
+  });
+
+  it("sorts ascending and descending", async () => {
+    await store.createNote("First", { id: "first" });
+    await store.createNote("Second", { id: "second" });
+
+    const asc = await store.queryNotes({ sort: "asc" });
+    expect(asc[0].content).toBe("First");
+
+    const desc = await store.queryNotes({ sort: "desc" });
+    expect(desc[0].content).toBe("Second");
+  });
+
+  // ---- Cursor pagination (vault#313) ----
+  //
+  // Opaque cursors for "since last checked" agent loops. The cursor binds
+  // to the query's filters via sha256 of the result-set-affecting params;
+  // a mismatched cursor raises CursorError. Pagination is keyset on
+  // (updated_at, id) so two notes sharing a millisecond don't get skipped
+  // or doubled across the page boundary.
+  describe("cursor pagination", () => {
+    // Helper: pin a note's updated_at to a known value so cursor math
+    // doesn't race wall-clock writes from the test harness.
+    function pinUpdatedAt(id: string, iso: string) {
+      // Mirror production: EVERY write maintains updated_at_ms in lockstep with
+      // updated_at (vault#586 — the integer column is the keyset-ordering
+      // authority). A helper that pinned only the string would leave a stale ms
+      // and mis-order the cursor. The pinned values here are canonical `...Z`,
+      // so `Date.parse` is exact.
+      db.prepare("UPDATE notes SET updated_at = ?, updated_at_ms = ? WHERE id = ?").run(
+        iso,
+        Date.parse(iso),
+        id,
+      );
+    }
+
+    it("first call returns notes + a next_cursor string", async () => {
+      await store.createNote("A", { id: "na" });
+      await store.createNote("B", { id: "nb" });
+      const page = await store.queryNotesPaged({ tags: [], limit: 50 });
+      expect(page.notes.length).toBe(2);
+      expect(typeof page.next_cursor).toBe("string");
+      expect(page.next_cursor.length).toBeGreaterThan(0);
+    });
+
+    it("subsequent call with cursor returns only newer notes", async () => {
+      const a = await store.createNote("first", { id: "p1" });
+      pinUpdatedAt(a.id, "2026-04-01T00:00:00.000Z");
+      const b = await store.createNote("second", { id: "p2" });
+      pinUpdatedAt(b.id, "2026-04-02T00:00:00.000Z");
+
+      const page1 = await store.queryNotesPaged({});
+      // Both notes returned, cursor advances to "second"'s watermark.
+      expect(page1.notes.map((n) => n.id).sort()).toEqual(["p1", "p2"]);
+
+      // No new writes yet — second call should be empty.
+      const page2 = await store.queryNotesPaged({ cursor: page1.next_cursor });
+      expect(page2.notes).toHaveLength(0);
+
+      // Now write a new note; third call should return only it.
+      const c = await store.createNote("third", { id: "p3" });
+      pinUpdatedAt(c.id, "2026-04-03T00:00:00.000Z");
+      const page3 = await store.queryNotesPaged({ cursor: page2.next_cursor });
+      expect(page3.notes.map((n) => n.id)).toEqual(["p3"]);
+    });
+
+    it("next_cursor is always returned, even on an empty result page", async () => {
+      // No notes at all — first call returns empty array but still a cursor.
+      const page = await store.queryNotesPaged({});
+      expect(page.notes).toHaveLength(0);
+      expect(typeof page.next_cursor).toBe("string");
+      expect(page.next_cursor.length).toBeGreaterThan(0);
+
+      // Decode it: empty-page sentinel watermark is millis 0 + empty id.
+      const decoded = decodeCursor(page.next_cursor);
+      expect(decoded.last_updated_at).toBe(0);
+      expect(decoded.last_id).toBe("");
+    });
+
+    it("cursor with stale query_hash raises CursorError (cursor_query_mismatch)", async () => {
+      await store.createNote("a", { tags: ["x"], id: "qm1" });
+      await store.createNote("b", { tags: ["y"], id: "qm2" });
+
+      const page1 = await store.queryNotesPaged({ tags: ["x"] });
+      expect(page1.notes.map((n) => n.id)).toEqual(["qm1"]);
+
+      // Reuse the cursor with a different query — must reject loudly.
+      try {
+        await store.queryNotesPaged({ tags: ["y"], cursor: page1.next_cursor });
+        throw new Error("expected CursorError");
+      } catch (err: any) {
+        expect(err.name).toBe("CursorError");
+        expect(err.code).toBe("cursor_query_mismatch");
+      }
+    });
+
+    it("cursor with malformed payload raises CursorError (cursor_invalid)", async () => {
+      try {
+        await store.queryNotesPaged({ cursor: "not-a-real-cursor-!!!" });
+        throw new Error("expected CursorError");
+      } catch (err: any) {
+        expect(err.name).toBe("CursorError");
+        expect(err.code).toBe("cursor_invalid");
+      }
+    });
+
+    it("tiebreaker: two notes at the same updated_at use id as the secondary sort key", async () => {
+      const ts = "2026-04-15T00:00:00.000Z";
+      const a = await store.createNote("alpha", { id: "tb-a" });
+      const b = await store.createNote("beta", { id: "tb-b" });
+      const c = await store.createNote("gamma", { id: "tb-c" });
+      pinUpdatedAt(a.id, ts);
+      pinUpdatedAt(b.id, ts);
+      pinUpdatedAt(c.id, ts);
+
+      // Page 1 with limit=2: should return a + b (id-ascending tiebreaker).
+      const page1 = await store.queryNotesPaged({ limit: 2 });
+      expect(page1.notes.map((n) => n.id)).toEqual(["tb-a", "tb-b"]);
+
+      // Page 2 with the cursor: should return c (id > "tb-b" at same ms).
+      // Note: c is queried with the same query_hash since limit is
+      // excluded from the hash inputs by design.
+      const page2 = await store.queryNotesPaged({ limit: 2, cursor: page1.next_cursor });
+      expect(page2.notes.map((n) => n.id)).toEqual(["tb-c"]);
+    });
+
+    it("cursor advances correctly when notes share a millisecond on the page boundary", async () => {
+      // Two notes share the exact updated_at the cursor was minted at.
+      // The keyset predicate must include the larger-id one but NOT
+      // duplicate the cursor's own note.
+      const ts = "2026-04-15T12:34:56.789Z";
+      const a = await store.createNote("first-at-ts", { id: "ms-a" });
+      pinUpdatedAt(a.id, ts);
+
+      const page1 = await store.queryNotesPaged({ limit: 50 });
+      expect(page1.notes.map((n) => n.id)).toEqual(["ms-a"]);
+
+      // Now write a note that lands at the EXACT same updated_at (race
+      // window between pages). Its id sorts AFTER "ms-a".
+      const b = await store.createNote("second-at-same-ts", { id: "ms-b" });
+      pinUpdatedAt(b.id, ts);
+
+      const page2 = await store.queryNotesPaged({ cursor: page1.next_cursor });
+      // Must NOT include "ms-a" (we already saw it), MUST include "ms-b"
+      // (its id sorts after the cursor's last_id at the same timestamp).
+      expect(page2.notes.map((n) => n.id)).toEqual(["ms-b"]);
+    });
+
+    it("cursor invariance across reboots: a serialized cursor still resumes correctly", async () => {
+      // Cursors are self-contained — they don't reference any server-side
+      // state. Simulate a reboot by tearing down the DB+store and replaying
+      // the same data; the cursor minted on instance #1 must work against
+      // instance #2 with the same query.
+      const a1 = await store.createNote("note-1", { id: "reboot-1", path: "n1" });
+      pinUpdatedAt(a1.id, "2026-04-01T00:00:00.000Z");
+      const a2 = await store.createNote("note-2", { id: "reboot-2", path: "n2" });
+      pinUpdatedAt(a2.id, "2026-04-02T00:00:00.000Z");
+
+      const page1 = await store.queryNotesPaged({ limit: 1 });
+      expect(page1.notes.map((n) => n.id)).toEqual(["reboot-1"]);
+      const cursor = page1.next_cursor;
+
+      // Simulate a process restart with a fresh DB seeded the same way.
+      db.close();
+      db = new Database(":memory:");
+      store = new SqliteStore(db);
+      const a1b = await store.createNote("note-1", { id: "reboot-1", path: "n1" });
+      pinUpdatedAt(a1b.id, "2026-04-01T00:00:00.000Z");
+      const a2b = await store.createNote("note-2", { id: "reboot-2", path: "n2" });
+      pinUpdatedAt(a2b.id, "2026-04-02T00:00:00.000Z");
+
+      // The cursor is opaque-but-portable: encodes only millis + id + hash,
+      // none of which depend on server-side session state.
+      const page2 = await store.queryNotesPaged({ limit: 1, cursor });
+      expect(page2.notes.map((n) => n.id)).toEqual(["reboot-2"]);
+    });
+
+    it("cursor mode rejects sort: desc (descending iteration would skip new writes)", async () => {
+      await store.createNote("a");
+      const page = await store.queryNotesPaged({});
+      try {
+        await store.queryNotesPaged({ cursor: page.next_cursor, sort: "desc" });
+        throw new Error("expected QueryError");
+      } catch (err: any) {
+        expect(err.name).toBe("QueryError");
+        expect(err.code).toBe("INVALID_QUERY");
+        expect(err.message.toLowerCase()).toContain("ascending");
+      }
+    });
+
+    it("cursor mode rejects orderBy (mutually exclusive with updated_at keyset)", async () => {
+      const { declareField } = await import("./indexed-fields.js");
+      declareField(db, "priority", "INTEGER", "task");
+      await store.createNote("a", { metadata: { priority: 1 } });
+      const page = await store.queryNotesPaged({});
+      try {
+        await store.queryNotesPaged({ cursor: page.next_cursor, orderBy: "priority" });
+        throw new Error("expected QueryError");
+      } catch (err: any) {
+        expect(err.name).toBe("QueryError");
+        expect(err.code).toBe("INVALID_QUERY");
+        expect(err.message.toLowerCase()).toContain("order_by");
+      }
+    });
+
+    it("cursor + tag filter: only notes matching the filter advance the watermark", async () => {
+      // Cursor pagination composes with the rest of the query — the
+      // watermark tracks the last note that matched the filter, not the
+      // last note in the vault.
+      const a = await store.createNote("task-1", { tags: ["task"], id: "ct-1" });
+      pinUpdatedAt(a.id, "2026-04-01T00:00:00.000Z");
+      const b = await store.createNote("not-a-task", { tags: ["other"], id: "ct-2" });
+      pinUpdatedAt(b.id, "2026-04-02T00:00:00.000Z");
+      const c = await store.createNote("task-2", { tags: ["task"], id: "ct-3" });
+      pinUpdatedAt(c.id, "2026-04-03T00:00:00.000Z");
+
+      const page1 = await store.queryNotesPaged({ tags: ["task"] });
+      expect(page1.notes.map((n) => n.id).sort()).toEqual(["ct-1", "ct-3"]);
+
+      const page2 = await store.queryNotesPaged({
+        tags: ["task"],
+        cursor: page1.next_cursor,
+      });
+      expect(page2.notes).toHaveLength(0);
+    });
+
+    it("query_hash is stable across key-order permutations of the same query", async () => {
+      // Two semantically-equivalent queries differing only in JS object key
+      // order must produce the same cursor binding — otherwise an SDK that
+      // reshuffles parameters between calls would silently invalidate the
+      // cursor.
+      const { computeQueryHash } = await import("./cursor.js");
+      const h1 = computeQueryHash({
+        tags: ["a", "b"],
+        path: "Projects",
+        metadata: { status: "open" },
+      });
+      const h2 = computeQueryHash({
+        metadata: { status: "open" },
+        path: "Projects",
+        tags: ["a", "b"],
+      });
+      expect(h1).toBe(h2);
+
+      // ...and tag-array order is irrelevant (different SDKs may sort).
+      const h3 = computeQueryHash({
+        tags: ["b", "a"],
+        path: "Projects",
+        metadata: { status: "open" },
+      });
+      expect(h3).toBe(h1);
+    });
+
+    it("MCP query-notes: cursor mode returns {notes, next_cursor} envelope", async () => {
+      await store.createNote("a", { id: "mcp-a" });
+      await store.createNote("b", { id: "mcp-b" });
+
+      const tools = generateMcpTools(store);
+      const query = tools.find((t) => t.name === "query-notes")!;
+
+      // First call without cursor returns flat array (legacy shape).
+      const firstResult = await query.execute({}) as unknown;
+      expect(Array.isArray(firstResult)).toBe(true);
+
+      // Get a cursor by minting one ourselves via the store.
+      const seed = await store.queryNotesPaged({});
+
+      // Second call with cursor returns the wrapped envelope.
+      const envelope = await query.execute({ cursor: seed.next_cursor }) as any;
+      expect(envelope).toHaveProperty("notes");
+      expect(envelope).toHaveProperty("next_cursor");
+      expect(Array.isArray(envelope.notes)).toBe(true);
+      // No new writes since seed → empty page, cursor still advances.
+      expect(envelope.notes).toHaveLength(0);
+      expect(typeof envelope.next_cursor).toBe("string");
+    });
+  });
+
+  describe("ULID ids for new notes (existing IDs unchanged)", () => {
+    function pinUpdatedAt(id: string, iso: string) {
+      // Keep updated_at_ms in lockstep — see the sibling helper's note (vault#586).
+      db.prepare("UPDATE notes SET updated_at = ?, updated_at_ms = ? WHERE id = ?").run(
+        iso,
+        Date.parse(iso),
+        id,
+      );
+    }
+
+    it("new notes get ULID-format ids (26-char Crockford base32)", async () => {
+      const note = await store.createNote("fresh note");
+      expect(note.id).toHaveLength(26);
+      expect(note.id).toMatch(ULID_REGEX);
+    });
+
+    it("generateUlid() output matches the ULID format directly", () => {
+      const id = generateUlid();
+      expect(id).toHaveLength(26);
+      expect(id).toMatch(ULID_REGEX);
+    });
+
+    it("ULIDs minted in the same millisecond are monotonically increasing", () => {
+      const ids = Array.from({ length: 200 }, () => generateUlid());
+      // No duplicates, and strictly increasing under plain string compare —
+      // this is the monotonic-within-a-ms guarantee, not just uniqueness.
+      const unique = new Set(ids);
+      expect(unique.size).toBe(ids.length);
+      for (let i = 1; i < ids.length; i++) {
+        expect(ids[i]! > ids[i - 1]!).toBe(true);
+      }
+    });
+
+    it("an explicitly-supplied old-format id still round-trips (create/read/link/resolve)", async () => {
+      const oldId = "2020-01-01-00-00-00-000001";
+
+      // create — old-format id passed explicitly via opts.id.
+      const oldNote = await store.createNote("legacy note", { id: oldId, path: "legacy-note" });
+      expect(oldNote.id).toBe(oldId);
+
+      // read — by id and by path.
+      const byId = await store.getNote(oldId);
+      expect(byId?.id).toBe(oldId);
+      expect(byId?.content).toBe("legacy note");
+      const byPath = await store.getNoteByPath("legacy-note");
+      expect(byPath?.id).toBe(oldId);
+
+      // link — a brand-new (ULID) note links to the old-format note, and
+      // vice versa; both directions traverse the graph correctly.
+      const newNote = await store.createNote("modern note");
+      expect(newNote.id).toMatch(ULID_REGEX);
+      await store.createLink(newNote.id, oldId, "references");
+      await store.createLink(oldId, newNote.id, "referenced-by");
+
+      const outbound = await store.getLinks(newNote.id, { direction: "outbound" });
+      expect(outbound.some((l) => l.targetId === oldId)).toBe(true);
+      const inbound = await store.getLinks(newNote.id, { direction: "inbound" });
+      expect(inbound.some((l) => l.sourceId === oldId)).toBe(true);
+
+      // resolve — resolveLinkTarget's id-then-path-then-title chain works
+      // identically for an old-format id as it does for a ULID.
+      expect(resolveLinkTarget(db, oldId)).toBe(oldId);
+      expect(resolveLinkTarget(db, "legacy-note")).toBe(oldId);
+      expect(resolveLinkTarget(db, newNote.id)).toBe(newNote.id);
+    });
+
+    it("mixed-format cursor pagination is stable under a shared updated_at (no miss/dupe)", async () => {
+      const ts = "2026-05-01T00:00:00.000Z";
+      const ids: string[] = [];
+
+      // Two "old" notes with explicit timestamp-format ids...
+      for (const oldId of ["2020-01-01-00-00-00-000001", "2020-06-15-12-30-00-500000"]) {
+        const n = await store.createNote(`old ${oldId}`, { id: oldId });
+        pinUpdatedAt(n.id, ts);
+        ids.push(n.id);
+      }
+      // ...and three "new" notes with auto-generated ULIDs, all sharing the
+      // exact same updated_at — id is the ONLY thing that can order them.
+      for (let i = 0; i < 3; i++) {
+        const n = await store.createNote(`new ${i}`);
+        expect(n.id).toMatch(ULID_REGEX);
+        pinUpdatedAt(n.id, ts);
+        ids.push(n.id);
+      }
+
+      // The expected stable total order is plain string comparison over the
+      // id column — same rule the SQL keyset ORDER BY uses (BINARY/ASCII
+      // collation), which holds regardless of id format.
+      const expectedOrder = [...ids].sort();
+
+      // Paginate with a small limit to force several pages across the
+      // format boundary and confirm no note is skipped or repeated.
+      //
+      // The first call MUST pass `cursor: ""` (the documented bootstrap
+      // value — see queryNotes's cursor-mode doc comment in
+      // core/src/notes.ts), NOT omit `cursor` entirely. Omitting it opts
+      // OUT of cursor/keyset mode altogether, which orders the first page
+      // by `created_at` (insertion order) instead of `updated_at` — a
+      // DIFFERENT order than every subsequent (real-cursor) page uses. That
+      // mismatch produces a watermark from a page in the wrong order, which
+      // can then skip rows once keyset mode takes over on page 2 — exactly
+      // the bug this test exists to catch, so the harness itself must use
+      // the correct bootstrap contract or it can flake based on whether
+      // `created_at` happens to tie across the fixture's notes.
+      const seen: string[] = [];
+      let cursor = "";
+      for (let page = 0; page < 10; page++) {
+        const result = await store.queryNotesPaged({ limit: 2, cursor });
+        if (result.notes.length === 0) break;
+        seen.push(...result.notes.map((n) => n.id));
+        cursor = result.next_cursor;
+      }
+
+      expect(seen).toEqual(expectedOrder);
+      expect(new Set(seen).size).toBe(seen.length);
+    });
+  });
+
+  it("limits results", async () => {
+    for (let i = 0; i < 5; i++) await store.createNote(`Note ${i}`);
+    const results = await store.queryNotes({ limit: 3 });
+    expect(results).toHaveLength(3);
+  });
+
+  it("has_tags=false returns only untagged notes", async () => {
+    await store.createNote("Tagged", { tags: ["daily"] });
+    await store.createNote("Plain");
+
+    const results = await store.queryNotes({ hasTags: false });
+    expect(results.map((n) => n.content).sort()).toEqual(["Plain"]);
+  });
+
+  it("has_tags=true returns only tagged notes", async () => {
+    await store.createNote("Tagged", { tags: ["daily"] });
+    await store.createNote("Plain");
+
+    const results = await store.queryNotes({ hasTags: true });
+    expect(results.map((n) => n.content).sort()).toEqual(["Tagged"]);
+  });
+
+  it("has_tags is ignored when `tags` is also provided (tag filter wins)", async () => {
+    await store.createNote("A", { tags: ["daily"] });
+    await store.createNote("B");
+
+    // tags:["daily"] already constrains to tagged notes; has_tags is a no-op.
+    const truthy = await store.queryNotes({ tags: ["daily"], hasTags: true });
+    expect(truthy.map((n) => n.content)).toEqual(["A"]);
+
+    // `has_tags: false` would contradict `tags` — but tag filter wins, so "A" still returns.
+    const falsy = await store.queryNotes({ tags: ["daily"], hasTags: false });
+    expect(falsy.map((n) => n.content)).toEqual(["A"]);
+  });
+
+  it("has_links=false returns orphaned notes (no inbound or outbound links)", async () => {
+    const a = await store.createNote("A", { id: "ha" });
+    const b = await store.createNote("B", { id: "hb" });
+    await store.createNote("Orphan", { id: "ho" });
+    await store.createLink(a.id, b.id, "mentions");
+
+    const orphans = await store.queryNotes({ hasLinks: false });
+    expect(orphans.map((n) => n.content).sort()).toEqual(["Orphan"]);
+  });
+
+  it("has_links=true returns notes with any link (inbound or outbound)", async () => {
+    const a = await store.createNote("Source", { id: "la" });
+    const b = await store.createNote("Target", { id: "lb" });
+    await store.createNote("Orphan", { id: "lo" });
+    await store.createLink(a.id, b.id, "mentions");
+
+    // Both Source (outbound) and Target (inbound) should appear.
+    const linked = await store.queryNotes({ hasLinks: true });
+    expect(linked.map((n) => n.content).sort()).toEqual(["Source", "Target"]);
+  });
+
+  it("composes has_tags + has_links (untagged and orphaned)", async () => {
+    const a = await store.createNote("Tagged+linked", { tags: ["x"], id: "ca" });
+    const b = await store.createNote("Plain+linked", { id: "cb" });
+    await store.createNote("Tagged+orphan", { tags: ["x"], id: "cc" });
+    await store.createNote("Plain+orphan", { id: "cd" });
+    await store.createLink(a.id, b.id, "mentions");
+
+    const loners = await store.queryNotes({ hasTags: false, hasLinks: false });
+    expect(loners.map((n) => n.content)).toEqual(["Plain+orphan"]);
+  });
+
+  it("has_tags=false composes with exclude_tags as a no-op (untagged notes have no tags to exclude)", async () => {
+    await store.createNote("Tagged", { tags: ["archived"] });
+    await store.createNote("Plain");
+
+    const results = await store.queryNotes({ hasTags: false, excludeTags: ["archived"] });
+    expect(results.map((n) => n.content)).toEqual(["Plain"]);
+  });
+
+  // ---- Operator objects + order_by on indexed metadata fields ----
+
+  describe("metadata operators + order_by", () => {
+    async function seedIndexedPriorities() {
+      const { declareField } = await import("./indexed-fields.js");
+      declareField(db, "priority", "INTEGER", "project");
+      declareField(db, "status", "TEXT", "project");
+    }
+
+    it("eq operator on indexed field matches primitive exactly", async () => {
+      await seedIndexedPriorities();
+      await store.createNote("high", { metadata: { priority: 5 } });
+      await store.createNote("low", { metadata: { priority: 1 } });
+
+      const results = await store.queryNotes({ metadata: { priority: { eq: 5 } } });
+      expect(results.map((n) => n.content)).toEqual(["high"]);
+    });
+
+    it("ne operator returns non-matching rows AND rows without the field", async () => {
+      await seedIndexedPriorities();
+      await store.createNote("has-1", { metadata: { priority: 1 } });
+      await store.createNote("has-2", { metadata: { priority: 2 } });
+      await store.createNote("missing"); // no priority at all
+
+      const results = await store.queryNotes({ metadata: { priority: { ne: 1 } } });
+      expect(results.map((n) => n.content).sort()).toEqual(["has-2", "missing"]);
+    });
+
+    it("gt / gte / lt / lte compose into range queries on one field", async () => {
+      await seedIndexedPriorities();
+      for (const p of [1, 2, 3, 4, 5]) {
+        await store.createNote(`p${p}`, { metadata: { priority: p } });
+      }
+      const range = await store.queryNotes({ metadata: { priority: { gte: 2, lt: 5 } } });
+      expect(range.map((n) => n.content).sort()).toEqual(["p2", "p3", "p4"]);
+    });
+
+    it("in and not_in take arrays; empty in returns no rows, empty not_in returns all", async () => {
+      await seedIndexedPriorities();
+      await store.createNote("a", { metadata: { status: "active" } });
+      await store.createNote("b", { metadata: { status: "exploring" } });
+      await store.createNote("c", { metadata: { status: "done" } });
+
+      const inResult = await store.queryNotes({ metadata: { status: { in: ["active", "exploring"] } } });
+      expect(inResult.map((n) => n.content).sort()).toEqual(["a", "b"]);
+
+      const notInResult = await store.queryNotes({ metadata: { status: { not_in: ["done"] } } });
+      // "done" excluded; rows with status=null (none here) would also pass.
+      expect(notInResult.map((n) => n.content).sort()).toEqual(["a", "b"]);
+
+      const emptyIn = await store.queryNotes({ metadata: { status: { in: [] } } });
+      expect(emptyIn).toHaveLength(0);
+    });
+
+    it("exists: true / false distinguishes present vs absent field", async () => {
+      await seedIndexedPriorities();
+      await store.createNote("has", { metadata: { priority: 3 } });
+      await store.createNote("missing");
+
+      const has = await store.queryNotes({ metadata: { priority: { exists: true } } });
+      expect(has.map((n) => n.content)).toEqual(["has"]);
+
+      const missing = await store.queryNotes({ metadata: { priority: { exists: false } } });
+      expect(missing.map((n) => n.content)).toEqual(["missing"]);
+    });
+
+    it("order_by sorts by the indexed field; sort='desc' reverses direction", async () => {
+      await seedIndexedPriorities();
+      await store.createNote("p3", { metadata: { priority: 3 } });
+      await store.createNote("p1", { metadata: { priority: 1 } });
+      await store.createNote("p2", { metadata: { priority: 2 } });
+
+      const asc = await store.queryNotes({ orderBy: "priority" });
+      expect(asc.map((n) => n.content)).toEqual(["p1", "p2", "p3"]);
+
+      const desc = await store.queryNotes({ orderBy: "priority", sort: "desc" });
+      expect(desc.map((n) => n.content)).toEqual(["p3", "p2", "p1"]);
+    });
+
+    it("operator objects compose with tag and exclude_tags filters", async () => {
+      await seedIndexedPriorities();
+      await store.createNote("p5-project", { tags: ["project"], metadata: { priority: 5 } });
+      await store.createNote("p3-project", { tags: ["project"], metadata: { priority: 3 } });
+      await store.createNote("p5-other", { tags: ["other"], metadata: { priority: 5 } });
+
+      const results = await store.queryNotes({
+        tags: ["project"],
+        metadata: { priority: { gte: 4 } },
+      });
+      expect(results.map((n) => n.content)).toEqual(["p5-project"]);
+    });
+
+    it("primitive metadata values keep working (backcompat, scan JSON)", async () => {
+      // Note: priority is NOT declared indexed here — primitive match still
+      // goes through json_extract and doesn't require an index.
+      await store.createNote("match", { metadata: { kind: "draft" } });
+      await store.createNote("other", { metadata: { kind: "final" } });
+
+      const results = await store.queryNotes({ metadata: { kind: "draft" } });
+      expect(results.map((n) => n.content)).toEqual(["match"]);
+    });
+
+    it("operator on a non-indexed field throws FIELD_NOT_INDEXED", async () => {
+      await store.createNote("x", { metadata: { foo: "bar" } });
+      expect(
+        store.queryNotes({ metadata: { foo: { eq: "bar" } } }),
+      ).rejects.toThrow(/not indexed/);
+    });
+
+    it("order_by on a non-indexed field throws FIELD_NOT_INDEXED", async () => {
+      await store.createNote("x", { metadata: { foo: 1 } });
+      expect(store.queryNotes({ orderBy: "foo" })).rejects.toThrow(/not indexed/);
+    });
+
+    // ---- vault#585: order_by "updated_at" is a pseudo-field like link_count ----
+    //
+    // Before vault#585, `order_by: "updated_at"` always threw
+    // FIELD_NOT_INDEXED — `updated_at` is a native `notes` column, not a
+    // declared-indexed metadata field, and the generic order_by branch
+    // gated every field (including this one) through `requireIndexedField`
+    // (see the 2026-06 MCP-tool-description-audit CHANGELOG entry — this
+    // was documented, intentional behavior, not a silent mis-sort). This
+    // test proves the NEW capability lands correct from day one: ordering
+    // on the integer `updated_at_ms` mirror (vault#586), immune to the
+    // TEXT-lexicographic trap a plain `ORDER BY updated_at` would fall
+    // into — a space-form timestamp's ' ' (0x20) always sorts BEFORE any
+    // canonical `T`-separated timestamp's 'T' (0x54) on the same calendar
+    // day, regardless of the actual wall-clock instant either encodes.
+    it("order_by: \"updated_at\" sorts correctly across canonical + non-canonical timestamps (vault#585)", async () => {
+      const p = await store.createNote("P earliest (canonical)");
+      const q = await store.createNote("Q middle (space-form, non-canonical)");
+      const r = await store.createNote("R latest (canonical)");
+      const pin = (id: string, raw: string) => {
+        const ms = timestampToMs(raw);
+        if (ms === null) throw new Error(`test fixture bug: unparseable timestamp ${raw}`);
+        db.prepare("UPDATE notes SET updated_at = ?, updated_at_ms = ? WHERE id = ?").run(raw, ms, id);
+      };
+      // True chronological order: P (08:00) < Q (12:00) < R (16:00). Q's
+      // space-form TEXT ("2024-11-02 12:00:00") sorts BEFORE P's canonical
+      // TEXT ("2024-11-02T08:00:00.000Z") under a plain string compare
+      // (' ' < 'T'), which is exactly backwards.
+      pin(p.id, "2024-11-02T08:00:00.000Z");
+      pin(q.id, "2024-11-02 12:00:00");
+      pin(r.id, "2024-11-02T16:00:00.000Z");
+
+      const asc = await store.queryNotes({ orderBy: "updated_at", sort: "asc" });
+      expect(asc.map((n) => n.content)).toEqual([
+        "P earliest (canonical)",
+        "Q middle (space-form, non-canonical)",
+        "R latest (canonical)",
+      ]);
+
+      const desc = await store.queryNotes({ orderBy: "updated_at", sort: "desc" });
+      expect(desc.map((n) => n.content)).toEqual([
+        "R latest (canonical)",
+        "Q middle (space-form, non-canonical)",
+        "P earliest (canonical)",
+      ]);
+    });
+
+    it("unknown operator throws UNKNOWN_OPERATOR with supported-op list", async () => {
+      await seedIndexedPriorities();
+      expect(
+        store.queryNotes({ metadata: { priority: { bogus: 5 } as any } }),
+      ).rejects.toThrow(/unknown operator "bogus"/);
+    });
+
+    it("in/not_in without an array value throws INVALID_OPERATOR_VALUE", async () => {
+      await seedIndexedPriorities();
+      expect(
+        store.queryNotes({ metadata: { priority: { in: 5 } as any } }),
+      ).rejects.toThrow(/expects an array/);
+    });
+
+    // ---- `date` field type: gt/gte/lt/lte + order_by (vault#date-field-type) ----
+    //
+    // Indexed `date` fields store TEXT (ISO-8601 strings compare correctly
+    // lexicographically), so this exercises the SAME generic string-indexed-
+    // field machinery `email_date`/`status` above already use — no
+    // date-specific SQL was added. Uses a real tag schema (`type: "date",
+    // indexed: true`), not raw `declareField`, to prove the wiring end to end.
+    it("gt/gte/lt/lte compose into range queries on an indexed `date` field", async () => {
+      // Indexed-field reconciliation (declareField → generated column +
+      // index) runs through the `update-tag` tool / `store.upsertTagRecord`
+      // — `store.upsertTagSchema` is the legacy description+fields-only
+      // facade and does NOT create the backing column.
+      const tools = generateMcpTools(store);
+      const updateTag = tools.find((t) => t.name === "update-tag")!;
+      await updateTag.execute({
+        tag: "meeting",
+        fields: { meeting_date: { type: "date", indexed: true } },
+      });
+      await store.createNote("jan", { tags: ["meeting"], metadata: { meeting_date: "2026-01-15" } });
+      await store.createNote("apr", { tags: ["meeting"], metadata: { meeting_date: "2026-04-15" } });
+      await store.createNote("jul", { tags: ["meeting"], metadata: { meeting_date: "2026-07-09T14:30:00.000Z" } });
+      await store.createNote("oct", { tags: ["meeting"], metadata: { meeting_date: "2026-10-15" } });
+
+      const range = await store.queryNotes({
+        metadata: { meeting_date: { gte: "2026-04-01", lt: "2026-10-01" } },
+      });
+      expect(range.map((n) => n.content).sort()).toEqual(["apr", "jul"]);
+    });
+
+    it("order_by sorts by an indexed `date` field", async () => {
+      const tools = generateMcpTools(store);
+      const updateTag = tools.find((t) => t.name === "update-tag")!;
+      await updateTag.execute({
+        tag: "meeting",
+        fields: { meeting_date: { type: "date", indexed: true } },
+      });
+      await store.createNote("later", { tags: ["meeting"], metadata: { meeting_date: "2026-07-09" } });
+      await store.createNote("earlier", { tags: ["meeting"], metadata: { meeting_date: "2026-01-15" } });
+      await store.createNote("middle", { tags: ["meeting"], metadata: { meeting_date: "2026-04-01" } });
+
+      const asc = await store.queryNotes({ orderBy: "meeting_date" });
+      expect(asc.map((n) => n.content)).toEqual(["earlier", "middle", "later"]);
+    });
+  });
+});
+
+// ---- Search ----
+
+describe("searchNotes", async () => {
+  it("finds notes by content", async () => {
+    await store.createNote("Walked up Flagstaff trail");
+    await store.createNote("Meeting about Horizon");
+
+    const results = await store.searchNotes("Flagstaff");
+    expect(results).toHaveLength(1);
+    expect(results[0].content).toContain("Flagstaff");
+  });
+
+  it("filters search by tag", async () => {
+    await store.createNote("Daily Flagstaff", { tags: ["daily"] });
+    await store.createNote("Doc Flagstaff", { tags: ["doc"] });
+
+    const results = await store.searchNotes("Flagstaff", { tags: ["daily"] });
+    expect(results).toHaveLength(1);
+    expect(results[0].tags).toContain("daily");
+  });
+
+  it("filters search by excludeTags (vault#647)", async () => {
+    await store.createNote("Flagstaff keep", { tags: ["daily"] });
+    await store.createNote("Flagstaff drop", { tags: ["daily", "archived"] });
+
+    const results = await store.searchNotes("Flagstaff", { tags: ["daily"], excludeTags: ["archived"] });
+    expect(results).toHaveLength(1);
+    expect(results[0].content).toContain("keep");
+    expect(results[0].tags).not.toContain("archived");
+  });
+
+  it("filters search by dateFrom (vault#647)", async () => {
+    await store.createNote("Flagstaff recent", { tags: ["daily"], created_at: "2026-07-01T00:00:00.000Z" });
+    await store.createNote("Flagstaff old", { tags: ["daily"], created_at: "2023-06-01T00:00:00.000Z" });
+
+    const results = await store.searchNotes("Flagstaff", { tags: ["daily"], dateFrom: "2026-06-01" });
+    expect(results).toHaveLength(1);
+    expect(results[0].content).toContain("recent");
+  });
+
+  it("returns empty for no match", async () => {
+    await store.createNote("Hello world");
+    const results = await store.searchNotes("nonexistent");
+    expect(results).toHaveLength(0);
+  });
+});
+
+// ---- Links ----
+
+describe("links", async () => {
+  it("creates a link", async () => {
+    await store.createNote("A", { id: "a" });
+    await store.createNote("B", { id: "b" });
+
+    const link = await store.createLink("a", "b", "mentions");
+    expect(link.sourceId).toBe("a");
+    expect(link.targetId).toBe("b");
+    expect(link.relationship).toBe("mentions");
+  });
+
+  it("deletes a link", async () => {
+    await store.createNote("A", { id: "a" });
+    await store.createNote("B", { id: "b" });
+    await store.createLink("a", "b", "mentions");
+    await store.deleteLink("a", "b", "mentions");
+
+    const links = await store.getLinks("a");
+    expect(links).toHaveLength(0);
+  });
+
+  it("gets outbound links", async () => {
+    await store.createNote("A", { id: "a" });
+    await store.createNote("B", { id: "b" });
+    await store.createNote("C", { id: "c" });
+    await store.createLink("a", "b", "mentions");
+    await store.createLink("c", "a", "quotes");
+
+    const outbound = await store.getLinks("a", { direction: "outbound" });
+    expect(outbound).toHaveLength(1);
+    expect(outbound[0].targetId).toBe("b");
+  });
+
+  it("gets inbound links", async () => {
+    await store.createNote("A", { id: "a" });
+    await store.createNote("B", { id: "b" });
+    await store.createLink("a", "b", "mentions");
+
+    const inbound = await store.getLinks("b", { direction: "inbound" });
+    expect(inbound).toHaveLength(1);
+    expect(inbound[0].sourceId).toBe("a");
+  });
+
+  it("gets all links (both directions)", async () => {
+    await store.createNote("A", { id: "a" });
+    await store.createNote("B", { id: "b" });
+    await store.createNote("C", { id: "c" });
+    await store.createLink("a", "b", "mentions");
+    await store.createLink("c", "a", "quotes");
+
+    const all = await store.getLinks("a", { direction: "both" });
+    expect(all).toHaveLength(2);
+  });
+
+  it("link creation is idempotent", async () => {
+    await store.createNote("A", { id: "a" });
+    await store.createNote("B", { id: "b" });
+    await store.createLink("a", "b", "mentions");
+    await store.createLink("a", "b", "mentions"); // duplicate
+    const links = await store.getLinks("a");
+    expect(links.filter((l) => l.relationship === "mentions")).toHaveLength(1);
+  });
+
+  // vault#439 — traverseLinks isTraversable predicate (wall, not sieve).
+  // Topology: a -> b(blocked) -> c. A predicate that blocks `b` must make
+  // `c` unreachable (the BFS can't walk THROUGH b), not merely filtered out.
+  it("traverseLinks: isTraversable predicate is a wall (can't reach past a blocked hop)", async () => {
+    await store.createNote("A", { id: "a" });
+    await store.createNote("B", { id: "b" });
+    await store.createNote("C", { id: "c" });
+    await store.createLink("a", "b", "relates");
+    await store.createLink("b", "c", "relates");
+
+    const blocked = traverseLinks(db, "a", {
+      max_depth: 5,
+      isTraversable: (id) => id !== "b",
+    });
+    const ids = blocked.map((t) => t.noteId);
+    expect(ids).not.toContain("b"); // blocked hop is excluded from results
+    expect(ids).not.toContain("c"); // and unreachable beyond it
+  });
+
+  it("traverseLinks: no predicate walks the full graph (unchanged)", async () => {
+    await store.createNote("A", { id: "a" });
+    await store.createNote("B", { id: "b" });
+    await store.createNote("C", { id: "c" });
+    await store.createLink("a", "b", "relates");
+    await store.createLink("b", "c", "relates");
+
+    const all = traverseLinks(db, "a", { max_depth: 5 });
+    const ids = all.map((t) => t.noteId);
+    expect(ids).toContain("b");
+    expect(ids).toContain("c");
+  });
+
+  it("traverseLinks: an allowed alternate path still reaches the far node", async () => {
+    // a -> b(blocked) -> d ; a -> c(allowed) -> d. d reachable via c.
+    await store.createNote("A", { id: "a" });
+    await store.createNote("B", { id: "b" });
+    await store.createNote("C", { id: "c" });
+    await store.createNote("D", { id: "d" });
+    await store.createLink("a", "b", "relates");
+    await store.createLink("b", "d", "relates");
+    await store.createLink("a", "c", "relates");
+    await store.createLink("c", "d", "relates");
+
+    const res = traverseLinks(db, "a", {
+      max_depth: 5,
+      isTraversable: (id) => id !== "b",
+    });
+    const ids = res.map((t) => t.noteId);
+    expect(ids).not.toContain("b");
+    expect(ids).toContain("c");
+    expect(ids).toContain("d"); // reachable via the allowed c-path
+  });
+});
+
+// ---- Attachments ----
+
+describe("attachments", async () => {
+  it("adds and retrieves attachments", async () => {
+    const note = await store.createNote("Voice memo", { tags: ["daily", "voice"] });
+    const attachment = await store.addAttachment(note.id, "2026-03-31/audio.wav", "audio/wav");
+
+    expect(attachment.noteId).toBe(note.id);
+    expect(attachment.mimeType).toBe("audio/wav");
+
+    const attachments = await store.getAttachments(note.id);
+    expect(attachments).toHaveLength(1);
+    expect(attachments[0].path).toBe("2026-03-31/audio.wav");
+  });
+
+  it("cascade deletes attachments with note", async () => {
+    const note = await store.createNote("Test");
+    await store.addAttachment(note.id, "file.png", "image/png");
+    await store.deleteNote(note.id);
+
+    const attachments = await store.getAttachments(note.id);
+    expect(attachments).toHaveLength(0);
+  });
+
+  it("deleteAttachment removes row and reports orphaned path", async () => {
+    const note = await store.createNote("Has attachment");
+    const att = await store.addAttachment(note.id, "2026-04-18/pic.png", "image/png");
+
+    const result = await store.deleteAttachment(note.id, att.id);
+    expect(result).toEqual({ deleted: true, path: "2026-04-18/pic.png", orphaned: true });
+    expect(await store.getAttachments(note.id)).toHaveLength(0);
+  });
+
+  it("deleteAttachment returns deleted:false for nonexistent id", async () => {
+    const note = await store.createNote("x");
+    const result = await store.deleteAttachment(note.id, "does-not-exist");
+    expect(result).toEqual({ deleted: false, path: null, orphaned: false });
+  });
+
+  it("deleteAttachment is scoped to noteId (cross-note attempt is a no-op)", async () => {
+    const a = await store.createNote("A");
+    const b = await store.createNote("B");
+    const attA = await store.addAttachment(a.id, "files/a.png", "image/png");
+
+    const result = await store.deleteAttachment(b.id, attA.id);
+    expect(result.deleted).toBe(false);
+    expect(await store.getAttachments(a.id)).toHaveLength(1);
+  });
+
+  it("deleteAttachment reports orphaned:false when a sibling attachment shares the path", async () => {
+    const a = await store.createNote("A");
+    const b = await store.createNote("B");
+    const attA = await store.addAttachment(a.id, "shared/pic.png", "image/png");
+    await store.addAttachment(b.id, "shared/pic.png", "image/png");
+
+    const result = await store.deleteAttachment(a.id, attA.id);
+    expect(result).toEqual({ deleted: true, path: "shared/pic.png", orphaned: false });
+  });
+});
+
+// ---- MCP Tools ----
+
+describe("MCP tools", async () => {
+  it("generates the consolidated tool set", () => {
+    const tools = generateMcpTools(store);
+    const names = tools.map((t) => t.name);
+
+    expect(names).toContain("query-notes");
+    expect(names).toContain("create-note");
+    expect(names).toContain("update-note");
+    expect(names).toContain("delete-note");
+    expect(names).toContain("list-tags");
+    expect(names).toContain("update-tag");
+    expect(names).toContain("delete-tag");
+    expect(names).toContain("find-path");
+    expect(names).toContain("vault-info");
+    // prune-schema (admin) — drops orphaned indexed-field columns whose
+    // declaring tags are gone. The gitcoin orphaned-fields fix.
+    expect(names).toContain("prune-schema");
+    // rename-tag / merge-tags (vault#552) — MCP parity with the
+    // pre-existing REST rename/merge engine. doctor (admin, vault#552) —
+    // read-only taxonomy/metadata integrity scan.
+    expect(names).toContain("rename-tag");
+    expect(names).toContain("merge-tags");
+    expect(names).toContain("doctor");
+    // Six note-schema tools (list/update/delete-note-schema +
+    // list/set/delete-schema-mapping) retired in v17 — the standalone
+    // note_schemas + schema_mappings subsystem was a parallel path to
+    // tags.fields with zero operator usage. See vault#267.
+    expect(names).not.toContain("list-note-schemas");
+    expect(names).not.toContain("update-note-schema");
+    expect(names).not.toContain("delete-note-schema");
+    expect(names).not.toContain("list-schema-mappings");
+    expect(names).not.toContain("set-schema-mapping");
+    expect(names).not.toContain("delete-schema-mapping");
+    // synthesize-notes retired in v17 — replicable with query-notes(near=) +
+    // find-path + agent-side aggregation. See vault#268.
+    expect(names).not.toContain("synthesize-notes");
+    expect(tools).toHaveLength(13);
+  });
+
+  it("create-note tool works", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const result = await createNote.execute({ content: "Hello", tags: ["daily"] }) as any;
+    expect(result.content).toBe("Hello");
+    expect(result.tags).toContain("daily");
+  });
+
+  it("create-note batch mode works", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const result = await createNote.execute({
+      notes: [
+        { content: "A", tags: ["daily"] },
+        { content: "B", tags: ["doc"] },
+      ],
+    }) as any[];
+    expect(result).toHaveLength(2);
+    expect(result[0].tags).toContain("daily");
+    expect(result[1].tags).toContain("doc");
+  });
+
+  // vault#316 — the create-note tool re-reads each note AFTER
+  // `applySchemaDefaults` runs, so the response reflects the post-defaults
+  // on-disk state (matching the update-note path). Before the fix the
+  // response mapped over the pre-defaults in-memory objects, so a
+  // schema-default-filled field was missing from the returned note even
+  // though it had just been written to disk.
+  it("create-note response reflects post-applySchemaDefaults state (vault#316)", async () => {
+    // vault#553 Decision B: backfill is explicit-`default`-only now — declare
+    // one so this test still exercises the post-defaults re-read mechanism
+    // (the thing vault#316 is actually about).
+    await store.upsertTagSchema("task", {
+      fields: { priority: { type: "string", enum: ["high", "low"], default: "high" } },
+    });
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+
+    // Single: default lands in the returned metadata.
+    const single = await createNote.execute({
+      content: "do the thing",
+      path: "Inbox/task-1",
+      tags: ["task"],
+    }) as any;
+    expect(single.metadata?.priority).toBe("high"); // explicit schema default
+    // Disk and response agree.
+    const onDisk = await store.getNoteByPath("Inbox/task-1");
+    expect((onDisk!.metadata as any)?.priority).toBe("high");
+
+    // Batch: each entry is re-read post-defaults too.
+    const batch = await createNote.execute({
+      notes: [
+        { content: "a", path: "Inbox/task-2", tags: ["task"] },
+        { content: "b", path: "Inbox/task-3", tags: ["task"] },
+      ],
+    }) as any[];
+    expect(batch[0].metadata?.priority).toBe("high");
+    expect(batch[1].metadata?.priority).toBe("high");
+  });
+
+  it("create-note accepts extension field (vault#328)", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const result = await createNote.execute({
+      content: "month,income\n2026-01,12000",
+      path: "Tabular/budget",
+      extension: "csv",
+    }) as any;
+    expect(result.extension).toBe("csv");
+  });
+
+  it("create-note defaults extension to 'md' when omitted (vault#328)", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const result = await createNote.execute({ content: "plain markdown" }) as any;
+    expect(result.extension).toBe("md");
+  });
+
+  it("create-note rejects invalid extension (uppercase, dot, reserved) (vault#328)", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    // Uppercase
+    expect(createNote.execute({ content: "x", extension: "CSV" })).rejects.toThrow(/invalid extension/);
+    // Dot
+    expect(createNote.execute({ content: "x", extension: "csv.bak" })).rejects.toThrow(/invalid extension/);
+    // Slash
+    expect(createNote.execute({ content: "x", extension: "foo/bar" })).rejects.toThrow(/invalid extension/);
+    // Reserved "parachute" prefix (lowercase — the pattern check passes,
+    // so the reserved-prefix guard is what fires).
+    expect(createNote.execute({ content: "x", extension: "parachute" })).rejects.toThrow(/reserved/);
+    expect(createNote.execute({ content: "x", extension: "parachutex" })).rejects.toThrow(/reserved/);
+    // Too long (>16)
+    expect(createNote.execute({ content: "x", extension: "a".repeat(17) })).rejects.toThrow(/invalid extension/);
+    // Empty
+    expect(createNote.execute({ content: "x", extension: "" })).rejects.toThrow(/non-empty/);
+  });
+
+  it("update-note changes extension (vault#328)", async () => {
+    const note = await store.createNote("hi", { path: "Foo" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const result = await updateNote.execute({ id: note.id, extension: "mdx", force: true }) as any;
+    expect(result.extension).toBe("mdx");
+  });
+
+  it("update-note validates extension on update branch (vault#328)", async () => {
+    const note = await store.createNote("hi", { path: "Foo" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    expect(
+      updateNote.execute({ id: note.id, extension: "BAD", force: true }),
+    ).rejects.toThrow(/invalid extension/);
+  });
+
+  it("update-note if_missing=create honors extension (vault#328)", async () => {
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const result = await updateNote.execute({
+      id: "Tabular/new-budget",
+      content: "month,total\n2026-02,9000",
+      extension: "csv",
+      if_missing: "create",
+    }) as any;
+    expect(result.created).toBe(true);
+    expect(result.extension).toBe("csv");
+  });
+
+  // ---- Metadata key-deletion via null tombstone (vault#478 / #479) ---------
+
+  it("update-note deletes a metadata key when its value is null (RFC 7386)", async () => {
+    const note = await store.createNote("m", {
+      metadata: { keep: "yes", drop: "old", other: 1 },
+    });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    await updateNote.execute({ id: note.id, metadata: { drop: null }, force: true });
+
+    const fresh = await store.getNote(note.id);
+    // The deleted key is GONE — not a literal JSON null.
+    expect(fresh!.metadata).not.toHaveProperty("drop");
+    // Other keys are untouched.
+    expect(fresh!.metadata).toMatchObject({ keep: "yes", other: 1 });
+  });
+
+  it("update-note metadata key-rename in one call (new key set, old key deleted)", async () => {
+    const note = await store.createNote("m", {
+      metadata: { "old-key": "v", stable: true },
+    });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    await updateNote.execute({
+      id: note.id,
+      metadata: { new_key: "v", "old-key": null },
+      force: true,
+    });
+
+    const fresh = await store.getNote(note.id);
+    expect(fresh!.metadata).not.toHaveProperty("old-key");
+    expect(fresh!.metadata).toMatchObject({ new_key: "v", stable: true });
+  });
+
+  it("deleting an absent metadata key is a no-op (round-trips cleanly)", async () => {
+    const note = await store.createNote("m", { metadata: { a: 1 } });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    await updateNote.execute({ id: note.id, metadata: { ghost: null }, force: true });
+    const fresh = await store.getNote(note.id);
+    expect(fresh!.metadata).toEqual({ a: 1 });
+    expect(fresh!.metadata).not.toHaveProperty("ghost");
+  });
+
+  it("query-notes filters by extension (vault#328)", async () => {
+    await store.createNote("md note", { path: "a" });
+    await store.createNote("csv note", { path: "b", extension: "csv" });
+    await store.createNote("yaml note", { path: "c", extension: "yaml" });
+    const tools = generateMcpTools(store);
+    const queryNotes = tools.find((t) => t.name === "query-notes")!;
+
+    // Single extension
+    const csv = await queryNotes.execute({ extension: "csv", include_content: true }) as any[];
+    expect(csv).toHaveLength(1);
+    expect(csv[0].path).toBe("b");
+
+    // Array shape
+    const both = await queryNotes.execute({ extension: ["csv", "yaml"], include_content: true }) as any[];
+    expect(both).toHaveLength(2);
+    expect(both.map((n) => n.path).sort()).toEqual(["b", "c"]);
+  });
+
+  it("create-note with links resolves targets by path", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    await store.createNote("Target", { path: "People/Alice" });
+    const result = await createNote.execute({
+      content: "Links to Alice",
+      links: [{ target: "People/Alice", relationship: "mentions" }],
+    }) as any;
+    const links = await store.getLinks(result.id, { direction: "outbound" });
+    expect(links.some((l) => l.relationship === "mentions")).toBe(true);
+  });
+
+  // vault#555 — structured `links` used to resolve by exact path only (no
+  // basename/title fallback, unlike [[wikilinks]]). "Bare Title" against a
+  // note filed at "People/Alice" is a basename match, same as `[[Alice]]`.
+  it("create-note with links resolves targets by BASENAME (title), same as [[wikilinks]]", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    await store.createNote("Target", { path: "People/Alice" });
+    const result = await createNote.execute({
+      content: "Links to Alice by bare title",
+      links: [{ target: "Alice", relationship: "knows" }],
+    }) as any;
+    const links = await store.getLinks(result.id, { direction: "outbound" });
+    expect(links).toHaveLength(1);
+    expect(links[0]!.relationship).toBe("knows");
+  });
+
+  // vault#555 — a link to a note created LATER in the same create-note
+  // batch used to silently drop (item 0 resolved before item 1 existed).
+  // The equivalent forward-ref via a [[wikilink]] already resolved; this
+  // makes structured `links` match.
+  it("create-note batch: a link to a note created LATER in the same batch resolves (forward-ref)", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const result = await createNote.execute({
+      notes: [
+        { path: "A", content: "links to B", links: [{ target: "B", relationship: "knows" }] },
+        { path: "B", content: "the target" },
+      ],
+    }) as any[];
+    const a = result.find((n: any) => n.path === "A");
+    const links = await store.getLinks(a.id, { direction: "outbound" });
+    expect(links).toHaveLength(1);
+    expect(links[0]!.relationship).toBe("knows");
+    // No warning — it resolved within the batch.
+    expect(a.warnings).toBeUndefined();
+  });
+
+  // vault#555 — a target that genuinely can't resolve now must surface an
+  // `unresolved_link` warning (never silent), AND lazily backfill the edge
+  // the moment a matching note is created later — mirroring the
+  // `unresolved_wikilinks` forward-ref contract.
+  it("create-note with an unresolvable link target: warns now, backfills the edge when the target is created later", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const source = await createNote.execute({
+      content: "links to a note that doesn't exist yet",
+      links: [{ target: "Nonexistent Target", relationship: "knows" }],
+    }) as any;
+
+    expect(source.warnings).toBeDefined();
+    expect(source.warnings).toHaveLength(1);
+    expect(source.warnings[0].code).toBe("unresolved_link");
+    expect(source.warnings[0].target).toBe("Nonexistent Target");
+    expect(source.warnings[0].relationship).toBe("knows");
+    expect(await store.getLinks(source.id, { direction: "outbound" })).toHaveLength(0);
+
+    // Creating the target note later backfills the edge automatically.
+    const target = await store.createNote("here now", { path: "Nonexistent Target" });
+    const links = await store.getLinks(source.id, { direction: "outbound" });
+    expect(links).toHaveLength(1);
+    expect(links[0]!.targetId).toBe(target.id);
+    expect(links[0]!.relationship).toBe("knows");
+  });
+
+  // vault#555 — structured-link forward-refs (any relationship) must
+  // coexist with pending [[wikilink]] forward-refs on the SAME note without
+  // one clobbering the other when the note's content is re-synced.
+  it("pending structured-link forward-ref survives a wikilink content re-sync on the same note", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const source = await createNote.execute({
+      content: "no wikilinks yet",
+      links: [{ target: "Future Note", relationship: "knows" }],
+    }) as any;
+    expect(source.warnings?.[0]?.code).toBe("unresolved_link");
+
+    // Editing content (which re-syncs [[wikilink]]-kind unresolved entries)
+    // must not wipe the pending structured-link entry.
+    await updateNote.execute({ id: source.id, content: "now with a [[Some Other Unresolved Note]]", force: true });
+
+    const target = await store.createNote("arrived", { path: "Future Note" });
+    const links = await store.getLinks(source.id, { direction: "outbound" });
+    expect(links.some((l) => l.targetId === target.id && l.relationship === "knows")).toBe(true);
+  });
+
+  // vault#570 — content-parsed [[wikilinks]] to a missing target used to
+  // fire NO write-time warning at all, even though the equivalent
+  // structured `links` entry (tested above) already did. This closes that
+  // asymmetry: the SAME `unresolved_link` warning shape, sourced from
+  // content instead of `links`.
+  it("create-note with a content [[wikilink]] to a missing target: warns (unresolved_link), same as structured links", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const source = await createNote.execute({
+      content: "See [[Missing Note]] for details.",
+    }) as any;
+
+    expect(source.warnings).toBeDefined();
+    expect(source.warnings).toHaveLength(1);
+    expect(source.warnings[0].code).toBe("unresolved_link");
+    expect(source.warnings[0].target).toBe("Missing Note");
+    expect(source.warnings[0].relationship).toBe("wikilink");
+    expect(await store.getLinks(source.id, { direction: "outbound" })).toHaveLength(0);
+
+    // Backfills automatically, same as the structured-link contract.
+    const target = await store.createNote("here now", { path: "Missing Note" });
+    const links = await store.getLinks(source.id, { direction: "outbound" });
+    expect(links).toHaveLength(1);
+    expect(links[0]!.targetId).toBe(target.id);
+  });
+
+  // vault#570 — a target matching ≥2 notes (e.g. two notes sharing a
+  // basename/title) is a factually different situation from "no note
+  // matches" — reporting it as `unresolved_link` ("did not resolve to any
+  // note") would be WRONG (it matched two, not zero). Must surface a
+  // distinct `ambiguous_link` warning instead, and must NOT create an edge
+  // (there's no principled way to pick one of the two candidates).
+  it("create-note with a content [[wikilink]] to an AMBIGUOUS target (2 same-title notes): ambiguous_link, not unresolved_link, no edge", async () => {
+    const a = await store.createNote("A", { path: "Folder1/Shared Title" });
+    const b = await store.createNote("B", { path: "Folder2/Shared Title" });
+
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const source = await createNote.execute({
+      content: "See [[Shared Title]] for details.",
+    }) as any;
+
+    expect(source.warnings).toBeDefined();
+    expect(source.warnings).toHaveLength(1);
+    expect(source.warnings[0].code).toBe("ambiguous_link");
+    expect(source.warnings[0].target).toBe("Shared Title");
+    expect(source.warnings[0].relationship).toBe("wikilink");
+    expect(source.warnings[0].candidate_count).toBe(2);
+
+    // No edge created to EITHER candidate.
+    const links = await store.getLinks(source.id, { direction: "outbound" });
+    expect(links).toHaveLength(0);
+    expect(links.some((l) => l.targetId === a.id || l.targetId === b.id)).toBe(false);
+
+    // Not queued for lazy resolution either — a future note being created
+    // can't retroactively resolve an ambiguity between two EXISTING notes.
+    // The table itself may not even exist yet (nothing else in this test
+    // ever queued anything) — `PRAGMA table_info` on a nonexistent table
+    // returns zero rows rather than throwing, same tolerance the wikilinks
+    // module itself uses.
+    const tableExists = (db.prepare("PRAGMA table_info(unresolved_wikilinks)").all() as unknown[]).length > 0;
+    if (tableExists) {
+      const pending = db.prepare(
+        "SELECT * FROM unresolved_wikilinks WHERE source_id = ?",
+      ).all(source.id) as unknown[];
+      expect(pending).toHaveLength(0);
+    }
+  });
+
+  // vault#570 — the same ambiguous-target treatment applies to structured
+  // `links`, not just content [[wikilinks]] (resolveOrQueueLink is the
+  // shared implementation both paths call).
+  it("create-note with a structured link to an AMBIGUOUS target: ambiguous_link, no edge", async () => {
+    await store.createNote("A", { path: "Folder1/Dup" });
+    await store.createNote("B", { path: "Folder2/Dup" });
+
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const source = await createNote.execute({
+      content: "no wikilinks here",
+      links: [{ target: "Dup", relationship: "knows" }],
+    }) as any;
+
+    expect(source.warnings).toBeDefined();
+    expect(source.warnings).toHaveLength(1);
+    expect(source.warnings[0].code).toBe("ambiguous_link");
+    expect(source.warnings[0].target).toBe("Dup");
+    expect(source.warnings[0].relationship).toBe("knows");
+    expect(source.warnings[0].candidate_count).toBe(2);
+    expect(await store.getLinks(source.id, { direction: "outbound" })).toHaveLength(0);
+  });
+
+  // vault#570 — a content [[wikilink]] to a note created LATER in the same
+  // create-note batch must resolve silently (forward-ref), exactly like
+  // structured `links` already do — no spurious `unresolved_link` warning
+  // just because the classification pass runs before this fix would have.
+  it("create-note batch: a content [[wikilink]] to a note created LATER in the same batch resolves without warning", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const result = await createNote.execute({
+      notes: [
+        { path: "WikiA", content: "links to [[WikiB]]" },
+        { path: "WikiB", content: "the target" },
+      ],
+    }) as any[];
+    const a = result.find((n: any) => n.path === "WikiA");
+    expect(a.warnings).toBeUndefined();
+    const links = await store.getLinks(a.id, { direction: "outbound" });
+    expect(links).toHaveLength(1);
+    expect(links[0]!.relationship).toBe("wikilink");
+  });
+
+  // vault#570 — update-note's content replace path gets the same
+  // unresolved_link/ambiguous_link treatment as create-note.
+  it("update-note content replace with a [[wikilink]] to a missing target: warns (unresolved_link)", async () => {
+    const note = await store.createNote("plain content", { path: "Updatable" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    const result = await updateNote.execute({
+      id: note.id,
+      content: "now references [[Not Yet Real]]",
+      force: true,
+    }) as any;
+
+    expect(result.warnings).toBeDefined();
+    expect(result.warnings[0].code).toBe("unresolved_link");
+    expect(result.warnings[0].target).toBe("Not Yet Real");
+
+    // A tags/links-only update on the SAME note must NOT re-surface the
+    // warning — nothing about content changed on this call.
+    const tagOnly = await updateNote.execute({
+      id: note.id,
+      tags: { add: ["x"] },
+      force: true,
+    }) as any;
+    expect(tagOnly.warnings).toBeUndefined();
+  });
+
+  it("update-note content replace with a [[wikilink]] to an AMBIGUOUS target: ambiguous_link, no edge", async () => {
+    await store.createNote("A", { path: "Folder1/Both" });
+    await store.createNote("B", { path: "Folder2/Both" });
+    const note = await store.createNote("plain content", { path: "Updatable2" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    const result = await updateNote.execute({
+      id: note.id,
+      content: "now references [[Both]]",
+      force: true,
+    }) as any;
+
+    expect(result.warnings).toBeDefined();
+    expect(result.warnings[0].code).toBe("ambiguous_link");
+    expect(result.warnings[0].candidate_count).toBe(2);
+    expect(await store.getLinks(note.id, { direction: "outbound" })).toHaveLength(0);
+  });
+
+  it("update-note tool updates created_at", async () => {
+    const note = await store.createNote("Test");
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const newDate = "2025-03-01T00:00:00.000Z";
+    const result = await updateNote.execute({ id: note.id, created_at: newDate, force: true }) as any;
+    expect(result.createdAt).toBe(newDate);
+    expect(result.content).toBe("Test");
+  });
+
+  it("update-note tool merges metadata", async () => {
+    const note = await store.createNote("Test", { metadata: { existing: "value" } });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const result = await updateNote.execute({ id: note.id, metadata: { importance: "high" }, force: true }) as any;
+    expect(result.metadata).toEqual({ existing: "value", importance: "high" });
+  });
+
+  it("update-note tags add/remove works", async () => {
+    const note = await store.createNote("Test");
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    // Add tags
+    await updateNote.execute({ id: note.id, tags: { add: ["pinned", "daily"] }, force: true });
+    expect((await store.getNote(note.id))!.tags).toContain("pinned");
+    expect((await store.getNote(note.id))!.tags).toContain("daily");
+
+    // Remove tags
+    await updateNote.execute({ id: note.id, tags: { remove: ["pinned"] }, force: true });
+    expect((await store.getNote(note.id))!.tags).not.toContain("pinned");
+    expect((await store.getNote(note.id))!.tags).toContain("daily");
+  });
+
+  // vault#555 fix 2 — a tag-only (or links-only) update-note call with
+  // `force: true` (no `if_updated_at`) used to leave `updated_at` frozen:
+  // the mcp.ts `updates` object had no core fields, so `store.updateNote`
+  // was never even called. Breaks cursor polling (ORDER BY updated_at) and
+  // any updated_at-based sync filter.
+  it("update-note tags-only mutation with force:true bumps updated_at", async () => {
+    const note = await store.createNote("Test");
+    const before = note.updatedAt;
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    await new Promise((r) => setTimeout(r, 5));
+
+    await updateNote.execute({ id: note.id, tags: { add: ["pinned"] }, force: true });
+    const after1 = (await store.getNote(note.id))!.updatedAt;
+    expect(after1).not.toBe(before);
+    expect(new Date(after1) > new Date(before)).toBe(true);
+
+    await new Promise((r) => setTimeout(r, 5));
+    await updateNote.execute({ id: note.id, tags: { remove: ["pinned"] }, force: true });
+    const after2 = (await store.getNote(note.id))!.updatedAt;
+    expect(new Date(after2) > new Date(after1)).toBe(true);
+  });
+
+  it("update-note links-only mutation with force:true bumps updated_at", async () => {
+    await store.createNote("A", { id: "a" });
+    await store.createNote("B", { id: "b" });
+    const before = (await store.getNote("a"))!.updatedAt;
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    await new Promise((r) => setTimeout(r, 5));
+
+    await updateNote.execute({ id: "a", links: { add: [{ target: "b", relationship: "mentions" }] }, force: true });
+    const after1 = (await store.getNote("a"))!.updatedAt;
+    expect(new Date(after1) > new Date(before)).toBe(true);
+
+    await new Promise((r) => setTimeout(r, 5));
+    await updateNote.execute({ id: "a", links: { remove: [{ target: "b", relationship: "mentions" }] }, force: true });
+    const after2 = (await store.getNote("a"))!.updatedAt;
+    expect(new Date(after2) > new Date(after1)).toBe(true);
+  });
+
+  it("update-note links add/remove works", async () => {
+    await store.createNote("A", { id: "a" });
+    await store.createNote("B", { id: "b" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    // Add link
+    await updateNote.execute({ id: "a", links: { add: [{ target: "b", relationship: "mentions" }] }, force: true });
+    expect(await store.getLinks("a", { direction: "outbound" })).toHaveLength(1);
+
+    // Remove link
+    await updateNote.execute({ id: "a", links: { remove: [{ target: "b", relationship: "mentions" }] }, force: true });
+    expect(await store.getLinks("a", { direction: "outbound" })).toHaveLength(0);
+  });
+
+  // vault#555 — update-note's links.add gets the same basename/title
+  // resolution + lazy forward-ref queueing as create-note's.
+  it("update-note links.add resolves by BASENAME and warns+queues when unresolvable", async () => {
+    await store.createNote("A", { id: "a" });
+    await store.createNote("Target", { path: "People/Bob" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    // Basename match
+    const byTitle = await updateNote.execute({
+      id: "a",
+      links: { add: [{ target: "Bob", relationship: "knows" }] },
+      force: true,
+    }) as any;
+    expect(byTitle.warnings).toBeUndefined();
+    expect(await store.getLinks("a", { direction: "outbound" })).toHaveLength(1);
+
+    // Unresolvable target: warns, queues, backfills later.
+    const unresolved = await updateNote.execute({
+      id: "a",
+      links: { add: [{ target: "Not Yet Real", relationship: "wants" }] },
+      force: true,
+    }) as any;
+    expect(unresolved.warnings).toBeDefined();
+    expect(unresolved.warnings[0].code).toBe("unresolved_link");
+    expect(unresolved.warnings[0].target).toBe("Not Yet Real");
+
+    const target = await store.createNote("arrived", { path: "Not Yet Real" });
+    const links = await store.getLinks("a", { direction: "outbound" });
+    expect(links.some((l) => l.targetId === target.id && l.relationship === "wants")).toBe(true);
+  });
+
+  // vault feedback #8 — echo hydrated links on the update response when the
+  // request mutated links OR `include_links` is set, so callers don't re-query.
+  it("update-note echoes hydrated links when the update mutates links", async () => {
+    await store.createNote("A", { id: "a" });
+    await store.createNote("B", { id: "b", path: "beta", tags: ["t"] });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const result = await updateNote.execute({
+      id: "a",
+      links: { add: [{ target: "b", relationship: "mentions" }] },
+      force: true,
+    }) as any;
+    expect(Array.isArray(result.links)).toBe(true);
+    expect(result.links).toHaveLength(1);
+    // Hydrated shape matches query-notes' include_links output.
+    const link = result.links[0];
+    expect(link.sourceId).toBe("a");
+    expect(link.targetId).toBe("b");
+    expect(link.relationship).toBe("mentions");
+    expect(link.targetNote.path).toBe("beta");
+    expect(link.targetNote.tags).toEqual(["t"]);
+  });
+
+  it("update-note echoes links on removal (post-removal set)", async () => {
+    await store.createNote("A", { id: "a" });
+    await store.createNote("B", { id: "b" });
+    await store.createNote("C", { id: "c" });
+    await store.createLink("a", "b", "mentions");
+    await store.createLink("a", "c", "mentions");
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const result = await updateNote.execute({
+      id: "a",
+      links: { remove: [{ target: "b", relationship: "mentions" }] },
+      force: true,
+    }) as any;
+    expect(result.links).toHaveLength(1);
+    expect(result.links[0].targetId).toBe("c");
+  });
+
+  it("update-note with include_links echoes links even without a mutation", async () => {
+    await store.createNote("A", { id: "a" });
+    await store.createNote("B", { id: "b" });
+    await store.createLink("a", "b", "mentions");
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const result = await updateNote.execute({
+      id: "a",
+      content: "updated",
+      include_links: true,
+      force: true,
+    }) as any;
+    expect(result.content).toBe("updated");
+    expect(result.links).toHaveLength(1);
+    expect(result.links[0].targetId).toBe("b");
+  });
+
+  it("update-note without a link mutation or flag does NOT echo links", async () => {
+    await store.createNote("A", { id: "a" });
+    await store.createNote("B", { id: "b" });
+    await store.createLink("a", "b", "mentions");
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const result = await updateNote.execute({ id: "a", content: "updated", force: true }) as any;
+    expect(result.content).toBe("updated");
+    expect(result).not.toHaveProperty("links");
+  });
+
+  it("update-note batch echoes links per-item (only on the mutated/flagged item)", async () => {
+    await store.createNote("A", { id: "a" });
+    await store.createNote("B", { id: "b" });
+    await store.createNote("C", { id: "c" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const result = await updateNote.execute({
+      notes: [
+        // Item 0 mutates links → echoes.
+        { id: "a", links: { add: [{ target: "b", relationship: "mentions" }] }, force: true },
+        // Item 1 only edits content, no flag → no links key.
+        { id: "c", content: "C updated", force: true },
+      ],
+    }) as any[];
+    expect(result).toHaveLength(2);
+    expect(result[0].links).toHaveLength(1);
+    expect(result[0].links[0].targetId).toBe("b");
+    expect(result[1]).not.toHaveProperty("links");
+  });
+
+  it("update-note if_missing=create with include_links echoes links (no link mutation)", async () => {
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    // The created note has no links yet and the payload declares none, so the
+    // echo is driven purely by the explicit `include_links` flag — closing the
+    // create-on-missing × flag-only matrix gap. Hydrated `links` key is present
+    // (empty array), not absent.
+    const result = await updateNote.execute({
+      id: "fresh-note",
+      content: "brand new",
+      if_missing: "create",
+      include_links: true,
+    }) as any;
+    expect(result.created).toBe(true);
+    expect(result.content).toBe("brand new");
+    expect(Array.isArray(result.links)).toBe(true);
+    expect(result.links).toHaveLength(0);
+  });
+
+  it("update-note removes wikilink brackets when removing wikilink-type link", async () => {
+    await store.createNote("Target", { id: "target", path: "People/Alice" });
+    const source = await store.createNote("See [[People/Alice]] for details", { id: "source" });
+    await store.createLink("source", "target", "wikilink");
+
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const result = await updateNote.execute({
+      id: "source",
+      links: { remove: [{ target: "target", relationship: "wikilink" }] },
+      force: true,
+    }) as any;
+    expect(result.content).toBe("See People/Alice for details");
+  });
+
+  it("update-note batch mode works", async () => {
+    const a = await store.createNote("A", { id: "a" });
+    const b = await store.createNote("B", { id: "b" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const result = await updateNote.execute({
+      notes: [
+        { id: "a", content: "A updated", force: true },
+        { id: "b", tags: { add: ["pinned"] }, force: true },
+      ],
+    }) as any[];
+    expect(result).toHaveLength(2);
+    expect(result[0].content).toBe("A updated");
+    expect((await store.getNote("b"))!.tags).toContain("pinned");
+  });
+
+  it("update-note resolves note by path", async () => {
+    await store.createNote("Test", { path: "Projects/README" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const result = await updateNote.execute({ id: "Projects/README", content: "Updated", force: true }) as any;
+    expect(result.content).toBe("Updated");
+  });
+
+  it("update-note accepts if_updated_at when it matches current updated_at", async () => {
+    const note = await store.createNote("First");
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    const first = await updateNote.execute({ id: note.id, content: "Second", force: true }) as any;
+    expect(first.content).toBe("Second");
+    expect(first.updatedAt).toBeTruthy();
+
+    const second = await updateNote.execute({
+      id: note.id,
+      content: "Third",
+      if_updated_at: first.updatedAt,
+    }) as any;
+    expect(second.content).toBe("Third");
+  });
+
+  it("update-note rejects if_updated_at mismatch with conflict error", async () => {
+    const note = await store.createNote("First");
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    const after = await updateNote.execute({ id: note.id, content: "Second", force: true }) as any;
+
+    // Simulate a stale client that has the pre-update timestamp (or something else).
+    const staleTimestamp = "2020-01-01T00:00:00.000Z";
+    expect(staleTimestamp).not.toBe(after.updatedAt);
+
+    let err: any;
+    try {
+      await updateNote.execute({
+        id: note.id,
+        content: "Third",
+        if_updated_at: staleTimestamp,
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeTruthy();
+    expect(err.code).toBe("CONFLICT");
+    expect(err.note_id).toBe(note.id);
+    expect(err.current_updated_at).toBe(after.updatedAt);
+    expect(err.expected_updated_at).toBe(staleTimestamp);
+
+    // Note unchanged
+    expect((await store.getNote(note.id))!.content).toBe("Second");
+  });
+
+  it("update-note if_updated_at conflicts when the caller's timestamp doesn't match", async () => {
+    const note = await store.createNote("First");
+    // A fresh note has updatedAt === createdAt. Sending a
+    // mismatching timestamp must still be rejected as a conflict.
+    expect(note.updatedAt).toBe(note.createdAt);
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    let err: any;
+    try {
+      await updateNote.execute({
+        id: note.id,
+        content: "Second",
+        if_updated_at: "2020-01-01T00:00:00.000Z",
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeTruthy();
+    expect(err.code).toBe("CONFLICT");
+    expect(err.current_updated_at).toBe(note.createdAt);
+  });
+
+  it("create-note returns updatedAt equal to createdAt on fresh notes", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const result = await createNote.execute({ content: "Hello" }) as any;
+    expect(result.updatedAt).toBeTruthy();
+    expect(result.updatedAt).toBe(result.createdAt);
+  });
+
+  it("update-note requires if_updated_at or force (precondition-required)", async () => {
+    const note = await store.createNote("Test", { path: "Inbox/x" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    let err: any;
+    try {
+      await updateNote.execute({ id: note.id, content: "changed" });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.code).toBe("PRECONDITION_REQUIRED");
+    expect(err.note_id).toBe(note.id);
+    expect(err.note_path).toBe("Inbox/x");
+    expect((await store.getNote(note.id))!.content).toBe("Test");
+  });
+
+  // ---- include_content response-shape opt-out (vault#285 friction point 2.response) ----
+  //
+  // Default behavior is unchanged: full Note is returned with `content`.
+  // Setting `include_content: false` swaps in the lean NoteIndex shape
+  // (drops content, adds byteSize + preview). Cuts the response cost on
+  // small-edit / large-note workflows.
+  describe("update-note include_content", () => {
+    it("defaults to full Note (back-compat)", async () => {
+      const note = await store.createNote("Original body", { path: "x" });
+      const tools = generateMcpTools(store);
+      const updateNote = tools.find((t) => t.name === "update-note")!;
+      const result = await updateNote.execute({
+        id: note.id,
+        content: "Replaced body",
+        force: true,
+      }) as any;
+      expect(result.content).toBe("Replaced body");
+      // Index-only fields must NOT appear on the back-compat shape.
+      expect(result.byteSize).toBeUndefined();
+      expect(result.preview).toBeUndefined();
+    });
+
+    it("include_content: false returns the lean NoteIndex shape", async () => {
+      const longBody = "a".repeat(5_000);
+      const note = await store.createNote(longBody, { path: "big-note" });
+      const tools = generateMcpTools(store);
+      const updateNote = tools.find((t) => t.name === "update-note")!;
+      const result = await updateNote.execute({
+        id: note.id,
+        append: " edit",
+        include_content: false,
+      }) as any;
+      // No content payload — that's the whole point of the opt-out.
+      expect(result.content).toBeUndefined();
+      // Index fields present.
+      expect(typeof result.byteSize).toBe("number");
+      expect(result.byteSize).toBe(5_000 + 5); // original + " edit"
+      expect(typeof result.preview).toBe("string");
+      expect(result.preview.length).toBeGreaterThan(0);
+      expect(result.id).toBe(note.id);
+      expect(result.path).toBe("big-note");
+      expect(result.updatedAt).toBeTruthy();
+    });
+
+    it("include_content: false applies uniformly across batch responses", async () => {
+      await store.createNote("A", { id: "a", path: "a" });
+      await store.createNote("B", { id: "b", path: "b" });
+      const tools = generateMcpTools(store);
+      const updateNote = tools.find((t) => t.name === "update-note")!;
+      const result = await updateNote.execute({
+        include_content: false,
+        notes: [
+          { id: "a", content: "A v2", force: true },
+          { id: "b", append: " v2" },
+        ],
+      }) as any[];
+      expect(result).toHaveLength(2);
+      for (const item of result) {
+        expect(item.content).toBeUndefined();
+        expect(typeof item.byteSize).toBe("number");
+        expect(typeof item.preview).toBe("string");
+      }
+    });
+
+    it("include_content: false preserves validation_status when present", async () => {
+      // Declare a tag schema with an indexed `priority` field that constrains
+      // values; then write a note whose metadata violates the schema, so
+      // attachValidationStatus has something to surface.
+      await store.upsertTagSchema("task", {
+        description: "tasks",
+        fields: {
+          priority: { type: "string", enum: ["low", "med", "high"], indexed: false },
+        },
+      });
+      await store.createNote("a task", { id: "t1", tags: ["task"] });
+      const tools = generateMcpTools(store);
+      const updateNote = tools.find((t) => t.name === "update-note")!;
+      const result = await updateNote.execute({
+        id: "t1",
+        metadata: { priority: "URGENT" }, // not in enum — generates a warning
+        include_content: false,
+        force: true,
+      }) as any;
+      expect(result.content).toBeUndefined();
+      expect(result.validation_status).toBeTruthy();
+      expect(Array.isArray(result.validation_status.warnings)).toBe(true);
+      expect(result.validation_status.warnings.length).toBeGreaterThan(0);
+    });
+  });
+
+  it("update-note force:true bypasses precondition and mutates unconditionally", async () => {
+    const note = await store.createNote("First");
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const result = await updateNote.execute({ id: note.id, content: "Second", force: true }) as any;
+    expect(result.content).toBe("Second");
+  });
+
+  it("update-note conflict error surfaces note_path", async () => {
+    const note = await store.createNote("First", { path: "Inbox/y" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    await updateNote.execute({ id: note.id, content: "Second", force: true });
+
+    let err: any;
+    try {
+      await updateNote.execute({
+        id: note.id,
+        content: "Third",
+        if_updated_at: "2020-01-01T00:00:00.000Z",
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.code).toBe("CONFLICT");
+    expect(err.note_path).toBe("Inbox/y");
+  });
+
+  it("update-note batch aborts on first conflict without touching subsequent items", async () => {
+    await store.createNote("A", { id: "a" });
+    await store.createNote("B", { id: "b" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    // Bump a's updated_at so any stale if_updated_at conflicts.
+    const bumped = await updateNote.execute({ id: "a", content: "A bumped", force: true }) as any;
+    expect(bumped.updatedAt).toBeTruthy();
+
+    let err: any;
+    try {
+      await updateNote.execute({
+        notes: [
+          { id: "a", content: "A new", if_updated_at: "2020-01-01T00:00:00.000Z" },
+          { id: "b", content: "B new", force: true },
+        ],
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.code).toBe("CONFLICT");
+
+    // a was not modified by this call; b was not touched.
+    expect((await store.getNote("a"))!.content).toBe("A bumped");
+    expect((await store.getNote("b"))!.content).toBe("B");
+  });
+
+  it("update-note is atomic under concurrent if_updated_at — exactly one winner", async () => {
+    // Fires two updates with the same if_updated_at via `Promise.allSettled`.
+    // bun:sqlite is synchronous, so these interleave at JS microtask
+    // boundaries rather than in true parallel — but that's the production
+    // concurrency model (one node, event-loop scheduling). The guarantee
+    // comes from the atomic conditional UPDATE in notes.ts: exactly one of
+    // the two statements can match `AND updated_at IS ?`. Without that
+    // atomicity both would commit and silently destroy one write — the
+    // scenario if_updated_at exists to prevent.
+    const note = await store.createNote("seed");
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    // Establish a known updated_at the two callers both read.
+    const seed = await updateNote.execute({ id: note.id, content: "seed-v1", force: true }) as any;
+    expect(seed.updatedAt).toBeTruthy();
+
+    const results = await Promise.allSettled([
+      updateNote.execute({ id: note.id, content: "racer-A", if_updated_at: seed.updatedAt }),
+      updateNote.execute({ id: note.id, content: "racer-B", if_updated_at: seed.updatedAt }),
+    ]);
+
+    const fulfilled = results.filter((r) => r.status === "fulfilled");
+    const rejected = results.filter((r) => r.status === "rejected");
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    const err = (rejected[0] as PromiseRejectedResult).reason as any;
+    expect(err?.code).toBe("CONFLICT");
+
+    // The winner's content is what ended up persisted.
+    const winner = (fulfilled[0] as PromiseFulfilledResult<any>).value;
+    const persisted = await store.getNote(note.id);
+    expect(persisted!.content).toBe(winner.content);
+    expect(["racer-A", "racer-B"]).toContain(persisted!.content);
+  });
+
+  it("update-note with links.remove rolls back link deletion when if_updated_at conflicts", async () => {
+    await store.createNote("Target", { id: "target", path: "People/Alice" });
+    const source = await store.createNote("See [[People/Alice]] for details", {
+      id: "source",
+    });
+    await store.createLink("source", "target", "wikilink");
+
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    // Bump so a stale if_updated_at conflicts; and capture state after bump.
+    await updateNote.execute({ id: "source", content: "See [[People/Alice]] for details", force: true });
+    const preConflictLinks = await store.getLinks("source", { direction: "outbound" });
+    expect(preConflictLinks).toHaveLength(1);
+
+    let err: any;
+    try {
+      await updateNote.execute({
+        id: "source",
+        links: { remove: [{ target: "target", relationship: "wikilink" }] },
+        if_updated_at: "2020-01-01T00:00:00.000Z",
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.code).toBe("CONFLICT");
+
+    // The link must still exist — if it had been removed before the
+    // conflict check, this would be 0.
+    const postConflictLinks = await store.getLinks("source", { direction: "outbound" });
+    expect(postConflictLinks).toHaveLength(1);
+    expect((await store.getNote("source"))!.content).toBe("See [[People/Alice]] for details");
+  });
+
+  it("update-note append concatenates to end without precondition", async () => {
+    const note = await store.createNote("first line\n", { id: "n1" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    // No if_updated_at and no force — append-only is precondition-exempt.
+    const result = await updateNote.execute({ id: note.id, append: "second line\n" }) as any;
+    expect(result.content).toBe("first line\nsecond line\n");
+
+    const persisted = await store.getNote(note.id);
+    expect(persisted!.content).toBe("first line\nsecond line\n");
+  });
+
+  it("update-note prepend concatenates to start without precondition", async () => {
+    const note = await store.createNote("body", { id: "n1" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    const result = await updateNote.execute({ id: note.id, prepend: "header\n" }) as any;
+    expect(result.content).toBe("header\nbody");
+  });
+
+  it("update-note prepend on frontmatter-led content injects after closing --- (#203)", async () => {
+    const original = "---\ntitle: Foo\ntags: [bar]\n---\nbody line 1\n";
+    const note = await store.createNote(original, { id: "n1" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    const result = await updateNote.execute({ id: note.id, prepend: "preamble\n" }) as any;
+    // Frontmatter still at byte 0 — parsers expecting `---\n` will find it.
+    expect(result.content.startsWith("---\ntitle: Foo\ntags: [bar]\n---\n")).toBe(true);
+    // Prepend lands immediately after the closing fence, before the body.
+    expect(result.content).toBe(
+      "---\ntitle: Foo\ntags: [bar]\n---\npreamble\nbody line 1\n",
+    );
+  });
+
+  it("update-note prepend on content lacking frontmatter injects at byte 0", async () => {
+    const note = await store.createNote("# Heading\nbody\n", { id: "n1" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    const result = await updateNote.execute({ id: note.id, prepend: "preamble\n" }) as any;
+    expect(result.content).toBe("preamble\n# Heading\nbody\n");
+  });
+
+  it("update-note append+prepend in one call lands both contributions", async () => {
+    const note = await store.createNote("middle", { id: "n1" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    const result = await updateNote.execute({
+      id: note.id,
+      prepend: "[start] ",
+      append: " [end]",
+    }) as any;
+    expect(result.content).toBe("[start] middle [end]");
+  });
+
+  it("update-note rejects content + append in same call", async () => {
+    const note = await store.createNote("body", { id: "n1" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    let err: any;
+    try {
+      await updateNote.execute({ id: note.id, content: "new", append: "more", force: true });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.message).toMatch(/mutually exclusive/);
+  });
+
+  it("update-note rejects content + content_edit in same call", async () => {
+    const note = await store.createNote("hello world", { id: "n1" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    let err: any;
+    try {
+      await updateNote.execute({
+        id: note.id,
+        content: "replace",
+        content_edit: { old_text: "hello", new_text: "hi" },
+        force: true,
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.message).toMatch(/mutually exclusive/);
+  });
+
+  it("update-note rejects append + content_edit in same call", async () => {
+    const note = await store.createNote("hello world", { id: "n1" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    let err: any;
+    try {
+      await updateNote.execute({
+        id: note.id,
+        append: " more",
+        content_edit: { old_text: "hello", new_text: "hi" },
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.message).toMatch(/mutually exclusive/);
+  });
+
+  it("update-note append still requires precondition when combined with other fields", async () => {
+    const note = await store.createNote("body", { id: "n1" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    // append + metadata is NOT precondition-exempt — metadata mutation
+    // can lose data on a stale read, so the safety gate stays in.
+    let err: any;
+    try {
+      await updateNote.execute({ id: note.id, append: " more", metadata: { x: 1 } });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.code).toBe("PRECONDITION_REQUIRED");
+  });
+
+  it("update-note append is atomic under concurrent calls — both lands", async () => {
+    const note = await store.createNote("seed:", { id: "n1" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    // Two concurrent appends. SQL-level concat means both contributions
+    // land — neither overwrites the other.
+    const results = await Promise.all([
+      updateNote.execute({ id: note.id, append: " A" }),
+      updateNote.execute({ id: note.id, append: " B" }),
+    ]);
+    expect(results).toHaveLength(2);
+
+    const persisted = await store.getNote(note.id);
+    // Final content is one of "seed: A B" or "seed: B A" — the order
+    // depends on which write got the lock first, but both contributions
+    // are present.
+    expect(persisted!.content === "seed: A B" || persisted!.content === "seed: B A").toBe(true);
+  });
+
+  it("update-note append updates updated_at and respects if_updated_at when supplied", async () => {
+    const note = await store.createNote("seed", { id: "n1" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    // With if_updated_at — succeeds because we're using the right token.
+    const ok = await updateNote.execute({ id: note.id, append: " A", if_updated_at: note.updatedAt }) as any;
+    expect(ok.content).toBe("seed A");
+    expect(ok.updatedAt).not.toBe(note.updatedAt);
+
+    // Stale token — conflict.
+    let err: any;
+    try {
+      await updateNote.execute({ id: note.id, append: " B", if_updated_at: note.updatedAt });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.code).toBe("CONFLICT");
+  });
+
+  it("update-note append parses new wikilinks introduced via append", async () => {
+    const target = await store.createNote("Alice's note", { id: "alice", path: "People/Alice" });
+    const source = await store.createNote("intro\n", { id: "src" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    await updateNote.execute({ id: source.id, append: "see [[People/Alice]]" });
+
+    const links = await store.getLinks(source.id, { direction: "outbound" });
+    expect(links.some((l) => l.targetId === target.id && l.relationship === "wikilink")).toBe(true);
+  });
+
+  it("update-note content_edit replaces a single occurrence", async () => {
+    const note = await store.createNote("hello world", { id: "n1" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    const result = await updateNote.execute({
+      id: note.id,
+      content_edit: { old_text: "hello", new_text: "hi" },
+      if_updated_at: note.updatedAt,
+    }) as any;
+    expect(result.content).toBe("hi world");
+  });
+
+  it("update-note content_edit errors when old_text is not found", async () => {
+    const note = await store.createNote("hello world", { id: "n1" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    let err: any;
+    try {
+      await updateNote.execute({
+        id: note.id,
+        content_edit: { old_text: "missing", new_text: "x" },
+        if_updated_at: note.updatedAt,
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.message).toMatch(/not found/);
+    // Note must be untouched.
+    const persisted = await store.getNote(note.id);
+    expect(persisted!.content).toBe("hello world");
+  });
+
+  it("update-note content_edit errors when old_text matches multiple times", async () => {
+    const note = await store.createNote("hello hello", { id: "n1" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    let err: any;
+    try {
+      await updateNote.execute({
+        id: note.id,
+        content_edit: { old_text: "hello", new_text: "hi" },
+        if_updated_at: note.updatedAt,
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.message).toMatch(/matches multiple times|exactly once/);
+    const persisted = await store.getNote(note.id);
+    expect(persisted!.content).toBe("hello hello");
+  });
+
+  it("update-note content_edit requires precondition by default", async () => {
+    const note = await store.createNote("hello world", { id: "n1" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    let err: any;
+    try {
+      await updateNote.execute({
+        id: note.id,
+        content_edit: { old_text: "hello", new_text: "hi" },
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.code).toBe("PRECONDITION_REQUIRED");
+  });
+
+  it("update-note content_edit conflicts when if_updated_at is stale", async () => {
+    const note = await store.createNote("hello world", { id: "n1" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    // Bump the note so a stale token will conflict at the SQL layer.
+    await updateNote.execute({ id: note.id, content: "hello world", force: true });
+
+    let err: any;
+    try {
+      await updateNote.execute({
+        id: note.id,
+        content_edit: { old_text: "hello", new_text: "hi" },
+        if_updated_at: "2020-01-01T00:00:00.000Z",
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.code).toBe("CONFLICT");
+  });
+
+  // vault#555 fix 7 (INVESTIGATE) — a tester reported update-note batch
+  // AND parallel singles failing 7/8 with "old_text not found" when
+  // multiple items share the SAME content_edit.old_text, though each
+  // succeeded standalone. The orchestrator could NOT reproduce live (repro
+  // hit shell artifacts). Investigated here with proper in-memory tests:
+  //
+  //   - Batch AND parallel-singles, N items EACH TARGETING A DIFFERENT
+  //     note, all sharing the same old_text: every item succeeds. Each
+  //     item resolves its OWN note's content fresh (there's no shared
+  //     mutable state across items/calls — `resolveNote` reads straight
+  //     off the DB per item, and the content_edit search+replace is pure
+  //     synchronous JS with no `await` between the read and the write, so
+  //     two "parallel" async calls can't interleave mid-computation
+  //     either). Re-run 20x below with zero failures.
+  //   - The one scenario that DOES reproduce "1 succeeds, 7 fail
+  //     content_edit_not_found" is N calls sharing the same old_text
+  //     against the SAME note — and that's CORRECT behavior (the first
+  //     call consumes the only occurrence; the rest correctly report it's
+  //     gone), not a bug. This is the most plausible explanation for what
+  //     was actually observed: a test harness that accidentally pointed
+  //     every call at one note (a variable/loop bug — "shell artifacts")
+  //     rather than N distinct notes.
+  //
+  // VERDICT: not reproducible as a real bug against different notes. No
+  // fix applied — these tests document the correct behavior.
+  it("update-note BATCH: N items with the SAME content_edit.old_text on DIFFERENT notes all succeed", async () => {
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const N = 8;
+    const notes = [];
+    for (let i = 0; i < N; i++) {
+      notes.push(await store.createNote(`prefix TARGET_TEXT suffix-${i}`, { path: `batch-ce-${i}` }));
+    }
+
+    const result = await updateNote.execute({
+      notes: notes.map((n) => ({
+        id: n.id,
+        content_edit: { old_text: "TARGET_TEXT", new_text: "REPLACED" },
+        force: true,
+      })),
+    }) as any[];
+
+    expect(result).toHaveLength(N);
+    for (let i = 0; i < N; i++) {
+      expect(result[i].content).toBe(`prefix REPLACED suffix-${i}`);
+    }
+  });
+
+  it("update-note PARALLEL SINGLES: N concurrent calls with the SAME content_edit.old_text on DIFFERENT notes all succeed", async () => {
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const N = 8;
+    const notes = [];
+    for (let i = 0; i < N; i++) {
+      notes.push(await store.createNote(`prefix TARGET_TEXT suffix-${i}`, { path: `parallel-ce-${i}` }));
+    }
+
+    const results = await Promise.all(
+      notes.map((n) =>
+        updateNote.execute({
+          id: n.id,
+          content_edit: { old_text: "TARGET_TEXT", new_text: "REPLACED" },
+          force: true,
+        }),
+      ),
+    ) as any[];
+
+    for (let i = 0; i < N; i++) {
+      expect(results[i].content).toBe(`prefix REPLACED suffix-${i}`);
+    }
+  });
+
+  it("update-note PARALLEL SINGLES with shared old_text: 20 repeated trials, zero failures (flake hunt)", async () => {
+    for (let trial = 0; trial < 20; trial++) {
+      const trialDb = new Database(":memory:");
+      const trialStore = new SqliteStore(trialDb);
+      const tools = generateMcpTools(trialStore);
+      const updateNote = tools.find((t) => t.name === "update-note")!;
+      const N = 8;
+      const notes = [];
+      for (let i = 0; i < N; i++) {
+        notes.push(await trialStore.createNote(`prefix TARGET_TEXT suffix-${i}`, { path: `flake-${i}` }));
+      }
+      const outcomes = await Promise.allSettled(
+        notes.map((n) =>
+          updateNote.execute({
+            id: n.id,
+            content_edit: { old_text: "TARGET_TEXT", new_text: "REPLACED" },
+            force: true,
+          }),
+        ),
+      );
+      const failures = outcomes.filter((o) => o.status === "rejected");
+      expect(failures.length).toBe(0);
+    }
+  });
+
+  it("update-note with shared old_text against the SAME note: 1 succeeds, 7 correctly fail (documents the LIKELY source of the original report — not a bug)", async () => {
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const note = await store.createNote("prefix TARGET_TEXT suffix", { path: "shared-ce" });
+
+    const outcomes = await Promise.allSettled(
+      Array.from({ length: 8 }, () =>
+        updateNote.execute({
+          id: note.id,
+          content_edit: { old_text: "TARGET_TEXT", new_text: "REPLACED" },
+          force: true,
+        }),
+      ),
+    );
+    const succeeded = outcomes.filter((o) => o.status === "fulfilled").length;
+    const failed = outcomes.filter((o) => o.status === "rejected");
+    expect(succeeded).toBe(1);
+    expect(failed).toHaveLength(7);
+    for (const f of failed) {
+      expect((f as PromiseRejectedResult).reason.error_type).toBe("content_edit_not_found");
+    }
+  });
+
+  it("query-notes single note by id", async () => {
+    const note = await store.createNote("Hello", { path: "test/note" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ id: note.id }) as any;
+    expect(result.content).toBe("Hello");
+    expect(result.path).toBe("test/note");
+    // updatedAt is the optimistic-concurrency token. Callers can't arm a
+    // followup update without it, so it must always come back from a
+    // single-note fetch.
+    expect(result.updatedAt).toBeTruthy();
+    expect(result.updatedAt).toBe(note.updatedAt);
+  });
+
+  describe("metadata is always present on the wire (V1.1)", () => {
+    it("a note created with no metadata reads back with an empty-object `metadata` key, not an absent one", async () => {
+      const note = await store.createNote("No metadata here");
+      expect("metadata" in note).toBe(true);
+      expect(note.metadata).toEqual({});
+      // The real acid test: does the key survive a JSON round-trip, or does
+      // `JSON.stringify` drop it because it's `undefined`?
+      expect(JSON.parse(JSON.stringify(note))).toHaveProperty("metadata", {});
+
+      const fetched = await store.getNote(note.id);
+      expect(fetched).toHaveProperty("metadata", {});
+      expect(JSON.parse(JSON.stringify(fetched))).toHaveProperty("metadata", {});
+
+      // `tags` has always been unconditionally present ([]) — confirm that
+      // invariant still holds alongside the metadata fix.
+      expect(note.tags).toEqual([]);
+    });
+
+    it("a note whose metadata was explicitly written as {} also reads back with metadata: {}", async () => {
+      const note = await store.createNote("Explicit empty metadata", { metadata: {} });
+      expect(note.metadata).toEqual({});
+      const fetched = await store.getNote(note.id);
+      expect(fetched!.metadata).toEqual({});
+    });
+
+    it("a note WITH real metadata is unchanged by the fix", async () => {
+      const note = await store.createNote("Has metadata", { metadata: { source: "import", version: 2 } });
+      expect(note.metadata).toEqual({ source: "import", version: 2 });
+      const fetched = await store.getNote(note.id);
+      expect(fetched!.metadata).toEqual({ source: "import", version: 2 });
+    });
+
+    it("queryNotes list results carry metadata: {} on metadata-less notes", async () => {
+      await store.createNote("List entry, no metadata");
+      const results = await store.queryNotes({});
+      expect(results.length).toBeGreaterThan(0);
+      for (const r of results) {
+        expect(r).toHaveProperty("metadata", {});
+      }
+    });
+
+    it("searchNotes results carry metadata: {} on metadata-less notes", async () => {
+      await store.createNote("Findable via search, no metadata");
+      const results = await store.searchNotes("Findable");
+      expect(results.length).toBeGreaterThan(0);
+      for (const r of results) {
+        expect(r).toHaveProperty("metadata", {});
+      }
+    });
+
+    it("MCP query-notes (single by id) carries metadata: {} on a metadata-less note", async () => {
+      const note = await store.createNote("MCP single, no metadata");
+      const tools = generateMcpTools(store);
+      const query = tools.find((t) => t.name === "query-notes")!;
+      const result = await query.execute({ id: note.id }) as any;
+      expect(result).toHaveProperty("metadata", {});
+      expect(JSON.parse(JSON.stringify(result))).toHaveProperty("metadata", {});
+    });
+
+    it("MCP query-notes (list) carries metadata: {} on metadata-less notes", async () => {
+      await store.createNote("MCP list, no metadata");
+      const tools = generateMcpTools(store);
+      const query = tools.find((t) => t.name === "query-notes")!;
+      const result = await query.execute({}) as any;
+      const list = Array.isArray(result) ? result : result.notes;
+      expect(list.length).toBeGreaterThan(0);
+      for (const r of list) {
+        expect(r).toHaveProperty("metadata", {});
+      }
+    });
+  });
+
+  it("query-notes single note by path", async () => {
+    await store.createNote("By Path", { path: "Projects/README" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ id: "Projects/README" }) as any;
+    expect(result.content).toBe("By Path");
+  });
+
+  // ---- Title-fallback id resolution (additive — vault "title-fallback link + id resolution") ----
+
+  it("query-notes single note by H1 title when id AND path both miss", async () => {
+    await store.createNote("# My Great Note\n\nBody.", { path: "Inbox/2026-07-10-xyz" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ id: "My Great Note" }) as any;
+    expect(result.content).toBe("# My Great Note\n\nBody.");
+    expect(result.path).toBe("Inbox/2026-07-10-xyz");
+  });
+
+  it("query-notes exact path still wins over a same-named title on another note", async () => {
+    const byPath = await store.createNote("Path note", { path: "My Great Note" });
+    await store.createNote("# My Great Note\n\nOther body.", { path: "Inbox/other" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ id: "My Great Note" }) as any;
+    expect(result.id).toBe(byPath.id);
+    expect(result.content).toBe("Path note");
+  });
+
+  it("query-notes stays unresolved (not_found) when 2+ notes share the same H1 title", async () => {
+    await store.createNote("# Dup Note\n\nA.", { path: "Inbox/dup-a" });
+    await store.createNote("# Dup Note\n\nB.", { path: "Inbox/dup-b" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ id: "Dup Note" }) as any;
+    expect(result.error_type).toBe("not_found");
+  });
+
+  it("query-notes by tag", async () => {
+    await store.createNote("Test", { tags: ["daily"] });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ tag: ["daily"] }) as any[];
+    expect(result).toHaveLength(1);
+  });
+
+  it("query-notes has_tags=false surfaces untagged notes", async () => {
+    await store.createNote("Tagged", { tags: ["daily"] });
+    await store.createNote("Plain");
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ has_tags: false, include_content: true }) as any[];
+    expect(result.map((n) => n.content)).toEqual(["Plain"]);
+  });
+
+  it("query-notes has_links=false surfaces orphaned notes", async () => {
+    const a = await store.createNote("Source", { id: "mq-a" });
+    const b = await store.createNote("Target", { id: "mq-b" });
+    await store.createNote("Orphan", { id: "mq-o" });
+    await store.createLink(a.id, b.id, "mentions");
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ has_links: false, include_content: true }) as any[];
+    expect(result.map((n) => n.content)).toEqual(["Orphan"]);
+  });
+
+  // ---- has_broken_links / include_broken_links (vault#555) ----
+
+  it("query-notes has_broken_links=true surfaces only notes with a dangling wikilink", async () => {
+    await store.createNote("[[Nonexistent Target]]", { id: "mq-broken", path: "mq-broken" });
+    await store.createNote("no links here", { id: "mq-clean", path: "mq-clean" });
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ has_broken_links: true, include_content: true }) as any[];
+    expect(result.map((n) => n.path)).toEqual(["mq-broken"]);
+  });
+
+  it("query-notes has_broken_links=false excludes notes with a dangling link", async () => {
+    await store.createNote("[[Nonexistent Target]]", { id: "mq-broken2", path: "mq-broken2" });
+    await store.createNote("no links here", { id: "mq-clean2", path: "mq-clean2" });
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ has_broken_links: false, include_content: true }) as any[];
+    expect(result.map((n) => n.path).sort()).toEqual(["mq-clean2"]);
+  });
+
+  it("query-notes has_broken_links is safe on a vault where no link has ever gone unresolved", async () => {
+    // Fresh store, beforeEach — the unresolved_wikilinks table has never
+    // been created. true should match nothing (not throw); false should
+    // be a no-op (matches everything).
+    await store.createNote("plain note", { id: "mq-nolinks", path: "mq-nolinks" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const truthy = await query.execute({ has_broken_links: true, include_content: true }) as any[];
+    expect(truthy).toEqual([]);
+    const falsy = await query.execute({ has_broken_links: false, include_content: true }) as any[];
+    expect(falsy.map((n) => n.path)).toEqual(["mq-nolinks"]);
+  });
+
+  it("a target created later resolves the wikilink and the note drops out of has_broken_links:true", async () => {
+    await store.createNote("[[Later Target]]", { id: "mq-fixable", path: "mq-fixable" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    expect((await query.execute({ has_broken_links: true }) as any[]).length).toBe(1);
+
+    await store.createNote("here now", { path: "Later Target" });
+    expect((await query.execute({ has_broken_links: true }) as any[]).length).toBe(0);
+  });
+
+  it("query-notes include_broken_links surfaces {target, relationship} for a single note", async () => {
+    await store.createNote("[[Missing Note]]", { id: "mq-single-broken", path: "mq-single-broken" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ id: "mq-single-broken", include_broken_links: true }) as any;
+    expect(result.broken_links).toEqual([{ target: "Missing Note", relationship: "wikilink" }]);
+  });
+
+  it("query-notes include_broken_links surfaces a structured link's unresolved_link entry too", async () => {
+    const created = await generateMcpTools(store).find((t) => t.name === "create-note")!.execute({
+      content: "body",
+      path: "mq-structured-broken",
+      links: [{ target: "Does Not Exist", relationship: "depends-on" }],
+    }) as any;
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ id: created.id, include_broken_links: true }) as any;
+    expect(result.broken_links).toEqual([{ target: "Does Not Exist", relationship: "depends-on" }]);
+  });
+
+  it("query-notes include_broken_links is [] for a note with no dangling links", async () => {
+    await store.createNote("clean", { id: "mq-clean-single", path: "mq-clean-single" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ id: "mq-clean-single", include_broken_links: true }) as any;
+    expect(result.broken_links).toEqual([]);
+  });
+
+  it("query-notes include_broken_links works in list mode, batched across the page", async () => {
+    await store.createNote("[[Ghost A]]", { id: "mq-list-a", path: "mq-list-a" });
+    await store.createNote("[[Ghost B]]", { id: "mq-list-b", path: "mq-list-b" });
+    await store.createNote("clean", { id: "mq-list-c", path: "mq-list-c" });
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ include_broken_links: true, include_content: true }) as any[];
+    const byId = new Map(result.map((n: any) => [n.id, n.broken_links]));
+    expect(byId.get("mq-list-a")).toEqual([{ target: "Ghost A", relationship: "wikilink" }]);
+    expect(byId.get("mq-list-b")).toEqual([{ target: "Ghost B", relationship: "wikilink" }]);
+    expect(byId.get("mq-list-c")).toEqual([]);
+  });
+
+  // ---- has_ambiguous_links / include_ambiguous_links (vault#581) ----
+  //
+  // Symmetric with the has_broken_links block above. Before #581 an
+  // ambiguous target was visible ONLY in the transient write-time
+  // `ambiguous_link` warning — nothing was persisted, so `has_broken_links`
+  // did not match the note (it was classified CLEAN by
+  // `has_broken_links: false`) and a later audit could not find it.
+
+  it("query-notes has_ambiguous_links=true surfaces only notes whose wikilink matched two notes", async () => {
+    await store.createNote("first", { id: "mq-amb-c1", path: "one/Dup" });
+    await store.createNote("second", { id: "mq-amb-c2", path: "two/Dup" });
+    await store.createNote("see [[Dup]]", { id: "mq-amb-src", path: "mq-amb-src" });
+    await store.createNote("no links here", { id: "mq-amb-clean", path: "mq-amb-clean" });
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ has_ambiguous_links: true, include_content: true }) as any[];
+    expect(result.map((n) => n.path)).toEqual(["mq-amb-src"]);
+  });
+
+  it("query-notes has_ambiguous_links=false excludes notes with an ambiguous link", async () => {
+    await store.createNote("first", { path: "a/Twin" });
+    await store.createNote("second", { path: "b/Twin" });
+    await store.createNote("see [[Twin]]", { id: "mq-amb-src2", path: "mq-amb-src2" });
+    await store.createNote("clean", { id: "mq-amb-clean2", path: "mq-amb-clean2" });
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ has_ambiguous_links: false, include_content: true }) as any[];
+    expect(result.map((n) => n.path).sort()).toEqual(["a/Twin", "b/Twin", "mq-amb-clean2"]);
+  });
+
+  it("an ambiguous link is NOT counted as a broken link (the two filters are disjoint)", async () => {
+    await store.createNote("first", { path: "x/Both" });
+    await store.createNote("second", { path: "y/Both" });
+    await store.createNote("see [[Both]]", { id: "mq-amb-disjoint", path: "mq-amb-disjoint" });
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    expect((await query.execute({ has_broken_links: true }) as any[]).map((n: any) => n.id)).toEqual([]);
+    expect((await query.execute({ has_ambiguous_links: true }) as any[]).map((n: any) => n.id)).toEqual(["mq-amb-disjoint"]);
+  });
+
+  it("query-notes has_ambiguous_links is safe on a vault where no link has ever been ambiguous", async () => {
+    // Fresh store, beforeEach — the ambiguous_wikilinks table has never been
+    // created. true should match nothing (not throw); false should be a
+    // no-op (matches everything). Mirrors the has_broken_links pin above.
+    await store.createNote("plain note", { id: "mq-amb-none", path: "mq-amb-none" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const truthy = await query.execute({ has_ambiguous_links: true, include_content: true }) as any[];
+    expect(truthy).toEqual([]);
+    const falsy = await query.execute({ has_ambiguous_links: false, include_content: true }) as any[];
+    expect(falsy.map((n) => n.path)).toEqual(["mq-amb-none"]);
+  });
+
+  it("query-notes include_ambiguous_links surfaces {target, relationship, candidate_count} for a single note", async () => {
+    await store.createNote("first", { path: "p/Ghost" });
+    await store.createNote("second", { path: "q/Ghost" });
+    await store.createNote("see [[Ghost]]", { id: "mq-amb-single", path: "mq-amb-single" });
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ id: "mq-amb-single", include_ambiguous_links: true }) as any;
+    expect(result.ambiguous_links).toEqual([{ target: "Ghost", relationship: "wikilink", candidate_count: 2 }]);
+  });
+
+  it("query-notes include_ambiguous_links surfaces a structured link's ambiguous_link entry too", async () => {
+    await store.createNote("first", { path: "s1/Fork" });
+    await store.createNote("second", { path: "s2/Fork" });
+    const created = await generateMcpTools(store).find((t) => t.name === "create-note")!.execute({
+      content: "body",
+      path: "mq-amb-structured",
+      links: [{ target: "Fork", relationship: "depends-on" }],
+    }) as any;
+    expect(created.warnings?.[0]?.code).toBe("ambiguous_link");
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ id: created.id, include_ambiguous_links: true }) as any;
+    expect(result.ambiguous_links).toEqual([{ target: "Fork", relationship: "depends-on", candidate_count: 2 }]);
+    expect((await query.execute({ has_ambiguous_links: true }) as any[]).map((n: any) => n.id)).toEqual([created.id]);
+  });
+
+  it("query-notes include_ambiguous_links is [] for a note with no ambiguous links", async () => {
+    await store.createNote("clean", { id: "mq-amb-clean-single", path: "mq-amb-clean-single" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ id: "mq-amb-clean-single", include_ambiguous_links: true }) as any;
+    expect(result.ambiguous_links).toEqual([]);
+  });
+
+  it("query-notes include_ambiguous_links works in list mode, batched across the page", async () => {
+    await store.createNote("first", { path: "l1/Echo" });
+    await store.createNote("second", { path: "l2/Echo" });
+    await store.createNote("see [[Echo]]", { id: "mq-amb-list-a", path: "mq-amb-list-a" });
+    await store.createNote("also [[Echo]]", { id: "mq-amb-list-b", path: "mq-amb-list-b" });
+    await store.createNote("clean", { id: "mq-amb-list-c", path: "mq-amb-list-c" });
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ include_ambiguous_links: true, include_content: true }) as any[];
+    const byId = new Map(result.map((n: any) => [n.id, n.ambiguous_links]));
+    expect(byId.get("mq-amb-list-a")).toEqual([{ target: "Echo", relationship: "wikilink", candidate_count: 2 }]);
+    expect(byId.get("mq-amb-list-b")).toEqual([{ target: "Echo", relationship: "wikilink", candidate_count: 2 }]);
+    expect(byId.get("mq-amb-list-c")).toEqual([]);
+  });
+
+  // ---- self-healing: ambiguity must resolve when it stops being ambiguous ----
+
+  it("deleting one colliding candidate resolves the ambiguity — link created, note drops out of has_ambiguous_links", async () => {
+    const keep = await store.createNote("first", { path: "keep/Heal" });
+    const drop = await store.createNote("second", { path: "drop/Heal" });
+    const src = await store.createNote("see [[Heal]]", { id: "mq-amb-heal", path: "mq-amb-heal" });
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    expect((await query.execute({ has_ambiguous_links: true }) as any[]).length).toBe(1);
+
+    await store.deleteNote(drop.id);
+    expect((await query.execute({ has_ambiguous_links: true }) as any[]).length).toBe(0);
+    const links = await query.execute({ id: src.id, include_links: true }) as any;
+    expect(links.links.map((l: any) => l.targetId)).toEqual([keep.id]);
+  });
+
+  it("renaming one colliding candidate out of the way resolves a structured link's ambiguity", async () => {
+    // Structured links (and typed `reference` fields) are the clean rename
+    // case: unlike a content [[wikilink]], nothing rewrites the stored
+    // target string, so the sweep is the only thing that can heal it.
+    const keep = await store.createNote("first", { path: "keep/Fork" });
+    const moved = await store.createNote("second", { path: "move/Fork" });
+    const created = await generateMcpTools(store).find((t) => t.name === "create-note")!.execute({
+      content: "body", path: "mq-amb-rename", links: [{ target: "Fork", relationship: "depends-on" }],
+    }) as any;
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    expect((await query.execute({ has_ambiguous_links: true }) as any[]).map((n: any) => n.id)).toEqual([created.id]);
+
+    await store.updateNote(moved.id, { path: "move/Elsewhere" });
+    expect((await query.execute({ has_ambiguous_links: true }) as any[]).length).toBe(0);
+    const links = await query.execute({ id: created.id, include_links: true }) as any;
+    expect(links.links.map((l: any) => [l.targetId, l.relationship])).toEqual([[keep.id, "depends-on"]]);
+  });
+
+  it("renaming a colliding candidate also clears a content wikilink's ambiguity (via cascadeRename)", async () => {
+    // vault#708 — an AMBIGUOUS `[[Rename]]` never pointed at the renamed
+    // note (it pointed at nothing: two candidates, no `links` row), so the
+    // cascade must leave the text alone and let the vault#581 sweep heal it.
+    // With `move/Rename` moved away, `keep/Rename` is the only candidate
+    // left, so the bracket resolves to KEEP. Before vault#708 the cascade
+    // rewrote the text to `[[Elsewhere]]` on a basename match and the link
+    // followed the note that moved away — the bug this pin used to record.
+    const keep = await store.createNote("first", { path: "keep/Rename" });
+    const moved = await store.createNote("second", { path: "move/Rename" });
+    const src = await store.createNote("see [[Rename]]", { id: "mq-amb-rename2", path: "mq-amb-rename2" });
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    expect((await query.execute({ has_ambiguous_links: true }) as any[]).length).toBe(1);
+
+    await store.updateNote(moved.id, { path: "move/Elsewhere" });
+    expect((await query.execute({ has_ambiguous_links: true }) as any[]).length).toBe(0);
+    expect((await store.getNote(src.id))!.content).toBe("see [[Rename]]");
+    const links = await query.execute({ id: src.id, include_links: true }) as any;
+    expect(links.links.map((l: any) => l.targetId)).toEqual([keep.id]);
+  });
+
+  // ---- vault#239: the visibility model reaches the BROKEN-links surface ----
+  //
+  // vault#581's auth review made the AMBIGUOUS surface answer on a scoped
+  // reader's own sub-vault (>=2 VISIBLE candidates). The same question has a
+  // second answer core must give: 0 visible candidates means the reference is
+  // BROKEN for that reader — whichever table its row currently lives in.
+  //
+  // Without this, `refreshAmbiguousLinks`' delete-time demotion into
+  // `unresolved_wikilinks` is the ONLY thing that makes such a note "broken",
+  // so the answer flips purely because notes the reader can't see were
+  // deleted. Core stays scope-unaware: it just invokes the injected
+  // `ambiguityVisible` closure, exactly as the ambiguity surface does.
+
+  /** `[[Dup]]` with two candidates, neither of which `visibleIds` contains. */
+  async function hiddenCandidates(prefix: string) {
+    const h1 = await store.createNote("hidden one", { path: `${prefix}-p1/Dup` });
+    const h2 = await store.createNote("hidden two", { path: `${prefix}-p2/Dup` });
+    const src = await store.createNote("see [[Dup]]", { id: `${prefix}-src`, path: `${prefix}-src` });
+    return { h1, h2, src, hidden: new Set([h1.id, h2.id]) };
+  }
+
+  it("include_broken_links reports a target whose only candidates fail the visibility predicate", async () => {
+    const { src, hidden } = await hiddenCandidates("mq-vis-brk");
+    const tools = generateMcpTools(store, { ambiguityVisible: (id: string) => !hidden.has(id) });
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await query.execute({ id: src.id, include_broken_links: true }) as any;
+    expect(result.broken_links).toEqual([{ target: "Dup", relationship: "wikilink" }]);
+    // ...and it is NOT also reported as ambiguous (the surfaces stay disjoint).
+    expect((await query.execute({ id: src.id, include_ambiguous_links: true }) as any).ambiguous_links)
+      .toEqual([]);
+  });
+
+  it("has_broken_links answers on the visible sub-vault and does not move when a hidden candidate is deleted", async () => {
+    const { src, h1, h2, hidden } = await hiddenCandidates("mq-vis-heal");
+    const tools = generateMcpTools(store, { ambiguityVisible: (id: string) => !hidden.has(id) });
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const snapshot = async () => ({
+      truthy: ((await query.execute({ has_broken_links: true })) as any[]).map((n: any) => n.id),
+      falsy: ((await query.execute({ has_broken_links: false })) as any[]).map((n: any) => n.id),
+      broken: (await query.execute({ id: src.id, include_broken_links: true }) as any).broken_links,
+    });
+
+    const before = await snapshot();
+    expect(before.truthy).toContain(src.id);
+    expect(before.falsy).not.toContain(src.id);
+
+    await store.deleteNote(h1.id);
+    await store.deleteNote(h2.id);
+
+    const after = await snapshot();
+    expect(after.truthy).toContain(src.id);
+    expect(after.falsy).not.toContain(src.id);
+    expect(after.broken).toEqual(before.broken);
+  });
+
+  it("a target with ONE visible candidate is neither broken nor ambiguous (negative control)", async () => {
+    // Guards against a fix that just reports every ambiguous row as broken:
+    // one candidate survives the predicate, so the reference RESOLVES in the
+    // reader's sub-vault.
+    const keep = await store.createNote("visible", { path: "mq-vis-one-a/Dup" });
+    const hide = await store.createNote("hidden", { path: "mq-vis-one-b/Dup" });
+    const src = await store.createNote("see [[Dup]]", { id: "mq-vis-one-src", path: "mq-vis-one-src" });
+
+    const tools = generateMcpTools(store, { ambiguityVisible: (id: string) => id !== hide.id });
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({
+      id: src.id, include_broken_links: true, include_ambiguous_links: true,
+    }) as any;
+    expect(result.broken_links).toEqual([]);
+    expect(result.ambiguous_links).toEqual([]);
+    expect(((await query.execute({ has_broken_links: true })) as any[]).map((n: any) => n.id))
+      .not.toContain(src.id);
+    expect(keep.id).toBeTruthy();
+  });
+
+  it("a STALE ambiguous row that resolves cleanly again is not reported broken", async () => {
+    // A `WikilinkResolution` that RESOLVED carries an empty `candidates`
+    // array, which a naive "count the visible candidates" check would read
+    // as 0 == broken. The row goes stale through the documented vault#581
+    // gap: ambiguity via the H1-TITLE fallback, cleared by editing one
+    // title, which does not re-run the sweep (only a path change does).
+    await store.createNote("# Twin\n\nfirst", { id: "mq-vis-stale-a", path: "mq-vis-stale-a" });
+    const b = await store.createNote("# Twin\n\nsecond", { id: "mq-vis-stale-b", path: "mq-vis-stale-b" });
+    const src = await store.createNote("see [[Twin]]", { id: "mq-vis-stale-src", path: "mq-vis-stale-src" });
+
+    const unscoped = generateMcpTools(store).find((t) => t.name === "query-notes")!;
+    expect((await unscoped.execute({ id: src.id, include_ambiguous_links: true }) as any).ambiguous_links)
+      .toEqual([{ target: "Twin", relationship: "wikilink", candidate_count: 2 }]);
+
+    await store.updateNote(b.id, { content: "# Other\n\nsecond" });
+
+    // Row still says "ambiguous"; the target now resolves to the ONE
+    // remaining, visible note — so neither surface may report it.
+    const query = generateMcpTools(store, { ambiguityVisible: () => true })
+      .find((t) => t.name === "query-notes")!;
+    const result = await query.execute({
+      id: src.id, include_broken_links: true, include_ambiguous_links: true,
+    }) as any;
+    expect(result.broken_links).toEqual([]);
+    expect(result.ambiguous_links).toEqual([]);
+  });
+
+  it("NO predicate injected → broken-links answers from the persisted tables only (regression)", async () => {
+    const { src, h1, h2 } = await hiddenCandidates("mq-vis-unscoped");
+    const query = generateMcpTools(store).find((t) => t.name === "query-notes")!;
+    const read = async () => await query.execute({
+      id: src.id, include_broken_links: true, include_ambiguous_links: true,
+    }) as any;
+
+    const before = await read();
+    expect(before.broken_links).toEqual([]);
+    expect(before.ambiguous_links)
+      .toEqual([{ target: "Dup", relationship: "wikilink", candidate_count: 2 }]);
+    expect(((await query.execute({ has_broken_links: true })) as any[]).map((n: any) => n.id))
+      .not.toContain(src.id);
+
+    await store.deleteNote(h1.id);
+    await store.deleteNote(h2.id);
+
+    const after = await read();
+    expect(after.broken_links).toEqual([{ target: "Dup", relationship: "wikilink" }]);
+    expect(after.ambiguous_links).toEqual([]);
+  });
+
+  // ---- vault#708: the rename cascade follows resolution, not basenames ----
+
+  it("cascadeRename leaves an unambiguous full-path bracket aimed at the OTHER same-named note alone", async () => {
+    const keep = await store.createNote("first", { path: "keep/Rename" });
+    const moved = await store.createNote("second", { path: "move/Rename" });
+    const src = await store.createNote("see [[keep/Rename]]", { id: "c708-other", path: "c708-other" });
+
+    await store.updateNote(moved.id, { path: "move/Elsewhere" });
+
+    expect((await store.getNote(src.id))!.content).toBe("see [[keep/Rename]]");
+    const query = generateMcpTools(store).find((t) => t.name === "query-notes")!;
+    const links = await query.execute({ id: src.id, include_links: true }) as any;
+    expect(links.links.map((l: any) => l.targetId)).toEqual([keep.id]);
+  });
+
+  it("cascadeRename follows an unambiguous BASENAME bracket and keeps it a basename", async () => {
+    const moved = await store.createNote("only one", { path: "move/Rename" });
+    const src = await store.createNote("see [[Rename]]", { id: "c708-basename", path: "c708-basename" });
+
+    await store.updateNote(moved.id, { path: "move/Elsewhere" });
+
+    expect((await store.getNote(src.id))!.content).toBe("see [[Elsewhere]]");
+    const query = generateMcpTools(store).find((t) => t.name === "query-notes")!;
+    const links = await query.execute({ id: src.id, include_links: true }) as any;
+    expect(links.links.map((l: any) => l.targetId)).toEqual([moved.id]);
+  });
+
+  it("cascadeRename widens a basename bracket to the full path when the NEW basename is ambiguous", async () => {
+    const moved = await store.createNote("first", { path: "a/Foo" });
+    await store.createNote("collides with the new name", { path: "b/Bar" });
+    const src = await store.createNote("see [[Foo]]", { id: "c708-widen", path: "c708-widen" });
+
+    await store.updateNote(moved.id, { path: "a/Bar" });
+
+    // `[[Bar]]` would now match two notes, so the bracket widens rather than
+    // becoming ambiguous.
+    expect((await store.getNote(src.id))!.content).toBe("see [[a/Bar]]");
+    const query = generateMcpTools(store).find((t) => t.name === "query-notes")!;
+    const links = await query.execute({ id: src.id, include_links: true }) as any;
+    expect(links.links.map((l: any) => l.targetId)).toEqual([moved.id]);
+    expect((await query.execute({ has_ambiguous_links: true }) as any[]).length).toBe(0);
+  });
+
+  it("cascadeRename rewrites alias / anchor / block-ref / embed / full-path / .ext forms, and skips code fences", async () => {
+    const moved = await store.createNote("only one", { path: "move/Rename" });
+    const src = await store.createNote(
+      "a [[Rename|shown]] b [[Rename#Heading]] c [[Rename#^blk]] d [[move/Rename]] e [[move/Rename.md]] f ![[Rename]]\n\n```\ng [[Rename]]\n```\n",
+      { id: "c708-forms", path: "c708-forms" },
+    );
+
+    await store.updateNote(moved.id, { path: "move/Elsewhere" });
+
+    expect((await store.getNote(src.id))!.content).toBe(
+      "a [[Elsewhere|shown]] b [[Elsewhere#Heading]] c [[Elsewhere#^blk]] d [[move/Elsewhere]] e [[move/Elsewhere.md]] f ![[Elsewhere]]\n\n```\ng [[Rename]]\n```\n",
+    );
+  });
+
+  it("cascadeRename rewrites an explicit-extension bracket on a non-md note", async () => {
+    const moved = await store.createNote("csv", { path: "move/Data", extension: "csv" });
+    const src = await store.createNote("see [[move/Data.csv]]", { id: "c708-ext", path: "c708-ext" });
+
+    await store.updateNote(moved.id, { path: "move/Info" });
+
+    expect((await store.getNote(src.id))!.content).toBe("see [[move/Info.csv]]");
+    const query = generateMcpTools(store).find((t) => t.name === "query-notes")!;
+    const links = await query.execute({ id: src.id, include_links: true }) as any;
+    expect(links.links.map((l: any) => l.targetId)).toEqual([moved.id]);
+  });
+
+  it("cascadeRename rewrites the renamed note's OWN self-referencing bracket", async () => {
+    // Self-links are deliberately never given a `links` row, so the note
+    // itself has to be seeded into the cascade's source set.
+    const moved = await store.createNote("about [[move/Rename]] itself", { path: "move/Rename" });
+    await store.updateNote(moved.id, { path: "move/Elsewhere" });
+    expect((await store.getNote(moved.id))!.content).toBe("about [[move/Elsewhere]] itself");
+  });
+
+  it("cascadeRename leaves a bracket that resolved through the H1-title fallback alone", async () => {
+    // A title-fallback link doesn't depend on the path, so a repath must not
+    // touch it — and it keeps resolving afterwards.
+    const moved = await store.createNote("# Distinct Title\n\nbody", { path: "move/Rename" });
+    const src = await store.createNote("see [[Distinct Title]]", { id: "c708-title", path: "c708-title" });
+
+    await store.updateNote(moved.id, { path: "move/Elsewhere" });
+
+    expect((await store.getNote(src.id))!.content).toBe("see [[Distinct Title]]");
+    const query = generateMcpTools(store).find((t) => t.name === "query-notes")!;
+    const links = await query.execute({ id: src.id, include_links: true }) as any;
+    expect(links.links.map((l: any) => l.targetId)).toEqual([moved.id]);
+  });
+
+  it("deleting BOTH colliding candidates turns the ambiguous link into a broken one", async () => {
+    const a = await store.createNote("first", { path: "d1/Gone" });
+    const b = await store.createNote("second", { path: "d2/Gone" });
+    await store.createNote("see [[Gone]]", { id: "mq-amb-to-broken", path: "mq-amb-to-broken" });
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    await store.deleteNote(a.id);
+    await store.deleteNote(b.id);
+
+    expect((await query.execute({ has_ambiguous_links: true }) as any[]).length).toBe(0);
+    expect((await query.execute({ has_broken_links: true }) as any[]).map((n: any) => n.id)).toEqual(["mq-amb-to-broken"]);
+    const single = await query.execute({ id: "mq-amb-to-broken", include_broken_links: true }) as any;
+    expect(single.broken_links).toEqual([{ target: "Gone", relationship: "wikilink" }]);
+  });
+
+  it("editing the wikilink out of the content clears the persisted ambiguity", async () => {
+    await store.createNote("first", { path: "e1/Vanish" });
+    await store.createNote("second", { path: "e2/Vanish" });
+    const src = await store.createNote("see [[Vanish]]", { id: "mq-amb-edit", path: "mq-amb-edit" });
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    expect((await query.execute({ has_ambiguous_links: true }) as any[]).length).toBe(1);
+
+    await store.updateNote(src.id, { content: "no links now" });
+    expect((await query.execute({ has_ambiguous_links: true }) as any[]).length).toBe(0);
+  });
+
+  it("deleting the SOURCE note cascades its ambiguous rows away", async () => {
+    await store.createNote("first", { path: "c1/Casc" });
+    await store.createNote("second", { path: "c2/Casc" });
+    const src = await store.createNote("see [[Casc]]", { id: "mq-amb-cascade", path: "mq-amb-cascade" });
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    expect((await query.execute({ has_ambiguous_links: true }) as any[]).length).toBe(1);
+    await store.deleteNote(src.id);
+    expect((await query.execute({ has_ambiguous_links: true }) as any[]).length).toBe(0);
+  });
+
+  it("a THIRD colliding note bumps the persisted candidate_count", async () => {
+    await store.createNote("first", { path: "t1/Trio" });
+    await store.createNote("second", { path: "t2/Trio" });
+    await store.createNote("see [[Trio]]", { id: "mq-amb-count", path: "mq-amb-count" });
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    let single = await query.execute({ id: "mq-amb-count", include_ambiguous_links: true }) as any;
+    expect(single.ambiguous_links).toEqual([{ target: "Trio", relationship: "wikilink", candidate_count: 2 }]);
+
+    await store.createNote("third", { path: "t3/Trio" });
+    single = await query.execute({ id: "mq-amb-count", include_ambiguous_links: true }) as any;
+    expect(single.ambiguous_links).toEqual([{ target: "Trio", relationship: "wikilink", candidate_count: 3 }]);
+  });
+
+  it("has_ambiguous_links is bound into the cursor query-hash", async () => {
+    await store.createNote("first", { path: "cur1/Hash" });
+    await store.createNote("second", { path: "cur2/Hash" });
+    await store.createNote("see [[Hash]]", { id: "mq-amb-cursor", path: "mq-amb-cursor" });
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const page = await query.execute({ cursor: "", limit: 1, has_ambiguous_links: true }) as any;
+    expect(page.notes.map((n: any) => n.id)).toEqual(["mq-amb-cursor"]);
+    // Flipping the filter must invalidate the cursor rather than silently
+    // continuing the prior filter's watermark.
+    expect(query.execute({ cursor: page.next_cursor, limit: 1, has_ambiguous_links: false }))
+      .rejects.toThrow(/cursor was minted for a different query/);
+  });
+
+  it("query-notes metadata operator query routes through the indexed column", async () => {
+    const { declareField } = await import("./indexed-fields.js");
+    declareField(db, "priority", "INTEGER", "project");
+    await store.createNote("high", { metadata: { priority: 5 } });
+    await store.createNote("mid", { metadata: { priority: 3 } });
+    await store.createNote("low", { metadata: { priority: 1 } });
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({
+      metadata: { priority: { gte: 3 } },
+      include_content: true,
+    }) as any[];
+    expect(result.map((n) => n.content).sort()).toEqual(["high", "mid"]);
+  });
+
+  it("query-notes order_by + sort=desc surfaces highest-priority first", async () => {
+    const { declareField } = await import("./indexed-fields.js");
+    declareField(db, "priority", "INTEGER", "project");
+    await store.createNote("p2", { metadata: { priority: 2 } });
+    await store.createNote("p5", { metadata: { priority: 5 } });
+    await store.createNote("p1", { metadata: { priority: 1 } });
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({
+      order_by: "priority",
+      sort: "desc",
+      include_content: true,
+    }) as any[];
+    expect(result.map((n) => n.content)).toEqual(["p5", "p2", "p1"]);
+  });
+
+  it("query-notes list defaults to no content (index mode)", async () => {
+    const content = "This is the note body.";
+    await store.createNote(content, { tags: ["daily"], path: "Notes/test", metadata: { status: "draft" } });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ tag: ["daily"] }) as any[];
+    expect(result).toHaveLength(1);
+    const entry = result[0];
+    expect(entry.content).toBeUndefined();
+    expect(entry.id).toBeTruthy();
+    expect(entry.path).toBe("Notes/test");
+    expect(entry.byteSize).toBe(Buffer.byteLength(content, "utf8"));
+  });
+
+  it("query-notes list with include_content: true returns full content", async () => {
+    await store.createNote("Full body", { tags: ["daily"] });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ tag: ["daily"], include_content: true }) as any[];
+    expect(result).toHaveLength(1);
+    expect(result[0].content).toBe("Full body");
+  });
+
+  it("query-notes index mode truncates preview and counts utf-8 bytes", async () => {
+    const longContent = "line one\nline two has\tlots    of   whitespace\n" + "x".repeat(300) + " ✨✨✨";
+    await store.createNote(longContent, { tags: ["long"] });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ tag: ["long"] }) as any[];
+    expect(result).toHaveLength(1);
+    const entry = result[0];
+    expect(entry.byteSize).toBe(Buffer.byteLength(longContent, "utf8"));
+    expect(entry.byteSize).toBeGreaterThan(longContent.length);
+    expect(entry.preview.length).toBeLessThanOrEqual(120);
+    expect(entry.preview.includes("\n")).toBe(false);
+  });
+
+  it("query-notes index mode does not split astral-plane surrogate pairs", async () => {
+    const emoji = "😀";
+    const longContent = emoji.repeat(130);
+    await store.createNote(longContent, { tags: ["astral"] });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ tag: ["astral"] }) as any[];
+    expect(result).toHaveLength(1);
+    const preview = result[0].preview as string;
+    const codePoints = Array.from(preview);
+    expect(codePoints.length).toBeLessThanOrEqual(120);
+    for (const cp of codePoints) {
+      expect(cp).toBe(emoji);
+    }
+  });
+
+  it("query-notes honors filters (date range, path_prefix, limit, offset)", async () => {
+    await store.createNote("A", { tags: ["keep"], path: "Projects/a", created_at: "2025-03-05T00:00:00.000Z" });
+    await store.createNote("B", { tags: ["keep"], path: "Projects/b", created_at: "2025-03-10T00:00:00.000Z" });
+    await store.createNote("C", { tags: ["keep"], path: "Other/c",    created_at: "2025-03-15T00:00:00.000Z" });
+    await store.createNote("D", { tags: ["keep"], path: "Projects/d", created_at: "2025-04-02T00:00:00.000Z" });
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    // date range filter
+    const inMarch = await query.execute({
+      date_from: "2025-03-01",
+      date_to: "2025-04-01",
+      sort: "asc",
+    }) as any[];
+    expect(inMarch).toHaveLength(3);
+    expect(inMarch.every((n) => n.content === undefined)).toBe(true);
+
+    // path_prefix filter
+    const projects = await query.execute({ path_prefix: "Projects" }) as any[];
+    expect(projects).toHaveLength(3);
+    expect(projects.every((n) => n.path!.startsWith("Projects"))).toBe(true);
+
+    // limit + offset. Returning exactly `limit` rows with no cursor also
+    // trips the V1.3 truncation-honesty warning (results.length === limit,
+    // an inherent heuristic — it can't distinguish "exactly this many rows
+    // exist" from "capped, more may follow" without a lookahead), which
+    // wraps the response in { notes, warnings } instead of a bare array —
+    // same envelope shape the tool already uses for other warnings.
+    const pageResult = await query.execute({
+      path_prefix: "Projects",
+      sort: "asc",
+      limit: 2,
+      offset: 1,
+    }) as any;
+    const page = Array.isArray(pageResult) ? pageResult : pageResult.notes;
+    expect(page).toHaveLength(2);
+    // vault#601: explicit offset is deliberate paging — no truncated warning.
+    expect(pageResult.warnings?.some((w: any) => w.code === "truncated") ?? false).toBe(false);
+  });
+
+  it("query-notes exclude_path_prefix drops matching paths and keeps pathless notes (vault#628)", async () => {
+    await store.createNote("user", { path: "Projects/a" });
+    await store.createNote("sys", { path: ".parachute/notes/settings" });
+    await store.createNote("bare"); // no path
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const r = await query.execute({ exclude_path_prefix: ".parachute/", include_content: true }) as any[];
+    const contents = r.map((n: any) => n.content).sort();
+    expect(contents).toEqual(["bare", "user"]);
+  });
+
+  it("query-notes search composes with exclude_path_prefix (vault#628)", async () => {
+    // The MCP search branch enumerates QueryOpts fields rather than
+    // spreading them. After #656, REST search picks up exclude_path_prefix
+    // via ...parsed.queryOpts; omitting the field here is the silent-drop
+    // class this lane kills.
+    await store.createNote("unique-628-search-term keep", { path: "Projects/a" });
+    await store.createNote("unique-628-search-term drop", { path: ".parachute/notes/settings" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const r = await query.execute({
+      search: "unique-628-search-term",
+      exclude_path_prefix: ".parachute/",
+      include_content: true,
+    }) as any[];
+    const contents = r.map((n: any) => n.content);
+    expect(contents).toContain("unique-628-search-term keep");
+    expect(contents).not.toContain("unique-628-search-term drop");
+  });
+
+  it("query-notes full-text search works", async () => {
+    await store.createNote("Flagstaff trail");
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ search: "Flagstaff" }) as any[];
+    expect(result).toHaveLength(1);
+  });
+
+  it("query-notes with include_links enriches results", async () => {
+    await store.createNote("A", { id: "a", path: "alpha" });
+    await store.createNote("B", { id: "b", path: "beta" });
+    await store.createLink("a", "b", "mentions");
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ id: "a", include_links: true }) as any;
+    expect(result.links).toBeDefined();
+    expect(result.links).toHaveLength(1);
+  });
+
+  it("query-notes include_metadata: true returns all metadata (single)", async () => {
+    await store.createNote("Body", { metadata: { summary: "short", status: "draft", priority: 1 } });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ id: (await store.queryNotes({}))[0]!.id, include_metadata: true }) as any;
+    expect(result.metadata).toEqual({ summary: "short", status: "draft", priority: 1 });
+  });
+
+  it("query-notes include_metadata: false strips metadata (single)", async () => {
+    await store.createNote("Body", { metadata: { summary: "short", status: "draft" } });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ id: (await store.queryNotes({}))[0]!.id, include_metadata: false }) as any;
+    expect(result.metadata).toBeUndefined();
+    expect(result.content).toBe("Body"); // other fields unaffected
+  });
+
+  it("query-notes include_metadata: string[] returns only specified fields (single)", async () => {
+    await store.createNote("Body", { metadata: { summary: "short", status: "draft", priority: 1 } });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ id: (await store.queryNotes({}))[0]!.id, include_metadata: ["summary"] }) as any;
+    expect(result.metadata).toEqual({ summary: "short" });
+  });
+
+  it("query-notes include_metadata: false strips metadata (list)", async () => {
+    await store.createNote("A", { tags: ["meta-test"], metadata: { summary: "a" } });
+    await store.createNote("B", { tags: ["meta-test"], metadata: { summary: "b" } });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ tag: "meta-test", include_metadata: false }) as any[];
+    expect(result).toHaveLength(2);
+    for (const n of result) {
+      expect(n.metadata).toBeUndefined();
+    }
+  });
+
+  it("query-notes include_metadata: string[] filters fields (list)", async () => {
+    await store.createNote("A", { tags: ["meta-filter"], metadata: { summary: "a", status: "ok", extra: true } });
+    await store.createNote("B", { tags: ["meta-filter"], metadata: { summary: "b", extra: false } });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ tag: "meta-filter", include_metadata: ["summary", "status"] }) as any[];
+    expect(result).toHaveLength(2);
+    const a = result.find((n: any) => n.metadata?.summary === "a");
+    const b = result.find((n: any) => n.metadata?.summary === "b");
+    expect(a.metadata).toEqual({ summary: "a", status: "ok" });
+    expect(b.metadata).toEqual({ summary: "b" }); // status absent → omitted
+  });
+
+  it("query-notes include_metadata: string[] with no matching fields keeps metadata: {} (vault#600)", async () => {
+    // V1.1 invariant: rowToNote always emits `metadata: {}`. The projection
+    // branch used to set `metadata: undefined` when no requested keys
+    // matched, so the key vanished from the wire again.
+    await store.createNote("A", { tags: ["no-match-meta"], metadata: { summary: "a" } });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ tag: "no-match-meta", include_metadata: ["nonexistent"] }) as any[];
+    expect(result).toHaveLength(1);
+    expect(result[0]).toHaveProperty("metadata", {});
+    expect(JSON.parse(JSON.stringify(result[0]))).toHaveProperty("metadata", {});
+  });
+
+  it("query-notes near param scopes results to graph neighborhood", async () => {
+    await store.createNote("Center", { id: "center" });
+    await store.createNote("Near", { id: "near", tags: ["t"] });
+    await store.createNote("Far", { id: "far", tags: ["t"] });
+    await store.createLink("center", "near", "mentions");
+    // "far" is not linked to "center"
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ tag: "t", near: { note_id: "center", depth: 1 } }) as any[];
+    expect(result).toHaveLength(1);
+    expect(result[0].id).toBe("near");
+  });
+
+  it("query-notes near returns neighborhood even when limit is small and unrelated notes were created first (#130)", async () => {
+    // Repro of #130: anchor + linked notes get crowded out by unrelated notes
+    // when the query runs ORDER BY created_at LIMIT 5 BEFORE the
+    // neighborhood filter. With the SQL-pushed ids filter, LIMIT applies to
+    // the neighborhood, not the whole notes table.
+    //
+    // Seed: 10 unrelated notes created first, THEN the anchor + 2 linked
+    // notes. With limit=5 and ORDER BY created_at ASC, the unrelated ten
+    // would fill the slate and the in-neighborhood notes would never appear.
+    for (let i = 0; i < 10; i++) {
+      await store.createNote(`Unrelated ${i}`, { id: `unrelated-${i}` });
+    }
+    await store.createNote("Anchor", { id: "anchor" });
+    await store.createNote("Outbound target", { id: "outbound" });
+    await store.createNote("Inbound source", { id: "inbound" });
+    await store.createLink("anchor", "outbound", "wikilink");
+    await store.createLink("inbound", "anchor", "wikilink");
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({
+      near: { note_id: "anchor", depth: 2 },
+      limit: 5,
+    }) as any[];
+
+    const ids = result.map((n: any) => n.id).sort();
+    expect(ids).toEqual(["anchor", "inbound", "outbound"]);
+  });
+
+  it("delete-note accepts path", async () => {
+    await store.createNote("To delete", { path: "Temp/note" });
+    const tools = generateMcpTools(store);
+    const deleteTool = tools.find((t) => t.name === "delete-note")!;
+    const result = await deleteTool.execute({ id: "Temp/note" }) as any;
+    expect(result.deleted).toBe(true);
+    expect(await store.getNoteByPath("Temp/note")).toBeNull();
+  });
+
+  it("delete-tag with zero notes removes tag from list", async () => {
+    await store.createNote("Test", { tags: ["ephemeral"] });
+    await store.untagNote((await store.queryNotes({})).find((n) => n.tags?.includes("ephemeral"))!.id, ["ephemeral"]);
+    const before = await store.listTags();
+    expect(before.some((t) => t.name === "ephemeral")).toBe(true);
+
+    const result = await store.deleteTag("ephemeral");
+    expect(result).toEqual({ deleted: true, notes_untagged: 0 });
+
+    const after = await store.listTags();
+    expect(after.some((t) => t.name === "ephemeral")).toBe(false);
+  });
+
+  it("delete-tag with N notes untags all but preserves notes", async () => {
+    const n1 = await store.createNote("A", { tags: ["doomed"] });
+    const n2 = await store.createNote("B", { tags: ["doomed", "keeper"] });
+
+    const result = await store.deleteTag("doomed");
+    expect(result).toEqual({ deleted: true, notes_untagged: 2 });
+
+    expect(await store.getNote(n1.id)).not.toBeNull();
+    expect(await store.getNote(n2.id)).not.toBeNull();
+    expect((await store.getNote(n1.id))!.tags).not.toContain("doomed");
+    expect((await store.getNote(n2.id))!.tags).not.toContain("doomed");
+    expect((await store.getNote(n2.id))!.tags).toContain("keeper");
+    expect((await store.listTags()).some((t) => t.name === "doomed")).toBe(false);
+  });
+
+  it("delete-tag nonexistent returns deleted: false", async () => {
+    const result = await store.deleteTag("never-existed");
+    expect(result).toEqual({ deleted: false, notes_untagged: 0 });
+  });
+
+  it("delete-tag MCP tool works", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    await createNote.execute({ content: "Test", tags: ["mcp-tag"] });
+
+    const deleteTool = tools.find((t) => t.name === "delete-tag")!;
+    const result = await deleteTool.execute({ tag: "mcp-tag" }) as any;
+    expect(result.deleted).toBe(true);
+    expect(result.notes_untagged).toBe(1);
+
+    const listTool = tools.find((t) => t.name === "list-tags")!;
+    const tags = await listTool.execute({}) as any[];
+    expect(tags.some((t: any) => t.name === "mcp-tag")).toBe(false);
+  });
+
+  it("list-tags single tag detail with schema", async () => {
+    await store.createNote("Test", { tags: ["person"] });
+    await store.upsertTagSchema("person", {
+      description: "A person",
+      fields: { name: { type: "string" } },
+    });
+    const tools = generateMcpTools(store);
+    const listTags = tools.find((t) => t.name === "list-tags")!;
+    const result = await listTags.execute({ tag: "person" }) as any;
+    expect(result.name).toBe("person");
+    expect(result.count).toBe(1);
+    expect(result.description).toBe("A person");
+    expect(result.fields.name.type).toBe("string");
+  });
+
+  it("list-tags include_schema returns schemas for all tags", async () => {
+    await store.createNote("A", { tags: ["person"] });
+    await store.createNote("B", { tags: ["project"] });
+    await store.upsertTagSchema("person", { description: "A person" });
+    const tools = generateMcpTools(store);
+    const listTags = tools.find((t) => t.name === "list-tags")!;
+    const result = await listTags.execute({ include_schema: true }) as any[];
+    const person = result.find((t: any) => t.name === "person");
+    expect(person.description).toBe("A person");
+    const project = result.find((t: any) => t.name === "project");
+    expect(project.description).toBeNull();
+  });
+
+  it("update-tag creates schema if not exists", async () => {
+    const tools = generateMcpTools(store);
+    const updateTag = tools.find((t) => t.name === "update-tag")!;
+    const result = await updateTag.execute({
+      tag: "person",
+      description: "A person",
+      fields: { name: { type: "string" } },
+    }) as any;
+    expect(result.tag).toBe("person");
+    expect(result.description).toBe("A person");
+  });
+
+  it("update-tag merges fields with existing", async () => {
+    await store.upsertTagSchema("person", {
+      description: "A person",
+      fields: { name: { type: "string" } },
+    });
+    const tools = generateMcpTools(store);
+    const updateTag = tools.find((t) => t.name === "update-tag")!;
+    const result = await updateTag.execute({
+      tag: "person",
+      fields: { age: { type: "integer" } },
+    }) as any;
+    expect(result.fields.name.type).toBe("string");
+    expect(result.fields.age.type).toBe("integer");
+  });
+
+  // vault#555 fix 4 — a non-indexed field's `type` was never validated
+  // anywhere; a genuinely unrecognized type string was accepted and
+  // persisted verbatim, no error.
+  it("update-tag rejects an unrecognized field type (invalid_type)", async () => {
+    const tools = generateMcpTools(store);
+    const updateTag = tools.find((t) => t.name === "update-tag")!;
+    let caught: any;
+    try {
+      await updateTag.execute({ tag: "widget", fields: { weird: { type: "frobnicator" } } });
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeDefined();
+    expect(caught.error_type).toBe("tag_field_conflict");
+    expect(caught.violations).toHaveLength(1);
+    expect(caught.violations[0].field).toBe("weird");
+    expect(caught.violations[0].reason).toBe("invalid_type");
+
+    // Nothing persisted.
+    const record = await store.getTagRecord("widget");
+    expect(record?.fields ?? null).toBeFalsy();
+  });
+
+  // vault#555 fix 5 — one call declaring TWO bad fields (an unrecognized
+  // type AND a non-conforming default) reports BOTH violations together,
+  // not just the first one encountered.
+  it("update-tag reports an unrecognized type AND a bad default together in one call", async () => {
+    const tools = generateMcpTools(store);
+    const updateTag = tools.find((t) => t.name === "update-tag")!;
+    let caught: any;
+    try {
+      await updateTag.execute({
+        tag: "widget",
+        fields: {
+          weird: { type: "frobnicator" },
+          bad_default: { type: "string", enum: ["a", "b"], default: "zzz" },
+        },
+      });
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeDefined();
+    expect(caught.violations).toHaveLength(2);
+    const byField = new Map(caught.violations.map((v: any) => [v.field, v.reason]));
+    expect(byField.get("weird")).toBe("invalid_type");
+    expect(byField.get("bad_default")).toBe("invalid_default");
+  });
+
+  it("update-tag accepts every recognized field type", async () => {
+    const tools = generateMcpTools(store);
+    const updateTag = tools.find((t) => t.name === "update-tag")!;
+    const result = await updateTag.execute({
+      tag: "widget",
+      fields: {
+        a: { type: "string" },
+        b: { type: "number" },
+        c: { type: "integer" },
+        d: { type: "boolean" },
+        e: { type: "array" },
+        f: { type: "object" },
+        g: { type: "reference" },
+        h: { type: "date" },
+      },
+    }) as any;
+    expect(result.fields.a.type).toBe("string");
+    expect(result.fields.f.type).toBe("object");
+    expect(result.fields.g.type).toBe("reference");
+    expect(result.fields.h.type).toBe("date");
+  });
+
+  // vault#date-field-type: `date` stores/validates like `string` — an
+  // ISO-8601 date or full RFC3339 timestamp — reusing cursor.ts's
+  // `timestampToMs` (the same parser `date_filter`'s `updated_at` bound
+  // uses) rather than a second, independently-drifting date parser.
+  it("update-tag accepts a `date` field's default in both ISO forms", async () => {
+    const tools = generateMcpTools(store);
+    const updateTag = tools.find((t) => t.name === "update-tag")!;
+    const dateOnly = await updateTag.execute({
+      tag: "meeting",
+      fields: { meeting_date: { type: "date", default: "2026-07-09" } },
+    }) as any;
+    expect(dateOnly.fields.meeting_date.default).toBe("2026-07-09");
+
+    const fullTimestamp = await updateTag.execute({
+      tag: "meeting",
+      fields: { meeting_date: { type: "date", default: "2026-07-09T14:30:00.000Z" } },
+    }) as any;
+    expect(fullTimestamp.fields.meeting_date.default).toBe("2026-07-09T14:30:00.000Z");
+  });
+
+  it("update-tag rejects a non-ISO default on a `date` field (invalid_default)", async () => {
+    const tools = generateMcpTools(store);
+    const updateTag = tools.find((t) => t.name === "update-tag")!;
+    let caught: any;
+    try {
+      await updateTag.execute({
+        tag: "meeting",
+        fields: { meeting_date: { type: "date", default: "not-a-date" } },
+      });
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeDefined();
+    expect(caught.error_type).toBe("tag_field_conflict");
+    expect(caught.violations[0].field).toBe("meeting_date");
+    expect(caught.violations[0].reason).toBe("invalid_default");
+    // Nothing persisted.
+    const record = await store.getTagRecord("meeting");
+    expect(record?.fields ?? null).toBeFalsy();
+  });
+
+  // ---- Typed reference field: indexed value + auto-link (vault#typed-reference-field) ----
+
+  describe("typed reference field", () => {
+    it("create-note with a reference-typed field indexes the value AND creates the link", async () => {
+      const target = await store.createNote("Alice", { path: "People/Alice" });
+      await store.upsertTagSchema("task", { fields: { assignee: { type: "reference" } } });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const result = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        metadata: { assignee: "People/Alice" },
+      }) as any;
+
+      // (a) the value half — stored + readable like a string field.
+      expect(result.metadata.assignee).toBe("People/Alice");
+
+      // (b) the link half — a graph edge to the resolved target, relationship = field name.
+      const links = await store.getLinks(result.id, { direction: "outbound" });
+      const assigneeLink = links.find((l) => l.relationship === "assignee");
+      expect(assigneeLink).toBeDefined();
+      expect(assigneeLink!.targetId).toBe(target.id);
+    });
+
+    it("resolves a reference field by note ID as well as path/title", async () => {
+      const target = await store.createNote("Bob", { id: "bob-id" });
+      await store.upsertTagSchema("task", { fields: { assignee: { type: "reference" } } });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const result = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        metadata: { assignee: "bob-id" },
+      }) as any;
+
+      const links = await store.getLinks(result.id, { direction: "outbound" });
+      expect(links.find((l) => l.relationship === "assignee")?.targetId).toBe(target.id);
+    });
+
+    it("querying by a reference field's value works (plain metadata filter and, when indexed, the eq operator)", async () => {
+      await store.createNote("Alice", { path: "People/Alice", id: "alice" });
+      const tools = generateMcpTools(store);
+      const updateTag = tools.find((t) => t.name === "update-tag")!;
+      await updateTag.execute({
+        tag: "task",
+        fields: { assignee: { type: "reference", indexed: true } },
+      });
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const created = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        metadata: { assignee: "alice" },
+      }) as any;
+
+      const queryNotes = tools.find((t) => t.name === "query-notes")!;
+      const plain = await queryNotes.execute({ tags: ["task"], metadata: { assignee: "alice" } }) as any[];
+      expect(plain.map((n: any) => n.id)).toContain(created.id);
+
+      const viaOperator = await queryNotes.execute({
+        tags: ["task"],
+        metadata: { assignee: { eq: "alice" } },
+      }) as any[];
+      expect(viaOperator.map((n: any) => n.id)).toContain(created.id);
+    });
+
+    it("update-note changing a reference field's value moves the link (old edge dropped, new edge created)", async () => {
+      const alice = await store.createNote("Alice", { id: "alice" });
+      const bob = await store.createNote("Bob", { id: "bob" });
+      await store.upsertTagSchema("task", { fields: { assignee: { type: "reference" } } });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const note = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        metadata: { assignee: "alice" },
+      }) as any;
+
+      let links = await store.getLinks(note.id, { direction: "outbound" });
+      expect(links.filter((l) => l.relationship === "assignee").map((l) => l.targetId)).toEqual([alice.id]);
+
+      const updateNote = tools.find((t) => t.name === "update-note")!;
+      await updateNote.execute({ id: note.id, metadata: { assignee: "bob" }, force: true });
+
+      links = await store.getLinks(note.id, { direction: "outbound" });
+      const assigneeLinks = links.filter((l) => l.relationship === "assignee");
+      expect(assigneeLinks).toHaveLength(1);
+      expect(assigneeLinks[0]!.targetId).toBe(bob.id);
+
+      const fresh = await store.getNote(note.id);
+      expect(fresh!.metadata!.assignee).toBe("bob");
+    });
+
+    it("update-note clearing a reference field drops the link", async () => {
+      await store.createNote("Alice", { id: "alice" });
+      await store.upsertTagSchema("task", { fields: { assignee: { type: "reference" } } });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const note = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        metadata: { assignee: "alice" },
+      }) as any;
+
+      let links = await store.getLinks(note.id, { direction: "outbound" });
+      expect(links.some((l) => l.relationship === "assignee")).toBe(true);
+
+      const updateNote = tools.find((t) => t.name === "update-note")!;
+      // RFC 7386 tombstone — null deletes the key.
+      await updateNote.execute({ id: note.id, metadata: { assignee: null }, force: true });
+
+      links = await store.getLinks(note.id, { direction: "outbound" });
+      expect(links.some((l) => l.relationship === "assignee")).toBe(false);
+
+      const fresh = await store.getNote(note.id);
+      expect(fresh!.metadata).not.toHaveProperty("assignee");
+    });
+
+    it("re-writing a reference field with the SAME value is a no-op (link untouched)", async () => {
+      const alice = await store.createNote("Alice", { id: "alice" });
+      await store.upsertTagSchema("task", { fields: { assignee: { type: "reference" } } });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const note = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        metadata: { assignee: "alice" },
+      }) as any;
+
+      const before = await store.getLinks(note.id, { direction: "outbound" });
+      const beforeLink = before.find((l) => l.relationship === "assignee");
+      expect(beforeLink).toBeDefined();
+
+      const updateNote = tools.find((t) => t.name === "update-note")!;
+      await updateNote.execute({ id: note.id, metadata: { assignee: "alice" }, force: true });
+
+      const after = await store.getLinks(note.id, { direction: "outbound" });
+      const afterLinks = after.filter((l) => l.relationship === "assignee");
+      expect(afterLinks).toHaveLength(1);
+      expect(afterLinks[0]!.targetId).toBe(alice.id);
+      // Same createdAt — proves the edge was never dropped and recreated.
+      expect(afterLinks[0]!.createdAt).toBe(beforeLink!.createdAt);
+    });
+
+    it("a reference field's unresolved target queues and backfills when the target note is created later", async () => {
+      await store.upsertTagSchema("task", { fields: { assignee: { type: "reference" } } });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const note = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        metadata: { assignee: "Not Yet Created" },
+      }) as any;
+
+      let links = await store.getLinks(note.id, { direction: "outbound" });
+      expect(links.some((l) => l.relationship === "assignee")).toBe(false);
+
+      const queryNotes = tools.find((t) => t.name === "query-notes")!;
+      const broken = await queryNotes.execute({ has_broken_links: true }) as any[];
+      expect(broken.map((n: any) => n.id)).toContain(note.id);
+
+      const target = await store.createNote("here now", { path: "Not Yet Created" });
+
+      links = await store.getLinks(note.id, { direction: "outbound" });
+      const assigneeLink = links.find((l) => l.relationship === "assignee");
+      expect(assigneeLink).toBeDefined();
+      expect(assigneeLink!.targetId).toBe(target.id);
+    });
+
+    it("a content-only or tags-only update does not touch a note's reference-field link", async () => {
+      const alice = await store.createNote("Alice", { id: "alice" });
+      await store.upsertTagSchema("task", { fields: { assignee: { type: "reference" } } });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const note = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        metadata: { assignee: "alice" },
+      }) as any;
+
+      const before = await store.getLinks(note.id, { direction: "outbound" });
+      const beforeLink = before.find((l) => l.relationship === "assignee");
+
+      // Content-only update — no `metadata` key in the call at all.
+      await store.updateNote(note.id, { content: "Ship it faster" });
+
+      const after = await store.getLinks(note.id, { direction: "outbound" });
+      const afterLink = after.find((l) => l.relationship === "assignee");
+      expect(afterLink).toBeDefined();
+      expect(afterLink!.targetId).toBe(alice.id);
+      expect(afterLink!.createdAt).toBe(beforeLink!.createdAt);
+    });
+
+    it("regression guard: cardinality:'one' (scalar) reference field still creates exactly one edge", async () => {
+      const alice = await store.createNote("Alice", { id: "alice" });
+      await store.upsertTagSchema("task", { fields: { assignee: { type: "reference", cardinality: "one" } } });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const note = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        metadata: { assignee: "alice" },
+      }) as any;
+
+      const links = (await store.getLinks(note.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "assignee");
+      expect(links).toHaveLength(1);
+      expect(links[0]!.targetId).toBe(alice.id);
+    });
+
+    // ---- Gap #2: cardinality:"many" (array) reference fields (vault#typed-reference-field) ----
+
+    it("cardinality:'many' reference field creates one link per array element, deduped, with no spurious type_mismatch warning", async () => {
+      const carol = await store.createNote("Carol", { path: "People/Carol" });
+      const dave = await store.createNote("Dave", { path: "People/Dave" });
+      await store.upsertTagSchema("task", {
+        fields: { collaborators: { type: "reference", cardinality: "many" } },
+      });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const result = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        // "People/Carol" appears twice — duplicate elements must dedupe to one edge.
+        metadata: { collaborators: ["People/Carol", "People/Dave", "People/Carol"] },
+      }) as any;
+
+      // No spurious type_mismatch — an array is exactly what cardinality:"many" asks
+      // for; pre-fix, valueMatchesType's "reference" case only accepted strings.
+      expect(result.validation_status.warnings).toEqual([]);
+
+      const links = (await store.getLinks(result.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "collaborators");
+      expect(links).toHaveLength(2);
+      expect(new Set(links.map((l) => l.targetId))).toEqual(new Set([carol.id, dave.id]));
+
+      // Traversable via find-path, same as a scalar reference link.
+      const findPath = tools.find((t) => t.name === "find-path")!;
+      const path = await findPath.execute({ source: result.id, target: carol.id }) as any;
+      expect(path?.path).toEqual([result.id, carol.id]);
+    });
+
+    it("update-note changing a cardinality:'many' reference array adds the new link, drops the removed one, and leaves the unchanged one alone", async () => {
+      const carol = await store.createNote("Carol", { path: "People/Carol" });
+      const dave = await store.createNote("Dave", { path: "People/Dave" });
+      const erin = await store.createNote("Erin", { path: "People/Erin" });
+      await store.upsertTagSchema("task", {
+        fields: { collaborators: { type: "reference", cardinality: "many" } },
+      });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const note = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        metadata: { collaborators: ["People/Carol", "People/Dave"] },
+      }) as any;
+
+      let links = (await store.getLinks(note.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "collaborators");
+      expect(links).toHaveLength(2);
+      const carolLinkBefore = links.find((l) => l.targetId === carol.id)!;
+
+      const updateNote = tools.find((t) => t.name === "update-note")!;
+      // Drop Dave, add Erin, keep Carol.
+      await updateNote.execute({
+        id: note.id,
+        metadata: { collaborators: ["People/Carol", "People/Erin"] },
+        force: true,
+      });
+
+      links = (await store.getLinks(note.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "collaborators");
+      expect(links).toHaveLength(2);
+      expect(new Set(links.map((l) => l.targetId))).toEqual(new Set([carol.id, erin.id]));
+      // Dropped — Dave's link is gone.
+      expect(links.some((l) => l.targetId === dave.id)).toBe(false);
+      // Unchanged — Carol's edge is the SAME row (createdAt preserved), proving a
+      // real diff (not a blanket clear-and-recreate under the relationship).
+      const carolLinkAfter = links.find((l) => l.targetId === carol.id)!;
+      expect(carolLinkAfter.createdAt).toBe(carolLinkBefore.createdAt);
+    });
+
+    it("an unresolved array element is queued and backfills when its target note is created later, without disturbing already-resolved siblings", async () => {
+      const carol = await store.createNote("Carol", { path: "People/Carol" });
+      await store.upsertTagSchema("task", {
+        fields: { collaborators: { type: "reference", cardinality: "many" } },
+      });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const note = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        metadata: { collaborators: ["People/Carol", "People/Not Yet Created"] },
+      }) as any;
+
+      let links = (await store.getLinks(note.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "collaborators");
+      expect(links).toHaveLength(1); // only Carol resolves so far
+      expect(links[0]!.targetId).toBe(carol.id);
+
+      const queryNotes = tools.find((t) => t.name === "query-notes")!;
+      const broken = await queryNotes.execute({ has_broken_links: true }) as any[];
+      expect(broken.map((n: any) => n.id)).toContain(note.id);
+
+      const target = await store.createNote("here now", { path: "People/Not Yet Created" });
+
+      links = (await store.getLinks(note.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "collaborators");
+      expect(links).toHaveLength(2);
+      expect(new Set(links.map((l) => l.targetId))).toEqual(new Set([carol.id, target.id]));
+    });
+
+    it("an array element resolving to the note itself creates a self-loop link, matching scalar self-reference behavior", async () => {
+      await store.upsertTagSchema("task", {
+        fields: { collaborators: { type: "reference", cardinality: "many" } },
+      });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const note = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        path: "Tasks/Self",
+        metadata: { collaborators: ["Tasks/Self"] },
+      }) as any;
+
+      const links = (await store.getLinks(note.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "collaborators");
+      expect(links).toHaveLength(1);
+      expect(links[0]!.targetId).toBe(note.id);
+    });
+
+    it("an ambiguous array element (matches ≥2 notes) is neither linked nor queued, mirroring the scalar ambiguous contract", async () => {
+      await store.createNote("Shared Title", { path: "A/Shared Title" });
+      await store.createNote("Shared Title", { path: "B/Shared Title" });
+      const target = await store.createNote("Target", { path: "People/Target" });
+      await store.upsertTagSchema("task", {
+        fields: { collaborators: { type: "reference", cardinality: "many" } },
+      });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const note = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        metadata: { collaborators: ["Shared Title", "People/Target"] },
+      }) as any;
+
+      const links = (await store.getLinks(note.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "collaborators");
+      // Only the unambiguous element links; "Shared Title" is neither linked nor queued.
+      expect(links).toHaveLength(1);
+      expect(links[0]!.targetId).toBe(target.id);
+
+      const queryNotes = tools.find((t) => t.name === "query-notes")!;
+      const broken = await queryNotes.execute({ has_broken_links: true }) as any[];
+      expect(broken.map((n: any) => n.id)).not.toContain(note.id);
+    });
+
+    // ---- Gap #3: schema-after-data backfill (vault#typed-reference-field) ----
+
+    it("declaring type:'reference' via update-tag after notes already carry the value backfills links for existing notes (scalar and array)", async () => {
+      const alice = await store.createNote("Alice", { path: "People/Alice" });
+      const bob = await store.createNote("Bob", { path: "People/Bob" });
+      const carol = await store.createNote("Carol", { path: "People/Carol" });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+
+      // Written BEFORE the tag declares these fields as `reference` — plain
+      // untyped metadata, no schema applies at write time, so no link is created.
+      const scalarNote = await createNote.execute({
+        content: "Scalar task",
+        tags: ["task"],
+        metadata: { manager: "People/Alice" },
+      }) as any;
+      const arrayNote = await createNote.execute({
+        content: "Array task",
+        tags: ["task"],
+        metadata: { collaborators: ["People/Bob", "People/Carol"] },
+      }) as any;
+
+      expect((await store.getLinks(scalarNote.id, { direction: "outbound" })).length).toBe(0);
+      expect((await store.getLinks(arrayNote.id, { direction: "outbound" })).length).toBe(0);
+
+      const updateTag = tools.find((t) => t.name === "update-tag")!;
+      await updateTag.execute({
+        tag: "task",
+        fields: {
+          manager: { type: "reference" },
+          collaborators: { type: "reference", cardinality: "many" },
+        },
+      });
+
+      const scalarLinks = (await store.getLinks(scalarNote.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "manager");
+      expect(scalarLinks).toHaveLength(1);
+      expect(scalarLinks[0]!.targetId).toBe(alice.id);
+
+      const arrayLinks = (await store.getLinks(arrayNote.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "collaborators");
+      expect(arrayLinks).toHaveLength(2);
+      expect(new Set(arrayLinks.map((l) => l.targetId))).toEqual(new Set([bob.id, carol.id]));
+
+      // Idempotency: a LATER update-tag call that declares a NEW reference
+      // field re-triggers the tag's whole backfill walk (see
+      // `backfillReferenceFieldLinks` — it re-syncs every reference field on
+      // each note, not just the newly-added one). Already-synced links must
+      // not duplicate.
+      await updateTag.execute({
+        tag: "task",
+        fields: { reviewer: { type: "reference" } },
+      });
+
+      const scalarLinksAfter = (await store.getLinks(scalarNote.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "manager");
+      expect(scalarLinksAfter).toHaveLength(1);
+      const arrayLinksAfter = (await store.getLinks(arrayNote.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "collaborators");
+      expect(arrayLinksAfter).toHaveLength(2);
+    });
+
+    it("declaring type:'reference' on a PARENT tag backfills links for notes carrying a descendant (child) tag", async () => {
+      const alice = await store.createNote("Alice", { path: "People/Alice" });
+      const tools = generateMcpTools(store);
+      const updateTag = tools.find((t) => t.name === "update-tag")!;
+      // `subtask` is a child of `task` via parent_names — schema inheritance
+      // (vault#270) means `subtask` notes are in `task`'s effective walk.
+      await updateTag.execute({ tag: "subtask", parent_names: ["task"] });
+
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const note = await createNote.execute({
+        content: "Child task",
+        tags: ["subtask"],
+        metadata: { manager: "People/Alice" },
+      }) as any;
+
+      expect((await store.getLinks(note.id, { direction: "outbound" })).length).toBe(0);
+
+      await updateTag.execute({ tag: "task", fields: { manager: { type: "reference" } } });
+
+      const links = (await store.getLinks(note.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "manager");
+      expect(links).toHaveLength(1);
+      expect(links[0]!.targetId).toBe(alice.id);
+    });
+
+    // ---- Round-4 review fixes (2026-07-10) ----
+
+    it("BLOCKER 1: the schema-declaration backfill walks ALL notes, not the first 100", async () => {
+      // One shared target every note references.
+      const target = await store.createNote("Target", { path: "People/Target" });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+
+      // 120 notes each carrying a `manager` value BEFORE the field is a
+      // reference — exceeds queryNotes' default LIMIT 100.
+      const noteIds: string[] = [];
+      for (let i = 0; i < 120; i++) {
+        const n = await createNote.execute({
+          content: `Task ${i}`,
+          tags: ["task"],
+          metadata: { manager: "People/Target" },
+        }) as any;
+        noteIds.push(n.id);
+      }
+
+      const updateTag = tools.find((t) => t.name === "update-tag")!;
+      await updateTag.execute({ tag: "task", fields: { manager: { type: "reference" } } });
+
+      // EVERY one of the 120 notes must have a manager edge — a 100-cap would
+      // leave 20 unlinked (the silent-half-graph this feature prevents).
+      let linked = 0;
+      for (const id of noteIds) {
+        const links = (await store.getLinks(id, { direction: "outbound" }))
+          .filter((l) => l.relationship === "manager" && l.targetId === target.id);
+        if (links.length === 1) linked++;
+      }
+      expect(linked).toBe(120);
+    });
+
+    it("BLOCKER 2: re-declaring an ALREADY-reference field via update-tag heals notes whose links were never built", async () => {
+      const alice = await store.createNote("Alice", { path: "People/Alice" });
+      const tools = generateMcpTools(store);
+      const updateTag = tools.find((t) => t.name === "update-tag")!;
+      const createNote = tools.find((t) => t.name === "create-note")!;
+
+      // Field is declared reference from the start, and a note is written.
+      await updateTag.execute({ tag: "task", fields: { manager: { type: "reference" } } });
+      const note = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        metadata: { manager: "People/Alice" },
+      }) as any;
+      expect((await store.getLinks(note.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "manager")).toHaveLength(1);
+
+      // Simulate a pre-fix vault: the edge was never built. Delete it directly,
+      // leaving the metadata value in place but the graph edge missing.
+      await store.deleteLink(note.id, alice.id, "manager");
+      expect((await store.getLinks(note.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "manager")).toHaveLength(0);
+
+      // Re-declare the SAME already-reference field — the documented heal path.
+      // A transition-keyed trigger would no-op here; the fix fires the backfill
+      // for any reference field in the declared schema.
+      await updateTag.execute({ tag: "task", fields: { manager: { type: "reference" } } });
+
+      const healed = (await store.getLinks(note.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "manager");
+      expect(healed).toHaveLength(1);
+      expect(healed[0]!.targetId).toBe(alice.id);
+    });
+
+    it("NIT 3: dropping an array element reconciles against RESOLVED targets — a since-renamed target's stale edge is dropped, and an aliased-same-target edge survives", async () => {
+      const dave = await store.createNote("Dave", { path: "People/Dave" });
+      const erin = await store.createNote("Erin", { path: "People/Erin" });
+      await store.upsertTagSchema("task", {
+        fields: { collaborators: { type: "reference", cardinality: "many" } },
+      });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const updateNote = tools.find((t) => t.name === "update-note")!;
+
+      // --- Corner (a): a still-present element whose target is renamed after
+      // linking; then a DIFFERENT element is dropped. The renamed target's
+      // stale edge must be reconciled away (the old re-resolve-removed-value
+      // approach left it forever).
+      const note = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        metadata: { collaborators: ["People/Dave", "People/Erin"] },
+      }) as any;
+      expect((await store.getLinks(note.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "collaborators")).toHaveLength(2);
+
+      // Rename Dave's target note — the raw value "People/Dave" no longer resolves.
+      await updateNote.execute({ id: dave.id, path: "People/David", force: true });
+
+      // Drop Erin (a different element); keep the now-stale "People/Dave".
+      await updateNote.execute({
+        id: note.id,
+        metadata: { collaborators: ["People/Dave"] },
+        force: true,
+      });
+
+      const afterA = (await store.getLinks(note.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "collaborators");
+      // Erin dropped; Dave's stale edge (target renamed, value no longer
+      // resolves) reconciled away → zero edges, not a lingering stale one.
+      expect(afterA.some((l) => l.targetId === erin.id)).toBe(false);
+      expect(afterA.some((l) => l.targetId === dave.id)).toBe(false);
+
+      // --- Corner (c): two elements ALIAS the same target (path + H1 title).
+      // Dropping one alias must keep the shared edge (still referenced by the
+      // survivor), not delete it.
+      const carol = await store.createNote("# Carol\n\nbody", { path: "People/Carol" });
+      const aliasNote = await createNote.execute({
+        content: "Alias task",
+        tags: ["task"],
+        // "People/Carol" (path) and "Carol" (H1 title) both resolve to carol.
+        metadata: { collaborators: ["People/Carol", "Carol"] },
+      }) as any;
+      let aliasLinks = (await store.getLinks(aliasNote.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "collaborators");
+      expect(aliasLinks).toHaveLength(1);
+      expect(aliasLinks[0]!.targetId).toBe(carol.id);
+
+      // Drop the title alias, keep the path alias → the shared edge survives.
+      await updateNote.execute({
+        id: aliasNote.id,
+        metadata: { collaborators: ["People/Carol"] },
+        force: true,
+      });
+      aliasLinks = (await store.getLinks(aliasNote.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "collaborators");
+      expect(aliasLinks).toHaveLength(1);
+      expect(aliasLinks[0]!.targetId).toBe(carol.id);
+    });
+  });
+
+  it("find-path works with ID/path resolution", async () => {
+    await store.createNote("A", { id: "a", path: "People/Alice" });
+    await store.createNote("B", { id: "b" });
+    await store.createNote("C", { id: "c", path: "Projects/X" });
+    await store.createLink("a", "b", "mentions");
+    await store.createLink("b", "c", "related-to");
+
+    const tools = generateMcpTools(store);
+    const findPath = tools.find((t) => t.name === "find-path")!;
+    const result = await findPath.execute({ source: "People/Alice", target: "Projects/X" }) as any;
+    expect(result).not.toBeNull();
+    expect(result.path).toEqual(["a", "b", "c"]);
+    expect(result.relationships).toEqual(["mentions", "related-to"]);
+  });
+
+  it("create-note via store triggers wikilink sync", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+
+    await store.createNote("Target", { path: "Target Note" });
+    const source = await createNote.execute({ content: "See [[Target Note]]" }) as any;
+
+    const links = await store.getLinks(source.id, { direction: "outbound" });
+    expect(links.some((l) => l.relationship === "wikilink")).toBe(true);
+  });
+
+  it("create-note with schema tag leaves undeclared fields ABSENT (vault#553 Decision B — no implicit enum[0]/zero-value backfill)", async () => {
+    await store.upsertTagSchema("person", {
+      description: "A person",
+      fields: {
+        first_appeared: { type: "string" },
+        active: { type: "boolean" },
+        priority: { type: "integer" },
+        status: { type: "string", enum: ["active", "archived"] },
+      },
+    });
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await createNote.execute({ content: "Alice", tags: ["person"] }) as any;
+    const fresh = await query.execute({ id: result.id }) as any;
+    // None of these fields declares a `default` — the pre-0.7.0 behavior
+    // (enum[0] / type zero-value backfill) is retired. "Never set" now stays
+    // genuinely absent instead of masquerading as "explicitly set to X" — in
+    // fact NO field got backfilled, so `metadata` itself stays empty/absent.
+    expect(fresh.metadata?.first_appeared).toBeUndefined();
+    expect(fresh.metadata?.active).toBeUndefined();
+    expect(fresh.metadata?.priority).toBeUndefined();
+    expect(fresh.metadata?.status).toBeUndefined();
+  });
+
+  it("create-note with schema tag applies EXPLICIT `default:` values only (vault#553 Decision B)", async () => {
+    await store.upsertTagSchema("employee", {
+      description: "An employee",
+      fields: {
+        active: { type: "boolean", default: true },
+        priority: { type: "integer", default: 3 },
+        status: { type: "string", enum: ["active", "archived"], default: "active" },
+        nickname: { type: "string" }, // no default — stays absent
+      },
+    });
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await createNote.execute({ content: "Bob", tags: ["employee"] }) as any;
+    const fresh = await query.execute({ id: result.id }) as any;
+    expect(fresh.metadata.active).toBe(true);
+    expect(fresh.metadata.priority).toBe(3);
+    expect(fresh.metadata.status).toBe("active");
+    expect(fresh.metadata.nickname).toBeUndefined();
+  });
+
+  // ---- query-notes input-shape tolerance (vault#214) ----
+  //
+  // The MCP framework drops top-level keys not in the inputSchema without
+  // raising — so an LLM caller passing the wrong field name gets a silent
+  // no-op rather than an error. We accept canonical + camelCase + singular
+  // aliases so the most common LLM mistakes still apply the filter, and
+  // we mirror the `tag` param's string-or-array shape so a single excluded
+  // tag doesn't need a wrapping array.
+
+  it("query-notes accepts `excludeTags` (camelCase alias)", async () => {
+    await store.createNote("a", { tags: ["email"] });
+    await store.createNote("b", { tags: ["email", "urgent"] });
+    const tools = generateMcpTools(store);
+    const queryNotes = tools.find((t) => t.name === "query-notes")!;
+    const r = await queryNotes.execute({ tag: "email", excludeTags: ["urgent"], include_content: true }) as any[];
+    expect(r).toHaveLength(1);
+    expect(r[0].content).toBe("a");
+  });
+
+  it("query-notes accepts `exclude_tag` (singular alias)", async () => {
+    await store.createNote("a", { tags: ["email"] });
+    await store.createNote("b", { tags: ["email", "urgent"] });
+    const tools = generateMcpTools(store);
+    const queryNotes = tools.find((t) => t.name === "query-notes")!;
+    const r = await queryNotes.execute({ tag: "email", exclude_tag: "urgent", include_content: true }) as any[];
+    expect(r).toHaveLength(1);
+    expect(r[0].content).toBe("a");
+  });
+
+  it("query-notes `exclude_tags` accepts a single string (mirrors `tag`)", async () => {
+    await store.createNote("a", { tags: ["email"] });
+    await store.createNote("b", { tags: ["email", "urgent"] });
+    const tools = generateMcpTools(store);
+    const queryNotes = tools.find((t) => t.name === "query-notes")!;
+    const r = await queryNotes.execute({ tag: "email", exclude_tags: "urgent", include_content: true }) as any[];
+    expect(r).toHaveLength(1);
+    expect(r[0].content).toBe("a");
+  });
+
+  it("query-notes canonical `exclude_tags: [...]` still works (regression)", async () => {
+    await store.createNote("a", { tags: ["email"] });
+    await store.createNote("b", { tags: ["email", "urgent"] });
+    const tools = generateMcpTools(store);
+    const queryNotes = tools.find((t) => t.name === "query-notes")!;
+    const r = await queryNotes.execute({ tag: "email", exclude_tags: ["urgent"], include_content: true }) as any[];
+    expect(r).toHaveLength(1);
+    expect(r[0].content).toBe("a");
+  });
+
+  it("query-notes search composes with exclude_tags (vault#647)", async () => {
+    // Pre-fix the FTS branch forwarded only `{tags, limit, expand, mode, sort}`
+    // so exclude_tags was silently dropped: the response looked like a real
+    // result set that simply answered a different question.
+    await store.createNote("widget keep", { tags: ["email"] });
+    await store.createNote("widget drop", { tags: ["email", "urgent"] });
+    const tools = generateMcpTools(store);
+    const queryNotes = tools.find((t) => t.name === "query-notes")!;
+    const r = await queryNotes.execute({
+      search: "widget",
+      tag: "email",
+      exclude_tags: "urgent",
+      include_content: true,
+    }) as any[];
+    expect(r.map((n: any) => n.content)).toEqual(["widget keep"]);
+  });
+
+  it("query-notes search composes with date_from (vault#647)", async () => {
+    await store.createNote("widget recent", { tags: ["email"], created_at: "2026-07-01T00:00:00.000Z" });
+    await store.createNote("widget old", { tags: ["email"], created_at: "2023-06-01T00:00:00.000Z" });
+    const tools = generateMcpTools(store);
+    const queryNotes = tools.find((t) => t.name === "query-notes")!;
+    const r = await queryNotes.execute({
+      search: "widget",
+      tag: "email",
+      date_from: "2026-06-01",
+      include_content: true,
+    }) as any[];
+    expect(r.map((n: any) => n.content)).toEqual(["widget recent"]);
+  });
+
+  it("query-notes routes through store.queryNotes so tag-hierarchy expansion fires", async () => {
+    // `voice` and `text` declare "manual" as their parent via the v14
+    // tags.parent_names column. A query for `tag: "manual"` should match
+    // notes tagged with either child — that expansion only happens when
+    // the call goes through `store.queryNotes`, not `noteOps.queryNotes`
+    // directly.
+    await store.upsertTagRecord("voice", { parent_names: ["manual"] });
+    await store.upsertTagRecord("text", { parent_names: ["manual"] });
+    await store.createNote("voice memo", { tags: ["voice"] });
+    await store.createNote("text memo", { tags: ["text"] });
+    await store.createNote("unrelated", { tags: ["other"] });
+
+    const tools = generateMcpTools(store);
+    const queryNotes = tools.find((t) => t.name === "query-notes")!;
+    const r = await queryNotes.execute({ tag: "manual", include_content: true }) as any[];
+    expect(r).toHaveLength(2);
+    expect(r.map((n) => n.content).sort()).toEqual(["text memo", "voice memo"]);
+  });
+
+  it("query-notes FTS path routes through store.searchNotes so tag-hierarchy expansion fires (vault#227)", async () => {
+    // Same fixture shape as the structured-query hierarchy test above, but
+    // exercising the search branch. Pre-fix the FTS path called
+    // `noteOps.searchNotes` directly and silently dropped descendant matches —
+    // `tag: "manual"` would only return notes literally tagged #manual, not
+    // notes tagged with the declared children #voice / #text.
+    await store.upsertTagRecord("voice", { parent_names: ["manual"] });
+    await store.upsertTagRecord("text", { parent_names: ["manual"] });
+    await store.createNote("voice handoff notes", { tags: ["voice"] });
+    await store.createNote("text handoff notes", { tags: ["text"] });
+    await store.createNote("unrelated handoff", { tags: ["other"] });
+
+    const tools = generateMcpTools(store);
+    const queryNotes = tools.find((t) => t.name === "query-notes")!;
+    const r = await queryNotes.execute({ search: "handoff", tag: "manual", include_content: true }) as any[];
+    expect(r).toHaveLength(2);
+    expect(r.map((n) => n.content).sort()).toEqual(["text handoff notes", "voice handoff notes"]);
+    expect(r.map((n) => n.content)).not.toContain("unrelated handoff");
+  });
+
+  it("query-notes does not mutate caller's params object across repeated calls", async () => {
+    // normalizeTags returns a defensive copy of array inputs so the downstream
+    // store layer can sort/dedupe without touching the caller's reference.
+    // Without the copy, a caller reusing the same params object would see its
+    // exclude_tags array reordered (or worse) on the second call.
+    await store.createNote("a", { tags: ["email"] });
+    await store.createNote("b", { tags: ["email", "urgent"] });
+    await store.createNote("c", { tags: ["email", "spam"] });
+
+    const tools = generateMcpTools(store);
+    const queryNotes = tools.find((t) => t.name === "query-notes")!;
+    const params = { tag: "email", exclude_tags: ["urgent", "spam"], include_content: true };
+
+    const r1 = await queryNotes.execute(params) as any[];
+    expect(params.exclude_tags).toEqual(["urgent", "spam"]);
+
+    const r2 = await queryNotes.execute(params) as any[];
+    expect(params.exclude_tags).toEqual(["urgent", "spam"]);
+
+    expect(r1.map((n) => n.content).sort()).toEqual(["a"]);
+    expect(r2.map((n) => n.content).sort()).toEqual(["a"]);
+  });
+
+  // ---- empty-note acceptance (vault#323) + batch-cap MCP ----
+
+  it("create-note accepts bare empty content with no path", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const result = await createNote.execute({ content: "" }) as any;
+    expect(result).toBeTruthy();
+    const note = Array.isArray(result) ? result[0] : result;
+    expect(note.content).toBe("");
+    const fetched = await store.getNote(note.id);
+    expect(fetched).not.toBeNull();
+    expect(fetched!.content).toBe("");
+  });
+
+  it("create-note batch with mixed empty + content entries succeeds end-to-end", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const result = await createNote.execute({
+      notes: [
+        { content: "first" },
+        { content: "" },
+        { content: "third" },
+      ],
+    }) as any[];
+    expect(result).toHaveLength(3);
+    expect(result.map((n) => n.content)).toEqual(["first", "", "third"]);
+  });
+
+  it("create-note batch over MAX_BATCH_SIZE rejects with BATCH_TOO_LARGE", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const notes = Array.from({ length: 501 }, (_, i) => ({ content: `n${i}` }));
+    let err: any;
+    try {
+      await createNote.execute({ notes });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.code).toBe("BATCH_TOO_LARGE");
+    expect(err.limit).toBe(500);
+    expect(err.got).toBe(501);
+  });
+
+  it("update-note batch over MAX_BATCH_SIZE rejects with BATCH_TOO_LARGE", async () => {
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const notes = Array.from({ length: 501 }, (_, i) => ({
+      id: `id${i}`,
+      content: "x",
+      force: true,
+    }));
+    let err: any;
+    try {
+      await updateNote.execute({ notes });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.code).toBe("BATCH_TOO_LARGE");
+    expect(err.limit).toBe(500);
+    expect(err.got).toBe(501);
+  });
+
+  it("create-note batch where mid-item triggers PATH_CONFLICT rolls back prefix items (#236)", async () => {
+    // The empty-note pre-walk (#213) catches `{}` before any DB write; a
+    // path-conflict can only surface on the actual INSERT, mid-loop. Without
+    // the BEGIN/COMMIT wrap the prefix items would have already landed.
+    await store.createNote("seed", { path: "taken-236" });
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const beforeIds = (await store.queryNotes({})).map((n) => n.id).sort();
+
+    let err: any;
+    try {
+      await createNote.execute({
+        notes: [
+          { content: "ok-1", path: "fresh-236-1" },
+          { content: "ok-2", path: "fresh-236-2" },
+          { content: "boom", path: "taken-236" },
+        ],
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeTruthy();
+
+    // The two prefix items must NOT have been created — atomic rollback.
+    const afterIds = (await store.queryNotes({})).map((n) => n.id).sort();
+    expect(afterIds).toEqual(beforeIds);
+    expect(await store.queryNotes({ path: "fresh-236-1" })).toHaveLength(0);
+    expect(await store.queryNotes({ path: "fresh-236-2" })).toHaveLength(0);
+  });
+
+  it("update-note batch rolls back prefix tag mutation when a later item path-conflicts (#236)", async () => {
+    await store.createNote("A", { id: "a236" });
+    await store.createNote("B", { id: "b236" });
+    await store.createNote("C", { id: "c236", path: "occupied-236" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    const aBefore = await store.getNote("a236");
+
+    let err: any;
+    try {
+      await updateNote.execute({
+        notes: [
+          // Item 0 mutates a236's content + adds a tag. force=true skips
+          // the if_updated_at precondition.
+          { id: "a236", content: "A mutated", force: true, tags: { add: ["should-rollback"] } },
+          // Item 1 tries to take a path already owned by c236 — PATH_CONFLICT.
+          { id: "b236", path: "occupied-236", force: true },
+        ],
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.code).toBe("PATH_CONFLICT");
+
+    // Item 0's tag-add + content change must be rolled back — the batch
+    // transaction reverted them when item 1 path-conflicted (#236).
+    const aAfter = await store.getNote("a236");
+    expect(aAfter!.content).toBe(aBefore!.content);
+    expect(aAfter!.tags ?? []).not.toContain("should-rollback");
+  });
+
+  it("update-note batch rolls back prefix mutation when a later item if_updated_at-conflicts (#261)", async () => {
+    // The companion to the PATH_CONFLICT test above. Item 1's stale
+    // `if_updated_at` must surface as a ConflictError so the batch's
+    // BEGIN/COMMIT wrap can roll back item 0's mutation.
+    //
+    // Pre-fix (vault#261): `noteOps.updateNote` checked `res.changes === 0`
+    // to detect the precondition miss. Inside this multi-statement batch
+    // transaction, `.changes` reported a stale non-zero value from prior
+    // writes, so the conflict was silently missed and item 0's mutation
+    // committed with item 1 ignored.
+    //
+    // Post-fix: the conditional UPDATE uses `RETURNING id` and detects the
+    // miss directly from row presence. ConflictError fires; batch rolls back.
+    //
+    // Standalone bun:sqlite repro is pending — six attempted reductions
+    // (basic txn, async/microtask, prepared-statement reuse, mcp-loop
+    // mirror, hook-dispatch mirror, syncWikilinks-style writes) failed to
+    // hit the .changes-stale path outside the full BunStore plumbing. The
+    // bug surfaces only through `BunStore.updateNote` → hook dispatch.
+    // See vault#261 for the audit trail.
+    await store.createNote("A", { id: "a261" });
+    await store.createNote("B", { id: "b261" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    const aBefore = await store.getNote("a261");
+
+    let err: any;
+    try {
+      await updateNote.execute({
+        notes: [
+          // Item 0 mutates a261's content + adds a tag (force, no precondition).
+          { id: "a261", content: "A mutated", force: true, tags: { add: ["should-rollback"] } },
+          // Item 1 has a stale if_updated_at on b261 — should ConflictError.
+          { id: "b261", content: "B should-not-land", if_updated_at: "2020-01-01T00:00:00.000Z" },
+        ],
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.code).toBe("CONFLICT");
+
+    // Item 0's tag-add + content change must be rolled back.
+    const aAfter = await store.getNote("a261");
+    expect(aAfter!.content).toBe(aBefore!.content);
+    expect(aAfter!.tags ?? []).not.toContain("should-rollback");
+  });
+});
+
+// ---- query-notes link expansion ----
+
+describe("query-notes link expansion", async () => {
+  it("expands a single [[wikilink]] inline in full mode by default", async () => {
+    await store.createNote("# Who I Am\nI teach Taiji.", { path: "Statements/Who" });
+    await store.createNote(
+      "Canon:\nSee [[Statements/Who]] for identity.",
+      { path: "Canon" },
+    );
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await query.execute({
+      id: "Canon",
+      expand_links: true,
+    }) as any;
+
+    expect(result.content).toContain('<expanded path="Statements/Who" mode="full">');
+    expect(result.content).toContain("I teach Taiji.");
+    expect(result.content).toContain("</expanded>");
+  });
+
+  it("summary mode inlines only metadata.summary, not full content", async () => {
+    await store.createNote(
+      "# Long canonical statement\n\n(Many paragraphs of detail follow...)",
+      { path: "Statements/Philosophy", metadata: { summary: "Unforced / wu wei." } },
+    );
+    await store.createNote("Overview: [[Statements/Philosophy]]", { path: "Index" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await query.execute({
+      id: "Index",
+      expand_links: true,
+      expand_mode: "summary",
+    }) as any;
+
+    expect(result.content).toContain('mode="summary"');
+    expect(result.content).toContain("Unforced / wu wei.");
+    expect(result.content).not.toContain("Many paragraphs of detail");
+  });
+
+  it("deduplicates: a linked note expanded once, subsequent references marked", async () => {
+    await store.createNote("target body", { path: "Target" });
+    await store.createNote(
+      "First [[Target]], then [[Target]] again.",
+      { path: "Source" },
+    );
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await query.execute({
+      id: "Source",
+      expand_links: true,
+    }) as any;
+
+    // Exactly one <expanded> block.
+    const openCount = (result.content.match(/<expanded /g) ?? []).length;
+    expect(openCount).toBe(1);
+    expect(result.content).toContain("(expanded above)");
+  });
+
+  it("cycle guard: A→B→A does not expand A inside B", async () => {
+    await store.createNote("A body with [[B]] reference.", { path: "A" });
+    await store.createNote("B body with [[A]] reference.", { path: "B" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await query.execute({
+      id: "A",
+      expand_links: true,
+      expand_depth: 3,
+    }) as any;
+
+    // A appears as the container but should only be expanded once (in the top-level note).
+    // B is expanded inside A; inside B, the [[A]] reference should NOT re-expand A.
+    const expandedOpens = (result.content.match(/<expanded path="(A|B)" mode="full">/g) ?? []).length;
+    expect(expandedOpens).toBe(1); // only B is expanded; A is the top note, never re-expanded
+    expect(result.content).toContain("(expanded above)"); // B's reference to A becomes the marker
+  });
+
+  it("expand_depth=1 (default) expands top-level wikilinks but not nested ones", async () => {
+    await store.createNote("leaf content", { path: "Leaf" });
+    await store.createNote("middle body with [[Leaf]] inside", { path: "Middle" });
+    await store.createNote("root references [[Middle]]", { path: "Root" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await query.execute({ id: "Root", expand_links: true }) as any;
+
+    expect(result.content).toContain('<expanded path="Middle"');
+    // Middle's content is inlined, including its raw [[Leaf]] reference — but Leaf is NOT expanded.
+    expect(result.content).toContain("[[Leaf]]");
+    expect(result.content).not.toContain('<expanded path="Leaf"');
+  });
+
+  it("expand_depth=2 recurses one additional level", async () => {
+    await store.createNote("leaf content", { path: "Leaf" });
+    await store.createNote("middle [[Leaf]] inside", { path: "Middle" });
+    await store.createNote("root references [[Middle]]", { path: "Root" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await query.execute({
+      id: "Root",
+      expand_links: true,
+      expand_depth: 2,
+    }) as any;
+
+    expect(result.content).toContain('<expanded path="Middle"');
+    expect(result.content).toContain('<expanded path="Leaf"');
+    expect(result.content).toContain("leaf content");
+  });
+
+  it("expand_depth is clamped to MAX_EXPAND_DEPTH (3)", async () => {
+    await store.createNote("level-4", { path: "L4" });
+    await store.createNote("level-3 [[L4]]", { path: "L3" });
+    await store.createNote("level-2 [[L3]]", { path: "L2" });
+    await store.createNote("level-1 [[L2]]", { path: "L1" });
+    await store.createNote("root [[L1]]", { path: "Root" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    // Request depth=99 — should clamp to 3, so L4 is NOT expanded.
+    const result = await query.execute({
+      id: "Root",
+      expand_links: true,
+      expand_depth: 99,
+    }) as any;
+
+    expect(result.content).toContain('<expanded path="L1"');
+    expect(result.content).toContain('<expanded path="L2"');
+    expect(result.content).toContain('<expanded path="L3"');
+    expect(result.content).not.toContain('<expanded path="L4"');
+    expect(result.content).toContain("[[L4]]"); // raw, beyond clamp
+  });
+
+  it("leaves unresolved [[wikilinks]] unchanged", async () => {
+    await store.createNote("root mentions [[DoesNotExist]]", { path: "Root" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await query.execute({ id: "Root", expand_links: true }) as any;
+    expect(result.content).toBe("root mentions [[DoesNotExist]]");
+  });
+
+  it("expand_links: false (default) leaves content untouched", async () => {
+    await store.createNote("target body", { path: "Target" });
+    await store.createNote("before [[Target]] after", { path: "Source" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await query.execute({ id: "Source" }) as any;
+    expect(result.content).toBe("before [[Target]] after");
+    expect(result.content).not.toContain("<expanded");
+  });
+
+  it("list queries expand per-note and dedup across the result", async () => {
+    await store.createNote("shared body", { path: "Shared" });
+    await store.createNote(
+      "first note references [[Shared]]",
+      { path: "A", tags: ["list-test"] },
+    );
+    await store.createNote(
+      "second note also references [[Shared]]",
+      { path: "B", tags: ["list-test"] },
+    );
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await query.execute({
+      tag: ["list-test"],
+      include_content: true,
+      expand_links: true,
+      sort: "asc",
+    }) as any[];
+
+    expect(result).toHaveLength(2);
+    const expandedBlocks = result
+      .map((n) => (n.content.match(/<expanded /g) ?? []).length)
+      .reduce((a, b) => a + b, 0);
+    expect(expandedBlocks).toBe(1); // shared note expanded exactly once total
+    const withMarker = result.find((n) => n.content.includes("(expanded above)"));
+    expect(withMarker).toBeTruthy();
+  });
+
+  it("self-reference does not expand (note can't inline itself)", async () => {
+    await store.createNote("I reference [[Self]] in my own body.", { path: "Self" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await query.execute({ id: "Self", expand_links: true }) as any;
+    expect(result.content).not.toContain("<expanded");
+    expect(result.content).toContain("(expanded above)");
+  });
+
+  it("handles [[Target|alias]] and [[Target#anchor]] wikilink forms", async () => {
+    await store.createNote("target body", { path: "Target" });
+    await store.createNote(
+      "See [[Target|the target]] or [[Target#section]].",
+      { path: "Source" },
+    );
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await query.execute({ id: "Source", expand_links: true }) as any;
+    // Both references resolve to same target — first expands, second marked.
+    const openCount = (result.content.match(/<expanded /g) ?? []).length;
+    expect(openCount).toBe(1);
+    expect(result.content).toContain("(expanded above)");
+  });
+
+  it("does not expand wikilinks inside fenced code blocks", async () => {
+    await store.createNote("target body", { path: "Target" });
+    await store.createNote(
+      "Example code:\n```\n[[Target]]\n```\nAnd a real link: [[Target]].",
+      { path: "Src" },
+    );
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await query.execute({ id: "Src", expand_links: true }) as any;
+
+    // The fenced [[Target]] stays verbatim; the real one gets expanded exactly once.
+    const expandedOpens = (result.content.match(/<expanded /g) ?? []).length;
+    expect(expandedOpens).toBe(1);
+    expect(result.content).toContain("```\n[[Target]]\n```");
+  });
+
+  it("does not expand wikilinks inside inline code", async () => {
+    await store.createNote("target body", { path: "Target" });
+    await store.createNote(
+      "Pass `[[Target]]` to render a link. A real one: [[Target]].",
+      { path: "Src" },
+    );
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await query.execute({ id: "Src", expand_links: true }) as any;
+    const expandedOpens = (result.content.match(/<expanded /g) ?? []).length;
+    expect(expandedOpens).toBe(1);
+    expect(result.content).toContain("`[[Target]]`");
+  });
+
+  it("expand_depth=0 is a no-op (no expansion performed)", async () => {
+    await store.createNote("target body", { path: "Target" });
+    await store.createNote("see [[Target]]", { path: "Src" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await query.execute({
+      id: "Src",
+      expand_links: true,
+      expand_depth: 0,
+    }) as any;
+    expect(result.content).toBe("see [[Target]]");
+  });
+
+  it("expand_links=true is a silent no-op when include_content=false", async () => {
+    await store.createNote("target body", { path: "Target" });
+    await store.createNote("see [[Target]]", { path: "Src", tags: ["silent"] });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    // List mode defaults to include_content=false; expansion has nothing to
+    // operate on, so the result is the standard lean/index shape.
+    const result = await query.execute({ tag: ["silent"], expand_links: true }) as any[];
+    expect(result).toHaveLength(1);
+    expect(result[0].content).toBeUndefined();
+    expect(result[0].preview).toBeTruthy();
+  });
+
+  it("expand_mode=summary with no metadata.summary AND no lede (title-only note) renders empty body inline", async () => {
+    // Single-line content: the whole thing IS the title, so there's no
+    // paragraph after it for computeLede to fall back to.
+    await store.createNote("unsummarized title-only body", { path: "Plain" });
+    await store.createNote("see [[Plain]]", { path: "Src" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await query.execute({
+      id: "Src",
+      expand_links: true,
+      expand_mode: "summary",
+    }) as any;
+    expect(result.content).toContain('mode="summary"');
+    // No summary, no lede — we still get the block but with nothing between delimiters.
+    expect(result.content).not.toContain("unsummarized title-only body");
+  });
+
+  it("expand_mode=summary with no metadata.summary falls back to the note's lede", async () => {
+    await store.createNote(
+      "# Long canonical statement\n\nUnforced / wu wei, in one paragraph.\n\n(Many paragraphs of detail follow...)",
+      { path: "Statements/NoSummary" },
+    );
+    await store.createNote("Overview: [[Statements/NoSummary]]", { path: "Index2" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await query.execute({
+      id: "Index2",
+      expand_links: true,
+      expand_mode: "summary",
+    }) as any;
+
+    expect(result.content).toContain('mode="summary"');
+    expect(result.content).toContain("Unforced / wu wei, in one paragraph.");
+    expect(result.content).not.toContain("Many paragraphs of detail");
+    // The heading/title itself isn't repeated as the summary.
+    expect(result.content).not.toContain("Long canonical statement");
+  });
+
+  it("expand_mode=summary: metadata.summary still wins over the lede when both are present", async () => {
+    await store.createNote(
+      "# Title\n\nThis is the lede paragraph, not the summary.",
+      { path: "Statements/Both", metadata: { summary: "The curated summary." } },
+    );
+    await store.createNote("see [[Statements/Both]]", { path: "Index3" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await query.execute({
+      id: "Index3",
+      expand_links: true,
+      expand_mode: "summary",
+    }) as any;
+
+    expect(result.content).toContain("The curated summary.");
+    expect(result.content).not.toContain("This is the lede paragraph");
+  });
+
+  it("expand_mode=summary lede fallback respects a leading frontmatter block", async () => {
+    await store.createNote(
+      "---\ntitle: X\n---\n# Real Title\n\nThe lede after frontmatter and title.",
+      { path: "Statements/Frontmatter" },
+    );
+    await store.createNote("see [[Statements/Frontmatter]]", { path: "Index4" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await query.execute({
+      id: "Index4",
+      expand_links: true,
+      expand_mode: "summary",
+    }) as any;
+
+    expect(result.content).toContain("The lede after frontmatter and title.");
+    expect(result.content).not.toContain("Real Title");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tag hierarchy via tags.parent_names (post-v14, docs/contracts/tag-data-model.md)
+// ---------------------------------------------------------------------------
+
+describe("tag hierarchy (tags.parent_names)", async () => {
+  it("query for parent tag returns notes tagged with declared child", async () => {
+    await store.upsertTagRecord("voice", { parent_names: ["manual"] });
+    await store.createNote("voice note", { tags: ["voice"] });
+    await store.createNote("text note", { tags: ["text"] });
+
+    const results = await store.queryNotes({ tags: ["manual"] });
+    expect(results.length).toBe(1);
+    expect(results[0]!.content).toBe("voice note");
+  });
+
+  it("expands transitively across multiple levels", async () => {
+    await store.upsertTagRecord("manual", { parent_names: ["note"] });
+    await store.upsertTagRecord("voice", { parent_names: ["manual"] });
+    await store.createNote("voice note", { tags: ["voice"] });
+    await store.createNote("manual-only note", { tags: ["manual"] });
+    await store.createNote("note-only note", { tags: ["note"] });
+
+    // #note matches all three (note + manual + voice).
+    const noteResults = await store.queryNotes({ tags: ["note"] });
+    expect(noteResults.length).toBe(3);
+
+    // #manual matches voice + manual-only, not note-only.
+    const manualResults = await store.queryNotes({ tags: ["manual"] });
+    expect(manualResults.map((n) => n.content).sort()).toEqual([
+      "manual-only note",
+      "voice note",
+    ]);
+  });
+
+  it("query for child does not match parent-tagged notes", async () => {
+    await store.upsertTagRecord("voice", { parent_names: ["manual"] });
+    await store.createNote("voice note", { tags: ["voice"] });
+    await store.createNote("manual-only note", { tags: ["manual"] });
+
+    const results = await store.queryNotes({ tags: ["voice"] });
+    expect(results.length).toBe(1);
+    expect(results[0]!.content).toBe("voice note");
+  });
+
+  it("supports multiple parents (diamond inheritance)", async () => {
+    await store.upsertTagRecord("voice-meeting", { parent_names: ["voice", "meeting"] });
+    await store.createNote("vm", { tags: ["voice-meeting"] });
+    await store.createNote("v", { tags: ["voice"] });
+    await store.createNote("m", { tags: ["meeting"] });
+
+    expect((await store.queryNotes({ tags: ["voice"] })).length).toBe(2); // v + vm
+    expect((await store.queryNotes({ tags: ["meeting"] })).length).toBe(2); // m + vm
+  });
+
+  it("hierarchy is invalidated when parent_names is set", async () => {
+    await store.createNote("voice note", { tags: ["voice"] });
+    // Before the parents are declared, #manual matches nothing.
+    expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(0);
+
+    await store.upsertTagRecord("voice", { parent_names: ["manual"] });
+
+    // After upsert, the cache invalidates and the next query expands.
+    expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(1);
+  });
+
+  it("hierarchy is invalidated when parent_names is repointed", async () => {
+    await store.createNote("voice note", { tags: ["voice"] });
+    await store.upsertTagRecord("voice", { parent_names: ["manual"] });
+    expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(1);
+
+    // Repoint the parent.
+    await store.upsertTagRecord("voice", { parent_names: ["audio"] });
+
+    expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(0);
+    expect((await store.queryNotes({ tags: ["audio"] })).length).toBe(1);
+  });
+
+  it("hierarchy is invalidated when parent_names is cleared", async () => {
+    await store.createNote("voice note", { tags: ["voice"] });
+    await store.upsertTagRecord("voice", { parent_names: ["manual"] });
+    expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(1);
+
+    await store.upsertTagRecord("voice", { parent_names: null });
+    expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(0);
+  });
+
+  it("hierarchy is invalidated when a parent tag is deleted", async () => {
+    await store.upsertTagRecord("voice", { parent_names: ["manual"] });
+    await store.createNote("voice note", { tags: ["voice"] });
+    expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(1);
+
+    // Drop the child tag — the row holding the parent_names declaration
+    // disappears, so the hierarchy edge goes with it.
+    await store.deleteTag("voice");
+    expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(0);
+  });
+
+  it("tagMatch=any flattens all expansions across input tags", async () => {
+    await store.upsertTagRecord("voice", { parent_names: ["manual"] });
+    await store.createNote("v", { tags: ["voice"] });
+    await store.createNote("p", { tags: ["project"] });
+    await store.createNote("o", { tags: ["other"] });
+
+    const results = await store.queryNotes({
+      tags: ["manual", "project"],
+      tagMatch: "any",
+    });
+    expect(results.map((n) => n.content).sort()).toEqual(["p", "v"]);
+  });
+
+  it("tagMatch=all (default) requires each input tag's expanded set to be present", async () => {
+    await store.upsertTagRecord("voice", { parent_names: ["manual"] });
+    // Note has both #voice (which satisfies #manual via expansion) AND #project.
+    await store.createNote("vp", { tags: ["voice", "project"] });
+    await store.createNote("p-only", { tags: ["project"] });
+
+    const results = await store.queryNotes({
+      tags: ["manual", "project"], // default tagMatch=all
+    });
+    expect(results.length).toBe(1);
+    expect(results[0]!.content).toBe("vp");
+  });
+
+  it("tolerates a cycle without infinite-looping", async () => {
+    await store.upsertTagRecord("a", { parent_names: ["b"] });
+    await store.upsertTagRecord("b", {}); // bare row, no parent yet
+    // vault#552: upsertTagRecord now REJECTS a parent_names write that would
+    // close a cycle, so the second leg of the cycle can no longer be built
+    // via the public API — simulate pre-existing cyclic data (written
+    // before the guard shipped, or via any path that bypasses it) with a
+    // direct DB write, same technique as "malformed parent_names JSON is
+    // ignored silently" below. Traversal must stay cycle-safe regardless of
+    // how the cycle got there.
+    (store as any).db.prepare("UPDATE tags SET parent_names = ? WHERE name = ?")
+      .run(JSON.stringify(["a"]), "b");
+    (store as any)._tagHierarchy = null;
+    await store.createNote("note-a", { tags: ["a"] });
+
+    // Both a and b should resolve without hanging; both reach the same set {a, b}.
+    expect((await store.queryNotes({ tags: ["a"] })).length).toBe(1);
+    expect((await store.queryNotes({ tags: ["b"] })).length).toBe(1);
+  });
+
+  it("malformed parent_names JSON is ignored silently", async () => {
+    // Stuff a malformed value into the column directly to simulate an
+    // out-of-band write. The resolver should drop it without throwing.
+    await store.upsertTagRecord("voice", { parent_names: ["manual"] });
+    (store as any).db.prepare("UPDATE tags SET parent_names = ? WHERE name = ?")
+      .run("not valid json {{{", "voice");
+    // Force cache reload.
+    (store as any)._tagHierarchy = null;
+    await store.createNote("v", { tags: ["voice"] });
+
+    expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(0);
+    expect((await store.queryNotes({ tags: ["voice"] })).length).toBe(1);
+  });
+
+  it("a tag with no parent_names is a hierarchy no-op", async () => {
+    await store.upsertTagRecord("voice", { description: "voice notes" });
+    await store.createNote("v", { tags: ["voice"] });
+    await store.createNote("m", { tags: ["manual"] });
+
+    expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(1);
+    expect((await store.queryNotes({ tags: ["voice"] })).length).toBe(1);
+  });
+
+  it("legacy `_tags/<name>` notes left in place do not affect the hierarchy", async () => {
+    // Post-v14, the resolver reads tags.parent_names — not notes. A leftover
+    // `_tags/*` note from a pre-v14 vault is harmless historical record.
+    await store.createNote("legacy", {
+      path: "_tags/voice",
+      metadata: { parents: ["manual"] },
+    });
+    await store.createNote("voice note", { tags: ["voice"] });
+
+    expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Schema validation — driven by `tags.fields` (post-v17, vault#267)
+// ---------------------------------------------------------------------------
+// Originally written against the `_schemas/<name>` + `_schema_defaults`
+// notes-as-config convention (issue #177); rewritten for vault#246 against
+// the standalone `note_schemas` + `schema_mappings` tables; rewritten again
+// for vault#267 against `tags.fields` after the standalone subsystem retired.
+// The validation surface is intentionally smaller now — schemas are tag-axis
+// only (no path_prefix) and advisory only (no `required` concept).
+
+describe("schema validation (tags.fields)", async () => {
+  it("returns no validation_status when no tag declares fields", async () => {
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({ content: "plain note" }) as any;
+    expect(result.validation_status).toBeUndefined();
+  });
+
+  it("returns no validation_status when no tag on the note declares fields", async () => {
+    // A different tag has fields, but the note isn't tagged with it.
+    await store.upsertTagSchema("task", {
+      fields: { priority: { type: "string" } },
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({ content: "plain note", tags: ["other"] }) as any;
+    expect(result.validation_status).toBeUndefined();
+  });
+
+  it("validation passes (empty warnings) when fields match types", async () => {
+    await store.upsertTagSchema("task", {
+      fields: {
+        priority: { type: "string", enum: ["high", "medium", "low"] },
+        done: { type: "boolean" },
+      },
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "ok",
+      tags: ["task"],
+      metadata: { priority: "high", done: false },
+    }) as any;
+
+    expect(result.validation_status.schemas).toEqual(["task"]);
+    expect(result.validation_status.warnings).toEqual([]);
+  });
+
+  it("type_mismatch warning when a field's value is the wrong type", async () => {
+    await store.upsertTagSchema("task", {
+      fields: { priority: { type: "string" }, done: { type: "boolean" } },
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["task"],
+      metadata: { priority: "high", done: "yes" }, // wrong: should be boolean
+    }) as any;
+
+    expect(result.validation_status.warnings.length).toBe(1);
+    expect(result.validation_status.warnings[0].reason).toBe("type_mismatch");
+    expect(result.validation_status.warnings[0].field).toBe("done");
+  });
+
+  it("enum_mismatch warning when a field's value is outside the declared enum", async () => {
+    await store.upsertTagSchema("task", {
+      fields: { priority: { type: "string", enum: ["high", "medium", "low"] } },
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["task"],
+      metadata: { priority: "ULTRA" },
+    }) as any;
+
+    expect(result.validation_status.warnings[0].reason).toBe("enum_mismatch");
+  });
+
+  // ---- `date` field type (vault#date-field-type) ----
+  //
+  // Motivation: today a date-ish field (e.g. a `meeting` tag's
+  // `meeting_date`) can only be declared `type: "string"`, with "ISO date"
+  // explained in prose — nothing can programmatically discover
+  // date-candidate fields for a calendar view. `date` validates like
+  // `string` but requires an ISO-8601 date or full RFC3339 timestamp,
+  // parsed by the SAME `timestampToMs` (cursor.ts) `date_filter`'s
+  // `updated_at` bound uses.
+
+  it("no warning when a `date` field's value is a bare ISO date (YYYY-MM-DD)", async () => {
+    await store.upsertTagSchema("meeting", {
+      fields: { meeting_date: { type: "date" } },
+    });
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "standup",
+      tags: ["meeting"],
+      metadata: { meeting_date: "2026-07-09" },
+    }) as any;
+    expect(result.validation_status.warnings).toEqual([]);
+  });
+
+  it("no warning when a `date` field's value is a full RFC3339 timestamp", async () => {
+    await store.upsertTagSchema("meeting", {
+      fields: { meeting_date: { type: "date" } },
+    });
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "standup",
+      tags: ["meeting"],
+      metadata: { meeting_date: "2026-07-09T14:30:00.000Z" },
+    }) as any;
+    expect(result.validation_status.warnings).toEqual([]);
+  });
+
+  it("type_mismatch warning when a `date` field's value isn't a parseable ISO string", async () => {
+    await store.upsertTagSchema("meeting", {
+      fields: { meeting_date: { type: "date" } },
+    });
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "standup",
+      tags: ["meeting"],
+      metadata: { meeting_date: "not-a-date" },
+    }) as any;
+    expect(result.validation_status.warnings).toHaveLength(1);
+    expect(result.validation_status.warnings[0].reason).toBe("type_mismatch");
+    expect(result.validation_status.warnings[0].field).toBe("meeting_date");
+  });
+
+  it("a `date` field's type_mismatch is a HARD REJECTION under strict:true, same as any other type", async () => {
+    await store.upsertTagSchema("meeting", {
+      fields: { meeting_date: { type: "date", strict: true } },
+    });
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    await expect(create.execute({
+      content: "standup",
+      tags: ["meeting"],
+      metadata: { meeting_date: "not-a-date" },
+    })).rejects.toThrow();
+  });
+
+  it("an indexed `date` field's type_mismatch is ALWAYS a hard rejection, independent of strict (vault#553 Decision A)", async () => {
+    await store.upsertTagSchema("meeting", {
+      fields: { meeting_date: { type: "date", indexed: true } },
+    });
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    await expect(create.execute({
+      content: "standup",
+      tags: ["meeting"],
+      metadata: { meeting_date: "not-a-date" },
+    })).rejects.toThrow();
+  });
+
+  // Sharp edge (docs/HTTP_API.md's "type: date" callout): a schema edit
+  // that tightens an existing field from `string` to `date` does NOT
+  // retroactively revalidate notes already carrying a non-ISO value —
+  // only the field's NEXT write is checked. No migration, no data change.
+  it("tightening an existing field from string to date does not retroactively touch existing notes", async () => {
+    await store.upsertTagSchema("meeting", {
+      fields: { meeting_date: { type: "string" } },
+    });
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const note = await create.execute({
+      content: "old-style note",
+      tags: ["meeting"],
+      metadata: { meeting_date: "sometime next week" }, // not ISO — fine under type:"string"
+    }) as any;
+    expect(note.validation_status.warnings).toEqual([]);
+
+    // Tighten the schema. This must not touch the existing note.
+    await store.upsertTagSchema("meeting", {
+      fields: { meeting_date: { type: "date" } },
+    });
+
+    const fresh = await query.execute({ id: note.id }) as any;
+    expect(fresh.metadata.meeting_date).toBe("sometime next week");
+  });
+
+  // vault#555 fix 3 — an enum-membership violation on an INDEXED
+  // (non-strict) field is stored, findable via `eq` (indexed⇒strict is
+  // TYPE-only, not enum-domain — a ratified policy, not a bug), but the
+  // advisory `enum_mismatch` warning used to be visible ONLY on the
+  // one-time create/update response — a caller reading the note back via
+  // query-notes (the natural way to re-check a stored value) saw nothing,
+  // contradicting "advisory violations surface as warnings."
+  it("query-notes surfaces validation_status (enum_mismatch on an indexed field) — single-id fetch", async () => {
+    const tools = generateMcpTools(store);
+    const updateTag = tools.find((t) => t.name === "update-tag")!;
+    const create = tools.find((t) => t.name === "create-note")!;
+    const query = tools.find((t) => t.name === "query-notes")!;
+    await updateTag.execute({
+      tag: "widget",
+      fields: { status: { type: "string", enum: ["a", "b"], indexed: true } },
+    });
+    const created = await create.execute({ content: "x", tags: ["widget"], metadata: { status: "bogus" } }) as any;
+
+    // Findable via eq — indexed⇒strict is TYPE-only, enum stays advisory.
+    const found = await query.execute({ metadata: { status: { eq: "bogus" } }, include_content: true }) as any[];
+    expect(found).toHaveLength(1);
+    expect(found[0].validation_status?.warnings?.[0]?.reason).toBe("enum_mismatch");
+
+    // Single-id fetch also carries it.
+    const single = await query.execute({ id: created.id }) as any;
+    expect(single.validation_status.warnings[0].reason).toBe("enum_mismatch");
+    expect(single.validation_status.warnings[0].field).toBe("status");
+  });
+
+  it("query-notes surfaces validation_status on the default list path (lean NoteIndex shape)", async () => {
+    await store.upsertTagSchema("task", {
+      fields: { priority: { type: "string", enum: ["high", "low"] } },
+    });
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const query = tools.find((t) => t.name === "query-notes")!;
+    await create.execute({ content: "x", tags: ["task"], metadata: { priority: "ULTRA" } });
+
+    // Default list mode (include_content omitted → lean NoteIndex).
+    const list = await query.execute({ tag: "task" }) as any[];
+    expect(list).toHaveLength(1);
+    expect(list[0].validation_status?.warnings?.[0]?.reason).toBe("enum_mismatch");
+  });
+
+  it("query-notes omits validation_status entirely when no tag declares fields (no behavior change)", async () => {
+    await store.createNote("plain note", { tags: ["untagged-schema"] });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const list = await query.execute({ tag: "untagged-schema" }) as any[];
+    expect(list[0].validation_status).toBeUndefined();
+  });
+
+  it("validation never blocks the write — note exists with warnings attached", async () => {
+    await store.upsertTagSchema("task", {
+      fields: { priority: { type: "boolean" } },
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["task"],
+      metadata: { priority: "high" }, // wrong type, but the write still lands
+    }) as any;
+
+    expect(result.id).toBeTruthy();
+    expect(result.validation_status.warnings.length).toBe(1);
+
+    const fetched = await store.getNote(result.id);
+    expect(fetched).not.toBeNull();
+    expect(fetched!.content).toBe("x");
+  });
+
+  it("update-note also surfaces validation_status", async () => {
+    await store.upsertTagSchema("task", {
+      fields: { priority: { type: "string", enum: ["high", "low"] } },
+    });
+    const note = await store.createNote("body", { tags: ["task"], metadata: { priority: "high" } });
+
+    const tools = generateMcpTools(store);
+    const update = tools.find((t) => t.name === "update-note")!;
+    const result = await update.execute({
+      id: note.id,
+      metadata: { priority: "ULTRA" },
+      if_updated_at: note.updatedAt,
+    }) as any;
+
+    expect(result.validation_status.warnings[0].reason).toBe("enum_mismatch");
+  });
+
+  it("cache invalidates when a tag schema is updated", async () => {
+    await store.upsertTagSchema("task", {
+      fields: { priority: { type: "boolean" } },
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    let result = await create.execute({
+      content: "x",
+      tags: ["task"],
+      metadata: { priority: "high" },
+    }) as any;
+    expect(result.validation_status.warnings[0].field).toBe("priority");
+    expect(result.validation_status.warnings[0].reason).toBe("type_mismatch");
+
+    // Re-declare with a string type; cache must reflect the change.
+    await store.upsertTagSchema("task", {
+      fields: { priority: { type: "string" } },
+    });
+    result = await create.execute({
+      content: "y",
+      tags: ["task"],
+      metadata: { priority: "high" },
+    }) as any;
+    expect(result.validation_status.warnings).toEqual([]);
+  });
+
+  it("cache invalidates when a tag schema is deleted", async () => {
+    await store.upsertTagSchema("task", {
+      fields: { priority: { type: "boolean" } },
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    let result = await create.execute({
+      content: "x",
+      tags: ["task"],
+      metadata: { priority: "high" },
+    }) as any;
+    expect(result.validation_status.warnings.length).toBe(1);
+
+    await store.deleteTagSchema("task");
+
+    result = await create.execute({
+      content: "y",
+      tags: ["task"],
+      metadata: { priority: "high" },
+    }) as any;
+    expect(result.validation_status).toBeUndefined();
+  });
+
+  it("multiple tag schemas combine warnings", async () => {
+    await store.upsertTagSchema("task", {
+      fields: { priority: { type: "string" } },
+    });
+    await store.upsertTagSchema("project", {
+      fields: { status: { type: "string", enum: ["active", "done"] } },
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["task", "project"],
+      metadata: { priority: 7, status: "WIP" }, // bad: wrong type, bad enum
+    }) as any;
+
+    expect(result.validation_status.schemas.sort()).toEqual(["project", "task"]);
+    expect(result.validation_status.warnings.length).toBe(2);
+  });
+
+  it("legacy `_schemas/<name>` notes are inert post-v17", async () => {
+    // The notes still write/read fine — they're just no longer interpreted
+    // as schema config. Nothing in tags.fields → no validation.
+    await store.createNote("", {
+      path: "_schemas/task",
+      metadata: { fields: { priority: { type: "string" } } },
+    });
+    await store.createNote("", {
+      path: "_schema_defaults",
+      metadata: { tags: { task: "task" } },
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({ content: "x", tags: ["task"] }) as any;
+    expect(result.validation_status).toBeUndefined();
+  });
+
+  // vault#310 — integer type validation. JSON has no separate integer
+  // type, so a JSON number with zero fractional part (`5`, `5.0`) must
+  // pass an `integer`-typed field. Pre-fix, the validator had no
+  // `"integer"` case at all — falling through the switch returned
+  // undefined and every integer-typed field warned `type_mismatch` on
+  // legitimate values. Gitcoin Brain's drift detector emits JSON for
+  // diffs; every `kpi: 3` triggered the false-positive and buried the
+  // real warnings.
+
+  it("integer-typed field: JSON integer (5) passes (vault#310)", async () => {
+    await store.upsertTagSchema("kpi", { fields: { count: { type: "integer" } } });
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["kpi"],
+      metadata: { count: 5 },
+    }) as any;
+    expect(result.validation_status?.warnings ?? []).toEqual([]);
+  });
+
+  it("integer-typed field: JSON `5.0` (zero-fractional) passes (vault#310)", async () => {
+    // 5.0 is the canonical Gitcoin shape — JSON.parse decodes the
+    // emitted JSON number as a JS Number; the JS Number for `5.0` is
+    // identical to `5` so Number.isInteger reports true. This is the
+    // load-bearing assertion for the Gitcoin drift-detector use case.
+    await store.upsertTagSchema("kpi", { fields: { count: { type: "integer" } } });
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["kpi"],
+      metadata: { count: 5.0 },
+    }) as any;
+    expect(result.validation_status?.warnings ?? []).toEqual([]);
+  });
+
+  it("integer-typed field: JSON `5.5` (non-zero fractional) warns type_mismatch (vault#310)", async () => {
+    await store.upsertTagSchema("kpi", { fields: { count: { type: "integer" } } });
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["kpi"],
+      metadata: { count: 5.5 },
+    }) as any;
+    expect(result.validation_status.warnings.length).toBe(1);
+    expect(result.validation_status.warnings[0].reason).toBe("type_mismatch");
+    expect(result.validation_status.warnings[0].field).toBe("count");
+  });
+
+  it("integer-typed field: string `\"5\"` warns type_mismatch (no string→number coercion) (vault#310)", async () => {
+    await store.upsertTagSchema("kpi", { fields: { count: { type: "integer" } } });
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["kpi"],
+      metadata: { count: "5" },
+    }) as any;
+    expect(result.validation_status.warnings.length).toBe(1);
+    expect(result.validation_status.warnings[0].reason).toBe("type_mismatch");
+  });
+
+  it("integer-typed field: edge `5.0000000000001` warns type_mismatch (vault#310)", async () => {
+    await store.upsertTagSchema("kpi", { fields: { count: { type: "integer" } } });
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["kpi"],
+      metadata: { count: 5.0000000000001 },
+    }) as any;
+    expect(result.validation_status.warnings.length).toBe(1);
+    expect(result.validation_status.warnings[0].reason).toBe("type_mismatch");
+  });
+
+  it("integer-typed field: boolean warns type_mismatch (vault#310)", async () => {
+    // Pin that boolean is rejected (Number.isInteger(true) returns
+    // false, but extra coverage in case anyone "improves" the check
+    // with a looser predicate later).
+    await store.upsertTagSchema("kpi", { fields: { count: { type: "integer" } } });
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["kpi"],
+      metadata: { count: true },
+    }) as any;
+    expect(result.validation_status.warnings.length).toBe(1);
+    expect(result.validation_status.warnings[0].reason).toBe("type_mismatch");
+  });
+
+  // Note on NaN/Infinity: those values pass through
+  // JSON.stringify as `null`, then the validator's null short-circuit
+  // (schema-defaults.ts:327 — "value === null → skip") filters them out
+  // before reaching the type check. We can't observe them in
+  // validation_status from this layer; a dedicated unit test against
+  // `valueMatchesType` would catch the case at the inner boundary.
+  // Pinned at the next layer down:
+
+  it("valueMatchesType('integer', ...) rejects NaN / Infinity (vault#310)", async () => {
+    // Reach the unexported helper indirectly via validateNote on a
+    // hand-built resolved-schemas + metadata where the value is the
+    // actual NaN/Infinity (no JSON round-trip).
+    const { validateNote, loadSchemaConfig } = await import("./schema-defaults.js");
+    // Seed via the public surface, then load the resolved schemas
+    // snapshot.
+    await store.upsertTagSchema("k", { fields: { c: { type: "integer" } } });
+    const resolved = loadSchemaConfig((store as any).db);
+    expect(validateNote(resolved, { tags: ["k"], metadata: { c: Number.NaN } })?.warnings[0]?.reason)
+      .toBe("type_mismatch");
+    expect(validateNote(resolved, { tags: ["k"], metadata: { c: Number.POSITIVE_INFINITY } })?.warnings[0]?.reason)
+      .toBe("type_mismatch");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// `date` field type — offset normalization on write (vault#date-field-type
+// review fix). A raw TEXT compare only sorts ISO-8601 timestamps correctly
+// when every stored value shares the SAME offset representation.
+// `timestampToMs` correctly VALIDATES an explicit ±HH:MM offset, but the
+// value used to persist VERBATIM — a mixed-offset vault silently
+// mis-ordered/mis-filtered. `normalizeDateFields` (schema-defaults.ts),
+// wired into every store write path, rewrites a full timestamp to canonical
+// UTC (`Z`-suffixed) before the row is written.
+// ---------------------------------------------------------------------------
+
+describe("date field type — offset normalization (vault#date-field-type review fix)", async () => {
+  async function declareIndexedMeetingDate() {
+    const tools = generateMcpTools(store);
+    const updateTag = tools.find((t) => t.name === "update-tag")!;
+    await updateTag.execute({
+      tag: "meeting",
+      fields: { meeting_date: { type: "date", indexed: true } },
+    });
+    return tools;
+  }
+
+  // The reviewer's exact repro: "2026-07-16T10:00:00+02:00" (= 08:00Z) vs
+  // "2026-07-16T09:00:00Z" (= 09:00Z). Persisted verbatim, a raw string
+  // compare gets these BACKWARDS (comparing "10" vs "09" after the shared
+  // "2026-07-16T" prefix says the +02:00 value sorts LATER, when its actual
+  // instant — 08:00Z — is EARLIER). Post-normalization both values are
+  // Z-form UTC, so the string compare IS the instant compare.
+  it("order_by ASC returns mixed-offset values in true chronological order", async () => {
+    const tools = await declareIndexedMeetingDate();
+    const create = tools.find((t) => t.name === "create-note")!;
+    await create.execute({
+      content: "earlier (offset form)",
+      tags: ["meeting"],
+      metadata: { meeting_date: "2026-07-16T10:00:00+02:00" }, // = 08:00Z
+    });
+    await create.execute({
+      content: "later (Z form)",
+      tags: ["meeting"],
+      metadata: { meeting_date: "2026-07-16T09:00:00Z" }, // = 09:00Z
+    });
+
+    const asc = await store.queryNotes({ orderBy: "meeting_date" });
+    expect(asc.map((n) => n.content)).toEqual(["earlier (offset form)", "later (Z form)"]);
+  });
+
+  it("a gt bound correctly excludes an earlier instant expressed with an offset", async () => {
+    const tools = await declareIndexedMeetingDate();
+    const create = tools.find((t) => t.name === "create-note")!;
+    await create.execute({
+      content: "before threshold (offset form, = 08:00Z)",
+      tags: ["meeting"],
+      metadata: { meeting_date: "2026-07-16T10:00:00+02:00" },
+    });
+    await create.execute({
+      content: "after threshold (Z form, = 09:00Z)",
+      tags: ["meeting"],
+      metadata: { meeting_date: "2026-07-16T09:00:00Z" },
+    });
+
+    // Threshold sits BETWEEN the two instants (08:30Z). Pre-fix, the
+    // unnormalized "+02:00" value's raw string ("...10:00:00+02:00")
+    // compared GREATER than the threshold string despite its instant being
+    // earlier — a false match. Post-fix it correctly falls below.
+    const results = await store.queryNotes({
+      metadata: { meeting_date: { gt: "2026-07-16T08:30:00Z" } },
+    });
+    expect(results.map((n) => n.content)).toEqual(["after threshold (Z form, = 09:00Z)"]);
+  });
+
+  it("create-note normalizes an offset timestamp to canonical Z-form; the stored/returned value is not the verbatim input", async () => {
+    const tools = await declareIndexedMeetingDate();
+    const create = tools.find((t) => t.name === "create-note")!;
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const created = await create.execute({
+      content: "standup",
+      tags: ["meeting"],
+      metadata: { meeting_date: "2026-07-16T10:00:00+02:00" },
+    }) as any;
+
+    // The create response itself already reflects the normalized value...
+    expect(created.metadata.meeting_date).toBe("2026-07-16T08:00:00.000Z");
+    // ...and so does a fresh read-back (round-trips through the DB, not an echo).
+    const fresh = await query.execute({ id: created.id }) as any;
+    expect(fresh.metadata.meeting_date).toBe("2026-07-16T08:00:00.000Z");
+  });
+
+  it("update-note (merge-patch) normalizes an offset timestamp the same way create-note does", async () => {
+    const tools = await declareIndexedMeetingDate();
+    const create = tools.find((t) => t.name === "create-note")!;
+    const update = tools.find((t) => t.name === "update-note")!;
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const created = await create.execute({
+      content: "standup",
+      tags: ["meeting"],
+    }) as any;
+
+    await update.execute({
+      id: created.id,
+      metadata: { meeting_date: "2026-07-16T10:00:00+02:00" },
+      force: true,
+    });
+
+    const fresh = await query.execute({ id: created.id }) as any;
+    expect(fresh.metadata.meeting_date).toBe("2026-07-16T08:00:00.000Z");
+  });
+
+  // ---- round 2: tag-add + date-metadata in the SAME call (vault#date-
+  // field-type review round 2) ----
+  //
+  // `store.tagNote` (the actual tag mutation) runs AFTER the core UPDATE in
+  // both mcp.ts call sites that combine tags + metadata in one item — the
+  // reviewer live-verified that without passing the PROJECTED tag set into
+  // `store.updateNote`, normalization resolved the schema against the
+  // note's STALE pre-write tags and missed a field newly declared by the
+  // tag being added in this same call.
+
+  it("update-note: tags.add + an offset date value in the SAME call still normalizes (bare, untagged note)", async () => {
+    const tools = await declareIndexedMeetingDate();
+    const create = tools.find((t) => t.name === "create-note")!;
+    const update = tools.find((t) => t.name === "update-note")!;
+    const query = tools.find((t) => t.name === "query-notes")!;
+    // Bare, untagged note — "meeting" (and its meeting_date:date field) is
+    // NOT yet on this note; it's added in the SAME update-note call below.
+    const created = await create.execute({ content: "standup" }) as any;
+
+    const result = await update.execute({
+      id: created.id,
+      tags: { add: ["meeting"] },
+      metadata: { meeting_date: "2026-07-16T10:00:00+02:00" },
+      force: true,
+    }) as any;
+
+    expect(result.metadata.meeting_date).toBe("2026-07-16T08:00:00.000Z");
+    const fresh = await query.execute({ id: created.id }) as any;
+    expect(fresh.metadata.meeting_date).toBe("2026-07-16T08:00:00.000Z");
+    expect(fresh.tags).toContain("meeting");
+  });
+
+  it("create-note if_exists:update: tags + an offset date value in the SAME call still normalizes (bare, untagged note)", async () => {
+    const tools = await declareIndexedMeetingDate();
+    const create = tools.find((t) => t.name === "create-note")!;
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const created = await create.execute({ content: "standup", path: "Inbox/round2-upsert" }) as any;
+
+    const result = await create.execute({
+      path: "Inbox/round2-upsert",
+      tags: ["meeting"],
+      metadata: { meeting_date: "2026-07-16T10:00:00+02:00" },
+      if_exists: "update",
+    }) as any;
+
+    expect(result.metadata.meeting_date).toBe("2026-07-16T08:00:00.000Z");
+    const fresh = await query.execute({ id: created.id }) as any;
+    expect(fresh.metadata.meeting_date).toBe("2026-07-16T08:00:00.000Z");
+    expect(fresh.tags).toContain("meeting");
+  });
+
+  // ---- round 2: copy-on-write, never mutate the caller's object ----
+
+  it("store.createNote does NOT mutate the caller's metadata object", async () => {
+    await declareIndexedMeetingDate();
+    const callerMetadata = { meeting_date: "2026-07-16T10:00:00+02:00" };
+    const callerMetadataSnapshot = { ...callerMetadata };
+    await store.createNote("standup", { tags: ["meeting"], metadata: callerMetadata });
+    // The caller's own object must be byte-identical to before the call —
+    // core is a published library; a direct embedder's reference must
+    // never change out from under them.
+    expect(callerMetadata).toEqual(callerMetadataSnapshot);
+  });
+
+  it("store.updateNote does NOT mutate the caller's metadata object", async () => {
+    await declareIndexedMeetingDate();
+    const note = await store.createNote("standup", { tags: ["meeting"] });
+    const callerMetadata = { meeting_date: "2026-07-16T10:00:00+02:00" };
+    const callerMetadataSnapshot = { ...callerMetadata };
+    await store.updateNote(note.id, { metadata: callerMetadata });
+    expect(callerMetadata).toEqual(callerMetadataSnapshot);
+  });
+
+  it("a bare YYYY-MM-DD value passes through untouched (no offset to normalize)", async () => {
+    const tools = await declareIndexedMeetingDate();
+    const create = tools.find((t) => t.name === "create-note")!;
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const created = await create.execute({
+      content: "standup",
+      tags: ["meeting"],
+      metadata: { meeting_date: "2026-07-16" },
+    }) as any;
+    expect(created.metadata.meeting_date).toBe("2026-07-16");
+    const fresh = await query.execute({ id: created.id }) as any;
+    expect(fresh.metadata.meeting_date).toBe("2026-07-16");
+  });
+
+  it("a value already in canonical Z-form passes through unchanged (no spurious rewrite)", async () => {
+    const tools = await declareIndexedMeetingDate();
+    const create = tools.find((t) => t.name === "create-note")!;
+    const created = await create.execute({
+      content: "standup",
+      tags: ["meeting"],
+      metadata: { meeting_date: "2026-07-16T09:00:00.000Z" },
+    }) as any;
+    expect(created.metadata.meeting_date).toBe("2026-07-16T09:00:00.000Z");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// update-note `if_missing: "create"` — idempotent upsert (vault#309)
+// ---------------------------------------------------------------------------
+
+describe("update-note if_missing=create (vault#309)", async () => {
+  let store: SqliteStore;
+  beforeEach(() => {
+    store = new SqliteStore(new Database(":memory:"));
+  });
+
+  it("creates the note when missing + carries created: true", async () => {
+    const tools = generateMcpTools(store);
+    const update = tools.find((t) => t.name === "update-note")!;
+    const result = await update.execute({
+      id: "Inbox/2026-05-13-meeting",
+      content: "agenda body",
+      tags: ["meeting"],
+      metadata: { priority: "high" },
+      if_missing: "create",
+    }) as any;
+    expect(result.created).toBe(true);
+    expect(result.path).toBe("Inbox/2026-05-13-meeting");
+    expect(result.content).toBe("agenda body");
+    expect(result.tags).toContain("meeting");
+    expect(result.metadata?.priority).toBe("high");
+
+    // And the row landed.
+    const fetched = await store.getNoteByPath("Inbox/2026-05-13-meeting");
+    expect(fetched).not.toBeNull();
+  });
+
+  it("updates the note when present + carries created: false", async () => {
+    await store.createNote("original", { path: "p", metadata: { v: 1 } });
+    const tools = generateMcpTools(store);
+    const update = tools.find((t) => t.name === "update-note")!;
+    const result = await update.execute({
+      id: "p",
+      content: "updated body",
+      metadata: { v: 2 },
+      if_missing: "create",
+      force: true, // bypass OC since this is an unconditional update
+    }) as any;
+    expect(result.created).toBe(false);
+    expect(result.content).toBe("updated body");
+    expect(result.metadata?.v).toBe(2);
+  });
+
+  it("without if_missing, missing note errors (current behavior — back-compat)", async () => {
+    const tools = generateMcpTools(store);
+    const update = tools.find((t) => t.name === "update-note")!;
+    await expect(update.execute({
+      id: "nope",
+      content: "x",
+      force: true,
+    })).rejects.toThrow(/Note not found/);
+  });
+
+  it("create branch applies tag-schema defaults when the new tag declares fields", async () => {
+    // vault#553 Decision B: backfill is explicit-`default`-only.
+    await store.upsertTagSchema("task", {
+      fields: { priority: { type: "string", enum: ["high", "low"], default: "high" } },
+    });
+    const tools = generateMcpTools(store);
+    const update = tools.find((t) => t.name === "update-note")!;
+    const result = await update.execute({
+      id: "Inbox/new-task",
+      content: "do the thing",
+      tags: ["task"],
+      if_missing: "create",
+    }) as any;
+    expect(result.created).toBe(true);
+    // Schema defaults populated metadata.priority on insert.
+    expect(result.metadata?.priority).toBe("high");
+  });
+
+  it("create branch surfaces validation warnings just like create-note", async () => {
+    await store.upsertTagSchema("task", {
+      fields: { priority: { type: "string", enum: ["high", "low"] } },
+    });
+    const tools = generateMcpTools(store);
+    const update = tools.find((t) => t.name === "update-note")!;
+    const result = await update.execute({
+      id: "Inbox/bad-task",
+      content: "x",
+      tags: ["task"],
+      metadata: { priority: "ULTRA" },
+      if_missing: "create",
+    }) as any;
+    expect(result.created).toBe(true);
+    expect(result.validation_status?.warnings?.[0]?.reason).toBe("enum_mismatch");
+  });
+
+  it("idempotent: second call with same id + same content updates without error", async () => {
+    const tools = generateMcpTools(store);
+    const update = tools.find((t) => t.name === "update-note")!;
+    const first = await update.execute({
+      id: "Inbox/sync-target",
+      content: "v1",
+      if_missing: "create",
+    }) as any;
+    expect(first.created).toBe(true);
+
+    const second = await update.execute({
+      id: "Inbox/sync-target",
+      content: "v2",
+      if_missing: "create",
+      force: true,
+    }) as any;
+    expect(second.created).toBe(false);
+    expect(second.content).toBe("v2");
+
+    // Only one row exists.
+    const all = await store.queryNotes({ limit: 100 });
+    expect(all.filter((n) => n.path === "Inbox/sync-target")).toHaveLength(1);
+  });
+
+  // vault#321 F3 — schema-conflict warning surfaces on the create
+  // branch. The branch reuses `attachValidationStatus` so the
+  // conflict-detection logic should fire, but pre-fold it wasn't
+  // pinned. Two tags directly applied to the new note, each
+  // declaring the same field with conflicting specs → schema_conflict
+  // warning (the existing `resolveNoteSchemas` walk produces this for
+  // both inheritance chains AND multi-tag direct application).
+  it("schema-conflict warning surfaces on create branch (vault#321 F3)", async () => {
+    await store.upsertTagSchema("kpi", {
+      fields: { count: { type: "integer" } },
+    });
+    await store.upsertTagSchema("metric", {
+      fields: { count: { type: "string" } }, // conflicting spec
+    });
+    const tools = generateMcpTools(store);
+    const update = tools.find((t) => t.name === "update-note")!;
+    const result = await update.execute({
+      id: "Inbox/conflicting-tags",
+      content: "x",
+      tags: ["kpi", "metric"],
+      metadata: { count: 5 },
+      if_missing: "create",
+    }) as any;
+    expect(result.created).toBe(true);
+    const conflict = result.validation_status.warnings.find(
+      (w: any) => w.reason === "schema_conflict",
+    );
+    expect(conflict).toBeDefined();
+    expect(conflict.field).toBe("count");
+    // First-tag-wins precedence (kpi → integer). The loser_schema
+    // field names metric.
+    expect(conflict.schema).toBe("kpi");
+    expect(conflict.loser_schema).toBe("metric");
+  });
+
+  // vault#321 F4 — links.add on the create branch is applied. The
+  // implementation at mcp.ts:644-650 was present pre-fold; this
+  // test pins it so a future regression breaking Gitcoin's
+  // upsert-with-typed-links workflow goes red.
+  it("links.add applied on create branch (vault#321 F4)", async () => {
+    // Two pre-existing target notes the new source links to.
+    await store.createNote("A", { id: "t-mcp-a-321", path: "Targets/A-mcp" });
+    await store.createNote("B", { id: "t-mcp-b-321", path: "Targets/B-mcp" });
+
+    const tools = generateMcpTools(store);
+    const update = tools.find((t) => t.name === "update-note")!;
+    const result = await update.execute({
+      id: "Inbox/mcp-source-321",
+      content: "source body",
+      if_missing: "create",
+      links: {
+        add: [
+          { target: "t-mcp-a-321", relationship: "derived-from" },
+          { target: "Targets/B-mcp", relationship: "responds-to", metadata: { weight: 5 } },
+        ],
+      },
+    }) as any;
+    expect(result.created).toBe(true);
+
+    const sourceId = result.id as string;
+    const outboundLinks = await store.getLinks(sourceId, { direction: "outbound" });
+    const derivedFrom = outboundLinks.find((l) => l.relationship === "derived-from");
+    expect(derivedFrom).toBeDefined();
+    expect(derivedFrom!.targetId).toBe("t-mcp-a-321");
+
+    const respondsTo = outboundLinks.find((l) => l.relationship === "responds-to");
+    expect(respondsTo).toBeDefined();
+    expect(respondsTo!.targetId).toBe("t-mcp-b-321");
+    expect(respondsTo!.metadata).toEqual({ weight: 5 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// create-note `if_exists` — idempotent upsert on a path conflict (vault#555)
+// ---------------------------------------------------------------------------
+
+describe("create-note if_exists (vault#555)", async () => {
+  let store: SqliteStore;
+  beforeEach(() => {
+    store = new SqliteStore(new Database(":memory:"));
+  });
+
+  it("default (no if_exists) still throws path_conflict — back-compat", async () => {
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    await create.execute({ content: "first", path: "Inbox/dup" });
+    await expect(create.execute({ content: "second", path: "Inbox/dup" }))
+      .rejects.toThrow(/path_conflict/);
+  });
+
+  it('if_exists:"error" behaves identically to omitting it', async () => {
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    await create.execute({ content: "first", path: "Inbox/dup-explicit" });
+    await expect(create.execute({ content: "second", path: "Inbox/dup-explicit", if_exists: "error" }))
+      .rejects.toThrow(/path_conflict/);
+  });
+
+  it('if_exists:"ignore" returns the existing note untouched, no mutation', async () => {
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const first = await create.execute({
+      content: "original",
+      path: "Inbox/ignore-me",
+      tags: ["daily"],
+      metadata: { v: 1 },
+    }) as any;
+
+    const second = await create.execute({
+      content: "attempted overwrite",
+      path: "Inbox/ignore-me",
+      tags: ["other"],
+      metadata: { v: 2 },
+      if_exists: "ignore",
+    }) as any;
+
+    expect(second.existed).toBe(true);
+    expect(second.id).toBe(first.id);
+    expect(second.content).toBe("original"); // untouched
+    expect(second.metadata?.v).toBe(1); // untouched
+    expect(second.tags).toEqual(["daily"]); // "other" was never applied
+
+    // Confirm on disk too — no side effects at all.
+    const onDisk = await store.getNoteByPath("Inbox/ignore-me");
+    expect(onDisk!.content).toBe("original");
+    expect(onDisk!.tags).toEqual(["daily"]);
+  });
+
+  it('if_exists:"ignore" does not run schema-default backfill (genuinely zero mutation)', async () => {
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    // Create the note BEFORE the schema declares a default, so the
+    // existing row is missing the field the schema would now backfill.
+    const first = await create.execute({ content: "x", path: "Inbox/predates-schema", tags: ["task"] }) as any;
+    expect(first.metadata?.priority).toBeUndefined();
+
+    await store.upsertTagSchema("task", {
+      fields: { priority: { type: "string", enum: ["high", "low"], default: "high" } },
+    });
+
+    const second = await create.execute({
+      content: "y",
+      path: "Inbox/predates-schema",
+      tags: ["task"],
+      if_exists: "ignore",
+    }) as any;
+    expect(second.existed).toBe(true);
+    expect(second.metadata?.priority).toBeUndefined(); // no backfill — zero mutation promise
+  });
+
+  it('if_exists:"update" full-replaces content, RFC-7386-merges metadata, and unions tags/links', async () => {
+    await store.createNote("target body", { id: "t-upd-target", path: "Targets/upd" });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const first = await create.execute({
+      content: "v1",
+      path: "Inbox/update-me",
+      tags: ["daily"],
+      metadata: { a: 1, b: 2 },
+    }) as any;
+
+    const second = await create.execute({
+      content: "v2",
+      path: "Inbox/update-me",
+      tags: ["extra"],
+      metadata: { b: null, c: 3 }, // b deleted (RFC 7386), c added, a untouched
+      links: [{ target: "t-upd-target", relationship: "relates-to" }],
+      if_exists: "update",
+    }) as any;
+
+    expect(second.existed).toBe(true);
+    expect(second.id).toBe(first.id);
+    expect(second.content).toBe("v2"); // full replace
+    expect(second.metadata).toEqual({ a: 1, c: 3 }); // merged, b deleted
+    expect(second.tags?.sort()).toEqual(["daily", "extra"]); // union, nothing removed
+
+    const links = await store.getLinks(second.id, { direction: "outbound" });
+    expect(links.find((l) => l.relationship === "relates-to")?.targetId).toBe("t-upd-target");
+  });
+
+  it('if_exists:"update" with an omitted field leaves it untouched', async () => {
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    await create.execute({ content: "v1", path: "Inbox/partial-update", metadata: { keep: "me" } });
+
+    const second = await create.execute({
+      path: "Inbox/partial-update", // no `content` — should stay "v1"
+      metadata: { added: true },
+      if_exists: "update",
+    }) as any;
+    expect(second.content).toBe("v1");
+    expect(second.metadata).toEqual({ keep: "me", added: true });
+  });
+
+  it('if_exists:"replace" wholesale-overwrites content + metadata but keeps id/createdAt and unions tags', async () => {
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const first = await create.execute({
+      content: "v1",
+      path: "Inbox/replace-me",
+      tags: ["daily"],
+      metadata: { a: 1, b: 2 },
+    }) as any;
+
+    const second = await create.execute({
+      content: "v2",
+      path: "Inbox/replace-me",
+      tags: ["extra"],
+      metadata: { c: 3 }, // a and b are NOT merged in — wholesale replace
+      if_exists: "replace",
+    }) as any;
+
+    expect(second.existed).toBe(true);
+    expect(second.id).toBe(first.id);
+    expect(second.createdAt).toBe(first.createdAt);
+    expect(second.content).toBe("v2");
+    expect(second.metadata).toEqual({ c: 3 }); // a/b dropped, not merged
+    expect(second.tags?.sort()).toEqual(["daily", "extra"]); // tags stay additive
+  });
+
+  it('if_exists:"replace" with omitted content/metadata clears them to empty defaults', async () => {
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    await create.execute({ content: "v1", path: "Inbox/replace-blank", metadata: { a: 1 } });
+
+    const second = await create.execute({
+      path: "Inbox/replace-blank",
+      if_exists: "replace",
+    }) as any;
+    expect(second.content).toBe("");
+    // An empty `{}` metadata reads back as `{}`, not an absent key — the
+    // same convention every note with no metadata follows (rowToNote,
+    // vault V1.1), not something special about `replace`.
+    expect(second.metadata).toEqual({});
+  });
+
+  it("if_exists is a no-op without a path — a pathless create can never conflict", async () => {
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const a = await create.execute({ content: "one", if_exists: "ignore" }) as any;
+    const b = await create.execute({ content: "two", if_exists: "ignore" }) as any;
+    expect(a.id).not.toBe(b.id);
+    // `if_exists` was still passed, so `existed` is attached (there was
+    // simply nothing to conflict with) — `false`, not absent.
+    expect(a.existed).toBe(false);
+    expect(b.existed).toBe(false);
+  });
+
+  it("plain create-note calls (no if_exists) see zero response-shape change", async () => {
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({ content: "plain" }) as any;
+    expect("existed" in result).toBe(false);
+  });
+
+  it("existed:false when if_exists is set but no conflict occurs (fresh insert)", async () => {
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({ content: "fresh", path: "Inbox/fresh-one", if_exists: "update" }) as any;
+    expect(result.existed).toBe(false);
+  });
+
+  it("respects a per-item extension when disambiguating the conflict (vault#328)", async () => {
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    // Two notes at the same path, different extensions — legal per vault#328.
+    await create.execute({ content: "csv body", path: "Reports/q1", extension: "csv" });
+    await create.execute({ content: "md body", path: "Reports/q1", extension: "md" });
+
+    // ignore against the CSV one specifically.
+    const result = await create.execute({
+      content: "attempted",
+      path: "Reports/q1",
+      extension: "csv",
+      if_exists: "ignore",
+    }) as any;
+    expect(result.existed).toBe(true);
+    expect(result.content).toBe("csv body");
+    expect(result.extension).toBe("csv");
+  });
+
+  it("batch: if_exists is per-item, not inherited from a top-level default", async () => {
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    await create.execute({ content: "existing", path: "Inbox/batch-conflict" });
+
+    // Top-level if_exists is NOT merged into batch items (matches
+    // if_missing's contract on update-note) — the batch item below has no
+    // if_exists of its own, so it hits the default "error" path and the
+    // WHOLE batch rolls back, even though a top-level if_exists was passed.
+    await expect(create.execute({
+      if_exists: "ignore",
+      notes: [{ content: "conflict", path: "Inbox/batch-conflict" }],
+    })).rejects.toThrow(/path_conflict/);
+  });
+
+  it("batch: mixes fresh creates and if_exists hits in the same call, in order", async () => {
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    await create.execute({ content: "pre-existing", path: "Inbox/batch-b" });
+
+    const result = await create.execute({
+      notes: [
+        { content: "a", path: "Inbox/batch-a", if_exists: "ignore" },
+        { content: "b-new", path: "Inbox/batch-b", if_exists: "ignore" },
+        { content: "c", path: "Inbox/batch-c", if_exists: "ignore" },
+      ],
+    }) as any[];
+
+    expect(result).toHaveLength(3);
+    expect(result[0].existed).toBe(false);
+    expect(result[1].existed).toBe(true);
+    expect(result[1].content).toBe("pre-existing"); // untouched
+    expect(result[2].existed).toBe(false);
+  });
+
+  it("a genuine schema violation on if_exists:update still rejects and mutates nothing", async () => {
+    await store.upsertTagSchema("task", {
+      fields: { status: { type: "string", enum: ["open", "done"], strict: true, required: true } },
+    });
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    await create.execute({ content: "v1", path: "Inbox/strict-target", tags: ["task"], metadata: { status: "open" } });
+
+    await expect(create.execute({
+      content: "v2",
+      path: "Inbox/strict-target",
+      metadata: { status: "NOT-A-VALID-ENUM" },
+      if_exists: "update",
+    })).rejects.toThrow();
+
+    const onDisk = await store.getNoteByPath("Inbox/strict-target");
+    expect(onDisk!.content).toBe("v1"); // untouched — rejected before any write
+  });
+
+  it("if_exists:update re-validates against the CURRENT schema without re-supplying satisfied required fields", async () => {
+    await store.upsertTagSchema("task", {
+      fields: { status: { type: "string", enum: ["open", "done"], strict: true, required: true } },
+    });
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    await create.execute({ content: "v1", path: "Inbox/status-set", tags: ["task"], metadata: { status: "open" } });
+
+    // Only touching content — `status` is already satisfied by the
+    // EXISTING note, so re-validating the merged/projected shape (not the
+    // raw incoming item) must NOT demand it again.
+    const result = await create.execute({
+      content: "v2",
+      path: "Inbox/status-set",
+      if_exists: "update",
+    }) as any;
+    expect(result.content).toBe("v2");
+    expect(result.metadata?.status).toBe("open");
+  });
+
+  // vault#555 CRITICAL 2 (W8 fix-2 bug class): a tags-ONLY if_exists:"update"
+  // (no content/metadata) must still bump updated_at — store.tagNote genuinely
+  // mutates the note, and a frozen updated_at breaks cursor polling + sync.
+  it('if_exists:"update" with ONLY tags added still advances updated_at', async () => {
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const first = await create.execute({ content: "body", path: "Inbox/tagonly", tags: ["alpha"] }) as any;
+    const before = (await store.getNoteByPath("Inbox/tagonly"))!.updatedAt!;
+
+    // Ensure a strictly-later wall-clock so the bump is observable even if the
+    // two writes land in the same millisecond.
+    await new Promise((r) => setTimeout(r, 5));
+
+    const second = await create.execute({
+      path: "Inbox/tagonly",
+      tags: ["beta"], // ONLY a tag change — no content, no metadata
+      if_exists: "update",
+    }) as any;
+    expect(second.existed).toBe(true);
+    expect(second.tags?.sort()).toEqual(["alpha", "beta"]); // tag actually added
+    const after = (await store.getNoteByPath("Inbox/tagonly"))!.updatedAt!;
+    expect(after > before).toBe(true); // updated_at advanced
+    expect(second.id).toBe(first.id);
+  });
+
+  it('if_exists:"update" with ONLY links added still advances updated_at', async () => {
+    await store.createNote("target", { id: "tgt-linkonly", path: "Targets/linkonly" });
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    await create.execute({ content: "body", path: "Inbox/linkonly", tags: ["alpha"] });
+    const before = (await store.getNoteByPath("Inbox/linkonly"))!.updatedAt!;
+    await new Promise((r) => setTimeout(r, 5));
+
+    await create.execute({
+      path: "Inbox/linkonly",
+      links: [{ target: "tgt-linkonly", relationship: "relates-to" }],
+      if_exists: "update",
+    });
+    const after = (await store.getNoteByPath("Inbox/linkonly"))!.updatedAt!;
+    expect(after > before).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// create-note `summary` — compact batch response shape (vault#555)
+// ---------------------------------------------------------------------------
+
+describe("create-note summary (vault#555)", async () => {
+  let store: SqliteStore;
+  beforeEach(() => {
+    store = new SqliteStore(new Database(":memory:"));
+  });
+
+  it("summary:true returns {created, ids, failed} instead of N full note objects", async () => {
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      summary: true,
+      notes: [
+        { content: "a", path: "Inbox/sum-a" },
+        { content: "b", path: "Inbox/sum-b" },
+        { content: "c", path: "Inbox/sum-c" },
+      ],
+    }) as any;
+    expect(result.created).toBe(3);
+    expect(result.ids).toHaveLength(3);
+    expect(result.failed).toEqual([]);
+    // Not the full-object shape.
+    expect(result.notes).toBeUndefined();
+    expect(Array.isArray(result)).toBe(false);
+
+    // The ids really do resolve to the notes just created.
+    const onDisk = await store.getNoteByPath("Inbox/sum-a");
+    expect(result.ids).toContain(onDisk!.id);
+  });
+
+  it("summary:true `created` excludes if_exists hits — only counts brand-new inserts", async () => {
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    await create.execute({ content: "pre-existing", path: "Inbox/sum-existing" });
+
+    const result = await create.execute({
+      summary: true,
+      notes: [
+        { content: "fresh", path: "Inbox/sum-fresh", if_exists: "ignore" },
+        { content: "ignored", path: "Inbox/sum-existing", if_exists: "ignore" },
+      ],
+    }) as any;
+    expect(result.created).toBe(1); // only the fresh one
+    expect(result.ids).toHaveLength(2); // both ids are still reported
+  });
+
+  it("summary is ignored on a single-note (non-batch) call", async () => {
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({ content: "solo", summary: true }) as any;
+    expect(result.content).toBe("solo"); // full note object, not a summary
+    expect(result.created).toBeUndefined();
+  });
+
+  it("without summary, batch still returns full note objects (back-compat)", async () => {
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      notes: [{ content: "a", path: "Inbox/sum-nosummary" }],
+    }) as any[];
+    expect(Array.isArray(result)).toBe(true);
+    expect(result[0].content).toBe("a");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Schema inheritance via parent_names + `_default` universal parent — vault#270
+// ---------------------------------------------------------------------------
+
+describe("schema inheritance via parent_names (vault#270)", async () => {
+  it("single-parent: child inherits parent's fields", async () => {
+    await store.upsertTagRecord("work", {
+      fields: { project: { type: "string" } },
+    });
+    await store.upsertTagRecord("task", {
+      parent_names: ["work"],
+      fields: { priority: { type: "string" } },
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["task"],
+      metadata: { priority: 7, project: 42 }, // both wrong type
+    }) as any;
+
+    expect(result.validation_status.warnings.length).toBe(2);
+    const fields = result.validation_status.warnings.map((w: any) => w.field).sort();
+    expect(fields).toEqual(["priority", "project"]);
+  });
+
+  it("multi-parent: child gets union of parents' fields", async () => {
+    await store.upsertTagRecord("work", {
+      fields: { project: { type: "string" } },
+    });
+    await store.upsertTagRecord("publication", {
+      fields: { venue: { type: "string" } },
+    });
+    await store.upsertTagRecord("paper", {
+      parent_names: ["work", "publication"],
+      fields: { title: { type: "string" } },
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["paper"],
+      metadata: { title: 1, project: 2, venue: 3 }, // all wrong type
+    }) as any;
+
+    expect(result.validation_status.warnings.length).toBe(3);
+    const fields = result.validation_status.warnings.map((w: any) => w.field).sort();
+    expect(fields).toEqual(["project", "title", "venue"]);
+  });
+
+  it("diamond: A→B, A→C, B→D, C→D — D's field appears once", async () => {
+    await store.upsertTagRecord("D", {
+      fields: { d_field: { type: "string" } },
+    });
+    await store.upsertTagRecord("B", { parent_names: ["D"] });
+    await store.upsertTagRecord("C", { parent_names: ["D"] });
+    await store.upsertTagRecord("A", { parent_names: ["B", "C"] });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["A"],
+      metadata: { d_field: 999 }, // wrong type
+    }) as any;
+
+    expect(result.validation_status.warnings.length).toBe(1);
+    expect(result.validation_status.warnings[0].field).toBe("d_field");
+    expect(result.validation_status.warnings[0].schema).toBe("D");
+  });
+
+  it("cycle: A→B, B→A — no infinite loop, both fields visible", async () => {
+    await store.upsertTagRecord("B", {
+      fields: { b_field: { type: "string" } },
+    });
+    await store.upsertTagRecord("A", {
+      parent_names: ["B"],
+      fields: { a_field: { type: "string" } },
+    });
+    // vault#552: upsertTagRecord now REJECTS the write that would close this
+    // cycle (B declaring A as parent, when A already declares B) — simulate
+    // pre-existing cyclic data with a direct DB write, same technique as the
+    // "tolerates a cycle without infinite-looping" test above.
+    (store as any).db.prepare("UPDATE tags SET parent_names = ? WHERE name = ?")
+      .run(JSON.stringify(["A"]), "B");
+    (store as any)._tagHierarchy = null;
+    (store as any)._schemaConfig = null;
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["A"],
+      metadata: { a_field: 1, b_field: 2 }, // both wrong type
+    }) as any;
+
+    expect(result.validation_status.warnings.length).toBe(2);
+    const fields = result.validation_status.warnings.map((w: any) => w.field).sort();
+    expect(fields).toEqual(["a_field", "b_field"]);
+  });
+
+  it("override: child's spec wins over parent's for the same field name", async () => {
+    await store.upsertTagRecord("parent_tag", {
+      fields: { status: { type: "string", enum: ["a", "b"] } },
+    });
+    await store.upsertTagRecord("child_tag", {
+      parent_names: ["parent_tag"],
+      fields: { status: { type: "string", enum: ["x", "y"] } },
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["child_tag"],
+      metadata: { status: "x" }, // valid under child, invalid under parent
+    }) as any;
+
+    // Child's spec wins → "x" passes the enum check.
+    const enumWarnings = result.validation_status.warnings.filter(
+      (w: any) => w.reason === "enum_mismatch",
+    );
+    expect(enumWarnings.length).toBe(0);
+    // The conflict surfaces as a schema_conflict warning whose `schema` field
+    // names the *winning* tag (child).
+    const conflict = result.validation_status.warnings.find(
+      (w: any) => w.reason === "schema_conflict",
+    );
+    expect(conflict).toBeDefined();
+    expect(conflict.field).toBe("status");
+    expect(conflict.schema).toBe("child_tag");
+  });
+
+  it("conflict warning: two parents declare same field with different specs, first wins", async () => {
+    await store.upsertTagRecord("task", {
+      fields: { status: { type: "string", enum: ["todo", "doing", "done"] } },
+    });
+    await store.upsertTagRecord("publication", {
+      fields: { status: { type: "string", enum: ["draft", "published"] } },
+    });
+    // parent_names order = ["task", "publication"] → task wins.
+    await store.upsertTagRecord("article_task", {
+      parent_names: ["task", "publication"],
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["article_task"],
+      metadata: { status: "todo" }, // valid under task (winner), invalid under publication
+    }) as any;
+
+    const conflict = result.validation_status.warnings.find(
+      (w: any) => w.reason === "schema_conflict",
+    );
+    expect(conflict).toBeDefined();
+    expect(conflict.field).toBe("status");
+    expect(conflict.schema).toBe("task"); // winner
+    // No enum_mismatch — the value is valid under task's enum.
+    const enumMismatch = result.validation_status.warnings.find(
+      (w: any) => w.reason === "enum_mismatch",
+    );
+    expect(enumMismatch).toBeUndefined();
+  });
+
+  it("`_default` universal parent: untagged note picks up `_default`'s schema", async () => {
+    await store.upsertTagRecord("_default", {
+      fields: { author: { type: "string" } },
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "untagged note",
+      metadata: { author: 42 }, // wrong type
+    }) as any;
+
+    expect(result.validation_status.schemas).toEqual(["_default"]);
+    expect(result.validation_status.warnings.length).toBe(1);
+    expect(result.validation_status.warnings[0].field).toBe("author");
+  });
+
+  it("`_default` universal parent: tagged note gets `_default` + its tag schema", async () => {
+    await store.upsertTagRecord("_default", {
+      fields: { author: { type: "string" } },
+    });
+    await store.upsertTagRecord("task", {
+      fields: { priority: { type: "string" } },
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["task"],
+      metadata: { author: 1, priority: 2 }, // both wrong type
+    }) as any;
+
+    expect(result.validation_status.warnings.length).toBe(2);
+    const schemas = new Set(
+      result.validation_status.warnings.map((w: any) => w.schema),
+    );
+    expect(schemas.has("_default")).toBe(true);
+    expect(schemas.has("task")).toBe(true);
+  });
+
+  it("`_default` query expansion: query-notes { tag: '_default' } returns every note", async () => {
+    await store.upsertTagRecord("_default", { description: "universal parent" });
+    const a = await store.createNote("alpha", { tags: ["task"] });
+    const b = await store.createNote("beta", { tags: ["project"] });
+    const g = await store.createNote("gamma"); // untagged
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ tag: "_default" }) as any;
+
+    expect(result.length).toBe(3);
+    const ids = (result as { id: string }[]).map((n) => n.id).sort();
+    expect(ids).toEqual([a.id, b.id, g.id].sort());
+  });
+
+  it("missing parent: non-existent name in parent_names is silently skipped", async () => {
+    await store.upsertTagRecord("task", {
+      parent_names: ["nonexistent_tag"],
+      fields: { priority: { type: "string" } },
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["task"],
+      metadata: { priority: 999 }, // wrong type
+    }) as any;
+
+    // No error. task's own field still validates.
+    expect(result.validation_status.warnings.length).toBe(1);
+    expect(result.validation_status.warnings[0].field).toBe("priority");
+  });
+
+  it("`_default` deleted mid-session: cache invalidates, default behavior goes away", async () => {
+    await store.upsertTagRecord("_default", {
+      fields: { author: { type: "string" } },
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    let result = await create.execute({
+      content: "x",
+      metadata: { author: 42 }, // wrong type
+    }) as any;
+    expect(result.validation_status.warnings.length).toBe(1);
+
+    await store.deleteTag("_default");
+
+    result = await create.execute({
+      content: "y",
+      metadata: { author: 42 },
+    }) as any;
+    expect(result.validation_status).toBeUndefined();
+  });
+
+  it("`_default` + `tagMatch: 'any'` drops the tag filter entirely (every note matches)", async () => {
+    // Folded from PR #272 review (N1). With OR-semantics, `_default` matches
+    // everything → the disjunction collapses regardless of what else is in
+    // the list. Pre-fold this would have narrowed to `task`-tagged notes.
+    await store.upsertTagRecord("_default", { description: "universal parent" });
+    const a = await store.createNote("alpha", { tags: ["task"] });
+    const b = await store.createNote("beta", { tags: ["project"] });
+    const g = await store.createNote("gamma"); // untagged
+
+    const results = await store.queryNotes({ tags: ["_default", "task"], tagMatch: "any" });
+    const ids = results.map((n) => n.id).sort();
+    expect(ids).toEqual([a.id, b.id, g.id].sort());
+  });
+
+  it("`_default` + `tagMatch: 'all'` drops only `_default` from the AND-set", async () => {
+    // Symmetric guard for N1: AND-semantics should NOT collapse — `_default`
+    // is universally satisfied so it can be dropped, but other tags still
+    // narrow the result set.
+    await store.upsertTagRecord("_default", { description: "universal parent" });
+    const a = await store.createNote("alpha", { tags: ["task"] });
+    await store.createNote("beta", { tags: ["project"] });
+    await store.createNote("gamma"); // untagged
+
+    const results = await store.queryNotes({ tags: ["_default", "task"], tagMatch: "all" });
+    expect(results.length).toBe(1);
+    expect(results[0].id).toBe(a.id);
+  });
+
+  it("`searchNotes` with `_default` returns matches from every note (including untagged)", async () => {
+    // Folded from PR #272 review (N2). FTS-backed search now short-circuits
+    // the tag filter when `_default` is requested, matching `queryNotes`.
+    await store.upsertTagRecord("_default", { description: "universal parent" });
+    const a = await store.createNote("findme alpha", { tags: ["task"] });
+    const b = await store.createNote("findme beta"); // untagged
+
+    const results = await store.searchNotes("findme", { tags: ["_default"] });
+    const ids = results.map((n) => n.id).sort();
+    expect(ids).toEqual([a.id, b.id].sort());
+  });
+
+  it("`schema_conflict` warning carries structured `loser_schema`", async () => {
+    // Folded from PR #272 review (N3). Agents shouldn't have to regex
+    // `message` to find the overridden tag — surface it structurally.
+    await store.upsertTagRecord("task", {
+      fields: { status: { type: "string", enum: ["todo", "done"] } },
+    });
+    await store.upsertTagRecord("publication", {
+      fields: { status: { type: "string", enum: ["draft", "published"] } },
+    });
+    await store.upsertTagRecord("article_task", {
+      parent_names: ["task", "publication"],
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["article_task"],
+      metadata: { status: "todo" },
+    }) as any;
+
+    const conflict = result.validation_status.warnings.find(
+      (w: any) => w.reason === "schema_conflict",
+    );
+    expect(conflict).toBeDefined();
+    expect(conflict.schema).toBe("task"); // winner
+    expect(conflict.loser_schema).toBe("publication"); // overridden
+  });
+
+  it("non-conflict warnings (type/enum mismatch) don't carry `loser_schema`", async () => {
+    // Symmetric guard for N3: `loser_schema` is only meaningful for
+    // schema_conflict; absent on type/enum mismatches.
+    await store.upsertTagSchema("task", {
+      fields: { priority: { type: "string", enum: ["high", "low"] } },
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["task"],
+      metadata: { priority: "ULTRA" },
+    }) as any;
+
+    expect(result.validation_status.warnings[0].reason).toBe("enum_mismatch");
+    expect(result.validation_status.warnings[0].loser_schema).toBeUndefined();
+  });
+
+  it("invalidates schema cache when only parent_names changes (no fields touched)", async () => {
+    // Regression guard: pre-vault#270, parent_names changes only invalidated
+    // the hierarchy cache. Now they must also invalidate the schema cache,
+    // since inheritance walks parent chains at validation time.
+    await store.upsertTagRecord("base", {
+      fields: { tier: { type: "string" } },
+    });
+    await store.upsertTagRecord("derived", { description: "starts orphaned" });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    let result = await create.execute({
+      content: "x",
+      tags: ["derived"],
+      metadata: { tier: 1 },
+    }) as any;
+    expect(result.validation_status).toBeUndefined();
+
+    // Wire up inheritance — fields *not* touched, only parent_names.
+    await store.upsertTagRecord("derived", { parent_names: ["base"] });
+
+    result = await create.execute({
+      content: "y",
+      tags: ["derived"],
+      metadata: { tier: 1 }, // wrong type per base.tier
+    }) as any;
+    expect(result.validation_status.warnings.length).toBe(1);
+    expect(result.validation_status.warnings[0].field).toBe("tier");
+    expect(result.validation_status.warnings[0].schema).toBe("base");
+  });
+});
+
+describe("expandTagsWithDescendants (tag-scoped tokens — docs/contracts/tag-scoped-tokens.md)", async () => {
+  it("returns the union of root + every descendant per tags.parent_names", async () => {
+    await store.upsertTagRecord("health/food", { parent_names: ["health"] });
+    await store.upsertTagRecord("health/food/breakfast", { parent_names: ["health/food"] });
+    await store.upsertTagRecord("work", { description: "work things" });
+
+    const expanded = await store.expandTagsWithDescendants(["health"]);
+    expect(expanded.has("health")).toBe(true);
+    expect(expanded.has("health/food")).toBe(true);
+    expect(expanded.has("health/food/breakfast")).toBe(true);
+    expect(expanded.has("work")).toBe(false);
+  });
+
+  it("returns an empty set for an empty input (no allowlist = nothing to expand)", async () => {
+    const expanded = await store.expandTagsWithDescendants([]);
+    expect(expanded.size).toBe(0);
+  });
+
+  it("includes the root verbatim even when the tag has no declared descendants", async () => {
+    await store.createNote("solo", { tags: ["loner"] });
+    const expanded = await store.expandTagsWithDescendants(["loner"]);
+    expect([...expanded]).toEqual(["loner"]);
+  });
+
+  it("unions descendants from multiple roots", async () => {
+    await store.upsertTagRecord("health/food", { parent_names: ["health"] });
+    await store.upsertTagRecord("work/standup", { parent_names: ["work"] });
+    const expanded = await store.expandTagsWithDescendants(["health", "work"]);
+    expect(expanded.has("health")).toBe(true);
+    expect(expanded.has("health/food")).toBe(true);
+    expect(expanded.has("work")).toBe(true);
+    expect(expanded.has("work/standup")).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tag record API — docs/contracts/tag-data-model.md
+// ---------------------------------------------------------------------------
+
+describe("tag record API (docs/contracts/tag-data-model.md)", async () => {
+  it("upsertTagRecord persists description + fields + relationships + parent_names", async () => {
+    await store.upsertTagRecord("project", {
+      description: "long-running deliverable",
+      fields: { status: { type: "string", enum: ["active", "shipped"] } },
+      relationships: {
+        owned_by: { target_tag: "person", cardinality: "one", description: "DRI" },
+      },
+      parent_names: ["work"],
+    });
+    const r = await store.getTagRecord("project");
+    expect(r?.description).toBe("long-running deliverable");
+    expect(r?.fields?.status?.type).toBe("string");
+    expect(r?.relationships?.owned_by?.target_tag).toBe("person");
+    expect(r?.relationships?.owned_by?.cardinality).toBe("one");
+    expect(r?.parent_names).toEqual(["work"]);
+    expect(r?.created_at).toBeDefined();
+    expect(r?.updated_at).toBeDefined();
+  });
+
+  it("upsertTagRecord preserves columns left undefined in the patch", async () => {
+    await store.upsertTagRecord("project", {
+      description: "first",
+      fields: { status: { type: "string" } },
+      parent_names: ["work"],
+    });
+    await store.upsertTagRecord("project", { description: "second" });
+    const r = await store.getTagRecord("project");
+    expect(r?.description).toBe("second");
+    expect(r?.fields?.status?.type).toBe("string");
+    expect(r?.parent_names).toEqual(["work"]);
+  });
+
+  it("upsertTagRecord clears a column when patch passes null", async () => {
+    await store.upsertTagRecord("project", {
+      description: "deliverable",
+      parent_names: ["work"],
+    });
+    await store.upsertTagRecord("project", { parent_names: null });
+    const r = await store.getTagRecord("project");
+    expect(r?.description).toBe("deliverable");
+    expect(r?.parent_names).toBeUndefined();
+  });
+
+  it("listTagRecords returns every tag row, sorted by name", async () => {
+    await store.upsertTagRecord("zebra", { description: "z" });
+    await store.upsertTagRecord("alpha", { description: "a" });
+    const records = await store.listTagRecords();
+    const names = records.map((r) => r.tag);
+    const idxAlpha = names.indexOf("alpha");
+    const idxZebra = names.indexOf("zebra");
+    expect(idxAlpha).toBeGreaterThanOrEqual(0);
+    expect(idxZebra).toBeGreaterThan(idxAlpha);
+  });
+
+  // ---- relationships is an opaque vocabulary map (vault#428) ----
+  // Vault no longer enforces the historical { target_tag, cardinality }
+  // shape. Apps (the Weaver / structural-link picker) declare a freeform
+  // vocabulary; vault stores + returns it verbatim. The old typed shape is
+  // still a valid value, so the loosening is a backwards-compatible superset.
+
+  it("update-tag MCP persists the opaque relationship-vocabulary map verbatim (vault#428)", async () => {
+    const tools = generateMcpTools(store);
+    const update = tools.find((t) => t.name === "update-tag")!;
+    const vocab = {
+      "works-on": { from: "person", to: "project" },
+      "member-of": { from: "person", to: "organization" },
+      "partner-of": { from: "person", to: "person" },
+      "based-at": { from: "project", to: "place" },
+    };
+    await update.execute({ tag: "person", relationships: vocab });
+    const r = await store.getTagRecord("person");
+    expect(r?.relationships).toEqual(vocab);
+  });
+
+  it("update-tag MCP round-trips nested arbitrary relationship values verbatim", async () => {
+    const tools = generateMcpTools(store);
+    const update = tools.find((t) => t.name === "update-tag")!;
+    const vocab = {
+      rel: { from: "a", to: "b", note: "freeform", weight: 3, optional: true, tags: ["x", "y"] },
+    };
+    await update.execute({ tag: "thing", relationships: vocab });
+    const r = await store.getTagRecord("thing");
+    expect(r?.relationships).toEqual(vocab);
+  });
+
+  it("update-tag MCP still accepts the historical typed shape (backwards-compat)", async () => {
+    const tools = generateMcpTools(store);
+    const update = tools.find((t) => t.name === "update-tag")!;
+    const typed = { owned_by: { target_tag: "person", cardinality: "one", description: "DRI" } };
+    await update.execute({ tag: "project", relationships: typed });
+    const r = await store.getTagRecord("project");
+    expect(r?.relationships).toEqual(typed);
+  });
+
+  it("update-tag MCP accepts what used to be rejected (no inner-shape enforcement)", async () => {
+    const tools = generateMcpTools(store);
+    const update = tools.find((t) => t.name === "update-tag")!;
+    // Formerly rejected: non-vocabulary cardinality + missing target_tag.
+    const formerlyInvalid = {
+      a: { target_tag: "person", cardinality: "bogus" },
+      b: { cardinality: "one" },
+    };
+    await update.execute({ tag: "loose", relationships: formerlyInvalid });
+    const r = await store.getTagRecord("loose");
+    expect(r?.relationships).toEqual(formerlyInvalid);
+  });
+
+  it("update-tag MCP rejects a top-level array for relationships (must be a map)", async () => {
+    const tools = generateMcpTools(store);
+    const update = tools.find((t) => t.name === "update-tag")!;
+    await expect(
+      update.execute({ tag: "project", relationships: ["not", "a", "map"] as unknown as Record<string, unknown> }),
+    ).rejects.toThrow();
+  });
+
+  it("update-tag MCP sets parent_names and the hierarchy invalidates", async () => {
+    const tools = generateMcpTools(store);
+    const update = tools.find((t) => t.name === "update-tag")!;
+
+    await store.createNote("v note", { tags: ["voice"] });
+    expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(0);
+
+    await update.execute({
+      tag: "voice",
+      parent_names: ["manual"],
+    });
+
+    expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(1);
+  });
+
+  it("update-tag MCP empty parent_names array clears the column", async () => {
+    const tools = generateMcpTools(store);
+    const update = tools.find((t) => t.name === "update-tag")!;
+    await store.upsertTagRecord("voice", { parent_names: ["manual"] });
+    await update.execute({ tag: "voice", parent_names: [] });
+    const r = await store.getTagRecord("voice");
+    expect(r?.parent_names).toBeUndefined();
+  });
+
+  it("list-tags MCP single-tag detail includes relationships + parent_names", async () => {
+    await store.upsertTagRecord("project", {
+      description: "p",
+      relationships: { owned_by: { target_tag: "person", cardinality: "one" } },
+      parent_names: ["work"],
+    });
+    const tools = generateMcpTools(store);
+    const listTags = tools.find((t) => t.name === "list-tags")!;
+    const result = await listTags.execute({ tag: "project" }) as any;
+    expect(result.relationships?.owned_by?.target_tag).toBe("person");
+    expect(result.parent_names).toEqual(["work"]);
+    expect(result.created_at).toBeDefined();
+  });
+
+  it("list-tags MCP include_schema returns relationships + parent_names per tag", async () => {
+    await store.upsertTagRecord("project", {
+      relationships: { owned_by: { target_tag: "person", cardinality: "one" } },
+      parent_names: ["work"],
+    });
+    await store.createNote("p note", { tags: ["project"] });
+    const tools = generateMcpTools(store);
+    const listTags = tools.find((t) => t.name === "list-tags")!;
+    const all = await listTags.execute({ include_schema: true }) as any[];
+    const project = all.find((t) => t.name === "project")!;
+    expect(project.relationships?.owned_by?.target_tag).toBe("person");
+    expect(project.parent_names).toEqual(["work"]);
+  });
+
+  it("renameTag carries description + fields + relationships + parent_names onto the new row", async () => {
+    await store.upsertTagRecord("old-name", {
+      description: "before",
+      fields: { status: { type: "string" } },
+      relationships: { owned_by: { target_tag: "person", cardinality: "one" } },
+      parent_names: ["work"],
+    });
+    const result = await store.renameTag("old-name", "new-name");
+    expect("renamed" in result).toBe(true);
+
+    const renamed = await store.getTagRecord("new-name");
+    expect(renamed?.description).toBe("before");
+    expect(renamed?.fields?.status?.type).toBe("string");
+    expect(renamed?.relationships?.owned_by?.target_tag).toBe("person");
+    expect(renamed?.parent_names).toEqual(["work"]);
+
+    const old = await store.getTagRecord("old-name");
+    expect(old).toBeNull();
+  });
+
+  it("deleteTag drops the identity row + invalidates the hierarchy", async () => {
+    await store.upsertTagRecord("voice", {
+      description: "voice notes",
+      parent_names: ["manual"],
+    });
+    await store.createNote("v", { tags: ["voice"] });
+    expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(1);
+
+    await store.deleteTag("voice");
+    expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(0);
+    expect(await store.getTagRecord("voice")).toBeNull();
+  });
+
+  // ---- Indexed-field atomicity (vault#478) ----------------------------------
+
+  it("upsertTagRecord with a bad indexed-field name throws IndexedFieldError and leaves the schema unchanged", async () => {
+    // kebab-case field name violates [A-Za-z0-9_] / no-leading-digit. The
+    // declaration must NOT persist, and no orphan/lying index may be created.
+    await expect(
+      store.upsertTagRecord("meeting", {
+        description: "meetings",
+        fields: { "meeting-type": { type: "string", indexed: true } },
+      }),
+    ).rejects.toThrow(indexedFieldOps.IndexedFieldError);
+
+    // Schema is untouched — the tag row may not even exist, and definitely
+    // doesn't claim the poisoned field.
+    const record = await store.getTagRecord("meeting");
+    expect(record?.fields?.["meeting-type"]).toBeUndefined();
+
+    // No backing index row was created for the bad field.
+    expect(indexedFieldOps.getIndexedField(db, "meeting-type")).toBeNull();
+    // And the generated column doesn't exist either.
+    const cols = (db.prepare("PRAGMA table_xinfo(notes)").all() as { name: string }[]).map(
+      (c) => c.name,
+    );
+    expect(cols).not.toContain("meta_meeting-type");
+  });
+
+  it("upsertTagRecord with an unindexable type throws and leaves the schema unchanged", async () => {
+    await expect(
+      store.upsertTagRecord("meeting", {
+        fields: { attendees: { type: "json", indexed: true } },
+      }),
+    ).rejects.toThrow(indexedFieldOps.IndexedFieldError);
+    const record = await store.getTagRecord("meeting");
+    expect(record?.fields?.attendees).toBeUndefined();
+    expect(indexedFieldOps.getIndexedField(db, "attendees")).toBeNull();
+  });
+
+  it("a bad indexed field does NOT corrupt a prior valid declaration on the same tag", async () => {
+    // First, a clean valid indexed field.
+    await store.upsertTagRecord("meeting", {
+      fields: { held_on: { type: "string", indexed: true } },
+    });
+    expect(indexedFieldOps.getIndexedField(db, "held_on")?.declarerTags).toContain("meeting");
+
+    // Now an update that adds a poisoned field. The whole write must roll
+    // back — the prior valid field survives untouched.
+    await expect(
+      store.upsertTagRecord("meeting", {
+        fields: {
+          held_on: { type: "string", indexed: true },
+          "bad-field": { type: "string", indexed: true },
+        },
+      }),
+    ).rejects.toThrow(indexedFieldOps.IndexedFieldError);
+
+    const record = await store.getTagRecord("meeting");
+    expect(record?.fields?.held_on?.indexed).toBe(true);
+    expect(record?.fields?.["bad-field"]).toBeUndefined();
+    expect(indexedFieldOps.getIndexedField(db, "held_on")?.declarerTags).toContain("meeting");
+    expect(indexedFieldOps.getIndexedField(db, "bad-field")).toBeNull();
+  });
+
+  it("upsertTagRecord with fields:null releases indexed fields (transaction commits the release path)", async () => {
+    // Declare an indexed field, then clear all fields — the release path runs
+    // inside the same transaction as the persist. It must commit cleanly:
+    // the row, generated column, and index all drop.
+    await store.upsertTagRecord("meeting", {
+      fields: { held_on: { type: "string", indexed: true } },
+    });
+    expect(indexedFieldOps.getIndexedField(db, "held_on")?.declarerTags).toContain("meeting");
+
+    await store.upsertTagRecord("meeting", { fields: null });
+    const record = await store.getTagRecord("meeting");
+    expect(record?.fields).toBeUndefined();
+    expect(indexedFieldOps.getIndexedField(db, "held_on")).toBeNull();
+    const cols = (db.prepare("PRAGMA table_xinfo(notes)").all() as { name: string }[]).map(
+      (c) => c.name,
+    );
+    expect(cols).not.toContain("meta_held_on");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Schema migration v13 → v14 — docs/contracts/tag-data-model.md
+// ---------------------------------------------------------------------------
+
+describe("schema migration v13 → v14", async () => {
+  it("backfills tags.parent_names from `_tags/<name>` notes", async () => {
+    // Simulate a pre-v14 vault by writing a `_tags/<name>` note + the
+    // legacy tag_schemas row directly via a fresh DB at v13 shape.
+    const { Database } = await import("bun:sqlite");
+    const db = new Database(":memory:");
+
+    // Build the v13 shape inline: tags(name PK only), separate tag_schemas
+    // table, plus a notes row at `_tags/voice`.
+    db.exec("PRAGMA journal_mode = WAL");
+    db.exec(`CREATE TABLE notes (
+      id TEXT PRIMARY KEY, content TEXT DEFAULT '', path TEXT,
+      metadata TEXT DEFAULT '{}', created_at TEXT NOT NULL, updated_at TEXT
+    )`);
+    db.exec(`CREATE TABLE tags (name TEXT PRIMARY KEY)`);
+    db.exec(`CREATE TABLE tag_schemas (
+      tag_name TEXT PRIMARY KEY REFERENCES tags(name) ON DELETE CASCADE,
+      description TEXT, fields TEXT
+    )`);
+
+    db.prepare("INSERT INTO tags (name) VALUES (?)").run("voice");
+    db.prepare("INSERT INTO tag_schemas (tag_name, description, fields) VALUES (?, ?, ?)")
+      .run("voice", "voice notes", '{"recorded_at":{"type":"string"}}');
+    db.prepare(`INSERT INTO notes (id, path, metadata, created_at) VALUES (?, ?, ?, ?)`)
+      .run("n1", "_tags/voice", JSON.stringify({ parents: ["manual"] }), new Date().toISOString());
+
+    // Now run initSchema — it should add the v14 columns, copy schema +
+    // hierarchy data onto the tags row, and drop tag_schemas.
+    const { initSchema } = await import("./schema.ts");
+    initSchema(db);
+
+    // tag_schemas should be gone.
+    const tableExists = db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='tag_schemas'",
+    ).get();
+    expect(tableExists).toBeNull();
+
+    // tags row should carry the migrated fields.
+    const row = db.prepare(
+      "SELECT name, description, fields, parent_names FROM tags WHERE name = 'voice'",
+    ).get() as any;
+    expect(row.description).toBe("voice notes");
+    expect(JSON.parse(row.fields).recorded_at.type).toBe("string");
+    expect(JSON.parse(row.parent_names)).toEqual(["manual"]);
+
+    // The `_tags/voice` note is left in place as harmless historical record.
+    const note = db.prepare("SELECT id FROM notes WHERE path = '_tags/voice'").get();
+    expect(note).toBeDefined();
+
+    db.close();
+  });
+
+  it("is idempotent — running initSchema twice is a no-op the second time", async () => {
+    const { Database } = await import("bun:sqlite");
+    const { initSchema } = await import("./schema.ts");
+    const db = new Database(":memory:");
+    initSchema(db);
+    db.prepare(`
+      INSERT INTO tags (name, description, parent_names, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(
+      "voice",
+      "voice notes",
+      JSON.stringify(["manual"]),
+      new Date().toISOString(),
+      new Date().toISOString(),
+    );
+
+    // Second run must not throw, must not perturb the row, must not
+    // reintroduce tag_schemas.
+    initSchema(db);
+
+    const row = db.prepare("SELECT description, parent_names FROM tags WHERE name = 'voice'").get() as any;
+    expect(row.description).toBe("voice notes");
+    expect(JSON.parse(row.parent_names)).toEqual(["manual"]);
+
+    const tableExists = db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='tag_schemas'",
+    ).get();
+    expect(tableExists).toBeNull();
+    db.close();
+  });
+
+  // vault#248 — the migration body is wrapped in BEGIN IMMEDIATE / COMMIT
+  // with a try/catch ROLLBACK. A crash mid-migration must leave the DB in
+  // its pre-migration state (NOT half-migrated), and a retry must converge
+  // to the same final state as a clean run. The transaction wrap is what
+  // makes that guarantee — the `hasColumn` / `hasTable` idempotency guards
+  // are belt-and-suspenders, not load-bearing.
+  it("crash mid-migration rolls back to pre-migration state, then retry succeeds", async () => {
+    const { Database } = await import("bun:sqlite");
+    const { initSchema } = await import("./schema.ts");
+
+    const db = new Database(":memory:");
+    db.exec("PRAGMA journal_mode = WAL");
+    db.exec(`CREATE TABLE notes (
+      id TEXT PRIMARY KEY, content TEXT DEFAULT '', path TEXT,
+      metadata TEXT DEFAULT '{}', created_at TEXT NOT NULL, updated_at TEXT
+    )`);
+    db.exec(`CREATE TABLE tags (name TEXT PRIMARY KEY)`);
+    db.exec(`CREATE TABLE tag_schemas (
+      tag_name TEXT PRIMARY KEY REFERENCES tags(name) ON DELETE CASCADE,
+      description TEXT, fields TEXT
+    )`);
+
+    db.prepare("INSERT INTO tags (name) VALUES (?)").run("voice");
+    db.prepare("INSERT INTO tag_schemas (tag_name, description, fields) VALUES (?, ?, ?)")
+      .run("voice", "voice notes", '{"recorded_at":{"type":"string"}}');
+    db.prepare(`INSERT INTO notes (id, path, metadata, created_at) VALUES (?, ?, ?, ?)`)
+      .run("n1", "_tags/voice", JSON.stringify({ parents: ["manual"] }), new Date().toISOString());
+
+    // Patch db.exec to simulate a crash on the final DROP TABLE step. That's
+    // the right injection point: every ALTER + data copy has already landed
+    // inside the transaction, so a successful rollback proves the wrap
+    // covers the full migration body — not just the tail.
+    const origExec = db.exec.bind(db);
+    let crashOnDrop: boolean = true;
+    (db as any).exec = function (sql: string) {
+      if (crashOnDrop && sql.includes("DROP TABLE tag_schemas")) {
+        throw new Error("simulated crash mid-migration");
+      }
+      return origExec(sql);
+    };
+
+    expect(() => initSchema(db)).toThrow("simulated crash mid-migration");
+
+    // Pre-migration shape: tag_schemas table still exists with its row,
+    // tags table back to (name) only — none of the v14 columns landed,
+    // `_tags/voice` note untouched, schema_version row not yet written.
+    const tagSchemasStill = db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='tag_schemas'",
+    ).get();
+    expect(tagSchemasStill).toBeTruthy();
+    const schemaRow = db.prepare(
+      "SELECT description, fields FROM tag_schemas WHERE tag_name = 'voice'",
+    ).get() as any;
+    expect(schemaRow.description).toBe("voice notes");
+
+    const tagsCols = db.prepare("PRAGMA table_info(tags)").all() as { name: string }[];
+    const colNames = tagsCols.map((c) => c.name).sort();
+    expect(colNames).toEqual(["name"]);
+
+    const note = db.prepare("SELECT path, metadata FROM notes WHERE id = 'n1'").get() as any;
+    expect(note.path).toBe("_tags/voice");
+    expect(JSON.parse(note.metadata).parents).toEqual(["manual"]);
+
+    // No lingering open transaction — a SELECT after rollback succeeds, and
+    // a fresh BEGIN IMMEDIATE doesn't fail with "cannot start a transaction
+    // within a transaction".
+    db.exec("BEGIN IMMEDIATE");
+    db.exec("ROLLBACK");
+
+    // Retry: drop the crash injection, run initSchema again. It must
+    // converge to the same final post-v14 state as a clean run.
+    crashOnDrop = false;
+    initSchema(db);
+
+    const tableGone = db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='tag_schemas'",
+    ).get();
+    expect(tableGone).toBeNull();
+    const post = db.prepare(
+      "SELECT description, fields, parent_names FROM tags WHERE name = 'voice'",
+    ).get() as any;
+    expect(post.description).toBe("voice notes");
+    expect(JSON.parse(post.fields).recorded_at.type).toBe("string");
+    expect(JSON.parse(post.parent_names)).toEqual(["manual"]);
+
+    db.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Schema migration v16 → v17 — vault#267 (note_schemas + schema_mappings rip)
+// ---------------------------------------------------------------------------
+
+describe("schema migration v16 → v17", async () => {
+  // Build a v16-shape DB with the standalone note_schemas + schema_mappings
+  // tables and a couple of rows, then run initSchema again. The v17 migration
+  // should drop both tables.
+  async function buildV16ShapeWithLegacyTables(): Promise<Database> {
+    const { Database } = await import("bun:sqlite");
+    const db = new Database(":memory:");
+
+    // Create the v16-era schema fragments by hand. We can't call the post-v17
+    // initSchema to do this — SCHEMA_SQL no longer creates the dropped
+    // tables. Build them manually here so the migration test exercises the
+    // "upgrading from v16" path.
+    db.exec("PRAGMA journal_mode = WAL");
+    db.exec("PRAGMA foreign_keys = ON");
+    db.exec(`CREATE TABLE note_schemas (
+      name TEXT PRIMARY KEY,
+      description TEXT,
+      fields TEXT,
+      required TEXT,
+      created_at TEXT,
+      updated_at TEXT
+    )`);
+    db.exec(`CREATE TABLE schema_mappings (
+      schema_name TEXT NOT NULL REFERENCES note_schemas(name) ON DELETE CASCADE,
+      match_kind TEXT NOT NULL CHECK (match_kind IN ('path_prefix', 'tag')),
+      match_value TEXT NOT NULL,
+      PRIMARY KEY (schema_name, match_kind, match_value)
+    )`);
+    db.exec("CREATE INDEX idx_schema_mappings_match ON schema_mappings(match_kind, match_value)");
+
+    const now = new Date().toISOString();
+    db.prepare(
+      "INSERT INTO note_schemas (name, description, fields, required, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+    ).run("task", "A task", '{"priority":{"type":"string"}}', '["priority"]', now, now);
+    db.prepare(
+      "INSERT INTO note_schemas (name, created_at, updated_at) VALUES (?, ?, ?)",
+    ).run("journal-entry", now, now);
+    db.prepare(
+      "INSERT INTO schema_mappings (schema_name, match_kind, match_value) VALUES (?, ?, ?)",
+    ).run("task", "tag", "task");
+    db.prepare(
+      "INSERT INTO schema_mappings (schema_name, match_kind, match_value) VALUES (?, ?, ?)",
+    ).run("journal-entry", "path_prefix", "journal/");
+
+    return db;
+  }
+
+  it("drops note_schemas + schema_mappings tables on upgrade", async () => {
+    const db = await buildV16ShapeWithLegacyTables();
+    const { initSchema } = await import("./schema.ts");
+    initSchema(db);
+
+    const tables = db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('note_schemas','schema_mappings')",
+    ).all() as { name: string }[];
+    expect(tables).toEqual([]);
+
+    db.close();
+  });
+
+  it("idempotent — running on an already-v17 vault is a no-op", async () => {
+    const { Database } = await import("bun:sqlite");
+    const { initSchema } = await import("./schema.ts");
+    const db = new Database(":memory:");
+    initSchema(db); // First run: fresh v17 shape.
+
+    // Sanity: the dropped tables don't exist on a fresh vault.
+    let tables = db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('note_schemas','schema_mappings')",
+    ).all() as { name: string }[];
+    expect(tables).toEqual([]);
+
+    // Second run shouldn't crash and the tables stay absent.
+    initSchema(db);
+    tables = db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('note_schemas','schema_mappings')",
+    ).all() as { name: string }[];
+    expect(tables).toEqual([]);
+
+    db.close();
+  });
+
+  it("preserves notes + tags + tokens across the rip", async () => {
+    const db = await buildV16ShapeWithLegacyTables();
+
+    // Bring the rest of the schema up to v16 baseline so notes/tags/tokens
+    // exist, then re-run initSchema (which finishes the v17 migration).
+    const { initSchema } = await import("./schema.ts");
+    initSchema(db);
+
+    // Populate some unrelated state and re-run; nothing else should move.
+    await import("./store.ts").then(async ({ SqliteStore }) => {
+      const s = new SqliteStore(db);
+      await s.createNote("hello", { id: "n1", tags: ["task"] });
+      await s.upsertTagRecord("task", { description: "still here" });
+    });
+    initSchema(db);
+
+    const note = db.prepare("SELECT id, content FROM notes WHERE id = ?").get("n1") as any;
+    expect(note?.content).toBe("hello");
+    const tag = db.prepare("SELECT description FROM tags WHERE name = ?").get("task") as any;
+    expect(tag?.description).toBe("still here");
+
+    db.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Schema migration v15 → v16 — vault#257 (tokens.vault_name binding)
+// ---------------------------------------------------------------------------
+
+describe("schema migration v15 → v16", async () => {
+  // vault#257 — the v16 migration body (ALTER TABLE ADD COLUMN + CREATE
+  // INDEX) is wrapped in BEGIN IMMEDIATE / COMMIT with a try/catch
+  // ROLLBACK, mirroring the v14/v15 wrap shape from vault#251. The
+  // individual statements are atomic in SQLite, so the wrap is mostly
+  // belt-and-suspenders for THIS migration — but the test mirrors v14's
+  // crash-rollback shape so anyone touching migrations finds the same
+  // regression-pin pattern across versions.
+  it("crash mid-migration rolls back to pre-v16 state, then retry succeeds", async () => {
+    const { Database } = await import("bun:sqlite");
+    const { initSchema } = await import("./schema.ts");
+
+    // Build the full post-v16 shape, plant a row, then drop the v16
+    // additions so initSchema's migrateToV16 fires on the next call.
+    const db = new Database(":memory:");
+    db.exec("PRAGMA journal_mode = WAL");
+    initSchema(db);
+
+    const now = new Date().toISOString();
+    db.prepare(
+      "INSERT INTO tokens (token_hash, label, created_at, vault_name) VALUES (?, ?, ?, ?)",
+    ).run("sha256:abc123def456", "pre-existing", now, "work");
+
+    db.exec("DROP INDEX IF EXISTS idx_tokens_vault_name");
+    db.exec("ALTER TABLE tokens DROP COLUMN vault_name");
+
+    // Pre-condition: the column is gone but the row is still there
+    // (DROP COLUMN strips the column from existing rows).
+    const preCols = db.prepare("PRAGMA table_info(tokens)").all() as { name: string }[];
+    expect(preCols.map((c) => c.name)).not.toContain("vault_name");
+    const preRow = db.prepare("SELECT label FROM tokens WHERE token_hash = ?")
+      .get("sha256:abc123def456") as { label: string } | null;
+    expect(preRow?.label).toBe("pre-existing");
+
+    // Patch db.exec to crash on CREATE INDEX — the second statement inside
+    // the v16 transaction body. Crashing here proves the wrap covers the
+    // post-ALTER state, not just the tail. The injection deliberately
+    // doesn't match BEGIN/COMMIT/ROLLBACK so the catch's ROLLBACK still
+    // runs through the patched exec.
+    const origExec = db.exec.bind(db);
+    let crashOnIndex: boolean = true;
+    (db as any).exec = function (sql: string) {
+      if (crashOnIndex && sql.includes("CREATE INDEX") && sql.includes("idx_tokens_vault_name")) {
+        throw new Error("simulated crash mid-v16-migration");
+      }
+      return origExec(sql);
+    };
+
+    expect(() => initSchema(db)).toThrow("simulated crash mid-v16-migration");
+
+    // Pre-v16 shape after rollback: vault_name column must not exist; the
+    // pre-existing row must be untouched.
+    const colsAfterRollback = db.prepare("PRAGMA table_info(tokens)").all() as { name: string }[];
+    expect(colsAfterRollback.map((c) => c.name)).not.toContain("vault_name");
+    const idxAfterRollback = db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_tokens_vault_name'",
+    ).get();
+    expect(idxAfterRollback).toBeNull();
+    const rowAfterRollback = db.prepare("SELECT label FROM tokens WHERE token_hash = ?")
+      .get("sha256:abc123def456") as { label: string } | null;
+    expect(rowAfterRollback?.label).toBe("pre-existing");
+
+    // No lingering open transaction — a fresh BEGIN IMMEDIATE + ROLLBACK
+    // doesn't fail with "cannot start a transaction within a transaction".
+    db.exec("BEGIN IMMEDIATE");
+    db.exec("ROLLBACK");
+
+    // Retry: drop the crash injection, run initSchema again. Must converge
+    // to post-v16 shape (column added, index created, lenient NULL backfill
+    // on the pre-existing row per the migration spec).
+    crashOnIndex = false;
+    initSchema(db);
+
+    const colsPost = db.prepare("PRAGMA table_info(tokens)").all() as { name: string }[];
+    expect(colsPost.map((c) => c.name)).toContain("vault_name");
+    const idxPost = db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_tokens_vault_name'",
+    ).get();
+    expect(idxPost).toBeTruthy();
+    const rowPost = db.prepare("SELECT label, vault_name FROM tokens WHERE token_hash = ?")
+      .get("sha256:abc123def456") as { label: string; vault_name: string | null };
+    expect(rowPost.label).toBe("pre-existing");
+    expect(rowPost.vault_name).toBeNull();
+
+    db.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tag-scope auth post-v14 — docs/contracts/tag-scoped-tokens.md
+// ---------------------------------------------------------------------------
+
+describe("tag-scope auth (post-v14 hierarchy)", async () => {
+  it("token allowlisted for `health` matches descendants declared via parent_names", async () => {
+    await store.upsertTagRecord("health/food", { parent_names: ["health"] });
+    await store.upsertTagRecord("health/food/breakfast", { parent_names: ["health/food"] });
+
+    const expanded = await store.expandTagsWithDescendants(["health"]);
+    expect(expanded.has("health")).toBe(true);
+    expect(expanded.has("health/food")).toBe(true);
+    expect(expanded.has("health/food/breakfast")).toBe(true);
+  });
+
+  it("orphan sub-tag fallback: token for `health` still sees `#health/food` even with no declared hierarchy", async () => {
+    // Per docs/contracts/tag-scoped-tokens.md §Storage details, the auth check
+    // also splits on '/' and matches the root verbatim against the raw
+    // allowlist. This survives the v14 source-of-truth swap because the
+    // fallback lives in src/tag-scope.ts, not in the resolver.
+    const { noteWithinTagScope } = await import("../../src/tag-scope.ts");
+    const note = { id: "x", content: "", createdAt: "", tags: ["health/food"] };
+    const allowed = await store.expandTagsWithDescendants(["health"]);
+    // No declared hierarchy — the expansion returns just `health`.
+    expect(allowed.has("health/food")).toBe(false);
+    // But the string-form fallback still matches.
+    expect(noteWithinTagScope(note, allowed, ["health"])).toBe(true);
+  });
+});
+
+// ---- Vault projection (vault#271) ----
+
+describe("vault projection (vault#271)", async () => {
+  it("projects tags-with-schemas with effective inheritance", async () => {
+    const { buildVaultProjection } = await import("./vault-projection.ts");
+
+    // Universal `_default` parent declares `created_by`.
+    await store.upsertTagRecord("_default", {
+      fields: { created_by: { type: "string", description: "Origin agent" } },
+    });
+    // `person` declares `email` and inherits `created_by`.
+    await store.upsertTagRecord("person", {
+      description: "A person",
+      fields: { email: { type: "string", indexed: true } },
+    });
+    // `employee` extends `person` — should inherit BOTH `email` and `created_by`.
+    await store.upsertTagRecord("employee", {
+      description: "Person who works here",
+      fields: { title: { type: "string" } },
+      parent_names: ["person"],
+    });
+
+    const projection = buildVaultProjection(db);
+
+    const byName = Object.fromEntries(projection.tags.map((t) => [t.name, t]));
+
+    // _default appears (has fields).
+    expect(byName._default).toBeTruthy();
+    expect(byName._default.parents).toEqual([]);
+    expect(byName._default.effective_parents).toEqual([]);
+
+    // person inherits _default's universal field.
+    expect(byName.person.parents).toEqual([]);
+    expect(byName.person.effective_parents).toEqual(["_default"]);
+    expect(Object.keys(byName.person.effective_fields).sort()).toEqual([
+      "created_by",
+      "email",
+    ]);
+    // own fields stay separate
+    expect(Object.keys(byName.person.fields ?? {})).toEqual(["email"]);
+
+    // employee walks person → _default.
+    expect(byName.employee.parents).toEqual(["person"]);
+    expect(byName.employee.effective_parents).toEqual(["person", "_default"]);
+    expect(Object.keys(byName.employee.effective_fields).sort()).toEqual([
+      "created_by",
+      "email",
+      "title",
+    ]);
+  });
+
+  it("catalogs indexed fields across declarers", async () => {
+    const { buildVaultProjection } = await import("./vault-projection.ts");
+
+    // Indexed-field lifecycle is owned by the update-tag MCP tool, not
+    // store.upsertTagRecord — go through the tool so the indexed_fields
+    // table actually gets populated.
+    const tools = generateMcpTools(store);
+    const updateTag = tools.find((t) => t.name === "update-tag")!;
+    await updateTag.execute({
+      tag: "task",
+      fields: { status: { type: "string", indexed: true } },
+    });
+    await updateTag.execute({
+      tag: "project",
+      fields: {
+        status: { type: "string", indexed: true },
+        priority: { type: "integer", indexed: true },
+      },
+    });
+
+    const projection = buildVaultProjection(db);
+    const byName = Object.fromEntries(projection.indexed_fields.map((f) => [f.name, f]));
+
+    expect(byName.status).toBeTruthy();
+    expect(byName.status.type).toBe("string");
+    expect(byName.status.tags.sort()).toEqual(["project", "task"]);
+
+    expect(byName.priority).toBeTruthy();
+    expect(byName.priority.type).toBe("integer");
+    expect(byName.priority.tags).toEqual(["project"]);
+  });
+
+  // vault#date-field-type: `type: "date"` carries through the indexed-field
+  // catalog like any other type — nothing in the projection filters unknown
+  // or newer types out.
+  it("catalogs an indexed `date` field with its declared type", async () => {
+    const { buildVaultProjection } = await import("./vault-projection.ts");
+    const tools = generateMcpTools(store);
+    const updateTag = tools.find((t) => t.name === "update-tag")!;
+    await updateTag.execute({
+      tag: "meeting",
+      fields: { meeting_date: { type: "date", indexed: true } },
+    });
+
+    const projection = buildVaultProjection(db);
+    const byName = Object.fromEntries(projection.indexed_fields.map((f) => [f.name, f]));
+    expect(byName.meeting_date).toBeTruthy();
+    expect(byName.meeting_date.type).toBe("date");
+    expect(byName.meeting_date.tags).toEqual(["meeting"]);
+  });
+
+  it("includes the static query-hint catalog", async () => {
+    const { buildVaultProjection, QUERY_HINTS } = await import("./vault-projection.ts");
+    const projection = buildVaultProjection(db);
+    expect(projection.query_hints.length).toBe(QUERY_HINTS.length);
+    expect(projection.query_hints.some((h) => h.startsWith("query-notes { tag:"))).toBe(true);
+    expect(projection.query_hints.some((h) => h.includes("near:"))).toBe(true);
+  });
+
+  it("includes stats only when requested", async () => {
+    const { buildVaultProjection } = await import("./vault-projection.ts");
+    await store.createNote("a", { tags: ["x"] });
+    await store.createNote("b", { tags: ["x", "y"] });
+
+    const without = buildVaultProjection(db);
+    expect(without.stats).toBeUndefined();
+
+    const withStats = buildVaultProjection(db, { includeStats: true });
+    expect(withStats.stats).toBeTruthy();
+    expect(withStats.stats!.totalNotes).toBe(2);
+    expect(withStats.stats!.tagCount).toBe(2);
+  });
+
+  it("degrades gracefully on an empty vault", async () => {
+    const { buildVaultProjection } = await import("./vault-projection.ts");
+    const projection = buildVaultProjection(db);
+    expect(projection.tags).toEqual([]);
+    expect(projection.indexed_fields).toEqual([]);
+    // Query hints are static — present even on a blank vault.
+    expect(projection.query_hints.length).toBeGreaterThan(0);
+  });
+
+  it("renders a markdown brief listing tags-with-schemas and indexed fields", async () => {
+    const { buildVaultProjection, projectionToMarkdown } = await import(
+      "./vault-projection.ts"
+    );
+
+    await store.createNote("a", { tags: ["person"] });
+    const tools = generateMcpTools(store);
+    const updateTag = tools.find((t) => t.name === "update-tag")!;
+    await updateTag.execute({
+      tag: "person",
+      description: "A person",
+      fields: { email: { type: "string", indexed: true } },
+    });
+
+    const projection = buildVaultProjection(db, { includeStats: true });
+    const md = projectionToMarkdown({
+      vaultName: "test",
+      description: "My vault",
+      projection,
+    });
+
+    expect(md).toContain('You are connected to Parachute Vault "test"');
+    expect(md).toContain("My vault");
+    expect(md).toContain("1 tag with schemas: person");
+    expect(md).toContain("Indexed metadata fields");
+    expect(md).toContain("email");
+    expect(md).toContain("#person");
+    expect(md).toContain("vault-info");
+    expect(md).toContain("list-tags { include_schema: true }");
+    // Scripting pointer (closes the "points nowhere" gap): the brief routes an
+    // agent to the HTTP API + the public guide, with the vault name baked into
+    // the copy-paste mint command.
+    expect(md).toContain("## Scripting & automation (beyond this session)");
+    expect(md).toContain("https://parachute.computer/scripting/");
+    expect(md).toContain("parachute auth mint-token --scope vault:test:read --ephemeral");
+    expect(md).toContain("vault/test/api");
+  });
+
+  it("markdown brief degrades gracefully when no schemas declared", async () => {
+    const { buildVaultProjection, projectionToMarkdown } = await import(
+      "./vault-projection.ts"
+    );
+
+    const projection = buildVaultProjection(db, { includeStats: true });
+    const md = projectionToMarkdown({
+      vaultName: "fresh",
+      description: null,
+      projection,
+    });
+
+    expect(md).toContain('Parachute Vault "fresh"');
+    expect(md).toContain("No tag schemas declared");
+    expect(md).toContain("No indexed metadata fields");
+    expect(md).toContain("Querying");
+  });
+
+  it("markdown brief skips a non-string description instead of throwing (vault#669 recovery)", async () => {
+    const { buildVaultProjection, projectionToMarkdown } = await import(
+      "./vault-projection.ts"
+    );
+
+    const projection = buildVaultProjection(db, { includeStats: true });
+    const md = projectionToMarkdown({
+      vaultName: "poisoned",
+      // A write door that skipped the type guard used to persist a number
+      // and take down initialize via `description.trim is not a function`.
+      description: 123 as unknown as string,
+      projection,
+    });
+
+    expect(md).toContain('Parachute Vault "poisoned"');
+    expect(md).not.toContain("123");
+  });
+
+  it("markdown brief stays under ~5K tokens for a 50-tags-with-schemas vault", async () => {
+    const { buildVaultProjection, projectionToMarkdown } = await import(
+      "./vault-projection.ts"
+    );
+
+    for (let i = 0; i < 50; i++) {
+      await store.upsertTagRecord(`schema_tag_${i}`, {
+        description: `Description for tag ${i} — covers what this tag is used for in the vault.`,
+        fields: {
+          [`field_${i}_a`]: { type: "string", indexed: i % 3 === 0 },
+          [`field_${i}_b`]: { type: "integer" },
+        },
+      });
+    }
+
+    const projection = buildVaultProjection(db, { includeStats: true });
+    const md = projectionToMarkdown({
+      vaultName: "big",
+      description: "Big test vault",
+      projection,
+    });
+
+    // Rough token approximation: 1 token ≈ 4 chars. Budget: 5K tokens.
+    const approxTokens = md.length / 4;
+    expect(approxTokens).toBeLessThan(5000);
+  });
+});
+
+// ---- Path write-validation (vault#589 / FIX 2) ----
+
+describe("validatePath — reject NUL / '..' at the write surface", () => {
+  const NUL = String.fromCharCode(0);
+
+  it("rejects a NUL byte in the path", () => {
+    expect(() => validatePath(`bad${NUL}path`)).toThrow(PathValidationError);
+    try {
+      validatePath(`x${NUL}y`);
+      throw new Error("expected validatePath to throw");
+    } catch (e: any) {
+      expect(e.code).toBe("INVALID_PATH");
+      expect(e.error_type).toBe("invalid_path");
+      expect(e.reason).toMatch(/NUL/);
+    }
+  });
+
+  it("rejects a '..' path segment (traversal-shaped)", () => {
+    expect(() => validatePath("..")).toThrow(PathValidationError);
+    expect(() => validatePath("../secrets")).toThrow(PathValidationError);
+    expect(() => validatePath("a/../b")).toThrow(PathValidationError);
+    expect(() => validatePath("a/..")).toThrow(PathValidationError);
+    // Backslash form normalizes to '/', so it's caught too.
+    expect(() => validatePath("a\\..\\b")).toThrow(PathValidationError);
+  });
+
+  it("accepts legitimate paths, including ones that merely contain dots", () => {
+    expect(() => validatePath("Projects/Parachute/README")).not.toThrow();
+    expect(() => validatePath("notes/2026-07-09")).not.toThrow();
+    expect(() => validatePath("weird...name")).not.toThrow(); // three literal dots, not a '..' segment
+    expect(() => validatePath("a/.hidden/b")).not.toThrow();   // single-dot-prefixed segment is fine
+    expect(() => validatePath("with spaces and : colon?")).not.toThrow(); // FORBIDDEN_CHARS stay un-enforced at write
+  });
+
+  it("treats a null / undefined / empty path as valid (notes need no path)", () => {
+    expect(() => validatePath(null)).not.toThrow();
+    expect(() => validatePath(undefined)).not.toThrow();
+    expect(() => validatePath("")).not.toThrow();
+    expect(() => validatePath("   ")).not.toThrow(); // normalizes to null
+  });
+});
+
+describe("reference target_tags", async () => {
+  let store: SqliteStore;
+  let N: any;
+  beforeEach(async () => {
+    store = new SqliteStore(new Database(":memory:"));
+    await store.upsertTagRecord("node", {});
+    await store.upsertTagRecord("server", { parent_names: ["node"] });
+    await store.upsertTagRecord("person", {});
+    await store.upsertTagRecord("task", {
+      fields: { node: { type: "reference", target_tags: ["node"] } },
+    });
+  });
+  const warnsOf = (n: any, reason: string) =>
+    (store.validateNoteAgainstSchemas({ tags: n.tags, metadata: n.metadata })?.warnings ?? []).filter((w) => w.reason === reason);
+
+  it("accepts a target carrying the right tag", async () => {
+    await store.createNote("x", { path: "N/a", tags: ["node"] });
+    const t = await store.createNote("t", { tags: ["task"], metadata: { node: "N/a" } });
+    expect(warnsOf(t, "target_tag_mismatch")).toHaveLength(0);
+  });
+  it("accepts a subtype via parent_names", async () => {
+    await store.createNote("x", { path: "N/s", tags: ["server"] });
+    const t = await store.createNote("t", { tags: ["task"], metadata: { node: "N/s" } });
+    expect(warnsOf(t, "target_tag_mismatch")).toHaveLength(0);
+  });
+  it("warns (advisory) on the wrong type", async () => {
+    await store.createNote("x", { path: "P/bob", tags: ["person"] });
+    const t = await store.createNote("t", { tags: ["task"], metadata: { node: "P/bob" } });
+    const w = warnsOf(t, "target_tag_mismatch");
+    expect(w).toHaveLength(1);
+    expect(w[0].strict).toBeUndefined();
+  });
+  it("marks the warning strict when the field is strict", async () => {
+    await store.upsertTagRecord("task", {
+      fields: { node: { type: "reference", target_tags: ["node"], strict: true } },
+    });
+    await store.createNote("x", { path: "P/bob", tags: ["person"] });
+    const t = await store.createNote("t", { tags: ["task"], metadata: { node: "P/bob" } });
+    expect(warnsOf(t, "target_tag_mismatch")[0].strict).toBe(true);
+  });
+  it("strict field: create-note rejects a wrong-type target, accepts subtype, tolerates unresolved", async () => {
+    await store.upsertTagRecord("task", {
+      fields: { node: { type: "reference", target_tags: ["node"], strict: true } },
+    });
+    await store.createNote("x", { path: "P/bob", tags: ["person"] });
+    await store.createNote("s", { path: "N/s", tags: ["server"] });
+    const tools = generateMcpTools(store);
+    const cn = tools.find((x: any) => x.name === "create-note")!;
+    await expect(cn.execute({ content: "t", tags: ["task"], metadata: { node: "P/bob" } })).rejects.toMatchObject({ name: "SchemaValidationError", code: "SCHEMA_VALIDATION", violations: [expect.objectContaining({ field: "node", reason: "target_tag_mismatch", strict: true })] });
+    await cn.execute({ content: "t2", tags: ["task"], metadata: { node: "N/s" } });
+    await cn.execute({ content: "t3", tags: ["task"], metadata: { node: "N/nowhere" } });
+  });
+  it("ambiguous target is unresolved (advisory), never rejected, even when strict", async () => {
+    await store.upsertTagRecord("task", {
+      fields: { node: { type: "reference", target_tags: ["node"], strict: true } },
+    });
+    await store.createNote("a", { path: "A/dup", tags: ["person"] });
+    await store.createNote("b", { path: "B/dup", tags: ["person"] });
+    const cn = generateMcpTools(store).find((x: any) => x.name === "create-note")!;
+    const r: any = await cn.execute({ content: "t", tags: ["task"], metadata: { node: "dup" } });
+    expect(r.validation_status.warnings.map((w: any) => w.reason)).toEqual(["unresolved_reference"]);
+  });
+  it("messages never include the target's own tag list", async () => {
+    await store.createNote("x", { path: "P/bob", tags: ["person"] });
+    const t = await store.createNote("t", { tags: ["task"], metadata: { node: "P/bob" } });
+    const w = warnsOf(t, "target_tag_mismatch")[0];
+    expect(w.message).not.toContain("person");
+    expect(w.message).toContain("node");
+  });
+  it("unresolved target: advisory unresolved_reference, never strict, link still queued", async () => {
+    await store.upsertTagRecord("task", {
+      fields: { node: { type: "reference", target_tags: ["node"], strict: true } },
+    });
+    const t = await store.createNote("t", { tags: ["task"], metadata: { node: "N/later" } });
+    const w = warnsOf(t, "unresolved_reference");
+    expect(w).toHaveLength(1);
+    expect(w[0].strict).toBeUndefined();
+    const later = await store.createNote("x", { path: "N/later", tags: ["node"] });
+    expect(warnsOf(await store.getNote(t.id), "unresolved_reference")).toHaveLength(0);
+    expect(later).toBeTruthy();
+  });
+  it("no change for reference fields without target_tags", async () => {
+    await store.upsertTagRecord("plain", { fields: { ref: { type: "reference" } } });
+    await store.createNote("x", { path: "P/bob", tags: ["person"] });
+    const t = await store.createNote("t", { tags: ["plain"], metadata: { ref: "P/bob" } });
+    expect(store.validateNoteAgainstSchemas({ tags: t.tags, metadata: t.metadata })?.warnings).toEqual([]);
+  });
+  it("checks each element of a cardinality:many field", async () => {
+    await store.upsertTagRecord("multi", {
+      fields: { nodes: { type: "reference", cardinality: "many", target_tags: ["node"] } },
+    });
+    await store.createNote("x", { path: "N/a", tags: ["node"] });
+    await store.createNote("y", { path: "P/bob", tags: ["person"] });
+    const t = await store.createNote("t", { tags: ["multi"], metadata: { nodes: ["N/a", "P/bob"] } });
+    expect(warnsOf(t, "target_tag_mismatch")).toHaveLength(1);
+  });
+  it("read-time validation_status (query-notes) shows it", async () => {
+    await store.createNote("x", { path: "P/bob", tags: ["person"] });
+    await store.createNote("t", { path: "T/1", tags: ["task"], metadata: { node: "P/bob" } });
+    const tools = generateMcpTools(store);
+    const q = tools.find((x: any) => x.name === "query-notes")!;
+    const r: any = await q.execute({ id: "T/1" });
+    expect(r.validation_status.warnings.map((w: any) => w.reason)).toContain("target_tag_mismatch");
+  });
+  it("update-tag rejects malformed target_tags", async () => {
+    const tools = generateMcpTools(store);
+    const ut = tools.find((x: any) => x.name === "update-tag")!;
+    await expect(ut.execute({ tag: "bad", fields: { f: { type: "reference", target_tags: "node" } } })).rejects.toThrow(/target_tags/);
+    await expect(ut.execute({ tag: "bad", fields: { f: { type: "string", target_tags: ["node"] } } })).rejects.toThrow(/target_tags/);
+  });
+  it("list-tags schema output exposes target_tags", async () => {
+    const tools = generateMcpTools(store);
+    const lt = tools.find((x: any) => x.name === "list-tags")!;
+    const r: any = await lt.execute({ tag: "task" });
+    expect(r.fields.node.target_tags).toEqual(["node"]);
+  });
+});

@@ -1,0 +1,793 @@
+/**
+ * Operator token — long-lived hub-issued JWT that local CLI tools use to
+ * authenticate against on-box services (vault / scribe / channel) without
+ * running an interactive OAuth dance every time.
+ *
+ * Why this exists: modules require auth on every request — there is no
+ * "loopback is trusted" bypass, because browser extensions and compromised
+ * postinstalls can hit 127.0.0.1 too. The operator token is the on-box
+ * caller's bearer credential; it lives in `~/.parachute/operator.token`
+ * with mode 0600 so a different unix user can't read it.
+ *
+ * Browser apps follow the OAuth flow and never touch this file. Service
+ * accounts (cron jobs, oncall scripts) read it; that's the whole point.
+ *
+ * Lifetime: 90 days by default (was 365d through 0.5.7). The opportunistic
+ * auto-rotation helper `useOperatorTokenWithAutoRotate` re-mints any
+ * within-7d-of-expiry token in-place, so an operator who runs the CLI at
+ * least weekly never sees an expiry surprise. Fully expired tokens fail
+ * with an explicit re-auth message — auto-rotating from a dead token would
+ * defeat the lifetime cap (security: forces a manual re-auth touch).
+ *
+ * Operator-token jtis are tracked in the hub `tokens` registry as of
+ * hub#212 Phase 1 (created_via='operator_mint'); per-jti revocation is
+ * enforced via validateAccessToken's row.revokedAt check. A leaked file
+ * still stays valid until either its TTL elapses or the operator
+ * explicitly revokes the jti — treat operator.token like an SSH private
+ * key.
+ */
+import type { Database } from "bun:sqlite";
+import { promises as fs, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { decodeJwt } from "jose";
+import { configDir } from "./config.ts";
+import { EXPOSE_STATE_PATH, readExposeState } from "./expose-state.ts";
+import { validateHostAdminToken } from "./host-admin-token-validation.ts";
+import { readHubPort } from "./hub-control.ts";
+import { HUB_UNIT_DEFAULT_PORT } from "./hub-unit.ts";
+import {
+  TokenMintPrincipalGoneError,
+  recordTokenMint,
+  signAccessToken,
+  validateAccessToken,
+} from "./jwt-sign.ts";
+import { buildHubBoundOrigins } from "./origin-check.ts";
+import { getUserById } from "./users.ts";
+import { isLoopbackOrigin } from "./vault-hub-origin-env.ts";
+
+export const OPERATOR_TOKEN_FILENAME = "operator.token";
+/** Default operator-token lifetime — 90 days, was 365d through 0.5.7 (#213). */
+export const OPERATOR_TOKEN_TTL_SECONDS = 90 * 24 * 60 * 60;
+/**
+ * Auto-rotation threshold. When a CLI flow validates an operator token whose
+ * remaining lifetime is less than this, it silently re-mints with the same
+ * scope-set + a fresh full TTL. 7 days picked so a once-a-week operator
+ * never sees expiry; longer would let stale tokens accumulate, shorter
+ * would re-mint too often.
+ */
+export const OPERATOR_TOKEN_AUTO_ROTATE_THRESHOLD_SECONDS = 7 * 24 * 60 * 60;
+export const OPERATOR_TOKEN_AUDIENCE = "operator";
+export const OPERATOR_TOKEN_CLIENT_ID = "parachute-hub";
+
+/**
+ * Named scope-sets a `parachute auth rotate-operator` invocation can choose
+ * via `--scope-set`. Each set encodes the minimum scopes required for that
+ * operator-flow's API surface; `admin` is the back-compat superset and
+ * stays the default.
+ *
+ * Per-command gating rolls out incrementally:
+ *   - Auth surfaces (hub#221 `revoke-token`, hub#222 `mint-token`) gate on
+ *     `parachute:host:auth` — both `admin` and `auth` scope-sets carry it.
+ *   - Other CLI commands (`install`, `start`, `expose`, etc.) still accept
+ *     any token with `hub:admin` and don't yet check the narrower scopes;
+ *     a future follow-up wires per-command enforcement so a `start`-set
+ *     token can only lifecycle-manage, not install. Until then,
+ *     `--scope-set` is a tool the cautious operator can opt into without
+ *     breaking anyone.
+ *
+ * The fine-grained `parachute:host:install/start/expose/auth/vault` scopes
+ * are operator-only (non-requestable via public OAuth), like
+ * `parachute:host:admin` — registered in `scope-explanations.ts`.
+ */
+export type OperatorScopeSet = "install" | "start" | "expose" | "auth" | "vault" | "admin";
+
+export const OPERATOR_TOKEN_SCOPE_SET_NAMES: readonly OperatorScopeSet[] = [
+  "install",
+  "start",
+  "expose",
+  "auth",
+  "vault",
+  "admin",
+];
+
+/**
+ * Scopes embedded for each named set. `admin` preserves the pre-#213
+ * `OPERATOR_TOKEN_SCOPES` set verbatim plus the new fine-grained host
+ * scopes (which `admin` is a superset of by definition).
+ */
+export const OPERATOR_TOKEN_SCOPE_SETS: Readonly<Record<OperatorScopeSet, readonly string[]>> = {
+  install: ["parachute:host:install", "vault:read"],
+  start: ["parachute:host:start"],
+  expose: ["parachute:host:expose"],
+  auth: ["parachute:host:auth"],
+  vault: ["parachute:host:vault"],
+  admin: [
+    "hub:admin",
+    "parachute:host:admin",
+    "parachute:host:install",
+    "parachute:host:start",
+    "parachute:host:expose",
+    "parachute:host:auth",
+    "parachute:host:vault",
+    "vault:admin",
+    "scribe:admin",
+  ],
+};
+
+/**
+ * Pre-#213 export: the broad "admin" scope-set as a flat array. Kept for
+ * back-compat with callers (e.g. existing tests) that imported the constant
+ * directly. New callers should use `OPERATOR_TOKEN_SCOPE_SETS.admin`.
+ */
+export const OPERATOR_TOKEN_SCOPES = OPERATOR_TOKEN_SCOPE_SETS.admin;
+
+/** Custom JWT claim that records which scope-set this operator token was minted under. */
+export const OPERATOR_TOKEN_SCOPE_SET_CLAIM = "pa_scope_set";
+
+/** Default scope-set when none is specified. Preserves pre-#213 behavior. */
+export const OPERATOR_TOKEN_DEFAULT_SCOPE_SET: OperatorScopeSet = "admin";
+
+export function isOperatorScopeSet(value: unknown): value is OperatorScopeSet {
+  return (
+    typeof value === "string" &&
+    (OPERATOR_TOKEN_SCOPE_SET_NAMES as readonly string[]).includes(value)
+  );
+}
+
+export function operatorTokenPath(dir: string = configDir()): string {
+  return join(dir, OPERATOR_TOKEN_FILENAME);
+}
+
+/**
+ * The `jti` of the operator token currently on disk, or null when there
+ * isn't one (no file, empty file, undecodable, or no `jti` claim).
+ *
+ * Sync + decode-only on purpose. Its callers are guards that must answer
+ * "is the jti in front of me the LIVE operator credential?" (hub#931) —
+ * `parachute auth revoke-token`, `POST /api/auth/revoke-token` and
+ * `parachute doctor`. A guard has to fail OPEN on an unreadable file (null
+ * → no match → the caller's normal path runs), so every failure mode
+ * collapses to the same null; signature verification would add nothing,
+ * because the question is about the bytes on disk, not their validity.
+ */
+export function readOperatorTokenJti(dir: string = configDir()): string | null {
+  let token: string;
+  try {
+    token = readFileSync(operatorTokenPath(dir), "utf8").trim();
+  } catch {
+    return null;
+  }
+  if (token.length === 0) return null;
+  try {
+    const jti = decodeJwt(token).jti;
+    return typeof jti === "string" && jti.length > 0 ? jti : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Refusal shown when a revoke targets the live `operator.token` jti without
+ * break-glass (hub#931). Shared by the CLI and HTTP surfaces so both name
+ * the SAME reason: revoking it doesn't just invalidate a credential, it
+ * takes module-ops down with it, and `rotate-operator` is the safe path.
+ */
+export function liveOperatorTokenRevokeRefusal(jti: string, dir: string = configDir()): string {
+  return `jti ${jti} is the live operator token at ${operatorTokenPath(dir)} — revoking it would break module-ops (start/stop/restart/upgrade) on this box. Run \`parachute auth rotate-operator\` to replace it first`;
+}
+
+export interface MintOperatorTokenOpts {
+  /**
+   * Hub origin — written into the JWT's `iss` claim. On-box services
+   * (vault, scribe, channel) reject tokens whose `iss` doesn't match the
+   * `PARACHUTE_HUB_ORIGIN` they were started with. Callers derive this via
+   * `deriveHubOrigin()`.
+   */
+  issuer: string;
+  /** Override the JWT-sign clock — tests pin time. */
+  now?: () => Date;
+  /** Override the random jti — tests pin it. */
+  jti?: string;
+  /** Override the audience claim. Defaults to "operator". */
+  audience?: string;
+  /** Which named scope-set to mint under. Defaults to "admin" (pre-#213 behavior). */
+  scopeSet?: OperatorScopeSet;
+  /** Override the lifetime. Tests pin this; production uses the default. */
+  ttlSeconds?: number;
+}
+
+export async function mintOperatorToken(
+  db: Database,
+  userId: string,
+  opts: MintOperatorTokenOpts,
+): Promise<{ token: string; jti: string; expiresAt: string; scopeSet: OperatorScopeSet }> {
+  const user = getUserById(db, userId);
+  if (!user) {
+    throw new TokenMintPrincipalGoneError(
+      `mintOperatorToken: no hub user ${userId}; operator mint is a person-mint`,
+    );
+  }
+  const scopeSet = opts.scopeSet ?? OPERATOR_TOKEN_DEFAULT_SCOPE_SET;
+  const scopes = [...OPERATOR_TOKEN_SCOPE_SETS[scopeSet]];
+  const minted = await signAccessToken(db, {
+    sub: user.id,
+    scopes,
+    audience: opts.audience ?? OPERATOR_TOKEN_AUDIENCE,
+    clientId: OPERATOR_TOKEN_CLIENT_ID,
+    issuer: opts.issuer,
+    ttlSeconds: opts.ttlSeconds ?? OPERATOR_TOKEN_TTL_SECONDS,
+    // Operator token — the hub-operator bearer. No per-user vault pin; the
+    // operator can act against any vault in this hub. Empty `vault_scope`
+    // is the "no restriction" sentinel (matches the admin OAuth shape).
+    vaultScope: [],
+    extraClaims: { [OPERATOR_TOKEN_SCOPE_SET_CLAIM]: scopeSet },
+    ...(opts.jti !== undefined ? { jti: opts.jti } : {}),
+    ...(opts.now !== undefined ? { now: opts.now } : {}),
+  });
+  // Register every operator-mint with the unified token registry (hub#212
+  // Phase 1 / hub#833). JWT sub is the hub user id; user_id is set so
+  // account delete / password-reset revoke this row. subject stays the
+  // "operator" display label.
+  recordTokenMint(db, {
+    jti: minted.jti,
+    createdVia: "operator_mint",
+    subject: "operator",
+    userId: user.id,
+    userUpdatedAt: user.updatedAt,
+    clientId: OPERATOR_TOKEN_CLIENT_ID,
+    scopes,
+    expiresAt: minted.expiresAt,
+    ...(opts.now !== undefined ? { now: opts.now } : {}),
+  });
+  return { ...minted, scopeSet };
+}
+
+/**
+ * Atomically writes the token to `<dir>/operator.token` with mode 0600.
+ * Atomic = write to `<path>.tmp` then rename, so a half-written file never
+ * exists at the canonical path.
+ */
+export async function writeOperatorTokenFile(
+  token: string,
+  dir: string = configDir(),
+): Promise<string> {
+  await fs.mkdir(dir, { recursive: true });
+  const path = operatorTokenPath(dir);
+  const tmp = `${path}.tmp`;
+  await fs.writeFile(tmp, `${token}\n`, { mode: 0o600 });
+  // Defense-in-depth: if the file already existed with looser permissions,
+  // some platforms (Linux, macOS) preserve the prior inode's mode rather
+  // than honoring the create-mode hint on rename. Force 0600 explicitly.
+  await fs.chmod(tmp, 0o600);
+  await fs.rename(tmp, path);
+  return path;
+}
+
+/**
+ * Reads the operator token file, trims trailing whitespace. Returns null
+ * if the file doesn't exist (caller decides whether that's an error). Any
+ * other read error propagates.
+ *
+ * On read, checks file permissions. If the file is group- or world-readable
+ * (mode bits 0o077 set), logs a warning but does NOT fail the read — a
+ * read-only failure here would lock operators out of every CLI command,
+ * with no in-CLI way to recover. The warning + remediation hint
+ * (`chmod 0600 <path>`) lets the operator self-correct without losing
+ * access. New writes via `writeOperatorTokenFile` are always 0600.
+ */
+export async function readOperatorTokenFile(dir: string = configDir()): Promise<string | null> {
+  const path = operatorTokenPath(dir);
+  try {
+    const buf = await fs.readFile(path, "utf8");
+    await warnIfWorldReadable(path);
+    const trimmed = buf.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw err;
+  }
+}
+
+async function warnIfWorldReadable(path: string): Promise<void> {
+  try {
+    const stat = await fs.stat(path);
+    const looseBits = stat.mode & 0o077;
+    if (looseBits !== 0) {
+      const mode = (stat.mode & 0o777).toString(8).padStart(4, "0");
+      console.error(
+        `parachute: operator token file at ${path} has mode ${mode} (group/other can read it). Run \`chmod 0600 ${path}\` to lock it down.`,
+      );
+    }
+  } catch {
+    // If stat fails (file vanished between read and stat, or platform
+    // doesn't expose mode bits), skip the warning — the read already
+    // succeeded, and this is defense-in-depth, not a hard gate.
+  }
+}
+
+export interface IssueOperatorTokenResult {
+  token: string;
+  jti: string;
+  expiresAt: string;
+  path: string;
+  scopeSet: OperatorScopeSet;
+}
+
+/**
+ * Mint + write in one call. Used by `parachute auth set-password` (after
+ * password set), `parachute auth rotate-operator`, and the auto-rotation
+ * path inside `useOperatorTokenWithAutoRotate`.
+ */
+export async function issueOperatorToken(
+  db: Database,
+  userId: string,
+  opts: MintOperatorTokenOpts & { dir?: string },
+): Promise<IssueOperatorTokenResult> {
+  const minted = await mintOperatorToken(db, userId, opts);
+  const path = await writeOperatorTokenFile(minted.token, opts.dir);
+  return { ...minted, path };
+}
+
+export class OperatorTokenExpiredError extends Error {
+  override name = "OperatorTokenExpiredError";
+}
+
+export interface UseOperatorTokenOpts {
+  /**
+   * Hub origin the caller resolved. Required. As of hub#516 this is a SEED of
+   * the known-issuer SET the token's `iss` is validated against
+   * ({@link buildKnownIssuersForOperatorToken}), not the sole `iss` validator —
+   * so a caller that resolves loopback (`status`) still accepts a public-`iss`
+   * operator token from `expose-state.json`, and vice versa. It also remains
+   * the `iss` stamped on an auto-rotated re-mint.
+   */
+  issuer: string;
+  /** configDir override (where operator.token lives). Defaults to `configDir()`. */
+  configDir?: string;
+  /**
+   * Override the rotation clock. Tests pin this; production uses
+   * `() => new Date()`.
+   */
+  now?: () => Date;
+}
+
+/**
+ * Disambiguated outcome of `useOperatorTokenWithAutoRotate`. The prior
+ * surface (boolean `refreshed`) conflated three operationally distinct
+ * cases under a single `false` value: (a) token is fresh, no rotation
+ * needed; (b) within rotation window but rotation skipped due to
+ * privilege guard; (c) within rotation window but rotation skipped due
+ * to missing sub claim. This shape surfaces each case so future
+ * rotation telemetry / admin UI can branch on them. See hub#216 for the
+ * motivation; hub#212 Phase 2 is the natural consumer.
+ *
+ * - `fresh` — remaining lifetime above the auto-rotation threshold;
+ *   the token on disk was returned as-is. The healthy steady state.
+ * - `rotated` — rotation fired; the on-disk token was overwritten.
+ *   `rotated` companion field on `UsedOperatorToken` carries the new
+ *   path / scopeSet / expiry.
+ * - `skipped` — within rotation window, but rotation was deliberately
+ *   not performed. `reason` distinguishes:
+ *     - `aud-mismatch`: the on-disk JWT carries a non-operator audience.
+ *       This is the privilege-escalation guard (a hand-stashed scope-narrow
+ *       JWT must not be silently upgraded). See operator-token.ts line ~360.
+ *     - `no-sub`: the on-disk JWT lacks a `sub` claim, so the helper can't
+ *       safely re-mint (don't know who the token belongs to). Surfaced via
+ *       the caller's downstream invalid-token error path.
+ *     - `no-scope-set`: the on-disk JWT carries `aud: operator` but lacks
+ *       (or has an unrecognized) `pa_scope_set` claim. Refusing to rotate
+ *       here is hub#224's hardening: the prior behaviour fell back to the
+ *       default scope-set (admin) on rotation, which silently widened a
+ *       narrow-scope token of unknown provenance. Legitimately-issued
+ *       operator tokens always carry a recognized `pa_scope_set` (set by
+ *       `issueOperatorToken`); a token without it is either a hand-crafted
+ *       JWT (don't widen) or a pre-#213 legacy token (operator should
+ *       explicitly `parachute auth rotate-operator` to recover).
+ *     - `sub-not-user`: `sub` is present but is not a `users` row (the old
+ *       `"operator"` sentinel, or a deleted user). `mintOperatorToken` is a
+ *       person-mint as of hub#833 and throws `TokenMintPrincipalGoneError`
+ *       for those; catching it here keeps auto-rotate fail-closed without
+ *       turning a legacy file into a CLI exception. Recover via explicit
+ *       `parachute auth rotate-operator` against a real users row.
+ */
+export type RotationStatus =
+  | { kind: "fresh" }
+  | { kind: "rotated" }
+  | {
+      kind: "skipped";
+      reason: "aud-mismatch" | "no-sub" | "no-scope-set" | "sub-not-user";
+    };
+
+export interface UsedOperatorToken {
+  /** The operator token plaintext to present as bearer. After auto-rotation, this is the freshly-minted token. */
+  token: string;
+  /** Validated payload of `token` (post-rotation if a rotation occurred). */
+  payload: Awaited<ReturnType<typeof validateAccessToken>>["payload"];
+  /** Set when this call rotated the on-disk token. The new path on disk. */
+  rotated?: { path: string; scopeSet: OperatorScopeSet; expiresAt: string };
+  /**
+   * Disambiguated rotation outcome. See {@link RotationStatus}. Callers that
+   * only need "did the token rotate?" can check `status.kind === "rotated"`
+   * or the presence of the `rotated` companion field (equivalent). Future
+   * telemetry / admin UI can branch on `skipped.reason` to surface why a
+   * rotation didn't fire.
+   */
+  status: RotationStatus;
+}
+
+/**
+ * Compose the Fly.io default public origin from `FLY_APP_NAME`, mirroring the
+ * server-side `flyDefaultOrigin` (hub-server.ts) so the client-side
+ * known-issuer set matches the origin the hub stamps tokens with on Fly. Kept
+ * local (a one-liner) rather than imported to avoid pulling hub-server.ts /
+ * serve.ts into the CLI auth path. Fly slugs never contain `/`; anything with
+ * one is spoofed or malformed.
+ */
+function flyDefaultOrigin(env: NodeJS.ProcessEnv): string | undefined {
+  const app = env.FLY_APP_NAME;
+  if (typeof app !== "string" || app.length === 0 || app.includes("/")) return undefined;
+  return `https://${app}.fly.dev`;
+}
+
+/**
+ * Assemble the SET of origins this hub legitimately answers on, from on-disk
+ * client state — the client-side mirror of hub-server.ts's per-request
+ * `buildHubBoundOrigins` call (hub#516). The operator token's `iss` is
+ * validated against this set rather than a single issuer, so a token whose
+ * `iss` is the hub's PUBLIC origin (stamped after `parachute expose`) is
+ * accepted even when the CLI command resolved a loopback `issuer` (the
+ * `status` case) — and vice versa.
+ *
+ * The set is:
+ *   - `seedIssuer` — the issuer the caller resolved (loopback for `status`,
+ *     `r.hubOrigin` / public for lifecycle). Kept as a seed so callers that
+ *     pass a value still contribute it; never the sole gate.
+ *   - loopback aliases — `http://127.0.0.1:<port>` AND `http://localhost:<port>`
+ *     for the hub's port (`readHubPort(configDir) ?? HUB_UNIT_DEFAULT_PORT`),
+ *     matching the hub's own loopback alias set (`buildHubBoundOrigins`).
+ *   - the expose-state public origin — `expose-state.json`'s `hubOrigin`, the
+ *     public URL the hub stamps on tokens once exposed.
+ *   - the platform/env public origin — `PARACHUTE_HUB_ORIGIN` ∪
+ *     `RENDER_EXTERNAL_URL` ∪ the composed Fly default — for container deploys
+ *     where the public origin comes from the platform, not expose-state.
+ *
+ * Provenance is NOT established here: `validateHostAdminToken` runs the JWKS
+ * signature check FIRST and unconditionally. This set is the belt-and-suspenders
+ * `iss` allowlist layered on top — a foreign `iss` (not loopback / expose /
+ * env) is rejected, and an empty set fails closed.
+ */
+export function buildKnownIssuersForOperatorToken(
+  configDirOverride: string | undefined,
+  seedIssuer: string,
+): readonly string[] {
+  const dir = configDirOverride ?? configDir();
+  const loopbackPort = readHubPort(dir) ?? HUB_UNIT_DEFAULT_PORT;
+  let exposeHubOrigin: string | undefined;
+  try {
+    exposeHubOrigin = readExposeState(join(dir, "expose-state.json"))?.hubOrigin;
+  } catch {
+    // A malformed expose-state.json must never lock the operator out of the
+    // CLI — the seed issuer + loopback aliases already cover legitimate
+    // loopback access; treat it as "no public origin known."
+    exposeHubOrigin = undefined;
+  }
+  const platformOrigin =
+    process.env.PARACHUTE_HUB_ORIGIN ??
+    process.env.RENDER_EXTERNAL_URL ??
+    flyDefaultOrigin(process.env);
+  return buildHubBoundOrigins({
+    issuer: seedIssuer,
+    loopbackPort,
+    ...(exposeHubOrigin !== undefined ? { exposeHubOrigin } : {}),
+    ...(platformOrigin !== undefined ? { platformOrigin } : {}),
+  });
+}
+
+/**
+ * The canonical "use the operator token in a CLI flow" helper. Reads
+ * `~/.parachute/operator.token`, validates against `db` + the hub's
+ * known-issuer SET, and:
+ *
+ *   - If the token has fully expired: throws `OperatorTokenExpiredError`
+ *     with an actionable message. Does NOT auto-rotate from a dead token —
+ *     auto-rotating an expired token would defeat the lifetime cap.
+ *   - If the remaining lifetime is below the auto-rotate threshold (7d):
+ *     re-mints under the same scope-set, writes back to disk, and returns
+ *     the new token. Operator never sees an expiry surprise as long as
+ *     they exercise the CLI at least weekly.
+ *   - Otherwise: returns the original token + payload.
+ *
+ * Callers receive the (possibly fresh) token to present onward. The
+ * scope-set is preserved across rotations via the `pa_scope_set` claim;
+ * tokens that lack a recognized `pa_scope_set` claim are NOT auto-rotated
+ * (hub#224 hardening — the prior fallback to the default scope-set
+ * silently widened narrow-scope tokens of unknown provenance). Operators
+ * holding a legacy token without the claim should `parachute auth
+ * rotate-operator` to recover.
+ *
+ * ## Test-author note (hub#224)
+ *
+ * Tests that stash a JWT at `~/.parachute/operator.token` to exercise
+ * downstream gate-check behaviour need to side-step auto-rotation, or
+ * the helper will silently swap the test's narrow token for a fresh
+ * admin one before the gate runs. Two safe shapes:
+ *
+ *   1. **Long TTL.** Mint with `ttlSeconds: 30 * 24 * 60 * 60` (30d) so
+ *      `remaining > OPERATOR_TOKEN_AUTO_ROTATE_THRESHOLD_SECONDS` and the
+ *      helper returns the token as-is (`status.kind === "fresh"`). This
+ *      is the pattern in `bootstrapWithOperatorScopes` (hub#222 tests).
+ *   2. **Non-operator audience.** Sign with `audience: "scribe"` (or any
+ *      non-`"operator"` value) so the line ~398 guard fires
+ *      (`status.kind === "skipped"`, `reason: "aud-mismatch"`). This is
+ *      the pattern in the pre-#222 narrow-rejection test.
+ *
+ * `aud: "operator"` + short TTL + recognized `pa_scope_set` is the
+ * auto-rotation path. `aud: "operator"` + short TTL + missing/invalid
+ * `pa_scope_set` lands on the no-scope-set skip (hub#224). Either way,
+ * if you're seeing a "narrow token magically became admin," check
+ * the test's `audience` + TTL first.
+ */
+export async function useOperatorTokenWithAutoRotate(
+  db: Database,
+  opts: UseOperatorTokenOpts,
+): Promise<UsedOperatorToken | null> {
+  const dir = opts.configDir ?? configDir();
+  const token = await readOperatorTokenFile(dir);
+  if (!token) return null;
+  const now = opts.now ?? (() => new Date());
+
+  // Validate against the hub's KNOWN-ISSUER SET, not a single `opts.issuer`
+  // (hub#516). The operator token is the hub's OWN self-issued credential; its
+  // `iss` is the hub's loopback origin before `expose` and its PUBLIC origin
+  // after. Callers resolve `opts.issuer` inconsistently — `status` hardcodes
+  // loopback, lifecycle uses `r.hubOrigin` (public when exposed) — so a single
+  // per-issuer check rejected the public-`iss` operator token on `status` even
+  // though `restart` worked. `validateHostAdminToken` (the #517 helper) gates
+  // on the JWKS SIGNATURE first+unconditionally (provenance), then accepts the
+  // `iss` if it's ANY origin the hub legitimately answers on. Validation
+  // failures (signature mismatch, missing kid, expired-by-jose, revoked, or an
+  // `iss` foreign to the whole set) bubble out for the caller to render.
+  const knownIssuers = buildKnownIssuersForOperatorToken(opts.configDir, opts.issuer);
+  const validated = await validateHostAdminToken(db, token, knownIssuers);
+  const { payload } = validated;
+
+  const exp = typeof payload.exp === "number" ? payload.exp : 0;
+  const nowSec = Math.floor(now().getTime() / 1000);
+  const remaining = exp - nowSec;
+
+  // jose's verify will reject expired tokens before we get here, so this
+  // branch is defensive; callers that catch validateAccessToken errors and
+  // re-call this with a hand-rolled payload would land here.
+  if (remaining <= 0) {
+    throw new OperatorTokenExpiredError(
+      "your operator token has expired; run `parachute auth rotate-operator` to re-mint",
+    );
+  }
+
+  if (remaining > OPERATOR_TOKEN_AUTO_ROTATE_THRESHOLD_SECONDS) {
+    return { token, payload, status: { kind: "fresh" } };
+  }
+
+  // Within rotation window — but only auto-rotate if this is genuinely an
+  // operator token. The audience check is the privilege-escalation guard:
+  // an arbitrary scope-narrow JWT (aud: "scribe", "vault", …) hand-stashed
+  // at ~/.parachute/operator.token must NOT be silently upgraded to a full
+  // operator token by the hub. Legitimate operator-tokens minted via
+  // `set-password` / `rotate-operator` carry `aud: "operator"`.
+  if (payload.aud !== OPERATOR_TOKEN_AUDIENCE) {
+    return { token, payload, status: { kind: "skipped", reason: "aud-mismatch" } };
+  }
+
+  // Re-mint preserving scope-set.
+  const sub = typeof payload.sub === "string" ? payload.sub : null;
+  if (!sub) {
+    // No sub claim — can't safely auto-rotate (don't know who the token
+    // belongs to). Return as-is; the caller will likely surface this as an
+    // invalid-token error downstream.
+    return { token, payload, status: { kind: "skipped", reason: "no-sub" } };
+  }
+  // Refuse to auto-rotate without a recognized scope-set claim. The prior
+  // behaviour fell back to OPERATOR_TOKEN_DEFAULT_SCOPE_SET (admin), which
+  // silently widened a narrow `aud: "operator"` token of unknown provenance
+  // — hand-crafted or pre-#213 legacy. hub#224's hardening: a missing or
+  // invalid `pa_scope_set` means "I don't know what scope to re-mint under,"
+  // so don't re-mint at all. The operator can recover via an explicit
+  // `parachute auth rotate-operator` (which always sets the claim).
+  const claimedSet = payload[OPERATOR_TOKEN_SCOPE_SET_CLAIM];
+  if (!isOperatorScopeSet(claimedSet)) {
+    return { token, payload, status: { kind: "skipped", reason: "no-scope-set" } };
+  }
+  const scopeSet: OperatorScopeSet = claimedSet;
+  let issued: IssueOperatorTokenResult;
+  try {
+    issued = await issueOperatorToken(db, sub, {
+      dir,
+      issuer: opts.issuer,
+      scopeSet,
+      now: opts.now,
+    });
+  } catch (err) {
+    // Person-mint as of hub#833: a legacy `"operator"` sentinel or a
+    // deleted-user `sub` is not a users row. Skip rather than throw so
+    // callers (expose-supervisor, CLI try-wraps) can log `skipped:
+    // sub-not-user` instead of treating this as a crash.
+    if (err instanceof TokenMintPrincipalGoneError) {
+      return { token, payload, status: { kind: "skipped", reason: "sub-not-user" } };
+    }
+    throw err;
+  }
+  const reValidated = await validateAccessToken(db, issued.token, opts.issuer);
+  return {
+    token: issued.token,
+    payload: reValidated.payload,
+    rotated: { path: issued.path, scopeSet: issued.scopeSet, expiresAt: issued.expiresAt },
+    status: { kind: "rotated" },
+  };
+}
+
+export interface SelfHealOperatorTokenOpts {
+  /**
+   * The hub's CURRENT issuer (its public origin once exposed). The stale
+   * on-disk token is re-minted under this value. Must be the resolved hub
+   * origin, never a raw flag — callers pass `r.hubOrigin` from lifecycle.
+   */
+  issuer: string;
+  /** configDir override (where operator.token lives). Defaults to `configDir()`. */
+  configDir?: string;
+  /** Operator-facing log sink. Defaults to a no-op (silent). */
+  log?: (line: string) => void;
+  /** Override the JWT-sign clock — tests pin time. Forwarded to `issueOperatorToken`. */
+  now?: () => Date;
+}
+
+/**
+ * Disambiguated outcome of {@link selfHealOperatorTokenIssuer}. Modelled on
+ * {@link RotationStatus} — a small discriminated union the caller logs and
+ * tests assert.
+ *
+ * - `absent` — no `operator.token` on disk; nothing to heal.
+ * - `fresh` — the token's `iss` already matches the current issuer; the file
+ *   is left byte-identical (no rewrite, no log).
+ * - `rotated` — the token was genuine-but-stale; re-minted under the current
+ *   issuer with the SAME scope-set + sub. `path` / `expiresAt` / `scopeSet`
+ *   describe the freshly-written token.
+ * - `skipped` — a guard fired; the on-disk file is left untouched. `reason`:
+ *     - `unverifiable`: the on-disk token's signature did NOT verify against
+ *       this hub's current keys (bad/unknown/expired kid, jose `exp` failure,
+ *       or a revoked jti). We must NOT resurrect or trust it — the operator
+ *       recovers via `parachute auth rotate-operator`.
+ *     - `aud-mismatch`: the token carries a non-operator audience. A
+ *       hand-stashed scope-narrow JWT must not be silently re-minted as a
+ *       full operator token (parallels the {@link useOperatorTokenWithAutoRotate}
+ *       privilege guard).
+ *     - `no-sub`: the token lacks a `sub` claim, so we can't re-mint (don't
+ *       know who it belongs to).
+ *     - `no-scope-set`: the token lacks (or has an unrecognized) `pa_scope_set`
+ *       claim. Falling back to a default would widen scope (hub#224 hardening);
+ *       refuse instead. Operator recovers via explicit rotate-operator.
+ *     - `sub-not-user`: `sub` is present but is not a `users` row. Same
+ *       person-mint fail-close as auto-rotate (`mintOperatorToken` throws
+ *       `TokenMintPrincipalGoneError`). The on-disk file is left untouched.
+ *     - `issuer-loopback`: the TARGET issuer is loopback. Re-minting to a
+ *       loopback `iss` would downgrade a good public token; never do it.
+ */
+export type OperatorIssuerHealStatus =
+  | { kind: "absent" }
+  | { kind: "fresh" }
+  | { kind: "rotated"; path: string; scopeSet: OperatorScopeSet; expiresAt: string }
+  | {
+      kind: "skipped";
+      reason:
+        | "unverifiable"
+        | "aud-mismatch"
+        | "no-sub"
+        | "no-scope-set"
+        | "sub-not-user"
+        | "issuer-loopback";
+    };
+
+/**
+ * Self-heal the operator token's `iss` when the hub's origin changed after
+ * the token was minted.
+ *
+ * The bug this closes (hub#481, same family as the rc.17 Cloudflare 401 P0):
+ * `parachute init`/setup mints `~/.parachute/operator.token` stamped with the
+ * hub's origin-at-creation-time (`http://127.0.0.1:1939` on a box set up
+ * before exposure). After `parachute expose` brings the hub up on a public
+ * origin, on-box services validate incoming bearers' `iss` against the hub's
+ * CURRENT origin, so the stale-`iss` operator token is rejected on every CLI
+ * auth flow with `bearer token invalid — unexpected "iss" claim value`. That
+ * breaks `vault create`, `mcp-install`, and `/api/auth/mint-token`. The token
+ * is genuine — it just predates the origin change — so re-issuing it under the
+ * current issuer (preserving its scope-set + sub) is the right repair.
+ *
+ * Hooked into `parachute start hub` (parallel to how rc.17 hooked
+ * `selfHealVaultHubOrigin` into `start vault`): existing broken deploys
+ * self-correct on the next `start/restart hub`.
+ *
+ * ## Security invariant (reviewer: verify this holds)
+ *
+ * Re-mint is gated on `validateAccessToken(db, token)` succeeding WITHOUT an
+ * `expectedIssuer` argument — i.e. the on-disk token's SIGNATURE verifies
+ * against THIS hub's current public keys (by kid) and passes jose's `exp`
+ * check and the revocation check, while NOT pinning `iss`. An attacker cannot
+ * forge that signature, so the ONLY tokens that can ever be re-minted are ones
+ * this hub itself previously minted. There is no path to mint a token from an
+ * untrusted/forged input. Further:
+ *   - scope-set is preserved verbatim (`payload.pa_scope_set`) — no widening;
+ *   - expired tokens are refused (jose `exp` → `skipped: unverifiable`);
+ *   - revoked tokens are refused (validateAccessToken's revocation check);
+ *   - a non-operator audience is refused (`skipped: aud-mismatch`);
+ *   - a loopback TARGET issuer is refused (`skipped: issuer-loopback`) — never
+ *     downgrade a good public token back to loopback.
+ * This is strictly a re-issue of the hub's own still-valid credential under
+ * the hub's own new issuer.
+ */
+export async function selfHealOperatorTokenIssuer(
+  db: Database,
+  opts: SelfHealOperatorTokenOpts,
+): Promise<OperatorIssuerHealStatus> {
+  const dir = opts.configDir ?? configDir();
+  const token = await readOperatorTokenFile(dir);
+  if (!token) return { kind: "absent" };
+
+  // Target-issuer loopback guard FIRST. Re-minting to a loopback `iss` would
+  // downgrade a good public token to a non-reachable issuer, recreating the
+  // exact iss-mismatch this fix prevents (mirrors `isLoopbackOrigin`'s role in
+  // vault-hub-origin-env.ts). Never do it — bail before touching the token.
+  if (isLoopbackOrigin(opts.issuer)) return { kind: "skipped", reason: "issuer-loopback" };
+
+  // Verify the on-disk token WITHOUT pinning `iss`: this checks the signature
+  // against the hub's current keys (by kid) + jose's `exp` + revocation, but
+  // deliberately does NOT reject a stale issuer. A throw here means the token
+  // is unverifiable (bad/unknown/expired kid, expired-by-jose, revoked) — we
+  // must NOT resurrect or trust it. Leave the disk file untouched; the operator
+  // recovers via `parachute auth rotate-operator`.
+  let payload: Awaited<ReturnType<typeof validateAccessToken>>["payload"];
+  try {
+    ({ payload } = await validateAccessToken(db, token));
+  } catch {
+    return { kind: "skipped", reason: "unverifiable" };
+  }
+
+  // `iss` already current → no-op. Do NOT rewrite the file; it must stay
+  // byte-identical so repeated `start hub`s don't churn it.
+  if (payload.iss === opts.issuer) return { kind: "fresh" };
+
+  // `iss` differs → genuine-but-stale. Apply the same provenance guards
+  // `useOperatorTokenWithAutoRotate` uses before re-minting.
+  if (payload.aud !== OPERATOR_TOKEN_AUDIENCE) {
+    return { kind: "skipped", reason: "aud-mismatch" };
+  }
+  const sub = typeof payload.sub === "string" && payload.sub.length > 0 ? payload.sub : null;
+  if (!sub) return { kind: "skipped", reason: "no-sub" };
+  const claimedSet = payload[OPERATOR_TOKEN_SCOPE_SET_CLAIM];
+  if (!isOperatorScopeSet(claimedSet)) {
+    // No recognized scope-set → falling back to a default would widen scope
+    // (hub#224). Refuse; never widen.
+    return { kind: "skipped", reason: "no-scope-set" };
+  }
+
+  // Re-mint preserving scope-set + sub. `issueOperatorToken` writes the new
+  // token to disk atomically (mint → writeOperatorTokenFile).
+  let issued: IssueOperatorTokenResult;
+  try {
+    issued = await issueOperatorToken(db, sub, {
+      dir,
+      issuer: opts.issuer,
+      scopeSet: claimedSet,
+      ...(opts.now !== undefined ? { now: opts.now } : {}),
+    });
+  } catch (err) {
+    if (err instanceof TokenMintPrincipalGoneError) {
+      return { kind: "skipped", reason: "sub-not-user" };
+    }
+    throw err;
+  }
+  return {
+    kind: "rotated",
+    path: issued.path,
+    scopeSet: issued.scopeSet,
+    expiresAt: issued.expiresAt,
+  };
+}

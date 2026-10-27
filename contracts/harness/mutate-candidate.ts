@@ -1,21 +1,18 @@
 // `bun run mutants:candidate`: mutants and flips applied to the candidate's source, then the candidate rebuilt
 // (PLAN §7.2: "mutants are applied to the candidate's source, then the candidate is rebuilt").
 //
-// For each entry: check the pinned repo out into a temp git worktree, apply the one change, build a candidate from
-// it (harness/build-stock-candidate.ts, the other repo at its pin), run the named suite against that candidate with
-// `bun run candidate`, and require
+// For each entry: build the core candidate (harness/build-core-candidate.ts) from this repo's working tree with the
+// one change applied to packages/<repo>/ (vault or hub, moved in by lane A1), run the named suite against that
+// candidate with `bun run candidate`, and require
 //   - a mutant: every contract in `catches` red;
 //   - a flip:   every red() contract in `catches` reporting "now green" (the fix makes it pass).
-// When lane A1 replaces the stock build, this file builds from this repo's packages/ instead.
 //
 //   bun run mutants:candidate [name ...]     all of MUTANTS, CANDIDATE_MUTANTS and FLIPS, or only those named
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { ensureRepos } from "./services.ts";
-import { buildStockCandidate } from "./build-stock-candidate.ts";
+import { buildCoreCandidate, stageWorkspace } from "./build-core-candidate.ts";
 import { CANDIDATE_MUTANTS, FLIPS, MUTANTS, type Mutant } from "./mutants.ts";
-import pins from "../pins.json";
 
 async function run(cmd: string[], opts: { cwd: string; env?: Record<string, string> }) {
   const p = Bun.spawn(cmd, { cwd: opts.cwd, env: { ...process.env, ...opts.env }, stdout: "pipe", stderr: "pipe" });
@@ -35,48 +32,53 @@ if (unknown.length) {
   process.exit(2);
 }
 const contracts = resolve(import.meta.dir, "..");
-const repos = await ensureRepos();
-for (const r of [repos.vault, repos.hub]) await run(["git", "worktree", "prune"], { cwd: r });
-let current: { repo: string; dir: string } | null = null;
+// One snapshot of the workspace for the whole run: every mutant is built from the same source.
+const snapshot = mkdtempSync(join(process.env.TMPDIR ?? tmpdir(), "pcore-cmut-base-"));
+const staged = { dir: join(snapshot, "lib"), rev: await stageWorkspace(resolve(contracts, ".."), join(snapshot, "lib")), installed: true };
+// Installed once, here: each mutant gets a copy of the installed workspace with its one change, so a network blip
+// in a mutant's own install can't stand in for a missed mutant. No mutant may change what install builds.
+{
+  const inst = await run(["bun", "install", "--frozen-lockfile"], { cwd: staged.dir });
+  if (inst.code !== 0) throw new Error(`bun install of the snapshot failed: ${inst.out.slice(-1500)}`);
+}
+console.log(`[mutants:candidate] source ${staged.rev}`);
+let current: string | null = null;
 let child: ReturnType<typeof Bun.spawn> | null = null;
 const cleanup = async () => {
   child?.kill();
   if (child) await child.exited;
-  if (current) {
-    await run(["git", "worktree", "remove", "--force", join(current.dir, "src")], { cwd: current.repo });
-    rmSync(current.dir, { recursive: true, force: true });
-  }
+  if (current) rmSync(current, { recursive: true, force: true });
+  rmSync(snapshot, { recursive: true, force: true });
 };
 process.on("SIGINT", async () => (await cleanup(), process.exit(130)));
 process.on("SIGTERM", async () => (await cleanup(), process.exit(130)));
 
-const results: { name: string; kind: string; ok: boolean }[] = [];
+const results: { name: string; kind: string; ok: boolean; error?: boolean }[] = [];
 for (const m of all.filter((m) => only.length === 0 || only.includes(m.name))) {
   const which = m.repo ?? "vault";
-  const repo = which === "hub" ? repos.hub : repos.vault;
   const dir = mkdtempSync(join(process.env.TMPDIR ?? tmpdir(), `pcore-cmut-${m.name}-`));
-  const tree = join(dir, "src");
-  current = { repo, dir };
+  current = dir;
   let ok = false;
+  let errored = false;
   try {
-    const add = await run(["git", "worktree", "add", "--detach", "--quiet", tree, (pins as any)[which].commit], { cwd: repo });
-    if (add.code !== 0) throw new Error(`git worktree add failed: ${add.out}`);
-    if (m.patch) {
-      const ap = await run(["git", "apply", join(import.meta.dir, m.patch)], { cwd: tree });
-      if (ap.code !== 0) throw new Error(`${m.name}: git apply ${m.patch} failed: ${ap.out}`);
-    } else {
-      const path = join(tree, m.file!);
-      const src = readFileSync(path, "utf8");
-      const hits = src.split(m.find!).length - 1;
-      if (hits !== 1) throw new Error(`${m.name}: expected the target text once in ${which}/${m.file}, found ${hits}`);
-      writeFileSync(path, src.replace(m.find!, m.replace!));
-    }
     const cand = join(dir, "candidate");
-    await buildStockCandidate({
-      out: cand,
-      hubDir: which === "hub" ? tree : repos.hub,
-      vaultDir: which === "vault" ? tree : repos.vault,
-    });
+    // The change goes into the copied workspace, never this checkout: patches and paths are relative to the
+    // package (packages/vault or packages/hub), as they were to today's repos.
+    const apply = async (lib: string) => {
+      const pkg = join(lib, "packages", which);
+      if (m.file?.startsWith("packages/")) throw new Error(`${m.name}: ${which}/${m.file} is built at install (the snapshot is installed once)`);
+      if (m.patch) {
+        const ap = await run(["git", "apply", join(import.meta.dir, m.patch)], { cwd: pkg });
+        if (ap.code !== 0) throw new Error(`${m.name}: git apply ${m.patch} failed: ${ap.out}`);
+      } else {
+        const path = join(pkg, m.file!);
+        const src = readFileSync(path, "utf8");
+        const hits = src.split(m.find!).length - 1;
+        if (hits !== 1) throw new Error(`${m.name}: expected the target text once in packages/${which}/${m.file}, found ${hits}`);
+        writeFileSync(path, src.replace(m.find!, m.replace!));
+      }
+    };
+    await buildCoreCandidate({ out: cand, staged, edit: { label: `${m.kind} ${m.name}`, apply } });
     child = Bun.spawn(["bun", "run", "harness/run-candidate.ts", ...m.suite.split(" ")], {
       cwd: contracts,
       env: { ...process.env, CANDIDATE_DIR: cand, CANDIDATE_SHA256: "", CONTRACT_SHOW_LOGS: "0" },
@@ -104,17 +106,18 @@ for (const m of all.filter((m) => only.length === 0 || only.includes(m.name))) {
     for (const t of red) console.log(`    red: ${t}`);
     if (!ok) console.log(out.slice(-3000));
   } catch (err) {
+    errored = true;
     console.log(`\n[${m.kind} ${m.name}] ERROR ${(err as Error).message}`);
   } finally {
-    await run(["git", "worktree", "remove", "--force", tree], { cwd: repo });
     rmSync(dir, { recursive: true, force: true });
     current = null;
   }
-  results.push({ name: m.name, kind: m.kind, ok });
+  results.push({ name: m.name, kind: m.kind, ok, error: errored });
 }
+rmSync(snapshot, { recursive: true, force: true });
 console.log("");
 const width = Math.max(...results.map((r) => r.name.length));
-for (const r of results) console.log(`[mutants:candidate] ${r.kind.padEnd(6)} ${r.name.padEnd(width)}  ${r.ok ? (r.kind === "flip" ? "flipped" : "caught") : "MISSED"}`);
+for (const r of results) console.log(`[mutants:candidate] ${r.kind.padEnd(6)} ${r.name.padEnd(width)}  ${r.ok ? (r.kind === "flip" ? "flipped" : "caught") : r.error ? "ERROR (not tested)" : "MISSED"}`);
 const missed = results.filter((r) => !r.ok);
 console.log(`[mutants:candidate] ${results.length - missed.length}/${results.length} ok`);
 process.exit(missed.length ? 1 : 0);

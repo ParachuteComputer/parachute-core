@@ -7,6 +7,7 @@
     "today": "bun run harness/run.ts",
     "v1": "bun run harness/run.ts suites/v1",
     "build:stock": "bun run harness/build-stock-candidate.ts",
+    "build:core": "bun run harness/build-core-candidate.ts",
     "candidate": "bun run harness/run-candidate.ts",
     "prism-compat": "bun run harness/prism-compat.ts",
     "mutants": "bun run harness/mutate.ts",

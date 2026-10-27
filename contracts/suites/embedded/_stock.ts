@@ -3,7 +3,7 @@
 import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { candidateEnv, loadCandidate, runCli, type CandidateInfo } from "../../harness/candidate.ts";
+import { candidateEnv, loadCandidate, oldStockWant, runCli, type CandidateInfo } from "../../harness/candidate.ts";
 import { allowOrigins, candidate, freePort, safeFetch, until } from "../candidate-lib.ts";
 import { must, stockDir, tail } from "./_lib.ts";
 
@@ -12,7 +12,7 @@ export async function binaries(stock = false): Promise<CandidateInfo> {
   const c = candidate();
   if (!stock) return c;
   const dir = stockDir();
-  const { manifest, sha256 } = await loadCandidate(dir);
+  const { manifest, sha256 } = await loadCandidate(dir, oldStockWant());
   must(manifest.profile === "stock-0.7", `setup: ${dir} is not the stock 0.7 build`);
   return { ...c, dir, bin: `${dir}/bin/parachute`, vaultBin: `${dir}/bin/parachute-vault`, profile: manifest.profile, sha256 };
 }

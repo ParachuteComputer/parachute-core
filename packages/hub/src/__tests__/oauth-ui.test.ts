@@ -1,0 +1,949 @@
+import { describe, expect, test } from "bun:test";
+import {
+  type AuthorizeFormParams,
+  VAULT_PICK_ACCOUNT,
+  escapeHtml,
+  renderApprovePending,
+  renderConsent,
+  renderError,
+  renderHiddenInputs,
+  renderLogin,
+  renderNotFoundPage,
+  renderUnknownClient,
+  substituteVaultDisplay,
+} from "../oauth-ui.ts";
+
+const PARAMS: AuthorizeFormParams = {
+  clientId: "client-abc",
+  redirectUri: "https://app.example/cb",
+  responseType: "code",
+  scope: "vault:read vault:admin",
+  codeChallenge: "ch",
+  codeChallengeMethod: "S256",
+  state: "xyz",
+  resource: null,
+};
+
+const CSRF = "csrf-token-fixture";
+
+describe("escapeHtml", () => {
+  test("escapes the five HTML metacharacters", () => {
+    expect(escapeHtml(`<script>alert("x&y'z")</script>`)).toBe(
+      "&lt;script&gt;alert(&quot;x&amp;y&#39;z&quot;)&lt;/script&gt;",
+    );
+  });
+});
+
+describe("renderHiddenInputs", () => {
+  test("emits one hidden input per non-state field, plus state when present", () => {
+    const html = renderHiddenInputs(PARAMS);
+    expect(html).toContain('name="client_id" value="client-abc"');
+    expect(html).toContain('name="redirect_uri" value="https://app.example/cb"');
+    expect(html).toContain('name="response_type" value="code"');
+    expect(html).toContain('name="scope" value="vault:read vault:admin"');
+    expect(html).toContain('name="code_challenge" value="ch"');
+    expect(html).toContain('name="code_challenge_method" value="S256"');
+    expect(html).toContain('name="state" value="xyz"');
+  });
+
+  test("omits state input when state is null", () => {
+    const html = renderHiddenInputs({ ...PARAMS, state: null });
+    expect(html).not.toContain('name="state"');
+  });
+
+  test("escapes hostile values into hidden inputs", () => {
+    const html = renderHiddenInputs({
+      ...PARAMS,
+      state: `"><script>alert(1)</script>`,
+      // RFC 8707 resource is round-tripped through a hidden input too, so a
+      // hostile value must be escaped the same way.
+      resource: `"><script>alert(2)</script>`,
+    });
+    expect(html).not.toContain("<script>alert(1)</script>");
+    expect(html).not.toContain("<script>alert(2)</script>");
+    expect(html).toContain("&lt;script&gt;");
+    // The resource value is emitted as a hidden input (escaped).
+    expect(html).toContain('name="resource"');
+    expect(html).toContain("alert(2)");
+  });
+});
+
+describe("renderLogin", () => {
+  test("contains form, hidden inputs, and a Sign in submit", () => {
+    const html = renderLogin({ params: PARAMS, csrfToken: CSRF });
+    expect(html).toContain('action="/oauth/authorize"');
+    expect(html).toContain('name="__action" value="login"');
+    expect(html).toContain('name="username"');
+    expect(html).toContain('name="password"');
+    expect(html).toContain("Sign in");
+    // Hidden state echoed
+    expect(html).toContain('name="state" value="xyz"');
+    // Brand styling present
+    expect(html).toContain("Parachute");
+  });
+
+  test("renders an error banner when errorMessage is set", () => {
+    const html = renderLogin({ params: PARAMS, csrfToken: CSRF, errorMessage: "bad pw" });
+    expect(html).toContain("error-banner");
+    expect(html).toContain("bad pw");
+  });
+
+  test("escapes the error message", () => {
+    const html = renderLogin({
+      params: PARAMS,
+      csrfToken: CSRF,
+      errorMessage: "<script>x</script>",
+    });
+    expect(html).not.toContain("<script>x</script>");
+    expect(html).toContain("&lt;script&gt;");
+  });
+});
+
+describe("renderConsent", () => {
+  test("shows client name, client_id, and a row per scope", () => {
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "client-abc",
+      clientName: "MyApp",
+      scopes: ["vault:read", "vault:admin"],
+    });
+    // Page h1: "Approve <client>?" per design-system.md §5 verb canon
+    // (Workstream I, 2026-05-25 — was "Authorize <client>?").
+    expect(html).toContain("Approve");
+    expect(html).toContain("MyApp");
+    expect(html).toContain("client-abc");
+    expect(html).toContain("vault:read");
+    expect(html).toContain("vault:admin");
+    // Scope explanations from the registry
+    expect(html).toContain("Read your notes");
+    // hub#689 Leg 1: the admin label enumerates the concrete grants — and
+    // leads with tag-schema management, which is the most common legitimate
+    // reason an MCP client needs admin at all.
+    expect(html).toContain("Read and write everything, plus");
+    expect(html).toMatch(/manage the tag schema/i);
+  });
+
+  test("highlights admin scopes with a danger color and badge", () => {
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:admin"],
+    });
+    expect(html).toContain("scope-admin");
+    expect(html).toContain("badge-admin");
+  });
+
+  test("renders unknown scopes verbatim with a muted explanation", () => {
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["mystery.module:do-thing"],
+    });
+    expect(html).toContain("scope-unknown");
+    expect(html).toContain("mystery.module:do-thing");
+    expect(html).toContain("no built-in description");
+    // Unknown is UNASSESSED, not low. `forcesExplicitConsent` fails closed on a
+    // scope with no explanation, so the row the user reads must carry the same
+    // posture the gate does rather than presenting it as ordinary.
+    expect(html).toContain("risk-elevated");
+  });
+
+  // An `elevated` `account:*` scope used to render indistinguishably from
+  // `vault:<name>:write` — same `write` badge, and the consequence line fired
+  // only at `high`. One reaches a single vault; the other reaches every vault
+  // in the account. The words have to say which.
+  test("account:self:write gets the account-wide consequence line; vault:work:write does not", () => {
+    const accountHtml = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["account:self:write"],
+    });
+    expect(accountHtml).toContain("Account-wide.");
+    expect(accountHtml).toContain("every vault in this account");
+    // But it must NOT borrow the high tier's warning: the write tier's own
+    // label promises it cannot mint credentials that outlive the app's access.
+    expect(accountHtml).not.toContain("keep working even after you disconnect");
+    // Danger red stays reserved for `high`, so red keeps meaning one thing.
+    // (Assert on the rendered BADGE, not the class name — the stylesheet
+    // inlines a `.badge-danger` rule on every page.)
+    expect(accountHtml).not.toContain(`badge-danger">account-wide`);
+
+    const vaultHtml = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:work:write"],
+    });
+    expect(vaultHtml).not.toContain("Account-wide.");
+  });
+
+  test("account:self:admin keeps the high-risk account-wide warning and danger badge", () => {
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["account:self:admin"],
+    });
+    expect(html).toContain("Account-wide.");
+    expect(html).toContain("keep working even after you disconnect");
+    expect(html).toContain(`badge-danger">account-wide`);
+  });
+
+  test("an unknown grantable extra is offered as elevated, not low", () => {
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:read"],
+      grantableExtras: ["mystery.module:do-thing"],
+    });
+    expect(html).toContain("mystery.module:do-thing");
+    expect(html).toContain("risk-elevated extra-scope");
+    expect(html).not.toContain("risk-low extra-scope");
+  });
+
+  test("a no-scope request says the token would do nothing, and points at the picker", () => {
+    // A client may legally omit `scope` (RFC 6749 §3.3) and MCP clients often
+    // do. This used to read "the app gets a session token only", which
+    // described a ZERO-SCOPE token as though it were a normal outcome — the
+    // user approved, got a credential, and nothing worked.
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: [],
+    });
+    expect(html).toContain("scope-empty");
+    expect(html).toMatch(/won't be able to do anything/i);
+  });
+
+  test("a no-scope request opens the additional-access picker by default", () => {
+    // When the client asked for nothing, the checklist is the ONLY path to a
+    // working token — so it starts expanded rather than collapsed.
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: [],
+      grantableExtras: ["vault:read", "account:self:admin"],
+    });
+    expect(html).toMatch(/<details class="extras" open/);
+    expect(html).toContain('name="extra_scope"');
+  });
+
+  test("extras are COLLAPSED and never pre-checked when the client did request scopes", () => {
+    // Pre-ticking a permission isn't consent, and the section exists mainly to
+    // make high-risk scopes reachable — so nothing is selected for the user.
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:read"],
+      grantableExtras: ["vault:admin", "account:self:admin"],
+    });
+    expect(html).toContain('<details class="extras" >');
+    expect(html).not.toMatch(/name="extra_scope"[^>]*checked/);
+  });
+
+  test("a high-risk extra carries its consequence, not just a colour", () => {
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:read"],
+      grantableExtras: ["account:self:admin"],
+    });
+    expect(html).toContain("risk-high");
+    expect(html).toMatch(/keep working even after you disconnect/i);
+  });
+
+  test("no grantable extras → no section at all", () => {
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:read"],
+      grantableExtras: [],
+    });
+    expect(html).not.toContain('class="extras"');
+  });
+
+  test("includes Approve and Deny buttons posting __action=consent", () => {
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: [],
+    });
+    expect(html).toContain('name="__action" value="consent"');
+    expect(html).toContain('name="approve" value="yes"');
+    expect(html).toContain('name="approve" value="no"');
+  });
+
+  test("escapes a hostile client name", () => {
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "<img src=x onerror=alert(1)>",
+      scopes: [],
+    });
+    expect(html).not.toContain("<img src=x");
+    expect(html).toContain("&lt;img");
+  });
+
+  test("renders a vault picker when vaultPicker is set", () => {
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:read"],
+      vaultPicker: { unnamedVerbs: ["read"], availableVaults: ["work", "personal"] },
+    });
+    expect(html).toContain("Pick a vault");
+    expect(html).toContain('name="vault_pick" value="work"');
+    expect(html).toContain('name="vault_pick" value="personal"');
+    expect(html).toContain(`name="vault_pick" value="${VAULT_PICK_ACCOUNT}"`);
+    // Whole-account is the free-picker default, not the first vault.
+    expect(html).toMatch(new RegExp(`name="vault_pick" value="${VAULT_PICK_ACCOUNT}" checked`));
+    expect(html).not.toMatch(/name="vault_pick" value="work" checked/);
+  });
+
+  test("escapes a hostile vault name in the picker", () => {
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:read"],
+      vaultPicker: {
+        unnamedVerbs: ["read"],
+        availableVaults: [`evil"><script>alert(1)</script>`],
+      },
+    });
+    expect(html).not.toContain("<script>alert(1)</script>");
+    expect(html).toContain("&quot;&gt;&lt;script&gt;");
+  });
+
+  test("disables the Approve button when no vaults exist", () => {
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:read"],
+      vaultPicker: { unnamedVerbs: ["read"], availableVaults: [] },
+    });
+    expect(html).toContain("no vaults exist");
+    expect(html).toContain('value="yes" class="btn btn-primary" disabled');
+  });
+
+  test("disables Approve + shows copy when user can't authorize (hub#431)", () => {
+    const html = renderConsent({
+      params: { ...PARAMS, scope: "vault:work:read" },
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:work:read"],
+      userCanAuthorizeRequest: false,
+    });
+    expect(html).toContain("You have no assigned vaults");
+    expect(html).toContain("ask the hub admin".replace("ask", "Ask"));
+    expect(html).toContain('value="yes" class="btn btn-primary" disabled');
+  });
+
+  test("leaves Approve enabled when userCanAuthorizeRequest is true (hub#431)", () => {
+    const html = renderConsent({
+      params: { ...PARAMS, scope: "vault:work:read" },
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:work:read"],
+      userCanAuthorizeRequest: true,
+    });
+    expect(html).not.toContain("You have no assigned vaults");
+    expect(html).not.toContain('value="yes" class="btn btn-primary" disabled');
+  });
+
+  test("never renders the retired verb selector", () => {
+    const html = renderConsent({
+      params: { ...PARAMS, scope: "vault:read" },
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:read"],
+      vaultPicker: { unnamedVerbs: ["read"], availableVaults: ["work"], lockedVault: "work" },
+    });
+    expect(html.match(/name="verb_select"/g) ?? []).toHaveLength(0);
+  });
+
+  test("locked picker defaults to the assigned vault and offers whole-account", () => {
+    const html = renderConsent({
+      params: { ...PARAMS, scope: "vault:read" },
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:read"],
+      vaultPicker: { unnamedVerbs: ["read"], availableVaults: ["work"], lockedVault: "work" },
+    });
+    expect(html).toMatch(/name="vault_pick" value="work" checked/);
+    expect(html).toContain(`name="vault_pick" value="${VAULT_PICK_ACCOUNT}"`);
+    expect(html).toContain("All assigned vaults");
+    expect(html).not.toContain('<input type="hidden" name="vault_pick"');
+    expect(VAULT_PICK_ACCOUNT).toContain(":");
+  });
+
+  // hub#314 — same-hub vs external trust marker. The `.badge-trust-*` class
+  // names are always present in the inlined <style> block, so assertions target
+  // the RENDERED ELEMENT form (`class="badge badge-trust-*"`) + the copy text,
+  // which only appear in the consent body when the marker actually renders.
+  test("renders the first-party trust marker for a same-hub client", () => {
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:read"],
+      sameHub: true,
+    });
+    expect(html).toContain('class="badge badge-trust-same-hub"');
+    expect(html).toContain(">First-party<");
+    expect(html).toContain("Registered through this hub");
+    // The external badge / copy must NOT appear for a same-hub client.
+    expect(html).not.toContain('class="badge badge-trust-external"');
+    expect(html).not.toContain("third-party app that registered itself");
+  });
+
+  test("renders the external trust marker for a third-party DCR client", () => {
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:read"],
+      sameHub: false,
+    });
+    expect(html).toContain('class="badge badge-trust-external"');
+    expect(html).toContain(">External<");
+    expect(html).toContain("third-party app that registered itself");
+    // The first-party badge / copy must NOT appear for an external client.
+    expect(html).not.toContain('class="badge badge-trust-same-hub"');
+    expect(html).not.toContain("Registered through this hub");
+  });
+
+  test("renders no trust marker when provenance is unknown (sameHub omitted)", () => {
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:read"],
+      // sameHub omitted → undefined → no badge
+    });
+    expect(html).not.toContain('class="trust-marker');
+    expect(html).not.toContain('class="badge badge-trust-same-hub"');
+    expect(html).not.toContain('class="badge badge-trust-external"');
+  });
+});
+
+describe("renderError", () => {
+  test("renders a card with title and message", () => {
+    const html = renderError({ title: "Boom", message: "something blew up", status: 400 });
+    expect(html).toContain("Boom");
+    expect(html).toContain("something blew up");
+    expect(html).toContain('class="card"');
+    // Brand mark visible so the user knows where they are
+    expect(html).toContain("Parachute");
+  });
+
+  test("escapes hostile title + message", () => {
+    const html = renderError({
+      title: "<script>1</script>",
+      message: '"><img>',
+      status: 400,
+    });
+    expect(html).not.toContain("<script>1</script>");
+    expect(html).not.toContain('"><img>');
+    expect(html).toContain("&lt;script&gt;");
+  });
+});
+
+describe("renderNotFoundPage (closes hub#392)", () => {
+  test("renders a branded full-page HTML doc with a path back to /", () => {
+    const html = renderNotFoundPage("/some-missing-route");
+    expect(html).toStartWith("<!doctype html>");
+    expect(html).toContain("<title>Not found");
+    expect(html).toContain("Not found");
+    // Brand mark — the operator sees this is a Parachute page, not just a generic 404
+    expect(html).toContain("pc-brand-mark-clip-not-found");
+    expect(html).toContain("Parachute");
+    // The CTA back to hub home
+    expect(html).toContain('href="/"');
+    expect(html).toContain("Go to hub home");
+  });
+
+  test("echoes + escapes the requested pathname in the message", () => {
+    const html = renderNotFoundPage("/this-page-does-not-exist");
+    expect(html).toContain("/this-page-does-not-exist");
+  });
+
+  test("escapes hostile pathnames", () => {
+    const html = renderNotFoundPage('/"><script>alert(1)</script>');
+    expect(html).not.toContain('"><script>alert(1)</script>');
+    expect(html).toContain("&lt;script&gt;");
+  });
+});
+
+describe("renderUnknownClient", () => {
+  test("escapes the client_id into the page", () => {
+    const html = renderUnknownClient({
+      clientId: "<img src=x>",
+      selfOriginRedirectPath: null,
+    });
+    expect(html).toContain("&lt;img src=x&gt;");
+    expect(html).not.toContain("<img src=x>");
+  });
+
+  test("renders the recovery button when selfOriginRedirectPath is set", () => {
+    const html = renderUnknownClient({
+      clientId: "stale-id",
+      selfOriginRedirectPath: "/notes/oauth/callback",
+    });
+    expect(html).toContain('id="unknown-client-reset"');
+    expect(html).toContain('data-target="/notes/oauth/callback"');
+    // The inline JS clears the Notes-side DCR cache prefix.
+    expect(html).toContain("'lens:dcr:'");
+  });
+
+  test("escapes selfOriginRedirectPath into the data-target attribute", () => {
+    const html = renderUnknownClient({
+      clientId: "id",
+      selfOriginRedirectPath: '/x"><script>alert(1)</script>',
+    });
+    expect(html).not.toContain("><script>alert(1)</script>");
+    expect(html).toContain("&quot;");
+  });
+
+  test("omits the recovery button when selfOriginRedirectPath is null", () => {
+    const html = renderUnknownClient({
+      clientId: "stale-id",
+      selfOriginRedirectPath: null,
+    });
+    expect(html).not.toContain('id="unknown-client-reset"');
+    expect(html).not.toContain("'lens:dcr:'");
+    // Static fallback help text still surfaces.
+    expect(html).toContain("close this window");
+  });
+});
+
+describe("substituteVaultDisplay", () => {
+  test("undefined → leaves the scope untouched", () => {
+    expect(substituteVaultDisplay("vault:read", undefined)).toBe("vault:read");
+  });
+
+  test("named vault → substitutes vault:<name>:<verb>", () => {
+    expect(substituteVaultDisplay("vault:read", "work")).toBe("vault:work:read");
+    expect(substituteVaultDisplay("vault:write", "default")).toBe("vault:default:write");
+  });
+
+  test("null → renders a <TBD> placeholder for the consent picker", () => {
+    expect(substituteVaultDisplay("vault:read", null)).toBe("vault:<TBD>:read");
+  });
+
+  test("non-vault scope passes through regardless of displayVault", () => {
+    expect(substituteVaultDisplay("scribe:transcribe", "work")).toBe("scribe:transcribe");
+    expect(substituteVaultDisplay("channel:send", null)).toBe("channel:send");
+  });
+
+  test("already-named vault scope passes through (caller specified the vault)", () => {
+    expect(substituteVaultDisplay("vault:other:read", "work")).toBe("vault:other:read");
+  });
+
+  test("vault admin (vault:admin) gets the same named display as other verbs", () => {
+    expect(substituteVaultDisplay("vault:admin", "work")).toBe("vault:work:admin");
+  });
+
+  test("'*' → renders the wildcard display form (vault:*:<verb>)", () => {
+    // Approve-time rendering: no vault has been picked yet (the consent
+    // picker hasn't run), but rendering the raw `vault:read` form implies
+    // unrestricted full-vault access. The wildcard signals "scope will be
+    // narrowed to a specific vault at consent" — mirrors the SPA's
+    // `/admin/approve-client/<id>` view.
+    expect(substituteVaultDisplay("vault:read", "*")).toBe("vault:*:read");
+    expect(substituteVaultDisplay("vault:write", "*")).toBe("vault:*:write");
+  });
+
+  test("'*' → non-vault scopes still pass through unchanged", () => {
+    expect(substituteVaultDisplay("scribe:transcribe", "*")).toBe("scribe:transcribe");
+    expect(substituteVaultDisplay("channel:send", "*")).toBe("channel:send");
+  });
+
+  test("'*' → already-named vault scopes pass through (caller specified the vault)", () => {
+    expect(substituteVaultDisplay("vault:work:read", "*")).toBe("vault:work:read");
+    expect(substituteVaultDisplay("vault:other:write", "*")).toBe("vault:other:write");
+  });
+});
+
+describe("renderConsent displayVault substitution", () => {
+  test("non-admin user (lockedVault) → consent shows vault:<assigned>:<verb>", () => {
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:read", "vault:write"],
+      vaultPicker: {
+        unnamedVerbs: ["read", "write"],
+        availableVaults: ["my-vault"],
+        lockedVault: "my-vault",
+      },
+      displayVault: "my-vault",
+    });
+    expect(html).toContain("vault:my-vault:read");
+    expect(html).toContain("vault:my-vault:write");
+    // Raw unnamed form (the thing this PR fixes) must NOT appear in the
+    // rendered scope-row code blocks. Scope name shows up inside
+    // `<code class="scope-name">…</code>` so check the row substring.
+    expect(html).not.toMatch(/<code class="scope-name">vault:read<\/code>/);
+    expect(html).not.toMatch(/<code class="scope-name">vault:write<\/code>/);
+  });
+
+  test("admin user, single-vault hub → picker pre-checks the only vault, consent shows it", () => {
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:read"],
+      vaultPicker: { unnamedVerbs: ["read"], availableVaults: ["default"] },
+      displayVault: "default",
+    });
+    expect(html).toContain("vault:default:read");
+    expect(html).not.toMatch(/<code class="scope-name">vault:read<\/code>/);
+  });
+
+  test("admin user, multi-vault hub → displayVault=null renders <TBD> + picker hint", () => {
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:read"],
+      vaultPicker: { unnamedVerbs: ["read"], availableVaults: ["work", "personal"] },
+      displayVault: null,
+    });
+    expect(html).toContain("vault:&lt;TBD&gt;:read");
+    expect(html).toContain("scope-pending-note");
+    expect(html).toContain("A specific vault is picked below");
+    // explainScope label still resolves via the verb-form lookup.
+    expect(html).toContain("Read your notes");
+  });
+
+  test("admin displayVault substitution includes the admin verb", () => {
+    const html = renderConsent({
+      params: { ...PARAMS, scope: "vault:admin" },
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:admin"],
+      displayVault: "u",
+    });
+    expect(html).toContain('<code class="scope-name">vault:u:admin</code>');
+  });
+
+  test("display-normalized duplicate vault scopes render one row", () => {
+    const html = renderConsent({
+      params: { ...PARAMS, scope: "vault:read vault:unforced:read" },
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:read", "vault:unforced:read"],
+      displayVault: "unforced",
+    });
+    expect((html.match(/<li class="scope/g) ?? []).length).toBe(1);
+  });
+
+  test("displayVault undefined preserves the legacy raw form (no substitution)", () => {
+    // The existing oauth-ui.test.ts cases call renderConsent without
+    // displayVault — confirming the back-compat shape stays.
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:read"],
+    });
+    expect(html).toContain("vault:read");
+  });
+});
+
+describe("renderApprovePending unauthenticated CTAs", () => {
+  const COMMON = {
+    clientName: "MyApp",
+    clientId: "client-xyz",
+    redirectUris: ["https://app.example/cb"],
+    requestedScopes: ["vault:read"],
+    hubOrigin: "https://hub.example.com",
+  };
+
+  test("without loginNextUrl: Sign in CTA falls back to /admin/approve-client/<id>", () => {
+    // Back-compat fallback for callers that don't have an in-flight OAuth
+    // URL to resume (e.g. direct share-page entry). The SPA approve path
+    // approves the client but discards any OAuth context — fine here
+    // because there's no OAuth flow to discard.
+    const html = renderApprovePending(COMMON);
+    expect(html).toContain("Sign in as admin to approve");
+    const expectedHref = `/login?next=${encodeURIComponent("/admin/approve-client/client-xyz")}`;
+    expect(html).toContain(`href="${expectedHref}"`);
+  });
+
+  test("with loginNextUrl set: Sign in CTA preserves the authorize URL through login", () => {
+    // The OAuth-flow entry case (the bug fix): the page is rendered for an
+    // `/oauth/authorize?...` GET, the operator isn't signed in, the CTA
+    // sends them through `/login?next=<authorize URL>` so post-login they
+    // land BACK on the OAuth flow — now authenticated, see the inline
+    // approve form, click once, OAuth flow resumes through consent →
+    // redirect_uri callback. Without this the SPA approves the client but
+    // the calling app (Claude MCP) is never told and the user loops on
+    // retry. Caught when Aaron tested via Claude.ai's MCP connector
+    // against the Render deploy.
+    const authorizeUrl =
+      "/oauth/authorize?client_id=client-xyz&redirect_uri=https%3A%2F%2Fapp.example%2Fcb" +
+      "&response_type=code&code_challenge=abc&code_challenge_method=S256&state=rt";
+    const html = renderApprovePending({ ...COMMON, loginNextUrl: authorizeUrl });
+    expect(html).toContain("Sign in as admin to approve");
+    const expectedHref = `/login?next=${encodeURIComponent(authorizeUrl)}`;
+    expect(html).toContain(`href="${expectedHref}"`);
+    // Sanity: the legacy SPA approve path is NOT what `next` points at.
+    const legacyHref = `/login?next=${encodeURIComponent("/admin/approve-client/client-xyz")}`;
+    expect(html).not.toContain(`href="${legacyHref}"`);
+    // The shareable deep link (secondary CTA, not Sign-in) still uses
+    // the SPA approve path — it's for sharing with another admin who
+    // isn't in an OAuth flow.
+    expect(html).toContain("https://hub.example.com/admin/approve-client/client-xyz");
+  });
+
+  test("renders fully-qualified shareable deep link + Copy button + clipboard JS", () => {
+    const html = renderApprovePending(COMMON);
+    expect(html).toContain("https://hub.example.com/admin/approve-client/client-xyz");
+    expect(html).toContain('id="approve-share-copy"');
+    expect(html).toContain('data-link="https://hub.example.com/admin/approve-client/client-xyz"');
+    // Inline JS uses navigator.clipboard.writeText with visual feedback.
+    expect(html).toContain("navigator.clipboard");
+    expect(html).toContain("writeText");
+    expect(html).toContain("Copied!");
+  });
+
+  test("trims a trailing slash on hubOrigin so the deep link doesn't double-slash", () => {
+    const html = renderApprovePending({ ...COMMON, hubOrigin: "https://hub.example.com/" });
+    expect(html).toContain("https://hub.example.com/admin/approve-client/client-xyz");
+    expect(html).not.toContain("https://hub.example.com//admin/");
+  });
+
+  test("retired CLI hint does NOT appear in the unauthenticated branch", () => {
+    const html = renderApprovePending(COMMON);
+    expect(html).not.toContain("parachute auth approve-client");
+    expect(html).not.toContain("from a terminal");
+  });
+
+  test("escapes hostile client_id into href, data-link, and the visible deep link", () => {
+    const html = renderApprovePending({
+      ...COMMON,
+      clientId: "<img src=x onerror=alert(1)>",
+    });
+    expect(html).not.toContain("<img src=x");
+    // encodeURIComponent in both the href and the deep-link URL produces
+    // %3Cimg…; that lives inside escapeHtml-wrapped attribute values.
+    expect(html).toContain("%3Cimg");
+  });
+
+  test("admin-authenticated branch hides the unauth CTAs and renders the inline approve form", () => {
+    const html = renderApprovePending({
+      ...COMMON,
+      approveForm: {
+        csrfToken: CSRF,
+        returnTo: "/oauth/authorize?client_id=client-xyz",
+        redirectUri: "https://client.example/cb",
+      },
+    });
+    expect(html).toContain('action="/oauth/authorize/approve"');
+    // Workstream I, 2026-05-25 — button label "Approve and continue"
+    // → "Approve" per design-system.md §5 (Approve is canon; the suffix
+    // was verbal noise implying optionality where there is none).
+    expect(html).toContain(">Approve</button>");
+    expect(html).not.toContain("Sign in as admin to approve");
+    expect(html).not.toContain("Or send this link to your hub admin");
+    expect(html).not.toContain("parachute auth approve-client");
+  });
+
+  test("authed branch renders Deny button + hidden inputs for redirect_uri / state (hub#390)", () => {
+    const html = renderApprovePending({
+      ...COMMON,
+      approveForm: {
+        csrfToken: CSRF,
+        returnTo: "/oauth/authorize?client_id=client-xyz",
+        redirectUri: "https://client.example/cb",
+        state: "abc-state",
+      },
+    });
+    // Both buttons present, distinguished by decision value.
+    expect(html).toContain('name="decision" value="approve"');
+    expect(html).toContain('name="decision" value="deny"');
+    expect(html).toContain(">Deny</button>");
+    // Hidden inputs carry redirect_uri + state for the deny handler.
+    expect(html).toContain('name="redirect_uri" value="https://client.example/cb"');
+    expect(html).toContain('name="state" value="abc-state"');
+  });
+
+  test("authed branch omits state hidden input when state is undefined (spec-allowed)", () => {
+    const html = renderApprovePending({
+      ...COMMON,
+      approveForm: {
+        csrfToken: CSRF,
+        returnTo: "/oauth/authorize?client_id=client-xyz",
+        redirectUri: "https://client.example/cb",
+        // state intentionally absent
+      },
+    });
+    expect(html).toContain('name="redirect_uri" value="https://client.example/cb"');
+    expect(html).not.toContain('name="state"');
+  });
+});
+
+describe("renderApprovePending scope display (wildcard substitution)", () => {
+  const COMMON = {
+    clientName: "MyApp",
+    clientId: "client-xyz",
+    redirectUris: ["https://app.example/cb"],
+    hubOrigin: "https://hub.example.com",
+  };
+
+  test("unnamed vault scopes render with the wildcard form (vault:*:<verb>)", () => {
+    // The bug Aaron hit on rc.1: the server-rendered approve-pending page
+    // showed raw `vault:read` / `vault:write` rather than the resolved
+    // `vault:*:<verb>` form the SPA already used. Both the unauth viewer
+    // and the authenticated admin branch get the substituted display so
+    // they match the SPA's `/admin/approve-client/<id>` view.
+    const html = renderApprovePending({
+      ...COMMON,
+      requestedScopes: ["vault:read", "vault:write"],
+    });
+    expect(html).toMatch(/<code class="scope-name">vault:\*:read<\/code>/);
+    expect(html).toMatch(/<code class="scope-name">vault:\*:write<\/code>/);
+    // Raw unnamed form must NOT appear in the rendered scope-row code
+    // blocks any more — that was the bug.
+    expect(html).not.toMatch(/<code class="scope-name">vault:read<\/code>/);
+    expect(html).not.toMatch(/<code class="scope-name">vault:write<\/code>/);
+  });
+
+  test("wildcard explanation surfaces below the scope list when any scope renders with `*`", () => {
+    const html = renderApprovePending({
+      ...COMMON,
+      requestedScopes: ["vault:read"],
+    });
+    // The `<p class="scope-wildcard-note">…` element is what's conditional;
+    // `.scope-wildcard-note` as a CSS class name is always present in the
+    // stylesheet, so match the rendered element specifically.
+    expect(html).toMatch(/<p class="scope-wildcard-note">/);
+    expect(html).toContain("a specific vault is selected during sign-in");
+    expect(html).toContain("unbound shape");
+  });
+
+  test("wildcard explanation is omitted when no scope renders with `*`", () => {
+    // All-non-vault: explanation absent.
+    const nonVault = renderApprovePending({
+      ...COMMON,
+      requestedScopes: ["scribe:transcribe", "channel:send"],
+    });
+    expect(nonVault).not.toMatch(/<p class="scope-wildcard-note">/);
+    expect(nonVault).not.toContain("unbound shape");
+
+    // Already-named vault: explanation absent (vault already specified).
+    const named = renderApprovePending({
+      ...COMMON,
+      requestedScopes: ["vault:work:read"],
+    });
+    expect(named).not.toMatch(/<p class="scope-wildcard-note">/);
+    expect(named).not.toContain("unbound shape");
+
+    // Empty scopes: explanation absent (no scope rows at all).
+    const empty = renderApprovePending({ ...COMMON, requestedScopes: [] });
+    expect(empty).not.toMatch(/<p class="scope-wildcard-note">/);
+  });
+
+  test("already-named vault scopes still render as-is (no double substitution)", () => {
+    const html = renderApprovePending({
+      ...COMMON,
+      requestedScopes: ["vault:work:read"],
+    });
+    expect(html).toMatch(/<code class="scope-name">vault:work:read<\/code>/);
+    // Pre-existing named scopes don't get mangled by the wildcard substitution.
+    expect(html).not.toMatch(/vault:\*:work/);
+  });
+
+  test("mixed scopes render the wildcard explanation when ANY scope is unnamed-vault", () => {
+    const html = renderApprovePending({
+      ...COMMON,
+      requestedScopes: ["scribe:transcribe", "vault:read"],
+    });
+    expect(html).toMatch(/<code class="scope-name">scribe:transcribe<\/code>/);
+    expect(html).toMatch(/<code class="scope-name">vault:\*:read<\/code>/);
+    expect(html).toMatch(/<p class="scope-wildcard-note">/);
+  });
+
+  test("authenticated admin branch also gets the wildcard substitution + explanation", () => {
+    // Both branches of the page render through the same scope-display path
+    // — the inline-form admin viewer sees the same resolved scopes as the
+    // unauth viewer with the sign-in CTA.
+    const html = renderApprovePending({
+      ...COMMON,
+      requestedScopes: ["vault:read", "vault:write"],
+      approveForm: {
+        csrfToken: CSRF,
+        returnTo: "/oauth/authorize?client_id=client-xyz",
+        redirectUri: "https://client.example/cb",
+      },
+    });
+    expect(html).toContain('action="/oauth/authorize/approve"');
+    expect(html).toMatch(/<code class="scope-name">vault:\*:read<\/code>/);
+    expect(html).toMatch(/<code class="scope-name">vault:\*:write<\/code>/);
+    expect(html).toMatch(/<p class="scope-wildcard-note">/);
+  });
+});
+
+describe("CSS / styling guarantees", () => {
+  test("does not load fonts from a third-party CDN (privacy)", () => {
+    const html = renderLogin({ params: PARAMS, csrfToken: CSRF });
+    expect(html).not.toContain("fonts.googleapis.com");
+    expect(html).not.toContain("fonts.gstatic.com");
+  });
+
+  test("sets referrer policy to no-referrer", () => {
+    expect(renderLogin({ params: PARAMS, csrfToken: CSRF })).toContain(
+      'name="referrer" content="no-referrer"',
+    );
+  });
+
+  test("declares mobile-friendly viewport", () => {
+    expect(renderLogin({ params: PARAMS, csrfToken: CSRF })).toContain(
+      'name="viewport" content="width=device-width, initial-scale=1"',
+    );
+  });
+});

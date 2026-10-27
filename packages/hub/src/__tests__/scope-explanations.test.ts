@@ -1,0 +1,299 @@
+import { describe, expect, test } from "bun:test";
+import {
+  FIRST_PARTY_SCOPES,
+  NON_REQUESTABLE_SCOPES,
+  SCOPE_EXPLANATIONS,
+  explainScope,
+  forcesExplicitConsent,
+  isNonRequestableScope,
+  isRequestableScope,
+  isWellFormedOrNonVaultScope,
+  scopeIsAdmin,
+} from "../scope-explanations.ts";
+
+describe("SCOPE_EXPLANATIONS", () => {
+  test("covers every canonical first-party scope from oauth-scopes.md", () => {
+    // Source of truth: docs/contracts/oauth-scopes.md.
+    const expected = [
+      "vault:read",
+      "vault:write",
+      "vault:admin",
+      "scribe:transcribe",
+      "scribe:admin",
+      "hub:admin",
+      "parachute:host:admin",
+      // Account scopes (Parachute App campaign, Phase 2).
+      "account:self:admin",
+      "account:self:write",
+      "account:self:read",
+    ];
+    for (const s of expected) {
+      expect(SCOPE_EXPLANATIONS[s]).toBeDefined();
+      expect(SCOPE_EXPLANATIONS[s]?.label.length).toBeGreaterThan(10);
+    }
+  });
+
+  // hub#689 Leg 1: the vault:admin consent copy must enumerate what
+  // admin actually grants (config/settings, triggers/automation, GitHub
+  // backup, token minting) on top of read/write — so the consent screen
+  // is honest about the admin blast radius, not a vague "configuration
+  // changes" hand-wave.
+  test("vault:admin label enumerates the concrete admin grants (hub#689 Leg 1)", () => {
+    const label = SCOPE_EXPLANATIONS["vault:admin"]?.label ?? "";
+    const lower = label.toLowerCase();
+    expect(SCOPE_EXPLANATIONS["vault:admin"]?.level).toBe("admin");
+    // Read + write are still part of what admin grants.
+    expect(lower).toContain("read");
+    expect(lower).toContain("write");
+    // The four enumerated admin powers.
+    expect(lower).toContain("config");
+    expect(lower).toContain("trigger");
+    expect(lower).toContain("github");
+    expect(lower).toContain("token");
+  });
+
+  test("FIRST_PARTY_SCOPES is sorted and matches the keys of SCOPE_EXPLANATIONS", () => {
+    expect(FIRST_PARTY_SCOPES).toEqual([...FIRST_PARTY_SCOPES].sort());
+    expect(new Set(FIRST_PARTY_SCOPES)).toEqual(new Set(Object.keys(SCOPE_EXPLANATIONS)));
+  });
+});
+
+describe("explainScope", () => {
+  test("returns the entry for a known scope", () => {
+    expect(explainScope("vault:read")?.level).toBe("read");
+  });
+
+  test("returns null for an unknown scope", () => {
+    expect(explainScope("notes:weird-thing")).toBeNull();
+  });
+
+  // Approval-UX rc.19: the consent screen renders the *resolved* scope
+  // shape (`vault:<name>:read`) rather than the raw OAuth request
+  // (`vault:read`) so the operator sees the form the token will carry.
+  // explainScope falls back to the unnamed verb's entry for both the
+  // narrowed (`vault:work:read`) and wildcard-display (`vault:*:read`)
+  // forms so the consent UI keeps the same label + level styling.
+  test("named vault scopes (vault:<name>:<verb>) reuse the unnamed-verb explanation", () => {
+    expect(explainScope("vault:work:read")?.label).toBe(SCOPE_EXPLANATIONS["vault:read"]?.label);
+    expect(explainScope("vault:work:read")?.level).toBe("read");
+    expect(explainScope("vault:my-techne_2:write")?.level).toBe("write");
+  });
+
+  test("wildcard vault display form (vault:*:<verb>) explains via the unnamed verb", () => {
+    expect(explainScope("vault:*:read")?.level).toBe("read");
+    expect(explainScope("vault:*:write")?.level).toBe("write");
+  });
+
+  // Single-consent change (2026-05-29): vault:<name>:admin is now REQUESTABLE
+  // and reaches the consent screen, so explainScope MUST resolve it to the
+  // vault:admin explanation (level "admin"). The trusted-client gates use
+  // the resulting elevated risk to keep it consent-gated.
+  test("resolves a per-vault admin (vault:<name>:admin) to the vault:admin explanation", () => {
+    expect(explainScope("vault:default:admin")?.label).toBe(
+      SCOPE_EXPLANATIONS["vault:admin"]?.label,
+    );
+    expect(explainScope("vault:default:admin")?.level).toBe("admin");
+    expect(explainScope("vault:my-techne_2:admin")?.level).toBe("admin");
+    expect(explainScope("vault:*:admin")?.level).toBe("admin");
+  });
+
+  // Surface Git Transport Phase 1: named per-surface scopes
+  // (`surface:<name>:<verb>`) reach the consent screen via the 3→2-segment
+  // collapse, so explainScope MUST resolve them to the unnamed surface:read /
+  // surface:write labels — else the operator sees the raw scope string.
+  test("named surface scopes (surface:<name>:<verb>) reuse the unnamed-verb explanation", () => {
+    expect(explainScope("surface:gitcoin-brain:read")?.label).toBe(
+      SCOPE_EXPLANATIONS["surface:read"]?.label,
+    );
+    expect(explainScope("surface:gitcoin-brain:read")?.level).toBe("read");
+    expect(explainScope("surface:my-app_2:write")?.label).toBe(
+      SCOPE_EXPLANATIONS["surface:write"]?.label,
+    );
+    expect(explainScope("surface:my-app_2:write")?.level).toBe("write");
+    expect(explainScope("surface:*:write")?.level).toBe("write");
+  });
+});
+
+describe("scopeIsAdmin", () => {
+  test("true for admin scopes", () => {
+    expect(scopeIsAdmin("vault:admin")).toBe(true);
+    expect(scopeIsAdmin("hub:admin")).toBe(true);
+    expect(scopeIsAdmin("parachute:host:admin")).toBe(true);
+  });
+
+  // Single-consent change (2026-05-29): the named per-vault admin form must
+  // be recognized as admin. Its explanation's elevated risk is load-bearing —
+  // the same-hub and trust-by-client_name gates use that risk to keep the
+  // grant consent-gated instead of silently auto-minting it.
+  test("true for named per-vault admin (vault:<name>:admin)", () => {
+    expect(scopeIsAdmin("vault:work:admin")).toBe(true);
+    expect(scopeIsAdmin("vault:default:admin")).toBe(true);
+    expect(scopeIsAdmin("vault:my-techne_2:admin")).toBe(true);
+  });
+
+  test("false for non-admin and unknown scopes", () => {
+    expect(scopeIsAdmin("vault:read")).toBe(false);
+    expect(scopeIsAdmin("agent:send")).toBe(false);
+    expect(scopeIsAdmin("unknown:anything")).toBe(false);
+  });
+
+  test("scopeIsAdmin('runner:admin') returns false — module-declared admin scopes don't participate (deliberate; see scope-explanations.ts comment)", () => {
+    expect(scopeIsAdmin("runner:admin")).toBe(false);
+  });
+});
+
+describe("forcesExplicitConsent", () => {
+  test("allows low-risk vault scopes but forces elevated/high/unknown scopes", () => {
+    expect(forcesExplicitConsent("vault:read")).toBe(false);
+    expect(forcesExplicitConsent("vault:work:write")).toBe(false);
+    expect(forcesExplicitConsent("account:self:write")).toBe(true);
+    expect(forcesExplicitConsent("account:self:admin")).toBe(true);
+    expect(forcesExplicitConsent("unknown:anything")).toBe(true);
+  });
+});
+
+describe("NON_REQUESTABLE_SCOPES (#96)", () => {
+  test("contains parachute:host:admin", () => {
+    expect(NON_REQUESTABLE_SCOPES.has("parachute:host:admin")).toBe(true);
+  });
+
+  test("contains the service-admin scopes hub:admin and scribe:admin (2026-06-30 over-permissioning fix)", () => {
+    // A vault MCP connector (e.g. Claude) is pointed at the hub-level AS by the
+    // vault's protected-resource metadata, so hub:admin/scribe:admin would be
+    // advertised on its consent screen + minted if approved — wildly
+    // over-privileged for a vault reader. Every legit use is operator-bearer /
+    // session (operator token, DCR self-registration, admin SPA), never
+    // /oauth/authorize — so these fail closed without breaking operator paths.
+    expect(NON_REQUESTABLE_SCOPES.has("hub:admin")).toBe(true);
+    expect(NON_REQUESTABLE_SCOPES.has("scribe:admin")).toBe(true);
+  });
+
+  test("does NOT contain the account scopes — they're requestable now (2026-07-30)", () => {
+    // Previously cookie-minted only. Blocking them outright conflated
+    // "dangerous" with "forbidden" and made a legitimate capability (an agent
+    // that manages your vaults) impossible to build. They're requestable, and
+    // the protection moved to where it belongs: the mint choke-point caps them
+    // to the account holder, and the consent screen renders them at risk tier
+    // "high" with the consequences named. See the [9b]/[9c] cap tests in
+    // oauth-handlers.test.ts — those are what keep this safe.
+    expect(NON_REQUESTABLE_SCOPES.has("account:self:admin")).toBe(false);
+    expect(NON_REQUESTABLE_SCOPES.has("account:self:write")).toBe(false);
+    expect(NON_REQUESTABLE_SCOPES.has("account:self:read")).toBe(false);
+  });
+
+  test("every non-requestable scope is a known first-party scope", () => {
+    for (const s of NON_REQUESTABLE_SCOPES) {
+      expect(FIRST_PARTY_SCOPES).toContain(s);
+    }
+  });
+});
+
+describe("isRequestableScope", () => {
+  test("false for parachute:host:admin", () => {
+    expect(isRequestableScope("parachute:host:admin")).toBe(false);
+  });
+
+  test("false for service-admin scopes hub:admin and scribe:admin (operator-only, 2026-06-30)", () => {
+    expect(isRequestableScope("hub:admin")).toBe(false);
+    expect(isRequestableScope("scribe:admin")).toBe(false);
+  });
+
+  test("true for non-admin first-party scopes", () => {
+    expect(isRequestableScope("vault:read")).toBe(true);
+    expect(isRequestableScope("vault:admin")).toBe(true);
+    expect(isRequestableScope("scribe:transcribe")).toBe(true);
+  });
+
+  test("true for unknown scopes (third-party module scopes pass through)", () => {
+    expect(isRequestableScope("notes:something-new")).toBe(true);
+  });
+
+  // Single-consent change (2026-05-29): per-vault admin scopes are now
+  // requestable via the public OAuth flow. The anti-privesc cap at the mint
+  // choke-point (`capScopesToUserAuthority`) keeps a non-owner from actually
+  // being granted admin — but the scope is no longer rejected up front, so
+  // Claude MCP (consenting as the owner) can mint a vault admin token.
+  test("true for any vault:<name>:admin scope (single-consent change)", () => {
+    expect(isRequestableScope("vault:default:admin")).toBe(true);
+    expect(isRequestableScope("vault:work:admin")).toBe(true);
+    expect(isRequestableScope("vault:my-techne_2:admin")).toBe(true);
+  });
+
+  test("account scopes ARE requestable, with risk-aware consent gating", () => {
+    expect(isRequestableScope("account:self:admin")).toBe(true);
+    expect(isRequestableScope("account:self:write")).toBe(true);
+    expect(isRequestableScope("account:self:read")).toBe(true);
+    // explainScope resolves them (direct SCOPE_EXPLANATIONS keys) with the
+    // right levels and risk tiers.
+    expect(explainScope("account:self:admin")?.level).toBe("admin");
+    expect(explainScope("account:self:write")?.level).toBe("write");
+    expect(explainScope("account:self:read")?.level).toBe("read");
+    expect(scopeIsAdmin("account:self:admin")).toBe(true);
+    expect(scopeIsAdmin("account:self:read")).toBe(false);
+  });
+
+  test("host-level operator scopes stay non-requestable", () => {
+    // The asymmetry the single-consent change preserved: per-vault admin is
+    // now requestable (capped at mint), but host-wide operator authority is
+    // still operator-only-mintable.
+    expect(isRequestableScope("parachute:host:admin")).toBe(false);
+    expect(isRequestableScope("parachute:host:auth")).toBe(false);
+  });
+
+  test("vault:<name>:read|write stays requestable", () => {
+    expect(isRequestableScope("vault:default:read")).toBe(true);
+    expect(isRequestableScope("vault:work:write")).toBe(true);
+  });
+
+  // Item C — case-insensitive guard. A casing variant of a host-level scope
+  // must NOT slip past the exact-string membership check as "requestable."
+  test("uppercase / mixed-case host scopes are non-requestable (item C)", () => {
+    expect(isRequestableScope("PARACHUTE:HOST:AUTH")).toBe(false);
+    expect(isRequestableScope("Parachute:Host:Admin")).toBe(false);
+    expect(isRequestableScope("parachute:HOST:vault")).toBe(false);
+    // And the direct predicate agrees.
+    expect(isNonRequestableScope("PARACHUTE:HOST:AUTH")).toBe(true);
+    expect(isNonRequestableScope("parachute:Host:Install")).toBe(true);
+    // Canonical lowercase still works unchanged.
+    expect(isNonRequestableScope("parachute:host:auth")).toBe(true);
+    // Service-admin scopes are non-requestable too, case-insensitively (2026-06-30).
+    expect(isNonRequestableScope("HUB:ADMIN")).toBe(true);
+    // A genuinely requestable scope (even uppercased) stays requestable.
+    expect(isNonRequestableScope("VAULT:READ")).toBe(false);
+  });
+});
+
+// Mint-time shape guard (defensive hygiene, audit 2026-05-28). Rejects only the
+// *named* three-segment vault shape when malformed; leaves the unnamed two-
+// segment forms and all non-vault scopes alone.
+describe("isWellFormedOrNonVaultScope", () => {
+  test("rejects the four audited malformed named-vault forms", () => {
+    expect(isWellFormedOrNonVaultScope("vault:work:ADMIN")).toBe(false); // uppercase verb
+    expect(isWellFormedOrNonVaultScope("vault::admin")).toBe(false); // empty name
+    expect(isWellFormedOrNonVaultScope("vault:work:read:admin")).toBe(false); // extra segment
+    expect(isWellFormedOrNonVaultScope("VAULT:work:admin")).toBe(false); // uppercase resource
+  });
+
+  test("admits well-formed named-vault scopes (all three verbs)", () => {
+    expect(isWellFormedOrNonVaultScope("vault:work:read")).toBe(true);
+    expect(isWellFormedOrNonVaultScope("vault:work:write")).toBe(true);
+    expect(isWellFormedOrNonVaultScope("vault:work:admin")).toBe(true);
+    expect(isWellFormedOrNonVaultScope("vault:my-techne_2:admin")).toBe(true);
+  });
+
+  test("admits the unnamed two-segment vault forms (out of remit)", () => {
+    expect(isWellFormedOrNonVaultScope("vault:read")).toBe(true);
+    expect(isWellFormedOrNonVaultScope("vault:write")).toBe(true);
+    expect(isWellFormedOrNonVaultScope("vault:admin")).toBe(true);
+    expect(isWellFormedOrNonVaultScope("vault")).toBe(true); // bare, no colon
+  });
+
+  test("admits all non-vault scopes unconditionally", () => {
+    expect(isWellFormedOrNonVaultScope("scribe:transcribe")).toBe(true);
+    expect(isWellFormedOrNonVaultScope("parachute:host:auth")).toBe(true);
+    expect(isWellFormedOrNonVaultScope("parachute:host:admin")).toBe(true);
+    expect(isWellFormedOrNonVaultScope("hub:admin")).toBe(true);
+    // A three-segment non-vault scope is not constrained even if malformed-looking.
+    expect(isWellFormedOrNonVaultScope("scribe:work:ADMIN")).toBe(true);
+  });
+});
