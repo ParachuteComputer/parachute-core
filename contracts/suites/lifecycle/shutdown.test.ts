@@ -505,13 +505,14 @@ function stopScenario(label: string, fault: (box: Box, s: Serve) => Promise<void
       // In flight when the fault comes: five writes the hub is in the middle of reading. The rest of each body
       // goes after the fault; whichever get 201 must survive too.
       const holding = await holdWrites(box, 5);
-      await fault(box, s);
-      // The deadline runs from the fault, while the held writes finish: draining them doesn't buy serve more time.
+      // The deadline runs from the moment the fault is invoked, through the fault itself (the stop file's command can
+      // take a while) and while the held writes finish: neither buys serve more time.
       const deadline = opts.deadline ?? 10_000;
       // Under a parent, `s` is the parent (now dead); serve's status comes from its observer.
       const exited = s.status
         ? until(() => s.status!() !== undefined, deadline, 100).then((ok) => (ok ? s.status!()! : null))
         : exitWithin(s, deadline);
+      await fault(box, s);
       const inFlight = await holding.release();
       acked.push(...inFlight.acked);
       const exit = await exited;
