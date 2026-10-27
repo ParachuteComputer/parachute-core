@@ -12,7 +12,7 @@
 //   bun run prism-compat                     CANDIDATE_DIR / CANDIDATE_SHA256 as for `bun run candidate`
 import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { enterSandbox } from "./sandbox.ts";
+import { enterSandbox, hostNode } from "./sandbox.ts";
 import { loadCandidate, prepareInfo } from "./candidate.ts";
 import { reposDir } from "./services.ts";
 import pins from "../pins.json";
@@ -43,7 +43,7 @@ await enterSandbox();
 const dir = resolve(process.env.CANDIDATE_DIR ?? join(contracts, ".cache", "candidate-stock"));
 const { manifest, sha256 } = await loadCandidate(dir);
 const info = prepareInfo(dir, manifest, sha256);
-const node = Bun.which("node");
+const node = hostNode();
 if (!node) throw new Error("prism-compat: node is needed (his suite is a Node script)");
 symlinkSync(node, join(info.runtimeDir, "node"));
 const lsof = Bun.which("lsof");

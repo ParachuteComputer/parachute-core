@@ -4,8 +4,9 @@
 // a WAL and an instance file behind in every run"). For each fault (SIGTERM, SIGINT, the vault's stop file, parent
 // death, a SIGKILLed serve, the vault failing to start after the hub is up, an occupied vault port, ten restarts in
 // a row) it checks the oracles that can fail:
-//   - acknowledged writes survive: a note that got 201 is there after a restart, including writes in flight when
-//     the signal came;
+//   - acknowledged writes survive: a note that got 201 is there after a restart, including writes the hub was in
+//     the middle of reading when the fault came (held open mid-body, seen read with `ss`); those must get an
+//     answer (201 or a refusal), not silence;
 //   - `/api/ready` says ready only when a write goes through, and never while the vault can't start;
 //   - the program exits (0 for a clean stop, non-zero for a part that failed to start) within its deadline;
 //   - both ports closed and no process left from this home (child path: the vault child; in-process: nothing);
@@ -27,6 +28,7 @@ import { createServer, connect, type Server } from "node:net";
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { randomBytes } from "node:crypto";
+import { constants as osConstants } from "node:os";
 import { candidateEnv } from "../../harness/candidate.ts";
 import { allowOrigins, candidate, cli, freePort, newHome, safeFetch, until } from "../candidate-lib.ts";
 import { must, red, rest } from "../lib.ts";
@@ -54,6 +56,8 @@ interface Serve {
   proc: ReturnType<typeof Bun.spawn>;
   exited: Promise<number>;
   log(): string;
+  /** Under a parent: serve's own exit status as its observer saw it, or undefined while it runs. */
+  status?: () => Exit | undefined;
 }
 
 class Box {
@@ -142,22 +146,37 @@ class Box {
     };
     // stock-0.7 workaround (fix 1): the vault child fetches the hub's keys from :1939 unless told otherwise.
     if (c.profile === "stock-0.7") extra.PARACHUTE_HUB_JWKS_ORIGIN = this.origin;
-    const logPath = join(this.user, `serve-${++this.logs}.log`);
+    const n = ++this.logs;
+    const logPath = join(this.user, `serve-${n}.log`);
+    const env = candidateEnv(c, this.home, this.env(extra));
     const cmd = this.inside([c.bin, "serve"]);
-    const proc = opts.parent
-      ? // A parent that starts serve, tells it its own pid, and waits: SIGKILL it and serve's parent is gone.
-        Bun.spawn(["sh", "-c", '"$@" --parent-pid $$ >"$LC_LOG" 2>&1 & wait', "sh", ...cmd], {
-          env: { ...candidateEnv(c, this.home, this.env(extra)), LC_LOG: logPath },
-          cwd: this.user,
-          stdout: "ignore",
-          stderr: "ignore",
-        })
-      : Bun.spawn(cmd, { env: candidateEnv(c, this.home, this.env(extra)), cwd: this.user, stdout: Bun.file(logPath), stderr: Bun.file(logPath) });
-    return {
-      proc,
-      exited: proc.exited,
-      log: () => (existsSync(logPath) ? readFileSync(logPath, "utf8").replace(/pvk_[A-Za-z0-9_-]+/g, "pvk_<redacted>") : ""),
+    const log = () => (existsSync(logPath) ? readFileSync(logPath, "utf8").replace(/pvk_[A-Za-z0-9_-]+/g, "pvk_<redacted>") : "");
+    if (!opts.parent) {
+      const proc = Bun.spawn(cmd, { env, cwd: this.user, stdout: Bun.file(logPath), stderr: Bun.file(logPath) });
+      return { proc, exited: proc.exited, log };
+    }
+    // Three processes: the parent P (what --parent-pid names, and what the test SIGKILLs), an observer W started by
+    // P, and serve, W's child. W outlives P, waits for serve and writes serve's real exit status ($?, 128+N for
+    // death by signal N) to a file. P and W don't carry PARACHUTE_HOME, so they never count as "left from this home";
+    // serve gets its environment through `env -i`.
+    const statusPath = join(this.user, `serve-${n}.status`);
+    const observer = '"$@" --parent-pid "$PPID" >"$LC_LOG" 2>&1; echo $? >"$LC_STATUS.tmp" && mv "$LC_STATUS.tmp" "$LC_STATUS"';
+    const parent = 'sh -c "$LC_OBSERVER" observer "$@" & wait';
+    const serveCmd = ["env", "-i", ...Object.entries(env).map(([k, v]) => `${k}=${v}`), ...cmd];
+    const proc = Bun.spawn(["sh", "-c", parent, "parent", ...serveCmd], {
+      env: { PATH: "/usr/bin:/bin", LC_OBSERVER: observer, LC_LOG: logPath, LC_STATUS: statusPath },
+      cwd: this.user,
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    const status = (): Exit | undefined => {
+      if (!existsSync(statusPath)) return undefined;
+      const code = Number(readFileSync(statusPath, "utf8").trim());
+      if (code <= 128) return code;
+      const sig = Object.entries(osConstants.signals).find(([, v]) => v === code - 128)?.[0];
+      return (sig as NodeJS.Signals | undefined) ?? code;
     };
+    return { proc, exited: proc.exited, log, status };
   }
 
   /** A process inside the box holding a TCP port (not a Parachute process). */
@@ -183,6 +202,23 @@ class Box {
 
   api() {
     return rest(`${this.origin}/vault/${this.vaultName}`, this.token);
+  }
+
+  /**
+   * Established connections the hub's port has accepted, from `ss` inside the box: the peer, how many bytes the hub's
+   * side has received, and how many of those still wait unread in the kernel (Recv-Q).
+   */
+  hubConnections(): { peer: string; received: number; unread: number }[] {
+    const r = Bun.spawnSync(this.inside(["ss", "-tinH", "state", "established", `( sport = :${this.port} )`]), { stdout: "pipe", stderr: "pipe" });
+    const out: { peer: string; received: number; unread: number }[] = [];
+    const lines = r.stdout.toString().split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      const c = lines[i]!.trim().split(/\s+/);
+      if (c.length < 4 || !/^\d+$/.test(c[0]!)) continue;
+      const detail = lines[i + 1] ?? "";
+      out.push({ peer: c[3]!, unread: Number(c[0]), received: Number(detail.match(/bytes_received:(\d+)/)?.[1] ?? 0) });
+    }
+    return out;
   }
 
   /** TCP ports listening in this box's network namespace. */
@@ -252,6 +288,67 @@ async function write(box: Box): Promise<{ id: string; content: string } | null> 
   } catch {
     return null;
   }
+}
+
+/** What happened to the writes held open across the fault. */
+interface InFlight {
+  held: number;
+  acked: { id: string; content: string }[];
+  refused: number[]; // HTTP statuses other than 201: an explicit answer
+  dropped: string[]; // no answer at all (connection closed, reset)
+}
+
+/**
+ * Open `n` note writes and hold them in the middle of their bodies, on connections of their own. Returns once the
+ * hub has accepted every connection and read everything sent so far (each new connection has received at least
+ * the first half of a body and has nothing unread in the kernel, per `ss` in the box): the server is reading these
+ * requests. `release()` sends the rest and collects each answer.
+ */
+async function holdWrites(box: Box, n: number): Promise<{ release(): Promise<InFlight> }> {
+  const before = new Set(box.hubConnections().map((c) => c.peer));
+  const held = Array.from({ length: n }, () => {
+    const k = ++noteSeq;
+    const content = `Made-up lifecycle note ${k}, held open: the otter stacked ${k * 3} reeds on the ${randomBytes(2).toString("hex")} bank.`;
+    const json = JSON.stringify({ path: `lifecycle/${box.vaultName}/held${k}`, content });
+    const half = Math.floor(json.length / 2);
+    let ctl!: ReadableStreamDefaultController<Uint8Array>;
+    const body = new ReadableStream<Uint8Array>({ start: (c) => void (ctl = c) });
+    ctl.enqueue(new TextEncoder().encode(json.slice(0, half)));
+    const answer = safeFetch(`${box.origin}/vault/${box.vaultName}/api/notes`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${box.token}`, "content-type": "application/json" },
+      body,
+      duplex: "half",
+      keepalive: false,
+    } as RequestInit)
+      .then(async (r) => ({ status: r.status, body: (await r.json().catch(() => null)) as any }))
+      .catch((e) => ({ status: null, error: String((e as Error).message ?? e) }));
+    return { content, rest: json.slice(half), firstHalf: half, ctl, answer };
+  });
+  const minimum = Math.min(...held.map((h) => h.firstHalf));
+  const reading = () => {
+    const fresh = box.hubConnections().filter((c) => !before.has(c.peer));
+    return fresh.length >= n && fresh.every((c) => c.unread === 0 && c.received >= minimum);
+  };
+  must(await until(reading, 10_000, 20), `setup: the ${n} held writes never all reached the hub: ${JSON.stringify(box.hubConnections())}`);
+  return {
+    async release() {
+      for (const h of held) {
+        try {
+          h.ctl.enqueue(new TextEncoder().encode(h.rest));
+          h.ctl.close();
+        } catch {} // the connection is already gone
+      }
+      const out: InFlight = { held: n, acked: [], refused: [], dropped: [] };
+      for (const h of held) {
+        const a: any = await h.answer;
+        if (a.status === 201 && typeof a.body?.id === "string") out.acked.push({ id: a.body.id, content: h.content });
+        else if (a.status !== null) out.refused.push(a.status);
+        else out.dropped.push(a.error);
+      }
+      return out;
+    },
+  };
 }
 
 /**
@@ -382,6 +479,7 @@ interface Outcome {
   lost: string[]; // acknowledged notes missing after a restart
   running: string[]; // listeners and processes left after the stop
   disk: string[]; // files and databases left after the stop
+  inFlight: InFlight; // the writes held open across the fault
 }
 
 /** Run a scenario once, however many tests read its outcome. */
@@ -404,22 +502,28 @@ function stopScenario(label: string, fault: (box: Box, s: Serve) => Promise<void
       const acked = [await untilUsable(box, s)];
       for (let i = 0; i < 5; i++) acked.push((await write(box))!);
       must(acked.every(Boolean), "setup: a write before the fault was refused");
-      // In flight when the fault comes: whichever of these get 201 must survive too.
-      const burst = Array.from({ length: 20 }, () => write(box));
-      await Bun.sleep(5);
+      // In flight when the fault comes: five writes the hub is in the middle of reading. The rest of each body
+      // goes after the fault; whichever get 201 must survive too.
+      const holding = await holdWrites(box, 5);
       await fault(box, s);
-      for (const w of await Promise.all(burst)) if (w) acked.push(w);
-      // Under a parent, `s` is the parent (now dead): serve's exit is seen as its processes going away.
-      const exit = opts.parent
-        ? (await until(() => box.processes().length === 0, opts.deadline ?? 10_000, 100)) ? 0 : null
-        : await exitWithin(s, opts.deadline ?? 10_000);
-      const running = exit === null ? [`serve still running ${(opts.deadline ?? 10_000) / 1000} s after ${label}`] : await leftRunning(box);
+      const inFlight = await holding.release();
+      acked.push(...inFlight.acked);
+      const deadline = opts.deadline ?? 10_000;
+      // Under a parent, `s` is the parent (now dead); serve's status comes from its observer.
+      const exit = s.status
+        ? (await until(() => s.status!() !== undefined, deadline, 100)) ? s.status()! : null
+        : await exitWithin(s, deadline);
+      const running = exit === null ? [`serve still running ${deadline / 1000} s after ${label}`] : await leftRunning(box);
       const disk = exit === null ? [] : leftOnDisk(box);
       for (const p of box.processes()) process.kill(p.pid, "SIGKILL"); // whatever is left, so the restart is fair
       await until(() => box.processes().length === 0 && !box.listening().length, 5_000, 100);
       const lost = await readBack(box, acked);
-      console.log(`[lifecycle] ${label}: exit ${exit}, ${acked.length} writes acknowledged (${acked.length - 6} of 20 in flight), ${lost.length} lost, ${running.length + disk.length} problems`);
-      return { exit, acked: acked.length, lost, running, disk };
+      const f = inFlight;
+      console.log(
+        `[lifecycle] ${label}: exit ${exit}; ${acked.length} writes acknowledged; in flight ${f.held}: ${f.acked.length} acknowledged, ` +
+          `${f.refused.length} refused (${f.refused.join(",")}), ${f.dropped.length} dropped; ${lost.length} lost; ${running.length + disk.length} problems`,
+      );
+      return { exit, acked: acked.length, lost, running, disk, inFlight };
     } finally {
       await box.close();
     }
@@ -435,13 +539,20 @@ function stoppedAndGone(o: Outcome) {
 }
 
 function cleanOnDisk(o: Outcome) {
-  must(o.exit !== null, `serve did not stop, so its home was never left: ${o.running.join("; ")}`);
-  must(o.disk.length === 0, o.disk.join("; "));
+  cleanOnDiskOf(o.exit, o.running, o.disk);
 }
 
+function cleanOnDiskOf(exit: Exit, running: string[], disk: string[]) {
+  must(exit !== null, `serve did not stop, so its home was never left: ${running.join("; ")}`);
+  must(disk.length === 0, disk.join("; "));
+}
+
+/** Every acknowledged write is there after a restart, and the writes in flight got an answer, not silence. */
 function nothingLost(o: Outcome) {
   must(o.acked >= 6, `setup: only ${o.acked} writes acknowledged`);
   must(o.lost.length === 0, `acknowledged writes lost: ${o.lost.join(", ")}`);
+  const f = o.inFlight;
+  must(f.acked.length + f.refused.length > 0, `none of the ${f.held} writes in flight got an answer: ${f.dropped.join("; ")}`);
 }
 
 // ── the contracts ──────────────────────────────────────────────────────────────────────────────────────────
@@ -485,7 +596,7 @@ describe("lifecycle: shutdown", () => {
   // (Prism's installer, §3) waits on that.
   red(
     "/api/ready says ready within 5 s of the first write going through",
-    { reason: /\/api\/ready said ready only (\d{2,}|[6-9]) s after a write went through/, lane: "C" },
+    { reason: /^\/api\/ready said ready only (\d{2,}|[6-9]) s after a write went through$/, lane: "C" },
     async () => {
       const r = await setup();
       must(r.readyAfter !== null, "/api/ready never said ready within 40 s of a write going through");
@@ -499,7 +610,7 @@ describe("lifecycle: shutdown", () => {
   for (const sig of ["SIGTERM", "SIGINT"] as const) {
     const run = stopScenario(sig, async (_box, s) => void s.proc.kill(sig));
 
-    test(`${sig}: acknowledged writes survive, including ones in flight when it came`, async () => nothingLost(await run()), SLOW);
+    test(`${sig}: acknowledged writes survive, and writes the hub was reading when it came are answered`, async () => nothingLost(await run()), SLOW);
 
     test(`${sig}: serve exits 0 within 10 s, both ports closed, no process left`, async () => stoppedAndGone(await run()), SLOW);
 
@@ -522,18 +633,18 @@ describe("lifecycle: shutdown", () => {
     { deadline: 15_000 },
   );
 
-  test("the stop file: acknowledged writes survive", async () => nothingLost(await stopFile()), SLOW);
+  test("the stop file: acknowledged writes survive, and writes in flight are answered", async () => nothingLost(await stopFile()), SLOW);
 
   red(
     "the stop file: the whole serve stops (exit 0 within 15 s), both ports closed, no process left",
-    { reason: /serve still running 15 s after the stop file/, lane: "A2" },
+    { reason: /^serve still running 15 s after the stop file$/, lane: "A2" },
     async () => stoppedAndGone(await stopFile()),
     SLOW,
   );
 
   red(
     "the stop file: the home is left clean",
-    { reason: /serve did not stop, so its home was never left/, lane: "A2" },
+    { reason: /^serve did not stop, so its home was never left: serve still running 15 s after the stop file$/, lane: "A2" },
     async () => cleanOnDisk(await stopFile()),
     SLOW,
   );
@@ -542,7 +653,7 @@ describe("lifecycle: shutdown", () => {
   // none, and must not die with its shell; with it, a SIGKILLed parent is a stop like SIGTERM.
   red(
     "parent death: serve --parent-pid stops cleanly within 10 s of its parent's SIGKILL",
-    { reason: /serve --parent-pid did not start: .*unexpected argument "--parent-pid"/, lane: "C" },
+    { reason: /^serve --parent-pid did not start: parachute serve: unexpected argument "--parent-pid" \| usage: parachute serve$/, lane: "C" },
     async () => {
       const o = await stopScenario("its parent died", async (_box, s) => void s.proc.kill("SIGKILL"), { parent: true })();
       stoppedAndGone(o);
@@ -648,7 +759,7 @@ describe("lifecycle: shutdown", () => {
 
   red(
     "SIGKILL: a SIGKILLed serve leaves no process behind (its vault notices its parent died)",
-    { reason: /process left 5 s after serve was SIGKILLed: pid \d+ .*vault.*serve/, lane: "A2" },
+    { reason: /^process left 5 s after serve was SIGKILLed: pid \d+ \S*bun \S*vault\S*\/cli\.ts serve$/, lane: "A2" },
     async () => {
       const o = await killed();
       must(o.orphans.length === 0, o.orphans.join("; "));
@@ -658,7 +769,7 @@ describe("lifecycle: shutdown", () => {
 
   red(
     "SIGKILL: a stale ready.json from the killed run never reads as ready",
-    { reason: /stale run\/ready\.json still there after the restart's hub answered/, lane: "A2" },
+    { reason: /^stale run\/ready\.json still there after the restart's hub answered$/, lane: "A2" },
     async () => {
       const o = await killed();
       const problems = [...o.staleProblems, ...o.seen];
@@ -721,7 +832,7 @@ describe("lifecycle: shutdown", () => {
 
   red(
     "vault start failure: serve stops itself, non-zero, cleanly",
-    { reason: /serve still running 20 s after the vault failed to start/, lane: "A2" },
+    { reason: /^serve still running 20 s after the vault failed to start$/, lane: "A2" },
     async () => {
       const o = await brokenDb();
       must(o.problems.length === 0, o.problems.join("; "));
@@ -742,7 +853,7 @@ describe("lifecycle: shutdown", () => {
 
   red(
     "occupied vault port: serve stops itself, non-zero, cleanly",
-    { reason: /serve still running 20 s after the vault port was taken/, lane: "A2" },
+    { reason: /^serve still running 20 s after the vault port was taken$/, lane: "A2" },
     async () => {
       const o = await occupied();
       must(o.problems.length === 0, o.problems.join("; "));
@@ -771,18 +882,13 @@ describe("lifecycle: shutdown", () => {
       must(opened && s.proc.exitCode === null, `setup: the vault port never opened on restart: ${s.log().slice(-800)}`);
       s.proc.kill("SIGTERM");
       const exit = await exitWithin(s, 10_000);
-      const problems: string[] = [];
-      if (exit === null) problems.push("serve still running 10 s after SIGTERM during start-up");
-      else {
-        const bad = exitProblem(exit);
-        if (bad) problems.push(bad);
-        problems.push(...(await leftRunning(box)), ...leftOnDisk(box));
-      }
+      const running = exit === null ? ["serve still running 10 s after SIGTERM during start-up"] : await leftRunning(box);
+      const disk = exit === null ? [] : leftOnDisk(box);
       for (const p of box.processes()) process.kill(p.pid, "SIGKILL");
       if (exit === null) s.proc.kill("SIGKILL");
       await until(() => box.processes().length === 0 && !box.listening().length, 5_000, 100);
       const lost = await readBack(box, acked);
-      return { problems, lost };
+      return { exit, running, disk, lost };
     } finally {
       await box.close();
     }
@@ -793,12 +899,36 @@ describe("lifecycle: shutdown", () => {
     must(o.lost.length === 0, `acknowledged writes lost: ${o.lost.join(", ")}`);
   }, SLOW);
 
+  // Three invariants, three contracts, each red today for exactly one anchored reason: any further problem (a
+  // second orphan, a damaged database) makes it red for the wrong reason instead of hiding behind the first.
   red(
-    "SIGTERM during start-up: serve still stops cleanly (exit 0, nothing left, home clean)",
-    { reason: /serve died of SIGTERM instead of stopping.*process left: pid \d+ .*vault.*serve/, lane: "A2" },
+    "SIGTERM during start-up: serve exits 0 (the signal is handled, not fatal)",
+    { reason: /^serve died of SIGTERM instead of stopping$/, lane: "A2" },
     async () => {
       const o = await duringStartup();
-      must(o.problems.length === 0, o.problems.join("; "));
+      must(o.exit !== null, o.running.join("; "));
+      const bad = exitProblem(o.exit);
+      must(!bad, bad!);
+    },
+    SLOW,
+  );
+
+  red(
+    "SIGTERM during start-up: both ports closed, no process left",
+    { reason: /^still listening: 127\.0\.0\.1:1940 \(vault\); process left: pid \d+ \S*bun \S*vault\S*\/cli\.ts serve$/, lane: "A2" },
+    async () => {
+      const o = await duringStartup();
+      must(o.running.length === 0, o.running.join("; "));
+    },
+    SLOW,
+  );
+
+  red(
+    "SIGTERM during start-up: the home is left clean (WAL checkpointed, no instance file)",
+    { reason: /^left behind: hub-instance\.json; WAL left: vault\/data\/life[0-9a-f]+\/vault\.db-wal \d+ bytes$/, lane: "A2" },
+    async () => {
+      const o = await duringStartup();
+      cleanOnDiskOf(o.exit, o.running, o.disk);
     },
     SLOW,
   );

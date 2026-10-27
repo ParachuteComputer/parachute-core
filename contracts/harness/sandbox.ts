@@ -95,10 +95,11 @@ export async function enterSandbox(): Promise<void> {
     // Host → level 1: new user, network, PID and mount namespaces, root inside them.
     const unshare = Bun.which("unshare");
     if (!unshare) throw new Error("sandbox: `unshare` (util-linux) is needed to run a candidate");
+    const keep = keepPaths(); // before the env is copied: it records PCORE_NODE_BIN
     const p = Bun.spawn(
       [unshare, "--user", "--map-root-user", "--net", "--pid", "--fork", "--mount-proc", "--kill-child", "--", process.execPath, ...process.argv.slice(1)],
       {
-        env: { ...process.env, [SANDBOX_ENV]: "1", PCORE_SANDBOX_KEEP: JSON.stringify(keepPaths()), PCORE_HOST_UID: String(process.getuid?.() ?? "") },
+        env: { ...process.env, [SANDBOX_ENV]: "1", PCORE_SANDBOX_KEEP: JSON.stringify(keep), PCORE_HOST_UID: String(process.getuid?.() ?? "") },
         stdio: ["inherit", "inherit", "inherit"],
       },
     );
@@ -169,6 +170,15 @@ export async function sandboxOutboundPackets(): Promise<number> {
   return n;
 }
 
+/** The real Node binary on the host, or null. Inside the sandbox, PCORE_NODE_BIN carries it. */
+export function hostNode(): string | null {
+  if (process.env.PCORE_NODE_BIN) return process.env.PCORE_NODE_BIN;
+  const which = Bun.which("node");
+  if (!which) return null;
+  const r = Bun.spawnSync([which, "-e", "process.stdout.write(process.execPath)"], { stdout: "pipe", stderr: "ignore" });
+  return r.exitCode === 0 ? r.stdout.toString() : null;
+}
+
 /** What a run needs from the host filesystem, besides the system (/usr, /etc): this repo, the candidate and old stock
  *  build when they live elsewhere, Bun, and Node (Benjamin's suite). Computed outside, before the mounts. */
 function keepPaths(): { path: string; rw: boolean }[] {
@@ -179,11 +189,11 @@ function keepPaths(): { path: string; rw: boolean }[] {
   for (const k of ["CANDIDATE_DIR", "OLD_STOCK_DIR"]) if (process.env[k]) keep.push({ path: resolve(process.env[k]!), rw: false });
   keep.push({ path: realpathSync(process.execPath), rw: false });
   if (process.execPath !== realpathSync(process.execPath)) keep.push({ path: process.execPath, rw: false });
-  const node = Bun.which("node");
+  // Node's real binary, asked of Node itself: a version manager's shim (mise, nvm) needs config the sandbox hides.
+  const node = hostNode();
   if (node) {
-    const real = realpathSync(node);
-    keep.push({ path: dirname(dirname(real)), rw: false }); // the install, so its lib/ comes along
-    if (node !== real) keep.push({ path: dirname(node), rw: false }); // a shim folder (mise, nvm)
+    keep.push({ path: dirname(dirname(node)), rw: false }); // the install, so its lib/ comes along
+    process.env.PCORE_NODE_BIN = node;
   }
   return keep.filter((k) => existsSync(k.path));
 }
