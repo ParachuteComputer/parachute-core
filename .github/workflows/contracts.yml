@@ -1,10 +1,13 @@
-# The contract suites (contracts/README.md).
+# The contract suites (contracts/README.md), and the moved code's own checks.
+#   packages   the workspace (packages/): frozen install, every dependency in range, typecheck, and the vault's
+#              and hub's own test suites, as their repos ran them
 #   today      today's contracts against the pinned hub and vault (the reference for today's behaviour)
-#   candidate  every suite against the candidate this job builds, launched the way a user launches it, in a
-#              private network + PID namespace; the run must report the hash the build produced (PLAN §7.2)
+#   candidate  every suite against the core candidate this job builds from packages/ (build:core), launched the
+#              way a user launches it, in a private network + PID namespace; the run must report the hash the
+#              build produced (PLAN §7.2). The stock 0.7 build is there too, as "the old programs".
 #   prism      Benjamin's compatibility suite, unchanged, against the same build (the Nov 9 gate, PLAN §3.1)
-#   mutants    the contracts must catch each mutant, on the pinned vault and on rebuilt candidates; each flip
-#              must turn its red contracts green
+#   mutants    the contracts must catch each mutant, on the pinned vault and on rebuilt core candidates; each
+#              flip must turn its red contracts green
 # Everything is local to the runner: throwaway homes, random ports, no live service.
 name: contracts
 
@@ -22,6 +25,32 @@ env:
   BUN_VERSION: "1.4"
 
 jobs:
+  packages:
+    name: the moved code (workspace, typecheck, the vault's and hub's own tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - run: bun install --frozen-lockfile
+      - name: every installed dependency is in the range its dependent asks for
+        run: bun scripts/check-dependency-tree.ts .
+      - name: typecheck (cli, vault, hub)
+        run: |
+          bun run --cwd packages/cli typecheck
+          bun run --cwd packages/vault typecheck
+          bun run --cwd packages/hub typecheck
+      - name: the vault's own tests
+        working-directory: packages/vault
+        run: |
+          bun test ./src/
+          bun test ./core/src/
+      - name: the hub's own tests
+        working-directory: packages/hub
+        run: bun test --timeout 30000 ./src
+
   today:
     name: today's contracts (+ v1 pending)
     runs-on: ubuntu-latest
@@ -70,9 +99,12 @@ jobs:
       - *sandbox
       - *repos
       - run: bun install --frozen-lockfile
-      - name: build the candidate
+      - name: build the candidate (the one program, from packages/)
         id: build
-        run: bun run build:stock --out "$RUNNER_TEMP/candidate"
+        run: bun run build:core --out "$RUNNER_TEMP/candidate"
+      - &stock
+        name: build the old programs (stock 0.7 from the pins, for takeover, identity and rollback)
+        run: bun run build:stock
       - name: the contracts, against exactly that build
         env:
           CANDIDATE_DIR: ${{ steps.build.outputs.dir }}
@@ -103,9 +135,10 @@ jobs:
       - *sandbox
       - *repos
       - run: bun install --frozen-lockfile
-      - name: build the candidate
+      - name: build the candidate (the one program, from packages/)
         id: build
-        run: bun run build:stock --out "$RUNNER_TEMP/candidate"
+        run: bun run build:core --out "$RUNNER_TEMP/candidate"
+      - *stock
       - name: his suite, unchanged (expected FAILs listed in prism-compat-expected.json until slice 1)
         env:
           CANDIDATE_DIR: ${{ steps.build.outputs.dir }}
@@ -132,7 +165,7 @@ jobs:
         run: bun run mutants
 
   mutants-candidate:
-    name: mutants and flips on rebuilt candidates
+    name: mutants and flips on rebuilt core candidates
     runs-on: ubuntu-latest
     needs: [candidate]
     timeout-minutes: 120
@@ -147,5 +180,6 @@ jobs:
       - *sandbox
       - *repos
       - run: bun install --frozen-lockfile
+      - *stock
       - name: each mutant caught, each flip flipped
         run: bun run mutants:candidate
