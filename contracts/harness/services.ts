@@ -162,18 +162,19 @@ export async function startServices(opts: { keep?: boolean } = {}): Promise<Runn
   const sandbox = mkdtempSync(join(process.env.TMPDIR ?? tmpdir(), `pcore-contracts-${runId}-`));
   let hubProc: ReturnType<typeof Bun.spawn> | null = null;
   let vaultProc: ReturnType<typeof Bun.spawn> | null = null;
-  let stopped = false;
-  const stop = async () => {
-    if (stopped) return;
-    stopped = true;
-    live.delete(stop);
-    try {
-      await kill(vaultProc);
-      await kill(hubProc);
-    } finally {
-      if (!opts.keep) rmSync(sandbox, { recursive: true, force: true });
-    }
-  };
+  // One shared promise: a signal handler and the normal exit path may both call stop(), and both must wait for
+  // the whole cleanup (an early return here once let process.exit cut the cleanup short and leak the hub).
+  let stopping: Promise<void> | null = null;
+  const stop = () =>
+    (stopping ??= (async () => {
+      live.delete(stop);
+      try {
+        await kill(vaultProc);
+        await kill(hubProc);
+      } finally {
+        if (!opts.keep) rmSync(sandbox, { recursive: true, force: true });
+      }
+    })());
   live.add(stop);
 
   const home = join(sandbox, "home");
