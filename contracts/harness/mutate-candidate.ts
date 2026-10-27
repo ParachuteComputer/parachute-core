@@ -34,7 +34,13 @@ if (unknown.length) {
 const contracts = resolve(import.meta.dir, "..");
 // One snapshot of the workspace for the whole run: every mutant is built from the same source.
 const snapshot = mkdtempSync(join(process.env.TMPDIR ?? tmpdir(), "pcore-cmut-base-"));
-const staged = { dir: join(snapshot, "lib"), rev: await stageWorkspace(resolve(contracts, ".."), join(snapshot, "lib")) };
+const staged = { dir: join(snapshot, "lib"), rev: await stageWorkspace(resolve(contracts, ".."), join(snapshot, "lib")), installed: true };
+// Installed once, here: each mutant gets a copy of the installed workspace with its one change, so a network blip
+// in a mutant's own install can't stand in for a missed mutant. No mutant may change what install builds.
+{
+  const inst = await run(["bun", "install", "--frozen-lockfile"], { cwd: staged.dir });
+  if (inst.code !== 0) throw new Error(`bun install of the snapshot failed: ${inst.out.slice(-1500)}`);
+}
 console.log(`[mutants:candidate] source ${staged.rev}`);
 let current: string | null = null;
 let child: ReturnType<typeof Bun.spawn> | null = null;
@@ -47,18 +53,20 @@ const cleanup = async () => {
 process.on("SIGINT", async () => (await cleanup(), process.exit(130)));
 process.on("SIGTERM", async () => (await cleanup(), process.exit(130)));
 
-const results: { name: string; kind: string; ok: boolean }[] = [];
+const results: { name: string; kind: string; ok: boolean; error?: boolean }[] = [];
 for (const m of all.filter((m) => only.length === 0 || only.includes(m.name))) {
   const which = m.repo ?? "vault";
   const dir = mkdtempSync(join(process.env.TMPDIR ?? tmpdir(), `pcore-cmut-${m.name}-`));
   current = dir;
   let ok = false;
+  let errored = false;
   try {
     const cand = join(dir, "candidate");
     // The change goes into the copied workspace, never this checkout: patches and paths are relative to the
     // package (packages/vault or packages/hub), as they were to today's repos.
     const apply = async (lib: string) => {
       const pkg = join(lib, "packages", which);
+      if (m.file?.startsWith("packages/")) throw new Error(`${m.name}: ${which}/${m.file} is built at install (the snapshot is installed once)`);
       if (m.patch) {
         const ap = await run(["git", "apply", join(import.meta.dir, m.patch)], { cwd: pkg });
         if (ap.code !== 0) throw new Error(`${m.name}: git apply ${m.patch} failed: ${ap.out}`);
@@ -98,17 +106,18 @@ for (const m of all.filter((m) => only.length === 0 || only.includes(m.name))) {
     for (const t of red) console.log(`    red: ${t}`);
     if (!ok) console.log(out.slice(-3000));
   } catch (err) {
+    errored = true;
     console.log(`\n[${m.kind} ${m.name}] ERROR ${(err as Error).message}`);
   } finally {
     rmSync(dir, { recursive: true, force: true });
     current = null;
   }
-  results.push({ name: m.name, kind: m.kind, ok });
+  results.push({ name: m.name, kind: m.kind, ok, error: errored });
 }
 rmSync(snapshot, { recursive: true, force: true });
 console.log("");
 const width = Math.max(...results.map((r) => r.name.length));
-for (const r of results) console.log(`[mutants:candidate] ${r.kind.padEnd(6)} ${r.name.padEnd(width)}  ${r.ok ? (r.kind === "flip" ? "flipped" : "caught") : "MISSED"}`);
+for (const r of results) console.log(`[mutants:candidate] ${r.kind.padEnd(6)} ${r.name.padEnd(width)}  ${r.ok ? (r.kind === "flip" ? "flipped" : "caught") : r.error ? "ERROR (not tested)" : "MISSED"}`);
 const missed = results.filter((r) => !r.ok);
 console.log(`[mutants:candidate] ${results.length - missed.length}/${results.length} ok`);
 process.exit(missed.length ? 1 : 0);

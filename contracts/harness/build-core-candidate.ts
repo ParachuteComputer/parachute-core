@@ -45,7 +45,7 @@ export async function stageWorkspace(source: string, dest: string): Promise<stri
   mkdirSync(dest, { recursive: true });
   for (const f of files.filter(WORKSPACE)) {
     if (f.split("/").includes("node_modules")) continue;
-    if (existsSync(join(source, f))) cpSync(join(source, f), join(dest, f), { recursive: true, dereference: false });
+    if (existsSync(join(source, f))) cpSync(join(source, f), join(dest, f), { recursive: true, dereference: false, verbatimSymlinks: true });
   }
   const head = (await sh(["git", "rev-parse", "--short=7", "HEAD"], source).catch(() => "unknown")).trim();
   const dirty = (await sh(["git", "status", "--porcelain", "--", "package.json", "bun.lock", "bunfig.toml", "packages"], source).catch(() => "")).trim() ? "+changes" : "";
@@ -57,8 +57,9 @@ export async function buildCoreCandidate(opts: {
   /** A checkout to build from (default: this repo's working tree). */
   source?: string;
   /** Or a workspace stageWorkspace() already copied, with its revision: a mutant run builds every mutant from one
-   *  snapshot, so editing the checkout during the run changes nothing. */
-  staged?: { dir: string; rev: string };
+   *  snapshot, so editing the checkout during the run changes nothing. `installed`: the snapshot has been through
+   *  `bun install` already, so its copy is used as is (one network install per mutant run, not one per mutant). */
+  staged?: { dir: string; rev: string; installed?: boolean };
   /** Change the copied workspace (lib/) before install; `label` names the change in CANDIDATE.json. */
   edit?: { label: string; apply: (lib: string) => Promise<void> };
 }): Promise<{ sha256: string }> {
@@ -69,12 +70,13 @@ export async function buildCoreCandidate(opts: {
   mkdirSync(join(out, "bin"), { recursive: true });
   let rev: string;
   if (opts.staged) {
-    cpSync(opts.staged.dir, lib, { recursive: true, dereference: false });
+    // verbatimSymlinks: keep each link's target as written (bun's are relative), so the copy stays a closed tree.
+    cpSync(opts.staged.dir, lib, { recursive: true, dereference: false, verbatimSymlinks: true });
     rev = opts.staged.rev;
   } else rev = await stageWorkspace(source, lib);
   if (opts.edit) await opts.edit.apply(lib);
   // Builds the hub's packages (depcheck, door-contract) through the root `prepare` script.
-  await sh(["bun", "install", "--frozen-lockfile"], lib);
+  if (!opts.staged?.installed) await sh(["bun", "install", "--frozen-lockfile"], lib);
 
   for (const name of NAMES) symlinkSync(`../lib/packages/cli/bin/${name}`, join(out, "bin", name));
 
