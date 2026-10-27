@@ -137,7 +137,13 @@ describe("access with tag-scoped passes (today)", () => {
               }
             }
         }),
-        { numRuns: Number(process.env.FC_RUNS ?? 6), seed, endOnFailure: true },
+        {
+          numRuns: Number(process.env.FC_RUNS ?? 6),
+          seed,
+          endOnFailure: true,
+          // Always tried first: an untagged note, each root alone, a child tag, and a note under two roots.
+          examples: [[[[], [ROOTS[0]!], [ROOTS[1]!], [ROOTS[2]!], [TAGS[3]!], [ROOTS[1]!, ROOTS[2]!]]]],
+        },
       );
     },
     120_000,

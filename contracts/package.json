@@ -5,7 +5,8 @@
   "license": "AGPL-3.0-only",
   "scripts": {
     "today": "bun run harness/run.ts",
-    "test": "bun test suites/",
+    "v1": "bun run harness/run.ts --v1",
+    "mutants": "bun run harness/mutate.ts",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

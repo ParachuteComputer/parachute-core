@@ -47,6 +47,12 @@ export async function ensureRepos(): Promise<{ vault: string; hub: string }> {
   const out: Record<string, string> = {};
   for (const [key, name] of [["vault", "parachute-vault"], ["hub", "parachute-hub"]] as const) {
     const pin = (pins as any)[key] as { repo: string; commit: string };
+    // VAULT_REPO_DIR / HUB_REPO_DIR: run against another checkout (harness/mutate.ts uses this for mutants).
+    const override = process.env[`${key.toUpperCase()}_REPO_DIR`];
+    if (override) {
+      out[key] = override;
+      continue;
+    }
     const dir = join(root, name);
     if (!existsSync(join(dir, ".git"))) await sh(["git", "clone", "--quiet", pin.repo, dir]);
     const head = (await sh(["git", "rev-parse", "HEAD"], dir)).trim();

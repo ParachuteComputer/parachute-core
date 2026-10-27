@@ -3,7 +3,7 @@
 //   bun run today                 the `today` contracts (must pass)
 //   bun run today -- --v1         also the `v1` contracts (decided behaviour today's code lacks; marked failing)
 //   bun run today -- --keep       keep the temp home for a look afterwards
-//   bun run today -- <filter>     extra args go to `bun test` (e.g. a file name)
+//   bun run today -- suites/today/notes.test.ts   only that file; other extra args go to `bun test`
 //
 // To run against services you started yourself, skip this file: write a services JSON (see harness/services.ts,
 // `Services`) and run `CONTRACT_SERVICES=<file> bun test suites/today`.
@@ -33,8 +33,11 @@ const stopOnSignal = async () => {
 process.on("SIGINT", stopOnSignal);
 process.on("SIGTERM", stopOnSignal);
 try {
-  const dirs = ["suites/today", ...(v1 ? ["suites/v1"] : [])];
-  const p = Bun.spawn(["bun", "test", "--timeout", "60000", ...dirs, ...extra], {
+  // Named suite files replace the default set; anything else is passed to `bun test` as is.
+  const named = extra.filter((a) => a.startsWith("suites/"));
+  const dirs = named.length ? named : ["suites/today", ...(v1 ? ["suites/v1"] : [])];
+  const rest = extra.filter((a) => !a.startsWith("suites/"));
+  const p = Bun.spawn(["bun", "test", "--timeout", "60000", ...dirs.map((d) => `./${d}`), ...rest], {
     cwd: contracts,
     env: { ...process.env, CONTRACT_SERVICES: servicesFile },
     stdout: "inherit",
