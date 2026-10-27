@@ -1,10 +1,12 @@
-// Build the root bun.lock from the moved packages' own lockfiles, so the one workspace resolves every dependency to
-// the version vault and hub already locked in their repos (a fresh `bun install` moved 78 of the vault's and 29 of
-// the hub's to newer versions). Run it again after a `git subtree pull`:
+// Build the root bun.lock from the moved packages' own lockfiles, so the one workspace resolves its dependencies to
+// the versions vault and hub already locked in their repos (a fresh `bun install` moved 78 of the vault's and 29 of
+// the hub's to newer versions). Where the two locked one name differently, a hoisted tree keeps one: the rule below
+// picks it, and scripts/check-dependency-tree.ts lists each such departure with its reason (and fails on any other).
+// Run it again after a `git subtree pull`:
 //
 //   mv bun.lock /tmp/fresh.lock; bun install --lockfile-only; mv bun.lock /tmp/fresh.lock   (fresh workspace entries)
 //   bun scripts/lock-from-subtrees.ts /tmp/fresh.lock packages/vault/bun.lock packages/hub/bun.lock > bun.lock
-//   bun install && bun scripts/check-dependency-tree.ts .
+//   bun install && bun scripts/check-dependency-tree.ts . packages/vault/bun.lock packages/hub/bun.lock
 //
 // `fresh` supplies the workspace entries (they must match each package.json as it is now).
 const read = async (f: string) => Bun.JSONC.parse(await Bun.file(f).text()) as any;

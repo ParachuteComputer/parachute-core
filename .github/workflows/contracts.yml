@@ -35,8 +35,8 @@ jobs:
         with:
           bun-version: ${{ env.BUN_VERSION }}
       - run: bun install --frozen-lockfile
-      - name: every installed dependency is in the range its dependent asks for
-        run: bun scripts/check-dependency-tree.ts .
+      - name: every dependency in range, and every version the moved repos locked kept (or a listed departure)
+        run: bun scripts/check-dependency-tree.ts . packages/vault/bun.lock packages/hub/bun.lock
       - name: typecheck (cli, vault, hub)
         run: |
           bun run --cwd packages/cli typecheck

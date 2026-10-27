@@ -21,7 +21,7 @@ say what that program must do, written so they ran against **today's** code firs
 | [`packages/vault/`](packages/vault/) | Today's vault, moved in with `git subtree` at `42fbf93` (vault 0.7.9), history kept. |
 | [`packages/hub/`](packages/hub/) | Today's hub, moved in with `git subtree` at `53d327b` (hub 0.7.19), history kept. |
 | [`packages/cli/`](packages/cli/) | The one command, `parachute-core`: the hub's commands, `vault <command>` for the vault's, and `version [--json]`. `parachute` and `parachute-vault` are aliases inside the built folder only. |
-| `package.json`, `bun.lock` | One Bun workspace over `packages/`. `bun.lock` keeps the versions the two repos had locked (`scripts/lock-from-subtrees.ts`). |
+| `package.json`, `bun.lock` | One Bun workspace over `packages/`. `bun.lock` keeps the versions the two repos had locked, except seven listed with their reasons in `scripts/check-dependency-tree.ts` (one otpauth for both, and type packages). |
 | [`contracts/`](contracts/) | A black-box contract suite (Bun + TypeScript). It talks to a running vault and hub over HTTP and MCP, the same doors real clients use. It never imports their code. |
 | [`contracts/harness/`](contracts/harness/) | Starts a throwaway vault and hub from today's repos at pinned commits, on random local ports, in a temp home; stops and deletes them after. |
 | [`PROCESS.md`](PROCESS.md) | How we build: what we reuse and what we rewrite, which tests we write, how a change lands, how people and agents work here together. |
