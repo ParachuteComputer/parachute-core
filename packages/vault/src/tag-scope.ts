@@ -49,6 +49,8 @@ const OUT_OF_SCOPE_LABEL = "(outside your token's tag scope)";
 export class TagScopeSet extends Set<string> {
   privateTags: Set<string> = new Set();
   privateRoots: string[] = [];
+  /** The token's raw `scoped_tags`: a tag equal to or under one is never private to it. */
+  scopedRoots: string[] = [];
   /**
    * Fail-closed marker (vault#766 retro-review): the vault's `private_tags`
    * could not be determined (key present but unparseable, vault.yaml
@@ -104,6 +106,7 @@ export async function expandTokenTagScope(
     priv = res.tags;
   }
   const out = new TagScopeSet(await store.expandTagsWithDescendants(scoped_tags));
+  out.scopedRoots = [...scoped_tags];
   if (priv.length > 0) {
     // Exempt = covered by the token itself: in the expanded allowlist, or
     // equal to / under a raw `scoped_tags` entry (string-form sub-tags).
@@ -196,9 +199,12 @@ export function tagDeniedByPrivateTags(tag: string, allowed: Set<string> | null)
   if (allowed.denyAll) return true;
   if (allowed.privateTags.size === 0 && allowed.privateRoots.length === 0) return false;
   if (allowed.privateTags.has(tag)) return true;
-  const root = tag.split("/")[0];
-  if (!root || !allowed.privateRoots.includes(root) || allowed.has(tag)) return false;
-  return true;
+  // String-form sub-tags (no declared hierarchy): a tag equal to or under a
+  // private tag, at any depth (`secret/nested` hides `secret/nested/child`),
+  // unless the token names it or an ancestor of it.
+  const under = (t: string, root: string) => t === root || t.startsWith(`${root}/`);
+  if (!allowed.privateRoots.some((p) => under(tag, p))) return false;
+  return !(allowed.has(tag) || allowed.scopedRoots.some((s) => under(tag, s)));
 }
 
 /**
