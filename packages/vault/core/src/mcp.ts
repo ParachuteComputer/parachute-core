@@ -532,6 +532,12 @@ export interface GenerateMcpToolsOpts {
    */
   resolveVisibility?: (note: Note) => boolean;
   /**
+   * `mayChangePublished` is an OPTIONAL check, read at each write: false means
+   * this session may not change a note's `metadata.published` (a tag-scoped
+   * session without the published tag). Omitted (unscoped) → no check.
+   */
+  mayChangePublished?: () => boolean;
+  /**
    * `searchVisibility` is an OPTIONAL per-note predicate for `query-notes`'s
    * full-text `search`: matches are ranked and limited over only the notes it
    * accepts, so a scoped answer doesn't depend on notes the caller can't see
@@ -660,9 +666,12 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
     path?: string | null;
     tags?: string[];
     metadata?: Record<string, unknown>;
+    wasPublished?: boolean;
+    defaultTags?: string[];
   }): void => {
     enforceStrictWrite(store, shape, {
       isVisible: expandVisibility,
+      ...(opts?.mayChangePublished ? { mayChangePublished: opts.mayChangePublished() } : {}),
       bypass: strictBypass,
       onBypass: onStrictBypass
         ? (violations) =>
@@ -1576,7 +1585,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           // (existing ∪ incoming), not the raw incoming item — a caller
           // updating one field of an already-conforming note shouldn't have
           // to re-supply every `required` field just to pass validation.
-          enforceStrict({ path: existingNote.path, tags: [...projectedTags], metadata: projectedMetadata });
+          enforceStrict({ path: existingNote.path, tags: [...projectedTags], metadata: projectedMetadata, defaultTags: incomingTags, wasPublished: (existingNote.metadata as Record<string, unknown> | undefined)?.published === true });
 
           // vault#555 fix 2 (W8 fix-2 bug class, generalist must-fix): a
           // tags-only or links-only "update" leaves `updates` empty, so
@@ -1681,6 +1690,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
               path: item.path as string | undefined,
               tags: item.tags as string[] | undefined,
               metadata: item.metadata as Record<string, unknown> | undefined,
+              defaultTags: item.tags as string[] | undefined,
             });
             let note: Note;
             try {
@@ -1779,6 +1789,10 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
         const mutatedIds = new Set<string>();
         for (const note of created) {
           if (noMutateIds.has(note.id)) continue;
+          // A scoped session (ifExistsVisible set) updating an existing note
+          // applied the defaults of the tags it brought, checked; it never
+          // backfills defaults of the note's other tags, hidden ones included.
+          if (ifExistsVisible && existedMap.get(note.id) === true) continue;
           if (note.tags && note.tags.length > 0) {
             for (const id of await applySchemaDefaults(store, db, [note.id], note.tags)) {
               mutatedIds.add(id);
@@ -1995,6 +2009,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
                   path: createOpts.path ?? undefined,
                   tags: createOpts.tags,
                   metadata: createOpts.metadata,
+                  defaultTags: createOpts.tags,
                 });
                 const created = await store.createNote(content, createOpts);
                 await applySchemaDefaults(store, db, [created.id], created.tags ?? []);
@@ -2198,7 +2213,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
               const projectedMeta = stItem !== undefined
                 ? { ...baseMeta, [stItem.field as string]: stItem.to }
                 : baseMeta;
-              enforceStrict({ path: note.path, tags: [...projectedTags], metadata: projectedMeta });
+              enforceStrict({ path: note.path, tags: [...projectedTags], metadata: projectedMeta, defaultTags: ((item.tags as any)?.add as string[] | undefined) ?? [], wasPublished: (note.metadata as Record<string, unknown> | undefined)?.published === true });
             }
 
             // vault#555 fix 2 — tag and link mutations must bump `updated_at`
@@ -3030,6 +3045,22 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
  * explicitly. Don't add a defaults path that could inject a violating value
  * without re-gating.
  */
+/** The defaults `applySchemaDefaults` would offer for these tags (first tag declaring a field wins). */
+export function schemaDefaultsFor(db: Database, tags: string[]): Record<string, unknown> {
+  const schemas = tagSchemaOps.getTagSchemaMap(db);
+  const defaults: Record<string, unknown> = {};
+  for (const tag of tags) {
+    const fields = schemas[tag]?.fields;
+    if (!fields) continue;
+    for (const [field, fieldSchema] of Object.entries(fields)) {
+      if (field in defaults) continue;
+      const value = defaultForField(fieldSchema);
+      if (value !== undefined) defaults[field] = value;
+    }
+  }
+  return defaults;
+}
+
 export async function applySchemaDefaults(store: Store, db: Database, noteIds: string[], tags: string[]): Promise<string[]> {
   const schemas = tagSchemaOps.getTagSchemaMap(db);
   if (Object.keys(schemas).length === 0) return [];
@@ -3112,11 +3143,52 @@ export function defaultForField(field: { default?: unknown }): unknown {
  * Returns the would-be violations (empty when none) so a caller can inspect
  * them; the throw / bypass decision is already made internally.
  */
+/**
+ * A tag-scoped write tried to change whether a note is published through
+ * `metadata.published` (which `/view` honours like the published tag) without
+ * the published tag in its scope (G2: a scoped writer can't make a note public,
+ * or take it down, without authority over publishing).
+ */
+export class PublishScopeError extends Error {
+  code = "PUBLISH_OUT_OF_SCOPE" as const;
+  error_type = "tag_scope_violation" as const;
+  constructor() {
+    super("tag_scope_violation: this token can't change metadata.published (whether the note is public) without the published tag in its scope");
+    this.name = "PublishScopeError";
+  }
+}
+
 export function enforceStrictWrite(
   store: Store,
-  shape: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown> },
-  opts?: { bypass?: boolean; onBypass?: (violations: ValidationWarning[]) => void; isVisible?: (note: Note) => boolean },
+  shape: {
+    path?: string | null;
+    tags?: string[];
+    metadata?: Record<string, unknown>;
+    /** Whether the note was published (metadata.published) before this write. */
+    wasPublished?: boolean;
+    /** The tags whose schema defaults the write applies afterwards (all on a create, the added ones on an update). */
+    defaultTags?: string[];
+  },
+  opts?: {
+    bypass?: boolean;
+    onBypass?: (violations: ValidationWarning[]) => void;
+    isVisible?: (note: Note) => boolean;
+    /** false: the write may not change `metadata.published` (a scoped pass without the published tag). */
+    mayChangePublished?: boolean;
+  },
 ): ValidationWarning[] {
+  if (opts?.mayChangePublished === false) {
+    // As it will be after the write: schema defaults fill fields the note
+    // lacks (applySchemaDefaults, for `defaultTags`), so a default
+    // `published: true` publishes too.
+    const meta = shape.metadata ?? {};
+    let published = meta.published;
+    if (!("published" in meta) && shape.defaultTags?.length) {
+      const defaults = schemaDefaultsFor(store.db, shape.defaultTags.map(stripTagHash));
+      if ("published" in defaults) published = defaults.published;
+    }
+    if ((published === true) !== (shape.wasPublished === true)) throw new PublishScopeError();
+  }
   const status = store.validateNoteAgainstSchemas(shape, opts?.isVisible ? { isVisible: opts.isVisible } : undefined);
   const violations = strictViolations(status);
   if (violations.length === 0) return [];

@@ -310,6 +310,8 @@ export function generateScopedMcpTools(
     ...(nearTraversable ? { nearTraversable } : {}),
     ...(ifExistsVisible ? { ifExistsVisible } : {}),
     ...(aggregateVisibility ? { aggregateVisibility, searchVisibility: aggregateVisibility, resolveVisibility: aggregateVisibility } : {}),
+    // G2: a scoped session changes `metadata.published` only with the published tag in scope.
+    ...(scoped ? { mayChangePublished: () => tagVisibleInScope(readVaultConfig(vaultName)?.published_tag ?? "publish", allowedHolder.value, rawTags) } : {}),
     ...(ambiguityVisible ? { ambiguityVisible } : {}),
     ...(writeContext ? { writeContext } : {}),
     ...(strictBypass ? { strictBypass } : {}),

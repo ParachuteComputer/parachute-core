@@ -77,7 +77,7 @@ import {
   resolveEmbeddingCapability,
   type EmbeddingCapability,
 } from "./embedding/capability.ts";
-import { getSharedEmbeddingProvider } from "./vault-store.ts";
+import { getSharedEmbeddingProvider, getVaultNameForStore } from "./vault-store.ts";
 import { loadSchemaConfig } from "../core/src/schema-defaults.ts";
 import {
   buildExpandVisibility,
@@ -146,10 +146,11 @@ const NO_WRITE_CTX: WriteCtx = { actor: null, via: null };
 function gateStrictWrite(
   store: Store,
   writeCtx: WriteCtx,
-  shape: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown> },
+  shape: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown>; wasPublished?: boolean; defaultTags?: string[] },
   tagScope: TagScopeCtx = NO_TAG_SCOPE,
 ): void {
   enforceStrictWrite(store, shape, {
+    ...(tagScope.raw !== null ? { mayChangePublished: mayPublish(store, tagScope) } : {}),
     isVisible: buildExpandVisibility(tagScope.allowed, tagScope.raw),
     bypass: writeCtx.bypassStrict === true,
     onBypass: (violations: ValidationWarning[]) => {
@@ -162,6 +163,13 @@ function gateStrictWrite(
       });
     },
   });
+}
+
+/** Whether a tag-scoped pass may change `metadata.published`: only with the vault's published tag in scope. */
+function mayPublish(store: Store, tagScope: TagScopeCtx): boolean {
+  const name = getVaultNameForStore(store);
+  const publishedTag = (name ? readVaultConfig(name)?.published_tag : undefined) ?? "publish";
+  return tagVisibleInScope(publishedTag, tagScope.allowed, tagScope.raw);
 }
 
 import {
@@ -241,6 +249,9 @@ function conflictResponse(e: any): Response | null {
   // Strict-schema rejection (vault#299 Part A). One error carrying ALL
   // per-field violations (settled lead #1). 422 Unprocessable Entity —
   // the note exists / request is well-formed but violates the contract.
+  if (e && e.code === "PUBLISH_OUT_OF_SCOPE") {
+    return json({ error: "Forbidden", error_type: "tag_scope_violation", message: e.message }, 403);
+  }
   if (e && e.code === "SCHEMA_VALIDATION") {
     return json(
       {
@@ -2483,7 +2494,7 @@ async function handleNotesInner(
         const incomingTags: string[] = item.tags ?? [];
         const projectedTags = new Set<string>([...(existingNote.tags ?? []), ...incomingTags]);
         const projectedMetadata = updates.metadata ?? ((existingNote.metadata as Record<string, unknown>) ?? {});
-        gateStrictWrite(store, writeCtx, { path: existingNote.path, tags: [...projectedTags], metadata: projectedMetadata }, tagScope);
+        gateStrictWrite(store, writeCtx, { path: existingNote.path, tags: [...projectedTags], metadata: projectedMetadata, defaultTags: incomingTags, wasPublished: (existingNote.metadata as Record<string, unknown> | undefined)?.published === true }, tagScope);
 
         // vault#555 fix 2 (W8 fix-2 bug class, generalist must-fix): gate the
         // core UPDATE on the tag/link mutation too, not just `updates` — a
@@ -2572,6 +2583,7 @@ async function handleNotesInner(
             path: item.path,
             tags: item.tags,
             metadata: item.metadata,
+            defaultTags: item.tags,
           }, tagScope);
           let note: Note;
           try {
@@ -2704,6 +2716,10 @@ async function handleNotesInner(
         // schema-default backfill of a since-added default the existing
         // note predates — skip them entirely.
         if (noMutateIds.has(note.id)) continue;
+        // A scoped session's update of an existing note applied the defaults of
+        // the tags it brought (checked, in the existing-note branch); it never
+        // backfills defaults of the note's other tags, hidden ones included.
+        if (tagScope.raw !== null && existedMap.get(note.id) === true) continue;
         if (note.tags?.length) {
           for (const id of await applySchemaDefaults(store, db, [note.id], note.tags)) {
             mutatedIds.add(id);
@@ -3038,6 +3054,7 @@ async function handleNotesInner(
         gateStrictWrite(store, writeCtx, {
           path: note ? note.path : latestTombstone(db, id)?.path,
           tags: note?.tags ?? [], metadata: version.metadata,
+          wasPublished: (note?.metadata as Record<string, unknown> | undefined)?.published === true,
         }, tagScope);
         const restored = await store.restoreNoteVersion(id, storageIndex, {
           actor: writeCtx.actor, via: writeCtx.via,
@@ -3179,6 +3196,7 @@ async function handleNotesInner(
             path: createOpts.path ?? undefined,
             tags: createOpts.tags,
             metadata: createOpts.metadata,
+            defaultTags: createOpts.tags,
           }, tagScope);
           const created = await store.createNote(content, createOpts);
           if (tagsArr.length > 0) {
@@ -3463,7 +3481,7 @@ async function handleNotesInner(
         const projectedMeta = stBody !== undefined
           ? { ...baseMeta, [stBody.field as string]: stBody.to }
           : baseMeta;
-        gateStrictWrite(store, writeCtx, { path: note.path, tags: [...projectedTags], metadata: projectedMeta }, tagScope);
+        gateStrictWrite(store, writeCtx, { path: note.path, tags: [...projectedTags], metadata: projectedMeta, defaultTags: (body.tags?.add as string[] | undefined) ?? [], wasPublished: (note.metadata as Record<string, unknown> | undefined)?.published === true }, tagScope);
       }
 
       // vault#555 fix 2 — tag and link mutations must bump `updated_at` too,
