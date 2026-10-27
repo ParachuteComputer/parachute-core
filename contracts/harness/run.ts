@@ -29,6 +29,7 @@ process.on("SIGTERM", onSignal);
 const t0 = Date.now();
 const running = await startServices({ keep });
 const s = running.services;
+console.log(`[contracts] code: ${running.provenance}`);
 console.log(`[contracts] hub ${s.hub}, vault "${s.vaultName}" at ${s.vaultDirect} (${Date.now() - t0} ms)`);
 
 const servicesFile = join(s.home, "..", "..", "services-for-contracts.json");

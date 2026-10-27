@@ -36,6 +36,8 @@ jobs:
         run: bun run today
       - name: v1 contracts (marked failing until built)
         run: bun run v1
+      - name: harness self-tests (origin guard, cleanup, pinned checkouts)
+        run: bun run selftest
 
   mutants:
     name: mutants (the contracts must catch each)

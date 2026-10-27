@@ -9,11 +9,12 @@
 //     config.yaml first;
 //   - the vault trusts http://127.0.0.1:1939 unless told otherwise (vault src/hub-jwt.ts:24-41) → we always set
 //     PARACHUTE_HUB_ORIGIN and PARACHUTE_HUB_JWKS_ORIGIN to the throwaway hub.
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { randomBytes } from "node:crypto";
 import pins from "../pins.json";
+import { allowOrigins, safeFetch } from "./guard.ts";
 
 export interface Services {
   hub: string; // http://127.0.0.1:<port>
@@ -29,6 +30,26 @@ export interface Services {
 // Ports are drawn from 47000-49499, so these can't come up; the guard stays in case the range ever changes.
 const FORBIDDEN_PORTS = new Set([1939, 1940, 1941, 1942, 1943, 1944, 1945, 1946]);
 const CONTRACTS = resolve(import.meta.dir, "..");
+// Preloaded into both services: they exit if this process dies, even by SIGKILL (harness/watchdog.ts).
+const WATCHDOG = join(import.meta.dir, "watchdog.ts");
+const SANDBOX_PREFIX = "pcore-contracts-";
+
+/** Remove temp homes left by harness processes that are gone (e.g. SIGKILLed: no cleanup code could run). */
+function sweepStaleSandboxes(base: string): void {
+  for (const name of readdirSync(base)) {
+    if (!name.startsWith(SANDBOX_PREFIX)) continue;
+    const ownerFile = join(base, name, "owner.pid");
+    if (!existsSync(ownerFile)) continue;
+    const owner = Number(readFileSync(ownerFile, "utf8"));
+    let alive = true;
+    try {
+      process.kill(owner, 0);
+    } catch {
+      alive = false;
+    }
+    if (!alive) rmSync(join(base, name), { recursive: true, force: true });
+  }
+}
 
 export function reposDir(): string {
   return process.env.PARACHUTE_REPOS ?? join(CONTRACTS, ".cache", "repos");
@@ -41,17 +62,52 @@ async function sh(cmd: string[], cwd?: string): Promise<string> {
   return out;
 }
 
-/** Clone vault and hub at their pins (once) and install their dependencies. */
-export async function ensureRepos(): Promise<{ vault: string; hub: string }> {
+// Ignored files a pinned checkout may carry: installed dependencies, and the packages the hub's own `prepare`
+// script builds from tracked source on install (their bytes are checked against the stamp below).
+const ALLOWED_IGNORED = [/(^|\/)node_modules\//, /^packages\/[^/]+\/dist\//];
+
+/** Files that make a checkout differ from its commit: edits, untracked files, unexpected ignored files. */
+export async function dirtyFiles(dir: string): Promise<string[]> {
+  const out = await sh(["git", "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored"], dir);
+  return out
+    .split("\0")
+    .filter(Boolean)
+    .filter((e) => !(e.startsWith("!! ") && ALLOWED_IGNORED.some((re) => re.test(e.slice(3)))))
+    .map((e) => e.slice(3));
+}
+
+/** A hash of the install-built output, so a hand-edited dist/ can't pass as pinned code. */
+async function buildHash(dir: string): Promise<string> {
+  const files = (await sh(["git", "ls-files", "-z", "--others", "--ignored", "--exclude-standard"], dir))
+    .split("\0")
+    .filter((f) => /^packages\/[^/]+\/dist\//.test(f))
+    .sort();
+  const h = new Bun.CryptoHasher("sha256");
+  for (const f of files) h.update(`${f}\0`).update(await Bun.file(join(dir, f)).bytes());
+  return h.digest("hex");
+}
+
+export interface Repos {
+  vault: string;
+  hub: string;
+  /** One line saying exactly what code this run uses; printed by harness/run.ts. */
+  provenance: string;
+}
+
+/** Clone vault and hub at their pins (once), refuse checkouts that differ from the pins, install dependencies. */
+export async function ensureRepos(): Promise<Repos> {
   const root = reposDir();
   mkdirSync(root, { recursive: true });
   const out: Record<string, string> = {};
+  const said: string[] = [];
   for (const [key, name] of [["vault", "parachute-vault"], ["hub", "parachute-hub"]] as const) {
     const pin = (pins as any)[key] as { repo: string; commit: string };
-    // VAULT_REPO_DIR / HUB_REPO_DIR: run against another checkout (harness/mutate.ts uses this for mutants).
+    // VAULT_REPO_DIR / HUB_REPO_DIR: run against another checkout on purpose (harness/mutate.ts uses this). Such a
+    // run is not a pinned run, and says so.
     const override = process.env[`${key.toUpperCase()}_REPO_DIR`];
     if (override) {
       out[key] = override;
+      said.push(`${key} NOT PINNED (from ${override})`);
       continue;
     }
     const dir = join(root, name);
@@ -61,16 +117,28 @@ export async function ensureRepos(): Promise<{ vault: string; hub: string }> {
       await sh(["git", "fetch", "--quiet", "origin"], dir).catch(() => {});
       await sh(["git", "checkout", "--quiet", pin.commit], dir);
     }
-    // Reinstall whenever the checked-out commit differs from the one the dependencies were installed for.
+    const dirty = await dirtyFiles(dir);
+    if (dirty.length) {
+      throw new Error(
+        `${dir} differs from pinned commit ${pin.commit}: ${dirty.slice(0, 10).join(", ")}${dirty.length > 10 ? ", ..." : ""}. ` +
+          `Delete it to re-clone, or use ${key.toUpperCase()}_REPO_DIR for a deliberate unpinned run.`,
+      );
+    }
+    // Reinstall whenever the commit differs from the one the dependencies were installed for; then the build
+    // output must match what that install produced.
     const stamp = join(dir, "node_modules", ".contracts-installed-for");
     const want = (await sh(["git", "rev-parse", "HEAD"], dir)).trim();
-    if (!existsSync(stamp) || readFileSync(stamp, "utf8").trim() !== want) {
+    const [stampedCommit, stampedBuild] = existsSync(stamp) ? readFileSync(stamp, "utf8").trim().split(" ") : [];
+    if (stampedCommit !== want) {
       await sh(["bun", "install", "--frozen-lockfile"], dir);
-      writeFileSync(stamp, `${want}\n`);
+      writeFileSync(stamp, `${want} ${await buildHash(dir)}\n`);
+    } else if (stampedBuild !== (await buildHash(dir))) {
+      throw new Error(`${dir}: packages/*/dist changed since install. Delete ${stamp} to rebuild.`);
     }
     out[key] = dir;
+    said.push(`${key} ${pin.commit} (clean)`);
   }
-  return out as { vault: string; hub: string };
+  return { vault: out.vault!, hub: out.hub!, provenance: said.join(", ") };
 }
 
 async function portFree(port: number): Promise<boolean> {
@@ -96,7 +164,7 @@ async function waitFor(url: string, ok: (r: Response) => boolean, what: string, 
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) {
     try {
-      if (ok(await fetch(url))) return;
+      if (ok(await safeFetch(url))) return;
     } catch {}
     await Bun.sleep(200);
   }
@@ -106,6 +174,7 @@ async function waitFor(url: string, ok: (r: Response) => boolean, what: string, 
 
 export interface Running {
   services: Services;
+  provenance: string;
   stop(): Promise<void>;
   logs(): Promise<string>;
 }
@@ -159,20 +228,24 @@ async function kill(p: ReturnType<typeof Bun.spawn> | null): Promise<void> {
 export async function startServices(opts: { keep?: boolean } = {}): Promise<Running> {
   const repos = await ensureRepos();
   const runId = randomBytes(4).toString("hex");
-  const sandbox = mkdtempSync(join(process.env.TMPDIR ?? tmpdir(), `pcore-contracts-${runId}-`));
+  const base = process.env.TMPDIR ?? tmpdir();
+  sweepStaleSandboxes(base);
+  const sandbox = mkdtempSync(join(base, `${SANDBOX_PREFIX}${runId}-`));
+  writeFileSync(join(sandbox, "owner.pid"), `${process.pid}\n`);
   let hubProc: ReturnType<typeof Bun.spawn> | null = null;
   let vaultProc: ReturnType<typeof Bun.spawn> | null = null;
   // One shared promise: a signal handler and the normal exit path may both call stop(), and both must wait for
-  // the whole cleanup (an early return here once let process.exit cut the cleanup short and leak the hub).
+  // the whole cleanup. It stays in `live` until the cleanup has finished, so a signal that arrives mid-cleanup
+  // still awaits it through stopAll() before process.exit (harness/selftest/cleanup.test.ts).
   let stopping: Promise<void> | null = null;
   const stop = () =>
     (stopping ??= (async () => {
-      live.delete(stop);
       try {
         await kill(vaultProc);
         await kill(hubProc);
       } finally {
         if (!opts.keep) rmSync(sandbox, { recursive: true, force: true });
+        live.delete(stop);
       }
     })());
   live.add(stop);
@@ -186,6 +259,7 @@ export async function startServices(opts: { keep?: boolean } = {}): Promise<Runn
     const hubPort = await freePort();
     const vaultPort = await freePort([hubPort]);
     const hub = `http://127.0.0.1:${hubPort}`;
+    allowOrigins(hub, `http://127.0.0.1:${vaultPort}`);
     const vaultName = `contracts${runId}`;
     const operatorToken = randomBytes(24).toString("base64url");
     const admin = { username: "owner", password: `pw-${randomBytes(12).toString("hex")}` };
@@ -208,6 +282,8 @@ export async function startServices(opts: { keep?: boolean } = {}): Promise<Runn
     hubProc = Bun.spawn(
       [
         "bun",
+        "--preload",
+        WATCHDOG,
         "-e",
         `const m = await import(${JSON.stringify(join(repos.hub, "src/commands/serve.ts"))}); await m.serve({ skipModuleBoot: true });`,
       ],
@@ -225,7 +301,7 @@ export async function startServices(opts: { keep?: boolean } = {}): Promise<Runn
       },
     );
     await waitFor(`${hub}/health`, (r) => r.ok, "hub", hubLog);
-    vaultProc = Bun.spawn(["bun", "src/server.ts"], {
+    vaultProc = Bun.spawn(["bun", "--preload", WATCHDOG, "src/server.ts"], {
       cwd: repos.vault,
       env: {
         ...baseEnv,
@@ -263,6 +339,7 @@ export async function startServices(opts: { keep?: boolean } = {}): Promise<Runn
     await hubCli(services, ["auth", "rotate-operator"]);
     return {
       services,
+      provenance: repos.provenance,
       stop,
       logs: async () =>
         `--- hub ---\n${await Bun.file(hubLog).text().catch(() => "")}\n--- vault ---\n${await Bun.file(vaultLog).text().catch(() => "")}`

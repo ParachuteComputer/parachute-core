@@ -1,7 +1,7 @@
 // The consumer connector's sign-in, step by step, as a consumer AI app does it. Shared by today/ and v1/.
 import { expect } from "bun:test";
 import { createHash, randomBytes } from "node:crypto";
-import { services } from "./lib.ts";
+import { safeFetch, services } from "./lib.ts";
 
 const s = services();
 export const MCP_URL = `${s.hub}/vault/${s.vaultName}/mcp`;
@@ -31,7 +31,7 @@ export interface Connected {
 /** Everything a consumer app does to connect, given only the MCP URL and the person's sign-in. */
 export async function connect(opts: { scope?: (vault: string) => string; appName: string }): Promise<Connected> {
   // 1. The app calls MCP with no token and is told where to authenticate.
-  const cold = await fetch(MCP_URL, {
+  const cold = await safeFetch(MCP_URL, {
     method: "POST",
     headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
@@ -42,21 +42,21 @@ export async function connect(opts: { scope?: (vault: string) => string; appName
   expect(prmUrl).toBeString();
 
   // 2. Protected-resource metadata names the resource and its authorization server.
-  const prm = await (await fetch(onHub(prmUrl))).json();
+  const prm = await (await safeFetch(onHub(prmUrl))).json();
   expect(prm.resource).toBe(MCP_URL);
   const issuer = prm.authorization_servers[0];
   expect(issuer).toBe(s.hub);
   expect(prm.scopes_supported).toContain(`vault:${s.vaultName}:read`);
 
   // 3. Authorization-server metadata: registration, PKCE S256, public clients.
-  const as = await (await fetch(`${issuer}/.well-known/oauth-authorization-server`)).json();
+  const as = await (await safeFetch(`${issuer}/.well-known/oauth-authorization-server`)).json();
   expect(as.issuer).toBe(issuer);
   for (const k of ["registration_endpoint", "authorization_endpoint", "token_endpoint"]) onHub(as[k]);
   expect(as.code_challenge_methods_supported).toContain("S256");
   expect(as.token_endpoint_auth_methods_supported).toContain("none");
 
   // 4. Dynamic client registration with the app's own redirect URI.
-  const reg = await fetch(as.registration_endpoint, {
+  const reg = await safeFetch(as.registration_endpoint, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -72,9 +72,9 @@ export async function connect(opts: { scope?: (vault: string) => string; appName
   expect(clientId).toBeString();
 
   // 5. The person signs in (in the browser the app opens; here, the same form posts).
-  const loginPage = await fetch(`${issuer}/login`, { redirect: "manual" });
+  const loginPage = await safeFetch(`${issuer}/login`, { redirect: "manual" });
   const csrf = cookie(loginPage, "parachute_hub_csrf");
-  const login = await fetch(`${issuer}/login`, {
+  const login = await safeFetch(`${issuer}/login`, {
     method: "POST",
     redirect: "manual",
     headers: { "content-type": "application/x-www-form-urlencoded", cookie: `parachute_hub_csrf=${csrf}` },
@@ -98,7 +98,7 @@ export async function connect(opts: { scope?: (vault: string) => string; appName
     state,
     resource: MCP_URL,
   };
-  const auth = await fetch(`${as.authorization_endpoint}?${new URLSearchParams(params)}`, {
+  const auth = await safeFetch(`${as.authorization_endpoint}?${new URLSearchParams(params)}`, {
     redirect: "manual",
     headers: { cookie: `parachute_hub_session=${session}` },
   });
@@ -110,7 +110,7 @@ export async function connect(opts: { scope?: (vault: string) => string; appName
     const html = await auth.text();
     expect(html).toContain('value="consent"');
     const csrf2 = cookie(auth, "parachute_hub_csrf") ?? csrf;
-    const consent = await fetch(as.authorization_endpoint, {
+    const consent = await safeFetch(as.authorization_endpoint, {
       method: "POST",
       redirect: "manual",
       headers: {
@@ -135,7 +135,7 @@ export async function connect(opts: { scope?: (vault: string) => string; appName
   expect(code).toBeString();
 
   // 7. Code + verifier for tokens.
-  const tok = await fetch(as.token_endpoint, {
+  const tok = await safeFetch(as.token_endpoint, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
