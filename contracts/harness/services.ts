@@ -111,8 +111,12 @@ export async function hubCli(s: Services, args: string[]): Promise<string> {
 }
 
 /** Mint a hub-signed pass the way an operator does today (`parachute auth mint-token`). */
-export async function mintToken(s: Services, opts: { scope: string; permissions?: object; label?: string }): Promise<string> {
+export async function mintToken(
+  s: Services,
+  opts: { scope: string; permissions?: object; label?: string; user?: string },
+): Promise<string> {
   const args = ["auth", "mint-token", "--scope", opts.scope, "--ephemeral", "--label", opts.label ?? "contracts"];
+  if (opts.user) args.push("--user", opts.user);
   if (opts.permissions) args.push("--permissions", JSON.stringify(opts.permissions));
   const tok = (await hubCli(s, args)).trim().split("\n").pop()!.trim();
   if (tok.split(".").length !== 3) throw new Error("mint-token did not print a JWT");
