@@ -8,8 +8,8 @@
 //
 // The hub's own e2e/mcp-probe.ts walks the same flow; this contract adds discovery from a cold start, an outside
 // redirect URI (the app's, not the hub's), the official MCP SDK client, and the checks a person relies on.
-import { beforeAll, describe, expect, test } from "bun:test";
-import { mcp, operator, runId, services } from "../lib.ts";
+import { describe, expect, test } from "bun:test";
+import { mcp, operator, runId, safeFetch, services } from "../lib.ts";
 import { connect, MCP_URL, type Connected } from "../oauth.ts";
 
 const s = services();
@@ -17,11 +17,9 @@ const s = services();
 describe("consumer connector: a consumer AI app connects to a person's vault over MCP", () => {
   let app: Connected;
 
-  beforeAll(async () => {
+  // The other tests in this file use the connection this one makes (bun runs a file's tests in order).
+  test("the app connects from nothing but the MCP URL and the person's approval", async () => {
     app = await connect({ appName: `Consumer app ${runId("app")}` });
-  });
-
-  test("the app connects from nothing but the MCP URL and the person's approval", () => {
     expect(app.access.split(".").length).toBe(3);
     expect(app.scope).toContain(`vault:${s.vaultName}:write`);
   });
@@ -83,7 +81,7 @@ describe("consumer connector: a consumer AI app connects to a person's vault ove
 
   test("the app keeps working after its access token is refreshed", async () => {
     expect(app.refresh).toBeString();
-    const r = await fetch(app.tokenEndpoint, {
+    const r = await safeFetch(app.tokenEndpoint, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: app.refresh!, client_id: app.clientId }),
@@ -106,7 +104,7 @@ describe("consumer connector: a consumer AI app connects to a person's vault ove
       // in hub packages/door-contract/src/tokens.ts). Outside it, a replay is treated as theft (RFC 6819 §5.2.2.3).
       const own = await connect({ appName: `Refresh app ${runId("app")}` });
       const refresh = (token: string) =>
-        fetch(own.tokenEndpoint, {
+        safeFetch(own.tokenEndpoint, {
           method: "POST",
           headers: { "content-type": "application/x-www-form-urlencoded" },
           body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: token, client_id: own.clientId }),
@@ -141,7 +139,7 @@ describe("consumer connector: a consumer AI app connects to a person's vault ove
     const claims = JSON.parse(Buffer.from(p!, "base64url").toString());
     const forged = `${h}.${Buffer.from(JSON.stringify({ ...claims, scope: `${claims.scope} vault:${s.vaultName}:admin` })).toString("base64url")}.${sig}`;
     for (const bad of [forged, "not-a-token"]) {
-      const r = await fetch(MCP_URL, {
+      const r = await safeFetch(MCP_URL, {
         method: "POST",
         headers: {
           authorization: `Bearer ${bad}`,

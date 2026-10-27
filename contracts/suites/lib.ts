@@ -3,13 +3,19 @@
 import { readFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { mintToken, type Services } from "../harness/services.ts";
+import { allowOrigins, safeFetch } from "../harness/guard.ts";
+
+export { safeFetch };
 
 export type { Services };
 
 export function services(): Services {
   const path = process.env.CONTRACT_SERVICES;
   if (!path) throw new Error("CONTRACT_SERVICES is not set: run the suite with `bun run today` (harness/run.ts)");
-  return JSON.parse(readFileSync(path, "utf8"));
+  const s: Services = JSON.parse(readFileSync(path, "utf8"));
+  // Only these two may ever be called; see harness/guard.ts.
+  allowOrigins(s.hub, s.vaultDirect);
+  return s;
 }
 
 /** A unique prefix per test run, so contracts never see each other's notes. */
@@ -26,7 +32,7 @@ export interface Reply<T = any> {
 /** REST against one vault. `base` is either the vault directly or the vault behind the hub. */
 export function rest(base: string, token: string) {
   async function call<T = any>(method: string, path: string, body?: unknown): Promise<Reply<T>> {
-    const r = await fetch(`${base}/api${path}`, {
+    const r = await safeFetch(`${base}/api${path}`, {
       method,
       headers: {
         authorization: `Bearer ${token}`,
@@ -81,6 +87,7 @@ export async function mcp(url: string, token: string) {
   const client = new Client({ name: "parachute-contracts", version: "0.0.0" });
   const transport = new StreamableHTTPClientTransport(new URL(url), {
     requestInit: { headers: { authorization: `Bearer ${token}` } },
+    fetch: safeFetch,
   });
   await client.connect(transport);
   return {

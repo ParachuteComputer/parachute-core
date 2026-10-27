@@ -1,6 +1,6 @@
 // Notes: a markdown body plus typed fields, read and written through the door clients use (the hub).
 import { describe, expect, test } from "bun:test";
-import { enc, operator, runId } from "../lib.ts";
+import { enc, operator, runId, safeFetch, services } from "../lib.ts";
 
 const api = operator();
 
@@ -83,8 +83,7 @@ describe("notes", () => {
   });
 
   test("no token, no notes", async () => {
-    const { services } = await import("../lib.ts");
-    const r = await fetch(`${services().vaultViaHub}/api/notes`);
+    const r = await safeFetch(`${services().vaultViaHub}/api/notes`);
     expect(r.status).toBe(401);
   });
 });

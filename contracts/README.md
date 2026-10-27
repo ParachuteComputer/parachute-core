@@ -13,6 +13,7 @@ bun install
 bun run today        # start a throwaway hub + vault from the pinned commits, run suites/today, stop them
 bun run v1           # the v1 contracts: decided behaviour that today's code lacks (marked failing)
 bun run mutants      # break today's vault five ways and check the contracts catch each one
+bun run selftest     # the harness's own safety checks (below)
 bun run typecheck
 ```
 
@@ -28,9 +29,28 @@ A full `today` run takes about a minute; half of that is one contract waiting ou
 - **vault** `42fbf93`, started by the harness, registered with the hub through the temp home's `services.json`.
 
 Both listen on 127.0.0.1, on random ports between 47000 and 49500, with `HOME` and `PARACHUTE_HOME` in a fresh temp
-dir that is deleted afterwards. The harness never uses ports 1939–1946, and it points every issuer setting at the
-throwaway hub, because today's code otherwise falls back to the live hub on 1939 (the comments in `services.ts`
-say where). Test data is made up.
+dir. The harness points every issuer setting at the throwaway hub, because today's code otherwise falls back to the
+live hub on 1939 (the comments in `services.ts` say where). Test data is made up.
+
+What keeps a run away from the live install, each held by a test in `harness/selftest/`:
+
+- **Every request goes through one guard** (`harness/guard.ts`). Only the throwaway hub and vault may be called,
+  the live ports 1939–1946 are refused even if registered, and redirects are returned instead of followed, so a
+  bounced request can't carry a cookie, code or token anywhere else. The MCP client uses the same guard. A
+  self-test fails if any file calls `fetch()` directly.
+- **Cleanup always finishes.** `stopAll()` (what the signal handlers call) waits for any cleanup already under way.
+  The services also preload `harness/watchdog.ts` and exit within half a second if the harness dies, even by
+  SIGKILL. The next run deletes temp homes whose owner process is gone, but never homes kept with `--keep`, and
+  never another user's.
+- **A pinned run runs the pinned code.** A cached checkout with edited tracked files, untracked files or unexpected
+  ignored files is refused. The only ignored files allowed are `node_modules/` and the hub's `packages/*/dist/`,
+  which its install builds. Their bytes are hashed at install time and checked on every run. Every run prints what
+  it ran, e.g. `[contracts] code: vault 42fbf93 (clean), hub 53d327b (clean)`. A deliberate run against other code
+  (`VAULT_REPO_DIR` / `HUB_REPO_DIR`, which the mutants use) says `NOT PINNED`.
+  Files hidden from `git status` (skip-worktree, assume-unchanged) are refused too. **Not checked:** the contents
+  of `node_modules/`. Dependencies come from `bun install --frozen-lockfile` against each repo's lockfile, but a
+  hand-edited file inside them would go unnoticed. Delete `.cache/repos` if in doubt; CI starts from a cache keyed
+  on `pins.json`.
 
 To run the contracts against something else (a build of this repo, a cloud deployment), write a services file in
 the `Services` shape and run `CONTRACT_SERVICES=<file> bun test ./suites/today`.

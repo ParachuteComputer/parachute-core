@@ -58,7 +58,7 @@ of them pass, then moving it to `today/`.
 2. **Contracts first.** A behaviour change starts with the contract that describes it; a bug fix starts with a
    contract that fails.
 3. **Pull request** with what changed, why, the suite's summary lines, and, for a new test, how you made it fail.
-4. **CI must be green**: typecheck, `today`, `v1`, mutants.
+4. **CI must be green**: typecheck, `today`, `v1`, the harness self-tests, mutants.
 5. **Review by someone else.** The author never approves their own pull request. Code reviews can be agents.
    Changes to what a contract *means* (a rule, not a typo) need Aaron or Benjamin.
 6. **Squash-merge.** Releases and deploys are separate decisions and don't happen from this repo yet.

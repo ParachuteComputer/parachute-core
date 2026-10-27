@@ -67,12 +67,15 @@ async function observe(token: string, made: Made[], word: string, prefix: string
   const seen: Record<string, Set<string>> = {};
   const add = (path: string, ids: string[]) => (seen[path] = new Set(ids.filter((id) => made.some((m) => m.id === id))));
 
-  add("list", ((await api.get(`/notes?path_prefix=${enc(prefix)}&limit=500`)).body ?? []).map((n: any) => n.id));
-  add("search", ((await api.get(`/notes?search=${word}&limit=500`)).body ?? []).map((n: any) => n.id));
+  const tagLeak: string[] = [];
+  const listed = (await api.get(`/notes?path_prefix=${enc(prefix)}&limit=500`)).body ?? [];
+  const searched = (await api.get(`/notes?search=${word}&limit=500`)).body ?? [];
+  for (const n of [...listed, ...searched]) tagLeak.push(...(n.tags ?? []));
+  add("list", listed.map((n: any) => n.id));
+  add("search", searched.map((n: any) => n.id));
   const got: string[] = [];
   const versions: string[] = [];
   const linked: string[] = [];
-  const tagLeak: string[] = [];
   for (const m of made) {
     const g = await api.get(`/notes/${m.id}?include_links=true`);
     expect([200, 404]).toContain(g.status);
@@ -92,6 +95,7 @@ async function observe(token: string, made: Made[], word: string, prefix: string
   try {
     const q = await client.call("query-notes", { search: word, limit: 500 });
     const list = Array.isArray(q) ? q : (q.notes ?? q.results ?? []);
+    for (const n of list) tagLeak.push(...(n.tags ?? []));
     add("mcp", list.map((n: any) => n.id));
   } finally {
     await client.close();
@@ -115,10 +119,14 @@ describe("access with tag-scoped passes (today)", () => {
             const expected = made.filter((m) => visibleTo(sub, m.tags)).map((m) => m.id).sort();
             for (const [path, ids] of Object.entries(seen)) {
               // Links may only ever name visible notes; the other paths must show exactly the visible ones.
-              if (path === "links") expect([...ids].every((id) => expected.includes(id))).toBe(true);
+              // Every note links to every other, so two visible notes means links were seen, and none were hidden.
+              if (path === "links") {
+                expect([...ids].every((id) => expected.includes(id))).toBe(true);
+                if (expected.length >= 2) expect(ids.size).toBeGreaterThanOrEqual(2);
+              }
               else expect({ pass: sub, path, ids: [...ids].sort() }).toEqual({ pass: sub, path, ids: expected });
             }
-            // A visible note never reveals the out-of-scope tags it also carries.
+            // A visible note never reveals the out-of-scope tags it also carries (on get, list, search or MCP).
             expect(tagLeak.filter((t) => TAGS.includes(t) && !visibleTo(sub, [t]))).toEqual([]);
             views.set(key(sub), seen);
           }
