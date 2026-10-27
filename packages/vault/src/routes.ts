@@ -98,6 +98,7 @@ import {
   scrubValidationStatusByScope,
   tagScopeForbidden,
   tagsWithinScope,
+  projectTagUpdate,
   tagVisibleInScope,
 } from "./tag-scope.ts";
 import { ParentCycleError, InvalidFieldDefaultError, InvalidFieldTypeError } from "../core/src/tag-schemas.ts";
@@ -3215,11 +3216,11 @@ async function handleNotesInner(
           let validated: any = attachValidationStatus(store, db, final, buildExpandVisibility(tagScope.allowed, tagScope.raw));
           if (scopedCreateWarnings.length > 0) validated.warnings = scopedCreateWarnings;
           // Tag-scope (vault#568): scrub the echoed note so create-then-read
-          // returns the SAME shape. A scoped token may legitimately attach an
-          // out-of-scope co-tag on write (`tagsWithinScope` only requires ONE
-          // in-scope tag), so this isn't a leak of anything it didn't send —
-          // but leaving it unscrubbed would make the write door the one place
-          // the full tag set is observable. Same for validation_status.
+          // returns the SAME shape. Since G2 a scoped token can't add an
+          // out-of-scope tag here (`tagsWithinScope`), but schema defaults
+          // and the read-path scrub must agree: leaving the echo unscrubbed
+          // would make the write door the one place the full tag set is
+          // observable. Same for validation_status.
           validated = scrubNoteTagsByScope(validated, tagScope.allowed, tagScope.raw);
           if (validated.validation_status) {
             const vs = scrubValidationStatusByScope(validated.validation_status, tagScope.allowed, tagScope.raw);
@@ -3248,10 +3249,8 @@ async function handleNotesInner(
       // before any write if it would drift outside the allowlist. This
       // covers the bot-untags-its-only-allowlisted-tag escape route.
       if (tagScope.allowed) {
-        const removed = new Set<string>((body.tags?.remove as string[] | undefined) ?? []);
-        const projected = new Set<string>((note.tags ?? []).filter((t) => !removed.has(t)));
-        for (const t of (body.tags?.add as string[] | undefined) ?? []) projected.add(t);
-        if (!tagsWithinScope([...projected], tagScope.allowed, tagScope.raw)) {
+        const { projected, added, removed } = projectTagUpdate(note.tags, body.tags?.add, body.tags?.remove);
+        if (!tagsWithinScope(projected, tagScope.allowed, tagScope.raw, added, removed)) {
           return tagScopeForbidden(tagScope.raw ?? []);
         }
       }

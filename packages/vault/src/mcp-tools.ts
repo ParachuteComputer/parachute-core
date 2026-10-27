@@ -37,6 +37,7 @@ import {
   scrubTagFieldViolationsByScope,
   scrubValidationStatusByScope,
   tagsWithinScope,
+  projectTagUpdate,
   tagVisibleInScope,
 } from "./tag-scope.ts";
 import { TagFieldConflictError, ParentCycleError } from "../core/src/tag-schemas.ts";
@@ -839,10 +840,8 @@ function applyTagScopeWrappers(
       if (!existing || !noteWithinTagScope(existing, allowed, rawTags)) {
         return { error: "Note not found", error_type: "not_found", id };
       }
-      const removed = new Set<string>((item as any).tags?.remove ?? []);
-      const projected = new Set<string>((existing.tags ?? []).filter((t) => !removed.has(t)));
-      for (const t of ((item as any).tags?.add ?? []) as string[]) projected.add(t);
-      if (!tagsWithinScope([...projected], allowed, rawTags)) {
+      const { projected, added, removed } = projectTagUpdate(existing.tags, (item as any).tags?.add, (item as any).tags?.remove);
+      if (!tagsWithinScope(projected, allowed, rawTags, added, removed)) {
         return forbidden("update-note: post-update tag set must satisfy the token's allowlist");
       }
     }

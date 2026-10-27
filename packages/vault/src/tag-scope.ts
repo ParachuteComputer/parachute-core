@@ -377,22 +377,71 @@ export function scrubValidationStatusByScope<
  * (already including any tag updates). The string-form fallback in
  * `rawRoots` mirrors the read-path semantics — a token allowlisted for
  * `health` can write `#health/food` even when the sub-tag has no
- * declared schema. Returns true iff write is permitted.
+ * declared schema.
+ *
+ * G2 (fixes 6 and 15): every tag the write ADDS must itself be one the
+ * token can read (`tagVisibleInScope`). `added` is the tags this write puts
+ * on the note that it didn't carry before (on a create, all of them, the
+ * default). Before G2 one in-scope tag let a write add any other
+ * (vault#568): `publish` (making the note public on /view), a tag outside
+ * the scope, or a `private_tags` tag. A private tag is never in scope unless
+ * the token names it (`expandTokenTagScope` exempts exactly those), so this
+ * one rule covers both. Editing a note that already carries out-of-scope
+ * co-tags still works: those tags aren't added. Returns true iff the write
+ * is permitted.
  */
 export function tagsWithinScope(
   tags: string[] | undefined,
   allowed: Set<string> | null,
   rawRoots: string[] | null,
+  added: string[] = tags ?? [],
+  removed: string[] = [],
 ): boolean {
   if (rawRoots === null) return true;
   if (scopeDeniesAll(allowed)) return false;
-  if (!tags || tags.length === 0) return false;
-  for (const t of tags) {
+  // Compared bare, as stored: tagNote / untagNote strip a leading `#`.
+  const bare = (list: unknown) =>
+    (Array.isArray(list) ? list : []).filter((t): t is string => typeof t === "string").map(stripTagHash).filter((t) => t !== "");
+  const result = bare(tags);
+  if (result.length === 0) return false;
+  if ([...added, ...removed].some((t) => typeof t !== "string")) return false;
+  // A tag the pass can't read is neither attached nor detached by it: detaching
+  // one would change what other readers see, and checking only when present
+  // would tell the writer whether a hidden tag is there.
+  for (const t of [...bare(added), ...bare(removed)]) {
+    if (!tagVisibleInScope(t, allowed, rawRoots)) return false;
+  }
+  for (const t of result) {
     if (allowed && allowed.has(t)) return true;
     const root = t.split("/")[0];
     if (root && rawRoots.includes(root)) return true;
   }
   return false;
+}
+
+/**
+ * An update's `tags: {add, remove}` applied to a note's tags the way the
+ * store applies them (tagNote(add), then untagNote(remove), both stripping a
+ * leading `#`): the tags the note ends with, and every tag the write asks to attach. Feed both
+ * to `tagsWithinScope`; a projection that differs from what is stored is a
+ * way around the check (`remove: ["#mine"]`, or a tag in both lists).
+ */
+export function projectTagUpdate(
+  existing: string[] | undefined,
+  add: unknown,
+  remove: unknown,
+): { projected: string[]; added: string[]; removed: string[] } {
+  const bare = (v: unknown) =>
+    (Array.isArray(v) ? v : []).filter((t): t is string => typeof t === "string").map(stripTagHash).filter((t) => t !== "");
+  const before = new Set(existing ?? []);
+  const removed = new Set(bare(remove));
+  const after = new Set([...before, ...bare(add)].filter((t) => !removed.has(t)));
+  // `added` is every tag the write asks to attach: one it removes again in the
+  // same write (the store attaches it first, applying its schema defaults),
+  // and one the note already carries (re-adding re-applies the defaults, and
+  // refusing only when absent would tell the writer whether a hidden tag is
+  // there). Edits that don't ask to add a tag are unaffected.
+  return { projected: [...after], added: [...new Set(bare(add))], removed: [...removed] };
 }
 
 /**
