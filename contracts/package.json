@@ -8,7 +8,9 @@
     "v1": "bun run harness/run.ts suites/v1",
     "build:stock": "bun run harness/build-stock-candidate.ts",
     "candidate": "bun run harness/run-candidate.ts",
+    "prism-compat": "bun run harness/prism-compat.ts",
     "mutants": "bun run harness/mutate.ts",
+    "mutants:candidate": "bun run harness/mutate-candidate.ts",
     "selftest": "bun test --timeout 120000 ./harness/selftest",
     "typecheck": "tsc --noEmit"
   },

@@ -1,0 +1,35 @@
+{
+  "comment": "FAILs Benjamin's suite (harness/prism-compat.ts) reports on today's code, each with why and the lane that fixes it. Empty from slice 1 on (PLAN \u00a76): the Nov 9 gate is 0 FAIL.",
+  "fails": [
+    {
+      "check": "E2",
+      "reason": "Bun's transpiler cache is written into $HOME (.bun/install/cache), outside PARACHUTE_HOME",
+      "lane": "D (bundle keeps the cache in the home)"
+    },
+    {
+      "check": "isolation: Parachute files written to the children's HOME (outside PARACHUTE_HOME, E2)",
+      "reason": "same as E2",
+      "lane": "D"
+    },
+    {
+      "check": "E6",
+      "reason": "the CLI signs with the issuer from hub/run/hub.port or :1939, not PARACHUTE_HUB_ORIGIN (fix 1)",
+      "lane": "C"
+    },
+    {
+      "check": "tokens: CLI issuer follows PARACHUTE_HUB_ORIGIN (operator.token iss)",
+      "reason": "fix 1",
+      "lane": "C"
+    },
+    {
+      "check": "E8",
+      "reason": "hub.db, WAL/SHM and vault.db are 0644, data dirs 0755 (fix 3)",
+      "lane": "B"
+    },
+    {
+      "check": "security: secret files 0600 in 0700 dirs (E8)",
+      "reason": "fix 3",
+      "lane": "B"
+    }
+  ]
+}
