@@ -1951,7 +1951,7 @@ function applySearchTitleBoost(
 export function searchNotes(
   db: Database,
   query: string,
-  opts?: QueryOpts & { mode?: SearchMode },
+  opts?: QueryOpts & { mode?: SearchMode; visible?: (note: Note) => boolean },
 ): Note[] {
   const limit = typeof opts?.limit === "number" ? opts.limit : 50;
   // Literal-by-default (vault#551): escape the caller's text so FTS5's own
@@ -2026,7 +2026,9 @@ export function searchNotes(
   const extraWhere = conditions.length > 0 ? `AND ${conditions.join(" AND ")}` : "";
 
   try {
-    const rows = db.prepare(`
+    const rows = opts?.visible
+      ? searchVisibleOnly(db, ftsQuery, extraWhere, params, orderBy, limit, opts.visible)
+      : db.prepare(`
       SELECT n.*, ${scoreExpr} AS score FROM notes n
       JOIN notes_fts fts ON fts.rowid = n.rowid
       WHERE notes_fts MATCH ?
@@ -2044,6 +2046,60 @@ export function searchNotes(
     // ourselves (empty-limit validation, etc.) is re-raised untouched.
     if (err instanceof QueryError) throw err;
     throw searchSyntaxError(query, err, mode);
+  }
+}
+
+let visibleSearchSeq = 0;
+
+/**
+ * Full-text search for a caller who sees only some notes (a tag-scoped pass,
+ * via `searchNotes`'s `visible`): the answer depends on the visible notes
+ * alone (fix 8). Ranking over `notes_fts` can't give that: bm25 reads
+ * index-wide statistics (how many notes hold each term, the average length),
+ * so a hidden note holding the word moved a visible note's score, and the
+ * LIMIT ran before the scope filter, so hidden notes could take a visible
+ * note's place. Here every match is found first, the visible ones kept, and
+ * those ranked in a throwaway FTS5 index holding only them (same columns,
+ * tokenizer and weights), with the LIMIT last. Scores are therefore relative
+ * to the visible matches, which is all `Note.score` promises.
+ */
+function searchVisibleOnly(
+  db: Database,
+  ftsQuery: string,
+  extraWhere: string,
+  params: SQLQueryBindings[],
+  orderBy: string,
+  limit: number,
+  visible: (note: Note) => boolean,
+): (NoteRow & { score: number })[] {
+  const matched = db.prepare(`
+    SELECT n.rowid AS rowid, n.id AS id FROM notes n
+    JOIN notes_fts fts ON fts.rowid = n.rowid
+    WHERE notes_fts MATCH ?
+      ${extraWhere}
+  `).all(ftsQuery, ...params) as { rowid: number; id: string }[];
+  if (matched.length === 0) return [];
+  const tagsById = getNoteTagsForNotes(db, matched.map((r) => r.id));
+  const keep = matched.filter((r) => visible({ id: r.id, tags: tagsById.get(r.id) ?? [] } as Note));
+  if (keep.length === 0) return [];
+  const ftsSql = (db.prepare("SELECT sql FROM sqlite_master WHERE name = 'notes_fts'").get() as { sql: string } | null)?.sql ?? "";
+  const tokenize = /tokenize\s*=\s*'([^']*)'/i.exec(ftsSql)?.[1] ?? "porter unicode61";
+  const table = `visible_search_${++visibleSearchSeq}`;
+  db.run(`CREATE VIRTUAL TABLE temp.${table} USING fts5(path, content, tokenize='${tokenize.replace(/'/g, "''")}')`);
+  try {
+    db.prepare(`
+      INSERT INTO temp.${table}(rowid, path, content)
+      SELECT rowid, COALESCE(path, ''), content FROM notes WHERE rowid IN (SELECT value FROM json_each(?))
+    `).run(JSON.stringify(keep.map((r) => r.rowid)));
+    return db.prepare(`
+      SELECT n.*, (-1.0 * bm25(${table}, ${SEARCH_WEIGHT_PATH}, ${SEARCH_WEIGHT_CONTENT})) AS score
+      FROM ${table} JOIN notes n ON n.rowid = ${table}.rowid
+      WHERE ${table} MATCH ?
+      ORDER BY ${orderBy}
+      LIMIT ?
+    `).all(ftsQuery, limit) as (NoteRow & { score: number })[];
+  } finally {
+    db.run(`DROP TABLE temp.${table}`);
   }
 }
 

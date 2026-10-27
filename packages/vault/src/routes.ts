@@ -1749,6 +1749,8 @@ async function handleNotesInner(
               offset: undefined,
               cursor: undefined,
               orderBy: undefined,
+              // Fix 8: a scoped pass's answer is ranked over what it can see.
+              visible: buildExpandVisibility(tagScope.allowed, tagScope.raw),
             });
           } catch (e: any) {
             if (e && e.name === "QueryError") {

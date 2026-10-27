@@ -309,7 +309,7 @@ export function generateScopedMcpTools(
     ...(expandVisibility ? { expandVisibility } : {}),
     ...(nearTraversable ? { nearTraversable } : {}),
     ...(ifExistsVisible ? { ifExistsVisible } : {}),
-    ...(aggregateVisibility ? { aggregateVisibility } : {}),
+    ...(aggregateVisibility ? { aggregateVisibility, searchVisibility: aggregateVisibility } : {}),
     ...(ambiguityVisible ? { ambiguityVisible } : {}),
     ...(writeContext ? { writeContext } : {}),
     ...(strictBypass ? { strictBypass } : {}),

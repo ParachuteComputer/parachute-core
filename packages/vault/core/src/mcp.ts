@@ -491,6 +491,13 @@ export interface GenerateMcpToolsOpts {
    */
   aggregateVisibility?: (note: Note) => boolean;
   /**
+   * `searchVisibility` is an OPTIONAL per-note predicate for `query-notes`'s
+   * full-text `search`: matches are ranked and limited over only the notes it
+   * accepts, so a scoped answer doesn't depend on notes the caller can't see
+   * (fix 8, see `searchNotes`). Omitted (unscoped) → the plain FTS path.
+   */
+  searchVisibility?: (note: Note) => boolean;
+  /**
    * `ambiguityVisible` (vault#581 auth review) is an OPTIONAL per-note
    * predicate gating everything the ambiguous-links surface discloses.
    * `candidate_count` is derived VAULT-WIDE, so a stored `2` on a `[[Dup]]`
@@ -586,6 +593,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
   const nearTraversable = opts?.nearTraversable;
   const ifExistsVisible = opts?.ifExistsVisible;
   const aggregateVisibility = opts?.aggregateVisibility;
+  const searchVisibility = opts?.searchVisibility;
   const ambiguityVisible = opts?.ambiguityVisible;
   // Write-attribution (vault#298) — captured once at tool-generation time
   // (a fresh tool set is generated per MCP request, so this is request-scoped)
@@ -1158,6 +1166,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
               limit: (params.limit as number) ?? 50,
               mode,
               sort: params.sort as "asc" | "desc" | undefined,
+              ...(searchVisibility ? { visible: searchVisibility } : {}),
             });
             // Zero-result `did_you_mean` (vault#551 WS2B) — cheap (a bounded
             // FTS5-vocabulary scan) and ONLY computed on the already-rare
