@@ -11,7 +11,7 @@
 //   - checks that every listening socket belongs to a process started from the candidate folder, and reports the
 //     process model it saw (one process, or a hub with a vault child);
 //   - writes nothing a release would own, except the workarounds a profile names (printed on every run).
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { randomBytes } from "node:crypto";
@@ -48,9 +48,13 @@ export interface CandidateInfo {
   sha256: string;
 }
 
-/** sha256 over every path in the folder (sorted), its kind, and its bytes or link target. CANDIDATE.json is left out. */
+/**
+ * sha256 over every path in the folder (sorted), its kind, and its bytes or link target. CANDIDATE.json is left out.
+ * A symlink that resolves outside the folder is refused: what it points at would run without being hashed.
+ */
 export async function treeHash(root: string): Promise<string> {
   const h = new Bun.CryptoHasher("sha256");
+  const realRoot = realpathSync(root);
   const walk = async (rel: string) => {
     const abs = join(root, rel);
     const names = readdirSync(abs).sort();
@@ -58,7 +62,18 @@ export async function treeHash(root: string): Promise<string> {
       const r = rel ? `${rel}/${name}` : name;
       if (r === MANIFEST) continue;
       const st = lstatSync(join(root, r));
-      if (st.isSymbolicLink()) h.update(`L\0${r}\0${readlinkSync(join(root, r))}\0`);
+      if (st.isSymbolicLink()) {
+        const target = readlinkSync(join(root, r));
+        const lexical = resolve(dirname(join(realRoot, r)), target);
+        let real = lexical;
+        try {
+          real = realpathSync(join(root, r));
+        } catch {} // a dangling link is hashed by its target string; it can't run anything
+        for (const t of [lexical, real]) {
+          if (t !== realRoot && !t.startsWith(realRoot + "/")) throw new Error(`candidate ${root}: ${r} links outside the candidate (${target})`);
+        }
+        h.update(`L\0${r}\0${target}\0`);
+      }
       else if (st.isDirectory()) {
         h.update(`D\0${r}\0`);
         await walk(r);
@@ -162,20 +177,61 @@ export function listeningProcesses(): Proc[] {
   return out;
 }
 
+/** The parts of a process the attribution looks at (from /proc). */
+export interface ProcFacts {
+  pid: number;
+  exe: string; // realpath of /proc/<pid>/exe
+  cmdline: string[];
+  cwd: string;
+}
+
+/**
+ * Why a process is not the candidate, or null if it is. It is the candidate when its executable is inside the
+ * candidate folder, or when its executable is the run's Bun (the runtime folder holds only that) and the script Bun
+ * runs, its first non-flag argument, resolves inside the candidate folder. A candidate path anywhere else on the
+ * command line counts for nothing.
+ */
+export function notCandidate(p: ProcFacts, info: { dir: string; bun: string }): string | null {
+  const dir = realpathSync(info.dir);
+  const inside = (f: string) => f === dir || f.startsWith(dir + "/");
+  if (inside(p.exe)) return null;
+  if (p.exe !== info.bun) return `pid ${p.pid} runs ${p.exe}, neither the candidate nor the run's Bun`;
+  const script = p.cmdline.slice(1).find((a) => !a.startsWith("-"));
+  if (!script) return `pid ${p.pid} is Bun with no script`;
+  let real = resolve(p.cwd, script);
+  try {
+    real = realpathSync(real);
+  } catch {}
+  return inside(real) ? null : `pid ${p.pid} is Bun running ${script}, outside the candidate`;
+}
+
+function procFacts(pid: number): ProcFacts {
+  return {
+    pid,
+    exe: realpathSync(`/proc/${pid}/exe`),
+    cmdline: readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").filter(Boolean),
+    cwd: readlinkSync(`/proc/${pid}/cwd`),
+  };
+}
+
 /**
  * Check that whatever listens now was started from the candidate (and not, say, a Bun global install), and say
- * which process model that is. `ignore` names processes the harness itself owns (none, normally).
+ * which process model that is. Only meaningful inside the sandbox, where nothing else runs.
  */
 export function observeCandidate(info: CandidateInfo): { model: "in-process" | "child"; lines: string[] } {
   const procs = listeningProcesses().filter((p) => p.pid !== process.pid);
-  const lines: string[] = [];
-  const foreign = procs.filter((p) => !p.cmdline.some((a) => a.startsWith(info.dir + "/")));
-  for (const p of procs) {
-    const where = p.cmdline.find((a) => a.startsWith(info.dir + "/")) ?? p.cmdline.join(" ");
-    lines.push(`pid ${p.pid} ${where.replace(info.dir, "<candidate>")} ${p.cmdline.slice(-1)[0] === where ? "" : p.cmdline.slice(-1)[0]} listens ${p.listens.join(" ")}`);
-  }
   if (!procs.length) throw new Error("candidate check: nothing is listening");
-  if (foreign.length) throw new Error(`candidate check: listeners not started from the candidate: ${foreign.map((p) => `${p.pid} ${p.cmdline.join(" ")}`).join("; ")}`);
+  const bun = realpathSync(join(info.runtimeDir, "bun"));
+  const lines: string[] = [];
+  const problems: string[] = [];
+  for (const p of procs) {
+    const f = procFacts(p.pid);
+    const why = notCandidate(f, { dir: info.dir, bun });
+    if (why) problems.push(why);
+    const script = f.exe === bun ? f.cmdline.slice(1).find((a) => !a.startsWith("-")) ?? "" : f.exe;
+    lines.push(`pid ${p.pid} ${script.replace(info.dir, "<candidate>")} ${f.cmdline.slice(2).join(" ")} listens ${p.listens.join(" ")}`);
+  }
+  if (problems.length) throw new Error(`candidate check: listeners not started from the candidate: ${problems.join("; ")}`);
   return { model: procs.length === 1 ? "in-process" : "child", lines };
 }
 

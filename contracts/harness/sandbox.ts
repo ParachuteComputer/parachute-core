@@ -7,6 +7,11 @@
 // and its own PID space, so a candidate can neither reach nor signal anything live. The contracts' guard still
 // refuses ports 1939-1946 inside (harness/guard.ts).
 //
+// Files: the sandbox also has its own mounts. Fresh, empty tmpfs hide /run (the systemd and D-Bus sockets, Docker),
+// /tmp and the user's home (every Unix socket kept there, and the live ~/.parachute). Only what a run needs is
+// bound back, at the same path: this repo and the candidate read-only, and Bun and Node. So a candidate can't reach
+// a host daemon through a socket file, nor write anything that outlives the run except through its own scratch.
+//
 // The trap: a dummy interface holds the default route, and an nftables counter counts every packet that leaves
 // by anything but loopback. Nothing it counts can get anywhere (the dummy drops it), and the count is how
 // "no outbound connection" is proved rather than sampled (embedded/offline).
@@ -89,7 +94,10 @@ export async function enterSandbox(): Promise<void> {
     if (!unshare) throw new Error("sandbox: `unshare` (util-linux) is needed to run a candidate");
     const p = Bun.spawn(
       [unshare, "--user", "--map-root-user", "--net", "--pid", "--fork", "--mount-proc", "--kill-child", "--", process.execPath, ...process.argv.slice(1)],
-      { env: { ...process.env, [SANDBOX_ENV]: "1" }, stdio: ["inherit", "inherit", "inherit"] },
+      {
+        env: { ...process.env, [SANDBOX_ENV]: "1", PCORE_SANDBOX_KEEP: JSON.stringify(keepPaths()), PCORE_HOST_UID: String(process.getuid?.() ?? "") },
+        stdio: ["inherit", "inherit", "inherit"],
+      },
     );
     const forward = (sig: NodeJS.Signals) => () => p.kill(sig);
     process.on("SIGINT", forward("SIGINT"));
@@ -97,6 +105,12 @@ export async function enterSandbox(): Promise<void> {
     // If unshare can't start (e.g. AppArmor's user-namespace restriction on Ubuntu 24.04), it says why on stderr.
     process.exit(await p.exited);
   }
+  if (!process.env.PCORE_SANDBOX_MOUNTED) {
+    hideHostFiles(JSON.parse(process.env.PCORE_SANDBOX_KEEP ?? "[]"));
+    process.env.PCORE_SANDBOX_MOUNTED = "1";
+  }
+  // Sockets the host session points at: gone with /run and /tmp, and nothing should look for them.
+  for (const k of ["DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "SSH_AUTH_SOCK", "WAYLAND_DISPLAY", "DISPLAY", "TMUX"]) delete process.env[k];
   // Inside: the namespace must be new and empty. The only interfaces are loopback and, once made, the trap.
   const have = links();
   const unexpected = have.filter((l) => l !== "lo" && l !== TRAP_IF);
@@ -114,6 +128,58 @@ export async function enterSandbox(): Promise<void> {
     must(["nft", "add", "chain", "inet", "pctrap", "out", "{ type filter hook output priority 0; }"]);
     must(["nft", "add", "rule", "inet", "pctrap", "out", "oifname", "!=", "lo", "counter"]);
   }
+}
+
+/** What a run needs from the host filesystem, besides the system (/usr, /etc): this repo, the candidate and old stock
+ *  build when they live elsewhere, Bun, and Node (Benjamin's suite). Computed outside, before the mounts. */
+function keepPaths(): { path: string; rw: boolean }[] {
+  const { realpathSync, existsSync } = require("node:fs") as typeof import("node:fs");
+  const { dirname, resolve } = require("node:path") as typeof import("node:path");
+  const repo = resolve(import.meta.dir, "..", "..");
+  const keep: { path: string; rw: boolean }[] = [{ path: repo, rw: false }];
+  for (const k of ["CANDIDATE_DIR", "OLD_STOCK_DIR"]) if (process.env[k]) keep.push({ path: resolve(process.env[k]!), rw: false });
+  keep.push({ path: realpathSync(process.execPath), rw: false });
+  if (process.execPath !== realpathSync(process.execPath)) keep.push({ path: process.execPath, rw: false });
+  const node = Bun.which("node");
+  if (node) {
+    const real = realpathSync(node);
+    keep.push({ path: dirname(dirname(real)), rw: false }); // the install, so its lib/ comes along
+    if (node !== real) keep.push({ path: dirname(node), rw: false }); // a shim folder (mise, nvm)
+  }
+  return keep.filter((k) => existsSync(k.path));
+}
+
+/** Inside the new mount namespace: tmpfs over /run, /tmp and $HOME, then bind back what `keep` names. */
+function hideHostFiles(keep: { path: string; rw: boolean }[]): void {
+  const { mkdirSync, statSync, writeFileSync } = require("node:fs") as typeof import("node:fs");
+  const { dirname, join } = require("node:path") as typeof import("node:path");
+  const home = process.env.HOME ?? "";
+  must(["mount", "--make-rprivate", "/"]);
+  // Stage the paths to keep somewhere the tmpfs won't cover, then cover, then put them back at the same path.
+  must(["mount", "-t", "tmpfs", "-o", "mode=0755", "pcore-run", "/run"]);
+  const stage = "/run/pcore-stage";
+  mkdirSync(stage);
+  const staged = keep.map((k, i) => {
+    const dir = statSync(k.path).isDirectory();
+    const at = join(stage, String(i));
+    if (dir) mkdirSync(at);
+    else writeFileSync(at, "");
+    must(["mount", "--rbind", k.path, at]);
+    return { ...k, at, dir };
+  });
+  must(["mount", "-t", "tmpfs", "-o", "mode=1777", "pcore-tmp", "/tmp"]);
+  if (home && home !== "/") must(["mount", "-t", "tmpfs", "-o", "mode=0755", "pcore-home", home]);
+  // Shortest first, so a path inside another kept path lands on top of it.
+  for (const k of staged.sort((a, b) => a.path.length - b.path.length)) {
+    if (k.dir) mkdirSync(k.path, { recursive: true });
+    else {
+      mkdirSync(dirname(k.path), { recursive: true });
+      writeFileSync(k.path, "", { flag: "a" });
+    }
+    must(["mount", "--rbind", k.at, k.path]);
+    if (!k.rw) must(["mount", "-o", "remount,bind,ro", k.path]);
+  }
+  if (home) mkdirSync(home, { recursive: true });
 }
 
 /** Packets that tried to leave by anything but loopback since the sandbox started (or since `mark`). */
