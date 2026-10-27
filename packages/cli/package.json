@@ -8,5 +8,8 @@
   "dependencies": {
     "@openparachute/hub": "workspace:*",
     "@openparachute/vault": "workspace:*"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
   }
 }

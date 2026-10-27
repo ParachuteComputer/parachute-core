@@ -51,16 +51,6 @@
         "typescript": "^5",
       },
     },
-    "packages/hub/packages/scope-guard": {
-      "name": "@openparachute/scope-guard",
-      "version": "0.5.1",
-      "dependencies": {
-        "jose": "^6.2.2",
-      },
-      "peerDependencies": {
-        "typescript": "^5",
-      },
-    },
     "packages/vault": {
       "name": "@openparachute/vault",
       "version": "0.7.9",
@@ -216,7 +206,7 @@
 
     "@openparachute/hub": ["@openparachute/hub@workspace:packages/hub"],
 
-    "@openparachute/scope-guard": ["@openparachute/scope-guard@workspace:packages/hub/packages/scope-guard"],
+    "@openparachute/scope-guard": ["@openparachute/scope-guard@0.5.0", "", { "dependencies": { "jose": "^6.2.2" }, "peerDependencies": { "typescript": "^5" } }, "sha512-cnX4hutteyIWPSj1I5UvIGShBNLrQSrW1DpP2CNJfHl0ndi5DrdvQvxjXQj3S8/F/FDlhTbFyTNqmyErATuN4Q=="],
 
     "@openparachute/vault": ["@openparachute/vault@workspace:packages/vault"],
 
