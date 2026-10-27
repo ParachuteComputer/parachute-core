@@ -92,7 +92,12 @@ export async function treeHash(root: string): Promise<string> {
   return h.digest("hex");
 }
 
-export async function loadCandidate(dir: string): Promise<{ manifest: CandidateManifest; sha256: string }> {
+/**
+ * Load a candidate and check its bytes against its manifest, and against `want` (default CANDIDATE_SHA256, the hash
+ * CI's build step produced for the candidate under test). The old stock programs are a different build: they pass
+ * `oldStockWant()`.
+ */
+export async function loadCandidate(dir: string, want: string | undefined = process.env.CANDIDATE_SHA256): Promise<{ manifest: CandidateManifest; sha256: string }> {
   const d = resolve(dir);
   if (!existsSync(join(d, MANIFEST))) throw new Error(`${d} is not a candidate (no ${MANIFEST}); build one with \`bun run build:stock\``);
   for (const b of ["bin/parachute", "bin/parachute-vault"]) {
@@ -101,9 +106,13 @@ export async function loadCandidate(dir: string): Promise<{ manifest: CandidateM
   const manifest = JSON.parse(readFileSync(join(d, MANIFEST), "utf8")) as CandidateManifest;
   const sha256 = await treeHash(d);
   if (sha256 !== manifest.sha256) throw new Error(`candidate ${d}: files hash to ${sha256}, but ${MANIFEST} says ${manifest.sha256}`);
-  const want = process.env.CANDIDATE_SHA256;
   if (want && want !== sha256) throw new Error(`candidate ${d}: files hash to ${sha256}, but this CI build produced ${want}`);
   return { manifest, sha256 };
+}
+
+/** What the old stock build must hash to: OLD_STOCK_SHA256 (CI passes its build:stock step's hash), else its manifest. */
+export function oldStockWant(): string | undefined {
+  return process.env.OLD_STOCK_SHA256;
 }
 
 /** The environment every candidate process gets: nothing from the caller's shell but locale. */

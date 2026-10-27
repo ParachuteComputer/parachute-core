@@ -104,11 +104,13 @@ jobs:
         run: bun run build:core --out "$RUNNER_TEMP/candidate"
       - &stock
         name: build the old programs (stock 0.7 from the pins, for takeover, identity and rollback)
+        id: stock
         run: bun run build:stock
       - name: the contracts, against exactly that build
         env:
           CANDIDATE_DIR: ${{ steps.build.outputs.dir }}
           CANDIDATE_SHA256: ${{ steps.build.outputs.sha256 }}
+          OLD_STOCK_SHA256: ${{ steps.stock.outputs.sha256 }}
         run: bun run candidate -- --v1 2>&1 | tee "$RUNNER_TEMP/candidate.log"; test "${PIPESTATUS[0]}" -eq 0
         shell: bash
       - name: the run reported the hash this job built, before and after
@@ -143,6 +145,7 @@ jobs:
         env:
           CANDIDATE_DIR: ${{ steps.build.outputs.dir }}
           CANDIDATE_SHA256: ${{ steps.build.outputs.sha256 }}
+          OLD_STOCK_SHA256: ${{ steps.stock.outputs.sha256 }}
         run: bun run prism-compat
 
   mutants:
@@ -182,4 +185,6 @@ jobs:
       - run: bun install --frozen-lockfile
       - *stock
       - name: each mutant caught, each flip flipped
+        env:
+          OLD_STOCK_SHA256: ${{ steps.stock.outputs.sha256 }}
         run: bun run mutants:candidate

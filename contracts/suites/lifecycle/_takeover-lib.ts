@@ -22,7 +22,7 @@ import { copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSy
 import { createServer, connect, type Server } from "node:net";
 import { Database } from "bun:sqlite";
 import { dirname, join, relative, resolve } from "node:path";
-import { candidateEnv, loadCandidate, treeHash, type CandidateInfo } from "../../harness/candidate.ts";
+import { candidateEnv, loadCandidate, oldStockWant, treeHash, type CandidateInfo } from "../../harness/candidate.ts";
 import { allowOrigins, candidate, freePort, oldStockDir, newHome, safeFetch, until } from "../candidate-lib.ts";
 import { must, rest } from "../lib.ts";
 
@@ -42,7 +42,7 @@ let oldStockCache: OldStock | null = null;
 export async function oldStock(): Promise<OldStock> {
   if (oldStockCache) return oldStockCache;
   const dir = oldStockDir();
-  const { manifest } = await loadCandidate(dir);
+  const { manifest } = await loadCandidate(dir, oldStockWant());
   must(manifest.profile === "stock-0.7", `setup: ${dir} is not a stock 0.7 build (profile ${manifest.profile})`);
   const pkg = (p: string) => JSON.parse(readFileSync(join(dir, "lib", p, "package.json"), "utf8"));
   const hub = pkg("hub");

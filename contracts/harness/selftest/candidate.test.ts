@@ -4,7 +4,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { loadCandidate, MANIFEST, notCandidate, treeHash } from "../candidate.ts";
+import { loadCandidate, MANIFEST, notCandidate, oldStockWant, treeHash } from "../candidate.ts";
 
 const root = mkdtempSync(join(process.env.TMPDIR ?? tmpdir(), "pcore-candidate-selftest-"));
 afterAll(() => rmSync(root, { recursive: true, force: true }));
@@ -37,6 +37,21 @@ describe("candidate adapter", () => {
       await expect(loadCandidate(d)).rejects.toThrow(/but this CI build produced/);
     } finally {
       delete process.env.CANDIDATE_SHA256;
+    }
+  });
+
+  test("the old stock programs are checked against their own build's hash, not the candidate's", async () => {
+    const d = await fakeCandidate("old");
+    const own = (await loadCandidate(d)).sha256;
+    process.env.CANDIDATE_SHA256 = "0".repeat(64); // the candidate under test is another build
+    try {
+      process.env.OLD_STOCK_SHA256 = own;
+      expect((await loadCandidate(d, oldStockWant())).sha256).toBe(own);
+      process.env.OLD_STOCK_SHA256 = "1".repeat(64);
+      await expect(loadCandidate(d, oldStockWant())).rejects.toThrow(/but this CI build produced/);
+    } finally {
+      delete process.env.CANDIDATE_SHA256;
+      delete process.env.OLD_STOCK_SHA256;
     }
   });
 });
