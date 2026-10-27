@@ -48,11 +48,11 @@ for (const m of MUTANTS.filter((m) => only.length === 0 || only.includes(m.name)
     const add = await run(["git", "worktree", "add", "--detach", "--quiet", tree, pins.vault.commit], { cwd: repos.vault });
     if (add.code !== 0) throw new Error(`git worktree add failed: ${add.out}`);
     symlinkSync(join(repos.vault, "node_modules"), join(tree, "node_modules"));
-    const path = join(tree, m.file);
+    const path = join(tree, m.file!);
     const src = readFileSync(path, "utf8");
-    const hits = src.split(m.find).length - 1;
+    const hits = src.split(m.find!).length - 1;
     if (hits !== 1) throw new Error(`mutant ${m.name}: expected the target text once in ${m.file}, found ${hits}`);
-    writeFileSync(path, src.replace(m.find, m.replace));
+    writeFileSync(path, src.replace(m.find!, m.replace!));
 
     child = Bun.spawn(["bun", "run", "harness/run.ts", m.suite], {
       cwd: contracts,

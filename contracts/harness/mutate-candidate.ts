@@ -61,18 +61,23 @@ for (const m of all.filter((m) => only.length === 0 || only.includes(m.name))) {
   try {
     const add = await run(["git", "worktree", "add", "--detach", "--quiet", tree, (pins as any)[which].commit], { cwd: repo });
     if (add.code !== 0) throw new Error(`git worktree add failed: ${add.out}`);
-    const path = join(tree, m.file);
-    const src = readFileSync(path, "utf8");
-    const hits = src.split(m.find).length - 1;
-    if (hits !== 1) throw new Error(`${m.name}: expected the target text once in ${which}/${m.file}, found ${hits}`);
-    writeFileSync(path, src.replace(m.find, m.replace));
+    if (m.patch) {
+      const ap = await run(["git", "apply", join(import.meta.dir, m.patch)], { cwd: tree });
+      if (ap.code !== 0) throw new Error(`${m.name}: git apply ${m.patch} failed: ${ap.out}`);
+    } else {
+      const path = join(tree, m.file!);
+      const src = readFileSync(path, "utf8");
+      const hits = src.split(m.find!).length - 1;
+      if (hits !== 1) throw new Error(`${m.name}: expected the target text once in ${which}/${m.file}, found ${hits}`);
+      writeFileSync(path, src.replace(m.find!, m.replace!));
+    }
     const cand = join(dir, "candidate");
     await buildStockCandidate({
       out: cand,
       hubDir: which === "hub" ? tree : repos.hub,
       vaultDir: which === "vault" ? tree : repos.vault,
     });
-    child = Bun.spawn(["bun", "run", "harness/run-candidate.ts", m.suite], {
+    child = Bun.spawn(["bun", "run", "harness/run-candidate.ts", ...m.suite.split(" ")], {
       cwd: contracts,
       env: { ...process.env, CANDIDATE_DIR: cand, CANDIDATE_SHA256: "", CONTRACT_SHOW_LOGS: "0" },
       stdout: "pipe",
@@ -88,8 +93,8 @@ for (const m of all.filter((m) => only.length === 0 || only.includes(m.name))) {
       console.log(`\n[mutant ${m.name}] ${m.why}`);
       console.log(ok ? `  CAUGHT: ${red.length} contract(s) red` : `  NOT CAUGHT (exit ${code}); expected red: ${missing.join(" | ")}`);
     } else {
-      // A red() contract that passes fails with `now green: "<its name>"` (suites/lib.ts).
-      const greened = red.map((t) => t.replace(/ \[red today; lane [^\]]*\]$/, "")).filter((n) => out.includes(`now green: "${n}"`));
+      // A red() contract that passes fails with `now green: "<its name>" passes` (suites/lib.ts).
+      const greened = [...out.matchAll(/now green: "(.+?)" passes\./g)].map((x) => x[1]!);
       const flipped = m.catches.filter((want) => greened.some((n) => n.includes(want)));
       const missing = m.catches.filter((w) => !flipped.includes(w));
       ok = missing.length === 0;

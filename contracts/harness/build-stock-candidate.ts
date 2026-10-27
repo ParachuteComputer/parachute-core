@@ -47,7 +47,10 @@ export async function buildStockCandidate(opts: { out: string; hubDir?: string; 
     if (override) {
       // A working tree, edits included (that's the point for mutants); never its node_modules or .git.
       const files = (await sh(["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"], override)).split("\0").filter(Boolean);
-      for (const f of files) if (existsSync(join(override, f))) cpSync(join(override, f), join(dest, f), { recursive: true, dereference: false });
+      // Never node_modules, even a symlink to one (a worktree may link the pinned checkout's): `bun install` below
+      // would otherwise write into the pinned checkout through it.
+      const own = files.filter((f) => !f.split("/").includes("node_modules"));
+      for (const f of own) if (existsSync(join(override, f))) cpSync(join(override, f), join(dest, f), { recursive: true, dereference: false });
       const head = (await sh(["git", "rev-parse", "--short=7", "HEAD"], override)).trim();
       const dirty = (await sh(["git", "status", "--porcelain"], override)).trim() ? "+changes" : "";
       source[key] = `${head}${dirty} (from ${override})`;
