@@ -9,7 +9,7 @@
 // `Services`) and run `CONTRACT_SERVICES=<file> bun test suites/today`.
 import { join } from "node:path";
 import { writeFileSync } from "node:fs";
-import { startServices } from "./services.ts";
+import { startServices, stopAll } from "./services.ts";
 
 const args = process.argv.slice(2);
 const keep = args.includes("--keep");
@@ -17,6 +17,15 @@ const v1 = args.includes("--v1");
 const extra = args.filter((a) => a !== "--keep" && a !== "--v1");
 
 const contracts = join(import.meta.dir, "..");
+// Installed before anything starts, so an interrupt during startup still stops the services and removes the home.
+let child: ReturnType<typeof Bun.spawn> | null = null;
+const onSignal = async () => {
+  child?.kill();
+  await stopAll();
+  process.exit(130);
+};
+process.on("SIGINT", onSignal);
+process.on("SIGTERM", onSignal);
 const t0 = Date.now();
 const running = await startServices({ keep });
 const s = running.services;
@@ -26,23 +35,17 @@ const servicesFile = join(s.home, "..", "..", "services-for-contracts.json");
 writeFileSync(servicesFile, JSON.stringify(s));
 
 let code = 1;
-const stopOnSignal = async () => {
-  await running.stop();
-  process.exit(130);
-};
-process.on("SIGINT", stopOnSignal);
-process.on("SIGTERM", stopOnSignal);
 try {
   // Named suite files replace the default set; anything else is passed to `bun test` as is.
   const named = extra.filter((a) => a.startsWith("suites/"));
   const dirs = named.length ? named : ["suites/today", ...(v1 ? ["suites/v1"] : [])];
   const rest = extra.filter((a) => !a.startsWith("suites/"));
-  const p = Bun.spawn(["bun", "test", "--timeout", "60000", ...dirs.map((d) => `./${d}`), ...rest], {
+  const p = (child = Bun.spawn(["bun", "test", "--timeout", "60000", ...dirs.map((d) => `./${d}`), ...rest], {
     cwd: contracts,
     env: { ...process.env, CONTRACT_SERVICES: servicesFile },
     stdout: "inherit",
     stderr: "inherit",
-  });
+  }));
   code = await p.exited;
   if (code !== 0 && process.env.CONTRACT_SHOW_LOGS !== "0") {
     console.log("[contracts] failed; service log tail:\n" + (await running.logs()).slice(-4000));

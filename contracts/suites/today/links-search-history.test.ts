@@ -1,6 +1,6 @@
 // Links between notes, full-text search, and the history every note keeps.
 import { describe, expect, test } from "bun:test";
-import { enc, operator, paths, runId } from "../lib.ts";
+import { enc, operator, pass, paths, rest, runId, services } from "../lib.ts";
 
 const api = operator();
 
@@ -109,9 +109,16 @@ describe("history", () => {
   });
 
   test("history records who made each change", async () => {
+    // Two different writers: the operator, then a person with a hub-signed pass.
+    const token = await pass({ level: "write" });
+    const person = JSON.parse(Buffer.from(token.split(".")[1]!, "base64url").toString()).sub;
+    const them = rest(services().vaultViaHub, token);
     let note = (await api.post("/notes", { content: "a", path: `${runId("hist")}/who` })).body;
-    note = (await api.patch(`/notes/${note.id}`, { content: "b", if_updated_at: note.updatedAt })).body;
-    const v = (await api.get(`/notes/${note.id}/versions`)).body.versions[0];
-    expect(v.actor ?? v.via).toBeTruthy();
+    note = (await them.patch(`/notes/${note.id}`, { content: "bb", if_updated_at: note.updatedAt })).body;
+    note = (await api.patch(`/notes/${note.id}`, { content: "ccc", if_updated_at: note.updatedAt })).body;
+    const versions = (await api.get(`/notes/${note.id}/versions`)).body.versions;
+    // Each saved version records who replaced it: the person replaced "a", then the operator replaced "bb".
+    const replacedBy = Object.fromEntries(versions.map((v: any) => [v.content_len, v.actor]));
+    expect(replacedBy).toEqual({ 1: person, 2: "operator" });
   });
 });

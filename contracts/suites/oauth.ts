@@ -12,6 +12,14 @@ function cookie(r: Response, name: string): string | undefined {
 }
 const csrfIn = (html: string) => html.match(/name="__csrf"\s+value="([^"]+)"/)?.[1];
 
+/** Every URL the server hands us must stay on the throwaway hub, so a misconfigured hub can't steer the session
+ *  cookie or an auth code to the live one. */
+function onHub(url: string | undefined): string {
+  expect(url).toBeString();
+  expect(new URL(url!).origin).toBe(s.hub);
+  return url!;
+}
+
 export interface Connected {
   clientId: string;
   access: string;
@@ -34,7 +42,7 @@ export async function connect(opts: { scope?: (vault: string) => string; appName
   expect(prmUrl).toBeString();
 
   // 2. Protected-resource metadata names the resource and its authorization server.
-  const prm = await (await fetch(prmUrl!)).json();
+  const prm = await (await fetch(onHub(prmUrl))).json();
   expect(prm.resource).toBe(MCP_URL);
   const issuer = prm.authorization_servers[0];
   expect(issuer).toBe(s.hub);
@@ -43,6 +51,7 @@ export async function connect(opts: { scope?: (vault: string) => string; appName
   // 3. Authorization-server metadata: registration, PKCE S256, public clients.
   const as = await (await fetch(`${issuer}/.well-known/oauth-authorization-server`)).json();
   expect(as.issuer).toBe(issuer);
+  for (const k of ["registration_endpoint", "authorization_endpoint", "token_endpoint"]) onHub(as[k]);
   expect(as.code_challenge_methods_supported).toContain("S256");
   expect(as.token_endpoint_auth_methods_supported).toContain("none");
 
