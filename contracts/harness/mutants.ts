@@ -79,10 +79,33 @@ export const CANDIDATE_MUTANTS: Mutant[] = [
   {"name": "vault-binds-all", "why": "binds: the vault's default bind switched to every interface", "repo": "vault", "file": "src/bind.ts", "find": "  return \"127.0.0.1\";", "replace": "  return \"0.0.0.0\";", "suite": "suites/safety/loopback.test.ts", "catches": ["parachute-vault serve` with no VAULT_BIND binds 127.0.0.1 only"]},
   {"name": "hub-ignores-bind-host", "why": "a fix 2 that hardcodes loopback and breaks the containers' PARACHUTE_BIND_HOST", "repo": "hub", "file": "src/commands/serve.ts", "find": "  const hostname = env.PARACHUTE_BIND_HOST || \"0.0.0.0\";", "replace": "  const hostname = \"127.0.0.1\";", "suite": "suites/safety/loopback.test.ts", "catches": ["PARACHUTE_BIND_HOST=0.0.0.0 still binds every interface"]},
   {"name": "view-anonymous-reads", "why": "/view treats a request with no pass as authenticated", "repo": "vault", "file": "src/routing.ts", "find": "  if (!key) return false;\n  const auth = await authenticateVaultRequest(req, vaultConfig);\n  return !(\"error\" in auth);", "replace": "  if (!key) return true;\n  const auth = await authenticateVaultRequest(req, vaultConfig);\n  return !(\"error\" in auth);", "suite": "suites/safety/view-scope.test.ts", "catches": ["with no pass, /view shows neither note"]},
+  {"name": "tag-schema-needs-write-only", "why": "Prism: a write pass may change tag schemas", "repo": "vault", "file": "src/routing.ts", "find": "(isTagSchemaMutation || isNoteHistoryErase || isHistoryCompact) ? \"admin\"", "replace": "(isNoteHistoryErase || isHistoryCompact) ? \"admin\"", "suite": "suites/compat/prism.test.ts", "catches": ["tag schema: PUT /tags/:name with a write pass"]},
+  {"name": "if-exists-ignored", "why": "a taken path silently replaced", "repo": "vault", "file": "src/routes.ts", "find": "const ifExists: string = item.if_exists ?? \"error\";", "replace": "const ifExists: string = \"replace\";", "suite": "suites/compat", "catches": ["if_exists:error → 409", "uni-publish", "the door"]},
+  {"name": "attachment-download-admin-only", "why": "Prism's vault-rw allowlist loses a tool", "repo": "vault", "file": "core/src/mcp-manifest.ts", "find": "name: \"request-attachment-download\",\n      requiredVerb: \"read\",", "replace": "name: \"request-attachment-download\",\n      requiredVerb: \"admin\",", "suite": "suites/compat/prism.test.ts", "catches": ["a write pass sees every tool in Prism's vault-rw allowlist"]},
+  {"name": "mint-service-ignored", "why": "hub#872: member agent writes attributed to the operator", "repo": "hub", "file": "src/commands/auth.ts", "find": "const asService = flags.service;", "replace": "const asService = undefined as string | undefined;", "suite": "suites/compat/prism.test.ts", "catches": ["--service <id> makes the pass's sub"]},
+  {"name": "revocation-list-empty", "why": "revoked passes keep working", "repo": "hub", "file": "src/api-revocation-list.ts", "find": "const jtis = listActiveRevocations(deps.db, now);", "replace": "const jtis: string[] = [];", "suite": "suites/compat/prism.test.ts", "catches": ["auth revoke-token <jti> puts the jti", "the vault refuses a revoked pass"]},
+  {"name": "nip98-no-forwarded-https", "why": "the Uni app and uni-nightly locked out behind Tailscale Serve", "repo": "hub", "file": "src/nostr-http-auth.ts", "find": "if (layerOf(req, peer) !== \"loopback\" && isHttpsRequest(req)) {", "replace": "if (false && layerOf(req, peer) !== \"loopback\" && isHttpsRequest(req)) {", "suite": "suites/compat/uni.test.ts", "catches": ["the Uni app's shape", "uni-nightly", "the Uni app: create-note"]},
+  {"name": "nip98-unlinked-message", "why": "the Uni app's 'not linked' hint breaks", "repo": "hub", "file": "src/nostr-http-auth.ts", "find": "\"Nostr pubkey is not linked to a hub user\"", "replace": "\"Nostr pubkey is unknown to this hub\"", "suite": "suites/compat/uni.test.ts", "catches": ["an unlinked key is refused"]},
+  {"name": "ticket-reusable", "why": "upload tickets stop being single-use", "repo": "vault", "file": "src/attachment-tickets.ts", "find": "    if (!ticket) return null;\n    this.tickets.delete(id);\n    return ticket;", "replace": "    if (!ticket) return null;\n    return ticket;", "suite": "suites/compat/uni.test.ts", "catches": ["the Uni app: create-note"]},
+  {"name": "cursor-bootstrap-regression", "why": "vault#550 back: cursor= gets a bare array", "repo": "vault", "file": "src/routes.ts", "find": "const cursorMode = cursorParam !== null;", "replace": "const cursorMode = !!cursorParam;", "suite": "suites/compat/uni.test.ts", "catches": ["uni-digest", "the door"]},
+  {"name": "self-register-restamps", "why": "services.json rewritten every boot", "repo": "vault", "file": "src/self-register.ts", "find": "    version: deps.version,\n    installDir,\n  };", "replace": "    version: deps.version,\n    installDir,\n    ...({ registeredAt: new Date().toISOString() } as {}),\n  };", "suite": "suites/compat/uni.test.ts", "catches": ["a restart leaves services.json"]},
+  {"name": "hub-admin-route-unauthenticated", "why": "an admin route reachable by any local process without a token", "repo": "hub", "file": "src/api-hub.ts", "find": "    await requireScope(deps.db, req, HOST_ADMIN_SCOPE, deps.knownIssuers ?? [deps.issuer]);", "replace": "    void requireScope;", "suite": "suites/embedded/hostile-local.test.ts", "catches": ["box: with no token", "box: with a vault read token", "box: with a vault write token"]}
 ];
 
 /** Fixes that must flip red contracts to "now green" (`catches` lists the red contracts that must flip). */
 export const FLIPS: Mutant[] = [
+  {
+    name: "issuer-hub",
+    why: "fix 1 in the hub: PARACHUTE_HUB_ORIGIN names the CLI's issuer, and serve points its vault child's key fetch at itself",
+    repo: "hub",
+    patch: "flips/issuer-hub.patch",
+    suite: "suites/embedded/issuer.test.ts",
+    catches: [
+      "with PARACHUTE_HUB_ORIGIN set, rotate-operator and mint-token sign with exactly that iss",
+      "box: on a non-default hub port with only PARACHUTE_HUB_ORIGIN set",
+      "box: a vault the hub starts verifies that hub's tokens on a non-default hub port",
+    ],
+  },
   {
     name: "safety-fixes-hub",
     why: "fixes 2, 13 and 14 in the hub: loopback by default, a mint never wider than its minter, unknown permission keys refused",
