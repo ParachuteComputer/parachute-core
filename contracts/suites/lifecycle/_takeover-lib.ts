@@ -3,7 +3,7 @@
 // made by those old programs, and a network of its own.
 //
 // Why each piece:
-//   - The old programs are the stock 0.7 build (.cache/candidate-stock, hash-checked; OLD_STOCK_DIR to use another),
+//   - The old programs are the stock 0.7 build (candidate-lib oldStockDir(), hash-checked),
 //     not the candidate: once the candidate is v0.8 its folder holds core, and the point is old next to new.
 //     Today the candidate *is* that build, so this is the brief's "copy the candidate's own lib/hub and lib/vault".
 //   - The layout copies what bun did on uni (read-only look, 10-27): ~/.bun/bin/parachute is a relative symlink to
@@ -23,7 +23,7 @@ import { createServer, connect, type Server } from "node:net";
 import { Database } from "bun:sqlite";
 import { dirname, join, relative, resolve } from "node:path";
 import { candidateEnv, loadCandidate, treeHash, type CandidateInfo } from "../../harness/candidate.ts";
-import { allowOrigins, candidate, freePort, newHome, safeFetch, until } from "../candidate-lib.ts";
+import { allowOrigins, candidate, freePort, oldStockDir, newHome, safeFetch, until } from "../candidate-lib.ts";
 import { must, rest } from "../lib.ts";
 
 export { must, treeHash };
@@ -41,7 +41,7 @@ let oldStockCache: OldStock | null = null;
 /** The stock 0.7 build the old global install is copied from, checked against its own CANDIDATE.json hash. */
 export async function oldStock(): Promise<OldStock> {
   if (oldStockCache) return oldStockCache;
-  const dir = resolve(process.env.OLD_STOCK_DIR ?? join(import.meta.dir, "..", "..", ".cache", "candidate-stock"));
+  const dir = oldStockDir();
   const { manifest } = await loadCandidate(dir);
   must(manifest.profile === "stock-0.7", `setup: ${dir} is not a stock 0.7 build (profile ${manifest.profile})`);
   const pkg = (p: string) => JSON.parse(readFileSync(join(dir, "lib", p, "package.json"), "utf8"));

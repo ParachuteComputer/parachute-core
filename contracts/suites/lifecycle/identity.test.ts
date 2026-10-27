@@ -44,7 +44,7 @@ function candidatePackage(): { name: string; version: string; bin: Record<string
   const root = join(dir, "package.json");
   if (!existsSync(root)) {
     // No root package: say which packages its programs come from (the stock build runs lib/hub and lib/vault).
-    const libs = existsSync(join(dir, "lib")) ? readdirSync(join(dir, "lib")).filter((d) => existsSync(join(dir, "lib", d, "package.json"))) : [];
+    const libs = existsSync(join(dir, "lib")) ? readdirSync(join(dir, "lib")).sort().filter((d) => existsSync(join(dir, "lib", d, "package.json"))) : [];
     const names = libs.map((d) => JSON.parse(readFileSync(join(dir, "lib", d, "package.json"), "utf8")).name as string);
     throw new Error(`package name is ${names.join(" + ") || "unknown"} (no package.json at the candidate root; its programs come from ${libs.map((d) => `lib/${d}`).join(", ")})`);
   }

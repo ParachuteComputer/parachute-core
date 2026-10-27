@@ -1,6 +1,6 @@
 // Run by rollback.test.ts in a network of its own (_lib.ts inOwnNetwork), because the stock box puts its vault on
 // the fixed port 1940. PLAN §3 "Adopting an existing stock home in place", the embedded/rollback contract:
-//   1. stock 0.7 (.cache/candidate-stock) makes a home as Prism's stock mode does: a vault, a box serve, an operator,
+//   1. stock 0.7 (oldStockDir()) makes a home as Prism's stock mode does: a vault, a box serve, an operator,
 //      a write token ("Prism's old token") and a note;
 //   2. the candidate opens that same home with `serve --embedded` on the same hub origin: the old token still
 //      works, it writes, updates and mints a new token; services.json is left as it was; it stops cleanly;

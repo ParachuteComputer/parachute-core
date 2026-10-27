@@ -40,6 +40,9 @@ export interface CandidateInfo {
   vaultBin: string; // <dir>/bin/parachute-vault
   runtimeDir: string; // a folder holding only `bun`, for PATH
   scratch: string; // where suites make throwaway homes
+  /** Today's stock 0.7 build, for "the old programs" (takeover, identity, rollback to stock): the candidate itself
+   *  while it is stock, else OLD_STOCK_DIR or .cache/candidate-stock. */
+  oldStockDir: string;
   profile: CandidateManifest["profile"];
   processModel: CandidateManifest["process_model"];
   sha256: string;
@@ -346,6 +349,7 @@ export function prepareInfo(dir: string, manifest: CandidateManifest, sha256: st
     vaultBin: join(d, "bin", "parachute-vault"),
     runtimeDir,
     scratch,
+    oldStockDir: resolve(process.env.OLD_STOCK_DIR ?? (manifest.profile === "stock-0.7" ? d : join(import.meta.dir, "..", ".cache", "candidate-stock"))),
     profile: manifest.profile,
     processModel: manifest.process_model,
     sha256,

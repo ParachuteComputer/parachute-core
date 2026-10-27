@@ -15,6 +15,11 @@ export function candidate(): CandidateInfo {
   return JSON.parse(readFileSync(path, "utf8"));
 }
 
+/** Today's stock 0.7 build: "the old programs" a v0.8 candidate takes over from or rolls back to. */
+export function oldStockDir(): string {
+  return candidate().oldStockDir;
+}
+
 /** A fresh, empty throwaway PARACHUTE_HOME (not yet created) in a fresh throwaway user home. */
 export function newHome(label = "home"): string {
   return freshHome(candidate(), label);

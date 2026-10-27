@@ -4,7 +4,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { allowOrigins, candidate, cli, freePort, safeFetch, start, until, type Served } from "../candidate-lib.ts";
+import { allowOrigins, candidate, cli, oldStockDir, freePort, safeFetch, start, until, type Served } from "../candidate-lib.ts";
 import { must } from "../lib.ts";
 
 export { must };
@@ -229,9 +229,9 @@ export async function report(fn: (input: any) => Promise<unknown>, opts: { trap?
   }
 }
 
-/** The stock 0.7 candidate (.cache/candidate-stock), for the rollback leg: today's hub 0.7.19 and vault 0.7.9. */
+/** The stock 0.7 build, for the rollback leg: today's hub 0.7.19 and vault 0.7.9 (candidate-lib oldStockDir()). */
 export function stockDir(): string {
-  return resolve(import.meta.dir, "../../.cache/candidate-stock");
+  return oldStockDir();
 }
 
 export { candidate };
