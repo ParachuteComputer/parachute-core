@@ -1,0 +1,58 @@
+# Runs the contract suite against today's hub and vault at the commits in contracts/pins.json.
+# Everything is local to the runner: a throwaway hub and vault on random ports in a temp home.
+name: contracts
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: contracts-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  today:
+    name: today's contracts (+ v1 pending)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4
+      - name: cache the pinned vault + hub checkouts
+        uses: actions/cache@v4
+        with:
+          path: contracts/.cache/repos
+          key: repos-${{ hashFiles('contracts/pins.json') }}-bun1.4
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - name: today's contracts (must pass)
+        run: bun run today
+      - name: v1 contracts (marked failing until built)
+        run: bun run v1
+
+  mutants:
+    name: mutants (the contracts must catch each)
+    runs-on: ubuntu-latest
+    needs: today
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4
+      - uses: actions/cache@v4
+        with:
+          path: contracts/.cache/repos
+          key: repos-${{ hashFiles('contracts/pins.json') }}-bun1.4
+      - run: bun install --frozen-lockfile
+      - run: bun run mutants
