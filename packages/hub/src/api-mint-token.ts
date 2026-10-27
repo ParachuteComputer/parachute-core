@@ -65,6 +65,7 @@ import {
   vaultScopeName,
 } from "./scope-explanations.ts";
 import { getUserById, resolveUser } from "./users.ts";
+import { bearerPermissionsProblem, ENFORCED_PERMISSION_KEYS, scopedTagsWiderThanMinter, unknownPermissionKeys } from "./permissions-claim.ts";
 
 // Re-export `canGrant` so existing importers (and the symmetric revoke path)
 // have a single name to reach for; the implementation lives in the shared
@@ -162,6 +163,7 @@ export async function handleApiMintToken(req: Request, deps: ApiMintTokenDeps): 
   // 2. Bearer validation (signature, issuer, expiry, revocation).
   let bearerSub: string;
   let bearerScopes: string[];
+  let bearerPermissions: unknown;
   try {
     const validated = await validateAccessToken(
       deps.db,
@@ -173,6 +175,12 @@ export async function handleApiMintToken(req: Request, deps: ApiMintTokenDeps): 
       return jsonError(401, "unauthenticated", "bearer token has no sub claim");
     }
     bearerSub = sub;
+    bearerPermissions = (validated.payload as { permissions?: unknown }).permissions;
+    // A bearer carrying restrictions no vault enforces (a pass minted before
+    // fix 14) is refused outright: the vault 401s it, and minting from it
+    // would launder it into a clean pass without those restrictions.
+    const badBearerPermissions = bearerPermissionsProblem(bearerPermissions);
+    if (badBearerPermissions !== null) return jsonError(401, "unauthenticated", `bearer token ${badBearerPermissions}`);
     bearerScopes =
       typeof validated.payload.scope === "string"
         ? validated.payload.scope.split(/\s+/).filter((s) => s.length > 0)
@@ -449,8 +457,20 @@ export async function handleApiMintToken(req: Request, deps: ApiMintTokenDeps): 
       return jsonError(400, "invalid_request", "permissions must be a JSON object");
     }
     permissionsClaim = body.permissions as Record<string, unknown>;
+    const unknownKeys = unknownPermissionKeys(permissionsClaim);
+    if (unknownKeys.length > 0) {
+      return jsonError(
+        400,
+        "invalid_request",
+        `permissions has unknown key(s) ${unknownKeys.join(", ")}; a vault enforces only ${ENFORCED_PERMISSION_KEYS.join(", ")}`,
+      );
+    }
     permissionsCanonical = JSON.stringify(permissionsClaim);
   }
+  // Never wider than the bearer, tags included (fix 13): the scope checks
+  // above attenuate scope strings only.
+  const widerTags = scopedTagsWiderThanMinter(bearerPermissions, permissionsClaim);
+  if (widerTags !== null) return jsonError(400, "invalid_scope", widerTags);
 
   // Derive the `vault_scope` pin. Collect the set of vault names `<N>` from
   // every requested `vault:<N>:<verb>` scope that was authorized via a

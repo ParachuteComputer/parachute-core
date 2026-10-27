@@ -1990,7 +1990,7 @@ describe("parachute auth mint-token", () => {
         isInteractive: () => false,
       };
       await captureOutput(() => auth(["set-password", "--password", "pw"], deps));
-      const permissions = '{"vault":{"default":{"write_tags":["health"]}}}';
+      const permissions = '{"scoped_tags":["health"]}';
       const { code, stdout } = await captureOutput(() =>
         auth(["mint-token", "--scope", "vault:default:write", "--permissions", permissions], deps),
       );
@@ -1999,19 +1999,36 @@ describe("parachute auth mint-token", () => {
       const db = openHubDb(tmp.dbPath);
       try {
         const validated = await validateAccessToken(db, token);
-        expect(validated.payload.permissions).toEqual({
-          vault: { default: { write_tags: ["health"] } },
-        });
+        expect(validated.payload.permissions).toEqual({ scoped_tags: ["health"] });
         const jti = validated.payload.jti as string;
         const row = db
           .query<{ permissions: string }, [string]>("SELECT permissions FROM tokens WHERE jti = ?")
           .get(jti);
-        expect(JSON.parse(row!.permissions)).toEqual({
-          vault: { default: { write_tags: ["health"] } },
-        });
+        expect(JSON.parse(row!.permissions)).toEqual({ scoped_tags: ["health"] });
       } finally {
         db.close();
       }
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  // Fix 14: the shape the help once suggested is refused, naming the key.
+  test("--permissions with a key no vault enforces is rejected", async () => {
+    const tmp = makeTmp();
+    try {
+      const deps: AuthDeps = {
+        dbPath: tmp.dbPath,
+        configDir: tmp.dir,
+        isInteractive: () => false,
+      };
+      await captureOutput(() => auth(["set-password", "--password", "pw"], deps));
+      const { code, stdout, stderr } = await captureOutput(() =>
+        auth(["mint-token", "--scope", "vault:default:write", "--permissions", '{"vault":{"default":{"write_tags":["health"]}}}'], deps),
+      );
+      expect(code).toBe(1);
+      expect(stdout.trim()).toBe("");
+      expect(stderr).toContain("unknown key(s) vault");
     } finally {
       tmp.cleanup();
     }

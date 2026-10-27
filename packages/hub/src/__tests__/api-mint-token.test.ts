@@ -300,7 +300,7 @@ describe("POST /api/auth/mint-token (hub#212 Phase 1)", () => {
       const { db, userId } = await bootstrap(h.dir);
       try {
         const op = await mintOperatorToken(db, userId, { issuer: ISSUER });
-        const permissions = { vault: { default: { write_tags: ["health"] } } };
+        const permissions = { scoped_tags: ["health"] };
         const resp = await handleApiMintToken(
           jsonRequest(
             { scope: "vault:default:write", permissions },
@@ -317,6 +317,30 @@ describe("POST /api/auth/mint-token (hub#212 Phase 1)", () => {
           .query<{ permissions: string }, [string]>("SELECT permissions FROM tokens WHERE jti = ?")
           .get(body.jti);
         expect(JSON.parse(row!.permissions)).toEqual(permissions);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  // Fix 14: a key no vault enforces would be signed in and ignored, leaving
+  // the pass unlimited; the endpoint refuses it instead.
+  test("400 when permissions carry a key no vault enforces (the old write_tags shape)", async () => {
+    const h = makeHarness();
+    try {
+      const { db, userId } = await bootstrap(h.dir);
+      try {
+        const op = await mintOperatorToken(db, userId, { issuer: ISSUER });
+        for (const permissions of [{ vault: { default: { write_tags: ["health"] } } }, { scoped_tags: ["health"], write_tags: ["health"] }]) {
+          const resp = await handleApiMintToken(
+            jsonRequest({ scope: "vault:default:write", permissions }, { authorization: `Bearer ${op.token}` }),
+            { db, issuer: ISSUER },
+          );
+          expect(resp.status).toBe(400);
+          expect(((await resp.json()) as { error_description?: string; message?: string; error: string }).error).toBe("invalid_request");
+        }
       } finally {
         db.close();
       }
