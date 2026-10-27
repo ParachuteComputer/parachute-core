@@ -420,7 +420,7 @@ describe("HookRegistry — deleted note events", () => {
     expect(seen[0]!.path).toBe("to-delete");
   });
 
-  it("DeletedNoteRef has no metadata/tags/content (predicate authors take note)", async () => {
+  it("DeletedNoteRef has no metadata/content, only the tags the note had (predicate authors take note)", async () => {
     const observedPayloads: unknown[] = [];
     hooks.onNote({
       event: "deleted",
@@ -435,10 +435,11 @@ describe("HookRegistry — deleted note events", () => {
     expect(observedPayloads).toHaveLength(1);
     const p = observedPayloads[0] as Record<string, unknown>;
     expect(p.id).toBe(n.id);
-    // Strictly minimal shape — no full Note fields leak through.
+    // Minimal shape — no full Note fields leak through, except the tags the
+    // note carried, which live subscriptions need to scope the delete (G5).
     expect(p.content).toBeUndefined();
     expect(p.metadata).toBeUndefined();
-    expect(p.tags).toBeUndefined();
+    expect([...(p.tags as string[])].sort()).toEqual(["one", "two"]);
   });
 
   it("array events allow subscribing to created+updated+deleted in one hook", async () => {

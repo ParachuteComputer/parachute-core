@@ -1032,7 +1032,7 @@ export class BunSqliteStore implements Store {
     // any orphans missed by the targeted-removal fast path.
     this.hooks.dispatch(
       "deleted",
-      { id, ...(existing?.path ? { path: existing.path } : {}) },
+      { id, ...(existing?.path ? { path: existing.path } : {}), ...(existing ? { tags: existing.tags ?? [] } : {}) },
       this,
     );
   }

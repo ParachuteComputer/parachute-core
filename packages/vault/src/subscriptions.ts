@@ -43,9 +43,10 @@
  *   3. created/updated → `matcher.match(note) && noteWithinTagScope(...)` ?
  *      emit `upsert{note}` : (updated only) emit `remove{id}` (left-the-set,
  *      idempotent on the client);
- *   4. deleted → broadcast `remove{id}` to all that vault's subs (the delete
- *      payload is a thin `{id, path?}` ref — no tags/metadata — so it can't
- *      be scope-matched; see the design's "Auth / scope intersection" §).
+ *   4. deleted → `remove{id}` to the subs whose scope covers the note's tags
+ *      as they were just before the delete (the ref carries them, G5); an
+ *      unscoped sub hears every delete. Before G5 every delete went to every
+ *      sub, so a tag-scoped socket learned the id of each hidden note deleted.
  *
  * O(writes × subscriptions). At vault scale (hundreds of notes, single-digit
  * open tabs) this is free; documented ceiling, not a silent cap.
@@ -313,11 +314,14 @@ export class SubscriptionManager {
       if (sub.vaultName !== vaultName) continue;
 
       if (event === "deleted") {
-        // Thin ref ({id, path?}) — un-scope-matchable. Broadcast remove{id};
-        // the client ignores ids it never held. Documented low-sensitivity
-        // existence leak (see design §scope-intersection).
+        // Same rule as a left-the-set update below: only a sub whose scope
+        // covers the note could have held it (G5). The client ignores ids it
+        // never held. A ref without tags (the note was already gone) reaches
+        // unscoped subs only.
         const ref = payload as DeletedNoteRef;
-        this.emit(sub, "remove", { id: ref.id });
+        if (noteWithinTagScope({ id: ref.id, tags: ref.tags ?? [] } as Note, sub.tagScopeAllowed, sub.tagScopeRaw)) {
+          this.emit(sub, "remove", { id: ref.id });
+        }
         continue;
       }
 
