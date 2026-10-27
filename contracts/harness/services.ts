@@ -34,20 +34,24 @@ const CONTRACTS = resolve(import.meta.dir, "..");
 const WATCHDOG = join(import.meta.dir, "watchdog.ts");
 const SANDBOX_PREFIX = "pcore-contracts-";
 
-/** Remove temp homes left by harness processes that are gone (e.g. SIGKILLed: no cleanup code could run). */
-function sweepStaleSandboxes(base: string): void {
+/** Remove temp homes left by harness processes that are gone (e.g. SIGKILLed: no cleanup code could run).
+ *  Only a provably dead owner counts (ESRCH; EPERM means someone else's live process), homes kept with --keep stay,
+ *  and a home we can't remove is left alone rather than failing the run. */
+export function sweepStaleSandboxes(base: string): void {
   for (const name of readdirSync(base)) {
     if (!name.startsWith(SANDBOX_PREFIX)) continue;
-    const ownerFile = join(base, name, "owner.pid");
-    if (!existsSync(ownerFile)) continue;
-    const owner = Number(readFileSync(ownerFile, "utf8"));
-    let alive = true;
+    const dir = join(base, name);
     try {
-      process.kill(owner, 0);
-    } catch {
-      alive = false;
-    }
-    if (!alive) rmSync(join(base, name), { recursive: true, force: true });
+      if (existsSync(join(dir, "kept")) || !existsSync(join(dir, "owner.pid"))) continue;
+      const owner = Number(readFileSync(join(dir, "owner.pid"), "utf8"));
+      try {
+        process.kill(owner, 0);
+        continue; // alive
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== "ESRCH") continue;
+      }
+      rmSync(dir, { recursive: true, force: true });
+    } catch {}
   }
 }
 
@@ -68,17 +72,32 @@ const ALLOWED_IGNORED = [/(^|\/)node_modules\//, /^packages\/[^/]+\/dist\//];
 
 /** Files that make a checkout differ from its commit: edits, untracked files, unexpected ignored files. */
 export async function dirtyFiles(dir: string): Promise<string[]> {
-  const out = await sh(["git", "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored"], dir);
-  return out
-    .split("\0")
-    .filter(Boolean)
-    .filter((e) => !(e.startsWith("!! ") && ALLOWED_IGNORED.some((re) => re.test(e.slice(3)))))
-    .map((e) => e.slice(3));
+  // node_modules is left out of the walk (it's huge); see the README on what that does and doesn't check.
+  const out = await sh(
+    ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored", "--", ".", ":(glob,exclude)**/node_modules/**"],
+    dir,
+  );
+  const fields = out.split("\0");
+  const dirty: string[] = [];
+  for (let i = 0; i < fields.length; i++) {
+    const e = fields[i]!;
+    if (!e) continue;
+    const xy = e.slice(0, 2);
+    const path = e.slice(3);
+    if (xy[0] === "R" || xy[0] === "C") i++; // -z puts a rename's source path in its own field
+    if (xy === "!!" && ALLOWED_IGNORED.some((re) => re.test(path))) continue;
+    dirty.push(path);
+  }
+  // git status can't see edits to files flagged skip-worktree (S) or assume-unchanged (lowercase); refuse those.
+  for (const line of (await sh(["git", "ls-files", "-v", "-z"], dir)).split("\0")) {
+    if (line && (line[0] === "S" || /^[a-z]/.test(line))) dirty.push(line.slice(2));
+  }
+  return dirty;
 }
 
 /** A hash of the install-built output, so a hand-edited dist/ can't pass as pinned code. */
 async function buildHash(dir: string): Promise<string> {
-  const files = (await sh(["git", "ls-files", "-z", "--others", "--ignored", "--exclude-standard"], dir))
+  const files = (await sh(["git", "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--", "packages"], dir))
     .split("\0")
     .filter((f) => /^packages\/[^/]+\/dist\//.test(f))
     .sort();
@@ -129,7 +148,12 @@ export async function ensureRepos(): Promise<Repos> {
     const stamp = join(dir, "node_modules", ".contracts-installed-for");
     const want = (await sh(["git", "rev-parse", "HEAD"], dir)).trim();
     const [stampedCommit, stampedBuild] = existsSync(stamp) ? readFileSync(stamp, "utf8").trim().split(" ") : [];
-    if (stampedCommit !== want) {
+    if (stampedCommit !== want || !stampedBuild) {
+      // The hub's prepare script skips building a package whose dist/ exists, so clear old build output first:
+      // otherwise dist/ compiled from an earlier commit would be stamped as this one.
+      if (existsSync(join(dir, "packages"))) {
+        for (const pkg of readdirSync(join(dir, "packages"))) rmSync(join(dir, "packages", pkg, "dist"), { recursive: true, force: true });
+      }
       await sh(["bun", "install", "--frozen-lockfile"], dir);
       writeFileSync(stamp, `${want} ${await buildHash(dir)}\n`);
     } else if (stampedBuild !== (await buildHash(dir))) {
@@ -232,6 +256,7 @@ export async function startServices(opts: { keep?: boolean } = {}): Promise<Runn
   sweepStaleSandboxes(base);
   const sandbox = mkdtempSync(join(base, `${SANDBOX_PREFIX}${runId}-`));
   writeFileSync(join(sandbox, "owner.pid"), `${process.pid}\n`);
+  if (opts.keep) writeFileSync(join(sandbox, "kept"), ""); // the sweep leaves kept homes alone
   let hubProc: ReturnType<typeof Bun.spawn> | null = null;
   let vaultProc: ReturnType<typeof Bun.spawn> | null = null;
   // One shared promise: a signal handler and the normal exit path may both call stop(), and both must wait for
@@ -273,12 +298,18 @@ export async function startServices(opts: { keep?: boolean } = {}): Promise<Runn
 
     const baseEnv = {
       PATH: process.env.PATH ?? "",
+      PCORE_HARNESS_PID: String(process.pid), // read by harness/watchdog.ts
       HOME: home,
       PARACHUTE_HOME: phome,
       TMPDIR: sandbox,
       PARACHUTE_HUB_ORIGIN: hub,
     };
 
+    // A stop() that began mid-startup has already run; never start a service after it.
+    const notStopping = () => {
+      if (stopping) throw new Error("startup interrupted");
+    };
+    notStopping();
     hubProc = Bun.spawn(
       [
         "bun",
@@ -301,6 +332,7 @@ export async function startServices(opts: { keep?: boolean } = {}): Promise<Runn
       },
     );
     await waitFor(`${hub}/health`, (r) => r.ok, "hub", hubLog);
+    notStopping();
     vaultProc = Bun.spawn(["bun", "--preload", WATCHDOG, "src/server.ts"], {
       cwd: repos.vault,
       env: {

@@ -51,6 +51,13 @@ describe("pinned checkouts", () => {
     expect(await refused(join(root, "untracked"))).toContain("src/extra.ts");
   });
 
+  test("an edit hidden from git status with --skip-worktree is refused", async () => {
+    const dir = await cacheWithVault("hidden");
+    await git(["update-index", "--skip-worktree", "src/tag-scope.ts"], dir);
+    appendFileSync(join(dir, "src/tag-scope.ts"), "\n// changed\n");
+    expect(await refused(join(root, "hidden"))).toContain("src/tag-scope.ts");
+  });
+
   test("an ignored file outside node_modules and build output is refused", async () => {
     const dir = await cacheWithVault("ignored");
     writeFileSync(join(dir, ".env"), "VAULT_AUTH_TOKEN=made-up\n");

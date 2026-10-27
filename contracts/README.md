@@ -40,12 +40,17 @@ What keeps a run away from the live install, each held by a test in `harness/sel
   self-test fails if any file calls `fetch()` directly.
 - **Cleanup always finishes.** `stopAll()` (what the signal handlers call) waits for any cleanup already under way.
   The services also preload `harness/watchdog.ts` and exit within half a second if the harness dies, even by
-  SIGKILL. The next run deletes temp homes whose owner process is gone.
+  SIGKILL. The next run deletes temp homes whose owner process is gone, but never homes kept with `--keep`, and
+  never another user's.
 - **A pinned run runs the pinned code.** A cached checkout with edited tracked files, untracked files or unexpected
   ignored files is refused. The only ignored files allowed are `node_modules/` and the hub's `packages/*/dist/`,
   which its install builds. Their bytes are hashed at install time and checked on every run. Every run prints what
   it ran, e.g. `[contracts] code: vault 42fbf93 (clean), hub 53d327b (clean)`. A deliberate run against other code
   (`VAULT_REPO_DIR` / `HUB_REPO_DIR`, which the mutants use) says `NOT PINNED`.
+  Files hidden from `git status` (skip-worktree, assume-unchanged) are refused too. **Not checked:** the contents
+  of `node_modules/`. Dependencies come from `bun install --frozen-lockfile` against each repo's lockfile, but a
+  hand-edited file inside them would go unnoticed. Delete `.cache/repos` if in doubt; CI starts from a cache keyed
+  on `pins.json`.
 
 To run the contracts against something else (a build of this repo, a cloud deployment), write a services file in
 the `Services` shape and run `CONTRACT_SERVICES=<file> bun test ./suites/today`.

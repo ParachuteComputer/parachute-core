@@ -56,7 +56,9 @@ describe("guarded fetch", () => {
           readFileSync(p, "utf8")
             .split("\n")
             .forEach((line, i) => {
-              if (/(^|[^.\w])fetch\(/.test(line) && !line.trim().startsWith("//")) offenders.push(`${p}:${i + 1}`);
+              // Any call of something named fetch (fetch(, globalThis.fetch(, Bun.fetch (...) except safeFetch.
+              if (/(^|[^\w])fetch\s*\(/.test(line.replace(/safeFetch/g, "")) && !line.trim().startsWith("//"))
+                offenders.push(`${p}:${i + 1}`);
             });
         }
       }
