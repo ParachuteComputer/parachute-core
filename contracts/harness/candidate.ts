@@ -1,0 +1,353 @@
+// The candidate adapter (CONTRACT_TARGET=candidate): run the contracts against a built `parachute`, launched the
+// way a user launches it, and prove which bytes were tested.
+//
+// A candidate is a folder with bin/parachute, bin/parachute-vault and CANDIDATE.json (harness/build-stock-candidate.ts
+// builds today's code that way; lane A1's build will write the same shape). The adapter:
+//   - refuses a candidate whose files don't hash to the sha256 in CANDIDATE.json, or to CANDIDATE_SHA256 when CI
+//     passes the hash its build step produced;
+//   - runs only bin/parachute and bin/parachute-vault, with a PATH that holds the candidate, Bun and the system,
+//     never ~/.bun/bin or a global install;
+//   - starts it inside the sandbox (harness/sandbox.ts), with its own HOME and PARACHUTE_HOME;
+//   - checks that every listening socket belongs to a process started from the candidate folder, and reports the
+//     process model it saw (one process, or a hub with a vault child);
+//   - writes nothing a release would own, except the workarounds a profile names (printed on every run).
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { randomBytes } from "node:crypto";
+import { allowOrigins, safeFetch } from "./guard.ts";
+import type { Running, Services } from "./services.ts";
+
+export const MANIFEST = "CANDIDATE.json";
+
+export interface CandidateManifest {
+  name: string;
+  /** "stock-0.7": today's hub + vault; "v0.8": the one program. Decides the launch and its allowed workarounds. */
+  profile: "stock-0.7" | "v0.8";
+  version: Record<string, string> | string;
+  source: Record<string, string> | string;
+  core_commit: string;
+  /** What the build says it is: "child" (hub + vault child) or "in-process". The run checks what it sees. */
+  process_model: "child" | "in-process";
+  platform: string;
+  sha256: string;
+}
+
+/** What a suite needs to start the candidate itself (embedded/, lifecycle/): written to CONTRACT_CANDIDATE. */
+export interface CandidateInfo {
+  dir: string;
+  bin: string; // <dir>/bin/parachute
+  vaultBin: string; // <dir>/bin/parachute-vault
+  runtimeDir: string; // a folder holding only `bun`, for PATH
+  scratch: string; // where suites make throwaway homes
+  profile: CandidateManifest["profile"];
+  processModel: CandidateManifest["process_model"];
+  sha256: string;
+}
+
+/** sha256 over every path in the folder (sorted), its kind, and its bytes or link target. CANDIDATE.json is left out. */
+export async function treeHash(root: string): Promise<string> {
+  const h = new Bun.CryptoHasher("sha256");
+  const walk = async (rel: string) => {
+    const abs = join(root, rel);
+    const names = readdirSync(abs).sort();
+    for (const name of names) {
+      const r = rel ? `${rel}/${name}` : name;
+      if (r === MANIFEST) continue;
+      const st = lstatSync(join(root, r));
+      if (st.isSymbolicLink()) h.update(`L\0${r}\0${readlinkSync(join(root, r))}\0`);
+      else if (st.isDirectory()) {
+        h.update(`D\0${r}\0`);
+        await walk(r);
+      } else if (st.isFile()) {
+        h.update(`F\0${r}\0${(st.mode & 0o111) ? "x" : "-"}\0`);
+        h.update(await Bun.file(join(root, r)).bytes());
+        h.update("\0");
+      }
+    }
+  };
+  await walk("");
+  return h.digest("hex");
+}
+
+export async function loadCandidate(dir: string): Promise<{ manifest: CandidateManifest; sha256: string }> {
+  const d = resolve(dir);
+  if (!existsSync(join(d, MANIFEST))) throw new Error(`${d} is not a candidate (no ${MANIFEST}); build one with \`bun run build:stock\``);
+  for (const b of ["bin/parachute", "bin/parachute-vault"]) {
+    if (!existsSync(join(d, b))) throw new Error(`candidate ${d} has no ${b}`);
+  }
+  const manifest = JSON.parse(readFileSync(join(d, MANIFEST), "utf8")) as CandidateManifest;
+  const sha256 = await treeHash(d);
+  if (sha256 !== manifest.sha256) throw new Error(`candidate ${d}: files hash to ${sha256}, but ${MANIFEST} says ${manifest.sha256}`);
+  const want = process.env.CANDIDATE_SHA256;
+  if (want && want !== sha256) throw new Error(`candidate ${d}: files hash to ${sha256}, but this CI build produced ${want}`);
+  return { manifest, sha256 };
+}
+
+/** The environment every candidate process gets: nothing from the caller's shell but locale. */
+export function candidateEnv(info: CandidateInfo, home: string, extra: Record<string, string> = {}): Record<string, string> {
+  return {
+    PATH: `${info.dir}/bin:${info.runtimeDir}:/usr/local/bin:/usr/bin:/bin`,
+    HOME: dirname(home),
+    PARACHUTE_HOME: home,
+    TMPDIR: join(dirname(home), "tmp"),
+    LANG: "C.UTF-8",
+    ...extra,
+  };
+}
+
+/** A fresh throwaway user home (`<scratch>/<id>/u`) with `.parachute` not yet created. Returns PARACHUTE_HOME. */
+export function freshHome(info: CandidateInfo, label = "home"): string {
+  const user = mkdtempSync(join(info.scratch, `${label}-`));
+  mkdirSync(join(user, "tmp"), { recursive: true });
+  return join(user, ".parachute");
+}
+
+// ── which processes are listening, and from where ───────────────────────────────────────────────────────────
+
+interface Proc {
+  pid: number;
+  cmdline: string[];
+  listens: string[];
+}
+
+function socketInodes(): Map<string, string> {
+  const map = new Map<string, string>(); // inode → "addr:port"
+  const v4 = (hex: string) => hex.match(/../g)!.reverse().map((b) => parseInt(b, 16)).join(".");
+  for (const [f, six] of [["/proc/net/tcp", false], ["/proc/net/tcp6", true]] as const) {
+    let text = "";
+    try {
+      text = readFileSync(f, "utf8");
+    } catch {
+      continue;
+    }
+    for (const line of text.split("\n").slice(1)) {
+      const c = line.trim().split(/\s+/);
+      if (c[3] !== "0A") continue;
+      const [a, p] = c[1]!.split(":");
+      const addr = six ? (/^0+$/.test(a!) ? "[::]" : a === "00000000000000000000000001000000" ? "[::1]" : `[${a}]`) : v4(a!);
+      map.set(c[9]!, `${addr}:${parseInt(p!, 16)}`);
+    }
+  }
+  return map;
+}
+
+/** Every process in this PID namespace that holds a listening socket. Only meaningful inside the sandbox. */
+export function listeningProcesses(): Proc[] {
+  const inodes = socketInodes();
+  const out: Proc[] = [];
+  for (const name of readdirSync("/proc")) {
+    if (!/^\d+$/.test(name)) continue;
+    const pid = Number(name);
+    const listens: string[] = [];
+    try {
+      for (const fd of readdirSync(`/proc/${pid}/fd`)) {
+        let link = "";
+        try {
+          link = readlinkSync(`/proc/${pid}/fd/${fd}`);
+        } catch {
+          continue;
+        }
+        const m = link.match(/^socket:\[(\d+)\]$/);
+        if (m && inodes.has(m[1]!)) listens.push(inodes.get(m[1]!)!);
+      }
+      if (!listens.length) continue;
+      const cmdline = readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").filter(Boolean);
+      out.push({ pid, cmdline, listens: [...new Set(listens)].sort() });
+    } catch {}
+  }
+  return out;
+}
+
+/**
+ * Check that whatever listens now was started from the candidate (and not, say, a Bun global install), and say
+ * which process model that is. `ignore` names processes the harness itself owns (none, normally).
+ */
+export function observeCandidate(info: CandidateInfo): { model: "in-process" | "child"; lines: string[] } {
+  const procs = listeningProcesses().filter((p) => p.pid !== process.pid);
+  const lines: string[] = [];
+  const foreign = procs.filter((p) => !p.cmdline.some((a) => a.startsWith(info.dir + "/")));
+  for (const p of procs) {
+    const where = p.cmdline.find((a) => a.startsWith(info.dir + "/")) ?? p.cmdline.join(" ");
+    lines.push(`pid ${p.pid} ${where.replace(info.dir, "<candidate>")} ${p.cmdline.slice(-1)[0] === where ? "" : p.cmdline.slice(-1)[0]} listens ${p.listens.join(" ")}`);
+  }
+  if (!procs.length) throw new Error("candidate check: nothing is listening");
+  if (foreign.length) throw new Error(`candidate check: listeners not started from the candidate: ${foreign.map((p) => `${p.pid} ${p.cmdline.join(" ")}`).join("; ")}`);
+  return { model: procs.length === 1 ? "in-process" : "child", lines };
+}
+
+// ── the box launch: a person's install, as `parachute serve` runs it on uni ─────────────────────────────────
+
+async function freePort(taken: number[] = []): Promise<number> {
+  for (let i = 0; i < 100; i++) {
+    const p = 47000 + Math.floor(Math.random() * 2500);
+    if (taken.includes(p)) continue;
+    try {
+      const s = Bun.listen({ hostname: "127.0.0.1", port: p, socket: { data() {} } });
+      s.stop(true);
+      return p;
+    } catch {}
+  }
+  throw new Error("no free port");
+}
+
+export async function runCli(
+  info: CandidateInfo,
+  home: string,
+  args: string[],
+  opts: { bin?: string; env?: Record<string, string>; stdin?: string; timeoutMs?: number } = {},
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  const p = Bun.spawn([opts.bin ?? info.bin, ...args], {
+    env: candidateEnv(info, home, opts.env),
+    cwd: dirname(home),
+    stdin: opts.stdin === undefined ? "ignore" : new Blob([opts.stdin]),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const timer = setTimeout(() => p.kill("SIGKILL"), opts.timeoutMs ?? 60_000);
+  const [stdout, stderr, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
+  clearTimeout(timer);
+  return { code, stdout, stderr };
+}
+
+async function waitFor(url: string, ok: (r: Response) => boolean, what: string, log: () => string): Promise<void> {
+  const deadline = Date.now() + 45_000;
+  while (Date.now() < deadline) {
+    try {
+      if (ok(await safeFetch(url))) return;
+    } catch {}
+    await Bun.sleep(200);
+  }
+  throw new Error(`${what} did not come up at ${url}\n--- log tail ---\n${log().slice(-2500)}`);
+}
+
+export interface CandidateRunning extends Running {
+  info: CandidateInfo;
+  workarounds: string[];
+  observed: { model: "in-process" | "child"; lines: string[] };
+}
+
+/**
+ * Start the candidate as a box install: create a vault, then `parachute serve` on a random port with the hub
+ * supervising the vault, an admin seeded from the environment, an operator token rotated, and an admin pass minted
+ * with the real CLI. Everything else the contracts do goes through HTTP and MCP.
+ */
+export async function startCandidateBox(info: CandidateInfo, opts: { keep?: boolean } = {}): Promise<CandidateRunning> {
+  const home = freshHome(info, "box");
+  const user = dirname(home);
+  const log = join(user, "serve.log");
+  const workarounds: string[] = [];
+  let hub: ReturnType<typeof Bun.spawn> | null = null;
+  const stop = async () => {
+    if (hub && hub.exitCode === null && hub.signalCode === null) {
+      hub.kill("SIGTERM");
+      const done = await Promise.race([hub.exited.then(() => true), Bun.sleep(10_000).then(() => false)]);
+      if (!done) hub.kill("SIGKILL");
+    }
+    if (!opts.keep) rmSync(user, { recursive: true, force: true });
+  };
+  try {
+    const hubPort = await freePort();
+    const hubOrigin = `http://127.0.0.1:${hubPort}`;
+    allowOrigins(hubOrigin);
+    const vaultName = `cand${randomBytes(3).toString("hex")}`;
+    const admin = { username: "owner", password: `pw-${randomBytes(12).toString("hex")}` };
+    const env = { PORT: String(hubPort), PARACHUTE_HUB_ORIGIN: hubOrigin, EMBEDDINGS_ENABLED: "false" };
+
+    // 1. A vault, the way `parachute-vault create` makes one (registers it in services.json for the hub).
+    const create = await runCli(info, home, ["create", vaultName, "--no-mirror", "--json"], { bin: info.vaultBin, env });
+    if (create.code !== 0) throw new Error(`parachute-vault create failed (${create.code}): ${create.stderr.slice(-600)}`);
+
+    // 2. The hub. Today's `serve` binds every interface unless told (fix 2, safety/loopback); a box sets it.
+    const serveEnv: Record<string, string> = {};
+    if (info.profile === "stock-0.7") {
+      // Today's CLI signs passes with the issuer from hub/run/hub.port, falling back to :1939, and `serve` doesn't
+      // write that file (fix 1, embedded/issuer). Prism's suite writes it too. A v0.8 candidate gets no such help.
+      mkdirSync(join(home, "hub", "run"), { recursive: true });
+      writeFileSync(join(home, "hub", "run", "hub.port"), `${hubPort}\n`);
+      workarounds.push("hub/run/hub.port written (fix 1)");
+      // The vault the hub starts fetches the hub's signing keys from :1939 unless PARACHUTE_HUB_JWKS_ORIGIN says
+      // otherwise (vault src/hub-jwt.ts), so on any other port no pass verifies. Same family as fix 1.
+      serveEnv.PARACHUTE_HUB_JWKS_ORIGIN = hubOrigin;
+      workarounds.push("PARACHUTE_HUB_JWKS_ORIGIN set for the vault child (fix 1)");
+    }
+    const out = Bun.file(log);
+    hub = Bun.spawn([info.bin, "serve"], {
+      env: candidateEnv(info, home, {
+        ...env,
+        ...serveEnv,
+        PARACHUTE_BIND_HOST: "127.0.0.1",
+        PARACHUTE_INITIAL_ADMIN_USERNAME: admin.username,
+        PARACHUTE_INITIAL_ADMIN_PASSWORD: admin.password,
+      }),
+      cwd: user,
+      stdout: out,
+      stderr: out,
+    });
+    const tail = () => (existsSync(log) ? readFileSync(log, "utf8").replace(/pvk_[A-Za-z0-9_-]+/g, "pvk_<redacted>") : "(no log)");
+    await waitFor(`${hubOrigin}/health`, (r) => r.ok, "hub", tail);
+    await waitFor(
+      `${hubOrigin}/vault/${vaultName}/mcp`,
+      (r) => r.status === 401 && (r.headers.get("www-authenticate") ?? "").includes(`/vault/${vaultName}/`),
+      "hub → vault route",
+      tail,
+    );
+
+    // 3. The operator: rotate the operator token, then mint an admin pass with the real CLI.
+    const rot = await runCli(info, home, ["auth", "rotate-operator"], { env });
+    if (rot.code !== 0) throw new Error(`auth rotate-operator failed (${rot.code}): ${rot.stderr.slice(-600)}`);
+    const scope = ["read", "write", "admin"].map((l) => `vault:${vaultName}:${l}`).join(" ");
+    const mint = await runCli(info, home, ["auth", "mint-token", "--scope", scope, "--label", "contracts-operator"], { env });
+    const operatorToken = mint.stdout.trim().split("\n").pop()!.trim();
+    if (mint.code !== 0 || operatorToken.split(".").length !== 3) throw new Error(`auth mint-token failed (${mint.code}): ${mint.stderr.slice(-600)}`);
+
+    const observed = observeCandidate(info);
+    const services: Services = {
+      hub: hubOrigin,
+      vaultName,
+      // The vault's own port is a box detail (today: 1940, inside the sandbox). Contracts use the hub; the guard
+      // refuses 1939-1946 anyway.
+      vaultDirect: `http://127.0.0.1:1940/vault/${vaultName}`,
+      vaultViaHub: `${hubOrigin}/vault/${vaultName}`,
+      operatorToken,
+      operatorActor: JSON.parse(Buffer.from(operatorToken.split(".")[1]!, "base64url").toString()).sub,
+      admin,
+      hubRepo: "",
+      home,
+      cli: [info.bin],
+      cliEnv: candidateEnv(info, home, env),
+    };
+    return {
+      services,
+      provenance: `candidate ${info.sha256.slice(0, 16)} (${info.profile})`,
+      info,
+      workarounds,
+      observed,
+      stop,
+      logs: async () => tail(),
+    };
+  } catch (err) {
+    await stop();
+    throw err;
+  }
+}
+
+/** Make the CandidateInfo for a loaded candidate: a scratch folder and a runtime folder holding only Bun. */
+export function prepareInfo(dir: string, manifest: CandidateManifest, sha256: string): CandidateInfo {
+  const scratch = mkdtempSync(join(process.env.TMPDIR ?? tmpdir(), "pcore-candidate-"));
+  const runtimeDir = join(scratch, "runtime");
+  mkdirSync(runtimeDir);
+  // Only Bun: the folder it usually lives in (~/.bun/bin) also holds a globally installed `parachute`.
+  symlinkSync(process.execPath, join(runtimeDir, "bun"));
+  const d = resolve(dir);
+  return {
+    dir: d,
+    bin: join(d, "bin", "parachute"),
+    vaultBin: join(d, "bin", "parachute-vault"),
+    runtimeDir,
+    scratch,
+    profile: manifest.profile,
+    processModel: manifest.process_model,
+    sha256,
+  };
+}
