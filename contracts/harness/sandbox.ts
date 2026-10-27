@@ -73,7 +73,7 @@ export function listeners(): string[] {
 }
 
 export function inSandbox(): boolean {
-  return process.env[SANDBOX_ENV] === "1";
+  return process.env[SANDBOX_ENV] === "2";
 }
 
 /** Network interfaces in this namespace. */
@@ -89,7 +89,10 @@ function links(): string[] {
  * one and exits with its code; inside, it checks the namespace really is private and sets up loopback and the trap.
  */
 export async function enterSandbox(): Promise<void> {
-  if (!inSandbox()) {
+  const level = process.env[SANDBOX_ENV];
+  if (level === "2") return; // already inside, unprivileged
+  if (!level) {
+    // Host → level 1: new user, network, PID and mount namespaces, root inside them.
     const unshare = Bun.which("unshare");
     if (!unshare) throw new Error("sandbox: `unshare` (util-linux) is needed to run a candidate");
     const p = Bun.spawn(
@@ -105,29 +108,65 @@ export async function enterSandbox(): Promise<void> {
     // If unshare can't start (e.g. AppArmor's user-namespace restriction on Ubuntu 24.04), it says why on stderr.
     process.exit(await p.exited);
   }
-  if (!process.env.PCORE_SANDBOX_MOUNTED) {
-    hideHostFiles(JSON.parse(process.env.PCORE_SANDBOX_KEEP ?? "[]"));
-    process.env.PCORE_SANDBOX_MOUNTED = "1";
-  }
-  // Sockets the host session points at: gone with /run and /tmp, and nothing should look for them.
-  for (const k of ["DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "SSH_AUTH_SOCK", "WAYLAND_DISPLAY", "DISPLAY", "TMUX"]) delete process.env[k];
-  // Inside: the namespace must be new and empty. The only interfaces are loopback and, once made, the trap.
+  // Level 1 (root of the new namespaces): set up files and network, then run everything else one level down.
+  const cwd = process.cwd();
+  process.chdir("/"); // so nothing here keeps a handle on the host tree under the covers
+  hideHostFiles(JSON.parse(process.env.PCORE_SANDBOX_KEEP ?? "[]"));
+  setUpNetwork();
+  process.chdir(cwd);
+  // The trap counter needs CAP_NET_ADMIN over this network, which level 2 doesn't have: serve it from here.
+  const trap = Bun.listen({ unix: TRAP_SOCKET, socket: { open: (sock) => void sock.end(String(outboundPackets())), data() {} } });
+  // Level 2: a nested user and mount namespace. Mounts made above arrive locked: nothing at level 2 (the harness,
+  // the suites, the candidate) can unmount a cover to see what is under it, or make a read-only path writable.
+  const p = Bun.spawn(["unshare", "--user", "--map-root-user", "--mount", "--fork", "--kill-child", "--", process.execPath, ...process.argv.slice(1)], {
+    env: { ...cleanEnv(), [SANDBOX_ENV]: "2" },
+    stdio: ["inherit", "inherit", "inherit"],
+  });
+  const forward = (sig: NodeJS.Signals) => () => p.kill(sig);
+  process.on("SIGINT", forward("SIGINT"));
+  process.on("SIGTERM", forward("SIGTERM"));
+  const code = await p.exited;
+  trap.stop(true);
+  process.exit(code);
+}
+
+const TRAP_SOCKET = "/run/pcore-trap.sock";
+
+/** The environment for level 2: without the host session's sockets (gone with /run and /tmp anyway) or the setup. */
+function cleanEnv(): Record<string, string> {
+  const env: Record<string, string> = {};
+  const drop = new Set(["DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "SSH_AUTH_SOCK", "WAYLAND_DISPLAY", "DISPLAY", "TMUX", "PCORE_SANDBOX_KEEP"]);
+  for (const [k, v] of Object.entries(process.env)) if (v !== undefined && !drop.has(k)) env[k] = v;
+  return env;
+}
+
+/** Level 1: the namespace must be new and empty; bring up loopback and the trap. */
+function setUpNetwork(): void {
   const have = links();
-  const unexpected = have.filter((l) => l !== "lo" && l !== TRAP_IF);
+  const unexpected = have.filter((l) => l !== "lo");
   if (unexpected.length) throw new Error(`sandbox: not a private network namespace (interfaces: ${have.join(", ")})`);
-  if (!have.includes(TRAP_IF)) {
-    must(["ip", "link", "set", "lo", "up"]);
-    const live = listeningPorts();
-    if (live.length) throw new Error(`sandbox: fresh namespace already has listeners on ${live.join(", ")}`);
-    must(["ip", "link", "add", TRAP_IF, "type", "dummy"]);
-    must(["ip", "addr", "add", "198.18.0.1/15", "dev", TRAP_IF]);
-    must(["ip", "link", "set", TRAP_IF, "up"]);
-    must(["ip", "route", "add", "default", "dev", TRAP_IF]);
-    must(["ip", "-6", "route", "add", "default", "dev", TRAP_IF]);
-    must(["nft", "add", "table", "inet", "pctrap"]);
-    must(["nft", "add", "chain", "inet", "pctrap", "out", "{ type filter hook output priority 0; }"]);
-    must(["nft", "add", "rule", "inet", "pctrap", "out", "oifname", "!=", "lo", "counter"]);
-  }
+  must(["ip", "link", "set", "lo", "up"]);
+  const live = listeningPorts();
+  if (live.length) throw new Error(`sandbox: fresh namespace already has listeners on ${live.join(", ")}`);
+  must(["ip", "link", "add", TRAP_IF, "type", "dummy"]);
+  must(["ip", "addr", "add", "198.18.0.1/15", "dev", TRAP_IF]);
+  must(["ip", "link", "set", TRAP_IF, "up"]);
+  must(["ip", "route", "add", "default", "dev", TRAP_IF]);
+  must(["ip", "-6", "route", "add", "default", "dev", TRAP_IF]);
+  must(["nft", "add", "table", "inet", "pctrap"]);
+  must(["nft", "add", "chain", "inet", "pctrap", "out", "{ type filter hook output priority 0; }"]);
+  must(["nft", "add", "rule", "inet", "pctrap", "out", "oifname", "!=", "lo", "counter"]);
+}
+
+/** The sandbox-wide trap count, asked of level 1 (from level 2, where the suites and the candidate run). */
+export async function sandboxOutboundPackets(): Promise<number> {
+  const text = await new Promise<string>((done, fail) => {
+    let buf = "";
+    Bun.connect({ unix: TRAP_SOCKET, socket: { data: (_s, d) => void (buf += d.toString()), close: () => done(buf), error: (_s, e) => fail(e) } }).catch(fail);
+  });
+  const n = Number(text);
+  if (!Number.isFinite(n) || text === "") throw new Error(`sandbox: trap answered ${JSON.stringify(text)}`);
+  return n;
 }
 
 /** What a run needs from the host filesystem, besides the system (/usr, /etc): this repo, the candidate and old stock
@@ -179,6 +218,9 @@ function hideHostFiles(keep: { path: string; rw: boolean }[]): void {
     must(["mount", "--rbind", k.at, k.path]);
     if (!k.rw) must(["mount", "-o", "remount,bind,ro", k.path]);
   }
+  // The staging binds are writable aliases of the kept paths: take them away.
+  for (const k of staged) must(["umount", "-R", k.at]);
+  must(["rm", "-rf", stage]);
   if (home) mkdirSync(home, { recursive: true });
 }
 

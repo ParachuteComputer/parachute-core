@@ -86,12 +86,26 @@ describe("sandbox", () => {
     expect(r.links.sort()).toEqual(["lo", "pctrap0"]);
     expect(r.listening).toEqual([]);
     expect(r.after).toBeGreaterThan(r.before);
-    expect(r.pid).toBeLessThan(10); // its own PID space
+    expect(r.processes).toBeLessThan(20); // its own PID space: only the sandbox's few processes are visible
     server.stop(true);
     expect(outside).toBe("connected"); // control: the socket answers from the host
     expect(r.hostSocket).toBe("ENOENT");
     expect(r.repoWrite).toBe("EROFS");
     expect(r.userBus).not.toBe(true);
     expect(r.liveHome).toBe(false);
+    // Nothing the candidate runs as can take the covers off, make the repo writable, or find the staging aliases.
+    expect(r.escapes).toEqual({ umountTmp: false, umountHome: false, umountRun: false, remountRepoRw: false, stagingLeft: false });
+  }, 30_000);
+});
+
+describe("attribution during a run", () => {
+  test("a listener a candidate launch hands off to outside the candidate is flagged; one inside is not", async () => {
+    const p = Bun.spawn(["bun", join(import.meta.dir, "attribution-probe.ts")], { stdout: "pipe", stderr: "pipe", env: { ...process.env, PCORE_SANDBOX: "" } });
+    const [out, err, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
+    expect(code, err).toBe(0);
+    const r = JSON.parse(out.trim().split("\n").pop()!);
+    expect(r.inside).toEqual([]);
+    expect(r.handOff.length).toBe(1);
+    expect(r.handOff[0]).toMatch(/outside the candidate/);
   }, 30_000);
 });

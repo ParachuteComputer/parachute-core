@@ -411,3 +411,103 @@ export function prepareInfo(dir: string, manifest: CandidateManifest, sha256: st
     sha256,
   };
 }
+
+// ── attribution for every launch, not only the box's ─────────────────────────────────────────────────────────
+
+/** Listening socket inodes in the network namespace `pid` lives in (suites start boxes in nested namespaces). */
+function listeningInodesOf(pid: number, cache: Map<string, Set<string>>): Set<string> {
+  let ns = "";
+  try {
+    ns = readlinkSync(`/proc/${pid}/ns/net`);
+  } catch {
+    return new Set();
+  }
+  const hit = cache.get(ns);
+  if (hit) return hit;
+  const set = new Set<string>();
+  for (const f of ["tcp", "tcp6"]) {
+    try {
+      for (const line of readFileSync(`/proc/${pid}/net/${f}`, "utf8").split("\n").slice(1)) {
+        const c = line.trim().split(/\s+/);
+        if (c[3] === "0A") set.add(c[9]!);
+      }
+    } catch {}
+  }
+  cache.set(ns, set);
+  return set;
+}
+
+/**
+ * Watches the sandbox while the suites run. Any process that holds a listening socket and comes from a launch of the
+ * candidate must itself be the candidate (`notCandidate`). A launch is a process run from the candidate folder, or
+ * one running in the candidate's environment (its bin/ on PATH, as candidateEnv() sets and children inherit), or a
+ * descendant of either. So a candidate that hands its work to code outside its folder (a global install found
+ * on PATH, say) is caught whichever suite started it. It samples every 250 ms, so a listener that lives for less than
+ * that can go unseen.
+ */
+export function watchAttribution(info: CandidateInfo): { stop(): string[] } {
+  const dir = realpathSync(info.dir);
+  const bun = realpathSync(join(info.runtimeDir, "bun"));
+  const inside = (f: string) => f === dir || f.startsWith(dir + "/");
+  const problems = new Set<string>();
+  const launches = new Set<number>(); // remembered across samples: a launcher may exec into something else
+  const candidatePath = (pid: number) => {
+    try {
+      const path = readFileSync(`/proc/${pid}/environ`, "utf8").split("\0").find((e) => e.startsWith("PATH="));
+      return !!path && path.slice(5).split(":").some((d) => d === `${info.dir}/bin` || d === `${dir}/bin`);
+    } catch {
+      return false;
+    }
+  };
+  const scan = () => {
+    const procs = new Map<number, { ppid: number; launch: boolean; facts: ProcFacts | null }>();
+    for (const name of readdirSync("/proc")) {
+      if (!/^\d+$/.test(name)) continue;
+      const pid = Number(name);
+      try {
+        const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+        const ppid = Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1]);
+        const facts = procFacts(pid);
+        const launch = inside(facts.exe) || facts.cmdline.slice(0, 2).some((a) => {
+          try {
+            return inside(realpathSync(resolve(facts.cwd, a)));
+          } catch {
+            return inside(resolve(facts.cwd, a));
+          }
+        });
+        if (launch || candidatePath(pid)) launches.add(pid);
+        procs.set(pid, { ppid, launch: launches.has(pid), facts });
+      } catch {}
+    }
+    const nets = new Map<string, Set<string>>();
+    for (const [pid, p] of procs) {
+      if (pid === process.pid || !p.facts) continue;
+      const listening = listeningInodesOf(pid, nets);
+      if (!listening.size) continue;
+      let holds = false;
+      try {
+        for (const fd of readdirSync(`/proc/${pid}/fd`)) {
+          const m = readlinkSync(`/proc/${pid}/fd/${fd}`).match(/^socket:\[(\d+)\]$/);
+          if (m && listening.has(m[1]!)) holds = true;
+        }
+      } catch {}
+      if (!holds) continue;
+      let fromCandidate = false;
+      for (let q: number | undefined = pid, hops = 0; q && hops < 64; q = procs.get(q)?.ppid, hops++) {
+        if (procs.get(q)?.launch) fromCandidate = true;
+      }
+      if (!fromCandidate) continue;
+      const why = notCandidate(p.facts, { dir, bun });
+      if (why) problems.add(`${why} (${p.facts.cmdline.join(" ").replace(dir, "<candidate>").slice(0, 200)})`);
+    }
+  };
+  const timer = setInterval(scan, 250);
+  scan();
+  return {
+    stop() {
+      clearInterval(timer);
+      scan();
+      return [...problems];
+    },
+  };
+}

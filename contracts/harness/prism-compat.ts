@@ -12,7 +12,7 @@
 //   bun run prism-compat                     CANDIDATE_DIR / CANDIDATE_SHA256 as for `bun run candidate`
 import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { enterSandbox, inSandbox } from "./sandbox.ts";
+import { enterSandbox } from "./sandbox.ts";
 import { loadCandidate, prepareInfo } from "./candidate.ts";
 import { reposDir } from "./services.ts";
 import pins from "../pins.json";
@@ -28,7 +28,7 @@ async function sh(cmd: string[], cwd?: string): Promise<string> {
 }
 
 // Fetch outside the sandbox (it has no network): a clean checkout of his repo at the pin.
-if (!inSandbox()) {
+if (!process.env.PCORE_SANDBOX) {
   const pin = (pins as any).prism as { repo: string; commit: string };
   if (!existsSync(join(prism, ".git"))) await sh(["git", "clone", "--quiet", "--filter=blob:none", pin.repo, prism]);
   const head = (await sh(["git", "rev-parse", "HEAD"], prism)).trim();

@@ -13,7 +13,7 @@
 import { join, resolve } from "node:path";
 import { rmSync, writeFileSync } from "node:fs";
 import { enterSandbox, listeners } from "./sandbox.ts";
-import { loadCandidate, prepareInfo, startCandidateBox, treeHash } from "./candidate.ts";
+import { loadCandidate, prepareInfo, startCandidateBox, treeHash, watchAttribution } from "./candidate.ts";
 
 await enterSandbox();
 
@@ -63,6 +63,7 @@ try {
   const named = extra.filter((a) => a.startsWith("suites/"));
   const dirs = named.length ? named : ["suites/today", "suites/compat", "suites/safety", "suites/embedded", "suites/lifecycle", ...(v1 ? ["suites/v1"] : [])];
   const rest = extra.filter((a) => !a.startsWith("suites/"));
+  const watch = watchAttribution(info);
   child = Bun.spawn(["bun", "test", "--timeout", "120000", ...dirs.map((d) => `./${d}`), ...rest], {
     cwd: contracts,
     env: { ...process.env, CONTRACT_TARGET: "candidate", CONTRACT_SERVICES: servicesFile, CONTRACT_CANDIDATE: candidateFile },
@@ -71,6 +72,11 @@ try {
   });
   code = await child.exited;
   child = null;
+  const foreign = watch.stop();
+  if (foreign.length) {
+    console.error(`[candidate] listeners started from the candidate that aren't the candidate:\n  ${foreign.join("\n  ")}`);
+    code = code || 1;
+  } else console.log("[candidate] every listener started from the candidate during the run was the candidate");
   if (code !== 0 && process.env.CONTRACT_SHOW_LOGS !== "0") console.log("[candidate] failed; serve log tail:\n" + (await running.logs()).slice(-4000));
 } catch (err) {
   console.error(`[candidate] ${(err as Error).message}`);
