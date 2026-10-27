@@ -15,16 +15,19 @@
 // and NPM_CONFIG_PREFIX pointing into the throwaway HOME. The first run is on a fresh, empty Parachute home: with
 // no existing home there is nothing to take over, so serve runs (takeover.test.ts covers an existing home).
 //
-// Red today: the candidate is the stock build (no root package.json, programs from lib/hub = @openparachute/hub),
-// with no bin/parachute-core. The setup test is green and proves the old global install is real.
+// Lane A1 (the name and bins) made the first three green on the core build. The install step is lane D's: until
+// then `parachute-core install` is still the hub's module installer. On the stock build all four are red (no root
+// package.json, programs from lib/hub = @openparachute/hub, no bin/parachute-core). The setup test proves the old
+// global install is real.
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, lstatSync, readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { randomBytes } from "node:crypto";
 import { red } from "../lib.ts";
 import { candidate, freePort, safeFetch, until } from "../candidate-lib.ts";
-import { json, must, newMachine, oldInstallHash, oldStock, requireCore, treeHash, type Machine } from "./_takeover-lib.ts";
+import { holders, json, must, newMachine, oldInstallHash, oldStock, requireCore, treeHash, type Machine } from "./_takeover-lib.ts";
 
-const NO_CORE = /no bin\/parachute-core in the candidate/;
+const NO_INSTALL = /parachute-core install --prefix exited \d+/;
 
 let machines: Machine[] = [];
 afterEach(async () => {
@@ -91,7 +94,7 @@ describe("identity: setup", () => {
 });
 
 describe("identity", () => {
-  red("the package is @openparachute/core and links only parachute-core, never @openparachute/hub or @openparachute/vault", { reason: /package name is @openparachute\/hub/, lane: "D" }, () => {
+  test("the package is @openparachute/core and links only parachute-core, never @openparachute/hub or @openparachute/vault", () => {
     const pkg = candidatePackage();
     must(pkg.name !== "@openparachute/hub" && pkg.name !== "@openparachute/vault", `package name is ${pkg.name}`);
     must(pkg.name === "@openparachute/core", `package name is ${pkg.name}, not @openparachute/core`);
@@ -99,7 +102,7 @@ describe("identity", () => {
     expect(Object.keys(pkg.bin)).toEqual(["parachute-core"]);
   });
 
-  red("the candidate has bin/parachute-core, with bin/parachute and bin/parachute-vault as aliases in its folder", { reason: NO_CORE, lane: "D" }, async () => {
+  test("the candidate has bin/parachute-core, with bin/parachute and bin/parachute-vault as aliases in its folder", async () => {
     const c = candidate();
     requireCore(c);
     // The aliases (for Prism and Benjamin's suite) run core, not the old programs.
@@ -110,7 +113,7 @@ describe("identity", () => {
     }
   }, 120_000);
 
-  red("`parachute-core version --json` says @openparachute/core, its version, schema and Bun", { reason: NO_CORE, lane: "D" }, async () => {
+  test("`parachute-core version --json` says @openparachute/core, its version, schema and Bun", async () => {
     const m = await machine("id-version", false);
     const r = await m.run([requireCore(m.info), "version", "--json"]);
     expect(r.code).toBe(0);
@@ -123,7 +126,37 @@ describe("identity", () => {
     if (existsSync(root)) expect(v.version).toBe(JSON.parse(readFileSync(root, "utf8")).version);
   }, 120_000);
 
-  red("install and first run leave the old global packages byte-identical, and parachute still resolves to the old hub", { reason: NO_CORE, lane: "D" }, async () => {
+  // PLAN §2.1: in the child process model the hub starts its vault from its own install, never from PATH, so on a
+  // box like uni (old parachute-vault 0.7.9 in ~/.bun/bin) it can't start the old vault on the same data.
+  test("with the old parachute-vault first on PATH, the vault `parachute-core serve` starts is core's own", async () => {
+    const m = await machine("id-child");
+    const which = await m.run(["sh", "-c", "command -v parachute-vault"]);
+    must(which.stdout.trim() === join(m.user, ".bun/bin/parachute-vault"), `setup: parachute-vault on PATH is ${which.stdout.trim()}`);
+    const bin = requireCore(m.info);
+    const vaultName = `own${randomBytes(3).toString("hex")}`;
+    const port = await freePort();
+    const origin = await m.expose(port);
+    const env = { PORT: String(port), PARACHUTE_HUB_ORIGIN: origin, PARACHUTE_BIND_HOST: "127.0.0.1" };
+    const create = await m.run([bin, "vault", "create", vaultName, "--no-mirror", "--json"], { env });
+    must(create.code === 0, `parachute-core vault create exited ${create.code}: ${create.stderr.slice(-600)}`);
+    const box = m.spawn([bin, "serve"], { env });
+    try {
+      const db = join(m.home, "vault", "data", vaultName, "vault.db");
+      const up = await until(async () => box.proc.exitCode !== null || holders(db).length > 0, 60_000);
+      must(up && box.proc.exitCode === null, `parachute-core serve did not start a vault on ${vaultName} (exit ${box.proc.exitCode}):\n${box.log().slice(-1500)}`);
+      const held = holders(db);
+      must(held.length === 1, `expected one process holding vault.db, got ${JSON.stringify(held)}`);
+      // The vault runs as `bun <script> serve`; the script must be inside the candidate.
+      const script = held[0]!.cmd.split(" ").slice(1).find((a) => !a.startsWith("-")) ?? "";
+      const real = realpathSync(resolve(m.user, script));
+      const dir = realpathSync(m.info.dir);
+      must(real.startsWith(dir + "/"), `the hub started the vault from ${real}, not from core (${held[0]!.cmd})`);
+    } finally {
+      await box.stop();
+    }
+  }, 120_000);
+
+  red("install and first run leave the old global packages byte-identical, and parachute still resolves to the old hub", { reason: NO_INSTALL, lane: "D" }, async () => {
     const stock = await oldStock();
     const m = await machine("id-install");
     const before = { bun: await oldInstallHash(m), npm: await treeHash(m.npmPrefix) };

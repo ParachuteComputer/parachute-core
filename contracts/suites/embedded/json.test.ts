@@ -1,12 +1,13 @@
 // embedded/json (PLAN §3 "Tokens and versions"; Benjamin's E5/E7, as his suite and his server call them:
 // prism scripts/parachute-compat/run.mjs:258,416-420, apps/server/src/mcp-token.ts:85-106, vault-provision.ts:31-39).
 // A host reads machine output, never human text:
-//   - `parachute version --json` → {name, version, schema, bun};
+//   - `parachute version --json` → {name: "@openparachute/core", version, schema, bun} (the name is the package's,
+//     PLAN §2.5; lane A1 made it green);
 //   - `parachute auth mint-token … --json` → {token, jti, exp, scopes, aud}, matching the token's own claims;
 //   - `parachute auth revoke-token <jti> --json` → {revoked: true, jti};
 //   - `parachute-vault create <name> --mint --scope write --no-mirror --json` → {name, token, …}, the token signed by
 //     the hub with iss = PARACHUTE_HUB_ORIGIN and scoped to that vault.
-// Today there is no `version` command and mint/revoke have no --json. Lane B turns these green.
+// Today mint/revoke have no --json. Lane B turns these green.
 import { describe, expect, test } from "bun:test";
 import { randomBytes } from "node:crypto";
 import { cli, freePort, newHome } from "../candidate-lib.ts";
@@ -36,12 +37,12 @@ describe("embedded/json", () => {
     expect(claims(m.stdout.trim().split("\n").pop()!)?.jti).toBeString();
   });
 
-  red("version --json prints {name, version, schema, bun}", { reason: /unknown command "version"/, lane: "B" }, async () => {
+  test("version --json prints {name, version, schema, bun}", async () => {
     const r = await cli(newHome("json"), ["version", "--json"]);
     must(r.code === 0, `version --json exited ${r.code}: ${tail(r.stderr)}`);
     const j = json(r.stdout);
     must(j && sortedKeys(j) === "bun,name,schema,version", `version --json keys are ${j && sortedKeys(j)}, want bun,name,schema,version`);
-    must(j.name === "parachute" && /^\d+\.\d+\.\d+/.test(j.version), `version --json says ${JSON.stringify(j)}`);
+    must(j.name === "@openparachute/core" && /^\d+\.\d+\.\d+/.test(j.version), `version --json says ${JSON.stringify(j)}`);
     must(Number.isInteger(j.schema) && j.schema > 0, `schema is ${j.schema}, want a positive integer`);
     must(j.bun === Bun.version || /^\d+\.\d+\.\d+/.test(j.bun), `bun is ${j.bun}`);
   });

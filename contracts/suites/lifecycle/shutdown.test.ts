@@ -762,7 +762,7 @@ describe("lifecycle: shutdown", () => {
 
   red(
     "SIGKILL: a SIGKILLed serve leaves no process behind (its vault notices its parent died)",
-    { reason: /^process left 5 s after serve was SIGKILLed: pid \d+ \S*bun \S*vault\S*\/cli\.ts serve$/, lane: "A2" },
+    { reason: /^process left 5 s after serve was SIGKILLed: pid \d+ \S*bun \S*(vault\S*\/cli|\/parachute-vault)\.ts serve$/, lane: "A2" },
     async () => {
       const o = await killed();
       must(o.orphans.length === 0, o.orphans.join("; "));
@@ -918,7 +918,7 @@ describe("lifecycle: shutdown", () => {
 
   red(
     "SIGTERM during start-up: both ports closed, no process left",
-    { reason: /^still listening: 127\.0\.0\.1:1940 \(vault\); process left: pid \d+ \S*bun \S*vault\S*\/cli\.ts serve$/, lane: "A2" },
+    { reason: /^still listening: 127\.0\.0\.1:1940 \(vault\); process left: pid \d+ \S*bun \S*(vault\S*\/cli|\/parachute-vault)\.ts serve$/, lane: "A2" },
     async () => {
       const o = await duringStartup();
       must(o.running.length === 0, o.running.join("; "));

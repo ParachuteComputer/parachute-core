@@ -535,7 +535,7 @@ describe("compat/uni: the box", () => {
     const pids = holders(join(s.home, "vault", "data", V, "vault.db"));
     expect(pids.length).toBe(1);
     const cmd = readFileSync(`/proc/${pids[0]}/cmdline`, "utf8").split("\0").join(" ");
-    expect(cmd).toMatch(/vault\/src\/cli\.ts serve|parachute-vault serve|parachute serve/);
+    expect(cmd).toMatch(/vault\/src\/cli\.ts serve|parachute-vault(\.ts)? serve|parachute(\.ts)? serve/);
   });
 
   test("a restart leaves services.json, vault/config.yaml and vault/.env byte-identical, keeps the data, and one process holds vault.db", async () => {
