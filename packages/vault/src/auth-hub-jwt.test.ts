@@ -615,17 +615,45 @@ describe("authenticateVaultRequest — hub JWT tag-scoping (auth-unification C0)
     expect(paths).toEqual(["h1", "w1"]);
   });
 
-  test("permissions present but scoped_tags absent → scoped_tags=null (unscoped)", async () => {
+  test("permissions present with only principal_pubkey → scoped_tags=null (unscoped)", async () => {
     seedVault("journal");
     const token = await signJwt(kp, {
       iss: fixture.origin,
       aud: "vault.journal",
       scope: "vault:journal:read",
-      permissions: { some_other_perm: true },
+      permissions: { principal_pubkey: "ab".repeat(32) },
     });
     const auth = await authOk(token, "journal");
     expect(auth.scoped_tags).toBeNull();
   });
+
+  // Fix 14: a permissions key this vault doesn't enforce (e.g. the `write_tags`
+  // the hub CLI's help once suggested) is a restriction nobody applies. Serving
+  // the token would make it whole-vault while its holder believes it limited,
+  // so it is refused instead.
+  for (const permissions of [{ some_other_perm: true }, { write_tags: ["health"] }, { scoped_tags: ["health"], write_tags: ["health"] }]) {
+    test(`permissions with a key the vault doesn't enforce (${Object.keys(permissions).join(", ")}) → 401 fail-closed`, async () => {
+      seedVault("journal");
+      const token = await signJwt(kp, {
+        iss: fixture.origin,
+        aud: "vault.journal",
+        scope: "vault:journal:read",
+        permissions,
+      });
+      const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const result = await authenticateVaultRequest(bearer(token), readVaultConfig("journal")!);
+        expect("error" in result).toBe(true);
+        if ("error" in result) {
+          expect(result.error.status).toBe(401);
+          const body = (await result.error.json()) as { message: string };
+          expect(body.message).toContain("doesn't enforce");
+        }
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+  }
 
   test("permissions.scoped_tags:null → scoped_tags=null (explicit unscoped)", async () => {
     seedVault("journal");
