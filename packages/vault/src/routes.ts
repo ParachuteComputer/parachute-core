@@ -4620,9 +4620,9 @@ function isNotePublished(note: { tags?: string[]; metadata?: unknown }, publishe
 export async function handleViewNote(
   store: Store,
   idOrPath: string,
-  options: { authenticated?: boolean; publishedTag?: string } = {},
+  options: { authenticated?: boolean; publishedTag?: string; visible?: (note: Note) => boolean } = {},
 ): Promise<Response> {
-  const { authenticated = false, publishedTag = "publish" } = options;
+  const { publishedTag = "publish", visible } = options;
   let note: Note | null;
   try {
     note = await resolveNote(store, idOrPath);
@@ -4639,6 +4639,8 @@ export async function handleViewNote(
   if (!note) {
     return new Response("Not Found", { status: 404, headers: { "Content-Type": "text/plain" } });
   }
+  // A tag-scoped reader sees an unpublished note only inside its tags (G1).
+  const authenticated = (options.authenticated ?? false) && (!visible || visible(note));
   if (!authenticated && !isNotePublished(note, publishedTag)) {
     return new Response("Not Found", { status: 404, headers: { "Content-Type": "text/plain" } });
   }

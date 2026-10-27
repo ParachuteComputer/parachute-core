@@ -54,6 +54,7 @@
 
 import pkg from "../package.json" with { type: "json" };
 import type { VaultConfig } from "./config.ts";
+import type { Note, Store } from "../core/src/types.ts";
 import {
   readVaultConfig,
   readGlobalConfig,
@@ -90,7 +91,7 @@ import {
   type WriteCtx,
 } from "./routes.ts";
 import { handleTriggers } from "./triggers-api.ts";
-import { expandTokenTagScope, scopedStatsFilter } from "./tag-scope.ts";
+import { expandTokenTagScope, noteWithinTagScope, scopedStatsFilter } from "./tag-scope.ts";
 import {
   handleProtectedResource,
   handleRootProtectedResource,
@@ -211,18 +212,28 @@ async function dispatchScopedMcp(
 
 /**
  * Check if a /view request has a valid API key (header or ?key= query param).
- * Returns true if authenticated, false if not. Never rejects — unauthenticated
- * requests still get public notes.
+ * `authenticated` is false if not. Never rejects — unauthenticated requests
+ * still get public notes.
+ *
+ * A tag-scoped key also gets `visible`, the same `noteWithinTagScope` rule
+ * every API read uses: /view renders an unpublished note only when the key
+ * could read it through the API (G1). Outside its tags the key reads /view
+ * like no key at all.
  */
-async function isViewAuthenticated(
+async function viewAccess(
   req: Request,
   vaultConfig: VaultConfig | null,
-): Promise<boolean> {
-  if (!vaultConfig) return false;
+  store: Store,
+): Promise<{ authenticated: boolean; visible?: (note: Note) => boolean }> {
+  if (!vaultConfig) return { authenticated: false };
   const key = extractApiKey(req);
-  if (!key) return false;
+  if (!key) return { authenticated: false };
   const auth = await authenticateVaultRequest(req, vaultConfig);
-  return !("error" in auth);
+  if ("error" in auth) return { authenticated: false };
+  if (!auth.scoped_tags) return { authenticated: true };
+  const rawTags = auth.scoped_tags;
+  const allowed = await expandTokenTagScope(store, rawTags);
+  return { authenticated: true, visible: (note) => noteWithinTagScope(note, allowed, rawTags) };
 }
 
 /**
@@ -523,9 +534,10 @@ export async function route(
   const vaultViewMatch = subpath.match(/^\/view\/(.+)$/);
   if (vaultViewMatch && req.method === "GET") {
     const store = getVaultStore(vaultName);
-    const authenticated = await isViewAuthenticated(req, vaultConfig);
+    const { authenticated, visible } = await viewAccess(req, vaultConfig, store);
     return handleViewNote(store, decodeURIComponent(vaultViewMatch[1]!), {
       authenticated,
+      visible,
       publishedTag: vaultConfig.published_tag,
     });
   }
