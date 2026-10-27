@@ -10,8 +10,9 @@ export interface Mutant {
   name: string;
   /** Instead of find/replace: a patch file (relative to harness/), applied with `git apply` (flips only). */
   patch?: string;
-  /** Which of today's repos the change is in (default: vault). */
-  repo?: "vault" | "hub";
+  /** Which package the change is in (default: vault): today's repos, moved to packages/vault and packages/hub, or
+   *  packages/cli (the one command, lane A1). `bun run mutants` (the pinned vault) takes only vault mutants. */
+  repo?: "vault" | "hub" | "cli";
   why: string;
   file?: string;
   find?: string;
@@ -95,23 +96,16 @@ export const CANDIDATE_MUTANTS: Mutant[] = [
   {"name": "hub-ready-always", "why": "/api/ready says ready before the box is usable", "repo": "hub", "file": "src/api-ready.ts", "find": "  const isReady = transient.length === 0 && persistent.length === 0;", "replace": "  const isReady = true;", "suite": "suites/lifecycle/shutdown.test.ts", "catches": ["/api/ready says ready only once a write goes through", "vault start failure: /api/ready never says ready", "occupied vault port: /api/ready never says ready"]},
   {"name": "hub-keeps-instance-file", "why": "the instance file is left after a clean stop", "repo": "hub", "file": "src/commands/serve.ts", "find": "      clearHubInstanceFile(CONFIG_DIR);", "replace": "      // clearHubInstanceFile(CONFIG_DIR);", "suite": "suites/lifecycle/shutdown.test.ts", "catches": ["SIGTERM: the home is left clean", "SIGINT: the home is left clean", "ten restarts in a row: every stop is clean"]},
   {"name": "rest-sort-ignored", "why": "area-briefs reads newest first; the REST sort parameter is ignored", "repo": "vault", "file": "src/routes.ts", "find": "    sort: (parseQuery(url, \"sort\") as \"asc\" | \"desc\") ?? undefined,", "replace": "    sort: undefined,", "suite": "suites/compat/uni.test.ts", "catches": ["extra clients"]},
+  {"name": "issuer-from-port", "why": "fix 1 undone in the CLI: the issuer comes from hub.port or :1939 again, not PARACHUTE_HUB_ORIGIN (was the issuer-hub flip)", "repo": "hub", "file": "src/hub-issuer.ts", "find": "  override ??= process.env.PARACHUTE_HUB_ORIGIN;\n", "replace": "", "suite": "suites/embedded/issuer.test.ts", "catches": ["with PARACHUTE_HUB_ORIGIN set, rotate-operator and mint-token sign with exactly that iss", "box: on a non-default hub port with only PARACHUTE_HUB_ORIGIN set"]},
+  {"name": "vault-keys-from-1939", "why": "fix 1 undone in serve: the vault child fetches its keys from :1939 again (was the issuer-hub flip)", "repo": "hub", "file": "src/commands/serve.ts", "find": "  process.env.PARACHUTE_HUB_JWKS_ORIGIN ??= `http://127.0.0.1:${port}`;\n", "replace": "", "suite": "suites/embedded/issuer.test.ts", "catches": ["box: a vault the hub starts verifies that hub's tokens on a non-default hub port"]},
+  {"name": "version-names-the-hub", "why": "identity: `version --json` names the old package", "repo": "cli", "file": "src/dispatch.ts", "find": "return { name: core.name, version: core.version,", "replace": "return { name: \"@openparachute/hub\", version: core.version,", "suite": "suites/lifecycle/identity.test.ts suites/embedded/json.test.ts", "catches": ["with bin/parachute and bin/parachute-vault as aliases", "`parachute-core version --json` says @openparachute/core", "version --json prints {name, version, schema, bun}"]},
+  {"name": "aliases-run-the-old-programs", "why": "identity: bin/parachute-vault skips core and runs the vault CLI directly", "repo": "cli", "file": "bin/parachute-vault", "find": "exec bun \"$here/../src/parachute-vault.ts\" \"$@\"", "replace": "exec bun \"$here/../../vault/src/cli.ts\" \"$@\"", "suite": "suites/lifecycle/identity.test.ts", "catches": ["with bin/parachute and bin/parachute-vault as aliases"]},
+  {"name": "vault-child-from-path", "why": "PLAN §2.1: the hub finds `parachute-vault` on the user's PATH, so on uni it would start the old 0.7.9 vault", "repo": "cli", "file": "bin/parachute-core", "find": "PATH=\"$here:$PATH\" exec bun", "replace": "exec bun", "suite": "suites/lifecycle/identity.test.ts", "catches": ["the vault `parachute-core serve` starts is core's own"]},
   {"name": "hub-drops-open-requests-on-stop", "why": "stop must answer or finish requests it has started reading, not drop them", "repo": "hub", "file": "src/commands/serve.ts", "find": "    stop: async () => {\n      // Stop supervised children first so they get a clean SIGTERM", "replace": "    stop: async () => {\n      void server.stop(true);\n      // Stop supervised children first so they get a clean SIGTERM", "suite": "suites/lifecycle/shutdown.test.ts", "catches": ["SIGTERM: acknowledged writes survive, and writes the hub was reading"]}
 ];
 
 /** Fixes that must flip red contracts to "now green" (`catches` lists the red contracts that must flip). */
 export const FLIPS: Mutant[] = [
-  {
-    name: "issuer-hub",
-    why: "fix 1 in the hub: PARACHUTE_HUB_ORIGIN names the CLI's issuer, and serve points its vault child's key fetch at itself",
-    repo: "hub",
-    patch: "flips/issuer-hub.patch",
-    suite: "suites/embedded/issuer.test.ts",
-    catches: [
-      "with PARACHUTE_HUB_ORIGIN set, rotate-operator and mint-token sign with exactly that iss",
-      "box: on a non-default hub port with only PARACHUTE_HUB_ORIGIN set",
-      "box: a vault the hub starts verifies that hub's tokens on a non-default hub port",
-    ],
-  },
   {
     name: "safety-fixes-hub",
     why: "fixes 2, 13 and 14 in the hub: loopback by default, a mint never wider than its minter, unknown permission keys refused",

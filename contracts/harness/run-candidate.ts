@@ -1,6 +1,6 @@
 // `bun run candidate`: run the contracts against a built candidate (CONTRACT_TARGET=candidate).
 //
-//   bun run candidate                        today, compat, safety, embedded, lifecycle against .cache/candidate-stock
+//   bun run candidate                        today, compat, safety, embedded, lifecycle against .cache/candidate-core
 //   bun run candidate -- --v1                also the v1 contracts
 //   bun run candidate -- suites/embedded     only those suites/files; other args go to `bun test`
 //   CANDIDATE_DIR=<dir>                      another candidate (an unpacked v0.8 tarball, a mutant build)
@@ -22,7 +22,7 @@ const keep = args.includes("--keep");
 const v1 = args.includes("--v1");
 const extra = args.filter((a) => a !== "--keep" && a !== "--v1");
 const contracts = resolve(import.meta.dir, "..");
-const dir = resolve(process.env.CANDIDATE_DIR ?? join(contracts, ".cache", "candidate-stock"));
+const dir = resolve(process.env.CANDIDATE_DIR ?? join(contracts, ".cache", "candidate-core"));
 
 const { manifest, sha256 } = await loadCandidate(dir);
 const info = prepareInfo(dir, manifest, sha256);

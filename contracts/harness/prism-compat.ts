@@ -40,7 +40,7 @@ if (!process.env.PCORE_SANDBOX) {
 }
 await enterSandbox();
 
-const dir = resolve(process.env.CANDIDATE_DIR ?? join(contracts, ".cache", "candidate-stock"));
+const dir = resolve(process.env.CANDIDATE_DIR ?? join(contracts, ".cache", "candidate-core"));
 const { manifest, sha256 } = await loadCandidate(dir);
 const info = prepareInfo(dir, manifest, sha256);
 const node = hostNode();
