@@ -626,6 +626,8 @@ export async function serve(opts: ServeOpts = {}): Promise<{
 
   const envPort = parsePort(env.PORT);
   const port = opts.port ?? envPort ?? DEFAULT_PORT;
+  // Fix 1 (v0.8 PLAN §2.3): the vault child fetches its signing keys from this hub, not :1939. Lane C passes it in.
+  process.env.PARACHUTE_HUB_JWKS_ORIGIN ??= `http://127.0.0.1:${port}`;
   // Containers default to 0.0.0.0 so the platform's HTTP forwarder can
   // reach us; the `--hostname` flag / PARACHUTE_BIND_HOST is the escape
   // hatch for setups that want loopback-only inside a sidecar.

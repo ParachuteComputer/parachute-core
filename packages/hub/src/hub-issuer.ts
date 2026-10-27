@@ -16,6 +16,8 @@ import { deriveHubOrigin } from "./hub-origin.ts";
  * resource server's strict check even when scopes match.
  */
 export function resolveHubIssuer(override: string | undefined, configDir: string): string {
+  // Fix 1 (v0.8 PLAN §2.3): PARACHUTE_HUB_ORIGIN names the issuer, before hub/run/hub.port and :1939.
+  override ??= process.env.PARACHUTE_HUB_ORIGIN;
   if (override) {
     const fromOverride = deriveHubOrigin({ override });
     if (fromOverride) return fromOverride;
