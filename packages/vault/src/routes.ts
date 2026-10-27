@@ -1,0 +1,5344 @@
+import { UnreadablePrivateTagsError } from "./config.ts";
+import { getImportedVersion, importStorageIndex, parseHistorySelector, projectHistoryRow, ImportedHistoryUnrecoverableError } from "../core/src/history-import.js";
+/**
+ * REST API route handlers for the multi-vault server.
+ *
+ * Mirrors the MCP tools:
+ *   /api/notes          — query-notes, create-note, update-note, delete-note
+ *   /api/tags           — list-tags, update-tag, delete-tag
+ *   /api/find-path      — find-path
+ *   /api/vault          — vault-info
+ *
+ * Each handler receives a Store instance (already resolved for the vault)
+ * and the Request, and returns a Response.
+ */
+
+import { HistoryNotFoundError, latestTombstone } from "../core/src/history.js";
+import { projectHistoryProvenance } from "../core/src/history-visibility.js";
+import { isNoteIdShape } from "../core/src/ulid.js";
+import type { Database } from "bun:sqlite";
+import type { Store, Note, QueryOpts, AggregateSpec } from "../core/src/types.ts";
+import { TAG_EXPAND_MODES, stripTagHash, suggestSimilarTag, type TagExpandMode } from "../core/src/tag-hierarchy.ts";
+import {
+  collectUnknownTagWarnings,
+  emptySearchWarning,
+  ignoredParamWarning,
+  truncatedResultsWarning,
+  computeSearchDidYouMean,
+  searchDidYouMeanWarning,
+  embeddingsPendingWarning,
+  type QueryWarning,
+} from "../core/src/query-warnings.ts";
+import { SEARCH_MODES, buildLiteralSearchQuery, isValidSearchMode, type SearchMode } from "../core/src/search-query.ts";
+import {
+  listUnresolvedWikilinks,
+  resolveOrQueueLink,
+  resolveStructuredLinkNote,
+  getUnresolvedLinksForNote,
+  getUnresolvedLinksForNotes,
+  listZeroVisibleAmbiguousAsUnresolved,
+  listResolvedToInvisibleAsUnresolved,
+  narrowByVisibleBrokenness,
+  sqlHasBrokenLinks,
+  getAmbiguousLinksForNote,
+  getAmbiguousLinksForNotes,
+  narrowByVisibleAmbiguity,
+  sqlHasAmbiguousLinks,
+  getContentWikilinkWarnings,
+  ambiguousLinkWarning,
+  unresolvedLinkWarning,
+  narrowLinkWarningsForVisibility,
+} from "../core/src/wikilinks.ts";
+import { transactionAsync } from "../core/src/txn.ts";
+import { getNote, getNotes, getNoteTags, getNoteByTitle, toNoteIndex, filterMetadata, mergeMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError, PathConflictError, validatePath, PathValidationError, getVaultMap, isValidIfUpdatedAt, IF_UPDATED_AT_HINT } from "../core/src/notes.ts";
+import { normalizePath } from "../core/src/paths.ts";
+import {
+  parseContentRange,
+  applyContentRange,
+  contentRangeRequiresContent,
+  type ContentRange,
+} from "../core/src/content-range.ts";
+import { attachValidationStatus, enforceStrictWrite, applySchemaDefaults } from "../core/src/mcp.ts";
+import {
+  BLOCKED_ATTACHMENT_EXTENSIONS,
+  ATTACHMENT_MIME_TYPES,
+} from "../core/src/attachment/policy.ts";
+import type { ValidationWarning } from "../core/src/schema-defaults.ts";
+import { logStrictBypass } from "./scopes.ts";
+import * as linkOps from "../core/src/links.ts";
+import * as tagSchemaOps from "../core/src/tag-schemas.ts";
+import { IndexedFieldError } from "../core/src/indexed-fields.ts";
+import { buildVaultProjection, resolveTagInheritance } from "../core/src/vault-projection.ts";
+import {
+  resolveTranscriptionCapability,
+  type TranscriptionCapability,
+} from "./transcription/capability.ts";
+import {
+  resolveEmbeddingCapability,
+  type EmbeddingCapability,
+} from "./embedding/capability.ts";
+import { getSharedEmbeddingProvider } from "./vault-store.ts";
+import { loadSchemaConfig } from "../core/src/schema-defaults.ts";
+import {
+  buildExpandVisibility,
+  filterHydratedLinksByTagScope,
+  filterNotesByTagScope,
+  noteWithinTagScope,
+  scrubTagCountsForPrivateTags,
+  scopedCountFilter,
+  scopedStatsFilter,
+  doctorNoteTagsPredicate,
+  scopeQueryTags,
+  scrubIndexedFieldConflictError,
+  scrubNotesTagsByScope,
+  scrubNoteTagsByScope,
+  scrubParentCycleError,
+  scrubReferencingTagsByScope,
+  scrubTagFieldViolationsByScope,
+  scrubValidationStatusByScope,
+  tagScopeForbidden,
+  tagsWithinScope,
+  tagVisibleInScope,
+} from "./tag-scope.ts";
+import { ParentCycleError, InvalidFieldDefaultError, InvalidFieldTypeError } from "../core/src/tag-schemas.ts";
+import { findTokensReferencingTag } from "./token-store.ts";
+
+/**
+ * Tag-scope context threaded through handlers. `allowed` is the
+ * pre-expanded set of permitted tags (root + descendants), `raw` is the
+ * original allowlist for error messages. Both null when the token is
+ * unscoped — handlers fast-path on `allowed === null` and behave
+ * identically to the pre-tag-scope code path.
+ */
+export type TagScopeCtx = { allowed: Set<string> | null; raw: string[] | null };
+
+const NO_TAG_SCOPE: TagScopeCtx = { allowed: null, raw: null };
+
+/**
+ * Write-attribution context (vault#298) for REST writes — the principal
+ * (`actor`) and interface (`via`) threaded from the authenticated request into
+ * `store.createNote` / `store.updateNote`. Both null for paths without an auth
+ * context (the no-op default). See `WriteContext` in core/src/notes.ts.
+ */
+export type WriteCtx = {
+  actor: string | null;
+  via: string | null;
+  /**
+   * Migration-bypass (vault#299). True when the caller holds `vault:migrate`
+   * — strict-schema enforcement is skipped and the bypass is logged. Defaults
+   * to false (full enforcement) for every normal write.
+   */
+  bypassStrict?: boolean;
+};
+
+const vis = (t: TagScopeCtx) => { const v = buildExpandVisibility(t.allowed, t.raw); return v ? { isVisible: v } : undefined; };
+
+const NO_WRITE_CTX: WriteCtx = { actor: null, via: null };
+
+/**
+ * Run the shared strict-schema gate for a REST write (vault#299). Mirrors the
+ * MCP path's `enforceStrict` closure: enforce unless the caller holds the
+ * migration-bypass scope, and log every bypassed write to the daemon's
+ * structured log (the audit-log table, #300, is deferred). Throws
+ * `SchemaValidationError` (caught by the route's catch → 422) when not bypassed.
+ */
+function gateStrictWrite(
+  store: Store,
+  writeCtx: WriteCtx,
+  shape: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown> },
+  tagScope: TagScopeCtx = NO_TAG_SCOPE,
+): void {
+  enforceStrictWrite(store, shape, {
+    isVisible: buildExpandVisibility(tagScope.allowed, tagScope.raw),
+    bypass: writeCtx.bypassStrict === true,
+    onBypass: (violations: ValidationWarning[]) => {
+      logStrictBypass({
+        actor: writeCtx.actor,
+        via: writeCtx.via,
+        path: shape.path ?? null,
+        tags: shape.tags,
+        violations,
+      });
+    },
+  });
+}
+
+import {
+  expandContent,
+  DEFAULT_EXPAND_DEPTH,
+  MAX_EXPAND_DEPTH,
+  type ExpandContext,
+  type ExpandMode,
+} from "../core/src/expand.ts";
+import { join, extname, normalize } from "path";
+import { existsSync, mkdirSync, statSync, unlinkSync, writeFileSync } from "fs";
+import { assetsDir, readGlobalConfig, readVaultConfig } from "./config.ts";
+import {
+  NO_PROVIDER_ERROR,
+  noProviderErrorFor,
+  classifyAutoTranscribe,
+  shouldAutoTranscribe,
+  warnNoTranscriptionProvider,
+} from "./auto-transcribe.ts";
+// usage.ts imports `assetsDir` from config.ts (neutral ground), so this import
+// of invalidateUsageCache does NOT form a cycle — routes.ts → usage.ts only.
+import { invalidateUsageCache } from "./usage.ts";
+
+// Re-export `assetsDir` (now defined in config.ts) so the existing callers
+// that import it from this module — mirror-deps, mirror-routes, server,
+// triggers, cli — keep working unchanged.
+export { assetsDir };
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function conflictResponse(e: any): Response | null {
+  if (e instanceof NotFoundError) return json({ error: e.message, error_type: "not_found" }, 404);
+  // Duck-type on `code` rather than `instanceof ConflictError`: this
+  // error originates in the core package and survives any future
+  // bundling / module-boundary split more robustly than a prototype check.
+  if (e && e.code === "CONFLICT") {
+    return json(
+      {
+        // New structured shape — what agents should key on.
+        error_type: "conflict",
+        current_updated_at: e.current_updated_at ?? null,
+        your_updated_at: e.expected_updated_at,
+        path: e.note_path ?? null,
+        note_id: e.note_id,
+        message: e.message,
+        hint: "re-read the note (GET) and re-apply your change against its current `updated_at`, or pass `force: true` to overwrite",
+        // Legacy fields — kept for the lens VaultConflictError shim and
+        // any other pre-launch callers. Safe to drop post-launch.
+        error: "conflict",
+        expected_updated_at: e.expected_updated_at,
+      },
+      409,
+    );
+  }
+  // State-transition compare-and-set conflict (vault#299 Part B). A
+  // DISTINCT error vocabulary from `conflict` (settled lead #3): the
+  // field VALUE didn't match `from`, not the updated_at token. 409.
+  if (e && e.code === "TRANSITION_CONFLICT") {
+    return json(
+      {
+        error_type: "transition_conflict",
+        error: "transition_conflict",
+        note_id: e.note_id,
+        path: e.note_path ?? null,
+        field: e.field,
+        expected_from: e.expected_from,
+        to: e.to,
+        current: e.current ?? null,
+        message: e.message,
+        hint: "re-read the note's current value for this field and retry the transition from its actual current state",
+      },
+      409,
+    );
+  }
+  // Strict-schema rejection (vault#299 Part A). One error carrying ALL
+  // per-field violations (settled lead #1). 422 Unprocessable Entity —
+  // the note exists / request is well-formed but violates the contract.
+  if (e && e.code === "SCHEMA_VALIDATION") {
+    return json(
+      {
+        error_type: "schema_validation",
+        error: "schema_validation",
+        violations: e.violations ?? [],
+        message: e.message,
+        hint: "fix every field listed in `violations` and retry — none of this write was applied",
+      },
+      422,
+    );
+  }
+  // Path-rename collision — schema's UNIQUE(path) tripped. Issue #126.
+  if (e && e.code === "PATH_CONFLICT") {
+    return json(
+      {
+        error_type: "path_conflict",
+        error: "path_conflict",
+        path: e.path,
+        message: e.message,
+        hint: "pass a different `path`, or omit it to leave the existing path unchanged",
+      },
+      409,
+    );
+  }
+  if (e && e.code === "INVALID_EXTENSION") {
+    return json(
+      { error_type: "invalid_extension", error: "invalid_extension", extension: e.extension, reason: e.reason, message: e.message },
+      400,
+    );
+  }
+  // Bad `path` value (vault#589 / FIX 2) — NUL byte or `..` segment.
+  if (e && e.code === "INVALID_PATH") {
+    return json(
+      { error_type: "invalid_path", error: "invalid_path", path: e.path, reason: e.reason, message: e.message },
+      400,
+    );
+  }
+  if (e && e.code === "PRECONDITION_REQUIRED") return json({ error_type: "precondition_required", note_id: e.note_id, message: e.message }, 428);
+  if (e && e.code === "HISTORY_NOT_FOUND") return json({ error: e.message, error_type: "not_found" }, 404);
+  if (e && e.code === "HISTORY_OVERFLOW") return json({
+    error_type: "history_overflow", note_id: e.note_id, byte_size: e.byte_size, limit: e.limit, message: e.message,
+    hint: "this note exceeds the 2 MB version-history ceiling, so it cannot be updated while history is enabled; delete it, or shrink it out-of-band, or disable history for this vault",
+  }, 413);
+  if (e && e.code === "HISTORY_UNRECOVERABLE") return json({
+    error_type: "history_unrecoverable", note_id: e.note_id, ...(e.origin === "git-import" ? { origin: e.origin, import_ix: e.import_ix } : { version_ix: e.version_ix }), message: e.message,
+    hint: e.reason === "delta_orphan" ? "this version's stored delta cannot be rebuilt — its base blob is missing or corrupt; run GET /api/doctor for the `history_delta_orphan` finding" : "this version is an overflow tombstone — the note's size and deletion were recorded but its content never was",
+  }, 409);
+  return null;
+}
+
+function json(data: unknown, status = 200): Response {
+  return Response.json(data, { status });
+}
+
+/**
+ * `json(...)` plus the `X-Parachute-Warnings` response header (vault#550) —
+ * `encodeURIComponent(JSON.stringify(warnings))`, set only when `warnings`
+ * is non-empty. Percent-encoded because HTTP header VALUES are
+ * Latin1/ASCII-only (the Fetch spec's ByteString requirement) while warning
+ * `message` text uses this codebase's normal house style (em dashes,
+ * curly-free but occasionally non-ASCII punctuation) — a raw
+ * `JSON.stringify` throws `TypeError: invalid header value` the first time
+ * a message isn't 7-bit-clean. Decode with `decodeURIComponent` then
+ * `JSON.parse`. Exists so bare-array responses (`GET /notes` without a
+ * cursor) can carry warnings WITHOUT changing their wire shape — a code
+ * consumer doing `for (const note of await res.json())` keeps working
+ * unmodified, while a consumer that cares can read the header. Envelope
+ * shapes (`{notes, next_cursor}`, `{nodes, edges}`) get the header too for
+ * uniform discoverability; callers that want warnings INLINE in an
+ * envelope should also spread them into the response body before calling
+ * this (see the cursor-envelope call sites in `handleNotesInner`).
+ */
+function jsonWithWarnings(data: unknown, warnings: QueryWarning[], status = 200): Response {
+  const res = json(data, status);
+  if (warnings.length > 0) {
+    res.headers.set("X-Parachute-Warnings", encodeURIComponent(JSON.stringify(warnings)));
+  }
+  return res;
+}
+
+/**
+ * Sane upper bound on a mutating-route JSON request body (LB7c). Without
+ * this, a giant field (most commonly a note's `content`) sails straight
+ * through `req.json()` and into wikilink parsing + the store write with no
+ * gate at all — reproduced at 50MB `content` -> 201 Created, RSS 92MB ->
+ * 663MB (memory-DoS via a single request). 10MB is generous for
+ * hand-authored or transcribed note content (multiple hours of dense
+ * transcript) while bounding the failure mode. Mirrors `/upload`'s
+ * `MAX_UPLOAD_BYTES` file-size gate for the JSON-body transport.
+ */
+export const MAX_JSON_BODY_BYTES = 10 * 1024 * 1024;
+
+function payloadTooLargeResponse(bytes: number): Response {
+  return json(
+    {
+      error: `Request body too large (${(bytes / 1024 / 1024).toFixed(1)}MB). Max: ${Math.round(MAX_JSON_BODY_BYTES / 1024 / 1024)}MB`,
+      error_type: "payload_too_large",
+      limit: MAX_JSON_BODY_BYTES,
+      got: bytes,
+    },
+    413,
+  );
+}
+
+/**
+ * Single choke point for every mutating route that reads a JSON request
+ * body (LB7 — door asymmetry fix). Three failure modes, all returning a
+ * clean 400/413 instead of falling through to server.ts's generic
+ * `{ error: "Internal server error" }` 500-with-no-`error_type` (LB7a), or
+ * silently succeeding on a wrong-shape body (LB7b — `null` used to throw a
+ * TypeError deep in the handler; `42`/`[]` used to sail through property
+ * access as `undefined` and create a blank note/no-op update):
+ *
+ *   1. **Oversize** — `Content-Length` over {@link MAX_JSON_BODY_BYTES}
+ *      rejects BEFORE `req.json()` even buffers/parses the body (the cheap
+ *      path). When the header is absent or understates the true size
+ *      (chunked transfer, a lying client), the parsed body's own
+ *      JSON-serialized size is checked as a backstop — one extra parse, but
+ *      still cheaper than letting the oversized value reach the store and
+ *      get re-processed (wikilink scan, indexing, etc.).
+ *   2. **Malformed JSON** — `req.json()` rejects; caught here rather than
+ *      propagating to the top-level handler.
+ *   3. **Wrong shape** — valid JSON, but not a plain object (`null`, an
+ *      array, or a bare primitive). Gated by `requireObject` (default
+ *      `true`); every current caller wants this — the parameter exists so a
+ *      future non-object-bodied route doesn't have to bypass the helper
+ *      entirely to opt out.
+ *
+ * Callers: check `.ok` and return `.response` on failure; `.body` is the
+ * parsed JSON value (still `any` — this validates SHAPE, not the specific
+ * fields a given route requires, which callers keep checking themselves).
+ */
+async function parseJsonBody(
+  req: Request,
+  opts?: { requireObject?: boolean },
+): Promise<{ ok: true; body: any } | { ok: false; response: Response }> {
+  const contentLengthHeader = req.headers.get("content-length");
+  if (contentLengthHeader) {
+    const declaredBytes = Number(contentLengthHeader);
+    if (Number.isFinite(declaredBytes) && declaredBytes > MAX_JSON_BODY_BYTES) {
+      return { ok: false, response: payloadTooLargeResponse(declaredBytes) };
+    }
+  }
+
+  const INVALID_JSON = Symbol("invalid-json");
+  const parsed = await req.json().catch(() => INVALID_JSON);
+  if (parsed === INVALID_JSON) {
+    return { ok: false, response: json({ error: "Invalid JSON body", error_type: "invalid_json" }, 400) };
+  }
+
+  if (!contentLengthHeader) {
+    const approxBytes = Buffer.byteLength(JSON.stringify(parsed) ?? "", "utf8");
+    if (approxBytes > MAX_JSON_BODY_BYTES) {
+      return { ok: false, response: payloadTooLargeResponse(approxBytes) };
+    }
+  }
+
+  const requireObject = opts?.requireObject ?? true;
+  if (requireObject && (parsed === null || typeof parsed !== "object" || Array.isArray(parsed))) {
+    // The body PARSED as JSON but is the wrong SHAPE (a primitive/array/null,
+    // not an object) — a `invalid_request` per the taxonomy (parallel to
+    // `/tags/merge`'s `sources`/`target` shape errors). `invalid_json` is
+    // reserved for a genuine parse failure (the branch above).
+    return {
+      ok: false,
+      response: json(
+        {
+          error: "Request body must be a JSON object",
+          error_type: "invalid_request",
+          hint: `expected a JSON object body — got ${parsed === null ? "null" : Array.isArray(parsed) ? "an array" : typeof parsed}`,
+        },
+        400,
+      ),
+    };
+  }
+
+  return { ok: true, body: parsed };
+}
+
+/**
+ * REST-only `removed_param` warning (vault#550) — the flat `date_field` /
+ * `date_from` / `date_to` query-string params were removed at 0.6.4
+ * (vault#288) and have been silently ignored ever since (routes.ts:633-ish
+ * comment). A request that passes any of them now gets a warning naming
+ * the ignored param and the bracket-style replacement, instead of quietly
+ * coming back unfiltered. One warning per param present (a caller passing
+ * all three gets three entries — precise, not lossy-summarized).
+ */
+function collectRemovedParamWarnings(url: URL): QueryWarning[] {
+  const REMOVED_DATE_PARAMS = ["date_field", "date_from", "date_to"] as const;
+  const warnings: QueryWarning[] = [];
+  for (const param of REMOVED_DATE_PARAMS) {
+    if (url.searchParams.has(param)) {
+      warnings.push({
+        code: "removed_param",
+        message: `\`${param}\` was removed in 0.6.4 (vault#288) and is silently ignored — use bracket-style date filters instead: \`meta[created_at][gte]=…\` / \`meta[created_at][lt]=…\` (or \`meta[updated_at][...]\`).`,
+        param,
+      });
+    }
+  }
+  return warnings;
+}
+
+function parseBool(val: string | null, defaultVal: boolean): boolean {
+  if (val === null) return defaultVal;
+  return val === "true" || val === "1";
+}
+
+function parseBoolOrUndef(val: string | null): boolean | undefined {
+  if (val === null) return undefined;
+  if (val === "true" || val === "1") return true;
+  if (val === "false" || val === "0") return false;
+  return undefined;
+}
+
+function parseQuery(url: URL, key: string): string | null {
+  return url.searchParams.get(key);
+}
+
+/**
+ * Parse `link_count_direction` (vault feedback #4). Defaults to "both";
+ * anything other than the three known values falls back to "both" so a
+ * typo silently degrades to the documented default rather than erroring.
+ *
+ * Tag-scope note (symmetric with the MCP param description): `linkCount`
+ * is a raw degree that MAY include edges to notes a tag-scoped token can't
+ * see — the tag-scope filter runs post-query, over the result notes, not
+ * their neighbors. Only the number leaks, not the neighbor.
+ */
+function parseLinkCountDirection(url: URL): "both" | "outbound" | "inbound" {
+  const v = url.searchParams.get("link_count_direction");
+  if (v === "outbound" || v === "inbound") return v;
+  return "both";
+}
+
+/**
+ * Parse a repeatable, comma-list query param (`tag`, `exclude_tag`,
+ * `exclude_path_prefix`). Two accepted shapes, and they compose:
+ *   - `?tag=a,b` (comma-list)
+ *   - `?tag=a&tag=b` (repeated param)
+ * Both yield `["a", "b"]`. This used to be `searchParams.get()` + split,
+ * which silently kept only the FIRST occurrence — a caller passing
+ * `?tag=a&tag=b` got results filtered by `a` alone, with no signal that
+ * `b` had been dropped (vault#659). Mirrors `parseExtensionFilter` below,
+ * with two deliberate differences: this always returns an array (these
+ * callers take `string[]`), and it does NOT trim — `exclude_path_prefix`
+ * is a path fragment, where surrounding whitespace is data, not noise.
+ * Returns undefined when absent so the queryNotes filter is skipped.
+ */
+function parseQueryList(url: URL, key: string): string[] | undefined {
+  const all = url.searchParams.getAll(key);
+  if (all.length === 0) return undefined;
+  // Flatten comma-lists inside each param.
+  const flat = all.flatMap((v) => v.split(",")).filter((s) => s.length > 0);
+  return flat.length > 0 ? flat : undefined;
+}
+
+/**
+ * Parse `?content_offset=` / `?content_length=` (content range — bounded
+ * reads for large notes; unit is UTF-8 bytes, see core/src/content-range.ts
+ * for the codepoint-boundary slicing rules). Returns `{ range: null }` when
+ * neither param is present (response byte-identical to the no-pagination
+ * shape), or `{ error }` (400 INVALID_QUERY) on invalid values or when the
+ * response shape excludes content — range params on a content-less shape
+ * error loudly rather than silently no-op, same policy as `?expand=`.
+ */
+function parseContentRangeQuery(
+  url: URL,
+  includeContent: boolean,
+): { range: ContentRange | null; error?: Response } {
+  try {
+    const range = parseContentRange(
+      parseQuery(url, "content_offset") ?? undefined,
+      parseQuery(url, "content_length") ?? undefined,
+    );
+    if (range && !includeContent) throw contentRangeRequiresContent();
+    return { range };
+  } catch (e: any) {
+    // Duck-type on `name` — core is a separate module, so `instanceof`
+    // is fragile across bundling boundaries (same note as the QueryError
+    // handling in the structured-query path below).
+    if (e && e.name === "QueryError") {
+      return {
+        range: null,
+        error: json(
+          { error: e.message, code: e.code ?? "INVALID_QUERY", error_type: e.error_type ?? "invalid_query" },
+          400,
+        ),
+      };
+    }
+    throw e;
+  }
+}
+
+/**
+ * Parse the extension query parameter (vault#328). Two accepted shapes:
+ *   - `?extension=csv` (single value → string)
+ *   - `?extension=csv&extension=yaml` OR `?extension=csv,yaml`
+ *     (repeated or comma-list → array)
+ * Returns undefined when absent so the queryNotes filter is skipped.
+ * Validation lives at the engine layer — bad strings result in zero
+ * matches rather than 400, mirroring how `path` works.
+ */
+function parseExtensionFilter(url: URL): string | string[] | undefined {
+  const all = url.searchParams.getAll("extension");
+  if (all.length === 0) return undefined;
+  // Flatten comma-lists inside each param.
+  const flat = all.flatMap((v) => v.split(",")).map((s) => s.trim()).filter((s) => s.length > 0);
+  if (flat.length === 0) return undefined;
+  if (flat.length === 1) return flat[0]!;
+  return flat;
+}
+
+function parseInt10(val: string | null): number | undefined {
+  if (!val) return undefined;
+  const n = parseInt(val, 10);
+  return isNaN(n) ? undefined : n;
+}
+
+/**
+ * Parse + validate `?limit=` / `?offset=` for the structured-query path
+ * (vault#550). Before this, `parseInt10(...) ?? 50` silently swallowed a
+ * non-numeric value into the default (a caller's typo `?limit=fifty` just
+ * became `limit=50` with no signal), and any negative value that DID parse
+ * flowed straight through to SQLite, whose `LIMIT -1` means "no limit" —
+ * silently returning EVERYTHING instead of erroring. Returns `{value}`
+ * (undefined when the param is absent — the caller applies its own
+ * default) or `{error}` (400 `invalid_query`) when present-but-malformed.
+ * `got` echoes the ORIGINAL raw string so the error is legible even though
+ * the coerced value (e.g. `NaN`) wouldn't be.
+ */
+function parseNonNegativeIntParam(
+  url: URL,
+  key: "limit" | "offset",
+): { value?: number; error?: Response } {
+  const raw = parseQuery(url, key);
+  if (raw === null || raw === "") return {};
+  const trimmed = raw.trim();
+  if (!/^-?\d+$/.test(trimmed)) {
+    return {
+      error: json(
+        {
+          error: `\`${key}\` must be an integer, got ${JSON.stringify(raw)}`,
+          error_type: "invalid_query",
+          code: "INVALID_QUERY",
+          field: key,
+          got: raw,
+          hint: `pass a non-negative integer (e.g. ?${key}=${key === "limit" ? "50" : "0"}), or omit for the default`,
+        },
+        400,
+      ),
+    };
+  }
+  const n = parseInt(trimmed, 10);
+  if (n < 0) {
+    return {
+      error: json(
+        {
+          error: `\`${key}\` must be zero or greater, got ${n}${key === "limit" ? " — a negative limit used to silently mean \"unlimited\" (SQLite semantics leaking through)" : ""}`,
+          error_type: "invalid_query",
+          code: "INVALID_QUERY",
+          field: key,
+          got: raw,
+          hint: "pass a non-negative integer, or omit for the default",
+        },
+        400,
+      ),
+    };
+  }
+  return { value: n };
+}
+
+/**
+ * Parse bracket-style metadata filters (vault#285 friction point 1.3).
+ *
+ * Maps `?meta[field][op]=value` (Stripe / JSON:API / Strapi convention) to
+ * the engine `metadata` filter shape at `core/src/notes.ts:494-509`. Recognised
+ * forms:
+ *
+ *   - `?meta[field]=value`                 — shorthand equality (JSON-scan;
+ *                                            no indexed-field declaration
+ *                                            required)
+ *   - `?meta[field][op]=value`             — operator query (routes through
+ *                                            the indexed generated column;
+ *                                            engine raises FIELD_NOT_INDEXED
+ *                                            if the field isn't declared)
+ *   - `?meta[field][in][]=v1&[in][]=v2`    — array form for in/not_in
+ *   - `?meta[field][in]=v1,v2`             — comma-separated form for in/not_in
+ *
+ * Supported operators mirror the engine: `eq`, `ne`, `gt`, `gte`, `lt`,
+ * `lte`, `in`, `not_in`, `exists`. `exists` requires `"true"` or `"false"`;
+ * other values reject with INVALID_OPERATOR_VALUE.
+ *
+ * Compound filters AND together: multiple `meta[a][gte]=1&meta[a][lt]=5`
+ * on the same field merge into one operator object; filters on different
+ * fields stack as independent AND clauses (engine semantics).
+ *
+ * **Bridge for the real `n.created_at` / `n.updated_at` columns** — these
+ * route through `dateFilter` (the existing engine path that exempts them
+ * from the indexed-field gate), not through the metadata-filter path. Only
+ * `gte` (→ inclusive `from`) and `lt` (→ exclusive `to`) are accepted on
+ * these fields, matching the dateFilter contract exactly. Other operators
+ * reject with INVALID_QUERY so callers don't think `meta[created_at][eq]=…`
+ * works.
+ *
+ * Returns `{ metadata?, dateFilter?, error? }`. When `error` is set the
+ * caller should return it directly (already shaped as a 400 with
+ * `error` + `code`).
+ */
+function parseMetaBrackets(url: URL): {
+  metadata?: Record<string, unknown>;
+  dateFilter?: { field: string; from?: string; to?: string };
+  error?: Response;
+} {
+  // Real columns on `notes` — exempt from the indexed-field gate, routed
+  // through `dateFilter` instead of `metadata`.
+  const REAL_DATE_COLUMNS = new Set(["created_at", "updated_at"]);
+  // Operators that take an array value. Used for parser-level rejection of
+  // `[]`-array syntax on the wrong operator (e.g. `meta[field][eq][]=value`).
+  const ARRAY_OPS = new Set(["in", "not_in"]);
+  // `meta[FIELD]` or `meta[FIELD][OP]` or `meta[FIELD][OP][]`. Field names are
+  // bounded by `FIELD_NAME_RE` at the engine layer; the parser is liberal here
+  // and lets the engine raise the loud error on bad names.
+  const META_RE = /^meta\[([^\]]+)\](?:\[([^\]]+)\](\[\])?)?$/;
+
+  // `metadata[field]` is either a primitive (shorthand `eq` via json_extract)
+  // or a sub-object of operator clauses. The two are *mutually exclusive per
+  // field per request*: mixing them is a silent-data-loss footgun (op set,
+  // then shorthand stomps; or shorthand set, then op stomps) so we reject
+  // loudly. Track each field's chosen form here.
+  const metadata: Record<string, unknown> = {};
+  const shorthandFields = new Set<string>();
+  const opBucketsByField = new Map<string, Map<string, string[]>>(); // field → op → values (array form)
+  const opObjectByField = new Map<string, Record<string, unknown>>(); // field → built op object (single-value ops)
+
+  // dateFilter accumulates `from` (gte) and `to` (lt) bounds on a single
+  // column. Spanning both `created_at` AND `updated_at` in one request is
+  // not expressible (the engine takes one `field`), so we reject early
+  // rather than silently corrupting one bound. See vault#289 review F1.
+  let dateField: "created_at" | "updated_at" | null = null;
+  let dateFrom: string | undefined;
+  let dateTo: string | undefined;
+
+  function rejectMixedForms(field: string): Response {
+    return json(
+      {
+        error: `bracket-meta filter: cannot mix shorthand and operator forms for the same field — \`meta[${field}]=…\` and \`meta[${field}][<op>]=…\` are mutually exclusive in one request. Pick one form.`,
+        code: "INVALID_QUERY",
+        error_type: "invalid_query",
+        field,
+        hint: `pick either \`meta[${field}]=value\` or \`meta[${field}][<op>]=value\`, not both`,
+      },
+      400,
+    );
+  }
+
+  function getOpObject(field: string): Record<string, unknown> {
+    let bucket = opObjectByField.get(field);
+    if (!bucket) {
+      bucket = {};
+      opObjectByField.set(field, bucket);
+    }
+    return bucket;
+  }
+
+  for (const [key, value] of url.searchParams.entries()) {
+    const m = META_RE.exec(key);
+    if (!m) continue;
+    const field = m[1]!;
+    const op = m[2];
+    const isArray = m[3] === "[]";
+
+    // Bridge: real date columns route to dateFilter, not metadata.
+    if (REAL_DATE_COLUMNS.has(field)) {
+      if (!op) {
+        return {
+          error: json(
+            {
+              error: `bracket-date filter on \`${field}\` requires an operator: meta[${field}][gte]=… (lower bound) or meta[${field}][lt]=… (upper bound, exclusive).`,
+              code: "INVALID_QUERY",
+              error_type: "invalid_query",
+              field,
+              hint: `pass meta[${field}][gte]=… and/or meta[${field}][lt]=…`,
+            },
+            400,
+          ),
+        };
+      }
+      if (op !== "gte" && op !== "lt") {
+        return {
+          error: json(
+            {
+              error: `bracket-date filter on \`${field}\` supports only \`gte\` (inclusive lower bound) and \`lt\` (exclusive upper bound). Got: \`${op}\`. The dateFilter contract is half-open by design.`,
+              code: "INVALID_QUERY",
+              error_type: "invalid_query",
+              field,
+              got: op,
+              hint: `use \`gte\` or \`lt\` — meta[${field}][gte]=… / meta[${field}][lt]=…`,
+            },
+            400,
+          ),
+        };
+      }
+      // F1: dateFilter takes a single column. Reject the cross-column
+      // case before assigning — otherwise the second column's
+      // assignment would silently override the first.
+      if (dateField !== null && dateField !== field) {
+        return {
+          error: json(
+            {
+              error: `bracket-date filter cannot span both \`created_at\` and \`updated_at\` in one request — issue two queries or use one column per request.`,
+              code: "INVALID_QUERY",
+              error_type: "invalid_query",
+              field,
+              hint: "issue two queries, or filter one date column per request",
+            },
+            400,
+          ),
+        };
+      }
+      dateField = field as "created_at" | "updated_at";
+      if (op === "gte") dateFrom = value;
+      else dateTo = value;
+      continue;
+    }
+
+    // Regular metadata field.
+    if (!op) {
+      // Shorthand: `?meta[field]=value` → primitive (engine routes through
+      // json_extract; no indexed declaration required).
+      // F2: reject if any operator form already wrote a bucket for this
+      // field — the two shapes don't compose and the silent stomp would
+      // drop one form's intent. Mirror check for the reverse order below.
+      if (opObjectByField.has(field) || opBucketsByField.has(field)) {
+        return { error: rejectMixedForms(field) };
+      }
+      shorthandFields.add(field);
+      metadata[field] = value;
+      continue;
+    }
+    // F2: reject if shorthand already wrote a primitive for this field.
+    if (shorthandFields.has(field)) {
+      return { error: rejectMixedForms(field) };
+    }
+    // F4: `[]`-array syntax only makes sense for `in` / `not_in`. Other ops
+    // (eq, gt, exists, …) take a scalar; `meta[field][eq][]=v` is a
+    // shape error — surface it at the parser layer with a clear message
+    // instead of letting the engine raise a generic INVALID_OPERATOR_VALUE
+    // downstream.
+    if (isArray && !ARRAY_OPS.has(op)) {
+      return {
+        error: json(
+          {
+            error: `bracket-meta filter: array form \`meta[${field}][${op}][]=…\` is only valid for \`in\` and \`not_in\`. \`${op}\` takes a single value — use \`meta[${field}][${op}]=value\` instead.`,
+            code: "INVALID_OPERATOR_VALUE",
+            error_type: "invalid_query",
+            field,
+            got: op,
+            hint: `use \`meta[${field}][${op}]=value\` (no \`[]\`) — array form is only for \`in\`/\`not_in\``,
+          },
+          400,
+        ),
+      };
+    }
+    if (isArray) {
+      // `meta[field][in][]=v1&meta[field][in][]=v2`. Nested map keeps
+      // field and op as separate dimensions — no string-concat ambiguity
+      // for field names that contain (or might one day be allowed to
+      // contain) the delimiter character. See vault#289 review F5.
+      let fieldBucket = opBucketsByField.get(field);
+      if (!fieldBucket) {
+        fieldBucket = new Map<string, string[]>();
+        opBucketsByField.set(field, fieldBucket);
+      }
+      let values = fieldBucket.get(op);
+      if (!values) {
+        values = [];
+        fieldBucket.set(op, values);
+      }
+      values.push(value);
+      continue;
+    }
+    if (op === "in" || op === "not_in") {
+      // Comma form: `meta[field][in]=v1,v2`. Mutually exclusive with the
+      // `[]` array form per field+op — last write wins if both are
+      // supplied; we don't reject because the resulting array is well-
+      // defined regardless of which form a caller picked.
+      const arr = value.includes(",")
+        ? value.split(",").map((s) => s.trim()).filter((s) => s.length > 0)
+        : [value];
+      getOpObject(field)[op] = arr;
+    } else if (op === "exists") {
+      const bool = value === "true" ? true : value === "false" ? false : null;
+      if (bool === null) {
+        return {
+          error: json(
+            {
+              error: `bracket-meta filter: \`exists\` on \`${field}\` requires "true" or "false", got "${value}"`,
+              code: "INVALID_OPERATOR_VALUE",
+              error_type: "invalid_query",
+              field,
+              got: value,
+              hint: `pass meta[${field}][exists]=true or meta[${field}][exists]=false`,
+            },
+            400,
+          ),
+        };
+      }
+      getOpObject(field)[op] = bool;
+    } else {
+      // eq / ne / gt / gte / lt / lte — all primitive, single value. Type
+      // coercion is left to SQLite affinity rules: indexed columns are
+      // declared TEXT or INTEGER, and SQLite will compare a string-shaped
+      // numeric correctly against an INTEGER column. The engine raises
+      // UNKNOWN_OPERATOR if `op` isn't in SUPPORTED_OPS.
+      getOpObject(field)[op] = value;
+    }
+  }
+
+  // Roll up `[]`-array buckets onto their op-objects. Done after the main
+  // loop so `in`/`not_in` array-form and comma-form on the same field
+  // collapse into one merged op-object cleanly.
+  for (const [field, opMap] of opBucketsByField) {
+    for (const [op, values] of opMap) {
+      getOpObject(field)[op] = values;
+    }
+  }
+  // Roll up op-objects onto the metadata payload.
+  for (const [field, opObj] of opObjectByField) {
+    metadata[field] = opObj;
+  }
+
+  const result: {
+    metadata?: Record<string, unknown>;
+    dateFilter?: { field: string; from?: string; to?: string };
+  } = {};
+  if (Object.keys(metadata).length > 0) result.metadata = metadata;
+  if (dateField) {
+    result.dateFilter = { field: dateField };
+    if (dateFrom !== undefined) result.dateFilter.from = dateFrom;
+    if (dateTo !== undefined) result.dateFilter.to = dateTo;
+  }
+  return result;
+}
+
+/**
+ * Parse the `?metadata=<json>` alias on GET /api/notes — the JSON-object form
+ * of the metadata filter, symmetric with the nested `metadata` object MCP
+ * forwards verbatim (`core/src/mcp.ts`). The value is a JSON object of the form
+ * `{"field":{"op":value}}` (operator query) or `{"field":value}` (shorthand
+ * equality via the engine's json_extract fallback).
+ *
+ * This exists because the bracket grammar (`?meta[field][op]=value`) couldn't
+ * see a `metadata=` param at all — it was silently dropped, and the query
+ * returned ALL tag-matching notes (a silent wrong result, not an error).
+ *
+ * We do NOT validate operators here — the parsed object lowers straight into
+ * `queryNotes`, where `validateOperatorObject` raises a loud 400 on unknown
+ * operators (caught by the QueryError handler in handleNotes). We only enforce
+ * that the param parses and is a non-null, non-array plain object; anything
+ * else is a malformed filter the engine can't consume.
+ *
+ * An empty object (`metadata={}`) carries no filter intent, so it's treated as
+ * absent: it sets no metadata filter AND doesn't trip the both-forms guard, so
+ * it composes harmlessly with bracket params.
+ *
+ * Returns `{ metadata?, error? }`. When `error` is set the caller returns it
+ * directly (already shaped as a 400 with `error` + `code`).
+ */
+function parseMetadataJsonAlias(url: URL): {
+  metadata?: Record<string, unknown>;
+  error?: Response;
+} {
+  const raw = parseQuery(url, "metadata");
+  if (raw === null) return {};
+
+  const malformed = (detail: string): Response =>
+    json(
+      {
+        error: `metadata query param must be a JSON object of the form {"field":{"op":value}} — ${detail}`,
+        code: "INVALID_QUERY",
+        error_type: "invalid_query",
+        field: "metadata",
+        hint: 'pass a JSON object, e.g. ?metadata={"status":{"eq":"active"}}',
+      },
+      400,
+    );
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    return { error: malformed(`failed to parse: ${e instanceof Error ? e.message : String(e)}`) };
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    const got = Array.isArray(parsed) ? "array" : parsed === null ? "null" : typeof parsed;
+    return { error: malformed(`got ${got}`) };
+  }
+  // Empty object → no filter intent. Return absent so it neither sets a
+  // metadata filter nor trips the both-forms guard in the handler.
+  if (Object.keys(parsed).length === 0) return {};
+  return { metadata: parsed as Record<string, unknown> };
+}
+
+/**
+ * Parse + validate the `?expand=` tag-expansion axis (vault tag `expand` axis).
+ * Shared by `parseNotesQueryOpts` (structured, subscribe, and search) so the
+ * enum lives in exactly one place and `GET /notes?search=...&expand=bogus` is
+ * validated identically to the structured path.
+ *
+ * Returns `{ expand }` (undefined when absent/empty → store defaults to
+ * "subtypes") or `{ error }` (a 400 Response) on an unknown value.
+ */
+export function parseExpandParam(url: URL): { expand?: TagExpandMode; error?: Response } {
+  const expandParam = parseQuery(url, "expand");
+  if (expandParam === null || expandParam === "") return {};
+  if (!(TAG_EXPAND_MODES as readonly string[]).includes(expandParam)) {
+    return {
+      error: json(
+        {
+          error: `invalid \`expand\` value "${expandParam}" — must be one of ${TAG_EXPAND_MODES.map((m) => `"${m}"`).join(", ")}. Omit for the default ("subtypes": parent_names descendants).`,
+          code: "INVALID_QUERY",
+          error_type: "invalid_query",
+          field: "expand",
+          got: expandParam,
+          hint: `pass one of ${TAG_EXPAND_MODES.map((m) => `"${m}"`).join(", ")}, or omit for the default`,
+        },
+        400,
+      ),
+    };
+  }
+  return { expand: expandParam as TagExpandMode };
+}
+
+/**
+ * Parse + validate `?search_mode=` (vault#551) — how `search` text is
+ * turned into an FTS5 query. "literal" (default, omit or pass explicitly):
+ * escape + phrase-quote so punctuation is literal content, not FTS5
+ * syntax. "advanced": raw FTS5 passthrough (pre-#551 behavior) for
+ * boolean/phrase/prefix operators. Same validation shape as
+ * `parseExpandParam` — loud 400 on an unknown value rather than a silent
+ * fallback to the default.
+ *
+ * Returns `{ mode }` (undefined when absent/empty → search branch defaults
+ * to "literal") or `{ error }` (a 400 Response) on an unknown value.
+ */
+function parseSearchModeParam(url: URL): { mode?: SearchMode; error?: Response } {
+  const raw = parseQuery(url, "search_mode");
+  if (raw === null || raw === "") return {};
+  if (!isValidSearchMode(raw)) {
+    return {
+      error: json(
+        {
+          error: `invalid \`search_mode\` value "${raw}" — must be one of ${SEARCH_MODES.map((m) => `"${m}"`).join(", ")}. Omit for the default ("literal").`,
+          code: "INVALID_QUERY",
+          error_type: "invalid_query",
+          field: "search_mode",
+          got: raw,
+          hint: `pass "literal" or "advanced", or omit for the default ("literal")`,
+        },
+        400,
+      ),
+    };
+  }
+  return { mode: raw };
+}
+
+/**
+ * Parse the shared notes-query parameters (tags / excludeTags / path /
+ * pathPrefix / extension / metadata filters / date filters / sort / paging /
+ * cursor) into a `QueryOpts`, plus flags for the query shapes that the live
+ * subscription endpoint must reject (`search`, `near`, `cursor`).
+ *
+ * Factored out of `handleNotesInner`'s structured-query branch so the
+ * `/subscribe` route evaluates the SAME predicate the snapshot query does —
+ * predicate parity by construction, not copy-paste. `handleNotesInner` keeps
+ * its own inline parsing for the single-note (`id`) branch; the full-text
+ * (`search`) branch now reuses this helper for every structured filter
+ * (vault#647) so `exclude_tag` / date / path / metadata compose with
+ * `?search=` instead of being silently dropped.
+ *
+ * Returns `{ error }` (a 400 Response) on a malformed metadata filter, exactly
+ * as the inline code did. `hasSearch` is surfaced from the raw `search` param
+ * (this helper does not itself build a search query — the caller routes that).
+ *
+ * `tagScope` (vault#675): out-of-scope `tag=` / `exclude_tag=` inputs are
+ * rewritten so they match nothing, exactly as a nonexistent tag would — see
+ * `scopeQueryTags`. Applied here so every branch that lowers a query string
+ * (structured, `search`, `semantic`, `aggregate`, `near`, cursor) is covered
+ * by one call, the same way this helper already gives subscribe/search
+ * predicate parity. Default `NO_TAG_SCOPE` → no-op, so the WS route's
+ * upgrade-time parse (which runs before the socket authenticates) is
+ * unchanged; `ws-server.ts` applies the scoping once auth is known.
+ */
+/**
+ * The `visible` predicate the vault#581 ambiguous-links surface consults for
+ * a TAG-SCOPED reader — `undefined` (and therefore a complete no-op) for an
+ * unscoped one. Identical shape and rule to the MCP door's `ambiguityVisible`
+ * (`src/mcp-tools.ts`) and to `nearTraversable`: look a CANDIDATE note's tags
+ * up by id and apply the same `noteWithinTagScope` test every other read path
+ * uses, so the two doors cannot drift on who counts as a visible candidate.
+ *
+ * Needed because `candidate_count` is derived vault-wide: without it a
+ * `work`-scoped reader learns from `candidate_count: 2` on its own `[[Dup]]`
+ * that a second `Dup` exists in a scope it cannot see.
+ *
+ * vault#239 reuses the SAME predicate for the BROKEN-links surface — "which
+ * of this target's candidates can the reader see" is one question, and the
+ * ambiguous (>=2 visible) and broken (0 visible) answers are two faces of it.
+ */
+function ambiguityVisibilityFor(
+  db: Database,
+  tagScope: TagScopeCtx,
+): ((noteId: string) => boolean) | undefined {
+  if (tagScope.raw === null) return undefined;
+  return (noteId: string) =>
+    noteWithinTagScope(
+      { id: noteId, tags: getNoteTags(db, noteId) } as Note,
+      tagScope.allowed,
+      tagScope.raw,
+    );
+}
+
+/**
+ * Re-decide a WRITE response's `ambiguous_link` warnings against the caller's
+ * own sub-vault. `create-note`/`update-note` echo per-note `warnings`, and an
+ * `ambiguous_link` entry carries a `candidate_count` derived VAULT-WIDE — so
+ * without this a `work`-scoped writer saving `[[Dup]]` learns from
+ * `candidate_count: 2` that a second `Dup` exists in a scope it cannot see.
+ * That is exactly the vault#707 read-side oracle, reachable through the write
+ * door. Same predicate ({@link ambiguityVisibilityFor}) and same core decision
+ * function as the read surfaces, so the doors cannot drift. Unscoped: the
+ * predicate is `undefined` and the array is returned unchanged.
+ */
+function narrowWriteWarnings(
+  db: Database,
+  warnings: QueryWarning[],
+  tagScope: TagScopeCtx,
+): QueryWarning[] {
+  const visible = ambiguityVisibilityFor(db, tagScope);
+  return visible ? narrowLinkWarningsForVisibility(db, warnings, visible) : warnings;
+}
+
+export function parseNotesQueryOpts(url: URL, tagScope: TagScopeCtx = NO_TAG_SCOPE): {
+  queryOpts?: QueryOpts;
+  hasSearch: boolean;
+  hasNear: boolean;
+  hasCursor: boolean;
+  error?: Response;
+} {
+  const hasSearch = parseQuery(url, "search") !== null && parseQuery(url, "search") !== "";
+  const hasNear = parseQuery(url, "near[note_id]") !== null;
+  const cursorParam = parseQuery(url, "cursor");
+  const hasCursor = cursorParam !== null && cursorParam !== "";
+
+  const tags = parseQueryList(url, "tag");
+  const bracket = parseMetaBrackets(url);
+  if (bracket.error) return { hasSearch, hasNear, hasCursor, error: bracket.error };
+  const metadataAlias = parseMetadataJsonAlias(url);
+  if (metadataAlias.error) return { hasSearch, hasNear, hasCursor, error: metadataAlias.error };
+  if (metadataAlias.metadata && bracket.metadata) {
+    return {
+      hasSearch,
+      hasNear,
+      hasCursor,
+      error: json(
+        {
+          error: "pass metadata filters as either the JSON `metadata=` param or bracket `meta[field][op]=` form, not both.",
+          code: "INVALID_QUERY",
+          error_type: "invalid_query",
+          hint: "pick one metadata-filter form: `metadata=` or `meta[field][op]=`, not both",
+        },
+        400,
+      ),
+    };
+  }
+
+  // Tag-expansion axis (vault tag `expand` axis). Optional; absent →
+  // "subtypes" (resolved at the store, kept undefined here so it stays
+  // byte-identical to pre-axis behavior). Unknown value → 400 via the shared
+  // helper (same shape the search branch uses).
+  const expandParsed = parseExpandParam(url);
+  if (expandParsed.error) return { hasSearch, hasNear, hasCursor, error: expandParsed.error };
+  const expand = expandParsed.expand;
+
+  // limit/offset validation (vault#550) — see parseNonNegativeIntParam.
+  const limitParsed = parseNonNegativeIntParam(url, "limit");
+  if (limitParsed.error) return { hasSearch, hasNear, hasCursor, error: limitParsed.error };
+  const offsetParsed = parseNonNegativeIntParam(url, "offset");
+  if (offsetParsed.error) return { hasSearch, hasNear, hasCursor, error: offsetParsed.error };
+
+  const queryOpts: QueryOpts = {
+    tags,
+    tagMatch: (parseQuery(url, "tag_match") as "all" | "any") ?? (tags && tags.length > 1 ? "any" : undefined),
+    expand,
+    excludeTags: parseQueryList(url, "exclude_tag"),
+    hasTags: parseBoolOrUndef(parseQuery(url, "has_tags")),
+    hasLinks: linkOps.sqlHasLinks(parseBoolOrUndef(parseQuery(url, "has_links")), tagScope.raw !== null),
+    // Presence filter on dangling outbound wikilinks/structured links
+    // (vault#555) — see core/src/types.ts QueryOpts.hasBrokenLinks.
+    // vault#239: for a TAG-SCOPED reader NEITHER polarity is safe to push
+    // into SQL — a note can be broken in that reader's sub-vault while
+    // carrying no `unresolved_wikilinks` row at all (its target's only
+    // candidates are invisible, so the row sits in `ambiguous_wikilinks`
+    // instead). Both are lifted here and re-decided per note by
+    // `narrowByVisibleBrokenness`. Identity for an unscoped reader.
+    hasBrokenLinks: sqlHasBrokenLinks(
+      parseBoolOrUndef(parseQuery(url, "has_broken_links")),
+      tagScope.raw !== null,
+    ),
+    // Presence filter on AMBIGUOUS outbound links — a target that matched ≥2
+    // notes (vault#581) — see core/src/types.ts QueryOpts.hasAmbiguousLinks.
+    // vault#581 auth review: for a TAG-SCOPED reader only the `true` polarity
+    // is safe to push into SQL (it's a superset of the right answer);
+    // `false` is lifted here and both are re-decided per note by
+    // `narrowByVisibleAmbiguity` on the reader's own visible sub-vault.
+    hasAmbiguousLinks: sqlHasAmbiguousLinks(
+      parseBoolOrUndef(parseQuery(url, "has_ambiguous_links")),
+      tagScope.raw !== null,
+    ),
+    path: parseQuery(url, "path") ?? undefined,
+    pathPrefix: parseQuery(url, "path_prefix") ?? undefined,
+    excludePathPrefix: parseQueryList(url, "exclude_path_prefix"),
+    extension: parseExtensionFilter(url),
+    metadata: bracket.metadata ?? metadataAlias.metadata,
+    // Write-attribution filters (vault#298) — symmetric with the MCP
+    // query-notes tool so a REST caller can ask "what did Mathilda write" /
+    // "what came in via the meeting-ingest surface" the same way.
+    createdBy: parseQuery(url, "created_by") ?? undefined,
+    lastUpdatedBy: parseQuery(url, "last_updated_by") ?? undefined,
+    createdVia: parseQuery(url, "created_via") ?? undefined,
+    lastUpdatedVia: parseQuery(url, "last_updated_via") ?? undefined,
+    // Date-range filtering on the query string is bracket-style only:
+    // `?meta[created_at][gte]=…&meta[created_at][lt]=…` (see
+    // `parseMetaBrackets`). The flat `date_field` / `date_from` / `date_to`
+    // params were removed in 0.6.4 (vault#288, breaking) — they are now
+    // ignored. The MCP `date_from` / `date_to` shorthand is a separate,
+    // supported convenience and is unaffected.
+    ...(bracket.dateFilter ? { dateFilter: bracket.dateFilter } : {}),
+    sort: (parseQuery(url, "sort") as "asc" | "desc") ?? undefined,
+    orderBy: parseQuery(url, "order_by") ?? undefined,
+    limit: limitParsed.value ?? 50,
+    offset: offsetParsed.value,
+    cursor: cursorParam ?? undefined,
+  };
+
+  return {
+    queryOpts: scopeQueryTags(queryOpts, tagScope.allowed, tagScope.raw),
+    hasSearch,
+    hasNear,
+    hasCursor,
+  };
+}
+
+/**
+ * Parse the `?aggregate[group_by]=…&aggregate[op]=…&aggregate[field]=…`
+ * aggregation params (bracket-style, consistent with `meta[field][op]=`
+ * above) into an `AggregateSpec`. Absent entirely (none of the three keys
+ * present) → `{}` — no aggregate intent, the caller falls through to a
+ * normal query. `op` is required when ANY of the three is present.
+ * `group_by` is required for `sum` and optional for `count` (vault#626 —
+ * `?aggregate[op]=count` alone is the filtered total). `field` is optional
+ * at the parser level (its requiredness depends on `op`, enforced by
+ * `aggregateNotes` itself). Value validity beyond shape (indexed field,
+ * numeric type, sum-requires-field) is ALSO enforced by `aggregateNotes` —
+ * same FIELD_NOT_INDEXED / INVALID_QUERY contract every other query
+ * surface uses.
+ *
+ * Returns `{ aggregate? }` or `{ error }` (a 400 Response) on a malformed
+ * shape (missing `op`, `sum` without `group_by`, or an unrecognized `op`).
+ */
+function parseAggregateParam(url: URL): { aggregate?: AggregateSpec; error?: Response } {
+  const groupByRaw = parseQuery(url, "aggregate[group_by]");
+  const op = parseQuery(url, "aggregate[op]");
+  const field = parseQuery(url, "aggregate[field]");
+  // Empty `aggregate[group_by]=` is omitted, not an empty grouping key.
+  const groupBy = groupByRaw === "" ? null : groupByRaw;
+  if (groupBy === null && op === null && field === null) return {};
+  if (op === null) {
+    return {
+      error: json(
+        {
+          error: `aggregate requires aggregate[op] ("count" or "sum"). group_by is optional for count (filtered total) and required for sum.`,
+          code: "INVALID_QUERY",
+          error_type: "invalid_query",
+          field: "aggregate",
+          hint: `pass ?aggregate[op]=count or ?aggregate[group_by]=<field|tag>&aggregate[op]=<count|sum>[&aggregate[field]=<numeric field>]`,
+        },
+        400,
+      ),
+    };
+  }
+  if (op !== "count" && op !== "sum") {
+    return {
+      error: json(
+        {
+          error: `invalid aggregate[op]: "${op}" — must be "count" or "sum"`,
+          code: "INVALID_QUERY",
+          error_type: "invalid_query",
+          field: "aggregate.op",
+          got: op,
+          hint: `pass "count" or "sum"`,
+        },
+        400,
+      ),
+    };
+  }
+  if (op === "sum" && groupBy === null) {
+    return {
+      error: json(
+        {
+          error: `aggregate[group_by] is required when aggregate[op] is "sum"`,
+          code: "INVALID_QUERY",
+          error_type: "invalid_query",
+          field: "aggregate.group_by",
+          hint: `pass ?aggregate[group_by]=<field|tag>&aggregate[op]=sum&aggregate[field]=<numeric field>`,
+        },
+        400,
+      ),
+    };
+  }
+  return {
+    aggregate: {
+      ...(groupBy !== null ? { group_by: groupBy } : {}),
+      op,
+      field: field ?? undefined,
+    },
+  };
+}
+
+/**
+ * Parse include_metadata query param.
+ * - absent/null → undefined (all metadata, default)
+ * - "true"/"1" → true (all metadata)
+ * - "false"/"0" → false (no metadata)
+ * - "summary,status" → ["summary", "status"] (field filter)
+ */
+function parseIncludeMetadata(url: URL): boolean | string[] | undefined {
+  const val = url.searchParams.get("include_metadata");
+  if (val === null) return undefined;
+  if (val === "true" || val === "1") return true;
+  if (val === "false" || val === "0") return false;
+  const fields = val.split(",").map((s) => s.trim()).filter(Boolean);
+  if (fields.length === 0) return undefined; // empty string → treat as default (all)
+  return fields;
+}
+
+/**
+ * Parse expand_links/expand_depth/expand_mode from query params, returning
+ * an (ExpandContext, depth) pair if expansion is requested, else null.
+ *
+ * `tagScope` (security review): when the caller is tag-scoped, an `isVisible`
+ * predicate is built from the SAME tag-scope allowlist the rest of the
+ * handler uses and injected into the expand context. The expander then
+ * leaves any `[[wikilink]]` whose target is out of scope UNRESOLVED — so
+ * `expand_links=true` can never inline out-of-scope note content (and the
+ * out-of-scope case is byte-indistinguishable from a missing target). For
+ * an unscoped token the predicate is `undefined` and expansion behaves
+ * exactly as before.
+ */
+function parseExpandParams(
+  url: URL,
+  db: any,
+  tagScope: TagScopeCtx = NO_TAG_SCOPE,
+): { ctx: ExpandContext; depth: number } | null {
+  if (!parseBool(parseQuery(url, "expand_links"), false)) return null;
+  const modeRaw = parseQuery(url, "expand_mode");
+  const mode: ExpandMode = modeRaw === "summary" ? "summary" : "full";
+  const depth = Math.max(
+    0,
+    Math.min(
+      parseInt10(parseQuery(url, "expand_depth")) ?? DEFAULT_EXPAND_DEPTH,
+      MAX_EXPAND_DEPTH,
+    ),
+  );
+  const isVisible = buildExpandVisibility(tagScope.allowed, tagScope.raw);
+  return { ctx: { db, mode, expanded: new Set(), ...(isVisible ? { isVisible } : {}) }, depth };
+}
+
+
+/**
+ * Resolve a note by ID or path. Tries ID first, then case-insensitive
+ * path. A trailing `.<ext>` matching the extension pattern is parsed
+ * as `(path, extension)` to disambiguate notes sharing a path
+ * differing only by extension (vault#330 S1). When the path is
+ * ambiguous and no extension hint is supplied, `getNoteByPath` throws
+ * `AmbiguousPathError` — REST handlers catch it and return 409.
+ *
+ * Title fallback (additive): when id AND path/extension both miss
+ * cleanly (no throw), tries an H1-title match via `getNoteByTitle` — the
+ * note whose first `# ` content line equals `idOrPath`, only when
+ * exactly one note has that title. Mirrors the MCP-layer `resolveNote`
+ * in core/src/mcp.ts and `[[wikilink]]` resolution (core/src/wikilinks.ts);
+ * exact id/path always wins first. Skipped (falls through to "not found")
+ * when `store.db` isn't available — the `Store` interface documents `db`
+ * as always present on the concrete class, but a handful of tests pass a
+ * minimal duck-typed stub (e.g. `handleViewNote`'s coverage in
+ * published.test.ts) that only implements `getNote`/`getNoteByPath`; this
+ * fallback must never turn that into a crash.
+ */
+async function resolveNote(store: Store, idOrPath: string): Promise<Note | null> {
+  const byId = await store.getNote(idOrPath);
+  if (byId) return byId;
+  const extMatch = idOrPath.match(/^(.*)\.([a-z0-9]{1,16})$/i);
+  if (extMatch) {
+    const explicit = await store.getNoteByPath(extMatch[1]!, extMatch[2]!);
+    if (explicit) return explicit;
+  }
+  const byPath = await store.getNoteByPath(idOrPath);
+  if (byPath) return byPath;
+  return store.db ? getNoteByTitle(store.db, idOrPath) : null;
+}
+
+async function requireNote(store: Store, idOrPath: string): Promise<Note> {
+  const note = await resolveNote(store, idOrPath);
+  if (!note) throw new NotFoundError(`Note not found: "${idOrPath}"`);
+  return note;
+}
+
+class NotFoundError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "NotFoundError";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Notes — GET/POST/PATCH/DELETE /api/notes[/:idOrPath]
+// ---------------------------------------------------------------------------
+
+/**
+ * Convert a thrown `AmbiguousPathError` (vault#330 S1) into a structured
+ * 409 JSON response. Shared by every handler that calls `resolveNote`
+ * with a user-supplied path — handleNotes, handleFindPath,
+ * handleViewNote. Returns null when the error isn't an
+ * AmbiguousPathError so the caller can re-throw / fall through.
+ */
+function ambiguousPathResponse(e: any): Response | null {
+  if (!e || e.code !== "AMBIGUOUS_PATH") return null;
+  return json(
+    {
+      error_type: "ambiguous_path",
+      error: "ambiguous_path",
+      path: e.path,
+      candidates: e.candidates,
+      message: e.message,
+    },
+    409,
+  );
+}
+
+/** vault#739: 400 for an `if_updated_at` that isn't an ISO timestamp (was a 500). */
+function invalidIfUpdatedAtResponse(): Response {
+  return json(
+    {
+      error: "if_updated_at must be an ISO-8601 timestamp string",
+      error_type: "invalid_request",
+      field: "if_updated_at",
+      hint: IF_UPDATED_AT_HINT,
+    },
+    400,
+  );
+}
+
+export async function handleNotes(
+  req: Request,
+  store: Store,
+  subpath: string,
+  vault?: string,
+  tagScope: TagScopeCtx = NO_TAG_SCOPE,
+  writeCtx: WriteCtx = NO_WRITE_CTX,
+): Promise<Response> {
+  try {
+    return await handleNotesInner(req, store, subpath, vault, tagScope, writeCtx);
+  } catch (e: any) {
+    const ambig = ambiguousPathResponse(e);
+    if (ambig) return ambig;
+    throw e;
+  }
+}
+
+async function handleNotesInner(
+  req: Request,
+  store: Store,
+  subpath: string,
+  vault?: string,
+  tagScope: TagScopeCtx = NO_TAG_SCOPE,
+  writeCtx: WriteCtx = NO_WRITE_CTX,
+): Promise<Response> {
+  const url = new URL(req.url);
+  const method = req.method;
+  const db = store.db;
+
+  // ---- Collection routes (no ID in path) ----
+  if (subpath === "") {
+    // GET /notes — query (all filters as query params)
+    if (method === "GET") {
+      const id = parseQuery(url, "id");
+      const search = parseQuery(url, "search");
+
+      // Single note by id/path
+      if (id) {
+        const note = await resolveNote(store, id);
+        if (!note) return json({ error: "Note not found", error_type: "not_found", id }, 404);
+        // Tag-scope: a token can't see what its allowlist excludes. Surface
+        // as 404 (not 403) — the existence of the note is itself information
+        // we shouldn't leak across the scope boundary.
+        if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
+          return json({ error: "Note not found", error_type: "not_found", id }, 404);
+        }
+        const includeContent = parseBool(parseQuery(url, "include_content"), true);
+        const contentRange = parseContentRangeQuery(url, includeContent);
+        if (contentRange.error) return contentRange.error;
+        let result: any = includeContent ? { ...note } : toNoteIndex(note);
+        // Tag-scope (vault#568): the note is visible via at least one
+        // in-scope tag, but its `.tags` array would otherwise name every
+        // out-of-scope co-tag it carries. No-op unscoped.
+        result = scrubNoteTagsByScope(result, tagScope.allowed, tagScope.raw);
+        const expand = parseExpandParams(url, db, tagScope);
+        if (expand && includeContent && typeof result.content === "string") {
+          expand.ctx.expanded.add(note.id);
+          result.content = expandContent(result.content, expand.ctx, expand.depth);
+        }
+        // Content range applies to the FINAL returned content (post-
+        // expansion) — the window the client pages through is the same
+        // document it would have received unpaged.
+        if (contentRange.range && includeContent) applyContentRange(result, contentRange.range);
+        result = filterMetadata(result, parseIncludeMetadata(url));
+        if (parseBool(parseQuery(url, "include_links"), false)) {
+          // Tag-scope: drop links whose neighbor is out of scope so the
+          // hydrated sourceNote/targetNote summaries can't leak out-of-scope
+          // ids/paths/tags. No-op for unscoped tokens.
+          result.links = filterHydratedLinksByTagScope(
+            linkOps.getLinksHydrated(db, note.id),
+            tagScope.allowed,
+            tagScope.raw,
+          );
+        }
+        if (parseBool(parseQuery(url, "include_broken_links"), false)) {
+          // No tag-scope filtering needed (unlike include_links above): a
+          // broken-link `target` never resolved to a note, so there's no
+          // neighbor identity/content to leak — just the string this note's
+          // own [[wikilink]]/structured link already named. The predicate is
+          // not a filter but an ADDITION (vault#239): it makes a reference
+          // whose only candidates are invisible read as broken here, instead
+          // of only once the last of them is deleted.
+          result.broken_links = getUnresolvedLinksForNote(db, note.id, ambiguityVisibilityFor(db, tagScope));
+        }
+        if (parseBool(parseQuery(url, "include_ambiguous_links"), false)) {
+          // Same no-tag-scope-needed reasoning as broken_links above: an
+          // ambiguous `target` never became a link, so no neighbor identity
+          // is exposed — only the string this note's own reference named.
+          result.ambiguous_links = getAmbiguousLinksForNote(db, note.id, ambiguityVisibilityFor(db, tagScope));
+        }
+        if (parseBool(parseQuery(url, "include_attachments"), false)) {
+          result.attachments = await store.getAttachments(note.id);
+        }
+        // linkCount injected after filterMetadata on purpose — same as
+        // links/attachments above; filterMetadata only touches `metadata`.
+        if (parseBool(parseQuery(url, "include_link_count"), false)) {
+          result.linkCount = linkOps.getLinkCounts(db, [note.id], parseLinkCountDirection(url), ambiguityVisibilityFor(db, tagScope)).get(note.id) ?? 0;
+        }
+        return json(result);
+      }
+
+      // Semantic search (EXPERIMENTAL — semantic search MVP). Mirrors the
+      // MCP `query-notes` tool's `near_text`/`semantic` params — see
+      // `core/src/mcp.ts`'s `query-notes` handler for the identical
+      // validation/shape this branch reproduces over REST. Checked BEFORE
+      // the search/cursor exclusivity check below so `semantic=true`
+      // combined with `search=` or `cursor=` gets its OWN error naming
+      // `semantic`, not silently routed into the search branch.
+      const nearText = parseQuery(url, "near_text");
+      const semantic = parseBool(parseQuery(url, "semantic"), false);
+      if (semantic) {
+        if (search) {
+          return json(
+            {
+              error: "semantic is incompatible with full-text search — pick one (semantic ranks by meaning via near_text; search ranks by keyword).",
+              code: "INVALID_QUERY",
+              error_type: "invalid_query",
+              field: "semantic",
+              hint: "drop `search` when using `semantic`, or drop `semantic`/`near_text` to use keyword search",
+            },
+            400,
+          );
+        }
+        const semanticAggregate = parseAggregateParam(url);
+        if (semanticAggregate.error) return semanticAggregate.error;
+        if (semanticAggregate.aggregate) {
+          return json(
+            {
+              error: "aggregate is incompatible with semantic search — a rollup returns groups, not ranked notes.",
+              code: "INVALID_QUERY",
+              error_type: "invalid_query",
+              field: "aggregate",
+              hint: "drop `semantic`/`near_text` when using `aggregate`",
+            },
+            400,
+          );
+        }
+        if (parseQuery(url, "cursor") !== null) {
+          return json(
+            {
+              error: "cursor is incompatible with semantic search — ranking is by similarity, not a stable row order to page through.",
+              code: "INVALID_QUERY",
+              error_type: "invalid_query",
+              field: "semantic",
+              hint: "drop `cursor` when using `semantic`",
+            },
+            400,
+          );
+        }
+        if (!nearText || !nearText.trim()) {
+          return json(
+            {
+              error: "semantic=true requires `near_text` — the free text to rank notes by meaning.",
+              code: "INVALID_QUERY",
+              error_type: "invalid_query",
+              field: "near_text",
+              hint: "pass ?near_text=...&semantic=true",
+            },
+            400,
+          );
+        }
+        const parsed = parseNotesQueryOpts(url, tagScope);
+        if (parsed.error) return parsed.error;
+        try {
+          const semanticResult = await store.semanticSearch(nearText, { ...parsed.queryOpts, cursor: undefined });
+          const semanticWarnings: QueryWarning[] = [];
+          if (semanticResult.pendingCount > 0) {
+            semanticWarnings.push(
+              embeddingsPendingWarning(semanticResult.pendingCount, semanticResult.totalCandidates),
+            );
+          }
+          let filtered = filterNotesByTagScope(semanticResult.notes, tagScope.allowed, tagScope.raw);
+          // Apply the same scoped presence filters as the structured list.
+          filtered = narrowByVisibleAmbiguity(
+            db,
+            filtered,
+            parseBoolOrUndef(parseQuery(url, "has_ambiguous_links")),
+            ambiguityVisibilityFor(db, tagScope),
+          );
+          filtered = narrowByVisibleBrokenness(
+            db,
+            filtered,
+            parseBoolOrUndef(parseQuery(url, "has_broken_links")),
+            ambiguityVisibilityFor(db, tagScope),
+          );
+          filtered = linkOps.narrowByVisibleLinks(
+            db,
+            filtered,
+            parseBoolOrUndef(parseQuery(url, "has_links")),
+            ambiguityVisibilityFor(db, tagScope),
+          );
+          const includeContent = parseBool(parseQuery(url, "include_content"), false);
+          const contentRange = parseContentRangeQuery(url, includeContent);
+          if (contentRange.error) return contentRange.error;
+          const inclMeta = parseIncludeMetadata(url);
+          let output: any[] = includeContent ? filtered.map((n) => ({ ...n })) : filtered.map(toNoteIndex);
+          // Tag-scope (vault#568): filter each surviving note's own `.tags`
+          // to the in-scope subset — being visible via one tag must not
+          // disclose the NAMES of its out-of-scope co-tags. No-op unscoped.
+          output = scrubNotesTagsByScope(output, tagScope.allowed, tagScope.raw);
+          const expand = parseExpandParams(url, db, tagScope);
+          if (expand && includeContent) {
+            for (const n of output) expand.ctx.expanded.add(n.id);
+            for (const n of output) {
+              if (typeof n.content === "string") {
+                n.content = expandContent(n.content, expand.ctx, expand.depth);
+              }
+            }
+          }
+          if (contentRange.range && includeContent) {
+            for (const n of output) applyContentRange(n, contentRange.range);
+          }
+          if (inclMeta !== undefined && inclMeta !== true) {
+            output = output.map((n: any) => filterMetadata(n, inclMeta));
+          }
+          if (parseBool(parseQuery(url, "include_link_count"), false)) {
+            const counts = linkOps.getLinkCounts(db, output.map((n: any) => n.id), parseLinkCountDirection(url), ambiguityVisibilityFor(db, tagScope));
+            for (const n of output) n.linkCount = counts.get(n.id) ?? 0;
+          }
+          return jsonWithWarnings(output, semanticWarnings);
+        } catch (e: any) {
+          if (e && e.name === "QueryError") {
+            // `semantic_unavailable` (no/not-ready provider) is a capability
+            // gap, not a malformed request — 503, distinct from every other
+            // QueryError's 400. Never a silent fallback to keyword search.
+            const status = e.error_type === "semantic_unavailable" ? 503 : 400;
+            return json(
+              {
+                error: e.message,
+                code: e.code ?? "INVALID_QUERY",
+                error_type: e.error_type ?? "invalid_query",
+                ...(e.field !== undefined ? { field: e.field } : {}),
+                ...(e.got !== undefined ? { got: e.got } : {}),
+                ...(e.hint !== undefined ? { hint: e.hint } : {}),
+              },
+              status,
+            );
+          }
+          throw e;
+        }
+      }
+      // `near_text` without `semantic: true` is inert — same ignored_param
+      // convention as `search_mode` without `search` (below). Rather than a
+      // whole extra branch, this warning rides whichever normal path (search
+      // or structured query) actually runs — appended just before each
+      // branch's own `jsonWithWarnings` call would otherwise return.
+      const nearTextIgnored: QueryWarning[] = nearText !== null
+        ? [ignoredParamWarning("near_text", "`semantic=true` is required to activate near_text — pass both together")]
+        : [];
+
+      // Cursor + full-text search is mutually exclusive (vault#313 reviewer).
+      // FTS owns its own ordering (relevance, not updated_at), so a cursor
+      // would skip rows. MCP rejects this combo at `core/src/mcp.ts`; REST
+      // would otherwise route into the `if (search)` branch below and
+      // silently drop the cursor. Reject here for surface parity. Presence
+      // check (`!== null`), not truthiness (vault#550) — a bootstrap
+      // `?cursor=` attempt against a search query is still cursor intent
+      // and must still be rejected, not silently treated as "no cursor."
+      if (search && parseQuery(url, "cursor") !== null) {
+        return json(
+          {
+            error: "cursor is incompatible with full-text search — FTS has its own ordering. Use date_filter on updated_at for since-last-checked search.",
+            code: "INVALID_QUERY",
+            error_type: "invalid_query",
+            field: "cursor",
+            hint: "drop `cursor` when using `search`, or drop `search` and use `meta[updated_at][gte]=…` for since-last-checked polling",
+          },
+          400,
+        );
+      }
+
+      // vault#626 — `search=` used to silently ignore `aggregate[...]` and
+      // return note rows. MCP already rejects the combo; REST must too.
+      if (search) {
+        const searchAggregate = parseAggregateParam(url);
+        if (searchAggregate.error) return searchAggregate.error;
+        if (searchAggregate.aggregate) {
+          return json(
+            {
+              error: "aggregate is incompatible with full-text search — pick one.",
+              code: "INVALID_QUERY",
+              error_type: "invalid_query",
+              field: "aggregate",
+              hint: "drop `search` when using `aggregate`",
+            },
+            400,
+          );
+        }
+      }
+
+      // Full-text search
+      if (search) {
+        // vault#647: parse the structured filter grammar here too. Pre-fix
+        // this branch bypassed `parseNotesQueryOpts` and only forwarded
+        // tag/limit/expand/mode/sort, so `exclude_tag` and date/path/metadata
+        // were silently dropped — a well-formed result set answering a
+        // different question. `search_mode` is still parsed here because it
+        // is search-specific (the helper does not know about it).
+        const parsed = parseNotesQueryOpts(url, tagScope);
+        if (parsed.error) return parsed.error;
+        const searchModeParsed = parseSearchModeParam(url);
+        if (searchModeParsed.error) return searchModeParsed.error;
+        const mode: SearchMode = searchModeParsed.mode ?? "literal";
+
+        const searchWarnings: QueryWarning[] = [...nearTextIgnored];
+        // `offset` under full-text search (vault contracts-brief V1.2):
+        // `searchNotes` has no offset parameter at all — FTS5 ranks by
+        // relevance, not a stable row order, so paging by offset over it
+        // is unsound. Rather than silently return page 1 with no signal
+        // (the pre-existing behavior — `?search=x&offset=50` == `?search=x`),
+        // flag it. Presence check (not truthiness) so `offset=0` — a caller
+        // being explicit about "start" — still warns; it's equally
+        // meaningless here. The structured-query path (below) has real
+        // offset support and is unaffected.
+        if (parseQuery(url, "offset") !== null) {
+          searchWarnings.push(
+            ignoredParamWarning(
+              "offset",
+              "full-text search has no stable row order to offset into — results are always page 1, ranked by relevance",
+            ),
+          );
+        }
+        let rawResults: Note[];
+        // "Only whitespace/quotes" (vault#551 edge case) — short-circuit
+        // BEFORE ever calling FTS5 rather than risk a syntax error (or a
+        // meaningless always-empty query) on a degenerate escaped phrase.
+        if (mode === "literal" && buildLiteralSearchQuery(search).isEmpty) {
+          rawResults = [];
+          searchWarnings.push(emptySearchWarning());
+        } else {
+          try {
+            // A malformed `search_mode: "advanced"` query throws here
+            // (structured `invalid_search_syntax`, vault#551) instead of
+            // the pre-#551 silent `[]` — caught below and formatted the
+            // same way the structured-query path formats a `QueryError`.
+            rawResults = await store.searchNotes(search, {
+              ...parsed.queryOpts,
+              mode,
+              // Search has no offset/cursor/orderBy contract (offset is
+              // warned above; cursor is rejected before this branch).
+              offset: undefined,
+              cursor: undefined,
+              orderBy: undefined,
+            });
+          } catch (e: any) {
+            if (e && e.name === "QueryError") {
+              return json(
+                {
+                  error: e.message,
+                  code: e.code ?? "INVALID_QUERY",
+                  // vault#554: default error_type to "invalid_query" for the
+                  // long-standing QueryError call sites that predate the
+                  // vault#550/#551 convention (FIELD_NOT_INDEXED,
+                  // UNKNOWN_OPERATOR, ...) — every QueryError now carries a
+                  // stable error_type, not just the newer ones that set it.
+                  error_type: e.error_type ?? "invalid_query",
+                  ...(e.field !== undefined ? { field: e.field } : {}),
+                  ...(e.got !== undefined ? { got: e.got } : {}),
+                  ...(e.hint !== undefined ? { hint: e.hint } : {}),
+                },
+                400,
+              );
+            }
+            throw e;
+          }
+          // Zero-result `did_you_mean` (vault#551 WS2B) — cheap (a bounded
+          // FTS5-vocabulary scan) and ONLY computed on the already-rare
+          // empty-result path, mirroring `unknown_tag`'s did_you_mean.
+          // Gated on `tagScope.allowed === null` (unscoped) — same stance
+          // as `collectUnknownTagWarnings` below: the FTS5 vocabulary spans
+          // the whole vault regardless of scope, so surfacing a suggestion
+          // to a scoped token would leak out-of-scope content's existence
+          // across the scope boundary. Unlike the MCP path, REST enforces
+          // tag-scope inline (no post-hoc wrapper to strip it for us), so
+          // the gate has to live here explicitly.
+          if (rawResults.length === 0 && tagScope.allowed === null) {
+            const suggestion = computeSearchDidYouMean(db, search);
+            if (suggestion) {
+              searchWarnings.push(searchDidYouMeanWarning(search, suggestion));
+            }
+          }
+        }
+        // Tag-scope: drop any result the token isn't permitted to see. Filter
+        // happens after the store query so an empty post-filter list still
+        // returns 200 [] (consistent with "no matches"), not 403.
+        let results = filterNotesByTagScope(rawResults, tagScope.allowed, tagScope.raw);
+        // Apply the same scoped presence filters as the structured list.
+        results = narrowByVisibleAmbiguity(
+          db,
+          results,
+          parseBoolOrUndef(parseQuery(url, "has_ambiguous_links")),
+          ambiguityVisibilityFor(db, tagScope),
+        );
+        results = narrowByVisibleBrokenness(
+          db,
+          results,
+          parseBoolOrUndef(parseQuery(url, "has_broken_links")),
+          ambiguityVisibilityFor(db, tagScope),
+        );
+        results = linkOps.narrowByVisibleLinks(
+          db,
+          results,
+          parseBoolOrUndef(parseQuery(url, "has_links")),
+          ambiguityVisibilityFor(db, tagScope),
+        );
+        const includeContent = parseBool(parseQuery(url, "include_content"), false);
+        const contentRange = parseContentRangeQuery(url, includeContent);
+        if (contentRange.error) return contentRange.error;
+        const inclMeta = parseIncludeMetadata(url);
+        let output: any[] = includeContent ? results.map((n) => ({ ...n })) : results.map(toNoteIndex);
+        // Tag-scope (vault#568): filter each surviving note's own `.tags` to
+        // the in-scope subset — see the structured-query branch below.
+        output = scrubNotesTagsByScope(output, tagScope.allowed, tagScope.raw);
+        const expand = parseExpandParams(url, db, tagScope);
+        if (expand && includeContent) {
+          for (const n of output) expand.ctx.expanded.add(n.id);
+          for (const n of output) {
+            if (typeof n.content === "string") {
+              n.content = expandContent(n.content, expand.ctx, expand.depth);
+            }
+          }
+        }
+        // Content range — per-note, post-expansion (see core/src/content-range.ts).
+        if (contentRange.range && includeContent) {
+          for (const n of output) applyContentRange(n, contentRange.range);
+        }
+        if (inclMeta !== undefined && inclMeta !== true) {
+          output = output.map((n: any) => filterMetadata(n, inclMeta));
+        }
+        // Opt-in link degree (vault feedback #4) — one batch count, same as
+        // the structured-query path. Runs AFTER filterMetadata on purpose
+        // (filterMetadata only touches `metadata`, so linkCount survives —
+        // don't casually swap the order).
+        if (parseBool(parseQuery(url, "include_link_count"), false)) {
+          const counts = linkOps.getLinkCounts(
+            db,
+            output.map((n: any) => n.id),
+            parseLinkCountDirection(url),
+            ambiguityVisibilityFor(db, tagScope),
+          );
+          for (const n of output) n.linkCount = counts.get(n.id) ?? 0;
+        }
+        return jsonWithWarnings(output, searchWarnings);
+      }
+
+      // Structured query
+      //
+      // Date-range filtering on the query string uses one syntax:
+      //
+      //   - **Bracket-style** (canonical, vault#285 friction point 1.3):
+      //     `?meta[field][op]=value` / `?meta[created_at][gte]=…`. Exposes
+      //     the full engine `metadata` filter (eq/ne/gt/gte/lt/lte/in/
+      //     not_in/exists) and the dateFilter bridge through one consistent
+      //     shape. See `parseMetaBrackets` for the grammar.
+      //
+      // The flat date params (`?date_field=created_at&date_from=…&date_to=…`
+      // and the legacy bare `?date_from=…&date_to=…`) were REMOVED in 0.6.4
+      // (vault#288, breaking change). They are now silently ignored — a
+      // request that passes only flat date params comes back unfiltered.
+      // Bracket-style is functionally complete (full operator set), so no
+      // capability was lost. Migrate `date_field=created_at&date_from=X` to
+      // `meta[created_at][gte]=X` (and `date_to=Y` to `meta[created_at][lt]=Y`).
+      //
+      // Surface asymmetry: REST flattens to a query string; MCP takes a
+      // nested `date_filter: { field, from, to }` object directly (plus a
+      // top-level `date_from` / `date_to` shorthand, which is unaffected by
+      // this removal). Both lower to the same store-level `dateFilter` shape.
+      // Structured-query parsing is shared with the live `/subscribe` route
+      // (see `parseNotesQueryOpts`) so both endpoints lower an identical query
+      // string to the same `QueryOpts` — predicate parity by construction.
+      const parsed = parseNotesQueryOpts(url, tagScope);
+      if (parsed.error) return parsed.error;
+      const queryOpts = parsed.queryOpts!;
+      const cursorParam = parseQuery(url, "cursor");
+      // Cursor mode is keyed on PRESENCE (`!== null`), not truthiness
+      // (vault#550 bootstrap fix). `?cursor=` (present, empty) is the
+      // bootstrap call — "I want to paginate, no watermark yet" — and must
+      // still engage the `{notes, next_cursor}` envelope. Before this fix
+      // `if (cursorParam)` treated an empty string exactly like an absent
+      // param, so the FIRST call could never obtain a cursor even though
+      // `core/src/mcp.ts` documented that flow — the cursor bootstrap gap
+      // this wave closes. Omitting `cursor` entirely (`cursorParam ===
+      // null`) is the only way to opt OUT — that keeps today's bare-array
+      // compat shape.
+      const cursorMode = cursorParam !== null;
+      // Opaque cursor for "since last checked" agent loops (vault#313) is
+      // mutually exclusive with the `near` graph-neighborhood scope (rebuilding
+      // the neighborhood per page isn't stable).
+      const nearNoteIdEarly = parseQuery(url, "near[note_id]");
+      if (cursorMode && nearNoteIdEarly) {
+        return json(
+          {
+            error: "cursor is incompatible with near (graph neighborhood). Resolve the neighborhood first, then iterate with cursor over the resulting note set.",
+            code: "INVALID_QUERY",
+            error_type: "invalid_query",
+            field: "cursor",
+            hint: "resolve the `near` neighborhood first, then paginate the resulting note set with `cursor`",
+          },
+          400,
+        );
+      }
+
+      // Resolve the neighborhood before ordering and pagination.
+      const nearNoteId = parseQuery(url, "near[note_id]");
+      if (!nearNoteId) {
+        const orphan = ["near[then][relationship]", "near[then][direction]", "near[then][depth]"].find((k) => parseQuery(url, k) !== null);
+        if (orphan) {
+          return json({
+            error: `${orphan} requires near[note_id] — the second hop needs a first-hop anchor.`,
+            code: "INVALID_QUERY",
+            error_type: "invalid_query",
+            field: "near",
+            hint: "pass near[note_id]=<anchor> or drop near[then][...]",
+          }, 400);
+        }
+      }
+      if (nearNoteId) {
+        const anchor = await resolveNote(store, nearNoteId);
+        if (!anchor) return json({ error: "Anchor note not found", error_type: "not_found", note_id: nearNoteId }, 404);
+        // Tag-scope: anchor must itself be visible to this token.
+        if (!noteWithinTagScope(anchor, tagScope.allowed, tagScope.raw)) {
+          return json({ error: "Anchor note not found", error_type: "not_found", note_id: nearNoteId }, 404);
+        }
+        const nearSpec: linkOps.NearSpec = {
+          depth: parseInt10(parseQuery(url, "near[depth]")) ?? undefined,
+          relationship: parseQuery(url, "near[relationship]") ?? undefined,
+          direction: (parseQuery(url, "near[direction]") ?? "both") as linkOps.NearSpec["direction"],
+        };
+        const thenRel = parseQuery(url, "near[then][relationship]");
+        const thenDir = parseQuery(url, "near[then][direction]");
+        const thenDepth = parseInt10(parseQuery(url, "near[then][depth]"));
+        if (thenRel !== null || thenDir !== null || thenDepth != null) {
+          nearSpec.then = {
+            relationship: thenRel ?? undefined,
+            direction: (thenDir ?? "both") as linkOps.NearSpec["direction"],
+            depth: thenDepth ?? undefined,
+          };
+        }
+        const nearErr = linkOps.validateNearSpec(nearSpec);
+        if (nearErr) return json({ error: nearErr, code: "INVALID_QUERY", error_type: "invalid_query", field: "near" }, 400);
+        // Tag-scope policy for `near[]` (vault#439 — hop-guard, symmetric with
+        // find-path): for a tag-scoped token the BFS refuses to traverse
+        // THROUGH out-of-scope notes — scope is a wall, not a sieve. So a token
+        // scoped to ["work"] can't reach an in-scope note at depth 2 via a
+        // #personal intermediary at depth 1; that note is simply unreachable.
+        // The `filterNotesByTagScope` pass below still runs (defense in depth),
+        // but the wall makes it redundant for the `near[]` result set.
+        // Unscoped tokens (`tagScope.raw === null`) install no predicate → the
+        // FULL graph is walked exactly as before, behavior unchanged.
+        const isTraversable = tagScope.raw
+          ? (id: string) =>
+              noteWithinTagScope(
+                { id, tags: getNoteTags(db, id) } as Note,
+                tagScope.allowed,
+                tagScope.raw,
+              )
+          : undefined;
+        queryOpts.ids = [...linkOps.resolveNearScope(db, anchor.id, nearSpec, isTraversable)];
+      }
+
+      // Aggregation / rollup mode (top new-feature ask from a UX round).
+      // Mutually exclusive with cursor/search/semantic — a rollup returns one
+      // row per group, not a paginated note list — so reject those
+      // combos loudly before touching the DB. It composes with `near`: the
+      // neighborhood id set scopes the rollup (vault#779). After the rollup we
+      // short-circuit: none of the normal-query output machinery below
+      // (expand, include_links, metadata filtering, ...) applies to rollup rows.
+      const aggregateParsed = parseAggregateParam(url);
+      if (aggregateParsed.error) return aggregateParsed.error;
+      if (aggregateParsed.aggregate) {
+        if (cursorMode) {
+          return json(
+            {
+              error: "aggregate is incompatible with cursor pagination — a rollup has no watermark to page through.",
+              code: "INVALID_QUERY",
+              error_type: "invalid_query",
+              field: "aggregate",
+              hint: "drop `cursor` when using `aggregate`",
+            },
+            400,
+          );
+        }
+        try {
+          let rows;
+          if (tagScope.raw === null) {
+            rows = await store.aggregateNotes({ ...queryOpts, aggregate: aggregateParsed.aggregate });
+          } else {
+            // Tag-scoped: filter to visible notes FIRST — fetch every note
+            // the OTHER filters match (unpaginated, same `limit: 1000000`
+            // "get everything" convention core's `syncAllWikilinks` uses),
+            // narrow via the SAME `filterNotesByTagScope` every other read
+            // path applies, THEN aggregate over just that visible id set
+            // (reusing the `ids` filter `near` already pushes into SQL).
+            const allMatches = await store.queryNotes({ ...queryOpts, limit: 1000000, offset: 0 });
+            let visible = filterNotesByTagScope(allMatches, tagScope.allowed, tagScope.raw);
+            // vault#581 auth review: a rollup over `has_ambiguous_links` is
+            // the same oracle as the note-level filter — a non-zero count
+            // still reveals the collision — so re-decide each note's
+            // ambiguity on the visible sub-vault before aggregating.
+            visible = narrowByVisibleAmbiguity(
+              db,
+              visible,
+              parseBoolOrUndef(parseQuery(url, "has_ambiguous_links")),
+              ambiguityVisibilityFor(db, tagScope),
+            );
+            // vault#239: the `has_broken_links` rollup is the same oracle for
+            // the same reason — re-decide brokenness on the sub-vault too.
+            visible = narrowByVisibleBrokenness(
+              db,
+              visible,
+              parseBoolOrUndef(parseQuery(url, "has_broken_links")),
+              ambiguityVisibilityFor(db, tagScope),
+            );
+            visible = linkOps.narrowByVisibleLinks(
+              db,
+              visible,
+              parseBoolOrUndef(parseQuery(url, "has_links")),
+              ambiguityVisibilityFor(db, tagScope),
+            );
+            // Always run the rollup, even on an empty visible set: ungrouped
+            // count (vault#626) must return `[{group:null,value:0}]`, not `[]`.
+            rows = await store.aggregateNotes({ ids: visible.map((n) => n.id), aggregate: aggregateParsed.aggregate });
+            // That note-level narrowing isn't sufficient on its own under
+            // `group_by: "tag"`: a note can be in scope via one tag while
+            // ALSO carrying an out-of-scope co-tag, and a tag rollup's
+            // `group` values ARE tag names — the co-tag would otherwise
+            // surface directly as a group. Scrub group NAMES too, mirroring
+            // the MCP wrapper's identical fix (src/mcp-tools.ts).
+            if (aggregateParsed.aggregate.group_by === "tag") {
+              rows = rows.filter(
+                (r: any) => typeof r?.group === "string" && tagVisibleInScope(r.group, tagScope.allowed, tagScope.raw),
+              );
+            }
+          }
+          return json(rows);
+        } catch (e: any) {
+          if (e && e.name === "QueryError") {
+            return json(
+              {
+                error: e.message,
+                code: e.code ?? "INVALID_QUERY",
+                error_type: e.error_type ?? "invalid_query",
+                ...(e.field !== undefined ? { field: e.field } : {}),
+                ...(e.got !== undefined ? { got: e.got } : {}),
+                ...(e.hint !== undefined ? { hint: e.hint } : {}),
+              },
+              400,
+            );
+          }
+          throw e;
+        }
+      }
+
+      // Warnings channel (vault#550). `unknown_tag` stays structured-query
+      // only (skipped entirely for a tag-scoped session:
+      // `collectUnknownTagWarnings` resolves `did_you_mean` against the
+      // FULL vault-wide tag catalog, which would leak an out-of-scope tag's
+      // existence/name across the scope boundary — the same "no leak"
+      // stance this codebase takes everywhere else
+      // (docs/contracts/tag-scoped-tokens.md)). `removed_param` warnings
+      // carry no tag information and fire regardless of scope. `search_mode`
+      // without `search` (vault#551) also carries no tag information — this
+      // IS the structured-query path precisely because `search` was absent
+      // or empty, so a `search_mode` param here is always a no-op.
+      const queryWarnings: QueryWarning[] = [
+        ...nearTextIgnored,
+        ...collectRemovedParamWarnings(url),
+        ...(parseQuery(url, "search_mode")
+          ? [
+              ignoredParamWarning(
+                "search_mode",
+                "no `search` was provided — search_mode only affects full-text search query parsing",
+              ),
+            ]
+          : []),
+        ...(tagScope.allowed === null
+          ? collectUnknownTagWarnings(db, queryOpts.tags, queryOpts.expand, store.getTagHierarchy())
+          : []),
+      ];
+      let results: Note[];
+      let nextCursor: string | null = null;
+      try {
+        if (cursorMode) {
+          const page = await store.queryNotesPaged(queryOpts);
+          results = page.notes;
+          nextCursor = page.next_cursor;
+        } else {
+          results = await store.queryNotes(queryOpts);
+        }
+      } catch (e: any) {
+        // QueryError (non-indexed order_by, unknown operator, ...) surfaces
+        // here. Duck-type on `name` + `code` — core is a separate module, so
+        // `instanceof` is fragile across bundling boundaries. The newer
+        // vault#550 call sites (limit/offset/date validation in
+        // core/src/notes.ts) additionally set `field`/`got`/`hint` — merged
+        // in when present. vault#554: every QueryError now carries a stable
+        // `error_type` (defaults to "invalid_query" for the long-standing
+        // call sites that predate that convention), not just the newer ones.
+        if (e && e.name === "QueryError") {
+          return json(
+            {
+              error: e.message,
+              code: e.code ?? "INVALID_QUERY",
+              error_type: e.error_type ?? "invalid_query",
+              ...(e.field !== undefined ? { field: e.field } : {}),
+              ...(e.got !== undefined ? { got: e.got } : {}),
+              ...(e.hint !== undefined ? { hint: e.hint } : {}),
+            },
+            400,
+          );
+        }
+        // CursorError carries a structured code (cursor_invalid /
+        // cursor_query_mismatch) so the agent loop can distinguish a
+        // malformed cursor from a hash-mismatch and react appropriately
+        // (the latter typically means the agent changed its filter and
+        // should drop the cursor + restart from scratch). vault#554: `code`
+        // IS the `error_type` vocabulary here — surfaced explicitly so a
+        // caller can branch on `error_type` alone like every other error.
+        if (e && e.name === "CursorError") {
+          return json({ error: e.message, code: e.code ?? "cursor_invalid", error_type: e.code ?? "cursor_invalid" }, 400);
+        }
+        throw e;
+      }
+      // Truncation-honesty (vault contracts-brief V1.3): captured BEFORE
+      // tag-scope filtering, which can only shrink the set further —
+      // this reflects whether the underlying store query actually hit its
+      // `limit` (i.e. there may be more rows the caller never saw). Cursor
+      // mode is exempt — it already carries `next_cursor` as the honest
+      // "more may follow" signal, so a second warning would be redundant.
+      // Explicit offset is also exempt (vault#601): the caller is already
+      // paging, not hitting an accidental full default page.
+      if (!cursorMode && queryOpts.offset === undefined && results.length === queryOpts.limit) {
+        queryWarnings.push(truncatedResultsWarning(queryOpts.limit));
+      }
+
+      // Tag-scope: drop any result outside the allowlist before shaping
+      // output. Same semantics as the search path — empty result is 200 [],
+      // not 403.
+      results = filterNotesByTagScope(results, tagScope.allowed, tagScope.raw);
+      // vault#581 auth review — `has_ambiguous_links` must answer on the
+      // reader's OWN sub-vault: the SQL filter counts a persisted row even
+      // when the notes that collided are invisible, which would let a scoped
+      // token sweep its corpus for cross-scope naming collisions. No-op
+      // unscoped and when the filter wasn't asked for. Mirrors the MCP door.
+      results = narrowByVisibleAmbiguity(
+        db,
+        results,
+        parseBoolOrUndef(parseQuery(url, "has_ambiguous_links")),
+        ambiguityVisibilityFor(db, tagScope),
+      );
+      // vault#239 — same rule for `has_broken_links`: the SQL filter was
+      // lifted for a scoped reader, so the real predicate is applied here on
+      // that reader's own sub-vault. No-op unscoped. Mirrors the MCP door.
+      results = narrowByVisibleBrokenness(
+        db,
+        results,
+        parseBoolOrUndef(parseQuery(url, "has_broken_links")),
+        ambiguityVisibilityFor(db, tagScope),
+      );
+      results = linkOps.narrowByVisibleLinks(
+        db,
+        results,
+        parseBoolOrUndef(parseQuery(url, "has_links")),
+        ambiguityVisibilityFor(db, tagScope),
+      );
+
+      const includeContent = parseBool(parseQuery(url, "include_content"), false);
+      const contentRange = parseContentRangeQuery(url, includeContent);
+      if (contentRange.error) return contentRange.error;
+      const includeLinks = parseBool(parseQuery(url, "include_links"), false);
+      const includeBrokenLinks = parseBool(parseQuery(url, "include_broken_links"), false);
+      const includeAmbiguousLinks = parseBool(parseQuery(url, "include_ambiguous_links"), false);
+      const includeAttachments = parseBool(parseQuery(url, "include_attachments"), false);
+      const includeLinkCount = parseBool(parseQuery(url, "include_link_count"), false);
+      const inclMeta = parseIncludeMetadata(url);
+      let output: any[] = includeContent ? results.map((n) => ({ ...n })) : results.map(toNoteIndex);
+      // Tag-scope (vault#568): filter each surviving note's own `.tags` to
+      // the in-scope subset. Deliberately applied to `output`, NOT `results`:
+      // `results` still feeds `store.validateNoteAgainstSchemas` below (which
+      // needs the FULL tag set to compute the status that then gets its own
+      // scope scrub) and the graph-edge walk. Because `nodes` (graph format),
+      // `enrichedOut`, and the cursor/plain envelopes are all derived from
+      // `output`, this one call covers every shape this branch can return.
+      // No-op unscoped.
+      output = scrubNotesTagsByScope(output, tagScope.allowed, tagScope.raw);
+      const expand = parseExpandParams(url, db, tagScope);
+      if (expand && includeContent) {
+        for (const n of output) expand.ctx.expanded.add(n.id);
+        for (const n of output) {
+          if (typeof n.content === "string") {
+            n.content = expandContent(n.content, expand.ctx, expand.depth);
+          }
+        }
+      }
+      // Content range — per-note, post-expansion (see core/src/content-range.ts).
+      if (contentRange.range && includeContent) {
+        for (const n of output) applyContentRange(n, contentRange.range);
+      }
+      // vault#555 fix 3 — attach validation_status on reads too (mirrors
+      // MCP query-notes). Additive, present only when a tag declares
+      // `fields`. Runs BEFORE metadata filtering so it sees full metadata
+      // regardless of `include_metadata`. Scrubbed for a tag-scoped caller
+      // (vault#555 auth review) so an out-of-scope co-tag's schema shape
+      // doesn't leak — `results` here is already scope-filtered, but a
+      // surviving note may carry an out-of-scope co-tag whose schema would
+      // otherwise appear in its validation_status. No-op when unscoped.
+      {
+        const statusById = new Map(
+          results.map((n) => [
+            n.id,
+            scrubValidationStatusByScope(
+              store.validateNoteAgainstSchemas({
+                path: n.path,
+                tags: n.tags,
+                metadata: n.metadata as Record<string, unknown> | undefined,
+              }, vis(tagScope)),
+              tagScope.allowed,
+              tagScope.raw,
+            ),
+          ]),
+        );
+        for (const n of output as any[]) {
+          const status = statusById.get(n.id);
+          if (status) n.validation_status = status;
+        }
+      }
+      if (inclMeta !== undefined && inclMeta !== true) {
+        output = output.map((n: any) => filterMetadata(n, inclMeta));
+      }
+      // Opt-in link degree (vault feedback #4). ONE batch count over all
+      // result ids — NOT a per-note query — so the field stays O(2 index
+      // scans) per request regardless of page size. Mutates `output` in
+      // place; injected on the same objects the enrichment loop below
+      // touches, the same way `links`/`attachments` are surfaced.
+      // Ordering: this runs AFTER the filterMetadata pass above on purpose —
+      // filterMetadata only touches the `metadata` key, so a linkCount
+      // injected here survives. Don't casually swap the order; injecting
+      // before filterMetadata would still survive today but couples the two
+      // to filterMetadata's current narrow behavior.
+      if (includeLinkCount) {
+        const counts = linkOps.getLinkCounts(
+          db,
+          output.map((n: any) => n.id),
+          parseLinkCountDirection(url),
+          ambiguityVisibilityFor(db, tagScope),
+        );
+        for (const n of output) n.linkCount = counts.get(n.id) ?? 0;
+      }
+
+      // Graph format — reshape into { nodes, edges }
+      if (parseQuery(url, "format") === "graph") {
+        const resultIds = new Set(results.map((n) => n.id));
+        const nodes = output.map((n: any) => ({ id: n.id, path: n.path ?? null, tags: n.tags ?? [] }));
+        const edges: { source: string; target: string; relationship: string }[] = [];
+        if (includeLinks) {
+          const linksByNote = linkOps.getLinksHydratedForNotes(db, results.map((n) => n.id));
+          for (const n of results) {
+            for (const link of linksByNote.get(n.id) ?? []) {
+              // Only include edges where source is this note and target is in the result set
+              if (link.sourceId === n.id && resultIds.has(link.targetId)) {
+                edges.push({ source: link.sourceId, target: link.targetId, relationship: link.relationship });
+              }
+            }
+          }
+        }
+        // Envelope shape → warnings inline (same policy as the cursor
+        // envelope below), plus the header via jsonWithWarnings.
+        return jsonWithWarnings(
+          { nodes, edges, ...(queryWarnings.length > 0 ? { warnings: queryWarnings } : {}) },
+          queryWarnings,
+        );
+      }
+
+      if (includeLinks || includeBrokenLinks || includeAmbiguousLinks || includeAttachments) {
+        // Whole-page link hydration in a constant number of queries — the
+        // per-note variant cost (1 link query + 1 summary query + N tag
+        // queries) × page size. 2026-06-10 perf measurements.
+        const linksByNote = includeLinks
+          ? linkOps.getLinksHydratedForNotes(db, output.map((n: any) => n.id))
+          : null;
+        // Same batched-per-page shape as links (vault#555). No tag-scope
+        // filtering needed — a broken-link `target` never resolved to a
+        // note, so there's no neighbor identity to leak.
+        const brokenLinksByNote = includeBrokenLinks
+          ? getUnresolvedLinksForNotes(db, output.map((n: any) => n.id), ambiguityVisibilityFor(db, tagScope))
+          : null;
+        // Same again for the ambiguity twin (vault#581), same non-leak logic.
+        const ambiguousLinksByNote = includeAmbiguousLinks
+          ? getAmbiguousLinksForNotes(db, output.map((n: any) => n.id), ambiguityVisibilityFor(db, tagScope))
+          : null;
+        const enrichedOut: any[] = [];
+        for (const n of output) {
+          const enriched: any = { ...n };
+          if (linksByNote) {
+            // Tag-scope: strip out-of-scope-neighbor links (no-op unscoped).
+            enriched.links = filterHydratedLinksByTagScope(
+              linksByNote.get(n.id) ?? [],
+              tagScope.allowed,
+              tagScope.raw,
+            );
+          }
+          if (brokenLinksByNote) enriched.broken_links = brokenLinksByNote.get(n.id) ?? [];
+          if (ambiguousLinksByNote) enriched.ambiguous_links = ambiguousLinksByNote.get(n.id) ?? [];
+          if (includeAttachments) enriched.attachments = await store.getAttachments(n.id);
+          enrichedOut.push(enriched);
+        }
+        // Cursor mode wraps the list in {notes, next_cursor} so an agent
+        // loop can chain calls without tracking a watermark client-side.
+        // Legacy callers (no `cursor` param) still get the flat array.
+        // Warnings (vault#550): inline on the envelope, header either way
+        // (see jsonWithWarnings).
+        if (cursorMode) {
+          return jsonWithWarnings(
+            { notes: enrichedOut, next_cursor: nextCursor, ...(queryWarnings.length > 0 ? { warnings: queryWarnings } : {}) },
+            queryWarnings,
+          );
+        }
+        return jsonWithWarnings(enrichedOut, queryWarnings);
+      }
+
+      if (cursorMode) {
+        return jsonWithWarnings(
+          { notes: output, next_cursor: nextCursor, ...(queryWarnings.length > 0 ? { warnings: queryWarnings } : {}) },
+          queryWarnings,
+        );
+      }
+      return jsonWithWarnings(output, queryWarnings);
+    }
+
+    // POST /notes — create (single or batch)
+    if (method === "POST") {
+      const parsedBody = await parseJsonBody(req);
+      if (!parsedBody.ok) return parsedBody.response;
+      const body = parsedBody.body as any;
+      // `notes` (when present) must actually be an array — otherwise
+      // `items` below iterates whatever `body.notes` happens to be (e.g. a
+      // STRING iterates as one-character items), silently creating a batch
+      // of blank notes (LB7b).
+      if (body.notes !== undefined && !Array.isArray(body.notes)) {
+        return json(
+          {
+            error: "notes must be an array",
+            error_type: "invalid_request",
+            field: "notes",
+            hint: 'pass { "notes": [...] } for a batch, or a single note object with no `notes` key',
+          },
+          400,
+        );
+      }
+      const items: any[] = body.notes ?? [body];
+      // Every batch item must itself be a plain object — a primitive/array
+      // entry would otherwise read as an all-`undefined` note (LB7b).
+      for (const item of items) {
+        if (item === null || typeof item !== "object" || Array.isArray(item)) {
+          return json(
+            {
+              error: "each note must be a JSON object",
+              error_type: "invalid_request",
+              hint: 'each entry in "notes" (or the top-level body, for a single-note POST) must be an object, e.g. {"content": "..."}',
+            },
+            400,
+          );
+        }
+      }
+
+      // Batch cap (#213): refuse oversized batches before doing any work. 500
+      // is the cap (Benjamin's number) — tighter blast radius than 1000 for
+      // the runaway-client case that flooded a deployment with 7,453 notes.
+      if (items.length > MAX_BATCH_SIZE) {
+        return json(
+          {
+            error_type: "batch_too_large",
+            error: "BatchTooLarge",
+            message: `max ${MAX_BATCH_SIZE} notes per request, got ${items.length}`,
+            limit: MAX_BATCH_SIZE,
+          },
+          413,
+        );
+      }
+
+      // Tag-scope pre-validation: every new note in the batch must carry at
+      // least one tag inside the token's allowlist. Reject the whole request
+      // before any DB write so a tag-scoped token can't accidentally land a
+      // partial batch with an in-scope prefix.
+      if (tagScope.allowed) {
+        for (let i = 0; i < items.length; i++) {
+          if (!tagsWithinScope(items[i]?.tags, tagScope.allowed, tagScope.raw)) {
+            return tagScopeForbidden(tagScope.raw ?? []);
+          }
+        }
+      }
+
+      const created: Note[] = [];
+      // Structured `links` are resolved in a second pass, after every note
+      // in this batch has been created (vault#555) — resolving inline (the
+      // old behavior) meant a link from item 0 to item 1's path silently
+      // dropped, since item 1 didn't exist yet at the moment item 0's links
+      // were processed. Mirrors the MCP create-note fix exactly (both
+      // layers share `resolveOrQueueLink` from core/wikilinks.ts).
+      const pendingLinks: { sourceId: string; links: { target: string; relationship: string }[] }[] = [];
+      const linkWarningsByNote = new Map<string, QueryWarning[]>();
+      const pushLinkWarning = (noteId: string, warning: QueryWarning): void => {
+        const list = linkWarningsByNote.get(noteId) ?? [];
+        list.push(warning);
+        linkWarningsByNote.set(noteId, list);
+      };
+      // Content wikilinks whose note+content pair needs an `unresolved_link`/
+      // `ambiguous_link` warning check (vault#570) — deferred to the same
+      // second pass as `pendingLinks` for the same forward-ref-within-batch
+      // reason (a content `[[wikilink]]` to a batch sibling created later
+      // resolves via the pending-wikilink backfill by the time this runs).
+      const contentWikilinkNotes: { noteId: string; content: string }[] = [];
+      // `if_exists` bookkeeping (vault#555) — mirrors core/src/mcp.ts's
+      // create-note tool exactly (same contract, independent REST-layer
+      // reimplementation sharing the same core primitives). See that file's
+      // doc comments for the full rationale.
+      const existedMap = new Map<string, boolean>();
+      const noMutateIds = new Set<string>();
+      const recordExistedBranch = (resultNote: Note, noMutate: boolean): void => {
+        existedMap.set(resultNote.id, true);
+        if (noMutate) noMutateIds.add(resultNote.id);
+        created.push(resultNote);
+      };
+      const applyExistingNote = async (
+        item: any,
+        existingNote: Note,
+        mode: "ignore" | "update" | "replace",
+      ): Promise<{ note: Note; noMutate: boolean }> => {
+        // CRITICAL scope guard (vault#555 auth-review must-fix): `existingNote`
+        // was resolved VAULT-WIDE by path (store.getNoteByPath) at BOTH call
+        // sites below (proactive + race-backstop). The batch's incoming-tag
+        // pre-validation guards only each item's OWN tags — NOT this resolved
+        // note — so without this a token scoped to `public` could READ (ignore)
+        // or OVERWRITE (update/replace) a note carrying only an out-of-scope
+        // tag `secret` just by naming its path. When the note is outside the
+        // caller's tag scope, treat it as a path conflict — the path is taken,
+        // but invisible to this caller — throwing BEFORE any read/mutation so
+        // we never expose content or write. `noteWithinTagScope` is a no-op for
+        // unscoped tokens (tagScope.raw === null → always true). The throw
+        // propagates to runBatch's PATH_CONFLICT catch → 409 path_conflict,
+        // byte-identical to a genuine conflict (leaks nothing about WHY).
+        if (!noteWithinTagScope(existingNote, tagScope.allowed, tagScope.raw)) {
+          throw new PathConflictError(existingNote.path ?? "");
+        }
+        if (mode === "ignore") {
+          return { note: existingNote, noMutate: true };
+        }
+        const updates: { content?: string; metadata?: Record<string, unknown> } = {};
+        if (mode === "update") {
+          if (item.content !== undefined) updates.content = item.content;
+          if (item.metadata !== undefined) {
+            updates.metadata = mergeMetadata(
+              existingNote.metadata as Record<string, unknown> | null | undefined,
+              item.metadata,
+            );
+          }
+        } else {
+          // "replace" — PUT semantics: content/metadata become exactly this
+          // payload (empty default when omitted), never merged.
+          updates.content = item.content ?? "";
+          updates.metadata = item.metadata ?? {};
+        }
+
+        const incomingTags: string[] = item.tags ?? [];
+        const projectedTags = new Set<string>([...(existingNote.tags ?? []), ...incomingTags]);
+        const projectedMetadata = updates.metadata ?? ((existingNote.metadata as Record<string, unknown>) ?? {});
+        gateStrictWrite(store, writeCtx, { path: existingNote.path, tags: [...projectedTags], metadata: projectedMetadata }, tagScope);
+
+        // vault#555 fix 2 (W8 fix-2 bug class, generalist must-fix): gate the
+        // core UPDATE on the tag/link mutation too, not just `updates` — a
+        // tags-only/links-only "update" leaves `updates` empty, and skipping
+        // store.updateNote would freeze `updated_at` even though store.tagNote
+        // genuinely mutates the note (breaking cursor polling + updated_at
+        // sync). Mirrors the update-note/PATCH hasTagMutation||hasLinkMutation
+        // gate. "replace" always sets content+metadata, so it was unaffected.
+        const hasLinkMutation = item.links !== undefined;
+        let result: Note = existingNote;
+        if (Object.keys(updates).length > 0 || incomingTags.length > 0 || hasLinkMutation) {
+          result = await store.updateNote(existingNote.id, {
+            ...updates,
+            actor: writeCtx.actor,
+            via: writeCtx.via,
+          });
+        }
+
+        // Content-wikilink warnings (vault#570) — this branch's content
+        // update (if any) already ran `syncWikilinks` inside
+        // `store.updateNote` above; queue for the shared second-pass
+        // classification below.
+        if (updates.content !== undefined) {
+          contentWikilinkNotes.push({ noteId: result.id, content: updates.content });
+        }
+
+        if (incomingTags.length > 0) {
+          await store.tagNote(result.id, incomingTags);
+          // Redundant with the outer batch loop's applySchemaDefaults (this
+          // note isn't in `noMutateIds` — only "ignore" hits are), but harmless
+          // (idempotent) — kept so the update/replace branch is self-contained.
+          await applySchemaDefaults(store, db, [result.id], incomingTags);
+        }
+
+        if (item.links) {
+          pendingLinks.push({ sourceId: result.id, links: item.links as { target: string; relationship: string }[] });
+        }
+
+        return { note: (await store.getNote(result.id)) ?? result, noMutate: false };
+      };
+
+      // Wrap multi-item batches in a SQLite transaction so a mid-batch
+      // failure (path conflict, etc.) rolls back every prior insert. Without
+      // this, callers got half-applied batches where the prefix landed and
+      // the offending entry surfaced the 409 — see #236. Single-item posts
+      // are already atomic at the store layer and skip the wrap so they
+      // don't collide with concurrent single-item callers on the shared
+      // bun:sqlite connection. A caught PATH_CONFLICT (the if_exists race
+      // backstop below) does NOT roll back the transaction — only a throw
+      // that escapes `runBatch` does (see core/src/txn.ts).
+      const batched = items.length > 1;
+      const runBatch = async (): Promise<void> => {
+        for (const item of items) {
+          // Validate extension before reaching the Store (vault#328).
+          // Thrown inside the batch transaction — rolls the batch back,
+          // same shape as the path-conflict path.
+          const extension = item.extension !== undefined
+            ? validateExtension(item.extension)
+            : undefined;
+          // Reject NUL / `..` paths at the write surface (vault#589 / FIX 2).
+          // Same batch-transaction throw semantics as extension validation.
+          validatePath(item.path);
+          const effectiveExtension = extension ?? "md";
+          const ifExists: string = item.if_exists ?? "error";
+          const upsertMode = ifExists === "ignore" || ifExists === "update" || ifExists === "replace";
+
+          // Proactive existence check (vault#555) — only possible with a
+          // path. Handles the common, non-racing case cleanly: skips the
+          // raw-item strict gate below (it would validate the wrong shape —
+          // see `applyExistingNote`) and goes straight to the collision
+          // branch. The catch below is the backstop for a true race.
+          let existingNote: Note | null = null;
+          if (upsertMode && item.path) {
+            const normalized = normalizePath(item.path);
+            existingNote = normalized ? await store.getNoteByPath(normalized, effectiveExtension) : null;
+          }
+          if (existingNote) {
+            const { note: resultNote, noMutate } = await applyExistingNote(item, existingNote, ifExists as "ignore" | "update" | "replace");
+            recordExistedBranch(resultNote, noMutate);
+            continue;
+          }
+
+          // Strict-schema gate (vault#299) — reject before any write so a
+          // mid-batch violation rolls back the batch transaction.
+          gateStrictWrite(store, writeCtx, {
+            path: item.path,
+            tags: item.tags,
+            metadata: item.metadata,
+          }, tagScope);
+          let note: Note;
+          try {
+            note = await store.createNote(item.content ?? "", {
+              id: item.id,
+              path: item.path,
+              tags: item.tags,
+              metadata: item.metadata,
+              created_at: item.createdAt ?? item.created_at,
+              ...(extension !== undefined ? { extension } : {}),
+              // Write-attribution (vault#298) — REST batch create.
+              actor: writeCtx.actor,
+              via: writeCtx.via,
+            });
+          } catch (err: any) {
+            // Race backstop (vault#555): a concurrent writer's INSERT
+            // committed between our proactive check and this one.
+            // Re-resolve the now-existing row and fall through to the SAME
+            // branch a proactive hit would have taken.
+            if (upsertMode && err?.code === "PATH_CONFLICT") {
+              const winner = await store.getNoteByPath(err.path, effectiveExtension);
+              if (winner) {
+                const { note: resultNote, noMutate } = await applyExistingNote(item, winner, ifExists as "ignore" | "update" | "replace");
+                recordExistedBranch(resultNote, noMutate);
+                continue;
+              }
+            }
+            throw err;
+          }
+
+          if (upsertMode) existedMap.set(note.id, false);
+
+          if (item.links) {
+            pendingLinks.push({ sourceId: note.id, links: item.links as { target: string; relationship: string }[] });
+          }
+
+          // Content-wikilink warnings (vault#570) — `store.createNote` above
+          // already ran `syncWikilinks` (gated on `content` truthy, same
+          // condition here); queue for the shared second-pass classification.
+          if (item.content) {
+            contentWikilinkNotes.push({ noteId: note.id, content: item.content });
+          }
+
+          created.push((await store.getNote(note.id)) ?? note);
+        }
+
+        // --- Resolve structured links (vault#555) ---
+        // Same semantics as [[wikilinks]]: ID or path/title match, tried now
+        // that every sibling note in this batch exists. A target that still
+        // doesn't resolve is queued for lazy resolution (backfills
+        // automatically when a matching note is created later) and surfaces
+        // an `unresolved_link` warning naming the target. A target that
+        // matched ≥2 notes (vault#570) is neither linked nor queued —
+        // surfaces a distinct `ambiguous_link` warning instead. Never silent.
+        for (const { sourceId, links } of pendingLinks) {
+          for (const link of links) {
+            const outcome = resolveOrQueueLink(db, sourceId, link.target, link.relationship);
+            if (outcome.status === "resolved") {
+              await store.createLink(sourceId, outcome.note_id, link.relationship);
+            } else if (outcome.status === "ambiguous") {
+              pushLinkWarning(sourceId, ambiguousLinkWarning(link.target, link.relationship, outcome.candidates.length));
+            } else {
+              pushLinkWarning(sourceId, unresolvedLinkWarning(link.target, link.relationship));
+            }
+          }
+        }
+
+        // --- Content-wikilink warnings (vault#570) ---
+        // Same forward-ref-aware timing as the structured-links pass above.
+        for (const { noteId, content } of contentWikilinkNotes) {
+          for (const warning of getContentWikilinkWarnings(db, noteId, content)) {
+            pushLinkWarning(noteId, warning);
+          }
+        }
+      };
+      try {
+        await (batched ? transactionAsync(db, runBatch) : runBatch());
+      } catch (e: any) {
+        // Duck-type for module-boundary robustness (matches the PATCH branch).
+        if (e && e.code === "PATH_CONFLICT") {
+          return json(
+            {
+              error_type: "path_conflict",
+              error: "path_conflict",
+              path: e.path,
+              message: e.message,
+              hint: "pass a different `path`, or omit it to let the vault assign one",
+            },
+            409,
+          );
+        }
+        // Strict-schema rejection (vault#299 Part A) on create — 422.
+        if (e && e.code === "SCHEMA_VALIDATION") {
+          return json(
+            {
+              error_type: "schema_validation",
+              error: "schema_validation",
+              violations: e.violations ?? [],
+              message: e.message,
+              hint: "fix every field listed in `violations` and retry — none of this write was applied",
+            },
+            422,
+          );
+        }
+        if (e && e.code === "INVALID_EXTENSION") {
+          return json(
+            { error_type: "invalid_extension", error: "invalid_extension", extension: e.extension, reason: e.reason, message: e.message },
+            400,
+          );
+        }
+        // Bad `path` value (vault#589 / FIX 2) — NUL byte or `..` segment.
+        if (e && e.code === "INVALID_PATH") {
+          return json(
+            { error_type: "invalid_path", error: "invalid_path", path: e.path, reason: e.reason, message: e.message },
+            400,
+          );
+        }
+        throw e;
+      }
+
+      // Apply tag schema defaults, then re-read the notes whose metadata was
+      // actually default-filled so the response reflects the final on-disk
+      // state (the `created` entries were read before `applySchemaDefaults`
+      // ran). Mirrors the MCP create-note path (vault#316). Batched re-read
+      // (`getNotes` = one `WHERE id IN (...)`), skipped when no defaults
+      // applied so the common no-defaults path adds zero extra reads.
+      const mutatedIds = new Set<string>();
+      for (const note of created) {
+        // "ignore" hits (vault#555) promise ZERO mutation, including
+        // schema-default backfill of a since-added default the existing
+        // note predates — skip them entirely.
+        if (noMutateIds.has(note.id)) continue;
+        if (note.tags?.length) {
+          for (const id of await applySchemaDefaults(store, db, [note.id], note.tags)) {
+            mutatedIds.add(id);
+          }
+        }
+      }
+      const refreshed =
+        mutatedIds.size === 0
+          ? created
+          : (() => {
+              const byId = new Map(getNotes(db, [...mutatedIds]).map((n) => [n.id, n]));
+              return created.map((n) => byId.get(n.id) ?? n);
+            })();
+
+      // Attach `validation_status` so HTTP create-note matches the MCP
+      // surface (vault#287). `attachValidationStatus` returns the note
+      // unchanged when no tag declares fields, so vaults without any tag
+      // schemas see no behavior change. Fold in any `unresolved_link`
+      // warnings (vault#555) — additive, present only when this note's
+      // `links` had a target that didn't resolve. `existed` (vault#555) is
+      // attached ONLY for items whose `if_exists` actually engaged — the
+      // default "error" path's response shape is untouched.
+      const final = refreshed.map((n) => {
+        const validated = attachValidationStatus(store, db, n, buildExpandVisibility(tagScope.allowed, tagScope.raw));
+        const warnings = narrowWriteWarnings(db, linkWarningsByNote.get(n.id) ?? [], tagScope);
+        const existed = existedMap.get(n.id);
+        let out: any = validated;
+        if (warnings.length > 0) out = { ...out, warnings };
+        if (existed !== undefined) out = { ...out, existed };
+        // Tag-scope (vault#568): a create response echoes the STORED note,
+        // and under `if_exists: ignore|update|replace` that's a note that
+        // already existed with tags this token never supplied. Without the
+        // scrub a scoped caller could recover any co-tagged note's full tag
+        // set through the write door. Same treatment on the validation_status
+        // this response carries — the #555 scrub was only wired to the read
+        // paths, so the write door still named out-of-scope schemas.
+        out = scrubNoteTagsByScope(out, tagScope.allowed, tagScope.raw);
+        if (out.validation_status) {
+          const vs = scrubValidationStatusByScope(out.validation_status, tagScope.allowed, tagScope.raw);
+          if (vs === undefined) { const { validation_status: _d, ...rest } = out; out = rest; }
+          else out = { ...out, validation_status: vs };
+        }
+        return out;
+      });
+
+      // Batch summary (vault#555) — compact shape instead of N full note
+      // objects. Batch-only (a `notes` array); `summary` is ignored on a
+      // single-note POST. Mirrors the MCP create-note tool exactly.
+      if (body.notes && body.summary === true) {
+        return json(
+          {
+            created: final.filter((n: any) => n.existed !== true).length,
+            ids: final.map((n: any) => n.id),
+            // Reserved for future partial-batch-failure reporting — a batch
+            // create is all-or-nothing today, so this is always empty.
+            failed: [] as unknown[],
+          },
+          201,
+        );
+      }
+
+      return json(body.notes ? final : final[0], 201);
+    }
+
+    return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
+  }
+
+  // ---- Note-level routes (/notes/:idOrPath[/attachments]) ----
+  const idMatch = subpath.match(/^\/([^/]+)(\/.*)?$/);
+  if (!idMatch) return json({ error: "Not found", error_type: "not_found" }, 404);
+
+  const idOrPath = decodeURIComponent(idMatch[1]!);
+  const sub = idMatch[2] ?? "";
+
+  // Attachments sub-routes (keep as-is — Daily needs them)
+  if (sub === "/attachments") {
+    if (method === "POST") {
+      const note = await resolveNote(store, idOrPath);
+      if (!note) return json({ error: "Not found", error_type: "not_found" }, 404);
+      if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
+        return json({ error: "Not found", error_type: "not_found" }, 404);
+      }
+      const parsedBody = await parseJsonBody(req);
+      if (!parsedBody.ok) return parsedBody.response;
+      const body = parsedBody.body as {
+        path: string;
+        mimeType: string;
+        transcribe?: boolean;
+        segment_index?: unknown;
+      };
+      if (!body.path || !body.mimeType) {
+        return json(
+          { error: "path and mimeType are required", error_type: "missing_required_field", hint: "pass both `path` and `mimeType`" },
+          400,
+        );
+      }
+
+      // Decide whether to enqueue this attachment for transcription. Two paths:
+      //
+      // - **Explicit caller opt-in (legacy path, Lens flow):** `transcribe: true`
+      //   on the POST. The note already has a `_Transcript pending._` stub the
+      //   worker replaces on success — `transcribe_origin: "legacy"` preserves
+      //   the stub-patching behavior.
+      // - **Auto-transcribe (vault#353):** mime-type is `audio/*` AND the
+      //   operator has flipped `auto_transcribe.enabled = true` AND scribe is
+      //   reachable. The caller didn't opt in explicitly; we infer from the
+      //   audio mime-type. `transcribe_origin: "auto"` tells the worker to
+      //   materialize a `<attachment-path>.transcript.md` note on completion.
+      //
+      // Explicit `transcribe: true` wins — if the caller asked, we honor that
+      // regardless of the auto-transcribe toggle (back-compat).
+      const explicitOptIn = body.transcribe === true;
+      // Explicit opt-OUT. `transcribe: false` is a caller saying no, and it is
+      // NOT the same as saying nothing — which is the only reading this route
+      // had until now (`body.transcribe` was read once, as `=== true`, so
+      // `false` and absent were indistinguishable).
+      //
+      // That collapse is what put the auto path in front of a decision the user
+      // had already made: the app's `voice-capture-plan.ts` sets this from the
+      // capture's transcribe toggle, its docstring states the invariant
+      // ("every link sends `transcribe: false`"), and the sync queue dropped
+      // the `false` in transit. With both halves in place a "no" arrives as a
+      // "no" and auto-transcribe is never consulted — it exists to guess when
+      // nobody expressed a preference, which is no longer this case.
+      //
+      // Absent still means absent, so old app builds and any caller with
+      // genuinely no opinion are byte-unchanged; this is additive.
+      const explicitOptOut = body.transcribe === false;
+      // Per-vault auto-transcribe: read THIS vault's `auto_transcribe.enabled`
+      // (vault.yaml) and pass it as the precedence-winning toggle. A vault that
+      // set its own value uses it; one that left it unset falls through to the
+      // global toggle inside `shouldAutoTranscribe` (per-vault → global → true).
+      const perVaultEnabled = vault
+        ? readVaultConfig(vault)?.auto_transcribe?.enabled
+        : undefined;
+      // vault#643: classify rather than collapse to a boolean. "Operator
+      // turned it off" and "nothing is configured to do it" both used to read
+      // as `false`, so a misconfigured box silently accepted audio and
+      // transcribed nothing — no marker, no status, no log.
+      // An explicit opt-out resolves to `disabled`, which already carries
+      // exactly the right meaning here — "silence is correct: they asked for
+      // nothing to happen" (see `AutoTranscribeDecision`). Reusing it rather
+      // than adding a kind means the downstream branches need no changes: not
+      // `transcribe`, so nothing is enqueued; not `unavailable`, so no `failed`
+      // marker and no missing-provider warning. The attachment links as a plain
+      // audio file, which is what the caller asked for.
+      const autoDecision = explicitOptIn
+        ? ({ kind: "transcribe" } as const)
+        : explicitOptOut
+          ? ({ kind: "disabled" } as const)
+          : classifyAutoTranscribe(body.mimeType, { perVaultEnabled });
+      const autoOptIn = !explicitOptIn && autoDecision.kind === "transcribe";
+      // Enabled, audio, but no reachable provider. Record it on the attachment
+      // so the state is visible in the API and the admin SPA instead of the
+      // upload looking like an ordinary file.
+      const transcribeUnavailable = !explicitOptIn && autoDecision.kind === "unavailable";
+      // Per-segment slots (voice W2, cloud twin: workers/vault/src/rest/notes.ts
+      // ~791-800): an optional `segment_index` (integer >= 0) lets one recording
+      // split across several attachments on ONE note, each resolving into its
+      // own `(part N)` marker (N = segment_index + 1, see transcription-worker.ts
+      // markersFor). A malformed value is silently ignored — the attachment
+      // still links, it just falls back to the bare, un-segmented markers.
+      const segIdx = body.segment_index;
+      const validSegment = typeof segIdx === "number" && Number.isInteger(segIdx) && segIdx >= 0;
+      const attMeta = (explicitOptIn || autoOptIn)
+        ? {
+            transcribe_status: "pending" as const,
+            transcribe_requested_at: new Date().toISOString(),
+            transcribe_origin: (explicitOptIn ? "legacy" : "auto") as "legacy" | "auto",
+            ...(validSegment ? { segment_index: segIdx } : {}),
+          }
+        : transcribeUnavailable
+          ? {
+              transcribe_status: "failed" as const,
+              // Name the real situation — see noProviderErrorFor. On a box
+              // with a local provider configured, the flat NO_PROVIDER_ERROR
+              // told the operator to do what they had already done.
+              transcribe_error: noProviderErrorFor(
+                autoDecision.kind === "unavailable" ? autoDecision.localProvider : null,
+              ),
+              transcribe_requested_at: new Date().toISOString(),
+              transcribe_origin: "auto" as const,
+              ...(validSegment ? { segment_index: segIdx } : {}),
+            }
+          : undefined;
+      if (transcribeUnavailable) warnNoTranscriptionProvider();
+
+      const attachment = await store.addAttachment(note.id, body.path, body.mimeType, attMeta);
+
+      if (explicitOptIn) {
+        const noteMeta = (note.metadata as Record<string, unknown> | undefined) ?? {};
+        if (noteMeta.transcribe_stub !== true) {
+          await store.updateNote(note.id, {
+            metadata: { ...noteMeta, transcribe_stub: true },
+            skipUpdatedAt: true,
+          });
+        }
+      }
+
+      return json(attachment, 201);
+    }
+    if (method === "GET") {
+      const note = await resolveNote(store, idOrPath);
+      if (!note) return json({ error: "Not found", error_type: "not_found" }, 404);
+      if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
+        return json({ error: "Not found", error_type: "not_found" }, 404);
+      }
+      return json(await store.getAttachments(note.id));
+    }
+    return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
+  }
+
+  const attMatch = sub.match(/^\/attachments\/([^/]+)$/);
+  if (attMatch) {
+    const attId = decodeURIComponent(attMatch[1]!);
+    if (method === "DELETE") {
+      const note = await resolveNote(store, idOrPath);
+      if (!note) return json({ error: "Not found", error_type: "not_found" }, 404);
+      if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
+        return json({ error: "Not found", error_type: "not_found" }, 404);
+      }
+      const result = await store.deleteAttachment(note.id, attId);
+      if (!result.deleted) return json({ error: "Not found", error_type: "not_found" }, 404);
+      // Unlink the storage file only if no other attachment still references
+      // the same path. Best-effort: the row is already gone, so a missing
+      // file or unlink error should not flip the DELETE to an error.
+      if (vault && result.path && result.orphaned) {
+        const assets = assetsDir(vault);
+        const filePath = normalize(join(assets, result.path));
+        if (filePath.startsWith(normalize(assets)) && existsSync(filePath)) {
+          try { unlinkSync(filePath); } catch {}
+        }
+      }
+      return new Response(null, { status: 204 });
+    }
+    return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
+  }
+
+  // POST /notes/:idOrPath/retry-transcription — vault#353 design Q5 + finding F.
+  //
+  // Re-runs transcription against a failed audio attachment. Two target
+  // shapes, dispatched in handleRetryTranscription by whether the note carries
+  // `transcript_status` frontmatter:
+  //   - Auto-flow (vault#353): target is a `<audio>.transcript.md` note with
+  //     `transcript_status: "failed"`; audio located via
+  //     `transcript_attachment_id`, origin preserved as "auto".
+  //   - Legacy in-body memo (finding F): target is the memo note itself (no
+  //     `transcript_status`); finds its own failed attachment, resets it
+  //     preserving `transcribe_origin: "legacy"`, and re-arms `transcribe_stub`.
+  //
+  // Wire shape:
+  //   POST .../notes/<idOrPath>/retry-transcription
+  //   →  202 { attachment_id, attachment_path, transcript_note_id, worker }
+  //      400 not_failed              (auto-flow: transcript already succeeded)
+  //      400 missing_attachment_id   (auto-flow: transcript_attachment_id absent)
+  //      400 no_failed_attachment    (legacy: no failed audio attachment to retry)
+  //      404 attachment_missing      (auto-flow: transcript_attachment_id row deleted)
+  //      404 audio_missing           (audio file unlinked from disk)
+  if (sub === "/retry-transcription") {
+    if (method !== "POST") return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
+    if (!vault) return json({ error: "Vault context required", error_type: "invalid_request" }, 400);
+    const note = await resolveNote(store, idOrPath);
+    if (!note) return json({ error: "Not found", error_type: "not_found" }, 404);
+    if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
+      return json({ error: "Not found", error_type: "not_found" }, 404);
+    }
+    return handleRetryTranscription(store, note, vault);
+  }
+
+  const verMatch = sub.match(/^\/versions\/([^/]+)$/);
+  const importMatch = sub.match(/^\/imports\/([^/]+)$/);
+  if (sub === "/versions" || verMatch || importMatch || sub === "/restore") {
+    const note = await resolveNote(store, idOrPath);
+    if (note && !noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
+      return json({ error: "Not found", error_type: "not_found" }, 404);
+    }
+    if (!note && (tagScope.raw !== null || !isNoteIdShape(idOrPath) ||
+      !(await store.listNoteVersions(idOrPath, { limit: 1 })).length)) {
+      return json({ error: "Not found", error_type: "not_found" }, 404);
+    }
+    const id = note?.id ?? idOrPath;
+    if (sub === "/versions") {
+      if (method === "GET") {
+        const parsedLimit = Number.parseInt(url.searchParams.get("limit") ?? "50", 10);
+        const limit = Number.isNaN(parsedLimit) ? 50 : Math.min(200, Math.max(0, parsedLimit));
+        const offset = Math.max(0, Number.parseInt(url.searchParams.get("offset") ?? "0", 10) || 0);
+        const versions = await store.listNoteVersions(id, { limit, offset });
+        const total = await store.countNoteVersions(id);
+        return json({ versions: versions.map(row => projectHistoryProvenance(projectHistoryRow(row), tagScope.allowed !== null)), total });
+      }
+      if (method === "DELETE") {
+        const result = await store.eraseNoteHistory(id);
+        return json({ erased: true, id, versions_deleted: result.versionsDeleted, blobs_deleted: result.blobsDeleted });
+      }
+    } else if (importMatch && method === "GET") {
+      const index = Number(importMatch[1]);
+      if (!/^\d+$/.test(importMatch[1]!) || !Number.isSafeInteger(index) || index < 0) return json({ error: "Invalid import_ix", error_type: "invalid_request" }, 400);
+      try {
+        const version = getImportedVersion(db, id, index);
+        return version ? json(projectHistoryProvenance(projectHistoryRow(version), tagScope.allowed !== null)) : json({ error: "Not found", error_type: "not_found", origin: "git-import", import_ix: index }, 404);
+      } catch (e) {
+        const response = conflictResponse(e);
+        if (response) return response;
+        throw e;
+      }
+    } else if (verMatch && method === "GET") {
+      const ix = Number(verMatch[1]);
+      if (!/^\d+$/.test(verMatch[1]!) || !Number.isInteger(ix) || ix < 0) return json({ error: "Invalid version_ix", error_type: "invalid_request" }, 400);
+      try {
+        const version = await store.getNoteVersion(id, ix);
+        return version ? json(projectHistoryProvenance(version, tagScope.allowed !== null)) : json({ error: "Not found", error_type: "not_found" }, 404);
+      } catch (e) {
+        const response = conflictResponse(e);
+        if (response) return response;
+        throw e;
+      }
+    } else if (sub === "/restore" && method === "POST") {
+      const parsed = await parseJsonBody(req);
+      if (!parsed.ok) return parsed.response;
+      const body = parsed.body;
+      if (body.if_updated_at !== undefined && !isValidIfUpdatedAt(body.if_updated_at)) return invalidIfUpdatedAtResponse();
+      let selector: ReturnType<typeof parseHistorySelector>;
+      try { selector = parseHistorySelector(body); } catch {
+        return json({ error: "Invalid history selector", error_type: "invalid_request" }, 400);
+      }
+      if (!selector) return json({ error: "History selector is required", error_type: "missing_required_field" }, 400);
+      const imported = "import_ix" in selector;
+      const storageIndex = "import_ix" in selector ? importStorageIndex(selector.import_ix) : selector.version_ix;
+      try {
+        const version = "import_ix" in selector ? getImportedVersion(db, id, selector.import_ix) : await store.getNoteVersion(id, storageIndex);
+        if (!version) return json({ error: "Not found", error_type: "not_found", ...(imported ? selector : {}) }, 404);
+        gateStrictWrite(store, writeCtx, {
+          path: note ? note.path : latestTombstone(db, id)?.path,
+          tags: note?.tags ?? [], metadata: version.metadata,
+        }, tagScope);
+        const restored = await store.restoreNoteVersion(id, storageIndex, {
+          actor: writeCtx.actor, via: writeCtx.via,
+          ...(body.if_updated_at !== undefined ? { if_updated_at: body.if_updated_at as string } : {}),
+        });
+        let validated: any = attachValidationStatus(store, db, restored, buildExpandVisibility(tagScope.allowed, tagScope.raw));
+        validated = scrubNoteTagsByScope(validated, tagScope.allowed, tagScope.raw);
+        if (validated.validation_status) {
+          const vs = scrubValidationStatusByScope(validated.validation_status, tagScope.allowed, tagScope.raw);
+          if (vs === undefined) { const { validation_status: _d, ...rest } = validated; validated = rest; }
+          else validated = { ...validated, validation_status: vs };
+        }
+        return json({ ...validated, restored_from: "import_ix" in selector ? selector : selector.version_ix, recreated: !note });
+      } catch (e: any) {
+        if ("import_ix" in selector && e?.code === "HISTORY_UNRECOVERABLE" && e.origin !== "git-import") e = new ImportedHistoryUnrecoverableError(id, selector.import_ix, e.reason);
+        const r = conflictResponse(e);
+        if (r) return r;
+        throw e;
+      }
+    }
+    return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
+  }
+
+  if (sub !== "") return json({ error: "Not found", error_type: "not_found" }, 404);
+
+  // GET /notes/:idOrPath — single note
+  if (method === "GET") {
+    const note = await resolveNote(store, idOrPath);
+    if (!note) return json({ error: "Not found", error_type: "not_found" }, 404);
+    if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
+      return json({ error: "Not found", error_type: "not_found" }, 404);
+    }
+    const includeContent = parseBool(parseQuery(url, "include_content"), true);
+    const contentRange = parseContentRangeQuery(url, includeContent);
+    if (contentRange.error) return contentRange.error;
+    let result: any = includeContent ? { ...note } : toNoteIndex(note);
+    // Tag-scope (vault#568): filter `.tags` to the in-scope subset. Placed
+    // before the validation_status block on purpose — that block reads
+    // `note.tags` (the full set) to COMPUTE the status and then scrubs the
+    // status itself, so the two scrubs are independent.
+    result = scrubNoteTagsByScope(result, tagScope.allowed, tagScope.raw);
+    // vault#555 fix 3 — mirror the MCP query-notes fix: attach
+    // validation_status on reads too, not just on the one-time create/update
+    // write response. See core/src/mcp.ts's query-notes handler for the
+    // full rationale. Scrubbed for a tag-scoped caller (vault#555 auth
+    // review) so an out-of-scope co-tag's schema shape doesn't leak — no-op
+    // for unscoped callers (tagScope.raw === null).
+    {
+      const status = scrubValidationStatusByScope(
+        store.validateNoteAgainstSchemas({
+          path: note.path,
+          tags: note.tags,
+          metadata: note.metadata as Record<string, unknown> | undefined,
+        }, vis(tagScope)),
+        tagScope.allowed,
+        tagScope.raw,
+      );
+      if (status) result.validation_status = status;
+    }
+    const expand = parseExpandParams(url, db, tagScope);
+    if (expand && includeContent && typeof result.content === "string") {
+      expand.ctx.expanded.add(note.id);
+      result.content = expandContent(result.content, expand.ctx, expand.depth);
+    }
+    // Content range applies to the FINAL returned content (post-expansion).
+    if (contentRange.range && includeContent) applyContentRange(result, contentRange.range);
+    result = filterMetadata(result, parseIncludeMetadata(url));
+    if (parseBool(parseQuery(url, "include_links"), false)) {
+      // Tag-scope: drop out-of-scope-neighbor links (no-op unscoped).
+      result.links = filterHydratedLinksByTagScope(
+        linkOps.getLinksHydrated(db, note.id),
+        tagScope.allowed,
+        tagScope.raw,
+      );
+    }
+    if (parseBool(parseQuery(url, "include_attachments"), false)) {
+      result.attachments = await store.getAttachments(note.id);
+    }
+    if (parseBool(parseQuery(url, "include_link_count"), false)) {
+      result.linkCount = linkOps.getLinkCounts(db, [note.id], parseLinkCountDirection(url), ambiguityVisibilityFor(db, tagScope)).get(note.id) ?? 0;
+    }
+    return json(result);
+  }
+
+  // PATCH /notes/:idOrPath — update (content, path, metadata, tags, links)
+  if (method === "PATCH") {
+    try {
+      // Body is parsed up front so the `if_missing: "create"` branch
+      // (vault#309) can fire when the note doesn't exist. Pre-#309
+      // shape parsed the body only after the not-found check.
+      const parsedBody = await parseJsonBody(req);
+      if (!parsedBody.ok) return parsedBody.response;
+      const body = parsedBody.body as any;
+      if (body.if_updated_at !== undefined && !isValidIfUpdatedAt(body.if_updated_at)) return invalidIfUpdatedAtResponse();
+      const note = await resolveNote(store, idOrPath);
+      if (!note) {
+        // vault#309 — `if_missing: "create"` turns this PATCH into a
+        // create using the same payload. POST /notes is the canonical
+        // create surface, but supporting it inline on PATCH lets sync
+        // loops use one endpoint for both branches. Returns the
+        // created note with `created: true` and HTTP 200 (not 201 —
+        // the response shape is "the note as it now exists," same
+        // contract as the update path; `created: true` carries the
+        // signal).
+        if (body.if_missing === "create") {
+          const idOrPathStr = idOrPath;
+          // Tag-scope check on the create branch: the prospective
+          // tag set must still satisfy scope. Compute from body.tags
+          // (create-shape: an array, not the {add,remove} dict).
+          const tagsArr = Array.isArray(body.tags)
+            ? body.tags as string[]
+            : Array.isArray(body.tags?.add) ? body.tags.add as string[] : [];
+          if (tagScope.allowed && !tagsWithinScope(tagsArr, tagScope.allowed, tagScope.raw)) {
+            return tagScopeForbidden(tagScope.raw ?? []);
+          }
+          const idLooksLikePath = idOrPathStr.includes("/") || !/^[A-Za-z0-9_-]+$/.test(idOrPathStr);
+          const explicitPath = typeof body.path === "string" ? body.path as string : undefined;
+          // Validate extension before reaching the Store (vault#328).
+          const createExt = body.extension !== undefined
+            ? validateExtension(body.extension)
+            : undefined;
+          // Reject NUL / `..` paths at the write surface (vault#589 / FIX 2).
+          // Covers both the explicit `path` and the idOrPath-as-path shape.
+          validatePath(explicitPath ?? (idLooksLikePath ? idOrPathStr : undefined));
+          const createOpts: Parameters<Store["createNote"]>[1] = {
+            ...(idLooksLikePath ? { path: explicitPath ?? idOrPathStr } : { id: idOrPathStr, ...(explicitPath !== undefined ? { path: explicitPath } : {}) }),
+            ...(tagsArr.length > 0 ? { tags: tagsArr } : {}),
+            ...(body.metadata !== undefined ? { metadata: body.metadata as Record<string, unknown> } : {}),
+            ...(body.created_at !== undefined ? { created_at: body.created_at as string } : {}),
+            ...(body.createdAt !== undefined ? { created_at: body.createdAt as string } : {}),
+            ...(createExt !== undefined ? { extension: createExt } : {}),
+            // Write-attribution (vault#298) — REST upsert-create branch.
+            actor: writeCtx.actor,
+            via: writeCtx.via,
+          };
+          const content = (body.content as string | undefined) ?? "";
+          // Strict-schema gate (vault#299) — if_missing:"create" is a create.
+          gateStrictWrite(store, writeCtx, {
+            path: createOpts.path ?? undefined,
+            tags: createOpts.tags,
+            metadata: createOpts.metadata,
+          }, tagScope);
+          const created = await store.createNote(content, createOpts);
+          if (tagsArr.length > 0) {
+            await applySchemaDefaults(store, db, [created.id], tagsArr);
+          }
+          // vault#321 F2 — apply `links.add` on the create branch.
+          // MCP's create-on-missing branch already did this
+          // (`core/src/mcp.ts` if_missing=create block); the REST side
+          // was missing it, producing a cross-surface inconsistency
+          // operators (Gitcoin's drift sync) would trip on. Mirror the
+          // MCP recipe exactly:
+          //   - `links.add` IS applied — drift sync can declare typed
+          //     links at upsert time and have them materialize.
+          //   - `links.remove` is ignored (nothing to remove on a
+          //     fresh note).
+          //   - Missing target notes skip silently (mirrors MCP).
+          const linksAdd = (body.links as any)?.add as { target: string; relationship: string; metadata?: Record<string, unknown> }[] | undefined;
+          // `unresolved_link` / `ambiguous_link` warnings (vault#555, vault#570)
+          // — a target that doesn't resolve is queued for lazy resolution
+          // (backfills automatically when a matching note is created later),
+          // and a target matching ≥2 notes is neither linked nor queued.
+          // Never silently dropped.
+          const createWarnings: QueryWarning[] = [];
+          if (linksAdd) {
+            for (const link of linksAdd) {
+              const outcome = resolveOrQueueLink(db, created.id, link.target, link.relationship);
+              if (outcome.status === "resolved") {
+                await store.createLink(created.id, outcome.note_id, link.relationship, link.metadata);
+              } else if (outcome.status === "ambiguous") {
+                createWarnings.push(ambiguousLinkWarning(link.target, link.relationship, outcome.candidates.length));
+              } else {
+                createWarnings.push(unresolvedLinkWarning(link.target, link.relationship));
+              }
+            }
+          }
+          // Content-wikilink warnings (vault#570) — `store.createNote` above
+          // already ran `syncWikilinks`; this is the single-note (non-batch)
+          // create path, so there's no batch-sibling forward-ref to wait for
+          // — compute right away against the committed content.
+          if (content) {
+            createWarnings.push(...getContentWikilinkWarnings(db, created.id, content));
+          }
+          const scopedCreateWarnings = narrowWriteWarnings(db, createWarnings, tagScope);
+          const final = await store.getNote(created.id);
+          if (!final) return json({ error: "Note disappeared", error_type: "internal_error" }, 500);
+          let validated: any = attachValidationStatus(store, db, final, buildExpandVisibility(tagScope.allowed, tagScope.raw));
+          if (scopedCreateWarnings.length > 0) validated.warnings = scopedCreateWarnings;
+          // Tag-scope (vault#568): scrub the echoed note so create-then-read
+          // returns the SAME shape. A scoped token may legitimately attach an
+          // out-of-scope co-tag on write (`tagsWithinScope` only requires ONE
+          // in-scope tag), so this isn't a leak of anything it didn't send —
+          // but leaving it unscrubbed would make the write door the one place
+          // the full tag set is observable. Same for validation_status.
+          validated = scrubNoteTagsByScope(validated, tagScope.allowed, tagScope.raw);
+          if (validated.validation_status) {
+            const vs = scrubValidationStatusByScope(validated.validation_status, tagScope.allowed, tagScope.raw);
+            if (vs === undefined) { const { validation_status: _d, ...rest } = validated; validated = rest; }
+            else validated = { ...validated, validation_status: vs };
+          }
+          const includeContentResp = body.include_content !== false;
+          if (includeContentResp) return json({ ...validated, created: true });
+          const lean: any = toNoteIndex(validated);
+          const vs = (validated as any).validation_status;
+          if (vs !== undefined) lean.validation_status = vs;
+          if (scopedCreateWarnings.length > 0) lean.warnings = scopedCreateWarnings;
+          lean.created = true;
+          return json(lean);
+        }
+        throw new NotFoundError(`Note not found: "${idOrPath}"`);
+      }
+      // Tag-scope: existing note must be in scope. Mirror the read-side
+      // 404-not-403 stance — a token can't see (and therefore can't
+      // discover-then-modify) notes outside its allowlist.
+      if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
+        throw new NotFoundError(`Note not found: "${idOrPath}"`);
+      }
+      // Tag-scope: post-update tag set must still satisfy scope. Compute
+      // the prospective tag set (existing − removed + added) and reject
+      // before any write if it would drift outside the allowlist. This
+      // covers the bot-untags-its-only-allowlisted-tag escape route.
+      if (tagScope.allowed) {
+        const removed = new Set<string>((body.tags?.remove as string[] | undefined) ?? []);
+        const projected = new Set<string>((note.tags ?? []).filter((t) => !removed.has(t)));
+        for (const t of (body.tags?.add as string[] | undefined) ?? []) projected.add(t);
+        if (!tagsWithinScope([...projected], tagScope.allowed, tagScope.raw)) {
+          return tagScopeForbidden(tagScope.raw ?? []);
+        }
+      }
+
+      // --- Validate mutual exclusion of content modes ---
+      const hasContent = body.content !== undefined;
+      const hasAppendPrepend = body.append !== undefined || body.prepend !== undefined;
+      const hasContentEdit = body.content_edit !== undefined;
+      const contentModes = (hasContent ? 1 : 0) + (hasAppendPrepend ? 1 : 0) + (hasContentEdit ? 1 : 0);
+      if (contentModes > 1) {
+        return json(
+          {
+            error: "mutually_exclusive",
+            error_type: "mutually_exclusive",
+            message: "`content`, `append`/`prepend`, and `content_edit` are mutually exclusive — pick one mode of content update.",
+            hint: "pass exactly one of `content`, `append`/`prepend`, or `content_edit`",
+          },
+          400,
+        );
+      }
+
+      // --- Safety-by-default: refuse mutations without a precondition ---
+      // Mirror the MCP tool: require `if_updated_at` unless the caller
+      // explicitly sets `force: true`. 428 Precondition Required is the
+      // RFC 6585 status for exactly this case.
+      //
+      // Append/prepend-only updates are exempt — SQL-atomic concatenation
+      // is no-conflict-by-design. Tag/link mutations are *not* exempt
+      // (#201): they're idempotent set-ops, but still represent a
+      // non-content change the caller should observe before re-asserting.
+      const isAppendOnly = hasAppendPrepend
+        && !hasContent
+        && !hasContentEdit
+        && body.path === undefined
+        && body.metadata === undefined
+        && body.created_at === undefined
+        && body.createdAt === undefined
+        && body.tags === undefined
+        && body.links === undefined;
+      // A state_transition is itself a compare-and-set precondition (vault#299
+      // Part B) — a transition-only PATCH needs no if_updated_at/force.
+      const isTransitionOnly = body.state_transition !== undefined
+        && !hasContent
+        && !hasAppendPrepend
+        && !hasContentEdit
+        && body.path === undefined
+        && body.metadata === undefined
+        && body.created_at === undefined
+        && body.createdAt === undefined
+        && body.tags === undefined
+        && body.links === undefined;
+      if (!isAppendOnly && !isTransitionOnly && body.if_updated_at === undefined && body.force !== true) {
+        return json(
+          {
+            error_type: "precondition_required",
+            error: "precondition_required",
+            message:
+              "update requires `if_updated_at` (the note's last-seen updated_at) or `force: true`.",
+            note_id: note.id,
+            path: note.path ?? null,
+            hint: "re-read the note, pass its `updated_at` as `if_updated_at`, or pass `force: true` to skip the check",
+          },
+          428,
+        );
+      }
+
+      // --- Resolve content_edit into a full content string ---
+      let contentOverride = body.content as string | undefined;
+      if (hasContentEdit) {
+        const ce = body.content_edit as { old_text?: unknown; new_text?: unknown };
+        if (typeof ce?.old_text !== "string" || typeof ce?.new_text !== "string") {
+          return json(
+            {
+              error: "bad_request",
+              error_type: "invalid_content_edit",
+              field: "content_edit",
+              message: "`content_edit` requires { old_text: string, new_text: string }.",
+              hint: "pass { old_text: string, new_text: string }",
+            },
+            400,
+          );
+        }
+        const idx = note.content.indexOf(ce.old_text);
+        if (idx < 0) {
+          // 422 Unprocessable Entity, not 404: the note exists, the request is
+          // syntactically valid, but the search string can't be applied to the
+          // current content. Returning 404 implied "note doesn't exist" and
+          // confused operators chasing a missing record (#202).
+          return json(
+            {
+              error: "unprocessable_content",
+              error_type: "content_edit_not_found",
+              field: "content_edit.old_text",
+              message: `content_edit: \`old_text\` not found in note "${note.id}". Re-read and retry.`,
+              hint: "re-read the note's current content and retry with an old_text that occurs exactly once",
+            },
+            422,
+          );
+        }
+        const second = note.content.indexOf(ce.old_text, idx + 1);
+        if (second >= 0) {
+          return json(
+            {
+              error: "ambiguous",
+              error_type: "content_edit_ambiguous",
+              field: "content_edit.old_text",
+              message: `content_edit: \`old_text\` matches multiple times in note "${note.id}" — must match exactly once. Add surrounding context.`,
+              hint: "add surrounding context to old_text so it matches exactly once",
+            },
+            409,
+          );
+        }
+        contentOverride = note.content.slice(0, idx) + ce.new_text + note.content.slice(idx + ce.old_text.length);
+      }
+
+      // --- Plan bracket cleanup for wikilink removals (no DB writes yet) ---
+      // The actual link deletions happen only after the core UPDATE succeeds,
+      // so a conflict leaves the note untouched.
+      const linksRemove = body.links?.remove as { target: string; relationship: string }[] | undefined;
+      const resolvedLinksToRemove: { targetId: string; relationship: string }[] = [];
+      if (linksRemove) {
+        for (const link of linksRemove) {
+          const target = resolveStructuredLinkNote(db, link.target);
+          if (!target) continue;
+          resolvedLinksToRemove.push({ targetId: target.id, relationship: link.relationship });
+          if (link.relationship === "wikilink" && target.path) {
+            // Materialize the prospective content for append/prepend callers
+            // so we don't fight the SQL-atomic path with a JS-level rewrite.
+            const current = contentOverride
+              ?? (hasAppendPrepend
+                ? (body.prepend as string ?? "") + note.content + (body.append as string ?? "")
+                : note.content);
+            const cleaned = removeWikilinkBrackets(current, target.path);
+            if (cleaned !== current) contentOverride = cleaned;
+          }
+        }
+      }
+
+      // --- Core update (runs the if_updated_at check atomically) ---
+      const updates: any = {};
+      if (contentOverride !== undefined) {
+        updates.content = contentOverride;
+      } else if (hasAppendPrepend) {
+        if (body.append !== undefined) updates.append = body.append;
+        if (body.prepend !== undefined) updates.prepend = body.prepend;
+      }
+      if (body.path !== undefined) {
+        // Reject NUL / `..` paths at the write surface (vault#589 / FIX 2).
+        // Throws PathValidationError → 400 in the outer catch.
+        validatePath(body.path);
+        updates.path = body.path;
+      }
+      if (body.extension !== undefined) {
+        // Validate up front (vault#328). Throws ExtensionValidationError
+        // which the outer catch converts to a 400.
+        updates.extension = validateExtension(body.extension);
+      }
+      if (body.metadata !== undefined) {
+        // RFC 7386 merge: incoming `null` removes the key (vault#478/#479).
+        updates.metadata = mergeMetadata(
+          note.metadata as Record<string, unknown> | null | undefined,
+          body.metadata as Record<string, unknown>,
+        );
+      }
+      if (body.created_at !== undefined || body.createdAt !== undefined) {
+        updates.created_at = body.created_at ?? body.createdAt;
+      }
+      if (body.if_updated_at !== undefined) {
+        updates.if_updated_at = body.if_updated_at;
+      }
+      // Compare-and-set state transition (vault#299 Part B). Combinable with
+      // other field updates; folds into the same atomic UPDATE.
+      const stBody = body.state_transition as { field?: unknown; from?: unknown; to?: unknown } | undefined;
+      if (stBody !== undefined) {
+        if (typeof stBody.field !== "string" || stBody.field.length === 0) {
+          return json(
+            {
+              error: "bad_request",
+              error_type: "invalid_state_transition",
+              field: "state_transition.field",
+              message: "`state_transition.field` must be a non-empty string.",
+              hint: "pass a non-empty string naming the metadata field to transition",
+            },
+            400,
+          );
+        }
+        updates.state_transition = { field: stBody.field, from: stBody.from, to: stBody.to };
+      }
+
+      // --- Strict-schema gate (vault#299 Part A) ---
+      // Validate the PROSPECTIVE shape (final tags + merged metadata, incl. a
+      // state_transition's `to`) before the write so a rejection leaves the
+      // note untouched. Throws SchemaValidationError → 422 in the catch.
+      {
+        const removeSet = new Set<string>((body.tags?.remove as string[] | undefined) ?? []);
+        const projectedTags = new Set<string>((note.tags ?? []).filter((t) => !removeSet.has(t)));
+        for (const t of (body.tags?.add as string[] | undefined) ?? []) projectedTags.add(t);
+        const baseMeta = updates.metadata ?? ((note.metadata as Record<string, unknown>) ?? {});
+        const projectedMeta = stBody !== undefined
+          ? { ...baseMeta, [stBody.field as string]: stBody.to }
+          : baseMeta;
+        gateStrictWrite(store, writeCtx, { path: note.path, tags: [...projectedTags], metadata: projectedMeta }, tagScope);
+      }
+
+      // vault#555 fix 2 — tag and link mutations must bump `updated_at` too,
+      // not just core-field (content/path/metadata) changes. Mirrors the MCP
+      // `update-note` fix exactly: a tags-only or links-only PATCH with
+      // `force: true` (no `if_updated_at`) left `updates` empty, so
+      // `store.updateNote` was never even called and `updated_at` never
+      // moved despite a real tags/note_tags or links change.
+      const hasTagMutation = (body.tags?.add?.length ?? 0) > 0 || (body.tags?.remove?.length ?? 0) > 0;
+      const hasLinkMutation = body.links?.add !== undefined || body.links?.remove !== undefined;
+      // Content-wikilink warnings (vault#570) gate on the SAME condition
+      // `store.updateNote`/`syncWikilinks` use to decide whether to re-sync
+      // content wikilinks at all — a tags/links-only PATCH must not
+      // spuriously re-warn about pre-existing broken links this call never
+      // touched.
+      const contentChanged = updates.content !== undefined
+        || updates.append !== undefined
+        || updates.prepend !== undefined;
+      if (Object.keys(updates).length > 0 || hasTagMutation || hasLinkMutation) {
+        // Write-attribution (vault#298) — REST update. Stamp the most-recent-
+        // write columns on the same UPDATE that bumps updated_at. `updates`
+        // may carry no core fields at all (a pure tag/link mutation) — that's
+        // fine: `noteOps.updateNote` unconditionally SETs
+        // `updated_at`/`last_updated_by`/`last_updated_via` whenever
+        // `skipUpdatedAt` isn't set, so this still issues a real UPDATE.
+        updates.actor = writeCtx.actor;
+        updates.via = writeCtx.via;
+        await store.updateNote(note.id, updates);
+      }
+
+      // --- Remove links (after core UPDATE; conflict would have thrown already) ---
+      for (const { targetId, relationship } of resolvedLinksToRemove) {
+        await store.deleteLink(note.id, targetId, relationship);
+      }
+
+      // Tags
+      if (body.tags?.add?.length) {
+        await store.tagNote(note.id, body.tags.add);
+        await applySchemaDefaults(store, db, [note.id], body.tags.add);
+      }
+      if (body.tags?.remove?.length) {
+        await store.untagNote(note.id, body.tags.remove);
+      }
+
+      // Add links. `unresolved_link` / `ambiguous_link` warnings (vault#555,
+      // vault#570) — a target that doesn't resolve is queued for lazy
+      // resolution (backfills automatically when a matching note is created
+      // later); a target matching ≥2 notes is neither linked nor queued.
+      // Never silently dropped.
+      const linkWarnings: QueryWarning[] = [];
+      if (body.links?.add) {
+        for (const link of body.links.add as { target: string; relationship: string; metadata?: Record<string, unknown> }[]) {
+          const outcome = resolveOrQueueLink(db, note.id, link.target, link.relationship);
+          if (outcome.status === "resolved") {
+            await store.createLink(note.id, outcome.note_id, link.relationship, link.metadata);
+          } else if (outcome.status === "ambiguous") {
+            linkWarnings.push(ambiguousLinkWarning(link.target, link.relationship, outcome.candidates.length));
+          } else {
+            linkWarnings.push(unresolvedLinkWarning(link.target, link.relationship));
+          }
+        }
+      }
+
+      // Response shape: full Note (back-compat default) or lean NoteIndex
+      // (vault#285 friction point 2.response — opt-out for callers making
+      // frequent small edits to large notes). Mirror the MCP `update-note`
+      // `include_content` knob exactly, *and* `validation_status` attachment
+      // (vault#287) so HTTP and MCP consumers see the same schema-validation
+      // signal. Recipe matches `core/src/mcp.ts:751` — attach to the full
+      // Note first, then carry the field across the lean conversion (since
+      // `toNoteIndex` drops unknown fields).
+      const updatedNote = await store.getNote(note.id);
+      if (updatedNote === null) return json({ error: "Note disappeared", error_type: "not_found" }, 404);
+      // Content-wikilink warnings (vault#570) — `store.updateNote` above
+      // already ran `syncWikilinks` when `contentChanged`; this PATCH
+      // handles a single note (no batch-sibling forward-ref to wait for),
+      // so compute right away against the committed content.
+      if (contentChanged) {
+        linkWarnings.push(...getContentWikilinkWarnings(db, note.id, updatedNote.content));
+      }
+      let validated: any = attachValidationStatus(store, db, updatedNote, buildExpandVisibility(tagScope.allowed, tagScope.raw));
+      // Tag-scope (vault#568): the update response echoes the STORED note, so
+      // without this a scoped caller could recover a co-tagged note's full tag
+      // set with a no-op PATCH — the read-path scrub would be trivially
+      // bypassable. The validation_status scrub rides along for the same
+      // reason (#555 only wired it to the read paths).
+      validated = scrubNoteTagsByScope(validated, tagScope.allowed, tagScope.raw);
+      if (validated.validation_status) {
+        const vs = scrubValidationStatusByScope(validated.validation_status, tagScope.allowed, tagScope.raw);
+        if (vs === undefined) { const { validation_status: _d, ...rest } = validated; validated = rest; }
+        else validated = { ...validated, validation_status: vs };
+      }
+      // Echo hydrated links when a link mutation was part of this request,
+      // OR the caller explicitly asked for them via `?include_links=true`
+      // (vault feedback #8). Previously the update response omitted links
+      // entirely (`getNote` populates tags but not links), forcing callers
+      // to re-GET with `?include_links=true` just to confirm a link they
+      // had just added/removed. Additive field, scoped to UPDATE: present
+      // only when mutated or requested. Mirrors the GET / query-notes
+      // hydration call form exactly (`linkOps.getLinksHydrated`).
+      const linkMutated = body.links?.add !== undefined || body.links?.remove !== undefined;
+      const includeLinksResp = linkMutated || parseBool(parseQuery(url, "include_links"), false);
+      if (includeLinksResp) {
+        // Tag-scope: strip out-of-scope-neighbor links from the echoed set
+        // (no-op unscoped). A write token tag-scoped to #work mustn't learn
+        // about a #personal note it happened to link to.
+        validated.links = filterHydratedLinksByTagScope(
+          linkOps.getLinksHydrated(db, updatedNote.id),
+          tagScope.allowed,
+          tagScope.raw,
+        );
+      }
+      const scopedLinkWarnings = narrowWriteWarnings(db, linkWarnings, tagScope);
+      if (scopedLinkWarnings.length > 0) validated.warnings = scopedLinkWarnings;
+      const includeContentResp = body.include_content !== false;
+      // `created: false` is appended to every update-path response so
+      // sync-loop callers using `if_missing: "create"` can distinguish
+      // the two branches without a separate query (vault#309). The
+      // create-branch response above carries `created: true`.
+      if (includeContentResp) return json({ ...validated, created: false });
+      const lean: any = toNoteIndex(validated);
+      const vs = (validated as any).validation_status;
+      if (vs !== undefined) lean.validation_status = vs;
+      // Carry the link echo across the lean conversion — `toNoteIndex`
+      // drops unknown fields, same as the `validation_status` recipe above.
+      if (validated.links !== undefined) lean.links = validated.links;
+      if (scopedLinkWarnings.length > 0) lean.warnings = scopedLinkWarnings;
+      lean.created = false;
+      return json(lean);
+    } catch (e: any) {
+      const r = conflictResponse(e);
+      if (r) return r;
+      throw e;
+    }
+  }
+
+  // DELETE /notes/:idOrPath — vault:write (no admin gate; consistent with verbForMethod)
+  if (method === "DELETE") {
+    const note = await resolveNote(store, idOrPath);
+    if (!note) return json({ error: "Not found", error_type: "not_found" }, 404);
+    // Tag-scope: can't delete what you can't read. 404 (not 403) for the
+    // same no-leak reason as the read paths.
+    if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
+      return json({ error: "Not found", error_type: "not_found" }, 404);
+    }
+    await store.deleteNote(note.id, { actor: writeCtx.actor, via: writeCtx.via });
+    return json({ deleted: true, id: note.id });
+  }
+
+  return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
+}
+
+// ---------------------------------------------------------------------------
+// Tags — GET/PUT/DELETE /api/tags[/:name], POST /api/tags/merge,
+//        POST /api/tags/:name/rename
+// ---------------------------------------------------------------------------
+
+export async function handleTags(
+  req: Request,
+  store: Store,
+  subpath = "",
+  tagScope: TagScopeCtx = NO_TAG_SCOPE,
+  writeCtx: WriteCtx = NO_WRITE_CTX,
+): Promise<Response> {
+  const url = new URL(req.url);
+
+  // GET /tags — list all, or get single tag detail
+  if (req.method === "GET" && subpath === "") {
+    const singleTag = parseQuery(url, "tag");
+
+    if (singleTag) {
+      // Tag-scope: a tag-scoped token can only see tags reachable from its
+      // allowlist (root + descendants per the parent_names hierarchy).
+      // Anything else 404s — same "no leak" stance as note reads. This
+      // early-return means the vault#550 unknown-tag 404 below never even
+      // runs for a scope-excluded name — `did_you_mean` (which searches
+      // vault-wide) can't fire and leak an out-of-scope tag's existence.
+      if (tagScope.allowed && !tagScope.allowed.has(singleTag)) {
+        return json({ error: "Tag not found", error_type: "tag_not_found", tag: singleTag }, 404);
+      }
+      const allTags = await store.listTags();
+      const found = allTags.find((t) => t.name === singleTag);
+      const record = await store.getTagRecord(singleTag);
+      // vault#550 — a tag with no identity row AND no notes carrying it
+      // isn't a legitimate (if empty) tag; it's a typo or a tag from a
+      // different vault. Return a structured 404 instead of synthesizing
+      // an all-null 200. `did_you_mean` candidates are restricted to the
+      // caller's allowlist when scoped (defense in depth — this branch is
+      // normally unreachable for a scoped session per the early-return
+      // above, but stays scope-safe if that ever changes).
+      if (!found && !record) {
+        const candidates = tagScope.allowed
+          ? allTags.filter((t) => tagScope.allowed!.has(t.name)).map((t) => t.name)
+          : allTags.map((t) => t.name);
+        const suggestion = suggestSimilarTag(candidates, singleTag);
+        return json(
+          {
+            error: "Tag not found",
+            error_type: "tag_not_found",
+            tag: singleTag,
+            ...(suggestion ? { did_you_mean: suggestion } : {}),
+          },
+          404,
+        );
+      }
+      return json({
+        name: singleTag,
+        count: found?.count ?? 0,
+        expanded_count: found?.expanded_count ?? 0,
+        description: record?.description ?? null,
+        fields: record?.fields ?? null,
+        relationships: record?.relationships ?? null,
+        parent_names: record?.parent_names ?? null,
+        created_at: record?.created_at ?? null,
+        updated_at: record?.updated_at ?? null,
+      });
+    }
+
+    const tags = await store.listTags();
+    const filtered = tagScope.allowed
+      ? await scrubTagCountsForPrivateTags(store, tags.filter((t) => tagScope.allowed!.has(t.name)), tagScope.allowed)
+      : tags;
+    if (parseBool(parseQuery(url, "include_schema"), false)) {
+      const records = new Map(
+        (await store.listTagRecords()).map((r) => [r.tag, r] as const),
+      );
+      return json(filtered.map((t) => {
+        const r = records.get(t.name);
+        return {
+          ...t,
+          description: r?.description ?? null,
+          fields: r?.fields ?? null,
+          relationships: r?.relationships ?? null,
+          parent_names: r?.parent_names ?? null,
+          created_at: r?.created_at ?? null,
+          updated_at: r?.updated_at ?? null,
+        };
+      }));
+    }
+    return json(filtered);
+  }
+
+  // POST /tags/merge — atomic multi-source merge into a target tag.
+  // Must come before the /:name matcher so "merge" isn't read as a tag name.
+  if (subpath === "/merge") {
+    if (req.method !== "POST") return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
+    const body = (await req.json().catch(() => null)) as
+      | { sources?: unknown; target?: unknown }
+      | null;
+    if (!body) return json({ error: "Invalid JSON body", error_type: "invalid_json" }, 400);
+    const sources = body.sources;
+    const target = body.target;
+    if (!Array.isArray(sources) || !sources.every((s) => typeof s === "string" && s.length > 0)) {
+      return json({ error: "sources must be a non-empty array of strings", error_type: "invalid_request", field: "sources" }, 400);
+    }
+    if (typeof target !== "string" || target.length === 0) {
+      return json({ error: "target must be a non-empty string", error_type: "invalid_request", field: "target" }, 400);
+    }
+    // Tag-scope: every source AND the target must be inside the allowlist.
+    // A merge that pulls notes out of a token's scope (or pushes notes into
+    // it) is a privilege escalation; refuse the whole op.
+    if (tagScope.allowed) {
+      for (const t of [...sources, target]) {
+        if (!tagScope.allowed.has(t)) {
+          return tagScopeForbidden(tagScope.raw ?? []);
+        }
+      }
+    }
+    // Same dependency check as DELETE /tags/:name — merging consumes every
+    // source tag, so a source referenced by a tag-scoped token would orphan
+    // that token's allowlist. Aggregate matches across sources for a single
+    // 409 envelope.
+    const referenced: { source: string; tokens: { id: string; label: string }[] }[] = [];
+    const db = store.db;
+    for (const src of sources) {
+      const tokens = findTokensReferencingTag(db, src as string);
+      if (tokens.length > 0) referenced.push({ source: src as string, tokens });
+    }
+    if (referenced.length > 0) {
+      return json(
+        {
+          error: "TagInUseByTokens",
+          error_type: "tag_in_use_by_tokens",
+          message: `Cannot merge: ${referenced.length} source tag(s) referenced by tag-scoped token(s); revoke or re-mint them first.`,
+          referenced_by: referenced,
+        },
+        409,
+      );
+    }
+    const result = await store.mergeTags(sources, target);
+    return json(result);
+  }
+
+  // POST /tags/:name/rename — atomic rename across tags + note_tags + schema
+  const renameMatch = subpath.match(/^\/([^/]+)\/rename$/);
+  if (renameMatch) {
+    if (req.method !== "POST") return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
+    const oldName = decodeURIComponent(renameMatch[1]!);
+    const body = (await req.json().catch(() => null)) as { new_name?: unknown } | null;
+    if (!body) return json({ error: "Invalid JSON body", error_type: "invalid_json" }, 400);
+    const newName = body.new_name;
+    if (typeof newName !== "string" || newName.length === 0) {
+      return json({ error: "new_name must be a non-empty string", error_type: "invalid_request", field: "new_name" }, 400);
+    }
+    if (tagScope.allowed && (!tagScope.allowed.has(oldName) || !tagScope.allowed.has(newName))) {
+      return tagScopeForbidden(tagScope.raw ?? []);
+    }
+    // Vault#240: rename now cascades to tokens.scoped_tags (and every
+    // other surface). The old fail-closed token-reference check has been
+    // removed; the cascade rewrites the JSON allowlist atomically. See
+    // notes.ts:renameTag for the surfaces touched.
+    const result = await store.renameTag(oldName, newName, { actor: writeCtx.actor ?? undefined, via: writeCtx.via ?? undefined });
+    if ("error" in result) {
+      if (result.error === "not_found") {
+        return json({ error: "not_found", error_type: "tag_not_found", tag: oldName }, 404);
+      }
+      if (result.error === "target_exists") {
+        return json(
+          {
+            error: "target_exists",
+            error_type: "target_exists",
+            target: newName,
+            conflicting: result.conflicting,
+            message: "Target tag (or one of its sub-tags) already exists; use POST /api/tags/merge to combine them.",
+            hint: "use POST /api/tags/merge to combine the tags instead",
+          },
+          409,
+        );
+      }
+    }
+    return json(result);
+  }
+
+  // POST /tags/:name/conformance — count existing notes that would VIOLATE a
+  // proposed field spec for the tag (vault#283 tightening warning). Read-only
+  // (POST because it carries a proposed `fields` body). Must precede the
+  // /:name matcher so "conformance" isn't read as a tag name.
+  const conformanceMatch = subpath.match(/^\/([^/]+)\/conformance$/);
+  if (conformanceMatch) {
+    if (req.method !== "POST") return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
+    const cTag = decodeURIComponent(conformanceMatch[1]!);
+    if (tagScope.allowed && !tagScope.allowed.has(cTag)) {
+      return json({ error: "Tag not found", error_type: "tag_not_found", tag: cTag }, 404);
+    }
+    const body = (await req.json().catch(() => null)) as
+      | { fields?: Record<string, unknown> | null }
+      | null;
+    if (!body) return json({ error: "Invalid JSON body", error_type: "invalid_json" }, 400);
+    // The proposed fields the operator intends to save. Sanitized through the
+    // same parse the resolver uses (drop non-object specs). Empty/absent →
+    // nothing to enforce → zero violations.
+    const proposed: Record<string, tagSchemaOps.TagFieldSchema> = {};
+    if (body.fields && typeof body.fields === "object" && !Array.isArray(body.fields)) {
+      for (const [k, v] of Object.entries(body.fields)) {
+        if (v && typeof v === "object" && !Array.isArray(v)) {
+          proposed[k] = v as tagSchemaOps.TagFieldSchema;
+        }
+      }
+    }
+    const report = await store.countTagConformance(cTag, proposed);
+    return json(report);
+  }
+
+  // GET /tags/:name/effective — the tag's effective (own ∪ inherited) fields +
+  // direct/effective parents + schema-conflict info, drawn from the same
+  // projection vault-info exposes. Read-only inheritance preview for the
+  // Schema editor (vault#283). Must precede the /:name matcher.
+  const effectiveMatch = subpath.match(/^\/([^/]+)\/effective$/);
+  if (effectiveMatch) {
+    if (req.method !== "GET") return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
+    const eTag = decodeURIComponent(effectiveMatch[1]!);
+    if (tagScope.allowed && !tagScope.allowed.has(eTag)) {
+      return json({ error: "Tag not found", error_type: "tag_not_found", tag: eTag }, 404);
+    }
+    const projection = buildVaultProjection(store.db);
+    const record = await store.getTagRecord(eTag);
+    // Resolve inheritance directly (not via projection.tags, which omits
+    // hierarchy-only tags carrying no own schema) so the editor's preview
+    // works even for a tag the operator is just starting to give fields.
+    const resolved = loadSchemaConfig(store.db);
+    const { effective_parents, effective_fields } = resolveTagInheritance(resolved, eTag);
+    return json({
+      name: eTag,
+      parents: record?.parent_names ?? [],
+      effective_parents,
+      fields: record?.fields ?? null,
+      effective_fields,
+      indexed_fields: projection.indexed_fields,
+    });
+  }
+
+  // Routes with tag name
+  const nameMatch = subpath.match(/^\/([^/]+)$/);
+  if (!nameMatch) return json({ error: "Not found", error_type: "not_found" }, 404);
+  const tagName = decodeURIComponent(nameMatch[1]!);
+
+  // GET /tags/:name — single tag detail (full record)
+  if (req.method === "GET") {
+    // Same "no leak" early-return as the `?tag=` form above — a
+    // scope-excluded name 404s before `did_you_mean` (vault-wide) can run.
+    if (tagScope.allowed && !tagScope.allowed.has(tagName)) {
+      return json({ error: "Tag not found", error_type: "tag_not_found", tag: tagName }, 404);
+    }
+    const allTags = await store.listTags();
+    const found = allTags.find((t) => t.name === tagName);
+    const record = await store.getTagRecord(tagName);
+    // vault#550 — see the `?tag=` form above for the rationale (no
+    // identity row + no memberships = not a real tag, not a legitimate
+    // empty one).
+    if (!found && !record) {
+      const candidates = tagScope.allowed
+        ? allTags.filter((t) => tagScope.allowed!.has(t.name)).map((t) => t.name)
+        : allTags.map((t) => t.name);
+      const suggestion = suggestSimilarTag(candidates, tagName);
+      return json(
+        {
+          error: "Tag not found",
+          error_type: "tag_not_found",
+          tag: tagName,
+          ...(suggestion ? { did_you_mean: suggestion } : {}),
+        },
+        404,
+      );
+    }
+    return json({
+      name: tagName,
+      count: found?.count ?? 0,
+      expanded_count: found?.expanded_count ?? 0,
+      description: record?.description ?? null,
+      fields: record?.fields ?? null,
+      relationships: record?.relationships ?? null,
+      parent_names: record?.parent_names ?? null,
+      created_at: record?.created_at ?? null,
+      updated_at: record?.updated_at ?? null,
+    });
+  }
+
+  // PUT /tags/:name — upsert tag identity row. Body accepts any combination
+  // of { description, fields, relationships, parent_names }; omitted keys
+  // are preserved, explicit null clears. See docs/contracts/tag-data-model.md.
+  if (req.method === "PUT") {
+    // Canonical-bare-tag guard (vault#XXX): normalize the upserted tag NAME so
+    // the existing-field merge read (store.getTagSchema below) and the upsert
+    // both target the bare row. store.upsertTagRecord re-normalizes (idempotent)
+    // for the write; this keeps the partial-merge read correct for a
+    // `#`-decorated PUT path. (GET/DELETE/rename keep their literal lookups —
+    // rename's source-name must still match a `#`-prefixed legacy row so the
+    // data migration can rename it away.)
+    const putTagName = stripTagHash(tagName);
+    if (tagScope.allowed && !tagScope.allowed.has(putTagName)) {
+      return tagScopeForbidden(tagScope.raw ?? []);
+    }
+    const parsedBody = await parseJsonBody(req);
+    if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.body as {
+      description?: string | null;
+      fields?: Record<string, unknown> | null;
+      relationships?: Record<string, unknown> | null;
+      parent_names?: unknown;
+      /**
+       * When true, `fields` is treated as the FULL intended field map for the
+       * tag — fields absent from the payload are DROPPED (a replace, not a
+       * merge). Default false preserves the historical partial-update merge
+       * the MCP `update-tag` tool relies on (omitted keys preserved). The
+       * Schema editor (vault#283) sends the full map + `replace_fields: true`
+       * so removing a field row actually deletes the field. See
+       * docs/contracts/tag-data-model.md.
+       */
+      replace_fields?: unknown;
+    };
+    const replaceFields = body.replace_fields === true;
+
+    // Validate the relationships payload up front so a bad payload returns
+    // 400, not a thrown 500. `relationships` is an opaque vocabulary map
+    // (relationship-name → arbitrary JSON the app interprets); we only check
+    // that it's a JSON object (a map), then persist verbatim.
+    let relationshipsPatch:
+      | tagSchemaOps.TagRelationshipMap
+      | null
+      | undefined;
+    if (body.relationships === null) {
+      relationshipsPatch = null;
+    } else if (body.relationships !== undefined) {
+      try {
+        relationshipsPatch = tagSchemaOps.validateRelationships(body.relationships);
+      } catch (err) {
+        return json(
+          { error: (err as Error).message, error_type: "invalid_relationships" },
+          400,
+        );
+      }
+    }
+
+    let parentNamesPatch: string[] | null | undefined;
+    if (body.parent_names === null) {
+      parentNamesPatch = null;
+    } else if (body.parent_names !== undefined) {
+      if (!Array.isArray(body.parent_names)) {
+        return json(
+          {
+            error: "parent_names must be an array of tag names",
+            error_type: "invalid_parent_names",
+            field: "parent_names",
+            hint: "pass an array of tag name strings, or null to clear",
+          },
+          400,
+        );
+      }
+      const cleaned = (body.parent_names as unknown[]).filter(
+        (p): p is string => typeof p === "string" && p.length > 0,
+      );
+      parentNamesPatch = cleaned.length > 0 ? cleaned : null;
+    }
+
+    // Field merge mirrors MCP update-tag — preserves prior keys when the
+    // payload only declares new ones. UNLESS `replace_fields: true`, in which
+    // case `fields` is the full intended map and absent keys are dropped (the
+    // Schema editor's full-replacement save — vault#283; without this a
+    // removed field row is silently resurrected by the merge).
+    let fieldsPatch:
+      | Record<string, tagSchemaOps.TagFieldSchema>
+      | null
+      | undefined;
+    if (body.fields === null) {
+      fieldsPatch = null;
+    } else if (body.fields !== undefined) {
+      if (replaceFields) {
+        const full = body.fields as Record<string, tagSchemaOps.TagFieldSchema>;
+        fieldsPatch = Object.keys(full).length > 0 ? full : null;
+      } else {
+        const existing = await store.getTagSchema(putTagName);
+        const merged: Record<string, tagSchemaOps.TagFieldSchema> = {
+          ...(existing?.fields ?? {}),
+          ...(body.fields as Record<string, tagSchemaOps.TagFieldSchema>),
+        };
+        fieldsPatch = Object.keys(merged).length > 0 ? merged : null;
+      }
+    }
+
+    // Cross-tag field validation (vault#553/#554) — validate the fields THIS
+    // call is declaring (`body.fields`, not the merged `fieldsPatch`) against
+    // every other tag's schema BEFORE any write. Mirrors the MCP update-tag
+    // tool's cross-tag checks so REST and MCP report identically for this
+    // class: EVERY conflicting field in one response (not just the first),
+    // and the message states explicitly that no changes were applied —
+    // nothing is persisted before this check runs. Two case families are
+    // deliberately EXCLUDED and keep their pre-existing `IndexedFieldError`
+    // → 400 `invalid_indexed_field` path below (unchanged status/error_type):
+    // the own-field checks (unsupported type, invalid name — vault#478) AND
+    // both-indexed cross-tag type conflicts (already 400 on main via
+    // `declareField`'s cross-declarer sqlite-type check; the wire-contract
+    // floor forbids flipping that to 422). What this pre-check newly rejects
+    // — silent 200s on main — is non-indexed type conflicts and indexed-flag
+    // conflicts. See `collectCrossTagFieldViolations`'s doc comment.
+    if (body.fields && typeof body.fields === "object" && !Array.isArray(body.fields)) {
+      const incomingFields = body.fields as Record<string, tagSchemaOps.TagFieldSchema>;
+      // vault#555 fix 5 — fold the own-field `default`/`type` checks into
+      // the SAME bundled report as the cross-tag ones. Before this, a bad
+      // `default` (and, since fix 4 added the check, an unrecognized
+      // `type`) went through `store.upsertTagRecord`'s fail-fast pre-
+      // validate below INSTEAD — a single-violation 400 that silently never
+      // mentioned any OTHER bad field in the same call. `unsupported_
+      // indexed_type`/`invalid_field_name` deliberately stay OUT of this
+      // bundle — REST's established single-violation `400
+      // invalid_indexed_field` contract for those two is unchanged
+      // (vault#478; see `collectCrossTagFieldViolations`'s doc comment).
+      const fieldViolations = tagSchemaOps.collectCrossTagFieldViolations(
+        store.db,
+        putTagName,
+        incomingFields,
+      ).concat(tagSchemaOps.collectOwnFieldDefaultAndTypeViolations(incomingFields));
+      if (fieldViolations.length > 0) {
+        // Tag-scope scrub (vault#554 auth-and-scope fold): the write is
+        // still rejected, but a violation whose conflicting declarer is
+        // outside a scoped caller's allowlist must not name that tag or
+        // reveal its schema. No-op for unscoped callers (allowed === null).
+        const violations = scrubTagFieldViolationsByScope(fieldViolations, tagScope.allowed);
+        return json(
+          {
+            error: "tag_field_conflict",
+            error_type: "tag_field_conflict",
+            tag: putTagName,
+            violations,
+            message: `${violations.length} field violation(s) for tag "${putTagName}" — no changes were applied.`,
+          },
+          422,
+        );
+      }
+    }
+
+    // A bad indexed-field name (or an unindexable type, or a cross-tag type
+    // mismatch) is a CLIENT error — return 400, not the catch-all 500. The
+    // store pre-validates and is transactional, so the schema is left
+    // unchanged on failure (no orphan/lying index). vault#478.
+    let result;
+    try {
+      result = await store.upsertTagRecord(putTagName, {
+        ...(body.description !== undefined ? { description: body.description } : {}),
+        ...(fieldsPatch !== undefined ? { fields: fieldsPatch } : {}),
+        ...(relationshipsPatch !== undefined ? { relationships: relationshipsPatch } : {}),
+        ...(parentNamesPatch !== undefined ? { parent_names: parentNamesPatch } : {}),
+      });
+    } catch (err) {
+      if (err instanceof IndexedFieldError) {
+        // Tag-scope scrub (vault#554 fold): declareField's cross-declarer
+        // type-conflict message names the other declarer tag(s) + their
+        // sqlite type — generalize when any declarer is outside a scoped
+        // caller's allowlist. No-op for unscoped callers and for the solo
+        // own-field errors (no declarer_tags). Status/error_type unchanged.
+        const scrubbed = scrubIndexedFieldConflictError(err, tagScope.allowed);
+        return json(
+          { error: scrubbed.message, error_type: "invalid_indexed_field" },
+          400,
+        );
+      }
+      if (err instanceof InvalidFieldDefaultError) {
+        // vault#553 Decision B — a declared `default` doesn't conform to its
+        // own field's type/enum. Own-field error (no cross-tag data), so no
+        // scrub needed. DEFENSE-IN-DEPTH ONLY as of vault#555 fix 5 — the
+        // pre-check above (`collectOwnFieldDefaultAndTypeViolations`) now
+        // catches every `invalid_default` BEFORE reaching `store.upsertTagRecord`
+        // and reports it bundled via `tag_field_conflict` 422 instead; this
+        // branch only fires for a caller that somehow bypasses that pre-check.
+        return json(
+          { error: err.message, error_type: "invalid_field_default", field: err.field },
+          400,
+        );
+      }
+      if (err instanceof InvalidFieldTypeError) {
+        // vault#555 fix 4 — a declared `type` isn't one of the six
+        // recognized values. Same defense-in-depth posture as
+        // InvalidFieldDefaultError above — the pre-check catches this in
+        // the normal path and reports it bundled instead.
+        return json(
+          { error: err.message, error_type: "invalid_field_type", field: err.field, type: err.type, valid_types: err.valid_types },
+          400,
+        );
+      }
+      if (err instanceof ParentCycleError) {
+        // vault#552: parent_names would close a cycle. Nothing was
+        // persisted. Scope-scrub the cycle path for a tag-scoped caller —
+        // the write stays rejected either way. `error` is a SHORT code and
+        // `message` the human sentence — the same split every sibling 409 in
+        // this file uses (target_exists, tag_in_use_by_tokens,
+        // tag_referenced_as_parent). parachute-surface's shared VaultClient
+        // 409 handler reads `body.message` (falling back to a hardcoded
+        // "Note was edited elsewhere"), so the message key is load-bearing:
+        // without it the Tags parent_names editor would show the wrong
+        // conflict text.
+        const scrubbed = scrubParentCycleError(err, tagScope.allowed);
+        return json(
+          {
+            error: "ParentCycle",
+            error_type: "parent_cycle",
+            tag: scrubbed.tag,
+            cycle: scrubbed.cycle,
+            message: scrubbed.message,
+          },
+          409,
+        );
+      }
+      throw err;
+    }
+    return json(result);
+  }
+
+  // DELETE /tags/:name — delete tag + identity row + remove from all notes
+  if (req.method === "DELETE") {
+    if (tagScope.allowed && !tagScope.allowed.has(tagName)) {
+      return tagScopeForbidden(tagScope.raw ?? []);
+    }
+    // Tag-scoped tokens reference root tags by name; deleting a referenced
+    // tag would silently orphan the token's allowlist. Fail closed (409)
+    // and name the offending tokens so the operator can revoke or re-mint
+    // before retrying. docs/contracts/tag-scoped-tokens.md §Dependencies.
+    const referenced_by = findTokensReferencingTag(store.db, tagName);
+    if (referenced_by.length > 0) {
+      return json(
+        {
+          error: "TagInUseByTokens",
+          error_type: "tag_in_use_by_tokens",
+          message: `Tag "${tagName}" is referenced by ${referenced_by.length} tag-scoped token(s); revoke or re-mint them before deleting.`,
+          tag: tagName,
+          referenced_by,
+        },
+        409,
+      );
+    }
+    // `?cascade=true` / `?detach=true` (synonyms — see DeleteTagOpts):
+    // required to delete a tag another tag's parent_names still references
+    // (vault#552). Query params, not a DELETE body, so the flag is visible
+    // in access logs and works with any HTTP client without body support.
+    const cascade = parseBool(parseQuery(url, "cascade"), false);
+    const detach = parseBool(parseQuery(url, "detach"), false);
+    const result = await store.deleteTag(tagName, { cascade, detach });
+    if ("error" in result) {
+      // Referential-integrity refusal (vault#552). Scope-scrub the
+      // referencing tag names for a tag-scoped caller — the delete is
+      // still refused (integrity is scope-independent), but an
+      // out-of-scope referrer's name must not leak. Same posture as
+      // `tag_field_conflict`'s scrub.
+      const referencing_tags = scrubReferencingTagsByScope(result.referencing_tags, tagScope.allowed);
+      return json(
+        {
+          error: "TagReferencedAsParent",
+          error_type: "tag_referenced_as_parent",
+          tag: tagName,
+          referencing_tags,
+          message: `Tag "${tagName}" is referenced by ${referencing_tags.length} other tag(s)' parent_names; pass ?cascade=true or ?detach=true to also remove the reference, or update the referencing tag(s) first.`,
+          hint: "pass ?cascade=true or ?detach=true, or fix the referencing tag(s)' parent_names first",
+        },
+        409,
+      );
+    }
+    return json(result);
+  }
+
+  return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
+}
+
+// ---------------------------------------------------------------------------
+// Find-path — GET /api/find-path?source=...&target=...
+// ---------------------------------------------------------------------------
+
+export async function handleFindPath(
+  req: Request,
+  store: Store,
+  tagScope: TagScopeCtx = NO_TAG_SCOPE,
+): Promise<Response> {
+  if (req.method !== "GET") return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
+
+  const url = new URL(req.url);
+  const source = parseQuery(url, "source");
+  const target = parseQuery(url, "target");
+  if (!source || !target) {
+    return json(
+      { error: "source and target parameters are required", error_type: "invalid_request", hint: "pass both ?source= and ?target=" },
+      400,
+    );
+  }
+
+  const db = store.db;
+  try {
+    const sourceNote = await resolveNote(store, source);
+    if (!sourceNote) return json({ error: `Note not found: "${source}"`, error_type: "not_found", note_id: source }, 404);
+    if (!noteWithinTagScope(sourceNote, tagScope.allowed, tagScope.raw)) {
+      return json({ error: `Note not found: "${source}"`, error_type: "not_found", note_id: source }, 404);
+    }
+    const targetNote = await resolveNote(store, target);
+    if (!targetNote) return json({ error: `Note not found: "${target}"`, error_type: "not_found", note_id: target }, 404);
+    if (!noteWithinTagScope(targetNote, tagScope.allowed, tagScope.raw)) {
+      return json({ error: `Note not found: "${target}"`, error_type: "not_found", note_id: target }, 404);
+    }
+    const maxDepth = Math.min(parseInt10(parseQuery(url, "max_depth")) ?? 5, 10);
+
+    // Tag-scope on the *path* itself: every intermediate hop must also be
+    // within scope. A reachable target via an out-of-scope hop is not a
+    // permitted answer — surface as "no path" (null).
+    const result = linkOps.findPath(db, sourceNote.id, targetNote.id, { max_depth: maxDepth });
+    if (result && tagScope.allowed) {
+      for (const id of result.path) {
+        const hop = await store.getNote(id);
+        if (!hop || !noteWithinTagScope(hop, tagScope.allowed, tagScope.raw)) {
+          return json(null);
+        }
+      }
+    }
+    return json(result);
+  } catch (e: any) {
+    if (e instanceof NotFoundError) return json({ error: e.message, error_type: "not_found" }, 404);
+    // vault#331 N1 — surface AmbiguousPathError from resolveNote as 409
+    // mirroring the handleNotes path. Without this, an ambiguous source/
+    // target path on /api/find-path bubbled to a server-level 500.
+    const ambig = ambiguousPathResponse(e);
+    if (ambig) return ambig;
+    throw e;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Vault info — GET/PATCH /api/vault
+// ---------------------------------------------------------------------------
+
+type VaultConfigLike = {
+  name: string;
+  description?: string | null;
+  audio_retention?: "keep" | "until_transcribed" | "never";
+  auto_transcribe?: { enabled?: boolean };
+};
+
+const VALID_AUDIO_RETENTION = ["keep", "until_transcribed", "never"] as const;
+
+/**
+ * Resolve the effective auto-transcribe toggle for a vault's GET response, the
+ * SAME resolution `shouldAutoTranscribe` uses at the decision point:
+ * **per-vault → global → true**. A vault that set its own `auto_transcribe`
+ * shows that; one that left it unset shows the server-wide default (itself
+ * default-ON). This keeps the GET in lock-step with what the worker actually
+ * does, with no field-name drift.
+ */
+function resolveAutoTranscribeEnabled(vaultConfig: VaultConfigLike): boolean {
+  return (
+    vaultConfig.auto_transcribe?.enabled
+    ?? readGlobalConfig().auto_transcribe?.enabled
+    ?? true
+  );
+}
+
+function vaultResponse(vaultConfig: VaultConfigLike): Record<string, unknown> {
+  return {
+    name: vaultConfig.name,
+    description: vaultConfig.description ?? null,
+    config: {
+      audio_retention: vaultConfig.audio_retention ?? "keep",
+      auto_transcribe: {
+        enabled: resolveAutoTranscribeEnabled(vaultConfig),
+      },
+    },
+  };
+}
+
+export async function handleVault(
+  req: Request,
+  store: Store,
+  vaultConfig: VaultConfigLike,
+  persist?: () => void,
+  /**
+   * Injection seam (scribe-fold Phase 1) for the transcription capability
+   * probe on the GET landing. Production omits it and resolves the live
+   * default (scribe-http) provider's availability; tests inject a deterministic
+   * resolver. Kept separate from the `auto_transcribe` POLICY toggle: this
+   * reports whether transcription is actually POSSIBLE (a provider is
+   * configured AND available), which is what a surface gates its mic on.
+   */
+  resolveCapability: () => Promise<TranscriptionCapability> = resolveTranscriptionCapability,
+  /**
+   * Tag-scope allowlist (front-door structural map). Threaded from
+   * routing.ts the same way every other read handler gets it. Unscoped
+   * (`NO_TAG_SCOPE`) by default so every pre-existing call site — none of
+   * which pass this — is unaffected.
+   */
+  tagScope: TagScopeCtx = NO_TAG_SCOPE,
+  /**
+   * Injection seam (semantic search MVP, EXPERIMENTAL) for the embeddings
+   * capability probe — same shape as `resolveCapability` above. Production
+   * omits it and resolves the shared embedding provider's availability;
+   * tests inject a deterministic resolver.
+   */
+  resolveEmbeddingCap: () => Promise<EmbeddingCapability> = () =>
+    resolveEmbeddingCapability(getSharedEmbeddingProvider()),
+): Promise<Response> {
+  const url = new URL(req.url);
+
+  if (req.method === "GET") {
+    const result: Record<string, unknown> = vaultResponse(vaultConfig);
+    // Transcription capability flag — `enabled` iff a provider is configured
+    // and available. `minutes_remaining` is omitted (cloud/plan concern;
+    // self-host is unmetered). This is the field Notes gates the mic on.
+    result.transcription = await resolveCapability();
+    // Embeddings capability flag (semantic search MVP, EXPERIMENTAL) — same
+    // "configured AND available" contract as transcription above. This is
+    // the honest advertisement `query-notes { semantic: true }` backs: a
+    // vault reporting `enabled: false` gets `semantic_unavailable`, never a
+    // silent keyword fallback.
+    result.embeddings = await resolveEmbeddingCap();
+    // Front-door structural map — ALWAYS included (unlike `stats`, which is
+    // include_stats-gated): three cheap grouped-COUNT queries, so a fresh
+    // reader orients in one call. Scope-aware: a tag-scoped token's map
+    // covers only notes reachable through an in-scope tag (`tagFilter`
+    // restricts the underlying query rather than post-hoc filtering an
+    // unscoped rollup — see `getVaultMap`'s doc comment for why).
+    result.map =
+      tagScope.raw === null
+        ? getVaultMap(store.db)
+        : getVaultMap(store.db, scopedCountFilter(store, tagScope.allowed));
+    if (parseBool(parseQuery(url, "include_stats"), false)) {
+      // vault#766: subtract notes a private tag hides from a scoped caller.
+      result.stats = await store.getVaultStats(
+        tagScope.raw === null ? undefined : scopedStatsFilter(store, tagScope.allowed),
+      );
+    }
+    return json(result);
+  }
+
+  if (req.method === "PATCH") {
+    const parsedBody = await parseJsonBody(req);
+    if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.body as {
+      description?: unknown;
+      config?: { audio_retention?: string; auto_transcribe?: { enabled?: unknown } };
+    };
+    let dirty = false;
+
+    if (body.description !== undefined) {
+      // vault#669: runtime type guard mirroring the audio_retention /
+      // auto_transcribe validators below — the `description?: string`
+      // annotation was a compile-time claim guarding nothing (cast retyped
+      // to `unknown` so the check is mandatory), so a write/admin caller
+      // could persist a non-string and poison the next MCP `initialize`
+      // (cloud#87). Reject non-string/non-null with the same 400 body
+      // shape the sibling validators in this handler emit. `null` stays
+      // legal: it clears the description. Cross-door parity with cloud#263.
+      if (body.description !== null && typeof body.description !== "string") {
+        return json(
+          {
+            error: "invalid_description",
+            error_type: "invalid_description",
+            field: "description",
+            got: body.description,
+            message: "description must be a string or null",
+            hint: "pass a string, or null to clear the description",
+          },
+          400,
+        );
+      }
+      vaultConfig.description = body.description;
+      dirty = true;
+    }
+
+    if (body.config?.audio_retention !== undefined) {
+      const v = body.config.audio_retention;
+      if (!VALID_AUDIO_RETENTION.includes(v as typeof VALID_AUDIO_RETENTION[number])) {
+        return json(
+          {
+            error: "invalid_audio_retention",
+            error_type: "invalid_audio_retention",
+            field: "config.audio_retention",
+            got: v,
+            message: `audio_retention must be one of: ${VALID_AUDIO_RETENTION.join(", ")}`,
+            hint: `pass one of: ${VALID_AUDIO_RETENTION.join(", ")}`,
+          },
+          400,
+        );
+      }
+      vaultConfig.audio_retention = v as typeof VALID_AUDIO_RETENTION[number];
+      dirty = true;
+    }
+
+    // auto_transcribe.enabled — PER-VAULT toggle persisted to THIS vault's
+    // vault.yaml (via `persist`, the same writeVaultConfig path as
+    // description/audio_retention). Flipping it for vault X affects only X;
+    // scribe's "link to vault X" PATCHes this and never touches other vaults.
+    // The worker reads the same per-vault field (per-vault → global → true).
+    // Validate the shape: when `auto_transcribe` is present it must carry a
+    // boolean `enabled`.
+    if (body.config?.auto_transcribe !== undefined) {
+      const enabled = body.config.auto_transcribe?.enabled;
+      if (typeof enabled !== "boolean") {
+        return json(
+          {
+            error: "invalid_auto_transcribe",
+            error_type: "invalid_auto_transcribe",
+            field: "config.auto_transcribe.enabled",
+            got: enabled,
+            message: "auto_transcribe.enabled must be a boolean",
+            hint: "pass true or false",
+          },
+          400,
+        );
+      }
+      vaultConfig.auto_transcribe = { ...vaultConfig.auto_transcribe, enabled };
+      dirty = true;
+    }
+
+    if (dirty && persist) {
+      try { persist(); } catch (err) {
+        if (err instanceof UnreadablePrivateTagsError) {
+          return json({ error: err.message }, 409);
+        }
+        throw err;
+      }
+    }
+    return json(vaultResponse(vaultConfig));
+  }
+
+  return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
+}
+
+// ---------------------------------------------------------------------------
+// Unresolved wikilinks — REST-only (admin/maintenance)
+// ---------------------------------------------------------------------------
+
+export function handleUnresolvedWikilinks(
+  req: Request,
+  store: Store,
+  tagScope: TagScopeCtx = NO_TAG_SCOPE,
+): Response {
+  const url = new URL(req.url);
+  const limitStr = url.searchParams.get("limit");
+  const limit = limitStr ? parseInt(limitStr, 10) : 50;
+  const db = store.db;
+  const result = listUnresolvedWikilinks(db, limit);
+
+  // Unscoped token → return as-is (unchanged behavior).
+  if (tagScope.raw === null) return Response.json(result);
+
+  // Tag-scope confidentiality (security review): each unresolved row carries
+  // a `source_id` (+ `source_path`) plus the raw `target_path` wikilink
+  // string. For a tag-scoped token, surface ONLY rows whose SOURCE note is
+  // within the token's tag scope — otherwise we'd leak out-of-scope note IDs
+  // and the wikilink target strings those notes contain. Filter the page and
+  // recompute `count` from the filtered set so the aggregate total of
+  // out-of-scope rows doesn't leak either.
+  const inScope = (row: { source_id: string }): boolean => {
+    const note = getNote(db, row.source_id);
+    return note !== null && noteWithinTagScope(note, tagScope.allowed, tagScope.raw);
+  };
+  const filtered = result.unresolved.filter(inScope);
+
+  // vault#239: a reference whose only candidates are OUT OF SCOPE is broken
+  // in this reader's sub-vault, but its row lives in `ambiguous_wikilinks`
+  // until the last of those candidates is deleted. Reporting it only after
+  // that deletion makes this listing a timing oracle for a cross-scope naming
+  // collision — the same one `getAmbiguousLinksForNotes` narrows away on the
+  // note surfaces. Fold those rows in so the answer is stable across the
+  // delete. Deduped against the base listing by (source, relationship,
+  // target); the two tables are disjoint by construction, so this only
+  // guards against a stale row.
+  const seen = new Set(filtered.map((r) => `${r.source_id}\u0000${r.relationship}\u0000${r.target_path.toLowerCase()}`));
+  const visible = ambiguityVisibilityFor(db, tagScope)!;
+  const collapsed = [
+    ...listZeroVisibleAmbiguousAsUnresolved(db, visible, limit),
+    ...listResolvedToInvisibleAsUnresolved(db, visible, limit),
+  ].filter((row) => {
+    const key = `${row.source_id}\u0000${row.relationship}\u0000${row.target_path.toLowerCase()}`;
+    if (!inScope(row) || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  const merged = [...filtered, ...collapsed].slice(0, limit);
+  return Response.json({ unresolved: merged, count: merged.length });
+}
+
+// ---------------------------------------------------------------------------
+// Doctor — GET /api/doctor (vault#552, admin-gated in routing.ts)
+// ---------------------------------------------------------------------------
+
+/**
+ * `GET /vault/{name}/api/doctor` — read-only taxonomy/metadata integrity
+ * scan. Method + `vault:admin` scope are already enforced by the caller
+ * (`src/routing.ts`, dispatched before the generic read/write gate — same
+ * shape as `/api/triggers`); this handler just runs the scan with the
+ * caller's tag-scope allowlist. See `core/src/doctor.ts` for the finding
+ * catalog.
+ */
+export async function handleDoctor(
+  req: Request,
+  store: Store,
+  tagScope: TagScopeCtx = NO_TAG_SCOPE,
+): Promise<Response> {
+  const q = new URL(req.url).searchParams;
+  if (q.has("deep") && !["true", "false"].includes(q.get("deep")!)) return json({ error: "deep must be true or false" }, 400);
+  const deep = q.get("deep") === "true";
+  if (deep && tagScope.allowed !== null) return json({ error: "deep history audit requires an unrestricted session" }, 403);
+  const after = q.get("history_after") ?? undefined;
+  const maxBlobs = q.has("history_max_blobs") ? Number(q.get("history_max_blobs")) : undefined;
+  const budgetMs = q.has("history_budget_ms") ? Number(q.get("history_budget_ms")) : undefined;
+  if ((after !== undefined && !/^[a-f0-9]{64}$/.test(after)) ||
+      (maxBlobs !== undefined && (!Number.isInteger(maxBlobs) || maxBlobs < 1 || maxBlobs > 500)) ||
+      (budgetMs !== undefined && (!Number.isInteger(budgetMs) || budgetMs < 1 || budgetMs > 1000))) return json({ error: "invalid history audit bounds or cursor" }, 400);
+  const report = await store.doctor({ allowedTags: tagScope.allowed, noteTagsInScope: doctorNoteTagsPredicate(tagScope.allowed, tagScope.raw), deep, history_after: after, history_max_blobs: maxBlobs, history_budget_ms: budgetMs });
+  return json(report);
+}
+
+// ---------------------------------------------------------------------------
+// Published notes — public, no-auth HTML rendering
+// ---------------------------------------------------------------------------
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function renderMarkdown(md: string): string {
+  const lines = md.split("\n");
+  const out: string[] = [];
+  let inCodeBlock = false;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+
+    if (line.trimStart().startsWith("```")) {
+      if (inCodeBlock) {
+        out.push("</code></pre>");
+        inCodeBlock = false;
+      } else {
+        out.push("<pre><code>");
+        inCodeBlock = true;
+      }
+      continue;
+    }
+    if (inCodeBlock) {
+      out.push(escapeHtml(line));
+      continue;
+    }
+
+    const trimmed = line.trim();
+
+    if (!trimmed) {
+      out.push("");
+      continue;
+    }
+
+    const headerMatch = trimmed.match(/^(#{1,6})\s+(.+)/);
+    if (headerMatch) {
+      const level = headerMatch[1]!.length;
+      out.push(`<h${level}>${inlineMarkdown(escapeHtml(headerMatch[2]!))}</h${level}>`);
+      continue;
+    }
+
+    if (trimmed.startsWith("- ") || trimmed.startsWith("* ")) {
+      const items: string[] = [trimmed.slice(2)];
+      while (i + 1 < lines.length) {
+        const next = lines[i + 1]!.trim();
+        if (next.startsWith("- ") || next.startsWith("* ")) {
+          items.push(next.slice(2));
+          i++;
+        } else break;
+      }
+      out.push("<ul>");
+      for (const item of items) {
+        out.push(`<li>${inlineMarkdown(escapeHtml(item))}</li>`);
+      }
+      out.push("</ul>");
+      continue;
+    }
+
+    out.push(`<p>${inlineMarkdown(escapeHtml(trimmed))}</p>`);
+  }
+
+  if (inCodeBlock) out.push("</code></pre>");
+  return out.join("\n");
+}
+
+function inlineMarkdown(html: string): string {
+  html = html.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+  html = html.replace(/\*(.+?)\*/g, "<em>$1</em>");
+  html = html.replace(/`(.+?)`/g, "<code>$1</code>");
+  html = html.replace(/\[(.+?)\]\((.+?)\)/g, (_match, text, url) => {
+    const decoded = url.replace(/&amp;/g, "&");
+    if (/^(https?:|mailto:|#|\/)/i.test(decoded)) {
+      return `<a href="${url}">${text}</a>`;
+    }
+    return text;
+  });
+  return html;
+}
+
+function isNotePublished(note: { tags?: string[]; metadata?: unknown }, publishedTag: string = "publish"): boolean {
+  if (note.tags?.includes(publishedTag)) return true;
+  const meta = note.metadata as Record<string, unknown> | undefined;
+  if (meta?.published === true) return true;
+  return false;
+}
+
+/**
+ * GET /view/:idOrPath — serve a note as clean HTML.
+ * Supports ID or path resolution.
+ */
+export async function handleViewNote(
+  store: Store,
+  idOrPath: string,
+  options: { authenticated?: boolean; publishedTag?: string } = {},
+): Promise<Response> {
+  const { authenticated = false, publishedTag = "publish" } = options;
+  let note: Note | null;
+  try {
+    note = await resolveNote(store, idOrPath);
+  } catch (e: any) {
+    // vault#331 N1 — surface AmbiguousPathError as 409. The HTML view
+    // route doesn't otherwise return JSON, but the structured body is
+    // the right shape for the API contract; a human reader hitting
+    // this URL gets the JSON inline (rare — the bare path form is
+    // mostly an API consumer's mistake).
+    const ambig = ambiguousPathResponse(e);
+    if (ambig) return ambig;
+    throw e;
+  }
+  if (!note) {
+    return new Response("Not Found", { status: 404, headers: { "Content-Type": "text/plain" } });
+  }
+  if (!authenticated && !isNotePublished(note, publishedTag)) {
+    return new Response("Not Found", { status: 404, headers: { "Content-Type": "text/plain" } });
+  }
+
+  const title = note.path?.split("/").pop()?.replace(/\.[^.]+$/, "") ?? note.id;
+  const rendered = renderMarkdown(note.content);
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escapeHtml(title)}</title>
+<style>
+  body {
+    max-width: 42rem;
+    margin: 2rem auto;
+    padding: 0 1rem;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.6;
+    color: #1a1a1a;
+  }
+  pre {
+    background: #f5f5f5;
+    padding: 1rem;
+    border-radius: 4px;
+    overflow-x: auto;
+  }
+  code {
+    font-size: 0.9em;
+    background: #f5f5f5;
+    padding: 0.15em 0.3em;
+    border-radius: 3px;
+  }
+  pre code {
+    background: none;
+    padding: 0;
+  }
+  a { color: #0066cc; }
+  h1, h2, h3, h4, h5, h6 { margin-top: 1.5em; margin-bottom: 0.5em; }
+  ul { padding-left: 1.5em; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #1a1a1a; color: #e0e0e0; }
+    pre, code { background: #2a2a2a; }
+    a { color: #66b3ff; }
+  }
+</style>
+</head>
+<body>
+${rendered}
+</body>
+</html>`;
+
+  return new Response(html, {
+    status: 200,
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      "Content-Security-Policy": "default-src 'self'; script-src 'none'; style-src 'unsafe-inline'",
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Retry transcription (vault#353 design Q5)
+// ---------------------------------------------------------------------------
+
+/**
+ * Re-enqueue the original audio attachment for a failed transcription.
+ *
+ * Two target shapes are accepted:
+ *
+ *   - **Auto-flow (vault#353):** the target is a `<audio>.transcript.md` note
+ *     carrying `transcript_status` frontmatter. Requires that status be
+ *     `failed`; locates the audio via `transcript_attachment_id`; preserves
+ *     `transcribe_origin: "auto"` so a retried success overwrites this
+ *     transcript note in place. Behavior is byte-identical to the original
+ *     vault#353 contract.
+ *
+ *   - **Legacy in-body memo (finding F):** the target is the memo note
+ *     itself — no `transcript_status` frontmatter. The original capture body
+ *     holds `![[<audio>]]` + a `_Transcription unavailable._` marker (written
+ *     by the worker on terminal failure). We find the note's own failed audio
+ *     attachment, reset it to pending **preserving `transcribe_origin:
+ *     "legacy"`** (forcing "auto" would switch to the sibling-transcript-note
+ *     shape and orphan the in-body embed), and **re-stamp `transcribe_stub:
+ *     true`** on the note. The stub re-arm is load-bearing: the legacy success
+ *     path early-returns unless `transcribe_stub === true`, so without it the
+ *     retried success would never write the transcript back into the body.
+ *     On success the worker replaces the `_Transcription unavailable._` marker
+ *     with the transcript in place, yielding the same final shape a first-try
+ *     success would.
+ *
+ * Common steps for both: validate the audio attachment row exists (404 if
+ * gone) and its file is still on disk (404 if unlinked — e.g. retention=never
+ * already dropped it), reset the transcribe_status fields, then kick the
+ * worker if registered (otherwise the sweep picks it up).
+ */
+async function handleRetryTranscription(
+  store: Store,
+  note: Note,
+  vault: string,
+): Promise<Response> {
+  const meta = (note.metadata as Record<string, unknown> | undefined) ?? {};
+
+  // Legacy in-body memo: no `transcript_status` frontmatter. The note owns
+  // the failed audio attachment directly; there's no sibling transcript note.
+  if (typeof meta.transcript_status !== "string") {
+    return handleRetryLegacyInBody(store, note, vault);
+  }
+
+  if (meta.transcript_status !== "failed") {
+    return json(
+      {
+        error: "not_failed",
+        error_type: "not_failed",
+        message: `Transcript note status is "${meta.transcript_status}" — only failed transcripts can be retried.`,
+        transcript_status: meta.transcript_status,
+      },
+      400,
+    );
+  }
+  const attachmentId = typeof meta.transcript_attachment_id === "string"
+    ? meta.transcript_attachment_id
+    : undefined;
+  if (!attachmentId) {
+    return json(
+      {
+        error: "missing_attachment_id",
+        error_type: "missing_attachment_id",
+        message: "Transcript note has no `transcript_attachment_id` — can't locate the original audio.",
+      },
+      400,
+    );
+  }
+  const attachment = await store.getAttachment(attachmentId);
+  if (!attachment) {
+    return json(
+      {
+        error: "attachment_missing",
+        error_type: "attachment_missing",
+        message: `Original audio attachment ${attachmentId} no longer exists in the vault.`,
+      },
+      404,
+    );
+  }
+  // Audio file existence + safety: defense-in-depth against a bad attachment
+  // row pointing outside the vault assets dir. Same guard as the worker.
+  const assetsRoot = assetsDir(vault);
+  const audioFilePath = normalize(join(assetsRoot, attachment.path));
+  if (!audioFilePath.startsWith(normalize(assetsRoot)) || !existsSync(audioFilePath)) {
+    return json(
+      {
+        error: "audio_missing",
+        error_type: "audio_missing",
+        message: `Original audio file at "${attachment.path}" no longer exists on disk.`,
+      },
+      404,
+    );
+  }
+
+  // Reset transcribe_status. Worker reads this row, sees "pending", processes
+  // it. Preserve `transcribe_origin: "auto"` so the worker materializes the
+  // transcript note (overwriting this failed note in place).
+  const attMeta = { ...(attachment.metadata ?? {}) } as Record<string, unknown>;
+  attMeta.transcribe_status = "pending";
+  attMeta.transcribe_requested_at = new Date().toISOString();
+  attMeta.transcribe_origin = "auto";
+  delete attMeta.transcribe_backoff_until;
+  delete attMeta.transcribe_error;
+  delete attMeta.transcribe_error_code;
+  delete attMeta.transcribe_attempts;
+  await store.setAttachmentMetadata(attachment.id, attMeta);
+
+  // Kick the worker for an event-driven re-run (no 30s sweep wait). The
+  // worker re-reads the row + processes immediately. If the worker isn't
+  // registered (scribe not configured this boot), we still reset the row;
+  // the next boot's sweep will pick it up. The 503 path is for callers that
+  // want certainty — but for v0.6 the sweep guarantee is enough.
+  const { getTranscriptionWorker } = await import("./transcription-registry.ts");
+  const worker = getTranscriptionWorker();
+  if (worker) {
+    // Refresh the attachment after the metadata write so the worker's
+    // in-process dedupe check sees pending.
+    const fresh = await store.getAttachment(attachment.id) ?? attachment;
+    // Fire-and-forget — the response shouldn't wait on transcription.
+    void worker.kick(vault, fresh);
+  }
+
+  return json(
+    {
+      status: "queued",
+      attachment_id: attachment.id,
+      attachment_path: attachment.path,
+      transcript_note_id: note.id,
+      worker: worker ? "kicked" : "sweep-only",
+    },
+    202,
+  );
+}
+
+/**
+ * Retry path for a legacy in-body voice memo (finding F). The target note is
+ * the memo itself (no `transcript_status` frontmatter); it directly owns the
+ * audio attachment whose transcription failed.
+ *
+ * Steps:
+ *   1. Find the note's own audio attachment with `transcribe_status ===
+ *      "failed"`. 400 `no_failed_attachment` if none — there's nothing to
+ *      retry.
+ *   2. Validate the audio file is still on disk (404 `audio_missing`).
+ *   3. Reset the attachment to pending, **preserving `transcribe_origin:
+ *      "legacy"`** (never force "auto" — that switches to the sibling-
+ *      transcript-note shape and orphans the in-body `![[memo]]` embed).
+ *   4. **Re-stamp `transcribe_stub: true`** on the note. The legacy worker
+ *      success path early-returns unless the note carries this flag (it was
+ *      cleared when the failure marker was written), so re-arming it is what
+ *      lets the retried success replace the `_Transcription unavailable._`
+ *      marker with the transcript.
+ *   5. Kick the worker if registered; otherwise the sweep picks it up.
+ */
+async function handleRetryLegacyInBody(
+  store: Store,
+  note: Note,
+  vault: string,
+): Promise<Response> {
+  const attachments = await store.getAttachments(note.id);
+  const failed = attachments.find((a) => {
+    const m = (a.metadata as Record<string, unknown> | undefined) ?? {};
+    return m.transcribe_status === "failed";
+  });
+  if (!failed) {
+    return json(
+      {
+        error: "no_failed_attachment",
+        error_type: "no_failed_attachment",
+        message:
+          "Target note is not a transcript note and has no audio attachment with a failed transcription to retry.",
+      },
+      400,
+    );
+  }
+
+  // Audio file existence + safety: defense-in-depth against a bad attachment
+  // row pointing outside the vault assets dir. Same guard as the worker.
+  const assetsRoot = assetsDir(vault);
+  const audioFilePath = normalize(join(assetsRoot, failed.path));
+  if (!audioFilePath.startsWith(normalize(assetsRoot)) || !existsSync(audioFilePath)) {
+    return json(
+      {
+        error: "audio_missing",
+        error_type: "audio_missing",
+        message: `Original audio file at "${failed.path}" no longer exists on disk.`,
+      },
+      404,
+    );
+  }
+
+  // Reset the attachment back to pending. Preserve `transcribe_origin:
+  // "legacy"` (a default of `undefined` is also legacy, but make it explicit
+  // so a retried row reads unambiguously) — forcing "auto" here would make
+  // the worker materialize a sibling transcript note instead of patching the
+  // in-body embed, orphaning the memo.
+  const attMeta = { ...(failed.metadata ?? {}) } as Record<string, unknown>;
+  attMeta.transcribe_status = "pending";
+  attMeta.transcribe_requested_at = new Date().toISOString();
+  attMeta.transcribe_origin = "legacy";
+  delete attMeta.transcribe_backoff_until;
+  delete attMeta.transcribe_error;
+  delete attMeta.transcribe_error_code;
+  delete attMeta.transcribe_attempts;
+  await store.setAttachmentMetadata(failed.id, attMeta);
+
+  // Re-arm the stub on the note. The worker's legacy success path gates on
+  // `transcribe_stub === true` and CLEARED it when it wrote the failure
+  // marker; without re-stamping it the retried success early-returns and
+  // never writes the transcript back into the body. Use skipUpdatedAt so the
+  // note's modification time still reflects user intent, matching the
+  // worker's own note writes.
+  //
+  // OC-guarded (vault#435): this read-transform-write would otherwise clobber
+  // a user edit landing between `resolveNote` (above) and this write. Thread
+  // `if_updated_at` and retry once on conflict — re-read, re-apply the
+  // metadata-only re-stamp against the fresh note, write with the fresh
+  // precondition. A second conflict surfaces as 409 so the user can retry.
+  // Only the `transcribe_stub` flag is stamped (never content), so re-applying
+  // against the fresh note is always the correct surgical transform.
+  const restampStub = (current: Note): Record<string, unknown> => ({
+    ...((current.metadata as Record<string, unknown> | undefined) ?? {}),
+    transcribe_stub: true,
+  });
+  try {
+    try {
+      await store.updateNote(note.id, {
+        metadata: restampStub(note),
+        skipUpdatedAt: true,
+        if_updated_at: note.updatedAt,
+      });
+    } catch (err: any) {
+      if (!err || err.code !== "CONFLICT") throw err;
+      // Conflict — re-read, re-apply the stub re-stamp, retry once.
+      const fresh = await store.getNote(note.id);
+      if (!fresh) {
+        return json(
+          { error: "note_missing", error_type: "not_found", message: "Target note disappeared during retry." },
+          404,
+        );
+      }
+      await store.updateNote(fresh.id, {
+        metadata: restampStub(fresh),
+        skipUpdatedAt: true,
+        if_updated_at: fresh.updatedAt,
+      });
+    }
+  } catch (err: any) {
+    if (err && err.code === "CONFLICT") {
+      // Double conflict — the note kept changing under us. It's a user-facing
+      // request; return 409 so the caller can retry against fresh state. The
+      // attachment was already reset to pending above; a successful re-stamp
+      // on the user's next retry (or the next sweep, if they re-arm the stub)
+      // will let the worker patch the transcript in.
+      return json(
+        {
+          error_type: "conflict",
+          error: "conflict",
+          note_id: note.id,
+          current_updated_at: err.current_updated_at ?? null,
+          your_updated_at: err.expected_updated_at,
+          // Mirror the standard PATCH 409 shape (see the notes-update handler
+          // above) — both `your_updated_at` and `expected_updated_at` carry the
+          // same value, kept for shape-congruence with existing callers.
+          expected_updated_at: err.expected_updated_at,
+          message:
+            "Note was modified concurrently while arming the retry; re-fetch and try again.",
+          hint: "re-fetch the note and retry the retry-transcription call",
+        },
+        409,
+      );
+    }
+    throw err;
+  }
+
+  const { getTranscriptionWorker } = await import("./transcription-registry.ts");
+  const worker = getTranscriptionWorker();
+  if (worker) {
+    const fresh = await store.getAttachment(failed.id) ?? failed;
+    void worker.kick(vault, fresh);
+  }
+
+  return json(
+    {
+      status: "queued",
+      attachment_id: failed.id,
+      attachment_path: failed.path,
+      transcript_note_id: note.id,
+      worker: worker ? "kicked" : "sweep-only",
+    },
+    202,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Storage (file upload/serve) — kept as-is, Daily needs it
+//
+// `assetsDir` moved to config.ts (next to the other path helpers) to break the
+// usage.ts↔routes.ts import cycle; it's re-exported from this module's top so
+// existing importers are unaffected.
+// ---------------------------------------------------------------------------
+
+export const MAX_UPLOAD_BYTES = 100 * 1024 * 1024; // 100MB
+
+/**
+ * Transport-level `Bun.serve` `maxRequestBodySize` ceiling (vault#588 FIX 2).
+ *
+ * The app-level caps above (`MAX_JSON_BODY_BYTES` 10MB, `MAX_UPLOAD_BYTES`
+ * 100MB) only run AFTER the transport has already buffered the body: the
+ * `Content-Length` pre-check in `parseJsonBody` short-circuits early, but a
+ * chunked request with no `Content-Length` header falls through to the
+ * post-parse backstop — which still means Bun buffered the whole thing into
+ * memory first. Bun's *default* `maxRequestBodySize` (128MB) happened to sit
+ * above `MAX_UPLOAD_BYTES` and so never bit in practice, but it was never
+ * actually configured — an accident of the default, not a deliberate
+ * ceiling wired to this codebase's own limits.
+ *
+ * Set explicitly here so the ceiling is legible and reconciled: it MUST be
+ * >= `MAX_UPLOAD_BYTES` (a legitimate max-size attachment upload must not be
+ * rejected at the transport layer before `/upload`'s own 100MB check ever
+ * runs) with headroom for multipart overhead (boundary delimiters, per-part
+ * headers — a few hundred bytes in practice, but the 20MB margin is
+ * generous rather than exact). `MAX_JSON_BODY_BYTES` (10MB) is well under
+ * `MAX_UPLOAD_BYTES`, so it never drives this number.
+ */
+export const MAX_REQUEST_BODY_BYTES = MAX_UPLOAD_BYTES + 20 * 1024 * 1024; // 120MB
+
+// Storage upload policy (extension blocklist + MIME lookup) now lives in
+// core/src/attachment/policy.ts — the canonical source shared with the
+// attachment-ticket mint/spend path (vault attachment-tickets design,
+// "shared BLOCKED_EXTENSIONS"), so a blocked extension can never diverge
+// between REST and tickets. See that module's doc comment for the full
+// same-origin-XSS rationale and the MIME curation invariant.
+const BLOCKED_EXTENSIONS = BLOCKED_ATTACHMENT_EXTENSIONS;
+const MIME_TYPES = ATTACHMENT_MIME_TYPES;
+
+/**
+ * Parse a single-range `Range: bytes=a-b` header (RFC 7233 §2.1 — single
+ * range only, attachments-for-agents design D9, the REST twin of MCP's
+ * `content_offset`). Returns `null` — this function's own contract is
+ * "serve the full response, unranged" — for a missing header, a
+ * MALFORMED value, an unrecognized unit, a multi-range list
+ * (`bytes=0-10,20-30` — ignored, not an error, per D9), or a range this
+ * file can't satisfy (a `start` past EOF). `start`/`end` are both
+ * INCLUSIVE byte offsets; `end` is clamped to `total - 1` when the
+ * request left it open (`bytes=500-`) or asked past EOF.
+ *
+ * IMPORTANT — this `null` contract is NOT the last word for an
+ * unsatisfiable (syntactically-valid but out-of-bounds) range on a real
+ * `Bun.serve()` deployment. Live-verified against an actual socket (not
+ * the in-process `handleStorage()` call the test suite uses): when the
+ * response body is a `Bun.file()` — which `handleStorage`'s full-response
+ * branch below always hands back — Bun's OWN runtime transparently
+ * reinterprets the incoming request's `Range` header a second time and,
+ * for an out-of-bounds range, overrides our 200 with a native
+ * **416 Range Not Satisfiable**, regardless of what this function or
+ * `handleStorage` returned. That's RFC 7233-correct and is being KEPT,
+ * not fought — so in practice, `null` from an out-of-bounds `start`
+ * still results in a 200 from `handleStorage`'s own logic, but the byte
+ * that actually reaches a real client for that specific case is a 416
+ * courtesy of Bun itself. MALFORMED and multi-range headers are NOT
+ * range-shaped at all, so Bun's native layer doesn't touch them — those
+ * two cases genuinely serve the full 200, in-process harness and real
+ * socket alike.
+ */
+export function parseByteRangeHeader(header: string | null, total: number): { start: number; end: number } | null {
+  if (!header || total <= 0) return null;
+  const match = header.match(/^bytes=(\d*)-(\d*)$/);
+  if (!match) return null; // malformed, unrecognized unit, or a multi-range list
+  const [, startRaw, endRaw] = match;
+  if (startRaw === "" && endRaw === "") return null;
+
+  if (startRaw === "") {
+    // Suffix range: last N bytes (`bytes=-500`).
+    const suffixLength = Number(endRaw);
+    if (!Number.isSafeInteger(suffixLength) || suffixLength <= 0) return null;
+    return { start: Math.max(0, total - suffixLength), end: total - 1 };
+  }
+
+  const start = Number(startRaw);
+  if (!Number.isSafeInteger(start) || start < 0 || start >= total) return null;
+  const end = endRaw === "" ? total - 1 : Math.min(Number(endRaw), total - 1);
+  if (!Number.isSafeInteger(end) || end < start) return null;
+  return { start, end };
+}
+
+export async function handleStorage(
+  req: Request,
+  path: string,
+  vault: string,
+  store: Store,
+  tagScope: TagScopeCtx = NO_TAG_SCOPE,
+): Promise<Response> {
+  const assets = assetsDir(vault);
+
+  if (req.method === "POST" && path === "/upload") {
+    // vault#588 FIX 1 — `req.formData()` throws on a malformed/non-multipart
+    // body (bad boundary, truncated body, wrong Content-Type entirely). Left
+    // uncaught, that throw escapes to server.ts's generic top-level catch: a
+    // 500 with no `error_type` — the multipart-transport analog of the
+    // `req.json()` gap LB7 fixed for the JSON routes (`parseJsonBody` above).
+    // Catch it here and return the same `invalid_request` taxonomy entry
+    // LB7b uses for "syntactically-parseable-transport but wrong/unusable
+    // shape" (see docs/HTTP_API.md's error-taxonomy table) rather than
+    // minting a new `invalid_form` type for what's ultimately the same bucket.
+    // Typed off `req.formData()`'s own return, not the DOM lib `FormData`
+    // global — `req: Request` resolves through undici's ambient types here,
+    // whose `FormData` isn't structurally assignable to lib.dom's.
+    let form: Awaited<ReturnType<typeof req.formData>>;
+    try {
+      form = await req.formData();
+    } catch {
+      return json(
+        {
+          error: "Request body must be valid multipart/form-data",
+          error_type: "invalid_request",
+          hint: "expected a multipart/form-data body with a `file` field",
+        },
+        400,
+      );
+    }
+    const file = form.get("file");
+    if (!(file instanceof File)) {
+      return json({ error: "file is required", error_type: "missing_required_field", field: "file" }, 400);
+    }
+    if (file.size > MAX_UPLOAD_BYTES) {
+      return json(
+        {
+          error: `File too large (${Math.round(file.size / 1024 / 1024)}MB). Max: 100MB`,
+          error_type: "file_too_large",
+          limit: MAX_UPLOAD_BYTES,
+          got: file.size,
+        },
+        413,
+      );
+    }
+    // Strip trailing dots/whitespace before extracting the extension so a
+    // `evil.html.` / `evil.svg ` can't slip past the blocklist
+    // (extname("evil.html.") === "."). The blocklist is belt-and-suspenders;
+    // anything that still gets through serves as octet-stream + nosniff anyway.
+    const ext = extname(file.name.replace(/[.\s]+$/, "")).toLowerCase();
+    if (BLOCKED_EXTENSIONS.has(ext)) {
+      // Active-content types only — blocked because they execute as script when
+      // served same-origin from /storage/ (see BLOCKED_EXTENSIONS). Everything
+      // else (incl. unknown/arbitrary files) is accepted and served as a
+      // download (octet-stream + nosniff).
+      return json(
+        {
+          error: `File type ${ext} not allowed (active/executable content)`,
+          error_type: "blocked_upload_extension",
+          extension: ext,
+        },
+        400,
+      );
+    }
+
+    const date = new Date().toISOString().split("T")[0]!;
+    const dir = join(assets, date);
+    mkdirSync(dir, { recursive: true });
+
+    const filename = `${Date.now()}-${crypto.randomUUID()}${ext}`;
+    const filePath = join(dir, filename);
+    const buffer = Buffer.from(await file.arrayBuffer());
+    writeFileSync(filePath, buffer);
+
+    const relativePath = `${date}/${filename}`;
+    const mimeType = MIME_TYPES[ext] ?? "application/octet-stream";
+
+    // Invalidate the usage dir-walk cache for this vault — the new attachment
+    // changed the assets-directory footprint, so the next /.parachute/usage
+    // read must re-walk rather than report a stale (smaller) number. Without
+    // this hook the cache's 60s TTL would briefly under-report after an
+    // upload. (usage.ts:invalidateUsageCache is a no-op-cheap map delete.)
+    invalidateUsageCache(vault);
+
+    return json({ path: relativePath, size: buffer.length, mimeType }, 201);
+  }
+
+  // Decode percent-encoding BEFORE matching. `path` arrives from
+  // `url.pathname`, which (per WHATWG) keeps an encoded `%2F` slash literal —
+  // so a caller requesting `/api/storage/<date>%2F<file>` would never satisfy
+  // the literal-slash match below and would fall through to the 404. Decoding
+  // first accepts both the literal-slash and `%2F`-encoded forms, and yields
+  // the literal-slash path that the DB stores (`${date}/${filename}`) so the
+  // tag-scope reverse-lookup matches. This intentionally diverges from the
+  // single-note routes, which decode their *first* segment only and therefore
+  // REQUIRE `%2F` for slashes-in-an-id — a trap-grade asymmetry we accept here
+  // because storage paths are always multi-segment date/file pairs.
+  //
+  // Guard-safety (verified): the traversal guard below operates on the
+  // post-`normalize(join())` filesystem path, so a decoded `..` is still
+  // caught → 403. Decode is idempotent for today's unencoded callers
+  // (filenames are `<Date.now()>-<uuid>.<ext>` — no stray `%`). A malformed
+  // `%` (e.g. `2026%2`) throws → 404, consistent with the no-existence-oracle
+  // stance (and an improvement over the prior catch-all 500).
+  let decodedPath: string;
+  try {
+    decodedPath = decodeURIComponent(path);
+  } catch {
+    return json({ error: "Not found", error_type: "not_found" }, 404);
+  }
+
+  const fileMatch = decodedPath.match(/^\/([^/]+)\/(.+)$/);
+  if (req.method === "GET" && fileMatch) {
+    const reqPath = `${fileMatch[1]}/${fileMatch[2]}`;
+    const filePath = normalize(join(assets, reqPath));
+
+    if (!filePath.startsWith(normalize(assets))) {
+      return json({ error: "Invalid path", error_type: "invalid_path" }, 403);
+    }
+    if (!existsSync(filePath)) {
+      return json({ error: "Not found", error_type: "not_found" }, 404);
+    }
+
+    // Tag-scope gate (C0 adversarial-audit finding). The note-keyed
+    // attachment surfaces (GET /notes/:id?include_attachments, GET
+    // /notes/:id/attachments, query results) are all gated behind
+    // `noteWithinTagScope`, but this raw byte-serve endpoint historically
+    // shipped bytes purely by filesystem path with only a path-traversal
+    // guard — so a tag-scoped token (scoped to e.g. ["work"]) could fetch
+    // an out-of-scope note's attachment bytes directly if it learned the
+    // storage path. Path secrecy (the 122-bit UUID in the filename) is NOT
+    // an access control. When the token is tag-scoped, reverse-lookup the
+    // requested path → owning attachment row(s) → note_id, and serve only
+    // if at least one owning note is within scope. Unscoped tokens
+    // (tagScope.raw === null) keep the prior behavior verbatim.
+    //
+    // 404 (not 403) on out-of-scope / no-owning-row, matching the
+    // note-level surfaces — don't create an existence oracle that confirms
+    // "this path exists but you can't see it."
+    if (tagScope.raw !== null) {
+      const rows = await store.getAttachmentsByPath(reqPath);
+      let allowed = false;
+      for (const att of rows) {
+        const note = await store.getNote(att.noteId);
+        if (note && noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
+          allowed = true;
+          break;
+        }
+      }
+      if (!allowed) {
+        return json({ error: "Not found", error_type: "not_found" }, 404);
+      }
+    }
+
+    const stat = statSync(filePath);
+    const ext = extname(filePath).toLowerCase();
+    const contentType = MIME_TYPES[ext] ?? "application/octet-stream";
+    const total = stat.size;
+
+    // vault attachments-for-agents design (D9) — the REST twin of MCP's
+    // `content_offset`. `Bun.file(filePath)` resolves lazily: `.slice()`
+    // creates a bounded view and only the requested bytes are actually read
+    // on `.arrayBuffer()`/streaming, replacing the prior whole-file
+    // `readFileSync` (a standing memory smell on a large attachment, e.g. a
+    // 90 MB video) on BOTH the ranged and full-file paths below.
+    const bunFile = Bun.file(filePath);
+    const range = parseByteRangeHeader(req.headers.get("range"), total);
+
+    if (range) {
+      const { start, end } = range; // inclusive
+      return new Response(bunFile.slice(start, end + 1), {
+        status: 206,
+        headers: {
+          "Content-Type": contentType,
+          "Content-Length": String(end - start + 1),
+          "Content-Range": `bytes ${start}-${end}/${total}`,
+          "Accept-Ranges": "bytes",
+          // Defense-in-depth: never let a browser MIME-sniff a stored asset
+          // into an active type — see the full-response branch below.
+          "X-Content-Type-Options": "nosniff",
+        },
+      });
+    }
+
+    return new Response(bunFile, {
+      headers: {
+        "Content-Type": contentType,
+        "Content-Length": String(total),
+        "Accept-Ranges": "bytes",
+        // Defense-in-depth: never let a browser MIME-sniff a stored asset into
+        // an active type (e.g. an octet-stream body sniffed as text/html).
+        // Combined with the upload blocklist (no .svg/.html) this closes the
+        // same-origin XSS surface for served attachments. Mirrors routing.ts's
+        // SPA-asset stance.
+        "X-Content-Type-Options": "nosniff",
+      },
+    });
+  }
+
+  return json({ error: "Not found", error_type: "not_found" }, 404);
+}
+
+// applySchemaDefaults lives in core/src/mcp.ts (vault#553) — REST used to
+// carry a byte-identical duplicate; importing it means REST and MCP can
+// never drift on this behavior again, and the cloud runtime (which imports
+// core directly) inherits it without any handler-side code.
+
+function removeWikilinkBrackets(content: string, targetPath: string): string {
+  const escaped = targetPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  content = content.replace(new RegExp(`\\[\\[${escaped}\\|([^\\]]+)\\]\\]`, "gi"), "$1");
+  content = content.replace(new RegExp(`\\[\\[${escaped}(#[^\\]]+)?\\]\\]`, "gi"), `${targetPath}$1`);
+  return content;
+}
+
+/** POST /api/history/compact — unscoped administrators; absent bounds are unbounded. */
+export async function handleHistoryCompact(req: Request, store: Store, tagScope: TagScopeCtx = NO_TAG_SCOPE): Promise<Response> {
+  if (tagScope.raw !== null)
+    return json({ error: "Not found", error_type: "not_found" }, 404);
+  const declared = Number(req.headers.get("content-length"));
+  if (declared > MAX_JSON_BODY_BYTES)
+    return payloadTooLargeResponse(declared);
+  let body: Record<string, unknown>;
+  try {
+    const raw = await req.text();
+    if (new TextEncoder().encode(raw).length > MAX_JSON_BODY_BYTES)
+      return payloadTooLargeResponse(new TextEncoder().encode(raw).length);
+    const parsed = raw.trim() ? JSON.parse(raw) : {};
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+      throw new Error("object required");
+    body = parsed;
+  }
+  catch {
+    return json({ error: "Invalid compaction request", error_type: "invalid_request" }, 400);
+  }
+  if ((body.note_id !== undefined && (typeof body.note_id !== "string" || body.note_id.length === 0)) ||
+    [body.budget_ms, body.max_notes].some(v => v !== undefined && (typeof v !== "number" || !Number.isInteger(v) || v < 1)))
+    return json({ error: "Invalid compaction request", error_type: "invalid_request" }, 400);
+  try {
+    return json(store.compactHistory({ noteId: body.note_id as string | undefined, budgetMs: body.budget_ms as number | undefined ?? null, maxNotes: body.max_notes as number | undefined ?? null }));
+  }
+  catch (err) {
+    const conflict = conflictResponse(err);
+    if (conflict)
+      return conflict;
+    return json({ error: "Compaction failed", error_type: "compaction_failed", message: err instanceof Error ? err.message : String(err) }, 500);
+  }
+}
