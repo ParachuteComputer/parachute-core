@@ -64,6 +64,7 @@
 import type { EmbeddingProvider } from "../../core/src/embedding/provider.ts";
 import { ExternalApiEmbeddingProvider } from "./external-api.ts";
 import { OnnxTransformersEmbeddingProvider } from "./onnx-transformers.ts";
+import { outboundAllowed } from "../offline.ts";
 
 /** Default model requested from the config-upgrade tier when `EMBEDDING_MODEL` is unset. Matches the plan's recommended quality default (Ollama `bge-m3`). */
 export const DEFAULT_EXTERNAL_EMBEDDING_MODEL = "bge-m3";
@@ -135,6 +136,8 @@ export function buildEmbeddingProvider(
 ): EmbeddingProvider | undefined {
   if (!resolveEmbeddingsEnabled(env, opts?.persistedEnabled)) return undefined;
   const config = resolveEmbeddingApiConfig(env);
+  // Offline: an embeddings API off the machine is not called; semantic search stays off.
+  if (config.url && !outboundAllowed(config.url, env)) return undefined;
   if (config.url) {
     return new ExternalApiEmbeddingProvider({
       url: config.url,

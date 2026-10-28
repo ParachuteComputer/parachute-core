@@ -3,15 +3,17 @@
 // bytes and mode, and no file added or removed), embedded or not.
 // The newer home is made with today's CLI, then the schema marker both databases use (a `schema_version` table:
 // vault core/src/schema.ts:421,762, SCHEMA_VERSION 32; hub src/hub-db.ts:939-955, 24 migrations) gets one more
-// row, on the throwaway copy. Today nothing checks it: the vault re-stamps its own version and carries on.
-// The home is always compared, whatever the exit; today the box servers' red reasons name the exact files they add.
-// Lane B turns these green.
-import { Database } from "bun:sqlite";
+// row, on the throwaway copy. Before lane B nothing checked it: the vault re-stamped its own version and carried on.
+// The home is always compared, whatever the exit.
+// Lane B made these green: every command (packages/cli/src/dispatch.ts) reads each database's schema stamp, without
+// opening it for writing, before it parses its own arguments, so the embedded cases hold before serve --embedded and
+// bootstrap exist (lanes C, E), and must keep holding once they do.
+import { Database, constants } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { randomBytes } from "node:crypto";
+import { mkdirSync, renameSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { cli, freePort, newHome, start } from "../candidate-lib.ts";
-import { red } from "../lib.ts";
 import { diff, exitWithin, must, ports, snapshot, tail } from "./_lib.ts";
 
 const VAULT = "older";
@@ -23,6 +25,35 @@ function raiseSchema(dbPath: string): number {
   db.run("INSERT INTO schema_version (version, applied_at) VALUES (?, ?)", [top + 1, new Date(Date.now() + 60_000).toISOString()]);
   db.close();
   return top + 1;
+}
+
+/**
+ * The same, but the new row is left in the WAL by a writer killed before it checkpoints, as a newer program that
+ * crashed (or a CLI that exits without closing) leaves it: the database file alone still says the old version, and
+ * reading the WAL is what makes SQLite write its -shm index.
+ */
+function raiseSchemaInWal(dbPath: string): void {
+  const top = (() => {
+    const db = new Database(dbPath, { readonly: true });
+    const v = (db.query("SELECT MAX(version) AS v FROM schema_version").get() as { v: number }).v;
+    db.close();
+    return v;
+  })();
+  const w = Bun.spawnSync([
+    process.execPath,
+    "-e",
+    `const { Database } = require("bun:sqlite");
+     const db = new Database(${JSON.stringify(dbPath)});
+     db.exec("PRAGMA journal_mode = WAL");
+     db.exec("PRAGMA wal_autocheckpoint = 0");
+     db.run("INSERT INTO schema_version (version, applied_at) VALUES (?, ?)", [${top + 1}, new Date().toISOString()]);
+     process.kill(process.pid, "SIGKILL");`,
+  ]);
+  must(w.signalCode === "SIGKILL" && statSync(`${dbPath}-wal`).size > 0, `setup: no WAL left with the new row (${w.stderr})`);
+  const file = new Database(`file:${dbPath}?immutable=1`, constants.SQLITE_OPEN_READONLY | constants.SQLITE_OPEN_URI);
+  const inFile = (file.query("SELECT MAX(version) AS v FROM schema_version").get() as { v: number }).v;
+  file.close();
+  must(inFile === top, `setup: the new row reached the database file (${inFile})`);
 }
 
 /** A box-mode home made by today's CLI: a first account (hub.db) and, optionally, a vault (vault.db). */
@@ -63,9 +94,8 @@ describe("embedded/newer-data", () => {
     expect(raiseSchema(join(home, "hub.db"))).toBeGreaterThan(1);
   });
 
-  red(
+  test(
     "serve --embedded on a newer vault.db exits 6 and leaves the home byte-identical",
-    { reason: /^serve --embedded: exit 1, want 6: .*unexpected argument "--embedded"/s, lane: "B" },
     async () => {
       const home = await makeHome(true);
       raiseSchema(vaultDb(home));
@@ -74,9 +104,8 @@ describe("embedded/newer-data", () => {
     },
   );
 
-  red(
+  test(
     "bootstrap --embedded on a newer vault.db exits 6 and leaves the home byte-identical",
-    { reason: /^bootstrap --embedded: exit 1, want 6: .*unknown command "bootstrap"/s, lane: "B" },
     async () => {
       const home = await makeHome(true);
       raiseSchema(vaultDb(home));
@@ -84,9 +113,8 @@ describe("embedded/newer-data", () => {
     },
   );
 
-  red(
+  test(
     "serve --embedded on a newer hub.db exits 6 and leaves the home byte-identical",
-    { reason: /^serve --embedded: exit 1, want 6: .*unexpected argument "--embedded"/s, lane: "B" },
     async () => {
       const home = await makeHome(true);
       raiseSchema(join(home, "hub.db"));
@@ -95,11 +123,9 @@ describe("embedded/newer-data", () => {
     },
   );
 
-  red(
+  // Before lane B the vault carried on serving the newer vault.db and wrote its WAL files.
+  test(
     "box: parachute-vault serve on a newer vault.db exits 6 and leaves the home byte-identical",
-    // Today the vault carries on serving the newer vault.db and writes to it; that exact change (its WAL files, and
-    // nothing else) is the known failure. Any other change, or another exit, is red for the wrong reason.
-    { reason: /^parachute-vault serve: the home changed \(still running after 20 s\): \+ vault\/data\/older\/vault\.db-shm, \+ vault\/data\/older\/vault\.db-wal$/, lane: "B" },
     async () => {
       const home = await makeHome(true);
       raiseSchema(vaultDb(home));
@@ -107,15 +133,45 @@ describe("embedded/newer-data", () => {
     },
   );
 
-  red(
+  // Before lane B the hub carried on serving the newer hub.db and wrote hub-instance.json, its WAL and well-known/.
+  test(
     "box: parachute serve on a newer hub.db exits 6 and leaves the home byte-identical",
-    // Today the hub carries on serving the newer hub.db and writes to the home; that exact set of changes is the
-    // known failure. Any other change (hub.db itself rewritten, say), or another exit, is red for the wrong reason.
-    { reason: /^parachute serve: the home changed \(still running after 20 s\): \+ hub-instance\.json, \+ hub\.db-shm, \+ hub\.db-wal, \+ well-known, \+ well-known\/hub\.html$/, lane: "B" },
     async () => {
       const home = await makeHome(false); // no vault row, so the hub supervises nothing
       raiseSchema(join(home, "hub.db"));
       await refuses(home, "parachute serve", ["serve"], { env: { PORT: String(await freePort()), PARACHUTE_BIND_HOST: "127.0.0.1" } });
     },
   );
+
+  test("box: parachute serve on a hub.db whose newer schema is still only in its WAL exits 6 and leaves the home byte-identical", async () => {
+    const home = await makeHome(false);
+    raiseSchemaInWal(join(home, "hub.db"));
+    await refuses(home, "parachute serve", ["serve"], { env: { PORT: String(await freePort()), PARACHUTE_BIND_HOST: "127.0.0.1" } });
+  });
+
+  test("box: parachute-vault create help (a vault named help) on a home with a newer vault.db exits 6 and leaves the home byte-identical", async () => {
+    // Only help itself skips the check; an argument that happens to say "help" doesn't.
+    const home = await makeHome(true);
+    raiseSchema(vaultDb(home));
+    await refuses(home, "parachute-vault create help", ["create", "help", "--no-mirror", "--json"], { vault: true, env: { EMBEDDINGS_ENABLED: "false" } });
+  });
+
+  test("box: parachute-vault serve --help on a newer vault.db in the older vaults/ layout exits 6 and leaves the home byte-identical", async () => {
+    // Help is a command too: the vault CLI moves an older layout before it reads its arguments (Codex round 2).
+    const home = await makeHome(true);
+    raiseSchema(vaultDb(home));
+    renameSync(join(home, "vault", "data"), join(home, "vaults"));
+    await refuses(home, "parachute-vault serve --help", ["serve", "--help"], { vault: true, env: { EMBEDDINGS_ENABLED: "false" } });
+  });
+
+  for (const legacy of ["vaults", "vault/vaults"]) {
+    test(`box: parachute-vault serve on a newer vault.db in the older ${legacy}/ layout exits 6 and leaves the home byte-identical`, async () => {
+      // The vault moves an older layout into vault/data/ when it opens; a newer database there must be refused first.
+      const home = await makeHome(true);
+      raiseSchema(vaultDb(home));
+      mkdirSync(join(home, legacy), { recursive: true });
+      renameSync(join(home, "vault", "data", VAULT), join(home, legacy, VAULT));
+      await refuses(home, "parachute-vault serve", ["serve"], { vault: true, env: { PORT: String(await freePort()), EMBEDDINGS_ENABLED: "false" } });
+    });
+  }
 });

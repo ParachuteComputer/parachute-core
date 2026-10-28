@@ -924,17 +924,42 @@ export const HUB_DB_BUSY_TIMEOUT_MS = 5000;
  */
 export const GRANT_ATTRIBUTION_MIGRATION = 22;
 
+/** The newest `hub.db` schema this hub knows: a `hub.db` stamped higher was written by a newer hub (PLAN §3, fix 4). */
+export const HUB_SCHEMA_VERSION = Math.max(...MIGRATIONS.map((m) => m.version));
+
 export function openHubDb(path: string = hubDbPath()): Database {
   mkdirSync(dirname(path), { recursive: true });
   const db = new Database(path);
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
   db.exec(`PRAGMA busy_timeout = ${HUB_DB_BUSY_TIMEOUT_MS}`);
-  migrate(db);
+  try {
+    migrate(db);
+  } catch (err) {
+    db.close();
+    throw err;
+  }
   return db;
 }
 
+/** A hub.db stamped with a schema newer than this hub: it was written by a newer hub (PLAN §3, fix 4). */
+export class NewerHubSchemaError extends Error {
+  constructor(readonly found: number) {
+    super(`hub.db is at schema ${found}, newer than this hub knows (${HUB_SCHEMA_VERSION}); refusing to migrate it`);
+    this.name = "NewerHubSchemaError";
+  }
+}
+
 export function migrate(db: Database): void {
+  // Before anything writes: an older hub must never migrate, or add rows to, a newer hub.db.
+  const hasVersions = db
+    .query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'")
+    .get();
+  if (hasVersions) {
+    const top = (db.query("SELECT MAX(version) AS v FROM schema_version").get() as { v: number | null })
+      .v;
+    if (top !== null && top > HUB_SCHEMA_VERSION) throw new NewerHubSchemaError(top);
+  }
   db.exec(`
     CREATE TABLE IF NOT EXISTS schema_version (
       version INTEGER PRIMARY KEY,

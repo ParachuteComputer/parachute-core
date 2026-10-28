@@ -27,6 +27,7 @@ import {
   type EmbedResult,
   type ProviderAvailability,
 } from "../../core/src/embedding/provider.ts";
+import { offlineFetchInit } from "../offline.ts";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 
@@ -107,6 +108,7 @@ export class ExternalApiEmbeddingProvider implements EmbeddingProvider {
       if (this.apiKey) headers["Authorization"] = `Bearer ${this.apiKey}`;
 
       const resp = await this.fetchImpl(`${this.url}/embeddings`, {
+        ...offlineFetchInit(),
         method: "POST",
         headers,
         body: JSON.stringify({ model: this.model, input: input.texts }),

@@ -61,6 +61,7 @@ import { sanitizePublicOrigin } from "../vault-hub-origin-env.ts";
 import { WELL_KNOWN_DIR } from "../well-known.ts";
 import { createWsBridgeHandlers } from "../ws-bridge.ts";
 import { bootSupervisedModules } from "./serve-boot.ts";
+import { isOffline } from "../offline.ts";
 
 /**
  * Build the `Bun.serve` options for the hub listener. Extracted (pure) so the
@@ -808,8 +809,11 @@ export async function serve(opts: ServeOpts = {}): Promise<{
   // opts in by dropping a key file in (no restart needed either way).
   // Skipped under `skipModuleBoot` alongside every other real timer, so tests
   // never spawn a 60-second poll.
+  // Offline (embedded, or serve --offline): the relay is off the machine, so neither is started.
   let reconciler: ChannelReconciler | null = null;
-  if (!opts.skipModuleBoot) {
+  if (isOffline()) {
+    log("parachute serve: offline: channel membership sync not started (PARACHUTE_OFFLINE).");
+  } else if (!opts.skipModuleBoot) {
     reconciler = startChannelReconciler({ db: dbHolder.get(), log });
     log(
       "parachute serve: channel membership sync armed (60s poll over `sync` channel bindings, " +

@@ -614,7 +614,24 @@ export function applyConnectionPragmas(db: Database): ConnectionPragmaResult {
 /**
  * Initialize database schema. Idempotent — safe to call on every startup.
  */
+/** A vault.db stamped with a schema newer than this code: it was written by a newer vault (PLAN §3, fix 4). */
+export class NewerSchemaError extends Error {
+  constructor(readonly found: number, readonly known: number = SCHEMA_VERSION) {
+    super(`vault.db is at schema ${found}, newer than this vault knows (${known}); refusing to migrate it`);
+    this.name = "NewerSchemaError";
+  }
+}
+
+/** Throw NewerSchemaError if the database records a schema newer than SCHEMA_VERSION. Reads only. */
+export function assertNotNewer(db: Database): void {
+  if (!hasTable(db, "schema_version")) return;
+  const row = db.prepare("SELECT MAX(version) AS v FROM schema_version").get() as { v: number | null } | null;
+  if (row?.v != null && row.v > SCHEMA_VERSION) throw new NewerSchemaError(row.v);
+}
+
 export function initSchema(db: Database): void {
+  // Before anything writes: an older vault must never half-migrate, or re-stamp, a newer database.
+  assertNotNewer(db);
   applyConnectionPragmas(db);
 
   // Check if we need to migrate from v2

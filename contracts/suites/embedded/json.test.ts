@@ -7,7 +7,8 @@
 //   - `parachute auth revoke-token <jti> --json` → {revoked: true, jti};
 //   - `parachute-vault create <name> --mint --scope write --no-mirror --json` → {name, token, …}, the token signed by
 //     the hub with iss = PARACHUTE_HUB_ORIGIN and scoped to that vault.
-// Today mint/revoke have no --json. Lane B turns these green.
+// Lane B turned mint and revoke green. Provisioning while embedded waits on lane C's serve --embedded and lane E's
+// bootstrap (it is red with NO_EMBEDDED until then).
 import { describe, expect, test } from "bun:test";
 import { randomBytes } from "node:crypto";
 import { cli, freePort, newHome } from "../candidate-lib.ts";
@@ -47,9 +48,8 @@ describe("embedded/json", () => {
     must(j.bun === Bun.version || /^\d+\.\d+\.\d+/.test(j.bun), `bun is ${j.bun}`);
   });
 
-  red(
+  test(
     "auth mint-token --json prints {token, jti, exp, scopes, aud}, and they match the token's claims",
-    { reason: /mint-token --json exited 1: .*unknown flag "--json"/s, lane: "B" },
     async () => {
       const home = await operatorHome();
       const scope = "vault:default:write";
@@ -68,9 +68,8 @@ describe("embedded/json", () => {
     },
   );
 
-  red(
+  test(
     "auth revoke-token <jti> --json prints {revoked: true, jti}",
-    { reason: /revoke-token --json exited 1: .*unexpected flag "--json"/s, lane: "B" },
     async () => {
       const home = await operatorHome();
       const m = await cli(home, ["auth", "mint-token", "--scope", "vault:default:read", "--ephemeral"]);
@@ -85,7 +84,7 @@ describe("embedded/json", () => {
 
   red(
     "parachute-vault create --mint --scope write --no-mirror --json, run while serve --embedded holds the home, prints a write token the vault accepts",
-    { reason: NO_EMBEDDED, lane: "B" },
+    { reason: NO_EMBEDDED, lane: "C, E (B's part is in)" },
     async () => {
       // Prism provisions vaults this way through PARACHUTE_VAULT_BIN while Parachute runs (vault-provision.ts:31-39).
       const home = newHome("json");

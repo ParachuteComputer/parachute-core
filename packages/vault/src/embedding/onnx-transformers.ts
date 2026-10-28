@@ -42,6 +42,7 @@ import {
   type EmbedResult,
   type ProviderAvailability,
 } from "../../core/src/embedding/provider.ts";
+import { isOffline } from "../offline.ts";
 
 /** P0-verified bundle-sized default: 34MB q8 ONNX, well under the "~100MB zero-config" bar. */
 const DEFAULT_MODEL_ID = "Xenova/bge-small-en-v1.5";
@@ -70,7 +71,9 @@ async function defaultPipelineLoader(modelId: string): Promise<FeatureExtraction
   // (never `core/`), but keeping the ~34MB dependency's load off the
   // module-init path means a vault that never touches semantic search
   // never pays the import cost either.
-  const { pipeline } = await import("@huggingface/transformers");
+  const { pipeline, env } = await import("@huggingface/transformers");
+  // Offline: a model already in the cache loads; a missing one is not downloaded.
+  if (isOffline()) env.allowRemoteModels = false;
   const extractor = await pipeline("feature-extraction", modelId, { dtype: "q8" });
   return extractor as unknown as FeatureExtractionFn;
 }
