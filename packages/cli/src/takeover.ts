@@ -557,13 +557,8 @@ export function holders(home: string): Holder[] {
   return out;
 }
 
-/**
- * holders(), each attributed to the unit whose main process it is or descends from (a unit's MainPID and its children
- * are its processes, as its cgroup holds them); a holder of none of `units` keeps its cgroup's unit.
- */
-export function heldBy(home: string, units: string[]): Holder[] {
-  const held = holders(home);
-  if (held.length === 0 || process.platform !== "linux") return held;
+/** The parent of every process (Linux). */
+function parents(): Map<number, number> {
   const parent = new Map<number, number>();
   for (const name of readdirSync("/proc")) {
     if (!/^\d+$/.test(name)) continue;
@@ -572,6 +567,81 @@ export function heldBy(home: string, units: string[]): Holder[] {
       parent.set(Number(name), Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1]));
     } catch {}
   }
+  return parent;
+}
+
+/** Every process of a unit: its MainPID and descendants, and every process its cgroup names as the unit. */
+function unitProcesses(unit: string): number[] {
+  const out = new Set<number>();
+  const root = mainPid(unit);
+  const parent = parents();
+  for (const pid of parent.keys()) {
+    for (let p: number | undefined = pid, hops = 0; root > 0 && p && p > 1 && hops < 64; p = parent.get(p), hops++) {
+      if (p === root) {
+        out.add(pid);
+        break;
+      }
+    }
+    try {
+      const services = [...readFileSync(`/proc/${pid}/cgroup`, "utf8").matchAll(/\/([\w@.-]+\.service)(?=\/|$)/gm)].map((m) => m[1]!);
+      if (services.filter((u) => !u.startsWith("user@")).pop() === unit) out.add(pid);
+    } catch {}
+  }
+  return [...out];
+}
+
+/**
+ * Is it safe to stop and disable `unit` for `home`? Each of its processes (not only the ones holding this home's data)
+ * is checked for another home's databases, and systemd must answer, completely, which other units a stop or disable
+ * would reach (`allowed` may be reached). Returns what is wrong, or null.
+ */
+function unsafeToStop(unit: string, home: string, allowed: Set<string>): string | null {
+  const ours = new Set<string>();
+  for (const f of dataFiles(home)) {
+    try {
+      const st = statSync(f);
+      ours.add(`${st.dev}:${st.ino}`);
+    } catch {}
+  }
+  for (const pid of unitProcesses(unit)) {
+    let fds: string[] = [];
+    try {
+      fds = readdirSync(`/proc/${pid}/fd`);
+    } catch {
+      continue;
+    }
+    for (const fd of fds) {
+      try {
+        const link = readlinkSync(`/proc/${pid}/fd/${fd}`);
+        if (!/(^|\/)(hub|vault)\.db(-wal|-shm)?$/.test(link)) continue;
+        const st = statSync(`/proc/${pid}/fd/${fd}`);
+        if (!ours.has(`${st.dev}:${st.ino}`)) return `${unit} also has another home's database open (pid ${pid}: ${link}); stopping it would stop that home too`;
+      } catch {}
+    }
+  }
+  // RequiredBy/BoundBy/ConsistsOf every systemd reports; PropagatesStopTo (v249) and UpheldBy (v248) only newer ones,
+  // and one that doesn't know them can't have them set. `Also=` is an [Install] line, not a property: read from the
+  // unit's effective text.
+  const must = ["RequiredBy", "BoundBy", "ConsistsOf"];
+  const keys = [...must, "PropagatesStopTo", "UpheldBy"];
+  const r = run(["systemctl", "--user", "show", unit, ...keys.flatMap((k) => ["-p", k])]);
+  const got = new Map(r.stdout.split("\n").map((l) => /^(\w+)=(.*)$/.exec(l.trim())).filter((m): m is RegExpExecArray => !!m).map((m) => [m[1]!, m[2]!]));
+  if (r.code !== 0 || must.some((k) => !got.has(k))) return `systemd didn't say which units stopping ${unit} would reach (systemctl show exited ${r.code})`;
+  const also = unitText(unit)
+    .split("\n")
+    .flatMap((l) => (/^\s*Also\s*=\s*(.*)$/.exec(l)?.[1] ?? "").split(/\s+/));
+  const reach = [...keys.flatMap((k) => (got.get(k) ?? "").split(/\s+/)), ...also].filter((x) => x && !allowed.has(x) && x !== unit && x !== "default.target");
+  return reach.length ? `stopping or disabling ${unit} would also reach ${reach.join(", ")}` : null;
+}
+
+/**
+ * holders(), each attributed to the unit whose main process it is or descends from (a unit's MainPID and its children
+ * are its processes, as its cgroup holds them); a holder of none of `units` keeps its cgroup's unit.
+ */
+export function heldBy(home: string, units: string[]): Holder[] {
+  const held = holders(home);
+  if (held.length === 0 || process.platform !== "linux") return held;
+  const parent = parents();
   const roots = units.map((u) => [u, mainPid(u)] as const).filter(([, pid]) => pid > 0);
   for (const h of held) {
     for (let p: number | undefined = h.pid, hops = 0; p && p > 1 && hops < 64; p = parent.get(p), hops++) {
@@ -1135,7 +1205,9 @@ async function coreUnitUp(port: number, d: Detected, log: (s: string) => void): 
   let hub = "";
   const ok = await waitUntil(async () => {
     if (!active()) return true;
-    for (const p of [port, ...listeningPorts(pid).filter((x) => x !== port)]) {
+    // Only ports its own process listens on count (the configured one first, if it is among them).
+    const owned = listeningPorts(pid);
+    for (const p of [...owned.filter((x) => x === port), ...owned.filter((x) => x !== port)]) {
       if (await isReady(`http://127.0.0.1:${p}`)) {
         hub = `http://127.0.0.1:${p}`;
         return true;
@@ -1144,6 +1216,7 @@ async function coreUnitUp(port: number, d: Detected, log: (s: string) => void): 
     return false;
   }, 60_000, 500);
   if (!ok || !active() || !hub) return `${CORE_UNIT} (pid ${pid}) is not ready (tried port ${port} and the ports it listens on)`;
+  if (!heldBy(d.home, [CORE_UNIT]).some((h) => h.unit === CORE_UNIT)) return `${CORE_UNIT} (pid ${pid}) answers, but none of its processes has this home's data open`;
   const problems = await checkVaults(hub, d, checkEnv(d), log, false);
   if (problems.length) return `${CORE_UNIT} answers, but ${problems.join("; ")}`;
   await Bun.sleep(3000);
@@ -1197,7 +1270,14 @@ function resumeUnits(paused: Record_["paused"]): string[] {
   return errors;
 }
 
-async function takeOver(d: Detected, say: (s: string) => void): Promise<{ backup: string; record: Record_; core_unit: string | null }> {
+async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ backup: string; record: Record_; core_unit: string | null }> {
+  // What was shown may have changed while the person decided: everything is found again now, and if the units to
+  // pause or the processes holding the data differ, nothing is done.
+  const d = await detect(asked.home);
+  const shape = (x: Detected) => JSON.stringify([x.units.filter((u) => u.old || u.unseen).map((u) => [u.name, u.old, !!u.unseen]), x.running.map((h) => [h.pid, h.unit ?? ""]).sort()]);
+  if (shape(d) !== shape(asked)) {
+    throw new Exit(EXIT.failed, "what takeover found changed since it was shown (a unit or a process holding the data); nothing was changed. Run takeover again to see what it finds now.");
+  }
   if (d.units.some((u) => u.old && u.manager === "launchd" && (u.active || u.enabled))) {
     throw new Exit(EXIT.failed, "the old programs run as launchd agents; taking those over isn't built yet (macOS). Nothing was changed.");
   }
@@ -1212,29 +1292,20 @@ async function takeOver(d: Detected, say: (s: string) => void): Promise<{ backup
     throw new Exit(EXIT.failed, `${CORE_UNIT} is already loaded from ${fragment}; this takeover won't shadow or replace it. Nothing was changed.`);
   }
   if (existsSync(coreUnitFile)) {
-    const text = unitText(CORE_UNIT);
-    const on = run(["systemctl", "--user", "is-active", CORE_UNIT]).stdout.trim() === "active" || run(["systemctl", "--user", "is-enabled", CORE_UNIT]).stdout.trim() === "enabled";
-    if (!unitServes(text, d.home, false) || on) {
-      throw new Exit(EXIT.failed, `${CORE_UNIT} already exists (${tilde(coreUnitFile)})${on ? " and is on" : " for another home"}; this takeover won't replace it. Nothing was changed.`);
+    // Replaced only when it is one a takeover of this home wrote (its mark line) and it is off.
+    const state = run(["systemctl", "--user", "is-active", CORE_UNIT]).stdout.trim();
+    const on = !["inactive", "failed"].includes(state) || run(["systemctl", "--user", "is-enabled", CORE_UNIT]).stdout.trim() === "enabled";
+    if (readCoreUnitMark() !== d.home || on) {
+      throw new Exit(EXIT.failed, `${CORE_UNIT} already exists (${tilde(coreUnitFile)})${on ? " and is on" : " and wasn't written by a takeover of this home"}; this takeover won't replace it. Nothing was changed.`);
     }
   }
   const toPause = d.units.filter((u) => u.old && u.manager === "systemd");
   const pausable = new Set(toPause.map((u) => u.name));
-  const both = d.running.filter((h) => h.other && h.unit && pausable.has(h.unit));
-  if (both.length) {
-    throw new Exit(EXIT.held, `${[...new Set(both.map((h) => h.unit))].join(" and ")} also ${both.length === 1 ? "has" : "have"} another home's databases open (pid ${both.map((h) => h.pid).join(", ")}); pausing it would stop that home too. Nothing was changed.`);
-  }
-  // Stopping or disabling a unit can reach others (Also=, PropagatesStopTo=, units that require, bind to or are part
-  // of it): refused, rather than touching another home's service.
+  // Stopping or disabling a unit can reach another home: another home's databases in any of its processes, or units
+  // a stop or disable would reach (Also=, PropagatesStopTo=, units that require, bind to or are part of it).
   for (const u of toPause) {
-    const deps = run(["systemctl", "--user", "show", u.name, "-p", "Also", "-p", "PropagatesStopTo", "-p", "RequiredBy", "-p", "BoundBy", "-p", "ConsistsOf", "-p", "UpheldBy"]).stdout;
-    const reach = deps
-      .split("\n")
-      .flatMap((l) => (/^(?:Also|PropagatesStopTo|RequiredBy|BoundBy|ConsistsOf|UpheldBy)=(.+)$/.exec(l.trim())?.[1] ?? "").split(/\s+/))
-      .filter((x) => x && !pausable.has(x) && x !== "default.target");
-    if (reach.length) {
-      throw new Exit(EXIT.failed, `stopping or disabling ${u.name} would also reach ${reach.join(", ")}; takeover won't touch units it hasn't seen serving this home. Nothing was changed.`);
-    }
+    const why = unsafeToStop(u.name, d.home, pausable);
+    if (why) throw new Exit(EXIT.held, `${why}. Nothing was changed.`);
   }
   const outside = d.running.filter((h) => !h.unit || !pausable.has(h.unit));
   if (outside.length) {
@@ -1396,12 +1467,29 @@ async function rollBack(home: string, say: (s: string) => void): Promise<Record<
   const record = readRecord(home);
   if (!record || record.state !== "taken-over") throw new Exit(EXIT.failed, `${tilde(home)} has no takeover to roll back${record ? ` (it was rolled back on ${record.rolled_back_at})` : ""}`);
   if (record.core_unit) {
-    // Still this home's? Running: its process has this home's data open. Not running: it still carries the mark this
-    // takeover wrote. Otherwise it may serve another home now, and it isn't touched.
-    const runningPid = mainPid(record.core_unit);
-    const ours = runningPid > 0 ? heldBy(home, [record.core_unit]).some((h) => h.unit === record.core_unit) : readCoreUnitMark() === home;
-    if (!ours) {
-      throw new Exit(EXIT.failed, `${record.core_unit} ${runningPid > 0 ? "is running but doesn't have this home's data open" : "no longer carries this takeover's mark for this home"}; it may serve another home now, so rollback won't touch it. Stop it yourself if it is this home's, then run takeover --rollback again.`);
+    // Still this home's? Running: one of its processes has this home's data open, none another home's, and stopping it
+    // reaches no other unit. Stopped: it still carries the mark this takeover wrote. Anything systemd won't say, or
+    // a unit that runs with no process named: not touched.
+    const shown = run(["systemctl", "--user", "show", record.core_unit, "-p", "ActiveState", "-p", "MainPID"]);
+    const state = /^ActiveState=(.*)$/m.exec(shown.stdout)?.[1]?.trim();
+    const pidText = /^MainPID=(\d+)$/m.exec(shown.stdout)?.[1];
+    if (shown.code !== 0 || state === undefined || pidText === undefined) {
+      throw new Exit(EXIT.failed, `systemd didn't say whether ${record.core_unit} runs (systemctl show exited ${shown.code}); rollback won't touch it.`);
+    }
+    const stopped = state === "inactive" || state === "failed";
+    let why: string | null = null;
+    if (stopped) {
+      if (readCoreUnitMark() !== home) why = "no longer carries this takeover's mark for this home";
+    } else if (Number(pidText) === 0) {
+      why = `is ${state} but systemd names no process for it`;
+    } else if (!heldBy(home, [record.core_unit]).some((h) => h.unit === record.core_unit)) {
+      why = "is running but none of its processes has this home's data open";
+    } else {
+      why = unsafeToStop(record.core_unit, home, new Set());
+    }
+    if (why) {
+      const what = why.startsWith(record.core_unit) ? why : `${record.core_unit} ${why}`;
+      throw new Exit(EXIT.failed, `${what}; it may serve another home now, so rollback won't touch it. Stop it yourself if it is this home's, then run takeover --rollback again.`);
     }
     say(`Stopping ${record.core_unit} …`);
     const r = run(["systemctl", "--user", "disable", "--now", record.core_unit]);
