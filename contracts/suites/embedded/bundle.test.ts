@@ -2,7 +2,7 @@
 // tarball holds is what Prism ships, so it is tested as shipped.
 //   - the layout: bin/parachute-core and its two aliases, runtime/bun, lib/, entitlements/bun.plist, LICENSE,
 //     THIRD-PARTY-NOTICES.txt, SOURCE.md, VERSION;
-//   - it runs on its own pinned Bun (release/bun.json), with no Bun on PATH, the hub and its vault child both;
+//   - it runs on its own pinned Bun (release/bun.json), with no Bun on PATH, serve and (on the child path) its vault child;
 //   - the tarball unpacks to exactly the tree under test, and SHA256SUMS names its hash;
 //   - lib/ has no local embedding stack (no onnxruntime, no sharp), no dev tools, and native code only for this
 //     platform;
@@ -349,12 +349,14 @@ describe("embedded/bundle", () => {
     const up = await until(async () => box.proc.exitCode !== null || (await safeFetch(`${origin}/vault/${vaultName}/mcp`)).status === 401, 60_000);
     must(up && box.proc.exitCode === null, `serve from "${copy}" did not come up (exit ${box.proc.exitCode}):\n${box.log().slice(-1500)}`);
 
-    // Both the hub and the vault child it started run on the copy's own runtime/bun.
+    // serve runs on the copy's own runtime/bun: one process with the vault inside (lane A2), or, on the child path
+    // (until the Nov 3 decision), the hub and the vault child it started, both on it.
+    const childPath = JSON.parse(readFileSync(join(copy, "CANDIDATE.json"), "utf8")).process_model === "child";
     const ours = processesOf(join(copy, "runtime", "bun"), copy);
     expect({
       hub: ours.some((l) => l.includes(`${copy}/lib/`) && l.includes("/src/parachute-core.ts serve")),
       vault: ours.some((l) => l.includes(`${copy}/lib/`) && l.includes("/src/parachute-vault.ts serve")),
-    }).toEqual({ hub: true, vault: true });
+    }).toEqual({ hub: true, vault: childPath });
 
     // A password sign-in hashes and verifies with argon2, the one native addon, loaded from the payload.
     expect(await signIn(origin, admin.username, `${admin.password}-wrong`)).toBeUndefined();
