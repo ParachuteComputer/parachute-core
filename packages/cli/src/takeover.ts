@@ -217,45 +217,92 @@ export function systemdWords(value: string): string[] | undefined {
 }
 
 /**
- * The value of `key` on one line of an environment file (systemd.exec(5)), for the plain forms only: bare (trailing
- * whitespace dropped, inner spaces and `#` kept: only a line that starts with # or ; is a comment) or wholly quoted.
- * undefined when the line doesn't assign `key`; null when it does in a form this doesn't read (a backslash, quoting
- * that doesn't close or has more after it): the home is then "unknown".
+ * PARACHUTE_HOME from an environment file, read only when every line of it is unambiguous: blank, a comment (a line
+ * starting with # or ;), or `KEY=value` on one line, with no backslash and either no quotes or one pair around the
+ * whole value. Anything else (a value that goes on over lines, escapes, odd quoting) is null: unknown, because an
+ * unrelated variable's text could then read as an assignment. undefined when the file doesn't set it.
  */
-function envFileValue(line: string, key: string): string | undefined | null {
-  if (/^\s*[#;]/.test(line)) return undefined;
-  const m = new RegExp(`^\\s*(?:export\\s+)?${key}\\s*=\\s*(.*)$`).exec(line);
-  if (!m) return undefined;
-  const raw = m[1]!.replace(/\s+$/, "");
-  if (raw.includes("\\")) return null;
-  const q = raw[0];
-  if (q === '"' || q === "'") return raw.length >= 2 && raw.endsWith(q) && !raw.slice(1, -1).includes(q) ? raw.slice(1, -1) : null;
-  return raw;
+function envFileHome(body: string): string | undefined | null {
+  let home: string | undefined;
+  for (const line of body.split("\n")) {
+    if (/^\s*$/.test(line) || /^\s*[#;]/.test(line)) continue;
+    const m = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/.exec(line);
+    if (!m) return null;
+    const raw = m[2]!;
+    if (raw.includes("\\")) return null;
+    let value = raw;
+    const q = raw[0];
+    if (q === '"' || q === "'") {
+      if (raw.length < 2 || !raw.endsWith(q) || raw.slice(1, -1).includes(q)) return null;
+      value = raw.slice(1, -1);
+    } else if (/["']/.test(raw)) return null;
+    if (m[1] === "PARACHUTE_HOME") home = value;
+  }
+  return home;
+}
+
+/** systemd's specifiers in a value: %h (the user's home) and %% (a percent); any other one is null: unknown. */
+function specifiers(v: string): string | null {
+  let out = "";
+  for (let i = 0; i < v.length; i++) {
+    if (v[i] !== "%") {
+      out += v[i];
+      continue;
+    }
+    const n = v[++i];
+    if (n === "%") out += "%";
+    else if (n === "h") out += userHome();
+    else return null;
+  }
+  return out;
+}
+
+/** PARACHUTE_HOME in the user manager's own environment, which every unit inherits; null when systemd can't say. */
+function managerHome(): string | undefined | null {
+  const r = run(["systemctl", "--user", "show-environment"]);
+  if (r.code !== 0) return null;
+  const line = r.stdout.split("\n").find((l) => l.startsWith("PARACHUTE_HOME="));
+  if (!line) return undefined;
+  const v = line.slice("PARACHUTE_HOME=".length);
+  return /[\\'"$]/.test(v) ? null : v;
 }
 
 /**
- * The home a unit serves, by systemd's rules (systemd.exec(5)): variables from `EnvironmentFile=` override
- * `Environment=` whatever the order of the lines; within each kind the last assignment wins; an empty `Environment=`
- * or `EnvironmentFile=` resets that kind's list. With no PARACHUTE_HOME, ~/.parachute. "unknown" when it can't be
- * established (an environment file it can't read): callers then take the safe side.
+ * The home a unit serves, by systemd's rules (systemd.exec(5)), reading only what is unambiguous:
+ *   - variables from `EnvironmentFile=` override `Environment=`, whatever the order of the lines; within each kind
+ *     the last assignment wins; an empty `Environment=` or `EnvironmentFile=` resets that kind's list;
+ *   - with neither, the user manager's environment, then ~/.parachute;
+ *   - "unknown" for anything else: systemd escapes or odd quoting, specifiers other than %h and %%, an environment
+ *     file it can't read whole (see envFileHome), `UnsetEnvironment=` or `PassEnvironment=` naming PARACHUTE_HOME,
+ *     or a manager environment systemd won't report. Callers then take the safe side (never pause; serve refuses).
  */
-export function unitHome(text: string): string | "unknown" {
-  const expand = (v: string) => v.replace(/%h/g, userHome()).replace(/%%/g, "%");
+export function unitHome(text: string, manager: () => string | undefined | null = managerHome): string | "unknown" {
   let fromEnv: string | undefined;
   let files: { path: string; optional: boolean }[] = [];
   for (const line of text.split("\n")) {
+    if (/^\s*(UnsetEnvironment|PassEnvironment)\s*=.*\bPARACHUTE_HOME\b/.test(line)) return "unknown";
     const env = /^\s*Environment\s*=\s*(.*)$/.exec(line)?.[1];
     if (env !== undefined) {
       if (env.trim() === "") fromEnv = undefined;
       const words = systemdWords(env);
       if (!words) return "unknown";
-      for (const w of words) if (w.startsWith("PARACHUTE_HOME=")) fromEnv = expand(w.slice("PARACHUTE_HOME=".length));
+      for (const w of words) {
+        if (!w.startsWith("PARACHUTE_HOME=")) continue;
+        const v = specifiers(w.slice("PARACHUTE_HOME=".length));
+        if (v === null) return "unknown";
+        fromEnv = v;
+      }
       continue;
     }
     const file = /^\s*EnvironmentFile\s*=\s*(.*)$/.exec(line)?.[1]?.trim();
     if (file !== undefined) {
-      if (file === "") files = [];
-      else files.push({ path: expand(file.replace(/^-/, "")), optional: file.startsWith("-") });
+      if (file === "") {
+        files = [];
+        continue;
+      }
+      const path = specifiers(file.replace(/^-/, ""));
+      if (path === null) return "unknown";
+      files.push({ path, optional: file.startsWith("-") });
     }
   }
   let fromFiles: string | undefined;
@@ -267,14 +314,15 @@ export function unitHome(text: string): string | "unknown" {
       if (f.optional && !existsSync(f.path)) continue; // systemd skips a missing optional file
       return "unknown";
     }
-    for (const line of body.split("\n")) {
-      const v = envFileValue(line, "PARACHUTE_HOME");
-      if (v === null) return "unknown";
-      if (v !== undefined) fromFiles = v;
-    }
+    const v = envFileHome(body);
+    if (v === null) return "unknown";
+    if (v !== undefined) fromFiles = v;
   }
   const set = fromFiles ?? fromEnv;
-  return set ? set : join(userHome(), ".parachute");
+  if (set) return set;
+  const fromManager = manager();
+  if (fromManager === null) return "unknown";
+  return fromManager || join(userHome(), ".parachute");
 }
 
 /**

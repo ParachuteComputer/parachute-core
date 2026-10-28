@@ -133,6 +133,7 @@ stop_unit() {
 code=0
 case "$verb" in
   daemon-reload) exit 0 ;;
+  show-environment) exit 0 ;;
   is-active) for u in $units; do if known "$u"; then s=$(st "$u" active); echo "$s"; [ "$s" = active ] || code=3; else echo inactive; code=3; fi; done; exit $code ;;
   is-enabled) for u in $units; do if known "$u"; then s=$(st "$u" enabled); echo "$s"; [ "$s" = enabled ] || code=1; else echo "Failed to get unit file state for $u: No such file or directory" >&2; code=1; fi; done; exit $code ;;
   start|stop|restart|enable|disable)

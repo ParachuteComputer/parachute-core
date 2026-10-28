@@ -4,7 +4,10 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { systemdWords, unitHome } from "./takeover.ts";
+import { systemdWords, unitHome as readHome } from "./takeover.ts";
+
+// The user manager's environment sets no PARACHUTE_HOME here, unless a test says so.
+const unitHome = (text: string, manager: () => string | undefined | null = () => undefined) => readHome(text, manager);
 
 const dir = mkdtempSync(join(tmpdir(), "takeover-unit-"));
 const file = (name: string, body: string) => {
@@ -44,6 +47,24 @@ describe("unitHome", () => {
     expect(unitHome(`EnvironmentFile=${file("d.env", "PARACHUTE_HOME=/srv/home\\ other\n")}\n`)).toBe("unknown");
     expect(unitHome(`EnvironmentFile=${file("e.env", "PARACHUTE_HOME=\"/a\" b\n")}\n`)).toBe("unknown");
     expect(unitHome(`[Service]\nEnvironment="PARACHUTE_HOME=/srv/home\\x20other"\n`)).toBe("unknown");
+  });
+  test("an unrelated variable's value going on over lines makes the file unknown, not a second assignment", () => {
+    const f = file("f.env", `DESCRIPTION="first\nPARACHUTE_HOME=/srv/this\nlast"\n`);
+    expect(unitHome(`Environment=PARACHUTE_HOME=/srv/other\nEnvironmentFile=${f}\n`)).toBe("unknown");
+  });
+  test("UnsetEnvironment= or PassEnvironment= naming PARACHUTE_HOME makes it unknown", () => {
+    expect(unitHome(`Environment=PARACHUTE_HOME=/srv/this\nUnsetEnvironment=PARACHUTE_HOME\n`)).toBe("unknown");
+    expect(unitHome(`PassEnvironment=PARACHUTE_HOME\n`)).toBe("unknown");
+  });
+  test("specifiers: %% is a percent, %h the user's home, any other one unknown", () => {
+    expect(unitHome(`Environment=PARACHUTE_HOME=/srv/%%h\n`)).toBe("/srv/%h");
+    expect(unitHome(`Environment=PARACHUTE_HOME=%h/p\n`)).toMatch(/\/p$/);
+    expect(unitHome(`Environment=PARACHUTE_HOME=/srv/%u\n`)).toBe("unknown");
+  });
+  test("with no PARACHUTE_HOME in the unit, the user manager's environment decides; one systemd won't report is unknown", () => {
+    expect(unitHome(`[Service]\n`, () => "/srv/managed")).toBe("/srv/managed");
+    expect(unitHome(`[Service]\n`, () => null)).toBe("unknown");
+    expect(unitHome(`Environment=PARACHUTE_HOME=/srv/unit\n`, () => "/srv/managed")).toBe("/srv/unit");
   });
   test("a missing optional file is skipped; a missing required one, or broken quoting, is unknown", () => {
     expect(unitHome(`Environment=PARACHUTE_HOME=/env\nEnvironmentFile=-${join(dir, "none.env")}\n`)).toBe("/env");
