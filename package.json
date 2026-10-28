@@ -1,7 +1,7 @@
 {
   "name": "@openparachute/core",
-  "version": "0.8.0-dev.0",
-  "description": "Parachute: one program for the vault and the hub. Command: parachute-core.",
+  "version": "0.8.0-pre.1",
+  "description": "Parachute: one program for the vault and the hub. Command: parachute (parachute-core is an alias).",
   "private": true,
   "type": "module",
   "license": "AGPL-3.0-or-later",
@@ -11,6 +11,7 @@
   },
   "workspaces": ["packages/cli", "packages/vault", "packages/hub", "packages/hub/packages/depcheck", "packages/hub/packages/door-contract"],
   "bin": {
+    "parachute": "packages/cli/bin/parachute",
     "parachute-core": "packages/cli/bin/parachute-core"
   },
   "trustedDependencies": ["onnxruntime-node", "protobufjs"],

@@ -1,0 +1,159 @@
+# Release: publish @openparachute/core to npm when a version bump reaches main (RELEASING.md).
+#
+#   plan            scripts/release-plan.ts: is this version new on npm, and which dist-tag. X.Y.Z-pre.N → `next`,
+#                   X.Y.Z → `latest`; anything else (0.8.0-dev.0) never publishes. A package npm has never seen is
+#                   skipped: the first publish is by hand, once (npm trusted publishing can't create a package).
+#   build           the linux-x64 bundle, the npm package packed from it (release/npm.ts), and the same test as the
+#                   contracts job `npm`: installed with npm and with bun, Benjamin's suite on the npm install. The
+#                   .tgz it tested is what the publish jobs publish, byte for byte.
+#   publish-next    a prerelease, on its own after build.
+#   publish-latest  a stable, only after the environment `npm-latest` is approved. Its required reviewer is the
+#                   `unforcedagi` account, and Uni approves only after Aaron taps the approval card (RELEASING.md).
+#   tag-record      tags v<version> on the commit that shipped (a record; nothing triggers on it).
+#
+# No token: npm trusted publishing (OIDC). npm checks this workflow's identity (ParachuteComputer/parachute-core,
+# release.yml) against the package's trusted publisher, which Aaron sets up once on npmjs.com. Publishing from a
+# public repository through OIDC adds provenance; --provenance says so explicitly.
+name: release
+
+on:
+  push:
+    branches: [main]
+    # Only a merge that can change the version runs this; every other merge was tested by contracts.yml already.
+    paths:
+      - package.json
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  BUN_VERSION: "1.4"
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      should_publish: ${{ steps.plan.outputs.should_publish }}
+      version: ${{ steps.plan.outputs.version }}
+      dist_tag: ${{ steps.plan.outputs.dist_tag }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # A stable is compared with its prerelease's tag (v<X.Y.Z-pre.N>..HEAD): history and tags are needed.
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - name: the plan's own tests
+        run: bun test ./scripts
+      - id: plan
+        run: bun scripts/release-plan.ts
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: allow the sandbox (unprivileged user namespaces; nftables and lsof)
+        working-directory: .
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo apt-get update -qq && sudo apt-get install -y -qq nftables lsof iproute2 >/dev/null
+      - run: bun install --frozen-lockfile
+      - name: build the bundle
+        id: build
+        run: bun run build:core --out "$RUNNER_TEMP/build/candidate" --pack "$RUNNER_TEMP/dist"
+      - name: pack @openparachute/core from it
+        id: npm
+        run: bun ../release/npm.ts --from "${{ steps.build.outputs.dir }}" --out "$RUNNER_TEMP/npm"
+      - name: the package is the version the plan decided on
+        run: |
+          got=$(tar -xzOf "${{ steps.npm.outputs.tarball }}" package/package.json | bun -e 'console.log(JSON.parse(await Bun.stdin.text()).version)')
+          test "$got" = "${{ needs.plan.outputs.version }}" || { echo "::error::packed $got, plan said ${{ needs.plan.outputs.version }}"; exit 1; }
+      - name: install it with npm and with bun, then Benjamin's suite on it
+        env:
+          CANDIDATE_DIR: ${{ steps.build.outputs.dir }}
+          NPM_SCRATCH: ${{ runner.temp }}
+        run: bun run npm-package -- --tgz "${{ steps.npm.outputs.tarball }}"
+      - name: the tested package, and its sha256
+        working-directory: ${{ runner.temp }}/npm
+        run: |
+          mv "${{ steps.npm.outputs.tarball }}" package.tgz
+          sha256sum package.tgz | tee package.tgz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-package
+          path: |
+            ${{ runner.temp }}/npm/package.tgz
+            ${{ runner.temp }}/npm/package.tgz.sha256
+          retention-days: 30
+
+  publish-next:
+    needs: [plan, build]
+    if: needs.plan.outputs.dist_tag == 'next'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # npm trusted publishing (OIDC) and provenance
+    steps: &publish
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-package
+      - name: the bytes the build job tested
+        run: sha256sum -c package.tgz.sha256
+      - uses: actions/setup-node@v6
+        with:
+          # Trusted publishing needs npm 11.5.1+ and Node 22.14+ (docs.npmjs.com/trusted-publishers). Node 24 ships
+          # npm 11; older npm would fall back to a token and fail, since there is none.
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+      - name: npm is new enough for trusted publishing
+        run: |
+          npm --version
+          node -e 'const [a,b,c]=process.argv[1].split(".").map(Number); process.exit(a>11||(a===11&&(b>5||(b===5&&c>=1)))?0:1)' "$(npm --version)"
+      - name: publish
+        run: npm publish package.tgz --tag "${{ needs.plan.outputs.dist_tag }}" --access public --provenance
+
+  publish-latest:
+    needs: [plan, build]
+    if: needs.plan.outputs.dist_tag == 'latest'
+    runs-on: ubuntu-latest
+    # Waits here until the npm-latest environment's reviewer approves (RELEASING.md).
+    environment: npm-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps: *publish
+
+  tag-record:
+    needs: [plan, publish-next, publish-latest]
+    if: always() && (needs.publish-next.result == 'success' || needs.publish-latest.result == 'success')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: tag v<version> (kept if it exists, e.g. made by the GitHub pre-release)
+        run: |
+          t="v${{ needs.plan.outputs.version }}"
+          if git rev-parse -q --verify "refs/tags/$t" >/dev/null; then echo "$t already exists"; exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "$t" && git push origin "$t"

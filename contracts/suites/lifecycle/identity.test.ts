@@ -1,26 +1,28 @@
-// v0.8's identity: a new package and command, so nobody's update of the old ones becomes v0.8, and installing v0.8
-// never touches the old global install. Aaron's 10-27 requirement (PLAN §8.1 "Install", identity section being
-// added; lane D builds the tarball and its install step).
+// v0.8's identity: a new package, so nobody's update of the old ones becomes v0.8, and installing v0.8 never touches
+// the old global install. Aaron's 10-27 requirement (PLAN §2.5, §8.1 "Install"; lane D built the tarball and its
+// install step). Its command is `parachute` (Aaron, 10-27: "`parachute` is the go-to name for this new parachute
+// system"; lane R), with `parachute-core` kept as an alias.
 //
-// v0.8 ships as npm package @openparachute/core with the global command `parachute-core`. @openparachute/hub
-// (`parachute`) and @openparachute/vault (`parachute-vault`) never get a 0.8. The tarball has bin/parachute-core,
-// plus bin/parachute and bin/parachute-vault aliases inside the unpacked folder only (for Prism and Benjamin's
-// suite), which our installer never links onto a shared PATH. `parachute-core version --json` →
-// {name: "@openparachute/core", version, schema, bun}. `bin/parachute-core install --prefix <dir>` puts the
-// unpacked tree in <dir>/<version>/ and links <dir>/bin/parachute-core. Neither that, nor unpacking and running
-// `bin/parachute-core serve`, changes ~/.bun/install/global, ~/.bun/bin/parachute{,-vault} or the npm global
-// prefix, and `parachute` on PATH still resolves to the old hub afterwards.
+// v0.8 ships as npm package @openparachute/core with the commands `parachute` and `parachute-core`.
+// @openparachute/hub (`parachute`) and @openparachute/vault (`parachute-vault`) never get a 0.8. The tarball has
+// bin/parachute, bin/parachute-core and bin/parachute-vault; `parachute-vault` stays inside the unpacked folder (for
+// Prism and Benjamin's suite) and our installer never links it onto a shared PATH. `parachute version --json` →
+// {name: "@openparachute/core", version, schema, bun}. `bin/parachute install --prefix <dir>` puts the unpacked
+// tree in <dir>/<version>/ and links <dir>/bin/parachute and <dir>/bin/parachute-core. Neither that, nor unpacking
+// and running `bin/parachute serve`, changes ~/.bun/install/global, ~/.bun/bin/parachute{,-vault} or the npm global
+// prefix. Where the old hub's `parachute` comes first on PATH, it still resolves to the old hub afterwards, and the
+// install says so and names `parachute-core`; with the install's bin first, `parachute` is v0.8.
 //
 // The machine (_takeover-lib.ts) has the stock 0.7 hub and vault laid out as `bun add -g` does, with BUN_INSTALL
 // and NPM_CONFIG_PREFIX pointing into the throwaway HOME. The first run is on a fresh, empty Parachute home: with
 // no existing home there is nothing to take over, so serve runs (takeover.test.ts covers an existing home).
 //
 // Lane A1 (the name and bins) made the first three green on the core build; lane D's install step (packages/cli
-// src/install.ts) the fourth. Before lane D, `parachute-core install` was the hub's module installer ("no package
-// specified to add"). On the stock build all four fail (no root package.json, programs from lib/hub =
-// @openparachute/hub, no bin/parachute-core). The setup test proves the old global install is real.
+// src/install.ts) the fourth; lane R moved the command to `parachute`. On the stock build all four fail (no root
+// package.json, programs from lib/hub = @openparachute/hub, no bin/parachute-core). The setup test proves the old
+// global install is real.
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
 import { candidate, freePort, safeFetch, until } from "../candidate-lib.ts";
@@ -91,30 +93,31 @@ describe("identity: setup", () => {
 });
 
 describe("identity", () => {
-  test("the package is @openparachute/core and links only parachute-core, never @openparachute/hub or @openparachute/vault", () => {
+  test("the package is @openparachute/core and links parachute and parachute-core, never parachute-vault", () => {
     const pkg = candidatePackage();
     must(pkg.name !== "@openparachute/hub" && pkg.name !== "@openparachute/vault", `package name is ${pkg.name}`);
     must(pkg.name === "@openparachute/core", `package name is ${pkg.name}, not @openparachute/core`);
-    // What `npm i -g` / `bun add -g` would link onto PATH: only parachute-core, never the old commands.
-    expect(Object.keys(pkg.bin)).toEqual(["parachute-core"]);
+    // What `npm i -g` / `bun add -g` would link onto PATH: the command and its alias, never the old vault's name.
+    expect(Object.keys(pkg.bin).sort()).toEqual(["parachute", "parachute-core"]);
   });
 
-  test("the candidate has bin/parachute-core, with bin/parachute and bin/parachute-vault as aliases in its folder", async () => {
+  test("the candidate has bin/parachute, with bin/parachute-core and bin/parachute-vault in its folder", async () => {
     const c = candidate();
     requireCore(c);
-    // The aliases (for Prism and Benjamin's suite) run core, not the old programs.
+    // Every name runs core, not the old programs.
     const m = await machine("id-alias", false);
-    for (const alias of ["parachute", "parachute-vault"]) {
+    for (const alias of ["parachute", "parachute-core", "parachute-vault"]) {
       const r = await m.run([join(c.dir, "bin", alias), "version", "--json"]);
       expect({ alias, name: json(r, `bin/${alias} version --json`).name }).toEqual({ alias, name: "@openparachute/core" });
     }
   }, 120_000);
 
-  test("`parachute-core version --json` says @openparachute/core, its version, schema and Bun", async () => {
+  test("`parachute version --json` says @openparachute/core, its version, schema and Bun", async () => {
     const m = await machine("id-version", false);
-    const r = await m.run([requireCore(m.info), "version", "--json"]);
+    requireCore(m.info);
+    const r = await m.run([join(m.info.dir, "bin", "parachute"), "version", "--json"]);
     expect(r.code).toBe(0);
-    const v = json(r, "parachute-core version --json");
+    const v = json(r, "parachute version --json");
     expect(v.name).toBe("@openparachute/core");
     expect(v.version).toMatch(/^\d+\.\d+\.\d+/);
     expect(v.schema).toBeDefined();
@@ -161,45 +164,93 @@ describe("identity", () => {
       const now = { bun: await oldInstallHash(m), npm: await treeHash(m.npmPrefix) };
       expect({ step, ...now }).toEqual({ step, ...before });
     };
-    const bin = requireCore(m.info);
+    requireCore(m.info);
+    const bin = join(m.info.dir, "bin", "parachute");
 
-    // 1. Unpacked and run in place: `bin/parachute-core serve` on a fresh home.
+    // 1. Unpacked and run in place: `bin/parachute serve` on a fresh home.
     await firstRun(m, bin, join(m.user, ".parachute"));
     await unchanged("unpack and serve");
 
     // 2. The install step, then the installed command's first run on another fresh home.
     const prefix = join(m.user, ".local/share/parachute");
     const inst = await m.run([bin, "install", "--prefix", prefix]);
-    must(inst.code === 0, `parachute-core install --prefix exited ${inst.code}: ${inst.stderr.slice(-600)}`);
+    must(inst.code === 0, `parachute install --prefix exited ${inst.code}: ${inst.stderr.slice(-600)}`);
     await unchanged("install");
-    const version = json(await m.run([bin, "version", "--json"]), "parachute-core version --json").version;
-    expect(existsSync(join(prefix, version, "bin", "parachute-core"))).toBe(true);
-    expect(lstatSync(join(prefix, "bin", "parachute-core")).isSymbolicLink()).toBe(true);
-    // The aliases stay inside the unpacked folder: the shared bin has only parachute-core.
-    expect(readdirSync(join(prefix, "bin"))).toEqual(["parachute-core"]);
-    await firstRun(m, join(prefix, "bin", "parachute-core"), join(m.user, ".parachute-installed"));
+    // The old hub's `parachute` comes first on this machine's PATH: the install says so and names the alias.
+    must(
+      inst.stdout.includes(`\`parachute\` on your PATH is an older Parachute (0.7's hub, @openparachute/hub): ${join(m.user, ".bun/bin/parachute")}`) &&
+        inst.stdout.includes("run this version as `parachute-core`"),
+      `the install did not name the older parachute first on PATH:\n${inst.stdout}`,
+    );
+    const version = json(await m.run([bin, "version", "--json"]), "parachute version --json").version;
+    expect(existsSync(join(prefix, version, "bin", "parachute"))).toBe(true);
+    // The command and its alias are linked; parachute-vault stays inside the unpacked folder.
+    expect(readdirSync(join(prefix, "bin")).sort()).toEqual(["parachute", "parachute-core"]);
+    for (const name of ["parachute", "parachute-core"]) expect(lstatSync(join(prefix, "bin", name)).isSymbolicLink()).toBe(true);
+    await firstRun(m, join(prefix, "bin", "parachute"), join(m.user, ".parachute-installed"));
     await unchanged("installed first run");
 
     // Again, from the bundle (a second complete copy; <version> switches to it and the first is kept, since a running
     // serve may use it), then from the installed copy itself (nothing copied). The installed command keeps working.
-    for (const [from, copies] of [[bin, 2], [join(prefix, "bin", "parachute-core"), 2]] as const) {
+    for (const [from, copies] of [[bin, 2], [join(prefix, "bin", "parachute"), 2]] as const) {
       const again = await m.run([from, "install", "--prefix", prefix]);
-      must(again.code === 0, `parachute-core install again (from ${from}) exited ${again.code}: ${again.stderr.slice(-600)}`);
-      expect(json(await m.run([join(prefix, "bin", "parachute-core"), "version", "--json"]), "installed version --json").version).toBe(version);
+      must(again.code === 0, `parachute install again (from ${from}) exited ${again.code}: ${again.stderr.slice(-600)}`);
+      expect(json(await m.run([join(prefix, "bin", "parachute"), "version", "--json"]), "installed version --json").version).toBe(version);
       expect({ from, copies: readdirSync(join(prefix, ".store")).filter((n) => !n.startsWith(".")).length }).toEqual({ from, copies });
     }
     await unchanged("installed again");
 
-    // 3. With the install on PATH, `parachute` is still the old hub and `parachute-core` is core.
-    const path = `${join(prefix, "bin")}:${m.env().PATH}`;
-    const r = await m.run(["sh", "-c", "command -v parachute; parachute --version; command -v parachute-core; parachute-core version --json"], { env: { PATH: path } });
-    const [hub, hubV, coreAt, coreJson] = r.stdout.trim().split("\n");
+    // 3. With the install on PATH after the old one, `parachute` is still the old hub and `parachute-core` is core.
+    //    With it first, `parachute` is core, and the old hub is still there by its own path.
+    const ask = "command -v parachute; parachute --version; command -v parachute-core; parachute-core version --json; parachute version --json";
+    const after = await m.run(["sh", "-c", ask], { env: { PATH: `${m.env().PATH}:${join(prefix, "bin")}` } });
+    const [hub, hubV, coreAt, coreJson] = after.stdout.trim().split("\n");
     expect(hub).toBe(join(m.user, ".bun/bin/parachute"));
     expect(hubV).toBe(stock.hubVersion);
     expect(coreAt).toBe(join(prefix, "bin", "parachute-core"));
     expect(JSON.parse(coreJson!).name).toBe("@openparachute/core");
+    const first = await m.run(["sh", "-c", ask], { env: { PATH: `${join(prefix, "bin")}:${m.env().PATH}` } });
+    const [ours, , , , oursJson] = first.stdout.trim().split("\n");
+    expect(ours).toBe(join(prefix, "bin", "parachute"));
+    expect(JSON.parse(oursJson!).name).toBe("@openparachute/core");
+    expect((await m.run([join(m.user, ".bun/bin/parachute"), "--version"])).stdout.trim()).toBe(stock.hubVersion);
     await unchanged("after");
   }, 180_000);
+
+  test("install never replaces another program's `parachute`: a prefix holding the old one, a link shaped like ours, a bin or store linked elsewhere, is refused", async () => {
+    const m = await machine("id-foreign");
+    const before = { bun: await oldInstallHash(m), npm: await treeHash(m.npmPrefix), listing: readdirSync(join(m.user, ".bun")).sort() };
+    const bin = join(requireCore(m.info), "..", "parachute");
+    // --prefix ~/.bun: its bin/ is the old global bin, with the old hub's `parachute` in it.
+    const into = await m.run([bin, "install", "--prefix", join(m.user, ".bun")]);
+    expect({ code: into.code, says: /not this installer's/.test(into.stderr) }).toEqual({ code: 2, says: true });
+    // A prefix whose bin/ is a link to the old global bin.
+    const prefix = join(m.user, "linked-prefix");
+    mkdirSync(prefix);
+    symlinkSync(join(m.user, ".bun", "bin"), join(prefix, "bin"));
+    const linked = await m.run([bin, "install", "--prefix", prefix]);
+    expect({ code: linked.code, says: /link to another folder/.test(linked.stderr), left: readdirSync(prefix) }).toEqual({ code: 2, says: true, left: ["bin"] });
+    // Another program's link of the shape this installer makes (../<version>/bin/parachute), into its own folder.
+    const shaped = join(m.user, "shaped-prefix");
+    mkdirSync(join(shaped, "0.7.0", "bin"), { recursive: true });
+    writeFileSync(join(shaped, "0.7.0", "bin", "parachute"), "#!/bin/sh\necho another program\n", { mode: 0o755 });
+    mkdirSync(join(shaped, "bin"));
+    symlinkSync("../0.7.0/bin/parachute", join(shaped, "bin", "parachute"));
+    const look = await m.run([bin, "install", "--prefix", shaped]);
+    expect({ code: look.code, says: /not this installer's/.test(look.stderr), link: readlinkSync(join(shaped, "bin", "parachute")), left: readdirSync(shaped).sort() }).toEqual({ code: 2, says: true, link: "../0.7.0/bin/parachute", left: ["0.7.0", "bin"] });
+    // A prefix whose .store is a link to a folder elsewhere (holding something shaped like a half-done copy).
+    const elsewhere = join(m.user, "elsewhere");
+    mkdirSync(join(elsewhere, "0.1.0-deadbeef.tmp"), { recursive: true });
+    writeFileSync(join(elsewhere, "keep.txt"), "made-up file\n");
+    const stored = join(m.user, "stored-prefix");
+    mkdirSync(stored);
+    symlinkSync(elsewhere, join(stored, ".store"));
+    const st = await m.run([bin, "install", "--prefix", stored]);
+    expect({ code: st.code, says: /link to another folder/.test(st.stderr), elsewhere: readdirSync(elsewhere).sort() }).toEqual({ code: 2, says: true, elsewhere: ["0.1.0-deadbeef.tmp", "keep.txt"] });
+    expect({ bun: await oldInstallHash(m), npm: await treeHash(m.npmPrefix), listing: readdirSync(join(m.user, ".bun")).sort() }).toEqual(before);
+    const r = await m.run([join(m.user, ".bun/bin/parachute"), "--version"]);
+    expect(r.stdout.trim()).toBe((await oldStock()).hubVersion);
+  }, 120_000);
 
   test("install: one at a time per prefix (a held lock refuses a second install; two at once leave one complete copy)", async () => {
     const m = await machine("id-lock", false);
@@ -220,6 +271,6 @@ describe("identity", () => {
     const store = readdirSync(join(prefix, ".store")).filter((n) => !n.startsWith("."));
     expect(store.filter((n) => n.endsWith(".tmp"))).toEqual([]);
     expect(store.length).toBe(both.filter((r) => r.code === 0).length);
-    expect(json(await m.run([join(prefix, "bin", "parachute-core"), "version", "--json"]), "installed version --json").name).toBe("@openparachute/core");
+    expect(json(await m.run([join(prefix, "bin", "parachute"), "version", "--json"]), "installed version --json").name).toBe("@openparachute/core");
   }, 180_000);
 });

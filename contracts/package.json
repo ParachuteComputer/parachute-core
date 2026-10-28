@@ -10,6 +10,7 @@
     "build:core": "bun run harness/build-core-candidate.ts",
     "candidate": "bun run harness/run-candidate.ts",
     "prism-compat": "bun run harness/prism-compat.ts",
+    "npm-package": "bun run harness/npm-package.ts",
     "mutants": "bun run harness/mutate.ts",
     "mutants:candidate": "bun run harness/mutate-candidate.ts",
     "selftest": "bun test --timeout 120000 ./harness/selftest",

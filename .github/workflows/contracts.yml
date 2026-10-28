@@ -8,6 +8,8 @@
 #              there too, as "the old programs".
 #              The child-path build (--process-model child) runs compat/* until the Nov 3 decision deletes one path.
 #   prism      Benjamin's compatibility suite, unchanged, against the same build (the Nov 9 gate, PLAN §3.1)
+#   npm        the npm package (release/npm.ts) packed from the same build, installed with `npm i -g` and
+#              `bun add -g`, and his suite on the npm install; keeps the linux-x64 tarball and the .tgz as artifacts
 # The signed macOS bundle has its own workflow (bundle-macos.yml).
 #   mutants    the contracts must catch each mutant, on the pinned vault and on rebuilt core candidates; each
 #              flip must turn its red contracts green
@@ -47,6 +49,8 @@ jobs:
           bun run --cwd packages/hub typecheck
       - name: the cli's own tests
         run: bun test ./packages/cli
+      - name: the release plan's own tests (what a merge may publish to npm, scripts/release-plan.ts)
+        run: bun test ./scripts
       - name: the vault's own tests
         working-directory: packages/vault
         run: |
@@ -168,6 +172,48 @@ jobs:
           CANDIDATE_SHA256: ${{ steps.build.outputs.sha256 }}
           OLD_STOCK_SHA256: ${{ steps.stock.outputs.sha256 }}
         run: bun run prism-compat
+
+  npm:
+    name: the npm package, installed with npm and with bun, and Benjamin's suite on it
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: actions/setup-node@v6
+        with:
+          # npm 11.5+ (Node 24), the npm the release job publishes with (release.yml)
+          node-version: '24'
+      - *sandbox
+      - *repos
+      - run: bun install --frozen-lockfile
+      - *build
+      - name: pack @openparachute/core from that bundle (release/npm.ts)
+        id: npm
+        run: bun ../release/npm.ts --from "${{ steps.build.outputs.dir }}" --out "$RUNNER_TEMP/npm"
+      - name: install it with npm and with bun (an old hub and vault planted beside it), then his suite on it
+        env:
+          CANDIDATE_DIR: ${{ steps.build.outputs.dir }}
+          NPM_SCRATCH: ${{ runner.temp }}
+        run: bun run npm-package -- --tgz "${{ steps.npm.outputs.tarball }}"
+      - name: the npm package's sha256 (npm-SHA256SUMS, for the release and the first publish by hand)
+        working-directory: ${{ runner.temp }}/npm
+        run: sha256sum "$(basename "${{ steps.npm.outputs.tarball }}")" | tee npm-SHA256SUMS
+      - name: keep the linux-x64 tarball, its SHA256SUMS and the npm package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.build.outputs.name }}
+          path: |
+            ${{ steps.build.outputs.tarball }}
+            ${{ runner.temp }}/dist/SHA256SUMS
+            ${{ steps.npm.outputs.tarball }}
+            ${{ runner.temp }}/npm/npm-SHA256SUMS
+          retention-days: 14
 
   mutants:
     name: mutants on the pinned vault (the contracts must catch each)

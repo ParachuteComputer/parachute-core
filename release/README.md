@@ -5,12 +5,13 @@ candidate every contract suite runs, so what is tested is what ships.
 
 ```
 parachute-core-<version>-<platform>/
-  bin/parachute-core               the one command (a link into lib/packages/cli/bin)
-  bin/parachute, bin/parachute-vault   the same program under its old names, for Prism and Benjamin's suite only
+  bin/parachute                    the command (a link into lib/packages/cli/bin): the hub's 0.7 commands, and v0.8's
+  bin/parachute-core               the same program under its other name (kept for now)
+  bin/parachute-vault              the vault's commands under their 0.7 name, for Prism and Benjamin's suite
   runtime/bun                      the pinned Bun (bun.json), sha256-checked
   lib/                             the workspace: sources, bun.lock, a production node_modules, built admin pages
   entitlements/bun.plist           allow-jit, for runtime/bun under the hardened runtime
-  package.json                     @openparachute/core, bin parachute-core
+  package.json                     @openparachute/core, bins parachute and parachute-core
   LICENSE  THIRD-PARTY-NOTICES.txt  SOURCE.md  VERSION
   CANDIDATE.json                   what was built, and the sha256 of every other file
 ```
@@ -45,10 +46,12 @@ An external embedding API (`EMBEDDING_API_URL`) works.
 
 ## Install for a person
 
-`parachute-core install [--prefix <dir>]` copies the unpacked bundle to `<dir>/<version>/` and links
-`<dir>/bin/parachute-core` (default `~/.local/share/parachute-core`). It touches nothing else: not the old
-`~/.bun` global install, not npm's prefix, and `parachute` / `parachute-vault` are never linked anywhere
-(`lifecycle/identity`).
+`parachute install [--prefix <dir>]` copies the unpacked bundle to `<dir>/<version>/` and links
+`<dir>/bin/parachute` and `<dir>/bin/parachute-core` (default `~/.local/share/parachute-core`). It touches nothing
+else: not the old `~/.bun` global install, not npm's prefix, not PATH or a shell's startup files, and
+`parachute-vault` is never linked anywhere. When an older `parachute` (0.7's hub) comes first on PATH, it leaves it
+there and says to use `parachute-core` until the takeover (`lifecycle/identity`). `parachute install <module>` is
+still the hub's 0.7 module installer.
 
 ## Signing (macOS)
 
@@ -57,15 +60,8 @@ to its runtimes. The CI job `bundle-macos` does the same ad hoc, so the tree tha
 run inside Prism: `runtime/bun` gets `com.apple.security.cs.allow-jit` (Bun's JIT); everything else, the argon2
 addon included, gets none. Ask of Prism: treat `parachute/runtime/bun` like its Node runtime.
 
-## Publishing (not done from here)
+## Publishing
 
-Nothing in this repo publishes. CI keeps the signed darwin-arm64 tarball and its `SHA256SUMS` as a workflow artifact
-(`bundle-macos`, 14 days). Attaching them to the Nov 9 pre-release is a separate step that needs Aaron's go. The
-step, for the record (not run):
-
-```bash
-gh run download <bundle-macos run id> -n parachute-core-<version>-darwin-arm64 -D dist/
-(cd dist && shasum -a 256 -c SHA256SUMS)
-gh release create v0.8.0-pre.1 --prerelease --title "Parachute v0.8.0-pre.1" --notes-file <notes> \
-  dist/parachute-core-<version>-darwin-arm64.tar.gz dist/SHA256SUMS
-```
+[`RELEASING.md`](../RELEASING.md): npm through trusted publishing (`release.yml`), and the GitHub release with the
+CI-built tarballs. `npm.ts` makes the npm package from a built bundle: the same sources without `runtime/bun` or
+`node_modules`, run on the Bun on PATH.
