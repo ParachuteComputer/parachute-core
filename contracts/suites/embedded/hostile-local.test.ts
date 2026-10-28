@@ -4,12 +4,12 @@
 // X-Forwarded-For/X-Real-IP: 127.0.0.1. Each probe gets a 4xx, and afterwards nothing it asked for happened (the
 // operator's token still works, no account was added, the vault still serves). The routes are in _hostile.ts.
 // Box mode is green today (run in a network of its own, so stop/restart probes can't touch the suite's own box,
-// hostile.run.ts). Embedded mode is red today (no --embedded); lane C turns it green.
+// hostile.run.ts). Embedded mode: green since lane C (packages/cli/src/embedded.ts), set up with servedHome() until
+// lane E's bootstrap.
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { newHome, safeFetch } from "../candidate-lib.ts";
-import { red } from "../lib.ts";
-import { NO_EMBEDDED, claims, embeddedHome, inOwnNetwork, mint, must } from "./_lib.ts";
+import { claims, servedHome, inOwnNetwork, mintJwt, must } from "./_lib.ts";
 import { effects, forged, notRefused } from "./_hostile.ts";
 
 let box: any;
@@ -32,18 +32,16 @@ describe("embedded/hostile-local", () => {
     expect((await boxRun()).effects).toEqual([]);
   });
 
-  red(
-    "embedded: no token, vault tokens and a forged operator token are refused on every admin, module and token route, and change nothing",
-    { reason: NO_EMBEDDED, lane: "C" },
-    async () => {
-      const e = await embeddedHome(newHome("hostile"));
+  test(
+    "embedded: no token, vault tokens and a forged operator token are refused on every admin, module and token route, and change nothing", async () => {
+      const e = await servedHome(newHome("hostile"));
       try {
         const operator = readFileSync(e.boot.operator_token_file, "utf8").trim();
         const jti = claims(operator)?.jti;
         const v = e.vaultName;
-        const read = (await mint(e.home, `vault:${v}:read`)).token;
-        const write = (await mint(e.home, `vault:${v}:write`)).token;
-        const vaultAdmin = (await mint(e.home, `vault:${v}:read vault:${v}:write vault:${v}:admin`)).token;
+        const read = (await mintJwt(e.home, `vault:${v}:read`)).token;
+        const write = (await mintJwt(e.home, `vault:${v}:write`)).token;
+        const vaultAdmin = (await mintJwt(e.home, `vault:${v}:read vault:${v}:write vault:${v}:admin`)).token;
         const control = await safeFetch(`${e.hub}/api/modules`, { headers: { authorization: `Bearer ${operator}` } });
         must(control.status === 200 || control.status === 409, `setup: the operator's token doesn't open GET /api/modules (${control.status})`);
         for (const [who, token] of [["no token", undefined], ["read", read], ["write", write], ["forged operator", forged(operator)]] as const) {

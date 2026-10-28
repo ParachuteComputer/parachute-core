@@ -6,14 +6,14 @@
 //   - a non-loopback address exits 2; a port in use exits 4;
 //   - run/ready.json reports both ports and the issuer;
 //   - the hub's /health is 200 only once the vault answers (his suite otherwise starts a second vault).
-// Today `serve` takes no arguments (hub src/cli.ts: `unexpected argument`). Lane C turns these green.
+// Stock 0.7 `serve` takes no arguments (hub src/cli.ts: `unexpected argument`). Green since lane C
+// (packages/cli/src/embedded.ts).
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { candidateEnv } from "../../harness/candidate.ts";
-import { candidate, cli, listeners, newHome, safeFetch, start, until } from "../candidate-lib.ts";
-import { red } from "../lib.ts";
-import { NO_EMBEDDED, exitWithin, exited, must, ports, readyJson, serveEmbedded, tail } from "./_lib.ts";
+import { candidate, cli, freePort, listeners, newHome, safeFetch, start, until } from "../candidate-lib.ts";
+import { exitWithin, exited, must, ports, readyJson, serveEmbedded, tail } from "./_lib.ts";
 
 /** Wait until something listens on `addr` (e.g. "127.0.0.1:1939") or the process exits; fail with its log if not. */
 async function listensOn(s: ReturnType<typeof start>, addr: string) {
@@ -33,7 +33,7 @@ describe("embedded/serve", () => {
     expect(r.code).toBe(0);
   });
 
-  red("serve --embedded with neither PARACHUTE_HOME nor --home exits 2 and creates no home", { reason: NO_EMBEDDED, lane: "C" }, async () => {
+  test("serve --embedded with neither PARACHUTE_HOME nor --home exits 2 and creates no home", async () => {
     const c = candidate();
     const home = newHome("serve");
     const env = candidateEnv(c, home);
@@ -46,7 +46,7 @@ describe("embedded/serve", () => {
     must(!(await Bun.file(join(dirname(home), ".parachute", "hub.db")).exists()), "it made a home in $HOME/.parachute anyway");
   });
 
-  red("--home <dir> is the same as PARACHUTE_HOME", { reason: NO_EMBEDDED, lane: "C" }, async () => {
+  test("--home <dir> is the same as PARACHUTE_HOME", async () => {
     const home = newHome("serve");
     const elsewhere = newHome("other"); // PARACHUTE_HOME points here; --home must win
     const [h, v] = await ports(2);
@@ -60,7 +60,19 @@ describe("embedded/serve", () => {
     }
   });
 
-  red("the hub port is --listen, then PORT, then 1939", { reason: NO_EMBEDDED, lane: "C" }, async () => {
+  test("a flag given twice (--home A --home=B) exits 2 and touches neither home", async () => {
+    // One home, decided once: the checks before serve (newer data, modes) and serve itself must agree on it.
+    const a = newHome("serve");
+    const b = newHome("serve");
+    const [h, v] = await ports(2);
+    const s = start(newHome("other"), ["serve", "--embedded", "--home", a, `--home=${b}`, "--listen", `127.0.0.1:${h}`, "--vault-listen", `127.0.0.1:${v}`]);
+    const code = await exitWithin(s, 15_000);
+    await s.stop("SIGKILL", 2000);
+    must(code === 2, `--home given twice: exit ${code}, want 2: ${tail(s.log())}`);
+    must(!existsSync(a) && !existsSync(b), `a home was created: ${[a, b].filter(existsSync).join(", ")}`);
+  });
+
+  test("the hub port is --listen, then PORT, then 1939", async () => {
     const [flag, env, v1, v2, v3] = await ports(5);
     // --listen beats PORT.
     let s = start(newHome("serve"), ["serve", "--embedded", "--listen", `127.0.0.1:${flag}`, "--vault-listen", `127.0.0.1:${v1}`], { env: { PORT: String(env) } });
@@ -86,7 +98,7 @@ describe("embedded/serve", () => {
     }
   });
 
-  red("the vault port is --vault-listen, then `port` in vault/config.yaml, then 1940", { reason: NO_EMBEDDED, lane: "C" }, async () => {
+  test("the vault port is --vault-listen, then `port` in vault/config.yaml, then 1940", async () => {
     const [h1, h2, h3, flag, conf] = await ports(5);
     // --vault-listen beats the config file.
     let home = newHome("serve");
@@ -123,7 +135,7 @@ describe("embedded/serve", () => {
     }
   });
 
-  red("a non-loopback --listen or --vault-listen exits 2 and binds nothing", { reason: /--listen 0\.0\.0\.0: exit 1, want 2: .*unexpected argument "--embedded"/s, lane: "C" }, async () => {
+  test("a non-loopback --listen or --vault-listen exits 2 and binds nothing", async () => {
     const [h, v] = await ports(2);
     // 198.18.0.1 is a real non-loopback address in the sandbox (the trap interface), so a bind would succeed.
     for (const [flag, addr] of [["--listen", "0.0.0.0"], ["--listen", "198.18.0.1"], ["--vault-listen", "0.0.0.0"], ["--vault-listen", "198.18.0.1"]] as const) {
@@ -138,7 +150,7 @@ describe("embedded/serve", () => {
     }
   });
 
-  red("a hub or vault port already in use exits 4", { reason: /hub port in use: exit 1, want 4: .*unexpected argument "--embedded"/s, lane: "C" }, async () => {
+  test("a hub or vault port already in use exits 4", async () => {
     const [h, v] = await ports(2);
     const holder = Bun.listen({ hostname: "127.0.0.1", port: h!, socket: { data() {} } });
     try {
@@ -161,7 +173,121 @@ describe("embedded/serve", () => {
     }
   });
 
-  red("run/ready.json reports both ports, the issuer and the pid", { reason: NO_EMBEDDED, lane: "C" }, async () => {
+  test("only 127.0.0.1: another loopback address (127.0.0.2, ::1) exits 2 and binds nothing", async () => {
+    // The hub reaches its vault on 127.0.0.1; a vault listening elsewhere would answer its own /health while
+    // every request through the hub failed (Codex review 1, finding 3).
+    const [h, v] = await ports(2);
+    for (const [flag, addr] of [["--vault-listen", "127.0.0.2"], ["--vault-listen", "[::1]"], ["--listen", "127.0.0.2"], ["--listen", "[::1]"]] as const) {
+      const args = flag === "--listen"
+        ? ["--listen", `${addr}:${h}`, "--vault-listen", `127.0.0.1:${v}`]
+        : ["--listen", `127.0.0.1:${h}`, "--vault-listen", `${addr}:${v}`];
+      const s = start(newHome("serve"), ["serve", "--embedded", ...args]);
+      const code = await exitWithin(s, 15_000);
+      await s.stop("SIGKILL", 2000);
+      must(code === 2, `${flag} ${addr}: exit ${code}, want 2: ${tail(s.log())}`);
+      must(!listeners().some((l) => l.endsWith(`:${h}`) || l.endsWith(`:${v}`)), `${flag} ${addr}: something still listens`);
+    }
+  });
+
+  test("a PARACHUTE_HUB_ORIGIN that isn't exactly an origin (a trailing slash, a path) exits 2", async () => {
+    // The issuer is PARACHUTE_HUB_ORIGIN exactly (PLAN §3); a value serve would have to rewrite is refused.
+    for (const origin of [`http://127.0.0.1:${await freePort()}/`, "http://host.example.test/parachute"]) {
+      const [h, v] = await ports(2);
+      const s = start(newHome("serve"), ["serve", "--embedded", "--listen", `127.0.0.1:${h}`, "--vault-listen", `127.0.0.1:${v}`], { env: { PARACHUTE_HUB_ORIGIN: origin } });
+      const code = await exitWithin(s, 15_000);
+      await s.stop("SIGKILL", 2000);
+      must(code === 2, `PARACHUTE_HUB_ORIGIN=${origin}: exit ${code}, want 2: ${tail(s.log())}`);
+    }
+  });
+
+  test("an unusable home exits 5 and leaves nothing running (embedded.json is a folder)", async () => {
+    const home = newHome("serve");
+    mkdirSync(join(home, "embedded.json"), { recursive: true, mode: 0o700 });
+    const [h, v] = await ports(2);
+    const s = start(home, ["serve", "--embedded", "--listen", `127.0.0.1:${h}`, "--vault-listen", `127.0.0.1:${v}`]);
+    const code = await exitWithin(s, 30_000);
+    await s.stop("SIGKILL", 2000);
+    must(code === 5, `exit ${code}, want 5: ${tail(s.log())}`);
+    must(!listeners().some((l) => l.endsWith(`:${h}`) || l.endsWith(`:${v}`)), `still listening: ${listeners().join(" ")}`);
+    must(!existsSync(join(home, "run", "serve.lock")), "run/serve.lock left behind");
+  });
+
+  test("two serves started at once on one home: one runs, the other exits 2 with managed_by_host", async () => {
+    const home = newHome("serve");
+    mkdirSync(home, { recursive: true, mode: 0o700 });
+    const [h1, v1, h2, v2] = await ports(4);
+    const a = start(home, ["serve", "--embedded", "--listen", `127.0.0.1:${h1}`, "--vault-listen", `127.0.0.1:${v1}`]);
+    const b = start(home, ["serve", "--embedded", "--listen", `127.0.0.1:${h2}`, "--vault-listen", `127.0.0.1:${v2}`]);
+    try {
+      const both = [a, b];
+      const settled = await until(() => both.some(exited) && both.some((s) => !exited(s)) && readyJson(home) !== undefined, 45_000);
+      must(!both.every(exited), `both exited: ${a.proc.exitCode} / ${b.proc.exitCode}: ${tail(a.log())} | ${tail(b.log())}`);
+      must(settled, `after 45 s: ${both.filter(exited).length} of 2 exited (want exactly one), ready.json ${readyJson(home) ? "present" : "absent"}`);
+      const loser = both.find(exited)!;
+      const winner = both.find((s) => !exited(s))!;
+      must(loser.proc.exitCode === 2 && /managed_by_host/.test(loser.log()), `the second serve: exit ${loser.proc.exitCode}, want 2 with managed_by_host: ${tail(loser.log())}`);
+      must(readyJson(home)?.pid === winner.proc.pid, `ready.json names pid ${readyJson(home)?.pid}, want the running serve ${winner.proc.pid}`);
+      // The running serve still holds the home: its lock survived the other's exit.
+      const second = start(home, ["serve"], { vault: true, env: { PORT: String(await freePort([h1!, v1!, h2!, v2!])) } });
+      const code = await exitWithin(second, 20_000);
+      await second.stop("SIGKILL", 2000);
+      must(code === 2, `after the race, parachute-vault serve: exit ${code}, want 2 (the home must still be held): ${tail(second.log())}`);
+    } finally {
+      await a.stop();
+      await b.stop();
+    }
+  });
+
+  test("a home whose run/ready.json is a folder exits 5, leaves nothing running, and releases the home", async () => {
+    const home = newHome("serve");
+    mkdirSync(join(home, "run", "ready.json"), { recursive: true, mode: 0o700 });
+    for (const round of [1, 2]) {
+      const [h, v] = await ports(2);
+      const s = start(home, ["serve", "--embedded", "--listen", `127.0.0.1:${h}`, "--vault-listen", `127.0.0.1:${v}`]);
+      const code = await exitWithin(s, 30_000);
+      await s.stop("SIGKILL", 2000);
+      must(code === 5, `start ${round}: exit ${code}, want 5: ${tail(s.log())}`);
+      // The second start finds the home free: the first released its hold although a cleanup step failed.
+      must(!/managed_by_host/.test(s.log()), `start ${round} was refused as managed_by_host: the hold wasn't released`);
+      must(!listeners().some((l) => l.endsWith(`:${h}`) || l.endsWith(`:${v}`)), `start ${round}: still listening: ${listeners().join(" ")}`);
+    }
+  });
+
+  test("after a SIGKILLed serve, three serves started at once on its home: one runs, the others exit 2", async () => {
+    const home = newHome("serve");
+    const first = await serveEmbedded(home);
+    first.proc.kill("SIGKILL");
+    await first.proc.exited;
+    must(await until(() => !listeners().some((l) => l.endsWith(`:${first.hubPort}`) || l.endsWith(`:${first.vaultPort}`)), 15_000), "setup: the killed serve's ports never closed");
+    const ps = await ports(6);
+    const all = [0, 1, 2].map((i) => start(home, ["serve", "--embedded", "--listen", `127.0.0.1:${ps[2 * i]}`, "--vault-listen", `127.0.0.1:${ps[2 * i + 1]}`]));
+    try {
+      const settled = await until(() => all.filter(exited).length === 2 && readyJson(home)?.pid !== first.proc.pid && readyJson(home) !== undefined, 45_000);
+      const running = all.filter((s) => !exited(s));
+      must(settled && running.length === 1, `after 45 s: ${running.length} of 3 running (want exactly one): ${all.map((s) => `${s.proc.exitCode}: ${tail(s.log(), 300)}`).join(" | ")}`);
+      for (const s of all.filter(exited)) {
+        must(s.proc.exitCode === 2 && /managed_by_host/.test(s.log()), `a losing serve: exit ${s.proc.exitCode}, want 2 with managed_by_host: ${tail(s.log())}`);
+      }
+      must(readyJson(home)?.pid === running[0]!.proc.pid, `ready.json names pid ${readyJson(home)?.pid}, want the running serve ${running[0]!.proc.pid}`);
+    } finally {
+      for (const s of all) await s.stop();
+    }
+  });
+
+  test("a corrupt embedded.json exits 5 and is left as it was (its earlier issuers are never dropped)", async () => {
+    const home = newHome("serve");
+    mkdirSync(home, { recursive: true, mode: 0o700 });
+    const corrupt = '{"issuer": "http://127.0.0.1:47001", "accepted_issuers": ["http://127.0.0.1:47001"'; // cut short
+    writeFileSync(join(home, "embedded.json"), corrupt, { mode: 0o600 });
+    const [h, v] = await ports(2);
+    const s = start(home, ["serve", "--embedded", "--listen", `127.0.0.1:${h}`, "--vault-listen", `127.0.0.1:${v}`]);
+    const code = await exitWithin(s, 30_000);
+    await s.stop("SIGKILL", 2000);
+    must(code === 5, `exit ${code}, want 5: ${tail(s.log())}`);
+    must(readFileSync(join(home, "embedded.json"), "utf8") === corrupt, "embedded.json was rewritten");
+  });
+
+  test("run/ready.json reports both ports, the issuer and the pid", async () => {
     const e = await serveEmbedded(newHome("serve"));
     try {
       const r = readyJson(e.home);
@@ -178,7 +304,7 @@ describe("embedded/serve", () => {
     }
   });
 
-  red("the hub's /health is 200 only once the vault answers", { reason: NO_EMBEDDED, lane: "C" }, async () => {
+  test("the hub's /health is 200 only once the vault answers", async () => {
     const e = await serveEmbedded(newHome("serve"), { ready: false });
     try {
       let hubUp = false;

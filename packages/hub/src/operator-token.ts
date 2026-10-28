@@ -31,6 +31,7 @@ import { promises as fs, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { decodeJwt } from "jose";
 import { configDir } from "./config.ts";
+import { readEmbeddedState } from "./embedded-home.ts";
 import { EXPOSE_STATE_PATH, readExposeState } from "./expose-state.ts";
 import { validateHostAdminToken } from "./host-admin-token-validation.ts";
 import { readHubPort } from "./hub-control.ts";
@@ -475,12 +476,15 @@ export function buildKnownIssuersForOperatorToken(
     process.env.PARACHUTE_HUB_ORIGIN ??
     process.env.RENDER_EXTERNAL_URL ??
     flyDefaultOrigin(process.env);
-  return buildHubBoundOrigins({
+  const known = buildHubBoundOrigins({
     issuer: seedIssuer,
     loopbackPort,
     ...(exposeHubOrigin !== undefined ? { exposeHubOrigin } : {}),
     ...(platformOrigin !== undefined ? { platformOrigin } : {}),
   });
+  // An embedded home's earlier issuers (v0.8 PLAN §3): an operator token from a start on another port stays usable.
+  const embedded = readEmbeddedState(dir);
+  return embedded ? [...new Set([...known, ...embedded.accepted_issuers])] : known;
 }
 
 /**

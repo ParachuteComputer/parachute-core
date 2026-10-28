@@ -1,6 +1,6 @@
 // Fix 2: `parachute serve` listens on loopback only, unless told otherwise; so does the vault.
 //
-// Today the hub binds `PARACHUTE_BIND_HOST || "0.0.0.0"` (hub src/commands/serve.ts:629-632), so a plain
+// Stock 0.7 binds `PARACHUTE_BIND_HOST || "0.0.0.0"` (hub src/commands/serve.ts:629-632), so a plain
 // `parachute serve` on a laptop answers on every interface. The vault already defaults to 127.0.0.1 unless
 // VAULT_BIND says otherwise (vault src/bind.ts resolveBindHostname). The hub's container files set
 // PARACHUTE_BIND_HOST=0.0.0.0 explicitly (PLAN §2.3), so the escape hatch must keep working. PLAN §2.3, §5 fix 2,
@@ -38,7 +38,7 @@ describe("loopback by default (fix 2)", () => {
     expect(addrs.length).toBeGreaterThan(0);
   });
 
-  red("`parachute serve` with no PARACHUTE_BIND_HOST and no --listen binds 127.0.0.1 only", { reason: /parachute serve listens beyond loopback: (0\.0\.0\.0|\[::\])/, lane: "C" }, async () => {
+  test("`parachute serve` with no PARACHUTE_BIND_HOST and no --listen binds 127.0.0.1 only", async () => {
     const { addrs } = await serve();
     must(addrs.every(loopback), `parachute serve listens beyond loopback: ${addrs.join(" ")}`);
   });
@@ -46,6 +46,16 @@ describe("loopback by default (fix 2)", () => {
   test("PARACHUTE_BIND_HOST=0.0.0.0 still binds every interface (the containers' escape hatch)", async () => {
     const { port, addrs } = await serve({ env: { PARACHUTE_BIND_HOST: "0.0.0.0" } });
     expect(addrs).toContain(`0.0.0.0:${port}`);
+  });
+
+  test("`parachute serve --listen <port>` (no host) keeps PARACHUTE_BIND_HOST=0.0.0.0, as a container sets it", async () => {
+    const home = newHome("hub-bind");
+    const port = await freePort();
+    const p = start(home, ["serve", "--listen", String(port)], { env: { PARACHUTE_BIND_HOST: "0.0.0.0", EMBEDDINGS_ENABLED: "false" } });
+    started.push(p);
+    const on = () => listeners().filter((l) => l.endsWith(`:${port}`));
+    must(await until(() => on().length > 0, 45_000), `parachute serve --listen ${port} never listened: ${p.log().slice(-800)}`);
+    must(on().includes(`0.0.0.0:${port}`), `--listen ${port} with PARACHUTE_BIND_HOST=0.0.0.0 bound ${on().join(" ")}, want 0.0.0.0:${port}`);
   });
 
   test("`parachute-vault serve` with no VAULT_BIND binds 127.0.0.1 only", async () => {

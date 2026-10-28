@@ -1002,25 +1002,57 @@ async function main(argv: string[]): Promise<number> {
         console.log(serveHelp());
         return 0;
       }
-      if (rest.length > 0) {
-        console.error(`parachute serve: unexpected argument "${rest[0]}"`);
-        console.error("usage: parachute serve");
-        return 1;
-      }
-      // `serve` returns once Bun.serve is bound; the listener keeps the
-      // event loop alive until SIGINT/SIGTERM, at which point we stop the
-      // server cleanly and exit. Container supervisor (tini, Render, Docker)
-      // reaps us once the event loop drains.
+      // `serve [--listen <host>:<port>] [--parent-pid <pid>]` (v0.8 PLAN §2.3, §3). `serve --embedded` is
+      // core's own (packages/cli/src/embedded.ts) and never reaches here.
+      const usage = "usage: parachute serve [--listen <host>:<port>] [--parent-pid <pid>]";
       const mod = await loadCommand("serve", () => import("./commands/serve.ts"));
       if (!mod) return 1;
-      const { stop: stopServer } = await mod.serve();
+      let listen: { host?: string; port: number } | undefined;
+      let parentPid: number | undefined;
+      for (let i = 0; i < rest.length; i++) {
+        const arg = rest[i]!;
+        const [flag, inline] = arg.startsWith("--") && arg.includes("=") ? [arg.slice(0, arg.indexOf("=")), arg.slice(arg.indexOf("=") + 1)] : [arg, undefined];
+        const value = inline ?? rest[i + 1];
+        if (flag === "--listen") {
+          listen = mod.parseListen(value);
+          if (!listen) {
+            console.error(`parachute serve: --listen needs <host>:<port>, got ${JSON.stringify(value ?? "")}`);
+            console.error(usage);
+            return 2;
+          }
+        } else if (flag === "--parent-pid") {
+          parentPid = /^\d+$/.test(value ?? "") ? Number(value) : undefined;
+          if (!parentPid) {
+            console.error(`parachute serve: --parent-pid needs a process id, got ${JSON.stringify(value ?? "")}`);
+            console.error(usage);
+            return 2;
+          }
+        } else {
+          console.error(`parachute serve: unexpected argument "${arg}"`);
+          console.error(usage);
+          return 1;
+        }
+        if (inline === undefined) i++;
+      }
+      // `serve` returns once Bun.serve is bound; the listener keeps the
+      // event loop alive until SIGINT/SIGTERM (or, with --parent-pid, its
+      // parent's exit), at which point we stop the server cleanly and exit.
+      // Container supervisor (tini, Render, Docker) reaps us once the event
+      // loop drains.
+      const { stop: stopServer } = await mod.serve(
+        listen ? { port: listen.port, ...(listen.host !== undefined ? { hostname: listen.host } : {}) } : {},
+      );
       await new Promise<void>((resolve) => {
+        let stopping = false;
         const handler = async () => {
+          if (stopping) return;
+          stopping = true;
           await stopServer();
           resolve();
         };
         process.on("SIGINT", handler);
         process.on("SIGTERM", handler);
+        if (parentPid !== undefined) mod.watchParentPid(parentPid, () => void handler());
       });
       return 0;
     }

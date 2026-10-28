@@ -8,6 +8,7 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { CONFIG_DIR } from "./config.ts";
+import { isEmbeddedHome } from "./embedded-home.ts";
 import type { ServeEntry } from "./tailscale/commands.ts";
 
 export const EXPOSE_STATE_PATH = join(CONFIG_DIR, "expose-state.json");
@@ -99,6 +100,9 @@ function validate(raw: unknown, path: string): ExposeState {
 }
 
 export function readExposeState(path: string = EXPOSE_STATE_PATH): ExposeState | undefined {
+  // An embedded home never reads expose-state (v0.8 PLAN §3 "Issuer"): a box install's leftovers can't name the
+  // issuer a host's Parachute signs with.
+  if (isEmbeddedHome(dirname(path))) return undefined;
   if (!existsSync(path)) return undefined;
   let raw: unknown;
   try {

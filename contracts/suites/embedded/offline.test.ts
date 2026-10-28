@@ -10,7 +10,7 @@
 // lane E's bootstrap exist.
 import { describe, expect, test } from "bun:test";
 import { red } from "../lib.ts";
-import { NO_EMBEDDED, inOwnNetwork, must } from "./_lib.ts";
+import { NO_BOOTSTRAP, inOwnNetwork, must } from "./_lib.ts";
 
 describe("embedded/offline", () => {
   test("the trap counts: a connection attempt to a non-loopback address moves the counter", async () => {
@@ -40,7 +40,7 @@ describe("embedded/offline", () => {
     must(r.offlineLogged, "the vault's log doesn't say it skipped the webhook for being offline");
   });
 
-  red("start, bootstrap, a write and a stop send no packet off the machine", { reason: NO_EMBEDDED, lane: "C, E (B's part is in)" }, async () => {
+  red("start, bootstrap, a write and a stop send no packet off the machine", { reason: NO_BOOTSTRAP, lane: "E (B's and C's parts are in)" }, async () => {
     const r = await inOwnNetwork("offline.run.ts", { mode: "embedded" });
     must(r.after === r.before, `${r.after - r.before} packet(s) tried to leave by a non-loopback interface`);
   });

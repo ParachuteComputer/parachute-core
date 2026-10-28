@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { createServer } from "node:net";
 import { dirname, join } from "node:path";
 import { CONFIG_DIR } from "./config.ts";
+import { isEmbeddedHome } from "./embedded-home.ts";
 import { type AliveFn, clearPid, defaultAlive, readPid, runDir } from "./process-state.ts";
 
 /**
@@ -35,6 +36,8 @@ export function hubPortPath(configDir: string = CONFIG_DIR): string {
 }
 
 export function readHubPort(configDir: string = CONFIG_DIR): number | undefined {
+  // An embedded home never reads hub/run/hub.port (v0.8 PLAN §3 "Issuer"); its ports are in run/ready.json.
+  if (isEmbeddedHome(configDir)) return undefined;
   const p = hubPortPath(configDir);
   if (!existsSync(p)) return undefined;
   const raw = readFileSync(p, "utf8").trim();

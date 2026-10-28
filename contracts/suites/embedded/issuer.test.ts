@@ -10,14 +10,14 @@
 // Stock 0.7 takes the issuer from expose-state, then hub.port, then :1939 (hub src/hub-issuer.ts:18-30) and ignores
 // PARACHUTE_HUB_ORIGIN. Lane A1 took fix 1's two lines into the moved hub (PARACHUTE_HUB_ORIGIN names the issuer;
 // serve points its vault child's key fetch at itself), so the CLI and box tests are green on the core build. The
-// embedded tests are lane C's, which also replaces those environment variables with values passed in (PLAN §2.2).
+// embedded tests are green since lane C: serve --embedded passes the issuer, every earlier one and the key source to
+// its vault, and the vault fetches revocations from that key source too (vault src/hub-jwt.ts).
 import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { cli, freePort, newHome } from "../candidate-lib.ts";
-import { red } from "../lib.ts";
-import { NO_EMBEDDED, claims, embeddedHome, embeddedJson, inOwnNetwork, mint, must, readNotes, readyJson, serveEmbedded, tail } from "./_lib.ts";
+import { claims, servedHome, embeddedJson, inOwnNetwork, mintJwt, must, readNotes, readyJson, serveEmbedded, tail } from "./_lib.ts";
 
 /** A first hub account, the way a box makes one from a script (stock `auth set-password` takes --password off a TTY). */
 const firstUser = (home: string, env?: Record<string, string>) =>
@@ -53,20 +53,18 @@ describe("embedded/issuer", () => {
     },
   );
 
-  red(
-    "embedded, PARACHUTE_HUB_ORIGIN set: ready.json, embedded.json and every minted token carry exactly it, and the vault accepts them",
-    { reason: NO_EMBEDDED, lane: "C" },
-    async () => {
+  test(
+    "embedded, PARACHUTE_HUB_ORIGIN set: ready.json, embedded.json and every minted token carry exactly it, and the vault accepts them", async () => {
       const home = newHome("iss");
       const hubPort = await freePort();
       // Any origin the host chooses; not the port it listens on.
       const origin = `http://127.0.0.1:${await freePort([hubPort])}`;
       const env = { PARACHUTE_HUB_ORIGIN: origin };
-      const e = await embeddedHome(home, { hubPort, env });
+      const e = await servedHome(home, { hubPort, env });
       try {
         must(readyJson(home)?.issuer === origin, `ready.json issuer is ${readyJson(home)?.issuer}, want ${origin}`);
         must(operatorIss(home) === origin, `operator.token iss is ${operatorIss(home)}, want ${origin}`);
-        const t = await mint(home, `vault:${e.vaultName}:read`, ["--ephemeral"], env);
+        const t = await mintJwt(home, `vault:${e.vaultName}:read`, ["--ephemeral"], env);
         must(claims(t.token)?.iss === origin, `mint-token iss is ${claims(t.token)?.iss}, want ${origin}`);
         const got = await readNotes(e.vault, e.vaultName, t.token);
         must(got.status === 200, `the vault refused the hub's own token: HTTP ${got.status} ${got.text}`);
@@ -77,17 +75,15 @@ describe("embedded/issuer", () => {
     },
   );
 
-  red(
-    "embedded, no PARACHUTE_HUB_ORIGIN: the issuer is http://127.0.0.1:<hub port> on every start, and tokens from an earlier port still verify",
-    { reason: NO_EMBEDDED, lane: "C" },
-    async () => {
+  test(
+    "embedded, no PARACHUTE_HUB_ORIGIN: the issuer is http://127.0.0.1:<hub port> on every start, and tokens from an earlier port still verify", async () => {
       const home = newHome("iss");
-      const first = await embeddedHome(home);
+      const first = await servedHome(home);
       const firstIss = `http://127.0.0.1:${first.hubPort}`;
       let old: string;
       try {
         must(readyJson(home)?.issuer === firstIss, `ready.json issuer is ${readyJson(home)?.issuer}, want ${firstIss}`);
-        old = (await mint(home, `vault:${first.vaultName}:read`)).token;
+        old = (await mintJwt(home, `vault:${first.vaultName}:read`)).token;
         must(claims(old)?.iss === firstIss, `mint-token iss is ${claims(old)?.iss}, want ${firstIss}`);
       } finally {
         must((await first.stop()) === 0, "the first serve did not stop cleanly");
@@ -97,7 +93,7 @@ describe("embedded/issuer", () => {
       try {
         const nowIss = `http://127.0.0.1:${second.hubPort}`;
         must(readyJson(home)?.issuer === nowIss, `after a restart on another port, ready.json issuer is ${readyJson(home)?.issuer}, want ${nowIss}`);
-        const fresh = await mint(home, `vault:${first.vaultName}:read`);
+        const fresh = await mintJwt(home, `vault:${first.vaultName}:read`);
         must(claims(fresh.token)?.iss === nowIss, `after a restart, mint-token iss is ${claims(fresh.token)?.iss}, want ${nowIss}`);
         const accepted = embeddedJson(home)?.accepted_issuers ?? [];
         must(accepted.includes(firstIss), `embedded.json accepted_issuers ${JSON.stringify(accepted)} lacks the earlier ${firstIss}`);
@@ -111,22 +107,20 @@ describe("embedded/issuer", () => {
     },
   );
 
-  red(
-    "embedded never reads expose-state.json or hub/run/hub.port, and leaves them as they were",
-    { reason: NO_EMBEDDED, lane: "C" },
-    async () => {
+  test(
+    "embedded never reads expose-state.json or hub/run/hub.port, and leaves them as they were", async () => {
       const home = newHome("iss");
       // Made-up leftovers from a box install: a public origin and a stale port.
       mkdirSync(join(home, "hub", "run"), { recursive: true, mode: 0o700 });
       const exposeState = JSON.stringify({ hubOrigin: "https://planted.example.test", canonicalFqdn: "planted.example.test" });
       writeFileSync(join(home, "expose-state.json"), exposeState, { mode: 0o600 });
       writeFileSync(join(home, "hub", "run", "hub.port"), "47001\n", { mode: 0o600 });
-      const e = await embeddedHome(home);
+      const e = await servedHome(home);
       try {
         const want = `http://127.0.0.1:${e.hubPort}`;
         must(readyJson(home)?.issuer === want, `ready.json issuer is ${readyJson(home)?.issuer}, want ${want}`);
         must(operatorIss(home) === want, `operator.token iss is ${operatorIss(home)}, want ${want}`);
-        const t = await mint(home, `vault:${e.vaultName}:read`);
+        const t = await mintJwt(home, `vault:${e.vaultName}:read`);
         must(claims(t.token)?.iss === want, `mint-token iss is ${claims(t.token)?.iss}, want ${want}`);
         must(readFileSync(join(home, "expose-state.json"), "utf8") === exposeState, "expose-state.json changed");
         must(readFileSync(join(home, "hub", "run", "hub.port"), "utf8") === "47001\n", "hub/run/hub.port changed");
@@ -142,6 +136,16 @@ describe("embedded/issuer", () => {
       const r = await inOwnNetwork("box-issuer.run.ts", { hubPortFile: false });
       must(!r.hubPortFile, "hub/run/hub.port was written");
       must(r.iss === r.origin, `mint-token iss is ${r.iss}, want ${r.origin}`);
+      must(r.status === 200, `the vault refused a token its own hub signed: HTTP ${r.status} ${r.body}`);
+    },
+  );
+
+  test(
+    "box: a hub bound to another loopback address (127.0.0.2) gives the vault it starts a key source it can reach",
+    async () => {
+      // The vault fetches the hub's keys from the address the hub listens on, not 127.0.0.1 (Codex review 4).
+      const r = await inOwnNetwork("box-issuer.run.ts", { hubPortFile: false, bindHost: "127.0.0.2" });
+      must(r.iss === r.origin, `setup: mint-token iss is ${r.iss}, want ${r.origin}`);
       must(r.status === 200, `the vault refused a token its own hub signed: HTTP ${r.status} ${r.body}`);
     },
   );

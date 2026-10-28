@@ -45,7 +45,7 @@ import {
   generateInstanceNonce,
   writeHubInstanceFile,
 } from "../hub-instance.ts";
-import { hubFetch } from "../hub-server.ts";
+import { type EmbeddedHubDeps, hubFetch } from "../hub-server.ts";
 import { getHubOrigin } from "../hub-settings.ts";
 import { writeHubFile } from "../hub.ts";
 import { enrichedPath } from "../spawn-path.ts";
@@ -238,6 +238,14 @@ export interface ServeOpts {
   supervisor?: Supervisor;
   /** Skip the services.json boot pass (test-only). */
   skipModuleBoot?: boolean;
+  /** The bind address; `--listen` (v0.8 PLAN §2.3). Default: PARACHUTE_BIND_HOST, then 127.0.0.1. */
+  hostname?: string;
+  /**
+   * `serve --embedded` (v0.8 PLAN §3; packages/cli/src/embedded.ts): the issuer serve decided, the vault's port and
+   * readiness. An embedded hub boots no supervised module (the host's serve starts the vault itself and ignores the
+   * services.json vault row), runs no Buzz poller or self-probe, and logs no setup token: the host bootstraps it.
+   */
+  embedded?: EmbeddedHubDeps & { issuer: string };
 }
 
 export interface ServeResult {
@@ -255,6 +263,58 @@ export interface ServeResult {
 }
 
 const DEFAULT_PORT = 1939;
+
+/**
+ * Parse a `--listen` value: `<host>:<port>`, `[<ipv6>]:<port>`, or a bare `<port>` (no host: the caller keeps its
+ * default bind, e.g. PARACHUTE_BIND_HOST). Returns undefined for anything else.
+ */
+export function parseListen(value: string | undefined): { host?: string; port: number } | undefined {
+  const v = value?.trim();
+  if (!v) return undefined;
+  let host: string | undefined;
+  let portText = v;
+  if (v.startsWith("[")) {
+    const close = v.indexOf("]:");
+    if (close < 0) return undefined;
+    host = v.slice(1, close);
+    portText = v.slice(close + 2);
+  } else if (v.includes(":")) {
+    const at = v.lastIndexOf(":");
+    host = v.slice(0, at);
+    portText = v.slice(at + 1);
+    if (!host || host.includes(":")) return undefined; // ":1939", or an IPv6 address without brackets
+  }
+  if (host !== undefined && (!host || /[\s\[\]/]/.test(host))) return undefined;
+  if (!/^\d{1,5}$/.test(portText)) return undefined;
+  const port = Number(portText);
+  if (port < 1 || port > 65535) return undefined;
+  return host === undefined ? { port } : { host, port };
+}
+
+/** True for an address only this machine can reach: 127.0.0.0/8, ::1, localhost. */
+export function isLoopbackHost(host: string): boolean {
+  return host === "localhost" || host === "::1" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
+}
+
+/** Is `pid` a live process? Signal 0 checks existence; EPERM means it exists but isn't ours, which still counts. */
+export function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/** Stop when `pid` is gone (`--parent-pid`, PLAN §3): poll every 500 ms; call `onGone` once. Returns a cancel. */
+export function watchParentPid(pid: number, onGone: () => void, everyMs = 500): () => void {
+  const timer = setInterval(() => {
+    if (pidAlive(pid)) return;
+    clearInterval(timer);
+    onGone();
+  }, everyMs);
+  return () => clearInterval(timer);
+}
 
 /**
  * Build the startup banner line.
@@ -628,12 +688,25 @@ export async function serve(opts: ServeOpts = {}): Promise<{
 
   const envPort = parsePort(env.PORT);
   const port = opts.port ?? envPort ?? DEFAULT_PORT;
-  // Fix 1 (v0.8 PLAN §2.3): the vault child fetches its signing keys from this hub, not :1939. Lane C passes it in.
-  process.env.PARACHUTE_HUB_JWKS_ORIGIN ??= `http://127.0.0.1:${port}`;
-  // Containers default to 0.0.0.0 so the platform's HTTP forwarder can
-  // reach us; the `--hostname` flag / PARACHUTE_BIND_HOST is the escape
-  // hatch for setups that want loopback-only inside a sidecar.
-  const hostname = env.PARACHUTE_BIND_HOST || "0.0.0.0";
+  // Fix 1 (v0.8 PLAN §2.3): the vault child fetches its signing keys from this hub, not :1939, at an address the
+  // hub listens on: loopback for a wildcard bind, else the very address it binds (127.0.0.2 stays 127.0.0.2).
+  const bindHost = opts.hostname ?? (env.PARACHUTE_BIND_HOST || "127.0.0.1");
+  const keyHost =
+    bindHost === "0.0.0.0" || bindHost === "localhost"
+      ? "127.0.0.1"
+      : bindHost === "::"
+        ? "[::1]"
+        : bindHost.includes(":")
+          ? `[${bindHost}]`
+          : bindHost;
+  process.env.PARACHUTE_HUB_JWKS_ORIGIN ??= `http://${keyHost}:${port}`;
+  // Loopback by default (v0.8 PLAN §2.3, fix 2): a plain `parachute serve` on a laptop answers on 127.0.0.1 only.
+  // `--listen` or PARACHUTE_BIND_HOST say otherwise; the hub's container files set PARACHUTE_BIND_HOST=0.0.0.0
+  // explicitly so the platform's HTTP forwarder can reach them.
+  const hostname = bindHost;
+  const embedded = opts.embedded;
+  // An embedded hub supervises nothing and starts no background work of its own (PLAN §3).
+  const bootModules = !opts.skipModuleBoot && !embedded;
 
   // Ensure the well-known dir exists, and (re)write the static hub.html so `/`
   // serves something coherent on a fresh disk (the dynamic path through
@@ -669,13 +742,16 @@ export async function serve(opts: ServeOpts = {}): Promise<{
   } catch {
     dbHubOrigin = undefined;
   }
-  const issuer = resolveStartupIssuer(
-    { ...opts, ...(dbHubOrigin !== undefined ? { dbHubOrigin } : {}) },
-    env,
-  );
+  // Embedded: exactly the issuer serve decided (PARACHUTE_HUB_ORIGIN, else the loopback origin), PLAN §3.
+  const issuer = embedded
+    ? embedded.issuer
+    : resolveStartupIssuer({ ...opts, ...(dbHubOrigin !== undefined ? { dbHubOrigin } : {}) }, env);
   const adminBootstrap = await seedInitialAdminIfNeeded(dbHolder.get(), env, log);
 
-  if (adminBootstrap === "needs-setup") {
+  if (adminBootstrap === "needs-setup" && embedded) {
+    // The host bootstraps an embedded hub from its CLI; no setup token is minted or printed.
+    log("parachute serve --embedded: no admin account yet; the host creates one (bootstrap or auth set-password).");
+  } else if (adminBootstrap === "needs-setup") {
     log(
       "parachute serve: no admin account configured. Visit /admin/setup once the hub is reachable, or seed via PARACHUTE_INITIAL_ADMIN_USERNAME + PARACHUTE_INITIAL_ADMIN_PASSWORD env vars for scripted deploys.",
     );
@@ -711,6 +787,16 @@ export async function serve(opts: ServeOpts = {}): Promise<{
     port,
     hostname,
     fetch: hubFetch(WELL_KNOWN_DIR, {
+      ...(embedded
+        ? {
+            embedded: {
+              vaultPort: embedded.vaultPort,
+              vaultAnswers: embedded.vaultAnswers,
+              ready: embedded.ready,
+              acceptedIssuers: embedded.acceptedIssuers,
+            },
+          }
+        : {}),
       getDb: () => dbHolder.get(),
       onDbError: (err) => dbHolder.healOrExit(err),
       // #610: /health's db check probes the path so monitoring + the #591
@@ -730,7 +816,8 @@ export async function serve(opts: ServeOpts = {}): Promise<{
     livenessTimer.stop();
     dbHolder.get().close();
     const conflict = hubPortConflictMessage(err, port);
-    if (conflict) throw new Error(conflict);
+    // The code lets `serve --embedded` exit 4 for a port in use (PLAN §3).
+    if (conflict) throw Object.assign(new Error(conflict), { code: "EADDRINUSE" });
     throw err;
   }
 
@@ -762,7 +849,7 @@ export async function serve(opts: ServeOpts = {}): Promise<{
   // Skipped alongside module boot in tests (`skipModuleBoot`) so the test path
   // never spawns a real 5-minute timer / loopback fetch.
   let selfProbe: HubSelfProbe | undefined;
-  if (!opts.skipModuleBoot) {
+  if (bootModules) {
     selfProbe = armHubSelfProbe(
       { port, nonce: instanceNonce, record: instanceRecord, configDir: CONFIG_DIR },
       { log },
@@ -793,7 +880,7 @@ export async function serve(opts: ServeOpts = {}): Promise<{
   // the two already match; logs only when it heals. Mirrors the issuer
   // self-heal pattern in vault-hub-origin-env.ts. Skipped in tests via
   // `opts.skipModuleBoot` (which also gates the boot it feeds).
-  if (!opts.skipModuleBoot) {
+  if (bootModules) {
     try {
       selfHealScribeAuth({ configDir: CONFIG_DIR, log });
     } catch (err) {
@@ -817,7 +904,7 @@ export async function serve(opts: ServeOpts = {}): Promise<{
   let reconciler: ChannelReconciler | null = null;
   if (isOffline()) {
     log("parachute serve: offline: channel membership sync not started (PARACHUTE_OFFLINE).");
-  } else if (!opts.skipModuleBoot) {
+  } else if (bootModules) {
     reconciler = startChannelReconciler({ db: dbHolder.get(), log });
     log(
       "parachute serve: channel membership sync armed (60s poll over `sync` channel bindings, " +
@@ -832,7 +919,7 @@ export async function serve(opts: ServeOpts = {}): Promise<{
   // `$BUN_INSTALL/install/global/node_modules`) and the row that says
   // "this module is registered + active." Idempotent: the supervisor
   // skips modules that are already running.
-  if (!opts.skipModuleBoot) {
+  if (bootModules) {
     try {
       const booted = await bootSupervisedModules(supervisor, {
         manifestPath: SERVICES_MANIFEST_PATH,

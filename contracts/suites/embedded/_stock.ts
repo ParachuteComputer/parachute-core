@@ -37,7 +37,7 @@ export async function serveBox(
   args: string[] = [],
 ): Promise<StockBox> {
   const port = Number(env.PORT ?? (await freePort()));
-  const hub = `http://127.0.0.1:${port}`;
+  const hub = `http://${env.PARACHUTE_BIND_HOST ?? "127.0.0.1"}:${port}`;
   allowOrigins(hub);
   const logPath = `${dirname(home)}/box-${Date.now()}.log`;
   const proc = Bun.spawn([info.bin, "serve", ...args], {

@@ -11,7 +11,7 @@ import { isAbsolute, join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { cli, newHome } from "../candidate-lib.ts";
 import { red } from "../lib.ts";
-import { NO_BOOTSTRAP, NO_EMBEDDED, bootstrap, claims, diff, mint, must, readNotes, serveEmbedded, snapshot, tail } from "./_lib.ts";
+import { NO_BOOTSTRAP, bootstrap, claims, diff, mint, must, readNotes, serveEmbedded, snapshot, tail } from "./_lib.ts";
 
 /** The checks every successful first bootstrap must pass. */
 function checkFirstRun(home: string, b: Awaited<ReturnType<typeof bootstrap>>, want: { admin: string; vault: string }) {
@@ -57,7 +57,7 @@ describe("embedded/bootstrap", () => {
 
   red(
     "Prism's suite: bootstrap --embedded --username --password-file --vault --json, while serve runs, makes that account and vault",
-    { reason: NO_EMBEDDED, lane: "E" },
+    { reason: NO_BOOTSTRAP, lane: "E" },
     async () => {
       const home = newHome("boot");
       const e = await serveEmbedded(home);

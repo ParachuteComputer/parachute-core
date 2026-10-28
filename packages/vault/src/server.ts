@@ -16,6 +16,13 @@ async function shutdown(signal: string): Promise<void> {
   process.exit(0);
 }
 
-const vault = await startVault({ onStopFile: () => void shutdown("STOP_SIGNAL") });
+// Under `serve --embedded` (v0.8 PLAN §2.2 item 3, §3) the vault child doesn't register itself: core never rewrites
+// services.json, which the stock hub needs to roll back to (its install folder, its port). The embedded serve passes
+// PARACHUTE_VAULT_SELF_REGISTER=0; "after-first-boot" registers only a vault first boot created, and the embedded
+// child never creates one.
+const vault = await startVault({
+  onStopFile: () => void shutdown("STOP_SIGNAL"),
+  ...(process.env.PARACHUTE_VAULT_SELF_REGISTER === "0" ? { selfRegister: "after-first-boot" as const } : {}),
+});
 process.on("SIGINT", () => void shutdown("SIGINT"));
 process.on("SIGTERM", () => void shutdown("SIGTERM"));

@@ -397,7 +397,7 @@ import { renderNotFoundPage } from "./oauth-ui.ts";
 import { assertSameOriginForCookieMutation, buildHubBoundOrigins } from "./origin-check.ts";
 import { clearPid, writePid } from "./process-state.ts";
 import { toResponse as proxyErrorToResponse, renderProxyError } from "./proxy-error-ui.ts";
-import { classifyUpstream } from "./proxy-state.ts";
+import { DEFAULT_BOOT_WINDOW_MS, classifyUpstream } from "./proxy-state.ts";
 import { type RequestLayer, bindRequestPeer, isLoopbackPeer, layerOf } from "./request-layer.ts";
 import { isHttpsRequest } from "./request-protocol.ts";
 import { makeAppDistResolver, serveAppAtRoot } from "./root-serve.ts";
@@ -408,7 +408,7 @@ import {
   findServiceByShort,
   shortNameForManifest,
 } from "./service-spec.ts";
-import { type ServiceEntry, readManifest, readManifestLenient } from "./services-manifest.ts";
+import { type ServiceEntry, readManifest, readManifestLenient, setEmbeddedVaultPort } from "./services-manifest.ts";
 import { findActiveSession } from "./sessions.ts";
 import {
   type SetupWizardDeps,
@@ -1257,7 +1257,80 @@ function stripPrefixFor(entry: ServiceEntry): boolean {
   return fb?.manifest.stripPrefix ?? km?.canonicalStripPrefix ?? false;
 }
 
+/**
+ * What `serve --embedded` (v0.8 PLAN §3; packages/cli/src/embedded.ts) gives the hub. A host starts one process
+ * and waits on it, so:
+ *   - `/health` is 200 only once the vault answers (Benjamin's suite otherwise starts a second vault);
+ *   - `/api/ready` is 200 only once the box is usable, and 503 before;
+ *   - the install/upgrade/module routes answer 409 `managed_by_host`: the host manages Parachute here;
+ *   - the issuer is the one serve decided, pinned (no hub_settings, expose-state or request-origin tier), and every
+ *     earlier issuer of this home still counts as the hub's own.
+ */
+export interface EmbeddedHubDeps {
+  /** The embedded vault's listener; the vault rows of services.json are routed here (in memory). */
+  vaultPort: number;
+  vaultAnswers: () => boolean;
+  ready: () => boolean;
+  acceptedIssuers: readonly string[];
+}
+
+/** The routes a host-managed hub refuses with 409 managed_by_host (v0.8 PLAN §3 "Managed by the host"). */
+export function isManagedByHostRoute(pathname: string): boolean {
+  return (
+    pathname === "/api/hub/upgrade" ||
+    pathname === "/api/modules/channel" ||
+    /^\/api\/modules\/[^/]+\/(install|start|stop|restart|upgrade|uninstall)$/.test(pathname)
+  );
+}
+
+export function managedByHostResponse(): Response {
+  return Response.json(
+    {
+      error: {
+        code: "managed_by_host",
+        message: "This Parachute is managed by its host application (serve --embedded); install, upgrade and module changes go through the host.",
+      },
+    },
+    { status: 409, headers: { "cache-control": "no-store" } },
+  );
+}
+
+/**
+ * The supervised modules whose own health endpoint answers right now (loopback, 1 s each). `/api/ready` counts a
+ * module inside its boot window as ready once it answers, so a usable box says so at once instead of 30 s later
+ * (lifecycle/shutdown, v0.8 PLAN §2.2).
+ */
+async function modulesAnswering(supervisor: Supervisor, manifestPath: string): Promise<Set<string>> {
+  const up = new Set<string>();
+  // Only a module still inside its boot window: past it, /api/ready doesn't ask (api-ready.ts).
+  const now = Date.now();
+  const running = supervisor.list().filter((m) => {
+    const started = m.startedAt ? Date.parse(m.startedAt) : Number.NaN;
+    return m.status === "running" && Number.isFinite(started) && now - started < DEFAULT_BOOT_WINDOW_MS;
+  });
+  if (running.length === 0) return up;
+  const services = readManifestLenient(manifestPath).services;
+  await Promise.all(
+    running.map(async (m) => {
+      const entry = findServiceByShort(services, m.short);
+      if (!entry) return;
+      const path = typeof entry.health === "string" && entry.health.startsWith("/") ? entry.health : "/health";
+      try {
+        const r = await fetch(`http://127.0.0.1:${entry.port}${path}`, { signal: AbortSignal.timeout(1000) });
+        await r.arrayBuffer();
+        // Its own server answering is what counts: a per-vault health path may want a token (401/403).
+        if (r.ok || r.status === 401 || r.status === 403) up.add(m.short);
+      } catch {
+        // not answering yet
+      }
+    }),
+  );
+  return up;
+}
+
 export interface HubFetchDeps {
+  /** Set by `serve --embedded` only. See {@link EmbeddedHubDeps}. */
+  embedded?: EmbeddedHubDeps;
   /**
    * Lazily opens (or returns a cached handle to) the hub DB. Optional so
    * tests can exercise routes that don't touch the DB (the well-known doc,
@@ -2195,8 +2268,12 @@ export function hubFetch(
       }
     });
 
+  const embedded = deps?.embedded;
+  if (embedded) setEmbeddedVaultPort(embedded.vaultPort);
   const oauthDeps = (req: Request) => {
-    const issuer = resolveIssuer(req, getDb?.(), configuredIssuer, loadExposeHubOrigin);
+    // Embedded: the issuer serve decided, exactly (v0.8 PLAN §3 "Issuer").
+    const issuer =
+      embedded && configuredIssuer ? configuredIssuer : resolveIssuer(req, getDb?.(), configuredIssuer, loadExposeHubOrigin);
     return {
       issuer,
       // Per-request resolution (closes #245): expose-state.json can change
@@ -2219,7 +2296,7 @@ export function hubFetch(
           // configured issuer points elsewhere. See origin-check.ts
           // jsdoc for the failure case this closes.
           platformOrigin: process.env.RENDER_EXTERNAL_URL ?? flyDefaultOrigin(process.env),
-        }),
+        }).concat(embedded?.acceptedIssuers ?? []),
     };
   };
 
@@ -2451,6 +2528,13 @@ export function hubFetch(
       // /health while every DB route 500s). The probe NEVER throws — a thrown
       // probe would make /health itself 500, defeating the point.
       if (pathname === "/health") {
+        // Embedded: not healthy until the vault answers (v0.8 PLAN §3 "Serve").
+        if (embedded && !embedded.vaultAnswers()) {
+          return Response.json(
+            { status: "starting", service: "parachute-hub", version: pkg.version },
+            { status: 503, headers: { "cache-control": "no-store" } },
+          );
+        }
         let db: "ok" | string = "unconfigured";
         if (getDb) {
           try {
@@ -2509,8 +2593,16 @@ export function hubFetch(
       // module has come up. Public + DB-free so it works during the pre-
       // admin lockout (the page that polls it is itself served pre-auth).
       if (pathname === "/api/ready") {
+        // Embedded: 200 only once both databases are open and the vault answers, 503 before (v0.8 PLAN §3).
+        if (embedded) {
+          const ready = embedded.ready();
+          return Response.json({ ready }, { status: ready ? 200 : 503, headers: { "cache-control": "no-store" } });
+        }
         const readyDeps: Parameters<typeof handleApiReady>[1] = {};
-        if (deps?.supervisor !== undefined) readyDeps.supervisor = deps.supervisor;
+        if (deps?.supervisor !== undefined) {
+          readyDeps.supervisor = deps.supervisor;
+          readyDeps.answering = await modulesAnswering(deps.supervisor, manifestPath);
+        }
         return handleApiReady(req, readyDeps);
       }
 
@@ -3472,6 +3564,9 @@ export function hubFetch(
       // helper, not the supervisor. Host-admin gated inside the handler (reuses
       // the same validateAccessToken + scope check the module-ops API uses); the
       // channel param is a closed enum (rc|latest) — no injection surface.
+      // Embedded: the host manages install, upgrade and modules (v0.8 PLAN §3), even for the operator.
+      if (embedded && isManagedByHostRoute(pathname)) return managedByHostResponse();
+
       if (pathname === "/api/hub/upgrade") {
         if (!getDb) return dbNotConfigured();
         return handleHubUpgrade(req, {
