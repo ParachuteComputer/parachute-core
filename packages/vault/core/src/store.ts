@@ -1032,7 +1032,7 @@ export class BunSqliteStore implements Store {
     // any orphans missed by the targeted-removal fast path.
     this.hooks.dispatch(
       "deleted",
-      { id, ...(existing?.path ? { path: existing.path } : {}) },
+      { id, ...(existing?.path ? { path: existing.path } : {}), ...(existing ? { tags: existing.tags ?? [] } : {}) },
       this,
     );
   }
@@ -1150,7 +1150,7 @@ export class BunSqliteStore implements Store {
     return { ...opts, _tagsExpanded: expanded } as QueryOpts;
   }
 
-  async searchNotes(query: string, opts?: QueryOpts & { mode?: SearchMode }): Promise<Note[]> {
+  async searchNotes(query: string, opts?: QueryOpts & { mode?: SearchMode; visible?: (note: Note) => boolean }): Promise<Note[]> {
     // Same bare-tag strip + hierarchy expansion queryNotes uses, so
     // `search` + `tag: "manual"` still matches declared descendants
     // (vault#227) and `#tag` / `tag` resolve identically. Default
@@ -1159,12 +1159,12 @@ export class BunSqliteStore implements Store {
     // makes `_default` collapse drop the whole tag filter (OR + universal
     // parent = every note).
     const incoming = opts ?? {};
-    const withTagMatch: QueryOpts & { mode?: SearchMode } = {
+    const withTagMatch: QueryOpts & { mode?: SearchMode; visible?: (note: Note) => boolean } = {
       ...incoming,
       tagMatch: incoming.tagMatch ?? (incoming.tags && incoming.tags.length > 0 ? "any" : undefined),
     };
     const expanded = this.expandQueryTags(this.normalizeQueryTags(withTagMatch));
-    const { expand: _e, ...rest } = expanded as QueryOpts & { mode?: SearchMode };
+    const { expand: _e, ...rest } = expanded as QueryOpts & { mode?: SearchMode; visible?: (note: Note) => boolean };
     return noteOps.searchNotes(this.db, query, rest);
   }
 

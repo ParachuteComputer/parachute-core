@@ -37,6 +37,7 @@ import {
   scrubTagFieldViolationsByScope,
   scrubValidationStatusByScope,
   tagsWithinScope,
+  projectTagUpdate,
   tagVisibleInScope,
 } from "./tag-scope.ts";
 import { TagFieldConflictError, ParentCycleError } from "../core/src/tag-schemas.ts";
@@ -308,7 +309,9 @@ export function generateScopedMcpTools(
     ...(expandVisibility ? { expandVisibility } : {}),
     ...(nearTraversable ? { nearTraversable } : {}),
     ...(ifExistsVisible ? { ifExistsVisible } : {}),
-    ...(aggregateVisibility ? { aggregateVisibility } : {}),
+    ...(aggregateVisibility ? { aggregateVisibility, searchVisibility: aggregateVisibility, resolveVisibility: aggregateVisibility } : {}),
+    // G2: a scoped session changes `metadata.published` only with the published tag in scope.
+    ...(scoped ? { mayChangePublished: () => tagVisibleInScope(readVaultConfig(vaultName)?.published_tag ?? "publish", allowedHolder.value, rawTags) } : {}),
     ...(ambiguityVisible ? { ambiguityVisible } : {}),
     ...(writeContext ? { writeContext } : {}),
     ...(strictBypass ? { strictBypass } : {}),
@@ -563,8 +566,13 @@ function applyTagScopeWrappers(
     // Check history visibility before materialisation can throw a content error.
     const historyId = (params as any)?.versions?.note_id;
     if (allowed && typeof historyId === "string") {
-      const note = resolveNote(store.db, historyId);
-      if (note && !noteWithinTagScope(note, allowed, rawTags)) return { error: "Note not found", error_type: "not_found", id: historyId };
+      // Resolve among visible notes only, like every other reference: a
+      // hidden note at the path never shadows a visible one (path.ext,
+      // title). Whatever doesn't resolve — missing, or matching only hidden
+      // notes — gets one answer (vault#738's shape, echoing the caller's own
+      // ref), so the response never tells the two apart.
+      const note = resolveNote(store.db, historyId, (n) => noteWithinTagScope(n, allowed, rawTags));
+      if (!note) return { error: "Note not found", error_type: "not_found", id: historyId };
     }
     // vault#738 review: scope before any note-dependent resolution/error
     // path. Otherwise content-range validation and ambiguous-path candidates
@@ -575,7 +583,7 @@ function applyTagScopeWrappers(
     if (allowed && typeof singleRef === "string" && singleRef
         && (params as any).aggregate === undefined && !(params as any).versions) {
       try {
-        const note = resolveNote(store.db, singleRef);
+        const note = resolveNote(store.db, singleRef, allowed ? (n) => noteWithinTagScope(n, allowed, rawTags) : undefined);
         if (!note || !noteWithinTagScope(note, allowed, rawTags)) {
           return { error: "Note not found", error_type: "not_found", id: singleRef };
         }
@@ -594,7 +602,7 @@ function applyTagScopeWrappers(
     const nearRef = (params as any)?.near?.note_id;
     if (allowed && typeof nearRef === "string") {
       let anchor: Note | null = null;
-      try { anchor = resolveNote(store.db, nearRef); } catch { anchor = null; }
+      try { anchor = resolveNote(store.db, nearRef, allowed ? (n) => noteWithinTagScope(n, allowed, rawTags) : undefined); } catch { anchor = null; }
       if (!anchor || !noteWithinTagScope(anchor, allowed, rawTags)) {
         return { error: "Anchor note not found", error_type: "not_found", note_id: nearRef };
       }
@@ -633,7 +641,7 @@ function applyTagScopeWrappers(
       || ("version_ix" in result && "error" in result)
     )) {
       const id = (params as any).versions.note_id;
-      const note = resolveNote(store.db, id);
+      const note = resolveNote(store.db, id, allowed ? (n) => noteWithinTagScope(n, allowed, rawTags) : undefined);
       if (!note || !noteWithinTagScope(note, allowed, rawTags)) {
         return { error: "Note not found", error_type: "not_found", id };
       }
@@ -727,7 +735,15 @@ function applyTagScopeWrappers(
 
   wrapReadTool(tools, "find-path", async (orig, params) => {
     const allowed = await getAllowed();
-    const result = await orig(params);
+    let result: unknown;
+    try {
+      result = await orig(params);
+    } catch (e: any) {
+      // An end the session can't see doesn't resolve (resolveVisibility); it
+      // reads as "no path", the same as a path through a hidden note.
+      if (allowed && e?.error_type === "not_found") return null;
+      throw e;
+    }
     if (!allowed || !result || typeof result !== "object" || !("path" in result)) return result;
     const ids = (result as any).path as string[];
     for (const id of ids) {
@@ -839,10 +855,8 @@ function applyTagScopeWrappers(
       if (!existing || !noteWithinTagScope(existing, allowed, rawTags)) {
         return { error: "Note not found", error_type: "not_found", id };
       }
-      const removed = new Set<string>((item as any).tags?.remove ?? []);
-      const projected = new Set<string>((existing.tags ?? []).filter((t) => !removed.has(t)));
-      for (const t of ((item as any).tags?.add ?? []) as string[]) projected.add(t);
-      if (!tagsWithinScope([...projected], allowed, rawTags)) {
+      const { projected, added, removed } = projectTagUpdate(existing.tags, (item as any).tags?.add, (item as any).tags?.remove);
+      if (!tagsWithinScope(projected, allowed, rawTags, added, removed)) {
         return forbidden("update-note: post-update tag set must satisfy the token's allowlist");
       }
     }
@@ -977,6 +991,17 @@ function applyTagScopeWrappers(
     if (params.deep) return forbidden("deep history audit requires an unrestricted session");
     return runDoctorScan(store.db, { allowedTags: allowed, noteTagsInScope: doctorNoteTagsPredicate(allowed, rawTags) });
   });
+
+  // Every tool resolves an id/path/title through `resolveVisibility`
+  // (generateScopedMcpTools), which reads the allowlist from the shared
+  // holder synchronously. Resolve it before any tool runs, not only in the
+  // tools wrapped above, so no reference is resolved against an empty holder.
+  for (const tool of tools) {
+    wrapReadTool(tools, tool.name, async (orig, params) => {
+      await getAllowed();
+      return await orig(params);
+    });
+  }
 }
 
 function wrapReadTool(

@@ -303,6 +303,9 @@ export async function handleMcp(
       }
       // Strict-schema rejection (vault#299 Part A) — one error carrying ALL
       // per-field violations (settled lead #1).
+      if (e?.code === "PUBLISH_OUT_OF_SCOPE") {
+        throw mcpDomainError(ErrorCode.InvalidRequest, message, { error_type: "tag_scope_violation" });
+      }
       if (e?.code === "SCHEMA_VALIDATION") {
         throw mcpDomainError(ErrorCode.InvalidParams, message, {
           error_type: "schema_validation",

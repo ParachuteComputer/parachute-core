@@ -1,18 +1,20 @@
 // Fix 14: restrictions fail closed. A permission key nobody enforces is refused, never silently ignored.
 //
-// Today the CLI's own help suggests `--permissions '{"vault":{"default":{"write_tags":["health"]}}}'` (hub
-// src/commands/auth.ts:260, and the error text at :1242), but nothing reads `write_tags`: the mint copies the object
-// verbatim (src/api-mint-token.ts:441-452), scope-guard passes it through untouched (packages/scope-guard/src/
-// validate.ts:682-688), and the vault reads only `scoped_tags` and `principal_pubkey` (vault src/auth.ts:543,570).
-// So the operator gets a pass they think is limited and it is whole-vault. PLAN §5 fix 14, §7.5 mutant
-// "fail-closed: unknown keys ignored". Lane F.
+// Before the fix (hub 53d327b, vault 42fbf93) the CLI's own help suggested
+// `--permissions '{"vault":{"default":{"write_tags":["health"]}}}'` (hub src/commands/auth.ts:260, and the error text
+// at :1242), but nothing read `write_tags`: the mint copied the object verbatim (src/api-mint-token.ts:441-452),
+// scope-guard passes it through untouched (packages/scope-guard/src/validate.ts:682-688), and the vault reads only
+// `scoped_tags` and `principal_pubkey` (vault src/auth.ts:543,570). So the operator got a pass they thought limited
+// and it was whole-vault. Fixed by lane F in packages/hub (src/api-mint-token.ts, src/permissions-claim.ts, src/commands/auth.ts) (both mint
+// doors) and packages/vault (src/auth.ts) (the vault); mutants "mint-unknown-keys-ignored",
+// "cli-unknown-keys-ignored" and "vault-unknown-keys-ignored" put each back. PLAN §5 fix 14, §7.5.
 //
 // The vault half needs a pass that carries an unknown key even after the mint refuses to issue one (passes minted
 // before the fix live until they expire). The file signs one with the box's own key (suites/safety/_lib.ts resign);
 // a plain test proves the vault accepts such a re-signed pass when its keys are known.
 import { beforeAll, describe, expect, test } from "bun:test";
 import { hubCli, mintToken } from "../../harness/services.ts";
-import { must, red, rest, runId, services } from "../lib.ts";
+import { must, rest, runId, services } from "../lib.ts";
 import { claims, mintOverHttp, note, pass, resign } from "./_lib.ts";
 
 const s = services();
@@ -51,9 +53,9 @@ async function served(token: string): Promise<boolean> {
 /** Whether a pass's claims carry the unknown key `write_tags` anywhere in its permissions. */
 const carriesWriteTags = (token: string) => JSON.stringify(claims(token).permissions ?? null).includes('"write_tags"');
 
-// The red reasons below are thrown only when the known bug is actually observed (a usable pass carrying the
-// unknown key was issued, or the vault served a note to such a pass). Anything else (a 5xx, a crash, an answer that
-// is neither the fix nor the bug) throws "unexpected …", which no red() reason here matches.
+// Each test below passes only on a refusal. The bug (a usable pass carrying the unknown key was issued, or the vault
+// served a note to such a pass) and anything else (a 5xx, a crash, an answer that is neither) fail with different
+// reasons, so a failure says which.
 
 describe("the mint refuses permission keys nobody enforces (fix 14)", () => {
   test("the mint accepts the keys the vault enforces: scoped_tags over HTTP and in the CLI (positive control)", async () => {
@@ -63,7 +65,7 @@ describe("the mint refuses permission keys nobody enforces (fix 14)", () => {
     expect(claims(await pass({ level: "read", tags: [MINE] })).permissions).toEqual({ scoped_tags: [MINE] });
   });
 
-  red("the mint endpoint refuses an unknown permission key (write_tags, as the CLI help suggests)", { reason: /mint endpoint issued a pass with unknown permission keys/, lane: "F" }, async () => {
+  test("the mint endpoint refuses an unknown permission key (write_tags, as the CLI help suggests)", async () => {
     for (const permissions of [ADVERTISED, { write_tags: [MINE] }, { scoped_tags: [MINE], write_tags: [MINE] }]) {
       const r = await mintOverHttp(admin, { scope: `vault:${s.vaultName}:read vault:${s.vaultName}:write`, permissions });
       if (r.status === 400) continue; // refused, as it should be
@@ -75,7 +77,7 @@ describe("the mint refuses permission keys nobody enforces (fix 14)", () => {
     }
   });
 
-  red("`parachute auth mint-token` refuses an unknown permission key", { reason: /the CLI issued a pass with unknown permission keys/, lane: "F" }, async () => {
+  test("`parachute auth mint-token` refuses an unknown permission key", async () => {
     let out = "";
     try {
       out = await hubCli(s, ["auth", "mint-token", "--scope", `vault:${s.vaultName}:write`, "--ephemeral", "--label", "contracts-advertised", "--permissions", JSON.stringify(ADVERTISED)]);
@@ -97,7 +99,7 @@ describe("the vault refuses passes with permission keys it doesn't enforce (fix 
     expect(await reads(resign(plainRead, { principal_pubkey: "ab".repeat(32) }))).toEqual({ mine: 200, other: 200 });
   });
 
-  red("the vault answers 401 to a pass whose permissions carry an unknown key", { reason: /the vault accepted a pass with unknown permission keys/, lane: "F" }, async () => {
+  test("the vault answers 401 to a pass whose permissions carry an unknown key", async () => {
     for (const permissions of [ADVERTISED, { write_tags: [MINE] }, { scoped_tags: [MINE], write_tags: [MINE] }]) {
       const token = resign(plainRead, permissions);
       const got = await reads(token);
@@ -105,5 +107,23 @@ describe("the vault refuses passes with permission keys it doesn't enforce (fix 
       must(await served(token), `unexpected vault answer to a pass with unknown permission keys ${JSON.stringify(permissions)}: ${JSON.stringify(got)}`);
       must(false, `the vault accepted a pass with unknown permission keys ${JSON.stringify(permissions)}: ${JSON.stringify(got)}`);
     }
+  });
+});
+
+// Codex round 1: a pass minted before the fix may still carry an unknown key. The vault refuses it (above); the
+// mint must refuse it as a minter too, or it can trade itself for a clean pass that drops the restriction.
+describe("a pass carrying unknown permission keys can't mint (fix 14)", () => {
+  test("a vault admin pass re-signed with write_tags can't mint a read pass over HTTP", async () => {
+    const legacy = resign(admin, { write_tags: [MINE] });
+    const r = await mintOverHttp(legacy, { scope: `vault:${s.vaultName}:read`, label: "contracts-laundered" });
+    if (r.status === 401 || r.status === 403) return; // refused, as it should be
+    must(r.status === 200 && typeof r.body?.token === "string", `unexpected mint answer: status ${r.status}: ${JSON.stringify(r.body).slice(0, 300)}`);
+    must(false, `a pass carrying unknown permission keys minted a new pass (claims ${JSON.stringify(claims(r.body.token).permissions ?? null)}; reads ${JSON.stringify(await reads(r.body.token))})`);
+  });
+
+  test("the same admin pass without the unknown key still mints (positive control)", async () => {
+    const r = await mintOverHttp(resign(admin, { scoped_tags: [MINE] }), { scope: `vault:${s.vaultName}:read`, permissions: { scoped_tags: [MINE] } });
+    expect(r.status).toBe(200);
+    expect(await reads(r.body.token)).toEqual({ mine: 200, other: 404 });
   });
 });

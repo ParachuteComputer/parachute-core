@@ -58,7 +58,7 @@ import {
   contentRangeRequiresContent,
   type ContentRange,
 } from "../core/src/content-range.ts";
-import { attachValidationStatus, enforceStrictWrite, applySchemaDefaults } from "../core/src/mcp.ts";
+import { attachValidationStatus, enforceStrictWrite, applySchemaDefaults, resolveVisibleNote } from "../core/src/mcp.ts";
 import {
   BLOCKED_ATTACHMENT_EXTENSIONS,
   ATTACHMENT_MIME_TYPES,
@@ -77,7 +77,7 @@ import {
   resolveEmbeddingCapability,
   type EmbeddingCapability,
 } from "./embedding/capability.ts";
-import { getSharedEmbeddingProvider } from "./vault-store.ts";
+import { getSharedEmbeddingProvider, getVaultNameForStore } from "./vault-store.ts";
 import { loadSchemaConfig } from "../core/src/schema-defaults.ts";
 import {
   buildExpandVisibility,
@@ -98,6 +98,7 @@ import {
   scrubValidationStatusByScope,
   tagScopeForbidden,
   tagsWithinScope,
+  projectTagUpdate,
   tagVisibleInScope,
 } from "./tag-scope.ts";
 import { ParentCycleError, InvalidFieldDefaultError, InvalidFieldTypeError } from "../core/src/tag-schemas.ts";
@@ -145,10 +146,11 @@ const NO_WRITE_CTX: WriteCtx = { actor: null, via: null };
 function gateStrictWrite(
   store: Store,
   writeCtx: WriteCtx,
-  shape: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown> },
+  shape: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown>; wasPublished?: boolean; defaultTags?: string[] },
   tagScope: TagScopeCtx = NO_TAG_SCOPE,
 ): void {
   enforceStrictWrite(store, shape, {
+    ...(tagScope.raw !== null ? { mayChangePublished: mayPublish(store, tagScope) } : {}),
     isVisible: buildExpandVisibility(tagScope.allowed, tagScope.raw),
     bypass: writeCtx.bypassStrict === true,
     onBypass: (violations: ValidationWarning[]) => {
@@ -161,6 +163,13 @@ function gateStrictWrite(
       });
     },
   });
+}
+
+/** Whether a tag-scoped pass may change `metadata.published`: only with the vault's published tag in scope. */
+function mayPublish(store: Store, tagScope: TagScopeCtx): boolean {
+  const name = getVaultNameForStore(store);
+  const publishedTag = (name ? readVaultConfig(name)?.published_tag : undefined) ?? "publish";
+  return tagVisibleInScope(publishedTag, tagScope.allowed, tagScope.raw);
 }
 
 import {
@@ -240,6 +249,9 @@ function conflictResponse(e: any): Response | null {
   // Strict-schema rejection (vault#299 Part A). One error carrying ALL
   // per-field violations (settled lead #1). 422 Unprocessable Entity —
   // the note exists / request is well-formed but violates the contract.
+  if (e && e.code === "PUBLISH_OUT_OF_SCOPE") {
+    return json({ error: "Forbidden", error_type: "tag_scope_violation", message: e.message }, 403);
+  }
   if (e && e.code === "SCHEMA_VALIDATION") {
     return json(
       {
@@ -1341,7 +1353,14 @@ function parseExpandParams(
  * published.test.ts) that only implements `getNote`/`getNoteByPath`; this
  * fallback must never turn that into a crash.
  */
-async function resolveNote(store: Store, idOrPath: string): Promise<Note | null> {
+async function resolveNote(
+  store: Store,
+  idOrPath: string,
+  visible?: (note: Note) => boolean,
+): Promise<Note | null> {
+  // A caller who sees only some notes resolves among those alone: a hidden
+  // note never shadows, blocks or names itself in a visible lookup.
+  if (visible && store.db) return resolveVisibleNote(store.db, idOrPath, visible);
   const byId = await store.getNote(idOrPath);
   if (byId) return byId;
   const extMatch = idOrPath.match(/^(.*)\.([a-z0-9]{1,16})$/i);
@@ -1430,6 +1449,8 @@ async function handleNotesInner(
   tagScope: TagScopeCtx = NO_TAG_SCOPE,
   writeCtx: WriteCtx = NO_WRITE_CTX,
 ): Promise<Response> {
+  // Path resolution sees only what the pass can read (an ambiguous path never names a hidden note).
+  const scopeVisible = buildExpandVisibility(tagScope.allowed, tagScope.raw);
   const url = new URL(req.url);
   const method = req.method;
   const db = store.db;
@@ -1443,7 +1464,7 @@ async function handleNotesInner(
 
       // Single note by id/path
       if (id) {
-        const note = await resolveNote(store, id);
+        const note = await resolveNote(store, id, scopeVisible);
         if (!note) return json({ error: "Note not found", error_type: "not_found", id }, 404);
         // Tag-scope: a token can't see what its allowlist excludes. Surface
         // as 404 (not 403) — the existence of the note is itself information
@@ -1748,6 +1769,8 @@ async function handleNotesInner(
               offset: undefined,
               cursor: undefined,
               orderBy: undefined,
+              // Fix 8: a scoped pass's answer is ranked over what it can see.
+              visible: buildExpandVisibility(tagScope.allowed, tagScope.raw),
             });
           } catch (e: any) {
             if (e && e.name === "QueryError") {
@@ -1922,7 +1945,7 @@ async function handleNotesInner(
         }
       }
       if (nearNoteId) {
-        const anchor = await resolveNote(store, nearNoteId);
+        const anchor = await resolveNote(store, nearNoteId, scopeVisible);
         if (!anchor) return json({ error: "Anchor note not found", error_type: "not_found", note_id: nearNoteId }, 404);
         // Tag-scope: anchor must itself be visible to this token.
         if (!noteWithinTagScope(anchor, tagScope.allowed, tagScope.raw)) {
@@ -2471,7 +2494,7 @@ async function handleNotesInner(
         const incomingTags: string[] = item.tags ?? [];
         const projectedTags = new Set<string>([...(existingNote.tags ?? []), ...incomingTags]);
         const projectedMetadata = updates.metadata ?? ((existingNote.metadata as Record<string, unknown>) ?? {});
-        gateStrictWrite(store, writeCtx, { path: existingNote.path, tags: [...projectedTags], metadata: projectedMetadata }, tagScope);
+        gateStrictWrite(store, writeCtx, { path: existingNote.path, tags: [...projectedTags], metadata: projectedMetadata, defaultTags: incomingTags, wasPublished: (existingNote.metadata as Record<string, unknown> | undefined)?.published === true }, tagScope);
 
         // vault#555 fix 2 (W8 fix-2 bug class, generalist must-fix): gate the
         // core UPDATE on the tag/link mutation too, not just `updates` — a
@@ -2560,6 +2583,7 @@ async function handleNotesInner(
             path: item.path,
             tags: item.tags,
             metadata: item.metadata,
+            defaultTags: item.tags,
           }, tagScope);
           let note: Note;
           try {
@@ -2692,6 +2716,10 @@ async function handleNotesInner(
         // schema-default backfill of a since-added default the existing
         // note predates — skip them entirely.
         if (noMutateIds.has(note.id)) continue;
+        // A scoped session's update of an existing note applied the defaults of
+        // the tags it brought (checked, in the existing-note branch); it never
+        // backfills defaults of the note's other tags, hidden ones included.
+        if (tagScope.raw !== null && existedMap.get(note.id) === true) continue;
         if (note.tags?.length) {
           for (const id of await applySchemaDefaults(store, db, [note.id], note.tags)) {
             mutatedIds.add(id);
@@ -2769,7 +2797,7 @@ async function handleNotesInner(
   // Attachments sub-routes (keep as-is — Daily needs them)
   if (sub === "/attachments") {
     if (method === "POST") {
-      const note = await resolveNote(store, idOrPath);
+      const note = await resolveNote(store, idOrPath, scopeVisible);
       if (!note) return json({ error: "Not found", error_type: "not_found" }, 404);
       if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
         return json({ error: "Not found", error_type: "not_found" }, 404);
@@ -2894,7 +2922,7 @@ async function handleNotesInner(
       return json(attachment, 201);
     }
     if (method === "GET") {
-      const note = await resolveNote(store, idOrPath);
+      const note = await resolveNote(store, idOrPath, scopeVisible);
       if (!note) return json({ error: "Not found", error_type: "not_found" }, 404);
       if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
         return json({ error: "Not found", error_type: "not_found" }, 404);
@@ -2908,7 +2936,7 @@ async function handleNotesInner(
   if (attMatch) {
     const attId = decodeURIComponent(attMatch[1]!);
     if (method === "DELETE") {
-      const note = await resolveNote(store, idOrPath);
+      const note = await resolveNote(store, idOrPath, scopeVisible);
       if (!note) return json({ error: "Not found", error_type: "not_found" }, 404);
       if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
         return json({ error: "Not found", error_type: "not_found" }, 404);
@@ -2953,7 +2981,7 @@ async function handleNotesInner(
   if (sub === "/retry-transcription") {
     if (method !== "POST") return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
     if (!vault) return json({ error: "Vault context required", error_type: "invalid_request" }, 400);
-    const note = await resolveNote(store, idOrPath);
+    const note = await resolveNote(store, idOrPath, scopeVisible);
     if (!note) return json({ error: "Not found", error_type: "not_found" }, 404);
     if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
       return json({ error: "Not found", error_type: "not_found" }, 404);
@@ -2964,7 +2992,7 @@ async function handleNotesInner(
   const verMatch = sub.match(/^\/versions\/([^/]+)$/);
   const importMatch = sub.match(/^\/imports\/([^/]+)$/);
   if (sub === "/versions" || verMatch || importMatch || sub === "/restore") {
-    const note = await resolveNote(store, idOrPath);
+    const note = await resolveNote(store, idOrPath, scopeVisible);
     if (note && !noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
       return json({ error: "Not found", error_type: "not_found" }, 404);
     }
@@ -3026,6 +3054,7 @@ async function handleNotesInner(
         gateStrictWrite(store, writeCtx, {
           path: note ? note.path : latestTombstone(db, id)?.path,
           tags: note?.tags ?? [], metadata: version.metadata,
+          wasPublished: (note?.metadata as Record<string, unknown> | undefined)?.published === true,
         }, tagScope);
         const restored = await store.restoreNoteVersion(id, storageIndex, {
           actor: writeCtx.actor, via: writeCtx.via,
@@ -3053,7 +3082,7 @@ async function handleNotesInner(
 
   // GET /notes/:idOrPath — single note
   if (method === "GET") {
-    const note = await resolveNote(store, idOrPath);
+    const note = await resolveNote(store, idOrPath, scopeVisible);
     if (!note) return json({ error: "Not found", error_type: "not_found" }, 404);
     if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
       return json({ error: "Not found", error_type: "not_found" }, 404);
@@ -3120,7 +3149,7 @@ async function handleNotesInner(
       if (!parsedBody.ok) return parsedBody.response;
       const body = parsedBody.body as any;
       if (body.if_updated_at !== undefined && !isValidIfUpdatedAt(body.if_updated_at)) return invalidIfUpdatedAtResponse();
-      const note = await resolveNote(store, idOrPath);
+      const note = await resolveNote(store, idOrPath, scopeVisible);
       if (!note) {
         // vault#309 — `if_missing: "create"` turns this PATCH into a
         // create using the same payload. POST /notes is the canonical
@@ -3167,6 +3196,7 @@ async function handleNotesInner(
             path: createOpts.path ?? undefined,
             tags: createOpts.tags,
             metadata: createOpts.metadata,
+            defaultTags: createOpts.tags,
           }, tagScope);
           const created = await store.createNote(content, createOpts);
           if (tagsArr.length > 0) {
@@ -3215,11 +3245,11 @@ async function handleNotesInner(
           let validated: any = attachValidationStatus(store, db, final, buildExpandVisibility(tagScope.allowed, tagScope.raw));
           if (scopedCreateWarnings.length > 0) validated.warnings = scopedCreateWarnings;
           // Tag-scope (vault#568): scrub the echoed note so create-then-read
-          // returns the SAME shape. A scoped token may legitimately attach an
-          // out-of-scope co-tag on write (`tagsWithinScope` only requires ONE
-          // in-scope tag), so this isn't a leak of anything it didn't send —
-          // but leaving it unscrubbed would make the write door the one place
-          // the full tag set is observable. Same for validation_status.
+          // returns the SAME shape. Since G2 a scoped token can't add an
+          // out-of-scope tag here (`tagsWithinScope`), but schema defaults
+          // and the read-path scrub must agree: leaving the echo unscrubbed
+          // would make the write door the one place the full tag set is
+          // observable. Same for validation_status.
           validated = scrubNoteTagsByScope(validated, tagScope.allowed, tagScope.raw);
           if (validated.validation_status) {
             const vs = scrubValidationStatusByScope(validated.validation_status, tagScope.allowed, tagScope.raw);
@@ -3248,10 +3278,8 @@ async function handleNotesInner(
       // before any write if it would drift outside the allowlist. This
       // covers the bot-untags-its-only-allowlisted-tag escape route.
       if (tagScope.allowed) {
-        const removed = new Set<string>((body.tags?.remove as string[] | undefined) ?? []);
-        const projected = new Set<string>((note.tags ?? []).filter((t) => !removed.has(t)));
-        for (const t of (body.tags?.add as string[] | undefined) ?? []) projected.add(t);
-        if (!tagsWithinScope([...projected], tagScope.allowed, tagScope.raw)) {
+        const { projected, added, removed } = projectTagUpdate(note.tags, body.tags?.add, body.tags?.remove);
+        if (!tagsWithinScope(projected, tagScope.allowed, tagScope.raw, added, removed)) {
           return tagScopeForbidden(tagScope.raw ?? []);
         }
       }
@@ -3453,7 +3481,7 @@ async function handleNotesInner(
         const projectedMeta = stBody !== undefined
           ? { ...baseMeta, [stBody.field as string]: stBody.to }
           : baseMeta;
-        gateStrictWrite(store, writeCtx, { path: note.path, tags: [...projectedTags], metadata: projectedMeta }, tagScope);
+        gateStrictWrite(store, writeCtx, { path: note.path, tags: [...projectedTags], metadata: projectedMeta, defaultTags: (body.tags?.add as string[] | undefined) ?? [], wasPublished: (note.metadata as Record<string, unknown> | undefined)?.published === true }, tagScope);
       }
 
       // vault#555 fix 2 — tag and link mutations must bump `updated_at` too,
@@ -3592,7 +3620,7 @@ async function handleNotesInner(
 
   // DELETE /notes/:idOrPath — vault:write (no admin gate; consistent with verbForMethod)
   if (method === "DELETE") {
-    const note = await resolveNote(store, idOrPath);
+    const note = await resolveNote(store, idOrPath, scopeVisible);
     if (!note) return json({ error: "Not found", error_type: "not_found" }, 404);
     // Tag-scope: can't delete what you can't read. 404 (not 403) for the
     // same no-leak reason as the read paths.
@@ -4197,12 +4225,12 @@ export async function handleFindPath(
 
   const db = store.db;
   try {
-    const sourceNote = await resolveNote(store, source);
+    const sourceNote = await resolveNote(store, source, buildExpandVisibility(tagScope.allowed, tagScope.raw));
     if (!sourceNote) return json({ error: `Note not found: "${source}"`, error_type: "not_found", note_id: source }, 404);
     if (!noteWithinTagScope(sourceNote, tagScope.allowed, tagScope.raw)) {
       return json({ error: `Note not found: "${source}"`, error_type: "not_found", note_id: source }, 404);
     }
-    const targetNote = await resolveNote(store, target);
+    const targetNote = await resolveNote(store, target, buildExpandVisibility(tagScope.allowed, tagScope.raw));
     if (!targetNote) return json({ error: `Note not found: "${target}"`, error_type: "not_found", note_id: target }, 404);
     if (!noteWithinTagScope(targetNote, tagScope.allowed, tagScope.raw)) {
       return json({ error: `Note not found: "${target}"`, error_type: "not_found", note_id: target }, 404);
@@ -4620,12 +4648,14 @@ function isNotePublished(note: { tags?: string[]; metadata?: unknown }, publishe
 export async function handleViewNote(
   store: Store,
   idOrPath: string,
-  options: { authenticated?: boolean; publishedTag?: string } = {},
+  options: { authenticated?: boolean; publishedTag?: string; visible?: (note: Note) => boolean } = {},
 ): Promise<Response> {
-  const { authenticated = false, publishedTag = "publish" } = options;
+  const { publishedTag = "publish", visible } = options;
   let note: Note | null;
   try {
-    note = await resolveNote(store, idOrPath);
+    // Ambiguity resolves among the notes this reader may see (published, or
+    // readable by its pass), so a hidden note's id never appears in a 409.
+    note = await resolveNote(store, idOrPath, (n) => isNotePublished(n, publishedTag) || ((options.authenticated ?? false) && (!visible || visible(n))));
   } catch (e: any) {
     // vault#331 N1 — surface AmbiguousPathError as 409. The HTML view
     // route doesn't otherwise return JSON, but the structured body is
@@ -4639,6 +4669,8 @@ export async function handleViewNote(
   if (!note) {
     return new Response("Not Found", { status: 404, headers: { "Content-Type": "text/plain" } });
   }
+  // A tag-scoped reader sees an unpublished note only inside its tags (G1).
+  const authenticated = (options.authenticated ?? false) && (!visible || visible(note));
   if (!authenticated && !isNotePublished(note, publishedTag)) {
     return new Response("Not Found", { status: 404, headers: { "Content-Type": "text/plain" } });
   }

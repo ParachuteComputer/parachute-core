@@ -1,15 +1,16 @@
 // Fix 13: the hub's mint endpoint never issues a pass wider than the pass that asks for it, tags included.
 //
-// Today `POST /api/auth/mint-token` checks the requested scope strings against the minter's (capability
-// attenuation, hub src/api-mint-token.ts:10-30) but copies the request's `permissions` verbatim into the new pass
-// (src/api-mint-token.ts:441-452), and never looks at the minter's own `permissions`. So a vault admin limited to
-// one tag can mint itself a pass with no tag limit, or with other tags. PLAN §5 fix 13, §7.5 mutant "mint:
-// permissions copied". Lane F.
+// Before the fix (hub 53d327b) `POST /api/auth/mint-token` checked the requested scope strings against the minter's
+// (capability attenuation, src/api-mint-token.ts:10-30) but copied the request's `permissions` verbatim into the new
+// pass (src/api-mint-token.ts:441-452), and never looked at the minter's own `permissions`. So a vault admin limited
+// to one tag could mint itself a pass with no tag limit, or with other tags. Fixed by lane F in
+// packages/hub (src/api-mint-token.ts, src/permissions-claim.ts, src/commands/auth.ts); mutant "mint-permissions-copied" puts the bug back.
+// PLAN §5 fix 13, §7.5.
 //
 // The oracle is what the minted pass can read: "wider" means it reads a note the minter can't. A refusal (4xx)
 // passes as well.
 import { beforeAll, describe, expect, test } from "bun:test";
-import { must, red, rest, runId, services } from "../lib.ts";
+import { must, rest, runId, services } from "../lib.ts";
 import { claims, mintOverHttp, note, scopedAdmin } from "./_lib.ts";
 
 const s = services();
@@ -54,17 +55,17 @@ describe("mint never widens (fix 13)", () => {
     expect(got!.readsOther).toBe(false);
   });
 
-  red("a tag-scoped minter can't mint an unscoped pass", { reason: /minted a pass wider than the minter: no tags asked/, lane: "F" }, async () => {
+  test("a tag-scoped minter can't mint an unscoped pass", async () => {
     const got = await mintAndRead();
     must(got === null || !got.readsOther, `minted a pass wider than the minter: no tags asked, and the new pass (permissions ${JSON.stringify(got && claims(got.token).permissions)}) reads a note outside the minter's tags`);
   });
 
-  red("a tag-scoped minter can't mint a pass for other tags", { reason: /minted a pass wider than the minter: other tags asked/, lane: "F" }, async () => {
+  test("a tag-scoped minter can't mint a pass for other tags", async () => {
     const got = await mintAndRead({ scoped_tags: [OTHER] });
     must(got === null || !got.readsOther, `minted a pass wider than the minter: other tags asked, and the new pass reads a note outside the minter's tags`);
   });
 
-  red("a tag-scoped minter can't widen its tags by adding one", { reason: /minted a pass wider than the minter: its tags plus another/, lane: "F" }, async () => {
+  test("a tag-scoped minter can't widen its tags by adding one", async () => {
     const got = await mintAndRead({ scoped_tags: [MINE, OTHER] });
     must(got === null || !got.readsOther, `minted a pass wider than the minter: its tags plus another asked, and the new pass reads a note outside the minter's tags`);
   });

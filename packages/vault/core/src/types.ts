@@ -567,7 +567,8 @@ export interface Store {
    * (vault#647). Unspecified `tagMatch` defaults to `"any"` so historical
    * FTS tag semantics (a single IN (...)) stay put.
    */
-  searchNotes(query: string, opts?: QueryOpts & { mode?: SearchMode }): Promise<Note[]>;
+  /** `visible`: rank and limit over only the notes it admits (a tag-scoped caller, fix 8). */
+  searchNotes(query: string, opts?: QueryOpts & { mode?: SearchMode; visible?: (note: Note) => boolean }): Promise<Note[]>;
   /**
    * Semantic search (EXPERIMENTAL — see `QueryOpts.nearText`/`semantic`).
    * The one invocation point for the store's `EmbeddingProvider`: embeds

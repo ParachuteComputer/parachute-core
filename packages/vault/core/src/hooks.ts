@@ -49,11 +49,13 @@ import type { Note, Store, Attachment } from "./types.js";
 
 /**
  * Note-mutation events. `"created"` and `"updated"` carry the full post-write
- * `Note`; `"deleted"` carries only `{ id, path }` — the row is gone by
+ * `Note`; `"deleted"` carries only `{ id, path, tags }` — the row is gone by
  * dispatch time, so handlers can't re-read it. Down-stream consumers (e.g.
- * the git-mirror) match by id/path and react (remove file, etc.). Predicate
- * authors writing a `when(note)` for `"deleted"` should rely on `note.id` /
- * `note.path` only; everything else is undefined for the deleted shape.
+ * the git-mirror) match by id/path and react (remove file, etc.); live
+ * subscriptions read `tags` to send the delete only where it was visible.
+ * Predicate authors writing a `when(note)` for `"deleted"` should rely on
+ * `note.id` / `note.path` / `note.tags` only; everything else is undefined
+ * for the deleted shape.
  */
 export type HookEvent = "created" | "updated" | "deleted";
 
@@ -66,6 +68,12 @@ export type HookEvent = "created" | "updated" | "deleted";
 export interface DeletedNoteRef {
   id: string;
   path?: string;
+  /**
+   * The note's tags just before the delete, so a consumer can tell who could
+   * see it (live subscriptions send the delete only to those, G5). Absent when
+   * the note was already gone.
+   */
+  tags?: string[];
 }
 
 /**

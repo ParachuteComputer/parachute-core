@@ -68,6 +68,7 @@ import { bindPubkeyOperatorAttested, findPubkeyLink } from "../pubkey-links.ts";
 import { isNonRequestableScope } from "../scope-explanations.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
 import { generateTotpSecret, otpauthUrlFor, verifyTotpCode } from "../totp.ts";
+import { ENFORCED_PERMISSION_KEYS, unknownPermissionKeys } from "../permissions-claim.ts";
 import {
   clearEnrollment,
   getTotpState,
@@ -256,10 +257,11 @@ a deprecated alias; passing it emits a one-line stderr deprecation
 notice. \`--ttl\` will be removed in a future release.
 
 --permissions accepts a JSON object encoding fine-grained constraints
-beyond OAuth scope (e.g.
-\`--permissions '{"vault":{"default":{"write_tags":["health"]}}}'\`).
-Carried in the JWT as the \`permissions\` claim per the convergence
-section of the auth-architecture research doc.
+beyond OAuth scope (e.g. \`--permissions '{"scoped_tags":["health"]}'\`
+limits the pass to notes tagged health or under it). Carried in the JWT
+as the \`permissions\` claim. Only the keys a vault enforces are accepted
+(scoped_tags, principal_pubkey); any other key is refused, so a pass is
+never silently wider than asked.
 
 Every mint writes a row to the hub's token registry (one source of
 truth for revocation, admin UI introspection). Requires a valid
@@ -1239,7 +1241,15 @@ async function runMintToken(args: readonly string[], deps: AuthDeps): Promise<nu
       const parsed = JSON.parse(flags.permissions) as unknown;
       if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
         console.error(
-          'parachute auth mint-token: --permissions must be a JSON object (e.g. \'{"vault":{"default":{"write_tags":["health"]}}}\')',
+          'parachute auth mint-token: --permissions must be a JSON object (e.g. \'{"scoped_tags":["health"]}\')',
+        );
+        return 1;
+      }
+      // Fail closed (fix 14): a key no vault enforces would leave the pass unlimited.
+      const unknownKeys = unknownPermissionKeys(parsed as Record<string, unknown>);
+      if (unknownKeys.length > 0) {
+        console.error(
+          `parachute auth mint-token: --permissions has unknown key(s) ${unknownKeys.join(", ")}; a vault enforces only ${ENFORCED_PERMISSION_KEYS.join(", ")}`,
         );
         return 1;
       }

@@ -432,6 +432,30 @@ function droppedPvtTokenResponse(): Response {
 class MalformedScopedTagsError extends Error {}
 
 /**
+ * The `permissions` keys this vault enforces. A hub JWT carrying any other
+ * key is refused (fix 14, fail closed): a restriction nobody enforces would
+ * leave the token whole-vault while its holder believes it limited (the hub
+ * CLI's help once suggested an unenforced `write_tags`). The hub's mint
+ * doors refuse such keys too; this catches tokens minted before that, until
+ * they expire.
+ */
+const ENFORCED_PERMISSION_KEYS = new Set(["scoped_tags", "principal_pubkey"]);
+
+class UnknownPermissionKeysError extends Error {
+  constructor(readonly keys: string[]) {
+    super(`token carries permission key(s) this vault doesn't enforce: ${keys.join(", ")}`);
+  }
+}
+
+function rejectUnknownPermissionKeys(permissions: Record<string, unknown> | undefined): void {
+  if (!permissions) return;
+  const unknown = Object.keys(permissions).filter((k) => !ENFORCED_PERMISSION_KEYS.has(k));
+  if (unknown.length > 0) {
+    throw new UnknownPermissionKeysError(unknown);
+  }
+}
+
+/**
  * Map a validated hub JWT's `permissions` claim into the `scoped_tags`
  * allowlist for `AuthResult` (auth-unification arc, C0 — the READ side).
  *
@@ -674,6 +698,7 @@ async function authenticateHubJwt(
     // C0: read tag-scoping from the validated token's `permissions` claim.
     // Throws MalformedScopedTagsError (caught below → 401) on a present-but-
     // malformed claim so we never widen access on a misread.
+    rejectUnknownPermissionKeys(claims.permissions);
     const scoped_tags = parseScopedTagsFromPermissions(claims.permissions);
     // Write-attribution axis 2 (vault#698): the NIP-98 signing pubkey, when
     // the hub stamped one. Fail-soft — see `parsePrincipalPubkey`.
@@ -708,6 +733,15 @@ async function authenticateHubJwt(
       via: principalPubkey !== null ? nostrVia(principalPubkey) : "api",
     };
   } catch (err) {
+    if (err instanceof UnknownPermissionKeysError) {
+      console.warn(`[auth] hub JWT rejected: ${err.message}`);
+      return {
+        error: Response.json(
+          { error: "Unauthorized", message: err.message },
+          { status: 401 },
+        ),
+      };
+    }
     if (err instanceof MalformedScopedTagsError) {
       // Fail-closed (C0): a present-but-malformed `permissions.scoped_tags`
       // means the token wanted to be tag-scoped but we can't read the
