@@ -5,7 +5,7 @@
 //   - nothing is written outside the home: the throwaway user HOME has no new entry afterwards, Bun's transpiler
 //     cache included (today's stock run writes .bun/install/cache into $HOME, one of the 3 FAILs in Benjamin's suite).
 // Today there is no embedded mode, and /api/ready is true before any module has started (hub src/api-ready.ts).
-// Lane C turns these green (E2 with lane D's bundle).
+// Lane C turns these green. The box E2 case is green from lane D's bundle on.
 import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -119,9 +119,9 @@ describe("embedded/ready-stop", () => {
     },
   );
 
-  red(
+  // Lane D: the bundle's wrappers turn Bun's transpiler cache off (it went to ~/.bun/install/cache).
+  test(
     "box: the CLI writes nothing outside PARACHUTE_HOME (set-password, rotate-operator, vault create, mint)",
-    { reason: /written outside the home: .*\.bun/, lane: "D" },
     async () => {
       const home = newHome("e2box");
       const before = new Set(snapshot(dirname(home)).keys());

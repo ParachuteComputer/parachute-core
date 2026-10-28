@@ -84,6 +84,11 @@ function links(): string[] {
     .map((l) => l.split(":")[1]!.trim().split("@")[0]!);
 }
 
+/** On a macOS CI runner there are no namespaces: the run happens on the runner itself, a throwaway VM. */
+export function onMacRunner(): boolean {
+  return process.platform === "darwin" && process.env.GITHUB_ACTIONS === "true";
+}
+
 /**
  * Called first by anything that starts a candidate. Outside the sandbox it re-executes the current command inside
  * one and exits with its code; inside, it checks the namespace really is private and sets up loopback and the trap.
@@ -91,6 +96,13 @@ function links(): string[] {
 export async function enterSandbox(): Promise<void> {
   const level = process.env[SANDBOX_ENV];
   if (level === "2") return; // already inside, unprivileged
+  if (process.platform === "darwin") {
+    // macOS has no network or PID namespaces. The bundle's signed-tree runs (PLAN §7.3) happen only on GitHub's
+    // macos-14 runners, where nothing else listens; never on a person's Mac, which may run a live Parachute.
+    if (!onMacRunner()) throw new Error("sandbox: on macOS a candidate runs only on a CI runner (GITHUB_ACTIONS=true); there is no network namespace here");
+    console.log("[sandbox] macOS CI runner: no namespaces, the run uses the runner itself");
+    return;
+  }
   if (!level) {
     // Host → level 1: new user, network, PID and mount namespaces, root inside them.
     const unshare = Bun.which("unshare");
@@ -189,6 +201,8 @@ function keepPaths(): { path: string; rw: boolean }[] {
   const repo = resolve(import.meta.dir, "..", "..");
   const keep: { path: string; rw: boolean }[] = [{ path: repo, rw: false }];
   for (const k of ["CANDIDATE_DIR", "OLD_STOCK_DIR"]) if (process.env[k]) keep.push({ path: resolve(process.env[k]!), rw: false });
+  // The tarball and its SHA256SUMS (embedded/bundle checks them against the tree).
+  if (process.env.CANDIDATE_TARBALL) keep.push({ path: dirname(resolve(process.env.CANDIDATE_TARBALL)), rw: false });
   keep.push({ path: realpathSync(process.execPath), rw: false });
   if (process.execPath !== realpathSync(process.execPath)) keep.push({ path: process.execPath, rw: false });
   // Node's real binary, asked of Node itself: a version manager's shim (mise, nvm) needs config the sandbox hides.

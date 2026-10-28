@@ -78,7 +78,8 @@ export class UncheckedError extends Error {}
  *   - with no WAL beside it, the file is opened `immutable`;
  *   - a non-empty WAL (a crash, a running server, or a CLI that exited without closing) holds commits the file
  *     doesn't, and SQLite reading a WAL rewrites its -shm index, creating it if need be. So the database is read in
- *     a scratch folder outside the home, by hard link (or a copy, up to COPY_LIMIT) with a copy of the WAL.
+ *     a scratch folder outside the home, by hard link (or a copy, up to COPY_LIMIT; on macOS only a copy) with a
+ *     copy of the WAL.
  *     `outside` is tried first (the home's parent, usually the same filesystem), then the system's temp folder.
  *     If none works (no writable place, or too big to copy across filesystems), it throws UncheckedError: it never
  *     reads a WAL in place.
@@ -87,7 +88,10 @@ export function schemaOf(path: string, outside: string = tmpdir()): number | und
   const wal = `${path}-wal`;
   if (!(existsSync(wal) && statSync(wal).size > 0)) return topVersion(openImmutable(path));
   const places = [...new Set([outside, tmpdir()])];
-  for (const copy of [false, true]) {
+  // Never a hard link on macOS: a second process opening the live file through a link, while serve has it open,
+  // makes serve's SQLite fail with a disk I/O error there (seen on macos-14, lane D's bundle-macos job; Linux is
+  // fine). So on macOS the database is copied, up to COPY_LIMIT, and a larger one with a WAL is not checked.
+  for (const copy of process.platform === "darwin" ? [true] : [false, true]) {
     if (copy && statSync(path).size > COPY_LIMIT) break;
     for (const place of places) {
       let scratch: string | undefined;

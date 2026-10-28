@@ -1,23 +1,29 @@
-// `bun run build:core`: build this repo's one program as a candidate, in the layout v0.8's tarball will have.
+// `bun run build:core`: build this repo's one program as a candidate: the v0.8 bundle tree (release/bundle.ts), which
+// is what the tarball holds.
 //
-//   <out>/bin/parachute-core     the one command (links into lib/packages/cli/bin)
+//   <out>/bin/parachute-core     the one command (a wrapper that runs lib/ on runtime/bun)
 //   <out>/bin/parachute          alias: the hub's commands, for Prism's PARACHUTE_BIN and Benjamin's suite
 //   <out>/bin/parachute-vault    alias: the vault's commands, for PARACHUTE_VAULT_BIN
-//   <out>/lib/                   the workspace (package.json, bun.lock, packages/), `bun install --frozen-lockfile`
+//   <out>/runtime/bun            the pinned Bun (release/bun.json)
+//   <out>/lib/                   the workspace (package.json, bun.lock, packages/), production node_modules
 //   <out>/package.json           what npm and bun would publish and link: @openparachute/core, bin parachute-core
+//   <out>/entitlements/, LICENSE, THIRD-PARTY-NOTICES.txt, SOURCE.md, VERSION
 //   <out>/CANDIDATE.json         profile "v0.8", and the sha256 of every other file in <out>
 //
 // The candidate adapter (harness/candidate.ts) runs only what is in this folder, and refuses it if a byte changed.
-// Lane D turns this folder into the tarball; the layout stays.
 //
-//   bun run build:core [--out <dir>] [--source <checkout>]
+//   bun run build:core [--out <dir>] [--source <checkout>] [--sign] [--pack <dir> | --no-pack]
 //
 // --source builds from another checkout's working tree, edits included. The default is this repo's working tree;
-// CI builds from a clean checkout, so that is the commit. The candidate mutants pass `edit`, which changes the
-// copied source in lib/ before it is installed (harness/mutate-candidate.ts).
-import { appendFileSync, cpSync, existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+// CI builds from a clean checkout, so that is the commit. --sign (macOS) signs the tree ad hoc with the hardened
+// runtime before it is hashed (release/sign.ts). It then writes <name>.tar.gz and SHA256SUMS into --pack <dir>
+// (default <out>/../dist; release/pack.ts). The candidate mutants pass `edit`, which changes the copied source in lib/ before it is
+// installed (harness/mutate-candidate.ts).
+import { appendFileSync, cpSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { treeHash, MANIFEST } from "./candidate.ts";
+import { installWorkspace, layOutBundle } from "../../release/bundle.ts";
+import { packTree } from "../../release/pack.ts";
 
 async function sh(cmd: string[], cwd?: string): Promise<string> {
   const p = Bun.spawn(cmd, { cwd, stdout: "pipe", stderr: "pipe" });
@@ -33,8 +39,7 @@ function arg(name: string): string | undefined {
 
 const REPO = resolve(import.meta.dir, "..", "..");
 /** What goes into lib/: the workspace and nothing else (not contracts/, docs/ or the repo's own files). */
-const WORKSPACE = (f: string) => ["package.json", "bun.lock", "bunfig.toml"].includes(f) || f.startsWith("packages/");
-const NAMES = ["parachute-core", "parachute", "parachute-vault"];
+const WORKSPACE = (f: string) => ["package.json", "bun.lock", "bunfig.toml", "LICENSE"].includes(f) || f.startsWith("packages/");
 
 /**
  * Copy the workspace from a checkout's working tree (tracked and untracked files, never node_modules or a build
@@ -62,7 +67,9 @@ export async function buildCoreCandidate(opts: {
   staged?: { dir: string; rev: string; installed?: boolean };
   /** Change the copied workspace (lib/) before install; `label` names the change in CANDIDATE.json. */
   edit?: { label: string; apply: (lib: string) => Promise<void> };
-}): Promise<{ sha256: string }> {
+  /** Sign the tree ad hoc with the hardened runtime before hashing it (macOS; release/sign.ts). */
+  sign?: boolean;
+}): Promise<{ sha256: string; name: string }> {
   const out = resolve(opts.out);
   const source = resolve(opts.source ?? REPO);
   rmSync(out, { recursive: true, force: true });
@@ -75,44 +82,46 @@ export async function buildCoreCandidate(opts: {
     rev = opts.staged.rev;
   } else rev = await stageWorkspace(source, lib);
   if (opts.edit) await opts.edit.apply(lib);
-  // Builds the hub's packages (depcheck, door-contract) through the root `prepare` script.
-  if (!opts.staged?.installed) await sh(["bun", "install", "--frozen-lockfile"], lib);
-
-  for (const name of NAMES) symlinkSync(`../lib/packages/cli/bin/${name}`, join(out, "bin", name));
+  // The production install, admin pages and pruning (release/bundle.ts); a staged snapshot has had it already.
+  const leftOut = opts.staged?.installed ? undefined : await installWorkspace(lib);
+  const commit = (await sh(["git", "rev-parse", "HEAD"], opts.staged ? REPO : source).catch(() => "unknown")).trim();
+  const bundle = await layOutBundle(out, { commit, rev, leftOut, sign: opts.sign });
 
   const pkg = await Bun.file(join(lib, "package.json")).json();
   const version = async (p: string) => (await Bun.file(join(lib, p, "package.json")).json()).version as string;
-  writeFileSync(
-    join(out, "package.json"),
-    JSON.stringify(
-      { name: pkg.name, version: pkg.version, description: pkg.description, license: pkg.license, type: "module", bin: { "parachute-core": "bin/parachute-core" } },
-      null,
-      2,
-    ) + "\n",
-  );
 
   const sha256 = await treeHash(out);
   const manifest = {
     name: pkg.name,
     profile: "v0.8",
-    note: "the one program built from this repo's workspace; the hub still starts the vault as a child (lane A1)",
+    note: "the v0.8 bundle tree built from this repo's workspace (lane D); the hub still starts the vault as a child",
     version: { core: pkg.version, hub: await version("packages/hub"), vault: await version("packages/vault") },
     source: { core: `${rev}${opts.source ? ` (from ${source})` : ""}${opts.edit ? ` + ${opts.edit.label}` : ""}` },
     core_commit: rev.replace("+changes", ""),
     process_model: "child",
     platform: `${process.platform}-${process.arch}`,
+    bundle,
     sha256,
   };
   writeFileSync(join(out, MANIFEST), JSON.stringify(manifest, null, 2) + "\n");
-  return { sha256 };
+  return { sha256, name: bundle.name };
 }
 
 if (import.meta.main) {
   const out = arg("--out") ?? join(REPO, "contracts", ".cache", "candidate-core");
   const t0 = Date.now();
-  const { sha256 } = await buildCoreCandidate({ out, source: arg("--source") });
+  const { sha256, name } = await buildCoreCandidate({ out, source: arg("--source"), sign: process.argv.includes("--sign") });
   console.log(`[candidate] built ${out} in ${Math.round((Date.now() - t0) / 1000)} s`);
   console.log(`[candidate] sha256 ${sha256}`);
   // For CI: the build step's output, compared with what the runs report (harness/run-candidate.ts).
-  if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `sha256=${sha256}\ndir=${out}\n`);
+  if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `sha256=${sha256}\ndir=${out}\nname=${name}\n`);
+  // The tarball goes next to the tree by default (<out>/../dist), where embedded/bundle looks for it.
+  const packDir = process.argv.includes("--no-pack") ? undefined : (arg("--pack") ?? join(dirname(out), "dist"));
+  if (packDir) {
+    mkdirSync(packDir, { recursive: true });
+    const p = await packTree(out, name, packDir);
+    console.log(`[candidate] packed ${p.tarball}`);
+    console.log(`[candidate] tarball sha256 ${p.sha256} (${p.sums})`);
+    if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `tarball=${p.tarball}\n`);
+  }
 }

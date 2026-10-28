@@ -1,5 +1,19 @@
 #!/bin/sh
-# `parachute-core` (packages/cli/src/dispatch.ts), run with the Bun on PATH. This folder goes first on PATH, so the vault
+# `parachute-core` (packages/cli/src/dispatch.ts). In the bundle (release/bundle.ts: bin/parachute-core links here) it runs on the
+# bundle's own runtime/bun; from a source checkout, on the Bun on PATH. This folder goes first on PATH, so the vault
 # the hub starts (`parachute-vault serve`) and every other command the hub runs by name is this install's own.
+# Bun's transpiler cache is off unless the caller sets one: by default Bun writes it to ~/.bun, outside the home.
 here="$(dirname "$(readlink -f "$0")")"
+bundle="$here/../../../.."
+# A bundle is the folder four levels up only if its lib/packages/cli/bin is this folder (not a source checkout's parent).
+# A bundle runs on its own runtime/bun or not at all: never on a Bun found on PATH.
+if [ -f "$bundle/VERSION" ] && [ "$(cd "$bundle/lib/packages/cli/bin" 2>/dev/null && pwd -P)" = "$here" ]; then
+  if [ ! -x "$bundle/runtime/bun" ]; then
+    echo "parachute-core: this bundle's runtime/bun is missing or not executable; unpack the tarball again" >&2
+    exit 69
+  fi
+  PATH="$bundle/runtime:$PATH"
+fi
+: "${BUN_RUNTIME_TRANSPILER_CACHE_PATH:=0}"
+export BUN_RUNTIME_TRANSPILER_CACHE_PATH
 PATH="$here:$PATH" exec bun "$here/../src/parachute-core.ts" "$@"
