@@ -91,8 +91,12 @@ describe("embedded/bootstrap", () => {
     checkFirstRun(home, first, { admin: "owner", vault: "default" });
     const file = first.json.operator_token_file;
     const token = readFileSync(file, "utf8").trim();
-    // A careless edit or a bad copy: the signature's last character changed.
-    const damaged = token.slice(0, -1) + (token.endsWith("A") ? "B" : "A");
+    // A careless edit or a bad copy: one byte of the signature changed. (Not its last base64url character, whose low
+    // bits can be padding the decoder ignores, which would leave the signature valid; Codex round 3.)
+    const [head, body, sig] = token.split(".");
+    const bytes = Buffer.from(sig!, "base64url");
+    bytes[0] = bytes[0]! ^ 0xff;
+    const damaged = `${head}.${body}.${bytes.toString("base64url")}`;
     writeFileSync(file, `${damaged}\n`, { mode: 0o600 });
     const again = await bootstrap(home);
     must(again.code === 0 && again.json?.created === false, `second bootstrap exited ${again.code}: ${tail(again.stderr || again.stdout)}`);
