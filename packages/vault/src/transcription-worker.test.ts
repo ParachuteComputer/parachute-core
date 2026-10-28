@@ -1778,3 +1778,45 @@ describe("transcription worker — segmented recordings (voice W2)", () => {
     expect((note!.metadata as any)?.transcribe_stub).toBe(true);
   });
 });
+
+describe("transcription worker: stop with a transcription in flight", () => {
+  // A vault stopping inside a longer-lived process (`parachute-core serve`) closes its stores after stop(). A
+  // transcription still waiting on its provider must write nothing, and the tick must open no further vault.
+  test("stop() mid-transcribe: no write after it, no second vault opened, the attachment stays pending", async () => {
+    await store.createNote("# 🎙️ Voice memo\n\n_Transcript pending._\n", { id: "nstop", metadata: { transcribe_stub: true } });
+    seedAudio("memos/stop.webm");
+    await store.addAttachment("nstop", "memos/stop.webm", "audio/webm", { transcribe_status: "pending" });
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let started!: () => void;
+    const inProvider = new Promise<void>((r) => (started = r));
+    const provider = {
+      name: "transcribe-cpp",
+      available: async () => ({ ok: true }),
+      transcribe: async () => {
+        started();
+        await gate;
+        return { text: "made-up transcript that must not land" };
+      },
+    };
+    const opened: string[] = [];
+    const worker = startTranscriptionWorker({
+      vaultList: () => ["first", "second"],
+      getStore: (name: string) => (opened.push(name), store as unknown as Store),
+      resolveAssetsDir: () => assetsRoot,
+      provider,
+      pollIntervalMs: 10_000_000,
+      logger: silentLogger,
+    });
+    const ticking = worker.tick();
+    await inProvider;
+    const stopping = worker.stop();
+    release();
+    await Promise.all([ticking, stopping]);
+
+    expect(opened).not.toContain("second");
+    const [att] = await store.getAttachments("nstop");
+    expect(att.metadata?.transcribe_status).toBe("pending");
+    expect((await store.getNote("nstop"))!.content).toBe("# 🎙️ Voice memo\n\n_Transcript pending._\n");
+  });
+});

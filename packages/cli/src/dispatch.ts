@@ -10,7 +10,8 @@
 // Every name answers `version` / `--version` with core's version, and `version --json` with
 // {name: "@openparachute/core", version, schema, bun}: it is one program with one version.
 //
-// Lane A1 moves the code in and keeps the vault a child process: `serve` is still the hub's, and the hub starts its
+// `serve` (under `parachute-core` and `parachute`) runs the vault inside this process (lane A2, ./serve.ts). Until the
+// Nov 3 decision the child path stays (`PARACHUTE_PROCESS_MODEL=child`): `serve` is the hub's, and the hub starts its
 // vault as `parachute-vault serve`. bin/ puts itself first on PATH (bin/parachute-core), so that child is this
 // install's own vault, never an older `parachute-vault` found on PATH (PLAN §2.1).
 //
@@ -114,6 +115,10 @@ export async function dispatch(role: Role): Promise<void> {
   }
   if (role === "core" && r.cli === "hub" && (argv.length === 0 || ["help", "--help", "-h"].includes(argv[0]!))) {
     console.log(coreHelp());
+  }
+  if (r.cli === "hub" && r.argv[0] === "serve") {
+    const { processModel, serveInProcess } = await import("./serve.ts");
+    if (processModel() === "in-process") await serveInProcess(r.argv.slice(1));
   }
   const entry = r.cli === "hub" ? HUB_CLI : VAULT_CLI;
   // Both CLIs read process.argv.slice(2) when they load, and may start themselves again from process.argv[1].

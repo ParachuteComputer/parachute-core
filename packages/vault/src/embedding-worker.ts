@@ -68,6 +68,10 @@ export class EmbeddingWorker {
   private readonly logger: { error: (...args: unknown[]) => void; log?: (...args: unknown[]) => void };
   private timer: ReturnType<typeof setInterval> | null = null;
   private sweeping = false;
+  /** Set by stop(): a sweep or an embed in flight writes nothing more and opens no further vault (a vault stopping
+   *  inside a longer-lived process closes its stores right after). Cleared by start(). */
+  private stopped = false;
+  private currentSweep: Promise<unknown> = Promise.resolve();
 
   constructor(opts: EmbeddingWorkerOpts) {
     this.provider = opts.provider;
@@ -113,10 +117,11 @@ export class EmbeddingWorker {
     if (plan.stale.length === 0) return; // no-op edit (or nothing embeddable) — zero provider calls
 
     const avail = await this.provider.available();
-    if (!avail.ok) return; // not configured/ready — leave stale, retried later
+    if (!avail.ok || this.stopped) return; // not configured/ready — leave stale, retried later
 
     try {
       const { vectors } = await this.provider.embed({ texts: plan.stale.map((c) => c.text) });
+      if (this.stopped) return; // stopped while the provider worked: its store may be closed now
       for (let i = 0; i < plan.stale.length; i++) {
         const chunk = plan.stale[i]!;
         const vector = vectors[i];
@@ -132,6 +137,7 @@ export class EmbeddingWorker {
 
   /** Event-path entry point — called from the registered `onNote` hook. */
   async kick(vaultName: string, note: Note): Promise<void> {
+    if (this.stopped) return;
     const store = this.getStore(vaultName);
     await this.embedNote(store, note);
   }
@@ -153,29 +159,38 @@ export class EmbeddingWorker {
    */
   async sweepOnce(): Promise<{ processed: number; vaults: number }> {
     if (!this.provider) return { processed: 0, vaults: 0 }; // off switch
-    if (this.sweeping) return { processed: 0, vaults: 0 };
+    if (this.sweeping || this.stopped) return { processed: 0, vaults: 0 };
     this.sweeping = true;
+    const sweep = this.sweepVaults(this.provider);
+    this.currentSweep = sweep.catch(() => {});
     try {
-      let processed = 0;
-      const vaults = this.vaultList();
-      for (const vaultName of vaults) {
-        const store = this.getStore(vaultName);
-        const pending = getNotesPendingEmbedding(store.db, this.provider.model);
-        for (const row of pending) {
-          const note = await store.getNote(row.id);
-          if (!note) continue; // deleted between the scan and now
-          await this.embedNote(store, note);
-          processed++;
-        }
-      }
-      return { processed, vaults: vaults.length };
+      return await sweep;
     } finally {
       this.sweeping = false;
     }
   }
 
+  private async sweepVaults(provider: EmbeddingProvider): Promise<{ processed: number; vaults: number }> {
+    let processed = 0;
+    const vaults = this.vaultList();
+    for (const vaultName of vaults) {
+      if (this.stopped) break;
+      const store = this.getStore(vaultName);
+      const pending = getNotesPendingEmbedding(store.db, provider.model);
+      for (const row of pending) {
+        if (this.stopped) break;
+        const note = await store.getNote(row.id);
+        if (!note) continue; // deleted between the scan and now
+        await this.embedNote(store, note);
+        processed++;
+      }
+    }
+    return { processed, vaults: vaults.length };
+  }
+
   /** Start the recurring sweep. No-op if already started. */
   start(): void {
+    this.stopped = false;
     if (this.timer) return;
     this.timer = setInterval(() => {
       void this.sweepOnce().catch((err) => this.logger.error("[embedding] sweep failed:", err));
@@ -183,12 +198,18 @@ export class EmbeddingWorker {
     this.timer.unref?.();
   }
 
-  /** Stop the recurring sweep. */
+  /** Stop the recurring sweep; a sweep or embed in flight writes nothing more (see `stopped`). */
   stop(): void {
+    this.stopped = true;
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
     }
+  }
+
+  /** Resolves when the sweep in flight, if any, has ended. */
+  drain(): Promise<void> {
+    return this.currentSweep.then(() => {});
   }
 }
 

@@ -85,10 +85,18 @@ export function isSharedEmbeddingProviderActive(): boolean {
   return getSharedEmbeddingProvider() !== undefined;
 }
 
-/** Test-only: force a fresh provider on the next `getSharedEmbeddingProvider()` call. */
-export function resetSharedEmbeddingProviderForTests(): void {
+/**
+ * Force a fresh provider on the next `getSharedEmbeddingProvider()` call: a vault stopping inside a longer-lived
+ * process (`parachute-core serve`), so its next start reads the setting again as a new process did.
+ */
+export function resetSharedEmbeddingProvider(): void {
   sharedEmbeddingProvider = undefined;
   sharedEmbeddingProviderResolved = false;
+}
+
+/** Test-only: force a fresh provider on the next `getSharedEmbeddingProvider()` call. */
+export function resetSharedEmbeddingProviderForTests(): void {
+  resetSharedEmbeddingProvider();
 }
 
 /** Get or create a store for a vault. */

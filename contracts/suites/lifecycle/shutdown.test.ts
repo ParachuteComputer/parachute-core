@@ -14,7 +14,9 @@
 //     bytes, which is `PRAGMA wal_checkpoint` with 0 frames left) and `PRAGMA integrity_check` ok, read with
 //     bun:sqlite read-only from the stopped home;
 //   - a stale `ready.json` from a SIGKILLed run never reads as ready.
-// Lane A2 turns the red ones green (the coordinator); `--parent-pid` is lane C's flag (§3).
+// Lane A2 turned its red ones green on the in-process path (packages/cli/src/serve.ts, the coordinator); the ready
+// bound and `--parent-pid` are lane C's (§3). The child path (PARACHUTE_PROCESS_MODEL=child, until the Nov 3
+// decision) still fails those.
 //
 // How it runs. Each scenario is a box install in a fresh home, launched the way a person does it (`parachute-vault
 // create`, then `parachute serve`; same sequence as harness/candidate.ts startCandidateBox). A box's vault listens
@@ -617,7 +619,7 @@ describe("lifecycle: shutdown", () => {
 
     test(`${sig}: serve exits 0 within 10 s, both ports closed, no process left`, async () => stoppedAndGone(await run()), SLOW);
 
-    // Green today for a steady-state stop; the same oracles fail for a stop during start-up (below).
+    // Green on 0.7 too for a steady-state stop; a stop during start-up (below) is where 0.7 failed them.
     test(
       `${sig}: the home is left clean: every WAL checkpointed, integrity ok, no ready.json or hub-instance.json`,
       async () => cleanOnDisk(await run()),
@@ -625,8 +627,8 @@ describe("lifecycle: shutdown", () => {
     );
   }
 
-  // The stop file (vault src/server.ts:740-758): `parachute-vault stop` writes vault/stop.signal; the server polls
-  // for it. In one program it is one more way into the same coordinator, so the whole serve stops.
+  // The stop file: `parachute-vault stop` writes vault/stop.signal; the vault polls for it (vault
+  // src/start-vault.ts). In one program it is one more way into the same coordinator, so the whole serve stops.
   const stopFile = stopScenario(
     "the stop file",
     async (box) => {
@@ -638,16 +640,14 @@ describe("lifecycle: shutdown", () => {
 
   test("the stop file: acknowledged writes survive, and writes in flight are answered", async () => nothingLost(await stopFile()), SLOW);
 
-  red(
+  test(
     "the stop file: the whole serve stops (exit 0 within 15 s), both ports closed, no process left",
-    { reason: /^serve still running 15 s after the stop file$/, lane: "A2" },
     async () => stoppedAndGone(await stopFile()),
     SLOW,
   );
 
-  red(
+  test(
     "the stop file: the home is left clean",
-    { reason: /^serve did not stop, so its home was never left: serve still running 15 s after the stop file$/, lane: "A2" },
     async () => cleanOnDisk(await stopFile()),
     SLOW,
   );
@@ -760,9 +760,8 @@ describe("lifecycle: shutdown", () => {
     must(o.lost.length === 0, `acknowledged writes lost: ${o.lost.join(", ")}`);
   }, SLOW);
 
-  red(
+  test(
     "SIGKILL: a SIGKILLed serve leaves no process behind (its vault notices its parent died)",
-    { reason: /^process left 5 s after serve was SIGKILLed: pid \d+ \S*bun \S*(vault\S*\/cli|\/parachute-vault)\.ts serve$/, lane: "A2" },
     async () => {
       const o = await killed();
       must(o.orphans.length === 0, o.orphans.join("; "));
@@ -770,9 +769,8 @@ describe("lifecycle: shutdown", () => {
     SLOW,
   );
 
-  red(
+  test(
     "SIGKILL: a stale ready.json from the killed run never reads as ready",
-    { reason: /^stale run\/ready\.json still there after the restart's hub answered$/, lane: "A2" },
     async () => {
       const o = await killed();
       const problems = [...o.staleProblems, ...o.seen];
@@ -833,9 +831,8 @@ describe("lifecycle: shutdown", () => {
     expect(o.readyWhileBroken).toEqual([]);
   }, SLOW);
 
-  red(
+  test(
     "vault start failure: serve stops itself, non-zero, cleanly",
-    { reason: /^serve still running 20 s after the vault failed to start$/, lane: "A2" },
     async () => {
       const o = await brokenDb();
       must(o.problems.length === 0, o.problems.join("; "));
@@ -854,9 +851,8 @@ describe("lifecycle: shutdown", () => {
     must(o.occupierAlive, "the process holding the vault port was killed");
   }, SLOW);
 
-  red(
+  test(
     "occupied vault port: serve stops itself, non-zero, cleanly",
-    { reason: /^serve still running 20 s after the vault port was taken$/, lane: "A2" },
     async () => {
       const o = await occupied();
       must(o.problems.length === 0, o.problems.join("; "));
@@ -865,9 +861,10 @@ describe("lifecycle: shutdown", () => {
   );
 
   // A stop can come at any moment, including in the middle of start-up (systemd restarting a unit, a person
-  // pressing Ctrl-C). Here it comes the moment the vault's port opens. Today `parachute serve` installs its
-  // signal handlers only after start-up finishes (hub src/cli.ts:1016-1024, after `await mod.serve()`, which awaits
-  // the module boot), so the signal kills the hub outright and its vault child is left running.
+  // pressing Ctrl-C). Here it comes the moment the vault's port opens. 0.7's `parachute serve` installed its signal
+  // handlers only after start-up finished (hub src/cli.ts:1016-1024, after `await mod.serve()`, which awaits the
+  // module boot), so the signal killed the hub outright and left its vault child running; the coordinator installs
+  // them before anything starts.
   const duringStartup = once(async () => {
     const box = new Box("life-early");
     try {
@@ -902,11 +899,9 @@ describe("lifecycle: shutdown", () => {
     must(o.lost.length === 0, `acknowledged writes lost: ${o.lost.join(", ")}`);
   }, SLOW);
 
-  // Three invariants, three contracts, each red today for exactly one anchored reason: any further problem (a
-  // second orphan, a damaged database) makes it red for the wrong reason instead of hiding behind the first.
-  red(
+  // Three invariants, three contracts, so a mutant that breaks one is named by it.
+  test(
     "SIGTERM during start-up: serve exits 0 (the signal is handled, not fatal)",
-    { reason: /^serve died of SIGTERM instead of stopping$/, lane: "A2" },
     async () => {
       const o = await duringStartup();
       must(o.exit !== null, o.running.join("; "));
@@ -916,9 +911,8 @@ describe("lifecycle: shutdown", () => {
     SLOW,
   );
 
-  red(
+  test(
     "SIGTERM during start-up: both ports closed, no process left",
-    { reason: /^still listening: 127\.0\.0\.1:1940 \(vault\); process left: pid \d+ \S*bun \S*(vault\S*\/cli|\/parachute-vault)\.ts serve$/, lane: "A2" },
     async () => {
       const o = await duringStartup();
       must(o.running.length === 0, o.running.join("; "));
@@ -926,9 +920,8 @@ describe("lifecycle: shutdown", () => {
     SLOW,
   );
 
-  red(
+  test(
     "SIGTERM during start-up: the home is left clean (WAL checkpointed, no instance file)",
-    { reason: /^left behind: hub-instance\.json; WAL left: vault\/data\/life[0-9a-f]+\/vault\.db-wal \d+ bytes$/, lane: "A2" },
     async () => {
       const o = await duringStartup();
       cleanOnDiskOf(o.exit, o.running, o.disk);

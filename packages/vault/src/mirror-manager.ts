@@ -571,6 +571,12 @@ export class MirrorManager {
   /** Unsubscribe handles returned by `hooks.on*()`. */
   private unsubscribes: Array<() => void> = [];
   private stopping = false;
+  /**
+   * Bumped by every stop(). A start() still in its awaits when a stop comes is stale: it checks this before its
+   * initial export and before subscribing, so a stopped manager never subscribes or arms a timer afterwards (a vault
+   * stopping inside a longer-lived process, `parachute-core serve`).
+   */
+  private generation = 0;
   /** A flush is currently running. Other triggers should not start a new one. */
   private inFlight = false;
   /** Set when an event/safety-net tick arrives during an in-flight flush. */
@@ -653,6 +659,8 @@ export class MirrorManager {
     assertMirrorActive(this.deps.vaultName);
     this.startCount++;
     await this.stop({ preserveStatus: true });
+    const generation = this.generation;
+    const stale = () => generation !== this.generation;
 
     const config = this.deps.readMirrorConfig() ?? defaultMirrorConfig();
     this.currentConfig = config;
@@ -747,6 +755,7 @@ export class MirrorManager {
     // exports; they get the original "push needs credentials" feedback
     // when auto_push fires.
     await this.applyCredentialsToRemote(path);
+    if (stale()) return this.getStatus();
 
     // Initial export — full pass (no cursor) so the mirror starts
     // byte-equivalent to current vault state, regardless of when the
@@ -765,6 +774,7 @@ export class MirrorManager {
       // net loop attempts again if armed; the next successful pass
       // clears last_error.
     }
+    if (stale()) return this.getStatus();
 
     if (config.sync_mode === "events") {
       this.subscribeToHooks();
@@ -795,6 +805,7 @@ export class MirrorManager {
    */
   async stop(opts: { preserveStatus?: boolean } = {}): Promise<void> {
     this.stopping = true;
+    this.generation++;
 
     // Unsubscribe BEFORE waiting for in-flight — additional events
     // arriving after we start the settle wait would re-arm the debounce

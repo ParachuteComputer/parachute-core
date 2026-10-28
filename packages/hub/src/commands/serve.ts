@@ -610,7 +610,8 @@ export function armServeDbWatchdog<H = unknown>(
  */
 export async function serve(opts: ServeOpts = {}): Promise<{
   result: ServeResult;
-  stop: () => Promise<void>;
+  /** `deadline` (ms, default 5000): how long the whole stop may take before open connections are closed. */
+  stop: (stopOpts?: { deadline?: number }) => Promise<void>;
 }> {
   const env = opts.env ?? process.env;
   const log = opts.log ?? ((line) => console.log(line));
@@ -725,6 +726,9 @@ export async function serve(opts: ServeOpts = {}): Promise<{
   try {
     server = Bun.serve(serveOptions);
   } catch (err) {
+    // Nothing else has started yet; close what has, so a failed start leaves hub.db checkpointed (v0.8 PLAN §2.2).
+    livenessTimer.stop();
+    dbHolder.get().close();
     const conflict = hubPortConflictMessage(err, port);
     if (conflict) throw new Error(conflict);
     throw err;
@@ -857,20 +861,26 @@ export async function serve(opts: ServeOpts = {}): Promise<{
       adminBootstrap,
       supervisor,
     },
-    stop: async () => {
+    stop: async (stopOpts: { deadline?: number } = {}) => {
+      const stopBy = Date.now() + (stopOpts.deadline ?? 5_000);
       // Stop supervised children first so they get a clean SIGTERM
       // before the HTTP server (which they may depend on for hub-issued
       // tokens) goes away.
-      for (const state of supervisor.list()) {
-        await supervisor.stop(state.short);
-      }
+      // All at once: each child gets its own kill timeout, not the sum of everyone's (v0.8 PLAN §2.2).
+      await Promise.all(supervisor.list().map((state) => supervisor.stop(state.short)));
       selfProbe?.stop();
       reconciler?.stop();
       livenessTimer.stop();
       // Both sockets come down. Leaving the guard bound after a restart would
       // make the hub's own next boot race itself for 127.0.0.1:<port>.
       await loopbackGuard?.stop();
-      await server.stop();
+      // Requests in flight finish; whatever is still open at the deadline (a bridged WebSocket, a request stuck
+      // upstream) is closed, so the rest of this stop always runs (v0.8 PLAN §2.2).
+      const drained = await Promise.race([
+        server.stop().then(() => true, () => true),
+        Bun.sleep(Math.max(250, stopBy - Date.now() - 250)).then(() => false),
+      ]);
+      if (!drained) await server.stop(true);
       // Clear our on-disk identity so a cleanly-stopped hub leaves no stale
       // self-probe verdict for `status` / `doctor` to read (hub#737 review).
       clearHubInstanceFile(CONFIG_DIR);

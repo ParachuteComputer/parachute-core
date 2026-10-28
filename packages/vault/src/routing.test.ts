@@ -144,6 +144,8 @@ function reset(): void {
   // the vault names these tests reuse so each test starts cache-cold.
   invalidateUsageCache("journal");
   invalidateUsageCache("other");
+  // A process-wide storage root from a sibling file would make every vault's assets one shared folder.
+  delete process.env.ASSETS_DIR;
   if (existsSync(testDir)) rmSync(testDir, { recursive: true, force: true });
   mkdirSync(testDir, { recursive: true });
   mkdirSync(join(testDir, "vault", "data"), { recursive: true });

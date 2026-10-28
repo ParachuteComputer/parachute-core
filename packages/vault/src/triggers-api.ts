@@ -86,7 +86,7 @@ export function loadVaultTriggers(vaultName: string, store: SqliteStore): number
   return triggers.length;
 }
 
-/** Test-only: clear the live registry (unregistering each hook). */
+/** Clear the live registry (unregistering each hook): tests, and a vault stopping inside a longer-lived process. */
 export function clearLiveTriggers(): void {
   for (const [, fn] of liveTriggers) {
     try {
