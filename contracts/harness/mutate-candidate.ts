@@ -82,7 +82,9 @@ for (const m of all.filter((m) => only.length === 0 || only.includes(m.name))) {
     };
     await buildCoreCandidate({ out: cand, staged, edit: { label: `${m.kind} ${m.name}`, apply }, ...(m.processModel ? { processModel: m.processModel } : {}) });
     if (m.processModel) console.log(`[${m.kind} ${m.name}] built as the ${m.processModel} path`);
-    child = Bun.spawn(["bun", "run", "harness/run-candidate.ts", ...m.suite.split(" ")], {
+    // focus: only the named contracts (a regex of their names, escaped), so a long suite file runs only what counts.
+    const focusArgs = m.kind === "mutant" && m.focus ? ["-t", m.catches.map((c) => c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")] : [];
+    child = Bun.spawn(["bun", "run", "harness/run-candidate.ts", ...m.suite.split(" "), ...focusArgs], {
       cwd: contracts,
       env: { ...process.env, CANDIDATE_DIR: cand, CANDIDATE_SHA256: "", CONTRACT_SHOW_LOGS: "0" },
       stdout: "pipe",
