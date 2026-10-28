@@ -40,10 +40,11 @@ export function processModel(env: NodeJS.ProcessEnv = process.env): ProcessModel
 
 /** A part failed to start (PLAN §3: exit 75). */
 export const EXIT_PART_FAILED = 75;
-/** Every stop step together, from the moment the stop is asked for. */
-const STOP_DEADLINE_MS = 8_000;
-/** What the parts after the hub keep for themselves out of the deadline. */
-const AFTER_HUB_MS = 3_500;
+/** Every stop step together, from the moment the stop is asked for (PLAN §3: exit within 10 s). */
+const STOP_DEADLINE_MS = 9_000;
+/** What the parts after the hub keep for themselves out of the deadline. The hub gets the rest: a request it is
+ *  still reading when the stop comes (a body arriving slowly) has that long to finish. */
+const AFTER_HUB_MS = 2_500;
 /** Keys the hub reads for itself that the vault's .env could set (see VaultPart.start). */
 const HUB_KEYS = ["PORT", "PARACHUTE_BIND_HOST", "PARACHUTE_HUB_ORIGIN", "PARACHUTE_HUB_ORIGINS", "PARACHUTE_HUB_JWKS_ORIGIN"] as const;
 
@@ -88,7 +89,7 @@ class Coordinator {
       console.error(`parachute serve: not stopped within ${STOP_DEADLINE_MS / 1000} s; exiting anyway`);
       this.closeAll();
       process.exit(code === 0 ? 1 : code);
-    }, STOP_DEADLINE_MS + 1_000);
+    }, STOP_DEADLINE_MS + 500);
     this.stopping = (async (): Promise<never> => {
       await Promise.race([this.step, Bun.sleep(left() - AFTER_HUB_MS)]);
       await this.stopParts(left);
@@ -153,6 +154,9 @@ class VaultPart {
   private hub: HubValues = {};
   /** Hub-read keys as the vault's .env file has them (a child read them over the hub's environment). */
   private fromEnvFile: Partial<Record<(typeof HUB_KEYS)[number], string>> = {};
+  /** Keys the vault's .env filled into the environment when it started: taken out again when it stops, so the next
+   *  start reads the file as it is then (a changed or removed setting), as a new child process did. */
+  private filled: string[] = [];
   private queue: Promise<unknown> = Promise.resolve();
 
   constructor(
@@ -177,6 +181,7 @@ class VaultPart {
       // The vault's .env fills unset environment keys when it starts. In one process that environment is the hub's
       // too, so the keys the hub reads for itself go back to what they were; the vault gets them as values instead.
       const before = Object.fromEntries(HUB_KEYS.map((k) => [k, process.env[k]]));
+      const unset = new Set(Object.keys(this.deps.readEnvFile()).filter((k) => process.env[k] === undefined));
       const file = this.deps.readEnvFile();
       this.fromEnvFile = Object.fromEntries(HUB_KEYS.filter((k) => file[k] !== undefined).map((k) => [k, file[k]]));
       try {
@@ -193,6 +198,7 @@ class VaultPart {
         this.failedAt = new Date().toISOString();
         throw err;
       } finally {
+        this.filled = [...unset].filter((k) => process.env[k] !== undefined && !(HUB_KEYS as readonly string[]).includes(k));
         for (const k of HUB_KEYS) {
           if (process.env[k] === before[k]) continue;
           if (before[k] === undefined) delete process.env[k];
@@ -210,6 +216,8 @@ class VaultPart {
       this.running = null;
       if (opts.onRequest) this.stoppedOnRequest = true;
       await v.stop({ reason: opts.onRequest ? "stop requested by the hub" : "serve stopping", deadline });
+      for (const k of this.filled) delete process.env[k];
+      this.filled = [];
     });
   }
 
@@ -381,12 +389,14 @@ export async function serveInProcess(args: string[]): Promise<never> {
 
   const { serve } = await import("@openparachute/hub/src/commands/serve.ts");
   try {
-    const hub = await coordinator.track(serve({ supervisor: new InProcessSupervisor() }));
+    // Children get 2 s after SIGTERM before SIGKILL (0.7: 5 s), so the hub's whole stop fits in its share of the
+    // coordinator's deadline (children at once, then its listener, bounded at 2 s).
+    const hub = await coordinator.track(serve({ supervisor: new InProcessSupervisor({ killTimeoutMs: 2_000 }) }));
     coordinator.add({
       name: "hub",
-      stop: async () => {
+      stop: async (deadline) => {
         hubStopping = true;
-        await hub.stop();
+        await hub.stop({ deadline });
       },
       // The hub's stop removes its instance file; if that stop never finished, this process's file goes here.
       close: (finished) => {
