@@ -4,14 +4,13 @@
 // Benjamin's suite checks secrets only; the plan says every file, so this checks every file.
 // Before lane B the CLIs created the databases and folders with the umask's 0644/0755. Lane B made the box case green
 // (umask 077 for every command, packages/cli/src/dispatch.ts) and repairs modes when serve --embedded starts; the
-// embedded cases are red until lane C's serve --embedded and lane E's bootstrap exist.
+// embedded cases are green since lane E's bootstrap (with lane C's serve --embedded).
 import { describe, expect, test } from "bun:test";
 import { chmodSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { cli, newHome, safeFetch } from "../candidate-lib.ts";
-import { red } from "../lib.ts";
-import { NO_BOOTSTRAP, embeddedHome, mint, modeProblems, must, serveEmbedded, snapshot, tail } from "./_lib.ts";
+import { bootstrap, embeddedHome, mint, modeProblems, must, serveEmbedded, snapshot, tail } from "./_lib.ts";
 
 describe("embedded/modes", () => {
   test("setup works today: the box CLI makes a home with hub.db and a vault", async () => {
@@ -33,9 +32,8 @@ describe("embedded/modes", () => {
     },
   );
 
-  red(
+  test(
     "embedded: after serve, bootstrap, vault create and a write, every folder is 0700 and every file 0600, -wal and -shm included",
-    { reason: NO_BOOTSTRAP, lane: "E (B's and C's parts are in)" },
     async () => {
       const home = newHome("modes");
       const e = await embeddedHome(home);
@@ -61,7 +59,20 @@ describe("embedded/modes", () => {
     },
   );
 
-  red("embedded: modes loosened while stopped are repaired on the next start", { reason: NO_BOOTSTRAP, lane: "E (B's and C's parts are in)" }, async () => {
+  test("embedded: modes loosened while stopped are repaired by the next bootstrap, before serve", async () => {
+    const home = newHome("modes");
+    const b = await bootstrap(home);
+    must(b.code === 0, `setup: bootstrap --embedded exited ${b.code}: ${tail(b.stderr)}`);
+    const loosen = [...snapshot(home).values()].filter((x) => (x.kind === "file" && /(\.db|\.token)$/.test(x.rel)) || (x.kind === "dir" && x.rel === "vault"));
+    must(loosen.length >= 2, `setup: nothing to loosen in ${readdirSync(home).join(", ")}`);
+    for (const x of loosen) chmodSync(join(home, x.rel), x.kind === "dir" ? 0o755 : 0o644);
+    const again = await bootstrap(home);
+    must(again.code === 0 && again.json?.created === false, `the second bootstrap exited ${again.code}: ${tail(again.stderr)}`);
+    const bad = modeProblems(home);
+    must(bad.length === 0, `not repaired by bootstrap: ${bad.slice(0, 10).join(", ")}`);
+  });
+
+  test("embedded: modes loosened while stopped are repaired on the next start", async () => {
     const home = newHome("modes");
     const first = await embeddedHome(home);
     await first.stop();

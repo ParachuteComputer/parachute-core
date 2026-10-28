@@ -9,7 +9,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { cli, freePort, newHome, safeFetch, start, until, allowOrigins } from "../candidate-lib.ts";
-import { diff, servedHome, exitWithin, must, snapshot, tail } from "./_lib.ts";
+import { diff, embeddedHome, exitWithin, must, snapshot, tail } from "./_lib.ts";
 
 const REFUSED_COMMANDS = [
   ["install", "vault"],
@@ -46,7 +46,7 @@ describe("embedded/refusals", () => {
   });
 
   test("while serve --embedded holds the home, parachute-vault serve exits 2 with managed_by_host", async () => {
-    const e = await servedHome(newHome("refuse"));
+    const e = await embeddedHome(newHome("refuse"));
     try {
       const port = await freePort([e.hubPort, e.vaultPort]);
       const s = start(e.home, ["serve"], { vault: true, env: { PORT: String(port) } });
@@ -61,7 +61,7 @@ describe("embedded/refusals", () => {
 
   test(
     "while serve --embedded holds the home, install, upgrade, expose, migrate and module commands exit 2 with managed_by_host and change nothing", async () => {
-      const e = await servedHome(newHome("refuse"));
+      const e = await embeddedHome(newHome("refuse"));
       try {
         const services = () => {
           try {
@@ -90,7 +90,7 @@ describe("embedded/refusals", () => {
 
   test(
     "while serve --embedded holds the home, install/upgrade/module routes answer 409 managed_by_host, even to the operator", async () => {
-      const e = await servedHome(newHome("refuse"));
+      const e = await embeddedHome(newHome("refuse"));
       try {
         const operator = readFileSync(e.boot.operator_token_file, "utf8").trim();
         for (const [method, path] of REFUSED_ROUTES) {

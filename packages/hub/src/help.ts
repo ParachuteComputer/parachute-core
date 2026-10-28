@@ -720,6 +720,8 @@ export function serveHelp(): string {
 
 Usage:
   parachute serve [--listen <host>:<port>] [--parent-pid <pid>] [--offline]
+  parachute serve --embedded [--home <dir>] [--listen 127.0.0.1:<port>]
+                  [--vault-listen 127.0.0.1:<port>] [--offline] [--parent-pid <pid>]
 
 Flags:
   --listen <host>:<port>            bind address and port (default 127.0.0.1,
@@ -733,6 +735,13 @@ Flags:
                                     download, outbound webhook or mirror push
                                     (sets PARACHUTE_OFFLINE=1 for the hub and
                                     every module it starts)
+  --embedded                        for a host application (Prism): one
+                                    process with its vault, in the host's home,
+                                    on 127.0.0.1 only, offline, managed by the
+                                    host. Set it up with
+                                    \`parachute bootstrap --embedded\`.
+  --vault-listen 127.0.0.1:<port>   (embedded) the vault's port (default the
+                                    home's vault/config.yaml, then 1940)
 
 This is the one runtime everywhere. The hub IS the foreground process: it
 runs the HTTP server on port 1939 AND an in-process supervisor that spawns

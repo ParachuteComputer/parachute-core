@@ -7,13 +7,12 @@
 //   - `parachute auth revoke-token <jti> --json` → {revoked: true, jti};
 //   - `parachute-vault create <name> --mint --scope write --no-mirror --json` → {name, token, …}, the token signed by
 //     the hub with iss = PARACHUTE_HUB_ORIGIN and scoped to that vault.
-// Lane B turned mint and revoke green. Provisioning while embedded waits on lane C's serve --embedded and lane E's
-// bootstrap (it is red with NO_BOOTSTRAP until then; serve --embedded is in since lane C).
+// Lane B turned mint and revoke green. Provisioning while embedded is green since lane E's bootstrap (with lane C's
+// serve --embedded).
 import { describe, expect, test } from "bun:test";
 import { randomBytes } from "node:crypto";
 import { cli, freePort, newHome } from "../candidate-lib.ts";
-import { red } from "../lib.ts";
-import { NO_BOOTSTRAP, claims, embeddedHome, json, must, readNotes, tail } from "./_lib.ts";
+import { claims, embeddedHome, json, must, readNotes, tail } from "./_lib.ts";
 
 /** A box-mode home with a first account and an operator token, made with the CLI alone (no server needed). */
 async function operatorHome(env?: Record<string, string>) {
@@ -82,9 +81,8 @@ describe("embedded/json", () => {
     },
   );
 
-  red(
+  test(
     "parachute-vault create --mint --scope write --no-mirror --json, run while serve --embedded holds the home, prints a write token the vault accepts",
-    { reason: NO_BOOTSTRAP, lane: "E (B's and C's parts are in)" },
     async () => {
       // Prism provisions vaults this way through PARACHUTE_VAULT_BIN while Parachute runs (vault-provision.ts:31-39).
       const home = newHome("json");

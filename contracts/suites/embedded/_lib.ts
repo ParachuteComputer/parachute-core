@@ -1,16 +1,13 @@
 // What the embedded/ contracts share: start `serve --embedded` on ports we choose, read its files, hash a home,
 // check modes, and run a stock box in a network of its own. Black box only: the candidate's bin/parachute and
 // bin/parachute-vault, HTTP, and the files a host is allowed to read (ready.json, embedded.json, the token file).
-import { createHash, randomBytes } from "node:crypto";
+import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { allowOrigins, candidate, cli, oldStockDir, freePort, safeFetch, start, until, type Served } from "../candidate-lib.ts";
 import { must } from "../lib.ts";
 
 export { must };
-
-/** Today's `parachute bootstrap` doesn't exist: `parachute: unknown command "bootstrap"`. */
-export const NO_BOOTSTRAP = /unknown command "bootstrap"/;
 
 /** The claims of a JWT, without verifying it (the vault does that). */
 export function claims(token: string): any {
@@ -274,34 +271,6 @@ export async function embeddedHome(
   return { ...e, vaultName: vault, boot: b.json };
 }
 
-/**
- * `serve --embedded`, then a home set up the way Benjamin's suite does it while bootstrap is missing (run.mjs
- * 330-395): `auth set-password` (a made-up password), `auth rotate-operator`, `parachute-vault create <vault>
- * --no-mirror`. For lane C's contracts, where the host's setup is not what they test; `bootstrap --embedded` is
- * lane E's (embedded/bootstrap), and lane E switches these back to embeddedHome() when it lands.
- * Returns the same shape as embeddedHome(): `boot.operator_token_file` is the operator token's path.
- */
-export async function servedHome(
-  home: string,
-  opts: { vault?: string; hubPort?: number; vaultPort?: number; env?: Record<string, string>; args?: string[] } = {},
-) {
-  const e = await serveEmbedded(home, opts);
-  const vault = opts.vault ?? "default";
-  const steps: [string[], boolean][] = [
-    [["auth", "set-password", "--username", "owner", "--password", `pw-${randomBytes(12).toString("hex")}`], false],
-    [["auth", "rotate-operator"], false],
-    [["create", vault, "--no-mirror", "--json"], true],
-  ];
-  for (const [args, vaultCli] of steps) {
-    const r = await cli(home, args, { env: opts.env, vault: vaultCli });
-    if (r.code !== 0) {
-      await e.stop();
-      must(false, `setup: ${vaultCli ? "parachute-vault" : "parachute"} ${args[0]} ${args[1] ?? ""} exited ${r.code}: ${tail(r.stderr || r.stdout)}`);
-    }
-  }
-  return { ...e, vaultName: vault, boot: { operator_token_file: join(home, "operator.token") } };
-}
-
 /** `auth mint-token --scope <scope> --json` → the parsed `{token, jti, exp, scopes, aud}`. */
 export async function mint(home: string, scope: string, extra: string[] = [], env?: Record<string, string>) {
   const r = await cli(home, ["auth", "mint-token", "--scope", scope, ...extra, "--json"], { env });
@@ -326,4 +295,24 @@ export async function mintJwt(home: string, scope: string, extra: string[] = [],
 export async function readNotes(vaultOrigin: string, vaultName: string, token: string) {
   const r = await safeFetch(`${vaultOrigin}/vault/${vaultName}/api/notes?limit=1`, { headers: { authorization: `Bearer ${token}` } });
   return { status: r.status, text: (await r.text()).slice(0, 300) };
+}
+
+/**
+ * Sign in at the hub's /login form with a username and password, as a person does in the browser (the same posts as
+ * suites/oauth.ts). True when the hub answers with a session cookie.
+ */
+export async function signIn(hub: string, username: string, password: string): Promise<boolean> {
+  const cookie = (r: Response, name: string) => {
+    for (const c of r.headers.getSetCookie()) if (c.startsWith(`${name}=`)) return c.split(";")[0]!.slice(name.length + 1);
+  };
+  const page = await safeFetch(`${hub}/login`, { redirect: "manual" });
+  const csrf = cookie(page, "parachute_hub_csrf");
+  const field = (await page.text()).match(/name="__csrf"\s+value="([^"]+)"/)?.[1];
+  const login = await safeFetch(`${hub}/login`, {
+    method: "POST",
+    redirect: "manual",
+    headers: { "content-type": "application/x-www-form-urlencoded", cookie: `parachute_hub_csrf=${csrf}` },
+    body: new URLSearchParams({ __csrf: field ?? csrf ?? "", username, password }),
+  });
+  return cookie(login, "parachute_hub_session") !== undefined;
 }

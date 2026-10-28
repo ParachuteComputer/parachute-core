@@ -4709,6 +4709,17 @@ interface VaultCredential {
  * reachable, return `token: null` plus explicit standalone guidance. There is
  * no local pvt_* fallback anymore.
  */
+/** Where a running `serve --embedded` on this home has its hub (`run/ready.json` listen), if one does. */
+function embeddedHubListen(): string | undefined {
+  try {
+    const ready = JSON.parse(readFileSync(join(CONFIG_DIR, "run", "ready.json"), "utf8")) as { listen?: unknown };
+    if (!existsSync(join(CONFIG_DIR, "embedded.json")) || typeof ready.listen !== "string") return undefined;
+    return /^127\.0\.0\.1:\d{1,5}$/.test(ready.listen) ? `http://${ready.listen}` : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 async function mintBootstrapCredential(
   name: string,
   verb: "read" | "write" = "read",
@@ -4734,7 +4745,10 @@ async function mintBootstrapCredential(
     };
   }
   const port = readGlobalConfig().port || DEFAULT_PORT;
-  const hub = chooseHubOrigin(port);
+  // An embedded home (v0.8 PLAN §3): the running `serve --embedded` says where its hub listens, whatever issuer
+  // the host chose (PARACHUTE_HUB_ORIGIN need not be that address, and may be unset), so the mint goes there.
+  const embeddedHub = embeddedHubListen();
+  const hub = embeddedHub ? { url: embeddedHub, source: "embedded" as const } : chooseHubOrigin(port);
   if (hub.source === "loopback") {
     return {
       token: null,

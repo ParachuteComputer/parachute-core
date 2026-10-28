@@ -4,14 +4,13 @@
 //   - its suite: --username compat --password-file <f> --vault compat, while serve --embedded runs (run.mjs:334).
 // --vault defaults to `default`, --username to `owner`; a second run says created:false and changes nothing; the
 // operator token goes to a 0600 file returned by path and is never printed; no git mirror is made.
-// Today there is no `bootstrap` command. Lane E turns these green.
+// Green since lane E (packages/cli/src/bootstrap.ts).
 import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { cli, newHome } from "../candidate-lib.ts";
-import { red } from "../lib.ts";
-import { NO_BOOTSTRAP, bootstrap, claims, diff, mint, must, readNotes, serveEmbedded, snapshot, tail } from "./_lib.ts";
+import { bootstrap, claims, diff, json, mint, must, readNotes, serveEmbedded, signIn, snapshot, tail } from "./_lib.ts";
 
 /** The checks every successful first bootstrap must pass. */
 function checkFirstRun(home: string, b: Awaited<ReturnType<typeof bootstrap>>, want: { admin: string; vault: string }) {
@@ -37,9 +36,8 @@ describe("embedded/bootstrap", () => {
     expect((await cli(newHome("boot"), ["--version"])).code).toBe(0);
   });
 
-  red(
+  test(
     "Prism's installer: bootstrap --embedded --json with no password, before serve, makes owner and vault `default`; serve then serves it",
-    { reason: NO_BOOTSTRAP, lane: "E" },
     async () => {
       const home = newHome("boot");
       const b = await bootstrap(home);
@@ -49,23 +47,33 @@ describe("embedded/bootstrap", () => {
         const t = await mint(home, "vault:default:write");
         const got = await readNotes(e.vault, "default", t.token);
         must(got.status === 200, `vault default refused a fresh token: HTTP ${got.status} ${got.text}`);
+        // Prism's server then provisions vaults with the operator token bootstrap wrote before serve chose its
+        // port (prism apps/server/src/vault-provision.ts): that token must still be good to the running hub.
+        const p = await cli(home, ["create", "prov", "--mint", "--scope", "write", "--no-mirror", "--json"], { vault: true });
+        const pj = json(p.stdout);
+        must(p.code === 0 && typeof pj?.token === "string" && pj.token.split(".").length === 3, `provisioning with the operator token from before serve minted nothing: ${tail(String(pj?.token_guidance ?? p.stderr), 300)}`);
+        const prov = await readNotes(e.vault, "prov", pj.token);
+        must(prov.status === 200, `the provisioned vault refused its token: HTTP ${prov.status} ${prov.text}`);
       } finally {
         await e.stop();
       }
     },
   );
 
-  red(
+  test(
     "Prism's suite: bootstrap --embedded --username --password-file --vault --json, while serve runs, makes that account and vault",
-    { reason: NO_BOOTSTRAP, lane: "E" },
     async () => {
       const home = newHome("boot");
       const e = await serveEmbedded(home);
       try {
         const pwFile = join(home, "..", "admin-password");
-        writeFileSync(pwFile, `pw-${randomBytes(12).toString("hex")}`, { mode: 0o600 });
+        const password = `pw-${randomBytes(12).toString("hex")}`;
+        writeFileSync(pwFile, `${password}\n`, { mode: 0o600 });
         const b = await bootstrap(home, ["--username", "compat", "--password-file", pwFile, "--vault", "compat"]);
         checkFirstRun(home, b, { admin: "compat", vault: "compat" });
+        // The password in the file (less its newline) is the account's: it signs in, and another doesn't.
+        must(await signIn(e.hub, "compat", password), "signing in with the password from --password-file failed");
+        must(!(await signIn(e.hub, "compat", `${password}x`)), "a wrong password signed in");
         const users = await cli(home, ["auth", "list-users"]);
         must(users.code === 0 && /compat/.test(users.stdout), `auth list-users doesn't show compat: ${tail(users.stdout || users.stderr)}`);
         const t = await mint(home, "vault:compat:write");
@@ -77,9 +85,34 @@ describe("embedded/bootstrap", () => {
     },
   );
 
-  red(
+  test("a damaged operator token is not kept: the next bootstrap writes one the running hub accepts", async () => {
+    const home = newHome("boot");
+    const first = await bootstrap(home);
+    checkFirstRun(home, first, { admin: "owner", vault: "default" });
+    const file = first.json.operator_token_file;
+    const token = readFileSync(file, "utf8").trim();
+    // A careless edit or a bad copy: one byte of the signature changed. (Not its last base64url character, whose low
+    // bits can be padding the decoder ignores, which would leave the signature valid; Codex round 3.)
+    const [head, body, sig] = token.split(".");
+    const bytes = Buffer.from(sig!, "base64url");
+    bytes[0] = bytes[0]! ^ 0xff;
+    const damaged = `${head}.${body}.${bytes.toString("base64url")}`;
+    writeFileSync(file, `${damaged}\n`, { mode: 0o600 });
+    const again = await bootstrap(home);
+    must(again.code === 0 && again.json?.created === false, `second bootstrap exited ${again.code}: ${tail(again.stderr || again.stdout)}`);
+    must(readFileSync(file, "utf8").trim() !== damaged, "bootstrap kept a damaged operator token");
+    const e = await serveEmbedded(home);
+    try {
+      const p = await cli(home, ["create", "prov", "--mint", "--scope", "write", "--no-mirror", "--json"], { vault: true });
+      const pj = json(p.stdout);
+      must(p.code === 0 && typeof pj?.token === "string" && pj.token.split(".").length === 3, `provisioning with the replaced operator token minted nothing: ${tail(String(pj?.token_guidance ?? p.stderr), 300)}`);
+    } finally {
+      await e.stop();
+    }
+  });
+
+  test(
     "a second bootstrap reports created:false, keeps the operator token, and changes nothing in the home",
-    { reason: NO_BOOTSTRAP, lane: "E" },
     async () => {
       const home = newHome("boot");
       const first = await bootstrap(home);

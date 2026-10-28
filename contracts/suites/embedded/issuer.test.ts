@@ -17,7 +17,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { cli, freePort, newHome } from "../candidate-lib.ts";
-import { claims, servedHome, embeddedJson, inOwnNetwork, mintJwt, must, readNotes, readyJson, serveEmbedded, tail } from "./_lib.ts";
+import { claims, embeddedHome, embeddedJson, inOwnNetwork, mintJwt, must, readNotes, readyJson, serveEmbedded, tail } from "./_lib.ts";
 
 /** A first hub account, the way a box makes one from a script (stock `auth set-password` takes --password off a TTY). */
 const firstUser = (home: string, env?: Record<string, string>) =>
@@ -60,7 +60,7 @@ describe("embedded/issuer", () => {
       // Any origin the host chooses; not the port it listens on.
       const origin = `http://127.0.0.1:${await freePort([hubPort])}`;
       const env = { PARACHUTE_HUB_ORIGIN: origin };
-      const e = await servedHome(home, { hubPort, env });
+      const e = await embeddedHome(home, { hubPort, env });
       try {
         must(readyJson(home)?.issuer === origin, `ready.json issuer is ${readyJson(home)?.issuer}, want ${origin}`);
         must(operatorIss(home) === origin, `operator.token iss is ${operatorIss(home)}, want ${origin}`);
@@ -78,7 +78,7 @@ describe("embedded/issuer", () => {
   test(
     "embedded, no PARACHUTE_HUB_ORIGIN: the issuer is http://127.0.0.1:<hub port> on every start, and tokens from an earlier port still verify", async () => {
       const home = newHome("iss");
-      const first = await servedHome(home);
+      const first = await embeddedHome(home);
       const firstIss = `http://127.0.0.1:${first.hubPort}`;
       let old: string;
       try {
@@ -115,7 +115,7 @@ describe("embedded/issuer", () => {
       const exposeState = JSON.stringify({ hubOrigin: "https://planted.example.test", canonicalFqdn: "planted.example.test" });
       writeFileSync(join(home, "expose-state.json"), exposeState, { mode: 0o600 });
       writeFileSync(join(home, "hub", "run", "hub.port"), "47001\n", { mode: 0o600 });
-      const e = await servedHome(home);
+      const e = await embeddedHome(home);
       try {
         const want = `http://127.0.0.1:${e.hubPort}`;
         must(readyJson(home)?.issuer === want, `ready.json issuer is ${readyJson(home)?.issuer}, want ${want}`);
