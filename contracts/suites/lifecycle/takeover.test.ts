@@ -409,8 +409,10 @@ describe("takeover", () => {
     const again = await core(m, ["takeover", "--home", m.home, "--yes", "--json"]);
     must(again.code === 0, `takeover after the cut exited ${again.code}: ${again.stderr.slice(-800)}`);
     expect(again.stderr).toContain("was interrupted");
-    expect(await until(() => orphan.proc.exitCode !== null, 10_000, 100)).toBe(true);
-    expect(stranger.proc.exitCode).toBeNull();
+    // Stopped by a signal: Bun then reports signalCode, and exitCode stays null.
+    const ended = (p: typeof orphan) => p.proc.exitCode !== null || p.proc.signalCode !== null;
+    expect(await until(() => ended(orphan), 10_000, 100)).toBe(true);
+    expect(ended(stranger)).toBe(false);
     await stranger.stop();
     const record = JSON.parse(readFileSync(join(m.home, "takeover.json"), "utf8"));
     expect({ state: record.state, paused: record.paused.map((u: { name: string }) => u.name), core_unit: record.core_unit }).toEqual({ state: "taken-over", paused: [HUB_UNIT], core_unit: "parachute-core.service" });
