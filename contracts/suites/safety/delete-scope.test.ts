@@ -1,14 +1,15 @@
 // Fix 7 (G5): a live subscriber hears about a delete only if it could see the note.
 //
-// Today every delete goes to every live subscriber of the vault as `remove{id}`, whatever the subscriber's tags
-// (vault src/subscriptions.ts:315-321: "Thin ref — un-scope-matchable. Broadcast remove{id}"), so a tag-scoped
-// socket learns the id of every hidden note that is deleted. PLAN §5 fix 7, §7.5 mutant "G5: the delete broadcast".
-// Lane F.
+// Before the fix (vault 42fbf93) every delete went to every live subscriber of the vault as `remove{id}`, whatever
+// the subscriber's tags (src/subscriptions.ts:315-321: "Thin ref — un-scope-matchable. Broadcast remove{id}"), so a
+// tag-scoped socket learned the id of every hidden note that was deleted. Fixed by lane F in
+// packages/vault (core/src/store.ts, src/subscriptions.ts): the delete event carries the note's tags and goes only to subscribers whose
+// scope covered them. Mutant "g5-delete-broadcast" puts the bug back. PLAN §5 fix 7, §7.5.
 //
 // Spoken black-box: a WebSocket to <vault>/api/subscribe through the hub, first message {"type":"auth","token"},
 // a snapshot until done:true, then upsert/remove frames (vault src/ws-subscribe.ts, src/ws-server.ts).
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { must, operator, red, runId } from "../lib.ts";
+import { must, operator, runId } from "../lib.ts";
 import { note, pass, subscribe, type LiveSocket } from "./_lib.ts";
 
 const op = operator();
@@ -51,7 +52,7 @@ describe("delete events reach only those who could see the note (fix 7)", () => 
     expect(ws.frames.some((f) => f.type === "remove" && f.id === visible)).toBe(true);
   });
 
-  red("a tag-scoped subscriber receives no delete event for a note outside its tags", { reason: /received the delete of a hidden note/, lane: "F" }, async () => {
+  test("a tag-scoped subscriber receives no delete event for a note outside its tags", async () => {
     const ws = await live();
     const { hidden } = await deleteBoth(ws, "hidden");
     const leaked = ws.frames.filter((f) => JSON.stringify(f).includes(hidden));

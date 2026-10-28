@@ -115,7 +115,7 @@ one that now passes.
 `packages/cli` in a copy, rebuilds the core candidate, and requires the named contracts to go red
 (`harness/mutants.ts`). **Flips** go the other way: a small fix to today's code that must turn
 named `red()` contracts "now green". A contract that is red today and green under the fix has a red/green proof
-that it tests the fix.
+that it tests the fix. When the real fix lands, its flip becomes mutants that put each bug back.
 
 ## The contracts
 
@@ -128,7 +128,7 @@ that it tests the fix.
 | `today/consumer-connector.test.ts` | **The consumer connector**, end to end, as a consumer AI app does it: MCP 401 → protected-resource metadata → server metadata → dynamic registration → sign in and consent → PKCE code → token. Then it writes, searches, reads and updates over MCP with the official SDK. It refreshes the token, and checks that replaying a used refresh token after the 30-second retry window ends the session. A read-only approval can't write. A forged token gets 401. |
 | `compat/prism.test.ts` | **What Prism relies on**, from its code: passes as it mints them, its JWT check, REST shapes and 409/428s, tag-schema rights, MCP tools per scope against its allowlists, revocation. Green today; must stay green. Candidate only. |
 | `compat/uni.test.ts` | **One probe per client of uni's box** (`uni-writers.json`: call shapes only), NIP-98 in both shapes, single-use events and tickets, one process per `vault.db`, config files unchanged across a restart. Green today. Candidate only. |
-| `safety/*.test.ts` | **Fixes 2, 5–8, 13–15** (PLAN §5): loopback by default, `/view` scope, scoped writes add no outside or private tag, deletes only to subscribers who could see the note, search scores leak nothing, a mint never widens, unknown permission keys refused. Red today; each moves to `today/` when fixed. |
+| `safety/*.test.ts` | **Fixes 2, 5–8, 13–15** (PLAN §5): loopback by default, `/view` scope, scoped writes attach or detach no tag the pass can't read and can't publish (REST and MCP), every reference resolves among the notes the caller may read, deletes only to subscribers who could see the note, search answers that don't depend on hidden notes, a mint never widens, unknown permission keys refused. Fixes 5–8 and 13–15 are green on the core build (lane F, in `packages/vault` and `packages/hub`) and red on the stock build (`CANDIDATE_DIR=.cache/candidate-stock`); loopback (fix 2) is still red, lane C. They stay here, not in `today/`, because `today/` runs against the pinned stock code. |
 | `embedded/*.test.ts` | **Embedded mode for Prism** (PLAN §3): serve, issuer (fix 1), JSON outputs, newer data (fix 4), modes (fix 3), bootstrap, refusals, ready and stop, offline (outbound trap), rollback to stock, hostile local callers. Red today, except issuer's CLI and box tests and `version --json` (green on the core build). |
 | `lifecycle/shutdown.test.ts` | **One shutdown coordinator** (PLAN §2.2, §7.4): every stop path keeps acknowledged writes, checkpoints the WAL, closes every port and removes its run files. |
 | `lifecycle/takeover.test.ts` | **First-run takeover** (PLAN §8.0): detect, dry run, backup, refuse while an old process holds the data, pause old units, same data, rollback. Red today. |
