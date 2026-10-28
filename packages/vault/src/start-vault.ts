@@ -29,7 +29,7 @@ import { startAttachmentTicketSweep, stopAttachmentTicketSweep } from "./attachm
 import { seedOnboardingNotesBestEffort } from "./onboarding-seed.ts";
 import { defaultHookRegistry } from "../core/src/hooks.ts";
 import { registerTriggers } from "./triggers.ts";
-import { loadVaultTriggers } from "./triggers-api.ts";
+import { clearLiveTriggers, loadVaultTriggers } from "./triggers-api.ts";
 import { route } from "./routing.ts";
 import { startTranscriptionWorker, registerTranscriptionHook, type TranscriptionWorker } from "./transcription-worker.ts";
 import { setTranscriptionWorker } from "./transcription-registry.ts";
@@ -144,8 +144,9 @@ export interface RunningVault {
   /** When the listener came up (ISO). */
   startedAt: string;
   /**
-   * Stop: drain the mirror managers, hooks and workers (5 s at most), stop the listener (requests in flight finish
-   * first, until `deadline` ms), then close every vault database, which checkpoints its WAL. Safe to call twice.
+   * Stop within `deadline` ms (default 5000): the listener first (requests in flight finish; whatever is still open at
+   * 40% of the deadline is closed), then drain the mirror managers, hooks and workers until shortly before the
+   * deadline, then close every vault database, which checkpoints its WAL. Safe to call twice.
    */
   stop(opts?: { reason?: string; deadline?: number }): Promise<void>;
 }
@@ -165,13 +166,15 @@ export async function startVault(opts: StartVaultOptions = {}): Promise<RunningV
 
   const stop = (stopOpts: { reason?: string; deadline?: number } = {}): Promise<void> =>
     (stopping ??= (async () => {
+      const deadline = stopOpts.deadline ?? 5_000;
+      const t0 = Date.now();
       if (stopTimer) clearInterval(stopTimer);
       console.log(`\n[${stopOpts.reason ?? "stop"}] vault shutting down; in-flight hooks: ${defaultHookRegistry.inFlightCount}`);
       // Stop taking requests first and let the ones in flight finish (bounded), then drain what they set off.
       if (server) {
         const s = server;
         const graceful = s.stop(false).then(() => true, () => true);
-        const inTime = await Promise.race([graceful, Bun.sleep(stopOpts.deadline ?? 5_000).then(() => false)]);
+        const inTime = await Promise.race([graceful, Bun.sleep(deadline * 0.4).then(() => false)]);
         if (!inTime) {
           console.warn("[shutdown] requests still open at the deadline; closing them");
           await s.stop(true);
@@ -188,8 +191,8 @@ export async function startVault(opts: StartVaultOptions = {}): Promise<RunningV
       //   2. Then drain hooks + stop the transcription worker in parallel —
       //      neither depends on the other.
       //
-      // The whole thing races a 5s timeout so a stuck handler doesn't hang
-      // shutdown indefinitely.
+      // The whole thing races what is left of the deadline so a stuck handler
+      // doesn't hang shutdown indefinitely.
       try {
         await Promise.race([
           (async () => {
@@ -212,7 +215,8 @@ export async function startVault(opts: StartVaultOptions = {}): Promise<RunningV
               transcriptionWorker?.stop() ?? Promise.resolve(),
             ]);
           })(),
-          new Promise<void>((resolve) => setTimeout(resolve, 5000)),
+          // What is left of the deadline, keeping a moment for the databases.
+          Bun.sleep(Math.max(100, deadline - (Date.now() - t0) - 300)),
         ]);
       } catch (err) {
         console.error("[shutdown] drain error:", err);
@@ -549,6 +553,7 @@ export async function startVault(opts: StartVaultOptions = {}): Promise<RunningV
       if (totalTriggers === 0) {
         console.log("[triggers] no persisted runtime triggers");
       }
+      undo.push(() => clearLiveTriggers());
     }
 
     const globalConfig = readGlobalConfig();

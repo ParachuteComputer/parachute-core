@@ -870,7 +870,10 @@ export async function serve(opts: ServeOpts = {}): Promise<{
       // Both sockets come down. Leaving the guard bound after a restart would
       // make the hub's own next boot race itself for 127.0.0.1:<port>.
       await loopbackGuard?.stop();
-      await server.stop();
+      // Requests in flight finish; whatever is still open after 3 s (a bridged WebSocket, a request stuck upstream)
+      // is closed, so the rest of this stop always runs (v0.8 PLAN §2.2).
+      const drained = await Promise.race([server.stop().then(() => true, () => true), Bun.sleep(3_000).then(() => false)]);
+      if (!drained) await server.stop(true);
       // Clear our on-disk identity so a cleanly-stopped hub leaves no stale
       // self-probe verdict for `status` / `doctor` to read (hub#737 review).
       clearHubInstanceFile(CONFIG_DIR);

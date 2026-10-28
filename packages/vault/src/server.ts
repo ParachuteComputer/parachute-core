@@ -11,7 +11,8 @@ let stopping = false;
 async function shutdown(signal: string): Promise<void> {
   if (stopping) return;
   stopping = true;
-  await vault.stop({ reason: signal, deadline: 3_000 });
+  // Within the hub supervisor's 5 s before it escalates to SIGKILL (hub src/supervisor.ts).
+  await vault.stop({ reason: signal, deadline: 4_000 });
   process.exit(0);
 }
 
