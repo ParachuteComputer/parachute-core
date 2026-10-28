@@ -10,7 +10,7 @@ import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { cli, newHome } from "../candidate-lib.ts";
-import { bootstrap, claims, diff, json, mint, must, readNotes, serveEmbedded, snapshot, tail } from "./_lib.ts";
+import { bootstrap, claims, diff, json, mint, must, readNotes, serveEmbedded, signIn, snapshot, tail } from "./_lib.ts";
 
 /** The checks every successful first bootstrap must pass. */
 function checkFirstRun(home: string, b: Awaited<ReturnType<typeof bootstrap>>, want: { admin: string; vault: string }) {
@@ -67,9 +67,13 @@ describe("embedded/bootstrap", () => {
       const e = await serveEmbedded(home);
       try {
         const pwFile = join(home, "..", "admin-password");
-        writeFileSync(pwFile, `pw-${randomBytes(12).toString("hex")}`, { mode: 0o600 });
+        const password = `pw-${randomBytes(12).toString("hex")}`;
+        writeFileSync(pwFile, `${password}\n`, { mode: 0o600 });
         const b = await bootstrap(home, ["--username", "compat", "--password-file", pwFile, "--vault", "compat"]);
         checkFirstRun(home, b, { admin: "compat", vault: "compat" });
+        // The password in the file (less its newline) is the account's: it signs in, and another doesn't.
+        must(await signIn(e.hub, "compat", password), "signing in with the password from --password-file failed");
+        must(!(await signIn(e.hub, "compat", `${password}x`)), "a wrong password signed in");
         const users = await cli(home, ["auth", "list-users"]);
         must(users.code === 0 && /compat/.test(users.stdout), `auth list-users doesn't show compat: ${tail(users.stdout || users.stderr)}`);
         const t = await mint(home, "vault:compat:write");
@@ -80,6 +84,28 @@ describe("embedded/bootstrap", () => {
       }
     },
   );
+
+  test("a damaged operator token is not kept: the next bootstrap writes one the running hub accepts", async () => {
+    const home = newHome("boot");
+    const first = await bootstrap(home);
+    checkFirstRun(home, first, { admin: "owner", vault: "default" });
+    const file = first.json.operator_token_file;
+    const token = readFileSync(file, "utf8").trim();
+    // A careless edit or a bad copy: the signature's last character changed.
+    const damaged = token.slice(0, -1) + (token.endsWith("A") ? "B" : "A");
+    writeFileSync(file, `${damaged}\n`, { mode: 0o600 });
+    const again = await bootstrap(home);
+    must(again.code === 0 && again.json?.created === false, `second bootstrap exited ${again.code}: ${tail(again.stderr || again.stdout)}`);
+    must(readFileSync(file, "utf8").trim() !== damaged, "bootstrap kept a damaged operator token");
+    const e = await serveEmbedded(home);
+    try {
+      const p = await cli(home, ["create", "prov", "--mint", "--scope", "write", "--no-mirror", "--json"], { vault: true });
+      const pj = json(p.stdout);
+      must(p.code === 0 && typeof pj?.token === "string" && pj.token.split(".").length === 3, `provisioning with the replaced operator token minted nothing: ${tail(String(pj?.token_guidance ?? p.stderr), 300)}`);
+    } finally {
+      await e.stop();
+    }
+  });
 
   test(
     "a second bootstrap reports created:false, keeps the operator token, and changes nothing in the home",

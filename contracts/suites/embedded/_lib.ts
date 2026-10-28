@@ -296,3 +296,23 @@ export async function readNotes(vaultOrigin: string, vaultName: string, token: s
   const r = await safeFetch(`${vaultOrigin}/vault/${vaultName}/api/notes?limit=1`, { headers: { authorization: `Bearer ${token}` } });
   return { status: r.status, text: (await r.text()).slice(0, 300) };
 }
+
+/**
+ * Sign in at the hub's /login form with a username and password, as a person does in the browser (the same posts as
+ * suites/oauth.ts). True when the hub answers with a session cookie.
+ */
+export async function signIn(hub: string, username: string, password: string): Promise<boolean> {
+  const cookie = (r: Response, name: string) => {
+    for (const c of r.headers.getSetCookie()) if (c.startsWith(`${name}=`)) return c.split(";")[0]!.slice(name.length + 1);
+  };
+  const page = await safeFetch(`${hub}/login`, { redirect: "manual" });
+  const csrf = cookie(page, "parachute_hub_csrf");
+  const field = (await page.text()).match(/name="__csrf"\s+value="([^"]+)"/)?.[1];
+  const login = await safeFetch(`${hub}/login`, {
+    method: "POST",
+    redirect: "manual",
+    headers: { "content-type": "application/x-www-form-urlencoded", cookie: `parachute_hub_csrf=${csrf}` },
+    body: new URLSearchParams({ __csrf: field ?? csrf ?? "", username, password }),
+  });
+  return cookie(login, "parachute_hub_session") !== undefined;
+}

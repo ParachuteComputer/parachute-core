@@ -21,6 +21,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
+import type { Database } from "bun:sqlite";
 
 const VAULT_CLI = fileURLToPath(new URL("./parachute-vault.ts", import.meta.url));
 const DEFAULT_USERNAME = "owner";
@@ -205,19 +206,23 @@ type HubModules = {
   users: typeof import("@openparachute/hub/src/users.ts");
   op: typeof import("@openparachute/hub/src/operator-token.ts");
   embedded: typeof import("@openparachute/hub/src/embedded-home.ts");
+  jwt: typeof import("@openparachute/hub/src/jwt-sign.ts");
   vaultName: typeof import("@openparachute/vault/src/vault-name.ts");
 };
 
-/** Is the operator token on disk one we can hand back: this account's, an operator token, not near expiry, from an accepted issuer? */
-function usableOperatorToken(home: string, userId: string, issuer: string, m: HubModules): boolean {
+/**
+ * Is the operator token on disk one we can hand back: signed by this hub's keys, not revoked, this account's, an
+ * operator token, from this issuer, and not near expiry? A damaged or revoked one is replaced (Codex round 2).
+ */
+async function usableOperatorToken(db: Database, home: string, userId: string, issuer: string, m: HubModules): Promise<boolean> {
   const path = join(home, m.op.OPERATOR_TOKEN_FILENAME);
   if (!existsSync(path)) return false;
   try {
     const token = readFileSync(path, "utf8").trim();
-    const claims = JSON.parse(Buffer.from(token.split(".")[1] ?? "", "base64url").toString("utf8"));
+    const { payload: claims } = await m.jwt.validateAccessToken(db, token, issuer);
     const aud = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
     const left = Number(claims.exp) - Date.now() / 1000;
-    return claims.sub === userId && aud.includes(m.op.OPERATOR_TOKEN_AUDIENCE) && claims.iss === issuer && left > m.op.OPERATOR_TOKEN_AUTO_ROTATE_THRESHOLD_SECONDS;
+    return claims.sub === userId && aud.includes(m.op.OPERATOR_TOKEN_AUDIENCE) && left > m.op.OPERATOR_TOKEN_AUTO_ROTATE_THRESHOLD_SECONDS;
   } catch {
     return false;
   }
@@ -258,6 +263,7 @@ export async function bootstrap(args: string[]): Promise<number> {
       users: await import("@openparachute/hub/src/users.ts"),
       op: await import("@openparachute/hub/src/operator-token.ts"),
       embedded: await import("@openparachute/hub/src/embedded-home.ts"),
+      jwt: await import("@openparachute/hub/src/jwt-sign.ts"),
       vaultName: await import("@openparachute/vault/src/vault-name.ts"),
     };
     const nameCheck = m.vaultName.validateVaultName(vault);
@@ -302,7 +308,7 @@ export async function bootstrap(args: string[]): Promise<number> {
         accountCreated = true;
       }
       issuer = settleIssuer(home, m.embedded.readEmbeddedState);
-      if (!usableOperatorToken(home, user.id, issuer, m)) {
+      if (!(await usableOperatorToken(db, home, user.id, issuer, m))) {
         await m.op.issueOperatorToken(db, user.id, { dir: home, issuer });
         tokenIssued = true;
       }
