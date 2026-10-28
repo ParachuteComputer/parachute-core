@@ -174,6 +174,10 @@ export async function dispatch(role: Role): Promise<void> {
     process.exit(await serveEmbedded(embeddedArgs));
   }
   if (bootstrapArgs) {
+    // bootstrap --embedded opens the home like serve --embedded does, so it puts back loosened modes too (PLAN §3).
+    if (process.env.PARACHUTE_HOME && bootstrapArgs.includes("--embedded")) {
+      for (const line of repairModes(home)) console.error(`parachute: mode repaired: ${line}`);
+    }
     const { bootstrap } = await import("./bootstrap.ts");
     process.exit(await bootstrap(bootstrapArgs));
   }
