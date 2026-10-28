@@ -736,7 +736,7 @@ describe("account MCP — list-vaults coverage", () => {
       expect(payload.covered).toBe("listed");
       expect(payload.vaults).toEqual([]);
     } finally {
-      if (prev === undefined) process.env.PARACHUTE_NOSTR_AUTO_PROVISION = undefined;
+      if (prev === undefined) Reflect.deleteProperty(process.env, "PARACHUTE_NOSTR_AUTO_PROVISION");
       else process.env.PARACHUTE_NOSTR_AUTO_PROVISION = prev;
       h.cleanup();
     }

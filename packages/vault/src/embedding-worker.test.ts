@@ -298,3 +298,39 @@ describe("registerEmbeddingHook", () => {
     expect(getNoteVectorRows(db, note.id)).toEqual([]);
   });
 });
+
+describe("EmbeddingWorker.stop with a sweep in flight", () => {
+  // A vault stopping inside a longer-lived process (`parachute-core serve`) closes its stores after stop(). A sweep
+  // still waiting on the provider must not then write, nor open the next vault's store.
+  it("stop() ends the sweep: no write after it, no further vault opened, drain() waits for it", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    class SlowProvider extends FakeProvider {
+      override async embed(input: EmbedInput): Promise<EmbedResult> {
+        await gate;
+        return super.embed(input);
+      }
+    }
+    const slow = new SlowProvider();
+    const other = new SqliteStore(new Database(":memory:"));
+    const opened: string[] = [];
+    const w = new EmbeddingWorker({
+      provider: slow,
+      vaultList: () => ["first", "second"],
+      getStore: (name) => (opened.push(name), name === "first" ? store : other),
+      logger: silentLogger,
+    });
+    const first = await store.createNote("made-up note one", { path: "a" });
+    await other.createNote("made-up note two", { path: "b" });
+
+    const sweep = w.sweepOnce();
+    await Bun.sleep(20); // the sweep is now waiting on the provider for the first vault's note
+    w.stop();
+    release();
+    await w.drain();
+    await sweep;
+
+    expect(getNoteVectorRows(db, first.id)).toEqual([]);
+    expect(opened).toEqual(["first"]);
+  });
+});

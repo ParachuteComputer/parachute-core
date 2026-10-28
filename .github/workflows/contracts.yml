@@ -6,6 +6,7 @@
 #              bundle, packed and unpacked again, launched the way a user launches it, in a private network + PID
 #              namespace; the run must report the hash the build produced (PLAN §7.2). The stock 0.7 build is
 #              there too, as "the old programs".
+#              The child-path build (--process-model child) runs compat/* until the Nov 3 decision deletes one path.
 #   prism      Benjamin's compatibility suite, unchanged, against the same build (the Nov 9 gate, PLAN §3.1)
 # The signed macOS bundle has its own workflow (bundle-macos.yml).
 #   mutants    the contracts must catch each mutant, on the pinned vault and on rebuilt core candidates; each
@@ -91,7 +92,7 @@ jobs:
   candidate:
     name: every suite on the candidate build
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     defaults:
       run:
         working-directory: contracts
@@ -133,6 +134,12 @@ jobs:
         run: |
           grep -qx "\[candidate\] sha256 ${{ steps.build.outputs.sha256 }}" "$RUNNER_TEMP/candidate.log"
           grep -q "^\[candidate\] unchanged after the run: sha256 ${{ steps.build.outputs.sha256 }}$" "$RUNNER_TEMP/candidate.log"
+      - name: the child path (the hub's vault child, the fallback until the Nov 3 decision) still serves every client
+        env:
+          OLD_STOCK_SHA256: ${{ steps.stock.outputs.sha256 }}
+        run: |
+          bun run build:core --out "$RUNNER_TEMP/candidate-child" --process-model child --no-pack
+          CANDIDATE_DIR="$RUNNER_TEMP/candidate-child" bun run candidate -- suites/compat
 
   prism:
     name: Benjamin's compatibility suite on the candidate build

@@ -12,8 +12,11 @@
 //
 // The candidate adapter (harness/candidate.ts) runs only what is in this folder, and refuses it if a byte changed.
 //
-//   bun run build:core [--out <dir>] [--source <checkout>] [--sign] [--pack <dir> | --no-pack]
+//   bun run build:core [--out <dir>] [--source <checkout>] [--sign] [--pack <dir> | --no-pack] [--process-model in-process|child]
 //
+// --process-model: the vault inside serve's process (the default, lane A2) or the hub's vault child (the fallback
+// until the Nov 3 decision, PLAN §2.1). A child build changes BUILT_PROCESS_MODEL in the copied packages/cli and
+// says so in CANDIDATE.json.
 // --source builds from another checkout's working tree, edits included. The default is this repo's working tree;
 // CI builds from a clean checkout, so that is the commit. --sign (macOS) signs the tree ad hoc with the hardened
 // runtime before it is hashed (release/sign.ts). It then writes <name>.tar.gz and SHA256SUMS into --pack <dir>
@@ -57,6 +60,20 @@ export async function stageWorkspace(source: string, dest: string): Promise<stri
   return `${head}${dirty}`;
 }
 
+const SERVE = "packages/cli/src/serve.ts";
+const BUILT = /^export const BUILT_PROCESS_MODEL: ProcessModel = "(in-process|child)";$/m;
+
+/** The process model the copied workspace's `serve` runs, after setting it to `want` if given. */
+async function setProcessModel(lib: string, want?: "in-process" | "child"): Promise<"in-process" | "child"> {
+  const file = join(lib, SERVE);
+  const text = await Bun.file(file).text();
+  const m = text.match(BUILT);
+  if (!m) throw new Error(`${SERVE} has no BUILT_PROCESS_MODEL line; the build can't tell what serve runs`);
+  if (!want || want === m[1]) return m[1] as "in-process" | "child";
+  writeFileSync(file, text.replace(BUILT, `export const BUILT_PROCESS_MODEL: ProcessModel = "${want}";`));
+  return want;
+}
+
 export async function buildCoreCandidate(opts: {
   out: string;
   /** A checkout to build from (default: this repo's working tree). */
@@ -69,6 +86,8 @@ export async function buildCoreCandidate(opts: {
   edit?: { label: string; apply: (lib: string) => Promise<void> };
   /** Sign the tree ad hoc with the hardened runtime before hashing it (macOS; release/sign.ts). */
   sign?: boolean;
+  /** What `serve` runs (default: what packages/cli/src/serve.ts says, "in-process"). */
+  processModel?: "in-process" | "child";
 }): Promise<{ sha256: string; name: string }> {
   const out = resolve(opts.out);
   const source = resolve(opts.source ?? REPO);
@@ -82,6 +101,7 @@ export async function buildCoreCandidate(opts: {
     rev = opts.staged.rev;
   } else rev = await stageWorkspace(source, lib);
   if (opts.edit) await opts.edit.apply(lib);
+  const model = await setProcessModel(lib, opts.processModel);
   // The production install, admin pages and pruning (release/bundle.ts); a staged snapshot has had it already.
   const leftOut = opts.staged?.installed ? undefined : await installWorkspace(lib);
   const commit = (await sh(["git", "rev-parse", "HEAD"], opts.staged ? REPO : source).catch(() => "unknown")).trim();
@@ -94,11 +114,14 @@ export async function buildCoreCandidate(opts: {
   const manifest = {
     name: pkg.name,
     profile: "v0.8",
-    note: "the v0.8 bundle tree built from this repo's workspace (lane D); the hub still starts the vault as a child",
+    note:
+      model === "in-process"
+        ? "the v0.8 bundle tree built from this repo's workspace; serve runs the vault inside its own process (lane A2)"
+        : "the v0.8 bundle tree built from this repo's workspace, child path: the hub starts the vault as a child (the fallback until Nov 3)",
     version: { core: pkg.version, hub: await version("packages/hub"), vault: await version("packages/vault") },
     source: { core: `${rev}${opts.source ? ` (from ${source})` : ""}${opts.edit ? ` + ${opts.edit.label}` : ""}` },
     core_commit: rev.replace("+changes", ""),
-    process_model: "child",
+    process_model: model,
     platform: `${process.platform}-${process.arch}`,
     bundle,
     sha256,
@@ -110,7 +133,9 @@ export async function buildCoreCandidate(opts: {
 if (import.meta.main) {
   const out = arg("--out") ?? join(REPO, "contracts", ".cache", "candidate-core");
   const t0 = Date.now();
-  const { sha256, name } = await buildCoreCandidate({ out, source: arg("--source"), sign: process.argv.includes("--sign") });
+  const pm = arg("--process-model");
+  if (pm !== undefined && pm !== "in-process" && pm !== "child") throw new Error(`--process-model is in-process or child, not ${pm}`);
+  const { sha256, name } = await buildCoreCandidate({ out, source: arg("--source"), sign: process.argv.includes("--sign"), processModel: pm });
   console.log(`[candidate] built ${out} in ${Math.round((Date.now() - t0) / 1000)} s`);
   console.log(`[candidate] sha256 ${sha256}`);
   // For CI: the build step's output, compared with what the runs report (harness/run-candidate.ts).

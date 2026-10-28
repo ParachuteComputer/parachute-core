@@ -23,6 +23,23 @@ import {
 const DEFAULT_HUB_LOOPBACK = "http://127.0.0.1:1939";
 
 /**
+ * The hub's values, when a host passes them in rather than through the environment: `parachute-core serve` runs the
+ * vault inside the hub's own process, where the environment is the hub's (v0.8 PLAN §2.2 item 2). Each value set here
+ * wins over its environment variable (`hubOrigin` over PARACHUTE_HUB_ORIGIN, `hubOrigins` over PARACHUTE_HUB_ORIGINS,
+ * `jwksOrigin` over PARACHUTE_HUB_JWKS_ORIGIN); an unset one falls back to it, as before.
+ */
+export interface HubValues {
+  hubOrigin?: string;
+  /** Comma-separated, as PARACHUTE_HUB_ORIGINS. */
+  hubOrigins?: string;
+  jwksOrigin?: string;
+}
+let passedIn: HubValues = {};
+export function setHubValues(values: HubValues): void {
+  passedIn = { ...values };
+}
+
+/**
  * Resolve the hub origin used to validate the token's `iss` claim. Strips a
  * trailing slash so we get a single canonical form.
  *
@@ -37,6 +54,7 @@ const DEFAULT_HUB_LOOPBACK = "http://127.0.0.1:1939";
  * is resolved separately by `getJwksOrigin()`; see vault#464.
  */
 export function getHubOrigin(): string {
+  if (passedIn.hubOrigin) return passedIn.hubOrigin.replace(/\/$/, "");
   const env = process.env.PARACHUTE_HUB_ORIGIN?.replace(/\/$/, "");
   if (env && env.length > 0) return env;
   return DEFAULT_HUB_LOOPBACK;
@@ -60,6 +78,7 @@ export function getHubOrigin(): string {
  * internal address. Trailing-slash-stripped, matching `getHubOrigin()`.
  */
 export function getJwksOrigin(): string {
+  if (passedIn.jwksOrigin) return passedIn.jwksOrigin.replace(/\/$/, "");
   const env = process.env.PARACHUTE_HUB_JWKS_ORIGIN?.replace(/\/$/, "");
   if (env && env.length > 0) return env;
   return DEFAULT_HUB_LOOPBACK;
@@ -115,7 +134,7 @@ const guard = createScopeGuard({
   // Re-evaluated per call so an operator widening the box's origins is picked up
   // without a vault restart. When the env var is unset → `[]` → scope-guard
   // collapses to the single canonical hubOrigin (byte-identical to before).
-  allowedIssuers: () => parseHubOrigins(process.env.PARACHUTE_HUB_ORIGINS),
+  allowedIssuers: () => parseHubOrigins(passedIn.hubOrigins ?? process.env.PARACHUTE_HUB_ORIGINS),
 });
 
 /**
