@@ -21,9 +21,11 @@
 // Green since lane E (packages/cli/src/takeover.ts). The setup test proves the old install and stock home are real
 // (the old `parachute` from the fake global install serves the notes). Takeover writes parachute-core.service into
 // the unit folder and enables it; the fake systemctl knows a unit by its file, as systemd does after daemon-reload,
-// and runs nothing, so each test starts core itself "as the unit would" (startCore), like the old box (startOldBox).
+// and runs it for real (its ExecStart with its Environment), so the v0.8 a test talks to after a takeover is the one
+// the unit runs (coreUnit). The old units it only keeps state for: each test runs the old programs itself
+// (startOldBox), "as the unit would".
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, readdirSync, readFileSync, readlinkSync, symlinkSync, unlinkSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, readlinkSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { until } from "../candidate-lib.ts";
 import { rest } from "../lib.ts";
@@ -41,7 +43,7 @@ import {
   readNotes,
   requireCore,
   schemaOf,
-  startCore,
+  coreUnit,
   startOldBox,
   oldInstallHash,
   treeHash,
@@ -270,7 +272,7 @@ describe("takeover", () => {
     expect(after.npm).toBe(before.npm);
     expect(after.unitFiles).toEqual(before.unitFiles);
 
-    const c = await startCore(m, s);
+    const c = await coreUnit(m, s);
     try {
       const got = await readNotes(s.origin, s.vaultName, s.readPass); // minted by the old hub before takeover
       expect(got.status).toBe(200);
@@ -322,12 +324,57 @@ describe("takeover", () => {
     const r = await core(m, ["takeover", "--home", m.home, "--yes", "--json"], s.serveEnv);
     must(r.code === 0, `takeover --yes from the old box's environment exited ${r.code}: ${r.stderr.slice(-600)}`);
     expect(m.unit(HUB_UNIT)).toEqual({ active: false, enabled: false });
-    const c = await startCore(m, s);
+    const c = await coreUnit(m, s);
     try {
       expect((await readNotes(s.origin, s.vaultName, s.readPass)).status).toBe(200);
     } finally {
       await c.stop();
     }
+  }, 120_000);
+
+  test("when parachute-core.service can't serve (its port is taken), takeover puts everything back and exits 8", async () => {
+    const { m, s } = await oldMachine("tk-unitfail");
+    // Something else on the machine holds the hub's port, so the unit's v0.8 can't bind it. The check run (on a free
+    // port) passes; only the hand-over to the unit fails.
+    const squatter = m.spawn([process.execPath, "-e", `Bun.listen({ hostname: "127.0.0.1", port: ${s.port}, socket: { data() {} } }); await Bun.sleep(600000)`]);
+    await Bun.sleep(500);
+    try {
+      const r = await core(m, ["takeover", "--home", m.home, "--yes", "--json"]);
+      must(r.code === 8, `takeover with a unit that can't serve exited ${r.code}, want 8: ${r.stderr.slice(-600)}`);
+      expect(r.stderr).toContain("parachute-core.service");
+      // The old hub unit is back on, v0.8's unit is off, and there is no takeover record.
+      expect(m.unit(HUB_UNIT)).toEqual({ active: true, enabled: true });
+      expect(m.unit(VAULT_UNIT)).toEqual({ active: false, enabled: false });
+      expect(m.unit("parachute-core.service")).toEqual({ active: false, enabled: false });
+      expect(existsSync(join(m.home, "takeover.json"))).toBe(false);
+    } finally {
+      await squatter.stop();
+    }
+    // The old programs, as their unit runs them, serve the notes as before.
+    const box = await startOldBox(m, s);
+    try {
+      const got = await readNotes(s.origin, s.vaultName, s.readPass);
+      expect(got.status).toBe(200);
+      for (const n of s.notes) expect(got.notes.find((x) => x.id === n.id)?.content).toBe(n.content);
+    } finally {
+      await box.stop();
+    }
+  }, 180_000);
+
+  test("a parachute-core.service that serves another home is never replaced: refused before anything changes", async () => {
+    const { m } = await oldMachine("tk-coreunit");
+    const theirs = join(m.unitDir, "parachute-core.service");
+    const text = `[Service]\nExecStart=/opt/elsewhere/bin/parachute-core serve\nEnvironment=PARACHUTE_HOME=${join(m.user, "another-home")}\n`;
+    writeFileSync(theirs, text);
+    const before = await snapshot(m);
+    const calls = m.systemctlCalls().length;
+    const r = await core(m, ["takeover", "--home", m.home, "--yes", "--json"]);
+    must(r.code !== 0, "takeover went ahead and replaced another home's parachute-core.service");
+    expect(r.stderr).toContain("parachute-core.service");
+    expect(readFileSync(theirs, "utf8")).toBe(text);
+    expect(await snapshot(m)).toEqual(before);
+    expect(m.systemctlCalls().slice(calls).filter((c) => MUTATING.test(c))).toEqual([]);
+    expect(existsSync(join(m.user, "parachute-takeover"))).toBe(false);
   }, 120_000);
 
   test("rollback: a note written under core reads and updates under the old programs", async () => {
@@ -336,19 +383,15 @@ describe("takeover", () => {
     const t = await core(m, ["takeover", "--home", m.home, "--yes", "--json"]);
     must(t.code === 0, `takeover --yes exited ${t.code}: ${t.stderr.slice(-600)}`);
 
-    const c = await startCore(m, s);
-    let written = { id: "", updatedAt: "" };
-    try {
-      const made = await rest(`${s.origin}/vault/${s.vaultName}`, s.writePass).post("/notes", {
-        path: "garden/written-under-core",
-        content: "Planted garlic in October; mulch after the first frost.",
-        tags: ["made-up"],
-      });
-      expect(made.status).toBe(201);
-      written = { id: made.body.id, updatedAt: made.body.updatedAt };
-    } finally {
-      await c.stop();
-    }
+    // Written to the v0.8 the unit runs; the rollback is what stops it.
+    await coreUnit(m, s);
+    const made = await rest(`${s.origin}/vault/${s.vaultName}`, s.writePass).post("/notes", {
+      path: "garden/written-under-core",
+      content: "Planted garlic in October; mulch after the first frost.",
+      tags: ["made-up"],
+    });
+    expect(made.status).toBe(201);
+    const written = { id: made.body.id, updatedAt: made.body.updatedAt };
 
     const calls = m.systemctlCalls().length;
     const r = await core(m, ["takeover", "--rollback", "--yes", "--json"]);

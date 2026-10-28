@@ -80,8 +80,12 @@ export interface UnitState {
 
 const FAKE_SYSTEMCTL = `#!/bin/sh
 # Fake systemctl for the contracts (an outside system). Answers from STATE/<unit>.active and STATE/<unit>.enabled,
-# changes them on start/stop/enable/disable (with --now), and logs every call to STATE/calls.log. Like systemd after
-# daemon-reload, a unit whose file is in UNITS is known too (inactive and disabled until changed). It runs nothing.
+# changes them on start/stop/enable/disable (with --now), and logs every call to STATE/calls.log.
+# - Units the test seeds (the old hub and vault) are bookkeeping only: each test runs the old programs itself.
+# - A unit known only by its file in UNITS (one the program under test installs, as systemd knows it after
+#   daemon-reload) is run for real: start runs its ExecStart= with its Environment= in a clean environment, as
+#   STATE/<unit>.pid; stop ends it; is-active says "failed" once its process is gone; show names its MainPID.
+# - show prints a unit file's Environment= lines (systemd prints the assignments it would pass).
 STATE=__STATE__
 UNITS=__UNITS__
 echo "$*" >> "$STATE/calls.log"
@@ -96,8 +100,35 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
-known() { [ -f "$STATE/$1.active" ] || [ -f "$UNITS/$1" ]; }
-st() { if [ -f "$STATE/$1.$2" ]; then cat "$STATE/$1.$2"; elif [ "$2" = active ]; then echo inactive; else echo disabled; fi; }
+seeded() { [ -f "$STATE/$1.seeded" ]; }
+known() { seeded "$1" || [ -f "$UNITS/$1" ]; }
+alive() { [ -f "$STATE/$1.pid" ] && kill -0 "$(cat "$STATE/$1.pid")" 2>/dev/null; }
+st() {
+  if [ "$2" = active ] && [ -f "$STATE/$1.pid" ] && ! alive "$1"; then echo failed; return; fi
+  if [ -f "$STATE/$1.$2" ]; then cat "$STATE/$1.$2"; elif [ "$2" = active ]; then echo inactive; else echo disabled; fi
+}
+run_unit() {
+  seeded "$1" && return 0
+  alive "$1" && return 0
+  f="$UNITS/$1"
+  cmd=$(sed -n 's/^ExecStart=//p' "$f" | head -1 | sed 's/%%/%/g')
+  (
+    exec 0</dev/null >>"$STATE/$1.log" 2>&1
+    envs=$(sed -n 's/^Environment=//p' "$f" | sed 's/%%/%/g')
+    exec env -i HOME="$HOME" PATH="$PATH" LANG=C.UTF-8 TMPDIR="$TMPDIR" sh -c "
+      $(echo "$envs" | while IFS= read -r l; do [ -n "$l" ] && echo "export $l"; done)
+      $(sed -n 's/^EnvironmentFile=//p' "$f" | sed 's/^-//' | while IFS= read -r ef; do echo "[ -f '$ef' ] && . '$ef'"; done)
+      exec $cmd"
+  ) &
+  echo $! > "$STATE/$1.pid"
+}
+stop_unit() {
+  alive "$1" || { rm -f "$STATE/$1.pid"; return 0; }
+  pid=$(cat "$STATE/$1.pid"); kill -TERM "$pid" 2>/dev/null
+  i=0; while kill -0 "$pid" 2>/dev/null && [ $i -lt 150 ]; do sleep 0.1; i=$((i+1)); done
+  kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+  rm -f "$STATE/$1.pid"
+}
 code=0
 case "$verb" in
   daemon-reload) exit 0 ;;
@@ -107,16 +138,20 @@ case "$verb" in
     for u in $units; do
       known "$u" || { echo "Unit $u not found." >&2; exit 5; }
       case "$verb" in
-        start|restart) echo active > "$STATE/$u.active" ;;
-        stop) echo inactive > "$STATE/$u.active" ;;
-        enable) echo enabled > "$STATE/$u.enabled"; [ -n "$now" ] && echo active > "$STATE/$u.active" ;;
-        disable) echo disabled > "$STATE/$u.enabled"; [ -n "$now" ] && echo inactive > "$STATE/$u.active" ;;
+        start) echo active > "$STATE/$u.active"; run_unit "$u" ;;
+        restart) stop_unit "$u"; echo active > "$STATE/$u.active"; run_unit "$u" ;;
+        stop) stop_unit "$u"; echo inactive > "$STATE/$u.active" ;;
+        enable) echo enabled > "$STATE/$u.enabled"; if [ -n "$now" ]; then echo active > "$STATE/$u.active"; run_unit "$u"; fi ;;
+        disable) echo disabled > "$STATE/$u.enabled"; if [ -n "$now" ]; then stop_unit "$u"; echo inactive > "$STATE/$u.active"; fi ;;
       esac
     done; exit 0 ;;
   show)
     for u in $units; do
       if known "$u"; then a=$(st "$u" active); e=$(st "$u" enabled); l=loaded; else a=inactive; e=""; l=not-found; fi
-      echo "Id=$u"; echo "LoadState=$l"; echo "ActiveState=$a"; echo "UnitFileState=$e"; echo "MainPID=0"; echo
+      pid=0; alive "$u" && pid=$(cat "$STATE/$u.pid")
+      echo "Id=$u"; echo "LoadState=$l"; echo "ActiveState=$a"; echo "UnitFileState=$e"; echo "MainPID=$pid"
+      if [ -f "$UNITS/$u" ]; then echo "Environment=$(sed -n 's/^Environment=//p' "$UNITS/$u" | tr '\n' ' ' | sed 's/ $//')"; fi
+      echo
     done; exit 0 ;;
   list-unit-files)
     for f in "$STATE"/*.enabled; do [ -f "$f" ] || continue; u=$(basename "$f" .enabled); echo "$u $(cat "$f")"; done; exit 0 ;;
@@ -126,9 +161,10 @@ case "$verb" in
 esac
 `;
 
-function unitFileText(name: string): string {
+function unitFileText(name: string, env: Record<string, string> = {}): string {
   const what = name.startsWith("parachute-vault") ? "parachute-vault serve" : "parachute serve";
-  return `[Unit]\nDescription=Parachute (${name}, made-up unit for the contracts)\n\n[Service]\nExecStart=%h/.bun/bin/${what}\nRestart=on-failure\n\n[Install]\nWantedBy=default.target\n`;
+  const lines = Object.entries(env).map(([k, v]) => `Environment=${k}=${v}\n`).join("");
+  return `[Unit]\nDescription=Parachute (${name}, made-up unit for the contracts)\n\n[Service]\nExecStart=%h/.bun/bin/${what}\n${lines}Restart=on-failure\n\n[Install]\nWantedBy=default.target\n`;
 }
 
 // ── the machine ──────────────────────────────────────────────────────────────────────────────────────────────
@@ -194,6 +230,7 @@ export async function newMachine(
   for (const [name, s] of Object.entries(units)) {
     writeFileSync(join(unitDir, name), unitFileText(name));
     writeFileSync(join(state, `${name}.active`), s.active ? "active\n" : "inactive\n");
+    writeFileSync(join(state, `${name}.seeded`), "");
     writeFileSync(join(state, `${name}.enabled`), s.enabled ? "enabled\n" : "disabled\n");
   }
 
@@ -284,6 +321,12 @@ export async function newMachine(
       return readFileSync(join(state, "calls.log"), "utf8").split("\n").filter(Boolean);
     },
     async dispose() {
+      // Units the fake systemctl started (parachute-core.service after a takeover).
+      for (const f of readdirSync(state).filter((n) => n.endsWith(".pid"))) {
+        try {
+          process.kill(Number(readFileSync(join(state, f), "utf8")), "SIGKILL");
+        } catch {}
+      }
       for (const p of procs.reverse()) await p.stop("SIGTERM", 10_000);
       for (const s of servers) s.close();
       holder.kill("SIGKILL");
@@ -332,6 +375,27 @@ export async function startOldBox(m: Machine, s: Pick<StockHome, "vaultName" | "
   const box = settling(m, m.spawn(["parachute", "serve"], { env: s.serveEnv }));
   await waitVault(s.origin, s.vaultName, box, "the old parachute serve");
   return box;
+}
+
+/**
+ * The v0.8 that parachute-core.service runs after a takeover (the fake systemctl runs units the program installs):
+ * waits until it serves the vault; `stop()` stops the unit, as `systemctl --user stop` would, and waits until nothing
+ * holds the home's databases.
+ */
+export async function coreUnit(m: Machine, s: Pick<StockHome, "vaultName" | "origin">): Promise<{ stop(): Promise<void>; log(): string }> {
+  const log = () => (existsSync(join(m.user, ".fake", "systemd", "parachute-core.service.log")) ? readFileSync(join(m.user, ".fake", "systemd", "parachute-core.service.log"), "utf8").replace(/pvk_[A-Za-z0-9_-]+/g, "pvk_<redacted>") : "");
+  const up = await until(async () => {
+    const r = await safeFetch(`${s.origin}/vault/${s.vaultName}/mcp`);
+    return r.status === 401 && (r.headers.get("www-authenticate") ?? "").includes(`/vault/${s.vaultName}/`);
+  }, 60_000);
+  must(up, `parachute-core.service is not serving vault ${s.vaultName} after takeover:\n${log().slice(-2000)}`);
+  return {
+    log,
+    async stop() {
+      await m.run(["systemctl", "--user", "stop", "parachute-core.service"]);
+      await until(() => dbHolders(m.home).length === 0, 15_000, 100);
+    },
+  };
 }
 
 /** Start the candidate's `parachute-core serve` on the home, with the old box's port and origin. */
@@ -391,6 +455,9 @@ export async function makeStockHome(m: Machine): Promise<StockHome> {
     PARACHUTE_INITIAL_ADMIN_USERNAME: "owner",
     PARACHUTE_INITIAL_ADMIN_PASSWORD: `pw-${randomBytes(12).toString("hex")}`,
   };
+  // The old units carry what the old box runs with, as an install's unit (or its drop-in) does; no password.
+  const unitEnv = { PORT: String(port), PARACHUTE_HUB_ORIGIN: origin, PARACHUTE_HUB_JWKS_ORIGIN: origin, PARACHUTE_BIND_HOST: "127.0.0.1" };
+  for (const u of m.units) writeFileSync(join(m.unitDir, u), unitFileText(u, unitEnv));
   await m.expose(port);
   const box = await startOldBox(m, { vaultName, origin, serveEnv });
   try {

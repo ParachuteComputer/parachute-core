@@ -127,6 +127,9 @@ interface Record_ {
   state: "taken-over" | "rolled-back";
   at: string;
   rolled_back_at?: string;
+  /** Set once a rollback has restored the backup, so a retried rollback doesn't restore it again. */
+  restored_at?: string;
+  moved_aside?: string;
   version: string;
   home: string;
   backup: string;
@@ -803,18 +806,28 @@ function writeCoreUnit(d: Detected, from: string): { path: string; port: number 
   return { path, port: unitPort(env, d.home) };
 }
 
-/** Is core's unit up: active and staying so; and when it names its process, answering /api/ready on its port. */
+const mainPid = (unit: string) => Number(/MainPID=(\d+)/.exec(run(["systemctl", "--user", "show", unit, "-p", "MainPID"]).stdout)?.[1] ?? 0);
+
+/**
+ * Is core's unit up: active, with a process systemd names, answering /api/ready on its port, and still the same
+ * process a few seconds later (not crash-looping). Anything less is a failed hand-over.
+ */
 async function coreUnitUp(port: number): Promise<string | null> {
   const active = () => run(["systemctl", "--user", "is-active", CORE_UNIT]).stdout.trim() === "active";
-  if (!(await waitUntil(active, 30_000, 500))) return `${CORE_UNIT} did not become active`;
+  if (!(await waitUntil(() => active() && mainPid(CORE_UNIT) > 0, 30_000, 500))) return `${CORE_UNIT} did not start a process`;
+  const pid = mainPid(CORE_UNIT);
+  const ok = await waitUntil(async () => (await getJson(`http://127.0.0.1:${port}/api/ready`)).status === 200 || !active(), 60_000, 500);
+  if (!ok || !active()) return `${CORE_UNIT} (pid ${pid}) is not answering /api/ready on port ${port}`;
   await Bun.sleep(3000);
-  if (!active()) return `${CORE_UNIT} stopped again within 3 s`;
-  const pid = Number(/MainPID=(\d+)/.exec(run(["systemctl", "--user", "show", CORE_UNIT, "-p", "MainPID"]).stdout)?.[1] ?? 0);
-  if (pid > 0) {
-    const ok = await waitUntil(async () => (await getJson(`http://127.0.0.1:${port}/api/ready`)).status === 200, 60_000, 500);
-    if (!ok) return `${CORE_UNIT} (pid ${pid}) is not answering /api/ready on port ${port}`;
-  }
+  if (!active() || mainPid(CORE_UNIT) !== pid) return `${CORE_UNIT} stopped or restarted within 3 s of answering`;
   return null;
+}
+
+/** Stop core's unit and wait until nothing holds the home's data; the holders left, if any. */
+async function stopCoreUnit(home: string): Promise<Holder[]> {
+  run(["systemctl", "--user", "disable", "--now", CORE_UNIT]);
+  await waitUntil(() => holders(home).length === 0, 20_000, 250);
+  return holders(home);
 }
 
 function writeRecord(home: string, r: Record_): void {
@@ -844,6 +857,14 @@ async function takeOver(d: Detected, say: (s: string) => void): Promise<{ backup
   }
   if (d.uncopyable.length) {
     throw new Exit(EXIT.failed, `the home has entries the backup can't copy as they are (${d.uncopyable.slice(0, 5).join(", ")}): links point outside it. Replace them with the real files, or back up yourself. Nothing was changed.`);
+  }
+  const coreUnitFile = join(systemdUnitDir(), CORE_UNIT);
+  if (existsSync(coreUnitFile)) {
+    const text = unitText(CORE_UNIT);
+    const on = run(["systemctl", "--user", "is-active", CORE_UNIT]).stdout.trim() === "active" || run(["systemctl", "--user", "is-enabled", CORE_UNIT]).stdout.trim() === "enabled";
+    if (!unitServes(text, d.home) || on) {
+      throw new Exit(EXIT.failed, `${CORE_UNIT} already exists (${tilde(coreUnitFile)})${on ? " and is on" : " for another home"}; this takeover won't replace it. Nothing was changed.`);
+    }
   }
   const toPause = d.units.filter((u) => u.old && u.manager === "systemd" && (u.active || u.enabled));
   const pausable = new Set(toPause.map((u) => u.name));
@@ -892,14 +913,20 @@ async function takeOver(d: Detected, say: (s: string) => void): Promise<{ backup
   say(`  ${copied.files} files, ${size(copied.bytes)}, each checked against its sha256 (manifest.json)`);
 
   // Any rollback from here puts the backup back first if v0.8 has migrated the data.
+  // The old programs come back only once nothing of v0.8 holds the data, and (after a migration) only once the
+  // backup is back; otherwise they stay paused and it says what is left to do.
   const undo = (why: string): Exit => {
+    const still = holders(d.home);
+    if (still.length) {
+      return new Exit(EXIT.checkFailed, `${why}; v0.8 still holds the data (${still.map((h) => `pid ${h.pid}`).join(", ")}), so the old units stay paused. Stop it, then enable and start ${paused.map((u) => u.name).join(" and ") || "the old programs"} yourself; the backup is in ${dest}`);
+    }
     let msg = why;
     if (d.migrations.length) {
       try {
         const aside = restore(d.home, dest);
         msg += `; the backup was restored (what v0.8 left is in ${aside})`;
       } catch (err) {
-        msg += `; restoring the backup failed too: ${(err as Error).message}. The backup is in ${dest}`;
+        return new Exit(EXIT.checkFailed, `${why}; restoring the backup failed: ${(err as Error).message}. The old units stay paused, because the data may be migrated. Restore ${dest}/home over ${d.home} (manifest.json has every sha256), then enable and start ${paused.map((u) => u.name).join(" and ")}.`);
       }
     }
     return new Exit(EXIT.checkFailed, putBack(msg) + ". The old programs are back as they were.");
@@ -911,7 +938,7 @@ async function takeOver(d: Detected, say: (s: string) => void): Promise<{ backup
   try {
     return await startAndHandOver();
   } catch (err) {
-    if (unitTried) run(["systemctl", "--user", "disable", "--now", CORE_UNIT]);
+    if (unitTried) await stopCoreUnit(d.home);
     rmSync(join(d.home, RECORD_FILE), { force: true });
     if (err instanceof Exit) throw err;
     throw undo(`${(err as Error).message}`);
@@ -995,20 +1022,24 @@ async function rollBack(home: string, say: (s: string) => void): Promise<Record<
     throw new Exit(EXIT.held, `still holding the data: ${still.map((h) => `pid ${h.pid} (${h.cmd.slice(0, 80)})`).join(", ")}. Stop it, then run takeover --rollback again.`);
   }
   let exported = 0;
-  let aside: string | undefined;
-  if (record.rollback === "restore-backup") {
+  if (record.rollback === "restore-backup" && !record.restored_at) {
     const dir = join(record.backup, `changed-since-takeover-${stamp()}`);
     exported = exportChanged(home, join(record.backup, "home"), dir);
     say(`Exported ${exported} notes changed since the takeover to ${tilde(dir)}`);
-    aside = restore(home, record.backup);
-    say(`Restored the backup; what v0.8 left is in ${tilde(aside)}`);
+    record.moved_aside = restore(home, record.backup);
+    record.restored_at = new Date().toISOString();
+    // Still "taken-over" until the old units are back: a rollback that fails from here can be run again, and it
+    // won't restore the backup a second time.
+    writeRecord(home, record);
+    say(`Restored the backup; what v0.8 left is in ${tilde(record.moved_aside)}`);
   }
   for (const u of record.paused) say(`Putting ${u.name} back (${u.enabled ? "enabled" : "disabled"}, ${u.active ? "running" : "stopped"}) …`);
   const errors = resumeUnits(record.paused);
-  const done: Record_ = { ...record, state: "rolled-back", rolled_back_at: new Date().toISOString() };
-  writeRecord(home, done);
-  if (errors.length) throw new Exit(EXIT.failed, `putting the old units back failed: ${errors.join("; ")}`);
-  return { rolled_back: true, rollback: record.rollback, exported_notes: exported, ...(aside ? { moved_aside: aside } : {}), units: record.paused.map((u) => u.name) };
+  if (errors.length) {
+    throw new Exit(EXIT.failed, `putting the old units back failed: ${errors.join("; ")}. v0.8 is stopped${record.restored_at ? " and the backup is restored" : ""}; fix that and run \`parachute-core takeover --rollback\` again`);
+  }
+  writeRecord(home, { ...record, state: "rolled-back", rolled_back_at: new Date().toISOString() });
+  return { rolled_back: true, rollback: record.rollback, exported_notes: exported, ...(record.moved_aside ? { moved_aside: record.moved_aside } : {}), units: record.paused.map((u) => u.name) };
 }
 
 export async function takeover(args: string[]): Promise<number> {
