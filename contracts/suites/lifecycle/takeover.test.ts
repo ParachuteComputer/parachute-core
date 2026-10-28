@@ -25,7 +25,7 @@
 // has this home's data open), and after a takeover the tests talk to the v0.8 parachute-core.service runs.
 import { afterEach, describe, expect, test } from "bun:test";
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { join } from "node:path";
 import { Database } from "bun:sqlite";
 import { decodeJwt, importPKCS8, SignJWT } from "jose";
 import { until } from "../candidate-lib.ts";
