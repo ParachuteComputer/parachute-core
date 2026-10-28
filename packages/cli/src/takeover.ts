@@ -183,25 +183,50 @@ function run(argv: string[], opts: { env?: Record<string, string> } = {}): { cod
 const systemdUnitDir = () => join(process.env.XDG_CONFIG_HOME || join(userHome(), ".config"), "systemd", "user");
 
 /**
- * The home a unit serves: its PARACHUTE_HOME (Environment= or an EnvironmentFile= it names), else ~/.parachute.
- * A unit of another home is never paused and never makes serve refuse this one.
+ * The home a unit serves, by systemd's rules (systemd.exec(5)): variables from `EnvironmentFile=` override
+ * `Environment=` whatever the order of the lines; within each kind the last assignment wins; an empty `Environment=`
+ * or `EnvironmentFile=` resets that kind's list. With no PARACHUTE_HOME, ~/.parachute. "unknown" when it can't be
+ * established (an environment file it can't read): callers then take the safe side.
  */
-function unitServes(text: string, home: string): boolean {
-  let set: string | undefined;
+function unitHome(text: string): string | "unknown" {
+  const expand = (v: string) => v.replace(/%h/g, userHome()).replace(/%%/g, "%");
+  let fromEnv: string | undefined;
+  let files: { path: string; optional: boolean }[] = [];
   for (const line of text.split("\n")) {
     const env = /^\s*Environment\s*=\s*(.*)$/.exec(line)?.[1];
-    if (env) {
-      const m = /(?:^|\s)"?PARACHUTE_HOME=([^"\s]+)/.exec(env);
-      if (m) set = m[1]!.replace(/%h/g, userHome());
+    if (env !== undefined) {
+      if (env.trim() === "") fromEnv = undefined;
+      for (const m of env.matchAll(/(?:^|\s)"?PARACHUTE_HOME=([^"\s]*)/g)) fromEnv = expand(m[1]!);
+      continue;
     }
-    const file = /^\s*EnvironmentFile\s*=\s*-?(.+)$/.exec(line)?.[1]?.trim().replace(/%h/g, userHome());
-    if (file) {
-      try {
-        const m = /^\s*(?:export\s+)?PARACHUTE_HOME=["']?([^"'\s]+)/m.exec(readFileSync(file, "utf8"));
-        if (m) set = m[1];
-      } catch {}
+    const file = /^\s*EnvironmentFile\s*=\s*(.*)$/.exec(line)?.[1]?.trim();
+    if (file !== undefined) {
+      if (file === "") files = [];
+      else files.push({ path: expand(file.replace(/^-/, "")), optional: file.startsWith("-") });
     }
   }
+  let fromFiles: string | undefined;
+  for (const f of files) {
+    let body: string;
+    try {
+      body = readFileSync(f.path, "utf8");
+    } catch {
+      if (f.optional && !existsSync(f.path)) continue; // systemd skips a missing optional file
+      return "unknown";
+    }
+    for (const m of body.matchAll(/^\s*(?:export\s+)?PARACHUTE_HOME=["']?([^"'\s]*)/gm)) fromFiles = m[1];
+  }
+  const set = fromFiles ?? fromEnv;
+  return set ? set : join(userHome(), ".parachute");
+}
+
+/**
+ * Does the unit serve `home`? `unsure` is the answer when its home can't be established: false where serving would
+ * mean pausing it (never pause what may be another home's), true where it would mean refusing to start (serve).
+ */
+function unitServes(text: string, home: string, unsure: boolean): boolean {
+  const theirs = unitHome(text);
+  if (theirs === "unknown") return unsure;
   const same = (a: string, b: string) => {
     try {
       return realpathSync(a) === realpathSync(b);
@@ -209,7 +234,7 @@ function unitServes(text: string, home: string): boolean {
       return resolve(a) === resolve(b);
     }
   };
-  return same(set ?? join(userHome(), ".parachute"), home);
+  return same(theirs, home);
 }
 
 /**
@@ -259,7 +284,7 @@ function systemdUnits(home: string): Unit[] {
     const text = unitText(name);
     const active = run(["systemctl", "--user", "is-active", name]).stdout.trim() === "active";
     const enabled = run(["systemctl", "--user", "is-enabled", name]).stdout.trim() === "enabled";
-    out.push({ name, manager: "systemd", active, enabled, ...(file ? { file } : {}), old: runsOld(name, text) && unitServes(text, home) });
+    out.push({ name, manager: "systemd", active, enabled, ...(file ? { file } : {}), old: runsOld(name, text) && unitServes(text, home, false) });
   }
   return out;
 }
@@ -397,7 +422,7 @@ export function oldOwner(home: string): string | null {
   for (const name of OLD_UNIT_NAMES) {
     if (!existsSync(join(systemdUnitDir(), name))) continue;
     const text = unitText(name);
-    if (runsOld(name, text) && unitServes(text, home)) why.push(`the unit ${name}`);
+    if (runsOld(name, text) && unitServes(text, home, true)) why.push(`the unit ${name}`);
   }
   if (process.platform === "darwin") {
     for (const u of launchdUnits()) if (u.old) why.push(`the launchd agent ${u.name}`);
@@ -910,7 +935,7 @@ async function takeOver(d: Detected, say: (s: string) => void): Promise<{ backup
   if (existsSync(coreUnitFile)) {
     const text = unitText(CORE_UNIT);
     const on = run(["systemctl", "--user", "is-active", CORE_UNIT]).stdout.trim() === "active" || run(["systemctl", "--user", "is-enabled", CORE_UNIT]).stdout.trim() === "enabled";
-    if (!unitServes(text, d.home) || on) {
+    if (!unitServes(text, d.home, false) || on) {
       throw new Exit(EXIT.failed, `${CORE_UNIT} already exists (${tilde(coreUnitFile)})${on ? " and is on" : " for another home"}; this takeover won't replace it. Nothing was changed.`);
     }
   }

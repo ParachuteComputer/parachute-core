@@ -25,7 +25,7 @@
 // the unit runs (coreUnit). The old units it only keeps state for: each test runs the old programs itself
 // (startOldBox), "as the unit would".
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, readdirSync, readFileSync, readlinkSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { until } from "../candidate-lib.ts";
 import { rest } from "../lib.ts";
@@ -359,6 +359,26 @@ describe("takeover", () => {
     } finally {
       await box.stop();
     }
+  }, 180_000);
+
+  test("a unit whose environment file names another home is left alone, even when a drop-in's Environment= names this one (systemd's precedence)", async () => {
+    const { m } = await oldMachine("tk-envfile");
+    // systemd.exec(5): variables from EnvironmentFile= override Environment=, whatever the order of the lines.
+    const envFile = join(m.user, "hub.env");
+    writeFileSync(envFile, `PARACHUTE_HOME=${join(m.user, "another-home")}\n`);
+    const unit = join(m.unitDir, HUB_UNIT);
+    writeFileSync(unit, readFileSync(unit, "utf8").replace("[Service]\n", `[Service]\nEnvironmentFile=${envFile}\n`));
+    mkdirSync(`${unit}.d`, { recursive: true });
+    writeFileSync(join(`${unit}.d`, "home.conf"), `[Service]\nEnvironment=PARACHUTE_HOME=${m.home}\n`);
+    const calls = m.systemctlCalls().length;
+    const r = await core(m, ["takeover", "--home", m.home, "--dry-run", "--json"]);
+    must(r.code === 0, `takeover --dry-run exited ${r.code}: ${r.stderr.slice(-600)}`);
+    const hub = (json(r, "takeover --dry-run --json").units as any[]).find((u) => u.name === HUB_UNIT);
+    expect(hub?.old).toBe(false);
+    const y = await core(m, ["takeover", "--home", m.home, "--yes", "--json"]);
+    expect(changesTo(m, HUB_UNIT, calls)).toEqual([]);
+    expect(m.unit(HUB_UNIT)).toEqual({ active: true, enabled: true });
+    void y;
   }, 180_000);
 
   test("a parachute-core.service that serves another home is never replaced: refused before anything changes", async () => {
