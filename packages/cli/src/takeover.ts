@@ -1411,7 +1411,7 @@ function holdTakeoverLock(home: string): boolean {
  * started it, restore the backup if v0.8 may have migrated the data, then enable and start the old units it paused
  * and wait until they have the home's data open again, so the next detection sees them. Removes the record.
  */
-async function putBackInterrupted(home: string, rec: Record_, say: (s: string) => void): Promise<string[]> {
+async function putBackInterrupted(home: string, rec: Record_, say: (s: string) => void): Promise<{ units: string[]; exported: number }> {
   if (rec.pid && rec.pid !== process.pid) {
     let cmd = "";
     try {
@@ -1433,12 +1433,13 @@ async function putBackInterrupted(home: string, rec: Record_, say: (s: string) =
   if (!(await waitUntil(() => inTheWay().length === 0, 20_000, 250))) {
     throw new Exit(EXIT.held, `still holding the data: ${inTheWay().map((h) => `pid ${h.pid} (${h.cmd.slice(0, 80)})`).join(", ")}. Stop it, then run takeover again.`);
   }
+  let exported = 0;
   if ((rec.stage === "checking" || rec.stage === "handing-over") && rec.migrations.length && rec.backup && !rec.restored_at) {
     const held = heldBy(home, units);
     if (held.length) throw new Exit(EXIT.held, `the old programs were started again on data v0.8 may have migrated (pid ${held.map((h) => h.pid).join(", ")}); stop them, then run takeover again so the backup is restored first.`);
     // Whatever changed since the backup (core's unit may have taken writes before the cut) is exported first.
     const dir = join(rec.backup, `changed-since-takeover-${stamp()}`);
-    const exported = exportChanged(home, join(rec.backup, "home"), dir);
+    exported = exportChanged(home, join(rec.backup, "home"), dir);
     if (exported) say(`  exported ${exported} note${exported === 1 ? "" : "s"} changed since the takeover began to ${tilde(dir)}`);
     // The record goes into the restored home with it, so a cut from here on still finds it (and won't restore again).
     const aside = restore(home, rec.backup, (a) => ({ ...rec, restored_at: new Date().toISOString(), moved_aside: a }));
@@ -1452,7 +1453,7 @@ async function putBackInterrupted(home: string, rec: Record_, say: (s: string) =
     throw new Exit(EXIT.failed, `${running.join(" and ")} ${running.length === 1 ? "is" : "are"} back, but without this home's data open after 90 s; run takeover again once ${running.length === 1 ? "it serves" : "they serve"} it.`);
   }
   say(`  ${units.join(" and ") || "the old programs"} back as before`);
-  return units;
+  return { units, exported };
 }
 
 async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ backup: string; record: Record_; core_unit: string | null }> {
@@ -1682,8 +1683,8 @@ function exportChanged(home: string, backupHome: string, dir: string): number {
 async function rollBack(home: string, say: (s: string) => void): Promise<Record<string, unknown>> {
   const record = readRecord(home);
   if (record?.state === "taking-over") {
-    const units = await putBackInterrupted(home, record, say);
-    return { rolled_back: true, rollback: "interrupted", exported_notes: 0, units };
+    const { units, exported } = await putBackInterrupted(home, record, say);
+    return { rolled_back: true, rollback: "interrupted", exported_notes: exported, units };
   }
   if (!record || record.state !== "taken-over") throw new Exit(EXIT.failed, `${tilde(home)} has no takeover to roll back${record ? ` (it was rolled back on ${record.rolled_back_at})` : ""}`);
   if (record.core_unit) {
