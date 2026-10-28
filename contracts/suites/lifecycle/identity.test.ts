@@ -15,19 +15,16 @@
 // and NPM_CONFIG_PREFIX pointing into the throwaway HOME. The first run is on a fresh, empty Parachute home: with
 // no existing home there is nothing to take over, so serve runs (takeover.test.ts covers an existing home).
 //
-// Lane A1 (the name and bins) made the first three green on the core build. The install step is lane D's: until
-// then `parachute-core install` is still the hub's module installer. On the stock build all four are red (no root
-// package.json, programs from lib/hub = @openparachute/hub, no bin/parachute-core). The setup test proves the old
-// global install is real.
+// Lane A1 (the name and bins) made the first three green on the core build; lane D's install step (packages/cli
+// src/install.ts) the fourth. Before lane D, `parachute-core install` was the hub's module installer ("no package
+// specified to add"). On the stock build all four fail (no root package.json, programs from lib/hub =
+// @openparachute/hub, no bin/parachute-core). The setup test proves the old global install is real.
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
-import { red } from "../lib.ts";
 import { candidate, freePort, safeFetch, until } from "../candidate-lib.ts";
 import { holders, json, must, newMachine, oldInstallHash, oldStock, requireCore, treeHash, type Machine } from "./_takeover-lib.ts";
-
-const NO_INSTALL = /parachute-core install --prefix exited \d+/;
 
 let machines: Machine[] = [];
 afterEach(async () => {
@@ -156,7 +153,7 @@ describe("identity", () => {
     }
   }, 120_000);
 
-  red("install and first run leave the old global packages byte-identical, and parachute still resolves to the old hub", { reason: NO_INSTALL, lane: "D" }, async () => {
+  test("install and first run leave the old global packages byte-identical, and parachute still resolves to the old hub", async () => {
     const stock = await oldStock();
     const m = await machine("id-install");
     const before = { bun: await oldInstallHash(m), npm: await treeHash(m.npmPrefix) };
@@ -183,6 +180,16 @@ describe("identity", () => {
     await firstRun(m, join(prefix, "bin", "parachute-core"), join(m.user, ".parachute-installed"));
     await unchanged("installed first run");
 
+    // Again, from the bundle (a second complete copy; <version> switches to it and the first is kept, since a running
+    // serve may use it), then from the installed copy itself (nothing copied). The installed command keeps working.
+    for (const [from, copies] of [[bin, 2], [join(prefix, "bin", "parachute-core"), 2]] as const) {
+      const again = await m.run([from, "install", "--prefix", prefix]);
+      must(again.code === 0, `parachute-core install again (from ${from}) exited ${again.code}: ${again.stderr.slice(-600)}`);
+      expect(json(await m.run([join(prefix, "bin", "parachute-core"), "version", "--json"]), "installed version --json").version).toBe(version);
+      expect({ from, copies: readdirSync(join(prefix, ".store")).filter((n) => !n.startsWith(".")).length }).toEqual({ from, copies });
+    }
+    await unchanged("installed again");
+
     // 3. With the install on PATH, `parachute` is still the old hub and `parachute-core` is core.
     const path = `${join(prefix, "bin")}:${m.env().PATH}`;
     const r = await m.run(["sh", "-c", "command -v parachute; parachute --version; command -v parachute-core; parachute-core version --json"], { env: { PATH: path } });
@@ -192,5 +199,27 @@ describe("identity", () => {
     expect(coreAt).toBe(join(prefix, "bin", "parachute-core"));
     expect(JSON.parse(coreJson!).name).toBe("@openparachute/core");
     await unchanged("after");
+  }, 180_000);
+
+  test("install: one at a time per prefix (a held lock refuses a second install; two at once leave one complete copy)", async () => {
+    const m = await machine("id-lock", false);
+    const bin = requireCore(m.info);
+    const prefix = join(m.user, ".local/share/parachute");
+    mkdirSync(join(prefix, ".store"), { recursive: true });
+    // Another install, as the OS sees it: a process holding the prefix's lock (flock(1), the same lock install takes).
+    const holder = m.spawn(["flock", "-o", join(prefix, ".store", ".lock"), "sleep", "600"]);
+    must(await until(async () => (await m.run(["flock", "-n", join(prefix, ".store", ".lock"), "true"])).code !== 0, 10_000), "setup: the holder never took the lock");
+    const busy = await m.run([bin, "install", "--prefix", prefix]);
+    expect({ code: busy.code, says: /another install/.test(busy.stderr), copies: readdirSync(join(prefix, ".store")).filter((n) => !n.startsWith(".")) }).toEqual({ code: 1, says: true, copies: [] });
+    // The holder gone (killed: the kernel drops its lock), installs go ahead. Two at once: each either completes or
+    // says another install is running, and what is left is complete copies only, with the command working.
+    await holder.stop("SIGKILL");
+    const both = await Promise.all([1, 2].map(() => m.run([bin, "install", "--prefix", prefix])));
+    for (const r of both) must(r.code === 0 || (r.code === 1 && /another install/.test(r.stderr)), `a concurrent install exited ${r.code}: ${r.stderr.slice(-400)}`);
+    must(both.some((r) => r.code === 0), "neither concurrent install completed");
+    const store = readdirSync(join(prefix, ".store")).filter((n) => !n.startsWith("."));
+    expect(store.filter((n) => n.endsWith(".tmp"))).toEqual([]);
+    expect(store.length).toBe(both.filter((r) => r.code === 0).length);
+    expect(json(await m.run([join(prefix, "bin", "parachute-core"), "version", "--json"]), "installed version --json").name).toBe("@openparachute/core");
   }, 180_000);
 });

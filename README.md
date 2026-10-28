@@ -22,11 +22,13 @@ say what that program must do, written so they ran against **today's** code firs
 | [`packages/hub/`](packages/hub/) | Today's hub, moved in with `git subtree` at `53d327b` (hub 0.7.19), history kept. |
 | [`packages/cli/`](packages/cli/) | The one command, `parachute-core`: the hub's commands, `vault <command>` for the vault's, and `version [--json]`. `parachute` and `parachute-vault` are aliases inside the built folder only. |
 | `package.json`, `bun.lock` | One Bun workspace over `packages/`. `bun.lock` keeps the versions the two repos had locked, except seven listed with their reasons in `scripts/check-dependency-tree.ts` (one otpauth and its @noble/hashes for both, the hub's @emnapi/runtime, and type packages). |
+| [`release/`](release/) | The v0.8 bundle: the tarball's tree (its own pinned Bun, a production `node_modules`, notices), ad hoc signing for macOS, `SHA256SUMS`. `parachute-core install` installs an unpacked bundle. |
 | [`contracts/`](contracts/) | A black-box contract suite (Bun + TypeScript). It talks to a running vault and hub over HTTP and MCP, the same doors real clients use. It never imports their code. |
 | [`contracts/harness/`](contracts/harness/) | Starts a throwaway vault and hub from today's repos at pinned commits, on random local ports, in a temp home; stops and deletes them after. |
 | [`PROCESS.md`](PROCESS.md) | How we build: what we reuse and what we rewrite, which tests we write, how a change lands, how people and agents work here together. |
 | [`AGENTS.md`](AGENTS.md) | The short rules for any agent (Uni's workers, Benjamin's agent, reviewers) working in this repo. |
 | `.github/workflows/contracts.yml` | CI: on every push and pull request, the moved code's own checks and tests, the contract suite against the pinned commits and against the core build, Benjamin's suite, then the mutants that prove it can fail. |
+| `.github/workflows/bundle-macos.yml` | CI on macos-14: the darwin-arm64 bundle signed ad hoc with the hardened runtime, unpacked to a path with a space; `embedded/bundle` and Benjamin's suite on the signed tree. On main, nightly, and pull requests that touch the bundle. |
 | [`docs/walkthrough/`](docs/walkthrough/) | The script and code for the short narrated walkthrough video. |
 
 Run the suite (needs Bun 1.4 and git):
@@ -36,7 +38,7 @@ bun install          # the workspace (packages/)
 cd contracts
 bun install
 bun run today        # clones vault + hub at the pinned commits (once), starts them, runs every contract, stops them
-bun run build:core   # builds packages/ as a candidate (.cache/candidate-core)
+bun run build:core   # builds packages/ as the v0.8 bundle (.cache/candidate-core; tarball in .cache/dist)
 bun run build:stock  # builds the pinned 0.7 programs, which takeover and identity need as "the old programs"
 bun run candidate    # every suite against the core build, in a sandbox
 bun run mutants      # breaks today's vault five ways; the contracts must catch each

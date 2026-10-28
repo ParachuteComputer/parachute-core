@@ -12,6 +12,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { buildCoreCandidate, stageWorkspace } from "./build-core-candidate.ts";
+import { installWorkspace } from "../../release/bundle.ts";
 import { CANDIDATE_MUTANTS, FLIPS, MUTANTS, type Mutant } from "./mutants.ts";
 
 async function run(cmd: string[], opts: { cwd: string; env?: Record<string, string> }) {
@@ -37,10 +38,10 @@ const snapshot = mkdtempSync(join(process.env.TMPDIR ?? tmpdir(), "pcore-cmut-ba
 const staged = { dir: join(snapshot, "lib"), rev: await stageWorkspace(resolve(contracts, ".."), join(snapshot, "lib")), installed: true };
 // Installed once, here: each mutant gets a copy of the installed workspace with its one change, so a network blip
 // in a mutant's own install can't stand in for a missed mutant. No mutant may change what install builds.
-{
-  const inst = await run(["bun", "install", "--frozen-lockfile"], { cwd: staged.dir });
-  if (inst.code !== 0) throw new Error(`bun install of the snapshot failed: ${inst.out.slice(-1500)}`);
-}
+// The bundle's install (release/bundle.ts): production node_modules, the admin pages built, the embedding stack left out.
+await installWorkspace(staged.dir).catch((err) => {
+  throw new Error(`install of the snapshot failed: ${(err as Error).message}`);
+});
 console.log(`[mutants:candidate] source ${staged.rev}`);
 let current: string | null = null;
 let child: ReturnType<typeof Bun.spawn> | null = null;

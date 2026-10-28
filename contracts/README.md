@@ -68,8 +68,11 @@ changes. So v0.8's suites run against **the candidate**: a built `parachute`, la
 
 - **A candidate** is a folder with `bin/parachute`, `bin/parachute-vault` and `CANDIDATE.json` (what it is, and a
   sha256 of every other file). `bun run build:core` builds this repo's workspace that way, with profile `v0.8`:
-  `bin/parachute-core` and its two aliases, `lib/` (the workspace, installed from the root `bun.lock`) and a
-  `package.json` naming `@openparachute/core`. It is what `bun run candidate` and `prism-compat` run by default.
+  the v0.8 bundle tree ([`release/`](../release/README.md)), which is what the tarball holds. `bin/parachute-core`
+  and its two aliases, `runtime/bun` (the pinned Bun), `lib/` (the workspace with a production install from the
+  root `bun.lock`, no embedding stack), a `package.json` naming `@openparachute/core`, the notices and the
+  entitlements. It also packs the tarball and `SHA256SUMS` into `.cache/dist/`. It is what `bun run candidate` and
+  `prism-compat` run by default; CI runs them on the tarball unpacked again.
   `bun run build:stock` builds today's hub and vault from `pins.json` into the same layout (profile `stock-0.7`);
   the suites that need the old programs (takeover, identity, rollback) find it in `.cache/candidate-stock`, or at
   `OLD_STOCK_DIR`.
@@ -86,6 +89,9 @@ changes. So v0.8's suites run against **the candidate**: a built `parachute`, la
   vault there. Inside, only loopback exists, plus a dummy interface holding the default route. An nftables counter
   counts every packet that tries to leave (`outboundPackets()`). The guard still refuses 1939–1946. On Ubuntu 24.04
   runners, CI turns off AppArmor's unprivileged user-namespace restriction first.
+- **On macOS** there are no namespaces. Only a GitHub runner may run a candidate there (`GITHUB_ACTIONS=true`), with
+  `bun run candidate -- --no-box`, which starts no box: CI's `bundle-macos` workflow runs `embedded/bundle` and
+  Benjamin's suite on the signed tree that way.
 - **Suites that start the candidate themselves** (`embedded/`, `lifecycle/`) use `suites/candidate-lib.ts`:
   `newHome()`, `cli()`, `start()`, `listeners()`, `outboundPackets()`.
 
@@ -129,10 +135,11 @@ that it tests the fix. When the real fix lands, its flip becomes mutants that pu
 | `compat/prism.test.ts` | **What Prism relies on**, from its code: passes as it mints them, its JWT check, REST shapes and 409/428s, tag-schema rights, MCP tools per scope against its allowlists, revocation. Green today; must stay green. Candidate only. |
 | `compat/uni.test.ts` | **One probe per client of uni's box** (`uni-writers.json`: call shapes only), NIP-98 in both shapes, single-use events and tickets, one process per `vault.db`, config files unchanged across a restart. Green today. Candidate only. |
 | `safety/*.test.ts` | **Fixes 2, 5–8, 13–15** (PLAN §5): loopback by default, `/view` scope, scoped writes attach or detach no tag the pass can't read and can't publish (REST and MCP), every reference resolves among the notes the caller may read, deletes only to subscribers who could see the note, search answers that don't depend on hidden notes, a mint never widens, unknown permission keys refused. Fixes 5–8 and 13–15 are green on the core build (lane F, in `packages/vault` and `packages/hub`) and red on the stock build (`CANDIDATE_DIR=.cache/candidate-stock`); loopback (fix 2) is still red, lane C. They stay here, not in `today/`, because `today/` runs against the pinned stock code. |
-| `embedded/*.test.ts` | **Embedded mode for Prism** (PLAN §3): serve, issuer (fix 1), JSON outputs, newer data (fix 4), modes (fix 3), bootstrap, refusals, ready and stop, offline (outbound trap), rollback to stock, hostile local callers. Red today, except issuer's CLI and box tests and `version --json` (green on the core build), and from lane B: mint/revoke `--json`, every newer-data case, the box modes case and the box `serve --offline` cases. |
+| `embedded/*.test.ts` | **Embedded mode for Prism** (PLAN §3): serve, issuer (fix 1), JSON outputs, newer data (fix 4), modes (fix 3), bootstrap, refusals, ready and stop, offline (outbound trap), rollback to stock, hostile local callers. Red today, except issuer's CLI and box tests and `version --json` (green on the core build), and from lane B: mint/revoke `--json`, every newer-data case, the box modes case and the box `serve --offline` cases; from lane D, the box CLI writing nothing outside the home. |
+| `embedded/bundle.test.ts` | **The bundle as shipped** (PLAN §3 "The bundle", "Signing"): the tarball's layout; its own pinned Bun with no Bun on PATH; the tarball and `SHA256SUMS` against the tree; no embedding stack or dev tools, native code only for the platform; notices for every package and the source commit; a run from a path with a space (argon2 sign-in, admin page, a write and a read); on macOS, every Mach-O signed ad hoc with the hardened runtime and only `runtime/bun` entitled (allow-jit). Green from lane D. |
 | `lifecycle/shutdown.test.ts` | **One shutdown coordinator** (PLAN §2.2, §7.4): every stop path keeps acknowledged writes, checkpoints the WAL, closes every port and removes its run files. |
 | `lifecycle/takeover.test.ts` | **First-run takeover** (PLAN §8.0): detect, dry run, backup, refuse while an old process holds the data, pause old units, same data, rollback. Red today. |
-| `lifecycle/identity.test.ts` | **The new name** (PLAN §2.5): `@openparachute/core` / `parachute-core`, with `parachute` and `parachute-vault` as aliases; the vault serve starts is core's own even with the old one first on PATH (green on the core build); installing it leaves the old global packages byte-identical (red until lane D). |
+| `lifecycle/identity.test.ts` | **The new name** (PLAN §2.5): `@openparachute/core` / `parachute-core`, with `parachute` and `parachute-vault` as aliases; the vault serve starts is core's own even with the old one first on PATH (green on the core build); installing it with `parachute-core install --prefix` leaves the old global packages byte-identical (green from lane D). |
 | `v1/sharing.test.ts` | Grants (who × what × how much). A pass alone grants nothing. Grants add up. Private notes are the exception inside a shared page. Revoking takes effect at once. |
 | `v1/connector-attribution.test.ts` | When an app writes for a person, the note names both. |
 

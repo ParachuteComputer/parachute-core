@@ -1,0 +1,100 @@
+# The v0.8 bundle as Prism ships it (PLAN §3 "The bundle" and "Signing", §7.3): built on macos-14 (arm64), signed
+# ad hoc with the hardened runtime (only runtime/bun gets an entitlement, allow-jit), packed, and unpacked to a path
+# with a space with Bun's developer caches removed. Then, on the signed tree:
+#   - embedded/bundle (layout, its own Bun, the tarball and SHA256SUMS, the payload, a run, the signatures);
+#   - Benjamin's suite, unchanged, with outbound network denied by sandbox-exec.
+# There are no namespaces on macOS: this runs only on a throwaway GitHub runner (harness/sandbox.ts onMacRunner).
+# The signed tarball and SHA256SUMS are kept as a workflow artifact for 14 days; this never makes a release.
+name: bundle-macos
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "release/**"
+      - "packages/cli/**"
+      - "contracts/harness/**"
+      - "contracts/suites/embedded/bundle.test.ts"
+      - "contracts/prism-compat-expected.json"
+      - "bun.lock"
+      - ".github/workflows/bundle-macos.yml"
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: bundle-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUN_VERSION: "1.4"
+
+jobs:
+  bundle-macos:
+    name: the signed bundle on macOS arm64 (embedded/bundle and Benjamin's suite on the signed tree)
+    runs-on: macos-14
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: cache the pinned checkouts (Benjamin's suite)
+        uses: actions/cache@v4
+        with:
+          path: contracts/.cache/repos
+          key: repos-macos-${{ hashFiles('contracts/pins.json') }}
+      - run: bun install --frozen-lockfile
+      - name: build the darwin-arm64 bundle, sign it ad hoc with the hardened runtime, and pack it
+        id: build
+        run: bun run build:core --out "$RUNNER_TEMP/build/candidate" --sign --pack "$RUNNER_TEMP/dist"
+      - name: unpack it to a path with a space (as Prism's Application Support is), and drop the developer caches
+        id: unpack
+        shell: bash
+        run: |
+          dest="$RUNNER_TEMP/Application Support/Prism/parachute"
+          mkdir -p "$dest"
+          tar -xzf "${{ steps.build.outputs.tarball }}" -C "$dest"
+          echo "dir=$dest/${{ steps.build.outputs.name }}" >> "$GITHUB_OUTPUT"
+          # Nothing the bundle runs may come from Bun's global cache (argon2 must load from the payload).
+          rm -rf ~/.bun/install/cache ~/Library/Caches/bun
+          cat "$RUNNER_TEMP/dist/SHA256SUMS"
+          codesign -dvvv "$dest/${{ steps.build.outputs.name }}/runtime/bun" 2>&1 | grep -E "^(Identifier|Format|CodeDirectory|Signature)"
+      - name: embedded/bundle on the signed tree (layout, pinned Bun, tarball, payload, a run, the signatures)
+        env:
+          CANDIDATE_DIR: ${{ steps.unpack.outputs.dir }}
+          CANDIDATE_TARBALL: ${{ steps.build.outputs.tarball }}
+          CANDIDATE_SHA256: ${{ steps.build.outputs.sha256 }}
+        shell: bash
+        run: |
+          bun run candidate -- --no-box suites/embedded/bundle.test.ts 2>&1 | tee "$RUNNER_TEMP/bundle.log"; test "${PIPESTATUS[0]}" -eq 0
+          grep -qx "\[candidate\] sha256 ${{ steps.build.outputs.sha256 }}" "$RUNNER_TEMP/bundle.log"
+          grep -q "^\[candidate\] unchanged after the run: sha256 ${{ steps.build.outputs.sha256 }}$" "$RUNNER_TEMP/bundle.log"
+          # The signature contract is skipped off macOS; here it must have run and passed.
+          grep -q "^(pass) embedded/bundle > macOS: every Mach-O is signed ad hoc" "$RUNNER_TEMP/bundle.log"
+      - name: fetch Benjamin's suite at its pin (before the network is denied)
+        shell: bash
+        run: |
+          repo=$(jq -r .prism.repo pins.json); commit=$(jq -r .prism.commit pins.json)
+          [ -d .cache/repos/prism/.git ] || git clone --quiet --filter=blob:none "$repo" .cache/repos/prism
+          git -C .cache/repos/prism checkout --quiet "$commit"
+      - name: his suite, unchanged, on the signed tree, with outbound network denied (sandbox-exec)
+        env:
+          CANDIDATE_DIR: ${{ steps.unpack.outputs.dir }}
+          CANDIDATE_SHA256: ${{ steps.build.outputs.sha256 }}
+        run: sandbox-exec -p '(version 1)(allow default)(deny network-outbound (remote ip "*:*"))(allow network-outbound (remote ip "localhost:*"))' bun run prism-compat
+      - name: keep the signed tarball and SHA256SUMS
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.build.outputs.name }}
+          path: |
+            ${{ runner.temp }}/dist/*.tar.gz
+            ${{ runner.temp }}/dist/SHA256SUMS
+          retention-days: 14

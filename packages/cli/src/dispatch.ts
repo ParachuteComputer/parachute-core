@@ -23,6 +23,9 @@
 //   - `serve --embedded` puts back loosened modes, and `serve --embedded` or `serve --offline` runs offline:
 //     PARACHUTE_OFFLINE=1 for this process and every child (no registry lookup, Buzz poller, model download,
 //     outbound webhook or mirror push).
+//
+// `parachute-core install` installs this bundle (install.ts, lane D). It is no longer the hub's module installer,
+// which runs `bun add -g` into the old global install; `parachute install` (the hub's name) still is.
 import { fileURLToPath } from "node:url";
 import { SCHEMA_VERSION } from "@openparachute/vault/core/src/schema.ts";
 import core from "../../../package.json" with { type: "json" };
@@ -44,6 +47,7 @@ function coreHelp(): string {
     "",
     "  parachute-core version [--json]   this program's name, version, data schema and Bun",
     "  parachute-core vault <command>    the vault's commands (what `parachute-vault <command>` was)",
+    "  parachute-core install [--prefix <dir>]   install this bundle for you (default ~/.local/share/parachute-core)",
     "  parachute-core <command>          the hub's commands (what `parachute <command>` was): serve, auth, …",
     "",
     "The hub's commands, for reference:",
@@ -52,7 +56,8 @@ function coreHelp(): string {
 }
 
 /** What a name and its arguments run: a built-in answer, or one of the moved CLIs with the arguments it gets. */
-export function route(role: Role, argv: string[]): { print: string } | { cli: "hub" | "vault"; argv: string[] } {
+export function route(role: Role, argv: string[]): { print: string } | { install: string[] } | { cli: "hub" | "vault"; argv: string[] } {
+  if (role === "core" && argv[0] === "install") return { install: argv.slice(1) };
   const cli = role === "vault" || (role === "core" && argv[0] === "vault") ? "vault" : "hub";
   const args = role === "core" && argv[0] === "vault" ? argv.slice(1) : argv;
   const [cmd, ...rest] = args;
@@ -75,6 +80,10 @@ export async function dispatch(role: Role): Promise<void> {
   if ("print" in r) {
     console.log(r.print);
     return;
+  }
+  if ("install" in r) {
+    const { install } = await import("./install.ts");
+    process.exit(install(r.install));
   }
   const home = homeDir();
   // Every command but `version` (answered above) runs behind the check, help included: the moved CLIs do work on
