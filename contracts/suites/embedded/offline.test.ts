@@ -6,11 +6,10 @@
 // loopback traffic doesn't. (Benjamin's lsof sampler passes without looking on Linux, PLAN §3.1 R4.)
 // The box cases (lane B) hold the switch itself: `serve --offline` sets PARACHUTE_OFFLINE for the hub and its vault
 // (packages/cli/src/dispatch.ts), and a webhook trigger off the machine, which calls out online (the control), doesn't
-// offline. `serve --embedded` sets the same switch; the embedded case is red until lane C's serve --embedded and
-// lane E's bootstrap exist.
+// offline. `serve --embedded` sets the same switch; the embedded case is green since lane E's bootstrap (lane C's
+// serve --embedded was in already).
 import { describe, expect, test } from "bun:test";
-import { red } from "../lib.ts";
-import { NO_BOOTSTRAP, inOwnNetwork, must } from "./_lib.ts";
+import { inOwnNetwork, must } from "./_lib.ts";
 
 describe("embedded/offline", () => {
   test("the trap counts: a connection attempt to a non-loopback address moves the counter", async () => {
@@ -40,7 +39,7 @@ describe("embedded/offline", () => {
     must(r.offlineLogged, "the vault's log doesn't say it skipped the webhook for being offline");
   });
 
-  red("start, bootstrap, a write and a stop send no packet off the machine", { reason: NO_BOOTSTRAP, lane: "E (B's and C's parts are in)" }, async () => {
+  test("start, bootstrap, a write and a stop send no packet off the machine", async () => {
     const r = await inOwnNetwork("offline.run.ts", { mode: "embedded" });
     must(r.after === r.before, `${r.after - r.before} packet(s) tried to leave by a non-loopback interface`);
   });

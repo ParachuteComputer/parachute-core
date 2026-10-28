@@ -13,7 +13,7 @@ import { randomBytes } from "node:crypto";
 import { candidateEnv } from "../../harness/candidate.ts";
 import { candidate, cli, listeners, listeningProcesses, newHome, safeFetch, until } from "../candidate-lib.ts";
 import { red, services } from "../lib.ts";
-import { servedHome, exitWithin, exited, mintJwt, must, ports, readyJson, serveEmbedded, snapshot, tail } from "./_lib.ts";
+import { embeddedHome, exitWithin, exited, mintJwt, must, ports, readyJson, serveEmbedded, snapshot, tail } from "./_lib.ts";
 
 const closed = (...ps: number[]) => !listeners().some((l) => ps.some((p) => l.endsWith(`:${p}`)));
 
@@ -49,7 +49,7 @@ describe("embedded/ready-stop", () => {
   });
 
   test("SIGTERM: exit 0 within 10 s, ready.json removed, both ports closed", async () => {
-    const e = await servedHome(newHome("stop"));
+    const e = await embeddedHome(newHome("stop"));
     const t0 = Date.now();
     const code = await e.stop("SIGTERM", 15_000);
     const ms = Date.now() - t0;
@@ -151,7 +151,7 @@ describe("embedded/ready-stop", () => {
     async () => {
       const home = newHome("e2");
       const before = new Set(snapshot(dirname(home)).keys());
-      const e = await servedHome(home);
+      const e = await embeddedHome(home);
       try {
         const t = await mintJwt(home, `vault:${e.vaultName}:write`);
         const w = await safeFetch(`${e.vault}/vault/${e.vaultName}/api/notes`, {

@@ -4,12 +4,12 @@
 // X-Forwarded-For/X-Real-IP: 127.0.0.1. Each probe gets a 4xx, and afterwards nothing it asked for happened (the
 // operator's token still works, no account was added, the vault still serves). The routes are in _hostile.ts.
 // Box mode is green today (run in a network of its own, so stop/restart probes can't touch the suite's own box,
-// hostile.run.ts). Embedded mode: green since lane C (packages/cli/src/embedded.ts), set up with servedHome() until
-// lane E's bootstrap.
+// hostile.run.ts). Embedded mode: green since lane C (packages/cli/src/embedded.ts), set up with `bootstrap --embedded`
+// (embeddedHome(), lane E).
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { newHome, safeFetch } from "../candidate-lib.ts";
-import { claims, servedHome, inOwnNetwork, mintJwt, must } from "./_lib.ts";
+import { claims, embeddedHome, inOwnNetwork, mintJwt, must } from "./_lib.ts";
 import { effects, forged, notRefused } from "./_hostile.ts";
 
 let box: any;
@@ -34,7 +34,7 @@ describe("embedded/hostile-local", () => {
 
   test(
     "embedded: no token, vault tokens and a forged operator token are refused on every admin, module and token route, and change nothing", async () => {
-      const e = await servedHome(newHome("hostile"));
+      const e = await embeddedHome(newHome("hostile"));
       try {
         const operator = readFileSync(e.boot.operator_token_file, "utf8").trim();
         const jti = claims(operator)?.jti;

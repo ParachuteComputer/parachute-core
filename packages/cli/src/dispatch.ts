@@ -29,7 +29,8 @@
 // which runs `bun add -g` into the old global install; `parachute install` (the hub's name) still is.
 //
 // Lane C: `serve --embedded` is core's own (embedded.ts), after those checks on the home it names (--home, else
-// PARACHUTE_HOME). While it holds a home, the commands that install, upgrade, expose, migrate or drive modules
+// PARACHUTE_HOME). Lane E: so is `bootstrap --embedded` (bootstrap.ts), the host's one-step setup, behind the same
+// checks on the home it names. While it holds a home, the commands that install, upgrade, expose, migrate or drive modules
 // are refused with managed_by_host, exit 2 (managed.ts, PLAN §3).
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -55,6 +56,7 @@ function coreHelp(): string {
     "  parachute-core version [--json]   this program's name, version, data schema and Bun",
     "  parachute-core vault <command>    the vault's commands (what `parachute-vault <command>` was)",
     "  parachute-core install [--prefix <dir>]   install this bundle for you (default ~/.local/share/parachute-core)",
+    "  parachute-core bootstrap --embedded …     set up a host-managed home in one step (see `bootstrap --help`)",
     "  parachute-core <command>          the hub's commands (what `parachute <command>` was): serve, auth, …",
     "",
     "The hub's commands, for reference:",
@@ -66,7 +68,7 @@ function coreHelp(): string {
 export function route(
   role: Role,
   argv: string[],
-): { print: string } | { install: string[] } | { embedded: string[] } | { cli: "hub" | "vault"; argv: string[] } {
+): { print: string } | { install: string[] } | { embedded: string[] } | { bootstrap: string[] } | { cli: "hub" | "vault"; argv: string[] } {
   if (role === "core" && argv[0] === "install") return { install: argv.slice(1) };
   const cli = role === "vault" || (role === "core" && argv[0] === "vault") ? "vault" : "hub";
   const args = role === "core" && argv[0] === "vault" ? argv.slice(1) : argv;
@@ -75,6 +77,7 @@ export function route(
     return { print: rest.includes("--json") ? JSON.stringify(versionJson()) : core.version };
   }
   if (cli === "hub" && cmd === "serve" && rest.includes("--embedded")) return { embedded: rest };
+  if (cli === "hub" && cmd === "bootstrap") return { bootstrap: rest };
   return { cli, argv: args };
 }
 
@@ -131,13 +134,15 @@ export async function dispatch(role: Role): Promise<void> {
     const { install } = await import("./install.ts");
     process.exit(install(r.install));
   }
-  // `serve --embedded` names its home with --home or PARACHUTE_HOME; with neither it exits 2 before touching
-  // anything (embedded.ts), so there is no home to check.
+  // `serve --embedded` and `bootstrap` name their home with --home or PARACHUTE_HOME; with neither they exit 2
+  // before touching anything (embedded.ts, bootstrap.ts), so there is no home to check.
   const embeddedArgs = "embedded" in r ? r.embedded : undefined;
-  if (embeddedArgs) {
-    const flag = homeFlag(embeddedArgs);
+  const bootstrapArgs = "bootstrap" in r ? r.bootstrap : undefined;
+  const hostArgs = embeddedArgs ?? bootstrapArgs;
+  if (hostArgs) {
+    const flag = homeFlag(hostArgs);
     if (flag.twice) {
-      console.error("parachute serve --embedded: --home given twice");
+      console.error(`parachute ${embeddedArgs ? "serve --embedded" : "bootstrap"}: --home given twice`);
       process.exit(2);
     }
     if (flag.home) process.env.PARACHUTE_HOME = resolve(flag.home);
@@ -145,7 +150,7 @@ export async function dispatch(role: Role): Promise<void> {
   const home = homeDir();
   // Every command but `version` (answered above) runs behind the check, help included: the moved CLIs do work on
   // the home before they read their arguments (the vault moves older layouts first), so `serve --help` is a command.
-  if (!embeddedArgs || process.env.PARACHUTE_HOME) {
+  if (!hostArgs || process.env.PARACHUTE_HOME) {
     const { HUB_SCHEMA_VERSION } = await import("@openparachute/hub/src/hub-db.ts");
     const { newer, unchecked } = newerData(home, { hub: HUB_SCHEMA_VERSION, vault: SCHEMA_VERSION });
     const name = role === "core" ? "parachute-core" : role === "hub" ? "parachute" : "parachute-vault";
@@ -167,6 +172,10 @@ export async function dispatch(role: Role): Promise<void> {
     if (process.env.PARACHUTE_HOME) for (const line of repairModes(home)) console.error(`parachute: mode repaired: ${line}`);
     const { serveEmbedded } = await import("./embedded.ts");
     process.exit(await serveEmbedded(embeddedArgs));
+  }
+  if (bootstrapArgs) {
+    const { bootstrap } = await import("./bootstrap.ts");
+    process.exit(await bootstrap(bootstrapArgs));
   }
   if (!("cli" in r)) return;
   const refusal = managedRefusal(r.cli, r.argv);
