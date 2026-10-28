@@ -1,5 +1,6 @@
 // Run by offline.test.ts in a network of its own with its own trap (_lib.ts report({trap: true})): only what this
 // script starts can move the counter. It reports the counter before and after; the assertions are in the test.
+import dgram from "node:dgram";
 import { appendFileSync } from "node:fs";
 import { join } from "node:path";
 import { allowOrigins, freePort, newHome, outboundPackets, safeFetch } from "../candidate-lib.ts";
@@ -10,12 +11,20 @@ import { binaries, run, serveBox } from "./_stock.ts";
 const OFF_MACHINE = "http://198.51.100.1:9";
 
 await report(
-  async (input: { mode: "trap" | "loopback" | "embedded" | "box"; offline?: boolean }) => {
+  async (input: { mode: "trap" | "multicast" | "loopback" | "embedded" | "box"; offline?: boolean }) => {
     const before = outboundPackets();
     if (input.mode === "trap") {
       // Positive control: a connection to a documentation address has to leave by the trap.
       allowOrigins(OFF_MACHINE);
       await safeFetch(`${OFF_MACHINE}/`, { signal: AbortSignal.timeout(1500) }).catch(() => undefined);
+    } else if (input.mode === "multicast") {
+      // Positive control: an ordinary UDP socket that joins an IPv6 multicast group makes the kernel send an MLD
+      // report off the machine. No raw socket needed, so the trap must count it.
+      const s = dgram.createSocket({ type: "udp6", reuseAddr: true });
+      await new Promise<void>((done) => s.bind(0, () => done()));
+      s.addMembership("ff15::db8:1", "::%pctrap0");
+      await Bun.sleep(1500);
+      s.close();
     } else if (input.mode === "loopback") {
       // Negative control: loopback traffic doesn't count.
       const s = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("ok") });

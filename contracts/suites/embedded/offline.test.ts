@@ -18,6 +18,11 @@ describe("embedded/offline", () => {
     expect(r.after).toBeGreaterThan(r.before);
   });
 
+  test("the trap counts what a program makes the kernel send: an IPv6 multicast join's MLD report", async () => {
+    const r = await inOwnNetwork("offline.run.ts", { mode: "multicast" });
+    expect(r.after).toBeGreaterThan(r.before);
+  });
+
   test("the trap is quiet for loopback: requests to a local server don't move the counter", async () => {
     const r = await inOwnNetwork("offline.run.ts", { mode: "loopback" });
     expect(r.after).toBe(r.before);

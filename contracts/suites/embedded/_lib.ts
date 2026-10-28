@@ -195,8 +195,26 @@ export async function inOwnNetwork(script: string, input: unknown = {}, timeoutM
   return JSON.parse(line.slice(9));
 }
 
-/** ICMPv6 types the kernel sends by itself on an interface that comes up (see report()). */
-export const KERNEL_ND = "{ nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert, mld-listener-report, mld2-listener-report }";
+/**
+ * An interface that comes up sends the kernel's own IPv6 discovery (router solicitations, the duplicate-address check)
+ * at its own times; CI saw one such packet land inside a test. Both are switched off on the trap before it comes up,
+ * and the trap waits until its counter has been still for 2 s (at most 15 s) before the script runs. Nothing is
+ * exempt from the count: a program that makes the kernel send anything off the machine (an IPv6 multicast join's
+ * MLD report included) is counted, which offline.test.ts proves.
+ */
+const TRAP_SYSCTLS = ["router_solicitations", "dad_transmits"];
+
+async function settleTrap(): Promise<void> {
+  const count = () => Number(/counter packets (\d+)/.exec(Bun.spawnSync(["nft", "list", "table", "inet", "pctrap"]).stdout.toString())?.[1]);
+  let last = count();
+  let still = 0;
+  for (let waited = 0; waited < 15_000 && still < 2_000; waited += 250) {
+    await Bun.sleep(250);
+    const now = count();
+    still = now === last ? still + 250 : 0;
+    last = now;
+  }
+}
 
 /** The body of an `inOwnNetwork` script: bring loopback up, run `fn`, print its result (or its error). */
 export async function report(fn: (input: any) => Promise<unknown>, opts: { trap?: boolean } = {}): Promise<void> {
@@ -206,16 +224,13 @@ export async function report(fn: (input: any) => Promise<unknown>, opts: { trap?
   if (opts.trap) {
     steps.push(
       ["ip", "link", "add", "pctrap0", "type", "dummy"],
+      ...TRAP_SYSCTLS.map((k) => ["sh", "-c", `echo 0 > /proc/sys/net/ipv6/conf/pctrap0/${k}`]),
       ["ip", "addr", "add", "198.18.0.1/15", "dev", "pctrap0"],
       ["ip", "link", "set", "pctrap0", "up"],
       ["ip", "route", "add", "default", "dev", "pctrap0"],
       ["ip", "-6", "route", "add", "default", "dev", "pctrap0"],
       ["nft", "add", "table", "inet", "pctrap"],
       ["nft", "add", "chain", "inet", "pctrap", "out", "{ type filter hook output priority 0; }"],
-      // The kernel's own IPv6 discovery on the dummy interface (router and neighbour solicitations, MLD reports)
-      // leaves at its own times and isn't the program under test; a program can't send those without raw sockets.
-      // Seen in CI: one 56-byte packet in a 12 s window with nothing running.
-      ["nft", "add", "rule", "inet", "pctrap", "out", "oifname", "!=", "lo", "icmpv6", "type", KERNEL_ND, "return"],
       ["nft", "add", "rule", "inet", "pctrap", "out", "oifname", "!=", "lo", "counter"],
     );
   }
@@ -226,6 +241,7 @@ export async function report(fn: (input: any) => Promise<unknown>, opts: { trap?
       process.exit(1);
     }
   }
+  if (opts.trap) await settleTrap();
   try {
     const result = await fn(JSON.parse(process.env.EMBEDDED_INPUT ?? "{}"));
     console.log(`@@RESULT ${JSON.stringify(result ?? null)}`);

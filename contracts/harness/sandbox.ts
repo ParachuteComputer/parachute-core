@@ -15,7 +15,7 @@
 // The trap: a dummy interface holds the default route, and an nftables counter counts every packet that leaves
 // by anything but loopback. Nothing it counts can get anywhere (the dummy drops it), and the count is how
 // "no outbound connection" is proved rather than sampled (embedded/offline).
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 
 export const SANDBOX_ENV = "PCORE_SANDBOX";
 const TRAP_IF = "pctrap0";
@@ -150,15 +150,14 @@ function setUpNetwork(): void {
   const live = listeningPorts();
   if (live.length) throw new Error(`sandbox: fresh namespace already has listeners on ${live.join(", ")}`);
   must(["ip", "link", "add", TRAP_IF, "type", "dummy"]);
+  // No router solicitations or duplicate-address checks of the kernel's own (suites/embedded/_lib.ts report()).
+  for (const k of ["router_solicitations", "dad_transmits"]) writeFileSync(`/proc/sys/net/ipv6/conf/${TRAP_IF}/${k}`, "0");
   must(["ip", "addr", "add", "198.18.0.1/15", "dev", TRAP_IF]);
   must(["ip", "link", "set", TRAP_IF, "up"]);
   must(["ip", "route", "add", "default", "dev", TRAP_IF]);
   must(["ip", "-6", "route", "add", "default", "dev", TRAP_IF]);
   must(["nft", "add", "table", "inet", "pctrap"]);
   must(["nft", "add", "chain", "inet", "pctrap", "out", "{ type filter hook output priority 0; }"]);
-  // Not the kernel's own IPv6 discovery on the trap interface (suites/embedded/_lib.ts report() says why).
-  must(["nft", "add", "rule", "inet", "pctrap", "out", "oifname", "!=", "lo", "icmpv6", "type",
-    "{ nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert, mld-listener-report, mld2-listener-report }", "return"]);
   must(["nft", "add", "rule", "inet", "pctrap", "out", "oifname", "!=", "lo", "counter"]);
 }
 
