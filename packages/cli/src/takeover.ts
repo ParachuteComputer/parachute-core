@@ -226,10 +226,10 @@ function envFileHome(body: string): string | undefined | null {
   let home: string | undefined;
   for (const line of body.split("\n")) {
     if (/^\s*$/.test(line) || /^\s*[#;]/.test(line)) continue;
-    const m = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/.exec(line);
+    const m = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/.exec(line); // no `export`: systemd isn't a shell
     if (!m) return null;
     const raw = m[2]!;
-    if (raw.includes("\\")) return null;
+    if (raw.includes("\\") || raw.includes("$")) return null;
     let value = raw;
     const q = raw[0];
     if (q === '"' || q === "'") {
@@ -279,8 +279,19 @@ function managerHome(): string | undefined | null {
 export function unitHome(text: string, manager: () => string | undefined | null = managerHome): string | "unknown" {
   let fromEnv: string | undefined;
   let files: { path: string; optional: boolean }[] = [];
+  let section = "";
   for (const line of text.split("\n")) {
+    if (/^\s*[#;]/.test(line)) continue;
+    // A continuation joins lines into one (systemd.syntax(7)): not read here.
+    if (/\\\s*$/.test(line)) return "unknown";
+    const head = /^\s*\[([^\]]+)\]\s*$/.exec(line);
+    if (head) {
+      section = head[1]!;
+      continue;
+    }
+    if (section !== "Service") continue; // Environment= counts only in [Service]
     if (/^\s*(UnsetEnvironment|PassEnvironment)\s*=.*\bPARACHUTE_HOME\b/.test(line)) return "unknown";
+    if (/^\s*Exec\w*\s*=.*\bPARACHUTE_HOME\b/.test(line)) return "unknown"; // a command that sets it itself
     const env = /^\s*Environment\s*=\s*(.*)$/.exec(line)?.[1];
     if (env !== undefined) {
       if (env.trim() === "") fromEnv = undefined;
@@ -289,7 +300,7 @@ export function unitHome(text: string, manager: () => string | undefined | null 
       for (const w of words) {
         if (!w.startsWith("PARACHUTE_HOME=")) continue;
         const v = specifiers(w.slice("PARACHUTE_HOME=".length));
-        if (v === null) return "unknown";
+        if (v === null || v.includes("$")) return "unknown";
         fromEnv = v;
       }
       continue;
@@ -318,11 +329,30 @@ export function unitHome(text: string, manager: () => string | undefined | null 
     if (v === null) return "unknown";
     if (v !== undefined) fromFiles = v;
   }
+  // An explicit empty value is set (the program then uses ~/.parachute, as configDir does); only an absent one falls
+  // through to the manager's environment.
   const set = fromFiles ?? fromEnv;
-  if (set) return set;
+  if (set !== undefined) return set || join(userHome(), ".parachute");
   const fromManager = manager();
   if (fromManager === null) return "unknown";
   return fromManager || join(userHome(), ".parachute");
+}
+
+/**
+ * The home a running process was given: PARACHUTE_HOME in /proc/<pid>/environ, else its HOME's .parachute (the
+ * hub's and vault's configDir). undefined when it can't be read (not Linux, another user's process).
+ */
+function processHome(pid: number): string | undefined {
+  try {
+    const vars = readFileSync(`/proc/${pid}/environ`, "utf8").split("\0");
+    const get = (k: string) => vars.find((v) => v.startsWith(`${k}=`))?.slice(k.length + 1);
+    const set = get("PARACHUTE_HOME");
+    if (set) return set;
+    const home = get("HOME");
+    return home ? join(home, ".parachute") : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -332,14 +362,15 @@ export function unitHome(text: string, manager: () => string | undefined | null 
 function unitServes(text: string, home: string, unsure: boolean): boolean {
   const theirs = unitHome(text);
   if (theirs === "unknown") return unsure;
-  const same = (a: string, b: string) => {
-    try {
-      return realpathSync(a) === realpathSync(b);
-    } catch {
-      return resolve(a) === resolve(b);
-    }
-  };
-  return same(theirs, home);
+  return sameHome(theirs, home);
+}
+
+function sameHome(a: string, b: string): boolean {
+  try {
+    return realpathSync(a) === realpathSync(b);
+  } catch {
+    return resolve(a) === resolve(b);
+  }
 }
 
 /**
@@ -389,7 +420,14 @@ function systemdUnits(home: string): Unit[] {
     const text = unitText(name);
     const active = run(["systemctl", "--user", "is-active", name]).stdout.trim() === "active";
     const enabled = run(["systemctl", "--user", "is-enabled", name]).stdout.trim() === "enabled";
-    out.push({ name, manager: "systemd", active, enabled, ...(file ? { file } : {}), old: runsOld(name, text) && unitServes(text, home, false), ...(runsOld(name, text) && unitHome(text) === "unknown" ? { home_unknown: true } : {}) });
+    // A running unit's process says for itself which home it was given; when it disagrees with the configuration (a
+    // wrapper script, a syntax read wrongly), the home is unknown and the unit is left alone.
+    let configured = unitHome(text);
+    const pid = active ? mainPid(name) : 0;
+    const given = pid > 0 ? processHome(pid) : undefined;
+    if (configured !== "unknown" && given !== undefined && !sameHome(configured, given)) configured = "unknown";
+    const old = runsOld(name, text);
+    out.push({ name, manager: "systemd", active, enabled, ...(file ? { file } : {}), old: old && configured !== "unknown" && sameHome(configured, home), ...(old && configured === "unknown" ? { home_unknown: true } : {}) });
   }
   return out;
 }
