@@ -129,9 +129,14 @@ export interface StartVaultOptions {
    * `parachute-core serve` passes the latter: core never rewrites services.json otherwise, because the old hub needs
    * it as it is for a rollback (PLAN §2.2 item 3).
    */
-  selfRegister?: true | "after-first-boot";
+  selfRegister?: true | "after-first-boot" | false;
   /** The vault first boot creates, when there are none. Default: `PARACHUTE_VAULT_NAME`. */
   firstBootVaultName?: string;
+  /**
+   * Create a first vault when there are none (default true). `false` under `serve --embedded`: the host bootstraps
+   * the home, and first boot would log a full API key (PLAN §2.2 item 3, §3).
+   */
+  firstBoot?: boolean;
   /** Print the first-boot vault's full API key in the log, as `parachute-vault serve` did. Default true. */
   logFirstBootKey?: boolean;
   /** Called when `parachute-vault stop` writes the stop file. Default: nothing but the log line. */
@@ -460,7 +465,8 @@ export async function startVault(opts: StartVaultOptions = {}): Promise<RunningV
     // logic lives in auth.ts (import-safe + unit-tested); see warnLegacyGlobalApiKeys.
     warnLegacyGlobalApiKeys(readGlobalConfig().api_keys);
 
-    const createdOnFirstBoot = await firstBootCreate(opts.firstBootVaultName ?? process.env.PARACHUTE_VAULT_NAME, opts.logFirstBootKey ?? true);
+    const createdOnFirstBoot =
+      opts.firstBoot === false ? false : await firstBootCreate(opts.firstBootVaultName ?? process.env.PARACHUTE_VAULT_NAME, opts.logFirstBootKey ?? true);
 
     // vault#266 — self-register manifest + installDir into services.json so
     // hub's discovery / admin SPA can find vault without a `parachute install
@@ -468,7 +474,7 @@ export async function startVault(opts: StartVaultOptions = {}): Promise<RunningV
     // changed); never throws (boot must not fail on bookkeeping). The merge-
     // preserving `upsertService` ensures any hub-stamped fields on the row
     // survive — see self-register.ts header for the v0.6 vs v0.7 design note.
-    if ((opts.selfRegister ?? true) === true || createdOnFirstBoot) selfRegister({ version: pkg.version });
+    if (opts.selfRegister !== false && ((opts.selfRegister ?? true) === true || createdOnFirstBoot)) selfRegister({ version: pkg.version });
 
     // Loud boot warning for vaults squatting a shadowed reserved name (B2 of the
     // 2026-06-09 hub-module-boundary migration). A vault named `admin`/`new`/

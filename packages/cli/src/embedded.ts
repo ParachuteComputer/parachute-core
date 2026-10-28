@@ -206,8 +206,9 @@ function startVaultChild(o: { home: string; host: string; port: number; issuer: 
     PARACHUTE_HUB_JWKS_ORIGIN: o.hubLoopback,
     // managed.ts lets exactly this child's `parachute-vault serve` through while the home is held.
     PARACHUTE_EMBEDDED_PARENT: String(process.pid),
-    // Core never rewrites services.json: the stock hub needs it as it was to roll back (PLAN §3).
-    PARACHUTE_VAULT_SELF_REGISTER: "0",
+    // No first-boot vault and no services.json write (vault src/server.ts): the host bootstraps, and the stock hub
+    // needs services.json as it was to roll back (PLAN §2.2 item 3, §3).
+    PARACHUTE_VAULT_HOST_MANAGED: "1",
   });
   const proc = Bun.spawn([process.execPath, VAULT_CLI, "serve"], { env, stdin: "ignore", stdout: "inherit", stderr: "pipe" });
   let tail = "";

@@ -287,6 +287,22 @@ describe("embedded/serve", () => {
     must(readFileSync(join(home, "embedded.json"), "utf8") === corrupt, "embedded.json was rewritten");
   });
 
+  test("a vault/.env naming a first-boot vault: serve --embedded creates no vault, logs no key and writes no services.json", async () => {
+    // The host bootstraps an embedded home (PLAN §2.2 item 3, §3); first boot would log a full API key and register
+    // itself in services.json, which a stock hub needs as it was to roll back (Codex review 11).
+    const home = newHome("serve");
+    mkdirSync(join(home, "vault"), { recursive: true, mode: 0o700 });
+    writeFileSync(join(home, "vault", ".env"), "PARACHUTE_VAULT_NAME=bootone\n", { mode: 0o600 });
+    const e = await serveEmbedded(home);
+    try {
+      must(!existsSync(join(home, "vault", "data", "bootone")), "first boot created the vault bootone");
+      must(!existsSync(join(home, "services.json")), "serve --embedded wrote services.json");
+      must(!/API key|pvk_/.test(e.log()), "a first-boot API key was logged");
+    } finally {
+      await e.stop();
+    }
+  });
+
   test("run/ready.json reports both ports, the issuer and the pid", async () => {
     const e = await serveEmbedded(newHome("serve"));
     try {
