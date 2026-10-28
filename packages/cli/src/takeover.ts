@@ -60,6 +60,8 @@ import { bundleRoot } from "./install.ts";
 export const EXIT = { ok: 0, failed: 1, usage: 2, noRoom: 5, held: 7, checkFailed: 8 } as const;
 export const RECORD_FILE = "takeover.json";
 const CORE_UNIT = "parachute-core.service";
+/** The first line of a core unit a takeover writes, followed by the home: rollback checks it before touching the unit. */
+const CORE_UNIT_MARK = "written by parachute-core takeover for";
 const CORE_ENTRY = fileURLToPath(new URL("./parachute-core.ts", import.meta.url));
 /** The old programs' own unit names. Any other unit whose command runs the old hub or vault counts too. */
 const OLD_UNIT_NAMES = new Set(["parachute-hub.service", "parachute-vault.service"]);
@@ -91,8 +93,11 @@ export interface Unit {
   file?: string;
   /** Runs the old hub or vault: the takeover pauses it. Other Parachute units (a tunnel, scribe) are left alone. */
   old: boolean;
-  /** Runs the old programs, but which home it serves can't be read from its configuration: left alone. */
-  home_unknown?: boolean;
+  /**
+   * Looks like the old hub or vault (its name or command), is enabled, but isn't running: what it serves can't be
+   * seen, so takeover won't go ahead until it is started (and seen) or disabled.
+   */
+  unseen?: boolean;
 }
 
 export interface Holder {
@@ -100,6 +105,8 @@ export interface Holder {
   cmd: string;
   /** The systemd unit the process belongs to, if any. */
   unit?: string;
+  /** It also has another home's databases open (a hub.db or vault.db that isn't this home's). */
+  other?: boolean;
 }
 
 export interface VaultInfo {
@@ -400,8 +407,22 @@ function runsOld(name: string, text: string): boolean {
   return OLD_UNIT_NAMES.has(name) || OLD_COMMAND.test(execs);
 }
 
+/** The names of Parachute's systemd user units (core's own included), from the user folder and systemd's list. */
+function parachuteUnitNames(): string[] {
+  if (process.platform !== "linux" || !Bun.which("systemctl")) return [];
+  const names = new Set<string>();
+  try {
+    for (const f of readdirSync(systemdUnitDir())) if (/^parachute[\w@.-]*\.service$/.test(f)) names.add(f);
+  } catch {}
+  for (const line of run(["systemctl", "--user", "list-unit-files", "--no-legend", "--no-pager", "parachute*"]).stdout.split("\n")) {
+    const m = /^(parachute[\w@.-]*\.service)\s/.exec(line.trim());
+    if (m) names.add(m[1]!);
+  }
+  return [...names].sort();
+}
+
 /** Parachute's systemd user units (not core's own), with state; and which of them run the old programs on `home`. */
-function systemdUnits(home: string): Unit[] {
+function systemdUnits(home: string, held: Holder[]): Unit[] {
   if (process.platform !== "linux" || !Bun.which("systemctl")) return [];
   const names = new Set<string>();
   const dir = systemdUnitDir();
@@ -418,16 +439,24 @@ function systemdUnits(home: string): Unit[] {
   for (const name of [...names].sort()) {
     const file = existsSync(join(dir, name)) ? join(dir, name) : undefined;
     const text = unitText(name);
-    const active = run(["systemctl", "--user", "is-active", name]).stdout.trim() === "active";
+    const state = run(["systemctl", "--user", "is-active", name]).stdout.trim();
+    const active = state === "active";
     const enabled = run(["systemctl", "--user", "is-enabled", name]).stdout.trim() === "enabled";
-    // A running unit's process says for itself which home it was given; when it disagrees with the configuration (a
-    // wrapper script, a syntax read wrongly), the home is unknown and the unit is left alone.
-    let configured = unitHome(text);
-    const pid = active ? mainPid(name) : 0;
-    const given = pid > 0 ? processHome(pid) : undefined;
-    if (configured !== "unknown" && given !== undefined && !sameHome(configured, given)) configured = "unknown";
-    const old = runsOld(name, text);
-    out.push({ name, manager: "systemd", active, enabled, ...(file ? { file } : {}), old: old && configured !== "unknown" && sameHome(configured, home), ...(old && configured === "unknown" ? { home_unknown: true } : {}) });
+    // Paused only on evidence: a process of this unit has this home's databases open (holders(): by device and
+    // inode). What its configuration says decides nothing here; that can't be read reliably (wrappers, bind mounts,
+    // working directories, systemd's grammar).
+    const running = !["inactive", "failed", "unknown", ""].includes(state);
+    const holds = held.some((h) => h.unit === name);
+    const looksOld = runsOld(name, text);
+    out.push({
+      name,
+      manager: "systemd",
+      active,
+      enabled,
+      ...(file ? { file } : {}),
+      old: holds,
+      ...(looksOld && !holds && !running && enabled ? { unseen: true } : {}),
+    });
   }
   return out;
 }
@@ -463,9 +492,18 @@ function dataFiles(home: string): string[] {
 
 /** Processes (not this one) holding any of the home's databases open, with the systemd unit each belongs to. */
 export function holders(home: string): Holder[] {
-  const files = new Set(dataFiles(home));
+  const files = dataFiles(home);
   const out: Holder[] = [];
   if (process.platform === "linux") {
+    // Compared by device and inode, read through /proc/<pid>/fd: the open file itself, whatever path, symlink, bind
+    // mount or working directory the process reached it by.
+    const ids = new Set<string>();
+    for (const f of files) {
+      try {
+        const st = statSync(f);
+        ids.add(`${st.dev}:${st.ino}`);
+      } catch {}
+    }
     for (const name of readdirSync("/proc")) {
       if (!/^\d+$/.test(name) || Number(name) === process.pid) continue;
       let fds: string[] = [];
@@ -474,13 +512,25 @@ export function holders(home: string): Holder[] {
       } catch {
         continue;
       }
-      const holds = fds.some((fd) => {
+      let holds = false;
+      let other = false;
+      for (const fd of fds) {
+        let st;
         try {
-          return files.has(readlinkSync(`/proc/${name}/fd/${fd}`));
+          st = statSync(`/proc/${name}/fd/${fd}`);
         } catch {
-          return false;
+          continue;
         }
-      });
+        if (!st.isFile()) continue;
+        if (ids.has(`${st.dev}:${st.ino}`)) holds = true;
+        else {
+          let link = "";
+          try {
+            link = readlinkSync(`/proc/${name}/fd/${fd}`);
+          } catch {}
+          if (/(^|\/)(hub|vault)\.db(-wal|-shm)?$/.test(link)) other = true;
+        }
+      }
       if (!holds) continue;
       let cmd = "";
       let unit: string | undefined;
@@ -493,11 +543,11 @@ export function holders(home: string): Holder[] {
         const services = [...readFileSync(`/proc/${name}/cgroup`, "utf8").matchAll(/\/([\w@.-]+\.service)(?=\/|$)/gm)].map((m) => m[1]!);
         unit = services.filter((u) => !u.startsWith("user@")).pop();
       } catch {}
-      out.push({ pid: Number(name), cmd, ...(unit ? { unit } : {}) });
+      out.push({ pid: Number(name), cmd, ...(unit ? { unit } : {}), ...(other ? { other } : {}) });
     }
     return out;
   }
-  const existing = [...files].filter((f) => existsSync(f));
+  const existing = files.filter((f) => existsSync(f));
   if (existing.length === 0 || !Bun.which("lsof")) return out;
   const r = run(["lsof", "-t", ...existing]);
   for (const pid of new Set(r.stdout.split(/\s+/).filter(Boolean).map(Number))) {
@@ -505,6 +555,34 @@ export function holders(home: string): Holder[] {
     out.push({ pid, cmd: run(["ps", "-o", "command=", "-p", String(pid)]).stdout.trim() });
   }
   return out;
+}
+
+/**
+ * holders(), each attributed to the unit whose main process it is or descends from (a unit's MainPID and its children
+ * are its processes, as its cgroup holds them); a holder of none of `units` keeps its cgroup's unit.
+ */
+export function heldBy(home: string, units: string[]): Holder[] {
+  const held = holders(home);
+  if (held.length === 0 || process.platform !== "linux") return held;
+  const parent = new Map<number, number>();
+  for (const name of readdirSync("/proc")) {
+    if (!/^\d+$/.test(name)) continue;
+    try {
+      const stat = readFileSync(`/proc/${name}/stat`, "utf8");
+      parent.set(Number(name), Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1]));
+    } catch {}
+  }
+  const roots = units.map((u) => [u, mainPid(u)] as const).filter(([, pid]) => pid > 0);
+  for (const h of held) {
+    for (let p: number | undefined = h.pid, hops = 0; p && p > 1 && hops < 64; p = parent.get(p), hops++) {
+      const root = roots.find(([, pid]) => pid === p);
+      if (root) {
+        h.unit = root[0];
+        break;
+      }
+    }
+  }
+  return held;
 }
 
 /** A query on a database without changing a byte of the home (home.ts readDatabase: immutable, or a scratch link). */
@@ -578,6 +656,7 @@ export async function detect(home: string): Promise<Detected> {
   const { HUB_SCHEMA_VERSION } = await import("@openparachute/hub/src/hub-db.ts");
   const { SCHEMA_VERSION } = await import("@openparachute/vault/core/src/schema.ts");
   const { resolveHubIssuer } = await import("@openparachute/hub/src/hub-issuer.ts");
+  const held = heldBy(home, parachuteUnitNames());
   const vaults: VaultInfo[] = [];
   const migrations: string[] = [];
   let hubSchema: number | null = null;
@@ -602,8 +681,8 @@ export async function detect(home: string): Promise<Detected> {
   return {
     home,
     old: oldInstalls(),
-    units: [...systemdUnits(home), ...launchdUnits()],
-    running: holders(home),
+    units: [...systemdUnits(home, held), ...launchdUnits()],
+    running: held,
     vaults,
     hub_schema: hubSchema,
     migrations,
@@ -627,7 +706,7 @@ function size(n: number): string {
 }
 
 function plan(d: Detected): string[] {
-  const pause = d.units.filter((u) => u.old && (u.active || u.enabled)).map((u) => u.name);
+  const pause = d.units.filter((u) => u.old).map((u) => u.name);
   const steps = [
     pause.length ? `pause ${pause.join(" and ")} (stop and disable; the unit files stay)` : "nothing to pause: no old unit is on",
     `back up the home to ${tilde(join(dirname(d.home), "parachute-takeover"))}/<time>/, with a sha256 for every file`,
@@ -646,7 +725,11 @@ export function describe(d: Detected): string {
   lines.push(found.length ? `Found Parachute ${found.join(" and ")} installed in ${where.join(" and ")}.` : "No old Parachute programs are installed globally (bun or npm).");
   for (const u of d.units) {
     const state = `${u.active ? "running" : "not running"}, ${u.enabled ? "starts at login" : "off at login"}`;
-    const why = u.home_unknown ? " (can't tell which home it serves from its configuration: left alone; if it holds this home's data, takeover stops)" : u.old ? "" : " (not the old hub or vault on this home: left alone)";
+    const why = u.old
+      ? " (has this home's data open: it will be paused)"
+      : u.unseen
+        ? " (enabled but not running, so which home it serves can't be seen: start it, or disable it, before taking over)"
+        : " (doesn't have this home's data open: left alone)";
     lines.push(`  ${u.manager} unit ${u.name}: ${state}${why}`);
   }
   for (const h of d.running) lines.push(`  process ${h.pid} has the data open${h.unit ? ` (${h.unit})` : ""}: ${h.cmd.slice(0, 120)}`);
@@ -962,6 +1045,35 @@ function unitPort(env: string[], home: string): number {
   return 1939;
 }
 
+/** The TCP ports a process listens on (Linux: its socket inodes against /proc/net/tcp and tcp6). */
+function listeningPorts(pid: number): number[] {
+  const inodes = new Set<string>();
+  try {
+    for (const fd of readdirSync(`/proc/${pid}/fd`)) {
+      try {
+        const m = /^socket:\[(\d+)\]$/.exec(readlinkSync(`/proc/${pid}/fd/${fd}`));
+        if (m) inodes.add(m[1]!);
+      } catch {}
+    }
+  } catch {
+    return [];
+  }
+  const ports = new Set<number>();
+  for (const table of ["/proc/net/tcp", "/proc/net/tcp6"]) {
+    let text = "";
+    try {
+      text = readFileSync(table, "utf8");
+    } catch {
+      continue;
+    }
+    for (const line of text.split("\n").slice(1)) {
+      const f = line.trim().split(/\s+/);
+      if (f.length > 9 && f[3] === "0A" && inodes.has(f[9]!)) ports.add(parseInt(f[1]!.split(":")[1]!, 16));
+    }
+  }
+  return [...ports];
+}
+
 /** A value for a systemd unit line: quoted, with `%` (specifiers), `\\` and `"` escaped. */
 const unitQuote = (v: string) => `"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/%/g, "%%")}"`;
 
@@ -988,6 +1100,7 @@ function writeCoreUnit(d: Detected, from: string): { path: string; port: number 
   const env = unitEnvironment(from);
   if (!env.some((l) => l.includes("PARACHUTE_HOME="))) env.unshift(`Environment=${unitQuote(`PARACHUTE_HOME=${d.home}`)}`);
   const text = [
+    `# ${CORE_UNIT_MARK} ${d.home}`,
     "[Unit]",
     `Description=Parachute ${core.version} (parachute-core): took over from ${from} on ${new Date().toISOString().slice(0, 10)}`,
     "After=network-online.target",
@@ -1014,11 +1127,23 @@ const mainPid = (unit: string) => Number(/MainPID=(\d+)/.exec(run(["systemctl", 
  */
 async function coreUnitUp(port: number, d: Detected, log: (s: string) => void): Promise<string | null> {
   const active = () => run(["systemctl", "--user", "is-active", CORE_UNIT]).stdout.trim() === "active";
-  if (!(await waitUntil(() => active() && mainPid(CORE_UNIT) > 0, 30_000, 500))) return `${CORE_UNIT} did not start a process`;
+  const failed = () => run(["systemctl", "--user", "is-active", CORE_UNIT]).stdout.trim() === "failed";
+  if (!(await waitUntil(() => failed() || (active() && mainPid(CORE_UNIT) > 0), 30_000, 500)) || failed()) return `${CORE_UNIT} did not start a process that stays up`;
   const pid = mainPid(CORE_UNIT);
-  const hub = `http://127.0.0.1:${port}`;
-  const ok = await waitUntil(async () => (await isReady(hub)) || !active(), 60_000, 500);
-  if (!ok || !active()) return `${CORE_UNIT} (pid ${pid}) is not ready on port ${port}`;
+  // Where it listens is asked of its own process (the configuration's PORT is only the first guess): the port that
+  // answers /api/ready with ready:true is the hub's.
+  let hub = "";
+  const ok = await waitUntil(async () => {
+    if (!active()) return true;
+    for (const p of [port, ...listeningPorts(pid).filter((x) => x !== port)]) {
+      if (await isReady(`http://127.0.0.1:${p}`)) {
+        hub = `http://127.0.0.1:${p}`;
+        return true;
+      }
+    }
+    return false;
+  }, 60_000, 500);
+  if (!ok || !active() || !hub) return `${CORE_UNIT} (pid ${pid}) is not ready (tried port ${port} and the ports it listens on)`;
   const problems = await checkVaults(hub, d, checkEnv(d), log, false);
   if (problems.length) return `${CORE_UNIT} answers, but ${problems.join("; ")}`;
   await Bun.sleep(3000);
@@ -1046,6 +1171,16 @@ function writeRecord(home: string, r: Record_): void {
   const tmp = `${p}.${process.pid}.tmp`;
   writeFileSync(tmp, `${JSON.stringify(r, null, 2)}\n`, { mode: 0o600 });
   renameSync(tmp, p);
+}
+
+/** The home named on the mark line of the core unit file, if it has one. */
+function readCoreUnitMark(): string | undefined {
+  try {
+    const first = readFileSync(join(systemdUnitDir(), CORE_UNIT), "utf8").split("\n")[0] ?? "";
+    return first.startsWith(`# ${CORE_UNIT_MARK} `) ? first.slice(`# ${CORE_UNIT_MARK} `.length) : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Put the old units back as they were: enabled ones enabled, running ones started. */
@@ -1083,11 +1218,31 @@ async function takeOver(d: Detected, say: (s: string) => void): Promise<{ backup
       throw new Exit(EXIT.failed, `${CORE_UNIT} already exists (${tilde(coreUnitFile)})${on ? " and is on" : " for another home"}; this takeover won't replace it. Nothing was changed.`);
     }
   }
-  const toPause = d.units.filter((u) => u.old && u.manager === "systemd" && (u.active || u.enabled));
+  const toPause = d.units.filter((u) => u.old && u.manager === "systemd");
   const pausable = new Set(toPause.map((u) => u.name));
+  const both = d.running.filter((h) => h.other && h.unit && pausable.has(h.unit));
+  if (both.length) {
+    throw new Exit(EXIT.held, `${[...new Set(both.map((h) => h.unit))].join(" and ")} also ${both.length === 1 ? "has" : "have"} another home's databases open (pid ${both.map((h) => h.pid).join(", ")}); pausing it would stop that home too. Nothing was changed.`);
+  }
+  // Stopping or disabling a unit can reach others (Also=, PropagatesStopTo=, units that require, bind to or are part
+  // of it): refused, rather than touching another home's service.
+  for (const u of toPause) {
+    const deps = run(["systemctl", "--user", "show", u.name, "-p", "Also", "-p", "PropagatesStopTo", "-p", "RequiredBy", "-p", "BoundBy", "-p", "ConsistsOf", "-p", "UpheldBy"]).stdout;
+    const reach = deps
+      .split("\n")
+      .flatMap((l) => (/^(?:Also|PropagatesStopTo|RequiredBy|BoundBy|ConsistsOf|UpheldBy)=(.+)$/.exec(l.trim())?.[1] ?? "").split(/\s+/))
+      .filter((x) => x && !pausable.has(x) && x !== "default.target");
+    if (reach.length) {
+      throw new Exit(EXIT.failed, `stopping or disabling ${u.name} would also reach ${reach.join(", ")}; takeover won't touch units it hasn't seen serving this home. Nothing was changed.`);
+    }
+  }
   const outside = d.running.filter((h) => !h.unit || !pausable.has(h.unit));
   if (outside.length) {
     throw new Exit(EXIT.held, `an old process holds the data and isn't run by a unit this can pause: ${outside.map((h) => `pid ${h.pid} (${h.cmd.slice(0, 80)})`).join(", ")}. Stop it, then run takeover again. Nothing was changed.`);
+  }
+  const unseen = d.units.filter((u) => u.unseen);
+  if (unseen.length) {
+    throw new Exit(EXIT.failed, `${unseen.map((u) => u.name).join(" and ")} ${unseen.length === 1 ? "looks" : "look"} like the old hub or vault and ${unseen.length === 1 ? "is" : "are"} enabled but not running, so takeover can't see which home ${unseen.length === 1 ? "it serves" : "they serve"}. Start ${unseen.length === 1 ? "it" : "them"} (\`systemctl --user start ${unseen[0]!.name}\`) so takeover can see, or disable ${unseen.length === 1 ? "it" : "them"} if ${unseen.length === 1 ? "it doesn't" : "they don't"} serve this home; then run takeover again. Nothing was changed.`);
   }
   const backupRoot = join(dirname(d.home), "parachute-takeover");
   try {
@@ -1106,9 +1261,11 @@ async function takeOver(d: Detected, say: (s: string) => void): Promise<{ backup
   };
   for (const u of toPause) {
     say(`Pausing ${u.name} …`);
-    paused.push({ name: u.name, manager: "systemd", active: u.active, enabled: u.enabled });
+    // It has the data open, so it runs (whatever systemd's word for it: active, activating, reloading): stopped, and
+    // started again on rollback.
+    paused.push({ name: u.name, manager: "systemd", active: true, enabled: u.enabled });
     try {
-      if (u.active) systemctl("stop", u.name);
+      systemctl("stop", u.name);
       if (u.enabled) systemctl("disable", u.name);
     } catch (err) {
       throw new Exit(EXIT.failed, putBack(`pausing ${u.name} failed: ${(err as Error).message}`));
@@ -1218,15 +1375,18 @@ function exportChanged(home: string, backupHome: string, dir: string): number {
   const byName = (root: string) =>
     new Map(databases(root, { hub: 0, vault: 0 }).filter((d) => d.rel !== "hub.db").map((d) => [basename(dirname(d.rel)), join(root, d.rel)]));
   const before = byName(backupHome);
-  for (const [name, path] of byName(home)) {
+  const now = byName(home);
+  for (const name of new Set([...before.keys(), ...now.keys()])) {
+    const path = now.get(name);
     const old = new Map<string, string>();
     const was = before.get(name);
     if (was) for (const r of readOnly(was, (db) => db.query("SELECT id, updated_at, content, metadata, path FROM notes").all() as any[])) old.set(r.id, JSON.stringify([r.updated_at, r.content, r.metadata, r.path]));
-    const now = readOnly(path, (db) => db.query("SELECT id, path, content, metadata, created_at, updated_at FROM notes").all() as any[]);
-    const changed = now.filter((r) => old.get(r.id) !== JSON.stringify([r.updated_at, r.content, r.metadata, r.path]));
-    const ids = new Set(now.map((r) => r.id));
+    // A vault deleted since the takeover has no rows now: every note of it is reported deleted.
+    const rows = path ? (readOnly(path, (db) => db.query("SELECT id, path, content, metadata, created_at, updated_at FROM notes").all() as any[])) : [];
+    const changed = rows.filter((r) => old.get(r.id) !== JSON.stringify([r.updated_at, r.content, r.metadata, r.path]));
+    const ids = new Set(rows.map((r) => r.id));
     const deleted = [...old.keys()].filter((id) => !ids.has(id));
-    if (changed.length || deleted.length) writeFileSync(join(dir, `${name}.json`), `${JSON.stringify({ changed, deleted_ids: deleted }, null, 2)}\n`, { mode: 0o600 });
+    if (changed.length || deleted.length) writeFileSync(join(dir, `${name}.json`), `${JSON.stringify({ ...(path ? {} : { vault_deleted: true }), changed, deleted_ids: deleted }, null, 2)}\n`, { mode: 0o600 });
     n += changed.length + deleted.length;
   }
   return n;
@@ -1236,13 +1396,20 @@ async function rollBack(home: string, say: (s: string) => void): Promise<Record<
   const record = readRecord(home);
   if (!record || record.state !== "taken-over") throw new Exit(EXIT.failed, `${tilde(home)} has no takeover to roll back${record ? ` (it was rolled back on ${record.rolled_back_at})` : ""}`);
   if (record.core_unit) {
+    // Still this home's? Running: its process has this home's data open. Not running: it still carries the mark this
+    // takeover wrote. Otherwise it may serve another home now, and it isn't touched.
+    const runningPid = mainPid(record.core_unit);
+    const ours = runningPid > 0 ? heldBy(home, [record.core_unit]).some((h) => h.unit === record.core_unit) : readCoreUnitMark() === home;
+    if (!ours) {
+      throw new Exit(EXIT.failed, `${record.core_unit} ${runningPid > 0 ? "is running but doesn't have this home's data open" : "no longer carries this takeover's mark for this home"}; it may serve another home now, so rollback won't touch it. Stop it yourself if it is this home's, then run takeover --rollback again.`);
+    }
     say(`Stopping ${record.core_unit} …`);
     const r = run(["systemctl", "--user", "disable", "--now", record.core_unit]);
     if (r.code !== 0) throw new Exit(EXIT.failed, `stopping ${record.core_unit} failed: ${(r.stderr || r.stdout).trim()}`);
   }
   // On a retry, old units already put back may hold the data again: they are not in the way.
   const resumed = new Set(record.paused.map((u) => u.name));
-  const inTheWay = () => holders(home).filter((h) => !(h.unit && resumed.has(h.unit) && (record.restored_at || record.rollback === "code-only")));
+  const inTheWay = () => heldBy(home, [...resumed]).filter((h) => !(h.unit && resumed.has(h.unit) && (record.restored_at || record.rollback === "code-only")));
   if (!(await waitUntil(() => inTheWay().length === 0, 20_000, 250))) {
     const still = inTheWay();
     throw new Exit(EXIT.held, `still holding the data: ${still.map((h) => `pid ${h.pid} (${h.cmd.slice(0, 80)})`).join(", ")}. Stop it, then run takeover --rollback again.`);

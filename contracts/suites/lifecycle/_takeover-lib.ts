@@ -81,14 +81,17 @@ export interface UnitState {
 const FAKE_SYSTEMCTL = `#!/bin/sh
 # Fake systemctl for the contracts (an outside system). Answers from STATE/<unit>.active and STATE/<unit>.enabled,
 # changes them on start/stop/enable/disable (with --now), and logs every call to STATE/calls.log.
-# - Units the test seeds (the old hub and vault) are bookkeeping only: each test runs the old programs itself.
-# - A unit known only by its file in UNITS (one the program under test installs, as systemd knows it after
-#   daemon-reload) is run for real: start runs its ExecStart= with its Environment= in a clean environment and a
-#   session of its own (no terminal's hang-up reaches it), as
-#   STATE/<unit>.pid; stop ends it; is-active says "failed" once its process is gone; show names its MainPID.
+# - Every unit with a file in UNITS is run for real when started: its ExecStart= (%h expanded) with its
+#   Environment= (the unit file, then its UNITS/<unit>.d/*.conf drop-ins), then its EnvironmentFile=s sourced, in a
+#   clean environment and a session of its own (no terminal's hang-up reaches it), as STATE/<unit>.pid; stop ends
+#   it; is-active says "failed" once its process is gone; show names its MainPID. The seeded old units start that
+#   way too (the stock home starts the ones seeded as running).
 # - show prints a unit file's Environment= lines (systemd prints the assignments it would pass).
 STATE=__STATE__
 UNITS=__UNITS__
+# A unit gets the user manager's PATH, never the PATH of whoever called systemctl (a takeover's own bin/ is first on
+# its PATH; an old hub started with it would start core's parachute-vault as its vault child).
+MANAGER_PATH=__PATH__
 echo "$*" >> "$STATE/calls.log"
 verb=""; now=""; units=""; props=""
 while [ $# -gt 0 ]; do
@@ -109,25 +112,31 @@ st() {
   if [ -f "$STATE/$1.$2" ]; then cat "$STATE/$1.$2"; elif [ "$2" = active ]; then echo inactive; else echo disabled; fi
 }
 run_unit() {
-  seeded "$1" && return 0
   alive "$1" && return 0
   f="$UNITS/$1"
-  cmd=$(sed -n 's/^ExecStart=//p' "$f" | head -1 | sed 's/%%/%/g')
+  [ -f "$f" ] || return 0
+  all="$f"; for d in "$UNITS/$1.d"/*.conf; do [ -f "$d" ] && all="$all $d"; done
+  cmd=$(sed -n 's/^ExecStart=//p' "$f" | head -1 | sed "s#%h#$HOME#g; s/%%/%/g")
   (
     exec 0</dev/null >>"$STATE/$1.log" 2>&1
-    envs=$(sed -n 's/^Environment=//p' "$f" | sed 's/%%/%/g')
-    exec setsid env -i HOME="$HOME" PATH="$PATH" LANG=C.UTF-8 TMPDIR="$TMPDIR" sh -c "
+    envs=$(cat $all | sed -n 's/^Environment=//p' | sed "s#%h#$HOME#g; s/%%/%/g")
+    exec setsid env -i HOME="$HOME" PATH="$MANAGER_PATH" LANG=C.UTF-8 TMPDIR="$TMPDIR" sh -c "
       $(echo "$envs" | while IFS= read -r l; do [ -n "$l" ] && echo "export $l"; done)
-      $(sed -n 's/^EnvironmentFile=//p' "$f" | sed 's/^-//' | while IFS= read -r ef; do echo "[ -f '$ef' ] && . '$ef'"; done)
+      $(cat $all | sed -n 's/^EnvironmentFile=//p' | sed 's/^-//' | while IFS= read -r ef; do echo "[ -f '$ef' ] && set -a && . '$ef' && set +a"; done)
       exec $cmd"
   ) &
   echo $! > "$STATE/$1.pid"
 }
+# Stop the unit's processes, all of them, as systemd stops a unit's cgroup: its main process, its process group (it
+# runs in a session of its own) and every descendant (a supervisor may start children in groups of their own).
+descendants() { for c in $(ps -o pid= --ppid "$1" 2>/dev/null); do echo "$c"; descendants "$c"; done; }
 stop_unit() {
-  alive "$1" || { rm -f "$STATE/$1.pid"; return 0; }
-  pid=$(cat "$STATE/$1.pid"); kill -TERM "$pid" 2>/dev/null
-  i=0; while kill -0 "$pid" 2>/dev/null && [ $i -lt 150 ]; do sleep 0.1; i=$((i+1)); done
-  kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+  [ -f "$STATE/$1.pid" ] || return 0
+  pid=$(cat "$STATE/$1.pid")
+  all="$pid $(descendants "$pid")"
+  kill -TERM -- "-$pid" 2>/dev/null; for q in $all; do kill -TERM "$q" 2>/dev/null; done
+  i=0; while [ $i -lt 150 ]; do left=""; for q in $all; do kill -0 "$q" 2>/dev/null && left="$left $q"; done; [ -z "$left" ] && break; sleep 0.1; i=$((i+1)); done
+  for q in $all; do kill -KILL "$q" 2>/dev/null; done
   rm -f "$STATE/$1.pid"
 }
 code=0
@@ -151,9 +160,13 @@ case "$verb" in
     for u in $units; do
       if known "$u"; then a=$(st "$u" active); e=$(st "$u" enabled); l=loaded; else a=inactive; e=""; l=not-found; fi
       pid=0; alive "$u" && pid=$(cat "$STATE/$u.pid")
-      echo "Id=$u"; echo "LoadState=$l"; echo "ActiveState=$a"; echo "UnitFileState=$e"; echo "MainPID=$pid"
-      if [ -f "$UNITS/$u" ]; then echo "FragmentPath=$UNITS/$u"; fi
-      if [ -f "$UNITS/$u" ]; then echo "Environment=$(sed -n 's/^Environment=//p' "$UNITS/$u" | tr '\n' ' ' | sed 's/ $//')"; fi
+      # With -p, only the properties asked for (as systemd does); the fake knows these, and the rest are empty.
+      p() { [ -z "$props" ] || case ",$props," in *",$1,"*) true ;; *) false ;; esac; }
+      p Id && echo "Id=$u"; p LoadState && echo "LoadState=$l"; p ActiveState && echo "ActiveState=$a"
+      p UnitFileState && echo "UnitFileState=$e"; p MainPID && echo "MainPID=$pid"
+      for k in Also PropagatesStopTo RequiredBy BoundBy ConsistsOf UpheldBy; do p "$k" && [ -n "$props" ] && echo "$k="; done
+      if [ -f "$UNITS/$u" ] && p FragmentPath; then echo "FragmentPath=$UNITS/$u"; fi
+      if [ -f "$UNITS/$u" ] && p Environment; then echo "Environment=$(sed -n 's/^Environment=//p' "$UNITS/$u" | tr '\n' ' ' | sed 's/ $//')"; fi
       echo
     done; exit 0 ;;
   list-unit-files)
@@ -227,7 +240,12 @@ export async function newMachine(
   mkdirSync(fakeBin, { recursive: true });
   mkdirSync(state, { recursive: true });
   mkdirSync(unitDir, { recursive: true });
-  writeFileSync(join(fakeBin, "systemctl"), FAKE_SYSTEMCTL.replace("__STATE__", JSON.stringify(state)).replace("__UNITS__", JSON.stringify(unitDir)), { mode: 0o755 });
+  const managerPath = `${fakeBin}:${join(user, ".bun", "bin")}:${info.runtimeDir}:/usr/local/bin:/usr/bin:/bin`;
+  writeFileSync(
+    join(fakeBin, "systemctl"),
+    FAKE_SYSTEMCTL.replace("__STATE__", JSON.stringify(state)).replace("__UNITS__", JSON.stringify(unitDir)).replace("__PATH__", JSON.stringify(managerPath)),
+    { mode: 0o755 },
+  );
   writeFileSync(join(state, "calls.log"), "");
   const units = opts.units ?? {};
   for (const [name, s] of Object.entries(units)) {
@@ -386,16 +404,25 @@ export async function startOldBox(m: Machine, s: Pick<StockHome, "vaultName" | "
  * holds the home's databases.
  */
 export async function coreUnit(m: Machine, s: Pick<StockHome, "vaultName" | "origin">): Promise<{ stop(): Promise<void>; log(): string }> {
-  const log = () => (existsSync(join(m.user, ".fake", "systemd", "parachute-core.service.log")) ? readFileSync(join(m.user, ".fake", "systemd", "parachute-core.service.log"), "utf8").replace(/pvk_[A-Za-z0-9_-]+/g, "pvk_<redacted>") : "");
+  return serving(m, s, "parachute-core.service");
+}
+
+/**
+ * What `unit` runs (the fake systemctl runs it), once it serves the vault at the old origin; `stop()` stops the unit
+ * as `systemctl --user stop` would and waits until nothing holds the home's databases.
+ */
+export async function serving(m: Machine, s: Pick<StockHome, "vaultName" | "origin">, unit: string): Promise<{ stop(): Promise<void>; log(): string }> {
+  const file = join(m.user, ".fake", "systemd", `${unit}.log`);
+  const log = () => (existsSync(file) ? readFileSync(file, "utf8").replace(/pvk_[A-Za-z0-9_-]+/g, "pvk_<redacted>") : "");
   const up = await until(async () => {
     const r = await safeFetch(`${s.origin}/vault/${s.vaultName}/mcp`);
     return r.status === 401 && (r.headers.get("www-authenticate") ?? "").includes(`/vault/${s.vaultName}/`);
   }, 60_000);
-  must(up, `parachute-core.service is not serving vault ${s.vaultName} after takeover:\n${log().slice(-2000)}`);
+  must(up, `${unit} is not serving vault ${s.vaultName}:\n${log().slice(-2000)}`);
   return {
     log,
     async stop() {
-      await m.run(["systemctl", "--user", "stop", "parachute-core.service"]);
+      await m.run(["systemctl", "--user", "stop", unit]);
       await until(() => dbHolders(m.home).length === 0, 15_000, 100);
     },
   };
@@ -485,6 +512,13 @@ export async function makeStockHome(m: Machine): Promise<StockHome> {
   } finally {
     const code = await box.stop();
     must(code === 0 || code === 143, `setup: the old box did not stop cleanly (exit ${code}):\n${box.log().slice(-1500)}`);
+    // The machine as a person has it: the units seeded as running run the old programs (the fake runs them).
+    for (const u of m.units) {
+      if (!m.unit(u).active) continue;
+      const r = await m.run(["systemctl", "--user", "start", u]);
+      must(r.code === 0, `setup: systemctl --user start ${u} exited ${r.code}: ${r.stderr}`);
+      await serving(m, { vaultName, origin }, u);
+    }
   }
 }
 
