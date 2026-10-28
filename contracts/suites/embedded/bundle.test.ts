@@ -371,7 +371,7 @@ describe("embedded/bundle", () => {
     must(mint.code === 0 && token.split(".").length === 3, `mint-token exited ${mint.code}: ${mint.stderr.slice(-400)}`);
     const auth = { authorization: `Bearer ${token}`, "content-type": "application/json" };
     const w = await safeFetch(`${origin}/vault/${vaultName}/api/notes`, { method: "POST", headers: auth, body: JSON.stringify({ content: "made-up bundle note", path: "bundle/one" }) });
-    expect(w.status).toBe(201);
+    must(w.status === 201, `a write answered ${w.status}: ${(await w.text()).slice(0, 300)}\n--- serve log ---\n${box.log().slice(-2500)}`);
     const r = await safeFetch(`${origin}/vault/${vaultName}/api/notes?limit=50&include_content=true`, { headers: auth });
     expect(r.status).toBe(200);
     expect(JSON.stringify(await r.json())).toContain("made-up bundle note");
