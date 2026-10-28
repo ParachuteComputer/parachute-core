@@ -198,9 +198,11 @@ export async function dispatch(role: Role): Promise<void> {
     process.exit(2);
   }
   if (r.cli === "vault" && r.argv[0] === "serve") stopWithEmbeddedParent();
-  // Lane E (PLAN §8.0): a box serve on a home the old 0.7 programs still own refuses with exit 7 and points at
-  // `parachute-core takeover`, before it opens anything.
-  if (r.cli === "hub" && r.argv[0] === "serve" && !["--help", "-h"].includes(r.argv[1] ?? "")) {
+  // Lane E (PLAN §8.0): a box serve (the hub's, or the vault's on its own) on a home the old 0.7 programs still own
+  // refuses with exit 7 and points at `parachute-core takeover`, before it opens anything. The vault child of a
+  // `serve --embedded` is the host's (embedded homes are adopted in place, PLAN §3).
+  const serving = r.argv[0] === "serve" && !["--help", "-h"].includes(r.argv[1] ?? "");
+  if (serving && (r.cli === "hub" || process.env.PARACHUTE_EMBEDDED_PARENT === undefined)) {
     const { serveRefusal } = await import("./takeover.ts");
     const refused = serveRefusal(home);
     if (refused) {

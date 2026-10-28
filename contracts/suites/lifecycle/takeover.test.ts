@@ -23,8 +23,9 @@
 // the unit folder and enables it; the fake systemctl knows a unit by its file, as systemd does after daemon-reload,
 // and runs nothing, so each test starts core itself "as the unit would" (startCore), like the old box (startOldBox).
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, readlinkSync, symlinkSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
+import { until } from "../candidate-lib.ts";
 import { rest } from "../lib.ts";
 import {
   OLD_UNITS,
@@ -276,6 +277,39 @@ describe("takeover", () => {
     }
     expect(schemaOf(vaultDb(m, s))).toBe(vaultSchema);
     expect(schemaOf(hubDb(m))).toBe(hubSchema);
+  }, 120_000);
+
+  test("the old units keep ~/.parachute only: core serves another home of its own on the same machine", async () => {
+    const { m, s } = await oldMachine("tk-other");
+    const other = join(m.user, "other-home");
+    const env = { ...s.serveEnv, PARACHUTE_HOME: other };
+    const made = await core(m, ["vault", "create", "elsewhere", "--no-mirror", "--json"], env);
+    must(made.code === 0, `setup: parachute-core vault create on another home exited ${made.code}: ${made.stderr.slice(-400)}`);
+    const box = m.spawn([requireCore(m.info), "serve"], { env });
+    try {
+      const up = await until(async () => box.proc.exitCode !== null || holders(join(other, "vault", "data", "elsewhere", "vault.db")).length > 0, 60_000);
+      must(up && box.proc.exitCode === null, `serve on a home the old units don't keep exited ${box.proc.exitCode}: ${box.log().slice(-600)}`);
+    } finally {
+      await box.stop();
+    }
+  }, 120_000);
+
+  test("a home with a link out of it is refused before anything changes: the backup couldn't copy it as it is", async () => {
+    const { m } = await oldMachine("tk-link");
+    // The snapshot helper hashes trees and refuses links, so it is taken without the link, and the link is checked
+    // and removed before comparing.
+    const before = await snapshot(m);
+    const link = join(m.home, "linked-out");
+    symlinkSync(join(m.user, "elsewhere"), link);
+    const calls = m.systemctlCalls().length;
+    const r = await core(m, ["takeover", "--home", m.home, "--yes", "--json"]);
+    must(r.code !== 0, "takeover went ahead on a home with a link out of it");
+    expect(r.stderr).toContain("linked-out");
+    expect(readlinkSync(link)).toBe(join(m.user, "elsewhere"));
+    unlinkSync(link);
+    expect(await snapshot(m)).toEqual(before);
+    expect(m.systemctlCalls().slice(calls).filter((c) => MUTATING.test(c))).toEqual([]);
+    expect(existsSync(join(m.user, "parachute-takeover"))).toBe(false);
   }, 120_000);
 
   test("takeover from a shell that still has the old box's settings (its port, origin and key source) checks v0.8 against itself and succeeds", async () => {

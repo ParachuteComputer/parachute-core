@@ -33,7 +33,7 @@
 //
 // `parachute-core serve` on a home the old programs still own, with no takeover record, refuses with exit 7 and says
 // to run takeover (oldOwner(), called from dispatch).
-import { Database, constants } from "bun:sqlite";
+import type { Database } from "bun:sqlite";
 import { createHash, randomBytes } from "node:crypto";
 import {
   copyFileSync,
@@ -54,7 +54,7 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import core from "../../../package.json" with { type: "json" };
-import { databases, homeDir, schemaOf } from "./home.ts";
+import { databases, homeDir, readDatabase, schemaOf } from "./home.ts";
 import { bundleRoot } from "./install.ts";
 
 export const EXIT = { ok: 0, failed: 1, usage: 2, noRoom: 5, held: 7, checkFailed: 8 } as const;
@@ -117,6 +117,8 @@ export interface Detected {
   rollback: "code-only" | "restore-backup";
   issuer: string;
   size_bytes: number;
+  /** Entries the backup can't copy as they are (symlinks, sockets): the takeover refuses while there are any. */
+  uncopyable: string[];
   others: string[];
   record: Record_ | null;
 }
@@ -177,8 +179,60 @@ function run(argv: string[], opts: { env?: Record<string, string> } = {}): { cod
 
 const systemdUnitDir = () => join(process.env.XDG_CONFIG_HOME || join(userHome(), ".config"), "systemd", "user");
 
-/** Parachute's systemd user units (not core's own), with state; and which of them run the old programs. */
-function systemdUnits(): Unit[] {
+/**
+ * The home a unit serves: its PARACHUTE_HOME (Environment= or an EnvironmentFile= it names), else ~/.parachute.
+ * A unit of another home is never paused and never makes serve refuse this one.
+ */
+function unitServes(text: string, home: string): boolean {
+  let set: string | undefined;
+  for (const line of text.split("\n")) {
+    const env = /^\s*Environment\s*=\s*(.*)$/.exec(line)?.[1];
+    if (env) {
+      const m = /(?:^|\s)"?PARACHUTE_HOME=([^"\s]+)/.exec(env);
+      if (m) set = m[1]!.replace(/%h/g, userHome());
+    }
+    const file = /^\s*EnvironmentFile\s*=\s*-?(.+)$/.exec(line)?.[1]?.trim().replace(/%h/g, userHome());
+    if (file) {
+      try {
+        const m = /^\s*(?:export\s+)?PARACHUTE_HOME=["']?([^"'\s]+)/m.exec(readFileSync(file, "utf8"));
+        if (m) set = m[1];
+      } catch {}
+    }
+  }
+  const same = (a: string, b: string) => {
+    try {
+      return realpathSync(a) === realpathSync(b);
+    } catch {
+      return resolve(a) === resolve(b);
+    }
+  };
+  return same(set ?? join(userHome(), ".parachute"), home);
+}
+
+/** The text of a unit and its drop-ins, from the files (systemd's own `cat` when the file isn't in the user folder). */
+function unitText(name: string): string {
+  const dir = systemdUnitDir();
+  let text = "";
+  try {
+    text = readFileSync(join(dir, name), "utf8");
+  } catch {
+    return run(["systemctl", "--user", "cat", name]).stdout;
+  }
+  try {
+    for (const f of readdirSync(join(dir, `${name}.d`)).sort()) if (f.endsWith(".conf")) text += `\n${readFileSync(join(dir, `${name}.d`, f), "utf8")}`;
+  } catch {}
+  return text;
+}
+
+/** Does the unit run the old hub or vault (by its name, unless its command is core's; or by its command)? */
+function runsOld(name: string, text: string): boolean {
+  const execs = text.split("\n").filter((l) => /^\s*ExecStart\s*=/.test(l)).join("\n");
+  if (/parachute-core/.test(execs)) return false;
+  return OLD_UNIT_NAMES.has(name) || OLD_COMMAND.test(execs);
+}
+
+/** Parachute's systemd user units (not core's own), with state; and which of them run the old programs on `home`. */
+function systemdUnits(home: string): Unit[] {
   if (process.platform !== "linux" || !Bun.which("systemctl")) return [];
   const names = new Set<string>();
   const dir = systemdUnitDir();
@@ -194,18 +248,10 @@ function systemdUnits(): Unit[] {
   const out: Unit[] = [];
   for (const name of [...names].sort()) {
     const file = existsSync(join(dir, name)) ? join(dir, name) : undefined;
-    let text = "";
-    if (file) {
-      try {
-        text = readFileSync(file, "utf8");
-      } catch {}
-    } else {
-      text = run(["systemctl", "--user", "cat", name]).stdout;
-    }
-    const execs = text.split("\n").filter((l) => /^\s*ExecStart\s*=/.test(l)).join("\n");
+    const text = unitText(name);
     const active = run(["systemctl", "--user", "is-active", name]).stdout.trim() === "active";
     const enabled = run(["systemctl", "--user", "is-enabled", name]).stdout.trim() === "enabled";
-    out.push({ name, manager: "systemd", active, enabled, ...(file ? { file } : {}), old: OLD_UNIT_NAMES.has(name) || OLD_COMMAND.test(execs) });
+    out.push({ name, manager: "systemd", active, enabled, ...(file ? { file } : {}), old: runsOld(name, text) && unitServes(text, home) });
   }
   return out;
 }
@@ -231,7 +277,11 @@ function launchdUnits(): Unit[] {
 
 /** Every SQLite file of the home's databases (with -wal and -shm). */
 function dataFiles(home: string): string[] {
-  const dbs = databases(home, { hub: 0, vault: 0 }).map((d) => join(home, d.rel));
+  let real = home;
+  try {
+    real = realpathSync(home); // /proc/<pid>/fd links name real paths
+  } catch {}
+  const dbs = databases(home, { hub: 0, vault: 0 }).map((d) => join(real, d.rel));
   return dbs.flatMap((d) => [d, `${d}-wal`, `${d}-shm`]);
 }
 
@@ -281,32 +331,9 @@ export function holders(home: string): Holder[] {
   return out;
 }
 
-/** A query on a database without changing a byte of the home (immutable, or a scratch copy when it has a WAL). */
+/** A query on a database without changing a byte of the home (home.ts readDatabase: immutable, or a scratch link). */
 function readOnly<T>(path: string, q: (db: Database) => T): T {
-  const wal = `${path}-wal`;
-  if (!(existsSync(wal) && statSync(wal).size > 0)) {
-    const uri = encodeURI(path).replace(/\?/g, "%3F").replace(/#/g, "%23");
-    const db = new Database(`file:${uri}?immutable=1`, constants.SQLITE_OPEN_READONLY | constants.SQLITE_OPEN_URI);
-    try {
-      return q(db);
-    } finally {
-      db.close();
-    }
-  }
-  const scratch = join(tmpdir(), `.parachute-takeover-read-${randomBytes(4).toString("hex")}`);
-  mkdirSync(scratch, { mode: 0o700 });
-  try {
-    copyFileSync(path, join(scratch, "db"));
-    copyFileSync(wal, join(scratch, "db-wal"));
-    const db = new Database(join(scratch, "db"), { readonly: true });
-    try {
-      return q(db);
-    } finally {
-      db.close();
-    }
-  } finally {
-    rmSync(scratch, { recursive: true, force: true });
-  }
+  return readDatabase(path, q, dirname(dirname(path)));
 }
 
 function treeSize(root: string): number {
@@ -359,7 +386,11 @@ export function oldOwner(home: string): string | null {
       if (pkg?.name === "@openparachute/hub" || pkg?.name === "@openparachute/vault") why.push(`${pkg.name} ${pkg.version} in ${dir}`);
     }
   }
-  for (const name of OLD_UNIT_NAMES) if (existsSync(join(systemdUnitDir(), name))) why.push(`the unit ${name}`);
+  for (const name of OLD_UNIT_NAMES) {
+    if (!existsSync(join(systemdUnitDir(), name))) continue;
+    const text = unitText(name);
+    if (runsOld(name, text) && unitServes(text, home)) why.push(`the unit ${name}`);
+  }
   if (process.platform === "darwin") {
     for (const u of launchdUnits()) if (u.old) why.push(`the launchd agent ${u.name}`);
   }
@@ -395,7 +426,7 @@ export async function detect(home: string): Promise<Detected> {
   return {
     home,
     old: oldInstalls(),
-    units: [...systemdUnits(), ...launchdUnits()],
+    units: [...systemdUnits(home), ...launchdUnits()],
     running: holders(home),
     vaults,
     hub_schema: hubSchema,
@@ -403,6 +434,7 @@ export async function detect(home: string): Promise<Detected> {
     rollback: migrations.length ? "restore-backup" : "code-only",
     issuer: resolveHubIssuer(undefined, home),
     size_bytes: treeSize(home),
+    uncopyable: entries(home).other,
     others,
     record: readRecord(home),
   };
@@ -454,6 +486,7 @@ export function describe(d: Detected): string {
     for (const m of d.migrations) lines.push(`  ${m}`);
     lines.push("Going back means restoring the backup: `parachute-core takeover --rollback` exports every note changed since, then restores it.");
   }
+  if (d.uncopyable.length) lines.push(`The home has ${d.uncopyable.length} entr${d.uncopyable.length === 1 ? "y" : "ies"} the backup can't copy as ${d.uncopyable.length === 1 ? "it is" : "they are"} (links): ${d.uncopyable.slice(0, 5).join(", ")}. Takeover won't go ahead until ${d.uncopyable.length === 1 ? "it is" : "they are"} replaced by the real files.`);
   if (d.record?.state === "taken-over") lines.push(`This home was already taken over on ${d.record.at} (backup ${tilde(d.record.backup)}).`);
   lines.push("With your yes, it will:");
   for (const s of plan(d)) lines.push(`  - ${s}`);
@@ -527,15 +560,18 @@ function sha256(path: string): string {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
-/** Every regular file under `root`, relative to it. */
-function files(root: string): string[] {
-  const out: string[] = [];
+/** Every regular file and folder under `root`, relative to it, and anything else (links, sockets) it can't copy. */
+function entries(root: string): { files: string[]; dirs: string[]; other: string[] } {
+  const out = { files: [] as string[], dirs: [] as string[], other: [] as string[] };
   const walk = (rel: string) => {
     for (const name of readdirSync(join(root, rel)).sort()) {
       const r = rel ? join(rel, name) : name;
       const st = lstatSync(join(root, r));
-      if (st.isDirectory()) walk(r);
-      else if (st.isFile()) out.push(r);
+      if (st.isDirectory()) {
+        out.dirs.push(r);
+        walk(r);
+      } else if (st.isFile()) out.files.push(r);
+      else out.other.push(r);
     }
   };
   walk("");
@@ -548,7 +584,9 @@ function backup(home: string, dest: string): { files: number; bytes: number } {
   mkdirSync(into, { recursive: true, mode: 0o700 });
   const manifest: Record<string, string> = {};
   let bytes = 0;
-  for (const rel of files(home)) {
+  const all = entries(home);
+  for (const rel of all.dirs) mkdirSync(join(into, rel), { recursive: true, mode: 0o700 });
+  for (const rel of all.files) {
     const from = join(home, rel);
     const to = join(into, rel);
     mkdirSync(dirname(to), { recursive: true, mode: 0o700 });
@@ -558,15 +596,18 @@ function backup(home: string, dest: string): { files: number; bytes: number } {
     manifest[rel] = h;
     bytes += statSync(from).size;
   }
-  writeFileSync(join(dest, "manifest.json"), `${JSON.stringify({ home, at: new Date().toISOString(), files: manifest }, null, 2)}\n`, { mode: 0o600 });
+  writeFileSync(join(dest, "manifest.json"), `${JSON.stringify({ home, at: new Date().toISOString(), files: manifest, folders: all.dirs }, null, 2)}\n`, { mode: 0o600 });
   return { files: Object.keys(manifest).length, bytes };
 }
 
 /** Put the backup's bytes back as the home; what was there moves aside (`<home>.after-takeover-<time>`). */
 function restore(home: string, dest: string): string {
-  const manifest = readJson(join(dest, "manifest.json"))?.files as Record<string, string> | undefined;
+  const read = readJson(join(dest, "manifest.json"));
+  const manifest = read?.files as Record<string, string> | undefined;
   if (!manifest) throw new Error(`no manifest in ${dest}`);
   const staged = `${home}.restoring-${randomBytes(3).toString("hex")}`;
+  mkdirSync(staged, { mode: 0o700 });
+  for (const rel of (read.folders ?? []) as string[]) mkdirSync(join(staged, rel), { recursive: true, mode: 0o700 });
   for (const [rel, h] of Object.entries(manifest)) {
     const to = join(staged, rel);
     mkdirSync(dirname(to), { recursive: true, mode: 0o700 });
@@ -647,7 +688,7 @@ async function checkRun(d: Detected, kids: string[], log: (s: string) => void): 
     const served = new Set<string>((jwks.body?.keys ?? []).map((k: any) => k.kid));
     const missing = kids.filter((k) => !served.has(k));
     if (missing.length || jwks.status !== 200) problems.push(`the hub's keys (JWKS HTTP ${jwks.status}) lack ${missing.length} of the ${kids.length} live signing keys`);
-    else log(`  the issuer and all ${kids.length} live signing keys are the same: every token issued before still verifies`);
+    else log(`  the issuer and ${kids.length === 1 ? "the live signing key are" : `all ${kids.length} live signing keys are`} the same: every token issued before still verifies`);
     for (const v of d.vaults) {
       const m = Bun.spawnSync([process.execPath, CORE_ENTRY, "auth", "mint-token", "--scope", `vault:${v.name}:read`, "--expires-in", "300", "--label", "takeover-check", "--json"], {
         env,
@@ -686,16 +727,40 @@ async function checkRun(d: Detected, kids: string[], log: (s: string) => void): 
 }
 
 /** The command a unit runs core with: the installed `<prefix>/bin/parachute-core` when this copy is installed. */
-function coreCommand(): string {
+function coreCommand(): string[] {
   const root = bundleRoot();
-  if (!root) return `${process.execPath} ${CORE_ENTRY}`;
+  if (!root) return [process.execPath, CORE_ENTRY];
   const store = root.lastIndexOf("/.store/");
   if (store >= 0) {
     const bin = join(root.slice(0, store), "bin", "parachute-core");
-    if (existsSync(bin)) return bin;
+    if (existsSync(bin)) return [bin];
   }
-  return join(root, "bin", "parachute-core");
+  return [join(root, "bin", "parachute-core")];
 }
+
+/** The port core's unit will listen on: the unit's PORT, else the old hub's hub/run/hub.port, else 1939. */
+function unitPort(env: string[], home: string): number {
+  for (const line of env) {
+    const m = /PORT=(\d{1,5})"?$/.exec(line);
+    if (m && /^Environment="PORT=/.test(line)) return Number(m[1]);
+  }
+  for (const line of env) {
+    const file = /^EnvironmentFile=-(.+)$/.exec(line)?.[1]?.replace(/%%/g, "%");
+    if (!file) continue;
+    try {
+      const m = /^\s*(?:export\s+)?PORT=["']?(\d{1,5})/m.exec(readFileSync(file, "utf8"));
+      if (m) return Number(m[1]);
+    } catch {}
+  }
+  try {
+    const n = Number(readFileSync(join(home, "hub", "run", "hub.port"), "utf8").trim());
+    if (Number.isInteger(n) && n > 0 && n < 65536) return n;
+  } catch {}
+  return 1939;
+}
+
+/** A value for a systemd unit line: quoted, with `%` (specifiers), `\\` and `"` escaped. */
+const unitQuote = (v: string) => `"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/%/g, "%%")}"`;
 
 /** The environment the old hub's unit gave it (PORT, bind, origins, drop-ins), as systemd lines for core's unit. */
 function unitEnvironment(unit: string): string[] {
@@ -705,27 +770,27 @@ function unitEnvironment(unit: string): string[] {
     if (line.startsWith("Environment=")) {
       for (const m of line.slice("Environment=".length).matchAll(/"((?:[^"\\]|\\.)*)"|(\S+)/g)) {
         const kv = m[1] ?? m[2]!;
-        if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(kv)) out.push(`Environment=${JSON.stringify(kv)}`);
+        if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(kv)) out.push(`Environment=${unitQuote(kv.replace(/\\(.)/g, "$1"))}`);
       }
     } else if (line.startsWith("EnvironmentFiles=")) {
       const path = line.slice("EnvironmentFiles=".length).replace(/\s*\(ignore_errors=(yes|no)\)\s*$/, "").trim();
-      if (path) out.push(`EnvironmentFile=-${path}`);
+      if (path) out.push(`EnvironmentFile=-${path.replace(/%/g, "%%")}`);
     }
   }
   return out;
 }
 
-function writeCoreUnit(d: Detected, from: string): string {
+function writeCoreUnit(d: Detected, from: string): { path: string; port: number } {
   const path = join(systemdUnitDir(), CORE_UNIT);
   const env = unitEnvironment(from);
-  if (!env.some((l) => l.includes("PARACHUTE_HOME="))) env.unshift(`Environment=${JSON.stringify(`PARACHUTE_HOME=${d.home}`)}`);
+  if (!env.some((l) => l.includes("PARACHUTE_HOME="))) env.unshift(`Environment=${unitQuote(`PARACHUTE_HOME=${d.home}`)}`);
   const text = [
     "[Unit]",
     `Description=Parachute ${core.version} (parachute-core): took over from ${from} on ${new Date().toISOString().slice(0, 10)}`,
     "After=network-online.target",
     "",
     "[Service]",
-    `ExecStart=${coreCommand()} serve`,
+    `ExecStart=${coreCommand().map(unitQuote).join(" ")} serve`,
     ...env,
     "Restart=on-failure",
     "",
@@ -735,19 +800,17 @@ function writeCoreUnit(d: Detected, from: string): string {
   ].join("\n");
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, text, { mode: 0o644 });
-  return path;
+  return { path, port: unitPort(env, d.home) };
 }
 
 /** Is core's unit up: active and staying so; and when it names its process, answering /api/ready on its port. */
-async function coreUnitUp(d: Detected): Promise<string | null> {
+async function coreUnitUp(port: number): Promise<string | null> {
   const active = () => run(["systemctl", "--user", "is-active", CORE_UNIT]).stdout.trim() === "active";
   if (!(await waitUntil(active, 30_000, 500))) return `${CORE_UNIT} did not become active`;
   await Bun.sleep(3000);
   if (!active()) return `${CORE_UNIT} stopped again within 3 s`;
   const pid = Number(/MainPID=(\d+)/.exec(run(["systemctl", "--user", "show", CORE_UNIT, "-p", "MainPID"]).stdout)?.[1] ?? 0);
   if (pid > 0) {
-    const issuerPort = Number(new URL(d.issuer).port || 0);
-    const port = issuerPort || 1939;
     const ok = await waitUntil(async () => (await getJson(`http://127.0.0.1:${port}/api/ready`)).status === 200, 60_000, 500);
     if (!ok) return `${CORE_UNIT} (pid ${pid}) is not answering /api/ready on port ${port}`;
   }
@@ -778,6 +841,9 @@ function resumeUnits(paused: Record_["paused"]): string[] {
 async function takeOver(d: Detected, say: (s: string) => void): Promise<{ backup: string; record: Record_; core_unit: string | null }> {
   if (d.units.some((u) => u.old && u.manager === "launchd" && (u.active || u.enabled))) {
     throw new Exit(EXIT.failed, "the old programs run as launchd agents; taking those over isn't built yet (macOS). Nothing was changed.");
+  }
+  if (d.uncopyable.length) {
+    throw new Exit(EXIT.failed, `the home has entries the backup can't copy as they are (${d.uncopyable.slice(0, 5).join(", ")}): links point outside it. Replace them with the real files, or back up yourself. Nothing was changed.`);
   }
   const toPause = d.units.filter((u) => u.old && u.manager === "systemd" && (u.active || u.enabled));
   const pausable = new Set(toPause.map((u) => u.name));
@@ -839,57 +905,79 @@ async function takeOver(d: Detected, say: (s: string) => void): Promise<{ backup
     return new Exit(EXIT.checkFailed, putBack(msg) + ". The old programs are back as they were.");
   };
 
-  const kids = liveKids(d.home);
-  say("Starting v0.8 on the same data and checking every answer …");
-  const problems = await checkRun(d, kids, say);
-  if (problems.length) throw undo(`a check failed: ${problems.join("; ")}`);
+  // From here every failure, expected or not, puts everything back: the unit, the record, the backup if v0.8
+  // migrated the data, and the old units.
+  let unitTried = false;
+  try {
+    return await startAndHandOver();
+  } catch (err) {
+    if (unitTried) run(["systemctl", "--user", "disable", "--now", CORE_UNIT]);
+    rmSync(join(d.home, RECORD_FILE), { force: true });
+    if (err instanceof Exit) throw err;
+    throw undo(`${(err as Error).message}`);
+  }
 
-  const record: Record_ = {
-    state: "taken-over",
-    at: new Date().toISOString(),
-    version: core.version,
-    home: d.home,
-    backup: dest,
-    rollback: d.rollback,
-    migrations: d.migrations,
-    paused,
-    core_unit: null,
-    issuer: d.issuer,
-  };
-  writeRecord(d.home, record);
+  async function startAndHandOver(): Promise<{ backup: string; record: Record_; core_unit: string | null }> {
+    const kids = liveKids(d.home);
+    say("Starting v0.8 on the same data and checking every answer …");
+    const problems = await checkRun(d, kids, say);
+    if (problems.length) throw undo(`a check failed: ${problems.join("; ")}`);
 
-  const hubUnit = toPause.find((u) => u.manager === "systemd" && /hub/.test(u.name)) ?? toPause[0];
-  if (hubUnit) {
-    say(`Starting v0.8 as ${CORE_UNIT} …`);
-    try {
-      writeCoreUnit(d, hubUnit.name);
-      systemctl("daemon-reload");
-      systemctl("enable", "--now", CORE_UNIT);
-      const down = await coreUnitUp(d);
-      if (down) throw new Error(down);
+    const record: Record_ = {
+      state: "taken-over",
+      at: new Date().toISOString(),
+      version: core.version,
+      home: d.home,
+      backup: dest,
+      rollback: d.rollback,
+      migrations: d.migrations,
+      paused,
+      core_unit: null,
+      issuer: d.issuer,
+    };
+    writeRecord(d.home, record);
+
+    const hubUnit = toPause.find((u) => u.manager === "systemd" && /hub/.test(u.name)) ?? toPause[0];
+    if (hubUnit) {
+      say(`Starting v0.8 as ${CORE_UNIT} …`);
+      unitTried = true;
+      try {
+        const unit = writeCoreUnit(d, hubUnit.name);
+        systemctl("daemon-reload");
+        systemctl("enable", "--now", CORE_UNIT);
+        const down = await coreUnitUp(unit.port);
+        if (down) throw new Error(down);
+      } catch (err) {
+        throw new Error(`starting ${CORE_UNIT} failed: ${(err as Error).message}`);
+      }
       record.core_unit = CORE_UNIT;
       writeRecord(d.home, record);
-    } catch (err) {
-      run(["systemctl", "--user", "disable", "--now", CORE_UNIT]);
-      rmSync(join(d.home, RECORD_FILE), { force: true });
-      throw undo(`starting ${CORE_UNIT} failed: ${(err as Error).message}`);
     }
+    return { backup: dest, record, core_unit: record.core_unit };
   }
-  return { backup: dest, record, core_unit: record.core_unit };
 }
 
-/** Changed notes since `since`, per vault, exported to `dir` before a restore (JSON, one file per vault). */
-function exportChanged(home: string, since: string, dir: string): number {
+/**
+ * Every note that differs from the backup (new, changed or deleted since the takeover), per vault, exported to
+ * `dir` as JSON before a restore puts the backup's notes back. Compared with the backup itself, not by timestamps,
+ * which an import can set to anything.
+ */
+function exportChanged(home: string, backupHome: string, dir: string): number {
   let n = 0;
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  for (const d of databases(home, { hub: 0, vault: 0 })) {
-    if (d.rel === "hub.db") continue;
-    const name = basename(dirname(d.rel));
-    const rows = readOnly(join(home, d.rel), (db) =>
-      db.query("SELECT id, path, content, metadata, created_at, updated_at FROM notes WHERE created_at > ? OR updated_at > ?").all(since, since),
-    );
-    if (rows.length) writeFileSync(join(dir, `${name}.json`), `${JSON.stringify(rows, null, 2)}\n`, { mode: 0o600 });
-    n += rows.length;
+  const byName = (root: string) =>
+    new Map(databases(root, { hub: 0, vault: 0 }).filter((d) => d.rel !== "hub.db").map((d) => [basename(dirname(d.rel)), join(root, d.rel)]));
+  const before = byName(backupHome);
+  for (const [name, path] of byName(home)) {
+    const old = new Map<string, string>();
+    const was = before.get(name);
+    if (was) for (const r of readOnly(was, (db) => db.query("SELECT id, updated_at, content, metadata, path FROM notes").all() as any[])) old.set(r.id, JSON.stringify([r.updated_at, r.content, r.metadata, r.path]));
+    const now = readOnly(path, (db) => db.query("SELECT id, path, content, metadata, created_at, updated_at FROM notes").all() as any[]);
+    const changed = now.filter((r) => old.get(r.id) !== JSON.stringify([r.updated_at, r.content, r.metadata, r.path]));
+    const ids = new Set(now.map((r) => r.id));
+    const deleted = [...old.keys()].filter((id) => !ids.has(id));
+    if (changed.length || deleted.length) writeFileSync(join(dir, `${name}.json`), `${JSON.stringify({ changed, deleted_ids: deleted }, null, 2)}\n`, { mode: 0o600 });
+    n += changed.length + deleted.length;
   }
   return n;
 }
@@ -910,7 +998,7 @@ async function rollBack(home: string, say: (s: string) => void): Promise<Record<
   let aside: string | undefined;
   if (record.rollback === "restore-backup") {
     const dir = join(record.backup, `changed-since-takeover-${stamp()}`);
-    exported = exportChanged(home, record.at, dir);
+    exported = exportChanged(home, join(record.backup, "home"), dir);
     say(`Exported ${exported} notes changed since the takeover to ${tilde(dir)}`);
     aside = restore(home, record.backup);
     say(`Restored the backup; what v0.8 left is in ${tilde(aside)}`);

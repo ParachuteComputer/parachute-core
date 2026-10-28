@@ -56,11 +56,15 @@ function openImmutable(path: string): Database {
 }
 
 function topVersion(db: Database): number | undefined {
+  const t = db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'").get();
+  if (!t) return undefined;
+  const row = db.query("SELECT MAX(version) AS v FROM schema_version").get() as { v: number | null } | null;
+  return row?.v ?? undefined;
+}
+
+function closing<T>(db: Database, q: (db: Database) => T): T {
   try {
-    const t = db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'").get();
-    if (!t) return undefined;
-    const row = db.query("SELECT MAX(version) AS v FROM schema_version").get() as { v: number | null } | null;
-    return row?.v ?? undefined;
+    return q(db);
   } finally {
     db.close();
   }
@@ -85,8 +89,13 @@ export class UncheckedError extends Error {}
  *     reads a WAL in place.
  */
 export function schemaOf(path: string, outside: string = tmpdir()): number | undefined {
+  return readDatabase(path, topVersion, outside);
+}
+
+/** Run a read-only query `q` on a database the way schemaOf reads it: never changing a byte under the home. */
+export function readDatabase<T>(path: string, q: (db: Database) => T, outside: string = tmpdir()): T {
   const wal = `${path}-wal`;
-  if (!(existsSync(wal) && statSync(wal).size > 0)) return topVersion(openImmutable(path));
+  if (!(existsSync(wal) && statSync(wal).size > 0)) return closing(openImmutable(path), q);
   const places = [...new Set([outside, tmpdir()])];
   // Never a hard link on macOS: a second process opening the live file through a link, while serve has it open,
   // makes serve's SQLite fail with a disk I/O error there (seen on macos-14, lane D's bundle-macos job; Linux is
@@ -101,7 +110,7 @@ export function schemaOf(path: string, outside: string = tmpdir()): number | und
         if (copy) copyFileSync(path, db);
         else linkSync(path, db);
         copyFileSync(wal, `${db}-wal`);
-        return topVersion(new Database(db, { readonly: true }));
+        return closing(new Database(db, { readonly: true }), q);
       } catch (e) {
         if (e instanceof Error && e.name === "SQLiteError") throw e;
       } finally {
