@@ -40,6 +40,7 @@
  *     matching scribe-http's "missing text field".
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "crypto";
 import { existsSync } from "fs";
 import { writeFile, unlink } from "fs/promises";
@@ -74,23 +75,39 @@ export type SpawnRunner = (
   opts?: { timeoutMs?: number },
 ) => Promise<SubprocessResult>;
 
-/** Every transcription subprocess running now (all local providers spawn through `defaultSpawnRunner`). */
-const running = new Set<ReturnType<typeof Bun.spawn>>();
-
 /**
- * Kill every transcription subprocess this process started and is still waiting on: the worker stopping inside a
- * longer-lived process (`parachute-core serve`). A vault in a process of its own had them go with its process group.
+ * Cancellation for transcription work. The worker runs each provider call inside its own scope
+ * (`runInTranscriptionScope`); every await inside keeps it, down to the spawn below. When the worker stops (a vault
+ * stopping inside a longer-lived process, `parachute-core serve`), it cancels the scope: subprocesses started in it are
+ * killed, and the runner starts no new one in it (a provider still preparing audio when the stop came). A vault in a
+ * process of its own had them go with its process group.
  */
-export function killTranscriptionSubprocesses(): void {
-  for (const proc of running) proc.kill();
+export interface TranscriptionScope {
+  cancelled: boolean;
+}
+const scopes = new AsyncLocalStorage<TranscriptionScope>();
+/** Every transcription subprocess running now (all local providers spawn through `defaultSpawnRunner`), and the
+ *  scope it was started in. */
+const running = new Map<ReturnType<typeof Bun.spawn>, TranscriptionScope | undefined>();
+
+export function runInTranscriptionScope<T>(scope: TranscriptionScope, fn: () => Promise<T>): Promise<T> {
+  return scopes.run(scope, fn);
+}
+
+/** Cancel `scope`: kill the subprocesses started in it; the runner starts no more in it. */
+export function cancelTranscriptionScope(scope: TranscriptionScope): void {
+  scope.cancelled = true;
+  for (const [proc, s] of running) if (s === scope) proc.kill();
 }
 
 /** Production spawn runner over `Bun.spawn`. */
 export const defaultSpawnRunner: SpawnRunner = async (cmd, opts) => {
+  const scope = scopes.getStore();
+  if (scope?.cancelled) return { exitCode: 125, stdout: "", stderr: "transcription stopped" };
   let proc: ReturnType<typeof Bun.spawn>;
   try {
     proc = Bun.spawn(cmd, { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
-    running.add(proc);
+    running.set(proc, scope);
   } catch (err) {
     // ENOENT etc. — the binary couldn't be launched at all.
     return { exitCode: 127, stdout: "", stderr: err instanceof Error ? err.message : String(err) };

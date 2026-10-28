@@ -51,7 +51,7 @@
  * again, which scribe and the metadata writes handle idempotently.
  */
 
-import { killTranscriptionSubprocesses } from "./transcription/providers/transcribe-cpp.ts";
+import { cancelTranscriptionScope, runInTranscriptionScope, type TranscriptionScope } from "./transcription/providers/transcribe-cpp.ts";
 import { join, normalize } from "path";
 import { existsSync, readFileSync, unlinkSync } from "fs";
 import type { Store, Attachment, Note } from "../core/src/types.ts";
@@ -254,6 +254,8 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
   });
 
   let stopped = false;
+  /** This worker's provider calls: cancelled by stop() (see transcribe-cpp.ts). */
+  const scope: TranscriptionScope = { cancelled: false };
   let inflight: Promise<void> = Promise.resolve();
   let timer: ReturnType<typeof setTimeout> | null = null;
 
@@ -542,12 +544,14 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
       // only the audio→text step.
       const audio = readFileSync(filePath);
       const startedAt = Date.now();
-      const result = await provider.transcribe({
-        audio,
-        filename: attachment.path.split("/").pop() ?? "audio",
-        mimeType: attachment.mimeType,
-        context,
-      });
+      const result = await runInTranscriptionScope(scope, () =>
+        provider.transcribe({
+          audio,
+          filename: attachment.path.split("/").pop() ?? "audio",
+          mimeType: attachment.mimeType,
+          context,
+        }),
+      );
       scribeResult = { text: result.text, durationMs: Date.now() - startedAt };
     } catch (err) {
       // Stopped while the provider worked (its subprocess killed by stop()): write nothing, the attachment stays
@@ -778,8 +782,8 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
     async stop() {
       stopped = true;
       if (timer) { clearTimeout(timer); timer = null; }
-      // A local provider's subprocess would otherwise run on until its timeout (600 s).
-      killTranscriptionSubprocesses();
+      // A local provider's subprocess would otherwise run on until its timeout (600 s), or start after this.
+      cancelTranscriptionScope(scope);
       await inflight;
     },
     tick,

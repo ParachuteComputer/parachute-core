@@ -2,7 +2,8 @@ import { describe, test, expect } from "bun:test";
 import {
   TranscribeCppProvider,
   defaultSpawnRunner,
-  killTranscriptionSubprocesses,
+  runInTranscriptionScope,
+  cancelTranscriptionScope,
   buildTranscribeArgs,
   buildFfmpegArgs,
   parseTranscribeCliOutput,
@@ -315,16 +316,44 @@ describe("TranscribeCppProvider.transcribe — error mapping", () => {
   });
 });
 
-describe("killTranscriptionSubprocesses", () => {
-  // The worker's stop() calls it, so a local provider's subprocess doesn't run on to its timeout after the vault
-  // stopped inside a longer-lived process (`parachute-core serve`).
-  test("ends a subprocess the runner is waiting on", async () => {
+describe("transcription scopes (the worker's stop)", () => {
+  // The worker's stop() cancels its scope, so a local provider's subprocess doesn't run on to its timeout, or start
+  // late, after the vault stopped inside a longer-lived process (`parachute-core serve`).
+  test("cancelling a scope ends a subprocess started in it", async () => {
+    const scope = { cancelled: false };
     const t0 = Date.now();
-    const running = defaultSpawnRunner(["sleep", "30"], { timeoutMs: 60_000 });
+    const running = runInTranscriptionScope(scope, () => defaultSpawnRunner(["sleep", "30"], { timeoutMs: 60_000 }));
     await Bun.sleep(100);
-    killTranscriptionSubprocesses();
+    cancelTranscriptionScope(scope);
     const result = await running;
     expect(result.exitCode).not.toBe(0);
     expect(Date.now() - t0).toBeLessThan(5_000);
+  });
+
+  test("a provider still preparing when its scope is cancelled starts no subprocess afterwards", async () => {
+    const scope = { cancelled: false };
+    let release!: () => void;
+    const preparing = new Promise<void>((r) => (release = r));
+    const t0 = Date.now();
+    const call = runInTranscriptionScope(scope, async () => {
+      await preparing; // e.g. writing the audio to a temp file before ffmpeg
+      return defaultSpawnRunner(["sleep", "30"], { timeoutMs: 60_000 });
+    });
+    cancelTranscriptionScope(scope);
+    release();
+    const result = await call;
+    expect(result.exitCode).toBe(125);
+    expect(Date.now() - t0).toBeLessThan(5_000);
+  });
+
+  test("another scope is left alone", async () => {
+    const mine = { cancelled: false };
+    const theirs = { cancelled: false };
+    const running = runInTranscriptionScope(theirs, () => defaultSpawnRunner(["sh", "-c", "sleep 0.3; echo done"]));
+    await Bun.sleep(50);
+    cancelTranscriptionScope(mine);
+    const result = await running;
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toBe("done");
   });
 });
