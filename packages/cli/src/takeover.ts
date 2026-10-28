@@ -212,14 +212,19 @@ function unitServes(text: string, home: string): boolean {
   return same(set ?? join(userHome(), ".parachute"), home);
 }
 
-/** The text of a unit and its drop-ins, from the files (systemd's own `cat` when the file isn't in the user folder). */
+/**
+ * The unit's effective configuration: systemd's own `cat` (the unit file and every drop-in, wherever they are; a
+ * later PARACHUTE_HOME overrides an earlier one). Only when systemd can't say, the user folder's file and drop-ins.
+ */
 function unitText(name: string): string {
+  const cat = run(["systemctl", "--user", "cat", name]);
+  if (cat.code === 0 && /^\[Service\]/m.test(cat.stdout)) return cat.stdout;
   const dir = systemdUnitDir();
   let text = "";
   try {
     text = readFileSync(join(dir, name), "utf8");
   } catch {
-    return run(["systemctl", "--user", "cat", name]).stdout;
+    return "";
   }
   try {
     for (const f of readdirSync(join(dir, `${name}.d`)).sort()) if (f.endsWith(".conf")) text += `\n${readFileSync(join(dir, `${name}.d`, f), "utf8")}`;
@@ -675,7 +680,7 @@ async function checkRun(d: Detected, kids: string[], log: (s: string) => void): 
   });
   const problems: string[] = [];
   try {
-    const ready = await waitUntil(async () => proc.exitCode !== null || (await getJson(`${hub}/api/ready`)).status === 200, 90_000, 300);
+    const ready = await waitUntil(async () => proc.exitCode !== null || (await isReady(hub)), 90_000, 300);
     if (!ready || proc.exitCode !== null) {
       let tail = "";
       try {
@@ -692,28 +697,7 @@ async function checkRun(d: Detected, kids: string[], log: (s: string) => void): 
     const missing = kids.filter((k) => !served.has(k));
     if (missing.length || jwks.status !== 200) problems.push(`the hub's keys (JWKS HTTP ${jwks.status}) lack ${missing.length} of the ${kids.length} live signing keys`);
     else log(`  the issuer and ${kids.length === 1 ? "the live signing key are" : `all ${kids.length} live signing keys are`} the same: every token issued before still verifies`);
-    for (const v of d.vaults) {
-      const m = Bun.spawnSync([process.execPath, CORE_ENTRY, "auth", "mint-token", "--scope", `vault:${v.name}:read`, "--expires-in", "300", "--label", "takeover-check", "--json"], {
-        env,
-        stdin: "ignore",
-        stdout: "pipe",
-        stderr: "pipe",
-      });
-      let token: string | undefined;
-      try {
-        token = JSON.parse(m.stdout.toString().trim().split("\n").pop() ?? "").token;
-      } catch {}
-      if (!token) {
-        problems.push(`vault ${v.name}: couldn't mint a read pass for the check (${m.stderr.toString().trim().slice(-200)})`);
-        continue;
-      }
-      const info = await getJson(`${hub}/vault/${encodeURIComponent(v.name)}/api/vault?include_stats=true`, token);
-      const count = info.body?.stats?.totalNotes;
-      const one = await getJson(`${hub}/vault/${encodeURIComponent(v.name)}/api/notes?limit=1`, token);
-      if (info.status !== 200 || count !== v.notes) problems.push(`vault ${v.name}: HTTP ${info.status}, ${count ?? "no"} notes, want ${v.notes}`);
-      else if (one.status !== 200 || (v.notes > 0 && !(Array.isArray(one.body) ? one.body.length : one.body?.notes?.length))) problems.push(`vault ${v.name}: reading a note gave HTTP ${one.status}`);
-      else log(`  vault ${v.name}: ${count} notes, read ok`);
-    }
+    problems.push(...(await checkVaults(hub, d, env, log, true)));
     return problems;
   } finally {
     if (proc.exitCode === null) {
@@ -727,6 +711,53 @@ async function checkRun(d: Detected, kids: string[], log: (s: string) => void): 
     }
     rmSync(logPath, { force: true });
   }
+}
+
+/** /api/ready answers 200 with {ready: true}; in box mode it answers 200 with ready:false while a part isn't up. */
+async function isReady(hub: string): Promise<boolean> {
+  const r = await getJson(`${hub}/api/ready`);
+  return r.status === 200 && r.body?.ready === true;
+}
+
+/** The environment a check's CLI calls (mint-token) run with: this home, the old issuer. */
+function checkEnv(d: Detected): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) if (v !== undefined) env[k] = v;
+  Object.assign(env, { PARACHUTE_HOME: d.home, PARACHUTE_HUB_ORIGIN: d.issuer, PARACHUTE_TAKEOVER_CHECK: "1" });
+  for (const k of ["PORT", "PARACHUTE_BIND_HOST", "PARACHUTE_HUB_ORIGINS", "VAULT_BIND"]) delete env[k];
+  return env;
+}
+
+/**
+ * Per vault, through the hub at `hub`: a 5-minute read pass minted for the check, the vault's stats and one read.
+ * `exact`: the note count must equal the count found on disk (the check run, which nothing else can reach); the
+ * unit's v0.8 is reachable by every client, which may write as soon as it answers, so there it must only answer.
+ */
+async function checkVaults(hub: string, d: Detected, env: Record<string, string>, log: (s: string) => void, exact: boolean): Promise<string[]> {
+  const problems: string[] = [];
+  for (const v of d.vaults) {
+    const m = Bun.spawnSync([process.execPath, CORE_ENTRY, "auth", "mint-token", "--scope", `vault:${v.name}:read`, "--expires-in", "300", "--label", "takeover-check", "--json"], {
+      env,
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    let token: string | undefined;
+    try {
+      token = JSON.parse(m.stdout.toString().trim().split("\n").pop() ?? "").token;
+    } catch {}
+    if (!token) {
+      problems.push(`vault ${v.name}: couldn't mint a read pass for the check (${m.stderr.toString().trim().slice(-200)})`);
+      continue;
+    }
+    const info = await getJson(`${hub}/vault/${encodeURIComponent(v.name)}/api/vault?include_stats=true`, token);
+    const count = info.body?.stats?.totalNotes;
+    const one = await getJson(`${hub}/vault/${encodeURIComponent(v.name)}/api/notes?limit=1`, token);
+    if (info.status !== 200 || typeof count !== "number" || (exact && count !== v.notes)) problems.push(`vault ${v.name}: HTTP ${info.status}, ${count ?? "no"} notes${exact ? `, want ${v.notes}` : ""}`);
+    else if (one.status !== 200 || (count > 0 && !(Array.isArray(one.body) ? one.body.length : one.body?.notes?.length))) problems.push(`vault ${v.name}: reading a note gave HTTP ${one.status}`);
+    else log(`  vault ${v.name}: ${count} notes, read ok`);
+  }
+  return problems;
 }
 
 /** The command a unit runs core with: the installed `<prefix>/bin/parachute-core` when this copy is installed. */
@@ -812,12 +843,15 @@ const mainPid = (unit: string) => Number(/MainPID=(\d+)/.exec(run(["systemctl", 
  * Is core's unit up: active, with a process systemd names, answering /api/ready on its port, and still the same
  * process a few seconds later (not crash-looping). Anything less is a failed hand-over.
  */
-async function coreUnitUp(port: number): Promise<string | null> {
+async function coreUnitUp(port: number, d: Detected, log: (s: string) => void): Promise<string | null> {
   const active = () => run(["systemctl", "--user", "is-active", CORE_UNIT]).stdout.trim() === "active";
   if (!(await waitUntil(() => active() && mainPid(CORE_UNIT) > 0, 30_000, 500))) return `${CORE_UNIT} did not start a process`;
   const pid = mainPid(CORE_UNIT);
-  const ok = await waitUntil(async () => (await getJson(`http://127.0.0.1:${port}/api/ready`)).status === 200 || !active(), 60_000, 500);
-  if (!ok || !active()) return `${CORE_UNIT} (pid ${pid}) is not answering /api/ready on port ${port}`;
+  const hub = `http://127.0.0.1:${port}`;
+  const ok = await waitUntil(async () => (await isReady(hub)) || !active(), 60_000, 500);
+  if (!ok || !active()) return `${CORE_UNIT} (pid ${pid}) is not ready on port ${port}`;
+  const problems = await checkVaults(hub, d, checkEnv(d), log, false);
+  if (problems.length) return `${CORE_UNIT} answers, but ${problems.join("; ")}`;
   await Bun.sleep(3000);
   if (!active() || mainPid(CORE_UNIT) !== pid) return `${CORE_UNIT} stopped or restarted within 3 s of answering`;
   return null;
@@ -994,7 +1028,7 @@ async function takeOver(d: Detected, say: (s: string) => void): Promise<{ backup
         writeRecord(d.home, record);
         systemctl("daemon-reload");
         systemctl("enable", "--now", CORE_UNIT);
-        const down = await coreUnitUp(unit.port);
+        const down = await coreUnitUp(unit.port, d, say);
         if (down) throw new Error(down);
       } catch (err) {
         throw new Error(`starting ${CORE_UNIT} failed: ${(err as Error).message}`);
