@@ -27,6 +27,9 @@ const testDir = join(
   tmpdir(),
   `vault-storage-test-${Date.now()}-${Math.random().toString(36).slice(2)}`,
 );
+// Put back in afterAll: `bun test ./src/` runs every file in one process, and a storage root left pointing here sent a
+// later file's attachments into this (deleted) folder, where routing.test.ts's usage tests then counted them.
+const before = { home: process.env.PARACHUTE_HOME, assets: process.env.ASSETS_DIR };
 process.env.PARACHUTE_HOME = testDir;
 process.env.ASSETS_DIR = join(testDir, "assets");
 
@@ -68,6 +71,10 @@ beforeAll(() => {
 
 afterAll(() => {
   if (existsSync(testDir)) rmSync(testDir, { recursive: true, force: true });
+  for (const [key, value] of [["PARACHUTE_HOME", before.home], ["ASSETS_DIR", before.assets]] as const) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
 });
 
 describe("storage upload allowlist", () => {
