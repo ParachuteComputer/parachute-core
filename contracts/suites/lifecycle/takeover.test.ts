@@ -475,11 +475,14 @@ describe("takeover", () => {
       restored_at: now, moved_aside: `${m.home}.after-takeover-cut`,
     };
     writeFileSync(join(staged, "takeover.json"), JSON.stringify(record));
+    // The person reaches the home through a link to it, which the cut leaves dangling.
+    const link = join(m.user, "home-link");
+    symlinkSync(m.home, link);
     renameSync(m.home, `${m.home}.after-takeover-cut`);
-    const dry = await core(m, ["takeover", "--home", m.home, "--dry-run"]);
+    const dry = await core(m, ["takeover", "--home", link, "--dry-run"]);
     expect(dry.code).toBe(1);
     expect(dry.stderr).toContain("--rollback --yes` finishes it");
-    const back = await core(m, ["takeover", "--home", m.home, "--rollback", "--yes", "--json"]);
+    const back = await core(m, ["takeover", "--home", link, "--rollback", "--yes", "--json"]);
     must(back.code === 0, `--rollback after a cut-off restore exited ${back.code}: ${back.stderr.slice(-800)}`);
     expect(back.stderr).toContain("was cut off before the restored copy took its place");
     expect(existsSync(staged)).toBe(false);

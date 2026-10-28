@@ -1415,6 +1415,24 @@ function finishRestore(home: string, say: (s: string) => void): void {
 }
 
 /**
+ * The home's real folder, also while it is missing (a restore cut between its renames leaves a link to it
+ * dangling): a link is followed by hand, and a missing folder is named by its real parent.
+ */
+export function realHome(p: string, hops = 0): string {
+  try {
+    return realpathSync(p);
+  } catch {}
+  try {
+    if (hops < 32 && lstatSync(p).isSymbolicLink()) return realHome(resolve(dirname(p), readlinkSync(p)), hops + 1);
+  } catch {}
+  try {
+    return join(realpathSync(dirname(p)), basename(p));
+  } catch {
+    return p;
+  }
+}
+
+/**
  * One takeover or rollback of a home at a time: an exclusive flock(2) on `<home>.takeover.lock`, beside the home (not
  * in it: backups copy the home and restores swap it), held until this process exits however it exits, so it is never
  * stale. The descriptor is close-on-exec, so a check run or module that outlives this process never holds it.
@@ -1793,10 +1811,7 @@ export async function takeover(args: string[]): Promise<number> {
     }
     // The real folder, once, for everything from here: a restore through a link to the home would replace the link,
     // and the old units, which name the real folder, would reopen the data the restore was meant to replace.
-    let home = resolve(f.home ?? homeDir());
-    try {
-      home = realpathSync(home);
-    } catch {}
+    const home = realHome(resolve(f.home ?? homeDir()));
     const out = (s: string) => (f.json ? console.error(s) : console.log(s));
     if (f.rollback) {
       if (!holdTakeoverLock(home)) throw new Exit(EXIT.held, `another takeover or rollback of ${tilde(home)} is running now; nothing was changed`);
