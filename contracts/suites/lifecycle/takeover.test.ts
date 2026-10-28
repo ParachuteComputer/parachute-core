@@ -400,6 +400,10 @@ describe("takeover", () => {
     await run.stop("SIGKILL");
     must(await until(() => dbHolders(m.home).length === 0, 15_000, 100), "setup: the cut-off check run still holds the data");
     expect(m.unit(HUB_UNIT)).toEqual({ active: false, enabled: false }); // what the cut left: nothing serves the home
+    // The dry run says the paused unit is put back, paused again and handed over, not "nothing to pause".
+    const dry = json(await core(m, ["takeover", "--home", m.home, "--dry-run", "--json"]), "takeover --dry-run --json");
+    expect(dry.plan[0]).toContain(`put ${HUB_UNIT} back`);
+    expect(dry.plan).toContain("run it from now on as parachute-core.service");
     // What a cut-off check run's modules leave (rehearsal/adam: an orphaned scribe holding its port, so the next check
     // run's scribe couldn't start): processes carrying the check run's mark. This home's are stopped; another's not.
     const idle = [process.execPath, "-e", "Bun.listen({ hostname: '127.0.0.1', port: 0, socket: { data() {} } }); await Bun.sleep(600000)"];

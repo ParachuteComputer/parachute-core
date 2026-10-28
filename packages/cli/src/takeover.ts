@@ -795,14 +795,19 @@ function size(n: number): string {
   return `${Math.max(1, Math.round(n / 1e3))} KB`;
 }
 
+/** The units an interrupted takeover paused (its record still says "taking-over"): they are put back first. */
+const cutOff = (d: Detected) => (d.record?.state === "taking-over" ? d.record.paused.map((u) => u.name) : []);
+
 function plan(d: Detected): string[] {
-  const pause = d.units.filter((u) => u.old).map((u) => u.name);
+  const back = cutOff(d);
+  const pause = [...new Set([...d.units.filter((u) => u.old).map((u) => u.name), ...back])];
   const steps = [
+    ...(back.length ? [`put ${back.join(" and ")} back as before, since the interrupted takeover paused ${back.length === 1 ? "it" : "them"}`] : []),
     pause.length ? `pause ${pause.join(" and ")} (stop and disable; the unit files stay)` : "nothing to pause: no old unit is on",
     `back up the home to ${tilde(join(dirname(d.home), "parachute-takeover"))}/<time>/, with a sha256 for every file`,
     `start v0.8 (${core.name} ${core.version}) on the same home and check every vault answers with the same notes`,
   ];
-  if (d.units.some((u) => u.old && u.manager === "systemd")) steps.push(`run it from now on as ${CORE_UNIT}`);
+  if (d.units.some((u) => u.old && u.manager === "systemd") || back.length) steps.push(`run it from now on as ${CORE_UNIT}`);
   steps.push("leave the old programs installed, as they are, and off");
   return steps;
 }
@@ -817,7 +822,9 @@ export function describe(d: Detected): string {
     const state = `${u.active ? "running" : "not running"}, ${u.enabled ? "starts at login" : "off at login"}`;
     const why = u.old
       ? " (has this home's data open: it will be paused)"
-      : u.unseen
+      : cutOff(d).includes(u.name)
+        ? " (paused by the interrupted takeover: put back first, then paused again)"
+        : u.unseen
         ? " (enabled but not running, so which home it serves can't be seen: start it, or disable it, before taking over)"
         : " (doesn't have this home's data open: left alone)";
     lines.push(`  ${u.manager} unit ${u.name}: ${state}${why}`);
