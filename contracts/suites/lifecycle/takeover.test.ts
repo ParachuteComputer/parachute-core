@@ -24,8 +24,8 @@
 // parachute-hub.service runs the old programs on the home. The takeover pauses a unit only on evidence (its process
 // has this home's data open), and after a takeover the tests talk to the v0.8 parachute-core.service runs.
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { Database } from "bun:sqlite";
 import { decodeJwt, importPKCS8, SignJWT } from "jose";
 import { until } from "../candidate-lib.ts";
@@ -446,7 +446,10 @@ describe("takeover", () => {
     must(started, `setup: the first takeover never recorded its start:\n${first.log().slice(-1500)}`);
     const backups = () => (existsSync(join(m.user, "parachute-takeover")) ? readdirSync(join(m.user, "parachute-takeover")).length : 0);
     const before = backups();
-    const second = await core(m, ["takeover", "--home", m.home, "--yes", "--json"]);
+    // The second reaches the same home by another path (a link to the user folder): the same lock all the same.
+    const alias = join(dirname(m.user), `${basename(m.user)}-alias`);
+    symlinkSync(m.user, alias);
+    const second = await core(m, ["takeover", "--home", join(alias, basename(m.home)), "--yes", "--json"]);
     expect(second.code).toBe(7);
     // Refused by the lock, before it reads anything (the record's pid check is only a second line).
     expect(second.stderr).toContain("another takeover or rollback of");
@@ -456,6 +459,71 @@ describe("takeover", () => {
     expect(JSON.parse(readFileSync(join(m.home, "takeover.json"), "utf8")).state).toBe("taken-over");
     expect(m.unit(HUB_UNIT)).toEqual({ active: false, enabled: false });
   }, 240_000);
+
+  test("a restore cut off between its two renames (no home, the restored copy beside it) is finished by --rollback", async () => {
+    // Codex's review of the rehearsal fixes (lane H): restore() moves the home aside, then the restored copy in; a cut
+    // between the two left no home at all, and neither takeover nor --rollback found anything to finish.
+    const { m, s } = await oldMachine("tk-swap");
+    await (await serving(m, s, HUB_UNIT)).stop();
+    must((await m.run(["systemctl", "--user", "disable", HUB_UNIT])).code === 0, "setup: disabling the old hub unit failed");
+    const staged = `${m.home}.restoring-cut`;
+    cpSync(m.home, staged, { recursive: true });
+    const now = new Date().toISOString();
+    const record = {
+      state: "taking-over", stage: "checking", at: now, version: "made-up", home: m.home, backup: "", rollback: "code-only", migrations: [],
+      paused: [{ name: HUB_UNIT, manager: "systemd", active: true, enabled: true }], core_unit: null, issuer: s.origin,
+      restored_at: now, moved_aside: `${m.home}.after-takeover-cut`,
+    };
+    writeFileSync(join(staged, "takeover.json"), JSON.stringify(record));
+    renameSync(m.home, `${m.home}.after-takeover-cut`);
+    const dry = await core(m, ["takeover", "--home", m.home, "--dry-run"]);
+    expect(dry.code).toBe(1);
+    expect(dry.stderr).toContain("--rollback --yes` finishes it");
+    const back = await core(m, ["takeover", "--home", m.home, "--rollback", "--yes", "--json"]);
+    must(back.code === 0, `--rollback after a cut-off restore exited ${back.code}: ${back.stderr.slice(-800)}`);
+    expect(back.stderr).toContain("was cut off before the restored copy took its place");
+    expect(existsSync(staged)).toBe(false);
+    expect(existsSync(join(m.home, "takeover.json"))).toBe(false);
+    expect(m.unit(HUB_UNIT)).toEqual({ active: true, enabled: true });
+    const c = await serving(m, s, HUB_UNIT);
+    try {
+      expect((await readNotes(s.origin, s.vaultName, s.readPass)).status).toBe(200);
+    } finally {
+      await c.stop();
+    }
+  }, 240_000);
+
+  test("putting a cut-off takeover back keeps its record until the old unit has the data open again", async () => {
+    // Codex's review of the rehearsal fixes (lane H): systemd accepting a start doesn't mean the old hub serves; if
+    // the record went first, a unit that then failed left paused data and nothing for --rollback to finish.
+    const { m, s } = await oldMachine("tk-stuck");
+    const run = m.spawn([requireCore(m.info), "takeover", "--home", m.home, "--yes", "--json"]);
+    must(await until(() => dbHolders(m.home).some((h) => h.cmd.includes("--listen")), 90_000, 50), `setup: no check run:\n${run.log().slice(-1500)}`);
+    for (const p of readdirSync("/proc").filter((x) => /^\d+$/.test(x))) {
+      try {
+        const cmd = readFileSync(`/proc/${p}/cmdline`, "utf8");
+        if ((cmd.includes("takeover") && cmd.includes(m.home)) || cmd.includes("--listen")) process.kill(Number(p), "SIGKILL");
+      } catch {}
+    }
+    await run.stop("SIGKILL");
+    must(await until(() => dbHolders(m.home).length === 0, 15_000, 100), "setup: the cut-off check run still holds the data");
+    // The old hub's unit now starts something that never opens the home (as a unit that fails after starting would).
+    const unitFile = join(m.unitDir, HUB_UNIT);
+    const text = readFileSync(unitFile, "utf8");
+    writeFileSync(unitFile, text.replace(/^ExecStart=.*$/m, "ExecStart=/bin/sleep 600"));
+    const stuck = await m.run([requireCore(m.info), "takeover", "--home", m.home, "--yes", "--json"], { timeoutMs: 200_000 });
+    expect(stuck.code).not.toBe(0);
+    expect(stuck.stderr).toContain("the record stays");
+    expect(JSON.parse(readFileSync(join(m.home, "takeover.json"), "utf8")).state).toBe("taking-over");
+    // Fixed, --rollback finishes the put-back.
+    await m.run(["systemctl", "--user", "stop", HUB_UNIT]);
+    writeFileSync(unitFile, text);
+    const back = await m.run([requireCore(m.info), "takeover", "--home", m.home, "--rollback", "--yes", "--json"], { timeoutMs: 200_000 });
+    must(back.code === 0, `--rollback after fixing the unit exited ${back.code}: ${back.stderr.slice(-800)}`);
+    expect(existsSync(join(m.home, "takeover.json"))).toBe(false);
+    expect(m.unit(HUB_UNIT)).toEqual({ active: true, enabled: true });
+    await serving(m, s, HUB_UNIT);
+  }, 400_000);
 
   test("takeover from a shell that still has the old box's settings (its port, origin and key source) checks v0.8 against itself and succeeds", async () => {
     // Found by lane E's walkthrough: a check run that took the shell's PARACHUTE_HUB_JWKS_ORIGIN fetched keys from

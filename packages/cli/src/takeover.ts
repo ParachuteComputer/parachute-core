@@ -1388,6 +1388,33 @@ function resumeUnits(paused: Record_["paused"]): string[] {
 }
 
 /**
+ * A restore cut off between its two renames leaves no home, and the restored copy (with its record) beside it as
+ * `<home>.restoring-<id>`: put that copy in place. Returns the folder it used, or null when there was nothing to finish.
+ */
+function staleRestore(home: string): string | null {
+  if (existsSync(home)) return null;
+  let found: { path: string; at: number } | null = null;
+  try {
+    for (const name of readdirSync(dirname(home))) {
+      if (!name.startsWith(`${basename(home)}.restoring-`)) continue;
+      const path = join(dirname(home), name);
+      const rec = readJson(join(path, RECORD_FILE));
+      if (!rec?.restored_at) continue; // a restore that failed before its swap, not one cut off mid-swap
+      const at = Date.parse(rec.restored_at);
+      if (!found || at > found.at) found = { path, at };
+    }
+  } catch {}
+  return found?.path ?? null;
+}
+
+function finishRestore(home: string, say: (s: string) => void): void {
+  const staged = staleRestore(home);
+  if (!staged) return;
+  renameSync(staged, home);
+  say(`A restore of ${tilde(home)} was cut off before the restored copy took its place; put it in place (${tilde(staged)} → ${tilde(home)}).`);
+}
+
+/**
  * One takeover or rollback of a home at a time: an exclusive flock(2) on `<home>.takeover.lock`, beside the home (not
  * in it: backups copy the home and restores swap it), held until this process exits however it exits, so it is never
  * stale. The descriptor is close-on-exec, so a check run or module that outlives this process never holds it.
@@ -1397,7 +1424,13 @@ function holdTakeoverLock(home: string): boolean {
     flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
     fcntl: { args: [FFIType.i32, FFIType.i32, FFIType.i32], returns: FFIType.i32 },
   });
-  const fd = openSync(`${home}.takeover.lock`, "a", 0o600); // kept open: closing it would drop the lock
+  // Keyed on the home's real path, so two runs reaching it by different paths (a link to it, or to a folder above it)
+  // take the same lock.
+  let real = home;
+  try {
+    real = realpathSync(home);
+  } catch {}
+  const fd = openSync(`${real}.takeover.lock`, "a", 0o600); // kept open: closing it would drop the lock
   const F_SETFD = 2;
   const FD_CLOEXEC = 1;
   lib.symbols.fcntl(fd, F_SETFD, FD_CLOEXEC);
@@ -1447,11 +1480,12 @@ async function putBackInterrupted(home: string, rec: Record_, say: (s: string) =
   }
   const errors = resumeUnits(rec.paused);
   if (errors.length) throw new Exit(EXIT.failed, `putting the old units back failed: ${errors.join("; ")}. Fix that and run takeover again.`);
-  rmSync(join(home, RECORD_FILE), { force: true });
+  // The record goes only once the old units have the data open again: a unit systemd starts may still fail.
   const running = rec.paused.filter((u) => u.active).map((u) => u.name);
   if (running.length && !(await waitUntil(() => running.every((u) => heldBy(home, running).some((h) => h.unit === u)), 90_000, 500))) {
-    throw new Exit(EXIT.failed, `${running.join(" and ")} ${running.length === 1 ? "is" : "are"} back, but without this home's data open after 90 s; run takeover again once ${running.length === 1 ? "it serves" : "they serve"} it.`);
+    throw new Exit(EXIT.failed, `${running.join(" and ")} ${running.length === 1 ? "was" : "were"} started again, but without this home's data open after 90 s; the record stays, so run takeover (or --rollback) again once ${running.length === 1 ? "it serves" : "they serve"} it.`);
   }
+  rmSync(join(home, RECORD_FILE), { force: true });
   say(`  ${units.join(" and ") || "the old programs"} back as before`);
   return { units, exported };
 }
@@ -1529,11 +1563,17 @@ async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ ba
     pid: process.pid,
   };
   writeRecord(d.home, progress);
-  const putBack = (why: string) => {
+  const putBack = async (why: string): Promise<string> => {
     const errors = resumeUnits(paused);
-    // Only once the old units are back is the run over; otherwise the record stays for the next run to finish.
-    if (!errors.length) rmSync(join(d.home, RECORD_FILE), { force: true });
-    return errors.length ? `${why}; putting the old units back also failed: ${errors.join("; ")}` : why;
+    if (errors.length) return `${why}; putting the old units back also failed: ${errors.join("; ")}`;
+    // Only once the old units have the data open again is the run over; until then the record stays, for the next
+    // takeover or --rollback to finish putting them back.
+    const running = paused.filter((u) => u.active).map((u) => u.name);
+    if (running.length && !(await waitUntil(() => running.every((u) => heldBy(d.home, running).some((h) => h.unit === u)), 90_000, 500))) {
+      return `${why}; ${running.join(" and ")} started again but without this home's data open after 90 s, so the takeover record stays: run \`parachute-core takeover --rollback\` once ${running.length === 1 ? "it serves" : "they serve"} the home`;
+    }
+    rmSync(join(d.home, RECORD_FILE), { force: true });
+    return why;
   };
   for (const u of toPause) {
     say(`Pausing ${u.name} …`);
@@ -1544,12 +1584,12 @@ async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ ba
       systemctl("stop", u.name);
       if (u.enabled) systemctl("disable", u.name);
     } catch (err) {
-      throw new Exit(EXIT.failed, putBack(`pausing ${u.name} failed: ${(err as Error).message}`));
+      throw new Exit(EXIT.failed, await putBack(`pausing ${u.name} failed: ${(err as Error).message}`));
     }
   }
   if (!(await waitUntil(() => holders(d.home).length === 0, 20_000, 250))) {
     const still = holders(d.home);
-    throw new Exit(EXIT.held, putBack(`after pausing the old units, still holding the data: ${still.map((h) => `pid ${h.pid} (${h.cmd.slice(0, 80)})`).join(", ")}; the old units were put back`));
+    throw new Exit(EXIT.held, await putBack(`after pausing the old units, still holding the data: ${still.map((h) => `pid ${h.pid} (${h.cmd.slice(0, 80)})`).join(", ")}; the old units were put back`));
   }
 
   const dest = join(backupRoot, stamp());
@@ -1558,7 +1598,7 @@ async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ ba
   try {
     copied = backup(d.home, dest);
   } catch (err) {
-    throw new Exit(EXIT.failed, putBack(`the backup failed: ${(err as Error).message}`));
+    throw new Exit(EXIT.failed, await putBack(`the backup failed: ${(err as Error).message}`));
   }
   say(`  ${copied.files} files, ${size(copied.bytes)}, each checked against its sha256 (manifest.json)`);
   writeRecord(d.home, { ...progress, stage: "backed-up", backup: dest });
@@ -1566,7 +1606,7 @@ async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ ba
   // Any rollback from here puts the backup back first if v0.8 has migrated the data.
   // The old programs come back only once nothing of v0.8 holds the data, and (after a migration) only once the
   // backup is back; otherwise they stay paused and it says what is left to do.
-  const undo = (why: string): Exit => {
+  const undo = async (why: string): Promise<Exit> => {
     const still = holders(d.home);
     if (still.length) {
       return new Exit(EXIT.checkFailed, `${why}; v0.8 still holds the data (${still.map((h) => `pid ${h.pid}`).join(", ")}), so the old units stay paused. Stop it, then enable and start ${paused.map((u) => u.name).join(" and ") || "the old programs"} yourself; the backup is in ${dest}`);
@@ -1584,7 +1624,8 @@ async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ ba
         return new Exit(EXIT.checkFailed, `${why}; restoring the backup failed: ${(err as Error).message}. The old units stay paused, because the data may be migrated. Restore ${dest}/home over ${d.home} (manifest.json has every sha256), then enable and start ${paused.map((u) => u.name).join(" and ")}.`);
       }
     }
-    return new Exit(EXIT.checkFailed, putBack(msg) + ". The old programs are back as they were.");
+    const back = await putBack(msg);
+    return new Exit(EXIT.checkFailed, back === msg ? `${msg}. The old programs are back as they were.` : back);
   };
 
   // From here every failure, expected or not, puts everything back: the unit, the record, the backup if v0.8
@@ -1603,7 +1644,7 @@ async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ ba
     // Not finished (a "taken-over" record may be there already) until undo() has put the old units back; it then
     // removes the record, or leaves this one for the next run to finish.
     writeRecord(d.home, { ...progress, stage: unitTried ? "handing-over" : "checking", backup: dest, core_unit: unitTried ? CORE_UNIT : null });
-    throw undo(`${(err as Error).message}`);
+    throw await undo(`${(err as Error).message}`);
   }
 
   async function startAndHandOver(): Promise<{ backup: string; record: Record_; core_unit: string | null }> {
@@ -1611,7 +1652,7 @@ async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ ba
     writeRecord(d.home, { ...progress, stage: "checking", backup: dest });
     say("Starting v0.8 on the same data and checking every answer …");
     const problems = await checkRun(d, kids, say);
-    if (problems.length) throw undo(`a check failed: ${problems.join("; ")}`);
+    if (problems.length) throw await undo(`a check failed: ${problems.join("; ")}`);
 
     const record: Record_ = {
       state: "taken-over",
@@ -1757,6 +1798,7 @@ export async function takeover(args: string[]): Promise<number> {
     const out = (s: string) => (f.json ? console.error(s) : console.log(s));
     if (f.rollback) {
       if (!holdTakeoverLock(home)) throw new Exit(EXIT.held, `another takeover or rollback of ${tilde(home)} is running now; nothing was changed`);
+      finishRestore(home, f.json ? say : out);
       const record = readRecord(home);
       if (!f.yes) {
         if (!record || (record.state !== "taken-over" && record.state !== "taking-over")) throw new Exit(EXIT.failed, `${tilde(home)} has no takeover to roll back`);
@@ -1773,8 +1815,11 @@ export async function takeover(args: string[]): Promise<number> {
       else out("Rolled back: the old programs have this home again.");
       return EXIT.ok;
     }
-    if (!existsSync(home)) throw new Exit(EXIT.failed, `there is no Parachute home at ${tilde(home)}: nothing to take over`);
+    const unfinished = staleRestore(home);
+    if (!existsSync(home) && !unfinished) throw new Exit(EXIT.failed, `there is no Parachute home at ${tilde(home)}: nothing to take over`);
+    if (f.dryRun && unfinished) throw new Exit(EXIT.failed, `a restore of ${tilde(home)} was cut off before the restored copy took its place (${tilde(unfinished)}); \`parachute-core takeover --rollback --yes\` finishes it`);
     if (!f.dryRun && !holdTakeoverLock(home)) throw new Exit(EXIT.held, `another takeover or rollback of ${tilde(home)} is running now; nothing was changed`);
+    if (!f.dryRun) finishRestore(home, out);
     const cut = readRecord(home);
     if (cut?.state === "taking-over" && !f.dryRun) {
       if (!f.yes && !confirm(`A takeover of this home started on ${cut.at} was interrupted. Put the old programs back first, then take over? [y/N] `)) {
