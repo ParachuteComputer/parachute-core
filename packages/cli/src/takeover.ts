@@ -828,7 +828,9 @@ export function describe(d: Detected): string {
   for (const v of d.vaults) lines.push(`  ${v.name}: ${v.notes} notes, schema ${v.schema}`);
   if (d.vaults.length > 1) lines.push(`  ${notes} notes in all`);
   if (d.hub_schema !== null) lines.push(`  hub.db: schema ${d.hub_schema}`);
-  if (d.others.length) lines.push(`Also registered: ${d.others.join(", ")}. v0.8 doesn't run ${d.others.length === 1 ? "it" : "them"}; left as ${d.others.length === 1 ? "it is" : "they are"}.`);
+  // Seen in rehearsal/uni and rehearsal/adam: core's supervisor boots these rows as the old hub did (the app on uni,
+  // scribe on Adam's box), with the program installed beside the old hub.
+  if (d.others.length) lines.push(`Also registered: ${d.others.join(", ")}. v0.8 starts ${d.others.length === 1 ? "it" : "them"} from services.json as the old hub did, with the installed program, which stays as it is.`);
   if (d.migrations.length === 0) {
     lines.push("v0.8 will use this data as it is: nothing is converted. Going back is starting the old programs again (`parachute-core takeover --rollback`).");
   } else {
