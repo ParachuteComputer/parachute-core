@@ -83,7 +83,8 @@ const FAKE_SYSTEMCTL = `#!/bin/sh
 # changes them on start/stop/enable/disable (with --now), and logs every call to STATE/calls.log.
 # - Units the test seeds (the old hub and vault) are bookkeeping only: each test runs the old programs itself.
 # - A unit known only by its file in UNITS (one the program under test installs, as systemd knows it after
-#   daemon-reload) is run for real: start runs its ExecStart= with its Environment= in a clean environment, as
+#   daemon-reload) is run for real: start runs its ExecStart= with its Environment= in a clean environment and a
+#   session of its own (no terminal's hang-up reaches it), as
 #   STATE/<unit>.pid; stop ends it; is-active says "failed" once its process is gone; show names its MainPID.
 # - show prints a unit file's Environment= lines (systemd prints the assignments it would pass).
 STATE=__STATE__
@@ -115,7 +116,7 @@ run_unit() {
   (
     exec 0</dev/null >>"$STATE/$1.log" 2>&1
     envs=$(sed -n 's/^Environment=//p' "$f" | sed 's/%%/%/g')
-    exec env -i HOME="$HOME" PATH="$PATH" LANG=C.UTF-8 TMPDIR="$TMPDIR" sh -c "
+    exec setsid env -i HOME="$HOME" PATH="$PATH" LANG=C.UTF-8 TMPDIR="$TMPDIR" sh -c "
       $(echo "$envs" | while IFS= read -r l; do [ -n "$l" ] && echo "export $l"; done)
       $(sed -n 's/^EnvironmentFile=//p' "$f" | sed 's/^-//' | while IFS= read -r ef; do echo "[ -f '$ef' ] && . '$ef'"; done)
       exec $cmd"
