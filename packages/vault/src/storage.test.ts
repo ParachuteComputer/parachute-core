@@ -180,7 +180,7 @@ describe("storage upload allowlist", () => {
 
 // ---------------------------------------------------------------------------
 // vault#588 FIX 1 — a malformed/non-multipart POST /upload body used to
-// throw uncaught out of `req.formData()`, escaping to server.ts's generic
+// throw uncaught out of `req.formData()`, escaping to start-vault.ts's generic
 // top-level catch: a 500 with no `error_type`. Same class LB7 (vault.test.ts)
 // fixed for `req.json()` on the JSON-bodied mutating routes, applied to the
 // multipart transport. Every assertion here MUST fail without the fix.
@@ -261,14 +261,13 @@ describe("transport-level request-body ceiling (vault#588 FIX 2)", () => {
     expect(MAX_REQUEST_BODY_BYTES).toBe(120 * 1024 * 1024);
   });
 
-  test("server.ts wires maxRequestBodySize to MAX_REQUEST_BODY_BYTES on the Bun.serve config", () => {
+  test("start-vault.ts wires maxRequestBodySize to MAX_REQUEST_BODY_BYTES on the Bun.serve config", () => {
     // A config-level assertion (per vault#588's own guidance — a real
     // >MAX_REQUEST_BODY_BYTES streaming test isn't worth the fixture cost).
-    // server.ts's `Bun.serve({...})` is a module-level side effect (it boots
-    // the real listener on import), so we can't import it in-test; read the
-    // source instead to confirm the constant is actually wired in, not just
-    // defined and forgotten.
-    const serverSrc = readFileSync(join(import.meta.dir, "server.ts"), "utf8");
+    // start-vault.ts's `Bun.serve({...})` binds a real listener (port 1940
+    // by default), so the test doesn't start it; read the source instead to
+    // confirm the constant is actually wired in, not just defined and forgotten.
+    const serverSrc = readFileSync(join(import.meta.dir, "start-vault.ts"), "utf8");
     expect(serverSrc).toMatch(/import\s*\{[^}]*MAX_REQUEST_BODY_BYTES[^}]*\}\s*from\s*"\.\/routes\.ts"/);
     expect(serverSrc).toMatch(/maxRequestBodySize:\s*MAX_REQUEST_BODY_BYTES/);
   });

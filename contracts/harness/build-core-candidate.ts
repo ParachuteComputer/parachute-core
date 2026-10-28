@@ -10,8 +10,11 @@
 // The candidate adapter (harness/candidate.ts) runs only what is in this folder, and refuses it if a byte changed.
 // Lane D turns this folder into the tarball; the layout stays.
 //
-//   bun run build:core [--out <dir>] [--source <checkout>]
+//   bun run build:core [--out <dir>] [--source <checkout>] [--process-model in-process|child]
 //
+// --process-model: the vault inside serve's process (the default, lane A2) or the hub's vault child (the fallback
+// until the Nov 3 decision, PLAN §2.1). A child build changes BUILT_PROCESS_MODEL in the copied packages/cli and
+// says so in CANDIDATE.json.
 // --source builds from another checkout's working tree, edits included. The default is this repo's working tree;
 // CI builds from a clean checkout, so that is the commit. The candidate mutants pass `edit`, which changes the
 // copied source in lib/ before it is installed (harness/mutate-candidate.ts).
@@ -52,6 +55,20 @@ export async function stageWorkspace(source: string, dest: string): Promise<stri
   return `${head}${dirty}`;
 }
 
+const SERVE = "packages/cli/src/serve.ts";
+const BUILT = /^export const BUILT_PROCESS_MODEL: ProcessModel = "(in-process|child)";$/m;
+
+/** The process model the copied workspace's `serve` runs, after setting it to `want` if given. */
+async function setProcessModel(lib: string, want?: "in-process" | "child"): Promise<"in-process" | "child"> {
+  const file = join(lib, SERVE);
+  const text = await Bun.file(file).text();
+  const m = text.match(BUILT);
+  if (!m) throw new Error(`${SERVE} has no BUILT_PROCESS_MODEL line; the build can't tell what serve runs`);
+  if (!want || want === m[1]) return m[1] as "in-process" | "child";
+  writeFileSync(file, text.replace(BUILT, `export const BUILT_PROCESS_MODEL: ProcessModel = "${want}";`));
+  return want;
+}
+
 export async function buildCoreCandidate(opts: {
   out: string;
   /** A checkout to build from (default: this repo's working tree). */
@@ -62,6 +79,8 @@ export async function buildCoreCandidate(opts: {
   staged?: { dir: string; rev: string; installed?: boolean };
   /** Change the copied workspace (lib/) before install; `label` names the change in CANDIDATE.json. */
   edit?: { label: string; apply: (lib: string) => Promise<void> };
+  /** What `serve` runs (default: what packages/cli/src/serve.ts says, "in-process"). */
+  processModel?: "in-process" | "child";
 }): Promise<{ sha256: string }> {
   const out = resolve(opts.out);
   const source = resolve(opts.source ?? REPO);
@@ -75,6 +94,7 @@ export async function buildCoreCandidate(opts: {
     rev = opts.staged.rev;
   } else rev = await stageWorkspace(source, lib);
   if (opts.edit) await opts.edit.apply(lib);
+  const model = await setProcessModel(lib, opts.processModel);
   // Builds the hub's packages (depcheck, door-contract) through the root `prepare` script.
   if (!opts.staged?.installed) await sh(["bun", "install", "--frozen-lockfile"], lib);
 
@@ -95,11 +115,14 @@ export async function buildCoreCandidate(opts: {
   const manifest = {
     name: pkg.name,
     profile: "v0.8",
-    note: "the one program built from this repo's workspace; the hub still starts the vault as a child (lane A1)",
+    note:
+      model === "in-process"
+        ? "the one program built from this repo's workspace; serve runs the vault inside its own process (lane A2)"
+        : "the one program built from this repo's workspace, child path: the hub starts the vault as a child (the fallback until Nov 3)",
     version: { core: pkg.version, hub: await version("packages/hub"), vault: await version("packages/vault") },
     source: { core: `${rev}${opts.source ? ` (from ${source})` : ""}${opts.edit ? ` + ${opts.edit.label}` : ""}` },
     core_commit: rev.replace("+changes", ""),
-    process_model: "child",
+    process_model: model,
     platform: `${process.platform}-${process.arch}`,
     sha256,
   };
@@ -110,7 +133,9 @@ export async function buildCoreCandidate(opts: {
 if (import.meta.main) {
   const out = arg("--out") ?? join(REPO, "contracts", ".cache", "candidate-core");
   const t0 = Date.now();
-  const { sha256 } = await buildCoreCandidate({ out, source: arg("--source") });
+  const pm = arg("--process-model");
+  if (pm !== undefined && pm !== "in-process" && pm !== "child") throw new Error(`--process-model is in-process or child, not ${pm}`);
+  const { sha256 } = await buildCoreCandidate({ out, source: arg("--source"), processModel: pm });
   console.log(`[candidate] built ${out} in ${Math.round((Date.now() - t0) / 1000)} s`);
   console.log(`[candidate] sha256 ${sha256}`);
   // For CI: the build step's output, compared with what the runs report (harness/run-candidate.ts).
