@@ -144,7 +144,7 @@ class Coordinator {
  * The vault as a part of this process. Its start, stop and restart run one at a time, so a supervisor call and a
  * stop never overlap, and a second start while one runs is a no-op.
  */
-class VaultPart {
+export class VaultPart {
   running: RunningVault | null = null;
   /** True once stopped on request (the hub's `stop vault`): reported as stopped, as a child would be. */
   stoppedOnRequest = false;
@@ -165,6 +165,7 @@ class VaultPart {
       startVault: (opts: StartVaultOptions) => Promise<RunningVault>;
       readEnvFile: () => Record<string, string>;
       setHubValues: (v: HubValues) => void;
+      isOffline: () => boolean;
       port: (requested?: number) => number;
       onStopFile: () => void;
     },
@@ -188,6 +189,9 @@ class VaultPart {
       // wins. The same here, for every key but the hub's own (above) and the home.
       for (const [k, v] of Object.entries(file)) {
         if ((HUB_KEYS as readonly string[]).includes(k) || k === "PARACHUTE_HOME") continue;
+        // Offline serve stays offline: the hub's supervisor sets PARACHUTE_OFFLINE=1 over a child's .env (lane B,
+        // hub supervisor.ts), and here the environment is the hub's own too.
+        if (k === "PARACHUTE_OFFLINE" && this.deps.isOffline()) continue;
         if (!this.replaced.has(k)) this.replaced.set(k, process.env[k]);
         process.env[k] = v;
       }
@@ -306,10 +310,12 @@ export async function serveInProcess(args: string[]): Promise<never> {
   const { buildHubOriginsEnvValue } = await import("@openparachute/hub/src/vault-hub-origin-env.ts");
   const vaultRow = () => readManifestLenient(SERVICES_MANIFEST_PATH).services.find((s) => s.name === "parachute-vault");
 
+  const { isOffline } = await import("@openparachute/hub/src/offline.ts");
   const vault = new VaultPart({
     startVault,
     readEnvFile,
     setHubValues,
+    isOffline: () => isOffline(),
     // The port the hub proxies to: what it asked for, else the services.json row's (snapped back to 1940 if it
     // drifted, as the hub does for a child), else config.yaml's, else 1940.
     port: (requested) => {
