@@ -46,6 +46,7 @@ export function primaryHelp(): string {
     "  parachute version [--json]          this program's name, version, data schema and Bun",
     "  parachute install [--prefix <dir>]  install this program for you (default ~/.local/share/parachute-core)",
     "  parachute bootstrap --embedded …    set up a host-managed home in one step (see `bootstrap --help`)",
+    "  parachute takeover [--dry-run]      move a home the old hub and vault (0.7) keep onto v0.8",
     "  parachute vault <command>           the vault's commands",
     "  parachute <command>                 the hub's commands, as in 0.7: serve, auth, …",
     "",

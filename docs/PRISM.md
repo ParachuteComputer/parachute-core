@@ -115,12 +115,13 @@ a private network namespace, and it must be zero.
   issuer out differently).
 - One launchd agent for Parachute instead of two (`cli/commands.ts`): `serve --embedded` starts and stops the vault.
 
-## What comes next
+## What else is in this build, and what comes next
 
-- **First-run takeover** (in review): on a machine where 0.7's hub and vault keep a home, `parachute-core takeover`
-  says what it found, backs up, pauses the old programs, starts v0.8 on the same data and checks it, and keeps the
-  old programs installed but off, with one command to go back. A box `serve` on such a home refuses with exit 7 until
-  then. Embedded homes are not touched by it: Prism adopts in place, as above.
+- **First-run takeover:** on a machine where 0.7's hub and vault keep a home, `parachute-core takeover` says what it
+  found, backs up, pauses the old programs, starts v0.8 on the same data and checks it, and keeps the old programs
+  installed but off; `parachute-core takeover --rollback` goes back. A box `serve` on such a home refuses with exit 7
+  until then. Embedded homes are not touched by it: Prism adopts in place, as above, and `serve --embedded` never
+  refuses for this reason.
 - From Nov 5, a candidate tarball each night, so the Nov 9 build isn't the first you see.
 
 ## Requests for your suite (PLAN §3.1)
