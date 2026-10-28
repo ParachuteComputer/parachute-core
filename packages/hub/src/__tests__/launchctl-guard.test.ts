@@ -120,8 +120,8 @@ describe("guardServiceManagerCommand — throws under a test runner", () => {
         guardServiceManagerCommand(["launchctl", "bootout", "gui/501/computer.parachute.SAFE"]),
       ).not.toThrow();
     } finally {
-      // Restore — `= undefined` to clear (the codebase convention; biome flags
-      // `delete process.env.X` as a perf foot-gun. See hub-settings.test.ts).
+      // Restore — delete to clear, not `= undefined` (Bun 1.4 stores the string
+      // "undefined"); Reflect.deleteProperty satisfies biome. See hub-settings.test.ts.
       if (prev === undefined) Reflect.deleteProperty(process.env, "PARACHUTE_ALLOW_REAL_LAUNCHCTL");
       else process.env.PARACHUTE_ALLOW_REAL_LAUNCHCTL = prev;
     }

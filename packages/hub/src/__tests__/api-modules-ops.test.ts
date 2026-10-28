@@ -616,8 +616,8 @@ describe("POST /api/modules/:short/install", () => {
       expect(calls).toContainEqual(["bun", "add", "-g", "@openparachute/vault@rc"]);
       expect(calls).not.toContainEqual(["bun", "add", "-g", "@openparachute/vault@latest"]);
     } finally {
-      // Bun's process.env supports the `[key]: undefined` shape
-      // (biome's noDelete rule preferred this over `delete`).
+      // Delete, not `= undefined`: Bun 1.4 stores the string "undefined".
+      // Reflect.deleteProperty satisfies biome's noDelete rule.
       if (prior === undefined) Reflect.deleteProperty(process.env, "PARACHUTE_INSTALL_CHANNEL");
       else process.env.PARACHUTE_INSTALL_CHANNEL = prior;
     }
@@ -654,8 +654,8 @@ describe("POST /api/modules/:short/install", () => {
       expect(calls).toContainEqual(["bun", "add", "-g", "@openparachute/vault@latest"]);
       expect(calls).not.toContainEqual(["bun", "add", "-g", "@openparachute/vault@rc"]);
     } finally {
-      // Bun's process.env supports the `[key]: undefined` shape
-      // (biome's noDelete rule preferred this over `delete`).
+      // Delete, not `= undefined`: Bun 1.4 stores the string "undefined".
+      // Reflect.deleteProperty satisfies biome's noDelete rule.
       if (prior === undefined) Reflect.deleteProperty(process.env, "PARACHUTE_INSTALL_CHANNEL");
       else process.env.PARACHUTE_INSTALL_CHANNEL = prior;
     }
@@ -689,8 +689,8 @@ describe("POST /api/modules/:short/install", () => {
       // Falls back to the DB-stored rc, not "@latest".
       expect(calls).toContainEqual(["bun", "add", "-g", "@openparachute/vault@rc"]);
     } finally {
-      // Bun's process.env supports the `[key]: undefined` shape
-      // (biome's noDelete rule preferred this over `delete`).
+      // Delete, not `= undefined`: Bun 1.4 stores the string "undefined".
+      // Reflect.deleteProperty satisfies biome's noDelete rule.
       if (prior === undefined) Reflect.deleteProperty(process.env, "PARACHUTE_INSTALL_CHANNEL");
       else process.env.PARACHUTE_INSTALL_CHANNEL = prior;
     }
