@@ -1051,7 +1051,7 @@ async function checkRun(d: Detected, kids: string[], log: (s: string) => void): 
     const missing = kids.filter((k) => !served.has(k));
     if (missing.length || jwks.status !== 200) problems.push(`the hub's keys (JWKS HTTP ${jwks.status}) lack ${missing.length} of the ${kids.length} live signing keys`);
     else log(`  the issuer and ${kids.length === 1 ? "the live signing key are" : `all ${kids.length} live signing keys are`} the same: every token issued before still verifies`);
-    problems.push(...(await checkVaults(hub, d, env, log, true)));
+    problems.push(...(await checkVaults(hub, d, log, true)));
     return problems;
   } finally {
     if (proc.exitCode === null) {
@@ -1073,13 +1073,26 @@ async function isReady(hub: string): Promise<boolean> {
   return r.status === 200 && r.body?.ready === true;
 }
 
-/** The environment a check's CLI calls (mint-token) run with: this home, the old issuer. */
-function checkEnv(d: Detected): Record<string, string> {
-  const env: Record<string, string> = {};
-  for (const [k, v] of Object.entries(process.env)) if (v !== undefined) env[k] = v;
-  Object.assign(env, { PARACHUTE_HOME: d.home, PARACHUTE_HUB_ORIGIN: d.issuer, PARACHUTE_TAKEOVER_CHECK: "1" });
-  for (const k of ["PORT", "PARACHUTE_BIND_HOST", "PARACHUTE_HUB_ORIGINS", "VAULT_BIND"]) delete env[k];
-  return env;
+/**
+ * A 5-minute read pass for one vault, signed with the home's own signing key and recorded in hub.db like any mint
+ * (subject takeover-check). Not through `auth mint-token`: that needs a usable operator token, and an old home's may
+ * not be one (uni's was issued under the tailnet's old name, which only the hub's server accepts; rehearsal/uni), and
+ * it would rotate one near expiry, writing operator.token in the home mid-takeover.
+ */
+async function mintCheckPass(d: Detected, vault: string): Promise<string> {
+  const { openHubDb } = await import("@openparachute/hub/src/hub-db.ts");
+  const { signAccessToken, recordTokenMint } = await import("@openparachute/hub/src/jwt-sign.ts");
+  const { inferAudience } = await import("@openparachute/hub/src/jwt-audience.ts");
+  const { OPERATOR_TOKEN_CLIENT_ID } = await import("@openparachute/hub/src/operator-token.ts");
+  const scopes = [`vault:${vault}:read`];
+  const db = openHubDb(join(d.home, "hub.db"));
+  try {
+    const minted = await signAccessToken(db, { sub: "takeover-check", scopes, audience: inferAudience(scopes), clientId: OPERATOR_TOKEN_CLIENT_ID, issuer: d.issuer, ttlSeconds: 300, vaultScope: [] });
+    recordTokenMint(db, { jti: minted.jti, createdVia: "cli_mint", subject: "takeover-check", clientId: OPERATOR_TOKEN_CLIENT_ID, scopes, expiresAt: minted.expiresAt });
+    return minted.token;
+  } finally {
+    db.close();
+  }
 }
 
 /**
@@ -1087,21 +1100,14 @@ function checkEnv(d: Detected): Record<string, string> {
  * `exact`: the note count must equal the count found on disk (the check run, which nothing else can reach); the
  * unit's v0.8 is reachable by every client, which may write as soon as it answers, so there it must only answer.
  */
-async function checkVaults(hub: string, d: Detected, env: Record<string, string>, log: (s: string) => void, exact: boolean): Promise<string[]> {
+async function checkVaults(hub: string, d: Detected, log: (s: string) => void, exact: boolean): Promise<string[]> {
   const problems: string[] = [];
   for (const v of d.vaults) {
-    const m = Bun.spawnSync([process.execPath, CORE_ENTRY, "auth", "mint-token", "--scope", `vault:${v.name}:read`, "--expires-in", "300", "--label", "takeover-check", "--json"], {
-      env,
-      stdin: "ignore",
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    let token: string | undefined;
+    let token: string;
     try {
-      token = JSON.parse(m.stdout.toString().trim().split("\n").pop() ?? "").token;
-    } catch {}
-    if (!token) {
-      problems.push(`vault ${v.name}: couldn't mint a read pass for the check (${m.stderr.toString().trim().slice(-200)})`);
+      token = await mintCheckPass(d, v.name);
+    } catch (err) {
+      problems.push(`vault ${v.name}: couldn't mint a read pass for the check (${String((err as Error).message).slice(-200)})`);
       continue;
     }
     const info = await getJson(`${hub}/vault/${encodeURIComponent(v.name)}/api/vault?include_stats=true`, token);
@@ -1249,7 +1255,7 @@ async function coreUnitUp(port: number, d: Detected, log: (s: string) => void): 
   }, 60_000, 500);
   if (!ok || !active() || !hub) return `${CORE_UNIT} (pid ${pid}) is not ready (tried port ${port} and the ports it listens on)`;
   if (!heldBy(d.home, [CORE_UNIT]).some((h) => h.unit === CORE_UNIT)) return `${CORE_UNIT} (pid ${pid}) answers, but none of its processes has this home's data open`;
-  const problems = await checkVaults(hub, d, checkEnv(d), log, false);
+  const problems = await checkVaults(hub, d, log, false);
   if (problems.length) return `${CORE_UNIT} answers, but ${problems.join("; ")}`;
   await Bun.sleep(3000);
   if (!active() || mainPid(CORE_UNIT) !== pid) return `${CORE_UNIT} stopped or restarted within 3 s of answering`;

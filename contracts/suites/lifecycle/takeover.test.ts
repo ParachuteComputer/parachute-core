@@ -27,6 +27,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
+import { decodeJwt, importPKCS8, SignJWT } from "jose";
 import { until } from "../candidate-lib.ts";
 import { rest } from "../lib.ts";
 import {
@@ -348,6 +349,26 @@ describe("takeover", () => {
       expect(readlinkSync(join(home, "transcription", "bin", "libmadeup.so.0"))).toBe("libmadeup.so.0.15.1");
       expect(readFileSync(join(home, "transcription", "bin", "libmadeup.so"), "utf8")).toBe("made-up library bytes");
     }
+    expect(m.unit(HUB_UNIT)).toEqual({ active: false, enabled: false });
+  }, 120_000);
+
+  test("takeover doesn't need a usable operator token: one issued under the box's old name (as uni's) is left alone, and the takeover succeeds", async () => {
+    // Found by rehearsal/uni (lane H): uni's operator.token (and every script pass) carries the tailnet's old name as
+    // its issuer, which the old hub's server accepts through its unit's RENDER_EXTERNAL_URL but `auth mint-token`
+    // doesn't. The takeover's check minted its read passes with that command, so every vault check failed (exit 8).
+    const { m } = await oldMachine("tk-oldop");
+    const opFile = join(m.home, "operator.token");
+    const hub = new Database(hubDb(m), { readonly: true });
+    const key = hub.query("SELECT kid, private_key_pem FROM signing_keys WHERE retired_at IS NULL").get() as { kid: string; private_key_pem: string };
+    hub.close();
+    const claims = decodeJwt(readFileSync(opFile, "utf8").trim());
+    const renamed = await new SignJWT({ ...claims, iss: "https://box-old-name.example-tailnet.test" })
+      .setProtectedHeader({ alg: "RS256", kid: key.kid })
+      .sign(await importPKCS8(key.private_key_pem, "RS256"));
+    writeFileSync(opFile, `${renamed}\n`, { mode: 0o600 });
+    const r = await core(m, ["takeover", "--home", m.home, "--yes", "--json"]);
+    must(r.code === 0, `takeover --yes with an operator token from the old name exited ${r.code}: ${r.stderr.slice(-600)}`);
+    expect(readFileSync(opFile, "utf8")).toBe(`${renamed}\n`);
     expect(m.unit(HUB_UNIT)).toEqual({ active: false, enabled: false });
   }, 120_000);
 
