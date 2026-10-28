@@ -183,12 +183,59 @@ function run(argv: string[], opts: { env?: Record<string, string> } = {}): { cod
 const systemdUnitDir = () => join(process.env.XDG_CONFIG_HOME || join(userHome(), ".config"), "systemd", "user");
 
 /**
+ * Split an `Environment=` value into its assignments as systemd does: whitespace between words, "…" and '…' quote
+ * (spaces kept), a backslash escapes the next character. undefined when the quoting doesn't close.
+ */
+export function systemdWords(value: string): string[] | undefined {
+  const out: string[] = [];
+  let word = "";
+  let inWord = false;
+  let quote: string | undefined;
+  for (let i = 0; i < value.length; i++) {
+    const c = value[i]!;
+    if (c === "\\") {
+      if (i + 1 >= value.length) return undefined;
+      word += value[++i];
+      inWord = true;
+    } else if (quote) {
+      if (c === quote) quote = undefined;
+      else word += c;
+    } else if (c === '"' || c === "'") {
+      quote = c;
+      inWord = true;
+    } else if (/\s/.test(c)) {
+      if (inWord) out.push(word);
+      word = "";
+      inWord = false;
+    } else {
+      word += c;
+      inWord = true;
+    }
+  }
+  if (quote) return undefined;
+  if (inWord) out.push(word);
+  return out;
+}
+
+/** A KEY=VALUE line of an environment file, its value unquoted ("…" or '…', or bare up to a comment). */
+function envFileValue(line: string, key: string): string | undefined | null {
+  const m = new RegExp(`^\\s*(?:export\\s+)?${key}\\s*=\\s*(.*)$`).exec(line);
+  if (!m) return undefined;
+  const raw = m[1]!.trim();
+  if (raw.startsWith('"') || raw.startsWith("'")) {
+    const words = systemdWords(raw);
+    return words && words.length === 1 ? words[0]! : null; // null: can't tell
+  }
+  return raw.replace(/\s+#.*$/, "");
+}
+
+/**
  * The home a unit serves, by systemd's rules (systemd.exec(5)): variables from `EnvironmentFile=` override
  * `Environment=` whatever the order of the lines; within each kind the last assignment wins; an empty `Environment=`
  * or `EnvironmentFile=` resets that kind's list. With no PARACHUTE_HOME, ~/.parachute. "unknown" when it can't be
  * established (an environment file it can't read): callers then take the safe side.
  */
-function unitHome(text: string): string | "unknown" {
+export function unitHome(text: string): string | "unknown" {
   const expand = (v: string) => v.replace(/%h/g, userHome()).replace(/%%/g, "%");
   let fromEnv: string | undefined;
   let files: { path: string; optional: boolean }[] = [];
@@ -196,7 +243,9 @@ function unitHome(text: string): string | "unknown" {
     const env = /^\s*Environment\s*=\s*(.*)$/.exec(line)?.[1];
     if (env !== undefined) {
       if (env.trim() === "") fromEnv = undefined;
-      for (const m of env.matchAll(/(?:^|\s)"?PARACHUTE_HOME=([^"\s]*)/g)) fromEnv = expand(m[1]!);
+      const words = systemdWords(env);
+      if (!words) return "unknown";
+      for (const w of words) if (w.startsWith("PARACHUTE_HOME=")) fromEnv = expand(w.slice("PARACHUTE_HOME=".length));
       continue;
     }
     const file = /^\s*EnvironmentFile\s*=\s*(.*)$/.exec(line)?.[1]?.trim();
@@ -214,7 +263,11 @@ function unitHome(text: string): string | "unknown" {
       if (f.optional && !existsSync(f.path)) continue; // systemd skips a missing optional file
       return "unknown";
     }
-    for (const m of body.matchAll(/^\s*(?:export\s+)?PARACHUTE_HOME=["']?([^"'\s]*)/gm)) fromFiles = m[1];
+    for (const line of body.split("\n")) {
+      const v = envFileValue(line, "PARACHUTE_HOME");
+      if (v === null) return "unknown";
+      if (v !== undefined) fromFiles = v;
+    }
   }
   const set = fromFiles ?? fromEnv;
   return set ? set : join(userHome(), ".parachute");

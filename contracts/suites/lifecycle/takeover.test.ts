@@ -381,6 +381,21 @@ describe("takeover", () => {
     void y;
   }, 180_000);
 
+  test("a unit whose quoted home has a space in it is read whole: one that serves '<this home> other' is left alone", async () => {
+    const { m } = await oldMachine("tk-quoted");
+    const unit = join(m.unitDir, HUB_UNIT);
+    mkdirSync(`${unit}.d`, { recursive: true });
+    writeFileSync(join(`${unit}.d`, "home.conf"), `[Service]\nEnvironment="PARACHUTE_HOME=${m.home} other"\n`);
+    const calls = m.systemctlCalls().length;
+    const r = await core(m, ["takeover", "--home", m.home, "--dry-run", "--json"]);
+    must(r.code === 0, `takeover --dry-run exited ${r.code}: ${r.stderr.slice(-600)}`);
+    const hub = (json(r, "takeover --dry-run --json").units as any[]).find((u) => u.name === HUB_UNIT);
+    expect(hub?.old).toBe(false);
+    await core(m, ["takeover", "--home", m.home, "--yes", "--json"]);
+    expect(changesTo(m, HUB_UNIT, calls)).toEqual([]);
+    expect(m.unit(HUB_UNIT)).toEqual({ active: true, enabled: true });
+  }, 180_000);
+
   test("a parachute-core.service that serves another home is never replaced: refused before anything changes", async () => {
     const { m } = await oldMachine("tk-coreunit");
     const theirs = join(m.unitDir, "parachute-core.service");
