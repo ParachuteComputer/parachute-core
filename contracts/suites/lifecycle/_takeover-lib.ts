@@ -80,8 +80,10 @@ export interface UnitState {
 
 const FAKE_SYSTEMCTL = `#!/bin/sh
 # Fake systemctl for the contracts (an outside system). Answers from STATE/<unit>.active and STATE/<unit>.enabled,
-# changes them on start/stop/enable/disable (with --now), and logs every call to STATE/calls.log.
+# changes them on start/stop/enable/disable (with --now), and logs every call to STATE/calls.log. Like systemd after
+# daemon-reload, a unit whose file is in UNITS is known too (inactive and disabled until changed). It runs nothing.
 STATE=__STATE__
+UNITS=__UNITS__
 echo "$*" >> "$STATE/calls.log"
 verb=""; now=""; units=""; props=""
 while [ $# -gt 0 ]; do
@@ -94,12 +96,13 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
-known() { [ -f "$STATE/$1.active" ]; }
+known() { [ -f "$STATE/$1.active" ] || [ -f "$UNITS/$1" ]; }
+st() { if [ -f "$STATE/$1.$2" ]; then cat "$STATE/$1.$2"; elif [ "$2" = active ]; then echo inactive; else echo disabled; fi; }
 code=0
 case "$verb" in
   daemon-reload) exit 0 ;;
-  is-active) for u in $units; do if known "$u"; then s=$(cat "$STATE/$u.active"); echo "$s"; [ "$s" = active ] || code=3; else echo inactive; code=3; fi; done; exit $code ;;
-  is-enabled) for u in $units; do if known "$u"; then s=$(cat "$STATE/$u.enabled"); echo "$s"; [ "$s" = enabled ] || code=1; else echo "Failed to get unit file state for $u: No such file or directory" >&2; code=1; fi; done; exit $code ;;
+  is-active) for u in $units; do if known "$u"; then s=$(st "$u" active); echo "$s"; [ "$s" = active ] || code=3; else echo inactive; code=3; fi; done; exit $code ;;
+  is-enabled) for u in $units; do if known "$u"; then s=$(st "$u" enabled); echo "$s"; [ "$s" = enabled ] || code=1; else echo "Failed to get unit file state for $u: No such file or directory" >&2; code=1; fi; done; exit $code ;;
   start|stop|restart|enable|disable)
     for u in $units; do
       known "$u" || { echo "Unit $u not found." >&2; exit 5; }
@@ -112,7 +115,7 @@ case "$verb" in
     done; exit 0 ;;
   show)
     for u in $units; do
-      if known "$u"; then a=$(cat "$STATE/$u.active"); e=$(cat "$STATE/$u.enabled"); l=loaded; else a=inactive; e=""; l=not-found; fi
+      if known "$u"; then a=$(st "$u" active); e=$(st "$u" enabled); l=loaded; else a=inactive; e=""; l=not-found; fi
       echo "Id=$u"; echo "LoadState=$l"; echo "ActiveState=$a"; echo "UnitFileState=$e"; echo "MainPID=0"; echo
     done; exit 0 ;;
   list-unit-files)
@@ -185,7 +188,7 @@ export async function newMachine(
   mkdirSync(fakeBin, { recursive: true });
   mkdirSync(state, { recursive: true });
   mkdirSync(unitDir, { recursive: true });
-  writeFileSync(join(fakeBin, "systemctl"), FAKE_SYSTEMCTL.replace("__STATE__", JSON.stringify(state)), { mode: 0o755 });
+  writeFileSync(join(fakeBin, "systemctl"), FAKE_SYSTEMCTL.replace("__STATE__", JSON.stringify(state)).replace("__UNITS__", JSON.stringify(unitDir)), { mode: 0o755 });
   writeFileSync(join(state, "calls.log"), "");
   const units = opts.units ?? {};
   for (const [name, s] of Object.entries(units)) {
