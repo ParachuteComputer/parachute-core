@@ -12,7 +12,13 @@
     "strict": true,
     "skipLibCheck": true,
     "noUncheckedIndexedAccess": true,
-    "types": ["bun"]
+    "types": ["bun"],
+    // The hub and the vault are found by path, not through node_modules: in the npm package (release/npm.ts) an old
+    // @openparachute/hub or /vault installed next to this one must never be what runs. Bun reads these at run time.
+    "paths": {
+      "@openparachute/hub/*": ["../hub/*"],
+      "@openparachute/vault/*": ["../vault/*"]
+    }
   },
   "include": ["src/**/*.ts"]
 }

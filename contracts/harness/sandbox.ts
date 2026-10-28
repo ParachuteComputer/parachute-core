@@ -200,7 +200,8 @@ function keepPaths(): { path: string; rw: boolean }[] {
   const { dirname, resolve } = require("node:path") as typeof import("node:path");
   const repo = resolve(import.meta.dir, "..", "..");
   const keep: { path: string; rw: boolean }[] = [{ path: repo, rw: false }];
-  for (const k of ["CANDIDATE_DIR", "OLD_STOCK_DIR"]) if (process.env[k]) keep.push({ path: resolve(process.env[k]!), rw: false });
+  // NPM_INSTALL_DIR: the scratch npm and bun installs of the npm package (harness/npm-package.ts).
+  for (const k of ["CANDIDATE_DIR", "OLD_STOCK_DIR", "NPM_INSTALL_DIR"]) if (process.env[k]) keep.push({ path: resolve(process.env[k]!), rw: false });
   // The tarball and its SHA256SUMS (embedded/bundle checks them against the tree).
   if (process.env.CANDIDATE_TARBALL) keep.push({ path: dirname(resolve(process.env.CANDIDATE_TARBALL)), rw: false });
   keep.push({ path: realpathSync(process.execPath), rw: false });

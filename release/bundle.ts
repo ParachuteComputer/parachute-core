@@ -1,15 +1,17 @@
 // The v0.8 bundle (PLAN §3 "The bundle", §2.5): the tree the tarball holds, which is also the candidate every suite
 // runs (contracts/harness/build-core-candidate.ts builds it; `bun run build:core`).
 //
-//   bin/parachute-core            the one command: links to lib/packages/cli/bin/, whose sh wrappers run lib/ on
-//                                 the bundle's runtime/bun when there is one
-//   bin/parachute, bin/parachute-vault   the same program under its two old names, for Prism's PARACHUTE_BIN /
-//                                 PARACHUTE_VAULT_BIN and Benjamin's suite; never linked onto a shared PATH
+//   bin/parachute                 the command (Aaron, 10-27): links to lib/packages/cli/bin/, whose sh wrappers run
+//                                 lib/ on the bundle's runtime/bun when there is one. The hub's 0.7 commands as they
+//                                 were (Prism's PARACHUTE_BIN, Benjamin's suite), plus v0.8's (packages/cli/src/primary.ts)
+//   bin/parachute-core            the same program under its other name (an alias, for now)
+//   bin/parachute-vault           the vault's commands under their 0.7 name, for Prism's PARACHUTE_VAULT_BIN and
+//                                 Benjamin's suite; never linked onto a shared PATH
 //   runtime/bun                   the pinned Bun (release/bun.json), checked against its sha256
 //   lib/                          the workspace with a production install of node_modules (release/payload.ts:
 //                                 no embedding stack, no dev tools) and the hub's and vault's built admin pages
 //   entitlements/bun.plist        allow-jit: what runtime/bun needs under the hardened runtime (release/sign.ts)
-//   package.json                  @openparachute/core, bin parachute-core
+//   package.json                  @openparachute/core, bins parachute and parachute-core
 //   LICENSE, THIRD-PARTY-NOTICES.txt, SOURCE.md, VERSION (the wrappers know the bundle by VERSION and runtime/bun)
 //
 // The wrappers turn Bun's transpiler cache off unless the caller sets BUN_RUNTIME_TRANSPILER_CACHE_PATH: by
@@ -82,7 +84,7 @@ export async function layOutBundle(out: string, opts: { commit: string; rev: str
   writeFileSync(
     join(out, "package.json"),
     JSON.stringify(
-      { name: pkg.name, version: pkg.version, description: pkg.description, license: pkg.license, type: "module", bin: { "parachute-core": "bin/parachute-core" } },
+      { name: pkg.name, version: pkg.version, description: pkg.description, license: pkg.license, type: "module", bin: { parachute: "bin/parachute", "parachute-core": "bin/parachute-core" } },
       null,
       2,
     ) + "\n",
