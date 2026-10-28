@@ -74,11 +74,23 @@ export type SpawnRunner = (
   opts?: { timeoutMs?: number },
 ) => Promise<SubprocessResult>;
 
+/** Every transcription subprocess running now (all local providers spawn through `defaultSpawnRunner`). */
+const running = new Set<ReturnType<typeof Bun.spawn>>();
+
+/**
+ * Kill every transcription subprocess this process started and is still waiting on: the worker stopping inside a
+ * longer-lived process (`parachute-core serve`). A vault in a process of its own had them go with its process group.
+ */
+export function killTranscriptionSubprocesses(): void {
+  for (const proc of running) proc.kill();
+}
+
 /** Production spawn runner over `Bun.spawn`. */
 export const defaultSpawnRunner: SpawnRunner = async (cmd, opts) => {
   let proc: ReturnType<typeof Bun.spawn>;
   try {
     proc = Bun.spawn(cmd, { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+    running.add(proc);
   } catch (err) {
     // ENOENT etc. — the binary couldn't be launched at all.
     return { exitCode: 127, stdout: "", stderr: err instanceof Error ? err.message : String(err) };
@@ -102,6 +114,7 @@ export const defaultSpawnRunner: SpawnRunner = async (cmd, opts) => {
     return { exitCode, stdout, stderr };
   } finally {
     if (timer) clearTimeout(timer);
+    running.delete(proc);
   }
 };
 

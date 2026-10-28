@@ -1,6 +1,8 @@
 import { describe, test, expect } from "bun:test";
 import {
   TranscribeCppProvider,
+  defaultSpawnRunner,
+  killTranscriptionSubprocesses,
   buildTranscribeArgs,
   buildFfmpegArgs,
   parseTranscribeCliOutput,
@@ -310,5 +312,19 @@ describe("TranscribeCppProvider.transcribe — error mapping", () => {
     expect(err).toBeInstanceOf(Error);
     expect(err).not.toBeInstanceOf(TranscriptionError);
     expect(err.message).toContain("no transcript text");
+  });
+});
+
+describe("killTranscriptionSubprocesses", () => {
+  // The worker's stop() calls it, so a local provider's subprocess doesn't run on to its timeout after the vault
+  // stopped inside a longer-lived process (`parachute-core serve`).
+  test("ends a subprocess the runner is waiting on", async () => {
+    const t0 = Date.now();
+    const running = defaultSpawnRunner(["sleep", "30"], { timeoutMs: 60_000 });
+    await Bun.sleep(100);
+    killTranscriptionSubprocesses();
+    const result = await running;
+    expect(result.exitCode).not.toBe(0);
+    expect(Date.now() - t0).toBeLessThan(5_000);
   });
 });

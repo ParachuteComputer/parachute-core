@@ -51,6 +51,7 @@
  * again, which scribe and the metadata writes handle idempotently.
  */
 
+import { killTranscriptionSubprocesses } from "./transcription/providers/transcribe-cpp.ts";
 import { join, normalize } from "path";
 import { existsSync, readFileSync, unlinkSync } from "fs";
 import type { Store, Attachment, Note } from "../core/src/types.ts";
@@ -549,6 +550,9 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
       });
       scribeResult = { text: result.text, durationMs: Date.now() - startedAt };
     } catch (err) {
+      // Stopped while the provider worked (its subprocess killed by stop()): write nothing, the attachment stays
+      // pending for the next start; the store may be closed now.
+      if (stopped) return;
       const errMsg = err instanceof Error ? err.message : String(err);
       const apiErr = err instanceof TranscriptionError ? err : null;
       // A non-retriable provider error (a 4xx the operator must fix — no
@@ -599,6 +603,7 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
       return;
     }
 
+    if (stopped) return; // as above: no write after stop()
     const { text: transcript, durationMs } = scribeResult;
 
     // Auto-origin success: materialize the transcript note (vault#353). The
@@ -718,6 +723,7 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
   async function tick(): Promise<number> {
     let processed = 0;
     for (const vault of opts.vaultList()) {
+      if (stopped) return processed; // no vault opened after stop()
       const store = opts.getStore(vault);
       let pending: Attachment[];
       try {
@@ -772,6 +778,8 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
     async stop() {
       stopped = true;
       if (timer) { clearTimeout(timer); timer = null; }
+      // A local provider's subprocess would otherwise run on until its timeout (600 s).
+      killTranscriptionSubprocesses();
       await inflight;
     },
     tick,
