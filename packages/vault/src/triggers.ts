@@ -36,7 +36,7 @@ import type { StoredTrigger } from "../core/src/triggers-store.ts";
 import { getVaultNameForStore } from "./vault-store.ts";
 import { assetsDir } from "./routes.ts";
 import { appendContextPart, fetchContextEntries, type ContextPayload } from "./context.ts";
-import { outboundAllowed } from "./offline.ts";
+import { offlineFetchInit, outboundAllowed } from "./offline.ts";
 
 const DEFAULT_TIMEOUT = 60_000;
 
@@ -198,6 +198,7 @@ async function dispatchJson(
   signal: AbortSignal,
 ): Promise<DispatchResult> {
   const resp = await fetch(url, {
+    ...offlineFetchInit(),
     method: "POST",
     headers: { "Content-Type": "application/json", ...authHeaders },
     body: JSON.stringify({
@@ -258,7 +259,7 @@ async function dispatchAttachment(
 
   // multipart boundary is set by fetch from the FormData body; only the auth
   // header is added here (no Content-Type — that would clobber the boundary).
-  const resp = await fetch(url, { method: "POST", body: form, headers: authHeaders, signal });
+  const resp = await fetch(url, { method: "POST", body: form, headers: authHeaders, signal, ...offlineFetchInit() });
   if (!resp.ok) {
     throw new Error(`webhook returned ${resp.status}: ${await resp.text().catch(() => "")}`);
   }
@@ -287,6 +288,7 @@ async function dispatchContent(
   }
 
   const resp = await fetch(url, {
+    ...offlineFetchInit(),
     method: "POST",
     headers: { "Content-Type": "application/json", ...authHeaders },
     body: JSON.stringify({ input: note.content }),

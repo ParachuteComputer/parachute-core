@@ -11,7 +11,7 @@
 import { Database, constants } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { randomBytes } from "node:crypto";
-import { statSync } from "node:fs";
+import { mkdirSync, renameSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { cli, freePort, newHome, start } from "../candidate-lib.ts";
 import { diff, exitWithin, must, ports, snapshot, tail } from "./_lib.ts";
@@ -148,4 +148,22 @@ describe("embedded/newer-data", () => {
     raiseSchemaInWal(join(home, "hub.db"));
     await refuses(home, "parachute serve", ["serve"], { env: { PORT: String(await freePort()), PARACHUTE_BIND_HOST: "127.0.0.1" } });
   });
+
+  test("box: parachute-vault create help (a vault named help) on a home with a newer vault.db exits 6 and leaves the home byte-identical", async () => {
+    // Only help itself skips the check; an argument that happens to say "help" doesn't.
+    const home = await makeHome(true);
+    raiseSchema(vaultDb(home));
+    await refuses(home, "parachute-vault create help", ["create", "help", "--no-mirror", "--json"], { vault: true, env: { EMBEDDINGS_ENABLED: "false" } });
+  });
+
+  for (const legacy of ["vaults", "vault/vaults"]) {
+    test(`box: parachute-vault serve on a newer vault.db in the older ${legacy}/ layout exits 6 and leaves the home byte-identical`, async () => {
+      // The vault moves an older layout into vault/data/ when it opens; a newer database there must be refused first.
+      const home = await makeHome(true);
+      raiseSchema(vaultDb(home));
+      mkdirSync(join(home, legacy), { recursive: true });
+      renameSync(join(home, "vault", "data", VAULT), join(home, legacy, VAULT));
+      await refuses(home, "parachute-vault serve", ["serve"], { vault: true, env: { PORT: String(await freePort()), EMBEDDINGS_ENABLED: "false" } });
+    });
+  }
 });

@@ -29,15 +29,23 @@ export function homeDir(env: NodeJS.ProcessEnv = process.env): string {
   return env.PARACHUTE_HOME || join(homedir(), ".parachute");
 }
 
+/**
+ * Where vaults live: today's `vault/data/<name>/`, and the two older layouts the vault moves on open
+ * (vault src/config.ts migrateFromLegacyLayout: `vaults/<name>/`; migrateVaultInternalLayout: `vault/vaults/<name>/`).
+ * A newer database in an old layout must be refused before that move.
+ */
+const VAULT_FOLDERS = [join("vault", "data"), "vaults", join("vault", "vaults")];
+
 /** The databases under a home, with the newest schema this program knows for each. */
 export function databases(home: string, known: { hub: number; vault: number }): { rel: string; known: number }[] {
   const out = [{ rel: "hub.db", known: known.hub }];
-  const data = join(home, "vault", "data");
-  let names: string[] = [];
-  try {
-    names = readdirSync(data).sort();
-  } catch {}
-  for (const name of names) out.push({ rel: join("vault", "data", name, "vault.db"), known: known.vault });
+  for (const folder of VAULT_FOLDERS) {
+    let names: string[] = [];
+    try {
+      names = readdirSync(join(home, folder)).sort();
+    } catch {}
+    for (const name of names) out.push({ rel: join(folder, name, "vault.db"), known: known.vault });
+  }
   return out.filter((d) => existsSync(join(home, d.rel)));
 }
 
@@ -58,8 +66,11 @@ function topVersion(db: Database): number | undefined {
   }
 }
 
-/** Above this, a database on another filesystem from every scratch folder is read in place rather than copied. */
+/** Above this, a database on another filesystem from every scratch folder is not copied (and not checked). */
 const COPY_LIMIT = 256 * 1024 * 1024;
+
+/** A database with a WAL that can't be read without changing the home: no scratch folder would take it. */
+export class UncheckedError extends Error {}
 
 /**
  * The highest `schema_version` a database records, or undefined when it has no such table (not ours, or empty).
@@ -69,7 +80,8 @@ const COPY_LIMIT = 256 * 1024 * 1024;
  *     doesn't, and SQLite reading a WAL rewrites its -shm index, creating it if need be. So the database is read in
  *     a scratch folder outside the home, by hard link (or a copy, up to COPY_LIMIT) with a copy of the WAL.
  *     `outside` is tried first (the home's parent, usually the same filesystem), then the system's temp folder.
- *     Only a database too big to copy, on a filesystem shared with neither, is read in place, read-only.
+ *     If none works (no writable place, or too big to copy across filesystems), it throws UncheckedError: it never
+ *     reads a WAL in place.
  */
 export function schemaOf(path: string, outside: string = tmpdir()): number | undefined {
   const wal = `${path}-wal`;
@@ -93,22 +105,27 @@ export function schemaOf(path: string, outside: string = tmpdir()): number | und
       }
     }
   }
-  return topVersion(new Database(path, { readonly: true }));
+  throw new UncheckedError(`${path} has a WAL and no scratch folder could take a copy of it`);
 }
 
-/** Every database under the home stamped with a schema newer than this program knows, as plain lines. */
-export function newerData(home: string, known: { hub: number; vault: number }): string[] {
-  const out: string[] = [];
+/**
+ * Every database under the home stamped with a schema newer than this program knows (`newer`), and every one that
+ * can't be read without changing the home (`unchecked`), as plain lines.
+ */
+export function newerData(home: string, known: { hub: number; vault: number }): { newer: string[]; unchecked: string[] } {
+  const newer: string[] = [];
+  const unchecked: string[] = [];
   for (const d of databases(home, known)) {
     let v: number | undefined;
     try {
       v = schemaOf(join(home, d.rel), dirname(home));
-    } catch {
-      continue; // not a database we can read: the command that opens it reports that
+    } catch (e) {
+      if (e instanceof UncheckedError) unchecked.push(`${d.rel} has a WAL that no scratch folder outside the home could take`);
+      continue; // otherwise not a database we can read: the command that opens it reports that
     }
-    if (v !== undefined && v > d.known) out.push(`${d.rel} is at schema ${v}; this program knows up to ${d.known}`);
+    if (v !== undefined && v > d.known) newer.push(`${d.rel} is at schema ${v}; this program knows up to ${d.known}`);
   }
-  return out;
+  return { newer, unchecked };
 }
 
 /**

@@ -19,6 +19,14 @@ export function isLoopbackUrl(url: string): boolean {
   return host === "localhost" || host.endsWith(".localhost") || host === "[::1]" || /^127(\.\d{1,3}){3}$/.test(host);
 }
 
+/**
+ * What a fetch the vault makes on its own adds to its options: offline, no redirect is followed, so a loopback URL
+ * can't hand the call to an address off the machine (a 3xx comes back as the answer, and counts as a failure).
+ */
+export function offlineFetchInit(env: NodeJS.ProcessEnv = process.env): { redirect?: "manual" } {
+  return isOffline(env) ? { redirect: "manual" } : {};
+}
+
 /** Whether the vault may call `url` now: always online, and offline only on loopback. */
 export function outboundAllowed(url: string, env: NodeJS.ProcessEnv = process.env): boolean {
   return !isOffline(env) || isLoopbackUrl(url);

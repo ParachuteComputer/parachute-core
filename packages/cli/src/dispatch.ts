@@ -61,10 +61,18 @@ export function route(role: Role, argv: string[]): { print: string } | { cli: "h
   return { cli, argv: args };
 }
 
-/** Exit code for a home with data newer than this program (PLAN §3: 6, data newer than this binary). */
+/** Exit codes (PLAN §3): 6, data newer than this binary; 5, a home that can't be used (here: can't be checked). */
 export const EXIT_NEWER_DATA = 6;
+export const EXIT_HOME_UNUSABLE = 5;
 
-const isHelp = (argv: string[]) => argv.length === 0 || argv.some((a) => a === "help" || a === "--help" || a === "-h");
+const HELP = ["help", "--help", "-h"];
+/**
+ * A request for help, which reads no home: no arguments, `help`, `--help`, or `<command> --help`. Only those exact
+ * shapes, so a vault named `help` (`create help --json`) is still a command that runs behind the checks.
+ */
+export function isHelp(argv: string[]): boolean {
+  return argv.length === 0 || HELP.includes(argv[0]!) || (argv.length === 2 && (argv[1] === "--help" || argv[1] === "-h"));
+}
 
 /** Run as `role` with this process's arguments. The moved CLIs run in this process, as if started directly. */
 export async function dispatch(role: Role): Promise<void> {
@@ -78,13 +86,19 @@ export async function dispatch(role: Role): Promise<void> {
   const home = homeDir();
   if (!isHelp(r.argv)) {
     const { HUB_SCHEMA_VERSION } = await import("@openparachute/hub/src/hub-db.ts");
-    const newer = newerData(home, { hub: HUB_SCHEMA_VERSION, vault: SCHEMA_VERSION });
+    const { newer, unchecked } = newerData(home, { hub: HUB_SCHEMA_VERSION, vault: SCHEMA_VERSION });
+    const name = role === "core" ? "parachute-core" : role === "hub" ? "parachute" : "parachute-vault";
     if (newer.length > 0) {
-      const name = role === "core" ? "parachute-core" : role === "hub" ? "parachute" : "parachute-vault";
       console.error(`${name}: this home was written by a newer Parachute (${core.name} ${core.version} here):`);
       for (const line of newer) console.error(`  ${line}`);
       console.error("Nothing was opened or changed. Run the newer version, or restore a backup made for this one.");
       process.exit(EXIT_NEWER_DATA);
+    }
+    if (unchecked.length > 0) {
+      console.error(`${name}: can't check this home's data without changing it:`);
+      for (const line of unchecked) console.error(`  ${line}`);
+      console.error("Nothing was opened or changed. Stop what holds it open, or make room in the temp folder, and retry.");
+      process.exit(EXIT_HOME_UNUSABLE);
     }
   }
   if (r.cli === "hub" && r.argv[0] === "serve") {

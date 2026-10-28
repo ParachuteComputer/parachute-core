@@ -23,8 +23,9 @@ await report(
       for (let i = 0; i < 5; i++) await (await safeFetch(`http://127.0.0.1:${s.port}/`)).text();
       s.stop(true);
     } else if (input.mode === "box") {
-      // A box whose vault has a webhook trigger off the machine, with or without `serve --offline`. A write that
-      // matches the trigger calls the webhook online (the trap counts it) and doesn't offline.
+      // A box whose vault has webhook triggers off the machine (one direct, one through a loopback redirect) and a
+      // vault .env that says PARACHUTE_OFFLINE=0, with or without `serve --offline`. A write that matches the
+      // triggers calls out online (the trap counts it) and doesn't offline.
       const info = await binaries();
       const home = newHome("offline");
       const port = await freePort();
@@ -33,10 +34,16 @@ await report(
       const env = { PORT: String(port), PARACHUTE_HUB_ORIGIN: origin, PARACHUTE_HUB_JWKS_ORIGIN: origin, EMBEDDINGS_ENABLED: "false" };
       const made = await run(info, home, ["create", "boxo", "--no-mirror", "--json"], env, true);
       must(made.code === 0, `setup: parachute-vault create exited ${made.code}: ${tail(made.stderr)}`);
+      // Two triggers: one straight off the machine, one to a loopback server that redirects off the machine.
+      const redirector = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => Response.redirect(`${OFF_MACHINE}/hook`, 307) });
+      const trigger = (name: string, url: string) =>
+        `  - name: ${name}\n    when:\n      tags: [probe]\n    action:\n      webhook: ${url}\n      timeout: 1500\n`;
       appendFileSync(
         join(home, "vault", "config.yaml"),
-        `triggers:\n  - name: offline-probe\n    when:\n      tags: [probe]\n    action:\n      webhook: ${OFF_MACHINE}/hook\n      timeout: 1500\n`,
+        `triggers:\n${trigger("offline-probe", `${OFF_MACHINE}/hook`)}${trigger("redirect-probe", `http://127.0.0.1:${redirector.port}/hook`)}`,
       );
+      // The vault's own .env says online; offline is the hub's to say, so it must not win.
+      appendFileSync(join(home, "vault", ".env"), "PARACHUTE_OFFLINE=0\n");
       // Counted from before serve starts to after it stops, so a call at start or at stop counts too.
       const box = await serveBox(info, home, "boxo", env, input.offline ? ["--offline"] : []);
       let offlineLogged = false;
@@ -56,6 +63,7 @@ await report(
         offlineLogged = /offline: not calling/.test(box.log());
       } finally {
         await box.stop();
+        redirector.stop(true);
       }
       return { before, after: outboundPackets(), offlineLogged };
     } else {

@@ -45,6 +45,7 @@ import {
 import { defaultPidOnPort } from "./hub-control.ts";
 import { orphanAttributable } from "./orphan-attribution.ts";
 import { type PortListeningFn, defaultPortListening } from "./port-probe.ts";
+import { isOffline } from "./offline.ts";
 
 /**
  * Which pid (if any) holds a TCP LISTEN on `port`. Production wires
@@ -1247,6 +1248,8 @@ const defaultSpawnFn: SpawnFn = (req) => {
   };
   if (req.cwd) spawnOpts.cwd = req.cwd;
   if (req.env) spawnOpts.env = { ...process.env, ...req.env };
+  // Offline is the hub's to say: a module's own .env can't turn it back on (PLAN §3).
+  if (isOffline()) spawnOpts.env = { ...(spawnOpts.env as Record<string, string>), PARACHUTE_OFFLINE: "1" };
   const proc = Bun.spawn([...req.cmd], spawnOpts);
   return proc as unknown as SupervisedProc;
 };

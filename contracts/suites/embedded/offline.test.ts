@@ -29,7 +29,7 @@ describe("embedded/offline", () => {
     expect(r.after).toBeGreaterThan(r.before);
   });
 
-  test("box: serve --offline doesn't call a webhook trigger off the machine, and says so in its log", async () => {
+  test("box: serve --offline doesn't call a webhook trigger off the machine, directly or by a redirect, whatever the vault's .env says, and says so in its log", async () => {
     const r = await inOwnNetwork("offline.run.ts", { mode: "box", offline: true });
     must(r.after === r.before, `${r.after - r.before} packet(s) tried to leave by a non-loopback interface`);
     must(r.offlineLogged, "the vault's log doesn't say it skipped the webhook for being offline");
