@@ -107,6 +107,10 @@ describe("embedded/serve", () => {
     try {
       await listensOn(s, `127.0.0.1:${flag}`);
       must(!listeners().includes(`127.0.0.1:${conf}`), `config.yaml port ${conf} was bound although --vault-listen said ${flag}`);
+      // serve writes ready.json once the vault answers /health, a moment after its port opens (it failed once in CI
+      // when read at once: run 40713448985), so wait for the file, then check what it says.
+      await until(() => exited(s) || readyJson(home) !== undefined, 30_000);
+      must(readyJson(home) !== undefined, `no ready.json: ${tail(s.log())}`);
       must(readyJson(home)?.vault_listen === `127.0.0.1:${flag}`, `ready.json vault_listen is ${readyJson(home)?.vault_listen}`);
     } finally {
       await s.stop();

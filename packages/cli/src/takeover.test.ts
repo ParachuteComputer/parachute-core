@@ -2,10 +2,10 @@
 // over, so reading another home's unit as this one's stops the wrong Parachute. The rule is to read only what is
 // unambiguous and call the rest "unknown" (never paused; serve refuses).
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { systemdWords, unitHome as readHome } from "./takeover.ts";
+import { backup, entries, restore, systemdWords, unitHome as readHome } from "./takeover.ts";
 
 // The user manager's environment sets no PARACHUTE_HOME here, unless a test says so.
 const unitHome = (text: string, manager: () => string | undefined | null = () => undefined) => readHome(text, manager);
@@ -82,5 +82,49 @@ describe("unitHome", () => {
   test("a missing optional file is skipped; a missing required one is unknown", () => {
     expect(unitHome(svc(`Environment=PARACHUTE_HOME=/env\nEnvironmentFile=-${join(dir, "none.env")}\n`))).toBe("/env");
     expect(unitHome(svc(`EnvironmentFile=${join(dir, "none.env")}\n`))).toBe("unknown");
+  });
+});
+
+// The backup and its restore (rehearsal/uni, lane H): uni's home has a library's version links in transcription/bin
+// (`libggml.so -> libggml.so.0 -> libggml.so.0.15.1`). They stay inside the home, so they are copied as links and put
+// back as links; only a link that leads out of the home (or a socket) can't be copied as it is.
+describe("backup and restore", () => {
+  const made = () => {
+    const root = mkdtempSync(join(tmpdir(), "takeover-backup-"));
+    const home = join(root, "home");
+    mkdirSync(join(home, "transcription", "bin"), { recursive: true });
+    mkdirSync(join(home, "vault", "data", "v"), { recursive: true });
+    writeFileSync(join(home, "transcription", "bin", "libx.so.0.15.1"), "made-up library bytes");
+    symlinkSync("libx.so.0.15.1", join(home, "transcription", "bin", "libx.so.0"));
+    symlinkSync("libx.so.0", join(home, "transcription", "bin", "libx.so"));
+    symlinkSync("../transcription/bin/libx.so", join(home, "vault", "lib"));
+    writeFileSync(join(home, "vault", "data", "v", "vault.db"), "made-up database bytes");
+    return { root, home };
+  };
+  const linkAt = (p: string) => (lstatSync(p).isSymbolicLink() ? readlinkSync(p) : "not a link");
+
+  test("links that stay inside the home are copied as links, with their targets as written, and restored as links", () => {
+    const { root, home } = made();
+    expect(entries(home).other).toEqual([]);
+    const dest = join(root, "backup");
+    expect(backup(home, dest).files).toBe(2);
+    expect(linkAt(join(dest, "home", "transcription", "bin", "libx.so"))).toBe("libx.so.0");
+    expect(linkAt(join(dest, "home", "vault", "lib"))).toBe("../transcription/bin/libx.so");
+    writeFileSync(join(home, "vault", "data", "v", "vault.db"), "changed after the backup");
+    const aside = restore(home, dest);
+    expect(linkAt(join(home, "transcription", "bin", "libx.so"))).toBe("libx.so.0");
+    expect(linkAt(join(home, "transcription", "bin", "libx.so.0"))).toBe("libx.so.0.15.1");
+    expect(linkAt(join(home, "vault", "lib"))).toBe("../transcription/bin/libx.so");
+    expect(readFileSync(join(home, "vault", "lib"), "utf8")).toBe("made-up library bytes");
+    expect(readFileSync(join(home, "vault", "data", "v", "vault.db"), "utf8")).toBe("made-up database bytes");
+    expect(readFileSync(join(aside, "vault", "data", "v", "vault.db"), "utf8")).toBe("changed after the backup");
+  });
+
+  test("a link that leads out of the home, by an absolute path or by .., can't be copied as it is", () => {
+    const { root, home } = made();
+    symlinkSync(join(root, "elsewhere"), join(home, "out-absolute"));
+    symlinkSync("../../elsewhere", join(home, "vault", "out-relative"));
+    symlinkSync("..", join(home, "transcription", "up"));
+    expect(entries(home).other.sort()).toEqual(["out-absolute", join("transcription", "up"), join("vault", "out-relative")].sort());
   });
 });

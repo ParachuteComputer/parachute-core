@@ -40,6 +40,7 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
   readlinkSync,
@@ -48,11 +49,13 @@ import {
   rmSync,
   statfsSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { dlopen, FFIType } from "bun:ffi";
 import core from "../../../package.json" with { type: "json" };
 import { databases, homeDir, readDatabase, schemaOf } from "./home.ts";
 import { bundleRoot } from "./install.ts";
@@ -126,14 +129,28 @@ export interface Detected {
   rollback: "code-only" | "restore-backup";
   issuer: string;
   size_bytes: number;
-  /** Entries the backup can't copy as they are (symlinks, sockets): the takeover refuses while there are any. */
+  /**
+   * Entries the backup can't copy as they are (links that lead out of the home, sockets): the takeover refuses while
+   * there are any. A link that stays inside the home (a library's version links) is copied as a link.
+   */
   uncopyable: string[];
   others: string[];
   record: Record_ | null;
 }
 
 interface Record_ {
-  state: "taken-over" | "rolled-back";
+  /**
+   * "taking-over" is written before anything is paused and stays until the takeover ends either way, so a run that
+   * was interrupted (an ssh drop, a reboot) is found and put back by the next takeover or --rollback.
+   */
+  state: "taking-over" | "taken-over" | "rolled-back";
+  /**
+   * How far a "taking-over" run got: "checking", v0.8 may have migrated the data; "handing-over", core's unit may also
+   * have taken writes from clients (they are exported before any restore).
+   */
+  stage?: "pausing" | "backed-up" | "checking" | "handing-over";
+  /** The process running a "taking-over" takeover: while it lives, another takeover leaves the home alone. */
+  pid?: number;
   at: string;
   rolled_back_at?: string;
   /** Set once a rollback has restored the backup, so a retried rollback doesn't restore it again. */
@@ -684,7 +701,7 @@ function treeSize(root: string): number {
 
 function readRecord(home: string): Record_ | null {
   const r = readJson(join(home, RECORD_FILE));
-  return r && (r.state === "taken-over" || r.state === "rolled-back") ? (r as Record_) : null;
+  return r && (r.state === "taking-over" || r.state === "taken-over" || r.state === "rolled-back") ? (r as Record_) : null;
 }
 
 /** Is `dir` inside this program's own install (so a services.json row pointing there is core's, not the old one's)? */
@@ -783,14 +800,19 @@ function size(n: number): string {
   return `${Math.max(1, Math.round(n / 1e3))} KB`;
 }
 
+/** The units an interrupted takeover paused (its record still says "taking-over"): they are put back first. */
+const cutOff = (d: Detected) => (d.record?.state === "taking-over" ? d.record.paused.map((u) => u.name) : []);
+
 function plan(d: Detected): string[] {
-  const pause = d.units.filter((u) => u.old).map((u) => u.name);
+  const back = cutOff(d);
+  const pause = [...new Set([...d.units.filter((u) => u.old).map((u) => u.name), ...back])];
   const steps = [
+    ...(back.length ? [`put ${back.join(" and ")} back as before, since the interrupted takeover paused ${back.length === 1 ? "it" : "them"}`] : []),
     pause.length ? `pause ${pause.join(" and ")} (stop and disable; the unit files stay)` : "nothing to pause: no old unit is on",
     `back up the home to ${tilde(join(dirname(d.home), "parachute-takeover"))}/<time>/, with a sha256 for every file`,
     `start v0.8 (${core.name} ${core.version}) on the same home and check every vault answers with the same notes`,
   ];
-  if (d.units.some((u) => u.old && u.manager === "systemd")) steps.push(`run it from now on as ${CORE_UNIT}`);
+  if (d.units.some((u) => u.old && u.manager === "systemd") || back.length) steps.push(`run it from now on as ${CORE_UNIT}`);
   steps.push("leave the old programs installed, as they are, and off");
   return steps;
 }
@@ -805,7 +827,9 @@ export function describe(d: Detected): string {
     const state = `${u.active ? "running" : "not running"}, ${u.enabled ? "starts at login" : "off at login"}`;
     const why = u.old
       ? " (has this home's data open: it will be paused)"
-      : u.unseen
+      : cutOff(d).includes(u.name)
+        ? " (paused by the interrupted takeover: put back first, then paused again)"
+        : u.unseen
         ? " (enabled but not running, so which home it serves can't be seen: start it, or disable it, before taking over)"
         : " (doesn't have this home's data open: left alone)";
     lines.push(`  ${u.manager} unit ${u.name}: ${state}${why}`);
@@ -816,7 +840,9 @@ export function describe(d: Detected): string {
   for (const v of d.vaults) lines.push(`  ${v.name}: ${v.notes} notes, schema ${v.schema}`);
   if (d.vaults.length > 1) lines.push(`  ${notes} notes in all`);
   if (d.hub_schema !== null) lines.push(`  hub.db: schema ${d.hub_schema}`);
-  if (d.others.length) lines.push(`Also registered: ${d.others.join(", ")}. v0.8 doesn't run ${d.others.length === 1 ? "it" : "them"}; left as ${d.others.length === 1 ? "it is" : "they are"}.`);
+  // Seen in rehearsal/uni and rehearsal/adam: core's supervisor boots these rows as the old hub did (the app on uni,
+  // scribe on Adam's box), with the program installed beside the old hub.
+  if (d.others.length) lines.push(`Also registered: ${d.others.join(", ")}. v0.8 starts ${d.others.length === 1 ? "it" : "them"} from services.json as the old hub did, with the installed program, which stays as it is.`);
   if (d.migrations.length === 0) {
     lines.push("v0.8 will use this data as it is: nothing is converted. Going back is starting the old programs again (`parachute-core takeover --rollback`).");
   } else {
@@ -824,8 +850,13 @@ export function describe(d: Detected): string {
     for (const m of d.migrations) lines.push(`  ${m}`);
     lines.push("Going back means restoring the backup: `parachute-core takeover --rollback` exports every note changed since, then restores it.");
   }
-  if (d.uncopyable.length) lines.push(`The home has ${d.uncopyable.length} entr${d.uncopyable.length === 1 ? "y" : "ies"} the backup can't copy as ${d.uncopyable.length === 1 ? "it is" : "they are"} (links): ${d.uncopyable.slice(0, 5).join(", ")}. Takeover won't go ahead until ${d.uncopyable.length === 1 ? "it is" : "they are"} replaced by the real files.`);
+  if (d.uncopyable.length) lines.push(`The home has ${d.uncopyable.length} entr${d.uncopyable.length === 1 ? "y" : "ies"} the backup can't copy as ${d.uncopyable.length === 1 ? "it is" : "they are"} (links out of it, or sockets): ${d.uncopyable.slice(0, 5).join(", ")}. Takeover won't go ahead until ${d.uncopyable.length === 1 ? "it is" : "they are"} replaced by the real files.`);
   if (d.record?.state === "taken-over") lines.push(`This home was already taken over on ${d.record.at} (backup ${tilde(d.record.backup)}).`);
+  if (d.record?.state === "taking-over") {
+    const units = d.record.paused.map((u) => u.name).join(" and ") || "the old programs";
+    const restoring = (d.record.stage === "checking" || d.record.stage === "handing-over") && d.record.migrations.length > 0 && d.record.backup && !d.record.restored_at;
+    lines.push(`A takeover of this home started on ${d.record.at} was interrupted. Taking over (or --rollback) first puts ${units} back as ${d.record.paused.length === 1 ? "it was" : "they were"}${restoring ? `, restoring the backup ${tilde(d.record.backup)} since v0.8 may have started migrating the data` : ""}.`);
+  }
   lines.push("With your yes, it will:");
   for (const s of plan(d)) lines.push(`  - ${s}`);
   return lines.join("\n");
@@ -898,9 +929,14 @@ function sha256(path: string): string {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
-/** Every regular file and folder under `root`, relative to it, and anything else (links, sockets) it can't copy. */
-function entries(root: string): { files: string[]; dirs: string[]; other: string[] } {
-  const out = { files: [] as string[], dirs: [] as string[], other: [] as string[] };
+/**
+ * Every regular file and folder under `root`, relative to it; every link whose target stays inside `root` (read as
+ * written, relative to the link's folder: `libggml.so -> libggml.so.0`), with that target; and anything else it
+ * can't copy as it is (a link leading out, a socket).
+ */
+export function entries(root: string): { files: string[]; dirs: string[]; links: [string, string][]; other: string[] } {
+  const out = { files: [] as string[], dirs: [] as string[], links: [] as [string, string][], other: [] as string[] };
+  const top = resolve(root);
   const walk = (rel: string) => {
     for (const name of readdirSync(join(root, rel)).sort()) {
       const r = rel ? join(rel, name) : name;
@@ -909,21 +945,28 @@ function entries(root: string): { files: string[]; dirs: string[]; other: string
         out.dirs.push(r);
         walk(r);
       } else if (st.isFile()) out.files.push(r);
-      else out.other.push(r);
+      else if (st.isSymbolicLink()) {
+        const target = readlinkSync(join(root, r));
+        const to = resolve(top, dirname(r), target);
+        if (to.startsWith(`${top}/`)) out.links.push([r, target]);
+        else out.other.push(r);
+      } else out.other.push(r);
     }
   };
   walk("");
   return out;
 }
 
-/** Copy every file of the home, byte for byte, with a manifest; check each copy against its hash. */
-function backup(home: string, dest: string): { files: number; bytes: number } {
+/** Copy every file of the home, byte for byte, and its inner links as links, with a manifest; check each copy. */
+export function backup(home: string, dest: string): { files: number; bytes: number } {
   const into = join(dest, "home");
   mkdirSync(into, { recursive: true, mode: 0o700 });
   const manifest: Record<string, string> = {};
   let bytes = 0;
   const all = entries(home);
   for (const rel of all.dirs) mkdirSync(join(into, rel), { recursive: true, mode: 0o700 });
+  // The takeover's own record is its bookkeeping, not the home's data: a restore never brings an old one back.
+  all.files = all.files.filter((rel) => rel !== RECORD_FILE && !rel.startsWith(`${RECORD_FILE}.`));
   for (const rel of all.files) {
     const from = join(home, rel);
     const to = join(into, rel);
@@ -934,12 +977,22 @@ function backup(home: string, dest: string): { files: number; bytes: number } {
     manifest[rel] = h;
     bytes += statSync(from).size;
   }
-  writeFileSync(join(dest, "manifest.json"), `${JSON.stringify({ home, at: new Date().toISOString(), files: manifest, folders: all.dirs }, null, 2)}\n`, { mode: 0o600 });
+  const links: Record<string, string> = {};
+  for (const [rel, target] of all.links) {
+    symlinkSync(target, join(into, rel));
+    if (readlinkSync(join(into, rel)) !== target) throw new Error(`the backup copy of the link ${rel} doesn't match the original`);
+    links[rel] = target;
+  }
+  writeFileSync(join(dest, "manifest.json"), `${JSON.stringify({ home, at: new Date().toISOString(), files: manifest, folders: all.dirs, links }, null, 2)}\n`, { mode: 0o600 });
   return { files: Object.keys(manifest).length, bytes };
 }
 
-/** Put the backup's bytes back as the home; what was there moves aside (`<home>.after-takeover-<time>`). */
-function restore(home: string, dest: string): string {
+/**
+ * Put the backup's bytes (and links) back as the home; what was there moves aside (`<home>.after-takeover-<time>`).
+ * `keep`, given where the old home goes, is the record to put in the restored home before it takes the home's place,
+ * so a run cut off right after the swap still finds its record.
+ */
+export function restore(home: string, dest: string, keep?: (aside: string) => Record_): string {
   const read = readJson(join(dest, "manifest.json"));
   const manifest = read?.files as Record<string, string> | undefined;
   if (!manifest) throw new Error(`no manifest in ${dest}`);
@@ -952,7 +1005,12 @@ function restore(home: string, dest: string): string {
     copyFileSync(join(dest, "home", rel), to);
     if (sha256(to) !== h) throw new Error(`the backup's ${rel} doesn't match its manifest`);
   }
+  for (const [rel, target] of Object.entries((read.links ?? {}) as Record<string, string>)) {
+    mkdirSync(dirname(join(staged, rel)), { recursive: true, mode: 0o700 });
+    symlinkSync(target, join(staged, rel));
+  }
   const aside = `${home}.after-takeover-${stamp()}`;
+  if (keep) writeFileSync(join(staged, RECORD_FILE), `${JSON.stringify(keep(aside), null, 2)}\n`, { mode: 0o600 });
   renameSync(home, aside);
   renameSync(staged, home);
   return aside;
@@ -989,10 +1047,53 @@ function liveKids(home: string): string[] {
 }
 
 /**
+ * Processes left from a check run on `home`: the check run marks its environment (PARACHUTE_TAKEOVER_CHECK=1 with this
+ * home), and its modules (scribe, the app) inherit it. The supervisor starts each module in its own process group, so
+ * when the check run dies without stopping them (killed, or its session dropped) they live on, holding the modules'
+ * ports, and the next v0.8 can't start them (rehearsal/adam: an orphaned scribe on :1943). Linux only.
+ */
+function checkLeftovers(home: string): number[] {
+  if (process.platform !== "linux") return [];
+  const out: number[] = [];
+  for (const name of readdirSync("/proc")) {
+    if (!/^\d+$/.test(name) || Number(name) === process.pid) continue;
+    try {
+      const vars = readFileSync(`/proc/${name}/environ`, "utf8").split("\0");
+      const theirs = vars.find((v) => v.startsWith("PARACHUTE_HOME="))?.slice("PARACHUTE_HOME=".length);
+      if (vars.includes("PARACHUTE_TAKEOVER_CHECK=1") && theirs && sameHome(theirs, home)) out.push(Number(name));
+    } catch {}
+  }
+  return out;
+}
+
+/** Stop what a check run left (SIGTERM, then SIGKILL after 10 s); the pids it stopped. */
+async function stopCheckLeftovers(home: string): Promise<number[]> {
+  const pids = checkLeftovers(home);
+  for (const pid of pids) {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {}
+  }
+  if (pids.length && !(await waitUntil(() => checkLeftovers(home).length === 0, 10_000, 200))) {
+    for (const pid of checkLeftovers(home)) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {}
+    }
+    await waitUntil(() => checkLeftovers(home).length === 0, 5_000, 100);
+  }
+  return pids;
+}
+
+/**
  * Start v0.8 on the home (a check run: this program's own `serve` on a free loopback port, with the old issuer)
  * and check every answer. Returns the problems found (empty when all is well); it always stops the check run.
  */
 async function checkRun(d: Detected, kids: string[], log: (s: string) => void): Promise<string[]> {
+  // Anything marked as this home's check run now is an earlier run's (this one hasn't started): it would hold the
+  // modules' ports this check run needs.
+  const stale = await stopCheckLeftovers(d.home);
+  if (stale.length) log(`  stopped ${stale.length} process${stale.length === 1 ? "" : "es"} an earlier check run left (pid ${stale.join(", ")})`);
   const port = freePort();
   const hub = `http://127.0.0.1:${port}`;
   const env: Record<string, string> = {};
@@ -1027,7 +1128,7 @@ async function checkRun(d: Detected, kids: string[], log: (s: string) => void): 
     const missing = kids.filter((k) => !served.has(k));
     if (missing.length || jwks.status !== 200) problems.push(`the hub's keys (JWKS HTTP ${jwks.status}) lack ${missing.length} of the ${kids.length} live signing keys`);
     else log(`  the issuer and ${kids.length === 1 ? "the live signing key are" : `all ${kids.length} live signing keys are`} the same: every token issued before still verifies`);
-    problems.push(...(await checkVaults(hub, d, env, log, true)));
+    problems.push(...(await checkVaults(hub, d, log, true)));
     return problems;
   } finally {
     if (proc.exitCode === null) {
@@ -1039,6 +1140,8 @@ async function checkRun(d: Detected, kids: string[], log: (s: string) => void): 
       } else if (proc.exitCode !== 0) problems.push(`the check run stopped with exit ${proc.exitCode}`);
       await proc.exited;
     }
+    const left = await stopCheckLeftovers(d.home);
+    if (left.length) log(`  stopped ${left.length} process${left.length === 1 ? "" : "es"} the check run left (pid ${left.join(", ")})`);
     rmSync(logPath, { force: true });
   }
 }
@@ -1049,13 +1152,26 @@ async function isReady(hub: string): Promise<boolean> {
   return r.status === 200 && r.body?.ready === true;
 }
 
-/** The environment a check's CLI calls (mint-token) run with: this home, the old issuer. */
-function checkEnv(d: Detected): Record<string, string> {
-  const env: Record<string, string> = {};
-  for (const [k, v] of Object.entries(process.env)) if (v !== undefined) env[k] = v;
-  Object.assign(env, { PARACHUTE_HOME: d.home, PARACHUTE_HUB_ORIGIN: d.issuer, PARACHUTE_TAKEOVER_CHECK: "1" });
-  for (const k of ["PORT", "PARACHUTE_BIND_HOST", "PARACHUTE_HUB_ORIGINS", "VAULT_BIND"]) delete env[k];
-  return env;
+/**
+ * A 5-minute read pass for one vault, signed with the home's own signing key and recorded in hub.db like any mint
+ * (subject takeover-check). Not through `auth mint-token`: that needs a usable operator token, and an old home's may
+ * not be one (uni's was issued under the tailnet's old name, which only the hub's server accepts; rehearsal/uni), and
+ * it would rotate one near expiry, writing operator.token in the home mid-takeover.
+ */
+async function mintCheckPass(d: Detected, vault: string): Promise<string> {
+  const { openHubDb } = await import("@openparachute/hub/src/hub-db.ts");
+  const { signAccessToken, recordTokenMint } = await import("@openparachute/hub/src/jwt-sign.ts");
+  const { inferAudience } = await import("@openparachute/hub/src/jwt-audience.ts");
+  const { OPERATOR_TOKEN_CLIENT_ID } = await import("@openparachute/hub/src/operator-token.ts");
+  const scopes = [`vault:${vault}:read`];
+  const db = openHubDb(join(d.home, "hub.db"));
+  try {
+    const minted = await signAccessToken(db, { sub: "takeover-check", scopes, audience: inferAudience(scopes), clientId: OPERATOR_TOKEN_CLIENT_ID, issuer: d.issuer, ttlSeconds: 300, vaultScope: [] });
+    recordTokenMint(db, { jti: minted.jti, createdVia: "cli_mint", subject: "takeover-check", clientId: OPERATOR_TOKEN_CLIENT_ID, scopes, expiresAt: minted.expiresAt });
+    return minted.token;
+  } finally {
+    db.close();
+  }
 }
 
 /**
@@ -1063,21 +1179,14 @@ function checkEnv(d: Detected): Record<string, string> {
  * `exact`: the note count must equal the count found on disk (the check run, which nothing else can reach); the
  * unit's v0.8 is reachable by every client, which may write as soon as it answers, so there it must only answer.
  */
-async function checkVaults(hub: string, d: Detected, env: Record<string, string>, log: (s: string) => void, exact: boolean): Promise<string[]> {
+async function checkVaults(hub: string, d: Detected, log: (s: string) => void, exact: boolean): Promise<string[]> {
   const problems: string[] = [];
   for (const v of d.vaults) {
-    const m = Bun.spawnSync([process.execPath, CORE_ENTRY, "auth", "mint-token", "--scope", `vault:${v.name}:read`, "--expires-in", "300", "--label", "takeover-check", "--json"], {
-      env,
-      stdin: "ignore",
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    let token: string | undefined;
+    let token: string;
     try {
-      token = JSON.parse(m.stdout.toString().trim().split("\n").pop() ?? "").token;
-    } catch {}
-    if (!token) {
-      problems.push(`vault ${v.name}: couldn't mint a read pass for the check (${m.stderr.toString().trim().slice(-200)})`);
+      token = await mintCheckPass(d, v.name);
+    } catch (err) {
+      problems.push(`vault ${v.name}: couldn't mint a read pass for the check (${String((err as Error).message).slice(-200)})`);
       continue;
     }
     const info = await getJson(`${hub}/vault/${encodeURIComponent(v.name)}/api/vault?include_stats=true`, token);
@@ -1225,7 +1334,7 @@ async function coreUnitUp(port: number, d: Detected, log: (s: string) => void): 
   }, 60_000, 500);
   if (!ok || !active() || !hub) return `${CORE_UNIT} (pid ${pid}) is not ready (tried port ${port} and the ports it listens on)`;
   if (!heldBy(d.home, [CORE_UNIT]).some((h) => h.unit === CORE_UNIT)) return `${CORE_UNIT} (pid ${pid}) answers, but none of its processes has this home's data open`;
-  const problems = await checkVaults(hub, d, checkEnv(d), log, false);
+  const problems = await checkVaults(hub, d, log, false);
   if (problems.length) return `${CORE_UNIT} answers, but ${problems.join("; ")}`;
   await Bun.sleep(3000);
   if (!active() || mainPid(CORE_UNIT) !== pid) return `${CORE_UNIT} stopped or restarted within 3 s of answering`;
@@ -1278,6 +1387,127 @@ function resumeUnits(paused: Record_["paused"]): string[] {
   return errors;
 }
 
+/**
+ * A restore cut off between its two renames leaves no home, and the restored copy (with its record) beside it as
+ * `<home>.restoring-<id>`: put that copy in place. Returns the folder it used, or null when there was nothing to finish.
+ */
+function staleRestore(home: string): string | null {
+  if (existsSync(home)) return null;
+  let found: { path: string; at: number } | null = null;
+  try {
+    for (const name of readdirSync(dirname(home))) {
+      if (!name.startsWith(`${basename(home)}.restoring-`)) continue;
+      const path = join(dirname(home), name);
+      const rec = readJson(join(path, RECORD_FILE));
+      if (!rec?.restored_at) continue; // a restore that failed before its swap, not one cut off mid-swap
+      const at = Date.parse(rec.restored_at);
+      if (!found || at > found.at) found = { path, at };
+    }
+  } catch {}
+  return found?.path ?? null;
+}
+
+function finishRestore(home: string, say: (s: string) => void): void {
+  const staged = staleRestore(home);
+  if (!staged) return;
+  renameSync(staged, home);
+  say(`A restore of ${tilde(home)} was cut off before the restored copy took its place; put it in place (${tilde(staged)} → ${tilde(home)}).`);
+}
+
+/**
+ * The home's real folder, also while it is missing (a restore cut between its renames leaves a link to it
+ * dangling): a link is followed by hand, and a missing folder is named by its real parent.
+ */
+export function realHome(p: string, hops = 0): string {
+  try {
+    return realpathSync(p);
+  } catch {}
+  try {
+    if (hops < 32 && lstatSync(p).isSymbolicLink()) return realHome(resolve(dirname(p), readlinkSync(p)), hops + 1);
+  } catch {}
+  try {
+    return join(realpathSync(dirname(p)), basename(p));
+  } catch {
+    return p;
+  }
+}
+
+/**
+ * One takeover or rollback of a home at a time: an exclusive flock(2) on `<home>.takeover.lock`, beside the home (not
+ * in it: backups copy the home and restores swap it), held until this process exits however it exits, so it is never
+ * stale. The descriptor is close-on-exec, so a check run or module that outlives this process never holds it.
+ */
+function holdTakeoverLock(home: string): boolean {
+  const lib = dlopen(process.platform === "darwin" ? "libSystem.B.dylib" : "libc.so.6", {
+    flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+    fcntl: { args: [FFIType.i32, FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+  });
+  // Keyed on the home's real path, so two runs reaching it by different paths (a link to it, or to a folder above it)
+  // take the same lock.
+  let real = home;
+  try {
+    real = realpathSync(home);
+  } catch {}
+  const fd = openSync(`${real}.takeover.lock`, "a", 0o600); // kept open: closing it would drop the lock
+  const F_SETFD = 2;
+  const FD_CLOEXEC = 1;
+  lib.symbols.fcntl(fd, F_SETFD, FD_CLOEXEC);
+  const LOCK_EX = 2;
+  const LOCK_NB = 4;
+  return lib.symbols.flock(fd, LOCK_EX | LOCK_NB) === 0;
+}
+
+/**
+ * Put back a takeover that was cut off (its record still says "taking-over"): stop core's unit if that run had
+ * started it, restore the backup if v0.8 may have migrated the data, then enable and start the old units it paused
+ * and wait until they have the home's data open again, so the next detection sees them. Removes the record.
+ */
+async function putBackInterrupted(home: string, rec: Record_, say: (s: string) => void): Promise<{ units: string[]; exported: number }> {
+  if (rec.pid && rec.pid !== process.pid) {
+    let cmd = "";
+    try {
+      cmd = readFileSync(`/proc/${rec.pid}/cmdline`, "utf8");
+    } catch {}
+    if (cmd.includes("takeover")) throw new Exit(EXIT.held, `a takeover of this home is running now (pid ${rec.pid}, started ${rec.at}); let it finish. Nothing was changed.`);
+  }
+  const units = rec.paused.map((u) => u.name);
+  say(`A takeover of this home started on ${rec.at} was interrupted; putting ${units.join(" and ") || "the old programs"} back first …`);
+  if (rec.core_unit && readCoreUnitMark() === home) {
+    const left = await stopCoreUnit(home);
+    if (left) throw new Exit(EXIT.failed, `${left}; stop it, then run takeover again.`);
+  }
+  const left = await stopCheckLeftovers(home);
+  if (left.length) say(`  stopped ${left.length} process${left.length === 1 ? "" : "es"} its check run left (pid ${left.join(", ")})`);
+  // Nothing of v0.8 (an orphaned check run) may hold the data; an old unit someone started again may.
+  const mine = new Set(units);
+  const inTheWay = () => heldBy(home, units).filter((h) => !(h.unit && mine.has(h.unit)));
+  if (!(await waitUntil(() => inTheWay().length === 0, 20_000, 250))) {
+    throw new Exit(EXIT.held, `still holding the data: ${inTheWay().map((h) => `pid ${h.pid} (${h.cmd.slice(0, 80)})`).join(", ")}. Stop it, then run takeover again.`);
+  }
+  let exported = 0;
+  if ((rec.stage === "checking" || rec.stage === "handing-over") && rec.migrations.length && rec.backup && !rec.restored_at) {
+    const held = heldBy(home, units);
+    if (held.length) throw new Exit(EXIT.held, `the old programs were started again on data v0.8 may have migrated (pid ${held.map((h) => h.pid).join(", ")}); stop them, then run takeover again so the backup is restored first.`);
+    // Whatever changed since the backup (core's unit may have taken writes before the cut) is exported first.
+    const dir = join(rec.backup, `changed-since-takeover-${stamp()}`);
+    exported = exportChanged(home, join(rec.backup, "home"), dir);
+    if (exported) say(`  exported ${exported} note${exported === 1 ? "" : "s"} changed since the takeover began to ${tilde(dir)}`);
+    // The record goes into the restored home with it, so a cut from here on still finds it (and won't restore again).
+    const aside = restore(home, rec.backup, (a) => ({ ...rec, restored_at: new Date().toISOString(), moved_aside: a }));
+    say(`  restored the backup ${tilde(rec.backup)}, since v0.8 may have started migrating the data (what it left is in ${tilde(aside)})`);
+  }
+  const errors = resumeUnits(rec.paused);
+  if (errors.length) throw new Exit(EXIT.failed, `putting the old units back failed: ${errors.join("; ")}. Fix that and run takeover again.`);
+  // The record goes only once the old units have the data open again: a unit systemd starts may still fail.
+  const running = rec.paused.filter((u) => u.active).map((u) => u.name);
+  if (running.length && !(await waitUntil(() => running.every((u) => heldBy(home, running).some((h) => h.unit === u)), 90_000, 500))) {
+    throw new Exit(EXIT.failed, `${running.join(" and ")} ${running.length === 1 ? "was" : "were"} started again, but without this home's data open after 90 s; the record stays, so run takeover (or --rollback) again once ${running.length === 1 ? "it serves" : "they serve"} it.`);
+  }
+  rmSync(join(home, RECORD_FILE), { force: true });
+  say(`  ${units.join(" and ") || "the old programs"} back as before`);
+  return { units, exported };
+}
+
 async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ backup: string; record: Record_; core_unit: string | null }> {
   // What was shown may have changed while the person decided: everything is found again now, and if the units to
   // pause or the processes holding the data differ, nothing is done.
@@ -1290,7 +1520,7 @@ async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ ba
     throw new Exit(EXIT.failed, "the old programs run as launchd agents; taking those over isn't built yet (macOS). Nothing was changed.");
   }
   if (d.uncopyable.length) {
-    throw new Exit(EXIT.failed, `the home has entries the backup can't copy as they are (${d.uncopyable.slice(0, 5).join(", ")}): links point outside it. Replace them with the real files, or back up yourself. Nothing was changed.`);
+    throw new Exit(EXIT.failed, `the home has entries the backup can't copy as they are (${d.uncopyable.slice(0, 5).join(", ")}): links that lead out of it, or sockets. Replace them with the real files, or back up yourself. Nothing was changed.`);
   }
   const coreUnitFile = join(systemdUnitDir(), CORE_UNIT);
   // What systemd has loaded under that name, wherever its file is: one outside the user folder is never shadowed.
@@ -1334,9 +1564,31 @@ async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ ba
   }
 
   const paused: Record_["paused"] = [];
-  const putBack = (why: string) => {
+  // Written before anything is paused: if this run is cut off (an ssh drop, a reboot), the next takeover or --rollback
+  // finds it and puts the old units back (and the backup, once v0.8 may have migrated the data).
+  const progress: Record_ = {
+    state: "taking-over",
+    stage: "pausing",
+    at: new Date().toISOString(),
+    version: core.version,
+    home: d.home,
+    backup: "",
+    rollback: d.rollback,
+    migrations: d.migrations,
+    paused: toPause.map((u) => ({ name: u.name, manager: "systemd" as const, active: true, enabled: u.enabled })),
+    core_unit: null,
+    issuer: d.issuer,
+    pid: process.pid,
+  };
+  writeRecord(d.home, progress);
+  const putBack = async (why: string): Promise<string> => {
     const errors = resumeUnits(paused);
-    return errors.length ? `${why}; putting the old units back also failed: ${errors.join("; ")}` : why;
+    if (errors.length) return `${why}; putting the old units back also failed: ${errors.join("; ")}`;
+    // The old units ran moments ago and systemd has them again (enabled, started): this run is over. Whether they
+    // then serve is up to them (another program may have taken their port meanwhile; lifecycle/takeover's
+    // "can't serve" contract). A run cut off before this point is what the record is for.
+    rmSync(join(d.home, RECORD_FILE), { force: true });
+    return why;
   };
   for (const u of toPause) {
     say(`Pausing ${u.name} …`);
@@ -1347,12 +1599,12 @@ async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ ba
       systemctl("stop", u.name);
       if (u.enabled) systemctl("disable", u.name);
     } catch (err) {
-      throw new Exit(EXIT.failed, putBack(`pausing ${u.name} failed: ${(err as Error).message}`));
+      throw new Exit(EXIT.failed, await putBack(`pausing ${u.name} failed: ${(err as Error).message}`));
     }
   }
   if (!(await waitUntil(() => holders(d.home).length === 0, 20_000, 250))) {
     const still = holders(d.home);
-    throw new Exit(EXIT.held, putBack(`after pausing the old units, still holding the data: ${still.map((h) => `pid ${h.pid} (${h.cmd.slice(0, 80)})`).join(", ")}; the old units were put back`));
+    throw new Exit(EXIT.held, await putBack(`after pausing the old units, still holding the data: ${still.map((h) => `pid ${h.pid} (${h.cmd.slice(0, 80)})`).join(", ")}; the old units were put back`));
   }
 
   const dest = join(backupRoot, stamp());
@@ -1361,14 +1613,15 @@ async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ ba
   try {
     copied = backup(d.home, dest);
   } catch (err) {
-    throw new Exit(EXIT.failed, putBack(`the backup failed: ${(err as Error).message}`));
+    throw new Exit(EXIT.failed, await putBack(`the backup failed: ${(err as Error).message}`));
   }
   say(`  ${copied.files} files, ${size(copied.bytes)}, each checked against its sha256 (manifest.json)`);
+  writeRecord(d.home, { ...progress, stage: "backed-up", backup: dest });
 
   // Any rollback from here puts the backup back first if v0.8 has migrated the data.
   // The old programs come back only once nothing of v0.8 holds the data, and (after a migration) only once the
   // backup is back; otherwise they stay paused and it says what is left to do.
-  const undo = (why: string): Exit => {
+  const undo = async (why: string): Promise<Exit> => {
     const still = holders(d.home);
     if (still.length) {
       return new Exit(EXIT.checkFailed, `${why}; v0.8 still holds the data (${still.map((h) => `pid ${h.pid}`).join(", ")}), so the old units stay paused. Stop it, then enable and start ${paused.map((u) => u.name).join(" and ") || "the old programs"} yourself; the backup is in ${dest}`);
@@ -1376,13 +1629,18 @@ async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ ba
     let msg = why;
     if (d.migrations.length) {
       try {
-        const aside = restore(d.home, dest);
+        // Core's unit may have taken writes before its check failed: whatever differs from the backup is exported.
+        const dir = join(dest, `changed-since-takeover-${stamp()}`);
+        const exported = exportChanged(d.home, join(dest, "home"), dir);
+        if (exported) msg += `; ${exported} note${exported === 1 ? "" : "s"} changed since the backup ${exported === 1 ? "is" : "are"} in ${dir}`;
+        const aside = restore(d.home, dest, (a) => ({ ...progress, stage: "checking", backup: dest, restored_at: new Date().toISOString(), moved_aside: a }));
         msg += `; the backup was restored (what v0.8 left is in ${aside})`;
       } catch (err) {
         return new Exit(EXIT.checkFailed, `${why}; restoring the backup failed: ${(err as Error).message}. The old units stay paused, because the data may be migrated. Restore ${dest}/home over ${d.home} (manifest.json has every sha256), then enable and start ${paused.map((u) => u.name).join(" and ")}.`);
       }
     }
-    return new Exit(EXIT.checkFailed, putBack(msg) + ". The old programs are back as they were.");
+    const back = await putBack(msg);
+    return new Exit(EXIT.checkFailed, back === msg ? `${msg}. The old programs are back as they were.` : back);
   };
 
   // From here every failure, expected or not, puts everything back: the unit, the record, the backup if v0.8
@@ -1397,16 +1655,19 @@ async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ ba
       // share the data. The record stays too, so `takeover --rollback` can finish the job once it is stopped.
       throw new Exit(EXIT.checkFailed, `${(err as Error).message}; then ${left}. The old units stay paused and nothing was restored; stop ${CORE_UNIT}, then run \`parachute-core takeover --rollback\`. The backup is in ${dest}`);
     }
-    rmSync(join(d.home, RECORD_FILE), { force: true });
-    if (err instanceof Exit) throw err;
-    throw undo(`${(err as Error).message}`);
+    if (err instanceof Exit) throw err; // from undo(), which has already put back what it could
+    // Not finished (a "taken-over" record may be there already) until undo() has put the old units back; it then
+    // removes the record, or leaves this one for the next run to finish.
+    writeRecord(d.home, { ...progress, stage: unitTried ? "handing-over" : "checking", backup: dest, core_unit: unitTried ? CORE_UNIT : null });
+    throw await undo(`${(err as Error).message}`);
   }
 
   async function startAndHandOver(): Promise<{ backup: string; record: Record_; core_unit: string | null }> {
     const kids = liveKids(d.home);
+    writeRecord(d.home, { ...progress, stage: "checking", backup: dest });
     say("Starting v0.8 on the same data and checking every answer …");
     const problems = await checkRun(d, kids, say);
-    if (problems.length) throw undo(`a check failed: ${problems.join("; ")}`);
+    if (problems.length) throw await undo(`a check failed: ${problems.join("; ")}`);
 
     const record: Record_ = {
       state: "taken-over",
@@ -1477,6 +1738,10 @@ function exportChanged(home: string, backupHome: string, dir: string): number {
 
 async function rollBack(home: string, say: (s: string) => void): Promise<Record<string, unknown>> {
   const record = readRecord(home);
+  if (record?.state === "taking-over") {
+    const { units, exported } = await putBackInterrupted(home, record, say);
+    return { rolled_back: true, rollback: "interrupted", exported_notes: exported, units };
+  }
   if (!record || record.state !== "taken-over") throw new Exit(EXIT.failed, `${tilde(home)} has no takeover to roll back${record ? ` (it was rolled back on ${record.rolled_back_at})` : ""}`);
   if (record.core_unit) {
     // Still this home's? Running: one of its processes has this home's data open, none another home's, and stopping it
@@ -1519,8 +1784,9 @@ async function rollBack(home: string, say: (s: string) => void): Promise<Record<
     const dir = join(record.backup, `changed-since-takeover-${stamp()}`);
     exported = exportChanged(home, join(record.backup, "home"), dir);
     say(`Exported ${exported} notes changed since the takeover to ${tilde(dir)}`);
-    record.moved_aside = restore(home, record.backup);
     record.restored_at = new Date().toISOString();
+    // The record (restored_at set) goes into the restored home with it: a cut from here on won't restore again.
+    record.moved_aside = restore(home, record.backup, (a) => ({ ...record, moved_aside: a }));
     // Still "taken-over" until the old units are back: a rollback that fails from here can be run again, and it
     // won't restore the backup a second time.
     writeRecord(home, record);
@@ -1543,12 +1809,16 @@ export async function takeover(args: string[]): Promise<number> {
       console.log(takeoverHelp());
       return EXIT.ok;
     }
-    const home = resolve(f.home ?? homeDir());
+    // The real folder, once, for everything from here: a restore through a link to the home would replace the link,
+    // and the old units, which name the real folder, would reopen the data the restore was meant to replace.
+    const home = realHome(resolve(f.home ?? homeDir()));
     const out = (s: string) => (f.json ? console.error(s) : console.log(s));
     if (f.rollback) {
+      if (!holdTakeoverLock(home)) throw new Exit(EXIT.held, `another takeover or rollback of ${tilde(home)} is running now; nothing was changed`);
+      finishRestore(home, f.json ? say : out);
       const record = readRecord(home);
       if (!f.yes) {
-        if (!record || record.state !== "taken-over") throw new Exit(EXIT.failed, `${tilde(home)} has no takeover to roll back`);
+        if (!record || (record.state !== "taken-over" && record.state !== "taking-over")) throw new Exit(EXIT.failed, `${tilde(home)} has no takeover to roll back`);
         out(`Rolling back stops v0.8${record.core_unit ? ` (${record.core_unit})` : ""} and puts ${record.paused.map((u) => u.name).join(" and ") || "the old programs"} back as they were.`);
         out(record.rollback === "code-only" ? "No data was converted, so every write made under v0.8 is kept." : `The data was migrated: every note changed since ${record.at} is exported first, then the backup ${tilde(record.backup)} is restored.`);
         if (!confirm("Roll back now? [y/N] ")) {
@@ -1562,7 +1832,20 @@ export async function takeover(args: string[]): Promise<number> {
       else out("Rolled back: the old programs have this home again.");
       return EXIT.ok;
     }
-    if (!existsSync(home)) throw new Exit(EXIT.failed, `there is no Parachute home at ${tilde(home)}: nothing to take over`);
+    const unfinished = staleRestore(home);
+    if (!existsSync(home) && !unfinished) throw new Exit(EXIT.failed, `there is no Parachute home at ${tilde(home)}: nothing to take over`);
+    if (f.dryRun && unfinished) throw new Exit(EXIT.failed, `a restore of ${tilde(home)} was cut off before the restored copy took its place (${tilde(unfinished)}); \`parachute-core takeover --rollback --yes\` finishes it`);
+    if (!f.dryRun && !holdTakeoverLock(home)) throw new Exit(EXIT.held, `another takeover or rollback of ${tilde(home)} is running now; nothing was changed`);
+    if (!f.dryRun) finishRestore(home, out);
+    const cut = readRecord(home);
+    if (cut?.state === "taking-over" && !f.dryRun) {
+      if (!f.yes && !confirm(`A takeover of this home started on ${cut.at} was interrupted. Put the old programs back first, then take over? [y/N] `)) {
+        if (!process.stdin.isTTY) throw new Exit(EXIT.usage, "nothing was changed: an earlier takeover was interrupted; pass --yes to put it back and take over (or --dry-run to only look)");
+        out("Nothing was changed.");
+        return EXIT.ok;
+      }
+      await putBackInterrupted(home, cut, f.json ? say : out);
+    }
     const d = await detect(home);
     const report = () => ({
       home: d.home,
