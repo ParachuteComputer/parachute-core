@@ -91,6 +91,8 @@ export interface Unit {
   file?: string;
   /** Runs the old hub or vault: the takeover pauses it. Other Parachute units (a tunnel, scribe) are left alone. */
   old: boolean;
+  /** Runs the old programs, but which home it serves can't be read from its configuration: left alone. */
+  home_unknown?: boolean;
 }
 
 export interface Holder {
@@ -183,21 +185,18 @@ function run(argv: string[], opts: { env?: Record<string, string> } = {}): { cod
 const systemdUnitDir = () => join(process.env.XDG_CONFIG_HOME || join(userHome(), ".config"), "systemd", "user");
 
 /**
- * Split an `Environment=` value into its assignments as systemd does: whitespace between words, "…" and '…' quote
- * (spaces kept), a backslash escapes the next character. undefined when the quoting doesn't close.
+ * Split an `Environment=` value into its assignments, for the plain forms only: words separated by whitespace, each
+ * bare or wholly in "…" or '…'. Any backslash (systemd's escapes: \\x20, \\s, …) or quoting that doesn't close gives
+ * undefined: the home is then "unknown", and callers take the safe side rather than guess.
  */
 export function systemdWords(value: string): string[] | undefined {
+  if (value.includes("\\")) return undefined;
   const out: string[] = [];
   let word = "";
   let inWord = false;
   let quote: string | undefined;
-  for (let i = 0; i < value.length; i++) {
-    const c = value[i]!;
-    if (c === "\\") {
-      if (i + 1 >= value.length) return undefined;
-      word += value[++i];
-      inWord = true;
-    } else if (quote) {
+  for (const c of value) {
+    if (quote) {
       if (c === quote) quote = undefined;
       else word += c;
     } else if (c === '"' || c === "'") {
@@ -217,16 +216,21 @@ export function systemdWords(value: string): string[] | undefined {
   return out;
 }
 
-/** A KEY=VALUE line of an environment file, its value unquoted ("…" or '…', or bare up to a comment). */
+/**
+ * The value of `key` on one line of an environment file (systemd.exec(5)), for the plain forms only: bare (trailing
+ * whitespace dropped, inner spaces and `#` kept: only a line that starts with # or ; is a comment) or wholly quoted.
+ * undefined when the line doesn't assign `key`; null when it does in a form this doesn't read (a backslash, quoting
+ * that doesn't close or has more after it): the home is then "unknown".
+ */
 function envFileValue(line: string, key: string): string | undefined | null {
+  if (/^\s*[#;]/.test(line)) return undefined;
   const m = new RegExp(`^\\s*(?:export\\s+)?${key}\\s*=\\s*(.*)$`).exec(line);
   if (!m) return undefined;
-  const raw = m[1]!.trim();
-  if (raw.startsWith('"') || raw.startsWith("'")) {
-    const words = systemdWords(raw);
-    return words && words.length === 1 ? words[0]! : null; // null: can't tell
-  }
-  return raw.replace(/\s+#.*$/, "");
+  const raw = m[1]!.replace(/\s+$/, "");
+  if (raw.includes("\\")) return null;
+  const q = raw[0];
+  if (q === '"' || q === "'") return raw.length >= 2 && raw.endsWith(q) && !raw.slice(1, -1).includes(q) ? raw.slice(1, -1) : null;
+  return raw;
 }
 
 /**
@@ -337,7 +341,7 @@ function systemdUnits(home: string): Unit[] {
     const text = unitText(name);
     const active = run(["systemctl", "--user", "is-active", name]).stdout.trim() === "active";
     const enabled = run(["systemctl", "--user", "is-enabled", name]).stdout.trim() === "enabled";
-    out.push({ name, manager: "systemd", active, enabled, ...(file ? { file } : {}), old: runsOld(name, text) && unitServes(text, home, false) });
+    out.push({ name, manager: "systemd", active, enabled, ...(file ? { file } : {}), old: runsOld(name, text) && unitServes(text, home, false), ...(runsOld(name, text) && unitHome(text) === "unknown" ? { home_unknown: true } : {}) });
   }
   return out;
 }
@@ -556,7 +560,8 @@ export function describe(d: Detected): string {
   lines.push(found.length ? `Found Parachute ${found.join(" and ")} installed in ${where.join(" and ")}.` : "No old Parachute programs are installed globally (bun or npm).");
   for (const u of d.units) {
     const state = `${u.active ? "running" : "not running"}, ${u.enabled ? "starts at login" : "off at login"}`;
-    lines.push(`  ${u.manager} unit ${u.name}: ${state}${u.old ? "" : " (not the old hub or vault: left alone)"}`);
+    const why = u.home_unknown ? " (can't tell which home it serves from its configuration: left alone; if it holds this home's data, takeover stops)" : u.old ? "" : " (not the old hub or vault on this home: left alone)";
+    lines.push(`  ${u.manager} unit ${u.name}: ${state}${why}`);
   }
   for (const h of d.running) lines.push(`  process ${h.pid} has the data open${h.unit ? ` (${h.unit})` : ""}: ${h.cmd.slice(0, 120)}`);
   const notes = d.vaults.reduce((n, v) => n + v.notes, 0);

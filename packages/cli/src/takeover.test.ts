@@ -14,10 +14,11 @@ const file = (name: string, body: string) => {
 };
 
 describe("systemdWords", () => {
-  test("quotes keep spaces, backslashes escape, unclosed quotes are refused", () => {
+  test("quotes keep spaces; any backslash (systemd's escapes) or unclosed quoting is not read", () => {
     expect(systemdWords(`"PARACHUTE_HOME=/srv/home other" PORT=1`)).toEqual(["PARACHUTE_HOME=/srv/home other", "PORT=1"]);
     expect(systemdWords(`PARACHUTE_HOME='/a b'`)).toEqual(["PARACHUTE_HOME=/a b"]);
-    expect(systemdWords(`PARACHUTE_HOME=/a\\ b`)).toEqual(["PARACHUTE_HOME=/a b"]);
+    expect(systemdWords(`PARACHUTE_HOME=/a\\ b`)).toBeUndefined();
+    expect(systemdWords(`"PARACHUTE_HOME=/srv/home\\x20other"`)).toBeUndefined();
     expect(systemdWords(`"PARACHUTE_HOME=/a`)).toBeUndefined();
   });
 });
@@ -37,6 +38,12 @@ describe("unitHome", () => {
   test("an empty Environment= resets, and the last assignment wins", () => {
     expect(unitHome(`Environment=PARACHUTE_HOME=/one\nEnvironment=\nEnvironment=PARACHUTE_HOME=/two\nEnvironment=PARACHUTE_HOME=/three\n`)).toBe("/three");
     expect(unitHome(`Environment=PARACHUTE_HOME=/one\nEnvironment=\n`)).toMatch(/\/\.parachute$/);
+  });
+  test("an environment file keeps inner spaces and # in a bare value; a backslash or odd quoting is unknown", () => {
+    expect(unitHome(`EnvironmentFile=${file("c.env", "# a comment\nPARACHUTE_HOME=/srv/home #other  \n")}\n`)).toBe("/srv/home #other");
+    expect(unitHome(`EnvironmentFile=${file("d.env", "PARACHUTE_HOME=/srv/home\\ other\n")}\n`)).toBe("unknown");
+    expect(unitHome(`EnvironmentFile=${file("e.env", "PARACHUTE_HOME=\"/a\" b\n")}\n`)).toBe("unknown");
+    expect(unitHome(`[Service]\nEnvironment="PARACHUTE_HOME=/srv/home\\x20other"\n`)).toBe("unknown");
   });
   test("a missing optional file is skipped; a missing required one, or broken quoting, is unknown", () => {
     expect(unitHome(`Environment=PARACHUTE_HOME=/env\nEnvironmentFile=-${join(dir, "none.env")}\n`)).toBe("/env");
