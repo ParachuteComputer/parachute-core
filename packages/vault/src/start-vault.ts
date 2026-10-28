@@ -206,6 +206,7 @@ export async function startVault(opts: StartVaultOptions = {}): Promise<RunningV
       );
       const transcriptionStop = transcriptionWorker?.stop() ?? Promise.resolve();
       embeddingWorker?.stop();
+      const embeddingDrain = embeddingWorker?.drain() ?? Promise.resolve();
       stopAttachmentTicketSweep();
       try {
         await Promise.race([
@@ -215,8 +216,8 @@ export async function startVault(opts: StartVaultOptions = {}): Promise<RunningV
             // running finishes (and sees it was stopped) before its stop does.
             await Promise.allSettled(mirrorStarts);
             await Promise.all(mirrorStops);
-            // Then drain hooks + the transcription worker in parallel.
-            await Promise.all([defaultHookRegistry.drain(), transcriptionStop]);
+            // Then drain hooks, the transcription worker and an embedding sweep in flight, in parallel.
+            await Promise.all([defaultHookRegistry.drain(), transcriptionStop, embeddingDrain]);
           })(),
           // What is left of the deadline, keeping a moment for the databases.
           Bun.sleep(Math.max(100, deadline - (Date.now() - t0) - 300)),
