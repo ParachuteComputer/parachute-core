@@ -6,6 +6,7 @@
 // candidate with `bun run candidate`, and require
 //   - a mutant: every contract in `catches` red;
 //   - a flip:   every red() contract in `catches` reporting "now green" (the fix makes it pass).
+// A mutant with `processModel` is built that way (e.g. "child": a bug only the child path can have, until Nov 3).
 //
 //   bun run mutants:candidate [name ...]     all of MUTANTS, CANDIDATE_MUTANTS and FLIPS, or only those named
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -78,7 +79,8 @@ for (const m of all.filter((m) => only.length === 0 || only.includes(m.name))) {
         writeFileSync(path, src.replace(m.find!, m.replace!));
       }
     };
-    await buildCoreCandidate({ out: cand, staged, edit: { label: `${m.kind} ${m.name}`, apply } });
+    await buildCoreCandidate({ out: cand, staged, edit: { label: `${m.kind} ${m.name}`, apply }, ...(m.processModel ? { processModel: m.processModel } : {}) });
+    if (m.processModel) console.log(`[${m.kind} ${m.name}] built as the ${m.processModel} path`);
     child = Bun.spawn(["bun", "run", "harness/run-candidate.ts", ...m.suite.split(" ")], {
       cwd: contracts,
       env: { ...process.env, CANDIDATE_DIR: cand, CANDIDATE_SHA256: "", CONTRACT_SHOW_LOGS: "0" },

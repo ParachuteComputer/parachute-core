@@ -23,7 +23,7 @@ import { readVaultConfig, readGlobalConfig, writeGlobalConfig, writeVaultConfig,
 import { existsSync, rmSync } from "fs";
 import { migrateVaultKeys } from "./token-store.ts";
 import { resolveFirstBootVaultName, reservedNameSquatWarnings } from "./vault-name.ts";
-import { getVaultStore, getVaultNameForStore, getSharedEmbeddingProvider, closeAllStores } from "./vault-store.ts";
+import { getVaultStore, getVaultNameForStore, getSharedEmbeddingProvider, closeAllStores, resetSharedEmbeddingProvider } from "./vault-store.ts";
 import { EmbeddingWorker, registerEmbeddingHook } from "./embedding-worker.ts";
 import { startAttachmentTicketSweep, stopAttachmentTicketSweep } from "./attachment-tickets.ts";
 import { seedOnboardingNotesBestEffort } from "./onboarding-seed.ts";
@@ -162,6 +162,8 @@ export async function startVault(opts: StartVaultOptions = {}): Promise<RunningV
   let embeddingWorker: EmbeddingWorker | null = null;
   let server: ReturnType<typeof Bun.serve> | null = null;
   let stopTimer: ReturnType<typeof setInterval> | null = null;
+  /** Mirror managers still starting (initial export): stop waits for them, so none subscribes after it. */
+  const mirrorStarts: Promise<unknown>[] = [];
   let stopping: Promise<void> | null = null;
 
   const stop = (stopOpts: { reason?: string; deadline?: number } = {}): Promise<void> =>
@@ -196,6 +198,8 @@ export async function startVault(opts: StartVaultOptions = {}): Promise<RunningV
       try {
         await Promise.race([
           (async () => {
+            // A manager still starting would subscribe to hooks after its stop; let it finish first.
+            await Promise.allSettled(mirrorStarts);
             // Mirror stop first — unsubscribes + cancels each debounce. Each
             // manager's internal soft-settle timeout (250ms) bounds the wait;
             // drain them in parallel so total shutdown stays bounded.
@@ -228,8 +232,10 @@ export async function startVault(opts: StartVaultOptions = {}): Promise<RunningV
           console.warn("[shutdown] cleanup step failed (non-fatal):", err);
         }
       }
-      // Last: every vault database this process opened. Closing the last connection checkpoints the WAL.
+      // Last: every vault database this process opened. Closing the last connection checkpoints the WAL. The
+      // embedding setting is read again on the next start, as a new process read it.
       closeAllStores(true);
+      resetSharedEmbeddingProvider();
     })());
 
   try {
@@ -641,7 +647,7 @@ export async function startVault(opts: StartVaultOptions = {}): Promise<RunningV
         try {
           const mgr = new MirrorManager(buildMirrorDeps(name));
           setMirrorManager(name, mgr);
-          void mgr
+          const starting = mgr
             .start()
             .then((status) => {
               if (!status.enabled && status.last_error) {
@@ -651,6 +657,7 @@ export async function startVault(opts: StartVaultOptions = {}): Promise<RunningV
             .catch((err) => {
               console.warn(`[mirror] vault "${name}" startup threw: ${(err as Error).message ?? err}`);
             });
+          mirrorStarts.push(starting);
         } catch (err) {
           // Isolated per-vault: one vault's failure never touches others.
           console.warn(`[mirror] vault "${name}" manager construction failed: ${(err as Error).message ?? err}`);

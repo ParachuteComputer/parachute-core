@@ -21,7 +21,7 @@
 //
 // The child path (`PARACHUTE_PROCESS_MODEL=child`: the hub starts `parachute-vault serve` as before) stays until the
 // Nov 3 decision (PLAN §2.1); then the losing path is deleted.
-import { rmSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { ModuleState, SpawnRequest } from "@openparachute/hub/src/supervisor.ts";
 import type { RunningVault, StartVaultOptions } from "@openparachute/vault/src/start-vault.ts";
@@ -50,12 +50,15 @@ const HUB_KEYS = ["PORT", "PARACHUTE_BIND_HOST", "PARACHUTE_HUB_ORIGIN", "PARACH
 interface Part {
   name: string;
   stop: (deadline: number) => Promise<void>;
-  /** Last, synchronous: release what must not stay open (run even when `stop` ran out of time). */
-  close?: () => void;
+  /** Last, synchronous: release what must not stay open. `finished`: whether `stop` completed in time. */
+  close?: (finished: boolean) => void;
 }
 
 class Coordinator {
   private parts: Part[] = [];
+  /** Parts whose stop completed in time. */
+  private finished = new Set<Part>();
+  private stopped = new Set<Part>();
   private step: Promise<unknown> = Promise.resolve();
   private stopping: Promise<never> | null = null;
   /** Set once a stop is asked for: start-up checks it after each part and goes no further. */
@@ -88,27 +91,43 @@ class Coordinator {
     }, STOP_DEADLINE_MS + 1_000);
     this.stopping = (async (): Promise<never> => {
       await Promise.race([this.step, Bun.sleep(left() - AFTER_HUB_MS)]);
-      // The hub first: requests it is reading still reach the vault. Then the rest, last added first.
-      const order = [...this.parts].reverse().sort((a, b) => Number(b.name === "hub") - Number(a.name === "hub"));
-      for (const part of order) {
-        const budget = Math.max(500, part.name === "hub" ? left() - AFTER_HUB_MS : left());
-        try {
-          await Promise.race([part.stop(budget), Bun.sleep(budget)]);
-        } catch (err) {
-          console.error(`parachute serve: stopping the ${part.name} failed: ${err instanceof Error ? err.message : String(err)}`);
-        }
-      }
+      await this.stopParts(left);
+      // A part still starting when the wait above ran out (the hub booting its modules: the supervisor refuses new
+      // starts from now on, so that ends soon) is stopped once it has started, if there is time.
+      await Promise.race([this.step, Bun.sleep(Math.max(0, left() - 1_500))]);
+      await this.stopParts(left);
+      const complete = this.parts.every((p) => this.finished.has(p));
       this.closeAll();
-      console.log(`parachute serve: stopped in ${Date.now() - t0} ms`);
-      process.exit(code);
+      console.log(`parachute serve: stopped in ${Date.now() - t0} ms${complete ? "" : " (a part did not finish stopping in time)"}`);
+      process.exit(code === 0 && !complete ? 1 : code);
     })();
     return this.stopping;
+  }
+
+  /** Stop every part not stopped yet: the hub first (requests it is reading still reach the vault), then the rest,
+   *  last added first. */
+  private async stopParts(left: () => number): Promise<void> {
+    const order = [...this.parts]
+      .filter((p) => !this.stopped.has(p))
+      .reverse()
+      .sort((a, b) => Number(b.name === "hub") - Number(a.name === "hub"));
+    for (const part of order) {
+      this.stopped.add(part);
+      const budget = Math.max(500, part.name === "hub" ? left() - AFTER_HUB_MS : left());
+      try {
+        const done = await Promise.race([part.stop(budget).then(() => true), Bun.sleep(budget).then(() => false)]);
+        if (done) this.finished.add(part);
+        else console.error(`parachute serve: the ${part.name} did not stop within ${budget} ms`);
+      } catch (err) {
+        console.error(`parachute serve: stopping the ${part.name} failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
   }
 
   private closeAll(): void {
     for (const part of this.parts) {
       try {
-        part.close?.();
+        part.close?.(this.finished.has(part));
       } catch {}
     }
     this.removeRunFiles();
@@ -128,6 +147,8 @@ class VaultPart {
   running: RunningVault | null = null;
   /** True once stopped on request (the hub's `stop vault`): reported as stopped, as a child would be. */
   stoppedOnRequest = false;
+  /** When a start asked for by the hub failed: reported as crashed until a start succeeds, as a child would be. */
+  failedAt: string | null = null;
   /** The hub's issuer and accepted origins for the vault, once the hub has them. */
   private hub: HubValues = {};
   /** Hub-read keys as the vault's .env file has them (a child read them over the hub's environment). */
@@ -167,6 +188,10 @@ class VaultPart {
           onStopFile: this.deps.onStopFile,
         });
         this.stoppedOnRequest = false;
+        this.failedAt = null;
+      } catch (err) {
+        this.failedAt = new Date().toISOString();
+        throw err;
       } finally {
         for (const k of HUB_KEYS) {
           if (process.env[k] === before[k]) continue;
@@ -290,12 +315,13 @@ export async function serveInProcess(args: string[]): Promise<never> {
   let hubStopping = false;
   const vaultState = (): ModuleState | undefined => {
     if (vault.running) return { short: "vault", status: "running", pid: process.pid, startedAt: vault.running.startedAt, restartsInWindow: 0 };
+    if (vault.failedAt) return { short: "vault", status: "crashed", restartsInWindow: 0, lastCrashAt: vault.failedAt, lastExitCode: EXIT_PART_FAILED };
     if (vault.stoppedOnRequest) return { short: "vault", status: "stopped", restartsInWindow: 0 };
     return undefined;
   };
   const crashed = (err: unknown): ModuleState => {
     console.error(`[supervisor] vault failed to start: ${err instanceof Error ? err.message : String(err)}`);
-    return { short: "vault", status: "crashed", restartsInWindow: 0, lastCrashAt: new Date().toISOString(), lastExitCode: EXIT_PART_FAILED };
+    return vaultState()!;
   };
   const requestedPort = (req?: SpawnRequest): number | undefined => {
     const n = Number(req?.env?.PORT);
@@ -304,6 +330,8 @@ export async function serveInProcess(args: string[]): Promise<never> {
   const issuerOf = (req?: SpawnRequest) => ({ origin: req?.env?.PARACHUTE_HUB_ORIGIN, origins: req?.env?.PARACHUTE_HUB_ORIGINS });
   class InProcessSupervisor extends Supervisor {
     override async start(req: SpawnRequest): Promise<ModuleState> {
+      // Serve is stopping: nothing new starts (the hub's module boot ends at once, so its stop can run).
+      if (coordinator.stopAsked) return { short: req.short, status: "stopped", restartsInWindow: 0 };
       if (req.short !== "vault") return super.start(req);
       // The setup wizard's first vault passes the name it asked for.
       const name = req.env?.PARACHUTE_VAULT_NAME;
@@ -328,6 +356,7 @@ export async function serveInProcess(args: string[]): Promise<never> {
       return vaultState();
     }
     override async restart(short: string, nextReq?: SpawnRequest): Promise<ModuleState | undefined> {
+      if (coordinator.stopAsked) return this.get(short);
       if (short !== "vault" || !vaultState()) return super.restart(short, nextReq);
       const port = requestedPort(nextReq) ?? vault.running?.port;
       await vault.stop(4_000, { onRequest: true });
@@ -358,6 +387,14 @@ export async function serveInProcess(args: string[]): Promise<never> {
       stop: async () => {
         hubStopping = true;
         await hub.stop();
+      },
+      // The hub's stop removes its instance file; if that stop never finished, this process's file goes here.
+      close: (finished) => {
+        if (finished) return;
+        const instance = join(CONFIG_DIR, "hub-instance.json");
+        try {
+          if (JSON.parse(readFileSync(instance, "utf8")).pid === process.pid) rmSync(instance, { force: true });
+        } catch {}
       },
     });
     // 3. What the hub gives a vault child: its issuer and the origins it answers on. The vault reads them when it

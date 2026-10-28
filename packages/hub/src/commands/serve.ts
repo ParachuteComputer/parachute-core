@@ -861,9 +861,8 @@ export async function serve(opts: ServeOpts = {}): Promise<{
       // Stop supervised children first so they get a clean SIGTERM
       // before the HTTP server (which they may depend on for hub-issued
       // tokens) goes away.
-      for (const state of supervisor.list()) {
-        await supervisor.stop(state.short);
-      }
+      // All at once: each child gets its own kill timeout, not the sum of everyone's (v0.8 PLAN §2.2).
+      await Promise.all(supervisor.list().map((state) => supervisor.stop(state.short)));
       selfProbe?.stop();
       reconciler?.stop();
       livenessTimer.stop();
