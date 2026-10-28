@@ -8,9 +8,10 @@
 // Lane B made these green: every command (packages/cli/src/dispatch.ts) reads each database's schema stamp, without
 // opening it for writing, before it parses its own arguments, so the embedded cases hold before serve --embedded and
 // bootstrap exist (lanes C, E), and must keep holding once they do.
-import { Database } from "bun:sqlite";
+import { Database, constants } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { randomBytes } from "node:crypto";
+import { statSync } from "node:fs";
 import { join } from "node:path";
 import { cli, freePort, newHome, start } from "../candidate-lib.ts";
 import { diff, exitWithin, must, ports, snapshot, tail } from "./_lib.ts";
@@ -24,6 +25,35 @@ function raiseSchema(dbPath: string): number {
   db.run("INSERT INTO schema_version (version, applied_at) VALUES (?, ?)", [top + 1, new Date(Date.now() + 60_000).toISOString()]);
   db.close();
   return top + 1;
+}
+
+/**
+ * The same, but the new row is left in the WAL by a writer killed before it checkpoints, as a newer program that
+ * crashed (or a CLI that exits without closing) leaves it: the database file alone still says the old version, and
+ * reading the WAL is what makes SQLite write its -shm index.
+ */
+function raiseSchemaInWal(dbPath: string): void {
+  const top = (() => {
+    const db = new Database(dbPath, { readonly: true });
+    const v = (db.query("SELECT MAX(version) AS v FROM schema_version").get() as { v: number }).v;
+    db.close();
+    return v;
+  })();
+  const w = Bun.spawnSync([
+    process.execPath,
+    "-e",
+    `const { Database } = require("bun:sqlite");
+     const db = new Database(${JSON.stringify(dbPath)});
+     db.exec("PRAGMA journal_mode = WAL");
+     db.exec("PRAGMA wal_autocheckpoint = 0");
+     db.run("INSERT INTO schema_version (version, applied_at) VALUES (?, ?)", [${top + 1}, new Date().toISOString()]);
+     process.kill(process.pid, "SIGKILL");`,
+  ]);
+  must(w.signalCode === "SIGKILL" && statSync(`${dbPath}-wal`).size > 0, `setup: no WAL left with the new row (${w.stderr})`);
+  const file = new Database(`file:${dbPath}?immutable=1`, constants.SQLITE_OPEN_READONLY | constants.SQLITE_OPEN_URI);
+  const inFile = (file.query("SELECT MAX(version) AS v FROM schema_version").get() as { v: number }).v;
+  file.close();
+  must(inFile === top, `setup: the new row reached the database file (${inFile})`);
 }
 
 /** A box-mode home made by today's CLI: a first account (hub.db) and, optionally, a vault (vault.db). */
@@ -112,4 +142,10 @@ describe("embedded/newer-data", () => {
       await refuses(home, "parachute serve", ["serve"], { env: { PORT: String(await freePort()), PARACHUTE_BIND_HOST: "127.0.0.1" } });
     },
   );
+
+  test("box: parachute serve on a hub.db whose newer schema is still only in its WAL exits 6 and leaves the home byte-identical", async () => {
+    const home = await makeHome(false);
+    raiseSchemaInWal(join(home, "hub.db"));
+    await refuses(home, "parachute serve", ["serve"], { env: { PORT: String(await freePort()), PARACHUTE_BIND_HOST: "127.0.0.1" } });
+  });
 });

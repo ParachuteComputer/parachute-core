@@ -3,9 +3,10 @@
 // out of the home, an unreadable file, a WAL left by a crash.
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { newerData, repairModes, schemaOf } from "./home.ts";
 
 const made: string[] = [];
@@ -18,6 +19,11 @@ function tmp(): string {
   return d;
 }
 const mode = (p: string) => statSync(p).mode & 0o777;
+/** Each file in a folder with a hash of its bytes. */
+const files = (dir: string) =>
+  readdirSync(dir)
+    .sort()
+    .map((f) => `${f} ${createHash("sha256").update(readFileSync(join(dir, f))).digest("hex")}`);
 
 /** A WAL-mode database with schema_version rows 1..top, closed cleanly (no -wal left). */
 function db(path: string, top: number): void {
@@ -51,18 +57,32 @@ describe("newerData", () => {
     expect(readdirSync(home)).toEqual(["hub.db"]);
   });
 
-  test("sees a schema bump that is still only in the WAL", () => {
+  test("a WAL a crashed writer left: sees the commit only the WAL holds, and changes no byte, -shm included", () => {
     const home = tmp();
     const path = join(home, "hub.db");
     db(path, 24);
-    // A writer that never closes leaves its commit in the -wal, as a crash does.
-    const w = new Database(path);
-    w.exec("PRAGMA journal_mode = WAL");
-    w.exec("PRAGMA wal_autocheckpoint = 0");
-    w.run("INSERT INTO schema_version VALUES (25, '2026-10-28T00:00:00Z')");
+    // A writer killed after a commit leaves it in the -wal, with a -shm index beside it.
+    const w = Bun.spawnSync([
+      process.execPath,
+      "-e",
+      `const { Database } = require("bun:sqlite");
+       const d = new Database(${JSON.stringify(path)});
+       d.exec("PRAGMA wal_autocheckpoint = 0");
+       d.run("INSERT INTO schema_version VALUES (25, '2026-10-28T00:00:00Z')");
+       process.kill(process.pid, "SIGKILL");`,
+    ]);
+    expect(w.signalCode).toBe("SIGKILL");
     expect(statSync(`${path}-wal`).size).toBeGreaterThan(0);
-    expect(schemaOf(path)).toBe(25);
-    w.close();
+    const before = files(home);
+    expect(schemaOf(path, home + "-outside")).toBe(25); // an unusable outside: falls back to the temp folder
+    expect(schemaOf(path, dirname(home))).toBe(25);
+    expect(files(home)).toEqual(before);
+    // Without the -shm (a careless copy), none is made.
+    rmSync(`${path}-shm`);
+    const noShm = files(home);
+    expect(schemaOf(path, dirname(home))).toBe(25);
+    expect(files(home)).toEqual(noShm);
+    expect(readdirSync(dirname(home)).filter((n) => n.startsWith(".parachute-schema-check-"))).toEqual([]);
   });
 
   test("a database without schema_version, or a file that isn't one, is not refused", () => {

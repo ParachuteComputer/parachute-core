@@ -5,9 +5,24 @@
 //   repairModes(home) folders 0700 and files 0600, put back after a careless copy or restore (fix 3, his E8).
 //                     New files get those modes from the umask dispatch sets.
 import { Database, constants } from "bun:sqlite";
-import { chmodSync, closeSync, constants as fs, existsSync, fchmodSync, fstatSync, lstatSync, openSync, readdirSync, statSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import {
+  chmodSync,
+  closeSync,
+  constants as fs,
+  copyFileSync,
+  existsSync,
+  fchmodSync,
+  fstatSync,
+  linkSync,
+  lstatSync,
+  mkdtempSync,
+  openSync,
+  readdirSync,
+  rmSync,
+  statSync,
+} from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 
 /** The home a command works on: `PARACHUTE_HOME`, else `~/.parachute` (as the hub and the vault resolve it). */
 export function homeDir(env: NodeJS.ProcessEnv = process.env): string {
@@ -26,18 +41,13 @@ export function databases(home: string, known: { hub: number; vault: number }): 
   return out.filter((d) => existsSync(join(home, d.rel)));
 }
 
-/**
- * The highest `schema_version` a database records, read without changing a byte of the home, or undefined when it
- * has no such table (not ours, or empty). With no WAL beside it the file is opened `immutable`, so SQLite creates
- * no -wal or -shm. A non-empty WAL holds commits the file doesn't, so then it is read through SQLite read-only:
- * the database and WAL are untouched, though SQLite may update the -shm index it keeps beside them.
- */
-export function schemaOf(path: string): number | undefined {
-  const wal = `${path}-wal`;
-  const hasWal = existsSync(wal) && statSync(wal).size > 0;
-  const db = hasWal
-    ? new Database(path, { readonly: true })
-    : new Database(`file:${encodeURI(path).replace(/\?/g, "%3F").replace(/#/g, "%23")}?immutable=1`, constants.SQLITE_OPEN_READONLY | constants.SQLITE_OPEN_URI);
+/** A database opened `immutable`: read-only, and SQLite makes no -wal or -shm beside it. */
+function openImmutable(path: string): Database {
+  const uri = encodeURI(path).replace(/\?/g, "%3F").replace(/#/g, "%23");
+  return new Database(`file:${uri}?immutable=1`, constants.SQLITE_OPEN_READONLY | constants.SQLITE_OPEN_URI);
+}
+
+function topVersion(db: Database): number | undefined {
   try {
     const t = db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'").get();
     if (!t) return undefined;
@@ -48,13 +58,51 @@ export function schemaOf(path: string): number | undefined {
   }
 }
 
+/** Above this, a database on another filesystem from every scratch folder is read in place rather than copied. */
+const COPY_LIMIT = 256 * 1024 * 1024;
+
+/**
+ * The highest `schema_version` a database records, or undefined when it has no such table (not ours, or empty).
+ * It never changes a byte under the home:
+ *   - with no WAL beside it, the file is opened `immutable`;
+ *   - a non-empty WAL (a crash, a running server, or a CLI that exited without closing) holds commits the file
+ *     doesn't, and SQLite reading a WAL rewrites its -shm index, creating it if need be. So the database is read in
+ *     a scratch folder outside the home, by hard link (or a copy, up to COPY_LIMIT) with a copy of the WAL.
+ *     `outside` is tried first (the home's parent, usually the same filesystem), then the system's temp folder.
+ *     Only a database too big to copy, on a filesystem shared with neither, is read in place, read-only.
+ */
+export function schemaOf(path: string, outside: string = tmpdir()): number | undefined {
+  const wal = `${path}-wal`;
+  if (!(existsSync(wal) && statSync(wal).size > 0)) return topVersion(openImmutable(path));
+  const places = [...new Set([outside, tmpdir()])];
+  for (const copy of [false, true]) {
+    if (copy && statSync(path).size > COPY_LIMIT) break;
+    for (const place of places) {
+      let scratch: string | undefined;
+      try {
+        scratch = mkdtempSync(join(place, ".parachute-schema-check-"));
+        const db = join(scratch, "db");
+        if (copy) copyFileSync(path, db);
+        else linkSync(path, db);
+        copyFileSync(wal, `${db}-wal`);
+        return topVersion(new Database(db, { readonly: true }));
+      } catch (e) {
+        if (e instanceof Error && e.name === "SQLiteError") throw e;
+      } finally {
+        if (scratch) rmSync(scratch, { recursive: true, force: true });
+      }
+    }
+  }
+  return topVersion(new Database(path, { readonly: true }));
+}
+
 /** Every database under the home stamped with a schema newer than this program knows, as plain lines. */
 export function newerData(home: string, known: { hub: number; vault: number }): string[] {
   const out: string[] = [];
   for (const d of databases(home, known)) {
     let v: number | undefined;
     try {
-      v = schemaOf(join(home, d.rel));
+      v = schemaOf(join(home, d.rel), dirname(home));
     } catch {
       continue; // not a database we can read: the command that opens it reports that
     }
