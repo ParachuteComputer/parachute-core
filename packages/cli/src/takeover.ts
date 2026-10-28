@@ -1071,6 +1071,10 @@ async function stopCheckLeftovers(home: string): Promise<number[]> {
  * and check every answer. Returns the problems found (empty when all is well); it always stops the check run.
  */
 async function checkRun(d: Detected, kids: string[], log: (s: string) => void): Promise<string[]> {
+  // Anything marked as this home's check run now is an earlier run's (this one hasn't started): it would hold the
+  // modules' ports this check run needs.
+  const stale = await stopCheckLeftovers(d.home);
+  if (stale.length) log(`  stopped ${stale.length} process${stale.length === 1 ? "" : "es"} an earlier check run left (pid ${stale.join(", ")})`);
   const port = freePort();
   const hub = `http://127.0.0.1:${port}`;
   const env: Record<string, string> = {};
