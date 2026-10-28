@@ -18,7 +18,8 @@
 //   - the umask is 077, so every folder this program (or a child it starts) creates is 0700 and every file 0600,
 //     the databases' -wal and -shm included;
 //   - a home with a database newer than this program is refused with exit 6, before anything opens it, so the home
-//     is byte-identical afterwards. `version` and `--help` still answer;
+//     is byte-identical afterwards. Only `version` still answers (help is a command: the moved CLIs touch the home
+//     before they read their arguments);
 //   - `serve --embedded` puts back loosened modes, and `serve --embedded` or `serve --offline` runs offline:
 //     PARACHUTE_OFFLINE=1 for this process and every child (no registry lookup, Buzz poller, model download,
 //     outbound webhook or mirror push).
@@ -65,14 +66,6 @@ export function route(role: Role, argv: string[]): { print: string } | { cli: "h
 export const EXIT_NEWER_DATA = 6;
 export const EXIT_HOME_UNUSABLE = 5;
 
-const HELP = ["help", "--help", "-h"];
-/**
- * A request for help, which reads no home: no arguments, `help`, `--help`, or `<command> --help`. Only those exact
- * shapes, so a vault named `help` (`create help --json`) is still a command that runs behind the checks.
- */
-export function isHelp(argv: string[]): boolean {
-  return argv.length === 0 || HELP.includes(argv[0]!) || (argv.length === 2 && (argv[1] === "--help" || argv[1] === "-h"));
-}
 
 /** Run as `role` with this process's arguments. The moved CLIs run in this process, as if started directly. */
 export async function dispatch(role: Role): Promise<void> {
@@ -84,7 +77,9 @@ export async function dispatch(role: Role): Promise<void> {
     return;
   }
   const home = homeDir();
-  if (!isHelp(r.argv)) {
+  // Every command but `version` (answered above) runs behind the check, help included: the moved CLIs do work on
+  // the home before they read their arguments (the vault moves older layouts first), so `serve --help` is a command.
+  {
     const { HUB_SCHEMA_VERSION } = await import("@openparachute/hub/src/hub-db.ts");
     const { newer, unchecked } = newerData(home, { hub: HUB_SCHEMA_VERSION, vault: SCHEMA_VERSION });
     const name = role === "core" ? "parachute-core" : role === "hub" ? "parachute" : "parachute-vault";

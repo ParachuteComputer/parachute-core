@@ -8,7 +8,6 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, s
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { UncheckedError, newerData, repairModes, schemaOf } from "./home.ts";
-import { isHelp } from "./dispatch.ts";
 
 const made: string[] = [];
 afterEach(() => {
@@ -133,14 +132,6 @@ describe("newerData", () => {
     mkdirSync(join(home, "vault", "data", "x"), { recursive: true });
     writeFileSync(join(home, "vault", "data", "x", "vault.db"), "not a database");
     expect(newerData(home, { hub: 24, vault: 32 })).toEqual({ newer: [], unchecked: [] });
-  });
-});
-
-describe("isHelp", () => {
-  test("only help itself skips the checks, not an argument that says help", () => {
-    for (const a of [[], ["help"], ["--help"], ["-h"], ["serve", "--help"], ["auth", "-h"]]) expect(isHelp(a)).toBe(true);
-    for (const a of [["create", "help", "--json"], ["create", "x", "--help", "--json"], ["auth", "mint-token", "--label", "help"]])
-      expect(isHelp(a)).toBe(false);
   });
 });
 

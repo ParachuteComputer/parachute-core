@@ -156,6 +156,14 @@ describe("embedded/newer-data", () => {
     await refuses(home, "parachute-vault create help", ["create", "help", "--no-mirror", "--json"], { vault: true, env: { EMBEDDINGS_ENABLED: "false" } });
   });
 
+  test("box: parachute-vault serve --help on a newer vault.db in the older vaults/ layout exits 6 and leaves the home byte-identical", async () => {
+    // Help is a command too: the vault CLI moves an older layout before it reads its arguments (Codex round 2).
+    const home = await makeHome(true);
+    raiseSchema(vaultDb(home));
+    renameSync(join(home, "vault", "data"), join(home, "vaults"));
+    await refuses(home, "parachute-vault serve --help", ["serve", "--help"], { vault: true, env: { EMBEDDINGS_ENABLED: "false" } });
+  });
+
   for (const legacy of ["vaults", "vault/vaults"]) {
     test(`box: parachute-vault serve on a newer vault.db in the older ${legacy}/ layout exits 6 and leaves the home byte-identical`, async () => {
       // The vault moves an older layout into vault/data/ when it opens; a newer database there must be refused first.
