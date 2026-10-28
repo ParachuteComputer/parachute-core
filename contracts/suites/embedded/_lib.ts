@@ -195,6 +195,9 @@ export async function inOwnNetwork(script: string, input: unknown = {}, timeoutM
   return JSON.parse(line.slice(9));
 }
 
+/** ICMPv6 types the kernel sends by itself on an interface that comes up (see report()). */
+export const KERNEL_ND = "{ nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert, mld-listener-report, mld2-listener-report }";
+
 /** The body of an `inOwnNetwork` script: bring loopback up, run `fn`, print its result (or its error). */
 export async function report(fn: (input: any) => Promise<unknown>, opts: { trap?: boolean } = {}): Promise<void> {
   // The same trap as harness/sandbox.ts, so candidate-lib outboundPackets() reads this network's own counter and
@@ -209,6 +212,10 @@ export async function report(fn: (input: any) => Promise<unknown>, opts: { trap?
       ["ip", "-6", "route", "add", "default", "dev", "pctrap0"],
       ["nft", "add", "table", "inet", "pctrap"],
       ["nft", "add", "chain", "inet", "pctrap", "out", "{ type filter hook output priority 0; }"],
+      // The kernel's own IPv6 discovery on the dummy interface (router and neighbour solicitations, MLD reports)
+      // leaves at its own times and isn't the program under test; a program can't send those without raw sockets.
+      // Seen in CI: one 56-byte packet in a 12 s window with nothing running.
+      ["nft", "add", "rule", "inet", "pctrap", "out", "oifname", "!=", "lo", "icmpv6", "type", KERNEL_ND, "return"],
       ["nft", "add", "rule", "inet", "pctrap", "out", "oifname", "!=", "lo", "counter"],
     );
   }

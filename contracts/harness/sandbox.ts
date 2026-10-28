@@ -156,6 +156,9 @@ function setUpNetwork(): void {
   must(["ip", "-6", "route", "add", "default", "dev", TRAP_IF]);
   must(["nft", "add", "table", "inet", "pctrap"]);
   must(["nft", "add", "chain", "inet", "pctrap", "out", "{ type filter hook output priority 0; }"]);
+  // Not the kernel's own IPv6 discovery on the trap interface (suites/embedded/_lib.ts report() says why).
+  must(["nft", "add", "rule", "inet", "pctrap", "out", "oifname", "!=", "lo", "icmpv6", "type",
+    "{ nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert, mld-listener-report, mld2-listener-report }", "return"]);
   must(["nft", "add", "rule", "inet", "pctrap", "out", "oifname", "!=", "lo", "counter"]);
 }
 
