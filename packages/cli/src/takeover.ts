@@ -48,6 +48,7 @@ import {
   rmSync,
   statfsSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -126,7 +127,10 @@ export interface Detected {
   rollback: "code-only" | "restore-backup";
   issuer: string;
   size_bytes: number;
-  /** Entries the backup can't copy as they are (symlinks, sockets): the takeover refuses while there are any. */
+  /**
+   * Entries the backup can't copy as they are (links that lead out of the home, sockets): the takeover refuses while
+   * there are any. A link that stays inside the home (a library's version links) is copied as a link.
+   */
   uncopyable: string[];
   others: string[];
   record: Record_ | null;
@@ -824,7 +828,7 @@ export function describe(d: Detected): string {
     for (const m of d.migrations) lines.push(`  ${m}`);
     lines.push("Going back means restoring the backup: `parachute-core takeover --rollback` exports every note changed since, then restores it.");
   }
-  if (d.uncopyable.length) lines.push(`The home has ${d.uncopyable.length} entr${d.uncopyable.length === 1 ? "y" : "ies"} the backup can't copy as ${d.uncopyable.length === 1 ? "it is" : "they are"} (links): ${d.uncopyable.slice(0, 5).join(", ")}. Takeover won't go ahead until ${d.uncopyable.length === 1 ? "it is" : "they are"} replaced by the real files.`);
+  if (d.uncopyable.length) lines.push(`The home has ${d.uncopyable.length} entr${d.uncopyable.length === 1 ? "y" : "ies"} the backup can't copy as ${d.uncopyable.length === 1 ? "it is" : "they are"} (links out of it, or sockets): ${d.uncopyable.slice(0, 5).join(", ")}. Takeover won't go ahead until ${d.uncopyable.length === 1 ? "it is" : "they are"} replaced by the real files.`);
   if (d.record?.state === "taken-over") lines.push(`This home was already taken over on ${d.record.at} (backup ${tilde(d.record.backup)}).`);
   lines.push("With your yes, it will:");
   for (const s of plan(d)) lines.push(`  - ${s}`);
@@ -898,9 +902,14 @@ function sha256(path: string): string {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
-/** Every regular file and folder under `root`, relative to it, and anything else (links, sockets) it can't copy. */
-function entries(root: string): { files: string[]; dirs: string[]; other: string[] } {
-  const out = { files: [] as string[], dirs: [] as string[], other: [] as string[] };
+/**
+ * Every regular file and folder under `root`, relative to it; every link whose target stays inside `root` (read as
+ * written, relative to the link's folder: `libggml.so -> libggml.so.0`), with that target; and anything else it
+ * can't copy as it is (a link leading out, a socket).
+ */
+export function entries(root: string): { files: string[]; dirs: string[]; links: [string, string][]; other: string[] } {
+  const out = { files: [] as string[], dirs: [] as string[], links: [] as [string, string][], other: [] as string[] };
+  const top = resolve(root);
   const walk = (rel: string) => {
     for (const name of readdirSync(join(root, rel)).sort()) {
       const r = rel ? join(rel, name) : name;
@@ -909,15 +918,20 @@ function entries(root: string): { files: string[]; dirs: string[]; other: string
         out.dirs.push(r);
         walk(r);
       } else if (st.isFile()) out.files.push(r);
-      else out.other.push(r);
+      else if (st.isSymbolicLink()) {
+        const target = readlinkSync(join(root, r));
+        const to = resolve(top, dirname(r), target);
+        if (to.startsWith(`${top}/`)) out.links.push([r, target]);
+        else out.other.push(r);
+      } else out.other.push(r);
     }
   };
   walk("");
   return out;
 }
 
-/** Copy every file of the home, byte for byte, with a manifest; check each copy against its hash. */
-function backup(home: string, dest: string): { files: number; bytes: number } {
+/** Copy every file of the home, byte for byte, and its inner links as links, with a manifest; check each copy. */
+export function backup(home: string, dest: string): { files: number; bytes: number } {
   const into = join(dest, "home");
   mkdirSync(into, { recursive: true, mode: 0o700 });
   const manifest: Record<string, string> = {};
@@ -934,12 +948,18 @@ function backup(home: string, dest: string): { files: number; bytes: number } {
     manifest[rel] = h;
     bytes += statSync(from).size;
   }
-  writeFileSync(join(dest, "manifest.json"), `${JSON.stringify({ home, at: new Date().toISOString(), files: manifest, folders: all.dirs }, null, 2)}\n`, { mode: 0o600 });
+  const links: Record<string, string> = {};
+  for (const [rel, target] of all.links) {
+    symlinkSync(target, join(into, rel));
+    if (readlinkSync(join(into, rel)) !== target) throw new Error(`the backup copy of the link ${rel} doesn't match the original`);
+    links[rel] = target;
+  }
+  writeFileSync(join(dest, "manifest.json"), `${JSON.stringify({ home, at: new Date().toISOString(), files: manifest, folders: all.dirs, links }, null, 2)}\n`, { mode: 0o600 });
   return { files: Object.keys(manifest).length, bytes };
 }
 
-/** Put the backup's bytes back as the home; what was there moves aside (`<home>.after-takeover-<time>`). */
-function restore(home: string, dest: string): string {
+/** Put the backup's bytes (and links) back as the home; what was there moves aside (`<home>.after-takeover-<time>`). */
+export function restore(home: string, dest: string): string {
   const read = readJson(join(dest, "manifest.json"));
   const manifest = read?.files as Record<string, string> | undefined;
   if (!manifest) throw new Error(`no manifest in ${dest}`);
@@ -951,6 +971,10 @@ function restore(home: string, dest: string): string {
     mkdirSync(dirname(to), { recursive: true, mode: 0o700 });
     copyFileSync(join(dest, "home", rel), to);
     if (sha256(to) !== h) throw new Error(`the backup's ${rel} doesn't match its manifest`);
+  }
+  for (const [rel, target] of Object.entries((read.links ?? {}) as Record<string, string>)) {
+    mkdirSync(dirname(join(staged, rel)), { recursive: true, mode: 0o700 });
+    symlinkSync(target, join(staged, rel));
   }
   const aside = `${home}.after-takeover-${stamp()}`;
   renameSync(home, aside);
@@ -1290,7 +1314,7 @@ async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ ba
     throw new Exit(EXIT.failed, "the old programs run as launchd agents; taking those over isn't built yet (macOS). Nothing was changed.");
   }
   if (d.uncopyable.length) {
-    throw new Exit(EXIT.failed, `the home has entries the backup can't copy as they are (${d.uncopyable.slice(0, 5).join(", ")}): links point outside it. Replace them with the real files, or back up yourself. Nothing was changed.`);
+    throw new Exit(EXIT.failed, `the home has entries the backup can't copy as they are (${d.uncopyable.slice(0, 5).join(", ")}): links that lead out of it, or sockets. Replace them with the real files, or back up yourself. Nothing was changed.`);
   }
   const coreUnitFile = join(systemdUnitDir(), CORE_UNIT);
   // What systemd has loaded under that name, wherever its file is: one outside the user folder is never shadowed.

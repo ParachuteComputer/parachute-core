@@ -331,6 +331,26 @@ describe("takeover", () => {
     expect(existsSync(join(m.user, "parachute-takeover"))).toBe(false);
   }, 120_000);
 
+  test("a home whose links stay inside it (a library's version links) is taken over: the backup keeps each link as a link", async () => {
+    // Found by rehearsal/uni (lane H): uni's home has transcription/bin/libggml.so -> libggml.so.0 -> libggml.so.0.15.1
+    // and the like, and takeover refused the whole home for them.
+    const { m } = await oldMachine("tk-inlinks");
+    const bin = join(m.home, "transcription", "bin");
+    mkdirSync(bin, { recursive: true });
+    writeFileSync(join(bin, "libmadeup.so.0.15.1"), "made-up library bytes");
+    symlinkSync("libmadeup.so.0.15.1", join(bin, "libmadeup.so.0"));
+    symlinkSync("libmadeup.so.0", join(bin, "libmadeup.so"));
+    const r = await core(m, ["takeover", "--home", m.home, "--yes", "--json"]);
+    must(r.code === 0, `takeover --yes on a home with links inside it exited ${r.code}: ${r.stderr.slice(-600)}`);
+    const backup = String(json(r, "takeover --yes --json").backup);
+    for (const home of [m.home, join(backup, "home")]) {
+      expect(readlinkSync(join(home, "transcription", "bin", "libmadeup.so"))).toBe("libmadeup.so.0");
+      expect(readlinkSync(join(home, "transcription", "bin", "libmadeup.so.0"))).toBe("libmadeup.so.0.15.1");
+      expect(readFileSync(join(home, "transcription", "bin", "libmadeup.so"), "utf8")).toBe("made-up library bytes");
+    }
+    expect(m.unit(HUB_UNIT)).toEqual({ active: false, enabled: false });
+  }, 120_000);
+
   test("takeover from a shell that still has the old box's settings (its port, origin and key source) checks v0.8 against itself and succeeds", async () => {
     // Found by lane E's walkthrough: a check run that took the shell's PARACHUTE_HUB_JWKS_ORIGIN fetched keys from
     // the old box's address, where nothing listens once it is paused, and every vault answered 401.
