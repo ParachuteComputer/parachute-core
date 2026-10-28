@@ -558,9 +558,10 @@ describe("hub-settings — hub_origin (hub#298)", () => {
       }
     } finally {
       if (prior === undefined) {
-        // Bun's process.env supports the `[key]: undefined` shape
-        // (biome's noDelete rule preferred this over `delete`).
-        process.env.PARACHUTE_HUB_ORIGIN = undefined;
+        // Not `= undefined`: Bun 1.4 stores the string "undefined", which
+        // leaked `iss: "undefined"` into every later file in the run.
+        // Reflect.deleteProperty satisfies biome's noDelete rule.
+        Reflect.deleteProperty(process.env, "PARACHUTE_HUB_ORIGIN");
       } else {
         process.env.PARACHUTE_HUB_ORIGIN = prior;
       }

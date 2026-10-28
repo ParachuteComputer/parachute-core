@@ -618,7 +618,7 @@ describe("POST /api/modules/:short/install", () => {
     } finally {
       // Bun's process.env supports the `[key]: undefined` shape
       // (biome's noDelete rule preferred this over `delete`).
-      if (prior === undefined) process.env.PARACHUTE_INSTALL_CHANNEL = undefined;
+      if (prior === undefined) Reflect.deleteProperty(process.env, "PARACHUTE_INSTALL_CHANNEL");
       else process.env.PARACHUTE_INSTALL_CHANNEL = prior;
     }
   });
@@ -656,7 +656,7 @@ describe("POST /api/modules/:short/install", () => {
     } finally {
       // Bun's process.env supports the `[key]: undefined` shape
       // (biome's noDelete rule preferred this over `delete`).
-      if (prior === undefined) process.env.PARACHUTE_INSTALL_CHANNEL = undefined;
+      if (prior === undefined) Reflect.deleteProperty(process.env, "PARACHUTE_INSTALL_CHANNEL");
       else process.env.PARACHUTE_INSTALL_CHANNEL = prior;
     }
   });
@@ -691,7 +691,7 @@ describe("POST /api/modules/:short/install", () => {
     } finally {
       // Bun's process.env supports the `[key]: undefined` shape
       // (biome's noDelete rule preferred this over `delete`).
-      if (prior === undefined) process.env.PARACHUTE_INSTALL_CHANNEL = undefined;
+      if (prior === undefined) Reflect.deleteProperty(process.env, "PARACHUTE_INSTALL_CHANNEL");
       else process.env.PARACHUTE_INSTALL_CHANNEL = prior;
     }
   });
@@ -1527,7 +1527,7 @@ describe("POST /api/modules/:short/upgrade", () => {
       expect(calls).toContainEqual(["bun", "add", "-g", "@openparachute/vault@rc"]);
       expect(calls).not.toContainEqual(["bun", "add", "-g", "@openparachute/vault@latest"]);
     } finally {
-      if (prior === undefined) process.env.PARACHUTE_INSTALL_CHANNEL = undefined;
+      if (prior === undefined) Reflect.deleteProperty(process.env, "PARACHUTE_INSTALL_CHANNEL");
       else process.env.PARACHUTE_INSTALL_CHANNEL = prior;
     }
   });

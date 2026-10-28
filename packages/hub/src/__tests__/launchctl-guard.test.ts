@@ -122,7 +122,7 @@ describe("guardServiceManagerCommand — throws under a test runner", () => {
     } finally {
       // Restore — `= undefined` to clear (the codebase convention; biome flags
       // `delete process.env.X` as a perf foot-gun. See hub-settings.test.ts).
-      if (prev === undefined) process.env.PARACHUTE_ALLOW_REAL_LAUNCHCTL = undefined;
+      if (prev === undefined) Reflect.deleteProperty(process.env, "PARACHUTE_ALLOW_REAL_LAUNCHCTL");
       else process.env.PARACHUTE_ALLOW_REAL_LAUNCHCTL = prev;
     }
   });
