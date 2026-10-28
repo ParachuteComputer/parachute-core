@@ -446,10 +446,10 @@ describe("takeover", () => {
     must(started, `setup: the first takeover never recorded its start:\n${first.log().slice(-1500)}`);
     const backups = () => (existsSync(join(m.user, "parachute-takeover")) ? readdirSync(join(m.user, "parachute-takeover")).length : 0);
     const before = backups();
-    // The second reaches the same home by another path (a link to the user folder): the same lock all the same.
-    const alias = join(dirname(m.user), `${basename(m.user)}-alias`);
-    symlinkSync(m.user, alias);
-    const second = await core(m, ["takeover", "--home", join(alias, basename(m.home)), "--yes", "--json"]);
+    // The second reaches the same home through a link to it: the same lock all the same.
+    const alias = join(m.user, "home-link");
+    symlinkSync(m.home, alias);
+    const second = await core(m, ["takeover", "--home", alias, "--yes", "--json"]);
     expect(second.code).toBe(7);
     // Refused by the lock, before it reads anything (the record's pid check is only a second line).
     expect(second.stderr).toContain("another takeover or rollback of");
