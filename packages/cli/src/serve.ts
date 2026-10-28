@@ -154,9 +154,10 @@ class VaultPart {
   private hub: HubValues = {};
   /** Hub-read keys as the vault's .env file has them (a child read them over the hub's environment). */
   private fromEnvFile: Partial<Record<(typeof HUB_KEYS)[number], string>> = {};
-  /** Keys the vault's .env filled into the environment when it started: taken out again when it stops, so the next
-   *  start reads the file as it is then (a changed or removed setting), as a new child process did. */
-  private filled: string[] = [];
+  /** What the environment held, before this vault's start, for each key its .env set: put back when it stops or
+   *  fails to start, so the next start reads the file as it is then (a changed or removed setting), as a new child
+   *  process did. */
+  private replaced = new Map<string, string | undefined>();
   private queue: Promise<unknown> = Promise.resolve();
 
   constructor(
@@ -181,9 +182,15 @@ class VaultPart {
       // The vault's .env fills unset environment keys when it starts. In one process that environment is the hub's
       // too, so the keys the hub reads for itself go back to what they were; the vault gets them as values instead.
       const before = Object.fromEntries(HUB_KEYS.map((k) => [k, process.env[k]]));
-      const unset = new Set(Object.keys(this.deps.readEnvFile()).filter((k) => process.env[k] === undefined));
       const file = this.deps.readEnvFile();
       this.fromEnvFile = Object.fromEntries(HUB_KEYS.filter((k) => file[k] !== undefined).map((k) => [k, file[k]]));
+      // A child got the vault's .env over the hub's environment (hub serve-boot.ts buildModuleSpawnRequest): the file
+      // wins. The same here, for every key but the hub's own (above) and the home.
+      for (const [k, v] of Object.entries(file)) {
+        if ((HUB_KEYS as readonly string[]).includes(k) || k === "PARACHUTE_HOME") continue;
+        if (!this.replaced.has(k)) this.replaced.set(k, process.env[k]);
+        process.env[k] = v;
+      }
       try {
         this.running = await this.deps.startVault({
           port: this.deps.port(opts.port),
@@ -196,9 +203,9 @@ class VaultPart {
         this.failedAt = null;
       } catch (err) {
         this.failedAt = new Date().toISOString();
+        this.restoreEnv();
         throw err;
       } finally {
-        this.filled = [...unset].filter((k) => process.env[k] !== undefined && !(HUB_KEYS as readonly string[]).includes(k));
         for (const k of HUB_KEYS) {
           if (process.env[k] === before[k]) continue;
           if (before[k] === undefined) delete process.env[k];
@@ -216,9 +223,16 @@ class VaultPart {
       this.running = null;
       if (opts.onRequest) this.stoppedOnRequest = true;
       await v.stop({ reason: opts.onRequest ? "stop requested by the hub" : "serve stopping", deadline });
-      for (const k of this.filled) delete process.env[k];
-      this.filled = [];
+      this.restoreEnv();
     });
+  }
+
+  private restoreEnv(): void {
+    for (const [k, previous] of this.replaced) {
+      if (previous === undefined) delete process.env[k];
+      else process.env[k] = previous;
+    }
+    this.replaced.clear();
   }
 
   /**

@@ -195,29 +195,28 @@ export async function startVault(opts: StartVaultOptions = {}): Promise<RunningV
       //
       // The whole thing races what is left of the deadline so a stuck handler
       // doesn't hang shutdown indefinitely.
+      // Every mirror manager this vault started is told to stop now, before any wait: a manager still in its start
+      // sees that and never subscribes or arms a timer afterwards (MirrorManager's generation). The workers and the
+      // ticket sweep stop here too, so nothing below that outlives the deadline can touch a vault started after
+      // this one in the same process; what the race leaves running only waits on these instances.
+      const mirrorStops = listMirrorManagers().map((m) =>
+        m.stop().catch((err) =>
+          console.warn(`[mirror] stop threw during shutdown (non-fatal): ${(err as Error).message ?? err}`),
+        ),
+      );
+      const transcriptionStop = transcriptionWorker?.stop() ?? Promise.resolve();
+      embeddingWorker?.stop();
+      stopAttachmentTicketSweep();
       try {
         await Promise.race([
           (async () => {
-            // A manager still starting would subscribe to hooks after its stop; let it finish first.
+            // Mirror stops first — each unsubscribes + cancels its debounce,
+            // within its internal soft-settle timeout (250ms); a start still
+            // running finishes (and sees it was stopped) before its stop does.
             await Promise.allSettled(mirrorStarts);
-            // Mirror stop first — unsubscribes + cancels each debounce. Each
-            // manager's internal soft-settle timeout (250ms) bounds the wait;
-            // drain them in parallel so total shutdown stays bounded.
-            await Promise.all(
-              listMirrorManagers().map((m) =>
-                m.stop().catch((err) =>
-                  console.warn(`[mirror] stop threw during shutdown (non-fatal): ${(err as Error).message ?? err}`),
-                ),
-              ),
-            );
-            // Then drain hooks + stop the transcription/embedding workers in
-            // parallel.
-            embeddingWorker?.stop();
-            stopAttachmentTicketSweep();
-            await Promise.all([
-              defaultHookRegistry.drain(),
-              transcriptionWorker?.stop() ?? Promise.resolve(),
-            ]);
+            await Promise.all(mirrorStops);
+            // Then drain hooks + the transcription worker in parallel.
+            await Promise.all([defaultHookRegistry.drain(), transcriptionStop]);
           })(),
           // What is left of the deadline, keeping a moment for the databases.
           Bun.sleep(Math.max(100, deadline - (Date.now() - t0) - 300)),
