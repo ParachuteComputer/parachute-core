@@ -40,6 +40,7 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
   readlinkSync,
@@ -54,6 +55,7 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { dlopen, FFIType } from "bun:ffi";
 import core from "../../../package.json" with { type: "json" };
 import { databases, homeDir, readDatabase, schemaOf } from "./home.ts";
 import { bundleRoot } from "./install.ts";
@@ -142,8 +144,11 @@ interface Record_ {
    * was interrupted (an ssh drop, a reboot) is found and put back by the next takeover or --rollback.
    */
   state: "taking-over" | "taken-over" | "rolled-back";
-  /** How far a "taking-over" run got: "checking" means v0.8 may have started migrating the data. */
-  stage?: "pausing" | "backed-up" | "checking";
+  /**
+   * How far a "taking-over" run got: "checking", v0.8 may have migrated the data; "handing-over", core's unit may also
+   * have taken writes from clients (they are exported before any restore).
+   */
+  stage?: "pausing" | "backed-up" | "checking" | "handing-over";
   /** The process running a "taking-over" takeover: while it lives, another takeover leaves the home alone. */
   pid?: number;
   at: string;
@@ -849,7 +854,7 @@ export function describe(d: Detected): string {
   if (d.record?.state === "taken-over") lines.push(`This home was already taken over on ${d.record.at} (backup ${tilde(d.record.backup)}).`);
   if (d.record?.state === "taking-over") {
     const units = d.record.paused.map((u) => u.name).join(" and ") || "the old programs";
-    const restoring = d.record.stage === "checking" && d.record.migrations.length > 0 && d.record.backup;
+    const restoring = (d.record.stage === "checking" || d.record.stage === "handing-over") && d.record.migrations.length > 0 && d.record.backup && !d.record.restored_at;
     lines.push(`A takeover of this home started on ${d.record.at} was interrupted. Taking over (or --rollback) first puts ${units} back as ${d.record.paused.length === 1 ? "it was" : "they were"}${restoring ? `, restoring the backup ${tilde(d.record.backup)} since v0.8 may have started migrating the data` : ""}.`);
   }
   lines.push("With your yes, it will:");
@@ -982,8 +987,12 @@ export function backup(home: string, dest: string): { files: number; bytes: numb
   return { files: Object.keys(manifest).length, bytes };
 }
 
-/** Put the backup's bytes (and links) back as the home; what was there moves aside (`<home>.after-takeover-<time>`). */
-export function restore(home: string, dest: string): string {
+/**
+ * Put the backup's bytes (and links) back as the home; what was there moves aside (`<home>.after-takeover-<time>`).
+ * `keep`, given where the old home goes, is the record to put in the restored home before it takes the home's place,
+ * so a run cut off right after the swap still finds its record.
+ */
+export function restore(home: string, dest: string, keep?: (aside: string) => Record_): string {
   const read = readJson(join(dest, "manifest.json"));
   const manifest = read?.files as Record<string, string> | undefined;
   if (!manifest) throw new Error(`no manifest in ${dest}`);
@@ -1001,6 +1010,7 @@ export function restore(home: string, dest: string): string {
     symlinkSync(target, join(staged, rel));
   }
   const aside = `${home}.after-takeover-${stamp()}`;
+  if (keep) writeFileSync(join(staged, RECORD_FILE), `${JSON.stringify(keep(aside), null, 2)}\n`, { mode: 0o600 });
   renameSync(home, aside);
   renameSync(staged, home);
   return aside;
@@ -1378,6 +1388,25 @@ function resumeUnits(paused: Record_["paused"]): string[] {
 }
 
 /**
+ * One takeover or rollback of a home at a time: an exclusive flock(2) on `<home>.takeover.lock`, beside the home (not
+ * in it: backups copy the home and restores swap it), held until this process exits however it exits, so it is never
+ * stale. The descriptor is close-on-exec, so a check run or module that outlives this process never holds it.
+ */
+function holdTakeoverLock(home: string): boolean {
+  const lib = dlopen(process.platform === "darwin" ? "libSystem.B.dylib" : "libc.so.6", {
+    flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+    fcntl: { args: [FFIType.i32, FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+  });
+  const fd = openSync(`${home}.takeover.lock`, "a", 0o600); // kept open: closing it would drop the lock
+  const F_SETFD = 2;
+  const FD_CLOEXEC = 1;
+  lib.symbols.fcntl(fd, F_SETFD, FD_CLOEXEC);
+  const LOCK_EX = 2;
+  const LOCK_NB = 4;
+  return lib.symbols.flock(fd, LOCK_EX | LOCK_NB) === 0;
+}
+
+/**
  * Put back a takeover that was cut off (its record still says "taking-over"): stop core's unit if that run had
  * started it, restore the backup if v0.8 may have migrated the data, then enable and start the old units it paused
  * and wait until they have the home's data open again, so the next detection sees them. Removes the record.
@@ -1404,10 +1433,15 @@ async function putBackInterrupted(home: string, rec: Record_, say: (s: string) =
   if (!(await waitUntil(() => inTheWay().length === 0, 20_000, 250))) {
     throw new Exit(EXIT.held, `still holding the data: ${inTheWay().map((h) => `pid ${h.pid} (${h.cmd.slice(0, 80)})`).join(", ")}. Stop it, then run takeover again.`);
   }
-  if (rec.stage === "checking" && rec.migrations.length && rec.backup && !rec.restored_at) {
+  if ((rec.stage === "checking" || rec.stage === "handing-over") && rec.migrations.length && rec.backup && !rec.restored_at) {
     const held = heldBy(home, units);
     if (held.length) throw new Exit(EXIT.held, `the old programs were started again on data v0.8 may have migrated (pid ${held.map((h) => h.pid).join(", ")}); stop them, then run takeover again so the backup is restored first.`);
-    const aside = restore(home, rec.backup);
+    // Whatever changed since the backup (core's unit may have taken writes before the cut) is exported first.
+    const dir = join(rec.backup, `changed-since-takeover-${stamp()}`);
+    const exported = exportChanged(home, join(rec.backup, "home"), dir);
+    if (exported) say(`  exported ${exported} note${exported === 1 ? "" : "s"} changed since the takeover began to ${tilde(dir)}`);
+    // The record goes into the restored home with it, so a cut from here on still finds it (and won't restore again).
+    const aside = restore(home, rec.backup, (a) => ({ ...rec, restored_at: new Date().toISOString(), moved_aside: a }));
     say(`  restored the backup ${tilde(rec.backup)}, since v0.8 may have started migrating the data (what it left is in ${tilde(aside)})`);
   }
   const errors = resumeUnits(rec.paused);
@@ -1539,7 +1573,11 @@ async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ ba
     let msg = why;
     if (d.migrations.length) {
       try {
-        const aside = restore(d.home, dest);
+        // Core's unit may have taken writes before its check failed: whatever differs from the backup is exported.
+        const dir = join(dest, `changed-since-takeover-${stamp()}`);
+        const exported = exportChanged(d.home, join(dest, "home"), dir);
+        if (exported) msg += `; ${exported} note${exported === 1 ? "" : "s"} changed since the backup ${exported === 1 ? "is" : "are"} in ${dir}`;
+        const aside = restore(d.home, dest, (a) => ({ ...progress, stage: "checking", backup: dest, restored_at: new Date().toISOString(), moved_aside: a }));
         msg += `; the backup was restored (what v0.8 left is in ${aside})`;
       } catch (err) {
         return new Exit(EXIT.checkFailed, `${why}; restoring the backup failed: ${(err as Error).message}. The old units stay paused, because the data may be migrated. Restore ${dest}/home over ${d.home} (manifest.json has every sha256), then enable and start ${paused.map((u) => u.name).join(" and ")}.`);
@@ -1563,7 +1601,7 @@ async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ ba
     if (err instanceof Exit) throw err; // from undo(), which has already put back what it could
     // Not finished (a "taken-over" record may be there already) until undo() has put the old units back; it then
     // removes the record, or leaves this one for the next run to finish.
-    writeRecord(d.home, { ...progress, stage: "checking", backup: dest });
+    writeRecord(d.home, { ...progress, stage: unitTried ? "handing-over" : "checking", backup: dest, core_unit: unitTried ? CORE_UNIT : null });
     throw undo(`${(err as Error).message}`);
   }
 
@@ -1689,8 +1727,9 @@ async function rollBack(home: string, say: (s: string) => void): Promise<Record<
     const dir = join(record.backup, `changed-since-takeover-${stamp()}`);
     exported = exportChanged(home, join(record.backup, "home"), dir);
     say(`Exported ${exported} notes changed since the takeover to ${tilde(dir)}`);
-    record.moved_aside = restore(home, record.backup);
     record.restored_at = new Date().toISOString();
+    // The record (restored_at set) goes into the restored home with it: a cut from here on won't restore again.
+    record.moved_aside = restore(home, record.backup, (a) => ({ ...record, moved_aside: a }));
     // Still "taken-over" until the old units are back: a rollback that fails from here can be run again, and it
     // won't restore the backup a second time.
     writeRecord(home, record);
@@ -1716,6 +1755,7 @@ export async function takeover(args: string[]): Promise<number> {
     const home = resolve(f.home ?? homeDir());
     const out = (s: string) => (f.json ? console.error(s) : console.log(s));
     if (f.rollback) {
+      if (!holdTakeoverLock(home)) throw new Exit(EXIT.held, `another takeover or rollback of ${tilde(home)} is running now; nothing was changed`);
       const record = readRecord(home);
       if (!f.yes) {
         if (!record || (record.state !== "taken-over" && record.state !== "taking-over")) throw new Exit(EXIT.failed, `${tilde(home)} has no takeover to roll back`);
@@ -1733,6 +1773,7 @@ export async function takeover(args: string[]): Promise<number> {
       return EXIT.ok;
     }
     if (!existsSync(home)) throw new Exit(EXIT.failed, `there is no Parachute home at ${tilde(home)}: nothing to take over`);
+    if (!f.dryRun && !holdTakeoverLock(home)) throw new Exit(EXIT.held, `another takeover or rollback of ${tilde(home)} is running now; nothing was changed`);
     const cut = readRecord(home);
     if (cut?.state === "taking-over" && !f.dryRun) {
       if (!f.yes && !confirm(`A takeover of this home started on ${cut.at} was interrupted. Put the old programs back first, then take over? [y/N] `)) {

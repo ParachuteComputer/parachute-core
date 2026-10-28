@@ -431,6 +431,32 @@ describe("takeover", () => {
     expect(m.unit(HUB_UNIT)).toEqual({ active: true, enabled: true });
   }, 240_000);
 
+  test("one takeover of a home at a time: a second one started while the first runs refuses with exit 7 and changes nothing", async () => {
+    // Codex's review of the rehearsal fixes (lane H): two takeovers could both pass detection, then both pause, back
+    // up and check the same home, and one could stop the other's check run.
+    const { m } = await oldMachine("tk-twice");
+    const first = m.spawn([requireCore(m.info), "takeover", "--home", m.home, "--yes", "--json"]);
+    const started = await until(() => {
+      try {
+        return JSON.parse(readFileSync(join(m.home, "takeover.json"), "utf8")).state === "taking-over";
+      } catch {
+        return false;
+      }
+    }, 90_000, 20);
+    must(started, `setup: the first takeover never recorded its start:\n${first.log().slice(-1500)}`);
+    const backups = () => (existsSync(join(m.user, "parachute-takeover")) ? readdirSync(join(m.user, "parachute-takeover")).length : 0);
+    const before = backups();
+    const second = await core(m, ["takeover", "--home", m.home, "--yes", "--json"]);
+    expect(second.code).toBe(7);
+    // Refused by the lock, before it reads anything (the record's pid check is only a second line).
+    expect(second.stderr).toContain("another takeover or rollback of");
+    expect(backups()).toBe(before);
+    const code = await first.proc.exited;
+    must(code === 0, `the first takeover exited ${code}: ${first.log().slice(-1200)}`);
+    expect(JSON.parse(readFileSync(join(m.home, "takeover.json"), "utf8")).state).toBe("taken-over");
+    expect(m.unit(HUB_UNIT)).toEqual({ active: false, enabled: false });
+  }, 240_000);
+
   test("takeover from a shell that still has the old box's settings (its port, origin and key source) checks v0.8 against itself and succeeds", async () => {
     // Found by lane E's walkthrough: a check run that took the shell's PARACHUTE_HUB_JWKS_ORIGIN fetched keys from
     // the old box's address, where nothing listens once it is paused, and every vault answered 401.
