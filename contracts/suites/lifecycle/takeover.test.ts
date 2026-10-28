@@ -33,6 +33,7 @@ import { rest } from "../lib.ts";
 import {
   OLD_UNITS,
   core,
+  dbHolders,
   fileHashes,
   findFiles,
   holders,
@@ -371,6 +372,58 @@ describe("takeover", () => {
     expect(readFileSync(opFile, "utf8")).toBe(`${renamed}\n`);
     expect(m.unit(HUB_UNIT)).toEqual({ active: false, enabled: false });
   }, 120_000);
+
+  test("a takeover cut off during its check run (an ssh drop) is put back and finished by running takeover again", async () => {
+    // Found by rehearsal/adam (lane H): cut off after pausing the old hub, a takeover left nothing serving the home,
+    // and running it again "succeeded" with no unit to hand over to and nothing for --rollback to put back.
+    const { m, s } = await oldMachine("tk-cut");
+    const run = m.spawn([requireCore(m.info), "takeover", "--home", m.home, "--yes", "--json"]);
+    const checking = await until(() => dbHolders(m.home).some((h) => h.cmd.includes("--listen")), 90_000, 50);
+    must(checking, `setup: the takeover's check run never opened the data:\n${run.log().slice(-1500)}`);
+    // The session drops: the takeover and its check run die together, mid-check.
+    const cut = [
+      ...readdirSync("/proc").filter((p) => /^\d+$/.test(p)).filter((p) => {
+        try {
+          const cmd = readFileSync(`/proc/${p}/cmdline`, "utf8");
+          return cmd.includes("takeover") && cmd.includes(m.home);
+        } catch {
+          return false;
+        }
+      }).map(Number),
+      ...dbHolders(m.home).filter((h) => h.cmd.includes("--listen")).map((h) => h.pid),
+    ];
+    for (const pid of cut) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {}
+    }
+    await run.stop("SIGKILL");
+    must(await until(() => dbHolders(m.home).length === 0, 15_000, 100), "setup: the cut-off check run still holds the data");
+    expect(m.unit(HUB_UNIT)).toEqual({ active: false, enabled: false }); // what the cut left: nothing serves the home
+    // What a cut-off check run's modules leave (rehearsal/adam: an orphaned scribe holding its port, so the next check
+    // run's scribe couldn't start): processes carrying the check run's mark. This home's are stopped; another's not.
+    const idle = [process.execPath, "-e", "Bun.listen({ hostname: '127.0.0.1', port: 0, socket: { data() {} } }); await Bun.sleep(600000)"];
+    const orphan = m.spawn(idle, { env: { PARACHUTE_TAKEOVER_CHECK: "1", PARACHUTE_HOME: m.home } });
+    const stranger = m.spawn(idle, { env: { PARACHUTE_TAKEOVER_CHECK: "1", PARACHUTE_HOME: join(m.user, "another-home") } });
+
+    const again = await core(m, ["takeover", "--home", m.home, "--yes", "--json"]);
+    must(again.code === 0, `takeover after the cut exited ${again.code}: ${again.stderr.slice(-800)}`);
+    expect(again.stderr).toContain("was interrupted");
+    expect(await until(() => orphan.proc.exitCode !== null, 10_000, 100)).toBe(true);
+    expect(stranger.proc.exitCode).toBeNull();
+    await stranger.stop();
+    const record = JSON.parse(readFileSync(join(m.home, "takeover.json"), "utf8"));
+    expect({ state: record.state, paused: record.paused.map((u: { name: string }) => u.name), core_unit: record.core_unit }).toEqual({ state: "taken-over", paused: [HUB_UNIT], core_unit: "parachute-core.service" });
+    const c = await coreUnit(m, s);
+    try {
+      expect((await readNotes(s.origin, s.vaultName, s.readPass)).status).toBe(200);
+    } finally {
+      await c.stop();
+    }
+    const back = await core(m, ["takeover", "--home", m.home, "--rollback", "--yes", "--json"]);
+    must(back.code === 0, `rollback after the finished takeover exited ${back.code}: ${back.stderr.slice(-600)}`);
+    expect(m.unit(HUB_UNIT)).toEqual({ active: true, enabled: true });
+  }, 240_000);
 
   test("takeover from a shell that still has the old box's settings (its port, origin and key source) checks v0.8 against itself and succeeds", async () => {
     // Found by lane E's walkthrough: a check run that took the shell's PARACHUTE_HUB_JWKS_ORIGIN fetched keys from
