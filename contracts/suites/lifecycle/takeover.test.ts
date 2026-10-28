@@ -232,9 +232,12 @@ describe("takeover", () => {
     must(held.length === 1, `setup: expected the old vault to hold vault.db, got ${JSON.stringify(held)}`);
     const pid = held[0]!.pid;
     const before = await snapshot(m, true);
+    const calls = m.systemctlCalls().length;
     const r = await core(m, ["takeover", "--home", m.home, "--yes", "--json"]);
     must(r.code === 7, `takeover while an old process holds the data exited ${r.code}, want 7: ${r.stderr.slice(-600)}`);
     expect(r.stdout + r.stderr).toMatch(new RegExp(`\\b${pid}\\b`));
+    // Refused before anything: no old unit was stopped or disabled (and started again) on the way.
+    expect(m.systemctlCalls().slice(calls).filter((c) => MUTATING.test(c))).toEqual([]);
     // Nothing changed: the home, the old install, the unit files, the units end as they were; no backup folder.
     expect(await snapshot(m, true)).toEqual(before);
     expect(existsSync(join(m.user, "parachute-takeover"))).toBe(false);
