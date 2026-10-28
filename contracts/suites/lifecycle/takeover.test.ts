@@ -24,7 +24,7 @@
 // parachute-hub.service runs the old programs on the home. The takeover pauses a unit only on evidence (its process
 // has this home's data open), and after a takeover the tests talk to the v0.8 parachute-core.service runs.
 import { afterEach, describe, expect, test } from "bun:test";
-import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
 import { decodeJwt, importPKCS8, SignJWT } from "jose";
@@ -499,10 +499,12 @@ describe("takeover", () => {
     const { m, s } = await oldMachine("tk-stuck");
     const run = m.spawn([requireCore(m.info), "takeover", "--home", m.home, "--yes", "--json"]);
     must(await until(() => dbHolders(m.home).some((h) => h.cmd.includes("--listen")), 90_000, 50), `setup: no check run:\n${run.log().slice(-1500)}`);
+    // Only this machine's: the takeover run on this home, and the check run holding this home's data.
+    const checkRuns = dbHolders(m.home).filter((h) => h.cmd.includes("--listen")).map((h) => h.pid);
     for (const p of readdirSync("/proc").filter((x) => /^\d+$/.test(x))) {
       try {
         const cmd = readFileSync(`/proc/${p}/cmdline`, "utf8");
-        if ((cmd.includes("takeover") && cmd.includes(m.home)) || cmd.includes("--listen")) process.kill(Number(p), "SIGKILL");
+        if ((cmd.includes("takeover") && cmd.includes(m.home)) || checkRuns.includes(Number(p))) process.kill(Number(p), "SIGKILL");
       } catch {}
     }
     await run.stop("SIGKILL");
@@ -524,6 +526,25 @@ describe("takeover", () => {
     expect(m.unit(HUB_UNIT)).toEqual({ active: true, enabled: true });
     await serving(m, s, HUB_UNIT);
   }, 400_000);
+
+  test("takeover and rollback through a link to the home act on the real folder and leave the link as it was", async () => {
+    // Codex's review of the rehearsal fixes (lane H): a restore through a link to the home would replace the link,
+    // and the old units, which name the real folder, would reopen the data the restore was meant to replace.
+    const { m, s } = await oldMachine("tk-homelink");
+    const link = join(m.user, "home-link");
+    symlinkSync(m.home, link);
+    const r = await core(m, ["takeover", "--home", link, "--yes", "--json"]);
+    must(r.code === 0, `takeover through a link to the home exited ${r.code}: ${r.stderr.slice(-600)}`);
+    const record = JSON.parse(readFileSync(join(m.home, "takeover.json"), "utf8"));
+    expect(record.home).toBe(realpathSync(m.home));
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
+    await (await coreUnit(m, s)).stop();
+    const back = await core(m, ["takeover", "--home", link, "--rollback", "--yes", "--json"]);
+    must(back.code === 0, `rollback through the link exited ${back.code}: ${back.stderr.slice(-600)}`);
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(readlinkSync(link)).toBe(m.home);
+    expect(m.unit(HUB_UNIT)).toEqual({ active: true, enabled: true });
+  }, 240_000);
 
   test("takeover from a shell that still has the old box's settings (its port, origin and key source) checks v0.8 against itself and succeeds", async () => {
     // Found by lane E's walkthrough: a check run that took the shell's PARACHUTE_HUB_JWKS_ORIGIN fetched keys from

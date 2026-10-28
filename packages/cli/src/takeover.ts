@@ -1566,12 +1566,9 @@ async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ ba
   const putBack = async (why: string): Promise<string> => {
     const errors = resumeUnits(paused);
     if (errors.length) return `${why}; putting the old units back also failed: ${errors.join("; ")}`;
-    // Only once the old units have the data open again is the run over; until then the record stays, for the next
-    // takeover or --rollback to finish putting them back.
-    const running = paused.filter((u) => u.active).map((u) => u.name);
-    if (running.length && !(await waitUntil(() => running.every((u) => heldBy(d.home, running).some((h) => h.unit === u)), 90_000, 500))) {
-      return `${why}; ${running.join(" and ")} started again but without this home's data open after 90 s, so the takeover record stays: run \`parachute-core takeover --rollback\` once ${running.length === 1 ? "it serves" : "they serve"} the home`;
-    }
+    // The old units ran moments ago and systemd has them again (enabled, started): this run is over. Whether they
+    // then serve is up to them (another program may have taken their port meanwhile; lifecycle/takeover's
+    // "can't serve" contract). A run cut off before this point is what the record is for.
     rmSync(join(d.home, RECORD_FILE), { force: true });
     return why;
   };
@@ -1794,7 +1791,12 @@ export async function takeover(args: string[]): Promise<number> {
       console.log(takeoverHelp());
       return EXIT.ok;
     }
-    const home = resolve(f.home ?? homeDir());
+    // The real folder, once, for everything from here: a restore through a link to the home would replace the link,
+    // and the old units, which name the real folder, would reopen the data the restore was meant to replace.
+    let home = resolve(f.home ?? homeDir());
+    try {
+      home = realpathSync(home);
+    } catch {}
     const out = (s: string) => (f.json ? console.error(s) : console.log(s));
     if (f.rollback) {
       if (!holdTakeoverLock(home)) throw new Exit(EXIT.held, `another takeover or rollback of ${tilde(home)} is running now; nothing was changed`);
