@@ -1,5 +1,5 @@
 {
-  "comment": "FAILs Benjamin's suite (harness/prism-compat.ts) reports on today's code, each with why and the lane that fixes it. Empty from slice 1 on (PLAN §6): the Nov 9 gate is 0 FAIL. E6 and the CLI issuer check pass from lane A1 on (fix 1's two lines in the moved hub); E6 also needs lsof on the machine to see the listeners, which CI installs.",
+  "comment": "FAILs Benjamin's suite (harness/prism-compat.ts) reports on today's code, each with why and the lane that fixes it. Empty from slice 1 on (PLAN §6): the Nov 9 gate is 0 FAIL. E6 and the CLI issuer check pass from lane A1 on (fix 1's two lines in the moved hub); E6 also needs lsof on the machine to see the listeners, which CI installs. E8 (file modes, fix 3) passes from lane B on (umask 077 for every command).",
   "fails": [
     {
       "check": "E2",
@@ -10,16 +10,6 @@
       "check": "isolation: Parachute files written to the children's HOME (outside PARACHUTE_HOME, E2)",
       "reason": "same as E2",
       "lane": "D"
-    },
-    {
-      "check": "E8",
-      "reason": "hub.db, WAL/SHM and vault.db are 0644, data dirs 0755 (fix 3)",
-      "lane": "B"
-    },
-    {
-      "check": "security: secret files 0600 in 0700 dirs (E8)",
-      "reason": "fix 3",
-      "lane": "B"
     }
   ]
 }

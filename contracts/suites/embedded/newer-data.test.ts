@@ -3,15 +3,16 @@
 // bytes and mode, and no file added or removed), embedded or not.
 // The newer home is made with today's CLI, then the schema marker both databases use (a `schema_version` table:
 // vault core/src/schema.ts:421,762, SCHEMA_VERSION 32; hub src/hub-db.ts:939-955, 24 migrations) gets one more
-// row, on the throwaway copy. Today nothing checks it: the vault re-stamps its own version and carries on.
-// The home is always compared, whatever the exit; today the box servers' red reasons name the exact files they add.
-// Lane B turns these green.
+// row, on the throwaway copy. Before lane B nothing checked it: the vault re-stamped its own version and carried on.
+// The home is always compared, whatever the exit.
+// Lane B made these green: every command (packages/cli/src/dispatch.ts) reads each database's schema stamp, without
+// opening it for writing, before it parses its own arguments, so the embedded cases hold before serve --embedded and
+// bootstrap exist (lanes C, E), and must keep holding once they do.
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 import { cli, freePort, newHome, start } from "../candidate-lib.ts";
-import { red } from "../lib.ts";
 import { diff, exitWithin, must, ports, snapshot, tail } from "./_lib.ts";
 
 const VAULT = "older";
@@ -63,9 +64,8 @@ describe("embedded/newer-data", () => {
     expect(raiseSchema(join(home, "hub.db"))).toBeGreaterThan(1);
   });
 
-  red(
+  test(
     "serve --embedded on a newer vault.db exits 6 and leaves the home byte-identical",
-    { reason: /^serve --embedded: exit 1, want 6: .*unexpected argument "--embedded"/s, lane: "B" },
     async () => {
       const home = await makeHome(true);
       raiseSchema(vaultDb(home));
@@ -74,9 +74,8 @@ describe("embedded/newer-data", () => {
     },
   );
 
-  red(
+  test(
     "bootstrap --embedded on a newer vault.db exits 6 and leaves the home byte-identical",
-    { reason: /^bootstrap --embedded: exit 1, want 6: .*unknown command "bootstrap"/s, lane: "B" },
     async () => {
       const home = await makeHome(true);
       raiseSchema(vaultDb(home));
@@ -84,9 +83,8 @@ describe("embedded/newer-data", () => {
     },
   );
 
-  red(
+  test(
     "serve --embedded on a newer hub.db exits 6 and leaves the home byte-identical",
-    { reason: /^serve --embedded: exit 1, want 6: .*unexpected argument "--embedded"/s, lane: "B" },
     async () => {
       const home = await makeHome(true);
       raiseSchema(join(home, "hub.db"));
@@ -95,11 +93,9 @@ describe("embedded/newer-data", () => {
     },
   );
 
-  red(
+  // Before lane B the vault carried on serving the newer vault.db and wrote its WAL files.
+  test(
     "box: parachute-vault serve on a newer vault.db exits 6 and leaves the home byte-identical",
-    // Today the vault carries on serving the newer vault.db and writes to it; that exact change (its WAL files, and
-    // nothing else) is the known failure. Any other change, or another exit, is red for the wrong reason.
-    { reason: /^parachute-vault serve: the home changed \(still running after 20 s\): \+ vault\/data\/older\/vault\.db-shm, \+ vault\/data\/older\/vault\.db-wal$/, lane: "B" },
     async () => {
       const home = await makeHome(true);
       raiseSchema(vaultDb(home));
@@ -107,11 +103,9 @@ describe("embedded/newer-data", () => {
     },
   );
 
-  red(
+  // Before lane B the hub carried on serving the newer hub.db and wrote hub-instance.json, its WAL and well-known/.
+  test(
     "box: parachute serve on a newer hub.db exits 6 and leaves the home byte-identical",
-    // Today the hub carries on serving the newer hub.db and writes to the home; that exact set of changes is the
-    // known failure. Any other change (hub.db itself rewritten, say), or another exit, is red for the wrong reason.
-    { reason: /^parachute serve: the home changed \(still running after 20 s\): \+ hub-instance\.json, \+ hub\.db-shm, \+ hub\.db-wal, \+ well-known, \+ well-known\/hub\.html$/, lane: "B" },
     async () => {
       const home = await makeHome(false); // no vault row, so the hub supervises nothing
       raiseSchema(join(home, "hub.db"));

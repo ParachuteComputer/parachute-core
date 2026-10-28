@@ -13,9 +13,19 @@
 // Lane A1 moves the code in and keeps the vault a child process: `serve` is still the hub's, and the hub starts its
 // vault as `parachute-vault serve`. bin/ puts itself first on PATH (bin/parachute-core), so that child is this
 // install's own vault, never an older `parachute-vault` found on PATH (PLAN §2.1).
+//
+// Before any command runs, under every name (lane B, PLAN §3, fixes 3 and 4):
+//   - the umask is 077, so every folder this program (or a child it starts) creates is 0700 and every file 0600,
+//     the databases' -wal and -shm included;
+//   - a home with a database newer than this program is refused with exit 6, before anything opens it, so the home
+//     is byte-identical afterwards. `version` and `--help` still answer;
+//   - `serve --embedded` puts back loosened modes, and `serve --embedded` or `serve --offline` runs offline:
+//     PARACHUTE_OFFLINE=1 for this process and every child (no registry lookup, Buzz poller, model download,
+//     outbound webhook or mirror push).
 import { fileURLToPath } from "node:url";
 import { SCHEMA_VERSION } from "@openparachute/vault/core/src/schema.ts";
 import core from "../../../package.json" with { type: "json" };
+import { homeDir, newerData, repairModes } from "./home.ts";
 
 export type Role = "core" | "hub" | "vault";
 
@@ -51,13 +61,38 @@ export function route(role: Role, argv: string[]): { print: string } | { cli: "h
   return { cli, argv: args };
 }
 
+/** Exit code for a home with data newer than this program (PLAN §3: 6, data newer than this binary). */
+export const EXIT_NEWER_DATA = 6;
+
+const isHelp = (argv: string[]) => argv.length === 0 || argv.some((a) => a === "help" || a === "--help" || a === "-h");
+
 /** Run as `role` with this process's arguments. The moved CLIs run in this process, as if started directly. */
 export async function dispatch(role: Role): Promise<void> {
+  process.umask(0o077);
   const argv = process.argv.slice(2);
   const r = route(role, argv);
   if ("print" in r) {
     console.log(r.print);
     return;
+  }
+  const home = homeDir();
+  if (!isHelp(r.argv)) {
+    const { HUB_SCHEMA_VERSION } = await import("@openparachute/hub/src/hub-db.ts");
+    const newer = newerData(home, { hub: HUB_SCHEMA_VERSION, vault: SCHEMA_VERSION });
+    if (newer.length > 0) {
+      const name = role === "core" ? "parachute-core" : role === "hub" ? "parachute" : "parachute-vault";
+      console.error(`${name}: this home was written by a newer Parachute (${core.name} ${core.version} here):`);
+      for (const line of newer) console.error(`  ${line}`);
+      console.error("Nothing was opened or changed. Run the newer version, or restore a backup made for this one.");
+      process.exit(EXIT_NEWER_DATA);
+    }
+  }
+  if (r.cli === "hub" && r.argv[0] === "serve") {
+    const embedded = r.argv.includes("--embedded");
+    if (embedded || r.argv.includes("--offline")) process.env.PARACHUTE_OFFLINE = "1";
+    // The hub's `serve` takes no --offline of its own: it reads PARACHUTE_OFFLINE.
+    r.argv = r.argv.filter((a) => a !== "--offline");
+    if (embedded) for (const line of repairModes(home)) console.error(`parachute: mode repaired: ${line}`);
   }
   if (role === "core" && r.cli === "hub" && (argv.length === 0 || ["help", "--help", "-h"].includes(argv[0]!))) {
     console.log(coreHelp());

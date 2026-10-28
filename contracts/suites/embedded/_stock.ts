@@ -28,13 +28,19 @@ export interface StockBox {
   log(): string;
 }
 
-/** `parachute serve` on a random port with the admin seeded from the environment; waits for the vault route. */
-export async function serveBox(info: CandidateInfo, home: string, vaultName: string, env: Record<string, string> = {}): Promise<StockBox> {
+/** `parachute serve [args]` on a random port with the admin seeded from the environment; waits for the vault route. */
+export async function serveBox(
+  info: CandidateInfo,
+  home: string,
+  vaultName: string,
+  env: Record<string, string> = {},
+  args: string[] = [],
+): Promise<StockBox> {
   const port = Number(env.PORT ?? (await freePort()));
   const hub = `http://127.0.0.1:${port}`;
   allowOrigins(hub);
   const logPath = `${dirname(home)}/box-${Date.now()}.log`;
-  const proc = Bun.spawn([info.bin, "serve"], {
+  const proc = Bun.spawn([info.bin, "serve", ...args], {
     env: candidateEnv(info, home, {
       PORT: String(port),
       PARACHUTE_BIND_HOST: "127.0.0.1",

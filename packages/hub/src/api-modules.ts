@@ -79,6 +79,7 @@ import {
   readManifestLenient,
 } from "./services-manifest.ts";
 import type { ModuleStartError, ModuleState, Supervisor } from "./supervisor.ts";
+import { isOffline } from "./offline.ts";
 
 /**
  * Resolve a known module to the display + install bootstrap data the admin SPA
@@ -440,6 +441,8 @@ export async function defaultFetchLatestVersion(
     // showed "rc.4 available" while @rc was actually rc.13).
     // encodeURIComponent handles scoped packages: @openparachute/vault →
     // %40openparachute%2Fvault. npm resolves the encoded form correctly.
+    // Offline (embedded, or serve --offline): no registry lookup; the page shows no newer version.
+    if (isOffline()) return null;
     const url = `https://registry.npmjs.org/-/package/${encodeURIComponent(pkg)}/dist-tags`;
     const res = await fetch(url, { signal: controller.signal });
     if (!res.ok) return null;

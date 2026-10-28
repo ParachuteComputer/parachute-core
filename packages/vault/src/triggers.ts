@@ -36,6 +36,7 @@ import type { StoredTrigger } from "../core/src/triggers-store.ts";
 import { getVaultNameForStore } from "./vault-store.ts";
 import { assetsDir } from "./routes.ts";
 import { appendContextPart, fetchContextEntries, type ContextPayload } from "./context.ts";
+import { outboundAllowed } from "./offline.ts";
 
 const DEFAULT_TIMEOUT = 60_000;
 
@@ -400,6 +401,13 @@ export function registerTriggers(
 
         // Handler-side re-check (same race-window protection as the old hooks)
         if (existingMeta[pendingKey] || existingMeta[renderedKey]) return;
+
+        // Offline: a webhook off the machine is not called, and the note is left unclaimed so it fires once the
+        // vault runs online again.
+        if (!outboundAllowed(trigger.action.webhook)) {
+          logger.error(`[trigger:${trigger.name}] offline: not calling ${new URL(trigger.action.webhook).origin} for note ${note.id}`);
+          return;
+        }
 
         const pendingAt = new Date().toISOString();
 

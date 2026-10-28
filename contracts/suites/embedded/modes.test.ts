@@ -2,7 +2,9 @@
 // under the home is 0700 and every file 0600, the databases' -wal and -shm included, under an ordinary umask (022),
 // after serve, bootstrap, vault create and a write; and modes loosened while it was stopped are repaired on open.
 // Benjamin's suite checks secrets only; the plan says every file, so this checks every file.
-// Today the CLIs create the databases and folders with the umask's 0644/0755. Lane B turns these green.
+// Before lane B the CLIs created the databases and folders with the umask's 0644/0755. Lane B made the box case green
+// (umask 077 for every command, packages/cli/src/dispatch.ts) and repairs modes when serve --embedded starts; the
+// embedded cases are red until lane C's serve --embedded and lane E's bootstrap exist.
 import { describe, expect, test } from "bun:test";
 import { chmodSync, readdirSync } from "node:fs";
 import { join } from "node:path";
@@ -19,9 +21,8 @@ describe("embedded/modes", () => {
     expect([...snapshot(home).keys()]).toContain("hub.db");
   });
 
-  red(
+  test(
     "box: what the CLI creates (set-password, rotate-operator, vault create) is 0600 in 0700 folders",
-    { reason: /mode problems: .*(0644|0755)/, lane: "B" },
     async () => {
       const home = newHome("modes");
       must((await cli(home, ["auth", "set-password", "--username", "owner", "--password", `pw-${randomBytes(12).toString("hex")}`])).code === 0, "setup: set-password failed");
@@ -34,7 +35,7 @@ describe("embedded/modes", () => {
 
   red(
     "embedded: after serve, bootstrap, vault create and a write, every folder is 0700 and every file 0600, -wal and -shm included",
-    { reason: NO_EMBEDDED, lane: "B" },
+    { reason: NO_EMBEDDED, lane: "C, E (B's part is in)" },
     async () => {
       const home = newHome("modes");
       const e = await embeddedHome(home);
@@ -60,7 +61,7 @@ describe("embedded/modes", () => {
     },
   );
 
-  red("embedded: modes loosened while stopped are repaired on the next start", { reason: NO_EMBEDDED, lane: "B" }, async () => {
+  red("embedded: modes loosened while stopped are repaired on the next start", { reason: NO_EMBEDDED, lane: "C, E (B's part is in)" }, async () => {
     const home = newHome("modes");
     const first = await embeddedHome(home);
     await first.stop();

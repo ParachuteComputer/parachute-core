@@ -719,7 +719,11 @@ export function serveHelp(): string {
   return `parachute serve — run the hub + supervisor foregrounded (the runtime)
 
 Usage:
-  parachute serve
+  parachute serve [--offline]
+
+  --offline   reach nothing off this machine on its own: no registry lookup,
+              Buzz poller, model download, outbound webhook or mirror push
+              (sets PARACHUTE_OFFLINE=1 for the hub and every module it starts)
 
 This is the one runtime everywhere. The hub IS the foreground process: it
 runs the HTTP server on port 1939 AND an in-process supervisor that spawns

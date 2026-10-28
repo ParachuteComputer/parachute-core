@@ -14,6 +14,7 @@
  */
 
 import { ensureGitAvailable } from "./git-preflight.ts";
+import { isOffline } from "./offline.ts";
 
 // ---------------------------------------------------------------------------
 // Commit message templating
@@ -141,6 +142,8 @@ export async function gitCommit(
 export async function gitPush(
   repoDir: string,
 ): Promise<{ ok: boolean; stderr: string }> {
+  // Offline: no push; the commits wait in the mirror for the next push online.
+  if (isOffline()) return { ok: false, stderr: "offline (PARACHUTE_OFFLINE): push skipped" };
   // Resolve the current branch name. `git rev-parse --abbrev-ref HEAD`
   // returns the branch on a checked-out branch (e.g. "main"); on a
   // detached HEAD it returns "HEAD" — in that case we bail to bare push

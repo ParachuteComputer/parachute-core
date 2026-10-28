@@ -42,6 +42,8 @@ jobs:
           bun run --cwd packages/cli typecheck
           bun run --cwd packages/vault typecheck
           bun run --cwd packages/hub typecheck
+      - name: the cli's own tests
+        run: bun test ./packages/cli
       - name: the vault's own tests
         working-directory: packages/vault
         run: |

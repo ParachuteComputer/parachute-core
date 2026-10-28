@@ -6,6 +6,8 @@ import { join } from "node:path";
 import {
   GRANT_ATTRIBUTION_MIGRATION,
   HUB_DB_BUSY_TIMEOUT_MS,
+  HUB_SCHEMA_VERSION,
+  NewerHubSchemaError,
   hubDbPath,
   migrate,
   openHubDb,
@@ -27,6 +29,27 @@ function makeHarness(): Harness {
 }
 
 describe("openHubDb + migrate", () => {
+  test("refuses a hub.db a newer hub wrote, and adds nothing to it (PLAN §3, fix 4)", () => {
+    const h = makeHarness();
+    try {
+      openHubDb(h.dbPath).close();
+      const raw = new Database(h.dbPath);
+      raw.run("INSERT INTO schema_version (version, applied_at) VALUES (?, ?)", [
+        HUB_SCHEMA_VERSION + 1,
+        new Date().toISOString(),
+      ]);
+      const count = () =>
+        (raw.query("SELECT COUNT(*) AS n FROM schema_version").get() as { n: number }).n;
+      const before = count();
+      expect(() => openHubDb(h.dbPath)).toThrow(NewerHubSchemaError);
+      expect(() => migrate(raw)).toThrow(`schema ${HUB_SCHEMA_VERSION + 1}`);
+      expect(count()).toBe(before);
+      raw.close();
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("creates schema_version + signing_keys on a fresh db", () => {
     const h = makeHarness();
     try {
