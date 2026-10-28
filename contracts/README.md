@@ -70,12 +70,14 @@ changes. So v0.8's suites run against **the candidate**: a built `parachute`, la
   sha256 of every other file). `bun run build:core` builds this repo's workspace that way, with profile `v0.8`:
   `bin/parachute-core` and its two aliases, `lib/` (the workspace, installed from the root `bun.lock`) and a
   `package.json` naming `@openparachute/core`. It is what `bun run candidate` and `prism-compat` run by default.
+  Its `serve` runs the vault inside its own process (lane A2, `packages/cli/src/serve.ts`); `--process-model child`
+  builds the fallback, where the hub starts the vault as a child, until the Nov 3 decision (PLAN §2.1).
   `bun run build:stock` builds today's hub and vault from `pins.json` into the same layout (profile `stock-0.7`);
   the suites that need the old programs (takeover, identity, rollback) find it in `.cache/candidate-stock`, or at
   `OLD_STOCK_DIR`.
 - **`bun run candidate`** (`harness/run-candidate.ts`) refuses a candidate whose bytes don't match its manifest, or
   `CANDIDATE_SHA256` (CI passes the hash its build step produced). Then it starts a box: `parachute-vault create`, then
-  `parachute serve` on a random port with the hub supervising its vault. An admin pass is minted with the real CLI.
+  `parachute serve` on a random port (with its vault inside, or supervised as a child on the child path). An admin pass is minted with the real CLI.
   It checks that every listening socket belongs to a process started from the candidate folder. It prints the hash,
   the source, the process model (as built and as seen) and any workaround, and hashes the candidate again after the
   run. The stock profile needs two workarounds, both fix 1, printed every run: it writes `hub/run/hub.port`, and it sets
