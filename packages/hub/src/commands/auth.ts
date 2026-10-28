@@ -151,6 +151,7 @@ Usage:
                                             [--ephemeral | --expires-in <seconds>]
                                             [--label <label>] [--user <username|id>]
                                             [--service <name>] [--permissions <json>]
+                                            [--json]
                                        Mint a scope-narrow JWT. Person-mint
                                        JWT sub is the hub account id (stdout =
                                        JWT). --label is the display label
@@ -161,13 +162,16 @@ Usage:
                                        when the value matches an account).
                                        --ephemeral = short-lived (1h); default
                                        lifetime is 90d. --ttl is the deprecated
-                                       lifetime alias.
-  parachute auth revoke-token <jti>    Mark a registry-row token revoked
+                                       lifetime alias. --json prints
+                                       {token, jti, exp, scopes, aud}.
+  parachute auth revoke-token <jti> [--break-glass] [--json]
+                                       Mark a registry-row token revoked
                                        by jti. Idempotent: a re-revoke
                                        prints the existing revoked_at and
                                        exits 0. Refuses the live
                                        operator.token jti unless
-                                       --break-glass is passed.
+                                       --break-glass is passed. --json
+                                       prints {revoked: true, jti}.
   parachute auth pending-clients       List OAuth clients awaiting approval
   parachute auth approve-client <id>   Approve a pending OAuth client
   parachute auth revoke-client <id>    Deregister (delete) an OAuth client,
@@ -1026,6 +1030,8 @@ interface MintTokenFlags {
   ttlDeprecationSeen?: boolean;
   /** --ephemeral: short-lived token (EPHEMERAL_TTL_SECONDS), the scripting default. */
   ephemeral?: boolean;
+  /** --json: print {token, jti, exp, scopes, aud} instead of the bare JWT (PLAN §3, Benjamin's E5). */
+  json?: boolean;
   error?: string;
 }
 
@@ -1041,6 +1047,7 @@ function parseMintTokenFlags(args: readonly string[]): MintTokenFlags {
   let permissions: string | undefined;
   let ttlDeprecationSeen = false;
   let ephemeral = false;
+  let json = false;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === "--scope") {
@@ -1110,6 +1117,8 @@ function parseMintTokenFlags(args: readonly string[]): MintTokenFlags {
       if (!permissions) return { error: "--permissions requires a value" };
     } else if (a === "--ephemeral") {
       ephemeral = true;
+    } else if (a === "--json") {
+      json = true;
     } else {
       return { error: `unknown flag "${a}"` };
     }
@@ -1143,6 +1152,7 @@ function parseMintTokenFlags(args: readonly string[]): MintTokenFlags {
     permissions,
     ttlDeprecationSeen,
     ephemeral,
+    json,
   };
 }
 
@@ -1206,7 +1216,7 @@ async function runMintToken(args: readonly string[], deps: AuthDeps): Promise<nu
   if (!flags.scope) {
     console.error("parachute auth mint-token: --scope is required");
     console.error(
-      "usage: parachute auth mint-token --scope <scope> [--aud <aud>] [--ephemeral | --expires-in <seconds>] [--label <label>] [--user <username|id>] [--service <name>] [--permissions <json>]",
+      "usage: parachute auth mint-token --scope <scope> [--aud <aud>] [--ephemeral | --expires-in <seconds>] [--label <label>] [--user <username|id>] [--service <name>] [--permissions <json>] [--json]",
     );
     return 1;
   }
@@ -1446,7 +1456,13 @@ async function runMintToken(args: readonly string[], deps: AuthDeps): Promise<nu
       throw err;
     }
 
-    console.log(minted.token);
+    if (flags.json) {
+      // exp as epoch seconds, the token's own claim (Prism's parseMintedToken reads it so).
+      const exp = Math.floor(Date.parse(minted.expiresAt) / 1000);
+      console.log(JSON.stringify({ token: minted.token, jti: minted.jti, exp, scopes, aud: audience }));
+    } else {
+      console.log(minted.token);
+    }
     return 0;
   } finally {
     db.close();
@@ -1482,29 +1498,34 @@ function appendHubAuditLine(configDir: string, line: string): void {
 }
 
 /**
- * `--break-glass` — the ONLY flag `revoke-token` accepts. It waives the
- * live-operator-token guard (hub#931) and nothing else; every other check
- * (scope gate, row existence, idempotency) still runs.
+ * `--break-glass` waives the live-operator-token guard (hub#931) and nothing
+ * else; every other check (scope gate, row existence, idempotency) still runs.
+ * `--json` prints `{revoked: true, jti}` on stdout instead of the human line
+ * (PLAN §3, Benjamin's E5). Those are the only two flags.
  */
 const REVOKE_TOKEN_BREAK_GLASS_FLAG = "--break-glass";
+const REVOKE_TOKEN_JSON_FLAG = "--json";
 
 async function runRevokeToken(args: readonly string[], deps: AuthDeps): Promise<number> {
-  // Single positional: the jti. One flag: --break-glass. (If we grow more —
-  // say, --reason for an audit string — they can join here without
-  // disrupting the positional contract.)
+  // Single positional: the jti. Two flags: --break-glass and --json. (If we
+  // grow more — say, --reason for an audit string — they can join here
+  // without disrupting the positional contract.)
   const positionals = args.filter((a) => !a.startsWith("--"));
   const flags = args.filter((a) => a.startsWith("--"));
   const breakGlass = flags.includes(REVOKE_TOKEN_BREAK_GLASS_FLAG);
-  const unknownFlags = flags.filter((f) => f !== REVOKE_TOKEN_BREAK_GLASS_FLAG);
+  const json = flags.includes(REVOKE_TOKEN_JSON_FLAG);
+  const unknownFlags = flags.filter(
+    (f) => f !== REVOKE_TOKEN_BREAK_GLASS_FLAG && f !== REVOKE_TOKEN_JSON_FLAG,
+  );
   if (unknownFlags.length > 0) {
     console.error(
-      `parachute auth revoke-token: unexpected flag "${unknownFlags[0]}" (this command takes a jti positional and ${REVOKE_TOKEN_BREAK_GLASS_FLAG})`,
+      `parachute auth revoke-token: unexpected flag "${unknownFlags[0]}" (this command takes a jti positional, ${REVOKE_TOKEN_BREAK_GLASS_FLAG} and ${REVOKE_TOKEN_JSON_FLAG})`,
     );
     return 1;
   }
   if (positionals.length === 0) {
     console.error("parachute auth revoke-token: missing jti argument");
-    console.error("usage: parachute auth revoke-token <jti> [--break-glass]");
+    console.error("usage: parachute auth revoke-token <jti> [--break-glass] [--json]");
     return 1;
   }
   if (positionals.length > 1) {
@@ -1575,7 +1596,11 @@ async function runRevokeToken(args: readonly string[], deps: AuthDeps): Promise<
       // Idempotent re-revoke. Surface the existing timestamp so an operator
       // who's not sure whether the previous attempt landed gets a clear
       // confirmation it did.
-      console.log(`already revoked at ${row.revokedAt}: jti=${jti}`);
+      if (json) {
+        console.log(JSON.stringify({ revoked: true, jti, revoked_at: row.revokedAt, already_revoked: true }));
+      } else {
+        console.log(`already revoked at ${row.revokedAt}: jti=${jti}`);
+      }
       return 0;
     }
     // Live-operator-token guard (hub#931). The jti sitting in
@@ -1616,9 +1641,13 @@ async function runRevokeToken(args: readonly string[], deps: AuthDeps): Promise<
     // `subject` column is NULL; calling that field "subject" in the
     // output would mislabel the UUID for any operator grepping on it.
     // `identity=` matches what the helper returns regardless of row type.
-    console.log(
-      `revoked: jti=${jti}, identity=${tokenRowIdentity(row)}, scope=${row.scopes.join(" ") || "(none)"}, revoked_by=${actor.by}`,
-    );
+    if (json) {
+      console.log(JSON.stringify({ revoked: true, jti }));
+    } else {
+      console.log(
+        `revoked: jti=${jti}, identity=${tokenRowIdentity(row)}, scope=${row.scopes.join(" ") || "(none)"}, revoked_by=${actor.by}`,
+      );
+    }
     // Audit line in the same `key=value` shape the HTTP path emits, appended
     // to hub.log so "who revoked this" is greppable in ONE place regardless
     // of which surface did it (hub#931 — the CLI path previously left no
