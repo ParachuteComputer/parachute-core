@@ -30,7 +30,8 @@
 //
 // Lane C: `serve --embedded` is core's own (embedded.ts), after those checks on the home it names (--home, else
 // PARACHUTE_HOME). Lane E: so is `bootstrap --embedded` (bootstrap.ts), the host's one-step setup, behind the same
-// checks on the home it names. While it holds a home, the commands that install, upgrade, expose, migrate or drive modules
+// checks on the home it names. `parachute-core takeover` (takeover.ts) moves a home the old programs keep onto v0.8,
+// and a box `serve` on such a home refuses with exit 7 until it has. While it holds a home, the commands that install, upgrade, expose, migrate or drive modules
 // are refused with managed_by_host, exit 2 (managed.ts, PLAN §3).
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -57,6 +58,7 @@ function coreHelp(): string {
     "  parachute-core vault <command>    the vault's commands (what `parachute-vault <command>` was)",
     "  parachute-core install [--prefix <dir>]   install this bundle for you (default ~/.local/share/parachute-core)",
     "  parachute-core bootstrap --embedded …     set up a host-managed home in one step (see `bootstrap --help`)",
+    "  parachute-core takeover [--dry-run]       move a home the old hub and vault (0.7) keep onto v0.8",
     "  parachute-core <command>          the hub's commands (what `parachute <command>` was): serve, auth, …",
     "",
     "The hub's commands, for reference:",
@@ -68,8 +70,9 @@ function coreHelp(): string {
 export function route(
   role: Role,
   argv: string[],
-): { print: string } | { install: string[] } | { embedded: string[] } | { bootstrap: string[] } | { cli: "hub" | "vault"; argv: string[] } {
+): { print: string } | { install: string[] } | { embedded: string[] } | { bootstrap: string[] } | { takeover: string[] } | { cli: "hub" | "vault"; argv: string[] } {
   if (role === "core" && argv[0] === "install") return { install: argv.slice(1) };
+  if (role === "core" && argv[0] === "takeover") return { takeover: argv.slice(1) };
   const cli = role === "vault" || (role === "core" && argv[0] === "vault") ? "vault" : "hub";
   const args = role === "core" && argv[0] === "vault" ? argv.slice(1) : argv;
   const [cmd, ...rest] = args;
@@ -84,6 +87,8 @@ export function route(
 /** Exit codes (PLAN §3): 6, data newer than this binary; 5, a home that can't be used (here: can't be checked). */
 export const EXIT_NEWER_DATA = 6;
 export const EXIT_HOME_UNUSABLE = 5;
+/** Exit 7 (PLAN §8.0): the old programs still own the home; run `parachute-core takeover`. */
+export const EXIT_OLD_PROGRAMS = 7;
 
 
 /**
@@ -139,10 +144,11 @@ export async function dispatch(role: Role): Promise<void> {
   const embeddedArgs = "embedded" in r ? r.embedded : undefined;
   const bootstrapArgs = "bootstrap" in r ? r.bootstrap : undefined;
   const hostArgs = embeddedArgs ?? bootstrapArgs;
-  if (hostArgs) {
-    const flag = homeFlag(hostArgs);
+  const takeoverArgs = "takeover" in r ? r.takeover : undefined;
+  if (hostArgs || takeoverArgs) {
+    const flag = homeFlag(hostArgs ?? takeoverArgs!);
     if (flag.twice) {
-      console.error(`parachute ${embeddedArgs ? "serve --embedded" : "bootstrap"}: --home given twice`);
+      console.error(`parachute ${embeddedArgs ? "serve --embedded" : bootstrapArgs ? "bootstrap" : "takeover"}: --home given twice`);
       process.exit(2);
     }
     if (flag.home) process.env.PARACHUTE_HOME = resolve(flag.home);
@@ -181,6 +187,10 @@ export async function dispatch(role: Role): Promise<void> {
     const { bootstrap } = await import("./bootstrap.ts");
     process.exit(await bootstrap(bootstrapArgs));
   }
+  if (takeoverArgs) {
+    const { takeover } = await import("./takeover.ts");
+    process.exit(await takeover(takeoverArgs));
+  }
   if (!("cli" in r)) return;
   const refusal = managedRefusal(r.cli, r.argv);
   if (refusal) {
@@ -188,6 +198,18 @@ export async function dispatch(role: Role): Promise<void> {
     process.exit(2);
   }
   if (r.cli === "vault" && r.argv[0] === "serve") stopWithEmbeddedParent();
+  // Lane E (PLAN §8.0): a box serve (the hub's, or the vault's on its own) on a home the old 0.7 programs still own
+  // refuses with exit 7 and points at `parachute-core takeover`, before it opens anything. The vault child of a
+  // `serve --embedded` is the host's (embedded homes are adopted in place, PLAN §3).
+  const serving = r.argv[0] === "serve" && !["--help", "-h"].includes(r.argv[1] ?? "");
+  if (serving && (r.cli === "hub" || process.env.PARACHUTE_EMBEDDED_PARENT === undefined)) {
+    const { serveRefusal } = await import("./takeover.ts");
+    const refused = serveRefusal(home);
+    if (refused) {
+      console.error(refused);
+      process.exit(EXIT_OLD_PROGRAMS);
+    }
+  }
   if (r.cli === "hub" && r.argv[0] === "serve") {
     if (r.argv.includes("--offline")) process.env.PARACHUTE_OFFLINE = "1";
     // The hub's `serve` takes no --offline of its own: it reads PARACHUTE_OFFLINE.
