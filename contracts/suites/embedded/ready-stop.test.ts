@@ -5,7 +5,7 @@
 //   - nothing is written outside the home: the throwaway user HOME has no new entry afterwards, Bun's transpiler
 //     cache included (today's stock run writes .bun/install/cache into $HOME, one of the 3 FAILs in Benjamin's suite).
 // Today there is no embedded mode, and /api/ready is true before any module has started (hub src/api-ready.ts).
-// Lane C turns these green. The box E2 case is green from lane D's bundle on.
+// Green since lane C (packages/cli/src/embedded.ts); the E2 cases (nothing outside the home) from lane D's bundle on.
 import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -13,7 +13,7 @@ import { randomBytes } from "node:crypto";
 import { candidateEnv } from "../../harness/candidate.ts";
 import { candidate, cli, listeners, listeningProcesses, newHome, safeFetch, until } from "../candidate-lib.ts";
 import { red, services } from "../lib.ts";
-import { NO_EMBEDDED, embeddedHome, exitWithin, exited, mint, must, ports, readyJson, serveEmbedded, snapshot, tail } from "./_lib.ts";
+import { servedHome, exitWithin, exited, mintJwt, must, ports, readyJson, serveEmbedded, snapshot, tail } from "./_lib.ts";
 
 const closed = (...ps: number[]) => !listeners().some((l) => ps.some((p) => l.endsWith(`:${p}`)));
 
@@ -29,7 +29,7 @@ describe("embedded/ready-stop", () => {
     expect((await safeFetch(`${services().hub}/api/ready`)).status).toBe(200);
   });
 
-  red("/api/ready is 200 only once the vault answers, and ready.json exists by then", { reason: NO_EMBEDDED, lane: "C" }, async () => {
+  test("/api/ready is 200 only once the vault answers, and ready.json exists by then", async () => {
     const e = await serveEmbedded(newHome("ready"), { ready: false });
     try {
       let ready = false;
@@ -48,8 +48,8 @@ describe("embedded/ready-stop", () => {
     }
   });
 
-  red("SIGTERM: exit 0 within 10 s, ready.json removed, both ports closed", { reason: NO_EMBEDDED, lane: "C" }, async () => {
-    const e = await embeddedHome(newHome("stop"));
+  test("SIGTERM: exit 0 within 10 s, ready.json removed, both ports closed", async () => {
+    const e = await servedHome(newHome("stop"));
     const t0 = Date.now();
     const code = await e.stop("SIGTERM", 15_000);
     const ms = Date.now() - t0;
@@ -58,7 +58,56 @@ describe("embedded/ready-stop", () => {
     must(closed(e.hubPort, e.vaultPort), `still listening: ${listeners().join(" ")}`);
   });
 
-  red("it exits when the pid given by --parent-pid dies", { reason: NO_EMBEDDED, lane: "C" }, async () => {
+  test("SIGKILL: its vault does not outlive it (the vault port closes within 10 s)", async () => {
+    const e = await serveEmbedded(newHome("kill"));
+    e.proc.kill("SIGKILL");
+    await e.proc.exited;
+    const gone = await until(() => closed(e.vaultPort), 10_000, 100);
+    // If the vault outlived it, end it here (only the process holding this home's vault port).
+    for (const p of listeningProcesses()) if (p.listens.some((l) => l.endsWith(`:${e.vaultPort}`))) process.kill(p.pid, "SIGKILL");
+    must(gone, `the vault still listens on ${e.vaultPort} 10 s after serve --embedded was SIGKILLed`);
+  });
+
+  test("SIGTERM during start-up: exit 0 within 10 s, never ready afterwards, ready.json absent, both ports closed", async () => {
+    const e = await serveEmbedded(newHome("early"), { ready: false });
+    // As soon as the hub listens (its vault is still starting), stop it.
+    must(await until(() => exited(e) || listeners().includes(`127.0.0.1:${e.hubPort}`), 45_000, 10), "the hub never listened");
+    must(!exited(e), `serve --embedded exited ${e.proc.exitCode} before the test could stop it: ${tail(e.log())}`);
+    const t0 = Date.now();
+    const code = await e.stop("SIGTERM", 15_000);
+    const ms = Date.now() - t0;
+    must(code === 0 && ms <= 10_000, `SIGTERM during start-up: exit ${code} after ${ms} ms, want 0 within 10 s: ${tail(e.log())}`);
+    must(!existsSync(join(e.home, "run", "ready.json")), "run/ready.json exists after a stop during start-up");
+    must(closed(e.hubPort, e.vaultPort), `still listening: ${listeners().join(" ")}`);
+  });
+
+  test("--parent-pid naming a process already gone: it exits without binding a port", async () => {
+    const gone = Bun.spawn(["true"]);
+    await gone.exited;
+    const e = await serveEmbedded(newHome("parent"), { ready: false, args: ["--parent-pid", String(gone.pid)] });
+    let bound = false;
+    const done = await until(() => {
+      if (listeners().some((l) => l.endsWith(`:${e.hubPort}`) || l.endsWith(`:${e.vaultPort}`))) bound = true;
+      return exited(e);
+    }, 20_000, 20);
+    await e.stop("SIGKILL", 2000);
+    must(done, "still running 20 s after starting with a dead --parent-pid");
+    must(!bound, "it bound a port although its parent was already gone");
+  });
+
+  test("its vault dies after ready: serve stops with exit 75, ready.json removed, the hub's port closed", async () => {
+    const e = await serveEmbedded(newHome("vaultdies"));
+    const vault = listeningProcesses().find((p) => p.listens.includes(`127.0.0.1:${e.vaultPort}`));
+    must(vault, `setup: no process listens on the vault port ${e.vaultPort}`);
+    process.kill(vault.pid, "SIGKILL");
+    const code = await exitWithin(e, 20_000);
+    await e.stop("SIGKILL", 2000);
+    must(code === 75, `after its vault died: exit ${code}, want 75: ${tail(e.log())}`);
+    must(!existsSync(join(e.home, "run", "ready.json")), "run/ready.json still there after its vault died");
+    must(closed(e.hubPort), `the hub still listens on ${e.hubPort}`);
+  });
+
+  test("it exits when the pid given by --parent-pid dies", async () => {
     const parent = Bun.spawn(["sleep", "600"]);
     const e = await serveEmbedded(newHome("parent"), { args: ["--parent-pid", String(parent.pid)] });
     try {
@@ -73,7 +122,7 @@ describe("embedded/ready-stop", () => {
     }
   });
 
-  red("without --parent-pid, it exits when the process that started it dies", { reason: /never came up: .*unexpected argument "--embedded"/s, lane: "C" }, async () => {
+  test("without --parent-pid, it exits when the process that started it dies", async () => {
     const c = candidate();
     const home = newHome("parent");
     const [h, v] = await ports(2);
@@ -96,15 +145,15 @@ describe("embedded/ready-stop", () => {
     must(gone, "still listening 15 s after the process that started it died");
   });
 
-  red(
+  // Lane C made serve itself write nothing outside the home; lane D's bundle keeps Bun's cache out of it too.
+  test(
     "nothing is written outside the home: serve, bootstrap, a mint, a write and a stop leave the user HOME as it was",
-    { reason: NO_EMBEDDED, lane: "C" },
     async () => {
       const home = newHome("e2");
       const before = new Set(snapshot(dirname(home)).keys());
-      const e = await embeddedHome(home);
+      const e = await servedHome(home);
       try {
-        const t = await mint(home, `vault:${e.vaultName}:write`);
+        const t = await mintJwt(home, `vault:${e.vaultName}:write`);
         const w = await safeFetch(`${e.vault}/vault/${e.vaultName}/api/notes`, {
           method: "POST",
           headers: { authorization: `Bearer ${t.token}`, "content-type": "application/json" },
@@ -115,7 +164,9 @@ describe("embedded/ready-stop", () => {
         await e.stop();
       }
       const extra = outsideHome(home, before);
-      must(extra.length === 0, `written outside the home: ${extra.slice(0, 10).join(", ")}`);
+      const others = extra.filter((p) => p !== ".bun" && !p.startsWith(".bun/"));
+      must(others.length === 0, `written outside the home: ${others.slice(0, 10).join(", ")}`);
+      must(extra.length === 0, `written outside the home: only Bun's cache (${extra.slice(0, 3).join(", ")}, ${extra.length} entries)`);
     },
   );
 

@@ -599,10 +599,8 @@ describe("lifecycle: shutdown", () => {
   // Today the hub reports a supervised module "transient" for a 30 s boot window after it starts (hub
   // src/proxy-state.ts:52, src/api-ready.ts), so a usable box says not-ready for 30 s. A host polling /api/ready
   // (Prism's installer, §3) waits on that.
-  red(
-    "/api/ready says ready within 5 s of the first write going through",
-    { reason: /^\/api\/ready said ready only (\d{2,}|[6-9]) s after a write went through$/, lane: "C" },
-    async () => {
+  test(
+    "/api/ready says ready within 5 s of the first write going through", async () => {
       const r = await setup();
       must(r.readyAfter !== null, "/api/ready never said ready within 40 s of a write going through");
       const sec = Math.round(r.readyAfter / 1000);
@@ -654,10 +652,8 @@ describe("lifecycle: shutdown", () => {
 
   // Parent death: `--parent-pid` (§3) names the process serve lives for. A box under systemd or `nohup` passes
   // none, and must not die with its shell; with it, a SIGKILLed parent is a stop like SIGTERM.
-  red(
-    "parent death: serve --parent-pid stops cleanly within 10 s of its parent's SIGKILL",
-    { reason: /^serve --parent-pid did not start: parachute serve: unexpected argument "--parent-pid" \| usage: parachute serve$/, lane: "C" },
-    async () => {
+  test(
+    "parent death: serve --parent-pid stops cleanly within 10 s of its parent's SIGKILL", async () => {
       const o = await stopScenario("its parent died", async (_box, s) => void s.proc.kill("SIGKILL"), { parent: true })();
       stoppedAndGone(o);
       cleanOnDisk(o);

@@ -5,12 +5,11 @@
 //     Prism's suite would otherwise cause, run.mjs:402-405);
 //   - install, upgrade, expose, migrate and module commands exit 2 the same way, and change nothing;
 //   - the matching HTTP routes answer 409 {"error":{"code":"managed_by_host",…}}, even to the operator's token.
-// Today there is no embedded mode. Lane C turns these green.
+// Green since lane C (packages/cli/src/managed.ts for the commands, hub src/hub-server.ts for the routes).
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { cli, freePort, newHome, safeFetch, start, until, allowOrigins } from "../candidate-lib.ts";
-import { red } from "../lib.ts";
-import { NO_EMBEDDED, diff, embeddedHome, exitWithin, must, snapshot, tail } from "./_lib.ts";
+import { diff, servedHome, exitWithin, must, snapshot, tail } from "./_lib.ts";
 
 const REFUSED_COMMANDS = [
   ["install", "vault"],
@@ -46,8 +45,8 @@ describe("embedded/refusals", () => {
     }
   });
 
-  red("while serve --embedded holds the home, parachute-vault serve exits 2 with managed_by_host", { reason: NO_EMBEDDED, lane: "C" }, async () => {
-    const e = await embeddedHome(newHome("refuse"));
+  test("while serve --embedded holds the home, parachute-vault serve exits 2 with managed_by_host", async () => {
+    const e = await servedHome(newHome("refuse"));
     try {
       const port = await freePort([e.hubPort, e.vaultPort]);
       const s = start(e.home, ["serve"], { vault: true, env: { PORT: String(port) } });
@@ -60,11 +59,9 @@ describe("embedded/refusals", () => {
     }
   });
 
-  red(
-    "while serve --embedded holds the home, install, upgrade, expose, migrate and module commands exit 2 with managed_by_host and change nothing",
-    { reason: NO_EMBEDDED, lane: "C" },
-    async () => {
-      const e = await embeddedHome(newHome("refuse"));
+  test(
+    "while serve --embedded holds the home, install, upgrade, expose, migrate and module commands exit 2 with managed_by_host and change nothing", async () => {
+      const e = await servedHome(newHome("refuse"));
       try {
         const services = () => {
           try {
@@ -91,11 +88,9 @@ describe("embedded/refusals", () => {
     },
   );
 
-  red(
-    "while serve --embedded holds the home, install/upgrade/module routes answer 409 managed_by_host, even to the operator",
-    { reason: NO_EMBEDDED, lane: "C" },
-    async () => {
-      const e = await embeddedHome(newHome("refuse"));
+  test(
+    "while serve --embedded holds the home, install/upgrade/module routes answer 409 managed_by_host, even to the operator", async () => {
+      const e = await servedHome(newHome("refuse"));
       try {
         const operator = readFileSync(e.boot.operator_token_file, "utf8").trim();
         for (const [method, path] of REFUSED_ROUTES) {

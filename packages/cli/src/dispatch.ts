@@ -27,10 +27,16 @@
 //
 // `parachute-core install` installs this bundle (install.ts, lane D). It is no longer the hub's module installer,
 // which runs `bun add -g` into the old global install; `parachute install` (the hub's name) still is.
+//
+// Lane C: `serve --embedded` is core's own (embedded.ts), after those checks on the home it names (--home, else
+// PARACHUTE_HOME). While it holds a home, the commands that install, upgrade, expose, migrate or drive modules
+// are refused with managed_by_host, exit 2 (managed.ts, PLAN §3).
+import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { SCHEMA_VERSION } from "@openparachute/vault/core/src/schema.ts";
 import core from "../../../package.json" with { type: "json" };
 import { homeDir, newerData, repairModes } from "./home.ts";
+import { managedRefusal } from "./managed.ts";
 
 export type Role = "core" | "hub" | "vault";
 
@@ -57,7 +63,10 @@ function coreHelp(): string {
 }
 
 /** What a name and its arguments run: a built-in answer, or one of the moved CLIs with the arguments it gets. */
-export function route(role: Role, argv: string[]): { print: string } | { install: string[] } | { cli: "hub" | "vault"; argv: string[] } {
+export function route(
+  role: Role,
+  argv: string[],
+): { print: string } | { install: string[] } | { embedded: string[] } | { cli: "hub" | "vault"; argv: string[] } {
   if (role === "core" && argv[0] === "install") return { install: argv.slice(1) };
   const cli = role === "vault" || (role === "core" && argv[0] === "vault") ? "vault" : "hub";
   const args = role === "core" && argv[0] === "vault" ? argv.slice(1) : argv;
@@ -65,6 +74,7 @@ export function route(role: Role, argv: string[]): { print: string } | { install
   if (cmd === "version" || cmd === "--version" || cmd === "-v") {
     return { print: rest.includes("--json") ? JSON.stringify(versionJson()) : core.version };
   }
+  if (cli === "hub" && cmd === "serve" && rest.includes("--embedded")) return { embedded: rest };
   return { cli, argv: args };
 }
 
@@ -72,6 +82,41 @@ export function route(role: Role, argv: string[]): { print: string } | { install
 export const EXIT_NEWER_DATA = 6;
 export const EXIT_HOME_UNUSABLE = 5;
 
+
+/**
+ * The vault child of `serve --embedded` (child path) stops when that serve is gone, even after a SIGKILL that
+ * gave it no chance to stop its vault: a SIGTERM to itself runs the vault's own shutdown. Without this, the
+ * orphan keeps the vault port and its databases open (PLAN §2.2, §3 "parent death").
+ */
+function stopWithEmbeddedParent(): void {
+  const raw = process.env.PARACHUTE_EMBEDDED_PARENT;
+  if (raw === undefined) return;
+  const parent = Number(raw);
+  // Started for an embedded serve that is already gone: there is nothing to serve for.
+  if (!Number.isInteger(parent) || parent <= 1 || process.ppid !== parent) {
+    console.error(`parachute-vault serve: the serve --embedded that started it (pid ${raw}) is gone; not starting`);
+    process.exit(75);
+  }
+  const timer = setInterval(() => {
+    if (process.ppid === parent) return;
+    clearInterval(timer); // once: the vault's own shutdown takes it from here
+    process.kill(process.pid, "SIGTERM");
+  }, 500);
+  timer.unref();
+}
+
+/**
+ * `--home <dir>` or `--home=<dir>` among `serve --embedded`'s arguments, if given, and whether it is given more
+ * than once (serve refuses that with exit 2, and nothing may check or repair a home before it does).
+ */
+function homeFlag(args: string[]): { home?: string; twice: boolean } {
+  const found: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--home") found.push(args[i + 1] ?? "");
+    else if (args[i]!.startsWith("--home=")) found.push(args[i]!.slice("--home=".length));
+  }
+  return { home: found[0], twice: found.length > 1 };
+}
 
 /** Run as `role` with this process's arguments. The moved CLIs run in this process, as if started directly. */
 export async function dispatch(role: Role): Promise<void> {
@@ -86,10 +131,21 @@ export async function dispatch(role: Role): Promise<void> {
     const { install } = await import("./install.ts");
     process.exit(install(r.install));
   }
+  // `serve --embedded` names its home with --home or PARACHUTE_HOME; with neither it exits 2 before touching
+  // anything (embedded.ts), so there is no home to check.
+  const embeddedArgs = "embedded" in r ? r.embedded : undefined;
+  if (embeddedArgs) {
+    const flag = homeFlag(embeddedArgs);
+    if (flag.twice) {
+      console.error("parachute serve --embedded: --home given twice");
+      process.exit(2);
+    }
+    if (flag.home) process.env.PARACHUTE_HOME = resolve(flag.home);
+  }
   const home = homeDir();
   // Every command but `version` (answered above) runs behind the check, help included: the moved CLIs do work on
   // the home before they read their arguments (the vault moves older layouts first), so `serve --help` is a command.
-  {
+  if (!embeddedArgs || process.env.PARACHUTE_HOME) {
     const { HUB_SCHEMA_VERSION } = await import("@openparachute/hub/src/hub-db.ts");
     const { newer, unchecked } = newerData(home, { hub: HUB_SCHEMA_VERSION, vault: SCHEMA_VERSION });
     const name = role === "core" ? "parachute-core" : role === "hub" ? "parachute" : "parachute-vault";
@@ -106,12 +162,23 @@ export async function dispatch(role: Role): Promise<void> {
       process.exit(EXIT_HOME_UNUSABLE);
     }
   }
+  if (embeddedArgs) {
+    process.env.PARACHUTE_OFFLINE = "1";
+    if (process.env.PARACHUTE_HOME) for (const line of repairModes(home)) console.error(`parachute: mode repaired: ${line}`);
+    const { serveEmbedded } = await import("./embedded.ts");
+    process.exit(await serveEmbedded(embeddedArgs));
+  }
+  if (!("cli" in r)) return;
+  const refusal = managedRefusal(r.cli, r.argv);
+  if (refusal) {
+    console.error(refusal);
+    process.exit(2);
+  }
+  if (r.cli === "vault" && r.argv[0] === "serve") stopWithEmbeddedParent();
   if (r.cli === "hub" && r.argv[0] === "serve") {
-    const embedded = r.argv.includes("--embedded");
-    if (embedded || r.argv.includes("--offline")) process.env.PARACHUTE_OFFLINE = "1";
+    if (r.argv.includes("--offline")) process.env.PARACHUTE_OFFLINE = "1";
     // The hub's `serve` takes no --offline of its own: it reads PARACHUTE_OFFLINE.
     r.argv = r.argv.filter((a) => a !== "--offline");
-    if (embedded) for (const line of repairModes(home)) console.error(`parachute: mode repaired: ${line}`);
   }
   if (role === "core" && r.cli === "hub" && (argv.length === 0 || ["help", "--help", "-h"].includes(argv[0]!))) {
     console.log(coreHelp());

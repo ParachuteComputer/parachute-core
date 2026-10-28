@@ -1,7 +1,7 @@
 // What the embedded/ contracts share: start `serve --embedded` on ports we choose, read its files, hash a home,
 // check modes, and run a stock box in a network of its own. Black box only: the candidate's bin/parachute and
 // bin/parachute-vault, HTTP, and the files a host is allowed to read (ready.json, embedded.json, the token file).
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { existsSync, lstatSync, readdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { allowOrigins, candidate, cli, oldStockDir, freePort, safeFetch, start, until, type Served } from "../candidate-lib.ts";
@@ -9,8 +9,6 @@ import { must } from "../lib.ts";
 
 export { must };
 
-/** Today's `parachute serve` refuses the flag: `parachute serve: unexpected argument "--embedded"` (hub src/cli.ts). */
-export const NO_EMBEDDED = /unexpected argument "--embedded"/;
 /** Today's `parachute bootstrap` doesn't exist: `parachute: unknown command "bootstrap"`. */
 export const NO_BOOTSTRAP = /unknown command "bootstrap"/;
 
@@ -276,12 +274,52 @@ export async function embeddedHome(
   return { ...e, vaultName: vault, boot: b.json };
 }
 
+/**
+ * `serve --embedded`, then a home set up the way Benjamin's suite does it while bootstrap is missing (run.mjs
+ * 330-395): `auth set-password` (a made-up password), `auth rotate-operator`, `parachute-vault create <vault>
+ * --no-mirror`. For lane C's contracts, where the host's setup is not what they test; `bootstrap --embedded` is
+ * lane E's (embedded/bootstrap), and lane E switches these back to embeddedHome() when it lands.
+ * Returns the same shape as embeddedHome(): `boot.operator_token_file` is the operator token's path.
+ */
+export async function servedHome(
+  home: string,
+  opts: { vault?: string; hubPort?: number; vaultPort?: number; env?: Record<string, string>; args?: string[] } = {},
+) {
+  const e = await serveEmbedded(home, opts);
+  const vault = opts.vault ?? "default";
+  const steps: [string[], boolean][] = [
+    [["auth", "set-password", "--username", "owner", "--password", `pw-${randomBytes(12).toString("hex")}`], false],
+    [["auth", "rotate-operator"], false],
+    [["create", vault, "--no-mirror", "--json"], true],
+  ];
+  for (const [args, vaultCli] of steps) {
+    const r = await cli(home, args, { env: opts.env, vault: vaultCli });
+    if (r.code !== 0) {
+      await e.stop();
+      must(false, `setup: ${vaultCli ? "parachute-vault" : "parachute"} ${args[0]} ${args[1] ?? ""} exited ${r.code}: ${tail(r.stderr || r.stdout)}`);
+    }
+  }
+  return { ...e, vaultName: vault, boot: { operator_token_file: join(home, "operator.token") } };
+}
+
 /** `auth mint-token --scope <scope> --json` → the parsed `{token, jti, exp, scopes, aud}`. */
 export async function mint(home: string, scope: string, extra: string[] = [], env?: Record<string, string>) {
   const r = await cli(home, ["auth", "mint-token", "--scope", scope, ...extra, "--json"], { env });
   const j = json(r.stdout);
   must(r.code === 0 && typeof j?.token === "string", `auth mint-token --json exited ${r.code}: ${tail(r.stderr || r.stdout)}`);
   return j as { token: string; jti: string; exp: unknown; scopes: unknown; aud: unknown };
+}
+
+/**
+ * `auth mint-token --scope <scope>` without --json: the JWT on the last line of stdout, the way Benjamin's suite
+ * reads it when --json isn't advertised (run.mjs parseMint). For lane C's contracts, so they don't wait on lane B's
+ * `--json` (embedded/json holds that).
+ */
+export async function mintJwt(home: string, scope: string, extra: string[] = [], env?: Record<string, string>) {
+  const r = await cli(home, ["auth", "mint-token", "--scope", scope, ...extra], { env });
+  const token = r.stdout.trim().split("\n").pop()?.trim() ?? "";
+  must(r.code === 0 && token.split(".").length === 3, `auth mint-token exited ${r.code}: ${tail(r.stderr || r.stdout)}`);
+  return { token };
 }
 
 /** GET a vault's notes with a token, straight at the vault listener. */

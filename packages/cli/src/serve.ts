@@ -17,7 +17,8 @@
 //   4. close every vault database still open, whatever happened above (a stop that ran out of time, a start cut
 //      short), and remove run/ready.json;
 //   5. exit: 0 for a stop, 75 for a part that failed to start.
-// Lane C adds `--parent-pid` (parent death is one more way into the same stop) and `--embedded`.
+// Lane C: `--parent-pid` (parent death is one more way into the same stop) and `--listen`; `serve --embedded` is
+// embedded.ts.
 //
 // The child path (`PARACHUTE_PROCESS_MODEL=child`: the hub starts `parachute-vault serve` as before) stays until the
 // Nov 3 decision (PLAN §2.1); then the losing path is deleted.
@@ -270,7 +271,41 @@ export class VaultPart {
 }
 
 function serveUsage(): void {
-  console.error("usage: parachute serve");
+  console.error("usage: parachute serve [--listen <host>:<port>] [--parent-pid <pid>]");
+}
+
+/** `--listen <host>:<port>` (a bare port keeps PARACHUTE_BIND_HOST) and `--parent-pid <pid>` (lane C, PLAN §2.3, §3). */
+async function serveFlags(args: string[]): Promise<{ listen?: { host?: string; port: number }; parentPid?: number }> {
+  const { parseListen } = await import("@openparachute/hub/src/commands/serve.ts");
+  const out: { listen?: { host?: string; port: number }; parentPid?: number } = {};
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    const eq = arg.startsWith("--") ? arg.indexOf("=") : -1;
+    const flag = eq > 0 ? arg.slice(0, eq) : arg;
+    const value = eq > 0 ? arg.slice(eq + 1) : args[i + 1];
+    if (flag === "--listen") {
+      const listen = parseListen(value);
+      if (!listen) {
+        console.error(`parachute serve: --listen needs <host>:<port>, got ${JSON.stringify(value ?? "")}`);
+        serveUsage();
+        process.exit(2);
+      }
+      out.listen = listen;
+    } else if (flag === "--parent-pid") {
+      if (!/^\d+$/.test(value ?? "") || Number(value) <= 0) {
+        console.error(`parachute serve: --parent-pid needs a process id, got ${JSON.stringify(value ?? "")}`);
+        serveUsage();
+        process.exit(2);
+      }
+      out.parentPid = Number(value);
+    } else {
+      console.error(`parachute serve: unexpected argument "${arg}"`);
+      serveUsage();
+      process.exit(1);
+    }
+    if (eq < 0) i++;
+  }
+  return out;
 }
 
 /** `serve` with the vault in this process. Runs until stopped; never returns. */
@@ -280,11 +315,7 @@ export async function serveInProcess(args: string[]): Promise<never> {
     console.log(serveHelp());
     process.exit(0);
   }
-  if (args.length > 0) {
-    console.error(`parachute serve: unexpected argument "${args[0]}"`);
-    serveUsage();
-    process.exit(1);
-  }
+  const flags = await serveFlags(args);
 
   // The hub and the vault each find the home from PARACHUTE_HOME when their config modules load.
   const { CONFIG_DIR, SERVICES_MANIFEST_PATH } = await import("@openparachute/hub/src/config.ts");
@@ -294,6 +325,11 @@ export async function serveInProcess(args: string[]): Promise<never> {
   process.on("SIGINT", () => void coordinator.stop("SIGINT"));
   // A ready.json from a run that was killed says nothing about this one (PLAN §3).
   coordinator.removeRunFiles();
+  // Parent death (lane C, PLAN §3): with --parent-pid, its exit is one more way into the same stop.
+  if (flags.parentPid !== undefined) {
+    const { watchParentPid } = await import("@openparachute/hub/src/commands/serve.ts");
+    watchParentPid(flags.parentPid, () => void coordinator.stop(`parent ${flags.parentPid} exited`));
+  }
 
   const fail = (part: string, err: unknown): Promise<never> => {
     console.error(`parachute serve: the ${part} failed to start: ${err instanceof Error ? err.message : String(err)}`);
@@ -411,7 +447,12 @@ export async function serveInProcess(args: string[]): Promise<never> {
   try {
     // Children get 2 s after SIGTERM before SIGKILL (0.7: 5 s), so the hub's whole stop fits in its share of the
     // coordinator's deadline (children at once, then its listener, bounded at 2 s).
-    const hub = await coordinator.track(serve({ supervisor: new InProcessSupervisor({ killTimeoutMs: 2_000 }) }));
+    const hub = await coordinator.track(
+      serve({
+        supervisor: new InProcessSupervisor({ killTimeoutMs: 2_000 }),
+        ...(flags.listen ? { port: flags.listen.port, ...(flags.listen.host !== undefined ? { hostname: flags.listen.host } : {}) } : {}),
+      }),
+    );
     coordinator.add({
       name: "hub",
       stop: async (deadline) => {

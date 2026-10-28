@@ -42,6 +42,12 @@ export interface ApiReadyDeps {
   now?: () => number;
   /** Test seam over the boot window. */
   bootWindowMs?: number;
+  /**
+   * Modules whose own health endpoint answered just now. Inside its boot window, a running module that answers is
+   * ready: the box is usable, so `/api/ready` says so (v0.8 PLAN §2.2; lifecycle/shutdown's 5 s bound) instead of
+   * waiting the window out.
+   */
+  answering?: ReadonlySet<string>;
 }
 
 export function handleApiReady(req: Request, deps: ApiReadyDeps = {}): Response {
@@ -77,7 +83,7 @@ export function handleApiReady(req: Request, deps: ApiReadyDeps = {}): Response 
             const parsed = Date.parse(m.startedAt);
             if (Number.isFinite(parsed)) startedMs = parsed;
           }
-          if (startedMs > 0 && now - startedMs < bootWindow) {
+          if (startedMs > 0 && now - startedMs < bootWindow && !deps.answering?.has(m.short)) {
             transient.push(m.short);
           } else {
             ready.push(m.short);

@@ -42,6 +42,8 @@ export interface Served {
   stop(signal?: NodeJS.Signals, ms?: number): Promise<number | null>;
 }
 
+let logSeq = 0;
+
 /** Start a long-running candidate command (e.g. `serve --embedded`) with its output in a log file. */
 export function start(
   home: string,
@@ -49,7 +51,8 @@ export function start(
   opts: { vault?: boolean; env?: Record<string, string> } = {},
 ): Served {
   const c = candidate();
-  const logPath = join(dirname(home), `${args[0] ?? "run"}-${Date.now()}.log`);
+  // A counter too: two starts in the same millisecond must not share (and clobber) one log.
+  const logPath = join(dirname(home), `${args[0] ?? "run"}-${Date.now()}-${++logSeq}.log`);
   const out = Bun.file(logPath);
   const proc = Bun.spawn([opts.vault ? c.vaultBin : c.bin, ...args], {
     env: candidateEnv(c, home, opts.env),

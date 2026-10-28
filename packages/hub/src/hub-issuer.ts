@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { readEmbeddedState } from "./embedded-home.ts";
 import { readExposeState } from "./expose-state.ts";
 import { HUB_DEFAULT_PORT, readHubPort } from "./hub-control.ts";
 import { deriveHubOrigin } from "./hub-origin.ts";
@@ -22,6 +23,10 @@ export function resolveHubIssuer(override: string | undefined, configDir: string
     const fromOverride = deriveHubOrigin({ override });
     if (fromOverride) return fromOverride;
   }
+  // An embedded home (v0.8 PLAN §3): the issuer `serve --embedded` decided on its latest start, never expose-state
+  // or hub/run/hub.port.
+  const embedded = readEmbeddedState(configDir);
+  if (embedded) return embedded.issuer;
   const state = readExposeState(join(configDir, "expose-state.json"));
   if (state?.hubOrigin) return state.hubOrigin;
   const exposeFqdn = state?.canonicalFqdn;

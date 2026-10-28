@@ -719,11 +719,20 @@ export function serveHelp(): string {
   return `parachute serve — run the hub + supervisor foregrounded (the runtime)
 
 Usage:
-  parachute serve [--offline]
+  parachute serve [--listen <host>:<port>] [--parent-pid <pid>] [--offline]
 
-  --offline   reach nothing off this machine on its own: no registry lookup,
-              Buzz poller, model download, outbound webhook or mirror push
-              (sets PARACHUTE_OFFLINE=1 for the hub and every module it starts)
+Flags:
+  --listen <host>:<port>            bind address and port (default 127.0.0.1,
+                                    then PORT or 1939). Overrides
+                                    PARACHUTE_BIND_HOST and PORT; a bare
+                                    <port> keeps PARACHUTE_BIND_HOST.
+  --parent-pid <pid>                stop cleanly (like SIGTERM) when that
+                                    process exits.
+  --offline                         reach nothing off this machine on its own:
+                                    no registry lookup, Buzz poller, model
+                                    download, outbound webhook or mirror push
+                                    (sets PARACHUTE_OFFLINE=1 for the hub and
+                                    every module it starts)
 
 This is the one runtime everywhere. The hub IS the foreground process: it
 runs the HTTP server on port 1939 AND an in-process supervisor that spawns
@@ -739,6 +748,8 @@ Render / Fly. Run it directly only for a foregrounded local debug, or on an
 init-less host that can't host a unit.
 
 Environment:
+  PARACHUTE_BIND_HOST               bind address (default 127.0.0.1, loopback
+                                    only). Containers set 0.0.0.0.
   PORT                              bind port (default 1939). Render injects
                                     this; honor it so the platform's HTTP
                                     forwarder lands on the right socket.

@@ -14,6 +14,7 @@
  */
 import {
   createScopeGuard,
+  defaultRevocationFetcher,
   HubJwtError,
   type HubJwtClaims,
   looksLikeJwt,
@@ -135,6 +136,11 @@ const guard = createScopeGuard({
   // without a vault restart. When the env var is unset → `[]` → scope-guard
   // collapses to the single canonical hubOrigin (byte-identical to before).
   allowedIssuers: () => parseHubOrigins(passedIn.hubOrigins ?? process.env.PARACHUTE_HUB_ORIGINS),
+  // The revocation list comes from the same local hub as the keys (v0.8 PLAN §2.3, fix 1). scope-guard 0.5.0
+  // fetches it from the issuer origin, which in embedded mode is whatever PARACHUTE_HUB_ORIGIN the host chose and
+  // need not be where the hub listens; the list's cache stays keyed per issuer. 0.5.1 does the same by default
+  // (`revocationOrigin ?? jwksOrigin`).
+  revocationFetcher: () => defaultRevocationFetcher(getJwksOrigin()),
 });
 
 /**

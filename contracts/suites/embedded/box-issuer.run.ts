@@ -7,12 +7,14 @@ import { freePort, newHome, safeFetch } from "../candidate-lib.ts";
 import { claims, must, report, tail } from "./_lib.ts";
 import { binaries, run, serveBox } from "./_stock.ts";
 
-await report(async (input: { hubPortFile: boolean }) => {
+await report(async (input: { hubPortFile: boolean; bindHost?: string }) => {
   const info = await binaries();
   const home = newHome("boxiss");
   const port = await freePort();
-  const origin = `http://127.0.0.1:${port}`;
-  const env = { PORT: String(port), PARACHUTE_HUB_ORIGIN: origin, EMBEDDINGS_ENABLED: "false" };
+  const host = input.bindHost ?? "127.0.0.1";
+  const origin = `http://${host}:${port}`;
+  const env: Record<string, string> = { PORT: String(port), PARACHUTE_HUB_ORIGIN: origin, EMBEDDINGS_ENABLED: "false" };
+  if (input.bindHost) env.PARACHUTE_BIND_HOST = input.bindHost;
   const made = await run(info, home, ["create", "boxv", "--no-mirror", "--json"], env, true);
   must(made.code === 0, `setup: parachute-vault create exited ${made.code}: ${tail(made.stderr)}`);
   if (input.hubPortFile) {

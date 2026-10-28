@@ -609,7 +609,27 @@ function validateManifest(raw: unknown, where: string): ServicesManifest {
  * state — but worth knowing: a fix upstream (e.g. app@rc.13 overwriting
  * the bad row on its next selfRegister) is what finally clears it.
  */
+// `serve --embedded` (v0.8 PLAN §3): the vault listens where the host said (--vault-listen), whatever port the
+// vault rows of services.json name, and core never rewrites that file (the old hub needs it for rollback). So
+// every lenient read in the serve process sees the vault rows on the embedded vault's port, in memory only;
+// the two writers below read the file as it is. Set once by an embedded serve's hubFetch (one per process).
+let embeddedVaultPort: number | undefined;
+export function setEmbeddedVaultPort(port: number | undefined): void {
+  embeddedVaultPort = port;
+}
+const isVaultRow = (e: ServiceEntry) => e.name === "parachute-vault" || e.name.startsWith("parachute-vault-");
+
 export function readManifestLenient(
+  path: string = SERVICES_MANIFEST_PATH,
+  log: { warn?: (msg: string) => void } = console,
+): ServicesManifest {
+  const m = readManifestLenientRaw(path, log);
+  const port = embeddedVaultPort;
+  if (port === undefined) return m;
+  return { ...m, services: m.services.map((e) => (isVaultRow(e) ? { ...e, port } : e)) };
+}
+
+function readManifestLenientRaw(
   path: string = SERVICES_MANIFEST_PATH,
   log: { warn?: (msg: string) => void } = console,
 ): ServicesManifest {
@@ -1007,7 +1027,7 @@ export function recordStartError(
   path: string = SERVICES_MANIFEST_PATH,
 ): void {
   if (!existsSync(path)) return;
-  const current = readManifestLenient(path);
+  const current = readManifestLenientRaw(path);
   const idx = current.services.findIndex((s) => s.name === name);
   if (idx < 0) return;
   const row = current.services[idx];
@@ -1023,7 +1043,7 @@ export function recordStartError(
  * No-op when the row is absent or already clean. */
 export function clearStartError(name: string, path: string = SERVICES_MANIFEST_PATH): void {
   if (!existsSync(path)) return;
-  const current = readManifestLenient(path);
+  const current = readManifestLenientRaw(path);
   const idx = current.services.findIndex((s) => s.name === name);
   if (idx < 0) return;
   const row = current.services[idx];
