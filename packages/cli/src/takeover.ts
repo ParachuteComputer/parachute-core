@@ -823,11 +823,19 @@ async function coreUnitUp(port: number): Promise<string | null> {
   return null;
 }
 
-/** Stop core's unit and wait until nothing holds the home's data; the holders left, if any. */
-async function stopCoreUnit(home: string): Promise<Holder[]> {
-  run(["systemctl", "--user", "disable", "--now", CORE_UNIT]);
-  await waitUntil(() => holders(home).length === 0, 20_000, 250);
-  return holders(home);
+/**
+ * Stop core's unit and confirm it: the stop command succeeded, systemd reports it inactive (or failed) with no
+ * process, and nothing holds the home's data. Returns what is still wrong, or null when it is stopped.
+ */
+async function stopCoreUnit(home: string): Promise<string | null> {
+  const r = run(["systemctl", "--user", "disable", "--now", CORE_UNIT]);
+  if (r.code !== 0) return `stopping ${CORE_UNIT} failed: ${(r.stderr || r.stdout).trim()}`;
+  const down = () => ["inactive", "failed"].includes(run(["systemctl", "--user", "is-active", CORE_UNIT]).stdout.trim()) && mainPid(CORE_UNIT) === 0;
+  if (!(await waitUntil(() => down() && holders(home).length === 0, 20_000, 250))) {
+    const still = holders(home);
+    return `${CORE_UNIT} is not confirmed stopped${still.length ? ` (still holding the data: ${still.map((h) => `pid ${h.pid}`).join(", ")})` : ""}`;
+  }
+  return null;
 }
 
 function writeRecord(home: string, r: Record_): void {
@@ -859,6 +867,12 @@ async function takeOver(d: Detected, say: (s: string) => void): Promise<{ backup
     throw new Exit(EXIT.failed, `the home has entries the backup can't copy as they are (${d.uncopyable.slice(0, 5).join(", ")}): links point outside it. Replace them with the real files, or back up yourself. Nothing was changed.`);
   }
   const coreUnitFile = join(systemdUnitDir(), CORE_UNIT);
+  // What systemd has loaded under that name, wherever its file is: one outside the user folder is never shadowed.
+  const loaded = run(["systemctl", "--user", "show", CORE_UNIT, "-p", "LoadState", "-p", "FragmentPath"]).stdout;
+  const fragment = /^FragmentPath=(.*)$/m.exec(loaded)?.[1]?.trim() ?? "";
+  if (/^LoadState=loaded$/m.test(loaded) && fragment && fragment !== coreUnitFile) {
+    throw new Exit(EXIT.failed, `${CORE_UNIT} is already loaded from ${fragment}; this takeover won't shadow or replace it. Nothing was changed.`);
+  }
   if (existsSync(coreUnitFile)) {
     const text = unitText(CORE_UNIT);
     const on = run(["systemctl", "--user", "is-active", CORE_UNIT]).stdout.trim() === "active" || run(["systemctl", "--user", "is-enabled", CORE_UNIT]).stdout.trim() === "enabled";
@@ -938,7 +952,12 @@ async function takeOver(d: Detected, say: (s: string) => void): Promise<{ backup
   try {
     return await startAndHandOver();
   } catch (err) {
-    if (unitTried) await stopCoreUnit(d.home);
+    const left = unitTried ? await stopCoreUnit(d.home) : null;
+    if (left) {
+      // v0.8 may still start or write: nothing is restored and the old units stay paused, so two servers never
+      // share the data. The record stays too, so `takeover --rollback` can finish the job once it is stopped.
+      throw new Exit(EXIT.checkFailed, `${(err as Error).message}; then ${left}. The old units stay paused and nothing was restored; stop ${CORE_UNIT}, then run \`parachute-core takeover --rollback\`. The backup is in ${dest}`);
+    }
     rmSync(join(d.home, RECORD_FILE), { force: true });
     if (err instanceof Exit) throw err;
     throw undo(`${(err as Error).message}`);
@@ -970,6 +989,9 @@ async function takeOver(d: Detected, say: (s: string) => void): Promise<{ backup
       unitTried = true;
       try {
         const unit = writeCoreUnit(d, hubUnit.name);
+        // Named in the record before it starts, so a rollback after a failed start knows to stop it.
+        record.core_unit = CORE_UNIT;
+        writeRecord(d.home, record);
         systemctl("daemon-reload");
         systemctl("enable", "--now", CORE_UNIT);
         const down = await coreUnitUp(unit.port);
@@ -977,8 +999,6 @@ async function takeOver(d: Detected, say: (s: string) => void): Promise<{ backup
       } catch (err) {
         throw new Error(`starting ${CORE_UNIT} failed: ${(err as Error).message}`);
       }
-      record.core_unit = CORE_UNIT;
-      writeRecord(d.home, record);
     }
     return { backup: dest, record, core_unit: record.core_unit };
   }
@@ -1017,8 +1037,11 @@ async function rollBack(home: string, say: (s: string) => void): Promise<Record<
     const r = run(["systemctl", "--user", "disable", "--now", record.core_unit]);
     if (r.code !== 0) throw new Exit(EXIT.failed, `stopping ${record.core_unit} failed: ${(r.stderr || r.stdout).trim()}`);
   }
-  if (!(await waitUntil(() => holders(home).length === 0, 20_000, 250))) {
-    const still = holders(home);
+  // On a retry, old units already put back may hold the data again: they are not in the way.
+  const resumed = new Set(record.paused.map((u) => u.name));
+  const inTheWay = () => holders(home).filter((h) => !(h.unit && resumed.has(h.unit) && (record.restored_at || record.rollback === "code-only")));
+  if (!(await waitUntil(() => inTheWay().length === 0, 20_000, 250))) {
+    const still = inTheWay();
     throw new Exit(EXIT.held, `still holding the data: ${still.map((h) => `pid ${h.pid} (${h.cmd.slice(0, 80)})`).join(", ")}. Stop it, then run takeover --rollback again.`);
   }
   let exported = 0;
@@ -1119,4 +1142,3 @@ export function serveRefusal(home: string): string | null {
     "it backs up first, and `parachute-core takeover --rollback` goes back.",
   ].join("\n");
 }
-

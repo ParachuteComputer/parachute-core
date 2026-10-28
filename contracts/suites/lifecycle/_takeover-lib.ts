@@ -150,6 +150,7 @@ case "$verb" in
       if known "$u"; then a=$(st "$u" active); e=$(st "$u" enabled); l=loaded; else a=inactive; e=""; l=not-found; fi
       pid=0; alive "$u" && pid=$(cat "$STATE/$u.pid")
       echo "Id=$u"; echo "LoadState=$l"; echo "ActiveState=$a"; echo "UnitFileState=$e"; echo "MainPID=$pid"
+      if [ -f "$UNITS/$u" ]; then echo "FragmentPath=$UNITS/$u"; fi
       if [ -f "$UNITS/$u" ]; then echo "Environment=$(sed -n 's/^Environment=//p' "$UNITS/$u" | tr '\n' ' ' | sed 's/ $//')"; fi
       echo
     done; exit 0 ;;
