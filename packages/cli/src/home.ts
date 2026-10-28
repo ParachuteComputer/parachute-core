@@ -87,7 +87,7 @@ export function schemaOf(path: string, outside: string = tmpdir()): number | und
   const wal = `${path}-wal`;
   if (!(existsSync(wal) && statSync(wal).size > 0)) return topVersion(openImmutable(path));
   const places = [...new Set([outside, tmpdir()])];
-  for (const copy of [false, true]) {
+  for (const copy of [true]) { // PROBE: never hard-link the live database
     if (copy && statSync(path).size > COPY_LIMIT) break;
     for (const place of places) {
       let scratch: string | undefined;
