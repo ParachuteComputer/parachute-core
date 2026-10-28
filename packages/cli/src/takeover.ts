@@ -619,6 +619,14 @@ function unsafeToStop(unit: string, home: string, allowed: Set<string>): string 
       } catch {}
     }
   }
+  return reachOf(unit, allowed);
+}
+
+/**
+ * Which other units a stop or disable of `unit` would reach, as systemd says (and its [Install] Also=): what is wrong,
+ * or null when it reaches none outside `allowed`, and systemd answered completely.
+ */
+function reachOf(unit: string, allowed: Set<string>): string | null {
   // RequiredBy/BoundBy/ConsistsOf every systemd reports; PropagatesStopTo (v249) and UpheldBy (v248) only newer ones,
   // and one that doesn't know them can't have them set. `Also=` is an [Install] line, not a property: read from the
   // unit's effective text.
@@ -1417,13 +1425,17 @@ async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ ba
     const hubUnit = toPause.find((u) => u.manager === "systemd" && /hub/.test(u.name)) ?? toPause[0];
     if (hubUnit) {
       say(`Starting v0.8 as ${CORE_UNIT} …`);
-      unitTried = true;
       try {
         const unit = writeCoreUnit(d, hubUnit.name);
+        systemctl("daemon-reload");
+        // A drop-in the unit already had (Also=, a stop that propagates) could make enabling, stopping or disabling
+        // it reach another unit: checked before it is ever enabled, so the cleanup's disable is safe too.
+        const reach = reachOf(CORE_UNIT, new Set());
+        if (reach) throw new Error(`${reach}; ${CORE_UNIT} was written but not enabled`);
+        unitTried = true;
         // Named in the record before it starts, so a rollback after a failed start knows to stop it.
         record.core_unit = CORE_UNIT;
         writeRecord(d.home, record);
-        systemctl("daemon-reload");
         systemctl("enable", "--now", CORE_UNIT);
         const down = await coreUnitUp(unit.port, d, say);
         if (down) throw new Error(down);
@@ -1479,7 +1491,7 @@ async function rollBack(home: string, say: (s: string) => void): Promise<Record<
     const stopped = state === "inactive" || state === "failed";
     let why: string | null = null;
     if (stopped) {
-      if (readCoreUnitMark() !== home) why = "no longer carries this takeover's mark for this home";
+      why = readCoreUnitMark() !== home ? "no longer carries this takeover's mark for this home" : reachOf(record.core_unit, new Set());
     } else if (Number(pidText) === 0) {
       why = `is ${state} but systemd names no process for it`;
     } else if (!heldBy(home, [record.core_unit]).some((h) => h.unit === record.core_unit)) {

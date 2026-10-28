@@ -423,6 +423,23 @@ describe("takeover", () => {
     expect(existsSync(join(m.user, "parachute-takeover"))).toBe(false);
   }, 120_000);
 
+  test("a drop-in that makes parachute-core.service reach another unit (Also=) stops the hand-over: exit 8, everything back, that unit untouched", async () => {
+    const { m, s } = await oldMachine("tk-also");
+    // A drop-in left on the core unit's name; enabling or disabling it would also enable or disable the vault unit.
+    const dir = join(m.unitDir, "parachute-core.service.d");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "also.conf"), `[Install]\nAlso=${VAULT_UNIT}\n`);
+    const calls = m.systemctlCalls().length;
+    const r = await m.run([requireCore(m.info), "takeover", "--home", m.home, "--yes", "--json"], { timeoutMs: 240_000 });
+    must(r.code === 8, `takeover with a core unit that reaches ${VAULT_UNIT} exited ${r.code}, want 8: ${r.stderr.slice(-600)}`);
+    expect(r.stderr).toContain(VAULT_UNIT);
+    expect(changesTo(m, VAULT_UNIT, calls)).toEqual([]);
+    expect(m.systemctlCalls().slice(calls).filter((c) => /\benable\b.*parachute-core/.test(c))).toEqual([]);
+    expect(m.unit(HUB_UNIT)).toEqual({ active: true, enabled: true });
+    expect(existsSync(join(m.home, "takeover.json"))).toBe(false);
+    await serving(m, s, HUB_UNIT);
+  }, 300_000);
+
   test("a parachute-core.service that serves another home is never replaced: refused before anything changes", async () => {
     const { m } = await oldMachine("tk-coreunit");
     const theirs = join(m.unitDir, "parachute-core.service");
