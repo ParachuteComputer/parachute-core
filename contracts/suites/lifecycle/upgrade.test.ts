@@ -206,7 +206,7 @@ describe("lifecycle/upgrade", () => {
     expect((await core(["upgrade", "--rollback"])).code).toBe(1); // nothing left to roll back
   }, 240_000);
 
-  test("a database that can't be read: no backup, no record, no crash; the command goes on and fails its own way", async () => {
+  test("a database that can't be read: named, left out of the backup, no crash; the command goes on and fails its own way", async () => {
     // A vault that can't open must stop serve with its own exit (lifecycle/shutdown "vault start failure"); the
     // upgrade step must not crash first and hide that.
     const home = newHome("up-unreadable");
@@ -215,7 +215,7 @@ describe("lifecycle/upgrade", () => {
     for (const f of [`${db}-wal`, `${db}-shm`]) rmSync(f, { force: true });
     writeFileSync(db, "Made-up bytes that are not a database.\n".repeat(200));
     const r = await cli(home, ["user", "list"]);
-    expect(r.stderr).toContain("can't read vault/data/brokenv/vault.db; no upgrade backup taken, and none recorded");
+    expect(r.stderr).toContain("can't read vault/data/brokenv/vault.db; it is not in any upgrade backup");
     expect(r.stderr).not.toMatch(/SQLiteError|^\s+at /m);
     expect(existsSync(join(home, "run", "release.json"))).toBe(false);
     expect(existsSync(join(dirname(home), "parachute-upgrade"))).toBe(false);

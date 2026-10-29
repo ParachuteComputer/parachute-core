@@ -61,6 +61,8 @@ interface Manifest {
   home: string;
   files: Record<string, string>;
   schemas: Record<string, number | null>;
+  /** Databases that couldn't be read, so weren't copied. A restore leaves them where they are. */
+  skipped?: string[];
 }
 
 const stamp = () => new Date().toISOString().replace(/[:.]/g, "-");
@@ -98,8 +100,8 @@ class Exit extends Error {
 }
 
 /** Copy each of the home's databases into `dest/home/<rel>`, consistently, with a checked manifest. */
-export function snapshot(home: string, dest: string, from: string): Manifest {
-  const dbs = databases(home, { hub: 0, vault: 0 });
+export function snapshot(home: string, dest: string, from: string, skipped: string[] = []): Manifest {
+  const dbs = databases(home, { hub: 0, vault: 0 }).filter((d) => !skipped.includes(d.rel));
   const need = dbs.reduce((n, d) => n + statSync(join(home, d.rel)).size + (existsSync(join(home, `${d.rel}-wal`)) ? statSync(join(home, `${d.rel}-wal`)).size : 0), 0);
   mkdirSync(dirname(dest), { recursive: true, mode: 0o700 });
   const free = statfsSync(dirname(dest));
@@ -107,7 +109,7 @@ export function snapshot(home: string, dest: string, from: string): Manifest {
     throw new Exit(EXIT.noRoom, `the backup before ${core.version} first opens this home needs ${size(need)} and ${dirname(dest)} has ${size(free.bavail * free.bsize)} free. Nothing was changed.`);
   }
   mkdirSync(join(dest, "home"), { recursive: true, mode: 0o700 });
-  const manifest: Manifest = { from, to: core.version, at: new Date().toISOString(), home, files: {}, schemas: {} };
+  const manifest: Manifest = { from, to: core.version, at: new Date().toISOString(), home, files: {}, schemas: {}, ...(skipped.length ? { skipped } : {}) };
   for (const d of dbs) {
     const to = join(dest, "home", d.rel);
     mkdirSync(dirname(to), { recursive: true, mode: 0o700 });
@@ -136,15 +138,16 @@ export function beforeOpen(home: string, say: (s: string) => void = (s) => conso
   }
   if (serveRefusal(home) !== null) return undefined;
   const since = new Date().toISOString();
-  const dbs = databases(home, { hub: 0, vault: 0 });
-  // A database that can't be read can't be backed up or judged. The command goes on and fails its own way (a vault
-  // that can't open stops serve with 75); nothing is recorded, so the next open of a readable home backs up first.
-  const unreadable = dbs.filter((d) => !readable(join(home, d.rel), dirname(home)));
-  if (unreadable.length) {
-    say(`parachute: can't read ${unreadable.map((d) => d.rel).join(", ")}; no upgrade backup taken, and none recorded`);
-    return undefined;
-  }
-  if (dbs.length === 0) {
+  let dbs = databases(home, { hub: 0, vault: 0 });
+  // A database that can't be read can't be backed up or judged: it is named, left out of the backup, and left alone
+  // by a restore. Every readable one is still backed up first. The command then goes on and fails its own way if it
+  // needs the broken one (a vault that can't open stops serve with 75). A home with nothing readable records nothing.
+  const unreadable = dbs.filter((d) => !readable(join(home, d.rel), dirname(home))).map((d) => d.rel);
+  const all = dbs;
+  dbs = dbs.filter((d) => !unreadable.includes(d.rel));
+  if (unreadable.length) say(`parachute: can't read ${unreadable.join(", ")}; it is not in any upgrade backup`);
+  if (unreadable.length && dbs.length === 0) return undefined;
+  if (all.length === 0) {
     const fresh: Release = { version: core.version, previous: was?.version ?? null, since, backup: null, state: "current" };
     writeRelease(home, fresh);
     return fresh;
@@ -168,7 +171,7 @@ export function beforeOpen(home: string, say: (s: string) => void = (s) => conso
   const previous = was ? (was.state === "rolled-back" ? (was.previous ?? "0.8") : was.version) : "0.8";
   const backup = join(dirname(home), "parachute-upgrade", `${previous}-to-${core.version}-${stamp()}`);
   say(`parachute: ${previous} → ${core.version} on this home: backing up its databases first, to ${backup}`);
-  snapshot(home, backup, previous);
+  snapshot(home, backup, previous, unreadable);
   const r: Release = { version: core.version, previous, since, backup, state: "current" };
   writeRelease(home, r);
   return r;
@@ -217,7 +220,14 @@ export function beforeOpenOrExit(home: string): number | null {
 
 function plan(home: string, r: Release, restore: boolean) {
   const manifest = r.backup ? (readJson(join(r.backup, "manifest.json")) as Manifest | undefined) : undefined;
-  const now = databases(home, { hub: 0, vault: 0 }).map((d) => ({ rel: d.rel, schema: schemaOf(join(home, d.rel), dirname(home)) ?? null }));
+  const schemaOrNull = (rel: string) => {
+    try {
+      return schemaOf(join(home, rel), dirname(home)) ?? null;
+    } catch {
+      return null; // can't be read: a database the backup skipped, which a restore leaves where it is
+    }
+  };
+  const now = databases(home, { hub: 0, vault: 0 }).map((d) => ({ rel: d.rel, schema: schemaOrNull(d.rel) }));
   // Code-only needs every database at a number the previous release opens: the number it had in the backup.
   const schemas = manifest?.schemas ?? {};
   const moved = now.filter((d) => d.rel in schemas && (d.schema ?? 0) > (schemas[d.rel] ?? 0));
@@ -287,7 +297,8 @@ export async function rollback(home: string, args: string[]): Promise<number> {
       const dir = join(r.backup!, `changed-since-${stamp()}`);
       // Always, a resumed restore too: what an interrupted one left (or an older release wrote since) is compared
       // with the backup like the rest, and a database already put back shows no change.
-      out.exported_notes = exportChanged(home, join(r.backup!, "home"), dir);
+      const left = p.manifest!.skipped ?? [];
+      out.exported_notes = exportChanged(home, join(r.backup!, "home"), dir, left);
       out.exported_to = dir;
       say(`Exported ${out.exported_notes} notes changed since the backup to ${dir}`);
       notHeld();
@@ -297,7 +308,7 @@ export async function rollback(home: string, args: string[]): Promise<number> {
       const aside = join(r.backup!, `after-${r.version}-${stamp()}`);
       const asides = [...(r.moved_aside ? [r.moved_aside] : []), ...(r.moved_aside_retries ?? [])];
       writeRelease(home, { ...r, state: "restoring", moved_aside: asides[0] ?? aside, ...(asides.length ? { moved_aside_retries: [...asides.slice(1), aside] } : {}) });
-      for (const rel of new Set([...p.now.map((d) => d.rel), ...Object.keys(files)])) {
+      for (const rel of new Set([...p.now.map((d) => d.rel).filter((rel) => !left.includes(rel)), ...Object.keys(files)])) {
         for (const suffix of ["", "-wal", "-shm"]) {
           const live = join(home, rel + suffix);
           if (!existsSync(live)) continue;
