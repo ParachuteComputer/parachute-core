@@ -214,12 +214,22 @@ export function beforeOpen(home: string, say: (s: string) => void = (s) => conso
     if (!r || r.version !== core.version || r.state !== "current") {
       // A step to take: let go, take the lock exclusively (it waits for the other commands), then hold it shared again.
       letGoShared();
-      const done = withReleaseLock(home, () => (recheckOrStop(recheck), beforeOpenLocked(home, say)));
-      if (done === undefined) {
-        // Nothing recorded (a home with nothing readable): still run holding the lock shared, checked again.
+      let seen = "";
+      const done = withReleaseLock(home, () => {
+        recheckOrStop(recheck);
+        const d = beforeOpenLocked(home, say);
+        seen = JSON.stringify(readRelease(home) ?? null);
+        return d;
+      });
+      if (done === "old-owner") return undefined; // the takeover's home: serve refuses it with 7 (dispatch)
+      if (done === "unreadable") {
+        // Nothing recorded (no database can be read). Run holding the lock shared, once nothing changed meanwhile:
+        // the same record, and still nothing readable. Otherwise take it from the top.
         holdShared(home);
         recheckOrStop(recheck);
-        return undefined;
+        const nothingReadable = databases(home, { hub: 0, vault: 0 }).every((d) => !readable(join(home, d.rel), dirname(home)));
+        if (nothingReadable && JSON.stringify(readRelease(home) ?? null) === seen) return undefined;
+        letGoShared();
       }
       continue;
     }
@@ -244,13 +254,14 @@ export function beforeOpen(home: string, say: (s: string) => void = (s) => conso
   throw new Exit(EXIT.failed, "this home's release record kept changing while this command started; run it again");
 }
 
-function beforeOpenLocked(home: string, say: (s: string) => void): Release | undefined {
+/** What the locked step did: the record now in force, or why it recorded nothing. */
+function beforeOpenLocked(home: string, say: (s: string) => void): Release | "old-owner" | "unreadable" {
   const was = readRelease(home);
   if (was && was.version === core.version && was.state === "current") return was.skipped?.length ? catchUp(home, was, say) : was;
   if (was?.state === "restoring") {
     throw new Exit(EXIT.failed, `a restore on this home was interrupted; what ${was.version} left is in ${was.moved_aside}. Run \`parachute upgrade --rollback --restore --yes\` again to finish it.`);
   }
-  if (serveRefusal(home) !== null) return undefined;
+  if (serveRefusal(home) !== null) return "old-owner";
   const since = new Date().toISOString();
   let dbs = databases(home, { hub: 0, vault: 0 });
   // A database that can't be read can't be backed up or judged: it is named, left out of the backup, and left alone
@@ -260,7 +271,7 @@ function beforeOpenLocked(home: string, say: (s: string) => void): Release | und
   const all = dbs;
   dbs = dbs.filter((d) => !unreadable.includes(d.rel));
   if (unreadable.length) say(`parachute: can't read ${unreadable.join(", ")}; it is not in any upgrade backup`);
-  if (unreadable.length && dbs.length === 0) return undefined;
+  if (unreadable.length && dbs.length === 0) return "unreadable";
   if (all.length === 0) {
     const fresh: Release = { version: core.version, previous: was?.version ?? null, since, backup: null, state: "current" };
     writeRelease(home, fresh);
