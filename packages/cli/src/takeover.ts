@@ -310,6 +310,41 @@ function managerEnv(): Map<string, string> | null {
   return env;
 }
 
+/**
+ * A value as `systemctl show-environment` prints it, decoded: as it is, or (when it has a space, a quote, a glob
+ * character, …) systemd's `$'…'` form (shell_maybe_quote with SHELL_ESCAPE_POSIX): `\\`, `\'`, `\"`, the C escapes,
+ * and other bytes as octal `\NNN` or `\xHH`. null for anything else, so the caller can say it couldn't be read.
+ */
+export function managerValue(v: string): string | null {
+  if (!v.startsWith("$'")) return v;
+  if (v.length < 3 || !v.endsWith("'")) return null;
+  const C: Record<string, number> = { a: 7, b: 8, e: 27, f: 12, n: 10, r: 13, t: 9, v: 11, "\\": 92, "'": 39, '"': 34, "?": 63 };
+  const chars = [...v.slice(2, -1)];
+  const bytes: number[] = [];
+  for (let i = 0; i < chars.length; i++) {
+    const c = chars[i]!;
+    if (c === "'") return null; // the quoting ended early: not one value
+    if (c !== "\\") {
+      bytes.push(...Buffer.from(c, "utf8"));
+      continue;
+    }
+    const n = chars[++i];
+    if (n === undefined) return null;
+    if (n in C) bytes.push(C[n]!);
+    else if (/[0-7]/.test(n)) {
+      let o = n;
+      while (o.length < 3 && /[0-7]/.test(chars[i + 1] ?? "")) o += chars[++i];
+      if (parseInt(o, 8) > 255) return null;
+      bytes.push(parseInt(o, 8));
+    } else if (n === "x" && /[0-9a-fA-F]/.test(chars[i + 1] ?? "")) {
+      let h = chars[++i]!;
+      if (/[0-9a-fA-F]/.test(chars[i + 1] ?? "")) h += chars[++i];
+      bytes.push(parseInt(h, 16));
+    } else return null;
+  }
+  return Buffer.from(bytes).toString("utf8");
+}
+
 /** PARACHUTE_HOME in the user manager's own environment, which every unit inherits; null when systemd can't say. */
 function managerHome(): string | undefined | null {
   const env = managerEnv();
@@ -1369,16 +1404,19 @@ function unitEnvironment(unit: string): string[] {
  * report). Without this, a takeover run under `systemd-run --user` checked v0.8 with the user manager's PATH, where
  * the modules' programs (scribe in ~/.bun/bin) aren't, though the unit's PATH has them (friends box, 10-29); and one
  * run from a shell would check with the shell's PATH what the unit runs with the manager's.
- * `unread`: environment files that exist but can't be read exactly (envFileVars), left out here; systemd still gives
- * them to the unit. No unit (a home a hand-run process served): the caller's environment, as it is.
+ * `unread`: what couldn't be read exactly (an environment file, see envFileVars; a manager value, see managerValue),
+ * left out here; systemd still gives it to the unit. No unit (a home a hand-run process served): the caller's environment, as it is.
  */
 function handOverEnv(from: string | undefined, base: NodeJS.ProcessEnv = process.env): { env: Record<string, string>; unread: string[] } {
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(base)) if (v !== undefined) env[k] = v;
   const unread: string[] = [];
   if (!from) return { env, unread };
-  // A value systemd printed quoted ($'…', escapes) isn't decoded here: the caller's stays for that name.
-  for (const [k, v] of managerEnv() ?? []) if (!v.startsWith("$'")) env[k] = v;
+  for (const [k, raw] of managerEnv() ?? []) {
+    const v = managerValue(raw);
+    if (v === null) unread.push(`the user manager's ${k}`); // the caller's stays for that name
+    else env[k] = v;
+  }
   const { vars, files } = unitEnv(from);
   for (const kv of vars) {
     const i = kv.indexOf("=");

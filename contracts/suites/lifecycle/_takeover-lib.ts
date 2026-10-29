@@ -143,7 +143,10 @@ stop_unit() {
 code=0
 case "$verb" in
   daemon-reload) exit 0 ;;
-  show-environment) printf 'HOME=%s\nLANG=C.UTF-8\nPATH=%s\nTMPDIR=%s\n' "$HOME" "$MANAGER_PATH" "$TMPDIR"; exit 0 ;;
+  show-environment)
+    # As systemd prints it: a value with a space, a quote or a backslash in its $'…' form, those two escaped.
+    q() { case "$1" in *" "*|*\\'*|*\\\\*) printf '%s%s%s' '$'"'" "$(printf '%s' "$1" | sed -e 's/[\\\\]/\\\\\\\\/g' -e "s/'/\\\\\\\\'/g")" "'" ;; *) printf '%s' "$1" ;; esac; }
+    printf 'HOME=%s\nLANG=C.UTF-8\nPATH=%s\nTMPDIR=%s\n' "$(q "$HOME")" "$(q "$MANAGER_PATH")" "$(q "$TMPDIR")"; exit 0 ;;
   is-active) for u in $units; do if known "$u"; then s=$(st "$u" active); echo "$s"; [ "$s" = active ] || code=3; else echo inactive; code=3; fi; done; exit $code ;;
   is-enabled) for u in $units; do if known "$u"; then s=$(st "$u" enabled); echo "$s"; [ "$s" = enabled ] || code=1; else echo "Failed to get unit file state for $u: No such file or directory" >&2; code=1; fi; done; exit $code ;;
   start|stop|restart|enable|disable)
@@ -222,7 +225,7 @@ export interface Machine {
 
 export async function newMachine(
   label: string,
-  opts: { oldInstall?: boolean; units?: Record<string, UnitState> } = {},
+  opts: { oldInstall?: boolean; units?: Record<string, UnitState>; managerPathFirst?: (user: string) => string } = {},
 ): Promise<Machine> {
   const info = candidate();
   const stock = await oldStock();
@@ -241,7 +244,8 @@ export async function newMachine(
   mkdirSync(fakeBin, { recursive: true });
   mkdirSync(state, { recursive: true });
   mkdirSync(unitDir, { recursive: true });
-  const managerPath = `${fakeBin}:${join(user, ".bun", "bin")}:${info.runtimeDir}:/usr/local/bin:/usr/bin:/bin`;
+  // `managerPathFirst`: a folder the user manager's PATH (not the shell's) starts with.
+  const managerPath = `${opts.managerPathFirst ? `${opts.managerPathFirst(user)}:` : ""}${fakeBin}:${join(user, ".bun", "bin")}:${info.runtimeDir}:/usr/local/bin:/usr/bin:/bin`;
   writeFileSync(
     join(fakeBin, "systemctl"),
     FAKE_SYSTEMCTL.replace("__STATE__", JSON.stringify(state)).replace("__UNITS__", JSON.stringify(unitDir)).replace("__PATH__", JSON.stringify(managerPath)),
