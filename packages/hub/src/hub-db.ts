@@ -897,16 +897,15 @@ const MIGRATIONS: readonly Migration[] = [
     sql: `
       -- Keys with scopes (T-318 design §2, revision 5; keys.ts). A key names,
       -- owns and describes one row of the token registry; the token row stays
-      -- the one source of truth for signature, expiry and revocation, so a
-      -- key can never change how a token verifies.
+      -- the one source of truth for signature, expiry, revocation, scopes and
+      -- tag scope (read live, so a vault rename can't leave a key stale): a
+      -- key can never change how a token verifies. An app's key follows its
+      -- refresh family through rotation.
       --
       --   name        unique, human: the token's label, app or owner
       --   owner       users.id for a person's (or a person's agent's or app's)
       --               key; the service name for a service key; NULL if unknown
       --   owner_kind  person | agent | app | service
-      --   scopes      the token's scopes, verbatim
-      --   allow_tags  today's tag scope (permissions.scoped_tags), as an
-      --               explicit allow list, which behaves exactly as today
       --   types       type scope (JSON array); NULL until keys scope by type
       --   denies      explicit denies (JSON array, e.g. ["private"]); NULL until enforced
       CREATE TABLE keys (
@@ -914,8 +913,6 @@ const MIGRATIONS: readonly Migration[] = [
         jti TEXT NOT NULL UNIQUE REFERENCES tokens(jti) ON DELETE CASCADE,
         owner TEXT,
         owner_kind TEXT NOT NULL CHECK (owner_kind IN ('person', 'agent', 'app', 'service')),
-        scopes TEXT NOT NULL,
-        allow_tags TEXT,
         types TEXT,
         denies TEXT,
         created_via TEXT,

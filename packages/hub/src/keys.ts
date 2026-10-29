@@ -9,8 +9,10 @@
  * stays the one source of truth for signature, expiry and revocation.
  *
  * What this lands (0.9.1 groundwork): the `keys` table (hub.db v25), the
- * migration that adopts every live token as a key, and a key for every new
- * mint recorded through `recordTokenMint`. Not yet: minting by key name
+ * migration that adopts every live token as a key, a key for every new mint
+ * (`recordTokenMint`), and one key per OAuth refresh family that follows it
+ * through rotation (`signRefreshToken`). Scopes and tag scope are read live
+ * from the token row, never copied. Not yet: minting by key name
  * (`parachute keys new`), type scopes and denies being enforced (the columns
  * exist, empty), and faces.
  */
@@ -23,9 +25,6 @@ export interface KeyRow {
   jti: string;
   owner: string | null;
   owner_kind: KeyOwnerKind;
-  scopes: string;
-  /** Today's tag scope (`permissions.scoped_tags`), carried as an explicit allow list. */
-  allow_tags: string | null;
   /** Type scope (§8a). Empty until 0.9.1 mints scope by type; the vault knows which tags are types. */
   types: string | null;
   denies: string | null;
@@ -37,9 +36,11 @@ export interface KeyView {
   name: string;
   owner: string | null;
   owner_kind: KeyOwnerKind;
+  /** The token's scopes, read live from the registry. */
   scopes: string[];
   /** Per vault, the highest level the scopes grant: `{uni: "write"}`. */
   levels: Record<string, "read" | "write" | "admin">;
+  /** Today's tag scope (`permissions.scoped_tags`) as an explicit allow list, read live: it behaves exactly as today. */
   allow_tags: string[] | null;
   types: string[] | null;
   denies: string[] | null;
@@ -106,10 +107,23 @@ function insertKey(db: Database, t: TokenRow): string {
   const name = uniqueName(db, baseName(t));
   const { owner, owner_kind } = ownerOf(t);
   db.prepare(
-    `INSERT INTO keys (name, jti, owner, owner_kind, scopes, allow_tags, types, denies, created_via, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)`,
-  ).run(name, t.jti, owner, owner_kind, t.scopes ?? "", allowTags(t.permissions), t.created_via, t.created_at);
+    `INSERT INTO keys (name, jti, owner, owner_kind, types, denies, created_via, created_at)
+     VALUES (?, ?, ?, ?, NULL, NULL, ?, ?)`,
+  ).run(name, t.jti, owner, owner_kind, t.created_via, t.created_at);
   return name;
+}
+
+/**
+ * An app's refresh token: one key per refresh family. A rotation moves the
+ * family's key onto the new token row instead of making a key per rotation.
+ */
+export function adoptRefreshToken(db: Database, jti: string, familyId: string): string | null {
+  const key = db
+    .prepare(`SELECT k.name FROM keys k JOIN tokens t ON t.jti = k.jti WHERE t.family_id = ? AND k.jti != ?`)
+    .get(familyId, jti) as { name: string } | null;
+  if (!key) return adoptToken(db, jti);
+  db.prepare("UPDATE keys SET jti = ? WHERE name = ?").run(jti, key.name);
+  return key.name;
 }
 
 /** Give the token `jti` its key, if it hasn't one. Returns the key's name. */
@@ -142,12 +156,12 @@ export function adoptLiveTokens(db: Database, now: Date = new Date()): number {
 export function listKeys(db: Database, now: Date = new Date()): KeyView[] {
   const rows = db
     .prepare(
-      `SELECT k.*, t.revoked_at, t.expires_at FROM keys k JOIN tokens t ON t.jti = k.jti ORDER BY k.created_at, k.name`,
+      `SELECT k.*, t.scopes, t.permissions, t.revoked_at, t.expires_at FROM keys k JOIN tokens t ON t.jti = k.jti ORDER BY k.created_at, k.name`,
     )
-    .all() as (KeyRow & { revoked_at: string | null; expires_at: string | null })[];
+    .all() as (KeyRow & { scopes: string | null; permissions: string | null; revoked_at: string | null; expires_at: string | null })[];
   const list = (v: string | null) => (v ? (JSON.parse(v) as string[]) : null);
   return rows.map((r) => {
-    const scopes = r.scopes.split(/\s+/).filter(Boolean);
+    const scopes = (r.scopes ?? "").split(/\s+/).filter(Boolean);
     const levels: Record<string, "read" | "write" | "admin"> = {};
     for (const s of scopes) {
       const m = s.match(/^vault:([^:]+):(read|write|admin)$/);
@@ -161,7 +175,7 @@ export function listKeys(db: Database, now: Date = new Date()): KeyView[] {
       owner_kind: r.owner_kind,
       scopes,
       levels,
-      allow_tags: list(r.allow_tags),
+      allow_tags: list(allowTags(r.permissions)),
       types: list(r.types),
       denies: list(r.denies),
       status: r.revoked_at ? "revoked" : r.expires_at && r.expires_at <= now.toISOString() ? "expired" : "active",

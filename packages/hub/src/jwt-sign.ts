@@ -27,7 +27,7 @@ import {
   importSPKI,
   jwtVerify,
 } from "jose";
-import { adoptToken } from "./keys.ts";
+import { adoptRefreshToken, adoptToken } from "./keys.ts";
 import { attributionPubkey } from "./pubkey-links.ts";
 import { renameVaultScopes, vaultScopeName } from "./scope-explanations.ts";
 import { getActiveSigningKey, getAllPublicKeys } from "./signing-keys.ts";
@@ -274,6 +274,7 @@ export function signRefreshToken(db: Database, opts: SignRefreshTokenOpts): Sign
       err,
     );
   }
+  keyForMint(db, opts.jti, familyId);
   return { token, refreshTokenHash, familyId, expiresAt };
 }
 
@@ -417,9 +418,10 @@ export function recordTokenMint(db: Database, opts: RecordTokenMintOpts): void {
  * the token, so failing to write one must never fail the mint: it is logged,
  * and the next start's migration-style adoption can fill it in.
  */
-function keyForMint(db: Database, jti: string): void {
+function keyForMint(db: Database, jti: string, refreshFamily?: string): void {
   try {
-    adoptToken(db, jti);
+    if (refreshFamily) adoptRefreshToken(db, jti, refreshFamily);
+    else adoptToken(db, jti);
   } catch (err) {
     console.error(`[hub] could not record a key for jti=${jti}: ${err instanceof Error ? err.message : String(err)}`);
   }
