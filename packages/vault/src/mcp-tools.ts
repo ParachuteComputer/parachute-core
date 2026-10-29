@@ -9,7 +9,7 @@ import { generateMcpTools, resolveNote } from "../core/src/mcp.ts";
 import { projectHistoryProvenance } from "../core/src/history-visibility.js";
 import type { McpToolDef, GenerateMcpToolsOpts } from "../core/src/mcp.ts";
 import { MCP_TOOL_REFERENCE, acceptedParams } from "../core/src/mcp-manifest.ts";
-import { checkToolParams } from "../core/src/mcp-short.ts";
+import { checkToolParams, NEW_TOOLS, TOOL_ALIASES, TOOL_ORDER, aliasDescription } from "../core/src/mcp-short.ts";
 import { getNote, getNoteTags, getVaultMap, getVaultStats } from "../core/src/notes.ts";
 import { narrowLinkWarningsForVisibility } from "../core/src/wikilinks.ts";
 import type { Note } from "../core/src/types.ts";
@@ -345,10 +345,103 @@ export function generateScopedMcpTools(
   // callers. See vault#376. The raw caller bearer (vault#403, MGT) is
   // forwarded to hub's mint-token attenuation proxy on mint.
   tools.push(buildManageTokenTool(vaultName, auth, callerBearer ?? null));
-  applyParamTeaching(tools, vaultName);
+  const shaped = applyElevenTools(tools, vaultName, auth);
+  applyParamTeaching(shaped, vaultName);
 
-  return tools;
+  return shaped;
 }
+
+/**
+ * 0.9's tool shape (T-318 §4): eleven tools, built from the old ones after every
+ * scope guard and wrapper is on them, so a new name can never do more than the
+ * old one did. `manage-types` and `attachment-url` dispatch on `action`;
+ * `manage-keys` is `manage-token` renamed; `query-notes {path_between}` runs
+ * find-path. The nine old names stay listed (Prism allow-lists some by name)
+ * with a one-line deprecation description, and their object results carry a
+ * `deprecation` field. Gone in 1.0.
+ */
+function applyElevenTools(tools: McpToolDef[], vaultName: string, auth: AuthResult | undefined): McpToolDef[] {
+  const byName = new Map(tools.map((t) => [t.name, t]));
+  const out: McpToolDef[] = [];
+
+  for (const [name, spec] of Object.entries(NEW_TOOLS)) {
+    const folded = Object.values(spec.folds).map((n) => byName.get(n));
+    if (folded.some((t) => !t)) continue; // e.g. no attachment tickets wired: no attachment-url
+    const actions = Object.keys(spec.folds);
+    out.push({
+      name,
+      description: spec.description,
+      inputSchema: spec.inputSchema,
+      // The least any action needs; each action re-checks its own verb below.
+      requiredVerb: folded.map((t) => t!.requiredVerb ?? "write").sort((a, b) => VERB_RANK[a]! - VERB_RANK[b]!)[0]!,
+      execute: async (params) => {
+        const action = (params.action ?? (name === "manage-types" ? "update" : undefined)) as string | undefined;
+        const target = action ? byName.get(spec.folds[action] ?? "") : undefined;
+        if (!target) {
+          throw Object.assign(new Error(`${name} needs \`action\`: ${actions.join(", ")}.`), {
+            error_type: "unknown_parameter",
+            field: "action",
+            hint: `one of ${actions.join(", ")}`,
+          });
+        }
+        const verb = target.requiredVerb ?? "write";
+        // No auth context means the caller's scopes were already settled outside (local stdio): nothing to narrow.
+        if (auth && !hasScopeForVault(auth.scopes, vaultName, verb)) {
+          throw new Error(`Forbidden: ${name} {action: "${action}"} needs the 'vault:${vaultName}:${verb}' scope.`);
+        }
+        const { action: _drop, ...rest } = params;
+        return target.execute(rest);
+      },
+    });
+  }
+
+  const token = byName.get("manage-token");
+  if (token) {
+    out.push({ ...token, name: "manage-keys", description: token.description.replace('vault-info {help: \"manage-token\"}', 'vault-info {help: \"manage-keys\"}') });
+  }
+
+  const query = byName.get("query-notes");
+  const findPath = byName.get("find-path");
+  if (query && findPath) {
+    const execute = query.execute;
+    query.execute = async (params) => {
+      if (params.path_between === undefined) return execute(params);
+      const pb = params.path_between as Record<string, unknown> | null;
+      if (!pb || typeof pb !== "object" || Array.isArray(pb)) {
+        throw Object.assign(new Error("path_between takes {source, target, max_depth?}."), { error_type: "invalid_query", field: "path_between" });
+      }
+      return findPath.execute(pb);
+    };
+  }
+
+  for (const t of tools) {
+    if (!(t.name in TOOL_ALIASES)) {
+      out.push(t);
+      continue;
+    }
+    const execute = t.execute;
+    const use = TOOL_ALIASES[t.name]!;
+    out.push({
+      ...t,
+      description: aliasDescription(t.name),
+      execute: async (params) => {
+        const result = await execute(params);
+        if (result && typeof result === "object" && !Array.isArray(result)) {
+          return { ...(result as Record<string, unknown>), deprecation: { tool: t.name, use, removed_in: "1.0" } };
+        }
+        return result;
+      },
+    });
+  }
+
+  const rank = (n: string) => {
+    const i = TOOL_ORDER.indexOf(n);
+    return i === -1 ? TOOL_ORDER.length : i;
+  };
+  return out.sort((a, b) => rank(a.name) - rank(b.name));
+}
+
+const VERB_RANK: Record<string, number> = { read: 0, write: 1, admin: 2 };
 
 /**
  * Errors that teach (T-318 §4): a parameter a tool doesn't accept is refused
@@ -358,7 +451,13 @@ export function generateScopedMcpTools(
  */
 function applyParamTeaching(tools: McpToolDef[], vaultName: string): void {
   for (const tool of tools) {
-    const reference = tool.name === "manage-token" ? Object.keys(manageTokenReference(vaultName).inputSchema.properties as object) : acceptedParams(tool.name);
+    const folds = NEW_TOOLS[tool.name]?.folds;
+    const reference =
+      tool.name === "manage-token" || tool.name === "manage-keys"
+        ? Object.keys(manageTokenReference(vaultName).inputSchema.properties as object)
+        : folds
+          ? ["action", ...Object.values(folds).flatMap((n) => acceptedParams(n) ?? [])]
+          : acceptedParams(tool.name);
     if (!reference) continue;
     const accepted = [...new Set([...reference, ...Object.keys(((tool.inputSchema as { properties?: object }).properties) ?? {})])];
     const execute = tool.execute;
@@ -1066,7 +1165,22 @@ function overrideVaultInfo(
     // parameter, which tools/list no longer carries.
     if (params.help !== undefined) {
       const name = String(params.help);
-      const ref = name === "manage-token" ? manageTokenReference(vaultName) : MCP_TOOL_REFERENCE.find((e) => e.name === name);
+      if (NEW_TOOLS[name]) {
+        const spec = NEW_TOOLS[name]!;
+        return {
+          tool: name,
+          description: spec.description,
+          parameters: spec.inputSchema,
+          // Each action takes the parameters of the tool it replaces.
+          actions: Object.fromEntries(
+            Object.entries(spec.folds).map(([action, old]) => [action, { replaces: old, parameters: MCP_TOOL_REFERENCE.find((e) => e.name === old)?.inputSchema }]),
+          ),
+        };
+      }
+      const ref =
+        name === "manage-token" || name === "manage-keys"
+          ? { ...manageTokenReference(vaultName), name }
+          : MCP_TOOL_REFERENCE.find((e) => e.name === name);
       if (!ref) {
         throw Object.assign(new Error(`No tool named "${name}". Tools: ${tools.map((t) => t.name).join(", ")}.`), {
           error_type: "unknown_tool",

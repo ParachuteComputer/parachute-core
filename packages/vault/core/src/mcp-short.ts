@@ -34,6 +34,11 @@ export interface ShortTool {
   inputSchema: Schema;
 }
 
+const PATH_BETWEEN_REF: Schema = {
+  ...obj({ source: str(), target: str(), max_depth: num() }, ["source", "target"]),
+  description: "The shortest link path between two notes, instead of notes",
+};
+
 const LINKS = {
   type: "array",
   items: obj({ target: str("Note path or id"), relationship: str() }, ["target"]),
@@ -41,7 +46,7 @@ const LINKS = {
 
 export const SHORT_TOOLS: Record<string, ShortTool> = {
   "query-notes": {
-    description: `Read notes: one note, a filtered list, a search, a link neighbourhood, counts, or a note's history.
+    description: `Read notes: one note, a filtered list, a search, a link neighbourhood or path, counts, or a note's history.
 - One note: \`id\` (id, path or title). Lists leave content out unless \`include_content: true\`.
 - Filters combine (AND). \`tag\` also matches subtypes (\`event\` finds \`event/meeting\`). \`metadata\` operators need an indexed field (vault-info lists them).
 - Returns an array of notes, or \`{notes, next_cursor?, warnings?}\` with \`cursor\` or warnings, or \`[{group, value}]\` with \`aggregate\`.
@@ -92,6 +97,7 @@ Rarer filters (has_links, order_by, expand_links, created_by, search_mode, …) 
       include_attachments: bool(),
       content_offset: num("Byte offset, for long notes"),
       content_length: num("Bytes to return"),
+      path_between: PATH_BETWEEN_REF,
     }),
   },
 
@@ -288,3 +294,74 @@ export function checkToolParams(tool: string, params: Record<string, unknown>, a
   }
   return null;
 }
+
+// ---------------------------------------------------------------------------
+// 0.9's eleven tools (T-318 §4): three new names fold nine old ones
+// ---------------------------------------------------------------------------
+
+/** The tools 0.9 adds; each runs the old tools underneath (src/mcp-tools.ts). */
+export const NEW_TOOLS: Record<string, ShortTool & { folds: Record<string, string> }> = {
+  "manage-types": {
+    description: `Change the vault's types and tags. \`action\`: update (default: create or change a tag, its \`fields\` and \`parent_names\`), rename {old_name, new_name}, merge {sources, target}, delete {tag, detach?}, prune (drop unused indexed columns; a dry run unless \`apply: true\`). ${HELP("manage-types")}`,
+    inputSchema: obj(
+      {
+        action: { type: "string", enum: ["update", "rename", "merge", "delete", "prune"] },
+        tag: str(),
+        description: str(),
+        fields: { type: "object", description: '{name: {type: "string"|"integer"|"boolean"|"date"|…, enum?, indexed?, default?}}' },
+        parent_names: { type: "array", items: { type: "string" } },
+        old_name: str(),
+        new_name: str(),
+        sources: { type: "array", items: { type: "string" } },
+        target: str(),
+        detach: bool(),
+        apply: bool(),
+      },
+    ),
+    folds: { update: "update-tag", rename: "rename-tag", merge: "merge-tags", delete: "delete-tag", prune: "prune-schema" },
+  },
+  "attachment-url": {
+    description: `A one-use URL for an attachment's bytes. upload: \`note\`, \`filename\` and exact \`size_bytes\`, then PUT the bytes to \`url\`. download: \`attachment_id\` (from query-notes \`include_attachments: true\`). ${HELP("attachment-url")}`,
+    inputSchema: obj(
+      {
+        action: { type: "string", enum: ["upload", "download"] },
+        note: str("upload: note id or path"),
+        filename: str(),
+        size_bytes: num(),
+        mime_type: str(),
+        transcribe: bool("Audio: transcribe it"),
+        attachment_id: str("download"),
+      },
+      ["action"],
+    ),
+    folds: { upload: "request-attachment-upload", download: "request-attachment-download" },
+  },
+};
+
+/** `query-notes {path_between}` replaces find-path. */
+export const PATH_BETWEEN: Schema = PATH_BETWEEN_REF;
+
+/** The nine old names 0.9 keeps as listed, working aliases until 1.0 (Prism allow-lists some by name). */
+export const TOOL_ALIASES: Record<string, string> = {
+  "find-path": "query-notes {path_between: {source, target}}",
+  "update-tag": 'manage-types {action: "update"}',
+  "rename-tag": 'manage-types {action: "rename"}',
+  "merge-tags": 'manage-types {action: "merge"}',
+  "delete-tag": 'manage-types {action: "delete"}',
+  "prune-schema": 'manage-types {action: "prune"}',
+  "request-attachment-upload": 'attachment-url {action: "upload"}',
+  "request-attachment-download": 'attachment-url {action: "download"}',
+  "manage-token": "manage-keys",
+};
+
+/** An alias's description: the one deprecation line, then nothing else (the schema stays as it was). */
+export function aliasDescription(tool: string): string {
+  return `Deprecated (gone in 1.0): use ${TOOL_ALIASES[tool]}. Same parameters as before.`;
+}
+
+/** The order tools/list sends: the eleven, then the aliases. */
+export const TOOL_ORDER = [
+  "query-notes", "create-note", "update-note", "delete-note", "list-tags", "vault-info", "doctor",
+  "read-attachment", "attachment-url", "manage-types", "manage-keys",
+  ...Object.keys(TOOL_ALIASES),
+];
