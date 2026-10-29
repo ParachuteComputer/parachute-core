@@ -541,8 +541,9 @@ describe("attachment tickets — discoverability", () => {
 
     const disabled = attachmentsInstructionBlock({ ticketsEnabled: false });
     expect(disabled).not.toContain("request-attachment-upload");
-    // The REST fallback recipe is always present, wired or not.
+    // Without tickets, the REST recipe is the way in (with tickets, the short brief leaves it out).
     expect(disabled).toContain("/storage/upload");
+    expect(enabled).not.toContain("/storage/upload");
   });
 
   test("bun's connect-time getServerInstruction includes the Attachments section and teaches the ticket tools", async () => {

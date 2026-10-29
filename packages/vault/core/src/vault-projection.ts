@@ -322,6 +322,9 @@ export function attachmentsInstructionBlock(opts: { ticketsEnabled: boolean; rea
       "`read-attachment` reads one into the conversation.",
     );
   }
+  if (!opts.ticketsEnabled) {
+    sentences.push("Over REST: `POST {base}/storage/upload` (multipart `file`), then `POST {base}/notes/{id}/attachments` `{path, mimeType}`.");
+  }
   return sentences.join(" ");
 }
 
