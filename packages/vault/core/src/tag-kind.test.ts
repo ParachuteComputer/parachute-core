@@ -13,15 +13,15 @@ function fresh() {
 }
 const tool = (tools: ReturnType<typeof generateMcpTools>, name: string) => tools.find((t) => t.name === name)!;
 
-describe("v33: every tag record gets a kind", () => {
+describe("every tag record gets a kind (an additive column, no schema number)", () => {
   test("fields or parents or being a parent make a type; everything else is a tag; idempotent; same columns as fresh", async () => {
     const { db, store } = fresh();
     await store.upsertTagRecord("person", { fields: { email: { type: "string" } } });
     await store.upsertTagRecord("event/meeting", { parent_names: ["event"] });
     await store.upsertTagRecord("described", { description: "only a description" });
     await store.createNote("x", { tags: ["pinned", "project/alder", "person", "event/meeting", "event"] });
-    // Back to v32 by hand: the column gone, the version stamped 32.
-    db.exec("ALTER TABLE tags DROP COLUMN kind; DELETE FROM schema_version; INSERT INTO schema_version (version, applied_at) VALUES (32, '2026-10-01T00:00:00.000Z')");
+    // A file as a 0.7/0.8 vault leaves it: no kind column.
+    db.exec("ALTER TABLE tags DROP COLUMN kind");
     initSchema(db);
     initSchema(db);
     expect(Object.fromEntries(tagKinds(db))).toEqual({
@@ -42,10 +42,19 @@ describe("v33: every tag record gets a kind", () => {
     db.close();
   });
 
-  test("a v33 vault opened by an older build is refused, not misread (the rollback is the takeover's restore)", () => {
-    const { db } = fresh();
-    db.exec(`INSERT INTO schema_version (version, applied_at) VALUES (${SCHEMA_VERSION + 1}, '2099-01-01T00:00:00.000Z')`);
-    expect(() => initSchema(db)).toThrow();
+  test("the other way: the file keeps its schema number, and an older vault's own writes still work on it", async () => {
+    const { db, store } = fresh();
+    await store.upsertTagRecord("task", { fields: { state: { type: "string" } } });
+    expect((db.prepare("SELECT MAX(version) AS v FROM schema_version").get() as { v: number }).v).toBe(32);
+    // What a 0.7/0.8 vault writes: it names its columns and knows nothing of kind.
+    db.prepare("INSERT INTO tags (name, description, fields, relationships, parent_names, created_at, updated_at) VALUES ('older', NULL, '{\"a\":{\"type\":\"string\"}}', NULL, NULL, 'x', 'x')").run();
+    db.prepare("INSERT OR IGNORE INTO tags (name) VALUES ('label')").run();
+    expect(tagKinds(db).get("older")).toBe("type"); // read by the rule while unrecorded
+    initSchema(db); // the next open records it
+    expect(db.prepare("SELECT name, kind FROM tags WHERE name IN ('older', 'label') ORDER BY name").all()).toEqual([
+      { name: "label", kind: "tag" },
+      { name: "older", kind: "type" },
+    ]);
     db.close();
   });
 
