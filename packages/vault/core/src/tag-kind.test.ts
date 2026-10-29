@@ -59,6 +59,33 @@ describe("v33: every tag record gets a kind", () => {
 });
 
 describe("kind rules", () => {
+  test("a parent's own record is never written: not by naming it, not by editing it; kind tag on a parent is refused", async () => {
+    const { db, store } = fresh();
+    await store.upsertTagRecord("child", { parent_names: ["parent"] });
+    await store.createNote("p", { tags: ["parent"] });
+    await store.upsertTagRecord("parent", { description: "edited" });
+    expect((db.prepare("SELECT kind FROM tags WHERE name = 'parent'").get() as { kind: string | null }).kind).toBeNull();
+    expect(tagKinds(db).get("parent")).toBe("type");
+    await expect(store.upsertTagRecord("parent", { kind: "tag" })).rejects.toThrow(/another tag's parent/);
+    // Drop the child's parent: the parent reads as a tag again, the same on any vault.
+    await store.upsertTagRecord("child", { parent_names: [] });
+    expect(tagKinds(db).get("parent")).toBe("tag");
+    db.close();
+  });
+
+  test("types with the wrong shape, and type with tags that can't be said exactly, are refused with the fix", async () => {
+    const { db, store, tools } = fresh();
+    await store.upsertTagRecord("person", { fields: { email: { type: "string" } } });
+    await store.upsertTagRecord("org", { fields: { site: { type: "string" } } });
+    await expect(tool(tools, "create-note").execute({ path: "X", content: "x", types: { add: ["person"] } })).rejects.toThrow(/types takes a list of names/);
+    expect(tagKinds(db).has("[object Object]")).toBe(false);
+    const q = tool(tools, "query-notes");
+    await expect(q.execute({ type: ["person", "org"], tag: "a" })).rejects.toThrow(/pass one type/);
+    await expect(q.execute({ type: "person", tag: ["a", "b"] })).rejects.toThrow(/tag_match/);
+    await q.execute({ type: "person", tag: ["a", "b"], tag_match: "all" });
+    db.close();
+  });
+
   test("naming a parent never writes the parent's record; it reads as a type", async () => {
     const { db, store } = fresh();
     await store.upsertTagRecord("secret", { kind: "tag" });

@@ -33,6 +33,7 @@
         "tags": [
           "personal"
         ],
+        "types": [],
         "metadata": {},
         "byteSize": 12,
         "preview": "personal dup",
@@ -51,6 +52,7 @@
         "tags": [
           "work"
         ],
+        "types": [],
         "metadata": {},
         "byteSize": 11,
         "preview": "src [[Dup]]",
@@ -92,6 +94,7 @@
         "tags": [
           "personal"
         ],
+        "types": [],
         "metadata": {},
         "byteSize": 12,
         "preview": "personal dup",
@@ -110,6 +113,7 @@
         "tags": [
           "work"
         ],
+        "types": [],
         "metadata": {},
         "byteSize": 11,
         "preview": "src [[Dup]]",

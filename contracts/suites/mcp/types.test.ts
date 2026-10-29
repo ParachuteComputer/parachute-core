@@ -42,6 +42,11 @@ describe("mcp/types", () => {
     await expect(c.call("create-note", { path: runId("bad"), content: "z", types: [pin] })).rejects.toThrow(/plain tag, not a type/);
     const rest = await operator().post("/notes", { path: runId("r"), content: "r", types: [pin] });
     expect(rest.status).toBe(422);
+    // PATCH: types with tags {add} land; with a tags array (which PATCH ignores on an existing note) they are refused, not dropped.
+    const patched = await operator().patch(`/notes/${enc(path)}`, { tags: { add: [] }, types: { add: [task] }, force: true });
+    expect(patched.status).toBe(200);
+    const mixed = await operator().patch(`/notes/${enc(path)}`, { tags: [pin], types: [task], force: true });
+    expect(mixed.status).toBe(400);
     await c.close();
   });
 

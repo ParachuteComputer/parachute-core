@@ -33,7 +33,7 @@ import {
 import { generateUlid } from "./ulid.js";
 import { captureVersion, readPriorNoteRow, DEFAULT_HISTORY_POLICY, type HistoryPolicy } from "./history.js";
 import { refreshCompactState } from "./history-compact-state.js";
-import { typeNames } from "./tag-kind.js";
+import { typeNamesAmong } from "./tag-kind.js";
 
 /**
  * Write-attribution context (vault#298) — the two axes of provenance threaded
@@ -162,10 +162,8 @@ export function getNote(db: Database, id: string): Note | null {
 /** Attach a note's tags, and the subset that are types (T-318 §8a). */
 function withTagsAndTypes(db: Database, note: Note): void {
   note.tags = getNoteTags(db, note.id);
-  if (note.tags.length) {
-    const types = typeNames(db);
-    note.types = note.tags.filter((t) => types.has(t));
-  } else note.types = [];
+  const types = typeNamesAmong(db, note.tags);
+  note.types = note.tags.filter((t) => types.has(t));
 }
 
 /**
@@ -1704,7 +1702,11 @@ function fetchNotesByIdsOrdered(db: Database, ids: string[]): Note[] {
     if (row) notes.push(rowToNote(row));
   }
   const tagsById = getNoteTagsForNotes(db, notes.map((n) => n.id));
-  for (const note of notes) note.tags = tagsById.get(note.id) ?? [];
+  const types = typeNamesAmong(db, [...new Set([...tagsById.values()].flat())]);
+  for (const note of notes) {
+    note.tags = tagsById.get(note.id) ?? [];
+    note.types = note.tags.filter((t) => types.has(t));
+  }
   return notes;
 }
 
@@ -2231,7 +2233,7 @@ export function semanticSearchNotes(
 function notesWithTags(db: Database, rows: NoteRow[], scores?: Map<string, number>): Note[] {
   const notes = rows.map(rowToNote);
   const tagsById = getNoteTagsForNotes(db, notes.map((n) => n.id));
-  const types = notes.length ? typeNames(db) : new Set<string>();
+  const types = typeNamesAmong(db, [...new Set([...tagsById.values()].flat())]);
   for (const note of notes) {
     note.tags = tagsById.get(note.id) ?? [];
     note.types = note.tags.filter((t) => types.has(t));

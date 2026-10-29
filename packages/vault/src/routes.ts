@@ -3151,6 +3151,10 @@ async function handleNotesInner(
       // shape parsed the body only after the not-found check.
       const parsedBody = await parseJsonBody(req);
       if (!parsedBody.ok) return parsedBody.response;
+      // A tags array on PATCH only matters to the if_missing create path; types go with {add, remove} or alone.
+      if ((parsedBody.body as any)?.types !== undefined && Array.isArray((parsedBody.body as any)?.tags) && (parsedBody.body as any)?.if_missing !== "create") {
+        return Response.json({ error: "send types with tags: {add, remove}, or alone", error_type: "tag_kind", field: "types", hint: "tags: {add: [...]}, types: {add: [...]}" }, { status: 400 });
+      }
       const folded = foldRestTypes(store.db, parsedBody.body, Array.isArray((parsedBody.body as any)?.tags) ? "create" : "update", tagScope.raw === null ? null : (t) => tagVisibleInScope(t, tagScope.allowed, tagScope.raw));
       if (folded instanceof Response) return folded;
       const body = folded as any;

@@ -44,6 +44,20 @@ export function tagKinds(db: Database): Map<string, TagKind> {
   return new Map(rows.map((r) => [r.name, r.kind]));
 }
 
+/** Which of `names` are types (only those rows are read: cheap on every note read). */
+export function typeNamesAmong(db: Database, names: string[]): Set<string> {
+  if (!names.length) return new Set();
+  const out = new Set<string>();
+  for (let i = 0; i < names.length; i += 500) {
+    const chunk = names.slice(i, i + 500);
+    const rows = db
+      .prepare(`SELECT t.name AS name FROM tags t WHERE t.name IN (${chunk.map(() => "?").join(", ")}) AND ${KIND_SQL} = 'type'`)
+      .all(...chunk) as { name: string }[];
+    for (const r of rows) out.add(r.name);
+  }
+  return out;
+}
+
 /** The names whose effective kind is `type`. */
 export function typeNames(db: Database): Set<string> {
   const rows = db.prepare(`SELECT t.name AS name FROM tags t WHERE ${KIND_SQL} = 'type'`).all() as { name: string }[];
@@ -51,14 +65,21 @@ export function typeNames(db: Database): Set<string> {
 }
 
 /**
- * The v33 migration's rule (§8a step 1): every row gets an explicit kind,
- * `type` when it has fields or parents or is named as a parent, else `tag`.
- * Idempotent: rows that already have a kind keep it.
+ * The v33 migration's rule (§8a step 1): every row records its kind, `type`
+ * when it has fields or parents, else `tag`. Being named as a parent is not
+ * recorded: it is read live (KIND_SQL), on a migrated vault as on a new one,
+ * so dropping the last child reads the same everywhere. Returns the effective
+ * counts (parents included). Idempotent: rows that already have a kind keep it.
  */
 export function recordTagKinds(db: Database): { types: number; tags: number } {
-  db.exec(`UPDATE tags AS t SET kind = ${DERIVED_KIND} WHERE t.kind IS NULL`);
-  const rows = db.prepare("SELECT kind, COUNT(*) AS n FROM tags GROUP BY kind").all() as { kind: TagKind; n: number }[];
-  return { types: rows.find((r) => r.kind === "type")?.n ?? 0, tags: rows.find((r) => r.kind === "tag")?.n ?? 0 };
+  db.exec(`UPDATE tags AS t SET kind = CASE WHEN ${HAS_STRUCTURE} THEN 'type' ELSE 'tag' END WHERE t.kind IS NULL`);
+  const kinds = [...tagKinds(db).values()];
+  return { types: kinds.filter((k) => k === "type").length, tags: kinds.filter((k) => k === "tag").length };
+}
+
+/** Whether some tag names `name` as a parent. */
+export function isParent(db: Database, name: string): boolean {
+  return !!db.prepare(`SELECT 1 FROM tags t WHERE t.name = ? AND ${IS_PARENT}`).get(name);
 }
 
 /**
@@ -144,6 +165,14 @@ export function foldTypeFilter(db: Database, params: Record<string, unknown>): R
   const { type: _type, ...rest } = params;
   if (rest.tag === undefined) return { ...rest, tag: types, tag_match: rest.tag_match ?? "any" };
   const tags = (Array.isArray(rest.tag) ? rest.tag : [rest.tag]).map(String);
+  // One filter carries both: only "all of them" can be said exactly. Anything else is refused, not guessed.
+  if (types.length > 1 || (tags.length > 1 && rest.tag_match !== "all")) {
+    throw kindError(
+      "type with tag matches notes carrying all of them: pass one type, and one tag or tag_match: \"all\". For either-or, make two queries.",
+      "type",
+      'one type, and tag_match: "all"',
+    );
+  }
   return { ...rest, tag: [...tags, ...types], tag_match: "all" };
 }
 
@@ -158,12 +187,21 @@ export function foldTypesIntoTags(db: Database, item: Record<string, unknown>, m
   return mergeTypesIntoTags(item, mode);
 }
 
-const asList = (v: unknown): string[] => (v === undefined || v === null ? [] : (Array.isArray(v) ? v : [v]).map((x) => stripTagHash(String(x))).filter(Boolean));
+const typesShapeError = (hint: string) => kindError(`types takes ${hint}.`, "types", hint);
+const asList = (v: unknown, hint = "a list of names"): string[] => {
+  if (v === undefined || v === null) return [];
+  const list = Array.isArray(v) ? v : [v];
+  if (list.some((x) => typeof x !== "string")) throw typesShapeError(hint);
+  return list.map((x) => stripTagHash(x as string)).filter(Boolean);
+};
 
 /** The type names a write adds. */
 function typesAdded(item: Record<string, unknown>, mode: "create" | "update"): string[] {
   const t = item.types as { add?: unknown } | string[] | string | undefined;
-  return mode === "create" || Array.isArray(t) || typeof t === "string" ? asList(t) : asList(t?.add);
+  if (mode === "create") return asList(t, "a list of names, e.g. types: [\"task\"]");
+  if (Array.isArray(t) || typeof t === "string") return asList(t);
+  if (!t || typeof t !== "object") throw typesShapeError('a list of names or {add, remove}');
+  return asList(t.add, "{add: [names], remove: [names]}");
 }
 
 /**
@@ -177,7 +215,7 @@ export function mergeTypesIntoTags(item: Record<string, unknown>, mode: "create"
   const add = typesAdded(item, mode);
   if (mode === "create") return { ...rest, tags: [...new Set([...asList(rest.tags), ...add])] };
   const t = types as { remove?: unknown } | string[] | string;
-  const remove = Array.isArray(t) || typeof t === "string" ? [] : asList(t?.remove);
+  const remove = Array.isArray(t) || typeof t === "string" ? [] : asList(t?.remove, "{add: [names], remove: [names]}");
   const tags = rest.tags as { add?: unknown; remove?: unknown } | string[] | undefined;
   const tagAdd = Array.isArray(tags) ? asList(tags) : asList(tags?.add);
   const tagRemove = Array.isArray(tags) ? [] : asList(tags?.remove);

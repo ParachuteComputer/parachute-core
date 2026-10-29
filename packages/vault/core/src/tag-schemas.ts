@@ -19,7 +19,7 @@ import { Database } from "bun:sqlite";
 import { mapFieldType, validateFieldName } from "./indexed-fields.js";
 import { loadTagHierarchy, findParentCycle } from "./tag-hierarchy.js";
 import { timestampToMs } from "./cursor.js";
-import { KIND_SQL, kindError, type TagKind } from "./tag-kind.js";
+import { KIND_SQL, isParent, kindError, type TagKind } from "./tag-kind.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -481,7 +481,12 @@ export function upsertTagRecord(
       "drop kind, or clear fields and parent_names",
     );
   }
-  const kind = structured || patch.kind === "type" ? "type" : patch.kind === "tag" ? "tag" : (existing?.kind ?? null);
+  // The recorded kind (not the effective one, which also counts being a parent: that is never written).
+  const stored = (db.prepare("SELECT kind FROM tags WHERE name = ?").get(tag) as { kind: TagKind | null } | null)?.kind ?? null;
+  if (patch.kind === "tag" && isParent(db, tag)) {
+    throw kindError(`"${tag}" is another tag's parent, and a parent is a type. Remove it from the children's parent_names first.`, "kind", "clear the children's parent_names");
+  }
+  const kind = structured || patch.kind === "type" ? "type" : patch.kind === "tag" ? "tag" : stored;
 
   db.prepare(
     `UPDATE tags
