@@ -97,6 +97,44 @@ describe("consumer connector: a consumer AI app connects to a person's vault ove
     }
   });
 
+  test("a refresh carrying the resource the app saved under an earlier setup still renews, and grants no more", async () => {
+    // A consumer app replays the `resource` it was authorized with on every refresh, perhaps months and several hub
+    // versions later. Vaults of mid-2026 built that value from the request (`x-forwarded-proto || "https"` +
+    // `x-forwarded-host`, else the request's own origin), so behind a tunnel an app may hold the http:// twin of the
+    // MCP URL, or the vault's own loopback origin. 0.7.x never read `resource` on refresh; a hub that refuses it
+    // leaves the app unable to renew, and the app signs the person out (a friend's box, 10-29: two connectors).
+    const own = await connect({ appName: `Saved-resource app ${runId("app")}` });
+    const mcpPath = new URL(MCP_URL).pathname;
+    const twin = new URL(MCP_URL);
+    twin.protocol = twin.protocol === "https:" ? "http:" : "https:";
+    const shapes = [
+      twin.toString(),
+      `${new URL(s.vaultDirect).origin}${mcpPath}`,
+      `http://localhost:${new URL(s.hub).port || "80"}${mcpPath}`,
+      `https://an-old-name.example${mcpPath}`,
+      `${new URL(s.hub).origin}/vault/${s.vaultName}-not-granted/mcp`,
+    ];
+    let refresh = own.refresh!;
+    for (const resource of shapes) {
+      const r = await safeFetch(own.tokenEndpoint, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: refresh, client_id: own.clientId, resource }),
+      });
+      const body = await r.json();
+      expect({ resource, status: r.status, error: body.error }).toEqual({ resource, status: 200, error: undefined });
+      // The renewed grant is the one the person approved: same scopes, this vault only.
+      expect(body.scope).toBe(own.scope);
+      refresh = body.refresh_token;
+      const c = await mcp(MCP_URL, body.access_token);
+      try {
+        expect(await c.tools()).toContain("query-notes");
+      } finally {
+        await c.close();
+      }
+    }
+  });
+
   test(
     "a used refresh token is dead once the 30-second retry window has passed, and replaying it ends the session",
     async () => {
