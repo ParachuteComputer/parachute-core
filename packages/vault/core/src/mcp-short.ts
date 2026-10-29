@@ -88,7 +88,7 @@ Rarer filters (has_links, order_by, expand_links, created_by, search_mode, …) 
         description: "Counts or sums per group instead of notes; other filters apply first",
       },
       versions: { ...obj({ note_id: str(), version_ix: { type: "integer", description: "Read this version (0 = oldest)" } }, ["note_id"]), description: "A note's earlier versions" },
-      cursor: str('Paging: "" for the first page, then the returned next_cursor'),
+      cursor: str('Changes since last call: "" first, then the returned next_cursor; an empty page means caught up, so stop'),
       sort: { type: "string", enum: ["asc", "desc"], description: "By created_at; search sorts by relevance unless set" },
       limit: num("Default 50"),
       offset: num(),
