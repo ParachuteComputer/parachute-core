@@ -168,22 +168,28 @@ export async function dispatch(role: Role, notice?: Notice): Promise<void> {
   const home = homeDir();
   // Every command but `version` (answered above) runs behind the check, help included: the moved CLIs do work on
   // the home before they read their arguments (the vault moves older layouts first), so `serve --help` is a command.
-  if (!hostArgs || process.env.PARACHUTE_HOME) {
-    const { HUB_SCHEMA_VERSION } = await import("@openparachute/hub/src/hub-db.ts");
+  const { HUB_SCHEMA_VERSION } = await import("@openparachute/hub/src/hub-db.ts");
+  const name = role === "core" ? "parachute-core" : role === "hub" ? "parachute" : "parachute-vault";
+  /** The newer-data check: the exit code to stop with (having said why), or null. Run again under the release lock. */
+  const newerCheck = (): number | null => {
     const { newer, unchecked } = newerData(home, { hub: HUB_SCHEMA_VERSION, vault: SCHEMA_VERSION });
-    const name = role === "core" ? "parachute-core" : role === "hub" ? "parachute" : "parachute-vault";
     if (newer.length > 0) {
       console.error(`${name}: this home was written by a newer Parachute (${core.name} ${core.version} here):`);
       for (const line of newer) console.error(`  ${line}`);
       console.error("Nothing was opened or changed. Run the newer version, or restore a backup made for this one.");
-      process.exit(EXIT_NEWER_DATA);
+      return EXIT_NEWER_DATA;
     }
     if (unchecked.length > 0) {
       console.error(`${name}: can't check this home's data without changing it:`);
       for (const line of unchecked) console.error(`  ${line}`);
       console.error("Nothing was opened or changed. Stop what holds it open, or make room in the temp folder, and retry.");
-      process.exit(EXIT_HOME_UNUSABLE);
+      return EXIT_HOME_UNUSABLE;
     }
+    return null;
+  };
+  if (!hostArgs || process.env.PARACHUTE_HOME) {
+    const stop = newerCheck();
+    if (stop !== null) process.exit(stop);
   }
   if (notice) {
     const { announce } = await import("./front.ts");
@@ -221,7 +227,7 @@ export async function dispatch(role: Role, notice?: Notice): Promise<void> {
     // The first time this release opens a home an older one served: record the step and back the databases up
     // first (release.ts). Not a host's (embedded) home, nor one the old 0.7 programs still own.
     const { beforeOpenOrExit } = await import("./release.ts");
-    const code = beforeOpenOrExit(home);
+    const code = beforeOpenOrExit(home, newerCheck);
     if (code !== null) process.exit(code);
   }
   if (r.cli === "hub" && r.argv[0] === "keys") {

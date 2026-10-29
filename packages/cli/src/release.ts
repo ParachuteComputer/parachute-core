@@ -108,12 +108,12 @@ class Exit extends Error {
  * Run `fn` holding the home's release lock. Every decision about run/release.json is re-read and made under it, so
  * two commands opening an older home at once take one backup, and a catch-up can't overwrite a rollback's state.
  */
-export function withReleaseLock<T>(home: string, fn: () => T): T {
+export function withReleaseLock<T>(home: string, fn: () => T, waitMs = 60_000, busy = "another parachute command is backing up or rolling back this home; run this again when it has finished"): T {
   mkdirSync(join(home, "run"), { recursive: true, mode: 0o700 });
   const db = new Database(join(home, RELEASE_LOCK), { create: true });
   try {
     chmodSync(join(home, RELEASE_LOCK), 0o600);
-    db.exec("PRAGMA busy_timeout = 60000");
+    db.exec(`PRAGMA busy_timeout = ${waitMs}`);
     db.exec("PRAGMA locking_mode = EXCLUSIVE");
     try {
       db.exec("BEGIN EXCLUSIVE");
@@ -121,7 +121,7 @@ export function withReleaseLock<T>(home: string, fn: () => T): T {
       db.exec("COMMIT"); // in exclusive locking mode the lock stays until the connection closes
     } catch (err) {
       if (/locked|busy/i.test(String((err as Error)?.message))) {
-        throw new Exit(EXIT.held, "another parachute command is backing up or rolling back this home; run this again when it has finished");
+        throw new Exit(EXIT.held, busy);
       }
       throw err;
     }
@@ -129,6 +129,37 @@ export function withReleaseLock<T>(home: string, fn: () => T): T {
   } finally {
     db.close();
   }
+}
+
+let sharedHold: Database | undefined;
+
+/**
+ * Hold the release lock shared for the rest of this process: any number of commands at once, but never while a
+ * backup, catch-up or rollback holds it exclusively (each waits for the other). The OS lets go when the process
+ * ends, however it ends.
+ */
+function holdShared(home: string): void {
+  if (sharedHold) return;
+  mkdirSync(join(home, "run"), { recursive: true, mode: 0o700 });
+  const db = new Database(join(home, RELEASE_LOCK), { create: true });
+  try {
+    chmodSync(join(home, RELEASE_LOCK), 0o600);
+    db.exec("PRAGMA busy_timeout = 60000");
+    db.exec("BEGIN");
+    db.query("SELECT count(*) FROM sqlite_master").get(); // a read transaction left open: a SHARED lock
+  } catch (err) {
+    db.close();
+    if (/locked|busy/i.test(String((err as Error)?.message))) {
+      throw new Exit(EXIT.held, "another parachute command is backing up or rolling back this home; run this again when it has finished");
+    }
+    throw err;
+  }
+  sharedHold = db;
+}
+
+function letGoShared(): void {
+  sharedHold?.close();
+  sharedHold = undefined;
 }
 
 /** Copy each of the home's databases into `dest/home/<rel>`, consistently, with a checked manifest. */
@@ -160,13 +191,52 @@ export function snapshot(home: string, dest: string, from: string, skipped: stri
  * written. Leaves alone a host's (embedded) home, a home the old 0.7 programs still own (the takeover's job), and
  * the takeover's own check run.
  */
-export function beforeOpen(home: string, say: (s: string) => void = (s) => console.error(s)): Release | undefined {
+/** The newer-data check, run again once the lock is held: an exit code (having said why), or null. */
+export type Recheck = () => number | null;
+
+/** Stop with the recheck's code; it has already said why. */
+function recheckOrStop(recheck: Recheck): void {
+  const code = recheck();
+  if (code !== null) throw new Exit(code, "");
+}
+
+export function beforeOpen(home: string, say: (s: string) => void = (s) => console.error(s), recheck: Recheck = () => null): Release | undefined {
   if (process.env.PARACHUTE_TAKEOVER_CHECK === "1") return undefined;
   if (!existsSync(home) || existsSync(join(home, "embedded.json"))) return undefined;
-  // The usual case, without the lock: this release already serves the home and nothing waits to be backed up.
-  const quick = readRelease(home);
-  if (quick && quick.version === core.version && quick.state === "current" && !quick.skipped?.length) return quick;
-  return withReleaseLock(home, () => beforeOpenLocked(home, say));
+  // A home the old 0.7 programs still own is the takeover's: nothing is written to it, not even the lock.
+  if (!readRelease(home) && serveRefusal(home) !== null) return undefined;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    // Every command holds the lock shared while it runs, so no rollback can move a database under it. Once held, the
+    // newer-data check runs again: a newer release may have moved the home while this one waited.
+    holdShared(home);
+    recheckOrStop(recheck);
+    const r = readRelease(home);
+    if (!r || r.version !== core.version || r.state !== "current") {
+      // A step to take: let go, take the lock exclusively (it waits for the other commands), then hold it shared again.
+      letGoShared();
+      const done = withReleaseLock(home, () => (recheckOrStop(recheck), beforeOpenLocked(home, say)));
+      if (done === undefined) return undefined; // nothing recorded (a home with nothing readable)
+      continue;
+    }
+    const recovered = (r.skipped ?? []).filter((rel) => existsSync(join(home, rel)) && readable(join(home, rel), dirname(home)));
+    if (!recovered.length) return r; // the usual case: this release serves the home, and nothing waits to be backed up
+    // A skipped database can be read now. Back it up if no other command runs; never wait on one (serve holds the
+    // lock shared for its whole run, and waiting would block even `parachute stop`): try again at the next command.
+    letGoShared();
+    try {
+      withReleaseLock(home, () => (recheckOrStop(recheck), beforeOpenLocked(home, say)), 1_500);
+    } catch (err) {
+      if (!(err instanceof Exit) || err.code !== EXIT.held) throw err;
+      say(`parachute: ${recovered.join(", ")} can be read now, but another parachute command is running; it is backed up at the next command that runs alone`);
+      // Held shared again, everything is checked again: the home may have moved while the lock was let go.
+      holdShared(home);
+      recheckOrStop(recheck);
+      const again = readRelease(home);
+      if (again && again.version === core.version && again.state === "current") return again;
+      letGoShared();
+    }
+  }
+  throw new Exit(EXIT.failed, "this home's release record kept changing while this command started; run it again");
 }
 
 function beforeOpenLocked(home: string, say: (s: string) => void): Release | undefined {
@@ -275,13 +345,13 @@ function madeByThisLine(home: string, dbs: { rel: string }[]): boolean {
  * `beforeOpen` for dispatch: the exit code to stop with, or null to go on. Every command goes through it, help
  * flags included: some commands read `--help` as a value and open the data anyway.
  */
-export function beforeOpenOrExit(home: string): number | null {
+export function beforeOpenOrExit(home: string, recheck: Recheck = () => null): number | null {
   try {
-    beforeOpen(home);
+    beforeOpen(home, undefined, recheck);
     return null;
   } catch (err) {
     if (err instanceof Exit) {
-      console.error(`parachute: ${err.message}`);
+      if (err.message) console.error(`parachute: ${err.message}`);
       return err.code;
     }
     throw err;
@@ -328,6 +398,8 @@ export async function rollback(home: string, args: string[]): Promise<number> {
       const answer = await new Promise<string>((res) => process.stdin.once("data", (b) => res(String(b).trim())));
       if (!/^y(es)?$/i.test(answer)) throw new Exit(EXIT.usage, "not confirmed; nothing was changed");
     }
+    // Exclusive: it waits for no running command. Serve, or any command still running on the home, holds the lock
+    // shared for its whole run, so the rollback says so (exit 7) instead of moving databases under it.
     const done = withReleaseLock(home, () => {
       // Read again under the lock: what was asked about may have changed while the question waited.
       const r = readRelease(home);
@@ -405,7 +477,7 @@ export async function rollback(home: string, args: string[]): Promise<number> {
       say(`Rolled back. Start ${r.previous} on ${home} now (its own \`parachute serve\`, or its unit). Any ${r.version} command run on it again backs up and moves forward again.`);
       if (json) console.log(JSON.stringify(out));
       return EXIT.ok;
-    });
+    }, 3_000, "a parachute command is running on this home (serve, or another); stop it (parachute stop, or its unit), then run this again");
     return done;
   } catch (caught) {
     // A database that can't be read (or any other fault) is said plainly, never as a stack trace.
