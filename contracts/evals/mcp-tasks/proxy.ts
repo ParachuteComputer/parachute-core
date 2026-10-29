@@ -4,8 +4,9 @@
 //   bun proxy.ts vault <old|new> <upstream mcp url> <token file> <log.jsonl>
 //     old: tools/list and instructions from old/tools.json (main at ccc7729, before the short descriptions)
 //     new: whatever this checkout's vault serves
-//   bun proxy.ts files <log.jsonl>
-//     one helper tool, `http_request`, so a model can spend an upload URL the way a shell would (the same in both arms)
+//   bun proxy.ts files <log.jsonl> <box origin> <the one readable file>
+//     one helper tool, `http_request`, so a model can spend an upload URL the way a shell would (the same in both arms).
+//     It reaches only the box's own origin and reads only the run's receipt file.
 import { appendFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -49,7 +50,8 @@ if (mode === "vault") {
   });
   await server.connect(new StdioServerTransport());
 } else if (mode === "files") {
-  const [logFile] = rest as [string];
+  const [logFile, boxOrigin, readable] = rest as [string, string, string];
+  if (!boxOrigin || !readable) throw new Error("usage: bun proxy.ts files <log> <box origin> <readable file>");
   const server = new Server({ name: "files", version: "0.0.0" }, { capabilities: { tools: {} } });
   const httpTool = {
     name: "http_request",
@@ -71,9 +73,9 @@ if (mode === "vault") {
     const a = (req.params.arguments ?? {}) as { method: string; url: string; headers?: Record<string, string>; file_path?: string; body?: string };
     try {
       const u = new URL(a.url);
-      // Only the box (loopback, never the live install's ports).
-      if (u.hostname !== "127.0.0.1" && u.hostname !== "localhost") throw new Error("only the vault's own host is reachable from this eval");
-      if (Number(u.port) >= 1939 && Number(u.port) <= 1946) throw new Error("refused: a live Parachute port");
+      // Only the box, and only the run's own file: a model can't reach another local service or read the host.
+      if (u.origin !== new URL(boxOrigin).origin) throw new Error("only the vault's own origin is reachable from this eval");
+      if (a.file_path !== undefined && a.file_path !== readable) throw new Error(`only ${readable} can be read in this eval`);
       const body = a.file_path ? readFileSync(a.file_path) : a.body;
       const r = await fetch(u, { method: a.method, headers: a.headers, body, redirect: "manual" });
       const text = await r.text();

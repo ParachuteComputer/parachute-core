@@ -58,8 +58,9 @@ export async function startBox(opts: { keep?: boolean } = {}): Promise<Box> {
       if (m) ready = JSON.parse(m[1]!);
     }
     if (!ready) {
-      const err = await new Response(proc.stderr).text().catch(() => "");
+      // Kill first: a child that hangs with stderr open would otherwise block the drain forever.
       proc.kill("SIGKILL");
+      const err = await Promise.race([new Response(proc.stderr).text().catch(() => ""), Bun.sleep(3000).then(() => "")]);
       if (attempt < 2) continue;
       throw new Error(`the box did not start: ${err.match(/^BOX-ERROR (.*)$/m)?.[1] ?? err.slice(-1500)}`);
     }

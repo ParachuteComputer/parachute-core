@@ -107,7 +107,7 @@ async function driveCodex(prompt: string, box: Box, arm: string): Promise<{ text
       "-c", 'mcp_servers.vault.default_tools_approval_mode="approve"',
       "-c", 'mcp_servers.files.default_tools_approval_mode="approve"',
       ...cfg("vault", [proxy, "vault", arm, box.mcpUrl, join(box.dir, "token"), join(box.dir, "calls.jsonl")]),
-      ...cfg("files", [proxy, "files", join(box.dir, "calls.jsonl")]),
+      ...cfg("files", [proxy, "files", join(box.dir, "calls.jsonl"), box.origin, join(box.dir, RECEIPT.filename)]),
       "-o", last,
       `${SYSTEM}\n\nDo not use a shell; use only the vault and files MCP tools.\n\nTask: ${prompt}`,
     ],
@@ -157,7 +157,7 @@ async function runJob(job: Job): Promise<Record<string, unknown>> {
       JSON.stringify({
         mcpServers: {
           vault: { command: process.execPath, args: [proxy, "vault", job.arm, box.mcpUrl, join(box.dir, "token"), calls] },
-          files: { command: process.execPath, args: [proxy, "files", calls] },
+          files: { command: process.execPath, args: [proxy, "files", calls, box.origin, join(box.dir, RECEIPT.filename)] },
         },
       }),
     );
