@@ -4,7 +4,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { hubDbPath, migrate, openHubDb } from "../hub-db.ts";
+import { HUB_SCHEMA_VERSION, hubDbPath, migrate, openHubDb } from "../hub-db.ts";
 import { recordTokenMint, renameTokensForVault, revokeTokenByJti, signAccessToken, signRefreshToken, validateAccessToken } from "../jwt-sign.ts";
 import { adoptLiveTokens, listKeys } from "../keys.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
@@ -19,7 +19,7 @@ function makeDb() {
 const FUTURE = "2099-01-01T00:00:00.000Z";
 const PAST = "2020-01-01T00:00:00.000Z";
 
-describe("v25: every live token becomes a key with the same scopes", () => {
+describe("keys: every live token becomes a key with the same scopes", () => {
   test("adopts live rows only, names them, finds their owners, and keeps scopes and tag scopes as they are", async () => {
     const { db, cleanup } = makeDb();
     try {
@@ -29,8 +29,8 @@ describe("v25: every live token becomes a key with the same scopes", () => {
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       );
       const at = "2026-10-01T00:00:00.000Z";
-      // Back to v24: no keys table, rows as today's hub writes them.
-      db.exec("DROP TABLE keys; DELETE FROM schema_version WHERE version = 25");
+      // A hub.db as an 0.8 hub leaves it: no keys table, rows as today's hub writes them.
+      db.exec("DROP TABLE keys");
       ins.run("t-script", null, "cli", "vault:uni:read vault:uni:write", FUTURE, at, "cli_mint", "uni-tasks", null, null, null);
       ins.run("t-script2", null, "cli", "vault:uni:read", FUTURE, at, "cli_mint", "uni-tasks", null, null, null);
       ins.run("t-person", user.id, "api-mint-token", "vault:uni:admin", FUTURE, at, "cli_mint", user.id, null, null, null);
@@ -40,6 +40,9 @@ describe("v25: every live token becomes a key with the same scopes", () => {
       ins.run("t-expired", null, "cli", "vault:uni:read", PAST, at, "cli_mint", "older", null, null, null);
       ins.run("t-rotated", user.id, "claude-app", "vault:uni:write", FUTURE, at, "oauth_refresh", null, null, null, "t-app");
       migrate(db);
+      // No schema bump: an 0.8 hub (and the 0.8 takeover's code-only rollback) still opens this file.
+      expect((db.prepare("SELECT MAX(version) AS v FROM schema_version").get() as { v: number }).v).toBe(HUB_SCHEMA_VERSION);
+      expect(HUB_SCHEMA_VERSION).toBe(24);
       const keys = Object.fromEntries(listKeys(db).map((k) => [k.name, k]));
       expect(Object.keys(keys).sort()).toEqual(["claude-app", "rowan", "agent-grant", "uni-tasks", "uni-tasks-2"].sort());
       expect(keys["uni-tasks"]).toMatchObject({ owner: "uni-tasks", owner_kind: "service", scopes: ["vault:uni:read", "vault:uni:write"], levels: { uni: "write" }, status: "active" });
