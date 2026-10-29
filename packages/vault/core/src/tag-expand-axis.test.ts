@@ -209,10 +209,9 @@ describe("tag expand axis — query engine", () => {
 });
 
 describe("tag expand axis — MCP query-notes schema + handler", () => {
-  it("query-notes schema advertises the four expand values", async () => {
-    const { generateMcpTools } = await import("./mcp.js");
-    const tools = generateMcpTools(store);
-    const q = tools.find((t) => t.name === "query-notes")!;
+  it("query-notes' full reference (vault-info {help}) names the four expand values", async () => {
+    const { MCP_TOOL_REFERENCE } = await import("./mcp-manifest.js");
+    const q = MCP_TOOL_REFERENCE.find((t) => t.name === "query-notes")!;
     const props = (q.inputSchema as any).properties;
     expect(props.expand).toBeDefined();
     expect(props.expand.enum).toEqual(["subtypes", "namespace", "both", "exact"]);
