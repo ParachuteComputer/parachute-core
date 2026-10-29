@@ -17,7 +17,7 @@ import { HistoryNotFoundError, latestTombstone } from "../core/src/history.js";
 import { projectHistoryProvenance } from "../core/src/history-visibility.js";
 import { isNoteIdShape } from "../core/src/ulid.js";
 import type { Database } from "bun:sqlite";
-import { foldTypesIntoTags } from "../core/src/tag-kind.ts";
+import { foldTypesIntoTags, mergeTypesIntoTags } from "../core/src/tag-kind.ts";
 import type { Store, Note, QueryOpts, AggregateSpec } from "../core/src/types.ts";
 import { TAG_EXPAND_MODES, stripTagHash, suggestSimilarTag, type TagExpandMode } from "../core/src/tag-hierarchy.ts";
 import {
@@ -2363,7 +2363,7 @@ async function handleNotesInner(
       const parsedBody = await parseJsonBody(req);
       if (!parsedBody.ok) return parsedBody.response;
       // T-318 §8a: `types` land in the one membership store with the tags.
-      const folded = foldRestTypes(store.db, parsedBody.body, "create");
+      const folded = foldRestTypes(store.db, parsedBody.body, "create", tagScope.raw !== null);
       if (folded instanceof Response) return folded;
       const body = folded as any;
       // `notes` (when present) must actually be an array — otherwise
@@ -3151,7 +3151,7 @@ async function handleNotesInner(
       // shape parsed the body only after the not-found check.
       const parsedBody = await parseJsonBody(req);
       if (!parsedBody.ok) return parsedBody.response;
-      const folded = foldRestTypes(store.db, parsedBody.body, Array.isArray((parsedBody.body as any)?.tags) ? "create" : "update");
+      const folded = foldRestTypes(store.db, parsedBody.body, Array.isArray((parsedBody.body as any)?.tags) ? "create" : "update", tagScope.raw !== null);
       if (folded instanceof Response) return folded;
       const body = folded as any;
       if (body.if_updated_at !== undefined && !isValidIfUpdatedAt(body.if_updated_at)) return invalidIfUpdatedAtResponse();
@@ -5390,11 +5390,14 @@ export async function handleHistoryCompact(req: Request, store: Store, tagScope:
  * REST's half of "writes accept both" (T-318 §8a): fold a body's `types` (and
  * each batch item's) into its tags, or answer 422 with the fix.
  */
-function foldRestTypes(db: Database, body: unknown, mode: "create" | "update"): unknown | Response {
+function foldRestTypes(db: Database, body: unknown, mode: "create" | "update", scoped: boolean): unknown | Response {
   if (!body || typeof body !== "object") return body;
+  // A tag-scoped caller's types are only memberships: merged into the tags the
+  // scope checks below see, with no record made or kind revealed before them.
+  const fold = (i: Record<string, unknown>) => (scoped ? mergeTypesIntoTags(i, mode) : foldTypesIntoTags(db, i, mode));
   try {
-    let out = foldTypesIntoTags(db, body as Record<string, unknown>, mode);
-    if (Array.isArray(out.notes)) out = { ...out, notes: (out.notes as Record<string, unknown>[]).map((i) => foldTypesIntoTags(db, i, mode)) };
+    let out = fold(body as Record<string, unknown>);
+    if (Array.isArray(out.notes)) out = { ...out, notes: (out.notes as Record<string, unknown>[]).map(fold) };
     return out;
   } catch (err) {
     if ((err as { error_type?: string })?.error_type !== "tag_kind") throw err;

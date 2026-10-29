@@ -16,6 +16,7 @@
  * contract hold through 0.9) and gain `types`, the subset that are types.
  */
 import type { Database } from "bun:sqlite";
+import { stripTagHash } from "./tag-hierarchy.js";
 
 export type TagKind = "type" | "tag";
 
@@ -94,7 +95,7 @@ export function kindError(message: string, field: string, hint: string): Error {
 export function ensureTypes(db: Database, names: string[]): void {
   const kinds = tagKinds(db);
   const now = new Date().toISOString();
-  for (const name of names) {
+  for (const name of names.map(stripTagHash).filter(Boolean)) {
     const kind = kinds.get(name);
     if (kind === "tag") {
       throw kindError(
@@ -109,17 +110,17 @@ export function ensureTypes(db: Database, names: string[]): void {
   }
 }
 
-/** For a query's `type` filter: every name must be a type. */
+/**
+ * For a query's `type` filter: a plain tag is refused with the fix. A name
+ * with no record matches nothing, as `tag` does: no error, so a tag-scoped
+ * caller (whose hidden names the server rewrites before this runs) can't tell
+ * a hidden type from an absent one.
+ */
 export function assertTypes(db: Database, names: string[]): void {
   const kinds = tagKinds(db);
-  for (const name of names) {
-    const kind = kinds.get(name);
-    if (kind === "type") continue;
-    throw kindError(
-      kind === "tag" ? `"${name}" is a plain tag, not a type: filter with tag: "${name}".` : `No type named "${name}". vault-info lists the types.`,
-      "type",
-      kind === "tag" ? `tag: "${name}"` : "vault-info",
-    );
+  for (const name of names.map(stripTagHash)) {
+    if (kinds.get(name) !== "tag") continue;
+    throw kindError(`"${name}" is a plain tag, not a type: filter with tag: "${name}".`, "type", `tag: "${name}"`);
   }
 }
 
@@ -148,19 +149,32 @@ export function foldTypeFilter(db: Database, params: Record<string, unknown>): R
  */
 export function foldTypesIntoTags(db: Database, item: Record<string, unknown>, mode: "create" | "update"): Record<string, unknown> {
   if (!item || item.types === undefined) return item;
+  ensureTypes(db, typesAdded(item, mode));
+  return mergeTypesIntoTags(item, mode);
+}
+
+const asList = (v: unknown): string[] => (v === undefined || v === null ? [] : (Array.isArray(v) ? v : [v]).map((x) => stripTagHash(String(x))).filter(Boolean));
+
+/** The type names a write adds. */
+function typesAdded(item: Record<string, unknown>, mode: "create" | "update"): string[] {
+  const t = item.types as { add?: unknown } | string[] | string | undefined;
+  return mode === "create" || Array.isArray(t) || typeof t === "string" ? asList(t) : asList(t?.add);
+}
+
+/**
+ * The same write with its `types` moved into `tags`, with no side effects: what
+ * a scope check must see (a tag-scoped writer's types are memberships like any
+ * other). create: tags ∪ types; update: tags.add ∪ types.add, tags.remove ∪ types.remove.
+ */
+export function mergeTypesIntoTags(item: Record<string, unknown>, mode: "create" | "update"): Record<string, unknown> {
+  if (!item || item.types === undefined) return item;
   const { types, ...rest } = item as { types: unknown } & Record<string, unknown>;
-  const asList = (v: unknown): string[] => (v === undefined || v === null ? [] : (Array.isArray(v) ? v : [v]).map(String));
-  if (mode === "create") {
-    const add = asList(types);
-    ensureTypes(db, add);
-    return { ...rest, tags: [...new Set([...asList(rest.tags), ...add])] };
-  }
-  const t = types as { add?: unknown; remove?: unknown } | string[];
-  const add = Array.isArray(t) || typeof t === "string" ? asList(t) : asList(t?.add);
+  const add = typesAdded(item, mode);
+  if (mode === "create") return { ...rest, tags: [...new Set([...asList(rest.tags), ...add])] };
+  const t = types as { remove?: unknown } | string[] | string;
   const remove = Array.isArray(t) || typeof t === "string" ? [] : asList(t?.remove);
-  ensureTypes(db, add);
   const tags = rest.tags as { add?: unknown; remove?: unknown } | string[] | undefined;
-  const tagAdd = Array.isArray(tags) ? tags.map(String) : asList(tags?.add);
+  const tagAdd = Array.isArray(tags) ? asList(tags) : asList(tags?.add);
   const tagRemove = Array.isArray(tags) ? [] : asList(tags?.remove);
   return { ...rest, tags: { add: [...new Set([...tagAdd, ...add])], remove: [...new Set([...tagRemove, ...remove])] } };
 }

@@ -3,7 +3,7 @@
 // Uni's readers keep working). Writes accept `types`; an old client's tags: ["task"] lands as the type it is. Queries
 // gain `type` (with subtypes); `tag` on a type keeps today's expansion. Fields and parents belong to types.
 import { describe, expect, test } from "bun:test";
-import { enc, mcp, operator, runId, services } from "../lib.ts";
+import { enc, mcp, operator, pass, rest, runId, services } from "../lib.ts";
 
 async function admin() {
   const s = services();
@@ -57,4 +57,46 @@ describe("mcp/types", () => {
     await expect(c.call("query-notes", { type: pin })).rejects.toThrow(/plain tag, not a type/);
     await c.close();
   });
+
+  // A tag-scoped key sees and touches only its tags; `types` are memberships like any other (Codex review, #18).
+  test("tag scope: types can't write, reveal or probe what the key can't see", async () => {
+    const s = services();
+    const c = await admin();
+    const work = runId("work");
+    const secret = runId("secret");
+    await c.call("manage-types", { tag: secret, fields: { [runId("f").replace(/-/g, "_")]: { type: "string" } } });
+    const shared = runId("shared");
+    const sharedId = (await c.call("create-note", { path: shared, content: "both", tags: [work, secret] })).id;
+    const tok = await pass({ level: "write", tags: [work] });
+    const scoped = await mcp(`${s.vaultViaHub}/mcp`, tok);
+    // Writes: a hidden type is refused like a hidden tag, by create and by update.
+    const made = await scoped.call("create-note", { path: runId("w"), content: "w", tags: [work], types: [secret] }).catch((e) => e);
+    expect(JSON.stringify(made)).toMatch(/tag_scope_violation|Forbidden|allowlist/);
+    const upd = await scoped.call("update-note", { id: sharedId, types: { remove: [secret] }, force: true }).catch((e) => e);
+    expect(JSON.stringify(upd)).toMatch(/tag_scope_violation|Forbidden|allowlist/);
+    expect((await c.call("query-notes", { id: shared })).tags).toContain(secret);
+    // Reads: the hidden type is scrubbed from types as from tags, over MCP and REST.
+    const read = await scoped.call("query-notes", { id: shared });
+    expect(read.tags).toEqual([work]);
+    expect(read.types ?? []).toEqual([]);
+    const viaRest = await rest(s.vaultViaHub, tok).get(`/notes/${enc(shared)}`);
+    expect(viaRest.body.tags).toEqual([work]);
+    expect(viaRest.body.types ?? []).toEqual([]);
+    // Queries: a hidden type and an absent name answer alike.
+    const hidden = await scoped.call("query-notes", { type: secret }).catch((e) => String(e));
+    const absent = await scoped.call("query-notes", { type: runId("absent") }).catch((e) => String(e));
+    expect(JSON.stringify(hidden)).toBe(JSON.stringify(absent));
+    await scoped.close();
+    await c.close();
+  });
+
+  test("a #-prefixed type lands on the same bare record as everywhere else", async () => {
+    const c = await admin();
+    const t = runId("hash");
+    const made = await c.call("create-note", { path: runId("h"), content: "h", types: [`#${t}`] });
+    expect(made.tags).toEqual([t]);
+    expect(made.types).toEqual([t]);
+    await c.close();
+  });
 });
+

@@ -500,15 +500,17 @@ export function buildExpandVisibility(
  * echo the stored note — a scoped caller could otherwise recover the full
  * tag set with a no-op `update-note`/`PATCH`.
  */
-export function scrubNoteTagsByScope<T extends { tags?: string[] }>(
+export function scrubNoteTagsByScope<T extends { tags?: string[]; types?: string[] }>(
   note: T,
   allowed: Set<string> | null,
   rawRoots: string[] | null,
 ): T {
   if (rawRoots === null || !note || !Array.isArray(note.tags)) return note;
   const visible = note.tags.filter((t) => tagVisibleInScope(t, allowed, rawRoots));
-  if (visible.length === note.tags.length) return note;
-  return { ...note, tags: visible };
+  // `types` (T-318 §8a) is a subset of `tags`: it gets the same scrub.
+  const types = Array.isArray(note.types) ? note.types.filter((t) => tagVisibleInScope(t, allowed, rawRoots)) : undefined;
+  if (visible.length === note.tags.length && (!types || types.length === note.types!.length)) return note;
+  return { ...note, tags: visible, ...(types ? { types } : {}) };
 }
 
 /** Array form of `scrubNoteTagsByScope`. No-op when unscoped. */
