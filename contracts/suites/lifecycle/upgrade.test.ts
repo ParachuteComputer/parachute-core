@@ -221,6 +221,37 @@ describe("lifecycle/upgrade", () => {
     expect(existsSync(join(dirname(home), "parachute-upgrade"))).toBe(false);
   }, 120_000);
 
+  test("a vault the backup skipped, repaired later, is backed up before 0.9 first opens it", async () => {
+    // A home 0.8 made, with two vaults; one can't be read when 0.9 first opens the home.
+    const home = newHome("up-recovered");
+    const run08 = (bin: string, args: string[]) =>
+      Bun.spawnSync([bin, ...args], { env: { PATH: `${info.runtimeDir}:/usr/bin:/bin`, HOME: dirname(home), PARACHUTE_HOME: home, EMBEDDINGS_ENABLED: "false" }, cwd: dirname(home) });
+    for (const v of ["goodv", "laterv"]) must(run08(prevVaultBin, ["create", v, "--no-mirror", "--json"]).exitCode === 0, `setup: 0.8 create ${v}`);
+    must(run08(prevBin, ["auth", "set-password", "--username", "owner", "--password", `pw-${randomBytes(12).toString("hex")}`]).exitCode === 0, "setup: 0.8 set-password");
+    const db = join(home, "vault", "data", "laterv", "vault.db");
+    const healthy = readFileSync(db);
+    for (const f of [`${db}-wal`, `${db}-shm`]) rmSync(f, { force: true });
+    writeFileSync(db, "Made-up bytes that are not a database.\n".repeat(200));
+
+    const first = await cli(home, ["user", "list"]);
+    expect(first.stderr).toContain("can't read vault/data/laterv/vault.db");
+    const rel = JSON.parse(readFileSync(join(home, "run", "release.json"), "utf8"));
+    expect(rel.skipped).toEqual(["vault/data/laterv/vault.db"]);
+    const manifest = () => JSON.parse(readFileSync(join(rel.backup, "manifest.json"), "utf8"));
+    expect(Object.keys(manifest().files).sort()).toEqual(["hub.db", "vault/data/goodv/vault.db"]);
+
+    writeFileSync(db, healthy); // repaired: the 0.8 bytes are back
+    const second = await cli(home, ["user", "list"]);
+    expect(second.stderr).toContain("vault/data/laterv/vault.db can be read now; backed it up first");
+    expect(Object.keys(manifest().files).sort()).toEqual(["hub.db", "vault/data/goodv/vault.db", "vault/data/laterv/vault.db"]);
+    expect(manifest().skipped).toBeUndefined();
+    // The copy is the vault as 0.8 left it: 0.9 hadn't opened it (no `kind` on its tags).
+    const copy = new Database(join(rel.backup, "home", "vault", "data", "laterv", "vault.db"), { readonly: true });
+    expect((copy.query("PRAGMA table_info(tags)").all() as { name: string }[]).some((c) => c.name === "kind")).toBe(false);
+    copy.close();
+    expect(JSON.parse(readFileSync(join(home, "run", "release.json"), "utf8")).skipped).toBeUndefined();
+  }, 120_000);
+
   test("a home 0.9 made has no earlier release: no backup, nothing to roll back", async () => {
     const home = newHome("up-fresh");
     must((await cli(home, ["user", "password", "--username", "owner", "--password", `pw-${randomBytes(12).toString("hex")}`])).code === 0, "setup: user password");

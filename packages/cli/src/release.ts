@@ -26,7 +26,7 @@
 // Exit codes, as the takeover's: 0 done · 1 nothing to roll back, or it can't be done code-only · 2 flags, or no
 // --yes where nobody can be asked · 5 no room for the backup · 7 a process holds the data.
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, statfsSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statfsSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import core from "../../../package.json" with { type: "json" };
 import { databases, readDatabase, schemaOf } from "./home.ts";
@@ -45,6 +45,8 @@ export interface Release {
   backup: string | null;
   /** "restoring" from the moment a restore starts moving databases until it has finished. */
   state: "current" | "rolled-back" | "restoring";
+  /** Databases the backup couldn't read: each is backed up into the same backup as soon as it can be read. */
+  skipped?: string[];
   /** Set when this release came to the home by its own takeover (0.7 → this): roll back with the takeover. */
   via?: "takeover";
   rolled_back_at?: string;
@@ -132,7 +134,7 @@ export function beforeOpen(home: string, say: (s: string) => void = (s) => conso
   if (process.env.PARACHUTE_TAKEOVER_CHECK === "1") return undefined;
   if (!existsSync(home) || existsSync(join(home, "embedded.json"))) return undefined;
   const was = readRelease(home);
-  if (was && was.version === core.version && was.state === "current") return was;
+  if (was && was.version === core.version && was.state === "current") return was.skipped?.length ? catchUp(home, was, say) : was;
   if (was?.state === "restoring") {
     throw new Exit(EXIT.failed, `a restore on this home was interrupted; what ${was.version} left is in ${was.moved_aside}. Run \`parachute upgrade --rollback --restore --yes\` again to finish it.`);
   }
@@ -172,9 +174,39 @@ export function beforeOpen(home: string, say: (s: string) => void = (s) => conso
   const backup = join(dirname(home), "parachute-upgrade", `${previous}-to-${core.version}-${stamp()}`);
   say(`parachute: ${previous} → ${core.version} on this home: backing up its databases first, to ${backup}`);
   snapshot(home, backup, previous, unreadable);
-  const r: Release = { version: core.version, previous, since, backup, state: "current" };
+  const r: Release = { version: core.version, previous, since, backup, state: "current", ...(unreadable.length ? { skipped: unreadable } : {}) };
   writeRelease(home, r);
   return r;
+}
+
+/**
+ * A database the backup skipped (it couldn't be read) and that can be read now, repaired or replaced: copy it into
+ * the same backup before this release opens it, so the backup still holds every database as it was before 0.9.
+ */
+function catchUp(home: string, r: Release, say: (s: string) => void): Release {
+  const now = r.skipped!.filter((rel) => existsSync(join(home, rel)) && readable(join(home, rel), dirname(home)));
+  if (!now.length || !r.backup) return r;
+  const path = join(r.backup, "manifest.json");
+  const manifest = readJson(path) as Manifest;
+  for (const rel of now) {
+    const to = join(r.backup, "home", rel);
+    mkdirSync(dirname(to), { recursive: true, mode: 0o700 });
+    rmSync(to, { force: true });
+    readDatabase(join(home, rel), (db) => db.run("VACUUM INTO ?", [to]), r.backup);
+    chmodSync(to, 0o600);
+    manifest.files[rel] = sha256(to);
+    manifest.schemas[rel] = schemaOf(to, r.backup) ?? null;
+  }
+  const left = (manifest.skipped ?? []).filter((rel) => !now.includes(rel));
+  if (left.length) manifest.skipped = left;
+  else delete manifest.skipped;
+  writeFileSync(`${path}.tmp`, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });
+  renameSync(`${path}.tmp`, path);
+  const next: Release = { ...r, ...(left.length ? { skipped: left } : {}) };
+  if (!left.length) delete next.skipped;
+  writeRelease(home, next);
+  say(`parachute: ${now.join(", ")} can be read now; backed it up first, to ${r.backup}`);
+  return next;
 }
 
 /** Whether SQLite can read `path` as a database (without changing a byte of the home). */

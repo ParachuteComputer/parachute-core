@@ -27,6 +27,11 @@ home with data:
    `<home>/../parachute-upgrade/<from>-to-<to>-<time>/home/<same path>`, with `manifest.json`: a sha256 and the
    schema number per file. It refuses with exit 5, changing nothing, when there is no room.
 2. **Record the step** in `run/release.json`: `{version, previous, since, backup, state}`.
+3. **A database that can't be read** is named on stderr, listed as `skipped` in the manifest and left out of the
+   backup. Every readable one is still backed up first, and a restore leaves a skipped one where it is. The command
+   then goes on and fails its own way if it needs the broken database (a vault that can't open stops `serve` with
+   75). A home where nothing is readable records nothing. Found by the mutants job: the step used to crash first,
+   which hid the vault's own start-failure path.
 
 It leaves alone:
 - a home 0.9 itself made (it already carries 0.9's structures);
