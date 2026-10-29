@@ -43,6 +43,12 @@ Found while building it: 0.9 refused to serve (exit 7, "an older Parachute still
 because the takeover took any vault registered outside this exact install for the 0.7 programs. Any
 `@openparachute/core` install now counts as ours.
 
+**One at a time.** Every command holds `run/release.lock` shared for as long as it runs. A backup, a catch-up and a
+rollback take it alone. So a rollback never moves a database under a running command (it exits 7 and says to stop
+Parachute), and a command waits while a backup or rollback runs. Once it holds the lock, a command runs the
+newer-data check (exit 6) again, because a newer release may have moved the home while it waited. Known limits: a
+command on a home that doesn't exist yet, or on a home the 0.7 programs still own (the takeover's), takes no lock.
+
 ## Going back: `parachute upgrade --rollback [--restore] [--yes] [--json]`
 
 - **Code-only (the default).** It checks that every database is at a number the previous release opens (the number

@@ -215,7 +215,12 @@ export function beforeOpen(home: string, say: (s: string) => void = (s) => conso
       // A step to take: let go, take the lock exclusively (it waits for the other commands), then hold it shared again.
       letGoShared();
       const done = withReleaseLock(home, () => (recheckOrStop(recheck), beforeOpenLocked(home, say)));
-      if (done === undefined) return undefined; // nothing recorded (a home with nothing readable)
+      if (done === undefined) {
+        // Nothing recorded (a home with nothing readable): still run holding the lock shared, checked again.
+        holdShared(home);
+        recheckOrStop(recheck);
+        return undefined;
+      }
       continue;
     }
     const recovered = (r.skipped ?? []).filter((rel) => existsSync(join(home, rel)) && readable(join(home, rel), dirname(home)));
@@ -384,6 +389,7 @@ export async function rollback(home: string, args: string[]): Promise<number> {
   try {
     if (unknown) throw new Exit(EXIT.usage, `unknown argument '${unknown}'\nusage: parachute upgrade --rollback [--restore] [--yes] [--json]`);
     const r = readRelease(home);
+    const asked = r ?? undefined;
     if (r?.via === "takeover") throw new Exit(EXIT.failed, "this home came over from 0.7 by the takeover; `parachute takeover --rollback` goes back");
     const resuming = r?.state === "restoring";
     if (resuming && !restore) throw new Exit(EXIT.failed, "a restore on this home was interrupted; finish it with --restore --yes");
@@ -401,8 +407,11 @@ export async function rollback(home: string, args: string[]): Promise<number> {
     // Exclusive: it waits for no running command. Serve, or any command still running on the home, holds the lock
     // shared for its whole run, so the rollback says so (exit 7) instead of moving databases under it.
     const done = withReleaseLock(home, () => {
-      // Read again under the lock: what was asked about may have changed while the question waited.
+      // Read again under the lock: what was asked about may have changed while the question waited. It must be the
+      // same step (and so the same backup) that was confirmed.
       const r = readRelease(home);
+      const same = (a?: Release) => a && JSON.stringify([a.version, a.previous, a.since, a.backup]);
+      if (same(r) !== same(asked)) throw new Exit(EXIT.failed, "this home's release record changed while the rollback waited; nothing was changed, run it again");
       const resuming = r?.state === "restoring";
       if (!r || (r.state !== "current" && !resuming) || !r.previous || r.via === "takeover" || (resuming && !restore)) {
         throw new Exit(EXIT.failed, "this home's release record changed while the rollback waited; run it again");
