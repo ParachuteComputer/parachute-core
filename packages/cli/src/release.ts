@@ -28,11 +28,14 @@
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statfsSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import { Database } from "bun:sqlite";
 import core from "../../../package.json" with { type: "json" };
 import { databases, readDatabase, schemaOf } from "./home.ts";
 import { exportChanged, holders, RECORD_FILE, serveRefusal } from "./takeover.ts";
 
 export const RELEASE_FILE = join("run", "release.json");
+/** One command at a time backs up, catches up or rolls back a home: an exclusive SQLite lock, released on exit. */
+export const RELEASE_LOCK = join("run", "release.lock");
 export const EXIT = { ok: 0, failed: 1, usage: 2, noRoom: 5, held: 7 } as const;
 
 export interface Release {
@@ -101,6 +104,33 @@ class Exit extends Error {
   }
 }
 
+/**
+ * Run `fn` holding the home's release lock. Every decision about run/release.json is re-read and made under it, so
+ * two commands opening an older home at once take one backup, and a catch-up can't overwrite a rollback's state.
+ */
+export function withReleaseLock<T>(home: string, fn: () => T): T {
+  mkdirSync(join(home, "run"), { recursive: true, mode: 0o700 });
+  const db = new Database(join(home, RELEASE_LOCK), { create: true });
+  try {
+    chmodSync(join(home, RELEASE_LOCK), 0o600);
+    db.exec("PRAGMA busy_timeout = 60000");
+    db.exec("PRAGMA locking_mode = EXCLUSIVE");
+    try {
+      db.exec("BEGIN EXCLUSIVE");
+      db.exec("CREATE TABLE IF NOT EXISTS hold (pid INTEGER)");
+      db.exec("COMMIT"); // in exclusive locking mode the lock stays until the connection closes
+    } catch (err) {
+      if (/locked|busy/i.test(String((err as Error)?.message))) {
+        throw new Exit(EXIT.held, "another parachute command is backing up or rolling back this home; run this again when it has finished");
+      }
+      throw err;
+    }
+    return fn();
+  } finally {
+    db.close();
+  }
+}
+
 /** Copy each of the home's databases into `dest/home/<rel>`, consistently, with a checked manifest. */
 export function snapshot(home: string, dest: string, from: string, skipped: string[] = []): Manifest {
   const dbs = databases(home, { hub: 0, vault: 0 }).filter((d) => !skipped.includes(d.rel));
@@ -133,6 +163,13 @@ export function snapshot(home: string, dest: string, from: string, skipped: stri
 export function beforeOpen(home: string, say: (s: string) => void = (s) => console.error(s)): Release | undefined {
   if (process.env.PARACHUTE_TAKEOVER_CHECK === "1") return undefined;
   if (!existsSync(home) || existsSync(join(home, "embedded.json"))) return undefined;
+  // The usual case, without the lock: this release already serves the home and nothing waits to be backed up.
+  const quick = readRelease(home);
+  if (quick && quick.version === core.version && quick.state === "current" && !quick.skipped?.length) return quick;
+  return withReleaseLock(home, () => beforeOpenLocked(home, say));
+}
+
+function beforeOpenLocked(home: string, say: (s: string) => void): Release | undefined {
   const was = readRelease(home);
   if (was && was.version === core.version && was.state === "current") return was.skipped?.length ? catchUp(home, was, say) : was;
   if (was?.state === "restoring") {
@@ -189,6 +226,7 @@ function catchUp(home: string, r: Release, say: (s: string) => void): Release {
   const path = join(r.backup, "manifest.json");
   const manifest = readJson(path) as Manifest;
   for (const rel of now) {
+    if (rel in manifest.files) continue; // already copied: never replace a copy taken before 0.9 opened it
     const to = join(r.backup, "home", rel);
     mkdirSync(dirname(to), { recursive: true, mode: 0o700 });
     rmSync(to, { force: true });
@@ -290,76 +328,85 @@ export async function rollback(home: string, args: string[]): Promise<number> {
       const answer = await new Promise<string>((res) => process.stdin.once("data", (b) => res(String(b).trim())));
       if (!/^y(es)?$/i.test(answer)) throw new Exit(EXIT.usage, "not confirmed; nothing was changed");
     }
-    const p = plan(home, r, restore);
-    if (restore && !p.manifest?.files) throw new Exit(EXIT.failed, `there is no backup to restore (${r.backup ?? "none was taken"})`);
-    if (!restore && p.moved.length) {
-      throw new Exit(EXIT.failed, `${r.previous} can't open ${p.moved.map((d) => d.rel).join(", ")} as it is now (a schema number moved since the backup). Run with --restore: it exports every note changed since, then puts the backup back.`);
-    }
-    if (restore) {
-      // The export keys vaults by name: two databases for one name (a leftover older layout) would export one.
-      const names = new Map<string, string>();
-      for (const d of p.now) {
-        if (d.rel === "hub.db") continue;
-        const name = basename(dirname(d.rel));
-        if (names.has(name)) throw new Exit(EXIT.failed, `two databases for the vault '${name}' (${names.get(name)}, ${d.rel}); move the one not in use out of the home first`);
-        names.set(name, d.rel);
+    const done = withReleaseLock(home, () => {
+      // Read again under the lock: what was asked about may have changed while the question waited.
+      const r = readRelease(home);
+      const resuming = r?.state === "restoring";
+      if (!r || (r.state !== "current" && !resuming) || !r.previous || r.via === "takeover" || (resuming && !restore)) {
+        throw new Exit(EXIT.failed, "this home's release record changed while the rollback waited; run it again");
       }
-    }
-    const notHeld = () => {
-      const held = holders(home);
-      if (held.length) {
-        throw new Exit(EXIT.held, `something holds the data: ${held.map((h) => `pid ${h.pid} (${h.cmd.slice(0, 80)})`).join(", ")}. Stop Parachute (parachute stop, or its unit), then run this again.`);
+      const p = plan(home, r, restore);
+      if (restore && !p.manifest?.files) throw new Exit(EXIT.failed, `there is no backup to restore (${r.backup ?? "none was taken"})`);
+      if (!restore && p.moved.length) {
+        throw new Exit(EXIT.failed, `${r.previous} can't open ${p.moved.map((d) => d.rel).join(", ")} as it is now (a schema number moved since the backup). Run with --restore: it exports every note changed since, then puts the backup back.`);
       }
-    };
-    notHeld();
-    const out: Record<string, unknown> = { rolled_back: true, from: r.version, to: r.previous, mode: p.mode, backup: r.backup };
-    if (p.mode === "code-only") {
-      say(`Every database here is at a schema number ${r.previous} opens, so nothing on disk changes and every ${r.version} write is kept.`);
-    } else {
-      const files = p.manifest!.files;
-      // 1. Stage the backup's databases beside the home and check each against the manifest, before anything moves.
-      const staged = join(r.backup!, `staged-${stamp()}`);
-      for (const [rel, hash] of Object.entries(files)) {
-        const to = join(staged, rel);
-        mkdirSync(dirname(to), { recursive: true, mode: 0o700 });
-        writeFileSync(to, readFileSync(join(r.backup!, "home", rel)), { mode: 0o600 });
-        if (sha256(to) !== hash) throw new Exit(EXIT.failed, `the backup's ${rel} doesn't match its manifest; nothing was changed`);
-      }
-      // 2. Export every note that differs from the backup, then check again that nothing has started since.
-      const dir = join(r.backup!, `changed-since-${stamp()}`);
-      // Always, a resumed restore too: what an interrupted one left (or an older release wrote since) is compared
-      // with the backup like the rest, and a database already put back shows no change.
-      const left = p.manifest!.skipped ?? [];
-      out.exported_notes = exportChanged(home, join(r.backup!, "home"), dir, left);
-      out.exported_to = dir;
-      say(`Exported ${out.exported_notes} notes changed since the backup to ${dir}`);
-      notHeld();
-      // 3. Swap: what is live moves aside, the staged copies take its place (renames on one filesystem). The record
-      //    says "restoring" throughout, so an interrupted swap is refused by every command until it is finished.
-      // Each attempt moves aside into its own folder, so a retry never overwrites what the first attempt kept.
-      const aside = join(r.backup!, `after-${r.version}-${stamp()}`);
-      const asides = [...(r.moved_aside ? [r.moved_aside] : []), ...(r.moved_aside_retries ?? [])];
-      writeRelease(home, { ...r, state: "restoring", moved_aside: asides[0] ?? aside, ...(asides.length ? { moved_aside_retries: [...asides.slice(1), aside] } : {}) });
-      for (const rel of new Set([...p.now.map((d) => d.rel).filter((rel) => !left.includes(rel)), ...Object.keys(files)])) {
-        for (const suffix of ["", "-wal", "-shm"]) {
-          const live = join(home, rel + suffix);
-          if (!existsSync(live)) continue;
-          mkdirSync(dirname(join(aside, rel)), { recursive: true, mode: 0o700 });
-          renameSync(live, join(aside, rel + suffix));
+      if (restore) {
+        // The export keys vaults by name: two databases for one name (a leftover older layout) would export one.
+        const names = new Map<string, string>();
+        for (const d of p.now) {
+          if (d.rel === "hub.db") continue;
+          const name = basename(dirname(d.rel));
+          if (names.has(name)) throw new Exit(EXIT.failed, `two databases for the vault '${name}' (${names.get(name)}, ${d.rel}); move the one not in use out of the home first`);
+          names.set(name, d.rel);
         }
       }
-      for (const rel of Object.keys(files)) {
-        mkdirSync(dirname(join(home, rel)), { recursive: true, mode: 0o700 });
-        renameSync(join(staged, rel), join(home, rel));
+      const notHeld = () => {
+        const held = holders(home);
+        if (held.length) {
+          throw new Exit(EXIT.held, `something holds the data: ${held.map((h) => `pid ${h.pid} (${h.cmd.slice(0, 80)})`).join(", ")}. Stop Parachute (parachute stop, or its unit), then run this again.`);
+        }
+      };
+      notHeld();
+      const out: Record<string, unknown> = { rolled_back: true, from: r.version, to: r.previous, mode: p.mode, backup: r.backup };
+      if (p.mode === "code-only") {
+        say(`Every database here is at a schema number ${r.previous} opens, so nothing on disk changes and every ${r.version} write is kept.`);
+      } else {
+        const files = p.manifest!.files;
+        // 1. Stage the backup's databases beside the home and check each against the manifest, before anything moves.
+        const staged = join(r.backup!, `staged-${stamp()}`);
+        for (const [rel, hash] of Object.entries(files)) {
+          const to = join(staged, rel);
+          mkdirSync(dirname(to), { recursive: true, mode: 0o700 });
+          writeFileSync(to, readFileSync(join(r.backup!, "home", rel)), { mode: 0o600 });
+          if (sha256(to) !== hash) throw new Exit(EXIT.failed, `the backup's ${rel} doesn't match its manifest; nothing was changed`);
+        }
+        // 2. Export every note that differs from the backup, then check again that nothing has started since.
+        const dir = join(r.backup!, `changed-since-${stamp()}`);
+        // Always, a resumed restore too: what an interrupted one left (or an older release wrote since) is compared
+        // with the backup like the rest, and a database already put back shows no change.
+        const left = p.manifest!.skipped ?? [];
+        out.exported_notes = exportChanged(home, join(r.backup!, "home"), dir, left);
+        out.exported_to = dir;
+        say(`Exported ${out.exported_notes} notes changed since the backup to ${dir}`);
+        notHeld();
+        // 3. Swap: what is live moves aside, the staged copies take its place (renames on one filesystem). The record
+        //    says "restoring" throughout, so an interrupted swap is refused by every command until it is finished.
+        // Each attempt moves aside into its own folder, so a retry never overwrites what the first attempt kept.
+        const aside = join(r.backup!, `after-${r.version}-${stamp()}`);
+        const asides = [...(r.moved_aside ? [r.moved_aside] : []), ...(r.moved_aside_retries ?? [])];
+        writeRelease(home, { ...r, state: "restoring", moved_aside: asides[0] ?? aside, ...(asides.length ? { moved_aside_retries: [...asides.slice(1), aside] } : {}) });
+        for (const rel of new Set([...p.now.map((d) => d.rel).filter((rel) => !left.includes(rel)), ...Object.keys(files)])) {
+          for (const suffix of ["", "-wal", "-shm"]) {
+            const live = join(home, rel + suffix);
+            if (!existsSync(live)) continue;
+            mkdirSync(dirname(join(aside, rel)), { recursive: true, mode: 0o700 });
+            renameSync(live, join(aside, rel + suffix));
+          }
+        }
+        for (const rel of Object.keys(files)) {
+          mkdirSync(dirname(join(home, rel)), { recursive: true, mode: 0o700 });
+          renameSync(join(staged, rel), join(home, rel));
+        }
+        out.moved_aside = aside;
+        say(`Put the backup's databases back; what ${r.version} left is in ${aside}`);
       }
-      out.moved_aside = aside;
-      say(`Put the backup's databases back; what ${r.version} left is in ${aside}`);
-    }
-    const at = new Date().toISOString();
-    writeRelease(home, { ...r, state: "rolled-back", rolled_back_at: at, ...(p.mode === "restore" ? { restored_at: at, moved_aside: readRelease(home)?.moved_aside ?? (out.moved_aside as string), moved_aside_retries: readRelease(home)?.moved_aside_retries } : {}) });
-    say(`Rolled back. Start ${r.previous} on ${home} now (its own \`parachute serve\`, or its unit). Any ${r.version} command run on it again backs up and moves forward again.`);
-    if (json) console.log(JSON.stringify(out));
-    return EXIT.ok;
+      const at = new Date().toISOString();
+      writeRelease(home, { ...r, state: "rolled-back", rolled_back_at: at, ...(p.mode === "restore" ? { restored_at: at, moved_aside: readRelease(home)?.moved_aside ?? (out.moved_aside as string), moved_aside_retries: readRelease(home)?.moved_aside_retries } : {}) });
+      say(`Rolled back. Start ${r.previous} on ${home} now (its own \`parachute serve\`, or its unit). Any ${r.version} command run on it again backs up and moves forward again.`);
+      if (json) console.log(JSON.stringify(out));
+      return EXIT.ok;
+    });
+    return done;
   } catch (caught) {
     // A database that can't be read (or any other fault) is said plainly, never as a stack trace.
     const err = caught instanceof Exit ? caught : new Exit(EXIT.failed, `${(caught as Error)?.message ?? caught}; nothing more was changed`);

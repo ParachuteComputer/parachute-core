@@ -75,6 +75,16 @@ async function mintWith(bin: string, label: string, level: "read" | "write" | "a
   return t;
 }
 
+/** A home the real 0.8 made on its own (no serve): the given vaults and a first account. */
+async function homeBy08(label: string, vaults: string[]): Promise<string> {
+  const home = newHome(label);
+  const run08 = (bin: string, args: string[]) =>
+    Bun.spawnSync([bin, ...args], { env: { PATH: `${info.runtimeDir}:/usr/bin:/bin`, HOME: dirname(home), PARACHUTE_HOME: home, EMBEDDINGS_ENABLED: "false" }, cwd: dirname(home) });
+  for (const v of vaults) must(run08(prevVaultBin, ["create", v, "--no-mirror", "--json"]).exitCode === 0, `setup: 0.8 create ${v}`);
+  must(run08(prevBin, ["auth", "set-password", "--username", "owner", "--password", `pw-${randomBytes(12).toString("hex")}`]).exitCode === 0, "setup: 0.8 set-password");
+  return home;
+}
+
 async function post(token: string, key: string, content: string, tags: string[] = []) {
   const r = await api(token).post("/notes", { path: `upgrade/${key}-${randomBytes(2).toString("hex")}`, content, tags });
   must(r.status === 201, `writing ${key} gave ${r.status}: ${JSON.stringify(r.body).slice(0, 300)}`);
@@ -221,13 +231,22 @@ describe("lifecycle/upgrade", () => {
     expect(existsSync(join(dirname(home), "parachute-upgrade"))).toBe(false);
   }, 120_000);
 
+  test("two 0.9 commands opening a 0.8 home at once take one backup between them", async () => {
+    const home = await homeBy08("up-race", ["goodv"]);
+    const both = await Promise.all([cli(home, ["user", "list"]), cli(home, ["user", "list"])]);
+    expect(both.map((b) => b.code)).toEqual([0, 0]);
+    const dirs = readdirSync(join(dirname(home), "parachute-upgrade"));
+    expect(dirs.length).toBe(1);
+    expect(JSON.parse(readFileSync(join(home, "run", "release.json"), "utf8")).backup).toBe(join(dirname(home), "parachute-upgrade", dirs[0]!));
+    // The one backup is the home as 0.8 left it: before 0.9 added its keys table.
+    const copy = new Database(join(dirname(home), "parachute-upgrade", dirs[0]!, "home", "hub.db"), { readonly: true });
+    expect(copy.query("SELECT 1 FROM sqlite_master WHERE name = 'keys'").get()).toBeNull();
+    copy.close();
+  }, 120_000);
+
   test("a vault the backup skipped, repaired later, is backed up before 0.9 first opens it", async () => {
     // A home 0.8 made, with two vaults; one can't be read when 0.9 first opens the home.
-    const home = newHome("up-recovered");
-    const run08 = (bin: string, args: string[]) =>
-      Bun.spawnSync([bin, ...args], { env: { PATH: `${info.runtimeDir}:/usr/bin:/bin`, HOME: dirname(home), PARACHUTE_HOME: home, EMBEDDINGS_ENABLED: "false" }, cwd: dirname(home) });
-    for (const v of ["goodv", "laterv"]) must(run08(prevVaultBin, ["create", v, "--no-mirror", "--json"]).exitCode === 0, `setup: 0.8 create ${v}`);
-    must(run08(prevBin, ["auth", "set-password", "--username", "owner", "--password", `pw-${randomBytes(12).toString("hex")}`]).exitCode === 0, "setup: 0.8 set-password");
+    const home = await homeBy08("up-recovered", ["goodv", "laterv"]);
     const db = join(home, "vault", "data", "laterv", "vault.db");
     const healthy = readFileSync(db);
     for (const f of [`${db}-wal`, `${db}-shm`]) rmSync(f, { force: true });
