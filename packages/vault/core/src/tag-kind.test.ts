@@ -99,8 +99,10 @@ describe("kind rules", () => {
     await expect(tool(tools, "create-note").execute({ notes: [{ path: "A", content: "a" }], types: ["secret"] })).rejects.toThrow(/inside each note of a batch/);
     await expect(tool(tools, "update-note").execute({ notes: [], types: ["secret"] })).rejects.toThrow(/inside each note of a batch/);
     expect(tagKinds(db).has("secret")).toBe(false);
-    // An update that names no note makes no type either.
-    await expect(tool(tools, "update-note").execute({ types: { add: ["secret"] }, force: true })).rejects.toThrow();
+    // An update that names no note (missing, empty or null id) makes no type either.
+    for (const id of [undefined, "", null]) {
+      await expect(Promise.resolve().then(() => tool(tools, "update-note").execute({ ...(id === undefined ? {} : { id }), types: { add: ["secret"] }, force: true }))).rejects.toThrow();
+    }
     expect(tagKinds(db).has("secret")).toBe(false);
     db.close();
   });

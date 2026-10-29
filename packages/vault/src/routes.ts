@@ -3156,7 +3156,8 @@ async function handleNotesInner(
       if ((parsedBody.body as any)?.types !== undefined && Array.isArray((parsedBody.body as any)?.tags)) {
         return Response.json({ error: "send types with tags: {add, remove}, or alone", error_type: "tag_kind", field: "types", hint: "tags: {add: [...]}, types: {add: [...]}" }, { status: 400 });
       }
-      const folded = foldRestTypes(store.db, parsedBody.body, "update", tagScope.raw === null ? null : (t) => tagVisibleInScope(t, tagScope.allowed, tagScope.raw));
+      // The URL names the note.
+      const folded = foldRestTypes(store.db, parsedBody.body, "update", tagScope.raw === null ? null : (t) => tagVisibleInScope(t, tagScope.allowed, tagScope.raw), true);
       if (folded instanceof Response) return folded;
       const body = folded as any;
       if (body.if_updated_at !== undefined && !isValidIfUpdatedAt(body.if_updated_at)) return invalidIfUpdatedAtResponse();
@@ -5395,16 +5396,22 @@ export async function handleHistoryCompact(req: Request, store: Store, tagScope:
  * REST's half of "writes accept both" (T-318 §8a): fold a body's `types` (and
  * each batch item's) into its tags, or answer 422 with the fix.
  */
-function foldRestTypes(db: Database, body: unknown, mode: "create" | "update", visible: ((tag: string) => boolean) | null): unknown | Response {
+function foldRestTypes(
+  db: Database,
+  body: unknown,
+  mode: "create" | "update",
+  visible: ((tag: string) => boolean) | null,
+  named = false,
+): unknown | Response {
   if (!body || typeof body !== "object") return body;
   // For a tag-scoped caller, a type outside its scope makes no record and
   // reveals no kind: the write is merged into the tags the scope checks below
   // see, and they refuse it. Types inside its scope are made types as for anyone.
   const fold = (i: Record<string, unknown>) => {
     const merged = mergeTypesIntoTags(i, mode);
-    if (!visible) return foldTypesIntoTags(db, i, mode);
+    if (!visible) return foldTypesIntoTags(db, i, mode, { named });
     const added = mode === "create" ? (merged.tags as string[] | undefined) ?? [] : ((merged.tags as { add?: string[] } | undefined)?.add ?? []);
-    return added.every(visible) ? foldTypesIntoTags(db, i, mode) : merged;
+    return added.every(visible) ? foldTypesIntoTags(db, i, mode, { named }) : merged;
   };
   try {
     let out = fold(body as Record<string, unknown>);

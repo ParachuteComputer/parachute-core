@@ -185,12 +185,18 @@ export function foldTypeFilter(db: Database, params: Record<string, unknown>): R
  * be a type (or new, then made one) and lands in the one membership store as
  * a tag does. create takes an array; update takes an array (add) or {add, remove}.
  */
-export function foldTypesIntoTags(db: Database, item: Record<string, unknown>, mode: "create" | "update"): Record<string, unknown> {
+export function foldTypesIntoTags(
+  db: Database,
+  item: Record<string, unknown>,
+  mode: "create" | "update",
+  opts: { named?: boolean } = {},
+): Record<string, unknown> {
   if (!item || item.types === undefined) return item;
   assertNoBatchLevelTypes(item);
   // An update with no note named makes nothing: the write is refused for the missing id, and nothing
   // about a type (or a hidden tag's kind) is created or revealed on the way there.
-  if (mode === "update" && item.id === undefined && item.note_id === undefined) return mergeTypesIntoTags(item, mode);
+  // (`named`: the caller names the note elsewhere, as REST PATCH does in its URL.)
+  if (mode === "update" && !opts.named && !item.id && !item.note_id) return mergeTypesIntoTags(item, mode);
   ensureTypes(db, typesAdded(item, mode));
   return mergeTypesIntoTags(item, mode);
 }
