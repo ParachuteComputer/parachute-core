@@ -137,6 +137,13 @@ export function beforeOpen(home: string, say: (s: string) => void = (s) => conso
   if (serveRefusal(home) !== null) return undefined;
   const since = new Date().toISOString();
   const dbs = databases(home, { hub: 0, vault: 0 });
+  // A database that can't be read can't be backed up or judged. The command goes on and fails its own way (a vault
+  // that can't open stops serve with 75); nothing is recorded, so the next open of a readable home backs up first.
+  const unreadable = dbs.filter((d) => !readable(join(home, d.rel), dirname(home)));
+  if (unreadable.length) {
+    say(`parachute: can't read ${unreadable.map((d) => d.rel).join(", ")}; no upgrade backup taken, and none recorded`);
+    return undefined;
+  }
   if (dbs.length === 0) {
     const fresh: Release = { version: core.version, previous: was?.version ?? null, since, backup: null, state: "current" };
     writeRelease(home, fresh);
@@ -165,6 +172,16 @@ export function beforeOpen(home: string, say: (s: string) => void = (s) => conso
   const r: Release = { version: core.version, previous, since, backup, state: "current" };
   writeRelease(home, r);
   return r;
+}
+
+/** Whether SQLite can read `path` as a database (without changing a byte of the home). */
+function readable(path: string, outside: string): boolean {
+  try {
+    readDatabase(path, (db) => db.query("SELECT count(*) FROM sqlite_master").get(), outside);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Whether 0.9 already opened every database here (it adds `keys` to hub.db and `kind` to each vault's tags). */
@@ -300,8 +317,9 @@ export async function rollback(home: string, args: string[]): Promise<number> {
     say(`Rolled back. Start ${r.previous} on ${home} now (its own \`parachute serve\`, or its unit). Any ${r.version} command run on it again backs up and moves forward again.`);
     if (json) console.log(JSON.stringify(out));
     return EXIT.ok;
-  } catch (err) {
-    if (!(err instanceof Exit)) throw err;
+  } catch (caught) {
+    // A database that can't be read (or any other fault) is said plainly, never as a stack trace.
+    const err = caught instanceof Exit ? caught : new Exit(EXIT.failed, `${(caught as Error)?.message ?? caught}; nothing more was changed`);
     console.error(`parachute upgrade --rollback: ${err.message}`);
     if (json) console.log(JSON.stringify({ rolled_back: false, error: err.message, exit: err.code }));
     return err.code;

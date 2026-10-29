@@ -16,7 +16,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createHash, randomBytes } from "node:crypto";
 import { Database } from "bun:sqlite";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { candidate, freePort, newHome, until } from "../candidate-lib.ts";
 import { cli } from "../candidate-lib.ts";
@@ -205,6 +205,21 @@ describe("lifecycle/upgrade", () => {
     }
     expect((await core(["upgrade", "--rollback"])).code).toBe(1); // nothing left to roll back
   }, 240_000);
+
+  test("a database that can't be read: no backup, no record, no crash; the command goes on and fails its own way", async () => {
+    // A vault that can't open must stop serve with its own exit (lifecycle/shutdown "vault start failure"); the
+    // upgrade step must not crash first and hide that.
+    const home = newHome("up-unreadable");
+    must((await cli(home, ["create", "brokenv", "--no-mirror", "--json"], { vault: true, env: { EMBEDDINGS_ENABLED: "false" } })).code === 0, "setup: vault create");
+    const db = join(home, "vault", "data", "brokenv", "vault.db");
+    for (const f of [`${db}-wal`, `${db}-shm`]) rmSync(f, { force: true });
+    writeFileSync(db, "Made-up bytes that are not a database.\n".repeat(200));
+    const r = await cli(home, ["user", "list"]);
+    expect(r.stderr).toContain("can't read vault/data/brokenv/vault.db; no upgrade backup taken, and none recorded");
+    expect(r.stderr).not.toMatch(/SQLiteError|^\s+at /m);
+    expect(existsSync(join(home, "run", "release.json"))).toBe(false);
+    expect(existsSync(join(dirname(home), "parachute-upgrade"))).toBe(false);
+  }, 120_000);
 
   test("a home 0.9 made has no earlier release: no backup, nothing to roll back", async () => {
     const home = newHome("up-fresh");
