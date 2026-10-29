@@ -537,7 +537,7 @@ describe("attachment tickets — discoverability", () => {
     const enabled = attachmentsInstructionBlock({ ticketsEnabled: true });
     expect(enabled).toContain("request-attachment-upload");
     expect(enabled).toContain("request-attachment-download");
-    expect(enabled).toContain("curl_example");
+    expect(enabled).toContain("one-use URL");
 
     const disabled = attachmentsInstructionBlock({ ticketsEnabled: false });
     expect(disabled).not.toContain("request-attachment-upload");
