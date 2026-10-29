@@ -208,7 +208,7 @@ export function frontHelp(): string {
     "  setup [expose|mcp|transcription|--embedded]   make something work, once",
     "  serve                         run in the foreground (units, containers, Prism)",
     "  start|stop|restart            the background service",
-    "  upgrade                       this program",
+    "  upgrade [--rollback]          this program, or back to the release before",
     "",
     "Safety",
     "  backup [now|list|schedule]    the vaults' backups",

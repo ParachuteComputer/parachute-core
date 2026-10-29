@@ -1,6 +1,7 @@
 // `parachute keys` (DESIGN-0.9 §1, §2): every way in is a key with a name, an owner and scopes.
 //
-//   keys list [--all] [--json]           every live key (the hub's `keys` table, PR #17), --all adds revoked/expired
+//   keys list [--all] [--json]           every live key (the hub's `keys` table, PR #17); --all adds revoked and
+//                                        expired keys and the CLI's own operator credential
 //   keys list --pending                  apps waiting for approval (auth pending-clients)
 //   keys new <name> --vault <v> [--can read|write|admin] [--expires-in <s> | --ephemeral] [--json]
 //                                        auth mint-token, labelled with the name, so its key is called <name>
@@ -157,7 +158,10 @@ export function keysCommand(args: string[]): KeysResult {
       keys: listKeys(db),
       users: new Map((db.prepare("SELECT id, username FROM users").all() as { id: string; username: string }[]).map((u) => [u.id, u.username])),
     }));
-    const shown = rest.includes("--all") ? keys : keys.filter((k) => k.status === "active");
+    // The CLI's own operator credential (host scopes) is plumbing, not a key anyone hands out (DESIGN §1: "the
+    // operator token becomes invisible"); --all shows it, with revoked and expired keys.
+    const hostCredential = (k: KeyView) => k.scopes.some((sc) => sc.startsWith("parachute:host:"));
+    const shown = rest.includes("--all") ? keys : keys.filter((k) => k.status === "active" && !hostCredential(k));
     if (rest.includes("--json")) console.log(JSON.stringify(shown.map((k) => ({ ...k, owner_name: k.owner ? (users.get(k.owner) ?? null) : null }))));
     else for (const line of show(shown, users)) console.log(line);
     return { exit: 0 };

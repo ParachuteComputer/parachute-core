@@ -49,7 +49,9 @@ export interface Release {
   via?: "takeover";
   rolled_back_at?: string;
   restored_at?: string;
+  /** Where a restore moved what was live; a retried restore adds its own folders in moved_aside_retries. */
   moved_aside?: string;
+  moved_aside_retries?: string[];
 }
 
 interface Manifest {
@@ -221,6 +223,14 @@ export async function rollback(home: string, args: string[]): Promise<number> {
     if (!r || (r.state !== "current" && !resuming) || !r.previous) {
       throw new Exit(EXIT.failed, r?.state === "rolled-back" ? `this home was rolled back to ${r.previous} on ${r.rolled_back_at}; nothing to roll back` : `no earlier release served this home (run/release.json says ${r ? `${r.version}, first` : "nothing"}); nothing to roll back`);
     }
+    if (restore && !yes) {
+      // Asked before any check below, so what is checked is what the restore then does.
+      const at = (readJson(join(r.backup ?? "", "manifest.json")) as Manifest | undefined)?.at ?? "an unknown time";
+      if (!process.stdin.isTTY) throw new Exit(EXIT.usage, "--restore puts the backup's databases back; add --yes to go ahead");
+      process.stdout.write(`Put back the databases backed up at ${at} (notes changed since are exported first)? [y/N] `);
+      const answer = await new Promise<string>((res) => process.stdin.once("data", (b) => res(String(b).trim())));
+      if (!/^y(es)?$/i.test(answer)) throw new Exit(EXIT.usage, "not confirmed; nothing was changed");
+    }
     const p = plan(home, r, restore);
     if (restore && !p.manifest?.files) throw new Exit(EXIT.failed, `there is no backup to restore (${r.backup ?? "none was taken"})`);
     if (!restore && p.moved.length) {
@@ -235,13 +245,6 @@ export async function rollback(home: string, args: string[]): Promise<number> {
         if (names.has(name)) throw new Exit(EXIT.failed, `two databases for the vault '${name}' (${names.get(name)}, ${d.rel}); move the one not in use out of the home first`);
         names.set(name, d.rel);
       }
-    }
-    if (restore && !yes) {
-      // Asked before the checks below, so nothing can start between the checks and the restore while it waits.
-      if (!process.stdin.isTTY) throw new Exit(EXIT.usage, "--restore puts the backup's databases back; add --yes to go ahead");
-      process.stdout.write(`Put back the databases backed up at ${p.manifest!.at} (notes changed since are exported first)? [y/N] `);
-      const answer = await new Promise<string>((res) => process.stdin.once("data", (b) => res(String(b).trim())));
-      if (!/^y(es)?$/i.test(answer)) throw new Exit(EXIT.usage, "not confirmed; nothing was changed");
     }
     const notHeld = () => {
       const held = holders(home);
@@ -265,16 +268,18 @@ export async function rollback(home: string, args: string[]): Promise<number> {
       }
       // 2. Export every note that differs from the backup, then check again that nothing has started since.
       const dir = join(r.backup!, `changed-since-${stamp()}`);
-      if (!resuming) {
-        out.exported_notes = exportChanged(home, join(r.backup!, "home"), dir);
-        out.exported_to = dir;
-        say(`Exported ${out.exported_notes} notes changed since the backup to ${dir}`);
-      }
+      // Always, a resumed restore too: what an interrupted one left (or an older release wrote since) is compared
+      // with the backup like the rest, and a database already put back shows no change.
+      out.exported_notes = exportChanged(home, join(r.backup!, "home"), dir);
+      out.exported_to = dir;
+      say(`Exported ${out.exported_notes} notes changed since the backup to ${dir}`);
       notHeld();
       // 3. Swap: what is live moves aside, the staged copies take its place (renames on one filesystem). The record
       //    says "restoring" throughout, so an interrupted swap is refused by every command until it is finished.
-      const aside = r.moved_aside ?? join(r.backup!, `after-${r.version}-${stamp()}`);
-      writeRelease(home, { ...r, state: "restoring", moved_aside: aside });
+      // Each attempt moves aside into its own folder, so a retry never overwrites what the first attempt kept.
+      const aside = join(r.backup!, `after-${r.version}-${stamp()}`);
+      const asides = [...(r.moved_aside ? [r.moved_aside] : []), ...(r.moved_aside_retries ?? [])];
+      writeRelease(home, { ...r, state: "restoring", moved_aside: asides[0] ?? aside, ...(asides.length ? { moved_aside_retries: [...asides.slice(1), aside] } : {}) });
       for (const rel of new Set([...p.now.map((d) => d.rel), ...Object.keys(files)])) {
         for (const suffix of ["", "-wal", "-shm"]) {
           const live = join(home, rel + suffix);
@@ -291,7 +296,7 @@ export async function rollback(home: string, args: string[]): Promise<number> {
       say(`Put the backup's databases back; what ${r.version} left is in ${aside}`);
     }
     const at = new Date().toISOString();
-    writeRelease(home, { ...r, state: "rolled-back", rolled_back_at: at, ...(p.mode === "restore" ? { restored_at: at, moved_aside: out.moved_aside as string } : {}) });
+    writeRelease(home, { ...r, state: "rolled-back", rolled_back_at: at, ...(p.mode === "restore" ? { restored_at: at, moved_aside: readRelease(home)?.moved_aside ?? (out.moved_aside as string), moved_aside_retries: readRelease(home)?.moved_aside_retries } : {}) });
     say(`Rolled back. Start ${r.previous} on ${home} now (its own \`parachute serve\`, or its unit). Any ${r.version} command run on it again backs up and moves forward again.`);
     if (json) console.log(JSON.stringify(out));
     return EXIT.ok;
