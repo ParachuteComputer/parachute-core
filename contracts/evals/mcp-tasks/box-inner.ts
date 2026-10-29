@@ -37,8 +37,11 @@ async function run(args: string[]): Promise<string> {
   return out;
 }
 
-const lo = Bun.spawnSync(["ip", "link", "set", "lo", "up"]);
-if (lo.exitCode !== 0) throw new Error(`ip link set lo up failed: ${lo.stderr}`);
+const lo = Bun.spawnSync(["ip", "link", "set", "lo", "up"], { stderr: "pipe" });
+if (lo.exitCode !== 0) {
+  console.error(`ip link set lo up failed (${lo.exitCode}): ${lo.stderr.toString()}`);
+  process.exit(1);
+}
 
 {
   const p = Bun.spawnSync([join(bin, "parachute-vault"), "create", vault, "--no-mirror", "--json"], { env, cwd: user });

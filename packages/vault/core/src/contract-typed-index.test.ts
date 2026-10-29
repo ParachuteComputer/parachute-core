@@ -21,6 +21,7 @@ import { describe, it, test, expect, beforeEach } from "bun:test";
 import { Database } from "bun:sqlite";
 import { SqliteStore } from "./store.js";
 import { generateMcpTools, SchemaValidationError } from "./mcp.js";
+import { MCP_TOOL_REFERENCE } from "./mcp-manifest.js";
 import { TransitionConflictError } from "./notes.js";
 import * as noteOps from "./notes.js";
 import { TagFieldConflictError } from "./tag-schemas.js";
@@ -221,7 +222,8 @@ describe("contract: typed indexes — Decision B: explicit-default-only enum bac
 
 describe("contract: typed indexes — Decision C: honest type list (#553, flipped from todo)", () => {
   it("the update-tag field-type description clarifies only string/integer/boolean/reference/date are indexable", () => {
-    const updateTag = generateMcpTools(store).find((t) => t.name === "update-tag")!;
+    // The full reference (vault-info {help: "update-tag"}) carries the field-type vocabulary.
+    const updateTag = MCP_TOOL_REFERENCE.find((t) => t.name === "update-tag")!;
     const typeDesc = (updateTag.inputSchema as any).properties.fields.additionalProperties.properties.type.description as string;
     // Honest about the full storage/advisory vocabulary AND the indexable subset.
     expect(typeDesc).toContain("number");

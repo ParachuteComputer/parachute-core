@@ -239,11 +239,15 @@ let done = 0;
 async function worker() {
   while (next < jobs.length) {
     const job = jobs[next++]!;
-    let row: Record<string, unknown>;
-    try {
-      row = await runJob(job);
-    } catch (err) {
-      row = { model: job.model, arm: job.arm, task: job.task.id, family: job.task.family, rep: job.rep, ok: false, why: `harness: ${String((err as Error)?.message ?? err).slice(0, 300)}`, harness_error: true };
+    let row: Record<string, unknown> = {};
+    // A box that fails to start is the harness's problem, not the model's: try again, then record it apart.
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        row = await runJob(job);
+        break;
+      } catch (err) {
+        row = { model: job.model, arm: job.arm, task: job.task.id, family: job.task.family, rep: job.rep, ok: false, why: `harness: ${String((err as Error)?.message ?? err).slice(-400)}`, harness_error: true };
+      }
     }
     appendFileSync(rowsFile, JSON.stringify(row) + "\n");
     done++;
