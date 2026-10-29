@@ -39,13 +39,16 @@ async function run(args: string[]): Promise<string> {
 
 const lo = Bun.spawnSync(["ip", "link", "set", "lo", "up"], { stderr: "pipe" });
 if (lo.exitCode !== 0) {
-  console.error(`ip link set lo up failed (${lo.exitCode}): ${lo.stderr.toString()}`);
+  console.error(`BOX-ERROR ip link set lo up failed (${lo.exitCode}): ${lo.stderr.toString()}`);
   process.exit(1);
 }
 
 {
-  const p = Bun.spawnSync([join(bin, "parachute-vault"), "create", vault, "--no-mirror", "--json"], { env, cwd: user });
-  if (p.exitCode !== 0) throw new Error(`parachute-vault create failed: ${p.stderr}`);
+  const p = Bun.spawnSync([join(bin, "parachute-vault"), "create", vault, "--no-mirror", "--json"], { env, cwd: user, stderr: "pipe" });
+  if (p.exitCode !== 0) {
+    console.error(`BOX-ERROR parachute-vault create failed (${p.exitCode}): ${p.stderr.toString().slice(-600).replace(/\n/g, " | ")}`);
+    process.exit(1);
+  }
 }
 const serveLog = Bun.file(join(dir, "serve.log"));
 const serve = Bun.spawn([join(bin, "parachute"), "serve"], {
@@ -131,6 +134,6 @@ try {
   }
   await stop();
 } catch (err) {
-  console.error(String((err as Error)?.stack ?? err));
+  console.error(`BOX-ERROR ${String((err as Error)?.message ?? err).replace(/\n/g, " | ")}`);
   await stop(1);
 }

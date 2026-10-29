@@ -61,7 +61,7 @@ export async function startBox(opts: { keep?: boolean } = {}): Promise<Box> {
       const err = await new Response(proc.stderr).text().catch(() => "");
       proc.kill("SIGKILL");
       if (attempt < 2) continue;
-      throw new Error(`the box did not start: ${err.slice(-1500)}`);
+      throw new Error(`the box did not start: ${err.match(/^BOX-ERROR (.*)$/m)?.[1] ?? err.slice(-1500)}`);
     }
     let server: ReturnType<typeof Bun.serve>;
     try {
