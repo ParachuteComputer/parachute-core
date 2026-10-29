@@ -1,5 +1,29 @@
 # Results: short MCP descriptions pass the ship gate
 
+## Re-run on the integrated 0.9.0-pre.1 shape (2026-10-29, T-318 integration)
+
+The same 720 runs on the final shape: #15, #16 (eleven tools, old names listed as aliases), #18 (types and tags) and
+#17 (keys) merged, plus one line in `cursor`'s description ("an empty page means caught up, so stop"), at commit
+3112695. Rows: [`results/2026-10-29-int/runs.jsonl`](results/2026-10-29-int/runs.jsonl); table:
+[`results/2026-10-29-int/SUMMARY.md`](results/2026-10-29-int/SUMMARY.md).
+
+| model | OLD success | NEW success | input tokens / task, OLD → NEW | calls / task (mean, t27 excluded) |
+|---|---:|---:|---:|---:|
+| Opus | 90/90 | **90/90** | 87.6k → 27.7k (−68%) | 2.10 → 2.09 |
+| Sonnet | 90/90 | **90/90** | 77.0k → 22.6k (−71%) | 1.64 → 1.51 |
+| Haiku | 89/90 | **90/90** | 81.7k → 26.6k (−67%) | 1.70 → 1.94 |
+| Codex | 88/90 | **89/90** | 100.5k → 79.0k (−21%) | 1.79 → 1.62 |
+
+- **The gate holds: NEW ≥ OLD for every model.** No model lost a task to the merge.
+- **The cursor line fixed Codex's endless paging.** On t27 Codex now takes 4 calls per run on NEW (OLD: 234, 651
+  and 771 calls; last night both arms took about 5,800).
+- NEW reads about 4k more tokens per task than last night's NEW (the alias names stay listed for Prism's allowlist,
+  and types add a little). Still about a third of OLD for the Claude models.
+- The failures are not about descriptions: Codex's t02 (both arms) and OLD t01 made 0 calls because the Codex CLI's
+  approval policy blocked the MCP call; Haiku's OLD t23 is the same one-off attachment miss as last night.
+
+## First run (2026-10-29, before the merge)
+
 Run 2026-10-29 (T-318 brief 09). 720 runs: 4 models × OLD/NEW × 30 tasks × 3 repeats (t31 skipped, no embeddings).
 Every row is in [`results/2026-10-29/runs.jsonl`](results/2026-10-29/runs.jsonl); the table is
 [`results/2026-10-29/SUMMARY.md`](results/2026-10-29/SUMMARY.md).
