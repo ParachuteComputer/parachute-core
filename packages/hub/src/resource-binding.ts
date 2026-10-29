@@ -326,13 +326,14 @@ function isLoopbackHostname(hostname: string): boolean {
 }
 
 /**
- * A `resource` as a log may show it: the scheme (http/https only), the host, and the path as one of a few fixed
+ * A `resource` as a log may show it: the scheme (http/https only), the host when it is one of `knownOrigins`' hosts
+ * or loopback (else `<other-host>`), and the path as one of a few fixed
  * templates with the vault name replaced (`/vault/<v>/mcp`, `/vault/<v>/.well-known/oauth-protected-resource`, `/mcp`,
  * `/`), else `<other-path>`. A query or fragment shows as `?…`. `none` when absent, `malformed` when it doesn't
  * parse, `<other-scheme>` for anything but http(s). Never the value itself: a resource may carry anything, and the
  * refresh path logs the unmatched ones on purpose.
  */
-export function resourceLogShape(resource: string | null | undefined): string {
+export function resourceLogShape(resource: string | null | undefined, knownOrigins: readonly string[] = []): string {
   if (!resource) return "none";
   let u: URL;
   try {
@@ -341,7 +342,8 @@ export function resourceLogShape(resource: string | null | undefined): string {
     return "malformed";
   }
   if (u.protocol !== "http:" && u.protocol !== "https:") return "<other-scheme>";
-  const host = /^[A-Za-z0-9.\-\[\]:]{1,100}$/.test(u.host) ? u.host : "<host>";
+  // Only a host the hub itself answers on (or loopback) is named; any other host is the client's to know, not the log's.
+  const host = isLoopbackHostname(u.hostname) || knownHosts(knownOrigins).has(u.host) ? u.host : "<other-host>";
   const p = u.pathname;
   let path = "<other-path>";
   if (VAULT_MCP_PATH_RE.test(p)) path = `/vault/<v>/mcp${p.endsWith("/") ? "/" : ""}`;

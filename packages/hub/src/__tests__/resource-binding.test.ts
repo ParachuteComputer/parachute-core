@@ -298,20 +298,21 @@ describe("resolveRefreshResource (refresh only: the resource a client saved unde
 
 describe("resourceLogShape", () => {
   test("scheme, host and path shape; the vault name, query and fragment never shown", () => {
+    expect(resourceLogShape("https://private-name.example/mcp", BOUND)).toBe("https://<other-host>/mcp");
     expect(resourceLogShape("http://127.0.0.1:1940/vault/jon/mcp")).toBe("http://127.0.0.1:1940/vault/<v>/mcp");
-    expect(resourceLogShape("https://hub.example/vault/jon/mcp?token=abc#x")).toBe("https://hub.example/vault/<v>/mcp?…");
-    expect(resourceLogShape("https://hub.example/mcp")).toBe("https://hub.example/mcp");
+    expect(resourceLogShape("https://hub.example/vault/jon/mcp?token=abc#x", BOUND)).toBe("https://hub.example/vault/<v>/mcp?…");
+    expect(resourceLogShape("https://hub.example/mcp", BOUND)).toBe("https://hub.example/mcp");
     expect(resourceLogShape(null)).toBe("none");
     expect(resourceLogShape("not a url")).toBe("malformed");
   });
 
   test("whatever else the resource carries stays out of the log: other paths, other schemes", () => {
-    expect(resourceLogShape("https://hub.example/mcp/SECRET")).toBe("https://hub.example<other-path>");
-    expect(resourceLogShape("https://hub.example/vault/jon/mcp/SECRET")).toBe("https://hub.example<other-path>");
-    expect(resourceLogShape("https://hub.example/SECRET")).toBe("https://hub.example<other-path>");
+    expect(resourceLogShape("https://hub.example/mcp/SECRET", BOUND)).toBe("https://hub.example<other-path>");
+    expect(resourceLogShape("https://hub.example/vault/jon/mcp/SECRET", BOUND)).toBe("https://hub.example<other-path>");
+    expect(resourceLogShape("https://hub.example/SECRET", BOUND)).toBe("https://hub.example<other-path>");
     expect(resourceLogShape("data:text/plain,SECRET")).toBe("<other-scheme>");
-    expect(resourceLogShape("https://user:SECRET@hub.example/mcp")).toBe("https://hub.example/mcp");
-    expect(resourceLogShape("http://hub.example/vault/jon/.well-known/oauth-protected-resource")).toBe(
+    expect(resourceLogShape("https://user:SECRET@hub.example/mcp", BOUND)).toBe("https://hub.example/mcp");
+    expect(resourceLogShape("http://hub.example/vault/jon/.well-known/oauth-protected-resource", BOUND)).toBe(
       "http://hub.example/vault/<v>/.well-known/oauth-protected-resource",
     );
     for (const r of ["https://hub.example/mcp/SECRET", "data:text/plain,SECRET", "https://user:SECRET@hub.example/mcp"])

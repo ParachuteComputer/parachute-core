@@ -785,6 +785,15 @@ function clientIdLogPrefix(clientId: string): string {
   return head && /^[A-Za-z0-9_-]+$/.test(head) ? head : "?";
 }
 
+/** The origins whose hosts a token log line may name: the bound set and every earlier issuer. A source that throws names none. */
+function tokenLogOrigins(deps: OAuthDeps): readonly string[] {
+  try {
+    return [...resolveBoundOrigins(deps), ...(deps.knownIssuers?.() ?? [])];
+  } catch {
+    return [];
+  }
+}
+
 /** The token endpoint's fixed error descriptions; any other (they can carry scopes, names or URLs) isn't logged. */
 const LOGGABLE_TOKEN_ERRORS = new Set([
   "body must be JSON",
@@ -817,6 +826,7 @@ function safeErrorDescription(d: unknown): string | null {
 async function logRefusedToken(
   form: Awaited<ReturnType<Request["formData"]>>,
   res: Response,
+  knownOrigins: readonly string[],
 ): Promise<void> {
   let error = "?";
   let description: string | null = null;
@@ -829,7 +839,7 @@ async function logRefusedToken(
   }
   const grantType = String(form.get("grant_type") ?? "");
   console.warn(
-    `[oauth] /oauth/token refused: grant_type=${/^[a-z_]{1,40}$/.test(grantType) ? grantType : "?"} status=${res.status} error=${error}${description ? ` (${description})` : ""} client=${clientIdLogPrefix(String(form.get("client_id") ?? ""))} resource=${resourceLogShape(form.get("resource") as string | null)}`,
+    `[oauth] /oauth/token refused: grant_type=${grantType === "authorization_code" || grantType === "refresh_token" ? grantType : "<other>"} status=${res.status} error=${error}${description ? ` (${description})` : ""} client=${clientIdLogPrefix(String(form.get("client_id") ?? ""))} resource=${resourceLogShape(form.get("resource") as string | null, knownOrigins)}`,
   );
 }
 
@@ -2810,10 +2820,10 @@ export async function handleToken(db: Database, req: Request, deps: OAuthDeps): 
   try {
     res = await dispatchToken(db, req, form, deps);
   } catch (err) {
-    await logRefusedToken(form, new Response(null, { status: 500 }));
+    await logRefusedToken(form, new Response(null, { status: 500 }), tokenLogOrigins(deps));
     throw err;
   }
-  if (res.status < 200 || res.status > 299) await logRefusedToken(form, res);
+  if (res.status < 200 || res.status > 299) await logRefusedToken(form, res, tokenLogOrigins(deps));
   return res;
 }
 
@@ -3091,7 +3101,7 @@ async function rotateAndRespond(
   );
   if (audienceResolution.ignored) {
     console.warn(
-      `[oauth] refresh ignored its resource (${audienceResolution.ignored}); the grant's own audience kept: client=${clientIdLogPrefix(row.clientId)} resource=${resourceLogShape(requestResource)}`,
+      `[oauth] refresh ignored its resource (${audienceResolution.ignored}); the grant's own audience kept: client=${clientIdLogPrefix(row.clientId)} resource=${resourceLogShape(requestResource, tokenLogOrigins(deps))}`,
     );
   }
   const audience = audienceResolution.audience;

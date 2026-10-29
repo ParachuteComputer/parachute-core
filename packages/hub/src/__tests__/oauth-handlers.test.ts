@@ -9942,7 +9942,7 @@ describe("RFC 8707 resource binding — vault-bound MCP (fix #461)", () => {
       expect(res?.status).toBe(400);
       expect(((await res!.json()) as { error_description: string }).error_description).toContain("password");
       expect(odd).toEqual([
-        `[oauth] /oauth/token refused: grant_type=password status=400 error=unsupported_grant_type client=${flow.clientId.slice(0, 6)} resource=none`,
+        `[oauth] /oauth/token refused: grant_type=<other> status=400 error=unsupported_grant_type client=${flow.clientId.slice(0, 6)} resource=none`,
       ]);
     } finally {
       flow.cleanup();
