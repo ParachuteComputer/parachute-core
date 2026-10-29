@@ -124,9 +124,11 @@ export function kindError(message: string, field: string, hint: string): Error {
  */
 export function validateTypes(db: Database, names: string[]): string[] {
   const kinds = tagKinds(db);
+  const pending = PENDING.get(db);
   const out = [...new Set(names.map(stripTagHash).filter(Boolean))];
   for (const name of out) {
-    if (kinds.get(name) === "tag") {
+    // A name another write is making a type right now (its membership is in, its kind not yet) counts as one.
+    if (kinds.get(name) === "tag" && !pending?.has(name)) {
       throw kindError(
         `"${name}" is a plain tag, not a type. Use tags: ["${name}"], or make it a type first: manage-types {tag: "${name}", kind: "type"}.`,
         "types",
@@ -137,18 +139,37 @@ export function validateTypes(db: Database, names: string[]): string[] {
   return out;
 }
 
-/** After a write that named `types` succeeded: their records say type (the write itself made any that were new). */
+/**
+ * After a write that named `types` returned: each name a note now carries says
+ * type. Only names with a membership are marked, so a write that made nothing
+ * (refused, rolled back, or an `if_exists: "ignore"` create that found its note)
+ * leaves no type behind. The write itself made the record (tagNote).
+ */
 export function markTypes(db: Database, names: string[]): void {
-  const now = new Date().toISOString();
   for (const name of new Set(names)) {
-    db.prepare("INSERT OR IGNORE INTO tags (name, kind, created_at, updated_at) VALUES (?, 'type', ?, ?)").run(name, now, now);
-    db.prepare("UPDATE tags SET kind = 'type' WHERE name = ? AND kind IS NULL").run(name);
+    db.prepare("UPDATE tags SET kind = 'type' WHERE name = ? AND kind IS NULL AND EXISTS (SELECT 1 FROM note_tags WHERE tag_name = ?)").run(name, name);
   }
 }
 
-/** Validate and mark at once, for a caller with no write to wait for. */
-export function ensureTypes(db: Database, names: string[]): void {
-  markTypes(db, validateTypes(db, names));
+/** Types writes in flight are making, per database: counted as types by validateTypes until they are marked. */
+const PENDING = new WeakMap<Database, Map<string, number>>();
+
+/** Hold `names` as pending types for the length of a write; returns the release. */
+export function holdTypes(db: Database, names: string[]): () => void {
+  if (!names.length) return () => {};
+  let map = PENDING.get(db);
+  if (!map) PENDING.set(db, (map = new Map()));
+  for (const n of names) map.set(n, (map.get(n) ?? 0) + 1);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    for (const n of names) {
+      const c = (map!.get(n) ?? 1) - 1;
+      if (c > 0) map!.set(n, c);
+      else map!.delete(n);
+    }
+  };
 }
 
 /**

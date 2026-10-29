@@ -108,6 +108,22 @@ describe("kind rules", () => {
     db.close();
   });
 
+  test("an ignored create marks nothing; two writes making the same new type at once both succeed", async () => {
+    const { db, store, tools } = fresh();
+    await store.createNote("a", { path: "A" });
+    const create = tool(tools, "create-note");
+    const kept: any = await create.execute({ path: "A", content: "x", if_exists: "ignore", types: ["ghost"] });
+    expect(kept.existed).toBe(true);
+    expect(tagKinds(db).get("ghost")).not.toBe("type");
+    const both = await Promise.allSettled([
+      create.execute({ path: "P1", content: "1", types: ["newtask"] }),
+      create.execute({ path: "P2", content: "2", types: ["newtask"] }),
+    ]);
+    expect(both.map((r) => r.status)).toEqual(["fulfilled", "fulfilled"]);
+    expect(tagKinds(db).get("newtask")).toBe("type");
+    db.close();
+  });
+
   test("types beside a batch is refused before anything is made", async () => {
     const { db, tools } = fresh();
     await expect(tool(tools, "create-note").execute({ notes: [{ path: "A", content: "a" }], types: ["secret"] })).rejects.toThrow(/inside each note of a batch/);

@@ -74,7 +74,7 @@ import {
   MAX_ATTACHMENT_IMAGE_BYTES,
   type AttachmentBytesProvider,
 } from "./attachment/bytes-provider.js";
-import { foldTypeFilter, markTypes, prepareCallTypes, refreshTypes, tagKinds } from "./tag-kind.js";
+import { foldTypeFilter, holdTypes, markTypes, prepareCallTypes, refreshTypes, tagKinds } from "./tag-kind.js";
 
 /**
  * A single MCP tool-result content block. Mirrors the subset of the MCP SDK's
@@ -3022,11 +3022,15 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
       const batchTypes = Array.isArray(params.notes) && (params.notes as Record<string, unknown>[]).some((n) => n?.types !== undefined);
       if (params.types === undefined && !batchTypes) return execute(params);
       const prepared = prepareCallTypes(db, params, mode);
-      const out = await execute(prepared.params);
-      const failed = out !== null && typeof out === "object" && !Array.isArray(out) && "error_type" in (out as Record<string, unknown>);
-      if (failed || !prepared.types.length) return out;
-      markTypes(db, prepared.types);
-      return refreshTypes(db, out);
+      const release = holdTypes(db, prepared.types);
+      try {
+        const out = await execute(prepared.params);
+        if (!prepared.types.length) return out;
+        markTypes(db, prepared.types);
+        return refreshTypes(db, out);
+      } finally {
+        release();
+      }
     };
   }
   // T-318 §4: `query-notes {path_between}` is find-path under its 0.9 name. Dispatched here so every runtime that

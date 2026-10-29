@@ -17,7 +17,7 @@ import { HistoryNotFoundError, latestTombstone } from "../core/src/history.js";
 import { projectHistoryProvenance } from "../core/src/history-visibility.js";
 import { isNoteIdShape } from "../core/src/ulid.js";
 import type { Database } from "bun:sqlite";
-import { markTypes, mergeTypesIntoTags, prepareCallTypes, refreshTypes } from "../core/src/tag-kind.ts";
+import { holdTypes, markTypes, mergeTypesIntoTags, prepareCallTypes, refreshTypes } from "../core/src/tag-kind.ts";
 import type { Store, Note, QueryOpts, AggregateSpec } from "../core/src/types.ts";
 import { TAG_EXPAND_MODES, stripTagHash, suggestSimilarTag, type TagExpandMode } from "../core/src/tag-hierarchy.ts";
 import {
@@ -1435,9 +1435,11 @@ export async function handleNotes(
 ): Promise<Response> {
   try {
     const res = await handleNotesInner(req, store, subpath, vault, tagScope, writeCtx);
-    const types = PENDING_TYPES.get(req);
-    if (!types || res.status >= 300) return res;
-    markTypes(store.db, types);
+    const pending = PENDING_TYPES.get(req);
+    if (!pending) return res;
+    pending.release();
+    if (res.status >= 300) return res;
+    markTypes(store.db, pending.names);
     // The body was built before the marking: read its notes' types again.
     if (!(res.headers.get("content-type") ?? "").includes("application/json")) return res;
     const body = refreshTypes(store.db, await res.json());
@@ -1445,6 +1447,7 @@ export async function handleNotes(
     headers.delete("content-length");
     return new Response(JSON.stringify(body), { status: res.status, headers });
   } catch (e: any) {
+    PENDING_TYPES.get(req)?.release();
     const ambig = ambiguousPathResponse(e);
     if (ambig) return ambig;
     throw e;
@@ -5426,7 +5429,7 @@ function foldRestTypes(
     });
     if (visible && !added.every(visible)) return notes ? { ...merged, notes } : merged;
     const prepared = prepareCallTypes(db, body as Record<string, unknown>, mode, { named });
-    if (prepared.types.length) PENDING_TYPES.set(req, prepared.types);
+    if (prepared.types.length) PENDING_TYPES.set(req, { names: prepared.types, release: holdTypes(db, prepared.types) });
     return prepared.params;
   } catch (err) {
     if ((err as { error_type?: string })?.error_type !== "tag_kind") throw err;
@@ -5435,4 +5438,4 @@ function foldRestTypes(
 }
 
 /** Types a REST write named, marked once it succeeded (T-318 §8a). */
-const PENDING_TYPES = new WeakMap<Request, string[]>();
+const PENDING_TYPES = new WeakMap<Request, { names: string[]; release: () => void }>();
