@@ -7,6 +7,8 @@
 #              namespace; the run must report the hash the build produced (PLAN §7.2). The stock 0.7 build is
 #              there too, as "the old programs".
 #              The child-path build (--process-model child) runs compat/* until the Nov 3 decision deletes one path.
+#              The previous release (0.8, built from its own commit, pins.json previous_core) is there for
+#              lifecycle/upgrade: the 0.8 → 0.9 step on a home and its rollback.
 #   prism      Benjamin's compatibility suite, unchanged, against the same build (the Nov 9 gate, PLAN §3.1)
 #   npm        the npm package (release/npm.ts) packed from the same build, installed with `npm i -g` and
 #              `bun add -g`, and his suite on the npm install; keeps the linux-x64 tarball and the .tgz as artifacts
@@ -125,12 +127,16 @@ jobs:
         name: build the old programs (stock 0.7 from the pins, for takeover, identity and rollback)
         id: stock
         run: bun run build:stock
+      - name: build the previous release (0.8, pins.json previous_core) for lifecycle/upgrade
+        id: previous
+        run: bun run build:previous --out "$RUNNER_TEMP/previous"
       - name: the contracts, against exactly that build
         env:
           CANDIDATE_DIR: ${{ steps.unpack.outputs.dir }}
           CANDIDATE_TARBALL: ${{ steps.build.outputs.tarball }}
           CANDIDATE_SHA256: ${{ steps.build.outputs.sha256 }}
           OLD_STOCK_SHA256: ${{ steps.stock.outputs.sha256 }}
+          PREVIOUS_CORE_DIR: ${{ steps.previous.outputs.dir }}
         run: bun run candidate -- --v1 2>&1 | tee "$RUNNER_TEMP/candidate.log"; test "${PIPESTATUS[0]}" -eq 0
         shell: bash
       - name: the run reported the hash this job built, before and after

@@ -2,7 +2,7 @@
 //
 //   keys list [--all] [--json]           every live key (the hub's `keys` table, PR #17), --all adds revoked/expired
 //   keys list --pending                  apps waiting for approval (auth pending-clients)
-//   keys new <name> --vault <v> [--can read|write] [--expires-in <s> | --ephemeral] [--json]
+//   keys new <name> --vault <v> [--can read|write|admin] [--expires-in <s> | --ephemeral] [--json]
 //                                        auth mint-token, labelled with the name, so its key is called <name>
 //   keys revoke <name|jti> [--json]      auth revoke-token on the key's token
 //   keys approve <client>                auth approve-client
@@ -10,8 +10,32 @@
 // New, list and revoke reuse the hub's own mint, revoke and key code: a key minted here verifies exactly as a token
 // from `auth mint-token` does. Type scopes and denies (`--types`, `--deny`) are refused until 0.9.1 enforces them, so
 // no key is ever broader than what was asked for.
+import { Database } from "bun:sqlite";
+import { mkdirSync } from "node:fs";
+import { join } from "node:path";
 import { hubDbPath, openHubDb } from "@openparachute/hub/src/hub-db.ts";
 import { listKeys, type KeyView } from "@openparachute/hub/src/keys.ts";
+import { homeDir } from "./home.ts";
+
+let held: Database | undefined;
+
+/**
+ * One `keys new` at a time per home, from the name check to the end of its mint: an exclusive SQLite lock on
+ * run/keys.lock, held by this process until it exits (the mint runs in this process; the OS releases the lock however
+ * it ends). Without it two `keys new worker` at once both pass the check and the mint names the second `worker-2`.
+ */
+function holdKeysLock(): void {
+  if (held) return;
+  const run = join(homeDir(), "run");
+  mkdirSync(run, { recursive: true, mode: 0o700 });
+  const db = new Database(join(run, "keys.lock"), { create: true });
+  db.exec("PRAGMA busy_timeout = 30000");
+  db.exec("PRAGMA locking_mode = EXCLUSIVE");
+  db.exec("BEGIN EXCLUSIVE");
+  db.exec("CREATE TABLE IF NOT EXISTS hold (pid INTEGER)");
+  db.exec("COMMIT"); // in exclusive locking mode the lock stays until the connection closes
+  held = db;
+}
 
 export type KeysResult = { exit: number } | { argv: string[] };
 
@@ -21,7 +45,7 @@ const PASS_NEW = new Set(["--expires-in", "--ephemeral", "--json", "--user", "--
 function usage(): string {
   return [
     "parachute keys list [--all] [--json] | list --pending",
-    "parachute keys new <name> --vault <vault> [--can read|write] [--expires-in <seconds> | --ephemeral] [--json]",
+    "parachute keys new <name> --vault <vault> [--can read|write|admin] [--expires-in <seconds> | --ephemeral] [--json]",
     "parachute keys revoke <name|jti> [--json]",
     "parachute keys approve <client>",
   ].join("\n");
@@ -53,7 +77,7 @@ function keysNew(args: string[]): KeysResult {
     return { exit: 2 };
   }
   let vault: string | undefined;
-  let can = "read";
+  let can: string = "read";
   const pass: string[] = [];
   try {
     for (let i = 0; i < rest.length; i++) {
@@ -79,20 +103,19 @@ function keysNew(args: string[]): KeysResult {
     console.error("parachute keys new: --vault <name> is required (which vault the key opens)");
     return { exit: 2 };
   }
-  if (can === "admin") {
-    console.error("parachute keys new: --can admin is not mintable from the command line (the hub refuses vault admin mints); use read or write");
+  const levels = ({ read: ["read"], write: ["read", "write"], admin: ["read", "write", "admin"] } as Record<string, string[]>)[can];
+  if (!levels) {
+    console.error("parachute keys new: --can is read, write or admin");
     return { exit: 2 };
   }
-  if (can !== "read" && can !== "write") {
-    console.error("parachute keys new: --can is read or write");
-    return { exit: 2 };
-  }
+  holdKeysLock();
   const taken = withHubDb((db) => db.prepare("SELECT 1 FROM keys WHERE name = ?").get(name));
   if (taken) {
     console.error(`parachute keys new: a key called '${name}' already exists (parachute keys list --all); pick another name`);
     return { exit: 1 };
   }
-  return { argv: ["auth", "mint-token", "--scope", `vault:${vault}:${can}`, "--label", name, ...pass] };
+  // Each level brings the ones below it, as every pass the hub mints for a person does.
+  return { argv: ["auth", "mint-token", "--scope", levels.map((l) => `vault:${vault}:${l}`).join(" "), "--label", name, ...pass] };
 }
 
 function keysRevoke(args: string[]): KeysResult {
@@ -107,7 +130,7 @@ function keysRevoke(args: string[]): KeysResult {
 }
 
 function show(keys: KeyView[], users: Map<string, string>): string[] {
-  if (!keys.length) return ["No keys. Make one: parachute keys new <name> --vault <vault> --can read|write"];
+  if (!keys.length) return ["No keys. Make one: parachute keys new <name> --vault <vault> --can read|write|admin"];
   const rows = keys.map((k) => [
     k.name,
     `${k.owner_kind}${k.owner ? ` ${users.get(k.owner) ?? k.owner}` : ""}`,

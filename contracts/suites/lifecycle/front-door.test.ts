@@ -69,6 +69,12 @@ describe("lifecycle/front-door", () => {
 
     const again = await box(["keys", "new", name, "--vault", s.vaultName]);
     expect(again.code).toBe(1); // a name is one key: no silent `-2`
+    // Two at once with one new name: one key, and the other refused (not `<name>-2`).
+    const twin = `fd-${randomBytes(3).toString("hex")}`;
+    const both = await Promise.all([0, 1].map(() => box(["keys", "new", twin, "--vault", s.vaultName, "--ephemeral"])));
+    expect(both.map((b) => b.code).sort()).toEqual([0, 1]);
+    const named = JSON.parse((await box(["keys", "list", "--json"])).stdout).map((k: any) => k.name).filter((n: string) => n.startsWith(twin));
+    expect(named).toEqual([twin]);
 
     const revoked = await box(["keys", "revoke", name]);
     must(revoked.code === 0, `keys revoke exited ${revoked.code}: ${tail(revoked.stderr)}`);
@@ -81,8 +87,8 @@ describe("lifecycle/front-door", () => {
     expect(JSON.parse((await box(["keys", "list", "--json"])).stdout).some((k: any) => k.name === name)).toBe(false);
   });
 
-  test("keys new refuses what this build can't hold to: --types, --deny, --can admin", async () => {
-    for (const extra of [["--types", "task"], ["--deny", "private"], ["--can", "admin"]]) {
+  test("keys new refuses what this build can't hold to: --types, --deny (0.9.1), and a level that isn't one", async () => {
+    for (const extra of [["--types", "task"], ["--deny", "private"], ["--can", "owner"]]) {
       const r = await box(["keys", "new", `fd-${randomBytes(3).toString("hex")}`, "--vault", s.vaultName, ...extra]);
       expect({ extra, code: r.code, printedKey: r.stdout.includes(".") }).toEqual({ extra, code: 2, printedKey: false });
     }
@@ -136,6 +142,7 @@ describe("lifecycle/front-door", () => {
     const before = snapshot(home);
     const r = await cli(home, ["auth", "list-users"]);
     expect(r.code).toBe(6);
+    expect((await cli(home, ["help"])).code).toBe(6); // help is behind the check too, as 0.8's was
     expect(diff(before, snapshot(home))).toEqual([]);
   });
 

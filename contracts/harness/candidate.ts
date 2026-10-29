@@ -47,6 +47,9 @@ export interface CandidateInfo {
   /** Today's stock 0.7 build, for "the old programs" (takeover, identity, rollback to stock): the candidate itself
    *  while it is stock, else OLD_STOCK_DIR or .cache/candidate-stock. */
   oldStockDir: string;
+  /** The release before this one (pins.json previous_core, 0.8), for lifecycle/upgrade: PREVIOUS_CORE_DIR or
+   *  .cache/candidate-previous (`bun run build:previous`). */
+  previousCoreDir: string;
   profile: CandidateManifest["profile"];
   processModel: CandidateManifest["process_model"];
   sha256: string;
@@ -437,6 +440,7 @@ export function prepareInfo(dir: string, manifest: CandidateManifest, sha256: st
     runtimeDir,
     scratch,
     oldStockDir: resolve(process.env.OLD_STOCK_DIR ?? (manifest.profile === "stock-0.7" ? d : join(import.meta.dir, "..", ".cache", "candidate-stock"))),
+    previousCoreDir: resolve(process.env.PREVIOUS_CORE_DIR ?? join(import.meta.dir, "..", ".cache", "candidate-previous")),
     profile: manifest.profile,
     processModel: manifest.process_model,
     sha256,

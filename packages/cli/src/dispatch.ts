@@ -71,7 +71,7 @@ function coreHelp(): string {
 export function route(
   role: Role,
   argv: string[],
-): { print: string } | { changes: string[] } | { install: string[] } | { embedded: string[] } | { bootstrap: string[] } | { takeover: string[] } | { cli: "hub" | "vault"; argv: string[] } {
+): { print: string } | { frontHelp: true } | { changes: string[] } | { install: string[] } | { embedded: string[] } | { bootstrap: string[] } | { takeover: string[] } | { cli: "hub" | "vault"; argv: string[] } {
   if (role === "core" && argv[0] === "install") return { install: argv.slice(1) };
   if (role === "core" && argv[0] === "takeover") return { takeover: argv.slice(1) };
   const cli = role === "vault" || (role === "core" && argv[0] === "vault") ? "vault" : "hub";
@@ -80,11 +80,18 @@ export function route(
   if (cmd === "version" || cmd === "--version" || cmd === "-v") {
     return { print: rest.includes("--json") ? JSON.stringify(versionJson()) : core.version };
   }
+  // `parachute help` (no --all): the front door's help (front.ts), after the home's checks.
+  if (role === "hub" && (args.length === 0 || (["help", "--help", "-h"].includes(cmd!) && !rest.includes("--all")))) return { frontHelp: true };
   // `changes` (front.ts) reads only the map it ships and the home's usage log, so it answers before any check.
   if (cli === "hub" && cmd === "changes") return { changes: rest };
   if (cli === "hub" && cmd === "serve" && rest.includes("--embedded")) return { embedded: rest };
   if (cli === "hub" && cmd === "bootstrap") return { bootstrap: rest };
   return { cli, argv: args };
+}
+
+/** A command asking only for its help (`serve --help`, `auth mint-token -h`): it opens nothing worth a backup. */
+function isHelpCall(argv: string[]): boolean {
+  return argv.length === 0 || argv.some((a) => a === "--help" || a === "-h") || argv[0] === "help";
 }
 
 /** Exit codes (PLAN §3): 6, data newer than this binary; 5, a home that can't be used (here: can't be checked). */
@@ -187,6 +194,11 @@ export async function dispatch(role: Role, notice?: Notice): Promise<void> {
     const { announce } = await import("./front.ts");
     announce(notice, home);
   }
+  if ("frontHelp" in r) {
+    const { frontHelp } = await import("./front.ts");
+    console.log(frontHelp());
+    return;
+  }
   if (embeddedArgs) {
     process.env.PARACHUTE_OFFLINE = "1";
     if (process.env.PARACHUTE_HOME) for (const line of repairModes(home)) console.error(`parachute: mode repaired: ${line}`);
@@ -206,6 +218,17 @@ export async function dispatch(role: Role, notice?: Notice): Promise<void> {
     process.exit(await takeover(takeoverArgs));
   }
   if (!("cli" in r)) return;
+  if (r.cli === "hub" && r.argv[0] === "upgrade" && r.argv.includes("--rollback")) {
+    const { rollback } = await import("./release.ts");
+    process.exit(await rollback(home, r.argv.slice(1)));
+  }
+  {
+    // The first time this release opens a home an older one served: record the step and back the databases up
+    // first (release.ts). Not a host's (embedded) home, nor one the old 0.7 programs still own.
+    const { beforeOpenOrExit } = await import("./release.ts");
+    const code = beforeOpenOrExit(home, isHelpCall(r.argv));
+    if (code !== null) process.exit(code);
+  }
   if (r.cli === "hub" && r.argv[0] === "keys") {
     // `keys` (and its alias `tokens`) is core's (keys.ts): answered here, or mapped onto the hub's auth commands.
     const { keysCommand } = await import("./keys.ts");

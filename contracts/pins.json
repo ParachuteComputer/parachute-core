@@ -11,5 +11,10 @@
   "prism": {
     "repo": "https://github.com/omniharmonic/prism.git",
     "commit": "55ac3df"
+  },
+  "previous_core": {
+    "comment": "The release before this one (0.8 on main), built as a candidate for lifecycle/upgrade: the 0.8 \u2192 0.9 step and its rollback.",
+    "version": "0.8.0-pre.1",
+    "commit": "ccc7729e74aa11fac4202a624523c8fa41889782"
   }
 }
