@@ -70,7 +70,15 @@ function sameSet(got: string[] | null, want: string[]): string | true {
   return JSON.stringify(got) === JSON.stringify(w) ? true : `got ${JSON.stringify(got)}, want ${JSON.stringify(w)}`;
 }
 
-const num = (v: unknown) => (typeof v === "number" ? v : typeof v === "string" && /^\d+$/.test(v.trim()) ? Number(v) : NaN);
+// A count may come bare or as {count: N} / {total: N}; formatting is not what the eval measures.
+const num = (v: unknown): number =>
+  typeof v === "number"
+    ? v
+    : typeof v === "string" && /^\d+$/.test(v.trim())
+      ? Number(v)
+      : v && typeof v === "object" && !Array.isArray(v) && ("count" in v || "total" in v)
+        ? num((v as any).count ?? (v as any).total)
+        : NaN;
 
 function sameCounts(got: unknown, want: Record<string, number>, lenient: Record<string, number[]> = {}): string | true {
   if (!got || typeof got !== "object" || Array.isArray(got)) return "no object in ANSWER";
