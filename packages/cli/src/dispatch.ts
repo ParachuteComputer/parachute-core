@@ -89,11 +89,6 @@ export function route(
   return { cli, argv: args };
 }
 
-/** A command asking only for its help (`serve --help`, `auth mint-token -h`): it opens nothing worth a backup. */
-function isHelpCall(argv: string[]): boolean {
-  return argv.length === 0 || argv.some((a) => a === "--help" || a === "-h") || argv[0] === "help";
-}
-
 /** Exit codes (PLAN §3): 6, data newer than this binary; 5, a home that can't be used (here: can't be checked). */
 export const EXIT_NEWER_DATA = 6;
 export const EXIT_HOME_UNUSABLE = 5;
@@ -226,7 +221,7 @@ export async function dispatch(role: Role, notice?: Notice): Promise<void> {
     // The first time this release opens a home an older one served: record the step and back the databases up
     // first (release.ts). Not a host's (embedded) home, nor one the old 0.7 programs still own.
     const { beforeOpenOrExit } = await import("./release.ts");
-    const code = beforeOpenOrExit(home, isHelpCall(r.argv));
+    const code = beforeOpenOrExit(home);
     if (code !== null) process.exit(code);
   }
   if (r.cli === "hub" && r.argv[0] === "keys") {

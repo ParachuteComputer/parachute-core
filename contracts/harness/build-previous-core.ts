@@ -3,8 +3,8 @@
 //
 //   bun run build:previous [--out <dir>]     default .cache/candidate-previous; CI passes PREVIOUS_CORE_DIR to the run
 //
-// The source is a shared local clone of this repo at that commit in .cache/previous-core-src (fetched first if this
-// clone lacks it, as CI's shallow checkout does; its build reads files through git), then its own
+// The source is a detached worktree of this repo at that commit in .cache/previous-core-src (its build reads files
+// through git), fetched first (CI's checkout is shallow), then its own
 // `bun install --frozen-lockfile` and its own `build:core --no-pack`.
 import { appendFileSync, existsSync, mkdirSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -28,13 +28,16 @@ function arg(name: string): string | undefined {
 export async function buildPreviousCore(out: string): Promise<{ sha256: string; dir: string }> {
   const { commit, version } = pins.previous_core;
   const src = join(CONTRACTS, ".cache", "previous-core-src");
-  if ((await sh(["git", "cat-file", "-e", `${commit}^{commit}`], REPO, { quiet: true })).code !== 0) {
-    await sh(["git", "fetch", "--depth", "1", "origin", commit], REPO);
-  }
+  // A shallow checkout (CI's) may name the commit without holding its tree: fetch it there, one commit deep. A full
+  // clone fetches only if it lacks the commit, and never with --depth, which would make the clone shallow.
+  const shallow = (await sh(["git", "rev-parse", "--is-shallow-repository"], REPO)).out.trim() === "true";
+  if (shallow) await sh(["git", "fetch", "--quiet", "--depth", "1", "origin", commit], REPO);
+  else if ((await sh(["git", "cat-file", "-e", `${commit}^{tree}`], REPO, { quiet: true })).code !== 0) await sh(["git", "fetch", "--quiet", "origin", commit], REPO);
+  await sh(["git", "worktree", "remove", "--force", src], REPO, { quiet: true });
   rmSync(src, { recursive: true, force: true });
+  await sh(["git", "worktree", "prune"], REPO);
   mkdirSync(join(CONTRACTS, ".cache"), { recursive: true });
-  await sh(["git", "clone", "--quiet", "--shared", "--no-checkout", REPO, src], REPO);
-  await sh(["git", "-c", "advice.detachedHead=false", "checkout", "--quiet", commit], src);
+  await sh(["git", "worktree", "add", "--quiet", "--detach", src, commit], REPO);
   await sh(["bun", "install", "--frozen-lockfile"], src);
   await sh(["bun", "install", "--frozen-lockfile"], join(src, "contracts"));
   rmSync(out, { recursive: true, force: true });

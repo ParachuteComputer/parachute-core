@@ -27,7 +27,7 @@
 // --yes where nobody can be asked · 5 no room for the backup · 7 a process holds the data.
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, statfsSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import core from "../../../package.json" with { type: "json" };
 import { databases, readDatabase, schemaOf } from "./home.ts";
 import { exportChanged, holders, RECORD_FILE, serveRefusal } from "./takeover.ts";
@@ -43,7 +43,10 @@ export interface Release {
   since: string;
   /** The backup taken before this release first opened the home (a folder with home/ and manifest.json), or null. */
   backup: string | null;
-  state: "current" | "rolled-back";
+  /** "restoring" from the moment a restore starts moving databases until it has finished. */
+  state: "current" | "rolled-back" | "restoring";
+  /** Set when this release came to the home by its own takeover (0.7 → this): roll back with the takeover. */
+  via?: "takeover";
   rolled_back_at?: string;
   restored_at?: string;
   moved_aside?: string;
@@ -126,6 +129,9 @@ export function beforeOpen(home: string, say: (s: string) => void = (s) => conso
   if (!existsSync(home) || existsSync(join(home, "embedded.json"))) return undefined;
   const was = readRelease(home);
   if (was && was.version === core.version && was.state === "current") return was;
+  if (was?.state === "restoring") {
+    throw new Exit(EXIT.failed, `a restore on this home was interrupted; what ${was.version} left is in ${was.moved_aside}. Run \`parachute upgrade --rollback --restore --yes\` again to finish it.`);
+  }
   if (serveRefusal(home) !== null) return undefined;
   const since = new Date().toISOString();
   const dbs = databases(home, { hub: 0, vault: 0 });
@@ -142,16 +148,18 @@ export function beforeOpen(home: string, say: (s: string) => void = (s) => conso
     writeRelease(home, r);
     return r;
   }
-  const previous = was ? (was.state === "rolled-back" ? (was.previous ?? "0.8") : was.version) : "0.8";
   const takeover = readJson(join(home, RECORD_FILE));
-  let backup: string;
-  if (!was && takeover?.state === "taken-over" && takeover.version === core.version && typeof takeover.backup === "string") {
-    backup = takeover.backup; // this release's own takeover backed the home up minutes ago
-  } else {
-    backup = join(dirname(home), "parachute-upgrade", `${previous}-to-${core.version}-${stamp()}`);
-    say(`parachute: ${previous} → ${core.version} on this home: backing up its databases first, to ${backup}`);
-    snapshot(home, backup, previous);
+  if (!was && takeover?.state === "taken-over" && takeover.version === core.version) {
+    // This release's own takeover moved the home from 0.7 minutes ago, with its own whole-home backup: the way
+    // back is `parachute takeover --rollback`, not this record's.
+    const r: Release = { version: core.version, previous: null, since, backup: null, state: "current", via: "takeover" };
+    writeRelease(home, r);
+    return r;
   }
+  const previous = was ? (was.state === "rolled-back" ? (was.previous ?? "0.8") : was.version) : "0.8";
+  const backup = join(dirname(home), "parachute-upgrade", `${previous}-to-${core.version}-${stamp()}`);
+  say(`parachute: ${previous} → ${core.version} on this home: backing up its databases first, to ${backup}`);
+  snapshot(home, backup, previous);
   const r: Release = { version: core.version, previous, since, backup, state: "current" };
   writeRelease(home, r);
   return r;
@@ -171,9 +179,11 @@ function madeByThisLine(home: string, dbs: { rel: string }[]): boolean {
   );
 }
 
-/** `beforeOpen` for dispatch: the exit code to stop with, or null to go on. Help opens nothing and skips it. */
-export function beforeOpenOrExit(home: string, help = false): number | null {
-  if (help) return null;
+/**
+ * `beforeOpen` for dispatch: the exit code to stop with, or null to go on. Every command goes through it, help
+ * flags included: some commands read `--help` as a value and open the data anyway.
+ */
+export function beforeOpenOrExit(home: string): number | null {
   try {
     beforeOpen(home);
     return null;
@@ -190,7 +200,8 @@ function plan(home: string, r: Release, restore: boolean) {
   const manifest = r.backup ? (readJson(join(r.backup, "manifest.json")) as Manifest | undefined) : undefined;
   const now = databases(home, { hub: 0, vault: 0 }).map((d) => ({ rel: d.rel, schema: schemaOf(join(home, d.rel), dirname(home)) ?? null }));
   // Code-only needs every database at a number the previous release opens: the number it had in the backup.
-  const moved = now.filter((d) => manifest && d.rel in manifest.schemas && (d.schema ?? 0) > (manifest.schemas[d.rel] ?? 0));
+  const schemas = manifest?.schemas ?? {};
+  const moved = now.filter((d) => d.rel in schemas && (d.schema ?? 0) > (schemas[d.rel] ?? 0));
   return { manifest, now, moved, mode: restore ? ("restore" as const) : ("code-only" as const) };
 }
 
@@ -204,35 +215,67 @@ export async function rollback(home: string, args: string[]): Promise<number> {
   try {
     if (unknown) throw new Exit(EXIT.usage, `unknown argument '${unknown}'\nusage: parachute upgrade --rollback [--restore] [--yes] [--json]`);
     const r = readRelease(home);
-    if (!r || r.state !== "current" || !r.previous) {
+    if (r?.via === "takeover") throw new Exit(EXIT.failed, "this home came over from 0.7 by the takeover; `parachute takeover --rollback` goes back");
+    const resuming = r?.state === "restoring";
+    if (resuming && !restore) throw new Exit(EXIT.failed, "a restore on this home was interrupted; finish it with --restore --yes");
+    if (!r || (r.state !== "current" && !resuming) || !r.previous) {
       throw new Exit(EXIT.failed, r?.state === "rolled-back" ? `this home was rolled back to ${r.previous} on ${r.rolled_back_at}; nothing to roll back` : `no earlier release served this home (run/release.json says ${r ? `${r.version}, first` : "nothing"}); nothing to roll back`);
     }
     const p = plan(home, r, restore);
-    if (restore && !p.manifest) throw new Exit(EXIT.failed, `there is no backup to restore (${r.backup ?? "none was taken"})`);
+    if (restore && !p.manifest?.files) throw new Exit(EXIT.failed, `there is no backup to restore (${r.backup ?? "none was taken"})`);
     if (!restore && p.moved.length) {
       throw new Exit(EXIT.failed, `${r.previous} can't open ${p.moved.map((d) => d.rel).join(", ")} as it is now (a schema number moved since the backup). Run with --restore: it exports every note changed since, then puts the backup back.`);
     }
-    const held = holders(home);
-    if (held.length) {
-      throw new Exit(EXIT.held, `something still holds the data: ${held.map((h) => `pid ${h.pid} (${h.cmd.slice(0, 80)})`).join(", ")}. Stop Parachute (parachute stop, or its unit), then run this again.`);
+    if (restore) {
+      // The export keys vaults by name: two databases for one name (a leftover older layout) would export one.
+      const names = new Map<string, string>();
+      for (const d of p.now) {
+        if (d.rel === "hub.db") continue;
+        const name = basename(dirname(d.rel));
+        if (names.has(name)) throw new Exit(EXIT.failed, `two databases for the vault '${name}' (${names.get(name)}, ${d.rel}); move the one not in use out of the home first`);
+        names.set(name, d.rel);
+      }
     }
     if (restore && !yes) {
+      // Asked before the checks below, so nothing can start between the checks and the restore while it waits.
       if (!process.stdin.isTTY) throw new Exit(EXIT.usage, "--restore puts the backup's databases back; add --yes to go ahead");
       process.stdout.write(`Put back the databases backed up at ${p.manifest!.at} (notes changed since are exported first)? [y/N] `);
       const answer = await new Promise<string>((res) => process.stdin.once("data", (b) => res(String(b).trim())));
       if (!/^y(es)?$/i.test(answer)) throw new Exit(EXIT.usage, "not confirmed; nothing was changed");
     }
+    const notHeld = () => {
+      const held = holders(home);
+      if (held.length) {
+        throw new Exit(EXIT.held, `something holds the data: ${held.map((h) => `pid ${h.pid} (${h.cmd.slice(0, 80)})`).join(", ")}. Stop Parachute (parachute stop, or its unit), then run this again.`);
+      }
+    };
+    notHeld();
     const out: Record<string, unknown> = { rolled_back: true, from: r.version, to: r.previous, mode: p.mode, backup: r.backup };
     if (p.mode === "code-only") {
       say(`Every database here is at a schema number ${r.previous} opens, so nothing on disk changes and every ${r.version} write is kept.`);
     } else {
+      const files = p.manifest!.files;
+      // 1. Stage the backup's databases beside the home and check each against the manifest, before anything moves.
+      const staged = join(r.backup!, `staged-${stamp()}`);
+      for (const [rel, hash] of Object.entries(files)) {
+        const to = join(staged, rel);
+        mkdirSync(dirname(to), { recursive: true, mode: 0o700 });
+        writeFileSync(to, readFileSync(join(r.backup!, "home", rel)), { mode: 0o600 });
+        if (sha256(to) !== hash) throw new Exit(EXIT.failed, `the backup's ${rel} doesn't match its manifest; nothing was changed`);
+      }
+      // 2. Export every note that differs from the backup, then check again that nothing has started since.
       const dir = join(r.backup!, `changed-since-${stamp()}`);
-      out.exported_notes = exportChanged(home, join(r.backup!, "home"), dir);
-      out.exported_to = dir;
-      say(`Exported ${out.exported_notes} notes changed since the backup to ${dir}`);
-      const aside = join(r.backup!, `after-${r.version}-${stamp()}`);
-      // Every database now, and every one in the backup: the backup's go back, anything newer moves aside.
-      for (const rel of new Set([...p.now.map((d) => d.rel), ...Object.keys(p.manifest!.files)])) {
+      if (!resuming) {
+        out.exported_notes = exportChanged(home, join(r.backup!, "home"), dir);
+        out.exported_to = dir;
+        say(`Exported ${out.exported_notes} notes changed since the backup to ${dir}`);
+      }
+      notHeld();
+      // 3. Swap: what is live moves aside, the staged copies take its place (renames on one filesystem). The record
+      //    says "restoring" throughout, so an interrupted swap is refused by every command until it is finished.
+      const aside = r.moved_aside ?? join(r.backup!, `after-${r.version}-${stamp()}`);
+      writeRelease(home, { ...r, state: "restoring", moved_aside: aside });
+      for (const rel of new Set([...p.now.map((d) => d.rel), ...Object.keys(files)])) {
         for (const suffix of ["", "-wal", "-shm"]) {
           const live = join(home, rel + suffix);
           if (!existsSync(live)) continue;
@@ -240,11 +283,9 @@ export async function rollback(home: string, args: string[]): Promise<number> {
           renameSync(live, join(aside, rel + suffix));
         }
       }
-      for (const [rel, hash] of Object.entries(p.manifest!.files)) {
-        const to = join(home, rel);
-        mkdirSync(dirname(to), { recursive: true, mode: 0o700 });
-        writeFileSync(to, readFileSync(join(r.backup!, "home", rel)), { mode: 0o600 });
-        if (sha256(to) !== hash) throw new Exit(EXIT.failed, `the restored ${rel} doesn't match the backup's manifest; what ${r.version} left is in ${aside}`);
+      for (const rel of Object.keys(files)) {
+        mkdirSync(dirname(join(home, rel)), { recursive: true, mode: 0o700 });
+        renameSync(join(staged, rel), join(home, rel));
       }
       out.moved_aside = aside;
       say(`Put the backup's databases back; what ${r.version} left is in ${aside}`);
