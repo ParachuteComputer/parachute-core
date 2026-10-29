@@ -84,6 +84,10 @@ describe("mcp/types", () => {
     // Writes: a hidden type is refused like a hidden tag, by create and by update.
     const made = await scoped.call("create-note", { path: runId("w"), content: "w", tags: [work], types: [secret] }).catch((e) => e);
     expect(JSON.stringify(made)).toMatch(/tag_scope_violation|Forbidden|allowlist/);
+    const ghost = runId("ghost");
+    const batch = await scoped.call("create-note", { notes: [{ path: runId("b"), content: "b", tags: [work] }], types: [ghost] }).catch((e) => e);
+    expect(JSON.stringify(batch)).toMatch(/inside each note of a batch/);
+    expect((await c.call("list-tags", { tag: ghost })).error_type).toBe("tag_not_found");
     const upd = await scoped.call("update-note", { id: sharedId, types: { remove: [secret] }, force: true }).catch((e) => e);
     expect(JSON.stringify(upd)).toMatch(/tag_scope_violation|Forbidden|allowlist/);
     expect((await c.call("query-notes", { id: shared })).tags).toContain(secret);

@@ -42,6 +42,18 @@ describe("every tag record gets a kind (an additive column, no schema number)", 
     db.close();
   });
 
+  test("an older program that gives a recorded tag fields makes it read as a type, and the next open records it", async () => {
+    const { db, store } = fresh();
+    await store.createNote("x", { tags: ["label"] });
+    initSchema(db);
+    expect((db.prepare("SELECT kind FROM tags WHERE name = 'label'").get() as { kind: string }).kind).toBe("tag");
+    db.prepare(`UPDATE tags SET fields = '{"a":{"type":"string"}}' WHERE name = 'label'`).run(); // as a 0.8 vault would
+    expect(tagKinds(db).get("label")).toBe("type");
+    initSchema(db);
+    expect((db.prepare("SELECT kind FROM tags WHERE name = 'label'").get() as { kind: string }).kind).toBe("type");
+    db.close();
+  });
+
   test("the other way: the file keeps its schema number, and an older vault's own writes still work on it", async () => {
     const { db, store } = fresh();
     await store.upsertTagRecord("task", { fields: { state: { type: "string" } } });
@@ -79,6 +91,14 @@ describe("kind rules", () => {
     // Drop the child's parent: the parent reads as a tag again, the same on any vault.
     await store.upsertTagRecord("child", { parent_names: [] });
     expect(tagKinds(db).get("parent")).toBe("tag");
+    db.close();
+  });
+
+  test("types beside a batch is refused before anything is made", async () => {
+    const { db, tools } = fresh();
+    await expect(tool(tools, "create-note").execute({ notes: [{ path: "A", content: "a" }], types: ["secret"] })).rejects.toThrow(/inside each note of a batch/);
+    await expect(tool(tools, "update-note").execute({ notes: [], types: ["secret"] })).rejects.toThrow(/inside each note of a batch/);
+    expect(tagKinds(db).has("secret")).toBe(false);
     db.close();
   });
 

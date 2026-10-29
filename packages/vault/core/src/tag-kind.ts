@@ -31,12 +31,14 @@ const IS_PARENT = `t.name IN (SELECT DISTINCT p.value FROM tags pt, json_each(CA
 const DERIVED_KIND = `CASE WHEN ${HAS_STRUCTURE} OR ${IS_PARENT} THEN 'type' ELSE 'tag' END`;
 
 /**
- * A row's effective kind, as SQL over `tags t`: its recorded kind, except that
- * a tag named as another tag's parent always reads as a type. Being a parent is
+ * A row's effective kind, as SQL over `tags t`: a type when it has fields or
+ * parents or is named as a parent (whatever was recorded: an older program
+ * may have added fields to a record this one called a tag), else its recorded
+ * kind (a type promoted with no fields stays one), else a tag. Being a parent is
  * read, never written onto the parent's record, so declaring a parent can't
  * change a record the caller may not be allowed to touch.
  */
-export const KIND_SQL = `CASE WHEN ${IS_PARENT} THEN 'type' ELSE COALESCE(t.kind, ${DERIVED_KIND}) END`;
+export const KIND_SQL = `CASE WHEN ${IS_PARENT} OR ${HAS_STRUCTURE} THEN 'type' ELSE COALESCE(t.kind, 'tag') END`;
 
 /** Every tag record's effective kind. */
 export function tagKinds(db: Database): Map<string, TagKind> {
@@ -73,6 +75,8 @@ export function typeNames(db: Database): Set<string> {
  */
 export function recordTagKinds(db: Database): { types: number; tags: number } {
   db.exec(`UPDATE tags AS t SET kind = CASE WHEN ${HAS_STRUCTURE} THEN 'type' ELSE 'tag' END WHERE t.kind IS NULL`);
+  // An older program may have given fields or parents to a record recorded as a tag.
+  db.exec(`UPDATE tags AS t SET kind = 'type' WHERE t.kind = 'tag' AND ${HAS_STRUCTURE}`);
   const kinds = [...tagKinds(db).values()];
   return { types: kinds.filter((k) => k === "type").length, tags: kinds.filter((k) => k === "tag").length };
 }
@@ -183,6 +187,7 @@ export function foldTypeFilter(db: Database, params: Record<string, unknown>): R
  */
 export function foldTypesIntoTags(db: Database, item: Record<string, unknown>, mode: "create" | "update"): Record<string, unknown> {
   if (!item || item.types === undefined) return item;
+  assertNoBatchLevelTypes(item);
   ensureTypes(db, typesAdded(item, mode));
   return mergeTypesIntoTags(item, mode);
 }
@@ -211,6 +216,7 @@ function typesAdded(item: Record<string, unknown>, mode: "create" | "update"): s
  */
 export function mergeTypesIntoTags(item: Record<string, unknown>, mode: "create" | "update"): Record<string, unknown> {
   if (!item || item.types === undefined) return item;
+  assertNoBatchLevelTypes(item);
   const { types, ...rest } = item as { types: unknown } & Record<string, unknown>;
   const add = typesAdded(item, mode);
   if (mode === "create") return { ...rest, tags: [...new Set([...asList(rest.tags), ...add])] };
@@ -220,4 +226,11 @@ export function mergeTypesIntoTags(item: Record<string, unknown>, mode: "create"
   const tagAdd = Array.isArray(tags) ? asList(tags) : asList(tags?.add);
   const tagRemove = Array.isArray(tags) ? [] : asList(tags?.remove);
   return { ...rest, tags: { add: [...new Set([...tagAdd, ...add])], remove: [...new Set([...tagRemove, ...remove])] } };
+}
+
+/** `types` belongs to each note of a batch, never beside `notes`: refused before anything is checked or made. */
+function assertNoBatchLevelTypes(item: Record<string, unknown>): void {
+  if (Array.isArray(item.notes)) {
+    throw kindError("types goes inside each note of a batch, not beside notes: notes: [{…, types: [...]}].", "types", "notes: [{…, types: [...]}]");
+  }
 }
