@@ -47,6 +47,13 @@ describe("mcp/types", () => {
     expect(patched.status).toBe(200);
     const mixed = await operator().patch(`/notes/${enc(path)}`, { tags: [pin], types: [task], force: true });
     expect(mixed.status).toBe(400);
+    const upsertExisting = await operator().patch(`/notes/${enc(path)}`, { if_missing: "create", tags: [pin], types: [task], force: true });
+    expect(upsertExisting.status).toBe(400);
+    // The upsert's create branch takes types alone and lands them.
+    const fresh = runId("upsert");
+    const upsertNew = await operator().patch(`/notes/${enc(fresh)}`, { if_missing: "create", content: "u", types: { add: [task] }, force: true });
+    expect(upsertNew.status).toBe(200);
+    expect(upsertNew.body.types).toEqual([task]);
     await c.close();
   });
 
