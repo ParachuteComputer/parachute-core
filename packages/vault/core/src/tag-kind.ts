@@ -118,26 +118,37 @@ export function kindError(message: string, field: string, hint: string): Error {
 }
 
 /**
- * The `types` a write names (§8a "writes accept both"): each must be a type, or
- * a new name, which is then recorded as a type. A plain tag is refused with
- * the fix, never silently promoted.
+ * The `types` a write names (§8a "writes accept both"): each must be a type
+ * or a new name. A plain tag is refused with the fix, never silently promoted.
+ * Reads only: nothing is made until the write has succeeded (markTypes).
  */
-export function ensureTypes(db: Database, names: string[]): void {
+export function validateTypes(db: Database, names: string[]): string[] {
   const kinds = tagKinds(db);
-  const now = new Date().toISOString();
-  for (const name of names.map(stripTagHash).filter(Boolean)) {
-    const kind = kinds.get(name);
-    if (kind === "tag") {
+  const out = [...new Set(names.map(stripTagHash).filter(Boolean))];
+  for (const name of out) {
+    if (kinds.get(name) === "tag") {
       throw kindError(
         `"${name}" is a plain tag, not a type. Use tags: ["${name}"], or make it a type first: manage-types {tag: "${name}", kind: "type"}.`,
         "types",
         `manage-types {tag: "${name}", kind: "type"}`,
       );
     }
-    if (kind === undefined) {
-      db.prepare("INSERT OR IGNORE INTO tags (name, kind, created_at, updated_at) VALUES (?, 'type', ?, ?)").run(name, now, now);
-    }
   }
+  return out;
+}
+
+/** After a write that named `types` succeeded: their records say type (the write itself made any that were new). */
+export function markTypes(db: Database, names: string[]): void {
+  const now = new Date().toISOString();
+  for (const name of new Set(names)) {
+    db.prepare("INSERT OR IGNORE INTO tags (name, kind, created_at, updated_at) VALUES (?, 'type', ?, ?)").run(name, now, now);
+    db.prepare("UPDATE tags SET kind = 'type' WHERE name = ? AND kind IS NULL").run(name);
+  }
+}
+
+/** Validate and mark at once, for a caller with no write to wait for. */
+export function ensureTypes(db: Database, names: string[]): void {
+  markTypes(db, validateTypes(db, names));
 }
 
 /**
@@ -181,24 +192,42 @@ export function foldTypeFilter(db: Database, params: Record<string, unknown>): R
 }
 
 /**
- * create-note / update-note `types` (§8a "writes accept both"): each name must
- * be a type (or new, then made one) and lands in the one membership store as
- * a tag does. create takes an array; update takes an array (add) or {add, remove}.
+ * A write's `types`, ready for it: validated (a plain tag is refused) and
+ * merged into its tags, plus the names to mark as types once the write has
+ * succeeded. An update that names no note (no id: the write will be refused for
+ * that) is only merged, so nothing about a type, or a hidden tag's kind, is
+ * looked at on the way. `named`: the caller names the note elsewhere (REST
+ * PATCH, in its URL).
  */
-export function foldTypesIntoTags(
+export function prepareTypes(
   db: Database,
   item: Record<string, unknown>,
   mode: "create" | "update",
   opts: { named?: boolean } = {},
-): Record<string, unknown> {
-  if (!item || item.types === undefined) return item;
+): { item: Record<string, unknown>; types: string[] } {
+  if (!item || item.types === undefined) return { item, types: [] };
   assertNoBatchLevelTypes(item);
-  // An update with no note named makes nothing: the write is refused for the missing id, and nothing
-  // about a type (or a hidden tag's kind) is created or revealed on the way there.
-  // (`named`: the caller names the note elsewhere, as REST PATCH does in its URL.)
-  if (mode === "update" && !opts.named && !item.id && !item.note_id) return mergeTypesIntoTags(item, mode);
-  ensureTypes(db, typesAdded(item, mode));
-  return mergeTypesIntoTags(item, mode);
+  if (mode === "update" && !opts.named && !item.id) return { item: mergeTypesIntoTags(item, mode), types: [] };
+  const types = validateTypes(db, typesAdded(item, mode));
+  return { item: mergeTypesIntoTags(item, mode), types };
+}
+
+/** prepareTypes over a call: its own types, or each batch item's. */
+export function prepareCallTypes(
+  db: Database,
+  params: Record<string, unknown>,
+  mode: "create" | "update",
+  opts: { named?: boolean } = {},
+): { params: Record<string, unknown>; types: string[] } {
+  const top = prepareTypes(db, params, mode, opts);
+  if (!Array.isArray(top.item.notes)) return { params: top.item, types: top.types };
+  const types = [...top.types];
+  const notes = (top.item.notes as Record<string, unknown>[]).map((n) => {
+    const r = prepareTypes(db, n, mode);
+    types.push(...r.types);
+    return r.item;
+  });
+  return { params: { ...top.item, notes }, types };
 }
 
 const typesShapeError = (hint: string) => kindError(`types takes ${hint}.`, "types", hint);
@@ -242,4 +271,20 @@ function assertNoBatchLevelTypes(item: Record<string, unknown>): void {
   if (Array.isArray(item.notes)) {
     throw kindError("types goes inside each note of a batch, not beside notes: notes: [{…, types: [...]}].", "types", "notes: [{…, types: [...]}]");
   }
+}
+
+/** After markTypes: the `types` of the notes a write returned, read again (they were computed before the marking). */
+export function refreshTypes<T>(db: Database, out: T): T {
+  const fix = (n: unknown): unknown => {
+    if (Array.isArray(n)) return n.map(fix);
+    if (!n || typeof n !== "object") return n;
+    const o = n as Record<string, unknown>;
+    if (Array.isArray(o.notes)) return { ...o, notes: o.notes.map(fix) };
+    if (Array.isArray(o.tags) && "types" in o) {
+      const types = typeNamesAmong(db, o.tags as string[]);
+      return { ...o, types: (o.tags as string[]).filter((t) => types.has(t)) };
+    }
+    return n;
+  };
+  return fix(out) as T;
 }

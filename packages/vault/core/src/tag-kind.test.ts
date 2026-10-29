@@ -94,6 +94,20 @@ describe("kind rules", () => {
     db.close();
   });
 
+  test("a batch that fails leaves no type behind, and a write that succeeds marks its types", async () => {
+    const { db, store, tools } = fresh();
+    await store.createNote("a", { path: "A" });
+    const upd = tool(tools, "update-note");
+    await expect(Promise.resolve().then(() => upd.execute({ notes: [{ id: "A", types: { add: ["newtype"] }, force: true }, { id: "missing", content: "x", force: true }] }))).rejects.toThrow();
+    expect(tagKinds(db).has("newtype")).toBe(false);
+    await expect(Promise.resolve().then(() => tool(tools, "create-note").execute({ notes: [{ path: "B", content: "b", types: ["newtype2"] }, { path: "A", content: "dup" }] }))).rejects.toThrow();
+    expect(tagKinds(db).has("newtype2")).toBe(false);
+    const ok: any = await upd.execute({ id: "A", types: { add: ["newtype"] }, force: true });
+    expect(ok.types ?? (await store.getNote(ok.id))?.types).toEqual(["newtype"]);
+    expect(tagKinds(db).get("newtype")).toBe("type");
+    db.close();
+  });
+
   test("types beside a batch is refused before anything is made", async () => {
     const { db, tools } = fresh();
     await expect(tool(tools, "create-note").execute({ notes: [{ path: "A", content: "a" }], types: ["secret"] })).rejects.toThrow(/inside each note of a batch/);

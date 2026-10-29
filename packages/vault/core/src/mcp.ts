@@ -74,7 +74,7 @@ import {
   MAX_ATTACHMENT_IMAGE_BYTES,
   type AttachmentBytesProvider,
 } from "./attachment/bytes-provider.js";
-import { foldTypeFilter, foldTypesIntoTags, tagKinds } from "./tag-kind.js";
+import { foldTypeFilter, markTypes, prepareCallTypes, refreshTypes, tagKinds } from "./tag-kind.js";
 
 /**
  * A single MCP tool-result content block. Mirrors the subset of the MCP SDK's
@@ -1470,8 +1470,6 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
     {
       name: "create-note",
       execute: async (params) => {
-        params = foldTypesIntoTags(db, params, "create");
-        if (Array.isArray(params.notes)) params = { ...params, notes: (params.notes as Record<string, unknown>[]).map((i) => foldTypesIntoTags(db, i, "create")) };
         const batch = params.notes as any[] | undefined;
         const items = batch ?? [params];
 
@@ -1854,8 +1852,6 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
     {
       name: "update-note",
       execute: async (params) => {
-        params = foldTypesIntoTags(db, params, "update");
-        if (Array.isArray(params.notes)) params = { ...params, notes: (params.notes as Record<string, unknown>[]).map((i) => foldTypesIntoTags(db, i, "update")) };
         const batch = params.notes as any[] | undefined;
         // vault#554: top-level `force` / `if_updated_at` apply as per-item
         // DEFAULTS in a batch call — item-level values win when both are
@@ -3015,6 +3011,23 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
       execute: impl.execute,
       ...(impl.resultContent ? { resultContent: impl.resultContent } : {}),
     });
+  }
+  // T-318 §8a: `types` on create-note / update-note. Validated and merged into the tags before the write; marked
+  // as types only after it succeeded, so a refused or rolled-back write (a batch included) leaves no type record.
+  for (const [name, mode] of [["create-note", "create"], ["update-note", "update"]] as const) {
+    const tool = tools.find((t) => t.name === name);
+    if (!tool) continue;
+    const execute = tool.execute;
+    tool.execute = async (params) => {
+      const batchTypes = Array.isArray(params.notes) && (params.notes as Record<string, unknown>[]).some((n) => n?.types !== undefined);
+      if (params.types === undefined && !batchTypes) return execute(params);
+      const prepared = prepareCallTypes(db, params, mode);
+      const out = await execute(prepared.params);
+      const failed = out !== null && typeof out === "object" && !Array.isArray(out) && "error_type" in (out as Record<string, unknown>);
+      if (failed || !prepared.types.length) return out;
+      markTypes(db, prepared.types);
+      return refreshTypes(db, out);
+    };
   }
   // T-318 §4: `query-notes {path_between}` is find-path under its 0.9 name. Dispatched here so every runtime that
   // advertises it (core's manifest) answers it; the bun server wraps it again around its tag-scoped find-path.

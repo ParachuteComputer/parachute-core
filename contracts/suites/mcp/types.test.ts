@@ -51,6 +51,11 @@ describe("mcp/types", () => {
     expect(viaPatch.status).toBe(200);
     expect(viaPatch.body.types).toContain(brandNew);
     expect((await operator().patch(`/notes/${enc(path)}`, { types: { add: [pin] }, force: true })).status).toBe(422);
+    // A write that fails makes no type: a batch whose second note collides is refused whole (MCP and REST).
+    const lost = runId("lost");
+    expect((await operator().post("/notes", { notes: [{ path: runId("ok"), content: "a", types: [lost] }, { path, content: "dup" }] })).status).toBeGreaterThanOrEqual(400);
+    await c.call("create-note", { notes: [{ path: runId("ok"), content: "a", types: [`${lost}-m`] }, { path, content: "dup" }] }).catch(() => null);
+    for (const name of [lost, `${lost}-m`]) expect((await c.call("list-tags", { tag: name })).error_type).toBe("tag_not_found");
     const mixed = await operator().patch(`/notes/${enc(path)}`, { tags: [pin], types: [task], force: true });
     expect(mixed.status).toBe(400);
     const upsertExisting = await operator().patch(`/notes/${enc(path)}`, { if_missing: "create", tags: [pin], types: [task], force: true });
