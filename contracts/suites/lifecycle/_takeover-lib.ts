@@ -467,7 +467,7 @@ async function waitVault(origin: string, vaultName: string, box: Proc, what: str
  * Make a stock home the way a person did: `parachute-vault create`, then `parachute serve`, an operator pass from
  * the real CLI, a few made-up notes written over REST, then a clean stop. All with the old programs on PATH.
  */
-export async function makeStockHome(m: Machine): Promise<StockHome> {
+export async function makeStockHome(m: Machine, opts: { unitEnv?: Record<string, string> } = {}): Promise<StockHome> {
   const vaultName = `old${randomBytes(3).toString("hex")}`;
   const port = await freePort();
   const origin = `http://127.0.0.1:${port}`;
@@ -486,7 +486,8 @@ export async function makeStockHome(m: Machine): Promise<StockHome> {
     PARACHUTE_INITIAL_ADMIN_PASSWORD: `pw-${randomBytes(12).toString("hex")}`,
   };
   // The old units carry what the old box runs with, as an install's unit (or its drop-in) does; no password.
-  const unitEnv = { PORT: String(port), PARACHUTE_HUB_ORIGIN: origin, PARACHUTE_HUB_JWKS_ORIGIN: origin, PARACHUTE_BIND_HOST: "127.0.0.1" };
+  // `opts.unitEnv` adds what a box's unit also has (the friends box's PATH and BUN_INSTALL).
+  const unitEnv = { PORT: String(port), PARACHUTE_HUB_ORIGIN: origin, PARACHUTE_HUB_JWKS_ORIGIN: origin, PARACHUTE_BIND_HOST: "127.0.0.1", ...opts.unitEnv };
   for (const u of m.units) writeFileSync(join(m.unitDir, u), unitFileText(u, unitEnv));
   await m.expose(port);
   const box = await startOldBox(m, { vaultName, origin, serveEnv });
