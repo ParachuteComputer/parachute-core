@@ -141,6 +141,8 @@ export interface Detected {
    * /api/ready stays false and the takeover's check fails (friends box, 10-29).
    */
   unfound: { name: string; command: string }[];
+  /** The old unit whose environment that PATH is (handOverUnit), or null: the caller's (no old unit is on). */
+  path_from: string | null;
   record: Record_ | null;
 }
 
@@ -801,6 +803,7 @@ export async function detect(home: string): Promise<Detected> {
     uncopyable: entries(home).other,
     others,
     unfound: await unfoundModules(moduleRows, corePath(handOverEnv(from).env.PATH ?? "")),
+    path_from: from ?? null,
     record,
   };
 }
@@ -811,9 +814,10 @@ export async function detect(home: string): Promise<Detected> {
  * the one v0.8 starts with. A row with no command to start (or one that can't be read) isn't counted.
  */
 async function unfoundModules(rows: any[], path: string): Promise<{ name: string; command: string }[]> {
+  const out: { name: string; command: string }[] = [];
+  if (!rows.length) return out;
   const { resolveSpec } = await import("@openparachute/hub/src/commands/serve-boot.ts");
   const { shortNameForManifest } = await import("@openparachute/hub/src/service-spec.ts");
-  const out: { name: string; command: string }[] = [];
   for (const row of rows) {
     const name = String(row.name);
     let command: string | undefined;
@@ -878,8 +882,8 @@ export function describe(d: Detected): string {
   // Seen in rehearsal/uni and rehearsal/adam: core's supervisor boots these rows as the old hub did (the app on uni,
   // scribe on Adam's box), with the program installed beside the old hub.
   if (d.others.length) lines.push(`Also registered: ${d.others.join(", ")}. v0.8 starts ${d.others.length === 1 ? "it" : "them"} from services.json as the old hub did, with the installed program, which stays as it is.`);
+  const from = d.path_from;
   for (const u of d.unfound) {
-    const from = handOverUnit(d.units, cutOff(d));
     lines.push(`Warning: v0.8 won't find \`${u.command}\` (${u.name}) on the PATH it will run with (${from ? `${from}'s` : "this shell's"}), so it can't start ${u.name}, and the takeover's check will fail and put everything back. Install it there, or set PATH in ${from ?? "this shell"}${from ? " (a drop-in)" : ""}, then look again.`);
   }
   if (d.migrations.length === 0) {
