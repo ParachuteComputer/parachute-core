@@ -19,7 +19,7 @@ describe("v33: every tag record gets a kind", () => {
     await store.upsertTagRecord("person", { fields: { email: { type: "string" } } });
     await store.upsertTagRecord("event/meeting", { parent_names: ["event"] });
     await store.upsertTagRecord("described", { description: "only a description" });
-    await store.createNote("x", { tags: ["pinned", "project/alder", "person", "event/meeting"] });
+    await store.createNote("x", { tags: ["pinned", "project/alder", "person", "event/meeting", "event"] });
     // Back to v32 by hand: the column gone, the version stamped 32.
     db.exec("ALTER TABLE tags DROP COLUMN kind; DELETE FROM schema_version; INSERT INTO schema_version (version, applied_at) VALUES (32, '2026-10-01T00:00:00.000Z')");
     initSchema(db);
@@ -27,7 +27,7 @@ describe("v33: every tag record gets a kind", () => {
     expect(Object.fromEntries(tagKinds(db))).toEqual({
       person: "type",
       "event/meeting": "type",
-      event: "type", // named as a parent, with no fields of its own
+      event: "type", // named as a parent, with no fields of its own (its row came from tagging a note)
       described: "tag",
       pinned: "tag",
       "project/alder": "tag", // a slash name stays a flat tag
@@ -38,7 +38,7 @@ describe("v33: every tag record gets a kind", () => {
     const cols = (d: Database) => (d.prepare("PRAGMA table_info(tags)").all() as { name: string }[]).map((c) => c.name);
     expect(cols(db)).toEqual(cols(fresh().db));
     // Membership is untouched.
-    expect((db.prepare("SELECT COUNT(*) AS n FROM note_tags").get() as { n: number }).n).toBe(4);
+    expect((db.prepare("SELECT COUNT(*) AS n FROM note_tags").get() as { n: number }).n).toBe(5);
     db.close();
   });
 
