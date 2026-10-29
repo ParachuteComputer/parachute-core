@@ -135,6 +135,14 @@ export interface Detected {
    */
   uncopyable: string[];
   others: string[];
+  /**
+   * Registered modules whose command v0.8 won't find on the PATH it will run with (the old hub unit's, see
+   * handOverEnv): its supervisor looks each command up there before starting it, so such a module never starts,
+   * /api/ready stays false and the takeover's check fails (friends box, 10-29).
+   */
+  unfound: { name: string; command: string }[];
+  /** The old unit whose environment that PATH is (handOverUnit), or null: the caller's (no old unit is on). */
+  path_from: string | null;
   record: Record_ | null;
 }
 
@@ -241,13 +249,13 @@ export function systemdWords(value: string): string[] | undefined {
 }
 
 /**
- * PARACHUTE_HOME from an environment file, read only when every line of it is unambiguous: blank, a comment (a line
+ * The assignments in an environment file, read only when every line of it is unambiguous: blank, a comment (a line
  * starting with # or ;), or `KEY=value` on one line, with no backslash and either no quotes or one pair around the
  * whole value. Anything else (a value that goes on over lines, escapes, odd quoting) is null: unknown, because an
- * unrelated variable's text could then read as an assignment. undefined when the file doesn't set it.
+ * unrelated variable's text could then read as an assignment. The last assignment of a name wins, as in systemd.
  */
-function envFileHome(body: string): string | undefined | null {
-  let home: string | undefined;
+function envFileVars(body: string): Map<string, string> | null {
+  const vars = new Map<string, string>();
   for (const line of body.split("\n")) {
     if (/^\s*$/.test(line) || /^\s*[#;]/.test(line)) continue;
     const m = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/.exec(line); // no `export`: systemd isn't a shell
@@ -260,9 +268,15 @@ function envFileHome(body: string): string | undefined | null {
       if (raw.length < 2 || !raw.endsWith(q) || raw.slice(1, -1).includes(q)) return null;
       value = raw.slice(1, -1);
     } else if (/["']/.test(raw)) return null;
-    if (m[1] === "PARACHUTE_HOME") home = value;
+    vars.set(m[1]!, value);
   }
-  return home;
+  return vars;
+}
+
+/** PARACHUTE_HOME from an environment file (see envFileVars): null when the file is ambiguous, undefined when unset. */
+function envFileHome(body: string): string | undefined | null {
+  const vars = envFileVars(body);
+  return vars === null ? null : vars.get("PARACHUTE_HOME");
 }
 
 /** systemd's specifiers in a value: %h (the user's home) and %% (a percent); any other one is null: unknown. */
@@ -281,13 +295,62 @@ function specifiers(v: string): string | null {
   return out;
 }
 
-/** PARACHUTE_HOME in the user manager's own environment, which every unit inherits; null when systemd can't say. */
-function managerHome(): string | undefined | null {
+/**
+ * The user manager's own environment, which every unit inherits, as `systemctl --user show-environment` prints it
+ * (values as printed: one systemd had to quote reads `$'…'`); null when systemd can't say.
+ */
+function managerEnv(): Map<string, string> | null {
   const r = run(["systemctl", "--user", "show-environment"]);
   if (r.code !== 0) return null;
-  const line = r.stdout.split("\n").find((l) => l.startsWith("PARACHUTE_HOME="));
-  if (!line) return undefined;
-  const v = line.slice("PARACHUTE_HOME=".length);
+  const env = new Map<string, string>();
+  for (const line of r.stdout.split("\n")) {
+    const i = line.indexOf("=");
+    if (i > 0) env.set(line.slice(0, i), line.slice(i + 1));
+  }
+  return env;
+}
+
+/**
+ * A value as `systemctl show-environment` prints it, decoded: as it is, or (when it has a space, a quote, a glob
+ * character, …) systemd's `$'…'` form (shell_maybe_quote with SHELL_ESCAPE_POSIX): `\\`, `\'`, `\"`, the C escapes,
+ * and other bytes as octal `\NNN` or `\xHH`. null for anything else, so the caller can say it couldn't be read.
+ */
+export function managerValue(v: string): string | null {
+  if (!v.startsWith("$'")) return v;
+  if (v.length < 3 || !v.endsWith("'")) return null;
+  const C: Record<string, number> = { a: 7, b: 8, e: 27, f: 12, n: 10, r: 13, t: 9, v: 11, "\\": 92, "'": 39, '"': 34, "?": 63 };
+  const chars = [...v.slice(2, -1)];
+  const bytes: number[] = [];
+  for (let i = 0; i < chars.length; i++) {
+    const c = chars[i]!;
+    if (c === "'") return null; // the quoting ended early: not one value
+    if (c !== "\\") {
+      bytes.push(...Buffer.from(c, "utf8"));
+      continue;
+    }
+    const n = chars[++i];
+    if (n === undefined) return null;
+    if (n in C) bytes.push(C[n]!);
+    else if (/[0-7]/.test(n)) {
+      let o = n;
+      while (o.length < 3 && /[0-7]/.test(chars[i + 1] ?? "")) o += chars[++i];
+      if (parseInt(o, 8) > 255) return null;
+      bytes.push(parseInt(o, 8));
+    } else if (n === "x" && /[0-9a-fA-F]/.test(chars[i + 1] ?? "")) {
+      let h = chars[++i]!;
+      if (/[0-9a-fA-F]/.test(chars[i + 1] ?? "")) h += chars[++i];
+      bytes.push(parseInt(h, 16));
+    } else return null;
+  }
+  return Buffer.from(bytes).toString("utf8");
+}
+
+/** PARACHUTE_HOME in the user manager's own environment, which every unit inherits; null when systemd can't say. */
+function managerHome(): string | undefined | null {
+  const env = managerEnv();
+  if (env === null) return null;
+  const v = env.get("PARACHUTE_HOME");
+  if (v === undefined) return undefined;
   return /[\\'"$]/.test(v) ? null : v;
 }
 
@@ -770,13 +833,15 @@ export async function detect(home: string): Promise<Detected> {
     if (!d.rel.startsWith(join("vault", "data"))) migrations.push(`vault ${name}: moved from ${dirname(d.rel)} to vault/data/${name}`);
   }
   const rows = readJson(join(home, "services.json"))?.services;
-  const others = Array.isArray(rows)
-    ? rows.map((r: any) => String(r?.name ?? "")).filter((n: string) => n && n !== "parachute-vault" && n !== "parachute-hub")
-    : [];
+  const moduleRows: any[] = Array.isArray(rows) ? rows.filter((r: any) => r?.name && r.name !== "parachute-vault" && r.name !== "parachute-hub") : [];
+  const others = moduleRows.map((r) => String(r.name));
+  const units = [...systemdUnits(home, held), ...launchdUnits()];
+  const record = readRecord(home);
+  const from = handOverUnit(units, record?.state === "taking-over" ? record.paused.map((u) => u.name) : []);
   return {
     home,
     old: oldInstalls(),
-    units: [...systemdUnits(home, held), ...launchdUnits()],
+    units,
     running: held,
     vaults,
     hub_schema: hubSchema,
@@ -786,8 +851,31 @@ export async function detect(home: string): Promise<Detected> {
     size_bytes: treeSize(home),
     uncopyable: entries(home).other,
     others,
-    record: readRecord(home),
+    unfound: await unfoundModules(moduleRows, corePath(handOverEnv(from).env.PATH ?? "")),
+    path_from: from ?? null,
+    record,
   };
+}
+
+/**
+ * The rows whose start command v0.8's supervisor won't find: it resolves the command the way boot does (resolveSpec)
+ * and looks it up with Bun.which on the PATH the process started with (a PATH changed later isn't seen), so `path` is
+ * the one v0.8 starts with. A row with no command to start (or one that can't be read) isn't counted.
+ */
+async function unfoundModules(rows: any[], path: string): Promise<{ name: string; command: string }[]> {
+  const out: { name: string; command: string }[] = [];
+  if (!rows.length) return out;
+  const { resolveSpec } = await import("@openparachute/hub/src/commands/serve-boot.ts");
+  const { shortNameForManifest } = await import("@openparachute/hub/src/service-spec.ts");
+  for (const row of rows) {
+    const name = String(row.name);
+    let command: string | undefined;
+    try {
+      command = (await resolveSpec(shortNameForManifest(name) ?? name, row))?.startCmd?.(row)?.[0];
+    } catch {}
+    if (command && Bun.which(command, { PATH: path }) === null) out.push({ name, command });
+  }
+  return out;
 }
 
 // ── plain words ──────────────────────────────────────────────────────────────────────────────────────────────
@@ -843,6 +931,10 @@ export function describe(d: Detected): string {
   // Seen in rehearsal/uni and rehearsal/adam: core's supervisor boots these rows as the old hub did (the app on uni,
   // scribe on Adam's box), with the program installed beside the old hub.
   if (d.others.length) lines.push(`Also registered: ${d.others.join(", ")}. v0.8 starts ${d.others.length === 1 ? "it" : "them"} from services.json as the old hub did, with the installed program, which stays as it is.`);
+  const from = d.path_from;
+  for (const u of d.unfound) {
+    lines.push(`Warning: v0.8 won't find \`${u.command}\` (${u.name}) on the PATH it will run with (${from ? `${from}'s` : "this shell's"}), so it can't start ${u.name}, and the takeover's check will fail and put everything back. Install it there, or set PATH in ${from ?? "this shell"}${from ? " (a drop-in)" : ""}, then look again.`);
+  }
   if (d.migrations.length === 0) {
     lines.push("v0.8 will use this data as it is: nothing is converted. Going back is starting the old programs again (`parachute-core takeover --rollback`).");
   } else {
@@ -1089,21 +1181,24 @@ async function stopCheckLeftovers(home: string): Promise<number[]> {
  * Start v0.8 on the home (a check run: this program's own `serve` on a free loopback port, with the old issuer)
  * and check every answer. Returns the problems found (empty when all is well); it always stops the check run.
  */
-async function checkRun(d: Detected, kids: string[], log: (s: string) => void): Promise<string[]> {
+async function checkRun(d: Detected, kids: string[], from: string | undefined, log: (s: string) => void): Promise<string[]> {
   // Anything marked as this home's check run now is an earlier run's (this one hasn't started): it would hold the
   // modules' ports this check run needs.
   const stale = await stopCheckLeftovers(d.home);
   if (stale.length) log(`  stopped ${stale.length} process${stale.length === 1 ? "" : "es"} an earlier check run left (pid ${stale.join(", ")})`);
   const port = freePort();
   const hub = `http://127.0.0.1:${port}`;
-  const env: Record<string, string> = {};
-  for (const [k, v] of Object.entries(process.env)) if (v !== undefined) env[k] = v;
-  // The old issuer, so tokens issued before carry it; keys and revocations from this check run's own hub, whatever
+  // The environment parachute-core.service will have (the old unit's: its PATH finds the modules' programs), then:
+  const { env, unread } = handOverEnv(from);
+  if (from) log(`  with ${from}'s environment, as ${CORE_UNIT} will have it${unread.length ? ` (not read exactly, so left out here: ${unread.join(", ")})` : ""}`);
+  // the old issuer, so tokens issued before carry it; keys and revocations from this check run's own hub, whatever
   // the caller's shell says (a JWKS origin left over from the old box points where nothing listens now).
   Object.assign(env, { PARACHUTE_HOME: d.home, PARACHUTE_HUB_ORIGIN: d.issuer, PARACHUTE_HUB_JWKS_ORIGIN: hub, PARACHUTE_TAKEOVER_CHECK: "1" });
   for (const k of ["PORT", "PARACHUTE_BIND_HOST", "PARACHUTE_HUB_ORIGINS", "VAULT_BIND"]) delete env[k];
   const logPath = join(tmpdir(), `parachute-takeover-check-${process.pid}.log`);
-  const proc = Bun.spawn([process.execPath, CORE_ENTRY, "serve", "--listen", `127.0.0.1:${port}`], {
+  // The command core's unit runs (in a bundle its bin/parachute-core, which puts the bundle's own bin and runtime
+  // first on PATH), so the check run finds by name what the unit will: this install's own, then the unit's PATH.
+  const proc = Bun.spawn([...coreCommand(), "serve", "--listen", `127.0.0.1:${port}`], {
     env,
     stdin: "ignore",
     stdout: Bun.file(logPath),
@@ -1199,6 +1294,15 @@ async function checkVaults(hub: string, d: Detected, log: (s: string) => void, e
   return problems;
 }
 
+/**
+ * The PATH core starts with when its unit gives it `path`: in a bundle, bin/parachute-core (coreCommand) puts the
+ * bundle's own bin and runtime first (packages/cli/bin/parachute-core); from a source checkout it runs on `path`.
+ */
+function corePath(path: string): string {
+  const root = bundleRoot();
+  return root ? [join(root, "lib", "packages", "cli", "bin"), join(root, "runtime"), path].join(":") : path;
+}
+
 /** The command a unit runs core with: the installed `<prefix>/bin/parachute-core` when this copy is installed. */
 function coreCommand(): string[] {
   const root = bundleRoot();
@@ -1264,22 +1368,79 @@ function listeningPorts(pid: number): number[] {
 /** A value for a systemd unit line: quoted, with `%` (specifiers), `\\` and `"` escaped. */
 const unitQuote = (v: string) => `"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/%/g, "%%")}"`;
 
-/** The environment the old hub's unit gave it (PORT, bind, origins, drop-ins), as systemd lines for core's unit. */
-function unitEnvironment(unit: string): string[] {
-  const out: string[] = [];
+/**
+ * The environment the old hub's unit gave it (PORT, bind, origins, PATH, BUN_INSTALL, drop-ins), as systemd has it
+ * loaded: its Environment= assignments (`KEY=value`, in order) and its environment files.
+ */
+function unitEnv(unit: string): { vars: string[]; files: string[] } {
+  const vars: string[] = [];
+  const files: string[] = [];
   const show = run(["systemctl", "--user", "show", unit, "-p", "Environment", "-p", "EnvironmentFiles"]).stdout;
   for (const line of show.split("\n")) {
     if (line.startsWith("Environment=")) {
       for (const m of line.slice("Environment=".length).matchAll(/"((?:[^"\\]|\\.)*)"|(\S+)/g)) {
         const kv = m[1] ?? m[2]!;
-        if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(kv)) out.push(`Environment=${unitQuote(kv.replace(/\\(.)/g, "$1"))}`);
+        if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(kv)) vars.push(kv.replace(/\\(.)/g, "$1"));
       }
     } else if (line.startsWith("EnvironmentFiles=")) {
       const path = line.slice("EnvironmentFiles=".length).replace(/\s*\(ignore_errors=(yes|no)\)\s*$/, "").trim();
-      if (path) out.push(`EnvironmentFile=-${path.replace(/%/g, "%%")}`);
+      if (path) files.push(path);
     }
   }
-  return out;
+  return { vars, files };
+}
+
+/** The old hub's unit environment (unitEnv) as systemd lines for core's unit. */
+function unitEnvironment(unit: string): string[] {
+  const { vars, files } = unitEnv(unit);
+  return [...vars.map((kv) => `Environment=${unitQuote(kv)}`), ...files.map((f) => `EnvironmentFile=-${f.replace(/%/g, "%%")}`)];
+}
+
+/**
+ * The environment v0.8 runs with once `from` is handed over, for the check run and the dry run, built as systemd
+ * builds parachute-core.service's: the user manager's environment (managerEnv; a unit with no PATH of its own runs
+ * with the manager's), then the unit's own over it (unitEnv; an environment file's assignments win over
+ * Environment=). The caller's environment is only the ground under those (HOME, LANG, …, and anything systemd won't
+ * report). Without this, a takeover run under `systemd-run --user` checked v0.8 with the user manager's PATH, where
+ * the modules' programs (scribe in ~/.bun/bin) aren't, though the unit's PATH has them (friends box, 10-29); and one
+ * run from a shell would check with the shell's PATH what the unit runs with the manager's.
+ * `unread`: what couldn't be read exactly (an environment file, see envFileVars; a manager value, see managerValue),
+ * left out here; systemd still gives it to the unit. No unit (a home a hand-run process served): the caller's environment, as it is.
+ */
+function handOverEnv(from: string | undefined, base: NodeJS.ProcessEnv = process.env): { env: Record<string, string>; unread: string[] } {
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(base)) if (v !== undefined) env[k] = v;
+  const unread: string[] = [];
+  if (!from) return { env, unread };
+  for (const [k, raw] of managerEnv() ?? []) {
+    const v = managerValue(raw);
+    if (v === null) unread.push(`the user manager's ${k}`); // the caller's stays for that name
+    else env[k] = v;
+  }
+  const { vars, files } = unitEnv(from);
+  for (const kv of vars) {
+    const i = kv.indexOf("=");
+    env[kv.slice(0, i)] = kv.slice(i + 1);
+  }
+  for (const f of files) {
+    let body: string;
+    try {
+      body = readFileSync(f, "utf8");
+    } catch {
+      if (existsSync(f)) unread.push(f); // a missing one is skipped, as core's unit (EnvironmentFile=-) skips it
+      continue;
+    }
+    const got = envFileVars(body);
+    if (got === null) unread.push(f);
+    else for (const [k, v] of got) env[k] = v;
+  }
+  return { env, unread };
+}
+
+/** The old unit core's unit takes over from (and takes its environment from): the old hub's, else the first one paused. */
+function handOverUnit(units: Unit[], cut: string[] = []): string | undefined {
+  const names = [...new Set([...units.filter((u) => u.old && u.manager === "systemd").map((u) => u.name), ...cut])];
+  return names.find((n) => /hub/.test(n)) ?? names[0];
 }
 
 function writeCoreUnit(d: Detected, from: string): { path: string; port: number } {
@@ -1538,6 +1699,8 @@ async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ ba
     }
   }
   const toPause = d.units.filter((u) => u.old && u.manager === "systemd");
+  // The unit core's unit replaces: its environment is the check run's and then core's unit's.
+  const hubUnit = handOverUnit(d.units);
   const pausable = new Set(toPause.map((u) => u.name));
   // Stopping or disabling a unit can reach another home: another home's databases in any of its processes, or units
   // a stop or disable would reach (Also=, PropagatesStopTo=, units that require, bind to or are part of it).
@@ -1666,7 +1829,7 @@ async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ ba
     const kids = liveKids(d.home);
     writeRecord(d.home, { ...progress, stage: "checking", backup: dest });
     say("Starting v0.8 on the same data and checking every answer …");
-    const problems = await checkRun(d, kids, say);
+    const problems = await checkRun(d, kids, hubUnit, say);
     if (problems.length) throw await undo(`a check failed: ${problems.join("; ")}`);
 
     const record: Record_ = {
@@ -1683,11 +1846,10 @@ async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ ba
     };
     writeRecord(d.home, record);
 
-    const hubUnit = toPause.find((u) => u.manager === "systemd" && /hub/.test(u.name)) ?? toPause[0];
     if (hubUnit) {
       say(`Starting v0.8 as ${CORE_UNIT} …`);
       try {
-        const unit = writeCoreUnit(d, hubUnit.name);
+        const unit = writeCoreUnit(d, hubUnit);
         systemctl("daemon-reload");
         // A drop-in the unit already had (Also=, a stop that propagates) could make enabling, stopping or disabling
         // it reach another unit: checked before it is ever enabled, so the cleanup's disable is safe too.
@@ -1858,6 +2020,7 @@ export async function takeover(args: string[]): Promise<number> {
       rollback: d.rollback,
       plan: plan(d),
       others: d.others,
+      unfound: d.unfound,
     });
     if (!f.json || !f.yes) out(describe(d));
     if (f.dryRun) {
