@@ -34,14 +34,19 @@ describe("mcp/tools", () => {
     const a = runId("kind");
     const field = runId("f").replace(/-/g, "_"); // field names are vault-wide: never reuse another suite's
     await c.call("manage-types", { tag: a, fields: { [field]: { type: "string" } } });
+    const gone = async (name: string) => (await c.call("list-tags", { tag: name })).error_type === "tag_not_found";
     const renamed = await c.call("manage-types", { action: "rename", old_name: a, new_name: `${a}-x` });
     expect(renamed.deprecation).toBeUndefined();
+    expect(await gone(a)).toBe(true);
     const tag = await c.call("list-tags", { tag: `${a}-x` });
     expect(Object.keys(tag.fields ?? {})).toEqual([field]);
     const old = await c.call("rename-tag", { old_name: `${a}-x`, new_name: `${a}-y` });
     expect(old.deprecation).toEqual({ tool: "rename-tag", use: 'manage-types {action: "rename"}', removed_in: "1.0" });
+    expect(await gone(`${a}-x`)).toBe(true);
+    expect(await gone(`${a}-y`)).toBe(false);
     const del = await c.call("manage-types", { action: "delete", tag: `${a}-y` });
     expect(del.deprecation).toBeUndefined();
+    expect(await gone(`${a}-y`)).toBe(true);
     await expect(c.call("manage-types", { action: "explode" })).rejects.toThrow(/needs `action`: update, rename, merge, delete, prune/);
     await c.close();
   });

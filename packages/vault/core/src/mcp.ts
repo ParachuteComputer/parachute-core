@@ -3007,6 +3007,21 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
       ...(impl.resultContent ? { resultContent: impl.resultContent } : {}),
     });
   }
+  // T-318 §4: `query-notes {path_between}` is find-path under its 0.9 name. Dispatched here so every runtime that
+  // advertises it (core's manifest) answers it; the bun server wraps it again around its tag-scoped find-path.
+  const query = tools.find((t) => t.name === "query-notes");
+  const findPath = tools.find((t) => t.name === "find-path");
+  if (query && findPath) {
+    const execute = query.execute;
+    query.execute = (params) => {
+      if (params.path_between === undefined) return execute(params);
+      const pb = params.path_between;
+      if (!pb || typeof pb !== "object" || Array.isArray(pb)) {
+        throw Object.assign(new Error("path_between takes {source, target, max_depth?}."), { error_type: "invalid_query", field: "path_between" });
+      }
+      return findPath.execute(pb as Record<string, unknown>);
+    };
+  }
   return tools;
 }
 
