@@ -124,7 +124,7 @@ Rarer filters (has_links, order_by, expand_links, created_by, search_mode, …) 
         content_edit: obj({ old_text: str(), new_text: str() }, ["old_text", "new_text"]),
         metadata: { type: "object" },
         tags: obj({ add: { type: "array", items: { type: "string" } }, remove: { type: "array", items: { type: "string" } } }),
-        links: obj({ add: LINKS, remove: LINKS }),
+        links: { type: "object", description: "{add: [{target, relationship?}], remove: [...]}" },
         path: str("Rename to"),
         if_updated_at: str(),
         force: bool(),
