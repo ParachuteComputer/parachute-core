@@ -1515,6 +1515,7 @@ export class BunSqliteStore implements Store {
       fields?: Record<string, tagSchemaOps.TagFieldSchema> | null;
       relationships?: tagSchemaOps.TagRelationshipMap | null;
       parent_names?: string[] | null;
+      kind?: "type" | "tag";
     },
   ) {
     // Canonical-bare-tag guard (vault#XXX) for the SCHEMA path. Strip leading

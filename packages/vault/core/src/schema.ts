@@ -6,8 +6,9 @@ import { transaction } from "./txn.js";
 import { timestampToMs } from "./cursor.js";
 import { ensureRelationshipColumn } from "./wikilinks.js";
 import { rebuildCompactState } from "./history-compact-state.js";
+import { recordTagKinds } from "./tag-kind.js";
 
-export const SCHEMA_VERSION = 32;
+export const SCHEMA_VERSION = 33;
 
 function migrateToV32(db: Database): void {
     const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='history_compact_state'").get();
@@ -16,6 +17,21 @@ function migrateToV32(db: Database): void {
     const previous = db.prepare("SELECT version FROM schema_version ORDER BY applied_at DESC, version ASC LIMIT 1").get() as { version: number } | null;
     if (exists && (!previous || previous.version >= 32)) return;
     rebuildCompactState(db);
+}
+
+/**
+ * v33 (T-318 design §8a): every tag record gets an explicit kind. `type` for a
+ * tag with fields or parent_names, or named as another tag's parent; `tag` for
+ * everything else. No membership moves (note_tags is untouched). Rollback is
+ * the takeover's restore: the column is additive, and a v32 binary refuses a
+ * v33 file (assertNotNewer) rather than misreading it.
+ */
+function migrateToV33(db: Database): void {
+  if (!hasColumn(db, "tags", "kind")) db.exec("ALTER TABLE tags ADD COLUMN kind TEXT");
+  const previous = db.prepare("SELECT MAX(version) AS v FROM schema_version").get() as { v: number | null } | null;
+  if (previous?.v != null && previous.v >= 33) return;
+  const counts = recordTagKinds(db);
+  if (previous?.v != null) console.error(`[vault] migrated to schema v33 (types and tags): ${counts.types} types, ${counts.tags} tags`);
 }
 
 /**
@@ -93,7 +109,10 @@ CREATE TABLE IF NOT EXISTS tags (
   relationships TEXT,
   parent_names TEXT,
   created_at TEXT,
-  updated_at TEXT
+  updated_at TEXT,
+  -- v33 (T-318 §8a): 'type' (fields, parents) or 'tag' (a flat label); NULL
+  -- on a row made implicitly by tagging, read by the same rule (tag-kind.ts).
+  kind TEXT
 );
 
 -- Note-Tag join
@@ -770,6 +789,7 @@ export function initSchema(db: Database): void {
   migrateToV30(db);
   migrateToV31(db);
   migrateToV32(db);
+  migrateToV33(db);
 
   // Rebuild any generated columns + indexes declared in indexed_fields.
   // No-op for a fresh vault; idempotent on existing vaults.

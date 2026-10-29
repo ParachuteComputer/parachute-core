@@ -17,6 +17,7 @@ import { HistoryNotFoundError, latestTombstone } from "../core/src/history.js";
 import { projectHistoryProvenance } from "../core/src/history-visibility.js";
 import { isNoteIdShape } from "../core/src/ulid.js";
 import type { Database } from "bun:sqlite";
+import { foldTypesIntoTags } from "../core/src/tag-kind.ts";
 import type { Store, Note, QueryOpts, AggregateSpec } from "../core/src/types.ts";
 import { TAG_EXPAND_MODES, stripTagHash, suggestSimilarTag, type TagExpandMode } from "../core/src/tag-hierarchy.ts";
 import {
@@ -2361,7 +2362,10 @@ async function handleNotesInner(
     if (method === "POST") {
       const parsedBody = await parseJsonBody(req);
       if (!parsedBody.ok) return parsedBody.response;
-      const body = parsedBody.body as any;
+      // T-318 §8a: `types` land in the one membership store with the tags.
+      const folded = foldRestTypes(store.db, parsedBody.body, "create");
+      if (folded instanceof Response) return folded;
+      const body = folded as any;
       // `notes` (when present) must actually be an array — otherwise
       // `items` below iterates whatever `body.notes` happens to be (e.g. a
       // STRING iterates as one-character items), silently creating a batch
@@ -3147,7 +3151,9 @@ async function handleNotesInner(
       // shape parsed the body only after the not-found check.
       const parsedBody = await parseJsonBody(req);
       if (!parsedBody.ok) return parsedBody.response;
-      const body = parsedBody.body as any;
+      const folded = foldRestTypes(store.db, parsedBody.body, Array.isArray((parsedBody.body as any)?.tags) ? "create" : "update");
+      if (folded instanceof Response) return folded;
+      const body = folded as any;
       if (body.if_updated_at !== undefined && !isValidIfUpdatedAt(body.if_updated_at)) return invalidIfUpdatedAtResponse();
       const note = await resolveNote(store, idOrPath, scopeVisible);
       if (!note) {
@@ -4083,8 +4089,12 @@ export async function handleTags(
         ...(fieldsPatch !== undefined ? { fields: fieldsPatch } : {}),
         ...(relationshipsPatch !== undefined ? { relationships: relationshipsPatch } : {}),
         ...(parentNamesPatch !== undefined ? { parent_names: parentNamesPatch } : {}),
+        ...((body as { kind?: "type" | "tag" }).kind !== undefined ? { kind: (body as { kind?: "type" | "tag" }).kind } : {}),
       });
     } catch (err) {
+      if ((err as { error_type?: string })?.error_type === "tag_kind") {
+        return Response.json({ error: (err as Error).message, error_type: "tag_kind", field: (err as { field?: string }).field }, { status: 422 });
+      }
       if (err instanceof IndexedFieldError) {
         // Tag-scope scrub (vault#554 fold): declareField's cross-declarer
         // type-conflict message names the other declarer tag(s) + their
@@ -5372,5 +5382,22 @@ export async function handleHistoryCompact(req: Request, store: Store, tagScope:
     if (conflict)
       return conflict;
     return json({ error: "Compaction failed", error_type: "compaction_failed", message: err instanceof Error ? err.message : String(err) }, 500);
+  }
+}
+
+
+/**
+ * REST's half of "writes accept both" (T-318 §8a): fold a body's `types` (and
+ * each batch item's) into its tags, or answer 422 with the fix.
+ */
+function foldRestTypes(db: Database, body: unknown, mode: "create" | "update"): unknown | Response {
+  if (!body || typeof body !== "object") return body;
+  try {
+    let out = foldTypesIntoTags(db, body as Record<string, unknown>, mode);
+    if (Array.isArray(out.notes)) out = { ...out, notes: (out.notes as Record<string, unknown>[]).map((i) => foldTypesIntoTags(db, i, mode)) };
+    return out;
+  } catch (err) {
+    if ((err as { error_type?: string })?.error_type !== "tag_kind") throw err;
+    return Response.json({ error: (err as Error).message, error_type: "tag_kind", field: "types", hint: (err as { hint?: string }).hint }, { status: 422 });
   }
 }

@@ -74,6 +74,7 @@ import {
   MAX_ATTACHMENT_IMAGE_BYTES,
   type AttachmentBytesProvider,
 } from "./attachment/bytes-provider.js";
+import { foldTypeFilter, foldTypesIntoTags, tagKinds } from "./tag-kind.js";
 
 /**
  * A single MCP tool-result content block. Mirrors the subset of the MCP SDK's
@@ -698,6 +699,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
     {
       name: "query-notes",
       execute: async (params) => {
+        params = foldTypeFilter(db, params);
         // --- Ambiguous-links scope split (vault#581 auth review) ---
         // `requestedHasAmbiguous` is what the caller asked for;
         // `sqlHasAmbiguous` is what is safe to push into SQL for a reader
@@ -1468,6 +1470,8 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
     {
       name: "create-note",
       execute: async (params) => {
+        params = foldTypesIntoTags(db, params, "create");
+        if (Array.isArray(params.notes)) params = { ...params, notes: (params.notes as Record<string, unknown>[]).map((i) => foldTypesIntoTags(db, i, "create")) };
         const batch = params.notes as any[] | undefined;
         const items = batch ?? [params];
 
@@ -1850,6 +1854,8 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
     {
       name: "update-note",
       execute: async (params) => {
+        params = foldTypesIntoTags(db, params, "update");
+        if (Array.isArray(params.notes)) params = { ...params, notes: (params.notes as Record<string, unknown>[]).map((i) => foldTypesIntoTags(db, i, "update")) };
         const batch = params.notes as any[] | undefined;
         // vault#554: top-level `force` / `if_updated_at` apply as per-item
         // DEFAULTS in a batch call — item-level values win when both are
@@ -2426,6 +2432,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           }
           return {
             name: singleTag,
+            kind: record?.kind ?? "tag",
             count: found?.count ?? 0,
             expanded_count: found?.expanded_count ?? 0,
             description: record?.description ?? null,
@@ -2437,7 +2444,8 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           };
         }
 
-        const tags = noteOps.listTags(db);
+        const kinds = tagKinds(db);
+        const tags = noteOps.listTags(db).map((t) => ({ ...t, kind: kinds.get(t.name) ?? "tag" }));
         if (params.include_schema) {
           const records = new Map(
             tagSchemaOps.listTagRecords(db).map((r) => [r.tag, r] as const),
@@ -2551,6 +2559,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           ...(fieldsPatch !== undefined ? { fields: fieldsPatch } : {}),
           ...(relationshipsPatch !== undefined ? { relationships: relationshipsPatch } : {}),
           ...(parentNamesPatch !== undefined ? { parent_names: parentNamesPatch } : {}),
+          ...(params.kind !== undefined ? { kind: params.kind as "type" | "tag" } : {}),
         });
 
         return result;
