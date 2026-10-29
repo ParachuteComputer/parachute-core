@@ -32,11 +32,12 @@ describe("mcp/tools", () => {
   test("manage-types updates, renames and deletes a type; the old names still do too, saying what replaced them", async () => {
     const c = await session("admin");
     const a = runId("kind");
-    await c.call("manage-types", { tag: a, fields: { state: { type: "string" } } });
+    const field = runId("f").replace(/-/g, "_"); // field names are vault-wide: never reuse another suite's
+    await c.call("manage-types", { tag: a, fields: { [field]: { type: "string" } } });
     const renamed = await c.call("manage-types", { action: "rename", old_name: a, new_name: `${a}-x` });
     expect(renamed.deprecation).toBeUndefined();
     const tag = await c.call("list-tags", { tag: `${a}-x` });
-    expect(Object.keys(tag.fields ?? {})).toEqual(["state"]);
+    expect(Object.keys(tag.fields ?? {})).toEqual([field]);
     const old = await c.call("rename-tag", { old_name: `${a}-x`, new_name: `${a}-y` });
     expect(old.deprecation).toEqual({ tool: "rename-tag", use: 'manage-types {action: "rename"}', removed_in: "1.0" });
     const del = await c.call("manage-types", { action: "delete", tag: `${a}-y` });
