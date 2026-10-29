@@ -82,6 +82,11 @@ describe("mcp/types", () => {
     const viaRest = await rest(s.vaultViaHub, tok).get(`/notes/${enc(shared)}`);
     expect(viaRest.body.tags).toEqual([work]);
     expect(viaRest.body.types ?? []).toEqual([]);
+    // A type inside the key's scope is still made a type over REST (Codex review, #18).
+    const inScope = `${work}/kind`;
+    const r = await rest(s.vaultViaHub, tok).post("/notes", { path: runId("in"), content: "in", types: [inScope] });
+    expect(r.status).toBe(201);
+    expect(r.body.types).toEqual([inScope]);
     // Queries: a hidden type and an absent name answer alike.
     const hidden = await scoped.call("query-notes", { type: secret }).catch((e) => String(e));
     const absent = await scoped.call("query-notes", { type: runId("absent") }).catch((e) => String(e));

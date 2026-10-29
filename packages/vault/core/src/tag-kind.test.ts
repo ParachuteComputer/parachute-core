@@ -59,6 +59,15 @@ describe("v33: every tag record gets a kind", () => {
 });
 
 describe("kind rules", () => {
+  test("naming a parent never writes the parent's record; it reads as a type", async () => {
+    const { db, store } = fresh();
+    await store.upsertTagRecord("secret", { kind: "tag" });
+    await store.upsertTagRecord("work", { parent_names: ["secret"] });
+    expect((db.prepare("SELECT kind FROM tags WHERE name = 'secret'").get() as { kind: string }).kind).toBe("tag");
+    expect(tagKinds(db).get("secret")).toBe("type");
+    db.close();
+  });
+
   test("fields make a type; an explicit plain tag can't carry fields; a rename keeps the kind", async () => {
     const { db, store, tools } = fresh();
     await store.upsertTagRecord("label", { kind: "type" });

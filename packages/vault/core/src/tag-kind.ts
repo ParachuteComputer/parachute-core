@@ -30,18 +30,23 @@ const IS_PARENT = `t.name IN (SELECT DISTINCT p.value FROM tags pt, json_each(CA
 /** The rule: what a row's kind is when nothing explicit is recorded (and what the v33 migration records). */
 const DERIVED_KIND = `CASE WHEN ${HAS_STRUCTURE} OR ${IS_PARENT} THEN 'type' ELSE 'tag' END`;
 
-/** A row's effective kind, as SQL over `tags t`. */
-export const KIND_SQL = `COALESCE(t.kind, ${DERIVED_KIND})`;
+/**
+ * A row's effective kind, as SQL over `tags t`: its recorded kind, except that
+ * a tag named as another tag's parent always reads as a type. Being a parent is
+ * read, never written onto the parent's record, so declaring a parent can't
+ * change a record the caller may not be allowed to touch.
+ */
+export const KIND_SQL = `CASE WHEN ${IS_PARENT} THEN 'type' ELSE COALESCE(t.kind, ${DERIVED_KIND}) END`;
 
 /** Every tag record's effective kind. */
 export function tagKinds(db: Database): Map<string, TagKind> {
-  const rows = db.prepare(`SELECT t.name AS name, COALESCE(t.kind, ${DERIVED_KIND}) AS kind FROM tags t`).all() as { name: string; kind: TagKind }[];
+  const rows = db.prepare(`SELECT t.name AS name, ${KIND_SQL} AS kind FROM tags t`).all() as { name: string; kind: TagKind }[];
   return new Map(rows.map((r) => [r.name, r.kind]));
 }
 
 /** The names whose effective kind is `type`. */
 export function typeNames(db: Database): Set<string> {
-  const rows = db.prepare(`SELECT t.name AS name FROM tags t WHERE COALESCE(t.kind, ${DERIVED_KIND}) = 'type'`).all() as { name: string }[];
+  const rows = db.prepare(`SELECT t.name AS name FROM tags t WHERE ${KIND_SQL} = 'type'`).all() as { name: string }[];
   return new Set(rows.map((r) => r.name));
 }
 

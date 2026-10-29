@@ -488,11 +488,7 @@ export function upsertTagRecord(
        SET description = ?, fields = ?, relationships = ?, parent_names = ?, kind = ?, updated_at = ?
      WHERE name = ?`,
   ).run(description, fields, relationships, parent_names, kind, now, tag);
-  // A parent is a type. Only an existing row is marked: a parent with no row
-  // stays a dangling name for doctor to report (it still reads as a type).
-  for (const parent of patch.parent_names ?? []) {
-    db.prepare("UPDATE tags SET kind = 'type' WHERE name = ? AND (kind IS NULL OR kind = 'tag')").run(parent);
-  }
+  // A parent reads as a type (tag-kind.ts KIND_SQL); its own record is never written here.
 
   return getTagRecord(db, tag)!;
 }

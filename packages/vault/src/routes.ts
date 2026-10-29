@@ -2363,7 +2363,7 @@ async function handleNotesInner(
       const parsedBody = await parseJsonBody(req);
       if (!parsedBody.ok) return parsedBody.response;
       // T-318 §8a: `types` land in the one membership store with the tags.
-      const folded = foldRestTypes(store.db, parsedBody.body, "create", tagScope.raw !== null);
+      const folded = foldRestTypes(store.db, parsedBody.body, "create", tagScope.raw === null ? null : (t) => tagVisibleInScope(t, tagScope.allowed, tagScope.raw));
       if (folded instanceof Response) return folded;
       const body = folded as any;
       // `notes` (when present) must actually be an array — otherwise
@@ -3151,7 +3151,7 @@ async function handleNotesInner(
       // shape parsed the body only after the not-found check.
       const parsedBody = await parseJsonBody(req);
       if (!parsedBody.ok) return parsedBody.response;
-      const folded = foldRestTypes(store.db, parsedBody.body, Array.isArray((parsedBody.body as any)?.tags) ? "create" : "update", tagScope.raw !== null);
+      const folded = foldRestTypes(store.db, parsedBody.body, Array.isArray((parsedBody.body as any)?.tags) ? "create" : "update", tagScope.raw === null ? null : (t) => tagVisibleInScope(t, tagScope.allowed, tagScope.raw));
       if (folded instanceof Response) return folded;
       const body = folded as any;
       if (body.if_updated_at !== undefined && !isValidIfUpdatedAt(body.if_updated_at)) return invalidIfUpdatedAtResponse();
@@ -5390,11 +5390,17 @@ export async function handleHistoryCompact(req: Request, store: Store, tagScope:
  * REST's half of "writes accept both" (T-318 §8a): fold a body's `types` (and
  * each batch item's) into its tags, or answer 422 with the fix.
  */
-function foldRestTypes(db: Database, body: unknown, mode: "create" | "update", scoped: boolean): unknown | Response {
+function foldRestTypes(db: Database, body: unknown, mode: "create" | "update", visible: ((tag: string) => boolean) | null): unknown | Response {
   if (!body || typeof body !== "object") return body;
-  // A tag-scoped caller's types are only memberships: merged into the tags the
-  // scope checks below see, with no record made or kind revealed before them.
-  const fold = (i: Record<string, unknown>) => (scoped ? mergeTypesIntoTags(i, mode) : foldTypesIntoTags(db, i, mode));
+  // For a tag-scoped caller, a type outside its scope makes no record and
+  // reveals no kind: the write is merged into the tags the scope checks below
+  // see, and they refuse it. Types inside its scope are made types as for anyone.
+  const fold = (i: Record<string, unknown>) => {
+    const merged = mergeTypesIntoTags(i, mode);
+    if (!visible) return foldTypesIntoTags(db, i, mode);
+    const added = mode === "create" ? (merged.tags as string[] | undefined) ?? [] : ((merged.tags as { add?: string[] } | undefined)?.add ?? []);
+    return added.every(visible) ? foldTypesIntoTags(db, i, mode) : merged;
+  };
   try {
     let out = fold(body as Record<string, unknown>);
     if (Array.isArray(out.notes)) out = { ...out, notes: (out.notes as Record<string, unknown>[]).map(fold) };
