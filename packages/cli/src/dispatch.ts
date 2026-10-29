@@ -38,6 +38,7 @@ import { fileURLToPath } from "node:url";
 import { SCHEMA_VERSION } from "@openparachute/vault/core/src/schema.ts";
 import core from "../../../package.json" with { type: "json" };
 import { homeDir, newerData, repairModes } from "./home.ts";
+import type { Notice } from "./front.ts";
 import { managedRefusal } from "./managed.ts";
 
 export type Role = "core" | "hub" | "vault";
@@ -70,7 +71,7 @@ function coreHelp(): string {
 export function route(
   role: Role,
   argv: string[],
-): { print: string } | { install: string[] } | { embedded: string[] } | { bootstrap: string[] } | { takeover: string[] } | { cli: "hub" | "vault"; argv: string[] } {
+): { print: string } | { changes: string[] } | { install: string[] } | { embedded: string[] } | { bootstrap: string[] } | { takeover: string[] } | { cli: "hub" | "vault"; argv: string[] } {
   if (role === "core" && argv[0] === "install") return { install: argv.slice(1) };
   if (role === "core" && argv[0] === "takeover") return { takeover: argv.slice(1) };
   const cli = role === "vault" || (role === "core" && argv[0] === "vault") ? "vault" : "hub";
@@ -79,6 +80,8 @@ export function route(
   if (cmd === "version" || cmd === "--version" || cmd === "-v") {
     return { print: rest.includes("--json") ? JSON.stringify(versionJson()) : core.version };
   }
+  // `changes` (front.ts) reads only the map it ships and the home's usage log, so it answers before any check.
+  if (cli === "hub" && cmd === "changes") return { changes: rest };
   if (cli === "hub" && cmd === "serve" && rest.includes("--embedded")) return { embedded: rest };
   if (cli === "hub" && cmd === "bootstrap") return { bootstrap: rest };
   return { cli, argv: args };
@@ -126,14 +129,21 @@ function homeFlag(args: string[]): { home?: string; twice: boolean } {
   return { home: found[0], twice: found.length > 1 };
 }
 
-/** Run as `role` with this process's arguments. The moved CLIs run in this process, as if started directly. */
-export async function dispatch(role: Role): Promise<void> {
+/**
+ * Run as `role` with this process's arguments. The moved CLIs run in this process, as if started directly.
+ * `notice`: an old name was used (front.ts); it is said, and counted, once the home has passed its checks.
+ */
+export async function dispatch(role: Role, notice?: Notice): Promise<void> {
   process.umask(0o077);
   const argv = process.argv.slice(2);
   const r = route(role, argv);
   if ("print" in r) {
     console.log(r.print);
     return;
+  }
+  if ("changes" in r) {
+    const { changes } = await import("./front.ts");
+    process.exit(changes(r.changes, homeDir()));
   }
   if ("install" in r) {
     const { install } = await import("./install.ts");
@@ -173,6 +183,10 @@ export async function dispatch(role: Role): Promise<void> {
       process.exit(EXIT_HOME_UNUSABLE);
     }
   }
+  if (notice) {
+    const { announce } = await import("./front.ts");
+    announce(notice, home);
+  }
   if (embeddedArgs) {
     process.env.PARACHUTE_OFFLINE = "1";
     if (process.env.PARACHUTE_HOME) for (const line of repairModes(home)) console.error(`parachute: mode repaired: ${line}`);
@@ -192,6 +206,13 @@ export async function dispatch(role: Role): Promise<void> {
     process.exit(await takeover(takeoverArgs));
   }
   if (!("cli" in r)) return;
+  if (r.cli === "hub" && r.argv[0] === "keys") {
+    // `keys` (and its alias `tokens`) is core's (keys.ts): answered here, or mapped onto the hub's auth commands.
+    const { keysCommand } = await import("./keys.ts");
+    const k = keysCommand(r.argv.slice(1));
+    if ("exit" in k) process.exit(k.exit);
+    r.argv = k.argv;
+  }
   const refusal = managedRefusal(r.cli, r.argv);
   if (refusal) {
     console.error(refusal);
