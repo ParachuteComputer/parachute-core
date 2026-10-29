@@ -288,7 +288,7 @@ export const TASKS: Task[] = [
       const r = await ctx.vault.call("query-notes", { id: "Expenses October", include_attachments: true });
       const note = Array.isArray(r) ? r[0] : (r.notes?.[0] ?? r);
       const atts: any[] = note?.attachments ?? [];
-      const att = atts.find((a) => /receipt/i.test(a.path ?? a.filename ?? ""));
+      const att = atts.find((a) => /receipt/i.test(a.metadata?.original_name ?? a.filename ?? "") || /\.pdf$/i.test(a.path ?? ""));
       if (!att) return `no receipt attachment (${atts.length} attachments)`;
       const t = await ctx.vault.call("request-attachment-download", { attachment_id: att.id });
       const bytes = await ctx.fetchBytes(t.url);
