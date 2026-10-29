@@ -170,7 +170,7 @@ export const QUERY_HINTS: readonly string[] = [
   "query-notes { tag: \"X\" } — all notes with tag X (includes descendants per inheritance)",
   "query-notes { tag: \"X\", metadata: { field: { op: value } } } — operator queries on indexed fields (eq/ne/gt/gte/lt/lte/in/not_in/exists)",
   "query-notes { search: \"...\" } — full-text search across content",
-  "query-notes { near: { id: \"...\" }, depth: 2 } — graph neighborhood within N hops",
+  "query-notes { near: { note_id: \"...\", depth: 2 } } — graph neighborhood within N hops",
   "query-notes { id: \"<note-id-or-path>\" } — fetch a single note by ID or path",
 ] as const;
 
