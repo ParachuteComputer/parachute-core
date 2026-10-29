@@ -5,13 +5,17 @@ import { readFileSync } from "node:fs";
 type Row = Record<string, any>;
 
 const mean = (xs: number[]) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0);
+const median = (xs: number[]) => {
+  const s = [...xs].sort((a, b) => a - b);
+  return s.length ? (s.length % 2 ? s[(s.length - 1) / 2]! : (s[s.length / 2 - 1]! + s[s.length / 2]!) / 2) : 0;
+};
 const k = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(Math.round(n)));
 
 export function summarize(rows: Row[]): string {
   rows = rows.filter((r) => !r.harness_error);
   const models = [...new Set(rows.map((r) => r.model))];
   const lines: string[] = [];
-  lines.push("| model | arm | success | runs | calls / task | input tokens / task | output tokens / task | cost (list $) |");
+  lines.push("| model | arm | success | runs | calls / task (median) | input tokens / task | output tokens / task | cost (list $) |");
   lines.push("|---|---|---:|---:|---:|---:|---:|---:|");
   for (const m of models) {
     for (const arm of ["old", "new"]) {
@@ -19,7 +23,7 @@ export function summarize(rows: Row[]): string {
       if (!rs.length) continue;
       const ok = rs.filter((r) => r.ok).length;
       lines.push(
-        `| ${m} | ${arm} | **${ok}/${rs.length}** (${Math.round((100 * ok) / rs.length)}%) | ${rs.length} | ${mean(rs.map((r) => r.calls ?? 0)).toFixed(1)} | ${k(mean(rs.map((r) => r.input_tokens ?? 0)))} | ${k(mean(rs.map((r) => r.output_tokens ?? 0)))} | ${rs.reduce((a, r) => a + (r.cost_usd ?? 0), 0).toFixed(2)} |`,
+        `| ${m} | ${arm} | **${ok}/${rs.length}** (${Math.round((100 * ok) / rs.length)}%) | ${rs.length} | ${mean(rs.map((r) => r.calls ?? 0)).toFixed(1)} (${median(rs.map((r) => r.calls ?? 0))}) | ${k(mean(rs.map((r) => r.input_tokens ?? 0)))} | ${k(mean(rs.map((r) => r.output_tokens ?? 0)))} | ${rs.reduce((a, r) => a + (r.cost_usd ?? 0), 0).toFixed(2)} |`,
       );
     }
   }
