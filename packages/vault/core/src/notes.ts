@@ -234,8 +234,8 @@ export function extractH1Title(content: string): string | null {
 export function findNotesByTitle(db: Database, title: string): { id: string; path: string | null }[] {
   const needle = title.trim().toLowerCase();
   if (!needle) return [];
-  const index = titleIndexes.get(db);
-  if (index) return index.get(needle) ?? [];
+  const index = resolutionIndexes.get(db);
+  if (index) return index.titles.get(needle) ?? [];
   const rows = db.prepare("SELECT id, path, content FROM notes").all() as {
     id: string;
     path: string | null;
@@ -251,38 +251,91 @@ export function findNotesByTitle(db: Database, title: string): { id: string; pat
   return matches;
 }
 
-/** Title indexes active for a database while {@link withTitleIndex} runs. */
-const titleIndexes = new WeakMap<Database, Map<string, { id: string; path: string | null }[]>>();
+/** Lookup indexes active for a database while {@link withTitleIndex} runs. */
+interface ResolutionIndex {
+  /** Lowercased H1 title -> notes carrying it (findNotesByTitle). */
+  titles: Map<string, { id: string; path: string | null }[]>;
+  /** ASCII-lowercased path -> notes (the `path = ? COLLATE NOCASE` arm of the basename lookup). */
+  paths: Map<string, { id: string; path: string }[]>;
+  /** ASCII-lowercased "/suffix" at every "/" in a path -> notes (the `lower(substr(path, -n))` arm). */
+  suffixes: Map<string, { id: string; path: string }[]>;
+}
+const resolutionIndexes = new WeakMap<Database, ResolutionIndex>();
+
+/** SQLite's NOCASE and lower() fold ASCII only; so must the index. */
+export function asciiLower(s: string): string {
+  return s.replace(/[A-Z]+/g, (m) => m.toLowerCase());
+}
+
+function pushTo<V>(map: Map<string, V[]>, key: string, v: V): void {
+  const list = map.get(key);
+  if (list) list.push(v);
+  else map.set(key, [v]);
+}
 
 /**
- * Run `fn` with {@link findNotesByTitle} answered from one H1-title index built
- * up front, instead of a full-content scan per call. For bulk passes that
- * resolve many wikilinks while no note is created, edited or deleted —
- * `syncAllWikilinks`, which only writes link rows. A large import used to pay
- * one scan of every note's content per wikilink that missed on id, path and
- * basename: quadratic in the vault, past the Durable Object's 300 s CPU limit
- * for a 2,700-note vault (T-318). Same matching rule as the scan (first `# `
- * line, trimmed, case-folded with toLowerCase), so the answers are identical.
- * Nested calls reuse the outer index.
+ * Run `fn` with wikilink resolution's two full-table lookups — the H1-title
+ * fallback ({@link findNotesByTitle}) and the basename match
+ * ({@link findNotesByBasename}) — answered from indexes built in one pass up
+ * front, instead of a scan per call. For bulk passes that resolve many
+ * wikilinks while no note is created, edited or deleted: `syncAllWikilinks`,
+ * which only writes link rows. A large import used to read every note's
+ * content once per wikilink that missed on id and path: quadratic in the
+ * vault, past the Durable Object's limits for a 2,700-note vault (T-318).
+ * The indexes apply the same matching rules as the SQL they replace, so the
+ * answers are identical. Nested calls reuse the outer index.
  */
 export function withTitleIndex<T>(db: Database, fn: () => T): T {
-  if (titleIndexes.has(db)) return fn();
-  const index = new Map<string, { id: string; path: string | null }[]>();
+  if (resolutionIndexes.has(db)) return fn();
+  const index: ResolutionIndex = { titles: new Map(), paths: new Map(), suffixes: new Map() };
   const rows = db.prepare("SELECT id, path, content FROM notes").all() as { id: string; path: string | null; content: string }[];
   for (const row of rows) {
     const h1 = extractH1Title(row.content);
-    if (!h1) continue;
-    const key = h1.toLowerCase();
-    const list = index.get(key);
-    if (list) list.push({ id: row.id, path: row.path });
-    else index.set(key, [{ id: row.id, path: row.path }]);
+    if (h1) pushTo(index.titles, h1.toLowerCase(), { id: row.id, path: row.path });
+    if (row.path !== null) {
+      const hit = { id: row.id, path: row.path };
+      const lower = asciiLower(row.path);
+      pushTo(index.paths, lower, hit);
+      for (let i = lower.indexOf("/"); i !== -1; i = lower.indexOf("/", i + 1)) {
+        pushTo(index.suffixes, lower.slice(i), hit);
+      }
+    }
   }
-  titleIndexes.set(db, index);
+  resolutionIndexes.set(db, index);
   try {
     return fn();
   } finally {
-    titleIndexes.delete(db);
+    resolutionIndexes.delete(db);
   }
+}
+
+/**
+ * Basename match for wikilink resolution: notes whose path equals `target`
+ * (NOCASE) or ends with `/target` (ASCII case-insensitive). One row per note,
+ * in table order. Indexed inside {@link withTitleIndex}; a scan otherwise.
+ */
+export function findNotesByBasename(db: Database, target: string): { id: string; path: string }[] {
+  const index = resolutionIndexes.get(db);
+  if (!index) {
+    return db.prepare(`
+      SELECT id, path FROM notes
+      WHERE path IS NOT NULL
+        AND (
+          path = ? COLLATE NOCASE
+          OR lower(substr(path, -length(?))) = lower(?)
+        )
+    `).all(target, `/${target}`, `/${target}`) as { id: string; path: string }[];
+  }
+  const key = asciiLower(target);
+  const seen = new Set<string>();
+  const out: { id: string; path: string }[] = [];
+  for (const hit of [...(index.paths.get(key) ?? []), ...(index.suffixes.get(`/${key}`) ?? [])]) {
+    if (!seen.has(hit.id)) {
+      seen.add(hit.id);
+      out.push(hit);
+    }
+  }
+  return out;
 }
 
 /**

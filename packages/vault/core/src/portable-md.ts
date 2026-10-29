@@ -1873,7 +1873,20 @@ export class FsImportSource implements ImportSource {
 export interface ImportEngineOptions {
   blowAway?: boolean;
   dryRun?: boolean;
+  /**
+   * Awaited every {@link IMPORT_CHECKPOINT_NOTES} notes and every
+   * {@link IMPORT_CHECKPOINT_LINKS} typed links while the import replays. A
+   * Durable Object runs the whole replay as one implicit storage transaction
+   * unless the code yields to the event loop, and the platform resets the
+   * object when one storage operation runs past ~30 s (a 2,698-note vault
+   * needed ~33 s, T-318). Cloud passes a short timer here so the writes commit
+   * in chunks. Self-host passes nothing: its import stays one real transaction.
+   */
+  checkpoint?: () => Promise<void>;
 }
+
+export const IMPORT_CHECKPOINT_NOTES = 200;
+export const IMPORT_CHECKPOINT_LINKS = 500;
 
 /**
  * Sink-agnostic import engine (Phase-1 shared-core, cloud design §4). Reads
@@ -2071,7 +2084,12 @@ async function importVaultReplay(
   // Track per-import (id → portable) so we can replay typed links after all
   // notes exist.
   const seenNotes = new Map<string, PortableNote>();
+  let sinceCheckpoint = 0;
   for (const relPath of source.listContentFiles()) {
+    if (opts.checkpoint && ++sinceCheckpoint >= IMPORT_CHECKPOINT_NOTES) {
+      sinceCheckpoint = 0;
+      await opts.checkpoint();
+    }
     // Derive the file's extension (lowercased, no leading dot) and the
     // user-visible note path (everything between the export root and the
     // extension). The source returns POSIX-relative paths already.
@@ -2223,7 +2241,10 @@ async function importVaultReplay(
     }
 
     // Upsert by id. createNote will throw on duplicate id; check first.
-    const existing = await store.getNote(id);
+    // After a blow-away wipe no note can exist yet (the wipe took them all and
+    // seenNotes drops repeated ids), so skip the lookup (T-318: it is one of the
+    // per-note costs that kept a 2,700-note import over cloud's limits).
+    const existing = opts.blowAway ? null : await store.getNote(id);
     if (existing) {
       // **Upsert merge policy** (vault#319 F2 — pinned here so future edits
       // don't drift):
@@ -2304,9 +2325,14 @@ async function importVaultReplay(
   // 4. Typed links — replay only now that all notes exist. Wikilinks (which
   // the exporter excludes from `links:`) rebuild from content brackets via
   // syncAllWikilinks (a callable Store method).
+  let linksSinceCheckpoint = 0;
   for (const [sourceId, portable] of seenNotes) {
     if (!portable.links) continue;
     for (const link of portable.links) {
+      if (opts.checkpoint && ++linksSinceCheckpoint >= IMPORT_CHECKPOINT_LINKS) {
+        linksSinceCheckpoint = 0;
+        await opts.checkpoint();
+      }
       // Confirm target exists. Forward refs to notes the export didn't
       // include (subset export) are skipped with a warning rather than
       // aborting.

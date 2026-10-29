@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import type { Note } from "./types.js";
 import * as linkOps from "./links.js";
-import { getNote, findNotesByTitle, extractH1Title } from "./notes.js";
+import { getNote, findNotesByTitle, findNotesByBasename, extractH1Title } from "./notes.js";
 import { chunkForInClause } from "./sql-in.js";
 import { pathTitle } from "./paths.js";
 import { transaction } from "./txn.js";
@@ -287,14 +287,7 @@ export function resolveWikilink(db: Database, target: string): string | null {
 
   // 3. Basename match — last path segment equals target.
   // e.g., target "README" matches path "Projects/Parachute/README"
-  const basename = db.prepare(`
-    SELECT id FROM notes
-    WHERE path IS NOT NULL
-      AND (
-        path = ? COLLATE NOCASE
-        OR lower(substr(path, -length(?))) = lower(?)
-      )
-  `).all(target, `/${target}`, `/${target}`) as { id: string }[];
+  const basename = findNotesByBasename(db, target);
 
   if (basename.length === 1) return basename[0]!.id;
   if (basename.length > 1) return null; // ambiguous basename — don't fall through to title
@@ -352,14 +345,7 @@ export function resolveWikilinkDetailed(db: Database, target: string): WikilinkR
   }
 
   // 3. Basename match
-  const basename = db.prepare(`
-    SELECT id, path FROM notes
-    WHERE path IS NOT NULL
-      AND (
-        path = ? COLLATE NOCASE
-        OR lower(substr(path, -length(?))) = lower(?)
-      )
-  `).all(target, `/${target}`, `/${target}`) as { id: string; path: string }[];
+  const basename = findNotesByBasename(db, target);
 
   if (basename.length === 1) {
     return { resolved: true, note_id: basename[0]!.id, path: basename[0]!.path, candidates: [] };

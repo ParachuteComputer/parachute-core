@@ -18,7 +18,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { SqliteStore } from "./store.js";
-import { importPortableVault } from "./portable-md.js";
+import { importPortableVault, importVault, IMPORT_CHECKPOINT_NOTES } from "./portable-md.js";
 import { syncWikilinks } from "./wikilinks.js";
 
 const SCAN = "SELECT id, path, content FROM notes";
@@ -111,5 +111,31 @@ describe("portable-md import: wikilink title fallback (T-318)", () => {
     const src = await store.createNote("see [[Plain Title]]", { path: "a/source" });
     const out = await store.getLinks(src.id, { direction: "outbound" });
     expect(out.map((l) => l.targetId)).toEqual([target.id]);
+  });
+
+  it("awaits the checkpoint during the replay and lands the same vault (cloud commits in chunks)", async () => {
+    const n = 2 * IMPORT_CHECKPOINT_NOTES + 10;
+    const dir = writeExport(n);
+    const snapshot = (db: Database) =>
+      JSON.stringify([
+        db.query("SELECT id, path, content, metadata, created_at, updated_at FROM notes ORDER BY id").all(),
+        db.query("SELECT source_id, target_id, relationship FROM links ORDER BY 1, 2, 3").all(),
+        db.query("SELECT source_id, target_path, relationship FROM unresolved_wikilinks ORDER BY 1, 2, 3").all(),
+      ]);
+    const plainDb = new Database(":memory:");
+    await importPortableVault(new SqliteStore(plainDb), { inDir: dir, blowAway: true });
+
+    const chunkDb = new Database(":memory:");
+    let calls = 0;
+    const { FsImportSource } = await import("./portable-md.js");
+    await importVault(new SqliteStore(chunkDb), new FsImportSource({ inDir: dir }), {
+      blowAway: true,
+      checkpoint: async () => {
+        calls++;
+        await new Promise((r) => setTimeout(r, 0));
+      },
+    });
+    expect(calls).toBe(2);
+    expect(snapshot(chunkDb)).toBe(snapshot(plainDb));
   });
 });
