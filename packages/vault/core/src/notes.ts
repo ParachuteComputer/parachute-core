@@ -234,6 +234,8 @@ export function extractH1Title(content: string): string | null {
 export function findNotesByTitle(db: Database, title: string): { id: string; path: string | null }[] {
   const needle = title.trim().toLowerCase();
   if (!needle) return [];
+  const index = titleIndexes.get(db);
+  if (index) return index.get(needle) ?? [];
   const rows = db.prepare("SELECT id, path, content FROM notes").all() as {
     id: string;
     path: string | null;
@@ -247,6 +249,40 @@ export function findNotesByTitle(db: Database, title: string): { id: string; pat
     }
   }
   return matches;
+}
+
+/** Title indexes active for a database while {@link withTitleIndex} runs. */
+const titleIndexes = new WeakMap<Database, Map<string, { id: string; path: string | null }[]>>();
+
+/**
+ * Run `fn` with {@link findNotesByTitle} answered from one H1-title index built
+ * up front, instead of a full-content scan per call. For bulk passes that
+ * resolve many wikilinks while no note is created, edited or deleted —
+ * `syncAllWikilinks`, which only writes link rows. A large import used to pay
+ * one scan of every note's content per wikilink that missed on id, path and
+ * basename: quadratic in the vault, past the Durable Object's 300 s CPU limit
+ * for a 2,700-note vault (T-318). Same matching rule as the scan (first `# `
+ * line, trimmed, case-folded with toLowerCase), so the answers are identical.
+ * Nested calls reuse the outer index.
+ */
+export function withTitleIndex<T>(db: Database, fn: () => T): T {
+  if (titleIndexes.has(db)) return fn();
+  const index = new Map<string, { id: string; path: string | null }[]>();
+  const rows = db.prepare("SELECT id, path, content FROM notes").all() as { id: string; path: string | null; content: string }[];
+  for (const row of rows) {
+    const h1 = extractH1Title(row.content);
+    if (!h1) continue;
+    const key = h1.toLowerCase();
+    const list = index.get(key);
+    if (list) list.push({ id: row.id, path: row.path });
+    else index.set(key, [{ id: row.id, path: row.path }]);
+  }
+  titleIndexes.set(db, index);
+  try {
+    return fn();
+  } finally {
+    titleIndexes.delete(db);
+  }
 }
 
 /**

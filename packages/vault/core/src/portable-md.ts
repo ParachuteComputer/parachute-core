@@ -2268,6 +2268,9 @@ async function importVaultReplay(
         ...(metadata ? { metadata } : {}),
         created_at,
         extension,
+        // Step 6's syncAllWikilinks resolves every note once all exist; doing
+        // it here too misses on each forward reference (T-318).
+        deferWikilinkSync: true,
       });
       stats.notes_created++;
     }

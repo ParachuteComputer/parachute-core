@@ -555,7 +555,15 @@ export class BunSqliteStore implements Store {
 
   // ---- Notes ----
 
-  async createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string; extension?: string; actor?: string | null; via?: string | null }): Promise<Note> {
+  /**
+   * `deferWikilinkSync`: skip this note's own `[[wikilink]]` resolution. Only
+   * for bulk writers that call {@link syncAllWikilinks} once every note exists
+   * (the portable-md import): resolving each note as it lands misses on every
+   * not-yet-imported target, and each miss scans all content for an H1 title.
+   * `syncWikilinks` recomputes a note's wikilink rows, unresolved and ambiguous
+   * rows from scratch, so the final pass gives the same result.
+   */
+  async createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string; extension?: string; actor?: string | null; via?: string | null; deferWikilinkSync?: boolean }): Promise<Note> {
     // Normalize `date`-typed field values to canonical UTC ISO form BEFORE
     // the write (vault#date-field-type — mixed-offset TEXT-compare
     // corruption). COPY-ON-WRITE (round 2) — reassign the local `opts`
@@ -573,7 +581,7 @@ export class BunSqliteStore implements Store {
       return created;
     });
 
-    if (content) {
+    if (content && !opts?.deferWikilinkSync) {
       syncWikilinks(this.db, note.id, content);
     }
 
@@ -1745,15 +1753,19 @@ export class BunSqliteStore implements Store {
     let totalAdded = 0;
     let totalRemoved = 0;
 
-    for (const note of allNotes) {
-      if (!note.content) continue;
-      const result = syncWikilinks(this.db, note.id, note.content);
-      if (result.added > 0 || result.removed > 0) {
-        synced++;
-        totalAdded += result.added;
-        totalRemoved += result.removed;
+    // One H1-title index for the whole pass: this loop writes only link rows,
+    // so titles can't change under it (see withTitleIndex).
+    noteOps.withTitleIndex(this.db, () => {
+      for (const note of allNotes) {
+        if (!note.content) continue;
+        const result = syncWikilinks(this.db, note.id, note.content);
+        if (result.added > 0 || result.removed > 0) {
+          synced++;
+          totalAdded += result.added;
+          totalRemoved += result.removed;
+        }
       }
-    }
+    });
 
     return { synced, totalAdded, totalRemoved };
   }
