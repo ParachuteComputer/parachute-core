@@ -140,6 +140,17 @@ export function adoptToken(db: Database, jti: string): string | null {
  * scopes"): each unrevoked, unexpired, current registry row gets a key. A
  * refresh token already rotated away is history, not a key. Idempotent.
  */
+/** Whether any live token has no key yet: what adoptLiveTokens would adopt (a read only). */
+export function hasTokensToAdopt(db: Database, now: Date = new Date()): boolean {
+  return !!db
+    .prepare(
+      `SELECT 1 FROM tokens t
+       WHERE t.revoked_at IS NULL AND t.rotated_to IS NULL AND (t.expires_at IS NULL OR t.expires_at > ?)
+         AND NOT EXISTS (SELECT 1 FROM keys k WHERE k.jti = t.jti) LIMIT 1`,
+    )
+    .get(now.toISOString());
+}
+
 export function adoptLiveTokens(db: Database, now: Date = new Date()): number {
   const rows = db
     .prepare(

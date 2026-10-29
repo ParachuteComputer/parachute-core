@@ -27,7 +27,7 @@ import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { CONFIG_DIR } from "./config.ts";
-import { adoptLiveTokens } from "./keys.ts";
+import { adoptLiveTokens, hasTokensToAdopt } from "./keys.ts";
 
 export function hubDbPath(configDir: string = CONFIG_DIR): string {
   return join(configDir, "hub.db");
@@ -1004,6 +1004,11 @@ export function migrate(db: Database): void {
  *   denies      explicit denies (JSON array, e.g. ["private"]); NULL until enforced
  */
 export function ensureKeys(db: Database): void {
+  // Every open of hub.db runs this, beside a hub that may be writing. Nothing to do is the usual case: check that
+  // with a read. Otherwise take the write lock first (IMMEDIATE, which waits out busy_timeout): a read-then-write
+  // transaction that loses the race to another writer gets "database is locked" at once, without waiting.
+  const hasTable = db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'keys'").get();
+  if (hasTable && !hasTokensToAdopt(db)) return;
   db.transaction(() => {
     db.exec(`
       CREATE TABLE IF NOT EXISTS keys (
@@ -1019,5 +1024,5 @@ export function ensureKeys(db: Database): void {
       CREATE INDEX IF NOT EXISTS keys_owner ON keys (owner);
     `);
     adoptLiveTokens(db);
-  })();
+  }).immediate();
 }

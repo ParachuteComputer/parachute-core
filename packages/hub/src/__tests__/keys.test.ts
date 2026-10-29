@@ -119,3 +119,43 @@ describe("keys: every live token becomes a key with the same scopes", () => {
   });
 });
 
+
+describe("keys: opening hub.db beside a running hub", () => {
+  // Every command opens hub.db, and every open adopts live tokens as keys. A read-then-write transaction loses to a
+  // writer that commits in between: SQLite answers "database is locked" at once, without waiting (seen in CI: the
+  // CLI's `auth mint-token` failed while serve wrote). The open must wait its turn instead.
+  test("adopting a token waits for another writer instead of failing with 'database is locked'", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "phub-keys-busy-"));
+    const path = hubDbPath(dir);
+    try {
+      const db = openHubDb(path);
+      db.prepare(
+        `INSERT INTO tokens (jti, user_id, client_id, scopes, expires_at, created_at, created_via, subject)
+         VALUES ('t-new', NULL, 'cli', 'vault:uni:read', ?, '2026-10-01T00:00:00.000Z', 'cli_mint', 'late')`,
+      ).run(FUTURE);
+      db.close();
+      // Another process: takes the write lock, writes, says so, holds it 600 ms, then commits.
+      const ready = join(dir, "ready");
+      const writer = Bun.spawn([process.execPath, "-e", `
+        const { Database } = require("bun:sqlite");
+        const db = new Database(${JSON.stringify(path)});
+        db.exec("PRAGMA busy_timeout = 5000");
+        db.exec("BEGIN IMMEDIATE");
+        db.exec("INSERT INTO schema_version (version, applied_at) SELECT 0, 'x' WHERE 0");
+        db.exec("UPDATE tokens SET subject = subject WHERE jti = 't-new'");
+        require("node:fs").writeFileSync(${JSON.stringify(ready)}, "1");
+        Bun.sleepSync(600);
+        db.exec("COMMIT");
+        db.close();
+      `], { stdout: "pipe", stderr: "pipe" });
+      while (!(await Bun.file(ready).exists())) await Bun.sleep(10);
+      let opened: ReturnType<typeof openHubDb> | undefined;
+      expect(() => (opened = openHubDb(path))).not.toThrow();
+      expect(listKeys(opened!).map((k) => k.name)).toEqual(["late"]);
+      opened!.close();
+      expect(await writer.exited).toBe(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
