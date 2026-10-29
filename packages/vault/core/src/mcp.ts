@@ -152,6 +152,32 @@ function structuredError(
   return Object.assign(new Error(message), fields);
 }
 
+const isNameList = (v: unknown): boolean => Array.isArray(v) && v.every((t) => typeof t === "string");
+
+/**
+ * `tags` must be a list of names (create-note), or a list / `{add, remove}`
+ * of lists (update-note). A bare string used to be iterated as characters —
+ * `tags: "meeting"` stored e, g, i, m, n, t (seen live on cloud, T-318) — so a
+ * wrong shape is refused before anything is written, with the fix in the
+ * message.
+ */
+function requireTagList(value: unknown, opts: { allowAddRemove: boolean }): void {
+  if (value === undefined || value === null || isNameList(value)) return;
+  if (opts.allowAddRemove && typeof value === "object" && !Array.isArray(value)) {
+    const op = value as { add?: unknown; remove?: unknown };
+    if ((op.add === undefined || isNameList(op.add)) && (op.remove === undefined || isNameList(op.remove))) return;
+  }
+  const example = typeof value === "string" ? JSON.stringify([value]) : '["meeting"]';
+  throw structuredError(`tags must be a list of tag names, e.g. ${example}${opts.allowAddRemove ? ' or {"add": ' + example + "}" : ""}`, {
+    error_type: "invalid_request",
+    field: "tags",
+    got: value,
+    hint: opts.allowAddRemove
+      ? "pass tags as an array of strings, or {add: [...], remove: [...]}"
+      : "pass tags as an array of strings",
+  });
+}
+
 function requireNoteReference(value: unknown): string {
   if (typeof value !== "string" || value.trim() === "") {
     throw structuredError("`id` is required", {
@@ -859,6 +885,14 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
         // in depth), but the wall makes it redundant for `near[]`.
         let nearScope: Set<string> | null = null;
         if (params.near) {
+          const nearIn = params.near as Record<string, unknown>;
+          if (typeof nearIn !== "object" || typeof nearIn.note_id !== "string" || nearIn.note_id.trim() === "") {
+            // The old connect-time hint taught `near: {id}`; say exactly what to send.
+            throw structuredError(
+              `near takes {note_id}, not ${"id" in Object(nearIn) ? "{id}" : JSON.stringify(nearIn)}: near: { note_id: "<id or path>", depth: 2 }`,
+              { error_type: "invalid_request", field: "near.note_id", hint: "put the anchor note's id or path in near.note_id, and depth inside near" },
+            );
+          }
           const near = params.near as { note_id: string } & linkOps.NearSpec;
           const nearErr = linkOps.validateNearSpec(near);
           if (nearErr) return { error: nearErr, error_type: "invalid_query" };
@@ -1474,6 +1508,8 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
         if (items.length > MAX_BATCH_SIZE) {
           throw new BatchTooLargeError(items.length);
         }
+        // Shape check on every item before any is written.
+        for (const item of items) requireTagList(item?.tags, { allowAddRemove: false });
 
         const created: Note[] = [];
         // Structured `links` are resolved in a SECOND pass, after every
@@ -1873,6 +1909,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
         // deep in updateNote (generic 500). Reject it up front, before any
         // item is written.
         for (const item of items) {
+          requireTagList(item?.tags, { allowAddRemove: true });
           if (item && item.if_updated_at !== undefined && !noteOps.isValidIfUpdatedAt(item.if_updated_at)) {
             throw new QueryError("if_updated_at must be an ISO-8601 timestamp string", "INVALID_REQUEST", {
               error_type: "invalid_request",
