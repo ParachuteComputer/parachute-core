@@ -27,6 +27,7 @@ import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { CONFIG_DIR } from "./config.ts";
+import { adoptLiveTokens } from "./keys.ts";
 
 export function hubDbPath(configDir: string = CONFIG_DIR): string {
   return join(configDir, "hub.db");
@@ -35,6 +36,8 @@ export function hubDbPath(configDir: string = CONFIG_DIR): string {
 interface Migration {
   version: number;
   sql: string;
+  /** Data work after `sql`, in the same transaction (v25 adopts every live token as a key). */
+  run?: (db: Database) => void;
 }
 
 const MIGRATIONS: readonly Migration[] = [
@@ -889,6 +892,42 @@ const MIGRATIONS: readonly Migration[] = [
       ALTER TABLE channel_vaults ADD COLUMN last_attempt_at TEXT;
     `,
   },
+  {
+    version: 25,
+    sql: `
+      -- Keys with scopes (T-318 design §2, revision 5; keys.ts). A key names,
+      -- owns and describes one row of the token registry; the token row stays
+      -- the one source of truth for signature, expiry and revocation, so a
+      -- key can never change how a token verifies.
+      --
+      --   name        unique, human: the token's label, app or owner
+      --   owner       users.id for a person's (or a person's agent's or app's)
+      --               key; the service name for a service key; NULL if unknown
+      --   owner_kind  person | agent | app | service
+      --   scopes      the token's scopes, verbatim
+      --   allow_tags  today's tag scope (permissions.scoped_tags), as an
+      --               explicit allow list, which behaves exactly as today
+      --   types       type scope (JSON array); NULL until keys scope by type
+      --   denies      explicit denies (JSON array, e.g. ["private"]); NULL until enforced
+      CREATE TABLE keys (
+        name TEXT PRIMARY KEY,
+        jti TEXT NOT NULL UNIQUE REFERENCES tokens(jti) ON DELETE CASCADE,
+        owner TEXT,
+        owner_kind TEXT NOT NULL CHECK (owner_kind IN ('person', 'agent', 'app', 'service')),
+        scopes TEXT NOT NULL,
+        allow_tags TEXT,
+        types TEXT,
+        denies TEXT,
+        created_via TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX keys_owner ON keys (owner);
+    `,
+    // Every unrevoked, unexpired, current token becomes a key with the same scopes (§2 migration).
+    run: (db) => {
+      adoptLiveTokens(db);
+    },
+  },
 ];
 
 /**
@@ -976,6 +1015,7 @@ export function migrate(db: Database): void {
     if (applied.has(m.version)) continue;
     db.transaction(() => {
       db.exec(m.sql);
+      m.run?.(db);
       insert.run(m.version, new Date().toISOString());
     })();
   }
