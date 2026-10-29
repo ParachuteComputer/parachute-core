@@ -9,6 +9,7 @@ import { generateMcpTools, resolveNote } from "../core/src/mcp.ts";
 import { projectHistoryProvenance } from "../core/src/history-visibility.js";
 import type { McpToolDef, GenerateMcpToolsOpts } from "../core/src/mcp.ts";
 import { MCP_TOOL_REFERENCE, acceptedParams } from "../core/src/mcp-manifest.ts";
+import { mergeTypesIntoTags } from "../core/src/tag-kind.ts";
 import { checkToolParams, NEW_TOOLS, TOOL_ALIASES, TOOL_ORDER, aliasDescription } from "../core/src/mcp-short.ts";
 import { getNote, getNoteTags, getVaultMap, getVaultStats } from "../core/src/notes.ts";
 import { narrowLinkWarningsForVisibility } from "../core/src/wikilinks.ts";
@@ -665,7 +666,7 @@ function applyTagScopeWrappers(
    * excludes nothing — again exactly a nonexistent tag). Aliases mirror
    * core's `exclude_tags ?? excludeTags ?? exclude_tag` resolution order.
    */
-  const QUERY_TAG_PARAMS = ["tag", "exclude_tags", "excludeTags", "exclude_tag"] as const;
+  const QUERY_TAG_PARAMS = ["tag", "type", "exclude_tags", "excludeTags", "exclude_tag"] as const;
   const scopeQueryTagParams = (params: any, allowed: Set<string> | null): any => {
     if (!params || typeof params !== "object") return params;
     let next = params;
@@ -945,7 +946,9 @@ function applyTagScopeWrappers(
     const items = Array.isArray((params as any).notes)
       ? (params as any).notes
       : [params];
-    for (const item of items) {
+    for (const raw of items) {
+      // T-318 §8a: `types` are memberships too; check them with the tags.
+      const item = mergeTypesIntoTags(raw as Record<string, unknown>, "create");
       const itemTags = Array.isArray((item as any).tags) ? ((item as any).tags as string[]) : [];
       if (!tagsWithinScope(itemTags, allowed, rawTags)) {
         return forbidden("create-note: every note must carry at least one tag in the token's allowlist");
@@ -970,7 +973,8 @@ function applyTagScopeWrappers(
     const items = Array.isArray((params as any).notes)
       ? (params as any).notes
       : [params];
-    for (const item of items) {
+    for (const raw of items) {
+      const item = mergeTypesIntoTags(raw as Record<string, unknown>, "update");
       const id = (item as any).id ?? (item as any).note_id;
       if (!id) continue;
       const existing = await store.getNote(id as string);

@@ -74,6 +74,7 @@ import {
   MAX_ATTACHMENT_IMAGE_BYTES,
   type AttachmentBytesProvider,
 } from "./attachment/bytes-provider.js";
+import { foldTypeFilter, holdTypes, markTypes, prepareCallTypes, refreshTypes, tagKinds } from "./tag-kind.js";
 
 /**
  * A single MCP tool-result content block. Mirrors the subset of the MCP SDK's
@@ -698,6 +699,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
     {
       name: "query-notes",
       execute: async (params) => {
+        params = foldTypeFilter(db, params);
         // --- Ambiguous-links scope split (vault#581 auth review) ---
         // `requestedHasAmbiguous` is what the caller asked for;
         // `sqlHasAmbiguous` is what is safe to push into SQL for a reader
@@ -2426,6 +2428,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           }
           return {
             name: singleTag,
+            kind: record?.kind ?? "tag",
             count: found?.count ?? 0,
             expanded_count: found?.expanded_count ?? 0,
             description: record?.description ?? null,
@@ -2437,7 +2440,8 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           };
         }
 
-        const tags = noteOps.listTags(db);
+        const kinds = tagKinds(db);
+        const tags = noteOps.listTags(db).map((t) => ({ ...t, kind: kinds.get(t.name) ?? "tag" }));
         if (params.include_schema) {
           const records = new Map(
             tagSchemaOps.listTagRecords(db).map((r) => [r.tag, r] as const),
@@ -2551,6 +2555,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           ...(fieldsPatch !== undefined ? { fields: fieldsPatch } : {}),
           ...(relationshipsPatch !== undefined ? { relationships: relationshipsPatch } : {}),
           ...(parentNamesPatch !== undefined ? { parent_names: parentNamesPatch } : {}),
+          ...(params.kind !== undefined ? { kind: params.kind as "type" | "tag" } : {}),
         });
 
         return result;
@@ -3006,6 +3011,27 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
       execute: impl.execute,
       ...(impl.resultContent ? { resultContent: impl.resultContent } : {}),
     });
+  }
+  // T-318 §8a: `types` on create-note / update-note. Validated and merged into the tags before the write; marked
+  // as types only after it succeeded, so a refused or rolled-back write (a batch included) leaves no type record.
+  for (const [name, mode] of [["create-note", "create"], ["update-note", "update"]] as const) {
+    const tool = tools.find((t) => t.name === name);
+    if (!tool) continue;
+    const execute = tool.execute;
+    tool.execute = async (params) => {
+      const batchTypes = Array.isArray(params.notes) && (params.notes as Record<string, unknown>[]).some((n) => n?.types !== undefined);
+      if (params.types === undefined && !batchTypes) return execute(params);
+      const prepared = prepareCallTypes(db, params, mode);
+      const release = holdTypes(db, prepared.types);
+      try {
+        const out = await execute(prepared.params);
+        if (!prepared.types.length) return out;
+        markTypes(db, prepared.types);
+        return refreshTypes(db, out);
+      } finally {
+        release();
+      }
+    };
   }
   // T-318 §4: `query-notes {path_between}` is find-path under its 0.9 name. Dispatched here so every runtime that
   // advertises it (core's manifest) answers it; the bun server wraps it again around its tag-scoped find-path.

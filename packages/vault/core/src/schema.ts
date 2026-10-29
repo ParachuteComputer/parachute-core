@@ -6,6 +6,7 @@ import { transaction } from "./txn.js";
 import { timestampToMs } from "./cursor.js";
 import { ensureRelationshipColumn } from "./wikilinks.js";
 import { rebuildCompactState } from "./history-compact-state.js";
+import { recordTagKinds } from "./tag-kind.js";
 
 export const SCHEMA_VERSION = 32;
 
@@ -17,6 +18,26 @@ function migrateToV32(db: Database): void {
     if (exists && (!previous || previous.version >= 32)) return;
     rebuildCompactState(db);
 }
+
+/**
+ * Types and tags (T-318 design §8a): every tag record carries a kind, `type`
+ * for a tag with fields or parent_names, `tag` for the rest (being named as a
+ * parent is read live, tag-kind.ts). Not a numbered migration on purpose: the
+ * column is additive and older code names the columns it writes, so a 0.7 or
+ * 0.8 vault opens this file unchanged. The 0.8 takeover then opens a home with
+ * no migration, and its code-only rollback still works (contracts:
+ * lifecycle/takeover). Run at every open, idempotently: the column if missing,
+ * then a kind for every row that has none (rows an older vault added in between
+ * included). No membership moves; note_tags is untouched.
+ */
+function ensureTagKinds(db: Database): void {
+  const added = !hasColumn(db, "tags", "kind");
+  if (added) db.exec("ALTER TABLE tags ADD COLUMN kind TEXT");
+  const counts = recordTagKinds(db);
+  const existing = (db.prepare("SELECT COUNT(*) AS n FROM notes").get() as { n: number }).n > 0;
+  if (added && existing) console.error(`[vault] tags now carry a kind (types and tags): ${counts.types} types, ${counts.tags} tags`);
+}
+
 
 /**
  * Deterministic last-resort epoch for a note whose `updated_at` AND
@@ -93,7 +114,11 @@ CREATE TABLE IF NOT EXISTS tags (
   relationships TEXT,
   parent_names TEXT,
   created_at TEXT,
-  updated_at TEXT
+  updated_at TEXT,
+  -- T-318 §8a: 'type' (fields, parents) or 'tag' (a flat label); NULL on a
+  -- row made implicitly by tagging, read by the same rule (tag-kind.ts).
+  -- Additive, with no schema number: see ensureTagKinds.
+  kind TEXT
 );
 
 -- Note-Tag join
@@ -770,6 +795,7 @@ export function initSchema(db: Database): void {
   migrateToV30(db);
   migrateToV31(db);
   migrateToV32(db);
+  ensureTagKinds(db);
 
   // Rebuild any generated columns + indexes declared in indexed_fields.
   // No-op for a fresh vault; idempotent on existing vaults.

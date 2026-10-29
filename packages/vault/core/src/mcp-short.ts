@@ -54,6 +54,7 @@ Rarer filters (has_links, order_by, expand_links, created_by, search_mode, …) 
     inputSchema: obj({
       id: str("One note by id, path or title"),
       tag: strs("Tag(s), subtypes included"),
+      type: strs("Type(s), subtypes included"),
       tag_match: { type: "string", enum: ["any", "all"], description: "With several tags: any (default) or all" },
       exclude_tags: strs("Leave out notes with these tags"),
       path: str("Exact path"),
@@ -107,6 +108,7 @@ Rarer filters (has_links, order_by, expand_links, created_by, search_mode, …) 
       content: str(),
       path: str('e.g. "Projects/Alder"'),
       tags: { type: "array", items: { type: "string" } },
+      types: { type: "array", items: { type: "string" }, description: "Types; land with the tags" },
       metadata: { type: "object" },
       links: LINKS,
       created_at: str("ISO timestamp, default now"),
@@ -130,6 +132,7 @@ Rarer filters (has_links, order_by, expand_links, created_by, search_mode, …) 
         content_edit: obj({ old_text: str(), new_text: str() }, ["old_text", "new_text"]),
         metadata: { type: "object" },
         tags: obj({ add: { type: "array", items: { type: "string" } }, remove: { type: "array", items: { type: "string" } } }),
+        types: { type: "object", description: "{add, remove}, as tags" },
         links: { type: "object", description: "{add: [{target, relationship?}], remove: [...]}" },
         path: str("Rename to"),
         if_updated_at: str(),
@@ -159,6 +162,7 @@ Rarer filters (has_links, order_by, expand_links, created_by, search_mode, …) 
         fields: { type: "object", description: '{name: {type: "string"|"integer"|"boolean"|"date"|…, enum?, indexed?, default?, strict?}}' },
         parent_names: { type: "array", items: { type: "string" } },
         relationships: { type: "object" },
+        kind: { type: "string", enum: ["type", "tag"] },
       },
       ["tag"],
     ),
@@ -302,11 +306,12 @@ export function checkToolParams(tool: string, params: Record<string, unknown>, a
 /** The tools 0.9 adds; each runs the old tools underneath (src/mcp-tools.ts). */
 export const NEW_TOOLS: Record<string, ShortTool & { folds: Record<string, string> }> = {
   "manage-types": {
-    description: `Change the vault's types and tags. \`action\`: update (default: create or change a tag, its \`fields\` and \`parent_names\`), rename {old_name, new_name}, merge {sources, target}, delete {tag, detach?}, prune (drop unused indexed columns; a dry run unless \`apply: true\`). ${HELP("manage-types")}`,
+    description: `Change the vault's types and tags. \`action\`: update (default: create or change one; \`fields\` and \`parent_names\` make it a type), rename {old_name, new_name}, merge {sources, target}, delete {tag, detach?}, prune (drop unused indexed columns; a dry run unless \`apply: true\`). ${HELP("manage-types")}`,
     inputSchema: obj(
       {
         action: { type: "string", enum: ["update", "rename", "merge", "delete", "prune"] },
         tag: str(),
+        kind: { type: "string", enum: ["type", "tag"], description: "type: has fields/parents; tag: a flat label" },
         description: str(),
         fields: { type: "object", description: '{name: {type: "string"|"integer"|"boolean"|"date"|…, enum?, indexed?, default?}}' },
         parent_names: { type: "array", items: { type: "string" } },

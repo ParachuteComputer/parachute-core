@@ -17,6 +17,7 @@ import { HistoryNotFoundError, latestTombstone } from "../core/src/history.js";
 import { projectHistoryProvenance } from "../core/src/history-visibility.js";
 import { isNoteIdShape } from "../core/src/ulid.js";
 import type { Database } from "bun:sqlite";
+import { holdTypes, markTypes, mergeTypesIntoTags, prepareCallTypes, refreshTypes } from "../core/src/tag-kind.ts";
 import type { Store, Note, QueryOpts, AggregateSpec } from "../core/src/types.ts";
 import { TAG_EXPAND_MODES, stripTagHash, suggestSimilarTag, type TagExpandMode } from "../core/src/tag-hierarchy.ts";
 import {
@@ -1433,8 +1434,20 @@ export async function handleNotes(
   writeCtx: WriteCtx = NO_WRITE_CTX,
 ): Promise<Response> {
   try {
-    return await handleNotesInner(req, store, subpath, vault, tagScope, writeCtx);
+    const res = await handleNotesInner(req, store, subpath, vault, tagScope, writeCtx);
+    const pending = PENDING_TYPES.get(req);
+    if (!pending) return res;
+    pending.release();
+    if (res.status >= 300) return res;
+    markTypes(store.db, pending.names);
+    // The body was built before the marking: read its notes' types again.
+    if (!(res.headers.get("content-type") ?? "").includes("application/json")) return res;
+    const body = refreshTypes(store.db, await res.json());
+    const headers = new Headers(res.headers);
+    headers.delete("content-length");
+    return new Response(JSON.stringify(body), { status: res.status, headers });
   } catch (e: any) {
+    PENDING_TYPES.get(req)?.release();
     const ambig = ambiguousPathResponse(e);
     if (ambig) return ambig;
     throw e;
@@ -2361,7 +2374,10 @@ async function handleNotesInner(
     if (method === "POST") {
       const parsedBody = await parseJsonBody(req);
       if (!parsedBody.ok) return parsedBody.response;
-      const body = parsedBody.body as any;
+      // T-318 §8a: `types` land in the one membership store with the tags.
+      const folded = foldRestTypes(store.db, req, parsedBody.body, "create", tagScope.raw === null ? null : (t) => tagVisibleInScope(t, tagScope.allowed, tagScope.raw));
+      if (folded instanceof Response) return folded;
+      const body = folded as any;
       // `notes` (when present) must actually be an array — otherwise
       // `items` below iterates whatever `body.notes` happens to be (e.g. a
       // STRING iterates as one-character items), silently creating a batch
@@ -3147,7 +3163,15 @@ async function handleNotesInner(
       // shape parsed the body only after the not-found check.
       const parsedBody = await parseJsonBody(req);
       if (!parsedBody.ok) return parsedBody.response;
-      const body = parsedBody.body as any;
+      // A tags array on PATCH is ignored on an existing note (and the if_missing create path takes {add} as well),
+      // so types go with tags: {add, remove}, or alone, on every branch; mixing them is refused, never dropped.
+      if ((parsedBody.body as any)?.types !== undefined && Array.isArray((parsedBody.body as any)?.tags)) {
+        return Response.json({ error: "send types with tags: {add, remove}, or alone", error_type: "tag_kind", field: "types", hint: "tags: {add: [...]}, types: {add: [...]}" }, { status: 400 });
+      }
+      // The URL names the note.
+      const folded = foldRestTypes(store.db, req, parsedBody.body, "update", tagScope.raw === null ? null : (t) => tagVisibleInScope(t, tagScope.allowed, tagScope.raw), true);
+      if (folded instanceof Response) return folded;
+      const body = folded as any;
       if (body.if_updated_at !== undefined && !isValidIfUpdatedAt(body.if_updated_at)) return invalidIfUpdatedAtResponse();
       const note = await resolveNote(store, idOrPath, scopeVisible);
       if (!note) {
@@ -4083,8 +4107,12 @@ export async function handleTags(
         ...(fieldsPatch !== undefined ? { fields: fieldsPatch } : {}),
         ...(relationshipsPatch !== undefined ? { relationships: relationshipsPatch } : {}),
         ...(parentNamesPatch !== undefined ? { parent_names: parentNamesPatch } : {}),
+        ...((body as { kind?: "type" | "tag" }).kind !== undefined ? { kind: (body as { kind?: "type" | "tag" }).kind } : {}),
       });
     } catch (err) {
+      if ((err as { error_type?: string })?.error_type === "tag_kind") {
+        return Response.json({ error: (err as Error).message, error_type: "tag_kind", field: (err as { field?: string }).field }, { status: 422 });
+      }
       if (err instanceof IndexedFieldError) {
         // Tag-scope scrub (vault#554 fold): declareField's cross-declarer
         // type-conflict message names the other declarer tag(s) + their
@@ -5374,3 +5402,40 @@ export async function handleHistoryCompact(req: Request, store: Store, tagScope:
     return json({ error: "Compaction failed", error_type: "compaction_failed", message: err instanceof Error ? err.message : String(err) }, 500);
   }
 }
+
+
+/**
+ * REST's half of "writes accept both" (T-318 §8a): fold a body's `types` (and
+ * each batch item's) into its tags, or answer 422 with the fix.
+ */
+function foldRestTypes(
+  db: Database,
+  req: Request,
+  body: unknown,
+  mode: "create" | "update",
+  visible: ((tag: string) => boolean) | null,
+  named = false,
+): unknown | Response {
+  if (!body || typeof body !== "object") return body;
+  try {
+    const merged = mergeTypesIntoTags(body as Record<string, unknown>, mode);
+    const notes = Array.isArray(merged.notes) ? (merged.notes as Record<string, unknown>[]).map((i) => mergeTypesIntoTags(i, mode)) : null;
+    // For a tag-scoped caller, a type outside its scope makes no record and reveals no kind: only the merge goes
+    // on, and the scope checks below refuse it. Otherwise types are validated now and marked once the write
+    // has succeeded (handleNotes), so a refused write makes nothing.
+    const added = [merged, ...(notes ?? [])].flatMap((i) => {
+      const t = i.tags as string[] | { add?: string[] } | undefined;
+      return Array.isArray(t) ? t : (t?.add ?? []);
+    });
+    if (visible && !added.every(visible)) return notes ? { ...merged, notes } : merged;
+    const prepared = prepareCallTypes(db, body as Record<string, unknown>, mode, { named });
+    if (prepared.types.length) PENDING_TYPES.set(req, { names: prepared.types, release: holdTypes(db, prepared.types) });
+    return prepared.params;
+  } catch (err) {
+    if ((err as { error_type?: string })?.error_type !== "tag_kind") throw err;
+    return Response.json({ error: (err as Error).message, error_type: "tag_kind", field: "types", hint: (err as { hint?: string }).hint }, { status: 422 });
+  }
+}
+
+/** Types a REST write named, marked once it succeeded (T-318 §8a). */
+const PENDING_TYPES = new WeakMap<Request, { names: string[]; release: () => void }>();
