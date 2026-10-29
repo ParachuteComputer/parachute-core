@@ -295,13 +295,27 @@ function specifiers(v: string): string | null {
   return out;
 }
 
-/** PARACHUTE_HOME in the user manager's own environment, which every unit inherits; null when systemd can't say. */
-function managerHome(): string | undefined | null {
+/**
+ * The user manager's own environment, which every unit inherits, as `systemctl --user show-environment` prints it
+ * (values as printed: one systemd had to quote reads `$'…'`); null when systemd can't say.
+ */
+function managerEnv(): Map<string, string> | null {
   const r = run(["systemctl", "--user", "show-environment"]);
   if (r.code !== 0) return null;
-  const line = r.stdout.split("\n").find((l) => l.startsWith("PARACHUTE_HOME="));
-  if (!line) return undefined;
-  const v = line.slice("PARACHUTE_HOME=".length);
+  const env = new Map<string, string>();
+  for (const line of r.stdout.split("\n")) {
+    const i = line.indexOf("=");
+    if (i > 0) env.set(line.slice(0, i), line.slice(i + 1));
+  }
+  return env;
+}
+
+/** PARACHUTE_HOME in the user manager's own environment, which every unit inherits; null when systemd can't say. */
+function managerHome(): string | undefined | null {
+  const env = managerEnv();
+  if (env === null) return null;
+  const v = env.get("PARACHUTE_HOME");
+  if (v === undefined) return undefined;
   return /[\\'"$]/.test(v) ? null : v;
 }
 
@@ -1348,10 +1362,13 @@ function unitEnvironment(unit: string): string[] {
 }
 
 /**
- * The environment v0.8 runs with once `from` is handed over, for the check run and the dry run: `base` (the caller's)
- * with the unit's environment over it, as parachute-core.service will carry it (unitEnv; an environment file's
- * assignments win over Environment=, as in systemd). Without it, a takeover run under `systemd-run --user` checked
- * v0.8 with the user manager's PATH, where the modules' programs (scribe in ~/.bun/bin) aren't (friends box, 10-29).
+ * The environment v0.8 runs with once `from` is handed over, for the check run and the dry run, built as systemd
+ * builds parachute-core.service's: the user manager's environment (managerEnv; a unit with no PATH of its own runs
+ * with the manager's), then the unit's own over it (unitEnv; an environment file's assignments win over
+ * Environment=). The caller's environment is only the ground under those (HOME, LANG, …, and anything systemd won't
+ * report). Without this, a takeover run under `systemd-run --user` checked v0.8 with the user manager's PATH, where
+ * the modules' programs (scribe in ~/.bun/bin) aren't, though the unit's PATH has them (friends box, 10-29); and one
+ * run from a shell would check with the shell's PATH what the unit runs with the manager's.
  * `unread`: environment files that exist but can't be read exactly (envFileVars), left out here; systemd still gives
  * them to the unit. No unit (a home a hand-run process served): the caller's environment, as it is.
  */
@@ -1360,6 +1377,8 @@ function handOverEnv(from: string | undefined, base: NodeJS.ProcessEnv = process
   for (const [k, v] of Object.entries(base)) if (v !== undefined) env[k] = v;
   const unread: string[] = [];
   if (!from) return { env, unread };
+  // A value systemd printed quoted ($'…', escapes) isn't decoded here: the caller's stays for that name.
+  for (const [k, v] of managerEnv() ?? []) if (!v.startsWith("$'")) env[k] = v;
   const { vars, files } = unitEnv(from);
   for (const kv of vars) {
     const i = kv.indexOf("=");

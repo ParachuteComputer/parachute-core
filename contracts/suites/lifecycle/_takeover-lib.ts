@@ -86,7 +86,8 @@ const FAKE_SYSTEMCTL = `#!/bin/sh
 #   clean environment and a session of its own (no terminal's hang-up reaches it), as STATE/<unit>.pid; stop ends
 #   it; is-active says "failed" once its process is gone; show names its MainPID. The seeded old units start that
 #   way too (the stock home starts the ones seeded as running).
-# - show prints a unit file's Environment= lines (systemd prints the assignments it would pass).
+# - show prints a unit file's Environment= lines (systemd prints the assignments it would pass); show-environment
+#   prints the environment every unit starts from (the manager's).
 STATE=__STATE__
 UNITS=__UNITS__
 # A unit gets the user manager's PATH, never the PATH of whoever called systemctl (a takeover's own bin/ is first on
@@ -142,7 +143,7 @@ stop_unit() {
 code=0
 case "$verb" in
   daemon-reload) exit 0 ;;
-  show-environment) exit 0 ;;
+  show-environment) printf 'HOME=%s\nLANG=C.UTF-8\nPATH=%s\nTMPDIR=%s\n' "$HOME" "$MANAGER_PATH" "$TMPDIR"; exit 0 ;;
   is-active) for u in $units; do if known "$u"; then s=$(st "$u" active); echo "$s"; [ "$s" = active ] || code=3; else echo inactive; code=3; fi; done; exit $code ;;
   is-enabled) for u in $units; do if known "$u"; then s=$(st "$u" enabled); echo "$s"; [ "$s" = enabled ] || code=1; else echo "Failed to get unit file state for $u: No such file or directory" >&2; code=1; fi; done; exit $code ;;
   start|stop|restart|enable|disable)

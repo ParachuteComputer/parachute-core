@@ -642,6 +642,19 @@ describe("takeover", () => {
     expect(await snapshot(m, true)).toEqual(before);
   }, 120_000);
 
+  test("a unit with no PATH of its own runs with the user manager's: the dry run looks modules' programs up there, not on the caller's PATH", async () => {
+    // The other way round from the friends box: run from a shell whose PATH has the program, for a unit that will
+    // run with the manager's PATH, which hasn't. The check would pass and parachute-core.service couldn't start it.
+    const { m } = await oldMachine("tk-mgrpath");
+    const shellBin = join(m.user, "shell-bin");
+    mkdirSync(shellBin);
+    writeFileSync(join(shellBin, "parachute-surface"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    register(m, [{ name: "parachute-surface", port: 1946, paths: ["/surface"], health: "/surface/healthz", version: "0.1.0" }]);
+    const dry = await core(m, ["takeover", "--home", m.home, "--dry-run", "--json"], { PATH: `${shellBin}:${m.env().PATH}` });
+    expect(json(dry, "takeover --dry-run --json").unfound).toEqual([{ name: "parachute-surface", command: "parachute-surface" }]);
+    expect(dry.stderr).toContain(`Warning: v0.8 won't find \`parachute-surface\` (parachute-surface) on the PATH it will run with (${HUB_UNIT}'s)`);
+  }, 120_000);
+
   test("when parachute-core.service can't serve (its port is taken), takeover puts everything back and exits 8", async () => {
     const { m, s } = await oldMachine("tk-unitfail");
     // Something else on the machine takes the hub's port as soon as the old hub lets go of it, so the unit's v0.8
