@@ -270,8 +270,9 @@ function needsQuote(s: string): boolean {
   // Booleans / null / numbers — would round-trip as a different type.
   if (s === "true" || s === "false" || s === "null") return true;
   if (/^-?\d+(\.\d+)?$/.test(s)) return true;
-  // YAML-meaningful starters.
-  if (/^[-?:&*!|>%@`#]/.test(s)) return true;
+  // YAML-meaningful starters, including the flow indicators and quotes: an
+  // unquoted `[[note]]` or `{x}` re-parses as a list or map (T-36).
+  if (/^[-?:&*!|>%@`#[\]{},'"]/.test(s)) return true;
   // Embedded `: ` (key/value separator) or `#` (comment) makes a plain
   // scalar ambiguous.
   if (s.includes(": ") || s.includes(" #")) return true;
