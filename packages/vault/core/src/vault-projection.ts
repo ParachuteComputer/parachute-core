@@ -500,7 +500,7 @@ export function projectionToMarkdown(args: {
   lines.push("## Scripting & automation (beyond this session)");
   lines.push("");
   lines.push(
-    `For a script or cron job, mint a key (\`parachute auth mint-token --scope vault:${vaultName}:read --ephemeral\`) and call the REST API; guide: https://parachute.computer/scripting/`,
+    `For a script or cron job, mint a key (\`parachute auth mint-token --scope vault:${vaultName}:read --ephemeral\`) and call the REST API at \`<hub-origin>/vault/${vaultName}/api/...\`; guide: https://parachute.computer/scripting/`,
   );
 
   return lines.join("\n");
