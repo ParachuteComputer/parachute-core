@@ -52,6 +52,7 @@ export interface KeyView {
 
 interface TokenRow {
   jti: string;
+  family_id: string | null;
   user_id: string | null;
   client_id: string | null;
   scopes: string;
@@ -100,7 +101,7 @@ function allowTags(permissions: string | null): string | null {
   }
 }
 
-const TOKEN_SELECT = `SELECT t.jti, t.user_id, t.client_id, t.scopes, t.permissions, t.created_via, t.subject, t.created_at, u.username
+const TOKEN_SELECT = `SELECT t.jti, t.family_id, t.user_id, t.client_id, t.scopes, t.permissions, t.created_via, t.subject, t.created_at, u.username
   FROM tokens t LEFT JOIN users u ON u.id = t.user_id`;
 
 function insertKey(db: Database, t: TokenRow): string {
@@ -148,7 +149,11 @@ export function adoptLiveTokens(db: Database, now: Date = new Date()): number {
        ORDER BY t.created_at, t.jti`,
     )
     .all(now.toISOString()) as TokenRow[];
-  for (const t of rows) insertKey(db, t);
+  // A refresh family keeps its one key: if an older hub rotated it, the key moves onto the new row.
+  for (const t of rows) {
+    if (t.family_id) adoptRefreshToken(db, t.jti, t.family_id);
+    else insertKey(db, t);
+  }
   return rows.length;
 }
 

@@ -86,6 +86,15 @@ describe("keys: every live token becomes a key with the same scopes", () => {
       const keys = listKeys(db);
       expect(keys).toHaveLength(1);
       expect((db.prepare("SELECT jti FROM keys").get() as { jti: string }).jti).toBe("r-2");
+      // An older hub (which knows nothing of keys) rotates the family; the next open moves the key, it doesn't add one.
+      db.prepare(
+        `INSERT INTO tokens (jti, user_id, client_id, scopes, refresh_token_hash, family_id, expires_at, created_at, created_via)
+         VALUES ('r-old-hub', ?, 'claude-app', 'vault:uni:write', 'h', ?, ?, ?, 'oauth_refresh')`,
+      ).run(user.id, first.familyId, FUTURE, new Date().toISOString());
+      db.prepare("UPDATE tokens SET rotated_to = 'r-old-hub' WHERE jti = 'r-2'").run();
+      migrate(db);
+      expect(listKeys(db).map((k) => [k.name, k.status])).toEqual([["claude-app", "active"]]);
+      expect((db.prepare("SELECT jti FROM keys").get() as { jti: string }).jti).toBe("r-old-hub");
       // A second app's family is a second key.
       signRefreshToken(db, { jti: "r-3", userId: user.id, clientId: "claude-app", scopes: ["vault:uni:read"] });
       expect(listKeys(db).map((k) => k.name).sort()).toEqual(["claude-app", "claude-app-2"]);
