@@ -15,6 +15,7 @@
       "tags": [
         "work"
       ],
+      "types": [],
       "broken_links": []
     },
     [],
@@ -32,6 +33,7 @@
         "tags": [
           "personal"
         ],
+        "types": [],
         "metadata": {},
         "byteSize": 12,
         "preview": "personal dup",
@@ -50,6 +52,7 @@
         "tags": [
           "work"
         ],
+        "types": [],
         "metadata": {},
         "byteSize": 11,
         "preview": "src [[Dup]]",
@@ -73,6 +76,7 @@
       "tags": [
         "work"
       ],
+      "types": [],
       "broken_links": []
     },
     [],
@@ -90,6 +94,7 @@
         "tags": [
           "personal"
         ],
+        "types": [],
         "metadata": {},
         "byteSize": 12,
         "preview": "personal dup",
@@ -108,6 +113,7 @@
         "tags": [
           "work"
         ],
+        "types": [],
         "metadata": {},
         "byteSize": 11,
         "preview": "src [[Dup]]",
