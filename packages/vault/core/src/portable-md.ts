@@ -1875,13 +1875,21 @@ export interface ImportEngineOptions {
   blowAway?: boolean;
   dryRun?: boolean;
   /**
-   * Awaited every {@link IMPORT_CHECKPOINT_NOTES} notes and every
-   * {@link IMPORT_CHECKPOINT_LINKS} typed links while the import replays. A
-   * Durable Object runs the whole replay as one implicit storage transaction
-   * unless the code yields to the event loop, and the platform resets the
-   * object when one storage operation runs past ~30 s (a 2,698-note vault
-   * needed ~33 s, T-318). Cloud passes a short timer here so the writes commit
-   * in chunks. Self-host passes nothing: its import stays one real transaction.
+   * Awaited while the import replays: after each wipe batch, every
+   * {@link IMPORT_CHECKPOINT_NOTES} notes and attachments, every
+   * {@link IMPORT_CHECKPOINT_LINKS} typed links, and every few hundred notes of
+   * the final wikilink pass. A Durable Object runs the whole replay as one
+   * implicit storage transaction unless the code yields to the event loop, and
+   * the platform resets the object when one storage operation runs past ~30 s
+   * (a 2,698-note vault needed ~33 s, T-318). Cloud passes a short timer here
+   * so the writes commit in chunks. Self-host passes nothing: its import stays
+   * one real transaction.
+   *
+   * The caller owns two consequences: other requests can run during each
+   * await, so it must keep every other writer and reader out until the import
+   * settles (cloud: the vault DO's import lock); and a failure part-way leaves
+   * the chunks already committed (cloud: the vault stays import-pending and a
+   * retry blow-away-replays it).
    */
   checkpoint?: () => Promise<void>;
 }
@@ -1978,6 +1986,8 @@ async function importVaultReplay(
         await store.deleteNote(note.id, { captureHistory: false });
         stats.notes_wiped++;
       }
+      // A retry into a half-imported vault wipes thousands of notes: chunk it too.
+      if (opts.checkpoint) await opts.checkpoint();
     }
     // Clear tag rows too — `deleteNote` clears note_tags via FK cascade but
     // leaves the `tags` table rows in place (orphaned schemas). `cascade:
@@ -2359,9 +2369,14 @@ async function importVaultReplay(
   // 5. Attachments — DB row then file copy (when the source has attachments
   // enabled). Skip the file-copy phase when it isn't; the DB row still
   // restores so callers operating without an assetsDir keep parity.
+  let attachmentsSinceCheckpoint = 0;
   for (const [noteId, portable] of seenNotes) {
     if (!portable.attachments) continue;
     for (const att of portable.attachments) {
+      if (opts.checkpoint && ++attachmentsSinceCheckpoint >= IMPORT_CHECKPOINT_NOTES) {
+        attachmentsSinceCheckpoint = 0;
+        await opts.checkpoint();
+      }
       if (opts.dryRun) {
         stats.attachments_restored++;
         continue;
@@ -2399,7 +2414,7 @@ async function importVaultReplay(
   // 6. Sync wikilinks across the imported set so `[[brackets]]` in content
   // rebuild link rows for the imported notes.
   if (!opts.dryRun) {
-    await store.syncAllWikilinks();
+    await store.syncAllWikilinks(opts.checkpoint ? { checkpoint: opts.checkpoint } : undefined);
   }
 
   // 7. Re-declare indexed fields (belt-and-suspenders + authoritative count).

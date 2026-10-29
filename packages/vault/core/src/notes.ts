@@ -251,14 +251,47 @@ export function findNotesByTitle(db: Database, title: string): { id: string; pat
   return matches;
 }
 
+/** A basename candidate, with what the SQL orders it by. */
+interface PathHit {
+  id: string;
+  path: string;
+  extension: string | null;
+}
+
+/** One note as the index reads it. */
+export interface IndexedNoteRow {
+  id: string;
+  path: string | null;
+  extension: string | null;
+  content: string;
+}
+
+/** BINARY collation: UTF-8 byte order, which is code point order (not JS's UTF-16 order). */
+function compareBinary(a: string | null, b: string | null): number {
+  if (a === b) return 0;
+  if (a === null) return -1;
+  if (b === null) return 1;
+  const ai = a[Symbol.iterator]();
+  const bi = b[Symbol.iterator]();
+  for (;;) {
+    const x = ai.next();
+    const y = bi.next();
+    if (x.done || y.done) return x.done ? (y.done ? 0 : -1) : 1;
+    const d = x.value.codePointAt(0)! - y.value.codePointAt(0)!;
+    if (d !== 0) return d;
+  }
+}
+
 /** Lookup indexes active for a database while {@link withTitleIndex} runs. */
 interface ResolutionIndex {
+  /** Every note, in table order: bulk passes iterate these instead of loading the notes again. */
+  rows: IndexedNoteRow[];
   /** Lowercased H1 title -> notes carrying it (findNotesByTitle). */
   titles: Map<string, { id: string; path: string | null }[]>;
   /** ASCII-lowercased path -> notes (the `path = ? COLLATE NOCASE` arm of the basename lookup). */
-  paths: Map<string, { id: string; path: string }[]>;
+  paths: Map<string, PathHit[]>;
   /** ASCII-lowercased "/suffix" at every "/" in a path -> notes (the `lower(substr(path, -n))` arm). */
-  suffixes: Map<string, { id: string; path: string }[]>;
+  suffixes: Map<string, PathHit[]>;
 }
 const resolutionIndexes = new WeakMap<Database, ResolutionIndex>();
 
@@ -273,6 +306,24 @@ function pushTo<V>(map: Map<string, V[]>, key: string, v: V): void {
   else map.set(key, [v]);
 }
 
+function buildResolutionIndex(db: Database): ResolutionIndex {
+  const rows = db.prepare("SELECT id, path, extension, content FROM notes").all() as IndexedNoteRow[];
+  const index: ResolutionIndex = { rows, titles: new Map(), paths: new Map(), suffixes: new Map() };
+  for (const row of rows) {
+    const h1 = extractH1Title(row.content);
+    if (h1) pushTo(index.titles, h1.toLowerCase(), { id: row.id, path: row.path });
+    if (row.path !== null) {
+      const hit = { id: row.id, path: row.path, extension: row.extension };
+      const lower = asciiLower(row.path);
+      pushTo(index.paths, lower, hit);
+      for (let i = lower.indexOf("/"); i !== -1; i = lower.indexOf("/", i + 1)) {
+        pushTo(index.suffixes, lower.slice(i), hit);
+      }
+    }
+  }
+  return index;
+}
+
 /**
  * Run `fn` with wikilink resolution's two full-table lookups — the H1-title
  * fallback ({@link findNotesByTitle}) and the basename match
@@ -283,27 +334,34 @@ function pushTo<V>(map: Map<string, V[]>, key: string, v: V): void {
  * content once per wikilink that missed on id and path: quadratic in the
  * vault, past the Durable Object's limits for a 2,700-note vault (T-318).
  * The indexes apply the same matching rules as the SQL they replace, so the
- * answers are identical. Nested calls reuse the outer index.
+ * answers are identical, in the same order. `fn` gets the rows the index read
+ * (every note, table order). Nested calls reuse the outer index.
  */
-export function withTitleIndex<T>(db: Database, fn: () => T): T {
-  if (resolutionIndexes.has(db)) return fn();
-  const index: ResolutionIndex = { titles: new Map(), paths: new Map(), suffixes: new Map() };
-  const rows = db.prepare("SELECT id, path, content FROM notes").all() as { id: string; path: string | null; content: string }[];
-  for (const row of rows) {
-    const h1 = extractH1Title(row.content);
-    if (h1) pushTo(index.titles, h1.toLowerCase(), { id: row.id, path: row.path });
-    if (row.path !== null) {
-      const hit = { id: row.id, path: row.path };
-      const lower = asciiLower(row.path);
-      pushTo(index.paths, lower, hit);
-      for (let i = lower.indexOf("/"); i !== -1; i = lower.indexOf("/", i + 1)) {
-        pushTo(index.suffixes, lower.slice(i), hit);
-      }
-    }
-  }
+export function withTitleIndex<T>(db: Database, fn: (rows: IndexedNoteRow[]) => T): T {
+  const outer = resolutionIndexes.get(db);
+  if (outer) return fn(outer.rows);
+  const index = buildResolutionIndex(db);
   resolutionIndexes.set(db, index);
   try {
-    return fn();
+    return fn(index.rows);
+  } finally {
+    resolutionIndexes.delete(db);
+  }
+}
+
+/**
+ * {@link withTitleIndex} for a pass that awaits (an import checkpoint). The
+ * index stays active across those awaits, so the caller must make sure no
+ * note is created, edited or deleted on this database until it settles: on
+ * cloud the vault refuses other requests while an import runs.
+ */
+export async function withTitleIndexAsync<T>(db: Database, fn: (rows: IndexedNoteRow[]) => Promise<T>): Promise<T> {
+  const outer = resolutionIndexes.get(db);
+  if (outer) return fn(outer.rows);
+  const index = buildResolutionIndex(db);
+  resolutionIndexes.set(db, index);
+  try {
+    return await fn(index.rows);
   } finally {
     resolutionIndexes.delete(db);
   }
@@ -311,8 +369,11 @@ export function withTitleIndex<T>(db: Database, fn: () => T): T {
 
 /**
  * Basename match for wikilink resolution: notes whose path equals `target`
- * (NOCASE) or ends with `/target` (ASCII case-insensitive). One row per note,
- * in table order. Indexed inside {@link withTitleIndex}; a scan otherwise.
+ * (NOCASE) or ends with `/target` (ASCII case-insensitive). One row per note.
+ * SQLite answers from the `(path, extension)` unique index, so rows come in
+ * that order; the indexed form inside {@link withTitleIndex} sorts the same
+ * way. (Only ambiguous candidate lists show the order; stored rows keep only
+ * the count.)
  */
 export function findNotesByBasename(db: Database, target: string): { id: string; path: string }[] {
   const index = resolutionIndexes.get(db);
@@ -327,15 +388,13 @@ export function findNotesByBasename(db: Database, target: string): { id: string;
     `).all(target, `/${target}`, `/${target}`) as { id: string; path: string }[];
   }
   const key = asciiLower(target);
-  const seen = new Set<string>();
-  const out: { id: string; path: string }[] = [];
+  const byId = new Map<string, PathHit>();
   for (const hit of [...(index.paths.get(key) ?? []), ...(index.suffixes.get(`/${key}`) ?? [])]) {
-    if (!seen.has(hit.id)) {
-      seen.add(hit.id);
-      out.push(hit);
-    }
+    if (!byId.has(hit.id)) byId.set(hit.id, hit);
   }
-  return out;
+  return [...byId.values()]
+    .sort((a, b) => compareBinary(a.path, b.path) || compareBinary(a.extension, b.extension))
+    .map(({ id, path }) => ({ id, path }));
 }
 
 /**

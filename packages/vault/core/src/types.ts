@@ -518,7 +518,8 @@ export interface Store {
    * after bulk-imports to rebuild link rows from `[[brackets]]` in
    * content. Returns counts for caller logging.
    */
-  syncAllWikilinks(): Promise<{ synced: number; totalAdded: number; totalRemoved: number }>;
+  /** `checkpoint`: awaited every few hundred notes (cloud import chunking; see ImportEngineOptions.checkpoint). */
+  syncAllWikilinks(opts?: { checkpoint?: () => Promise<void> }): Promise<{ synced: number; totalAdded: number; totalRemoved: number }>;
   /** vault#524: deletion captures a tombstone unless a blow-away import opts out. */
   deleteNote(id: string, opts?: { actor?: string | null; via?: string | null; captureHistory?: boolean }): Promise<void>;
   listNoteVersions(id: string, opts?: { limit?: number; offset?: number }): Promise<VersionRow[]>;

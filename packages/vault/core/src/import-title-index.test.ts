@@ -19,16 +19,18 @@ import { join } from "path";
 import { tmpdir } from "os";
 import { SqliteStore } from "./store.js";
 import { importPortableVault, importVault, IMPORT_CHECKPOINT_NOTES } from "./portable-md.js";
-import { syncWikilinks } from "./wikilinks.js";
+import { syncWikilinks, resolveWikilinkDetailed } from "./wikilinks.js";
+import { withTitleIndex } from "./notes.js";
 
-const SCAN = "SELECT id, path, content FROM notes";
+/** The H1-title lookup's scan, and the one scan that builds the index. */
+const SCANS = new Set(["SELECT id, path, content FROM notes", "SELECT id, path, extension, content FROM notes"]);
 
 /** Count full-content scans on this connection (the H1-title lookup's query). */
 function countScans(db: Database): { scans: number } {
   const counter = { scans: 0 };
   const prepare = db.prepare.bind(db);
   (db as unknown as { prepare: typeof db.prepare }).prepare = ((sql: string, ...rest: unknown[]) => {
-    if (sql.trim() === SCAN) counter.scans++;
+    if (SCANS.has(sql.trim())) counter.scans++;
     return (prepare as (s: string, ...r: unknown[]) => ReturnType<typeof db.prepare>)(sql, ...rest);
   }) as typeof db.prepare;
   return counter;
@@ -135,7 +137,57 @@ describe("portable-md import: wikilink title fallback (T-318)", () => {
         await new Promise((r) => setTimeout(r, 0));
       },
     });
-    expect(calls).toBe(2);
+    // 2 in the notes loop (at 200 and 400) + 2 in the final wikilink pass.
+    expect(calls).toBe(4);
     expect(snapshot(chunkDb)).toBe(snapshot(plainDb));
+
+    // A retry into the now-full vault also chunks its wipe (one 500-note batch).
+    calls = 0;
+    await importVault(new SqliteStore(chunkDb), new FsImportSource({ inDir: dir }), {
+      blowAway: true,
+      checkpoint: async () => {
+        calls++;
+        await new Promise((r) => setTimeout(r, 0));
+      },
+    });
+    expect(calls).toBe(5);
+    expect(snapshot(chunkDb)).toBe(snapshot(plainDb));
+  });
+});
+
+describe("withTitleIndex answers exactly like the SQL it replaces (T-318)", () => {
+  it("same resolution, candidates and order for odd paths and titles", async () => {
+    const db = new Database(":memory:");
+    const store = new SqliteStore(db);
+    // Insertion order matters: the SQL returns table order, so a suffix match
+    // inserted before a whole-path match must stay first.
+    const notes: Array<[string | undefined, string]> = [
+      ["z/readme", "# Shared title"],
+      ["README", "# shared TITLE"],
+      ["Projects/Parachute/Plan", "plan"],
+      ["Archive/parachute/plan", "old plan"],
+      ["Café/Été", "# Über Notes"],
+      ["café/ÉTÉ", "x"],
+      ["docs/a/b/c", "deep"],
+      ["other/B/C", "deep too"],
+      [undefined, "# Pathless Title"],
+      ["MiXeD/Case", "# Ünïcode Heading"],
+      ["solo/unique-name", "# Only One"],
+    ];
+    for (const [path, content] of notes) await store.createNote(content, path ? { path } : {});
+    // Same path, two extensions: the SQL orders these by extension.
+    await store.createNote("md body", { path: "x/dup/readme" });
+    await store.createNote("csv body", { path: "x/dup/readme", extension: "csv" });
+
+    const targets = [
+      "readme", "README", "plan", "Parachute/Plan", "parachute/plan", "Été", "été", "ÉTÉ", "Café/Été",
+      "b/c", "B/C", "a/b/c", "c", "Shared title", "shared title", "Pathless Title", "über notes",
+      "Über Notes", "ünïcode heading", "case", "CASE", "unique-name", "Only One", "nobody", "MiXeD/Case", "dup/readme",
+    ];
+    const plain = targets.map((t) => resolveWikilinkDetailed(db, t));
+    const indexed = withTitleIndex(db, () => targets.map((t) => resolveWikilinkDetailed(db, t)));
+    expect(indexed).toEqual(plain);
+    // The fixture really exercises ambiguity with more than one candidate.
+    expect(plain.filter((r) => r.ambiguous && r.candidates.length > 1).length).toBeGreaterThanOrEqual(3);
   });
 });

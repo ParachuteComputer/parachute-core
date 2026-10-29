@@ -101,6 +101,9 @@ function setsEqual(a: Set<string>, b: Set<string>): boolean {
  * synchronous; the public Store API is async so the same interface
  * can back an async runtime (e.g. Cloudflare Durable Objects SQLite).
  */
+/** Notes per checkpoint in {@link BunSqliteStore.syncAllWikilinks}. */
+export const SYNC_ALL_WIKILINKS_CHECKPOINT = 200;
+
 export class BunSqliteStore implements Store {
   public readonly hooks: HookRegistry;
   private readonly historyPolicy: HistoryPolicy;
@@ -1746,17 +1749,27 @@ export class BunSqliteStore implements Store {
   /**
    * Sync wikilinks for all notes in the vault.
    * Efficient for bulk imports — call once after importing all notes.
+   *
+   * `opts.checkpoint` is awaited every {@link SYNC_ALL_WIKILINKS_CHECKPOINT}
+   * notes (the cloud import passes one so its writes commit in chunks; see
+   * ImportEngineOptions.checkpoint). Nothing else may write notes on this
+   * database until the returned promise settles.
    */
-  async syncAllWikilinks(): Promise<{ synced: number; totalAdded: number; totalRemoved: number }> {
-    const allNotes = noteOps.queryNotes(this.db, { limit: 1000000 });
+  async syncAllWikilinks(opts?: { checkpoint?: () => Promise<void> }): Promise<{ synced: number; totalAdded: number; totalRemoved: number }> {
     let synced = 0;
     let totalAdded = 0;
     let totalRemoved = 0;
 
     // One H1-title index for the whole pass: this loop writes only link rows,
-    // so titles can't change under it (see withTitleIndex).
-    noteOps.withTitleIndex(this.db, () => {
-      for (const note of allNotes) {
+    // so titles can't change under it (see withTitleIndex). It also hands us
+    // every note's id and content, so the notes are read once, not twice.
+    await noteOps.withTitleIndexAsync(this.db, async (rows) => {
+      let sinceCheckpoint = 0;
+      for (const note of rows) {
+        if (opts?.checkpoint && ++sinceCheckpoint >= SYNC_ALL_WIKILINKS_CHECKPOINT) {
+          sinceCheckpoint = 0;
+          await opts.checkpoint();
+        }
         if (!note.content) continue;
         const result = syncWikilinks(this.db, note.id, note.content);
         if (result.added > 0 || result.removed > 0) {
