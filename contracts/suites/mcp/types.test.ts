@@ -85,8 +85,13 @@ describe("mcp/types", () => {
     const made = await scoped.call("create-note", { path: runId("w"), content: "w", tags: [work], types: [secret] }).catch((e) => e);
     expect(JSON.stringify(made)).toMatch(/tag_scope_violation|Forbidden|allowlist/);
     const ghost = runId("ghost");
-    const batch = await scoped.call("create-note", { notes: [{ path: runId("b"), content: "b", tags: [work] }], types: [ghost] }).catch((e) => e);
-    expect(JSON.stringify(batch)).toMatch(/inside each note of a batch/);
+    const batch = await scoped.call("create-note", { notes: [{ path: runId("b"), content: "b", tags: [work] }], types: [ghost] }).catch((e) => String(e));
+    expect(batch).toMatch(/inside each note of a batch/);
+    expect((await c.call("list-tags", { tag: ghost })).error_type).toBe("tag_not_found");
+    // An update naming no note makes nothing and says the same for a hidden tag and an absent name.
+    const noIdHidden = await scoped.call("update-note", { types: { add: [secret] }, force: true }).catch((e) => String(e));
+    const noIdGhost = await scoped.call("update-note", { types: { add: [ghost] }, force: true }).catch((e) => String(e));
+    expect(noIdHidden.replace(secret, "X")).toBe(noIdGhost.replace(ghost, "X"));
     expect((await c.call("list-tags", { tag: ghost })).error_type).toBe("tag_not_found");
     const upd = await scoped.call("update-note", { id: sharedId, types: { remove: [secret] }, force: true }).catch((e) => e);
     expect(JSON.stringify(upd)).toMatch(/tag_scope_violation|Forbidden|allowlist/);

@@ -188,6 +188,9 @@ export function foldTypeFilter(db: Database, params: Record<string, unknown>): R
 export function foldTypesIntoTags(db: Database, item: Record<string, unknown>, mode: "create" | "update"): Record<string, unknown> {
   if (!item || item.types === undefined) return item;
   assertNoBatchLevelTypes(item);
+  // An update with no note named makes nothing: the write is refused for the missing id, and nothing
+  // about a type (or a hidden tag's kind) is created or revealed on the way there.
+  if (mode === "update" && item.id === undefined && item.note_id === undefined) return mergeTypesIntoTags(item, mode);
   ensureTypes(db, typesAdded(item, mode));
   return mergeTypesIntoTags(item, mode);
 }
