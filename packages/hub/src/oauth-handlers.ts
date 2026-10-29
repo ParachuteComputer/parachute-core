@@ -785,9 +785,28 @@ function clientIdLogPrefix(clientId: string): string {
   return head && /^[A-Za-z0-9_-]+$/.test(head) ? head : "?";
 }
 
-/** An error_description a log may carry: fixed phrases only (no quotes, slashes or URLs). */
+/** The token endpoint's fixed error descriptions; any other (they can carry scopes, names or URLs) isn't logged. */
+const LOGGABLE_TOKEN_ERRORS = new Set([
+  "body must be JSON",
+  "client_id mismatch",
+  "client is registered but has not been approved by the hub operator (#74)",
+  "code already redeemed",
+  "code expired",
+  "code not found",
+  "code_verifier mismatch",
+  "missing required parameter",
+  "redirect_uri mismatch",
+  "refresh_token expired",
+  "refresh_token has no associated user",
+  "refresh_token not found",
+  "refresh_token revoked",
+  "refresh_token rotation conflict",
+  "unknown client_id",
+]);
+
+/** An error_description a log may carry: one of the fixed phrases above, else nothing. */
 function safeErrorDescription(d: unknown): string | null {
-  return typeof d === "string" && /^[A-Za-z0-9 _.,:()#-]{1,120}$/.test(d) ? d : null;
+  return typeof d === "string" && LOGGABLE_TOKEN_ERRORS.has(d) ? d : null;
 }
 
 /**

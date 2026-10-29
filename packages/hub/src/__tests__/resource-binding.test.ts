@@ -304,4 +304,17 @@ describe("resourceLogShape", () => {
     expect(resourceLogShape(null)).toBe("none");
     expect(resourceLogShape("not a url")).toBe("malformed");
   });
+
+  test("whatever else the resource carries stays out of the log: other paths, other schemes", () => {
+    expect(resourceLogShape("https://hub.example/mcp/SECRET")).toBe("https://hub.example<other-path>");
+    expect(resourceLogShape("https://hub.example/vault/jon/mcp/SECRET")).toBe("https://hub.example<other-path>");
+    expect(resourceLogShape("https://hub.example/SECRET")).toBe("https://hub.example<other-path>");
+    expect(resourceLogShape("data:text/plain,SECRET")).toBe("<other-scheme>");
+    expect(resourceLogShape("https://user:SECRET@hub.example/mcp")).toBe("https://hub.example/mcp");
+    expect(resourceLogShape("http://hub.example/vault/jon/.well-known/oauth-protected-resource")).toBe(
+      "http://hub.example/vault/<v>/.well-known/oauth-protected-resource",
+    );
+    for (const r of ["https://hub.example/mcp/SECRET", "data:text/plain,SECRET", "https://user:SECRET@hub.example/mcp"])
+      expect(resourceLogShape(r)).not.toContain("SECRET");
+  });
 });

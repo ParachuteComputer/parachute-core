@@ -9929,6 +9929,21 @@ describe("RFC 8707 resource binding — vault-bound MCP (fix #461)", () => {
       ]);
       expect(strict[0]).not.toContain(strictFlow.code);
       expect(strict[0]).not.toContain(strictFlow.verifier);
+
+      // A description built from the request (here it would quote the grant_type) is left out; only the fixed
+      // phrases are logged.
+      const odd = await warnLines(async () => {
+        res = await handleToken(
+          flow.db,
+          resourceTokenRequest(new URLSearchParams({ grant_type: "password", client_id: flow.clientId, username: "SECRETUSER" })),
+          RESOURCE_DEPS,
+        );
+      });
+      expect(res?.status).toBe(400);
+      expect(((await res!.json()) as { error_description: string }).error_description).toContain("password");
+      expect(odd).toEqual([
+        `[oauth] /oauth/token refused: grant_type=password status=400 error=unsupported_grant_type client=${flow.clientId.slice(0, 6)} resource=none`,
+      ]);
     } finally {
       flow.cleanup();
       strictFlow.cleanup();

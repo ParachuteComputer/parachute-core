@@ -326,9 +326,11 @@ function isLoopbackHostname(hostname: string): boolean {
 }
 
 /**
- * A `resource` as a log may show it: scheme, host and path shape, with the vault name replaced by `<v>`
- * (vault names are often people's names). The query and fragment are dropped (`?…`), the path is cut at 80
- * characters. `none` when absent, `malformed` when it doesn't parse. Never the value itself.
+ * A `resource` as a log may show it: the scheme (http/https only), the host, and the path as one of a few fixed
+ * templates with the vault name replaced (`/vault/<v>/mcp`, `/vault/<v>/.well-known/oauth-protected-resource`, `/mcp`,
+ * `/`), else `<other-path>`. A query or fragment shows as `?…`. `none` when absent, `malformed` when it doesn't
+ * parse, `<other-scheme>` for anything but http(s). Never the value itself: a resource may carry anything, and the
+ * refresh path logs the unmatched ones on purpose.
  */
 export function resourceLogShape(resource: string | null | undefined): string {
   if (!resource) return "none";
@@ -338,7 +340,13 @@ export function resourceLogShape(resource: string | null | undefined): string {
   } catch {
     return "malformed";
   }
-  const path = u.pathname.replace(/^\/vault\/[^/]+/, "/vault/<v>");
-  const cut = path.length > 80 ? `${path.slice(0, 80)}…` : path;
-  return `${u.protocol}//${u.host}${cut}${u.search || u.hash ? "?…" : ""}`;
+  if (u.protocol !== "http:" && u.protocol !== "https:") return "<other-scheme>";
+  const host = /^[A-Za-z0-9.\-\[\]:]{1,100}$/.test(u.host) ? u.host : "<host>";
+  const p = u.pathname;
+  let path = "<other-path>";
+  if (VAULT_MCP_PATH_RE.test(p)) path = `/vault/<v>/mcp${p.endsWith("/") ? "/" : ""}`;
+  else if (VAULT_PRM_PATH_RE.test(p)) path = "/vault/<v>/.well-known/oauth-protected-resource";
+  else if (ROOT_MCP_PATH_RE.test(p)) path = `/mcp${p.endsWith("/") ? "/" : ""}`;
+  else if (p === "/") path = "/";
+  return `${u.protocol}//${host}${path}${u.search || u.hash ? "?…" : ""}`;
 }
