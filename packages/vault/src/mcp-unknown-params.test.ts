@@ -142,6 +142,37 @@ describe("unknown parameters are ignored, as on 0.8, with a warning and a counte
     await expect(tool("query-notes")({ near: { id: "a/one" } })).rejects.toThrow(/near takes \{note_id\}, not \{id\}/);
   });
 
+  test("manage-types names a parameter the action called doesn't take", async () => {
+    await seed();
+    const log = captureStderr();
+    let r: any;
+    try {
+      r = await tool("manage-types")({ action: "rename", old_name: "alpha", new_name: "gamma", fields: { x: { type: "string" } } });
+    } finally {
+      log.restore();
+    }
+    expect((r.warnings ?? []).map((w: any) => w.field)).toEqual(["fields"]);
+    // ...and the update action, which does take `fields` and `kind`, is not warned about them.
+    const u = await tool("manage-types")({ tag: "delta", fields: { y: { type: "string" } }, kind: "type" });
+    expect((u.warnings ?? []).filter((w: any) => w.code === "unknown_parameter")).toEqual([]);
+  });
+
+  test("the log can't be forged or flooded by caller-chosen names", async () => {
+    const log = captureStderr();
+    try {
+      await tool("query-notes")({ "zz_forge\n[mcp] fake line": 1, limit: 1 });
+      for (let i = 0; i < 15; i++) await tool("query-notes")({ zz_rate_probe: i, limit: 1 });
+      for (let i = 0; i < 300; i++) await tool("list-tags")({ [`zz_card_${i}`]: 1 });
+    } finally {
+      log.restore();
+    }
+    expect(log.lines.every((l) => !l.includes("\n"))).toBe(true);
+    expect(log.lines.filter((l) => l.includes("zz_rate_probe"))).toHaveLength(10);
+    const distinct = new Set(log.lines.filter((l) => l.includes("list-tags.")).map((l) => /list-tags\.(\S+)/.exec(l)![1]));
+    expect(distinct.size).toBeLessThanOrEqual(257);
+    expect(distinct.has("<other>")).toBe(true);
+  });
+
   test("`vault` and `_`-names are never warned about", async () => {
     const r = await tool("query-notes")({ vault: VAULT, _client: "x", limit: 1 });
     expect((r.warnings ?? []).filter((w: any) => w.code === "unknown_parameter")).toEqual([]);

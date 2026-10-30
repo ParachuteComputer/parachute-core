@@ -10,7 +10,7 @@ import { projectHistoryProvenance } from "../core/src/history-visibility.js";
 import type { McpToolDef, GenerateMcpToolsOpts } from "../core/src/mcp.ts";
 import { MCP_TOOL_REFERENCE, acceptedParams } from "../core/src/mcp-manifest.ts";
 import { mergeTypesIntoTags } from "../core/src/tag-kind.ts";
-import { nestedParamProblem, NEW_TOOLS, TOOL_ALIASES, TOOL_ORDER, aliasDescription, unknownParams, type ParamProblem } from "../core/src/mcp-short.ts";
+import { nestedParamProblem, NEW_TOOLS, SHORT_TOOLS, TOOL_ALIASES, TOOL_ORDER, aliasDescription, unknownParams, type ParamProblem } from "../core/src/mcp-short.ts";
 import { getNote, getNoteTags, getVaultMap, getVaultStats } from "../core/src/notes.ts";
 import { narrowLinkWarningsForVisibility } from "../core/src/wikilinks.ts";
 import type { Note } from "../core/src/types.ts";
@@ -446,6 +446,24 @@ const VERB_RANK: Record<string, number> = { read: 0, write: 1, admin: 2 };
 
 /** Ignored unknown parameters so far, per `tool.param`, in this process (the counted log line). */
 const unknownParamCounts = new Map<string, number>();
+/** Distinct `tool.param` names counted one by one; past this, a tool's further new names count as `tool.<other>`. */
+const UNKNOWN_PARAM_KEYS_MAX = 256;
+
+/** Count one ignored name and log it: every one of the first 10 per name, then every 100th (the count says how many). */
+function countUnknownParam(tool: string, field: string): void {
+  // Caller-chosen text: never let it forge a line or grow without bound.
+  const name = field.replace(/[^\w.-]/g, "?").slice(0, 64);
+  let key = `${tool}.${name}`;
+  if (!unknownParamCounts.has(key) && unknownParamCounts.size >= UNKNOWN_PARAM_KEYS_MAX) key = `${tool}.<other>`;
+  const n = (unknownParamCounts.get(key) ?? 0) + 1;
+  unknownParamCounts.set(key, n);
+  if (n <= 10 || n % 100 === 0) console.error(`[mcp] unknown parameter ignored: ${key} (${n} since start)`);
+}
+
+/** Every parameter a core tool takes: its full reference schema and the short schema it advertises. */
+function takes(name: string): string[] {
+  return [...new Set([...(acceptedParams(name) ?? []), ...Object.keys((SHORT_TOOLS[name]?.inputSchema as { properties?: object })?.properties ?? {})])];
+}
 
 /**
  * Parameters a tool doesn't know (T-318 §4, and the 10-30 decision "nothing
@@ -455,8 +473,11 @@ const unknownParamCounts = new Map<string, number>();
  *     "unknown_parameter", message, field, hint}` (the one-line fix);
  *   - an array answer keeps its shape, so the log line is its only trace;
  *   - a call that fails anyway names the fix in its error;
- *   - every name is counted in one stderr line, `tool.param` and the count,
- *     never the value, so real exposure can be measured before 1.0.
+ *   - every name is counted in a stderr line, `tool.param` and the count,
+ *     never the value (`countUnknownParam`), so real exposure can be measured
+ *     before 1.0.
+ * `manage-types` and `attachment-url` check against the action called: a
+ * parameter only another action takes is ignored by this one, so it is named.
  * A misused nested key (`near: {id}`) is refused, as 0.8 refused it. A tool
  * accepts every parameter in its full reference schema and in the short schema
  * it advertises.
@@ -468,27 +489,29 @@ function applyParamTeaching(tools: McpToolDef[], vaultName: string): void {
       tool.name === "manage-token" || tool.name === "manage-keys"
         ? Object.keys(manageTokenReference(vaultName).inputSchema.properties as object)
         : folds
-          ? ["action", ...Object.values(folds).flatMap((n) => acceptedParams(n) ?? [])]
+          ? ["action", ...Object.values(folds).flatMap(takes)]
           : acceptedParams(tool.name);
     if (!reference) continue;
     const accepted = [...new Set([...reference, ...Object.keys(((tool.inputSchema as { properties?: object }).properties) ?? {})])];
+    const perAction = folds ? Object.fromEntries(Object.entries(folds).map(([a, n]) => [a, ["action", ...takes(n)]])) : undefined;
+    const acceptedFor = (params: Record<string, unknown>) => {
+      const action = params.action ?? (tool.name === "manage-types" ? "update" : undefined);
+      return (typeof action === "string" && perAction?.[action]) || accepted;
+    };
     const execute = tool.execute;
     tool.execute = async (params) => {
       const nested = nestedParamProblem(tool.name, params ?? {});
       if (nested) throw Object.assign(new Error(nested.message), nested);
-      const unknown = unknownParams(tool.name, params ?? {}, accepted);
+      const unknown = unknownParams(tool.name, params ?? {}, acceptedFor(params ?? {}));
       if (unknown.length === 0) return execute(params);
-      for (const u of unknown) {
-        const key = `${tool.name}.${u.field}`;
-        const n = (unknownParamCounts.get(key) ?? 0) + 1;
-        unknownParamCounts.set(key, n);
-        console.error(`[mcp] unknown parameter ignored: ${key} (${n} since start)`);
-      }
+      for (const u of unknown) countUnknownParam(tool.name, u.field);
       let result: unknown;
       try {
         result = await execute(params);
       } catch (err) {
-        if (err instanceof Error) err.message += ` (Also: ${unknown.map((u) => u.message.replace(/ Every parameter:.*$/, "")).join(" ")})`;
+        try {
+          if (err instanceof Error) err.message += ` (Also: ${unknown.map((u) => u.message.replace(/ Every parameter:.*$/, "")).join(" ")})`;
+        } catch {} // a frozen error keeps its own message
         throw err;
       }
       return withParamWarnings(tool.name, result, unknown);
