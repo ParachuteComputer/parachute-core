@@ -15,6 +15,7 @@
  * Notes keep `tags` (every name, as before, so 0.8 clients and Prism's
  * contract hold through 0.9) and gain `types`, the subset that are types.
  */
+import { chunkForInClause } from "./sql-in.js";
 import type { Database } from "bun:sqlite";
 import { stripTagHash } from "./tag-hierarchy.js";
 
@@ -50,8 +51,8 @@ export function tagKinds(db: Database): Map<string, TagKind> {
 export function typeNamesAmong(db: Database, names: string[]): Set<string> {
   if (!names.length) return new Set();
   const out = new Set<string>();
-  for (let i = 0; i < names.length; i += 500) {
-    const chunk = names.slice(i, i + 500);
+  // Chunked under Durable Object SQLite's 100-bound-param cap (sql-in.ts), as every other IN list in core.
+  for (const chunk of chunkForInClause(names)) {
     const rows = db
       .prepare(`SELECT t.name AS name FROM tags t WHERE t.name IN (${chunk.map(() => "?").join(", ")}) AND ${KIND_SQL} = 'type'`)
       .all(...chunk) as { name: string }[];

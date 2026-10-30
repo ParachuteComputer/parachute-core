@@ -198,3 +198,31 @@ describe("kind rules", () => {
     db.close();
   });
 });
+
+describe("types are read DO-safe: no statement binds more than 100 params (Durable Object SQLite's cap)", () => {
+  // Cloud found it (cloud test tag-hierarchy-param-cap, 0.9 on workerd): a note on 101+ tags read its types with one
+  // `IN (?×names)` of up to 500 names, and DO SQLite refused it ("too many SQL variables"), so creating the note 500'd.
+  test("creating and reading a note on 150 tags", async () => {
+    const { db, store } = fresh();
+    const tags = Array.from({ length: 150 }, (_, i) => `t${i}`);
+    for (const t of tags.slice(0, 5)) await store.upsertTagRecord(t, { fields: { x: { type: "string" } } });
+    let max = 0;
+    const orig = db.prepare.bind(db);
+    (db as unknown as { prepare: (sql: string) => unknown }).prepare = (sql: string) => {
+      const stmt = orig(sql) as unknown as Record<string, unknown>;
+      for (const m of ["all", "get", "run", "values", "iterate"]) {
+        const f = stmt[m];
+        if (typeof f === "function") stmt[m] = (...args: unknown[]) => ((max = Math.max(max, args.length)), (f as Function).apply(stmt, args));
+      }
+      return stmt;
+    };
+    try {
+      const n = await store.createNote("on many tags", { tags });
+      const got = await store.getNote(n.id);
+      expect(got?.types?.sort()).toEqual(["t0", "t1", "t2", "t3", "t4"]);
+    } finally {
+      (db as unknown as { prepare: unknown }).prepare = orig;
+    }
+    expect(max).toBeLessThanOrEqual(100);
+  });
+});
