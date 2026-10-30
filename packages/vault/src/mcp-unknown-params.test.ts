@@ -157,6 +157,21 @@ describe("unknown parameters are ignored, as on 0.8, with a warning and a counte
     expect((u.warnings ?? []).filter((w: any) => w.code === "unknown_parameter")).toEqual([]);
   });
 
+  test("each action's own parameters are never warned about", async () => {
+    await seed();
+    const d = await tool("manage-types")({ action: "delete", tag: "beta", cascade: false });
+    expect((d.warnings ?? []).filter((w: any) => w.code === "unknown_parameter")).toEqual([]);
+    const up = await tool("attachment-url")({ action: "upload", note: "a/one", filename: "x.txt", size_bytes: 3, segment_index: 0 });
+    expect((up.warnings ?? []).filter((w: any) => w.code === "unknown_parameter")).toEqual([]);
+    const down = await tool("attachment-url")({ action: "download", attachment_id: "none", filename: "x.txt" }).catch((e: Error) => e);
+    // download doesn't take filename: named (in the error here, as the attachment doesn't exist).
+    expect(String((down as any).message ?? JSON.stringify((down as any).warnings))).toContain("filename");
+  });
+
+  test("with no valid action the call is refused with the actions, so nothing is silently ignored", async () => {
+    await expect(tool("attachment-url")({ note: "a/one", attachment_id: "x" })).rejects.toThrow(/needs `action`: upload, download/);
+  });
+
   test("the log can't be forged or flooded by caller-chosen names", async () => {
     const log = captureStderr();
     try {
@@ -169,7 +184,7 @@ describe("unknown parameters are ignored, as on 0.8, with a warning and a counte
     expect(log.lines.every((l) => !l.includes("\n"))).toBe(true);
     expect(log.lines.filter((l) => l.includes("zz_rate_probe"))).toHaveLength(10);
     const distinct = new Set(log.lines.filter((l) => l.includes("list-tags.")).map((l) => /list-tags\.(\S+)/.exec(l)![1]));
-    expect(distinct.size).toBeLessThanOrEqual(257);
+    expect(distinct.size).toBeLessThanOrEqual(256);
     expect(distinct.has("<other>")).toBe(true);
   });
 

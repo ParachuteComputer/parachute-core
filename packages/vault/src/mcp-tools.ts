@@ -446,7 +446,8 @@ const VERB_RANK: Record<string, number> = { read: 0, write: 1, admin: 2 };
 
 /** Ignored unknown parameters so far, per `tool.param`, in this process (the counted log line). */
 const unknownParamCounts = new Map<string, number>();
-/** Distinct `tool.param` names counted one by one; past this, a tool's further new names count as `tool.<other>`. */
+/** At most this many `tool.param` keys in all, `tool.<other>` ones included: once full, a new name counts as its
+ *  tool's `<other>` if that key is already there, and is dropped from the count (still ignored and warned) if not. */
 const UNKNOWN_PARAM_KEYS_MAX = 256;
 
 /** Count one ignored name and log it: every one of the first 10 per name, then every 100th (the count says how many). */
@@ -454,7 +455,8 @@ function countUnknownParam(tool: string, field: string): void {
   // Caller-chosen text: never let it forge a line or grow without bound.
   const name = field.replace(/[^\w.-]/g, "?").slice(0, 64);
   let key = `${tool}.${name}`;
-  if (!unknownParamCounts.has(key) && unknownParamCounts.size >= UNKNOWN_PARAM_KEYS_MAX) key = `${tool}.<other>`;
+  if (!unknownParamCounts.has(key) && unknownParamCounts.size >= UNKNOWN_PARAM_KEYS_MAX - 1) key = `${tool}.<other>`;
+  if (!unknownParamCounts.has(key) && unknownParamCounts.size >= UNKNOWN_PARAM_KEYS_MAX) return;
   const n = (unknownParamCounts.get(key) ?? 0) + 1;
   unknownParamCounts.set(key, n);
   if (n <= 10 || n % 100 === 0) console.error(`[mcp] unknown parameter ignored: ${key} (${n} since start)`);
@@ -478,6 +480,8 @@ function takes(name: string): string[] {
  *     before 1.0.
  * `manage-types` and `attachment-url` check against the action called: a
  * parameter only another action takes is ignored by this one, so it is named.
+ * With no valid action (attachment-url has no default) the call is refused with
+ * the list of actions, so nothing is silently ignored and nothing is named.
  * A misused nested key (`near: {id}`) is refused, as 0.8 refused it. A tool
  * accepts every parameter in its full reference schema and in the short schema
  * it advertises.
