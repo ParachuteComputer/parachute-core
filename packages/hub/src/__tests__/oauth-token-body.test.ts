@@ -16,7 +16,11 @@ import { hubFetch } from "../hub-server.ts";
 import { handleToken } from "../oauth-handlers.ts";
 
 const ISSUER = "https://hub.example";
-const DEPS = { issuer: ISSUER, hubBoundOrigins: () => [ISSUER], loadServicesManifest: () => ({ services: [] }) };
+const DEPS = {
+  issuer: ISSUER,
+  hubBoundOrigins: () => [ISSUER],
+  loadServicesManifest: () => ({ services: [] }),
+};
 
 function tempDb() {
   const dir = mkdtempSync(join(process.env.TMPDIR ?? tmpdir(), "phub-token-body-"));
@@ -54,7 +58,11 @@ describe("/oauth/token with a body that isn't a form", () => {
           new Request(`${ISSUER}/oauth/token`, {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ grant_type: "refresh_token", refresh_token: SECRET_REFRESH, client_id: "abcdefgh" }),
+            body: JSON.stringify({
+              grant_type: "refresh_token",
+              refresh_token: SECRET_REFRESH,
+              client_id: "abcdefgh",
+            }),
           }),
           DEPS,
         ),
@@ -72,13 +80,21 @@ describe("/oauth/token with a body that isn't a form", () => {
   test("through the real listener: a JSON body gets the RFC 6749 JSON answer, not Bun's development error page", async () => {
     const t = tempDb();
     const server = Bun.serve(
-      hubServeOptions({ port: 0, hostname: "127.0.0.1", fetch: hubFetch(t.dir, { getDb: () => t.db, issuer: ISSUER }) }),
+      hubServeOptions({
+        port: 0,
+        hostname: "127.0.0.1",
+        fetch: hubFetch(t.dir, { getDb: () => t.db, issuer: ISSUER }),
+      }),
     );
     try {
       const res = await fetch(`http://127.0.0.1:${server.port}/oauth/token`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ grant_type: "refresh_token", refresh_token: SECRET_REFRESH, client_id: "abcdefgh" }),
+        body: JSON.stringify({
+          grant_type: "refresh_token",
+          refresh_token: SECRET_REFRESH,
+          client_id: "abcdefgh",
+        }),
       });
       const text = await res.text();
       expect({
