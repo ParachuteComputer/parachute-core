@@ -679,3 +679,43 @@ describe("HookRegistry — deleted attachment events", () => {
     expect(fired).toEqual([]);
   });
 });
+
+// A rename rewrites OTHER notes in the same transaction: the wikilink cascade
+// (content) and the reference-field repair (metadata, core v0.8). Those are
+// committed note writes like any other, so `updated` must fire for them too;
+// otherwise live subscriptions keep showing the old value and on-write work
+// (embeddings, mirrors) never hears of the change.
+describe("rename cascade fires updated for the notes it rewrites", () => {
+  it("wikilink cascade (content) and reference repair (metadata)", async () => {
+    await store.upsertTagSchema("task", { fields: { node: { type: "reference", indexed: true } } });
+    const target = await store.createNote("t", { path: "Projects/Old" });
+    const linker = await store.createNote("see [[Projects/Old]]", { path: "Notes/Linker" });
+    const child = await store.createNote("c", { path: "Tasks/One", tags: ["task"], metadata: { node: "Projects/Old" } });
+    const bystander = await store.createNote("unrelated", { path: "Notes/Other" });
+    await settle();
+
+    const updated = new Map<string, Note>();
+    hooks.onNote({ event: "updated", handler: (note) => { updated.set(note.id, note); } });
+    await store.updateNote(target.id, { path: "Projects/New" });
+    await settle();
+
+    expect(updated.get(target.id)?.path).toBe("Projects/New");
+    expect(updated.get(linker.id)?.content).toBe("see [[Projects/New]]");
+    expect(updated.get(child.id)?.metadata?.node).toBe("Projects/New");
+    expect(updated.has(bystander.id)).toBe(false);
+  });
+
+  it("does not fire for the rewritten notes when the rename rolls back", async () => {
+    await store.upsertTagSchema("task", { fields: { node: { type: "reference", indexed: true } } });
+    const target = await store.createNote("t", { path: "Projects/Old" });
+    const linker = await store.createNote("see [[Projects/Old]]", { path: "Notes/Linker" });
+    await store.createNote("taken", { path: "Projects/New" });
+    await settle();
+    const fired: string[] = [];
+    hooks.onNote({ event: "updated", handler: (note) => { fired.push(note.id); } });
+    await expect(store.updateNote(target.id, { path: "Projects/New" })).rejects.toThrow();
+    await settle();
+    expect(fired).toEqual([]);
+    expect((await store.getNote(linker.id))?.content).toBe("see [[Projects/Old]]");
+  });
+});
