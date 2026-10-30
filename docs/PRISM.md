@@ -14,16 +14,16 @@ same program under another name, kept for now). `parachute-vault` is there too, 
 [ParachuteComputer/parachute-core](https://github.com/ParachuteComputer/parachute-core/releases), built by CI:
 
 ```
-parachute-core-0.8.0-pre.1-darwin-arm64.tar.gz   signed ad hoc with the hardened runtime (bundle-macos)
-parachute-core-0.8.0-pre.1-linux-x64.tar.gz
+parachute-core-0.8.0-pre.2-darwin-arm64.tar.gz   signed ad hoc with the hardened runtime (bundle-macos)
+parachute-core-0.8.0-pre.2-linux-x64.tar.gz
 SHA256SUMS
 ```
 
 ```bash
 grep darwin-arm64 SHA256SUMS | shasum -a 256 -c     # on Linux: grep linux-x64 SHA256SUMS | sha256sum -c
-tar -xzf parachute-core-0.8.0-pre.1-darwin-arm64.tar.gz
-PARACHUTE_BIN="$PWD/parachute-core-0.8.0-pre.1-darwin-arm64/bin/parachute"
-PARACHUTE_VAULT_BIN="$PWD/parachute-core-0.8.0-pre.1-darwin-arm64/bin/parachute-vault"
+tar -xzf parachute-core-0.8.0-pre.2-darwin-arm64.tar.gz
+PARACHUTE_BIN="$PWD/parachute-core-0.8.0-pre.2-darwin-arm64/bin/parachute"
+PARACHUTE_VAULT_BIN="$PWD/parachute-core-0.8.0-pre.2-darwin-arm64/bin/parachute-vault"
 ```
 
 The tree: `bin/parachute`, `bin/parachute-core`, `bin/parachute-vault` (links into `lib/`); `runtime/bun` (Bun 1.4.4,
@@ -36,12 +36,13 @@ It runs from any folder, a path with spaces included.
 When Prism re-signs the payload, please treat `parachute/runtime/bun` like your Node runtime (the hardened runtime
 plus `allow-jit`); nothing else in the tree needs an entitlement.
 
-**npm** (for a machine with Bun 1.4+): published; `latest` and `next` are both `0.8.0-pre.1` today. It runs on the
-Bun on `PATH`. `parachute-vault` is not linked into a `bin` folder; it is in the package:
+**npm** (for a machine with Bun 1.4+): the newest prerelease is on the `next` tag, `0.8.0-pre.2`. `latest` stays at
+`0.8.0-pre.1` until 0.8.0 ships, so ask for `@next`. It runs on the Bun on `PATH`. `parachute-vault` is not linked
+into a `bin` folder; it is in the package:
 
 | Install | `parachute` | `parachute-vault` |
 |---|---|---|
-| `npm i @openparachute/core` (in a project) | `node_modules/.bin/parachute` | `node_modules/@openparachute/core/packages/cli/bin/parachute-vault` |
+| `npm i @openparachute/core@next` (in a project) | `node_modules/.bin/parachute` | `node_modules/@openparachute/core/packages/cli/bin/parachute-vault` |
 | `npm i -g @openparachute/core@next` | `<prefix>/bin/parachute` | `<prefix>/lib/node_modules/@openparachute/core/packages/cli/bin/parachute-vault` |
 | `bun add -g @openparachute/core@next` | `$BUN_INSTALL/bin/parachute` | `$BUN_INSTALL/install/global/node_modules/@openparachute/core/packages/cli/bin/parachute-vault` |
 
@@ -70,7 +71,7 @@ of serve, run from this install, never from `PATH`) and stops it with itself.
 
   ```json
   {"ready": true, "pid": 4242, "listen": "127.0.0.1:5100", "vault_listen": "127.0.0.1:5101",
-   "issuer": "http://127.0.0.1:5100", "version": "0.8.0-pre.1", "started_at": "2026-11-05T09:00:00.000Z"}
+   "issuer": "http://127.0.0.1:5100", "version": "0.8.0-pre.2", "started_at": "2026-11-05T09:00:00.000Z"}
   ```
 - While it holds the home, a second serve, `parachute-vault serve`, and the install, upgrade, expose, migrate and
   module commands exit 2 with `managed_by_host`; the matching HTTP routes answer 409
@@ -123,6 +124,12 @@ a private network namespace, and it must be zero.
 
 ## What else is in this build, and what comes next
 
+- **Since 0.8.0-pre.1:** wikilinks longer than 48 bytes resolve on Durable Objects (#23); import resolves wikilinks
+  once from a title index and commits in chunks (#25); tag queries over 100+ child tags, `path_prefix` and
+  `rename-tag` stay under Durable Object SQLite's caps (#27, #28); a rename's cascade writes reach live subscribers
+  (#29); restoring an old snapshot keeps its metadata exact (#32); OAuth refresh ignores a resource it can't match and
+  `/oauth/token` answers a non-form body 400 (#22, #31); takeover reads the old units' environment as systemd does
+  (#13, #20, #30). None of these touches the embedded contract: your suite passes unchanged.
 - **First-run takeover:** on a machine where 0.7's hub and vault keep a home, `parachute-core takeover` says what it
   found, backs up, pauses the old programs, starts v0.8 on the same data and checks it, and keeps the old programs
   installed but off; `parachute-core takeover --rollback` goes back. A box `serve` on such a home refuses with exit 7
