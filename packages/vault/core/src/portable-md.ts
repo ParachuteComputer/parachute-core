@@ -270,8 +270,9 @@ function needsQuote(s: string): boolean {
   // Booleans / null / numbers — would round-trip as a different type.
   if (s === "true" || s === "false" || s === "null") return true;
   if (/^-?\d+(\.\d+)?$/.test(s)) return true;
-  // YAML-meaningful starters.
-  if (/^[-?:&*!|>%@`#]/.test(s)) return true;
+  // YAML-meaningful starters, including the flow indicators and quotes: an
+  // unquoted `[[note]]` or `{x}` re-parses as a list or map (T-36).
+  if (/^[-?:&*!|>%@`#[\]{},'"]/.test(s)) return true;
   // Embedded `: ` (key/value separator) or `#` (comment) makes a plain
   // scalar ambiguous.
   if (s.includes(": ") || s.includes(" #")) return true;
@@ -1873,7 +1874,28 @@ export class FsImportSource implements ImportSource {
 export interface ImportEngineOptions {
   blowAway?: boolean;
   dryRun?: boolean;
+  /**
+   * Awaited while the import replays: after each wipe batch, every
+   * {@link IMPORT_CHECKPOINT_NOTES} notes and attachments, every
+   * {@link IMPORT_CHECKPOINT_LINKS} typed links, and every few hundred notes of
+   * the final wikilink pass. A Durable Object runs the whole replay as one
+   * implicit storage transaction unless the code yields to the event loop, and
+   * the platform resets the object when one storage operation runs past ~30 s
+   * (a 2,698-note vault needed ~33 s, T-318). Cloud passes a short timer here
+   * so the writes commit in chunks. Self-host passes nothing: its import stays
+   * one real transaction.
+   *
+   * The caller owns two consequences: other requests can run during each
+   * await, so it must keep every other writer and reader out until the import
+   * settles (cloud: the vault DO's import lock); and a failure part-way leaves
+   * the chunks already committed (cloud: the vault stays import-pending and a
+   * retry blow-away-replays it).
+   */
+  checkpoint?: () => Promise<void>;
 }
+
+export const IMPORT_CHECKPOINT_NOTES = 200;
+export const IMPORT_CHECKPOINT_LINKS = 500;
 
 /**
  * Sink-agnostic import engine (Phase-1 shared-core, cloud design §4). Reads
@@ -1964,6 +1986,8 @@ async function importVaultReplay(
         await store.deleteNote(note.id, { captureHistory: false });
         stats.notes_wiped++;
       }
+      // A retry into a half-imported vault wipes thousands of notes: chunk it too.
+      if (opts.checkpoint) await opts.checkpoint();
     }
     // Clear tag rows too — `deleteNote` clears note_tags via FK cascade but
     // leaves the `tags` table rows in place (orphaned schemas). `cascade:
@@ -2071,7 +2095,12 @@ async function importVaultReplay(
   // Track per-import (id → portable) so we can replay typed links after all
   // notes exist.
   const seenNotes = new Map<string, PortableNote>();
+  let sinceCheckpoint = 0;
   for (const relPath of source.listContentFiles()) {
+    if (opts.checkpoint && ++sinceCheckpoint >= IMPORT_CHECKPOINT_NOTES) {
+      sinceCheckpoint = 0;
+      await opts.checkpoint();
+    }
     // Derive the file's extension (lowercased, no leading dot) and the
     // user-visible note path (everything between the export root and the
     // extension). The source returns POSIX-relative paths already.
@@ -2223,7 +2252,10 @@ async function importVaultReplay(
     }
 
     // Upsert by id. createNote will throw on duplicate id; check first.
-    const existing = await store.getNote(id);
+    // After a blow-away wipe no note can exist yet (the wipe took them all and
+    // seenNotes drops repeated ids), so skip the lookup (T-318: it is one of the
+    // per-note costs that kept a 2,700-note import over cloud's limits).
+    const existing = opts.blowAway ? null : await store.getNote(id);
     if (existing) {
       // **Upsert merge policy** (vault#319 F2 — pinned here so future edits
       // don't drift):
@@ -2268,6 +2300,9 @@ async function importVaultReplay(
         ...(metadata ? { metadata } : {}),
         created_at,
         extension,
+        // Step 6's syncAllWikilinks resolves every note once all exist; doing
+        // it here too misses on each forward reference (T-318).
+        deferWikilinkSync: true,
       });
       stats.notes_created++;
     }
@@ -2301,9 +2336,14 @@ async function importVaultReplay(
   // 4. Typed links — replay only now that all notes exist. Wikilinks (which
   // the exporter excludes from `links:`) rebuild from content brackets via
   // syncAllWikilinks (a callable Store method).
+  let linksSinceCheckpoint = 0;
   for (const [sourceId, portable] of seenNotes) {
     if (!portable.links) continue;
     for (const link of portable.links) {
+      if (opts.checkpoint && ++linksSinceCheckpoint >= IMPORT_CHECKPOINT_LINKS) {
+        linksSinceCheckpoint = 0;
+        await opts.checkpoint();
+      }
       // Confirm target exists. Forward refs to notes the export didn't
       // include (subset export) are skipped with a warning rather than
       // aborting.
@@ -2329,9 +2369,14 @@ async function importVaultReplay(
   // 5. Attachments — DB row then file copy (when the source has attachments
   // enabled). Skip the file-copy phase when it isn't; the DB row still
   // restores so callers operating without an assetsDir keep parity.
+  let attachmentsSinceCheckpoint = 0;
   for (const [noteId, portable] of seenNotes) {
     if (!portable.attachments) continue;
     for (const att of portable.attachments) {
+      if (opts.checkpoint && ++attachmentsSinceCheckpoint >= IMPORT_CHECKPOINT_NOTES) {
+        attachmentsSinceCheckpoint = 0;
+        await opts.checkpoint();
+      }
       if (opts.dryRun) {
         stats.attachments_restored++;
         continue;
@@ -2369,7 +2414,7 @@ async function importVaultReplay(
   // 6. Sync wikilinks across the imported set so `[[brackets]]` in content
   // rebuild link rows for the imported notes.
   if (!opts.dryRun) {
-    await store.syncAllWikilinks();
+    await store.syncAllWikilinks(opts.checkpoint ? { checkpoint: opts.checkpoint } : undefined);
   }
 
   // 7. Re-declare indexed fields (belt-and-suspenders + authoritative count).

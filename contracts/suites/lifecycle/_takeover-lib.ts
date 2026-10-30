@@ -86,7 +86,8 @@ const FAKE_SYSTEMCTL = `#!/bin/sh
 #   clean environment and a session of its own (no terminal's hang-up reaches it), as STATE/<unit>.pid; stop ends
 #   it; is-active says "failed" once its process is gone; show names its MainPID. The seeded old units start that
 #   way too (the stock home starts the ones seeded as running).
-# - show prints a unit file's Environment= lines (systemd prints the assignments it would pass).
+# - show prints a unit file's Environment= lines (systemd prints the assignments it would pass); show-environment
+#   prints the environment every unit starts from (the manager's).
 STATE=__STATE__
 UNITS=__UNITS__
 # A unit gets the user manager's PATH, never the PATH of whoever called systemctl (a takeover's own bin/ is first on
@@ -142,7 +143,10 @@ stop_unit() {
 code=0
 case "$verb" in
   daemon-reload) exit 0 ;;
-  show-environment) exit 0 ;;
+  show-environment)
+    # As systemd prints it: a value with a space, a quote or a backslash in its $'…' form, those two escaped.
+    q() { case "$1" in *" "*|*\\'*|*\\\\*) printf '%s%s%s' '$'"'" "$(printf '%s' "$1" | sed -e 's/[\\\\]/\\\\\\\\/g' -e "s/'/\\\\\\\\'/g")" "'" ;; *) printf '%s' "$1" ;; esac; }
+    printf 'HOME=%s\nLANG=C.UTF-8\nPATH=%s\nTMPDIR=%s\n' "$(q "$HOME")" "$(q "$MANAGER_PATH")" "$(q "$TMPDIR")"; exit 0 ;;
   is-active) for u in $units; do if known "$u"; then s=$(st "$u" active); echo "$s"; [ "$s" = active ] || code=3; else echo inactive; code=3; fi; done; exit $code ;;
   is-enabled) for u in $units; do if known "$u"; then s=$(st "$u" enabled); echo "$s"; [ "$s" = enabled ] || code=1; else echo "Failed to get unit file state for $u: No such file or directory" >&2; code=1; fi; done; exit $code ;;
   start|stop|restart|enable|disable)
@@ -221,7 +225,7 @@ export interface Machine {
 
 export async function newMachine(
   label: string,
-  opts: { oldInstall?: boolean; units?: Record<string, UnitState> } = {},
+  opts: { oldInstall?: boolean; units?: Record<string, UnitState>; managerPathFirst?: (user: string) => string } = {},
 ): Promise<Machine> {
   const info = candidate();
   const stock = await oldStock();
@@ -240,7 +244,8 @@ export async function newMachine(
   mkdirSync(fakeBin, { recursive: true });
   mkdirSync(state, { recursive: true });
   mkdirSync(unitDir, { recursive: true });
-  const managerPath = `${fakeBin}:${join(user, ".bun", "bin")}:${info.runtimeDir}:/usr/local/bin:/usr/bin:/bin`;
+  // `managerPathFirst`: a folder the user manager's PATH (not the shell's) starts with.
+  const managerPath = `${opts.managerPathFirst ? `${opts.managerPathFirst(user)}:` : ""}${fakeBin}:${join(user, ".bun", "bin")}:${info.runtimeDir}:/usr/local/bin:/usr/bin:/bin`;
   writeFileSync(
     join(fakeBin, "systemctl"),
     FAKE_SYSTEMCTL.replace("__STATE__", JSON.stringify(state)).replace("__UNITS__", JSON.stringify(unitDir)).replace("__PATH__", JSON.stringify(managerPath)),
@@ -467,7 +472,7 @@ async function waitVault(origin: string, vaultName: string, box: Proc, what: str
  * Make a stock home the way a person did: `parachute-vault create`, then `parachute serve`, an operator pass from
  * the real CLI, a few made-up notes written over REST, then a clean stop. All with the old programs on PATH.
  */
-export async function makeStockHome(m: Machine): Promise<StockHome> {
+export async function makeStockHome(m: Machine, opts: { unitEnv?: Record<string, string> } = {}): Promise<StockHome> {
   const vaultName = `old${randomBytes(3).toString("hex")}`;
   const port = await freePort();
   const origin = `http://127.0.0.1:${port}`;
@@ -486,7 +491,8 @@ export async function makeStockHome(m: Machine): Promise<StockHome> {
     PARACHUTE_INITIAL_ADMIN_PASSWORD: `pw-${randomBytes(12).toString("hex")}`,
   };
   // The old units carry what the old box runs with, as an install's unit (or its drop-in) does; no password.
-  const unitEnv = { PORT: String(port), PARACHUTE_HUB_ORIGIN: origin, PARACHUTE_HUB_JWKS_ORIGIN: origin, PARACHUTE_BIND_HOST: "127.0.0.1" };
+  // `opts.unitEnv` adds what a box's unit also has (the friends box's PATH and BUN_INSTALL).
+  const unitEnv = { PORT: String(port), PARACHUTE_HUB_ORIGIN: origin, PARACHUTE_HUB_JWKS_ORIGIN: origin, PARACHUTE_BIND_HOST: "127.0.0.1", ...opts.unitEnv };
   for (const u of m.units) writeFileSync(join(m.unitDir, u), unitFileText(u, unitEnv));
   await m.expose(port);
   const box = await startOldBox(m, { vaultName, origin, serveEnv });

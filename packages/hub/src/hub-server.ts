@@ -372,6 +372,7 @@ import {
   startDbPathLivenessTimer,
 } from "./hub-db-liveness.ts";
 import { hubDbPath, openHubDb } from "./hub-db.ts";
+import { readEnvFileValues } from "./env-file.ts";
 import { getHubOrigin, resolveRootMode, resolveRootRedirect } from "./hub-settings.ts";
 import { type RenderHubOpts, renderHub } from "./hub.ts";
 import { pemToJwk } from "./jwks.ts";
@@ -1895,6 +1896,38 @@ export function resolveIssuer(
 }
 
 /**
+ * Every issuer this hub knows of, whatever the precedence picked for this request: the stored `hub_origin`, the
+ * configured issuer, the expose origin, and what the vault `.env` names (`PARACHUTE_HUB_ORIGIN`,
+ * `PARACHUTE_HUB_ORIGINS`). The refresh path uses it to recognise a `resource` a client saved under an earlier
+ * setup (oauth-handlers.ts resolveRefreshAudience). A source that can't be read is skipped.
+ */
+export function knownIssuers(
+  db: Database | undefined,
+  configuredIssuer: string | undefined,
+  readExpose: () => string | undefined = defaultExposeHubOriginRead,
+  vaultEnvPath: string = join(CONFIG_DIR, "vault", ".env"),
+): string[] {
+  const out: (string | undefined)[] = [configuredIssuer];
+  try {
+    if (db !== undefined) out.push(getHubOrigin(db) ?? undefined);
+  } catch {
+    // An unreadable settings table names no issuer.
+  }
+  try {
+    out.push(readExpose());
+  } catch {
+    // Malformed expose-state: nothing from it.
+  }
+  try {
+    const env = readEnvFileValues(vaultEnvPath);
+    out.push(env.PARACHUTE_HUB_ORIGIN, ...(env.PARACHUTE_HUB_ORIGINS ?? "").split(","));
+  } catch {
+    // No vault .env (or unreadable): nothing from it.
+  }
+  return out.map((o) => o?.trim()).filter((o): o is string => !!o);
+}
+
+/**
  * Where did the resolved issuer come from? Drives the source-label
  * surfaced in the admin SPA so operators can tell which precedence
  * layer they're on without inspecting the DB or env. Mirrors the
@@ -2297,6 +2330,8 @@ export function hubFetch(
           // jsdoc for the failure case this closes.
           platformOrigin: process.env.RENDER_EXTERNAL_URL ?? flyDefaultOrigin(process.env),
         }).concat(embedded?.acceptedIssuers ?? []),
+      // Only the refresh path reads this (a resource saved under an earlier setup, friends box 10-29).
+      knownIssuers: () => knownIssuers(getDb?.(), configuredIssuer, loadExposeHubOrigin),
     };
   };
 

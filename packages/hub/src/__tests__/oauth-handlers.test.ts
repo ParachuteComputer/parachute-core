@@ -9760,7 +9760,35 @@ describe("RFC 8707 resource binding — vault-bound MCP (fix #461)", () => {
     }
   });
 
-  test("refresh_token resource validation matches the row's named vault and rejects another vault", async () => {
+  /** Capture console.warn lines while `fn` runs. */
+  async function warnLines(fn: () => Promise<void>): Promise<string[]> {
+    const lines: string[] = [];
+    const original = console.warn;
+    console.warn = (...args: unknown[]) => {
+      lines.push(args.map(String).join(" "));
+    };
+    try {
+      await fn();
+    } finally {
+      console.warn = original;
+    }
+    return lines;
+  }
+
+  function refreshRequest(clientId: string, refreshToken: string, resource?: string): Request {
+    return resourceTokenRequest(
+      new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: refreshToken,
+        client_id: clientId,
+        ...(resource === undefined ? {} : { resource }),
+      }),
+    );
+  }
+
+  // Friends box, 10-29: Claude connectors authorized in June replayed the `resource` they saved then; v0.8
+  // refused it (invalid_target) before rotating, so they were never renewed. 0.7.x ignored `resource` on refresh.
+  test("refresh_token never refuses because of resource: each saved shape → 200 with the grant's audience, and the ignored ones are logged", async () => {
     const flow = await setupJonAuthorizationCode();
     try {
       const initialRes = await handleToken(
@@ -9772,53 +9800,153 @@ describe("RFC 8707 resource binding — vault-bound MCP (fix #461)", () => {
             client_id: flow.clientId,
             redirect_uri: "https://app.example/cb",
             code_verifier: flow.verifier,
-          }),
-        ),
-        RESOURCE_DEPS,
-      );
-      expect(initialRes.status).toBe(200);
-      const initial = (await initialRes.json()) as { refresh_token: string };
-
-      // A rejected target is checked before rotation, so the same refresh row
-      // remains usable for the matching resource immediately afterward.
-      const mismatchRes = await handleToken(
-        flow.db,
-        resourceTokenRequest(
-          new URLSearchParams({
-            grant_type: "refresh_token",
-            refresh_token: initial.refresh_token,
-            client_id: flow.clientId,
-            resource: `${ISSUER}/vault/boulder/mcp`,
-          }),
-        ),
-        RESOURCE_DEPS,
-      );
-      expect(mismatchRes.status).toBe(400);
-      const mismatch = (await mismatchRes.json()) as { error: string };
-      expect(mismatch.error).toBe("invalid_target");
-
-      const matchingRes = await handleToken(
-        flow.db,
-        resourceTokenRequest(
-          new URLSearchParams({
-            grant_type: "refresh_token",
-            refresh_token: initial.refresh_token,
-            client_id: flow.clientId,
             resource: flow.resource,
           }),
         ),
         RESOURCE_DEPS,
       );
-      expect(matchingRes.status).toBe(200);
-      const matching = (await matchingRes.json()) as {
-        access_token: string;
-        scope: string;
-      };
-      expect(matching.scope).toBe("vault:jon:read vault:jon:write");
-      const { payload } = await validateAccessToken(flow.db, matching.access_token, ISSUER);
-      expect(payload.aud).toBe("vault.jon");
+      expect(initialRes.status).toBe(200);
+      let refresh = ((await initialRes.json()) as { refresh_token: string }).refresh_token;
+
+      const shapes: [string, boolean][] = [
+        // [resource, logged as ignored?]
+        ["http://hub.example/vault/jon/mcp", false], // http twin of the issuer
+        ["http://127.0.0.1:1940/vault/jon/mcp", false], // loopback on the vault's own port
+        ["http://localhost:1939/vault/jon/.well-known/oauth-protected-resource", false],
+        ["https://old-tailnet.example/vault/jon/mcp", true], // a host the hub no longer knows
+        [`${ISSUER}/vault/boulder/mcp`, true], // a vault outside the grant
+        [`${ISSUER}/vault/jon`, true], // no /mcp
+        ["not a url", true],
+        [flow.resource, false],
+      ];
+      for (const [resource, ignored] of shapes) {
+        let res: Response | undefined;
+        const lines = await warnLines(async () => {
+          res = await handleToken(flow.db, refreshRequest(flow.clientId, refresh, resource), RESOURCE_DEPS);
+        });
+        expect({ resource, status: res?.status }).toEqual({ resource, status: 200 });
+        const body = (await res!.json()) as { access_token: string; refresh_token: string; scope: string };
+        expect(body.scope).toBe("vault:jon:read vault:jon:write");
+        const { payload } = await validateAccessToken(flow.db, body.access_token, ISSUER);
+        expect(payload.aud).toBe("vault.jon");
+        refresh = body.refresh_token;
+        const ignoredLines = lines.filter((l) => l.includes("refresh ignored its resource"));
+        expect({ resource, ignored: ignoredLines.length }).toEqual({ resource, ignored: ignored ? 1 : 0 });
+        for (const l of lines) {
+          expect(l).not.toContain(body.refresh_token);
+          expect(l).not.toContain("jon"); // the vault name is replaced in the resource shape
+        }
+      }
     } finally {
       flow.cleanup();
+    }
+  });
+
+  test("refresh_token resource picks among the grant's vaults on any origin the hub knows (scheme twin, loopback, an earlier issuer), and only there", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      approveClient(db, reg.client.clientId);
+      const deps = { ...RESOURCE_DEPS, knownIssuers: () => ["https://old.example"] };
+      const audienceFor = async (resource: string): Promise<unknown> => {
+        const minted = signRefreshToken(db, {
+          jti: `jti-${randomBytes(6).toString("hex")}`,
+          userId: user.id,
+          clientId: reg.client.clientId,
+          scopes: ["vault:jon:read", "vault:boulder:read"],
+        });
+        const res = await handleToken(db, refreshRequest(reg.client.clientId, minted.token, resource), deps);
+        expect(res.status).toBe(200);
+        const body = (await res.json()) as { access_token: string };
+        return (await validateAccessToken(db, body.access_token, ISSUER)).payload.aud;
+      };
+      expect(await audienceFor("http://hub.example/vault/boulder/mcp")).toBe("vault.boulder");
+      expect(await audienceFor("http://127.0.0.1:1940/vault/boulder/mcp")).toBe("vault.boulder");
+      expect(await audienceFor("https://old.example/vault/boulder/mcp")).toBe("vault.boulder");
+      expect(await audienceFor("http://old.example/vault/boulder/mcp")).toBe("vault.boulder");
+      // Not the hub's: ignored, so the grant's own audience (inferAudience: the first named vault).
+      expect(await audienceFor("https://elsewhere.example/vault/boulder/mcp")).toBe("vault.jon");
+      expect(await audienceFor("ftp://hub.example/vault/boulder/mcp")).toBe("vault.jon");
+      // A vault outside the grant never becomes the audience.
+      expect(await audienceFor(`${ISSUER}/vault/other/mcp`)).toBe("vault.jon");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("/oauth/token logs one line per refused answer: grant_type, error, client prefix, resource shape; no token", async () => {
+    const flow = await setupJonAuthorizationCode();
+    const strictFlow = await setupJonAuthorizationCode();
+    try {
+      const exchange = (f: typeof flow, resource: string) =>
+        handleToken(
+          f.db,
+          resourceTokenRequest(
+            new URLSearchParams({
+              grant_type: "authorization_code",
+              code: f.code,
+              client_id: f.clientId,
+              redirect_uri: "https://app.example/cb",
+              code_verifier: f.verifier,
+              resource,
+            }),
+          ),
+          RESOURCE_DEPS,
+        );
+      let res: Response | undefined;
+
+      // A 200 logs nothing.
+      const ok = await warnLines(async () => {
+        res = await exchange(flow, flow.resource);
+      });
+      expect(res?.status).toBe(200);
+      expect(ok).toEqual([]);
+
+      const unknownRefresh = randomBytes(32).toString("base64url");
+      const lines = await warnLines(async () => {
+        res = await handleToken(
+          flow.db,
+          refreshRequest(flow.clientId, unknownRefresh, "http://127.0.0.1:1940/vault/jon/mcp?x=secret"),
+          RESOURCE_DEPS,
+        );
+      });
+      expect(res?.status).toBe(400);
+      expect(lines).toEqual([
+        `[oauth] /oauth/token refused: grant_type=refresh_token status=400 error=invalid_grant (refresh_token not found) client=${flow.clientId.slice(0, 6)} resource=http://127.0.0.1:1940/vault/<v>/mcp?…`,
+      ]);
+      expect(lines[0]).not.toContain(unknownRefresh);
+
+      // The code exchange keeps its strict check, and its refusal is logged too (without the code, the verifier
+      // or the resource's vault name).
+      const strict = await warnLines(async () => {
+        res = await exchange(strictFlow, `${ISSUER}/vault/boulder/mcp`);
+      });
+      expect(res?.status).toBe(400);
+      expect(((await res!.json()) as { error: string }).error).toBe("invalid_target");
+      expect(strict).toEqual([
+        `[oauth] /oauth/token refused: grant_type=authorization_code status=400 error=invalid_target client=${strictFlow.clientId.slice(0, 6)} resource=https://hub.example/vault/<v>/mcp`,
+      ]);
+      expect(strict[0]).not.toContain(strictFlow.code);
+      expect(strict[0]).not.toContain(strictFlow.verifier);
+
+      // A description built from the request (here it would quote the grant_type) is left out; only the fixed
+      // phrases are logged.
+      const odd = await warnLines(async () => {
+        res = await handleToken(
+          flow.db,
+          resourceTokenRequest(new URLSearchParams({ grant_type: "password", client_id: flow.clientId, username: "SECRETUSER" })),
+          RESOURCE_DEPS,
+        );
+      });
+      expect(res?.status).toBe(400);
+      expect(((await res!.json()) as { error_description: string }).error_description).toContain("password");
+      expect(odd).toEqual([
+        `[oauth] /oauth/token refused: grant_type=<other> status=400 error=unsupported_grant_type client=${flow.clientId.slice(0, 6)} resource=none`,
+      ]);
+    } finally {
+      flow.cleanup();
+      strictFlow.cleanup();
     }
   });
 

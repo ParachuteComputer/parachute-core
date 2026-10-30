@@ -52,6 +52,17 @@ import {
 // YAML emitter
 // ---------------------------------------------------------------------------
 
+describe("emitYamlDoc — strings that start with a YAML flow or quote indicator (T-36)", () => {
+  it("round-trips [[wikilink]], [x], {y}, ',z' and quote-led strings as strings", () => {
+    // Obsidian-style `related: "[[note]]"` metadata: emitted unquoted, `[[a]]`
+    // re-parses as a nested list, so an export/import round trip changed the
+    // value's type (seen on a real vault: 1 note's `related` list).
+    const metadata = { related: ["[[content/00-home]]", "[x]", "{y}", ",z", "'q'", '"d"', "]e", "}f"] };
+    const fm = `---\n${emitYamlDoc({ id: "n1", metadata })}---\nbody\n`;
+    expect(parseFrontmatter(fm).frontmatter.metadata).toEqual(metadata);
+  });
+});
+
 describe("emitYamlDoc — idempotent serializer", () => {
   it("alpha-sorts top-level keys", () => {
     const out = emitYamlDoc({ b: 2, a: 1, c: 3 });
