@@ -1444,7 +1444,7 @@ export function handOverEnv(from: string | undefined, base: NodeJS.ProcessEnv = 
   }
   for (const f of files.flatMap((pattern) => {
     const paths = envFilePaths(pattern);
-    if (paths === null) unread.push(pattern);
+    if (paths === null) unread.push(pattern); // systemd reads what it matches; it isn't read here
     return paths ?? [];
   })) {
     let body: string;
@@ -1463,23 +1463,107 @@ export function handOverEnv(from: string | undefined, base: NodeJS.ProcessEnv = 
 
 /**
  * The files an EnvironmentFile= path names: itself, or, for a wildcard (systemd.exec: "an absolute filename or
- * wildcard expression"; systemd reads every match, sorted, as glob(3) finds them), the matches in its folder. null
- * for a wildcard in a folder name: not read here (named in `unread`).
+ * wildcard expression"), the matches in its folder, as systemd finds them: execute.c exec_context_load_environment
+ * calls safe_glob(fn, 0), glibc glob(3) with no flags, in the manager's C locale (it never calls setlocale). So no
+ * brace expansion, a leading dot only matched by a literal one, bytes in byte order. null (named in `unread`): a
+ * wildcard in a folder name, a pattern glob3Component can't follow exactly, or a folder that can't be listed (glob(3)
+ * would skip it silently; here what it holds is unknown, not empty).
  */
 function envFilePaths(pattern: string): string[] | null {
-  if (!/[*?[]/.test(pattern)) return [pattern];
+  if (!/[*?[\\]/.test(pattern)) return [pattern];
   const dir = dirname(pattern);
-  if (/[*?[]/.test(dir)) return null;
-  const base = basename(pattern);
-  const glob = new Bun.Glob(base);
-  let names: string[];
+  if (/[*?[\\]/.test(dir)) return null;
+  const matches = glob3Component(Buffer.from(basename(pattern), "utf8").toString("latin1"));
+  if (matches === null) return null;
+  let names: Buffer[];
   try {
-    names = readdirSync(dir);
-  } catch {
-    return []; // no folder: no match, skipped as core's unit (EnvironmentFile=-) skips it
+    names = readdirSync(dir, { encoding: "buffer" });
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    // No folder (or not a folder): glob(3) finds nothing, skipped as core's unit (EnvironmentFile=-) skips it.
+    if (code === "ENOENT" || code === "ENOTDIR") return [];
+    return null;
   }
-  // glob(3) without GLOB_PERIOD: a leading dot is matched only by a pattern that starts with one.
-  return names.filter((n) => (base.startsWith(".") || !n.startsWith(".")) && glob.match(n)).sort().map((n) => join(dir, n));
+  return names
+    .map((b) => b.toString("latin1"))
+    .filter(matches)
+    .sort()
+    .map((n) => join(dir, Buffer.from(n, "latin1").toString("utf8")));
+}
+
+const POSIX_CLASSES: Record<string, string> = {
+  alnum: "0-9A-Za-z", alpha: "A-Za-z", blank: " \\t", cntrl: "\\x00-\\x1f\\x7f", digit: "0-9", graph: "\\x21-\\x7e",
+  lower: "a-z", print: "\\x20-\\x7e", punct: "!-\\/:-@\\[-`{-~", space: " \\t\\n\\v\\f\\r", upper: "A-Z", xdigit: "0-9A-Fa-f",
+};
+const reByte = (c: string) => `\\x${c.charCodeAt(0).toString(16).padStart(2, "0")}`;
+
+/**
+ * A matcher for one path component of a glob(3) pattern as glibc reads it with no flags in the C locale (fnmatch with
+ * FNM_PERIOD): `*`, `?`, `[…]` (`!`/`^` negation, a leading `]` literal, ranges, `[:class:]`), `\\` quoting the next
+ * byte; braces and everything else literal; a name's leading dot matched only by a literal (or quoted) dot. Pattern
+ * and names are byte strings (latin1). What glibc matches nothing for (a reversed range, an unknown class, a trailing
+ * backslash) matches nothing here. null: `[.x.]` / `[=x=]`, not followed here.
+ */
+function glob3Component(p: string): ((name: string) => boolean) | null {
+  const none = () => false;
+  let re = "";
+  for (let i = 0; i < p.length; i++) {
+    const c = p[i]!;
+    if (c === "\\") {
+      if (i + 1 === p.length) return none;
+      re += reByte(p[++i]!);
+    } else if (c === "?") re += "[^]";
+    else if (c === "*") re += "[^]*";
+    else if (c === "[") {
+      let j = i + 1;
+      const negate = p[j] === "!" || p[j] === "^";
+      if (negate) j++;
+      let set = "";
+      let closed = false;
+      let bad = false;
+      for (let first = true; j < p.length; first = false) {
+        let a = p[j]!;
+        if (a === "]" && !first) {
+          closed = true;
+          break;
+        }
+        if (a === "[" && (p[j + 1] === "." || p[j + 1] === "=")) return null;
+        if (a === "[" && p[j + 1] === ":") {
+          const k = p.indexOf(":]", j + 2);
+          if (k < 0) break;
+          const cls = POSIX_CLASSES[p.slice(j + 2, k)];
+          if (cls === undefined) bad = true;
+          else set += cls;
+          j = k + 2;
+          continue;
+        }
+        if (a === "\\") {
+          if (j + 1 >= p.length) break;
+          a = p[++j]!;
+        }
+        j++;
+        if (p[j] === "-" && j + 1 < p.length && p[j + 1] !== "]") {
+          let b = p[j + 1]!;
+          j += 2;
+          if (b === "\\") {
+            if (j >= p.length) break;
+            b = p[j++]!;
+          }
+          if (b < a) bad = true;
+          else set += `${reByte(a)}-${reByte(b)}`;
+        } else set += reByte(a);
+      }
+      if (!closed) re += reByte("["); // no closing ]: a literal [
+      else if (bad) return none;
+      else {
+        re += `[${negate ? "^" : ""}${set}]`;
+        i = j;
+      }
+    } else re += reByte(c);
+  }
+  const rx = new RegExp(`^${re}$`);
+  const dot = p.startsWith(".") || p.startsWith("\\.");
+  return (name) => (dot || !name.startsWith(".")) && rx.test(name);
 }
 
 /** The old unit core's unit takes over from (and takes its environment from): the old hub's, else the first one paused. */
