@@ -12,8 +12,8 @@ import { join } from "node:path";
 const root = mkdtempSync(join(tmpdir(), "takeover-handover-env-"));
 afterAll(() => rmSync(root, { recursive: true, force: true }));
 
-/** handOverEnv("old.service", {}) in a child process whose `systemctl` prints `show` as given. */
-function handOver(show: string): { env: Record<string, string>; unread: string[] } {
+/** `call` (handOverEnv or unitEnvironment, on "old.service") in a child process whose `systemctl` prints `show`. */
+function inChild(show: string, call: string): any {
   const dir = mkdtempSync(join(root, "case-"));
   const bin = join(dir, "bin");
   mkdirSync(bin);
@@ -26,7 +26,7 @@ function handOver(show: string): { env: Record<string, string>; unread: string[]
   const driver = join(dir, "driver.ts");
   writeFileSync(
     driver,
-    `import { handOverEnv } from ${JSON.stringify(join(import.meta.dir, "takeover.ts"))};\nconsole.log(JSON.stringify(handOverEnv("old.service", {})));\n`,
+    `import { handOverEnv, unitEnvironment } from ${JSON.stringify(join(import.meta.dir, "takeover.ts"))};\nconsole.log(JSON.stringify(${call}));\n`,
   );
   const r = Bun.spawnSync([process.execPath, driver], {
     cwd: import.meta.dir,
@@ -37,6 +37,7 @@ function handOver(show: string): { env: Record<string, string>; unread: string[]
   if (r.exitCode !== 0) throw new Error(`driver failed: ${r.stderr.toString()}`);
   return JSON.parse(r.stdout.toString());
 }
+const handOver = (show: string): { env: Record<string, string>; unread: string[] } => inChild(show, `handOverEnv("old.service", {})`);
 
 describe("handOverEnv reads systemctl show as systemd prints it", () => {
   test("Environment= values: shell quoting and the C escapes systemd uses for control characters", () => {
@@ -70,5 +71,10 @@ describe("handOverEnv reads systemctl show as systemd prints it", () => {
     const { env, unread } = handOver(`Environment=PLAIN=1\nEnvironmentFiles=${join(root, "nowhere")}/*.conf (ignore_errors=yes)\n`);
     expect(unread).toEqual([]);
     expect(env.PLAIN).toBe("1");
+  });
+
+  test("core's unit gets such a value back as systemd will read it, on one line: a line break can't start a new setting", () => {
+    const lines: string[] = inChild(`Environment="NL=a\\nExecStartPre=/bin/false" "TAB=a\\tb"\n`, `unitEnvironment("old.service")`);
+    expect(lines).toEqual(['Environment="NL=a\\x0aExecStartPre=/bin/false"', 'Environment="TAB=a\\x09b"']);
   });
 });

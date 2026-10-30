@@ -311,19 +311,17 @@ function managerEnv(): Map<string, string> | null {
 }
 
 /**
- * A value as `systemctl show-environment` prints it, decoded: as it is, or (when it has a space, a quote, a glob
- * character, …) systemd's `$'…'` form (shell_maybe_quote with SHELL_ESCAPE_POSIX): `\\`, `\'`, `\"`, the C escapes,
- * and other bytes as octal `\NNN` or `\xHH`. null for anything else, so the caller can say it couldn't be read.
+ * The inside of a value systemd printed quoted, decoded: its backslash escapes are cescape_char's (`\\`, `\'`, `\"`,
+ * the C escapes, other bytes as octal `\NNN` or `\xHH`) and, in the "…" form, `\$` and `` \` `` (SHELL_NEED_ESCAPE).
+ * null for anything else, or for an unescaped `end` (the quoting ended early: not one value).
  */
-export function managerValue(v: string): string | null {
-  if (!v.startsWith("$'")) return v;
-  if (v.length < 3 || !v.endsWith("'")) return null;
+function unescapeShown(body: string, end: string, also = ""): string | null {
   const C: Record<string, number> = { a: 7, b: 8, e: 27, f: 12, n: 10, r: 13, t: 9, v: 11, "\\": 92, "'": 39, '"': 34, "?": 63 };
-  const chars = [...v.slice(2, -1)];
+  const chars = [...body];
   const bytes: number[] = [];
   for (let i = 0; i < chars.length; i++) {
     const c = chars[i]!;
-    if (c === "'") return null; // the quoting ended early: not one value
+    if (c === end) return null;
     if (c !== "\\") {
       bytes.push(...Buffer.from(c, "utf8"));
       continue;
@@ -331,6 +329,7 @@ export function managerValue(v: string): string | null {
     const n = chars[++i];
     if (n === undefined) return null;
     if (n in C) bytes.push(C[n]!);
+    else if (also.includes(n)) bytes.push(n.charCodeAt(0));
     else if (/[0-7]/.test(n)) {
       let o = n;
       while (o.length < 3 && /[0-7]/.test(chars[i + 1] ?? "")) o += chars[++i];
@@ -343,6 +342,17 @@ export function managerValue(v: string): string | null {
     } else return null;
   }
   return Buffer.from(bytes).toString("utf8");
+}
+
+/**
+ * A value as `systemctl show-environment` prints it, decoded: as it is, or (when it has a space, a quote, a glob
+ * character, …) systemd's `$'…'` form (shell_maybe_quote with SHELL_ESCAPE_POSIX), see unescapeShown. null for
+ * anything else, so the caller can say it couldn't be read.
+ */
+export function managerValue(v: string): string | null {
+  if (!v.startsWith("$'")) return v;
+  if (v.length < 3 || !v.endsWith("'")) return null;
+  return unescapeShown(v.slice(2, -1), "'");
 }
 
 /** PARACHUTE_HOME in the user manager's own environment, which every unit inherits; null when systemd can't say. */
@@ -1365,8 +1375,16 @@ function listeningPorts(pid: number): number[] {
   return [...ports];
 }
 
-/** A value for a systemd unit line: quoted, with `%` (specifiers), `\\` and `"` escaped. */
-const unitQuote = (v: string) => `"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/%/g, "%%")}"`;
+/**
+ * A value for a systemd unit line: quoted, with `%` (specifiers), `\\` and `"` escaped, and control characters as
+ * `\xHH` (systemd C-unescapes Environment=), so a value with a line break stays one line of the unit.
+ */
+const unitQuote = (v: string) =>
+  `"${v
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/%/g, "%%")
+    .replace(/[\x00-\x1f\x7f]/g, (c) => `\\x${c.charCodeAt(0).toString(16).padStart(2, "0")}`)}"`;
 
 /**
  * The environment the old hub's unit gave it (PORT, bind, origins, PATH, BUN_INSTALL, drop-ins), as systemd has it
@@ -1379,8 +1397,10 @@ function unitEnv(unit: string): { vars: string[]; files: string[] } {
   for (const line of show.split("\n")) {
     if (line.startsWith("Environment=")) {
       for (const m of line.slice("Environment=".length).matchAll(/"((?:[^"\\]|\\.)*)"|(\S+)/g)) {
-        const kv = m[1] ?? m[2]!;
-        if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(kv)) vars.push(kv.replace(/\\(.)/g, "$1"));
+        // systemd prints a value it had to quote as "…" (shell_maybe_quote): `\\`, `\"`, `\$`, `` \` `` and, for a
+        // control character, cescape_char's C escape (`\t`, `\n`, `\033`), not the letter after the backslash.
+        const kv = m[1] !== undefined ? (unescapeShown(m[1], '"', "$`") ?? m[1].replace(/\\(.)/g, "$1")) : m[2]!;
+        if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(kv)) vars.push(kv);
       }
     } else if (line.startsWith("EnvironmentFiles=")) {
       const path = line.slice("EnvironmentFiles=".length).replace(/\s*\(ignore_errors=(yes|no)\)\s*$/, "").trim();
@@ -1391,7 +1411,7 @@ function unitEnv(unit: string): { vars: string[]; files: string[] } {
 }
 
 /** The old hub's unit environment (unitEnv) as systemd lines for core's unit. */
-function unitEnvironment(unit: string): string[] {
+export function unitEnvironment(unit: string): string[] {
   const { vars, files } = unitEnv(unit);
   return [...vars.map((kv) => `Environment=${unitQuote(kv)}`), ...files.map((f) => `EnvironmentFile=-${f.replace(/%/g, "%%")}`)];
 }
@@ -1422,7 +1442,11 @@ export function handOverEnv(from: string | undefined, base: NodeJS.ProcessEnv = 
     const i = kv.indexOf("=");
     env[kv.slice(0, i)] = kv.slice(i + 1);
   }
-  for (const f of files) {
+  for (const f of files.flatMap((pattern) => {
+    const paths = envFilePaths(pattern);
+    if (paths === null) unread.push(pattern);
+    return paths ?? [];
+  })) {
     let body: string;
     try {
       body = readFileSync(f, "utf8");
@@ -1435,6 +1459,27 @@ export function handOverEnv(from: string | undefined, base: NodeJS.ProcessEnv = 
     else for (const [k, v] of got) env[k] = v;
   }
   return { env, unread };
+}
+
+/**
+ * The files an EnvironmentFile= path names: itself, or, for a wildcard (systemd.exec: "an absolute filename or
+ * wildcard expression"; systemd reads every match, sorted, as glob(3) finds them), the matches in its folder. null
+ * for a wildcard in a folder name: not read here (named in `unread`).
+ */
+function envFilePaths(pattern: string): string[] | null {
+  if (!/[*?[]/.test(pattern)) return [pattern];
+  const dir = dirname(pattern);
+  if (/[*?[]/.test(dir)) return null;
+  const base = basename(pattern);
+  const glob = new Bun.Glob(base);
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return []; // no folder: no match, skipped as core's unit (EnvironmentFile=-) skips it
+  }
+  // glob(3) without GLOB_PERIOD: a leading dot is matched only by a pattern that starts with one.
+  return names.filter((n) => (base.startsWith(".") || !n.startsWith(".")) && glob.match(n)).sort().map((n) => join(dir, n));
 }
 
 /** The old unit core's unit takes over from (and takes its environment from): the old hub's, else the first one paused. */
