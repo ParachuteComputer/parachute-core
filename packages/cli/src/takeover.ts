@@ -1407,7 +1407,7 @@ function unitEnvironment(unit: string): string[] {
  * `unread`: what couldn't be read exactly (an environment file, see envFileVars; a manager value, see managerValue),
  * left out here; systemd still gives it to the unit. No unit (a home a hand-run process served): the caller's environment, as it is.
  */
-function handOverEnv(from: string | undefined, base: NodeJS.ProcessEnv = process.env): { env: Record<string, string>; unread: string[] } {
+export function handOverEnv(from: string | undefined, base: NodeJS.ProcessEnv = process.env): { env: Record<string, string>; unread: string[] } {
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(base)) if (v !== undefined) env[k] = v;
   const unread: string[] = [];
