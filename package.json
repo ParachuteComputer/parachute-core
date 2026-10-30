@@ -1,6 +1,6 @@
 {
   "name": "@openparachute/core",
-  "version": "0.8.0-pre.1",
+  "version": "0.9.0-pre.1",
   "description": "Parachute: one program for the vault and the hub. Command: parachute (parachute-core is an alias).",
   "private": true,
   "type": "module",

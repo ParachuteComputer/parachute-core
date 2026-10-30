@@ -783,7 +783,11 @@ function ours(dir: string): boolean {
   try {
     const real = realpathSync(dir);
     const root = realpathSync(mine);
-    return real === root || real.startsWith(`${root}/`);
+    if (real === root || real.startsWith(`${root}/`)) return true;
+    // Any release of core is not "the old programs": a vault that 0.8's bundle registered (<bundle>/lib/packages/
+    // vault, beside lib/package.json @openparachute/core) is served by this release as its own (0.8 → 0.9).
+    const up = dirname(real);
+    return basename(up) === "packages" && readJson(join(dirname(up), "package.json"))?.name === core.name;
   } catch {
     return false;
   }
@@ -2004,11 +2008,12 @@ async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ ba
  * `dir` as JSON before a restore puts the backup's notes back. Compared with the backup itself, not by timestamps,
  * which an import can set to anything.
  */
-function exportChanged(home: string, backupHome: string, dir: string): number {
+export function exportChanged(home: string, backupHome: string, dir: string, skip: string[] = []): number {
   let n = 0;
   mkdirSync(dir, { recursive: true, mode: 0o700 });
+  // `skip`: databases (relative paths) a restore leaves in place, so there is nothing of theirs to export.
   const byName = (root: string) =>
-    new Map(databases(root, { hub: 0, vault: 0 }).filter((d) => d.rel !== "hub.db").map((d) => [basename(dirname(d.rel)), join(root, d.rel)]));
+    new Map(databases(root, { hub: 0, vault: 0 }).filter((d) => d.rel !== "hub.db" && !skip.includes(d.rel)).map((d) => [basename(dirname(d.rel)), join(root, d.rel)]));
   const before = byName(backupHome);
   const now = byName(home);
   for (const name of new Set([...before.keys(), ...now.keys()])) {

@@ -1,6 +1,6 @@
 {
   "name": "@openparachute/cli",
-  "version": "0.8.0-pre.1",
+  "version": "0.9.0-pre.1",
   "description": "The parachute-core command: one entry for the hub's and the vault's commands.",
   "private": true,
   "type": "module",

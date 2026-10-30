@@ -38,6 +38,7 @@ import { fileURLToPath } from "node:url";
 import { SCHEMA_VERSION } from "@openparachute/vault/core/src/schema.ts";
 import core from "../../../package.json" with { type: "json" };
 import { homeDir, newerData, repairModes } from "./home.ts";
+import type { Notice } from "./front.ts";
 import { managedRefusal } from "./managed.ts";
 
 export type Role = "core" | "hub" | "vault";
@@ -70,7 +71,7 @@ function coreHelp(): string {
 export function route(
   role: Role,
   argv: string[],
-): { print: string } | { install: string[] } | { embedded: string[] } | { bootstrap: string[] } | { takeover: string[] } | { cli: "hub" | "vault"; argv: string[] } {
+): { print: string } | { frontHelp: true } | { changes: string[] } | { install: string[] } | { embedded: string[] } | { bootstrap: string[] } | { takeover: string[] } | { cli: "hub" | "vault"; argv: string[] } {
   if (role === "core" && argv[0] === "install") return { install: argv.slice(1) };
   if (role === "core" && argv[0] === "takeover") return { takeover: argv.slice(1) };
   const cli = role === "vault" || (role === "core" && argv[0] === "vault") ? "vault" : "hub";
@@ -79,6 +80,10 @@ export function route(
   if (cmd === "version" || cmd === "--version" || cmd === "-v") {
     return { print: rest.includes("--json") ? JSON.stringify(versionJson()) : core.version };
   }
+  // `parachute help` (no --all): the front door's help (front.ts), after the home's checks.
+  if (role === "hub" && (args.length === 0 || (["help", "--help", "-h"].includes(cmd!) && !rest.includes("--all")))) return { frontHelp: true };
+  // `changes` (front.ts) reads only the map it ships and the home's usage log, so it answers before any check.
+  if (cli === "hub" && cmd === "changes") return { changes: rest };
   if (cli === "hub" && cmd === "serve" && rest.includes("--embedded")) return { embedded: rest };
   if (cli === "hub" && cmd === "bootstrap") return { bootstrap: rest };
   return { cli, argv: args };
@@ -126,14 +131,21 @@ function homeFlag(args: string[]): { home?: string; twice: boolean } {
   return { home: found[0], twice: found.length > 1 };
 }
 
-/** Run as `role` with this process's arguments. The moved CLIs run in this process, as if started directly. */
-export async function dispatch(role: Role): Promise<void> {
+/**
+ * Run as `role` with this process's arguments. The moved CLIs run in this process, as if started directly.
+ * `notice`: an old name was used (front.ts); it is said, and counted, once the home has passed its checks.
+ */
+export async function dispatch(role: Role, notice?: Notice): Promise<void> {
   process.umask(0o077);
   const argv = process.argv.slice(2);
   const r = route(role, argv);
   if ("print" in r) {
     console.log(r.print);
     return;
+  }
+  if ("changes" in r) {
+    const { changes } = await import("./front.ts");
+    process.exit(changes(r.changes, homeDir()));
   }
   if ("install" in r) {
     const { install } = await import("./install.ts");
@@ -156,22 +168,37 @@ export async function dispatch(role: Role): Promise<void> {
   const home = homeDir();
   // Every command but `version` (answered above) runs behind the check, help included: the moved CLIs do work on
   // the home before they read their arguments (the vault moves older layouts first), so `serve --help` is a command.
-  if (!hostArgs || process.env.PARACHUTE_HOME) {
-    const { HUB_SCHEMA_VERSION } = await import("@openparachute/hub/src/hub-db.ts");
+  const { HUB_SCHEMA_VERSION } = await import("@openparachute/hub/src/hub-db.ts");
+  const name = role === "core" ? "parachute-core" : role === "hub" ? "parachute" : "parachute-vault";
+  /** The newer-data check: the exit code to stop with (having said why), or null. Run again under the release lock. */
+  const newerCheck = (): number | null => {
     const { newer, unchecked } = newerData(home, { hub: HUB_SCHEMA_VERSION, vault: SCHEMA_VERSION });
-    const name = role === "core" ? "parachute-core" : role === "hub" ? "parachute" : "parachute-vault";
     if (newer.length > 0) {
       console.error(`${name}: this home was written by a newer Parachute (${core.name} ${core.version} here):`);
       for (const line of newer) console.error(`  ${line}`);
       console.error("Nothing was opened or changed. Run the newer version, or restore a backup made for this one.");
-      process.exit(EXIT_NEWER_DATA);
+      return EXIT_NEWER_DATA;
     }
     if (unchecked.length > 0) {
       console.error(`${name}: can't check this home's data without changing it:`);
       for (const line of unchecked) console.error(`  ${line}`);
       console.error("Nothing was opened or changed. Stop what holds it open, or make room in the temp folder, and retry.");
-      process.exit(EXIT_HOME_UNUSABLE);
+      return EXIT_HOME_UNUSABLE;
     }
+    return null;
+  };
+  if (!hostArgs || process.env.PARACHUTE_HOME) {
+    const stop = newerCheck();
+    if (stop !== null) process.exit(stop);
+  }
+  if (notice) {
+    const { announce } = await import("./front.ts");
+    announce(notice, home);
+  }
+  if ("frontHelp" in r) {
+    const { frontHelp } = await import("./front.ts");
+    console.log(frontHelp());
+    return;
   }
   if (embeddedArgs) {
     process.env.PARACHUTE_OFFLINE = "1";
@@ -192,6 +219,24 @@ export async function dispatch(role: Role): Promise<void> {
     process.exit(await takeover(takeoverArgs));
   }
   if (!("cli" in r)) return;
+  if (r.cli === "hub" && r.argv[0] === "upgrade" && r.argv.includes("--rollback")) {
+    const { rollback } = await import("./release.ts");
+    process.exit(await rollback(home, r.argv.slice(1)));
+  }
+  {
+    // The first time this release opens a home an older one served: record the step and back the databases up
+    // first (release.ts). Not a host's (embedded) home, nor one the old 0.7 programs still own.
+    const { beforeOpenOrExit } = await import("./release.ts");
+    const code = beforeOpenOrExit(home, newerCheck);
+    if (code !== null) process.exit(code);
+  }
+  if (r.cli === "hub" && r.argv[0] === "keys") {
+    // `keys` (and its alias `tokens`) is core's (keys.ts): answered here, or mapped onto the hub's auth commands.
+    const { keysCommand } = await import("./keys.ts");
+    const k = keysCommand(r.argv.slice(1));
+    if ("exit" in k) process.exit(k.exit);
+    r.argv = k.argv;
+  }
   const refusal = managedRefusal(r.cli, r.argv);
   if (refusal) {
     console.error(refusal);

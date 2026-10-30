@@ -33,6 +33,7 @@ import {
 import { generateUlid } from "./ulid.js";
 import { captureVersion, readPriorNoteRow, DEFAULT_HISTORY_POLICY, type HistoryPolicy } from "./history.js";
 import { refreshCompactState } from "./history-compact-state.js";
+import { typeNamesAmong } from "./tag-kind.js";
 
 /**
  * Write-attribution context (vault#298) — the two axes of provenance threaded
@@ -154,8 +155,15 @@ export function getNote(db: Database, id: string): Note | null {
   if (!row) return null;
 
   const note = rowToNote(row);
-  note.tags = getNoteTags(db, note.id);
+  withTagsAndTypes(db, note);
   return note;
+}
+
+/** Attach a note's tags, and the subset that are types (T-318 §8a). */
+function withTagsAndTypes(db: Database, note: Note): void {
+  note.tags = getNoteTags(db, note.id);
+  const types = typeNamesAmong(db, note.tags);
+  note.types = note.tags.filter((t) => types.has(t));
 }
 
 /**
@@ -181,7 +189,7 @@ export function getNoteByPath(db: Database, path: string, extension?: string): N
     ).get(path, extension.toLowerCase()) as NoteRow | null;
     if (!row) return null;
     const note = rowToNote(row);
-    note.tags = getNoteTags(db, note.id);
+    withTagsAndTypes(db, note);
     return note;
   }
 
@@ -194,7 +202,7 @@ export function getNoteByPath(db: Database, path: string, extension?: string): N
   if (rows.length === 0) return null;
   if (rows.length === 1) {
     const note = rowToNote(rows[0]!);
-    note.tags = getNoteTags(db, note.id);
+    withTagsAndTypes(db, note);
     return note;
   }
   throw new AmbiguousPathError(
@@ -1840,7 +1848,11 @@ function fetchNotesByIdsOrdered(db: Database, ids: string[]): Note[] {
     if (row) notes.push(rowToNote(row));
   }
   const tagsById = getNoteTagsForNotes(db, notes.map((n) => n.id));
-  for (const note of notes) note.tags = tagsById.get(note.id) ?? [];
+  const types = typeNamesAmong(db, [...new Set([...tagsById.values()].flat())]);
+  for (const note of notes) {
+    note.tags = tagsById.get(note.id) ?? [];
+    note.types = note.tags.filter((t) => types.has(t));
+  }
   return notes;
 }
 
@@ -2367,8 +2379,10 @@ export function semanticSearchNotes(
 function notesWithTags(db: Database, rows: NoteRow[], scores?: Map<string, number>): Note[] {
   const notes = rows.map(rowToNote);
   const tagsById = getNoteTagsForNotes(db, notes.map((n) => n.id));
+  const types = typeNamesAmong(db, [...new Set([...tagsById.values()].flat())]);
   for (const note of notes) {
     note.tags = tagsById.get(note.id) ?? [];
+    note.types = note.tags.filter((t) => types.has(t));
     if (scores) {
       const s = scores.get(note.id);
       if (s !== undefined) note.score = s;
@@ -2676,11 +2690,11 @@ export function renameTag(db: Database, oldName: string, newName: string, attr?:
     // `timestampToMs` never returns null here.
     const nowMs = timestampToMs(now) ?? Date.now();
     const readStmt = db.prepare(
-      "SELECT description, fields, relationships, parent_names, created_at FROM tags WHERE name = ?",
+      "SELECT description, fields, relationships, parent_names, created_at, kind FROM tags WHERE name = ?",
     );
     const insertStmt = db.prepare(
-      `INSERT INTO tags (name, description, fields, relationships, parent_names, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO tags (name, description, fields, relationships, parent_names, created_at, updated_at, kind)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     const repointStmt = db.prepare(
       "UPDATE note_tags SET tag_name = ? WHERE tag_name = ? RETURNING note_id",
@@ -2688,7 +2702,7 @@ export function renameTag(db: Database, oldName: string, newName: string, attr?:
     const dropStmt = db.prepare("DELETE FROM tags WHERE name = ?");
     for (const { from, to } of renames) {
       const old = readStmt.get(from) as
-        | { description: string | null; fields: string | null; relationships: string | null; parent_names: string | null; created_at: string | null }
+        | { description: string | null; fields: string | null; relationships: string | null; parent_names: string | null; created_at: string | null; kind: string | null }
         | null;
       insertStmt.run(
         to,
@@ -2698,6 +2712,7 @@ export function renameTag(db: Database, oldName: string, newName: string, attr?:
         old?.parent_names ?? null,
         old?.created_at ?? now,
         now,
+        old?.kind ?? null,
       );
       const repointed = repointStmt.all(to, from) as { note_id: string }[];
       renamedNoteTags += repointed.length;
@@ -3267,6 +3282,7 @@ export function toNoteIndex(note: Note): NoteIndex {
     lastUpdatedBy: note.lastUpdatedBy ?? null,
     lastUpdatedVia: note.lastUpdatedVia ?? null,
     tags: note.tags,
+    ...(note.types ? { types: note.types } : {}),
     metadata: note.metadata,
     byteSize,
     preview,

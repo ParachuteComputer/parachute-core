@@ -1,6 +1,7 @@
 import { SEARCH_MODES } from "./search-query.js";
 import { MIN_CONTENT_LENGTH } from "./content-range-constants.js";
 import { MAX_TICKET_UPLOAD_BYTES } from "./attachment/tickets.js";
+import { SHORT_TOOLS } from "./mcp-short.js";
 
 /**
  * Pure-data MCP tool manifest — the single source of truth for every core MCP
@@ -44,7 +45,14 @@ export interface McpToolManifestEntry {
   condition: McpToolCondition;
 }
 
-export const MCP_TOOL_MANIFEST: readonly McpToolManifestEntry[] = [
+/**
+ * The full reference for every core tool: the long descriptions and complete
+ * input schemas agents saw before 0.9's description budget. No longer sent in
+ * `tools/list`; `vault-info { help: "<tool>" }` returns an entry, and its
+ * schema's property names are the parameters a tool accepts
+ * (`unknownParams`, mcp-short.ts).
+ */
+export const MCP_TOOL_REFERENCE: readonly McpToolManifestEntry[] = [
     {
       name: "query-notes",
       requiredVerb: "read",
@@ -789,3 +797,21 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
       condition: "attachment-bytes",
     },
 ];
+
+/**
+ * What `tools/list` sends: each reference entry with its short description and
+ * schema from mcp-short.ts (T-318 §4 description budget). Same names, verbs,
+ * conditions and order as the reference.
+ */
+export const MCP_TOOL_MANIFEST: readonly McpToolManifestEntry[] = MCP_TOOL_REFERENCE.map((entry) => {
+  const short = SHORT_TOOLS[entry.name];
+  if (!short) throw new Error(`mcp-short.ts has no entry for MCP tool "${entry.name}"`);
+  return { ...entry, description: short.description, inputSchema: short.inputSchema };
+});
+
+/** The parameter names a core tool accepts: every property of its full reference schema. */
+export function acceptedParams(tool: string): string[] | null {
+  const entry = MCP_TOOL_REFERENCE.find((e) => e.name === tool);
+  if (!entry) return null;
+  return Object.keys(((entry.inputSchema as { properties?: Record<string, unknown> }).properties) ?? {});
+}

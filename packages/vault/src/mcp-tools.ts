@@ -8,6 +8,9 @@
 import { generateMcpTools, resolveNote } from "../core/src/mcp.ts";
 import { projectHistoryProvenance } from "../core/src/history-visibility.js";
 import type { McpToolDef, GenerateMcpToolsOpts } from "../core/src/mcp.ts";
+import { MCP_TOOL_REFERENCE, acceptedParams } from "../core/src/mcp-manifest.ts";
+import { mergeTypesIntoTags } from "../core/src/tag-kind.ts";
+import { nestedParamProblem, NEW_TOOLS, SHORT_TOOLS, TOOL_ALIASES, TOOL_ORDER, aliasDescription, unknownParams, type ParamProblem } from "../core/src/mcp-short.ts";
 import { getNote, getNoteTags, getVaultMap, getVaultStats } from "../core/src/notes.ts";
 import { narrowLinkWarningsForVisibility } from "../core/src/wikilinks.ts";
 import type { Note } from "../core/src/types.ts";
@@ -343,8 +346,190 @@ export function generateScopedMcpTools(
   // callers. See vault#376. The raw caller bearer (vault#403, MGT) is
   // forwarded to hub's mint-token attenuation proxy on mint.
   tools.push(buildManageTokenTool(vaultName, auth, callerBearer ?? null));
+  const shaped = applyElevenTools(tools, vaultName, auth);
+  applyParamTeaching(shaped, vaultName);
 
-  return tools;
+  return shaped;
+}
+
+/**
+ * 0.9's tool shape (T-318 §4): eleven tools, built from the old ones after every
+ * scope guard and wrapper is on them, so a new name can never do more than the
+ * old one did. `manage-types` and `attachment-url` dispatch on `action`;
+ * `manage-keys` is `manage-token` renamed; `query-notes {path_between}` runs
+ * find-path. The nine old names stay listed (Prism allow-lists some by name)
+ * with a one-line deprecation description, and their object results carry a
+ * `deprecation` field. Gone in 1.0.
+ */
+function applyElevenTools(tools: McpToolDef[], vaultName: string, auth: AuthResult | undefined): McpToolDef[] {
+  const byName = new Map(tools.map((t) => [t.name, t]));
+  const out: McpToolDef[] = [];
+
+  for (const [name, spec] of Object.entries(NEW_TOOLS)) {
+    const folded = Object.values(spec.folds).map((n) => byName.get(n));
+    if (folded.some((t) => !t)) continue; // e.g. no attachment tickets wired: no attachment-url
+    const actions = Object.keys(spec.folds);
+    out.push({
+      name,
+      description: spec.description,
+      inputSchema: spec.inputSchema,
+      // The least any action needs; each action re-checks its own verb below.
+      requiredVerb: folded.map((t) => t!.requiredVerb ?? "write").sort((a, b) => VERB_RANK[a]! - VERB_RANK[b]!)[0]!,
+      execute: async (params) => {
+        const action = (params.action ?? (name === "manage-types" ? "update" : undefined)) as string | undefined;
+        const target = action ? byName.get(spec.folds[action] ?? "") : undefined;
+        if (!target) {
+          throw Object.assign(new Error(`${name} needs \`action\`: ${actions.join(", ")}.`), {
+            error_type: "unknown_parameter",
+            field: "action",
+            hint: `one of ${actions.join(", ")}`,
+          });
+        }
+        const verb = target.requiredVerb ?? "write";
+        // No auth context means the caller's scopes were already settled outside (local stdio): nothing to narrow.
+        if (auth && !hasScopeForVault(auth.scopes, vaultName, verb)) {
+          throw new Error(`Forbidden: ${name} {action: "${action}"} needs the 'vault:${vaultName}:${verb}' scope.`);
+        }
+        const { action: _drop, ...rest } = params;
+        return target.execute(rest);
+      },
+    });
+  }
+
+  const token = byName.get("manage-token");
+  if (token) {
+    out.push({ ...token, name: "manage-keys", description: token.description.replace('vault-info {help: \"manage-token\"}', 'vault-info {help: \"manage-keys\"}') });
+  }
+
+  const query = byName.get("query-notes");
+  const findPath = byName.get("find-path");
+  if (query && findPath) {
+    const execute = query.execute;
+    query.execute = async (params) => {
+      if (params.path_between === undefined) return execute(params);
+      const pb = params.path_between as Record<string, unknown> | null;
+      if (!pb || typeof pb !== "object" || Array.isArray(pb)) {
+        throw Object.assign(new Error("path_between takes {source, target, max_depth?}."), { error_type: "invalid_query", field: "path_between" });
+      }
+      return findPath.execute(pb);
+    };
+  }
+
+  for (const t of tools) {
+    if (!(t.name in TOOL_ALIASES)) {
+      out.push(t);
+      continue;
+    }
+    const execute = t.execute;
+    const use = TOOL_ALIASES[t.name]!;
+    out.push({
+      ...t,
+      description: aliasDescription(t.name),
+      execute: async (params) => {
+        const result = await execute(params);
+        if (result && typeof result === "object" && !Array.isArray(result)) {
+          return { ...(result as Record<string, unknown>), deprecation: { tool: t.name, use, removed_in: "1.0" } };
+        }
+        return result;
+      },
+    });
+  }
+
+  const rank = (n: string) => {
+    const i = TOOL_ORDER.indexOf(n);
+    return i === -1 ? TOOL_ORDER.length : i;
+  };
+  return out.sort((a, b) => rank(a.name) - rank(b.name));
+}
+
+const VERB_RANK: Record<string, number> = { read: 0, write: 1, admin: 2 };
+
+/** Ignored unknown parameters so far, per `tool.param`, in this process (the counted log line). */
+const unknownParamCounts = new Map<string, number>();
+/** At most this many `tool.param` keys in all, `tool.<other>` ones included: once full, a new name counts as its
+ *  tool's `<other>` if that key is already there, and is dropped from the count (still ignored and warned) if not. */
+const UNKNOWN_PARAM_KEYS_MAX = 256;
+
+/** Count one ignored name and log it: every one of the first 10 per name, then every 100th (the count says how many). */
+function countUnknownParam(tool: string, field: string): void {
+  // Caller-chosen text: never let it forge a line or grow without bound.
+  const name = field.replace(/[^\w.-]/g, "?").slice(0, 64);
+  let key = `${tool}.${name}`;
+  if (!unknownParamCounts.has(key) && unknownParamCounts.size >= UNKNOWN_PARAM_KEYS_MAX - 1) key = `${tool}.<other>`;
+  if (!unknownParamCounts.has(key) && unknownParamCounts.size >= UNKNOWN_PARAM_KEYS_MAX) return;
+  const n = (unknownParamCounts.get(key) ?? 0) + 1;
+  unknownParamCounts.set(key, n);
+  if (n <= 10 || n % 100 === 0) console.error(`[mcp] unknown parameter ignored: ${key} (${n} since start)`);
+}
+
+/** Every parameter a core tool takes: its full reference schema and the short schema it advertises. */
+function takes(name: string): string[] {
+  return [...new Set([...(acceptedParams(name) ?? []), ...Object.keys((SHORT_TOOLS[name]?.inputSchema as { properties?: object })?.properties ?? {})])];
+}
+
+/**
+ * Parameters a tool doesn't know (T-318 §4, and the 10-30 decision "nothing
+ * removed before 1.0"). As on 0.8 the call runs with them ignored, so no client
+ * that worked on 0.8 breaks. Unlike 0.8 the answer says so:
+ *   - an object answer gets a `warnings` entry per name, `{code:
+ *     "unknown_parameter", message, field, hint}` (the one-line fix);
+ *   - an array answer keeps its shape, so the log line is its only trace;
+ *   - a call that fails anyway names the fix in its error;
+ *   - every name is counted in a stderr line, `tool.param` and the count,
+ *     never the value (`countUnknownParam`), so real exposure can be measured
+ *     before 1.0.
+ * `manage-types` and `attachment-url` check against the action called: a
+ * parameter only another action takes is ignored by this one, so it is named.
+ * With no valid action (attachment-url has no default) the call is refused with
+ * the list of actions, so nothing is silently ignored and nothing is named.
+ * A misused nested key (`near: {id}`) is refused, as 0.8 refused it. A tool
+ * accepts every parameter in its full reference schema and in the short schema
+ * it advertises.
+ */
+function applyParamTeaching(tools: McpToolDef[], vaultName: string): void {
+  for (const tool of tools) {
+    const folds = NEW_TOOLS[tool.name]?.folds;
+    const reference =
+      tool.name === "manage-token" || tool.name === "manage-keys"
+        ? Object.keys(manageTokenReference(vaultName).inputSchema.properties as object)
+        : folds
+          ? ["action", ...Object.values(folds).flatMap(takes)]
+          : acceptedParams(tool.name);
+    if (!reference) continue;
+    const accepted = [...new Set([...reference, ...Object.keys(((tool.inputSchema as { properties?: object }).properties) ?? {})])];
+    const perAction = folds ? Object.fromEntries(Object.entries(folds).map(([a, n]) => [a, ["action", ...takes(n)]])) : undefined;
+    const acceptedFor = (params: Record<string, unknown>) => {
+      const action = params.action ?? (tool.name === "manage-types" ? "update" : undefined);
+      return (typeof action === "string" && perAction?.[action]) || accepted;
+    };
+    const execute = tool.execute;
+    tool.execute = async (params) => {
+      const nested = nestedParamProblem(tool.name, params ?? {});
+      if (nested) throw Object.assign(new Error(nested.message), nested);
+      const unknown = unknownParams(tool.name, params ?? {}, acceptedFor(params ?? {}));
+      if (unknown.length === 0) return execute(params);
+      for (const u of unknown) countUnknownParam(tool.name, u.field);
+      let result: unknown;
+      try {
+        result = await execute(params);
+      } catch (err) {
+        try {
+          if (err instanceof Error) err.message += ` (Also: ${unknown.map((u) => u.message.replace(/ Every parameter:.*$/, "")).join(" ")})`;
+        } catch {} // a frozen error keeps its own message
+        throw err;
+      }
+      return withParamWarnings(tool.name, result, unknown);
+    };
+  }
+}
+
+function withParamWarnings(tool: string, result: unknown, unknown: ParamProblem[]): unknown {
+  const warnings = unknown.map((u) => ({ code: u.error_type, message: u.message, field: u.field, hint: u.hint }));
+  // query-notes answers `{notes, warnings}` whenever it has a warning (core mcp.ts), a shape its callers already read.
+  if (tool === "query-notes" && Array.isArray(result)) return { notes: result, warnings };
+  if (!result || typeof result !== "object" || Array.isArray(result)) return result;
+  const r = result as Record<string, unknown>;
+  return { ...r, warnings: [...(Array.isArray(r.warnings) ? r.warnings : []), ...warnings] };
 }
 
 /**
@@ -543,7 +728,7 @@ function applyTagScopeWrappers(
    * excludes nothing — again exactly a nonexistent tag). Aliases mirror
    * core's `exclude_tags ?? excludeTags ?? exclude_tag` resolution order.
    */
-  const QUERY_TAG_PARAMS = ["tag", "exclude_tags", "excludeTags", "exclude_tag"] as const;
+  const QUERY_TAG_PARAMS = ["tag", "type", "exclude_tags", "excludeTags", "exclude_tag"] as const;
   const scopeQueryTagParams = (params: any, allowed: Set<string> | null): any => {
     if (!params || typeof params !== "object") return params;
     let next = params;
@@ -823,7 +1008,9 @@ function applyTagScopeWrappers(
     const items = Array.isArray((params as any).notes)
       ? (params as any).notes
       : [params];
-    for (const item of items) {
+    for (const raw of items) {
+      // T-318 §8a: `types` are memberships too; check them with the tags.
+      const item = mergeTypesIntoTags(raw as Record<string, unknown>, "create");
       const itemTags = Array.isArray((item as any).tags) ? ((item as any).tags as string[]) : [];
       if (!tagsWithinScope(itemTags, allowed, rawTags)) {
         return forbidden("create-note: every note must carry at least one tag in the token's allowlist");
@@ -848,7 +1035,8 @@ function applyTagScopeWrappers(
     const items = Array.isArray((params as any).notes)
       ? (params as any).notes
       : [params];
-    for (const item of items) {
+    for (const raw of items) {
+      const item = mergeTypesIntoTags(raw as Record<string, unknown>, "update");
       const id = (item as any).id ?? (item as any).note_id;
       if (!id) continue;
       const existing = await store.getNote(id as string);
@@ -1039,6 +1227,35 @@ function overrideVaultInfo(
     // containing the scope name) — see "tools/call of vault-info with
     // description arg and vault:read scope is refused" in src/vault.test.ts.
     // Changing that transport shape is out of scope for this wave.
+    // `help` (T-318 §4): a tool's full reference, the long text and every
+    // parameter, which tools/list no longer carries.
+    if (params.help !== undefined) {
+      const name = String(params.help);
+      if (NEW_TOOLS[name]) {
+        const spec = NEW_TOOLS[name]!;
+        return {
+          tool: name,
+          description: spec.description,
+          parameters: spec.inputSchema,
+          // Each action takes the parameters of the tool it replaces.
+          actions: Object.fromEntries(
+            Object.entries(spec.folds).map(([action, old]) => [action, { replaces: old, parameters: MCP_TOOL_REFERENCE.find((e) => e.name === old)?.inputSchema }]),
+          ),
+        };
+      }
+      const ref =
+        name === "manage-token" || name === "manage-keys"
+          ? { ...manageTokenReference(vaultName), name }
+          : MCP_TOOL_REFERENCE.find((e) => e.name === name);
+      if (!ref) {
+        throw Object.assign(new Error(`No tool named "${name}". Tools: ${tools.map((t) => t.name).join(", ")}.`), {
+          error_type: "unknown_tool",
+          field: "help",
+          hint: "pass one of the tool names",
+        });
+      }
+      return { tool: ref.name, description: ref.description, parameters: ref.inputSchema };
+    }
     const config = readVaultConfig(vaultName);
     if (!config) throw new Error(`Vault "${vaultName}" not found`);
 
@@ -1190,14 +1407,13 @@ function resolveHubOrigin(): { url: string; source: string } {
  * matching the requested action. The MCP HTTP layer serializes the result
  * via `JSON.stringify`, so caller-side parsing keys off the action field.
  */
-function buildManageTokenTool(
-  vaultName: string,
-  auth: AuthResult | undefined,
-  callerBearer: string | null,
-): McpToolDef {
+/**
+ * manage-token's full reference (the long text agents saw before 0.9's
+ * description budget), for `vault-info { help: "manage-token" }`.
+ */
+export function manageTokenReference(vaultName: string): { name: string; description: string; inputSchema: Record<string, unknown> } {
   return {
     name: "manage-token",
-    requiredVerb: "admin",
     description:
       "Mint, revoke, or list short-TTL hub JWTs within this MCP session. " +
       "Designed for one-shot AI-driven workflows: mint a narrow token, run a " +
@@ -1246,6 +1462,33 @@ function buildManageTokenTool(
           type: "string",
           description: "(action=revoke) The jti (e.g. `t_abc123…`) returned by a prior mint. Revoke is idempotent — second revoke also returns ok=true.",
         },
+      },
+      required: ["action"],
+    },
+  };
+}
+
+function buildManageTokenTool(
+  vaultName: string,
+  auth: AuthResult | undefined,
+  callerBearer: string | null,
+): McpToolDef {
+  return {
+    name: "manage-token",
+    requiredVerb: "admin",
+    description:
+      "Mint, list or revoke short-lived keys for this vault. mint: `scope` (e.g. \"vault:" + vaultName + ":read\"), " +
+      "`ttl_seconds` (default 900, max 3600, or 90 days with `long_lived: true`), `description`. revoke: `jti`. " +
+      "Minted keys can't exceed yours. Every parameter: vault-info {help: \"manage-token\"}.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["mint", "revoke", "list"] },
+        scope: { oneOf: [{ type: "string" }, { type: "array", items: { type: "string" } }] },
+        ttl_seconds: { type: "number" },
+        long_lived: { type: "boolean" },
+        description: { type: "string" },
+        jti: { type: "string" },
       },
       required: ["action"],
     },

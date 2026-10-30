@@ -1,0 +1,1362 @@
+{
+ "schema": 1,
+ "from": "0.8",
+ "to": "0.9",
+ "version": "0.9.0-pre.1",
+ "status": "0.9.0-pre.1: every entry carries state: live (works in this build) or planned (designed, not built yet). Old names keep working either way.",
+ "rule": "data migrates automatically; every removed name has an entry here and warns for one release",
+ "upgrade_policy": "every step through 1.0 has a migration path; 1.0 takes any home from 0.7 on; after 1.0, older homes go to 1.0 first (1.0 is the required waypoint)",
+ "waypoint": "1.0",
+ "changes": [
+  {
+   "kind": "command",
+   "old": "parachute setup",
+   "new": "parachute setup",
+   "action": "merge",
+   "reason": "one first run: setup, setup-wizard, init, vault init, takeover and bootstrap become one command",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "command",
+   "old": "parachute setup-wizard",
+   "new": "parachute setup --no-browser",
+   "action": "merge",
+   "reason": "the terminal copy of the same wizard",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "command",
+   "old": "parachute init",
+   "new": "parachute setup",
+   "action": "merge",
+   "reason": "same job as setup",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "command",
+   "old": "parachute install <service>",
+   "new": "parachute setup | parachute upgrade",
+   "action": "merge",
+   "reason": "no modules; used on Adam's box, so it says what replaced it instead of disappearing",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "command",
+   "old": "parachute uninstall <service>",
+   "new": "parachute setup --uninstall",
+   "action": "drop",
+   "reason": "no modules; removing Parachute itself is a setup step",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "command",
+   "old": "parachute status",
+   "new": "parachute status",
+   "action": "keep",
+   "reason": "also absorbs the vault's status and url",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "command",
+   "old": "parachute doctor [--json|--fix]",
+   "new": "parachute doctor [--json|--fix]",
+   "action": "keep",
+   "reason": "also absorbs the vault's doctor, history rebuild-state and reap-clients",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "command",
+   "old": "parachute expose tailnet|public|cloudflare [off]",
+   "new": "parachute setup expose tailnet|public|off",
+   "action": "move",
+   "reason": "a one-time choice, like the other setup steps",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "command",
+   "old": "parachute start|stop|restart [service]",
+   "new": "parachute start|stop|restart",
+   "action": "keep",
+   "reason": "no service argument: there is one program",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "command",
+   "old": "parachute upgrade [service]",
+   "new": "parachute upgrade",
+   "action": "keep",
+   "reason": "fetches the next bundle; no service argument",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "command",
+   "old": "parachute logs <service> [-f]",
+   "new": "parachute logs [-f] [--vault <n>]",
+   "action": "keep",
+   "reason": "one log, filtered by vault",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "command",
+   "old": "parachute migrate [--list|--to-supervised|--teardown]",
+   "new": "parachute setup",
+   "action": "drop",
+   "reason": "the takeover (0.8) replaced these one-time moves",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "command",
+   "old": "parachute serve [--listen] [--offline]",
+   "new": "parachute serve",
+   "action": "keep",
+   "reason": "the foreground server for units, containers and hosts",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "command",
+   "old": "parachute auth set-password",
+   "new": "parachute user password",
+   "action": "move",
+   "reason": "people live under `user`",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "command",
+   "old": "parachute auth list-users",
+   "new": "parachute user list",
+   "action": "move",
+   "reason": "people live under `user`",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "command",
+   "old": "parachute auth link-pubkey",
+   "new": "parachute user pubkey add",
+   "action": "move",
+   "reason": "a Nostr key is a person's sign-in",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "command",
+   "old": "parachute auth 2fa",
+   "new": "parachute user 2fa",
+   "action": "move",
+   "reason": "people live under `user`",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "command",
+   "old": "parachute auth rotate-key",
+   "new": "parachute config rotate-signing-key",
+   "action": "move",
+   "reason": "a server setting, used rarely",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "command",
+   "old": "parachute auth rotate-operator",
+   "new": null,
+   "action": "drop",
+   "reason": "the CLI's own credential rotates itself; nobody should have to know it exists",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "command",
+   "old": "parachute auth mint-token",
+   "new": "parachute keys new <name>",
+   "action": "rename",
+   "reason": "every key has a name and an owner; --scope stays, narrowed by --types and --deny; --ephemeral stays",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "command",
+   "old": "parachute auth revoke-token <jti>",
+   "new": "parachute keys revoke <name|jti>",
+   "action": "rename",
+   "reason": "revoke by name, not only by jti",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "command",
+   "old": "parachute auth pending-clients",
+   "new": "parachute keys list --pending",
+   "action": "merge",
+   "reason": "an OAuth app is a key waiting for approval",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "command",
+   "old": "parachute auth approve-client <id>",
+   "new": "parachute keys approve <name>",
+   "action": "merge",
+   "reason": "same, by name",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "command",
+   "old": "parachute auth revoke-client <id>",
+   "new": "parachute keys revoke <name>",
+   "action": "merge",
+   "reason": "revoking the app's key removes its client and grant",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "command",
+   "old": "parachute auth reap-clients",
+   "new": "parachute doctor --fix",
+   "action": "merge",
+   "reason": "housekeeping",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "command",
+   "old": "parachute auth list-grants",
+   "new": "parachute keys list",
+   "action": "merge",
+   "reason": "a consent grant is an app's key",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "command",
+   "old": "parachute auth revoke-grant <client>",
+   "new": "parachute keys revoke <name>",
+   "action": "merge",
+   "reason": "same",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "command",
+   "old": "parachute hub set-origin <url>",
+   "new": "parachute config set server.origin <url>",
+   "action": "move",
+   "reason": "a setting",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "command",
+   "old": "parachute hub set-root-redirect|set-root-mode",
+   "new": "parachute config set server.root <path|app>",
+   "action": "move",
+   "reason": "two commands for one setting",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "command",
+   "old": "parachute surface token mint|list|revoke",
+   "new": null,
+   "action": "move",
+   "reason": "surfaces stay out of core (PLAN §4.2); the surface module keeps its deploy tokens",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "command",
+   "old": "parachute vault rename|remove (hub cascade)",
+   "new": "parachute vault rename|rm",
+   "action": "merge",
+   "reason": "one command that always does the identity cascade too",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "command",
+   "old": "parachute vault attach-|detach-|list-|sync-channels",
+   "new": "parachute vault channel attach|detach|list|sync",
+   "action": "rename",
+   "reason": "Adam's box uses these; one noun, four verbs",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "command",
+   "old": "parachute vault <anything> (passthrough)",
+   "new": "parachute vault <verb>",
+   "action": "drop",
+   "reason": "one CLI, no passthrough to a second binary",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "command",
+   "old": "parachute help | --version",
+   "new": "parachute help | version",
+   "action": "keep",
+   "reason": "",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "command",
+   "old": "parachute-vault init",
+   "new": "parachute setup",
+   "action": "merge",
+   "reason": "one first run",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "command",
+   "old": "parachute-vault create <name> [--mint]",
+   "new": "parachute vault new <name> [--key]",
+   "action": "rename",
+   "reason": "with --key it also mints the vault's first key and prints it",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "command",
+   "old": "parachute-vault packs add|list|remove, add-pack",
+   "new": "parachute vault pack add|list|rm",
+   "action": "merge",
+   "reason": "two commands for one idea",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "command",
+   "old": "parachute-vault list|ls",
+   "new": "parachute vault list",
+   "action": "move",
+   "reason": "",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "command",
+   "old": "parachute-vault mcp-install",
+   "new": "parachute setup mcp <client>",
+   "action": "move",
+   "reason": "connecting an AI client is a setup step",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "command",
+   "old": "parachute-vault mcp-config",
+   "new": "parachute setup mcp <client> --print",
+   "action": "merge",
+   "reason": "the dry form of the same step",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "command",
+   "old": "parachute-vault rename",
+   "new": "parachute vault rename",
+   "action": "merge",
+   "reason": "the hub's cascade and the vault's mechanics, in one",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "command",
+   "old": "parachute-vault remove|rm",
+   "new": "parachute vault rm",
+   "action": "merge",
+   "reason": "same",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "command",
+   "old": "parachute-vault config [set|unset]",
+   "new": "parachute config [get|set|unset]",
+   "action": "merge",
+   "reason": "one settings file (§5)",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "command",
+   "old": "parachute-vault tokens list|revoke",
+   "new": "parachute keys",
+   "action": "merge",
+   "reason": "the name stays as an alias: agents use it to find their keys (8 times in 30 days); the leftover pvt_ rows are listed once and then ignored",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "command",
+   "old": "parachute-vault tokens create",
+   "new": null,
+   "action": "drop",
+   "reason": "already removed (exits 1)",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "command",
+   "old": "parachute-vault set-password",
+   "new": null,
+   "action": "drop",
+   "reason": "legacy YAML owner password; hub sign-in is the only sign-in",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "command",
+   "old": "parachute-vault 2fa",
+   "new": null,
+   "action": "drop",
+   "reason": "legacy YAML 2FA; `user 2fa` is the one",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "command",
+   "old": "parachute-vault serve",
+   "new": "parachute serve",
+   "action": "merge",
+   "reason": "the vault always runs inside the one program",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "command",
+   "old": "parachute-vault logs|status|restart|stop",
+   "new": "parachute logs|status|restart|stop",
+   "action": "merge",
+   "reason": "one program, one set of verbs",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "command",
+   "old": "parachute-vault uninstall [--wipe]",
+   "new": "parachute setup --uninstall [--wipe]",
+   "action": "move",
+   "reason": "rare, destructive, belongs with setup",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "command",
+   "old": "parachute-vault doctor",
+   "new": "parachute doctor",
+   "action": "merge",
+   "reason": "one doctor",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "command",
+   "old": "parachute-vault url",
+   "new": "parachute status",
+   "action": "merge",
+   "reason": "status prints the URLs",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "command",
+   "old": "parachute-vault backup [status] [--schedule]",
+   "new": "parachute backup [now|list|restore|schedule]",
+   "action": "keep",
+   "reason": "whole home (accounts, keys, faces and vaults), with restore",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "command",
+   "old": "parachute-vault history-import plan|prepare|apply|retire|cancel",
+   "new": "parachute vault history import …",
+   "action": "move",
+   "reason": "under the vault noun",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "command",
+   "old": "parachute-vault import <path>",
+   "new": "parachute vault import <path>",
+   "action": "move",
+   "reason": "",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "command",
+   "old": "parachute-vault export <dir>",
+   "new": "parachute vault export <dir>",
+   "action": "move",
+   "reason": "",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "command",
+   "old": "parachute-vault history",
+   "new": "parachute vault history",
+   "action": "move",
+   "reason": "",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "command",
+   "old": "parachute-vault history rebuild-state",
+   "new": "parachute doctor --fix",
+   "action": "merge",
+   "reason": "a repair doctor already detects",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "command",
+   "old": "parachute-vault schema prune|migrate-field",
+   "new": "parachute vault schema prune|migrate-field",
+   "action": "move",
+   "reason": "",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "command",
+   "old": "parachute-vault transcription install",
+   "new": "parachute setup transcription",
+   "action": "move",
+   "reason": "a setup step",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "command",
+   "old": "parachute-vault transcription status",
+   "new": "parachute status",
+   "action": "merge",
+   "reason": "status reports it",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "command",
+   "old": "parachute-vault help | version",
+   "new": "parachute help | version",
+   "action": "merge",
+   "reason": "",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "command",
+   "old": "parachute-core version [--json]",
+   "new": "parachute version [--json]",
+   "action": "keep",
+   "reason": "part of the embedded contract",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "command",
+   "old": "parachute-core install [--prefix]",
+   "new": "parachute install [--prefix]",
+   "action": "keep",
+   "reason": "the installer's own step; not shown in help",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "command",
+   "old": "parachute-core vault <cmd>",
+   "new": "parachute vault <verb>",
+   "action": "keep",
+   "reason": "vault is a front-door noun",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "command",
+   "old": "parachute serve --embedded …",
+   "new": "parachute serve --embedded …",
+   "action": "keep",
+   "reason": "embedded contract v1, frozen for Prism (§Prism)",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "command",
+   "old": "parachute bootstrap --embedded …",
+   "new": "parachute setup --embedded …",
+   "action": "rename",
+   "reason": "kept unchanged inside embedded contract v1",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "mcp-tool",
+   "old": "query-notes",
+   "new": "query-notes",
+   "action": "keep",
+   "reason": "shaped by daily use; names and arguments unchanged",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "mcp-tool",
+   "old": "create-note",
+   "new": "create-note",
+   "action": "keep",
+   "reason": "shaped by daily use; names and arguments unchanged",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "mcp-tool",
+   "old": "update-note",
+   "new": "update-note",
+   "action": "keep",
+   "reason": "shaped by daily use; names and arguments unchanged",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "mcp-tool",
+   "old": "delete-note",
+   "new": "delete-note",
+   "action": "keep",
+   "reason": "shaped by daily use; names and arguments unchanged",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "mcp-tool",
+   "old": "list-tags",
+   "new": "list-tags",
+   "action": "keep",
+   "reason": "shaped by daily use; names and arguments unchanged",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "mcp-tool",
+   "old": "vault-info",
+   "new": "vault-info",
+   "action": "keep",
+   "reason": "shaped by daily use; names and arguments unchanged",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "mcp-tool",
+   "old": "doctor",
+   "new": "doctor",
+   "action": "keep",
+   "reason": "shaped by daily use; names and arguments unchanged",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "mcp-tool",
+   "old": "read-attachment",
+   "new": "read-attachment",
+   "action": "keep",
+   "reason": "shaped by daily use; names and arguments unchanged",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "mcp-tool",
+   "old": "find-path",
+   "new": "query-notes {path_between}",
+   "action": "merge",
+   "reason": "a second way to walk links; alias kept while Prism lists it",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "mcp-tool",
+   "old": "update-tag",
+   "new": "manage-types {action: update}",
+   "action": "merge",
+   "reason": "structure lives on types; the same tool renames, merges and deletes plain tags; old names alias",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "mcp-tool",
+   "old": "delete-tag",
+   "new": "manage-types {action: delete}",
+   "action": "merge",
+   "reason": "structure lives on types; the same tool renames, merges and deletes plain tags; old names alias",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "mcp-tool",
+   "old": "rename-tag",
+   "new": "manage-types {action: rename}",
+   "action": "merge",
+   "reason": "structure lives on types; the same tool renames, merges and deletes plain tags; old names alias",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "mcp-tool",
+   "old": "merge-tags",
+   "new": "manage-types {action: merge}",
+   "action": "merge",
+   "reason": "structure lives on types; the same tool renames, merges and deletes plain tags; old names alias",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "mcp-tool",
+   "old": "prune-schema",
+   "new": "manage-types {action: prune}",
+   "action": "merge",
+   "reason": "structure lives on types; the same tool renames, merges and deletes plain tags; old names alias",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "mcp-tool",
+   "old": "request-attachment-upload",
+   "new": "attachment-url {upload}",
+   "action": "merge",
+   "reason": "two halves of one job",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "mcp-tool",
+   "old": "request-attachment-download",
+   "new": "attachment-url {download}",
+   "action": "merge",
+   "reason": "two halves of one job",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "mcp-tool",
+   "old": "manage-token",
+   "new": "manage-keys",
+   "action": "rename",
+   "reason": "mint, list, revoke, each with scopes; admin only",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "mcp-tool",
+   "old": "list-vaults (account door)",
+   "new": "list-vaults",
+   "action": "keep",
+   "reason": "the Uni app calls it",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "mcp-tool",
+   "old": "create-vault (account door)",
+   "new": "manage-keys / admin API",
+   "action": "keep",
+   "reason": "kept in 0.9; folds into grants at 1.0",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "mcp-tool",
+   "old": "grant-access|revoke-access|list-access (account door)",
+   "new": "manage-keys",
+   "action": "merge",
+   "reason": "access is a key with scopes (0.9) and a grant (1.0)",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "endpoint",
+   "old": "/vault/<n>/api/notes*, tags*, storage*, attachments, versions, restore, find-path, vault",
+   "new": "same",
+   "action": "keep",
+   "reason": "the vault API: what every Uni script and Prism call today",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "endpoint",
+   "old": "/vault/<n>/api/subscribe (WebSocket)",
+   "new": "same",
+   "action": "keep",
+   "reason": "Prism uses it; v1 adds resume and the change feed",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "endpoint",
+   "old": "/vault/<n>/mcp, /vault/<n>/tickets/<id>",
+   "new": "same",
+   "action": "keep",
+   "reason": "",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "endpoint",
+   "old": "/vault/<n>/view/<id|path>",
+   "new": "/vault/<n>/view (the public face)",
+   "action": "keep",
+   "reason": "published notes become a declared public face",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "endpoint",
+   "old": "/vault/<n>/public/<id> (301)",
+   "new": null,
+   "action": "drop",
+   "reason": "a redirect to /view",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "endpoint",
+   "old": "/vault/<n>/oauth/* (410)",
+   "new": null,
+   "action": "drop",
+   "reason": "already gone",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "endpoint",
+   "old": "/vault/<n>/.parachute/* (22 admin routes)",
+   "new": "/admin/api/vaults/<n>/…",
+   "action": "move",
+   "reason": "admin belongs in the one admin API",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "endpoint",
+   "old": "/vault/<n>/api/triggers",
+   "new": "/admin/api/vaults/<n>/triggers",
+   "action": "move",
+   "reason": "admin only today",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "endpoint",
+   "old": "hub /api/* admin, /admin/*-token mints, /api/account/*, /account/* JSON",
+   "new": "/admin/api/…",
+   "action": "merge",
+   "reason": "four self-service and admin doors, one login each; one admin API",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "endpoint",
+   "old": "POST /api/auth/mint-token",
+   "new": "POST /admin/api/keys",
+   "action": "merge",
+   "reason": "one place to mint keys, with scopes",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "endpoint",
+   "old": "root /mcp (vault from token), hub /account/mcp, /mcp",
+   "new": "/mcp (account door, `vault` argument)",
+   "action": "merge",
+   "reason": "two doors at the same path today",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "endpoint",
+   "old": "/login, /logout, /oauth/*, /.well-known/*",
+   "new": "same",
+   "action": "keep",
+   "reason": "standards-shaped; clients depend on them",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "endpoint",
+   "old": "11 legacy 301 redirects",
+   "new": null,
+   "action": "drop",
+   "reason": "kept through 0.9, gone at 1.0",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "endpoint",
+   "old": "/vault/admin, /vault/<n>/admin SPAs",
+   "new": "/admin",
+   "action": "merge",
+   "reason": "one admin page",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "endpoint",
+   "old": "port 1940 (vault listener)",
+   "new": "port 1939",
+   "action": "merge",
+   "reason": "answers as an alias through 0.9; Uni's scripts use it today",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "endpoint",
+   "old": "X-API-Key header, ?key= query",
+   "new": "Authorization: Bearer",
+   "action": "drop",
+   "reason": "keys in URLs end up in logs; warned through 0.9 (tickets keep their URLs)",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "setting",
+   "old": "PARACHUTE_HOME",
+   "new": "PARACHUTE_HOME",
+   "action": "keep",
+   "reason": "where everything lives",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "setting",
+   "old": "PORT / PARACHUTE_BIND_HOST / VAULT_BIND",
+   "new": "server.port / server.bind",
+   "action": "merge",
+   "reason": "one listener",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "setting",
+   "old": "PARACHUTE_HUB_ORIGIN",
+   "new": "server.origin",
+   "action": "move",
+   "reason": "the issuer",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "setting",
+   "old": "PARACHUTE_HUB_ORIGINS",
+   "new": "server.accepted_issuers",
+   "action": "move",
+   "reason": "old issuers that stay valid (uni's t137 drop-in)",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "setting",
+   "old": "PARACHUTE_HUB_JWKS_ORIGIN, PARACHUTE_HUB_PORT",
+   "new": null,
+   "action": "drop",
+   "reason": "one process: the vault gets the keys passed in",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "setting",
+   "old": "PARACHUTE_HUB_ROOT_REDIRECT / _ROOT_MODE",
+   "new": "server.root",
+   "action": "merge",
+   "reason": "one setting",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "setting",
+   "old": "PARACHUTE_INSTALL_CHANNEL / PARACHUTE_CHANNEL / PARACHUTE_MODULE_CHANNEL",
+   "new": "upgrade.channel",
+   "action": "merge",
+   "reason": "three names for one setting",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "setting",
+   "old": "PARACHUTE_OFFLINE",
+   "new": "server.offline",
+   "action": "move",
+   "reason": "",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "setting",
+   "old": "PARACHUTE_NOSTR_AUTO_PROVISION / _LOGIN_2FA",
+   "new": "signin.nostr.*",
+   "action": "move",
+   "reason": "",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "setting",
+   "old": "PARACHUTE_WS_MAX_PER_IP / _TOTAL, HOOK_CONCURRENCY",
+   "new": "server.limits.*",
+   "action": "move",
+   "reason": "",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "setting",
+   "old": "PARACHUTE_PROCESS_MODEL",
+   "new": null,
+   "action": "drop",
+   "reason": "the losing process model is deleted before 0.8.0 (PLAN §2.1)",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "setting",
+   "old": "PARACHUTE_ACCOUNT_MCP_HOP_TTL_SECONDS, PARACHUTE_EXTRA_PATH, ASSETS_DIR",
+   "new": null,
+   "action": "drop",
+   "reason": "internal knobs",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "setting",
+   "old": "VAULT_AUTH_TOKEN",
+   "new": "a key with scopes",
+   "action": "drop",
+   "reason": "a shared secret with admin on every vault; warned through 0.9",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "setting",
+   "old": "PARACHUTE_VAULT_TOKEN",
+   "new": "PARACHUTE_KEY",
+   "action": "rename",
+   "reason": "one name for \"the key this client uses\"",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "setting",
+   "old": "SCRIBE_* / EMBEDDING_* / EMBEDDINGS_ENABLED / TRANSCRIPTION_* / 6 ASR binary vars",
+   "new": "transcription.* / embeddings.*",
+   "action": "move",
+   "reason": "",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "setting",
+   "old": "PARACHUTE_GITHUB_CLIENT_ID / _APP_SLUG",
+   "new": "mirror.github.*",
+   "action": "move",
+   "reason": "",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "setting",
+   "old": "PARACHUTE_INITIAL_ADMIN_*, PARACHUTE_BOOTSTRAP_TOKEN, PARACHUTE_VAULT_NAME",
+   "new": "setup inputs",
+   "action": "keep",
+   "reason": "containers and hosts set these once",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "setting",
+   "old": "hub.db hub_settings (13 keys)",
+   "new": "parachute.yaml",
+   "action": "move",
+   "reason": "settings in one file; hub.db keeps accounts and keys",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "setting",
+   "old": "vault/config.yaml, vault/.env, <svc>/.env, scribe/config.json",
+   "new": "parachute.yaml",
+   "action": "merge",
+   "reason": "",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "setting",
+   "old": "vault/data/<n>/vault.yaml (description, private_tags, published_tag, transcription, history)",
+   "new": "parachute.yaml vaults.<n>",
+   "action": "merge",
+   "reason": "tag schemas stay in the vault: they are data",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "setting",
+   "old": "expose-state.json, cloudflared-state.json, expose-last-provider.json",
+   "new": "state/expose.json",
+   "action": "merge",
+   "reason": "state, not settings",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "setting",
+   "old": "run/ready.json, hub-instance.json, embedded.json, takeover.json",
+   "new": "unchanged paths",
+   "action": "keep",
+   "reason": "Prism and the takeover read these",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "credential",
+   "old": "hub password + TOTP, Nostr key sign-in, session/CSRF/pending cookies",
+   "new": "a person's sign-in",
+   "action": "keep",
+   "reason": "how people get in",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "credential",
+   "old": "CLI/API mints, friend and account vault tokens, connection and agent-grant tokens, manage-token mints, Prism's token",
+   "new": "a key with scopes",
+   "action": "merge",
+   "reason": "one format, one place to list and revoke",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "credential",
+   "old": "OAuth client + consent grant + access/refresh tokens",
+   "new": "an app's key (OAuth is how it gets it)",
+   "action": "merge",
+   "reason": "an approved app shows up as a key owned by its approver",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "credential",
+   "old": "surface deploy token",
+   "new": "the surface module's own",
+   "action": "move",
+   "reason": "surfaces stay out of core",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "credential",
+   "old": "operator token",
+   "new": "the CLI's own key (hidden)",
+   "action": "keep",
+   "reason": "Prism's bootstrap file stays where it is",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "credential",
+   "old": "SPA, module, account, hop and vault-create handoff JWTs; attachment tickets; bootstrap and invite tokens; signing keys",
+   "new": "internal",
+   "action": "keep",
+   "reason": "nobody has to know them",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "credential",
+   "old": "pvk_ YAML API keys (still minted on first boot)",
+   "new": "a key with scopes",
+   "action": "drop",
+   "reason": "stop minting in 0.9, warn on use, refuse at 1.0",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "credential",
+   "old": "VAULT_AUTH_TOKEN",
+   "new": "a key with scopes",
+   "action": "drop",
+   "reason": "same",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "credential",
+   "old": "vault owner password + TOTP (YAML)",
+   "new": "a person's sign-in",
+   "action": "drop",
+   "reason": "legacy, read only by `expose public`",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  },
+  {
+   "kind": "credential",
+   "old": "pvt_ vault tokens",
+   "new": null,
+   "action": "drop",
+   "reason": "already refused",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "planned"
+  }
+ ]
+}

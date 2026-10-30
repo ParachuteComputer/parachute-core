@@ -55,6 +55,7 @@ import { listIndexedFields } from "./indexed-fields.js";
 import { pruneOrphanedIndexedFields } from "./indexed-fields.js";
 import { loadSchemaConfig } from "./schema-defaults.js";
 import { readBlobContent, hashContent, HistoryDeltaOrphanError } from "./history.js";
+import { typeKindReport } from "./tag-kind.js";
 
 function scanCompactStateDrift(db: Database): DoctorFinding[] {
   if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='history_compact_state'").get()) return [];
@@ -120,7 +121,8 @@ export type DoctorFindingType =
   | "history_storage"
   | "history_delta_orphan"
   | "history_content_audit"
-  | "history_compact_state_drift";
+  | "history_compact_state_drift"
+  | "tag_used_like_type";
 
 export type DoctorSeverity = "error" | "warning" | "info";
 
@@ -212,6 +214,7 @@ export function runDoctorScan(db: Database, opts?: DoctorScanOpts): DoctorReport
     ...(allowedTags === null ? scanHistoryStorage(db) : []),
     ...(allowedTags === null ? scanDeltaOrphans(db) : []),
     ...(allowedTags === null ? scanCompactStateDrift(db) : []),
+    ...(allowedTags === null ? scanTagsUsedLikeTypes(db) : []),
   ];
 
   const audit = opts?.deep ? auditHistoryBlobs(db, opts.history_after, opts.history_max_blobs, opts.history_budget_ms) : undefined;
@@ -513,4 +516,20 @@ function scanDeltaOrphans(db: Database): DoctorFinding[] {
     subject: `${s.orphan_deltas + s.unknown_encoding_blobs} unrecoverable history blob(s)`,
     detail: `${s.orphan_deltas} blob(s) are stored as fossil deltas whose base blob is missing or is itself a delta, and ${s.unknown_encoding_blobs} carry an encoding this version does not know how to read, so the versions referencing them cannot be reconstructed. Reading one answers 409 history_unrecoverable; listing versions still works.`,
     remedy: "Erase the affected note's history with DELETE /api/notes/<id>/versions, or restore the vault database from backup. This is a corruption finding, not a retention setting." }];
+}
+
+
+/**
+ * T-318 §8a step 2, the dry run: a plain tag on many notes is probably a kind
+ * of thing (a type) waiting to be named one. Advisory; nothing changes until
+ * the owner promotes it.
+ */
+function scanTagsUsedLikeTypes(db: Database): DoctorFinding[] {
+  return typeKindReport(db).look_like_types.map((t) => ({
+    type: "tag_used_like_type" as const,
+    severity: "info" as const,
+    subject: t.name,
+    detail: `"${t.name}" is a plain tag on ${t.notes} notes; it may be a type (a kind of thing, with fields).`,
+    remedy: `If it is: manage-types {tag: "${t.name}", kind: "type"}. If it is a label, nothing to do.`,
+  }));
 }

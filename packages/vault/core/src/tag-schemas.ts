@@ -19,6 +19,7 @@ import { Database } from "bun:sqlite";
 import { mapFieldType, validateFieldName } from "./indexed-fields.js";
 import { loadTagHierarchy, findParentCycle } from "./tag-hierarchy.js";
 import { timestampToMs } from "./cursor.js";
+import { KIND_SQL, isParent, kindError, type TagKind } from "./tag-kind.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -121,6 +122,8 @@ export interface TagSchema {
  * Full tag record — schema + typed relationships + hierarchy parents.
  */
 export interface TagRecord extends TagSchema {
+  /** T-318 §8a: `type` (fields, parents) or `tag` (a flat label). */
+  kind?: TagKind;
   relationships?: TagRelationshipMap;
   parent_names?: string[];
   created_at?: string;
@@ -136,6 +139,7 @@ interface TagRow {
   parent_names: string | null;
   created_at: string | null;
   updated_at: string | null;
+  kind?: TagKind | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -145,7 +149,7 @@ interface TagRow {
 /** List all tag records, sorted by name. */
 export function listTagRecords(db: Database): TagRecord[] {
   const rows = db.prepare(
-    "SELECT name, description, fields, relationships, parent_names, created_at, updated_at FROM tags ORDER BY name",
+    `SELECT name, description, fields, relationships, parent_names, created_at, updated_at, ${KIND_SQL} AS kind FROM tags t ORDER BY name`,
   ).all() as TagRow[];
   return rows.map(rowToRecord);
 }
@@ -153,7 +157,7 @@ export function listTagRecords(db: Database): TagRecord[] {
 /** Get a single tag record, or null if the tag doesn't exist. */
 export function getTagRecord(db: Database, tag: string): TagRecord | null {
   const row = db.prepare(
-    "SELECT name, description, fields, relationships, parent_names, created_at, updated_at FROM tags WHERE name = ?",
+    `SELECT name, description, fields, relationships, parent_names, created_at, updated_at, ${KIND_SQL} AS kind FROM tags t WHERE name = ?`,
   ).get(tag) as TagRow | null;
   return row ? rowToRecord(row) : null;
 }
@@ -433,8 +437,13 @@ export function upsertTagRecord(
     fields?: Record<string, TagFieldSchema> | null;
     relationships?: TagRelationshipMap | null;
     parent_names?: string[] | null;
+    /** T-318 §8a: "type" promotes a tag; "tag" is refused while it has fields or parents. */
+    kind?: TagKind;
   },
 ): TagRecord {
+  if (patch.kind !== undefined && patch.kind !== "type" && patch.kind !== "tag") {
+    throw kindError(`kind is "type" or "tag", not ${JSON.stringify(patch.kind)}.`, "kind", 'kind: "type"');
+  }
   if (patch.parent_names != null && patch.parent_names.length > 0) {
     const hierarchy = loadTagHierarchy(db);
     const cycle = findParentCycle(hierarchy, tag, patch.parent_names);
@@ -463,11 +472,28 @@ export function upsertTagRecord(
       ? jsonOrNull(existing?.parent_names)
       : jsonOrNull(patch.parent_names);
 
+  // Kind (T-318 §8a): fields and parents make a type; an explicit plain tag can't carry them.
+  const structured = !["{}", "null", "[]"].includes(fields ?? "null") || !["[]", "null"].includes(parent_names ?? "null");
+  if (patch.kind === "tag" && structured) {
+    throw kindError(
+      `"${tag}" can't be a plain tag while it has fields or parent_names. Remove them first, or leave it a type.`,
+      "kind",
+      "drop kind, or clear fields and parent_names",
+    );
+  }
+  // The recorded kind (not the effective one, which also counts being a parent: that is never written).
+  const stored = (db.prepare("SELECT kind FROM tags WHERE name = ?").get(tag) as { kind: TagKind | null } | null)?.kind ?? null;
+  if (patch.kind === "tag" && isParent(db, tag)) {
+    throw kindError(`"${tag}" is another tag's parent, and a parent is a type. Remove it from the children's parent_names first.`, "kind", "clear the children's parent_names");
+  }
+  const kind = structured || patch.kind === "type" ? "type" : patch.kind === "tag" ? "tag" : stored;
+
   db.prepare(
     `UPDATE tags
-       SET description = ?, fields = ?, relationships = ?, parent_names = ?, updated_at = ?
+       SET description = ?, fields = ?, relationships = ?, parent_names = ?, kind = ?, updated_at = ?
      WHERE name = ?`,
-  ).run(description, fields, relationships, parent_names, now, tag);
+  ).run(description, fields, relationships, parent_names, kind, now, tag);
+  // A parent reads as a type (tag-kind.ts KIND_SQL); its own record is never written here.
 
   return getTagRecord(db, tag)!;
 }
@@ -623,6 +649,7 @@ function rowToRecord(row: TagRow): TagRecord {
     parent_names: parseJson<string[]>(row.parent_names),
     created_at: row.created_at ?? undefined,
     updated_at: row.updated_at ?? undefined,
+    ...(row.kind ? { kind: row.kind } : {}),
   };
 }
 

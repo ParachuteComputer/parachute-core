@@ -68,7 +68,7 @@ try {
   writeFileSync(candidateFile, JSON.stringify(info));
 
   const named = extra.filter((a) => a.startsWith("suites/"));
-  const dirs = named.length ? named : ["suites/today", "suites/compat", "suites/safety", "suites/embedded", "suites/lifecycle", ...(v1 ? ["suites/v1"] : [])];
+  const dirs = named.length ? named : ["suites/today", "suites/compat", "suites/safety", "suites/embedded", "suites/lifecycle", "suites/mcp", ...(v1 ? ["suites/v1"] : [])];
   const rest = extra.filter((a) => !a.startsWith("suites/"));
   // The watcher reads /proc; on a macOS runner there is none (and no box).
   const watch = onMacRunner() ? { stop: () => [] as string[] } : watchAttribution(info);

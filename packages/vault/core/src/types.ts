@@ -58,6 +58,8 @@ export interface Note {
   lastUpdatedBy?: string | null;
   lastUpdatedVia?: string | null;
   tags?: string[];
+  /** T-318 §8a: the subset of `tags` that are types (fields, hierarchy). `tags` still lists every name through 0.9. */
+  types?: string[];
   links?: Link[];
   /**
    * Opt-in link degree (raw row count, both directions by default). Present
@@ -422,6 +424,7 @@ export interface NoteIndex {
   lastUpdatedBy?: string | null;
   lastUpdatedVia?: string | null;
   tags?: string[];
+  types?: string[];
   /** Always present (`{}` when empty) — see `Note.metadata`. */
   metadata?: Record<string, unknown>;
   byteSize: number;
@@ -723,6 +726,7 @@ export interface Store {
       fields?: Record<string, TagFieldSchema> | null;
       relationships?: TagRelationshipMap | null;
       parent_names?: string[] | null;
+      kind?: "type" | "tag";
     },
   ): Promise<TagRecord>;
 
