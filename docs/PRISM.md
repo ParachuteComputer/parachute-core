@@ -129,7 +129,7 @@ a private network namespace, and it must be zero.
   until then. Embedded homes are not touched by it: Prism adopts in place, as above, and `serve --embedded` never
   refuses for this reason.
 - **A signed macOS tarball every night**, so the Nov 9 build isn't the first you see. The `bundle-macos` workflow
-  builds main at 06:17 UTC, runs your suite on the signed tree, and keeps the tarball and `SHA256SUMS` as an Actions
+  builds main at 06:17 UTC and on every merge, runs your suite on the signed tree, and keeps the tarball and `SHA256SUMS` as an Actions
   artifact for 14 days: `gh run download <run id> -R ParachuteComputer/parachute-core -n
   parachute-core-<version>-darwin-arm64` (run ids: `gh run list -R ParachuteComputer/parachute-core -w
   bundle-macos.yml -b main`). Pull requests that touch the bundle get one too.
