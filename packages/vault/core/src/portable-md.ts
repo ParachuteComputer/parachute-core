@@ -1973,6 +1973,9 @@ async function importVaultReplay(
   opts: ImportEngineOptions,
   stats: ImportStats,
 ): Promise<void> {
+  // Read every YAML doc of this export as an export (see ScalarReading), so a
+  // snapshot the old exporter wrote restores its metadata exactly.
+  const reading = exportScalarReading(source);
   // 1. Optional wipe. Notes are deleted via the public Store API so hooks
   // fire (callers depend on `attachment.deleted` hooks for assets-dir
   // cleanup; we don't bypass that on blow-away). Deleted in bounded batches
@@ -2012,7 +2015,7 @@ async function importVaultReplay(
     // file is a YAML doc (no `---` markers); pad with them so
     // `parseFrontmatter` can chew on it via the same code path.
     const wrapped = `---\n${text}${text.endsWith("\n") ? "" : "\n"}---\n`;
-    const { frontmatter } = parseFrontmatter(wrapped);
+    const { frontmatter } = parseFrontmatter(wrapped, reading);
     const tagName = typeof frontmatter.name === "string" ? frontmatter.name : null;
     if (!tagName) continue;
     if (opts.dryRun) {
@@ -2075,7 +2078,7 @@ async function importVaultReplay(
     // The sidecar is a bare YAML doc (no `---`); wrap to reuse the shared
     // frontmatter parser.
     const wrapped = `---\n${text}${text.endsWith("\n") ? "" : "\n"}---\n`;
-    const { frontmatter } = parseFrontmatter(wrapped);
+    const { frontmatter } = parseFrontmatter(wrapped, reading);
     const sidecarId = typeof frontmatter.id === "string" ? frontmatter.id : null;
     const sidecarPath = typeof frontmatter.path === "string" ? frontmatter.path : null;
     const sidecarExt = typeof frontmatter.extension === "string" ? frontmatter.extension : null;
@@ -2113,7 +2116,7 @@ async function importVaultReplay(
     let content: string;
     if (supportsInlineFrontmatter(fileExt)) {
       const raw = source.readContentFile(relPath);
-      const parsed = parseFrontmatter(raw);
+      const parsed = parseFrontmatter(raw, reading);
       frontmatter = parsed.frontmatter;
       content = parsed.content;
     } else {
@@ -2433,7 +2436,7 @@ async function importVaultReplay(
     // row-exact promise.
     for (const { text } of source.readSchemaFiles()) {
       const wrapped = `---\n${text}${text.endsWith("\n") ? "" : "\n"}---\n`;
-      const { frontmatter } = parseFrontmatter(wrapped);
+      const { frontmatter } = parseFrontmatter(wrapped, reading);
       const fields = frontmatter.fields;
       if (fields && typeof fields === "object" && !Array.isArray(fields)) {
         for (const spec of Object.values(fields as Record<string, { indexed?: boolean }>)) {
@@ -2485,7 +2488,7 @@ export async function importPortableVault(
  * This is the canonical parser for the portable-md format. The legacy
  * `parseFrontmatter` in `obsidian.ts` delegates here.
  */
-export function parseFrontmatter(raw: string): {
+export function parseFrontmatter(raw: string, reading: ScalarReading = "yaml"): {
   frontmatter: Record<string, unknown>;
   content: string;
 } {
@@ -2512,7 +2515,42 @@ export function parseFrontmatter(raw: string): {
 
   const yamlBlock = lines.slice(1, closeIdx).join("\n");
   const content = lines.slice(closeIdx + 1).join("\n");
-  return { frontmatter: parseBlock(yamlBlock, 0).value, content };
+  return { frontmatter: parseBlock(yamlBlock, 0, reading).value, content };
+}
+
+/**
+ * How a scalar is read. `"yaml"` is plain YAML, for frontmatter anyone may
+ * have written (Obsidian, the legacy shim). The importer reads a portable-md
+ * export with `"export"`: neither this exporter nor the old one ever writes a
+ * non-empty flow collection, so an unquoted `[..]` or `{..}` there is a string
+ * the old exporter left unquoted (`[[Projects/Alpha]]`, `[draft]`, `{x}`).
+ * `"old-export"` is for an export dated before {@link FLOW_QUOTING_SINCE}: it
+ * also undoes the old exporter's other loss, a string that itself started and
+ * ended with a quote (`'single'`, `"double"`), which plain YAML unquotes. The
+ * old exporter single-quoted only what its `needsQuote` asked for and
+ * double-quoted only strings with control characters, so a quoted scalar it
+ * could not have produced is the literal value.
+ */
+export type ScalarReading = "yaml" | "export" | "old-export";
+
+/**
+ * The exporter quotes strings that start with `[ ] { } , ' "` since 2ca5178
+ * (authored at this instant). Every export dated earlier came from the exporter
+ * that did not, which is every snapshot taken before 2026-10-29.
+ */
+export const FLOW_QUOTING_SINCE = "2026-10-29T20:14:06Z";
+
+/** The {@link ScalarReading} for an export, from its `.parachute/vault.yaml`. */
+function exportScalarReading(source: ImportSource): ScalarReading {
+  let text: string;
+  try {
+    text = source.readContentFile(`${SIDECAR_DIR}/vault.yaml`);
+  } catch {
+    return "export";
+  }
+  const at = parseFrontmatter(`---\n${text}${text.endsWith("\n") ? "" : "\n"}---\n`).frontmatter.exported_at;
+  const ms = typeof at === "string" ? Date.parse(at) : NaN;
+  return Number.isFinite(ms) && ms < Date.parse(FLOW_QUOTING_SINCE) ? "old-export" : "export";
 }
 
 interface ParseResult {
@@ -2528,7 +2566,7 @@ interface ParseResult {
  * (anchors, references, multi-document streams, multi-line strings) are
  * not supported — out of scope for the export format.
  */
-function parseBlock(text: string, baseIndent: number): ParseResult {
+function parseBlock(text: string, baseIndent: number, reading: ScalarReading): ParseResult {
   const lines = text.split("\n");
   const result: Record<string, unknown> = {};
   let i = 0;
@@ -2568,17 +2606,17 @@ function parseBlock(text: string, baseIndent: number): ParseResult {
         continue;
       }
       if (peekLine.slice(peekIndent).startsWith("- ")) {
-        const { value, consumed } = parseArrayBlock(lines, i + 1, peekIndent);
+        const { value, consumed } = parseArrayBlock(lines, i + 1, peekIndent, reading);
         result[key] = value;
         i = i + 1 + consumed;
       } else {
         const block = lines.slice(i + 1).join("\n");
-        const { value, consumed } = parseBlock(block, peekIndent);
+        const { value, consumed } = parseBlock(block, peekIndent, reading);
         result[key] = value;
         i = i + 1 + consumed;
       }
     } else {
-      result[key] = parseScalarOrInline(valueText);
+      result[key] = parseScalarOrInline(valueText, reading);
       i++;
     }
   }
@@ -2606,7 +2644,12 @@ function countLeadingSpaces(s: string): number {
  *   - `- value` → scalar item.
  *   - `- key: value` (with possible following indented keys) → object item.
  */
-function parseArrayBlock(lines: string[], start: number, arrayIndent: number): { value: unknown[]; consumed: number } {
+function parseArrayBlock(
+  lines: string[],
+  start: number,
+  arrayIndent: number,
+  reading: ScalarReading,
+): { value: unknown[]; consumed: number } {
   const result: unknown[] = [];
   let i = start;
   while (i < lines.length) {
@@ -2623,7 +2666,7 @@ function parseArrayBlock(lines: string[], start: number, arrayIndent: number): {
     // Key regex matches parseBlock's (contract C2): dots + optional space.
     const objMatch = after.match(/^([\w][\w.-]*)\s*:\s*(.*)$/);
     if (!objMatch) {
-      result.push(parseScalarOrInline(after));
+      result.push(parseScalarOrInline(after, reading));
       i++;
       continue;
     }
@@ -2644,12 +2687,12 @@ function parseArrayBlock(lines: string[], start: number, arrayIndent: number): {
         if (peekIndent > itemIndent) {
           // Nested block under this first key.
           if (peekLine.slice(peekIndent).startsWith("- ")) {
-            const { value, consumed } = parseArrayBlock(lines, i + 1, peekIndent);
+            const { value, consumed } = parseArrayBlock(lines, i + 1, peekIndent, reading);
             itemObj[itemKey] = value;
             i = i + 1 + consumed;
           } else {
             const block = lines.slice(i + 1).join("\n");
-            const { value, consumed } = parseBlock(block, peekIndent);
+            const { value, consumed } = parseBlock(block, peekIndent, reading);
             itemObj[itemKey] = value;
             i = i + 1 + consumed;
           }
@@ -2662,7 +2705,7 @@ function parseArrayBlock(lines: string[], start: number, arrayIndent: number): {
         i++;
       }
     } else {
-      itemObj[itemKey] = parseScalarOrInline(itemValue);
+      itemObj[itemKey] = parseScalarOrInline(itemValue, reading);
       i++;
     }
 
@@ -2684,12 +2727,12 @@ function parseArrayBlock(lines: string[], start: number, arrayIndent: number): {
           const peekIndent = countLeadingSpaces(peekLine);
           if (peekIndent > itemIndent) {
             if (peekLine.slice(peekIndent).startsWith("- ")) {
-              const { value, consumed } = parseArrayBlock(lines, i + 1, peekIndent);
+              const { value, consumed } = parseArrayBlock(lines, i + 1, peekIndent, reading);
               itemObj[sibKey] = value;
               i = i + 1 + consumed;
             } else {
               const block = lines.slice(i + 1).join("\n");
-              const { value, consumed } = parseBlock(block, peekIndent);
+              const { value, consumed } = parseBlock(block, peekIndent, reading);
               itemObj[sibKey] = value;
               i = i + 1 + consumed;
             }
@@ -2699,7 +2742,7 @@ function parseArrayBlock(lines: string[], start: number, arrayIndent: number): {
         itemObj[sibKey] = "";
         i++;
       } else {
-        itemObj[sibKey] = parseScalarOrInline(sibValue);
+        itemObj[sibKey] = parseScalarOrInline(sibValue, reading);
         i++;
       }
     }
@@ -2743,14 +2786,15 @@ function splitInlineArray(inner: string): string[] {
  * Parse a scalar or inline form (`[a, b]`, `{ k: v }`). Used for the
  * value portion of `key: value` lines.
  */
-function parseScalarOrInline(s: string): unknown {
+function parseScalarOrInline(s: string, reading: ScalarReading): unknown {
+  if (reading !== "yaml" && isNonEmptyFlow(s)) return s;
   if (s.startsWith("[") && s.endsWith("]")) {
     const inner = s.slice(1, -1).trim();
     if (inner === "") return [];
     // Quote-aware split (contract C4 / §1.2): a comma inside a quoted
     // string is NOT an item separator, so `["a, b", c]` → 2 items, not 3.
     // Matches the web parser's `splitInlineArray`.
-    return splitInlineArray(inner).map((part) => parseScalarOrInline(part.trim()));
+    return splitInlineArray(inner).map((part) => parseScalarOrInline(part.trim(), reading));
   }
   if (s.startsWith("{") && s.endsWith("}")) {
     const inner = s.slice(1, -1).trim();
@@ -2760,14 +2804,44 @@ function parseScalarOrInline(s: string): unknown {
     // nested commas at this level since nested objects use block form).
     for (const part of inner.split(",")) {
       const m = part.trim().match(/^([\w][\w-]*):\s*(.*)$/);
-      if (m) out[m[1]!] = parseScalarOrInline(m[2]!.trim());
+      if (m) out[m[1]!] = parseScalarOrInline(m[2]!.trim(), reading);
     }
     return out;
   }
-  return unquote(s);
+  return unquote(s, reading);
 }
 
-function unquote(s: string): unknown {
+function isNonEmptyFlow(s: string): boolean {
+  const open = s[0];
+  if (open !== "[" && open !== "{") return false;
+  return s.endsWith(open === "[" ? "]" : "}") && s.slice(1, -1).trim() !== "";
+}
+
+// eslint-disable-next-line no-control-regex
+const CONTROL_CHARS = /[\n\r\t\v\f\x00-\x08\x0e-\x1f]/;
+
+/** The old exporter's `needsQuote` (before 2ca5178): no flow or quote starters. */
+function oldExporterNeedsQuote(s: string): boolean {
+  if (s === "" || s !== s.trim()) return true;
+  if (s === "true" || s === "false" || s === "null") return true;
+  if (/^-?\d+(\.\d+)?$/.test(s)) return true;
+  if (/^[-?:&*!|>%@`#]/.test(s)) return true;
+  if (s.includes(": ") || s.includes(" #")) return true;
+  return CONTROL_CHARS.test(s);
+}
+
+function unquote(s: string, reading: ScalarReading): unknown {
+  const value = unquoteYaml(s);
+  if (reading !== "old-export" || s.length < 2 || typeof value !== "string") return value;
+  // A quoted scalar the old exporter could not have written is the literal
+  // string: it single-quoted only what its needsQuote asked for (and not
+  // control characters), and double-quoted only control characters.
+  if (s.startsWith("'") && s.endsWith("'") && !(oldExporterNeedsQuote(value) && !CONTROL_CHARS.test(value))) return s;
+  if (s.startsWith('"') && s.endsWith('"') && !CONTROL_CHARS.test(value)) return s;
+  return value;
+}
+
+function unquoteYaml(s: string): unknown {
   if (s.startsWith("'") && s.endsWith("'")) {
     return s.slice(1, -1).replace(/''/g, "'");
   }
