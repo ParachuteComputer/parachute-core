@@ -1177,18 +1177,18 @@ export function buildFilterConditions(db: Database, opts: QueryOpts): { conditio
       // matches the input.
       const flat = Array.from(new Set(tagSets.flat()));
       if (flat.length > 0) {
-        const placeholders = flat.map(() => "?").join(", ");
-        conditions.push(`n.id IN (SELECT note_id FROM note_tags WHERE tag_name IN (${placeholders}))`);
-        params.push(...flat);
+        // One json_each param per set, not one `?` per tag: a tag with 100+
+        // declared descendants passed Durable Object SQLite's 100-param cap.
+        conditions.push(`n.id IN (SELECT note_id FROM note_tags WHERE tag_name IN ${IN_VIA_JSON_EACH})`);
+        params.push(jsonEachParam(flat));
       }
     } else {
       // "all": one membership clause per input tag, each accepting the
       // input or any descendant.
       for (const set of tagSets) {
         if (!set || set.length === 0) continue;
-        const placeholders = set.map(() => "?").join(", ");
-        conditions.push(`n.id IN (SELECT note_id FROM note_tags WHERE tag_name IN (${placeholders}))`);
-        params.push(...set);
+        conditions.push(`n.id IN (SELECT note_id FROM note_tags WHERE tag_name IN ${IN_VIA_JSON_EACH})`);
+        params.push(jsonEachParam(set));
       }
     }
   }
@@ -1296,27 +1296,25 @@ export function buildFilterConditions(db: Database, opts: QueryOpts): { conditio
     params.push(opts.path);
   }
 
-  // Path prefix. `escapeLikePattern` neutralizes `%` and `_` inside the
-  // caller-supplied prefix so it matches as a literal string: without it,
-  // `path_prefix=_tags/` silently matched `atags/…` too (`_` is LIKE's
-  // single-char wildcard), returning notes the caller never asked for and
-  // never saw a signal about (vault#659). The trailing `%` we append is
-  // still our actual wildcard. `ESCAPE '\'` is required for the escape to
-  // take effect.
+  // Path prefix: a literal, ASCII-case-insensitive prefix match (what
+  // `LIKE escaped(prefix) || '%'` used to do; `%`/`_` in the prefix are
+  // literal, vault#659). Not LIKE: Durable Object SQLite refuses a LIKE
+  // pattern over 50 bytes, so a long folder filter returned 500 on cloud.
+  // `instr(..) = 1` binds the prefix once (DO also caps a statement at 100
+  // bound params, and `exclude_path_prefix` is repeatable).
   if (opts.pathPrefix) {
-    conditions.push("n.path LIKE ? ESCAPE '\\'");
-    params.push(escapeLikePattern(opts.pathPrefix) + "%");
+    conditions.push("instr(lower(n.path), lower(?)) = 1");
+    params.push(opts.pathPrefix);
   }
 
-  // Path-prefix exclusion (vault#628). Mirrors `pathPrefix` matching
-  // (`LIKE prefix || '%'` with the same metachar escaping, SQLite LIKE is
-  // ASCII-case-insensitive). NULL paths are kept — they are not under the
-  // prefix. Repeatable: a note matching ANY listed prefix is dropped.
+  // Path-prefix exclusion (vault#628). Mirrors `pathPrefix` matching. NULL
+  // paths are kept — they are not under the prefix. Repeatable: a note
+  // matching ANY listed prefix is dropped.
   if (opts.excludePathPrefix && opts.excludePathPrefix.length > 0) {
     for (const prefix of opts.excludePathPrefix) {
       if (typeof prefix !== "string" || prefix.length === 0) continue;
-      conditions.push("(n.path IS NULL OR n.path NOT LIKE ? ESCAPE '\\')");
-      params.push(escapeLikePattern(prefix) + "%");
+      conditions.push("(n.path IS NULL OR instr(lower(n.path), lower(?)) != 1)");
+      params.push(prefix);
     }
   }
 
@@ -2647,14 +2645,13 @@ export function renameTag(db: Database, oldName: string, newName: string, attr?:
   // deepest path first if any later step needs deterministic ordering
   // (the SQL we run is order-independent, but it costs nothing here).
   //
-  // `escapeLikePattern` neutralizes `%` and `_` inside the operator-
-  // supplied tag name so a tag literally named `task_` doesn't pull
-  // `taskX/sub` into the rename transaction (that would be a write the
-  // caller never asked for — far worse than a downstream false-positive
-  // candidate). `ESCAPE '\\'` is required for the escape to take effect.
+  // A literal prefix match, so a tag literally named `task_` doesn't pull
+  // `taskX/sub` into the rename transaction. ASCII-case-insensitive, as the
+  // `LIKE` it replaces was. Not LIKE: Durable Object SQLite refuses a LIKE
+  // pattern over 50 bytes.
   const subRows = db
-    .prepare("SELECT name FROM tags WHERE name LIKE ? ESCAPE '\\' ORDER BY length(name) DESC")
-    .all(`${escapeLikePattern(oldName)}/%`) as { name: string }[];
+    .prepare("SELECT name FROM tags WHERE instr(lower(name), lower(?)) = 1 ORDER BY length(name) DESC")
+    .all(`${oldName}/`) as { name: string }[];
   const renames: { from: string; to: string }[] = [
     { from: oldName, to: newName },
     ...subRows.map((r) => ({ from: r.name, to: `${newName}${r.name.slice(oldName.length)}` })),
@@ -2723,29 +2720,31 @@ export function renameTag(db: Database, oldName: string, newName: string, attr?:
     }
 
     // ---- JSON-array cascade across parent_names / scoped_tags /
-    // declarer_tags. Same shape three times: cheap LIKE pre-filter, then
+    // declarer_tags. Same shape three times: cheap substring pre-filter, then
     // per-row JSON.parse → array.map → JSON.stringify. Replacing on the
     // parsed array (not the encoded string) is robust against escaping
     // edge cases. The pre-filter narrows the per-row work to just the
     // candidates that mention any of the renamed names.
     //
-    // Each call site supplies its own column name for the filter — SQL
-    // doesn't expand `column LIKE (a OR b)` into a disjunction. We also
-    // escape LIKE wildcards (`%`, `_`) inside tag names and append
-    // `ESCAPE '\\'` to every clause so a tag literally named `task_`
-    // doesn't match `taskX` as a false-positive candidate.
+    // The pre-filter looks for each old name's JSON string encoding as a
+    // literal substring, with every name in ONE json_each param. It used to
+    // be one inline `LIKE '%"name"%'` per renamed tag; Durable Object SQLite
+    // refuses a LIKE pattern over 50 bytes, so a long tag name failed the
+    // rename. The remap below is exact and case-sensitive, so a
+    // case-sensitive substring test is still a superset of the rows it
+    // changes.
     const renameMap = new Map(renames.map((r) => [r.from, r.to]));
     const remap = (s: string): string => renameMap.get(s) ?? s;
+    const jsonNeedles = JSON.stringify(renames.map((r) => JSON.stringify(r.from)));
+    const fromNames = JSON.stringify(renames.map((r) => r.from));
     const likeClauseFor = (column: string): string =>
-      renames
-        .map((r) => `${column} LIKE '%"${escapeJsonLike(r.from)}"%' ESCAPE '\\'`)
-        .join(" OR ");
+      `EXISTS (SELECT 1 FROM json_each(?) j WHERE instr(${column}, j.value) > 0)`;
 
     let parentRefsUpdated = 0;
     {
       const rows = db
-        .prepare(`SELECT name, parent_names FROM tags WHERE parent_names IS NOT NULL AND (${likeClauseFor("parent_names")})`)
-        .all() as { name: string; parent_names: string }[];
+        .prepare(`SELECT name, parent_names FROM tags WHERE parent_names IS NOT NULL AND (${likeClauseFor("tags.parent_names")})`)
+        .all(jsonNeedles) as { name: string; parent_names: string }[];
       // We just renamed every old name; the rows we're updating are now
       // keyed by the new name where applicable. The candidate clause
       // matched `parent_names` containing any old name — those references
@@ -2764,8 +2763,8 @@ export function renameTag(db: Database, oldName: string, newName: string, attr?:
     let tokensUpdated = 0;
     if (hasTable(db, "tokens")) {
       const rows = db
-        .prepare(`SELECT token_hash, scoped_tags FROM tokens WHERE scoped_tags IS NOT NULL AND (${likeClauseFor("scoped_tags")})`)
-        .all() as { token_hash: string; scoped_tags: string }[];
+        .prepare(`SELECT token_hash, scoped_tags FROM tokens WHERE scoped_tags IS NOT NULL AND (${likeClauseFor("tokens.scoped_tags")})`)
+        .all(jsonNeedles) as { token_hash: string; scoped_tags: string }[];
       const updateStmt = db.prepare("UPDATE tokens SET scoped_tags = ? WHERE token_hash = ?");
       for (const row of rows) {
         const next = remapJsonArray(row.scoped_tags, remap);
@@ -2778,8 +2777,8 @@ export function renameTag(db: Database, oldName: string, newName: string, attr?:
     let declarersUpdated = 0;
     if (hasTable(db, "indexed_fields")) {
       const rows = db
-        .prepare(`SELECT field, declarer_tags FROM indexed_fields WHERE declarer_tags IS NOT NULL AND (${likeClauseFor("declarer_tags")})`)
-        .all() as { field: string; declarer_tags: string }[];
+        .prepare(`SELECT field, declarer_tags FROM indexed_fields WHERE declarer_tags IS NOT NULL AND (${likeClauseFor("indexed_fields.declarer_tags")})`)
+        .all(jsonNeedles) as { field: string; declarer_tags: string }[];
       const updateStmt = db.prepare("UPDATE indexed_fields SET declarer_tags = ? WHERE field = ?");
       for (const row of rows) {
         const next = remapJsonArray(row.declarer_tags, remap);
@@ -2799,22 +2798,19 @@ export function renameTag(db: Database, oldName: string, newName: string, attr?:
     // pointing at the right path).
     let notesRewritten = 0;
     {
-      // Each pair of LIKE clauses uses ESCAPE '\\' so the bound pattern
-      // can carry a literal `%` or `_` from a tag name without the LIKE
-      // engine treating them as wildcards. The middle of the bound
-      // string is `escapeLikePattern(from)`; the leading/trailing `%` we
-      // wrap in are still our actual wildcards.
-      const orClauses = renames
-        .map(() => "(content LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\')")
-        .join(" OR ");
-      const params: string[] = [];
-      for (const { from } of renames) {
-        const safe = escapeLikePattern(from);
-        params.push(`%#${safe}%`, `%[[_tags/${safe}%`);
-      }
+      // Literal substring pre-filter for `#name` / `[[_tags/name`, all
+      // names in ONE json_each param. It used to bind two LIKE patterns per
+      // renamed tag: Durable Object SQLite refuses a LIKE pattern over 50
+      // bytes and a statement over 100 bound params, so a long tag, or a tag
+      // with 50+ sub-tags, failed the rename. `rewriteNoteBody` is
+      // case-sensitive, so a case-sensitive pre-filter is still a superset.
       const candidates = db
-        .prepare(`SELECT id, content FROM notes WHERE content IS NOT NULL AND content != '' AND (${orClauses})`)
-        .all(...params) as { id: string; content: string }[];
+        .prepare(
+          `SELECT id, content FROM notes WHERE content IS NOT NULL AND content != '' AND EXISTS (
+             SELECT 1 FROM json_each(?) j
+             WHERE instr(notes.content, '#' || j.value) > 0 OR instr(notes.content, '[[_tags/' || j.value) > 0)`,
+        )
+        .all(fromNames) as { id: string; content: string }[];
       // vault#555 fix 2 — this content rewrite is a real persisted-state
       // change (the note's `#oldtag` references literally became
       // `#newtag`) and must bump `updated_at` like any other content
@@ -2839,11 +2835,15 @@ export function renameTag(db: Database, oldName: string, newName: string, attr?:
     // Renaming the path keeps the vault internally consistent for any
     // operator who still inspects them by hand.
     {
-      const orClauses = renames.map(() => "path LIKE ? ESCAPE '\\'").join(" OR ");
-      const params = renames.map((r) => `_tags/${escapeLikePattern(r.from)}%`);
+      // Same single json_each param as above, for the same two DO caps.
+      // Columns are table-qualified: json_each has its own `path` column.
+      // `rewriteTagConfigPath` is case-sensitive, so this prefix test is too.
       const candidates = db
-        .prepare(`SELECT id, path FROM notes WHERE path IS NOT NULL AND (${orClauses})`)
-        .all(...params) as { id: string; path: string }[];
+        .prepare(
+          `SELECT id, path FROM notes WHERE path IS NOT NULL AND EXISTS (
+             SELECT 1 FROM json_each(?) j WHERE instr(notes.path, '_tags/' || j.value) = 1)`,
+        )
+        .all(fromNames) as { id: string; path: string }[];
       // vault#555 fix 2 — same reasoning as the content rewrite above: a
       // path rewrite is a real persisted-state change. `updated_at_ms` moves
       // with `updated_at` (vault#586).
@@ -2972,37 +2972,6 @@ function hasTable(db: Database, name: string): boolean {
     .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
     .get(name);
   return !!row;
-}
-
-/**
- * Escape a tag name for inline interpolation into a SQL LIKE pattern.
- * Doubles `'` for SQL-string safety AND backslash-prefixes the LIKE
- * wildcards (`%`, `_`) so a tag literally named `task_` doesn't match
- * `taskX` as a false-positive candidate. The escape character `\` is
- * declared at each call site via `ESCAPE '\\'`.
- *
- * Order matters: escape `\` first so a tag containing a backslash gets
- * its backslash doubled before we add our own escape prefixes for the
- * wildcards.
- */
-function escapeJsonLike(s: string): string {
-  return s
-    .replace(/\\/g, "\\\\")
-    .replace(/'/g, "''")
-    .replace(/%/g, "\\%")
-    .replace(/_/g, "\\_");
-}
-
-/**
- * Escape a tag name destined for a parameterized LIKE binding. No SQL
- * quote escape (param-binding handles that); just the wildcard
- * neutralization. Pair with `LIKE ? ESCAPE '\\'`.
- */
-function escapeLikePattern(s: string): string {
-  return s
-    .replace(/\\/g, "\\\\")
-    .replace(/%/g, "\\%")
-    .replace(/_/g, "\\_");
 }
 
 function escapeRegex(s: string): string {

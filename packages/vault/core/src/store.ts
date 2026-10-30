@@ -709,6 +709,9 @@ export class BunSqliteStore implements Store {
     // Keep the note-row write and every derived index/cascade write in one
     // atomic unit. Any later failure must leave the note and its indexes at
     // the pre-update state rather than committing only the first SQL write.
+    // Other notes the rename rewrites (cascade content, reference metadata):
+    // they get their own post-commit `updated` dispatch below.
+    const rewritten = new Set<string>();
     const note = this.transaction(() => {
       if (willWriteNoteRow(updates)) {
         const prior = readPriorNoteRow(this.db, id);
@@ -725,10 +728,10 @@ export class BunSqliteStore implements Store {
 
       if (updates.path !== undefined && note.path) {
         if (cascadePlan && oldPath && oldPath !== note.path) {
-          this.cascadeRename(cascadePlan, note, oldPath, { actor: updates.actor ?? null, via: updates.via ?? null });
+          this.cascadeRename(cascadePlan, note, oldPath, { actor: updates.actor ?? null, via: updates.via ?? null }, rewritten);
         }
         if (oldPath && oldPath !== note.path) {
-          this.repairReferenceFieldPaths(note, oldPath, { actor: updates.actor ?? null, via: updates.via ?? null });
+          this.repairReferenceFieldPaths(note, oldPath, { actor: updates.actor ?? null, via: updates.via ?? null }, rewritten);
         }
         resolveUnresolvedWikilinks(this.db, note.path, id);
         // vault#581 — a rename is one of the two ways an ambiguity stops being
@@ -758,6 +761,12 @@ export class BunSqliteStore implements Store {
     afterCommit(this.db, () => {
       this.invalidateConfigCachesForPath(note.path, oldPath);
       this.hooks.dispatch("updated", note, this);
+      for (const otherId of rewritten) {
+        if (otherId === id) continue;
+        // Read after commit: a note both cascades touched dispatches once, final state.
+        const other = noteOps.getNote(this.db, otherId);
+        if (other) this.hooks.dispatch("updated", other, this);
+      }
     });
 
     return note;
@@ -832,7 +841,7 @@ export class BunSqliteStore implements Store {
    * `unresolved_wikilinks` and `ambiguous_wikilinks` stay consistent with
    * the new text.
    */
-  private cascadeRename(plan: Map<string, string[]>, note: Note, oldPath: string, attr: { actor: string | null; via: string | null }): void {
+  private cascadeRename(plan: Map<string, string[]>, note: Note, oldPath: string, attr: { actor: string | null; via: string | null }, rewritten?: Set<string>): void {
     if (plan.size === 0 || !note.path) return;
     const newPath = note.path;
 
@@ -875,6 +884,7 @@ export class BunSqliteStore implements Store {
         noteOps.updateNote(this.db, sourceId, { content: updated });
         syncWikilinks(this.db, sourceId, updated);
         refreshCompactState(this.db, sourceId);
+        rewritten?.add(sourceId);
       }
     }
   }
@@ -893,7 +903,7 @@ export class BunSqliteStore implements Store {
    * caller's transaction; the indexed generated columns recompute from the
    * metadata JSON on write.
    */
-  private repairReferenceFieldPaths(note: Note, oldPath: string, attr: { actor: string | null; via: string | null }): void {
+  private repairReferenceFieldPaths(note: Note, oldPath: string, attr: { actor: string | null; via: string | null }, rewritten?: Set<string>): void {
     if (!note.path) return;
     const oldKey = normalizePath(oldPath)?.toLowerCase();
     if (!oldKey) return;
@@ -942,6 +952,7 @@ export class BunSqliteStore implements Store {
       if (prior) captureVersion(this.db, prior, { ...attr, op: "cascade-rename", policy: this.historyPolicy });
       noteOps.updateNote(this.db, sourceId, { metadata: next, actor: attr.actor, via: attr.via });
       refreshCompactState(this.db, sourceId);
+      rewritten?.add(sourceId);
     }
   }
 
