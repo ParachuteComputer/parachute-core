@@ -29,7 +29,7 @@ import { join } from "node:path";
 import { Database } from "bun:sqlite";
 import { decodeJwt, importPKCS8, SignJWT } from "jose";
 import { until } from "../candidate-lib.ts";
-import { rest } from "../lib.ts";
+import { rest, safeFetch } from "../lib.ts";
 import {
   OLD_UNITS,
   core,
@@ -67,10 +67,14 @@ afterEach(async () => {
  * A machine with the old programs, both old units, and a stock home with made-up notes, as a person has it:
  * parachute-hub.service runs the old programs (the fake systemctl runs it), parachute-vault.service is off.
  */
-async function oldMachine(label: string): Promise<{ m: Machine; s: StockHome; noteCount: number }> {
-  const m = await newMachine(label, { units: OLD_UNITS });
+async function oldMachine(
+  label: string,
+  unitEnv?: (m: Machine) => Record<string, string>,
+  managerPathFirst?: (user: string) => string,
+): Promise<{ m: Machine; s: StockHome; noteCount: number }> {
+  const m = await newMachine(label, { units: OLD_UNITS, managerPathFirst });
   machines.push(m);
-  const s = await makeStockHome(m);
+  const s = await makeStockHome(m, { unitEnv: unitEnv?.(m) });
   // Every note in the vault (vault create seeds a few welcome notes of its own), read through the old hub unit.
   const all = await readNotes(s.origin, s.vaultName, s.readPass);
   must(all.status === 200 && all.notes.length >= s.notes.length, `setup: the old box listed ${all.status} / ${all.notes.length} notes`);
@@ -113,6 +117,37 @@ const MUTATING = /\b(start|stop|restart|enable|disable|mask|kill)\b/;
 function changesTo(m: Machine, unit: string, from: number): string[] {
   const base = unit.replace(/\.service$/, "");
   return m.systemctlCalls().slice(from).filter((c) => MUTATING.test(c) && new RegExp(`\\b${base}(\\.service)?\\b`).test(c));
+}
+
+/** What the friends box's old unit carries besides the home's settings: ~/.bun/bin first on PATH, and BUN_INSTALL. */
+const boxUnitEnv = (m: Machine) => ({ PATH: `${m.bunDir}/bin:/usr/local/bin:/usr/bin:/bin`, BUN_INSTALL: m.bunDir });
+
+/**
+ * What `systemd-run --user` gives a takeover: the user manager's PATH (the friends box's, 10-29), with the fake
+ * systemctl where systemctl lives, and no BUN_INSTALL (empty: the machine's env() can't unset it). No ~/.bun/bin.
+ */
+const managerEnv = (m: Machine) => ({ PATH: `${join(m.user, ".fake", "bin")}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`, BUN_INSTALL: "" });
+
+const SCRIBE_ROW = { name: "parachute-scribe", port: 1943, paths: ["/scribe"], health: "/health", version: "0.5.0", stripPrefix: true };
+
+/**
+ * A stand-in for scribe as `bun add -g` installs it: a Bun script in ~/.bun/bin (so it needs `bun` on PATH too) that
+ * answers /health on the port its supervisor gives it.
+ */
+function standInScribe(m: Machine): void {
+  writeFileSync(
+    join(m.bunDir, "bin", "parachute-scribe"),
+    `#!/usr/bin/env bun\nBun.serve({ hostname: "127.0.0.1", port: Number(process.env.PORT || 1943), fetch: () => Response.json({ status: "ok" }) });\nsetInterval(() => {}, 1e9);\n`,
+    { mode: 0o755 },
+  );
+}
+
+/** Add module rows to the home's services.json, as their installs register them. */
+function register(m: Machine, rows: object[]): void {
+  const file = join(m.home, "services.json");
+  const doc = JSON.parse(readFileSync(file, "utf8"));
+  doc.services.push(...rows);
+  writeFileSync(file, `${JSON.stringify(doc, null, 2)}\n`);
 }
 
 describe("takeover: setup", () => {
@@ -562,6 +597,70 @@ describe("takeover", () => {
     } finally {
       await c.stop();
     }
+  }, 120_000);
+
+  test("takeover under the user manager's PATH (systemd-run --user) checks v0.8 with the old unit's PATH and BUN_INSTALL: a module whose program is only there starts, and the takeover succeeds", async () => {
+    // Found on the friends box (10-29): `takeover --yes` ran under `systemd-run --user`, so it had the user manager's
+    // PATH (no ~/.bun/bin) and no BUN_INSTALL. Its check run took that environment, v0.8 couldn't find the registered
+    // scribe's program, /api/ready stayed false, and after 90 s the takeover put everything back (exit 8). The old
+    // unit's PATH has ~/.bun/bin, and parachute-core.service would have carried it over.
+    const { m, s } = await oldMachine("tk-unitenv", boxUnitEnv);
+    standInScribe(m);
+    register(m, [SCRIBE_ROW]);
+    // The old hub as the box runs it: restarted with scribe registered (its unit's PATH finds the program).
+    await m.run(["systemctl", "--user", "restart", HUB_UNIT]);
+    await serving(m, s, HUB_UNIT);
+    // Long enough to see a failed check's own exit 8 (its 90 s wait, then the restore), not the harness's kill.
+    const r = await m.run([requireCore(m.info), "takeover", "--home", m.home, "--yes", "--json"], { env: managerEnv(m), timeoutMs: 200_000 });
+    must(r.code === 0, `takeover --yes under the user manager's PATH exited ${r.code}: ${r.stderr.slice(-800)}`);
+    expect(r.stderr).toContain(`with ${HUB_UNIT}'s environment`);
+    expect(readFileSync(join(m.unitDir, "parachute-core.service"), "utf8")).toContain(`Environment="PATH=${boxUnitEnv(m).PATH}"`);
+    // parachute-core.service, with that same environment, has scribe up too: ready, and scribe answers through it.
+    const c = await coreUnit(m, s);
+    try {
+      const ready = await until(async () => {
+        const res = await safeFetch(`${s.origin}/api/ready`, { headers: { accept: "application/json" } });
+        return res.status === 200 && (await res.json().catch(() => ({})))?.ready === true;
+      }, 60_000, 250);
+      expect(ready).toBe(true);
+      expect((await safeFetch(`${s.origin}/scribe/health`)).status).toBe(200);
+    } finally {
+      await c.stop();
+    }
+  }, 300_000);
+
+  test("the dry run warns when a registered module's program isn't on the PATH v0.8 will run with (the old unit's), and only then", async () => {
+    // Scribe's program is on the old unit's PATH (not the caller's): no warning. Surface's is nowhere: a warning.
+    const { m } = await oldMachine("tk-unfound", boxUnitEnv);
+    standInScribe(m);
+    register(m, [SCRIBE_ROW, { name: "parachute-surface", port: 1946, paths: ["/surface"], health: "/surface/healthz", version: "0.1.0" }]);
+    const before = await snapshot(m, true);
+    const calls = m.systemctlCalls().length;
+    const dry = await core(m, ["takeover", "--home", m.home, "--dry-run"], managerEnv(m));
+    must(dry.code === 0, `takeover --dry-run exited ${dry.code}: ${dry.stderr.slice(-600)}`);
+    expect(dry.stdout).toContain(`Warning: v0.8 won't find \`parachute-surface\` (parachute-surface) on the PATH it will run with (${HUB_UNIT}'s)`);
+    expect(dry.stdout).not.toContain("`parachute-scribe`");
+    const j = json(await core(m, ["takeover", "--home", m.home, "--dry-run", "--json"], managerEnv(m)), "takeover --dry-run --json");
+    expect(j.unfound).toEqual([{ name: "parachute-surface", command: "parachute-surface" }]);
+    expect(m.systemctlCalls().slice(calls).filter((c) => MUTATING.test(c))).toEqual([]);
+    expect(await snapshot(m, true)).toEqual(before);
+  }, 120_000);
+
+  test("a unit with no PATH of its own runs with the user manager's: the dry run looks modules' programs up there, not on the caller's PATH", async () => {
+    // The other way round from the friends box: run from a shell whose PATH has the program, for a unit that will
+    // run with the manager's PATH, which hasn't. The check would pass and parachute-core.service couldn't start it.
+    // And a program only in a manager PATH folder with a space in its name (systemd prints that PATH as $'…') is found.
+    const { m } = await oldMachine("tk-mgrpath", undefined, (user) => join(user, "my tools", "bin"));
+    const shellBin = join(m.user, "shell-bin");
+    const toolsBin = join(m.user, "my tools", "bin");
+    for (const [dir, prog] of [[shellBin, "parachute-surface"], [toolsBin, "parachute-scribe"]] as const) {
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, prog), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    }
+    register(m, [SCRIBE_ROW, { name: "parachute-surface", port: 1946, paths: ["/surface"], health: "/surface/healthz", version: "0.1.0" }]);
+    const dry = await core(m, ["takeover", "--home", m.home, "--dry-run", "--json"], { PATH: `${shellBin}:${m.env().PATH}` });
+    expect(json(dry, "takeover --dry-run --json").unfound).toEqual([{ name: "parachute-surface", command: "parachute-surface" }]);
+    expect(dry.stderr).toContain(`Warning: v0.8 won't find \`parachute-surface\` (parachute-surface) on the PATH it will run with (${HUB_UNIT}'s)`);
   }, 120_000);
 
   test("when parachute-core.service can't serve (its port is taken), takeover puts everything back and exits 8", async () => {

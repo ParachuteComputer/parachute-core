@@ -294,7 +294,8 @@ export async function bootSupervisedModules(
   return results;
 }
 
-async function resolveSpec(short: string, entry: ServiceEntry): Promise<ServiceSpec | undefined> {
+/** The spec boot starts a services.json row with (first-party, else its installDir's module.json). Also takeover's. */
+export async function resolveSpec(short: string, entry: ServiceEntry): Promise<ServiceSpec | undefined> {
   const firstParty = getSpec(short);
   if (firstParty) return firstParty;
   if (!entry.installDir) return undefined;

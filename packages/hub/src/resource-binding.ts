@@ -270,3 +270,85 @@ export function resolveRootMcpTokenAudience(
   if (fallbackAudience === "account") return "account";
   return null;
 }
+
+/**
+ * What a refresh's `resource` names, on the tolerant rules refresh uses (friends box, 10-29).
+ *
+ * Code exchange and authorize keep the strict rule above (`resolveResourceVault` / `isRootMcpResource`: the origin
+ * must be one of the hub's bound origins, exactly). A refresh replays the `resource` the client saved when it was
+ * authorized, perhaps months and several hub versions ago. The vaults of that time built the protected-resource
+ * metadata `resource` from the request (`x-forwarded-proto || "https"` + `x-forwarded-host`, else the request's own
+ * origin), so a client may hold `http://<public host>/vault/<v>/mcp`, a loopback origin on the vault's own port
+ * (`http://127.0.0.1:1940/…`) or a host the hub no longer answers on. 0.7.x never read `resource` on refresh.
+ *
+ * Here a resource is the hub's when its host (host:port, scheme ignored, so http and https of a known origin both
+ * count) is the host of one of `knownOrigins`, or when its hostname is loopback (any port). Only http and https.
+ * Returns the vault it names, `{ root: true }` for the root MCP door, or null (not ours, not an MCP resource,
+ * malformed). The caller decides what null means; on refresh it means "ignore the resource".
+ */
+export function resolveRefreshResource(
+  resource: string,
+  knownOrigins: readonly string[],
+): { vault: string } | { root: true } | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(resource);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+  if (!isLoopbackHostname(parsed.hostname) && !knownHosts(knownOrigins).has(parsed.host)) return null;
+  const mcp = VAULT_MCP_PATH_RE.exec(parsed.pathname) ?? VAULT_PRM_PATH_RE.exec(parsed.pathname);
+  if (mcp?.[1]) {
+    const name = decodeVaultName(mcp[1]);
+    return name ? { vault: name } : null;
+  }
+  if (ROOT_MCP_PATH_RE.test(parsed.pathname) || ROOT_PRM_PATH_RE.test(parsed.pathname)) return { root: true };
+  return null;
+}
+
+function knownHosts(origins: readonly string[]): Set<string> {
+  const out = new Set<string>();
+  for (const o of origins) {
+    try {
+      const u = new URL(o);
+      if (u.protocol === "http:" || u.protocol === "https:") out.add(u.host);
+    } catch {
+      // A malformed origin names no host.
+    }
+  }
+  return out;
+}
+
+function isLoopbackHostname(hostname: string): boolean {
+  const h = hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  return h === "localhost" || h === "127.0.0.1" || h === "::1";
+}
+
+/**
+ * A `resource` as a log may show it: the scheme (http/https only), the host when it is one of `knownOrigins`' hosts
+ * or loopback (else `<other-host>`), and the path as one of a few fixed
+ * templates with the vault name replaced (`/vault/<v>/mcp`, `/vault/<v>/.well-known/oauth-protected-resource`, `/mcp`,
+ * `/`), else `<other-path>`. A query or fragment shows as `?…`. `none` when absent, `malformed` when it doesn't
+ * parse, `<other-scheme>` for anything but http(s). Never the value itself: a resource may carry anything, and the
+ * refresh path logs the unmatched ones on purpose.
+ */
+export function resourceLogShape(resource: string | null | undefined, knownOrigins: readonly string[] = []): string {
+  if (!resource) return "none";
+  let u: URL;
+  try {
+    u = new URL(resource);
+  } catch {
+    return "malformed";
+  }
+  if (u.protocol !== "http:" && u.protocol !== "https:") return "<other-scheme>";
+  // Only a host the hub itself answers on (or loopback) is named; any other host is the client's to know, not the log's.
+  const host = isLoopbackHostname(u.hostname) || knownHosts(knownOrigins).has(u.host) ? u.host : "<other-host>";
+  const p = u.pathname;
+  let path = "<other-path>";
+  if (VAULT_MCP_PATH_RE.test(p)) path = `/vault/<v>/mcp${p.endsWith("/") ? "/" : ""}`;
+  else if (VAULT_PRM_PATH_RE.test(p)) path = "/vault/<v>/.well-known/oauth-protected-resource";
+  else if (ROOT_MCP_PATH_RE.test(p)) path = `/mcp${p.endsWith("/") ? "/" : ""}`;
+  else if (p === "/") path = "/";
+  return `${u.protocol}//${host}${path}${u.search || u.hash ? "?…" : ""}`;
+}

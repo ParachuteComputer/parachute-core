@@ -97,8 +97,10 @@ import {
   isRootMcpResource,
   narrowResourceVaultScopes,
   narrowRootMcpScopes,
+  resolveRefreshResource,
   resolveResourceVault,
   resolveRootMcpTokenAudience,
+  resourceLogShape,
 } from "./resource-binding.ts";
 import {
   ACCOUNT_SELF_ADMIN_SCOPE,
@@ -274,6 +276,13 @@ export interface OAuthDeps {
    * don't yet thread this through stay correct on a single-origin hub.
    */
   hubBoundOrigins?: () => readonly string[];
+  /**
+   * Every issuer this hub knows of, beyond the bound set: the stored `hub_origin`, the configured issuer, the
+   * expose origin, the vault `.env`'s `PARACHUTE_HUB_ORIGIN(S)`, an embedded home's earlier issuers. Only the
+   * refresh path reads it, to recognise a `resource` a client saved under an earlier setup (friends box, 10-29).
+   * Absent → the bound set alone.
+   */
+  knownIssuers?: () => readonly string[];
 }
 
 export interface ServicesCatalogEntry {
@@ -735,6 +744,103 @@ function resolveTokenResourceAudience(
     return { audience };
   }
   return { errorResponse: invalidTargetResponse(requestResource) };
+}
+
+/**
+ * Audience for a refresh, given the `resource` the client sent. A refresh never fails because of `resource`
+ * (friends box, 10-29: two Claude connectors authorized in June replayed a `resource` v0.8 refused, so they were
+ * never renewed and signed out). 0.7.x never read `resource` on refresh; v0.8 checked it like a code exchange.
+ *
+ *   - names a vault in the grant, on any origin `resolveRefreshResource` counts as the hub's → `vault.<name>`
+ *     (as the code exchange does: an explicit resource picks among the grant's vaults);
+ *   - names the root MCP door → the root-door audience, as the code exchange gives it;
+ *   - anything else (another host, no /mcp, a vault outside the grant, malformed, a root door the grant can't
+ *     serve) → the resource is ignored: the grant's own audience (`inferAudience(row.scopes)`, 0.7.x), with a
+ *     reason the caller logs.
+ *
+ * Ignoring can't widen access: the audience is either a vault the grant's scopes name or the grant's own, and the
+ * minted token carries the row's scopes unchanged.
+ */
+function resolveRefreshAudience(
+  requestResource: string | null,
+  grantedVaultNames: ReadonlySet<string>,
+  knownOrigins: readonly string[],
+  grantAudience: string,
+): { audience: string; ignored?: string } {
+  if (!requestResource) return { audience: grantAudience };
+  const target = resolveRefreshResource(requestResource, knownOrigins);
+  if (!target) return { audience: grantAudience, ignored: "not this hub's MCP resource" };
+  if ("vault" in target) {
+    if (!grantedVaultNames.has(target.vault)) return { audience: grantAudience, ignored: "names a vault outside the grant" };
+    return { audience: `vault.${target.vault}` };
+  }
+  const root = resolveRootMcpTokenAudience(grantedVaultNames, grantAudience);
+  if (root === null) return { audience: grantAudience, ignored: "root MCP door, grant names no vault" };
+  return { audience: root };
+}
+
+/** A client_id as a log may show it: the first 6 characters, or `?` for anything but [A-Za-z0-9_-]. */
+function clientIdLogPrefix(clientId: string): string {
+  const head = clientId.slice(0, 6);
+  return head && /^[A-Za-z0-9_-]+$/.test(head) ? head : "?";
+}
+
+/** The origins whose hosts a token log line may name: the bound set and every earlier issuer. A source that throws names none. */
+function tokenLogOrigins(deps: OAuthDeps): readonly string[] {
+  try {
+    return [...resolveBoundOrigins(deps), ...(deps.knownIssuers?.() ?? [])];
+  } catch {
+    return [];
+  }
+}
+
+/** The token endpoint's fixed error descriptions; any other (they can carry scopes, names or URLs) isn't logged. */
+const LOGGABLE_TOKEN_ERRORS = new Set([
+  "body must be JSON",
+  "client_id mismatch",
+  "client is registered but has not been approved by the hub operator (#74)",
+  "code already redeemed",
+  "code expired",
+  "code not found",
+  "code_verifier mismatch",
+  "missing required parameter",
+  "redirect_uri mismatch",
+  "refresh_token expired",
+  "refresh_token has no associated user",
+  "refresh_token not found",
+  "refresh_token revoked",
+  "refresh_token rotation conflict",
+  "unknown client_id",
+]);
+
+/** An error_description a log may carry: one of the fixed phrases above, else nothing. */
+function safeErrorDescription(d: unknown): string | null {
+  return typeof d === "string" && LOGGABLE_TOKEN_ERRORS.has(d) ? d : null;
+}
+
+/**
+ * One line per non-2xx answer from /oauth/token: grant_type, status, error code, the error description when it is
+ * a fixed phrase, the client_id's first 6 characters, and the `resource` shape (`resourceLogShape`). Never a token,
+ * code, verifier or secret. v0.8 answered refused refreshes silently, which hid the friends-box failure (10-29).
+ */
+async function logRefusedToken(
+  form: Awaited<ReturnType<Request["formData"]>>,
+  res: Response,
+  knownOrigins: readonly string[],
+): Promise<void> {
+  let error = "?";
+  let description: string | null = null;
+  try {
+    const body = (await res.clone().json()) as { error?: unknown; error_description?: unknown };
+    if (typeof body.error === "string" && /^[a-z_]{1,40}$/.test(body.error)) error = body.error;
+    description = safeErrorDescription(body.error_description);
+  } catch {
+    // Not JSON: the status says enough.
+  }
+  const grantType = String(form.get("grant_type") ?? "");
+  console.warn(
+    `[oauth] /oauth/token refused: grant_type=${grantType === "authorization_code" || grantType === "refresh_token" ? grantType : "<other>"} status=${res.status} error=${error}${description ? ` (${description})` : ""} client=${clientIdLogPrefix(String(form.get("client_id") ?? ""))} resource=${resourceLogShape(form.get("resource") as string | null, knownOrigins)}`,
+  );
 }
 
 // --- /oauth/authorize ------------------------------------------------------
@@ -2710,6 +2816,23 @@ function authenticateClient(
  */
 export async function handleToken(db: Database, req: Request, deps: OAuthDeps): Promise<Response> {
   const form = await req.formData();
+  let res: Response;
+  try {
+    res = await dispatchToken(db, req, form, deps);
+  } catch (err) {
+    await logRefusedToken(form, new Response(null, { status: 500 }), tokenLogOrigins(deps));
+    throw err;
+  }
+  if (res.status < 200 || res.status > 299) await logRefusedToken(form, res, tokenLogOrigins(deps));
+  return res;
+}
+
+async function dispatchToken(
+  db: Database,
+  req: Request,
+  form: Awaited<ReturnType<Request["formData"]>>,
+  deps: OAuthDeps,
+): Promise<Response> {
   const grantType = String(form.get("grant_type") ?? "");
   if (grantType === "authorization_code")
     return await handleTokenAuthorizationCode(db, req, form, deps);
@@ -2968,14 +3091,19 @@ async function rotateAndRespond(
   // dead-old-without-replacement (#107).
   // A refresh row has no separate authorization artifact to consult. Its
   // final named vault scopes are the resource binding already baked into the
-  // grant, so resource validation derives from the row itself.
-  const audienceResolution = resolveTokenResourceAudience(
+  // grant, so the audience derives from the row itself. A `resource` that
+  // doesn't match is ignored, never refused (resolveRefreshAudience).
+  const audienceResolution = resolveRefreshAudience(
     requestResource,
     namedVaultScopeNames(row.scopes),
-    resolveBoundOrigins(deps),
+    [...resolveBoundOrigins(deps), ...(deps.knownIssuers?.() ?? [])],
     inferAudience(row.scopes),
   );
-  if ("errorResponse" in audienceResolution) return audienceResolution.errorResponse;
+  if (audienceResolution.ignored) {
+    console.warn(
+      `[oauth] refresh ignored its resource (${audienceResolution.ignored}); the grant's own audience kept: client=${clientIdLogPrefix(row.clientId)} resource=${resourceLogShape(requestResource, tokenLogOrigins(deps))}`,
+    );
+  }
   const audience = audienceResolution.audience;
   try {
     const access = await signAccessToken(db, {

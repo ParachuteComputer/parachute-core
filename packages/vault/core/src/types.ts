@@ -474,7 +474,7 @@ export interface Store {
   // Notes. `actor` / `via` carry write-attribution (vault#298) — the
   // principal + interface stamped onto created_by/created_via (and mirrored
   // into the last_updated_* pair on create). Omitted → attribution NULL.
-  createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string; extension?: string; actor?: string | null; via?: string | null }): Promise<Note>;
+  createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string; extension?: string; actor?: string | null; via?: string | null; /** Bulk import only; see SqliteStore.createNote. */ deferWikilinkSync?: boolean }): Promise<Note>;
   getNote(id: string): Promise<Note | null>;
   /**
    * Look up a note by path. Pass `extension` to disambiguate when
@@ -521,7 +521,8 @@ export interface Store {
    * after bulk-imports to rebuild link rows from `[[brackets]]` in
    * content. Returns counts for caller logging.
    */
-  syncAllWikilinks(): Promise<{ synced: number; totalAdded: number; totalRemoved: number }>;
+  /** `checkpoint`: awaited every few hundred notes (cloud import chunking; see ImportEngineOptions.checkpoint). */
+  syncAllWikilinks(opts?: { checkpoint?: () => Promise<void> }): Promise<{ synced: number; totalAdded: number; totalRemoved: number }>;
   /** vault#524: deletion captures a tombstone unless a blow-away import opts out. */
   deleteNote(id: string, opts?: { actor?: string | null; via?: string | null; captureHistory?: boolean }): Promise<void>;
   listNoteVersions(id: string, opts?: { limit?: number; offset?: number }): Promise<VersionRow[]>;

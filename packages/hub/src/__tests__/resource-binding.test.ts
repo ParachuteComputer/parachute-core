@@ -3,8 +3,10 @@ import {
   isRootMcpResource,
   narrowResourceVaultScopes,
   narrowRootMcpScopes,
+  resolveRefreshResource,
   resolveResourceVault,
   resolveRootMcpTokenAudience,
+  resourceLogShape,
 } from "../resource-binding.ts";
 
 const ORIGIN = "https://hub.example";
@@ -263,5 +265,57 @@ describe("resolveRootMcpTokenAudience", () => {
   test("empty/foreign grant is null — token handler rejects invalid_target", () => {
     expect(resolveRootMcpTokenAudience(new Set(), "hub")).toBeNull();
     expect(resolveRootMcpTokenAudience(new Set(), "scribe")).toBeNull();
+  });
+});
+
+describe("resolveRefreshResource (refresh only: the resource a client saved under an earlier setup)", () => {
+  test("a known origin's host in either scheme, and loopback on any port, name the hub's vault", () => {
+    for (const r of [
+      `${ORIGIN}/vault/jon/mcp`,
+      "http://hub.example/vault/jon/mcp",
+      "http://127.0.0.1:1940/vault/jon/mcp",
+      "https://localhost:5173/vault/jon/mcp/",
+      "http://[::1]:1940/vault/jon/.well-known/oauth-protected-resource",
+    ]) {
+      expect({ r, t: resolveRefreshResource(r, BOUND) }).toEqual({ r, t: { vault: "jon" } });
+    }
+    expect(resolveRefreshResource("http://hub.example/mcp", BOUND)).toEqual({ root: true });
+  });
+
+  test("anything else is not the hub's: another host or port, another scheme, no /mcp, a bad name, malformed", () => {
+    for (const r of [
+      "https://evil.example/vault/jon/mcp",
+      "https://hub.example:8443/vault/jon/mcp",
+      "ftp://hub.example/vault/jon/mcp",
+      `${ORIGIN}/vault/jon`,
+      `${ORIGIN}/vault/%2F..%2Fadmin/mcp`,
+      "not a url",
+    ]) {
+      expect({ r, t: resolveRefreshResource(r, BOUND) }).toEqual({ r, t: null });
+    }
+  });
+});
+
+describe("resourceLogShape", () => {
+  test("scheme, host and path shape; the vault name, query and fragment never shown", () => {
+    expect(resourceLogShape("https://private-name.example/mcp", BOUND)).toBe("https://<other-host>/mcp");
+    expect(resourceLogShape("http://127.0.0.1:1940/vault/jon/mcp")).toBe("http://127.0.0.1:1940/vault/<v>/mcp");
+    expect(resourceLogShape("https://hub.example/vault/jon/mcp?token=abc#x", BOUND)).toBe("https://hub.example/vault/<v>/mcp?…");
+    expect(resourceLogShape("https://hub.example/mcp", BOUND)).toBe("https://hub.example/mcp");
+    expect(resourceLogShape(null)).toBe("none");
+    expect(resourceLogShape("not a url")).toBe("malformed");
+  });
+
+  test("whatever else the resource carries stays out of the log: other paths, other schemes", () => {
+    expect(resourceLogShape("https://hub.example/mcp/SECRET", BOUND)).toBe("https://hub.example<other-path>");
+    expect(resourceLogShape("https://hub.example/vault/jon/mcp/SECRET", BOUND)).toBe("https://hub.example<other-path>");
+    expect(resourceLogShape("https://hub.example/SECRET", BOUND)).toBe("https://hub.example<other-path>");
+    expect(resourceLogShape("data:text/plain,SECRET")).toBe("<other-scheme>");
+    expect(resourceLogShape("https://user:SECRET@hub.example/mcp", BOUND)).toBe("https://hub.example/mcp");
+    expect(resourceLogShape("http://hub.example/vault/jon/.well-known/oauth-protected-resource", BOUND)).toBe(
+      "http://hub.example/vault/<v>/.well-known/oauth-protected-resource",
+    );
+    for (const r of ["https://hub.example/mcp/SECRET", "data:text/plain,SECRET", "https://user:SECRET@hub.example/mcp"])
+      expect(resourceLogShape(r)).not.toContain("SECRET");
   });
 });

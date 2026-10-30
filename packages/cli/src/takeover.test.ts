@@ -5,7 +5,7 @@ import { describe, expect, test } from "bun:test";
 import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { backup, entries, restore, systemdWords, unitHome as readHome } from "./takeover.ts";
+import { backup, entries, managerValue, restore, systemdWords, unitHome as readHome } from "./takeover.ts";
 
 // The user manager's environment sets no PARACHUTE_HOME here, unless a test says so.
 const unitHome = (text: string, manager: () => string | undefined | null = () => undefined) => readHome(text, manager);
@@ -126,5 +126,26 @@ describe("backup and restore", () => {
     symlinkSync("../../elsewhere", join(home, "vault", "out-relative"));
     symlinkSync("..", join(home, "transcription", "up"));
     expect(entries(home).other.sort()).toEqual(["out-absolute", join("transcription", "up"), join("vault", "out-relative")].sort());
+  });
+});
+
+describe("managerValue: a value as systemctl show-environment prints it", () => {
+  test("plain values are taken as they are", () => {
+    expect(managerValue("/home/u/.bun/bin:/usr/bin")).toBe("/home/u/.bun/bin:/usr/bin");
+    expect(managerValue("")).toBe("");
+  });
+  test("systemd's $'…' form is decoded: a space, quotes, backslashes, C escapes, octal and hex bytes (UTF-8)", () => {
+    expect(managerValue("$'/home/u/My Tools/bin:/usr/bin'")).toBe("/home/u/My Tools/bin:/usr/bin");
+    expect(managerValue("$'it\\'s a \\\\ and \\\"q\\\"'")).toBe(`it's a \\ and "q"`);
+    expect(managerValue("$'a\\tb\\nc'")).toBe("a\tb\nc");
+    expect(managerValue("$'caf\\303\\251 \\x41'")).toBe("café A");
+    expect(managerValue("$'café'")).toBe("café");
+  });
+  test("anything it can't read exactly is null", () => {
+    expect(managerValue("$'unterminated")).toBeNull();
+    expect(managerValue("$'a'b'")).toBeNull();
+    expect(managerValue("$'\\q'")).toBeNull();
+    expect(managerValue("$'\\'")).toBeNull();
+    expect(managerValue("$'\\777'")).toBeNull();
   });
 });
