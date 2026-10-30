@@ -36,9 +36,12 @@ It runs from any folder, a path with spaces included.
 When Prism re-signs the payload, please treat `parachute/runtime/bun` like your Node runtime (the hardened runtime
 plus `allow-jit`); nothing else in the tree needs an entitlement.
 
-**npm** (for a machine with Bun 1.4+): the newest prerelease is on the `next` tag, `0.8.0-pre.2`. `latest` stays at
-`0.8.0-pre.1` until 0.8.0 ships, so ask for `@next`. It runs on the Bun on `PATH`. `parachute-vault` is not linked
-into a `bin` folder; it is in the package:
+**npm** (for a machine with Bun 1.4+): each prerelease goes to the `next` tag, and `latest` stays at `0.8.0-pre.1`
+until 0.8.0 ships, so ask for `@next`. Today `next` is still `0.8.0-pre.1`: npm refused CI's publish of `0.8.0-pre.2`
+until the package's trusted publisher is set up (RELEASING.md). Until then, install pre.2 from the release's npm file:
+download `openparachute-core-0.8.0-pre.2.tgz` and `npm-SHA256SUMS`, check it with `sha256sum -c npm-SHA256SUMS`
+(macOS: `shasum -a 256 -c npm-SHA256SUMS`), then `npm i ./openparachute-core-0.8.0-pre.2.tgz`. It runs on the Bun on
+`PATH`. `parachute-vault` is not linked into a `bin` folder; it is in the package:
 
 | Install | `parachute` | `parachute-vault` |
 |---|---|---|
