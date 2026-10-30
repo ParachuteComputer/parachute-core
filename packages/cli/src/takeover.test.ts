@@ -85,7 +85,7 @@ describe("unitHome", () => {
   });
 });
 
-// The backup and its restore (rehearsal/uni, lane H): uni's home has a library's version links in transcription/bin
+// The backup and its restore (a rehearsal, lane H): a real home has a library's version links in transcription/bin
 // (`libggml.so -> libggml.so.0 -> libggml.so.0.15.1`). They stay inside the home, so they are copied as links and put
 // back as links; only a link that leads out of the home (or a socket) can't be copied as it is.
 describe("backup and restore", () => {

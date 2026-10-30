@@ -105,7 +105,7 @@ export const NOTES_META_DIR = "notes-meta";
  * Extensions whose serialized form carries metadata as inline YAML
  * frontmatter at the top of the content file. `.md` is the canonical
  * case; `.mdx` joins it because MDX's parser accepts the same `---`
- * delimited preamble (and Aaron's planning to use MDX in notes).
+ * delimited preamble (and MDX in notes is planned).
  * Anything else is sidecar-required — see `core/src/portable-md.ts`
  * write/read paths.
  *

@@ -1,4 +1,4 @@
-# The v0.8 bundle as Prism ships it (PLAN §3 "The bundle" and "Signing", §7.3): built on macos-14 (arm64), signed
+# The v0.8 bundle as Prism ships it (PLAN §3 "The bundle" and "Signing", §7.3): built on macos-15 (arm64), signed
 # ad hoc with the hardened runtime (only runtime/bun gets an entitlement, allow-jit), packed, and unpacked to a path
 # with a space with Bun's developer caches removed. Then, on the signed tree:
 #   - embedded/bundle (layout, its own Bun, the tarball and SHA256SUMS, the payload, a run, the signatures);
@@ -33,7 +33,7 @@ env:
 jobs:
   bundle-macos:
     name: the signed bundle on macOS arm64 (embedded/bundle and Benjamin's suite on the signed tree)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
     defaults:
       run:
