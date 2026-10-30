@@ -10,7 +10,7 @@ import { projectHistoryProvenance } from "../core/src/history-visibility.js";
 import type { McpToolDef, GenerateMcpToolsOpts } from "../core/src/mcp.ts";
 import { MCP_TOOL_REFERENCE, acceptedParams } from "../core/src/mcp-manifest.ts";
 import { mergeTypesIntoTags } from "../core/src/tag-kind.ts";
-import { checkToolParams, NEW_TOOLS, TOOL_ALIASES, TOOL_ORDER, aliasDescription } from "../core/src/mcp-short.ts";
+import { nestedParamProblem, NEW_TOOLS, TOOL_ALIASES, TOOL_ORDER, aliasDescription, unknownParams, type ParamProblem } from "../core/src/mcp-short.ts";
 import { getNote, getNoteTags, getVaultMap, getVaultStats } from "../core/src/notes.ts";
 import { narrowLinkWarningsForVisibility } from "../core/src/wikilinks.ts";
 import type { Note } from "../core/src/types.ts";
@@ -444,11 +444,22 @@ function applyElevenTools(tools: McpToolDef[], vaultName: string, auth: AuthResu
 
 const VERB_RANK: Record<string, number> = { read: 0, write: 1, admin: 2 };
 
+/** Ignored unknown parameters so far, per `tool.param`, in this process (the counted log line). */
+const unknownParamCounts = new Map<string, number>();
+
 /**
- * Errors that teach (T-318 §4): a parameter a tool doesn't accept is refused
- * with the one-line fix and a pointer to `vault-info { help }`, instead of
- * being silently ignored. A tool accepts every parameter in its full reference
- * schema and in the short schema it advertises.
+ * Parameters a tool doesn't know (T-318 §4, and the 10-30 decision "nothing
+ * removed before 1.0"). As on 0.8 the call runs with them ignored, so no client
+ * that worked on 0.8 breaks. Unlike 0.8 the answer says so:
+ *   - an object answer gets a `warnings` entry per name, `{code:
+ *     "unknown_parameter", message, field, hint}` (the one-line fix);
+ *   - an array answer keeps its shape, so the log line is its only trace;
+ *   - a call that fails anyway names the fix in its error;
+ *   - every name is counted in one stderr line, `tool.param` and the count,
+ *     never the value, so real exposure can be measured before 1.0.
+ * A misused nested key (`near: {id}`) is refused, as 0.8 refused it. A tool
+ * accepts every parameter in its full reference schema and in the short schema
+ * it advertises.
  */
 function applyParamTeaching(tools: McpToolDef[], vaultName: string): void {
   for (const tool of tools) {
@@ -463,11 +474,35 @@ function applyParamTeaching(tools: McpToolDef[], vaultName: string): void {
     const accepted = [...new Set([...reference, ...Object.keys(((tool.inputSchema as { properties?: object }).properties) ?? {})])];
     const execute = tool.execute;
     tool.execute = async (params) => {
-      const problem = checkToolParams(tool.name, params ?? {}, accepted);
-      if (problem) throw Object.assign(new Error(problem.message), problem);
-      return execute(params);
+      const nested = nestedParamProblem(tool.name, params ?? {});
+      if (nested) throw Object.assign(new Error(nested.message), nested);
+      const unknown = unknownParams(tool.name, params ?? {}, accepted);
+      if (unknown.length === 0) return execute(params);
+      for (const u of unknown) {
+        const key = `${tool.name}.${u.field}`;
+        const n = (unknownParamCounts.get(key) ?? 0) + 1;
+        unknownParamCounts.set(key, n);
+        console.error(`[mcp] unknown parameter ignored: ${key} (${n} since start)`);
+      }
+      let result: unknown;
+      try {
+        result = await execute(params);
+      } catch (err) {
+        if (err instanceof Error) err.message += ` (Also: ${unknown.map((u) => u.message.replace(/ Every parameter:.*$/, "")).join(" ")})`;
+        throw err;
+      }
+      return withParamWarnings(tool.name, result, unknown);
     };
   }
+}
+
+function withParamWarnings(tool: string, result: unknown, unknown: ParamProblem[]): unknown {
+  const warnings = unknown.map((u) => ({ code: u.error_type, message: u.message, field: u.field, hint: u.hint }));
+  // query-notes answers `{notes, warnings}` whenever it has a warning (core mcp.ts), a shape its callers already read.
+  if (tool === "query-notes" && Array.isArray(result)) return { notes: result, warnings };
+  if (!result || typeof result !== "object" || Array.isArray(result)) return result;
+  const r = result as Record<string, unknown>;
+  return { ...r, warnings: [...(Array.isArray(r.warnings) ? r.warnings : []), ...warnings] };
 }
 
 /**

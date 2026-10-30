@@ -50,7 +50,7 @@ export interface McpToolManifestEntry {
  * input schemas agents saw before 0.9's description budget. No longer sent in
  * `tools/list`; `vault-info { help: "<tool>" }` returns an entry, and its
  * schema's property names are the parameters a tool accepts
- * (`checkToolParams`, mcp-short.ts).
+ * (`unknownParams`, mcp-short.ts).
  */
 export const MCP_TOOL_REFERENCE: readonly McpToolManifestEntry[] = [
     {

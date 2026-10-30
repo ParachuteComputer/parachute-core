@@ -9,8 +9,9 @@
  * Nothing is lost: the full text and every parameter stay in
  * `MCP_TOOL_REFERENCE` (mcp-manifest.ts), which `vault-info { help: "<tool>" }`
  * returns, and every parameter the reference names is still accepted. A
- * parameter a tool doesn't know is refused with the one-line fix
- * (`checkToolParams`) instead of being silently ignored.
+ * parameter a tool doesn't know is ignored, as 0.8 ignored it, and named with
+ * its one-line fix (`unknownParams`); a misused nested key is refused
+ * (`nestedParamProblem`).
  *
  * These texts shipped only after `contracts/evals/mcp-tasks` showed agents do
  * as well with them as with the long ones, model by model. Change them the
@@ -266,25 +267,36 @@ export interface ParamProblem {
 }
 
 /**
- * Check a call's arguments against every parameter the tool accepts
- * (`accepted`: the names in its full reference schema). Returns the one-line
- * fix for the first problem, or null. Names starting with `_` and the account
- * door's `vault` are always allowed.
+ * The call's top-level names the tool doesn't accept (`accepted`: the names in
+ * its full reference schema), each with its one-line fix. 0.8 ignored such a
+ * name and ran the call; 0.9 still does (nothing is removed before 1.0), and
+ * reports each one (src/mcp-tools.ts: a warning on the answer and a counted log
+ * line), so 1.0 can decide from real use whether to refuse them. Names starting
+ * with `_` and the account door's `vault` are always allowed.
  */
-export function checkToolParams(tool: string, params: Record<string, unknown>, accepted: readonly string[]): ParamProblem | null {
+export function unknownParams(tool: string, params: Record<string, unknown>, accepted: readonly string[]): ParamProblem[] {
   const known = new Set(accepted);
+  const out: ParamProblem[] = [];
   for (const key of Object.keys(params ?? {})) {
     if (known.has(key) || key === "vault" || key.startsWith("_")) continue;
     const alias = PARAM_ALIASES[tool]?.[key];
     const near = alias && known.has(alias) ? alias : [...known].map((k) => [k, distance(key, k)] as const).sort((a, b) => a[1] - b[1]).find(([, d]) => d <= 2)?.[0];
     const fix = near ? ` Did you mean \`${near}\`?` : "";
-    return {
-      message: `${tool} has no parameter \`${key}\`.${fix} ${HELP(tool)}`,
+    out.push({
+      message: `${tool} has no parameter \`${key}\`, so it was ignored.${fix} ${HELP(tool)}`,
       error_type: "unknown_parameter",
       field: key,
       hint: near ? `use ${near}` : `see vault-info {help: "${tool}"}`,
-    };
+    });
   }
+  return out;
+}
+
+/**
+ * A misused nested key (`near: {id}` for `{note_id}`), refused with its fix.
+ * 0.8 refused every one of these too, with a less helpful error.
+ */
+export function nestedParamProblem(tool: string, params: Record<string, unknown>): ParamProblem | null {
   for (const [t, param, wrong, right] of NESTED) {
     const v = params?.[param];
     if (t === tool && v && typeof v === "object" && !Array.isArray(v) && wrong in v && !(right in v)) {

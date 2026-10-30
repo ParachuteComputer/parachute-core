@@ -49,7 +49,11 @@ describe("mcp/budget", () => {
   test("errors teach: a misused or unknown parameter names the fix", async () => {
     const { c } = await session("write");
     await expect(c.call("query-notes", { near: { id: "Anything" } })).rejects.toThrow(/near takes \{note_id\}, not \{id\}/);
-    await expect(c.call("query-notes", { tags: "anything" })).rejects.toThrow(/no parameter `tags`.*Did you mean `tag`/);
+    // An unknown name is ignored, as 0.8 ignored it (nothing removed before 1.0), and the answer says so.
+    const ignored = await c.call("query-notes", { tags: "anything", limit: 1 });
+    expect(ignored.warnings).toContainEqual(expect.objectContaining({ code: "unknown_parameter", field: "tags", hint: "use tag" }));
+    expect(ignored.warnings.find((w: { code: string }) => w.code === "unknown_parameter").message).toMatch(/no parameter `tags`.*Did you mean `tag`/);
+    // A call that fails anyway still names the fix.
     await expect(c.call("update-note", { note_id: "x", append: "y" })).rejects.toThrow(/Did you mean `id`/);
     // A rare parameter left out of the short schema is still accepted.
     const r = await c.call("query-notes", { has_links: false, limit: 1 });
