@@ -1,5 +1,5 @@
-// First-run takeover: v0.8 moving onto a machine where the old hub and vault already run (uni's cut-over, and
-// a second, hosted box). The 10-27 requirement (PLAN §8.0; lane E).
+// First-run takeover: v0.8 moving onto a machine where the old hub and vault already run (a box being
+// cut over). The 10-27 requirement (PLAN §8.0; lane E).
 //
 // `parachute-core takeover [--home <dir>] [--dry-run] [--yes] [--json]` finds an existing Parachute home and the old
 // programs (installed or running), says what it found in plain words, and with --yes: backs up the home, pauses the
@@ -10,12 +10,12 @@
 //
 // Each test builds a person's machine (_takeover-lib.ts): the stock 0.7 programs laid out as `bun add -g` does, a
 // fake systemctl (an outside system) with an enabled, running parachute-hub.service and a leftover, disabled
-// parachute-vault.service (the hosted box has both unit files), and a stock home made by those old programs. The
+// parachute-vault.service (a box can have both unit files), and a stock home made by those old programs. The
 // takeover must pause only the units that are active or enabled.
 //
-// Not covered here: a home older than the core's schema (the hosted box's: hub schema 16, vaults at 26). There, opening the
+// Not covered here: a home older than the core's schema (e.g. hub schema 16, vaults at 26). There, opening the
 // home runs today's existing migrations, so rollback means restoring the backup ("restore-backup"). That path is
-// proven by the hosted box's rehearsal on a copy of the real backup, not in CI. Exit 8 (a failed post-start check) has no
+// proven by a rehearsal on a copy of a backup, not in CI. Exit 8 (a failed post-start check) has no
 // black-box trigger here either.
 //
 // Green since lane E (packages/cli/src/takeover.ts). The setup test proves the old install and stock home are real
@@ -119,11 +119,11 @@ function changesTo(m: Machine, unit: string, from: number): string[] {
   return m.systemctlCalls().slice(from).filter((c) => MUTATING.test(c) && new RegExp(`\\b${base}(\\.service)?\\b`).test(c));
 }
 
-/** What the hosted box's old unit carries besides the home's settings: ~/.bun/bin first on PATH, and BUN_INSTALL. */
+/** What a box's old unit carries besides the home's settings: ~/.bun/bin first on PATH, and BUN_INSTALL. */
 const boxUnitEnv = (m: Machine) => ({ PATH: `${m.bunDir}/bin:/usr/local/bin:/usr/bin:/bin`, BUN_INSTALL: m.bunDir });
 
 /**
- * What `systemd-run --user` gives a takeover: the user manager's PATH (the hosted box's, 10-29), with the fake
+ * What `systemd-run --user` gives a takeover: the user manager's PATH (as on one box, 10-29), with the fake
  * systemctl where systemctl lives, and no BUN_INSTALL (empty: the machine's env() can't unset it). No ~/.bun/bin.
  */
 const managerEnv = (m: Machine) => ({ PATH: `${join(m.user, ".fake", "bin")}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`, BUN_INSTALL: "" });
@@ -369,7 +369,7 @@ describe("takeover", () => {
   }, 120_000);
 
   test("a home whose links stay inside it (a library's version links) is taken over: the backup keeps each link as a link", async () => {
-    // Found by rehearsal/uni (lane H): uni's home has transcription/bin/libggml.so -> libggml.so.0 -> libggml.so.0.15.1
+    // Found by a rehearsal (lane H): a real home has transcription/bin/libggml.so -> libggml.so.0 -> libggml.so.0.15.1
     // and the like, and takeover refused the whole home for them.
     const { m } = await oldMachine("tk-inlinks");
     const bin = join(m.home, "transcription", "bin");
@@ -388,8 +388,8 @@ describe("takeover", () => {
     expect(m.unit(HUB_UNIT)).toEqual({ active: false, enabled: false });
   }, 120_000);
 
-  test("takeover doesn't need a usable operator token: one issued under the box's old name (as uni's) is left alone, and the takeover succeeds", async () => {
-    // Found by rehearsal/uni (lane H): uni's operator.token (and every script pass) carries the tailnet's old name as
+  test("takeover doesn't need a usable operator token: one issued under the box's old name is left alone, and the takeover succeeds", async () => {
+    // Found by a rehearsal (lane H): a box's operator.token (and every script pass) carries the box's old hostname as
     // its issuer, which the old hub's server accepts through its unit's RENDER_EXTERNAL_URL but `auth mint-token`
     // doesn't. The takeover's check minted its read passes with that command, so every vault check failed (exit 8).
     const { m } = await oldMachine("tk-oldop");
@@ -409,7 +409,7 @@ describe("takeover", () => {
   }, 120_000);
 
   test("a takeover cut off during its check run (an ssh drop) is put back and finished by running takeover again", async () => {
-    // Found by the hosted box's rehearsal (lane H): cut off after pausing the old hub, a takeover left nothing serving the home,
+    // Found by a rehearsal (lane H): cut off after pausing the old hub, a takeover left nothing serving the home,
     // and running it again "succeeded" with no unit to hand over to and nothing for --rollback to put back.
     const { m, s } = await oldMachine("tk-cut");
     const run = m.spawn([requireCore(m.info), "takeover", "--home", m.home, "--yes", "--json"]);
@@ -439,8 +439,8 @@ describe("takeover", () => {
     const dry = json(await core(m, ["takeover", "--home", m.home, "--dry-run", "--json"]), "takeover --dry-run --json");
     expect(dry.plan[0]).toContain(`put ${HUB_UNIT} back`);
     expect(dry.plan).toContain("run it from now on as parachute-core.service");
-    // What a cut-off check run's modules leave (the hosted box's rehearsal: an orphaned scribe holding its port, so the next check
-    // run's scribe couldn't start): processes carrying the check run's mark. This home's are stopped; another's not.
+    // What a cut-off check run's modules leave (a rehearsal: an orphaned module holding its port, so the next check
+    // run's couldn't start): processes carrying the check run's mark. This home's are stopped; another's not.
     const idle = [process.execPath, "-e", "Bun.listen({ hostname: '127.0.0.1', port: 0, socket: { data() {} } }); await Bun.sleep(600000)"];
     const orphan = m.spawn(idle, { env: { PARACHUTE_TAKEOVER_CHECK: "1", PARACHUTE_HOME: m.home } });
     const stranger = m.spawn(idle, { env: { PARACHUTE_TAKEOVER_CHECK: "1", PARACHUTE_HOME: join(m.user, "another-home") } });
@@ -600,7 +600,7 @@ describe("takeover", () => {
   }, 120_000);
 
   test("takeover under the user manager's PATH (systemd-run --user) checks v0.8 with the old unit's PATH and BUN_INSTALL: a module whose program is only there starts, and the takeover succeeds", async () => {
-    // Found on the hosted box (10-29): `takeover --yes` ran under `systemd-run --user`, so it had the user manager's
+    // Found on a box (10-29): `takeover --yes` ran under `systemd-run --user`, so it had the user manager's
     // PATH (no ~/.bun/bin) and no BUN_INSTALL. Its check run took that environment, v0.8 couldn't find the registered
     // scribe's program, /api/ready stayed false, and after 90 s the takeover put everything back (exit 8). The old
     // unit's PATH has ~/.bun/bin, and parachute-core.service would have carried it over.
@@ -647,7 +647,7 @@ describe("takeover", () => {
   }, 120_000);
 
   test("a unit with no PATH of its own runs with the user manager's: the dry run looks modules' programs up there, not on the caller's PATH", async () => {
-    // The other way round from the hosted box: run from a shell whose PATH has the program, for a unit that will
+    // The other way round from that box: run from a shell whose PATH has the program, for a unit that will
     // run with the manager's PATH, which hasn't. The check would pass and parachute-core.service couldn't start it.
     // And a program only in a manager PATH folder with a space in its name (systemd prints that PATH as $'…') is found.
     const { m } = await oldMachine("tk-mgrpath", undefined, (user) => join(user, "my tools", "bin"));
