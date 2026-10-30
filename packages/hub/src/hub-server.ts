@@ -2330,7 +2330,7 @@ export function hubFetch(
           // jsdoc for the failure case this closes.
           platformOrigin: process.env.RENDER_EXTERNAL_URL ?? flyDefaultOrigin(process.env),
         }).concat(embedded?.acceptedIssuers ?? []),
-      // Only the refresh path reads this (a resource saved under an earlier setup, friends box 10-29).
+      // Only the refresh path reads this (a resource saved under an earlier setup, a hosted box, 10-29).
       knownIssuers: () => knownIssuers(getDb?.(), configuredIssuer, loadExposeHubOrigin),
     };
   };

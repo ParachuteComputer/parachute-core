@@ -4,7 +4,7 @@
 // hub versions later. Before the fix (hub 53d327b, and v0.8 at ccc7729) a refresh checked `resource` like a code
 // exchange (packages/hub/src/oauth-handlers.ts resolveTokenResourceAudience) and answered 400 invalid_target for any
 // other scheme, host or vault; 0.7.6 and older never read it. On a friend's box taken over from 0.7.6 to v0.8 (10-29)
-// two Claude connectors authorized in June could not renew and signed out. Fixed in packages/hub
+// two connectors authorized months earlier could not renew and signed out. Fixed in packages/hub
 // (resolveRefreshAudience, resolveRefreshResource): an unmatched resource is ignored and logged, the grant's own
 // audience kept. Mutants "refresh-refuses-unmatched-resource" and "refresh-resource-outside-grant" put the bug back,
 // or widen the fix.

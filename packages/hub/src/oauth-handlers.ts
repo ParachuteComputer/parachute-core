@@ -279,7 +279,7 @@ export interface OAuthDeps {
   /**
    * Every issuer this hub knows of, beyond the bound set: the stored `hub_origin`, the configured issuer, the
    * expose origin, the vault `.env`'s `PARACHUTE_HUB_ORIGIN(S)`, an embedded home's earlier issuers. Only the
-   * refresh path reads it, to recognise a `resource` a client saved under an earlier setup (friends box, 10-29).
+   * refresh path reads it, to recognise a `resource` a client saved under an earlier setup (a hosted box, 10-29).
    * Absent → the bound set alone.
    */
   knownIssuers?: () => readonly string[];
@@ -748,7 +748,7 @@ function resolveTokenResourceAudience(
 
 /**
  * Audience for a refresh, given the `resource` the client sent. A refresh never fails because of `resource`
- * (friends box, 10-29: two Claude connectors authorized in June replayed a `resource` v0.8 refused, so they were
+ * (a hosted box, 10-29: two connectors authorized months earlier replayed a `resource` v0.8 refused, so they were
  * never renewed and signed out). 0.7.x never read `resource` on refresh; v0.8 checked it like a code exchange.
  *
  *   - names a vault in the grant, on any origin `resolveRefreshResource` counts as the hub's → `vault.<name>`
@@ -825,7 +825,7 @@ function safeErrorDescription(d: unknown): string | null {
 /**
  * One line per non-2xx answer from /oauth/token: grant_type, status, error code, the error description when it is
  * a fixed phrase, the client_id's first 6 characters, and the `resource` shape (`resourceLogShape`). Never a token,
- * code, verifier or secret. v0.8 answered refused refreshes silently, which hid the friends-box failure (10-29).
+ * code, verifier or secret. v0.8 answered refused refreshes silently, which hid the hosted box's failure (10-29).
  */
 async function logRefusedToken(
   form: Pick<Awaited<ReturnType<Request["formData"]>>, "get">,

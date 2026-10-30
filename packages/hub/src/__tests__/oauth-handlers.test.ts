@@ -9786,7 +9786,7 @@ describe("RFC 8707 resource binding — vault-bound MCP (fix #461)", () => {
     );
   }
 
-  // Friends box, 10-29: Claude connectors authorized in June replayed the `resource` they saved then; v0.8
+  // A hosted box, 10-29: connectors authorized months earlier replayed the `resource` they saved then; v0.8
   // refused it (invalid_target) before rotating, so they were never renewed. 0.7.x ignored `resource` on refresh.
   test("refresh_token never refuses because of resource: each saved shape → 200 with the grant's audience, and the ignored ones are logged", async () => {
     const flow = await setupJonAuthorizationCode();
