@@ -794,8 +794,12 @@ function tokenLogOrigins(deps: OAuthDeps): readonly string[] {
   }
 }
 
+/** /oauth/token's answer to a body that isn't application/x-www-form-urlencoded (or multipart). */
+const TOKEN_BODY_NOT_FORM = "body must be application/x-www-form-urlencoded";
+
 /** The token endpoint's fixed error descriptions; any other (they can carry scopes, names or URLs) isn't logged. */
 const LOGGABLE_TOKEN_ERRORS = new Set([
+  TOKEN_BODY_NOT_FORM,
   "body must be JSON",
   "client_id mismatch",
   "client is registered but has not been approved by the hub operator (#74)",
@@ -824,7 +828,7 @@ function safeErrorDescription(d: unknown): string | null {
  * code, verifier or secret. v0.8 answered refused refreshes silently, which hid the friends-box failure (10-29).
  */
 async function logRefusedToken(
-  form: Awaited<ReturnType<Request["formData"]>>,
+  form: Pick<Awaited<ReturnType<Request["formData"]>>, "get">,
   res: Response,
   knownOrigins: readonly string[],
 ): Promise<void> {
@@ -2815,7 +2819,20 @@ function authenticateClient(
  * 400/401 + `{error, error_description}`.
  */
 export async function handleToken(db: Database, req: Request, deps: OAuthDeps): Promise<Response> {
-  const form = await req.formData();
+  let form: Awaited<ReturnType<Request["formData"]>>;
+  try {
+    form = await req.formData();
+  } catch {
+    // Not a form body (a client posting JSON, say). Without this the throw leaves the handler: no refusal log
+    // line, and Bun's listener answers with its development error page (stack, source, paths) when NODE_ENV is
+    // unset, as the hub's own unit runs it. RFC 6749 §5.2: invalid_request.
+    const res = jsonResponse(
+      { error: "invalid_request", error_description: TOKEN_BODY_NOT_FORM },
+      400,
+    );
+    await logRefusedToken(new URLSearchParams(), res, tokenLogOrigins(deps));
+    return res;
+  }
   let res: Response;
   try {
     res = await dispatchToken(db, req, form, deps);
