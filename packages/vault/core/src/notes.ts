@@ -1169,18 +1169,18 @@ export function buildFilterConditions(db: Database, opts: QueryOpts): { conditio
       // matches the input.
       const flat = Array.from(new Set(tagSets.flat()));
       if (flat.length > 0) {
-        const placeholders = flat.map(() => "?").join(", ");
-        conditions.push(`n.id IN (SELECT note_id FROM note_tags WHERE tag_name IN (${placeholders}))`);
-        params.push(...flat);
+        // One json_each param per set, not one `?` per tag: a tag with 100+
+        // declared descendants passed Durable Object SQLite's 100-param cap.
+        conditions.push(`n.id IN (SELECT note_id FROM note_tags WHERE tag_name IN ${IN_VIA_JSON_EACH})`);
+        params.push(jsonEachParam(flat));
       }
     } else {
       // "all": one membership clause per input tag, each accepting the
       // input or any descendant.
       for (const set of tagSets) {
         if (!set || set.length === 0) continue;
-        const placeholders = set.map(() => "?").join(", ");
-        conditions.push(`n.id IN (SELECT note_id FROM note_tags WHERE tag_name IN (${placeholders}))`);
-        params.push(...set);
+        conditions.push(`n.id IN (SELECT note_id FROM note_tags WHERE tag_name IN ${IN_VIA_JSON_EACH})`);
+        params.push(jsonEachParam(set));
       }
     }
   }
