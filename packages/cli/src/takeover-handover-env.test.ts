@@ -73,6 +73,60 @@ describe("handOverEnv reads systemctl show as systemd prints it", () => {
     expect(env.PLAIN).toBe("1");
   });
 
+  test("a wildcard is matched as systemd's glob(3) matches it: braces are literal, not expanded", () => {
+    // execute.c exec_context_load_environment: safe_glob(fn, /* flags= */ 0, …), so no GLOB_BRACE.
+    const d = join(root, "envd-brace");
+    mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, "a1.conf"), "SHARED=brace-expanded\n");
+    writeFileSync(join(d, "{a,b}1.conf"), "SHARED=literal\n");
+    const { env, unread } = handOver(`EnvironmentFiles=${d}/{a,b}*.conf (ignore_errors=yes)\n`);
+    expect(unread).toEqual([]);
+    expect(env.SHARED).toBe("literal");
+  });
+
+  test("glob(3)'s other rules: a leading ! is literal, [[:upper:]] is a class, * and [.] don't match a leading dot", () => {
+    const d = join(root, "envd-glob3");
+    mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, "!x.cfg"), "BANG=read\n");
+    writeFileSync(join(d, "y.conf"), "CONF=read\n");
+    writeFileSync(join(d, "Up.env"), "UPPER=read\n");
+    writeFileSync(join(d, "low.env"), "LOWER=read\n");
+    writeFileSync(join(d, ".hidden.conf"), "HIDDEN=read\n");
+    writeFileSync(join(d, ".dot"), "DOT=read\n");
+    const { env, unread } = handOver(
+      [`!*.cfg`, `[[:upper:]]*.env`, `*.conf`, `[.]dot`].map((p) => `EnvironmentFiles=${d}/${p} (ignore_errors=yes)`).join("\n") + "\n",
+    );
+    expect(unread).toEqual([]);
+    expect(env.BANG).toBe("read");
+    expect(env.UPPER).toBe("read");
+    expect(env.LOWER).toBeUndefined();
+    expect(env.CONF).toBe("read");
+    expect(env.HIDDEN).toBeUndefined();
+    expect(env.DOT).toBeUndefined();
+  });
+
+  test("a wildcard whose folder can't be listed is named in unread, not taken as matching nothing", () => {
+    if (process.getuid?.() === 0) return; // root lists any folder
+    const d = join(root, "envd-locked");
+    mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, "x.conf"), "LOCKED=read\n");
+    chmodSync(d, 0o000);
+    try {
+      const { unread } = handOver(`EnvironmentFiles=${d}/*.conf (ignore_errors=yes)\n`);
+      expect(unread).toEqual([`${d}/*.conf`]);
+    } finally {
+      chmodSync(d, 0o755);
+    }
+  });
+
+  test("a wildcard under a path that isn't a folder matches nothing, as glob(3) finds nothing there", () => {
+    const f = join(root, "plain-file");
+    writeFileSync(f, "X=1\n");
+    const { env, unread } = handOver(`Environment=PLAIN=1\nEnvironmentFiles=${f}/*.conf (ignore_errors=yes)\n`);
+    expect(unread).toEqual([]);
+    expect(env.PLAIN).toBe("1");
+  });
+
   test("core's unit gets such a value back as systemd will read it, on one line: a line break can't start a new setting", () => {
     const lines: string[] = inChild(`Environment="NL=a\\nExecStartPre=/bin/false" "TAB=a\\tb"\n`, `unitEnvironment("old.service")`);
     expect(lines).toEqual(['Environment="NL=a\\x0aExecStartPre=/bin/false"', 'Environment="TAB=a\\x09b"']);
