@@ -200,3 +200,78 @@ describe("portable-md attachment links (T-318 #8)", async () => {
     );
   });
 });
+
+describe("portable-md attachment links: only the links export rewrote come back (T-318 #8)", async () => {
+  const tmpBase = join(tmpdir(), "parachute-portable-att-links-hand");
+  const assets = join(tmpBase, "assets");
+  const ID = "01M67ABS8ABZS3S1ZYSSK28ZVQ";
+  let store: SqliteStore;
+
+  beforeEach(() => {
+    try { rmSync(tmpBase, { recursive: true }); } catch {}
+    mkdirSync(join(assets, "2026-10-30"), { recursive: true });
+    writeFileSync(join(assets, IMG_PATH), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0xff]));
+    store = new SqliteStore(new Database(":memory:"));
+  });
+
+  /** A note with one attached image whose body links it twice: the storage
+   *  link the app writes, and a relative link a person typed that is exactly
+   *  the path the export would write. Returns the body and the attachment. */
+  async function seedHandWritten(): Promise<{ body: string; imgId: string; handTarget: string }> {
+    await store.createNote("draft", { id: ID, path: NOTE_PATH });
+    const img = await store.addAttachment(ID, IMG_PATH, "image/png");
+    const handTarget = `../../../${SIDECAR_DIR}/attachments/${img.id}/1793394673667-0a1b2c3d-garden.png`;
+    const body = [
+      `![garden.png](/api/storage/${IMG_PATH})`,
+      `Typed by hand: ![same file](${handTarget})`,
+      "",
+    ].join("\n");
+    await store.updateNote(ID, { content: body });
+    return { body, imgId: img.id, handTarget };
+  }
+
+  it("a hand-written relative sidecar link next to a storage link round-trips byte-identical", async () => {
+    const { body, imgId } = await seedHandWritten();
+    const outA = join(tmpBase, "a");
+    const stats = await exportVaultToDir(store, { outDir: outA, assetsDir: assets, exportedAt: "2026-10-30T15:10:00.000Z" });
+    expect(stats.attachments).toBe(1);
+    // The body already holds the sidecar path, so the export can't tell its
+    // own rewrite from the typed link: it leaves this attachment's links be.
+    expect(exportedBody(join(outA, `${NOTE_PATH}.md`))).toBe(body);
+
+    const target = new SqliteStore(new Database(":memory:"));
+    const destAssets = join(tmpBase, "dest-assets");
+    mkdirSync(destAssets, { recursive: true });
+    await importPortableVault(target, { inDir: outA, assetsDir: destAssets });
+    expect((await target.getNote(ID))!.content).toBe(body);
+    // Nothing export-only lands on the stored attachment row.
+    const rows = await target.getAttachments(ID);
+    expect(rows.map((r) => [r.path, r.mimeType, r.metadata ?? null])).toEqual([[IMG_PATH, "image/png", null]]);
+
+    // Re-export after import: same bytes once the re-minted attachment id is
+    // mapped back (ids re-mint on import, a known limitation).
+    const outB = join(tmpBase, "b");
+    await exportVaultToDir(target, { outDir: outB, assetsDir: destAssets, exportedAt: "2026-10-30T15:10:00.000Z" });
+    const newId = rows[0]!.id;
+    const a = readFileSync(join(outA, `${NOTE_PATH}.md`), "utf-8");
+    const b = readFileSync(join(outB, `${NOTE_PATH}.md`), "utf-8").split(newId).join(imgId);
+    expect(b).toBe(a);
+  });
+
+  it("an attachment whose binary is not exported leaves the body untouched both ways", async () => {
+    const { body } = await seedHandWritten();
+    rmSync(join(assets, IMG_PATH)); // row kept, file gone (e.g. evicted)
+    const runs: Array<[string, { assetsDir?: string }]> = [
+      ["missing", { assetsDir: assets }],
+      ["markdown-only", {}],
+    ];
+    for (const [name, opts] of runs) {
+      const out = join(tmpBase, name);
+      await exportVaultToDir(store, { outDir: out, ...opts, exportedAt: "2026-10-30T15:10:00.000Z" });
+      expect(exportedBody(join(out, `${NOTE_PATH}.md`))).toBe(body);
+      const target = new SqliteStore(new Database(":memory:"));
+      await importPortableVault(target, { inDir: out });
+      expect((await target.getNote(ID))!.content).toBe(body);
+    }
+  });
+});
