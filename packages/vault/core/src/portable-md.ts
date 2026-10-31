@@ -53,6 +53,10 @@
  *   - id: att_01HGZB...
  *     path: 2026-05-12/audio.m4a
  *     mime_type: audio/mp4
+ *   - body_link: ../.parachute/attachments/att_01HGZC.../map.png
+ *     id: att_01HGZC...       # body_link: the target the export wrote for
+ *     path: 2026-05-12/map.png  # this note's /api/storage/ links (T-318 #8)
+ *     mime_type: image/png
  * created_at: 2026-05-12T10:00:00.000Z
  * updated_at: 2026-05-12T11:23:45.123Z
  * ---
@@ -73,7 +77,7 @@
  */
 
 import { readdirSync, readFileSync, realpathSync, statSync, mkdirSync, writeFileSync, copyFileSync, existsSync, rmSync } from "fs";
-import { basename, join, relative, extname, dirname, resolve as resolvePath, sep as pathSep } from "path";
+import { basename, join, relative, extname, dirname, posix, resolve as resolvePath, sep as pathSep } from "path";
 import type { Store, Note, Link, Attachment } from "./types.js";
 import type { TagRecord } from "./tag-schemas.js";
 import { ParentCycleError } from "./tag-schemas.js";
@@ -100,6 +104,9 @@ export const SIDECAR_DIR = ".parachute";
  * Mirrors the inline-frontmatter shape so the parser can chew either.
  */
 export const NOTES_META_DIR = "notes-meta";
+
+/** The served URL prefix the app writes into note bodies for attachments. */
+const STORAGE_URL_PREFIX = "/api/storage/";
 
 /**
  * Extensions whose serialized form carries metadata as inline YAML
@@ -180,6 +187,19 @@ export interface PortableAttachmentRef {
   path: string;
   mime_type: string;
   metadata?: Record<string, unknown>;
+  /**
+   * Export-only (T-318 #8). The app links an attached file into a markdown
+   * body as `[name](/api/storage/<path>)` (or `![name](…)`), a URL only a
+   * running vault serves. When the export copied this binary and rewrote at
+   * least one such link in the note's body, this is the target it wrote in
+   * its place: the percent-encoded path from the note file to the copied
+   * file (`../.parachute/attachments/<id>/<basename>`). Import turns exactly
+   * that target back into the storage link and drops the key, so the body
+   * and the attachment row come back as stored. Absent means the body was
+   * written as stored for this attachment. Additive: older importers ignore
+   * it (and keep the relative links), so the format version stays 1.
+   */
+  body_link?: string;
 }
 
 /** Vault-level metadata in `.parachute/vault.yaml`. */
@@ -540,6 +560,97 @@ export function portableExportFilePath(note: PortableNote): string {
   const ext = note.extension ?? "md";
   if (note.path) return `${note.path}.${ext}`;
   return `_unpathed/${note.id}.${ext}`;
+}
+
+/** Export-root-relative sidecar path of an attachment's binary. */
+function attachmentSidecarPath(att: { id: string; path: string }): string {
+  return join(SIDECAR_DIR, "attachments", att.id, basename(att.path));
+}
+
+/**
+ * The markdown link target, from the note file at export-relative
+ * `noteRelPath`, to an attachment's sidecar file. Each segment is
+ * percent-encoded (and `(`/`)` too) so the target is one CommonMark link
+ * destination; a reader decodes it back to the file path.
+ */
+function relativeAttachmentTarget(noteRelPath: string, att: { id: string; path: string }): string {
+  const sidecar = attachmentSidecarPath(att).split(pathSep).join("/");
+  return posix
+    .relative(posix.dirname(posix.normalize(noteRelPath)), sidecar)
+    .split("/")
+    .map((s) => encodeURIComponent(s).replace(/[()]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`))
+    .join("/");
+}
+
+/** Whether a note of this extension gets its attachment links swapped. */
+function hasMarkdownBody(extension: string | undefined): boolean {
+  return supportsInlineFrontmatter(extension ?? "md");
+}
+
+/**
+ * Export side of {@link PortableAttachmentRef.body_link}. In a markdown body,
+ * every `](/api/storage/<att.path>)` of an attachment whose binary was
+ * written becomes `](<relative sidecar target>)`, and that attachment's ref
+ * records the target. An attachment is left as stored when the body has no
+ * storage link to it, or already holds its target (a link typed by hand,
+ * which the import could not tell from a rewritten one). So every occurrence
+ * of a recorded target in the exported body is one the export wrote.
+ */
+function withRelativeAttachmentLinks(
+  note: PortableNote,
+  noteRelPath: string,
+  writtenIds: ReadonlySet<string>,
+): PortableNote {
+  if (!note.attachments || !hasMarkdownBody(note.extension)) return note;
+  let content = note.content;
+  let changed = false;
+  const attachments = note.attachments.map((att) => {
+    if (!writtenIds.has(att.id)) return att;
+    const from = `](${STORAGE_URL_PREFIX}${att.path})`;
+    const target = relativeAttachmentTarget(noteRelPath, att);
+    if (!content.includes(from) || content.includes(`](${target})`)) return att;
+    content = content.split(from).join(`](${target})`);
+    changed = true;
+    return { ...att, body_link: target };
+  });
+  return changed ? { ...note, content, attachments } : note;
+}
+
+/**
+ * Import side of {@link PortableAttachmentRef.body_link}: in a markdown body,
+ * each recorded target becomes the storage link again. Only a target shaped
+ * like one the export writes for that attachment (`../` steps, then its
+ * sidecar path) counts. The export-only key is dropped from every ref so it
+ * never reaches an attachment row. Exported for the git-history import,
+ * which reads export bytes itself.
+ */
+export function fromExportedAttachmentLinks(
+  content: string,
+  attachments: unknown[],
+  extension: string | undefined,
+): { content: string; attachments: unknown[] } {
+  const markdown = hasMarkdownBody(extension);
+  let out = content;
+  const refs = attachments.map((att) => {
+    if (!att || typeof att !== "object" || !("body_link" in att)) return att;
+    const { body_link, ...ref } = att as Record<string, unknown>;
+    const { id, path } = ref;
+    if (
+      markdown && typeof body_link === "string" && typeof id === "string" && typeof path === "string" &&
+      id !== "" && path !== "" && isRelativeAttachmentTarget(body_link, { id, path })
+    ) {
+      out = out.split(`](${body_link})`).join(`](${STORAGE_URL_PREFIX}${path})`);
+    }
+    return ref;
+  });
+  return { content: out, attachments: refs };
+}
+
+/** Whether `target` is {@link relativeAttachmentTarget} of `att` from a note
+ *  file at some depth: zero or more `../`, then the encoded sidecar path. */
+function isRelativeAttachmentTarget(target: string, att: { id: string; path: string }): boolean {
+  const sidecar = relativeAttachmentTarget("note.md", att);
+  return target.endsWith(sidecar) && /^(\.\.\/)*$/.test(target.slice(0, target.length - sidecar.length));
 }
 
 // ---------------------------------------------------------------------------
@@ -1036,10 +1147,46 @@ export async function exportVault(
       }
     }
 
+    // Copy attachment binaries when the sink has them enabled. Each
+    // attachment is path-traversal-guarded on both ends by the sink; missing
+    // source files are skipped (warn) rather than aborting — the assets state
+    // may legitimately lag the DB (e.g. file evicted while row persists).
+    // Copied BEFORE the note text so the note's links can point at exactly
+    // the binaries that landed (PortableAttachmentRef.body_link) with one
+    // write per file — a key-collecting sink (cloud tar) must not see a note
+    // twice. So a note whose text write is then refused still leaves its
+    // binaries in the export (unreferenced, harmless).
+    const writtenAttachmentIds = new Set<string>();
+    if (sink.attachmentsEnabled && portable.attachments && portable.attachments.length > 0) {
+      for (const att of portable.attachments) {
+        // Dest: .parachute/attachments/<att-id>/<basename(att.path)>. Using
+        // att.id as the directory name keeps multiple attachments with the
+        // same basename from colliding; basename keeps it human-readable.
+        const copyResult = sink.copyAttachment(att.path, attachmentSidecarPath(att));
+        if (copyResult.ok) {
+          attachmentsWritten++;
+          writtenAttachmentIds.add(att.id);
+        } else {
+          skippedAttachments.push({
+            note_id: portable.id,
+            attachment_id: att.id,
+            path: att.path,
+            reason: copyResult.reason,
+          });
+        }
+      }
+    }
+
+    // Only the exported bytes change: `portable` (and the store) keep the
+    // note's real content.
+    const exportedNote = writtenAttachmentIds.size > 0
+      ? withRelativeAttachmentLinks(portable, relPath, writtenAttachmentIds)
+      : portable;
+
     // vault#317 F3 — path-traversal guard now lives in the sink: a note with
     // `path: "../../.ssh/authorized_keys"` is refused (not written off-tree)
     // and surfaced in `skipped_notes` so the operator can fix the note.
-    const noteWrite = sink.writeText(relPath, toPortableMarkdown(portable));
+    const noteWrite = sink.writeText(relPath, toPortableMarkdown(exportedNote));
     if (!noteWrite.ok) {
       skipped.push({ path: portable.path, reason: noteWrite.reason });
       continue;
@@ -1060,30 +1207,6 @@ export async function exportVault(
         skipped.push({ path: portable.path, reason: sidecarWrite.reason });
       } else {
         sidecarsWritten++;
-      }
-    }
-
-    // Copy attachment binaries when the sink has them enabled. Each
-    // attachment is path-traversal-guarded on both ends by the sink; missing
-    // source files are skipped (warn) rather than aborting — the assets state
-    // may legitimately lag the DB (e.g. file evicted while row persists).
-    if (sink.attachmentsEnabled && portable.attachments && portable.attachments.length > 0) {
-      for (const att of portable.attachments) {
-        // Dest: .parachute/attachments/<att-id>/<basename(att.path)>. Using
-        // att.id as the directory name keeps multiple attachments with the
-        // same basename from colliding; basename keeps it human-readable.
-        const destRelPath = join(SIDECAR_DIR, "attachments", att.id, basename(att.path));
-        const copyResult = sink.copyAttachment(att.path, destRelPath);
-        if (copyResult.ok) {
-          attachmentsWritten++;
-        } else {
-          skippedAttachments.push({
-            note_id: portable.id,
-            attachment_id: att.id,
-            path: att.path,
-            reason: copyResult.reason,
-          });
-        }
       }
     }
   }
@@ -2199,7 +2322,9 @@ async function importVaultReplay(
       ? frontmatter.metadata as Record<string, unknown>
       : undefined;
     const links = Array.isArray(frontmatter.links) ? frontmatter.links : undefined;
-    const attachments = Array.isArray(frontmatter.attachments) ? frontmatter.attachments : undefined;
+    let attachments = Array.isArray(frontmatter.attachments) ? frontmatter.attachments : undefined;
+    // Undo the export's attachment-link rewrite, exactly where it recorded one.
+    if (attachments) ({ content, attachments } = fromExportedAttachmentLinks(content, attachments, extension));
 
     const portable: PortableNote = {
       id,
@@ -2399,8 +2524,7 @@ async function importVaultReplay(
       // File copy: from sidecar to assetsDir. Source uses the EXPORTED
       // att.id (what the exporter wrote), not our freshly-minted row id.
       if (source.attachmentsEnabled) {
-        const srcRelPath = join(SIDECAR_DIR, "attachments", att.id, basename(att.path));
-        const result = source.restoreAttachment(srcRelPath, att.path);
+        const result = source.restoreAttachment(attachmentSidecarPath(att), att.path);
         if (!result.ok) {
           stats.skipped_attachments.push({
             note_id: noteId,
