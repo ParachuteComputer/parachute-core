@@ -37,7 +37,7 @@ Output (per [`exportVaultToDir`](https://github.com/ParachuteComputer/parachute-
 ```
 <dir>/
   .parachute/
-    vault.yaml                # vault meta + export_format_version
+    vault.yaml                # vault meta + export_format_version (+ attachment_links)
     schemas/<tag>.yaml        # one file per schema-carrying tag
     attachments/<id>/...      # binary files, keyed by export-time att.id
   <note.path>.md              # one file per pathed note
@@ -120,6 +120,7 @@ Exporting a vault, blowing it away, and re-importing the export reproduces byte-
 - **Multi-line strings.** Metadata values that contain newlines/tabs/control characters are double-quoted with YAML escape sequences (`\n`, `\xNN`) so the whole value stays on one physical YAML line. Single-quoted multi-line splits the parser — caught and pinned in vault#317 F1.
 - **Wikilinks in content.** Preserved verbatim. They're the content's job; the parser does not strip or rewrite them.
 - **Attachments.** Frontmatter `attachments[].path` carries the original vault-internal path (relative to `assetsDir`); the binary is copied under `.parachute/attachments/<att-id>/<basename>`. Import restores the binary to the original path. *Caveat:* attachment IDs re-mint on import (no `restoreAttachment(id, ...)` Store surface yet), so round-trip with attachments produces byte-different `attachments[].id` values between original and re-export. Refs still resolve by `(note_id, path)`; operators expecting strict byte-equivalence including att-IDs should know.
+- **Attachment links in note bodies.** When the binaries are copied, a markdown note's link or embed whose target is exactly `/api/storage/<att.path>` for one of its own copied attachments (the `![name](/api/storage/...)` / `[name](/api/storage/...)` the app inserts) is written as the relative path to the copied file, for example `../../.parachute/attachments/<att-id>/<basename>` (percent-encoded), so the exported note's images and links open in a file browser or markdown previewer. Every export's `vault.yaml` carries `attachment_links: relative`; import turns exactly those targets back (only the note's own attachment sidecar paths), so the imported body equals the original. Exports without the key (made before this change) import their bodies as written. Importers older than this change ignore the key and keep the relative links in the body.
 - **Idempotency.** Re-export an unchanged vault → byte-identical bytes (modulo `exported_at` in `vault.yaml`, which callers wanting strict byte-equivalence can pin via the `exportedAt` API option). Clean git diffs.
 
 ## Recipe: nightly git projection

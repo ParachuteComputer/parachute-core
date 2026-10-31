@@ -73,7 +73,7 @@
  */
 
 import { readdirSync, readFileSync, realpathSync, statSync, mkdirSync, writeFileSync, copyFileSync, existsSync, rmSync } from "fs";
-import { basename, join, relative, extname, dirname, resolve as resolvePath, sep as pathSep } from "path";
+import { basename, join, relative, extname, dirname, posix, resolve as resolvePath, sep as pathSep } from "path";
 import type { Store, Note, Link, Attachment } from "./types.js";
 import type { TagRecord } from "./tag-schemas.js";
 import { ParentCycleError } from "./tag-schemas.js";
@@ -100,6 +100,23 @@ export const SIDECAR_DIR = ".parachute";
  * Mirrors the inline-frontmatter shape so the parser can chew either.
  */
 export const NOTES_META_DIR = "notes-meta";
+
+/**
+ * `attachment_links` value in `vault.yaml` (T-318 #8). The app links an
+ * attached file into a markdown body as `[name](/api/storage/<att.path>)` (or
+ * `![name](…)`), a URL only a running vault serves. An export that copies the
+ * binaries points each such link of a note's own written attachments at the
+ * sidecar file, relative to the note file
+ * (`../.parachute/attachments/<att.id>/<basename>`), so the exported note opens
+ * with working links. Import reverses exactly those targets, and only when
+ * this marker is present, so an older export (or a relative link a person
+ * typed) imports byte-for-byte as before. Additive: importers ignore unknown
+ * `vault.yaml` keys, so the format version stays 1.
+ */
+export const ATTACHMENT_LINKS_RELATIVE = "relative";
+
+/** The served URL prefix the app writes into note bodies for attachments. */
+const STORAGE_URL_PREFIX = "/api/storage/";
 
 /**
  * Extensions whose serialized form carries metadata as inline YAML
@@ -188,6 +205,8 @@ export interface PortableVaultMeta {
   description?: string;
   export_format_version: number;
   exported_at: string;
+  /** See {@link ATTACHMENT_LINKS_RELATIVE}. Absent in exports that predate it. */
+  attachment_links?: typeof ATTACHMENT_LINKS_RELATIVE;
 }
 
 /** Stats returned from `exportVaultToDir`. */
@@ -540,6 +559,67 @@ export function portableExportFilePath(note: PortableNote): string {
   const ext = note.extension ?? "md";
   if (note.path) return `${note.path}.${ext}`;
   return `_unpathed/${note.id}.${ext}`;
+}
+
+/** Export-root-relative sidecar path of an attachment's binary. */
+function attachmentSidecarPath(att: { id: string; path: string }): string {
+  return join(SIDECAR_DIR, "attachments", att.id, basename(att.path));
+}
+
+/**
+ * The markdown link target, from the note file at export-relative
+ * `noteRelPath`, to an attachment's sidecar file. Each segment is
+ * percent-encoded (and `(`/`)` too) so the target is one CommonMark link
+ * destination; a reader decodes it back to the file path.
+ */
+function relativeAttachmentTarget(noteRelPath: string, att: { id: string; path: string }): string {
+  const sidecar = attachmentSidecarPath(att).split(pathSep).join("/");
+  return posix
+    .relative(posix.dirname(posix.normalize(noteRelPath)), sidecar)
+    .split("/")
+    .map((s) => encodeURIComponent(s).replace(/[()]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`))
+    .join("/");
+}
+
+/** Whether a note of this extension gets its attachment links swapped. */
+function hasMarkdownBody(extension: string | undefined): boolean {
+  return supportsInlineFrontmatter(extension ?? "md");
+}
+
+/**
+ * Replace each inline link/embed target that is exactly `from` (written
+ * `](from)`, the form the app inserts) with `to`. Nothing else in the body
+ * changes. `pairs` with a `from` that is not in the body are no-ops.
+ */
+function swapLinkTargets(content: string, pairs: Array<[from: string, to: string]>): string {
+  let out = content;
+  for (const [from, to] of pairs) out = out.split(`](${from})`).join(`](${to})`);
+  return out;
+}
+
+/** Export side of {@link ATTACHMENT_LINKS_RELATIVE}: storage links to the
+ *  note's written attachments become relative sidecar links. */
+function toRelativeAttachmentLinks(
+  content: string,
+  noteRelPath: string,
+  written: Array<{ id: string; path: string }>,
+): string {
+  return swapLinkTargets(
+    content,
+    written.map((att) => [`${STORAGE_URL_PREFIX}${att.path}`, relativeAttachmentTarget(noteRelPath, att)]),
+  );
+}
+
+/** Import side: the note's own relative sidecar links become storage links
+ *  again. Attachment refs that aren't well-formed are ignored. */
+function toStorageAttachmentLinks(content: string, noteRelPath: string, attachments: unknown[]): string {
+  const pairs: Array<[string, string]> = [];
+  for (const att of attachments) {
+    const { id, path } = (att ?? {}) as { id?: unknown; path?: unknown };
+    if (typeof id !== "string" || typeof path !== "string" || id === "" || path === "") continue;
+    pairs.push([relativeAttachmentTarget(noteRelPath, { id, path }), `${STORAGE_URL_PREFIX}${path}`]);
+  }
+  return swapLinkTargets(content, pairs);
 }
 
 // ---------------------------------------------------------------------------
@@ -904,6 +984,11 @@ export async function exportVault(
     exported_at: opts.exportedAt ?? new Date().toISOString(),
     ...(opts.vaultName ? { name: opts.vaultName } : {}),
     ...(opts.vaultDescription ? { description: opts.vaultDescription } : {}),
+    // Always written, so every export from this exporter declares the link
+    // convention its bodies follow (a markdown-only export just has no
+    // rewritten links). One rule for every sink keeps a binaries-on and a
+    // binaries-off export of the same vault equal outside the bodies.
+    attachment_links: ATTACHMENT_LINKS_RELATIVE,
   };
   // The manifest is STRUCTURAL, not per-note: a portable-md export WITHOUT its
   // `.parachute/vault.yaml` is unusable — restore (`importPortableVault`), CLI
@@ -1036,10 +1121,46 @@ export async function exportVault(
       }
     }
 
+    // Copy attachment binaries when the sink has them enabled. Each
+    // attachment is path-traversal-guarded on both ends by the sink; missing
+    // source files are skipped (warn) rather than aborting — the assets state
+    // may legitimately lag the DB (e.g. file evicted while row persists).
+    // Copied BEFORE the note text so the note's links can point at exactly
+    // the binaries that landed (ATTACHMENT_LINKS_RELATIVE) with one write per
+    // file — a key-collecting sink (cloud tar) must not see a note twice. So a
+    // note whose text write is then refused still leaves its binaries in the
+    // export (unreferenced, harmless).
+    const writtenAttachments: PortableAttachmentRef[] = [];
+    if (sink.attachmentsEnabled && portable.attachments && portable.attachments.length > 0) {
+      for (const att of portable.attachments) {
+        // Dest: .parachute/attachments/<att-id>/<basename(att.path)>. Using
+        // att.id as the directory name keeps multiple attachments with the
+        // same basename from colliding; basename keeps it human-readable.
+        const copyResult = sink.copyAttachment(att.path, attachmentSidecarPath(att));
+        if (copyResult.ok) {
+          attachmentsWritten++;
+          writtenAttachments.push(att);
+        } else {
+          skippedAttachments.push({
+            note_id: portable.id,
+            attachment_id: att.id,
+            path: att.path,
+            reason: copyResult.reason,
+          });
+        }
+      }
+    }
+
+    // Only the exported bytes change: `portable` (and the store) keep the
+    // note's real content.
+    const exportedNote = writtenAttachments.length > 0 && hasMarkdownBody(portable.extension)
+      ? { ...portable, content: toRelativeAttachmentLinks(portable.content, relPath, writtenAttachments) }
+      : portable;
+
     // vault#317 F3 — path-traversal guard now lives in the sink: a note with
     // `path: "../../.ssh/authorized_keys"` is refused (not written off-tree)
     // and surfaced in `skipped_notes` so the operator can fix the note.
-    const noteWrite = sink.writeText(relPath, toPortableMarkdown(portable));
+    const noteWrite = sink.writeText(relPath, toPortableMarkdown(exportedNote));
     if (!noteWrite.ok) {
       skipped.push({ path: portable.path, reason: noteWrite.reason });
       continue;
@@ -1060,30 +1181,6 @@ export async function exportVault(
         skipped.push({ path: portable.path, reason: sidecarWrite.reason });
       } else {
         sidecarsWritten++;
-      }
-    }
-
-    // Copy attachment binaries when the sink has them enabled. Each
-    // attachment is path-traversal-guarded on both ends by the sink; missing
-    // source files are skipped (warn) rather than aborting — the assets state
-    // may legitimately lag the DB (e.g. file evicted while row persists).
-    if (sink.attachmentsEnabled && portable.attachments && portable.attachments.length > 0) {
-      for (const att of portable.attachments) {
-        // Dest: .parachute/attachments/<att-id>/<basename(att.path)>. Using
-        // att.id as the directory name keeps multiple attachments with the
-        // same basename from colliding; basename keeps it human-readable.
-        const destRelPath = join(SIDECAR_DIR, "attachments", att.id, basename(att.path));
-        const copyResult = sink.copyAttachment(att.path, destRelPath);
-        if (copyResult.ok) {
-          attachmentsWritten++;
-        } else {
-          skippedAttachments.push({
-            note_id: portable.id,
-            attachment_id: att.id,
-            path: att.path,
-            reason: copyResult.reason,
-          });
-        }
       }
     }
   }
@@ -1975,7 +2072,11 @@ async function importVaultReplay(
 ): Promise<void> {
   // Read every YAML doc of this export as an export (see ScalarReading), so a
   // snapshot the old exporter wrote restores its metadata exactly.
-  const reading = exportScalarReading(source);
+  const manifest = readExportManifest(source);
+  const reading = exportScalarReading(manifest);
+  // Undo the exporter's attachment-link rewrite, only for an export that says
+  // it did one (ATTACHMENT_LINKS_RELATIVE).
+  const relativeAttachmentLinks = manifest.attachment_links === ATTACHMENT_LINKS_RELATIVE;
   // 1. Optional wipe. Notes are deleted via the public Store API so hooks
   // fire (callers depend on `attachment.deleted` hooks for assets-dir
   // cleanup; we don't bypass that on blow-away). Deleted in bounded batches
@@ -2200,6 +2301,9 @@ async function importVaultReplay(
       : undefined;
     const links = Array.isArray(frontmatter.links) ? frontmatter.links : undefined;
     const attachments = Array.isArray(frontmatter.attachments) ? frontmatter.attachments : undefined;
+    if (relativeAttachmentLinks && attachments && hasMarkdownBody(extension)) {
+      content = toStorageAttachmentLinks(content, relPath, attachments);
+    }
 
     const portable: PortableNote = {
       id,
@@ -2399,8 +2503,7 @@ async function importVaultReplay(
       // File copy: from sidecar to assetsDir. Source uses the EXPORTED
       // att.id (what the exporter wrote), not our freshly-minted row id.
       if (source.attachmentsEnabled) {
-        const srcRelPath = join(SIDECAR_DIR, "attachments", att.id, basename(att.path));
-        const result = source.restoreAttachment(srcRelPath, att.path);
+        const result = source.restoreAttachment(attachmentSidecarPath(att), att.path);
         if (!result.ok) {
           stats.skipped_attachments.push({
             note_id: noteId,
@@ -2540,15 +2643,21 @@ export type ScalarReading = "yaml" | "export" | "old-export";
  */
 export const FLOW_QUOTING_SINCE = "2026-10-29T20:14:06Z";
 
-/** The {@link ScalarReading} for an export, from its `.parachute/vault.yaml`. */
-function exportScalarReading(source: ImportSource): ScalarReading {
+/** An export's `.parachute/vault.yaml` keys, or `{}` when the source has none.
+ *  Keys this importer doesn't know are ignored. */
+function readExportManifest(source: ImportSource): Record<string, unknown> {
   let text: string;
   try {
     text = source.readContentFile(`${SIDECAR_DIR}/vault.yaml`);
   } catch {
-    return "export";
+    return {};
   }
-  const at = parseFrontmatter(`---\n${text}${text.endsWith("\n") ? "" : "\n"}---\n`).frontmatter.exported_at;
+  return parseFrontmatter(`---\n${text}${text.endsWith("\n") ? "" : "\n"}---\n`).frontmatter;
+}
+
+/** The {@link ScalarReading} for an export, from its `.parachute/vault.yaml`. */
+function exportScalarReading(manifest: Record<string, unknown>): ScalarReading {
+  const at = manifest.exported_at;
   const ms = typeof at === "string" ? Date.parse(at) : NaN;
   return Number.isFinite(ms) && ms < Date.parse(FLOW_QUOTING_SINCE) ? "old-export" : "export";
 }

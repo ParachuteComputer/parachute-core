@@ -111,17 +111,20 @@ describe("portable-md attachment links (T-318 #8)", async () => {
     const outDir = join(tmpBase, "out");
     const stats = await exportVaultToDir(store, { outDir, assetsDir: assets, exportedAt: "2026-10-30T15:10:00.000Z" });
     expect(stats.skipped_attachments).toHaveLength(1);
-    const targets = linkTargets(exportedBody(join(outDir, `${NOTE_PATH}.md`)));
-    expect(targets[0]!.startsWith(`../../../${SIDECAR_DIR}/attachments/`)).toBe(true);
-    expect(targets[1]).toBe(`/api/storage/${PDF_PATH}`);
+    const body = exportedBody(join(outDir, `${NOTE_PATH}.md`));
+    expect(linkTargets(body)[0]!.startsWith(`../../../${SIDECAR_DIR}/attachments/`)).toBe(true);
+    expect(body).toContain(`[seed list.pdf](/api/storage/${PDF_PATH})`);
   });
 
-  it("a markdown-only export (no binaries) leaves the body and vault.yaml as before", async () => {
+  it("a markdown-only export (no binaries) leaves the body as stored", async () => {
     await seedNote();
     const outDir = join(tmpBase, "out");
     await exportVaultToDir(store, { outDir, exportedAt: "2026-10-30T15:10:00.000Z" });
     expect(exportedBody(join(outDir, `${NOTE_PATH}.md`))).toBe(BODY);
-    expect(readFileSync(join(outDir, SIDECAR_DIR, "vault.yaml"), "utf-8")).not.toContain("attachment_links");
+    // …and it still imports back to the same body.
+    const target = new SqliteStore(new Database(":memory:"));
+    await importPortableVault(target, { inDir: outDir });
+    expect((await target.getNote("01M67ABS8ABZS3S1ZYSSK28ZVQ"))!.content).toBe(BODY);
   });
 
   it("export → import into a fresh vault gives back the original body, and re-export matches", async () => {
