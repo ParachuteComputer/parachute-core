@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { isNoteIdShape } from "../core/src/ulid.ts";
 import { applyImportedNote, beginImportRun, canonicalJson, importObservationDigest, importTargetDigest, readImportReceipt, type ImportedObservation, type ImportRun } from "../core/src/history-import.ts";
 import { hashContent, resolveHistoryPolicy, VERSION_MAX_BYTES, type HistoryPolicy } from "../core/src/history.ts";
-import { ATTACHMENT_LINKS_RELATIVE, toStorageAttachmentLinks } from "../core/src/portable-md.ts";
+import { fromExportedAttachmentLinks } from "../core/src/portable-md.ts";
 import { applyConnectionPragmas, initSchema } from "../core/src/schema.ts";
 import { DEFAULT_PORT, readGlobalConfig, readVaultConfig, vaultDbPath, vaultDir } from "./config.ts";
 import { checkHealth } from "./health.ts";
@@ -193,12 +193,7 @@ export function stageArchive(repo: string, tip: string, stage: Database, inputSe
       else stage.prepare("INSERT INTO issues VALUES(?,?,?)").run(commit, entry.path, reason);
     };
     const format = files.get(".parachute/vault.yaml");
-    const manifest = format ? yaml(read(format)) : {};
-    if (format && manifest.export_format_version !== 1) throw new Error("Unsupported portable export format");
-    // A commit whose export rewrote attachment links (T-318 #8): turn the
-    // note's own sidecar links back into the body the vault stored. The
-    // result depends on the file's path, so it gets its own parse-cache key.
-    const relativeLinks = manifest.attachment_links === ATTACHMENT_LINKS_RELATIVE;
+    if (format && yaml(read(format)).export_format_version !== 1) throw new Error("Unsupported portable export format");
     for (const entry of entries.filter(e => /^\.parachute\/notes-meta\/[^/]+\.yaml$/.test(e.path))) {
       let meta: Record<string, unknown> | undefined;
       try {
@@ -224,18 +219,17 @@ export function stageArchive(repo: string, tip: string, stage: Database, inputSe
       if (!/\.(md|mdx)$/.test(entry.path)) { stage.prepare("INSERT INTO issues VALUES(?,?,?)").run(commit, entry.path, "unclassified_file"); continue; }
       let meta: Record<string, unknown> | undefined;
       try {
-        const cacheKey = relativeLinks ? `${entry.hash}:links:${entry.path}` : entry.hash;
-        const cached = parsedGet.get(cacheKey) as { note_id: string; state: string } | null;
+        const cached = parsedGet.get(entry.hash) as { note_id: string; state: string } | null;
         if (cached) {
-          collect(cached.note_id, cached.state, () => JSON.parse((parsedBody.get(cacheKey) as { row_json: string }).row_json), { git_path: entry.path, blob: entry.hash });
+          collect(cached.note_id, cached.state, () => JSON.parse((parsedBody.get(entry.hash) as { row_json: string }).row_json), { git_path: entry.path, blob: entry.hash });
         } else {
           const parsed = inline(read(entry)); meta = parsed.meta;
-          const body = relativeLinks && Array.isArray(meta.attachments)
-            ? toStorageAttachmentLinks(parsed.content, entry.path, meta.attachments)
-            : parsed.content;
+          // Mirror commits are exports (T-318 #8): undo the attachment links the
+          // export rewrote, so a staged version is the body the vault stored.
+          const body = Array.isArray(meta.attachments) ? fromExportedAttachmentLinks(parsed.content, meta.attachments).content : parsed.content;
           const { id, row, state } = parseObservation(meta, body, entry);
-          parsedPut.run(cacheKey, id, state, JSON.stringify(row));
-          collect(id, state, () => JSON.parse((parsedBody.get(cacheKey) as { row_json: string }).row_json), { git_path: entry.path, blob: entry.hash });
+          parsedPut.run(entry.hash, id, state, JSON.stringify(row));
+          collect(id, state, () => JSON.parse((parsedBody.get(entry.hash) as { row_json: string }).row_json), { git_path: entry.path, blob: entry.hash });
         }
       } catch (error) { failure(entry, error, meta?.id); }
     }
