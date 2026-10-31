@@ -617,26 +617,40 @@ function withRelativeAttachmentLinks(
 }
 
 /**
- * Import side of {@link PortableAttachmentRef.body_link}: each recorded
- * target in a markdown body becomes the storage link again, and the
- * export-only key is dropped from the refs so it never reaches an attachment
- * row. Refs without the key pass through as read. Exported for the
- * git-history import, which reads export bytes itself.
+ * Import side of {@link PortableAttachmentRef.body_link}: in a markdown body,
+ * each recorded target becomes the storage link again. Only a target shaped
+ * like one the export writes for that attachment (`../` steps, then its
+ * sidecar path) counts. The export-only key is dropped from every ref so it
+ * never reaches an attachment row. Exported for the git-history import,
+ * which reads export bytes itself.
  */
 export function fromExportedAttachmentLinks(
   content: string,
   attachments: unknown[],
+  extension: string | undefined,
 ): { content: string; attachments: unknown[] } {
+  const markdown = hasMarkdownBody(extension);
   let out = content;
   const refs = attachments.map((att) => {
     if (!att || typeof att !== "object" || !("body_link" in att)) return att;
     const { body_link, ...ref } = att as Record<string, unknown>;
-    if (typeof body_link === "string" && body_link !== "" && typeof ref.path === "string" && ref.path !== "") {
-      out = out.split(`](${body_link})`).join(`](${STORAGE_URL_PREFIX}${ref.path})`);
+    const { id, path } = ref;
+    if (
+      markdown && typeof body_link === "string" && typeof id === "string" && typeof path === "string" &&
+      id !== "" && path !== "" && isRelativeAttachmentTarget(body_link, { id, path })
+    ) {
+      out = out.split(`](${body_link})`).join(`](${STORAGE_URL_PREFIX}${path})`);
     }
     return ref;
   });
   return { content: out, attachments: refs };
+}
+
+/** Whether `target` is {@link relativeAttachmentTarget} of `att` from a note
+ *  file at some depth: zero or more `../`, then the encoded sidecar path. */
+function isRelativeAttachmentTarget(target: string, att: { id: string; path: string }): boolean {
+  const sidecar = relativeAttachmentTarget("note.md", att);
+  return target.endsWith(sidecar) && /^(\.\.\/)*$/.test(target.slice(0, target.length - sidecar.length));
 }
 
 // ---------------------------------------------------------------------------
@@ -2310,9 +2324,7 @@ async function importVaultReplay(
     const links = Array.isArray(frontmatter.links) ? frontmatter.links : undefined;
     let attachments = Array.isArray(frontmatter.attachments) ? frontmatter.attachments : undefined;
     // Undo the export's attachment-link rewrite, exactly where it recorded one.
-    if (attachments && hasMarkdownBody(extension)) {
-      ({ content, attachments } = fromExportedAttachmentLinks(content, attachments));
-    }
+    if (attachments) ({ content, attachments } = fromExportedAttachmentLinks(content, attachments, extension));
 
     const portable: PortableNote = {
       id,

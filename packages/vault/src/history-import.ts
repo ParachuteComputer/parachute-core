@@ -3,7 +3,7 @@ import { Database, SQLiteError } from "bun:sqlite";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmodSync, closeSync, copyFileSync, existsSync, fsyncSync, mkdirSync, mkdtempSync, openSync, readSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, extname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { isNoteIdShape } from "../core/src/ulid.ts";
 import { applyImportedNote, beginImportRun, canonicalJson, importObservationDigest, importTargetDigest, readImportReceipt, type ImportedObservation, type ImportRun } from "../core/src/history-import.ts";
@@ -226,7 +226,8 @@ export function stageArchive(repo: string, tip: string, stage: Database, inputSe
           const parsed = inline(read(entry)); meta = parsed.meta;
           // Mirror commits are exports (T-318 #8): undo the attachment links the
           // export rewrote, so a staged version is the body the vault stored.
-          const body = Array.isArray(meta.attachments) ? fromExportedAttachmentLinks(parsed.content, meta.attachments).content : parsed.content;
+          const extension = typeof meta.extension === "string" ? meta.extension : extname(entry.path).slice(1);
+          const body = Array.isArray(meta.attachments) ? fromExportedAttachmentLinks(parsed.content, meta.attachments, extension).content : parsed.content;
           const { id, row, state } = parseObservation(meta, body, entry);
           parsedPut.run(entry.hash, id, state, JSON.stringify(row));
           collect(id, state, () => JSON.parse((parsedBody.get(entry.hash) as { row_json: string }).row_json), { git_path: entry.path, blob: entry.hash });

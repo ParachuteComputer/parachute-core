@@ -438,8 +438,9 @@ test("valid sidecar candidate selection binds both content and metadata blobs", 
 
 test("mirror commits with relative attachment links (T-318 #8) stage the original /api/storage body", async () => {
   // The mirror exports with binaries, so its commits hold bodies whose
-  // attachment links point at .parachute/attachments/… (vault.yaml says
-  // attachment_links: relative). A staged version must be the vault's body.
+  // attachment links point at .parachute/attachments/… (each rewritten
+  // attachment's frontmatter entry records it as body_link). A staged
+  // version must be the vault's body.
   const { SqliteStore } = await import("../core/src/store.ts");
   const { exportVaultToDir } = await import("../core/src/portable-md.ts");
   const dir = mkdtempSync(join(tmpdir(), "history-att-links-")), db = new Database(":memory:");

@@ -211,6 +211,16 @@ describe("portable-md attachment links (T-318 #8)", async () => {
     const rows = await target.getAttachments("n-plan");
     expect(rows.map((r) => [r.path, r.metadata ?? null])).toEqual([["2026-10-30/pic.png", null]]);
   });
+
+  it("a body_link that isn't the attachment's own sidecar target is dropped and its links stay as written", async () => {
+    for (const [name, bodyLink] of [["other-file", "../.parachute/attachments/att_two/pic.png"], ["url", "https://example.com/pic.png"]]) {
+      const dir = join(tmpBase, name!);
+      const body = writeExport(dir, bodyLink);
+      const target = new SqliteStore(new Database(":memory:"));
+      await importPortableVault(target, { inDir: dir });
+      expect((await target.getNote("n-plan"))!.content).toBe(body);
+    }
+  });
 });
 
 describe("portable-md attachment links: only the links export rewrote come back (T-318 #8)", async () => {
