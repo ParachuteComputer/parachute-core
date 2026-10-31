@@ -2631,12 +2631,13 @@ export function renameTag(db: Database, oldName: string, newName: string, attr?:
   // deepest path first if any later step needs deterministic ordering
   // (the SQL we run is order-independent, but it costs nothing here).
   //
-  // A literal prefix match, so a tag literally named `task_` doesn't pull
-  // `taskX/sub` into the rename transaction. ASCII-case-insensitive, as the
-  // `LIKE` it replaces was. Not LIKE: Durable Object SQLite refuses a LIKE
-  // pattern over 50 bytes.
+  // A literal, case-sensitive prefix match, so a tag literally named `task_`
+  // doesn't pull `taskX/sub` into the rename transaction, and renaming `Work`
+  // doesn't pull `work/sub` (a child of the separate tag `work`; tag names
+  // are case-sensitive in every query). Not LIKE: Durable Object SQLite
+  // refuses a LIKE pattern over 50 bytes, and LIKE ignores ASCII case.
   const subRows = db
-    .prepare("SELECT name FROM tags WHERE instr(lower(name), lower(?)) = 1 ORDER BY length(name) DESC")
+    .prepare("SELECT name FROM tags WHERE instr(name, ?) = 1 ORDER BY length(name) DESC")
     .all(`${oldName}/`) as { name: string }[];
   const renames: { from: string; to: string }[] = [
     { from: oldName, to: newName },
