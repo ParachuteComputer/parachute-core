@@ -611,8 +611,10 @@ function toRelativeAttachmentLinks(
 }
 
 /** Import side: the note's own relative sidecar links become storage links
- *  again. Attachment refs that aren't well-formed are ignored. */
-function toStorageAttachmentLinks(content: string, noteRelPath: string, attachments: unknown[]): string {
+ *  again. `noteRelPath` is the note file's export-relative POSIX path;
+ *  attachment refs that aren't well-formed are ignored. Exported for readers
+ *  of export bytes other than `importVault` (the git-history import). */
+export function toStorageAttachmentLinks(content: string, noteRelPath: string, attachments: unknown[]): string {
   const pairs: Array<[string, string]> = [];
   for (const att of attachments) {
     const { id, path } = (att ?? {}) as { id?: unknown; path?: unknown };
