@@ -715,6 +715,12 @@ export interface Store {
   listTagRecords(): Promise<TagRecord[]>;
   getTagRecord(tag: string): Promise<TagRecord | null>;
   /**
+   * T-318 §8a: the tags whose RECORDED kind is `type` (a record's `kind` is
+   * the effective one, which also counts being another tag's parent). The
+   * portable export uses it to keep a promoted type that is also a parent.
+   */
+  recordedTypeNames(): Promise<Set<string>>;
+  /**
    * Partial upsert. Any patch field left undefined is preserved; pass
    * null to clear. Touching `parent_names` invalidates the tag-hierarchy
    * cache. Returns the post-write row.

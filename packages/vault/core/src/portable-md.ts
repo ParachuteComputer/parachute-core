@@ -929,9 +929,10 @@ export async function exportVault(
   // definition from the backup — so a write failure here also fails loudly
   // (and never increments `schemasWritten` on a failed write).
   const tagRecords = await store.listTagRecords();
+  const recordedTypes = await store.recordedTypeNames();
   let schemasWritten = 0;
   for (const tag of tagRecords) {
-    if (!hasSchemaContent(tag)) continue;
+    if (!writesSchemaSidecar(tag, recordedTypes)) continue;
     const filename = sanitizeTagFilename(tag.tag) + ".yaml";
     const doc: Record<string, unknown> = { name: tag.tag };
     if (tag.description !== undefined) doc.description = tag.description;
@@ -940,6 +941,7 @@ export async function exportVault(
     if (tag.parent_names !== undefined && tag.parent_names.length > 0) {
       doc.parent_names = tag.parent_names;
     }
+    if (isBareType(tag, recordedTypes)) doc.kind = "type";
     const schemaPath = join(SIDECAR_DIR, "schemas", filename);
     const schemaWrite = sink.writeText(schemaPath, emitYamlDoc(doc));
     if (!schemaWrite.ok) {
@@ -1529,6 +1531,31 @@ export function hasSchemaContent(tag: TagRecord): boolean {
 }
 
 /**
+ * A type (T-318 §8a) that only `tags.kind` records: recorded `type`
+ * (`recordedTypes`, from `store.recordedTypeNames()`), with no fields and no
+ * parents of its own. Import re-derives a type from the sidecar's fields and
+ * parent_names; this one would come back as a plain tag, so its sidecar says
+ * `kind: type`. Being another tag's parent doesn't count either way: it is read
+ * live, never recorded, so a parent nobody promoted gets no `kind`, and a
+ * promoted one keeps it when its last child goes, as in the live vault. Older
+ * importers read only the keys they know and ignore it.
+ */
+export function isBareType(tag: TagRecord, recordedTypes: ReadonlySet<string>): boolean {
+  if (!recordedTypes.has(tag.tag)) return false;
+  if (tag.fields && Object.keys(tag.fields).length > 0) return false;
+  return !(tag.parent_names && tag.parent_names.length > 0);
+}
+
+/**
+ * True iff the export writer emits a schema sidecar for this tag: schema
+ * content, or a type only `kind` records. The keep-list for `pruneOrphans`
+ * must use this, or a mirror prunes the bare type's sidecar on every run.
+ */
+export function writesSchemaSidecar(tag: TagRecord, recordedTypes: ReadonlySet<string>): boolean {
+  return hasSchemaContent(tag) || isBareType(tag, recordedTypes);
+}
+
+/**
  * Tag names may contain `/` (sub-tag hierarchy). Replace with `__` for the
  * filename so the sidecar stays flat: `.parachute/schemas/<safe>.yaml`.
  * Round-trip on import recovers the `/` form from the `name:` key inside
@@ -2028,6 +2055,7 @@ async function importVaultReplay(
       fields: (frontmatter.fields as Record<string, unknown> | null | undefined) as any ?? null,
       relationships: (frontmatter.relationships as Record<string, unknown> | null | undefined) as any ?? null,
       parent_names: parentNames,
+      ...(frontmatter.kind === "type" ? { kind: "type" as const } : {}),
     };
     try {
       await store.upsertTagRecord(tagName, patch);
