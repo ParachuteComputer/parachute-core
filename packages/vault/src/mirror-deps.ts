@@ -7,7 +7,7 @@
  * vault-store + portable-md.
  */
 
-import { exportVaultToDir, parentNameSet, pruneOrphans, writesSchemaSidecar } from "../core/src/portable-md.ts";
+import { exportVaultToDir, pruneOrphans, writesSchemaSidecar } from "../core/src/portable-md.ts";
 
 import { defaultHookRegistry } from "../core/src/hooks.ts";
 import { readGlobalConfig, readVaultConfig } from "./config.ts";
@@ -62,9 +62,9 @@ export function buildMirrorDeps(vaultName: string): MirrorDeps {
       // Reviewer-flagged on vault#382 (Critical #1).
       // A type only `kind` records gets a sidecar too (writesSchemaSidecar, T-318 §8a).
       const tagRecords = await store.listTagRecords();
-      const parents = parentNameSet(tagRecords);
+      const recordedTypes = await store.recordedTypeNames();
       const validTagNames = new Set(
-        tagRecords.filter((t) => writesSchemaSidecar(t, parents)).map((t) => t.tag),
+        tagRecords.filter((t) => writesSchemaSidecar(t, recordedTypes)).map((t) => t.tag),
       );
       // Attachment IDs across all notes (the prune sweep keys on id).
       const validAttachmentIds = new Set<string>();

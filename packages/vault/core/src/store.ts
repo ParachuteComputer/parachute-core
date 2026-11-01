@@ -7,6 +7,7 @@ import { refreshCompactState } from "./history-compact-state.js";
 import * as noteOps from "./notes.js";
 import * as linkOps from "./links.js";
 import * as tagSchemaOps from "./tag-schemas.js";
+import { recordedTypeNames } from "./tag-kind.js";
 import * as indexedFieldOps from "./indexed-fields.js";
 import {
   pruneOrphanedIndexedFields,
@@ -1511,6 +1512,10 @@ export class BunSqliteStore implements Store {
 
   async getTagRecord(tag: string) {
     return tagSchemaOps.getTagRecord(this.db, tag);
+  }
+
+  async recordedTypeNames() {
+    return recordedTypeNames(this.db);
   }
 
   /**

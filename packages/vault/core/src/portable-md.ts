@@ -929,10 +929,10 @@ export async function exportVault(
   // definition from the backup — so a write failure here also fails loudly
   // (and never increments `schemasWritten` on a failed write).
   const tagRecords = await store.listTagRecords();
-  const parents = parentNameSet(tagRecords);
+  const recordedTypes = await store.recordedTypeNames();
   let schemasWritten = 0;
   for (const tag of tagRecords) {
-    if (!writesSchemaSidecar(tag, parents)) continue;
+    if (!writesSchemaSidecar(tag, recordedTypes)) continue;
     const filename = sanitizeTagFilename(tag.tag) + ".yaml";
     const doc: Record<string, unknown> = { name: tag.tag };
     if (tag.description !== undefined) doc.description = tag.description;
@@ -941,7 +941,7 @@ export async function exportVault(
     if (tag.parent_names !== undefined && tag.parent_names.length > 0) {
       doc.parent_names = tag.parent_names;
     }
-    if (isBareType(tag, parents)) doc.kind = "type";
+    if (isBareType(tag, recordedTypes)) doc.kind = "type";
     const schemaPath = join(SIDECAR_DIR, "schemas", filename);
     const schemaWrite = sink.writeText(schemaPath, emitYamlDoc(doc));
     if (!schemaWrite.ok) {
@@ -1531,22 +1531,19 @@ export function hasSchemaContent(tag: TagRecord): boolean {
 }
 
 /**
- * A type (T-318 §8a) that only `tags.kind` records: no fields, no parents of its
- * own, and not named as another tag's parent (a parent is read as a type, never
- * recorded as one, so it gets no `kind` here). Everything else about a kind is
- * re-derived on import from the sidecar's fields and parent_names; this one would
- * come back as a plain tag, so its sidecar says `kind: type`. Older importers
- * read only the keys they know and ignore it.
+ * A type (T-318 §8a) that only `tags.kind` records: recorded `type`
+ * (`recordedTypes`, from `store.recordedTypeNames()`), with no fields and no
+ * parents of its own. Import re-derives a type from the sidecar's fields and
+ * parent_names; this one would come back as a plain tag, so its sidecar says
+ * `kind: type`. Being another tag's parent doesn't count either way: it is read
+ * live, never recorded, so a parent nobody promoted gets no `kind`, and a
+ * promoted one keeps it when its last child goes, as in the live vault. Older
+ * importers read only the keys they know and ignore it.
  */
-export function isBareType(tag: TagRecord, parents: ReadonlySet<string>): boolean {
-  if (tag.kind !== "type" || parents.has(tag.tag)) return false;
+export function isBareType(tag: TagRecord, recordedTypes: ReadonlySet<string>): boolean {
+  if (!recordedTypes.has(tag.tag)) return false;
   if (tag.fields && Object.keys(tag.fields).length > 0) return false;
   return !(tag.parent_names && tag.parent_names.length > 0);
-}
-
-/** Every name some tag record lists in its parent_names. */
-export function parentNameSet(tags: readonly TagRecord[]): Set<string> {
-  return new Set(tags.flatMap((t) => t.parent_names ?? []));
 }
 
 /**
@@ -1554,8 +1551,8 @@ export function parentNameSet(tags: readonly TagRecord[]): Set<string> {
  * content, or a type only `kind` records. The keep-list for `pruneOrphans`
  * must use this, or a mirror prunes the bare type's sidecar on every run.
  */
-export function writesSchemaSidecar(tag: TagRecord, parents: ReadonlySet<string>): boolean {
-  return hasSchemaContent(tag) || isBareType(tag, parents);
+export function writesSchemaSidecar(tag: TagRecord, recordedTypes: ReadonlySet<string>): boolean {
+  return hasSchemaContent(tag) || isBareType(tag, recordedTypes);
 }
 
 /**

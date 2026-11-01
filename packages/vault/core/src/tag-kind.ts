@@ -82,6 +82,16 @@ export function recordTagKinds(db: Database): { types: number; tags: number } {
   return { types: kinds.filter((k) => k === "type").length, tags: kinds.filter((k) => k === "tag").length };
 }
 
+/**
+ * The names whose recorded kind is `type` (tags.kind, not KIND_SQL): what the
+ * record says, without being a parent. A tag promoted with `kind: "type"` keeps
+ * this when its last child goes, so the portable export carries it.
+ */
+export function recordedTypeNames(db: Database): Set<string> {
+  const rows = db.prepare(`SELECT name FROM tags WHERE kind = 'type'`).all() as { name: string }[];
+  return new Set(rows.map((r) => r.name));
+}
+
 /** Whether some tag names `name` as a parent. */
 export function isParent(db: Database, name: string): boolean {
   return !!db.prepare(`SELECT 1 FROM tags t WHERE t.name = ? AND ${IS_PARENT}`).get(name);
