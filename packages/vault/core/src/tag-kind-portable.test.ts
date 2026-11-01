@@ -53,4 +53,38 @@ describe("a type with no fields survives export and import", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  // Codex on #39: the recorded kind and "is a parent" are separate (KIND_SQL). A tag promoted with kind: "type"
+  // that is also a parent stays a type in the live vault when its last child goes; the export must carry that.
+  async function promotedParent() {
+    const v = fresh();
+    await run(v.tools, "update-tag", { tag: "area", kind: "type" });
+    await run(v.tools, "update-tag", { tag: "area/home", parent_names: ["area"] });
+    await run(v.tools, "create-note", { path: "a", content: "a", tags: ["area"] });
+    await run(v.tools, "create-note", { path: "h", content: "h", tags: ["area/home"] });
+    return v;
+  }
+
+  test("live store: a promoted type that is a parent stays a type after its last child goes (control)", async () => {
+    const v = await promotedParent();
+    expect(tagKinds(v.db).get("area")).toBe("type");
+    await run(v.tools, "update-tag", { tag: "area/home", parent_names: [] });
+    expect(tagKinds(v.db).get("area")).toBe("type");
+  });
+
+  test("a promoted type that is a parent stays a type through export and import after its last child goes", async () => {
+    const src = await promotedParent();
+    const dir = mkdtempSync(join(tmpdir(), "kind-portable-"));
+    try {
+      await exportVaultToDir(src.store, { outDir: dir, exportedAt: "2026-10-31T00:00:00.000Z" });
+      const dst = fresh();
+      await importPortableVault(dst.store, { inDir: dir, blowAway: true });
+      initSchema(dst.db);
+      expect(tagKinds(dst.db).get("area")).toBe("type");
+      await run(dst.tools, "update-tag", { tag: "area/home", parent_names: [] });
+      expect(tagKinds(dst.db).get("area")).toBe("type");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
