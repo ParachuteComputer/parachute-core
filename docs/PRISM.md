@@ -121,9 +121,10 @@ Read against Prism main `55ac3df`, and run on Linux in a private network namespa
 - **Prism doesn't call `serve --embedded` yet.** In embedded mode `prism run hub` is a placeholder
   (`supervisor.ts`, `runParachutePlaceholder`), and setup runs only `bootstrap --embedded --json` (`setup.ts:429`).
   That bootstrap followed by `serve --embedded --home … --listen 127.0.0.1:1939 --vault-listen 127.0.0.1:1940
-  --parent-pid …` serves every call Prism's code makes next. Those are `auth mint-token` without `--json` (stdout is
-  one line, the JWT), `--service`, `--ephemeral`, `GET /tags`, `PUT /tags/<name>`, `/storage/upload`, and MCP with
-  your read-write allowlist. Bootstrap records the issuer `http://127.0.0.1:1939`, which matches serve on 1939. On
+  --parent-pid …` served every Prism call we tried. Those were `auth mint-token` without `--json` (stdout is one
+  line, the JWT), `--service`, `--ephemeral`, `GET /tags`, `PUT /tags/<name>`, `POST` and `GET /notes`,
+  `/storage/upload`, and MCP with your read-write allowlist. Not tried: `/notes/:id/attachments`, versions,
+  restore, `/history/compact` and `/api/subscribe`. Bootstrap records the issuer `http://127.0.0.1:1939`, which matches serve on 1939. On
   any other hub port, give both commands `PARACHUTE_HUB_ORIGIN`.
 - **Stock mode on 0.8 works only on a home 0.8 made.** Stock mode is `parachute-stock.ts`, which runs `parachute
   serve` with `PORT=1939`. On a home made by stock 0.7.19/0.7.9 while those programs are still installed, `parachute
@@ -131,8 +132,8 @@ Read against Prism main `55ac3df`, and run on Linux in a private network namespa
   restarting into that exit. Open such a home with `serve --embedded` instead: it adopts the home in place, and stock
   0.7.19 still opens it afterwards. The other way is to run `parachute-core takeover` first.
 - **Prism's own backup** (`prism backup`, and the one `prism update` takes) copies `hub.db`, each `vault.db` and
-  `vault.yaml`. It leaves out the rest of an embedded home: attachments (`vault/data/<name>/assets/`),
-  `embedded.json` (the accepted issuers) and `operator.token`.
+  `vault.yaml`. It leaves out the rest of an embedded home, including attachments (`vault/data/<name>/assets/`),
+  `embedded.json` (the accepted issuers), `operator.token`, `vault/config.yaml` and `services.json`.
 
 ## What stays the same from 0.7
 
@@ -189,8 +190,9 @@ on it unchanged (46 pass, 0 fail, on the tarball and the npm install). What chan
   either were read back, and tag fields survived. Nothing was written outside the home.
   - The backup 0.9 takes on its first open skips embedded homes (`docs/UPGRADE-0.9.md` on #21).
   - A home that is not embedded (Prism's stock mode) is handled differently:
-    - 0.9's first command copies the databases into `<PARACHUTE_HOME>-upgrade/`, next to the home, and records
-      `run/release.json`.
+    - 0.9's first command copies the databases into a `parachute-upgrade/` folder in the home's parent folder,
+      and records `run/release.json`. For `<prefix>/parachute` that is `<prefix>/parachute-upgrade/`. For
+      `~/.parachute` it is `~/parachute-upgrade/`.
     - Old command names print one line on stderr there, for example `'auth mint-token' is now 'keys new <name>'`.
       Stdout and the exit code are unchanged, so Prism's last-line parse still works.
   - Before 0.9.1 we need to agree who backs up an embedded home before a newer bundle opens it: Prism, or
