@@ -181,7 +181,7 @@ on it unchanged (46 pass, 0 fail, on the tarball and the npm install). What chan
   in `tools/list` (its description starts "deprecated"), so your allowlists in `agent-profiles.ts` keep working.
   Add `attachment-url` when you move, and `manage-types` and `manage-keys` to the admin-only list (`lib.mjs:19`) so
   that check still covers them. A write key's `tools/list` holds 12 entries, 9 tools and 3 aliases, in about 10k
-  characters (61k on 0.8, 11 tools).
+  characters; on 0.8 the same key sees 11 tools in about 61k.
 - **Types and tags.** A tag with fields or parents is a type. Notes gain `types` (the types among their tags) next
   to `tags`, over REST and MCP; `tags` still lists every name. `tags: [...]` writes and `tag:` queries work as today.
 - **Keys.** Every token becomes a key with the same scopes; `parachute keys list` shows them. Verification is
