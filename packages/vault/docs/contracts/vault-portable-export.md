@@ -41,7 +41,7 @@ Output (per [`exportVaultToDir`](https://github.com/ParachuteComputer/parachute-
     schemas/<tag>.yaml        # one file per schema-carrying tag
     attachments/<id>/...      # binary files, keyed by export-time att.id
   <note.path>.md              # one file per pathed note
-  _unpathed/<note-id>.md      # one file per pathless note
+  _unpathed/<title>.md        # one file per pathless note, named after its title
 ```
 
 The sidecar directory is named `.parachute` so that walkers which skip dot-prefixed directories (including vault's own `walkMarkdownFiles`, Obsidian, Logseq, most SSGs) won't accidentally treat schemas or vault-meta as notes.
@@ -63,7 +63,7 @@ Fixed top-level key order, alpha-sorted nested keys — byte-identical re-emit o
 ```yaml
 ---
 id: 01HGZ9...                      # ULID — durable across path renames
-path: Inbox/2026-05-12-meeting     # omit for pathless notes (filed under _unpathed/<id>.md)
+path: Inbox/2026-05-12-meeting     # omit for pathless notes (filed under _unpathed/<title>.md)
 tags:
   - donor-pipeline
   - meeting
@@ -190,7 +190,7 @@ Restore: untar somewhere, then `parachute-vault import <untarred-dir> --blow-awa
 
 - **Case-insensitive filesystems silently collide notes whose paths differ only by case.** macOS APFS (default) and Windows NTFS (default) treat `Foo/Bar.md` and `Foo/bar.md` as the same file — export writes both, but the second overwrites the first on disk, silently losing one note. Affects ~1 note per case-collision pair, on those filesystems only. Linux ext4 and macOS APFS-CS (case-sensitive variant) unaffected. Tracked at [vault#327](https://github.com/ParachuteComputer/parachute-vault/issues/327) — fix lands in vault 0.4.5; until then, audit your vault for case-only-differing paths before relying on a round-trip on a case-insensitive disk.
 - **Path traversal is refused, not aborted.** A note with `path: "../../escape"` would otherwise write outside the export directory. `exportVaultToDir` resolves the candidate path against the export root and refuses the write with a `console.warn`, then keeps going. Partial export beats no export. Self-inflicted at the vault level (operator owns the data), but real for programmatic callers ingesting from external systems. See [`isWithinDir`](https://github.com/ParachuteComputer/parachute-vault/blob/main/core/src/portable-md.ts) and the F3 fix in vault#317.
-- **Pathless notes land in `_unpathed/`.** Notes without a `path:` go to `_unpathed/<note-id>.md` so they don't collide with each other and so a user importing into Obsidian sees them in one folder rather than scattered at the root.
+- **Pathless notes land in `_unpathed/`, named after their title.** Notes without a `path:` go to `_unpathed/` so a user importing into Obsidian sees them in one folder rather than scattered at the root. A markdown note's file is named after its display title (its first non-empty line, as the app shows it): characters a filesystem, Windows or Obsidian links refuse become spaces, leading dots and trailing dots and spaces go, the name is cut at a word to 80 bytes, and a note with no text is `Untitled`. When another note already holds the name, the next free one of `<title> 2.md`, `<title> 3.md`… is used, compared without letter case so an export unpacked on macOS or Windows never folds two notes into one file. A pathed note whose path is under `_unpathed/` keeps its own file. Exporting into an earlier export (`--since`, the git mirror) never writes over another note's file; a note whose title changed moves to its new name and its old file is removed, so the folder keeps one file per note. Import takes each note's id and path from its frontmatter, never from the file name, so the note comes back pathless with the same id; exports made before titles were used (`_unpathed/<note-id>.md`) import exactly as before, and the next export into such a folder renames those files. A pathless note in a sidecar format (`.csv`, `.yaml`, …) keeps `_unpathed/<note-id>.<ext>`, because its sidecar finds the content file by id.
 - **`exported_at` is the one timestamp that won't be byte-identical across runs.** It lives in `.parachute/vault.yaml`. Callers wanting strict byte-equivalence (tests, fixture diffing) pass `exportedAt` to the `exportVaultToDir` API; the CLI always stamps live. If you're git-projecting and want minimal diff noise, the `vault.yaml` file changing every run is the cost.
 - **Schema drift on import.** `import` without `--blow-away` warns on schema conflicts (export claims `fields.amount.type: number`, vault already has `fields.amount.type: string`). `--blow-away` replays the export's schemas exactly. Choose the verb that matches your intent.
 - **`--since` regenerates schemas every run, even if no tag schema changed.** The filter only narrows the *notes* set; schema sidecars are always written fully. For a git-projection cadence that produces tight diffs, expect schema files to surface in incremental commits even when the underlying schemas are unchanged.

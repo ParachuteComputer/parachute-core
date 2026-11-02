@@ -83,6 +83,7 @@ import type { TagRecord } from "./tag-schemas.js";
 import { ParentCycleError } from "./tag-schemas.js";
 import { transactionAsync } from "./txn.js";
 import { timestampToMs } from "./cursor.js";
+import { computeDisplayTitle } from "./display-title.js";
 
 // ---------------------------------------------------------------------------
 // Format constants
@@ -555,11 +556,139 @@ export function toSidecarYaml(note: PortableNote): string {
  * `_unpathed/<id>.<extension>` (no date-prefix coincidence with user
  * content). Default extension is "md" so pre-vault#328 exports produce
  * the same filenames.
+ *
+ * `exportVault` keeps this id-keyed name only for a pathless note whose
+ * extension needs a sidecar (the sidecar finds its content file by id). A
+ * pathless markdown note carries its id in its frontmatter, so the export
+ * names its file after its title instead (`UnpathedNames`).
  */
 export function portableExportFilePath(note: PortableNote): string {
   const ext = note.extension ?? "md";
   if (note.path) return `${note.path}.${ext}`;
-  return `_unpathed/${note.id}.${ext}`;
+  return `${UNPATHED_DIR}/${note.id}.${ext}`;
+}
+
+/** The export folder that holds the notes with no path. */
+const UNPATHED_DIR = "_unpathed";
+
+/** Max UTF-8 bytes of a pathless note's file-name stem: short enough to read,
+ *  and far under the 255-byte name limit with a ` 999` suffix and extension. */
+const UNPATHED_STEM_MAX_BYTES = 80;
+
+/** Characters a filesystem, Windows or Obsidian links refuse in a file name,
+ *  plus invisible format characters (zero-width, bidi controls, BOM). */
+const UNSAFE_NAME_CHARS = /[\u0000-\u001f\u007f/\\:*?"<>|#^[\]\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/g;
+
+/** Device names Windows refuses as a file name, with or without an extension. */
+const WINDOWS_RESERVED_NAME = /^(con|prn|aux|nul|com[0-9\u00b9\u00b2\u00b3]|lpt[0-9\u00b9\u00b2\u00b3])(\.|$)/i;
+
+/**
+ * The file-name stem for a pathless markdown note: its display title (the
+ * first non-empty line, as the app shows it) made safe on every common
+ * filesystem. Unsafe characters become spaces; leading dots go (a dot file
+ * is hidden, and import skips it); trailing dots and spaces go (Windows drops
+ * them); a long title is cut at a word to `UNPATHED_STEM_MAX_BYTES`. A note
+ * with no text is "Untitled".
+ */
+export function unpathedFileStem(content: string): string {
+  const clean = (s: string) => s.replace(/\s+/g, " ").replace(/^[\s.]+/, "").replace(/[\s.]+$/, "");
+  let stem = clean((computeDisplayTitle(content) ?? "").normalize("NFC").replace(UNSAFE_NAME_CHARS, " "));
+  if (Buffer.byteLength(stem) > UNPATHED_STEM_MAX_BYTES) {
+    let cut = "";
+    for (const ch of stem) {
+      if (Buffer.byteLength(cut + ch) > UNPATHED_STEM_MAX_BYTES) break;
+      cut += ch;
+    }
+    const lastSpace = cut.lastIndexOf(" ");
+    const midWord = stem[cut.length] !== " " && lastSpace > 0;
+    stem = clean(midWord ? cut.slice(0, lastSpace) : cut);
+  }
+  if (stem === "") return "Untitled";
+  return stem.replace(WINDOWS_RESERVED_NAME, "$1_$2");
+}
+
+/** Case- and normalization-insensitive identity of an export file name: two
+ *  names with the same key are one file on macOS and Windows, so an export
+ *  unpacked there must never hold both. */
+function fileNameKey(relPath: string): string {
+  return relPath.normalize("NFC").toLowerCase();
+}
+
+/**
+ * Chooses the file of each pathless markdown note in one export run:
+ * `_unpathed/<title>.md`, or `<title> 2.md`, `<title> 3.md`… when another
+ * note already holds that name. A name is held by a note claimed earlier in
+ * this run, by a pathed note whose path falls under `_unpathed/` (reserved up
+ * front, so it wins even if it is written later), or by a file an earlier
+ * export left in the destination (for an `--since` export or the git mirror,
+ * which re-export into the same folder) — so a write never replaces another
+ * note's file. A file whose id can't be read holds its name too.
+ *
+ * A note whose earlier file is already one of its title's names keeps it. When
+ * the title changes, the note's earlier files under `_unpathed/` (including an
+ * id-named one from before titles were used) are returned by `staleFiles` for
+ * removal, so the folder keeps one file per note. Import reads each note's id
+ * and path from its frontmatter, never from the file name.
+ */
+class UnpathedNames {
+  /** File-name key → id of the note holding it (null: a file with no readable id). */
+  private readonly holders = new Map<string, string | null>();
+  /** Note id → its files under `_unpathed/` from an earlier export. */
+  private readonly earlier = new Map<string, string[]>();
+
+  constructor(earlierFiles: Array<{ relPath: string; id: string | null }>, reserved: Array<{ relPath: string; id: string }>) {
+    for (const f of earlierFiles) {
+      this.holders.set(fileNameKey(f.relPath), f.id);
+      if (f.id !== null) this.earlier.set(f.id, [...(this.earlier.get(f.id) ?? []), f.relPath]);
+    }
+    for (const r of reserved) this.holders.set(fileNameKey(r.relPath), r.id);
+  }
+
+  private free(relPath: string, id: string): boolean {
+    const key = fileNameKey(relPath);
+    return !this.holders.has(key) || this.holders.get(key) === id;
+  }
+
+  /** Record that note `id` is written at `relPath` (pathed notes too). */
+  hold(relPath: string, id: string): void {
+    this.holders.set(fileNameKey(relPath), id);
+  }
+
+  /** The file for a pathless markdown note. */
+  claim(note: PortableNote): string {
+    const ext = note.extension ?? "md";
+    const stem = unpathedFileStem(note.content);
+    const nameKey = fileNameKey(`${UNPATHED_DIR}/${stem}`);
+    const suffix = new RegExp(`^( [0-9]+)?\\.${ext.toLowerCase()}$`);
+    const current = (this.earlier.get(note.id) ?? []).find((p) => {
+      const key = fileNameKey(p);
+      return key.startsWith(nameKey) && suffix.test(key.slice(nameKey.length)) && this.free(p, note.id);
+    });
+    if (current) {
+      this.hold(current, note.id);
+      return current;
+    }
+    for (let n = 1; ; n++) {
+      const candidate = `${UNPATHED_DIR}/${n === 1 ? stem : `${stem} ${n}`}.${ext}`;
+      if (this.free(candidate, note.id)) {
+        this.hold(candidate, note.id);
+        return candidate;
+      }
+    }
+  }
+
+  /** Note `id`'s earlier files other than the one just written at `relPath`.
+   *  Compared by key: on a case-insensitive disk, `Ideas.md` written over
+   *  `ideas.md` is the same file, which must stay. */
+  staleFiles(id: string, relPath: string): string[] {
+    const written = fileNameKey(relPath);
+    const stale = (this.earlier.get(id) ?? []).filter((p) => fileNameKey(p) !== written);
+    for (const p of stale) {
+      if (this.holders.get(fileNameKey(p)) === id) this.holders.delete(fileNameKey(p));
+    }
+    this.earlier.delete(id);
+    return stale;
+  }
 }
 
 /** Export-root-relative sidecar path of an attachment's binary. */
@@ -853,6 +982,15 @@ export interface ExportSink {
    *  to the attachment source (fs: `assetsDir`); `destRelPath` is export-
    *  root-relative. Only called when `attachmentsEnabled`. */
   copyAttachment(srcRelPath: string, destRelPath: string): SinkWriteResult;
+  /** Optional, for a destination that may already hold an earlier export
+   *  (the fs sink: `--since` exports and the git mirror write into the same
+   *  folder). The `.md`/`.mdx` files directly under export-root-relative
+   *  `dir`, as `dir/<name>`, each with its frontmatter `id` (null when it has
+   *  none or can't be read). A sink that always starts empty (cloud's tar)
+   *  leaves this and `removeText` out. */
+  listNoteFiles?(dir: string): Array<{ relPath: string; id: string | null }>;
+  /** Optional: remove a note file an earlier export wrote at `relPath`. */
+  removeText?(relPath: string): SinkWriteResult;
 }
 
 /**
@@ -916,6 +1054,39 @@ export class FsExportSink implements ExportSink {
         ok: false,
         reason: `fs write failed for "${relPath}": ${(err as Error)?.message ?? String(err)}`,
       };
+    }
+    return { ok: true };
+  }
+
+  listNoteFiles(dir: string): Array<{ relPath: string; id: string | null }> {
+    const full = join(this.root, dir);
+    if (!isWithinDir(resolvePath(full), this.rootResolved) || !existsSync(full)) return [];
+    const out: Array<{ relPath: string; id: string | null }> = [];
+    for (const entry of readdirSync(full)) {
+      if (entry.startsWith(".") || !supportsInlineFrontmatter(extname(entry).slice(1))) continue;
+      const file = join(full, entry);
+      let id: string | null = null;
+      try {
+        if (!statSync(file).isFile()) continue;
+        const fmId = parseFrontmatter(readFileSync(file, "utf-8")).frontmatter.id;
+        if (typeof fmId === "string" && fmId.trim() !== "") id = fmId;
+      } catch {
+        // Unreadable: listed with no id, so it holds its name and is never removed.
+      }
+      out.push({ relPath: `${dir}/${entry}`, id });
+    }
+    return out;
+  }
+
+  removeText(relPath: string): SinkWriteResult {
+    const fullResolved = resolvePath(join(this.root, relPath));
+    if (!isWithinDir(fullResolved, this.rootResolved)) {
+      return { ok: false, reason: `path-traversal: "${fullResolved}" escapes export root "${this.rootResolved}"` };
+    }
+    try {
+      rmSync(fullResolved, { force: true });
+    } catch (err) {
+      return { ok: false, reason: `fs remove failed for "${relPath}": ${(err as Error)?.message ?? String(err)}` };
     }
     return { ok: true };
   }
@@ -1100,7 +1271,7 @@ export async function exportVault(
     const groups = new Map<string, Array<{ note_id: string; path: string; extension: string }>>();
     for await (const note of iterateAllNotes(store)) {
       const portable = await noteToPortable(note, store);
-      if (!portable.path) continue; // _unpathed/<id>.<ext> is case-stable
+      if (!portable.path) continue; // UnpathedNames never folds two pathless notes into one name
       const ext = portable.extension ?? "md";
       const key = `${portable.path.toLowerCase()}|${ext.toLowerCase()}`;
       const entry = { note_id: portable.id, path: portable.path, extension: ext };
@@ -1117,16 +1288,26 @@ export async function exportVault(
     }
   }
 
+  // Pathless markdown notes are named after their title (T-318 #16). The
+  // reserved names are every pathed note under `_unpathed/` (not
+  // since-filtered: an unchanged one still owns its file).
+  const reservedUnpathed = (await store.queryNotes({ pathPrefix: `${UNPATHED_DIR}/`, limit: 1_000_000 }))
+    .filter((n) => n.path && fileNameKey(n.path).startsWith(`${UNPATHED_DIR}/`))
+    .map((n) => ({ relPath: `${n.path}.${n.extension ?? "md"}`, id: n.id }));
+  const unpathedNames = new UnpathedNames(sink.listNoteFiles?.(UNPATHED_DIR) ?? [], reservedUnpathed);
+
   for await (const note of iterateAllNotes(store)) {
     if (since && !shouldIncludeForSince(note, since)) continue;
     const portable = await noteToPortable(note, store);
-    let relPath = portableExportFilePath(portable);
+    let relPath = !portable.path && supportsInlineFrontmatter(portable.extension ?? "md")
+      ? unpathedNames.claim(portable)
+      : portableExportFilePath(portable);
 
     // Decide whether this note's filename needs disambiguation (vault#327).
     // Only meaningful when the sink is case-insensitive AND a prior note's
     // (path, ext) tuple already claimed the same lowercased filename slot.
-    // Pathless notes (`_unpathed/<id>.<ext>`) are immune by construction —
-    // their filename embeds the id, which is case-stable already.
+    // Pathless notes are immune: `UnpathedNames` compares names without
+    // letter case on every sink.
     if (!caseSensitive && portable.path) {
       const ext = portable.extension ?? "md";
       const key = `${portable.path.toLowerCase()}|${ext.toLowerCase()}`;
@@ -1192,6 +1373,11 @@ export async function exportVault(
       continue;
     }
     notesWritten++;
+    // This note's file under `_unpathed/` from an earlier export into the same
+    // folder (its old title, the id-named file older exports wrote, or the
+    // time before it had a path) goes, so the folder keeps one file per note.
+    unpathedNames.hold(relPath, portable.id);
+    for (const stale of unpathedNames.staleFiles(portable.id, relPath)) sink.removeText?.(stale);
 
     // Sidecar metadata write for non-frontmatter-compat extensions
     // (vault#328). The content file holds raw bytes (no YAML); the sidecar
@@ -1246,7 +1432,7 @@ export async function exportVault(
  *   - `<outDir>/.parachute/vault.yaml`
  *   - `<outDir>/.parachute/schemas/<tag>.yaml` for each tag that declares
  *     description/fields/relationships/parent_names.
- *   - `<outDir>/<note.path>.md` for each note (or `_unpathed/<id>.md`).
+ *   - `<outDir>/<note.path>.md` for each note (or `_unpathed/<title>.md`).
  *   - `<outDir>/.parachute/attachments/<id>/<basename>` for each attachment
  *     (only when `opts.assetsDir` is set; the sink's path-traversal guard
  *     rejects attachments whose source escapes assetsDir or whose dest would

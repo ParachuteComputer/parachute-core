@@ -2483,7 +2483,9 @@ describe("pathless markdown notes export under their title (T-318 #16)", async (
   const unpathedFiles = (outDir: string) => readdirSync(join(outDir, "_unpathed")).sort();
   const idIn = (outDir: string, name: string) =>
     parseFrontmatter(readFileSync(join(outDir, "_unpathed", name), "utf-8")).frontmatter.id;
-  /** What a round trip must keep: everything the vault stores for a note. */
+  /** What a round trip must keep: everything the vault stores for a note.
+   *  (Contents end in a newline: the export adds one when missing, for every
+   *  note, which is outside this change.) */
   const snapshot = async (s: SqliteStore, id: string) => {
     const n = await s.getNote(id);
     if (!n) return null;
@@ -2499,7 +2501,7 @@ describe("pathless markdown notes export under their title (T-318 #16)", async (
   };
 
   it("names the file after the note's title, and import restores it unpathed with the same id", async () => {
-    const note = await store.createNote("# Meeting with Sam\n\nAgenda: the garden plan.", {
+    const note = await store.createNote("# Meeting with Sam\n\nAgenda: the garden plan.\n", {
       tags: ["meeting"],
       metadata: { status: "draft" },
     });
@@ -2518,9 +2520,9 @@ describe("pathless markdown notes export under their title (T-318 #16)", async (
   });
 
   it("gives notes with the same title, in any letter case, distinct names", async () => {
-    const a = await store.createNote("# Ideas\none", { created_at: "2026-01-01T00:00:00.000Z" });
-    const b = await store.createNote("# ideas\ntwo", { created_at: "2026-01-02T00:00:00.000Z" });
-    const c = await store.createNote("Ideas", { created_at: "2026-01-03T00:00:00.000Z" });
+    const a = await store.createNote("# Ideas\none\n", { created_at: "2026-01-01T00:00:00.000Z" });
+    const b = await store.createNote("# ideas\ntwo\n", { created_at: "2026-01-02T00:00:00.000Z" });
+    const c = await store.createNote("Ideas\n", { created_at: "2026-01-03T00:00:00.000Z" });
     const outDir = join(tmpBase, "out");
     await exportVaultToDir(store, { outDir, exportedAt });
 
@@ -2533,11 +2535,11 @@ describe("pathless markdown notes export under their title (T-318 #16)", async (
 
   it("makes any title a safe, short file name; an empty note is Untitled", async () => {
     const cases: Array<[string, string]> = [
-      ['# Plan: a/b \\ c? *x* "y" <z> | w #tag [[link]] ^b', "Plan a b c x y z w tag link b.md"],
-      [".env notes", "env notes.md"],
-      ["CON", "CON_.md"],
-      ["# Café ☕ ünïcode", "Café ☕ ünïcode.md"],
-      ["trailing dots...", "trailing dots.md"],
+      ['# Plan: a/b \\ c? *x* "y" <z> | w #tag [[link]] ^b\n', "Plan a b c x y z w tag link b.md"],
+      [".env notes\n", "env notes.md"],
+      ["CON\n", "CON_.md"],
+      ["# Café ☕ ünïcode\n", "Café ☕ ünïcode.md"],
+      ["trailing dots...\n", "trailing dots.md"],
       ["", "Untitled.md"],
       ["   \n\n", "Untitled 2.md"],
     ];
@@ -2547,7 +2549,7 @@ describe("pathless markdown notes export under their title (T-318 #16)", async (
       const n = await store.createNote(content, { created_at: `2026-01-${String(day++).padStart(2, "0")}T00:00:00.000Z` });
       ids.push(n.id);
     }
-    const long = await store.createNote(`# ${"word ".repeat(100)}end`, { created_at: "2026-02-01T00:00:00.000Z" });
+    const long = await store.createNote(`# ${"word ".repeat(100)}end\n`, { created_at: "2026-02-01T00:00:00.000Z" });
     const outDir = join(tmpBase, "out");
     await exportVaultToDir(store, { outDir, exportedAt });
 
@@ -2560,8 +2562,8 @@ describe("pathless markdown notes export under their title (T-318 #16)", async (
   });
 
   it("never takes the file of a pathed note under _unpathed/", async () => {
-    const loose = await store.createNote("# Ideas\nloose", { created_at: "2026-01-01T00:00:00.000Z" });
-    const pathed = await store.createNote("filed", { path: "_unpathed/Ideas", created_at: "2026-01-02T00:00:00.000Z" });
+    const loose = await store.createNote("# Ideas\nloose\n", { created_at: "2026-01-01T00:00:00.000Z" });
+    const pathed = await store.createNote("filed\n", { path: "_unpathed/Ideas", created_at: "2026-01-02T00:00:00.000Z" });
     const outDir = join(tmpBase, "out");
     await exportVaultToDir(store, { outDir, exportedAt });
 
@@ -2573,17 +2575,17 @@ describe("pathless markdown notes export under their title (T-318 #16)", async (
 
   it("keeps one file per note when exporting again into an earlier export", async () => {
     const outDir = join(tmpBase, "out");
-    const kept = await store.createNote("# Garden\nbeds", { created_at: "2026-01-01T00:00:00.000Z" });
-    const moved = await store.createNote("# Draft\nv1", { created_at: "2026-01-02T00:00:00.000Z" });
+    const kept = await store.createNote("# Garden\nbeds\n", { created_at: "2026-01-01T00:00:00.000Z" });
+    const moved = await store.createNote("# Draft\nv1\n", { created_at: "2026-01-02T00:00:00.000Z" });
     await exportVaultToDir(store, { outDir, exportedAt });
     expect(unpathedFiles(outDir)).toEqual(["Draft.md", "Garden.md"]);
 
     // The title changes: the note's file moves, the old one goes.
     const cursor = new Date().toISOString();
     await Bun.sleep(5);
-    await store.updateNote(moved.id, { content: "# Seed order\nv2" });
+    await store.updateNote(moved.id, { content: "# Seed order\nv2\n" });
     // A new note takes an unchanged note's title: it must not overwrite that note's file.
-    const twin = await store.createNote("# Garden\nsecond");
+    const twin = await store.createNote("# Garden\nsecond\n");
     await exportVaultToDir(store, { outDir, exportedAt, since: cursor });
 
     expect(unpathedFiles(outDir)).toEqual(["Garden 2.md", "Garden.md", "Seed order.md"]);
@@ -2593,7 +2595,7 @@ describe("pathless markdown notes export under their title (T-318 #16)", async (
   });
 
   it("an export from before this change (_unpathed/<id>.md) imports as before, and re-exporting renames it", async () => {
-    const note = await store.createNote("# Old jot\nkept", { metadata: { mood: "calm" } });
+    const note = await store.createNote("# Old jot\nkept\n", { metadata: { mood: "calm" } });
     const outDir = join(tmpBase, "out");
     await exportVaultToDir(store, { outDir, exportedAt });
     // The old layout: the same bytes under the note's id.
