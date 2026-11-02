@@ -174,12 +174,12 @@ on it unchanged (46 pass, 0 fail, on the tarball and the npm install). What chan
   `revoke-token`, `version --json`, `parachute-vault create`) is unchanged. The new front door (`parachute help`,
   `setup --embedded`, `keys new`) maps onto the same code. On an embedded home the old names print no deprecation
   line and nothing is counted. `parachute changes --json` lists every old name and what replaced it.
-- **MCP: 11 tools, the old names as listed aliases.** `request-attachment-upload` and `-download` become
+- **MCP: 11 tools in all, with the old names listed as aliases.** `request-attachment-upload` and `-download` become
   `attachment-url`; `find-path` becomes `query-notes` with `path_between`; the tag tools become `manage-types`;
   `manage-token` becomes `manage-keys`. Every old name is still in `tools/list` (its description starts
   "deprecated"), so your allowlists in `agent-profiles.ts` keep working. Add `attachment-url` when you move, and
-  `manage-types` and `manage-keys` to the admin-only list (`lib.mjs:19`) so that check still covers them. The tool
-  list a write key sees shrinks from about 61k to 10k characters.
+  `manage-types` and `manage-keys` to the admin-only list (`lib.mjs:19`) so that check still covers them. A write
+  key's `tools/list` holds 12 entries, 9 tools and 3 aliases, in about 10k characters (61k on 0.8, 11 tools).
 - **Types and tags.** A tag with fields or parents is a type. Notes gain `types` (the types among their tags) next
   to `tags`, over REST and MCP; `tags` still lists every name. `tags: [...]` writes and `tag:` queries work as today.
 - **Keys.** Every token becomes a key with the same scopes; `parachute keys list` shows them. Verification is
