@@ -2540,6 +2540,7 @@ describe("pathless markdown notes export under their title (T-318 #16)", async (
       ["CON\n", "CON_.md"],
       ["# Café ☕ ünïcode\n", "Café ☕ ünïcode.md"],
       ["trailing dots...\n", "trailing dots.md"],
+      ["# Family 👨‍👩‍👧 trip\n", "Family 👨‍👩‍👧 trip.md"],
       ["", "Untitled.md"],
       ["   \n\n", "Untitled 2.md"],
     ];
@@ -2592,6 +2593,39 @@ describe("pathless markdown notes export under their title (T-318 #16)", async (
     expect(idIn(outDir, "Garden.md")).toBe(kept.id);
     expect(idIn(outDir, "Garden 2.md")).toBe(twin.id);
     await expectRoundTrip(outDir, [kept.id, moved.id, twin.id]);
+  });
+
+  it("a pathed note that takes a pathless note's earlier file in a --since export moves that note, never drops it", async () => {
+    const outDir = join(tmpBase, "out");
+    const loose = await store.createNote("# Ideas\nloose\n", { created_at: "2026-01-01T00:00:00.000Z" });
+    const other = await store.createNote("other\n", { created_at: "2026-01-02T00:00:00.000Z" });
+    await exportVaultToDir(store, { outDir, exportedAt });
+    expect(idIn(outDir, "Ideas.md")).toBe(loose.id);
+
+    const cursor = new Date().toISOString();
+    await Bun.sleep(5);
+    await store.updateNote(other.id, { path: "_unpathed/Ideas" });
+    await exportVaultToDir(store, { outDir, exportedAt, since: cursor });
+
+    expect(unpathedFiles(outDir)).toEqual(["Ideas 2.md", "Ideas.md"]);
+    expect(idIn(outDir, "Ideas.md")).toBe(other.id);
+    expect(idIn(outDir, "Ideas 2.md")).toBe(loose.id);
+    await expectRoundTrip(outDir, [loose.id, other.id]);
+  });
+
+  it("never removes a file outside the export through a linked _unpathed/ folder", async () => {
+    const outDir = join(tmpBase, "out");
+    const outside = join(tmpBase, "outside");
+    mkdirSync(outside, { recursive: true });
+    mkdirSync(outDir, { recursive: true });
+    symlinkSync(outside, join(outDir, "_unpathed"));
+    const note = await store.createNote("# Draft\nv1\n");
+    await exportVaultToDir(store, { outDir, exportedAt });
+    expect(existsSync(join(outside, "Draft.md"))).toBe(true);
+
+    await store.updateNote(note.id, { content: "# Final\nv2\n" });
+    await exportVaultToDir(store, { outDir, exportedAt });
+    expect(existsSync(join(outside, "Draft.md"))).toBe(true);
   });
 
   it("an export from before this change (_unpathed/<id>.md) imports as before, and re-exporting renames it", async () => {
