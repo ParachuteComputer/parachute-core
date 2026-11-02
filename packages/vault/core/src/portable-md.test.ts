@@ -2464,3 +2464,145 @@ describe("pruneOrphans", async () => {
     expect(existsSync(join(schemasDir, "with-schema.yaml"))).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Pathless notes export under a readable name (T-318 #16)
+// ---------------------------------------------------------------------------
+
+describe("pathless markdown notes export under their title (T-318 #16)", async () => {
+  const tmpBase = join(tmpdir(), "parachute-portable-unpathed-names");
+  let store: SqliteStore;
+  const exportedAt = "2026-05-13T00:00:00.000Z";
+
+  beforeEach(() => {
+    try { rmSync(tmpBase, { recursive: true }); } catch {}
+    mkdirSync(tmpBase, { recursive: true });
+    store = new SqliteStore(new Database(":memory:"));
+  });
+
+  const unpathedFiles = (outDir: string) => readdirSync(join(outDir, "_unpathed")).sort();
+  const idIn = (outDir: string, name: string) =>
+    parseFrontmatter(readFileSync(join(outDir, "_unpathed", name), "utf-8")).frontmatter.id;
+  /** What a round trip must keep: everything the vault stores for a note. */
+  const snapshot = async (s: SqliteStore, id: string) => {
+    const n = await s.getNote(id);
+    if (!n) return null;
+    return { id: n.id, path: n.path ?? null, content: n.content, tags: n.tags, metadata: n.metadata, createdAt: n.createdAt, updatedAt: n.updatedAt };
+  };
+  /** Import `outDir` into an empty vault and check every listed note came back unchanged. */
+  const expectRoundTrip = async (outDir: string, ids: string[]) => {
+    const fresh = new SqliteStore(new Database(":memory:"));
+    const stats = await importPortableVault(fresh, { inDir: outDir });
+    expect(stats.skipped_duplicate_ids).toEqual([]);
+    for (const id of ids) expect(await snapshot(fresh, id)).toEqual(await snapshot(store, id));
+    return fresh;
+  };
+
+  it("names the file after the note's title, and import restores it unpathed with the same id", async () => {
+    const note = await store.createNote("# Meeting with Sam\n\nAgenda: the garden plan.", {
+      tags: ["meeting"],
+      metadata: { status: "draft" },
+    });
+    const outDir = join(tmpBase, "out");
+    await exportVaultToDir(store, { outDir, exportedAt });
+
+    expect(unpathedFiles(outDir)).toEqual(["Meeting with Sam.md"]);
+    expect(idIn(outDir, "Meeting with Sam.md")).toBe(note.id);
+    const fresh = await expectRoundTrip(outDir, [note.id]);
+
+    // And the imported vault exports to the same bytes.
+    const again = join(tmpBase, "again");
+    await exportVaultToDir(fresh, { outDir: again, exportedAt });
+    expect(readFileSync(join(again, "_unpathed", "Meeting with Sam.md"), "utf-8"))
+      .toBe(readFileSync(join(outDir, "_unpathed", "Meeting with Sam.md"), "utf-8"));
+  });
+
+  it("gives notes with the same title, in any letter case, distinct names", async () => {
+    const a = await store.createNote("# Ideas\none", { created_at: "2026-01-01T00:00:00.000Z" });
+    const b = await store.createNote("# ideas\ntwo", { created_at: "2026-01-02T00:00:00.000Z" });
+    const c = await store.createNote("Ideas", { created_at: "2026-01-03T00:00:00.000Z" });
+    const outDir = join(tmpBase, "out");
+    await exportVaultToDir(store, { outDir, exportedAt });
+
+    expect(unpathedFiles(outDir)).toEqual(["Ideas 3.md", "Ideas.md", "ideas 2.md"]);
+    expect(idIn(outDir, "Ideas.md")).toBe(a.id);
+    expect(idIn(outDir, "ideas 2.md")).toBe(b.id);
+    expect(idIn(outDir, "Ideas 3.md")).toBe(c.id);
+    await expectRoundTrip(outDir, [a.id, b.id, c.id]);
+  });
+
+  it("makes any title a safe, short file name; an empty note is Untitled", async () => {
+    const cases: Array<[string, string]> = [
+      ['# Plan: a/b \\ c? *x* "y" <z> | w #tag [[link]] ^b', "Plan a b c x y z w tag link b.md"],
+      [".env notes", "env notes.md"],
+      ["CON", "CON_.md"],
+      ["# Café ☕ ünïcode", "Café ☕ ünïcode.md"],
+      ["trailing dots...", "trailing dots.md"],
+      ["", "Untitled.md"],
+      ["   \n\n", "Untitled 2.md"],
+    ];
+    const ids: string[] = [];
+    let day = 1;
+    for (const [content] of cases) {
+      const n = await store.createNote(content, { created_at: `2026-01-${String(day++).padStart(2, "0")}T00:00:00.000Z` });
+      ids.push(n.id);
+    }
+    const long = await store.createNote(`# ${"word ".repeat(100)}end`, { created_at: "2026-02-01T00:00:00.000Z" });
+    const outDir = join(tmpBase, "out");
+    await exportVaultToDir(store, { outDir, exportedAt });
+
+    cases.forEach(([, name], i) => expect(idIn(outDir, name)).toBe(ids[i]));
+    const longName = unpathedFiles(outDir).find((f) => f.startsWith("word "))!;
+    expect(longName).toMatch(/^(word )+word\.md$/);
+    expect(Buffer.byteLength(longName)).toBeLessThanOrEqual(100);
+    expect(unpathedFiles(outDir)).toHaveLength(cases.length + 1);
+    await expectRoundTrip(outDir, [...ids, long.id]);
+  });
+
+  it("never takes the file of a pathed note under _unpathed/", async () => {
+    const loose = await store.createNote("# Ideas\nloose", { created_at: "2026-01-01T00:00:00.000Z" });
+    const pathed = await store.createNote("filed", { path: "_unpathed/Ideas", created_at: "2026-01-02T00:00:00.000Z" });
+    const outDir = join(tmpBase, "out");
+    await exportVaultToDir(store, { outDir, exportedAt });
+
+    expect(unpathedFiles(outDir)).toEqual(["Ideas 2.md", "Ideas.md"]);
+    expect(idIn(outDir, "Ideas.md")).toBe(pathed.id);
+    expect(idIn(outDir, "Ideas 2.md")).toBe(loose.id);
+    await expectRoundTrip(outDir, [loose.id, pathed.id]);
+  });
+
+  it("keeps one file per note when exporting again into an earlier export", async () => {
+    const outDir = join(tmpBase, "out");
+    const kept = await store.createNote("# Garden\nbeds", { created_at: "2026-01-01T00:00:00.000Z" });
+    const moved = await store.createNote("# Draft\nv1", { created_at: "2026-01-02T00:00:00.000Z" });
+    await exportVaultToDir(store, { outDir, exportedAt });
+    expect(unpathedFiles(outDir)).toEqual(["Draft.md", "Garden.md"]);
+
+    // The title changes: the note's file moves, the old one goes.
+    const cursor = new Date().toISOString();
+    await Bun.sleep(5);
+    await store.updateNote(moved.id, { content: "# Seed order\nv2" });
+    // A new note takes an unchanged note's title: it must not overwrite that note's file.
+    const twin = await store.createNote("# Garden\nsecond");
+    await exportVaultToDir(store, { outDir, exportedAt, since: cursor });
+
+    expect(unpathedFiles(outDir)).toEqual(["Garden 2.md", "Garden.md", "Seed order.md"]);
+    expect(idIn(outDir, "Garden.md")).toBe(kept.id);
+    expect(idIn(outDir, "Garden 2.md")).toBe(twin.id);
+    await expectRoundTrip(outDir, [kept.id, moved.id, twin.id]);
+  });
+
+  it("an export from before this change (_unpathed/<id>.md) imports as before, and re-exporting renames it", async () => {
+    const note = await store.createNote("# Old jot\nkept", { metadata: { mood: "calm" } });
+    const outDir = join(tmpBase, "out");
+    await exportVaultToDir(store, { outDir, exportedAt });
+    // The old layout: the same bytes under the note's id.
+    const legacy = join(outDir, "_unpathed", `${note.id}.md`);
+    writeFileSync(legacy, readFileSync(join(outDir, "_unpathed", "Old jot.md"), "utf-8"));
+    rmSync(join(outDir, "_unpathed", "Old jot.md"));
+    await expectRoundTrip(outDir, [note.id]);
+
+    await exportVaultToDir(store, { outDir, exportedAt });
+    expect(unpathedFiles(outDir)).toEqual(["Old jot.md"]);
+  });
+});
