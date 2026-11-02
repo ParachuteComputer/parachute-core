@@ -4,7 +4,7 @@
  * The shipped layout writes them under `.parachute/attachments/<id>/`. Obsidian
  * (and any tool that hides dot-folders) never indexes that folder, so a person
  * who opens their export as an Obsidian vault sees broken images. Two visible
- * layouts: `folder` (`_attachments/<id>/<file>`) and `beside-note`
+ * layouts: `folder` (`_attachments/<storage path>`) and `beside-note`
  * (`<note> files/<file>`). Either one must still round-trip: the imported body
  * is the stored body, the binary comes back, and nothing export-only reaches
  * an attachment row. Old (sidecar) exports keep importing; those are pinned in
@@ -155,19 +155,41 @@ describe("portable-md visible attachment layouts (T-318 decision A)", () => {
     expect(existsSync(join(destAssets, "2026-10-30", "p1.png"))).toBe(false);
   });
 
-  it("folder: the mirror sweep removes an orphaned attachment folder and keeps live ones", async () => {
+  it("folder: files sit at their storage path; notes sharing a stored file share one copy", async () => {
+    // A third file whose storage path differs from IMG only by case: on a
+    // case-insensitive disk it would overwrite IMG, so it goes to its id folder.
+    const upper = IMG.replace("garden", "GARDEN");
+    writeFileSync(join(assets, upper), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x03]));
+    const third = await store.addAttachment(ROOT_ID, upper, "image/png");
+    const out = join(tmpBase, "out");
+    const stats = await exportVaultToDir(store, { outDir: out, assetsDir: assets, exportedAt: AT, attachmentLayout: "folder" });
+    expect(stats.attachments).toBe(4); // per ref, as in every layout
+    const files = (await Array.fromAsync(new Bun.Glob("**/*").scan({ cwd: join(out, ATTACHMENTS_FOLDER) }))).sort();
+    expect(files).toEqual([`${third.id}/${upper.split("/")[1]}`, IMG, IMG_2].sort());
+    expect(readFileSync(join(out, ATTACHMENTS_FOLDER, IMG))).toEqual(readFileSync(join(assets, IMG)));
+  });
+
+  it("folder: the mirror sweep removes files of deleted attachments and keeps live ones", async () => {
     const out = join(tmpBase, "mirror");
     await exportVaultToDir(store, { outDir: out, assetsDir: assets, exportedAt: AT, attachmentLayout: "folder" });
-    const live = (await store.getAttachments(SUB_ID)).map((a) => a.id);
+    // IMG_2's row is gone from the vault; IMG is still attached.
+    const live = (await store.getAttachments(ROOT_ID)).map((a) => a.id);
     const stats = pruneOrphans({
       outDir: out,
       validNoteIds: new Set([ROOT_ID, SUB_ID]),
       validTagNames: new Set(),
       validAttachmentIds: new Set(live),
+      validAttachmentPaths: new Set([IMG]),
     });
-    expect(stats.attachment_dirs_removed).toBe(1); // the root note's attachment
+    expect(stats.attachment_files_removed).toBe(1);
     expect(stats.notes_removed).toBe(0);
     expect(stats.unparseable_files).toEqual([]);
-    for (const id of live) expect(existsSync(join(out, ATTACHMENTS_FOLDER, id))).toBe(true);
+    expect(existsSync(join(out, ATTACHMENTS_FOLDER, IMG))).toBe(true);
+    expect(existsSync(join(out, ATTACHMENTS_FOLDER, "2026-10-31"))).toBe(false); // emptied folder removed
+    // Without the path set the folder is left alone.
+    await exportVaultToDir(store, { outDir: out, assetsDir: assets, exportedAt: AT, attachmentLayout: "folder" });
+    const untouched = pruneOrphans({ outDir: out, validNoteIds: new Set([ROOT_ID, SUB_ID]), validTagNames: new Set(), validAttachmentIds: new Set() });
+    expect(untouched.attachment_files_removed).toBe(0);
+    expect(existsSync(join(out, ATTACHMENTS_FOLDER, IMG_2))).toBe(true);
   });
 });

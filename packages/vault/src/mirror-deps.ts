@@ -66,21 +66,27 @@ export function buildMirrorDeps(vaultName: string): MirrorDeps {
       );
       // Attachment IDs across all notes (the prune sweep keys on id).
       const validAttachmentIds = new Set<string>();
+      const validAttachmentPaths = new Set<string>();
       for (const note of allNotes) {
         const atts = await store.getAttachments(note.id);
-        for (const a of atts) validAttachmentIds.add(a.id);
+        for (const a of atts) {
+          validAttachmentIds.add(a.id);
+          validAttachmentPaths.add(a.path);
+        }
       }
       const stats = pruneOrphans({
         outDir,
         validNoteIds,
         validTagNames,
         validAttachmentIds,
+        validAttachmentPaths,
       });
       return {
         notes_removed: stats.notes_removed,
         sidecars_removed: stats.sidecars_removed,
         schemas_removed: stats.schemas_removed,
-        attachment_dirs_removed: stats.attachment_dirs_removed,
+        // Prototype: `_attachments/` files count with the sidecar's id folders.
+        attachment_dirs_removed: stats.attachment_dirs_removed + stats.attachment_files_removed,
       };
     },
     firstChangedNoteTitle: async (cursor) => {

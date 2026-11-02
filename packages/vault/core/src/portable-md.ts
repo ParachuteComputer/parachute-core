@@ -31,7 +31,7 @@
  *     vault.yaml              # vault meta + export format version
  *     schemas/<tag>.yaml      # per-tag: description, fields, relationships, parent_names
  *     attachments/<att-id>/<filename>   # binary files, `sidecar` layout (PR 2; #308)
- *   _attachments/<att-id>/<filename>     # binary files, `folder` layout (default)
+ *   _attachments/<storage path>          # binary files, `folder` layout (default)
  *   <note.path>.md            # one file per note
  * ```
  *
@@ -54,8 +54,8 @@
  *   - id: att_01HGZB...
  *     path: 2026-05-12/audio.m4a
  *     mime_type: audio/mp4
- *   - body_link: ../_attachments/att_01HGZC.../map.png
- *     file: _attachments/att_01HGZC.../map.png  # where the binary went
+ *   - body_link: ../_attachments/2026-05-12/map.png
+ *     file: _attachments/2026-05-12/map.png  # where the binary went
  *     id: att_01HGZC...       # body_link: the target the export wrote for
  *     path: 2026-05-12/map.png  # this note's /api/storage/ links (T-318 #8)
  *     mime_type: image/png
@@ -582,7 +582,9 @@ function attachmentSidecarPath(att: { id: string; path: string }): string {
  * Where an export puts attachment binaries (T-318 decision A, prototype).
  *   - `sidecar`: `.parachute/attachments/<id>/<basename>` (format v1 as
  *     shipped). Obsidian and other dot-folder-hiding tools never see it.
- *   - `folder`: `_attachments/<id>/<basename>`, a visible top-level folder.
+ *   - `folder`: `_attachments/<storage path>` (the vault's own attachment
+ *     path, e.g. `_attachments/2026-11-01/<file>`), a visible top-level
+ *     folder; `_attachments/<id>/<basename>` when that path can't be used.
  *   - `beside-note`: `<note file without extension> files/<basename>`, next to
  *     the note that holds the attachment row.
  */
@@ -596,39 +598,57 @@ export const DEFAULT_ATTACHMENT_LAYOUT: AttachmentLayout = "folder";
 
 /**
  * The export-root-relative POSIX path an attachment's binary is written to.
- * `taken` holds the lowercased `beside-note` names already used by this note
- * (an id prefix disambiguates a second file with the same basename, also on
- * a case-insensitive filesystem).
+ * `noteTaken` holds the lowercased `beside-note` names this note already uses
+ * (an id prefix disambiguates a repeated basename, also on a case-insensitive
+ * filesystem). `folderOwners` maps each lowercased `folder` path this export
+ * already assigned to the storage path that owns it: the same storage path
+ * shares one file; a different one that would collide (only by case) or a
+ * storage path that is not a plain relative path goes to `<id>/<basename>`.
  */
 function exportedAttachmentPath(
   layout: AttachmentLayout,
   noteRelPath: string,
   att: { id: string; path: string },
-  taken: Set<string>,
+  noteTaken: Set<string>,
+  folderOwners: Map<string, string>,
 ): string {
   const name = basename(att.path);
   if (layout === "sidecar") return attachmentSidecarPath(att).split(pathSep).join("/");
-  if (layout === "folder") return `${ATTACHMENTS_FOLDER}/${att.id}/${name}`;
+  if (layout === "folder") {
+    const byPath = plainExportPath(`${ATTACHMENTS_FOLDER}/${att.path}`);
+    const owner = byPath === undefined ? undefined : folderOwners.get(byPath.toLowerCase());
+    if (byPath !== undefined && (owner === undefined || owner === att.path)) {
+      folderOwners.set(byPath.toLowerCase(), att.path);
+      return byPath;
+    }
+    return `${ATTACHMENTS_FOLDER}/${att.id}/${name}`;
+  }
   const dir = `${noteRelPath.slice(0, noteRelPath.length - extname(noteRelPath).length)} files`;
-  const unique = taken.has(`${dir}/${name}`.toLowerCase()) ? `${att.id}-${name}` : name;
-  taken.add(`${dir}/${unique}`.toLowerCase());
+  const unique = noteTaken.has(`${dir}/${name}`.toLowerCase()) ? `${att.id}-${name}` : name;
+  noteTaken.add(`${dir}/${unique}`.toLowerCase());
   return `${dir}/${unique}`;
 }
 
 /**
- * A ref's recorded `file`, when it is a plain export-relative POSIX path
- * (no absolute path, no `.`/`..`/empty segment, no backslash, nothing in a
- * dot-folder). Anything else is ignored (import falls back to the sidecar
- * path), so a hand-edited value can never point outside the export's files.
+ * `value` when it is a plain export-relative POSIX path (no absolute path,
+ * no `.`/`..`/empty segment, no backslash or NUL, nothing in a dot-folder).
+ */
+function plainExportPath(value: unknown): string | undefined {
+  if (typeof value !== "string" || value === "" || value.includes("\\") || value.includes("\0")) return undefined;
+  if (value.split("/").some((seg) => seg === "" || seg === "." || seg === "..")) return undefined;
+  // Never a sidecar (or other dot-folder) file: those are not attachment copies.
+  if (isExcludedPath(value)) return undefined;
+  return value;
+}
+
+/**
+ * A ref's recorded `file`, when it is a {@link plainExportPath}. Anything else
+ * is ignored (import falls back to the sidecar path), so a hand-edited value
+ * can never point outside the export's files.
  */
 function recordedAttachmentFile(att: unknown): string | undefined {
   if (!att || typeof att !== "object") return undefined;
-  const file = (att as Record<string, unknown>).file;
-  if (typeof file !== "string" || file === "" || file.includes("\\") || file.includes("\0")) return undefined;
-  if (file.split("/").some((seg) => seg === "" || seg === "." || seg === "..")) return undefined;
-  // Never a sidecar (or other dot-folder) file: those are not attachment copies.
-  if (isExcludedPath(file)) return undefined;
-  return file;
+  return plainExportPath((att as Record<string, unknown>).file);
 }
 
 /** Export-relative path the import reads an attachment's binary from. */
@@ -1152,6 +1172,8 @@ export async function exportVault(
   // (incremental export).
   const since = opts.since;
   const layout = opts.attachmentLayout ?? DEFAULT_ATTACHMENT_LAYOUT;
+  const folderOwners = new Map<string, string>();
+  const copiedFolderFiles = new Set<string>();
   const caseSensitive = sink.caseSensitive;
   let notesWritten = 0;
   let attachmentsWritten = 0;
@@ -1244,13 +1266,16 @@ export async function exportVault(
     // binaries in the export (unreferenced, harmless).
     const writtenAttachments = new Map<string, string>();
     if (sink.attachmentsEnabled && portable.attachments && portable.attachments.length > 0) {
-      const taken = new Set<string>();
+      const noteTaken = new Set<string>();
       for (const att of portable.attachments) {
-        // Dest per `layout` (see AttachmentLayout). The id directory (or, beside
-        // the note, an id prefix on a repeat) keeps attachments with the same
-        // basename from colliding; the basename keeps it human-readable.
-        const dest = exportedAttachmentPath(layout, relPath, att, taken);
-        const copyResult = sink.copyAttachment(att.path, dest);
+        // Dest per `layout` (see AttachmentLayout). The id directory, storage
+        // path or (beside the note) id prefix on a repeat keeps different
+        // binaries apart; the basename keeps it human-readable.
+        const dest = exportedAttachmentPath(layout, relPath, att, noteTaken, folderOwners);
+        // In the `folder` layout notes that attach the same stored file share
+        // one copy (counted per ref, like the other layouts).
+        const copyResult = copiedFolderFiles.has(dest) ? { ok: true as const } : sink.copyAttachment(att.path, dest);
+        if (copyResult.ok && layout === "folder") copiedFolderFiles.add(dest);
         if (copyResult.ok) {
           attachmentsWritten++;
           writtenAttachments.set(att.id, dest);
@@ -1346,7 +1371,7 @@ export async function exportVault(
  *     description/fields/relationships/parent_names.
  *   - `<outDir>/<note.path>.md` for each note (or `_unpathed/<id>.md`).
  *   - each attachment's binary per `opts.attachmentLayout` (default
- *     `_attachments/<id>/<basename>`; only when `opts.assetsDir` is set; the sink's path-traversal guard
+ *     `_attachments/<storage path>`; only when `opts.assetsDir` is set; the sink's path-traversal guard
  *     rejects attachments whose source escapes assetsDir or whose dest would
  *     escape outDir).
  *
@@ -1390,6 +1415,8 @@ export interface PruneOrphansStats {
   schemas_removed: number;
   /** Attachment directories removed (under `.parachute/attachments/`). */
   attachment_dirs_removed: number;
+  /** Attachment files removed (under `_attachments/`, the `folder` layout). */
+  attachment_files_removed: number;
   /**
    * Files we couldn't parse / classify. Surfaced for operator audit;
    * the sweep doesn't touch them. Empty when everything classified
@@ -1419,6 +1446,13 @@ export interface PruneOrphansOptions {
   validTagNames: Set<string>;
   /** Attachment IDs that should be kept (other dirs under `.parachute/attachments/` get removed). */
   validAttachmentIds: Set<string>;
+  /**
+   * Attachment storage paths that should be kept. The `folder` layout writes
+   * `_attachments/<storage path>` (or `_attachments/<id>/<basename>`); with
+   * this set, other files there are removed. Without it `_attachments/` is
+   * left alone.
+   */
+  validAttachmentPaths?: Set<string>;
   /**
    * Override `extension`-based content-file extension recognition. The
    * default treats `.md` and `.mdx` as having inline frontmatter (with
@@ -1462,6 +1496,7 @@ export function pruneOrphans(opts: PruneOrphansOptions): PruneOrphansStats {
     sidecars_removed: 0,
     schemas_removed: 0,
     attachment_dirs_removed: 0,
+    attachment_files_removed: 0,
     unparseable_files: [],
   };
 
@@ -1692,9 +1727,9 @@ export function pruneOrphans(opts: PruneOrphansOptions): PruneOrphansStats {
     }
   }
 
-  // ---- 4. Attachment directories (sidecar and `folder` layouts) ----
-  // `beside-note` files are not swept here (prototype gap).
-  for (const attachmentsRoot of [join(sidecarRoot, "attachments"), join(outDir, ATTACHMENTS_FOLDER)]) {
+  // ---- 4. Attachment directories (sidecar layout) ----
+  {
+    const attachmentsRoot = join(sidecarRoot, "attachments");
     if (existsSync(attachmentsRoot)) {
       try {
         for (const entry of readdirSync(attachmentsRoot)) {
@@ -1727,6 +1762,48 @@ export function pruneOrphans(opts: PruneOrphansOptions): PruneOrphansStats {
           reason: `attachments walk failed: ${(err as Error).message ?? err}`,
         });
       }
+    }
+  }
+
+  // ---- 5. Attachment files (`folder` layout) ----
+  // A file stays when its path under `_attachments/` is a live storage path
+  // or it sits in a live attachment's id folder. Emptied folders go too.
+  // `beside-note` files are not swept (prototype gap).
+  const folderRoot = join(outDir, ATTACHMENTS_FOLDER);
+  const validPaths = opts.validAttachmentPaths;
+  if (validPaths && existsSync(folderRoot)) {
+    const sweep = (dir: string): boolean => {
+      let empty = true;
+      for (const entry of readdirSync(dir)) {
+        const full = join(dir, entry);
+        let stat;
+        try {
+          stat = statSync(full);
+        } catch (err) {
+          stats.unparseable_files.push({ path: full, reason: `stat failed: ${(err as Error).message ?? err}` });
+          empty = false;
+          continue;
+        }
+        if (stat.isDirectory()) {
+          if (sweep(full)) safeRm(full, () => {}, { recursive: true });
+          else empty = false;
+          continue;
+        }
+        const rel = relative(folderRoot, full).split(pathSep).join("/");
+        if (validPaths.has(rel) || opts.validAttachmentIds.has(rel.split("/")[0]!)) {
+          empty = false;
+          continue;
+        }
+        safeRm(full, () => {
+          stats.attachment_files_removed++;
+        });
+      }
+      return empty;
+    };
+    try {
+      sweep(folderRoot);
+    } catch (err) {
+      stats.unparseable_files.push({ path: folderRoot, reason: `attachments walk failed: ${(err as Error).message ?? err}` });
     }
   }
 
