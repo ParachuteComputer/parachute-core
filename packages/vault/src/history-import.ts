@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { isNoteIdShape } from "../core/src/ulid.ts";
 import { applyImportedNote, beginImportRun, canonicalJson, importObservationDigest, importTargetDigest, readImportReceipt, type ImportedObservation, type ImportRun } from "../core/src/history-import.ts";
 import { hashContent, resolveHistoryPolicy, VERSION_MAX_BYTES, type HistoryPolicy } from "../core/src/history.ts";
-import { fromExportedAttachmentLinks } from "../core/src/portable-md.ts";
+import { ATTACHMENTS_FOLDER, fromExportedAttachmentLinks } from "../core/src/portable-md.ts";
 import { applyConnectionPragmas, initSchema } from "../core/src/schema.ts";
 import { DEFAULT_PORT, readGlobalConfig, readVaultConfig, vaultDbPath, vaultDir } from "./config.ts";
 import { checkHealth } from "./health.ts";
@@ -215,7 +215,7 @@ export function stageArchive(repo: string, tip: string, stage: Database, inputSe
       } catch (error) { failure(entry, error, meta?.id ?? entry.path.split("/").pop()?.slice(0, -5)); }
     }
     for (const entry of entries) {
-      if (entry.path.startsWith(".parachute/") || entry.path.startsWith(".doctor/") || entry.path === ".gitkeep" || used.has(entry.path)) continue;
+      if (entry.path.startsWith(".parachute/") || entry.path.startsWith(`${ATTACHMENTS_FOLDER}/`) || entry.path.startsWith(".doctor/") || entry.path === ".gitkeep" || used.has(entry.path)) continue;
       if (!/\.(md|mdx)$/.test(entry.path)) { stage.prepare("INSERT INTO issues VALUES(?,?,?)").run(commit, entry.path, "unclassified_file"); continue; }
       let meta: Record<string, unknown> | undefined;
       try {
@@ -227,7 +227,7 @@ export function stageArchive(repo: string, tip: string, stage: Database, inputSe
           // Mirror commits are exports (T-318 #8): undo the attachment links the
           // export rewrote, so a staged version is the body the vault stored.
           const extension = typeof meta.extension === "string" ? meta.extension : extname(entry.path).slice(1);
-          const body = Array.isArray(meta.attachments) ? fromExportedAttachmentLinks(parsed.content, meta.attachments, extension).content : parsed.content;
+          const body = Array.isArray(meta.attachments) ? fromExportedAttachmentLinks(parsed.content, meta.attachments, extension, entry.path).content : parsed.content;
           const { id, row, state } = parseObservation(meta, body, entry);
           parsedPut.run(entry.hash, id, state, JSON.stringify(row));
           collect(id, state, () => JSON.parse((parsedBody.get(entry.hash) as { row_json: string }).row_json), { git_path: entry.path, blob: entry.hash });

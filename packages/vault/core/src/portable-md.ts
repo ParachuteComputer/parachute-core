@@ -30,7 +30,8 @@
  *   .parachute/
  *     vault.yaml              # vault meta + export format version
  *     schemas/<tag>.yaml      # per-tag: description, fields, relationships, parent_names
- *     attachments/<att-id>/<filename>   # binary files (PR 2; #308)
+ *     attachments/<att-id>/<filename>   # binary files, `sidecar` layout (PR 2; #308)
+ *   _attachments/<att-id>/<filename>     # binary files, `folder` layout (default)
  *   <note.path>.md            # one file per note
  * ```
  *
@@ -53,7 +54,8 @@
  *   - id: att_01HGZB...
  *     path: 2026-05-12/audio.m4a
  *     mime_type: audio/mp4
- *   - body_link: ../.parachute/attachments/att_01HGZC.../map.png
+ *   - body_link: ../_attachments/att_01HGZC.../map.png
+ *     file: _attachments/att_01HGZC.../map.png  # where the binary went
  *     id: att_01HGZC...       # body_link: the target the export wrote for
  *     path: 2026-05-12/map.png  # this note's /api/storage/ links (T-318 #8)
  *     mime_type: image/png
@@ -200,6 +202,15 @@ export interface PortableAttachmentRef {
    * it (and keep the relative links), so the format version stays 1.
    */
   body_link?: string;
+  /**
+   * Export-only (T-318 decision A). The export-root-relative path the binary
+   * was copied to, written when the layout is not the legacy sidecar one
+   * (`.parachute/attachments/<id>/<basename>`, which import derives from the
+   * id). Import reads the binary from here and drops the key. An older
+   * importer ignores it and looks in the sidecar, so it restores the rows
+   * but reports the binaries missing.
+   */
+  file?: string;
 }
 
 /** Vault-level metadata in `.parachute/vault.yaml`. */
@@ -568,18 +579,80 @@ function attachmentSidecarPath(att: { id: string; path: string }): string {
 }
 
 /**
+ * Where an export puts attachment binaries (T-318 decision A, prototype).
+ *   - `sidecar`: `.parachute/attachments/<id>/<basename>` (format v1 as
+ *     shipped). Obsidian and other dot-folder-hiding tools never see it.
+ *   - `folder`: `_attachments/<id>/<basename>`, a visible top-level folder.
+ *   - `beside-note`: `<note file without extension> files/<basename>`, next to
+ *     the note that holds the attachment row.
+ */
+export type AttachmentLayout = "sidecar" | "folder" | "beside-note";
+
+/** The visible top-level folder of the `folder` layout. The underscore keeps
+ *  it apart from a user folder named "attachments" (and matches `_unpathed`). */
+export const ATTACHMENTS_FOLDER = "_attachments";
+
+export const DEFAULT_ATTACHMENT_LAYOUT: AttachmentLayout = "folder";
+
+/**
+ * The export-root-relative POSIX path an attachment's binary is written to.
+ * `taken` holds the lowercased `beside-note` names already used by this note
+ * (an id prefix disambiguates a second file with the same basename, also on
+ * a case-insensitive filesystem).
+ */
+function exportedAttachmentPath(
+  layout: AttachmentLayout,
+  noteRelPath: string,
+  att: { id: string; path: string },
+  taken: Set<string>,
+): string {
+  const name = basename(att.path);
+  if (layout === "sidecar") return attachmentSidecarPath(att).split(pathSep).join("/");
+  if (layout === "folder") return `${ATTACHMENTS_FOLDER}/${att.id}/${name}`;
+  const dir = `${noteRelPath.slice(0, noteRelPath.length - extname(noteRelPath).length)} files`;
+  const unique = taken.has(`${dir}/${name}`.toLowerCase()) ? `${att.id}-${name}` : name;
+  taken.add(`${dir}/${unique}`.toLowerCase());
+  return `${dir}/${unique}`;
+}
+
+/**
+ * A ref's recorded `file`, when it is a plain export-relative POSIX path
+ * (no absolute path, no `.`/`..`/empty segment, no backslash, nothing in a
+ * dot-folder). Anything else is ignored (import falls back to the sidecar
+ * path), so a hand-edited value can never point outside the export's files.
+ */
+function recordedAttachmentFile(att: unknown): string | undefined {
+  if (!att || typeof att !== "object") return undefined;
+  const file = (att as Record<string, unknown>).file;
+  if (typeof file !== "string" || file === "" || file.includes("\\") || file.includes("\0")) return undefined;
+  if (file.split("/").some((seg) => seg === "" || seg === "." || seg === "..")) return undefined;
+  // Never a sidecar (or other dot-folder) file: those are not attachment copies.
+  if (isExcludedPath(file)) return undefined;
+  return file;
+}
+
+/** Export-relative path the import reads an attachment's binary from. */
+function attachmentSourcePath(att: PortableAttachmentRef): string {
+  return recordedAttachmentFile(att) ?? attachmentSidecarPath(att);
+}
+
+/**
  * The markdown link target, from the note file at export-relative
- * `noteRelPath`, to an attachment's sidecar file. Each segment is
+ * `noteRelPath`, to the export-relative file `filePath`. Each segment is
  * percent-encoded (and `(`/`)` too) so the target is one CommonMark link
  * destination; a reader decodes it back to the file path.
  */
-function relativeAttachmentTarget(noteRelPath: string, att: { id: string; path: string }): string {
-  const sidecar = attachmentSidecarPath(att).split(pathSep).join("/");
+function relativeLinkTarget(noteRelPath: string, filePath: string): string {
   return posix
-    .relative(posix.dirname(posix.normalize(noteRelPath)), sidecar)
+    .relative(posix.dirname(posix.normalize(noteRelPath)), filePath)
     .split("/")
     .map((s) => encodeURIComponent(s).replace(/[()]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`))
     .join("/");
+}
+
+/** {@link relativeLinkTarget} to an attachment's legacy sidecar file. */
+function relativeAttachmentTarget(noteRelPath: string, att: { id: string; path: string }): string {
+  return relativeLinkTarget(noteRelPath, attachmentSidecarPath(att).split(pathSep).join("/"));
 }
 
 /** Whether a note of this extension gets its attachment links swapped. */
@@ -599,15 +672,16 @@ function hasMarkdownBody(extension: string | undefined): boolean {
 function withRelativeAttachmentLinks(
   note: PortableNote,
   noteRelPath: string,
-  writtenIds: ReadonlySet<string>,
+  written: ReadonlyMap<string, string>,
 ): PortableNote {
   if (!note.attachments || !hasMarkdownBody(note.extension)) return note;
   let content = note.content;
   let changed = false;
   const attachments = note.attachments.map((att) => {
-    if (!writtenIds.has(att.id)) return att;
+    const file = written.get(att.id);
+    if (file === undefined) return att;
     const from = `](${STORAGE_URL_PREFIX}${att.path})`;
-    const target = relativeAttachmentTarget(noteRelPath, att);
+    const target = relativeLinkTarget(noteRelPath, file);
     if (!content.includes(from) || content.includes(`](${target})`)) return att;
     content = content.split(from).join(`](${target})`);
     changed = true;
@@ -628,6 +702,7 @@ export function fromExportedAttachmentLinks(
   content: string,
   attachments: unknown[],
   extension: string | undefined,
+  noteRelPath?: string,
 ): { content: string; attachments: unknown[] } {
   const markdown = hasMarkdownBody(extension);
   let out = content;
@@ -635,10 +710,16 @@ export function fromExportedAttachmentLinks(
     if (!att || typeof att !== "object" || !("body_link" in att)) return att;
     const { body_link, ...ref } = att as Record<string, unknown>;
     const { id, path } = ref;
-    if (
-      markdown && typeof body_link === "string" && typeof id === "string" && typeof path === "string" &&
-      id !== "" && path !== "" && isRelativeAttachmentTarget(body_link, { id, path })
-    ) {
+    const file = recordedAttachmentFile(ref);
+    // A recorded file pins the one target the export wrote from this note;
+    // without one, the legacy sidecar shape at any depth.
+    const exportShaped = typeof body_link === "string" && (
+      file !== undefined
+        ? noteRelPath !== undefined && body_link === relativeLinkTarget(noteRelPath, file)
+        : typeof id === "string" && typeof path === "string" && id !== "" && path !== "" &&
+          isRelativeAttachmentTarget(body_link, { id, path })
+    );
+    if (markdown && exportShaped && typeof path === "string" && path !== "") {
       out = out.split(`](${body_link})`).join(`](${STORAGE_URL_PREFIX}${path})`);
     }
     return ref;
@@ -729,7 +810,7 @@ export interface ExportOptions {
   /**
    * Absolute path to the vault's assets directory (where attachment
    * bytes live, one file per `attachments.path` row). When set, attachment
-   * binaries are copied into `<outDir>/.parachute/attachments/<id>/<basename>`
+   * binaries are copied into the export per `attachmentLayout`
    * alongside the frontmatter reference. When unset, attachment refs are
    * still emitted but the binaries stay where they are — useful for
    * partial exports / git-projection where only the markdown is checked
@@ -762,6 +843,8 @@ export interface ExportOptions {
    * would block the operator's actual work.
    */
   failOnCaseCollision?: boolean;
+  /** Where attachment binaries go; default {@link DEFAULT_ATTACHMENT_LAYOUT}. */
+  attachmentLayout?: AttachmentLayout;
 }
 
 /**
@@ -992,6 +1075,8 @@ export interface ExportEngineOptions {
   since?: string;
   exportedAt?: string;
   failOnCaseCollision?: boolean;
+  /** Where attachment binaries go; default {@link DEFAULT_ATTACHMENT_LAYOUT}. */
+  attachmentLayout?: AttachmentLayout;
 }
 
 /**
@@ -1066,6 +1151,7 @@ export async function exportVault(
   // full-corpus load). If `since` is set, filter by updated_at >= since
   // (incremental export).
   const since = opts.since;
+  const layout = opts.attachmentLayout ?? DEFAULT_ATTACHMENT_LAYOUT;
   const caseSensitive = sink.caseSensitive;
   let notesWritten = 0;
   let attachmentsWritten = 0;
@@ -1156,16 +1242,18 @@ export async function exportVault(
     // write per file — a key-collecting sink (cloud tar) must not see a note
     // twice. So a note whose text write is then refused still leaves its
     // binaries in the export (unreferenced, harmless).
-    const writtenAttachmentIds = new Set<string>();
+    const writtenAttachments = new Map<string, string>();
     if (sink.attachmentsEnabled && portable.attachments && portable.attachments.length > 0) {
+      const taken = new Set<string>();
       for (const att of portable.attachments) {
-        // Dest: .parachute/attachments/<att-id>/<basename(att.path)>. Using
-        // att.id as the directory name keeps multiple attachments with the
-        // same basename from colliding; basename keeps it human-readable.
-        const copyResult = sink.copyAttachment(att.path, attachmentSidecarPath(att));
+        // Dest per `layout` (see AttachmentLayout). The id directory (or, beside
+        // the note, an id prefix on a repeat) keeps attachments with the same
+        // basename from colliding; the basename keeps it human-readable.
+        const dest = exportedAttachmentPath(layout, relPath, att, taken);
+        const copyResult = sink.copyAttachment(att.path, dest);
         if (copyResult.ok) {
           attachmentsWritten++;
-          writtenAttachmentIds.add(att.id);
+          writtenAttachments.set(att.id, dest);
         } else {
           skippedAttachments.push({
             note_id: portable.id,
@@ -1178,10 +1266,20 @@ export async function exportVault(
     }
 
     // Only the exported bytes change: `portable` (and the store) keep the
-    // note's real content.
-    const exportedNote = writtenAttachmentIds.size > 0
-      ? withRelativeAttachmentLinks(portable, relPath, writtenAttachmentIds)
+    // note's real content. Outside the sidecar layout each copied binary's
+    // ref records where it went, in the frontmatter or the metadata sidecar.
+    const recorded: PortableNote = layout !== "sidecar" && writtenAttachments.size > 0
+      ? {
+        ...portable,
+        attachments: portable.attachments!.map((att) => {
+          const file = writtenAttachments.get(att.id);
+          return file === undefined ? att : { ...att, file };
+        }),
+      }
       : portable;
+    const exportedNote = writtenAttachments.size > 0
+      ? withRelativeAttachmentLinks(recorded, relPath, writtenAttachments)
+      : recorded;
 
     // vault#317 F3 — path-traversal guard now lives in the sink: a note with
     // `path: "../../.ssh/authorized_keys"` is refused (not written off-tree)
@@ -1201,7 +1299,7 @@ export async function exportVault(
     if (!supportsInlineFrontmatter(portableExt)) {
       const sidecarWrite = sink.writeText(
         join(SIDECAR_DIR, NOTES_META_DIR, `${portable.id}.yaml`),
-        toSidecarYaml(portable),
+        toSidecarYaml(recorded),
       );
       if (!sidecarWrite.ok) {
         skipped.push({ path: portable.path, reason: sidecarWrite.reason });
@@ -1247,8 +1345,8 @@ export async function exportVault(
  *   - `<outDir>/.parachute/schemas/<tag>.yaml` for each tag that declares
  *     description/fields/relationships/parent_names.
  *   - `<outDir>/<note.path>.md` for each note (or `_unpathed/<id>.md`).
- *   - `<outDir>/.parachute/attachments/<id>/<basename>` for each attachment
- *     (only when `opts.assetsDir` is set; the sink's path-traversal guard
+ *   - each attachment's binary per `opts.attachmentLayout` (default
+ *     `_attachments/<id>/<basename>`; only when `opts.assetsDir` is set; the sink's path-traversal guard
  *     rejects attachments whose source escapes assetsDir or whose dest would
  *     escape outDir).
  *
@@ -1272,6 +1370,7 @@ export async function exportVaultToDir(
     since: opts.since,
     exportedAt: opts.exportedAt,
     failOnCaseCollision: opts.failOnCaseCollision,
+    attachmentLayout: opts.attachmentLayout,
   });
 }
 
@@ -1373,7 +1472,6 @@ export function pruneOrphans(opts: PruneOrphansOptions): PruneOrphansStats {
   const sidecarRoot = join(outDir, SIDECAR_DIR);
   const notesMetaRoot = join(sidecarRoot, NOTES_META_DIR);
   const schemasRoot = join(sidecarRoot, "schemas");
-  const attachmentsRoot = join(sidecarRoot, "attachments");
 
   // Path-traversal guard. `walkContentFiles` uses `statSync` which
   // follows symlinks — a symlink inside the mirror pointing OUTSIDE
@@ -1462,8 +1560,10 @@ export function pruneOrphans(opts: PruneOrphansOptions): PruneOrphansStats {
     }
   }
 
-  // Now walk content files (everything outside the .parachute sidecar).
-  const contentFiles = walkContentFiles(outDir);
+  // Now walk content files (everything outside the .parachute sidecar and
+  // the `folder` layout's attachment binaries, swept in step 4).
+  const attachmentsFolder = join(outDir, ATTACHMENTS_FOLDER);
+  const contentFiles = walkContentFiles(outDir).filter((f) => !isWithinDir(f, attachmentsFolder));
   // Track which sidecars matched a content file so we can also remove
   // orphaned sidecars (sidecar present but content file gone).
   const pairedSidecarIds = new Set<string>();
@@ -1592,38 +1692,41 @@ export function pruneOrphans(opts: PruneOrphansOptions): PruneOrphansStats {
     }
   }
 
-  // ---- 4. Attachment directories ----
-  if (existsSync(attachmentsRoot)) {
-    try {
-      for (const entry of readdirSync(attachmentsRoot)) {
-        const full = join(attachmentsRoot, entry);
-        let stat;
-        try {
-          stat = statSync(full);
-        } catch (err) {
-          stats.unparseable_files.push({
-            path: full,
-            reason: `stat failed: ${(err as Error).message ?? err}`,
-          });
-          continue;
+  // ---- 4. Attachment directories (sidecar and `folder` layouts) ----
+  // `beside-note` files are not swept here (prototype gap).
+  for (const attachmentsRoot of [join(sidecarRoot, "attachments"), join(outDir, ATTACHMENTS_FOLDER)]) {
+    if (existsSync(attachmentsRoot)) {
+      try {
+        for (const entry of readdirSync(attachmentsRoot)) {
+          const full = join(attachmentsRoot, entry);
+          let stat;
+          try {
+            stat = statSync(full);
+          } catch (err) {
+            stats.unparseable_files.push({
+              path: full,
+              reason: `stat failed: ${(err as Error).message ?? err}`,
+            });
+            continue;
+          }
+          if (!stat.isDirectory()) continue;
+          // The directory name IS the attachment id (per the export layout).
+          if (!opts.validAttachmentIds.has(entry)) {
+            safeRm(
+              full,
+              () => {
+                stats.attachment_dirs_removed++;
+              },
+              { recursive: true },
+            );
+          }
         }
-        if (!stat.isDirectory()) continue;
-        // The directory name IS the attachment id (per the export layout).
-        if (!opts.validAttachmentIds.has(entry)) {
-          safeRm(
-            full,
-            () => {
-              stats.attachment_dirs_removed++;
-            },
-            { recursive: true },
-          );
-        }
+      } catch (err) {
+        stats.unparseable_files.push({
+          path: attachmentsRoot,
+          reason: `attachments walk failed: ${(err as Error).message ?? err}`,
+        });
       }
-    } catch (err) {
-      stats.unparseable_files.push({
-        path: attachmentsRoot,
-        reason: `attachments walk failed: ${(err as Error).message ?? err}`,
-      });
     }
   }
 
@@ -1974,11 +2077,20 @@ export class FsImportSource implements ImportSource {
   restoreAttachment(srcRelPath: string, destRelPath: string): SinkWriteResult {
     const attachmentsRootResolved = resolvePath(join(this.sidecar, "attachments"));
     const srcResolved = resolvePath(join(this.inDir, srcRelPath));
-    if (!isWithinDir(srcResolved, attachmentsRootResolved)) {
-      return { ok: false, reason: `path-traversal on source: "${srcResolved}" escapes attachments root` };
+    // The sidecar attachments root, or (a ref's recorded `file`) the export's
+    // visible content area, never another sidecar file.
+    if (
+      !isWithinDir(srcResolved, attachmentsRootResolved) &&
+      !(isWithinDir(srcResolved, this.inDirResolved) && !isExcludedPath(relative(this.inDirResolved, srcResolved).split(pathSep).join("/")))
+    ) {
+      return { ok: false, reason: `path-traversal on source: "${srcResolved}" escapes the export's attachment files` };
     }
     if (!existsSync(srcResolved)) {
       return { ok: false, reason: `source attachment file missing at "${srcResolved}"` };
+    }
+    // A symlink inside the export must not pull a file from outside it.
+    if (!isWithinDir(realpathSync(srcResolved), realpathSync(this.inDirResolved))) {
+      return { ok: false, reason: `path-traversal on source: "${srcResolved}" resolves outside the export` };
     }
     // attachmentsEnabled guarantees assetsDirResolved is set.
     const assetsDirResolved = this.assetsDirResolved!;
@@ -2221,6 +2333,11 @@ async function importVaultReplay(
   // Track per-import (id → portable) so we can replay typed links after all
   // notes exist.
   const seenNotes = new Map<string, PortableNote>();
+  // Outside the sidecar layout the walk also meets attachment binaries. They
+  // are expected, not skipped notes: warn only for files no ref records,
+  // once every note's refs are known.
+  const deferredSkips: Array<{ relPath: string; message: string }> = [];
+  const recordedFiles = new Set<string>();
   let sinceCheckpoint = 0;
   for (const relPath of source.listContentFiles()) {
     if (opts.checkpoint && ++sinceCheckpoint >= IMPORT_CHECKPOINT_NOTES) {
@@ -2288,7 +2405,7 @@ async function importVaultReplay(
         // would orphan the row (no id, no path, no timestamps). Better to
         // surface the gap than silently lose shape.
         // eslint-disable-next-line no-console
-        console.warn(`[import] skipped "${relPath}": no matching sidecar at ${NOTES_META_DIR}/<id>.yaml (path="${userPath}", extension="${fileExt}")`);
+        deferredSkips.push({ relPath, message: `[import] skipped "${relPath}": no matching sidecar at ${NOTES_META_DIR}/<id>.yaml (path="${userPath}", extension="${fileExt}")` });
         continue;
       }
       frontmatter = found;
@@ -2305,7 +2422,7 @@ async function importVaultReplay(
       // importer is for the portable-md format, the legacy path stays on the
       // obsidian.ts parseObsidianVault flow.
       // eslint-disable-next-line no-console
-      console.warn(`[import] skipped "${relPath}": no \`id\` in frontmatter (legacy obsidian format — use parseObsidianVault)`);
+      deferredSkips.push({ relPath, message: `[import] skipped "${relPath}": no \`id\` in frontmatter (legacy obsidian format — use parseObsidianVault)` });
       continue;
     }
     const created_at = typeof frontmatter.created_at === "string" ? frontmatter.created_at : new Date().toISOString();
@@ -2324,7 +2441,13 @@ async function importVaultReplay(
     const links = Array.isArray(frontmatter.links) ? frontmatter.links : undefined;
     let attachments = Array.isArray(frontmatter.attachments) ? frontmatter.attachments : undefined;
     // Undo the export's attachment-link rewrite, exactly where it recorded one.
-    if (attachments) ({ content, attachments } = fromExportedAttachmentLinks(content, attachments, extension));
+    if (attachments) {
+      ({ content, attachments } = fromExportedAttachmentLinks(content, attachments, extension, relPath));
+      for (const att of attachments) {
+        const file = recordedAttachmentFile(att);
+        if (file !== undefined) recordedFiles.add(file);
+      }
+    }
 
     const portable: PortableNote = {
       id,
@@ -2461,6 +2584,11 @@ async function importVaultReplay(
     console.warn(`[import] orphaned sidecar "${sidecarId}.yaml": ${stats.skipped_sidecars[stats.skipped_sidecars.length - 1]!.reason}`);
   }
 
+  for (const skip of deferredSkips) {
+    // eslint-disable-next-line no-console
+    if (!recordedFiles.has(skip.relPath)) console.warn(skip.message);
+  }
+
   // 4. Typed links — replay only now that all notes exist. Wikilinks (which
   // the exporter excludes from `links:`) rebuild from content brackets via
   // syncAllWikilinks (a callable Store method).
@@ -2521,10 +2649,11 @@ async function importVaultReplay(
         att.metadata,
       );
 
-      // File copy: from sidecar to assetsDir. Source uses the EXPORTED
-      // att.id (what the exporter wrote), not our freshly-minted row id.
+      // File copy: from the export to assetsDir. Source is the ref's recorded
+      // `file`, else the sidecar path from the EXPORTED att.id (what the
+      // exporter wrote), not our freshly-minted row id.
       if (source.attachmentsEnabled) {
-        const result = source.restoreAttachment(attachmentSidecarPath(att), att.path);
+        const result = source.restoreAttachment(attachmentSourcePath(att), att.path);
         if (!result.ok) {
           stats.skipped_attachments.push({
             note_id: noteId,

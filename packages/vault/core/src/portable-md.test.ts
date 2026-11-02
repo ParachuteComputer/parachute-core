@@ -38,6 +38,7 @@ import {
   portableExportFilePath,
   probeCaseSensitive,
   pruneOrphans,
+  ATTACHMENTS_FOLDER,
   SIDECAR_DIR,
   NOTES_META_DIR,
   supportsInlineFrontmatter,
@@ -1259,11 +1260,12 @@ describe("portable-md attachments round-trip (vault#319 F3)", async () => {
     expect(exportStats.attachments).toBe(1);
     expect(exportStats.skipped_attachments).toEqual([]);
 
-    // The binary lives at .parachute/attachments/<att-id>/sample.bin.
+    // The binary lives at _attachments/<att-id>/sample.bin (the default
+    // layout; the sidecar one is pinned in portable-md-attachment-links.test.ts).
     const attachments = await store.getAttachments(note.id);
     expect(attachments).toHaveLength(1);
     const exportedAttId = attachments[0]!.id;
-    const sidecarFile = join(outDir, SIDECAR_DIR, "attachments", exportedAttId, "sample.bin");
+    const sidecarFile = join(outDir, ATTACHMENTS_FOLDER, exportedAttId, "sample.bin");
     expect(existsSync(sidecarFile)).toBe(true);
     expect(readFileSync(sidecarFile)).toEqual(originalBytes);
 

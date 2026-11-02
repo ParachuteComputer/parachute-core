@@ -14,6 +14,10 @@
  * back exactly those targets. So an old export, an attachment whose binary was
  * not exported, and a hand-typed relative link all import as written.
  *
+ * These tests pin the sidecar layout (`.parachute/attachments/`), which every
+ * export wrote before T-318 decision A and which import must keep reading.
+ * The visible layouts are in portable-md-attachment-layout.test.ts.
+ *
  * All data here is made up.
  */
 
@@ -76,7 +80,7 @@ describe("portable-md attachment links (T-318 #8)", async () => {
     const { imgId, pdfId } = await seedNote();
     const before = await store.getNote("01M67ABS8ABZS3S1ZYSSK28ZVQ");
     const outDir = join(tmpBase, "out");
-    const stats = await exportVaultToDir(store, { outDir, assetsDir: assets, exportedAt: "2026-10-30T15:10:00.000Z" });
+    const stats = await exportVaultToDir(store, { attachmentLayout: "sidecar", outDir, assetsDir: assets, exportedAt: "2026-10-30T15:10:00.000Z" });
     expect(stats.attachments).toBe(2);
 
     const noteFile = join(outDir, `${NOTE_PATH}.md`);
@@ -114,7 +118,7 @@ describe("portable-md attachment links (T-318 #8)", async () => {
     await seedNote();
     rmSync(join(assets, PDF_PATH)); // row kept, file gone (e.g. evicted)
     const outDir = join(tmpBase, "out");
-    const stats = await exportVaultToDir(store, { outDir, assetsDir: assets, exportedAt: "2026-10-30T15:10:00.000Z" });
+    const stats = await exportVaultToDir(store, { attachmentLayout: "sidecar", outDir, assetsDir: assets, exportedAt: "2026-10-30T15:10:00.000Z" });
     expect(stats.skipped_attachments).toHaveLength(1);
     const body = exportedBody(join(outDir, `${NOTE_PATH}.md`));
     expect(linkTargets(body)[0]!.startsWith(`../../../${SIDECAR_DIR}/attachments/`)).toBe(true);
@@ -126,7 +130,7 @@ describe("portable-md attachment links (T-318 #8)", async () => {
   it("a markdown-only export (no binaries) leaves the body as stored", async () => {
     await seedNote();
     const outDir = join(tmpBase, "out");
-    await exportVaultToDir(store, { outDir, exportedAt: "2026-10-30T15:10:00.000Z" });
+    await exportVaultToDir(store, { attachmentLayout: "sidecar", outDir, exportedAt: "2026-10-30T15:10:00.000Z" });
     expect(exportedBody(join(outDir, `${NOTE_PATH}.md`))).toBe(BODY);
     expect(readFileSync(join(outDir, `${NOTE_PATH}.md`), "utf-8")).not.toContain("body_link");
     // …and it still imports back to the same body.
@@ -138,7 +142,7 @@ describe("portable-md attachment links (T-318 #8)", async () => {
   it("export → import into a fresh vault gives back the original body, and re-export matches", async () => {
     const { imgId, pdfId } = await seedNote();
     const outA = join(tmpBase, "a");
-    await exportVaultToDir(store, { outDir: outA, assetsDir: assets, exportedAt: "2026-10-30T15:10:00.000Z" });
+    await exportVaultToDir(store, { attachmentLayout: "sidecar", outDir: outA, assetsDir: assets, exportedAt: "2026-10-30T15:10:00.000Z" });
 
     const target = new SqliteStore(new Database(":memory:"));
     const destAssets = join(tmpBase, "dest-assets");
@@ -151,7 +155,7 @@ describe("portable-md attachment links (T-318 #8)", async () => {
     // Re-export: identical bytes once the re-minted attachment ids (a known
     // import limitation) are mapped back.
     const outB = join(tmpBase, "b");
-    await exportVaultToDir(target, { outDir: outB, assetsDir: destAssets, exportedAt: "2026-10-30T15:10:00.000Z" });
+    await exportVaultToDir(target, { attachmentLayout: "sidecar", outDir: outB, assetsDir: destAssets, exportedAt: "2026-10-30T15:10:00.000Z" });
     const newIds = new Map((await target.getAttachments("01M67ABS8ABZS3S1ZYSSK28ZVQ")).map((a) => [a.path, a.id]));
     const mapIds = (s: string) => s.split(newIds.get(IMG_PATH)!).join(imgId).split(newIds.get(PDF_PATH)!).join(pdfId);
     const a = readFileSync(join(outA, `${NOTE_PATH}.md`), "utf-8");
@@ -255,7 +259,7 @@ describe("portable-md attachment links: only the links export rewrote come back 
   it("a hand-written relative sidecar link next to a storage link round-trips byte-identical", async () => {
     const { body, imgId } = await seedHandWritten();
     const outA = join(tmpBase, "a");
-    const stats = await exportVaultToDir(store, { outDir: outA, assetsDir: assets, exportedAt: "2026-10-30T15:10:00.000Z" });
+    const stats = await exportVaultToDir(store, { attachmentLayout: "sidecar", outDir: outA, assetsDir: assets, exportedAt: "2026-10-30T15:10:00.000Z" });
     expect(stats.attachments).toBe(1);
     // The body already holds the sidecar path, so the export can't tell its
     // own rewrite from the typed link: it leaves this attachment's links be.
@@ -274,7 +278,7 @@ describe("portable-md attachment links: only the links export rewrote come back 
     // now names a folder the re-export doesn't write, and the re-export does
     // rewrite the storage link. That export still imports to the same body.
     const outB = join(tmpBase, "b");
-    await exportVaultToDir(target, { outDir: outB, assetsDir: destAssets, exportedAt: "2026-10-30T15:10:00.000Z" });
+    await exportVaultToDir(target, { attachmentLayout: "sidecar", outDir: outB, assetsDir: destAssets, exportedAt: "2026-10-30T15:10:00.000Z" });
     expect(exportedBody(join(outB, `${NOTE_PATH}.md`))).not.toBe(body);
     expect(exportedBody(join(outB, `${NOTE_PATH}.md`))).toContain(`](../../../${SIDECAR_DIR}/attachments/${imgId}/`);
     const again = new SqliteStore(new Database(":memory:"));
@@ -291,7 +295,7 @@ describe("portable-md attachment links: only the links export rewrote come back 
     ];
     for (const [name, opts] of runs) {
       const out = join(tmpBase, name);
-      await exportVaultToDir(store, { outDir: out, ...opts, exportedAt: "2026-10-30T15:10:00.000Z" });
+      await exportVaultToDir(store, { attachmentLayout: "sidecar", outDir: out, ...opts, exportedAt: "2026-10-30T15:10:00.000Z" });
       expect(exportedBody(join(out, `${NOTE_PATH}.md`))).toBe(body);
       const target = new SqliteStore(new Database(":memory:"));
       await importPortableVault(target, { inDir: out });

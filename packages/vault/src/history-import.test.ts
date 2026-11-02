@@ -438,7 +438,7 @@ test("valid sidecar candidate selection binds both content and metadata blobs", 
 
 test("mirror commits with relative attachment links (T-318 #8) stage the original /api/storage body", async () => {
   // The mirror exports with binaries, so its commits hold bodies whose
-  // attachment links point at .parachute/attachments/… (each rewritten
+  // attachment links point at _attachments/… (each rewritten
   // attachment's frontmatter entry records it as body_link). A staged
   // version must be the vault's body.
   const { SqliteStore } = await import("../core/src/store.ts");
@@ -453,11 +453,13 @@ test("mirror commits with relative attachment links (T-318 #8) stage the origina
     await store.addAttachment(note.id, "2026-10-30/garden.png", "image/png");
     const repo = repoAt(join(dir, "repo"));
     await exportVaultToDir(store, { outDir: repo, assetsDir: assets, exportedAt: "2026-10-30T00:00:00.000Z" });
-    expect(readFileSync(join(repo, "Notes/2026/plan.md"), "utf8")).toContain("](../../.parachute/attachments/");
+    expect(readFileSync(join(repo, "Notes/2026/plan.md"), "utf8")).toContain("](../../_attachments/");
     git(repo, "add", "."); git(repo, "commit", "-m", "mirror");
     stageArchive(repo, git(repo, "rev-parse", "HEAD"), db);
     const rows = db.query("SELECT row_json FROM observations").all() as { row_json: string }[];
     expect(rows.map(r => JSON.parse(r.row_json).content)).toEqual([body]);
+    // The visible binary is an attachment file, not an unclassified note file.
+    expect(db.query("SELECT * FROM issues").all()).toEqual([]);
   } finally { db.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -473,7 +475,7 @@ test("mirror commits keep a hand-written relative attachment link as written (T-
     const store = new SqliteStore(new Database(":memory:"));
     const note = await store.createNote("draft", { path: "Notes/2026/plan" });
     const att = await store.addAttachment(note.id, "2026-10-30/garden.png", "image/png");
-    const body = `![garden.png](/api/storage/2026-10-30/garden.png)\n![typed](../../.parachute/attachments/${att.id}/garden.png)\n`;
+    const body = `![garden.png](/api/storage/2026-10-30/garden.png)\n![typed](../../_attachments/${att.id}/garden.png)\n`;
     await store.updateNote(note.id, { content: body });
     const repo = repoAt(join(dir, "repo"));
     await exportVaultToDir(store, { outDir: repo, assetsDir: assets, exportedAt: "2026-10-30T00:00:00.000Z" });
