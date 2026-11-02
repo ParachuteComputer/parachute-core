@@ -126,11 +126,12 @@ Read against Prism main `55ac3df`, and run on Linux in a private network namespa
   `/storage/upload`, and MCP with your read-write allowlist. Not tried: `/notes/:id/attachments`, versions,
   restore, `/history/compact` and `/api/subscribe`. Bootstrap records the issuer `http://127.0.0.1:1939`, which matches serve on 1939. On
   any other hub port, give both commands `PARACHUTE_HUB_ORIGIN`.
-- **Stock mode on 0.8 works only on a home 0.8 made.** Stock mode is `parachute-stock.ts`, which runs `parachute
-  serve` with `PORT=1939`. On a home made by stock 0.7.19/0.7.9 while those programs are still installed, `parachute
-  serve` exits 7 ("an older Parachute still owns …") and changes nothing, and Prism's hub agent would keep
-  restarting into that exit. Open such a home with `serve --embedded` instead: it adopts the home in place, and stock
-  0.7.19 still opens it afterwards. The other way is to run `parachute-core takeover` first.
+- **Stock mode on 0.8 refuses a home that stock 0.7 still owns.** Stock mode is `parachute-stock.ts`, which runs
+  `parachute serve` with `PORT=1939`. On a home 0.8 made, it works. On a home made by stock 0.7.19/0.7.9 while those
+  programs are still installed, `parachute serve` exits 7 ("an older Parachute still owns …") and changes nothing,
+  and Prism's hub agent would keep restarting into that exit. Open such a home with `serve --embedded` instead: it
+  adopts the home in place, and stock 0.7.19 still opens it afterwards. The other way is to run `parachute-core
+  takeover` first.
 - **Prism's own backup** (`prism backup`, and the one `prism update` takes) copies `hub.db`, each `vault.db` and
   `vault.yaml`. It leaves out the rest of an embedded home, including attachments (`vault/data/<name>/assets/`),
   `embedded.json` (the accepted issuers), `operator.token`, `vault/config.yaml` and `services.json`.
