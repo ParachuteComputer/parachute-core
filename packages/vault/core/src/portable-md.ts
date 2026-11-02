@@ -181,9 +181,9 @@ export interface PortableLink {
   metadata?: Record<string, unknown>;
 }
 
-/** Attachment reference in frontmatter. Binary file lives at
- *  `.parachute/attachments/<id>/<filename>`. PR 2 wires the file copy;
- *  PR 1 emits the reference. */
+/** Attachment reference in frontmatter. The binary lives at `file` when
+ *  recorded, else `.parachute/attachments/<id>/<filename>` (see
+ *  AttachmentLayout). PR 2 wires the file copy; PR 1 emits the reference. */
 export interface PortableAttachmentRef {
   id: string;
   path: string;
@@ -195,7 +195,7 @@ export interface PortableAttachmentRef {
    * running vault serves. When the export copied this binary and rewrote at
    * least one such link in the note's body, this is the target it wrote in
    * its place: the percent-encoded path from the note file to the copied
-   * file (`../.parachute/attachments/<id>/<basename>`). Import turns exactly
+   * file (e.g. `../_attachments/<storage path>`). Import turns exactly
    * that target back into the storage link and drops the key, so the body
    * and the attachment row come back as stored. Absent means the body was
    * written as stored for this attachment. Additive: older importers ignore
