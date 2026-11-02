@@ -37,11 +37,12 @@ When Prism re-signs the payload, please treat `parachute/runtime/bun` like your 
 plus `allow-jit`); nothing else in the tree needs an entitlement.
 
 **npm** (for a machine with Bun 1.4+): each prerelease goes to the `next` tag, and `latest` stays at `0.8.0-pre.1`
-until 0.8.0 ships, so ask for `@next`. Today `next` is still `0.8.0-pre.1`: npm refused CI's publish of `0.8.0-pre.2`
-until the package's trusted publisher is set up (RELEASING.md). Until then, install pre.2 from the release's npm file:
-download `openparachute-core-0.8.0-pre.2.tgz` and `npm-SHA256SUMS`, check it with `sha256sum -c npm-SHA256SUMS`
+until 0.8.0 ships, so ask for `@next`: `npm i @openparachute/core@next` gives `0.8.0-pre.2`, and a bare
+`npm i @openparachute/core` still gives `0.8.0-pre.1`. The package on npm is byte-identical to the release's
+`openparachute-core-0.8.0-pre.2.tgz`; to install from that file instead, check it with `sha256sum -c npm-SHA256SUMS`
 (macOS: `shasum -a 256 -c npm-SHA256SUMS`), then `npm i ./openparachute-core-0.8.0-pre.2.tgz`. It runs on the Bun on
-`PATH`. `parachute-vault` is not linked into a `bin` folder; it is in the package:
+`PATH` (without one, `parachute` exits 127, `bun: not found`). `parachute-vault` is not linked into a `bin` folder;
+it is in the package:
 
 | Install | `parachute` | `parachute-vault` |
 |---|---|---|
@@ -114,6 +115,27 @@ Exit 2 also when an account with another name exists.
 download, tunnel probe, Buzz poller, outbound webhook or mirror push. Our CI counts every packet that tries to leave
 a private network namespace, and it must be zero.
 
+## From Prism's host as it is today
+
+Read against Prism main `55ac3df`, and run on Linux in a private network namespace on ports 1939/1940:
+- **Prism doesn't call `serve --embedded` yet.** In embedded mode `prism run hub` is a placeholder
+  (`supervisor.ts`, `runParachutePlaceholder`), and setup runs only `bootstrap --embedded --json` (`setup.ts:429`).
+  That bootstrap followed by `serve --embedded --home … --listen 127.0.0.1:1939 --vault-listen 127.0.0.1:1940
+  --parent-pid …` served every Prism call we tried. Those were `auth mint-token` without `--json` (stdout is one
+  line, the JWT), `--service`, `--ephemeral`, `GET /tags`, `PUT /tags/<name>`, `POST` and `GET /notes`,
+  `/storage/upload`, and MCP with your read-write allowlist. Not tried: `/notes/:id/attachments`, versions,
+  restore, `/history/compact` and `/api/subscribe`. Bootstrap records the issuer `http://127.0.0.1:1939`, which matches serve on 1939. On
+  any other hub port, give both commands `PARACHUTE_HUB_ORIGIN`.
+- **Stock mode on 0.8 refuses a home that stock 0.7 still owns.** Stock mode is `parachute-stock.ts`, which runs
+  `parachute serve` with `PORT=1939`. On a home 0.8 made, it works. On a home made by stock 0.7.19/0.7.9 while those
+  programs are still installed, `parachute serve` exits 7 ("an older Parachute still owns …") and changes nothing,
+  and Prism's hub agent would keep restarting into that exit. Open such a home with `serve --embedded` instead: it
+  adopts the home in place, and stock 0.7.19 still opens it afterwards. The other way is to run `parachute-core
+  takeover` first.
+- **Prism's own backup** (`prism backup`, and the one `prism update` takes) copies `hub.db`, each `vault.db` and
+  `vault.yaml`. It leaves out the rest of an embedded home, including attachments (`vault/data/<name>/assets/`),
+  `embedded.json` (the accepted issuers), `operator.token`, `vault/config.yaml` and `services.json`.
+
 ## What stays the same from 0.7
 
 - Under `parachute` and `parachute-vault`, every command 0.7's hub and vault had runs as it did: the names, flags and
@@ -139,7 +161,7 @@ a private network namespace, and it must be zero.
   until then. Embedded homes are not touched by it: Prism adopts in place, as above, and `serve --embedded` never
   refuses for this reason.
 - **A signed macOS tarball every night**, so the Nov 9 build isn't the first you see. The `bundle-macos` workflow
-  builds main at 06:17 UTC and on every merge, runs your suite on the signed tree, and keeps the tarball and `SHA256SUMS` as an Actions
+  builds main every night and on every merge, runs your suite on the signed tree, and keeps the tarball and `SHA256SUMS` as an Actions
   artifact for 14 days: `gh run download <run id> -R ParachuteComputer/parachute-core -n
   parachute-core-<version>-darwin-arm64` (run ids: `gh run list -R ParachuteComputer/parachute-core -w
   bundle-macos.yml -b main`). Pull requests that touch the bundle get one too.
@@ -153,20 +175,30 @@ on it unchanged (46 pass, 0 fail, on the tarball and the npm install). What chan
   `revoke-token`, `version --json`, `parachute-vault create`) is unchanged. The new front door (`parachute help`,
   `setup --embedded`, `keys new`) maps onto the same code. On an embedded home the old names print no deprecation
   line and nothing is counted. `parachute changes --json` lists every old name and what replaced it.
-- **MCP: 11 tools, the old names as listed aliases.** `request-attachment-upload` and `-download` become
-  `attachment-url`; `find-path` becomes `query-notes` with `path_between`; the tag tools become `manage-types`;
-  `manage-token` becomes `manage-keys`. Every old name is still in `tools/list` (its description starts
-  "deprecated"), so your allowlists in `agent-profiles.ts` keep working. Add `attachment-url` when you move, and
-  `manage-types` and `manage-keys` to the admin-only list (`lib.mjs:19`) so that check still covers them. The tool
-  list a write key sees shrinks from about 61k to 10k characters.
+- **MCP: 11 tools, with the old names listed as aliases.** An admin key sees all 11, a write key 9 and a read key
+  6. `request-attachment-upload` and `-download` become `attachment-url`; `find-path` becomes `query-notes` with
+  `path_between`; the tag tools become `manage-types`; `manage-token` becomes `manage-keys`. Every old name is still
+  in `tools/list` (its description starts "deprecated"), so your allowlists in `agent-profiles.ts` keep working.
+  Add `attachment-url` when you move, and `manage-types` and `manage-keys` to the admin-only list (`lib.mjs:19`) so
+  that check still covers them. A write key's `tools/list` holds 12 entries, 9 tools and 3 aliases, in about 10k
+  characters; on 0.8 the same key sees 11 tools in about 61k.
 - **Types and tags.** A tag with fields or parents is a type. Notes gain `types` (the types among their tags) next
   to `tags`, over REST and MCP; `tags` still lists every name. `tags: [...]` writes and `tag:` queries work as today.
 - **Keys.** Every token becomes a key with the same scopes; `parachute keys list` shows them. Verification is
   unchanged: a token minted by 0.8 or 0.7 still verifies. Scoping keys by type comes in 0.9.1, which moves the hub's
   schema number.
-- **Upgrades.** 0.8 → 0.9 changes no schema number, so going back is code-only. The backup 0.9 takes on its first
-  open skips embedded homes (`docs/UPGRADE-0.9.md` on #21). Before 0.9.1 we need to agree who backs up an embedded
-  home before a newer bundle opens it: Prism, or `serve --embedded`.
+- **Upgrades.** 0.8 → 0.9 changes no schema number, so going back is code-only. One embedded home went 0.8 → 0.9 →
+  0.8 → 0.9 with Prism's calls at each step. Tokens minted under either version kept working, notes written under
+  either were read back, and tag fields survived. Nothing was written outside the home.
+  - The backup 0.9 takes on its first open skips embedded homes (`docs/UPGRADE-0.9.md` on #21).
+  - A home that is not embedded (Prism's stock mode) is handled differently:
+    - 0.9's first command copies the databases into a `parachute-upgrade/` folder in the home's parent folder,
+      and records `run/release.json`. For `<prefix>/parachute` that is `<prefix>/parachute-upgrade/`. For
+      `~/.parachute` it is `~/parachute-upgrade/`.
+    - Old command names print one line on stderr there, for example `'auth mint-token' is now 'keys new <name>'`.
+      Stdout and the exit code are unchanged, so Prism's last-line parse still works.
+  - Before 0.9.1 we need to agree who backs up an embedded home before a newer bundle opens it: Prism, or
+    `serve --embedded`.
 
 ## Requests for your suite (PLAN §3.1)
 
