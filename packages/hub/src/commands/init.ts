@@ -37,6 +37,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import pkg from "../../package.json" with { type: "json" };
 import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "../config.ts";
+import { coreUnitEntry } from "../core-host.ts";
 import { type ExposeState, readExposeState } from "../expose-state.ts";
 import { type EnsureHubOpts, HUB_DEFAULT_PORT, HUB_SVC, readHubPort } from "../hub-control.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
@@ -406,7 +407,7 @@ async function defaultExposeCloudflare(): Promise<number> {
  * runs the same on-disk entry the operator is invoking right now.
  */
 function defaultHubCliPath(): string {
-  return fileURLToPath(new URL("../cli.ts", import.meta.url));
+  return coreUnitEntry()?.cliPath ?? fileURLToPath(new URL("../cli.ts", import.meta.url));
 }
 
 /**
@@ -464,6 +465,7 @@ async function defaultEnsureHubViaUnit(opts: EnsureHubOpts): Promise<{
     // NOT the hard-coded default (§4.2).
     parachuteHome: configDir,
     cliPath: defaultHubCliPath(),
+    pathPrefix: coreUnitEntry()?.binDir,
     port,
     log,
   });

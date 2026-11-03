@@ -566,7 +566,7 @@ function launchdUnits(): Unit[] {
       text = readFileSync(join(dir, f), "utf8");
     } catch {}
     const active = run(["launchctl", "list", label]).code === 0;
-    return { name: label, manager: "launchd" as const, active, enabled: true, file: join(dir, f), old: OLD_COMMAND.test(text) || /hub|vault/i.test(label) };
+    return { name: label, manager: "launchd" as const, active, enabled: true, file: join(dir, f), old: !/parachute-core/.test(text) && (OLD_COMMAND.test(text) || /hub|vault/i.test(label)) };
   });
 }
 

@@ -4,6 +4,7 @@ import { createConnection } from "node:net";
 import { dirname, join } from "node:path";
 import { bunGlobalPrefixes, isLinked as defaultIsLinkedShared } from "../bun-link.ts";
 import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "../config.ts";
+import { bundledModuleDir } from "../core-host.ts";
 import { type ExposeState, readExposeState } from "../expose-state.ts";
 import {
   HUB_DEFAULT_PORT,
@@ -234,6 +235,11 @@ export interface InstallOpts {
    * `bunGlobalPrefixes()`.
    */
   findGlobalInstall?: (pkg: string) => string | null;
+  /**
+   * The folder of a module this program carries itself (core's vault), or null. When set, `install` registers
+   * that folder instead of running `bun add -g`. Default: `bundledModuleDir` (core-host.ts), null outside core.
+   */
+  bundledDir?: (pkg: string) => string | null;
   /**
    * Skip the post-install daemon start. The launch-day default is to leave
    * the service running so users don't have to remember the second command;
@@ -879,6 +885,7 @@ export async function install(input: string, opts: InstallOpts = {}): Promise<nu
   const linkedPath = opts.linkedPath ?? defaultLinkedPath;
   const findGlobalInstall = opts.findGlobalInstall ?? defaultFindGlobalInstall;
   const readManifest = opts.readManifest ?? readModuleManifest;
+  const bundledDir = opts.bundledDir ?? ((pkg: string) => bundledModuleDir(pkg));
 
   const target = resolveInstallTarget(input, opts, log);
   if (!target) return 1;
@@ -913,7 +920,13 @@ export async function install(input: string, opts: InstallOpts = {}): Promise<nu
       targetReal = target.absPath;
     }
   }
-  if (
+  // Inside @openparachute/core the vault is part of the program: never download the 0.7 package next to it.
+  const bundled = target.kind === "local-path" ? null : bundledDir(target.packageName);
+  if (bundled) {
+    log(
+      `${target.packageName} is part of this program (@openparachute/core) — nothing to download.`,
+    );
+  } else if (
     (target.kind === "first-party" || target.kind === "known-module") &&
     isLinked(target.packageName)
   ) {
@@ -987,7 +1000,7 @@ export async function install(input: string, opts: InstallOpts = {}): Promise<nu
   // third-party (npm / local-path) the manifest is the contract — its
   // absence hard-errors here. See
   // `docs/contracts/module-json-extensibility.md`.
-  const installDir = resolveInstallDir(target, findGlobalInstall);
+  const installDir = bundled ?? resolveInstallDir(target, findGlobalInstall);
   const installedManifest = await readInstalledManifest(target, installDir, {
     readManifest,
     log,
