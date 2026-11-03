@@ -100,6 +100,34 @@ const okHubUnitSupervisor = {
 };
 
 describe("parachute upgrade", () => {
+  test("inside @openparachute/core: the vault and hub are core's, so nothing is bun-added", async () => {
+    const h = makeHarness();
+    const before = process.env.PARACHUTE_CORE_ROOT;
+    // packages/hub/src/__tests__ → the package root, as core's `parachute` sets it.
+    const coreRoot = join(import.meta.dir, "..", "..", "..", "..");
+    process.env.PARACHUTE_CORE_ROOT = coreRoot;
+    try {
+      seedVault(h.manifestPath, join(coreRoot, "packages", "vault"));
+      const logs: string[] = [];
+      const m = makeRunner();
+      const code = await upgrade(undefined, {
+        manifestPath: h.manifestPath,
+        configDir: h.configDir,
+        runner: m.runner,
+        findGlobalInstall: () => null,
+        restartFn: async () => 0,
+        log: (l) => logs.push(l),
+      });
+      expect(code).toBe(0);
+      expect(m.calls.some((c) => c.cmd[0] === "bun" && c.cmd[1] === "add")).toBe(false);
+      expect(logs.join("\n")).toMatch(/vault: part of @openparachute\/core/);
+    } finally {
+      if (before === undefined) Reflect.deleteProperty(process.env, "PARACHUTE_CORE_ROOT");
+      else process.env.PARACHUTE_CORE_ROOT = before;
+      h.cleanup();
+    }
+  });
+
   test("errors cleanly when targeting a service that's not installed", async () => {
     const h = makeHarness();
     try {
