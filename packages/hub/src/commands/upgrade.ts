@@ -70,6 +70,7 @@ import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "../config.ts";
+import { bundledModuleDir, coreRoot, isCoreVaultDir, takenOver } from "../core-host.ts";
 import { HUB_PACKAGE, HUB_SVC } from "../hub-control.ts";
 import {
   type HubUnitDeps,
@@ -916,7 +917,26 @@ async function upgradeNpm(target: ResolvedTarget, sourceDir: string, r: Resolved
   return restarted;
 }
 
+/**
+ * Core's vault is what serves this home: the row points at a core copy's vault (this one, or an older bundle
+ * copy), or takeover moved the home to core (its row may still name the old npm vault). Not so on a box a
+ * pre-0.8.0-pre.3 `init` set up with npm's 0.7 vault, which upgrades from npm as before.
+ */
+function runsBundled(target: ResolvedTarget, r: Resolved): boolean {
+  if (!bundledModuleDir(target.packageName)) return false;
+  const dir = target.entry.installDir;
+  return (dir !== undefined && isCoreVaultDir(dir)) || takenOver(r.configDir);
+}
+
 async function upgradeOne(target: ResolvedTarget, r: Resolved): Promise<number> {
+  // Inside @openparachute/core the hub and the vault are this program. Upgrading them one by one would
+  // `bun add -g` the 0.7 packages next to it (seen on a fresh 0.8 box: vault 0.7.9 pulled from npm).
+  if (coreRoot() && (target.packageName === HUB_PACKAGE || runsBundled(target, r))) {
+    r.log(
+      `${target.short}: part of @openparachute/core. Upgrade core itself (re-run the installer, or \`bun add -g @openparachute/core@next\`), then \`parachute restart\`.`,
+    );
+    return 0;
+  }
   const sourceDir = resolveSourceDir(
     target.packageName,
     r.findGlobalInstall,

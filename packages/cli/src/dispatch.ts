@@ -44,6 +44,8 @@ export type Role = "core" | "hub" | "vault";
 
 const HUB_CLI = fileURLToPath(import.meta.resolve("@openparachute/hub/src/cli.ts"));
 const VAULT_CLI = fileURLToPath(import.meta.resolve("@openparachute/vault/src/cli.ts"));
+/** This program's package root (packages/cli/src → ../../..). */
+const CORE_ROOT = fileURLToPath(new URL("../../../", import.meta.url)).replace(/\/$/, "");
 
 export function versionJson(): { name: string; version: string; schema: number; bun: string } {
   // schema: the vault's data schema (vault core/src/schema.ts), what a newer-data check compares (PLAN §3, E7).
@@ -129,6 +131,10 @@ function homeFlag(args: string[]): { home?: string; twice: boolean } {
 /** Run as `role` with this process's arguments. The moved CLIs run in this process, as if started directly. */
 export async function dispatch(role: Role): Promise<void> {
   process.umask(0o077);
+  // The hub's code reads this (packages/hub/src/core-host.ts) to know it runs inside core: init writes a unit that
+  // runs core, and every install, upgrade and update check uses the vault core carries instead of npm's 0.7 one.
+  // Set first, so the unit's own serve (whose in-process path never returns) and its admin API have it too.
+  process.env.PARACHUTE_CORE_ROOT = CORE_ROOT;
   const argv = process.argv.slice(2);
   const r = route(role, argv);
   if ("print" in r) {
