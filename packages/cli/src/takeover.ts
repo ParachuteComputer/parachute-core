@@ -551,6 +551,11 @@ function systemdUnits(home: string, held: Holder[]): Unit[] {
   return out;
 }
 
+/** A plist's ProgramArguments, the part runsOld() would call its ExecStart. */
+export function launchdProgram(plist: string): string {
+  return /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/.exec(plist)?.[1] ?? "";
+}
+
 /** Parachute's launchd agents (macOS): reported; pausing them is not built yet. */
 function launchdUnits(): Unit[] {
   if (process.platform !== "darwin") return [];
@@ -566,7 +571,7 @@ function launchdUnits(): Unit[] {
       text = readFileSync(join(dir, f), "utf8");
     } catch {}
     const active = run(["launchctl", "list", label]).code === 0;
-    return { name: label, manager: "launchd" as const, active, enabled: true, file: join(dir, f), old: !/parachute-core/.test(text) && (OLD_COMMAND.test(text) || /hub|vault/i.test(label)) };
+    return { name: label, manager: "launchd" as const, active, enabled: true, file: join(dir, f), old: !/parachute-core/.test(launchdProgram(text)) && (OLD_COMMAND.test(text) || /hub|vault/i.test(label)) };
   });
 }
 

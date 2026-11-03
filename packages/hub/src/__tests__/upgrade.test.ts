@@ -121,6 +121,24 @@ describe("parachute upgrade", () => {
       expect(code).toBe(0);
       expect(m.calls.some((c) => c.cmd[0] === "bun" && c.cmd[1] === "add")).toBe(false);
       expect(logs.join("\n")).toMatch(/vault: part of @openparachute\/core/);
+
+      // A row that still points at an npm 0.7 vault (a box set up by 0.8.0-pre.1/pre.2) is upgraded as before,
+      // not waved off as core's.
+      const npmVault = join(h.installRoot, "vault");
+      writePackageJson(npmVault, { name: "@openparachute/vault", version: "0.7.9" });
+      seedVault(h.manifestPath, npmVault, "0.7.9");
+      const m2 = makeRunner([
+        { match: (c) => c[0] === "git" && c[1] === "rev-parse", code: 128 }, // an npm install, not a checkout
+      ]);
+      await upgrade("vault", {
+        manifestPath: h.manifestPath,
+        configDir: h.configDir,
+        runner: m2.runner,
+        findGlobalInstall: () => join(npmVault, "package.json"),
+        restartFn: async () => 0,
+        log: () => {},
+      });
+      expect(m2.calls.some((c) => c.cmd[0] === "bun" && c.cmd[1] === "add")).toBe(true);
     } finally {
       if (before === undefined) Reflect.deleteProperty(process.env, "PARACHUTE_CORE_ROOT");
       else process.env.PARACHUTE_CORE_ROOT = before;

@@ -45,6 +45,7 @@ import type { Database } from "bun:sqlite";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { compareVersions } from "./commands/upgrade.ts";
+import { bundledModuleDir } from "./core-host.ts";
 import { validateHostAdminToken } from "./host-admin-token-validation.ts";
 import {
   type ModuleInstallChannel,
@@ -58,6 +59,7 @@ import {
   readModuleManifest as defaultReadModuleManifest,
 } from "./module-manifest.ts";
 import type { ModuleFocus } from "./module-manifest.ts";
+import { isOffline } from "./offline.ts";
 import {
   FIRST_PARTY_FALLBACKS,
   KNOWN_MODULES,
@@ -79,7 +81,6 @@ import {
   readManifestLenient,
 } from "./services-manifest.ts";
 import type { ModuleStartError, ModuleState, Supervisor } from "./supervisor.ts";
-import { isOffline } from "./offline.ts";
 
 /**
  * Resolve a known module to the display + install bootstrap data the admin SPA
@@ -427,6 +428,8 @@ export async function defaultFetchLatestVersion(
   pkg: string,
   channel: ModuleInstallChannel,
 ): Promise<string | null> {
+  // Inside core the vault is this program; npm's @openparachute/vault is 0.7's, never an update for it.
+  if (bundledModuleDir(pkg)) return null;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 3_000);
   try {

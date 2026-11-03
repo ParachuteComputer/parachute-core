@@ -813,6 +813,43 @@ describe("POST /api/modules/:short/install", () => {
     expect(spawns.find((s) => s.short === "vault")?.cmd).toEqual(["parachute-vault", "serve"]);
   });
 
+  test("inside @openparachute/core: the admin install registers core's vault, never bun-adds 0.7's", async () => {
+    // The unit's own serve answers this API; on core it must not pull @openparachute/vault from npm, or the row
+    // points at a 0.7 package and core's serve refuses the home at the next restart (takeover's oldOwner).
+    const coreRoot = join(import.meta.dir, "..", "..", "..", "..");
+    const before = process.env.PARACHUTE_CORE_ROOT;
+    process.env.PARACHUTE_CORE_ROOT = coreRoot;
+    try {
+      const { supervisor } = makeIdleSupervisor();
+      const { run, calls } = alwaysOkRun();
+      const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+      const res = await handleInstall(
+        postReq("/api/modules/vault/install", { authorization: `Bearer ${bearer}` }),
+        "vault",
+        {
+          db: h.db,
+          issuer: ISSUER,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          supervisor,
+          run,
+        },
+      );
+      expect(res.status).toBe(202);
+      await new Promise((r) => setTimeout(r, 10));
+      expect(calls.some((c) => c[0] === "bun" && c[1] === "add")).toBe(false);
+      const manifest = JSON.parse(readFileSync(h.manifestPath, "utf8")) as {
+        services: Array<{ name: string; installDir?: string; paths: string[] }>;
+      };
+      const row = manifest.services.find((s) => s.name === "parachute-vault");
+      expect(row?.installDir).toBe(join(coreRoot, "packages", "vault"));
+      expect(row?.paths).toEqual([]);
+    } finally {
+      if (before === undefined) Reflect.deleteProperty(process.env, "PARACHUTE_CORE_ROOT");
+      else process.env.PARACHUTE_CORE_ROOT = before;
+    }
+  });
+
   test("still runs bun add -g when package is NOT bun-linked", async () => {
     // Companion to the above — confirms the short-circuit doesn't
     // unconditionally skip. On a friend's fresh machine (no bun link),

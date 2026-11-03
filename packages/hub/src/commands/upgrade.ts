@@ -917,10 +917,22 @@ async function upgradeNpm(target: ResolvedTarget, sourceDir: string, r: Resolved
   return restarted;
 }
 
+/** The row runs the vault core carries (not an npm 0.7 vault a pre-0.8.0-pre.3 `init` installed). */
+function runsBundled(target: ResolvedTarget): boolean {
+  const bundled = bundledModuleDir(target.packageName);
+  const dir = target.entry.installDir;
+  if (!bundled || !dir) return false;
+  try {
+    return realpathSync(dir) === realpathSync(bundled);
+  } catch {
+    return false;
+  }
+}
+
 async function upgradeOne(target: ResolvedTarget, r: Resolved): Promise<number> {
   // Inside @openparachute/core the hub and the vault are this program. Upgrading them one by one would
   // `bun add -g` the 0.7 packages next to it (seen on a fresh 0.8 box: vault 0.7.9 pulled from npm).
-  if (coreRoot() && (target.packageName === HUB_PACKAGE || bundledModuleDir(target.packageName))) {
+  if (coreRoot() && (target.packageName === HUB_PACKAGE || runsBundled(target))) {
     r.log(
       `${target.short}: part of @openparachute/core. Upgrade core itself (re-run the installer, or \`bun add -g @openparachute/core@next\`), then \`parachute restart\`.`,
     );

@@ -131,6 +131,10 @@ function homeFlag(args: string[]): { home?: string; twice: boolean } {
 /** Run as `role` with this process's arguments. The moved CLIs run in this process, as if started directly. */
 export async function dispatch(role: Role): Promise<void> {
   process.umask(0o077);
+  // The hub's code reads this (packages/hub/src/core-host.ts) to know it runs inside core: init writes a unit that
+  // runs core, and every install, upgrade and update check uses the vault core carries instead of npm's 0.7 one.
+  // Set first, so the unit's own serve (whose in-process path never returns) and its admin API have it too.
+  process.env.PARACHUTE_CORE_ROOT = CORE_ROOT;
   const argv = process.argv.slice(2);
   const r = route(role, argv);
   if ("print" in r) {
@@ -224,9 +228,6 @@ export async function dispatch(role: Role): Promise<void> {
     const { processModel, serveInProcess } = await import("./serve.ts");
     if (processModel() === "in-process") await serveInProcess(r.argv.slice(1));
   }
-  // The hub's `init` and `install vault` read this to write a unit that runs core and to use the vault core carries
-  // (packages/hub/src/core-host.ts). A source checkout and an npm install are both this folder's package root.
-  process.env.PARACHUTE_CORE_ROOT = CORE_ROOT;
   const entry = r.cli === "hub" ? HUB_CLI : VAULT_CLI;
   // Both CLIs read process.argv.slice(2) when they load, and may start themselves again from process.argv[1].
   process.argv = [process.argv[0]!, entry, ...r.argv];
