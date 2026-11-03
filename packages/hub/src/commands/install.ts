@@ -1259,8 +1259,12 @@ export async function install(input: string, opts: InstallOpts = {}): Promise<nu
     // third-party we override to `entryName` (= manifest.name) so the row
     // matches the lifecycle lookup key. First-party leaves it alone.
     const withName = seedBase.name === entryName ? seedBase : { ...seedBase, name: entryName };
-    const seed =
+    const seeded =
       withName.port === portResult.port ? withName : { ...withName, port: portResult.port };
+    // Core's vault never rewrites its row on boot (core keeps services.json as the old hub left it, for a rollback),
+    // so a placeholder `/vault/default` would stay and read as a vault that exists: the setup wizard "finds" it and
+    // never creates one. Seed it as installed with no vault yet (#478); `parachute-vault create` adds its path.
+    const seed = bundled ? { ...seeded, paths: [] } : seeded;
     upsertService(seed, manifestPath);
     entry = findService(entryName, manifestPath);
     if (entry) {

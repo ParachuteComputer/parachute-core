@@ -49,9 +49,11 @@ describe("install", () => {
       expect(code).toBe(0);
       expect(calls.some((c) => c[0] === "bun" && c[1] === "add")).toBe(false);
       expect(logs.join("\n")).toContain("part of this program (@openparachute/core)");
-      expect(findService("parachute-vault", path)?.installDir).toBe(
-        join(coreRoot, "packages", "vault"),
-      );
+      const row = findService("parachute-vault", path);
+      expect(row?.installDir).toBe(join(coreRoot, "packages", "vault"));
+      // No vault exists yet, and core's vault won't rewrite the row: a "/vault/default" placeholder would make the
+      // setup wizard skip creating the first vault.
+      expect(row?.paths).toEqual([]);
     } finally {
       if (before === undefined) Reflect.deleteProperty(process.env, "PARACHUTE_CORE_ROOT");
       else process.env.PARACHUTE_CORE_ROOT = before;
