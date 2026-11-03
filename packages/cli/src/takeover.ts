@@ -808,7 +808,8 @@ export function oldOwner(home: string): string | null {
   if (Array.isArray(rows)) {
     for (const row of rows) {
       const dir = typeof row?.installDir === "string" ? row.installDir : undefined;
-      if (!dir || !existsSync(join(dir, "package.json")) || ours(dir)) continue;
+      // Any copy of core's own vault (an older bundle copy under .store/ included) is 0.8, not an old program.
+      if (!dir || !existsSync(join(dir, "package.json")) || ours(dir) || existsSync(join(dir, "..", "cli", "src", "parachute-core.ts"))) continue;
       const pkg = readJson(join(dir, "package.json"));
       if (pkg?.name === "@openparachute/hub" || pkg?.name === "@openparachute/vault") why.push(`${pkg.name} ${pkg.version} in ${dir}`);
     }

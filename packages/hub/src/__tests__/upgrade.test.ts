@@ -139,6 +139,43 @@ describe("parachute upgrade", () => {
         log: () => {},
       });
       expect(m2.calls.some((c) => c.cmd[0] === "bun" && c.cmd[1] === "add")).toBe(true);
+
+      // A row on another copy of core (an older bundle copy under .store/) is still core's vault.
+      const copy = join(h.installRoot, ".store", "0.8.0-pre.3-abcd", "lib");
+      writePackageJson(join(copy, "packages", "vault"), {
+        name: "@openparachute/vault",
+        version: "0.7.9",
+      });
+      mkdirSync(join(copy, "packages", "cli", "src"), { recursive: true });
+      writeFileSync(join(copy, "packages", "cli", "src", "parachute-core.ts"), "");
+      seedVault(h.manifestPath, join(copy, "packages", "vault"), "0.7.9");
+      const m3 = makeRunner([{ match: (c) => c[0] === "git" && c[1] === "rev-parse", code: 128 }]);
+      await upgrade("vault", {
+        manifestPath: h.manifestPath,
+        configDir: h.configDir,
+        runner: m3.runner,
+        findGlobalInstall: () => null,
+        restartFn: async () => 0,
+        log: () => {},
+      });
+      expect(m3.calls.some((c) => c.cmd[0] === "bun" && c.cmd[1] === "add")).toBe(false);
+
+      // A taken-over home: core's vault serves it even though the row still names npm's.
+      seedVault(h.manifestPath, npmVault, "0.7.9");
+      writeFileSync(
+        join(h.configDir, "takeover.json"),
+        JSON.stringify({ state: "taken-over" }, null, 2),
+      );
+      const m4 = makeRunner([{ match: (c) => c[0] === "git" && c[1] === "rev-parse", code: 128 }]);
+      await upgrade("vault", {
+        manifestPath: h.manifestPath,
+        configDir: h.configDir,
+        runner: m4.runner,
+        findGlobalInstall: () => join(npmVault, "package.json"),
+        restartFn: async () => 0,
+        log: () => {},
+      });
+      expect(m4.calls.some((c) => c.cmd[0] === "bun" && c.cmd[1] === "add")).toBe(false);
     } finally {
       if (before === undefined) Reflect.deleteProperty(process.env, "PARACHUTE_CORE_ROOT");
       else process.env.PARACHUTE_CORE_ROOT = before;

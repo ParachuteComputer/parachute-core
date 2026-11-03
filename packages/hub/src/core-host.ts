@@ -10,7 +10,7 @@
  *
  * Outside core (the env unset) every function here returns null and the hub behaves as it did in 0.7.
  */
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 export const CORE_ROOT_ENV = "PARACHUTE_CORE_ROOT";
@@ -47,4 +47,21 @@ export function bundledModuleDir(
   if (!root || packageName !== "@openparachute/vault") return null;
   const dir = join(root, "packages", "vault");
   return existsSync(join(dir, "package.json")) ? dir : null;
+}
+
+/**
+ * Is `dir` the vault of some copy of core (this one, an older bundle copy under `.store/`, a source checkout)?
+ * A core vault sits at `<core>/packages/vault`, beside `<core>/packages/cli/src/parachute-core.ts`.
+ */
+export function isCoreVaultDir(dir: string): boolean {
+  return existsSync(join(dir, "..", "cli", "src", "parachute-core.ts"));
+}
+
+/** Has `parachute-core takeover` moved this home to core? Then core's vault serves it, whatever the row says. */
+export function takenOver(home: string): boolean {
+  try {
+    return JSON.parse(readFileSync(join(home, "takeover.json"), "utf8"))?.state === "taken-over";
+  } catch {
+    return false;
+  }
 }

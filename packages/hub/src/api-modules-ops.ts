@@ -41,7 +41,7 @@ import { unwireScribeAuth } from "./auto-wire.ts";
 import { isLinked as defaultIsLinked } from "./bun-link.ts";
 import { PARACHUTE_INSTALL_CHANNEL_ENV } from "./commands/install.ts";
 import { buildModuleSpawnRequest, reconcilePortToCanonical } from "./commands/serve-boot.ts";
-import { bundledModuleDir } from "./core-host.ts";
+import { bundledModuleDir, isCoreVaultDir, takenOver } from "./core-host.ts";
 import { validateHostAdminToken } from "./host-admin-token-validation.ts";
 import { getModuleInstallChannel } from "./hub-settings.ts";
 import { readModuleManifest } from "./module-manifest.ts";
@@ -1241,7 +1241,12 @@ async function runUpgrade(
   // the DB toggle says — asymmetric + surprising to the operator.
   // (Operators who want different install vs upgrade channels can still
   // do so via the DB toggle when no env is set.)
-  if (bundledModuleDir(spec.package)) {
+  // Core's vault serves this home (a core copy's row, or a taken-over home): upgrading it is upgrading core.
+  // A box an early 0.8 prerelease set up on npm's 0.7 vault upgrades from npm as before.
+  const row = findService(spec.manifestName, deps.manifestPath);
+  const coreServes =
+    (row?.installDir !== undefined && isCoreVaultDir(row.installDir)) || takenOver(deps.configDir);
+  if (bundledModuleDir(spec.package) && coreServes) {
     registry.update(
       opId,
       { status: "succeeded" },

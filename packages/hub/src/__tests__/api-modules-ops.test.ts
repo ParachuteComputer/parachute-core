@@ -1509,6 +1509,58 @@ describe("POST /api/modules/:short/upgrade", () => {
     expect(calls).toContainEqual(["bun", "add", "-g", "@openparachute/vault@latest"]);
   });
 
+  test("inside @openparachute/core: upgrading core's vault bun-adds nothing; an npm 0.7 vault row still upgrades", async () => {
+    const coreRoot = join(import.meta.dir, "..", "..", "..", "..");
+    const before = process.env.PARACHUTE_CORE_ROOT;
+    process.env.PARACHUTE_CORE_ROOT = coreRoot;
+    const seed = (installDir: string) =>
+      writeFileSync(
+        h.manifestPath,
+        JSON.stringify({
+          services: [
+            {
+              name: "parachute-vault",
+              port: 1940,
+              paths: ["/vault/default"],
+              health: "/vault/default/health",
+              version: "0.7.9",
+              installDir,
+            },
+          ],
+        }),
+      );
+    const go = async () => {
+      const { supervisor } = makeIdleSupervisor();
+      await supervisor.start({ short: "vault", cmd: ["parachute-vault", "serve"] });
+      const { run, calls } = alwaysOkRun();
+      const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+      await handleUpgrade(
+        postReq("/api/modules/vault/upgrade", { authorization: `Bearer ${bearer}` }),
+        "vault",
+        {
+          db: h.db,
+          issuer: ISSUER,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          supervisor,
+          run,
+          isLinked: TEST_DEFAULT_NOT_LINKED,
+        },
+      );
+      await new Promise((r) => setTimeout(r, 10));
+      return calls.some((c) => c[0] === "bun" && c[1] === "add");
+    };
+    try {
+      seed(join(coreRoot, "packages", "vault"));
+      expect(await go()).toBe(false);
+      seed(join(h.dir, "npm", "@openparachute", "vault"));
+      expect(await go()).toBe(true);
+    } finally {
+      if (before === undefined) Reflect.deleteProperty(process.env, "PARACHUTE_CORE_ROOT");
+      else process.env.PARACHUTE_CORE_ROOT = before;
+    }
+  });
+
   test("uses the rc channel when hub_settings.module_install_channel = rc (hub#275)", async () => {
     setModuleInstallChannel(h.db, "rc");
     const { supervisor } = makeIdleSupervisor();

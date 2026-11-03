@@ -6,6 +6,7 @@ import {
   API_MODULES_CHANNEL_REQUIRED_SCOPE,
   API_MODULES_REQUIRED_SCOPE,
   _clearLatestVersionCacheForTests,
+  defaultFetchLatestVersion,
   defaultReadInstalledVersion,
   handleApiModules,
   handleApiModulesChannel,
@@ -1565,5 +1566,18 @@ describe("PUT /api/modules/channel — hub#275 channel toggle", () => {
     );
     expect(res.status).toBe(200);
     expect(getSetting(h.db, "module_install_channel")).toBe("latest");
+  });
+});
+
+describe("defaultFetchLatestVersion inside @openparachute/core", () => {
+  test("offers no npm version for the vault core carries (npm's is 0.7's)", async () => {
+    const before = process.env.PARACHUTE_CORE_ROOT;
+    process.env.PARACHUTE_CORE_ROOT = join(import.meta.dir, "..", "..", "..", "..");
+    try {
+      expect(await defaultFetchLatestVersion("@openparachute/vault", "latest")).toBeNull();
+    } finally {
+      if (before === undefined) Reflect.deleteProperty(process.env, "PARACHUTE_CORE_ROOT");
+      else process.env.PARACHUTE_CORE_ROOT = before;
+    }
   });
 });

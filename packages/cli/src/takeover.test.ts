@@ -5,7 +5,7 @@ import { describe, expect, test } from "bun:test";
 import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { backup, entries, launchdProgram, managerValue, restore, systemdWords, unitHome as readHome } from "./takeover.ts";
+import { backup, entries, launchdProgram, managerValue, oldOwner, restore, systemdWords, unitHome as readHome } from "./takeover.ts";
 
 // The user manager's environment sets no PARACHUTE_HOME here, unless a test says so.
 const unitHome = (text: string, manager: () => string | undefined | null = () => undefined) => readHome(text, manager);
@@ -164,5 +164,34 @@ describe("launchdProgram", () => {
   test("a 0.7 agent is judged by its program, not by core's folder on its PATH", () => {
     const text = plist(["/Users/op/.bun/bin/bun", "/Users/op/.bun/install/global/node_modules/@openparachute/hub/src/cli.ts", "serve"], "/x/parachute-core/bin:/usr/bin");
     expect(launchdProgram(text)).not.toContain("parachute-core");
+  });
+});
+
+describe("oldOwner and copies of core", () => {
+  function home(installDir: string): string {
+    const h = mkdtempSync(join(tmpdir(), "core-oldowner-"));
+    writeFileSync(join(h, "hub.db"), "");
+    writeFileSync(join(h, "services.json"), JSON.stringify({ services: [{ name: "parachute-vault", port: 1940, paths: [], health: "/x", version: "0.7.9", installDir }] }));
+    return h;
+  }
+  function vaultDir(root: string, inCore: boolean): string {
+    const dir = join(root, "packages", "vault");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "@openparachute/vault", version: "0.7.9" }));
+    if (inCore) {
+      mkdirSync(join(root, "packages", "cli", "src"), { recursive: true });
+      writeFileSync(join(root, "packages", "cli", "src", "parachute-core.ts"), "");
+    }
+    return dir;
+  }
+
+  test("a row on another copy of core's vault (an older bundle copy) is not an old program", () => {
+    const copy = mkdtempSync(join(tmpdir(), "core-copy-"));
+    expect(oldOwner(home(vaultDir(copy, true)))).toBeNull();
+  });
+
+  test("a row on npm's 0.7 vault still is", () => {
+    const npm = mkdtempSync(join(tmpdir(), "npm-vault-"));
+    expect(oldOwner(home(vaultDir(npm, false)))).toContain("@openparachute/vault 0.7.9");
   });
 });
