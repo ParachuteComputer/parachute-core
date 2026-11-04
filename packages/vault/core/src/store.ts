@@ -1308,7 +1308,11 @@ export class BunSqliteStore implements Store {
   }
 
   async renameTag(oldName: string, newName: string, opts?: { actor?: string; via?: string }): Promise<noteOps.RenameTagResult> {
-    const result = noteOps.renameTag(this.db, oldName, newName, opts, this.historyPolicy);
+    // Notes whose content (`#old` → `#new`) or `_tags/` path the cascade
+    // rewrote: committed note writes, so they fire `updated` like core#29's
+    // path-rename cascade (live subscriptions, the embedding arm).
+    const rewritten = new Set<string>();
+    const result = noteOps.renameTag(this.db, oldName, newName, opts, this.historyPolicy, rewritten);
     // Vault#240: the cascade rewrites parent_names in OTHER tag rows as
     // part of the same transaction, plus tokens.scoped_tags and
     // indexed_fields.declarer_tags. Both caches are tag-keyed, so they
@@ -1325,6 +1329,12 @@ export class BunSqliteStore implements Store {
     if ("renamed" in result) {
       this.hooks.dispatchTag("deleted", oldName, this);
       this.hooks.dispatchTag("upserted", newName, this);
+      afterCommit(this.db, () => {
+        for (const id of rewritten) {
+          const note = noteOps.getNote(this.db, id);
+          if (note) this.hooks.dispatch("updated", note, this);
+        }
+      });
     }
     return result;
   }

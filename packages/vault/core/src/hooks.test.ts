@@ -719,3 +719,37 @@ describe("rename cascade fires updated for the notes it rewrites", () => {
     expect((await store.getNote(linker.id))?.content).toBe("see [[Projects/Old]]");
   });
 });
+
+// A tag rename rewrites `#old` to `#new` in the content of every note that
+// mentions it (and `_tags/old` config-note paths). Those are committed note
+// writes like the path-rename cascade above (core#29), so `updated` must fire
+// for them too, or live subscriptions keep the old body and the embedding arm
+// never re-embeds it.
+describe("tag rename fires updated for the notes whose content it rewrites", () => {
+  it("content rewritten by renameTag dispatches updated with the new body", async () => {
+    const mentions = await store.createNote("see #work here", { path: "Notes/Mentions", tags: ["work"] });
+    const bystander = await store.createNote("unrelated", { path: "Notes/Other" });
+    await settle();
+
+    const updated = new Map<string, Note>();
+    hooks.onNote({ event: "updated", handler: (note) => { updated.set(note.id, note); } });
+    const r = await store.renameTag("work", "job");
+    await settle();
+
+    expect("renamed" in r).toBe(true);
+    expect(updated.get(mentions.id)?.content).toBe("see #job here");
+    expect(updated.has(bystander.id)).toBe(false);
+  });
+
+  it("does not fire when the rename is refused", async () => {
+    await store.createNote("see #work", { path: "Notes/Mentions", tags: ["work"] });
+    await store.createNote("taken", { path: "Notes/Taken", tags: ["job"] });
+    await settle();
+    const fired: string[] = [];
+    hooks.onNote({ event: "updated", handler: (note) => { fired.push(note.id); } });
+    const r = await store.renameTag("work", "job");
+    await settle();
+    expect("error" in r).toBe(true);
+    expect(fired).toEqual([]);
+  });
+});
