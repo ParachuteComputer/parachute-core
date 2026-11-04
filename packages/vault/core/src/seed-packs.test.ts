@@ -209,6 +209,23 @@ describe("welcome pack — the five-guide ring", () => {
     expect(noteAt(welcomePack(), WELCOME_PATH).tags).toEqual(["guide"]);
   });
 
+  test("no guide says the Notes app tags everything #capture (it's opt-in since T-318)", () => {
+    // The Notes app adds the inbox tag only when the owner turns on "Tag new
+    // notes as an inbox" (Settings → Tag roles). The guides must not teach the
+    // old default, and the tag guide must still say how to opt in.
+    const notes = [...welcomePack().notes, ...GETTING_STARTED_PACK.notes];
+    for (const n of notes) {
+      expect(n.content).not.toMatch(/puts it on whatever you write/i);
+      expect(n.content).not.toMatch(/`capture` tag the Notes surface uses/i);
+    }
+    const tags = noteAt(welcomePack(), TAGS_GRAPH_PATH).content;
+    expect(tags).toContain('"Tag new notes as an inbox"');
+    expect(tags).toContain("it's off unless you turn it on");
+    expect(GETTING_STARTED_PACK.notes[0]!.content).toContain(
+      "turns on its inbox option, \"Tag new notes as an inbox\"",
+    );
+  });
+
   test("content anchors: the ratified copy is present (guards body drift)", () => {
     const pack = welcomePack();
     expect(noteAt(pack, WELCOME_PATH).content).toContain("This vault is yours.");
