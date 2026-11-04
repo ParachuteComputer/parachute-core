@@ -9317,7 +9317,7 @@ describe("vault projection (vault#271)", async () => {
     expect(md).toContain("email");
     expect(md).toContain("#person");
     expect(md).toContain("vault-info");
-    expect(md).toContain("list-tags { include_schema: true }");
+    expect(md).toContain('vault-info { help: "<tool>" }');
     // Scripting pointer (closes the "points nowhere" gap): the brief routes an
     // agent to the HTTP API + the public guide, with the vault name baked into
     // the copy-paste mint command.

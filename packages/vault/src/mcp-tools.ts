@@ -8,6 +8,8 @@
 import { generateMcpTools, resolveNote } from "../core/src/mcp.ts";
 import { projectHistoryProvenance } from "../core/src/history-visibility.js";
 import type { McpToolDef, GenerateMcpToolsOpts } from "../core/src/mcp.ts";
+import { MCP_TOOL_REFERENCE, acceptedParams } from "../core/src/mcp-manifest.ts";
+import { checkToolParams } from "../core/src/mcp-short.ts";
 import { getNote, getNoteTags, getVaultMap, getVaultStats } from "../core/src/notes.ts";
 import { narrowLinkWarningsForVisibility } from "../core/src/wikilinks.ts";
 import type { Note } from "../core/src/types.ts";
@@ -343,8 +345,29 @@ export function generateScopedMcpTools(
   // callers. See vault#376. The raw caller bearer (vault#403, MGT) is
   // forwarded to hub's mint-token attenuation proxy on mint.
   tools.push(buildManageTokenTool(vaultName, auth, callerBearer ?? null));
+  applyParamTeaching(tools, vaultName);
 
   return tools;
+}
+
+/**
+ * Errors that teach (T-318 §4): a parameter a tool doesn't accept is refused
+ * with the one-line fix and a pointer to `vault-info { help }`, instead of
+ * being silently ignored. A tool accepts every parameter in its full reference
+ * schema and in the short schema it advertises.
+ */
+function applyParamTeaching(tools: McpToolDef[], vaultName: string): void {
+  for (const tool of tools) {
+    const reference = tool.name === "manage-token" ? Object.keys(manageTokenReference(vaultName).inputSchema.properties as object) : acceptedParams(tool.name);
+    if (!reference) continue;
+    const accepted = [...new Set([...reference, ...Object.keys(((tool.inputSchema as { properties?: object }).properties) ?? {})])];
+    const execute = tool.execute;
+    tool.execute = async (params) => {
+      const problem = checkToolParams(tool.name, params ?? {}, accepted);
+      if (problem) throw Object.assign(new Error(problem.message), problem);
+      return execute(params);
+    };
+  }
 }
 
 /**
@@ -1039,6 +1062,20 @@ function overrideVaultInfo(
     // containing the scope name) — see "tools/call of vault-info with
     // description arg and vault:read scope is refused" in src/vault.test.ts.
     // Changing that transport shape is out of scope for this wave.
+    // `help` (T-318 §4): a tool's full reference, the long text and every
+    // parameter, which tools/list no longer carries.
+    if (params.help !== undefined) {
+      const name = String(params.help);
+      const ref = name === "manage-token" ? manageTokenReference(vaultName) : MCP_TOOL_REFERENCE.find((e) => e.name === name);
+      if (!ref) {
+        throw Object.assign(new Error(`No tool named "${name}". Tools: ${tools.map((t) => t.name).join(", ")}.`), {
+          error_type: "unknown_tool",
+          field: "help",
+          hint: "pass one of the tool names",
+        });
+      }
+      return { tool: ref.name, description: ref.description, parameters: ref.inputSchema };
+    }
     const config = readVaultConfig(vaultName);
     if (!config) throw new Error(`Vault "${vaultName}" not found`);
 
@@ -1190,14 +1227,13 @@ function resolveHubOrigin(): { url: string; source: string } {
  * matching the requested action. The MCP HTTP layer serializes the result
  * via `JSON.stringify`, so caller-side parsing keys off the action field.
  */
-function buildManageTokenTool(
-  vaultName: string,
-  auth: AuthResult | undefined,
-  callerBearer: string | null,
-): McpToolDef {
+/**
+ * manage-token's full reference (the long text agents saw before 0.9's
+ * description budget), for `vault-info { help: "manage-token" }`.
+ */
+export function manageTokenReference(vaultName: string): { name: string; description: string; inputSchema: Record<string, unknown> } {
   return {
     name: "manage-token",
-    requiredVerb: "admin",
     description:
       "Mint, revoke, or list short-TTL hub JWTs within this MCP session. " +
       "Designed for one-shot AI-driven workflows: mint a narrow token, run a " +
@@ -1246,6 +1282,33 @@ function buildManageTokenTool(
           type: "string",
           description: "(action=revoke) The jti (e.g. `t_abc123…`) returned by a prior mint. Revoke is idempotent — second revoke also returns ok=true.",
         },
+      },
+      required: ["action"],
+    },
+  };
+}
+
+function buildManageTokenTool(
+  vaultName: string,
+  auth: AuthResult | undefined,
+  callerBearer: string | null,
+): McpToolDef {
+  return {
+    name: "manage-token",
+    requiredVerb: "admin",
+    description:
+      "Mint, list or revoke short-lived keys for this vault. mint: `scope` (e.g. \"vault:" + vaultName + ":read\"), " +
+      "`ttl_seconds` (default 900, max 3600, or 90 days with `long_lived: true`), `description`. revoke: `jti`. " +
+      "Minted keys can't exceed yours. Every parameter: vault-info {help: \"manage-token\"}.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["mint", "revoke", "list"] },
+        scope: { oneOf: [{ type: "string" }, { type: "array", items: { type: "string" } }] },
+        ttl_seconds: { type: "number" },
+        long_lived: { type: "boolean" },
+        description: { type: "string" },
+        jti: { type: "string" },
       },
       required: ["action"],
     },

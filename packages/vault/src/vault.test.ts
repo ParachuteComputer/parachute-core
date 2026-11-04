@@ -915,7 +915,7 @@ describe("scoped MCP wrapper", async () => {
     expect(md).toContain("#person");
     expect(md).toContain("Querying");
     expect(md).toContain("vault-info");
-    expect(md).toContain("list-tags { include_schema: true }");
+    expect(md).toContain('vault-info { help: "<tool>" }');
 
     closeAllStores();
   });
@@ -947,7 +947,7 @@ describe("scoped MCP wrapper", async () => {
     expect(md).toContain("No indexed metadata fields");
     // Refresh hints surface both pointers so the agent knows where to look.
     expect(md).toContain("vault-info");
-    expect(md).toContain("list-tags");
+    expect(md).toContain("help");
 
     closeAllStores();
   });
