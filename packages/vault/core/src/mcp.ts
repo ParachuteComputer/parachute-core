@@ -160,8 +160,9 @@ function structuredError(
  * error naming a filter the caller didn't send.
  */
 function withSinceFilter(params: Record<string, unknown>): Record<string, unknown> {
-  if (params.since === undefined) return params;
-  const others = ["date_from", "date_to", "date_filter"].filter((k) => params[k] !== undefined);
+  // Null is how many clients send an optional they aren't using.
+  if (params.since === undefined || params.since === null) return params;
+  const others = ["date_from", "date_to", "date_filter"].filter((k) => params[k] !== undefined && params[k] !== null);
   if (others.length > 0) {
     throw new QueryError(
       `cannot combine since with ${others.join(", ")} — since is shorthand for date_filter on updated_at; pass one or the other`,
@@ -174,7 +175,7 @@ function withSinceFilter(params: Record<string, unknown>): Record<string, unknow
       "INVALID_QUERY",
     );
   }
-  const { since, ...rest } = params;
+  const { since, date_from: _from, date_to: _to, ...rest } = params;
   return { ...rest, date_filter: { field: "updated_at", from: since } };
 }
 

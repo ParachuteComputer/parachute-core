@@ -220,6 +220,20 @@ describe("live-match — predicate parity with the query engine", () => {
     await store.createNote("b", { tags: ["t"], metadata: { kind: "task" } });
     await assertParity({ tags: ["t"], metadata: { kind: "note" } });
   });
+
+  it("a bare metadata filter accepts the notes the query finds, for every stored value and probe (T-395)", async () => {
+    const stored: unknown[] = [true, false, 1, 0, 4, 1.5, "true", "false", "1", "4", "1.5", "no", "", "null", null, ["a", "b"], '["a","b"]', { k: 1 }, '{"k":1}', {}];
+    await store.upsertTagRecord("idx", { fields: { indexed_v: { type: "string", indexed: true } } });
+    for (const [i, v] of stored.entries()) {
+      await store.createNote(`v${i}`, { tags: ["t", "idx"], metadata: { v, indexed_v: v } });
+    }
+    await store.createNote("missing", { tags: ["t"], metadata: { other: 1 } });
+    const probes: unknown[] = [...stored.filter((v) => !(v && typeof v === "object" && !Array.isArray(v) && Object.keys(v).length > 0)), 5, "5", "missing"];
+    for (const probe of probes) {
+      await assertParity({ tags: ["t"], metadata: { v: probe } });
+      await assertParity({ tags: ["t"], metadata: { indexed_v: probe } });
+    }
+  });
 });
 
 describe("live-match — unsupportedSubscriptionReason cursor guard (vault#550)", () => {

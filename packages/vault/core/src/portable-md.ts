@@ -3041,8 +3041,15 @@ function parseArrayBlock(
     // Key regex matches parseBlock's (contract C2): dots + optional space. As
     // in YAML, a key's colon has a space or the end of the line after it, so
     // `- https://x` and `- 2027-02-03T17:00:00Z` are strings. The exporter wrote
-    // those unquoted until T-395, and this is what restores those exports.
-    const objMatch = after.match(/^([\w][\w.-]*)\s*:(?:\s+(.*))?$/);
+    // those unquoted until T-395, and this is what restores those exports. A
+    // string item never has lines under it, so one that does is an object whose
+    // first key holds a colon (keys aren't quoted): read it as this always did,
+    // or the keys under it are lost.
+    const nextLine = peekNextContent(lines, i + 1);
+    const hasLinesUnder = nextLine !== -1 && countLeadingSpaces(lines[nextLine]!) > indent;
+    const objMatch =
+      after.match(/^([\w][\w.-]*)\s*:(?:\s+(.*))?$/) ??
+      (hasLinesUnder ? after.match(/^([\w][\w.-]*)\s*:\s*(.*)$/) : null);
     if (!objMatch) {
       result.push(parseScalarOrInline(after, reading));
       i++;

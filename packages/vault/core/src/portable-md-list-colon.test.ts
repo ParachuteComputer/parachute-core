@@ -125,4 +125,11 @@ describe("the list rule in the parser", () => {
     expect(list("  - a:\n  - b\n")).toEqual([{ a: "" }, "b"]);
     expect(list("  - a:\tb\n")).toEqual([{ a: "b" }]);
   });
+
+  it("keeps an object item's other keys when its first key holds a colon", () => {
+    // The exporter doesn't quote keys, so `{"x:y": 1, "z": 2}` is written like this. Its first key comes back wrong, as
+    // it always did, but a string item never has lines under it, so this can't be one, and `z` must survive.
+    expect(list("  - x:y: 1\n    z: 2\n")).toEqual([{ x: "y: 1", z: 2 }]);
+    expect(list("  - plain:string\n  - x:y: 1\n    z: 2\n  - other:string\n")).toEqual(["plain:string", { x: "y: 1", z: 2 }, "other:string"]);
+  });
 });

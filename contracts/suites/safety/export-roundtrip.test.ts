@@ -115,6 +115,25 @@ describe("export, then import into a new vault", () => {
   });
 });
 
+describe("an object item whose first key holds a colon", () => {
+  test("an object item keeps its other keys, though the exporter doesn't quote that first key", async () => {
+    const op = operator();
+    const made = await op.post("/notes", { path: `${R}/colon-key`, content: "made up", metadata: { items: [{ "x:y": 1, z: 2 }] } });
+    expect(made.status).toBe(201);
+    const dir = join(SCRATCH, "colon-key");
+    await run(s.home, ["export", dir, "--vault", s.vaultName]);
+    const target = await restoreTarget("rt-key");
+    await run(target.home, ["import", dir, "--vault", target.vault, "--blow-away", "--yes"]);
+    const db = new Database(dbFile(target.home, target.vault), { readonly: true });
+    try {
+      const row = db.query("SELECT metadata FROM notes WHERE id = ?").get(made.body.id) as { metadata: string };
+      expect(JSON.parse(row.metadata).items[0].z).toBe(2);
+    } finally {
+      db.close();
+    }
+  });
+});
+
 describe("an export already on disk, written before the fix", () => {
   test("restores its colon list items as strings, and its object items as objects", async () => {
     const dir = join(SCRATCH, "old-export");

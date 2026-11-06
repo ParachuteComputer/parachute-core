@@ -103,7 +103,7 @@ describe("plain metadata equality: indexed routing is result-identical to the JS
   describe("a typed probe finds its JSON type (T-395)", () => {
     const seqs = (metadata: Record<string, unknown>) =>
       queryNotes(db, { metadata, sort: "asc" }).map((n) => n.metadata?.seq as number);
-    const VALUES: unknown[] = [true, false, 1, 0, 4, 1.5, "true", "false", "1", "4", "1.5", "null", null, "other"];
+    const VALUES: unknown[] = [true, false, 1, 0, 4, 1.5, 1e21, "true", "false", "1", "4", "1.5", "null", null, "other"];
     const at = (...wanted: unknown[]) => wanted.map((w) => VALUES.indexOf(w));
 
     async function seed(type: "string" | "integer" | "boolean") {
@@ -120,6 +120,8 @@ describe("plain metadata equality: indexed routing is result-identical to the JS
       [0, [0]],
       [4, [4, "4"]],
       [1.5, [1.5, "1.5"]],
+      // On a string index this holds only as a number: the column reads 1.0e+21, its JSON text 1e+21.
+      [1e21, [1e21]],
       [null, ["null", null]],
       // A string means the string, whatever it looks like.
       ["true", ["true"]],

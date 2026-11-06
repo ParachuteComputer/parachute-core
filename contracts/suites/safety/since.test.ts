@@ -1,9 +1,9 @@
 // `since` on MCP query-notes means "what changed since": edits count, not only new notes (T-395).
 //
 // Before the fix query-notes had no `since`: it was ignored, and the call came back with every note, unfiltered. PR
-// #21 points it at date_from, which is created_at, so an edit is missed either way. Fixed in packages/vault
-// (core/src/mcp.ts withSinceFilter). date_from stays what it says, created_at. Mutants "since-ignored" and
-// "since-on-created-at" put the bug back.
+// #21 still ignores it, with a hint to use date_from, which is created_at, so a caller who follows the hint misses
+// every edit. Fixed in packages/vault (core/src/mcp.ts withSinceFilter). date_from stays what it says, created_at.
+// Mutants "since-ignored" and "since-on-created-at" put the bug back.
 import { beforeAll, describe, expect, test } from "bun:test";
 import { mcp, operator, pass, paths, runId, services } from "../lib.ts";
 
@@ -78,6 +78,12 @@ describe("query-notes `since`", () => {
     for (const other of [{ date_from: at }, { date_to: at }, { date_filter: { field: "created_at", from: at } }]) {
       await expect(query({ since: at, ...other })).rejects.toThrow(/since/);
     }
+  });
+
+  test("null means not set, as clients send for an empty optional", async () => {
+    const all = paths(await query({}));
+    expect(paths(await query({ since: null }))).toEqual(all);
+    expect(paths(await query({ since: at, date_from: null, date_to: null, date_filter: null }))).toEqual([added, edited].sort());
   });
 
   test("a value that isn't a date is refused, not ignored", async () => {
