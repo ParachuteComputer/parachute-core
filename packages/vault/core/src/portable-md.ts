@@ -68,7 +68,8 @@
  * - Top-level frontmatter keys emitted in fixed order (above).
  * - Nested object keys alpha-sorted.
  * - Booleans `true`/`false`; numbers as-is; strings bare unless they
- *   contain YAML-meaningful characters, then single-quoted.
+ *   contain YAML-meaningful characters, then single-quoted. A list item with
+ *   a colon anywhere is always quoted.
  * - Trailing newline after closing `---`.
  *
  * Pin: vault → export → re-export → byte-identical bytes.
@@ -331,6 +332,18 @@ function quoteString(s: string): string {
   return `'${s.replace(/'/g, "''")}'`;
 }
 
+/**
+ * A scalar as a list item. `- https://x` is a string in YAML, but this module's
+ * parser read `- key:value` as an object until T-395, and importers from before
+ * then are still out there, so an item with a colon anywhere is quoted (also
+ * `- ends:`, a key with no value in any YAML). Only list items: a colon in a
+ * `key: value` scalar was always safe, and quoting those would rewrite every
+ * timestamp and URL in every existing export and git mirror.
+ */
+function emitListItem(value: unknown): string {
+  return typeof value === "string" && value.includes(":") ? quoteString(value) : emitScalar(value);
+}
+
 function emitScalar(value: unknown): string {
   if (value === null) return "null";
   if (value === undefined) return "null";
@@ -395,7 +408,7 @@ function emitValueBlock(value: unknown, indent: number): string | null {
     for (const item of value) {
       if (item === null || typeof item !== "object" || Array.isArray(item)) {
         // Scalar / array item — single line with `- `.
-        lines.push(`${pad}- ${emitScalar(item)}`);
+        lines.push(`${pad}- ${emitListItem(item)}`);
       } else {
         // Object item: emit keys with `- ` prefix on the first key, hanging
         // indent for the rest. Alpha-sort keys for idempotency.
@@ -3025,8 +3038,11 @@ function parseArrayBlock(
     // First content after `- `.
     const after = line.slice(indent + 2).trim();
     // Is this a scalar item (`- foo`) or an object item (`- key: value`)?
-    // Key regex matches parseBlock's (contract C2): dots + optional space.
-    const objMatch = after.match(/^([\w][\w.-]*)\s*:\s*(.*)$/);
+    // Key regex matches parseBlock's (contract C2): dots + optional space. As
+    // in YAML, a key's colon has a space or the end of the line after it, so
+    // `- https://x` and `- 2027-02-03T17:00:00Z` are strings. The exporter wrote
+    // those unquoted until T-395, and this is what restores those exports.
+    const objMatch = after.match(/^([\w][\w.-]*)\s*:(?:\s+(.*))?$/);
     if (!objMatch) {
       result.push(parseScalarOrInline(after, reading));
       i++;
@@ -3038,7 +3054,7 @@ function parseArrayBlock(
     // synthesize a normalized block string and recurse.
     const itemIndent = indent + 2;
     const itemKey = objMatch[1]!;
-    const itemValue = objMatch[2]!.trim();
+    const itemValue = (objMatch[2] ?? "").trim();
     const itemObj: Record<string, unknown> = {};
     if (itemValue === "") {
       // First key's value is a nested block — look at next line.
