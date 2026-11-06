@@ -139,4 +139,9 @@ describe("the list rule in the parser", () => {
     expect(list("  - x:y: 1\n    z: 2\n  - x:y: 3\n")).toEqual([{ x: "y: 1", z: 2 }, { x: "y: 3" }]);
     expect(list("  - 12:30: standup\n")).toEqual([{ "12": "30: standup" }]);
   });
+
+  it("keeps such an item an object when that key's value is a block under it", () => {
+    // `{"x:y": {c: 1}}`. The value is lost, as it always was; what's pinned is that the item stays an object.
+    expect(list("  - x:y:\n      c: 1\n  - plain:string\n")).toEqual([{ x: "y:" }, "plain:string"]);
+  });
 });
