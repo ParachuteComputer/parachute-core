@@ -337,9 +337,15 @@ describe("status — inside @openparachute/core: VERSION says what serves the ho
   });
 
   test("a placeholder row prints the installed package's version instead of 0.0.0-linked", async () => {
-    const out = await render({ version: "0.0.0-linked", installDir: coreVault });
-    expect(vaultLine(out)).toContain(coreVersion);
-    expect(out).not.toContain("0.0.0-linked");
+    const installed = mkdtempSync(join(tmpdir(), "pcli-installed-"));
+    try {
+      writeFileSync(join(installed, "package.json"), JSON.stringify({ version: "0.22.15" }));
+      const out = await render({ version: "0.0.0-linked", installDir: installed });
+      expect(vaultLine(out)).toContain("0.22.15");
+      expect(out).not.toContain("0.0.0-linked");
+    } finally {
+      rmSync(installed, { recursive: true, force: true });
+    }
   });
 
   test("a box still served by npm's 0.7 vault keeps saying so", async () => {
