@@ -7,6 +7,7 @@ import { computeDisplayTitle, skipLeadingFrontmatter } from "./display-title.js"
 import { transaction } from "./txn.js";
 import {
   buildOperatorClause,
+  buildPlainEqualityClause,
   isOperatorObject,
   QueryError,
   requireIndexedField,
@@ -1355,14 +1356,14 @@ export function buildFilterConditions(db: Database, opts: QueryOpts): { conditio
   }
 
   // Metadata filters — operator objects route through the indexed generated
-  // column (fast, loud errors on non-indexed fields); primitives keep the
-  // existing JSON-scan exact-match behavior for backcompat.
+  // column (fast, loud errors on non-indexed fields); primitives are an exact
+  // match on the JSON, bound by type (buildPlainEqualityClause).
   //
   // Plain-equality fast path (2026-06-10 perf measurements): when the field
   // happens to be indexed, a plain `{field: value}` equality used to pay the
   // same full-table json_extract scan as a non-indexed field — 280× slower
   // than the operator form `{field: {eq: value}}` ON THE SAME column. We now
-  // prepend an indexed-prefilter conjunct (`"meta_<field>" = ?`) so the
+  // prepend an indexed-prefilter conjunct (`"meta_<field>" IN (...)`) so the
   // B-tree narrows the candidates, while KEEPING the original json_extract
   // clause as a residual predicate. The conjunction is result-identical to
   // the scan by construction: any row the scan matches also satisfies the
@@ -1383,16 +1384,17 @@ export function buildFilterConditions(db: Database, opts: QueryOpts): { conditio
         conditions.push(sql);
         params.push(...opParams);
       } else {
-        const bound = typeof value === "string" ? value : JSON.stringify(value);
+        const eq = buildPlainEqualityClause(key, value);
         // `getIndexedField` returning a row proves `key` was validated by
         // FIELD_NAME_RE at declaration time, so interpolating the column
         // name is safe — same justification as buildOperatorClause.
-        if (getIndexedField(db, key)) {
-          conditions.push(`("meta_${key}" = ? AND json_extract(n.metadata, '$.' || ?) = ?)`);
-          params.push(bound, key, bound);
+        if (eq.indexProbes && getIndexedField(db, key)) {
+          const slots = eq.indexProbes.map(() => "?").join(", ");
+          conditions.push(`("meta_${key}" IN (${slots}) AND ${eq.sql})`);
+          params.push(...eq.indexProbes, ...eq.params);
         } else {
-          conditions.push(`json_extract(n.metadata, '$.' || ?) = ?`);
-          params.push(key, bound);
+          conditions.push(eq.sql);
+          params.push(...eq.params);
         }
       }
     }
