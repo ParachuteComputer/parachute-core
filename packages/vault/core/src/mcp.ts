@@ -723,8 +723,8 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
     // =====================================================================
     {
       name: "query-notes",
-      execute: async (rawParams) => {
-        const params = withSinceFilter(rawParams);
+      execute: async (params) => {
+        params = withSinceFilter(params);
         // --- Ambiguous-links scope split (vault#581 auth review) ---
         // `requestedHasAmbiguous` is what the caller asked for;
         // `sqlHasAmbiguous` is what is safe to push into SQL for a reader
