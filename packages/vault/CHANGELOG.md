@@ -6,7 +6,12 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+### Fixed
+- `query-notes` / `GET /notes`: a bare metadata filter on a boolean, number or null (`{done: true}`, `{streak: 4}`, `?meta[done]=true`) now finds notes holding that JSON value. It silently returned none, indexed or not, because the value was bound as text. A stored string that reads the same (`"true"`, `"4"`) still matches, as it always did; a string filter (`{streak: "4"}`) still finds only the string. REST bracket values that are exactly how JSON writes a boolean or number now read as one, so a persisted cursor bound to such a filter gets `cursor_query_mismatch` once and needs a fresh bootstrap (T-395).
+- Portable-md export and import: a list item with a colon and no space (`https://x`, `mailto:…`, `room:ops`, a timestamp) came back as an object (`{"https":"//x"}`), in metadata and in a type's enum values. The exporter now quotes such items, and the importer's list rule follows YAML (a key's colon has a space or the end of the line after it), which also restores exports written before this fix. The first export after upgrading rewrites the notes that hold such items, once (T-395).
+
 ### Added
+- MCP `query-notes`: `since` (ISO), the notes made or edited at or after that time, as shorthand for `date_filter: {field: "updated_at", from}`. Before, `since` was ignored and the call returned every note. `date_from` still means `created_at` (T-395).
 - `query-notes` / `GET /notes`: `near.direction` (`both` | `inbound` | `outbound`, applied at every hop) for directed graph traversal (#777), with the REST `near` scope now applied before pagination (#778).
 - `near.then` / `near[then][relationship|direction|depth]`: optional second hop that walks from every first-hop note (anchor included), enabling a subtree rollup in one request (#779).
 - `aggregate` now composes with `near` (the neighborhood id set scopes the rollup before every other filter); it remains exclusive with `search`, `cursor` and `semantic` (#779).
