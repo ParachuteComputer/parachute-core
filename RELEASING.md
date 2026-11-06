@@ -36,8 +36,9 @@ The npm name `parachute` belongs to someone else, so the package stays `@openpar
 To cut a prerelease: a PR that bumps `version` in `package.json`, `packages/cli/package.json`,
 `packages/hub/package.json` and `packages/vault/package.json` (and those lines in `bun.lock`) to the next `0.8.0-pre.N`,
 CI green, merged. All four carry core's version because the hub and the vault report their own: `/health`,
-`parachute status` and the vault's service card read them, and the contract in `lifecycle/identity.test.ts` goes red if
-one is missed. They are not published on their own; npm's `@openparachute/hub` and `vault` stay at 0.7. To promote: a PR that only drops the suffix (`0.8.0`), merged; then the approval.
+`parachute status` and the vault's service card read them. A test in `scripts/release-plan.test.ts` goes red on a PR that
+misses one, and `plan` refuses to publish it. They are not published on their own; npm's `@openparachute/hub` and `vault`
+stay at 0.7. To promote: a PR that only drops the suffix (`0.8.0`), merged; then the approval.
 
 ## Who approves a `latest`
 

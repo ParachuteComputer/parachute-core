@@ -172,7 +172,11 @@ describe("identity", () => {
       expect(((await (await safeFetch(`${origin}/health`)).json()) as { version: string }).version).toBe(version);
 
       const status = await m.run([bin, "status"], { env: { PARACHUTE_HOME: m.home } });
-      const line = (service: string) => status.stdout.split("\n").find((l) => l.trim().startsWith(service)) ?? `no ${service} row in:\n${status.stdout}${status.stderr}`;
+      const line = (service: string) => {
+        const found = status.stdout.split("\n").find((l) => l.trim().startsWith(service));
+        must(found !== undefined, `no ${service} row in:\n${status.stdout}${status.stderr}`);
+        return found!;
+      };
       expect(line("parachute-hub")).toContain(version);
       expect(line("parachute-vault")).toContain(version);
       expect(line("parachute-app")).toContain("0.22.15");

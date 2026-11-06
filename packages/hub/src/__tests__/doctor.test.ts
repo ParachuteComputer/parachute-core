@@ -541,6 +541,11 @@ describe("doctor — version drift (cosmetic; never FAIL)", () => {
       seedOperatorToken(h.configDir);
       const { checks } = await runDoctor(h, healthyDeps());
       expect(byName(checks, "version-drift")?.status).toBe("pass");
+
+      // Nothing readable there, and the warning still has something to say.
+      rmSync(join(installDir, "package.json"));
+      const again = await runDoctor(h, healthyDeps());
+      expect(byName(again.checks, "version-drift")?.status).toBe("warn");
     } finally {
       h.cleanup();
     }

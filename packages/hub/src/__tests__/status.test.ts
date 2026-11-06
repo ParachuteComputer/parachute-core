@@ -310,7 +310,9 @@ describe("status — inside @openparachute/core: VERSION says what serves the ho
   }
 
   function vaultLine(out: string): string {
-    return out.split("\n").find((l) => l.trim().startsWith("parachute-vault")) ?? out;
+    const line = out.split("\n").find((l) => l.trim().startsWith("parachute-vault"));
+    if (line === undefined) throw new Error(`no vault row in:\n${out}`);
+    return line;
   }
 
   test("a row an earlier 0.8 stamped 0.7.9 reads as core's version, with no STALE line", async () => {
@@ -332,6 +334,12 @@ describe("status — inside @openparachute/core: VERSION says what serves the ho
     } finally {
       rmSync(npmVault, { recursive: true, force: true });
     }
+  });
+
+  test("a placeholder row prints the installed package's version instead of 0.0.0-linked", async () => {
+    const out = await render({ version: "0.0.0-linked", installDir: coreVault });
+    expect(vaultLine(out)).toContain(coreVersion);
+    expect(out).not.toContain("0.0.0-linked");
   });
 
   test("a box still served by npm's 0.7 vault keeps saying so", async () => {

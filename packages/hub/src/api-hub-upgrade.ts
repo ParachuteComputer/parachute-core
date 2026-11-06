@@ -46,6 +46,7 @@ import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { defaultRunner, detectChannel } from "./commands/upgrade.ts";
+import { coreRoot } from "./core-host.ts";
 import { HUB_PACKAGE } from "./hub-control.ts";
 import { type HubUpgradeMode, detectHubUpgradeMode } from "./hub-upgrade-mode.ts";
 import {
@@ -254,6 +255,16 @@ export async function handleHubUpgrade(req: Request, deps: ApiHubUpgradeDeps): P
 
   const parsed = await parseBody(req);
   if (parsed instanceof Response) return parsed;
+
+  // Inside @openparachute/core the hub is this program, and npm's @openparachute/hub is 0.7's, never an update for
+  // it. The helper would refuse anyway (commands/upgrade.ts), after a pointless restart and a poll that can't succeed.
+  if (coreRoot(deps.env ?? process.env)) {
+    return jsonError(
+      409,
+      "part_of_core",
+      "the hub is part of @openparachute/core: upgrade core itself (re-run the installer, or `bun add -g @openparachute/core@next`), then `parachute restart`",
+    );
+  }
 
   const now = (deps.now ?? (() => new Date()))();
 

@@ -65,6 +65,17 @@ export function prereleasesOf(version: string, published: string[]): string[] {
 export const STABLE_NOTES = ["CHANGELOG.md", "RELEASING.md"];
 export const STABLE_VERSION_ONLY = ["package.json", "packages/cli/package.json", "packages/hub/package.json", "packages/vault/package.json", "bun.lock"];
 
+/** The manifests besides the root's that carry core's version: the hub and the vault report theirs as what runs. */
+export const VERSION_MANIFESTS = ["packages/cli/package.json", "packages/hub/package.json", "packages/vault/package.json"];
+
+/** The manifests that don't say `version`, each with what it says: published like that, a 0.8 box would report them. */
+export function manifestsOffVersion(version: string, readVersion: (path: string) => string | undefined): string[] {
+  return VERSION_MANIFESTS.flatMap((p) => {
+    const v = readVersion(p);
+    return v === version ? [] : [`${p} (${v ?? "unreadable"})`];
+  });
+}
+
 /** Changed paths a stable may not carry past its prerelease (the version-only files are checked by their diff). */
 export function changedPastPrerelease(paths: string[]): string[] {
   return paths.filter((p) => p && !STABLE_NOTES.includes(p) && !STABLE_VERSION_ONLY.includes(p));
@@ -147,6 +158,17 @@ if (import.meta.main) {
       }
       if (extra.length) decision = { refuse: true, reason: `${version} changes more than its prerelease ${pre} did: ${extra.join(", ")}` };
     }
+  }
+  // Whichever channel: every manifest that carries core's version says this one.
+  if ("publish" in decision && decision.publish) {
+    const off = manifestsOffVersion(version, (p) => {
+      try {
+        return JSON.parse(readFileSync(p, "utf8")).version;
+      } catch {
+        return undefined;
+      }
+    });
+    if (off.length) decision = { refuse: true, reason: `${version} isn't what these manifests say: ${off.join(", ")}. RELEASING.md: a bump changes all of them.` };
   }
   if ("refuse" in decision) {
     console.error(`::error::${pkg.name}@${version}: ${decision.reason}`);

@@ -152,6 +152,21 @@ describe("POST /api/hub/upgrade — auth gate", () => {
   });
 });
 
+describe("POST /api/hub/upgrade — inside @openparachute/core", () => {
+  test("409 with what to do instead: no helper, no restart, no offer of npm's 0.7 hub", async () => {
+    const bearer = await mintBearer(harness, ["parachute:host:admin"]);
+    // packages/hub/src/__tests__ → the package root, as core's `parachute` sets it.
+    const root = join(import.meta.dir, "..", "..", "..", "..");
+    const { deps, spawned } = baseDeps(harness, { env: { PARACHUTE_CORE_ROOT: root } });
+    const res = await handleHubUpgrade(postReq({ authorization: `Bearer ${bearer}` }), deps);
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: string; error_description: string };
+    expect(body.error).toBe("part_of_core");
+    expect(body.error_description).toContain("@openparachute/core");
+    expect(spawned.length).toBe(0);
+  });
+});
+
 describe("POST /api/hub/upgrade — channel validation (closed enum)", () => {
   test("rejects a non-enum channel with 400", async () => {
     const bearer = await mintBearer(harness, ["parachute:host:admin"]);
