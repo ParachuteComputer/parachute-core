@@ -626,6 +626,20 @@ function parseNonNegativeIntParam(
 }
 
 /**
+ * The value of `?meta[field]=value`. A query string carries no types, so a
+ * value that is exactly how JSON writes a boolean or number reads as that, and
+ * the engine's bare equality still finds the same text stored as a string.
+ * Anything else stays a string: `01234`, `1.50` and `1e3` are not how JSON
+ * writes a number, and a stored `"01234"` must keep matching.
+ */
+function shorthandValue(value: string): string | number | boolean {
+  if (value === "true") return true;
+  if (value === "false") return false;
+  const n = Number(value);
+  return Number.isFinite(n) && String(n) === value ? n : value;
+}
+
+/**
  * Parse bracket-style metadata filters (vault#285 friction point 1.3).
  *
  * Maps `?meta[field][op]=value` (Stripe / JSON:API / Strapi convention) to
@@ -662,20 +676,6 @@ function parseNonNegativeIntParam(
  * caller should return it directly (already shaped as a 400 with
  * `error` + `code`).
  */
-/**
- * The value of `?meta[field]=value`. A query string carries no types, so a
- * value that is exactly how JSON writes a boolean or number reads as that, and
- * the engine's bare equality still finds the same text stored as a string.
- * Anything else stays a string: `01234`, `1.50` and `1e3` are not how JSON
- * writes a number, and a stored `"01234"` must keep matching.
- */
-function shorthandValue(value: string): string | number | boolean {
-  if (value === "true") return true;
-  if (value === "false") return false;
-  const n = Number(value);
-  return Number.isFinite(n) && String(n) === value ? n : value;
-}
-
 function parseMetaBrackets(url: URL): {
   metadata?: Record<string, unknown>;
   dateFilter?: { field: string; from?: string; to?: string };

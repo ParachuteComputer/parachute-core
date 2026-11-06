@@ -116,9 +116,9 @@ describe("export, then import into a new vault", () => {
 });
 
 describe("an object item whose first key holds a colon", () => {
-  test("an object item keeps its other keys, though the exporter doesn't quote that first key", async () => {
+  test("an object item keeps its other keys, and stays an object, though the exporter doesn't quote that first key", async () => {
     const op = operator();
-    const made = await op.post("/notes", { path: `${R}/colon-key`, content: "made up", metadata: { items: [{ "x:y": 1, z: 2 }] } });
+    const made = await op.post("/notes", { path: `${R}/colon-key`, content: "made up", metadata: { items: [{ "x:y": 1, z: 2 }, { "x:y": 3 }] } });
     expect(made.status).toBe(201);
     const dir = join(SCRATCH, "colon-key");
     await run(s.home, ["export", dir, "--vault", s.vaultName]);
@@ -127,7 +127,9 @@ describe("an object item whose first key holds a colon", () => {
     const db = new Database(dbFile(target.home, target.vault), { readonly: true });
     try {
       const row = db.query("SELECT metadata FROM notes WHERE id = ?").get(made.body.id) as { metadata: string };
-      expect(JSON.parse(row.metadata).items[0].z).toBe(2);
+      const [first, second] = JSON.parse(row.metadata).items;
+      expect(first.z).toBe(2);
+      expect(typeof second).toBe("object");
     } finally {
       db.close();
     }
@@ -135,10 +137,11 @@ describe("an object item whose first key holds a colon", () => {
 });
 
 describe("an export already on disk, written before the fix", () => {
-  test("restores its colon list items as strings, and its object items as objects", async () => {
-    const dir = join(SCRATCH, "old-export");
+  // Both sides of FLOW_QUOTING_SINCE (core/src/portable-md.ts): the importer reads scalars differently by export date.
+  test.each(["2026-10-01T00:00:00.000Z", "2026-11-01T00:00:00.000Z"])("restores its colon list items as strings, and its object items as objects (exported %s)", async (exportedAt) => {
+    const dir = join(SCRATCH, `old-export-${exportedAt.slice(0, 10)}`);
     mkdirSync(join(dir, ".parachute"), { recursive: true });
-    writeFileSync(join(dir, ".parachute", "vault.yaml"), "exported_at: 2026-11-01T00:00:00.000Z\nformat_version: 1\nname: old\n");
+    writeFileSync(join(dir, ".parachute", "vault.yaml"), `exported_at: ${exportedAt}\nformat_version: 1\nname: old\n`);
     const id = "01M66HE43WKN0Z7EZ0766D7S6N";
     // Exactly what the old exporter wrote for these values. Made-up data.
     writeFileSync(

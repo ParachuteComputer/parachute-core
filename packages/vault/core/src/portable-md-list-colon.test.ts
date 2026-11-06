@@ -132,4 +132,11 @@ describe("the list rule in the parser", () => {
     expect(list("  - x:y: 1\n    z: 2\n")).toEqual([{ x: "y: 1", z: 2 }]);
     expect(list("  - plain:string\n  - x:y: 1\n    z: 2\n  - other:string\n")).toEqual(["plain:string", { x: "y: 1", z: 2 }, "other:string"]);
   });
+
+  it("keeps such an item an object when that key is its only one", () => {
+    // Every exporter quotes a string holding `: `, so bare it can only be a key and its value.
+    expect(list("  - x:y: 1\n")).toEqual([{ x: "y: 1" }]);
+    expect(list("  - x:y: 1\n    z: 2\n  - x:y: 3\n")).toEqual([{ x: "y: 1", z: 2 }, { x: "y: 3" }]);
+    expect(list("  - 12:30: standup\n")).toEqual([{ "12": "30: standup" }]);
+  });
 });
