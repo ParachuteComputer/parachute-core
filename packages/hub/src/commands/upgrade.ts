@@ -70,7 +70,7 @@ import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "../config.ts";
-import { bundledModuleDir, coreRoot, isCoreVaultDir, takenOver } from "../core-host.ts";
+import { bundledModuleDir, coreRoot, servingCoreVaultDir } from "../core-host.ts";
 import { HUB_PACKAGE, HUB_SVC } from "../hub-control.ts";
 import {
   type HubUnitDeps,
@@ -924,8 +924,7 @@ async function upgradeNpm(target: ResolvedTarget, sourceDir: string, r: Resolved
  */
 function runsBundled(target: ResolvedTarget, r: Resolved): boolean {
   if (!bundledModuleDir(target.packageName)) return false;
-  const dir = target.entry.installDir;
-  return (dir !== undefined && isCoreVaultDir(dir)) || takenOver(r.configDir);
+  return servingCoreVaultDir(target.entry.installDir, r.configDir) !== null;
 }
 
 async function upgradeOne(target: ResolvedTarget, r: Resolved): Promise<number> {

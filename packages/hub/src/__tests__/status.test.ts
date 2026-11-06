@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { status } from "../commands/status.ts";
@@ -262,6 +262,102 @@ describe("status — table + hub row", () => {
       expect(out).toMatch(/npm \(0\.22\.11\)/);
       expect(out).not.toMatch(/STALE:/);
     });
+  });
+});
+
+describe("status — inside @openparachute/core: VERSION says what serves the home", () => {
+  // packages/hub/src/__tests__ → the package root, as core's `parachute` sets it.
+  const coreRoot = join(import.meta.dir, "..", "..", "..", "..");
+  const coreVault = join(coreRoot, "packages", "vault");
+  const coreVersion: string = JSON.parse(readFileSync(join(coreRoot, "package.json"), "utf8")).version;
+
+  async function render(
+    row: { version: string; installDir: string },
+    setup: (configDir: string) => void = () => {},
+  ): Promise<string> {
+    const { path, configDir, cleanup } = makeTempPath();
+    const before = process.env.PARACHUTE_CORE_ROOT;
+    process.env.PARACHUTE_CORE_ROOT = coreRoot;
+    try {
+      setup(configDir);
+      upsertService(
+        {
+          name: "parachute-vault",
+          port: 1940,
+          paths: ["/vault/default"],
+          health: "/vault/default/health",
+          ...row,
+        },
+        path,
+      );
+      const lines: string[] = [];
+      await status({
+        ...supervisorOpts(configDir, path, {
+          moduleStates: {
+            supervisorAvailable: true,
+            modules: [runningModule("vault", row.version)],
+          },
+        }),
+        installSourceDeps: { bunGlobalPrefixes: () => [], readGitHead: () => undefined },
+        print: (l) => lines.push(l),
+      });
+      return lines.join("\n");
+    } finally {
+      if (before === undefined) Reflect.deleteProperty(process.env, "PARACHUTE_CORE_ROOT");
+      else process.env.PARACHUTE_CORE_ROOT = before;
+      cleanup();
+    }
+  }
+
+  function vaultLine(out: string): string {
+    const line = out.split("\n").find((l) => l.trim().startsWith("parachute-vault"));
+    if (line === undefined) throw new Error(`no vault row in:\n${out}`);
+    return line;
+  }
+
+  test("a row an earlier 0.8 stamped 0.7.9 reads as core's version, with no STALE line", async () => {
+    const out = await render({ version: "0.7.9", installDir: coreVault });
+    expect(vaultLine(out)).toContain(coreVersion);
+    expect(vaultLine(out)).not.toContain("0.7.9");
+    expect(out).not.toMatch(/STALE:/);
+  });
+
+  test("a taken-over home's row still names the old npm vault: core's vault serves it, so core's version", async () => {
+    const npmVault = mkdtempSync(join(tmpdir(), "pcli-npm-vault-"));
+    try {
+      writeFileSync(join(npmVault, "package.json"), JSON.stringify({ version: "0.7.9" }));
+      const out = await render({ version: "0.7.9", installDir: npmVault }, (configDir) =>
+        writeFileSync(join(configDir, "takeover.json"), JSON.stringify({ state: "taken-over" })),
+      );
+      expect(vaultLine(out)).toContain(coreVersion);
+      expect(vaultLine(out)).not.toContain("0.7.9");
+    } finally {
+      rmSync(npmVault, { recursive: true, force: true });
+    }
+  });
+
+  test("a placeholder row prints the installed package's version instead of 0.0.0-linked", async () => {
+    const installed = mkdtempSync(join(tmpdir(), "pcli-installed-"));
+    try {
+      writeFileSync(join(installed, "package.json"), JSON.stringify({ version: "0.22.15" }));
+      const out = await render({ version: "0.0.0-linked", installDir: installed });
+      expect(vaultLine(out)).toContain("0.22.15");
+      expect(out).not.toContain("0.0.0-linked");
+    } finally {
+      rmSync(installed, { recursive: true, force: true });
+    }
+  });
+
+  test("a box still served by npm's 0.7 vault keeps saying so", async () => {
+    const npmVault = mkdtempSync(join(tmpdir(), "pcli-npm-vault-"));
+    try {
+      writeFileSync(join(npmVault, "package.json"), JSON.stringify({ version: "0.7.9" }));
+      const out = await render({ version: "0.7.9", installDir: npmVault });
+      expect(vaultLine(out)).toContain("0.7.9");
+      expect(vaultLine(out)).not.toContain(coreVersion);
+    } finally {
+      rmSync(npmVault, { recursive: true, force: true });
+    }
   });
 });
 

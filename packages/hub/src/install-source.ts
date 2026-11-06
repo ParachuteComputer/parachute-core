@@ -148,6 +148,11 @@ function readVersion(packageDir: string, readJson: (p: string) => unknown): stri
   return undefined;
 }
 
+/** The `version` in `<packageDir>/package.json`, or undefined when it can't be read. */
+export function readInstalledPackageVersion(packageDir: string): string | undefined {
+  return readVersion(packageDir, defaultReadJson);
+}
+
 export interface DetectArgs {
   /** The services.json row name (`parachute-vault`, `agent`, etc.). */
   readonly entryName: string;

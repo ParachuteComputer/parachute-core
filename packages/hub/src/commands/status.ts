@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite";
 import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "../config.ts";
+import { servingCoreVaultDir } from "../core-host.ts";
 import { readHubPort } from "../hub-control.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { type SelfProbeState, readHubInstanceFile } from "../hub-instance.ts";
@@ -29,7 +30,12 @@ import {
   OperatorTokenExpiredError,
   fetchModuleStates as fetchModuleStatesImpl,
 } from "../module-ops-client.ts";
-import { canonicalPortForManifest, getSpec, shortNameForManifest } from "../service-spec.ts";
+import {
+  SEED_VERSION,
+  canonicalPortForManifest,
+  getSpec,
+  shortNameForManifest,
+} from "../service-spec.ts";
 import { type ServiceEntry, readManifest } from "../services-manifest.ts";
 
 export interface StatusOpts {
@@ -236,6 +242,8 @@ function urlForEntry(entry: ServiceEntry, short: string | undefined): string | u
  * Pure over the manifest entry + install-source deps; no process / network read.
  */
 interface ManifestRowBase {
+  /** What VERSION prints: the row's cached version, unless we know better (see manifestRowBase). */
+  version: string;
   short: string | undefined;
   url: string | undefined;
   driftWarning?: string;
@@ -254,6 +262,7 @@ interface ManifestRowBase {
 
 function manifestRowBase(
   entry: ServiceEntry,
+  configDir: string,
   installSourceDeps: DetectInstallSourceDeps,
   servedResolutionDeps: DetectServedResolutionDeps,
   launch?: { pid?: number | null; recordedCwd?: string },
@@ -276,12 +285,23 @@ function manifestRowBase(
 
   // Install-source detection (hub#243). One filesystem walk + maybe one
   // `git rev-parse` per row. Failures degrade silently to `unknown`.
+  // Core's vault never rewrites its row on boot (core keeps services.json as the old hub left it, for a rollback), so
+  // on core the row can't tell us the version: an upgraded or taken-over home keeps the 0.7.x the row was written with.
+  // Ask the vault that serves the home instead.
+  const coreVaultDir = short === "vault" ? servingCoreVaultDir(entry.installDir, configDir) : null;
+  const installDir = coreVaultDir ?? entry.installDir;
   const detectArgs: { entryName: string; installDir?: string } = { entryName: entry.name };
-  if (entry.installDir !== undefined) detectArgs.installDir = entry.installDir;
+  if (installDir !== undefined) detectArgs.installDir = installDir;
   const source = detectInstallSource(detectArgs, installSourceDeps);
   const sourceLabel = formatInstallSourceLabel(source);
-  const staleNote = isStale(entry.version, source)
-    ? `STALE: services.json cached ${entry.version}; live package.json ${source.livePackageVersion}`
+  // SEED_VERSION isn't a version: it's the install-time placeholder, and the rows hub serves itself (`app`, hub#831)
+  // keep it, having no boot of their own to replace it. What's on disk is the better answer for both.
+  const version =
+    coreVaultDir !== null || entry.version === SEED_VERSION
+      ? (source.livePackageVersion ?? entry.version)
+      : entry.version;
+  const staleNote = isStale(version, source)
+    ? `STALE: services.json cached ${version}; live package.json ${source.livePackageVersion}`
     : undefined;
 
   // Served-bundle guardrail (hub#780 / hub#783). Only shim-served rows
@@ -320,7 +340,8 @@ function manifestRowBase(
         : `failed to start: ${entry.lastStartError.error_description.split("\n")[0]}`
       : undefined;
 
-  return { short, url, driftWarning, sourceLabel, staleNote, servedNote, manifestStartErrorNote };
+  return {
+    version, short, url, driftWarning, sourceLabel, staleNote, servedNote, manifestStartErrorNote };
 }
 
 export async function status(opts: StatusOpts = {}): Promise<number> {
@@ -645,7 +666,7 @@ async function buildSupervisorRows(args: BuildSupervisorRowsArgs): Promise<Statu
   const rows: StatusRow[] = manifest.services.map((entry) => {
     const short = shortNameForManifest(entry.name) ?? (entry.installDir ? entry.name : undefined);
     const snap = short ? stateByShort.get(short) : undefined;
-    const base = manifestRowBase(entry, installSourceDeps, servedResolutionDeps, {
+    const base = manifestRowBase(entry, configDir, installSourceDeps, servedResolutionDeps, {
       pid: snap?.pid ?? null,
     });
 
@@ -655,7 +676,7 @@ async function buildSupervisorRows(args: BuildSupervisorRowsArgs): Promise<Statu
       return {
         service: entry.name,
         port: String(entry.port),
-        version: entry.version,
+        version: base.version,
         stateLabel: "inactive",
         pidLabel: "-",
         uptimeLabel: "-",
@@ -682,7 +703,7 @@ async function buildSupervisorRows(args: BuildSupervisorRowsArgs): Promise<Statu
       const row: StatusRow = {
         service: entry.name,
         port: String(entry.port),
-        version: entry.version,
+        version: base.version,
         stateLabel: "active",
         pidLabel: "-",
         uptimeLabel: "-",
@@ -717,7 +738,7 @@ async function buildSupervisorRows(args: BuildSupervisorRowsArgs): Promise<Statu
     const row: StatusRow = {
       service: entry.name,
       port: String(entry.port),
-      version: entry.version,
+      version: base.version,
       stateLabel,
       pidLabel: snap?.pid !== undefined && snap?.pid !== null ? String(snap.pid) : "-",
       uptimeLabel: "-",
