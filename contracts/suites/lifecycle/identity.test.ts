@@ -126,6 +126,70 @@ describe("identity", () => {
     if (existsSync(root)) expect(v.version).toBe(JSON.parse(readFileSync(root, "utf8")).version);
   }, 120_000);
 
+  // T-387: a live 0.8 walk (0.8.0-pre.3) showed `status` and /health saying hub 0.7.19 and vault 0.7.9, the app row
+  // saying 0.0.0-linked, and doctor warning about it, with a fix that couldn't clear it. Core's vault doesn't rewrite
+  // its row on boot, so the home an earlier 0.8 left keeps the old version unless the readers ask what's serving.
+  test("/health, `parachute status` and doctor report what runs, on a fresh home and on one an earlier 0.8 left", async () => {
+    const m = await machine("id-labels", false);
+    requireCore(m.info);
+    const bin = join(m.info.dir, "bin", "parachute");
+    const version = json(await m.run([bin, "version", "--json"]), "version --json").version;
+    // The two steps a fresh `parachute init` and its wizard take: register the vault core carries, create the first one.
+    for (const argv of [[bin, "install", "vault", "--no-start"], [join(m.info.dir, "bin", "parachute-vault"), "create", "default"]]) {
+      const r = await m.run(argv, { env: { PARACHUTE_HOME: m.home } });
+      must(r.code === 0, `${argv.slice(1).join(" ")}: exit ${r.code}\n${r.stdout}${r.stderr}`);
+    }
+
+    const manifest = join(m.home, "services.json");
+    const rows = () => JSON.parse(readFileSync(manifest, "utf8")).services as { name: string; version: string; installDir?: string }[];
+    const fresh = rows().find((r) => r.name === "parachute-vault");
+    expect({ row: "the vault's on a fresh home", version: fresh?.version }).toEqual({ row: "the vault's on a fresh home", version });
+
+    // What an earlier 0.8 left: the vault's row at the old version, and the app's at the install-time placeholder
+    // (hub serves the app's files itself, so nothing ever replaces it).
+    const app = join(m.user, "installed-app");
+    mkdirSync(app, { recursive: true });
+    writeFileSync(join(app, "package.json"), JSON.stringify({ name: "@openparachute/app", version: "0.22.15" }));
+    writeFileSync(
+      manifest,
+      JSON.stringify({
+        services: [
+          ...rows().map((r) => (r.name === "parachute-vault" ? { ...r, version: "0.7.9" } : r)),
+          { name: "parachute-app", port: 1944, paths: ["/app"], health: "/app/health", version: "0.0.0-linked", installDir: app },
+        ],
+      }),
+    );
+
+    const port = await freePort();
+    const origin = await m.expose(port);
+    mkdirSync(join(m.home, "hub", "run"), { recursive: true });
+    writeFileSync(join(m.home, "hub", "run", "hub.port"), `${port}\n`);
+    const box = m.spawn([bin, "serve"], {
+      env: { PARACHUTE_HOME: m.home, PORT: String(port), PARACHUTE_HUB_ORIGIN: origin, PARACHUTE_BIND_HOST: "127.0.0.1" },
+    });
+    try {
+      must(await until(async () => box.proc.exitCode !== null || (await safeFetch(`${origin}/health`)).ok, 60_000), `serve did not come up:\n${box.log().slice(-1500)}`);
+      expect(((await (await safeFetch(`${origin}/health`)).json()) as { version: string }).version).toBe(version);
+
+      const status = await m.run([bin, "status"], { env: { PARACHUTE_HOME: m.home } });
+      const line = (service: string) => status.stdout.split("\n").find((l) => l.trim().startsWith(service)) ?? `no ${service} row in:\n${status.stdout}${status.stderr}`;
+      expect(line("parachute-hub")).toContain(version);
+      expect(line("parachute-vault")).toContain(version);
+      expect(line("parachute-app")).toContain("0.22.15");
+      expect(status.stdout).not.toContain("0.7.");
+      expect(status.stdout).not.toContain("0.0.0-linked");
+      expect(status.stdout).not.toContain("STALE");
+
+      const doctor = await m.run([bin, "doctor", "--json"], { env: { PARACHUTE_HOME: m.home } });
+      const report = json(doctor, "doctor --json");
+      const checks = (report.checks ?? (report.groups ?? []).flatMap((g: { checks: unknown[] }) => g.checks)) as { name: string; status: string; detail: string }[];
+      const drift = checks.find((c) => c.name === "version-drift");
+      expect({ status: drift?.status, detail: drift?.detail }).toEqual({ status: "pass", detail: expect.any(String) });
+    } finally {
+      await box.stop();
+    }
+  }, 180_000);
+
   // PLAN §2.1: in the child process model the hub starts its vault from its own install, never from PATH, so on a
   // box like uni (old parachute-vault 0.7.9 in ~/.bun/bin) it can't start the old vault on the same data.
   test("with the old parachute-vault first on PATH, the vault `parachute-core serve` starts is core's own", async () => {

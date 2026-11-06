@@ -64,6 +64,8 @@ describe("release plan", () => {
 
   test("a stable may change only the version and the notes since its prerelease", () => {
     expect(changedPastPrerelease(["package.json", "bun.lock", "CHANGELOG.md", ""])).toEqual([]);
+    // Dropping the suffix touches every manifest that carries core's version (RELEASING.md).
+    expect(changedPastPrerelease(["packages/cli/package.json", "packages/hub/package.json", "packages/vault/package.json"])).toEqual([]);
     expect(changedPastPrerelease(["package.json", "packages/cli/src/serve.ts"])).toEqual(["packages/cli/src/serve.ts"]);
     const drop = 'diff --git a/bun.lock b/bun.lock\n--- a/bun.lock\n+++ b/bun.lock\n@@ -10 +10 @@\n-      "version": "0.8.0-pre.3",\n+      "version": "0.8.0",\n';
     expect(versionOnlyDiff(drop)).toBe(true);

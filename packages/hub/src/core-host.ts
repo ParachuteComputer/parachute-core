@@ -65,3 +65,18 @@ export function takenOver(home: string): boolean {
     return false;
   }
 }
+
+/**
+ * The folder of this core's vault, when that is what serves this home: the row points at a core copy's vault (this
+ * one, or an older bundle copy), or takeover moved the home to core (its row may still name the old npm vault).
+ * Null outside core, and on a box a pre-0.8.0-pre.3 `init` set up with npm's 0.7 vault, which that vault still serves.
+ */
+export function servingCoreVaultDir(
+  installDir: string | undefined,
+  home: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string | null {
+  const dir = bundledModuleDir("@openparachute/vault", env);
+  if (!dir) return null;
+  return (installDir !== undefined && isCoreVaultDir(installDir)) || takenOver(home) ? dir : null;
+}

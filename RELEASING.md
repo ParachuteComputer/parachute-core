@@ -24,7 +24,7 @@ The npm name `parachute` belongs to someone else, so the package stays `@openpar
    has never seen (the first publish is by hand, below). It refuses when npm can't be read, when a dist-tag would
    move backwards, for a prerelease of a version that already shipped stable, and for a stable `X.Y.Z` unless
    `X.Y.Z-pre.N` is already on npm and nothing changed since the tag `vX.Y.Z-pre.N` but `CHANGELOG.md`,
-   `RELEASING.md` and the `"version"` lines of `package.json`, `packages/cli/package.json` and `bun.lock`.
+   `RELEASING.md` and the `"version"` lines of the four manifests below and `bun.lock`.
 2. `build` builds the linux-x64 bundle, packs the npm package from it, and tests that `.tgz` the way the contracts
    job `npm` does: `npm i -g` and `bun add -g` into scratch prefixes, then Benjamin's suite on the npm install (0
    FAIL). That `.tgz` is the one published, checked by its sha256.
@@ -33,8 +33,11 @@ The npm name `parachute` belongs to someone else, so the package stays `@openpar
    (OIDC). Provenance is added because the repository is public.
 4. `tag-record` tags `v<version>` (kept if the GitHub pre-release already made it).
 
-To cut a prerelease: a PR that bumps `version` in `package.json` (and `packages/cli/package.json`) to the next
-`0.8.0-pre.N`, CI green, merged. To promote: a PR that only drops the suffix (`0.8.0`), merged; then the approval.
+To cut a prerelease: a PR that bumps `version` in `package.json`, `packages/cli/package.json`,
+`packages/hub/package.json` and `packages/vault/package.json` (and those lines in `bun.lock`) to the next `0.8.0-pre.N`,
+CI green, merged. All four carry core's version because the hub and the vault report their own: `/health`,
+`parachute status` and the vault's service card read them, and the contract in `lifecycle/identity.test.ts` goes red if
+one is missed. They are not published on their own; npm's `@openparachute/hub` and `vault` stay at 0.7. To promote: a PR that only drops the suffix (`0.8.0`), merged; then the approval.
 
 ## Who approves a `latest`
 

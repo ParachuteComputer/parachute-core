@@ -41,7 +41,7 @@ import { unwireScribeAuth } from "./auto-wire.ts";
 import { isLinked as defaultIsLinked } from "./bun-link.ts";
 import { PARACHUTE_INSTALL_CHANNEL_ENV } from "./commands/install.ts";
 import { buildModuleSpawnRequest, reconcilePortToCanonical } from "./commands/serve-boot.ts";
-import { bundledModuleDir, isCoreVaultDir, takenOver } from "./core-host.ts";
+import { bundledModuleDir, servingCoreVaultDir } from "./core-host.ts";
 import { validateHostAdminToken } from "./host-admin-token-validation.ts";
 import { getModuleInstallChannel } from "./hub-settings.ts";
 import { readModuleManifest } from "./module-manifest.ts";
@@ -1244,9 +1244,7 @@ async function runUpgrade(
   // Core's vault serves this home (a core copy's row, or a taken-over home): upgrading it is upgrading core.
   // A box an early 0.8 prerelease set up on npm's 0.7 vault upgrades from npm as before.
   const row = findService(spec.manifestName, deps.manifestPath);
-  const coreServes =
-    (row?.installDir !== undefined && isCoreVaultDir(row.installDir)) || takenOver(deps.configDir);
-  if (bundledModuleDir(spec.package) && coreServes) {
+  if (bundledModuleDir(spec.package) && servingCoreVaultDir(row?.installDir, deps.configDir)) {
     registry.update(
       opId,
       { status: "succeeded" },

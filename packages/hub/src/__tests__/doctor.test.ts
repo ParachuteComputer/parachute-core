@@ -517,6 +517,35 @@ describe("doctor — Tier 2 exposure (guarded hard)", () => {
 });
 
 describe("doctor — version drift (cosmetic; never FAIL)", () => {
+  test("a stopgap row whose installed package reads fine (the app hub serves itself) → PASS", async () => {
+    const h = makeHarness();
+    try {
+      const installDir = join(h.configDir, "installed-app");
+      mkdirSync(installDir, { recursive: true });
+      writeFileSync(join(installDir, "package.json"), JSON.stringify({ version: "0.22.15" }));
+      writeFileSync(
+        h.manifestPath,
+        JSON.stringify({
+          services: [
+            {
+              name: "parachute-app",
+              port: 1944,
+              paths: ["/app"],
+              health: "/app/health",
+              version: "0.0.0-linked",
+              installDir,
+            },
+          ],
+        }),
+      );
+      seedOperatorToken(h.configDir);
+      const { checks } = await runDoctor(h, healthyDeps());
+      expect(byName(checks, "version-drift")?.status).toBe("pass");
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("a 0.0.0-linked stopgap version → WARN labeled cosmetic, exit STAYS 0", async () => {
     const h = makeHarness();
     try {

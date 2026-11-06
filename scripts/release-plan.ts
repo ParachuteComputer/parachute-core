@@ -7,7 +7,7 @@
 //   X.Y.Z-pre.N   dist-tag `next`, published on the merge that brings that version to main
 //   X.Y.Z         dist-tag `latest`, only after an approval on the `npm-latest` environment (release.yml), and only
 //                 as a suffix-drop of an X.Y.Z-pre.N that is already on npm, with nothing changed since but the
-//                 release notes and the `"version"` lines of package.json, packages/cli/package.json and bun.lock
+//                 release notes and the `"version"` lines of the manifests that carry core's version and bun.lock
 //   anything else (0.8.0-dev.0) is not a release and never publishes.
 //
 // What it guards against, as the hub learned it:
@@ -63,7 +63,7 @@ export function prereleasesOf(version: string, published: string[]): string[] {
 
 /** What a stable may change since its prerelease: the notes freely, and in these files only `"version"` lines. */
 export const STABLE_NOTES = ["CHANGELOG.md", "RELEASING.md"];
-export const STABLE_VERSION_ONLY = ["package.json", "packages/cli/package.json", "bun.lock"];
+export const STABLE_VERSION_ONLY = ["package.json", "packages/cli/package.json", "packages/hub/package.json", "packages/vault/package.json", "bun.lock"];
 
 /** Changed paths a stable may not carry past its prerelease (the version-only files are checked by their diff). */
 export function changedPastPrerelease(paths: string[]): string[] {

@@ -75,9 +75,11 @@ import {
   defaultHubUnitDeps,
   queryHubUnitState as queryHubUnitStateImpl,
 } from "../hub-unit.ts";
+import { readInstalledPackageVersion } from "../install-source.ts";
 import { hasPriorDetachedInstall } from "../migrate-offer.ts";
 import { buildKnownIssuersForOperatorToken, operatorTokenPath } from "../operator-token.ts";
 import {
+  SEED_VERSION,
   canonicalPortForManifest,
   getSpec,
   getSpecFromInstallDir,
@@ -1518,9 +1520,17 @@ async function checkExposure(configDir: string, deps: ResolvedDeps): Promise<Che
  * positive-detection: a cached real version we have no live value to compare
  * against is NOT flagged (we don't have status.ts's install-source machinery
  * wired here, and guessing would risk a false WARN — #717).
+ *
+ * A stopgap row whose installed package we can read isn't flagged either: `status`
+ * prints that package's version, and a module hub serves itself (`app`, hub#831)
+ * has no boot to re-stamp the row, so the fix below couldn't clear the warning.
  */
 function checkVersionDrift(manifest: { services: ServiceEntry[] }): CheckResult {
-  const stopgaps = manifest.services.filter((s) => s.version === "0.0.0-linked");
+  const stopgaps = manifest.services.filter(
+    (s) =>
+      s.version === SEED_VERSION &&
+      (s.installDir === undefined || readInstalledPackageVersion(s.installDir) === undefined),
+  );
   if (stopgaps.length === 0) {
     return {
       name: "version-drift",
@@ -1534,7 +1544,7 @@ function checkVersionDrift(manifest: { services: ServiceEntry[] }): CheckResult 
     name: "version-drift",
     title: "Version freshness (cosmetic)",
     status: "warn",
-    detail: `services.json still has the install-time stopgap version "0.0.0-linked" for: ${names} (cosmetic — the running code is the live bundle)`,
+    detail: `services.json still has the install-time stopgap version "${SEED_VERSION}" for: ${names} (cosmetic — the running code is the live bundle)`,
     fix: "parachute restart <module>  # lets the module re-stamp its real version",
   };
 }
