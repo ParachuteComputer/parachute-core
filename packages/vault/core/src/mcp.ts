@@ -152,6 +152,33 @@ function structuredError(
   return Object.assign(new Error(message), fields);
 }
 
+/**
+ * query-notes' `since`: what changed since then, so edits to older notes count.
+ * It becomes a `date_filter` on `updated_at`, so every path through the tool
+ * (plain, search, semantic, aggregate) reads it the same way. Combined with
+ * another date filter it refuses: one would otherwise be dropped or fail with an
+ * error naming a filter the caller didn't send.
+ */
+function withSinceFilter(params: Record<string, unknown>): Record<string, unknown> {
+  // Null is how many clients send an optional they aren't using.
+  if (params.since === undefined || params.since === null) return params;
+  const others = ["date_from", "date_to", "date_filter"].filter((k) => params[k] !== undefined && params[k] !== null);
+  if (others.length > 0) {
+    throw new QueryError(
+      `cannot combine since with ${others.join(", ")} — since is shorthand for date_filter on updated_at; pass one or the other`,
+      "INVALID_QUERY",
+    );
+  }
+  if (typeof params.since !== "string") {
+    throw new QueryError(
+      `invalid since: ${JSON.stringify(params.since)} — must be an ISO-8601 date/timestamp string (e.g. "2026-07-09" or "2026-07-09T00:00:00.000Z").`,
+      "INVALID_QUERY",
+    );
+  }
+  const { since, date_from: _from, date_to: _to, ...rest } = params;
+  return { ...rest, date_filter: { field: "updated_at", from: since } };
+}
+
 function requireNoteReference(value: unknown): string {
   if (typeof value !== "string" || value.trim() === "") {
     throw structuredError("`id` is required", {
@@ -698,6 +725,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
     {
       name: "query-notes",
       execute: async (params) => {
+        params = withSinceFilter(params);
         // --- Ambiguous-links scope split (vault#581 auth review) ---
         // `requestedHasAmbiguous` is what the caller asked for;
         // `sqlHasAmbiguous` is what is safe to push into SQL for a reader

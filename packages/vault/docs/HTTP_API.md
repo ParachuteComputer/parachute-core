@@ -989,7 +989,7 @@ Query params:
 
   | Pattern | Meaning |
   |---|---|
-  | `meta[field]=value` | shorthand for `eq` (routes through `json_extract`) |
+  | `meta[field]=value` | exact match on the JSON, indexed or not (see below) |
   | `meta[field][eq|ne|gt|gte|lt|lte]=value` | comparison ops |
   | `meta[field][exists]=true|false` | presence check |
   | `meta[field][in]=a,b,c` or `meta[field][in][]=a&meta[field][in][]=b` | set membership |
@@ -1005,8 +1005,14 @@ Query params:
   reads like it ought to work on any field: `exists` is answered from the
   SAME generated column every other operator uses, so it needs the field
   indexed just like `eq`/`gt`/`in`/etc. The plain shorthand
-  (`meta[field]=value`, equivalent to `eq`) is the ONLY form that falls back
-  to a `json_extract` scan and works on a non-indexed field.
+  (`meta[field]=value`) is the ONLY form that falls back to a `json_extract`
+  scan and works on a non-indexed field.
+
+  A query string carries no types, so a shorthand value that is exactly how
+  JSON writes a boolean or number reads as one: `meta[done]=true` finds a stored
+  `true`, and `meta[streak]=4` a stored `4`. Each also finds the same text stored
+  as a string. Anything else is a string: `meta[zip]=01234` finds only `"01234"`.
+  A number doesn't match a boolean, or the other way round.
 
 - **Metadata filters (JSON alias)**
   - `metadata=<json>` — the JSON-object form of the same filter, e.g.

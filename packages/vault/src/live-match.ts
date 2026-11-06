@@ -120,7 +120,19 @@ function cmp(a: unknown, b: unknown): number | null {
   return as < bs ? -1 : as > bs ? 1 : 0;
 }
 
-/** Loose equality mirroring the json_extract shorthand + operator `eq`. */
+/**
+ * A bare `{field: value}` filter, mirroring `buildPlainEqualityClause`: the
+ * same JSON value, or the text `json_extract` gives for the stored value (a
+ * string as itself, an array or object as its JSON) equal to the filter's text.
+ * So `true` accepts a stored true and "true", and `"true"` only the string.
+ */
+function plainEq(actual: unknown, expected: unknown): boolean {
+  if (actual === expected) return true;
+  const text = typeof actual === "string" ? actual : actual && typeof actual === "object" ? JSON.stringify(actual) : null;
+  return text !== null && text === (typeof expected === "string" ? expected : JSON.stringify(expected));
+}
+
+/** Loose equality mirroring operator `eq` on a generated column. */
 function looseEq(actual: unknown, expected: unknown): boolean {
   if (actual === expected) return true;
   // Numbers vs numeric strings: the engine's operator path binds the raw
@@ -321,9 +333,8 @@ function matchAgainst(
       if (isOperatorObject(value)) {
         if (!evalOperatorObject(actual, value)) return false;
       } else {
-        // Primitive exact-match (json_extract shorthand). The engine compares
-        // the JSON-extracted scalar against the string/JSON form.
-        if (!looseEq(actual, value)) return false;
+        // Primitive exact-match (json_extract shorthand).
+        if (!plainEq(actual, value)) return false;
       }
     }
   }

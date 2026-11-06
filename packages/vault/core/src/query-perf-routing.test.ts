@@ -18,7 +18,7 @@
 import { describe, it, expect, beforeEach } from "bun:test";
 import { Database } from "bun:sqlite";
 import { SqliteStore } from "./store.js";
-import { queryNotes } from "./notes.js";
+import { aggregateNotes, buildFilterConditions, queryNotes, queryNotesPaged } from "./notes.js";
 import { getLinksHydrated, getLinksHydratedForNotes } from "./links.js";
 
 let db: Database;
@@ -98,6 +98,67 @@ describe("plain metadata equality: indexed routing is result-identical to the JS
     const hits = queryNotes(db, { metadata: { status_idx: "pending" } });
     expect(hits.length).toBe(1);
     expect(hits[0]!.metadata?.seq).toBe(0);
+  });
+
+  describe("a typed probe finds its JSON type (T-395)", () => {
+    const seqs = (metadata: Record<string, unknown>) =>
+      queryNotes(db, { metadata, sort: "asc" }).map((n) => n.metadata?.seq as number);
+    const VALUES: unknown[] = [true, false, 1, 0, 4, 1.5, 1e21, "true", "false", "1", "4", "1.5", "null", null, "other"];
+    const at = (...wanted: unknown[]) => wanted.map((w) => VALUES.indexOf(w));
+
+    async function seed(type: "string" | "integer" | "boolean") {
+      await store.upsertTagRecord("thing", { fields: { idx: { type, indexed: true } } });
+      for (let seq = 0; seq < VALUES.length; seq++) {
+        await store.createNote(`note ${seq}`, { tags: ["thing"], metadata: { seq, idx: VALUES[seq], raw: VALUES[seq] } });
+      }
+    }
+
+    const CASES: [unknown, unknown[]][] = [
+      [true, [true, "true"]],
+      [false, [false, "false"]],
+      [1, [1, "1"]],
+      [0, [0]],
+      [4, [4, "4"]],
+      [1.5, [1.5, "1.5"]],
+      // On a string index this holds only as a number: the column reads 1.0e+21, its JSON text 1e+21.
+      [1e21, [1e21]],
+      [null, ["null", null]],
+      // A string means the string, whatever it looks like.
+      ["true", ["true"]],
+      ["1", ["1"]],
+      ["null", ["null"]],
+    ];
+
+    for (const type of ["string", "integer", "boolean"] as const) {
+      it(`on a ${type} index and with no index`, async () => {
+        await seed(type);
+        for (const [probe, wanted] of CASES) {
+          expect(seqs({ raw: probe })).toEqual(at(...wanted));
+          expect(seqs({ idx: probe })).toEqual(at(...wanted));
+        }
+      });
+    }
+
+    it("a missing key isn't a stored null", async () => {
+      await store.createNote("no field", { metadata: { other: 1 } });
+      await store.createNote("null field", { metadata: { field: null } });
+      expect(queryNotes(db, { metadata: { field: null } }).map((n) => n.content)).toEqual(["null field"]);
+    });
+
+    it("the index still narrows a typed probe", async () => {
+      await seed("boolean");
+      const { conditions, params } = buildFilterConditions(db, { metadata: { idx: true } });
+      const plan = db
+        .query(`EXPLAIN QUERY PLAN SELECT n.id FROM notes n WHERE ${conditions.join(" AND ")}`)
+        .all(...params) as { detail: string }[];
+      expect(plan.map((p) => p.detail).join("\n")).toMatch(/USING (COVERING )?INDEX/);
+    });
+
+    it("counts and cursor pages use the same match", async () => {
+      await seed("integer");
+      expect(aggregateNotes(db, { metadata: { raw: true }, aggregate: { op: "count" } })).toEqual([{ group: null, value: 2 }]);
+      expect(queryNotesPaged(db, { metadata: { idx: 4 }, cursor: "" }).notes.length).toBe(2);
+    });
   });
 
   it("indexed plain equality agrees with the operator form for string values", async () => {

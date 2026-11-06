@@ -3,8 +3,7 @@
  *
  * A metadata value that is a plain object whose keys are all drawn from
  * {@link SUPPORTED_OPS} is treated as an operator query. Otherwise the value
- * falls through to the existing exact-match behavior (primitive → JSON
- * stringify compare).
+ * falls through to exact match ({@link buildPlainEqualityClause}).
  *
  * Operator queries route through the generated columns maintained by
  * `indexed-fields`: `meta_<field>` on `notes`, backed by a B-tree index. The
@@ -73,6 +72,64 @@ export function isOperatorObject(value: unknown): value is Record<string, unknow
     return false;
   }
   return Object.keys(value as object).length > 0;
+}
+
+export interface PlainEqualityClause {
+  /** The match itself, on the JSON. Always safe to run alone. */
+  sql: string;
+  params: SQLQueryBindings[];
+  /**
+   * Values for `"meta_<field>" IN (...)` when the field is indexed. Every row
+   * `sql` matches holds one of them in its generated column, so the index can
+   * narrow the candidates first. Null when no such values exist.
+   */
+  indexProbes: SQLQueryBindings[] | null;
+}
+
+/**
+ * Bare `{field: value}` equality on metadata.
+ *
+ * `json_extract` gives a JSON string as text, a number as a number, true and
+ * false as 1 and 0, and null as SQL NULL, and SQLite doesn't convert between
+ * text and numbers here. So each value binds the way its JSON type comes out:
+ *
+ * - string: compared as text. `{x: "5"}` doesn't match a stored 5.
+ * - number: compared as a number, on JSON numbers only, so `{x: 1}` doesn't
+ *   match a stored `true` (which also comes out as 1).
+ * - boolean and null: by `json_type`, so `{x: true}` doesn't match a stored 1,
+ *   and `{x: null}` matches a stored null but not a missing key.
+ * - array and empty object: compared as their JSON text, which is how
+ *   `json_extract` gives them back.
+ *
+ * Numbers, booleans and null also still match their text form (`{x: true}`
+ * finds a stored `"true"`). These filters used to be bound only as that text,
+ * so it's the one thing they found; vaults hold such strings, and dropping
+ * them would empty a working caller's results with no error.
+ */
+export function buildPlainEqualityClause(key: string, value: unknown): PlainEqualityClause {
+  const path = "'$.' || ?";
+  const asText = `json_extract(n.metadata, ${path}) = ?`;
+  if (typeof value === "string") {
+    return { sql: asText, params: [key, value], indexProbes: [value] };
+  }
+  const text = JSON.stringify(value);
+  if (typeof value === "number") {
+    return {
+      sql: `(${asText} OR (json_type(n.metadata, ${path}) IN ('integer', 'real') AND json_extract(n.metadata, ${path}) = ?))`,
+      params: [key, text, key, key, value],
+      indexProbes: [text, value],
+    };
+  }
+  if (typeof value === "boolean" || value === null) {
+    return {
+      // JSON.stringify(true) is also the name json_type gives it.
+      sql: `(${asText} OR json_type(n.metadata, ${path}) = ?)`,
+      params: [key, text, key, text],
+      // A stored null is NULL in the generated column, which IN can't find.
+      indexProbes: value === null ? null : [text, value ? 1 : 0],
+    };
+  }
+  return { sql: asText, params: [key, text], indexProbes: [text] };
 }
 
 function validateOperatorObject(field: string, obj: Record<string, unknown>): void {
