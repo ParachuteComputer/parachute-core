@@ -42,7 +42,7 @@ describe("parachute: the 0.9 front door", () => {
       expect({ used, entry: d.notice && entryFor(d.notice.entry)?.state }).toEqual({ used, entry: "live" });
       expect(lookup(used.split(" ")).length).toBeGreaterThan(0);
     }
-    expect(lookup(["find-path"])[0]?.new).toBe("query-notes {path_between}");
+    expect(lookup(["find-path"])[0]?.new).toBe("query-records {path_between}");
   });
 
   test("the map is well formed", () => {

@@ -550,7 +550,10 @@ describe("attachment tickets — discoverability", () => {
     const vaultName = freshVault("tickets-instructions");
     const md = await getServerInstruction(vaultName);
     expect(md).toContain("## Attachments");
-    expect(md).toContain("request-attachment-upload");
+    // T-407: this door lists attachment-url (0.9's one ticket tool) and the record tools, so its brief names them.
+    expect(md).toContain("`attachment-url` gives a one-use URL");
+    expect(md).not.toContain("request-attachment-upload");
+    expect(md).toContain("`include_attachments: true` on `query-records` lists a record's attachments.");
   });
 
   test("attachmentsInstructionBlock teaches read-attachment when readEnabled, and omits it when not", () => {

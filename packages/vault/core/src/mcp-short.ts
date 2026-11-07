@@ -17,8 +17,11 @@
  * as well with them as with the long ones, model by model. Change them the
  * same way: run the eval.
  *
- * Pure data (see mcp-manifest.ts's import-graph invariant): no imports.
+ * Pure data (see mcp-manifest.ts's import-graph invariant): its one import,
+ * mcp-records.ts, is pure too.
  */
+
+import { BODY, FIELDS } from "./mcp-records.js";
 
 type Schema = Record<string, unknown>;
 
@@ -201,7 +204,7 @@ Rarer filters (has_links, order_by, expand_links, created_by, search_mode, …) 
   },
 
   doctor: {
-    description: `Read-only check of tags and metadata (dangling parents, cycles, mixed field types). Returns findings, each with a remedy; fixes nothing. ${HELP("doctor")}`,
+    description: `Read-only check of types, tags and fields (dangling parents, cycles, mixed field types). Returns findings, each with a remedy; fixes nothing. ${HELP("doctor")}`,
     inputSchema: obj({ deep: bool("Also check history") }),
   },
 
@@ -231,6 +234,12 @@ Rarer filters (has_links, order_by, expand_links, created_by, search_mode, …) 
 /** Names agents reach for that a tool calls something else. Checked before edit distance. */
 const PARAM_ALIASES: Record<string, Record<string, string>> = {
   "query-notes": { query: "search", q: "search", text: "search", tags: "tag", note_id: "id", note: "id", ids: "id", filter: "metadata", where: "metadata", page_size: "limit", until: "date_filter", order: "sort" },
+  // The record tools (mcp-records.ts). Their old names (content, metadata, notes, note_id) are accepted, not unknown.
+  "query-records": { query: "search", q: "search", text: "search", tags: "tag", types: "type", record_id: "id", note_id: "id", record: "id", note: "id", ids: "id", filter: FIELDS, where: FIELDS, page_size: "limit", until: "date_filter", order: "sort" },
+  "update-record": { record_id: "id", note_id: "id", record: "id", note: "id", path_or_id: "id", text: BODY, add_tags: "tags", edit: `${BODY}_edit` },
+  "create-record": { text: BODY, tag: "tags", type: "types", title: "path" },
+  "delete-record": { record_id: "id", note_id: "id", record: "id", note: "id", path: "id" },
+  "list-types": { type: "name" },
   "update-note": { note_id: "id", note: "id", path_or_id: "id", text: "content", body: "content", add_tags: "tags", edit: "content_edit" },
   "create-note": { body: "content", text: "content", tag: "tags", title: "path" },
   "delete-note": { note_id: "id", note: "id", path: "id" },
@@ -249,6 +258,14 @@ const NESTED: [string, string, string, string][] = [
   ["update-note", "content_edit", "new", "new_text"],
   ["update-note", "content_edit", "find", "old_text"],
   ["update-note", "content_edit", "replace", "new_text"],
+  ["query-records", "near", "note", "id"],
+  ["query-records", "near", "record_id", "id"],
+  ["query-records", "versions", "note", "id"],
+  ["query-records", "versions", "record_id", "id"],
+  ["update-record", `${BODY}_edit`, "old", "old_text"],
+  ["update-record", `${BODY}_edit`, "new", "new_text"],
+  ["update-record", `${BODY}_edit`, "find", "old_text"],
+  ["update-record", `${BODY}_edit`, "replace", "new_text"],
 ];
 
 function distance(a: string, b: string): number {
@@ -339,11 +356,11 @@ export const NEW_TOOLS: Record<string, ShortTool & { folds: Record<string, strin
     folds: { update: "update-tag", rename: "rename-tag", merge: "merge-tags", delete: "delete-tag", prune: "prune-schema" },
   },
   "attachment-url": {
-    description: `A one-use URL for an attachment's bytes. upload: \`note\`, \`filename\` and exact \`size_bytes\`, then PUT the bytes to \`url\`. download: \`attachment_id\` (from query-notes \`include_attachments: true\`). ${HELP("attachment-url")}`,
+    description: `A one-use URL for an attachment's bytes. upload: \`record\`, \`filename\` and exact \`size_bytes\`, then PUT the bytes to \`url\`. download: \`attachment_id\` (from query-records \`include_attachments: true\`). ${HELP("attachment-url")}`,
     inputSchema: obj(
       {
         action: { type: "string", enum: ["upload", "download"] },
-        note: str("upload: note id or path"),
+        record: str("upload: record id or path"),
         filename: str(),
         size_bytes: num(),
         mime_type: str(),
@@ -361,7 +378,7 @@ export const PATH_BETWEEN: Schema = PATH_BETWEEN_REF;
 
 /** The nine old names 0.9 keeps as listed, working aliases until 1.0 (Prism allow-lists some by name). */
 export const TOOL_ALIASES: Record<string, string> = {
-  "find-path": "query-notes {path_between: {source, target}}",
+  "find-path": "query-records {path_between: {source, target}}",
   "update-tag": 'manage-types {action: "update"}',
   "rename-tag": 'manage-types {action: "rename"}',
   "merge-tags": 'manage-types {action: "merge"}',
@@ -377,9 +394,10 @@ export function aliasDescription(tool: string): string {
   return `Deprecated (gone in 1.0): use ${TOOL_ALIASES[tool]}. Same parameters as before.`;
 }
 
-/** The order tools/list sends: the eleven, then the aliases. */
+/** The order tools/list sends: the eleven (record tools first, T-407), then the aliases, note-named ones first. */
 export const TOOL_ORDER = [
-  "query-notes", "create-note", "update-note", "delete-note", "list-tags", "vault-info", "doctor",
+  "query-records", "create-record", "update-record", "delete-record", "list-types", "vault-info", "doctor",
   "read-attachment", "attachment-url", "manage-types", "manage-keys",
+  "query-notes", "create-note", "update-note", "delete-note", "list-tags",
   ...Object.keys(TOOL_ALIASES),
 ];

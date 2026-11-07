@@ -308,13 +308,15 @@ function sqliteToUserType(t: string): string {
  * inside the connect-time brief's token budget — see
  * `projectionToMarkdown`'s doc comment.
  */
-export function attachmentsInstructionBlock(opts: { ticketsEnabled: boolean; readEnabled?: boolean }): string {
+export function attachmentsInstructionBlock(opts: { ticketsEnabled: boolean; readEnabled?: boolean; ticketTool?: string }): string {
   const sentences: string[] = [
     "`include_attachments: true` on `query-notes` lists a note's attachments.",
   ];
   if (opts.ticketsEnabled) {
     sentences.push(
-      "`request-attachment-upload` / `request-attachment-download` give a one-use URL to PUT or GET the bytes.",
+      opts.ticketTool
+        ? `\`${opts.ticketTool}\` gives a one-use URL to PUT or GET the bytes.`
+        : "`request-attachment-upload` / `request-attachment-download` give a one-use URL to PUT or GET the bytes.",
     );
   }
   if (opts.readEnabled) {
@@ -364,9 +366,16 @@ export function projectionToMarkdown(args: {
    * that hasn't wired ticket support yet (or a test fixture) never
    * accidentally advertises tools it can't back.
    */
-  attachments?: { ticketsEnabled: boolean; readEnabled?: boolean };
+  attachments?: { ticketsEnabled: boolean; readEnabled?: boolean; ticketTool?: string };
+  /**
+   * The server's own words for this door (T-407: record words where the
+   * record tools are listed). Applied to the fixed text only, never to the
+   * vault's description, names or paths. Omitted: the text as written.
+   */
+  words?: (s: string) => string;
 }): string {
   const { vaultName, description, projection, coordinates } = args;
+  const w = args.words ?? ((s: string) => s);
   const stats = projection.stats;
 
   const lines: string[] = [];
@@ -411,7 +420,7 @@ export function projectionToMarkdown(args: {
     lines.push("");
     lines.push(
       `## Start here\n\nFor setting up or growing this vault, read the **${projection.getting_started}** guide: ` +
-        `\`query-notes { id: "${projection.getting_started}" }\`.`,
+        `\`${w("query-notes")} { id: "${projection.getting_started}" }\`.`,
     );
   }
 
@@ -433,26 +442,26 @@ export function projectionToMarkdown(args: {
     const noteLabel = noteCount === 1 ? "note" : "notes";
     const tagLabel = tagCount === 1 ? "tag" : "tags";
     const tagSuffix = withSchemas > 0 ? `, ${withSchemas} with schemas` : "";
-    lines.push(`- ${noteCount} ${noteLabel}, ${tagCount} ${tagLabel} total${tagSuffix}`);
+    lines.push(w(`- ${noteCount} ${noteLabel}, ${tagCount} ${tagLabel} total${tagSuffix}`));
   } else {
-    lines.push(`- (call \`vault-info { include_stats: true }\` for note/tag counts)`);
+    lines.push(w(`- (call \`vault-info { include_stats: true }\` for note/tag counts)`));
   }
 
   if (projection.tags.length === 0) {
-    lines.push(`- No tag schemas declared yet — every note is freeform.`);
+    lines.push(w(`- No tag schemas declared yet — every note is freeform.`));
   } else {
     const names = projection.tags.map((t) => t.name).join(", ");
     lines.push(`- ${projection.tags.length} tag${projection.tags.length === 1 ? "" : "s"} with schemas: ${names}`);
   }
 
   if (projection.indexed_fields.length > 0) {
-    lines.push(`- Indexed metadata fields (queryable with operators):`);
+    lines.push(w(`- Indexed metadata fields (queryable with operators):`));
     for (const f of projection.indexed_fields) {
       const declarers = f.tags.map((t) => `#${t}`).join(", ");
       lines.push(`  - ${f.name} (${f.type}; from ${declarers})`);
     }
   } else {
-    lines.push(`- No indexed metadata fields.`);
+    lines.push(w(`- No indexed metadata fields.`));
   }
 
   // Strict fields (vault#299): surface the enforced contract so an agent knows
@@ -478,7 +487,7 @@ export function projectionToMarkdown(args: {
   lines.push("## Querying");
   lines.push("");
   for (const hint of projection.query_hints) {
-    lines.push(`- \`${hint}\``);
+    lines.push(`- \`${w(hint)}\``);
   }
 
   lines.push("");
@@ -489,7 +498,7 @@ export function projectionToMarkdown(args: {
   lines.push("");
   lines.push("## Attachments");
   lines.push("");
-  lines.push(attachmentsInstructionBlock(args.attachments ?? { ticketsEnabled: false }));
+  lines.push(w(attachmentsInstructionBlock(args.attachments ?? { ticketsEnabled: false })));
 
   // Scripting pointer block: the connect-time brief used to dead-end on
   // querying — an agent had no path to "how do I script/automate against this

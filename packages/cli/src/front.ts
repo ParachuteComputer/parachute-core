@@ -317,6 +317,12 @@ export function changes(args: string[], home: string, out = console.log, err = c
     out("Old names used on this home (run/deprecations.json):");
     for (const [name, u] of usedNames.sort((a, b) => b[1].count - a[1].count)) out(`  ${name}: ${u.count}, last ${u.last_seen}`);
   }
+  // The vault counts its record names too (T-407), so the move to them can be watched next to the old names.
+  const adopted = Object.entries((existsSync(home) ? (readUsage(home) as { adopted?: UsageLog["names"] }).adopted : undefined) ?? {});
+  if (!words.length && adopted.length) {
+    out("New names used on this home:");
+    for (const [name, u] of adopted.sort((a, b) => b[1].count - a[1].count)) out(`  ${name}: ${u.count}, last ${u.last_seen}`);
+  }
   if (!words.length && !all) {
     out("");
     out("parachute changes --all adds what stays and what is planned; --json for scripts; --for-agent for agents.");

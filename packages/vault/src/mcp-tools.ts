@@ -10,6 +10,8 @@ import { projectHistoryProvenance } from "../core/src/history-visibility.js";
 import type { McpToolDef, GenerateMcpToolsOpts } from "../core/src/mcp.ts";
 import { MCP_TOOL_REFERENCE, acceptedParams } from "../core/src/mcp-manifest.ts";
 import { mergeTypesIntoTags } from "../core/src/tag-kind.ts";
+import { addRecordTools, NOTE_TOOL_NAMES, RECORD_TOOL_NAMES, recordParamNames, recordSchema, recordWords } from "../core/src/mcp-records.ts";
+import { countName } from "./name-usage.ts";
 import { nestedParamProblem, NEW_TOOLS, SHORT_TOOLS, TOOL_ALIASES, TOOL_ORDER, aliasDescription, unknownParams, type ParamProblem } from "../core/src/mcp-short.ts";
 import { getNote, getNoteTags, getVaultMap, getVaultStats } from "../core/src/notes.ts";
 import { narrowLinkWarningsForVisibility } from "../core/src/wikilinks.ts";
@@ -141,7 +143,9 @@ export async function getServerInstruction(
     // `generateScopedMcpTools` below) — the connect-time brief can
     // unconditionally teach both the ticket tools and read-attachment on
     // this door.
-    attachments: { ticketsEnabled: true, readEnabled: true },
+    attachments: { ticketsEnabled: true, readEnabled: true, ticketTool: "attachment-url" },
+    // T-407: this door lists the record tools first, so its brief speaks their words.
+    words: recordWords,
   });
 }
 
@@ -346,7 +350,8 @@ export function generateScopedMcpTools(
   // callers. See vault#376. The raw caller bearer (vault#403, MGT) is
   // forwarded to hub's mint-token attenuation proxy on mint.
   tools.push(buildManageTokenTool(vaultName, auth, callerBearer ?? null));
-  const shaped = applyElevenTools(tools, vaultName, auth);
+  const shaped = byToolOrder(addRecordTools(applyElevenTools(tools, vaultName, auth), (name, kind) => countName(`mcp ${name}`, kind)));
+  applyRecordWordsToVaultInfo(shaped);
   applyParamTeaching(shaped, vaultName);
 
   return shaped;
@@ -391,6 +396,15 @@ function applyElevenTools(tools: McpToolDef[], vaultName: string, auth: AuthResu
           throw new Error(`Forbidden: ${name} {action: "${action}"} needs the 'vault:${vaultName}:${verb}' scope.`);
         }
         const { action: _drop, ...rest } = params;
+        // T-407: attachment-url names the record it uploads to `record`; `note` stays as its old name through 0.9.
+        if (name === "attachment-url" && rest.record !== undefined) {
+          if (rest.note !== undefined) {
+            throw Object.assign(new Error("attachment-url: pass `record` or `note`, not both (`note` is its old name)."), { error_type: "invalid_query", field: "record", hint: "use record" });
+          }
+          const { record, ...others } = rest;
+          return target.execute({ ...others, note: record });
+        }
+        if (name === "attachment-url" && rest.note !== undefined) countName("mcp attachment-url note", "old");
         return target.execute(rest);
       },
     });
@@ -426,6 +440,7 @@ function applyElevenTools(tools: McpToolDef[], vaultName: string, auth: AuthResu
       ...t,
       description: aliasDescription(t.name),
       execute: async (params) => {
+        countName(`mcp ${t.name}`, "old");
         const result = await execute(params);
         if (result && typeof result === "object" && !Array.isArray(result)) {
           return { ...(result as Record<string, unknown>), deprecation: { tool: t.name, use, removed_in: "1.0" } };
@@ -435,11 +450,44 @@ function applyElevenTools(tools: McpToolDef[], vaultName: string, auth: AuthResu
     });
   }
 
+  return byToolOrder(out);
+}
+
+/** tools/list's order: TOOL_ORDER, then anything it doesn't name. */
+function byToolOrder(tools: McpToolDef[]): McpToolDef[] {
   const rank = (n: string) => {
     const i = TOOL_ORDER.indexOf(n);
     return i === -1 ? TOOL_ORDER.length : i;
   };
-  return out.sort((a, b) => rank(a.name) - rank(b.name));
+  return tools.sort((a, b) => rank(a.name) - rank(b.name));
+}
+
+/**
+ * vault-info on the record surface (T-407): `help` answers for a record tool
+ * with its note tool's full reference in record words, and the query hints
+ * name the record tools. Everything else vault-info returns keeps its shape.
+ */
+function applyRecordWordsToVaultInfo(tools: McpToolDef[]): void {
+  const info = tools.find((t) => t.name === "vault-info");
+  if (!info) return;
+  const execute = info.execute;
+  info.execute = async (params) => {
+    const help = params?.help;
+    const noteTool = typeof help === "string" ? NOTE_TOOL_NAMES[help] : undefined;
+    if (noteTool) {
+      const r = (await execute({ ...params, help: noteTool })) as { description?: string; parameters?: Record<string, unknown> };
+      return { tool: help, description: recordWords(r.description ?? ""), parameters: recordSchema(noteTool, r.parameters ?? {}) };
+    }
+    const r = await execute(params);
+    if (typeof help === "string" && RECORD_TOOL_NAMES[help] && r && typeof r === "object") {
+      return { ...(r as Record<string, unknown>), deprecation: { tool: help, use: RECORD_TOOL_NAMES[help], removed_in: "1.0" } };
+    }
+    if (r && typeof r === "object" && Array.isArray((r as { query_hints?: unknown }).query_hints)) {
+      const o = r as { query_hints: unknown[] };
+      return { ...o, query_hints: o.query_hints.map((h) => (typeof h === "string" ? recordWords(h) : h)) };
+    }
+    return r;
+  };
 }
 
 const VERB_RANK: Record<string, number> = { read: 0, write: 1, admin: 2 };
@@ -489,15 +537,17 @@ function takes(name: string): string[] {
 function applyParamTeaching(tools: McpToolDef[], vaultName: string): void {
   for (const tool of tools) {
     const folds = NEW_TOOLS[tool.name]?.folds;
-    const reference =
-      tool.name === "manage-token" || tool.name === "manage-keys"
+    const noteTool = NOTE_TOOL_NAMES[tool.name];
+    const reference = noteTool
+      ? recordParamNames(tool.name, takes(noteTool))
+      : tool.name === "manage-token" || tool.name === "manage-keys"
         ? Object.keys(manageTokenReference(vaultName).inputSchema.properties as object)
         : folds
-          ? ["action", ...Object.values(folds).flatMap(takes)]
-          : acceptedParams(tool.name);
+          ? ["action", ...Object.values(folds).flatMap(takes), ...(tool.name === "attachment-url" ? ["record"] : [])]
+          : RECORD_TOOL_NAMES[tool.name] ? takes(tool.name) : acceptedParams(tool.name); // a relisted note tool: its old short schema too
     if (!reference) continue;
     const accepted = [...new Set([...reference, ...Object.keys(((tool.inputSchema as { properties?: object }).properties) ?? {})])];
-    const perAction = folds ? Object.fromEntries(Object.entries(folds).map(([a, n]) => [a, ["action", ...takes(n)]])) : undefined;
+    const perAction = folds ? Object.fromEntries(Object.entries(folds).map(([a, n]) => [a, ["action", ...takes(n), ...(n === "request-attachment-upload" ? ["record"] : [])]])) : undefined;
     const acceptedFor = (params: Record<string, unknown>) => {
       const action = params.action ?? (tool.name === "manage-types" ? "update" : undefined);
       return (typeof action === "string" && perAction?.[action]) || accepted;
@@ -527,6 +577,7 @@ function withParamWarnings(tool: string, result: unknown, unknown: ParamProblem[
   const warnings = unknown.map((u) => ({ code: u.error_type, message: u.message, field: u.field, hint: u.hint }));
   // query-notes answers `{notes, warnings}` whenever it has a warning (core mcp.ts), a shape its callers already read.
   if (tool === "query-notes" && Array.isArray(result)) return { notes: result, warnings };
+  if (tool === "query-records" && Array.isArray(result)) return { records: result, warnings };
   if (!result || typeof result !== "object" || Array.isArray(result)) return result;
   const r = result as Record<string, unknown>;
   return { ...r, warnings: [...(Array.isArray(r.warnings) ? r.warnings : []), ...warnings] };

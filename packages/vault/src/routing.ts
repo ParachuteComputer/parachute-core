@@ -52,6 +52,7 @@
  * UX audit, 2026-05-25).
  */
 
+import { countName, restRouteName } from "./name-usage.ts";
 import pkg from "../package.json" with { type: "json" };
 import type { VaultConfig } from "./config.ts";
 import type { Note, Store } from "../core/src/types.ts";
@@ -1174,6 +1175,11 @@ export async function route(
     bypassStrict: hasMigrateScopeForVault(auth.scopes, vaultName),
   };
 
+  if (apiPath.startsWith("/notes")) {
+    // T-407: /api/notes is note-named; count each route's use for the 1.0 decision (names only, never ids).
+    const route = restRouteName(req.method, apiPath);
+    if (route) countName(route, "old");
+  }
   if (apiPath.startsWith("/notes")) return handleNotes(req, store, apiPath.slice(6), vaultName, tagScope, writeCtx);
   // Live-query SSE transport REMOVED (WS-hibernation migration Phase 5). The
   // WebSocket binding (an `Upgrade: websocket` GET /subscribe, handled in

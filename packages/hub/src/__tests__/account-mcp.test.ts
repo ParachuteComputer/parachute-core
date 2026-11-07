@@ -225,6 +225,7 @@ function toolsForMintedScope(scope: string): Array<{
 }> {
   const verb = scope.includes(":admin") ? "admin" : scope.includes(":write") ? "write" : "read";
   const read = [
+    "query-records",
     "query-notes",
     "list-tags",
     "find-path",
@@ -250,7 +251,7 @@ function toolsForMintedScope(scope: string): Array<{
     inputSchema: {
       type: "object",
       properties:
-        name === "query-notes"
+        name === "query-notes" || name === "query-records"
           ? {
               search: { type: "string" },
               sort: { type: "string" },
@@ -879,6 +880,37 @@ describe("account MCP — query-notes", () => {
       const byVault = Object.fromEntries(payload.results.map((r) => [r.vault, r]));
       expect(byVault.beta?.notes).toEqual([{ id: "n-beta" }]);
       expect(byVault.personal?.error).toMatch(/personal is down/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  // T-407: query-records is 0.9's name for query-notes; the account door fans it out the same way, in record words.
+  test("query-records fans out too, each vault called by that name and answered under `records`", async () => {
+    const h = await makeHarness();
+    try {
+      const token = await bearer(h, [HOST_ADMIN_SCOPE]);
+      const called: string[] = [];
+      const fetchImpl = (input: string | URL | Request, init?: RequestInit) =>
+        routeVaultMcp(input, init, {
+          onCall: ({ vault, rpc }) => {
+            called.push(`${vault}:${rpc.params?.name}`);
+            return [{ id: `r-${vault}` }];
+          },
+        });
+      const res = await handleAccountMcp(
+        bearerReq(token, rpc("tools/call", { name: "query-records", arguments: { search: "hello" } })),
+        mcpDeps(h, { fetchImpl }),
+      );
+      const payload = parseTool((await res.json()) as { result: { content: Array<{ text: string }> } }) as {
+        vaults_queried: string[];
+        results: Array<{ vault: string; records?: unknown; notes?: unknown }>;
+      };
+      expect(payload.vaults_queried.sort()).toEqual(["beta", "personal"]);
+      expect(called.sort()).toEqual(["beta:query-records", "personal:query-records"]);
+      const byVault = Object.fromEntries(payload.results.map((r) => [r.vault, r]));
+      expect(byVault.beta?.records).toEqual([{ id: "r-beta" }]);
+      expect(byVault.beta?.notes).toBeUndefined();
     } finally {
       h.cleanup();
     }
