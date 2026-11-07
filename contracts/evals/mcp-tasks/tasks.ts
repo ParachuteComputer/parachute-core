@@ -346,13 +346,14 @@ export const TASKS: Task[] = [
       if (num(ctx.answer) !== 12) return `answer ${JSON.stringify(ctx.answer)}, want 12`;
       // Real paging: pages of at most 5, a later call that hands back a next_cursor an earlier page returned, and
       // the pages together covering every event note.
-      const pages = ctx.calls.filter((c) => c.name === "query-notes" && !c.isError && c.args && "cursor" in c.args);
+      // query-records is query-notes under its 0.9 name (T-407): either pages.
+      const pages = ctx.calls.filter((c) => (c.name === "query-notes" || c.name === "query-records") && !c.isError && c.args && "cursor" in c.args);
       if (!pages.length) return "never used cursor";
       if (pages.some((c) => !(Number(c.args.limit) > 0 && Number(c.args.limit) <= 5))) return "a page without limit ≤ 5";
       const parsed = pages.map((c) => { try { return JSON.parse(c.result ?? ""); } catch { return null; } });
       const handedOut = new Set(parsed.map((r) => r?.next_cursor).filter((x) => typeof x === "string" && x));
       if (!pages.some((c) => handedOut.has(c.args.cursor))) return "never continued from a returned next_cursor";
-      const seen = new Set(parsed.flatMap((r) => (r?.notes ?? []).map((n: any) => n.path)));
+      const seen = new Set(parsed.flatMap((r) => (r?.notes ?? r?.records ?? []).map((n: any) => n.path)));
       const events = byFixture((n) => !!n.tags?.some((t) => t === "event" || t === "event/meeting"));
       const missing = events.filter((p) => !seen.has(p));
       return missing.length ? `pages missed ${missing.length} event notes` : true;

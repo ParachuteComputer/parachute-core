@@ -176,12 +176,17 @@ on it unchanged (46 pass, 0 fail, on the tarball and the npm install). What chan
   `setup --embedded`, `keys new`) maps onto the same code. On an embedded home the old names print no deprecation
   line and nothing is counted. `parachute changes --json` lists every old name and what replaced it.
 - **MCP: 11 tools, with the old names listed as aliases.** An admin key sees all 11, a write key 9 and a read key
-  6. `request-attachment-upload` and `-download` become `attachment-url`; `find-path` becomes `query-notes` with
-  `path_between`; the tag tools become `manage-types`; `manage-token` becomes `manage-keys`. Every old name is still
-  in `tools/list` (its description starts "deprecated"), so your allowlists in `agent-profiles.ts` keep working.
-  Add `attachment-url` when you move, and `manage-types` and `manage-keys` to the admin-only list (`lib.mjs:19`) so
-  that check still covers them. A write key's `tools/list` holds 12 entries, 9 tools and 3 aliases, in about 10k
-  characters; on 0.8 the same key sees 11 tools in about 61k.
+  6. "Record" is the noun (Aaron, 11-07): `query-notes`, `create-note`, `update-note`, `delete-note` and `list-tags`
+  become `query-records`, `create-record`, `update-record`, `delete-record` and `list-types`, which speak `body`
+  (was `content`), `fields` (was `metadata`), `records` for a batch and `{id}` for an anchor, and give `tags` as
+  plain labels next to `types`. `request-attachment-upload` and `-download` become `attachment-url` (its `note` is
+  `record`); `find-path` becomes `query-records` with `path_between`; the tag tools become `manage-types`;
+  `manage-token` becomes `manage-keys`. Every old name is still in `tools/list` through 0.9 (its description starts
+  "Deprecated") and answers exactly as on 0.8, so your allowlists in `agent-profiles.ts` keep working; the old
+  names go at 1.0, and each use is counted in the home's `run/deprecations.json` meanwhile (not on an embedded
+  home). Add the record names and `attachment-url` when you move, and `manage-types` and `manage-keys` to the
+  admin-only list (`lib.mjs:19`) so that check still covers them. A write key's `tools/list` holds 17 entries, 9
+  tools and 8 aliases, in about 11k characters; on 0.8 the same key sees 11 tools in about 61k.
 - **Types and tags.** A tag with fields or parents is a type. Notes gain `types` (the types among their tags) next
   to `tags`, over REST and MCP; `tags` still lists every name. `tags: [...]` writes and `tag:` queries work as today.
 - **Keys.** Every token becomes a key with the same scopes; `parachute keys list` shows them. Verification is
