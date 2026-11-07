@@ -88,7 +88,7 @@ export function mcpDomainError(
   return new McpError(code, humanMessage, data);
 }
 
-/** A record tool's JSON-RPC error in record words: message and hints, and `record_id` for `note_id` (T-407). */
+/** A record tool's JSON-RPC error in record words: the hints this file adds, and `record_id` for `note_id` (T-407). */
 function recordDoorError(err: McpError): McpError {
   const data = (err.data && typeof err.data === "object" ? { ...(err.data as Record<string, unknown>) } : err.data) as Record<string, unknown> | undefined;
   if (data) {
@@ -98,7 +98,8 @@ function recordDoorError(err: McpError): McpError {
       delete data.note_id;
     }
   }
-  return new McpError(err.code, recordWords(err.message.replace(MCP_ERROR_PREFIX_RE, "")), data);
+  // The message is already in record words (the record tool's errorOut); only what this file added is not.
+  return new McpError(err.code, err.message.replace(MCP_ERROR_PREFIX_RE, ""), data);
 }
 
 /**
