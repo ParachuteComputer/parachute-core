@@ -28,7 +28,7 @@ say what that program must do, written so they ran against **today's** code firs
 | [`PROCESS.md`](PROCESS.md) | How we build: what we reuse and what we rewrite, which tests we write, how a change lands, how people and agents work here together. |
 | [`AGENTS.md`](AGENTS.md) | The short rules for any agent (Uni's workers, Benjamin's agent, reviewers) working in this repo. |
 | `.github/workflows/contracts.yml` | CI: on every push and pull request, the moved code's own checks and tests, the contract suite against the pinned commits and against the core build, Benjamin's suite, then the mutants that prove it can fail. |
-| `.github/workflows/bundle-macos.yml` | CI on macos-14: the darwin-arm64 bundle signed ad hoc with the hardened runtime, unpacked to a path with a space; `embedded/bundle` and Benjamin's suite on the signed tree. On main, nightly, and pull requests that touch the bundle. |
+| `.github/workflows/bundle-macos.yml` | CI on macos-15: the darwin-arm64 bundle signed ad hoc with the hardened runtime, unpacked to a path with a space; `embedded/bundle` and Benjamin's suite on the signed tree. On main, nightly, and pull requests that touch the bundle. |
 | [`docs/walkthrough/`](docs/walkthrough/) | The script and code for the short narrated walkthrough video. |
 
 ## Install

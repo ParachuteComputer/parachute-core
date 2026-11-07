@@ -897,6 +897,8 @@ export interface InstallAndStartHubUnitOpts {
   bunInstall?: string;
   /** PATH to bake into the unit env (default a bun-bin-first sane PATH). */
   path?: string;
+  /** A folder put before the default PATH (core's `bin`, so the vault the hub runs by name is core's). */
+  pathPrefix?: string;
   /** Log file the hub's stdout+stderr is written to (default the hub logPath). */
   logPath?: string;
   /** Injectable deps (defaults to production). */
@@ -949,7 +951,8 @@ export async function installAndStartHubUnit(
   const deps = opts.deps ?? defaultHubUnitDeps;
   const port = opts.port ?? HUB_UNIT_DEFAULT_PORT;
   const bunInstall = opts.bunInstall ?? `${deps.homeDir()}/.bun`;
-  const path = opts.path ?? enrichedUnitPath(bunInstall, deps.homeDir(), deps.platform);
+  const basePath = opts.path ?? enrichedUnitPath(bunInstall, deps.homeDir(), deps.platform);
+  const path = opts.pathPrefix ? `${opts.pathPrefix}:${basePath}` : basePath;
   const logPath = opts.logPath ?? `${opts.parachuteHome}/hub/logs/hub.log`;
   const log = opts.log ?? (() => {});
 

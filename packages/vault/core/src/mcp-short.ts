@@ -62,6 +62,7 @@ Rarer filters (has_links, order_by, expand_links, created_by, search_mode, …) 
       path_prefix: str('e.g. "Projects/"'),
       search: str("Full-text search over title and content"),
       metadata: { type: "object", description: "{field: value} or {field: {eq|ne|gt|gte|lt|lte|in|not_in|exists: v}}" },
+      since: str("What changed: updated_at on or after (ISO date)"),
       date_from: str("created_at on or after (ISO date)"),
       date_to: str("created_at before (ISO date, exclusive)"),
       date_filter: { ...obj({ field: str("created_at (default), updated_at, or an indexed date field"), from: str(), to: str("exclusive") }), description: "Date range on another field" },
@@ -229,7 +230,7 @@ Rarer filters (has_links, order_by, expand_links, created_by, search_mode, …) 
 
 /** Names agents reach for that a tool calls something else. Checked before edit distance. */
 const PARAM_ALIASES: Record<string, Record<string, string>> = {
-  "query-notes": { query: "search", q: "search", text: "search", tags: "tag", note_id: "id", note: "id", ids: "id", filter: "metadata", where: "metadata", page_size: "limit", since: "date_from", until: "date_to", order: "sort" },
+  "query-notes": { query: "search", q: "search", text: "search", tags: "tag", note_id: "id", note: "id", ids: "id", filter: "metadata", where: "metadata", page_size: "limit", until: "date_filter", order: "sort" },
   "update-note": { note_id: "id", note: "id", path_or_id: "id", text: "content", body: "content", add_tags: "tags", edit: "content_edit" },
   "create-note": { body: "content", text: "content", tag: "tags", title: "path" },
   "delete-note": { note_id: "id", note: "id", path: "id" },

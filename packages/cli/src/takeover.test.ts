@@ -5,7 +5,7 @@ import { describe, expect, test } from "bun:test";
 import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { backup, entries, managerValue, restore, systemdWords, unitHome as readHome } from "./takeover.ts";
+import { backup, entries, launchdProgram, managerValue, oldOwner, restore, systemdWords, unitHome as readHome } from "./takeover.ts";
 
 // The user manager's environment sets no PARACHUTE_HOME here, unless a test says so.
 const unitHome = (text: string, manager: () => string | undefined | null = () => undefined) => readHome(text, manager);
@@ -85,7 +85,7 @@ describe("unitHome", () => {
   });
 });
 
-// The backup and its restore (rehearsal/uni, lane H): uni's home has a library's version links in transcription/bin
+// The backup and its restore (a rehearsal, lane H): a real home has a library's version links in transcription/bin
 // (`libggml.so -> libggml.so.0 -> libggml.so.0.15.1`). They stay inside the home, so they are copied as links and put
 // back as links; only a link that leads out of the home (or a socket) can't be copied as it is.
 describe("backup and restore", () => {
@@ -147,5 +147,51 @@ describe("managerValue: a value as systemctl show-environment prints it", () => 
     expect(managerValue("$'\\q'")).toBeNull();
     expect(managerValue("$'\\'")).toBeNull();
     expect(managerValue("$'\\777'")).toBeNull();
+  });
+});
+
+describe("launchdProgram", () => {
+  const plist = (args: string[], path: string) =>
+    `<plist><dict><key>Label</key><string>computer.parachute.hub</string><key>ProgramArguments</key><array>${args
+      .map((a) => `<string>${a}</string>`)
+      .join("")}</array><key>EnvironmentVariables</key><dict><key>PATH</key><string>${path}</string></dict></dict></plist>`;
+
+  test("a fresh 0.8 agent runs parachute-core: what takeover's launchd check exempts", () => {
+    const core = "/Users/op/.bun/install/global/node_modules/@openparachute/core";
+    expect(launchdProgram(plist(["/Users/op/.bun/bin/bun", `${core}/packages/cli/src/parachute-core.ts`, "serve"], `${core}/packages/cli/bin:/usr/bin`))).toContain("parachute-core");
+  });
+
+  test("a 0.7 agent is judged by its program, not by core's folder on its PATH", () => {
+    const text = plist(["/Users/op/.bun/bin/bun", "/Users/op/.bun/install/global/node_modules/@openparachute/hub/src/cli.ts", "serve"], "/x/parachute-core/bin:/usr/bin");
+    expect(launchdProgram(text)).not.toContain("parachute-core");
+  });
+});
+
+describe("oldOwner and copies of core", () => {
+  function home(installDir: string): string {
+    const h = mkdtempSync(join(tmpdir(), "core-oldowner-"));
+    writeFileSync(join(h, "hub.db"), "");
+    writeFileSync(join(h, "services.json"), JSON.stringify({ services: [{ name: "parachute-vault", port: 1940, paths: [], health: "/x", version: "0.7.9", installDir }] }));
+    return h;
+  }
+  function vaultDir(root: string, inCore: boolean): string {
+    const dir = join(root, "packages", "vault");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "@openparachute/vault", version: "0.7.9" }));
+    if (inCore) {
+      mkdirSync(join(root, "packages", "cli", "src"), { recursive: true });
+      writeFileSync(join(root, "packages", "cli", "src", "parachute-core.ts"), "");
+    }
+    return dir;
+  }
+
+  test("a row on another copy of core's vault (an older bundle copy) is not an old program", () => {
+    const copy = mkdtempSync(join(tmpdir(), "core-copy-"));
+    expect(oldOwner(home(vaultDir(copy, true)))).toBeNull();
+  });
+
+  test("a row on npm's 0.7 vault still is", () => {
+    const npm = mkdtempSync(join(tmpdir(), "npm-vault-"));
+    expect(oldOwner(home(vaultDir(npm, false)))).toContain("@openparachute/vault 0.7.9");
   });
 });

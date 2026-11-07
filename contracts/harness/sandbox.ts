@@ -98,7 +98,7 @@ export async function enterSandbox(): Promise<void> {
   if (level === "2") return; // already inside, unprivileged
   if (process.platform === "darwin") {
     // macOS has no network or PID namespaces. The bundle's signed-tree runs (PLAN §7.3) happen only on GitHub's
-    // macos-14 runners, where nothing else listens; never on a person's Mac, which may run a live Parachute.
+    // macos-15 runners, where nothing else listens; never on a person's Mac, which may run a live Parachute.
     if (!onMacRunner()) throw new Error("sandbox: on macOS a candidate runs only on a CI runner (GITHUB_ACTIONS=true); there is no network namespace here");
     console.log("[sandbox] macOS CI runner: no namespaces, the run uses the runner itself");
     return;

@@ -363,7 +363,7 @@ export async function newMachine(
   return machine;
 }
 
-/** The units a box like uni or Adam's has: the hub running and enabled, a leftover vault unit off and disabled. */
+/** The units a box running 0.7 has: the hub running and enabled, a leftover vault unit off and disabled. */
 export const OLD_UNITS: Record<string, UnitState> = {
   "parachute-hub.service": { active: true, enabled: true },
   "parachute-vault.service": { active: false, enabled: false },
@@ -491,7 +491,7 @@ export async function makeStockHome(m: Machine, opts: { unitEnv?: Record<string,
     PARACHUTE_INITIAL_ADMIN_PASSWORD: `pw-${randomBytes(12).toString("hex")}`,
   };
   // The old units carry what the old box runs with, as an install's unit (or its drop-in) does; no password.
-  // `opts.unitEnv` adds what a box's unit also has (the friends box's PATH and BUN_INSTALL).
+  // `opts.unitEnv` adds what a box's unit also has (a box's PATH and BUN_INSTALL).
   const unitEnv = { PORT: String(port), PARACHUTE_HUB_ORIGIN: origin, PARACHUTE_HUB_JWKS_ORIGIN: origin, PARACHUTE_BIND_HOST: "127.0.0.1", ...opts.unitEnv };
   for (const u of m.units) writeFileSync(join(m.unitDir, u), unitFileText(u, unitEnv));
   await m.expose(port);

@@ -3,8 +3,8 @@
 // A consumer app replays the RFC 8707 `resource` it was authorized with on every refresh, perhaps months and several
 // hub versions later. Before the fix (hub 53d327b, and v0.8 at ccc7729) a refresh checked `resource` like a code
 // exchange (packages/hub/src/oauth-handlers.ts resolveTokenResourceAudience) and answered 400 invalid_target for any
-// other scheme, host or vault; 0.7.6 and older never read it. On a friend's box taken over from 0.7.6 to v0.8 (10-29)
-// two Claude connectors authorized in June could not renew and signed out. Fixed in packages/hub
+// other scheme, host or vault; 0.7.6 and older never read it. On a box taken over from 0.7.6 to v0.8 (10-29)
+// two connectors authorized months earlier could not renew and signed out. Fixed in packages/hub
 // (resolveRefreshAudience, resolveRefreshResource): an unmatched resource is ignored and logged, the grant's own
 // audience kept. Mutants "refresh-refuses-unmatched-resource" and "refresh-resource-outside-grant" put the bug back,
 // or widen the fix.
@@ -21,7 +21,7 @@ test("a refresh carrying the resource the app saved under an earlier setup still
   // versions later. Vaults of mid-2026 built that value from the request (`x-forwarded-proto || "https"` +
   // `x-forwarded-host`, else the request's own origin), so behind a tunnel an app may hold the http:// twin of the
   // MCP URL, or the vault's own loopback origin. 0.7.x never read `resource` on refresh; a hub that refuses it
-  // leaves the app unable to renew, and the app signs the person out (a friend's box, 10-29: two connectors).
+  // leaves the app unable to renew, and the app signs the person out (10-29: two connectors).
   const own = await connect({ appName: `Saved-resource app ${runId("app")}` });
   const mcpPath = new URL(MCP_URL).pathname;
   const twin = new URL(MCP_URL);

@@ -41,6 +41,7 @@ import { unwireScribeAuth } from "./auto-wire.ts";
 import { isLinked as defaultIsLinked } from "./bun-link.ts";
 import { PARACHUTE_INSTALL_CHANNEL_ENV } from "./commands/install.ts";
 import { buildModuleSpawnRequest, reconcilePortToCanonical } from "./commands/serve-boot.ts";
+import { bundledModuleDir, servingCoreVaultDir } from "./core-host.ts";
 import { validateHostAdminToken } from "./host-admin-token-validation.ts";
 import { getModuleInstallChannel } from "./hub-settings.ts";
 import { readModuleManifest } from "./module-manifest.ts";
@@ -549,6 +550,8 @@ function resolveApiInstallChannel(
  * `stampInstallDir` had — callers fall through to a regen-only path.
  */
 function resolveInstallDirForSpec(spec: ServiceSpec, deps: ApiModulesOpsDeps): string | null {
+  const bundled = bundledModuleDir(spec.package);
+  if (bundled) return bundled;
   const findGlobalInstall = deps.findGlobalInstall;
   if (!findGlobalInstall) return null;
   const pkgJson = findGlobalInstall(spec.package);
@@ -811,7 +814,14 @@ export async function runInstall(
   // pre-this-fix; the shared `src/bun-link.ts` keeps both paths in
   // lockstep going forward.
   const isLinked = deps.isLinked ?? defaultIsLinked;
-  if (isLinked(spec.package)) {
+  if (bundledModuleDir(spec.package)) {
+    // Inside @openparachute/core the vault is this program (core-host.ts): never bun-add 0.7's next to it.
+    registry.update(
+      opId,
+      { status: "running" },
+      `${spec.package} is part of this program (@openparachute/core) — nothing to download`,
+    );
+  } else if (isLinked(spec.package)) {
     registry.update(
       opId,
       { status: "running" },
@@ -844,7 +854,10 @@ export async function runInstall(
   if (spec.seedEntry) {
     const existing = findService(spec.manifestName, deps.manifestPath);
     if (!existing) {
-      const entry = spec.seedEntry();
+      // Core's vault never rewrites its row on boot: seed "installed, no vault yet" (#478), as install.ts does.
+      const entry = bundledModuleDir(spec.package)
+        ? { ...spec.seedEntry(), paths: [] }
+        : spec.seedEntry();
       const { upsertService } = await import("./services-manifest.ts");
       upsertService(entry, deps.manifestPath);
       registry.update(opId, {}, `seeded services.json entry for ${short}`);
@@ -1228,6 +1241,17 @@ async function runUpgrade(
   // the DB toggle says — asymmetric + surprising to the operator.
   // (Operators who want different install vs upgrade channels can still
   // do so via the DB toggle when no env is set.)
+  // Core's vault serves this home (a core copy's row, or a taken-over home): upgrading it is upgrading core.
+  // A box an early 0.8 prerelease set up on npm's 0.7 vault upgrades from npm as before.
+  const row = findService(spec.manifestName, deps.manifestPath);
+  if (bundledModuleDir(spec.package) && servingCoreVaultDir(row?.installDir, deps.configDir)) {
+    registry.update(
+      opId,
+      { status: "succeeded" },
+      `${spec.package} is part of @openparachute/core: upgrade core itself, then restart`,
+    );
+    return;
+  }
   const channel = resolveApiInstallChannel(undefined, deps);
   const spec_str = `${spec.package}@${channel}`;
   registry.update(opId, { status: "running" }, `running bun add -g ${spec_str}`);

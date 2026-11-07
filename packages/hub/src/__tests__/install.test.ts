@@ -24,6 +24,43 @@ function makeTempPath(): { path: string; configDir: string; cleanup: () => void 
 }
 
 describe("install", () => {
+  test("inside @openparachute/core, `install vault` registers core's own vault and never downloads 0.7's", async () => {
+    // packages/hub/src/__tests__ → the package root, as core's `parachute` sets it (cli/src/dispatch.ts).
+    const coreRoot = realpathSync(join(import.meta.dir, "..", "..", "..", ".."));
+    const { path, cleanup } = makeTempPath();
+    const before = process.env.PARACHUTE_CORE_ROOT;
+    process.env.PARACHUTE_CORE_ROOT = coreRoot;
+    try {
+      const calls: string[][] = [];
+      const logs: string[] = [];
+      const code = await install("vault", {
+        runner: async (cmd) => {
+          calls.push([...cmd]);
+          return 0;
+        },
+        manifestPath: path,
+        startService: async () => 0,
+        isLinked: () => false,
+        findGlobalInstall: () => null,
+        portProbe: async () => false,
+        noStart: true,
+        log: (l) => logs.push(l),
+      });
+      expect(code).toBe(0);
+      expect(calls.some((c) => c[0] === "bun" && c[1] === "add")).toBe(false);
+      expect(logs.join("\n")).toContain("part of this program (@openparachute/core)");
+      const row = findService("parachute-vault", path);
+      expect(row?.installDir).toBe(join(coreRoot, "packages", "vault"));
+      // No vault exists yet, and core's vault won't rewrite the row: a "/vault/default" placeholder would make the
+      // setup wizard skip creating the first vault.
+      expect(row?.paths).toEqual([]);
+    } finally {
+      if (before === undefined) Reflect.deleteProperty(process.env, "PARACHUTE_CORE_ROOT");
+      else process.env.PARACHUTE_CORE_ROOT = before;
+      cleanup();
+    }
+  });
+
   test("rejects third-party package with no module.json (hard error)", async () => {
     const { path, cleanup } = makeTempPath();
     try {

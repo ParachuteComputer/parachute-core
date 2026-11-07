@@ -272,7 +272,7 @@ export function resolveRootMcpTokenAudience(
 }
 
 /**
- * What a refresh's `resource` names, on the tolerant rules refresh uses (friends box, 10-29).
+ * What a refresh's `resource` names, on the tolerant rules refresh uses (10-29).
  *
  * Code exchange and authorize keep the strict rule above (`resolveResourceVault` / `isRootMcpResource`: the origin
  * must be one of the hub's bound origins, exactly). A refresh replays the `resource` the client saved when it was

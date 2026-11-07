@@ -41,7 +41,7 @@ function enforceDoLimits(d: Database) {
 }
 
 // A folder name a person would plausibly use: 54 bytes with the slash.
-const DIR = "Meetings with the whole friends group about the move/";
+const DIR = "An example folder whose name runs past the byte cap/";
 
 let db: Database;
 let store: SqliteStore;
@@ -83,7 +83,7 @@ describe("path_prefix / exclude_path_prefix over 50 bytes", () => {
 
 describe("rename-tag cascade on Durable Object limits", () => {
   it("renames a tag whose sub-tag is over 48 bytes, rewriting body, parents and _tags paths", async () => {
-    const sub = "proj/meetings-with-the-whole-friends-group-about-the-move";
+    const sub = "proj/an-example-tag-whose-name-runs-past-the-byte-cap";
     expect(bytes(sub)).toBeGreaterThan(48);
     const n = await store.createNote(`body #${sub} and [[_tags/${sub}]]`, { tags: [sub] });
     await store.createNote("root", { tags: ["proj"] });
@@ -94,7 +94,7 @@ describe("rename-tag cascade on Durable Object limits", () => {
     expect(r.sub_tags_renamed).toBe(1);
     expect(r.notes_rewritten).toBe(1);
     expect(r.paths_renamed).toBe(1);
-    const newSub = "project/meetings-with-the-whole-friends-group-about-the-move";
+    const newSub = "project/an-example-tag-whose-name-runs-past-the-byte-cap";
     expect((await store.getNote(n.id))!.content).toBe(`body #${newSub} and [[_tags/${newSub}]]`);
     expect((await store.getNote(n.id))!.tags).toEqual([newSub]);
     expect((await store.queryNotes({ path: `_tags/${newSub}` })).length).toBe(1);
@@ -111,7 +111,7 @@ describe("rename-tag cascade on Durable Object limits", () => {
   });
 
   it("rewrites parent_names that name a long tag", async () => {
-    const parent = "area/meetings-with-the-whole-friends-group-about-it";
+    const parent = "area/an-example-parent-tag-whose-name-runs-past-the-cap";
     await store.createNote("x", { tags: [parent, "child"] });
     await store.upsertTagRecord("child", { parent_names: [parent] });
     const r = await store.renameTag(parent, "area/short");

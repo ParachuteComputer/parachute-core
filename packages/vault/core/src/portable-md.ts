@@ -53,6 +53,10 @@
  *   - id: att_01HGZB...
  *     path: 2026-05-12/audio.m4a
  *     mime_type: audio/mp4
+ *   - body_link: ../.parachute/attachments/att_01HGZC.../map.png
+ *     id: att_01HGZC...       # body_link: the target the export wrote for
+ *     path: 2026-05-12/map.png  # this note's /api/storage/ links (T-318 #8)
+ *     mime_type: image/png
  * created_at: 2026-05-12T10:00:00.000Z
  * updated_at: 2026-05-12T11:23:45.123Z
  * ---
@@ -64,7 +68,8 @@
  * - Top-level frontmatter keys emitted in fixed order (above).
  * - Nested object keys alpha-sorted.
  * - Booleans `true`/`false`; numbers as-is; strings bare unless they
- *   contain YAML-meaningful characters, then single-quoted.
+ *   contain YAML-meaningful characters, then single-quoted. A list item with
+ *   a colon anywhere is always quoted.
  * - Trailing newline after closing `---`.
  *
  * Pin: vault → export → re-export → byte-identical bytes.
@@ -72,13 +77,14 @@
  * See vault#308.
  */
 
-import { readdirSync, readFileSync, realpathSync, statSync, mkdirSync, writeFileSync, copyFileSync, existsSync, rmSync } from "fs";
-import { basename, join, relative, extname, dirname, resolve as resolvePath, sep as pathSep } from "path";
+import { readdirSync, readFileSync, realpathSync, statSync, mkdirSync, writeFileSync, copyFileSync, existsSync, rmSync, openSync, readSync, closeSync } from "fs";
+import { basename, join, relative, extname, dirname, posix, resolve as resolvePath, sep as pathSep } from "path";
 import type { Store, Note, Link, Attachment } from "./types.js";
 import type { TagRecord } from "./tag-schemas.js";
 import { ParentCycleError } from "./tag-schemas.js";
 import { transactionAsync } from "./txn.js";
 import { timestampToMs } from "./cursor.js";
+import { computeDisplayTitle } from "./display-title.js";
 
 // ---------------------------------------------------------------------------
 // Format constants
@@ -101,11 +107,14 @@ export const SIDECAR_DIR = ".parachute";
  */
 export const NOTES_META_DIR = "notes-meta";
 
+/** The served URL prefix the app writes into note bodies for attachments. */
+const STORAGE_URL_PREFIX = "/api/storage/";
+
 /**
  * Extensions whose serialized form carries metadata as inline YAML
  * frontmatter at the top of the content file. `.md` is the canonical
  * case; `.mdx` joins it because MDX's parser accepts the same `---`
- * delimited preamble (and Aaron's planning to use MDX in notes).
+ * delimited preamble (and MDX in notes is planned).
  * Anything else is sidecar-required — see `core/src/portable-md.ts`
  * write/read paths.
  *
@@ -180,6 +189,19 @@ export interface PortableAttachmentRef {
   path: string;
   mime_type: string;
   metadata?: Record<string, unknown>;
+  /**
+   * Export-only (T-318 #8). The app links an attached file into a markdown
+   * body as `[name](/api/storage/<path>)` (or `![name](…)`), a URL only a
+   * running vault serves. When the export copied this binary and rewrote at
+   * least one such link in the note's body, this is the target it wrote in
+   * its place: the percent-encoded path from the note file to the copied
+   * file (`../.parachute/attachments/<id>/<basename>`). Import turns exactly
+   * that target back into the storage link and drops the key, so the body
+   * and the attachment row come back as stored. Absent means the body was
+   * written as stored for this attachment. Additive: older importers ignore
+   * it (and keep the relative links), so the format version stays 1.
+   */
+  body_link?: string;
 }
 
 /** Vault-level metadata in `.parachute/vault.yaml`. */
@@ -310,6 +332,18 @@ function quoteString(s: string): string {
   return `'${s.replace(/'/g, "''")}'`;
 }
 
+/**
+ * A scalar as a list item. `- https://x` is a string in YAML, but this module's
+ * parser read `- key:value` as an object until T-395, and importers from before
+ * then are still out there, so an item with a colon anywhere is quoted (also
+ * `- ends:`, a key with no value in any YAML). Only list items: a colon in a
+ * `key: value` scalar was always safe, and quoting those would rewrite every
+ * timestamp and URL in every existing export and git mirror.
+ */
+function emitListItem(value: unknown): string {
+  return typeof value === "string" && value.includes(":") ? quoteString(value) : emitScalar(value);
+}
+
 function emitScalar(value: unknown): string {
   if (value === null) return "null";
   if (value === undefined) return "null";
@@ -374,7 +408,7 @@ function emitValueBlock(value: unknown, indent: number): string | null {
     for (const item of value) {
       if (item === null || typeof item !== "object" || Array.isArray(item)) {
         // Scalar / array item — single line with `- `.
-        lines.push(`${pad}- ${emitScalar(item)}`);
+        lines.push(`${pad}- ${emitListItem(item)}`);
       } else {
         // Object item: emit keys with `- ` prefix on the first key, hanging
         // indent for the rest. Alpha-sort keys for idempotency.
@@ -535,11 +569,243 @@ export function toSidecarYaml(note: PortableNote): string {
  * `_unpathed/<id>.<extension>` (no date-prefix coincidence with user
  * content). Default extension is "md" so pre-vault#328 exports produce
  * the same filenames.
+ *
+ * `exportVault` keeps this id-keyed name only for a pathless note whose
+ * extension needs a sidecar (the sidecar finds its content file by id). A
+ * pathless markdown note carries its id in its frontmatter, so the export
+ * names its file after its title instead (`UnpathedNames`).
  */
 export function portableExportFilePath(note: PortableNote): string {
   const ext = note.extension ?? "md";
   if (note.path) return `${note.path}.${ext}`;
-  return `_unpathed/${note.id}.${ext}`;
+  return `${UNPATHED_DIR}/${note.id}.${ext}`;
+}
+
+/** The export folder that holds the notes with no path. */
+const UNPATHED_DIR = "_unpathed";
+
+/** Max UTF-8 bytes of a pathless note's file-name stem: short enough to read,
+ *  and far under the 255-byte name limit with a ` 999` suffix and extension. */
+const UNPATHED_STEM_MAX_BYTES = 80;
+
+/** Characters a filesystem, Windows or Obsidian links refuse in a file name,
+ *  plus invisible format characters (zero-width space, bidi controls, BOM;
+ *  not the joiners U+200C/U+200D, which emoji and some scripts need). */
+const UNSAFE_NAME_CHARS = /[\u0000-\u001f\u007f/\\:*?"<>|#^[\]\u200b\u200e\u200f\u202a-\u202e\u2060-\u2069\ufeff]/g;
+
+/** Device names Windows refuses as a file name, with or without an extension. */
+const WINDOWS_RESERVED_NAME = /^(con|prn|aux|nul|com[0-9\u00b9\u00b2\u00b3]|lpt[0-9\u00b9\u00b2\u00b3])(\.|$)/i;
+
+/**
+ * The file-name stem for a pathless markdown note: its display title (the
+ * first non-empty line, as the app shows it) made safe on every common
+ * filesystem. Unsafe characters become spaces; leading dots go (a dot file
+ * is hidden, and import skips it); trailing dots and spaces go (Windows drops
+ * them); a long title is cut at a word to `UNPATHED_STEM_MAX_BYTES`. A note
+ * with no text is "Untitled".
+ */
+export function unpathedFileStem(content: string): string {
+  const clean = (s: string) => s.replace(/\s+/g, " ").replace(/^[\s.]+/, "").replace(/[\s.]+$/, "");
+  let stem = clean((computeDisplayTitle(content) ?? "").normalize("NFC").replace(UNSAFE_NAME_CHARS, " "));
+  if (Buffer.byteLength(stem) > UNPATHED_STEM_MAX_BYTES) {
+    let cut = "";
+    for (const ch of stem) {
+      if (Buffer.byteLength(cut + ch) > UNPATHED_STEM_MAX_BYTES) break;
+      cut += ch;
+    }
+    const lastSpace = cut.lastIndexOf(" ");
+    const midWord = stem[cut.length] !== " " && lastSpace > 0;
+    stem = clean(midWord ? cut.slice(0, lastSpace) : cut);
+  }
+  if (stem === "") return "Untitled";
+  return stem.replace(WINDOWS_RESERVED_NAME, "$1_$2");
+}
+
+/** Case- and normalization-insensitive identity of an export file name: two
+ *  names with the same key are one file on macOS and Windows, so an export
+ *  unpacked there must never hold both. */
+function fileNameKey(relPath: string): string {
+  return relPath.normalize("NFC").toLowerCase();
+}
+
+/**
+ * Chooses the file of each pathless markdown note in one export run:
+ * `_unpathed/<title>.md`, or `<title> 2.md`, `<title> 3.md`… when another
+ * note already holds that name. A name is held by a note claimed earlier in
+ * this run, by a pathed note whose path falls under `_unpathed/` (reserved up
+ * front, so it wins even if it is written later), or by a file an earlier
+ * export left in the destination (for an `--since` export or the git mirror,
+ * which re-export into the same folder) — so a write never replaces another
+ * note's file. A file whose id can't be read holds its name too. A note gets
+ * the first name free for it, so a re-export converges on the names a fresh
+ * export gives; when that is one of its own earlier files, the earlier
+ * spelling is reused (on a case-insensitive disk they are one file).
+ *
+ * When the name changes, the note's earlier files under `_unpathed/`
+ * (including an id-named one from before titles were used) are returned by
+ * `staleFiles` for removal, so the folder keeps one file per note. Import
+ * reads each note's id and path from its frontmatter, never from the name.
+ */
+class UnpathedNames {
+  /** Name key → id of the note holding it (null: a file with no readable id). */
+  private readonly holders = new Map<string, string | null>();
+  /** Name key → id of the note written there in this run. */
+  private readonly writtenBy = new Map<string, string>();
+  /** Note id → its files under `_unpathed/` from an earlier export. */
+  private readonly earlier = new Map<string, string[]>();
+  /** Names claimed in this run, and per stem the lowest suffix not yet
+   *  claimed, so N notes with one title cost O(N), not O(N²). */
+  private readonly claimed = new Set<string>();
+  private readonly lowestUnclaimed = new Map<string, number>();
+  /** Notes whose earlier file a pathed note's path now takes. */
+  readonly displaced = new Set<string>();
+
+  constructor(earlierFiles: Array<{ relPath: string; id: string | null }>, reserved: Array<{ relPath: string; id: string }>) {
+    for (const f of earlierFiles) {
+      this.holders.set(fileNameKey(f.relPath), f.id);
+      if (f.id !== null) this.earlier.set(f.id, [...(this.earlier.get(f.id) ?? []), f.relPath]);
+    }
+    for (const r of reserved) {
+      const key = fileNameKey(r.relPath);
+      const prior = this.holders.get(key);
+      if (prior && prior !== r.id) this.displaced.add(prior);
+      this.holders.set(key, r.id);
+    }
+  }
+
+  /** The file for a pathless markdown note. */
+  claim(note: PortableNote): string {
+    const ext = note.extension ?? "md";
+    const stem = unpathedFileStem(note.content);
+    const name = (n: number) => `${UNPATHED_DIR}/${n === 1 ? stem : `${stem} ${n}`}.${ext}`;
+    const stemKey = fileNameKey(`${stem}.${ext}`);
+    const own = new Map((this.earlier.get(note.id) ?? []).map((p) => [fileNameKey(p), p]));
+    for (let n = this.lowestUnclaimed.get(stemKey) ?? 1; ; n++) {
+      const key = fileNameKey(name(n));
+      const holder = this.holders.get(key);
+      if (holder !== undefined && holder !== note.id) continue;
+      this.holders.set(key, note.id);
+      this.claimed.add(key);
+      let low = this.lowestUnclaimed.get(stemKey) ?? 1;
+      while (this.claimed.has(fileNameKey(name(low)))) low++;
+      this.lowestUnclaimed.set(stemKey, low);
+      return own.get(key) ?? name(n);
+    }
+  }
+
+  /** Record that note `id` was written at `relPath` (pathed notes too). */
+  written(relPath: string, id: string): void {
+    const key = fileNameKey(relPath);
+    if (key.startsWith(`${UNPATHED_DIR}/`)) this.writtenBy.set(key, id);
+  }
+
+  /** Note `id`'s earlier files to remove now it is written at `relPath`: not
+   *  that file (compared by key: on a case-insensitive disk `Ideas.md` written
+   *  over `ideas.md` is one file), and not a file another note wrote over in
+   *  this run (a pathed note under `_unpathed/`). */
+  staleFiles(id: string, relPath: string): string[] {
+    const writtenKey = fileNameKey(relPath);
+    const stale = (this.earlier.get(id) ?? []).filter((p) => {
+      const key = fileNameKey(p);
+      return key !== writtenKey && (this.writtenBy.get(key) ?? id) === id;
+    });
+    for (const p of stale) {
+      if (this.holders.get(fileNameKey(p)) === id) this.holders.delete(fileNameKey(p));
+    }
+    this.earlier.delete(id);
+    return stale;
+  }
+}
+
+/** Export-root-relative sidecar path of an attachment's binary. */
+function attachmentSidecarPath(att: { id: string; path: string }): string {
+  return join(SIDECAR_DIR, "attachments", att.id, basename(att.path));
+}
+
+/**
+ * The markdown link target, from the note file at export-relative
+ * `noteRelPath`, to an attachment's sidecar file. Each segment is
+ * percent-encoded (and `(`/`)` too) so the target is one CommonMark link
+ * destination; a reader decodes it back to the file path.
+ */
+function relativeAttachmentTarget(noteRelPath: string, att: { id: string; path: string }): string {
+  const sidecar = attachmentSidecarPath(att).split(pathSep).join("/");
+  return posix
+    .relative(posix.dirname(posix.normalize(noteRelPath)), sidecar)
+    .split("/")
+    .map((s) => encodeURIComponent(s).replace(/[()]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`))
+    .join("/");
+}
+
+/** Whether a note of this extension gets its attachment links swapped. */
+function hasMarkdownBody(extension: string | undefined): boolean {
+  return supportsInlineFrontmatter(extension ?? "md");
+}
+
+/**
+ * Export side of {@link PortableAttachmentRef.body_link}. In a markdown body,
+ * every `](/api/storage/<att.path>)` of an attachment whose binary was
+ * written becomes `](<relative sidecar target>)`, and that attachment's ref
+ * records the target. An attachment is left as stored when the body has no
+ * storage link to it, or already holds its target (a link typed by hand,
+ * which the import could not tell from a rewritten one). So every occurrence
+ * of a recorded target in the exported body is one the export wrote.
+ */
+function withRelativeAttachmentLinks(
+  note: PortableNote,
+  noteRelPath: string,
+  writtenIds: ReadonlySet<string>,
+): PortableNote {
+  if (!note.attachments || !hasMarkdownBody(note.extension)) return note;
+  let content = note.content;
+  let changed = false;
+  const attachments = note.attachments.map((att) => {
+    if (!writtenIds.has(att.id)) return att;
+    const from = `](${STORAGE_URL_PREFIX}${att.path})`;
+    const target = relativeAttachmentTarget(noteRelPath, att);
+    if (!content.includes(from) || content.includes(`](${target})`)) return att;
+    content = content.split(from).join(`](${target})`);
+    changed = true;
+    return { ...att, body_link: target };
+  });
+  return changed ? { ...note, content, attachments } : note;
+}
+
+/**
+ * Import side of {@link PortableAttachmentRef.body_link}: in a markdown body,
+ * each recorded target becomes the storage link again. Only a target shaped
+ * like one the export writes for that attachment (`../` steps, then its
+ * sidecar path) counts. The export-only key is dropped from every ref so it
+ * never reaches an attachment row. Exported for the git-history import,
+ * which reads export bytes itself.
+ */
+export function fromExportedAttachmentLinks(
+  content: string,
+  attachments: unknown[],
+  extension: string | undefined,
+): { content: string; attachments: unknown[] } {
+  const markdown = hasMarkdownBody(extension);
+  let out = content;
+  const refs = attachments.map((att) => {
+    if (!att || typeof att !== "object" || !("body_link" in att)) return att;
+    const { body_link, ...ref } = att as Record<string, unknown>;
+    const { id, path } = ref;
+    if (
+      markdown && typeof body_link === "string" && typeof id === "string" && typeof path === "string" &&
+      id !== "" && path !== "" && isRelativeAttachmentTarget(body_link, { id, path })
+    ) {
+      out = out.split(`](${body_link})`).join(`](${STORAGE_URL_PREFIX}${path})`);
+    }
+    return ref;
+  });
+  return { content: out, attachments: refs };
+}
+
+/** Whether `target` is {@link relativeAttachmentTarget} of `att` from a note
+ *  file at some depth: zero or more `../`, then the encoded sidecar path. */
+function isRelativeAttachmentTarget(target: string, att: { id: string; path: string }): boolean {
+  const sidecar = relativeAttachmentTarget("note.md", att);
+  return target.endsWith(sidecar) && /^(\.\.\/)*$/.test(target.slice(0, target.length - sidecar.length));
 }
 
 // ---------------------------------------------------------------------------
@@ -742,6 +1008,15 @@ export interface ExportSink {
    *  to the attachment source (fs: `assetsDir`); `destRelPath` is export-
    *  root-relative. Only called when `attachmentsEnabled`. */
   copyAttachment(srcRelPath: string, destRelPath: string): SinkWriteResult;
+  /** Optional, for a destination that may already hold an earlier export
+   *  (the fs sink: `--since` exports and the git mirror write into the same
+   *  folder). The `.md`/`.mdx` files directly under export-root-relative
+   *  `dir`, as `dir/<name>`, each with its frontmatter `id` (null when it has
+   *  none or can't be read). A sink that always starts empty (cloud's tar)
+   *  leaves this and `removeText` out. */
+  listNoteFiles?(dir: string): Array<{ relPath: string; id: string | null }>;
+  /** Optional: remove a note file an earlier export wrote at `relPath`. */
+  removeText?(relPath: string): SinkWriteResult;
 }
 
 /**
@@ -809,6 +1084,41 @@ export class FsExportSink implements ExportSink {
     return { ok: true };
   }
 
+  listNoteFiles(dir: string): Array<{ relPath: string; id: string | null }> {
+    const full = join(this.root, dir);
+    if (!isWithinDir(resolvePath(full), this.rootResolved) || !existsSync(full)) return [];
+    const out: Array<{ relPath: string; id: string | null }> = [];
+    for (const entry of readdirSync(full)) {
+      if (entry.startsWith(".") || !supportsInlineFrontmatter(extname(entry).slice(1))) continue;
+      const file = join(full, entry);
+      let id: string | null = null;
+      try {
+        if (!statSync(file).isFile()) continue;
+        const fmId = frontmatterId(file);
+        if (typeof fmId === "string" && fmId.trim() !== "") id = fmId;
+      } catch {
+        // Unreadable: listed with no id, so it holds its name and is never removed.
+      }
+      out.push({ relPath: `${dir}/${entry}`, id });
+    }
+    return out;
+  }
+
+  removeText(relPath: string): SinkWriteResult {
+    // Resolve through symlinks before deleting (as `pruneOrphans` does): a
+    // linked folder inside the export must not lead a removal off-tree.
+    try {
+      const real = realpathSync(join(this.root, relPath));
+      if (!isWithinDir(real, realpathSync(this.root))) {
+        return { ok: false, reason: `"${real}" is outside the export root (symlink?); not removed` };
+      }
+      rmSync(real, { force: true });
+    } catch (err) {
+      return { ok: false, reason: `fs remove failed for "${relPath}": ${(err as Error)?.message ?? String(err)}` };
+    }
+    return { ok: true };
+  }
+
   copyAttachment(srcRelPath: string, destRelPath: string): SinkWriteResult {
     // attachmentsEnabled guarantees assetsDirResolved is set.
     const assetsDirResolved = this.assetsDirResolved!;
@@ -843,6 +1153,22 @@ export class FsExportSink implements ExportSink {
     }
     return { ok: true };
   }
+}
+
+/** The frontmatter `id` of a note file, reading only its head when the
+ *  frontmatter closes there (the git mirror lists `_unpathed/` on every flush). */
+function frontmatterId(file: string): unknown {
+  const head = Buffer.alloc(16 * 1024);
+  const fd = openSync(file, "r");
+  let read: number;
+  try {
+    read = readSync(fd, head, 0, head.length, 0);
+  } finally {
+    closeSync(fd);
+  }
+  const fromHead = parseFrontmatter(head.subarray(0, read).toString("utf-8")).frontmatter.id;
+  if (fromHead !== undefined || read < head.length) return fromHead;
+  return parseFrontmatter(readFileSync(file, "utf-8")).frontmatter.id;
 }
 
 /** Note-iteration batch size for the export walk — bounds the working set so
@@ -991,7 +1317,7 @@ export async function exportVault(
     const groups = new Map<string, Array<{ note_id: string; path: string; extension: string }>>();
     for await (const note of iterateAllNotes(store)) {
       const portable = await noteToPortable(note, store);
-      if (!portable.path) continue; // _unpathed/<id>.<ext> is case-stable
+      if (!portable.path) continue; // UnpathedNames never folds two pathless notes into one name
       const ext = portable.extension ?? "md";
       const key = `${portable.path.toLowerCase()}|${ext.toLowerCase()}`;
       const entry = { note_id: portable.id, path: portable.path, extension: ext };
@@ -1008,16 +1334,28 @@ export async function exportVault(
     }
   }
 
-  for await (const note of iterateAllNotes(store)) {
-    if (since && !shouldIncludeForSince(note, since)) continue;
+  // Pathless markdown notes are named after their title (T-318 #16). The
+  // reserved names are every pathed note under `_unpathed/` (not
+  // since-filtered: an unchanged one still owns its file).
+  const reservedUnpathed = (await store.queryNotes({ pathPrefix: `${UNPATHED_DIR}/`, limit: 1_000_000 }))
+    .map((n) => ({ relPath: `${n.path}.${n.extension ?? "md"}`, id: n.id }));
+  const unpathedNames = new UnpathedNames(sink.listNoteFiles?.(UNPATHED_DIR) ?? [], reservedUnpathed);
+
+  // One note's files. Called for each note the walk exports, then for a
+  // note displaced by a pathed note's file (below).
+  const exportedIds = new Set<string>();
+  const exportNote = async (note: Note): Promise<void> => {
+    exportedIds.add(note.id);
     const portable = await noteToPortable(note, store);
-    let relPath = portableExportFilePath(portable);
+    let relPath = !portable.path && supportsInlineFrontmatter(portable.extension ?? "md")
+      ? unpathedNames.claim(portable)
+      : portableExportFilePath(portable);
 
     // Decide whether this note's filename needs disambiguation (vault#327).
     // Only meaningful when the sink is case-insensitive AND a prior note's
     // (path, ext) tuple already claimed the same lowercased filename slot.
-    // Pathless notes (`_unpathed/<id>.<ext>`) are immune by construction —
-    // their filename embeds the id, which is case-stable already.
+    // Pathless notes are immune: `UnpathedNames` compares names without
+    // letter case on every sink.
     if (!caseSensitive && portable.path) {
       const ext = portable.extension ?? "md";
       const key = `${portable.path.toLowerCase()}|${ext.toLowerCase()}`;
@@ -1038,15 +1376,62 @@ export async function exportVault(
       }
     }
 
+    // Copy attachment binaries when the sink has them enabled. Each
+    // attachment is path-traversal-guarded on both ends by the sink; missing
+    // source files are skipped (warn) rather than aborting — the assets state
+    // may legitimately lag the DB (e.g. file evicted while row persists).
+    // Copied BEFORE the note text so the note's links can point at exactly
+    // the binaries that landed (PortableAttachmentRef.body_link) with one
+    // write per file — a key-collecting sink (cloud tar) must not see a note
+    // twice. So a note whose text write is then refused still leaves its
+    // binaries in the export (unreferenced, harmless).
+    const writtenAttachmentIds = new Set<string>();
+    if (sink.attachmentsEnabled && portable.attachments && portable.attachments.length > 0) {
+      for (const att of portable.attachments) {
+        // Dest: .parachute/attachments/<att-id>/<basename(att.path)>. Using
+        // att.id as the directory name keeps multiple attachments with the
+        // same basename from colliding; basename keeps it human-readable.
+        const copyResult = sink.copyAttachment(att.path, attachmentSidecarPath(att));
+        if (copyResult.ok) {
+          attachmentsWritten++;
+          writtenAttachmentIds.add(att.id);
+        } else {
+          skippedAttachments.push({
+            note_id: portable.id,
+            attachment_id: att.id,
+            path: att.path,
+            reason: copyResult.reason,
+          });
+        }
+      }
+    }
+
+    // Only the exported bytes change: `portable` (and the store) keep the
+    // note's real content.
+    const exportedNote = writtenAttachmentIds.size > 0
+      ? withRelativeAttachmentLinks(portable, relPath, writtenAttachmentIds)
+      : portable;
+
     // vault#317 F3 — path-traversal guard now lives in the sink: a note with
     // `path: "../../.ssh/authorized_keys"` is refused (not written off-tree)
     // and surfaced in `skipped_notes` so the operator can fix the note.
-    const noteWrite = sink.writeText(relPath, toPortableMarkdown(portable));
+    const noteWrite = sink.writeText(relPath, toPortableMarkdown(exportedNote));
     if (!noteWrite.ok) {
       skipped.push({ path: portable.path, reason: noteWrite.reason });
-      continue;
+      return;
     }
     notesWritten++;
+    // This note's file under `_unpathed/` from an earlier export into the same
+    // folder (its old title, the id-named file older exports wrote, or the
+    // time before it had a path) goes, so the folder keeps one file per note.
+    unpathedNames.written(relPath, portable.id);
+    for (const stale of unpathedNames.staleFiles(portable.id, relPath)) {
+      const removed = sink.removeText?.(stale);
+      if (removed && !removed.ok) {
+        // eslint-disable-next-line no-console
+        console.warn(`[export] could not remove "${stale}", an earlier file of note ${portable.id}: ${removed.reason}`);
+      }
+    }
 
     // Sidecar metadata write for non-frontmatter-compat extensions
     // (vault#328). The content file holds raw bytes (no YAML); the sidecar
@@ -1064,30 +1449,19 @@ export async function exportVault(
         sidecarsWritten++;
       }
     }
+  };
 
-    // Copy attachment binaries when the sink has them enabled. Each
-    // attachment is path-traversal-guarded on both ends by the sink; missing
-    // source files are skipped (warn) rather than aborting — the assets state
-    // may legitimately lag the DB (e.g. file evicted while row persists).
-    if (sink.attachmentsEnabled && portable.attachments && portable.attachments.length > 0) {
-      for (const att of portable.attachments) {
-        // Dest: .parachute/attachments/<att-id>/<basename(att.path)>. Using
-        // att.id as the directory name keeps multiple attachments with the
-        // same basename from colliding; basename keeps it human-readable.
-        const destRelPath = join(SIDECAR_DIR, "attachments", att.id, basename(att.path));
-        const copyResult = sink.copyAttachment(att.path, destRelPath);
-        if (copyResult.ok) {
-          attachmentsWritten++;
-        } else {
-          skippedAttachments.push({
-            note_id: portable.id,
-            attachment_id: att.id,
-            path: att.path,
-            reason: copyResult.reason,
-          });
-        }
-      }
-    }
+  for await (const note of iterateAllNotes(store)) {
+    if (since && !shouldIncludeForSince(note, since)) continue;
+    await exportNote(note);
+  }
+  // A pathed note under `_unpathed/` took the file an earlier export gave
+  // a pathless note. When the walk skipped that note (`--since`), write it
+  // again so it gets a new name instead of vanishing from the folder.
+  for (const id of unpathedNames.displaced) {
+    if (exportedIds.has(id)) continue;
+    const note = await store.getNote(id);
+    if (note) await exportNote(note);
   }
   if (skipped.length > 0) {
     // Surface to the caller without aborting — partial export is more useful
@@ -1125,7 +1499,7 @@ export async function exportVault(
  *   - `<outDir>/.parachute/vault.yaml`
  *   - `<outDir>/.parachute/schemas/<tag>.yaml` for each tag that declares
  *     description/fields/relationships/parent_names.
- *   - `<outDir>/<note.path>.md` for each note (or `_unpathed/<id>.md`).
+ *   - `<outDir>/<note.path>.md` for each note (or `_unpathed/<title>.md`).
  *   - `<outDir>/.parachute/attachments/<id>/<basename>` for each attachment
  *     (only when `opts.assetsDir` is set; the sink's path-traversal guard
  *     rejects attachments whose source escapes assetsDir or whose dest would
@@ -2227,7 +2601,9 @@ async function importVaultReplay(
       ? frontmatter.metadata as Record<string, unknown>
       : undefined;
     const links = Array.isArray(frontmatter.links) ? frontmatter.links : undefined;
-    const attachments = Array.isArray(frontmatter.attachments) ? frontmatter.attachments : undefined;
+    let attachments = Array.isArray(frontmatter.attachments) ? frontmatter.attachments : undefined;
+    // Undo the export's attachment-link rewrite, exactly where it recorded one.
+    if (attachments) ({ content, attachments } = fromExportedAttachmentLinks(content, attachments, extension));
 
     const portable: PortableNote = {
       id,
@@ -2427,8 +2803,7 @@ async function importVaultReplay(
       // File copy: from sidecar to assetsDir. Source uses the EXPORTED
       // att.id (what the exporter wrote), not our freshly-minted row id.
       if (source.attachmentsEnabled) {
-        const srcRelPath = join(SIDECAR_DIR, "attachments", att.id, basename(att.path));
-        const result = source.restoreAttachment(srcRelPath, att.path);
+        const result = source.restoreAttachment(attachmentSidecarPath(att), att.path);
         if (!result.ok) {
           stats.skipped_attachments.push({
             note_id: noteId,
@@ -2691,8 +3066,18 @@ function parseArrayBlock(
     // First content after `- `.
     const after = line.slice(indent + 2).trim();
     // Is this a scalar item (`- foo`) or an object item (`- key: value`)?
-    // Key regex matches parseBlock's (contract C2): dots + optional space.
-    const objMatch = after.match(/^([\w][\w.-]*)\s*:\s*(.*)$/);
+    // Key regex matches parseBlock's (contract C2): dots + optional space. As
+    // in YAML, a key's colon has a space or the end of the line after it, so
+    // `- https://x` and `- 2027-02-03T17:00:00Z` are strings. The exporter wrote
+    // those unquoted until T-395, and this is what restores those exports. An
+    // object whose first key holds a colon (keys aren't quoted) still reads as
+    // it always did, or the keys under it are lost: a string item never has
+    // lines under it, and every exporter quotes a string holding `: `.
+    const nextLine = peekNextContent(lines, i + 1);
+    const cannotBeString = /:\s/.test(after) || (nextLine !== -1 && countLeadingSpaces(lines[nextLine]!) > indent);
+    const objMatch =
+      after.match(/^([\w][\w.-]*)\s*:(?:\s+(.*))?$/) ??
+      (cannotBeString ? after.match(/^([\w][\w.-]*)\s*:\s*(.*)$/) : null);
     if (!objMatch) {
       result.push(parseScalarOrInline(after, reading));
       i++;
@@ -2704,7 +3089,7 @@ function parseArrayBlock(
     // synthesize a normalized block string and recurse.
     const itemIndent = indent + 2;
     const itemKey = objMatch[1]!;
-    const itemValue = objMatch[2]!.trim();
+    const itemValue = (objMatch[2] ?? "").trim();
     const itemObj: Record<string, unknown> = {};
     if (itemValue === "") {
       // First key's value is a nested block — look at next line.

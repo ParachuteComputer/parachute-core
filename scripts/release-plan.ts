@@ -7,7 +7,7 @@
 //   X.Y.Z-pre.N   dist-tag `next`, published on the merge that brings that version to main
 //   X.Y.Z         dist-tag `latest`, only after an approval on the `npm-latest` environment (release.yml), and only
 //                 as a suffix-drop of an X.Y.Z-pre.N that is already on npm, with nothing changed since but the
-//                 release notes and the `"version"` lines of package.json, packages/cli/package.json and bun.lock
+//                 release notes and the `"version"` lines of the manifests that carry core's version and bun.lock
 //   anything else (0.8.0-dev.0) is not a release and never publishes.
 //
 // What it guards against, as the hub learned it:
@@ -63,7 +63,18 @@ export function prereleasesOf(version: string, published: string[]): string[] {
 
 /** What a stable may change since its prerelease: the notes freely, and in these files only `"version"` lines. */
 export const STABLE_NOTES = ["CHANGELOG.md", "RELEASING.md"];
-export const STABLE_VERSION_ONLY = ["package.json", "packages/cli/package.json", "bun.lock"];
+export const STABLE_VERSION_ONLY = ["package.json", "packages/cli/package.json", "packages/hub/package.json", "packages/vault/package.json", "bun.lock"];
+
+/** The manifests besides the root's that carry core's version: the hub and the vault report theirs as what runs. */
+export const VERSION_MANIFESTS = ["packages/cli/package.json", "packages/hub/package.json", "packages/vault/package.json"];
+
+/** The manifests that don't say `version`, each with what it says: published like that, a 0.8 box would report them. */
+export function manifestsOffVersion(version: string, readVersion: (path: string) => string | undefined): string[] {
+  return VERSION_MANIFESTS.flatMap((p) => {
+    const v = readVersion(p);
+    return v === version ? [] : [`${p} (${v ?? "unreadable"})`];
+  });
+}
 
 /** Changed paths a stable may not carry past its prerelease (the version-only files are checked by their diff). */
 export function changedPastPrerelease(paths: string[]): string[] {
@@ -147,6 +158,17 @@ if (import.meta.main) {
       }
       if (extra.length) decision = { refuse: true, reason: `${version} changes more than its prerelease ${pre} did: ${extra.join(", ")}` };
     }
+  }
+  // Whichever channel: every manifest that carries core's version says this one.
+  if ("publish" in decision && decision.publish) {
+    const off = manifestsOffVersion(version, (p) => {
+      try {
+        return JSON.parse(readFileSync(p, "utf8")).version;
+      } catch {
+        return undefined;
+      }
+    });
+    if (off.length) decision = { refuse: true, reason: `${version} isn't what these manifests say: ${off.join(", ")}. RELEASING.md: a bump changes all of them.` };
   }
   if ("refuse" in decision) {
     console.error(`::error::${pkg.name}@${version}: ${decision.reason}`);

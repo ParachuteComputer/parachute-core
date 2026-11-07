@@ -138,7 +138,7 @@ export interface Detected {
   /**
    * Registered modules whose command v0.8 won't find on the PATH it will run with (the old hub unit's, see
    * handOverEnv): its supervisor looks each command up there before starting it, so such a module never starts,
-   * /api/ready stays false and the takeover's check fails (friends box, 10-29).
+   * /api/ready stays false and the takeover's check fails (10-29).
    */
   unfound: { name: string; command: string }[];
   /** The old unit whose environment that PATH is (handOverUnit), or null: the caller's (no old unit is on). */
@@ -551,6 +551,11 @@ function systemdUnits(home: string, held: Holder[]): Unit[] {
   return out;
 }
 
+/** A plist's ProgramArguments, the part runsOld() would call its ExecStart. */
+export function launchdProgram(plist: string): string {
+  return /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/.exec(plist)?.[1] ?? "";
+}
+
 /** Parachute's launchd agents (macOS): reported; pausing them is not built yet. */
 function launchdUnits(): Unit[] {
   if (process.platform !== "darwin") return [];
@@ -566,7 +571,7 @@ function launchdUnits(): Unit[] {
       text = readFileSync(join(dir, f), "utf8");
     } catch {}
     const active = run(["launchctl", "list", label]).code === 0;
-    return { name: label, manager: "launchd" as const, active, enabled: true, file: join(dir, f), old: OLD_COMMAND.test(text) || /hub|vault/i.test(label) };
+    return { name: label, manager: "launchd" as const, active, enabled: true, file: join(dir, f), old: !/parachute-core/.test(launchdProgram(text)) && (OLD_COMMAND.test(text) || /hub|vault/i.test(label)) };
   });
 }
 
@@ -807,7 +812,8 @@ export function oldOwner(home: string): string | null {
   if (Array.isArray(rows)) {
     for (const row of rows) {
       const dir = typeof row?.installDir === "string" ? row.installDir : undefined;
-      if (!dir || !existsSync(join(dir, "package.json")) || ours(dir)) continue;
+      // Any copy of core's own vault (an older bundle copy under .store/ included) is 0.8, not an old program.
+      if (!dir || !existsSync(join(dir, "package.json")) || ours(dir) || existsSync(join(dir, "..", "cli", "src", "parachute-core.ts"))) continue;
       const pkg = readJson(join(dir, "package.json"));
       if (pkg?.name === "@openparachute/hub" || pkg?.name === "@openparachute/vault") why.push(`${pkg.name} ${pkg.version} in ${dir}`);
     }
@@ -942,8 +948,7 @@ export function describe(d: Detected): string {
   for (const v of d.vaults) lines.push(`  ${v.name}: ${v.notes} notes, schema ${v.schema}`);
   if (d.vaults.length > 1) lines.push(`  ${notes} notes in all`);
   if (d.hub_schema !== null) lines.push(`  hub.db: schema ${d.hub_schema}`);
-  // Seen in rehearsal/uni and rehearsal/adam: core's supervisor boots these rows as the old hub did (the app on uni,
-  // scribe on Adam's box), with the program installed beside the old hub.
+  // Seen in rehearsals: core's supervisor boots these rows as the old hub did (the app, scribe), with the program installed beside the old hub.
   if (d.others.length) lines.push(`Also registered: ${d.others.join(", ")}. v0.8 starts ${d.others.length === 1 ? "it" : "them"} from services.json as the old hub did, with the installed program, which stays as it is.`);
   const from = d.path_from;
   for (const u of d.unfound) {
@@ -1156,7 +1161,7 @@ function liveKids(home: string): string[] {
  * Processes left from a check run on `home`: the check run marks its environment (PARACHUTE_TAKEOVER_CHECK=1 with this
  * home), and its modules (scribe, the app) inherit it. The supervisor starts each module in its own process group, so
  * when the check run dies without stopping them (killed, or its session dropped) they live on, holding the modules'
- * ports, and the next v0.8 can't start them (rehearsal/adam: an orphaned scribe on :1943). Linux only.
+ * ports, and the next v0.8 can't start them (seen in a rehearsal: an orphaned module still on its port). Linux only.
  */
 function checkLeftovers(home: string): number[] {
   if (process.platform !== "linux") return [];
@@ -1264,7 +1269,7 @@ async function isReady(hub: string): Promise<boolean> {
 /**
  * A 5-minute read pass for one vault, signed with the home's own signing key and recorded in hub.db like any mint
  * (subject takeover-check). Not through `auth mint-token`: that needs a usable operator token, and an old home's may
- * not be one (uni's was issued under the tailnet's old name, which only the hub's server accepts; rehearsal/uni), and
+ * not be one (one can be issued under the box's old hostname, which only the hub's server accepts; seen in a rehearsal), and
  * it would rotate one near expiry, writing operator.token in the home mid-takeover.
  */
 async function mintCheckPass(d: Detected, vault: string): Promise<string> {
@@ -1426,7 +1431,7 @@ export function unitEnvironment(unit: string): string[] {
  * with the manager's), then the unit's own over it (unitEnv; an environment file's assignments win over
  * Environment=). The caller's environment is only the ground under those (HOME, LANG, …, and anything systemd won't
  * report). Without this, a takeover run under `systemd-run --user` checked v0.8 with the user manager's PATH, where
- * the modules' programs (scribe in ~/.bun/bin) aren't, though the unit's PATH has them (friends box, 10-29); and one
+ * the modules' programs (in Bun's global bin) aren't, though the unit's PATH has them (10-29); and one
  * run from a shell would check with the shell's PATH what the unit runs with the manager's.
  * `unread`: what couldn't be read exactly (an environment file, see envFileVars; a manager value, see managerValue),
  * left out here; systemd still gives it to the unit. No unit (a home a hand-run process served): the caller's environment, as it is.

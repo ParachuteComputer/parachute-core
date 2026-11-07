@@ -43,8 +43,9 @@
 
 import type { Database } from "bun:sqlite";
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { compareVersions } from "./commands/upgrade.ts";
+import { bundledModuleDir, servingCoreVaultDir } from "./core-host.ts";
 import { validateHostAdminToken } from "./host-admin-token-validation.ts";
 import {
   type ModuleInstallChannel,
@@ -58,6 +59,7 @@ import {
   readModuleManifest as defaultReadModuleManifest,
 } from "./module-manifest.ts";
 import type { ModuleFocus } from "./module-manifest.ts";
+import { isOffline } from "./offline.ts";
 import {
   FIRST_PARTY_FALLBACKS,
   KNOWN_MODULES,
@@ -79,7 +81,6 @@ import {
   readManifestLenient,
 } from "./services-manifest.ts";
 import type { ModuleStartError, ModuleState, Supervisor } from "./supervisor.ts";
-import { isOffline } from "./offline.ts";
 
 /**
  * Resolve a known module to the display + install bootstrap data the admin SPA
@@ -427,6 +428,8 @@ export async function defaultFetchLatestVersion(
   pkg: string,
   channel: ModuleInstallChannel,
 ): Promise<string | null> {
+  // Inside core the vault is this program; npm's @openparachute/vault is 0.7's, never an update for it.
+  if (bundledModuleDir(pkg)) return null;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 3_000);
   try {
@@ -545,8 +548,13 @@ export async function handleApiModules(req: Request, deps: ApiModulesDeps): Prom
     // module's `<installDir>/package.json` `version` is authoritative for the
     // code actually on disk. Falls back to the cache when there's no installDir
     // or the package.json can't be read (e.g. a not-yet-booted seed row).
-    if (entry.installDir !== undefined) {
-      const live = readInstalledVersion(entry.installDir);
+    // Inside core the vault that serves the home can be another folder than the row's (a taken-over home's row
+    // still names the old npm vault): ask that one, as `parachute status` does.
+    const liveDir =
+      (short === "vault" ? servingCoreVaultDir(entry.installDir, dirname(deps.manifestPath)) : null) ??
+      entry.installDir;
+    if (liveDir !== undefined) {
+      const live = readInstalledVersion(liveDir);
       if (live !== null) value.version = live;
     }
     if (entry.installDir !== undefined) value.installDir = entry.installDir;

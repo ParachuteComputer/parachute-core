@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   API_MODULES_CHANNEL_REQUIRED_SCOPE,
   API_MODULES_REQUIRED_SCOPE,
   _clearLatestVersionCacheForTests,
+  defaultFetchLatestVersion,
   defaultReadInstalledVersion,
   handleApiModules,
   handleApiModulesChannel,
@@ -591,6 +592,24 @@ describe("GET /api/modules", () => {
     expect(vault?.installed_version).toBe("0.6.4-rc.15");
     // And with the corrected current, @latest 0.6.3 is still a downgrade → no offer.
     expect(vault?.upgrade_available).toBe(false);
+  });
+
+  test("inside core, a taken-over home's vault reads as core's, though its row still names the old npm vault", async () => {
+    const coreRoot = join(import.meta.dir, "..", "..", "..", "..");
+    const before = process.env.PARACHUTE_CORE_ROOT;
+    process.env.PARACHUTE_CORE_ROOT = coreRoot;
+    try {
+      writeFileSync(join(dirname(h.manifestPath), "takeover.json"), JSON.stringify({ state: "taken-over" }));
+      const mods = await modulesWith({
+        installedVersion: "0.7.9",
+        latest: null,
+        readInstalledVersion: (dir) => (dir === join(coreRoot, "packages", "vault") ? "0.8.0" : "0.7.9"),
+      });
+      expect(mods.find((m) => m.short === "vault")?.installed_version).toBe("0.8.0");
+    } finally {
+      if (before === undefined) Reflect.deleteProperty(process.env, "PARACHUTE_CORE_ROOT");
+      else process.env.PARACHUTE_CORE_ROOT = before;
+    }
   });
 
   test("falls back to the services.json version when the live read returns null", async () => {
@@ -1565,5 +1584,18 @@ describe("PUT /api/modules/channel — hub#275 channel toggle", () => {
     );
     expect(res.status).toBe(200);
     expect(getSetting(h.db, "module_install_channel")).toBe("latest");
+  });
+});
+
+describe("defaultFetchLatestVersion inside @openparachute/core", () => {
+  test("offers no npm version for the vault core carries (npm's is 0.7's)", async () => {
+    const before = process.env.PARACHUTE_CORE_ROOT;
+    process.env.PARACHUTE_CORE_ROOT = join(import.meta.dir, "..", "..", "..", "..");
+    try {
+      expect(await defaultFetchLatestVersion("@openparachute/vault", "latest")).toBeNull();
+    } finally {
+      if (before === undefined) Reflect.deleteProperty(process.env, "PARACHUTE_CORE_ROOT");
+      else process.env.PARACHUTE_CORE_ROOT = before;
+    }
   });
 });

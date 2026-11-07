@@ -100,6 +100,89 @@ const okHubUnitSupervisor = {
 };
 
 describe("parachute upgrade", () => {
+  test("inside @openparachute/core: the vault and hub are core's, so nothing is bun-added", async () => {
+    const h = makeHarness();
+    const before = process.env.PARACHUTE_CORE_ROOT;
+    // packages/hub/src/__tests__ → the package root, as core's `parachute` sets it.
+    const coreRoot = join(import.meta.dir, "..", "..", "..", "..");
+    process.env.PARACHUTE_CORE_ROOT = coreRoot;
+    try {
+      seedVault(h.manifestPath, join(coreRoot, "packages", "vault"));
+      const logs: string[] = [];
+      const m = makeRunner();
+      const code = await upgrade(undefined, {
+        manifestPath: h.manifestPath,
+        configDir: h.configDir,
+        runner: m.runner,
+        findGlobalInstall: () => null,
+        restartFn: async () => 0,
+        log: (l) => logs.push(l),
+      });
+      expect(code).toBe(0);
+      expect(m.calls.some((c) => c.cmd[0] === "bun" && c.cmd[1] === "add")).toBe(false);
+      expect(logs.join("\n")).toMatch(/vault: part of @openparachute\/core/);
+
+      // A row that still points at an npm 0.7 vault (a box set up by 0.8.0-pre.1/pre.2) is upgraded as before,
+      // not waved off as core's.
+      const npmVault = join(h.installRoot, "vault");
+      writePackageJson(npmVault, { name: "@openparachute/vault", version: "0.7.9" });
+      seedVault(h.manifestPath, npmVault, "0.7.9");
+      const m2 = makeRunner([
+        { match: (c) => c[0] === "git" && c[1] === "rev-parse", code: 128 }, // an npm install, not a checkout
+      ]);
+      await upgrade("vault", {
+        manifestPath: h.manifestPath,
+        configDir: h.configDir,
+        runner: m2.runner,
+        findGlobalInstall: () => join(npmVault, "package.json"),
+        restartFn: async () => 0,
+        log: () => {},
+      });
+      expect(m2.calls.some((c) => c.cmd[0] === "bun" && c.cmd[1] === "add")).toBe(true);
+
+      // A row on another copy of core (an older bundle copy under .store/) is still core's vault.
+      const copy = join(h.installRoot, ".store", "0.8.0-pre.3-abcd", "lib");
+      writePackageJson(join(copy, "packages", "vault"), {
+        name: "@openparachute/vault",
+        version: "0.7.9",
+      });
+      mkdirSync(join(copy, "packages", "cli", "src"), { recursive: true });
+      writeFileSync(join(copy, "packages", "cli", "src", "parachute-core.ts"), "");
+      seedVault(h.manifestPath, join(copy, "packages", "vault"), "0.7.9");
+      const m3 = makeRunner([{ match: (c) => c[0] === "git" && c[1] === "rev-parse", code: 128 }]);
+      await upgrade("vault", {
+        manifestPath: h.manifestPath,
+        configDir: h.configDir,
+        runner: m3.runner,
+        findGlobalInstall: () => null,
+        restartFn: async () => 0,
+        log: () => {},
+      });
+      expect(m3.calls.some((c) => c.cmd[0] === "bun" && c.cmd[1] === "add")).toBe(false);
+
+      // A taken-over home: core's vault serves it even though the row still names npm's.
+      seedVault(h.manifestPath, npmVault, "0.7.9");
+      writeFileSync(
+        join(h.configDir, "takeover.json"),
+        JSON.stringify({ state: "taken-over" }, null, 2),
+      );
+      const m4 = makeRunner([{ match: (c) => c[0] === "git" && c[1] === "rev-parse", code: 128 }]);
+      await upgrade("vault", {
+        manifestPath: h.manifestPath,
+        configDir: h.configDir,
+        runner: m4.runner,
+        findGlobalInstall: () => join(npmVault, "package.json"),
+        restartFn: async () => 0,
+        log: () => {},
+      });
+      expect(m4.calls.some((c) => c.cmd[0] === "bun" && c.cmd[1] === "add")).toBe(false);
+    } finally {
+      if (before === undefined) Reflect.deleteProperty(process.env, "PARACHUTE_CORE_ROOT");
+      else process.env.PARACHUTE_CORE_ROOT = before;
+      h.cleanup();
+    }
+  });
+
   test("errors cleanly when targeting a service that's not installed", async () => {
     const h = makeHarness();
     try {

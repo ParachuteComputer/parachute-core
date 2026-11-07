@@ -1,9 +1,9 @@
 // The publish decision (release-plan.ts): what a merge to main may send to npm, and what it must refuse.
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
-import { changedPastPrerelease, channelFor, compareVersions, decidePublish, readRegistry, versionOnlyDiff, type Registry } from "./release-plan.ts";
+import { VERSION_MANIFESTS, changedPastPrerelease, channelFor, compareVersions, decidePublish, manifestsOffVersion, readRegistry, versionOnlyDiff, type Registry } from "./release-plan.ts";
 
 const npm = (versions: string[], distTags: Record<string, string> = {}): Registry => ({ versions, distTags });
 const published = npm(["0.8.0-pre.1"], { next: "0.8.0-pre.1", latest: "0.8.0-pre.1" });
@@ -20,6 +20,19 @@ describe("release plan", () => {
     expect(compareVersions("0.8.0-pre.10", "0.8.0-pre.9")).toBe(1);
     expect(compareVersions("0.8.1-pre.1", "0.8.0")).toBe(1);
     expect(compareVersions("0.8.0-pre.2", "0.8.0-pre.2")).toBe(0);
+  });
+
+  test("a manifest that doesn't carry the version is named, so the release can refuse it", () => {
+    const at = (over: Record<string, string | undefined>) => (p: string) => (p in over ? over[p] : "0.8.0-pre.4");
+    expect(manifestsOffVersion("0.8.0-pre.4", at({}))).toEqual([]);
+    expect(manifestsOffVersion("0.8.0-pre.4", at({ "packages/hub/package.json": "0.8.0-pre.3" }))).toEqual(["packages/hub/package.json (0.8.0-pre.3)"]);
+    expect(manifestsOffVersion("0.8.0-pre.4", at({ "packages/vault/package.json": undefined }))).toEqual(["packages/vault/package.json (unreadable)"]);
+  });
+
+  test("this tree's manifests all carry the root's version", () => {
+    const root = join(import.meta.dir, "..");
+    const version = (p: string) => JSON.parse(readFileSync(join(root, p), "utf8")).version as string;
+    expect(VERSION_MANIFESTS.map((p) => [p, version(p)])).toEqual(VERSION_MANIFESTS.map((p) => [p, version("package.json")]));
   });
 
   test("a new prerelease on main publishes to next", () => {
@@ -64,6 +77,8 @@ describe("release plan", () => {
 
   test("a stable may change only the version and the notes since its prerelease", () => {
     expect(changedPastPrerelease(["package.json", "bun.lock", "CHANGELOG.md", ""])).toEqual([]);
+    // Dropping the suffix touches every manifest that carries core's version (RELEASING.md).
+    expect(changedPastPrerelease(["packages/cli/package.json", "packages/hub/package.json", "packages/vault/package.json"])).toEqual([]);
     expect(changedPastPrerelease(["package.json", "packages/cli/src/serve.ts"])).toEqual(["packages/cli/src/serve.ts"]);
     const drop = 'diff --git a/bun.lock b/bun.lock\n--- a/bun.lock\n+++ b/bun.lock\n@@ -10 +10 @@\n-      "version": "0.8.0-pre.3",\n+      "version": "0.8.0",\n';
     expect(versionOnlyDiff(drop)).toBe(true);
@@ -88,7 +103,10 @@ describe("release plan, run on a repository: a stable's diff since its prereleas
       const p = Bun.spawnSync(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", ...a], { cwd: dir, stdout: "pipe", stderr: "pipe" });
       if (p.exitCode !== 0) throw new Error(p.stderr.toString());
     };
-    const write = (f: string, text: string) => writeFileSync(join(dir, f), text);
+    const write = (f: string, text: string) => {
+      mkdirSync(dirname(join(dir, f)), { recursive: true });
+      writeFileSync(join(dir, f), text);
+    };
     const plan = () => {
       writeFileSync(join(dir, ".registry.json"), JSON.stringify(npm(["0.8.0-pre.3"], { next: "0.8.0-pre.3", latest: "0.8.0-pre.3" })));
       const p = Bun.spawnSync([process.execPath, script, "--registry", ".registry.json"], { cwd: dir, env: { ...process.env, GITHUB_REF_NAME: "main", GITHUB_OUTPUT: "" }, stdout: "pipe", stderr: "pipe" });
@@ -96,6 +114,7 @@ describe("release plan, run on a repository: a stable's diff since its prereleas
     };
     git("init", "-q");
     write("package.json", JSON.stringify({ name: "@openparachute/core", version: "0.8.0-pre.3" }, null, 2) + "\n");
+    for (const f of VERSION_MANIFESTS) write(f, JSON.stringify({ version: "0.8.0-pre.3" }, null, 2) + "\n");
     write("bun.lock", '{\n  "workspaces": {\n    "packages/cli": {\n      "version": "0.8.0-pre.3",\n    },\n  },\n}\n');
     write("serve.ts", "export {};\n");
     git("add", "-A");
@@ -104,10 +123,10 @@ describe("release plan, run on a repository: a stable's diff since its prereleas
     return { dir, git, write, plan };
   }
   const drop = (r: ReturnType<typeof repo>) => {
-    for (const f of ["package.json", "bun.lock"]) r.write(f, readFileSync(join(r.dir, f), "utf8").replace("0.8.0-pre.3", "0.8.0"));
+    for (const f of ["package.json", ...VERSION_MANIFESTS, "bun.lock"]) r.write(f, readFileSync(join(r.dir, f), "utf8").replace("0.8.0-pre.3", "0.8.0"));
   };
 
-  test("dropping the suffix (package.json and bun.lock) and adding notes publishes", () => {
+  test("dropping the suffix (the manifests and bun.lock) and adding notes publishes", () => {
     const r = repo();
     drop(r);
     r.write("CHANGELOG.md", "0.8.0\n");
@@ -115,6 +134,16 @@ describe("release plan, run on a repository: a stable's diff since its prereleas
     r.git("commit", "-qm", "0.8.0");
     const p = r.plan();
     expect({ code: p.code, publish: p.out.includes("should_publish=true") }).toEqual({ code: 0, publish: true });
+  });
+
+  test("a bump that misses a manifest refuses, naming it", () => {
+    const r = repo();
+    drop(r);
+    r.write("packages/hub/package.json", JSON.stringify({ version: "0.8.0-pre.3" }, null, 2) + "\n");
+    r.git("add", "-A");
+    r.git("commit", "-qm", "0.8.0, hub missed");
+    const p = r.plan();
+    expect({ code: p.code, names: p.out.includes("packages/hub/package.json (0.8.0-pre.3)") }).toEqual({ code: 1, names: true });
   });
 
   test("a code change, or a dependency added beside the version, refuses", () => {

@@ -42,7 +42,7 @@ function spyLikeBinds(d: Database) {
   return { seen, restore: () => ((d as unknown as { prepare: unknown }).prepare = orig) };
 }
 
-const LONG = "Meeting notes with the whole friends group about the move to cloud";
+const LONG = "An example note title written to run well past the fifty-byte cap";
 
 describe("wikilinks under the Durable Object LIKE cap (T-36)", () => {
   it("resolving and healing a long link binds no LIKE pattern over 50 bytes", async () => {

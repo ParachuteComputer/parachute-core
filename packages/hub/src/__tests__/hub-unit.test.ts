@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { join } from "node:path";
+import { coreUnitEntry } from "../core-host.ts";
 import {
   type HubUnitDeps,
   NO_MANAGER_MESSAGE,
@@ -253,6 +255,31 @@ describe("ensureHubUnit — §3.2 algorithm", () => {
 });
 
 describe("installAndStartHubUnit — init bringup (§3.3 / §4.2)", () => {
+  test("inside @openparachute/core: the unit runs core's entry, with core's bin first on PATH", async () => {
+    const coreRoot = join(import.meta.dir, "..", "..", "..", "..");
+    const entry = coreUnitEntry({ PARACHUTE_CORE_ROOT: coreRoot });
+    expect(entry).not.toBeNull();
+    expect(coreUnitEntry({})).toBeNull();
+    const f = fakeDeps({ platform: "linux", getuid: () => 1000, listeningSeq: [true] });
+    await installAndStartHubUnit({
+      parachuteHome: "/home/op/.parachute",
+      cliPath: entry!.cliPath,
+      pathPrefix: entry!.binDir,
+      port: 1939,
+      deps: f.deps,
+      readyPollMs: 0,
+    });
+    const written = f.files.get(systemdUnitPathForName(HUB_UNIT, "/home/op", false)) ?? "";
+    // core's serve, not the hub's src/cli.ts: takeover's runsOld() exempts an ExecStart naming parachute-core.
+    expect(written).toContain(
+      `${join(coreRoot, "packages", "cli", "src", "parachute-core.ts")} serve`,
+    );
+    expect(written).not.toContain("hub/src/cli.ts");
+    expect(written).toContain(
+      `PATH=${join(coreRoot, "packages", "cli", "bin")}:/home/op/.bun/bin:`,
+    );
+  });
+
   test("installs the hub unit (start:true) + waits readiness → started", async () => {
     const f = fakeDeps({
       platform: "linux",
