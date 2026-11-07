@@ -100,6 +100,34 @@ describe("mcp/records", () => {
     await c.close();
   });
 
+  test("names the caller chose come back as they were: field names, enum values, type names and paths in warnings and errors", async () => {
+    const c = await session("admin");
+    const type = `${runId("meeting")}-notes`;
+    await c.call("manage-types", { tag: type, fields: { notes: { type: "string", enum: ["Notes A"] } } });
+    const path = `records/${runId("m")} notes`;
+    const made = await c.call("create-record", { path, types: [type], fields: { notes: "Notes B" }, body: "x" });
+    const viaNote = await c.call("create-note", { path: `${path} 2`, tags: [type], metadata: { notes: "Notes B" }, content: "x" });
+    expect(made.validation_status).toEqual(viaNote.validation_status); // the schema check's report is the person's words
+    expect(JSON.stringify(made.validation_status)).toContain("notes");
+    expect(JSON.stringify(made.validation_status)).not.toContain("records");
+
+    const missing = `records/${runId("gone")} notes`;
+    await expect(c.call("update-record", { id: missing, append: "y" })).rejects.toThrow(missing);
+
+    // The conflict error a writer meets most teaches the record tool, and names the record.
+    const read = one(await c.call("query-records", { id: path }));
+    await c.call("update-record", { id: path, fields: { other: 1 }, if_updated_at: read.updatedAt });
+    const err: any = await c.client.callTool({ name: "update-record", arguments: { id: path, fields: { other: 2 }, if_updated_at: read.updatedAt } }).catch((e) => e);
+    expect(err?.data?.error_type).toBe("conflict");
+    expect(err.data.hint).toContain("query-records");
+    expect(err.data.hint).not.toContain("query-notes");
+    expect(err.data.record_id).toBe(read.id);
+    const old: any = await c.client.callTool({ name: "update-note", arguments: { id: path, metadata: { other: 3 }, if_updated_at: read.updatedAt } }).catch((e) => e);
+    expect(old.data.hint).toContain("query-notes"); // the old tool's error, as 0.8 gave it
+    expect(old.data.note_id).toBe(read.id);
+    await c.close();
+  });
+
   test("a writer's list: record tools first, each note tool after it marked deprecated with the record name", async () => {
     const c = await session("write");
     const tools = (await c.client.listTools()).tools;
@@ -107,7 +135,10 @@ describe("mcp/records", () => {
     for (const [old, fresh] of [["query-notes", "query-records"], ["create-note", "create-record"], ["update-note", "update-record"], ["delete-note", "delete-record"], ["list-tags", "list-types"]]) {
       expect(names.indexOf(fresh)).toBeGreaterThanOrEqual(0);
       expect(names.indexOf(old)).toBeGreaterThan(names.indexOf(fresh));
-      expect(tools.find((t) => t.name === old)!.description).toStartWith(`Deprecated (gone in 1.0): use ${fresh}.`);
+      const alias = tools.find((t) => t.name === old)!;
+      expect(alias.description).toBe(`Deprecated (gone in 1.0): use ${fresh}. Same parameters as before.`);
+      // A 0.8 client still sees the parameters it knows (names and types; the descriptions moved to the record tool).
+      if (old !== "list-tags") expect(Object.keys(alias.inputSchema.properties ?? {})).toContain(old === "delete-note" ? "id" : old === "query-notes" ? "include_content" : "content");
     }
     const create = tools.find((t) => t.name === "create-record")!;
     expect(Object.keys(create.inputSchema.properties ?? {})).toEqual(expect.arrayContaining(["body", "fields", "types", "tags", "records"]));

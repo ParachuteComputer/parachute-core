@@ -1,6 +1,6 @@
 // The record translator (T-407): pure rules, so pinned here; the black-box behaviour is contracts/suites/mcp/records.test.ts.
 import { describe, expect, test } from "bun:test";
-import { BODY, FIELDS, addRecordTools, paramsIn, recordSchema, recordWords, resultOut } from "./mcp-records.ts";
+import { BODY, FIELDS, addRecordTools, errorOut, noteAliasSchema, paramsIn, recordSchema, recordWords, resultOut } from "./mcp-records.ts";
 
 describe("record calls in", () => {
   test("record words become note words; a person's own field names are never touched", () => {
@@ -53,6 +53,32 @@ describe("record answers out", () => {
     });
   });
 
+  test("the schema check's report is a person's own words: field, enum values and type names pass through", () => {
+    const note = {
+      id: "1", metadata: { notes: "x" }, tags: ["meeting-notes"], types: ["meeting-notes"],
+      validation_status: { schemas: ["meeting-notes"], warnings: [{ field: "notes", reason: "enum", message: "'notes' must be one of [Notes A] (tag 'meeting-notes')" }] },
+    };
+    const r = resultOut("create-record", note) as any;
+    expect(r.validation_status).toEqual(note.validation_status);
+    expect(r[FIELDS]).toEqual({ notes: "x" });
+  });
+
+  test("a value the caller passed, quoted in a message, comes back as it was; the server's words around it move", () => {
+    expect(recordWords('Note not found: "Project notes"')).toBe('Record not found: "Project notes"');
+    expect(recordWords("tag 'no-notes' has no notes")).toBe("tag 'no-notes' has no records");
+    const r = resultOut("query-records", { notes: [], warnings: [{ code: "tag_not_found", message: 'tag "no-notes" matches no notes', tag: "no-notes", field: "notes" }] }) as any;
+    expect(r.warnings[0]).toEqual({ code: "tag_not_found", message: 'tag "no-notes" matches no records', tag: "no-notes", field: "notes" });
+  });
+
+  test("an error names a parameter in record words only when it is about the call's parameters", () => {
+    const param = errorOut(Object.assign(new Error("bad"), { error_type: "unknown_parameter", field: "content_edit" }), "update-record") as any;
+    expect(param.field).toBe(`${BODY}_edit`);
+    const theirs = errorOut(Object.assign(new Error("bad"), { error_type: "strict_violation", field: "notes" }), "update-record") as any;
+    expect(theirs.field).toBe("notes");
+    const other = errorOut(Object.assign(new Error("bad"), { error_type: "unknown_parameter", field: "name" }), "update-record") as any;
+    expect(other.field).toBe("name"); // list-types' name → tag map is list-types' own
+  });
+
   test("list-types answers as list-tags did (tag rows already speak type words)", () => {
     const rows = [{ name: "trip", kind: "type", count: 1, fields: { content: { type: "string" } } }];
     expect(resultOut("list-types", rows)).toBe(rows);
@@ -79,6 +105,13 @@ describe("record words", () => {
   });
 });
 
+describe("the relisted note tools", () => {
+  test("keep their parameter names and types, without descriptions or nested shapes", () => {
+    const schema = { type: "object", description: "x", required: ["id"], properties: { id: { type: "string" }, content: { type: "string", description: "text" }, tag: { oneOf: [{ type: "string" }, { type: "array", items: { type: "string" } }], description: "t" }, near: { type: "object", properties: { note_id: { type: "string", description: "id" } }, required: ["note_id"] } } };
+    expect(noteAliasSchema(schema)).toEqual({ type: "object", required: ["id"], properties: { id: { type: "string" }, content: { type: "string" }, tag: { oneOf: [{ type: "string" }, { type: "array" }] }, near: { type: "object" } } });
+  });
+});
+
 describe("addRecordTools", () => {
   const tool = (name: string, execute: (p: Record<string, unknown>) => unknown) => ({ name, description: name, inputSchema: { type: "object", properties: {} }, requiredVerb: "read" as const, execute });
 
@@ -89,13 +122,13 @@ describe("addRecordTools", () => {
     expect(tools.map((t) => t.name)).toEqual(["query-records", "vault-info", "query-notes"]);
     expect(await tools[0]!.execute({ [`include_${BODY}`]: true })).toEqual([{ id: "1", [BODY]: "x", [FIELDS]: {} }]);
     expect(seen[0]).toEqual({ include_content: true });
-    expect(tools[2]!.description).toStartWith("Deprecated (gone in 1.0): use query-records.");
+    expect(tools[2]!.description).toBe("Deprecated (gone in 1.0): use query-records. Same parameters as before.");
     expect(await tools[2]!.execute({ include_content: true })).toEqual([{ id: "1", content: "x", metadata: {} }]);
     expect(used).toEqual(["new:query-records", "old:query-notes"]);
   });
 
   test("a note tool's error reaches the record door in record words", async () => {
-    const [rec] = addRecordTools([tool("update-note", () => { throw Object.assign(new Error("Note not found: content_edit"), { field: "note_id", hint: "pass the note's id" }); })]);
+    const [rec] = addRecordTools([tool("update-note", () => { throw Object.assign(new Error("Note not found: content_edit"), { error_type: "invalid_query", field: "note_id", hint: "pass the note's id" }); })]);
     const err = await Promise.resolve(rec!.execute({ id: "x" })).catch((e) => e);
     expect(err.message).toBe(`Record not found: ${BODY}_edit`);
     expect(err.field).toBe("id");

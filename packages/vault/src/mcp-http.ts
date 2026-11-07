@@ -15,6 +15,7 @@
  * read-only keys see a filtered tool list.
  */
 
+import { NOTE_TOOL_NAMES, recordWords } from "../core/src/mcp-records.ts";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import {
@@ -85,6 +86,19 @@ export function mcpDomainError(
   const errorType = typeof data.error_type === "string" ? data.error_type : undefined;
   const humanMessage = errorType ? `[${errorType}] ${cleanMessage}` : cleanMessage;
   return new McpError(code, humanMessage, data);
+}
+
+/** A record tool's JSON-RPC error in record words: message and hints, and `record_id` for `note_id` (T-407). */
+function recordDoorError(err: McpError): McpError {
+  const data = (err.data && typeof err.data === "object" ? { ...(err.data as Record<string, unknown>) } : err.data) as Record<string, unknown> | undefined;
+  if (data) {
+    for (const k of ["hint", "how_to"]) if (typeof data[k] === "string") data[k] = recordWords(data[k] as string);
+    if ("note_id" in data) {
+      data.record_id = data.note_id;
+      delete data.note_id;
+    }
+  }
+  return new McpError(err.code, recordWords(err.message.replace(MCP_ERROR_PREFIX_RE, "")), data);
 }
 
 /**
@@ -162,7 +176,18 @@ export async function handleMcp(
     })),
   }));
 
+  // T-407: a record tool's domain errors are built below from its note tool's error, so they'd teach the note tool
+  // (`re-read the note (query-notes)`, `note_id`); the record door says them in its own words.
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    try {
+      return await callTool(request);
+    } catch (err) {
+      if (err instanceof McpError && NOTE_TOOL_NAMES[request.params.name]) throw recordDoorError(err);
+      throw err;
+    }
+  });
+
+  async function callTool(request: { params: { name: string; arguments?: Record<string, unknown> } }) {
     const { name, arguments: args } = request.params;
 
     // Dispatch against the FILTERED tool list — tools the caller can't see
@@ -452,7 +477,7 @@ export async function handleMcp(
         isError: true,
       };
     }
-  });
+  }
 
   await server.connect(transport);
   return transport.handleRequest(req);

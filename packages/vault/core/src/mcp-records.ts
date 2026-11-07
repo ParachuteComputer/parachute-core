@@ -58,7 +58,10 @@ const PARAMS: Record<string, Record<string, string>> = {
 /** Inside these objects an anchor is `{id}` on the record door, `{note_id}` on the note door. */
 const ANCHORS = ["near", "versions"];
 
-/** Output keys: note door → record door. A record's own fields are never walked, so a user's `content` key stays. */
+/**
+ * Output keys: note door → record door. A record's own fields are never walked, so a user's `content` key stays.
+ * An anchor you pass is `{id}`; a key in an answer that points at another record is `record_id`.
+ */
 const KEYS_OUT: Record<string, string> = pairs({
   content: BODY,
   metadata: FIELDS,
@@ -70,7 +73,7 @@ const KEYS_OUT: Record<string, string> = pairs({
   content_offset: `${BODY}_offset`,
   content_length: `${BODY}_length`,
 });
-/** Keys whose string values are the server's own words. */
+/** Keys whose string values are the server's own words (quoted parts left alone: recordWords). */
 const MESSAGE_KEYS = new Set(["error", "message", "hint", "how_to", "warning", "remedy", "reason", "use"]);
 
 export interface RecordToolDef {
@@ -95,6 +98,10 @@ const TOOL_RE = new RegExp(`\\b(${Object.keys(RECORD_TOOL_NAMES).join("|")})\\b`
  * applied to vault data: names, paths, a record's fields or body.
  */
 export function recordWords(s: string): string {
+  // Quoted text is what the caller passed in (a path, a tag, a field name, a value): echoed back as it was.
+  return s.split(/("[^"\n]*"|'[^'\n]*')/).map((part, i) => (i % 2 === 1 ? part : prose(part))).join("");
+}
+function prose(s: string): string {
   return s
     .replace(TOOL_RE, (m) => RECORD_TOOL_NAMES[m]!)
     .replace(/\bnote_id\b/g, "id")
@@ -202,45 +209,55 @@ function labels(tags: unknown, types: unknown): unknown {
   return tags.filter((x) => !t.has(x));
 }
 
-function walkOut(v: unknown): unknown {
-  if (Array.isArray(v)) return v.map(walkOut);
+/**
+ * A person's own names and values, passed through untouched: a record's fields, a link's relationships, and the
+ * schema check's report (its `field`, enum values and type names are theirs, not the server's parameters).
+ */
+const OPAQUE = new Set(["metadata", "fields", "relationships", "validation_status"]);
+
+function walkOut(tool: string, v: unknown): unknown {
+  if (Array.isArray(v)) return v.map((x) => walkOut(tool, x));
   if (!v || typeof v !== "object") return v;
   const o = v as Record<string, unknown>;
   const out: Record<string, unknown> = {};
+  // Only a warning about the call's own parameters names a parameter in `field`.
+  const aboutParams = o.code === "unknown_parameter" || o.error_type === "unknown_parameter";
   for (const [k, val] of Object.entries(o)) {
     const nk = KEYS_OUT[k] ?? k;
-    if (k === "metadata" || k === "fields" || k === "relationships") out[nk] = val; // a person's own names
+    if (OPAQUE.has(k)) out[nk] = val;
     else if (k === "tags" && Array.isArray(o.types)) out[nk] = labels(val, o.types);
-    else if (k === "field" && typeof val === "string") out[nk] = fieldOut(val);
-    else if (k === "warnings" && Array.isArray(val)) out[nk] = val.map(walkOut);
+    else if (k === "field" && typeof val === "string") out[nk] = aboutParams ? fieldOut(tool, val) : val;
     else if (MESSAGE_KEYS.has(k) && typeof val === "string") out[nk] = recordWords(val);
-    else out[nk] = walkOut(val);
+    else out[nk] = walkOut(tool, val);
   }
   return out;
 }
 
-/** A parameter name the server reports (`warnings[].field`, an error's `field`), as the record door calls it. */
-function fieldOut(f: string): string {
-  const all: Record<string, string> = { note_id: "id" };
-  for (const m of Object.values(PARAMS)) for (const [a, b] of Object.entries(m)) all[b] ??= a;
+/** A parameter name the server reports on this tool (`warnings[].field`, an error's `field`), in record words. */
+function fieldOut(tool: string, f: string): string {
+  const back: Record<string, string> = { note_id: "id" };
+  for (const [a, b] of Object.entries(PARAMS[tool] ?? {})) back[b] = a;
   const [head, ...rest] = f.split(".");
-  return [all[head!] ?? head, ...rest.map((p) => (p === "note_id" ? "id" : p))].join(".");
+  const anchor = ANCHORS.includes(head!);
+  return [back[head!] ?? head, ...rest.map((p) => (anchor && p === "note_id" ? "id" : p))].join(".");
 }
 
 /** A note-door answer → the record door's. Only the server's keys and words move; vault data stays as it is. */
 export function resultOut(tool: string, r: unknown): unknown {
   if (tool === "list-types") return r; // tag rows: name, kind, counts, fields — already the right words
-  return walkOut(r);
+  return walkOut(tool, r);
 }
 
 /** A note-door error, rewritten in place for the record door (frozen errors keep their own words). */
-export function errorOut(err: unknown): unknown {
+export function errorOut(err: unknown, tool = ""): unknown {
   const e = err as Record<string, unknown> | null;
   if (!e || typeof e !== "object") return err;
   try {
     if (err instanceof Error) err.message = recordWords(err.message);
     for (const k of ["hint", "how_to"]) if (typeof e[k] === "string") e[k] = recordWords(e[k] as string);
-    if (typeof e.field === "string") e.field = fieldOut(e.field);
+    // Only an error about the call's parameters names a parameter; a schema or transition error names a person's field.
+    const aboutParams = ["unknown_parameter", "invalid_query", "missing_required_field"].includes(String(e.error_type));
+    if (typeof e.field === "string" && aboutParams) e.field = fieldOut(tool, e.field);
   } catch {}
   return err;
 }
@@ -269,9 +286,22 @@ Rarer filters (has_links, order_by, expand_links, created_by, search_mode, …) 
   "list-types": "Every type and tag with its `kind` and counts (`count` exact, `expanded_count` with subtypes). `name` gives one in full (fields, parents); `include_schema: true` gives all of them.",
 };
 
-/** A deprecated note-named tool's description: one line, and a schema that takes anything (the old one still works). */
+/** A deprecated note-named tool's description: one line, as #21's other aliases have. */
 export function noteAliasDescription(noteTool: string): string {
-  return `Deprecated (gone in 1.0): use ${RECORD_TOOL_NAMES[noteTool]}. Same parameters as before (content, metadata, notes, note_id).`;
+  return `Deprecated (gone in 1.0): use ${RECORD_TOOL_NAMES[noteTool]}. Same parameters as before.`;
+}
+
+/**
+ * A deprecated note tool's schema: its old top-level parameter names and their types, without descriptions or
+ * nested shapes, so a 0.8 client still sees what it can pass while each alias stays inside the 400-token budget
+ * (contracts/suites/mcp/budget.test.ts). The full shapes are in the record tool and in vault-info {help}.
+ */
+export function noteAliasSchema(schema: unknown): Record<string, unknown> {
+  const s = (schema ?? {}) as { properties?: Record<string, any>; required?: string[] };
+  const props = Object.fromEntries(
+    Object.entries(s.properties ?? {}).map(([k, d]) => [k, d?.type ? { type: d.type } : d?.oneOf ? { oneOf: d.oneOf.map((o: any) => ({ type: o?.type })) } : {}]),
+  );
+  return { type: "object", properties: props, ...(s.required ? { required: s.required } : {}) };
 }
 
 /**
@@ -302,7 +332,7 @@ export function addRecordTools<T extends RecordToolDef>(tools: T[], onUse?: OnUs
         try {
           result = await execute(translated);
         } catch (err) {
-          throw errorOut(err);
+          throw errorOut(err, name);
         }
         return resultOut(name, result);
       },
@@ -310,7 +340,7 @@ export function addRecordTools<T extends RecordToolDef>(tools: T[], onUse?: OnUs
     aliases.push({
       ...t,
       description: noteAliasDescription(t.name),
-      inputSchema: { type: "object", additionalProperties: true },
+      inputSchema: noteAliasSchema(t.inputSchema),
       execute: async (params: Record<string, unknown>) => {
         onUse?.(t.name, "old");
         return execute(params);

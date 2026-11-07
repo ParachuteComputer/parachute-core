@@ -266,6 +266,10 @@ const NESTED: [string, string, string, string][] = [
   ["update-record", `${BODY}_edit`, "new", "new_text"],
   ["update-record", `${BODY}_edit`, "find", "old_text"],
   ["update-record", `${BODY}_edit`, "replace", "new_text"],
+  ["update-record", "content_edit", "old", "old_text"],
+  ["update-record", "content_edit", "new", "new_text"],
+  ["update-record", "content_edit", "find", "old_text"],
+  ["update-record", "content_edit", "replace", "new_text"],
 ];
 
 function distance(a: string, b: string): number {

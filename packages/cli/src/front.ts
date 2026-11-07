@@ -311,11 +311,17 @@ export function changes(args: string[], home: string, out = console.log, err = c
       if (words.length) out(`    ${c.reason}${c.removed_in ? `; the old name goes in ${c.removed_in}` : ""}`);
     }
   }
-  const usedNames = Object.entries(used);
+  // REST routes are counted too (T-407), apart: /api/notes is kept through 0.9, and its future is the spec's call.
+  const usedNames = Object.entries(used).filter(([name]) => !name.startsWith("rest "));
+  const restNames = Object.entries(used).filter(([name]) => name.startsWith("rest "));
   if (!words.length && usedNames.length) {
     out("");
     out("Old names used on this home (run/deprecations.json):");
     for (const [name, u] of usedNames.sort((a, b) => b[1].count - a[1].count)) out(`  ${name}: ${u.count}, last ${u.last_seen}`);
+  }
+  if (!words.length && restNames.length) {
+    out("Note-named REST routes used on this home (kept in 0.9):");
+    for (const [name, u] of restNames.sort((a, b) => b[1].count - a[1].count)) out(`  ${name.slice(5)}: ${u.count}, last ${u.last_seen}`);
   }
   // The vault counts its record names too (T-407), so the move to them can be watched next to the old names.
   const adopted = Object.entries((existsSync(home) ? (readUsage(home) as { adopted?: UsageLog["names"] }).adopted : undefined) ?? {});

@@ -12,11 +12,13 @@
  *
  * Writes are batched: the first use starts a timer, and the counts are merged
  * into the file at most every FLUSH_MS (and on exit), so a busy vault doesn't
- * write per call. A crash loses at most that window. Never written on a home a
+ * write per call. A crash loses at most that window. The CLI writes the same file the same way (read, change,
+ * rename, no lock), so in the rare instant both write, one write's counts can be lost: they are advice, not a ledger. Never written on a home a
  * host application manages (Prism's embedded serve, or its `embedded.json`):
  * those homes are its contract, and stay as it left them.
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 
 const USAGE_LOG = join("run", "deprecations.json");
@@ -30,9 +32,12 @@ const pending: Record<Section, Map<string, { n: number; first: string; last: str
 let timer: ReturnType<typeof setTimeout> | null = null;
 let exitHooked = false;
 
+/** The home the vault serves, as config.ts resolves it: PARACHUTE_HOME, else ~/.parachute (never under bun test). */
 function home(): string | null {
   const h = process.env.PARACHUTE_HOME;
-  return h && h.length > 0 ? h : null;
+  if (h && h.length > 0) return h;
+  if (process.env.NODE_ENV === "test") return null; // the live home is never a test's (config.ts says why)
+  return join(homedir(), ".parachute");
 }
 
 /** A home Prism holds: its embedded marker, or this process run as (or under) its embedded serve. */
