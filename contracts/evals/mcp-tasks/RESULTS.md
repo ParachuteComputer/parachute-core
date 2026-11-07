@@ -1,6 +1,31 @@
 # Results: short MCP descriptions pass the ship gate
 
-## Re-run on the integrated 0.9.0-pre.1 shape (2026-10-29, T-318 integration)
+## Re-run with the record tools (2026-11-07, T-407)
+
+OLD (main's 0.8 list at `ccc7729`) against NEW: this branch at 6543279, where `query-records`, `create-record`,
+`update-record`, `delete-record` and `list-types` lead and the note-named tools follow as deprecated aliases (then with
+an empty schema; from 12572c8 they list their parameter names and types). Sonnet and Haiku, 2 repeats, 30 tasks; no
+Opus and no Codex (Codex is out until 11-28). t27's scorer now counts `query-records` pages too. Rows:
+[`results/2026-11-07-records/runs.jsonl`](results/2026-11-07-records/runs.jsonl).
+
+| model | OLD success | NEW success | input tokens / task, OLD → NEW |
+|---|---:|---:|---:|
+| Sonnet | 60/60 | 59/60 | 75.2k → 23.5k |
+| Haiku | 60/60 | **60/60** | 78.7k → 27.3k |
+
+- Haiku holds the gate. Sonnet misses it by one run, on t23 (attach a receipt): the run read the note and
+  `vault-info`, then stopped without uploading.
+- t23 was re-run to tell words from chance, Sonnet NEW only. With the record tools (12572c8): 5/6, then 5/8
+  ([`results/2026-11-07-records-t23`](results/2026-11-07-records-t23/runs.jsonl), with OLD 6/6 beside them, and
+  [`-t23b`](results/2026-11-07-records-t23b/runs.jsonl)). On #21 just before the record tools (fd0ea50): 8/8, then 2/4
+  ([`results/2026-11-07-pr21-t23`](results/2026-11-07-pr21-t23/runs.jsonl)). Together 11/16 against 10/12 (Fisher p about 0.7).
+  Every failing transcript on both builds says the same thing: `attachment-url` asks for the exact `size_bytes`, the
+  model has no way to read a local file's size (the eval's `http_request` refuses `file://`), and it won't guess.
+  The runs that pass guess a size and correct it from the error, or send a larger one. So this is #21's
+  attachment-url text meeting this eval's file tool, on either build, not the record words. A sentence on what to do
+  without a size might fix it [inferred]; left for an eval-gated text change.
+
+
 
 The same 720 runs on the final shape: #15, #16 (eleven tools, old names listed as aliases), #18 (types and tags) and
 #17 (keys) merged, plus one line in `cursor`'s description ("an empty page means caught up, so stop"), at commit
