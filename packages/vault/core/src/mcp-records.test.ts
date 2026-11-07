@@ -66,6 +66,8 @@ describe("record answers out", () => {
   test("a value the caller passed, quoted in a message, comes back as it was; the server's words around it move", () => {
     expect(recordWords('Note not found: "Project notes"')).toBe('Record not found: "Project notes"');
     expect(recordWords("tag 'no-notes' has no notes")).toBe("tag 'no-notes' has no records");
+    // An apostrophe is not a quote: the server's prose around it still moves.
+    expect(recordWords("a note's body outranks another note's")).toBe("a record's body outranks another record's");
     const r = resultOut("query-records", { notes: [], warnings: [{ code: "tag_not_found", message: 'tag "no-notes" matches no notes', tag: "no-notes", field: "notes" }] }) as any;
     expect(r.warnings[0]).toEqual({ code: "tag_not_found", message: 'tag "no-notes" matches no records', tag: "no-notes", field: "notes" });
   });
@@ -75,6 +77,8 @@ describe("record answers out", () => {
     expect(param.field).toBe(`${BODY}_edit`);
     const theirs = errorOut(Object.assign(new Error("bad"), { error_type: "strict_violation", field: "notes" }), "update-record") as any;
     expect(theirs.field).toBe("notes");
+    const edit = errorOut(Object.assign(new Error("content_edit.old_text not found"), { error_type: "content_edit_not_found", field: "content_edit.old_text" }), "update-record") as any;
+    expect(edit.field).toBe(`${BODY}_edit.old_text`);
     const other = errorOut(Object.assign(new Error("bad"), { error_type: "unknown_parameter", field: "name" }), "update-record") as any;
     expect(other.field).toBe("name"); // list-types' name → tag map is list-types' own
   });
@@ -108,7 +112,7 @@ describe("record words", () => {
 describe("the relisted note tools", () => {
   test("keep their parameter names and types, without descriptions or nested shapes", () => {
     const schema = { type: "object", description: "x", required: ["id"], properties: { id: { type: "string" }, content: { type: "string", description: "text" }, tag: { oneOf: [{ type: "string" }, { type: "array", items: { type: "string" } }], description: "t" }, near: { type: "object", properties: { note_id: { type: "string", description: "id" } }, required: ["note_id"] } } };
-    expect(noteAliasSchema(schema)).toEqual({ type: "object", required: ["id"], properties: { id: { type: "string" }, content: { type: "string" }, tag: { oneOf: [{ type: "string" }, { type: "array" }] }, near: { type: "object" } } });
+    expect(noteAliasSchema(schema)).toEqual({ type: "object", required: ["id"], properties: { id: { type: "string" }, content: { type: "string" }, tag: { oneOf: [{ type: "string" }, { type: "array", items: { type: "string" } }] }, near: { type: "object" } } });
   });
 });
 

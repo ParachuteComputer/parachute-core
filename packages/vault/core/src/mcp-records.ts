@@ -99,7 +99,8 @@ const TOOL_RE = new RegExp(`\\b(${Object.keys(RECORD_TOOL_NAMES).join("|")})\\b`
  */
 export function recordWords(s: string): string {
   // Quoted text is what the caller passed in (a path, a tag, a field name, a value): echoed back as it was.
-  return s.split(/("[^"\n]*"|'[^'\n]*')/).map((part, i) => (i % 2 === 1 ? part : prose(part))).join("");
+  // A single quote counts only at a word's edge, so an apostrophe (a record's body, it's) never opens one.
+  return s.split(/("[^"\n]*"|(?<!\w)'[^'\n]*'(?!\w))/).map((part, i) => (i % 2 === 1 ? part : prose(part))).join("");
 }
 function prose(s: string): string {
   return s
@@ -256,7 +257,7 @@ export function errorOut(err: unknown, tool = ""): unknown {
     if (err instanceof Error) err.message = recordWords(err.message);
     for (const k of ["hint", "how_to"]) if (typeof e[k] === "string") e[k] = recordWords(e[k] as string);
     // Only an error about the call's parameters names a parameter; a schema or transition error names a person's field.
-    const aboutParams = ["unknown_parameter", "invalid_query", "missing_required_field"].includes(String(e.error_type));
+    const aboutParams = ["unknown_parameter", "invalid_query", "missing_required_field", "content_edit_not_found", "content_edit_ambiguous", "invalid_content_edit"].includes(String(e.error_type));
     if (typeof e.field === "string" && aboutParams) e.field = fieldOut(tool, e.field);
   } catch {}
   return err;
@@ -298,8 +299,11 @@ export function noteAliasDescription(noteTool: string): string {
  */
 export function noteAliasSchema(schema: unknown): Record<string, unknown> {
   const s = (schema ?? {}) as { properties?: Record<string, any>; required?: string[] };
+  // An array keeps `items` (its item type): function-calling APIs refuse an array schema without one.
+  const bare = (d: any): Record<string, unknown> =>
+    d?.type === "array" ? { type: "array", items: d.items?.type ? { type: d.items.type } : {} } : d?.type ? { type: d.type } : {};
   const props = Object.fromEntries(
-    Object.entries(s.properties ?? {}).map(([k, d]) => [k, d?.type ? { type: d.type } : d?.oneOf ? { oneOf: d.oneOf.map((o: any) => ({ type: o?.type })) } : {}]),
+    Object.entries(s.properties ?? {}).map(([k, d]) => [k, d?.oneOf ? { oneOf: d.oneOf.map(bare) } : bare(d)]),
   );
   return { type: "object", properties: props, ...(s.required ? { required: s.required } : {}) };
 }
