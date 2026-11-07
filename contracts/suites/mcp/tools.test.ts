@@ -1,14 +1,16 @@
 // 0.9's MCP shape (T-318 design §4): eleven tools for an admin, nine for a writer, six for a reader. manage-types folds
-// the five tag tools, attachment-url the two ticket tools, manage-keys renames manage-token, and query-notes
-// {path_between} replaces find-path. The nine old names stay listed and working through 0.9 (Prism allow-lists some by
-// name: compat/prism), each with a deprecation line and a `deprecation` field in its result.
+// the five tag tools, attachment-url the two ticket tools, manage-keys renames manage-token, and query-records
+// {path_between} replaces find-path. The record tools (T-407: query-records, create-record, update-record,
+// delete-record, list-types) lead; the note-named tools they replace and the nine other old names stay listed and
+// working through 0.9 (Prism allow-lists some by name: compat/prism), each with a deprecation line, and the nine with
+// a `deprecation` field in their results (the note-named five answer exactly as they did: mcp/records).
 import { describe, expect, test } from "bun:test";
 import { mcp, pass, runId, safeFetch, services } from "../lib.ts";
 
-const ELEVEN = ["query-notes", "create-note", "update-note", "delete-note", "list-tags", "vault-info", "doctor", "read-attachment", "attachment-url", "manage-types", "manage-keys"];
-const WRITER = ["query-notes", "create-note", "update-note", "delete-note", "list-tags", "vault-info", "doctor", "read-attachment", "attachment-url"];
-const READER = ["query-notes", "list-tags", "vault-info", "doctor", "read-attachment", "attachment-url"];
-const ALIASES = ["find-path", "update-tag", "rename-tag", "merge-tags", "delete-tag", "prune-schema", "request-attachment-upload", "request-attachment-download", "manage-token"];
+const ELEVEN = ["query-records", "create-record", "update-record", "delete-record", "list-types", "vault-info", "doctor", "read-attachment", "attachment-url", "manage-types", "manage-keys"];
+const WRITER = ["query-records", "create-record", "update-record", "delete-record", "list-types", "vault-info", "doctor", "read-attachment", "attachment-url"];
+const READER = ["query-records", "list-types", "vault-info", "doctor", "read-attachment", "attachment-url"];
+const ALIASES = ["query-notes", "create-note", "update-note", "delete-note", "list-tags", "find-path", "update-tag", "rename-tag", "merge-tags", "delete-tag", "prune-schema", "request-attachment-upload", "request-attachment-download", "manage-token"];
 
 async function session(level: "read" | "write" | "admin") {
   const s = services();
@@ -61,12 +63,16 @@ describe("mcp/tools", () => {
   test("attachment-url uploads and downloads; a reader may download but not upload", async () => {
     const w = await session("write");
     const path = runId("att");
-    await w.call("create-note", { path, content: "x" });
+    await w.call("create-record", { path, body: "x" });
     const bytes = new TextEncoder().encode("made-up attachment bytes");
-    const up = await w.call("attachment-url", { action: "upload", note: path, filename: "a.txt", size_bytes: bytes.length });
+    const up = await w.call("attachment-url", { action: "upload", record: path, filename: "a.txt", size_bytes: bytes.length });
     expect((await safeFetch(up.url, { method: "PUT", headers: { "content-type": "text/plain" }, body: bytes })).ok).toBe(true);
-    const note = await w.call("query-notes", { id: path, include_attachments: true });
+    const note = await w.call("query-records", { id: path, include_attachments: true });
     const att = (Array.isArray(note) ? note[0] : note).attachments[0];
+    // The old parameter name still uploads, through 0.9.
+    const old = await w.call("attachment-url", { action: "upload", note: path, filename: "c.txt", size_bytes: 3 });
+    expect(typeof old.url).toBe("string");
+    await expect(w.call("attachment-url", { action: "upload", record: path, note: path, filename: "d.txt", size_bytes: 3 })).rejects.toThrow(/`record` or `note`, not both/);
     const r = await session("read");
     const down = await r.call("attachment-url", { action: "download", attachment_id: att.id });
     expect(await (await safeFetch(down.url)).text()).toBe("made-up attachment bytes");
@@ -75,12 +81,13 @@ describe("mcp/tools", () => {
     await r.close();
   });
 
-  test("query-notes {path_between} finds the link path find-path found", async () => {
+  test("query-records {path_between} finds the link path find-path found", async () => {
     const c = await session("write");
     const a = runId("pa");
     const b = runId("pb");
-    await c.call("create-note", { notes: [{ path: b, content: "end" }, { path: a, content: `to [[${b}]]` }] });
-    const fresh = await c.call("query-notes", { path_between: { source: a, target: b } });
+    await c.call("create-record", { records: [{ path: b, body: "end" }, { path: a, body: `to [[${b}]]` }] });
+    const fresh = await c.call("query-records", { path_between: { source: a, target: b } });
+    expect((await c.call("query-notes", { path_between: { source: a, target: b } })).path).toEqual(fresh.path);
     const old = await c.call("find-path", { source: a, target: b });
     expect(fresh.path).toHaveLength(2);
     expect(old.path).toEqual(fresh.path);

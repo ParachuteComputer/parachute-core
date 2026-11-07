@@ -72,7 +72,7 @@ export function countName(name: string, kind: "old" | "new"): void {
 export function flushNameUsage(): void {
   if (timer) clearTimeout(timer);
   timer = null;
-  const h = home();
+  const h = process.env.PARACHUTE_DEPRECATIONS === "0" ? null : home(); // the CLI's opt-out holds here too
   const empty = pending.names.size === 0 && pending.adopted.size === 0;
   if (empty || !h || !existsSync(h) || hostManaged(h)) {
     pending.names.clear();

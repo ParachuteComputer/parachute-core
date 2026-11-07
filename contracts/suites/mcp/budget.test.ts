@@ -19,14 +19,14 @@ async function session(level: "read" | "write" | "admin") {
 describe("mcp/budget", () => {
   test("a writer session's tool list is under 4,000 tokens", async () => {
     const { c, tools } = await session("write");
-    expect(tools.map((t) => t.name)).toContain("update-note");
+    expect(tools.map((t) => t.name)).toContain("update-record");
     expect(tokens(tools)).toBeLessThanOrEqual(4000);
     await c.close();
   });
 
-  test("query-notes is under 1,500 tokens and every other tool under 400 (admin sees them all)", async () => {
+  test("query-records is under 1,500 tokens and every other tool under 400 (admin sees them all)", async () => {
     const { c, tools } = await session("admin");
-    const over = tools.map((t) => [t.name, tokens(t)] as const).filter(([name, n]) => n > (name === "query-notes" ? 1500 : 400));
+    const over = tools.map((t) => [t.name, tokens(t)] as const).filter(([name, n]) => n > (name === "query-records" ? 1500 : 400));
     expect(over).toEqual([]);
     await c.close();
   });
@@ -43,6 +43,13 @@ describe("mcp/budget", () => {
     const help = await c.call("vault-info", { help: "query-notes" });
     expect(help.tool).toBe("query-notes");
     expect(Object.keys(help.parameters.properties)).toEqual(expect.arrayContaining(["has_broken_links", "expand_links", "order_by", "created_by", "search_mode"]));
+    // T-407: the record tool's reference is the same one, in record words.
+    const rec = await c.call("vault-info", { help: "query-records" });
+    expect(rec.tool).toBe("query-records");
+    const props = Object.keys(rec.parameters.properties);
+    expect(props).toEqual(expect.arrayContaining(["has_broken_links", "expand_links", "fields", "include_body"]));
+    expect(props).not.toContain("metadata");
+    expect(rec.parameters.properties.near.properties).toHaveProperty("id");
     await c.close();
   });
 
