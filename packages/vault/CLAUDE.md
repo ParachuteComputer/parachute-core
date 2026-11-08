@@ -70,6 +70,12 @@ one-command setup; one Bun server (port 1940) hosts many vaults, each its own SQ
   environ the parent process *started* with, not the live `process.env`** — so the
   preload's assignment never reaches a child spawned without an explicit `env`. Always
   spread `process.env` into a spawned CLI's env (`runSubprocess` already does).
+- **`initSchema` skips everything on a vault already at `SCHEMA_VERSION`** (T-412: every Durable Object wake ran
+  every migration, writing one index row per note). So a change to `SCHEMA_SQL` or a migration reaches existing
+  vaults only with a `SCHEMA_VERSION` bump. A bump makes older programs refuse the vault (`NewerSchemaError`); for
+  something additive an older program can still open (an index), skip the bump and add a cheap check to the fast
+  path instead, as `ensurePathNocaseIndex` does. `core/src/row-costs.test.ts` pins `SCHEMA_SQL`'s hash to the
+  version, so the choice can't be skipped by accident.
 - **BYO GitHub App for the mirror backup flow**: `PARACHUTE_GITHUB_CLIENT_ID` +
   `PARACHUTE_GITHUB_APP_SLUG` must be set both-or-neither and name the SAME GitHub App —
   mixing apps breaks the install probe (the client_id mints the tokens, the slug builds

@@ -235,6 +235,28 @@ export function resolveNote(db: Database, idOrPath: string, visible?: (note: Not
 }
 
 /**
+ * The note a reference names exactly, for an act that can't be undone (erasing history, T-412): its id, or its path
+ * compared case-sensitively, where a trailing `.<ext>` may also be read as the extension (as resolveNote reads it).
+ * No case folding and no H1-title fallback, and more than one match is refused with AmbiguousPathError, so it never
+ * picks a note the caller didn't name: `inbox/today` can't reach `Inbox/Today`. Notes `visible` rejects count as
+ * absent.
+ */
+export function resolveNoteExact(db: Database, ref: string, visible?: (note: Note) => boolean): Note | null {
+  const seen = (n: Note | null) => (n && (!visible || visible(n)) ? n : null);
+  const byId = seen(noteOps.getNote(db, ref));
+  if (byId) return byId;
+  const ids = new Set<string>();
+  for (const r of db.prepare("SELECT id FROM notes WHERE path = ?").all(ref) as { id: string }[]) ids.add(r.id);
+  const extMatch = ref.match(/^(.*)\.([a-z0-9]{1,16})$/i);
+  if (extMatch) {
+    for (const r of db.prepare("SELECT id FROM notes WHERE path = ? AND extension = ?").all(extMatch[1]!, extMatch[2]!) as { id: string }[]) ids.add(r.id);
+  }
+  const hits = [...ids].map((id) => seen(noteOps.getNote(db, id))).filter((n): n is Note => n !== null);
+  if (hits.length > 1) throw new noteOps.AmbiguousPathError(ref, hits.map((n) => ({ id: n.id, extension: n.extension ?? "md" })));
+  return hits[0] ?? null;
+}
+
+/**
  * `resolveNote` for a caller who sees only the notes `visible` admits (a
  * tag-scoped pass, an anonymous /view). Each step treats a note it can't see
  * as absent and moves on, so a hidden note changes nothing about how a
@@ -2462,7 +2484,9 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
         const targets: string[] = [];
         const missing: string[] = [];
         for (const ref of refs) {
-          const note = resolveNote(db, ref, resolveVisibility);
+          // Erasing can't be undone, so it takes only an exact id or path (resolveNoteExact): never a case-folded
+          // path or an H1 title that might name another note.
+          const note = erase ? resolveNoteExact(db, ref, resolveVisibility) : resolveNote(db, ref, resolveVisibility);
           const id = note ? note.id : leftover(ref) ? ref : null;
           if (id === null) missing.push(ref);
           else if (!targets.includes(id)) targets.push(id);
@@ -2476,12 +2500,23 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
         }
         const results: Record<string, unknown>[] = [];
         for (const id of targets) {
-          if (erase) {
-            const r = await store.forgetNote(id, { actor: writeActor, via: writeVia });
-            results.push({ deleted: r.deleted, id, history_erased: { versions_deleted: r.versionsDeleted, blobs_deleted: r.blobsDeleted } });
-          } else {
-            await store.deleteNote(id, { actor: writeActor, via: writeVia });
-            results.push({ deleted: true, id });
+          try {
+            if (erase) {
+              const r = await store.forgetNote(id, { actor: writeActor, via: writeVia });
+              results.push({ deleted: r.deleted, id, history_erased: { versions_deleted: r.versionsDeleted, blobs_deleted: r.blobsDeleted } });
+            } else {
+              await store.deleteNote(id, { actor: writeActor, via: writeVia });
+              results.push({ deleted: true, id });
+            }
+          } catch (err) {
+            // Each note is its own transaction: say which were already done, so a retry can name the rest.
+            if (results.length === 0) throw err;
+            throw structuredError(`delete-note stopped at "${id}": ${err instanceof Error ? err.message : String(err)}`, {
+              error_type: "partial_failure",
+              field: "ids",
+              done: results.map((r) => r.id),
+              failed: id,
+            });
           }
         }
         if (!hasList) return results[0]!;

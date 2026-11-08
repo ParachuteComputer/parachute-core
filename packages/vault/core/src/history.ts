@@ -441,10 +441,14 @@ export function eraseNoteVersions(
   for (let pass = 0; pass < 4 && wave.length > 0; pass++) {
     const next = new Set<string>();
     for (const hash of wave) {
-      const base = (baseOf.get(hash) as { delta_of: string | null } | null)?.delta_of ?? null;
-      const gone = drop.run(hash, hash, hash).changes;
-      blobsDeleted += gone;
-      if (gone && base) next.add(base);
+      const row = baseOf.get(hash) as { delta_of: string | null } | null;
+      if (!row) continue;
+      drop.run(hash, hash, hash);
+      // Counted by looking, not by `.changes`: under Bun 1.4 a DELETE that removed nothing can report the previous
+      // statement's count, which overstated blobs_deleted.
+      if (baseOf.get(hash)) continue;
+      blobsDeleted++;
+      if (row.delta_of) next.add(row.delta_of);
     }
     wave = [...next];
   }

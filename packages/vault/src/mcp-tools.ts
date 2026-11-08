@@ -882,6 +882,9 @@ function applyTagScopeWrappers(
         return { error: "Note not found", error_type: "not_found", id };
       }
     }
+    // `ids` (T-412) is left to core: delete-note resolves every entry among the notes this session can see
+    // (resolveVisibility) before deleting any, and with eraseHistory "visible" refuses an already-deleted id.
+    // contracts/suites/safety/forget.test.ts pins both for a tag-scoped pass.
     return await orig(params);
   });
 

@@ -50,8 +50,11 @@ test("keeps a blob another note's history still holds, and that history still re
   await store.updateNote(gone.id, { content: "only the forgotten note said quokka" });
   await store.updateNote(gone.id, { content: "and then something else" });
 
-  await store.forgetNote(gone.id);
+  const blobsBefore = blobCount();
+  const r = await store.forgetNote(gone.id);
   expect(blobsHolding("quokka")).toBe(0);
+  // The reported count is what left the table (Bun's `.changes` overstated it).
+  expect(r.blobsDeleted).toBe(blobsBefore - blobCount());
   const versions = await store.listNoteVersions(keep.id);
   const v = await store.getNoteVersion(keep.id, versions[versions.length - 1]!.version_ix);
   expect(v?.content).toBe("made up words both notes once had");

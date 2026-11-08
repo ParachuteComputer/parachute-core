@@ -14,7 +14,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { SCHEMA_VERSION, initSchema } from "./schema.ts";
+import { SCHEMA_SQL, SCHEMA_VERSION, initSchema } from "./schema.ts";
 import { SqliteStore } from "./store.ts";
 import { generateMcpTools } from "./mcp.ts";
 
@@ -122,11 +122,19 @@ describe("v5 and v18 against each state of the path indexes", () => {
     // What a rollback, or the engine before T-412, leaves: the same SCHEMA_VERSION stamped later, and its own
     // every-open churn's end state (only v18's unique index). The index came without a version bump, so the
     // fast path must not take that stamp alone as current.
+    // This is the open where the old v5 renamed things, so the vault holds the pairs it renamed.
     await makeVault(50);
     let db = new Database(file);
+    const store = new SqliteStore(db);
+    await store.createNote("made up", { path: "Recipes/pasta" });
+    await store.createNote("a,b\n1,2", { path: "Recipes/pasta", extension: "csv" });
+    await store.createNote("made up", { path: "Inbox/Today" });
+    await store.createNote("made up", { path: "inbox/today" });
     db.exec("DROP INDEX idx_notes_path_nocase");
     db.query("INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)").run(SCHEMA_VERSION, "2999-01-01T00:00:00.000Z");
     const before = paths(db);
+    expect(before).toContain("Recipes/pasta.csv");
+    expect(before).toContain("inbox/today.md");
     db.close();
     db = new Database(file);
     new SqliteStore(db);
@@ -149,6 +157,20 @@ describe("v5 and v18 against each state of the path indexes", () => {
     await store.createNote("three", { path: "same/PATH" });
     expect(paths(db)).toEqual(["Same/path.csv", "Same/path.md", "same/PATH.md"]);
     db.close();
+  });
+});
+
+/** sha256 of SCHEMA_SQL as of SCHEMA_VERSION 32 with T-412 (idx_notes_path left out of it). */
+const SCHEMA_SQL_HASH_AT_32 = "7825b5218ba5e1cfb5e7a86c8b1cd8655ac59458104175f946d741da0e5fcaf7";
+
+describe("the fast path's promise", () => {
+  // initSchema skips SCHEMA_SQL and every migration on a vault stamped SCHEMA_VERSION (with the path index). So a
+  // change to SCHEMA_SQL that doesn't bump SCHEMA_VERSION would reach only new vaults, silently. If this fails: bump
+  // SCHEMA_VERSION (and give the change a migration), or, for something an older engine must still open with no
+  // bump, add its own check to initSchema's fast path as ensurePathNocaseIndex did. Then update the hash.
+  test("SCHEMA_SQL is the one SCHEMA_VERSION 32 was stamped with", () => {
+    const hash = new Bun.CryptoHasher("sha256").update(SCHEMA_SQL).digest("hex");
+    expect({ version: SCHEMA_VERSION, hash }).toEqual({ version: 32, hash: SCHEMA_SQL_HASH_AT_32 });
   });
 });
 

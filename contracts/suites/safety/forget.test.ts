@@ -10,17 +10,20 @@
 // - MCP `delete-note` takes `erase_history: true`, and `ids: [...]` for a list (all resolved before anything is
 //   deleted); with `erase_history` an id may also be a note already deleted that left history;
 // - REST `GET /history/deleted` lists deleted notes that still have history.
+// Erasing takes only an exact id or path (no case folding, no H1 title), since it can't be undone. A tag-scoped
+// pass resolves a list among the notes it can see and can't name a deleted note's leftover history.
 // Erasing history was already admin-only (vault#524), so all three need admin; listing deleted notes needs an
 // unscoped pass (a deleted note has no tags left to check a scope against; a scoped admin gets 404, as on
 // /history/compact). A plain delete is unchanged: it keeps the tombstone.
 import { describe, expect, test } from "bun:test";
-import { mcp, operator, pass, rest, runId, services } from "../lib.ts";
+import { enc, mcp, operator, pass, rest, runId, services } from "../lib.ts";
 import { note } from "./_lib.ts";
 
 const s = services();
 const op = operator();
 const R = runId("fg").replace(/-/g, "");
 const TAG = `${R}t`;
+const OTHER = `${R}o`;
 
 /** A note with two versions of history behind it (made up). */
 async function noteWithHistory(name: string): Promise<string> {
@@ -146,6 +149,55 @@ describe("MCP delete-note with ids and erase_history", () => {
     await expect(viaMcp(await pass({ level: "admin" }), { ids: [a, `${R}/no-such-note`], erase_history: true })).rejects.toThrow(/not_found|not found/i);
     expect((await op.get(`/notes/${a}`)).status).toBe(200);
     expect((await versions(a)).body.total).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe("erasing takes only an exact id or path (it can't be undone)", () => {
+  test("REST: a path that matches only without case finds nothing to erase, and the note stays", async () => {
+    const id = await noteWithHistory("solo/Today");
+    const r = await op.del(`/notes/${enc(`${R}/solo/today`)}?erase_history=true`);
+    expect(r.status).toBe(404);
+    expect((await op.get(`/notes/${id}`)).status).toBe(200);
+    expect((await versions(id)).body.total).toBeGreaterThanOrEqual(1);
+  });
+
+  test("MCP: of two notes whose paths differ only by case, the one named is erased and the other stays", async () => {
+    const upper = await noteWithHistory("pair/Today");
+    const lower = await noteWithHistory("pair/today");
+    const r = await viaMcp(await pass({ level: "admin" }), { id: `${R}/pair/today`, erase_history: true });
+    expect(r).toMatchObject({ deleted: true, id: lower });
+    expect((await op.get(`/notes/${upper}`)).status).toBe(200);
+    expect((await versions(upper)).body.total).toBeGreaterThanOrEqual(1);
+  });
+
+  test("MCP: an H1 title doesn't name a note to erase", async () => {
+    const id = await note(`${R}/titled`, `# Quarterly ${R}\nmade up`, [TAG]);
+    await expect(viaMcp(await pass({ level: "admin" }), { ids: [`Quarterly ${R}`], erase_history: true })).rejects.toThrow(/not_found|not found/i);
+    expect((await op.get(`/notes/${id}`)).status).toBe(200);
+  });
+});
+
+describe("a tag-scoped pass", () => {
+  test("a list naming a note outside its tags deletes nothing, plain or erasing", async () => {
+    const mine = await noteWithHistory("scoped-mine");
+    const theirs = await note(`${R}/scoped-theirs`, "made up", [OTHER]);
+    for (const level of ["write", "admin"] as const) {
+      const scoped = await pass({ level, tags: [TAG] });
+      await expect(viaMcp(scoped, { ids: [mine, theirs] })).rejects.toThrow(/not_found|not found/i);
+    }
+    await expect(viaMcp(await pass({ level: "admin", tags: [TAG] }), { ids: [mine, theirs], erase_history: true })).rejects.toThrow(/not_found|not found/i);
+    expect((await op.get(`/notes/${mine}`)).status).toBe(200);
+    expect((await op.get(`/notes/${theirs}`)).status).toBe(200);
+  });
+
+  test("an admin one erases a note in its tags, but can't name history a deleted note left", async () => {
+    const scoped = await pass({ level: "admin", tags: [TAG] });
+    const live = await noteWithHistory("scoped-live");
+    expect(await viaMcp(scoped, { ids: [live], erase_history: true })).toMatchObject({ deleted: 1 });
+    const left = await noteWithHistory("scoped-left");
+    expect((await op.del(`/notes/${left}`)).status).toBe(200);
+    await expect(viaMcp(scoped, { ids: [left], erase_history: true })).rejects.toThrow(/not_found|not found/i);
+    expect((await versions(left)).body.total).toBeGreaterThanOrEqual(1);
   });
 });
 

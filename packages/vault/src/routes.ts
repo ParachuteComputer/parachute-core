@@ -58,7 +58,7 @@ import {
   contentRangeRequiresContent,
   type ContentRange,
 } from "../core/src/content-range.ts";
-import { attachValidationStatus, enforceStrictWrite, applySchemaDefaults, resolveVisibleNote } from "../core/src/mcp.ts";
+import { attachValidationStatus, enforceStrictWrite, applySchemaDefaults, resolveNoteExact, resolveVisibleNote } from "../core/src/mcp.ts";
 import {
   BLOCKED_ATTACHMENT_EXTENSIONS,
   ATTACHMENT_MIME_TYPES,
@@ -3634,18 +3634,25 @@ async function handleNotesInner(
 
   // DELETE /notes/:idOrPath — vault:write (no admin gate; consistent with verbForMethod)
   if (method === "DELETE") {
-    const note = await resolveNote(store, idOrPath, scopeVisible);
+    // T-412: `?erase_history=true` also erases every version (no tombstone). routing.ts has already required admin
+    // for any value but false. Erasing can't be undone, so it takes only an exact id or path (resolveNoteExact).
+    const erase = url.searchParams.get("erase_history");
+    if (erase !== null && erase !== "true" && erase !== "false") {
+      return json({ error: "erase_history must be true or false", error_type: "invalid_request", field: "erase_history" }, 400);
+    }
+    let note: Note | null;
+    try {
+      note = erase === "true" && store.db ? resolveNoteExact(store.db, idOrPath, scopeVisible) : await resolveNote(store, idOrPath, scopeVisible);
+    } catch (e) {
+      const r = conflictResponse(e);
+      if (r) return r;
+      throw e;
+    }
     if (!note) return json({ error: "Not found", error_type: "not_found" }, 404);
     // Tag-scope: can't delete what you can't read. 404 (not 403) for the
     // same no-leak reason as the read paths.
     if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
       return json({ error: "Not found", error_type: "not_found" }, 404);
-    }
-    // T-412: `?erase_history=true` also erases every version (no tombstone). routing.ts has already required admin
-    // for any value but false.
-    const erase = url.searchParams.get("erase_history");
-    if (erase !== null && erase !== "true" && erase !== "false") {
-      return json({ error: "erase_history must be true or false", error_type: "invalid_request", field: "erase_history" }, 400);
     }
     if (erase === "true") {
       const r = await store.forgetNote(note.id, { actor: writeCtx.actor, via: writeCtx.via });
