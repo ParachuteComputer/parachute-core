@@ -102,4 +102,5 @@ test("the deleted-notes listing pages newest first and counts all of them on eve
   const page2 = await store.listDeletedNotes({ limit: 2, offset: 2 });
   expect(page2).toMatchObject({ total: 3, notes: [{ id: ids[0], path: "forget/kea", extension: "md" }] });
   expect((await store.listDeletedNotes({ limit: 2, offset: 9 })).total).toBe(3);
+  expect(await store.listDeletedNotes({ limit: 0 })).toEqual({ notes: [], total: 3 });
 });

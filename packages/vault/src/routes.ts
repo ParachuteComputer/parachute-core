@@ -3677,13 +3677,7 @@ async function handleNotesInner(
       if (found instanceof Response) return found;
       note = found.note;
     } else {
-      try {
-        note = await resolveNote(store, idOrPath, scopeVisible);
-      } catch (e) {
-        const r = conflictResponse(e);
-        if (r) return r;
-        throw e;
-      }
+      note = await resolveNote(store, idOrPath, scopeVisible);
     }
     if (!note) return json({ error: "Not found", error_type: "not_found" }, 404);
     // Tag-scope: can't delete what you can't read. 404 (not 403) for the

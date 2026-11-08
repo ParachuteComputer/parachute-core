@@ -613,6 +613,14 @@ export interface GenerateMcpToolsOpts {
    */
   ambiguityVisible?: (noteId: string) => boolean;
   /**
+   * Who may pass `erase_history: true` to `delete-note` (T-412). Erasing history is irreversible and admin-only
+   * (vault#524), and `delete-note` itself is a write tool, so the door says what this session may do. Omitted →
+   * refused with `insufficient_scope` (fail closed). `"visible"`: notes this session can see (a tag-scoped admin).
+   * `"all"`: also a note already deleted that left history (an unscoped admin; a deleted note has no tags left to
+   * check a scope against).
+   */
+  eraseHistory?: "visible" | "all";
+  /**
    * `AttachmentTicketProvider` seam (vault attachment-tickets design,
    * Wave 1 — D10 "tools omitted when unwired"). When provided,
    * `generateMcpTools` appends `request-attachment-upload` /
@@ -621,14 +629,6 @@ export interface GenerateMcpToolsOpts {
    * ABSENT from the list entirely — not merely erroring on call — so an
    * agent is never shown an affordance the runtime can't back.
    */
-  /**
-   * Who may pass `erase_history: true` to `delete-note` (T-412). Erasing history is irreversible and admin-only
-   * (vault#524), and `delete-note` itself is a write tool, so the door says what this session may do. Omitted →
-   * refused with `insufficient_scope` (fail closed). `"visible"`: notes this session can see (a tag-scoped admin).
-   * `"all"`: also a note already deleted that left history (an unscoped admin; a deleted note has no tags left to
-   * check a scope against).
-   */
-  eraseHistory?: "visible" | "all";
   attachmentTickets?: {
     provider: AttachmentTicketProvider;
     /** This vault's own name — stamped onto every minted ticket so the spend route can cheaply reject a cross-vault replay. */

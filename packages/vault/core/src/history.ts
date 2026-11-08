@@ -407,12 +407,10 @@ export function eraseHistory(
   db: Database,
   noteId: string,
 ): { versionsDeleted: number; blobsDeleted: number } {
+  // The targeted erase, then the full sweep this endpoint has always run (it also collects orphans other paths left).
   return transaction(db, () => {
-    const versionsDeleted = db
-      .prepare("DELETE FROM note_versions WHERE note_id = ?")
-      .run(noteId).changes;
-    db.prepare("DELETE FROM history_compact_state WHERE note_id=?").run(noteId);
-    return { versionsDeleted, ...gcBlobs(db) };
+    const erased = eraseNoteVersions(db, noteId);
+    return { versionsDeleted: erased.versionsDeleted, blobsDeleted: erased.blobsDeleted + gcBlobs(db).blobsDeleted };
   });
 }
 /**
@@ -496,8 +494,8 @@ export function listDeletedNotes(
     .all(limit, offset) as (DeletedNoteRow & { total: number })[];
   let total = rows[0]?.total;
   if (total === undefined) {
-    // A page past the end has no row to carry the window's count.
-    total = offset === 0 ? 0 : (db
+    // An empty page (past the end, or limit 0) has no row to carry the window's count.
+    total = offset === 0 && limit > 0 ? 0 : (db
       .prepare("SELECT COUNT(*) AS n FROM (SELECT 1 FROM note_versions v GROUP BY v.note_id HAVING NOT EXISTS (SELECT 1 FROM notes n WHERE n.id = v.note_id))")
       .get() as { n: number }).n;
   }
