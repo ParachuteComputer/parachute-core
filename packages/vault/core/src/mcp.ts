@@ -2486,7 +2486,20 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
         for (const ref of refs) {
           // Erasing can't be undone, so it takes only an exact id or path (resolveNoteExact): never a case-folded
           // path or an H1 title that might name another note.
-          const note = erase ? resolveNoteExact(db, ref, resolveVisibility) : resolveNote(db, ref, resolveVisibility);
+          let note: Note | null;
+          try {
+            note = erase ? resolveNoteExact(db, ref, resolveVisibility) : resolveNote(db, ref, resolveVisibility);
+          } catch (err) {
+            // delete-note has no `extension` parameter, so AmbiguousPathError's own hint would point nowhere.
+            if (erase && err instanceof noteOps.AmbiguousPathError) {
+              throw structuredError(`"${ref}" names more than one note; name the one to erase by its id`, {
+                error_type: "ambiguous_path",
+                field: hasList ? "ids" : "id",
+                candidates: err.candidates,
+              });
+            }
+            throw err;
+          }
           const id = note ? note.id : leftover(ref) ? ref : null;
           if (id === null) missing.push(ref);
           else if (!targets.includes(id)) targets.push(id);

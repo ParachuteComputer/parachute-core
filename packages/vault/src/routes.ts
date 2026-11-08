@@ -3642,7 +3642,11 @@ async function handleNotesInner(
     }
     let note: Note | null;
     try {
-      note = erase === "true" && store.db ? resolveNoteExact(store.db, idOrPath, scopeVisible) : await resolveNote(store, idOrPath, scopeVisible);
+      if (erase === "true" && !store.db) {
+        // Never erase through the loose lookup (case folding, H1 title): refuse instead.
+        return json({ error: "erase_history needs the vault's database", error_type: "internal_error" }, 500);
+      }
+      note = erase === "true" ? resolveNoteExact(store.db, idOrPath, scopeVisible) : await resolveNote(store, idOrPath, scopeVisible);
     } catch (e) {
       const r = conflictResponse(e);
       if (r) return r;

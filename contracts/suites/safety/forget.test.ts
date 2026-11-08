@@ -170,6 +170,15 @@ describe("erasing takes only an exact id or path (it can't be undone)", () => {
     expect((await versions(upper)).body.total).toBeGreaterThanOrEqual(1);
   });
 
+  test("MCP: a name that fits two notes is refused, says to use the id, and deletes nothing", async () => {
+    const plain = await note(`${R}/Recipe.v2`, "made up", [TAG]);
+    const r = await op.post("/notes", { path: `${R}/Recipe`, extension: "v2", content: "made up" });
+    expect(r.status).toBe(201);
+    await expect(viaMcp(await pass({ level: "admin" }), { ids: [`${R}/Recipe.v2`], erase_history: true })).rejects.toThrow(/ambiguous|more than one note.*by its id/i);
+    expect((await op.get(`/notes/${plain}`)).status).toBe(200);
+    expect((await op.get(`/notes/${r.body.id}`)).status).toBe(200);
+  });
+
   test("MCP: an H1 title doesn't name a note to erase", async () => {
     const id = await note(`${R}/titled`, `# Quarterly ${R}\nmade up`, [TAG]);
     await expect(viaMcp(await pass({ level: "admin" }), { ids: [`Quarterly ${R}`], erase_history: true })).rejects.toThrow(/not_found|not found/i);
