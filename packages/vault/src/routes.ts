@@ -626,6 +626,20 @@ function parseNonNegativeIntParam(
 }
 
 /**
+ * The value of `?meta[field]=value`. A query string carries no types, so a
+ * value that is exactly how JSON writes a boolean or number reads as that, and
+ * the engine's bare equality still finds the same text stored as a string.
+ * Anything else stays a string: `01234`, `1.50` and `1e3` are not how JSON
+ * writes a number, and a stored `"01234"` must keep matching.
+ */
+function shorthandValue(value: string): string | number | boolean {
+  if (value === "true") return true;
+  if (value === "false") return false;
+  const n = Number(value);
+  return Number.isFinite(n) && String(n) === value ? n : value;
+}
+
+/**
  * Parse bracket-style metadata filters (vault#285 friction point 1.3).
  *
  * Maps `?meta[field][op]=value` (Stripe / JSON:API / Strapi convention) to
@@ -782,7 +796,7 @@ function parseMetaBrackets(url: URL): {
     // Regular metadata field.
     if (!op) {
       // Shorthand: `?meta[field]=value` → primitive (engine routes through
-      // json_extract; no indexed declaration required).
+      // json_extract; no indexed declaration required), typed where it can be.
       // F2: reject if any operator form already wrote a bucket for this
       // field — the two shapes don't compose and the silent stomp would
       // drop one form's intent. Mirror check for the reverse order below.
@@ -790,7 +804,7 @@ function parseMetaBrackets(url: URL): {
         return { error: rejectMixedForms(field) };
       }
       shorthandFields.add(field);
-      metadata[field] = value;
+      metadata[field] = shorthandValue(value);
       continue;
     }
     // F2: reject if shorthand already wrote a primitive for this field.
