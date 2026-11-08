@@ -82,7 +82,7 @@ describe("a wake on a vault at this schema", () => {
 });
 
 describe("v5 and v18 against each state of the path indexes", () => {
-  // Older vaults reach v33 from any of these: v5's unique index (pre-v18), v18's composite one, both (an
+  // Older vaults reach this engine from any of these: v5's unique index (pre-v18), v18's composite one, both (an
   // interrupted swap), or the old plain index left beside either. Each must end with exactly the composite unique
   // index and the case-insensitive lookup index, with no path renamed.
   const states: [string, string[]][] = [
@@ -117,6 +117,28 @@ describe("v5 and v18 against each state of the path indexes", () => {
       db.close();
     });
   }
+
+  test("a vault an older engine of this version opened last (current stamp, no case-insensitive index) gets the index once", async () => {
+    // What a rollback, or the engine before T-412, leaves: the same SCHEMA_VERSION stamped later, and its own
+    // every-open churn's end state (only v18's unique index). The index came without a version bump, so the
+    // fast path must not take that stamp alone as current.
+    await makeVault(50);
+    let db = new Database(file);
+    db.exec("DROP INDEX idx_notes_path_nocase");
+    db.query("INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)").run(SCHEMA_VERSION, "2999-01-01T00:00:00.000Z");
+    const before = paths(db);
+    db.close();
+    db = new Database(file);
+    new SqliteStore(db);
+    expect(indexes(db)).toEqual(["idx_notes_path_ext_unique", "idx_notes_path_nocase"]);
+    expect(paths(db)).toEqual(before);
+    const after = cookie(db);
+    db.close();
+    db = new Database(file);
+    new SqliteStore(db);
+    expect(cookie(db)).toBe(after);
+    db.close();
+  });
 
   test("uniqueness is unchanged: same path and extension refused; another extension or a case variant allowed", async () => {
     const db = new Database(file);
