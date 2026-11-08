@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { HistoryPreconditionRequiredError } from "./history.js";
 import type { Store, Note, Link, Attachment, QueryOpts, QueryNotesPage, AggregateRow, SemanticSearchResult } from "./types.js";
-import { compactNote, compactVault, countNoteVersions, type CompactResult, type CompactSummary, captureVersion, readPriorNoteRow, resolveHistoryPolicy, appendRestoreMarker, listVersions, getVersion, latestTombstone, eraseHistory, sweepDeletedHistory, deletedHistoryStats, HistoryNotFoundError, HistoryOverflowError, HistoryUnrecoverableError, DEFAULT_HISTORY_POLICY, VERSION_MAX_BYTES, type VersionRow, type HistoryPolicy, type HistoryOp } from "./history.js";
+import { compactNote, compactVault, countNoteVersions, type CompactResult, type CompactSummary, captureVersion, readPriorNoteRow, resolveHistoryPolicy, appendRestoreMarker, listVersions, getVersion, latestTombstone, eraseHistory, eraseNoteVersions, listDeletedNotes, sweepDeletedHistory, deletedHistoryStats, HistoryNotFoundError, HistoryOverflowError, HistoryUnrecoverableError, DEFAULT_HISTORY_POLICY, VERSION_MAX_BYTES, type VersionRow, type HistoryPolicy, type HistoryOp } from "./history.js";
 import { initSchema } from "./schema.js";
 import { refreshCompactState } from "./history-compact-state.js";
 import * as noteOps from "./notes.js";
@@ -1019,6 +1019,18 @@ export class BunSqliteStore implements Store {
       .run(createdAt, updatedAt, updatedAtMs, id);
   }
 
+  async listDeletedNotes(opts?: { limit?: number; offset?: number }) { return listDeletedNotes(this.db, opts); }
+
+  async forgetNote(id: string, opts?: { actor?: string | null; via?: string | null }): Promise<{ deleted: boolean; versionsDeleted: number; blobsDeleted: number }> {
+    const existing = noteOps.getNote(this.db, id);
+    const erased = this.transaction(() => {
+      if (existing) this.deleteNoteRows(id, existing, { ...opts, captureHistory: false });
+      return eraseNoteVersions(this.db, id);
+    });
+    if (existing) this.afterDelete(id, existing);
+    return { deleted: existing !== null, ...erased };
+  }
+
   async deleteNote(id: string, opts?: { actor?: string | null; via?: string | null; captureHistory?: boolean }): Promise<void> {
     // Read before delete so we can invalidate config caches on the way out
     // AND so the post-delete hook dispatch carries the minimum payload
@@ -1032,21 +1044,29 @@ export class BunSqliteStore implements Store {
     // it's individually re-saved. See requeueInboundWikilinksForDelete's doc
     // comment for why this must run pre-delete and what it deliberately
     // excludes (typed `links`, not just wikilinks).
-    this.transaction(() => {
-      requeueInboundWikilinksForDelete(this.db, id);
-      // vault#581 — the deleted note's resolution keys, captured BEFORE the row
-      // goes away and swept AFTER, so a `[[Dup]]` that was ambiguous only
-      // because of THIS note resolves (or, if it was the last candidate,
-      // demotes to an ordinary broken link).
-      const ambiguityKeys = noteResolutionKeys(existing);
-      if (opts?.captureHistory !== false) {
-        const prior = readPriorNoteRow(this.db, id);
-        if (prior) captureVersion(this.db, prior, { actor: opts?.actor ?? null, via: opts?.via ?? null, op: "delete", policy: this.historyPolicy });
-      }
-      noteOps.deleteNote(this.db, id);
-      refreshAmbiguousLinks(this.db, ambiguityKeys);
-      refreshCompactState(this.db, id);
-    });
+    this.transaction(() => this.deleteNoteRows(id, existing, opts));
+    this.afterDelete(id, existing);
+  }
+
+  /** deleteNote's writes, for one transaction (forgetNote shares them). */
+  private deleteNoteRows(id: string, existing: Note | null, opts?: { actor?: string | null; via?: string | null; captureHistory?: boolean }): void {
+    requeueInboundWikilinksForDelete(this.db, id);
+    // vault#581 — the deleted note's resolution keys, captured BEFORE the row
+    // goes away and swept AFTER, so a `[[Dup]]` that was ambiguous only
+    // because of THIS note resolves (or, if it was the last candidate,
+    // demotes to an ordinary broken link).
+    const ambiguityKeys = noteResolutionKeys(existing);
+    if (opts?.captureHistory !== false) {
+      const prior = readPriorNoteRow(this.db, id);
+      if (prior) captureVersion(this.db, prior, { actor: opts?.actor ?? null, via: opts?.via ?? null, op: "delete", policy: this.historyPolicy });
+    }
+    noteOps.deleteNote(this.db, id);
+    refreshAmbiguousLinks(this.db, ambiguityKeys);
+    refreshCompactState(this.db, id);
+  }
+
+  /** What follows a delete's commit: config caches and the `deleted` hook. */
+  private afterDelete(id: string, existing: Note | null): void {
     if (existing?.path) this.invalidateConfigCachesForPath(existing.path);
     // Dispatch even when `existing` was null — the caller asked for a
     // deletion, and downstream consumers (e.g. the mirror) reconcile via

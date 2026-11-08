@@ -270,10 +270,11 @@ describe("contract: typed indexes — Decision D: migrateToV24 poison coercion (
     noteOps.tagNote(db, nonCoercible.id, ["metric"]);
     noteOps.tagNote(db, boolish.id, ["metric"]);
 
-    // Re-running initSchema (idempotent by construction for every migration
+    // Re-running initSchema on a vault stamped pre-v24 (idempotent by construction for every migration
     // step) exercises migrateToV24's coercion pass over the poison just
     // planted via the raw noteOps layer (bypassing the strict write gate —
     // simulating data that predates it, or an operator-side bulk import).
+    stampAsVersion(db, 23);
     initSchema(db);
 
     const after = (id: string) => (noteOps.getNote(db, id)!.metadata as any);
@@ -292,6 +293,7 @@ describe("contract: typed indexes — Decision D: migrateToV24 poison coercion (
 
     // Idempotency: a second re-run coerces nothing further and doesn't
     // touch the already-clean/already-coerced/already-left values.
+    stampAsVersion(db, 23);
     initSchema(db);
     expect(after(clean.id).n).toBe(42);
     expect(after(coercible.id).n).toBe(5);
@@ -304,6 +306,7 @@ describe("contract: typed indexes — Decision D: migrateToV24 poison coercion (
     await store.upsertTagRecord("item", { fields: { code: { type: "string", indexed: true } } });
     noteOps.tagNote(db, note.id, ["item"]);
 
+    stampAsVersion(db, 23);
     initSchema(db);
     expect((noteOps.getNote(db, note.id)!.metadata as any).code).toBe("12345");
   });
@@ -413,3 +416,13 @@ describe("contract: update-tag messaging — #553/#554 (flipped from todo)", () 
   // src/contract-errors.test.ts (core/ shouldn't import from src/ — that
   // boundary runs one direction only).
 });
+
+/**
+ * Stamp `db` as a vault last opened at schema `version`, so the next initSchema runs the migrations as on an
+ * upgrade. initSchema skips them on a vault already at SCHEMA_VERSION (T-412), so a test that plants old-shaped
+ * data in a fresh vault must also say the vault is old.
+ */
+function stampAsVersion(db: Database, version: number): void {
+  db.exec("DELETE FROM schema_version");
+  db.prepare("INSERT INTO schema_version (version, applied_at) VALUES (?, ?)").run(version, "2020-01-01T00:00:00.000Z");
+}

@@ -407,13 +407,100 @@ export function eraseHistory(
   db: Database,
   noteId: string,
 ): { versionsDeleted: number; blobsDeleted: number } {
+  // The targeted erase, then the full sweep this endpoint has always run (it also collects orphans other paths left).
   return transaction(db, () => {
-    const versionsDeleted = db
-      .prepare("DELETE FROM note_versions WHERE note_id = ?")
-      .run(noteId).changes;
-    db.prepare("DELETE FROM history_compact_state WHERE note_id=?").run(noteId);
-    return { versionsDeleted, ...gcBlobs(db) };
+    const erased = eraseNoteVersions(db, noteId);
+    return { versionsDeleted: erased.versionsDeleted, blobsDeleted: erased.blobsDeleted + gcBlobs(db).blobsDeleted };
   });
+}
+/**
+ * Delete every version of one note, its compaction state, and the blobs only those versions used (T-412). Blobs are
+ * shared by content, so a blob goes only when no other version holds it and no other blob is a delta against it; a
+ * freed delta's base is then tried too (deltas are depth one). Reads grow with this note's history, not with the
+ * vault's, unlike {@link gcBlobs}, which {@link eraseHistory} still runs (it also sweeps orphans other paths left).
+ * Call inside a transaction.
+ */
+export function eraseNoteVersions(
+  db: Database,
+  noteId: string,
+): { versionsDeleted: number; blobsDeleted: number } {
+  const hashes = (db
+    .prepare("SELECT DISTINCT content_hash FROM note_versions WHERE note_id = ? AND content_hash IS NOT NULL")
+    .all(noteId) as { content_hash: string }[]).map((r) => r.content_hash);
+  const versionsDeleted = db.prepare("DELETE FROM note_versions WHERE note_id = ?").run(noteId).changes;
+  db.prepare("DELETE FROM history_compact_state WHERE note_id=?").run(noteId);
+  const baseOf = db.prepare("SELECT delta_of FROM note_blobs WHERE hash = ?");
+  const drop = db.prepare(
+    "DELETE FROM note_blobs WHERE hash = ? AND NOT EXISTS (SELECT 1 FROM note_versions WHERE content_hash = ?) AND NOT EXISTS (SELECT 1 FROM note_blobs WHERE delta_of = ?)",
+  );
+  let blobsDeleted = 0;
+  let wave = [...new Set(hashes)];
+  // Bounded like gcBlobs: two waves suffice at depth one; four even in a corrupt chain.
+  for (let pass = 0; pass < 4 && wave.length > 0; pass++) {
+    const next = new Set<string>();
+    for (const hash of wave) {
+      const row = baseOf.get(hash) as { delta_of: string | null } | null;
+      if (!row) continue;
+      drop.run(hash, hash, hash);
+      // Counted by looking, not by `.changes`: under Bun 1.4 this DELETE, when it removed nothing, reported the
+      // previous statement's count, which overstated blobs_deleted.
+      if (baseOf.get(hash)) continue;
+      blobsDeleted++;
+      if (row.delta_of) next.add(row.delta_of);
+    }
+    wave = [...next];
+  }
+  return { versionsDeleted, blobsDeleted };
+}
+/** One deleted note that still has history: what `GET /history/deleted` lists. */
+export interface DeletedNoteRow {
+  id: string;
+  /** The path its newest version had. */
+  path: string | null;
+  extension: string | null;
+  /** When it was deleted (its newest tombstone), or null when no tombstone is left (an interrupted erase, an import). */
+  deleted_at: string | null;
+  versions: number;
+}
+/**
+ * Notes that are gone but whose versions are not (T-412): every plain delete leaves one, and so does a "delete
+ * everything" interrupted between deleting and erasing. Newest deletion first. Reads every version row once, so it
+ * is an admin listing, not a hot path.
+ */
+export function listDeletedNotes(
+  db: Database,
+  opts?: { limit?: number; offset?: number },
+): { notes: DeletedNoteRow[]; total: number } {
+  if (!historyTablesPresent(db)) return { notes: [], total: 0 };
+  const limit = Math.min(1000, Math.max(0, opts?.limit ?? 100));
+  const offset = Math.max(0, opts?.offset ?? 0);
+  // One walk of note_versions in note_id order (idx_note_versions_note), one probe of notes per note id, the total
+  // from a window over the groups, and the newest path read for the page's rows only: the listing reads each
+  // version row once, not once per page twice.
+  const rows = db
+    .prepare(
+      `SELECT p.id, p.versions, p.deleted_at, p.total,
+        (SELECT x.path FROM note_versions x WHERE x.note_id = p.id ORDER BY x.version_ix DESC LIMIT 1) AS path,
+        (SELECT x.extension FROM note_versions x WHERE x.note_id = p.id ORDER BY x.version_ix DESC LIMIT 1) AS extension
+      FROM (
+        SELECT g.*, COUNT(*) OVER () AS total FROM (
+          SELECT v.note_id AS id, COUNT(*) AS versions, MAX(v.superseded_at) AS last_at,
+            MAX(CASE WHEN v.op = 'delete' THEN v.superseded_at END) AS deleted_at
+          FROM note_versions v GROUP BY v.note_id
+          HAVING NOT EXISTS (SELECT 1 FROM notes n WHERE n.id = v.note_id)
+        ) g ORDER BY g.last_at DESC, g.id ASC LIMIT ? OFFSET ?
+      ) p ORDER BY p.last_at DESC, p.id ASC`,
+    )
+    .all(limit, offset) as (DeletedNoteRow & { total: number })[];
+  let total = rows[0]?.total;
+  if (total === undefined) {
+    // An empty page (past the end, or limit 0) has no row to carry the window's count.
+    total = offset === 0 && limit > 0 ? 0 : (db
+      .prepare("SELECT COUNT(*) AS n FROM (SELECT 1 FROM note_versions v GROUP BY v.note_id HAVING NOT EXISTS (SELECT 1 FROM notes n WHERE n.id = v.note_id))")
+      .get() as { n: number }).n;
+  }
+  const notes = rows.map(({ total: _t, ...row }) => ({ id: row.id, path: row.path, extension: row.extension, deleted_at: row.deleted_at, versions: row.versions }));
+  return { notes, total };
 }
 export function deletedHistoryStats(db: Database): {
   notes: number;

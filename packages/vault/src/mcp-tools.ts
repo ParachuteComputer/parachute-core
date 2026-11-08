@@ -316,6 +316,9 @@ export function generateScopedMcpTools(
     ...(writeContext ? { writeContext } : {}),
     ...(strictBypass ? { strictBypass } : {}),
     ...(onStrictBypass ? { onStrictBypass } : {}),
+    // T-412: delete-note's erase_history is admin-only, like DELETE /notes/:id/versions (vault#524). A scoped admin
+    // erases only notes it can see; only an unscoped one may name a note already deleted.
+    ...(auth && hasScopeForVault(auth.scopes, vaultName, "admin") ? { eraseHistory: scoped ? "visible" as const : "all" as const } : {}),
     attachmentTickets: {
       provider: getSharedAttachmentTicketProvider(),
       vaultName,
@@ -879,6 +882,9 @@ function applyTagScopeWrappers(
         return { error: "Note not found", error_type: "not_found", id };
       }
     }
+    // `ids` (T-412) is left to core: delete-note resolves every entry among the notes this session can see
+    // (resolveVisibility) before deleting any, and with eraseHistory "visible" refuses an already-deleted id.
+    // contracts/suites/safety/forget.test.ts pins both for a tag-scoped pass.
     return await orig(params);
   });
 
