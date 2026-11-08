@@ -7,7 +7,7 @@ import { timestampToMs } from "./cursor.js";
 import { ensureRelationshipColumn } from "./wikilinks.js";
 import { rebuildCompactState } from "./history-compact-state.js";
 
-export const SCHEMA_VERSION = 32;
+export const SCHEMA_VERSION = 33;
 
 function migrateToV32(db: Database): void {
     const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='history_compact_state'").get();
@@ -464,7 +464,9 @@ END;
 
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_notes_created ON notes(created_at);
-CREATE INDEX IF NOT EXISTS idx_notes_path ON notes(path) WHERE path IS NOT NULL;
+-- Path indexes are made by the migrations, not here: idx_notes_path_ext_unique (v18, uniqueness, case-sensitive) and
+-- idx_notes_path_nocase (v33, the case-insensitive lookups). This block used to make idx_notes_path, which v5 then
+-- dropped on every open: one index row written per note, twice, on every wake (T-412).
 CREATE INDEX IF NOT EXISTS idx_note_tags_note ON note_tags(note_id, tag_name);
 CREATE INDEX IF NOT EXISTS idx_note_tags_tag ON note_tags(tag_name, note_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_note ON attachments(note_id);
@@ -629,10 +631,27 @@ export function assertNotNewer(db: Database): void {
   if (row?.v != null && row.v > SCHEMA_VERSION) throw new NewerSchemaError(row.v);
 }
 
+/**
+ * The version the most recent initSchema stamped. An older vault that opened this file after a newer one stamps its
+ * own, older version later, so the latest stamp (not the highest) says whether the schema is current. On an
+ * applied_at tie the lower version wins: a needless full run is safe, a skipped one isn't.
+ */
+function latestStamp(db: Database): number | null {
+  if (!hasTable(db, "schema_version")) return null;
+  const row = db.prepare("SELECT version FROM schema_version ORDER BY applied_at DESC, version ASC LIMIT 1").get() as { version: number } | null;
+  return row?.version ?? null;
+}
+
 export function initSchema(db: Database): void {
   // Before anything writes: an older vault must never half-migrate, or re-stamp, a newer database.
   assertNotNewer(db);
   applyConnectionPragmas(db);
+
+  // A vault this code already brought to SCHEMA_VERSION needs nothing more. Every step below is meant to be
+  // idempotent, but running them all on each open is not free: on cloud every Durable Object wake did it, reading
+  // the vault several times over and (through v5) writing one index row per note (T-412). The stamp is written
+  // last, so an open that stopped part way runs everything again.
+  if (latestStamp(db) === SCHEMA_VERSION) return;
 
   // Check if we need to migrate from v2
   const hasOldTables = hasTable(db, "things");
@@ -770,6 +789,8 @@ export function initSchema(db: Database): void {
   migrateToV30(db);
   migrateToV31(db);
   migrateToV32(db);
+  // v33: a case-insensitive path index for the `path = ? COLLATE NOCASE` lookups (T-412).
+  migrateToV33(db);
 
   // Rebuild any generated columns + indexes declared in indexed_fields.
   // No-op for a fresh vault; idempotent on existing vaults.
@@ -808,9 +829,12 @@ function migrateToV4(db: Database): void {
 function migrateToV5(db: Database): void {
   if (!hasTable(db, "notes")) return;
 
-  // Check if the unique index already exists
+  // Done once already if either unique path index exists: v5's own, or v18's (path, extension) that replaced it.
+  // Checking only v5's made this run on every open of every vault past v18 (T-412): it rewrote no path in the common
+  // case, but its dedupe below renamed the second of any two notes whose paths differ only by extension or by case
+  // (both allowed since v18) to `<path>-1`, and it rebuilt a path index over every note for v18 to drop again.
   const indexes = db.prepare(
-    "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_notes_path_unique'",
+    "SELECT name FROM sqlite_master WHERE type='index' AND name IN ('idx_notes_path_unique', 'idx_notes_path_ext_unique')",
   ).all();
   if (indexes.length > 0) return;
 
@@ -2091,4 +2115,20 @@ function migrateToV31(db: Database): void {
       PRIMARY KEY(note_id, import_ix)
     );
   `));
+}
+
+/**
+ * Migrate v32 → v33: index paths without case (T-412). Every path lookup (getNoteByPath, a reference field's target,
+ * wikilink resolution, if_exists) asks `path = ? COLLATE NOCASE`, and the only path index left was v18's
+ * case-sensitive unique `(path, extension)`, so each lookup read every note. This index answers them; it is not
+ * unique, so path uniqueness stays exactly v18's: `(path, extension)`, case-sensitive. Also drops v4's plain
+ * `idx_notes_path` wherever an older SCHEMA_SQL left it (it duplicated the leading column of v18's index).
+ * Building it writes one index row per note, once.
+ */
+function migrateToV33(db: Database): void {
+  if (!hasTable(db, "notes")) return;
+  transaction(db, () => {
+    db.exec("DROP INDEX IF EXISTS idx_notes_path");
+    db.exec("CREATE INDEX IF NOT EXISTS idx_notes_path_nocase ON notes(path COLLATE NOCASE) WHERE path IS NOT NULL");
+  });
 }
