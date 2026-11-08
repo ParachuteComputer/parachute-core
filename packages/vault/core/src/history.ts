@@ -476,22 +476,33 @@ export function listDeletedNotes(
   if (!historyTablesPresent(db)) return { notes: [], total: 0 };
   const limit = Math.min(1000, Math.max(0, opts?.limit ?? 100));
   const offset = Math.max(0, opts?.offset ?? 0);
-  const gone = "NOT EXISTS (SELECT 1 FROM notes n WHERE n.id = v.note_id)";
-  const notes = db
+  // One walk of note_versions in note_id order (idx_note_versions_note), one probe of notes per note id, the total
+  // from a window over the groups, and the newest path read for the page's rows only: the listing reads each
+  // version row once, not once per page twice.
+  const rows = db
     .prepare(
-      `SELECT v.note_id AS id, COUNT(*) AS versions,
-        (SELECT MAX(t.superseded_at) FROM note_versions t WHERE t.note_id = v.note_id AND t.op = 'delete') AS deleted_at,
-        (SELECT x.path FROM note_versions x WHERE x.note_id = v.note_id ORDER BY x.version_ix DESC LIMIT 1) AS path,
-        (SELECT x.extension FROM note_versions x WHERE x.note_id = v.note_id ORDER BY x.version_ix DESC LIMIT 1) AS extension,
-        MAX(v.superseded_at) AS last_at
-      FROM note_versions v WHERE ${gone}
-      GROUP BY v.note_id ORDER BY last_at DESC, v.note_id ASC LIMIT ? OFFSET ?`,
+      `SELECT p.id, p.versions, p.deleted_at, p.total,
+        (SELECT x.path FROM note_versions x WHERE x.note_id = p.id ORDER BY x.version_ix DESC LIMIT 1) AS path,
+        (SELECT x.extension FROM note_versions x WHERE x.note_id = p.id ORDER BY x.version_ix DESC LIMIT 1) AS extension
+      FROM (
+        SELECT g.*, COUNT(*) OVER () AS total FROM (
+          SELECT v.note_id AS id, COUNT(*) AS versions, MAX(v.superseded_at) AS last_at,
+            MAX(CASE WHEN v.op = 'delete' THEN v.superseded_at END) AS deleted_at
+          FROM note_versions v GROUP BY v.note_id
+          HAVING NOT EXISTS (SELECT 1 FROM notes n WHERE n.id = v.note_id)
+        ) g ORDER BY g.last_at DESC, g.id ASC LIMIT ? OFFSET ?
+      ) p ORDER BY p.last_at DESC, p.id ASC`,
     )
-    .all(limit, offset) as (DeletedNoteRow & { last_at: string })[];
-  const total = (db
-    .prepare(`SELECT COUNT(DISTINCT v.note_id) AS n FROM note_versions v WHERE ${gone}`)
-    .get() as { n: number }).n;
-  return { notes: notes.map(({ last_at: _last, ...row }) => row), total };
+    .all(limit, offset) as (DeletedNoteRow & { total: number })[];
+  let total = rows[0]?.total;
+  if (total === undefined) {
+    // A page past the end has no row to carry the window's count.
+    total = offset === 0 ? 0 : (db
+      .prepare("SELECT COUNT(*) AS n FROM (SELECT 1 FROM note_versions v GROUP BY v.note_id HAVING NOT EXISTS (SELECT 1 FROM notes n WHERE n.id = v.note_id))")
+      .get() as { n: number }).n;
+  }
+  const notes = rows.map(({ total: _t, ...row }) => ({ id: row.id, path: row.path, extension: row.extension, deleted_at: row.deleted_at, versions: row.versions }));
+  return { notes, total };
 }
 export function deletedHistoryStats(db: Database): {
   notes: number;

@@ -161,6 +161,24 @@ describe("erasing takes only an exact id or path (it can't be undone)", () => {
     expect((await versions(id)).body.total).toBeGreaterThanOrEqual(1);
   });
 
+  test("REST DELETE /notes/:id/versions: a path that matches only without case finds nothing to erase", async () => {
+    const id = await noteWithHistory("solo/Versions");
+    expect((await op.del(`/notes/${enc(`${R}/solo/versions`)}/versions`)).status).toBe(404);
+    expect((await versions(id)).body.total).toBeGreaterThanOrEqual(1);
+    expect((await op.del(`/notes/${enc(`${R}/solo/Versions`)}/versions`)).status).toBe(200);
+    expect((await versions(id)).body.total).toBe(0);
+  });
+
+  test("REST: a name that fits two notes is a 409 that says to use the id, and nothing is erased", async () => {
+    const plain = await note(`${R}/Rest.v2`, "made up", [TAG]);
+    const other = await op.post("/notes", { path: `${R}/Rest`, extension: "v2", content: "made up" });
+    const r = await op.del(`/notes/${enc(`${R}/Rest.v2`)}?erase_history=true`);
+    expect(r.status).toBe(409);
+    expect(r.body.message).toMatch(/by its id/);
+    expect((await op.get(`/notes/${plain}`)).status).toBe(200);
+    expect((await op.get(`/notes/${other.body.id}`)).status).toBe(200);
+  });
+
   test("MCP: of two notes whose paths differ only by case, the one named is erased and the other stays", async () => {
     const upper = await noteWithHistory("pair/Today");
     const lower = await noteWithHistory("pair/today");

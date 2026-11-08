@@ -50,7 +50,7 @@ import {
   narrowLinkWarningsForVisibility,
 } from "../core/src/wikilinks.ts";
 import { transactionAsync } from "../core/src/txn.ts";
-import { getNote, getNotes, getNoteTags, getNoteByTitle, toNoteIndex, filterMetadata, mergeMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError, PathConflictError, validatePath, PathValidationError, getVaultMap, isValidIfUpdatedAt, IF_UPDATED_AT_HINT } from "../core/src/notes.ts";
+import { getNote, getNotes, getNoteTags, getNoteByTitle, toNoteIndex, filterMetadata, mergeMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError, PathConflictError, validatePath, PathValidationError, getVaultMap, isValidIfUpdatedAt, IF_UPDATED_AT_HINT, AmbiguousPathError } from "../core/src/notes.ts";
 import { normalizePath } from "../core/src/paths.ts";
 import {
   parseContentRange,
@@ -1385,6 +1385,29 @@ async function resolveNote(
   const byPath = await store.getNoteByPath(idOrPath);
   if (byPath) return byPath;
   return store.db ? getNoteByTitle(store.db, idOrPath) : null;
+}
+
+/**
+ * The note an erase names (T-412): exact only (resolveNoteExact: id, or case-sensitive path), since erasing can't be
+ * undone. A name that fits two notes is a 409 that says how to name one; `{note: null}` is not found. Never the
+ * loose lookup: with no db handle it refuses.
+ */
+function resolveForErase(store: Store, idOrPath: string, visible?: (note: Note) => boolean): { note: Note | null } | Response {
+  if (!store.db) return json({ error: "erasing history needs the vault's database", error_type: "internal_error" }, 500);
+  try {
+    return { note: resolveNoteExact(store.db, idOrPath, visible) };
+  } catch (e) {
+    if (e instanceof AmbiguousPathError) {
+      return json({
+        error: "ambiguous_path",
+        error_type: "ambiguous_path",
+        message: `"${idOrPath}" names more than one note; name the one to erase by its id, or add its .extension`,
+        path: idOrPath,
+        candidates: e.candidates,
+      }, 409);
+    }
+    throw e;
+  }
 }
 
 async function requireNote(store: Store, idOrPath: string): Promise<Note> {
@@ -3006,7 +3029,15 @@ async function handleNotesInner(
   const verMatch = sub.match(/^\/versions\/([^/]+)$/);
   const importMatch = sub.match(/^\/imports\/([^/]+)$/);
   if (sub === "/versions" || verMatch || importMatch || sub === "/restore") {
-    const note = await resolveNote(store, idOrPath, scopeVisible);
+    // Erasing a live note's history takes only an exact id or path (T-412); reading and restoring keep the usual lookup.
+    let note: Note | null;
+    if (sub === "/versions" && method === "DELETE") {
+      const found = resolveForErase(store, idOrPath, scopeVisible);
+      if (found instanceof Response) return found;
+      note = found.note;
+    } else {
+      note = await resolveNote(store, idOrPath, scopeVisible);
+    }
     if (note && !noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
       return json({ error: "Not found", error_type: "not_found" }, 404);
     }
@@ -3641,16 +3672,18 @@ async function handleNotesInner(
       return json({ error: "erase_history must be true or false", error_type: "invalid_request", field: "erase_history" }, 400);
     }
     let note: Note | null;
-    try {
-      if (erase === "true" && !store.db) {
-        // Never erase through the loose lookup (case folding, H1 title): refuse instead.
-        return json({ error: "erase_history needs the vault's database", error_type: "internal_error" }, 500);
+    if (erase === "true") {
+      const found = resolveForErase(store, idOrPath, scopeVisible);
+      if (found instanceof Response) return found;
+      note = found.note;
+    } else {
+      try {
+        note = await resolveNote(store, idOrPath, scopeVisible);
+      } catch (e) {
+        const r = conflictResponse(e);
+        if (r) return r;
+        throw e;
       }
-      note = erase === "true" ? resolveNoteExact(store.db, idOrPath, scopeVisible) : await resolveNote(store, idOrPath, scopeVisible);
-    } catch (e) {
-      const r = conflictResponse(e);
-      if (r) return r;
-      throw e;
     }
     if (!note) return json({ error: "Not found", error_type: "not_found" }, 404);
     // Tag-scope: can't delete what you can't read. 404 (not 403) for the

@@ -2474,7 +2474,12 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             throw structuredError("`ids` must be a non-empty list of note ids or paths", { error_type: "invalid_request", field: "ids" });
           }
           if (params.ids.length > MAX_BATCH_SIZE) throw new BatchTooLargeError(params.ids.length);
-          refs = params.ids.map((v: unknown) => requireNoteReference(v));
+          refs = params.ids.map((v: unknown, i: number) => {
+            if (typeof v !== "string" || v.trim() === "") {
+              throw structuredError(`\`ids[${i}]\` must be a note id or path`, { error_type: "invalid_request", field: "ids" });
+            }
+            return v;
+          });
         } else {
           refs = [requireNoteReference(params.id)];
         }

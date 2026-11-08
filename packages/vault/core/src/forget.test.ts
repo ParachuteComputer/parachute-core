@@ -87,3 +87,19 @@ test("fires the deleted hook once, as a plain delete does, and writes no tombsto
   expect(seen).toEqual([id]);
   expect((db.query("SELECT COUNT(*) AS n FROM note_versions WHERE op = 'delete'").get() as { n: number }).n).toBe(0);
 });
+
+test("the deleted-notes listing pages newest first and counts all of them on every page", async () => {
+  const ids: string[] = [];
+  for (const w of ["kea", "kakapo", "takahe"]) {
+    const id = await longHistory(w, 1);
+    await store.deleteNote(id);
+    ids.push(id);
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  const page1 = await store.listDeletedNotes({ limit: 2 });
+  expect(page1.total).toBe(3);
+  expect(page1.notes.map((n) => n.id)).toEqual([ids[2], ids[1]]);
+  const page2 = await store.listDeletedNotes({ limit: 2, offset: 2 });
+  expect(page2).toMatchObject({ total: 3, notes: [{ id: ids[0], path: "forget/kea", extension: "md" }] });
+  expect((await store.listDeletedNotes({ limit: 2, offset: 9 })).total).toBe(3);
+});
