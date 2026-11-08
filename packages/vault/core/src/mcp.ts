@@ -5,6 +5,8 @@ import { transactionAsync } from "./txn.js";
 import * as noteOps from "./notes.js";
 import { filterMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError, validatePath } from "./notes.js";
 import { normalizePath } from "./paths.js";
+import { isNoteIdShape } from "./ulid.js";
+import { countNoteVersions } from "./history.js";
 import { QueryError } from "./query-operators.js";
 import { TAG_EXPAND_MODES, stripTagHash, suggestSimilarTag, type TagExpandMode } from "./tag-hierarchy.js";
 import {
@@ -597,6 +599,14 @@ export interface GenerateMcpToolsOpts {
    * ABSENT from the list entirely — not merely erroring on call — so an
    * agent is never shown an affordance the runtime can't back.
    */
+  /**
+   * Who may pass `erase_history: true` to `delete-note` (T-412). Erasing history is irreversible and admin-only
+   * (vault#524), and `delete-note` itself is a write tool, so the door says what this session may do. Omitted →
+   * refused with `insufficient_scope` (fail closed). `"visible"`: notes this session can see (a tag-scoped admin).
+   * `"all"`: also a note already deleted that left history (an unscoped admin; a deleted note has no tags left to
+   * check a scope against).
+   */
+  eraseHistory?: "visible" | "all";
   attachmentTickets?: {
     provider: AttachmentTicketProvider;
     /** This vault's own name — stamped onto every minted ticket so the spend route can cheaply reject a cross-vault replay. */
@@ -2414,9 +2424,68 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
     {
       name: "delete-note",
       execute: async (params) => {
-        const note = requireNote(db, requireNoteReference(params.id), resolveVisibility);
-        await store.deleteNote(note.id, { actor: writeActor, via: writeVia });
-        return { deleted: true, id: note.id };
+        // T-412: `ids` deletes a list, `erase_history` also erases every version (no tombstone). Every reference is
+        // resolved before anything is deleted, so a list naming a missing note deletes nothing.
+        const erase = params.erase_history === true;
+        if (params.erase_history !== undefined && params.erase_history !== null && typeof params.erase_history !== "boolean") {
+          throw structuredError("`erase_history` must be a boolean", { error_type: "invalid_request", field: "erase_history" });
+        }
+        const hasList = params.ids !== undefined && params.ids !== null;
+        const hasOne = params.id !== undefined && params.id !== null;
+        if (hasList === hasOne) {
+          throw structuredError(hasList ? "pass `id` or `ids`, not both" : "`id` is required", {
+            error_type: hasList ? "invalid_request" : "missing_required_field",
+            field: "id",
+            hint: "pass the note's id or path (or its unique H1 title), or `ids` (a list) for several",
+          });
+        }
+        if (erase && !opts?.eraseHistory) {
+          throw structuredError("erase_history needs the vault's admin scope: erasing history is irreversible", {
+            error_type: "insufficient_scope",
+            field: "erase_history",
+            required_scope: "vault:admin",
+          });
+        }
+        let refs: string[];
+        if (hasList) {
+          if (!Array.isArray(params.ids) || params.ids.length === 0) {
+            throw structuredError("`ids` must be a non-empty list of note ids or paths", { error_type: "invalid_request", field: "ids" });
+          }
+          if (params.ids.length > MAX_BATCH_SIZE) throw new BatchTooLargeError(params.ids.length);
+          refs = params.ids.map((v: unknown) => requireNoteReference(v));
+        } else {
+          refs = [requireNoteReference(params.id)];
+        }
+        // An id whose note is gone but whose history is left: only an unscoped admin erasing history may name it.
+        const leftover = (ref: string) =>
+          erase && opts?.eraseHistory === "all" && isNoteIdShape(ref) && countNoteVersions(db, ref) > 0;
+        const targets: string[] = [];
+        const missing: string[] = [];
+        for (const ref of refs) {
+          const note = resolveNote(db, ref, resolveVisibility);
+          const id = note ? note.id : leftover(ref) ? ref : null;
+          if (id === null) missing.push(ref);
+          else if (!targets.includes(id)) targets.push(id);
+        }
+        if (missing.length > 0) {
+          throw structuredError(`Note not found: ${missing.map((m) => `"${m}"`).join(", ")}`, {
+            error_type: "not_found",
+            field: hasList ? "ids" : "id",
+            missing,
+          });
+        }
+        const results: Record<string, unknown>[] = [];
+        for (const id of targets) {
+          if (erase) {
+            const r = await store.forgetNote(id, { actor: writeActor, via: writeVia });
+            results.push({ deleted: r.deleted, id, history_erased: { versions_deleted: r.versionsDeleted, blobs_deleted: r.blobsDeleted } });
+          } else {
+            await store.deleteNote(id, { actor: writeActor, via: writeVia });
+            results.push({ deleted: true, id });
+          }
+        }
+        if (!hasList) return results[0]!;
+        return { deleted: results.filter((r) => r.deleted).length, results };
       },
     },
 

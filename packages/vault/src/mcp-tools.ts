@@ -316,6 +316,9 @@ export function generateScopedMcpTools(
     ...(writeContext ? { writeContext } : {}),
     ...(strictBypass ? { strictBypass } : {}),
     ...(onStrictBypass ? { onStrictBypass } : {}),
+    // T-412: delete-note's erase_history is admin-only, like DELETE /notes/:id/versions (vault#524). A scoped admin
+    // erases only notes it can see; only an unscoped one may name a note already deleted.
+    ...(auth && hasScopeForVault(auth.scopes, vaultName, "admin") ? { eraseHistory: scoped ? "visible" as const : "all" as const } : {}),
     attachmentTickets: {
       provider: getSharedAttachmentTicketProvider(),
       vaultName,

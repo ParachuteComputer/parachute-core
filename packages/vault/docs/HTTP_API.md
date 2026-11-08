@@ -81,6 +81,9 @@ Version history is the first self-hosted-first feature tracked in this table.
 | `POST /notes/:id/restore` | honored | not yet | Self-hosted only — hosted door is PR 4 of #524 |
 | `DELETE /notes/:id/versions` | honored | not yet | Self-hosted only — hosted door is PR 4 of #524 |
 | `query-notes versions (MCP)` | honored | not yet | Self-hosted only — hosted door is PR 4 of #524 |
+| `DELETE /notes/:id?erase_history=true` | honored | honored once cloud pins core with T-412 | T-412 |
+| `GET /history/deleted` | honored | honored once cloud pins core with T-412 | T-412 |
+| `delete-note` `ids` / `erase_history` (MCP) | honored | honored once cloud pins core with T-412 | T-412; core's tool, so both doors get it from the pin |
 | `has_broken_links` | honored | honored | [cloud#290](https://github.com/ParachuteComputer/parachute-cloud/pull/290) (B1) |
 | `has_ambiguous_links` | honored | honored | [cloud#290](https://github.com/ParachuteComputer/parachute-cloud/pull/290) (B1) |
 | `include_broken_links` | honored | honored | [cloud#298](https://github.com/ParachuteComputer/parachute-cloud/pull/298) (B7) |
@@ -1531,6 +1534,25 @@ Versions are **not** full-text searchable.
 - `DELETE /vault/{name}/api/notes/{idOrPath}/versions` is **`vault:admin`
   and irreversible**. It returns `{erased:true, id, versions_deleted,
   blobs_deleted}` without deleting a live note.
+- **Deleting and forgetting (T-412).** A plain `DELETE /notes/{idOrPath}`
+  (`vault:write`) keeps a tombstone version, so the note can be restored.
+  `DELETE /vault/{name}/api/notes/{idOrPath}?erase_history=true` is
+  **`vault:admin` and irreversible**: it deletes the note and every version
+  of it in one transaction, writes no tombstone, and returns `{deleted:true,
+  id, history_erased:{versions_deleted, blobs_deleted}}`. `erase_history=false`
+  is a plain delete; any other value is 400 `invalid_request` (and needs admin
+  to get that far). MCP `delete-note` takes the same `erase_history: true`
+  (admin) and `ids: [...]` (up to 500) for a list; every reference is resolved
+  before anything is deleted, so a list naming a missing note deletes nothing.
+  With `erase_history`, an unscoped admin may also name a note already deleted
+  whose history is left; its history is erased and it reports `deleted: false`.
+- `GET /vault/{name}/api/history/deleted?limit=100&offset=0` requires
+  **`vault:admin`** and lists deleted notes that still have history, newest
+  deletion first: `{notes: [{id, path, extension, deleted_at, versions}],
+  total}`. `deleted_at` is null when no tombstone is left. `limit` is at most
+  1000. Tag-scoped callers receive 404, as on `/history/compact`. A deleted
+  note's tombstone and versions are kept until erased, unless the vault sets
+  `history.deleted_retention_days`.
 
 - `POST /vault/{name}/api/history/compact` requires **`vault:admin`** and
   returns a compaction summary, including `remaining_candidates` and

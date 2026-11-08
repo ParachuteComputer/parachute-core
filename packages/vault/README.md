@@ -254,7 +254,7 @@ parachute-vault backup status                  # schedule, last run, destination
 
 ## MCP tools (13 core, + attachments + admin)
 
-**Notes**: `query-notes` (universal read — single by ID/path, filter, search, graph neighborhood), `create-note` (single or batch), `update-note` (single or batch — content, tags, links, metadata), `delete-note`
+**Notes**: `query-notes` (universal read — single by ID/path, filter, search, graph neighborhood), `create-note` (single or batch), `update-note` (single or batch — content, tags, links, metadata), `delete-note` (single or a list; `erase_history` with admin forgets every version)
 **Tags**: `list-tags` (with optional schema detail), `update-tag` (upsert description + schema fields), `delete-tag`, `rename-tag`, `merge-tags`
 **Graph**: `find-path` (BFS between two notes)
 **Vault**: `vault-info` (get/update description + stats)

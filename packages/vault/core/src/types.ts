@@ -7,7 +7,7 @@ import type { ValidationStatus } from "./schema-defaults.js";
 import type { ConformanceReport } from "./conformance.js";
 import type { FindPathResult } from "./links.js";
 import type { DoctorReport, DoctorScanOpts } from "./doctor.js";
-import type { CompactResult, CompactSummary, HistoryOp, VersionRow } from "./history.js";
+import type { CompactResult, CompactSummary, DeletedNoteRow, HistoryOp, VersionRow } from "./history.js";
 
 // ---- Re-exports ----
 
@@ -526,6 +526,14 @@ export interface Store {
   getNoteVersion(id: string, versionIx: number): Promise<(VersionRow & { content: string | null }) | null>;
   restoreNoteVersion(id: string, versionIx: number, opts: { actor?: string | null; via?: string | null; if_updated_at?: string }): Promise<Note>;
   eraseNoteHistory(id: string): Promise<{ versionsDeleted: number; blobsDeleted: number }>;
+  /**
+   * Delete a note and erase every version of it, in one transaction, with no tombstone (T-412). An id whose note is
+   * already deleted has its leftover history erased. `deleted` says whether a note was there to delete. Fires
+   * `deleted` like deleteNote when it was.
+   */
+  forgetNote(id: string, opts?: { actor?: string | null; via?: string | null }): Promise<{ deleted: boolean; versionsDeleted: number; blobsDeleted: number }>;
+  /** Deleted notes that still have history, newest deletion first (T-412). */
+  listDeletedNotes(opts?: { limit?: number; offset?: number }): Promise<{ notes: DeletedNoteRow[]; total: number }>;
   sweepDeletedHistory(): { notesSwept: number; versionsDeleted: number; blobsDeleted: number };
   countNoteVersions(id: string): Promise<number>;
   compactNote(id: string): CompactResult;

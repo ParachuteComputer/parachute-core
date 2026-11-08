@@ -3641,6 +3641,16 @@ async function handleNotesInner(
     if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
       return json({ error: "Not found", error_type: "not_found" }, 404);
     }
+    // T-412: `?erase_history=true` also erases every version (no tombstone). routing.ts has already required admin
+    // for any value but false.
+    const erase = url.searchParams.get("erase_history");
+    if (erase !== null && erase !== "true" && erase !== "false") {
+      return json({ error: "erase_history must be true or false", error_type: "invalid_request", field: "erase_history" }, 400);
+    }
+    if (erase === "true") {
+      const r = await store.forgetNote(note.id, { actor: writeCtx.actor, via: writeCtx.via });
+      return json({ deleted: true, id: note.id, history_erased: { versions_deleted: r.versionsDeleted, blobs_deleted: r.blobsDeleted } });
+    }
     await store.deleteNote(note.id, { actor: writeCtx.actor, via: writeCtx.via });
     return json({ deleted: true, id: note.id });
   }
@@ -5353,6 +5363,27 @@ function removeWikilinkBrackets(content: string, targetPath: string): string {
   content = content.replace(new RegExp(`\\[\\[${escaped}\\|([^\\]]+)\\]\\]`, "gi"), "$1");
   content = content.replace(new RegExp(`\\[\\[${escaped}(#[^\\]]+)?\\]\\]`, "gi"), `${targetPath}$1`);
   return content;
+}
+
+/**
+ * GET /api/history/deleted — deleted notes that still have history, newest deletion first (T-412). Unscoped
+ * administrators: a deleted note has no tags left to check a tag scope against, so a scoped pass gets the same 404
+ * as /history/compact. `limit` (default 100, max 1000) and `offset`.
+ */
+export async function handleDeletedNotes(req: Request, store: Store, tagScope: TagScopeCtx = NO_TAG_SCOPE): Promise<Response> {
+  if (tagScope.raw !== null) return json({ error: "Not found", error_type: "not_found" }, 404);
+  const url = new URL(req.url);
+  const num = (name: string, dflt: number) => {
+    const raw = url.searchParams.get(name);
+    if (raw === null) return dflt;
+    return /^\d+$/.test(raw) ? Number(raw) : NaN;
+  };
+  const limit = num("limit", 100);
+  const offset = num("offset", 0);
+  if (!Number.isSafeInteger(limit) || !Number.isSafeInteger(offset) || limit > 1000) {
+    return json({ error: "limit (0-1000) and offset must be whole numbers", error_type: "invalid_request" }, 400);
+  }
+  return json(await store.listDeletedNotes({ limit, offset }));
 }
 
 /** POST /api/history/compact — unscoped administrators; absent bounds are unbounded. */
