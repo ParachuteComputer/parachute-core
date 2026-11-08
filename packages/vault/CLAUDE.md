@@ -74,7 +74,7 @@ one-command setup; one Bun server (port 1940) hosts many vaults, each its own SQ
   every migration, writing one index row per note). So a change to `SCHEMA_SQL` or a migration reaches existing
   vaults only with a `SCHEMA_VERSION` bump. A bump makes older programs refuse the vault (`NewerSchemaError`); for
   something additive an older program can still open (an index), skip the bump and add a cheap check to the fast
-  path instead, as `ensurePathNocaseIndex` does. `core/src/row-costs.test.ts` pins `SCHEMA_SQL`'s hash to the
+  path instead, as `ensurePathNocaseIndex` does. `core/src/row-costs.test.ts` pins the hashes of `SCHEMA_SQL` and of `initSchema`'s code to the
   version, so the choice can't be skipped by accident.
 - **BYO GitHub App for the mirror backup flow**: `PARACHUTE_GITHUB_CLIENT_ID` +
   `PARACHUTE_GITHUB_APP_SLUG` must be set both-or-neither and name the SAME GitHub App —

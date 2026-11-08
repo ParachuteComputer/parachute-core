@@ -444,8 +444,8 @@ export function eraseNoteVersions(
       const row = baseOf.get(hash) as { delta_of: string | null } | null;
       if (!row) continue;
       drop.run(hash, hash, hash);
-      // Counted by looking, not by `.changes`: under Bun 1.4 a DELETE that removed nothing can report the previous
-      // statement's count, which overstated blobs_deleted.
+      // Counted by looking, not by `.changes`: under Bun 1.4 this DELETE, when it removed nothing, reported the
+      // previous statement's count, which overstated blobs_deleted.
       if (baseOf.get(hash)) continue;
       blobsDeleted++;
       if (row.delta_of) next.add(row.delta_of);

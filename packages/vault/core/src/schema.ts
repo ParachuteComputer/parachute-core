@@ -653,7 +653,12 @@ export function initSchema(db: Database): void {
   // last, so an open that stopped part way runs everything again. The path index is checked too because it came
   // without a version bump (see ensurePathNocaseIndex): an engine of the same SCHEMA_VERSION from before it, or a
   // rollback to one, stamps the vault current without making it.
-  if (latestStamp(db) === SCHEMA_VERSION && hasIndex(db, "idx_notes_path_nocase")) return;
+  if (latestStamp(db) === SCHEMA_VERSION && hasIndex(db, "idx_notes_path_nocase")) {
+    // Still heal declared indexed fields (a column or index missing after a restore): a few catalog reads, no
+    // writes when nothing is missing.
+    rebuildIndexes(db);
+    return;
+  }
 
   // Check if we need to migrate from v2
   const hasOldTables = hasTable(db, "things");
@@ -2120,7 +2125,7 @@ function migrateToV31(db: Database): void {
 }
 
 function hasIndex(db: Database, name: string): boolean {
-  return db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?").get(name) !== null;
+  return !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?").get(name);
 }
 
 /**

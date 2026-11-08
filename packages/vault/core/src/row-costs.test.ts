@@ -60,6 +60,18 @@ describe("a wake on a vault at this schema", () => {
     db.close();
   });
 
+  test("still heals a declared indexed field whose index went missing", async () => {
+    let db = new Database(file);
+    const store = new SqliteStore(db);
+    await store.upsertTagRecord("thing", { fields: { level: { type: "integer", indexed: true } } } as any);
+    db.exec("DROP INDEX idx_meta_level");
+    db.close();
+    db = new Database(file);
+    new SqliteStore(db);
+    expect(db.query("SELECT name FROM sqlite_master WHERE name = 'idx_meta_level'").get()).toBeTruthy();
+    db.close();
+  });
+
   test("keeps notes whose paths differ only by extension or by case", async () => {
     // Both are allowed (v18's unique index is on (path, extension), case-sensitive). v5's every-boot dedupe,
     // GROUP BY path COLLATE NOCASE, renamed the second of each pair to `<path>-1` on the next open.
@@ -163,6 +175,9 @@ describe("v5 and v18 against each state of the path indexes", () => {
 /** sha256 of SCHEMA_SQL as of SCHEMA_VERSION 32 with T-412 (idx_notes_path left out of it). */
 const SCHEMA_SQL_HASH_AT_32 = "7825b5218ba5e1cfb5e7a86c8b1cd8655ac59458104175f946d741da0e5fcaf7";
 
+/** sha256 of initSchema's code (comments and spacing left out) as of SCHEMA_VERSION 32 with T-412. */
+const INIT_SCHEMA_HASH_AT_32 = "12514042dd6126cd039151fa33d00bc0d6ca3305ce0496fd22b020994cbb8fd4";
+
 describe("the fast path's promise", () => {
   // initSchema skips SCHEMA_SQL and every migration on a vault stamped SCHEMA_VERSION (with the path index). So a
   // change to SCHEMA_SQL that doesn't bump SCHEMA_VERSION would reach only new vaults, silently. If this fails: bump
@@ -171,6 +186,15 @@ describe("the fast path's promise", () => {
   test("SCHEMA_SQL is the one SCHEMA_VERSION 32 was stamped with", () => {
     const hash = new Bun.CryptoHasher("sha256").update(SCHEMA_SQL).digest("hex");
     expect({ version: SCHEMA_VERSION, hash }).toEqual({ version: 32, hash: SCHEMA_SQL_HASH_AT_32 });
+  });
+
+  // The same promise for the steps initSchema runs: a migration or every-open step added without a bump (as
+  // t318-09/types-tags adds ensureTagKinds) never runs on a vault the fast path skips. Comments are left out of the
+  // hash; any change to the calls or to the fast path's condition shows here.
+  test("initSchema's steps are the ones SCHEMA_VERSION 32 was stamped with", () => {
+    const code = initSchema.toString().replace(/\/\/[^\n]*/g, "").replace(/\s+/g, " ");
+    const hash = new Bun.CryptoHasher("sha256").update(code).digest("hex");
+    expect({ version: SCHEMA_VERSION, hash }).toEqual({ version: 32, hash: INIT_SCHEMA_HASH_AT_32 });
   });
 });
 

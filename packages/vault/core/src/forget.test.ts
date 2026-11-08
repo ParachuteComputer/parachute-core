@@ -33,9 +33,11 @@ test("removes the note, its versions and every blob only it used, deltas include
   expect((db.query("SELECT COUNT(*) AS n FROM note_blobs WHERE delta_of IS NOT NULL").get() as { n: number }).n).toBeGreaterThan(0);
   expect(blobsHolding("zebrafinch")).toBeGreaterThan(0);
 
+  const versionsBefore = await store.countNoteVersions(id);
+  expect(versionsBefore).toBeGreaterThanOrEqual(14);
   const r = await store.forgetNote(id);
   expect(r.deleted).toBe(true);
-  expect(r.versionsDeleted).toBeGreaterThanOrEqual(14);
+  expect(r.versionsDeleted).toBe(versionsBefore);
   expect(await store.getNote(id)).toBeNull();
   expect(await store.countNoteVersions(id)).toBe(0);
   expect(blobCount()).toBe(0);

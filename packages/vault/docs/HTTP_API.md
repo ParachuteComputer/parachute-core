@@ -1550,7 +1550,11 @@ Versions are **not** full-text searchable.
   **`vault:admin`** and lists deleted notes that still have history, newest
   deletion first: `{notes: [{id, path, extension, deleted_at, versions}],
   total}`. `deleted_at` is null when no tombstone is left. `limit` is at most
-  1000. Tag-scoped callers receive 404, as on `/history/compact`. A deleted
+  1000. Erase a listed note's history with `DELETE /notes/{id}/versions` or
+  MCP `delete-note` with `erase_history` (`DELETE /notes/{id}?erase_history=true`
+  needs a live note). Erasing takes only an exact id or case-sensitive path,
+  and reaches the vault's own history only: a git mirror, an export or a
+  backup keeps its own copy. Tag-scoped callers receive 404, as on `/history/compact`. A deleted
   note's tombstone and versions are kept until erased, unless the vault sets
   `history.deleted_retention_days`.
 
