@@ -5,7 +5,7 @@
  * Covers the query engine (`store.queryNotes` → `expandQueryTags` →
  * `_tagsExpanded`) and the mode-aware core helpers
  * (`getTagExpansion`/`getTagNamespace`). REST + MCP + SSE parity are exercised
- * in their own suites (`routes`/`mcp` here, `subscribe`/`live-match` in src/).
+ * in their own suites (`routes`/`mcp` here, `subscribe` in src/, `live-match` here).
  *
  * The corpus deliberately separates the two axes so a mode that confuses them
  * fails loudly:

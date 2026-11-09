@@ -3,7 +3,7 @@
 // Before the fix the engine bound every bare value as text (JSON.stringify), and json_extract gives a number for a
 // JSON true or 4, so these filters returned no notes and no error, indexed or not, on REST and MCP. Fixed in
 // packages/vault (core/src/query-operators.ts buildPlainEqualityClause, src/routes.ts bracket shorthand,
-// src/live-match.ts for a live subscription). Mutants "bare-equality-text-only", "bare-bracket-text-only" and
+// core/src/live-match.ts for a live subscription). Mutants "bare-equality-text-only", "bare-bracket-text-only" and
 // "live-bare-truthy" put each back.
 //
 // The notes are made so a sloppy fix shows: `one` holds a 1 where `yes` holds a true, and the other way round, so

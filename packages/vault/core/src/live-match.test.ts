@@ -9,9 +9,9 @@
 
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import { Database } from "bun:sqlite";
-import { SqliteStore } from "../core/src/store.ts";
-import { generateMcpTools } from "../core/src/mcp.ts";
-import type { QueryOpts } from "../core/src/types.ts";
+import { SqliteStore } from "./store.ts";
+import { generateMcpTools } from "./mcp.ts";
+import type { QueryOpts } from "./types.ts";
 import { buildLiveMatcher } from "./live-match.ts";
 
 /**
