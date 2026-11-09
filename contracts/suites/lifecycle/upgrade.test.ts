@@ -4,7 +4,8 @@
 // The home is made by the real 0.8 (pins.json previous_core, `bun run build:previous`): a vault, a tag with fields,
 // made-up notes and a minted key. Then the candidate:
 //   - its first command backs the databases up, outside the home, before it opens them, and only once;
-//   - it serves the home: 0.8's key still reads, the tag with fields is a type, `keys list` names 0.8's key;
+//   - it serves the home: 0.8's key still reads, the tag with fields is a type (the `kind` column added even
+//     though 0.8 left the vault current by its own schema stamp), `keys list` names 0.8's key;
 //   - `upgrade --rollback` refuses while anything holds the data (exit 7); stopped, it is code-only: 0.9's step
 //     moved no schema number, so nothing on disk changes, and 0.8 serves every 0.9 write. 0.9 then picks up what
 //     0.8 wrote meanwhile (and backs up again first);
@@ -116,6 +117,15 @@ beforeAll(async () => {
     await box.stop();
   }
   expect(existsSync(join(m.home, "run", "release.json"))).toBe(false);
+  // The vault as 0.8 leaves it once it has served: current by 0.8's own lights (its schema stamp, T-412's path
+  // index), so 0.9's first open takes the "already current" path. A 0.8 from before T-412 left no such index and hid
+  // the kind bug (audit L2-01).
+  const eight = new Database(vaultDb(), { readonly: true });
+  const cols = (eight.query("PRAGMA table_info(tags)").all() as { name: string }[]).map((c) => c.name);
+  const nocase = eight.query("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_notes_path_nocase'").get();
+  eight.close();
+  must(nocase !== null, "setup: the 0.8 build left no idx_notes_path_nocase; previous_core must be a 0.8 with T-412");
+  expect(cols).not.toContain("kind");
 }, 240_000);
 
 afterAll(async () => {
@@ -152,6 +162,10 @@ describe("lifecycle/upgrade", () => {
   test("0.9 serves the 0.8 home: 0.8's key reads, a tag with fields is a type, 0.9 writes; rollback waits for it to stop", async () => {
     const box = await serve(info.bin, "0.9 serve");
     try {
+      // 0.9 gave the vault 0.8 made its `kind` column (one additive ALTER, no schema number).
+      const db = new Database(vaultDb(), { readonly: true });
+      expect((db.query("PRAGMA table_info(tags)").all() as { name: string }[]).map((c) => c.name)).toContain("kind");
+      db.close();
       expect((await api(writer).get(`/notes/${ids.plan}`)).body).toMatchObject({ types: ["project"] });
       expect((await api(writer).get(`/notes/${ids.label}`)).body).toMatchObject({ types: [], tags: ["pinned"] });
       const made = await core(["keys", "new", "nine-writer", "--vault", vault, "--can", "write"]);
@@ -177,7 +191,7 @@ describe("lifecycle/upgrade", () => {
     try {
       expect((await api(writer).get(`/notes/${ids.nine}`)).body?.content).toBe("Written under 0.9 with a key made by keys new.");
       expect((await api(nine).get(`/notes/${ids.plan}`)).status).toBe(200); // a 0.9 key is a token 0.8 verifies
-      await post(writer, "eight", "Written under 0.8 after the rollback.", ["project"]);
+      await post(writer, "eight", "Written under 0.8 after the rollback.", ["project", "eight-label"]);
       await mintWith(prevBin, "after-rollback", "read");
     } finally {
       await box.stop();
@@ -188,7 +202,17 @@ describe("lifecycle/upgrade", () => {
     expect(JSON.parse(again.stdout).map((k: any) => k.name)).toEqual(expect.arrayContaining(["old-writer", "nine-writer", "after-rollback"]));
     expect(backups().length).toBe(2); // forward again, backed up again
     expect(release()).toMatchObject({ previous: "0.8", state: "current" });
-  }, 240_000);
+
+    // 0.9 again reads what 0.8 wrote meanwhile: a type stays a type, a label 0.8 made is a tag.
+    const back = await serve(info.bin, "0.9 serve after 0.8's writes");
+    try {
+      expect((await api(writer).get(`/notes/${ids.eight}`)).body).toMatchObject({ types: ["project"], tags: expect.arrayContaining(["eight-label"]) });
+      const listed = await api(writer).get(`/notes?tag=project`);
+      expect(listed.status).toBe(200);
+    } finally {
+      await back.stop();
+    }
+  }, 300_000);
 
   test("rollback --restore: notes changed since the backup are exported, the backup's databases go back, and 0.8 serves them", async () => {
     const box = await serve(info.bin, "0.9 serve");

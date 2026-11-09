@@ -1,4 +1,4 @@
-// `bun run build:previous`: the release before this one (pins.json `previous_core`: 0.8, main at ccc7729), built the
+// `bun run build:previous`: the release before this one (pins.json `previous_core`: the 0.8 that 0.9 upgrades from), built the
 // way its own commit builds a candidate, for lifecycle/upgrade (the 0.8 → 0.9 step on a home, and its rollback).
 //
 //   bun run build:previous [--out <dir>]     default .cache/candidate-previous; CI passes PREVIOUS_CORE_DIR to the run

@@ -667,6 +667,21 @@ function latestStamp(db: Database): number | null {
   return row?.version ?? null;
 }
 
+/**
+ * Whether every step initSchema runs without a schema number is already done. Such a step is additive, so an
+ * older engine of the same SCHEMA_VERSION still opens the vault and a rollback stays code-only; but that older
+ * engine also stamps the vault current, so the fast path must look for the step's own mark. The rule: **every
+ * un-numbered step in initSchema has its check here.** Missing one breaks every vault an older engine opened last
+ * (audit L2-01: 0.8 stamps 32 with the path index, 0.9's `kind` column came after, and every type lookup then
+ * failed with "no such column: t.kind"). Each check is one catalog read, no writes.
+ */
+export function unnumberedStepsDone(db: Database): boolean {
+  return (
+    hasIndex(db, "idx_notes_path_nocase") && // ensurePathNocaseIndex (T-412)
+    hasColumn(db, "tags", "kind") // ensureTagKinds (T-318 §8a, 0.9)
+  );
+}
+
 export function initSchema(db: Database): void {
   // Before anything writes: an older vault must never half-migrate, or re-stamp, a newer database.
   assertNotNewer(db);
@@ -675,10 +690,10 @@ export function initSchema(db: Database): void {
   // A vault this code already brought to SCHEMA_VERSION needs nothing more. Every step below is meant to be
   // idempotent, but running them all on each open is not free: on cloud every Durable Object wake did it, reading
   // the vault several times over and (through v5) writing one index row per note (T-412). The stamp is written
-  // last, so an open that stopped part way runs everything again. The path index is checked too because it came
-  // without a version bump (see ensurePathNocaseIndex): an engine of the same SCHEMA_VERSION from before it, or a
-  // rollback to one, stamps the vault current without making it.
-  if (latestStamp(db) === SCHEMA_VERSION && hasIndex(db, "idx_notes_path_nocase")) {
+  // last, so an open that stopped part way runs everything again. The steps that came without a version bump are
+  // checked too (unnumberedStepsDone): an engine of the same SCHEMA_VERSION from before one of them, or a rollback
+  // to one, stamps the vault current without making it.
+  if (latestStamp(db) === SCHEMA_VERSION && unnumberedStepsDone(db)) {
     // Still heal declared indexed fields (a column or index missing after a restore): a few catalog reads, no
     // writes when nothing is missing.
     rebuildIndexes(db);
@@ -821,8 +836,10 @@ export function initSchema(db: Database): void {
   migrateToV30(db);
   migrateToV31(db);
   migrateToV32(db);
+  // Steps with no version bump. Each has its check in unnumberedStepsDone, or the fast path skips it.
+  // Types and tags: the `kind` column and a kind for every row (T-318 §8a).
   ensureTagKinds(db);
-  // A case-insensitive path index for the `path = ? COLLATE NOCASE` lookups (T-412). Not a version bump.
+  // A case-insensitive path index for the `path = ? COLLATE NOCASE` lookups (T-412).
   ensurePathNocaseIndex(db);
 
   // Rebuild any generated columns + indexes declared in indexed_fields.
