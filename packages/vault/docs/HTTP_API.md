@@ -410,6 +410,11 @@ Warning codes today:
   `search=` (the mode only shapes how `search` text becomes an FTS5 query).
   Carries `param`. Structured-query only (by construction — this fires
   precisely because `search=` was absent).
+- `truncated` (contracts-brief V1.3) — the page came back full (`limit`
+  rows) without `cursor=` or `offset=`, so there may be more. Carries
+  `limit`. Structured-query only. For a tag-scoped token it is decided on
+  the page the token gets back, after the scope filter (T-419): hidden notes
+  matching the filter never cause it.
 - `search_did_you_mean` (vault#551 WS2B, schema v25) — `search=` returned
   ZERO results and a spelling suggestion cleared the similarity bar
   (edit-distance against the FTS5 vocabulary + tag names). Carries `query`
@@ -641,6 +646,8 @@ actually affected by the bug — only the message string could double.
 |---|---|---|---|
 | `invalid_audio_retention` | 400 | `field`, `got`, `hint` | `config.audio_retention` isn't one of `keep`, `until_transcribed`, `never`. |
 | `invalid_auto_transcribe` | 400 | `field`, `got`, `hint` | `config.auto_transcribe.enabled` isn't a boolean. |
+| `insufficient_scope` | 403 | `required_scope: "vault:admin"`, `granted_scopes` | The body carries `description` (any value, `null` included) and the token lacks admin for this vault. |
+| `tag_scope_violation` | 403 | `scoped_tags` | The token is tag-scoped. Description and config are vault-wide, so a tag-scoped token can't PATCH here at any verb. |
 
 ### Storage upload/serve
 
@@ -807,7 +814,10 @@ Vault metadata for every vault on the server.
 
 #### `GET /vault/{name}` — `vault:<name>:read`
 Single-vault landing payload — name, description, createdAt, and stats in
-one round trip.
+one round trip. A token for this vault with no vault verb gets `403
+insufficient_scope` (`required_scope: "vault:read"`); before T-419 it got the
+payload. A tag-scoped token's `stats` count only the notes it can see (see
+`GET /api/vault` below).
 
 ```json
 {
@@ -2371,11 +2381,29 @@ posture as `GET /tags` and `GET /vault/{name}/api/find-path`.
 `?include_stats=true` folds the same `VaultStats` shape into the response
 under `stats` — the deeper aggregate (monthly distribution, earliest/latest
 note, content bytes, top 20 tags). `map` is always present and cheaper;
-reach for `include_stats` only when you need those extras.
+reach for `include_stats` only when you need those extras. For a tag-scoped
+token, `stats` covers the same notes as `map`: every count, `topTags` (only
+in-scope tags) and `earliestNote`/`latestNote` come from notes reachable
+through an in-scope tag and not hidden by a private tag (T-419; before, stats
+stayed vault-wide and named hidden tags and note ids). The same holds for the
+bare vault root, `/.parachute/usage` counts, MCP `vault-info`
+`include_stats` and the counts line of the MCP connect-time instructions.
 
-#### `PATCH /vault/{name}/api/vault` — `vault:write`
+#### `PATCH /vault/{name}/api/vault` — `vault:write` for `config`, `vault:admin` for `description`
 Update the description and/or nested `config` fields. Only the fields you
 pass are changed; omitted fields are left alone.
+
+- A body carrying `description` (any value, `null` included) needs
+  `vault:admin`, the same rule as MCP `vault-info`: the description is the
+  text every MCP `initialize` hands every AI connection, so editing it is
+  curation. A write token gets `403 insufficient_scope` with
+  `required_scope: "vault:admin"` and nothing in the body is applied.
+- A body with only `config` needs `vault:write` (the Notes app sets
+  `config.audio_retention` with a read+write token).
+- A tag-scoped token gets `403 tag_scope_violation` at any verb: description
+  and config are vault-wide.
+
+(T-419, audit L3-01: before, any write token could set the description.)
 
 ```json
 {
@@ -2408,6 +2436,13 @@ before this setting existed read back as `"keep"`.
 The mirror endpoints expose the persistent `mirror:` block in
 `config.yaml` and the in-process watch lifecycle — shipped in 0.4.7-rc.1
 (vault#346 follow-up).
+
+Every `/.parachute/mirror[/…]` route (config, `run-now`, `push-now`,
+`history`, `import`, `auth`) needs admin with no tag restriction: a
+tag-scoped admin token gets `403 tag_scope_violation` (T-419), since these
+routes export, replace or describe the whole vault. `/api/triggers[/…]` is
+refused the same way (a trigger fires on any matching note, hidden ones
+included).
 
 #### `GET /vault/{name}/.parachute/mirror` — `vault:<name>:admin`
 Returns the current persisted config + runtime status:

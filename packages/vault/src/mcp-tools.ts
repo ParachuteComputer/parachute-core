@@ -98,8 +98,8 @@ function filterProjectionByScope(
  * tags + descendants before rendering — symmetric with the JSON
  * `vault-info` wrapper, so a tag-scoped token never learns about
  * out-of-scope tags via the connect-time brief either. Aggregate counts
- * stay vault-wide (pre-existing behaviour) EXCEPT that notes hidden by a
- * private tag are subtracted, and `map` is scope-restricted (vault#766).
+ * (the stats line and `map`) cover only the notes the token can see: reachable
+ * through an in-scope tag and not hidden by a private tag (vault#766, T-419).
  *
  * Async because expanding the tag-scope allowlist hits the store's
  * hierarchy resolver. Returns the orientation block even when the vault
@@ -1059,6 +1059,14 @@ function overrideVaultInfo(
       if (!auth || !hasScopeForVault(auth.scopes, vaultName, "admin")) {
         throw new Error(
           `Forbidden: updating the vault description requires the 'vault:admin' scope (or 'vault:${vaultName}:admin'). Granted scopes: ${auth?.scopes.join(" ") || "(none)"}.`,
+        );
+      }
+      // T-419 (audit L3-01): the description is vault-wide (every AI
+      // connection's `initialize` carries it), so a tag-scoped admin session
+      // can't set it either. Same refusal as REST PATCH /api/vault.
+      if (auth.scoped_tags !== null) {
+        throw new Error(
+          `Forbidden: this token is restricted to tags: ${auth.scoped_tags.join(", ")}. The vault description is vault-wide and needs a token with no tag restriction.`,
         );
       }
       // vault#669: runtime type guard — the `as string` cast below was a

@@ -159,20 +159,20 @@ export function deniedTagNamesInUse(store: Store, allowed: Set<string> | null): 
 }
 
 /**
- * The `getVaultStats` filter for a scoped caller. `stats` has always been a
- * vault-wide aggregate for scoped tokens (pre-#271 behaviour, unchanged
- * here); vault#766 only subtracts the notes a private tag hides from this
- * caller. Returns `undefined` (plain vault-wide stats) when unscoped or when
- * nothing is private; an all-zero filter when the scope failed closed.
+ * The `getVaultStats` filter for a scoped caller: the same visible set as
+ * `map` (`scopedCountFilter`), so every figure counts only notes reachable
+ * through an in-scope tag and not hidden by a private tag, `topTags` names
+ * only in-scope tags, and `earliestNote`/`latestNote` are visible notes.
+ * T-419 (audit L3-10 #5): stats used to stay vault-wide for a scoped token
+ * (minus private tags only), which named hidden tags and note ids. Returns
+ * `undefined` (plain vault-wide stats) only when unscoped.
  */
 export function scopedStatsFilter(
   store: Store,
   allowed: Set<string> | null,
 ): { tagFilter?: string[]; excludeTags?: string[] } | undefined {
   if (!allowed) return undefined;
-  if (scopeDeniesAll(allowed)) return { tagFilter: [] };
-  const excludeTags = deniedTagNamesInUse(store, allowed);
-  return excludeTags.length > 0 ? { excludeTags } : undefined;
+  return scopedCountFilter(store, allowed);
 }
 
 /**
@@ -801,6 +801,24 @@ export function scrubParentCycleError(
   if (err.cycle.every((t) => allowed.has(t))) return err;
   const scrubbedCycle = err.cycle.map((t) => (allowed.has(t) ? t : OUT_OF_SCOPE_LABEL));
   return new ParentCycleError(err.tag, scrubbedCycle);
+}
+
+/**
+ * 403 for a tag-scoped token on a vault-wide surface (T-419, audit L3-01 and
+ * L3-10 #4): the vault's description and config, triggers, and the mirror and
+ * import routes act on every note, not on a tag, so a scoped token can't use
+ * them at any verb. Same envelope as `tagScopeForbidden`.
+ */
+export function tagScopedVaultWideForbidden(scoped_tags: string[]): Response {
+  return Response.json(
+    {
+      error: "Forbidden",
+      error_type: "tag_scope_violation",
+      message: `This token is restricted to tags: ${scoped_tags.join(", ")}. This endpoint acts on the whole vault and needs a token with no tag restriction.`,
+      scoped_tags,
+    },
+    { status: 403 },
+  );
 }
 
 /**

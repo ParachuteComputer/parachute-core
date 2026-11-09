@@ -2188,18 +2188,6 @@ async function handleNotesInner(
         }
         throw e;
       }
-      // Truncation-honesty (vault contracts-brief V1.3): captured BEFORE
-      // tag-scope filtering, which can only shrink the set further —
-      // this reflects whether the underlying store query actually hit its
-      // `limit` (i.e. there may be more rows the caller never saw). Cursor
-      // mode is exempt — it already carries `next_cursor` as the honest
-      // "more may follow" signal, so a second warning would be redundant.
-      // Explicit offset is also exempt (vault#601): the caller is already
-      // paging, not hitting an accidental full default page.
-      if (!cursorMode && queryOpts.offset === undefined && results.length === queryOpts.limit) {
-        queryWarnings.push(truncatedResultsWarning(queryOpts.limit));
-      }
-
       // Tag-scope: drop any result outside the allowlist before shaping
       // output. Same semantics as the search path — empty result is 200 [],
       // not 403.
@@ -2230,6 +2218,19 @@ async function handleNotesInner(
         parseBoolOrUndef(parseQuery(url, "has_links")),
         ambiguityVisibilityFor(db, tagScope),
       );
+
+      // Truncation-honesty (vault contracts-brief V1.3): the page the caller
+      // gets back is full, so there may be more rows. Decided AFTER the
+      // tag-scope narrowing above (T-419, audit L3-10 #2): decided before it,
+      // a scoped reader's empty page still carried the warning whenever
+      // hidden notes matched, a yes/no oracle on any filter. Unscoped, the
+      // narrowing is a no-op, so nothing changes there. Cursor mode is exempt
+      // — it already carries `next_cursor` as the honest "more may follow"
+      // signal. Explicit offset is also exempt (vault#601): the caller is
+      // already paging, not hitting an accidental full default page.
+      if (!cursorMode && queryOpts.offset === undefined && results.length === queryOpts.limit) {
+        queryWarnings.push(truncatedResultsWarning(queryOpts.limit));
+      }
 
       const includeContent = parseBool(parseQuery(url, "include_content"), false);
       const contentRange = parseContentRangeQuery(url, includeContent);
@@ -4420,7 +4421,7 @@ export async function handleVault(
         ? getVaultMap(store.db)
         : getVaultMap(store.db, scopedCountFilter(store, tagScope.allowed));
     if (parseBool(parseQuery(url, "include_stats"), false)) {
-      // vault#766: subtract notes a private tag hides from a scoped caller.
+      // A scoped caller's stats count only the notes it can see (vault#766, T-419).
       result.stats = await store.getVaultStats(
         tagScope.raw === null ? undefined : scopedStatsFilter(store, tagScope.allowed),
       );

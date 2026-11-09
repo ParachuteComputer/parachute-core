@@ -33,6 +33,7 @@ import { registerVaultTrigger } from "./triggers.ts";
 import { SUPPORTED_OPS } from "../core/src/query-operators.ts";
 import { hasScopeForVault, SCOPE_ADMIN } from "./scopes.ts";
 import type { AuthResult } from "./auth.ts";
+import { tagScopedVaultWideForbidden } from "./tag-scope.ts";
 
 // ---------------------------------------------------------------------------
 // Live registry of unregister-fns, keyed by `${vault}${name}` (SPACE
@@ -272,6 +273,11 @@ export async function handleTriggers(
       { status: 403 },
     );
   }
+
+  // A tag-scoped admin token can't manage triggers (T-419, audit L3-10 #4): a
+  // trigger fires on any note matching its `when`, hidden ones included, and a
+  // webhook trigger sends that note out and can write the reply back into it.
+  if (auth.scoped_tags !== null) return tagScopedVaultWideForbidden(auth.scoped_tags);
 
   const itemName = subPath.startsWith("/") ? decodeURIComponent(subPath.slice(1)) : "";
 
