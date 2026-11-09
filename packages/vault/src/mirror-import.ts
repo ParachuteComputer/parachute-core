@@ -18,7 +18,7 @@
  *   - Creates a temp dir (`os.tmpdir() + /parachute-import-<rand>`).
  *   - Resolves the authed clone URL (stored credentials, supplied per-call
  *     PAT, or none).
- *   - Shells `git clone --depth 1 --progress <authedUrl> <tempDir>` with
+ *   - Shells `git clone --depth 1 --progress -- <authedUrl> <tempDir>` with
  *     `GIT_TERMINAL_PROMPT=0` so bad credentials fail fast rather than
  *     blocking on a stdin prompt. Bounded by a STALL timeout (no progress
  *     output for 10 min), not a wall-clock one — see `cloneTimeoutMs`.
@@ -305,6 +305,45 @@ export class CloneFailedError extends Error {
 // ---------------------------------------------------------------------------
 
 /**
+ * Why `remoteUrl` can't be imported from, or `null` when it can (T-419, audit
+ * L3-02). Import is a vault-admin action over HTTP, and an admin is not the box
+ * owner, so the clone may only reach a remote git host:
+ *
+ *   - `https://host/...` — the common case (GitHub, GitLab, a forge).
+ *   - `ssh://[user@]host/...` and scp-style `user@host:path`.
+ *
+ * Everything else is refused: a local path or `file://` (it cloned ANOTHER
+ * vault's mirror off the same disk), `http://`, `git://`, `ext::` (runs a
+ * command), any `<transport>::` form, and anything that starts with `-` (git
+ * would read it as an option). A host or user that starts with `-` is refused
+ * too (ssh would read it as an option). The box owner importing a local export
+ * at the shell uses `parachute vault import <dir>`, which never comes here.
+ */
+export function importRemoteUrlProblem(remoteUrl: string): string | null {
+  const httpsOrSsh = "Use an https:// or ssh clone URL (https://host/owner/repo.git, git@host:owner/repo.git).";
+  if (remoteUrl.length === 0) return `remote_url is empty. ${httpsOrSsh}`;
+  if (remoteUrl.startsWith("-")) return `remote_url can't start with "-". ${httpsOrSsh}`;
+  // Whitespace and control characters have no place in a clone URL.
+  if (/[\s\x00-\x1f\x7f]/.test(remoteUrl)) return `remote_url has whitespace or control characters. ${httpsOrSsh}`;
+  // scp-style ssh: `user@host:path`. The user and host must not start with `-`.
+  const scp = remoteUrl.match(/^([A-Za-z0-9_][A-Za-z0-9._-]*)@([A-Za-z0-9][A-Za-z0-9.-]*):(.+)$/);
+  if (scp) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(remoteUrl);
+  } catch {
+    return `remote_url is not a URL. ${httpsOrSsh}`;
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "ssh:") {
+    return `remote_url uses ${parsed.protocol.replace(/:$/, "")}://, which import doesn't take. ${httpsOrSsh}`;
+  }
+  if (parsed.hostname.length === 0 || /^(-|%2d)/i.test(parsed.hostname) || /^(-|%2d)/i.test(parsed.username)) {
+    return `remote_url needs a host name (and no "-" at the start of the host or user). ${httpsOrSsh}`;
+  }
+  return null;
+}
+
+/**
  * Build the URL we hand to `git clone`. Behavior depends on `auth`:
  *
  *   - `pat` → embed `x-access-token:<TOKEN>` userinfo if the URL doesn't
@@ -317,43 +356,26 @@ export class CloneFailedError extends Error {
  *     (vault#399) — `vaultName` is required for this auth kind.
  *   - `none` → return the URL verbatim.
  *
- * Returns `null` when the URL is unparseable (caller surfaces a 400).
+ * Returns `null` when the URL is unparseable or not one import takes
+ * ({@link importRemoteUrlProblem}; caller surfaces a 400).
  */
 export function authedCloneUrl(
   remoteUrl: string,
   auth: ImportAuth,
   vaultName: string,
 ): { authedUrl: string; appliedAuth: "stored_oauth" | "stored_pat" | "per_call_pat" | "none" } | null {
-  // Local-path / SSH-shorthand pass-through. Git accepts three URL shapes:
-  //   - HTTPS/HTTP — what we embed auth into below.
-  //   - SSH (`git@host:owner/repo`) — relies on ssh-agent, no userinfo
-  //     slot. We pass verbatim.
-  //   - Local path (`/abs/path` or `./rel/path`) or `file://` — used by
-  //     local-disk mirrors + E2E tests. Pass verbatim; no auth to embed.
-  // The naive `new URL(...)` call below would reject all three of these
-  // pre-validation (local paths don't have a scheme), so detect them
-  // first.
-  if (remoteUrl.startsWith("/") || remoteUrl.startsWith("./") || remoteUrl.startsWith("../")) {
-    return { authedUrl: remoteUrl, appliedAuth: "none" };
-  }
-  if (remoteUrl.startsWith("file://")) {
-    return { authedUrl: remoteUrl, appliedAuth: "none" };
-  }
-  // SSH shorthand: `git@host:owner/repo.git`. Pattern: `<user>@<host>:<path>`.
-  // Doesn't parse as a URL — detect by the colon-after-host shape.
-  if (/^[A-Za-z0-9_-]+@[A-Za-z0-9.-]+:[^/]/.test(remoteUrl)) {
-    return { authedUrl: remoteUrl, appliedAuth: "none" };
-  }
-
+  // Only https:// and ssh reach a clone (T-419): a local path, file://,
+  // git://, ext:: or a leading "-" is refused here as well as at the route.
+  if (importRemoteUrlProblem(remoteUrl) !== null) return null;
+  // SSH (`git@host:owner/repo`, `ssh://...`) relies on ssh-agent and has no
+  // userinfo slot for a token: pass verbatim. Only https gets auth embedded.
   let parsed: URL;
   try {
     parsed = new URL(remoteUrl);
   } catch {
-    return null;
+    return { authedUrl: remoteUrl, appliedAuth: "none" }; // scp-style ssh
   }
-  // Only http/https get userinfo treatment. SSH URLs (`ssh://git@host/...`),
-  // git://, etc., parse as URLs but we don't try to embed creds in them.
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+  if (parsed.protocol !== "https:") {
     return { authedUrl: remoteUrl, appliedAuth: "none" };
   }
 
@@ -582,7 +604,8 @@ export async function cloneAndImport(opts: ImportOpts): Promise<ImportResult> {
   if (!authResult) {
     inFlight.delete(opts.vaultName);
     throw new CloneFailedError(
-      `remote_url is not a valid URL: "${redactRemoteUrl(opts.remoteUrl)}"`,
+      `remote_url is not one import takes: "${redactRemoteUrl(opts.remoteUrl)}". ` +
+        (importRemoteUrlProblem(opts.remoteUrl) ?? "It doesn't parse as a URL."),
     );
   }
   const { authedUrl } = authResult;
@@ -595,7 +618,8 @@ export async function cloneAndImport(opts: ImportOpts): Promise<ImportResult> {
       // pipe, not a tty. Without it git stays silent, the stall timer has
       // nothing to observe, and the operator watches a spinner with no
       // information for the length of a multi-GB transfer.
-      ["git", "clone", "--depth", "1", "--progress", authedUrl, tempDir],
+      // `--` so nothing after it is read as an option (T-419).
+      ["git", "clone", "--depth", "1", "--progress", "--", authedUrl, tempDir],
       {
         timeoutMs: cloneTimeoutMs,
         stallTimeoutMs: cloneStallTimeoutMs,
@@ -624,6 +648,10 @@ export async function cloneAndImport(opts: ImportOpts): Promise<ImportResult> {
     if (!existsSync(join(tempDir, ".parachute", "vault.yaml"))) {
       throw new NotAVaultExportError();
     }
+    // The import never needs git's own folder, and `.git/config` holds the
+    // authed clone URL (a stored OAuth token or PAT). Delete it so no read
+    // path the cloned repo can steer, a symlink say, can reach it (T-419).
+    rmSync(join(tempDir, ".git"), { recursive: true, force: true });
 
     // Delegate to the importer. `blowAway: true` for replace mode triggers
     // the wipe-then-import path (deletes notes via the public store API

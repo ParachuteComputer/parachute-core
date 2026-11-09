@@ -77,7 +77,7 @@
  * See vault#308.
  */
 
-import { readdirSync, readFileSync, realpathSync, statSync, mkdirSync, writeFileSync, copyFileSync, existsSync, rmSync, openSync, readSync, closeSync } from "fs";
+import { readdirSync, readFileSync, realpathSync, statSync, lstatSync, mkdirSync, writeFileSync, copyFileSync, existsSync, rmSync, openSync, readSync, closeSync } from "fs";
 import { basename, join, relative, extname, dirname, posix, resolve as resolvePath, sep as pathSep } from "path";
 import type { Store, Note, Link, Attachment } from "./types.js";
 import type { TagRecord } from "./tag-schemas.js";
@@ -2156,70 +2156,92 @@ export interface ImportSource {
 
 /**
  * Filesystem `ImportSource` — reads an `exportVaultToDir` output directory.
- * Owns the read-side path-traversal guards (refuse to follow a symlink out
- * of the sidecar, refuse an attachment whose source escapes the attachments
- * root or whose dest escapes assetsDir) so the engine consumes clean data.
+ * Owns the read-side path-traversal guards so the engine consumes clean data.
+ *
+ * The export dir may be a git clone of someone else's repo (mirror import),
+ * and a repo can carry symlinks. `path.resolve` doesn't follow links, so a
+ * link pointing out of the clone (`note.md -> ~/.ssh/id_ed25519`, a folder
+ * link, a sidecar or attachment link) passed the old check and pulled a
+ * server file into a note body or the vault's assets (T-419, audit L3-02).
+ * Every read now goes through {@link FsImportSource.fileIn}: the file's REAL
+ * path (`realpathSync`, every link resolved) must be a regular file inside
+ * the folder it belongs to (the export root for content,
+ * `.parachute/attachments` for an attachment, the sidecar folder for a
+ * sidecar), separator-aware, and that folder must be at its own place with no
+ * link on the way to it. Per folder, not just "in the clone": the clone holds
+ * `.git/config`, and that carries the clone URL with any stored token in it
+ * (mirror import also deletes the clone's `.git` before importing). The
+ * content walk also doesn't step into linked folders at all.
  */
 export class FsImportSource implements ImportSource {
   readonly attachmentsEnabled: boolean;
   private readonly inDir: string;
-  private readonly inDirResolved: string;
+  private readonly inDirReal: string;
   private readonly sidecar: string;
   private readonly assetsDirResolved?: string;
 
   constructor(opts: { inDir: string; assetsDir?: string }) {
     this.inDir = opts.inDir;
-    this.inDirResolved = resolvePath(opts.inDir);
+    // The root itself may sit under a link (macOS `/tmp` → `/private/tmp`).
+    this.inDirReal = realpathSync(opts.inDir);
     this.sidecar = join(opts.inDir, SIDECAR_DIR);
     if (opts.assetsDir) this.assetsDirResolved = resolvePath(opts.assetsDir);
     this.attachmentsEnabled = !!opts.assetsDir;
   }
 
-  readSchemaFiles(): Array<{ name: string; text: string }> {
-    const dir = join(this.sidecar, "schemas");
+  /** The real path of `path` when it is a regular file inside `dir`, after
+   *  resolving every symlink on the way; else `null`. `dir` (one of the
+   *  export's own folders) must really be where it is named, not a link to
+   *  some other folder of the clone (`.parachute/attachments -> ..` would let
+   *  an attachment id name `.git`). */
+  private fileIn(path: string, dir: string): string | null {
+    let real: string;
+    let dirReal: string;
+    try {
+      dirReal = realpathSync(dir);
+      real = realpathSync(path);
+      if (!statSync(real).isFile()) return null;
+    } catch {
+      return null;
+    }
+    if (dirReal !== join(this.inDirReal, relative(this.inDir, dir))) return null;
+    return isWithinDir(real, dirReal) ? real : null;
+  }
+
+  private readSidecarYamls(dir: string): Array<{ name: string; text: string }> {
     if (!existsSync(dir)) return [];
-    const dirResolved = resolvePath(dir);
     const out: Array<{ name: string; text: string }> = [];
     for (const entry of readdirSync(dir)) {
       if (!entry.endsWith(".yaml")) continue;
-      const fullPath = join(dir, entry);
-      // Path-traversal guard on the read side: refuse to follow a symlink
-      // out of the sidecar (readdirSync only surfaces names — belt-and-
-      // suspenders).
-      if (!isWithinDir(resolvePath(fullPath), dirResolved)) continue;
-      out.push({ name: entry, text: readFileSync(fullPath, "utf-8") });
+      const real = this.fileIn(join(dir, entry), dir);
+      if (real === null) continue; // a link out of the export, or not a file
+      out.push({ name: entry, text: readFileSync(real, "utf-8") });
     }
     return out;
   }
 
+  readSchemaFiles(): Array<{ name: string; text: string }> {
+    return this.readSidecarYamls(join(this.sidecar, "schemas"));
+  }
+
   readNotesMetaFiles(): string[] {
-    const dir = join(this.sidecar, NOTES_META_DIR);
-    if (!existsSync(dir)) return [];
-    const dirResolved = resolvePath(dir);
-    const out: string[] = [];
-    for (const entry of readdirSync(dir)) {
-      if (!entry.endsWith(".yaml")) continue;
-      if (entry.startsWith(".")) continue;
-      const fullPath = join(dir, entry);
-      if (!isWithinDir(resolvePath(fullPath), dirResolved)) continue;
-      out.push(readFileSync(fullPath, "utf-8"));
-    }
-    return out;
+    return this.readSidecarYamls(join(this.sidecar, NOTES_META_DIR))
+      .filter((f) => !f.name.startsWith("."))
+      .map((f) => f.text);
   }
 
   listContentFiles(): string[] {
     const out: string[] = [];
-    for (const filePath of walkContentFiles(this.inDir)) {
-      // Containment check — walkContentFiles should already be safe, but
-      // verify the resolved path is inside inDir (symlinks).
-      if (!isWithinDir(resolvePath(filePath), this.inDirResolved)) continue;
+    for (const filePath of walkContentFiles(this.inDir, { skipSymlinks: true })) {
       out.push(relative(this.inDir, filePath).split(pathSep).join("/"));
     }
     return out;
   }
 
   readContentFile(relPath: string): string {
-    return readFileSync(join(this.inDir, relPath), "utf-8");
+    const real = this.fileIn(join(this.inDir, relPath), this.inDir);
+    if (real === null) throw new Error(`"${relPath}" is not a file inside the export (a symlink out of it?)`);
+    return readFileSync(real, "utf-8");
   }
 
   restoreAttachment(srcRelPath: string, destRelPath: string): SinkWriteResult {
@@ -2228,8 +2250,11 @@ export class FsImportSource implements ImportSource {
     if (!isWithinDir(srcResolved, attachmentsRootResolved)) {
       return { ok: false, reason: `path-traversal on source: "${srcResolved}" escapes attachments root` };
     }
-    if (!existsSync(srcResolved)) {
-      return { ok: false, reason: `source attachment file missing at "${srcResolved}"` };
+    // One answer for missing and linked-away alike, so the warning can't tell
+    // an importer whether some path exists on this server.
+    const srcReal = this.fileIn(srcResolved, attachmentsRootResolved);
+    if (srcReal === null) {
+      return { ok: false, reason: `source attachment "${srcRelPath}" is missing, or not a file inside the export's attachments (a symlink out of them?)` };
     }
     // attachmentsEnabled guarantees assetsDirResolved is set.
     const assetsDirResolved = this.assetsDirResolved!;
@@ -2238,7 +2263,7 @@ export class FsImportSource implements ImportSource {
       return { ok: false, reason: `path-traversal on dest: "${destResolved}" escapes assetsDir` };
     }
     mkdirSync(dirname(destResolved), { recursive: true });
-    copyFileSync(srcResolved, destResolved);
+    copyFileSync(srcReal, destResolved);
     return { ok: true };
   }
 }
@@ -3355,15 +3380,21 @@ export function walkMarkdownFiles(dir: string): string[] {
  * `.parachute/` is reached separately by the importer. Files with no
  * extension are skipped (no way to tell what they are; vault doesn't
  * write extensionless notes by design).
+ *
+ * `skipSymlinks` (the importer): a symlinked file or folder is not listed
+ * or entered, so a link in a cloned repo can't lead the walk off-tree
+ * (T-419). The exporter's orphan prune walks without it and guards each
+ * removal with `realpathSync` instead.
  */
-export function walkContentFiles(dir: string): string[] {
+export function walkContentFiles(dir: string, opts: { skipSymlinks?: boolean } = {}): string[] {
   const results: string[] = [];
+  const statOf = opts.skipSymlinks ? lstatSync : statSync;
   function walk(current: string) {
     for (const entry of readdirSync(current)) {
       if (entry.startsWith(".")) continue;
       if (entry === "node_modules") continue;
       const full = join(current, entry);
-      const stat = statSync(full);
+      const stat = statOf(full);
       if (stat.isDirectory()) walk(full);
       else if (stat.isFile() && extname(entry).length > 0) results.push(full);
     }
