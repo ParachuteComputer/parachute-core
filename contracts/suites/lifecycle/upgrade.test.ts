@@ -13,9 +13,10 @@
 //   - a home 0.9 made has no earlier release: no backup, nothing to roll back.
 //   - while 0.8's server holds the home, a 0.9 command (even `parachute-vault --help`) refuses with 7, taking no
 //     backup and writing no record, and doesn't refresh a stray record either (T-418, the 11-05 record); a command
-//     that only drives the server (`status`, `restart`) goes on without a step;
+//     that only drives the unit (`stop`, `restart`) goes on without a step and writes nothing of 0.9's;
 //   - a record whose backup is gone is not trusted: the home is backed up again first, without waiting on a running
-//     0.9 command, and a rollback won't use that later copy (T-418).
+//     0.9 command, and a rollback won't use that later copy (T-418);
+//   - a home an older release took over is never taken for one 0.9 made, whatever a stray 0.9 command added (T-418).
 // Each machine has its own network (the box holds 1940; _takeover-lib.ts). Red on 0.8 (no release record, no
 // rollback); green from 0.9's release.ts.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
@@ -145,11 +146,17 @@ describe("lifecycle/upgrade", () => {
       expect(existsSync(join(m.home, "run", "release.json"))).toBe(false);
       expect(backups()).toEqual([]);
 
-      // A command that only drives the server goes on (0.8 says to upgrade with `parachute restart`), taking no step.
+      // A command that only drives the unit goes on (0.8 says to upgrade with `parachute restart`), taking no step.
+      // `status` opens hub.db (0.9 would add its keys table under 0.8), so it is refused like any other command.
+      const stop = await run(info.bin, ["stop"]);
+      expect({ code: stop.code === 7 ? 7 : "not 7", refused: stop.stderr.includes("took no backup") }).toEqual({ code: "not 7", refused: false });
       const status = await run(info.bin, ["status"]);
-      expect({ code: status.code === 7 ? 7 : "not 7", refused: status.stderr.includes("took no backup") }).toEqual({ code: "not 7", refused: false });
+      expect(status.code).toBe(7);
       expect(existsSync(join(m.home, "run", "release.json"))).toBe(false);
       expect(backups()).toEqual([]);
+      const hub = new Database(join(m.home, "hub.db"), { readonly: true });
+      expect(hub.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'keys'").get()).toBeNull(); // nothing of 0.9's
+      hub.close();
 
       // The 11-05 record itself, with its backup cleaned away: 0.9 must not refresh it under 0.8's server.
       const stray = { version: release0x(), previous: "0.8", since: new Date().toISOString(), backup: join(dirname(m.home), "parachute-upgrade", "gone"), state: "current" };
@@ -346,6 +353,24 @@ describe("lifecycle/upgrade", () => {
     const rb = await cli(home, ["upgrade", "--rollback"]);
     expect(rb.code).toBe(1);
     expect(rb.stderr).toContain("was taken again on");
+  }, 120_000);
+
+  test("a home an older release took over, which a stray 0.9 command touched, still gets its backup (T-418)", async () => {
+    // Uni's box: 0.8's takeover moved it from 0.7 (takeover.json names 0.8), the 11-05 command opened it with 0.9
+    // code, and the record it wrote was then moved aside by hand. 0.9's structures are in the databases now, but the
+    // home is 0.8's: the real upgrade must back it up and name 0.8, not take it for a home 0.9 made.
+    const home = await homeBy08("up-touched", ["goodv"]);
+    // The stray commands: one opens hub.db (keys), one opens the vault (its tags' kind).
+    must((await cli(home, ["user", "list"])).code === 0, "setup: the stray 0.9 hub command");
+    must((await cli(home, ["export", join(dirname(home), "stray-export"), "--vault", "goodv"], { vault: true, env: { EMBEDDINGS_ENABLED: "false" } })).code === 0, "setup: the stray 0.9 vault command");
+    renameSync(join(home, "run", "release.json"), join(home, "run", "release.json.wrong-record"));
+    writeFileSync(join(home, "takeover.json"), JSON.stringify({ state: "taken-over", version: "0.8.0-pre.1", at: "2026-10-29T18:00:00.000Z", home, backup: join(dirname(home), "parachute-takeover", "made-up"), rollback: "code-only", migrations: [], paused: [], core_unit: null, issuer: "http://127.0.0.1:1939" }));
+    const before = readdirSync(join(dirname(home), "parachute-upgrade")).length;
+    const r = await cli(home, ["user", "list"]);
+    expect(r.code).toBe(0);
+    expect(r.stderr).toContain("0.8 → ");
+    expect(readdirSync(join(dirname(home), "parachute-upgrade")).length).toBe(before + 1);
+    expect(JSON.parse(readFileSync(join(home, "run", "release.json"), "utf8"))).toMatchObject({ previous: "0.8", state: "current" });
   }, 120_000);
 
   test("a home 0.9 made has no earlier release: no backup, nothing to roll back", async () => {

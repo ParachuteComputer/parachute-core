@@ -205,7 +205,7 @@ function recheckOrStop(recheck: Recheck): void {
 /** Options for a command's release step. */
 export interface BeforeOpenOpts {
   /**
-   * A command that only drives the running server (start, stop, restart, status, logs): while another process holds
+   * A command that only drives the running server (start, stop or restart with no module named): while another process holds
    * the home it takes no step and goes on, so `parachute restart` after installing a new release still works (0.8's
    * own upgrade advice). The serve it starts takes the step, once the old server has let go.
    */
@@ -320,7 +320,6 @@ function beforeOpenLocked(home: string, say: (s: string) => void, opts: BeforeOp
     throw new Exit(EXIT.failed, `a restore on this home was interrupted; what ${was.version} left is in ${was.moved_aside}. Run \`parachute upgrade --rollback --restore --yes\` again to finish it.`);
   }
   if (serveRefusal(home) !== null) return "old-owner";
-  if (servedElsewhere(home, was, opts)) return "served";
   const since = new Date().toISOString();
   let dbs = databases(home, { hub: 0, vault: 0 });
   // A database that can't be read can't be backed up or judged: it is named, left out of the backup, and left alone
@@ -339,7 +338,15 @@ function beforeOpenLocked(home: string, say: (s: string) => void, opts: BeforeOp
   // Before 0.9 nothing wrote this record. A home with data and no record was last served by 0.8 (a 0.7 home is the
   // takeover's until it has moved), unless 0.9 made it: a command that created the home found nothing to record
   // before it ran, and left 0.9's own structures (the hub's keys table, the tags' kind column) behind.
-  if (!was && madeByThisLine(home, dbs)) {
+  // A home an older release's takeover moved is never "made by this line", whatever a stray command of this release
+  // added to it (T-418: the 11-05 command opened such a home; its record was then moved aside by hand).
+  const tk = readJson(join(home, RECORD_FILE));
+  const olderTakeover = typeof tk?.version === "string" && tk.version !== core.version;
+  // Nothing is recorded while something else holds the data (T-418), except the record of this release's own
+  // takeover: the takeover command still holds the data when it starts the new unit, whose serve writes it below.
+  const ownTakeover = !was && tk?.state === "taken-over" && tk.version === core.version;
+  if (!ownTakeover && servedElsewhere(home, was, opts)) return "served";
+  if (!was && !olderTakeover && madeByThisLine(home, dbs)) {
     const r: Release = { version: core.version, previous: null, since, backup: null, state: "current" };
     writeRelease(home, r);
     return r;

@@ -38,7 +38,7 @@ home with data:
    2026-11-05 a 0.9 `parachute-vault --help`, run with no `PARACHUTE_HOME` on a box whose 0.8 unit served
    `~/.parachute`, recorded 0.9 as current there while 0.8 kept serving; a real 0.9 start would then have skipped
    its backup. Stop the serving release (its unit, or `parachute stop`) to move the home, or run the command with
-   the release that serves it. `parachute start`, `stop`, `restart`, `status` and `logs` only drive the server, so
+   the release that serves it. `parachute start`, `stop` and `restart` with no module named only drive the unit, so
    they go on without a step (0.8 says to upgrade with "install, then `parachute restart`"); the serve they start
    takes the step once the old server has let go.
 5. **A record is trusted only with its backup.** Each later command checks that the backup the record names still
@@ -49,7 +49,9 @@ home with data:
    command says so and goes on; the next one tries again.
 
 It leaves alone:
-- a home 0.9 itself made (it already carries 0.9's structures);
+- a home 0.9 itself made (it already carries 0.9's structures), unless an older release's takeover moved it
+  (`takeover.json` names that release): then 0.9's structures are a stray command's, and the home still gets its
+  backup (T-418);
 - a host's embedded home (Prism's contract v1: the host keeps its own backups);
 - a home the old 0.7 programs still own (the takeover's job);
 - a home this release's own takeover just moved from 0.7 (`via: "takeover"`; `takeover --rollback` goes back).
