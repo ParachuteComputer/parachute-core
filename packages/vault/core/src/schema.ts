@@ -26,9 +26,11 @@ function migrateToV32(db: Database): void {
  * column is additive and older code names the columns it writes, so a 0.7 or
  * 0.8 vault opens this file unchanged. The 0.8 takeover then opens a home with
  * no migration, and its code-only rollback still works (contracts:
- * lifecycle/takeover). Run at every open, idempotently: the column if missing,
- * then a kind for every row that has none (rows an older vault added in between
- * included). No membership moves; note_tags is untouched.
+ * lifecycle/takeover). Run on every full open (not the fast path: a vault
+ * already current, its column there, writes nothing), idempotently: the column
+ * if missing, then a kind for every row that has none. Rows an older vault adds
+ * in between are read by the same rule (tag-kind.ts KIND_SQL) until a full open
+ * records them. No membership moves; note_tags is untouched.
  */
 function ensureTagKinds(db: Database): void {
   const added = !hasColumn(db, "tags", "kind");

@@ -42,13 +42,24 @@ describe("every tag record gets a kind (an additive column, no schema number)", 
     db.close();
   });
 
-  test("an older program that gives a recorded tag fields makes it read as a type, and the next open records it", async () => {
+  // An open of a vault already current writes nothing (T-412's fast path, initSchema), so what an older program
+  // wrote in between is read by the rule (KIND_SQL) on every open, and recorded on the next full migration run.
+  const stampOneBack = (db: Database) => {
+    db.exec("DELETE FROM schema_version");
+    db.prepare("INSERT INTO schema_version (version, applied_at) VALUES (?, ?)").run(SCHEMA_VERSION - 1, "2026-01-01T00:00:00.000Z");
+  };
+
+  test("an older program that gives a recorded tag fields makes it read as a type on every open; a full run records it", async () => {
     const { db, store } = fresh();
     await store.createNote("x", { tags: ["label"] });
+    stampOneBack(db);
     initSchema(db);
     expect((db.prepare("SELECT kind FROM tags WHERE name = 'label'").get() as { kind: string }).kind).toBe("tag");
     db.prepare(`UPDATE tags SET fields = '{"a":{"type":"string"}}' WHERE name = 'label'`).run(); // as a 0.8 vault would
     expect(tagKinds(db).get("label")).toBe("type");
+    initSchema(db); // current: the fast path, no write
+    expect(tagKinds(db).get("label")).toBe("type");
+    stampOneBack(db);
     initSchema(db);
     expect((db.prepare("SELECT kind FROM tags WHERE name = 'label'").get() as { kind: string }).kind).toBe("type");
     db.close();
@@ -62,7 +73,11 @@ describe("every tag record gets a kind (an additive column, no schema number)", 
     db.prepare("INSERT INTO tags (name, description, fields, relationships, parent_names, created_at, updated_at) VALUES ('older', NULL, '{\"a\":{\"type\":\"string\"}}', NULL, NULL, 'x', 'x')").run();
     db.prepare("INSERT OR IGNORE INTO tags (name) VALUES ('label')").run();
     expect(tagKinds(db).get("older")).toBe("type"); // read by the rule while unrecorded
-    initSchema(db); // the next open records it
+    initSchema(db); // an open of a current vault writes nothing; the rule still reads them right
+    expect(tagKinds(db).get("older")).toBe("type");
+    expect(tagKinds(db).get("label")).toBe("tag");
+    stampOneBack(db);
+    initSchema(db); // a full run records them
     expect(db.prepare("SELECT name, kind FROM tags WHERE name IN ('older', 'label') ORDER BY name").all()).toEqual([
       { name: "label", kind: "tag" },
       { name: "older", kind: "type" },
