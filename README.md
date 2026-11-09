@@ -34,7 +34,7 @@ say what that program must do, written so they ran against **today's** code firs
 ## Install
 
 v0.8 is in prerelease. **npm** (needs Bun 1.4+): `npm i -g @openparachute/core@next` or
-`bun add -g @openparachute/core@next`. **The bundle** (its own Bun, nothing else needed): download
+`bun add -g @openparachute/core@next`. 0.9's prereleases go to `@beta` until 0.9 has been tried (RELEASING.md). **The bundle** (its own Bun, nothing else needed): download
 `parachute-core-<version>-<platform>.tar.gz` and `SHA256SUMS` from a
 [release](https://github.com/ParachuteComputer/parachute-core/releases), check, unpack, and run
 `bin/parachute install` (it links `parachute` and `parachute-core` into `~/.local/share/parachute-core/bin`).

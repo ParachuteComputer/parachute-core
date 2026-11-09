@@ -15,8 +15,13 @@ The npm name `parachute` belongs to someone else, so the package stays `@openpar
 | Version | npm dist-tag | Published |
 |---|---|---|
 | `0.8.0-dev.N` | none | never (not a release) |
-| `0.8.0-pre.N` | `next` | on its own, when the merge that brings that version reaches `main` |
-| `0.8.0` | `latest` | only after an approval on the GitHub environment `npm-latest` (below) |
+| `0.8.0-pre.N` (the line `next` serves) | `next` | when the merge that brings that version reaches `main`, after an approval on the GitHub environment `npm-prerelease` (below) |
+| `0.9.0-pre.N` (a later line) | `beta` | the same way. The one-liner and every installed box follow `next`, so a new line is tried on `beta` first (ROADMAP "Channel first") |
+| `0.8.0` | `latest` | only after an approval on the GitHub environment `npm-latest` (below), and only for the line `next` serves |
+
+Which line `next` serves is `NEXT_SERVES` in `scripts/release-plan.ts` (today `0.8`). Moving it (to `0.9`, once 0.9
+has been through beta, uni and cloud: ROADMAP's pacing rule) is its own PR, merged before the stable of that line;
+`plan` refuses a stable of a line `next` doesn't serve yet. After it moves, the next `0.9.0-pre.N` goes to `next`.
 
 **A merge to `main` that changes the version is the release.** `.github/workflows/release.yml` runs on it:
 
@@ -28,8 +33,10 @@ The npm name `parachute` belongs to someone else, so the package stays `@openpar
 2. `build` builds the linux-x64 bundle, packs the npm package from it, and tests that `.tgz` the way the contracts
    job `npm` does: `npm i -g` and `bun add -g` into scratch prefixes, then Benjamin's suite on the npm install (0
    FAIL). That `.tgz` is the one published, checked by its sha256.
-3. `publish-next` (a prerelease) or `publish-latest` (a stable, after approval) runs
-   `npm publish package.tgz --tag <next|latest> --access public --provenance`. No token: npm trusted publishing
+3. `publish-prerelease` (a prerelease, after approval on `npm-prerelease`) or `publish-latest` (a stable, after
+   approval on `npm-latest`) first checks that its environment has a required reviewer (GitHub makes a named
+   environment nobody set up, with no rules, which would hold nothing), then runs
+   `npm publish package.tgz --tag <next|beta|latest> --access public --provenance`. No token: npm trusted publishing
    (OIDC). Provenance is added because the repository is public.
 4. `tag-record` tags `v<version>` (kept if the GitHub pre-release already made it).
 
@@ -40,14 +47,15 @@ CI green, merged. All four carry core's version because the hub and the vault re
 misses one, and `plan` refuses to publish it. They are not published on their own; npm's `@openparachute/hub` and `vault`
 stay at 0.7. To promote: a PR that only drops the suffix (`0.8.0`), merged; then the approval.
 
-## Who approves a `latest`
+## Who approves a release
 
-`publish-latest` runs in the environment `npm-latest`. Its one required reviewer is the GitHub account
-`unforcedagi` (the account Uni works as), and it deploys from `main` only.
+`publish-latest` runs in the environment `npm-latest`, `publish-prerelease` (`next` and `beta`) in `npm-prerelease`.
+Each one's one required reviewer is the GitHub account `unforcedagi` (the account Uni works as), and each deploys
+from `main` only.
 
-**Uni approves only after Aaron taps the approval card.** When a `latest` run waits, Uni posts an approval card to
-Aaron (the version, the prerelease it promotes, the run link). Only after his tap does Uni approve the deployment,
-as `unforcedagi`. Nothing else approves it. "Prevent self-review" is off on purpose: Uni both merges and approves
+**Uni approves only after Aaron taps the approval card.** When a run waits, Uni posts an approval card to Aaron (the
+version, its dist-tag, for a stable the prerelease it promotes, the run link). Only after his tap does Uni approve
+the deployment, as `unforcedagi`. Nothing else approves it. "Prevent self-review" is off on purpose: Uni both merges and approves
 as `unforcedagi`, so the human step is Aaron's tap, not a second GitHub account.
 
 The environment was made with (for the record):
@@ -58,6 +66,17 @@ gh api -X PUT repos/ParachuteComputer/parachute-core/environments/npm-latest --i
  "deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}
 EOF
 gh api -X POST repos/ParachuteComputer/parachute-core/environments/npm-latest/deployment-branch-policies -f name=main -f type=branch
+```
+
+`npm-prerelease` the same way. It is needed before any prerelease publishes; until it exists, `publish-prerelease`
+fails closed. Not made yet (T-421 left it to Aaron or Uni):
+
+```bash
+gh api -X PUT repos/ParachuteComputer/parachute-core/environments/npm-prerelease --input - <<'JSON'
+{"reviewers":[{"type":"User","id":305537573}],"prevent_self_review":false,
+ "deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}
+JSON
+gh api -X POST repos/ParachuteComputer/parachute-core/environments/npm-prerelease/deployment-branch-policies -f name=main -f type=branch
 ```
 
 ## One-time setup (Aaron, on his own machine and npmjs.com)
@@ -88,8 +107,8 @@ trust is set. Until then `plan` skips every merge with that reason.
    - Organization or user: `ParachuteComputer`
    - Repository: `parachute-core`
    - Workflow filename: `release.yml`
-   - Environment name: **leave blank** (one publisher covers both jobs; `publish-next` has no environment, and the
-     `latest` gate is GitHub's `npm-latest` environment)
+   - Environment name: **leave blank** (one publisher covers both publish jobs; their gates are GitHub's
+     `npm-prerelease` and `npm-latest` environments)
    - Allowed actions, if offered: `npm publish` (not `npm dist-tag`)
 
    Save. Or, with npm 11.15+ in a terminal (asks for 2FA once):
@@ -104,7 +123,10 @@ From then on, the next `0.8.0-pre.N` merged to `main` publishes itself to `next`
 
 - `404` / `ENEEDAUTH` on publish: the trusted publisher is missing or doesn't match. Check the three fields above
   exactly (`ParachuteComputer` / `parachute-core` / `release.yml`); a renamed workflow file needs the rule changed.
-- `plan` refused "older than next": two prerelease PRs merged out of order. Bump past the published one, merge again.
+- `plan` refused "older than next" (or beta): two prerelease PRs merged out of order. Bump past the published one,
+  merge again.
+- `plan` refused "next still serves": a stable of a new line before `NEXT_SERVES` moved. Merge that PR first.
+- A publish job failed "has no required reviewer": its environment isn't set up (above). Set it up, then re-run.
 - `plan` skipped "never had this package": the one-time setup hasn't been done.
 
 ## The GitHub pre-release (the bundle)

@@ -2,11 +2,15 @@
 //
 //   bun scripts/release-plan.ts [--package-json <file>] [--registry <file>]   writes version, dist_tag, should_publish to $GITHUB_OUTPUT
 //
-// The pattern is the hub's (parachute-hub scripts/release-plan.ts, decidePublish), cut down to this package's two
+// The pattern is the hub's (parachute-hub scripts/release-plan.ts, decidePublish), cut down to this package's
 // channels:
-//   X.Y.Z-pre.N   dist-tag `next`, published on the merge that brings that version to main
-//   X.Y.Z         dist-tag `latest`, only after an approval on the `npm-latest` environment (release.yml), and only
-//                 as a suffix-drop of an X.Y.Z-pre.N that is already on npm, with nothing changed since but the
+//   X.Y.Z-pre.N   of the line `next` serves (NEXT_SERVES, X.Y): dist-tag `next`; of a later line: dist-tag `beta`.
+//                 The one-liner and every installed box follow `next`, so a new line is tried on `beta` first
+//                 (ROADMAP "Channel first": 0.9.0-pre.* go to beta, never next). Either is published only after an
+//                 approval on the `npm-prerelease` environment (release.yml).
+//   X.Y.Z         dist-tag `latest`, only after an approval on the `npm-latest` environment (release.yml), only for
+//                 the line `next` serves (moving `next` to a new line is its own PR, which changes NEXT_SERVES), and
+//                 only as a suffix-drop of an X.Y.Z-pre.N that is already on npm, with nothing changed since but the
 //                 release notes and the `"version"` lines of the manifests that carry core's version and bun.lock
 //   anything else (0.8.0-dev.0) is not a release and never publishes.
 //
@@ -21,7 +25,24 @@
 //   - a stable that skipped its prerelease, or carries new code past it.
 import { appendFileSync, readFileSync } from "node:fs";
 
-export type Channel = "next" | "latest";
+export type Channel = "next" | "beta" | "latest";
+
+/**
+ * The line (X.Y) whose prereleases go to `next`, the channel the one-liner and every installed box follow. A
+ * prerelease of a later line goes to `beta`. Moving it is the decision to offer that line to everyone on `next`
+ * (ROADMAP pacing: beta, then uni, then cloud, then latest and next), made in its own PR.
+ */
+export const NEXT_SERVES = "0.8";
+
+/** X.Y of a version. */
+function lineOf(version: string): string {
+  return version.split(".").slice(0, 2).join(".");
+}
+
+/** <0, 0, >0 for two X.Y lines. */
+function compareLines(a: string, b: string): number {
+  return compareVersions(`${a}.0`, `${b}.0`);
+}
 
 export type Decision = { publish: true; reason: string } | { publish: false; reason: string } | { refuse: true; reason: string };
 
@@ -32,9 +53,9 @@ export interface Registry {
   distTags: Record<string, string>;
 }
 
-/** `next` for X.Y.Z-pre.N, `latest` for X.Y.Z, null for anything else. */
-export function channelFor(version: string): Channel | null {
-  if (/^\d+\.\d+\.\d+-pre\.\d+$/.test(version)) return "next";
+/** `next` for X.Y.Z-pre.N of the line `next` serves, `beta` for one of a later line, `latest` for X.Y.Z, null for anything else. */
+export function channelFor(version: string, nextServes: string = NEXT_SERVES): Channel | null {
+  if (/^\d+\.\d+\.\d+-pre\.\d+$/.test(version)) return compareLines(lineOf(version), nextServes) > 0 ? "beta" : "next";
   if (/^\d+\.\d+\.\d+$/.test(version)) return "latest";
   return null;
 }
@@ -58,7 +79,7 @@ export function compareVersions(a: string, b: string): number {
 /** The X.Y.Z-pre.N on npm a stable X.Y.Z would drop the suffix of, newest first. */
 export function prereleasesOf(version: string, published: string[]): string[] {
   const core = version.split("-")[0]!;
-  return published.filter((v) => v.startsWith(`${core}-pre.`) && channelFor(v) === "next").sort(compareVersions).reverse();
+  return published.filter((v) => v.startsWith(`${core}-pre.`) && /^\d+\.\d+\.\d+-pre\.\d+$/.test(v)).sort(compareVersions).reverse();
 }
 
 /** What a stable may change since its prerelease: the notes freely, and in these files only `"version"` lines. */
@@ -88,9 +109,9 @@ export function versionOnlyDiff(diff: string): boolean {
 }
 
 /** The decision for `version`, pushed to `branch`, given what npm has (or `null`: npm couldn't be read). */
-export function decidePublish(version: string, registry: Registry | null, branch: string | undefined): Decision {
-  const channel = channelFor(version);
-  if (!channel) return { publish: false, reason: `${version} is not a release version (X.Y.Z-pre.N for next, X.Y.Z for latest)` };
+export function decidePublish(version: string, registry: Registry | null, branch: string | undefined, nextServes: string = NEXT_SERVES): Decision {
+  const channel = channelFor(version, nextServes);
+  if (!channel) return { publish: false, reason: `${version} is not a release version (X.Y.Z-pre.N for next or beta, X.Y.Z for latest)` };
   if (branch !== "main") return { publish: false, reason: `releases publish from main only (this is ${branch ?? "no branch"})` };
   if (!registry) return { refuse: true, reason: "npm couldn't be read: refusing to guess, since a wrong answer either double-publishes or drops a release" };
   if (registry.versions.includes(version)) return { publish: false, reason: `${version} is already on npm` };
@@ -107,13 +128,17 @@ export function decidePublish(version: string, registry: Registry | null, branch
   if (current && compareVersions(version, current) < 0) {
     return { refuse: true, reason: `${version} is older than ${channel} (${current}): publishing would move ${channel} backwards. Bump past it and merge again.` };
   }
-  // A prerelease of a version that already shipped stable (0.8.0-pre.4 after 0.8.0) would put next below latest.
+  // A prerelease of a version that already shipped stable (0.8.0-pre.4 after 0.8.0) would sit below latest.
   const latest = registry.distTags.latest;
-  if (channel === "next" && latest && channelFor(latest) === "latest" && compareVersions(version, latest) < 0) {
+  if (channel !== "latest" && latest && channelFor(latest, nextServes) === "latest" && compareVersions(version, latest) < 0) {
     return { refuse: true, reason: `${version} is a prerelease of a version older than latest (${latest}): bump to the next version's -pre.1` };
   }
   if (channel === "latest" && prereleasesOf(version, registry.versions).length === 0) {
-    return { refuse: true, reason: `${version} is a stable version but npm has no ${version}-pre.*: a stable drops the suffix of a prerelease that shipped on next first` };
+    return { refuse: true, reason: `${version} is a stable version but npm has no ${version}-pre.*: a stable drops the suffix of a prerelease that shipped on next or beta first` };
+  }
+  // A stable of a line next doesn't serve would leave next (every installed box) a line behind latest.
+  if (channel === "latest" && compareLines(lineOf(version), nextServes) > 0) {
+    return { refuse: true, reason: `${version} is a stable of ${lineOf(version)}, but next still serves ${nextServes} (NEXT_SERVES in scripts/release-plan.ts): moving next to ${lineOf(version)} is its own PR, merged before this one` };
   }
   return { publish: true, reason: `${version} is not on npm yet; it goes to ${channel}` };
 }

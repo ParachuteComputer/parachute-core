@@ -3,14 +3,22 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
-import { VERSION_MANIFESTS, changedPastPrerelease, channelFor, compareVersions, decidePublish, manifestsOffVersion, readRegistry, versionOnlyDiff, type Registry } from "./release-plan.ts";
+import { NEXT_SERVES, VERSION_MANIFESTS, changedPastPrerelease, channelFor, compareVersions, decidePublish, manifestsOffVersion, readRegistry, versionOnlyDiff, type Registry } from "./release-plan.ts";
 
 const npm = (versions: string[], distTags: Record<string, string> = {}): Registry => ({ versions, distTags });
 const published = npm(["0.8.0-pre.1"], { next: "0.8.0-pre.1", latest: "0.8.0-pre.1" });
 
 describe("release plan", () => {
-  test("channels: X.Y.Z-pre.N is next, X.Y.Z is latest, anything else is not a release", () => {
+  test("channels: X.Y.Z-pre.N of the line next serves is next, of a later line beta; X.Y.Z is latest; anything else is not a release", () => {
+    expect(NEXT_SERVES).toBe("0.8");
     expect(channelFor("0.8.0-pre.1")).toBe("next");
+    expect(channelFor("0.8.1-pre.1")).toBe("next");
+    // 0.9 is tried on beta first: the one-liner and every 0.8 box install `next` (ROADMAP "Channel first", L6-04).
+    expect(channelFor("0.9.0-pre.1")).toBe("beta");
+    expect(channelFor("1.0.0-pre.1")).toBe("beta");
+    // The PR that moves next to 0.9 moves NEXT_SERVES with it.
+    expect(channelFor("0.9.0-pre.4", "0.9")).toBe("next");
+    expect(channelFor("0.9.0", "0.8")).toBe("latest");
     expect(channelFor("0.8.0")).toBe("latest");
     for (const v of ["0.8.0-dev.0", "0.8.0-rc.1", "0.8.0-pre", "v0.8.0", "0.8"]) expect({ v, c: channelFor(v) }).toEqual({ v, c: null });
   });
@@ -37,6 +45,22 @@ describe("release plan", () => {
 
   test("a new prerelease on main publishes to next", () => {
     expect(decidePublish("0.8.0-pre.2", published, "main")).toEqual({ publish: true, reason: expect.stringContaining("next") });
+  });
+
+  test("0.9's prerelease (PR #21) publishes to beta and leaves next, which every 0.8 box follows, alone", () => {
+    const today = npm(["0.8.0-pre.1", "0.8.0-pre.2", "0.8.0-pre.3"], { latest: "0.8.0-pre.1", next: "0.8.0-pre.3" });
+    expect(decidePublish("0.9.0-pre.1", today, "main")).toEqual({ publish: true, reason: expect.stringContaining("goes to beta") });
+    // beta never moves backwards either, and a 0.8 prerelease still goes to next beside it
+    const tried = npm([...today.versions, "0.9.0-pre.2"], { ...today.distTags, beta: "0.9.0-pre.2" });
+    expect(decidePublish("0.9.0-pre.1", tried, "main")).toMatchObject({ refuse: true, reason: expect.stringContaining("older than beta") });
+    expect(decidePublish("0.8.0-pre.4", tried, "main")).toEqual({ publish: true, reason: expect.stringContaining("goes to next") });
+  });
+
+  test("a stable of a line next doesn't serve yet refuses: moving next is its own decision", () => {
+    const tried = npm(["0.8.0-pre.3", "0.8.0", "0.9.0-pre.2"], { latest: "0.8.0", next: "0.8.0-pre.3", beta: "0.9.0-pre.2" });
+    expect(decidePublish("0.9.0", tried, "main")).toMatchObject({ refuse: true, reason: expect.stringContaining("NEXT_SERVES") });
+    // its prerelease shipped on beta counts as the one it drops the suffix of
+    expect(decidePublish("0.9.0", tried, "main", "0.9")).toEqual({ publish: true, reason: expect.stringContaining("latest") });
   });
 
   test("a dev version never publishes, and nothing publishes off main", () => {

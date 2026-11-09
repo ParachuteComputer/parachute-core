@@ -1,14 +1,18 @@
 # Release: publish @openparachute/core to npm when a version bump reaches main (RELEASING.md).
 #
-#   plan            scripts/release-plan.ts: is this version new on npm, and which dist-tag. X.Y.Z-pre.N → `next`,
-#                   X.Y.Z → `latest`; anything else (0.8.0-dev.0) never publishes. A package npm has never seen is
-#                   skipped: the first publish is by hand, once (npm trusted publishing can't create a package).
+#   plan            scripts/release-plan.ts: is this version new on npm, and which dist-tag. X.Y.Z-pre.N → `next`
+#                   for the line next serves (NEXT_SERVES), `beta` for a later line (0.9.0-pre.* while next serves
+#                   0.8); X.Y.Z → `latest`; anything else (0.8.0-dev.0) never publishes. A package npm has never seen
+#                   is skipped: the first publish is by hand, once (npm trusted publishing can't create a package).
 #   build           the linux-x64 bundle, the npm package packed from it (release/npm.ts), and the same test as the
 #                   contracts job `npm`: installed with npm and with bun, Benjamin's suite on the npm install. The
 #                   .tgz it tested is what the publish jobs publish, byte for byte.
-#   publish-next    a prerelease, on its own after build.
-#   publish-latest  a stable, only after the environment `npm-latest` is approved. Its required reviewer is the
-#                   `unforcedagi` account, and Uni approves only after Aaron taps the approval card (RELEASING.md).
+#   publish-prerelease  a prerelease (`next` or `beta`), only after the environment `npm-prerelease` is approved.
+#   publish-latest  a stable, only after the environment `npm-latest` is approved. Each environment's required
+#                   reviewer is the `unforcedagi` account, and Uni approves only after Aaron taps the approval card
+#                   (RELEASING.md). Each publish first checks that its environment really has a required reviewer:
+#                   GitHub makes an environment a workflow names but nobody set up, with no rules, so a missing one
+#                   would wave the publish through.
 #   tag-record      tags v<version> on the commit that shipped (a record; nothing triggers on it).
 #
 # No token: npm trusted publishing (OIDC). npm checks this workflow's identity (ParachuteComputer/parachute-core,
@@ -102,14 +106,29 @@ jobs:
             ${{ runner.temp }}/npm/package.tgz.sha256
           retention-days: 30
 
-  publish-next:
+  publish-prerelease:
     needs: [plan, build]
-    if: needs.plan.outputs.dist_tag == 'next'
+    if: needs.plan.outputs.dist_tag == 'next' || needs.plan.outputs.dist_tag == 'beta'
     runs-on: ubuntu-latest
+    # Waits here until the npm-prerelease environment's reviewer approves (RELEASING.md).
+    environment: npm-prerelease
+    env:
+      GATE: npm-prerelease
     permissions:
       contents: read
+      actions: read # read the environment's rules (the gate check below)
       id-token: write # npm trusted publishing (OIDC) and provenance
     steps: &publish
+      - name: this job's environment has a required reviewer (fail closed if nobody set it up)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          n=$(gh api "repos/$GITHUB_REPOSITORY/environments/$GATE" --jq '[.protection_rules[]? | select(.type == "required_reviewers")] | length') || n=0
+          if [ "${n:-0}" -lt 1 ]; then
+            echo "::error::environment $GATE has no required reviewer, so nothing held this publish. Set it up (RELEASING.md, \"Who approves a release\"), then re-run."
+            exit 1
+          fi
+          echo "environment $GATE: $n required-reviewer rule(s)"
       - uses: actions/download-artifact@v4
         with:
           name: npm-package
@@ -134,14 +153,17 @@ jobs:
     runs-on: ubuntu-latest
     # Waits here until the npm-latest environment's reviewer approves (RELEASING.md).
     environment: npm-latest
+    env:
+      GATE: npm-latest
     permissions:
       contents: read
+      actions: read
       id-token: write
     steps: *publish
 
   tag-record:
-    needs: [plan, publish-next, publish-latest]
-    if: always() && (needs.publish-next.result == 'success' || needs.publish-latest.result == 'success')
+    needs: [plan, publish-prerelease, publish-latest]
+    if: always() && (needs.publish-prerelease.result == 'success' || needs.publish-latest.result == 'success')
     runs-on: ubuntu-latest
     permissions:
       contents: write
