@@ -43,7 +43,7 @@ import {
   scopeQueryTags,
   scrubNotesTagsByScope,
 } from "./tag-scope.ts";
-import { buildLiveMatcher } from "./live-match.ts";
+import { buildLiveMatcher } from "../core/src/live-match.ts";
 import {
   subscriptionManager,
   WsSink,

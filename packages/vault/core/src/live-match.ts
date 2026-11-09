@@ -2,6 +2,11 @@
  * In-process query matcher for live subscriptions (live-query SSE — design
  * `design/2026-06-08-live-query-sse.md`).
  *
+ * In the engine so both runtimes run this one matcher: the bun server's SSE and
+ * WebSocket doors, and cloud's vault DO (`@openparachute/core/src/live-match.js`).
+ * Cloud used to carry a copy, which kept the loose equality #47 replaced here and
+ * delivered live what the query no longer found (audit L1-03, T-421).
+ *
  * The snapshot path evaluates a `QueryOpts` against the DB via the SQL query
  * engine (`core/src/notes.ts queryNotes`). The live path can't go back to the
  * DB for every mutation — the changed note is already in hand from the
@@ -49,8 +54,8 @@
  * snapshot is the COMPLETE matching set (parity with the unbounded matcher).
  */
 
-import type { Note, QueryOpts, Store } from "../core/src/types.ts";
-import { SUPPORTED_OPS } from "../core/src/query-operators.ts";
+import type { Note, QueryOpts, Store } from "./types.js";
+import { SUPPORTED_OPS } from "./query-operators.js";
 
 const OPS_SET: ReadonlySet<string> = new Set<string>(SUPPORTED_OPS);
 
