@@ -177,6 +177,30 @@ describe("safety/owner-keys: app keys", () => {
     expect((await mintKey({ name, vault: s.vaultName, can: "write" })).status).toBe(409);
   });
 
+  test("a revoked key is refused at once however it is presented: lower-case bearer, X-API-Key, ?key=, root /mcp", async () => {
+    const name = `alt-${id()}`;
+    const key = (await mintKey({ name, vault: s.vaultName, can: "write" })).body.token;
+    expect((await call(`/account/keys/${name}`, { method: "DELETE", auth: bearer() })).status).toBe(200);
+    const v = `/vault/${s.vaultName}/api/notes?limit=1`;
+    expect((await call(v, { auth: `bearer ${key}` })).status).toBe(401);
+    expect((await call(v, { headers: { "x-api-key": key } })).status).toBe(401);
+    expect((await call(`${v}&key=${key}`)).status).toBe(401);
+    const rpc = { jsonrpc: "2.0", id: 1, method: "tools/list" };
+    const root = await call("/mcp", { method: "POST", auth: `Bearer ${key}`, body: rpc, headers: { accept: "application/json, text/event-stream" } });
+    expect(root.status).toBe(401);
+  });
+
+  test("deleting a vault ends its keys", async () => {
+    const v = `del${id()}`;
+    expect((await call("/account/vaults", { method: "POST", auth: bearer(), body: { name: v, bare: true } })).status).toBe(201);
+    const name = `dv-${id()}`;
+    const key = (await mintKey({ name, vault: v, can: "write" })).body.token;
+    expect((await writeNote(v, key)).status).toBe(201);
+    expect((await call(`/account/vaults/${v}`, { method: "DELETE", auth: bearer() })).status).toBe(200);
+    const listed = (await call("/account/keys", { auth: bearer() })).body.keys.find((k: any) => k.name === name);
+    expect(listed.status).toBe("revoked");
+  });
+
   test("/account/keys needs the account token", async () => {
     expect((await call("/account/keys")).status).toBe(401);
     expect((await call("/account/keys", { method: "POST", body: { name: `n-${id()}`, vault: s.vaultName, can: "read" } })).status).toBe(401);

@@ -382,7 +382,8 @@ import {
 } from "./module-manifest.ts";
 import { isNostrAuthorization } from "./nostr-http-auth.ts";
 import { routeAccountKeys } from "./account-keys.ts";
-import { touchKey } from "./keys.ts";
+import { KEY_TOUCH_INTERVAL_MS, touchKey } from "./keys.ts";
+import { validateAccessToken } from "./jwt-sign.ts";
 import { handleNostrLogin } from "./nostr-login.ts";
 import { isLegacyNotesPath, logNotesRedirect, maybeRedirectNotes } from "./notes-redirect.ts";
 import {
@@ -981,18 +982,22 @@ async function proxyRequest(
 }
 
 /**
- * The registry row behind a `/vault/*` request's bearer, if it is one of the hub's JWTs (0.9.1, T-414).
+ * The key behind a vault request (0.9.1, T-414): the credential the vault itself would read, in its order
+ * (`Authorization: Bearer` in any case, then `X-API-Key`, then `?key=`; packages/vault/src/auth.ts extractApiKey),
+ * and, when it is one of the hub's JWTs, its registry row's jti and whether that row is revoked.
  *
- * The payload is decoded WITHOUT verifying the signature, and that is safe for both uses: a revoked row only
- * ever refuses (a forged token naming a revoked jti is refused, as the vault would refuse it anyway), and the
- * last-used stamp is written only after the vault itself accepted the token (not 401/403), so a forged jti can't
- * stamp someone else's key. Any other credential (none, an opaque key, a malformed token) returns null and the
- * vault's own auth decides, exactly as before.
+ * The payload is decoded WITHOUT verifying the signature, which is safe for the refusal: a revoked row only ever
+ * refuses, and a forged token naming a revoked jti would be refused by the vault anyway. The last-used stamp
+ * (`recordKeyUse`) verifies the signature before it writes. Any other credential (none, an opaque key, a
+ * malformed token) returns null, and the vault's own auth decides, exactly as before.
  */
-function vaultBearerKey(db: Database, req: Request): { jti: string; revoked: boolean } | null {
+function vaultBearerKey(db: Database, req: Request): { jti: string; token: string; revoked: boolean } | null {
   const header = req.headers.get("authorization");
-  const m = header?.match(/^Bearer\s+([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)$/);
-  if (!m) return null;
+  let token: string | null = null;
+  if (header && /^Bearer\s+/i.test(header)) token = header.replace(/^Bearer\s+/i, "");
+  else token = req.headers.get("x-api-key") ?? new URL(req.url).searchParams.get("key");
+  const m = token?.match(/^([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)$/);
+  if (!token || !m) return null;
   let jti: unknown;
   try {
     jti = (JSON.parse(Buffer.from(m[2]!, "base64url").toString("utf8")) as { jti?: unknown }).jti;
@@ -1002,7 +1007,26 @@ function vaultBearerKey(db: Database, req: Request): { jti: string; revoked: boo
   if (typeof jti !== "string" || !jti) return null;
   const row = db.query("SELECT revoked_at FROM tokens WHERE jti = ?").get(jti) as { revoked_at: string | null } | null;
   if (!row) return null;
-  return { jti, revoked: row.revoked_at !== null };
+  return { jti, token, revoked: row.revoked_at !== null };
+}
+
+/**
+ * Stamp a key's last use after the vault accepted its request. At most once a minute per key (`touchKey`), and
+ * only once the token's signature checks out against this hub's keys, so a forged token that merely names a
+ * jti can't stamp someone's key. Never fails the request.
+ */
+async function recordKeyUse(db: Database, use: { jti: string; token: string }, issuers: readonly string[]): Promise<void> {
+  try {
+    const row = db.query("SELECT last_used_at FROM keys WHERE jti = ?").get(use.jti) as { last_used_at: string | null } | null;
+    if (!row) return;
+    if (row.last_used_at && Date.now() - Date.parse(row.last_used_at) < KEY_TOUCH_INTERVAL_MS) return;
+    await validateAccessToken(db, use.token, issuers);
+    touchKey(db, use.jti);
+  } catch (err) {
+    if (err instanceof Error && /database|sqlite/i.test(err.message)) {
+      console.error(`[hub] could not record key use: ${err.message}`);
+    }
+  }
 }
 
 function revokedKeyResponse(): Response {
@@ -4596,8 +4620,16 @@ export function hubFetch(
             manifestPath,
           });
         }
+        // The key door (T-414) on the root MCP door too: a vault key spent here is refused at once once revoked.
+        const keyUse = getDb ? vaultBearerKey(getDb(), req) : null;
+        if (keyUse?.revoked) return revokedKeyResponse();
         const proxied = await proxyToVaultDaemon(req, manifestPath, deps?.supervisor, peerAddr);
-        if (proxied) return proxied;
+        if (proxied) {
+          if (keyUse && getDb && proxied.status !== 401 && proxied.status !== 403) {
+            await recordKeyUse(getDb(), keyUse, oauthDeps(req).hubBoundOrigins());
+          }
+          return proxied;
+        }
         return vaultModuleNotRunning();
       }
 
@@ -4629,11 +4661,7 @@ export function hubFetch(
         const proxied = await proxyToVault(req, manifestPath, deps?.supervisor, peerAddr);
         if (proxied) {
           if (keyUse && getDb && proxied.status !== 401 && proxied.status !== 403) {
-            try {
-              touchKey(getDb(), keyUse.jti);
-            } catch (err) {
-              console.error(`[hub] could not record key use: ${err instanceof Error ? err.message : String(err)}`);
-            }
+            await recordKeyUse(getDb(), keyUse, oauthDeps(req).hubBoundOrigins());
           }
           return decorateWithChrome(proxied, req, pathname, getDb);
         }

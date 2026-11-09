@@ -79,9 +79,10 @@ describe("POST /account/token with NIP-98", () => {
 });
 
 describe("/account/keys", () => {
-  async function accountBearer(sub: string) {
+  // The hub's own account token carries the host superset (account-token.ts ACCOUNT_TOKEN_SCOPES).
+  async function accountBearer(sub: string, scopes = ["account:self:admin", "parachute:host:admin", "parachute:host:auth"]) {
     return (
-      await signAccessToken(db, { sub, scopes: ["account:self:admin"], audience: "account", clientId: "t", issuer: ISSUER, ttlSeconds: 600 })
+      await signAccessToken(db, { sub, scopes, audience: "account", clientId: "parachute-account", issuer: ISSUER, ttlSeconds: 600 })
     ).token;
   }
   const call = (path: string, token: string, method = "GET", body?: unknown) =>
@@ -107,6 +108,15 @@ describe("/account/keys", () => {
     expect((await call("/account/keys/arcade", tb, "DELETE")).status).toBe(404);
     const listA = (await (await call("/account/keys", ta)).json()) as { keys: { name: string; status: string }[] };
     expect(listA.keys.map((k) => [k.name, k.status])).toEqual([["arcade", "active"]]);
+  });
+
+  test("an OAuth app holding only account:self:admin can't mint, list or revoke app keys", async () => {
+    const a = await createUser(db, "alice", "alice-passphrase-1");
+    const thirdParty = await accountBearer(a.id, ["account:self:admin"]);
+    expect((await call("/account/keys", thirdParty, "POST", { name: "sneaky", vault: "arcade", can: "write" })).status).toBe(403);
+    expect((await call("/account/keys", thirdParty)).status).toBe(403);
+    expect((await call("/account/keys/sneaky", thirdParty, "DELETE")).status).toBe(403);
+    expect(listKeys(db).some((k) => k.name === "sneaky")).toBe(false);
   });
 
   test("an app key's row is kind app, owned by its person, and its last use is throttled to a minute", async () => {

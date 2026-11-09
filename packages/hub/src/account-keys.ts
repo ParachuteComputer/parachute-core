@@ -14,8 +14,8 @@
  *   - **Never admin.** `can` is `read` or `write`, nothing else, and the body may carry no other field: a `scopes`
  *     list, `admin` or a typo is refused with 400 before anything is signed. The scopes are built here:
  *     `vault:<v>:read`, plus `vault:<v>:write` for write, with `vault_scope` pinned to `<v>` and `aud=vault.<v>`.
- *   - **Only the account mints.** Every route needs the account token (`account:self:admin`, or the operator's
- *     `parachute:host:admin`), the same gate as the other `/account/*` mints. An app key carries only vault scopes,
+ *   - **Only the owner mints.** Every route needs `parachute:host:admin`: the hub's own account token (session or
+ *     NIP-98 sign-in) or the operator's credential. Not an OAuth app holding `account:self:admin` (see `account`). An app key carries only vault scopes,
  *     so it can't list, mint or revoke keys, or mint itself anything wider (`/api/auth/mint-token` attenuates).
  *   - **A name is one key, forever.** A taken name, revoked or not, is refused (409), so a new key never inherits
  *     an old key's name, last-used time or write stamps. The name is checked and the row written in one synchronous
@@ -27,7 +27,8 @@
  * Long-lived: one year by default and at most (the hub's mint cap); `expires_in` (seconds) can shorten it.
  */
 import type { Database } from "bun:sqlite";
-import { requireAnyScope, ACCOUNT_MUTATION_SCOPES, listVaultsWithMeta } from "./account-api.ts";
+import { listVaultsWithMeta, requireAnyScope } from "./account-api.ts";
+import { HOST_ADMIN_SCOPE } from "./admin-vaults.ts";
 import { type AdminAuthContext, adminAuthErrorResponse } from "./admin-auth.ts";
 import { SERVICES_MANIFEST_PATH } from "./config.ts";
 import {
@@ -99,9 +100,15 @@ const APP_KEYS_SQL = `SELECT k.name, k.jti, k.created_at, k.last_used_at, t.scop
   FROM keys k JOIN tokens t ON t.jti = k.jti
   WHERE t.created_via = 'app_key' AND t.user_id = ?`;
 
+/**
+ * The gate: the hub's own account token (`/account/token`, by session or NIP-98) or the operator's credential —
+ * both carry `parachute:host:admin`, which no OAuth client can be granted. Not `account:self:admin` alone: that
+ * scope is OAuth-requestable (hub#827), and a third-party app holding it must not mint year-long keys that outlive
+ * its own grant (the same reason the create-vault handoff is capped, account-api.ts).
+ */
 async function account(req: Request, deps: AccountKeysDeps): Promise<AdminAuthContext | Response> {
   try {
-    return await requireAnyScope(deps.db, req, ACCOUNT_MUTATION_SCOPES, deps.knownIssuers ?? [deps.issuer]);
+    return await requireAnyScope(deps.db, req, [HOST_ADMIN_SCOPE], deps.knownIssuers ?? [deps.issuer]);
   } catch (e) {
     return adminAuthErrorResponse(e);
   }
