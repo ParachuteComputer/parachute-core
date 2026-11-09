@@ -183,6 +183,32 @@ operator has demonstrated authority via one of the five paths.**
 There is no path that promotes a client without an explicit operator
 action.
 
+### Names and where the code goes (audit L3-04)
+
+Public DCR needs no sign-in, so a `client_name` proves nothing. Three
+rules keep a self-registered app from passing as Parachute's own:
+
+- **The consent page shows the redirect origin** (scheme, host, port)
+  under the app's name, for every client. Loopback redirects say "an app
+  on this device".
+- **Parachute-looking names are reserved.** Public DCR answers
+  `400 invalid_client_metadata` for a `client_name` that reads as
+  "parachute" once case, accents, width, spacing, punctuation and common
+  look-alike letters are set aside, unless the registration is the
+  operator's (bearer `hub:admin`, or a session on the hub's own origin),
+  or every `redirect_uri` is first-party: one of the hub's own origins,
+  `https://app.parachute.computer`, `https://my.parachute.computer`,
+  `https://notes.parachute.computer`, or loopback. Another hub's agent
+  connector (`Parachute Hub (agent connector)`) is allowed by exact name.
+  `client_name` is capped at 100 characters for everyone.
+- **Trust by name follows the redirect.** The hub#409 carry-over (a fresh
+  client_id with a name the person already approved skips consent)
+  applies only when the new client sends the person back to the same
+  origin as a client they granted under that name, or to loopback when
+  that one did too. Same-origin alone is not enough: a plain link carries
+  no `Origin` or `Referer`, and the check then falls back to the `Host`
+  header, which always matches.
+
 ## SPA approve page (two cases, one route)
 
 `/admin/approve-client/<id>` serves two distinct flows distinguished

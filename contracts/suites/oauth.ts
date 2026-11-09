@@ -20,6 +20,32 @@ function onHub(url: string | undefined): string {
   return url!;
 }
 
+/**
+ * The box admin's session, signed in once per test process. Every password attempt counts against the box's lockout
+ * (5 per username and IP per 15 minutes, packages/hub/src/rate-limit.ts), and every suite in a run shares one box, so
+ * signing in again for each app would lock the admin out after the fifth.
+ */
+let admin: Promise<{ session: string; csrf: string }> | null = null;
+export function adminSession(): Promise<{ session: string; csrf: string }> {
+  admin ??= (async () => {
+    const loginPage = await safeFetch(`${s.hub}/login`, { redirect: "manual" });
+    const csrf = cookie(loginPage, "parachute_hub_csrf");
+    const login = await safeFetch(`${s.hub}/login`, {
+      method: "POST",
+      redirect: "manual",
+      headers: { "content-type": "application/x-www-form-urlencoded", cookie: `parachute_hub_csrf=${csrf}` },
+      body: new URLSearchParams({ __csrf: csrfIn(await loginPage.text()) ?? csrf ?? "", ...s.admin }),
+    });
+    const session = cookie(login, "parachute_hub_session");
+    if (!session || !csrf) {
+      admin = null;
+      throw new Error(`setup: the admin's sign-in gave ${login.status} and no session`);
+    }
+    return { session, csrf };
+  })();
+  return admin;
+}
+
 export interface Connected {
   clientId: string;
   access: string;
@@ -72,16 +98,7 @@ export async function connect(opts: { scope?: (vault: string) => string; appName
   expect(clientId).toBeString();
 
   // 5. The person signs in (in the browser the app opens; here, the same form posts).
-  const loginPage = await safeFetch(`${issuer}/login`, { redirect: "manual" });
-  const csrf = cookie(loginPage, "parachute_hub_csrf");
-  const login = await safeFetch(`${issuer}/login`, {
-    method: "POST",
-    redirect: "manual",
-    headers: { "content-type": "application/x-www-form-urlencoded", cookie: `parachute_hub_csrf=${csrf}` },
-    body: new URLSearchParams({ __csrf: csrfIn(await loginPage.text()) ?? csrf ?? "", ...s.admin }),
-  });
-  const session = cookie(login, "parachute_hub_session");
-  expect(session).toBeString();
+  const { session, csrf } = await adminSession();
 
   // 6. Authorize with PKCE; the person sees the consent screen and approves.
   const verifier = randomBytes(32).toString("base64url");

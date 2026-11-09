@@ -27,6 +27,7 @@
 
 import type { Database } from "bun:sqlite";
 import { ACCOUNT_VAULTS_UNNARROWED, accountVaultsScope } from "@openparachute/door-contract";
+import { redirectHome } from "./clients.ts";
 import { renameVaultScopes, vaultScopeName } from "./scope-explanations.ts";
 
 const HUB_ACCOUNT_VAULTS_BOUND = accountVaultsScope("self");
@@ -156,8 +157,9 @@ export function isCoveredByGrant(
  * this specific client_id."
  *
  * Tradeoff: an attacker who can register a client with a known-trusted
- * name (e.g. `"claude-code"`) gets auto-trust on first authorize. The
- * defenses we kept:
+ * name (e.g. `"claude-code"`) whose redirect URIs all sit on the trusted
+ * client's origins gets auto-trust on first authorize, but every code then
+ * goes to those origins, not to the attacker. The defenses we kept:
  *   1. Admin-scope flows still show consent (handled by the caller,
  *      not this helper).
  *   2. The audit log records each auto-trust event with both client_ids
@@ -173,36 +175,52 @@ export function findGrantByClientName(
   db: Database,
   userId: string,
   clientName: string,
+  clientRedirectUris: readonly string[],
 ): Grant | null {
   if (!clientName) return null;
-  const row = db
+  // The name alone is not the app (audit L3-04): anyone can register any name
+  // through public DCR. Trust carries only to a client that can send the
+  // person nowhere the trusted one couldn't: every one of its redirect URIs
+  // has a home (origin, or loopback for any port) among the trusted client's.
+  // A stranger's "Claude" pointing at their own host, or listing claude.ai
+  // beside their own host, matches nothing and gets the consent page. All of
+  // them, not just this request's: the grant recorded for the new client_id
+  // covers every redirect it registered.
+  const homes = clientRedirectUris.map(redirectHome);
+  if (homes.length === 0 || homes.includes(null)) return null;
+  const rows = db
     .prepare(
-      `SELECT g.user_id, g.client_id, g.scopes, g.granted_at
+      `SELECT g.user_id, g.client_id, g.scopes, g.granted_at, c.redirect_uris
        FROM grants g
        JOIN clients c ON g.client_id = c.client_id
        WHERE g.user_id = ? AND c.client_name = ?
-       ORDER BY g.granted_at DESC
-       LIMIT 1`,
+       ORDER BY g.granted_at DESC`,
     )
-    .get(userId, clientName) as GrantRow | undefined;
-  return row ? rowToGrant(row) : null;
+    .all(userId, clientName) as (GrantRow & { redirect_uris: string })[];
+  for (const row of rows) {
+    const trusted = new Set((JSON.parse(row.redirect_uris) as string[]).map(redirectHome));
+    if (homes.every((h) => trusted.has(h))) return rowToGrant(row);
+  }
+  return null;
 }
 
 /**
- * Test whether `requestedScopes` is covered by ANY grant for the given
- * client_name + user. The client_name-keyed counterpart to
- * `isCoveredByGrant`. Used by /oauth/authorize to skip BOTH the
- * approve-pending screen + the consent screen when the operator has
+ * Test whether `requestedScopes` is covered by a grant for the given
+ * client_name + user, from a client whose redirect homes include all of
+ * `clientRedirectUris`' (see `findGrantByClientName`). The client_name-keyed
+ * counterpart to `isCoveredByGrant`. Used by /oauth/authorize to skip BOTH
+ * the approve-pending screen + the consent screen when the operator has
  * previously approved a same-named client with sufficient scopes.
  */
 export function isCoveredByGrantForClientName(
   db: Database,
   userId: string,
   clientName: string,
+  clientRedirectUris: readonly string[],
   requestedScopes: readonly string[],
 ): boolean {
   if (requestedScopes.length === 0) return false;
-  const grant = findGrantByClientName(db, userId, clientName);
+  const grant = findGrantByClientName(db, userId, clientName, clientRedirectUris);
   if (!grant) return false;
   const granted = new Set(grant.scopes);
   return requestedCoveredByGranted(granted, requestedScopes);
