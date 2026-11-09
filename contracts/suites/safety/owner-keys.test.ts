@@ -196,7 +196,7 @@ describe("safety/owner-keys: app keys", () => {
     const name = `dv-${id()}`;
     const key = (await mintKey({ name, vault: v, can: "write" })).body.token;
     expect((await writeNote(v, key)).status).toBe(201);
-    expect((await call(`/account/vaults/${v}`, { method: "DELETE", auth: bearer() })).status).toBe(200);
+    expect((await call(`/account/vaults/${v}`, { method: "DELETE", auth: bearer(), body: { confirm: v } })).status).toBe(200);
     const listed = (await call("/account/keys", { auth: bearer() })).body.keys.find((k: any) => k.name === name);
     expect(listed.status).toBe("revoked");
   });
