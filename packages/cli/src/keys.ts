@@ -16,7 +16,7 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { hubDbPath, openHubDb } from "@openparachute/hub/src/hub-db.ts";
 import { listKeys, type KeyView } from "@openparachute/hub/src/keys.ts";
-import { takeFileLock } from "./file-lock.ts";
+import { KEYS_LOCK, takeFileLock } from "./file-lock.ts";
 import { homeDir } from "./home.ts";
 
 let held: Database | undefined;
@@ -30,7 +30,7 @@ export function holdKeysLock(): void {
   if (held) return;
   const run = join(homeDir(), "run");
   mkdirSync(run, { recursive: true, mode: 0o700 });
-  held = takeFileLock(join(run, "keys.lock"), 30_000);
+  held = takeFileLock(join(homeDir(), KEYS_LOCK), 30_000);
 }
 
 export type KeysResult = { exit: number } | { argv: string[] };

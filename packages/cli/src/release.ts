@@ -30,7 +30,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, sta
 import { basename, dirname, join } from "node:path";
 import { Database } from "bun:sqlite";
 import core from "../../../package.json" with { type: "json" };
-import { takeFileLock } from "./file-lock.ts";
+import { isLockBusy, takeFileLock } from "./file-lock.ts";
 import { databases, readDatabase, schemaOf } from "./home.ts";
 import { exportChanged, holders, RECORD_FILE, serveRefusal } from "./takeover.ts";
 
@@ -115,7 +115,7 @@ export function withReleaseLock<T>(home: string, fn: () => T, waitMs = 60_000, b
   try {
     db = takeFileLock(join(home, RELEASE_LOCK), waitMs);
   } catch (err) {
-    if (/locked|busy/i.test(String((err as Error)?.message))) throw new Exit(EXIT.held, busy);
+    if (isLockBusy(err)) throw new Exit(EXIT.held, busy);
     throw err;
   }
   try {
