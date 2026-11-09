@@ -1,0 +1,9 @@
+# Started by parachute-probe.service's OnFailure= when a probe fails (docs/probe/README.md).
+# This example only writes the failing line to the journal under its own tag. Replace ExecStart with your own
+# alert (a mail, a chat webhook, a push), and keep the pass and note content out of it: the probe's line has neither.
+[Unit]
+Description=Parachute probe failed: tell someone
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'journalctl --user -u parachute-probe.service -n 1 -o cat --no-pager | systemd-cat -t parachute-probe-alert -p err'

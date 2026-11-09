@@ -1,0 +1,18 @@
+# One run of `parachute probe` against this box's canary vault (docs/probe/README.md).
+# Install: copy this file, parachute-probe.timer and parachute-probe-failed.service to ~/.config/systemd/user/,
+# then `systemctl --user daemon-reload && systemctl --user enable --now parachute-probe.timer`.
+[Unit]
+Description=Parachute probe: the canary vault opens and answers (REST and MCP)
+# Runs once per failed probe (every 5 minutes while the vault is broken). Point it at whatever wakes you.
+OnFailure=parachute-probe-failed.service
+
+[Service]
+Type=oneshot
+# PARACHUTE_PROBE_URL and PARACHUTE_PROBE_VAULT (and optionally PARACHUTE_PROBE_NOTE), one per line.
+EnvironmentFile=%h/.config/parachute-probe/env
+# The read-only pass lives in a 0600 file, never on the command line (it would show in `ps`).
+# `parachute install` links the command here; with npm or bun, use the path `command -v parachute` prints.
+ExecStart=%h/.local/share/parachute-core/bin/parachute probe --token-file %h/.config/parachute-probe/token
+TimeoutStartSec=90
+# The probe is a client: it never needs more rights than it starts with.
+NoNewPrivileges=yes
