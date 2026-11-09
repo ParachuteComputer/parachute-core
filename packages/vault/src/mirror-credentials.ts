@@ -689,8 +689,8 @@ export async function applyToGitRemote(
   const verb = probeCode === 0 ? "set-url" : "add";
   const cmd =
     verb === "set-url"
-      ? ["git", "remote", "set-url", "origin", remoteUrl]
-      : ["git", "remote", "add", "origin", remoteUrl];
+      ? ["git", "remote", "set-url", "--", "origin", remoteUrl]
+      : ["git", "remote", "add", "--", "origin", remoteUrl];
   const proc = Bun.spawn(cmd, {
     cwd: repoDir,
     stdout: "pipe",

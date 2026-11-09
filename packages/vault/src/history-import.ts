@@ -365,7 +365,7 @@ function privateBundle(archive: string, expected: string, dir: string): string {
   const repo = join(dir, "objects.git"); mkdirSync(repo);
   git(repo, ["init", "--bare"]);
   git(repo, ["bundle", "verify", copy]);
-  git(repo, ["fetch", "--no-tags", copy, "+refs/*:refs/*"]);
+  git(repo, ["fetch", "--no-tags", "--", copy, "+refs/*:refs/*"]);
   return repo;
 }
 function readManifest(vault: string, path: string): ImportManifest {
