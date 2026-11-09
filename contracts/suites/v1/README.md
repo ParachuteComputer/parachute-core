@@ -33,3 +33,6 @@ first guess, chosen to sit next to today's REST API. Change them here first if t
 - **Private notes for exceptions.** A private note inside a shared page is reached only by grants on the note.
 - **Revoking is immediate** for grant changes.
 - **The consumer connector records the app** as well as the person.
+- **History follows the tags a version had** (`history-scope.test.ts`, audit L3-11). A saved version records the
+  note's tags at the time; a tag-scoped pass lists, reads and restores only versions whose tags were in its scope.
+  Today a version is checked against the note's tags now, so moving a note into a tag shows its old content.
