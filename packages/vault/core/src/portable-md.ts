@@ -2163,10 +2163,13 @@ export interface ImportSource {
  * link pointing out of the clone (`note.md -> ~/.ssh/id_ed25519`, a folder
  * link, a sidecar or attachment link) passed the old check and pulled a
  * server file into a note body or the vault's assets (T-419, audit L3-02).
- * Every read now goes through {@link FsImportSource.fileInTree}: the file's
- * REAL path (`realpathSync`, every link resolved) must be a regular file
- * inside the export's real root, separator-aware. The content walk also
- * doesn't step into linked folders at all.
+ * Every read now goes through {@link FsImportSource.fileIn}: the file's REAL
+ * path (`realpathSync`, every link resolved) must be a regular file inside
+ * the real path of the folder it belongs to (the export root for content,
+ * `.parachute/attachments` for an attachment, the sidecar folder for a
+ * sidecar), separator-aware. Per folder, not just "in the clone": the clone
+ * holds `.git/config`, and that carries the clone URL with any stored token
+ * in it. The content walk also doesn't step into linked folders at all.
  */
 export class FsImportSource implements ImportSource {
   readonly attachmentsEnabled: boolean;
@@ -2184,17 +2187,21 @@ export class FsImportSource implements ImportSource {
     this.attachmentsEnabled = !!opts.assetsDir;
   }
 
-  /** The real path of `path` when it is a regular file inside the export
-   *  (after resolving every symlink on the way), else `null`. */
-  private fileInTree(path: string): string | null {
+  /** The real path of `path` when it is a regular file inside `dir` (the
+   *  export's own folder `dir`, itself inside the export), after resolving
+   *  every symlink on the way; else `null`. */
+  private fileIn(path: string, dir: string): string | null {
     let real: string;
+    let dirReal: string;
     try {
+      dirReal = realpathSync(dir);
       real = realpathSync(path);
       if (!statSync(real).isFile()) return null;
     } catch {
       return null;
     }
-    return isWithinDir(real, this.inDirReal) ? real : null;
+    if (!isWithinDir(dirReal, this.inDirReal)) return null;
+    return isWithinDir(real, dirReal) ? real : null;
   }
 
   private readSidecarYamls(dir: string): Array<{ name: string; text: string }> {
@@ -2202,7 +2209,7 @@ export class FsImportSource implements ImportSource {
     const out: Array<{ name: string; text: string }> = [];
     for (const entry of readdirSync(dir)) {
       if (!entry.endsWith(".yaml")) continue;
-      const real = this.fileInTree(join(dir, entry));
+      const real = this.fileIn(join(dir, entry), dir);
       if (real === null) continue; // a link out of the export, or not a file
       out.push({ name: entry, text: readFileSync(real, "utf-8") });
     }
@@ -2228,7 +2235,7 @@ export class FsImportSource implements ImportSource {
   }
 
   readContentFile(relPath: string): string {
-    const real = this.fileInTree(join(this.inDir, relPath));
+    const real = this.fileIn(join(this.inDir, relPath), this.inDir);
     if (real === null) throw new Error(`"${relPath}" is not a file inside the export (a symlink out of it?)`);
     return readFileSync(real, "utf-8");
   }
@@ -2239,12 +2246,11 @@ export class FsImportSource implements ImportSource {
     if (!isWithinDir(srcResolved, attachmentsRootResolved)) {
       return { ok: false, reason: `path-traversal on source: "${srcResolved}" escapes attachments root` };
     }
-    if (!existsSync(srcResolved)) {
-      return { ok: false, reason: `source attachment file missing at "${srcResolved}"` };
-    }
-    const srcReal = this.fileInTree(srcResolved);
+    // One answer for missing and linked-away alike, so the warning can't tell
+    // an importer whether some path exists on this server.
+    const srcReal = this.fileIn(srcResolved, attachmentsRootResolved);
     if (srcReal === null) {
-      return { ok: false, reason: `source attachment "${srcRelPath}" is not a file inside the export (a symlink out of it?)` };
+      return { ok: false, reason: `source attachment "${srcRelPath}" is missing, or not a file inside the export's attachments (a symlink out of them?)` };
     }
     // attachmentsEnabled guarantees assetsDirResolved is set.
     const assetsDirResolved = this.assetsDirResolved!;

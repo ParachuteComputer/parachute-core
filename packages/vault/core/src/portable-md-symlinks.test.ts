@@ -47,21 +47,24 @@ describe("importPortableVault: symlinks in a cloned export (T-419)", () => {
     // The repo: a real note, a note with an attachment row, and a link of each kind.
     const repo = join(base, "repo");
     const side = join(repo, ".parachute");
-    for (const d of ["notes-meta", "schemas", "attachments/att-1"]) mkdirSync(join(side, d), { recursive: true });
+    for (const d of ["notes-meta", "schemas", "attachments/att-1", "attachments/att-2"]) mkdirSync(join(side, d), { recursive: true });
     writeFileSync(join(side, "vault.yaml"), "export_format_version: 1\nexported_at: 2026-11-08T00:00:00.000Z\n");
     writeFileSync(join(repo, "ok.md"), fm(["id: ok", "path: ok"], "a made-up note"));
-    writeFileSync(join(repo, "att.md"), fm(["id: att", "path: att", "attachments:", "  - id: att-1", "    path: 2026/key.pem", "    mime_type: text/plain"], "has a file"));
+    writeFileSync(join(repo, "att.md"), fm(["id: att", "path: att", "attachments:", "  - id: att-1", "    path: 2026/key.pem", "    mime_type: text/plain", "  - id: att-2", "    path: 2026/config.txt", "    mime_type: text/plain"], "has files"));
     writeFileSync(join(repo, "data.csv"), "a,b\n1,2\n");
     symlinkSync(join(outside, "secret.md"), join(repo, "leak.md"));
     symlinkSync(join(outside, "folder"), join(repo, "linked"));
     symlinkSync(join(outside, "meta.yaml"), join(side, "notes-meta", "leak-meta.yaml"));
     symlinkSync(join(outside, "schema.yaml"), join(side, "schemas", "linkedtag.yaml"));
     symlinkSync(join(outside, "key.pem"), join(side, "attachments", "att-1", "key.pem"));
+    // Inside the clone but outside the attachments: the clone's .git/config holds the URL it came from, token and all.
+    symlinkSync("../../../.git/config", join(side, "attachments", "att-2", "config.txt"));
     git(["init", "-q", "-b", "main"], repo);
     git(["add", "-A"], repo);
     git(["commit", "-q", "-m", "made-up export"], repo);
     const clone = join(base, "clone");
     git(["clone", "-q", "--", `file://${repo}`, clone], base);
+    git(["remote", "set-url", "origin", "https://x-access-token:MADE-UP-TOKEN@github.com/o/r.git"], clone);
 
     const store = new SqliteStore(new Database(":memory:"));
     const assets = join(base, "assets");
@@ -75,5 +78,8 @@ describe("importPortableVault: symlinks in a cloned export (T-419)", () => {
     expect(stats.skipped_attachments.map((s) => s.reason).join(" ")).toContain("not a file inside the export");
     const copied = join(assets, "2026", "key.pem");
     expect(existsSync(copied) ? readFileSync(copied, "utf-8") : "").not.toContain(SECRET);
+    const config = join(assets, "2026", "config.txt");
+    expect(existsSync(config) ? readFileSync(config, "utf-8") : "").not.toContain("MADE-UP-TOKEN");
+    expect(stats.attachments_restored).toBe(0);
   });
 });

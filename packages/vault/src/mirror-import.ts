@@ -337,7 +337,7 @@ export function importRemoteUrlProblem(remoteUrl: string): string | null {
   if (parsed.protocol !== "https:" && parsed.protocol !== "ssh:") {
     return `remote_url uses ${parsed.protocol.replace(/:$/, "")}://, which import doesn't take. ${httpsOrSsh}`;
   }
-  if (parsed.hostname.length === 0 || parsed.hostname.startsWith("-") || /^(-|%2d)/i.test(parsed.username)) {
+  if (parsed.hostname.length === 0 || /^(-|%2d)/i.test(parsed.hostname) || /^(-|%2d)/i.test(parsed.username)) {
     return `remote_url needs a host name (and no "-" at the start of the host or user). ${httpsOrSsh}`;
   }
   return null;

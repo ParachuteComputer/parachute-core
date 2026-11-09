@@ -14,8 +14,8 @@
 // An honest https remote, without the network: the box's own git config (`url.<local repo>.insteadOf`, in the
 // box's HOME, which only the box owner can write) rewrites one made-up https URL to a throwaway repo here. The
 // vault still sees and checks an https URL; git stands in for the git host. Mutants "import-url-unchecked",
-// "import-follows-content-links", "import-follows-sidecar-links" and "import-follows-attachment-links" put each
-// guard back.
+// "import-follows-content-links", "import-follows-sidecar-links", "import-follows-attachment-links" and
+// "import-attachments-whole-clone" put each guard back.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -78,12 +78,13 @@ beforeAll(async () => {
   mkdirSync(join(p, "notes-meta"), { recursive: true });
   mkdirSync(join(p, "schemas"), { recursive: true });
   mkdirSync(join(p, "attachments", `${R}-a1`), { recursive: true });
+  mkdirSync(join(p, "attachments", `${R}-a2`), { recursive: true });
   mkdirSync(join(REPO, R), { recursive: true });
   writeFileSync(join(p, "vault.yaml"), "export_format_version: 1\nexported_at: 2026-11-08T00:00:00.000Z\n");
   writeFileSync(join(REPO, R, "ok.md"), fm([`id: ${R}-ok`, `path: ${R}/ok`], "a made-up note"));
   writeFileSync(
     join(REPO, R, "att.md"),
-    fm([`id: ${R}-att`, `path: ${R}/att`, "attachments:", `  - id: ${R}-a1`, `    path: ${R}/key.pem`, "    mime_type: text/plain"], "has a file"),
+    fm([`id: ${R}-att`, `path: ${R}/att`, "attachments:", `  - id: ${R}-a1`, `    path: ${R}/key.pem`, "    mime_type: text/plain", `  - id: ${R}-a2`, `    path: ${R}/config.txt`, "    mime_type: text/plain"], "has files"),
   );
   writeFileSync(join(REPO, R, "data.csv"), "a,b\n1,2\n");
   symlinkSync(join(OUTSIDE, "secret.md"), join(REPO, R, "leak.md"));
@@ -91,6 +92,9 @@ beforeAll(async () => {
   symlinkSync(join(OUTSIDE, "meta.yaml"), join(p, "notes-meta", `${R}-leakmeta.yaml`));
   symlinkSync(join(OUTSIDE, "schema.yaml"), join(p, "schemas", `${R}s.yaml`));
   symlinkSync(join(OUTSIDE, "key.pem"), join(p, "attachments", `${R}-a1`, "key.pem"));
+  // A link that stays inside the clone but leaves the attachments: the clone's own .git/config holds the URL it
+  // was cloned from, with a stored token in it when there is one.
+  symlinkSync("../../../.git/config", join(p, "attachments", `${R}-a2`, "config.txt"));
   git(["init", "-q", "-b", "main"], REPO);
   git(["add", "-A"], REPO);
   git(["commit", "-q", "-m", "made-up export"], REPO);
@@ -137,6 +141,14 @@ describe("a symlink in the cloned repo doesn't reach the server's files", () => 
     expect(await r.text()).not.toContain(SECRET);
     expect(r.status).toBe(404);
   });
+
+  test("an attachment linked to the clone's own .git/config (where a token would sit) isn't copied", async () => {
+    const r = await safeFetch(`${s.vaultViaHub}/api/storage/${R}/config.txt`, {
+      headers: { authorization: `Bearer ${s.operatorToken}` },
+    });
+    expect(await r.text()).not.toContain(REMOTE);
+    expect(r.status).toBe(404);
+  });
 });
 
 describe("the import URL: https:// and ssh only, 400 for the rest", () => {
@@ -150,6 +162,7 @@ describe("the import URL: https:// and ssh only, 400 for the rest", () => {
     ["an option (-u)", "-ufalse"],
     ["an option (--upload-pack)", "--upload-pack=false"],
     ["an ssh host that is an option", "ssh://-oProxyCommand=false/owner/vault.git"],
+    ["an ssh host that is an encoded option", "ssh://%2doProxyCommand=false/owner/vault.git"],
     ["a scp-style host that is an option", "git@-oProxyCommand=false:owner/vault.git"],
   ];
   for (const [what, url] of refused) {
