@@ -205,6 +205,8 @@ describe("public registration refuses names that look like Parachute's own", () 
     "P.A.R.A.C.H.U.T.E",
     "Ｐａｒａｃｈｕｔｅ", // fullwidth
     "Pаrаchutе", // Cyrillic а and е
+    "Раrасһutе", // six Cyrillic look-alikes: only the look-alike table catches it
+    "ParachutᎬ", // Cherokee E, a letter the table lacks: only the "parachute with unknown letters" rule catches it
     "ᴘarachute", // small capital
     "Parachut3",
   ]) {
