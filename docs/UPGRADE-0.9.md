@@ -41,6 +41,10 @@ home with data:
    the release that serves it. `parachute start`, `stop` and `restart` with no module named only drive the unit, so
    they go on without a step (0.8 says to upgrade with "install, then `parachute restart`"); the serve they start
    takes the step once the old server has let go.
+   A record that names this release while another release's server holds the home was written by a command that
+   never served it (the 11-05 record): it is moved aside (`run/release.json.stray-<time>`), so the real step later
+   backs the home up. Only Parachute's own programs count as a server: a sqlite3 shell or a replicator holding a
+   database doesn't stop the step (the backup is a consistent copy).
 5. **A record is trusted only with its backup.** Each later command checks that the backup the record names still
    has its `manifest.json` for this step. If it is gone, the home is backed up again first (never while another
    release holds the data, and without waiting on a running 0.9 command: then the next command that runs alone

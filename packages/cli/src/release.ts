@@ -26,12 +26,12 @@
 // Exit codes, as the takeover's: 0 done · 1 nothing to roll back, or it can't be done code-only · 2 flags, or no
 // --yes where nobody can be asked · 5 no room for the backup · 7 a process holds the data.
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statfsSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statfsSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { Database } from "bun:sqlite";
 import core from "../../../package.json" with { type: "json" };
 import { databases, readDatabase, schemaOf } from "./home.ts";
-import { exportChanged, holders, RECORD_FILE, serveRefusal } from "./takeover.ts";
+import { exportChanged, holders, RECORD_FILE, serveRefusal, type Holder } from "./takeover.ts";
 
 export const RELEASE_FILE = join("run", "release.json");
 /** One command at a time backs up, catches up or rolls back a home: an exclusive SQLite lock, released on exit. */
@@ -112,24 +112,36 @@ class Exit extends Error {
  */
 export function withReleaseLock<T>(home: string, fn: () => T, waitMs = 60_000, busy = "another parachute command is backing up or rolling back this home; run this again when it has finished"): T {
   mkdirSync(join(home, "run"), { recursive: true, mode: 0o700 });
-  const db = new Database(join(home, RELEASE_LOCK), { create: true });
-  try {
-    chmodSync(join(home, RELEASE_LOCK), 0o600);
-    db.exec(`PRAGMA busy_timeout = ${waitMs}`);
-    db.exec("PRAGMA locking_mode = EXCLUSIVE");
+  // Tried in short attempts, closing the connection between them. BEGIN EXCLUSIVE takes SHARED first and then
+  // escalates, so two commands arriving in the same moment each held SHARED while waiting for the other to let go,
+  // and both slept in SQLite's busy handler for the whole wait (T-418 found it: lifecycle/upgrade's race, about 1 in
+  // 30). Letting go between attempts breaks that tie.
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    const db = new Database(join(home, RELEASE_LOCK), { create: true });
     try {
+      chmodSync(join(home, RELEASE_LOCK), 0o600);
+      db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.min(250, deadline - Date.now()))}`);
+      db.exec("PRAGMA locking_mode = EXCLUSIVE");
       db.exec("BEGIN EXCLUSIVE");
       db.exec("CREATE TABLE IF NOT EXISTS hold (pid INTEGER)");
       db.exec("COMMIT"); // in exclusive locking mode the lock stays until the connection closes
     } catch (err) {
+      db.close();
       if (/locked|busy/i.test(String((err as Error)?.message))) {
+        if (Date.now() < deadline) {
+          Bun.sleepSync(10 + Math.floor(Math.random() * 90));
+          continue;
+        }
         throw new Exit(EXIT.held, busy);
       }
       throw err;
     }
-    return fn();
-  } finally {
-    db.close();
+    try {
+      return fn();
+    } finally {
+      db.close();
+    }
   }
 }
 
@@ -250,6 +262,31 @@ export function beforeOpen(home: string, say: (s: string) => void = (s) => conso
       }
       continue;
     }
+    // The record names this release, but is another release serving the home? Then a command that never served it
+    // wrote the record (T-418: 11-05). It is moved aside, so the real step backs the home up when this release does
+    // open it; then this command stops like any other while another release serves (a unit command goes on).
+    if (!triedAlone && process.platform === "linux" && otherServers(home).length) {
+      letGoShared();
+      let moved: string | undefined;
+      try {
+        withReleaseLock(home, () => {
+          recheckOrStop(recheck);
+          const now = readRelease(home);
+          if (now && JSON.stringify(now) === JSON.stringify(r) && confirmedOthers(home).length) {
+            moved = join(home, `${RELEASE_FILE}.stray-${stamp()}`);
+            renameSync(join(home, RELEASE_FILE), moved);
+          }
+        }, 1_500);
+      } catch (err) {
+        if (!(err instanceof Exit) || err.code !== EXIT.held) throw err;
+      }
+      if (moved) say(`parachute: run/release.json said ${r.version} serves this home, but another Parachute does; that record was written by a command that never served it, and is moved aside to ${moved}`);
+      if (moved || confirmedOthers(home).length) {
+        if (servedElsewhere(home, undefined, opts)) return holdSharedAndGo(home, recheck);
+      }
+      triedAlone = true;
+      continue;
+    }
     const recovered = (r.skipped ?? []).filter((rel) => existsSync(join(home, rel)) && readable(join(home, rel), dirname(home)));
     const backupGone = !backupHolds(r);
     // The usual case: this release serves the home, its backup is there, and nothing waits to be backed up.
@@ -291,15 +328,7 @@ function holdSharedAndGo(home: string, recheck: Recheck): undefined {
  * lock, which every command of this release holds shared while it runs: whatever holds the data now is not one.
  */
 function servedElsewhere(home: string, was: Release | undefined, opts: BeforeOpenOpts): boolean {
-  // A server holds the data for as long as it runs; another command of this release opens it only for a moment
-  // before it reaches the lock (dispatch's newer-data check). So only a process seen holding it on three looks
-  // about 300 ms apart counts.
-  let held = holders(home);
-  for (let look = 1; look < 3 && held.length; look++) {
-    Bun.sleepSync(300);
-    const again = new Set(holders(home).map((h) => h.pid));
-    held = held.filter((h) => again.has(h.pid));
-  }
+  const held = confirmedOthers(home);
   if (!held.length) return false;
   if (opts.passIfServed) return true;
   const who = held.map((h) => `pid ${h.pid} (${h.cmd.length > 120 ? `…${h.cmd.slice(-120)}` : h.cmd}${h.unit ? `, in ${h.unit}` : ""})`).join(", ");
@@ -310,6 +339,48 @@ function servedElsewhere(home: string, was: Release | undefined, opts: BeforeOpe
     EXIT.held,
     `another Parachute serves this home (${was ? `run/release.json says ${was.version}, ${was.state}` : "an older release; this home has no release record"}): ${who}. ${core.version} took no backup and recorded nothing. Run this command with the Parachute that serves the home, or stop it (${stopIt}) and run it again to move this home to ${core.version}.`,
   );
+}
+
+/** Whether process `pid` has the file with this dev:ino open (Linux, /proc). */
+function hasOpen(pid: number, id: string): boolean {
+  try {
+    for (const fd of readdirSync(`/proc/${pid}/fd`)) {
+      try {
+        const st = statSync(`/proc/${pid}/fd/${fd}`);
+        if (`${st.dev}:${st.ino}` === id) return true;
+      } catch {}
+    }
+  } catch {}
+  return false;
+}
+
+/**
+ * Parachute servers of another release holding this home's data: processes holding a database whose program is
+ * Parachute's (a replicator, a backup tool or a sqlite3 shell is not a server, and doesn't stop the step: the backup
+ * is a consistent copy), and which don't hold the release lock (every command of this release does while it runs).
+ */
+function otherServers(home: string): Holder[] {
+  let lockId = "";
+  try {
+    const st = statSync(join(home, RELEASE_LOCK));
+    lockId = `${st.dev}:${st.ino}`;
+  } catch {}
+  const parachute = (h: Holder) => h.cmd.split(" ").slice(0, 2).some((w) => /parachute/i.test(basename(w)));
+  return holders(home).filter((h) => parachute(h) && !(lockId && process.platform === "linux" && hasOpen(h.pid, lockId)));
+}
+
+/**
+ * `otherServers`, seen on three looks about 300 ms apart: a server holds the data for as long as it runs, while
+ * another command of this release opens it only for a moment before it reaches the lock (dispatch's newer-data check).
+ */
+function confirmedOthers(home: string): Holder[] {
+  let held = otherServers(home);
+  for (let look = 1; look < 3 && held.length; look++) {
+    Bun.sleepSync(300);
+    const again = new Set(otherServers(home).map((h) => h.pid));
+    held = held.filter((h) => again.has(h.pid));
+  }
+  return held;
 }
 
 /** What the locked step did: the record now in force, or why it recorded nothing. */
@@ -359,8 +430,7 @@ function beforeOpenLocked(home: string, say: (s: string) => void, opts: BeforeOp
     writeRelease(home, r);
     return r;
   }
-  const takeover = readJson(join(home, RECORD_FILE));
-  if (!was && takeover?.state === "taken-over" && takeover.version === core.version) {
+  if (ownTakeover) {
     // This release's own takeover moved the home from 0.7 minutes ago, with its own whole-home backup: the way
     // back is `parachute takeover --rollback`, not this record's.
     const r: Release = { version: core.version, previous: null, since, backup: null, state: "current", via: "takeover" };
@@ -414,7 +484,7 @@ function catchUp(home: string, r: Release, say: (s: string) => void): Release {
 function backupHolds(r: Release): boolean {
   if (!r.backup) return true;
   const m = readJson(join(r.backup, "manifest.json")) as Manifest | undefined;
-  return !!m && m.to === r.version && (r.previous === null || m.from === r.previous) && typeof m.files === "object";
+  return !!m && m.to === r.version && (r.previous === null || m.from === r.previous) && typeof m.files === "object" && Object.keys(m.files).every((rel) => existsSync(join(r.backup!, "home", rel)));
 }
 
 /**

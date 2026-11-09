@@ -16,13 +16,14 @@
 //     that only drives the unit (`stop`, `restart`) goes on without a step and writes nothing of 0.9's;
 //   - a record whose backup is gone is not trusted: the home is backed up again first, without waiting on a running
 //     0.9 command, and a rollback won't use that later copy (T-418);
-//   - a home an older release took over is never taken for one 0.9 made, whatever a stray 0.9 command added (T-418).
+//   - a home an older release took over is never taken for one 0.9 made, whatever a stray 0.9 command added (T-418);
+//   - a stray record whose backup is still there is moved aside while 0.8 serves; a sqlite3 reader is no server.
 // Each machine has its own network (the box holds 1940; _takeover-lib.ts). Red on 0.8 (no release record, no
 // rollback); green from 0.9's release.ts.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createHash, randomBytes } from "node:crypto";
 import { Database } from "bun:sqlite";
-import { existsSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { candidate, freePort, newHome, start, until } from "../candidate-lib.ts";
 import { cli } from "../candidate-lib.ts";
@@ -165,8 +166,28 @@ describe("lifecycle/upgrade", () => {
       expect(again.code).toBe(7);
       expect(again.stderr).toContain("took no backup and recorded nothing");
       expect(backups()).toEqual([]);
-      expect(JSON.parse(readFileSync(join(m.home, "run", "release.json"), "utf8"))).toEqual(stray);
-      rmSync(join(m.home, "run", "release.json"));
+      // Not refreshed: moved aside, so the real upgrade backs the home up.
+      expect(existsSync(join(m.home, "run", "release.json"))).toBe(false);
+      const first = readdirSync(join(m.home, "run")).filter((f) => f.startsWith("release.json.stray-"));
+      expect(first.length).toBe(1);
+      expect(JSON.parse(readFileSync(join(m.home, "run", first[0]!), "utf8"))).toEqual(stray);
+      rmSync(join(m.home, "run", first[0]!));
+
+      // The same record with its backup still there (as on 11-05 before anyone cleaned up): it must not be trusted
+      // while 0.8 serves, and it is moved aside, so the real upgrade later backs the home up.
+      const keptDir = join(dirname(m.home), "parachute-upgrade", "0.8-to-stray");
+      mkdirSync(join(keptDir, "home"), { recursive: true });
+      writeFileSync(join(keptDir, "manifest.json"), JSON.stringify({ from: "0.8", to: release0x(), at: stray.since, home: m.home, files: {}, schemas: {} }));
+      writeFileSync(join(m.home, "run", "release.json"), JSON.stringify({ ...stray, backup: keptDir }));
+      const kept = await run(info.vaultBin, ["--help"]);
+      expect(kept.code).toBe(7);
+      expect(kept.stderr).toContain("that record was written by a command that never served it");
+      expect(existsSync(join(m.home, "run", "release.json"))).toBe(false);
+      const aside = readdirSync(join(m.home, "run")).filter((f) => f.startsWith("release.json.stray-"));
+      expect(aside.length).toBe(1);
+      rmSync(join(m.home, "run", aside[0]!));
+      rmSync(keptDir, { recursive: true });
+      expect(backups()).toEqual([]);
     } finally {
       await box.stop();
     }
@@ -283,7 +304,7 @@ describe("lifecycle/upgrade", () => {
   test("two 0.9 commands opening a 0.8 home at once take one backup between them", async () => {
     const home = await homeBy08("up-race", ["goodv"]);
     const both = await Promise.all([cli(home, ["user", "list"]), cli(home, ["user", "list"])]);
-    expect(both.map((b) => b.code)).toEqual([0, 0]);
+    must(both.every((b) => b.code === 0), `exits ${both.map((b) => b.code).join(", ")}: ${both.map((b) => b.stderr.slice(-500)).join(" | ")}`);
     const dirs = readdirSync(join(dirname(home), "parachute-upgrade"));
     expect(dirs.length).toBe(1);
     expect(JSON.parse(readFileSync(join(home, "run", "release.json"), "utf8")).backup).toBe(join(dirname(home), "parachute-upgrade", dirs[0]!));
@@ -371,6 +392,23 @@ describe("lifecycle/upgrade", () => {
     expect(r.stderr).toContain("0.8 → ");
     expect(readdirSync(join(dirname(home), "parachute-upgrade")).length).toBe(before + 1);
     expect(JSON.parse(readFileSync(join(home, "run", "release.json"), "utf8"))).toMatchObject({ previous: "0.8", state: "current" });
+  }, 120_000);
+
+  test("a process that isn't Parachute holding a database (a sqlite3 reader) doesn't stop the step (T-418)", async () => {
+    const home = await homeBy08("up-reader", ["goodv"]);
+    const db = join(home, "vault", "data", "goodv", "vault.db");
+    const reader = Bun.spawn(["python3", "-c", "import sqlite3,sys,time; c=sqlite3.connect(sys.argv[1]); c.execute('select count(*) from sqlite_master').fetchall(); print('open', flush=True); time.sleep(120)", db], { stdout: "pipe", stderr: "pipe" });
+    try {
+      const out = reader.stdout.getReader();
+      must(new TextDecoder().decode((await out.read()).value).includes("open"), "setup: the reader didn't open the vault");
+      const r = await cli(home, ["user", "list"]);
+      expect(r.code).toBe(0);
+      expect(r.stderr).toContain("0.8 → ");
+      expect(JSON.parse(readFileSync(join(home, "run", "release.json"), "utf8"))).toMatchObject({ previous: "0.8", state: "current" });
+    } finally {
+      reader.kill("SIGKILL");
+      await reader.exited;
+    }
   }, 120_000);
 
   test("a home 0.9 made has no earlier release: no backup, nothing to roll back", async () => {
