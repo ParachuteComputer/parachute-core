@@ -33,6 +33,16 @@ home with data:
    75). A home where nothing is readable records nothing. Found by the mutants job: the step used to crash first,
    which hid the vault's own start-failure path.
 
+4. **Never while another release serves the home** (T-418). If any other process holds the home's databases (0.8's
+   unit, say), it refuses with exit 7 and names the process, before it backs anything up or writes a record. On
+   2026-11-05 a 0.9 `parachute-vault --help`, run with no `PARACHUTE_HOME` on a box whose 0.8 unit served
+   `~/.parachute`, recorded 0.9 as current there while 0.8 kept serving; a real 0.9 start would then have skipped
+   its backup. Stop the serving release (its unit, or `parachute stop`) to move the home, or run the command with
+   the release that serves it.
+5. **A record is trusted only with its backup.** Each later command checks that the backup the record names still
+   has its `manifest.json` for this step. If it is gone, the home is backed up again first, and the record says
+   when (`backup_retaken_at`); that copy is the home as it is then, not as the previous release left it.
+
 It leaves alone:
 - a home 0.9 itself made (it already carries 0.9's structures);
 - a host's embedded home (Prism's contract v1: the host keeps its own backups);
