@@ -114,6 +114,7 @@ export function stagePackage(bundle: string, out: string): string {
   for (const f of ["LICENSE"]) cpSync(join(lib, f), join(stage, f));
   const readme = join(resolve(import.meta.dir, ".."), "README.md");
   cpSync(existsSync(join(lib, "README.md")) ? join(lib, "README.md") : readme, join(stage, "README.md"));
+  const deps = Object.entries(dependencies(lib));
   const pkg = {
     name: root.name,
     version: root.version,
@@ -124,12 +125,12 @@ export function stagePackage(bundle: string, out: string): string {
     homepage: REPO_URL,
     bin: { parachute: "packages/cli/bin/parachute", "parachute-core": "packages/cli/bin/parachute-core" },
     files: ["packages", "LICENSE", "README.md"],
-    dependencies: Object.fromEntries(Object.entries(dependencies(lib)).filter(([n]) => !OPTIONAL.includes(n))),
+    dependencies: Object.fromEntries(deps.filter(([n]) => !OPTIONAL.includes(n))),
     // The local embedding stack is optional (T-418): on a machine with a system libvips, npm runs sharp's install
     // script, which then tries to compile sharp and fails. As an optional dependency that drops the stack instead of
     // failing the whole install; semantic search then says on /health that it can't load ("failing"), and every
     // other part of Parachute works. `bun add -g` runs no dependency's scripts, so it always gets the stack.
-    optionalDependencies: Object.fromEntries(Object.entries(dependencies(lib)).filter(([n]) => OPTIONAL.includes(n))),
+    optionalDependencies: Object.fromEntries(deps.filter(([n]) => OPTIONAL.includes(n))),
     // Bun runs it (the wrappers exec `bun`); npm only installs it.
     engines: { bun: ">=1.4" },
     publishConfig: { access: "public" },

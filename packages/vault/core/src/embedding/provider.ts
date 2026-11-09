@@ -82,7 +82,7 @@ export interface EmbeddingProvider {
    * written, instead of failing each note in a log line (T-418). Never throws.
    */
   warm?(): Promise<ProviderAvailability>;
-  /** Optional: true while a lazily loaded model is still loading (between `warm()`/the first `embed()` and its end). */
+  /** Optional: true until a lazily loaded model has loaded (or failed), so an untried model never reads as ready. */
   loading?(): boolean;
 }
 

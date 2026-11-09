@@ -159,9 +159,9 @@ export class OnnxTransformersEmbeddingProvider implements EmbeddingProvider {
     }
   }
 
-  /** True from the first load attempt until it has loaded or failed. */
+  /** True until the model has loaded or failed: a model nobody has tried to load yet is not "ready". */
   loading(): boolean {
-    return this.extractorPromise !== null && !this.loaded && this.broken === null;
+    return !this.loaded && this.broken === null;
   }
 
   /**

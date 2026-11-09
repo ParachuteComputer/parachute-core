@@ -2,7 +2,7 @@
 // against the sha256 pinned there every time they are used, and copied to lib/packages/vault/models/<id>/, where
 // the vault reads them (packages/vault/src/embedding/onnx-transformers.ts). A file that doesn't match is refused.
 // So a fresh install embeds with no download and no network, and what is tested is what ships (T-418).
-import { copyFileSync, existsSync, mkdirSync, renameSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, renameSync, rmSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import pin from "./model.json";
 
@@ -25,6 +25,12 @@ async function fetchFile(rel: string, want: string): Promise<string> {
     if (!res.ok) throw new Error(`model: ${MODEL.id} ${rel}: HTTP ${res.status}`);
     const tmp = `${cached}.${process.pid}.tmp`;
     await Bun.write(tmp, res);
+    // Checked before it enters the cache: a bad download (an error page, a cut-off body) is never kept.
+    const fetched = await sha256(tmp);
+    if (fetched !== want) {
+      rmSync(tmp, { force: true });
+      throw new Error(`model: ${MODEL.id} ${rel} downloaded with sha256 ${fetched}, pinned ${want}; refused`);
+    }
     renameSync(tmp, cached);
   }
   const got = await sha256(cached);
