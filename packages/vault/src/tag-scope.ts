@@ -190,14 +190,14 @@ export function scopedCountFilter(
   if (!allowed || scopeDeniesAll(allowed)) return { tagFilter: [], excludeTags: [] };
   const roots = allowed instanceof TagScopeSet ? allowed.scopedRoots : [];
   const tagFilter = new Set(allowed);
-  if (roots.length > 0) {
-    const rows = store.db.prepare("SELECT DISTINCT tag_name FROM note_tags").all() as { tag_name: string }[];
-    for (const { tag_name: t } of rows) {
-      const root = t.split("/")[0];
-      if (root && roots.includes(root)) tagFilter.add(t);
-    }
+  const excludeTags: string[] = [];
+  const rows = store.db.prepare("SELECT DISTINCT tag_name FROM note_tags").all() as { tag_name: string }[];
+  for (const { tag_name: t } of rows) {
+    const root = t.split("/")[0];
+    if (root && roots.includes(root)) tagFilter.add(t);
+    if (tagDeniedByPrivateTags(t, allowed)) excludeTags.push(t);
   }
-  return { tagFilter: [...tagFilter], excludeTags: deniedTagNamesInUse(store, allowed) };
+  return { tagFilter: [...tagFilter], excludeTags };
 }
 
 /**

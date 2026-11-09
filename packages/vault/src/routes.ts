@@ -64,7 +64,7 @@ import {
   ATTACHMENT_MIME_TYPES,
 } from "../core/src/attachment/policy.ts";
 import type { ValidationWarning } from "../core/src/schema-defaults.ts";
-import { logStrictBypass } from "./scopes.ts";
+import { logStrictBypass, SCOPE_ADMIN } from "./scopes.ts";
 import * as linkOps from "../core/src/links.ts";
 import * as tagSchemaOps from "../core/src/tag-schemas.ts";
 import { IndexedFieldError } from "../core/src/indexed-fields.ts";
@@ -86,7 +86,6 @@ import {
   noteWithinTagScope,
   scrubTagCountsForPrivateTags,
   scopedCountFilter,
-  scopedStatsFilter,
   doctorNoteTagsPredicate,
   scopeQueryTags,
   scrubIndexedFieldConflictError,
@@ -4366,6 +4365,23 @@ function vaultResponse(vaultConfig: VaultConfigLike): Record<string, unknown> {
   };
 }
 
+/**
+ * The 403 for a vault-description edit without admin (T-419, audit L3-01).
+ * Same envelope as routing.ts's other insufficient_scope refusals.
+ */
+export function descriptionNeedsAdmin(vaultName: string, grantedScopes: string[]): Response {
+  return json(
+    {
+      error: "Forbidden",
+      error_type: "insufficient_scope",
+      message: `Changing the vault description requires the '${SCOPE_ADMIN}' scope (or '${SCOPE_ADMIN.replace("vault:", `vault:${vaultName}:`)}').`,
+      required_scope: SCOPE_ADMIN,
+      granted_scopes: grantedScopes,
+    },
+    403,
+  );
+}
+
 export async function handleVault(
   req: Request,
   store: Store,
@@ -4396,13 +4412,15 @@ export async function handleVault(
   resolveEmbeddingCap: () => Promise<EmbeddingCapability> = () =>
     resolveEmbeddingCapability(getSharedEmbeddingProvider()),
   /**
-   * T-419 (audit L3-01): the 403 to answer a PATCH whose body carries
-   * `description` (any value, null included) when the caller lacks admin.
-   * routing.ts builds it from the token's scopes; null lets the edit through.
-   * Checked before anything in the body is applied. A config-only PATCH never
-   * sees it (the Notes app sets audio_retention with read+write).
+   * T-419 (audit L3-01): how to refuse a PATCH whose body carries
+   * `description` (any value, null included). Editing the description needs
+   * admin; routing.ts passes `null` (allow) only for an admin token, and a
+   * refusal carrying the token's scopes otherwise. Fails closed: a caller that
+   * passes nothing gets every description edit refused. Checked before
+   * anything in the body is applied. A config-only PATCH never sees it (the
+   * Notes app sets audio_retention with a read+write token).
    */
-  descriptionForbidden: Response | null = null,
+  descriptionForbidden: (() => Response) | null = () => descriptionNeedsAdmin(vaultConfig.name, []),
 ): Promise<Response> {
   const url = new URL(req.url);
 
@@ -4424,15 +4442,12 @@ export async function handleVault(
     // covers only notes reachable through an in-scope tag (`tagFilter`
     // restricts the underlying query rather than post-hoc filtering an
     // unscoped rollup — see `getVaultMap`'s doc comment for why).
-    result.map =
-      tagScope.raw === null
-        ? getVaultMap(store.db)
-        : getVaultMap(store.db, scopedCountFilter(store, tagScope.allowed));
+    // One filter for map and stats: a scoped caller's stats count only the
+    // notes it can see, the same set as map (vault#766, T-419).
+    const countScope = tagScope.raw === null ? undefined : scopedCountFilter(store, tagScope.allowed);
+    result.map = getVaultMap(store.db, countScope);
     if (parseBool(parseQuery(url, "include_stats"), false)) {
-      // A scoped caller's stats count only the notes it can see (vault#766, T-419).
-      result.stats = await store.getVaultStats(
-        tagScope.raw === null ? undefined : scopedStatsFilter(store, tagScope.allowed),
-      );
+      result.stats = await store.getVaultStats(countScope);
     }
     return json(result);
   }
@@ -4446,7 +4461,7 @@ export async function handleVault(
     };
     let dirty = false;
 
-    if (body.description !== undefined && descriptionForbidden) return descriptionForbidden;
+    if (body.description !== undefined && descriptionForbidden) return descriptionForbidden();
 
     if (body.description !== undefined) {
       // vault#669: runtime type guard mirroring the audio_retention /

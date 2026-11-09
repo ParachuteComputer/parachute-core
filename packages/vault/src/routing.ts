@@ -82,6 +82,7 @@ import {
   handleTags,
   handleFindPath,
   handleVault,
+  descriptionNeedsAdmin,
   handleUnresolvedWikilinks,
   handleStorage,
   handleViewNote,
@@ -1249,20 +1250,11 @@ export async function route(
     // vault-wide (a scoped writer setting retention would drop audio on notes
     // it can't see).
     if (req.method === "PATCH" && tagScope.raw !== null) return tagScopedVaultWideForbidden(tagScope.raw);
-    // handleVault parses the body (once, under its size cap) and answers with
-    // this when the body carries `description`.
-    const descriptionForbidden = req.method === "PATCH" && !hasScopeForVault(auth.scopes, vaultName, "admin")
-      ? Response.json(
-          {
-            error: "Forbidden",
-            error_type: "insufficient_scope",
-            message: `Changing the vault description requires the '${SCOPE_ADMIN}' scope (or '${SCOPE_ADMIN.replace("vault:", `vault:${vaultName}:`)}').`,
-            required_scope: SCOPE_ADMIN,
-            granted_scopes: auth.scopes,
-          },
-          { status: 403 },
-        )
-      : null;
+    // handleVault parses the body (once, under its size cap) and refuses a
+    // description edit unless this is null (admin).
+    const descriptionForbidden = hasScopeForVault(auth.scopes, vaultName, "admin")
+      ? null
+      : () => descriptionNeedsAdmin(vaultName, auth.scopes);
     return handleVault(
       req,
       store,

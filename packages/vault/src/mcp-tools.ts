@@ -25,7 +25,6 @@ import {
   expandTokenTagScope,
   scrubTagCountsForPrivateTags,
   scopedCountFilter,
-  scopedStatsFilter,
   doctorNoteTagsPredicate,
   filterHydratedLinksByTagScope,
   noteWithinTagScope,
@@ -118,10 +117,11 @@ export async function getServerInstruction(
     const allowed = await expandTokenTagScope(store, auth.scoped_tags);
     // vault#766: the brief's counts (stats line, map) must not include notes
     // a private tag hides from this token — build them scope-aware.
+    const countScope = scopedCountFilter(store, allowed);
     projection = buildVaultProjection(store.db, {
       includeStats: true,
-      countScope: scopedCountFilter(store, allowed),
-      statsScope: scopedStatsFilter(store, allowed),
+      countScope,
+      statsScope: countScope,
     });
     if (allowed) projection = filterProjectionByScope(projection, allowed);
   } else {
@@ -792,13 +792,10 @@ function applyTagScopeWrappers(
     // resolved allowlist instead of filtering `orig`'s unscoped result.
     // vault#766: `scopedCountFilter` also drops notes hidden by a private
     // tag (deny wins) and zeroes everything for a fail-closed scope.
-    if (r.map) {
-      r.map = getVaultMap(store.db, scopedCountFilter(store, allowed));
-    }
-    if (r.stats) {
-      const statsScope = scopedStatsFilter(store, allowed);
-      if (statsScope) r.stats = getVaultStats(store.db, statsScope);
-    }
+    // T-419: stats count the same visible notes as map (one filter for both).
+    const countScope = r.map || r.stats ? scopedCountFilter(store, allowed) : undefined;
+    if (r.map) r.map = getVaultMap(store.db, countScope);
+    if (r.stats) r.stats = getVaultStats(store.db, countScope);
     return r;
   });
 
