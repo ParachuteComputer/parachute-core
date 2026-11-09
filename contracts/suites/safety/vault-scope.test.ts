@@ -207,7 +207,8 @@ describe("stats count only what a tag-scoped pass can see (L3-10 #5)", () => {
       await c.close();
     }
     const brief = await instructions(token);
-    must(/- 3 notes, 2 tags total/.test(brief), `the connect-time brief counts notes outside the pass's scope: ${brief.match(/- \d+ notes?, \d+ tags? total/)?.[0]}`);
+    // 0.9 words it in records (T-407); the count is what's checked.
+    must(/- 3 (?:notes|records), 2 tags total/.test(brief), `the connect-time brief counts notes outside the pass's scope: ${brief.match(/- \d+ (?:notes?|records?), \d+ tags? total/)?.[0]}`);
   });
 });
 
