@@ -11,29 +11,29 @@ const MAX_MESSAGE_CHARS = 200;
 const MAX_FRAMES = 10;
 
 /**
- * Every quoted span becomes `…`. Double quotes and backticks always delimit, and a backslash-escaped one inside a
- * span doesn't close it. Typographic pairs (“…”, ‘…’, «…») delimit too. A single quote opens a span only when it
- * doesn't follow a letter or digit, and closes it only when no letter or digit follows, so an apostrophe
- * (`Can't find variable`, `'Bob's notes'`) is neither; the price is that a quote glued to a word (`key'value'`) isn't
- * cut. A span with no closing quote runs to the end of the message: an unclosed quote is where user text is most
- * likely to follow.
+ * Every quoted span becomes `…`, and quotes are not paired: everything from the first quote character (' " ` “ ” ‘ ’
+ * « ») to the last goes, and a lone one takes the rest of the message. Pairing can't be trusted: V8's JSON.parse
+ * quotes its input, which is full of its own `"`, and an apostrophe looks like a quote. Over-cutting
+ * ("Can't find variable" → "Can…") is the safe side. The same rule as cloud's `workers/vault/src/error-log.ts`.
  */
-const QUOTED_SPAN = new RegExp(
-  [
-    '"(?:[^"\\\\]|\\\\[\\s\\S]?)*(?:"|$)',
-    "`(?:[^`\\\\]|\\\\[\\s\\S]?)*(?:`|$)",
-    "“[^”]*(?:”|$)",
-    "‘[^’]*(?:’|$)",
-    "«[^»]*(?:»|$)",
-    "(?<![\\p{L}\\p{N}])'(?:[^']|'(?=[\\p{L}\\p{N}]))*(?:'|$)",
-  ].join("|"),
-  "gu",
-);
+const QUOTE = /['"`“”‘’«»]/;
 
 /** `err.message` made safe to log: quoted spans cut, whitespace runs (newlines too) collapsed, at most 200 chars. */
 export function redactErrorMessage(message: string): string {
   const oneLine = message.replace(/\s+/g, " ");
-  const cut = oneLine.replace(QUOTED_SPAN, "…").trim().slice(0, MAX_MESSAGE_CHARS);
+  const first = oneLine.search(QUOTE);
+  let out = oneLine;
+  if (first >= 0) {
+    let last = first;
+    for (let i = oneLine.length - 1; i > first; i--) {
+      if (QUOTE.test(oneLine[i]!)) {
+        last = i;
+        break;
+      }
+    }
+    out = `${oneLine.slice(0, first)}…${last > first ? oneLine.slice(last + 1) : ""}`;
+  }
+  const cut = out.trim().slice(0, MAX_MESSAGE_CHARS);
   // Don't leave half of a surrogate pair at the cut.
   return /[\uD800-\uDBFF]$/.test(cut) ? cut.slice(0, -1) : cut;
 }

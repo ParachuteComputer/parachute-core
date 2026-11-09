@@ -147,24 +147,27 @@ describe("MCP tool crash → one server log line (audit L6-02)", () => {
 
 describe("mcpToolErrorLine — what the line may carry", () => {
   test("quoted spans in the message are cut, so quoted input (V8's JSON.parse) stays out", () => {
-    // Bun's JSON.parse doesn't quote its input; V8's (cloud) does, in this shape.
-    const err = new SyntaxError(`Unexpected token 'x', "${MARKER}" is not valid JSON`);
-    const line = mcpToolErrorLine("create-note", err, "1.2.3");
-    expect(line).toContain('class=SyntaxError msg="Unexpected token …, … is not valid JSON"');
-    expect(line).not.toContain(MARKER);
+    // Bun's JSON.parse doesn't quote its input; V8's (cloud) does, and the input carries its own quotes. These are
+    // V8's real messages for JSON.parse('[10,"<marker>",x]') and JSON.parse('{"a":[1,"<marker>",x]}').
+    for (const input of [`[10,"${MARKER}",x]`, `{"a":[1,"${MARKER}",x]}`, `{"pw": ${MARKER}}`]) {
+      const err = new SyntaxError(`Unexpected token 'x', "${input}" is not valid JSON`);
+      const line = mcpToolErrorLine("create-note", err, "1.2.3");
+      expect(line).toContain('class=SyntaxError msg="Unexpected token … is not valid JSON"');
+      expect(line).not.toContain(MARKER);
+    }
     expect(redactErrorMessage(`bad \`${MARKER}\` here`)).toBe("bad … here");
-    expect(redactErrorMessage(`name: ‘${MARKER}’ “${MARKER}” «${MARKER}»`)).toBe("name: … … …");
+    expect(redactErrorMessage(`name: ‘${MARKER}’ “${MARKER}” «${MARKER}»`)).toBe("name: …");
   });
 
-  test("an unclosed quote cuts to the end; an apostrophe is not a quote", () => {
+  test("quotes are not paired: first quote to last is cut, a lone quote takes the rest", () => {
     expect(redactErrorMessage(`Unexpected end of input "${MARKER}`)).toBe("Unexpected end of input …");
-    expect(redactErrorMessage("Can't find variable: foo")).toBe("Can't find variable: foo");
-    // An apostrophe inside a single-quoted span, or an escaped quote inside a double-quoted one, doesn't end it.
+    expect(redactErrorMessage("Can't find variable: foo")).toBe("Can…");
     expect(redactErrorMessage(`Note '${MARKER}'s diary ${MARKER}' not found`)).toBe("Note … not found");
     expect(redactErrorMessage(`bad "a\\"${MARKER}" here`)).toBe("bad … here");
+    expect(redactErrorMessage(`open '/nope/${MARKER}' x.md'`)).toBe("open …");
     // JSC's source excerpt, as the real server prints it.
     expect(redactErrorMessage(`tag.replace is not a function. (In 'tag.replace(/^[#\\s]+/, "")', 'tag.replace' is undefined)`)).toBe(
-      "tag.replace is not a function. (In …, … is undefined)",
+      "tag.replace is not a function. (In … is undefined)",
     );
   });
 
