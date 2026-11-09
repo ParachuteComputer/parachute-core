@@ -3,6 +3,7 @@ import { Database } from "bun:sqlite";
 import { SqliteStore } from "./store.js";
 import { HookRegistry, type DeletedNoteRef, type DeletedAttachmentRef } from "./hooks.js";
 import type { Note } from "./types.js";
+import { transactionAsync } from "./txn.js";
 
 let db: Database;
 let hooks: HookRegistry;
@@ -25,6 +26,43 @@ async function settle(): Promise<void> {
   await Promise.resolve();
   await hooks.drain();
 }
+
+describe("hooks wait for the batch's commit (T-421, audit L2-05)", () => {
+  // A batch runs in one transaction (transactionAsync). Its notes exist only if it commits, so no hook (live push,
+  // mirror, embeddings, triggers) may hear of them before then, and none at all when it rolls back.
+  it("a batch that rolls back fires no created, updated or deleted hook", async () => {
+    const before = await store.createNote("kept", { path: "kept" });
+    await settle();
+    const fired: string[] = [];
+    hooks.onNote({ event: ["created", "updated", "deleted"], handler: (n: any) => void fired.push(n.id) });
+    await expect(
+      transactionAsync(db, async () => {
+        await store.createNote("rolled back", { path: "gone" });
+        await store.createNotes([{ content: "bulk", path: "bulk-gone" }]);
+        await store.updateNote(before.id, { content: "changed" });
+        await store.deleteNote(before.id);
+        throw new Error("the third item collides");
+      }),
+    ).rejects.toThrow("collides");
+    await settle();
+    expect(fired).toEqual([]);
+    expect((await store.getNote(before.id))?.content).toBe("kept");
+  });
+
+  it("a batch that commits fires each hook once, after the commit", async () => {
+    const fired: string[] = [];
+    hooks.onNote({ event: ["created", "deleted"], handler: (n: any) => void fired.push(n.path ?? n.id) });
+    await transactionAsync(db, async () => {
+      await store.createNote("a", { path: "a" });
+      const b = await store.createNote("b", { path: "b" });
+      await settle();
+      expect(fired).toEqual([]); // nothing before the commit
+      await store.deleteNote(b.id);
+    });
+    await settle();
+    expect(fired.sort()).toEqual(["a", "b", "b"]);
+  });
+});
 
 describe("HookRegistry", async () => {
   it("fires registered hook on createNote", async () => {

@@ -603,7 +603,9 @@ export class BunSqliteStore implements Store {
     this.syncReferenceFieldLinks(note, undefined);
 
     this.invalidateConfigCachesForPath(note.path);
-    this.hooks.dispatch("created", note, this);
+    // Inside a batch (transactionAsync) the note exists only once the batch commits: no hook may hear of it before,
+    // and none if it rolls back (T-421). Outside a transaction afterCommit runs at once, as before.
+    afterCommit(this.db, () => this.hooks.dispatch("created", note, this));
 
     return note;
   }
@@ -1072,11 +1074,14 @@ export class BunSqliteStore implements Store {
     // Dispatch even when `existing` was null — the caller asked for a
     // deletion, and downstream consumers (e.g. the mirror) reconcile via
     // id. Path is undefined in that case; the mirror sweep will catch
-    // any orphans missed by the targeted-removal fast path.
-    this.hooks.dispatch(
-      "deleted",
-      { id, ...(existing?.path ? { path: existing.path } : {}), ...(existing ? { tags: existing.tags ?? [] } : {}) },
-      this,
+    // any orphans missed by the targeted-removal fast path. Inside a batch,
+    // only once it commits (T-421), as createNote and updateNote.
+    afterCommit(this.db, () =>
+      this.hooks.dispatch(
+        "deleted",
+        { id, ...(existing?.path ? { path: existing.path } : {}), ...(existing ? { tags: existing.tags ?? [] } : {}) },
+        this,
+      ),
     );
   }
 
@@ -1420,7 +1425,7 @@ export class BunSqliteStore implements Store {
       // Same reference-field auto-link sync as singleton createNote
       // (vault#typed-reference-field) — no prior metadata on a fresh create.
       this.syncReferenceFieldLinks(note, undefined);
-      this.hooks.dispatch("created", note, this);
+      afterCommit(this.db, () => this.hooks.dispatch("created", note, this)); // after the batch commits, as createNote
     }
     return notes;
   }
