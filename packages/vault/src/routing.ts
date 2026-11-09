@@ -68,7 +68,8 @@ import {
   extractApiKey,
 } from "./auth.ts";
 import { hasScopeForVault, hasMigrateScopeForVault, SCOPE_ADMIN, SCOPE_READ, scopeForMethod, verbForMethod } from "./scopes.ts";
-import { getVaultStore } from "./vault-store.ts";
+import { getSharedEmbeddingProvider, getVaultStore } from "./vault-store.ts";
+import { resolveEmbeddingCapability } from "./embedding/capability.ts";
 import { handleScopedMcp } from "./mcp-http.ts";
 import {
   defaultAdminSpaDistDir,
@@ -363,11 +364,15 @@ export async function route(
   // ---------------------------------------------------------------------
 
   if (path === "/health") {
+    // The embedder's state rides on /health (T-418): semantic search turned on with a model that can't load used to
+    // look healthy here while every note's embed failed. Anyone sees the state; the reason (it names install paths)
+    // only a caller with a pass for the vault, at /vault/<name>/api/health or /api/vault.
+    const { error: _reason, ...embeddings } = await resolveEmbeddingCapability(getSharedEmbeddingProvider());
     const auth = await authenticateGlobalRequest(req);
     if ("error" in auth) {
-      return Response.json({ status: "ok" });
+      return Response.json({ status: "ok", embeddings });
     }
-    return Response.json({ status: "ok", vaults: listVaults() });
+    return Response.json({ status: "ok", vaults: listVaults(), embeddings });
   }
 
   // Public vault-name discovery. Lets unauthenticated clients (e.g. the
@@ -1220,7 +1225,7 @@ export async function route(
   }
   if (apiPath === "/unresolved-wikilinks") return handleUnresolvedWikilinks(req, store, tagScope);
   if (apiPath.startsWith("/storage")) return handleStorage(req, apiPath.slice(8), vaultName, store, tagScope);
-  if (apiPath === "/health") return Response.json({ status: "ok", vault: vaultName });
+  if (apiPath === "/health") return Response.json({ status: "ok", vault: vaultName, embeddings: await resolveEmbeddingCapability(getSharedEmbeddingProvider()) });
 
   return Response.json({ error: "Not found" }, { status: 404 });
 }

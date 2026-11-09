@@ -149,7 +149,7 @@ export async function enableSemanticSearch(
     ok: true,
     restarted: true,
     message:
-      "semantic search on — vault restarted; the ~34 MB model downloads on first use and existing notes are indexed in the background",
+      "semantic search on — vault restarted; existing notes are indexed in the background (the vault's /health says whether the embedding model loaded)",
   };
 }
 
