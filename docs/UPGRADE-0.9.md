@@ -33,8 +33,30 @@ home with data:
    75). A home where nothing is readable records nothing. Found by the mutants job: the step used to crash first,
    which hid the vault's own start-failure path.
 
+4. **Never while another release serves the home** (T-418). If any other process holds the home's databases (0.8's
+   unit, say), it refuses with exit 7 and names the process, before it backs anything up or writes a record. On
+   2026-11-05 a 0.9 `parachute-vault --help`, run with no `PARACHUTE_HOME` on a box whose 0.8 unit served
+   `~/.parachute`, recorded 0.9 as current there while 0.8 kept serving; a real 0.9 start would then have skipped
+   its backup. Stop the serving release (its unit, or `parachute stop`) to move the home, or run the command with
+   the release that serves it. `parachute stop` and `restart` with no module named only drive the unit, so they go on
+   without a step when the serving release runs under Parachute's unit (on a box without one they would offer the
+   move to a supervised unit, so they are refused there too) (0.8 says to upgrade with "install, then `parachute restart`"); the serve they start
+   takes the step once the old server has let go.
+   A record that names this release while another release's server holds the home was written by a command that
+   never served it (the 11-05 record): it is moved aside (`run/release.json.stray-<time>`), so the real step later
+   backs the home up. Only a Parachute `serve` counts as a server: a sqlite3 shell, a replicator or an older
+   `parachute-vault mcp` holding a database doesn't stop the step (the backup is a consistent copy).
+5. **A record is trusted only with its backup.** Each later command checks that the backup the record names still
+   has its `manifest.json` for this step. If it is gone, the home is backed up again first (never while another
+   release holds the data, and without waiting on a running 0.9 command: then the next command that runs alone
+   does it), and the record says when (`backup_retaken_at`). That copy is the home as it is then, not as the
+   previous release left it, so `upgrade --rollback` refuses to use it and says why. With no room for it, the
+   command says so and goes on; the next one tries again.
+
 It leaves alone:
-- a home 0.9 itself made (it already carries 0.9's structures);
+- a home 0.9 itself made (it already carries 0.9's structures), unless an older release's takeover moved it
+  (`takeover.json` names that release): then 0.9's structures are a stray command's, and the home still gets its
+  backup (T-418);
 - a host's embedded home (Prism's contract v1: the host keeps its own backups);
 - a home the old 0.7 programs still own (the takeover's job);
 - a home this release's own takeover just moved from 0.7 (`via: "takeover"`; `takeover --rollback` goes back).

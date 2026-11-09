@@ -11,14 +11,21 @@
 //   - `upgrade --rollback --restore --yes` exports the notes changed since the backup, then puts the backup back,
 //     and 0.8 serves that;
 //   - a home 0.9 made has no earlier release: no backup, nothing to roll back.
+//   - while 0.8's server holds the home, a 0.9 command (even `parachute-vault --help`) refuses with 7, taking no
+//     backup and writing no record, and doesn't refresh a stray record either (T-418, the 11-05 record); `stop` and
+//     `status` are refused too when 0.8 runs outside a Parachute unit, and nothing of 0.9's is written;
+//   - a record whose backup is gone is not trusted: the home is backed up again first, without waiting on a running
+//     0.9 command, and a rollback won't use that later copy (T-418);
+//   - a home an older release took over is never taken for one 0.9 made, whatever a stray 0.9 command added (T-418);
+//   - a stray record whose backup is still there is moved aside while 0.8 serves; a sqlite3 reader is no server.
 // Each machine has its own network (the box holds 1940; _takeover-lib.ts). Red on 0.8 (no release record, no
 // rollback); green from 0.9's release.ts.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createHash, randomBytes } from "node:crypto";
 import { Database } from "bun:sqlite";
-import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { candidate, freePort, newHome, until } from "../candidate-lib.ts";
+import { candidate, freePort, newHome, start, until } from "../candidate-lib.ts";
 import { cli } from "../candidate-lib.ts";
 import { must, rest, safeFetch } from "../lib.ts";
 import { dbHolders, newMachine, type Machine, type Proc } from "./_takeover-lib.ts";
@@ -39,6 +46,8 @@ const sha = (p: string) => createHash("sha256").update(readFileSync(p)).digest("
 const vaultDb = () => join(m.home, "vault", "data", vault, "vault.db");
 const dbHashes = () => ({ hub: sha(join(m.home, "hub.db")), vault: sha(vaultDb()) });
 const release = () => JSON.parse(readFileSync(join(m.home, "run", "release.json"), "utf8"));
+/** The candidate's own version, from its package.json (as `version --json` reports it). */
+const release0x = () => JSON.parse(readFileSync(join(info.dir, "package.json"), "utf8")).version as string;
 const backups = () => {
   const d = join(dirname(m.home), "parachute-upgrade");
   return existsSync(d) ? readdirSync(d).sort() : [];
@@ -123,6 +132,69 @@ afterAll(async () => {
 });
 
 describe("lifecycle/upgrade", () => {
+  test("while 0.8's server holds the home, a 0.9 command takes no backup and records nothing (T-418)", async () => {
+    // 2026-11-05: `parachute-vault --help` from a 0.9 checkout, run with no PARACHUTE_HOME on a box whose 0.8 unit
+    // served ~/.parachute, backed the home up and wrote run/release.json saying 0.9 was current while 0.8 kept
+    // serving. A real 0.9 start would then have found its own version recorded and skipped its backup.
+    const box = await serve(prevBin, "0.8 serve");
+    try {
+      for (const [bin, args] of [[info.vaultBin, ["--help"]], [info.bin, ["keys", "list"]]] as const) {
+        const r = await run(bin, [...args]);
+        expect({ cmd: `${bin.split("/").pop()} ${args.join(" ")}`, code: r.code }).toEqual({ cmd: `${bin.split("/").pop()} ${args.join(" ")}`, code: 7 });
+        expect(r.stderr).toMatch(/pid \d+ \([^)]*serve/); // names the server that holds the home
+        expect(r.stderr).toContain("took no backup and recorded nothing");
+      }
+      expect(existsSync(join(m.home, "run", "release.json"))).toBe(false);
+      expect(backups()).toEqual([]);
+
+      // `stop` and `restart` go on only when the other server runs under Parachute's unit (0.8 says to upgrade with
+      // `parachute restart`; that case needs a real systemd unit, which the sandbox has none of). This 0.8 runs by hand,
+      // so `stop` is refused too: with no unit it would offer the move to a supervised unit under 0.8's feet.
+      // `status` opens hub.db (0.9 would add its keys table under 0.8), so it is refused like any other command.
+      const stop = await run(info.bin, ["stop"]);
+      expect({ code: stop.code, refused: stop.stderr.includes("took no backup") }).toEqual({ code: 7, refused: true });
+      const status = await run(info.bin, ["status"]);
+      expect(status.code).toBe(7);
+      expect(existsSync(join(m.home, "run", "release.json"))).toBe(false);
+      expect(backups()).toEqual([]);
+      const hub = new Database(join(m.home, "hub.db"), { readonly: true });
+      expect(hub.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'keys'").get()).toBeNull(); // nothing of 0.9's
+      hub.close();
+
+      // The 11-05 record itself, with its backup cleaned away: 0.9 must not refresh it under 0.8's server.
+      const stray = { version: release0x(), previous: "0.8", since: new Date().toISOString(), backup: join(dirname(m.home), "parachute-upgrade", "gone"), state: "current" };
+      writeFileSync(join(m.home, "run", "release.json"), JSON.stringify(stray));
+      const again = await run(info.vaultBin, ["--help"]);
+      expect(again.code).toBe(7);
+      expect(again.stderr).toContain("took no backup and recorded nothing");
+      expect(backups()).toEqual([]);
+      // Not refreshed: moved aside, so the real upgrade backs the home up.
+      expect(existsSync(join(m.home, "run", "release.json"))).toBe(false);
+      const first = readdirSync(join(m.home, "run")).filter((f) => f.startsWith("release.json.stray-"));
+      expect(first.length).toBe(1);
+      expect(JSON.parse(readFileSync(join(m.home, "run", first[0]!), "utf8"))).toEqual(stray);
+      rmSync(join(m.home, "run", first[0]!));
+
+      // The same record with its backup still there (as on 11-05 before anyone cleaned up): it must not be trusted
+      // while 0.8 serves, and it is moved aside, so the real upgrade later backs the home up.
+      const keptDir = join(dirname(m.home), "parachute-upgrade", "0.8-to-stray");
+      mkdirSync(join(keptDir, "home"), { recursive: true });
+      writeFileSync(join(keptDir, "manifest.json"), JSON.stringify({ from: "0.8", to: release0x(), at: stray.since, home: m.home, files: {}, schemas: {} }));
+      writeFileSync(join(m.home, "run", "release.json"), JSON.stringify({ ...stray, backup: keptDir }));
+      const kept = await run(info.vaultBin, ["--help"]);
+      expect(kept.code).toBe(7);
+      expect(kept.stderr).toContain("that record was written by a command that never served it");
+      expect(existsSync(join(m.home, "run", "release.json"))).toBe(false);
+      const aside = readdirSync(join(m.home, "run")).filter((f) => f.startsWith("release.json.stray-"));
+      expect(aside.length).toBe(1);
+      rmSync(join(m.home, "run", aside[0]!));
+      rmSync(keptDir, { recursive: true });
+      expect(backups()).toEqual([]);
+    } finally {
+      await box.stop();
+    }
+  }, 180_000);
+
   test("0.9's first command on a 0.8 home backs its databases up first, outside the home, and only once", async () => {
     const before = dbHashes();
     const r = await core(["keys", "list", "--json"]);
@@ -234,7 +306,7 @@ describe("lifecycle/upgrade", () => {
   test("two 0.9 commands opening a 0.8 home at once take one backup between them", async () => {
     const home = await homeBy08("up-race", ["goodv"]);
     const both = await Promise.all([cli(home, ["user", "list"]), cli(home, ["user", "list"])]);
-    expect(both.map((b) => b.code)).toEqual([0, 0]);
+    must(both.every((b) => b.code === 0), `exits ${both.map((b) => b.code).join(", ")}: ${both.map((b) => b.stderr.slice(-500)).join(" | ")}`);
     const dirs = readdirSync(join(dirname(home), "parachute-upgrade"));
     expect(dirs.length).toBe(1);
     expect(JSON.parse(readFileSync(join(home, "run", "release.json"), "utf8")).backup).toBe(join(dirname(home), "parachute-upgrade", dirs[0]!));
@@ -269,6 +341,91 @@ describe("lifecycle/upgrade", () => {
     expect((copy.query("PRAGMA table_info(tags)").all() as { name: string }[]).some((c) => c.name === "kind")).toBe(false);
     copy.close();
     expect(JSON.parse(readFileSync(join(home, "run", "release.json"), "utf8")).skipped).toBeUndefined();
+  }, 120_000);
+
+  test("a record whose backup is gone backs the home up again before it is trusted (T-418)", async () => {
+    // The early return ("this release already serves this home") used to trust the record alone.
+    const home = await homeBy08("up-gone", ["goodv"]);
+    must((await cli(home, ["user", "list"])).code === 0, "setup: the first 0.9 command");
+    const first = JSON.parse(readFileSync(join(home, "run", "release.json"), "utf8"));
+    must(first.backup && existsSync(join(first.backup, "manifest.json")), "setup: the first command took no backup");
+    // While another 0.9 command runs (it holds the release lock shared), a command doesn't wait on it: it says so and
+    // goes on; the backup is taken again by the next command that runs alone.
+    const watcher = start(home, ["export", join(dirname(home), "export-watch"), "--watch", "--vault", "goodv"], { vault: true, env: { EMBEDDINGS_ENABLED: "false" } });
+    try {
+      must(await until(() => watcher.log().includes("Exported"), 30_000), `setup: export --watch never started: ${watcher.log().slice(-600)}`);
+      renameSync(first.backup, `${first.backup}-moved-away`);
+      const t0 = Date.now();
+      const busy = await cli(home, ["user", "list"]);
+      expect({ code: busy.code, quick: Date.now() - t0 < 20_000 }).toEqual({ code: 0, quick: true });
+      expect(busy.stderr).toContain(`the backup this home's record names (${first.backup}) is gone, but another parachute command is running`);
+    } finally {
+      await watcher.stop();
+    }
+    const r = await cli(home, ["user", "list"]);
+    expect(r.code).toBe(0);
+    expect(r.stderr).toContain(`the backup this home's record names (${first.backup}) is gone or isn't this step's; backing up`);
+    const again = JSON.parse(readFileSync(join(home, "run", "release.json"), "utf8"));
+    expect(again).toMatchObject({ version: first.version, previous: "0.8", state: "current" });
+    expect(again.backup).not.toBe(first.backup);
+    expect(existsSync(join(again.backup, "manifest.json"))).toBe(true);
+    // And trusted from then on: no third backup.
+    await cli(home, ["user", "list"]);
+    expect(readdirSync(join(dirname(home), "parachute-upgrade")).filter((d) => !d.endsWith("-moved-away")).length).toBe(1);
+    // A copy taken after 0.9 opened the home can't back a rollback: it says so instead.
+    const rb = await cli(home, ["upgrade", "--rollback"]);
+    expect(rb.code).toBe(1);
+    expect(rb.stderr).toContain("was taken again on");
+  }, 120_000);
+
+  test("a home an older release took over, which a stray 0.9 command touched, still gets its backup (T-418)", async () => {
+    // Uni's box: 0.8's takeover moved it from 0.7 (takeover.json names 0.8), the 11-05 command opened it with 0.9
+    // code, and the record it wrote was then moved aside by hand. 0.9's structures are in the databases now, but the
+    // home is 0.8's: the real upgrade must back it up and name 0.8, not take it for a home 0.9 made.
+    const home = await homeBy08("up-touched", ["goodv"]);
+    // The stray commands: one opens hub.db (keys), one opens the vault (its tags' kind).
+    must((await cli(home, ["user", "list"])).code === 0, "setup: the stray 0.9 hub command");
+    must((await cli(home, ["export", join(dirname(home), "stray-export"), "--vault", "goodv"], { vault: true, env: { EMBEDDINGS_ENABLED: "false" } })).code === 0, "setup: the stray 0.9 vault command");
+    renameSync(join(home, "run", "release.json"), join(home, "run", "release.json.wrong-record"));
+    writeFileSync(join(home, "takeover.json"), JSON.stringify({ state: "taken-over", version: "0.8.0-pre.1", at: "2026-10-29T18:00:00.000Z", home, backup: join(dirname(home), "parachute-takeover", "made-up"), rollback: "code-only", migrations: [], paused: [], core_unit: null, issuer: "http://127.0.0.1:1939" }));
+    const before = readdirSync(join(dirname(home), "parachute-upgrade")).length;
+    const r = await cli(home, ["user", "list"]);
+    expect(r.code).toBe(0);
+    expect(r.stderr).toContain("0.8 → ");
+    expect(readdirSync(join(dirname(home), "parachute-upgrade")).length).toBe(before + 1);
+    expect(JSON.parse(readFileSync(join(home, "run", "release.json"), "utf8"))).toMatchObject({ previous: "0.8", state: "current" });
+  }, 120_000);
+
+  test("a 0.8 home with a stray record moved aside (no takeover) still gets its backup (T-418)", async () => {
+    // A home 0.8 made by itself: once the stray record is moved aside (by 0.9, or by hand), 0.9's structures from the
+    // stray command must not make it look like a home 0.9 made.
+    const home = await homeBy08("up-moved", ["goodv"]);
+    must((await cli(home, ["user", "list"])).code === 0, "setup: the stray 0.9 hub command");
+    must((await cli(home, ["export", join(dirname(home), "stray-export"), "--vault", "goodv"], { vault: true, env: { EMBEDDINGS_ENABLED: "false" } })).code === 0, "setup: the stray 0.9 vault command");
+    renameSync(join(home, "run", "release.json"), join(home, "run", "release.json.stray-made-up"));
+    const before = readdirSync(join(dirname(home), "parachute-upgrade")).length;
+    const r = await cli(home, ["user", "list"]);
+    expect(r.code).toBe(0);
+    expect(r.stderr).toContain("0.8 → ");
+    expect(readdirSync(join(dirname(home), "parachute-upgrade")).length).toBe(before + 1);
+    expect(JSON.parse(readFileSync(join(home, "run", "release.json"), "utf8"))).toMatchObject({ previous: "0.8", state: "current" });
+  }, 120_000);
+
+  test("a process that isn't Parachute holding a database (a sqlite3 reader) doesn't stop the step (T-418)", async () => {
+    const home = await homeBy08("up-reader", ["goodv"]);
+    const db = join(home, "vault", "data", "goodv", "vault.db");
+    const reader = Bun.spawn(["python3", "-c", "import sqlite3,sys,time; c=sqlite3.connect(sys.argv[1]); c.execute('select count(*) from sqlite_master').fetchall(); print('open', flush=True); time.sleep(120)", db], { stdout: "pipe", stderr: "pipe" });
+    try {
+      const out = reader.stdout.getReader();
+      must(new TextDecoder().decode((await out.read()).value).includes("open"), "setup: the reader didn't open the vault");
+      const r = await cli(home, ["user", "list"]);
+      expect(r.code).toBe(0);
+      expect(r.stderr).toContain("0.8 → ");
+      expect(JSON.parse(readFileSync(join(home, "run", "release.json"), "utf8"))).toMatchObject({ previous: "0.8", state: "current" });
+    } finally {
+      reader.kill("SIGKILL");
+      await reader.exited;
+    }
   }, 120_000);
 
   test("a home 0.9 made has no earlier release: no backup, nothing to roll back", async () => {

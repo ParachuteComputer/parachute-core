@@ -188,10 +188,21 @@ export class EmbeddingWorker {
     return { processed, vaults: vaults.length };
   }
 
-  /** Start the recurring sweep. No-op if already started. */
+  /**
+   * Start the recurring sweep. No-op if already started. With a provider that loads a model, the model is loaded now
+   * (in the background), so a model that can't load is said once, loudly, at start, and /health says "failing"
+   * before any note is written (T-418), rather than one quiet log line per note.
+   */
   start(): void {
     this.stopped = false;
     if (this.timer) return;
+    const provider = this.provider;
+    if (provider?.warm) {
+      void provider.warm().then((r) => {
+        if (r.ok) this.logger.log?.(`[embedding] semantic search is on: ${provider.name} (${provider.model}) is ready`);
+        else this.logger.error(`[embedding] semantic search is on, but ${provider.name} (${provider.model}) can't embed: ${r.reason}. No note gets an embedding until this is fixed; /health says embeddings "failing".`);
+      });
+    }
     this.timer = setInterval(() => {
       void this.sweepOnce().catch((err) => this.logger.error("[embedding] sweep failed:", err));
     }, this.sweepIntervalMs);
