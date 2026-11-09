@@ -25,7 +25,6 @@ import {
   expandTokenTagScope,
   scrubTagCountsForPrivateTags,
   scopedCountFilter,
-  scopedStatsFilter,
   doctorNoteTagsPredicate,
   filterHydratedLinksByTagScope,
   noteWithinTagScope,
@@ -98,8 +97,8 @@ function filterProjectionByScope(
  * tags + descendants before rendering — symmetric with the JSON
  * `vault-info` wrapper, so a tag-scoped token never learns about
  * out-of-scope tags via the connect-time brief either. Aggregate counts
- * stay vault-wide (pre-existing behaviour) EXCEPT that notes hidden by a
- * private tag are subtracted, and `map` is scope-restricted (vault#766).
+ * (the stats line and `map`) cover only the notes the token can see: reachable
+ * through an in-scope tag and not hidden by a private tag (vault#766, T-419).
  *
  * Async because expanding the tag-scope allowlist hits the store's
  * hierarchy resolver. Returns the orientation block even when the vault
@@ -118,10 +117,11 @@ export async function getServerInstruction(
     const allowed = await expandTokenTagScope(store, auth.scoped_tags);
     // vault#766: the brief's counts (stats line, map) must not include notes
     // a private tag hides from this token — build them scope-aware.
+    const countScope = scopedCountFilter(store, allowed);
     projection = buildVaultProjection(store.db, {
       includeStats: true,
-      countScope: scopedCountFilter(store, allowed),
-      statsScope: scopedStatsFilter(store, allowed),
+      countScope,
+      statsScope: countScope,
     });
     if (allowed) projection = filterProjectionByScope(projection, allowed);
   } else {
@@ -792,13 +792,10 @@ function applyTagScopeWrappers(
     // resolved allowlist instead of filtering `orig`'s unscoped result.
     // vault#766: `scopedCountFilter` also drops notes hidden by a private
     // tag (deny wins) and zeroes everything for a fail-closed scope.
-    if (r.map) {
-      r.map = getVaultMap(store.db, scopedCountFilter(store, allowed));
-    }
-    if (r.stats) {
-      const statsScope = scopedStatsFilter(store, allowed);
-      if (statsScope) r.stats = getVaultStats(store.db, statsScope);
-    }
+    // T-419: stats count the same visible notes as map (one filter for both).
+    const countScope = r.map || r.stats ? scopedCountFilter(store, allowed) : undefined;
+    if (r.map) r.map = getVaultMap(store.db, countScope);
+    if (r.stats) r.stats = getVaultStats(store.db, countScope);
     return r;
   });
 
@@ -1059,6 +1056,14 @@ function overrideVaultInfo(
       if (!auth || !hasScopeForVault(auth.scopes, vaultName, "admin")) {
         throw new Error(
           `Forbidden: updating the vault description requires the 'vault:admin' scope (or 'vault:${vaultName}:admin'). Granted scopes: ${auth?.scopes.join(" ") || "(none)"}.`,
+        );
+      }
+      // T-419 (audit L3-01): the description is vault-wide (every AI
+      // connection's `initialize` carries it), so a tag-scoped admin session
+      // can't set it either. Same refusal as REST PATCH /api/vault.
+      if (auth.scoped_tags !== null) {
+        throw new Error(
+          `Forbidden: this token is restricted to tags: ${auth.scoped_tags.join(", ")}. The vault description is vault-wide and needs a token with no tag restriction.`,
         );
       }
       // vault#669: runtime type guard — the `as string` cast below was a

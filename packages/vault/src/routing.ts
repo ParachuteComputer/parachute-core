@@ -82,6 +82,7 @@ import {
   handleTags,
   handleFindPath,
   handleVault,
+  descriptionNeedsAdmin,
   handleUnresolvedWikilinks,
   handleStorage,
   handleViewNote,
@@ -92,7 +93,7 @@ import {
   type WriteCtx,
 } from "./routes.ts";
 import { handleTriggers } from "./triggers-api.ts";
-import { expandTokenTagScope, noteWithinTagScope, scopedStatsFilter } from "./tag-scope.ts";
+import { expandTokenTagScope, noteWithinTagScope, scopedStatsFilter, tagScopedVaultWideForbidden } from "./tag-scope.ts";
 import {
   handleProtectedResource,
   handleRootProtectedResource,
@@ -611,6 +612,8 @@ export async function route(
         { status: 403 },
       );
     }
+    // The vault's and host's whole config: not for a tag-scoped token (T-419).
+    if (configAuth.scoped_tags !== null) return tagScopedVaultWideForbidden(configAuth.scoped_tags);
     const globalConfig = readGlobalConfig();
     return handleConfig(vaultConfig, globalConfig);
   }
@@ -664,12 +667,26 @@ export async function route(
   }
 
   // Bare `/vault/<name>` — single-vault root. Returns name, description,
-  // createdAt, and stats. One round trip for a viz landing page.
+  // createdAt, and stats. One round trip for a viz landing page. Read-gated
+  // (T-419, audit G-C): a token for this vault holding no vault verb used to
+  // get the description and stats here while `/api/*` refused it.
   if (subpath === "" || subpath === "/") {
     if (req.method !== "GET") {
       return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
-    // vault#766: a scoped caller's stats exclude notes a private tag hides.
+    if (!hasScopeForVault(auth.scopes, vaultName, "read")) {
+      return Response.json(
+        {
+          error: "Forbidden",
+          error_type: "insufficient_scope",
+          message: `This endpoint requires the '${SCOPE_READ}' scope (or '${SCOPE_READ.replace("vault:", `vault:${vaultName}:`)}').`,
+          required_scope: SCOPE_READ,
+          granted_scopes: auth.scopes,
+        },
+        { status: 403 },
+      );
+    }
+    // A scoped caller's stats count only the notes it can see (vault#766, T-419).
     const stats = await store.getVaultStats(
       scopedStatsFilter(store, await expandTokenTagScope(store, auth.scoped_tags)),
     );
@@ -710,6 +727,21 @@ export async function route(
       scopedStatsFilter(store, await expandTokenTagScope(store, auth.scoped_tags)),
     );
     return Response.json(buildUsageReport(vaultName, stats, { fresh }));
+  }
+
+  // Vault-wide and host-wide admin routes refuse a tag-scoped admin token
+  // (T-419, audit L3-10 #4). The mirror routes (config, run-now, push-now,
+  // history, import, auth) act on the whole vault: push-now exports every
+  // note, import with mode "replace" deletes notes. Embeddings and
+  // transcription set host-wide settings for every vault. A non-admin token
+  // falls through to each route's own admin gate, so it still gets the usual
+  // insufficient_scope 403. (/.parachute/config, above, checks the same.)
+  if (
+    (subpath === "/.parachute/embeddings" || subpath === "/.parachute/transcription" ||
+      subpath === "/.parachute/mirror" || subpath.startsWith("/.parachute/mirror/")) &&
+    auth.scoped_tags !== null && hasScopeForVault(auth.scopes, vaultName, "admin")
+  ) {
+    return tagScopedVaultWideForbidden(auth.scoped_tags);
   }
 
   // /.parachute/embeddings — Admin-gated read+write of the semantic-search
@@ -775,6 +807,7 @@ export async function route(
   // at 0.5.0 (vault#282 Stage 2 — vault is a pure hub resource-server). Hub
   // JWTs are minted via hub's registry (`/api/auth/mint-token`); a `/tokens`
   // request now falls through to the catch-all 404 below.
+
 
   // /.parachute/mirror — Admin-gated read+write of THIS vault's persistent
   // mirror config + runtime status. Per-vault (vault#400): the manager is
@@ -1207,6 +1240,21 @@ export async function route(
   if (isDeletedList) return handleDeletedNotes(req, store, tagScope);
   if (apiPath === "/find-path") return handleFindPath(req, store, tagScope);
   if (apiPath === "/vault") {
+    // PATCH /api/vault (T-419, audit L3-01). The description is the text every
+    // MCP `initialize` hands every AI connection, so editing it is curation and
+    // needs admin, the same rule as MCP `vault-info` (src/mcp-tools.ts). A body
+    // with only `config` stays at write: the Notes app connects with
+    // read+write and PATCHes `{config:{audio_retention}}` from Settings and the
+    // capture screen, so admin-only PATCH would break it for every Notes user.
+    // A tag-scoped token is refused either way: description and config are
+    // vault-wide (a scoped writer setting retention would drop audio on notes
+    // it can't see).
+    if (req.method === "PATCH" && tagScope.raw !== null) return tagScopedVaultWideForbidden(tagScope.raw);
+    // handleVault parses the body (once, under its size cap) and refuses a
+    // description edit unless this is null (admin).
+    const descriptionForbidden = hasScopeForVault(auth.scopes, vaultName, "admin")
+      ? null
+      : () => descriptionNeedsAdmin(vaultName, auth.scopes);
     return handleVault(
       req,
       store,
@@ -1216,6 +1264,8 @@ export async function route(
       },
       undefined, // resolveCapability — keep the production default
       tagScope,
+      undefined, // resolveEmbeddingCap — keep the production default
+      descriptionForbidden,
     );
   }
   if (apiPath === "/unresolved-wikilinks") return handleUnresolvedWikilinks(req, store, tagScope);

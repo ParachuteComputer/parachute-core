@@ -159,33 +159,45 @@ export function deniedTagNamesInUse(store: Store, allowed: Set<string> | null): 
 }
 
 /**
- * The `getVaultStats` filter for a scoped caller. `stats` has always been a
- * vault-wide aggregate for scoped tokens (pre-#271 behaviour, unchanged
- * here); vault#766 only subtracts the notes a private tag hides from this
- * caller. Returns `undefined` (plain vault-wide stats) when unscoped or when
- * nothing is private; an all-zero filter when the scope failed closed.
+ * The `getVaultStats` filter for a scoped caller: the same visible set as
+ * `map` (`scopedCountFilter`), so every figure counts only notes reachable
+ * through an in-scope tag and not hidden by a private tag, `topTags` names
+ * only in-scope tags, and `earliestNote`/`latestNote` are visible notes.
+ * T-419 (audit L3-10 #5): stats used to stay vault-wide for a scoped token
+ * (minus private tags only), which named hidden tags and note ids. Returns
+ * `undefined` (plain vault-wide stats) only when unscoped.
  */
 export function scopedStatsFilter(
   store: Store,
   allowed: Set<string> | null,
 ): { tagFilter?: string[]; excludeTags?: string[] } | undefined {
   if (!allowed) return undefined;
-  if (scopeDeniesAll(allowed)) return { tagFilter: [] };
-  const excludeTags = deniedTagNamesInUse(store, allowed);
-  return excludeTags.length > 0 ? { excludeTags } : undefined;
+  return scopedCountFilter(store, allowed);
 }
 
 /**
  * The count-query filter for a scoped caller: the allowlist to count
  * through, minus notes carrying a denied tag. A fail-closed scope counts
- * nothing (empty allowlist).
+ * nothing (empty allowlist). The allowlist also takes every tag in use whose
+ * `/` root is one of the token's own `scoped_tags` (an undeclared string-form
+ * sub-tag such as `work/meetings`), because `noteWithinTagScope` admits those
+ * notes on reads; without them the counts missed notes the token can read.
  */
 export function scopedCountFilter(
   store: Store,
   allowed: Set<string> | null,
 ): { tagFilter: string[]; excludeTags: string[] } {
   if (!allowed || scopeDeniesAll(allowed)) return { tagFilter: [], excludeTags: [] };
-  return { tagFilter: [...allowed], excludeTags: deniedTagNamesInUse(store, allowed) };
+  const roots = allowed instanceof TagScopeSet ? allowed.scopedRoots : [];
+  const tagFilter = new Set(allowed);
+  const excludeTags: string[] = [];
+  const rows = store.db.prepare("SELECT DISTINCT tag_name FROM note_tags").all() as { tag_name: string }[];
+  for (const { tag_name: t } of rows) {
+    const root = t.split("/")[0];
+    if (root && roots.includes(root)) tagFilter.add(t);
+    if (tagDeniedByPrivateTags(t, allowed)) excludeTags.push(t);
+  }
+  return { tagFilter: [...tagFilter], excludeTags };
 }
 
 /**
@@ -801,6 +813,24 @@ export function scrubParentCycleError(
   if (err.cycle.every((t) => allowed.has(t))) return err;
   const scrubbedCycle = err.cycle.map((t) => (allowed.has(t) ? t : OUT_OF_SCOPE_LABEL));
   return new ParentCycleError(err.tag, scrubbedCycle);
+}
+
+/**
+ * 403 for a tag-scoped token on a vault-wide surface (T-419, audit L3-01 and
+ * L3-10 #4): the vault's description and config, triggers, and the mirror and
+ * import routes act on every note, not on a tag, so a scoped token can't use
+ * them at any verb. Same envelope as `tagScopeForbidden`.
+ */
+export function tagScopedVaultWideForbidden(scoped_tags: string[]): Response {
+  return Response.json(
+    {
+      error: "Forbidden",
+      error_type: "tag_scope_violation",
+      message: `This token is restricted to tags: ${scoped_tags.join(", ")}. This endpoint acts on the whole vault and needs a token with no tag restriction.`,
+      scoped_tags,
+    },
+    { status: 403 },
+  );
 }
 
 /**
