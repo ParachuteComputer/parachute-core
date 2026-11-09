@@ -365,9 +365,10 @@ export async function route(
 
   if (path === "/health") {
     // The embedder's state rides on /health (T-418): semantic search turned on with a model that can't load used to
-    // look healthy here while every note's embed failed. Anyone sees the state; the reason (it names install paths)
-    // only a caller with a pass for the vault, at /vault/<name>/api/health or /api/vault.
-    const { error: _reason, ...embeddings } = await resolveEmbeddingCapability(getSharedEmbeddingProvider());
+    // look healthy here while every note's embed failed. Anyone sees the state; the provider, model and reason (it
+    // names install paths) only a caller with a pass for the vault, at /vault/<name>/api/health or /api/vault.
+    const { enabled, state } = await resolveEmbeddingCapability(getSharedEmbeddingProvider());
+    const embeddings = { enabled, state };
     const auth = await authenticateGlobalRequest(req);
     if ("error" in auth) {
       return Response.json({ status: "ok", embeddings });

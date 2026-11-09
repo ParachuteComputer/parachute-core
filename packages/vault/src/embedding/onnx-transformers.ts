@@ -14,8 +14,8 @@
  * `packages/vault/models/<model id>/`. When they are there they are the only source: nothing is downloaded, so a
  * fresh install embeds offline (and `PARACHUTE_OFFLINE` homes, Prism's, can use it). A source checkout has no
  * `models/`; there the weights download from the Hugging Face hub on first use (a base-MODEL download, not note
- * content leaving the box) into `<PARACHUTE_HOME>/vault/models`, never into the install. Every embedding call runs
- * entirely on this machine.
+ * content leaving the box) into transformers' own cache, as before. Every embedding call runs entirely on this
+ * machine.
  *
  * ## bun+onnxruntime verdict (P0/V2 spike)
  *
@@ -51,7 +51,6 @@ import {
 import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { isOffline } from "../offline.ts";
-import { VAULT_HOME } from "../config.ts";
 
 /** P0-verified bundle-sized default: 34MB q8 ONNX, well under the "~100MB zero-config" bar. */
 const DEFAULT_MODEL_ID = "Xenova/bge-small-en-v1.5";
@@ -89,8 +88,6 @@ async function defaultPipelineLoader(modelId: string): Promise<FeatureExtraction
   // module-init path means a vault that never touches semantic search
   // never pays the import cost either.
   const { pipeline, env } = await import("@huggingface/transformers");
-  // Downloads (a source checkout) go to the home, never into the install (whose default is inside node_modules).
-  env.cacheDir = join(VAULT_HOME, "models");
   if (hasBundledModel(modelId)) {
     // The shipped files are the model: read from the install, never downloaded.
     env.localModelPath = `${BUNDLED_MODELS_DIR}/`;
