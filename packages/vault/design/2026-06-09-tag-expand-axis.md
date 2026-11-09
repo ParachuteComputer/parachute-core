@@ -60,7 +60,7 @@ Per-input-tag: `expand` applies to each tag in a multi-tag query independently
    against the enum (unknown → 400). Flows into both `/notes` and `/subscribe`.
 4. **MCP** (`core/src/mcp.ts query-notes`): add `expand` to the tool schema with
    the four values + doc text; default `"subtypes"`.
-5. **Live-query SSE** (`src/live-match.ts buildLiveMatcher` + `src/subscribe.ts`):
+5. **Live-query SSE** (`core/src/live-match.ts buildLiveMatcher` + `src/subscribe.ts`):
    the matcher's tag expansion MUST use the same mode as the snapshot, so a
    subscription's snapshot and live events agree. Thread `opts.expand` through
    `buildLiveMatcher`; it currently hardcodes subtype expansion. **This is the
