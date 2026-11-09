@@ -28,7 +28,9 @@ PARACHUTE_VAULT_BIN="$PWD/parachute-core-0.8.0-pre.2-darwin-arm64/bin/parachute-
 
 The tree: `bin/parachute`, `bin/parachute-core`, `bin/parachute-vault` (links into `lib/`); `runtime/bun` (Bun 1.4.4,
 sha256-pinned; the bundle runs on it, never on a Bun from `PATH`, and refuses to start without it, exit 69); `lib/`
-(sources and a production `node_modules`, argon2 for the platform, no onnxruntime or sharp);
+(sources and a production `node_modules`, argon2 for the platform; from 0.8.0, the local semantic search stack too:
+onnxruntime-node and sharp for the platform, and the 34 MB model in `lib/packages/vault/models/`, so the tarball is
+about 118 MB instead of 62 MB; semantic search stays off unless a home turns it on);
 `entitlements/bun.plist` (`com.apple.security.cs.allow-jit`, for `runtime/bun` only); `LICENSE`,
 `THIRD-PARTY-NOTICES.txt`, `SOURCE.md` (the exact commit), `VERSION`, `CANDIDATE.json` (the sha256 of every file).
 It runs from any folder, a path with spaces included.

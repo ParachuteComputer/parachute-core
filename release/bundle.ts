@@ -9,7 +9,8 @@
 //                                 Benjamin's suite; never linked onto a shared PATH
 //   runtime/bun                   the pinned Bun (release/bun.json), checked against its sha256
 //   lib/                          the workspace with a production install of node_modules (release/payload.ts:
-//                                 no embedding stack, no dev tools) and the hub's and vault's built admin pages
+//                                 the embedding stack for this platform only, no dev tools), the hub's and vault's
+//                                 built admin pages, and the embedding model (release/model.ts)
 //   entitlements/bun.plist        allow-jit: what runtime/bun needs under the hardened runtime (release/sign.ts)
 //   package.json                  @openparachute/core, bins parachute and parachute-core
 //   LICENSE, THIRD-PARTY-NOTICES.txt, SOURCE.md, VERSION (the wrappers know the bundle by VERSION and runtime/bun)
@@ -20,7 +21,8 @@
 import { copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { installPinnedBun, hostPlatform } from "./runtime.ts";
-import { LEFT_OUT, prune, workspaces, writeNotices } from "./payload.ts";
+import { keepPlatform, LEFT_OUT, prune, workspaces, writeNotices } from "./payload.ts";
+import { installModel, MODEL, modelNotice } from "./model.ts";
 import { signTree } from "./sign.ts";
 import { bundleName } from "./pack.ts";
 
@@ -28,8 +30,12 @@ const RELEASE = import.meta.dir;
 export const NAMES = ["parachute-core", "parachute", "parachute-vault"];
 const REPO_URL = "https://github.com/ParachuteComputer/parachute-core";
 
+// onnxruntime-node's postinstall downloads its CUDA providers (~316 MB on linux-x64) from NuGet: the bundle never
+// ships them (the production install runs no scripts), and the download made CI builds fail on a network blip.
+const INSTALL_ENV = { ...process.env, ONNXRUNTIME_NODE_INSTALL: "skip" };
+
 async function sh(cmd: string[], cwd?: string): Promise<string> {
-  const p = Bun.spawn(cmd, { cwd, stdout: "pipe", stderr: "pipe" });
+  const p = Bun.spawn(cmd, { cwd, env: INSTALL_ENV, stdout: "pipe", stderr: "pipe" });
   const [out, err, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
   if (code !== 0) throw new Error(`${cmd.join(" ")} (in ${cwd ?? "."}) failed (${code}): ${(out + err).slice(-800)}`);
   return out;
@@ -52,7 +58,10 @@ export async function installWorkspace(lib: string): Promise<string[]> {
   }
   for (const w of workspaces(lib)) rmSync(join(w, "node_modules"), { recursive: true, force: true });
   await sh(["bun", "install", "--frozen-lockfile", "--production", "--ignore-scripts"], lib);
-  return prune(lib);
+  const removed = prune(lib);
+  keepPlatform(lib);
+  await installModel(lib);
+  return removed;
 }
 
 export interface BundleFacts {
@@ -90,7 +99,7 @@ export async function layOutBundle(out: string, opts: { commit: string; rev: str
     ) + "\n",
   );
   const leftOut = opts.leftOut ?? [];
-  const packages = writeNotices(lib, join(out, "THIRD-PARTY-NOTICES.txt"), { version: bun.version, licence: readFileSync(join(RELEASE, "bun-LICENSE.md"), "utf8") });
+  const packages = writeNotices(lib, join(out, "THIRD-PARTY-NOTICES.txt"), { version: bun.version, licence: readFileSync(join(RELEASE, "bun-LICENSE.md"), "utf8") }, [modelNotice()]);
   writeFileSync(
     join(out, "VERSION"),
     [
@@ -114,8 +123,10 @@ export async function layOutBundle(out: string, opts: { commit: string; rev: str
       `- \`lib/\` is that commit's workspace (\`package.json\`, \`bun.lock\`, \`packages/\`) as source, with a production`,
       `  install of \`node_modules\` from \`bun.lock\` (${packages} packages, listed with their licences in`,
       "  `THIRD-PARTY-NOTICES.txt`) and the hub's and vault's admin pages built (`web/ui/dist`).",
-      `- Left out of \`node_modules\`: ${LEFT_OUT.map((p) => `\`${p}\``).join(", ")} and what only they need${leftOut.length ? ` (${leftOut.length} packages)` : ""}.`,
-      "  Local semantic search needs them; an external embedding API (`EMBEDDING_API_URL`) works without.",
+      `- Left out of \`node_modules\`: ${LEFT_OUT.map((p) => `\`${p}\``).join(", ")} and what only they need${leftOut.length ? ` (${leftOut.length} packages)` : ""},`,
+      "  and onnxruntime-node's binaries for other platforms. Neither is used here.",
+      `- \`lib/packages/vault/models/${MODEL.id}\` is the local semantic search model, ${MODEL.base} (${MODEL.license}), from`,
+      `  https://huggingface.co/${MODEL.id} at revision \`${MODEL.revision}\` (release/model.json pins each file's sha256).`,
       `- \`runtime/bun\` is Bun ${bun.version}, unchanged from ${bun.zip} of its release (sha256 \`${bun.sha256}\`),`,
       "  https://github.com/oven-sh/bun/releases. Its licence and the libraries it links are at the end of",
       "  `THIRD-PARTY-NOTICES.txt`.",

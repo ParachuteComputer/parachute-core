@@ -76,6 +76,14 @@ export interface EmbeddingProvider {
    * gates the `embeddings` capability flag on the vault landing.
    */
   available(): Promise<ProviderAvailability>;
+  /**
+   * Optional: load now whatever `embed()` would load on first use (a model), and report the result. The vault calls
+   * it once at start, so a provider that can't work says so on /health and the vault's info before any note is
+   * written, instead of failing each note in a log line (T-418). Never throws.
+   */
+  warm?(): Promise<ProviderAvailability>;
+  /** Optional: true until a lazily loaded model has loaded (or failed), so an untried model never reads as ready. */
+  loading?(): boolean;
 }
 
 /**
