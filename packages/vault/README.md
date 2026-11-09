@@ -260,7 +260,7 @@ parachute-vault backup status                  # schedule, last run, destination
 names below stay listed and working as deprecated aliases through 0.9 and go at 1.0; each use is counted in the
 home's `run/deprecations.json` (`parachute changes` prints the counts).
 
-**Notes**: `query-notes` (universal read — single by ID/path, filter, search, graph neighborhood), `create-note` (single or batch), `update-note` (single or batch — content, tags, links, metadata), `delete-note`
+**Notes**: `query-notes` (universal read — single by ID/path, filter, search, graph neighborhood), `create-note` (single or batch), `update-note` (single or batch — content, tags, links, metadata), `delete-note` (single or a list; `erase_history` with admin forgets every version)
 **Tags**: `list-tags` (with optional schema detail), `update-tag` (upsert description + schema fields), `delete-tag`, `rename-tag`, `merge-tags`
 **Graph**: `find-path` (BFS between two notes)
 **Vault**: `vault-info` (get/update description + stats)

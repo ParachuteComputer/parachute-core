@@ -88,6 +88,7 @@ import {
   handleViewNote,
   handleDoctor,
   handleHistoryCompact,
+  handleDeletedNotes,
   type TagScopeCtx,
   type WriteCtx,
 } from "./routes.ts";
@@ -1120,14 +1121,21 @@ export async function route(
     ((req.method === "PUT" || req.method === "DELETE") && /^\/tags\/[^/]+$/.test(apiSubpath)) ||
     (req.method === "POST" &&
       (apiSubpath === "/tags/merge" || /^\/tags\/[^/]+\/rename$/.test(apiSubpath)));
-  // Erasing note history is irreversible and requires admin (vault#524).
-  const isNoteHistoryErase = req.method === "DELETE" && /^\/notes\/[^/]+\/versions$/.test(apiSubpath);
+  // Erasing note history is irreversible and requires admin (vault#524). So does a delete that erases it
+  // (`?erase_history=`, T-412): any value but an absent or explicit false is gated here, and the handler refuses a
+  // value it can't read. Listing deleted notes with history left is the same admin's job.
+  const eraseParam = req.method === "DELETE" && /^\/notes\/[^/]+$/.test(apiSubpath)
+    ? new URL(req.url).searchParams.get("erase_history")
+    : null;
+  const isNoteHistoryErase = (req.method === "DELETE" && /^\/notes\/[^/]+\/versions$/.test(apiSubpath)) ||
+    (eraseParam !== null && eraseParam !== "false");
   const isHistoryCompact = req.method === "POST" && apiSubpath === "/history/compact";
-  const requiredVerb = isReadOnlyPost ? "read" : (isTagSchemaMutation || isNoteHistoryErase || isHistoryCompact) ? "admin" : verbForMethod(req.method);
+  const isDeletedList = req.method === "GET" && apiSubpath === "/history/deleted";
+  const requiredVerb = isReadOnlyPost ? "read" : (isTagSchemaMutation || isNoteHistoryErase || isHistoryCompact || isDeletedList) ? "admin" : verbForMethod(req.method);
   if (!hasScopeForVault(auth.scopes, vaultName, requiredVerb)) {
     const requiredApiScope = isReadOnlyPost
       ? SCOPE_READ
-      : (isTagSchemaMutation || isNoteHistoryErase || isHistoryCompact)
+      : (isTagSchemaMutation || isNoteHistoryErase || isHistoryCompact || isDeletedList)
         ? SCOPE_ADMIN
         : scopeForMethod(req.method);
     return Response.json(
@@ -1202,6 +1210,7 @@ export async function route(
   }
   if (apiPath.startsWith("/tags")) return handleTags(req, store, apiPath.slice(5), tagScope, writeCtx);
   if (isHistoryCompact) return handleHistoryCompact(req, store, tagScope);
+  if (isDeletedList) return handleDeletedNotes(req, store, tagScope);
   if (apiPath === "/find-path") return handleFindPath(req, store, tagScope);
   if (apiPath === "/vault") {
     return handleVault(

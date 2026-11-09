@@ -516,13 +516,14 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
       // genuinely append-only callers — gating WITHIN write rather
       // than promoting deletes out of it.
       requiredVerb: "write",
-      description: "Permanently delete a note and all its tags and links. Accepts ID, path, or (fallback, only when id/path both miss and exactly one note matches) its H1 title.",
+      description: "Delete a note and all its tags and links. Accepts ID, path, or (fallback, only when id/path both miss and exactly one note matches) its H1 title; or `ids`, a list (up to 500), all resolved before any is deleted, so a list naming a missing note deletes nothing. A delete keeps a version of the note (restorable from its history) unless `erase_history: true`, which also erases every saved version, so the vault itself has nothing left to restore (a git mirror, exports and backups keep their own copies); that needs the vault's admin scope, and with it an id may also be a note already deleted whose history is left (list them with REST `GET /api/history/deleted`). Returns `{deleted, id}` (plus `history_erased`) for `id`, `{deleted: <count>, results: [...]}` for `ids`.",
       inputSchema: {
         type: "object",
         properties: {
           id: { type: "string", description: "Note ID, path, or (fallback, only when id/path both miss and exactly one note matches) its H1 title" },
+          ids: { type: "array", items: { type: "string" }, description: "Several notes (IDs or paths), instead of `id`; up to 500" },
+          erase_history: { type: "boolean", description: "Also erase every saved version, so the vault can't restore the note (default false; a git mirror or backup keeps its own copy). Needs admin scope. Takes only an exact id or path." },
         },
-        required: ["id"],
       },
       condition: "core",
     },

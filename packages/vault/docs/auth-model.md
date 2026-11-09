@@ -98,7 +98,8 @@ tokens list` / `revoke` exist only to clean those rows up.)
   `find-path`, `vault-info` (stats), `doctor`. `write` (additive) =
   `create-note`, `update-note`, `delete-note`. `admin` (additive) =
   `update-tag`, `delete-tag`, `rename-tag`, `merge-tags`, `prune-schema`,
-  `manage-token`, `vault-info` (description update). Source of truth:
+  `manage-token`, `vault-info` (description update), `delete-note` with
+  `erase_history: true` (T-412). Source of truth:
   `requiredVerb` on each tool in `core/src/mcp.ts`.
 
 Inheritance: `vault:admin ⊇ vault:write ⊇ vault:read`. The
@@ -191,7 +192,7 @@ the hub's OAuth endpoints.
 
 | Path | Method | Auth required | Unauthenticated response | Authenticated-but-underscoped response |
 |---|---|---|---|---|
-| `/vault/<name>/mcp[/…]` | any | Bearer (any vault scope) | `401 {error:"Unauthorized", …}` + `WWW-Authenticate: Bearer resource_metadata="…"` (RFC 9728 challenge) | Per-tool: `vault:read` (`query-notes`/`list-tags`/`find-path`/`vault-info`/`doctor`), `vault:write` (`create-note`/`update-note`/`delete-note`), or `vault:admin` (`update-tag`/`delete-tag`/`rename-tag`/`merge-tags`/`prune-schema`/`manage-token`, and `vault-info`'s description-update branch). Under-scoped `tools/call` returns `{isError:true, content:[…"requires the '<verb>' scope"…]}`. Under-scoped tools are *also filtered out of `tools/list`*. |
+| `/vault/<name>/mcp[/…]` | any | Bearer (any vault scope) | `401 {error:"Unauthorized", …}` + `WWW-Authenticate: Bearer resource_metadata="…"` (RFC 9728 challenge) | Per-tool: `vault:read` (`query-notes`/`list-tags`/`find-path`/`vault-info`/`doctor`), `vault:write` (`create-note`/`update-note`/`delete-note`), or `vault:admin` (`update-tag`/`delete-tag`/`rename-tag`/`merge-tags`/`prune-schema`/`manage-token`, `vault-info`'s description-update branch, and `delete-note`'s `erase_history`). Under-scoped `tools/call` returns `{isError:true, content:[…"requires the '<verb>' scope"…]}`. Under-scoped tools are *also filtered out of `tools/list`*. |
 | `/vault/<name>/view/<idOrPath>` | GET | Auth-aware (see notes) | `404 Not Found` for private notes; `200 <html>` for published notes | — |
 | `/vault/<name>/public/<id>` | GET | Auth-aware (legacy alias) | `301` to `/vault/<name>/view/<id>` preserving `?key=…` | — |
 | `/vault/<name>` | GET | Bearer (any scope) | `401` | — |

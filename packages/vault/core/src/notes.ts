@@ -1164,6 +1164,9 @@ export function buildFilterConditions(db: Database, opts: QueryOpts): { conditio
   // cost O(candidates × row size) regardless of limit. The IN-subquery
   // rides idx_note_tags_tag, produces each note id at most once, and lets
   // the whole query drop DISTINCT. See the 2026-06-10 perf measurements.
+  // Positions in `conditions` of the tag-membership clauses, so they can be re-shaped once we know whether an
+  // indexed metadata equality will drive the query (see the end of the metadata block).
+  const tagClauses: number[] = [];
   if (opts.tags && opts.tags.length > 0) {
     // Canonical-bare-tag guard (vault#XXX) backstop for direct-core callers
     // that bypass BunSqliteStore.normalizeQueryTags (the store normalizes +
@@ -1181,6 +1184,7 @@ export function buildFilterConditions(db: Database, opts: QueryOpts): { conditio
       if (flat.length > 0) {
         // One json_each param per set, not one `?` per tag: a tag with 100+
         // declared descendants passed Durable Object SQLite's 100-param cap.
+        tagClauses.push(conditions.length);
         conditions.push(`n.id IN (SELECT note_id FROM note_tags WHERE tag_name IN ${IN_VIA_JSON_EACH})`);
         params.push(jsonEachParam(flat));
       }
@@ -1189,6 +1193,7 @@ export function buildFilterConditions(db: Database, opts: QueryOpts): { conditio
       // input or any descendant.
       for (const set of tagSets) {
         if (!set || set.length === 0) continue;
+        tagClauses.push(conditions.length);
         conditions.push(`n.id IN (SELECT note_id FROM note_tags WHERE tag_name IN ${IN_VIA_JSON_EACH})`);
         params.push(jsonEachParam(set));
       }
@@ -1380,10 +1385,16 @@ export function buildFilterConditions(db: Database, opts: QueryOpts): { conditio
   // matches but the raw extraction doesn't (e.g. JSON number 5 vs query
   // string "5") are excluded by the residual — exactly as the scan excluded
   // them. Pinned by query-plain-eq-routing.test.ts.
+  // Set when an indexed column is matched by equality (`eq`, `in`, or the plain-equality prefilter below):
+  // SQLite then drives the query from that column's B-tree.
+  let indexedEqualityDriver = false;
   if (opts.metadata) {
     for (const [key, value] of Object.entries(opts.metadata)) {
       if (isOperatorObject(value)) {
         const indexedField = requireIndexedField(db, key);
+        const ops = value as Record<string, unknown>;
+        if (ops.eq !== undefined && ops.eq !== null) indexedEqualityDriver = true;
+        if (Array.isArray(ops.in) && ops.in.length > 0) indexedEqualityDriver = true;
         const { sql, params: opParams } = buildOperatorClause(
           key,
           value as Record<string, unknown>,
@@ -1397,6 +1408,7 @@ export function buildFilterConditions(db: Database, opts: QueryOpts): { conditio
         // FIELD_NAME_RE at declaration time, so interpolating the column
         // name is safe — same justification as buildOperatorClause.
         if (eq.indexProbes && getIndexedField(db, key)) {
+          indexedEqualityDriver = true;
           const slots = eq.indexProbes.map(() => "?").join(", ");
           conditions.push(`("meta_${key}" IN (${slots}) AND ${eq.sql})`);
           params.push(...eq.indexProbes, ...eq.params);
@@ -1405,6 +1417,17 @@ export function buildFilterConditions(db: Database, opts: QueryOpts): { conditio
           params.push(...eq.params);
         }
       }
+    }
+  }
+
+  // Tag membership beside an indexed equality (T-412). `n.id IN (SELECT note_id ...)` is the right shape when the
+  // tag drives the query: SQLite walks the tag's ids. But when an indexed equality drives it, SQLite keeps the IN
+  // as a membership test and first lists every note under the tag, so "reactions of player X" read every reaction
+  // (4,200 rows on the Taste Arcade test, against 44 by field and path prefix). A correlated EXISTS is one probe of
+  // idx_note_tags_note per candidate instead. Same notes either way: both say "has a tag in this set".
+  if (indexedEqualityDriver) {
+    for (const i of tagClauses) {
+      conditions[i] = `EXISTS (SELECT 1 FROM note_tags tg WHERE tg.note_id = n.id AND tg.tag_name IN ${IN_VIA_JSON_EACH})`;
     }
   }
 

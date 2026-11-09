@@ -51,7 +51,7 @@ import {
   narrowLinkWarningsForVisibility,
 } from "../core/src/wikilinks.ts";
 import { transactionAsync } from "../core/src/txn.ts";
-import { getNote, getNotes, getNoteTags, getNoteByTitle, toNoteIndex, filterMetadata, mergeMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError, PathConflictError, validatePath, PathValidationError, getVaultMap, isValidIfUpdatedAt, IF_UPDATED_AT_HINT } from "../core/src/notes.ts";
+import { getNote, getNotes, getNoteTags, getNoteByTitle, toNoteIndex, filterMetadata, mergeMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError, PathConflictError, validatePath, PathValidationError, getVaultMap, isValidIfUpdatedAt, IF_UPDATED_AT_HINT, AmbiguousPathError } from "../core/src/notes.ts";
 import { normalizePath } from "../core/src/paths.ts";
 import {
   parseContentRange,
@@ -59,7 +59,7 @@ import {
   contentRangeRequiresContent,
   type ContentRange,
 } from "../core/src/content-range.ts";
-import { attachValidationStatus, enforceStrictWrite, applySchemaDefaults, resolveVisibleNote } from "../core/src/mcp.ts";
+import { attachValidationStatus, enforceStrictWrite, applySchemaDefaults, resolveNoteExact, resolveVisibleNote } from "../core/src/mcp.ts";
 import {
   BLOCKED_ATTACHMENT_EXTENSIONS,
   ATTACHMENT_MIME_TYPES,
@@ -1386,6 +1386,29 @@ async function resolveNote(
   const byPath = await store.getNoteByPath(idOrPath);
   if (byPath) return byPath;
   return store.db ? getNoteByTitle(store.db, idOrPath) : null;
+}
+
+/**
+ * The note an erase names (T-412): exact only (resolveNoteExact: id, or case-sensitive path), since erasing can't be
+ * undone. A name that fits two notes is a 409 that says how to name one; `{note: null}` is not found. Never the
+ * loose lookup: with no db handle it refuses.
+ */
+function resolveForErase(store: Store, idOrPath: string, visible?: (note: Note) => boolean): { note: Note | null } | Response {
+  if (!store.db) return json({ error: "erasing history needs the vault's database", error_type: "internal_error" }, 500);
+  try {
+    return { note: resolveNoteExact(store.db, idOrPath, visible) };
+  } catch (e) {
+    if (e instanceof AmbiguousPathError) {
+      return json({
+        error: "ambiguous_path",
+        error_type: "ambiguous_path",
+        message: `"${idOrPath}" names more than one note; name the one to erase by its id, or add its .extension`,
+        path: idOrPath,
+        candidates: e.candidates,
+      }, 409);
+    }
+    throw e;
+  }
 }
 
 async function requireNote(store: Store, idOrPath: string): Promise<Note> {
@@ -3022,7 +3045,15 @@ async function handleNotesInner(
   const verMatch = sub.match(/^\/versions\/([^/]+)$/);
   const importMatch = sub.match(/^\/imports\/([^/]+)$/);
   if (sub === "/versions" || verMatch || importMatch || sub === "/restore") {
-    const note = await resolveNote(store, idOrPath, scopeVisible);
+    // Erasing a live note's history takes only an exact id or path (T-412); reading and restoring keep the usual lookup.
+    let note: Note | null;
+    if (sub === "/versions" && method === "DELETE") {
+      const found = resolveForErase(store, idOrPath, scopeVisible);
+      if (found instanceof Response) return found;
+      note = found.note;
+    } else {
+      note = await resolveNote(store, idOrPath, scopeVisible);
+    }
     if (note && !noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
       return json({ error: "Not found", error_type: "not_found" }, 404);
     }
@@ -3658,12 +3689,29 @@ async function handleNotesInner(
 
   // DELETE /notes/:idOrPath — vault:write (no admin gate; consistent with verbForMethod)
   if (method === "DELETE") {
-    const note = await resolveNote(store, idOrPath, scopeVisible);
+    // T-412: `?erase_history=true` also erases every version (no tombstone). routing.ts has already required admin
+    // for any value but false. Erasing can't be undone, so it takes only an exact id or path (resolveNoteExact).
+    const erase = url.searchParams.get("erase_history");
+    if (erase !== null && erase !== "true" && erase !== "false") {
+      return json({ error: "erase_history must be true or false", error_type: "invalid_request", field: "erase_history" }, 400);
+    }
+    let note: Note | null;
+    if (erase === "true") {
+      const found = resolveForErase(store, idOrPath, scopeVisible);
+      if (found instanceof Response) return found;
+      note = found.note;
+    } else {
+      note = await resolveNote(store, idOrPath, scopeVisible);
+    }
     if (!note) return json({ error: "Not found", error_type: "not_found" }, 404);
     // Tag-scope: can't delete what you can't read. 404 (not 403) for the
     // same no-leak reason as the read paths.
     if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
       return json({ error: "Not found", error_type: "not_found" }, 404);
+    }
+    if (erase === "true") {
+      const r = await store.forgetNote(note.id, { actor: writeCtx.actor, via: writeCtx.via });
+      return json({ deleted: true, id: note.id, history_erased: { versions_deleted: r.versionsDeleted, blobs_deleted: r.blobsDeleted } });
     }
     await store.deleteNote(note.id, { actor: writeCtx.actor, via: writeCtx.via });
     return json({ deleted: true, id: note.id });
@@ -5381,6 +5429,27 @@ function removeWikilinkBrackets(content: string, targetPath: string): string {
   content = content.replace(new RegExp(`\\[\\[${escaped}\\|([^\\]]+)\\]\\]`, "gi"), "$1");
   content = content.replace(new RegExp(`\\[\\[${escaped}(#[^\\]]+)?\\]\\]`, "gi"), `${targetPath}$1`);
   return content;
+}
+
+/**
+ * GET /api/history/deleted — deleted notes that still have history, newest deletion first (T-412). Unscoped
+ * administrators: a deleted note has no tags left to check a tag scope against, so a scoped pass gets the same 404
+ * as /history/compact. `limit` (default 100, max 1000) and `offset`.
+ */
+export async function handleDeletedNotes(req: Request, store: Store, tagScope: TagScopeCtx = NO_TAG_SCOPE): Promise<Response> {
+  if (tagScope.raw !== null) return json({ error: "Not found", error_type: "not_found" }, 404);
+  const url = new URL(req.url);
+  const num = (name: string, dflt: number) => {
+    const raw = url.searchParams.get(name);
+    if (raw === null) return dflt;
+    return /^\d+$/.test(raw) ? Number(raw) : NaN;
+  };
+  const limit = num("limit", 100);
+  const offset = num("offset", 0);
+  if (!Number.isSafeInteger(limit) || !Number.isSafeInteger(offset) || limit > 1000) {
+    return json({ error: "limit (0-1000) and offset must be whole numbers", error_type: "invalid_request" }, 400);
+  }
+  return json(await store.listDeletedNotes({ limit, offset }));
 }
 
 /** POST /api/history/compact — unscoped administrators; absent bounds are unbounded. */

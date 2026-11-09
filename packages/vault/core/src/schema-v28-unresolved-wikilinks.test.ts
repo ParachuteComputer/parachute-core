@@ -66,6 +66,9 @@ describe("migrateToV28 — heals a pre-#555 2-column table at boot", () => {
       src.id,
       "Target A",
     );
+    // A pre-#555 table belongs to a vault last opened before v28: say so, or initSchema skips the migrations.
+    db.exec("DELETE FROM schema_version");
+    db.prepare("INSERT INTO schema_version (version, applied_at) VALUES (?, ?)").run(27, "2020-01-01T00:00:00.000Z");
   });
 
   it("initSchema rebuilds the 3-column PK and backfills relationship='wikilink'", () => {

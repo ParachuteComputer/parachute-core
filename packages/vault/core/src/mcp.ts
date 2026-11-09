@@ -5,6 +5,8 @@ import { transactionAsync } from "./txn.js";
 import * as noteOps from "./notes.js";
 import { filterMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError, validatePath } from "./notes.js";
 import { normalizePath } from "./paths.js";
+import { isNoteIdShape } from "./ulid.js";
+import { countNoteVersions } from "./history.js";
 import { QueryError } from "./query-operators.js";
 import { TAG_EXPAND_MODES, stripTagHash, suggestSimilarTag, type TagExpandMode } from "./tag-hierarchy.js";
 import {
@@ -231,6 +233,28 @@ export function resolveNote(db: Database, idOrPath: string, visible?: (note: Not
   const byPath = noteOps.getNoteByPath(db, idOrPath);
   if (byPath) return byPath;
   return noteOps.getNoteByTitle(db, idOrPath);
+}
+
+/**
+ * The note a reference names exactly, for an act that can't be undone (erasing history, T-412): its id, or its path
+ * compared case-sensitively, where a trailing `.<ext>` may also be read as the extension (as resolveNote reads it).
+ * No case folding and no H1-title fallback, and more than one match is refused with AmbiguousPathError, so it never
+ * picks a note the caller didn't name: `inbox/today` can't reach `Inbox/Today`. Notes `visible` rejects count as
+ * absent.
+ */
+export function resolveNoteExact(db: Database, ref: string, visible?: (note: Note) => boolean): Note | null {
+  const seen = (n: Note | null) => (n && (!visible || visible(n)) ? n : null);
+  const byId = seen(noteOps.getNote(db, ref));
+  if (byId) return byId;
+  const ids = new Set<string>();
+  for (const r of db.prepare("SELECT id FROM notes WHERE path = ?").all(ref) as { id: string }[]) ids.add(r.id);
+  const extMatch = ref.match(/^(.*)\.([a-z0-9]{1,16})$/i);
+  if (extMatch) {
+    for (const r of db.prepare("SELECT id FROM notes WHERE path = ? AND extension = ?").all(extMatch[1]!, extMatch[2]!) as { id: string }[]) ids.add(r.id);
+  }
+  const hits = [...ids].map((id) => seen(noteOps.getNote(db, id))).filter((n): n is Note => n !== null);
+  if (hits.length > 1) throw new noteOps.AmbiguousPathError(ref, hits.map((n) => ({ id: n.id, extension: n.extension ?? "md" })));
+  return hits[0] ?? null;
 }
 
 /**
@@ -589,6 +613,14 @@ export interface GenerateMcpToolsOpts {
    * are returned as-is and the SQL filter answers directly, unchanged.
    */
   ambiguityVisible?: (noteId: string) => boolean;
+  /**
+   * Who may pass `erase_history: true` to `delete-note` (T-412). Erasing history is irreversible and admin-only
+   * (vault#524), and `delete-note` itself is a write tool, so the door says what this session may do. Omitted →
+   * refused with `insufficient_scope` (fail closed). `"visible"`: notes this session can see (a tag-scoped admin).
+   * `"all"`: also a note already deleted that left history (an unscoped admin; a deleted note has no tags left to
+   * check a scope against).
+   */
+  eraseHistory?: "visible" | "all";
   /**
    * `AttachmentTicketProvider` seam (vault attachment-tickets design,
    * Wave 1 — D10 "tools omitted when unwired"). When provided,
@@ -2415,9 +2447,99 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
     {
       name: "delete-note",
       execute: async (params) => {
-        const note = requireNote(db, requireNoteReference(params.id), resolveVisibility);
-        await store.deleteNote(note.id, { actor: writeActor, via: writeVia });
-        return { deleted: true, id: note.id };
+        // T-412: `ids` deletes a list, `erase_history` also erases every version (no tombstone). Every reference is
+        // resolved before anything is deleted, so a list naming a missing note deletes nothing.
+        const erase = params.erase_history === true;
+        if (params.erase_history !== undefined && params.erase_history !== null && typeof params.erase_history !== "boolean") {
+          throw structuredError("`erase_history` must be a boolean", { error_type: "invalid_request", field: "erase_history" });
+        }
+        const hasList = params.ids !== undefined && params.ids !== null;
+        const hasOne = params.id !== undefined && params.id !== null;
+        if (hasList === hasOne) {
+          throw structuredError(hasList ? "pass `id` or `ids`, not both" : "`id` is required", {
+            error_type: hasList ? "invalid_request" : "missing_required_field",
+            field: "id",
+            hint: "pass the note's id or path (or its unique H1 title), or `ids` (a list) for several",
+          });
+        }
+        if (erase && !opts?.eraseHistory) {
+          throw structuredError("erase_history needs the vault's admin scope: erasing history is irreversible", {
+            error_type: "insufficient_scope",
+            field: "erase_history",
+            required_scope: "vault:admin",
+          });
+        }
+        let refs: string[];
+        if (hasList) {
+          if (!Array.isArray(params.ids) || params.ids.length === 0) {
+            throw structuredError("`ids` must be a non-empty list of note ids or paths", { error_type: "invalid_request", field: "ids" });
+          }
+          if (params.ids.length > MAX_BATCH_SIZE) throw new BatchTooLargeError(params.ids.length);
+          refs = params.ids.map((v: unknown, i: number) => {
+            if (typeof v !== "string" || v.trim() === "") {
+              throw structuredError(`\`ids[${i}]\` must be a note id or path`, { error_type: "invalid_request", field: "ids" });
+            }
+            return v;
+          });
+        } else {
+          refs = [requireNoteReference(params.id)];
+        }
+        // An id whose note is gone but whose history is left: only an unscoped admin erasing history may name it.
+        const leftover = (ref: string) =>
+          erase && opts?.eraseHistory === "all" && isNoteIdShape(ref) && countNoteVersions(db, ref) > 0;
+        const targets: string[] = [];
+        const missing: string[] = [];
+        for (const ref of refs) {
+          // Erasing can't be undone, so it takes only an exact id or path (resolveNoteExact): never a case-folded
+          // path or an H1 title that might name another note.
+          let note: Note | null;
+          try {
+            note = erase ? resolveNoteExact(db, ref, resolveVisibility) : resolveNote(db, ref, resolveVisibility);
+          } catch (err) {
+            // delete-note has no `extension` parameter, so AmbiguousPathError's own hint would point nowhere.
+            if (erase && err instanceof noteOps.AmbiguousPathError) {
+              throw structuredError(`"${ref}" names more than one note; name the one to erase by its id`, {
+                error_type: "ambiguous_path",
+                field: hasList ? "ids" : "id",
+                candidates: err.candidates,
+              });
+            }
+            throw err;
+          }
+          const id = note ? note.id : leftover(ref) ? ref : null;
+          if (id === null) missing.push(ref);
+          else if (!targets.includes(id)) targets.push(id);
+        }
+        if (missing.length > 0) {
+          throw structuredError(`Note not found: ${missing.map((m) => `"${m}"`).join(", ")}`, {
+            error_type: "not_found",
+            field: hasList ? "ids" : "id",
+            missing,
+          });
+        }
+        const results: Record<string, unknown>[] = [];
+        for (const id of targets) {
+          try {
+            if (erase) {
+              const r = await store.forgetNote(id, { actor: writeActor, via: writeVia });
+              results.push({ deleted: r.deleted, id, history_erased: { versions_deleted: r.versionsDeleted, blobs_deleted: r.blobsDeleted } });
+            } else {
+              await store.deleteNote(id, { actor: writeActor, via: writeVia });
+              results.push({ deleted: true, id });
+            }
+          } catch (err) {
+            // Each note is its own transaction: say which were already done, so a retry can name the rest.
+            if (results.length === 0) throw err;
+            throw structuredError(`delete-note stopped at "${id}": ${err instanceof Error ? err.message : String(err)}`, {
+              error_type: "partial_failure",
+              field: "ids",
+              done: results.map((r) => r.id),
+              failed: id,
+            });
+          }
+        }
+        if (!hasList) return results[0]!;
+        return { deleted: results.filter((r) => r.deleted).length, results };
       },
     },
 

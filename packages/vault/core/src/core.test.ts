@@ -339,7 +339,8 @@ describe("updated_at backfill on init", async () => {
     };
     expect(before.updated_at).toBeNull();
 
-    // Re-run init: migration should backfill without touching the row otherwise.
+    // Re-run init as on a pre-v11 vault: migration should backfill without touching the row otherwise.
+    stampAsVersion(raw, 10);
     initSchema(raw);
     const after = raw.prepare("SELECT created_at, updated_at FROM notes WHERE id = ?").get(
       "legacy",
@@ -9086,6 +9087,7 @@ describe("schema migration v15 → v16", async () => {
       return origExec(sql);
     };
 
+    stampAsVersion(db, 15);
     expect(() => initSchema(db)).toThrow("simulated crash mid-v16-migration");
 
     // Pre-v16 shape after rollback: vault_name column must not exist; the
@@ -9550,3 +9552,13 @@ describe("reference target_tags", async () => {
     expect(r.fields.node.target_tags).toEqual(["node"]);
   });
 });
+
+/**
+ * Stamp `db` as a vault last opened at schema `version`, so the next initSchema runs the migrations as on an
+ * upgrade. initSchema skips them on a vault already at SCHEMA_VERSION (T-412), so a test that plants old-shaped
+ * data in a fresh vault must also say the vault is old.
+ */
+function stampAsVersion(db: Database, version: number): void {
+  db.exec("DELETE FROM schema_version");
+  db.prepare("INSERT INTO schema_version (version, applied_at) VALUES (?, ?)").run(version, "2020-01-01T00:00:00.000Z");
+}
