@@ -21,6 +21,7 @@
  *   - **No JavaScript.** Entirely form-based. Submit is the only interaction.
  */
 import { WORDMARK_TEXT, brandMarkSvg } from "./brand.ts";
+import { redirectHome } from "./clients.ts";
 import { renderCsrfHiddenInput } from "./csrf.ts";
 import { NOSTR_LOGIN_STYLES, renderNostrKeyDoor } from "./nostr-login-ui.ts";
 import { type ScopeExplanation, explainScope, riskForExplanation } from "./scope-explanations.ts";
@@ -355,6 +356,30 @@ export function renderLogin(props: LoginViewProps): string {
   return baseDocument("Sign in to Parachute Hub", body);
 }
 
+/**
+ * Where the app sends you back after Approve, shown under its name on the
+ * consent page for every client (audit L3-04). A self-registered app can take
+ * any name; the redirect origin is the part it can't fake, since the code goes
+ * there. Origin only (scheme, host, port): the path adds noise, not trust.
+ */
+function renderReturnsTo(redirectUri: string): string {
+  let origin = redirectUri;
+  try {
+    origin = new URL(redirectUri).origin;
+  } catch {
+    // The handler only renders consent for a registered, parsed redirect_uri;
+    // fall back to the raw value rather than hiding it.
+  }
+  const local =
+    redirectHome(redirectUri) === "loopback"
+      ? ` <span class="client-return-note">an app on this device</span>`
+      : "";
+  return `<p class="client-return">
+          <span class="client-return-label">Sends you back to</span>
+          <code>${escapeHtml(origin)}</code>${local}
+        </p>`;
+}
+
 export function renderConsent(props: ConsentViewProps): string {
   const {
     params,
@@ -471,6 +496,7 @@ export function renderConsent(props: ConsentViewProps): string {
           <span class="brand-name">${WORDMARK_TEXT}</span>
         </div>
         <h1>Approve <span class="client-name">${escapeHtml(clientName)}</span>?</h1>
+        ${renderReturnsTo(params.redirectUri)}
         <p class="subtitle">
           This app is requesting access to your Parachute account.
         </p>
@@ -1275,6 +1301,23 @@ const STYLES = `
     flex-wrap: wrap;
   }
   .client-meta-label { text-transform: uppercase; letter-spacing: 0.05em; }
+  .client-return {
+    margin: 0 0 0.6rem;
+    font-size: 0.9rem;
+    color: ${PALETTE.fgMuted};
+    display: flex;
+    gap: 0.4rem;
+    align-items: baseline;
+    flex-wrap: wrap;
+  }
+  .client-return code {
+    font-family: ${FONT_MONO};
+    font-size: 0.88rem;
+    font-weight: 600;
+    color: ${PALETTE.fg};
+    word-break: break-all;
+  }
+  .client-return-note { color: ${PALETTE.fgDim}; font-size: 0.8rem; }
   .client-meta code {
     font-family: ${FONT_MONO};
     font-size: 0.78rem;
@@ -1774,6 +1817,8 @@ const STYLES = `
     .scope { background: #1f1c18; border-color: #3a362f; }
     .scope-name { color: #e8e4dc; }
     .client-meta code { background: #1f1c18; color: #a8a29a; }
+    .client-return { color: #a8a29a; }
+    .client-return code { color: #f0ece4; }
     .btn-secondary { background: #25221d; border-color: #3a362f; color: #a8a29a; }
     .btn-secondary:hover { color: #e8e4dc; border-color: #6b6860; }
     .error-help { border-color: #3a362f; color: #a8a29a; }

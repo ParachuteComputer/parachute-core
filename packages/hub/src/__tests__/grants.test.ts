@@ -18,6 +18,8 @@ import {
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { createUser } from "../users.ts";
 
+const APP_CB = "https://app.example/cb";
+
 async function harness() {
   const dir = mkdtempSync(join(tmpdir(), "phub-grants-"));
   const db = openHubDb(hubDbPath(dir));
@@ -129,11 +131,11 @@ describe("grants module (#75)", () => {
         clientName: "mcp-reconnect",
       });
       recordGrant(h.db, h.userId, named.client.clientId, ["account:self:vaults"]);
-      expect(isCoveredByGrantForClientName(h.db, h.userId, "mcp-reconnect", ["account:vaults"])).toBe(
+      expect(isCoveredByGrantForClientName(h.db, h.userId, "mcp-reconnect", [APP_CB], ["account:vaults"])).toBe(
         true,
       );
       expect(
-        isCoveredByGrantForClientName(h.db, h.userId, "mcp-reconnect", [
+        isCoveredByGrantForClientName(h.db, h.userId, "mcp-reconnect", [APP_CB], [
           "account:vaults",
           "vault:work:read",
         ]),
@@ -141,7 +143,7 @@ describe("grants module (#75)", () => {
       expect(revokeGrant(h.db, h.userId, named.client.clientId)).toBe(true);
       recordGrant(h.db, h.userId, named.client.clientId, ["account:vaults"]);
       expect(
-        isCoveredByGrantForClientName(h.db, h.userId, "mcp-reconnect", ["account:self:vaults"]),
+        isCoveredByGrantForClientName(h.db, h.userId, "mcp-reconnect", [APP_CB], ["account:self:vaults"]),
       ).toBe(true);
     } finally {
       h.cleanup();
@@ -238,10 +240,39 @@ describe("findGrantByClientName / isCoveredByGrantForClientName (hub#409)", () =
         clientName: "claude-code",
       });
       // findGrantByClientName should return the prior grant
-      const grant = findGrantByClientName(h.db, h.userId, "claude-code");
+      const grant = findGrantByClientName(h.db, h.userId, "claude-code", [APP_CB]);
       expect(grant).not.toBeNull();
       expect(grant?.clientId).toBe(reg1.client.clientId);
       expect(grant?.scopes).toEqual(["a", "b"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("only a client with the same redirect home carries the name's trust (audit L3-04)", async () => {
+    const h = await harness();
+    try {
+      const real = registerClient(h.db, { redirectUris: [APP_CB], clientName: "Claude" });
+      recordGrant(h.db, h.userId, real.client.clientId, ["vault:default:read"]);
+      const cli = registerClient(h.db, {
+        redirectUris: ["http://127.0.0.1:41001/callback"],
+        clientName: "Claude Code",
+      });
+      recordGrant(h.db, h.userId, cli.client.clientId, ["vault:default:read"]);
+      const read = ["vault:default:read"];
+      // Same origin, another path: the app re-registered.
+      expect(isCoveredByGrantForClientName(h.db, h.userId, "Claude", ["https://app.example/other"], read)).toBe(true);
+      // A stranger's host, a look-alike subdomain, the http twin: no trust.
+      for (const uri of ["https://evil.example/cb", "https://app.example.evil.example/cb", "http://app.example/cb"]) {
+        expect(isCoveredByGrantForClientName(h.db, h.userId, "Claude", [uri], read)).toBe(false);
+      }
+      // The trusted origin listed beside a stranger's: the grant would cover both, so no trust.
+      expect(isCoveredByGrantForClientName(h.db, h.userId, "Claude", [APP_CB, "https://evil.example/cb"], read)).toBe(false);
+      // Loopback on any port and host spelling counts as the same home.
+      expect(isCoveredByGrantForClientName(h.db, h.userId, "Claude Code", ["http://localhost:50123/callback"], read)).toBe(true);
+      expect(isCoveredByGrantForClientName(h.db, h.userId, "Claude Code", ["https://cli.example/callback"], read)).toBe(false);
+      // Loopback never carries a hosted app's trust.
+      expect(isCoveredByGrantForClientName(h.db, h.userId, "Claude", ["http://127.0.0.1:9/cb"], read)).toBe(false);
     } finally {
       h.cleanup();
     }
@@ -255,7 +286,7 @@ describe("findGrantByClientName / isCoveredByGrantForClientName (hub#409)", () =
         clientName: "claude-code",
       });
       // No grants recorded
-      expect(findGrantByClientName(h.db, h.userId, "claude-code")).toBeNull();
+      expect(findGrantByClientName(h.db, h.userId, "claude-code", [APP_CB])).toBeNull();
     } finally {
       h.cleanup();
     }
@@ -264,7 +295,7 @@ describe("findGrantByClientName / isCoveredByGrantForClientName (hub#409)", () =
   test("returns null when client_name is empty string", async () => {
     const h = await harness();
     try {
-      expect(findGrantByClientName(h.db, h.userId, "")).toBeNull();
+      expect(findGrantByClientName(h.db, h.userId, "", [APP_CB])).toBeNull();
     } finally {
       h.cleanup();
     }
@@ -281,7 +312,7 @@ describe("findGrantByClientName / isCoveredByGrantForClientName (hub#409)", () =
       // Another user — should NOT see the grant. (hub is single-user-by-
       // default; pass allowMulti for the test.)
       const other = await createUser(h.db, "other-user", "pw", { allowMulti: true });
-      expect(findGrantByClientName(h.db, other.id, "claude-code")).toBeNull();
+      expect(findGrantByClientName(h.db, other.id, "claude-code", [APP_CB])).toBeNull();
     } finally {
       h.cleanup();
     }
@@ -317,7 +348,7 @@ describe("findGrantByClientName / isCoveredByGrantForClientName (hub#409)", () =
         ["a", "b"],
         new Date("2026-04-10T00:00:00Z"),
       );
-      const grant = findGrantByClientName(h.db, h.userId, "claude-code");
+      const grant = findGrantByClientName(h.db, h.userId, "claude-code", [APP_CB]);
       // Most recent = reg3's grant (2026-04-15)
       expect(grant?.clientId).toBe(reg3.client.clientId);
       expect(grant?.scopes).toEqual(["a", "c"]);
@@ -338,10 +369,10 @@ describe("findGrantByClientName / isCoveredByGrantForClientName (hub#409)", () =
         "vault:default:write",
       ]);
       expect(
-        isCoveredByGrantForClientName(h.db, h.userId, "claude-code", ["vault:default:read"]),
+        isCoveredByGrantForClientName(h.db, h.userId, "claude-code", [APP_CB], ["vault:default:read"]),
       ).toBe(true);
       expect(
-        isCoveredByGrantForClientName(h.db, h.userId, "claude-code", [
+        isCoveredByGrantForClientName(h.db, h.userId, "claude-code", [APP_CB], [
           "vault:default:read",
           "vault:default:write",
         ]),
@@ -361,10 +392,10 @@ describe("findGrantByClientName / isCoveredByGrantForClientName (hub#409)", () =
       recordGrant(h.db, h.userId, reg.client.clientId, ["vault:default:read"]);
       // Asking for write — not previously granted
       expect(
-        isCoveredByGrantForClientName(h.db, h.userId, "claude-code", ["vault:default:write"]),
+        isCoveredByGrantForClientName(h.db, h.userId, "claude-code", [APP_CB], ["vault:default:write"]),
       ).toBe(false);
       expect(
-        isCoveredByGrantForClientName(h.db, h.userId, "claude-code", [
+        isCoveredByGrantForClientName(h.db, h.userId, "claude-code", [APP_CB], [
           "vault:default:read",
           "vault:default:write",
         ]),
@@ -382,7 +413,7 @@ describe("findGrantByClientName / isCoveredByGrantForClientName (hub#409)", () =
         clientName: "claude-code",
       });
       recordGrant(h.db, h.userId, reg.client.clientId, ["a"]);
-      expect(isCoveredByGrantForClientName(h.db, h.userId, "claude-code", [])).toBe(false);
+      expect(isCoveredByGrantForClientName(h.db, h.userId, "claude-code", [APP_CB], [])).toBe(false);
     } finally {
       h.cleanup();
     }

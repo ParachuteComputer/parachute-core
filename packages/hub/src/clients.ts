@@ -467,6 +467,137 @@ export function expandRedirectUrisForHubOrigins(
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// Who may call itself Parachute (audit L3-04, consent phishing)
+// ---------------------------------------------------------------------------
+//
+// Public DCR needs no sign-in, so anyone can register "Parachute Console
+// (official)" pointing at their own host and send a person the authorize link.
+// The consent page now shows where the app sends you back; on top of that, a
+// name that looks like Parachute's own is kept for Parachute's own apps.
+
+/** Longest `client_name` DCR accepts. Names render on the consent page. */
+export const CLIENT_NAME_MAX_LENGTH = 100;
+
+/**
+ * Parachute's own app origins, which register Notes ("Parachute Notes")
+ * against a box: the cloud's app and account hosts and the standalone Notes
+ * deploy. Exact origins only: other `*.parachute.computer` hosts include
+ * boxes and vaults run for other people.
+ */
+export const PARACHUTE_APP_ORIGINS: readonly string[] = [
+  "https://app.parachute.computer",
+  "https://my.parachute.computer",
+  "https://notes.parachute.computer",
+];
+
+/**
+ * Names first-party clients send from origins that aren't this hub's: another
+ * Parachute hub registering itself as an agent connector
+ * (`oauth-client.ts` `registerClient`) has a redirect on ITS own origin.
+ * Exact match; the consent page shows that origin.
+ */
+const FIRST_PARTY_NAMES_FROM_ANYWHERE: ReadonlySet<string> = new Set([
+  "Parachute Hub (agent connector)",
+]);
+
+/** Letters from other scripts that read as Latin in the word "parachute". */
+const LOOKALIKES: Readonly<Record<string, string>> = {
+  а: "a", // Cyrillic
+  с: "c",
+  е: "e",
+  һ: "h",
+  р: "p",
+  т: "t",
+  υ: "u", // Greek
+  α: "a",
+  ε: "e",
+  ρ: "p",
+  τ: "t",
+  ϲ: "c",
+  ս: "u", // Armenian
+  ⲣ: "p", // Coptic
+  ɑ: "a", // Latin alpha, upsilon, small capitals
+  ʋ: "u",
+  ᴀ: "a",
+  ᴄ: "c",
+  ᴇ: "e",
+  ʜ: "h",
+  ᴘ: "p",
+  ʀ: "r",
+  ᴛ: "t",
+  ᴜ: "u",
+  "4": "a", // digits standing in for letters
+  "3": "e",
+  "7": "t",
+};
+
+/**
+ * True when `name` reads as "parachute" once case, accents, width, spacing,
+ * punctuation and common look-alike letters are set aside: "Para-chute",
+ * "P.A.R.A.C.H.U.T.E", fullwidth or Cyrillic spellings all count.
+ */
+export function looksLikeParachute(name: string): boolean {
+  let folded = "";
+  for (const ch of name.normalize("NFKD").toLowerCase()) {
+    const c = LOOKALIKES[ch] ?? ch;
+    if (/[a-z0-9]/.test(c)) folded += c;
+  }
+  return folded.includes("parachute");
+}
+
+function isLoopbackHost(hostname: string): boolean {
+  const h = hostname.replace(/^\[|\]$/g, "");
+  return h === "localhost" || h === "::1" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
+}
+
+/**
+ * Where a redirect sends the person, for comparing two clients: the origin,
+ * or `"loopback"` for any loopback host and port (RFC 8252 §7.3: a native app
+ * picks a fresh port each run, and only software on the person's own machine
+ * can receive it). Null when it doesn't parse.
+ */
+export function redirectHome(uri: string): string | null {
+  try {
+    const u = new URL(uri);
+    return isLoopbackHost(u.hostname) ? "loopback" : u.origin;
+  } catch {
+    return null;
+  }
+}
+
+/** A redirect that only Parachute (or the person's own machine) can receive. */
+export function isFirstPartyRedirect(uri: string, hubOrigins: readonly string[]): boolean {
+  const home = redirectHome(uri);
+  if (home === null) return false;
+  if (home === "loopback" || PARACHUTE_APP_ORIGINS.includes(home)) return true;
+  return hubOrigins.some((o) => redirectHome(o) === home);
+}
+
+/**
+ * Why DCR must refuse this `client_name`, or null when it may register.
+ * `operatorRegistered`: the registration authenticated as this hub's admin
+ * (bearer `hub:admin`, or an admin's session on the hub's own origin), which
+ * may use any name. Otherwise a Parachute-looking name needs every redirect_uri to be
+ * first-party (`isFirstPartyRedirect`), or be a known first-party name.
+ */
+export function clientNameProblem(
+  name: unknown,
+  redirectUris: readonly string[],
+  hubOrigins: readonly string[],
+  operatorRegistered: boolean,
+): string | null {
+  if (name === undefined || name === null) return null;
+  if (typeof name !== "string") return "client_name must be a string";
+  if (name.length > CLIENT_NAME_MAX_LENGTH) {
+    return `client_name must be at most ${CLIENT_NAME_MAX_LENGTH} characters`;
+  }
+  if (operatorRegistered || !looksLikeParachute(name)) return null;
+  if (FIRST_PARTY_NAMES_FROM_ANYWHERE.has(name)) return null;
+  if (redirectUris.every((u) => isFirstPartyRedirect(u, hubOrigins))) return null;
+  return "client_name is reserved for Parachute's own apps; choose a name of your own";
+}
+
 export function verifyClientSecret(client: OAuthClient, presented: string): boolean {
   if (!client.clientSecretHash) return false;
   const presentedHash = createHash("sha256").update(presented).digest("hex");
