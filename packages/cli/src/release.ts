@@ -112,7 +112,7 @@ class Exit extends Error {
  */
 export function withReleaseLock<T>(home: string, fn: () => T, waitMs = 60_000, busy = "another parachute command is backing up or rolling back this home; run this again when it has finished"): T {
   mkdirSync(join(home, "run"), { recursive: true, mode: 0o700 });
-  // Tried in short attempts, closing the connection between them. BEGIN EXCLUSIVE takes SHARED first and then
+  // Tried in attempts of up to 2 s, closing the connection between them. BEGIN EXCLUSIVE takes SHARED first and then
   // escalates, so two commands arriving in the same moment each held SHARED while waiting for the other to let go,
   // and both slept in SQLite's busy handler for the whole wait (T-418 found it: lifecycle/upgrade's race, about 1 in
   // 30). Letting go between attempts breaks that tie.
@@ -121,7 +121,9 @@ export function withReleaseLock<T>(home: string, fn: () => T, waitMs = 60_000, b
     const db = new Database(join(home, RELEASE_LOCK), { create: true });
     try {
       chmodSync(join(home, RELEASE_LOCK), 0o600);
-      db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.min(250, deadline - Date.now()))}`);
+      // Each attempt waits up to 2 s holding SQLite's PENDING lock, so new commands queue behind it and it isn't
+      // starved; a tie (both waiting) ends when one attempt gives up.
+      db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.min(2_000, deadline - Date.now()))}`);
       db.exec("PRAGMA locking_mode = EXCLUSIVE");
       db.exec("BEGIN EXCLUSIVE");
       db.exec("CREATE TABLE IF NOT EXISTS hold (pid INTEGER)");
@@ -217,7 +219,7 @@ function recheckOrStop(recheck: Recheck): void {
 /** Options for a command's release step. */
 export interface BeforeOpenOpts {
   /**
-   * A command that only drives the running server (start, stop or restart with no module named): while another process holds
+   * A command that only drives the running server (stop or restart with no module named): while another process holds
    * the home it takes no step and goes on, so `parachute restart` after installing a new release still works (0.8's
    * own upgrade advice). The serve it starts takes the step, once the old server has let go.
    */
@@ -233,6 +235,7 @@ export function beforeOpen(home: string, say: (s: string) => void = (s) => conso
   // A home the old 0.7 programs still own is the takeover's: nothing is written to it, not even the lock.
   if (!readRelease(home) && serveRefusal(home) !== null) return undefined;
   let triedAlone = false;
+  let strayChecked = false;
   for (let attempt = 0; attempt < 3; attempt++) {
     // Every command holds the lock shared while it runs, so no rollback can move a database under it. Once held, the
     // newer-data check runs again: a newer release may have moved the home while this one waited.
@@ -265,7 +268,7 @@ export function beforeOpen(home: string, say: (s: string) => void = (s) => conso
     // The record names this release, but is another release serving the home? Then a command that never served it
     // wrote the record (T-418: 11-05). It is moved aside, so the real step backs the home up when this release does
     // open it; then this command stops like any other while another release serves (a unit command goes on).
-    if (!triedAlone && process.platform === "linux" && otherServers(home).length) {
+    if (!strayChecked && process.platform === "linux" && otherServers(home).length) {
       letGoShared();
       let moved: string | undefined;
       try {
@@ -282,9 +285,9 @@ export function beforeOpen(home: string, say: (s: string) => void = (s) => conso
       }
       if (moved) say(`parachute: run/release.json said ${r.version} serves this home, but another Parachute does; that record was written by a command that never served it, and is moved aside to ${moved}`);
       if (moved || confirmedOthers(home).length) {
-        if (servedElsewhere(home, undefined, opts)) return holdSharedAndGo(home, recheck);
+        if (servedElsewhere(home, moved ? undefined : r, opts)) return holdSharedAndGo(home, recheck);
       }
-      triedAlone = true;
+      strayChecked = true;
       continue;
     }
     const recovered = (r.skipped ?? []).filter((rel) => existsSync(join(home, rel)) && readable(join(home, rel), dirname(home)));
@@ -355,9 +358,9 @@ function hasOpen(pid: number, id: string): boolean {
 }
 
 /**
- * Parachute servers of another release holding this home's data: processes holding a database whose program is
- * Parachute's (a replicator, a backup tool or a sqlite3 shell is not a server, and doesn't stop the step: the backup
- * is a consistent copy), and which don't hold the release lock (every command of this release does while it runs).
+ * Parachute servers of another release holding this home's data: `serve` processes of Parachute's programs holding a
+ * database (anything else holding one doesn't stop the step: the backup is a consistent copy), which don't hold the
+ * release lock (every command of this release does while it runs).
  */
 function otherServers(home: string): Holder[] {
   let lockId = "";
@@ -365,8 +368,11 @@ function otherServers(home: string): Holder[] {
     const st = statSync(join(home, RELEASE_LOCK));
     lockId = `${st.dev}:${st.ino}`;
   } catch {}
-  const parachute = (h: Holder) => h.cmd.split(" ").slice(0, 2).some((w) => /parachute/i.test(basename(w)));
-  return holders(home).filter((h) => parachute(h) && !(lockId && process.platform === "linux" && hasOpen(h.pid, lockId)));
+  // A Parachute server: its program is Parachute's (…/parachute, …/parachute-core, …/src/parachute-vault.ts; the
+  // path may hold spaces, so the whole command line is matched) and it runs `serve`. A sqlite3 shell on
+  // ~/.parachute/hub.db, a replicator or an older `parachute-vault mcp` is not.
+  const server = (h: Holder) => /\/parachute(-core|-vault)?(\.ts)? serve( |$)/.test(h.cmd);
+  return holders(home).filter((h) => server(h) && !(lockId && process.platform === "linux" && hasOpen(h.pid, lockId)));
 }
 
 /**

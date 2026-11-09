@@ -38,13 +38,13 @@ home with data:
    2026-11-05 a 0.9 `parachute-vault --help`, run with no `PARACHUTE_HOME` on a box whose 0.8 unit served
    `~/.parachute`, recorded 0.9 as current there while 0.8 kept serving; a real 0.9 start would then have skipped
    its backup. Stop the serving release (its unit, or `parachute stop`) to move the home, or run the command with
-   the release that serves it. `parachute start`, `stop` and `restart` with no module named only drive the unit, so
-   they go on without a step (0.8 says to upgrade with "install, then `parachute restart`"); the serve they start
+   the release that serves it. `parachute stop` and `restart` with no module named only drive the unit, so they go on
+   without a step (0.8 says to upgrade with "install, then `parachute restart`"); the serve they start
    takes the step once the old server has let go.
    A record that names this release while another release's server holds the home was written by a command that
    never served it (the 11-05 record): it is moved aside (`run/release.json.stray-<time>`), so the real step later
-   backs the home up. Only Parachute's own programs count as a server: a sqlite3 shell or a replicator holding a
-   database doesn't stop the step (the backup is a consistent copy).
+   backs the home up. Only a Parachute `serve` counts as a server: a sqlite3 shell, a replicator or an older
+   `parachute-vault mcp` holding a database doesn't stop the step (the backup is a consistent copy).
 5. **A record is trusted only with its backup.** Each later command checks that the backup the record names still
    has its `manifest.json` for this step. If it is gone, the home is backed up again first (never while another
    release holds the data, and without waiting on a running 0.9 command: then the next command that runs alone

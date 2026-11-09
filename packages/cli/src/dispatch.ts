@@ -235,9 +235,10 @@ export async function dispatch(role: Role, notice?: Notice): Promise<void> {
     const { beforeOpenOrExit } = await import("./release.ts");
     // Commands that only drive the server's unit go on while another release serves the home (taking no step): the
     // serve they start takes it. `parachute restart` after installing a new release is how 0.8 says to upgrade. Only
-    // with no module named: `status`, and start/stop/restart of a module, open hub.db (and 0.9 would add its tables).
+    // with no module named: `status`, and stop/restart of a module, open hub.db (and 0.9 would add its tables). Not
+    // `start`: on a box without a unit it offers the move to a supervised unit, which must not run under 0.8.
     const named = r.argv.slice(1).filter((a, i, all) => !a.startsWith("-") && all[i - 1] !== "--hub-origin"); // a module, not a flag's value
-    const unitCommand = r.cli === "hub" && ["start", "stop", "restart"].includes(r.argv[0] ?? "") && named.length === 0;
+    const unitCommand = r.cli === "hub" && ["stop", "restart"].includes(r.argv[0] ?? "") && named.length === 0;
     const code = beforeOpenOrExit(home, newerCheck, { passIfServed: unitCommand });
     if (code !== null) process.exit(code);
   }
