@@ -93,10 +93,31 @@ describe("mcp/records", () => {
     expect(Array.isArray(near)).toBe(true);
     await expect(c.call("create-record", { path: `${path}-2`, body: "a", content: "b" })).rejects.toThrow(/pass `body` or `content`, not both/);
     await expect(c.call("query-records", { near: { note: path } })).rejects.toThrow(/near takes \{id\}, not \{note\}/);
-    const ignored = await c.call("query-records", { tags: "x", limit: 1 });
-    expect(ignored.warnings).toContainEqual(expect.objectContaining({ code: "unknown_parameter", field: "tags", hint: "use tag" }));
-    expect(ignored.warnings.find((w: any) => w.code === "unknown_parameter").message).toMatch(/^query-records has no parameter `tags`/);
+    await expect(c.call("query-records", { tags: "x", limit: 1 })).rejects.toThrow(/\] query-records has no parameter `tags`\. Did you mean `tag`\?/);
     await expect(c.call("update-record", { record_id: "x", append: "y" })).rejects.toThrow(/Did you mean `id`/);
+    await c.close();
+  });
+
+  test("the 0.9 tools refuse a parameter they don't take, with the fix; the 0.8 names still run and warn, as 0.8 did", async () => {
+    // L7-12: query-records {typo_param} returned the whole vault, and a misspelt filter a plausible wrong answer.
+    // Nobody called the record door before 0.9, so it refuses; a 0.8 client on the note door keeps working (SPEC v2 §4.3).
+    const c = await session("admin");
+    const path = `records/${runId("strict")}`;
+    await expect(c.call("query-records", { typo_param: 1 })).rejects.toThrow(/\] query-records has no parameter `typo_param`\./);
+    await expect(c.call("query-records", { metadata_filter: { a: 1 } })).rejects.toThrow(/has no parameter `metadata_filter`/);
+    // Refused before anything is written.
+    await expect(c.call("create-record", { path, body: "x", colour: "red" })).rejects.toThrow(/\] create-record has no parameter `colour`/);
+    expect((await c.call("query-records", { id: path })).error_type).toBe("not_found");
+    await expect(c.call("manage-types", { action: "rename", old_name: "a", new_name: "b", fields: {} })).rejects.toThrow(/manage-types has no parameter `fields`/);
+    // Old names and the account door's `vault` are still taken, and `_`-names stay free for clients.
+    const made = await c.call("create-record", { path, content: "old word", _client: "probe" });
+    expect(made.body).toBe("old word");
+    const listed = await c.call("query-records", { limit: 1, _trace: 1 });
+    expect(listed.error_type).toBeUndefined();
+    expect(Array.isArray(listed) || Array.isArray(listed.records)).toBe(true);
+    // The note door runs the same call as 0.8 did, and says what it ignored.
+    const old = await c.call("query-notes", { typo_param: 1, limit: 1 });
+    expect(old.warnings).toContainEqual(expect.objectContaining({ code: "unknown_parameter", field: "typo_param" }));
     await c.close();
   });
 

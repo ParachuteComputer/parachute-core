@@ -9,9 +9,9 @@
  * Nothing is lost: the full text and every parameter stay in
  * `MCP_TOOL_REFERENCE` (mcp-manifest.ts), which `vault-info { help: "<tool>" }`
  * returns, and every parameter the reference names is still accepted. A
- * parameter a tool doesn't know is ignored, as 0.8 ignored it, and named with
- * its one-line fix (`unknownParams`); a misused nested key is refused
- * (`nestedParamProblem`).
+ * parameter a tool doesn't know is named with its one-line fix (`unknownParams`):
+ * refused by the tools 0.9 adds (REFUSES_UNKNOWN_PARAMS), ignored by the 0.8
+ * names, as 0.8 ignored it. A misused nested key is refused (`nestedParamProblem`).
  *
  * These texts shipped only after `contracts/evals/mcp-tasks` showed agents do
  * as well with them as with the long ones, model by model. Change them the
@@ -289,14 +289,33 @@ export interface ParamProblem {
 }
 
 /**
+ * The tools 0.9 adds. Nobody called them before 0.9, so they refuse a parameter they don't take (audit L7-12: a
+ * misspelt filter on query-records returned the whole vault). Every name a 0.8 client can call keeps 0.8's rule:
+ * the call runs with the name ignored, and the answer says so (SPEC v2 §4.3, the same split as `tag` naming a type:
+ * refused on the record door, warned and counted on the note door).
+ */
+export const REFUSES_UNKNOWN_PARAMS: ReadonlySet<string> = new Set([
+  "query-records",
+  "create-record",
+  "update-record",
+  "delete-record",
+  "list-types",
+  "manage-types",
+  "attachment-url",
+  "manage-keys",
+]);
+
+/**
  * The call's top-level names the tool doesn't accept (`accepted`: the names in
  * its full reference schema), each with its one-line fix. 0.8 ignored such a
- * name and ran the call; 0.9 still does (nothing is removed before 1.0), and
- * reports each one (src/mcp-tools.ts: a warning on the answer and a counted log
- * line), so 1.0 can decide from real use whether to refuse them. Names starting
- * with `_` and the account door's `vault` are always allowed.
+ * name and ran the call; on a 0.8 name 0.9 still does (nothing a 0.8 client
+ * sends is refused before 1.0), and reports each one (src/mcp-tools.ts: a
+ * warning on the answer and a counted log line), so 1.0 can decide from real use
+ * whether to refuse them. A tool in REFUSES_UNKNOWN_PARAMS refuses the call
+ * instead (`refused` words the message so). Names starting with `_` and the
+ * account door's `vault` are always allowed.
  */
-export function unknownParams(tool: string, params: Record<string, unknown>, accepted: readonly string[]): ParamProblem[] {
+export function unknownParams(tool: string, params: Record<string, unknown>, accepted: readonly string[], refused = false): ParamProblem[] {
   const known = new Set(accepted);
   const out: ParamProblem[] = [];
   for (const key of Object.keys(params ?? {})) {
@@ -305,7 +324,7 @@ export function unknownParams(tool: string, params: Record<string, unknown>, acc
     const near = alias && known.has(alias) ? alias : [...known].map((k) => [k, distance(key, k)] as const).sort((a, b) => a[1] - b[1]).find(([, d]) => d <= 2)?.[0];
     const fix = near ? ` Did you mean \`${near}\`?` : "";
     out.push({
-      message: `${tool} has no parameter \`${key}\`, so it was ignored.${fix} ${HELP(tool)}`,
+      message: `${tool} has no parameter \`${key}\`${refused ? "." : ", so it was ignored."}${fix} ${HELP(tool)}`,
       error_type: "unknown_parameter",
       field: key,
       hint: near ? `use ${near}` : `see vault-info {help: "${tool}"}`,

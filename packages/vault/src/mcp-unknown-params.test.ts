@@ -69,7 +69,7 @@ function captureStderr() {
   return { lines, restore: () => spy.mockRestore() };
 }
 
-describe("unknown parameters are ignored, as on 0.8, with a warning and a counted log line", () => {
+describe("unknown parameters: ignored on a 0.8 name, as on 0.8, with a warning and a counted log line; refused on a tool 0.9 adds", () => {
   test("query-notes {tags} runs as if it weren't there, and the answer names the fix", async () => {
     await seed();
     const log = captureStderr();
@@ -142,16 +142,21 @@ describe("unknown parameters are ignored, as on 0.8, with a warning and a counte
     await expect(tool("query-notes")({ near: { id: "a/one" } })).rejects.toThrow(/near takes \{note_id\}, not \{id\}/);
   });
 
-  test("manage-types names a parameter the action called doesn't take", async () => {
+  test("manage-types (new in 0.9) refuses a parameter the action called doesn't take, before it runs", async () => {
     await seed();
     const log = captureStderr();
-    let r: any;
     try {
-      r = await tool("manage-types")({ action: "rename", old_name: "alpha", new_name: "gamma", fields: { x: { type: "string" } } });
+      await expect(tool("manage-types")({ action: "rename", old_name: "alpha", new_name: "gamma", fields: { x: { type: "string" } } })).rejects.toMatchObject({
+        error_type: "unknown_parameter",
+        field: "fields",
+        message: expect.stringMatching(/^manage-types has no parameter `fields`\./),
+      });
     } finally {
       log.restore();
     }
-    expect((r.warnings ?? []).map((w: any) => w.field)).toEqual(["fields"]);
+    expect(log.lines.some((l) => l.includes("manage-types.fields"))).toBe(true); // still counted
+    const one = await tool("query-notes")({ id: "a/one" });
+    expect(one.tags).toEqual(["alpha"]); // nothing renamed
     // ...and the update action, which does take `fields` and `kind`, is not warned about them.
     const u = await tool("manage-types")({ tag: "delta", fields: { y: { type: "string" } }, kind: "type" });
     expect((u.warnings ?? []).filter((w: any) => w.code === "unknown_parameter")).toEqual([]);

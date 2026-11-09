@@ -12,7 +12,7 @@ import { MCP_TOOL_REFERENCE, acceptedParams } from "../core/src/mcp-manifest.ts"
 import { mergeTypesIntoTags } from "../core/src/tag-kind.ts";
 import { addRecordTools, NOTE_TOOL_NAMES, RECORD_TOOL_NAMES, recordParamNames, recordSchema, recordWords } from "../core/src/mcp-records.ts";
 import { countName } from "./name-usage.ts";
-import { nestedParamProblem, NEW_TOOLS, SHORT_TOOLS, TOOL_ALIASES, TOOL_ORDER, aliasDescription, unknownParams, type ParamProblem } from "../core/src/mcp-short.ts";
+import { nestedParamProblem, NEW_TOOLS, SHORT_TOOLS, TOOL_ALIASES, TOOL_ORDER, aliasDescription, unknownParams, REFUSES_UNKNOWN_PARAMS, type ParamProblem } from "../core/src/mcp-short.ts";
 import { getNote, getNoteTags, getVaultMap, getVaultStats } from "../core/src/notes.ts";
 import { narrowLinkWarningsForVisibility } from "../core/src/wikilinks.ts";
 import type { Note } from "../core/src/types.ts";
@@ -495,14 +495,14 @@ function applyRecordWordsToVaultInfo(tools: McpToolDef[]): void {
 
 const VERB_RANK: Record<string, number> = { read: 0, write: 1, admin: 2 };
 
-/** Ignored unknown parameters so far, per `tool.param`, in this process (the counted log line). */
+/** Unknown parameters so far (ignored on a 0.8 name, refused on a 0.9 tool), per `tool.param`, in this process (the counted log line). */
 const unknownParamCounts = new Map<string, number>();
 /** At most this many `tool.param` keys in all, `tool.<other>` ones included: once full, a new name counts as its
  *  tool's `<other>` if that key is already there, and is dropped from the count (still ignored and warned) if not. */
 const UNKNOWN_PARAM_KEYS_MAX = 256;
 
-/** Count one ignored name and log it: every one of the first 10 per name, then every 100th (the count says how many). */
-function countUnknownParam(tool: string, field: string): void {
+/** Count one unknown name and log it: every one of the first 10 per name, then every 100th (the count says how many). */
+function countUnknownParam(tool: string, field: string, refused = false): void {
   // Caller-chosen text: never let it forge a line or grow without bound.
   const name = field.replace(/[^\w.-]/g, "?").slice(0, 64);
   let key = `${tool}.${name}`;
@@ -510,7 +510,7 @@ function countUnknownParam(tool: string, field: string): void {
   if (!unknownParamCounts.has(key) && unknownParamCounts.size >= UNKNOWN_PARAM_KEYS_MAX) return;
   const n = (unknownParamCounts.get(key) ?? 0) + 1;
   unknownParamCounts.set(key, n);
-  if (n <= 10 || n % 100 === 0) console.error(`[mcp] unknown parameter ignored: ${key} (${n} since start)`);
+  if (n <= 10 || n % 100 === 0) console.error(`[mcp] unknown parameter ${refused ? "refused" : "ignored"}: ${key} (${n} since start)`);
 }
 
 /** Every parameter a core tool takes: its full reference schema and the short schema it advertises. */
@@ -519,8 +519,11 @@ function takes(name: string): string[] {
 }
 
 /**
- * Parameters a tool doesn't know (T-318 §4, and the 10-30 decision "nothing
- * removed before 1.0"). As on 0.8 the call runs with them ignored, so no client
+ * Parameters a tool doesn't know. On the tools 0.9 adds (REFUSES_UNKNOWN_PARAMS:
+ * the record tools, manage-types, attachment-url, manage-keys) the call is
+ * refused before it runs, with each name's fix (audit L7-12, SPEC v2 §4.3). On
+ * every name a 0.8 client can call (T-318 §4, and the 10-30 decision "nothing
+ * removed before 1.0") the call runs with them ignored, as on 0.8, so no client
  * that worked on 0.8 breaks. Unlike 0.8 the answer says so:
  *   - an object answer gets a `warnings` entry per name, `{code:
  *     "unknown_parameter", message, field, hint}` (the one-line fix);
@@ -530,7 +533,7 @@ function takes(name: string): string[] {
  *     never the value (`countUnknownParam`), so real exposure can be measured
  *     before 1.0.
  * `manage-types` and `attachment-url` check against the action called: a
- * parameter only another action takes is ignored by this one, so it is named.
+ * parameter only another action takes is refused by this one, with its name.
  * With no valid action (attachment-url has no default) the call is refused with
  * the list of actions, so nothing is silently ignored and nothing is named.
  * A misused nested key (`near: {id}`) is refused, as 0.8 refused it. A tool
@@ -559,9 +562,16 @@ function applyParamTeaching(tools: McpToolDef[], vaultName: string): void {
     tool.execute = async (params) => {
       const nested = nestedParamProblem(tool.name, params ?? {});
       if (nested) throw Object.assign(new Error(nested.message), nested);
-      const unknown = unknownParams(tool.name, params ?? {}, acceptedFor(params ?? {}));
+      const refuses = REFUSES_UNKNOWN_PARAMS.has(tool.name);
+      const unknown = unknownParams(tool.name, params ?? {}, acceptedFor(params ?? {}), refuses);
       if (unknown.length === 0) return execute(params);
-      for (const u of unknown) countUnknownParam(tool.name, u.field);
+      for (const u of unknown) countUnknownParam(tool.name, u.field, refuses);
+      if (refuses) {
+        // Before anything runs, so nothing is written: every unknown name in one message, the first one's fix.
+        const [first] = unknown;
+        const message = unknown.length === 1 ? first!.message : `${unknown.map((u) => u.message.replace(/ Every parameter:.*$/, "")).join(" ")} Every parameter: vault-info {help: "${tool.name}"}.`;
+        throw Object.assign(new Error(message), { error_type: "unknown_parameter", field: first!.field, hint: first!.hint });
+      }
       let result: unknown;
       try {
         result = await execute(params);
