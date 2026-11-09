@@ -17,10 +17,10 @@ afterEach(() => {
 
 const src = (f: string) => JSON.stringify(join(import.meta.dir, f));
 const takers = {
-  "the release lock": (home: string, file: string) =>
+  "the release lock": (home: string) =>
     `const { withReleaseLock } = await import(${src("release.ts")}); console.log(withReleaseLock(${JSON.stringify(home)}, () => "held", 10_000));`,
-  "the keys lock (keys.ts takes it this way)": (_home: string, file: string) =>
-    `const { takeFileLock } = await import(${src("file-lock.ts")}); takeFileLock(${JSON.stringify(file)}, 10_000); console.log("held");`,
+  "the keys lock": (home: string) =>
+    `process.env.PARACHUTE_HOME = ${JSON.stringify(home)}; const { holdKeysLock } = await import(${src("keys.ts")}); holdKeysLock(); console.log("held");`,
 };
 
 for (const [what, script] of Object.entries(takers)) {
@@ -28,7 +28,7 @@ for (const [what, script] of Object.entries(takers)) {
     const home = mkdtempSync(join(tmpdir(), "pcore-file-lock-"));
     made.push(home);
     mkdirSync(join(home, "run"));
-    const file = join(home, RELEASE_LOCK);
+    const file = join(home, what === "the release lock" ? RELEASE_LOCK : join("run", "keys.lock"));
     // The command ahead: it has begun taking the lock (RESERVED), as BEGIN EXCLUSIVE does before it waits out readers.
     const ahead = new Database(file, { create: true });
     ahead.exec("CREATE TABLE IF NOT EXISTS hold (pid INTEGER)");
@@ -37,7 +37,7 @@ for (const [what, script] of Object.entries(takers)) {
     ahead.exec("INSERT INTO hold VALUES (1)");
 
     // The second command asks for the lock now and waits.
-    const second = Bun.spawn(["bun", "-e", script(home, file)], { stdout: "pipe", stderr: "pipe" });
+    const second = Bun.spawn(["bun", "-e", script(home)], { stdout: "pipe", stderr: "pipe" });
     try {
       await Bun.sleep(1_000); // the second command is inside its wait
 

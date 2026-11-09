@@ -26,7 +26,7 @@ let held: Database | undefined;
  * run/keys.lock, held by this process until it exits (the mint runs in this process; the OS releases the lock however
  * it ends). Without it two `keys new worker` at once both pass the check and the mint names the second `worker-2`.
  */
-function holdKeysLock(): void {
+export function holdKeysLock(): void {
   if (held) return;
   const run = join(homeDir(), "run");
   mkdirSync(run, { recursive: true, mode: 0o700 });
