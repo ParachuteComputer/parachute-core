@@ -185,6 +185,7 @@ describe("safety/owner-keys: app keys", () => {
     expect((await call(v, { auth: `bearer ${key}` })).status).toBe(401);
     expect((await call(v, { headers: { "x-api-key": key } })).status).toBe(401);
     expect((await call(`${v}&key=${key}`)).status).toBe(401);
+    expect((await call(`${v}&key=${key}`, { headers: { "x-api-key": "" } })).status).toBe(401); // empty header falls through, as at the vault
     const rpc = { jsonrpc: "2.0", id: 1, method: "tools/list" };
     const root = await call("/mcp", { method: "POST", auth: `Bearer ${key}`, body: rpc, headers: { accept: "application/json, text/event-stream" } });
     expect(root.status).toBe(401);

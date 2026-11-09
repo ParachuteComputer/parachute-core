@@ -80,11 +80,11 @@
  *   /account/mcp                  (POST/DELETE/OPTIONS) → account-level MCP
  *                                                (NIP-98 or account:self:* /
  *                                                host:admin Bearer)
- *   /account/vaults               (GET/POST)   → list / create vault (create returns vault_token;
- *                                                {bare: true} → no welcome notes, T-414)
  *   /account/keys                 (GET/POST)   → named app keys: list (with last use) / mint one vault
  *                                                at read|write, never admin (host:admin bearer, T-414)
- *   /account/keys/<name>          (DELETE)     → revoke an app key (refused at the /vault/* and /mcp door at once)
+ *   /account/keys/<name>          (DELETE)     → revoke an app key (refused at the hub's vault doors at once)
+ *   /account/vaults               (GET/POST)   → list / create vault (create returns vault_token;
+ *                                                {bare: true} → no welcome notes, T-414)
  *   /account/vaults/<name>/rename (POST)       → rename (host-admin)
  *   /account/vaults/<name>        (DELETE)     → teardown (wraps /vaults/<name> cascade)
  *   /account/vaults/<name>/token  (POST)       → per-vault scoped token mint
@@ -998,10 +998,11 @@ async function proxyRequest(
  * malformed token) returns null, and the vault's own auth decides, exactly as before.
  */
 function vaultBearerKey(db: Database, req: Request): { jti: string; token: string; revoked: boolean } | null {
+  // Exactly the vault's order and emptiness rules: a header that is present but empty falls through, as there.
   const header = req.headers.get("authorization");
-  let token: string | null = null;
+  let token: string | null;
   if (header && /^Bearer\s+/i.test(header)) token = header.replace(/^Bearer\s+/i, "");
-  else token = req.headers.get("x-api-key") ?? new URL(req.url).searchParams.get("key");
+  else token = req.headers.get("x-api-key") || new URL(req.url).searchParams.get("key");
   const m = token?.match(/^([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)$/);
   if (!token || !m) return null;
   let jti: unknown;
@@ -1021,12 +1022,16 @@ function vaultBearerKey(db: Database, req: Request): { jti: string; token: strin
  * only once the token's signature checks out against this hub's keys, so a forged token that merely names a
  * jti can't stamp someone's key. Never fails the request.
  */
-async function recordKeyUse(db: Database, use: { jti: string; token: string }, issuers: readonly string[]): Promise<void> {
+async function recordKeyUse(db: Database, use: { jti: string; token: string }): Promise<void> {
   try {
+    // A cheap read first, so the signature check runs at most once a minute per key (touchKey's own SQL throttle
+    // is the guard; this only saves the verify).
     const row = db.query("SELECT last_used_at FROM keys WHERE jti = ?").get(use.jti) as { last_used_at: string | null } | null;
     if (!row) return;
     if (row.last_used_at && Date.now() - Date.parse(row.last_used_at) < KEY_TOUCH_INTERVAL_MS) return;
-    await validateAccessToken(db, use.token, issuers);
+    // The signature is what matters here, not the issuer: the vault already accepted this token, and a key minted
+    // under an earlier origin of this hub still verifies against its keys.
+    await validateAccessToken(db, use.token);
     touchKey(db, use.jti);
   } catch (err) {
     if (err instanceof Error && /database|sqlite/i.test(err.message)) {
@@ -1044,6 +1049,27 @@ function revokedKeyResponse(): Response {
       "www-authenticate": 'Bearer error="invalid_token", error_description="this key has been revoked"',
     },
   });
+}
+
+/**
+ * The key door around a vault proxy (0.9.1, T-414): refuse a revoked hub token before it reaches the vault, and
+ * stamp the key's last use after the vault accepted it. The stamp is awaited so a list right after a write sees it;
+ * it costs one indexed read per request, and a signature check at most once a minute per key. Every hub route that forwards a
+ * bearer to the vault goes through here: `/vault/<name>/*`, `/vault/admin*` and the root `/mcp`.
+ */
+async function throughKeyDoor(
+  req: Request,
+  getDb: (() => Database) | undefined,
+  proxy: () => Promise<Response | undefined>,
+): Promise<Response | undefined> {
+  const db = getDb?.();
+  const keyUse = db ? vaultBearerKey(db, req) : null;
+  if (keyUse?.revoked) return revokedKeyResponse();
+  const proxied = await proxy();
+  if (proxied && keyUse && db && proxied.status !== 401 && proxied.status !== 403) {
+    await recordKeyUse(db, keyUse);
+  }
+  return proxied;
 }
 
 /**
@@ -4306,6 +4332,10 @@ export function hubFetch(
       // credential (it never touches /oauth/authorize, so never hits consent).
       // First-admin-gated (account ≡ box), CSRF double-submit + the same-origin
       // Origin belt below. Stateless (no tokens row); revocation = logout.
+      // Or (T-414) `Authorization: Nostr <event>` (NIP-98) from a linked key of
+      // the hub admin: no cookie, so the belt below passes it (Authorization
+      // isn't ambient) and logout can't end it; it lives its 10 minutes, and
+      // unlinking the key stops new ones.
       if (pathname === "/account/token") {
         if (!getDb) return dbNotConfigured();
         // Origin belt (hub#632 posture): a cookie-authed POST mint gets the
@@ -4584,7 +4614,7 @@ export function hubFetch(
           const gate = forceChangePasswordGate(getDb(), req);
           if (gate) return gate;
         }
-        const proxied = await proxyToVaultAdmin(req, manifestPath, deps?.supervisor, peerAddr);
+        const proxied = await throughKeyDoor(req, getDb, () => proxyToVaultAdmin(req, manifestPath, deps?.supervisor, peerAddr));
         if (proxied) return decorateWithChrome(proxied, req, pathname, getDb);
         return new Response("not found", { status: 404 });
       }
@@ -4627,15 +4657,8 @@ export function hubFetch(
           });
         }
         // The key door (T-414) on the root MCP door too: a vault key spent here is refused at once once revoked.
-        const keyUse = getDb ? vaultBearerKey(getDb(), req) : null;
-        if (keyUse?.revoked) return revokedKeyResponse();
-        const proxied = await proxyToVaultDaemon(req, manifestPath, deps?.supervisor, peerAddr);
-        if (proxied) {
-          if (keyUse && getDb && proxied.status !== 401 && proxied.status !== 403) {
-            await recordKeyUse(getDb(), keyUse, oauthDeps(req).hubBoundOrigins());
-          }
-          return proxied;
-        }
+        const proxied = await throughKeyDoor(req, getDb, () => proxyToVaultDaemon(req, manifestPath, deps?.supervisor, peerAddr));
+        if (proxied) return proxied;
         return vaultModuleNotRunning();
       }
 
@@ -4662,15 +4685,8 @@ export function hubFetch(
         }
         // The key door (0.9.1, T-414): a revoked key is refused here at once, rather than when the vault's
         // 60 s revocation cache next refreshes; and a key the vault accepted gets its last-used time.
-        const keyUse = getDb ? vaultBearerKey(getDb(), req) : null;
-        if (keyUse?.revoked) return revokedKeyResponse();
-        const proxied = await proxyToVault(req, manifestPath, deps?.supervisor, peerAddr);
-        if (proxied) {
-          if (keyUse && getDb && proxied.status !== 401 && proxied.status !== 403) {
-            await recordKeyUse(getDb(), keyUse, oauthDeps(req).hubBoundOrigins());
-          }
-          return decorateWithChrome(proxied, req, pathname, getDb);
-        }
+        const proxied = await throughKeyDoor(req, getDb, () => proxyToVault(req, manifestPath, deps?.supervisor, peerAddr));
+        if (proxied) return decorateWithChrome(proxied, req, pathname, getDb);
         return new Response("not found", { status: 404 });
       }
 

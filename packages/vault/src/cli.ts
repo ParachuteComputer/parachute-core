@@ -1182,6 +1182,9 @@ async function cmdCreate(args: string[]) {
         vault_config: vaultConfigPath(name),
       },
       set_as_default: setAsDefault,
+      // T-414: says the vault was made bare, so the hub can tell this CLI honoured `--bare` (an older one drops
+      // unknown flags and seeds anyway).
+      ...(bare ? { bare: true } : {}),
     };
     console.log(JSON.stringify(payload));
     return;

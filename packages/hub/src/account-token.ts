@@ -45,6 +45,13 @@
  *      session isn't in an unlock window, refuse (423) — same as the host-admin
  *      mint (the account token is at least as powerful, so it inherits the gate).
  *
+ * The owner's key door (0.9.1, T-414). The same mint is also reached by NIP-98 (`Authorization: Nostr <event>`)
+ * from a key linked to the hub admin; see `handleNostrAccountToken` below. That path has no session, so gates 1, 2
+ * and 4 don't apply (the signature replaces them; see its doc) and logout can't end its token: it lives its 10
+ * minutes, and unlinking the key stops new ones. A linked key is as strong as the admin's password plus any second
+ * factor, exactly as on the hub's existing NIP-98 doors (`/mcp`, the admin API via admin-auth.ts), which also
+ * grant the admin per request without a session, a lock PIN or TOTP.
+ *
  * Statelessness + revocation (SCOPE-d). Like the host-admin token, the account
  * token is deliberately NOT persisted in the `tokens` table — no registry row,
  * no per-jti revocation. It is short-lived (10 min) and re-minted from the live

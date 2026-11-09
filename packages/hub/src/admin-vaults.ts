@@ -496,6 +496,15 @@ export async function provisionVault(
   if (!result.ok) {
     return { ok: false, status: result.status, message: result.message };
   }
+  // A bare create must be confirmed by the CLI that made it: a vault module older than 0.9.1 drops `--bare` and
+  // seeds the guides anyway. Say so rather than answer as if the vault were bare.
+  if (deps.bare && (result.createJson as { bare?: unknown } | null)?.bare !== true) {
+    return {
+      ok: false,
+      status: 409,
+      message: `vault "${name}" was created, but the installed vault module doesn't support bare and seeded it; update the vault module`,
+    };
+  }
 
   // Re-read services.json: the CLI just wrote it.
   const created = findExistingVault(manifestPath, name);

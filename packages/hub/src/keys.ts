@@ -18,6 +18,10 @@
  */
 import type { Database } from "bun:sqlite";
 
+/** A key's name: letters, digits, `.`, `_`, `-`; up to 80; starts with a letter or digit. `parachute keys new` and
+ *  `POST /account/keys` share it. */
+export const KEY_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
+
 export type KeyOwnerKind = "person" | "agent" | "app" | "service";
 
 export interface KeyRow {

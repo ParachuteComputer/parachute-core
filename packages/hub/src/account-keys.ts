@@ -37,6 +37,7 @@ import {
   revokeTokenByJti,
   signAccessToken,
 } from "./jwt-sign.ts";
+import { KEY_NAME_RE } from "./keys.ts";
 import { getUserById } from "./users.ts";
 import { VAULT_NAME_CHARSET_RE } from "./vault-name.ts";
 
@@ -46,8 +47,6 @@ export const APP_KEY_CLIENT_ID = "parachute-app-key";
 export const APP_KEY_MAX_TTL_SECONDS = 365 * 24 * 60 * 60;
 /** The shortest key worth naming. */
 export const APP_KEY_MIN_TTL_SECONDS = 60;
-/** Same rule as `parachute keys new`: letters, digits, `.`, `_`, `-`; up to 80; starts with a letter or digit. */
-export const APP_KEY_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
 
 const LEVELS = { read: ["read"], write: ["read", "write"] } as const;
 type Can = keyof typeof LEVELS;
@@ -158,7 +157,7 @@ async function mintAppKey(req: Request, deps: AccountKeysDeps): Promise<Response
     return err(400, "invalid_request", `unknown field(s): ${extra.join(", ")}; an app key takes name, vault, can and expires_in`);
   }
   const { name, vault, can, expires_in } = body;
-  if (typeof name !== "string" || !APP_KEY_NAME_RE.test(name)) {
+  if (typeof name !== "string" || !KEY_NAME_RE.test(name)) {
     return err(400, "invalid_name", "name: letters, digits, '.', '_' and '-', up to 80, starting with a letter or digit");
   }
   if (typeof vault !== "string" || !VAULT_NAME_CHARSET_RE.test(vault)) {
