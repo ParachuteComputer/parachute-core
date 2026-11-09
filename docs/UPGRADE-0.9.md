@@ -14,6 +14,10 @@ database above its own number (exit 6). So a number is a promise to older progra
   the hub. 0.8 never reads either. Anything 0.8 writes meanwhile, 0.9 re-derives on its next open: a tag 0.8 made
   gets its `kind` from the rule (fields or parents → type), and a token 0.8 minted becomes a key. So 0.8 → 0.9 has
   no migration in the takeover's sense, and going back is code-only. Both are proved against the real 0.8.
+  0.9.1's owner keys (T-414) are the same kind: `keys.last_used_at` is one more additive column, and an app key
+  (`POST /account/keys`) is an ordinary hub token scoped `vault:<v>:read[ write]` with a registry row, so 0.9.0 and
+  0.8 honour it exactly as scoped and refuse it once revoked (through the revocation list, within its 60 s cache;
+  only 0.9.1's door refuses at once). No number moves.
 - **Something an older program would misread unsafely → a number.** The first is planned for 0.9.1: keys enforced by
   type, with explicit denies. 0.8 would ignore a key's type scope and let its token read the whole vault. That is
   a leak, so 0.9.1 must move the hub's number (25), and 0.8 must refuse that `hub.db`.

@@ -80,7 +80,11 @@
  *   /account/mcp                  (POST/DELETE/OPTIONS) → account-level MCP
  *                                                (NIP-98 or account:self:* /
  *                                                host:admin Bearer)
- *   /account/vaults               (GET/POST)   → list / create vault (create returns vault_token)
+ *   /account/vaults               (GET/POST)   → list / create vault (create returns vault_token;
+ *                                                {bare: true} → no welcome notes, T-414)
+ *   /account/keys                 (GET/POST)   → named app keys: list (with last use) / mint one vault
+ *                                                at read|write, never admin (host:admin bearer, T-414)
+ *   /account/keys/<name>          (DELETE)     → revoke an app key (refused at the /vault/* and /mcp door at once)
  *   /account/vaults/<name>/rename (POST)       → rename (host-admin)
  *   /account/vaults/<name>        (DELETE)     → teardown (wraps /vaults/<name> cascade)
  *   /account/vaults/<name>/token  (POST)       → per-vault scoped token mint
@@ -186,7 +190,9 @@
  *                                                 superset {account:self:admin,
  *                                                 parachute:host:admin, parachute:host:auth}
  *                                                 aud="account"; first-admin-gated,
- *                                                 CSRF + same-origin belt; stateless
+ *                                                 CSRF + same-origin belt; stateless. Also NIP-98:
+ *                                                 `Authorization: Nostr` from a linked key of
+ *                                                 the hub admin mints the same token (T-414)
  *   /account/2fa                  (GET + POST) → user self-service 2FA enroll/disenroll
  *                                                 (hub#473; QR + backup codes)
  *   /account/vault-token/<name>   (POST)       → friend mints a scoped
