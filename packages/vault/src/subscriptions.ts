@@ -67,7 +67,7 @@ import { defaultHookRegistry } from "../core/src/hooks.ts";
 import { toNoteIndex } from "../core/src/notes.ts";
 import { getVaultNameForStore } from "./vault-store.ts";
 import { noteWithinTagScope, scrubNoteTagsByScope } from "./tag-scope.ts";
-import type { LiveMatcher } from "./live-match.ts";
+import type { LiveMatcher } from "../core/src/live-match.ts";
 
 /** Default per-vault concurrent-subscription cap. Over it → 503. */
 export const DEFAULT_MAX_SUBSCRIPTIONS_PER_VAULT = 100;
