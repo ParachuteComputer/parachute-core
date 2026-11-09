@@ -243,8 +243,9 @@ A tag answers "what kind of thing is this?" — #person, #recipe, #idea. Tag a
 few notes the same way and a view lights up: all your people, all your recipes,
 everything half-finished. Your vault starts with just two:
 
-- #capture — the Notes app puts it on whatever you write or speak in directly,
-  marking your own raw words.
+- #capture — an inbox tag for your own raw words. The Notes app adds it to a
+  new note you write or speak in only if you open Settings → Tag roles and turn
+  on "Tag new notes as an inbox"; it's off unless you turn it on.
 - #guide — these notes.
 
 Underneath, everything is one graph: every note a node, every link an edge.
@@ -436,9 +437,11 @@ their existing data in is covered under "Bringing existing notes in" below.
 
 A vault is **notes + tags + links** in one graph, reachable over MCP (you, now),
 a REST API (scripts), and any surface (a UI). It ships *nearly blank* — just a
-small welcome web and the \`capture\` tag the Notes surface uses; no other
-predefined tags or schema. You and the operator design the structure that fits
-*their* life and work. The vault is the engine; the meaning is yours to bring.
+small welcome web and the \`capture\` inbox tag; no other predefined tags or
+schema. (The Notes app tags new notes \`capture\` only if the person
+turns on its inbox option, "Tag new notes as an inbox".) You and the operator
+design the structure that fits *their* life and work. The vault is the engine;
+the meaning is yours to bring.
 
 Core moves, grouped by the scope each needs — \`tools/list\` shows exactly the
 ones your token can call (see "What your scope allows" below):
