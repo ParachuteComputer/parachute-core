@@ -17,7 +17,9 @@ Read `PROCESS.md` first. The short version:
 - **CI green before merge**: every `contracts` job (`PROCESS.md` §3).
 - **Review by someone who didn't write it.** In practice that is a fresh Claude reviewer (an agent that didn't write
   the code), recorded in a `## Review` section of the pull request body with its verdict, round cap 3. GitHub
-  approvals aren't used: Uni opens and merges pull requests as `unforcedagi`, after the review says ship. Changes to
+  approvals aren't used: Uni opens pull requests and merges them into `next` as `unforcedagi`, after the review says
+  ship. The `next`→`main` release pull request publishes to npm, so Aaron (`unforced`) merges it; an agent never
+  merges into `main`. Changes to
   what a contract *means* need Aaron or Benjamin.
 - **Test data is made up.** No real notes, journals, keys or `.env` contents, ever. The harness runs on random
   local ports in a temp home; never point the suite at a live vault or hub.

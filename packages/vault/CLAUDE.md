@@ -15,8 +15,8 @@ one-command setup; one Bun server (port 1940) hosts many vaults, each its own SQ
 ## Conventions
 
 - Bun for everything (`Bun.serve`, `bun:sqlite`, `Bun.$`, `bun test`). No Node.js.
-- Bare primitives: no default tag schema — clients bring their own. A new vault gets a few
-  starter notes (Welcome, Capture anything, Getting Started), nothing more. Opt-in seed
+- Bare primitives: no default tag schema — clients bring their own. A new vault gets the
+  welcome guides and Getting Started notes plus the `capture` and `guide` tags (no fields), nothing more. Opt-in seed
   packs live in `core/src/seed-packs.ts` (`add-pack <name>`). External data packs
   use `packs add|list|remove` (see `docs/external-packs.md`); state is in each
   vault's `packs/`, migrated from legacy `modules/`. Connector/views declarations

@@ -16,8 +16,9 @@
 # Everything is local to the runner: throwaway homes, random ports, no live service.
 name: contracts
 
-# Every job here is a required check on main and next, so none may carry a path filter (a required check that never
-# runs blocks the merge).
+# Every job here is meant to be a required check on main and next (branch protection, T-420; release.yml's
+# contracts-green already requires them before npm publish), so none may carry a path filter (a required check that
+# never runs blocks the merge).
 on:
   push:
     branches: [main, next]

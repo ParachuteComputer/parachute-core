@@ -43,10 +43,11 @@ of them pass, then moving it to `today/`.
    and both mutant jobs).
 5. **Review by someone who didn't write it.** Today that is a fresh Claude reviewer, recorded in a `## Review`
    section of the pull request body (who reviewed, the rounds, the verdict; round cap 3). GitHub approvals aren't
-   used: Uni opens and merges pull requests as `unforcedagi`, so the review section is the record. Changes to what
+   used: Uni opens pull requests and merges them into `next` as `unforcedagi`, so the review section is the record. Changes to what
    a contract *means* (a rule, not a typo) need Aaron or Benjamin.
 6. **Squash-merge** into `next`.
-7. **Releases** are a pull request from `next` to `main` that bumps the version. The merge publishes
+7. **Releases** are a pull request from `next` to `main` that bumps the version, merged by Aaron (`unforced`; an
+   agent never merges into `main`) with a merge commit, not a squash, so the branches don't diverge. The merge publishes
    `@openparachute/core` to npm once that commit's contracts jobs pass (`RELEASING.md`). Nothing deploys from this
    repo: the hosted door (parachute-cloud) pins a core commit and deploys from there.
 

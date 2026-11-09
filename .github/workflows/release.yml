@@ -108,6 +108,9 @@ jobs:
   # A red or cancelled job: re-run it in contracts, then re-run this workflow's failed jobs.
   contracts-green:
     name: the commit's contracts checks passed
+    needs: plan
+    # Hold a runner (up to 190 minutes) only when something will publish.
+    if: needs.plan.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 190
     permissions:
@@ -117,7 +120,8 @@ jobs:
       SHA: ${{ github.sha }}
       WAIT_MINUTES: 180
       # A push started CI on this commit too, so wait for its checks to appear. A manual run of a commit CI never ran
-      # on is refused at once.
+      # on (no required check at all) is refused at once; one whose CI is still running waits (a job that waits on
+      # another has no check run until that one finishes).
       WAIT_FOR_MISSING: ${{ github.event_name == 'push' }}
       # The job names in contracts.yml, as GitHub shows them. Rename a job there, rename it here.
       REQUIRED: |
@@ -134,6 +138,7 @@ jobs:
           deadline=$(( $(date +%s) + WAIT_MINUTES * 60 ))
           while :; do
             waiting=""
+            missing=0
             while IFS= read -r name; do
               [ -n "$name" ] || continue
               # The newest attempt of the job with that name on this commit, from GitHub Actions (app 15368).
@@ -147,15 +152,14 @@ jobs:
                 completed/*)
                   echo "::error::\"$name\" is $state on $SHA. Fix it or re-run it, then re-run this job."
                   exit 1 ;;
-                missing)
-                  if [ "$WAIT_FOR_MISSING" != true ]; then
-                    echo "::error::$SHA has no \"$name\" check. CI runs on pull requests and on pushes to main and next."
-                    exit 1
-                  fi
-                  waiting=1 ;;
+                missing) missing=$((missing + 1)); waiting=1 ;;
                 *) waiting=1 ;;
               esac
             done <<< "$REQUIRED"
+            if [ "$WAIT_FOR_MISSING" != true ] && [ "$missing" -eq "$(grep -c . <<< "$REQUIRED")" ]; then
+              echo "::error::$SHA has no contracts checks at all. CI runs on pull requests and on pushes to main and next."
+              exit 1
+            fi
             if [ -z "$waiting" ]; then echo "Every required check passed on $SHA."; exit 0; fi
             if [ "$(date +%s)" -ge "$deadline" ]; then
               echo "::error::The required checks on $SHA did not all finish within $WAIT_MINUTES minutes."
