@@ -57,6 +57,14 @@ import { HOST_ADMIN_SCOPES } from "./admin-host-admin-token.ts";
 import { lockedResponse, requireUnlocked } from "./admin-lock.ts";
 import { CSRF_FIELD_NAME, verifyCsrfToken } from "./csrf.ts";
 import { signAccessToken } from "./jwt-sign.ts";
+import {
+  NostrHttpAuthError,
+  type NostrReplayCache,
+  extractNostrEvent,
+  isNostrAuthorization,
+  resolveNostrPrincipal,
+  verifyNostrHttpEvent,
+} from "./nostr-http-auth.ts";
 import { isHttpsRequest } from "./request-protocol.ts";
 import { ACCOUNT_SELF_ADMIN_SCOPE } from "./scope-explanations.ts";
 import {
@@ -86,6 +94,11 @@ export interface MintAccountTokenDeps {
   db: Database;
   /** Hub origin — written into JWT `iss`. */
   issuer: string;
+  /** NIP-98 test seams: the replay cache (default: the process-wide one) and the clock. */
+  replay?: NostrReplayCache;
+  now?: () => Date;
+  /** Peer address for the NIP-98 `u` check (`requestAbsoluteUrl`); the dispatcher passes it. */
+  peerAddr?: string | null;
 }
 
 export async function handleAccountToken(
@@ -95,6 +108,9 @@ export async function handleAccountToken(
   if (req.method !== "POST") {
     return jsonError(405, "method_not_allowed", "use POST");
   }
+
+  // The owner's key door (0.9.1, T-414): `Authorization: Nostr <event>` instead of a session.
+  if (isNostrAuthorization(req)) return handleNostrAccountToken(req, deps);
 
   // Gate 1 — session. No identity, no mint.
   const sid = parseSessionCookie(req.headers.get("cookie"));
@@ -171,6 +187,72 @@ export async function handleAccountToken(
         "set-cookie": sessionCookie,
       },
     },
+  );
+}
+
+/**
+ * `POST /account/token` signed with NIP-98 (0.9.1, T-414): the hub's owner proves possession of their Nostr key
+ * and gets the same account token the session path mints, with no password and no cookie. This is how the Uni app
+ * (one npub, one token per hub) and a script sign in to a box.
+ *
+ * It reuses the hub's one NIP-98 verifier (`nostr-http-auth.ts`, the same check `/mcp` and the admin API run):
+ * BIP-340 signature, kind 27235, `created_at` within ±60 s, the event id single-use (replay cache), `u` equal to
+ * this request's URL, `method` POST, and `payload` equal to the body's sha256 (absent for an empty body). The key
+ * must already be linked to an account (`parachute auth link-pubkey`, or `/api/account/pubkeys`): auto-provision
+ * never applies here, so an unknown key can't become an account. Then the same first-admin gate as the session
+ * path: only the hub's owner gets the account superset.
+ *
+ * No CSRF check and no Origin belt: an `Authorization` header is not ambient, so a cross-site page can't make a
+ * browser send one. No screen-lock check: that lock guards an idle browser session, and here there is no session;
+ * the signature is a fresh proof of the key. Nothing is set or renewed in a cookie.
+ */
+async function handleNostrAccountToken(req: Request, deps: MintAccountTokenDeps): Promise<Response> {
+  let userId: string;
+  try {
+    const event = extractNostrEvent(req);
+    const body = new Uint8Array(await req.arrayBuffer());
+    verifyNostrHttpEvent(req, event, {
+      body,
+      ...(deps.now ? { now: deps.now } : {}),
+      ...(deps.replay ? { replay: deps.replay } : {}),
+      ...(deps.peerAddr !== undefined ? { peerAddr: deps.peerAddr } : {}),
+    });
+    const principal = await resolveNostrPrincipal(deps.db, event, {
+      autoProvision: false,
+      ...(deps.now ? { now: deps.now } : {}),
+    });
+    userId = principal.userId;
+  } catch (err) {
+    if (err instanceof NostrHttpAuthError) {
+      return jsonError(err.status, "invalid_nostr_auth", `${err.code}: ${err.message}`);
+    }
+    throw err;
+  }
+  if (!isHubAdmin(deps.db, userId)) {
+    return jsonError(
+      403,
+      "not_admin",
+      "account token mint is restricted to the hub admin — this key belongs to another account",
+    );
+  }
+  const minted = await signAccessToken(deps.db, {
+    sub: userId,
+    scopes: [...ACCOUNT_TOKEN_SCOPES],
+    audience: ACCOUNT_TOKEN_AUDIENCE,
+    clientId: ACCOUNT_TOKEN_CLIENT_ID,
+    issuer: deps.issuer,
+    ttlSeconds: ACCOUNT_TOKEN_TTL_SECONDS,
+    vaultScope: [],
+    ...(deps.now ? { now: deps.now } : {}),
+  });
+  return new Response(
+    JSON.stringify({
+      token: minted.token,
+      expires_at: minted.expiresAt,
+      scopes: ACCOUNT_TOKEN_SCOPES,
+      aud: ACCOUNT_TOKEN_AUDIENCE,
+    }),
+    { status: 200, headers: { "content-type": "application/json", "cache-control": "no-store" } },
   );
 }
 

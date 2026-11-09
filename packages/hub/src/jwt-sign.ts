@@ -202,7 +202,13 @@ export type TokenCreatedVia =
   // labelling them `cli_mint` misattributes them in registry forensics —
   // exactly backwards, since the whole point of both fixes is that the CLI
   // bootstrap token never leaves the hub.
-  | "vault_create_handoff";
+  | "vault_create_handoff"
+  // App keys (0.9.1, T-414; `account-keys.ts`) — a named, long-lived
+  // `vault:<name>:read[ write]` key the owner mints over `POST /account/keys`
+  // for an app (Taste Arcade's worker, a script). Never admin. Its key row is
+  // owned by the person and kind `app`; `/account/keys` lists and revokes
+  // exactly these.
+  | "app_key";
 
 export interface SignedRefreshToken {
   /** Opaque token to return to the client. NOT recoverable from the DB. */

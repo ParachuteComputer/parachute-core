@@ -336,18 +336,28 @@ async function orchestrate(
   manifestPath: string,
   name: string,
   runCommand: (cmd: readonly string[]) => Promise<RunResult>,
-  opts: { noMirror?: boolean } = {},
+  opts: { noMirror?: boolean; bare?: boolean } = {},
 ): Promise<OrchestrateOk | OrchestrateError> {
   const vaultRegistered = findService("parachute-vault", manifestPath) !== undefined;
   // `--no-mirror` opts this create out of the default internal live mirror
   // (§3 default_mirror knob). Only meaningful on the `create` branch — the
   // bootstrap `install` path provisions the default vault and follows the
   // server-wide knob.
+  // `--bare` (0.9.1, T-414): no welcome or guide notes. Only the `create` branch can honour it, so a bare request
+  // with no vault module installed yet is refused below rather than seeded silently.
   const cmd = vaultRegistered
-    ? opts.noMirror
-      ? ["parachute-vault", "create", name, "--json", "--no-mirror"]
-      : ["parachute-vault", "create", name, "--json"]
+    ? [
+        "parachute-vault",
+        "create",
+        name,
+        "--json",
+        ...(opts.noMirror ? ["--no-mirror"] : []),
+        ...(opts.bare ? ["--bare"] : []),
+      ]
     : ["parachute", "install", "vault"];
+  if (!vaultRegistered && opts.bare) {
+    return { ok: false, status: 409, message: "a bare vault needs the vault module installed first (parachute install vault)" };
+  }
   let result: RunResult;
   try {
     result = await runCommand(cmd);
@@ -442,6 +452,8 @@ export async function provisionVault(
     runCommand?: CreateVaultDeps["runCommand"];
     /** `'off'` appends `--no-mirror`; anything else follows the server knob. */
     defaultMirror?: string;
+    /** No welcome or guide notes (`parachute-vault create --bare`; 0.9.1, T-414). */
+    bare?: boolean;
   },
 ): Promise<ProvisionVaultResult> {
   const manifestPath = deps.manifestPath ?? SERVICES_MANIFEST_PATH;
@@ -479,6 +491,7 @@ export async function provisionVault(
 
   const result = await orchestrate(manifestPath, name, runCommand, {
     noMirror: deps.defaultMirror === "off",
+    ...(deps.bare ? { bare: true } : {}),
   });
   if (!result.ok) {
     return { ok: false, status: result.status, message: result.message };

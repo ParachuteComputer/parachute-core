@@ -133,8 +133,9 @@ function show(keys: KeyView[], users: Map<string, string>): string[] {
     Object.entries(k.levels).map(([v, l]) => `${v}:${l}`).join(" ") || k.scopes.join(" "),
     k.allow_tags ? `only #${k.allow_tags.join(" #")}` : "",
     k.status === "active" ? (k.expires_at ? `until ${k.expires_at.slice(0, 10)}` : "") : k.status,
+    k.last_used_at ? k.last_used_at.slice(0, 16).replace("T", " ") : "never",
   ]);
-  const head = ["NAME", "OWNER", "CAN", "LIMITS", "STATUS"];
+  const head = ["NAME", "OWNER", "CAN", "LIMITS", "STATUS", "LAST USED"];
   const width = head.map((h, i) => Math.max(h.length, ...rows.map((r) => r[i]!.length)));
   return [head, ...rows].map((r) => r.map((c, i) => c.padEnd(width[i]!)).join("  ").trimEnd());
 }

@@ -1040,6 +1040,9 @@ async function cmdCreate(args: string[]) {
   // even when the server-wide `default_mirror` knob is `internal`. Parity for
   // operators who want one bare vault without flipping the global default.
   const noMirror = args.includes("--no-mirror");
+  // `--bare` (0.9.1, T-414): no welcome or guide notes, no tags — an empty vault for an app that brings its own
+  // types (Taste Arcade's reactions). The guides teach a person and their AI; an app's vault doesn't want them.
+  const bare = args.includes("--bare");
 
   // --- Auth opt-in (vault#442). Default = per-user OAuth, NO token minted. ---
   // `--mint` opts into a scope-narrow hub JWT for the header-auth / script
@@ -1089,7 +1092,7 @@ async function cmdCreate(args: string[]) {
   }
   const name = positional[0];
   if (!name) {
-    console.error("Usage: parachute-vault create <name> [--json]");
+    console.error("Usage: parachute-vault create <name> [--json] [--no-mirror] [--bare]");
     process.exit(1);
   }
 
@@ -1116,6 +1119,7 @@ async function cmdCreate(args: string[]) {
   const wasFirst = listVaults().length === 0;
   const credential = await createVault(name, {
     ...(noMirror ? { enableMirror: false } : {}),
+    ...(bare ? { seed: false } : {}),
     ...(mintVerb ? { mintVerb } : {}),
   });
 
@@ -4810,6 +4814,11 @@ interface CreateVaultOptions {
    */
   enableMirror?: boolean;
   /**
+   * Seed the welcome and getting-started packs (default true). `--bare` sets it false: the vault starts with no
+   * notes and no tags (0.9.1, T-414).
+   */
+  seed?: boolean;
+  /**
    * Test seam threaded straight into `bootstrapInternalMirror` (default
    * `Bun.which`). Inject a fn returning `null` to exercise the
    * git-not-installed best-effort path without uninstalling git from the
@@ -4872,7 +4881,7 @@ async function createVault(
   // fails the create. Runs BEFORE the mirror bootstrap so the seeded content
   // lands in the initial mirror commit. See src/onboarding-seed.ts +
   // core/src/seed-packs.ts.
-  await seedOnboardingNotesBestEffort(seedStore);
+  if (opts.seed !== false) await seedOnboardingNotesBestEffort(seedStore);
 
   // Default new vaults to an internal live mirror (local git backup of the
   // markdown projection). Backup-on-by-default; GitHub off-site backup is an
@@ -5178,8 +5187,9 @@ Setup:
   parachute --version                      Print the installed version (alias: -v, version)
 
 Vaults:
-  parachute-vault create <name> [--json] [--no-mirror] [--mint [--scope read|write]] [--token <bearer>]
+  parachute-vault create <name> [--json] [--no-mirror] [--bare] [--mint [--scope read|write]] [--token <bearer>]
                                            Create a new vault (--json: emit { name, token, paths, set_as_default }).
+                                           --bare: no welcome or guide notes and no tags (an app's vault).
                                            Default auth is per-user OAuth — NO token is minted; connect with
                                            "claude mcp add --transport http parachute-<name> <endpoint>" and sign in
                                            on first use. --mint opts into a scope-narrow hub JWT for the header-auth /

@@ -30,6 +30,8 @@ export interface KeyRow {
   denies: string | null;
   created_via: string | null;
   created_at: string;
+  /** When the hub last let this key through to a vault (`touchKey`): ISO, at most a minute stale; NULL if never. */
+  last_used_at: string | null;
 }
 
 export interface KeyView {
@@ -48,6 +50,7 @@ export interface KeyView {
   created_via: string | null;
   created_at: string;
   expires_at: string | null;
+  last_used_at: string | null;
 }
 
 interface TokenRow {
@@ -68,6 +71,7 @@ const LEVEL_RANK = { read: 0, write: 1, admin: 2 } as const;
 
 /** Who a token's key belongs to, by how the token was made. */
 export function ownerOf(t: Pick<TokenRow, "user_id" | "client_id" | "created_via" | "subject">): { owner: string | null; owner_kind: KeyOwnerKind } {
+  if (t.created_via === "app_key") return { owner: t.user_id ?? null, owner_kind: "app" };
   if (t.created_via && AGENT_VIA.has(t.created_via)) return { owner: t.user_id ?? null, owner_kind: "agent" };
   if (t.created_via === "oauth_refresh" || (t.client_id && t.client_id !== "api-mint-token" && !t.subject)) {
     return { owner: t.user_id ?? null, owner_kind: "app" };
@@ -198,6 +202,24 @@ export function listKeys(db: Database, now: Date = new Date()): KeyView[] {
       created_via: r.created_via,
       created_at: r.created_at,
       expires_at: r.expires_at,
+      last_used_at: r.last_used_at ?? null,
     };
   });
+}
+
+/** How stale `last_used_at` may be: one write per key per minute at most, however busy the key. */
+export const KEY_TOUCH_INTERVAL_MS = 60_000;
+
+/**
+ * Record that the key holding token `jti` was just used (0.9.1, T-414: "last used" in `keys list` and
+ * `GET /account/keys`). Throttled in SQL, so a busy key costs one row write a minute. A token without a key (none
+ * should exist after `ensureKeys`) is ignored. Returns whether a row was written.
+ */
+export function touchKey(db: Database, jti: string, now: Date = new Date()): boolean {
+  const stamp = now.toISOString();
+  const since = new Date(now.getTime() - KEY_TOUCH_INTERVAL_MS).toISOString();
+  const r = db
+    .prepare("UPDATE keys SET last_used_at = ? WHERE jti = ? AND (last_used_at IS NULL OR last_used_at < ?)")
+    .run(stamp, jti, since);
+  return Number(r.changes) > 0;
 }

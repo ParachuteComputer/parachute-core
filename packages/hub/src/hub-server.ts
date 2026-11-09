@@ -381,6 +381,8 @@ import {
   readModuleManifest as defaultReadModuleManifest,
 } from "./module-manifest.ts";
 import { isNostrAuthorization } from "./nostr-http-auth.ts";
+import { routeAccountKeys } from "./account-keys.ts";
+import { touchKey } from "./keys.ts";
 import { handleNostrLogin } from "./nostr-login.ts";
 import { isLegacyNotesPath, logNotesRedirect, maybeRedirectNotes } from "./notes-redirect.ts";
 import {
@@ -976,6 +978,42 @@ async function proxyRequest(
     });
     return proxyErrorToResponse(rendered);
   }
+}
+
+/**
+ * The registry row behind a `/vault/*` request's bearer, if it is one of the hub's JWTs (0.9.1, T-414).
+ *
+ * The payload is decoded WITHOUT verifying the signature, and that is safe for both uses: a revoked row only
+ * ever refuses (a forged token naming a revoked jti is refused, as the vault would refuse it anyway), and the
+ * last-used stamp is written only after the vault itself accepted the token (not 401/403), so a forged jti can't
+ * stamp someone else's key. Any other credential (none, an opaque key, a malformed token) returns null and the
+ * vault's own auth decides, exactly as before.
+ */
+function vaultBearerKey(db: Database, req: Request): { jti: string; revoked: boolean } | null {
+  const header = req.headers.get("authorization");
+  const m = header?.match(/^Bearer\s+([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)$/);
+  if (!m) return null;
+  let jti: unknown;
+  try {
+    jti = (JSON.parse(Buffer.from(m[2]!, "base64url").toString("utf8")) as { jti?: unknown }).jti;
+  } catch {
+    return null;
+  }
+  if (typeof jti !== "string" || !jti) return null;
+  const row = db.query("SELECT revoked_at FROM tokens WHERE jti = ?").get(jti) as { revoked_at: string | null } | null;
+  if (!row) return null;
+  return { jti, revoked: row.revoked_at !== null };
+}
+
+function revokedKeyResponse(): Response {
+  return new Response(JSON.stringify({ error: "invalid_token", error_description: "this key has been revoked" }), {
+    status: 401,
+    headers: {
+      "content-type": "application/json",
+      "cache-control": "no-store",
+      "www-authenticate": 'Bearer error="invalid_token", error_description="this key has been revoked"',
+    },
+  });
 }
 
 /**
@@ -4248,7 +4286,7 @@ export function hubFetch(
           const rejected = assertSameOriginForCookieMutation(req, oauthDeps(req).hubBoundOrigins());
           if (rejected) return rejected;
         }
-        return handleAccountToken(req, { db: getDb(), issuer: oauthDeps(req).issuer });
+        return handleAccountToken(req, { db: getDb(), issuer: oauthDeps(req).issuer, peerAddr });
       }
 
       // /account/2fa — user self-service TOTP 2FA enroll / disenroll (hub#473).
@@ -4324,6 +4362,17 @@ export function hubFetch(
           knownIssuers: oauthDeps(req).hubBoundOrigins(),
           manifestPath,
         });
+      }
+      // /account/keys — named app keys (0.9.1, T-414; account-keys.ts): mint, list (with last use), revoke.
+      if (pathname === "/account/keys" || pathname.startsWith("/account/keys/")) {
+        if (!getDb) return dbNotConfigured();
+        const handled = await routeAccountKeys(req, pathname, {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
+          manifestPath,
+        });
+        if (handled) return handled;
       }
       if (pathname === "/account/vaults") {
         if (!getDb) return dbNotConfigured();
@@ -4573,8 +4622,21 @@ export function hubFetch(
           const gate = forceChangePasswordGate(getDb(), req);
           if (gate) return gate;
         }
+        // The key door (0.9.1, T-414): a revoked key is refused here at once, rather than when the vault's
+        // 60 s revocation cache next refreshes; and a key the vault accepted gets its last-used time.
+        const keyUse = getDb ? vaultBearerKey(getDb(), req) : null;
+        if (keyUse?.revoked) return revokedKeyResponse();
         const proxied = await proxyToVault(req, manifestPath, deps?.supervisor, peerAddr);
-        if (proxied) return decorateWithChrome(proxied, req, pathname, getDb);
+        if (proxied) {
+          if (keyUse && getDb && proxied.status !== 401 && proxied.status !== 403) {
+            try {
+              touchKey(getDb(), keyUse.jti);
+            } catch (err) {
+              console.error(`[hub] could not record key use: ${err instanceof Error ? err.message : String(err)}`);
+            }
+          }
+          return decorateWithChrome(proxied, req, pathname, getDb);
+        }
         return new Response("not found", { status: 404 });
       }
 
