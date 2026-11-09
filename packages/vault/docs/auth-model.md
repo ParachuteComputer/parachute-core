@@ -220,9 +220,10 @@ An authenticated caller sees any note; an unauthenticated caller sees
 shape as a missing note — we don't leak the existence of private notes).
 
 **Vault-wide surfaces refuse tag-scoped tokens (T-419).** `PATCH
-/api/vault`, MCP `vault-info`'s description update, `/api/triggers[/…]` and
-every `/.parachute/mirror[/…]` route (config, run-now, push-now, history,
-import, auth) act on the whole vault, so a token carrying `scoped_tags` gets
+/api/vault`, MCP `vault-info`'s description update, `/api/triggers[/…]`, every
+`/.parachute/mirror[/…]` route (config, run-now, push-now, history, import,
+auth), `/.parachute/config`, `/.parachute/embeddings` and
+`/.parachute/transcription` act on the whole vault or host, so a token carrying `scoped_tags` gets
 `403 {error:"Forbidden", error_type:"tag_scope_violation", scoped_tags}` even
 with admin (MCP: an in-band `isError` result). A tag-scoped token's stats
 (bare vault root, `/.parachute/usage`, `GET /api/vault?include_stats`, MCP

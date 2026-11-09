@@ -611,6 +611,8 @@ export async function route(
         { status: 403 },
       );
     }
+    // The vault's and host's whole config: not for a tag-scoped token (T-419).
+    if (configAuth.scoped_tags !== null) return tagScopedVaultWideForbidden(configAuth.scoped_tags);
     const globalConfig = readGlobalConfig();
     return handleConfig(vaultConfig, globalConfig);
   }
@@ -726,6 +728,21 @@ export async function route(
     return Response.json(buildUsageReport(vaultName, stats, { fresh }));
   }
 
+  // Vault-wide and host-wide admin routes refuse a tag-scoped admin token
+  // (T-419, audit L3-10 #4). The mirror routes (config, run-now, push-now,
+  // history, import, auth) act on the whole vault: push-now exports every
+  // note, import with mode "replace" deletes notes. Embeddings and
+  // transcription set host-wide settings for every vault. A non-admin token
+  // falls through to each route's own admin gate, so it still gets the usual
+  // insufficient_scope 403. (/.parachute/config, above, checks the same.)
+  if (
+    (subpath === "/.parachute/embeddings" || subpath === "/.parachute/transcription" ||
+      subpath === "/.parachute/mirror" || subpath.startsWith("/.parachute/mirror/")) &&
+    auth.scoped_tags !== null && hasScopeForVault(auth.scopes, vaultName, "admin")
+  ) {
+    return tagScopedVaultWideForbidden(auth.scoped_tags);
+  }
+
   // /.parachute/embeddings — Admin-gated read+write of the semantic-search
   // (embeddings) opt-in toggle. The 0.7.3 fast-follow: gives the admin SPA a
   // real toggle over the persisted `embeddings_enabled` config.yaml setting so
@@ -790,17 +807,6 @@ export async function route(
   // JWTs are minted via hub's registry (`/api/auth/mint-token`); a `/tokens`
   // request now falls through to the catch-all 404 below.
 
-  // The mirror routes (config, run-now, push-now, history, import, auth) act on
-  // the whole vault: push-now exports every note, import with mode "replace"
-  // deletes notes. A tag-scoped admin token can't use them (T-419, audit
-  // L3-10 #4). A non-admin token falls through to each route's own admin gate
-  // so it still gets the usual insufficient_scope 403.
-  if (
-    (subpath === "/.parachute/mirror" || subpath.startsWith("/.parachute/mirror/")) &&
-    auth.scoped_tags !== null && hasScopeForVault(auth.scopes, vaultName, "admin")
-  ) {
-    return tagScopedVaultWideForbidden(auth.scoped_tags);
-  }
 
   // /.parachute/mirror — Admin-gated read+write of THIS vault's persistent
   // mirror config + runtime status. Per-vault (vault#400): the manager is
@@ -1242,17 +1248,11 @@ export async function route(
     // A tag-scoped token is refused either way: description and config are
     // vault-wide (a scoped writer setting retention would drop audio on notes
     // it can't see).
-    if (req.method === "PATCH") {
-      if (tagScope.raw !== null) return tagScopedVaultWideForbidden(tagScope.raw);
-      let carriesDescription = false;
-      try {
-        const peek = await req.clone().json();
-        carriesDescription = peek !== null && typeof peek === "object" && "description" in peek;
-      } catch {
-        // Unparseable: handleVault answers it with its usual 400.
-      }
-      if (carriesDescription && !hasScopeForVault(auth.scopes, vaultName, "admin")) {
-        return Response.json(
+    if (req.method === "PATCH" && tagScope.raw !== null) return tagScopedVaultWideForbidden(tagScope.raw);
+    // handleVault parses the body (once, under its size cap) and answers with
+    // this when the body carries `description`.
+    const descriptionForbidden = req.method === "PATCH" && !hasScopeForVault(auth.scopes, vaultName, "admin")
+      ? Response.json(
           {
             error: "Forbidden",
             error_type: "insufficient_scope",
@@ -1261,9 +1261,8 @@ export async function route(
             granted_scopes: auth.scopes,
           },
           { status: 403 },
-        );
-      }
-    }
+        )
+      : null;
     return handleVault(
       req,
       store,
@@ -1273,6 +1272,8 @@ export async function route(
       },
       undefined, // resolveCapability — keep the production default
       tagScope,
+      undefined, // resolveEmbeddingCap — keep the production default
+      descriptionForbidden,
     );
   }
   if (apiPath === "/unresolved-wikilinks") return handleUnresolvedWikilinks(req, store, tagScope);

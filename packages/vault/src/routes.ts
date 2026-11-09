@@ -4395,6 +4395,14 @@ export async function handleVault(
    */
   resolveEmbeddingCap: () => Promise<EmbeddingCapability> = () =>
     resolveEmbeddingCapability(getSharedEmbeddingProvider()),
+  /**
+   * T-419 (audit L3-01): the 403 to answer a PATCH whose body carries
+   * `description` (any value, null included) when the caller lacks admin.
+   * routing.ts builds it from the token's scopes; null lets the edit through.
+   * Checked before anything in the body is applied. A config-only PATCH never
+   * sees it (the Notes app sets audio_retention with read+write).
+   */
+  descriptionForbidden: Response | null = null,
 ): Promise<Response> {
   const url = new URL(req.url);
 
@@ -4437,6 +4445,8 @@ export async function handleVault(
       config?: { audio_retention?: string; auto_transcribe?: { enabled?: unknown } };
     };
     let dirty = false;
+
+    if (body.description !== undefined && descriptionForbidden) return descriptionForbidden;
 
     if (body.description !== undefined) {
       // vault#669: runtime type guard mirroring the audio_retention /

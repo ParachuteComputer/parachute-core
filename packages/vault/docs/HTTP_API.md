@@ -2440,9 +2440,11 @@ The mirror endpoints expose the persistent `mirror:` block in
 Every `/.parachute/mirror[/…]` route (config, `run-now`, `push-now`,
 `history`, `import`, `auth`) needs admin with no tag restriction: a
 tag-scoped admin token gets `403 tag_scope_violation` (T-419), since these
-routes export, replace or describe the whole vault. `/api/triggers[/…]` is
-refused the same way (a trigger fires on any matching note, hidden ones
-included).
+routes export, replace or describe the whole vault. `/api/triggers[/…]`,
+`/.parachute/config`, `/.parachute/embeddings` and
+`/.parachute/transcription` are refused the same way (a trigger fires on any
+matching note, hidden ones included; the others read or set vault-wide and
+host-wide settings).
 
 #### `GET /vault/{name}/.parachute/mirror` — `vault:<name>:admin`
 Returns the current persisted config + runtime status:

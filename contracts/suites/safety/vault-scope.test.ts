@@ -11,9 +11,11 @@
 //   hidden notes matched a filter. Now it is decided on what the reader gets back.
 // - L3-10 #5: stats (the bare vault root, `/.parachute/usage`, `GET /api/vault?include_stats`, MCP `vault-info`
 //   and the connect-time brief) were vault-wide for a scoped pass and named hidden tags and note ids. Now they count
-//   only the notes the pass can see, like `map` already did.
-// - L3-10 #4: a tag-scoped admin pass reached triggers (a webhook trigger sends any note anywhere) and the mirror
-//   and import routes (which export or replace the whole vault). Now it gets 403 tag_scope_violation.
+//   only the notes the pass can see, like `map` already did. Both now also count a note whose only tag is an
+//   undeclared string-form sub-tag of the pass's tag (`<tag>/sub`), which reads already admit.
+// - L3-10 #4: a tag-scoped admin pass reached triggers (a webhook trigger sends any note anywhere), the mirror
+//   and import routes (which export or replace the whole vault), and the vault's and host's settings
+//   (`/.parachute/config`, `embeddings`, `transcription`). Now it gets 403 tag_scope_violation.
 // - G-C: the bare vault root `/vault/<n>` gave description and stats to a pass for this vault holding no vault
 //   verb. Now it needs read.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
@@ -25,6 +27,7 @@ const op = operator();
 const R = runId("vs").replace(/-/g, "");
 const MINE = `${R}mine`;
 const SECRET = `${R}secret`;
+const SUB = `${MINE}/sub`; // a string-form sub-tag, never declared as MINE's child
 let before: { description: string | null; retention: string };
 let mineIds: string[] = [];
 
@@ -66,6 +69,7 @@ beforeAll(async () => {
   mineIds = [
     await note(`${R}/mine/a`, "made up note one", [MINE]),
     await note(`${R}/mine/b`, "made up note two, co-tagged", [MINE, SECRET]),
+    await note(`${R}/mine/c`, "made up note three, under a sub-tag only", [SUB]),
   ];
   await note(`${R}/Secret/s1`, "made up hidden one", [SECRET]);
   await note(`${R}/Secret/s2`, "made up hidden two", [SECRET]);
@@ -158,11 +162,17 @@ describe("stats count only what a tag-scoped pass can see (L3-10 #5)", () => {
   function checkStats(where: string, stats: any) {
     const tags = (stats.topTags ?? []).map((t: any) => t.tag);
     must(!tags.includes(SECRET), `${where}: stats name a tag outside the pass's scope`);
-    must(stats.totalNotes === 2, `${where}: stats count notes outside the pass's scope (totalNotes ${stats.totalNotes}, can see 2)`);
+    must(stats.totalNotes === 3, `${where}: stats count notes outside the pass's scope, or miss ones it can read (totalNotes ${stats.totalNotes}, can see 3)`);
     expect(mineIds).toContain(stats.earliestNote?.id);
     expect(mineIds).toContain(stats.latestNote?.id);
-    expect(stats.tagCount).toBe(1);
+    expect([...tags].sort()).toEqual([MINE, SUB].sort());
+    expect(stats.tagCount).toBe(2);
   }
+
+  test("setup: the pass reads exactly the three notes, the sub-tag one included", async () => {
+    const r = await rest(s.vaultViaHub, await pass({ level: "read", tags: [MINE] })).get(`/notes?path_prefix=${R}/`);
+    expect(r.body.map((n: any) => n.id).sort()).toEqual([...mineIds].sort());
+  });
 
   test("the bare vault root", async () => {
     const r = await raw(await pass({ level: "read", tags: [MINE] }), "GET", "");
@@ -176,11 +186,16 @@ describe("stats count only what a tag-scoped pass can see (L3-10 #5)", () => {
     checkStats("GET /api/vault?include_stats", r.body.stats);
   });
 
+  test("GET /api/vault map counts the sub-tag note too", async () => {
+    const map = (await rest(s.vaultViaHub, await pass({ level: "read", tags: [MINE] })).get("/vault")).body.map;
+    must(map.total_notes === 3, `GET /api/vault map misses a note the pass can read (total_notes ${map.total_notes}, can see 3)`);
+  });
+
   test("/.parachute/usage", async () => {
     const r = await raw(await pass({ level: "read", tags: [MINE] }), "GET", "/.parachute/usage");
     expect(r.status).toBe(200);
-    must(r.body.counts.notes === 2, `/.parachute/usage counts notes outside the pass's scope (${r.body.counts.notes}, can see 2)`);
-    expect(r.body.counts.tags).toBe(1);
+    must(r.body.counts.notes === 3, `/.parachute/usage counts notes outside the pass's scope (${r.body.counts.notes}, can see 3)`);
+    expect(r.body.counts.tags).toBe(2);
   });
 
   test("MCP vault-info and the connect-time brief", async () => {
@@ -192,11 +207,11 @@ describe("stats count only what a tag-scoped pass can see (L3-10 #5)", () => {
       await c.close();
     }
     const brief = await instructions(token);
-    must(/- 2 notes, 1 tag total/.test(brief), `the connect-time brief counts notes outside the pass's scope: ${brief.match(/- \d+ notes?, \d+ tags? total/)?.[0]}`);
+    must(/- 3 notes, 2 tags total/.test(brief), `the connect-time brief counts notes outside the pass's scope: ${brief.match(/- \d+ notes?, \d+ tags? total/)?.[0]}`);
   });
 });
 
-describe("a tag-scoped admin pass can't reach triggers, mirror or import (L3-10 #4)", () => {
+describe("a tag-scoped admin pass can't reach triggers, mirror, import or the vault's settings (L3-10 #4)", () => {
   const routes: [string, string, unknown?][] = [
     ["GET", "/api/triggers"],
     ["POST", "/api/triggers", {}],
@@ -208,6 +223,11 @@ describe("a tag-scoped admin pass can't reach triggers, mirror or import (L3-10 
     ["POST", "/.parachute/mirror/import", {}],
     ["GET", "/.parachute/mirror/import/nojob"],
     ["GET", "/.parachute/mirror/auth"],
+    ["GET", "/.parachute/config"],
+    ["GET", "/.parachute/embeddings"],
+    ["PUT", "/.parachute/embeddings", {}],
+    ["GET", "/.parachute/transcription"],
+    ["PUT", "/.parachute/transcription", {}],
   ];
 
   test("each route answers 403 tag_scope_violation", async () => {

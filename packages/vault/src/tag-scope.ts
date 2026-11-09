@@ -178,14 +178,26 @@ export function scopedStatsFilter(
 /**
  * The count-query filter for a scoped caller: the allowlist to count
  * through, minus notes carrying a denied tag. A fail-closed scope counts
- * nothing (empty allowlist).
+ * nothing (empty allowlist). The allowlist also takes every tag in use whose
+ * `/` root is one of the token's own `scoped_tags` (an undeclared string-form
+ * sub-tag such as `work/meetings`), because `noteWithinTagScope` admits those
+ * notes on reads; without them the counts missed notes the token can read.
  */
 export function scopedCountFilter(
   store: Store,
   allowed: Set<string> | null,
 ): { tagFilter: string[]; excludeTags: string[] } {
   if (!allowed || scopeDeniesAll(allowed)) return { tagFilter: [], excludeTags: [] };
-  return { tagFilter: [...allowed], excludeTags: deniedTagNamesInUse(store, allowed) };
+  const roots = allowed instanceof TagScopeSet ? allowed.scopedRoots : [];
+  const tagFilter = new Set(allowed);
+  if (roots.length > 0) {
+    const rows = store.db.prepare("SELECT DISTINCT tag_name FROM note_tags").all() as { tag_name: string }[];
+    for (const { tag_name: t } of rows) {
+      const root = t.split("/")[0];
+      if (root && roots.includes(root)) tagFilter.add(t);
+    }
+  }
+  return { tagFilter: [...tagFilter], excludeTags: deniedTagNamesInUse(store, allowed) };
 }
 
 /**
