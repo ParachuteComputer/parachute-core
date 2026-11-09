@@ -2350,7 +2350,13 @@ export async function importVault(
   // debounce; transcription only fires on attachment `created` and kicks an
   // idempotent worker), so a rollback can't leave a half-applied side effect
   // the sweep won't reconcile.
-  if (opts.blowAway && !opts.dryRun) {
+  //
+  // A caller that passes `checkpoint` asks for the opposite: writes committed in
+  // chunks (cloud, where one transaction past ~30 s resets the Durable Object;
+  // see ImportEngineOptions.checkpoint). Its import runs unwrapped, as it always
+  // did in effect: before the DO backend gave transactionAsync a real
+  // transaction (audit L2-05) this wrapper was a no-op there.
+  if (opts.blowAway && !opts.dryRun && !opts.checkpoint) {
     await transactionAsync(store.db, () => importVaultReplay(store, source, opts, stats));
   } else {
     await importVaultReplay(store, source, opts, stats);
