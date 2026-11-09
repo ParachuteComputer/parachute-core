@@ -530,7 +530,38 @@ const LOOKALIKES: Readonly<Record<string, string>> = {
   "4": "a", // digits standing in for letters
   "3": "e",
   "7": "t",
+  "@": "a", // symbols standing in for letters (T-419 review)
+  "€": "e",
+  г: "r", // more Cyrillic, Greek and Latin extras (T-419 review)
+  н: "h",
+  и: "u",
+  η: "h",
+  ɛ: "e",
+  ʈ: "t",
+  ꓑ: "p", // Lisu
+  ᑭ: "p", // Canadian syllabics
 };
+
+/**
+ * "parachute" with some of its letters swapped for letters the table above doesn't know (shown as "?"): at least
+ * five of the nine must be the real ASCII letter, so a word that merely shares letters doesn't count. Catches a
+ * look-alike from a script the table lacks ("Parachutɛ" before ɛ was added). A name with no ASCII letter at all
+ * isn't caught here; the consent page's redirect origin is the defence for those.
+ */
+function nearParachute(folded: string[]): boolean {
+  const target = "parachute";
+  for (let i = 0; i + target.length <= folded.length; i++) {
+    let real = 0;
+    let ok = true;
+    for (let j = 0; j < target.length; j++) {
+      const c = folded[i + j]!;
+      if (c === target[j]) real++;
+      else if (c !== "?") { ok = false; break; }
+    }
+    if (ok && real >= 5) return true;
+  }
+  return false;
+}
 
 /**
  * True when `name` reads as "parachute" once case, accents, width, spacing,
@@ -538,12 +569,16 @@ const LOOKALIKES: Readonly<Record<string, string>> = {
  * "P.A.R.A.C.H.U.T.E", fullwidth or Cyrillic spellings all count.
  */
 export function looksLikeParachute(name: string): boolean {
-  let folded = "";
-  for (const ch of name.normalize("NFKD").toLowerCase()) {
-    const c = LOOKALIKES[ch] ?? ch;
-    if (/[a-z0-9]/.test(c)) folded += c;
+  const folded: string[] = [];
+  for (const raw of name) {
+    // Map before NFKD too (a capital look-alike may decompose or lowercase to a letter the table doesn't hold).
+    for (const ch of (LOOKALIKES[raw] ?? raw).normalize("NFKD").toLowerCase()) {
+      const c = LOOKALIKES[ch] ?? ch;
+      if (/[a-z0-9]/.test(c)) folded.push(c);
+      else if (/[\p{L}\p{N}]/u.test(c)) folded.push("?");
+    }
   }
-  return folded.includes("parachute");
+  return folded.join("").includes("parachute") || nearParachute(folded);
 }
 
 function isLoopbackHost(hostname: string): boolean {
