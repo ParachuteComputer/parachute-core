@@ -323,7 +323,7 @@ describe("must-fix 2: private_tags parsing", () => {
     const res = await handleVault(new Request(`http://localhost/vault/${V}/api/vault`, {
       method: "PATCH", headers: { "content-type": "application/json" },
       body: JSON.stringify({ description: "edited" }),
-    }), getVaultStore(V), config, () => writeVaultConfig(config));
+    }), getVaultStore(V), config, () => writeVaultConfig(config), undefined, undefined, undefined, null);
     expect(res.status).toBe(409);
     expect(await res.json()).toEqual({ error: unreadableMessage });
     expect(readFileSync(vaultConfigPath(V), "utf-8")).toBe(before);

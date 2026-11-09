@@ -8,11 +8,15 @@
 // node_modules (npm or bun installs the dependencies on the person's machine, argon2 for their platform).
 //
 //   package.json                   @openparachute/core: bins `parachute` and `parachute-core`; the hub's and the
-//                                  vault's dependencies, each at the version bun.lock has, without what the bundle
-//                                  leaves out (release/payload.ts: the local embedding stack, TypeScript). npm and bun
-//                                  still install TypeScript (~23 MB): @openparachute/scope-guard, depcheck and
-//                                  door-contract declare it as a peer, and a package can't turn off another's peer.
-//                                  Nothing runs it. The embedding stack (~500 MB) is not installed.
+//                                  vault's dependencies, each at the version bun.lock has, without TypeScript (the
+//                                  bundle leaves it out too, release/payload.ts). npm and bun still install it
+//                                  (~23 MB): @openparachute/scope-guard, depcheck and door-contract declare it as a
+//                                  peer, and a package can't turn off another's peer. Nothing runs it.
+//                                  The local embedding stack (@huggingface/transformers, onnxruntime, sharp) is an
+//                                  optional dependency (T-418): npm installs it for every platform (~650 MB, and on
+//                                  linux-x64 onnxruntime-node's postinstall fetches its CUDA providers); the bundle
+//                                  ships one platform's (~100 MB).
+//   packages/vault/models/         the embedding model (release/model.ts), so a fresh install embeds offline
 //   packages/cli/                  the command (bin/ wrappers, src/, and the tsconfig.json whose `paths` find the
 //                                  hub and the vault below: Bun honours them inside node_modules too, so an old
 //                                  @openparachute/hub next to this package in a global install is never the one run)
@@ -27,6 +31,8 @@ import { join, relative, resolve } from "node:path";
 import { LEFT_OUT } from "./payload.ts";
 
 const REPO_URL = "https://github.com/ParachuteComputer/parachute-core";
+/** Installed as optional dependencies (see stagePackage). */
+const OPTIONAL = ["@huggingface/transformers"];
 
 /** Which files of a moved package ship: its own package.json `files`, plus the package.json itself. */
 const KEEP: Record<string, string[]> = {
@@ -108,6 +114,7 @@ export function stagePackage(bundle: string, out: string): string {
   for (const f of ["LICENSE"]) cpSync(join(lib, f), join(stage, f));
   const readme = join(resolve(import.meta.dir, ".."), "README.md");
   cpSync(existsSync(join(lib, "README.md")) ? join(lib, "README.md") : readme, join(stage, "README.md"));
+  const deps = Object.entries(dependencies(lib));
   const pkg = {
     name: root.name,
     version: root.version,
@@ -118,7 +125,12 @@ export function stagePackage(bundle: string, out: string): string {
     homepage: REPO_URL,
     bin: { parachute: "packages/cli/bin/parachute", "parachute-core": "packages/cli/bin/parachute-core" },
     files: ["packages", "LICENSE", "README.md"],
-    dependencies: dependencies(lib),
+    dependencies: Object.fromEntries(deps.filter(([n]) => !OPTIONAL.includes(n))),
+    // The local embedding stack is optional (T-418): on a machine with a system libvips, npm runs sharp's install
+    // script, which then tries to compile sharp and fails. As an optional dependency that drops the stack instead of
+    // failing the whole install; semantic search then says on /health that it can't load ("failing"), and every
+    // other part of Parachute works. `bun add -g` runs no dependency's scripts, so it always gets the stack.
+    optionalDependencies: Object.fromEntries(deps.filter(([n]) => OPTIONAL.includes(n))),
     // Bun runs it (the wrappers exec `bun`); npm only installs it.
     engines: { bun: ">=1.4" },
     publishConfig: { access: "public" },

@@ -195,7 +195,7 @@ the hub's OAuth endpoints.
 | `/vault/<name>/mcp[/…]` | any | Bearer (any vault scope) | `401 {error:"Unauthorized", …}` + `WWW-Authenticate: Bearer resource_metadata="…"` (RFC 9728 challenge) | Per-tool: `vault:read` (`query-notes`/`list-tags`/`find-path`/`vault-info`/`doctor`), `vault:write` (`create-note`/`update-note`/`delete-note`), or `vault:admin` (`update-tag`/`delete-tag`/`rename-tag`/`merge-tags`/`prune-schema`/`manage-token`, `vault-info`'s description-update branch, and `delete-note`'s `erase_history`). Under-scoped `tools/call` returns `{isError:true, content:[…"requires the '<verb>' scope"…]}`. Under-scoped tools are *also filtered out of `tools/list`*. |
 | `/vault/<name>/view/<idOrPath>` | GET | Auth-aware (see notes) | `404 Not Found` for private notes; `200 <html>` for published notes | — |
 | `/vault/<name>/public/<id>` | GET | Auth-aware (legacy alias) | `301` to `/vault/<name>/view/<id>` preserving `?key=…` | — |
-| `/vault/<name>` | GET | Bearer (any scope) | `401` | — |
+| `/vault/<name>` | GET | Bearer with `vault:read` (T-419; any token for the vault used to pass) | `401` | `403 {…error_type:"insufficient_scope", required_scope:"vault:read"…}` |
 | `/vault/<name>/api/notes[/…]` | GET/HEAD | Bearer with `vault:read` | `401` | `403 {error:"Forbidden", error_type:"insufficient_scope", required_scope:"vault:read", granted_scopes:[…]}` |
 | `/vault/<name>/api/notes[/…]` | POST/PATCH/DELETE | Bearer with `vault:write` | `401` | `403` with `required_scope:"vault:write"` |
 | `/vault/<name>/api/tags[/…]` | GET | Bearer with `vault:read` | `401` | `403` |
@@ -205,7 +205,7 @@ the hub's OAuth endpoints.
 | `/vault/<name>/api/tags/<name>/rename` | POST | Bearer with `vault:admin` (mirrors the MCP `rename-tag` re-tier) | `401` | `403 {…required_scope:"vault:admin"…}` |
 | `/vault/<name>/api/find-path` | GET | Bearer with `vault:read` | `401` | `403` |
 | `/vault/<name>/api/vault` | GET | Bearer with `vault:read` | `401` | `403` |
-| `/vault/<name>/api/vault` | PATCH | Bearer with `vault:write` | `401` | `403` |
+| `/vault/<name>/api/vault` | PATCH | Bearer with `vault:write` for a `config`-only body; `vault:admin` when the body carries `description` (T-419, same rule as MCP `vault-info`). No tag-scoped token, at any verb. | `401` | `403 {…required_scope:"vault:admin"…}` for a description edit without admin; `403 {error_type:"tag_scope_violation"…}` for a tag-scoped token |
 | `/vault/<name>/api/doctor` | GET | Bearer with `vault:read` (re-tiered from `vault:admin` — mirrors the MCP `doctor` re-tier; never mutates, already tag-scope-restricted) | `401` | `403 {…required_scope:"vault:read"…}` |
 | `/vault/<name>/api/unresolved-wikilinks` | GET | Bearer with `vault:read` | `401` | `403` |
 | `/vault/<name>/api/storage/upload` | POST | Bearer with `vault:write` | `401` | `403` |
@@ -218,6 +218,16 @@ determined by (a) the note carrying the `published_tag` from
 An authenticated caller sees any note; an unauthenticated caller sees
 *only* published notes and gets `404` for everything else (same response
 shape as a missing note — we don't leak the existence of private notes).
+
+**Vault-wide surfaces refuse tag-scoped tokens (T-419).** `PATCH
+/api/vault`, MCP `vault-info`'s description update, `/api/triggers[/…]`, every
+`/.parachute/mirror[/…]` route (config, run-now, push-now, history, import,
+auth), `/.parachute/config`, `/.parachute/embeddings` and
+`/.parachute/transcription` act on the whole vault or host, so a token carrying `scoped_tags` gets
+`403 {error:"Forbidden", error_type:"tag_scope_violation", scoped_tags}` even
+with admin (MCP: an in-band `isError` result). A tag-scoped token's stats
+(bare vault root, `/.parachute/usage`, `GET /api/vault?include_stats`, MCP
+`vault-info`, the connect-time instructions) count only the notes it can see.
 
 **Scope inheritance:** every `403` above resolves against
 `admin ⊇ write ⊇ read`. A token with `vault:admin` passes every scope

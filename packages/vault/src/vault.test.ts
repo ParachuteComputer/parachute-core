@@ -9132,10 +9132,39 @@ describe("handleVault: audio_retention", async () => {
       store,
       cfg as any,
       () => {},
+      undefined,
+      undefined,
+      undefined,
+      null, // an admin caller: description edits allowed
     );
     expect(res.status).toBe(200);
     expect(cfg.description).toBe("new desc");
     expect(cfg.audio_retention).toBe("until_transcribed");
+  });
+
+  // T-419 (audit L3-01): the handler fails closed. A caller that doesn't say
+  // the token may edit the description gets 403, and nothing in the body is
+  // applied (retention included).
+  test("PATCH with description is refused unless the caller allows it, and applies nothing", async () => {
+    const cfg: { name: string; description?: string; audio_retention?: string } = {
+      name: "default",
+      description: "old",
+      audio_retention: "keep",
+    };
+    let persisted = 0;
+    const res = await handleVault(
+      mkVaultReq("PATCH", { description: null, config: { audio_retention: "never" } }),
+      store,
+      cfg as any,
+      () => { persisted++; },
+    );
+    expect(res.status).toBe(403);
+    const body = await res.json() as any;
+    expect(body.error_type).toBe("insufficient_scope");
+    expect(body.required_scope).toBe("vault:admin");
+    expect(cfg.description).toBe("old");
+    expect(cfg.audio_retention).toBe("keep");
+    expect(persisted).toBe(0);
   });
 
   test("PATCH with empty body is a no-op that still returns current state", async () => {

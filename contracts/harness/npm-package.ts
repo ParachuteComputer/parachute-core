@@ -11,12 +11,14 @@
 // package in both installs (as `bun add -g` leaves them on a box that had 0.7) and in npm's own node_modules:
 //   - `parachute version --json` and `parachute-core version --json` from both installs name @openparachute/core
 //     at the package's version, and `parachute --help` from both is core's, not the planted old hub's;
+//   - semantic search on, from both installs: a note written gets an embedding from the shipped model (T-418);
 //   - Benjamin's suite with --bin <prefix>/bin/parachute and the package's own parachute-vault: 0 FAIL, the same
 //     rule as prism-compat (prism-compat-expected.json, empty).
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { enterSandbox, hostNode, SANDBOX_ENV } from "./sandbox.ts";
+import { allowOrigins, safeFetch } from "./guard.ts";
 import { reposDir } from "./services.ts";
 import pins from "../pins.json";
 
@@ -69,7 +71,10 @@ if (!process.env[SANDBOX_ENV]) {
   // npm needs a HOME for its cache; a scratch one, so nothing of the user's npm config is read.
   const npmHome = join(scratch, "npm-home");
   mkdirSync(npmHome);
-  const npmEnv = { PATH: process.env.PATH ?? "", HOME: npmHome, npm_config_cache: join(npmHome, ".npm"), npm_config_update_notifier: "false", npm_config_fund: "false", npm_config_audit: "false" };
+  // SHARP_IGNORE_GLOBAL_LIBVIPS: on a machine with a system libvips (this one may have it) sharp's install script tries
+  // to compile sharp and fails, which drops the optional embedding stack (release/npm.ts). That is the package
+  // working as designed on such a machine; what is tested here is the package, not the host's libvips.
+  const npmEnv = { PATH: process.env.PATH ?? "", HOME: npmHome, npm_config_cache: join(npmHome, ".npm"), npm_config_update_notifier: "false", npm_config_fund: "false", npm_config_audit: "false", SHARP_IGNORE_GLOBAL_LIBVIPS: "1" };
   // npm next to Node's real binary: a version manager's shim (mise) reads config from the real HOME.
   const hostNpm = hostNode() ? join(dirname(hostNode()!), "npm") : null;
   const npm = hostNpm && existsSync(hostNpm) ? hostNpm : (Bun.which("npm") ?? fail("npm is needed"));
@@ -95,15 +100,17 @@ if (!process.env[SANDBOX_ENV]) {
     if (a.join("\n") !== b.join("\n")) fail(`@openparachute/${w}'s dist from npm differs from the bundle's build`);
   }
   console.log("[npm-package] @openparachute/depcheck and door-contract from npm: the bundle's dist/, byte for byte");
-  // What it installed: never the local embedding stack the bundle leaves out (release/payload.ts). TypeScript comes
-  // along as a peer of three @openparachute packages (release/npm.ts says why); it is reported, not refused.
+  // What it installed: the local embedding stack, which semantic search needs (T-418; until 0.8.0-pre.3 it was left
+  // out, and a home with semantic search on failed every embed). TypeScript comes along as a peer of three
+  // @openparachute packages (release/npm.ts says why); it is reported, not refused.
   const deps = (root: string) => existsSync(root) ? readdirSync(root).flatMap((n) => (n.startsWith("@") ? readdirSync(join(root, n)).map((m) => `${n}/${m}`) : [n])) : [];
   for (const [what, root] of [["npm", join(installed, "node_modules")], ["bun", join(bunInstall, "install", "global", "node_modules")]] as const) {
     const names = deps(root);
-    const heavy = names.filter((n) => ["@huggingface/transformers", "onnxruntime-node", "onnxruntime-web", "sharp"].includes(n));
-    if (heavy.length) fail(`${what} installed the local embedding stack: ${heavy.join(", ")}`);
-    console.log(`[npm-package] ${what}: ${names.length} packages, no embedding stack${names.includes("typescript") ? "; typescript (a peer)" : ""}`);
+    const missing = ["@huggingface/transformers", "onnxruntime-node"].filter((n) => !names.includes(n));
+    if (missing.length) fail(`${what} did not install the local embedding stack: ${missing.join(", ")} missing`);
+    console.log(`[npm-package] ${what}: ${names.length} packages, the embedding stack included${names.includes("typescript") ? "; typescript (a peer)" : ""}`);
   }
+  if (!existsSync(join(installed, "packages", "vault", "models", "Xenova", "bge-small-en-v1.5", "onnx", "model_quantized.onnx"))) fail("the package has no embedding model (packages/vault/models)");
 
   // The old programs beside it, as a box that had 0.7 has them (next to the package in the global node_modules),
   // and in the package's own node_modules, the first place a bare import would look: if the package ever resolved
@@ -163,6 +170,14 @@ for (const prefix of [join(scratch, "npm"), join(scratch, "bun")]) {
 }
 console.log(`[npm-package] both installs answer as @openparachute/core ${version}; the planted 0.7 hub and vault never ran`);
 
+// Semantic search on, a fresh home, no network: a note written gets an embedding from the model the package ships
+// (T-418). From each install.
+for (const prefix of [join(scratch, "npm"), join(scratch, "bun")]) {
+  const why = await embedsOneNote(join(prefix, "bin", "parachute"));
+  if (why) fail(`${prefix}/bin/parachute with semantic search on: ${why}`);
+}
+console.log("[npm-package] both installs embed a note with the shipped model, offline");
+
 console.log(`[npm-package] his suite: ${(pins as any).prism.repo} ${(pins as any).prism.commit}`);
 if (!lsof) console.log("[npm-package] lsof is missing: his listener and outbound checks can't look (they pass vacuously; R4)");
 const suiteHome = join(mkdtempSync(join(tmpdir(), "npm-pc-")), "home");
@@ -185,3 +200,70 @@ for (const f of fails) console.log(`[npm-package]   FAIL ${f}`);
 const unexpected = fails.filter((f) => !expected.some((e) => e.check === f));
 if (unexpected.length) fail(`${unexpected.length} FAIL in his suite on the npm install`);
 console.log("[npm-package] OK");
+
+/** Serve a fresh home from `bin` with semantic search on, write two notes, and wait for a semantic search to rank
+ *  the right one first with nothing pending. Returns why not, or null. */
+async function embedsOneNote(bin: string): Promise<string | null> {
+  const user = mkdtempSync(join(tmpdir(), "npm-embed-"));
+  const home = join(user, ".parachute");
+  const env = { PATH, HOME: user, PARACHUTE_HOME: home, LANG: "C.UTF-8", EMBEDDINGS_ENABLED: "true" };
+  // Two distinct free loopback ports (never the live 1939-1946).
+  const free = (taken: number[]): number => {
+    for (let i = 0; i < 100; i++) {
+      const p = 47000 + Math.floor(Math.random() * 2500);
+      if (taken.includes(p)) continue;
+      try {
+        Bun.listen({ hostname: "127.0.0.1", port: p, socket: { data() {} } }).stop(true);
+        return p;
+      } catch {}
+    }
+    throw new Error("no free port");
+  };
+  const h = free([]);
+  const v = free([h]);
+  const hub = `http://127.0.0.1:${h}`;
+  const vaultOrigin = `http://127.0.0.1:${v}`;
+  allowOrigins(hub, vaultOrigin);
+  const proc = Bun.spawn([bin, "serve", "--embedded", "--listen", `127.0.0.1:${h}`, "--vault-listen", `127.0.0.1:${v}`], { env, cwd: user, stdout: "pipe", stderr: "pipe" });
+  let log = "";
+  for (const s of [proc.stdout, proc.stderr]) void (async () => { for await (const c of s) log += new TextDecoder().decode(c); })();
+  const poll = async (ok: () => Promise<boolean>, ms: number) => {
+    for (const end = Date.now() + ms; Date.now() < end; await Bun.sleep(500)) {
+      if (proc.exitCode !== null) return false;
+      try { if (await ok()) return true; } catch {}
+    }
+    return false;
+  };
+  try {
+    if (!(await poll(async () => (await safeFetch(`${hub}/api/ready`)).status === 200, 60_000))) return `serve --embedded never got ready (exit ${proc.exitCode}): ${log.slice(-800)}`;
+    const cli = (args: string[]) => Bun.spawnSync([bin, ...args], { env, cwd: user, stdout: "pipe", stderr: "pipe" });
+    const b = cli(["bootstrap", "--embedded", "--vault", "emb", "--json"]);
+    if (b.exitCode !== 0) return `bootstrap exited ${b.exitCode}: ${b.stderr.toString().slice(-400)}`;
+    const m = cli(["auth", "mint-token", "--scope", "vault:emb:write", "--json"]);
+    if (m.exitCode !== 0) return `mint-token exited ${m.exitCode}: ${m.stderr.toString().slice(-400)}`;
+    const headers = { authorization: `Bearer ${JSON.parse(m.stdout.toString()).token}`, "content-type": "application/json" };
+    const api = `${vaultOrigin}/vault/emb/api`;
+    for (const [path, content] of [
+      ["garden/seedlings", "Made up: the community garden needs tomato seedlings and bean seeds planted before May."],
+      ["bikes/repair", "Made up: the bike shop fixes flat tyres and replaces worn brake pads on Saturdays."],
+    ]) {
+      const w = await safeFetch(`${api}/notes`, { method: "POST", headers, body: JSON.stringify({ path, content }) });
+      if (w.status !== 201) return `writing ${path} answered ${w.status}`;
+    }
+    let last = "";
+    const found = await poll(async () => {
+      const r = await safeFetch(`${api}/notes?semantic=true&near_text=${encodeURIComponent("planting vegetables")}&limit=2`, { headers });
+      const body = await r.json();
+      last = `${r.status} ${JSON.stringify(body).slice(0, 300)}`;
+      const notes = Array.isArray(body) ? body : (body?.notes ?? body?.results);
+      return r.status === 200 && !(body?.warnings ?? []).some((w: any) => w.code === "embeddings_pending") && notes?.[0]?.path === "garden/seedlings";
+    }, 90_000);
+    return found ? null : `no note was embedded in 90 s (last semantic search: ${last}); serve log: ${log.slice(-800)}`;
+  } finally {
+    proc.kill("SIGTERM");
+    await Promise.race([proc.exited, Bun.sleep(15_000)]);
+    if (proc.exitCode === null) proc.kill("SIGKILL");
+    await proc.exited;
+    rmSync(user, { recursive: true, force: true });
+  }
+}

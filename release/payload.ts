@@ -1,14 +1,37 @@
 // What goes into the bundle's lib/node_modules, and the notices for it.
 //
-// The bundle leaves out the local embedding stack (PLAN §3: "no onnxruntime or sharp"): @huggingface/transformers
-// and everything only it needs (onnxruntime-node, onnxruntime-web, sharp, …, about 500 MB). Semantic search is off
-// by default since vault 0.7.3, and the vault imports transformers only when local embeddings are turned on
-// (vault src/embedding/onnx-transformers.ts), where a missing package fails that provider, not the vault. An
-// external embedding API (EMBEDDING_API_URL) still works. It also leaves out TypeScript, a build-time peer.
+// The bundle ships the local embedding stack (T-418): @huggingface/transformers, onnxruntime-node and sharp, so a
+// home with semantic search on embeds with the bundled model (release/model.ts). Until 0.8.0-pre.3 it was left out
+// (PLAN §3, "no onnxruntime or sharp"); a box that had semantic search on under 0.7 then failed every embed after
+// the 0.8 takeover, and nothing said so but a log line per note. What it still leaves out:
+//   - onnxruntime-web (~130 MB): transformers' browser runtime; under Bun it loads onnxruntime-node;
+//   - onnxruntime-node's binaries for other platforms (keepPlatform below); its CUDA providers are never fetched
+//     (they come from its postinstall, and the production install runs no scripts);
+//   - TypeScript, a build-time peer.
 import { existsSync, lstatSync, readdirSync, readFileSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 
-export const LEFT_OUT = ["@huggingface/transformers", "typescript"];
+export const LEFT_OUT = ["onnxruntime-web", "typescript"];
+
+/** onnxruntime-node keeps a prebuilt binary per platform under bin/napi-vN/<os>/<arch>: keep only this one. Returns what went. */
+export function keepPlatform(lib: string, platform = `${process.platform}/${process.arch}`): string[] {
+  const removed: string[] = [];
+  for (const at of installed(resolve(lib)).filter((d) => readPkg(d).name === "onnxruntime-node")) {
+    const bin = join(at, "bin");
+    if (!existsSync(bin)) continue;
+    for (const napi of readdirSync(bin)) {
+      for (const os of readdirSync(join(bin, napi))) {
+        for (const arch of readdirSync(join(bin, napi, os))) {
+          if (`${os}/${arch}` === platform) continue;
+          rmSync(join(bin, napi, os, arch), { recursive: true, force: true });
+          removed.push(relative(lib, join(bin, napi, os, arch)));
+        }
+        if (!readdirSync(join(bin, napi, os)).length) rmSync(join(bin, napi, os), { recursive: true });
+      }
+    }
+  }
+  return removed;
+}
 
 interface Pkg {
   name?: string;
@@ -116,7 +139,7 @@ function licenseText(dir: string): string | null {
  * THIRD-PARTY-NOTICES.txt: every package in lib's node_modules (name, version, licence, its licence file), then
  * the runtime (Bun's own licence document, which lists what it links). Returns the number of packages.
  */
-export function writeNotices(lib: string, out: string, runtime: { version: string; licence: string }): number {
+export function writeNotices(lib: string, out: string, runtime: { version: string; licence: string }, extra: string[] = []): number {
   const pkgs = installed(resolve(lib))
     .map((dir) => ({ dir, p: readPkg(dir) }))
     .sort((a, b) => `${a.p.name}@${a.p.version}`.localeCompare(`${b.p.name}@${b.p.version}`));
@@ -135,6 +158,7 @@ export function writeNotices(lib: string, out: string, runtime: { version: strin
     const text = licenseText(dir);
     parts.push("", "-".repeat(78), `${id}  (${lic})  lib/${relative(resolve(lib), dir)}`, "", text ?? `No licence file in the package; its package.json says: ${lic}.`);
   }
+  for (const e of extra) parts.push("", "-".repeat(78), e);
   parts.push("", "-".repeat(78), `bun@${runtime.version}  (MIT, with the libraries it links)  runtime/bun`, "", runtime.licence.trim(), "");
   writeFileSync(out, parts.join("\n"));
   return seen.size;

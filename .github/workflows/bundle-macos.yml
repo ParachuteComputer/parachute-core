@@ -2,6 +2,8 @@
 # ad hoc with the hardened runtime (only runtime/bun gets an entitlement, allow-jit), packed, and unpacked to a path
 # with a space with Bun's developer caches removed. Then, on the signed tree:
 #   - embedded/bundle (layout, its own Bun, the tarball and SHA256SUMS, the payload, a run, the signatures);
+#   - embedded/embeddings (semantic search from the signed tree: onnxruntime and the model load under the hardened
+#     runtime, a note gets an embedding; T-418);
 #   - Benjamin's suite, unchanged, with outbound network denied by sandbox-exec.
 # There are no namespaces on macOS: this runs only on a throwaway GitHub runner (harness/sandbox.ts onMacRunner).
 # The signed tarball and SHA256SUMS are kept as a workflow artifact for 14 days; this never makes a release.
@@ -16,6 +18,8 @@ on:
       - "packages/cli/**"
       - "contracts/harness/**"
       - "contracts/suites/embedded/bundle.test.ts"
+      - "contracts/suites/embedded/embeddings.test.ts"
+      - "packages/vault/src/embedding/**"
       - "contracts/prism-compat-expected.json"
       - "bun.lock"
       - ".github/workflows/bundle-macos.yml"
@@ -67,18 +71,19 @@ jobs:
           rm -rf ~/.bun/install/cache ~/Library/Caches/bun
           cat "$RUNNER_TEMP/dist/SHA256SUMS"
           codesign -dvvv "$dest/${{ steps.build.outputs.name }}/runtime/bun" 2>&1 | grep -E "^(Identifier|Format|CodeDirectory|Signature)"
-      - name: embedded/bundle on the signed tree (layout, pinned Bun, tarball, payload, a run, the signatures)
+      - name: embedded/bundle and embedded/embeddings on the signed tree (layout, pinned Bun, tarball, payload, a run, the signatures, a note embedded)
         env:
           CANDIDATE_DIR: ${{ steps.unpack.outputs.dir }}
           CANDIDATE_TARBALL: ${{ steps.build.outputs.tarball }}
           CANDIDATE_SHA256: ${{ steps.build.outputs.sha256 }}
         shell: bash
         run: |
-          bun run candidate -- --no-box suites/embedded/bundle.test.ts 2>&1 | tee "$RUNNER_TEMP/bundle.log"; test "${PIPESTATUS[0]}" -eq 0
+          bun run candidate -- --no-box suites/embedded/bundle.test.ts suites/embedded/embeddings.test.ts 2>&1 | tee "$RUNNER_TEMP/bundle.log"; test "${PIPESTATUS[0]}" -eq 0
           grep -qx "\[candidate\] sha256 ${{ steps.build.outputs.sha256 }}" "$RUNNER_TEMP/bundle.log"
           grep -q "^\[candidate\] unchanged after the run: sha256 ${{ steps.build.outputs.sha256 }}$" "$RUNNER_TEMP/bundle.log"
           # The signature contract is skipped off macOS; here it must have run and passed.
           grep -q "^(pass) embedded/bundle > macOS: every Mach-O is signed ad hoc" "$RUNNER_TEMP/bundle.log"
+          grep -q "^(pass) embedded/embeddings > a fresh install with semantic search on embeds a note" "$RUNNER_TEMP/bundle.log"
       - name: fetch Benjamin's suite at its pin (before the network is denied)
         shell: bash
         run: |

@@ -13,7 +13,8 @@
     "core/package.json",
     ".parachute",
     "tsconfig.json",
-    "web/ui/dist"
+    "web/ui/dist",
+    "models"
   ],
   "scripts": {
     "start": "bun src/server.ts",

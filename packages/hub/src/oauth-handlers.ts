@@ -44,6 +44,7 @@ import {
   type OAuthClient,
   type RegisteredClient,
   approveClient,
+  clientNameProblem,
   expandRedirectUrisForHubOrigins,
   getClient,
   isValidRedirectUri,
@@ -952,6 +953,12 @@ function pendingClientResponse(
   //      the operator into authorizing it.
   //   3. Requires a non-empty client_name — DCR allows omitting it, in
   //      which case the prior-grant lookup has nothing to match against.
+  //   3b. Requires every redirect of this client to have a home (origin, or
+  //      loopback) that a client the user granted under that name had
+  //      (audit L3-04, `findGrantByClientName`). The same-
+  //      origin check above passes for any plain link (no Origin or Referer
+  //      falls back to Host), so without this a stranger's "Claude" pointing
+  //      at their own host got a code silently.
   //   4. Requires scope coverage — a strict superset (the new request asks
   //      for scopes the prior grant didn't cover) falls through to the
   //      approve-pending screen so the operator explicitly approves the
@@ -967,7 +974,13 @@ function pendingClientResponse(
     client.clientName &&
     requestedScopes.length > 0 &&
     !requestedScopes.some(forcesExplicitConsent) &&
-    isCoveredByGrantForClientName(db, session.userId, client.clientName, requestedScopes)
+    isCoveredByGrantForClientName(
+      db,
+      session.userId,
+      client.clientName,
+      client.redirectUris,
+      requestedScopes,
+    )
   ) {
     console.log(
       `[oauth] auto-approved pending client by prior client_name trust client_id=${client.clientId} client_name=${JSON.stringify(client.clientName)} user_id=${session.userId} scopes=${requestedScopes.join(" ")} (hub#409)`,
@@ -1375,7 +1388,9 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
     // un-held verb. Guarded identically to the in-`pendingClientResponse`
     // block: same-origin + non-empty client_name + low-risk requested scopes
     // (`forcesExplicitConsent` is risk-based, not verb-based) + prior-grant
-    // coverage. When it doesn't apply, fall through to the consent render (the
+    // coverage by a same-named client with the same redirect homes (audit
+    // L3-04: same-origin alone passes for any plain link, see
+    // `findGrantByClientName`). When it doesn't apply, fall through to the consent render (the
     // single-consent payoff: one consent screen, then silent).
     const earlyRequested = parsed.scope.split(" ").filter((s) => s.length > 0);
     if (
@@ -1383,7 +1398,13 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
       client.clientName &&
       earlyRequested.length > 0 &&
       !earlyRequested.some(forcesExplicitConsent) &&
-      isCoveredByGrantForClientName(db, earlySession.userId, client.clientName, earlyRequested)
+      isCoveredByGrantForClientName(
+        db,
+        earlySession.userId,
+        client.clientName,
+        client.redirectUris,
+        earlyRequested,
+      )
     ) {
       console.log(
         `[oauth] carried prior client_name trust onto fresh client_id=${client.clientId} client_name=${JSON.stringify(client.clientName)} user_id=${earlySession.userId} scopes=${earlyRequested.join(" ")} (hub#409)`,
@@ -3428,6 +3449,10 @@ export async function handleRegister(
   // trust the client for low-risk scopes (hub#312).
   let status: ClientStatus = "pending";
   let sameHub = false;
+  // Only the hub's admin may register a Parachute-looking name for a foreign
+  // redirect (audit L3-04): a friend account's session also makes `sameHub`,
+  // and must not let them pass an app off as Parachute's own to the others.
+  let mayUseReservedName = false;
   if (req.headers.get("authorization")) {
     try {
       // Validate the operator bearer's `iss` against the SET of origins the
@@ -3439,6 +3464,7 @@ export async function handleRegister(
       await requireScope(db, req, "hub:admin", deps.hubBoundOrigins?.() ?? deps.issuer);
       status = "approved";
       sameHub = true;
+      mayUseReservedName = true;
     } catch (err) {
       if (err instanceof AdminAuthError) return adminAuthErrorResponse(err);
       throw err;
@@ -3457,7 +3483,19 @@ export async function handleRegister(
     if (session && isSameOriginRequest(req, resolveBoundOrigins(deps))) {
       status = "approved";
       sameHub = true;
+      mayUseReservedName = isHubAdmin(db, session.userId);
     }
+  }
+  // Reserved names and the length cap (audit L3-04). Checked before the wizard
+  // window below so a refused registration doesn't spend it.
+  const nameProblem = clientNameProblem(
+    body.client_name,
+    redirectUris,
+    resolveBoundOrigins(deps),
+    mayUseReservedName,
+  );
+  if (nameProblem) {
+    return jsonResponse({ error: "invalid_client_metadata", error_description: nameProblem }, 400);
   }
   // First-client auto-approve window (hub#268 Item 3). The wizard's expose
   // step opens a 60-minute window where the very next registration is

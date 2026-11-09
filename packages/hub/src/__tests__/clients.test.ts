@@ -4,8 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { issueAuthCode } from "../auth-codes.ts";
 import {
+  CLIENT_NAME_MAX_LENGTH,
   InvalidRedirectUriError,
   approveClient,
+  clientNameProblem,
+  looksLikeParachute,
   deleteClient,
   expandRedirectUrisForHubOrigins,
   findReapableClients,
@@ -669,5 +672,50 @@ describe("isValidRedirectUri", () => {
     expect(isValidRedirectUri("https://claude.ai/api/mcp/auth_callback")).toBe(true);
     expect(isValidRedirectUri("http://localhost:1939/admin/oauth/callback")).toBe(true);
     expect(isValidRedirectUri("https://my-surface.github.io/cb?x=1")).toBe(true);
+  });
+});
+
+describe("client_name policy for public DCR (audit L3-04)", () => {
+  const HUB = ["http://127.0.0.1:1939", "https://box.example"];
+  const evil = ["https://evil.example/cb"];
+
+  test("looksLikeParachute sees through case, spacing, punctuation, width, accents and look-alikes", () => {
+    for (const n of ["Parachute", "my parachute app", "Para-chute", "P.A.R.A.C.H.U.T.E", "Ｐａｒａｃｈｕｔｅ", "Pаrаchutе", "Parachüte", "Pɑrɑchute", "ᴘarachute", "Parachʋte", "Parachut3", "Par4chute",
+      // T-419 review: symbols, letters outside the table, small capitals, Lisu, syllabics, mixed Cyrillic
+      "P@rachute", "Pa r@chute", "Parachut\u20ac", "Parac\u041dute", "\u03a1\u0391R\u0391C\u0397UT\u0395", "Parachut\u025b", "Parachu\u0288e", "Pa\u0433achute", "\u1d18\u1d00\u0280\u1d00\u1d04\u029c\u1d1c\u1d1b\u1d07", "\ua4d1arachute", "\u146darachute", "\u0420\u0430\u0433\u0430\u0441\u04bb\u0438te"]) {
+      expect({ n, hit: looksLikeParachute(n) }).toEqual({ n, hit: true });
+    }
+    for (const n of ["Claude", "Notes", "Paracord", "chute"]) {
+      expect({ n, hit: looksLikeParachute(n) }).toEqual({ n, hit: false });
+    }
+  });
+
+  test("a Parachute-looking name needs every redirect to be first-party, or the operator", () => {
+    expect(clientNameProblem("Parachute Console", evil, HUB, false)).toMatch(/reserved/);
+    expect(clientNameProblem("Parachute Notes", ["https://box.example/oauth/callback", ...evil], HUB, false)).toMatch(/reserved/);
+    // A look-alike subdomain of a first-party origin is not first-party.
+    expect(clientNameProblem("Parachute Notes", ["https://app.parachute.computer.evil.example/cb"], HUB, false)).toMatch(/reserved/);
+    for (const uri of [
+      "https://box.example/oauth/callback",
+      "http://127.0.0.1:1939/notes/oauth/callback",
+      "https://app.parachute.computer/oauth/callback",
+      "https://my.parachute.computer/oauth/callback",
+      "https://notes.parachute.computer/oauth/callback",
+      "http://localhost:5173/oauth/callback",
+      "http://[::1]:5173/oauth/callback",
+    ]) {
+      expect({ uri, problem: clientNameProblem("Parachute Notes", [uri], HUB, false) }).toEqual({ uri, problem: null });
+    }
+    expect(clientNameProblem("Parachute Tasks", evil, HUB, true)).toBeNull();
+    expect(clientNameProblem("Parachute Hub (agent connector)", ["https://other-hub.example/cb"], HUB, false)).toBeNull();
+    expect(clientNameProblem("Claude", evil, HUB, false)).toBeNull();
+    expect(clientNameProblem(undefined, evil, HUB, false)).toBeNull();
+  });
+
+  test("length cap and type, for everyone", () => {
+    expect(clientNameProblem("a".repeat(CLIENT_NAME_MAX_LENGTH), evil, HUB, false)).toBeNull();
+    expect(clientNameProblem("a".repeat(CLIENT_NAME_MAX_LENGTH + 1), evil, HUB, false)).toMatch(/at most/);
+    expect(clientNameProblem("a".repeat(CLIENT_NAME_MAX_LENGTH + 1), evil, HUB, true)).toMatch(/at most/);
+    expect(clientNameProblem({ evil: true }, evil, HUB, false)).toMatch(/string/);
   });
 });

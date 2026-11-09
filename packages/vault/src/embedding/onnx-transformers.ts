@@ -6,10 +6,16 @@
  *
  * Runs `bge-small-en-v1.5` (q8-quantized ONNX, ~34MB — P0's eval
  * confirmed this is genuinely bundle-sized, unlike bge-m3's 1.1GB) via
- * `@huggingface/transformers`, IN-PROCESS, no subprocess. Model weights
- * download from the Hugging Face hub to a local cache on first use (a
- * base-MODEL download, not note content leaving the box) — every actual
- * embedding call after that runs entirely on this machine.
+ * `@huggingface/transformers`, IN-PROCESS, no subprocess.
+ *
+ * ## Where the model comes from (T-418)
+ *
+ * The bundle and the npm package ship the model's files, pinned by revision and sha256 (`release/model.json`), in
+ * `packages/vault/models/<model id>/`. When they are there they are the only source: nothing is downloaded, so a
+ * fresh install embeds offline (and `PARACHUTE_OFFLINE` homes, Prism's, can use it). A source checkout has no
+ * `models/`; there the weights download from the Hugging Face hub on first use (a base-MODEL download, not note
+ * content leaving the box) into transformers' own cache, as before. Every embedding call runs entirely on this
+ * machine.
  *
  * ## bun+onnxruntime verdict (P0/V2 spike)
  *
@@ -42,6 +48,8 @@ import {
   type EmbedResult,
   type ProviderAvailability,
 } from "../../core/src/embedding/provider.ts";
+import { existsSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { isOffline } from "../offline.ts";
 
 /** P0-verified bundle-sized default: 34MB q8 ONNX, well under the "~100MB zero-config" bar. */
@@ -66,14 +74,29 @@ export interface OnnxTransformersProviderOpts {
   pipelineLoader?: (modelId: string) => Promise<FeatureExtractionFn>;
 }
 
+/** The models the bundle and the npm package ship (`release/model.ts` puts them here); absent in a source checkout. */
+export const BUNDLED_MODELS_DIR = resolve(import.meta.dir, "..", "..", "models");
+
+/** Whether the shipped files of `modelId` (q8 weights and tokenizer) are in `dir`. */
+export function hasBundledModel(modelId: string, dir: string = BUNDLED_MODELS_DIR): boolean {
+  return ["config.json", "tokenizer.json", "tokenizer_config.json", join("onnx", "model_quantized.onnx")].every((f) => existsSync(join(dir, modelId, f)));
+}
+
 async function defaultPipelineLoader(modelId: string): Promise<FeatureExtractionFn> {
   // Dynamic import (not a top-level import) — this file lives in `src/`
   // (never `core/`), but keeping the ~34MB dependency's load off the
   // module-init path means a vault that never touches semantic search
   // never pays the import cost either.
   const { pipeline, env } = await import("@huggingface/transformers");
-  // Offline: a model already in the cache loads; a missing one is not downloaded.
-  if (isOffline()) env.allowRemoteModels = false;
+  if (hasBundledModel(modelId)) {
+    // The shipped files are the model: read from the install, never downloaded.
+    env.localModelPath = `${BUNDLED_MODELS_DIR}/`;
+    env.allowLocalModels = true;
+    env.allowRemoteModels = false;
+  } else if (isOffline()) {
+    // Offline: a model already in the cache loads; a missing one is not downloaded.
+    env.allowRemoteModels = false;
+  }
   const extractor = await pipeline("feature-extraction", modelId, { dtype: "q8" });
   return extractor as unknown as FeatureExtractionFn;
 }
@@ -86,6 +109,7 @@ export class OnnxTransformersEmbeddingProvider implements EmbeddingProvider {
   private readonly pipelineLoader: (modelId: string) => Promise<FeatureExtractionFn>;
   private extractorPromise: Promise<FeatureExtractionFn> | null = null;
   private broken: string | null = null;
+  private loaded = false;
 
   constructor(opts: OnnxTransformersProviderOpts = {}) {
     this.model = opts.modelId ?? DEFAULT_MODEL_ID;
@@ -107,13 +131,34 @@ export class OnnxTransformersEmbeddingProvider implements EmbeddingProvider {
       throw new EmbeddingError(this.broken, { code: "onnx_unavailable", retriable: false });
     }
     if (!this.extractorPromise) {
-      this.extractorPromise = this.pipelineLoader(this.model).catch((err) => {
-        const reason = `bundled ONNX embedding model failed to load: ${err instanceof Error ? err.message : String(err)}`;
-        this.broken = reason;
-        throw new EmbeddingError(reason, { code: "onnx_unavailable", retriable: false });
-      });
+      this.extractorPromise = this.pipelineLoader(this.model).then(
+        (extractor) => {
+          this.loaded = true;
+          return extractor;
+        },
+        (err) => {
+          const reason = `bundled ONNX embedding model failed to load: ${err instanceof Error ? err.message : String(err)}`;
+          this.broken = reason;
+          throw new EmbeddingError(reason, { code: "onnx_unavailable", retriable: false });
+        },
+      );
     }
     return this.extractorPromise;
+  }
+
+  /** Load the model now (once; later calls share the load) and say whether it can embed. Never throws. */
+  async warm(): Promise<ProviderAvailability> {
+    try {
+      await this.getExtractor();
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, reason: this.broken ?? (err instanceof Error ? err.message : String(err)) };
+    }
+  }
+
+  /** True until the model has loaded or failed: a model nobody has tried to load yet is not "ready". */
+  loading(): boolean {
+    return !this.loaded && this.broken === null;
   }
 
   /**
