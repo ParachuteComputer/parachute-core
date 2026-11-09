@@ -48,7 +48,10 @@ put in `lib/packages/vault/models/` by `model.ts`. Semantic search is still off 
 on, it embeds with no download and no network. Until 0.8.0-pre.3 the stack was left out, and a home that had it on
 under 0.7 failed every embed after the takeover with nothing but a log line per note; now `/health` says
 `embeddings: failing` when the model can't load. Left out: `onnxruntime-web` (the browser runtime) and other
-platforms' binaries. The cost: the linux-x64 tarball went from about 62 MB to 118 MB (243 MB unpacked).
+platforms' binaries. The cost: the linux-x64 tarball went from about 62 MB to 118 MB (243 MB unpacked). The bundles
+built today are linux-x64 and darwin-arm64; onnxruntime-node 1.24 has no Intel-Mac (darwin-x64) binary, so there
+semantic search would say `failing`. The external API (`EMBEDDING_API_URL`) still only says `ready` once configured:
+it has no load to check at start, so a wrong URL shows in each embed's log line.
 
 ## Install for a person
 
