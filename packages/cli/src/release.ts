@@ -294,8 +294,9 @@ function servedElsewhere(home: string, was: Release | undefined, opts: BeforeOpe
   const held = holders(home);
   if (!held.length) return false;
   if (opts.passIfServed) return true;
-  const who = held.map((h) => `pid ${h.pid} (${h.cmd.length > 120 ? `…${h.cmd.slice(-120)}` : h.cmd}${h.unit ? `, unit ${h.unit}` : ""})`).join(", ");
-  const unit = held.find((h) => h.unit)?.unit;
+  const who = held.map((h) => `pid ${h.pid} (${h.cmd.length > 120 ? `…${h.cmd.slice(-120)}` : h.cmd}${h.unit ? `, in ${h.unit}` : ""})`).join(", ");
+  // Only a Parachute unit is named to stop: a server started by hand runs inside whatever unit started its shell.
+  const unit = held.find((h) => h.unit && /parachute/i.test(h.unit))?.unit;
   const stopIt = unit ? `\`parachute stop\` or \`systemctl --user stop ${unit}\`` : process.platform === "darwin" ? "`parachute stop`, or its launchd agent" : "`parachute stop`, or stop that process";
   throw new Served(
     EXIT.held,
