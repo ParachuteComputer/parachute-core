@@ -291,7 +291,15 @@ function holdSharedAndGo(home: string, recheck: Recheck): undefined {
  * lock, which every command of this release holds shared while it runs: whatever holds the data now is not one.
  */
 function servedElsewhere(home: string, was: Release | undefined, opts: BeforeOpenOpts): boolean {
-  const held = holders(home);
+  // A server holds the data for as long as it runs; another command of this release opens it only for a moment
+  // before it reaches the lock (dispatch's newer-data check). So only a process seen holding it on three looks
+  // about 300 ms apart counts.
+  let held = holders(home);
+  for (let look = 1; look < 3 && held.length; look++) {
+    Bun.sleepSync(300);
+    const again = new Set(holders(home).map((h) => h.pid));
+    held = held.filter((h) => again.has(h.pid));
+  }
   if (!held.length) return false;
   if (opts.passIfServed) return true;
   const who = held.map((h) => `pid ${h.pid} (${h.cmd.length > 120 ? `…${h.cmd.slice(-120)}` : h.cmd}${h.unit ? `, in ${h.unit}` : ""})`).join(", ");
