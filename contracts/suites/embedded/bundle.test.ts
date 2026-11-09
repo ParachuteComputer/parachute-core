@@ -4,8 +4,8 @@
 //     THIRD-PARTY-NOTICES.txt, SOURCE.md, VERSION;
 //   - it runs on its own pinned Bun (release/bun.json), with no Bun on PATH, serve and (on the child path) its vault child;
 //   - the tarball unpacks to exactly the tree under test, and SHA256SUMS names its hash;
-//   - lib/ has no local embedding stack (no onnxruntime, no sharp), no dev tools, and native code only for this
-//     platform;
+//   - lib/ has the local embedding stack and its model (T-418), no browser runtime, no dev tools, and native code only
+//     for this platform;
 //   - every package in lib/ is in the notices, and SOURCE.md names the commit it was built from;
 //   - copied to a path with a space and run with no Bun on PATH: create a vault, serve, sign in with a password
 //     (argon2 from the payload), the admin page, a write and a read;
@@ -298,14 +298,23 @@ describe("embedded/bundle", () => {
     rmSync(out, { recursive: true, force: true });
   }, 120_000);
 
-  test("lib/ has no local embedding stack, no dev tools, and native code only for this platform", () => {
+  test("lib/ has the local embedding stack and its model, no dev tools, and native code only for this platform", () => {
     const lib = join(dir(), "lib");
     const names = new Set([...installedPackages(lib).values()].map((p) => p.slice(0, p.lastIndexOf("@"))));
-    const unwanted = ["onnxruntime-node", "onnxruntime-web", "onnxruntime-common", "sharp", "@huggingface/transformers", "typescript", "@biomejs/biome", "bun-types"];
+    // Semantic search turned on must work from the bundle (T-418): transformers, onnxruntime-node and the pinned model.
+    const wanted = ["@huggingface/transformers", "onnxruntime-node", "onnxruntime-common", "sharp", "@node-rs/argon2"];
+    must(wanted.every((n) => names.has(n)), `lib/ lacks ${wanted.filter((n) => !names.has(n)).join(", ")}`);
+    const model = JSON.parse(readFileSync(join(REPO, "release", "model.json"), "utf8")) as { id: string; files: Record<string, string> };
+    for (const [rel, want] of Object.entries(model.files)) {
+      const at = join(lib, "packages", "vault", "models", model.id, rel);
+      must(existsSync(at) && sha256(at) === want, `the model's ${rel} is missing or not the pinned file`);
+    }
+    const unwanted = ["onnxruntime-web", "typescript", "@biomejs/biome", "bun-types"];
     must(unwanted.every((n) => !names.has(n)), `lib/ ships ${unwanted.filter((n) => names.has(n)).join(", ")}`);
-    expect(names.has("@node-rs/argon2")).toBe(true);
-    const natives = files(lib, (f) => f.endsWith(".node"));
+    // Native code: addons (.node) and the libraries they load (onnxruntime's), all for this platform only.
+    const natives = files(lib, (f) => f.endsWith(".node") || /\.so(\.\d+)*$/.test(f) || f.endsWith(".dylib"));
     expect(natives.length).toBeGreaterThan(0);
+    expect(natives.some((f) => f.includes("onnxruntime"))).toBe(true);
     const wrong = natives.map((f) => ({ f, t: nativeTarget(join(lib, f)) })).filter((n) => n.t !== platform);
     must(wrong.length === 0, `native code for another platform: ${wrong.map((w) => `${w.f} (${w.t})`).join(", ")}`);
     // The admin pages are built into the tree, where hub and vault look for them.
