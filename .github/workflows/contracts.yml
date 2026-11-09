@@ -18,14 +18,19 @@
 # Everything is local to the runner: throwaway homes, random ports, no live service.
 name: contracts
 
+# Every job here is meant to be a required check on main and next (branch protection, T-420; release.yml's
+# contracts-green already requires them before npm publish), so none may carry a path filter (a required check that
+# never runs blocks the merge).
 on:
   push:
-    branches: [main]
+    branches: [main, next]
   pull_request:
   workflow_dispatch:
 
 concurrency:
-  group: contracts-${{ github.ref }}
+  # A newer push cancels a stale run on the same PR or on next. On main each commit gets its own group, so nothing
+  # cancels it: release.yml publishes a commit only after that commit's contracts checks have passed.
+  group: contracts-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -44,6 +49,8 @@ jobs:
       - run: bun install --frozen-lockfile
       - name: every dependency in range, and every version the moved repos locked kept (or a listed departure)
         run: bun scripts/check-dependency-tree.ts . packages/vault/bun.lock packages/hub/bun.lock
+      - name: the agent-facing docs (AGENTS.md, CLAUDE.md, PROCESS.md) name only paths that exist
+        run: bun scripts/check-doc-paths.ts
       - name: typecheck (cli, vault, hub)
         run: |
           bun run --cwd packages/cli typecheck

@@ -11,7 +11,7 @@ name: bundle-macos
 
 on:
   push:
-    branches: [main]
+    branches: [main, next]
   pull_request:
     paths:
       - "release/**"

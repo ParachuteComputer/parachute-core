@@ -20,7 +20,7 @@ import type { Database } from "bun:sqlite";
  *     catalog-hidden below write; PATCH encodes path ids;
  *   - descriptor advertises account_mcp_endpoint (see account-api.test).
  */
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1674,6 +1674,59 @@ describe("account MCP — vault module proxy", () => {
       expect(res.status).toBe(200);
       expect(seen).toEqual([{ name: "delete-note", args: { id: "n1" } }]);
     } finally {
+      h.cleanup();
+    }
+  });
+
+  // Audit L6-02: the hub's own failure on the way to a vault was invisible in its log, like the vault's crashes.
+  test("a vault the hub can't reach logs one mcp_tool_error line; a refusal logs none; arguments never", async () => {
+    const h = await makeHarness();
+    const marker = `marker-${Math.random().toString(36).slice(2)}`;
+    const logged: string[] = [];
+    const spy = spyOn(console, "error").mockImplementation((...a: unknown[]) => {
+      logged.push(a.map(String).join(" "));
+    });
+    try {
+      // The network is faked (outside our control): the vault's tools/list answers, the tools/call never connects.
+      const fetchImpl = (input: string | URL | Request, init?: RequestInit) =>
+        routeVaultMcp(input, init, {
+          onCall: () => {
+            throw new TypeError("Unable to connect. Is the computer able to access the url?");
+          },
+        });
+      const res = await handleAccountMcp(
+        nostrReq(
+          OWNER_SECRET,
+          rpc("tools/call", { name: "create-note", arguments: { vault: "beta", content: marker } }),
+        ),
+        mcpDeps(h, { fetchImpl }),
+      );
+      const body = (await res.json()) as { result?: { isError?: boolean } };
+      expect(body.result?.isError).toBe(true);
+      const crashes = logged.filter((l) => l.includes("event=mcp_tool_error"));
+      expect(crashes).toHaveLength(1);
+      expect(crashes[0]).toContain("tool=create-note");
+      expect(crashes[0]).toContain("class=TypeError");
+      expect(crashes[0]).toMatch(/ version=\S+$/);
+      expect(logged.join("\n")).not.toContain(marker);
+
+      logged.length = 0;
+      const refused = await handleAccountMcp(
+        nostrReq(
+          FRIEND_SECRET,
+          rpc("tools/call", {
+            name: "create-note",
+            arguments: { vault: "personal", content: marker },
+          }),
+        ),
+        mcpDeps(h, { fetchImpl }),
+      );
+      const refusal = (await refused.json()) as { error?: { data?: { error_type?: string } } };
+      expect(refusal.error?.data?.error_type).toBe("vault_not_covered");
+      expect(logged.filter((l) => l.includes("event=mcp_tool_error"))).toEqual([]);
+      expect(logged.join("\n")).not.toContain(marker);
+    } finally {
+      spy.mockRestore();
       h.cleanup();
     }
   });

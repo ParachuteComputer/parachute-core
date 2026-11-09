@@ -13,7 +13,7 @@ The README is the operator intro; this file is for agents and humans working *on
 ## Gotchas — hard-won, don't rediscover
 
 - **Port 1939 is pinned with no fallback.** `tailscale serve` needs a stable localhost target; a walking fallback would silently break cross-machine URLs.
-- **`src/notes-serve.ts` must strip its `--mount` prefix** before joining with `dist/`. Without the strip, `/notes/sw.js` and `/notes/manifest.webmanifest` get SPA-shelled as `text/html`, the browser never registers the service worker or manifest, and the PWA install prompt never fires.
+- **`src/bundle-serve.ts` (the static shim behind the `/app` and `/notes` mounts) must strip its `--mount` prefix** before joining with `dist/`. Without the strip, `/notes/sw.js` and `/notes/manifest.webmanifest` get SPA-shelled as `text/html`, the browser never registers the service worker or manifest, and the PWA install prompt never fires.
 - **Services own the write side of `~/.parachute/services.json`** (`src/services-manifest.ts`); the CLI only seeds a missing entry post-install at `SEED_VERSION` (`"0.0.0-linked"` — "stopgap, the service's own boot overwrites").
 - **`install` checks bun's global node_modules for a bun-link symlink before `bun add -g`** — modules linked from source (not yet on npm) would otherwise 404.
 

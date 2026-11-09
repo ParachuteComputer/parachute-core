@@ -4,30 +4,9 @@ Short and plain on purpose. Change it by pull request, like code.
 
 ## 1. Reuse or rewrite, module by module
 
-Today's code is about 238,000 lines across vault, hub and cloud, not counting tests. The rule: **move what already
-works and has tests; rewrite only where today's shape is the problem.** Every move lands behind the contracts.
-The groups and line counts are from the T-289 module map (`deep/core/MODULE-MAP.md` §2, commits vault `42fbf93`,
-hub `53d327b`).
-
-| Part of v1 | Comes from | Reuse or rewrite | Why |
-|---|---|---|---|
-| **Vault core**: notes, types, links, history, query, hooks, MCP tools, portable markdown (~49k) | vault `core/` and storage | **Reuse**, moved as is | It's the best-tested code we have and already runtime-free (`core/src`). The contracts here are written against what it does. |
-| **Tag scope → grants** | vault `src/tag-scope.ts` | **Rewrite** around one reader per identity | Today's scope is per-pass and per-path. v1 needs grants in the vault, "adds up", private notes, and one checkpoint every read goes through (deep/access). |
-| **REST handlers** (5,344 lines) | vault `src/routes.ts` | **Reuse, then refactor** to take a `Host` | Tied to the machine through four imports. Making it take its host from outside ends the cloud's hand ports. |
-| **Sign-in ("the door")**: OAuth, passwords, sessions, TOTP, Nostr, account pages (~35k) | hub | **Reuse** the handlers | They already take `(db, request)` and return a response. The consumer-connector contract pins their behaviour. |
-| **Agent grants, Connections, hop passes, `pvk_` keys, the vault's own passwords** | hub, vault | **Drop** | The vault can't tell who acted (a renewed Connections pass has `sub = "connection"`). An agent becomes an identity with an owner and its own key. |
-| **Supervisor, port table, proxy, surface host, module lifecycle** (~31k) | hub | **Drop** | One program has one router. Nothing to supervise or proxy. |
-| **Host: Bun** (server, CLI, OS unit, backup, config) (~38k) | vault and hub | **Reuse**, merged into one host | Mostly glue; merge the two CLIs into one. |
-| **Transcription, embedding** (~6.5k) | vault | **Reuse** as workers beside the core | Already behind provider interfaces. |
-| **Built-in page** (sign in, keys, vaults, sharing, approving apps) | hub admin SPA (10k) | **Rewrite small** | Five jobs. The current SPA does many more. |
-| **Live editing** | the T-271 spike, deep/live | **New** | No code in today's repos. |
-| **Surface** (Notes UI and the surface host) | parachute-surface | **Stays outside** | Surfaces are apps. They talk to the core over HTTP and MCP like any other app. |
-| **Buzz channel vaults** (3.4k) | hub | **Undecided** (A14) | Default: an outside agent keeps a group in step with a channel. |
-
-The order: (1) `contracts/` against today's code (this repo, now); (2) move vault core and the door handlers in, with
-a Bun host, while vault and hub keep shipping from their repos; (3) REST handlers take their host; (4) one router,
-and delete the proxy and supervisor; (5) cloud depends on `core` as a package; (6) grants move into the vault;
-(7) live editing. Each step lands when every `today` contract passes against the new build.
+The rule: **move what already works and has tests; rewrite only where today's shape is the problem.** Every move
+lands behind the contracts. The original plan, module by module, is in
+[`docs/history/v1-move-plan.md`](docs/history/v1-move-plan.md).
 
 ## 2. Which tests, and why unit tests are a minority
 
@@ -53,15 +32,24 @@ of them pass, then moving it to `today/`.
 
 ## 3. How a change lands
 
-1. **One branch per task**: `<who>/<task>-<slug>`, e.g. `uni/t308-contracts`, `ben/b6-anchors`. Never push to
-   `main`.
+1. **One branch per task**: `<who>/<task>-<slug>`, e.g. `uni/t308-contracts`, `ben/b6-anchors`, from `next`.
+   Never push to `next` or `main`. `next` is the trunk; `main` is what's released.
 2. **Contracts first.** A behaviour change starts with the contract that describes it; a bug fix starts with a
    contract that fails.
-3. **Pull request** with what changed, why, the suite's summary lines, and, for a new test, how you made it fail.
-4. **CI must be green**: typecheck, `today`, `v1`, the harness self-tests, mutants.
-5. **Review by someone else.** The author never approves their own pull request. Code reviews can be agents.
-   Changes to what a contract *means* (a rule, not a typo) need Aaron or Benjamin.
-6. **Squash-merge.** Releases and deploys are separate decisions and don't happen from this repo yet.
+3. **Pull request against `next`** with what changed, why, the suite's summary lines, and, for a new test, how you
+   made it fail.
+4. **CI must be green**: every job in `.github/workflows/contracts.yml` (the moved code's typecheck and tests,
+   `today` and `v1`, the harness self-tests, every suite on the candidate build, Benjamin's suite, the npm package,
+   and both mutant jobs).
+5. **Review by someone who didn't write it.** Today that is a fresh Claude reviewer, recorded in a `## Review`
+   section of the pull request body (who reviewed, the rounds, the verdict; round cap 3). GitHub approvals aren't
+   used: Uni opens pull requests and merges them into `next` as `unforcedagi`, so the review section is the record. Changes to what
+   a contract *means* (a rule, not a typo) need Aaron or Benjamin.
+6. **Squash-merge** into `next`.
+7. **Releases** are a pull request from `next` to `main` that bumps the version, merged by Aaron (`unforced`; an
+   agent never merges into `main`) with a merge commit, not a squash, so the branches don't diverge. The merge publishes
+   `@openparachute/core` to npm once that commit's contracts jobs pass (`RELEASING.md`). Nothing deploys from this
+   repo: the hosted door (parachute-cloud) pins a core commit and deploys from there.
 
 Pins move in their own pull requests. If a pin bump turns a contract red, someone decides whether the code or the
 contract is wrong, and says so in the pull request.
@@ -74,9 +62,9 @@ contract is wrong, and says so in the pull request.
   pull request names its brief or issue.
 - **Split by contract, not by file.** A task names the contracts it will make pass (or add). Two agents don't take
   the same contract at once. The issue says who has it.
-- **Cross-review.** A Uni worker's pull request is reviewed by Benjamin's agent or a different Uni worker, and the
-  other way round. The reviewer runs the suite, not just reads the diff.
+- **Cross-review.** A pull request is reviewed by an agent that didn't write it: today a fresh Claude reviewer that
+  Uni starts, and Benjamin's agent when it reviews. The reviewer runs the suite, not just reads the diff.
 - **Questions go up, not around.** When a contract's meaning is unclear, the agent asks its own person (Aaron
   through Uni, or Benjamin). It doesn't guess and it doesn't edit the contract to fit the code.
-- **Private by default.** No real notes, journals or keys in tests, logs or pull requests. The repo stays private.
-  Until the CLA is reviewed and in force, only people and agents working for Aaron or Benjamin contribute.
+- **Public repo, private data.** The repo is public. No real notes, journals or keys in tests, logs or pull
+  requests. Until the CLA is reviewed and in force, only people and agents working for Aaron or Benjamin contribute.
