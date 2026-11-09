@@ -38,10 +38,15 @@ home with data:
    2026-11-05 a 0.9 `parachute-vault --help`, run with no `PARACHUTE_HOME` on a box whose 0.8 unit served
    `~/.parachute`, recorded 0.9 as current there while 0.8 kept serving; a real 0.9 start would then have skipped
    its backup. Stop the serving release (its unit, or `parachute stop`) to move the home, or run the command with
-   the release that serves it.
+   the release that serves it. `parachute start`, `stop`, `restart`, `status` and `logs` only drive the server, so
+   they go on without a step (0.8 says to upgrade with "install, then `parachute restart`"); the serve they start
+   takes the step once the old server has let go.
 5. **A record is trusted only with its backup.** Each later command checks that the backup the record names still
-   has its `manifest.json` for this step. If it is gone, the home is backed up again first, and the record says
-   when (`backup_retaken_at`); that copy is the home as it is then, not as the previous release left it.
+   has its `manifest.json` for this step. If it is gone, the home is backed up again first (never while another
+   release holds the data, and without waiting on a running 0.9 command: then the next command that runs alone
+   does it), and the record says when (`backup_retaken_at`). That copy is the home as it is then, not as the
+   previous release left it, so `upgrade --rollback` refuses to use it and says why. With no room for it, the
+   command says so and goes on; the next one tries again.
 
 It leaves alone:
 - a home 0.9 itself made (it already carries 0.9's structures);

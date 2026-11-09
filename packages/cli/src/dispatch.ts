@@ -233,7 +233,10 @@ export async function dispatch(role: Role, notice?: Notice): Promise<void> {
     // The first time this release opens a home an older one served: record the step and back the databases up
     // first (release.ts). Not a host's (embedded) home, nor one the old 0.7 programs still own.
     const { beforeOpenOrExit } = await import("./release.ts");
-    const code = beforeOpenOrExit(home, newerCheck);
+    // Commands that only drive the running server go on while another release serves the home (taking no step): the
+    // serve they start takes it. `parachute restart` after installing a new release is how 0.8 says to upgrade.
+    const unitCommand = r.cli === "hub" && ["start", "stop", "restart", "status", "logs"].includes(r.argv[0] ?? "");
+    const code = beforeOpenOrExit(home, newerCheck, { passIfServed: unitCommand });
     if (code !== null) process.exit(code);
   }
   if (r.cli === "hub" && r.argv[0] === "keys") {

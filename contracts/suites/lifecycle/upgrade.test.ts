@@ -12,8 +12,10 @@
 //     and 0.8 serves that;
 //   - a home 0.9 made has no earlier release: no backup, nothing to roll back.
 //   - while 0.8's server holds the home, a 0.9 command (even `parachute-vault --help`) refuses with 7, taking no
-//     backup and writing no record (T-418, the 11-05 record);
-//   - a record whose backup is gone is not trusted: the home is backed up again first (T-418).
+//     backup and writing no record, and doesn't refresh a stray record either (T-418, the 11-05 record); a command
+//     that only drives the server (`status`, `restart`) goes on without a step;
+//   - a record whose backup is gone is not trusted: the home is backed up again first, without waiting on a running
+//     0.9 command, and a rollback won't use that later copy (T-418).
 // Each machine has its own network (the box holds 1940; _takeover-lib.ts). Red on 0.8 (no release record, no
 // rollback); green from 0.9's release.ts.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
@@ -21,7 +23,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { Database } from "bun:sqlite";
 import { existsSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { candidate, freePort, newHome, until } from "../candidate-lib.ts";
+import { candidate, freePort, newHome, start, until } from "../candidate-lib.ts";
 import { cli } from "../candidate-lib.ts";
 import { must, rest, safeFetch } from "../lib.ts";
 import { dbHolders, newMachine, type Machine, type Proc } from "./_takeover-lib.ts";
@@ -42,6 +44,8 @@ const sha = (p: string) => createHash("sha256").update(readFileSync(p)).digest("
 const vaultDb = () => join(m.home, "vault", "data", vault, "vault.db");
 const dbHashes = () => ({ hub: sha(join(m.home, "hub.db")), vault: sha(vaultDb()) });
 const release = () => JSON.parse(readFileSync(join(m.home, "run", "release.json"), "utf8"));
+/** The candidate's own version, from its package.json (as `version --json` reports it). */
+const release0x = () => JSON.parse(readFileSync(join(info.dir, "package.json"), "utf8")).version as string;
 const backups = () => {
   const d = join(dirname(m.home), "parachute-upgrade");
   return existsSync(d) ? readdirSync(d).sort() : [];
@@ -140,6 +144,22 @@ describe("lifecycle/upgrade", () => {
       }
       expect(existsSync(join(m.home, "run", "release.json"))).toBe(false);
       expect(backups()).toEqual([]);
+
+      // A command that only drives the server goes on (0.8 says to upgrade with `parachute restart`), taking no step.
+      const status = await run(info.bin, ["status"]);
+      expect({ code: status.code === 7 ? 7 : "not 7", refused: status.stderr.includes("took no backup") }).toEqual({ code: "not 7", refused: false });
+      expect(existsSync(join(m.home, "run", "release.json"))).toBe(false);
+      expect(backups()).toEqual([]);
+
+      // The 11-05 record itself, with its backup cleaned away: 0.9 must not refresh it under 0.8's server.
+      const stray = { version: release0x(), previous: "0.8", since: new Date().toISOString(), backup: join(dirname(m.home), "parachute-upgrade", "gone"), state: "current" };
+      writeFileSync(join(m.home, "run", "release.json"), JSON.stringify(stray));
+      const again = await run(info.vaultBin, ["--help"]);
+      expect(again.code).toBe(7);
+      expect(again.stderr).toContain("took no backup and recorded nothing");
+      expect(backups()).toEqual([]);
+      expect(JSON.parse(readFileSync(join(m.home, "run", "release.json"), "utf8"))).toEqual(stray);
+      rmSync(join(m.home, "run", "release.json"));
     } finally {
       await box.stop();
     }
@@ -299,10 +319,22 @@ describe("lifecycle/upgrade", () => {
     must((await cli(home, ["user", "list"])).code === 0, "setup: the first 0.9 command");
     const first = JSON.parse(readFileSync(join(home, "run", "release.json"), "utf8"));
     must(first.backup && existsSync(join(first.backup, "manifest.json")), "setup: the first command took no backup");
-    renameSync(first.backup, `${first.backup}-moved-away`);
+    // While another 0.9 command runs (it holds the release lock shared), a command doesn't wait on it: it says so and
+    // goes on; the backup is taken again by the next command that runs alone.
+    const watcher = start(home, ["export", join(dirname(home), "export-watch"), "--watch", "--vault", "goodv"], { vault: true, env: { EMBEDDINGS_ENABLED: "false" } });
+    try {
+      must(await until(() => watcher.log().includes("Exported"), 30_000), `setup: export --watch never started: ${watcher.log().slice(-600)}`);
+      renameSync(first.backup, `${first.backup}-moved-away`);
+      const t0 = Date.now();
+      const busy = await cli(home, ["user", "list"]);
+      expect({ code: busy.code, quick: Date.now() - t0 < 20_000 }).toEqual({ code: 0, quick: true });
+      expect(busy.stderr).toContain(`the backup this home's record names (${first.backup}) is gone, but another parachute command is running`);
+    } finally {
+      await watcher.stop();
+    }
     const r = await cli(home, ["user", "list"]);
     expect(r.code).toBe(0);
-    expect(r.stderr).toContain(`the backup this home's record names (${first.backup}) is gone`);
+    expect(r.stderr).toContain(`the backup this home's record names (${first.backup}) is gone or isn't this step's; backing up`);
     const again = JSON.parse(readFileSync(join(home, "run", "release.json"), "utf8"));
     expect(again).toMatchObject({ version: first.version, previous: "0.8", state: "current" });
     expect(again.backup).not.toBe(first.backup);
@@ -310,6 +342,10 @@ describe("lifecycle/upgrade", () => {
     // And trusted from then on: no third backup.
     await cli(home, ["user", "list"]);
     expect(readdirSync(join(dirname(home), "parachute-upgrade")).filter((d) => !d.endsWith("-moved-away")).length).toBe(1);
+    // A copy taken after 0.9 opened the home can't back a rollback: it says so instead.
+    const rb = await cli(home, ["upgrade", "--rollback"]);
+    expect(rb.code).toBe(1);
+    expect(rb.stderr).toContain("was taken again on");
   }, 120_000);
 
   test("a home 0.9 made has no earlier release: no backup, nothing to roll back", async () => {
