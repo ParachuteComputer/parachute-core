@@ -116,7 +116,9 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       SHA: ${{ github.sha }}
       WAIT_MINUTES: 180
-      WAIT_FOR_MISSING: true
+      # A push started CI on this commit too, so wait for its checks to appear. A manual run of a commit CI never ran
+      # on is refused at once.
+      WAIT_FOR_MISSING: ${{ github.event_name == 'push' }}
       # The job names in contracts.yml, as GitHub shows them. Rename a job there, rename it here.
       REQUIRED: |
         the moved code (workspace, typecheck, the vault's and hub's own tests)
