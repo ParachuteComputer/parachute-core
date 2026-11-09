@@ -11,12 +11,15 @@
 //   - `upgrade --rollback --restore --yes` exports the notes changed since the backup, then puts the backup back,
 //     and 0.8 serves that;
 //   - a home 0.9 made has no earlier release: no backup, nothing to roll back.
+//   - while 0.8's server holds the home, a 0.9 command (even `parachute-vault --help`) refuses with 7, taking no
+//     backup and writing no record (T-418, the 11-05 record);
+//   - a record whose backup is gone is not trusted: the home is backed up again first (T-418).
 // Each machine has its own network (the box holds 1940; _takeover-lib.ts). Red on 0.8 (no release record, no
 // rollback); green from 0.9's release.ts.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createHash, randomBytes } from "node:crypto";
 import { Database } from "bun:sqlite";
-import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { candidate, freePort, newHome, until } from "../candidate-lib.ts";
 import { cli } from "../candidate-lib.ts";
@@ -123,6 +126,25 @@ afterAll(async () => {
 });
 
 describe("lifecycle/upgrade", () => {
+  test("while 0.8's server holds the home, a 0.9 command takes no backup and records nothing (T-418)", async () => {
+    // 2026-11-05: `parachute-vault --help` from a 0.9 checkout, run with no PARACHUTE_HOME on a box whose 0.8 unit
+    // served ~/.parachute, backed the home up and wrote run/release.json saying 0.9 was current while 0.8 kept
+    // serving. A real 0.9 start would then have found its own version recorded and skipped its backup.
+    const box = await serve(prevBin, "0.8 serve");
+    try {
+      for (const [bin, args] of [[info.vaultBin, ["--help"]], [info.bin, ["keys", "list"]]] as const) {
+        const r = await run(bin, [...args]);
+        expect({ cmd: `${bin.split("/").pop()} ${args.join(" ")}`, code: r.code }).toEqual({ cmd: `${bin.split("/").pop()} ${args.join(" ")}`, code: 7 });
+        expect(r.stderr).toMatch(/pid \d+ \([^)]*serve/); // names the server that holds the home
+        expect(r.stderr).toContain("took no backup and recorded nothing");
+      }
+      expect(existsSync(join(m.home, "run", "release.json"))).toBe(false);
+      expect(backups()).toEqual([]);
+    } finally {
+      await box.stop();
+    }
+  }, 180_000);
+
   test("0.9's first command on a 0.8 home backs its databases up first, outside the home, and only once", async () => {
     const before = dbHashes();
     const r = await core(["keys", "list", "--json"]);
@@ -269,6 +291,25 @@ describe("lifecycle/upgrade", () => {
     expect((copy.query("PRAGMA table_info(tags)").all() as { name: string }[]).some((c) => c.name === "kind")).toBe(false);
     copy.close();
     expect(JSON.parse(readFileSync(join(home, "run", "release.json"), "utf8")).skipped).toBeUndefined();
+  }, 120_000);
+
+  test("a record whose backup is gone backs the home up again before it is trusted (T-418)", async () => {
+    // The early return ("this release already serves this home") used to trust the record alone.
+    const home = await homeBy08("up-gone", ["goodv"]);
+    must((await cli(home, ["user", "list"])).code === 0, "setup: the first 0.9 command");
+    const first = JSON.parse(readFileSync(join(home, "run", "release.json"), "utf8"));
+    must(first.backup && existsSync(join(first.backup, "manifest.json")), "setup: the first command took no backup");
+    renameSync(first.backup, `${first.backup}-moved-away`);
+    const r = await cli(home, ["user", "list"]);
+    expect(r.code).toBe(0);
+    expect(r.stderr).toContain(`the backup this home's record names (${first.backup}) is gone`);
+    const again = JSON.parse(readFileSync(join(home, "run", "release.json"), "utf8"));
+    expect(again).toMatchObject({ version: first.version, previous: "0.8", state: "current" });
+    expect(again.backup).not.toBe(first.backup);
+    expect(existsSync(join(again.backup, "manifest.json"))).toBe(true);
+    // And trusted from then on: no third backup.
+    await cli(home, ["user", "list"]);
+    expect(readdirSync(join(dirname(home), "parachute-upgrade")).filter((d) => !d.endsWith("-moved-away")).length).toBe(1);
   }, 120_000);
 
   test("a home 0.9 made has no earlier release: no backup, nothing to roll back", async () => {

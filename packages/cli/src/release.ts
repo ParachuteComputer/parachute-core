@@ -54,6 +54,8 @@ export interface Release {
   via?: "takeover";
   rolled_back_at?: string;
   restored_at?: string;
+  /** Set when the backup the record named was gone and the home was backed up again (backUpAgain). */
+  backup_retaken_at?: string;
   /** Where a restore moved what was live; a retried restore adds its own folders in moved_aside_retries. */
   moved_aside?: string;
   moved_aside_retries?: string[];
@@ -211,7 +213,7 @@ export function beforeOpen(home: string, say: (s: string) => void = (s) => conso
     holdShared(home);
     recheckOrStop(recheck);
     const r = readRelease(home);
-    if (!r || r.version !== core.version || r.state !== "current") {
+    if (!r || r.version !== core.version || r.state !== "current" || !backupHolds(r)) {
       // A step to take: let go, take the lock exclusively (it waits for the other commands), then hold it shared again.
       letGoShared();
       let seen = "";
@@ -247,7 +249,7 @@ export function beforeOpen(home: string, say: (s: string) => void = (s) => conso
       holdShared(home);
       recheckOrStop(recheck);
       const again = readRelease(home);
-      if (again && again.version === core.version && again.state === "current") return again;
+      if (again && again.version === core.version && again.state === "current" && backupHolds(again)) return again;
       letGoShared();
     }
   }
@@ -257,11 +259,25 @@ export function beforeOpen(home: string, say: (s: string) => void = (s) => conso
 /** What the locked step did: the record now in force, or why it recorded nothing. */
 function beforeOpenLocked(home: string, say: (s: string) => void): Release | "old-owner" | "unreadable" {
   const was = readRelease(home);
-  if (was && was.version === core.version && was.state === "current") return was.skipped?.length ? catchUp(home, was, say) : was;
+  if (was && was.version === core.version && was.state === "current") {
+    if (!backupHolds(was)) return backUpAgain(home, was, say);
+    return was.skipped?.length ? catchUp(home, was, say) : was;
+  }
   if (was?.state === "restoring") {
     throw new Exit(EXIT.failed, `a restore on this home was interrupted; what ${was.version} left is in ${was.moved_aside}. Run \`parachute upgrade --rollback --restore --yes\` again to finish it.`);
   }
   if (serveRefusal(home) !== null) return "old-owner";
+  // Another release serves this home (T-418): on 2026-11-05 a 0.9 `parachute-vault --help`, run on a home 0.8's unit
+  // served, backed it up and recorded 0.9 as current while 0.8 kept serving, so a real 0.9 start would have skipped
+  // its backup. A step is recorded only when nothing else holds the data: this release is then the one that opens it.
+  const held = holders(home);
+  if (held.length) {
+    const who = held.map((h) => `pid ${h.pid} (${h.cmd.length > 120 ? `…${h.cmd.slice(-120)}` : h.cmd}${h.unit ? `, unit ${h.unit}` : ""})`).join(", ");
+    throw new Exit(
+      EXIT.held,
+      `another Parachute serves this home (${was ? `run/release.json says ${was.version}, ${was.state}` : "an older release; this home has no release record"}): ${who}. ${core.version} took no backup and recorded nothing. Run this command with the Parachute that serves the home, or stop it (its unit, or \`parachute stop\`) to move this home to ${core.version}.`,
+    );
+  }
   const since = new Date().toISOString();
   let dbs = databases(home, { hub: 0, vault: 0 });
   // A database that can't be read can't be backed up or judged: it is named, left out of the backup, and left alone
@@ -331,6 +347,34 @@ function catchUp(home: string, r: Release, say: (s: string) => void): Release {
   writeRelease(home, next);
   say(`parachute: ${now.join(", ")} can be read now; backed it up first, to ${r.backup}`);
   return next;
+}
+
+/**
+ * Whether the record's backup is still there and is the backup of this step: its manifest names the same releases.
+ * A record with no backup (a home this release made, or its own takeover's) has nothing to check.
+ */
+function backupHolds(r: Release): boolean {
+  if (!r.backup) return true;
+  const m = readJson(join(r.backup, "manifest.json")) as Manifest | undefined;
+  return !!m && m.to === r.version && (r.previous === null || m.from === r.previous) && typeof m.files === "object";
+}
+
+/**
+ * The record says this release serves the home, but the backup it names is gone (or isn't this step's): back the
+ * databases up again before the record is trusted, so "a backup first" still holds for the next step or a restore.
+ * The copy is of the home as it is now, not as the previous release left it; the record says when it was taken.
+ */
+function backUpAgain(home: string, was: Release, say: (s: string) => void): Release {
+  const dbs = databases(home, { hub: 0, vault: 0 });
+  const unreadable = dbs.filter((d) => !readable(join(home, d.rel), dirname(home))).map((d) => d.rel);
+  const previous = was.previous ?? "0.8";
+  const backup = join(dirname(home), "parachute-upgrade", `${previous}-to-${core.version}-${stamp()}`);
+  say(`parachute: the backup this home's record names (${was.backup}) is gone or isn't this step's; backing up its databases again first, to ${backup}`);
+  snapshot(home, backup, previous, unreadable);
+  const r: Release = { ...was, backup, backup_retaken_at: new Date().toISOString(), ...(unreadable.length ? { skipped: unreadable } : {}) };
+  if (!unreadable.length) delete r.skipped;
+  writeRelease(home, r);
+  return r;
 }
 
 /** Whether SQLite can read `path` as a database (without changing a byte of the home). */
