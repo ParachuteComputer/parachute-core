@@ -25,6 +25,9 @@
 //     PARACHUTE_OFFLINE=1 for this process and every child (no registry lookup, Buzz poller, model download,
 //     outbound webhook or mirror push).
 //
+// `parachute-core probe` checks that one vault on a running box opens and answers, through the hub (probe.ts, audit
+// L6-03). It is a client: it touches no home, so it runs before the checks above.
+//
 // `parachute-core install` installs this bundle (install.ts, lane D). It is no longer the hub's module installer,
 // which runs `bun add -g` into the old global install; `parachute install` (the hub's name) still is.
 //
@@ -62,6 +65,7 @@ function coreHelp(): string {
     "  parachute-core install [--prefix <dir>]   install this bundle for you (default ~/.local/share/parachute-core)",
     "  parachute-core bootstrap --embedded …     set up a host-managed home in one step (see `bootstrap --help`)",
     "  parachute-core takeover [--dry-run]       move a home the old hub and vault (0.7) keep onto v0.8",
+    "  parachute-core probe --url <hub> --vault <name>   check one vault opens and answers (REST and MCP)",
     "  parachute-core <command>          the hub's commands (what `parachute <command>` was): serve, auth, …",
     "",
     "The hub's commands, for reference:",
@@ -73,8 +77,9 @@ function coreHelp(): string {
 export function route(
   role: Role,
   argv: string[],
-): { print: string } | { frontHelp: true } | { changes: string[] } | { install: string[] } | { embedded: string[] } | { bootstrap: string[] } | { takeover: string[] } | { cli: "hub" | "vault"; argv: string[] } {
+): { print: string } | { frontHelp: true } | { changes: string[] } | { install: string[] } | { probe: string[] } | { embedded: string[] } | { bootstrap: string[] } | { takeover: string[] } | { cli: "hub" | "vault"; argv: string[] } {
   if (role === "core" && argv[0] === "install") return { install: argv.slice(1) };
+  if (role === "core" && argv[0] === "probe") return { probe: argv.slice(1) };
   if (role === "core" && argv[0] === "takeover") return { takeover: argv.slice(1) };
   const cli = role === "vault" || (role === "core" && argv[0] === "vault") ? "vault" : "hub";
   const args = role === "core" && argv[0] === "vault" ? argv.slice(1) : argv;
@@ -156,6 +161,11 @@ export async function dispatch(role: Role, notice?: Notice): Promise<void> {
   if ("install" in r) {
     const { install } = await import("./install.ts");
     process.exit(install(r.install));
+  }
+  // `probe` is a client of a running box (probe.ts): it opens no home, so it runs before the home checks.
+  if ("probe" in r) {
+    const { probe } = await import("./probe.ts");
+    process.exit(await probe(r.probe));
   }
   // `serve --embedded` and `bootstrap` name their home with --home or PARACHUTE_HOME; with neither they exit 2
   // before touching anything (embedded.ts, bootstrap.ts), so there is no home to check.

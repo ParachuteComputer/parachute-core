@@ -20,7 +20,7 @@ say what that program must do, written so they ran against **today's** code firs
 |---|---|
 | [`packages/vault/`](packages/vault/) | Today's vault, moved in with `git subtree` at `42fbf93` (vault 0.7.9), history kept. |
 | [`packages/hub/`](packages/hub/) | Today's hub, moved in with `git subtree` at `53d327b` (hub 0.7.19), history kept. |
-| [`packages/cli/`](packages/cli/) | The one command, `parachute`: the hub's 0.7 commands as they were, `vault <command>` for the vault's, `version [--json]`, and `install` (this program). `parachute-core` is the same program under another name, kept for now; `parachute-vault` is the vault's commands under their 0.7 name, inside the built folder only. |
+| [`packages/cli/`](packages/cli/) | The one command, `parachute`: the hub's 0.7 commands as they were, `vault <command>` for the vault's, `version [--json]`, `install` (this program), and `probe` (does one vault on a running box open and answer; [`docs/probe/`](docs/probe/)). `parachute-core` is the same program under another name, kept for now; `parachute-vault` is the vault's commands under their 0.7 name, inside the built folder only. |
 | `package.json`, `bun.lock` | One Bun workspace over `packages/`. `bun.lock` keeps the versions the two repos had locked, except seven listed with their reasons in `scripts/check-dependency-tree.ts` (one otpauth and its @noble/hashes for both, the hub's @emnapi/runtime, and type packages). |
 | [`release/`](release/) | The v0.8 bundle: the tarball's tree (its own pinned Bun, a production `node_modules`, notices), ad hoc signing for macOS, `SHA256SUMS`. `parachute install` installs an unpacked bundle. |
 | [`contracts/`](contracts/) | A black-box contract suite (Bun + TypeScript). It talks to a running vault and hub over HTTP and MCP, the same doors real clients use. It never imports their code. |
@@ -29,6 +29,7 @@ say what that program must do, written so they ran against **today's** code firs
 | [`AGENTS.md`](AGENTS.md) | The short rules for any agent (Uni's workers, Benjamin's agent, reviewers) working in this repo. |
 | `.github/workflows/contracts.yml` | CI: on every pull request and every push to `main` and `next`, the moved code's own checks and tests, the contract suite against the pinned commits and against the core build, Benjamin's suite, then the mutants that prove it can fail. |
 | `.github/workflows/bundle-macos.yml` | CI on macos-15: the darwin-arm64 bundle signed ad hoc with the hardened runtime, unpacked to a path with a space; `embedded/bundle` and Benjamin's suite on the signed tree. On pushes to main and next, nightly, and pull requests that touch the bundle. |
+| [`docs/probe/`](docs/probe/) | `parachute probe` against a canary vault: setting up the vault and a read-only pass, and systemd user units that run it every five minutes with an `OnFailure=` hook. |
 | [`docs/walkthrough/`](docs/walkthrough/) | The script and code for the short narrated walkthrough video. |
 
 ## Install

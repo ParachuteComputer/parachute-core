@@ -6,6 +6,7 @@
 //                                        (`install --help` is still the hub's)
 //   parachute install <module> …         still the hub's module installer, as in 0.7
 //   parachute takeover …                 moves a home the old 0.7 programs keep onto v0.8 (lane E)
+//   parachute probe …                    checks one vault on a running box opens and answers (probe.ts, L6-03)
 //   parachute, parachute help            this program's own lines first, then the hub's help
 //
 // Everything else (`vault <command>` included, which goes through the hub's own `vault` command) is the hub's.
@@ -34,7 +35,7 @@ export function primaryRole(argv: string[]): Role {
   const [cmd, ...rest] = argv;
   // `install --help` stays the hub's module-installer help, as in 0.7; this program's install is in `parachute help`.
   if (cmd === "install" && !namesModule(rest) && !["--help", "-h"].includes(rest[0] ?? "")) return "core";
-  if (cmd === "takeover") return "core";
+  if (cmd === "takeover" || cmd === "probe") return "core";
   return "hub";
 }
 
@@ -47,6 +48,7 @@ export function primaryHelp(): string {
     "  parachute install [--prefix <dir>]  install this program for you (default ~/.local/share/parachute-core)",
     "  parachute bootstrap --embedded …    set up a host-managed home in one step (see `bootstrap --help`)",
     "  parachute takeover [--dry-run]      move a home the old hub and vault (0.7) keep onto v0.8",
+    "  parachute probe --url <hub> --vault <name>   check one vault opens and answers (REST and MCP)",
     "  parachute vault <command>           the vault's commands",
     "  parachute <command>                 the hub's commands, as in 0.7: serve, auth, …",
     "",
