@@ -21,7 +21,9 @@ The npm name `parachute` belongs to someone else, so the package stays `@openpar
 
 Which line `next` serves is `NEXT_SERVES` in `scripts/release-plan.ts` (today `0.8`). Moving it (to `0.9`, once 0.9
 has been through beta, uni and cloud: ROADMAP's pacing rule) is its own PR, merged before the stable of that line;
-`plan` refuses a stable of a line `next` doesn't serve yet. After it moves, the next `0.9.0-pre.N` goes to `next`.
+`plan` refuses a stable of a line `next` doesn't serve yet. After it moves, the next `0.9.0-pre.N` goes to `next`;
+the same PR changes the hub's "upgrade core itself" hint (`packages/hub/src/commands/upgrade.ts`, `api-hub-upgrade.ts`),
+which names `@beta` while 0.9 is tried there.
 
 **A merge to `main` that changes the version is the release.** `.github/workflows/release.yml` runs on it:
 

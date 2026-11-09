@@ -110,7 +110,7 @@ describe("mcp/records", () => {
     expect((await c.call("query-records", { id: path })).error_type).toBe("not_found");
     await expect(c.call("manage-types", { action: "rename", old_name: "a", new_name: "b", fields: {} })).rejects.toThrow(/manage-types has no parameter `fields`/);
     // Old names and the account door's `vault` are still taken, and `_`-names stay free for clients.
-    const made = await c.call("create-record", { path, content: "old word", _client: "probe" });
+    const made = await c.call("create-record", { path, content: "old word", vault: "ignored-on-this-door", _client: "probe" });
     expect(made.body).toBe("old word");
     const listed = await c.call("query-records", { limit: 1, _trace: 1 });
     expect(listed.error_type).toBeUndefined();
@@ -164,6 +164,12 @@ describe("mcp/records", () => {
     const create = tools.find((t) => t.name === "create-record")!;
     expect(Object.keys(create.inputSchema.properties ?? {})).toEqual(expect.arrayContaining(["body", "fields", "types", "tags", "records"]));
     expect(Object.keys(create.inputSchema.properties ?? {})).not.toContain("content");
+    // T-412's delete options are listed on both doors (the merge with next once dropped them from the short schema).
+    for (const name of ["delete-record", "delete-note"]) {
+      const del = tools.find((t) => t.name === name)!;
+      expect(Object.keys(del.inputSchema.properties ?? {})).toEqual(expect.arrayContaining(["id", "ids", "erase_history"]));
+      expect(del.inputSchema.required ?? []).not.toContain("id");
+    }
     // The instructions name the record tools, and never a note-named tool.
     const ins = c.client.getInstructions() ?? "";
     expect(ins).toContain("query-records");

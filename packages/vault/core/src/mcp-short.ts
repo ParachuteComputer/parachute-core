@@ -150,7 +150,9 @@ Rarer filters (has_links, order_by, expand_links, created_by, search_mode, …) 
 
   "delete-note": {
     description: "Delete a note (by id, path or title), with its tags and links.",
-    inputSchema: obj({ id: str() }, ["id"]),
+    // T-412 (next): `ids` deletes several, `erase_history` (admin) forgets every version too. The merge with next
+    // kept them in the reference schema but not here, so a client reading tools/list couldn't find them.
+    inputSchema: obj({ id: str(), ids: { type: "array", items: { type: "string" } }, erase_history: bool() }),
   },
 
   "list-tags": {

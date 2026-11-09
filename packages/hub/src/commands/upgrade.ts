@@ -932,7 +932,7 @@ async function upgradeOne(target: ResolvedTarget, r: Resolved): Promise<number> 
   // `bun add -g` the 0.7 packages next to it (seen on a fresh 0.8 box: vault 0.7.9 pulled from npm).
   if (coreRoot() && (target.packageName === HUB_PACKAGE || runsBundled(target, r))) {
     r.log(
-      `${target.short}: part of @openparachute/core. Upgrade core itself (re-run the installer, or \`bun add -g @openparachute/core@next\`, or \`@beta\` for a 0.9 prerelease), then \`parachute restart\`.`,
+      `${target.short}: part of @openparachute/core. Upgrade core itself (\`bun add -g @openparachute/core@beta\` while 0.9 is in beta; the installer and \`@next\` give 0.8), then \`parachute restart\`.`,
     );
     return 0;
   }
