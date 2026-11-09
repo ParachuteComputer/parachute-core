@@ -46,6 +46,8 @@ jobs:
       - run: bun install --frozen-lockfile
       - name: every dependency in range, and every version the moved repos locked kept (or a listed departure)
         run: bun scripts/check-dependency-tree.ts . packages/vault/bun.lock packages/hub/bun.lock
+      - name: the agent-facing docs (AGENTS.md, CLAUDE.md, PROCESS.md) name only paths that exist
+        run: bun scripts/check-doc-paths.ts
       - name: typecheck (cli, vault, hub)
         run: |
           bun run --cwd packages/cli typecheck

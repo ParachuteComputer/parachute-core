@@ -74,8 +74,8 @@ fixed ports, and history shows they have written into a live home before. CI run
 
 ## What's not decided
 
-- **The final shape of the code.** The vault and hub have moved in as they were (lane A1), and the hub still starts
-  the vault as a child process. The order of the next moves is in `PROCESS.md`; each lands only when the contracts
+- **The final shape of the code.** The vault and hub have moved in as they were (lane A1). The hub runs the vault
+  in-process; the child-process path is kept as a fallback. The order of the next moves is in `PROCESS.md`; each lands only when the contracts
   still pass.
 - **The grants model in code.** "Sharing only adds up, private notes for exceptions" is decided (A13). Today's code
   has no grants, so the suite checks the part today's tag-scoped tokens already promise and keeps the rest as `v1`
