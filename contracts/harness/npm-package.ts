@@ -14,7 +14,7 @@
 //   - semantic search on, from both installs: a note written gets an embedding from the shipped model (T-418);
 //   - Benjamin's suite with --bin <prefix>/bin/parachute and the package's own parachute-vault: 0 FAIL, the same
 //     rule as prism-compat (prism-compat-expected.json, empty).
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { enterSandbox, hostNode, SANDBOX_ENV } from "./sandbox.ts";
@@ -207,8 +207,20 @@ async function embedsOneNote(bin: string): Promise<string | null> {
   const user = mkdtempSync(join(tmpdir(), "npm-embed-"));
   const home = join(user, ".parachute");
   const env = { PATH, HOME: user, PARACHUTE_HOME: home, LANG: "C.UTF-8", EMBEDDINGS_ENABLED: "true" };
-  const port = () => 47000 + Math.floor(Math.random() * 2500);
-  const [h, v] = [port(), port() + 1];
+  // Two distinct free loopback ports (never the live 1939-1946).
+  const free = (taken: number[]): number => {
+    for (let i = 0; i < 100; i++) {
+      const p = 47000 + Math.floor(Math.random() * 2500);
+      if (taken.includes(p)) continue;
+      try {
+        Bun.listen({ hostname: "127.0.0.1", port: p, socket: { data() {} } }).stop(true);
+        return p;
+      } catch {}
+    }
+    throw new Error("no free port");
+  };
+  const h = free([]);
+  const v = free([h]);
   const hub = `http://127.0.0.1:${h}`;
   const vaultOrigin = `http://127.0.0.1:${v}`;
   allowOrigins(hub, vaultOrigin);
@@ -251,5 +263,7 @@ async function embedsOneNote(bin: string): Promise<string | null> {
     proc.kill("SIGTERM");
     await Promise.race([proc.exited, Bun.sleep(15_000)]);
     if (proc.exitCode === null) proc.kill("SIGKILL");
+    await proc.exited;
+    rmSync(user, { recursive: true, force: true });
   }
 }
