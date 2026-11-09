@@ -12,8 +12,8 @@
 //     and 0.8 serves that;
 //   - a home 0.9 made has no earlier release: no backup, nothing to roll back.
 //   - while 0.8's server holds the home, a 0.9 command (even `parachute-vault --help`) refuses with 7, taking no
-//     backup and writing no record, and doesn't refresh a stray record either (T-418, the 11-05 record); a command
-//     that only drives the unit (`stop`, `restart`) goes on without a step and writes nothing of 0.9's;
+//     backup and writing no record, and doesn't refresh a stray record either (T-418, the 11-05 record); `stop` and
+//     `status` are refused too when 0.8 runs outside a Parachute unit, and nothing of 0.9's is written;
 //   - a record whose backup is gone is not trusted: the home is backed up again first, without waiting on a running
 //     0.9 command, and a rollback won't use that later copy (T-418);
 //   - a home an older release took over is never taken for one 0.9 made, whatever a stray 0.9 command added (T-418);
@@ -147,10 +147,12 @@ describe("lifecycle/upgrade", () => {
       expect(existsSync(join(m.home, "run", "release.json"))).toBe(false);
       expect(backups()).toEqual([]);
 
-      // A command that only drives the unit goes on (0.8 says to upgrade with `parachute restart`), taking no step.
+      // `stop` and `restart` go on only when the other server runs under Parachute's unit (0.8 says to upgrade with
+      // `parachute restart`; that case needs a real systemd unit, which the sandbox has none of). This 0.8 runs by hand,
+      // so `stop` is refused too: with no unit it would offer the move to a supervised unit under 0.8's feet.
       // `status` opens hub.db (0.9 would add its keys table under 0.8), so it is refused like any other command.
       const stop = await run(info.bin, ["stop"]);
-      expect({ code: stop.code === 7 ? 7 : "not 7", refused: stop.stderr.includes("took no backup") }).toEqual({ code: "not 7", refused: false });
+      expect({ code: stop.code, refused: stop.stderr.includes("took no backup") }).toEqual({ code: 7, refused: true });
       const status = await run(info.bin, ["status"]);
       expect(status.code).toBe(7);
       expect(existsSync(join(m.home, "run", "release.json"))).toBe(false);
@@ -386,6 +388,21 @@ describe("lifecycle/upgrade", () => {
     must((await cli(home, ["export", join(dirname(home), "stray-export"), "--vault", "goodv"], { vault: true, env: { EMBEDDINGS_ENABLED: "false" } })).code === 0, "setup: the stray 0.9 vault command");
     renameSync(join(home, "run", "release.json"), join(home, "run", "release.json.wrong-record"));
     writeFileSync(join(home, "takeover.json"), JSON.stringify({ state: "taken-over", version: "0.8.0-pre.1", at: "2026-10-29T18:00:00.000Z", home, backup: join(dirname(home), "parachute-takeover", "made-up"), rollback: "code-only", migrations: [], paused: [], core_unit: null, issuer: "http://127.0.0.1:1939" }));
+    const before = readdirSync(join(dirname(home), "parachute-upgrade")).length;
+    const r = await cli(home, ["user", "list"]);
+    expect(r.code).toBe(0);
+    expect(r.stderr).toContain("0.8 → ");
+    expect(readdirSync(join(dirname(home), "parachute-upgrade")).length).toBe(before + 1);
+    expect(JSON.parse(readFileSync(join(home, "run", "release.json"), "utf8"))).toMatchObject({ previous: "0.8", state: "current" });
+  }, 120_000);
+
+  test("a 0.8 home with a stray record moved aside (no takeover) still gets its backup (T-418)", async () => {
+    // A home 0.8 made by itself: once the stray record is moved aside (by 0.9, or by hand), 0.9's structures from the
+    // stray command must not make it look like a home 0.9 made.
+    const home = await homeBy08("up-moved", ["goodv"]);
+    must((await cli(home, ["user", "list"])).code === 0, "setup: the stray 0.9 hub command");
+    must((await cli(home, ["export", join(dirname(home), "stray-export"), "--vault", "goodv"], { vault: true, env: { EMBEDDINGS_ENABLED: "false" } })).code === 0, "setup: the stray 0.9 vault command");
+    renameSync(join(home, "run", "release.json"), join(home, "run", "release.json.stray-made-up"));
     const before = readdirSync(join(dirname(home), "parachute-upgrade")).length;
     const r = await cli(home, ["user", "list"]);
     expect(r.code).toBe(0);

@@ -219,8 +219,8 @@ function recheckOrStop(recheck: Recheck): void {
 /** Options for a command's release step. */
 export interface BeforeOpenOpts {
   /**
-   * A command that only drives the running server (stop or restart with no module named): while another process holds
-   * the home it takes no step and goes on, so `parachute restart` after installing a new release still works (0.8's
+   * A command that only drives the running server (stop or restart with no module named): while another release's
+   * server holds the home under Parachute's unit, it takes no step and goes on, so `parachute restart` after installing a new release still works (0.8's
    * own upgrade advice). The serve it starts takes the step, once the old server has let go.
    */
   passIfServed?: boolean;
@@ -236,7 +236,7 @@ export function beforeOpen(home: string, say: (s: string) => void = (s) => conso
   if (!readRelease(home) && serveRefusal(home) !== null) return undefined;
   let triedAlone = false;
   let strayChecked = false;
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (let attempt = 0; attempt < 5; attempt++) {
     // Every command holds the lock shared while it runs, so no rollback can move a database under it. Once held, the
     // newer-data check runs again: a newer release may have moved the home while this one waited.
     holdShared(home);
@@ -333,7 +333,9 @@ function holdSharedAndGo(home: string, recheck: Recheck): undefined {
 function servedElsewhere(home: string, was: Release | undefined, opts: BeforeOpenOpts): boolean {
   const held = confirmedOthers(home);
   if (!held.length) return false;
-  if (opts.passIfServed) return true;
+  // Only when the other server runs under Parachute's unit: then stop/restart drive that unit (the upgrade path).
+  // With no unit they would offer the move to a supervised unit, which must not happen under another release.
+  if (opts.passIfServed && held.every((h) => h.unit && /parachute/i.test(h.unit))) return true;
   const who = held.map((h) => `pid ${h.pid} (${h.cmd.length > 120 ? `…${h.cmd.slice(-120)}` : h.cmd}${h.unit ? `, in ${h.unit}` : ""})`).join(", ");
   // Only a Parachute unit is named to stop: a server started by hand runs inside whatever unit started its shell.
   const unit = held.find((h) => h.unit && /parachute/i.test(h.unit))?.unit;
@@ -426,7 +428,9 @@ function beforeOpenLocked(home: string, say: (s: string) => void, opts: BeforeOp
   // A home an older release's takeover moved is never "made by this line", whatever a stray command of this release
   // added to it (T-418: the 11-05 command opened such a home; its record was then moved aside by hand).
   const tk = readJson(join(home, RECORD_FILE));
-  const olderTakeover = typeof tk?.version === "string" && tk.version !== core.version;
+  // Likewise a home with a record moved aside (a stray one, or one moved by hand): some release recorded itself here.
+  const movedRecord = existsSync(join(home, "run")) && readdirSync(join(home, "run")).some((f) => f.startsWith("release.json.") && !f.endsWith(".tmp"));
+  const olderTakeover = (typeof tk?.version === "string" && tk.version !== core.version) || movedRecord;
   // Nothing is recorded while something else holds the data (T-418), except the record of this release's own
   // takeover: the takeover command still holds the data when it starts the new unit, whose serve writes it below.
   const ownTakeover = !was && tk?.state === "taken-over" && tk.version === core.version;

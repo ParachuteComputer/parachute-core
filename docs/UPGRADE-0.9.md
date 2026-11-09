@@ -39,7 +39,8 @@ home with data:
    `~/.parachute`, recorded 0.9 as current there while 0.8 kept serving; a real 0.9 start would then have skipped
    its backup. Stop the serving release (its unit, or `parachute stop`) to move the home, or run the command with
    the release that serves it. `parachute stop` and `restart` with no module named only drive the unit, so they go on
-   without a step (0.8 says to upgrade with "install, then `parachute restart`"); the serve they start
+   without a step when the serving release runs under Parachute's unit (on a box without one they would offer the
+   move to a supervised unit, so they are refused there too) (0.8 says to upgrade with "install, then `parachute restart`"); the serve they start
    takes the step once the old server has let go.
    A record that names this release while another release's server holds the home was written by a command that
    never served it (the 11-05 record): it is moved aside (`run/release.json.stray-<time>`), so the real step later
