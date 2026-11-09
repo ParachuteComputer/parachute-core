@@ -28,9 +28,9 @@
  * atomic blow-away import (`importVault` wrapping schema/note/link writes,
  * several of which open their own `transaction`).
  *
- * The `transactionSync` (Durable-Object) delegate path is unchanged — a DO
- * backend supplies its own natively re-entrant primitive, so the SAVEPOINT
- * bookkeeping here only governs the bun `BEGIN` path.
+ * The `transactionSync` / `transactionAsync` (Durable-Object) delegate paths
+ * are unchanged — a DO backend supplies its own natively re-entrant primitives,
+ * so the SAVEPOINT bookkeeping here only governs the bun `BEGIN` path.
  *
  * **Shared-connection invariant (load-bearing for {@link transactionAsync}).**
  * The bun backend is a single synchronous connection. A `transactionAsync`
@@ -64,6 +64,10 @@ export interface TxnCapableDb {
   /** Native commit-on-return / rollback-on-throw transaction, when the backend
    *  provides one (e.g. a DO shim delegating to `ctx.storage.transactionSync`). */
   transactionSync?<T>(fn: () => T): T;
+  /** Native commit-on-resolve / rollback-on-reject transaction around an async body, when the backend provides
+   *  one (a DO shim delegating to `ctx.storage.transaction`). {@link transactionAsync} prefers it: without it a
+   *  backend that blocks `BEGIN` ran an async batch with no transaction at all (audit L2-05). */
+  transactionAsync?<T>(fn: () => Promise<T>): Promise<T>;
 }
 
 /**
@@ -238,12 +242,14 @@ export function transaction<T>(db: TxnCapableDb, fn: () => T): T {
  * mcp.ts / routes.ts. A DO backend can't map this onto `transactionSync`
  * (which forbids awaiting); porting the batch path is a Phase-2 concern.
  *
- * Deliberately NOT given the `db.transactionSync` fast-path that {@link transaction}
- * has: `transactionSync` runs its callback synchronously and forbids awaiting,
- * so it cannot wrap an `async` body that awaits the Store facade between writes.
- * A DO backend that needs an atomic async batch has to reshape the batch as a
- * synchronous unit (or use an async DO transaction primitive) — out of scope
- * for this seam; the bun `BEGIN IMMEDIATE` path stays the single implementation.
+ * Not given the `db.transactionSync` fast-path that {@link transaction} has:
+ * `transactionSync` runs its callback synchronously and forbids awaiting, so it
+ * cannot wrap an `async` body that awaits the Store facade between writes. A
+ * backend that blocks `BEGIN` (Durable Objects) supplies `db.transactionAsync`
+ * instead (cloud: `ctx.storage.transaction`), and this delegates to it, so a
+ * batch there is all or nothing as it is on bun. Without it such a backend's
+ * `BEGIN`/`COMMIT` were no-ops and a failed batch kept its first writes (audit
+ * L2-05). bun's `Database` has neither, so it takes the `BEGIN IMMEDIATE` path.
  *
  * Re-entrant (vault#589): if the connection is already inside a transaction —
  * e.g. the atomic blow-away import wraps this around store writes that
@@ -252,6 +258,17 @@ export function transaction<T>(db: TxnCapableDb, fn: () => T): T {
  */
 export async function transactionAsync<T>(db: TxnCapableDb, fn: () => Promise<T>): Promise<T> {
   enterAfterCommitFrame(db);
+  if (typeof db.transactionAsync === "function") {
+    let result: T;
+    try {
+      result = await db.transactionAsync(fn);
+    } catch (err) {
+      rollbackAfterCommitFrame(db);
+      throw err;
+    }
+    commitAfterCommitFrame(db);
+    return result;
+  }
   let frame: TxnFrame;
   try {
     frame = enterTxn(db);

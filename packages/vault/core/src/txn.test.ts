@@ -190,6 +190,63 @@ describe("transaction — native transactionSync preference (DO backend)", () =>
   });
 });
 
+describe("transactionAsync — native transactionAsync preference (DO backend, audit L2-05)", () => {
+  /** A db exposing a native async transaction (standing in for cloud's shim over ctx.storage.transaction): it
+   *  owns BEGIN/COMMIT/ROLLBACK itself, here on a bun connection, so none of it flows through `exec`. */
+  function nativeAsyncDb(): { db: TxnCapableDb; execs: string[]; bun: Database } {
+    const bun = freshDb();
+    const execs: string[] = [];
+    const db: TxnCapableDb = {
+      exec(sql: string): void {
+        execs.push(sql);
+        bun.exec(sql);
+      },
+      async transactionAsync<T>(fn: () => Promise<T>): Promise<T> {
+        bun.exec("BEGIN");
+        try {
+          const r = await fn();
+          bun.exec("COMMIT");
+          return r;
+        } catch (err) {
+          bun.exec("ROLLBACK");
+          throw err;
+        }
+      },
+    };
+    return { db, execs, bun };
+  }
+
+  it("rolls a failed async batch back through the backend's own transaction, issuing no BEGIN of its own", async () => {
+    const { db, execs, bun } = nativeAsyncDb();
+    const ran: string[] = [];
+    await expect(
+      transactionAsync(db, async () => {
+        db.exec("INSERT INTO t (id, v) VALUES (1, 'a')");
+        afterCommit(db, () => ran.push("hook"));
+        await Promise.resolve();
+        throw new Error("third item collides");
+      }),
+    ).rejects.toThrow("third item collides");
+    expect((bun.prepare("SELECT COUNT(*) AS c FROM t").get() as { c: number }).c).toBe(0);
+    expect(execs).toEqual(["INSERT INTO t (id, v) VALUES (1, 'a')"]);
+    expect(ran).toEqual([]); // a rolled-back batch fires no after-commit hook
+  });
+
+  it("commits a good batch and runs its after-commit hooks once, after the commit", async () => {
+    const { db, bun } = nativeAsyncDb();
+    const ran: string[] = [];
+    const out = await transactionAsync(db, async () => {
+      db.exec("INSERT INTO t (id, v) VALUES (1, 'a')");
+      afterCommit(db, () => ran.push(`hook saw ${(bun.prepare("SELECT COUNT(*) AS c FROM t").get() as { c: number }).c}`));
+      await Promise.resolve();
+      expect(ran).toEqual([]);
+      return "ok";
+    });
+    expect(out).toBe("ok");
+    expect(ran).toEqual(["hook saw 1"]);
+  });
+});
+
 describe("transactionAsync", () => {
   it("commits and returns the callback's resolved value", async () => {
     const db = freshDb();
