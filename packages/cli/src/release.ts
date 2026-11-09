@@ -114,11 +114,12 @@ export function withReleaseLock<T>(home: string, fn: () => T, waitMs = 60_000, b
   try {
     chmodSync(join(home, RELEASE_LOCK), 0o600);
     db.exec(`PRAGMA busy_timeout = ${waitMs}`);
-    db.exec("PRAGMA locking_mode = EXCLUSIVE");
+    // The lock is a transaction left open: BEGIN EXCLUSIVE takes it, closing the connection lets it go. Not
+    // `locking_mode = EXCLUSIVE`: in that mode a waiting BEGIN keeps the read lock it took on the way, so two commands
+    // asking at once each wait for the other until both time out (lifecycle/upgrade, release-lock.test.ts).
     try {
+      db.exec("CREATE TABLE IF NOT EXISTS hold (pid INTEGER)"); // a write only the first time, on a fresh file
       db.exec("BEGIN EXCLUSIVE");
-      db.exec("CREATE TABLE IF NOT EXISTS hold (pid INTEGER)");
-      db.exec("COMMIT"); // in exclusive locking mode the lock stays until the connection closes
     } catch (err) {
       if (/locked|busy/i.test(String((err as Error)?.message))) {
         throw new Exit(EXIT.held, busy);
