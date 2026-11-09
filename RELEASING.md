@@ -28,10 +28,12 @@ The npm name `parachute` belongs to someone else, so the package stays `@openpar
 2. `build` builds the linux-x64 bundle, packs the npm package from it, and tests that `.tgz` the way the contracts
    job `npm` does: `npm i -g` and `bun add -g` into scratch prefixes, then Benjamin's suite on the npm install (0
    FAIL). That `.tgz` is the one published, checked by its sha256.
-3. `publish-next` (a prerelease) or `publish-latest` (a stable, after approval) runs
+3. `contracts-green` waits until every `contracts.yml` job has passed on the same commit (about 80 minutes) and
+   fails at the first red one. Neither publish job starts before it passes.
+4. `publish-next` (a prerelease) or `publish-latest` (a stable, after approval) runs
    `npm publish package.tgz --tag <next|latest> --access public --provenance`. No token: npm trusted publishing
    (OIDC). Provenance is added because the repository is public.
-4. `tag-record` tags `v<version>` (kept if the GitHub pre-release already made it).
+5. `tag-record` tags `v<version>` (kept if the GitHub pre-release already made it).
 
 To cut a prerelease: a PR that bumps `version` in `package.json`, `packages/cli/package.json`,
 `packages/hub/package.json` and `packages/vault/package.json` (and those lines in `bun.lock`) to the next `0.8.0-pre.N`,

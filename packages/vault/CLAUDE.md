@@ -15,7 +15,8 @@ one-command setup; one Bun server (port 1940) hosts many vaults, each its own SQ
 ## Conventions
 
 - Bun for everything (`Bun.serve`, `bun:sqlite`, `Bun.$`, `bun test`). No Node.js.
-- Bare primitives: vaults start blank — clients bring their own tag schema. Opt-in seed
+- Bare primitives: no default tag schema — clients bring their own. A new vault gets the
+  welcome guides and Getting Started notes plus the `capture` and `guide` tags (no fields), nothing more. Opt-in seed
   packs live in `core/src/seed-packs.ts` (`add-pack <name>`). External data packs
   use `packs add|list|remove` (see `docs/external-packs.md`); state is in each
   vault's `packs/`, migrated from legacy `modules/`. Connector/views declarations
@@ -84,5 +85,6 @@ one-command setup; one Bun server (port 1940) hosts many vaults, each its own SQ
 ## Deployment
 
 Self-hosted is this repo's product: Mac launchd, VPS via `docker compose`, Cloudflare
-Tunnel for HTTPS. The hosted door ships today from [`parachute-cloud`](../parachute-cloud)
-(Cloudflare Workers / D1 / R2) — not from this repo.
+Tunnel for HTTPS. The hosted door ships today from the parachute-cloud repo
+(github.com/ParachuteComputer/parachute-cloud: Cloudflare Workers, one Durable Object per vault, D1 for
+identity, R2 for files), not from this repo.

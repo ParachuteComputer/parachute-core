@@ -6,6 +6,7 @@
 #   build           the linux-x64 bundle, the npm package packed from it (release/npm.ts), and the same test as the
 #                   contracts job `npm`: installed with npm and with bun, Benjamin's suite on the npm install. The
 #                   .tgz it tested is what the publish jobs publish, byte for byte.
+#   contracts-green waits until every contracts.yml job has passed on this commit; no publish job runs before it.
 #   publish-next    a prerelease, on its own after build.
 #   publish-latest  a stable, only after the environment `npm-latest` is approved. Its required reviewer is the
 #                   `unforcedagi` account, and Uni approves only after Aaron taps the approval card (RELEASING.md).
@@ -102,8 +103,74 @@ jobs:
             ${{ runner.temp }}/npm/package.tgz.sha256
           retention-days: 30
 
+  # Nothing publishes until every contracts.yml job has passed on this exact commit. The same push to main starts
+  # contracts, so this waits for it (about 80 minutes, most of it mutants-candidate) and fails at the first red job.
+  # A red or cancelled job: re-run it in contracts, then re-run this workflow's failed jobs.
+  contracts-green:
+    name: the commit's contracts checks passed
+    needs: plan
+    # Hold a runner (up to 190 minutes) only when something will publish.
+    if: needs.plan.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 190
+    permissions:
+      checks: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SHA: ${{ github.sha }}
+      WAIT_MINUTES: 180
+      # A push started CI on this commit too, so wait for its checks to appear. A manual run of a commit CI never ran
+      # on (no required check at all) is refused at once; one whose CI is still running waits (a job that waits on
+      # another has no check run until that one finishes).
+      WAIT_FOR_MISSING: ${{ github.event_name == 'push' }}
+      # The job names in contracts.yml, as GitHub shows them. Rename a job there, rename it here.
+      REQUIRED: |
+        the moved code (workspace, typecheck, the vault's and hub's own tests)
+        today's contracts (+ v1 pending)
+        every suite on the candidate build
+        Benjamin's compatibility suite on the candidate build
+        the npm package, installed with npm and with bun, and Benjamin's suite on it
+        mutants on the pinned vault (the contracts must catch each)
+        mutants and flips on rebuilt core candidates
+    steps:
+      - name: wait for every contracts job on this commit to pass
+        run: |
+          deadline=$(( $(date +%s) + WAIT_MINUTES * 60 ))
+          while :; do
+            waiting=""
+            missing=0
+            while IFS= read -r name; do
+              [ -n "$name" ] || continue
+              # The newest attempt of the job with that name on this commit, from GitHub Actions (app 15368).
+              state=$(gh api -X GET "repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs" \
+                -f check_name="$name" -f app_id=15368 -f filter=all -f per_page=100 \
+                --jq '.check_runs | max_by(.id) | if . == null then "missing" else "\(.status)/\(.conclusion)" end') \
+                || state="unreadable (retrying)"
+              echo "$state  $name"
+              case "$state" in
+                completed/success) ;;
+                completed/*)
+                  echo "::error::\"$name\" is $state on $SHA. Fix it or re-run it, then re-run this job."
+                  exit 1 ;;
+                missing) missing=$((missing + 1)); waiting=1 ;;
+                *) waiting=1 ;;
+              esac
+            done <<< "$REQUIRED"
+            if [ "$WAIT_FOR_MISSING" != true ] && [ "$missing" -eq "$(grep -c . <<< "$REQUIRED")" ]; then
+              echo "::error::$SHA has no contracts checks at all. CI runs on pull requests and on pushes to main and next."
+              exit 1
+            fi
+            if [ -z "$waiting" ]; then echo "Every required check passed on $SHA."; exit 0; fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::The required checks on $SHA did not all finish within $WAIT_MINUTES minutes."
+              exit 1
+            fi
+            echo "--- waiting"
+            sleep 60
+          done
+
   publish-next:
-    needs: [plan, build]
+    needs: [plan, build, contracts-green]
     if: needs.plan.outputs.dist_tag == 'next'
     runs-on: ubuntu-latest
     permissions:
@@ -129,7 +196,7 @@ jobs:
         run: npm publish package.tgz --tag "${{ needs.plan.outputs.dist_tag }}" --access public --provenance
 
   publish-latest:
-    needs: [plan, build]
+    needs: [plan, build, contracts-green]
     if: needs.plan.outputs.dist_tag == 'latest'
     runs-on: ubuntu-latest
     # Waits here until the npm-latest environment's reviewer approves (RELEASING.md).
