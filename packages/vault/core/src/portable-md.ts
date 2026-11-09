@@ -2383,10 +2383,10 @@ async function importVaultReplay(
       stats.schemas_restored++;
       continue;
     }
-    const parentNames = (frontmatter.parent_names as string[] | null | undefined) ?? null;
+    const parentNames = (exportList(frontmatter.parent_names) as string[] | null | undefined) ?? null;
     const patch = {
       description: (frontmatter.description as string | null | undefined) ?? null,
-      fields: (frontmatter.fields as Record<string, unknown> | null | undefined) as any ?? null,
+      fields: (exportFieldLists(frontmatter.fields) as Record<string, unknown> | null | undefined) as any ?? null,
       relationships: (frontmatter.relationships as Record<string, unknown> | null | undefined) as any ?? null,
       parent_names: parentNames,
     };
@@ -2555,7 +2555,8 @@ async function importVaultReplay(
     const extension = typeof frontmatter.extension === "string"
       ? frontmatter.extension
       : fileExt || "md";
-    const tags = Array.isArray(frontmatter.tags) ? frontmatter.tags.filter((t): t is string => typeof t === "string") : undefined;
+    const fmTags = exportList(frontmatter.tags);
+    const tags = Array.isArray(fmTags) ? fmTags.filter((t): t is string => typeof t === "string") : undefined;
     const metadata = (frontmatter.metadata && typeof frontmatter.metadata === "object" && !Array.isArray(frontmatter.metadata))
       ? frontmatter.metadata as Record<string, unknown>
       : undefined;
@@ -2913,6 +2914,33 @@ function exportScalarReading(source: ImportSource): ScalarReading {
   const at = parseFrontmatter(`---\n${text}${text.endsWith("\n") ? "" : "\n"}---\n`).frontmatter.exported_at;
   const ms = typeof at === "string" ? Date.parse(at) : NaN;
   return Number.isFinite(ms) && ms < Date.parse(FLOW_QUOTING_SINCE) ? "old-export" : "export";
+}
+
+/**
+ * A value the export format only ever writes as a block list: a note's `tags`,
+ * a schema's `parent_names`, a field's `enum` / `target_tags`. Neither exporter
+ * writes one inline, so a non-empty `[..]` there (which the "export" reading
+ * keeps as a string) was typed by a person editing the export, and is the list
+ * it looks like. Anything else is returned unchanged.
+ */
+function exportList(v: unknown): unknown {
+  return typeof v === "string" && v.startsWith("[") && isNonEmptyFlow(v) ? parseScalarOrInline(v, "yaml") : v;
+}
+
+/** A schema file's `fields` with each field's list-only keys read by {@link exportList}. */
+function exportFieldLists(fields: unknown): unknown {
+  if (!fields || typeof fields !== "object" || Array.isArray(fields)) return fields;
+  const out: Record<string, unknown> = {};
+  for (const [name, spec] of Object.entries(fields as Record<string, unknown>)) {
+    if (!spec || typeof spec !== "object" || Array.isArray(spec)) {
+      out[name] = spec;
+      continue;
+    }
+    const next: Record<string, unknown> = { ...(spec as Record<string, unknown>) };
+    for (const key of ["enum", "target_tags"]) if (key in next) next[key] = exportList(next[key]);
+    out[name] = next;
+  }
+  return out;
 }
 
 interface ParseResult {
