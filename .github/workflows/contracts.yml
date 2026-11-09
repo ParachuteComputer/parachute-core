@@ -16,14 +16,18 @@
 # Everything is local to the runner: throwaway homes, random ports, no live service.
 name: contracts
 
+# Every job here is a required check on main and next, so none may carry a path filter (a required check that never
+# runs blocks the merge).
 on:
   push:
-    branches: [main]
+    branches: [main, next]
   pull_request:
   workflow_dispatch:
 
 concurrency:
-  group: contracts-${{ github.ref }}
+  # A newer push cancels a stale run on the same PR or on next. On main each commit gets its own group, so nothing
+  # cancels it: release.yml publishes a commit only after that commit's contracts checks have passed.
+  group: contracts-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
   cancel-in-progress: true
 
 env:
