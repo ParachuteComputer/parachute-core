@@ -50,7 +50,10 @@ const cases: Array<[string, unknown]> = [
   ["a Proxy whose getters throw", hostile],
   ["an apostrophe inside a quoted span", new Error("Note 'Bob's private text' not found")],
   ["an escaped quote and a trailing backslash", new Error('bad "a\\"private text" C:\\')],
-  ["V8's JSON.parse of JSON with its own quotes", new SyntaxError(`Unexpected token 'x', "[10,"private text",x]" is not valid JSON`)],
+  [
+    "V8's JSON.parse of JSON with its own quotes",
+    new SyntaxError(`Unexpected token 'x', "[10,"private text",x]" is not valid JSON`),
+  ],
   ["a surrogate pair at the cut", new Error(`${"x".repeat(199)}😀`)],
   ["an unclosed quote into a trailing backslash", new Error('Path "C:\\private text\\')],
   ["typographic quotes", new Error("name: ‘private text’ “private text” «private text»")],
