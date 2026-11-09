@@ -30,6 +30,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, sta
 import { basename, dirname, join } from "node:path";
 import { Database } from "bun:sqlite";
 import core from "../../../package.json" with { type: "json" };
+import { takeFileLock } from "./file-lock.ts";
 import { databases, readDatabase, schemaOf } from "./home.ts";
 import { exportChanged, holders, RECORD_FILE, serveRefusal } from "./takeover.ts";
 
@@ -110,22 +111,14 @@ class Exit extends Error {
  */
 export function withReleaseLock<T>(home: string, fn: () => T, waitMs = 60_000, busy = "another parachute command is backing up or rolling back this home; run this again when it has finished"): T {
   mkdirSync(join(home, "run"), { recursive: true, mode: 0o700 });
-  const db = new Database(join(home, RELEASE_LOCK), { create: true });
+  let db: Database;
   try {
-    chmodSync(join(home, RELEASE_LOCK), 0o600);
-    db.exec(`PRAGMA busy_timeout = ${waitMs}`);
-    // The lock is a transaction left open: BEGIN EXCLUSIVE takes it, closing the connection lets it go. Not
-    // `locking_mode = EXCLUSIVE`: in that mode a waiting BEGIN keeps the read lock it took on the way, so two commands
-    // asking at once each wait for the other until both time out (lifecycle/upgrade, release-lock.test.ts).
-    try {
-      db.exec("CREATE TABLE IF NOT EXISTS hold (pid INTEGER)"); // a write only the first time, on a fresh file
-      db.exec("BEGIN EXCLUSIVE");
-    } catch (err) {
-      if (/locked|busy/i.test(String((err as Error)?.message))) {
-        throw new Exit(EXIT.held, busy);
-      }
-      throw err;
-    }
+    db = takeFileLock(join(home, RELEASE_LOCK), waitMs);
+  } catch (err) {
+    if (/locked|busy/i.test(String((err as Error)?.message))) throw new Exit(EXIT.held, busy);
+    throw err;
+  }
+  try {
     return fn();
   } finally {
     db.close();

@@ -16,6 +16,7 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { hubDbPath, openHubDb } from "@openparachute/hub/src/hub-db.ts";
 import { listKeys, type KeyView } from "@openparachute/hub/src/keys.ts";
+import { takeFileLock } from "./file-lock.ts";
 import { homeDir } from "./home.ts";
 
 let held: Database | undefined;
@@ -29,13 +30,7 @@ function holdKeysLock(): void {
   if (held) return;
   const run = join(homeDir(), "run");
   mkdirSync(run, { recursive: true, mode: 0o700 });
-  const db = new Database(join(run, "keys.lock"), { create: true });
-  db.exec("PRAGMA busy_timeout = 30000");
-  db.exec("PRAGMA locking_mode = EXCLUSIVE");
-  db.exec("BEGIN EXCLUSIVE");
-  db.exec("CREATE TABLE IF NOT EXISTS hold (pid INTEGER)");
-  db.exec("COMMIT"); // in exclusive locking mode the lock stays until the connection closes
-  held = db;
+  held = takeFileLock(join(run, "keys.lock"), 30_000);
 }
 
 export type KeysResult = { exit: number } | { argv: string[] };
