@@ -15,9 +15,9 @@ The npm name `parachute` belongs to someone else, so the package stays `@openpar
 | Version | npm dist-tag | Published |
 |---|---|---|
 | `0.8.0-dev.N` | none | never (not a release) |
-| `0.8.0-pre.N` (the line `next` serves) | `next` | when the merge that brings that version reaches `main`, after an approval on the GitHub environment `npm-prerelease` (below) |
+| `0.8.0-pre.N` (the line `next` serves) | `next` | when the merge that brings that version reaches `main`, once every `contracts.yml` check has passed on that commit and after an approval on the GitHub environment `npm-prerelease` (below) |
 | `0.9.0-pre.N` (a later line) | `beta` | the same way. The one-liner and every installed box follow `next`, so a new line is tried on `beta` first (ROADMAP "Channel first") |
-| `0.8.0` | `latest` | only after an approval on the GitHub environment `npm-latest` (below), and only for the line `next` serves |
+| `0.8.0` | `latest` | once every `contracts.yml` check has passed, only after an approval on the GitHub environment `npm-latest` (below), and only for the line `next` serves |
 
 Which line `next` serves is `NEXT_SERVES` in `scripts/release-plan.ts` (today `0.8`). Moving it (to `0.9`, once 0.9
 has been through beta, uni and cloud: ROADMAP's pacing rule) is its own PR, merged before the stable of that line;
@@ -121,10 +121,14 @@ trust is set. Until then `plan` skips every merge with that reason.
    and disallow tokens" → **Update Package Settings**. Trusted publishing is not a token, so CI keeps working; a
    leaked token can't publish.
 
-From then on, the next `0.8.0-pre.N` merged to `main` publishes itself to `next`, with provenance.
+From then on, a version merged to `main` publishes from CI, with provenance: once its contracts pass and the
+environment's reviewer approves (above). A prerelease of the line `next` serves goes to `next`, of a later line to
+`beta`.
 
 ## If a publish fails
 
+- `contracts-green` red or timed out: a `contracts.yml` job failed or was cancelled on that commit, so nothing
+  published. Re-run that job in the contracts run, then re-run the release run's failed jobs. Don't bump the version.
 - `404` / `ENEEDAUTH` on publish: the trusted publisher is missing or doesn't match. Check the three fields above
   exactly (`ParachuteComputer` / `parachute-core` / `release.yml`); a renamed workflow file needs the rule changed.
 - `plan` refused "older than next" (or beta): two prerelease PRs merged out of order. Bump past the published one,

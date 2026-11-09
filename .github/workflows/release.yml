@@ -175,7 +175,7 @@ jobs:
 
   publish-prerelease:
     needs: [plan, build, contracts-green]
-    if: needs.plan.outputs.dist_tag == 'next' || needs.plan.outputs.dist_tag == 'beta'
+    if: needs.plan.outputs.should_publish == 'true' && (needs.plan.outputs.dist_tag == 'next' || needs.plan.outputs.dist_tag == 'beta')
     runs-on: ubuntu-latest
     # Waits here until the npm-prerelease environment's reviewer approves (RELEASING.md).
     environment: npm-prerelease
@@ -216,7 +216,7 @@ jobs:
 
   publish-latest:
     needs: [plan, build, contracts-green]
-    if: needs.plan.outputs.dist_tag == 'latest'
+    if: needs.plan.outputs.should_publish == 'true' && needs.plan.outputs.dist_tag == 'latest'
     runs-on: ubuntu-latest
     # Waits here until the npm-latest environment's reviewer approves (RELEASING.md).
     environment: npm-latest
