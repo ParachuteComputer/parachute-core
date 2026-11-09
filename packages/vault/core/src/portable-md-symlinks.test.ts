@@ -82,4 +82,25 @@ describe("importPortableVault: symlinks in a cloned export (T-419)", () => {
     expect(existsSync(config) ? readFileSync(config, "utf-8") : "").not.toContain("MADE-UP-TOKEN");
     expect(stats.attachments_restored).toBe(0);
   });
+
+  it("an attachments folder that links elsewhere in the clone gives nothing", async () => {
+    // `.parachute/attachments -> ..`: attachment id `.git` would name the clone's .git folder.
+    const repo = join(base, "repo2");
+    mkdirSync(join(repo, ".parachute"), { recursive: true });
+    writeFileSync(join(repo, ".parachute", "vault.yaml"), "export_format_version: 1\nexported_at: 2026-11-08T00:00:00.000Z\n");
+    writeFileSync(join(repo, "att.md"), fm(["id: att", "path: att", "attachments:", "  - id: .git", "    path: x/config", "    mime_type: text/plain"], "has a file"));
+    symlinkSync("..", join(repo, ".parachute", "attachments"));
+    git(["init", "-q", "-b", "main"], repo);
+    git(["add", "-A"], repo);
+    git(["commit", "-q", "-m", "made-up export"], repo);
+    const clone = join(base, "clone2");
+    git(["clone", "-q", "--", `file://${repo}`, clone], base);
+    git(["remote", "set-url", "origin", "https://x-access-token:MADE-UP-TOKEN@github.com/o/r.git"], clone);
+
+    const assets = join(base, "assets2");
+    const stats = await importPortableVault(new SqliteStore(new Database(":memory:")), { inDir: clone, assetsDir: assets });
+    expect(stats.attachments_restored).toBe(0);
+    const config = join(assets, "x", "config");
+    expect(existsSync(config) ? readFileSync(config, "utf-8") : "").not.toContain("MADE-UP-TOKEN");
+  });
 });

@@ -648,6 +648,10 @@ export async function cloneAndImport(opts: ImportOpts): Promise<ImportResult> {
     if (!existsSync(join(tempDir, ".parachute", "vault.yaml"))) {
       throw new NotAVaultExportError();
     }
+    // The import never needs git's own folder, and `.git/config` holds the
+    // authed clone URL (a stored OAuth token or PAT). Delete it so no read
+    // path the cloned repo can steer, a symlink say, can reach it (T-419).
+    rmSync(join(tempDir, ".git"), { recursive: true, force: true });
 
     // Delegate to the importer. `blowAway: true` for replace mode triggers
     // the wipe-then-import path (deletes notes via the public store API

@@ -14,8 +14,10 @@
 // An honest https remote, without the network: the box's own git config (`url.<local repo>.insteadOf`, in the
 // box's HOME, which only the box owner can write) rewrites one made-up https URL to a throwaway repo here. The
 // vault still sees and checks an https URL; git stands in for the git host. Mutants "import-url-unchecked",
-// "import-follows-content-links", "import-follows-sidecar-links", "import-follows-attachment-links" and
-// "import-attachments-whole-clone" put each guard back.
+// "import-follows-content-links", "import-follows-sidecar-links", "import-follows-attachment-links",
+// "import-attachments-whole-clone" and "import-attachments-folder-linked" put each guard back. Two belts have no
+// mutant, since no contract can see them with the guards above in place: `--` before the URL, and deleting the
+// clone's .git (its config holds a stored token) before the import.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -31,6 +33,8 @@ const OUTSIDE = join(WORK, "server-only"); // the server's own files, outside an
 const REPO = join(WORK, "repo");
 const GITCONFIG = join(BOX_HOME, ".gitconfig");
 const REMOTE = `https://git-${R}.invalid/owner/vault.git`; // rewritten by the box's git config to REPO
+const REPO2 = join(WORK, "repo2"); // its attachments folder is a link to its own root
+const REMOTE2 = `https://git-${R}.invalid/owner/vault2.git`;
 let admin = "";
 let priorGitconfig: string | null = null;
 
@@ -84,7 +88,7 @@ beforeAll(async () => {
   writeFileSync(join(REPO, R, "ok.md"), fm([`id: ${R}-ok`, `path: ${R}/ok`], "a made-up note"));
   writeFileSync(
     join(REPO, R, "att.md"),
-    fm([`id: ${R}-att`, `path: ${R}/att`, "attachments:", `  - id: ${R}-a1`, `    path: ${R}/key.pem`, "    mime_type: text/plain", `  - id: ${R}-a2`, `    path: ${R}/config.txt`, "    mime_type: text/plain"], "has files"),
+    fm([`id: ${R}-att`, `path: ${R}/att`, "attachments:", `  - id: ${R}-a1`, `    path: ${R}/key.pem`, "    mime_type: text/plain", `  - id: ${R}-a2`, `    path: ${R}/copy.csv`, "    mime_type: text/plain"], "has files"),
   );
   writeFileSync(join(REPO, R, "data.csv"), "a,b\n1,2\n");
   symlinkSync(join(OUTSIDE, "secret.md"), join(REPO, R, "leak.md"));
@@ -92,15 +96,30 @@ beforeAll(async () => {
   symlinkSync(join(OUTSIDE, "meta.yaml"), join(p, "notes-meta", `${R}-leakmeta.yaml`));
   symlinkSync(join(OUTSIDE, "schema.yaml"), join(p, "schemas", `${R}s.yaml`));
   symlinkSync(join(OUTSIDE, "key.pem"), join(p, "attachments", `${R}-a1`, "key.pem"));
-  // A link that stays inside the clone but leaves the attachments: the clone's own .git/config holds the URL it
-  // was cloned from, with a stored token in it when there is one.
-  symlinkSync("../../../.git/config", join(p, "attachments", `${R}-a2`, "config.txt"));
+  // A link that stays inside the clone but leaves the attachments (to .git/config, it would reach the clone URL
+  // and its stored token; here a plain file of the clone).
+  symlinkSync(`../../../${R}/data.csv`, join(p, "attachments", `${R}-a2`, "copy.csv"));
   git(["init", "-q", "-b", "main"], REPO);
   git(["add", "-A"], REPO);
   git(["commit", "-q", "-m", "made-up export"], REPO);
 
+  // Repo 2: `.parachute/attachments` is itself a link to the clone's root, so an attachment id names any folder
+  // in the clone (`.git`, or a note folder).
+  mkdirSync(join(REPO2, ".parachute"), { recursive: true });
+  mkdirSync(join(REPO2, `${R}b`), { recursive: true });
+  writeFileSync(join(REPO2, ".parachute", "vault.yaml"), "export_format_version: 1\nexported_at: 2026-11-08T00:00:00.000Z\n");
+  writeFileSync(join(REPO2, `${R}b`, "plain.txt"), `in-clone file ${R}\n`);
+  writeFileSync(
+    join(REPO2, `${R}b`, "att.md"),
+    fm([`id: ${R}-att2`, `path: ${R}b/att`, "attachments:", "  - id: .git", `    path: ${R}b/config`, "    mime_type: text/plain", `  - id: ${R}b`, `    path: ${R}b/plain.txt`, "    mime_type: text/plain"], "has files"),
+  );
+  symlinkSync("..", join(REPO2, ".parachute", "attachments"));
+  git(["init", "-q", "-b", "main"], REPO2);
+  git(["add", "-A"], REPO2);
+  git(["commit", "-q", "-m", "made-up export"], REPO2);
+
   priorGitconfig = existsSync(GITCONFIG) ? readFileSync(GITCONFIG, "utf8") : null;
-  writeFileSync(GITCONFIG, `${priorGitconfig ?? ""}\n[url "file://${REPO}"]\n\tinsteadOf = ${REMOTE}\n`);
+  writeFileSync(GITCONFIG, `${priorGitconfig ?? ""}\n[url "file://${REPO}"]\n\tinsteadOf = ${REMOTE}\n[url "file://${REPO2}"]\n\tinsteadOf = ${REMOTE2}\n`);
 });
 
 afterAll(() => {
@@ -142,12 +161,37 @@ describe("a symlink in the cloned repo doesn't reach the server's files", () => 
     expect(r.status).toBe(404);
   });
 
-  test("an attachment linked to the clone's own .git/config (where a token would sit) isn't copied", async () => {
-    const r = await safeFetch(`${s.vaultViaHub}/api/storage/${R}/config.txt`, {
+  test("an attachment linked to another file of the clone, outside .parachute/attachments, isn't copied", async () => {
+    const r = await safeFetch(`${s.vaultViaHub}/api/storage/${R}/copy.csv`, {
       headers: { authorization: `Bearer ${s.operatorToken}` },
     });
-    expect(await r.text()).not.toContain(REMOTE);
+    expect(await r.text()).not.toContain("a,b");
     expect(r.status).toBe(404);
+  });
+});
+
+describe("an attachments folder that is itself a link, to elsewhere in the clone", () => {
+  let result: Reply;
+  beforeAll(async () => {
+    result = await importOver(REMOTE2, { wait: true });
+  });
+  const stored = async (path: string) => {
+    const r = await safeFetch(`${s.vaultViaHub}/api/storage/${path}`, { headers: { authorization: `Bearer ${s.operatorToken}` } });
+    return { status: r.status, text: await r.text() };
+  };
+
+  test("the import completes, and an attachment can't name a file outside .parachute/attachments", async () => {
+    expect(result.status, JSON.stringify(result.body).slice(0, 600)).toBe(200);
+    expect((await op.get(`/notes/${R}-att2`)).status).toBe(200);
+    const plain = await stored(`${R}b/plain.txt`);
+    expect(plain.text).not.toContain(`in-clone file ${R}`);
+    expect(plain.status).toBe(404);
+  });
+
+  test("nor the clone's .git/config", async () => {
+    const config = await stored(`${R}b/config`);
+    expect(config.text).not.toContain(REMOTE2);
+    expect(config.status).toBe(404);
   });
 });
 

@@ -2165,11 +2165,13 @@ export interface ImportSource {
  * server file into a note body or the vault's assets (T-419, audit L3-02).
  * Every read now goes through {@link FsImportSource.fileIn}: the file's REAL
  * path (`realpathSync`, every link resolved) must be a regular file inside
- * the real path of the folder it belongs to (the export root for content,
+ * the folder it belongs to (the export root for content,
  * `.parachute/attachments` for an attachment, the sidecar folder for a
- * sidecar), separator-aware. Per folder, not just "in the clone": the clone
- * holds `.git/config`, and that carries the clone URL with any stored token
- * in it. The content walk also doesn't step into linked folders at all.
+ * sidecar), separator-aware, and that folder must be at its own place with no
+ * link on the way to it. Per folder, not just "in the clone": the clone holds
+ * `.git/config`, and that carries the clone URL with any stored token in it
+ * (mirror import also deletes the clone's `.git` before importing). The
+ * content walk also doesn't step into linked folders at all.
  */
 export class FsImportSource implements ImportSource {
   readonly attachmentsEnabled: boolean;
@@ -2187,9 +2189,11 @@ export class FsImportSource implements ImportSource {
     this.attachmentsEnabled = !!opts.assetsDir;
   }
 
-  /** The real path of `path` when it is a regular file inside `dir` (the
-   *  export's own folder `dir`, itself inside the export), after resolving
-   *  every symlink on the way; else `null`. */
+  /** The real path of `path` when it is a regular file inside `dir`, after
+   *  resolving every symlink on the way; else `null`. `dir` (one of the
+   *  export's own folders) must really be where it is named, not a link to
+   *  some other folder of the clone (`.parachute/attachments -> ..` would let
+   *  an attachment id name `.git`). */
   private fileIn(path: string, dir: string): string | null {
     let real: string;
     let dirReal: string;
@@ -2200,7 +2204,7 @@ export class FsImportSource implements ImportSource {
     } catch {
       return null;
     }
-    if (!isWithinDir(dirReal, this.inDirReal)) return null;
+    if (dirReal !== join(this.inDirReal, relative(this.inDir, dir))) return null;
     return isWithinDir(real, dirReal) ? real : null;
   }
 
