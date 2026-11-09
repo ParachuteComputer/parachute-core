@@ -27,6 +27,7 @@ import {
   importSPKI,
   jwtVerify,
 } from "jose";
+import { adoptRefreshToken, adoptToken } from "./keys.ts";
 import { attributionPubkey } from "./pubkey-links.ts";
 import { renameVaultScopes, vaultScopeName } from "./scope-explanations.ts";
 import { getActiveSigningKey, getAllPublicKeys } from "./signing-keys.ts";
@@ -273,6 +274,7 @@ export function signRefreshToken(db: Database, opts: SignRefreshTokenOpts): Sign
       err,
     );
   }
+  keyForMint(db, opts.jti, familyId);
   return { token, refreshTokenHash, familyId, expiresAt };
 }
 
@@ -381,6 +383,7 @@ export function recordTokenMint(db: Database, opts: RecordTokenMintOpts): void {
           `account ${opts.userId} no longer exists (or was reset) at mint insert; refusing to register jti=${opts.jti}`,
         );
       }
+      keyForMint(db, opts.jti);
       return;
     }
     db.prepare(
@@ -400,12 +403,27 @@ export function recordTokenMint(db: Database, opts: RecordTokenMintOpts): void {
       opts.subject,
       subjectPubkey,
     );
+    keyForMint(db, opts.jti);
   } catch (err) {
     if (err instanceof TokenMintPrincipalGoneError) throw err;
     throw new RefreshTokenInsertError(
       `failed to insert token registry row (jti=${opts.jti}, created_via=${opts.createdVia}): ${err instanceof Error ? err.message : String(err)}`,
       err,
     );
+  }
+}
+
+/**
+ * Every recorded mint gets its key (T-318 §2, keys.ts). A key only describes
+ * the token, so failing to write one must never fail the mint: it is logged,
+ * and the next start's migration-style adoption can fill it in.
+ */
+function keyForMint(db: Database, jti: string, refreshFamily?: string): void {
+  try {
+    if (refreshFamily) adoptRefreshToken(db, jti, refreshFamily);
+    else adoptToken(db, jti);
+  } catch (err) {
+    console.error(`[hub] could not record a key for jti=${jti}: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
