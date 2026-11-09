@@ -2610,7 +2610,15 @@ export type RenameTagResult =
  * (the store wrapper) bust both `_tagHierarchy` and `_schemaConfig`
  * after the cascade returns.
  */
-export function renameTag(db: Database, oldName: string, newName: string, attr?: { actor?: string | null; via?: string | null }, policy: HistoryPolicy = DEFAULT_HISTORY_POLICY): RenameTagResult {
+export function renameTag(
+  db: Database,
+  oldName: string,
+  newName: string,
+  attr?: { actor?: string | null; via?: string | null },
+  policy: HistoryPolicy = DEFAULT_HISTORY_POLICY,
+  /** Collects the ids of notes whose content or path the cascade rewrote (the store fires `updated` for them). */
+  rewritten?: Set<string>,
+): RenameTagResult {
   // Normalize the TARGET so a rename can never create a `#`-prefixed tag. The
   // SOURCE (`oldName`) is left LITERAL on purpose — it's the transitional escape
   // hatch that lets the `#legacy/*` → `legacy/*` data migration find the
@@ -2813,6 +2821,7 @@ export function renameTag(db: Database, oldName: string, newName: string, attr?:
         updateStmt.run(next, now, nowMs, row.id);
         refreshCompactState(db, row.id);
         notesRewritten++;
+        rewritten?.add(row.id);
       }
     }
 
@@ -2842,6 +2851,7 @@ export function renameTag(db: Database, oldName: string, newName: string, attr?:
         updateStmt.run(next, now, nowMs, row.id);
         refreshCompactState(db, row.id);
         pathsRenamed++;
+        rewritten?.add(row.id);
       }
     }
 
