@@ -58,7 +58,10 @@ export function probeConfig(args: string[], env: Record<string, string | undefin
     if (name === "--token" || name === "--bearer") {
       return { error: `${name} is refused: an argument shows in \`ps\`. Put the pass in PARACHUTE_PROBE_TOKEN or a file named by --token-file` };
     }
-    if (!known.has(name)) return { error: `unknown argument ${JSON.stringify(name.slice(0, 40))}` };
+    if (!known.has(name)) {
+      // Echo a flag's name, never a bare value: a pass pasted as an argument must not reach the journal.
+      return { error: name.startsWith("--") ? `unknown flag ${JSON.stringify(name.slice(0, 40))}` : "an unexpected argument (not a --flag); its value is not shown" };
+    }
     const value = inline ?? args[++i];
     if (value === undefined || value === "") return { error: `${name} needs a value` };
     flags[name] = value;
