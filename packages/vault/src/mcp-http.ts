@@ -26,8 +26,10 @@ import {
 import { generateScopedMcpTools, getServerInstruction } from "./mcp-tools.ts";
 import type { AuthResult } from "./auth.ts";
 import type { McpToolDef } from "../core/src/mcp.ts";
+import { mcpToolErrorLine } from "../core/src/mcp-error-log.ts";
 import { hasScopeForVault } from "./scopes.ts";
 import type { VaultVerb } from "./scopes.ts";
+import pkg from "../package.json" with { type: "json" };
 
 /**
  * Required verb for an MCP tool. Reads `tool.requiredVerb` from the tool
@@ -447,6 +449,9 @@ export async function handleMcp(
           ...(e.mime_type !== undefined ? { mime_type: e.mime_type } : {}),
         });
       }
+      // Nobody tagged this error, so it is a crash, not a refusal (audit L6-02): without this line the server log
+      // showed only `POST … 200`. One line, no arguments; see core/src/mcp-error-log.ts.
+      console.error(mcpToolErrorLine(name, err, pkg.version));
       return {
         content: [{ type: "text" as const, text: `Error: ${message}` }],
         isError: true,

@@ -20,6 +20,7 @@
  */
 import type { Database } from "bun:sqlite";
 import { ACCOUNT_VAULTS_UNNARROWED } from "@openparachute/door-contract";
+import pkg from "../package.json" with { type: "json" };
 import type { AccountApiDeps } from "./account-api.ts";
 import { callVaultModuleTool, listVaultModuleTools } from "./account-mcp-backend.ts";
 import {
@@ -38,6 +39,7 @@ import {
 import { HOST_ADMIN_SCOPE } from "./admin-vaults.ts";
 import { SERVICES_MANIFEST_PATH } from "./config.ts";
 import { validateAccessToken } from "./jwt-sign.ts";
+import { mcpToolErrorLine } from "./mcp-error-log.ts";
 import {
   NostrHttpAuthError,
   type NostrReplayCache,
@@ -297,8 +299,7 @@ async function handleToolCall(
           ...err.extra,
         });
       }
-      const message = err instanceof Error ? err.message : "Unknown error";
-      return result(id, { content: [{ type: "text", text: `Error: ${message}` }], isError: true });
+      return toolCrash(id, name, err);
     }
   }
   const vaultTools = await listVaultModuleTools(ctx);
@@ -319,9 +320,20 @@ async function handleToolCall(
     if (err instanceof AccountToolError) {
       return rpcError(id, INVALID_PARAMS, err.message, { error_type: err.errorType, ...err.extra });
     }
-    const message = err instanceof Error ? err.message : "Unknown error";
-    return result(id, { content: [{ type: "text", text: `Error: ${message}` }], isError: true });
+    // The hub's own failure on the way to the vault (unreachable, an unreadable answer). A tool that crashes inside
+    // the vault comes back as an isError result, not a throw, and the vault logs that one itself.
+    return toolCrash(id, name, err);
   }
+}
+
+/**
+ * A tool call that threw something other than a refusal (`AccountToolError`): log one line server-side, the same
+ * shape the vault logs, never the arguments (audit L6-02), and answer with the in-band isError text as before.
+ */
+function toolCrash(id: JsonRpcId, name: string, err: unknown): JsonRpcMessage {
+  console.error(mcpToolErrorLine(name, err, pkg.version));
+  const message = err instanceof Error ? err.message : "Unknown error";
+  return result(id, { content: [{ type: "text", text: `Error: ${message}` }], isError: true });
 }
 
 async function listedTools(
