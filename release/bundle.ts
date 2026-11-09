@@ -30,8 +30,12 @@ const RELEASE = import.meta.dir;
 export const NAMES = ["parachute-core", "parachute", "parachute-vault"];
 const REPO_URL = "https://github.com/ParachuteComputer/parachute-core";
 
+// onnxruntime-node's postinstall downloads its CUDA providers (~316 MB on linux-x64) from NuGet: the bundle never
+// ships them (the production install runs no scripts), and the download made CI builds fail on a network blip.
+const INSTALL_ENV = { ...process.env, ONNXRUNTIME_NODE_INSTALL: "skip" };
+
 async function sh(cmd: string[], cwd?: string): Promise<string> {
-  const p = Bun.spawn(cmd, { cwd, stdout: "pipe", stderr: "pipe" });
+  const p = Bun.spawn(cmd, { cwd, env: INSTALL_ENV, stdout: "pipe", stderr: "pipe" });
   const [out, err, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
   if (code !== 0) throw new Error(`${cmd.join(" ")} (in ${cwd ?? "."}) failed (${code}): ${(out + err).slice(-800)}`);
   return out;
