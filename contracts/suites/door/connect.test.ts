@@ -53,7 +53,10 @@ describe("what an app is told before it connects", () => {
     // Which tokens the list holds depends on which contracts ran before this one (a revoked key in keys.test.ts adds
     // one), and bun doesn't fix the order of files: the fingerprint keeps the list's shape with `jtis` emptied.
     const list = rev.status === 200 ? await rev.json() : null;
-    if (list) expect(Array.isArray(list.jtis)).toBe(true);
+    if (list) {
+      expect(Array.isArray(list.jtis)).toBe(true);
+      expect(list.jtis.every((j: unknown) => typeof j === "string")).toBe(true);
+    }
     fp("connect/revocation-list", { status: rev.status, shape: list ? shape({ ...list, jtis: [] }) : null });
   });
 });

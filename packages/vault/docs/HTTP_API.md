@@ -2062,7 +2062,7 @@ the existing schema (mirrors MCP `update-tag`).
   from "explicitly set to the default." **Blast radius:** this only changes
   FUTURE writes — notes already backfilled under the old behavior keep their
   values; no migration touches them. **Parachute Cloud's REST kept the old
-  fill until cloud rc.195 (T-437)** (its MCP was already right): a note it
+  fill until parachute-cloud#403 (T-437)** (its MCP was already right): a note it
   created or tagged may hold `""`, `0`, `false` or the first enum value in
   fields it never set. A field that is `indexed` or `strict: true` and was
   filled with a value of the wrong type (`""` in a `date`, `number`, `array`
