@@ -4,7 +4,8 @@
 //
 // The pattern is the hub's (parachute-hub scripts/release-plan.ts, decidePublish), cut down to this package's
 // channels:
-//   X.Y.Z-pre.N   of the line `next` serves (NEXT_SERVES, X.Y): dist-tag `next`; of a later line: dist-tag `beta`.
+//   X.Y.Z-pre.N   of the line `next` serves (NEXT_SERVES, X.Y): dist-tag `next`, from SERVED_FROM (release/0.8 while
+//                 main carries 0.9); of a later line: dist-tag `beta`, from main.
 //                 The one-liner and every installed box follow `next`, so a new line is tried on `beta` first
 //                 (ROADMAP "Channel first": 0.9.0-pre.* go to beta, never next). Either is published only after an
 //                 approval on the `npm-prerelease` environment (release.yml).
@@ -33,6 +34,14 @@ export type Channel = "next" | "beta" | "latest";
  * (ROADMAP pacing: beta, then uni, then cloud, then latest and next), made in its own PR.
  */
 export const NEXT_SERVES = "0.8";
+
+/**
+ * The branch the line `next` serves publishes from, to `next` and `latest`. While `main` and `next` carry a later line
+ * (0.9), the served line ships from its own branch, `release/0.8` (cut at 53f956f), under that branch's own plan; from
+ * `main` only `beta` publishes, so no 0.9 commit can reach `next` or `latest`. The PR that moves NEXT_SERVES to 0.9
+ * sets this back to "main" (RELEASING.md, "Two lines").
+ */
+export const SERVED_FROM = "release/0.8";
 
 /** X.Y of a version. */
 function lineOf(version: string): string {
@@ -108,11 +117,27 @@ export function versionOnlyDiff(diff: string): boolean {
   return changed.every((l) => /^[+-]\s*"version":\s*"[^"]*",?\s*$/.test(l));
 }
 
-/** The decision for `version`, pushed to `branch`, given what npm has (or `null`: npm couldn't be read). */
-export function decidePublish(version: string, registry: Registry | null, branch: string | undefined, nextServes: string = NEXT_SERVES): Decision {
+/**
+ * The decision for `version`, pushed to `branch`, given what npm has (or `null`: npm couldn't be read). `beta` publishes
+ * from main only; `next` and `latest` from `servedFrom` only (SERVED_FROM).
+ */
+export function decidePublish(
+  version: string,
+  registry: Registry | null,
+  branch: string | undefined,
+  nextServes: string = NEXT_SERVES,
+  servedFrom: string = SERVED_FROM,
+): Decision {
   const channel = channelFor(version, nextServes);
   if (!channel) return { publish: false, reason: `${version} is not a release version (X.Y.Z-pre.N for next or beta, X.Y.Z for latest)` };
-  if (branch !== "main") return { publish: false, reason: `releases publish from main only (this is ${branch ?? "no branch"})` };
+  const from = channel === "beta" ? "main" : servedFrom;
+  if (branch !== from) {
+    // main carries the later line: a served-line version there is a mistake, said loudly rather than skipped.
+    if (branch === "main") {
+      return { refuse: true, reason: `${version} would go to ${channel}, which publishes from ${servedFrom} only while main carries a later line (SERVED_FROM in scripts/release-plan.ts)` };
+    }
+    return { publish: false, reason: `${channel} publishes from ${from} only (this is ${branch ?? "no branch"})` };
+  }
   if (!registry) return { refuse: true, reason: "npm couldn't be read: refusing to guess, since a wrong answer either double-publishes or drops a release" };
   if (registry.versions.includes(version)) return { publish: false, reason: `${version} is already on npm` };
   if (registry.versions.length === 0) {

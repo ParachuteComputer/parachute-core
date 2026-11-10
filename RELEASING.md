@@ -10,22 +10,38 @@ Two ways out, both built by CI from the same commit:
 The npm name `parachute` belongs to someone else, so the package stays `@openparachute/core`; its command is
 `parachute`.
 
+## Two lines: 0.9 on `next` and `main`, 0.8.x from `release/0.8`
+
+0.9 opened on `next` with `release/0.8` cut from `next` at 53f956f (the last 0.8 commit). From then on:
+
+- **0.9** is on `next` and reaches `main` when Aaron merges next→main. From `main` its prereleases publish to `beta`.
+  `main` publishes nothing to `next` or `latest`: `scripts/release-plan.ts` sends those only from `SERVED_FROM`
+  (`release/0.8`), and a served-line version on `main` refuses. So no 0.9 commit can reach `next` or `latest`.
+- **0.8.x fixes** are PRs with base `release/0.8`. That branch has its own `release.yml` and plan, which publish only
+  from `release/0.8` and only `0.8.x`, to `next` and `latest` (the 0.8 line's RELEASING.md says how).
+- A fix both lines need lands on each branch in its own PR (a cherry-pick).
+- **Moving `next` to 0.9** is one PR: `NEXT_SERVES = "0.9"`, `SERVED_FROM = "main"`, the hub's upgrade hint (below).
+  A PR on `release/0.8` in the same step stops that branch publishing to `next` (decided then: no publish, or its
+  own dist-tag).
+
 ## Channels
 
 | Version | npm dist-tag | Published |
 |---|---|---|
 | `0.8.0-dev.N` | none | never (not a release) |
-| `0.8.0-pre.N` (the line `next` serves) | `next` | when the merge that brings that version reaches `main`, once every `contracts.yml` check has passed on that commit and after an approval on the GitHub environment `npm-prerelease` (below) |
-| `0.9.0-pre.N` (a later line) | `beta` | the same way. The one-liner and every installed box follow `next`, so a new line is tried on `beta` first (ROADMAP "Channel first") |
-| `0.8.0` | `latest` | once every `contracts.yml` check has passed, only after an approval on the GitHub environment `npm-latest` (below), and only for the line `next` serves |
+| `0.8.x-pre.N` (the line `next` serves) | `next` | from `release/0.8` (`SERVED_FROM`) only, under that branch's own `release.yml` and RELEASING.md; never from `main` |
+| `0.9.0-pre.N` (a later line) | `beta` | from `main`, when the merge that brings that version reaches `main`, once every `contracts.yml` check has passed on that commit and after an approval on the GitHub environment `npm-prerelease` (below). The one-liner and every installed box follow `next`, so a new line is tried on `beta` first (ROADMAP "Channel first") |
+| `0.8.x` | `latest` | from `release/0.8` only, the same way, after an approval on the GitHub environment `npm-latest` |
 
-Which line `next` serves is `NEXT_SERVES` in `scripts/release-plan.ts` (today `0.8`). Moving it (to `0.9`, once 0.9
-has been through beta, uni and cloud: ROADMAP's pacing rule) is its own PR, merged before the stable of that line;
+Which line `next` serves is `NEXT_SERVES` in `scripts/release-plan.ts` (today `0.8`), and the branch it publishes from
+is `SERVED_FROM` (today `release/0.8`). Moving them (to `0.9` and `main`, once 0.9 has been through beta, uni and cloud:
+ROADMAP's pacing rule) is its own PR, merged before the stable of that line;
 `plan` refuses a stable of a line `next` doesn't serve yet. After it moves, the next `0.9.0-pre.N` goes to `next`;
 the same PR changes the hub's "upgrade core itself" hint (`packages/hub/src/commands/upgrade.ts`, `api-hub-upgrade.ts`),
 which names `@beta` while 0.9 is tried there.
 
-**A merge to `main` that changes the version is the release.** `.github/workflows/release.yml` runs on it:
+**A merge to `main` that changes the version is the 0.9 release** (`beta`). This branch's `.github/workflows/release.yml`
+runs on it (0.8.x releases run `release/0.8`'s own copy):
 
 1. `plan` (`scripts/release-plan.ts`, unit-tested) decides. It skips a version npm already has, and a package npm
    has never seen (the first publish is by hand, below). It refuses when npm can't be read, when a dist-tag would
@@ -55,7 +71,8 @@ stay at 0.7. To promote: a PR that only drops the suffix (`0.8.0`), merged; then
 
 `publish-latest` runs in the environment `npm-latest`, `publish-prerelease` (`next` and `beta`) in `npm-prerelease`.
 Each one's one required reviewer is the GitHub account `unforcedagi` (the account Uni works as), and each deploys
-from `main` only.
+from `main` only; `npm-latest` also from `release/0.8` once an admin adds that branch policy (RELEASING.md on
+`release/0.8`).
 
 **Uni approves only after Aaron taps the approval card.** When a run waits, Uni posts an approval card to Aaron (the
 version, its dist-tag, for a stable the prerelease it promotes, the run link). Only after his tap does Uni approve

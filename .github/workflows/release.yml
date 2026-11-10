@@ -2,7 +2,8 @@
 #
 #   plan            scripts/release-plan.ts: is this version new on npm, and which dist-tag. X.Y.Z-pre.N → `next`
 #                   for the line next serves (NEXT_SERVES), `beta` for a later line (0.9.0-pre.* while next serves
-#                   0.8); X.Y.Z → `latest`; anything else (0.8.0-dev.0) never publishes. A package npm has never seen
+#                   0.8); X.Y.Z → `latest`. From main only `beta`: `next` and `latest` publish from SERVED_FROM
+#                   (release/0.8, whose own copy of this workflow runs there), so no 0.9 commit reaches them; anything else (0.8.0-dev.0) never publishes. A package npm has never seen
 #                   is skipped: the first publish is by hand, once (npm trusted publishing can't create a package).
 #   build           the linux-x64 bundle, the npm package packed from it (release/npm.ts), and the same test as the
 #                   contracts job `npm`: installed with npm and with bun, Benjamin's suite on the npm install. The
