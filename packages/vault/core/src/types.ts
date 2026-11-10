@@ -58,6 +58,8 @@ export interface Note {
   lastUpdatedBy?: string | null;
   lastUpdatedVia?: string | null;
   tags?: string[];
+  /** T-318 §8a: the subset of `tags` that are types (fields, hierarchy). `tags` still lists every name through 0.9. */
+  types?: string[];
   links?: Link[];
   /**
    * Opt-in link degree (raw row count, both directions by default). Present
@@ -422,6 +424,7 @@ export interface NoteIndex {
   lastUpdatedBy?: string | null;
   lastUpdatedVia?: string | null;
   tags?: string[];
+  types?: string[];
   /** Always present (`{}` when empty) — see `Note.metadata`. */
   metadata?: Record<string, unknown>;
   byteSize: number;
@@ -720,6 +723,12 @@ export interface Store {
   listTagRecords(): Promise<TagRecord[]>;
   getTagRecord(tag: string): Promise<TagRecord | null>;
   /**
+   * T-318 §8a: the tags whose RECORDED kind is `type` (a record's `kind` is
+   * the effective one, which also counts being another tag's parent). The
+   * portable export uses it to keep a promoted type that is also a parent.
+   */
+  recordedTypeNames(): Promise<Set<string>>;
+  /**
    * Partial upsert. Any patch field left undefined is preserved; pass
    * null to clear. Touching `parent_names` invalidates the tag-hierarchy
    * cache. Returns the post-write row.
@@ -731,6 +740,7 @@ export interface Store {
       fields?: Record<string, TagFieldSchema> | null;
       relationships?: TagRelationshipMap | null;
       parent_names?: string[] | null;
+      kind?: "type" | "tag";
     },
   ): Promise<TagRecord>;
 

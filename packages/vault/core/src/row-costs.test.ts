@@ -14,7 +14,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { SCHEMA_SQL, SCHEMA_VERSION, initSchema } from "./schema.ts";
+import { SCHEMA_SQL, SCHEMA_VERSION, initSchema, unnumberedStepsDone } from "./schema.ts";
 import { SqliteStore } from "./store.ts";
 import { generateMcpTools } from "./mcp.ts";
 
@@ -160,6 +160,33 @@ describe("v5 and v18 against each state of the path indexes", () => {
     db.close();
   });
 
+  test("a vault 0.8 opened last (current stamp, the path index, no kind column) gets the kind column once", async () => {
+    // What 0.8 (core next with T-412) leaves: SCHEMA_VERSION stamped, idx_notes_path_nocase, and tags with no `kind`
+    // (0.9 adds it with no version bump). The fast path must not take that vault as current (audit L2-01): every type
+    // lookup read t.kind and failed. lifecycle/upgrade proves the same on a vault the real 0.8 build made.
+    await makeVault(5);
+    let db = new Database(file);
+    const store = new SqliteStore(db);
+    await store.upsertTagSchema("person", { fields: { email: { type: "string" } } });
+    await store.createNote("made up", { path: "people/Ada", tags: ["person", "pinned"] });
+    db.exec("ALTER TABLE tags DROP COLUMN kind");
+    db.query("INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)").run(SCHEMA_VERSION, "2999-01-01T00:00:00.000Z");
+    db.close();
+    db = new Database(file);
+    const reopened = new SqliteStore(db);
+    const cols = (db.query("PRAGMA table_info(tags)").all() as { name: string }[]).map((c) => c.name);
+    expect(cols).toContain("kind");
+    const note = await reopened.getNoteByPath("people/Ada");
+    expect(note?.types).toEqual(["person"]);
+    const after = cookie(db);
+    db.close();
+    // And the open after that is a no-op again.
+    db = new Database(file);
+    new SqliteStore(db);
+    expect(cookie(db)).toBe(after);
+    db.close();
+  });
+
   test("uniqueness is unchanged: same path and extension refused; another extension or a case variant allowed", async () => {
     const db = new Database(file);
     const store = new SqliteStore(db);
@@ -172,11 +199,11 @@ describe("v5 and v18 against each state of the path indexes", () => {
   });
 });
 
-/** sha256 of SCHEMA_SQL as of SCHEMA_VERSION 32 with T-412 (idx_notes_path left out of it). */
-const SCHEMA_SQL_HASH_AT_32 = "7825b5218ba5e1cfb5e7a86c8b1cd8655ac59458104175f946d741da0e5fcaf7";
+/** sha256 of SCHEMA_SQL as of SCHEMA_VERSION 32 with T-412 (idx_notes_path left out of it) and 0.9's `kind` on tags. */
+const SCHEMA_SQL_HASH_AT_32 = "4761ed052920ee81919b0d192c2ac5f314b465bb19861b62d2bec1cec5739599";
 
-/** sha256 of initSchema's code (comments and spacing left out) as of SCHEMA_VERSION 32 with T-412. */
-const INIT_SCHEMA_HASH_AT_32 = "12514042dd6126cd039151fa33d00bc0d6ca3305ce0496fd22b020994cbb8fd4";
+/** sha256 of initSchema's code and its fast-path check (comments and spacing left out) as of SCHEMA_VERSION 32 with T-412 and 0.9's ensureTagKinds. */
+const INIT_SCHEMA_HASH_AT_32 = "348f0488a94b7e38046789773549ed12faccca81feacd5373ceeee634a99e428";
 
 describe("the fast path's promise", () => {
   // initSchema skips SCHEMA_SQL and every migration on a vault stamped SCHEMA_VERSION (with the path index). So a
@@ -189,10 +216,12 @@ describe("the fast path's promise", () => {
   });
 
   // The same promise for the steps initSchema runs: a migration or every-open step added without a bump (as
-  // t318-09/types-tags adds ensureTagKinds) never runs on a vault the fast path skips. Comments are left out of the
-  // hash; any change to the calls or to the fast path's condition shows here.
+  // t318-09/types-tags added ensureTagKinds, audit L2-01) never runs on a vault the fast path skips. Comments are left
+  // out of the hash; any change to the calls or to the fast path's condition (unnumberedStepsDone) shows here. If
+  // this fails for a new un-numbered step: give it its check in unnumberedStepsDone and a test like "a vault 0.8
+  // opened last" above, then update the hash.
   test("initSchema's steps are the ones SCHEMA_VERSION 32 was stamped with", () => {
-    const code = initSchema.toString().replace(/\/\/[^\n]*/g, "").replace(/\s+/g, " ");
+    const code = (initSchema.toString() + unnumberedStepsDone.toString()).replace(/\/\/[^\n]*/g, "").replace(/\s+/g, " ");
     const hash = new Bun.CryptoHasher("sha256").update(code).digest("hex");
     expect({ version: SCHEMA_VERSION, hash }).toEqual({ version: 32, hash: INIT_SCHEMA_HASH_AT_32 });
   });

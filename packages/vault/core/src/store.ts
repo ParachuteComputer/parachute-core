@@ -7,6 +7,7 @@ import { refreshCompactState } from "./history-compact-state.js";
 import * as noteOps from "./notes.js";
 import * as linkOps from "./links.js";
 import * as tagSchemaOps from "./tag-schemas.js";
+import { recordedTypeNames } from "./tag-kind.js";
 import * as indexedFieldOps from "./indexed-fields.js";
 import {
   pruneOrphanedIndexedFields,
@@ -1538,6 +1539,10 @@ export class BunSqliteStore implements Store {
     return tagSchemaOps.getTagRecord(this.db, tag);
   }
 
+  async recordedTypeNames() {
+    return recordedTypeNames(this.db);
+  }
+
   /**
    * Partial upsert of the full tag record. Any patch field left undefined
    * is preserved; pass null to clear. Invalidates the tag-hierarchy cache
@@ -1562,6 +1567,7 @@ export class BunSqliteStore implements Store {
       fields?: Record<string, tagSchemaOps.TagFieldSchema> | null;
       relationships?: tagSchemaOps.TagRelationshipMap | null;
       parent_names?: string[] | null;
+      kind?: "type" | "tag";
     },
   ) {
     // Canonical-bare-tag guard (vault#XXX) for the SCHEMA path. Strip leading

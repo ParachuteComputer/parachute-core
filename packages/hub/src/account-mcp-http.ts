@@ -22,7 +22,7 @@ import type { Database } from "bun:sqlite";
 import { ACCOUNT_VAULTS_UNNARROWED } from "@openparachute/door-contract";
 import pkg from "../package.json" with { type: "json" };
 import type { AccountApiDeps } from "./account-api.ts";
-import { callVaultModuleTool, listVaultModuleTools } from "./account-mcp-backend.ts";
+import { callVaultModuleTool, FAN_OUT_TOOLS, listVaultModuleTools } from "./account-mcp-backend.ts";
 import {
   type AccountMcpPrincipal,
   type AccountToolContext,
@@ -311,7 +311,7 @@ async function handleToolCall(
   }
   try {
     const out = await callVaultModuleTool(name, args, ctx);
-    if (name === "query-notes") {
+    if (FAN_OUT_TOOLS.has(name)) {
       return result(id, { content: [{ type: "text", text: JSON.stringify(out, null, 2) }] });
     }
     if (isMcpToolResult(out)) return result(id, out);
@@ -353,7 +353,7 @@ function instructions(): string {
     "The Parachute hub account MCP — one connection across the vaults this key or token can use. " +
     "Hub-native: list-vaults, create-vault (owner / account write), grant-access / revoke-access / " +
     "list-access (if you can admin a vault). Everything else is the vault MCP catalog, live-listed, " +
-    "with a `vault` selector injected (omit on query-notes to fan out; required on every other vault tool). " +
+    "with a `vault` selector injected (omit on query-records to fan out; required on every other vault tool). " +
     "The vault-shaped catalog is a union of what SOME covered vault supports at the highest verb this " +
     "connection holds — a listed tool may be Unknown against a different vault where this connection " +
     "holds a lower verb. tools/list hides tools you cannot call on any covered vault."

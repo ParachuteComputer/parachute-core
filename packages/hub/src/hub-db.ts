@@ -27,6 +27,7 @@ import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { CONFIG_DIR } from "./config.ts";
+import { adoptLiveTokens, hasTokensToAdopt } from "./keys.ts";
 
 export function hubDbPath(configDir: string = CONFIG_DIR): string {
   return join(configDir, "hub.db");
@@ -979,4 +980,49 @@ export function migrate(db: Database): void {
       insert.run(m.version, new Date().toISOString());
     })();
   }
+  ensureKeys(db);
+}
+
+/**
+ * Keys with scopes (T-318 design §2; keys.ts). Not a numbered migration on
+ * purpose: the table is additive and a 0.7 or 0.8 hub ignores it, so hub.db
+ * keeps its schema number, the 0.8 takeover opens a home with no migration,
+ * and its code-only rollback still works. Run at every open, idempotently: the
+ * table if missing, then a key for every live token that has none (which also
+ * fills in mints an older hub recorded in between).
+ *
+ * A key names, owns and describes one row of the token registry; the token row
+ * stays the one source of truth for signature, expiry, revocation, scopes and
+ * tag scope (read live), so a key can never change how a token verifies. An
+ * app's key follows its refresh family through rotation.
+ *
+ *   name        unique, human: the token's label, app or person
+ *   owner       users.id for a person's (or a person's agent's or app's) key; the
+ *               service name for a service key; NULL if unknown
+ *   owner_kind  person | agent | app | service
+ *   types       type scope (JSON array); NULL until keys scope by type
+ *   denies      explicit denies (JSON array, e.g. ["private"]); NULL until enforced
+ */
+export function ensureKeys(db: Database): void {
+  // Every open of hub.db runs this, beside a hub that may be writing. Nothing to do is the usual case: check that
+  // with a read. Otherwise take the write lock first (IMMEDIATE, which waits out busy_timeout): a read-then-write
+  // transaction that loses the race to another writer gets "database is locked" at once, without waiting.
+  const hasTable = db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'keys'").get();
+  if (hasTable && !hasTokensToAdopt(db)) return;
+  db.transaction(() => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS keys (
+        name TEXT PRIMARY KEY,
+        jti TEXT NOT NULL UNIQUE REFERENCES tokens(jti) ON DELETE CASCADE,
+        owner TEXT,
+        owner_kind TEXT NOT NULL CHECK (owner_kind IN ('person', 'agent', 'app', 'service')),
+        types TEXT,
+        denies TEXT,
+        created_via TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS keys_owner ON keys (owner);
+    `);
+    adoptLiveTokens(db);
+  }).immediate();
 }

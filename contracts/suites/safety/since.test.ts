@@ -61,7 +61,10 @@ describe("query-notes `since`", () => {
   test("the tool's schema offers it, so a client can find it", async () => {
     const c = await mcp(`${s.vaultViaHub}/mcp`, s.operatorToken);
     try {
-      const tool = (await c.client.listTools()).tools.find((t) => t.name === "query-notes");
+      // The query tool a client is shown: query-records from 0.9 (T-407; query-notes stays as an alias that takes
+      // every old parameter, `since` included, as the other tests here show), query-notes before.
+      const tools = (await c.client.listTools()).tools;
+      const tool = tools.find((t) => t.name === "query-records") ?? tools.find((t) => t.name === "query-notes");
       expect(Object.keys(tool?.inputSchema.properties ?? {})).toContain("since");
     } finally {
       await c.close();

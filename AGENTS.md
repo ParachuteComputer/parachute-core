@@ -13,7 +13,8 @@ Read `PROCESS.md` first. The short version:
 - **One branch per task**, named `<owner>/<task>-<slug>` (for example `uni/t308-contracts`, `ben/b6-anchors`),
   from `next`. Open a pull request against `next`; never push to `next` or `main`. `next` is the trunk. `main` is
   what's released: a merge to `main` that changes the version publishes to npm (`RELEASING.md`), so work reaches
-  `main` only by a pull request from `next`.
+  `main` only by a pull request from `next`. `next` and `main` carry 0.9 (npm `beta`); **0.8.x fixes** are pull
+  requests against release/0.8, which publishes 0.8.x to `next` and `latest` (`RELEASING.md`, "Two lines").
 - **CI green before merge**: every `contracts` job (`PROCESS.md` §3).
 - **Review by someone who didn't write it.** In practice that is a fresh Claude reviewer (an agent that didn't write
   the code), recorded in a `## Review` section of the pull request body with its verdict, round cap 3. GitHub
