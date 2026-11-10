@@ -34,3 +34,31 @@ export async function startBoxDoor(info: CandidateInfo, opts: { keep?: boolean }
     throw err;
   }
 }
+
+/**
+ * Link a sign-in key to the box admin's account, the box's own way: ask for a challenge, sign the event the hub
+ * hands back, present it with the admin's password again, since it is the account's first key
+ * (`/api/account/pubkeys/challenge`, then `/verify`; cookie session and CSRF). A cloud-style
+ * door links a key with one call on the account door instead; the difference is named in deliberate.json.
+ */
+export async function linkOwnerKeyOnBox(hub: string, session: { cookie: string; csrf: string }, secretKey: string, password: string): Promise<void> {
+  const { schnorr } = await import("@noble/curves/secp256k1.js");
+  const { createHash } = await import("node:crypto");
+  const post = (path: string, body: Record<string, unknown>) =>
+    safeFetch(`${hub}${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: hub, cookie: session.cookie },
+      body: JSON.stringify({ __csrf: session.csrf, ...body }),
+    });
+  const asked = await post("/api/account/pubkeys/challenge", {});
+  const ch: any = await asked.json().catch(() => ({}));
+  if (!asked.ok || !ch.event_template) throw new Error(`door: the box's key challenge gave ${asked.status}: ${JSON.stringify(ch).slice(0, 200)}`);
+  const sk = Buffer.from(secretKey, "hex");
+  const pubkey = Buffer.from(schnorr.getPublicKey(sk)).toString("hex");
+  const t = ch.event_template;
+  const created_at = typeof t.created_at === "number" ? t.created_at : Math.floor(Date.now() / 1000);
+  const id = createHash("sha256").update(JSON.stringify([0, pubkey, created_at, t.kind, t.tags, t.content])).digest("hex");
+  const sig = Buffer.from(schnorr.sign(Buffer.from(id, "hex"), sk)).toString("hex");
+  const done = await post("/api/account/pubkeys/verify", { event: { id, pubkey, created_at, kind: t.kind, tags: t.tags, content: t.content, sig }, label: "door contracts", password });
+  if (!done.ok) throw new Error(`door: linking the owner key on the box gave ${done.status}: ${(await done.text()).slice(0, 300)}`);
+}

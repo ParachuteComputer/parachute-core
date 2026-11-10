@@ -32,6 +32,8 @@ export interface Door {
   otherVault: string;
   /** How this run is signed in as the owner. */
   signIn: { how: "cookie"; cookie: string; csrf: string } | { how: "nostr"; secretKey: string };
+  /** 0.9 doors: a made-up key the owner can sign in with (NIP-98), as hex. On a key-only door it is the sign-in. */
+  ownerKey?: string;
   /** Where this run may write its fingerprint (one JSON object per line). */
   fingerprint?: string;
 }
@@ -58,19 +60,9 @@ export function runId(label: string): string {
 
 // ── Credentials, through the account door ───────────────────────────────────────────────────────────────────
 
-/** NIP-98: an `Authorization: Nostr …` header that proves the made-up owner key for this one request. */
-async function nostrAuth(secretKey: string, url: string, method: string, body?: string): Promise<string> {
-  const { schnorr } = await import("@noble/curves/secp256k1.js");
-  const sk = Buffer.from(secretKey, "hex");
-  const pubkey = Buffer.from(schnorr.getPublicKey(sk)).toString("hex");
-  const tags = [["u", url], ["method", method]];
-  if (body !== undefined && body !== "") tags.push(["payload", createHash("sha256").update(body).digest("hex")]);
-  const created_at = Math.floor(Date.now() / 1000);
-  const id = createHash("sha256").update(JSON.stringify([0, pubkey, created_at, 27235, tags, ""])).digest("hex");
-  const sig = Buffer.from(schnorr.sign(Buffer.from(id, "hex"), sk)).toString("hex");
-  const event = { id, pubkey, created_at, kind: 27235, tags, content: "", sig };
-  return `Nostr ${Buffer.from(JSON.stringify(event)).toString("base64")}`;
-}
+import { nostrAuthorization as nostrAuth } from "../../harness/doors/workers.ts";
+
+export { nostrAuth };
 
 interface Held {
   token: string;
@@ -295,8 +287,10 @@ export const mediaType = (h: Headers) => (h.get("content-type") ?? "").split(";"
  * quiet skip. The answer is recorded, so the comparison shows it.
  */
 export function lacks(id: string): boolean {
-  const all = JSON.parse(readFileSync(new URL("./deliberate.json", import.meta.url), "utf8")).differences as { id: string; lacks?: string[] }[];
+  const all = JSON.parse(readFileSync(new URL("./deliberate.json", import.meta.url), "utf8")).differences as { id: string; lacks?: string[]; releases?: string[] }[];
   const entry = all.find((d) => d.id === id);
+  // An entry for one release line says nothing about a door on another: nothing is recorded there.
+  if (entry?.releases && !entry.releases.includes(door().release)) return false;
   const missing = !!entry?.lacks?.includes(door().kind);
   fp(`has/${id}`, !missing);
   return missing;

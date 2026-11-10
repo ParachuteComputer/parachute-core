@@ -69,10 +69,18 @@ export async function startWorkersDoor(opts: {
   repo: string;
   scratch: string;
   label: string;
+  /**
+   * Which of the checkout's configurations to run. "cloud": the staging environment of each worker's
+   * wrangler.toml (Parachute Cloud's own settings, with a dev sign-up). "personal": the single-owner profile the
+   * checkout ships in deploy/personal, rendered for a made-up owner key: closed sign-ups, billing off, production
+   * settings.
+   */
+  profile?: { kind: "cloud" } | { kind: "personal"; ownerPubkey: string; plan?: string };
   identityVars?: Record<string, string>;
   vaultVars?: Record<string, string>;
 }): Promise<WorkersDoor> {
   const { repo, label } = opts;
+  const profile = opts.profile ?? { kind: "cloud" };
   const identityDir = join(repo, "workers", "identity");
   const vaultDir = join(repo, "workers", "vault");
   for (const d of [identityDir, vaultDir]) {
@@ -89,7 +97,29 @@ export async function startWorkersDoor(opts: {
   writeFileSync(opsTokenFile, randomBytes(24).toString("base64url"), { mode: 0o600 });
   chmodSync(opsTokenFile, 0o600);
 
-  for (const d of [identityDir, vaultDir]) writeFileSync(join(d, GEN), withoutAi(readFileSync(join(d, "wrangler.toml"), "utf8")));
+  // Which config, environment and D1 name the two workers run from.
+  let envArgs: string[] = ["--env", "staging"];
+  let d1Name = "parachute-identity-staging";
+  if (profile.kind === "personal") {
+    // The checkout's own single-owner profile (deploy/personal/render.sh), for a made-up owner. Its rendered files are
+    // read and removed; what runs is this door's own copy, so a real rendered profile is never touched.
+    const render = join(repo, "deploy", "personal", "render.sh");
+    if (!existsSync(render)) throw new Error(`door: ${repo} has no deploy/personal profile`);
+    const prefix = `doorrun-${randomBytes(3).toString("hex")}`;
+    const profileFile = join(state, "profile.env");
+    writeFileSync(profileFile, `ACCOUNT_ID=${"0".repeat(32)}\nPREFIX=${prefix}\nOWNER_PUBKEY=${profile.ownerPubkey}\nADMIN_PUBKEYS=\nOWNER_PLAN=${profile.plan ?? "power"}\n`);
+    const rendered = [join(identityDir, "wrangler.personal.gen.toml"), join(vaultDir, "wrangler.personal.gen.toml")];
+    if (rendered.some((f) => existsSync(f))) throw new Error("door: this checkout already holds a rendered personal profile; use a checkout of its own");
+    const r = Bun.spawnSync(["bash", render, profileFile, "00000000-0000-4000-8000-000000000000", "local"], { stdout: "pipe", stderr: "pipe" });
+    if (r.exitCode !== 0) throw new Error(`door: rendering the personal profile failed: ${r.stderr.toString().slice(-400)}`);
+    writeFileSync(join(identityDir, GEN), withoutAi(readFileSync(rendered[0]!, "utf8")));
+    writeFileSync(join(vaultDir, GEN), withoutAi(readFileSync(rendered[1]!, "utf8")));
+    for (const f of rendered) rmSync(f, { force: true });
+    envArgs = [];
+    d1Name = `${prefix}-identity`;
+  } else {
+    for (const d of [identityDir, vaultDir]) writeFileSync(join(d, GEN), withoutAi(readFileSync(join(d, "wrangler.toml"), "utf8")));
+  }
   // The identity worker serves the app's files from dist-assets. A door test needs none of them: the same stub the
   // worker's own tests make. A real build is left alone.
   const assets = join(identityDir, "dist-assets");
@@ -105,7 +135,7 @@ export async function startWorkersDoor(opts: {
   const logFile = (n: string) => join(state, `${n}.log`);
   const logs = () => ["migrate", "vault", "identity"].map((n) => (existsSync(logFile(n)) ? `== ${n}\n${readFileSync(logFile(n), "utf8").replace(/\x1b\[[0-9;]*m/g, "")}` : "")).join("\n");
 
-  const mig = Bun.spawn([...wrangler(identityDir), "d1", "migrations", "apply", "parachute-identity-staging", "--local", "--env", "staging", "-c", GEN, "--persist-to", state], {
+  const mig = Bun.spawn([...wrangler(identityDir), "d1", "migrations", "apply", d1Name, "--local", ...envArgs, "-c", GEN, "--persist-to", state], {
     cwd: identityDir,
     env,
     stdout: Bun.file(logFile("migrate")),
@@ -118,7 +148,7 @@ export async function startWorkersDoor(opts: {
   const procs: ReturnType<typeof Bun.spawn>[] = [];
   const dev = (dir: string, port: number, name: string, v: Record<string, string>) => {
     const p = Bun.spawn(
-      [...wrangler(dir), "dev", "-c", GEN, "--env", "staging", "--ip", "127.0.0.1", "--port", String(port), "--inspector-port", "0", "--persist-to", state, "--show-interactive-dev-session=false", ...vars(v)],
+      [...wrangler(dir), "dev", "-c", GEN, ...envArgs, "--ip", "127.0.0.1", "--port", String(port), "--inspector-port", "0", "--persist-to", state, "--show-interactive-dev-session=false", ...vars(v)],
       { cwd: dir, env, stdout: Bun.file(logFile(name)), stderr: Bun.file(logFile(name)), stdin: "ignore" },
     );
     procs.push(p);
@@ -181,4 +211,27 @@ export async function signUp(issuer: string): Promise<{ cookie: string; csrf: st
   const session = cookieVal(v.headers.getSetCookie(), "parachute_id_session");
   if (!session) throw new Error(`door: the sign-up link gave no session (status ${v.status})`);
   return { cookie: `parachute_id_session=${session}; parachute_id_csrf=${csrf}`, csrf, email, password };
+}
+
+/** A made-up owner key for one run: 32 random bytes, and its public half. */
+export async function makeOwnerKey(): Promise<{ secretKey: string; pubkey: string }> {
+  const { schnorr } = await import("@noble/curves/secp256k1.js");
+  const sk = randomBytes(32);
+  return { secretKey: sk.toString("hex"), pubkey: Buffer.from(schnorr.getPublicKey(sk)).toString("hex") };
+}
+
+/** NIP-98: the `Authorization` header that proves a key for one request (kind 27235, `u`, `method`, `payload`). */
+export async function nostrAuthorization(secretKey: string, url: string, method: string, body?: string, extraTags: string[][] = []): Promise<string> {
+  const { schnorr } = await import("@noble/curves/secp256k1.js");
+  const { createHash } = await import("node:crypto");
+  const sk = Buffer.from(secretKey, "hex");
+  const pubkey = Buffer.from(schnorr.getPublicKey(sk)).toString("hex");
+  // An event's id is a hash of its fields, and a door accepts each id once. Two sign-ins by one key within the same
+  // second would otherwise be the same event; a random tag keeps them apart.
+  const tags = [["u", url], ["method", method], ["nonce", randomBytes(8).toString("hex")], ...extraTags];
+  if (body) tags.push(["payload", createHash("sha256").update(body).digest("hex")]);
+  const created_at = Math.floor(Date.now() / 1000);
+  const id = createHash("sha256").update(JSON.stringify([0, pubkey, created_at, 27235, tags, ""])).digest("hex");
+  const sig = Buffer.from(schnorr.sign(Buffer.from(id, "hex"), sk)).toString("hex");
+  return `Nostr ${Buffer.from(JSON.stringify({ id, pubkey, created_at, kind: 27235, tags, content: "", sig })).toString("base64")}`;
 }

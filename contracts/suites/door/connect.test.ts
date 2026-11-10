@@ -1,8 +1,8 @@
 // Surface E: connecting an app and holding keys. The OAuth path a consumer AI app takes, and the account door a
 // person's own app takes. A connector built against one door must connect to every door.
 import { beforeAll, describe, expect, test } from "bun:test";
-import { accountToken, accountTokenReply, door, fp, fpEach, mcp, mcpUrl, rest, runId, safeFetch, shape, vaultTokenReply, vaultUrl } from "./_door.ts";
-import { connect, type Connected, type Discovery } from "./_connect.ts";
+import { accountToken, accountTokenReply, door, fp, fpEach, lacks, mcp, mcpUrl, rest, runId, safeFetch, shape, vaultTokenReply, vaultUrl } from "./_door.ts";
+import { connect, discover, type Connected, type Discovery } from "./_connect.ts";
 
 const claimsOf = (jwt: string) => JSON.parse(Buffer.from(jwt.split(".")[1]!, "base64url").toString());
 const refreshWith = (c: Connected, refresh: string) =>
@@ -16,19 +16,50 @@ const usable = async (access: string) => {
   return r.status;
 };
 
-describe("connecting an app (OAuth)", () => {
-  let app: Connected & Discovery;
-  beforeAll(async () => {
-    app = await connect({ appName: `Door app ${runId("app")}` });
-  });
-
-  test("discovery tells an app the same things at every door", () => {
-    const { as, prm } = app;
+describe("what an app is told before it connects", () => {
+  test("discovery tells an app the same things at every door", async () => {
+    const { as, prm } = await discover();
     for (const k of ["registration_endpoint", "authorization_endpoint", "token_endpoint"]) expect(new URL(as[k]).origin).toBe(door().issuer);
     expect(as.code_challenge_methods_supported).toContain("S256");
     expect(as.token_endpoint_auth_methods_supported).toContain("none");
     expect(prm.scopes_supported).toContain(`vault:${door().vault}:read`);
     fpEach("connect/authorization-server", as);
+    fp("connect/admin-scope.advertised", prm.scopes_supported.includes(`vault:${door().vault}:admin`));
+  });
+
+  test("an app registers itself", async () => {
+    const { as } = await discover();
+    const reg = await safeFetch(as.registration_endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ client_name: `Door app ${runId("app")}`, redirect_uris: ["https://consumer-app.example/oauth/callback"], token_endpoint_auth_method: "none", grant_types: ["authorization_code", "refresh_token"], response_types: ["code"] }),
+    });
+    expect([200, 201]).toContain(reg.status);
+    const body = await reg.json();
+    expect(body.client_id).toBeString();
+    fp("connect/registration.reply.keys", Object.keys(body).sort());
+    const bad = await safeFetch(as.registration_endpoint, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ client_name: "x", redirect_uris: ["javascript:alert(1)"] }) });
+    fp("connect/refusal.bad-redirect", { status: bad.status, error: (await bad.json().catch(() => ({}))).error ?? null });
+  });
+
+  test("the published keys and the revocation list are where an app looks for them", async () => {
+    const d = door();
+    const jwks = await safeFetch(`${d.issuer}/.well-known/jwks.json`);
+    expect(jwks.status).toBe(200);
+    const keys = (await jwks.json()).keys;
+    expect(keys.length).toBeGreaterThanOrEqual(1);
+    fp("connect/jwks.key", { kty: keys[0].kty, alg: keys[0].alg ?? null, use: keys[0].use ?? null });
+    const rev = await safeFetch(`${d.issuer}/.well-known/parachute-revocation.json`);
+    fp("connect/revocation-list", { status: rev.status, shape: rev.status === 200 ? shape(await rev.json()) : null });
+  });
+});
+
+// The person's approval happens on the door's consent screen, in a browser session. A door whose owner signs in only
+// with a key has no such session yet, so an app can't be approved there: named in deliberate.json.
+describe.skipIf(lacks("oauth-approval"))("connecting an app (OAuth)", () => {
+  let app: Connected & Discovery;
+  beforeAll(async () => {
+    app = await connect({ appName: `Door app ${runId("app")}` });
   });
 
   test("the token reply and the token's claims have the same shape", () => {
@@ -97,13 +128,11 @@ describe("connecting an app (OAuth)", () => {
   });
 
   test("an app can ask for admin, and gets what the person approved", async () => {
-    const d = door();
     const asked = await connect({ appName: `Admin app ${runId("app")}`, scope: (v) => `vault:${v}:read vault:${v}:write vault:${v}:admin` }).then(
       (c) => ({ granted: c.scope.split(" ").map((s) => s.split(":").pop()).sort().join(" ") }),
       (e) => ({ refused: String(e.message).slice(0, 80) }),
     );
     fp("connect/admin-scope", asked);
-    fp("connect/admin-scope.advertised", app.prm.scopes_supported.includes(`vault:${d.vault}:admin`));
   });
 
   test("a revoked app stops working", async () => {
@@ -132,16 +161,6 @@ describe("connecting an app (OAuth)", () => {
     }
   });
 
-  test("the published keys and the revocation list are where an app looks for them", async () => {
-    const d = door();
-    const jwks = await safeFetch(`${d.issuer}/.well-known/jwks.json`);
-    expect(jwks.status).toBe(200);
-    const keys = (await jwks.json()).keys;
-    expect(keys.length).toBeGreaterThanOrEqual(1);
-    fp("connect/jwks.key", { kty: keys[0].kty, alg: keys[0].alg ?? null, use: keys[0].use ?? null });
-    const rev = await safeFetch(`${d.issuer}/.well-known/parachute-revocation.json`);
-    fp("connect/revocation-list", { status: rev.status, shape: rev.status === 200 ? shape(await rev.json()) : null });
-  });
 });
 
 describe("the account door (a person's own app)", () => {

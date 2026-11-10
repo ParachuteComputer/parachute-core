@@ -19,8 +19,8 @@ import { enterSandbox, inSandbox } from "../sandbox.ts";
 import { loadCandidate, prepareInfo, runCli } from "../candidate.ts";
 import { safeFetch } from "../guard.ts";
 import type { Door } from "../../suites/door/_door.ts";
-import { startBoxDoor } from "./box.ts";
-import { signUp, startWorkersDoor } from "./workers.ts";
+import { linkOwnerKeyOnBox, startBoxDoor } from "./box.ts";
+import { makeOwnerKey, nostrAuthorization, signUp, startWorkersDoor } from "./workers.ts";
 import { compare, readFingerprint, type Deliberate } from "./compare.ts";
 import { recordExport } from "../../suites/door/_exit.ts";
 import { appendFileSync, readdirSync, statSync } from "node:fs";
@@ -88,8 +88,15 @@ async function startBox(): Promise<Started> {
   const other = `other${randomBytes(3).toString("hex")}`;
   await ensureVault(box.issuer, await accountBearer(box.issuer, box.session), other);
   const release = /\b0\.9\./.test(JSON.stringify(manifest.version ?? "")) ? "0.9" : "0.8";
+  // A 0.9 box: link a made-up key to the admin's account through the account door, as its owner would.
+  let ownerKey: string | undefined;
+  if (release === "0.9") {
+    const owner = await makeOwnerKey();
+    await linkOwnerKeyOnBox(box.issuer, box.session, owner.secretKey, box.admin.password);
+    ownerKey = owner.secretKey;
+  }
   return {
-    door: { kind: "box", label: `box-${release}`, release, issuer: box.issuer, vaultOrigin: box.vaultOrigin, vault: box.vault, otherVault: other, signIn: { how: "cookie", ...box.session } },
+    door: { kind: "box", label: `box-${release}`, release, issuer: box.issuer, vaultOrigin: box.vaultOrigin, vault: box.vault, otherVault: other, signIn: { how: "cookie", ...box.session }, ...(ownerKey ? { ownerKey } : {}) },
     provenance: `box: candidate ${sha256.slice(0, 16)} (${manifest.name}, profile ${manifest.profile}, core ${manifest.core_commit})`,
     exportFiles: async () => {
       const dir = join(info.scratch, `export-${randomBytes(3).toString("hex")}`);
@@ -142,7 +149,41 @@ async function startCloud(): Promise<Started> {
   }
 }
 
-const starters: Record<string, () => Promise<Started>> = { box: startBox, cloud: startCloud };
+/** The owner of a key-only door signs in with the key: NIP-98 on POST /account/token. */
+async function accountBearerByKey(issuer: string, secretKey: string): Promise<string> {
+  const url = `${issuer}/account/token`;
+  const r = await safeFetch(url, { method: "POST", headers: { authorization: await nostrAuthorization(secretKey, url, "POST") } });
+  const j: any = await r.json().catch(() => ({}));
+  if (!r.ok || !j.token) throw new Error(`door: the owner key's sign-in gave ${r.status}: ${JSON.stringify(j).slice(0, 200)}`);
+  return j.token;
+}
+
+async function startPersonal(): Promise<Started> {
+  const repo = resolve(process.env.PERSONAL_REPO ?? "");
+  if (!process.env.PERSONAL_REPO || !existsSync(join(repo, "deploy", "personal"))) throw new Error("door: set PERSONAL_REPO to a parachute-cloud checkout that has deploy/personal");
+  const owner = await makeOwnerKey();
+  const w = await startWorkersDoor({ repo, scratch, label: "personal", profile: { kind: "personal", ownerPubkey: owner.pubkey } });
+  try {
+    const bearer = await accountBearerByKey(w.issuer, owner.secretKey);
+    const id = randomBytes(3).toString("hex");
+    const vault = `door${id}`;
+    const other = `other${id}`;
+    await ensureVault(w.issuer, bearer, vault);
+    await ensureVault(w.issuer, bearer, other);
+    return {
+      door: { kind: "personal", label: "personal-0.9", release: "0.9", issuer: w.issuer, vaultOrigin: w.vaultOrigin, vault, otherVault: other, signIn: { how: "nostr", secretKey: owner.secretKey }, ownerKey: owner.secretKey },
+      provenance: `personal: parachute-cloud ${gitHead(repo)} (deploy/personal profile), core pin ${corePin(repo)}, local workerd`,
+      stop: w.stop,
+      logs: w.logs,
+    };
+  } catch (err) {
+    const tail = w.logs();
+    await w.stop();
+    throw new Error(`${(err as Error).message}\n${tail.slice(-1500)}`);
+  }
+}
+
+const starters: Record<string, () => Promise<Started>> = { box: startBox, cloud: startCloud, personal: startPersonal };
 
 let failed = 0;
 const lines: string[] = [];
