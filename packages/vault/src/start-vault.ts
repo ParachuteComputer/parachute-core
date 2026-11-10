@@ -698,7 +698,11 @@ export async function startVault(opts: StartVaultOptions = {}): Promise<RunningV
         const corsHeaders = {
           "Access-Control-Allow-Origin": "*",
           "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type, Authorization, X-API-Key, Mcp-Session-Id",
+          // The Mcp-* request headers are what a browser MCP client sends after it has connected
+          // (`Mcp-Protocol-Version` on every call; `Mcp-Method` and `Mcp-Name` from the 2026 revision). Without them
+          // here the browser's preflight fails and a web app can list tools on Parachute Cloud but not on a box.
+          // The same list as cloud's vault worker; the door contracts compare the two (suites/door/rest.test.ts).
+          "Access-Control-Allow-Headers": "Content-Type, Authorization, X-API-Key, Mcp-Session-Id, Mcp-Protocol-Version, Mcp-Method, Mcp-Name",
           // Expose response headers a BROWSER-based MCP client (e.g. claude.ai) must
           // read cross-origin: `WWW-Authenticate` carries the RFC 9728 auth challenge
           // (the `resource_metadata` PRM URL) the client follows to discover the auth

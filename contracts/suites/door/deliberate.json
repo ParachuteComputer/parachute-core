@@ -1,23 +1,109 @@
 {
-  "comment": "Every difference between doors that the door contracts allow. An entry is a fact, a reason and an owner. See harness/doors/compare.ts.",
+  "comment": "Every difference between doors that the door contracts allow. An entry names the facts it excuses (harness/doors/compare.ts), says why in words a person building an app can act on, and names who decides whether it stays. `deliberate` is meant; `drift` is not meant and not yet fixed. An entry that excuses nothing fails the comparison, so this list can't outlive the differences.",
   "differences": [
     {
       "id": "export-over-http",
-      "keys": [
-        "has/export-over-http",
-        "exit/http.headers"
-      ],
-      "between": [
-        "box",
-        "cloud",
-        "personal"
-      ],
-      "lacks": [
-        "box"
-      ],
-      "why": "A box exports with its own command (`parachute-vault export`); cloud-style doors stream the same files from `GET /api/export`. The files are the same (compared under exit/file.*). A box gets the HTTP exit with 0.9.3.",
+      "keys": ["has/export-over-http", "exit/http.headers"],
+      "between": ["box", "cloud", "personal"],
+      "lacks": ["box"],
+      "status": "drift",
       "owner": "0.9.3 \"the exit\"",
-      "status": "drift"
+      "why": "A box exports with its own command (`parachute-vault export`); cloud-style doors stream the same files from `GET /api/export`. The files themselves are compared and equal (exit/file.*). An app that offers \"download my vault\" can do it over HTTP on cloud only."
+    },
+    {
+      "id": "account-unknown-vault",
+      "keys": ["account/refusal.unknown-vault"],
+      "between": ["box", "cloud", "personal"],
+      "status": "deliberate",
+      "owner": "cloud's multi-tenant identity",
+      "why": "Asking the account door for a vault that isn't yours: cloud answers 403 `not_owner` whether or not the name exists, so one account can't probe another's vault names. A box has one account and answers 404 `vault_not_found`. Treat both as \"not yours\"."
+    },
+    {
+      "id": "account-token-lifetime",
+      "keys": ["account/vault-token.lifetime"],
+      "between": ["box", "cloud", "personal"],
+      "status": "drift",
+      "owner": "Aaron (one door-contract, audit L1-04)",
+      "why": "A vault credential minted through the account door lasts 90 days on a box and 15 minutes on cloud. An app must read `expires_at` and mint again; one that stores the credential works for months on a box and breaks in a quarter of an hour on cloud."
+    },
+    {
+      "id": "account-reply-fields",
+      "keys": [
+        "account/vault-token.reply.services",
+        "account/vault.create.reply.keys",
+        "account/vault.create.reply.services",
+        "account/vault.create.reply.token_guidance",
+        "account/vault.create.reply.vault_id",
+        "account/vault.delete.report",
+        "account/vaults.item.keys",
+        "account/vaults.item.caps",
+        "account/vaults.item.created_at",
+        "account/vaults.item.mcp_url",
+        "account/vaults.item.usage",
+        "account/vaults.item.vault_id",
+        "account/vaults.item.version"
+      ],
+      "between": ["box", "cloud", "personal"],
+      "status": "drift",
+      "owner": "one door-contract (audit L1-04)",
+      "why": "The account door's replies share `name`, `url`, `vault_token` and `services[\"vault:<name>\"]` on every door, and the contracts hold those. Beyond them each door adds its own: cloud lists `vault_id`, `created_at`, `mcp_url`, `usage` and a second `services.vault` key; a box lists `caps`, `version` and `token_guidance`; the delete reply reports each runtime's own clean-up. Build on the shared fields; derive the MCP address as `<url>/mcp`."
+    },
+    {
+      "id": "admin-scope-not-advertised",
+      "keys": ["connect/admin-scope.advertised", "connect/authorization-server.scopes_supported", "mcp/protected-resource.scopes_supported"],
+      "between": ["box", "cloud", "personal"],
+      "status": "drift",
+      "owner": "Aaron (also audit L2-10: should an AI connector be offered admin at all)",
+      "why": "Both doors grant `vault:<name>:admin` to an app that asks and is approved. A box lists it in `scopes_supported`; cloud lists only read and write. A connector that asks for what is advertised can declare types on a box and not on cloud."
+    },
+    {
+      "id": "mcp-instructions",
+      "keys": ["mcp/read.instructions.sections", "mcp/write.instructions.sections", "mcp/admin.instructions.sections", "mcp/refusal.message-names-its-type"],
+      "between": ["box", "cloud", "personal"],
+      "releases": ["0.8"],
+      "status": "drift",
+      "owner": "0.9.0 cloud parity (audit L1-01, delta 36): the AI-facing text moves into the engine",
+      "why": "A model connecting to a box is told the vault's address, how to query, how files move and how to script it (seven sections). On cloud it gets the description and one line. A refused tool call's message starts with `[error_type]` on a box only; the code and the structured `data` are the same on both."
+    },
+    {
+      "id": "manage-token-tool",
+      "keys": ["mcp/admin.tool.manage-token.*", "mcp/admin.tool-count"],
+      "between": ["box", "cloud", "personal"],
+      "status": "deliberate",
+      "owner": "spec §8 (keys): on cloud a key is an approved OAuth app, managed in the account",
+      "why": "A box's admin sees a `manage-token` tool for the hub's tokens. Cloud has no hub token store: connections are listed and revoked through the account door."
+    },
+    {
+      "id": "discovery-address-form",
+      "keys": ["mcp/cold.challenge"],
+      "between": ["box", "cloud", "personal"],
+      "status": "drift",
+      "owner": "one door-contract (audit L1-04)",
+      "why": "The 401 from MCP names the protected-resource document at `/vault/<name>/.well-known/oauth-protected-resource` on a box and at `/.well-known/oauth-protected-resource/vault/<name>/mcp` on cloud. Both addresses answer with the same document on every door (held by mcp/protected-resource.at.*), so a client that follows the header works everywhere."
+    },
+    {
+      "id": "new-vault-seed",
+      "keys": ["rest/new-vault.tags"],
+      "between": ["box", "cloud", "personal"],
+      "status": "drift",
+      "owner": "audit L1-08: one seed in the engine",
+      "why": "A new vault holds the same starter notes on every door. A box also declares a `capture` type; cloud doesn't."
+    },
+    {
+      "id": "plan-caps-in-vault-info",
+      "keys": ["rest/vault-root.keys", "rest/vault-root.cap_bytes", "rest/vault-root.caps", "rest/vault.transcription"],
+      "between": ["box", "cloud", "personal"],
+      "status": "deliberate",
+      "owner": "cloud's plans and metered voice",
+      "why": "Cloud's vault info carries what the plan allows: `cap_bytes`, `caps`, and voice minutes left. A box has no plans."
+    },
+    {
+      "id": "provider-state-in-vault-info",
+      "keys": ["rest/vault-root.embeddings", "rest/vault-root.transcription", "rest/vault.embeddings"],
+      "between": ["box", "cloud", "personal"],
+      "status": "drift",
+      "owner": "0.9.3 one settings file and admin API",
+      "why": "`GET /vault/<name>` shows `embeddings` and `transcription` on cloud only; `GET /api/vault` shows `embeddings.state` on a box only. An app that shows whether semantic search is ready reads a different field per door."
     }
   ]
 }

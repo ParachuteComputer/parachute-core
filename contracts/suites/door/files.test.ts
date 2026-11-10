@@ -91,6 +91,26 @@ describe("files", () => {
       const again = await safeFetch(url, { method: ticket.method ?? "PUT", headers: { "content-type": "image/png" }, body: bytes });
       expect(again.status).toBe(404);
 
+      // The model's own way to look at a file: an image comes back as a real image block, text as a window.
+      expect(names).toContain("read-attachment");
+      const attId = (await reader.get(`/notes/${note.body.id}/attachments`)).body;
+      const first = (Array.isArray(attId) ? attId : attId.attachments)[0].id;
+      const seen: any = await c.client.callTool({ name: "read-attachment", arguments: { attachment_id: first } });
+      fp("files/read-attachment.image", { isError: seen.isError ?? false, blocks: (seen.content ?? []).map((b: any) => b.type), mime: (seen.content ?? []).find((b: any) => b.type === "image")?.mimeType ?? null });
+      const image = (seen.content ?? []).find((b: any) => b.type === "image");
+      expect(image, JSON.stringify(seen).slice(0, 300)).toBeTruthy();
+      expect(sha256(new Uint8Array(Buffer.from(image.data, "base64")))).toBe(sha256(bytes));
+
+      const text = new TextEncoder().encode("line one\nline two\n".repeat(50));
+      const tnote = await api.post("/notes", { content: "has text", path: `${runId("files")}/txt` });
+      const tup = await upload(text, "notes.txt", "text/plain");
+      if (tup.status === 201) {
+        const tatt = await api.post(`/notes/${tnote.body.id}/attachments`, { path: tup.body.path, mimeType: "text/plain" });
+        const window: any = await c.call("read-attachment", { attachment_id: tatt.body.id, content_offset: 0, content_length: 64 });
+        fp("files/read-attachment.text", shape(window));
+        expect(String(window.content)).toStartWith("line one");
+      }
+
       const listed = await reader.get(`/notes/${note.body.id}/attachments`);
       const atts = Array.isArray(listed.body) ? listed.body : listed.body.attachments;
       expect(atts.length).toBe(1);

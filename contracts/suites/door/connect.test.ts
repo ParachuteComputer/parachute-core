@@ -1,7 +1,7 @@
 // Surface E: connecting an app and holding keys. The OAuth path a consumer AI app takes, and the account door a
 // person's own app takes. A connector built against one door must connect to every door.
 import { beforeAll, describe, expect, test } from "bun:test";
-import { accountToken, accountTokenReply, door, fp, mcp, mcpUrl, rest, runId, safeFetch, shape, vaultTokenReply, vaultUrl } from "./_door.ts";
+import { accountToken, accountTokenReply, door, fp, fpEach, mcp, mcpUrl, rest, runId, safeFetch, shape, vaultTokenReply, vaultUrl } from "./_door.ts";
 import { connect, type Connected, type Discovery } from "./_connect.ts";
 
 const claimsOf = (jwt: string) => JSON.parse(Buffer.from(jwt.split(".")[1]!, "base64url").toString());
@@ -28,8 +28,7 @@ describe("connecting an app (OAuth)", () => {
     expect(as.code_challenge_methods_supported).toContain("S256");
     expect(as.token_endpoint_auth_methods_supported).toContain("none");
     expect(prm.scopes_supported).toContain(`vault:${door().vault}:read`);
-    fp("connect/authorization-server", as);
-    fp("connect/protected-resource", prm);
+    fpEach("connect/authorization-server", as);
   });
 
   test("the token reply and the token's claims have the same shape", () => {
@@ -165,13 +164,16 @@ describe("the account door (a person's own app)", () => {
     const listed = await list.json();
     const vaults = Array.isArray(listed) ? listed : listed.vaults;
     expect(vaults.map((v: any) => v.name)).toContain(d.vault);
-    fp("account/vaults.reply.shape", shape(Array.isArray(listed) ? [listed.find((v: any) => v.name === d.vault)] : { ...listed, vaults: [vaults.find((v: any) => v.name === d.vault)] }));
+    const mine = vaults.find((v: any) => v.name === d.vault);
+    expect(mine.url).toBe(`${d.vaultOrigin}/vault/${d.vault}`);
+    fp("account/vaults.reply.envelope", Array.isArray(listed) ? "array" : Object.keys(listed).sort());
+    fpEach("account/vaults.item", mine);
 
     const minted = await vaultTokenReply(d.vault, [`vault:${d.vault}:read`]);
     expect(minted.status).toBe(200);
     const body = await minted.json();
     expect(body.vault_token).toBeString();
-    fp("account/vault-token.reply.shape", shape(body));
+    fpEach("account/vault-token.reply", body);
     const c = claimsOf(body.vault_token);
     expect(c.aud).toBe(`vault.${d.vault}`);
     expect(c.scope).toBe(`vault:${d.vault}:read`);
@@ -200,7 +202,7 @@ describe("the account door (a person's own app)", () => {
     const name = `tmp${runId("v")}`;
     const made = await safeFetch(`${d.issuer}/account/vaults`, { method: "POST", headers: bearer, body: JSON.stringify({ name }) });
     expect(made.status).toBe(201);
-    fp("account/vault.create.reply.shape", shape(await made.json()));
+    fpEach("account/vault.create.reply", await made.json());
     const again = await safeFetch(`${d.issuer}/account/vaults`, { method: "POST", headers: bearer, body: JSON.stringify({ name }) });
     expect(again.status).toBe(409);
     fp("account/refusal.vault-taken", { status: again.status, error: (await again.json()).error ?? null });
@@ -209,7 +211,8 @@ describe("the account door (a person's own app)", () => {
     fp("account/refusal.vault-name", { status: bad.status, error: (await bad.json()).error ?? null });
     expect((await rest("read", name).get("/notes?limit=1")).status).toBe(200);
     const gone = await safeFetch(`${d.issuer}/account/vaults/${name}`, { method: "DELETE", headers: bearer, body: JSON.stringify({ confirm: name }) });
-    fp("account/vault.delete", { status: gone.status, shape: shape(await gone.json().catch(() => null)) });
+    fp("account/vault.delete.status", gone.status);
+    fp("account/vault.delete.report", Object.keys((await gone.json().catch(() => null)) ?? {}).sort());
     expect(gone.status).toBeLessThan(300);
   });
 });

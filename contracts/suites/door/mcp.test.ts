@@ -1,7 +1,7 @@
 // Surface D: the vault over MCP. An AI app sees a tool list, each tool's description and input schema, and results.
 // Those are the product for an AI client, so they are compared exactly: same tools, same words, same schemas.
 import { describe, expect, test } from "bun:test";
-import { door, fp, mcp, mcpUrl, runId, safeFetch, sha, shape, token } from "./_door.ts";
+import { door, fp, fpEach, mcp, mcpUrl, runId, safeFetch, sha, shape, token } from "./_door.ts";
 
 describe("the vault over MCP", () => {
   test("no credential: 401 that tells an app where to sign in", async () => {
@@ -17,7 +17,16 @@ describe("the vault over MCP", () => {
     fp("mcp/cold.challenge", www);
     const doc = await (await safeFetch(prm!)).json();
     expect(doc.resource).toBe(mcpUrl());
-    fp("mcp/protected-resource", doc);
+    fpEach("mcp/protected-resource", doc);
+    // RFC 9728 allows the document at either address; a client may build either. Both must answer, the same.
+    const d = door();
+    for (const [form, url] of [
+      ["well-known-first", `${d.vaultOrigin}/.well-known/oauth-protected-resource/vault/${d.vault}/mcp`],
+      ["vault-first", `${d.vaultOrigin}/vault/${d.vault}/.well-known/oauth-protected-resource`],
+    ] as const) {
+      const r = await safeFetch(url);
+      fp(`mcp/protected-resource.at.${form}`, { status: r.status, same: r.status === 200 ? JSON.stringify(await r.json()) === JSON.stringify(doc) : false });
+    }
   });
 
   for (const level of ["read", "write", "admin"] as const) {
@@ -25,14 +34,20 @@ describe("the vault over MCP", () => {
       const c = await mcp(level);
       try {
         const tools = await c.tools();
-        fp(`mcp/${level}.tools`, tools.map((t) => t.name));
+        // One fact per tool, so a door that lacks one tool is exactly one named difference.
+        fp(`mcp/${level}.tool-count`, tools.length);
         for (const t of tools) {
+          fp(`mcp/${level}.tool.${t.name}.present`, true);
           fp(`mcp/${level}.tool.${t.name}.schema`, sha(t.inputSchema));
           fp(`mcp/${level}.tool.${t.name}.words`, sha(t.description ?? ""));
           fp(`mcp/${level}.tool.${t.name}.hints`, t.annotations ?? null);
         }
         const init: any = (c.client as any).getServerVersion?.() ?? null;
-        fp(`mcp/${level}.server`, { name: init?.name ?? null, instructions: sha((c.client as any).getInstructions?.() ?? "") });
+        fp(`mcp/${level}.server.name`, init?.name ?? null);
+        // The instructions orient a model the moment it connects. They hold the vault's own counts and names, so
+        // they are compared by what they cover (their section headings), not byte for byte.
+        const instructions: string = (c.client as any).getInstructions?.() ?? "";
+        fp(`mcp/${level}.instructions.sections`, instructions.split("\n").filter((l) => l.startsWith("## ")).map((l) => l.slice(3).trim()));
         fp(`mcp/${level}.capabilities`, Object.keys((c.client as any).getServerCapabilities?.() ?? {}).sort());
       } finally {
         await c.close();
@@ -55,8 +70,16 @@ describe("the vault over MCP", () => {
       const seen = one.updatedAt ?? one.note?.updatedAt ?? one.notes?.[0]?.updatedAt;
       const up = await c.call("update-note", { id: `${r}/one`, content: `again ${r}`, if_updated_at: seen });
       fp("mcp/update-note.result.shape", shape(up));
-      const blind = await c.call("update-note", { id: `${r}/one`, content: "blind" }).then(() => "accepted", (e) => String(e.message).replace(new RegExp(r, "g"), "<r>").slice(0, 60));
-      fp("mcp/update-note.blind", blind);
+      // A refused call: the JSON-RPC code and the structured `data` are what an app branches on; the message is
+      // for the model. The message's lead-in is recorded apart, since doors may word it differently.
+      const blind: any = await c.client.callTool({ name: "update-note", arguments: { id: `${r}/one`, content: "blind" } }).then(() => null, (e) => e);
+      expect(blind).toBeTruthy();
+      fp("mcp/refusal.blind-update", { code: blind.code ?? null, type: blind.data?.error_type ?? null, keys: Object.keys(blind.data ?? {}).sort(), hint: blind.data?.hint ? sha(blind.data.hint) : null });
+      fp("mcp/refusal.message-names-its-type", /\[precondition_required\]/.test(String(blind.message)));
+      const dup: any = await c.client.callTool({ name: "create-note", arguments: { path: `${r}/one`, content: "dup" } }).then(() => null, (e) => e);
+      fp("mcp/refusal.path-taken", { code: dup?.code ?? null, type: dup?.data?.error_type ?? null, keys: Object.keys(dup?.data ?? {}).sort() });
+      const none: any = await c.client.callTool({ name: "query-notes", arguments: { id: `${r}/nope` } });
+      fp("mcp/query-notes.no-such-note", { isError: none.isError ?? false, shape: shape(JSON.parse(none.content?.[0]?.text ?? "null")) });
       const info = await c.call("vault-info", {});
       fp("mcp/vault-info.result.keys", Object.keys(info).sort());
       const tags = await c.call("list-tags", {});
@@ -92,7 +115,7 @@ describe("the vault over MCP", () => {
     }
     try {
       fp("mcp/root.connect", "connected");
-      fp("mcp/root.tools", (await c.tools()).map((t) => t.name));
+      fp("mcp/root.same-tools-as-the-vault", JSON.stringify((await c.tools()).map((t) => t.name)) === JSON.stringify(await (async () => { const v = await mcp("read"); try { return (await v.tools()).map((t) => t.name); } finally { await v.close(); } })()));
     } finally {
       await c.close();
     }

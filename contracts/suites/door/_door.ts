@@ -232,7 +232,9 @@ export function neutral(value: unknown): unknown {
   const text = (s: string) => {
     let out = s;
     for (const [from, to] of swaps) out = out.split(from).join(to);
-    out = out.split(`/vault/${d.vault}`).join("/vault/<v>").split(`vault:${d.vault}:`).join("vault:<v>:").split(`vault.${d.vault}`).join("vault.<v>");
+    for (const [name, mark] of [[d.vault, "<v>"], [d.otherVault, "<other>"]] as const) {
+      for (const lead of ["/vault/", "vault:", "vault.", "parachute-vault/", 'Vault "', 'vault "']) out = out.split(`${lead}${name}`).join(`${lead}${mark}`);
+    }
     return out.replace(/<vault-origin>|<issuer>/g, "<door>").replace(/<vault-host>|<issuer-host>/g, "<door-host>");
   };
   const walk = (v: unknown): unknown =>
@@ -241,7 +243,7 @@ export function neutral(value: unknown): unknown {
       : Array.isArray(v)
         ? v.map(walk)
         : v && typeof v === "object"
-          ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, walk((v as Record<string, unknown>)[k])]))
+          ? Object.fromEntries(Object.keys(v).map((k) => [text(k), walk((v as Record<string, unknown>)[k])] as const).sort(([x], [y]) => x.localeCompare(y)))
           : v;
   return walk(value);
 }
@@ -267,11 +269,19 @@ export function fp(key: string, value: unknown): void {
 }
 
 /** Status and error code of a reply, the part of a refusal an app branches on: never the message, which names the
- *  run's own notes. `error` is kept only when it is a code. */
-export function refusal(r: Reply): { status: number; error: unknown; type: unknown; keys: string[] } {
+ *  run's own notes. `error` is kept only when it is a code. `hint` is what the door tells the caller to do next;
+ *  its words are compared by hash, since an AI caller acts on them. */
+export function refusal(r: Reply): { status: number; error: unknown; type: unknown; keys: string[]; hint: string | null } {
   const b = r.body && typeof r.body === "object" ? (r.body as Record<string, unknown>) : {};
   const code = (v: unknown) => (typeof v === "string" && /^[a-z0-9_.-]{1,60}$/i.test(v) ? v : v === undefined ? null : "(text)");
-  return { status: r.status, error: code(b.error ?? b.code), type: code(b.error_type), keys: Object.keys(b).sort() };
+  return { status: r.status, error: code(b.error ?? b.code), type: code(b.error_type), keys: Object.keys(b).sort(), hint: typeof b.hint === "string" ? sha(b.hint) : null };
+}
+
+/** Record each top-level key of a reply as its own fact, so a named difference can be exactly one key wide. */
+export function fpEach(prefix: string, value: unknown): void {
+  const o = value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+  fp(`${prefix}.keys`, Object.keys(o).sort());
+  for (const k of Object.keys(o)) fp(`${prefix}.${k}`, shape(o[k]));
 }
 
 /** A content type without its parameters: `application/json;charset=utf-8` and `application/json` are one answer. */

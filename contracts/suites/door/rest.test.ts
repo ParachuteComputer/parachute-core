@@ -1,6 +1,6 @@
 // Surface A: notes over REST. What an app does with a vault URL and a credential must work the same at every door.
 import { describe, expect, test } from "bun:test";
-import { door, enc, fp, mediaType, paths, refusal, rest, runId, safeFetch, shape, token, vaultUrl } from "./_door.ts";
+import { door, enc, fp, fpEach, mediaType, paths, refusal, rest, runId, safeFetch, shape, token, vaultUrl } from "./_door.ts";
 
 const api = rest("write");
 const reader = rest("read");
@@ -117,6 +117,22 @@ describe("notes", () => {
     fp("rest/list.headers", { type: mediaType(first.headers), cursor: first.headers.has("x-next-cursor") });
   });
 
+  test("a long list is walked with a cursor: each page names the next", async () => {
+    const r = runId("cursor");
+    for (const n of [1, 2, 3]) expect((await api.post("/notes", { content: `c${n}`, path: `${r}/${n}` })).status).toBe(201);
+    const q = `path_prefix=${enc(`${r}/`)}&limit=2`;
+    const first = await api.get(`/notes?${q}&cursor=`);
+    expect(first.status, JSON.stringify(first.body).slice(0, 200)).toBe(200);
+    fp("rest/cursor.page.shape", shape({ ...first.body, notes: first.body.notes?.slice(0, 1) }));
+    expect(first.body.notes.length).toBe(2);
+    expect(first.body.next_cursor).toBeString();
+    const second = await api.get(`/notes?${q}&cursor=${enc(first.body.next_cursor)}`);
+    expect(second.status).toBe(200);
+    expect(paths([...first.body.notes, ...second.body.notes])).toEqual([`${r}/1`, `${r}/2`, `${r}/3`]);
+    const bad = await api.get(`/notes?${q}&cursor=not-a-cursor`);
+    fp("rest/refusal.bad-cursor", refusal(bad));
+  });
+
   test("a note without a path is kept and found by id", async () => {
     const made = await api.post("/notes", { content: `pathless ${runId("p")}` });
     expect(made.status).toBe(201);
@@ -187,9 +203,10 @@ describe("the vault itself", () => {
     expect(info.status).toBe(200);
     expect(info.body.name).toBe(door().vault);
     expect(info.body.description).toBe("Made-up vault for the door contracts.");
-    fp("rest/vault.shape", shape(info.body));
+    fpEach("rest/vault", info.body);
     const root = await reader.call("GET", "");
-    fp("rest/vault.root", { status: root.status, shape: root.status === 200 ? shape(root.body) : null });
+    expect(root.status).toBe(200);
+    fpEach("rest/vault-root", root.body);
   });
 
   test("the description is the owner's: a write credential cannot change it", async () => {

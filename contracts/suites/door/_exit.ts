@@ -23,6 +23,6 @@ export function recordExport(files: { name: string; bytes: Uint8Array }[], recor
     if (f.name === ".parachute/schemas/exitfixture.yaml") record(`exit/file.${f.name}`, maskExport(text(f.bytes)));
     if (f.name === ".parachute/vault.yaml") record("exit/file.vault.yaml.keys", text(f.bytes).split("\n").filter((l) => /^[a-z_]+:/.test(l)).map((l) => l.split(":")[0]).sort());
     if (f.name.startsWith("_unpathed/") && text(f.bytes).includes("exit-fixture pathless note")) record("exit/file.pathless", { name: f.name, text: maskExport(text(f.bytes)) });
-    if (f.name.startsWith(".parachute/attachments/") && f.bytes.length === FIXTURE_FILE.length) record("exit/file.attachment", { name: f.name.replace(/attachments\/[^/]+\//, "attachments/<att>/"), sha256: createHash("sha256").update(f.bytes).digest("hex") });
+    if (f.name.startsWith(".parachute/attachments/") && f.bytes.length === FIXTURE_FILE.length) record("exit/file.attachment", { name: f.name.replace(/attachments\/[^/]+\/[^/]+(\.\w+)$/, "attachments/<att>/<stored>$1"), sha256: createHash("sha256").update(f.bytes).digest("hex") });
   }
 }
