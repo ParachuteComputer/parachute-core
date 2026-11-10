@@ -45,12 +45,27 @@ describe("the comparison", () => {
   test("a note accepted before the move is excused; any other note is not, and a count is never enough", () => {
     const changed = { ...base, notes: [note("a", "one", { k: 1 }), note("b", "two")] };
     const src = digestOf({ ...base, notes: [note("a", "one", { "k y": 1 }), note("b", "two")] });
-    expect(compareDigests(src, digestOf(changed), { acceptNotes: ["a"] }).verdict).toBe("DIGEST EQUAL EXCEPT REVIEWED ITEMS");
-    expect(compareDigests(src, digestOf(changed), { acceptNotes: ["b"] }).ok).toBe(false);
+    const fieldRisk = (id: string) => [{ id, why: "a field name with a space, a colon or a non-ASCII character" }];
+    expect(compareDigests(src, digestOf(changed), { acceptNotes: fieldRisk("a") }).verdict).toBe("DIGEST EQUAL EXCEPT REVIEWED ITEMS");
+    expect(compareDigests(src, digestOf(changed), { acceptNotes: fieldRisk("b") }).ok).toBe(false);
     expect(compareDigests(src, digestOf(changed)).ok).toBe(false);
     // Accepting one note doesn't cover a second that changed too.
     const two = { ...base, notes: [note("a", "one", { k: 1 }), note("b", "TWO")] };
-    expect(compareDigests(src, digestOf(two), { acceptNotes: ["a"] }).ok).toBe(false);
+    expect(compareDigests(src, digestOf(two), { acceptNotes: fieldRisk("a") }).ok).toBe(false);
+  });
+
+  test("an accepted note is excused only for what its risk changes: a field-name risk doesn't cover a changed body, path or tags", () => {
+    const src = digestOf({ ...base, notes: [note("a", "one", { "k y": 1 }), note("b", "two")] });
+    const fieldRisk = [{ id: "a", why: "a field name with a space, a colon or a non-ASCII character" }];
+    const bodyToo = digestOf({ ...base, notes: [note("a", "ONE", { k: 1 }), note("b", "two")] });
+    expect(compareDigests(src, bodyToo, { acceptNotes: fieldRisk }).ok).toBe(false);
+    const moved = JSON.stringify(["a", "elsewhere/a", "md", sha("one"), { k: 1 }, [], "t1", "t2"]);
+    expect(compareDigests(src, digestOf({ ...base, notes: [moved, note("b", "two")] }), { acceptNotes: fieldRisk }).ok).toBe(false);
+    // CRLF is a risk about the body: it excuses the body, and not the fields.
+    const crlf = [{ id: "a", why: "a body with CRLF line endings" }];
+    const plain = digestOf({ ...base, notes: [note("a", "one"), note("b", "two")] });
+    expect(compareDigests(plain, digestOf({ ...base, notes: [note("a", "one "), note("b", "two")] }), { acceptNotes: crlf }).verdict).toBe("DIGEST EQUAL EXCEPT REVIEWED ITEMS");
+    expect(compareDigests(plain, digestOf({ ...base, notes: [note("a", "one", { x: 1 }), note("b", "two")] }), { acceptNotes: crlf }).ok).toBe(false);
   });
 
   test("a lost description fails", () => {
@@ -80,7 +95,12 @@ describe("the comparison", () => {
     const up = digestOf({ ...base, bare_types: ["idea"] });
     const down = digestOf(base);
     expect(compareDigests(up, down).ok).toBe(false);
-    expect(compareDigests(up, down, { dropBareTypes: true }).verdict).toBe("DIGEST EQUAL EXCEPT REVIEWED ITEMS");
+    // `idea` is on no note here, so on 0.8 it is gone, not a tag: excused only when that was accepted.
+    expect(compareDigests(up, down, { dropBareTypes: true }).ok).toBe(false);
+    expect(compareDigests(up, down, { dropBareTypes: "and-unused" }).verdict).toBe("DIGEST EQUAL EXCEPT REVIEWED ITEMS");
+    // On a note, it survives as a tag there.
+    const used = digestOf({ ...base, bare_types: ["idea"], tags_in_use: ["idea"] });
+    expect(compareDigests(used, digestOf({ ...base, tags_in_use: ["idea"] }), { dropBareTypes: true }).verdict).toBe("DIGEST EQUAL EXCEPT REVIEWED ITEMS");
     expect(compareDigests(down, up, { dropBareTypes: true }).ok).toBe(false);
   });
 });

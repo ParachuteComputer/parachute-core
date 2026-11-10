@@ -39,6 +39,8 @@ export function untar(buf: Uint8Array): TarFile[] {
 }
 
 function header(name: Uint8Array, size: number, type: string): Uint8Array {
+  // Eleven octal digits hold a size up to 8 GiB; a larger file needs a format this writer doesn't speak.
+  if (size >= 8 * 1024 ** 3) throw new Error("tar: a file of 8 GiB or more doesn't fit a ustar header");
   const h = new Uint8Array(BLOCK);
   h.set(name.subarray(0, 100), 0);
   const field = (off: number, len: number, value: string) => h.set(enc.encode(value.padStart(len - 1, "0")), off);

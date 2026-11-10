@@ -56,7 +56,8 @@ export interface Door {
   kind: DoorFile["kind"];
   /** A name for logs: the host, or the home's folder. Never a credential. */
   where: string;
-  release(): Promise<string>;
+  /** "0.8" or "0.9". With a vault the caller may read, asked of that vault; without one, the door file's word or a guess. */
+  release(vault?: string): Promise<string>;
   hasVault(name: string): Promise<boolean>;
   digest(vault: string): Promise<Digest>;
   description(vault: string): Promise<string | null>;
@@ -169,8 +170,16 @@ export function httpDoor(f: HttpDoorFile, opts: { production?: boolean; asOperat
   const door: Door = {
     kind: f.kind,
     where: new URL(origin).host,
-    async release() {
+    async release(vault) {
       if (f.release) return f.release;
+      // The record door is 0.9's. Asked with a credential of a vault that exists, so the answer is the door's own:
+      // 200 there is 0.9, 404 is 0.8. Without a vault it is only a guess for the plan's wording.
+      if (vault) {
+        const r = await vaultGet(vault)("/api/records?limit=1");
+        if (r.status === 200) return "0.9";
+        if (r.status === 404) return "0.8";
+        throw new Error(`asking ${new URL(origin).host} for its release gave ${r.status}; name it in the door file ("release": "0.8" or "0.9")`);
+      }
       const r = await call(`${origin}/vault/x/api/records`);
       return r.status === 404 ? "0.8" : "0.9";
     },
@@ -365,8 +374,9 @@ export function boxDoor(f: BoxDoorFile, opts: { scratch: string; liveBox?: boole
       rmSync(dir, { recursive: true, force: true });
       if (r.code !== 0) {
         const serving = /daemon is running/.test(r.err);
-        // Nothing was imported: take the empty vault away again so the name is free for the next try.
-        rmSync(vaultDir(vault), { recursive: true, force: true });
+        // Nothing was imported: take the empty vault away again, the box's own way (it also takes the vault out of
+        // the box's list and its default), so the name is free for the next try.
+        if (run(["remove", vault, "--yes"]).code !== 0) rmSync(vaultDir(vault), { recursive: true, force: true });
         throw new Error(serving ? "the box is serving: stop it for the import (`parachute stop`), run the move again, then start it" : `the box's import failed (${r.code}): ${r.err.slice(-400)}`);
       }
       return { notes: null };

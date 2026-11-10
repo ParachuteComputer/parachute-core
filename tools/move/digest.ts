@@ -308,13 +308,25 @@ export interface Comparison {
 
 /**
  * Compare two digests. A difference passes only when it was named before the move:
- *   - `acceptNotes`: ids of notes the plan said the format can't carry exactly, accepted by the person moving;
- *   - `dropBareTypes`: the move goes down a release (0.9 to 0.8), where a type with no fields comes back as a tag;
+ *   - `acceptNotes`: the notes the plan said the format can't carry exactly, accepted by the person moving. Each
+ *     excuses only what its risk changes (the fields; or the body, for CRLF), never the note's path, tags or times;
+ *   - `dropBareTypes`: the move goes down a release (0.9 to 0.8), where a type with no fields survives as a tag on the
+ *     notes that carry it. `"and-unused"` also excuses such a type that is on no note (accepted before the move);
  *   - `descriptionAtHandOver`: an operator's move, where the door sets the description after the operator's last read.
  * A count never excuses a difference: digests that differ with no line to show for it (a lost duplicate) fail.
  */
-export function compareDigests(a: Digest, b: Digest, opts: { acceptNotes?: string[]; dropBareTypes?: boolean; descriptionAtHandOver?: boolean; names?: [string, string] } = {}): Comparison {
-  const accept = new Set(opts.acceptNotes ?? []);
+export function compareDigests(
+  a: Digest,
+  b: Digest,
+  opts: { acceptNotes?: { id: string; why: string }[]; dropBareTypes?: boolean | "and-unused"; descriptionAtHandOver?: boolean; names?: [string, string] } = {},
+): Comparison {
+  // What an accepted risk may change, and nothing more: CRLF endings change the body; every other risk is about
+  // the fields. An accepted note whose path, tags or times came back different is not excused.
+  const accept = new Map<string, Set<string>>();
+  for (const r of opts.acceptNotes ?? []) {
+    const may = accept.get(r.id) ?? accept.set(r.id, new Set()).get(r.id)!;
+    may.add(/CRLF/.test(r.why) ? "content" : "fields");
+  }
   const [an, bn] = opts.names ?? ["source", "target"];
   const out: string[] = [];
   let bad = 0;
@@ -349,16 +361,23 @@ export function compareDigests(a: Digest, b: Digest, opts: { acceptNotes?: strin
             tally.missing = (tally.missing ?? 0) + 1;
             continue;
           }
-          for (const f of fields.filter((_, i) => JSON.stringify(s[i]) !== JSON.stringify(c[i]))) tally[f] = (tally[f] ?? 0) + 1;
-          if (accept.has(s[0] as string)) ok++;
+          const differing = fields.filter((_, i) => JSON.stringify(s[i]) !== JSON.stringify(c[i]));
+          for (const f of differing) tally[f] = (tally[f] ?? 0) + 1;
+          const may = accept.get(s[0] as string);
+          if (may && differing.every((f) => may.has(f))) ok++;
         }
         unexplained -= ok * 2; // one accepted note accounts for its line on each side
         reviewed += ok;
         extra += ` fields differing: ${JSON.stringify(tally)}${ok ? `, ${ok} accepted before the move` : ""}`;
       } else if (k === "bare_types" && opts.dropBareTypes && plus.length === 0) {
-        reviewed += minus.length;
-        unexplained = 0;
-        extra += `: ${minus.length} type(s) with no fields become tags on 0.8`;
+        // On 0.8 a type with no fields is a tag: it survives as a name on the notes that carry it. One that is on
+        // no note has nowhere to go, and is excused only when that was accepted before the move.
+        const kept = new Set(b.lines.tags_in_use);
+        const gone = minus.filter((name) => !kept.has(name));
+        const excused = opts.dropBareTypes === "and-unused" ? minus.length : minus.length - gone.length;
+        reviewed += excused;
+        unexplained = minus.length - excused;
+        extra += `: ${minus.length - gone.length} type(s) with no fields are tags on 0.8${gone.length ? `; ${gone.length} on no note ${opts.dropBareTypes === "and-unused" ? "are gone (accepted before the move)" : "are gone"}` : ""}`;
       }
       if (unexplained > 0 || minus.length + plus.length === 0) bad++;
     }

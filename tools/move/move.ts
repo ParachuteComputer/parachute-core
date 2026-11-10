@@ -15,6 +15,8 @@
 //   --accept-format-loss   go ahead though the plan found notes the export format can't carry exactly; the
 //                          verdict then excuses exactly those notes and no others
 //   --operator             the target door is entered as its operator, for an owner named in the door file
+//   --target-unchecked     close --delete without reading the new door first (it is read by default, and the old
+//                          vault is kept unless the new one still holds what was moved)
 //   --production           allow a parachute.computer host
 //   --live-box             allow this machine's own ~/.parachute as a box
 //
@@ -55,7 +57,8 @@ interface Plan {
   from: string;
   to: string;
   down: boolean;
-  accept: string[];
+  accept: { id: string; why: string }[];
+  acceptLoss: boolean;
   name: string;
 }
 
@@ -66,8 +69,10 @@ async function plan(from: Door, to: Door, vault: string, as: string, acceptLoss:
     lines.push(`${good ? "ok  " : "STOP"} ${line}`);
     if (!good) ok = false;
   };
-  const [fr, tr] = [await from.release(), await to.release()];
   if (!(await from.hasVault(vault))) die(`${from.where} has no vault named ${vault}`);
+  // The source's release is asked of the vault itself. The target has no vault of ours yet: its release is the door
+  // file's word or a guess here, and is asked again of the new vault before anything is compared.
+  const [fr, tr] = [await from.release(vault), await to.release()];
   const taken = await to.hasVault(as);
   say(!taken, taken ? `${to.where} already has a vault named ${as}: pass --as <another name>, or close the old one first` : `the name ${as} is free at ${to.where}`);
   const source = await from.digest(vault);
@@ -77,14 +82,19 @@ async function plan(from: Door, to: Door, vault: string, as: string, acceptLoss:
   const big = to.kind === "box" ? [] : source.files.filter((f) => f.size > MAX_FILE_BYTES);
   say(big.length === 0, big.length ? `${big.length} file(s) are over 50 MiB, the most this door takes in one piece` : "every file fits the target's door");
   const down = fr === "0.9" && tr === "0.8";
-  if (down && source.counts.bare_types) lines.push(`     going from 0.9 to 0.8: ${source.counts.bare_types} type(s) with no fields will come back as tags (they become types again on a 0.9 door)`);
+  if (down && source.counts.bare_types) {
+    const inUse = new Set(source.lines.tags_in_use);
+    const unused = source.lines.bare_types.filter((name) => !inUse.has(name)).length;
+    lines.push(`     going from 0.9 to 0.8: ${source.counts.bare_types - unused} type(s) with no fields will be tags there (types again on a 0.9 door)`);
+    if (unused) say(acceptLoss, `${unused} type(s) with no fields are on no note, and 0.8 has nowhere to keep them${acceptLoss ? ": accepted with --accept-format-loss" : ": put one on a note, or pass --accept-format-loss to leave them behind"}`);
+  }
   const risky = [...new Set(source.risks.map((r) => r.id))];
   if (risky.length) {
     const why = [...new Set(source.risks.map((r) => r.why))];
     say(acceptLoss, `${risky.length} note(s) hold something the export format doesn't carry exactly (${why.join("; ")})${acceptLoss ? ": accepted with --accept-format-loss" : ": fix them, or pass --accept-format-loss to move them as the format writes them"}`);
   } else lines.push("ok   every note is in a shape the export format carries exactly");
   lines.push(`     does not travel: earlier versions of notes${source.reader === "box-db" ? ` (${source.counts.versions} kept at the source)` : ""}; who wrote each note (${source.counts.attributed_notes} stamped); any credential`);
-  return { ok, lines, source, from: fr, to: tr, down, accept: acceptLoss ? risky : [], name: as };
+  return { ok, lines, source, from: fr, to: tr, down, accept: acceptLoss ? source.risks : [], acceptLoss, name: as };
 }
 
 function rekey(from: Door, to: Door, vault: string, as: string, who: Awaited<ReturnType<Door["whoHolds"]>>, description: string): string {
@@ -156,20 +166,45 @@ async function run(): Promise<void> {
     console.log("== import");
     await to.importNew(as!, exported, files, log);
 
-    // The export carries the description, but no door's import applies it: it is set again here, before the
-    // target is read, so the digest holds it too.
-    const described = description ? await to.describe(as!, description) : false;
-
-    console.log("== verify");
-    const target = await to.digest(as!);
-    const again = await from.digest(vault!);
+    // From here the new vault exists. Whatever happens next is written down, so a failed check never leaves a vault
+    // at the target with no record of how it got there.
+    const failedAfterImport = (err: unknown): never => {
+      const why = (err as Error).message;
+      writeFileSync(
+        join(out, "MOVE.json"),
+        `${JSON.stringify({ format: MANIFEST_FORMAT, vault, moved_as: as, source: { door: from.kind, where: from.where }, target: { door: to.kind, where: to.where }, verified: false, verdict: "NOT CHECKED", error: why, doors: { from: resolve(fromFile!), to: resolve(toFile!) } }, null, 2)}\n`,
+      );
+      return die(`move: after the import, the check did not finish (${why}). The new vault ${as} at ${to.where} exists and was NOT verified; the old one was not touched. Look at it, remove it, and run the move again.`, 1);
+    };
+    let described = false;
+    let target: Digest;
+    let again: Digest;
+    let down = p.down;
+    try {
+      // The export carries the description, but no door's import applies it: it is set again here, before the
+      // target is read, so the digest holds it too.
+      described = description ? await to.describe(as!, description) : false;
+      console.log("== verify");
+      // Asked of the new vault itself now, not guessed: only a real step down a release excuses a type becoming a tag.
+      down = p.from === "0.9" && (await to.release(as!)) === "0.8";
+      target = await to.digest(as!);
+      again = await from.digest(vault!);
+    } catch (err) {
+      return failedAfterImport(err);
+    }
     const still = compareDigests(p.source, again, { names: ["source before", "source after"] });
     const atHandOver = operator && !!description;
-    const moved = compareDigests(p.source, target, { acceptNotes: p.accept, dropBareTypes: p.down, descriptionAtHandOver: atHandOver, names: ["source", "target"] });
+    const moved = compareDigests(p.source, target, { acceptNotes: p.accept, dropBareTypes: down ? (p.acceptLoss ? "and-unused" : true) : false, descriptionAtHandOver: atHandOver, names: ["source", "target"] });
     for (const l of moved.lines) console.log(l);
     if (!still.ok || still.verdict !== "DIGEST EQUAL") console.log("the source changed while it was being moved:\n" + still.lines.join("\n"));
     const verified = moved.ok && still.verdict === "DIGEST EQUAL";
-    if (verified) await to.finish(as!, `move ${vault}`, description || undefined);
+    if (verified) {
+      try {
+        await to.finish(as!, `move ${vault}`, description || undefined);
+      } catch (err) {
+        return failedAfterImport(err);
+      }
+    }
 
     const who = await from.whoHolds(vault!).catch(() => null);
     const manifest = {
@@ -178,7 +213,7 @@ async function run(): Promise<void> {
       vault,
       moved_as: as,
       source: { door: from.kind, where: from.where, release: p.from },
-      target: { door: to.kind, where: to.where, release: p.to, entered_as: operator ? "operator" : "owner" },
+      target: { door: to.kind, where: to.where, release: down ? "0.8" : p.to, entered_as: operator ? "operator" : "owner" },
       exported: { by: exported.how, files: exported.files.length, tar_sha256: sha256(packed), tar_bytes: packed.length },
       attached_files: files.map((f) => ({ path: f.path, bytes: f.bytes.length, sha256: f.sha256 })),
       digests: { source: publicDigest(p.source), source_after: publicDigest(again), target: publicDigest(target) },
@@ -187,9 +222,10 @@ async function run(): Promise<void> {
         written_by: `does not travel (${p.source.counts.attributed_notes} note(s) carried a stamp at the source)`,
         credentials: "none travel; see REKEY.md",
         description: description ? (described ? "set again at the target, and in the digest" : atHandOver ? "set by the door when the vault was handed to its owner" : "not set by the move") : "none at the source",
-        ...(p.down ? { release: `0.9 to 0.8: ${p.source.counts.bare_types} type(s) with no fields become tags` } : {}),
+        ...(down ? { release: `0.9 to 0.8: ${p.source.counts.bare_types} type(s) with no fields are tags there, or gone if on no note` } : {}),
       },
-      accepted_before_the_move: p.accept.length ? { notes: p.accept.length, why: [...new Set(p.source.risks.map((r) => r.why))] } : null,
+      accepted_before_the_move: p.accept.length ? { notes: new Set(p.accept.map((r) => r.id)).size, why: [...new Set(p.accept.map((r) => r.why))] } : null,
+      accept_format_loss: p.acceptLoss,
       verdict: verified ? moved.verdict : still.verdict !== "DIGEST EQUAL" ? "SOURCE CHANGED DURING THE MOVE" : moved.verdict,
       verified,
       seconds: Math.round((Date.now() - t0) / 1000),
@@ -218,6 +254,7 @@ async function close(): Promise<void> {
   const keep = flag("--keep");
   const disconnect = has("--disconnect");
   const del = has("--delete");
+  const unchecked = has("--target-unchecked");
   const opts = { production: has("--production"), liveBox: has("--live-box") };
   if ([keep !== undefined, disconnect, del].filter(Boolean).length !== 1) die("say one of --keep \"<why>\", --disconnect, --delete", 2);
   const file = join(dir, "MOVE.json");
@@ -243,8 +280,30 @@ async function close(): Promise<void> {
       m.closed = { how: "disconnected", stopped, at };
       console.log(`disconnected ${stopped.length} holder(s) at ${from.where}${stopped.length ? `: ${stopped.join(", ")}` : ""}. The vault and its history stay; only the owner can write there now.`);
     } else {
+      // Deleting the old copy is only safe while the new one is still what was moved. Read it again now: a target
+      // that was deleted, reset or changed since the move means the old vault may be the only good copy.
+      if (!unchecked) {
+        let held = false;
+        let why = "";
+        try {
+          const target = await openDoor(m.doors.to, { scratch, ...opts }).digest(m.moved_as);
+          const down = m.source.release === "0.9" && m.target.release === "0.8" ? (m.accept_format_loss ? ("and-unused" as const) : true) : false;
+          const c = compareDigests(before, target, { acceptNotes: m.accepted_before_the_move ? before.risks : [], dropBareTypes: down, names: ["at the move", "the new door now"] });
+          held = c.ok;
+          if (!held) for (const l of c.lines) console.log(l);
+        } catch (err) {
+          why = (err as Error).message;
+        }
+        if (!held) {
+          die(
+            `refused: ${why ? `the new door (${m.target.where}) could not be read (${why})` : `the new door (${m.target.where}) no longer holds what was moved`}. The vault at ${from.where} is not deleted. ` +
+              "If the new door can't be read from here (a vault moved by an operator is readable only by its owner), check it there and pass --target-unchecked.",
+            1,
+          );
+        }
+      }
       await from.remove(m.vault);
-      m.closed = { how: "deleted", at, note: "its history and the door's backups of it went with it" };
+      m.closed = { how: "deleted", at, target_checked: !unchecked, note: "its history and the door's backups of it went with it" };
       console.log(`deleted: ${m.vault} is gone from ${from.where}.`);
     }
     writeFileSync(file, `${JSON.stringify(m, null, 2)}\n`);
@@ -263,8 +322,8 @@ async function verify(): Promise<void> {
   mkdirSync(scratch, { recursive: true, mode: 0o700 });
   try {
     const recorded = JSON.parse(readFileSync(join(dir, "private", "source.digest.json"), "utf8")) as Digest;
-    const accept = m.accepted_before_the_move ? [...new Set(recorded.risks.map((r) => r.id))] : [];
-    const down = m.source.release === "0.9" && m.target.release === "0.8";
+    const accept = m.accepted_before_the_move ? recorded.risks : [];
+    const down = m.source.release === "0.9" && m.target.release === "0.8" ? (m.accept_format_loss ? ("and-unused" as const) : true) : false;
     let ok = true;
     if (m.closed?.how !== "deleted") {
       const src = await openDoor(m.doors.from, { scratch, ...opts }).digest(m.vault);
