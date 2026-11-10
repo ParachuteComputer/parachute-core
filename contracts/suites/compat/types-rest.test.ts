@@ -40,7 +40,10 @@ describe("compat/types-rest: /api/records", () => {
     expect(Array.isArray(r.body)).toBe(true);
     expect(r.body.length).toBe(1);
     expect(r.body[0]).toHaveProperty("types");
+    expect(r.body[0]).toHaveProperty("fields");
+    expect(r.body[0]).not.toHaveProperty("metadata");
     expect(r.body[0]).not.toHaveProperty("content");
+    expect(r.body[0]).not.toHaveProperty("body");
   });
 
   test("a body that names an old word beside its new one is refused after auth, and nothing is written", async () => {
