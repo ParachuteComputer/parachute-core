@@ -28,5 +28,5 @@ Read `PROCESS.md` first. The short version:
 - **This repo is public.** Everything in code, tests, commits and pull requests is world-readable: no private
   notes, names from anyone's journal, internal hostnames or secrets.
 - **No outside code** until the CLA is reviewed and in force (see README, Licence).
-- **Releases happen here, deploys don't.** npm releases publish from `main` (`RELEASING.md`); don't publish by hand.
+- **Releases happen here, deploys don't.** npm releases publish from `main` (0.9, `beta`) and release/0.8 (0.8.x) (`RELEASING.md`); don't publish by hand.
   The hosted door deploys from parachute-cloud, which pins a core commit.

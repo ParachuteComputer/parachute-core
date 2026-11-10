@@ -74,7 +74,7 @@ describe("release plan", () => {
     expect(decidePublish("0.8.0-pre.2", published, B)).toMatchObject({ publish: true });
   });
 
-  test("0.9 code merged into release/0.8 refuses: it never reaches next or latest", () => {
+  test("a 0.9 version merged into release/0.8 refuses: it never reaches next or latest (0.9 code under a 0.8 version is review's to stop)", () => {
     const with09 = npm(["0.8.0-pre.1", "0.9.0-pre.1"], { next: "0.8.0-pre.1", beta: "0.9.0-pre.1" });
     expect(decidePublish("0.9.0-pre.2", with09, B)).toMatchObject({ refuse: true, reason: expect.stringContaining("0.8.x only") });
     expect(decidePublish("0.9.0", with09, B)).toMatchObject({ refuse: true, reason: expect.stringContaining("0.8.x only") });

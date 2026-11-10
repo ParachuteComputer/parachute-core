@@ -27,7 +27,9 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: release
+  # One queue per branch: release/0.8 and main release different lines, and a shared group would let GitHub cancel one
+  # line's waiting run when the other line's next run queues.
+  group: release-${{ github.ref }}
   cancel-in-progress: false
 
 env:
