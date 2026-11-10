@@ -1002,13 +1002,16 @@ export function migrate(db: Database): void {
  *   owner_kind  person | agent | app | service
  *   types       type scope (JSON array); NULL until keys scope by type
  *   denies      explicit denies (JSON array, e.g. ["private"]); NULL until enforced
+ *   last_used_at when the hub last let the key through to a vault (keys.ts touchKey); NULL if never
  */
 export function ensureKeys(db: Database): void {
   // Every open of hub.db runs this, beside a hub that may be writing. Nothing to do is the usual case: check that
   // with a read. Otherwise take the write lock first (IMMEDIATE, which waits out busy_timeout): a read-then-write
   // transaction that loses the race to another writer gets "database is locked" at once, without waiting.
   const hasTable = db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'keys'").get();
-  if (hasTable && !hasTokensToAdopt(db)) return;
+  const hasLastUsed =
+    !!hasTable && (db.query("PRAGMA table_info(keys)").all() as { name: string }[]).some((c) => c.name === "last_used_at");
+  if (hasTable && hasLastUsed && !hasTokensToAdopt(db)) return;
   db.transaction(() => {
     db.exec(`
       CREATE TABLE IF NOT EXISTS keys (
@@ -1019,10 +1022,14 @@ export function ensureKeys(db: Database): void {
         types TEXT,
         denies TEXT,
         created_via TEXT,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        last_used_at TEXT
       );
       CREATE INDEX IF NOT EXISTS keys_owner ON keys (owner);
     `);
+    // 0.9.1 (T-414): when the hub last let the key through. Additive, like the table: an older hub ignores it.
+    const cols = db.query("PRAGMA table_info(keys)").all() as { name: string }[];
+    if (!cols.some((c) => c.name === "last_used_at")) db.exec("ALTER TABLE keys ADD COLUMN last_used_at TEXT");
     adoptLiveTokens(db);
   }).immediate();
 }

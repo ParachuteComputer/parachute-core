@@ -80,7 +80,11 @@
  *   /account/mcp                  (POST/DELETE/OPTIONS) → account-level MCP
  *                                                (NIP-98 or account:self:* /
  *                                                host:admin Bearer)
- *   /account/vaults               (GET/POST)   → list / create vault (create returns vault_token)
+ *   /account/keys                 (GET/POST)   → named app keys: list (with last use) / mint one vault
+ *                                                at read|write, never admin (host:admin bearer, T-414)
+ *   /account/keys/<name>          (DELETE)     → revoke an app key (refused at the hub's vault doors at once)
+ *   /account/vaults               (GET/POST)   → list / create vault (create returns vault_token;
+ *                                                {bare: true} → no welcome notes, T-414)
  *   /account/vaults/<name>/rename (POST)       → rename (host-admin)
  *   /account/vaults/<name>        (DELETE)     → teardown (wraps /vaults/<name> cascade)
  *   /account/vaults/<name>/token  (POST)       → per-vault scoped token mint
@@ -186,7 +190,9 @@
  *                                                 superset {account:self:admin,
  *                                                 parachute:host:admin, parachute:host:auth}
  *                                                 aud="account"; first-admin-gated,
- *                                                 CSRF + same-origin belt; stateless
+ *                                                 CSRF + same-origin belt; stateless. Also NIP-98:
+ *                                                 `Authorization: Nostr` from a linked key of
+ *                                                 the hub admin mints the same token (T-414)
  *   /account/2fa                  (GET + POST) → user self-service 2FA enroll/disenroll
  *                                                 (hub#473; QR + backup codes)
  *   /account/vault-token/<name>   (POST)       → friend mints a scoped
@@ -381,6 +387,9 @@ import {
   readModuleManifest as defaultReadModuleManifest,
 } from "./module-manifest.ts";
 import { isNostrAuthorization } from "./nostr-http-auth.ts";
+import { routeAccountKeys } from "./account-keys.ts";
+import { KEY_TOUCH_INTERVAL_MS, touchKey } from "./keys.ts";
+import { validateAccessToken } from "./jwt-sign.ts";
 import { handleNostrLogin } from "./nostr-login.ts";
 import { isLegacyNotesPath, logNotesRedirect, maybeRedirectNotes } from "./notes-redirect.ts";
 import {
@@ -976,6 +985,91 @@ async function proxyRequest(
     });
     return proxyErrorToResponse(rendered);
   }
+}
+
+/**
+ * The key behind a vault request (0.9.1, T-414): the credential the vault itself would read, in its order
+ * (`Authorization: Bearer` in any case, then `X-API-Key`, then `?key=`; packages/vault/src/auth.ts extractApiKey),
+ * and, when it is one of the hub's JWTs, its registry row's jti and whether that row is revoked.
+ *
+ * The payload is decoded WITHOUT verifying the signature, which is safe for the refusal: a revoked row only ever
+ * refuses, and a forged token naming a revoked jti would be refused by the vault anyway. The last-used stamp
+ * (`recordKeyUse`) verifies the signature before it writes. Any other credential (none, an opaque key, a
+ * malformed token) returns null, and the vault's own auth decides, exactly as before.
+ */
+function vaultBearerKey(db: Database, req: Request): { jti: string; token: string; revoked: boolean } | null {
+  // Exactly the vault's order and emptiness rules: a header that is present but empty falls through, as there.
+  const header = req.headers.get("authorization");
+  let token: string | null;
+  if (header && /^Bearer\s+/i.test(header)) token = header.replace(/^Bearer\s+/i, "");
+  else token = req.headers.get("x-api-key") || new URL(req.url).searchParams.get("key");
+  const m = token?.match(/^([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)$/);
+  if (!token || !m) return null;
+  let jti: unknown;
+  try {
+    jti = (JSON.parse(Buffer.from(m[2]!, "base64url").toString("utf8")) as { jti?: unknown }).jti;
+  } catch {
+    return null;
+  }
+  if (typeof jti !== "string" || !jti) return null;
+  const row = db.query("SELECT revoked_at FROM tokens WHERE jti = ?").get(jti) as { revoked_at: string | null } | null;
+  if (!row) return null;
+  return { jti, token, revoked: row.revoked_at !== null };
+}
+
+/**
+ * Stamp a key's last use after the vault accepted its request. At most once a minute per key (`touchKey`), and
+ * only once the token's signature checks out against this hub's keys, so a forged token that merely names a
+ * jti can't stamp someone's key. Never fails the request.
+ */
+async function recordKeyUse(db: Database, use: { jti: string; token: string }): Promise<void> {
+  try {
+    // A cheap read first, so the signature check runs at most once a minute per key (touchKey's own SQL throttle
+    // is the guard; this only saves the verify).
+    const row = db.query("SELECT last_used_at FROM keys WHERE jti = ?").get(use.jti) as { last_used_at: string | null } | null;
+    if (!row) return;
+    if (row.last_used_at && Date.now() - Date.parse(row.last_used_at) < KEY_TOUCH_INTERVAL_MS) return;
+    // The signature is what matters here, not the issuer: the vault already accepted this token, and a key minted
+    // under an earlier origin of this hub still verifies against its keys.
+    await validateAccessToken(db, use.token);
+    touchKey(db, use.jti);
+  } catch (err) {
+    if (err instanceof Error && /database|sqlite/i.test(err.message)) {
+      console.error(`[hub] could not record key use: ${err.message}`);
+    }
+  }
+}
+
+function revokedKeyResponse(): Response {
+  return new Response(JSON.stringify({ error: "invalid_token", error_description: "this key has been revoked" }), {
+    status: 401,
+    headers: {
+      "content-type": "application/json",
+      "cache-control": "no-store",
+      "www-authenticate": 'Bearer error="invalid_token", error_description="this key has been revoked"',
+    },
+  });
+}
+
+/**
+ * The key door around a vault proxy (0.9.1, T-414): refuse a revoked hub token before it reaches the vault, and
+ * stamp the key's last use after the vault accepted it. The stamp is awaited so a list right after a write sees it;
+ * it costs one indexed read per request, and a signature check at most once a minute per key. Every hub route that forwards a
+ * bearer to the vault goes through here: `/vault/<name>/*`, `/vault/admin*` and the root `/mcp`.
+ */
+async function throughKeyDoor(
+  req: Request,
+  getDb: (() => Database) | undefined,
+  proxy: () => Promise<Response | undefined>,
+): Promise<Response | undefined> {
+  const db = getDb?.();
+  const keyUse = db ? vaultBearerKey(db, req) : null;
+  if (keyUse?.revoked) return revokedKeyResponse();
+  const proxied = await proxy();
+  if (proxied && keyUse && db && proxied.status !== 401 && proxied.status !== 403) {
+    await recordKeyUse(db, keyUse);
+  }
+  return proxied;
 }
 
 /**
@@ -4238,6 +4332,10 @@ export function hubFetch(
       // credential (it never touches /oauth/authorize, so never hits consent).
       // First-admin-gated (account ≡ box), CSRF double-submit + the same-origin
       // Origin belt below. Stateless (no tokens row); revocation = logout.
+      // Or (T-414) `Authorization: Nostr <event>` (NIP-98) from a linked key of
+      // the hub admin: no cookie, so the belt below passes it (Authorization
+      // isn't ambient) and logout can't end it; it lives its 10 minutes, and
+      // unlinking the key stops new ones.
       if (pathname === "/account/token") {
         if (!getDb) return dbNotConfigured();
         // Origin belt (hub#632 posture): a cookie-authed POST mint gets the
@@ -4248,7 +4346,7 @@ export function hubFetch(
           const rejected = assertSameOriginForCookieMutation(req, oauthDeps(req).hubBoundOrigins());
           if (rejected) return rejected;
         }
-        return handleAccountToken(req, { db: getDb(), issuer: oauthDeps(req).issuer });
+        return handleAccountToken(req, { db: getDb(), issuer: oauthDeps(req).issuer, peerAddr });
       }
 
       // /account/2fa — user self-service TOTP 2FA enroll / disenroll (hub#473).
@@ -4324,6 +4422,17 @@ export function hubFetch(
           knownIssuers: oauthDeps(req).hubBoundOrigins(),
           manifestPath,
         });
+      }
+      // /account/keys — named app keys (0.9.1, T-414; account-keys.ts): mint, list (with last use), revoke.
+      if (pathname === "/account/keys" || pathname.startsWith("/account/keys/")) {
+        if (!getDb) return dbNotConfigured();
+        const handled = await routeAccountKeys(req, pathname, {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
+          manifestPath,
+        });
+        if (handled) return handled;
       }
       if (pathname === "/account/vaults") {
         if (!getDb) return dbNotConfigured();
@@ -4505,7 +4614,7 @@ export function hubFetch(
           const gate = forceChangePasswordGate(getDb(), req);
           if (gate) return gate;
         }
-        const proxied = await proxyToVaultAdmin(req, manifestPath, deps?.supervisor, peerAddr);
+        const proxied = await throughKeyDoor(req, getDb, () => proxyToVaultAdmin(req, manifestPath, deps?.supervisor, peerAddr));
         if (proxied) return decorateWithChrome(proxied, req, pathname, getDb);
         return new Response("not found", { status: 404 });
       }
@@ -4547,7 +4656,8 @@ export function hubFetch(
             manifestPath,
           });
         }
-        const proxied = await proxyToVaultDaemon(req, manifestPath, deps?.supervisor, peerAddr);
+        // The key door (T-414) on the root MCP door too: a vault key spent here is refused at once once revoked.
+        const proxied = await throughKeyDoor(req, getDb, () => proxyToVaultDaemon(req, manifestPath, deps?.supervisor, peerAddr));
         if (proxied) return proxied;
         return vaultModuleNotRunning();
       }
@@ -4573,7 +4683,9 @@ export function hubFetch(
           const gate = forceChangePasswordGate(getDb(), req);
           if (gate) return gate;
         }
-        const proxied = await proxyToVault(req, manifestPath, deps?.supervisor, peerAddr);
+        // The key door (0.9.1, T-414): a revoked key is refused here at once, rather than when the vault's
+        // 60 s revocation cache next refreshes; and a key the vault accepted gets its last-used time.
+        const proxied = await throughKeyDoor(req, getDb, () => proxyToVault(req, manifestPath, deps?.supervisor, peerAddr));
         if (proxied) return decorateWithChrome(proxied, req, pathname, getDb);
         return new Response("not found", { status: 404 });
       }

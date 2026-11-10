@@ -15,7 +15,7 @@ import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { hubDbPath, openHubDb } from "@openparachute/hub/src/hub-db.ts";
-import { listKeys, type KeyView } from "@openparachute/hub/src/keys.ts";
+import { KEY_NAME_RE, listKeys, type KeyView } from "@openparachute/hub/src/keys.ts";
 import { KEYS_LOCK, takeFileLock } from "./file-lock.ts";
 import { homeDir } from "./home.ts";
 
@@ -35,7 +35,6 @@ export function holdKeysLock(): void {
 
 export type KeysResult = { exit: number } | { argv: string[] };
 
-const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
 const PASS_NEW = new Set(["--expires-in", "--ephemeral", "--json", "--user", "--service"]);
 
 function usage(): string {
@@ -68,7 +67,7 @@ function keysNew(args: string[]): KeysResult {
     console.error("parachute keys new: name the key, e.g. `parachute keys new uni-tasks --vault uni --can write`");
     return { exit: 2 };
   }
-  if (!NAME.test(name)) {
+  if (!KEY_NAME_RE.test(name)) {
     console.error(`parachute keys new: '${name}' is not a key name (letters, digits, '.', '_' and '-', up to 80)`);
     return { exit: 2 };
   }
@@ -133,8 +132,9 @@ function show(keys: KeyView[], users: Map<string, string>): string[] {
     Object.entries(k.levels).map(([v, l]) => `${v}:${l}`).join(" ") || k.scopes.join(" "),
     k.allow_tags ? `only #${k.allow_tags.join(" #")}` : "",
     k.status === "active" ? (k.expires_at ? `until ${k.expires_at.slice(0, 10)}` : "") : k.status,
+    k.last_used_at ? k.last_used_at.slice(0, 16).replace("T", " ") : "never",
   ]);
-  const head = ["NAME", "OWNER", "CAN", "LIMITS", "STATUS"];
+  const head = ["NAME", "OWNER", "CAN", "LIMITS", "STATUS", "LAST USED"];
   const width = head.map((h, i) => Math.max(h.length, ...rows.map((r) => r[i]!.length)));
   return [head, ...rows].map((r) => r.map((c, i) => c.padEnd(width[i]!)).join("  ").trimEnd());
 }
