@@ -39,8 +39,8 @@ of them pass, then moving it to `today/`.
 3. **Pull request against `next`** with what changed, why, the suite's summary lines, and, for a new test, how you
    made it fail.
 4. **CI must be green**: every job in `.github/workflows/contracts.yml` (the moved code's typecheck and tests,
-   `today` and `v1`, the harness self-tests, every suite on the candidate build, Benjamin's suite, the npm package,
-   and both mutant jobs).
+   `today` and `v1`, the harness self-tests, every suite on the candidate build, the door contracts on the box,
+   Benjamin's suite, the npm package, and both mutant jobs).
 5. **Review by someone who didn't write it.** Today that is a fresh Claude reviewer, recorded in a `## Review`
    section of the pull request body (who reviewed, the rounds, the verdict; round cap 3). GitHub approvals aren't
    used: Uni opens pull requests and merges them into `next` as `unforcedagi`, so the review section is the record. Changes to what
