@@ -5,7 +5,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { boxDescription, compareDigests, formatRisks, sha, SECTIONS, stillHolds, type Digest, type Section } from "./digest.ts";
+import { boxDescription, compareDigests, formatRisks, safeToDelete, sha, SECTIONS, stillHolds, type Digest, type Section } from "./digest.ts";
 import { filesFromExport } from "./doors.ts";
 import { tar, untar } from "./tar.ts";
 
@@ -181,23 +181,48 @@ describe("a box's description", () => {
 
 describe("before the old copy is deleted: does the new door still hold the vault?", () => {
   const file = (path: string, bytes: string) => ({ note: "a", path, mime: "image/png", size: 3, sha256: sha(bytes) });
-  const moved = digestOf({ notes: ["a", "b", "c", "d"].map((id) => note(id, id)) }, { files: [file("x.png", "x"), file("y.png", "y")] });
+  const ids = Array.from({ length: 20 }, (_, i) => `n${i}`);
+  const files = [file("x.png", "x"), file("y.png", "y"), file("z.png", "z")];
+  const moved = digestOf({ notes: ids.map((id) => note(id, id)) }, { files });
+  const now = (notes: string[], f = files) => digestOf({ notes }, { files: f });
+  const verdict = (d: Digest) => safeToDelete(stillHolds(moved, d)).ok;
 
-  test("a new door in normal use still holds it: notes added, one edited, one removed", () => {
-    const now = digestOf({ notes: [note("a", "a"), note("b", "edited"), note("c", "c"), note("new", "n")] }, { files: [file("x.png", "x"), file("y.png", "y")] });
-    expect(stillHolds(moved, now)).toEqual({ moved: 4, there: 3, changed: 1, gone: 1, added: 1, files: { moved: 2, there: 2 } });
+  test("a new door in light use still holds it: notes added, one edited, one removed", () => {
+    const used = now([...ids.slice(2).map((id) => note(id, id)), note("n1", "edited"), note("new", "n")]);
+    expect(stillHolds(moved, used)).toEqual({ moved: 20, there: 19, changed: 1, gone: 1, added: 1, files: { moved: 3, there: 3 } });
+    expect(verdict(used)).toBe(true);
+    expect(verdict(moved)).toBe(true);
   });
 
   test("a wiped or reset door doesn't: a fresh vault's own notes don't count", () => {
-    const reset = digestOf({ notes: [note("seed1", "s"), note("seed2", "s")] });
-    const h = stillHolds(moved, reset);
-    expect([h.there, h.added, h.files.there]).toEqual([0, 2, 0]);
-    expect(h.there * 2 < h.moved).toBe(true);
+    expect(verdict(now([note("seed1", "s"), note("seed2", "s")], []))).toBe(false);
   });
 
-  test("files count on their own: the notes there but the files gone is a loss", () => {
-    const h = stillHolds(moved, digestOf({ notes: moved.lines.notes }, { files: [file("x.png", "other bytes")] }));
-    expect(h.there).toBe(4);
-    expect(h.files.there).toBe(0);
+  test("every id there but the bodies blanked (a bad sync) doesn't", () => {
+    expect(verdict(now(ids.map((id) => note(id, ""))))).toBe(false);
+  });
+
+  test("a part restore doesn't: nine of twenty notes gone", () => {
+    expect(verdict(now(ids.slice(9).map((id) => note(id, id))))).toBe(false);
+    // More than a tenth, by one.
+    expect(verdict(now(ids.slice(3).map((id) => note(id, id))))).toBe(false);
+    expect(verdict(now(ids.slice(2).map((id) => note(id, id))))).toBe(true);
+  });
+
+  test("one moved file gone, or its bytes changed, doesn't, whatever the notes say", () => {
+    expect(verdict(now(moved.lines.notes, files.slice(1)))).toBe(false);
+    expect(verdict(now(moved.lines.notes, [file("x.png", "other bytes"), files[1]!, files[2]!]))).toBe(false);
+    const why = safeToDelete(stillHolds(moved, now(moved.lines.notes, files.slice(1)))).why;
+    expect(why).toContain("1 of the 3 moved file(s)");
+  });
+
+  test("a small vault: any change is more than a tenth, and says so", () => {
+    const small = digestOf({ notes: ["a", "b", "c"].map((id) => note(id, id)) });
+    const r = safeToDelete(stillHolds(small, digestOf({ notes: [note("a", "a"), note("b", "edited"), note("c", "c")] })));
+    expect(r.ok).toBe(false);
+    expect(r.why).toContain("more than a tenth");
+    expect(safeToDelete(stillHolds(small, small)).ok).toBe(true);
+    // Nothing moved, nothing to lose.
+    expect(safeToDelete(stillHolds(digestOf({}), digestOf({}))).ok).toBe(true);
   });
 });

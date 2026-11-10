@@ -25,7 +25,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { compareDigests, SECTIONS, stillHolds, type Digest } from "./digest.ts";
+import { compareDigests, safeToDelete, SECTIONS, stillHolds, type Digest } from "./digest.ts";
 import { filesFromExport, openDoor, type Door } from "./doors.ts";
 import { tar } from "./tar.ts";
 
@@ -43,7 +43,10 @@ const has = (name: string): boolean => {
   if (i >= 0) argv.splice(i, 1);
   return i >= 0;
 };
+/** The working folder of the command in hand, removed on every way out (process.exit skips `finally`). */
+let scratchDir: string | null = null;
 const die = (msg: string, code = 1): never => {
+  if (scratchDir) rmSync(scratchDir, { recursive: true, force: true });
   console.error(msg);
   process.exit(code);
 };
@@ -71,7 +74,8 @@ async function plan(from: Door, to: Door, vault: string, as: string, acceptLoss:
   };
   if (!(await from.hasVault(vault))) die(`${from.where} has no vault named ${vault}`);
   // The source's release is asked of the vault itself. The target has no vault of ours yet: its release is the door
-  // file's word or a guess here, and is asked again of the new vault before anything is compared.
+  // file's word, or asked of another vault the owner has there, or unknown. It is asked again of the new vault
+  // before anything is compared, and that answer is the one recorded.
   const [fr, tr] = [await from.release(vault), await to.release()];
   const taken = await to.hasVault(as);
   say(!taken, taken ? `${to.where} already has a vault named ${as}: pass --as <another name>, or close the old one first` : `the name ${as} is free at ${to.where}`);
@@ -148,6 +152,7 @@ async function run(): Promise<void> {
   if (!fromFile || !toFile || !vault || !as || (cmd === "run" && !outDir)) die("usage: move.ts plan|run <from.json> <to.json> --vault <name> [--as <new name>] [--out <folder>]", 2);
   const scratch = join(process.env.TMPDIR ?? tmpdir(), `parachute-move-${process.pid}`);
   mkdirSync(scratch, { recursive: true, mode: 0o700 });
+  scratchDir = scratch;
   try {
     const from = openDoor(fromFile!, { scratch, ...opts });
     const to = openDoor(toFile!, { scratch, ...opts, asOperator: operator });
@@ -181,8 +186,9 @@ async function run(): Promise<void> {
         join(out, "MOVE.json"),
         `${JSON.stringify({ format: MANIFEST_FORMAT, vault, moved_as: as, source: { door: from.kind, where: from.where }, target: { door: to.kind, where: to.where }, verified: false, verdict, error: why, doors: { from: resolve(fromFile!), to: resolve(toFile!) } }, null, 2)}\n`,
       );
-      rmSync(scratch, { recursive: true, force: true });
-      return die(`move: ${said} (${why}). The old vault was not touched. Look at ${as} at ${to.where}, remove it if it is there, and run the move again.`, 1);
+      // A name someone else took while this ran is not ours to remove.
+      const taken = /vault_taken|vault_name_taken|already has a vault/.test(why);
+      return die(`move: ${said} (${why}). The old vault was not touched. ${taken ? `The name ${as} was taken at ${to.where} while the move ran: nothing of yours is there. Run the move again with --as <another name>.` : `Look at ${as} at ${to.where}, remove it if it is there, and run the move again.`}`, 1);
     };
 
     console.log("== import");
@@ -282,6 +288,7 @@ async function close(): Promise<void> {
   if (m.closed) die(`already closed: ${JSON.stringify(m.closed)}`, 1);
   const scratch = join(process.env.TMPDIR ?? tmpdir(), `parachute-move-${process.pid}`);
   mkdirSync(scratch, { recursive: true, mode: 0o700 });
+  scratchDir = scratch;
   try {
     const from = openDoor(m.doors.from, { scratch, ...opts });
     const before = JSON.parse(readFileSync(join(dir, "private", "source.digest.json"), "utf8")) as Digest;
@@ -312,13 +319,13 @@ async function close(): Promise<void> {
         if (held) {
           console.log(`the new door (${m.target.where}) now: ${held.there} of ${held.moved} moved notes are there (${held.changed} changed since), ${held.gone} gone, ${held.added} added; ${held.files.there} of ${held.files.moved} moved files are there`);
         }
-        // The new door is in use, so notes there change. What must not be true is that it lost the vault: fewer than
-        // half of the moved notes, or of the moved files, still there means it was wiped, reset or replaced.
-        const lost = held !== null && (held.there * 2 < held.moved || held.files.there * 2 < held.files.moved);
-        if (!held || lost) {
+        // The new door is in use, so a few notes there change. What must not be true is that it lost the vault
+        // (digest.ts safeToDelete): a file gone, or more than a tenth of the moved notes gone or changed.
+        const safe = held ? safeToDelete(held) : { ok: false, why: `it could not be read (${why})` };
+        if (!safe.ok) {
           die(
-            `refused: ${!held ? `the new door (${m.target.where}) could not be read (${why})` : `the new door (${m.target.where}) no longer holds most of what was moved`}. The vault at ${from.where} is not deleted. ` +
-              "If the new door can't be read from here (a vault moved by an operator is readable only by its owner), check it there and pass --target-unchecked.",
+            `refused: the new door (${m.target.where}): ${safe.why}. The vault at ${from.where} is not deleted. ` +
+              "Deleting can't be undone. If you have looked at the new door and it is right (it is in heavy use, or only its owner can read it), pass --target-unchecked.",
             1,
           );
         }
@@ -341,6 +348,7 @@ async function verify(): Promise<void> {
   if (m.format !== MANIFEST_FORMAT) die("not a move folder", 1);
   const scratch = join(process.env.TMPDIR ?? tmpdir(), `parachute-move-${process.pid}`);
   mkdirSync(scratch, { recursive: true, mode: 0o700 });
+  scratchDir = scratch;
   try {
     const recorded = JSON.parse(readFileSync(join(dir, "private", "source.digest.json"), "utf8")) as Digest;
     const accept = m.accepted_before_the_move ? recorded.risks : [];
@@ -369,6 +377,7 @@ async function digest(): Promise<void> {
   if (!file || !vault) die("usage: move.ts digest <door.json> --vault <name>", 2);
   const scratch = join(process.env.TMPDIR ?? tmpdir(), `parachute-move-${process.pid}`);
   mkdirSync(scratch, { recursive: true, mode: 0o700 });
+  scratchDir = scratch;
   try {
     const d = await openDoor(file!, { scratch, production: has("--production"), liveBox: has("--live-box") }).digest(vault!);
     for (const s of SECTIONS) console.log(`${s.padEnd(15)} ${String(d.counts[s]).padStart(6)}  ${d.digests[s].slice(0, 16)}`);

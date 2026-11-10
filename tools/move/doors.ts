@@ -31,7 +31,7 @@ export interface HttpDoorFile {
   /** An operator moving a vault for its owner: the door's operator token and the owner's address. */
   ops_token_file?: string;
   owner_email_file?: string;
-  /** "0.8" or "0.9"; read from the door when absent. */
+  /** "0.8" or "0.9". Used for the plan when the door has no vault to ask; checked against the door's own answer. */
   release?: string;
 }
 export interface BoxDoorFile {
@@ -174,21 +174,34 @@ export function httpDoor(f: HttpDoorFile, opts: { production?: boolean; asOperat
     kind: f.kind,
     where: new URL(origin).host,
     async release(vault) {
-      if (f.release) return f.release;
       // The record door is 0.9's. Asked with a credential of a vault that exists, so the answer is the door's own:
-      // 200 there is 0.9, 404 is 0.8. With no vault named, any vault of the owner's will do. A door answers 404 for a
-      // vault it doesn't hold before it looks at the route, so asking without one would always say "0.8".
-      let ask = vault;
-      if (!ask && !operator) {
+      // 200 there is 0.9, 404 is 0.8. (A door answers 404 for a vault it doesn't hold before it looks at the
+      // route, so asking without one would always say "0.8".)
+      const ask = async (name: string) => {
+        const r = await vaultGet(name)("/api/records?limit=1");
+        return r.status === 200 ? "0.9" : r.status === 404 ? "0.8" : `HTTP ${r.status}`;
+      };
+      if (vault) {
+        // A named vault is always asked: what the door file says is checked against it, never taken instead of it.
+        const answer = await ask(vault);
+        if (answer !== "0.8" && answer !== "0.9") throw new Error(`asking ${new URL(origin).host} for its release gave ${answer}`);
+        if (f.release && f.release !== answer) throw new Error(`the door file says release ${f.release}, but ${new URL(origin).host} answers as ${answer}: correct the door file`);
+        return answer;
+      }
+      if (f.release) return f.release;
+      // No vault named: any vault of the owner's will do. If there is none, or it can't be asked just now, the
+      // release is unknown, which the plan handles; it is asked again of the new vault after the import.
+      if (operator) return "unknown";
+      try {
         const r = await account("/account/vaults");
         const j = (await r.json().catch(() => null)) as any;
-        ask = r.ok ? (Array.isArray(j) ? j : (j?.vaults ?? []))[0]?.name : undefined;
+        const first = r.ok ? (Array.isArray(j) ? j : (j?.vaults ?? []))[0]?.name : undefined;
+        if (!first) return "unknown";
+        const answer = await ask(first);
+        return answer === "0.9" ? "0.9" : "unknown"; // a 404 here may be a vault the door lists but doesn't serve yet
+      } catch {
+        return "unknown";
       }
-      if (!ask) return "unknown";
-      const r = await vaultGet(ask)("/api/records?limit=1");
-      if (r.status === 200) return "0.9";
-      if (r.status === 404) return "0.8";
-      throw new Error(`asking ${new URL(origin).host} for its release gave ${r.status}; name it in the door file ("release": "0.8" or "0.9")`);
     },
     async hasVault(name) {
       if (operator) {
@@ -350,8 +363,12 @@ export function boxDoor(f: BoxDoorFile, opts: { scratch: string; liveBox?: boole
     kind: "box",
     where: `box at ${f.home}`,
     async release() {
-      if (f.release) return f.release;
-      return /\b0\.9\./.test(run(["--version"]).out) ? "0.9" : "0.8";
+      // The box's own command says which release it is. Anything else (a command that failed, a release this tool
+      // doesn't know) is unknown, not "0.8".
+      const said = run(["--version"]).out;
+      const answer = /\b0\.9\./.test(said) ? "0.9" : /\b0\.8\./.test(said) ? "0.8" : "unknown";
+      if (f.release && answer !== "unknown" && f.release !== answer) throw new Error(`the door file says release ${f.release}, but the box's command says ${answer}: correct the door file`);
+      return answer === "unknown" ? (f.release ?? "unknown") : answer;
     },
     hasVault: async (name) => existsSync(vaultDir(name)),
     digest: (vault) => digestFromBox(join(vaultDir(vault), "vault.db"), join(vaultDir(vault), "assets"), vault),

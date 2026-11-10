@@ -56,15 +56,17 @@ what does not travel, the verdict, and how the old door was closed.
 
 `close` is a second command on purpose: the old door is touched only after you have looked at the new one.
 `--delete` and `--disconnect` first check that nothing was written to the old door since the move, and refuse if
-something was. `--delete` also reads the new door first and keeps the old vault unless the new one still holds most
-of what was moved, by note and by file (the new door is in use by then, so notes added, edited or removed there are
-expected; a door that was wiped or reset is not). It takes the old vault's history and the door's backups of it.
+something was. `--delete` also reads the new door first and keeps the old vault unless the new one still holds what
+was moved: every moved file with its bytes, and all but a tenth of the moved notes unchanged (a door in use changes
+a few notes; one that was wiped, part restored or blanked by a bad sync changes many). Deleting can't be undone, so
+the rule is strict; `--target-unchecked` is for the person who has looked. It takes the old vault's history and the door's backups of it.
 `--disconnect` stops every connected app and named key there and keeps the vault. `--keep "<why>"` records that it
 stays.
 
 A door's release is asked, never guessed: of the vault itself, or of any vault the owner has there. A target with no
 vault to ask is "unknown" until the new vault exists; name it in the door file (`"release": "0.9"`) to have the plan
-check a step down a release before anything moves.
+check a step down a release before anything moves. What the file says is checked against the door's own answer once
+the new vault exists, and a move stops if they disagree.
 
 ## The digest
 

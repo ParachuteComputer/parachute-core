@@ -176,7 +176,8 @@ export function boxDescription(yamlFile: string): string | null {
     else if (l.trim() === "") body.push("");
     else break;
   }
-  return body.join("\n").replace(/\n+$/, "") || null;
+  // Trimmed, as the box's own reader trims it (packages/vault/src/config.ts).
+  return body.join("\n").trim() || null;
 }
 
 /** A box's vault, from its database file and assets folder. Read-only; works with the box stopped or running. */
@@ -414,4 +415,24 @@ export function stillHolds(moved: Digest, now: Digest): { moved: number; there: 
     added: [...is.keys()].filter((k) => !was.has(k)).length,
     files: { moved: moved.files.length, there: moved.files.filter((f) => files.has(`${f.path}\t${f.sha256}`)).length },
   };
+}
+
+/**
+ * May the old copy be deleted, given how much of what was moved the new door still holds? Deleting can't be undone
+ * (the old vault's history and backups go with it), and there is a flag for the person who has looked and knows
+ * better, so this is strict on purpose:
+ *   - every moved file must still be there with the bytes it had;
+ *   - of the moved notes, at most a tenth may be gone or changed. A new door in use changes a few notes; one that
+ *     was wiped, partly restored, or had its bodies blanked by a bad sync changes many, with every id still there.
+ */
+export function safeToDelete(held: ReturnType<typeof stillHolds>): { ok: boolean; why: string } {
+  if (held.files.there < held.files.moved) {
+    const n = held.files.moved - held.files.there;
+    return { ok: false, why: `${n} of the ${held.files.moved} moved file(s) ${n === 1 ? "is" : "are"} not at the new door with the bytes that were moved` };
+  }
+  const touched = held.gone + held.changed;
+  if (touched > Math.floor(held.moved / 10)) {
+    return { ok: false, why: `${held.gone} of the ${held.moved} moved notes are gone from the new door and ${held.changed} have changed there: more than a tenth` };
+  }
+  return { ok: true, why: "" };
 }
