@@ -19,6 +19,7 @@ import { describe, it, expect, beforeEach } from "bun:test";
 import { Database } from "bun:sqlite";
 import { SqliteStore } from "./store.js";
 import { generateMcpTools } from "./mcp.js";
+import { MCP_TOOL_REFERENCE } from "./mcp-manifest.js";
 import {
   parseContentRange,
   sliceContentRange,
@@ -495,7 +496,9 @@ describe("MCP query-notes — content range", () => {
     const props = (query.inputSchema as any).properties;
     expect(props.content_offset).toBeDefined();
     expect(props.content_length).toBeDefined();
-    expect(query.description).toContain("content_offset");
-    expect(query.description).toContain("content_next_offset");
+    // The short description leaves the paging how-to to the full reference (vault-info {help}).
+    const reference = MCP_TOOL_REFERENCE.find((e) => e.name === "query-notes")!;
+    expect(reference.description).toContain("content_offset");
+    expect(reference.description).toContain("content_next_offset");
   });
 });

@@ -51,7 +51,7 @@ const UNION_CATALOG_LINE =
   "Catalog caveat: advertised from one covered vault's live list (highest verb this connection holds). Calling this against a different covered vault may return Unknown tool if that vault grants a lower verb.";
 
 const VAULT_FIELD_DESCRIPTION =
-  "Target vault by name. Omit on query-notes to fan the query across every reachable vault; required on every other vault-shaped tool.";
+  "Target vault by name. Omit on query-records (or query-notes) to fan the query across every reachable vault; required on every other vault-shaped tool.";
 
 const listCache = new WeakMap<AccountToolContext, Promise<readonly ListedMcpTool[]>>();
 
@@ -216,6 +216,9 @@ export async function postVaultMcp(
   return parseJsonRpcResult(res, vault.name);
 }
 
+/** The query tools the account door fans out across vaults: 0.9's record name and its note-named alias (T-407). */
+export const FAN_OUT_TOOLS: ReadonlySet<string> = new Set(["query-records", "query-notes"]);
+
 function injectVaultSelector(tool: {
   name: string;
   description?: unknown;
@@ -232,7 +235,7 @@ function injectVaultSelector(tool: {
     vault: { type: "string", description: VAULT_FIELD_DESCRIPTION },
   };
   const schema: Record<string, unknown> = { ...rawSchema, properties };
-  if (tool.name !== "query-notes") {
+  if (!FAN_OUT_TOOLS.has(tool.name)) {
     const req = Array.isArray(schema.required)
       ? schema.required.filter((x): x is string => typeof x === "string")
       : [];
@@ -332,13 +335,15 @@ async function queryOneVaultMcp(
   ctx: AccountToolContext,
   vault: AccountVaultMeta,
   args: Record<string, unknown>,
-): Promise<{ vault: string; notes: unknown } | { vault: string; error: string }> {
+  tool: string,
+): Promise<{ vault: string; notes?: unknown; records?: unknown } | { vault: string; error: string }> {
   try {
     const result = await postVaultMcp(ctx, vault, "read", "tools/call", {
-      name: "query-notes",
+      name: tool,
       arguments: args,
     });
-    return { vault: vault.name, notes: notesFromMcpResult(result) };
+    // Each vault answers in the words of the tool called: `records` for query-records, `notes` for query-notes.
+    return { vault: vault.name, [tool === "query-records" ? "records" : "notes"]: notesFromMcpResult(result) };
   } catch (err) {
     return {
       vault: vault.name,
@@ -350,9 +355,10 @@ async function queryOneVaultMcp(
 async function queryNotesOverlay(
   args: Record<string, unknown>,
   ctx: AccountToolContext,
+  tool = "query-notes",
 ): Promise<{
   vaults_queried: string[];
-  results: Array<{ vault: string; notes?: unknown; error?: string }>;
+  results: Array<{ vault: string; notes?: unknown; records?: unknown; error?: string }>;
 }> {
   const coverage = resolveCoverage(ctx.db, ctx.principal, installedVaults(ctx));
   let targets = coverage.vaults;
@@ -360,7 +366,7 @@ async function queryNotesOverlay(
     targets = [coveredVault(ctx, args.vault)];
   }
   const stripped = stripVaultArg(args);
-  const settled = await Promise.allSettled(targets.map((v) => queryOneVaultMcp(ctx, v, stripped)));
+  const settled = await Promise.allSettled(targets.map((v) => queryOneVaultMcp(ctx, v, stripped, tool)));
   return {
     vaults_queried: targets.map((v) => v.name),
     results: settled.map((s, i) =>
@@ -379,7 +385,7 @@ export async function callVaultModuleTool(
   args: Record<string, unknown>,
   ctx: AccountToolContext,
 ): Promise<unknown> {
-  if (name === "query-notes") return queryNotesOverlay(args, ctx);
+  if (FAN_OUT_TOOLS.has(name)) return queryNotesOverlay(args, ctx, name);
 
   const hit = coveredVault(ctx, args.vault);
   const verb = verbForVault(ctx, hit.name);

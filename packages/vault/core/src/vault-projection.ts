@@ -170,7 +170,7 @@ export const QUERY_HINTS: readonly string[] = [
   "query-notes { tag: \"X\" } — all notes with tag X (includes descendants per inheritance)",
   "query-notes { tag: \"X\", metadata: { field: { op: value } } } — operator queries on indexed fields (eq/ne/gt/gte/lt/lte/in/not_in/exists)",
   "query-notes { search: \"...\" } — full-text search across content",
-  "query-notes { near: { id: \"...\" }, depth: 2 } — graph neighborhood within N hops",
+  "query-notes { near: { note_id: \"...\", depth: 2 } } — notes within N link hops of a note",
   "query-notes { id: \"<note-id-or-path>\" } — fetch a single note by ID or path",
 ] as const;
 
@@ -308,23 +308,25 @@ function sqliteToUserType(t: string): string {
  * inside the connect-time brief's token budget — see
  * `projectionToMarkdown`'s doc comment.
  */
-export function attachmentsInstructionBlock(opts: { ticketsEnabled: boolean; readEnabled?: boolean }): string {
+export function attachmentsInstructionBlock(opts: { ticketsEnabled: boolean; readEnabled?: boolean; ticketTool?: string }): string {
   const sentences: string[] = [
-    "Notes can carry file attachments (`include_attachments: true` on `query-notes` returns their rows; bytes don't ride MCP tool RESULTS unless you ask for them).",
+    "`include_attachments: true` on `query-notes` lists a note's attachments.",
   ];
   if (opts.ticketsEnabled) {
     sentences.push(
-      "To move bytes without spending your own context, call `request-attachment-upload` / `request-attachment-download` — each mints a short-lived, single-use URL (with a ready-to-run `curl_example`) your shell spends directly; no MCP session credential is needed to spend it.",
+      opts.ticketTool
+        ? `\`${opts.ticketTool}\` gives a one-use URL to PUT or GET the bytes.`
+        : "`request-attachment-upload` / `request-attachment-download` give a one-use URL to PUT or GET the bytes.",
     );
   }
   if (opts.readEnabled) {
     sentences.push(
-      "To read an attachment directly into this conversation, call `read-attachment` — text comes back as a paginated `content` slice, images as a real image you can see, audio/video as a transcript pointer (never raw bytes), and PDF/other binary formats point you at a download ticket instead.",
+      "`read-attachment` reads one into the conversation.",
     );
   }
-  sentences.push(
-    "If your runtime holds this vault's own API token, REST works too: upload = `POST {base}/storage/upload` (multipart `file`, ≤100 MB) then `POST {base}/notes/{id}/attachments` `{path, mimeType, transcribe?}`; download = `GET {base}/storage/{path}` with the same `Authorization: Bearer` (honors a `Range: bytes=a-b` header for partial reads). Audio attached with `transcribe: true` is transcribed automatically.",
-  );
+  if (!opts.ticketsEnabled) {
+    sentences.push("Over REST: `POST {base}/storage/upload` (multipart `file`), then `POST {base}/notes/{id}/attachments` `{path, mimeType}`.");
+  }
   return sentences.join(" ");
 }
 
@@ -364,9 +366,16 @@ export function projectionToMarkdown(args: {
    * that hasn't wired ticket support yet (or a test fixture) never
    * accidentally advertises tools it can't back.
    */
-  attachments?: { ticketsEnabled: boolean; readEnabled?: boolean };
+  attachments?: { ticketsEnabled: boolean; readEnabled?: boolean; ticketTool?: string };
+  /**
+   * The server's own words for this door (T-407: record words where the
+   * record tools are listed). Applied to the fixed text only, never to the
+   * vault's description, names or paths. Omitted: the text as written.
+   */
+  words?: (s: string) => string;
 }): string {
   const { vaultName, description, projection, coordinates } = args;
+  const w = args.words ?? ((s: string) => s);
   const stats = projection.stats;
 
   const lines: string[] = [];
@@ -410,10 +419,8 @@ export function projectionToMarkdown(args: {
   if (projection.getting_started) {
     lines.push("");
     lines.push(
-      `## Start here\n\nThis vault has a **${projection.getting_started}** guide — how to set it up ` +
-        `and grow it (what a Parachute vault is, designing tags vs paths vs schemas, importing ` +
-        `existing notes). Read it when setting up or getting oriented, or when the operator asks ` +
-        `for help setting up their parachute. Fetch it with \`query-notes { id: "${projection.getting_started}" }\`.`,
+      `## Start here\n\nFor setting up or growing this vault, read the **${projection.getting_started}** guide: ` +
+        `\`${w("query-notes")} { id: "${projection.getting_started}" }\`.`,
     );
   }
 
@@ -435,26 +442,26 @@ export function projectionToMarkdown(args: {
     const noteLabel = noteCount === 1 ? "note" : "notes";
     const tagLabel = tagCount === 1 ? "tag" : "tags";
     const tagSuffix = withSchemas > 0 ? `, ${withSchemas} with schemas` : "";
-    lines.push(`- ${noteCount} ${noteLabel}, ${tagCount} ${tagLabel} total${tagSuffix}`);
+    lines.push(w(`- ${noteCount} ${noteLabel}, ${tagCount} ${tagLabel} total${tagSuffix}`));
   } else {
-    lines.push(`- (call \`vault-info { include_stats: true }\` for note/tag counts)`);
+    lines.push(w(`- (call \`vault-info { include_stats: true }\` for note/tag counts)`));
   }
 
   if (projection.tags.length === 0) {
-    lines.push(`- No tag schemas declared yet — every note is freeform.`);
+    lines.push(w(`- No tag schemas declared yet — every note is freeform.`));
   } else {
     const names = projection.tags.map((t) => t.name).join(", ");
     lines.push(`- ${projection.tags.length} tag${projection.tags.length === 1 ? "" : "s"} with schemas: ${names}`);
   }
 
   if (projection.indexed_fields.length > 0) {
-    lines.push(`- Indexed metadata fields (queryable with operators):`);
+    lines.push(w(`- Indexed metadata fields (queryable with operators):`));
     for (const f of projection.indexed_fields) {
       const declarers = f.tags.map((t) => `#${t}`).join(", ");
       lines.push(`  - ${f.name} (${f.type}; from ${declarers})`);
     }
   } else {
-    lines.push(`- No indexed metadata fields.`);
+    lines.push(w(`- No indexed metadata fields.`));
   }
 
   // Strict fields (vault#299): surface the enforced contract so an agent knows
@@ -480,18 +487,18 @@ export function projectionToMarkdown(args: {
   lines.push("## Querying");
   lines.push("");
   for (const hint of projection.query_hints) {
-    lines.push(`- \`${hint}\``);
+    lines.push(`- \`${w(hint)}\``);
   }
 
   lines.push("");
   lines.push("## Refreshing context");
   lines.push("");
-  lines.push("If schema or tags change during this session, call `vault-info` to refresh the full projection. Call `list-tags { include_schema: true }` for tag-only details.");
+  lines.push("`vault-info` refreshes this; `vault-info { help: \"<tool>\" }` gives a tool's every parameter.");
 
   lines.push("");
   lines.push("## Attachments");
   lines.push("");
-  lines.push(attachmentsInstructionBlock(args.attachments ?? { ticketsEnabled: false }));
+  lines.push(w(attachmentsInstructionBlock(args.attachments ?? { ticketsEnabled: false })));
 
   // Scripting pointer block: the connect-time brief used to dead-end on
   // querying — an agent had no path to "how do I script/automate against this
@@ -502,16 +509,8 @@ export function projectionToMarkdown(args: {
   lines.push("## Scripting & automation (beyond this session)");
   lines.push("");
   lines.push(
-    "This vault is also a plain HTTP API — reach for it when the user wants a script, cron job, or CI step rather than an interactive session:",
+    `For a script or cron job, mint a key (\`parachute auth mint-token --scope vault:${vaultName}:read --ephemeral\`) and call the REST API at \`<hub-origin>/vault/${vaultName}/api/...\`; guide: https://parachute.computer/scripting/`,
   );
-  lines.push(
-    `- Mint a scoped credential: \`parachute auth mint-token --scope vault:${vaultName}:read --ephemeral\` (\`--ephemeral\` = short-lived, ideal for scripts; use \`:write\` to create/edit).`,
-  );
-  lines.push(`- Call the REST API at \`<hub-origin>/vault/${vaultName}/api/...\`.`);
-  lines.push(
-    "- Full guide — copy-paste bash/Python/JS examples, plus how to design tags vs paths vs schemas: https://parachute.computer/scripting/",
-  );
-  lines.push("- For a prompt on a schedule with no code, see Parachute Runner.");
 
   return lines.join("\n");
 }

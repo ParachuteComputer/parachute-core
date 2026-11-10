@@ -201,7 +201,7 @@ function keepPaths(): { path: string; rw: boolean }[] {
   const repo = resolve(import.meta.dir, "..", "..");
   const keep: { path: string; rw: boolean }[] = [{ path: repo, rw: false }];
   // NPM_INSTALL_DIR: the scratch npm and bun installs of the npm package (harness/npm-package.ts).
-  for (const k of ["CANDIDATE_DIR", "OLD_STOCK_DIR", "NPM_INSTALL_DIR"]) if (process.env[k]) keep.push({ path: resolve(process.env[k]!), rw: false });
+  for (const k of ["CANDIDATE_DIR", "OLD_STOCK_DIR", "PREVIOUS_CORE_DIR", "NPM_INSTALL_DIR"]) if (process.env[k]) keep.push({ path: resolve(process.env[k]!), rw: false });
   // A door run (harness/doors) also starts a cloud checkout's two workers in here, on the same loopback as the box:
   // DOOR_KEEP names what that needs read-only (colon-separated), DOOR_SHARE the one folder a run may write and keep
   // (results, a cloud checkout's build scratch). Both are named by the person starting the run; nothing else of the
