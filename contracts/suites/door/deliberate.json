@@ -1,0 +1,23 @@
+{
+  "comment": "Every difference between doors that the door contracts allow. An entry is a fact, a reason and an owner. See harness/doors/compare.ts.",
+  "differences": [
+    {
+      "id": "export-over-http",
+      "keys": [
+        "has/export-over-http",
+        "exit/http.headers"
+      ],
+      "between": [
+        "box",
+        "cloud",
+        "personal"
+      ],
+      "lacks": [
+        "box"
+      ],
+      "why": "A box exports with its own command (`parachute-vault export`); cloud-style doors stream the same files from `GET /api/export`. The files are the same (compared under exit/file.*). A box gets the HTTP exit with 0.9.3.",
+      "owner": "0.9.3 \"the exit\"",
+      "status": "drift"
+    }
+  ]
+}

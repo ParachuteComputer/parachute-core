@@ -13,6 +13,7 @@
     "npm-package": "bun run harness/npm-package.ts",
     "mutants": "bun run harness/mutate.ts",
     "mutants:candidate": "bun run harness/mutate-candidate.ts",
+    "doors": "bun run harness/doors/run.ts",
     "selftest": "bun test --timeout 120000 ./harness/selftest",
     "typecheck": "tsc --noEmit"
   },

@@ -202,6 +202,12 @@ function keepPaths(): { path: string; rw: boolean }[] {
   const keep: { path: string; rw: boolean }[] = [{ path: repo, rw: false }];
   // NPM_INSTALL_DIR: the scratch npm and bun installs of the npm package (harness/npm-package.ts).
   for (const k of ["CANDIDATE_DIR", "OLD_STOCK_DIR", "NPM_INSTALL_DIR"]) if (process.env[k]) keep.push({ path: resolve(process.env[k]!), rw: false });
+  // A door run (harness/doors) also starts a cloud checkout's two workers in here, on the same loopback as the box:
+  // DOOR_KEEP names what that needs read-only (colon-separated), DOOR_SHARE the one folder a run may write and keep
+  // (results, a cloud checkout's build scratch). Both are named by the person starting the run; nothing else of the
+  // host's home is visible.
+  for (const p of (process.env.DOOR_KEEP ?? "").split(":").filter(Boolean)) keep.push({ path: resolve(p), rw: false });
+  for (const p of (process.env.DOOR_SHARE ?? "").split(":").filter(Boolean)) keep.push({ path: resolve(p), rw: true });
   // The tarball and its SHA256SUMS (embedded/bundle checks them against the tree).
   if (process.env.CANDIDATE_TARBALL) keep.push({ path: dirname(resolve(process.env.CANDIDATE_TARBALL)), rw: false });
   keep.push({ path: realpathSync(process.execPath), rw: false });
