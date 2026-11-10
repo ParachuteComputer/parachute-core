@@ -1,7 +1,7 @@
 // Surface D: the vault over MCP. An AI app sees a tool list, each tool's description and input schema, and results.
 // Those are the product for an AI client, so they are compared exactly: same tools, same words, same schemas.
 import { describe, expect, test } from "bun:test";
-import { door, fp, fpEach, mcp, mcpUrl, runId, safeFetch, sha, shape, token } from "./_door.ts";
+import { door, fp, fpEach, mcp, mcpUrl, neutral, runId, safeFetch, sha, shape, token } from "./_door.ts";
 
 describe("the vault over MCP", () => {
   test("no credential: 401 that tells an app where to sign in", async () => {
@@ -39,7 +39,7 @@ describe("the vault over MCP", () => {
         for (const t of tools) {
           fp(`mcp/${level}.tool.${t.name}.present`, true);
           fp(`mcp/${level}.tool.${t.name}.schema`, sha(t.inputSchema));
-          fp(`mcp/${level}.tool.${t.name}.words`, sha(t.description ?? ""));
+          fp(`mcp/${level}.tool.${t.name}.words`, sha(String(neutral(t.description ?? ""))));
           fp(`mcp/${level}.tool.${t.name}.hints`, t.annotations ?? null);
         }
         const init: any = (c.client as any).getServerVersion?.() ?? null;

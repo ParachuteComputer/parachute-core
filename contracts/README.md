@@ -125,6 +125,65 @@ one that now passes.
 named `red()` contracts "now green". A contract that is red today and green under the fix has a red/green proof
 that it tests the fix. When the real fix lands, its flip becomes mutants that put each bug back.
 
+## Doors: one suite, every way of running Parachute
+
+Parachute runs as a box (this repo), as Parachute Cloud (parachute-cloud: two Cloudflare workers) and as a personal
+door (cloud's two workers on someone's own Cloudflare account, one owner). An app that holds a vault's address and a
+credential must not be able to tell which one it is talking to. `suites/door/` is that promise as a test: the same
+files run against each door, and then the doors are compared with each other.
+
+```bash
+bun run build:core
+bun run doors                                    # the box alone
+CLOUD_REPO=<parachute-cloud checkout> bun run doors -- --doors box,cloud
+PERSONAL_REPO=<a checkout with deploy/personal> bun run doors -- --doors box,personal
+bun run doors -- --doors box --check-golden      # CI here: the box must match suites/door/golden/box-0.8.jsonl
+bun run doors -- --doors cloud --with-golden box-0.8   # CI in parachute-cloud: its door against the kept box
+bun run doors -- --remote door.json              # a deployed door (below)
+bun run moves                                    # a made-up vault through all three doors, every direction
+```
+
+- **The contracts are door-blind.** They read a door file (kind, release, where the issuer and the vault answer,
+  how this run is signed in) and speak HTTP and MCP. Getting the first sign-in is the one step that differs between
+  doors on purpose, so it happens in `harness/doors/` (a box's login form; cloud's sign-up; a personal door's owner
+  key over NIP-98). Everything after it goes through the account door, which every door has.
+- **Everything local runs in the sandbox**, on one private loopback: the built box and both workers of each cloud
+  checkout (`wrangler dev`, with the always-remote Workers AI binding taken out of the config it runs from). Nothing
+  reaches the network. A cloud checkout needs its dependencies installed and its engine pin materialised.
+- **Two checks.** Each contract passes on each door. And each run records a *fingerprint*: what an app could
+  branch on without any contract noticing. That is every MCP tool, its input schema and its words, the discovery
+  documents, the status, error code and hint of each refusal, the keys and value types of each reply, the exported
+  files of a fixed made-up note. `harness/doors/compare.ts` compares doors on the same release line fact by fact.
+- **A difference passes only if `suites/door/deliberate.json` names it**, with why and who decides. `deliberate`
+  means meant; `drift` means not meant and not yet fixed. An entry that excuses nothing fails the run, so the list
+  can't outlive the differences. A contract skips itself only through an entry (`lacks`).
+- **Across repos**, the box's fingerprint is kept in `suites/door/golden/`. CI here fails when the box no longer
+  matches it (`bun run doors:keep box-0.8` after a meant change, and commit the diff). parachute-cloud's CI runs its
+  own door from its pin of this folder and compares with the kept box. Neither repo builds the other's door.
+- **A deployed door** is run from a door file written by hand (`kind`, `label`, `release`, `issuer`, `vaultOrigin`,
+  `signIn: {how: "nostr", secretKeyFile}`), with `DOOR_REMOTE_HOSTS` naming its hosts. The run makes two vaults of
+  its own there and removes them. A `parachute.computer` host is always refused: these contracts create and delete
+  vaults.
+
+Results go to `DOOR_RESULTS` (default `.cache/doors`): `MATRIX.md` (every contract on every door), `COMPARE.md`
+(every difference and its verdict), and per door the output, the junit file and the fingerprint.
+
+`bun run moves` (`harness/doors/moves.ts`) is the same idea for moving a vault: [`tools/move`](../tools/move/README.md)
+run as a person would run it, a made-up vault through box, cloud and a personal door in all six directions, each
+arrival checked by digest, then the refusals (a taken name, a changed target, a source written to before it is
+deleted, a note the export format can't carry).
+
+| File | What it holds |
+|---|---|
+| `door/rest.test.ts` | Notes over REST: exact round trip, unique paths, 428/409 on updates, field merge, batches that keep nothing when half bad, paging by offset and by cursor, who may do what, CORS for a browser app, what a vault says about itself. |
+| `door/types.test.ts` | Types: declare and read back, strict and loose fields, find by typed field with every operator, rename and delete. |
+| `door/links.test.ts` | Wikilinks both ways, typed links and find-path, search that forgets, versions and restore, what an admin can list and forget. |
+| `door/mcp.test.ts` | The cold 401 and both discovery addresses; per level, every tool with its schema and words; a write, a read and the refusals through the official SDK; the root `/mcp`. |
+| `door/connect.test.ts` | Discovery, registration, PKCE, the token and its claims, refresh rotation and replay, read-only and admin approvals, revoke, the published keys; the account door (credential, list, mint, make and remove a vault). |
+| `door/files.test.ts` | Upload, attach, byte-equal download, a ranged read, refused active content, tickets over MCP, `read-attachment` (an image block; a text window). |
+| `door/exit.test.ts` | The export: every note, type and file; the bytes of a fixed made-up note are compared across doors (a box's come from its own command). |
+| `door/records.test.ts`, `door/keys.test.ts` | 0.9 doors only: the record door over MCP and REST; the owner's key (NIP-98), named app keys that stop when revoked. |
+
 ## The contracts
 
 | File | What it holds |

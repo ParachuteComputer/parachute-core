@@ -101,3 +101,36 @@ export function compare(prints: Record<string, Fingerprint>, deliberate: Deliber
   out.splice(2, 0, summary, "");
   return { ok, summary, report: `${out.join("\n")}\n` };
 }
+
+/** A fingerprint as it is kept in the repo: one fact per line, sorted, so a change reads as a diff. */
+export function serializeFingerprint(fp: Fingerprint): string {
+  return `${[...fp.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([key, v]) => JSON.stringify({ key, value: JSON.parse(v) })).join("\n")}\n`;
+}
+
+/** The contracts' results from a junit file: name → passed, failed or skipped. */
+export function readJunit(file: string): Map<string, "pass" | "fail" | "skip"> {
+  const out = new Map<string, "pass" | "fail" | "skip">();
+  if (!existsSync(file)) return out;
+  const xml = readFileSync(file, "utf8");
+  const unescape = (s: string) => s.replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+  for (const m of xml.matchAll(/<testcase\b([^>]*?)(\/>|>([\s\S]*?)<\/testcase>)/g)) {
+    const attr = (k: string) => unescape(new RegExp(`${k}="([^"]*)"`).exec(m[1]!)?.[1] ?? "");
+    const name = [attr("classname"), attr("name")].filter(Boolean).join(" > ");
+    const body = m[3] ?? "";
+    out.set(name, /<failure|<error/.test(body) ? "fail" : /<skipped/.test(body) ? "skip" : "pass");
+  }
+  return out;
+}
+
+/** One table: every contract, every door. */
+export function matrix(byDoor: Record<string, Map<string, "pass" | "fail" | "skip">>): string {
+  const labels = Object.keys(byDoor);
+  const names = [...new Set(labels.flatMap((l) => [...byDoor[l]!.keys()]))].sort();
+  const mark = { pass: "pass", fail: "**FAIL**", skip: "skipped" } as const;
+  const rows = names.map((n) => `| ${n.replace(/\|/g, "\\|")} | ${labels.map((l) => (byDoor[l]!.has(n) ? mark[byDoor[l]!.get(n)!] : "–")).join(" | ")} |`);
+  const totals = labels.map((l) => {
+    const v = [...byDoor[l]!.values()];
+    return `${v.filter((x) => x === "pass").length} pass, ${v.filter((x) => x === "fail").length} fail, ${v.filter((x) => x === "skip").length} skipped`;
+  });
+  return [`# Door contracts: every contract, every door`, "", `| Contract | ${labels.join(" | ")} |`, `|---|${labels.map(() => "---").join("|")}|`, ...rows, `| **Total** | ${totals.join(" | ")} |`, "", "A skipped contract is one the door's release doesn't have yet (the record door and keys are 0.9), or one a named difference in `deliberate.json` covers.", ""].join("\n");
+}

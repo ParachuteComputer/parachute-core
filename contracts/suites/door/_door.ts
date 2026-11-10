@@ -31,7 +31,7 @@ export interface Door {
   /** A second vault of the same owner: a credential for `vault` must not open it. */
   otherVault: string;
   /** How this run is signed in as the owner. */
-  signIn: { how: "cookie"; cookie: string; csrf: string } | { how: "nostr"; secretKey: string };
+  signIn: { how: "cookie"; cookie: string; csrf: string } | { how: "nostr"; secretKey: string; secretKeyFile?: string };
   /** 0.9 doors: a made-up key the owner can sign in with (NIP-98), as hex. On a key-only door it is the sign-in. */
   ownerKey?: string;
   /** Where this run may write its fingerprint (one JSON object per line). */
@@ -44,6 +44,17 @@ export function door(): Door {
   const path = process.env.CONTRACT_DOOR;
   if (!path) throw new Error("CONTRACT_DOOR is not set: run the suite with `bun run doors` (harness/doors/run.ts)");
   const d: Door = JSON.parse(readFileSync(path, "utf8"));
+  // These contracts make and delete vaults. They run against a door on this machine's loopback, or against a
+  // deployed door whose hosts the person running them has named (DOOR_REMOTE_HOSTS), and never Parachute Cloud.
+  const named = (process.env.DOOR_REMOTE_HOSTS ?? "").split(",").map((h) => h.trim()).filter(Boolean);
+  for (const url of [d.issuer, d.vaultOrigin]) {
+    const host = new URL(url).hostname;
+    if (/(^|\.)parachute\.computer$/.test(host)) throw new Error(`refused: ${host} is Parachute Cloud; the door contracts never run there`);
+    if (host !== "127.0.0.1" && host !== "localhost" && !named.includes(host)) throw new Error(`refused: ${host} is not this machine and is not named in DOOR_REMOTE_HOSTS`);
+  }
+  // A key kept in a file (a deployed door's made-up owner): read here, so a door file never holds it.
+  if (d.signIn.how === "nostr" && !d.signIn.secretKey && d.signIn.secretKeyFile) d.signIn.secretKey = readFileSync(d.signIn.secretKeyFile, "utf8").trim();
+  if (!d.ownerKey && d.signIn.how === "nostr" && d.release === "0.9") d.ownerKey = d.signIn.secretKey;
   allowOrigins(d.issuer, d.vaultOrigin);
   cached = d;
   return d;

@@ -128,6 +128,7 @@ jobs:
         the moved code (workspace, typecheck, the vault's and hub's own tests)
         today's contracts (+ v1 pending)
         every suite on the candidate build
+        the door contracts on the box (against the kept fingerprint) and the move tool's tests
         Benjamin's compatibility suite on the candidate build
         the npm package, installed with npm and with bun, and Benjamin's suite on it
         mutants on the pinned vault (the contracts must catch each)

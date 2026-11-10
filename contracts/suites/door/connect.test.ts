@@ -221,7 +221,7 @@ describe("the account door (a person's own app)", () => {
     const name = `tmp${runId("v")}`;
     const made = await safeFetch(`${d.issuer}/account/vaults`, { method: "POST", headers: bearer, body: JSON.stringify({ name }) });
     expect(made.status).toBe(201);
-    fpEach("account/vault.create.reply", await made.json());
+    fpEach("account/vault.create.reply", JSON.parse(JSON.stringify(await made.json()).split(name).join("<new>")));
     const again = await safeFetch(`${d.issuer}/account/vaults`, { method: "POST", headers: bearer, body: JSON.stringify({ name }) });
     expect(again.status).toBe(409);
     fp("account/refusal.vault-taken", { status: again.status, error: (await again.json()).error ?? null });

@@ -3,6 +3,12 @@
 //   bun run doors                              the box (the built candidate) and, when CLOUD_REPO is set, cloud
 //   bun run doors -- --doors box,cloud,personal
 //   bun run doors -- suites/door/rest.test.ts  only those files; other args go to `bun test`
+//   bun run doors -- --doors box --check-golden          the box must match the fingerprint kept in suites/door/golden
+//   bun run doors -- --doors cloud --with-golden box-0.8 compare cloud with the box's kept fingerprint (another
+//                                                        repo's CI: it runs its own door and needs no box)
+//   bun run doors:keep box-0.8                           keep the last run's fingerprint as the golden one
+//   bun run doors -- --remote <door.json>                a deployed door, from a door file written by hand; no
+//                                                        sandbox (it needs the network), DOOR_REMOTE_HOSTS names it
 //
 //   CANDIDATE_DIR=<dir>     the box: a built candidate (default .cache/candidate-core, from `bun run build:core`)
 //   CLOUD_REPO=<dir>        cloud: a parachute-cloud checkout, dependencies installed, engine pin materialised
@@ -21,7 +27,7 @@ import { safeFetch } from "../guard.ts";
 import type { Door } from "../../suites/door/_door.ts";
 import { linkOwnerKeyOnBox, startBoxDoor } from "./box.ts";
 import { makeOwnerKey, nostrAuthorization, signUp, startWorkersDoor } from "./workers.ts";
-import { compare, readFingerprint, type Deliberate } from "./compare.ts";
+import { compare, matrix, readFingerprint, readJunit, serializeFingerprint, type Deliberate } from "./compare.ts";
 import { recordExport } from "../../suites/door/_exit.ts";
 import { appendFileSync, readdirSync, statSync } from "node:fs";
 
@@ -37,14 +43,26 @@ if (!inSandbox() && !process.env.PCORE_SANDBOX) {
   // The sandbox's /tmp is its own; a TMPDIR under the hidden home would not exist inside.
   delete process.env.TMPDIR;
 }
-await enterSandbox();
+const remoteAt = process.argv.indexOf("--remote");
+const remoteFile = remoteAt >= 0 ? resolve(process.argv[remoteAt + 1] ?? "") : null;
+// A deployed door is reached over the network, which the sandbox doesn't have. Nothing local is started for it.
+if (!remoteFile) await enterSandbox();
 
 const args = process.argv.slice(2);
 const flag = (name: string) => {
   const i = args.indexOf(name);
   return i >= 0 ? args.splice(i, 2)[1] : undefined;
 };
-const want = (flag("--doors") ?? ["box", process.env.CLOUD_REPO ? "cloud" : "", process.env.PERSONAL_REPO ? "personal" : ""].filter(Boolean).join(",")).split(",");
+flag("--remote");
+const has = (name: string) => {
+  const i = args.indexOf(name);
+  if (i >= 0) args.splice(i, 1);
+  return i >= 0;
+};
+const withGolden = flag("--with-golden");
+const checkGolden = has("--check-golden");
+const goldenDir = join(contracts, "suites", "door", "golden");
+const want = remoteFile ? ["remote"] : (flag("--doors") ?? ["box", process.env.CLOUD_REPO ? "cloud" : "", process.env.PERSONAL_REPO ? "personal" : ""].filter(Boolean).join(",")).split(",");
 const files = args.filter((a) => a.startsWith("suites/"));
 const rest = args.filter((a) => !a.startsWith("suites/"));
 const results = process.env.DOOR_RESULTS!;
@@ -183,7 +201,41 @@ async function startPersonal(): Promise<Started> {
   }
 }
 
-const starters: Record<string, () => Promise<Started>> = { box: startBox, cloud: startCloud, personal: startPersonal };
+/**
+ * A deployed door, from a door file written by hand: kind, label, release, issuer, vaultOrigin, and a sign-in whose
+ * key is in a file (`signIn: {how: "nostr", secretKeyFile}`). The run makes its own two vaults there through the
+ * account door and removes them at the end. DOOR_REMOTE_HOSTS must name the door's hosts (suites/door/_door.ts).
+ */
+async function startRemote(): Promise<Started> {
+  const d = JSON.parse(readFileSync(remoteFile!, "utf8")) as Door;
+  if (d.signIn?.how !== "nostr" || !d.signIn.secretKeyFile) throw new Error("door: a remote door file signs in with a key file: signIn {how: \"nostr\", secretKeyFile}");
+  const { allowOrigins } = await import("../guard.ts");
+  for (const url of [d.issuer, d.vaultOrigin]) {
+    const host = new URL(url).hostname;
+    if (/(^|\.)parachute\.computer$/.test(host)) throw new Error(`refused: ${host} is Parachute Cloud`);
+    if (!(process.env.DOOR_REMOTE_HOSTS ?? "").split(",").map((h) => h.trim()).includes(host)) throw new Error(`refused: name ${host} in DOOR_REMOTE_HOSTS to run against it`);
+  }
+  allowOrigins(d.issuer, d.vaultOrigin);
+  const secretKey = readFileSync(d.signIn.secretKeyFile, "utf8").trim();
+  const id = randomBytes(3).toString("hex");
+  const [vault, other] = [`doorrun${id}`, `doorother${id}`];
+  const bearer = await accountBearerByKey(d.issuer, secretKey);
+  await ensureVault(d.issuer, bearer, vault);
+  await ensureVault(d.issuer, bearer, other);
+  return {
+    door: { ...d, vault, otherVault: other },
+    provenance: `remote: ${d.label} at ${new URL(d.issuer).host} and ${new URL(d.vaultOrigin).host}`,
+    stop: async () => {
+      const b = await accountBearerByKey(d.issuer, secretKey);
+      for (const name of [vault, other]) {
+        await safeFetch(`${d.issuer}/account/vaults/${name}`, { method: "DELETE", headers: { authorization: `Bearer ${b}`, "content-type": "application/json" }, body: JSON.stringify({ confirm: name }) }).catch(() => {});
+      }
+    },
+    logs: () => "",
+  };
+}
+
+const starters: Record<string, () => Promise<Started>> = { box: startBox, cloud: startCloud, personal: startPersonal, remote: startRemote };
 
 let failed = 0;
 const lines: string[] = [];
@@ -236,15 +288,45 @@ for (const name of want) {
   await s.stop();
 }
 
+// One table of every contract on every door.
+if (!files.length && labels.length) writeFileSync(join(results, "MATRIX.md"), matrix(Object.fromEntries(labels.map((l) => [l, readJunit(join(results, l, "junit.xml"))]))));
+
 // The second half: what an app could branch on must be the same on every door, apart from what deliberate.json names.
-if (labels.length > 1 && !files.length) {
+if (!files.length && labels.length) {
   const deliberate: Deliberate[] = JSON.parse(readFileSync(join(contracts, "suites", "door", "deliberate.json"), "utf8")).differences;
   const prints = Object.fromEntries(labels.map((l) => [l, readFingerprint(join(results, l, "fingerprint.jsonl"))]));
-  const c = compare(prints, deliberate);
-  writeFileSync(join(results, "COMPARE.md"), c.report);
-  console.log(c.summary);
-  lines.push(c.summary);
-  if (!c.ok) failed++;
+  for (const l of labels) {
+    const kept = join(goldenDir, `${l}.jsonl`);
+    // This run's fingerprint in the kept form. The repo is read-only in here; `bun run doors:keep <label>` copies it.
+    writeFileSync(join(results, l, "golden.jsonl"), serializeFingerprint(prints[l]!));
+    if (checkGolden) {
+      // The kept fingerprint is what other doors are compared with where this one isn't run (another repo's CI).
+      // A change here is a change to what every door is held to: it shows in the diff of the kept file.
+      const golden = existsSync(kept) ? readFingerprint(kept) : null;
+      const now = serializeFingerprint(prints[l]!);
+      const same = golden !== null && serializeFingerprint(golden) === now;
+      if (!same) {
+        const was = new Map(golden ?? []);
+        const changed = [...new Set([...was.keys(), ...prints[l]!.keys()])].filter((k) => was.get(k) !== prints[l]!.get(k)).sort();
+        console.log(`[doors] ${l}: differs from the kept fingerprint in ${changed.length} fact(s): ${changed.slice(0, 12).join(", ")}${changed.length > 12 ? ", …" : ""}`);
+        console.log(`[doors] if the change is meant: bun run doors:keep ${l}, and commit suites/door/golden/${l}.jsonl`);
+        failed++;
+      }
+      lines.push(`${same ? "PASS" : "FAIL"} golden ${l}`);
+    }
+  }
+  if (withGolden) {
+    const kept = join(goldenDir, `${withGolden}.jsonl`);
+    if (!existsSync(kept)) throw new Error(`door: no kept fingerprint ${kept}`);
+    if (!prints[withGolden]) prints[withGolden] = readFingerprint(kept);
+  }
+  if (Object.keys(prints).length > 1) {
+    const c = compare(prints, deliberate);
+    writeFileSync(join(results, "COMPARE.md"), c.report);
+    console.log(c.summary);
+    lines.push(c.summary);
+    if (!c.ok) failed++;
+  }
 }
 writeFileSync(join(results, "SUMMARY.txt"), `${lines.join("\n")}\n`);
 rmSync(scratch, { recursive: true, force: true });
