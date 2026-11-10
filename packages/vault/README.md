@@ -507,7 +507,12 @@ published_tag: public
 Every vault-touching path is scoped under `/vault/{name}/` — substitute your vault name (e.g. `default`) for `{name}`:
 
 ```
-GET/POST       /vault/{name}/api/notes                           query or create notes
+GET/POST       /vault/{name}/api/records                         query or create records (?type= filters by type)
+GET/PATCH/DEL  /vault/{name}/api/records/:idOrPath                read, update, delete a single record
+GET/POST       /vault/{name}/api/records/:id/attachments          list or add attachments
+GET            /vault/{name}/api/types                            every type and tag with its kind
+GET/PUT/DEL    /vault/{name}/api/types/:name                      get, update (admin) or delete (admin) a type
+GET/POST       /vault/{name}/api/notes                           0.8's name for /api/records (deprecated, gone in 1.0)
 GET/PATCH/DEL  /vault/{name}/api/notes/:idOrPath                  read, update, delete a single note
 GET/POST       /vault/{name}/api/notes/:id/attachments            list or add attachments
 GET            /vault/{name}/api/tags                             list tags (?include_schema=true for schemas)

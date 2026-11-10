@@ -6,7 +6,8 @@ A flat reference for the Parachute Vault REST surface. Intended for humans
 All endpoints serve JSON. Every per-vault resource lives under a vault-scoped
 root:
 
-- `/vault/{name}/api/...` — the REST surface for one vault
+- `/vault/{name}/api/...` — the REST surface for one vault (`/api/records` is the record door
+  from 0.9.1; `/api/notes` is its deprecated alias through 0.9, see "Records" below)
 - `/vault/{name}/mcp[/*]` — the MCP endpoint (not covered here; see
   `core/src/mcp.ts`)
 - `/vault/{name}/.well-known/oauth-{protected-resource,authorization-server}`
@@ -856,7 +857,45 @@ Current effective config values, with `writeOnly` fields (`scribeBearer`,
 }
 ```
 
+### Records (`/api/records`, `/api/types`) — from 0.9.1
+
+"Record" is the noun. `/vault/{name}/api/records[/...]` is every `/api/notes` route below under its new name
+(list, get, create, patch, delete, batch, versions and restore, attachments, retry-transcription), with the same
+scopes and gates, in the words of the MCP record tools (`query-records`, `create-record`, `update-record`,
+`delete-record`; one translator serves both, `core/src/rest-records.ts`):
+
+| `/api/notes` | `/api/records` |
+|---|---|
+| `content`, `metadata`, `content_edit` | `body`, `fields`, `body_edit` |
+| a batch `{notes: [...]}` / `{notes, next_cursor}` | `{records: [...]}` / `{records, next_cursor}` |
+| `?include_content`, `?include_metadata`, `?content_offset`, `?content_length` | `?include_body`, `?include_fields`, `?body_offset`, `?body_length` |
+| `note_id` in an answer (a version row, a conflict) | `record_id` |
+| `tags`: every name on the note, `types` beside it | `tags`: plain labels only; `types`: what it is |
+
+A person's own field names are never renamed (a field called `content` stays `content` inside `fields`).
+
+- **Writes.** `types` names a record's types (`types: ["task"]`; on PATCH `types: {add, remove}`); `tags` takes plain
+  labels only. A type's name in `tags` is refused with the fix: `422 {error_type: "tag_kind", field: "tags", hint:
+  'types: ["task"]'}`, and nothing is written (the MCP record tools refuse it the same way). A body that names an old
+  word beside its new one (`body` and `content`) is refused: `400 {error_type: "invalid_query", field: "body"}`.
+  An old word alone is still taken.
+- **`GET /api/records?type=<name>`** — records of that type and its subtypes (`event` finds `event/meeting`); several
+  types match any of them; with `?tag=`, records carrying all of them. A plain tag's name is refused with the fix
+  (`422 tag_kind`, use `?tag=`). An empty `?type=` is no filter.
+- **`GET /api/types`** — every type and tag with its `kind` (`"type"` or `"tag"`), `count` and `expanded_count`, as
+  MCP `list-types`; `?include_schema=true` adds each one's fields and parents. **`GET /api/types/{name}`** (or
+  `?name=`) — one in full, as `list-types {name}`. **`PUT` / `DELETE /api/types/{name}`**, `POST /api/types/merge`
+  and `POST /api/types/{name}/rename` are `/api/tags`' writes under the new name, and need `vault:admin`.
+  `/api/tags` keeps its 0.8 shape (no `kind`) through 0.9.
+
+**`/api/notes` is leaving.** It answers as before through 0.9, and every answer (success or error) carries
+`Deprecation: true` and `Link: </vault/{name}/api/records/...>; rel="successor-version"`. Each `/api/notes` route's
+use is counted in the home's `run/deprecations.json` (under `names`); `/api/records` and `/api/types` are counted
+under `adopted`. At 1.0 `/api/notes` answers `410 Gone` with the route to use (SPEC v2 §5.1).
+
 ### Notes
+
+The routes below are 0.8's note door; each one is also served under `/api/records` in record words (above).
 
 #### `GET /vault/{name}/api/notes` — `vault:read`
 Query notes. Returns `NoteIndex[]` by default (lean shape). Many filter

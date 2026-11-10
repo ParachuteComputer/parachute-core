@@ -191,6 +191,12 @@ on it unchanged (46 pass, 0 fail, on the tarball and the npm install). What chan
   tools and 8 aliases, in about 11k characters; on 0.8 the same key sees 11 tools in about 61k.
 - **Types and tags.** A tag with fields or parents is a type. Notes gain `types` (the types among their tags) next
   to `tags`, over REST and MCP; `tags` still lists every name. `tags: [...]` writes and `tag:` queries work as today.
+- **REST, from 0.9.1: `/api/records`.** The `/api/notes` routes under their record name, in the record tools' words
+  (`body`, `fields`, `records`, `record_id`, `include_body`; `tags` plain labels beside `types`); `?type=` filters by
+  type; `/api/types` lists every type and tag with its `kind`. The record door refuses a type's name in `tags`
+  (422 `tag_kind`, hint `types: [...]`), on REST and on `create-record`/`update-record`. `/api/notes` answers as
+  before, with a `Deprecation` header and a `Link` to the `/api/records` route; it goes at 1.0. Your probe
+  (`GET /records?limit=1&include_body=false`) gets a JSON array. Version rows keep `content_len` (no `body_len`).
 - **Keys.** Every token becomes a key with the same scopes; `parachute keys list` shows them. Verification is
   unchanged: a token minted by 0.8 or 0.7 still verifies. Scoping keys by type comes in 0.9.1, which moves the hub's
   schema number.

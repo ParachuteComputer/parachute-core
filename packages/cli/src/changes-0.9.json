@@ -900,10 +900,40 @@
   },
   {
    "kind": "endpoint",
-   "old": "/vault/<n>/api/notes*, tags*, storage*, attachments, versions, restore, find-path, vault",
+   "old": "/vault/<n>/api/notes[/...] (every route)",
+   "new": "/vault/<n>/api/records[/...]",
+   "action": "rename",
+   "reason": "record is the noun (from 0.9.1): the same routes in the record tools' words (body, fields, records, types beside tags). /api/notes answers through 0.9 with a Deprecation header and a Link to its /api/records route, each route's use counted in run/deprecations.json; 410 with the fix at 1.0",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "endpoint",
+   "old": "GET /vault/<n>/api/notes?tag=<a type> (subtypes included)",
+   "new": "GET /vault/<n>/api/records?type=<name>",
+   "action": "rename",
+   "reason": "a type is not a label (from 0.9.1): ?type= is query-records' type (the type and its subtypes; with ?tag, records carrying both). /api/notes gains nothing new",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "endpoint",
+   "old": "GET/PUT/DELETE /vault/<n>/api/tags/<name> (type records: fields, parents)",
+   "new": "GET/PUT/DELETE /vault/<n>/api/types/<name>",
+   "action": "rename",
+   "reason": "type records under their own name, beside /api/records (from 0.9.1): GET /api/types lists every type and tag with its kind (as list-types); writing needs admin. /api/tags keeps answering for both kinds through 0.9",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "endpoint",
+   "old": "/vault/<n>/api/tags*, storage*, attachments, find-path, vault",
    "new": "same",
    "action": "keep",
-   "reason": "the vault API: what every Uni script and Prism call today. Each /api/notes route's use is counted in run/deprecations.json; /api/records is decided in the 0.9 spec v2",
+   "reason": "the rest of the vault API keeps its shape; the /api/notes routes are the rename entry above",
    "since": "0.9",
    "removed_in": null,
    "state": "live"
