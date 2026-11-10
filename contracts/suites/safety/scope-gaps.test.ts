@@ -15,6 +15,7 @@
 //  7. A live subscription's scope is re-read on every event, and a note that leaves it is removed; an attachment
 //     ticket is re-checked when it is spent.
 //  8. The string sub-tag fallback: not closed (it would change what vault-scope.test.ts means; see the PR).
+//  9. Deliberate and documented: a hidden note's path answers 409 on create (pinned below: it names nothing more).
 //
 // `private_tags` is set the only way an operator can: in the vault's vault.yaml (see scoped-write.test.ts).
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
@@ -159,6 +160,21 @@ describe("gap 1: a scoped writer can't link into a hidden note, or learn that it
     const r = await op.post("/notes", { content: `see [[${hiddenPath}]]`, path: `${R}/g1/by-op`, tags: [MINE] });
     expect(r.status).toBe(201);
     expect(await linked(r.body.id, hiddenId)).toBe(true);
+  });
+});
+
+// Gap 9, deliberate (documented in packages/vault/docs/contracts/tag-scoped-tokens.md): paths are one namespace for
+// the whole vault, so creating at a hidden note's path answers 409 path_conflict. That says something is there; it
+// must say nothing more. Fixing it needs a path namespace per scope (1.0's grants).
+describe("gap 9 (deliberate): a hidden note's path answers 409 on create, and names nothing of the note", () => {
+  test("409 path_conflict, with no id, tag or content of the hidden note", async () => {
+    const hiddenId = await note(`${R}/g9/taken`, `hidden ${SECRET}`, [OTHER]);
+    const w = rest(s.vaultViaHub, await pass({ level: "write", tags: [MINE] }));
+    const r = await w.post("/notes", { content: "mine", path: `${R}/g9/taken`, tags: [MINE] });
+    expect(r.status).toBe(409);
+    expect(r.body.error_type).toBe("path_conflict");
+    const said = JSON.stringify(r.body);
+    must(!said.includes(hiddenId) && !said.includes(SECRET) && !said.includes(OTHER), `the 409 named the hidden note: ${said.slice(0, 300)}`);
   });
 });
 

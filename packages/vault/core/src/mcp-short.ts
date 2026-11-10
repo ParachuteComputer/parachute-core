@@ -182,7 +182,7 @@ Rarer filters (has_links, order_by, expand_links, created_by, search_mode, …) 
   },
 
   "rename-tag": {
-    description: "Rename a tag everywhere (notes, parents, keys, #mentions); its sub-tags follow.",
+    description: "Rename a tag everywhere (notes, parents, #mentions); its sub-tags follow. If a key's tag limit, private_tags or the published tag uses it, refused until you pass `force: true` (the refusal names them).",
     inputSchema: obj({ old_name: str(), new_name: str(), force: bool("Go ahead although a key's tag limit, private_tags or the published tag uses this name (the refusal names them)"), }, ["old_name", "new_name"]),
   },
 
