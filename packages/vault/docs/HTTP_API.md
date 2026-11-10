@@ -2064,9 +2064,12 @@ the existing schema (mirrors MCP `update-tag`).
   values; no migration touches them. **Parachute Cloud's REST kept the old
   fill until cloud rc.195 (T-437)** (its MCP was already right): a note it
   created or tagged may hold `""`, `0`, `false` or the first enum value in
-  fields it never set. An indexed `date` holding `""` refuses every later
-  edit of the note (`422 schema_validation`, `type_mismatch`) until the field
-  is set or removed: `PATCH` it with `metadata: { "<field>": null }`.
+  fields it never set. A field that is `indexed` or `strict: true` and was
+  filled with a value of the wrong type (`""` in a `date`, `number`, `array`
+  or `object` field) refuses every later edit of the note
+  (`422 schema_validation`, `type_mismatch`) until the field is set or
+  removed: `PATCH` it with `metadata: { "<field>": null }` and
+  `if_updated_at` (or `force: true`).
 - **Honest type list.** `type` accepts all eight of `string`/`boolean`/
   `integer`/`number`/`array`/`object`/`reference`/`date` for storage and
   advisory validation, but only `string`/`integer`/`boolean`/`reference`/
