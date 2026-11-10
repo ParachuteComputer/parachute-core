@@ -56,7 +56,10 @@ export interface Door {
   kind: DoorFile["kind"];
   /** A name for logs: the host, or the home's folder. Never a credential. */
   where: string;
-  /** "0.8" or "0.9". With a vault the caller may read, asked of that vault; without one, the door file's word or a guess. */
+  /**
+   * "0.8", "0.9" or "unknown". Asked of a vault the caller may read: the one named, or any of the owner's when none
+   * is. Never guessed: a door with no vault to ask, and no `release` in its door file, is "unknown".
+   */
   release(vault?: string): Promise<string>;
   hasVault(name: string): Promise<boolean>;
   digest(vault: string): Promise<Digest>;
@@ -173,15 +176,19 @@ export function httpDoor(f: HttpDoorFile, opts: { production?: boolean; asOperat
     async release(vault) {
       if (f.release) return f.release;
       // The record door is 0.9's. Asked with a credential of a vault that exists, so the answer is the door's own:
-      // 200 there is 0.9, 404 is 0.8. Without a vault it is only a guess for the plan's wording.
-      if (vault) {
-        const r = await vaultGet(vault)("/api/records?limit=1");
-        if (r.status === 200) return "0.9";
-        if (r.status === 404) return "0.8";
-        throw new Error(`asking ${new URL(origin).host} for its release gave ${r.status}; name it in the door file ("release": "0.8" or "0.9")`);
+      // 200 there is 0.9, 404 is 0.8. With no vault named, any vault of the owner's will do. A door answers 404 for a
+      // vault it doesn't hold before it looks at the route, so asking without one would always say "0.8".
+      let ask = vault;
+      if (!ask && !operator) {
+        const r = await account("/account/vaults");
+        const j = (await r.json().catch(() => null)) as any;
+        ask = r.ok ? (Array.isArray(j) ? j : (j?.vaults ?? []))[0]?.name : undefined;
       }
-      const r = await call(`${origin}/vault/x/api/records`);
-      return r.status === 404 ? "0.8" : "0.9";
+      if (!ask) return "unknown";
+      const r = await vaultGet(ask)("/api/records?limit=1");
+      if (r.status === 200) return "0.9";
+      if (r.status === 404) return "0.8";
+      throw new Error(`asking ${new URL(origin).host} for its release gave ${r.status}; name it in the door file ("release": "0.8" or "0.9")`);
     },
     async hasVault(name) {
       if (operator) {

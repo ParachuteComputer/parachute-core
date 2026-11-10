@@ -30,7 +30,7 @@ JSON that names a door and where its credentials are kept. It never holds a secr
 - **An owner** signs in with `owner_key_file` (a Nostr key, on a 0.9.1 door), or `session_file` (a browser session's
   cookie and CSRF value as JSON), or `account_token_file` (a credential already held; ten minutes on cloud).
 - **An operator** moving a vault for someone adds `--operator` and names the door's operator token and the owner's
-  address in files. That is how the friends box was moved into Parachute Cloud.
+  address in files. That is the operator import, the path first used to move a box's vaults into Parachute Cloud.
 - **A box** is moved with its own command on the machine it runs on. Its importer needs the database to itself: the
   box is stopped for an import (`parachute stop`), and the tool says so if it isn't.
 - `--production` is needed for a `parachute.computer` host, `--live-box` for this machine's own `~/.parachute`.
@@ -56,8 +56,15 @@ what does not travel, the verdict, and how the old door was closed.
 
 `close` is a second command on purpose: the old door is touched only after you have looked at the new one.
 `--delete` and `--disconnect` first check that nothing was written to the old door since the move, and refuse if
-something was. `--delete` takes the old vault's history and the door's backups of it. `--disconnect` stops every
-connected app and named key there and keeps the vault. `--keep "<why>"` records that it stays.
+something was. `--delete` also reads the new door first and keeps the old vault unless the new one still holds most
+of what was moved, by note and by file (the new door is in use by then, so notes added, edited or removed there are
+expected; a door that was wiped or reset is not). It takes the old vault's history and the door's backups of it.
+`--disconnect` stops every connected app and named key there and keeps the vault. `--keep "<why>"` records that it
+stays.
+
+A door's release is asked, never guessed: of the vault itself, or of any vault the owner has there. A target with no
+vault to ask is "unknown" until the new vault exists; name it in the door file (`"release": "0.9"`) to have the plan
+check a step down a release before anything moves.
 
 ## The digest
 

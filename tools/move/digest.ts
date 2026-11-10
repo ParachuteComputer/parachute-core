@@ -1,7 +1,7 @@
 // What a vault holds, as counts and sha256 digests, read the same way from any door, so "the same vault after the
 // move" is one comparison in every direction.
 //
-// Grown from the operator import's proof (T-379, the tool that moved the friends box into Parachute Cloud), which
+// Grown from the operator import's proof (T-379, the tool that moves a box's vaults into Parachute Cloud), which
 // read the box's database on one side and cloud's REST on the other. Two readers now:
 //   - `digestOverRest`: any door, through the vault's own REST: notes paged with content, links and files; types;
 //     each file's bytes;
@@ -387,4 +387,31 @@ export function compareDigests(
   const verdict = allSame ? "DIGEST EQUAL" : bad ? "DIGEST DIFFERS" : "DIGEST EQUAL EXCEPT REVIEWED ITEMS";
   out.push(`${verdict}${verdict === "DIGEST EQUAL EXCEPT REVIEWED ITEMS" ? ` (${reviewed})` : ""} (all: ${a.digests.all.slice(0, 16)} vs ${b.digests.all.slice(0, 16)})`);
   return { verdict, ok: !bad, reviewed, lines: out };
+}
+
+/**
+ * How much of what was moved is still at a door, for the check before the old copy is deleted. After a move the new
+ * door is in use: notes are added, edited and removed there, and none of that is a reason to keep the old copy. A
+ * new door that was wiped, reset or lost is. So this counts, by note id: still there, changed, gone, added.
+ */
+export function stillHolds(moved: Digest, now: Digest): { moved: number; there: number; changed: number; gone: number; added: number; files: { moved: number; there: number } } {
+  const id = (line: string) => JSON.parse(line)[0] as string;
+  const was = new Map(moved.lines.notes.map((l) => [id(l), l]));
+  const is = new Map(now.lines.notes.map((l) => [id(l), l]));
+  let there = 0;
+  let changed = 0;
+  for (const [k, line] of was) {
+    if (!is.has(k)) continue;
+    there++;
+    if (is.get(k) !== line) changed++;
+  }
+  const files = new Set(now.files.map((f) => `${f.path}\t${f.sha256}`));
+  return {
+    moved: was.size,
+    there,
+    changed,
+    gone: was.size - there,
+    added: [...is.keys()].filter((k) => !was.has(k)).length,
+    files: { moved: moved.files.length, there: moved.files.filter((f) => files.has(`${f.path}\t${f.sha256}`)).length },
+  };
 }

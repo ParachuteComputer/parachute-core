@@ -16,7 +16,7 @@
 //                          verdict then excuses exactly those notes and no others
 //   --operator             the target door is entered as its operator, for an owner named in the door file
 //   --target-unchecked     close --delete without reading the new door first (it is read by default, and the old
-//                          vault is kept unless the new one still holds what was moved)
+//                          vault is kept unless the new one still holds most of what was moved)
 //   --production           allow a parachute.computer host
 //   --live-box             allow this machine's own ~/.parachute as a box
 //
@@ -25,7 +25,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { compareDigests, SECTIONS, type Digest } from "./digest.ts";
+import { compareDigests, SECTIONS, stillHolds, type Digest } from "./digest.ts";
 import { filesFromExport, openDoor, type Door } from "./doors.ts";
 import { tar } from "./tar.ts";
 
@@ -81,12 +81,22 @@ async function plan(from: Door, to: Door, vault: string, as: string, acceptLoss:
   say(missing === 0, missing ? `${missing} file(s) are listed on notes but their bytes are gone at the source` : "every attached file's bytes are there");
   const big = to.kind === "box" ? [] : source.files.filter((f) => f.size > MAX_FILE_BYTES);
   say(big.length === 0, big.length ? `${big.length} file(s) are over 50 MiB, the most this door takes in one piece` : "every file fits the target's door");
+  // A step down a release matters only for a 0.9 source. The target's release is known when its door file names it
+  // or the owner already has a vault there to ask; otherwise it is asked of the new vault after the import, and the
+  // plan says what that could mean rather than guessing.
   const down = fr === "0.9" && tr === "0.8";
-  if (down && source.counts.bare_types) {
+  const mightBeDown = fr === "0.9" && tr === "unknown";
+  if ((down || mightBeDown) && source.counts.bare_types) {
     const inUse = new Set(source.lines.tags_in_use);
     const unused = source.lines.bare_types.filter((name) => !inUse.has(name)).length;
-    lines.push(`     going from 0.9 to 0.8: ${source.counts.bare_types - unused} type(s) with no fields will be tags there (types again on a 0.9 door)`);
-    if (unused) say(acceptLoss, `${unused} type(s) with no fields are on no note, and 0.8 has nowhere to keep them${acceptLoss ? ": accepted with --accept-format-loss" : ": put one on a note, or pass --accept-format-loss to leave them behind"}`);
+    const lead = down ? "going from 0.9 to 0.8" : `${to.where} has no vault of yours to ask its release; if it is 0.8`;
+    lines.push(`     ${lead}: ${source.counts.bare_types - unused} type(s) with no fields will be tags there (types again on a 0.9 door)`);
+    if (unused) {
+      say(
+        acceptLoss,
+        `${unused} type(s) with no fields are on no note, and 0.8 has nowhere to keep them${acceptLoss ? ": accepted with --accept-format-loss" : down ? ": put one on a note, or pass --accept-format-loss to leave them behind" : `: name the target's release in its door file ("release": "0.9") if it is 0.9, or pass --accept-format-loss`}`,
+      );
+    }
   }
   const risky = [...new Set(source.risks.map((r) => r.id))];
   if (risky.length) {
@@ -163,35 +173,43 @@ async function run(): Promise<void> {
     log(`${exported.files.length} files by ${exported.how}; ${files.length} attached file(s) match the source's bytes`);
     const description = (await from.description(vault!)) ?? "";
 
-    console.log("== import");
-    await to.importNew(as!, exported, files, log);
-
-    // From here the new vault exists. Whatever happens next is written down, so a failed check never leaves a vault
-    // at the target with no record of how it got there.
-    const failedAfterImport = (err: unknown): never => {
+    // From the import on, whatever happens is written down, so a move that stops half-way never leaves a vault at
+    // the target with no record of how it got there.
+    const stopped = (verdict: string, said: string, err: unknown): never => {
       const why = (err as Error).message;
       writeFileSync(
         join(out, "MOVE.json"),
-        `${JSON.stringify({ format: MANIFEST_FORMAT, vault, moved_as: as, source: { door: from.kind, where: from.where }, target: { door: to.kind, where: to.where }, verified: false, verdict: "NOT CHECKED", error: why, doors: { from: resolve(fromFile!), to: resolve(toFile!) } }, null, 2)}\n`,
+        `${JSON.stringify({ format: MANIFEST_FORMAT, vault, moved_as: as, source: { door: from.kind, where: from.where }, target: { door: to.kind, where: to.where }, verified: false, verdict, error: why, doors: { from: resolve(fromFile!), to: resolve(toFile!) } }, null, 2)}\n`,
       );
-      return die(`move: after the import, the check did not finish (${why}). The new vault ${as} at ${to.where} exists and was NOT verified; the old one was not touched. Look at it, remove it, and run the move again.`, 1);
+      rmSync(scratch, { recursive: true, force: true });
+      return die(`move: ${said} (${why}). The old vault was not touched. Look at ${as} at ${to.where}, remove it if it is there, and run the move again.`, 1);
     };
+
+    console.log("== import");
+    try {
+      await to.importNew(as!, exported, files, log);
+    } catch (err) {
+      return stopped("IMPORT INCOMPLETE", `the import did not finish, so ${as} at ${to.where} may be there in part`, err);
+    }
+
     let described = false;
     let target: Digest;
     let again: Digest;
-    let down = p.down;
+    let targetRelease: string;
     try {
       // The export carries the description, but no door's import applies it: it is set again here, before the
       // target is read, so the digest holds it too.
       described = description ? await to.describe(as!, description) : false;
       console.log("== verify");
-      // Asked of the new vault itself now, not guessed: only a real step down a release excuses a type becoming a tag.
-      down = p.from === "0.9" && (await to.release(as!)) === "0.8";
+      // Asked of the new vault itself, never guessed: this is what the manifest records, and what decides whether a
+      // type with no fields may have become a tag.
+      targetRelease = await to.release(as!);
       target = await to.digest(as!);
       again = await from.digest(vault!);
     } catch (err) {
-      return failedAfterImport(err);
+      return stopped("NOT CHECKED", `after the import, the check did not finish, so ${as} at ${to.where} exists and was NOT verified`, err);
     }
+    const down = p.from === "0.9" && targetRelease === "0.8";
     const still = compareDigests(p.source, again, { names: ["source before", "source after"] });
     const atHandOver = operator && !!description;
     const moved = compareDigests(p.source, target, { acceptNotes: p.accept, dropBareTypes: down ? (p.acceptLoss ? "and-unused" : true) : false, descriptionAtHandOver: atHandOver, names: ["source", "target"] });
@@ -202,7 +220,7 @@ async function run(): Promise<void> {
       try {
         await to.finish(as!, `move ${vault}`, description || undefined);
       } catch (err) {
-        return failedAfterImport(err);
+        return stopped("VERIFIED, NOT HANDED OVER", `the vault arrived and was verified, but handing ${as} to its owner at ${to.where} did not finish`, err);
       }
     }
 
@@ -213,7 +231,7 @@ async function run(): Promise<void> {
       vault,
       moved_as: as,
       source: { door: from.kind, where: from.where, release: p.from },
-      target: { door: to.kind, where: to.where, release: down ? "0.8" : p.to, entered_as: operator ? "operator" : "owner" },
+      target: { door: to.kind, where: to.where, release: targetRelease, entered_as: operator ? "operator" : "owner" },
       exported: { by: exported.how, files: exported.files.length, tar_sha256: sha256(packed), tar_bytes: packed.length },
       attached_files: files.map((f) => ({ path: f.path, bytes: f.bytes.length, sha256: f.sha256 })),
       digests: { source: publicDigest(p.source), source_after: publicDigest(again), target: publicDigest(target) },
@@ -257,6 +275,7 @@ async function close(): Promise<void> {
   const unchecked = has("--target-unchecked");
   const opts = { production: has("--production"), liveBox: has("--live-box") };
   if ([keep !== undefined, disconnect, del].filter(Boolean).length !== 1) die("say one of --keep \"<why>\", --disconnect, --delete", 2);
+  if (unchecked && !del) die("--target-unchecked goes with --delete", 2);
   const file = join(dir, "MOVE.json");
   const m = JSON.parse(readFileSync(file, "utf8"));
   if (m.format !== MANIFEST_FORMAT || !m.verified) die("that move was not verified: there is nothing to close", 1);
@@ -283,20 +302,22 @@ async function close(): Promise<void> {
       // Deleting the old copy is only safe while the new one is still what was moved. Read it again now: a target
       // that was deleted, reset or changed since the move means the old vault may be the only good copy.
       if (!unchecked) {
-        let held = false;
         let why = "";
+        let held: ReturnType<typeof stillHolds> | null = null;
         try {
-          const target = await openDoor(m.doors.to, { scratch, ...opts }).digest(m.moved_as);
-          const down = m.source.release === "0.9" && m.target.release === "0.8" ? (m.accept_format_loss ? ("and-unused" as const) : true) : false;
-          const c = compareDigests(before, target, { acceptNotes: m.accepted_before_the_move ? before.risks : [], dropBareTypes: down, names: ["at the move", "the new door now"] });
-          held = c.ok;
-          if (!held) for (const l of c.lines) console.log(l);
+          held = stillHolds(before, await openDoor(m.doors.to, { scratch, ...opts }).digest(m.moved_as));
         } catch (err) {
           why = (err as Error).message;
         }
-        if (!held) {
+        if (held) {
+          console.log(`the new door (${m.target.where}) now: ${held.there} of ${held.moved} moved notes are there (${held.changed} changed since), ${held.gone} gone, ${held.added} added; ${held.files.there} of ${held.files.moved} moved files are there`);
+        }
+        // The new door is in use, so notes there change. What must not be true is that it lost the vault: fewer than
+        // half of the moved notes, or of the moved files, still there means it was wiped, reset or replaced.
+        const lost = held !== null && (held.there * 2 < held.moved || held.files.there * 2 < held.files.moved);
+        if (!held || lost) {
           die(
-            `refused: ${why ? `the new door (${m.target.where}) could not be read (${why})` : `the new door (${m.target.where}) no longer holds what was moved`}. The vault at ${from.where} is not deleted. ` +
+            `refused: ${!held ? `the new door (${m.target.where}) could not be read (${why})` : `the new door (${m.target.where}) no longer holds most of what was moved`}. The vault at ${from.where} is not deleted. ` +
               "If the new door can't be read from here (a vault moved by an operator is readable only by its owner), check it there and pass --target-unchecked.",
             1,
           );

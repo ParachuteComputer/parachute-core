@@ -5,7 +5,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { boxDescription, compareDigests, formatRisks, sha, SECTIONS, type Digest, type Section } from "./digest.ts";
+import { boxDescription, compareDigests, formatRisks, sha, SECTIONS, stillHolds, type Digest, type Section } from "./digest.ts";
 import { filesFromExport } from "./doors.ts";
 import { tar, untar } from "./tar.ts";
 
@@ -176,5 +176,28 @@ describe("a box's description", () => {
     writeFileSync(y, 'name: atlas\ncreated_at: "2026-11-01T00:00:00.000Z"\n');
     expect(boxDescription(y)).toBeNull();
     expect(boxDescription(join(dir, "missing.yaml"))).toBeNull();
+  });
+});
+
+describe("before the old copy is deleted: does the new door still hold the vault?", () => {
+  const file = (path: string, bytes: string) => ({ note: "a", path, mime: "image/png", size: 3, sha256: sha(bytes) });
+  const moved = digestOf({ notes: ["a", "b", "c", "d"].map((id) => note(id, id)) }, { files: [file("x.png", "x"), file("y.png", "y")] });
+
+  test("a new door in normal use still holds it: notes added, one edited, one removed", () => {
+    const now = digestOf({ notes: [note("a", "a"), note("b", "edited"), note("c", "c"), note("new", "n")] }, { files: [file("x.png", "x"), file("y.png", "y")] });
+    expect(stillHolds(moved, now)).toEqual({ moved: 4, there: 3, changed: 1, gone: 1, added: 1, files: { moved: 2, there: 2 } });
+  });
+
+  test("a wiped or reset door doesn't: a fresh vault's own notes don't count", () => {
+    const reset = digestOf({ notes: [note("seed1", "s"), note("seed2", "s")] });
+    const h = stillHolds(moved, reset);
+    expect([h.there, h.added, h.files.there]).toEqual([0, 2, 0]);
+    expect(h.there * 2 < h.moved).toBe(true);
+  });
+
+  test("files count on their own: the notes there but the files gone is a loss", () => {
+    const h = stillHolds(moved, digestOf({ notes: moved.lines.notes }, { files: [file("x.png", "other bytes")] }));
+    expect(h.there).toBe(4);
+    expect(h.files.there).toBe(0);
   });
 });

@@ -17,7 +17,7 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSyn
 import { randomBytes } from "node:crypto";
 import { join, resolve } from "node:path";
 import { enterSandbox, inSandbox } from "../sandbox.ts";
-import { loadCandidate, prepareInfo } from "../candidate.ts";
+import { loadCandidate, prepareInfo, runCli } from "../candidate.ts";
 import { safeFetch } from "../guard.ts";
 import { compareDigests, digestFromBox, digestOverRest } from "../../../tools/move/digest.ts";
 import { emptyBoxHome, serveBoxHome, startBoxDoor } from "./box.ts";
@@ -244,8 +244,14 @@ try {
   }
 
   // ── the other three directions ───────────────────────────────────────────────────────────────────────────
-  await move("cloud-to-box", CLOUD, BOX_C, "atlas");
-  // Entered as the operator, the way a vault is moved for someone (the path proven for the friends box).
+  const m4 = await move("cloud-to-box", CLOUD, BOX_C, "atlas");
+  if (m4.ok) {
+    // The new copy is lost (here: removed from the box). Deleting the old one now would leave none: refused.
+    const gone = await runCli(info, homeC.home, ["remove", "atlas", "--yes"], { bin: info.vaultBin });
+    const c = await after(m4, ["close", "--delete"]);
+    res(gone.code === 0 && c.code === 1 && /is not deleted/.test(c.out) && (await listVaults(cloud)).includes("atlas"), "close --delete is refused when the new door no longer holds the vault", c.out.trim().split("\n").pop()?.slice(0, 150));
+  }
+  // Entered as the operator, the way a vault is moved for someone (the operator import).
   const m5 = await move("box-to-personal", BOX_A, PERSONAL_OP, "fieldnotes", ["--operator"]);
   if (m5.ok) {
     // The operator can't read a vault once it is handed over, and the door sets the description at that moment. The
