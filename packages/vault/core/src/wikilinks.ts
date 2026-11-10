@@ -734,8 +734,21 @@ export function syncWikilinks(
   db: Database,
   noteId: string,
   content: string,
+  /**
+   * Scope gap 1: which notes the WRITER may see (a tag-scoped writer only).
+   * A target it can't see is handled as a target that matched nothing:
+   * queued, never linked, so the write neither makes a link into a hidden
+   * note nor tells the writer it exists. A link to it that is already there
+   * (made by someone who could see it) is kept.
+   */
+  visible?: (noteId: string) => boolean,
 ): { added: number; removed: number; unresolved: string[]; ambiguous: AmbiguousWikilinkTarget[] } {
   const targetMap = dedupeWikilinkTargets(parseWikilinks(content));
+
+  // Get existing wikilink links from this note
+  const existing = linkOps.getLinks(db, noteId, { direction: "outbound" })
+    .filter((l) => l.relationship === WIKILINK_REL);
+  const existingTargets = new Set(existing.map((l) => l.targetId));
 
   // Resolve each unique target
   const resolvedLinks = new Map<string, { targetId: string; wl: ParsedWikilink }>();
@@ -746,9 +759,12 @@ export function syncWikilinks(
     const detail = resolveWikilinkDetailed(db, wl.target);
     if (detail.resolved) {
       // Don't create self-links — silently skipped, same as before.
-      if (detail.note_id !== noteId) {
-        resolvedLinks.set(detail.note_id!, { targetId: detail.note_id!, wl });
+      if (detail.note_id === noteId) continue;
+      if (visible && !visible(detail.note_id!) && !existingTargets.has(detail.note_id!)) {
+        unresolved.push(wl.target);
+        continue;
       }
+      resolvedLinks.set(detail.note_id!, { targetId: detail.note_id!, wl });
     } else if (detail.ambiguous) {
       ambiguous.push({ target: wl.target, count: detail.candidates.length });
     } else {
@@ -756,11 +772,6 @@ export function syncWikilinks(
     }
   }
 
-  // Get existing wikilink links from this note
-  const existing = linkOps.getLinks(db, noteId, { direction: "outbound" })
-    .filter((l) => l.relationship === WIKILINK_REL);
-
-  const existingTargets = new Set(existing.map((l) => l.targetId));
   const desiredTargets = new Set(resolvedLinks.keys());
 
   // Add new links
@@ -1721,6 +1732,13 @@ export function resolveOrQueueLink(
   sourceId: string,
   target: string,
   relationship: string,
+  /**
+   * Scope gap 1: which notes the writer may see (tag-scoped writers only). A
+   * target it can't see resolves as one that matched nothing: queued, and the
+   * caller gives the same `unresolved_link` warning, so no link is made into
+   * a hidden note and the answer doesn't say one exists.
+   */
+  visible?: (noteId: string) => boolean,
 ): ResolveOrQueueOutcome {
   const detail = resolveLinkTargetDetailed(db, target);
   if (detail.ambiguous) {
@@ -1734,7 +1752,7 @@ export function resolveOrQueueLink(
   // Not ambiguous (any more): drop a stale row this exact (source, target,
   // relationship) may have left behind on an earlier write.
   clearAmbiguousLinkTarget(db, sourceId, relationship, target);
-  if (detail.resolved) return { status: "resolved", note_id: detail.note_id! };
+  if (detail.resolved && (!visible || visible(detail.note_id!))) return { status: "resolved", note_id: detail.note_id! };
   queueUnresolvedLink(db, sourceId, target, relationship);
   return { status: "queued" };
 }
@@ -1760,12 +1778,18 @@ export function getContentWikilinkWarnings(
   db: Database,
   noteId: string,
   content: string,
+  /** Scope gap 1: a target the writer can't see warns as one that matched nothing (see {@link syncWikilinks}). */
+  visible?: (noteId: string) => boolean,
 ): QueryWarning[] {
   const targetMap = dedupeWikilinkTargets(parseWikilinks(content));
   const warnings: QueryWarning[] = [];
 
   for (const [, wl] of targetMap) {
     const detail = resolveWikilinkDetailed(db, wl.target);
+    if (detail.resolved && visible && detail.note_id !== noteId && !visible(detail.note_id!)) {
+      warnings.push(unresolvedLinkWarning(wl.target, WIKILINK_REL));
+      continue;
+    }
     if (detail.resolved) continue; // resolved (incl. self-link) — nothing to warn about
     if (detail.ambiguous) {
       warnings.push(ambiguousLinkWarning(wl.target, WIKILINK_REL, detail.candidates.length));

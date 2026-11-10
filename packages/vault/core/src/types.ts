@@ -474,7 +474,7 @@ export interface Store {
   // Notes. `actor` / `via` carry write-attribution (vault#298) — the
   // principal + interface stamped onto created_by/created_via (and mirrored
   // into the last_updated_* pair on create). Omitted → attribution NULL.
-  createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string; extension?: string; actor?: string | null; via?: string | null; /** Bulk import only; see SqliteStore.createNote. */ deferWikilinkSync?: boolean }): Promise<Note>;
+  createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string; extension?: string; actor?: string | null; via?: string | null; /** Bulk import only; see SqliteStore.createNote. */ deferWikilinkSync?: boolean; /** Scope gap 1: the writer's visibility (see SqliteStore.updateNote). */ linkVisible?: (noteId: string) => boolean }): Promise<Note>;
   getNote(id: string): Promise<Note | null>;
   /**
    * Look up a note by path. Pass `extension` to disambiguate when
@@ -506,7 +506,7 @@ export interface Store {
        * update-note executor must not either. §10.24 pins that.
        */
       historyOp?: HistoryOp;
-      actor?: string | null; via?: string | null; if_updated_at?: string; tagsForSchemaResolution?: string[] }): Promise<Note>;
+      actor?: string | null; via?: string | null; if_updated_at?: string; tagsForSchemaResolution?: string[]; /** Scope gap 1: the writer's visibility (see SqliteStore.updateNote). */ linkVisible?: (noteId: string) => boolean }): Promise<Note>;
   /**
    * Set a note's `created_at` and `updated_at` explicitly. Import-only:
    * used by the portable-md round-trip path to restore timestamps from

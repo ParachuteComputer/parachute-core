@@ -1077,6 +1077,19 @@ function parseSearchModeParam(url: URL): { mode?: SearchMode; error?: Response }
  * of this target's candidates can the reader see" is one question, and the
  * ambiguous (>=2 visible) and broken (0 visible) answers are two faces of it.
  */
+/**
+ * Scope gap 1: the store-write option that keeps a tag-scoped writer's links
+ * inside its scope. A structured link, `[[wikilink]]` or reference-field value
+ * naming a note the writer can't see resolves as one to nothing: queued, with
+ * the same `unresolved_link` warning, never a link into the hidden note.
+ * Unscoped: no option, unchanged. The same predicate goes to
+ * `resolveOrQueueLink`/`getContentWikilinkWarnings` on every write path.
+ */
+function linkOptFor(db: Database, tagScope: TagScopeCtx): { linkVisible?: (noteId: string) => boolean } {
+  const linkVisible = ambiguityVisibilityFor(db, tagScope);
+  return linkVisible ? { linkVisible } : {};
+}
+
 function ambiguityVisibilityFor(
   db: Database,
   tagScope: TagScopeCtx,
@@ -2565,6 +2578,7 @@ async function handleNotesInner(
         if (Object.keys(updates).length > 0 || incomingTags.length > 0 || hasLinkMutation) {
           result = await store.updateNote(existingNote.id, {
             ...updates,
+            ...linkOptFor(db, tagScope),
             actor: writeCtx.actor,
             via: writeCtx.via,
           });
@@ -2645,6 +2659,7 @@ async function handleNotesInner(
           let note: Note;
           try {
             note = await store.createNote(item.content ?? "", {
+              ...linkOptFor(db, tagScope),
               id: item.id,
               path: item.path,
               tags: item.tags,
@@ -2697,7 +2712,7 @@ async function handleNotesInner(
         // surfaces a distinct `ambiguous_link` warning instead. Never silent.
         for (const { sourceId, links } of pendingLinks) {
           for (const link of links) {
-            const outcome = resolveOrQueueLink(db, sourceId, link.target, link.relationship);
+            const outcome = resolveOrQueueLink(db, sourceId, link.target, link.relationship, linkOptFor(db, tagScope).linkVisible);
             if (outcome.status === "resolved") {
               await store.createLink(sourceId, outcome.note_id, link.relationship);
             } else if (outcome.status === "ambiguous") {
@@ -2711,7 +2726,7 @@ async function handleNotesInner(
         // --- Content-wikilink warnings (vault#570) ---
         // Same forward-ref-aware timing as the structured-links pass above.
         for (const { noteId, content } of contentWikilinkNotes) {
-          for (const warning of getContentWikilinkWarnings(db, noteId, content)) {
+          for (const warning of getContentWikilinkWarnings(db, noteId, content, linkOptFor(db, tagScope).linkVisible)) {
             pushLinkWarning(noteId, warning);
           }
         }
@@ -3271,7 +3286,7 @@ async function handleNotesInner(
             metadata: createOpts.metadata,
             defaultTags: createOpts.tags,
           }, tagScope);
-          const created = await store.createNote(content, createOpts);
+          const created = await store.createNote(content, { ...createOpts, ...linkOptFor(db, tagScope) });
           if (tagsArr.length > 0) {
             await applySchemaDefaults(store, db, [created.id], tagsArr);
           }
@@ -3295,7 +3310,7 @@ async function handleNotesInner(
           const createWarnings: QueryWarning[] = [];
           if (linksAdd) {
             for (const link of linksAdd) {
-              const outcome = resolveOrQueueLink(db, created.id, link.target, link.relationship);
+              const outcome = resolveOrQueueLink(db, created.id, link.target, link.relationship, linkOptFor(db, tagScope).linkVisible);
               if (outcome.status === "resolved") {
                 await store.createLink(created.id, outcome.note_id, link.relationship, link.metadata);
               } else if (outcome.status === "ambiguous") {
@@ -3310,7 +3325,7 @@ async function handleNotesInner(
           // create path, so there's no batch-sibling forward-ref to wait for
           // — compute right away against the committed content.
           if (content) {
-            createWarnings.push(...getContentWikilinkWarnings(db, created.id, content));
+            createWarnings.push(...getContentWikilinkWarnings(db, created.id, content, linkOptFor(db, tagScope).linkVisible));
           }
           const scopedCreateWarnings = narrowWriteWarnings(db, createWarnings, tagScope);
           const final = await store.getNote(created.id);
@@ -3582,7 +3597,7 @@ async function handleNotesInner(
         // `skipUpdatedAt` isn't set, so this still issues a real UPDATE.
         updates.actor = writeCtx.actor;
         updates.via = writeCtx.via;
-        await store.updateNote(note.id, updates);
+        await store.updateNote(note.id, { ...updates, ...linkOptFor(db, tagScope) });
       }
 
       // --- Remove links (after core UPDATE; conflict would have thrown already) ---
@@ -3607,7 +3622,7 @@ async function handleNotesInner(
       const linkWarnings: QueryWarning[] = [];
       if (body.links?.add) {
         for (const link of body.links.add as { target: string; relationship: string; metadata?: Record<string, unknown> }[]) {
-          const outcome = resolveOrQueueLink(db, note.id, link.target, link.relationship);
+          const outcome = resolveOrQueueLink(db, note.id, link.target, link.relationship, linkOptFor(db, tagScope).linkVisible);
           if (outcome.status === "resolved") {
             await store.createLink(note.id, outcome.note_id, link.relationship, link.metadata);
           } else if (outcome.status === "ambiguous") {
@@ -3633,7 +3648,7 @@ async function handleNotesInner(
       // handles a single note (no batch-sibling forward-ref to wait for),
       // so compute right away against the committed content.
       if (contentChanged) {
-        linkWarnings.push(...getContentWikilinkWarnings(db, note.id, updatedNote.content));
+        linkWarnings.push(...getContentWikilinkWarnings(db, note.id, updatedNote.content, linkOptFor(db, tagScope).linkVisible));
       }
       let validated: any = attachValidationStatus(store, db, updatedNote, buildExpandVisibility(tagScope.allowed, tagScope.raw));
       // Tag-scope (vault#568): the update response echoes the STORED note, so
