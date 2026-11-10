@@ -299,8 +299,16 @@ export class SubscriptionManager {
   private ensureHooks(): void {
     if (this.hooksRegistered) return;
     this.hooksRegistered = true;
-    const onNoteEvent = (event: HookEvent) => (payload: NoteHookPayload, store: Store) => {
-      this.dispatch(event, payload, store);
+    // Scope gap 7: wait one macrotask, then read the note again. A REST PATCH
+    // or an MCP update-note applies `tags` add/remove AFTER the update that
+    // fires this hook, so the hook's own read can see the tags from before:
+    // a note retagged out of a scope stayed on the socket, and no remove was
+    // sent. Those tag writes finish without I/O, so one macrotask is enough;
+    // events keep their order (each waits the same way, FIFO).
+    const onNoteEvent = (event: HookEvent) => async (payload: NoteHookPayload, store: Store) => {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const fresh = event === "deleted" ? payload : ((await store.getNote(payload.id)) ?? payload);
+      this.dispatch(event, fresh, store);
     };
     // NO `when` — a subscription must see all events to detect set-exit.
     this.unregisters.push(

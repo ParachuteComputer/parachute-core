@@ -209,7 +209,7 @@ describe("a tag-scoped pass", () => {
     const mine = await noteWithHistory("scoped-mine");
     const theirs = await note(`${R}/scoped-theirs`, "made up", [OTHER]);
     for (const level of ["write", "admin"] as const) {
-      const scoped = await pass({ level, tags: [TAG] });
+      const scoped = level === "admin" ? await scopedAdmin([TAG]) : await pass({ level, tags: [TAG] });
       await expect(viaMcp(scoped, { ids: [mine, theirs] })).rejects.toThrow(/not_found|not found/i);
     }
     await expect(viaMcp(await scopedAdmin([TAG]), { ids: [mine, theirs], erase_history: true })).rejects.toThrow(/not_found|not found/i);
