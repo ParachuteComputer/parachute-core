@@ -67,6 +67,20 @@ function masked(warnings: unknown, target: string): string {
   return JSON.stringify(warnings ?? []).split(target).join("<target>");
 }
 
+/** PATCH a note as the operator, with the `if_updated_at` precondition every PATCH needs. */
+async function opPatch(id: string, body: Record<string, unknown>): Promise<Reply> {
+  const at = (await op.get(`/notes/${enc(id)}`)).body?.updatedAt;
+  const r = await op.patch(`/notes/${enc(id)}`, { ...body, if_updated_at: at });
+  if (r.status !== 200) throw new Error(`setup: PATCH ${id} gave ${r.status}: ${JSON.stringify(r.body).slice(0, 200)}`);
+  return r;
+}
+
+/** A cursor's watermark (it is base64url JSON: anyone holding it can read it). */
+function watermark(cursor: unknown): { at: unknown; id: unknown } {
+  const c = JSON.parse(Buffer.from(String(cursor), "base64url").toString());
+  return { at: c.last_updated_at, id: c.last_id };
+}
+
 /** Whether the operator sees a link from `from` to `to` (either direction listed). */
 async function linked(from: string, to: string): Promise<boolean> {
   const r = await op.get(`/notes/${enc(from)}?include_links=true`);
@@ -156,24 +170,55 @@ describe("gap 2: no truncation or paging signal tells a scoped reader that hidde
     await note(`${R}/g2/mine/b`, "visible two", [MINE]);
   });
 
-  test("MCP query-notes: a page of only hidden notes carries no truncated warning; a full visible page does", async () => {
-    const c = await mcp(`${s.vaultViaHub}/mcp`, await pass({ level: "read", tags: [MINE] }));
+  test("MCP query-notes: a page of only hidden notes carries no truncated warning (guard: next drops a scoped session's warnings)", async () => {
     const truncated = (r: any) => JSON.stringify(r?.warnings ?? []).includes('"truncated"');
+    const scoped = await mcp(`${s.vaultViaHub}/mcp`, await pass({ level: "read", tags: [MINE] }));
+    const admin = await mcp(`${s.vaultViaHub}/mcp`, await pass({ level: "admin" }));
     try {
-      const hidden = await c.call("query-notes", { path_prefix: `${R}/g2/Secret`, limit: 1 });
+      const hidden = await scoped.call("query-notes", { path_prefix: `${R}/g2/Secret`, limit: 1 });
       must(!truncated(hidden), `MCP told a scoped reader that hidden notes match its filter: ${JSON.stringify(hidden).slice(0, 300)}`);
-      expect(truncated(await c.call("query-notes", { path_prefix: `${R}/g2/mine`, limit: 1 }))).toBe(true);
+      expect(truncated(await admin.call("query-notes", { path_prefix: `${R}/g2/Secret`, limit: 1 }))).toBe(true); // the check can see one
+    } finally {
+      await scoped.close();
+      await admin.close();
+    }
+  });
+
+  test("REST and MCP cursor paging: a filter that matches only hidden notes gives the cursor a filter that matches nothing gets", async () => {
+    const token = await pass({ level: "read", tags: [MINE] });
+    const reader = rest(s.vaultViaHub, token);
+    const hidden = await reader.get(`/notes?path_prefix=${enc(`${R}/g2/Secret`)}&limit=1&cursor=`);
+    const none = await reader.get(`/notes?path_prefix=${enc(`${R}/g2/nothing`)}&limit=1&cursor=`);
+    expect(hidden.status).toBe(200);
+    expect(hidden.body.notes).toEqual([]);
+    must(
+      JSON.stringify(watermark(hidden.body.next_cursor)) === JSON.stringify(watermark(none.body.next_cursor)),
+      `REST: the cursor told a scoped reader about hidden notes: ${JSON.stringify(watermark(hidden.body.next_cursor))}`,
+    );
+    const c = await mcp(`${s.vaultViaHub}/mcp`, token);
+    try {
+      const h = await c.call("query-notes", { path_prefix: `${R}/g2/Secret`, limit: 1, cursor: "" });
+      const n = await c.call("query-notes", { path_prefix: `${R}/g2/nothing`, limit: 1, cursor: "" });
+      must(
+        JSON.stringify(watermark(h.next_cursor)) === JSON.stringify(watermark(n.next_cursor)),
+        `MCP: the cursor told a scoped reader about hidden notes: ${JSON.stringify(watermark(h.next_cursor))}`,
+      );
     } finally {
       await c.close();
     }
   });
 
-  test("REST cursor paging: a filter that matches only hidden notes ends at once, as one that matches nothing", async () => {
+  test("cursor paging walks every note a scoped reader can see, past pages of hidden ones", async () => {
     const reader = rest(s.vaultViaHub, await pass({ level: "read", tags: [MINE] }));
-    const hidden = await reader.get(`/notes?path_prefix=${enc(`${R}/g2/Secret`)}&limit=1&cursor=`);
-    const none = await reader.get(`/notes?path_prefix=${enc(`${R}/g2/nothing`)}&limit=1&cursor=`);
-    expect(hidden.status).toBe(200);
-    must(JSON.stringify(hidden.body) === JSON.stringify(none.body), `cursor paging told a scoped reader that hidden notes match: ${JSON.stringify(hidden.body).slice(0, 300)}`);
+    const seen: string[] = [];
+    let cursor = "";
+    for (let i = 0; i < 5; i++) {
+      const r = await reader.get(`/notes?path_prefix=${enc(`${R}/g2/`)}&limit=1&cursor=${enc(cursor)}`);
+      seen.push(...r.body.notes.map((n: any) => n.path));
+      if (r.body.notes.length === 0) break;
+      cursor = r.body.next_cursor;
+    }
+    expect(seen.sort()).toEqual([`${R}/g2/mine/a`, `${R}/g2/mine/b`]);
   });
 });
 
@@ -281,7 +326,7 @@ describe("gap 6: changing a tag that a key's scope names is refused without forc
   });
 
   test("with force, the change goes through (positive control), and a tag no key names needs none", async () => {
-    expect((await op.put(`/tags/${enc(`${R}free`)}`, { description: "no key names this" })).status).toBe(200);
+    await note(`${R}/g6/free`, "a tag no key names", [`${R}free`]);
     expect((await op.post(`/tags/${enc(`${R}free`)}/rename`, { new_name: `${R}free2` })).status).toBe(200);
     const r = await op.post(`/tags/${enc(KEPT)}/rename?force=true`, { new_name: `${KEPT}x` });
     expect(r.status).toBe(200);
@@ -301,7 +346,7 @@ describe("gap 7: a live subscription follows the scope as it is now, and a ticke
     try {
       expect((await op.put(`/tags/${enc(CHILD)}?force=true`, { parent_names: null })).status).toBe(200);
       expect((await rest(s.vaultViaHub, token).get(`/notes/${id}`)).status).toBe(404);
-      await op.patch(`/notes/${id}`, { content: `second words ${SECRET}` });
+      await opPatch(id, { content: `second words ${SECRET}` });
       await live.waitFor((f) => f.type === "remove" && f.id === id, "the remove of a note that left the scope");
       must(!JSON.stringify(live.frames).includes(SECRET), "the socket sent a note after it left the pass's scope");
     } finally {
@@ -313,7 +358,7 @@ describe("gap 7: a live subscription follows the scope as it is now, and a ticke
     const id = await note(`${R}/g7/moves`, "in scope", [MINE]);
     const live = await subscribe(await pass({ level: "read", tags: [MINE] }));
     try {
-      await op.patch(`/notes/${id}`, { tags: { add: [OTHER], remove: [MINE] } });
+      await opPatch(id, { tags: { add: [OTHER], remove: [MINE] } });
       await live.waitFor((f) => f.type === "remove" && f.id === id, "the remove of a note retagged out of scope");
     } finally {
       live.close();
@@ -356,7 +401,7 @@ describe("gap 7: a live subscription follows the scope as it is now, and a ticke
     } finally {
       await c.close();
     }
-    await op.patch(`/notes/${leaves}`, { tags: { add: [OTHER], remove: [MINE] } });
+    await opPatch(leaves, { tags: { add: [OTHER], remove: [MINE] } });
     const r1 = await safeFetch(down1.url);
     expect(r1.status).toBe(200); // positive control
     const r2 = await safeFetch(down2.url);

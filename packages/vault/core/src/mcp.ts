@@ -1381,10 +1381,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             // requested, so `next_cursor` never surfaces as an honest
             // "more may follow" signal — this is that signal. Mirrors the
             // REST structured-query path in src/routes.ts.
-            // Scope gap 2: decided on what a scoped caller gets back (the
-            // wrapper drops what it can't see), as REST does since T-419.
-            const shown = searchVisibility ? results.filter(searchVisibility).length : results.length;
-            if (queryOpts.offset === undefined && shown === queryOpts.limit) {
+            if (queryOpts.offset === undefined && results.length === queryOpts.limit) {
               queryWarnings.push(truncatedResultsWarning(queryOpts.limit, "mcp"));
             }
           }
