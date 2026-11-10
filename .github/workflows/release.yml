@@ -1,4 +1,5 @@
-# Release: publish @openparachute/core to npm when a version bump reaches main (RELEASING.md).
+# Release: publish @openparachute/core 0.8.x to npm when a version bump reaches release/0.8 (RELEASING.md). main and
+# next carry 0.9, which publishes to beta from main under its own release.yml.
 #
 #   plan            scripts/release-plan.ts: is this version new on npm, and which dist-tag. X.Y.Z-pre.N → `next`,
 #                   X.Y.Z → `latest`; anything else (0.8.0-dev.0) never publishes. A package npm has never seen is
@@ -19,14 +20,16 @@ name: release
 
 on:
   push:
-    branches: [main]
+    branches: [release/0.8]
     # Only a merge that can change the version runs this; every other merge was tested by contracts.yml already.
     paths:
       - package.json
   workflow_dispatch:
 
 concurrency:
-  group: release
+  # One queue per branch: release/0.8 and main release different lines, and a shared group would let GitHub cancel one
+  # line's waiting run when the other line's next run queues.
+  group: release-${{ github.ref }}
   cancel-in-progress: false
 
 env:
@@ -103,7 +106,7 @@ jobs:
             ${{ runner.temp }}/npm/package.tgz.sha256
           retention-days: 30
 
-  # Nothing publishes until every contracts.yml job has passed on this exact commit. The same push to main starts
+  # Nothing publishes until every contracts.yml job has passed on this exact commit. The same push to release/0.8 starts
   # contracts, so this waits for it (about 80 minutes, most of it mutants-candidate) and fails at the first red job.
   # A red or cancelled job: re-run it in contracts, then re-run this workflow's failed jobs.
   contracts-green:
@@ -157,7 +160,7 @@ jobs:
               esac
             done <<< "$REQUIRED"
             if [ "$WAIT_FOR_MISSING" != true ] && [ "$missing" -eq "$(grep -c . <<< "$REQUIRED")" ]; then
-              echo "::error::$SHA has no contracts checks at all. CI runs on pull requests and on pushes to main and next."
+              echo "::error::$SHA has no contracts checks at all. CI runs on pull requests and on pushes to main, next and release/0.8."
               exit 1
             fi
             if [ -z "$waiting" ]; then echo "Every required check passed on $SHA."; exit 0; fi

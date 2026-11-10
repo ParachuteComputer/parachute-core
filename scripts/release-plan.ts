@@ -1,10 +1,14 @@
-// Whether a push to main publishes @openparachute/core to npm, and under which dist-tag (RELEASING.md).
+// Whether a push to release/0.8 publishes @openparachute/core to npm, and under which dist-tag (RELEASING.md).
+//
+// This is the 0.8 line's branch. 0.8.x ships from `release/0.8` (to `next` and `latest`); `main` and `next` carry 0.9,
+// whose prereleases go to `beta` from main under 0.9's own plan. So this plan publishes only from RELEASE_BRANCH, and
+// only versions of LINE: 0.9 code merged here by mistake refuses instead of reaching `next` or `latest`.
 //
 //   bun scripts/release-plan.ts [--package-json <file>] [--registry <file>]   writes version, dist_tag, should_publish to $GITHUB_OUTPUT
 //
 // The pattern is the hub's (parachute-hub scripts/release-plan.ts, decidePublish), cut down to this package's two
 // channels:
-//   X.Y.Z-pre.N   dist-tag `next`, published on the merge that brings that version to main
+//   X.Y.Z-pre.N   dist-tag `next`, published on the merge that brings that version to release/0.8
 //   X.Y.Z         dist-tag `latest`, only after an approval on the `npm-latest` environment (release.yml), and only
 //                 as a suffix-drop of an X.Y.Z-pre.N that is already on npm, with nothing changed since but the
 //                 release notes and the `"version"` lines of the manifests that carry core's version and bun.lock
@@ -22,6 +26,15 @@
 import { appendFileSync, readFileSync } from "node:fs";
 
 export type Channel = "next" | "latest";
+
+/** The branch the 0.8 line publishes from, and the one line it may publish (RELEASING.md, "Two lines"). */
+export const RELEASE_BRANCH = "release/0.8";
+export const LINE = "0.8";
+
+/** X.Y of a version. */
+export function lineOf(version: string): string {
+  return version.split(".").slice(0, 2).join(".");
+}
 
 export type Decision = { publish: true; reason: string } | { publish: false; reason: string } | { refuse: true; reason: string };
 
@@ -87,11 +100,14 @@ export function versionOnlyDiff(diff: string): boolean {
   return changed.every((l) => /^[+-]\s*"version":\s*"[^"]*",?\s*$/.test(l));
 }
 
-/** The decision for `version`, pushed to `branch`, given what npm has (or `null`: npm couldn't be read). */
+/** The decision for `version`, pushed to `branch` (only RELEASE_BRANCH publishes), given what npm has (or `null`: npm couldn't be read). */
 export function decidePublish(version: string, registry: Registry | null, branch: string | undefined): Decision {
   const channel = channelFor(version);
   if (!channel) return { publish: false, reason: `${version} is not a release version (X.Y.Z-pre.N for next, X.Y.Z for latest)` };
-  if (branch !== "main") return { publish: false, reason: `releases publish from main only (this is ${branch ?? "no branch"})` };
+  if (branch !== RELEASE_BRANCH) return { publish: false, reason: `${LINE}.x releases publish from ${RELEASE_BRANCH} only (this is ${branch ?? "no branch"})` };
+  if (lineOf(version) !== LINE) {
+    return { refuse: true, reason: `${version} is not a ${LINE}.x version: ${RELEASE_BRANCH} publishes ${LINE}.x only, to next and latest. A later line publishes to beta from main.` };
+  }
   if (!registry) return { refuse: true, reason: "npm couldn't be read: refusing to guess, since a wrong answer either double-publishes or drops a release" };
   if (registry.versions.includes(version)) return { publish: false, reason: `${version} is already on npm` };
   if (registry.versions.length === 0) {

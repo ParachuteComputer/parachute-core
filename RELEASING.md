@@ -10,15 +10,42 @@ Two ways out, both built by CI from the same commit:
 The npm name `parachute` belongs to someone else, so the package stays `@openparachute/core`; its command is
 `parachute`.
 
+## Two lines: 0.8.x ships from `release/0.8`
+
+`release/0.8` was cut from `next` at 53f956f (the last 0.8 commit) when 0.9 opened on `next`. From then on:
+
+- **0.8.x fixes** are PRs with base `release/0.8`, merged there. A merge to `release/0.8` that changes the version is
+  the 0.8 release (`next` for a prerelease, `latest` for a stable). This branch's `scripts/release-plan.ts` publishes
+  only from `release/0.8` (`RELEASE_BRANCH`) and only `0.8.x` (`LINE`): a 0.9 version merged here refuses.
+- **0.9** lives on `next` and reaches `main` when Aaron merges next→main. Its prereleases publish to `beta` from `main`
+  under 0.9's own plan, which sends `next` and `latest` only from `SERVED_FROM` (release/0.8) and refuses a
+  served-line version on `main`. Until the next→main merge brings that plan, `main` still runs the old one: nothing
+  0.9 may merge into `main` before then (Aaron merges next→main only).
+- A fix both lines need lands on `release/0.8` and is cherry-picked to `next` (or the other way), one PR each.
+
+Before anything merges into this branch, a repository admin does two things (Uni asks Aaron; neither is done
+yet):
+
+```bash
+# 1. let the npm-latest gate deploy from release/0.8 (until then publish-latest fails closed there)
+gh api -X POST repos/ParachuteComputer/parachute-core/environments/npm-latest/deployment-branch-policies -f name=release/0.8 -f type=branch
+# 2. protect release/0.8 like main and next (no deletion, no force push, PRs with the seven contracts checks): add it
+#    to the ruleset "T-420 main+next" (id 26847383). Do this BEFORE merging anything into release/0.8.
+gh api -X PUT repos/ParachuteComputer/parachute-core/rulesets/26847383 --input - <<'JSON'
+{"conditions":{"ref_name":{"include":["refs/heads/main","refs/heads/next","refs/heads/release/0.8"],"exclude":[]}}}
+JSON
+```
+
 ## Channels
 
 | Version | npm dist-tag | Published |
 |---|---|---|
 | `0.8.0-dev.N` | none | never (not a release) |
-| `0.8.0-pre.N` | `next` | on its own, when the merge that brings that version reaches `main` |
-| `0.8.0` | `latest` | only after an approval on the GitHub environment `npm-latest` (below) |
+| `0.8.x-pre.N` | `next` | on its own, when the merge that brings that version reaches `release/0.8` |
+| `0.8.x` | `latest` | only after an approval on the GitHub environment `npm-latest` (below) |
+| `0.9.x` and later | `beta` | never from this branch: from `main`, under 0.9's own plan |
 
-**A merge to `main` that changes the version is the release.** `.github/workflows/release.yml` runs on it:
+**A merge to `release/0.8` that changes the version is the release.** `.github/workflows/release.yml` runs on it:
 
 1. `plan` (`scripts/release-plan.ts`, unit-tested) decides. It skips a version npm already has, and a package npm
    has never seen (the first publish is by hand, below). It refuses when npm can't be read, when a dist-tag would
@@ -36,16 +63,19 @@ The npm name `parachute` belongs to someone else, so the package stays `@openpar
 5. `tag-record` tags `v<version>` (kept if the GitHub pre-release already made it).
 
 To cut a prerelease: a PR that bumps `version` in `package.json`, `packages/cli/package.json`,
-`packages/hub/package.json` and `packages/vault/package.json` (and those lines in `bun.lock`) to the next `0.8.0-pre.N`,
+`packages/hub/package.json` and `packages/vault/package.json` (and those lines in `bun.lock`) to the next `0.8.x-pre.N`,
 CI green, merged. All four carry core's version because the hub and the vault report their own: `/health`,
 `parachute status` and the vault's service card read them. A test in `scripts/release-plan.test.ts` goes red on a PR that
 misses one, and `plan` refuses to publish it. They are not published on their own; npm's `@openparachute/hub` and `vault`
-stay at 0.7. To promote: a PR that only drops the suffix (`0.8.0`), merged; then the approval.
+stay at 0.7. To promote: a PR that only drops the suffix (`0.8.x`), merged; then the approval.
+A prerelease on this branch publishes to `next` with no approval step (as 0.8 always did): the branch's ruleset
+(review, green contracts) is the gate, so it must be in place before anything merges here.
 
 ## Who approves a `latest`
 
 `publish-latest` runs in the environment `npm-latest`. Its one required reviewer is the GitHub account
-`unforcedagi` (the account Uni works as), and it deploys from `main` only.
+`unforcedagi` (the account Uni works as), and it deploys from `main` and (once the admin step above is done)
+`release/0.8`.
 
 **Uni approves only after Aaron taps the approval card.** When a `latest` run waits, Uni posts an approval card to
 Aaron (the version, the prerelease it promotes, the run link). Only after his tap does Uni approve the deployment,
@@ -100,7 +130,7 @@ trust is set. Until then `plan` skips every merge with that reason.
    and disallow tokens" → **Update Package Settings**. Trusted publishing is not a token, so CI keeps working; a
    leaked token can't publish.
 
-From then on, the next `0.8.0-pre.N` merged to `main` publishes itself to `next`, with provenance.
+From then on, the next `0.8.x-pre.N` merged to `release/0.8` publishes itself to `next`, with provenance.
 
 ## If a publish fails
 
@@ -119,7 +149,7 @@ gh run download <bundle-macos run id> -n parachute-core-<version>-darwin-arm64 -
 gh run download <contracts run id> -n parachute-core-<version>-linux-x64 -D dist/linux
 (cd dist/mac && sha256sum -c SHA256SUMS) && (cd dist/linux && sha256sum -c SHA256SUMS)
 # one SHA256SUMS for both tarballs, one for the npm package
-gh release create v<version> --prerelease --target <main commit> --title "<version>" --notes-file <notes> \
+gh release create v<version> --prerelease --target <release/0.8 commit> --title "<version>" --notes-file <notes> \
   dist/parachute-core-<version>-darwin-arm64.tar.gz dist/parachute-core-<version>-linux-x64.tar.gz dist/SHA256SUMS \
   dist/openparachute-core-<version>.tgz dist/npm-SHA256SUMS
 ```
