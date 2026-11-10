@@ -69,7 +69,9 @@ stay at 0.7. To promote: a PR that only drops the suffix (`0.8.0`), merged; then
 
 ## Who approves a release
 
-`publish-latest` runs in the environment `npm-latest`, `publish-prerelease` (`next` and `beta`) in `npm-prerelease`.
+`publish-latest` runs in the environment `npm-latest`, `publish-prerelease` in `npm-prerelease` (from `main`: `beta`
+while `next` serves 0.8, `next` once it serves 0.9). On release/0.8 the 0.8 line's own workflow publishes `next` with
+no approval step, as 0.8 always did; that branch's ruleset is its gate.
 Each one's one required reviewer is the GitHub account `unforcedagi` (the account Uni works as), and each deploys
 from `main` only; `npm-latest` also from `release/0.8` once an admin adds that branch policy (RELEASING.md on
 `release/0.8`).
