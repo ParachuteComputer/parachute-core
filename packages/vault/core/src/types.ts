@@ -550,7 +550,8 @@ export interface Store {
    * always present in the response — even on an empty page — so an
    * agent loop can persist a single watermark and keep polling.
    */
-  queryNotesPaged(opts: QueryOpts): Promise<QueryNotesPage>;
+  /** `visible`: page and cursor over only the notes a scoped caller may see (scope gap 2). */
+  queryNotesPaged(opts: QueryOpts, visible?: (note: Note) => boolean): Promise<QueryNotesPage>;
   /**
    * Aggregation / rollup query. Applies every OTHER filter in `opts` (tags,
    * metadata, date range, write-attribution, `ids`, ...) exactly as

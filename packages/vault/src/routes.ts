@@ -2160,7 +2160,11 @@ async function handleNotesInner(
       let nextCursor: string | null = null;
       try {
         if (cursorMode) {
-          const page = await store.queryNotesPaged(queryOpts);
+          // Scope gap 2: a scoped page and its cursor follow only notes the caller may see.
+          const page = await store.queryNotesPaged(
+            queryOpts,
+            tagScope.raw === null ? undefined : (n) => noteWithinTagScope(n, tagScope.allowed, tagScope.raw),
+          );
           results = page.notes;
           nextCursor = page.next_cursor;
         } else {

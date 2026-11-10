@@ -1938,6 +1938,65 @@ function toQueryHashInputs(opts: QueryOpts): QueryHashInputs {
 }
 
 /**
+ * Cursor paging for a caller that sees only some notes (scope gap 2): the
+ * page is the first `limit` notes it may see after the cursor, and the
+ * cursor it gets back is built from those notes only. Unfiltered, the
+ * watermark advanced over hidden rows too and so carried a hidden note's id
+ * and timestamp (base64 JSON, readable by anyone), and a page of only hidden
+ * notes still moved it: a yes/no answer to "does a hidden note match". Here
+ * the scan walks the keyset past hidden rows in batches until it has `limit`
+ * visible notes or the rows run out; hidden rows after the last visible one
+ * are scanned again by the next call, which is what keeps the watermark
+ * honest. The answer is exactly what an unscoped caller gets on a vault
+ * holding only the notes this caller may see.
+ */
+function queryVisibleNotesPaged(db: Database, opts: QueryOpts, visible: (note: Note) => boolean): QueryNotesPage {
+  // A bad limit gets queryNotes' own error, before anything is read.
+  if (opts.limit !== undefined && !(typeof opts.limit === "number" && Number.isInteger(opts.limit) && opts.limit >= 0)) {
+    return queryNotesPaged(db, opts);
+  }
+  const limit = typeof opts.limit === "number" ? opts.limit : 100; // queryNotes' default
+  const batch = Math.max(limit, 200);
+  const queryHash = computeQueryHash(toQueryHashInputs(opts));
+  let lastUpdatedAt = 0;
+  let lastId = "";
+  if (opts.cursor !== undefined && opts.cursor !== "") {
+    const prior = decodeCursor(opts.cursor);
+    lastUpdatedAt = prior.last_updated_at;
+    lastId = prior.last_id;
+  }
+  const encode = (ms: number, id: string) =>
+    encodeCursor({ v: CURSOR_VERSION, last_updated_at: ms, last_id: id, query_hash: queryHash });
+  const notes: Note[] = [];
+  if (limit === 0) return { notes, next_cursor: encode(lastUpdatedAt, lastId) };
+  // The scan's own position, over every row; the returned watermark follows visible rows only.
+  let scanCursor = opts.cursor ?? "";
+  let scanMs = lastUpdatedAt;
+  let scanId = lastId;
+  for (;;) {
+    const keys = new Map<string, number>();
+    const rows = queryNotes(db, { ...opts, cursor: scanCursor, limit: batch, offset: undefined }, keys);
+    for (const note of rows) {
+      const ms = keys.get(note.id) ?? 0;
+      if (ms > scanMs || (ms === scanMs && note.id > scanId)) {
+        scanMs = ms;
+        scanId = note.id;
+      }
+      if (!visible(note)) continue;
+      notes.push(note);
+      if (ms > lastUpdatedAt || (ms === lastUpdatedAt && note.id > lastId)) {
+        lastUpdatedAt = ms;
+        lastId = note.id;
+      }
+      if (notes.length === limit) return { notes, next_cursor: encode(lastUpdatedAt, lastId) };
+    }
+    if (rows.length < batch) break;
+    scanCursor = encode(scanMs, scanId);
+  }
+  return { notes, next_cursor: encode(lastUpdatedAt, lastId) };
+}
+
+/**
  * Cursor-paginated wrapper around `queryNotes` (vault#313).
  *
  * Always returns `{ notes, next_cursor }`. `next_cursor` advances even on
@@ -1961,7 +2020,8 @@ function toQueryHashInputs(opts: QueryOpts): QueryHashInputs {
  * `updated_at > 0 OR (updated_at = 0 AND id > "")` matches every row
  * with a non-null `updated_at` greater than the unix epoch).
  */
-export function queryNotesPaged(db: Database, opts: QueryOpts): QueryNotesPage {
+export function queryNotesPaged(db: Database, opts: QueryOpts, visible?: (note: Note) => boolean): QueryNotesPage {
+  if (visible) return queryVisibleNotesPaged(db, opts, visible);
   // Capture each page row's integer keyset key (vault#586) from the SAME
   // phase-1 statement that ordered + sliced the page — one consistent
   // snapshot, so the watermark can't leapfrog rows a cross-process writer

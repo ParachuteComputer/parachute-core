@@ -1111,7 +1111,7 @@ export class BunSqliteStore implements Store {
     return noteOps.queryNotes(this.db, this.expandQueryTags(this.normalizeQueryTags(opts)));
   }
 
-  async queryNotesPaged(opts: QueryOpts): Promise<QueryNotesPage> {
+  async queryNotesPaged(opts: QueryOpts, visible?: (note: Note) => boolean): Promise<QueryNotesPage> {
     // Hierarchy expansion happens internally — but importantly the cursor's
     // query_hash is computed from the CALLER'S opts (pre-expansion), so a
     // tag hierarchy edit between calls invalidates the cursor (different
@@ -1122,7 +1122,8 @@ export class BunSqliteStore implements Store {
     // Bare-tag normalization runs first (before the hash is taken inside
     // queryNotesPaged) so a `#tag`-form page-1 and a bare `tag`-form follow-up
     // resolve to the same cursor query_hash.
-    return noteOps.queryNotesPaged(this.db, this.expandQueryTags(this.normalizeQueryTags(opts)));
+    // `visible` (scope gap 2): the page and its cursor follow only the notes the caller may see.
+    return noteOps.queryNotesPaged(this.db, this.expandQueryTags(this.normalizeQueryTags(opts)), visible);
   }
 
   async aggregateNotes(opts: QueryOpts): Promise<AggregateRow[]> {
