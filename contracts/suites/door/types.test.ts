@@ -65,6 +65,42 @@ describe("types", () => {
     fp("types/loose.warning.shape", shape(made.body.warnings ?? made.body.validation_status ?? null));
   });
 
+  test("a field a note never set stays absent, an enum isn't filled with its first value, and the note can still be edited", async () => {
+    // HTTP_API.md and the tag contract (vault#553): only a declared `default` backfills; without one the field is
+    // absent, so `exists:false` means "never set". An indexed date filled with "" made every later edit fail 422.
+    const tag = runId("task");
+    const [kind, owner, note, count, done, due] = ["kind", "owner", "note", "count", "done", "due"].map((f) => `${f}_${runId("f")}`);
+    const put = await api.put(`/tags/${enc(tag)}`, {
+      fields: {
+        [kind]: { type: "string", enum: ["letter", "session"], default: "session" },
+        [owner]: { type: "string", enum: ["ag", "lena"] },
+        [note]: { type: "string" },
+        [count]: { type: "integer" },
+        [done]: { type: "boolean" },
+        [due]: { type: "date", indexed: true },
+      },
+    });
+    expect(put.status, JSON.stringify(put.body)).toBe(200);
+    const unset = [owner, note, count, done, due];
+    const r = runId("types");
+    const made = await writer.post("/notes", { content: "x", path: `${r}/unset`, tags: [tag] });
+    expect(made.status, JSON.stringify(made.body)).toBe(201);
+    const edit = await writer.patch(`/notes/${made.body.id}`, { content: "edited", if_updated_at: made.body.updatedAt });
+    expect(edit.status, JSON.stringify(edit.body)).toBe(200);
+    const after = await writer.get(`/notes/${made.body.id}`);
+    expect(after.body.content).toBe("edited");
+    expect(after.body.metadata?.[kind]).toBe("session");
+    for (const f of unset) expect(Object.keys(after.body.metadata ?? {}), f).not.toContain(f);
+    // The same when the type is added to a note that already exists.
+    const plain = await writer.post("/notes", { content: "y", path: `${r}/later` });
+    const tagIt = await writer.patch(`/notes/${plain.body.id}`, { tags: { add: [tag] }, if_updated_at: plain.body.updatedAt });
+    expect(tagIt.status, JSON.stringify(tagIt.body)).toBe(200);
+    const tagged = await writer.get(`/notes/${plain.body.id}`);
+    expect(tagged.body.metadata?.[kind]).toBe("session");
+    for (const f of unset) expect(Object.keys(tagged.body.metadata ?? {}), f).not.toContain(f);
+    expect(paths((await writer.get(`/notes?tag=${tag}&meta[${due}][exists]=false`)).body)).toEqual([`${r}/later`, `${r}/unset`]);
+  });
+
   test("notes can be listed by tag, and by all or any of several tags", async () => {
     const r = runId("types");
     const [a, b] = [`${r}-a`, `${r}-b`];
