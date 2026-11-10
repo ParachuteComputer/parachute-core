@@ -68,11 +68,14 @@ function itemIn(item: unknown, types: Set<string>, create: boolean): unknown {
   return out;
 }
 
+/** A link's note summaries (`sourceNote`, `targetNote`): an id, path and every name, on both doors (not records). */
+const SUMMARIES = new Set(["sourceNote", "targetNote"]);
+
 /** A record-door answer back in note words, checking the record door's promises on the way. */
-function answerBack(v: unknown, where: string): unknown {
+function answerBack(v: unknown, where: string, summary = false): unknown {
   if (Array.isArray(v)) return v.map((x) => answerBack(x, where));
   if (!isObj(v)) return v;
-  if (isRecordRow(v)) {
+  if (isRecordRow(v) && !summary) {
     for (const old of ["content", "metadata"]) if (old in v) throw new Error(`record door: a record carries the note word \`${old}\` (${where})`);
     if (!Array.isArray(v.types)) throw new Error(`record door: a record has no \`types\` (${where})`);
     const repeated = (Array.isArray(v.tags) ? v.tags : []).filter((t: string) => v.types.includes(t));
@@ -81,19 +84,33 @@ function answerBack(v: unknown, where: string): unknown {
   const out: Record<string, unknown> = {};
   for (const [k, val] of Object.entries(v)) {
     const nk = KEYS_BACK[k] ?? k;
-    out[nk] = OPAQUE.has(k) ? val : answerBack(val, where);
+    out[nk] = OPAQUE.has(k) ? val : answerBack(val, where, SUMMARIES.has(k));
   }
   // The note door's tags list every name on the note.
   if (isRecordRow(v) && Array.isArray(v.tags) && Array.isArray(v.types)) out.tags = [...new Set([...v.types, ...v.tags])].sort();
   return out;
 }
 
-/** The shape of an answer: keys and value types, never values (ids, stamps and run ids differ per prefix). */
+/**
+ * The shape of an answer: keys and value types, never values (ids, stamps and run ids differ per prefix). A list is
+ * the merged shape of its items, since an unfiltered list on the second prefix also holds the first one's notes. A
+ * person's own data (`metadata`, a schema report) is only "object": its keys are the test's data, not the door's.
+ */
 export function shapeOf(v: unknown): unknown {
   if (v === null || v === undefined) return null;
-  if (Array.isArray(v)) return [...new Set(v.map((x) => JSON.stringify(shapeOf(x))))].sort().map((x) => JSON.parse(x));
-  if (isObj(v)) return Object.fromEntries(Object.keys(v).sort().map((k) => [k, shapeOf(v[k])]));
+  if (Array.isArray(v)) return v.length ? [v.map(shapeOf).reduce(merge)] : [];
+  if (isObj(v)) return Object.fromEntries(Object.keys(v).sort().map((k) => [k, OPAQUE.has(k) ? "object" : shapeOf(v[k])]));
   return typeof v;
+}
+function merge(a: unknown, b: unknown): unknown {
+  if (a === null) return b; // a value one item has and another leaves null
+  if (b === null) return a;
+  if (isObj(a) && isObj(b)) {
+    return Object.fromEntries([...new Set([...Object.keys(a), ...Object.keys(b)])].sort().map((k) => [k, k in a && k in b ? merge(a[k], b[k]) : (a[k] ?? b[k])]));
+  }
+  if (Array.isArray(a) && Array.isArray(b)) return a.length && b.length ? [merge(a[0], b[0])] : a.length ? a : b;
+  if (JSON.stringify(a) === JSON.stringify(b)) return a;
+  return [...new Set([String(a), String(b)].flatMap((x) => x.split("|")))].sort().join("|");
 }
 
 /** The route as both prefixes share it: note words, the run id and a record's id or path taken out. */
