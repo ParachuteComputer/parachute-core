@@ -1,9 +1,11 @@
-// The publish decision (release-plan.ts): what a merge to main may send to npm, and what it must refuse.
+// The publish decision (release-plan.ts): what a merge to release/0.8 may send to npm, and what it must refuse.
 import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
-import { VERSION_MANIFESTS, changedPastPrerelease, channelFor, compareVersions, decidePublish, manifestsOffVersion, readRegistry, versionOnlyDiff, type Registry } from "./release-plan.ts";
+import { RELEASE_BRANCH, VERSION_MANIFESTS, changedPastPrerelease, channelFor, compareVersions, decidePublish, manifestsOffVersion, readRegistry, versionOnlyDiff, type Registry } from "./release-plan.ts";
+
+const B = RELEASE_BRANCH;
 
 const npm = (versions: string[], distTags: Record<string, string> = {}): Registry => ({ versions, distTags });
 const published = npm(["0.8.0-pre.1"], { next: "0.8.0-pre.1", latest: "0.8.0-pre.1" });
@@ -35,44 +37,53 @@ describe("release plan", () => {
     expect(VERSION_MANIFESTS.map((p) => [p, version(p)])).toEqual(VERSION_MANIFESTS.map((p) => [p, version("package.json")]));
   });
 
-  test("a new prerelease on main publishes to next", () => {
-    expect(decidePublish("0.8.0-pre.2", published, "main")).toEqual({ publish: true, reason: expect.stringContaining("next") });
+  test("a new prerelease on release/0.8 publishes to next", () => {
+    expect(decidePublish("0.8.0-pre.2", published, B)).toEqual({ publish: true, reason: expect.stringContaining("next") });
   });
 
-  test("a dev version never publishes, and nothing publishes off main", () => {
-    expect(decidePublish("0.8.0-dev.0", published, "main")).toMatchObject({ publish: false });
+  test("a dev version never publishes, and nothing publishes off release/0.8 (main carries 0.9)", () => {
+    expect(decidePublish("0.8.0-dev.0", published, B)).toMatchObject({ publish: false });
+    expect(decidePublish("0.8.0-pre.2", published, "main")).toMatchObject({ publish: false, reason: expect.stringContaining("release/0.8 only") });
+    expect(decidePublish("0.8.0-pre.2", published, "next")).toMatchObject({ publish: false });
     expect(decidePublish("0.8.0-pre.2", published, "uni/some-branch")).toMatchObject({ publish: false });
     expect(decidePublish("0.8.0-pre.2", published, undefined)).toMatchObject({ publish: false });
   });
 
   test("a version npm already has is skipped", () => {
-    expect(decidePublish("0.8.0-pre.1", published, "main")).toMatchObject({ publish: false, reason: expect.stringContaining("already on npm") });
+    expect(decidePublish("0.8.0-pre.1", published, B)).toMatchObject({ publish: false, reason: expect.stringContaining("already on npm") });
   });
 
   test("a package npm never had is skipped: the first publish is by hand", () => {
-    expect(decidePublish("0.8.0-pre.1", npm([]), "main")).toMatchObject({ publish: false, reason: expect.stringContaining("first publish") });
+    expect(decidePublish("0.8.0-pre.1", npm([]), B)).toMatchObject({ publish: false, reason: expect.stringContaining("first publish") });
   });
 
   test("npm that can't be read refuses", () => {
-    expect(decidePublish("0.8.0-pre.2", null, "main")).toMatchObject({ refuse: true });
+    expect(decidePublish("0.8.0-pre.2", null, B)).toMatchObject({ refuse: true });
   });
 
   test("a dist-tag never moves backwards", () => {
     const later = npm(["0.8.0-pre.1", "0.8.0-pre.3"], { next: "0.8.0-pre.3" });
-    expect(decidePublish("0.8.0-pre.2", later, "main")).toMatchObject({ refuse: true, reason: expect.stringContaining("backwards") });
+    expect(decidePublish("0.8.0-pre.2", later, B)).toMatchObject({ refuse: true, reason: expect.stringContaining("backwards") });
   });
 
   test("a prerelease never goes out after its version shipped stable", () => {
     const shipped = npm(["0.8.0-pre.3", "0.8.0"], { next: "0.8.0-pre.3", latest: "0.8.0" });
-    expect(decidePublish("0.8.0-pre.4", shipped, "main")).toMatchObject({ refuse: true, reason: expect.stringContaining("older than latest") });
-    expect(decidePublish("0.8.1-pre.1", shipped, "main")).toMatchObject({ publish: true });
+    expect(decidePublish("0.8.0-pre.4", shipped, B)).toMatchObject({ refuse: true, reason: expect.stringContaining("older than latest") });
+    expect(decidePublish("0.8.1-pre.1", shipped, B)).toMatchObject({ publish: true });
     // latest pointing at a prerelease (npm's first publish may do that) doesn't block the next prerelease
-    expect(decidePublish("0.8.0-pre.2", published, "main")).toMatchObject({ publish: true });
+    expect(decidePublish("0.8.0-pre.2", published, B)).toMatchObject({ publish: true });
+  });
+
+  test("0.9 code merged into release/0.8 refuses: it never reaches next or latest", () => {
+    const with09 = npm(["0.8.0-pre.1", "0.9.0-pre.1"], { next: "0.8.0-pre.1", beta: "0.9.0-pre.1" });
+    expect(decidePublish("0.9.0-pre.2", with09, B)).toMatchObject({ refuse: true, reason: expect.stringContaining("0.8.x only") });
+    expect(decidePublish("0.9.0", with09, B)).toMatchObject({ refuse: true, reason: expect.stringContaining("0.8.x only") });
+    expect(decidePublish("1.0.0-pre.1", with09, B)).toMatchObject({ refuse: true });
   });
 
   test("a stable needs its prerelease on npm first", () => {
-    expect(decidePublish("0.8.0", published, "main")).toEqual({ publish: true, reason: expect.stringContaining("latest") });
-    expect(decidePublish("0.9.0", published, "main")).toMatchObject({ refuse: true, reason: expect.stringContaining("0.9.0-pre.") });
+    expect(decidePublish("0.8.0", published, B)).toEqual({ publish: true, reason: expect.stringContaining("latest") });
+    expect(decidePublish("0.8.1", published, B)).toMatchObject({ refuse: true, reason: expect.stringContaining("0.8.1-pre.") });
   });
 
   test("a stable may change only the version and the notes since its prerelease", () => {
@@ -109,7 +120,7 @@ describe("release plan, run on a repository: a stable's diff since its prereleas
     };
     const plan = () => {
       writeFileSync(join(dir, ".registry.json"), JSON.stringify(npm(["0.8.0-pre.3"], { next: "0.8.0-pre.3", latest: "0.8.0-pre.3" })));
-      const p = Bun.spawnSync([process.execPath, script, "--registry", ".registry.json"], { cwd: dir, env: { ...process.env, GITHUB_REF_NAME: "main", GITHUB_OUTPUT: "" }, stdout: "pipe", stderr: "pipe" });
+      const p = Bun.spawnSync([process.execPath, script, "--registry", ".registry.json"], { cwd: dir, env: { ...process.env, GITHUB_REF_NAME: RELEASE_BRANCH, GITHUB_OUTPUT: "" }, stdout: "pipe", stderr: "pipe" });
       return { code: p.exitCode ?? 1, out: p.stdout.toString() + p.stderr.toString() };
     };
     git("init", "-q");

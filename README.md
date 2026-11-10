@@ -27,7 +27,7 @@ say what that program must do, written so they ran against **today's** code firs
 | [`contracts/harness/`](contracts/harness/) | Starts a throwaway vault and hub from today's repos at pinned commits, on random local ports, in a temp home; stops and deletes them after. |
 | [`PROCESS.md`](PROCESS.md) | How we build: what we reuse and what we rewrite, which tests we write, how a change lands, how people and agents work here together. |
 | [`AGENTS.md`](AGENTS.md) | The short rules for any agent (Uni's workers, Benjamin's agent, reviewers) working in this repo. |
-| `.github/workflows/contracts.yml` | CI: on every pull request and every push to `main` and `next`, the moved code's own checks and tests, the contract suite against the pinned commits and against the core build, Benjamin's suite, then the mutants that prove it can fail. |
+| `.github/workflows/contracts.yml` | CI: on every pull request and every push to `main`, `next` and `release/0.8`, the moved code's own checks and tests, the contract suite against the pinned commits and against the core build, Benjamin's suite, then the mutants that prove it can fail. |
 | `.github/workflows/bundle-macos.yml` | CI on macos-15: the darwin-arm64 bundle signed ad hoc with the hardened runtime, unpacked to a path with a space; `embedded/bundle` and Benjamin's suite on the signed tree. On pushes to main and next, nightly, and pull requests that touch the bundle. |
 | [`docs/probe/`](docs/probe/) | `parachute probe` against a canary vault: setting up the vault and a read-only pass, and systemd user units that run it every five minutes with an `OnFailure=` hook. |
 | [`docs/walkthrough/`](docs/walkthrough/) | The script and code for the short narrated walkthrough video. |
