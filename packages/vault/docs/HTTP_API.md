@@ -880,7 +880,7 @@ A person's own field names are never renamed (a field called `content` stays `co
   word beside its new one (`body` and `content`) is refused: `400 {error_type: "invalid_query", field: "body"}`.
   An old word alone is still taken.
 - **`GET /api/records?type=<name>`** — records of that type and its subtypes (`event` finds `event/meeting`); several
-  types match any of them; with `?tag=`, records carrying all of them. A plain tag's name is refused with the fix
+  types match any of them (`&tag_match=all`: all of them); with `?tag=`, records carrying all of them. A plain tag's name is refused with the fix
   (`422 tag_kind`, use `?tag=`). An empty `?type=` is no filter.
 - **`GET /api/types`** — every type and tag with its `kind` (`"type"` or `"tag"`), `count` and `expanded_count`, as
   MCP `list-types`; `?include_schema=true` adds each one's fields and parents. **`GET /api/types/{name}`** (or

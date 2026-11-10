@@ -31,6 +31,7 @@ import { defaultHookRegistry } from "../core/src/hooks.ts";
 import { registerTriggers } from "./triggers.ts";
 import { clearLiveTriggers, loadVaultTriggers } from "./triggers-api.ts";
 import { route } from "./routing.ts";
+import { notesDeprecationHeaders } from "../core/src/rest-records.ts";
 import { startTranscriptionWorker, registerTranscriptionHook, type TranscriptionWorker } from "./transcription-worker.ts";
 import { setTranscriptionWorker } from "./transcription-registry.ts";
 import { assetsDir, MAX_REQUEST_BODY_BYTES } from "./routes.ts";
@@ -711,7 +712,10 @@ export async function startVault(opts: StartVaultOptions = {}): Promise<RunningV
           // `Mcp-Session-Id` is the streamable-HTTP MCP session the client echoes
           // back. (Claude Code is a CLI → no CORS → unaffected. The hub already
           // exposes WWW-Authenticate; this matches it on the resource server.)
-          "Access-Control-Expose-Headers": "WWW-Authenticate, Mcp-Session-Id",
+          "Access-Control-Expose-Headers": "WWW-Authenticate, Mcp-Session-Id, Deprecation, Link",
+          // Every /api/notes answer, success or error, says the route is leaving (SPEC §5.1; gone at 1.0):
+          // `Deprecation: true` and a `Link` to its /api/records successor. A browser app can read both (above).
+          ...(notesDeprecationHeaders(path) ?? {}),
         };
 
         if (req.method === "OPTIONS") {

@@ -61,6 +61,16 @@ describe("compat/types-rest: /api/records", () => {
     expect(clash.status).toBe(400);
     expect(clash.body.field).toBe("fields");
     expect((await readApi.get(`/records/${enc(path)}`)).body.fields).toEqual({ n: 1 });
+    // Version rows point at their record with `record_id` (Prism's vault-door.ts reads it); `content_len` keeps its name.
+    expect((await writeApi.patch(`/records/${enc(path)}`, { body: "changed", force: true })).status).toBe(200);
+    const v = await readApi.get(`/records/${enc(path)}/versions`);
+    expect(v.status).toBe(200);
+    expect(v.body.total).toBeGreaterThanOrEqual(1);
+    const row = v.body.versions[0];
+    expect(row.record_id).toBe(made.body.id);
+    expect(row).not.toHaveProperty("note_id");
+    expect(typeof row.content_len).toBe("number");
+    expect((await readApi.get(`/records/${enc(path)}/versions/${row.version_ix}`)).body.body).toBe("kept");
   });
 });
 
@@ -148,6 +158,12 @@ describe("compat/types-rest: types", () => {
     const batch = await writeApi.post("/records", { records: [{ path: `${path}-1`, body: "x" }, { path: `${path}-2`, body: "y", tags: [type] }] });
     expect(batch.status).toBe(422);
     expect((await readApi.get(`/records/${enc(`${path}-1`)}`)).status).toBe(404);
+
+    // A name another record of the same batch makes a type is a type too.
+    const fresh = `${R}-fresh-type`;
+    const same = await writeApi.post("/records", { records: [{ path: `${path}-3`, body: "x", types: [fresh] }, { path: `${path}-4`, body: "y", tags: [fresh] }] });
+    expect(same.status).toBe(422);
+    expect((await readApi.get(`/records/${enc(`${path}-3`)}`)).status).toBe(404);
 
     const ok = await writeApi.post("/records", { path, body: "x", tags: ["pinned"] });
     expect(ok.status).toBe(201);

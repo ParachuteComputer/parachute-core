@@ -933,7 +933,7 @@
    "old": "/vault/<n>/api/tags*, storage*, attachments, find-path, vault",
    "new": "same",
    "action": "keep",
-   "reason": "the rest of the vault API keeps its shape; the /api/notes routes are the rename entry above",
+   "reason": "the rest of the vault API keeps its shape; the /api/notes routes are the rename entry above. /api/tags answers for types and tags alike through 0.9; a type's record moves to /api/types/<name> (entry above)",
    "since": "0.9",
    "removed_in": null,
    "state": "live"

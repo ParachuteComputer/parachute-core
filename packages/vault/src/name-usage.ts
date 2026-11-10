@@ -122,3 +122,10 @@ export function restRouteName(method: string, apiPath: string): string | null {
   const shape = parts.slice(0, 4).map((p, i) => (i === 0 ? p : i === 1 ? ":id" : i === 2 ? (SUBS.has(p) ? p : "?") : ":x"));
   return `rest ${method.toUpperCase().replace(/[^A-Z]/g, "").slice(0, 8)} /api/${shape.join("/")}`;
 }
+
+/** An `/api/types` request's route name for the count (`apiPath` is its `/tags…` twin): names only, never a type's. */
+export function typesRouteName(method: string, apiPath: string): string {
+  const parts = apiPath.split("/").filter(Boolean).slice(1, 3);
+  const shape = parts.map((p, i) => (i === 0 ? (p === "merge" ? p : ":name") : ["rename", "conformance", "effective"].includes(p) ? p : "?"));
+  return `rest ${method.toUpperCase().replace(/[^A-Z]/g, "").slice(0, 8)} /api/${["types", ...shape].join("/")}`;
+}

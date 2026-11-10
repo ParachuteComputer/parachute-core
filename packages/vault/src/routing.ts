@@ -52,8 +52,8 @@
  * UX audit, 2026-05-25).
  */
 
-import { countName, restRouteName } from "./name-usage.ts";
-import { notesDeprecationHeaders, recordsRoute } from "../core/src/rest-records.ts";
+import { countName, restRouteName, typesRouteName } from "./name-usage.ts";
+import { recordsRoute } from "../core/src/rest-records.ts";
 import { handleRecordsRest } from "./records-rest.ts";
 import pkg from "../package.json" with { type: "json" };
 import type { VaultConfig } from "./config.ts";
@@ -304,21 +304,7 @@ export function filterVaultListForBinding(
   return names.filter((name) => name === vaultName);
 }
 
-/**
- * Route one request. Every `/vault/<v>/api/notes…` answer, success or error (a 401 included), says the route is
- * leaving: `Deprecation: true` and a `Link` to its `/api/records` successor (SPEC §5.1; gone at 1.0).
- */
-export async function route(req: Request, path: string): Promise<Response> {
-  const res = await routeRequest(req, path);
-  const leaving = notesDeprecationHeaders(path);
-  if (!leaving || res.status === 101) return res;
-  const headers = new Headers(res.headers);
-  headers.set("Deprecation", leaving.Deprecation);
-  headers.append("Link", leaving.Link);
-  return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
-}
-
-async function routeRequest(
+export async function route(
   req: Request,
   path: string,
 ): Promise<Response> {
@@ -1276,7 +1262,7 @@ async function routeRequest(
     );
   }
   if (apiPath.startsWith("/tags") && recordsDoor) {
-    countName(`rest ${req.method.toUpperCase().replace(/[^A-Z]/g, "").slice(0, 8)} /api/types${apiPath === "/tags" ? "" : "/:name"}`, "new");
+    countName(typesRouteName(req.method, apiPath), "new");
     return handleRecordsRest(req, recordsDoor, `/vault/${vaultName}/api`, store, tagScope, (twin) =>
       handleTags(twin, store, apiPath.slice(5), tagScope, writeCtx));
   }

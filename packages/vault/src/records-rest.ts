@@ -86,7 +86,7 @@ export async function handleRecordsRest(
       } catch {
         isJson = false; // the twin answers bad JSON as it always has
       }
-      if (isJson) {
+      if (isJson && parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
         const moved = recordsBodyIn(req.method, parsed);
         if ("status" in moved) return refusal(moved);
         // The record door's tags hold plain labels: a type's name there is refused with the fix (SPEC §2.4).
