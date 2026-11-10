@@ -330,7 +330,7 @@ export function generateScopedMcpTools(
       provider: getSharedAttachmentTicketProvider(),
       vaultName,
       urlBase: ticketUrlBase,
-      ...(ticketNoteVisible ? { noteVisible: ticketNoteVisible } : {}),
+      ...(ticketNoteVisible ? { noteVisible: ticketNoteVisible, scopedTags: rawTags! } : {}),
     },
     // Attachment bytes (Wave 2 model lane): bun always wires a fresh fs
     // provider per session — cheap (stateless), unlike the ticket

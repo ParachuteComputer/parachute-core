@@ -66,7 +66,7 @@ import type { DeletedNoteRef, HookEvent, NoteHookPayload } from "../core/src/hoo
 import { defaultHookRegistry } from "../core/src/hooks.ts";
 import { toNoteIndex } from "../core/src/notes.ts";
 import { getVaultNameForStore } from "./vault-store.ts";
-import { noteWithinTagScope, scrubNoteTagsByScope } from "./tag-scope.ts";
+import { expandTokenTagScopeNow, noteWithinTagScope, scrubNoteTagsByScope } from "./tag-scope.ts";
 import type { LiveMatcher } from "../core/src/live-match.ts";
 
 /** Default per-vault concurrent-subscription cap. Over it → 503. */
@@ -95,11 +95,18 @@ export interface SubscriptionSink {
 interface Subscription {
   readonly vaultName: string;
   readonly matcher: LiveMatcher;
-  /** Expanded tag-scope allowlist (null = unscoped). */
-  readonly tagScopeAllowed: Set<string> | null;
+  /** Expanded tag-scope allowlist (null = unscoped). Re-read on every event (scope gap 7). */
+  tagScopeAllowed: Set<string> | null;
   /** Raw root-tag allowlist (null = unscoped) — `noteWithinTagScope` arg. */
   readonly tagScopeRaw: string[] | null;
   readonly sink: SubscriptionSink;
+  /**
+   * Scope gap 7: the ids a tag-scoped subscriber holds (its snapshot, then
+   * every upsert, less every remove), so a note that leaves the scope gets a
+   * `remove` the subscriber can act on, while a note it never held still
+   * gets nothing (M2: that would leak its id). Null for an unscoped sub.
+   */
+  readonly held: Set<string> | null;
   /** When true, `upsert` payloads carry the lean `NoteIndex` projection
    *  (`toNoteIndex`) instead of the full `Note` — for a subscription that opted
    *  into `include_content=false` (list views). `remove` is unaffected (already
@@ -211,6 +218,8 @@ export class SubscriptionManager {
     tagScopeAllowed: Set<string> | null;
     tagScopeRaw: string[] | null;
     sink: SubscriptionSink;
+    /** The ids the snapshot sent (tracked for a tag-scoped sub only, see `held`). */
+    heldIds?: Iterable<string>;
     maxBuffered?: number;
     /** Opt into the lean `NoteIndex` upsert shape (default false = full `Note`).
      *  Set for a list subscription that requested `include_content=false`. */
@@ -233,6 +242,7 @@ export class SubscriptionManager {
       tagScopeAllowed: args.tagScopeAllowed,
       tagScopeRaw: args.tagScopeRaw,
       sink: args.sink,
+      held: args.tagScopeRaw === null ? null : new Set(args.heldIds ?? []),
       lean: args.lean ?? false,
       tracksFlush: args.tracksFlush ?? true,
       countsTowardCap,
@@ -308,10 +318,20 @@ export class SubscriptionManager {
     const vaultName = this.resolveVault(store);
     if (!vaultName) return; // store not tracked → can't scope; drop safely
     if (this.subs.size === 0) return;
+    // Scope gap 7: a tag-scoped sub's scope is the scope as it is NOW (the tag
+    // hierarchy and private_tags may have changed since it subscribed). Read
+    // once per distinct scope per event.
+    const scopes = new Map<string, Set<string> | null>();
 
     for (const sub of this.subs) {
       if (sub.closed) continue;
       if (sub.vaultName !== vaultName) continue;
+      if (sub.tagScopeRaw !== null) {
+        const key = JSON.stringify(sub.tagScopeRaw);
+        if (!scopes.has(key)) scopes.set(key, expandTokenTagScopeNow(store, sub.tagScopeRaw));
+        sub.tagScopeAllowed = scopes.get(key)!;
+      }
+      const held = sub.held;
 
       if (event === "deleted") {
         // Same rule as a left-the-set update below: only a sub whose scope
@@ -319,9 +339,10 @@ export class SubscriptionManager {
         // never held. A ref without tags (the note was already gone) reaches
         // unscoped subs only.
         const ref = payload as DeletedNoteRef;
-        if (noteWithinTagScope({ id: ref.id, tags: ref.tags ?? [] } as Note, sub.tagScopeAllowed, sub.tagScopeRaw)) {
+        if (held?.has(ref.id) || noteWithinTagScope({ id: ref.id, tags: ref.tags ?? [] } as Note, sub.tagScopeAllowed, sub.tagScopeRaw)) {
           this.emit(sub, "remove", { id: ref.id });
         }
+        held?.delete(ref.id);
         continue;
       }
 
@@ -353,13 +374,17 @@ export class SubscriptionManager {
             sub.tagScopeRaw,
           ),
         });
-      } else if (event === "updated" && inScope) {
+        held?.add(note.id);
+      } else if (event === "updated" && (inScope || held?.has(note.id))) {
         // Left the set (predicate no longer true) BUT still within this
         // token's scope, so the sub could have held it — idempotent remove
         // (client drops the id if held, no-op otherwise). When the note is
         // OUT of scope the sub never had it; emitting would leak its id, so
         // we stay silent.
+        // Scope gap 7: also when the note just LEFT the scope (a tag removed,
+        // a private tag added, its tag re-parented away) and this sub held it.
         this.emit(sub, "remove", { id: note.id });
+        held?.delete(note.id);
       }
       // created that doesn't match → nothing (it was never in the set).
     }

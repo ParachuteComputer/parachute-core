@@ -291,6 +291,7 @@ export function createSubscribeWsBinding(deps: SubscribeWsDeps = {}): {
       tagScopeAllowed,
       tagScopeRaw: auth.scoped_tags,
       sink: new WsSink(ws),
+      heldIds: snapshotNotes.map((n) => n.id),
       lean,
       tracksFlush: false,
       countsTowardCap: false,

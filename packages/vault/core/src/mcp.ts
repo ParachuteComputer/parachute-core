@@ -653,6 +653,8 @@ export interface GenerateMcpToolsOpts {
      * internal callers) → every note/attachment is visible.
      */
     noteVisible?: (note: Note) => boolean | Promise<boolean>;
+    /** The session's tag scope, stamped on each ticket so its spend re-checks it (scope gap 7). */
+    scopedTags?: string[];
   };
   /**
    * `AttachmentBytesProvider` seam (Wave 2 model lane — D10, same "tools
@@ -2963,6 +2965,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             sizeBytes,
             transcribe: params.transcribe === true,
             ...(validSegment ? { segmentIndex: segIdx } : {}),
+            ...(ticketSeam.scopedTags ? { scopedTags: [...ticketSeam.scopedTags] } : {}),
           };
           await ticketSeam.provider.put(ticket);
 
@@ -3025,6 +3028,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             attachmentId: attachment.id,
             mimeType: downloadMime,
             sizeBytes: declaredSize,
+            ...(ticketSeam.scopedTags ? { scopedTags: [...ticketSeam.scopedTags] } : {}),
           };
           await ticketSeam.provider.put(ticket);
 
