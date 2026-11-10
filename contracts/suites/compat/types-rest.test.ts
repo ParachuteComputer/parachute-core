@@ -174,6 +174,43 @@ describe("compat/types-rest: types", () => {
   });
 });
 
+describe("compat/types-rest: a tag-scoped pass", () => {
+  test("learns nothing about a hidden name's kind: ?type= and a name in tags answer alike for a hidden type and a hidden tag", async () => {
+    const work = `${R}-work`;
+    const hiddenType = `${R}-secret-type`;
+    const hiddenTag = `${R}-secret-tag`;
+    expect((await adminApi.put(`/types/${enc(hiddenType)}`, { fields: { x: { type: "string" } } })).status).toBe(200);
+    expect((await writeApi.post("/notes", { path: `${R}/hidden`, content: "x", tags: [hiddenTag] })).status).toBe(201);
+    const scoped = rest(s.vaultViaHub, await pass({ level: "write", tags: [work] }));
+    const answer = async (p: Promise<{ status: number; body: any }>) => {
+      const r = await p;
+      return { status: r.status, type: r.body?.error_type ?? null, n: Array.isArray(r.body) ? r.body.length : null };
+    };
+    const byType = await answer(scoped.get(`/records?type=${enc(hiddenType)}`));
+    expect(byType.type).not.toBe("tag_kind");
+    expect(await answer(scoped.get(`/records?type=${enc(hiddenTag)}`))).toEqual(byType);
+    const inTags = await answer(scoped.post("/records", { path: `${R}/scoped-a`, body: "x", tags: [work, hiddenType] }));
+    expect(inTags.type).not.toBe("tag_kind");
+    expect(await answer(scoped.post("/records", { path: `${R}/scoped-b`, body: "x", tags: [work, hiddenTag] }))).toEqual(inTags);
+    const m = await mcp(`${s.vaultViaHub}/mcp`, await pass({ level: "write", tags: [work] }));
+    try {
+      const viaMcp = async (name: string) => {
+        const r: any = await m.client.callTool({ name: "create-record", arguments: { path: `${R}/scoped-mcp-${name}`, body: "x", tags: [work, name] } }).catch((e) => e);
+        return r?.data?.error_type ?? (r?.isError ? "isError" : "ok");
+      };
+      const mcpType = await viaMcp(hiddenType);
+      expect(mcpType).not.toBe("tag_kind");
+      expect(await viaMcp(hiddenTag)).toBe(mcpType);
+    } finally {
+      await m.close();
+    }
+    // A name it can see is refused with the fix as for anyone.
+    const visibleType = `${work}/kind`;
+    expect((await adminApi.put(`/types/${enc(visibleType)}`, { fields: { y: { type: "string" } } })).status).toBe(200);
+    expect(await answer(scoped.post("/records", { path: `${R}/scoped-c`, body: "x", tags: [work, visibleType] }))).toEqual({ status: 422, type: "tag_kind", n: null });
+  });
+});
+
 describe("compat/types-rest: /api/notes is leaving", () => {
   test("every /api/notes answer, success or error, carries Deprecation and a Link to its /api/records successor; /api/records none", async () => {
     const base = `/vault/${s.vaultName}/api`;
