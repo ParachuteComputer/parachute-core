@@ -50,8 +50,8 @@ of them pass, then moving it to `today/`.
    agent never merges into `main`) with a merge commit, not a squash, so the branches don't diverge. The merge publishes
    `@openparachute/core` to npm once that commit's contracts jobs pass (`RELEASING.md`). Nothing deploys from this
    repo: the hosted door (parachute-cloud) pins a core commit and deploys from there.
-   While `next` carries 0.9, the 0.8 line ships from `release/0.8` (cut at 53f956f): a 0.8.x fix is a pull request
-   against `release/0.8`, squash-merged by Uni; a pull request there that bumps the version is merged by Aaron and publishes 0.8.x to
+   While `next` carries 0.9, the 0.8 line ships from release/0.8 (cut at 53f956f): a 0.8.x fix is a pull request
+   against release/0.8, squash-merged by Uni; a pull request there that bumps the version is merged by Aaron and publishes 0.8.x to
    `next`/`latest` (`RELEASING.md`, "Two lines"). 0.9 prereleases go to `beta` from `main`.
 
 Pins move in their own pull requests. If a pin bump turns a contract red, someone decides whether the code or the
