@@ -3,7 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import { door, enc, fp, lacks, mcp, refusal, rest, runId, sha, shape } from "./_door.ts";
 
-const is09 = door().release === "0.9";
+const is09 = door().release.startsWith("0.9");
 const one = (r: any) => (Array.isArray(r) ? r[0] : r);
 
 describe.skipIf(!is09)("the record door over MCP", () => {

@@ -137,7 +137,7 @@ bun run build:core
 bun run doors                                    # the box alone
 CLOUD_REPO=<parachute-cloud checkout> bun run doors -- --doors box,cloud
 PERSONAL_REPO=<a checkout with deploy/personal> bun run doors -- --doors box,personal
-bun run doors -- --doors box --check-golden      # CI here: the box must match suites/door/golden/box-0.8.jsonl
+bun run doors -- --doors box --check-golden      # CI here: the box must match its kept file in suites/door/golden
 bun run doors -- --doors cloud --with-golden box-0.8   # CI in parachute-cloud: its door against the kept box
 bun run doors -- --remote door.json              # a deployed door (below)
 bun run moves                                    # a made-up vault through all three doors, every direction
@@ -157,9 +157,13 @@ bun run moves                                    # a made-up vault through all t
 - **A difference passes only if `suites/door/deliberate.json` names it**, with why and who decides. `deliberate`
   means meant; `drift` means not meant and not yet fixed. An entry that excuses nothing fails the run, so the list
   can't outlive the differences. A contract skips itself only through an entry (`lacks`).
-- **Across repos**, the box's fingerprint is kept in `suites/door/golden/`. CI here fails when the box no longer
-  matches it (`bun run doors:keep box-0.8` after a meant change, and commit the diff). parachute-cloud's CI runs its
-  own door from its pin of this folder and compares with the kept box. Neither repo builds the other's door.
+- **Across repos**, the box's fingerprint is kept in `suites/door/golden/`, one file per release line. CI here builds
+  the box from this branch and fails when it no longer matches its file (`box-0.9.jsonl` on `next`; after a meant
+  change, `bun run doors:keep box-0.9` and commit the diff). parachute-cloud's CI runs its own door from its pin of
+  this folder and compares with the kept box of the release it runs (`box-0.8.jsonl` while cloud is on 0.8; that
+  file was kept from `next` at 53f956f plus this suite's one fix to the box, the last 0.8 on `next`, and is checked
+  again by building `release/0.8`: `CANDIDATE_DIR=<that build> bun run doors -- --doors box --check-golden`).
+  Neither repo builds the other's door.
 - **A deployed door** is run from a door file written by hand (`kind`, `label`, `release`, `issuer`, `vaultOrigin`,
   `signIn: {how: "nostr", secretKeyFile}`), with `DOOR_REMOTE_HOSTS` naming its hosts. The run makes two vaults of
   its own there and removes them. A `parachute.computer` host is always refused: these contracts create and delete
@@ -182,7 +186,7 @@ deleted, a note the export format can't carry).
 | `door/connect.test.ts` | Discovery, registration, PKCE, the token and its claims, refresh rotation and replay, read-only and admin approvals, revoke, the published keys; the account door (credential, list, mint, make and remove a vault). |
 | `door/files.test.ts` | Upload, attach, byte-equal download, a ranged read, refused active content, tickets over MCP, `read-attachment` (an image block; a text window). |
 | `door/exit.test.ts` | The export: every note, type and file; the bytes of a fixed made-up note are compared across doors (a box's come from its own command). |
-| `door/records.test.ts`, `door/keys.test.ts` | 0.9 doors only: the record door over MCP and REST; the owner's key (NIP-98), named app keys that stop when revoked. |
+| `door/records.test.ts`, `door/keys.test.ts` | 0.9 doors: the record door over MCP and REST. 0.9.1 doors: the owner's key (NIP-98), named app keys that stop when revoked. |
 
 ## The contracts
 

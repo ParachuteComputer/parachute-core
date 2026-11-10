@@ -105,10 +105,13 @@ async function startBox(): Promise<Started> {
   const box = await startBoxDoor(info);
   const other = `other${randomBytes(3).toString("hex")}`;
   await ensureVault(box.issuer, await accountBearer(box.issuer, box.session), other);
-  const release = /\b0\.9\./.test(JSON.stringify(manifest.version ?? "")) ? "0.9" : "0.8";
-  // A 0.9 box: link a made-up key to the admin's account through the account door, as its owner would.
+  // The release line decides which contracts apply and which doors are compared with each other. 0.9.1 is 0.9 with
+  // owner keys (`/account/keys`); the version string doesn't say, so the door is asked.
+  let release = /\b0\.9\./.test(JSON.stringify(manifest.version ?? "")) ? "0.9" : "0.8";
+  if (release === "0.9" && (await safeFetch(`${box.issuer}/account/keys`)).status !== 404) release = "0.9.1";
+  // A 0.9.1 box: link a made-up key to the admin's account, as its owner would.
   let ownerKey: string | undefined;
-  if (release === "0.9") {
+  if (release === "0.9.1") {
     const owner = await makeOwnerKey();
     await linkOwnerKeyOnBox(box.issuer, box.session, owner.secretKey, box.admin.password);
     ownerKey = owner.secretKey;
@@ -189,7 +192,7 @@ async function startPersonal(): Promise<Started> {
     await ensureVault(w.issuer, bearer, vault);
     await ensureVault(w.issuer, bearer, other);
     return {
-      door: { kind: "personal", label: "personal-0.9", release: "0.9", issuer: w.issuer, vaultOrigin: w.vaultOrigin, vault, otherVault: other, signIn: { how: "nostr", secretKey: owner.secretKey }, ownerKey: owner.secretKey },
+      door: { kind: "personal", label: "personal-0.9.1", release: "0.9.1", issuer: w.issuer, vaultOrigin: w.vaultOrigin, vault, otherVault: other, signIn: { how: "nostr", secretKey: owner.secretKey }, ownerKey: owner.secretKey },
       provenance: `personal: parachute-cloud ${gitHead(repo)} (deploy/personal profile), core pin ${corePin(repo)}, local workerd`,
       stop: w.stop,
       logs: w.logs,
@@ -295,18 +298,20 @@ if (!files.length && labels.length) writeFileSync(join(results, "MATRIX.md"), ma
 if (!files.length && labels.length) {
   const deliberate: Deliberate[] = JSON.parse(readFileSync(join(contracts, "suites", "door", "deliberate.json"), "utf8")).differences;
   const prints = Object.fromEntries(labels.map((l) => [l, readFingerprint(join(results, l, "fingerprint.jsonl"))]));
+  let checkedGolden = 0;
   for (const l of labels) {
     const kept = join(goldenDir, `${l}.jsonl`);
     // This run's fingerprint in the kept form. The repo is read-only in here; `bun run doors:keep <label>` copies it.
     writeFileSync(join(results, l, "golden.jsonl"), serializeFingerprint(prints[l]!));
-    if (checkGolden) {
+    if (checkGolden && existsSync(kept)) {
+      checkedGolden++;
       // The kept fingerprint is what other doors are compared with where this one isn't run (another repo's CI).
       // A change here is a change to what every door is held to: it shows in the diff of the kept file.
-      const golden = existsSync(kept) ? readFingerprint(kept) : null;
+      const golden = readFingerprint(kept);
       const now = serializeFingerprint(prints[l]!);
-      const same = golden !== null && serializeFingerprint(golden) === now;
+      const same = serializeFingerprint(golden) === now;
       if (!same) {
-        const was = new Map(golden ?? []);
+        const was = new Map(golden);
         const changed = [...new Set([...was.keys(), ...prints[l]!.keys()])].filter((k) => was.get(k) !== prints[l]!.get(k)).sort();
         console.log(`[doors] ${l}: differs from the kept fingerprint in ${changed.length} fact(s): ${changed.slice(0, 12).join(", ")}${changed.length > 12 ? ", …" : ""}`);
         console.log(`[doors] if the change is meant: bun run doors:keep ${l}, and commit suites/door/golden/${l}.jsonl`);
@@ -314,6 +319,13 @@ if (!files.length && labels.length) {
       }
       lines.push(`${same ? "PASS" : "FAIL"} golden ${l}`);
     }
+  }
+  // A door with no kept file is not checked against one (cloud and personal are compared with a box instead). But
+  // a --check-golden run that found no kept file for any of its doors checked nothing, and says so.
+  if (checkGolden && checkedGolden === 0) {
+    console.log(`[doors] --check-golden: no kept fingerprint in suites/door/golden for ${labels.join(", ")}. After a first run: bun run doors:keep <label>`);
+    lines.push("FAIL golden (no kept fingerprint for any door in this run)");
+    failed++;
   }
   if (withGolden) {
     const kept = join(goldenDir, `${withGolden}.jsonl`);

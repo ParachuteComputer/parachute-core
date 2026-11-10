@@ -20,7 +20,7 @@ export interface Door {
   kind: "box" | "cloud" | "personal";
   /** A name for results, e.g. "box-0.8". */
   label: string;
-  /** The release line, "0.8" or "0.9": which surfaces the door is expected to have. */
+  /** The release line, "0.8", "0.9" or "0.9.1" (0.9 with owner keys): which surfaces the door is expected to have. */
   release: string;
   /** The origin that signs credentials and serves /oauth and /account. */
   issuer: string;
@@ -32,7 +32,7 @@ export interface Door {
   otherVault: string;
   /** How this run is signed in as the owner. */
   signIn: { how: "cookie"; cookie: string; csrf: string } | { how: "nostr"; secretKey: string; secretKeyFile?: string };
-  /** 0.9 doors: a made-up key the owner can sign in with (NIP-98), as hex. On a key-only door it is the sign-in. */
+  /** 0.9.1 doors: a made-up key the owner can sign in with (NIP-98), as hex. On a key-only door it is the sign-in. */
   ownerKey?: string;
   /** Where this run may write its fingerprint (one JSON object per line). */
   fingerprint?: string;
@@ -54,7 +54,7 @@ export function door(): Door {
   }
   // A key kept in a file (a deployed door's made-up owner): read here, so a door file never holds it.
   if (d.signIn.how === "nostr" && !d.signIn.secretKey && d.signIn.secretKeyFile) d.signIn.secretKey = readFileSync(d.signIn.secretKeyFile, "utf8").trim();
-  if (!d.ownerKey && d.signIn.how === "nostr" && d.release === "0.9") d.ownerKey = d.signIn.secretKey;
+  if (!d.ownerKey && d.signIn.how === "nostr") d.ownerKey = d.signIn.secretKey;
   allowOrigins(d.issuer, d.vaultOrigin);
   cached = d;
   return d;

@@ -1,9 +1,9 @@
-// Keys on a 0.9 door (0.9.1): the owner signs in with a key they hold, and gives each app a named key that can be
-// stopped by name. The same calls at every 0.9 door. Runs only on a 0.9 door.
+// Keys on a 0.9.1 door: the owner signs in with a key they hold, and gives each app a named key that can be
+// stopped by name. The same calls at every 0.9.1 door. Runs only there.
 import { describe, expect, test } from "bun:test";
 import { accountToken, door, fp, lacks, nostrAuth, refusal, rest, runId, safeFetch, shape, vaultUrl } from "./_door.ts";
 
-const is09 = door().release === "0.9";
+const is09 = door().release === "0.9.1"; // owner keys and named app keys arrived with 0.9.1
 const d = door();
 const bearer = async () => ({ authorization: `Bearer ${await accountToken()}`, "content-type": "application/json" });
 const withKey = (token: string, method: string, path: string, body?: unknown) =>

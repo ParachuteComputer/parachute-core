@@ -202,7 +202,8 @@
       ],
       "status": "drift",
       "owner": "T-430 (the personal door): a browser sign-in for an owner who holds only a key",
-      "why": "On a personal door the owner signs in with a Nostr key at `POST /account/token` and nowhere else, so there is no browser session to approve an app on the consent screen. A consumer AI app that connects by OAuth (Claude's connectors, any app that follows the MCP sign-in) can't be approved there; apps use a named key from `/account/keys` instead. Discovery and registration answer as on a box."
+      "why": "On a personal door the owner signs in with a Nostr key at `POST /account/token` and nowhere else, so there is no browser session to approve an app on the consent screen. A consumer AI app that connects by OAuth (Claude's connectors, any app that follows the MCP sign-in) can't be approved there; apps use a named key from `/account/keys` instead. Discovery and registration answer as on a box.",
+      "note": "Covers every fact the approval contracts record, because none of them can run on a personal door today. When the personal door gains a browser sign-in, delete this entry rather than narrowing it: each of those facts must then be equal or named on its own."
     },
     {
       "id": "records-over-rest",
@@ -215,7 +216,8 @@
         "personal"
       ],
       "releases": [
-        "0.9"
+        "0.9",
+        "0.9.1"
       ],
       "lacks": [
         "box"
@@ -235,7 +237,7 @@
         "personal"
       ],
       "releases": [
-        "0.9"
+        "0.9.1"
       ],
       "lacks": [
         "box"
@@ -254,7 +256,7 @@
         "personal"
       ],
       "releases": [
-        "0.9"
+        "0.9.1"
       ],
       "status": "drift",
       "owner": "core 0.9.1 keys (T-414)",
@@ -270,7 +272,7 @@
         "personal"
       ],
       "releases": [
-        "0.9"
+        "0.9.1"
       ],
       "status": "drift",
       "owner": "this change, once the 0.9 branch takes `next`",
@@ -287,7 +289,7 @@
         "personal"
       ],
       "releases": [
-        "0.9"
+        "0.9.1"
       ],
       "status": "drift",
       "owner": "core 0.9.1 keys (T-414)",

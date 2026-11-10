@@ -167,7 +167,8 @@ try {
     },
   };
   const boxOwner = cookieOwner(boxA.issuer, boxA.vaultOrigin, boxA.session);
-  console.log(`[moves] doors: box ${manifest.core_commit} (0.8), cloud and personal on local workerd`);
+  const boxRelease = /\b0\.9\./.test(JSON.stringify(manifest.version ?? "")) ? "0.9" : "0.8";
+  console.log(`[moves] doors: box ${manifest.core_commit} (${boxRelease}), cloud and personal on local workerd`);
 
   // Door files, as a person would write them. Secrets are files beside them, named but never read into a log.
   const CLOUD = doorFile("cloud", { kind: "cloud", issuer: cloudW.issuer, vault_origin: cloudW.vaultOrigin, session_file: secretFile("cloud-session.json", JSON.stringify({ cookie: me.cookie, csrf: me.csrf })), release: "0.8" });
@@ -176,11 +177,11 @@ try {
   // The same personal door, entered by its operator for the owner (on your own door you are both).
   const PERSONAL_OP = doorFile("personal-operator", { kind: "personal", issuer: personalW.issuer, vault_origin: personalW.vaultOrigin, owner_key_file: keyFile, ops_token_file: personalW.opsTokenFile, owner_email_file: secretFile("owner.email", `${key.pubkey}@nostr.invalid`), release: "0.9" });
   const boxEnv = (home: string) => ({ ...boxA.running.services.cliEnv, PARACHUTE_HOME: home });
-  const BOX_A = doorFile("box-a", { kind: "box", home: boxA.running.services.home, cli: [info.vaultBin], env: boxEnv(boxA.running.services.home), release: "0.8" });
+  const BOX_A = doorFile("box-a", { kind: "box", home: boxA.running.services.home, cli: [info.vaultBin], env: boxEnv(boxA.running.services.home), release: boxRelease });
   const homeB = await emptyBoxHome(info, "boxb");
-  const BOX_B = doorFile("box-b", { kind: "box", home: homeB.home, cli: [info.vaultBin], env: homeB.env, release: "0.8" });
+  const BOX_B = doorFile("box-b", { kind: "box", home: homeB.home, cli: [info.vaultBin], env: homeB.env, release: boxRelease });
   const homeC = await emptyBoxHome(info, "boxc");
-  const BOX_C = doorFile("box-c", { kind: "box", home: homeC.home, cli: [info.vaultBin], env: homeC.env, release: "0.8" });
+  const BOX_C = doorFile("box-c", { kind: "box", home: homeC.home, cli: [info.vaultBin], env: homeC.env, release: boxRelease });
 
   // ── the made-up vault, on Parachute Cloud ────────────────────────────────────────────────────────────────
   await makeVault(cloud, "atlas");
