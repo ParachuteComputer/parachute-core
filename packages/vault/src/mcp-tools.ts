@@ -22,6 +22,8 @@ import {
   type VaultProjection,
 } from "../core/src/vault-projection.ts";
 import { readVaultConfig, writeVaultConfig } from "./config.ts";
+import { forceFlag, parentsChange, tagChangeRefusal, type TagChange } from "./tag-change-guard.ts";
+import { stripTagHash } from "../core/src/tag-hierarchy.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { hasScopeForVault, hasMigrateScopeForVault, parseScopes, validateMintedScopes, logStrictBypass } from "./scopes.ts";
 import type { AuthResult } from "./auth.ts";
@@ -606,6 +608,39 @@ function withParamWarnings(tool: string, result: unknown, unknown: ParamProblem[
  */
 function applyTagDependencyGuards(tools: McpToolDef[], vaultName: string): void {
   const store = getVaultStore(vaultName);
+  // Scope gap 6: a rename, merge, delete or re-parent that changes what a live
+  // key, private_tags or the published tag reaches is refused unless the call
+  // passes `force: true`; the refusal names the keys (src/tag-change-guard.ts,
+  // the same check as the REST tag routes).
+  const guard = (name: string, change: (p: Record<string, any>) => TagChange | null) =>
+    wrapReadTool(tools, name, async (orig, params) => {
+      const p = (params ?? {}) as Record<string, any>;
+      const c = forceFlag(p.force) ? null : change(p);
+      const refusal = c && tagChangeRefusal(vaultName, store, c);
+      if (refusal) throw Object.assign(new Error(String(refusal.message)), refusal);
+      return await orig(params);
+    });
+  guard("rename-tag", (p) => {
+    const from = p.old_name ?? p.from ?? p.tag;
+    const to = p.new_name ?? p.to;
+    return typeof from === "string" && typeof to === "string" ? { kind: "rename", from, to } : null;
+  });
+  guard("merge-tags", (p) =>
+    Array.isArray(p.sources) && typeof p.target === "string"
+      ? { kind: "merge", sources: p.sources.filter((x: unknown): x is string => typeof x === "string"), target: p.target }
+      : null);
+  guard("delete-tag", (p) => {
+    const tag = p.tag ?? p.name;
+    return typeof tag === "string" ? { kind: "delete", tag } : null;
+  });
+  guard("update-tag", (p) => {
+    const tag = typeof p.tag === "string" ? stripTagHash(p.tag) : null;
+    if (!tag || p.parent_names === undefined) return null;
+    const parents = Array.isArray(p.parent_names)
+      ? p.parent_names.filter((x: unknown): x is string => typeof x === "string" && x.length > 0).map(stripTagHash)
+      : [];
+    return parentsChange(store, tag, parents) ? { kind: "reparent", tag, parents } : null;
+  });
   wrapReadTool(tools, "delete-tag", async (orig, params) => {
     const tag = (params as any).tag ?? (params as any).name;
     if (typeof tag === "string") {
@@ -1140,6 +1175,11 @@ function applyTagScopeWrappers(
     const tag = (params as any).tag ?? (params as any).name;
     if (typeof tag === "string" && !allowed.has(tag)) {
       return forbidden(`update-tag: tag "${tag}" is outside the token's allowlist`);
+    }
+    // Scope gap 6: its parents too, or it could pour its notes into another key's reach.
+    const parents = (params as any).parent_names;
+    if (Array.isArray(parents) && parents.some((p) => typeof p !== "string" || !tagVisibleInScope(stripTagHash(p), allowed, rawTags))) {
+      return forbidden("update-tag: a parent in parent_names is outside the token's allowlist");
     }
     try {
       return await orig(params);

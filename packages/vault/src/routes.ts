@@ -79,6 +79,7 @@ import {
   type EmbeddingCapability,
 } from "./embedding/capability.ts";
 import { getSharedEmbeddingProvider, getVaultNameForStore } from "./vault-store.ts";
+import { forceFlag, parentsChange, tagChangeRefusal, type TagChange } from "./tag-change-guard.ts";
 import { loadSchemaConfig } from "../core/src/schema-defaults.ts";
 import {
   buildExpandVisibility,
@@ -1088,6 +1089,18 @@ function parseSearchModeParam(url: URL): { mode?: SearchMode; error?: Response }
 function linkOptFor(db: Database, tagScope: TagScopeCtx): { linkVisible?: (noteId: string) => boolean } {
   const linkVisible = ambiguityVisibilityFor(db, tagScope);
   return linkVisible ? { linkVisible } : {};
+}
+
+/**
+ * Scope gap 6: the 409 for a tag change that alters who sees what, unless the
+ * request says `?force=true` (src/tag-change-guard.ts). Null: go ahead.
+ */
+function tagChangeGuard(store: Store, url: URL, change: TagChange): Response | null {
+  if (forceFlag(url.searchParams.get("force"))) return null;
+  const vaultName = getVaultNameForStore(store);
+  if (!vaultName) return null; // a store outside the daemon (tests) has no keys or vault.yaml
+  const refusal = tagChangeRefusal(vaultName, store, change);
+  return refusal ? json(refusal, 409) : null;
 }
 
 function ambiguityVisibilityFor(
@@ -3876,6 +3889,9 @@ export async function handleTags(
         409,
       );
     }
+    // Scope gap 6: merging moves notes out of the sources' reach and into the target's.
+    const mergeRefusal = tagChangeGuard(store, url, { kind: "merge", sources: sources as string[], target });
+    if (mergeRefusal) return mergeRefusal;
     const result = await store.mergeTags(sources, target);
     return json(result);
   }
@@ -3894,6 +3910,11 @@ export async function handleTags(
     if (tagScope.allowed && (!tagScope.allowed.has(oldName) || !tagScope.allowed.has(newName))) {
       return tagScopeForbidden(tagScope.raw ?? []);
     }
+    // Scope gap 6: renaming a name a live key's scope, private_tags or the
+    // published tag uses changes who sees what; it needs `?force=true`.
+    // (The vault#240 cascade rewrites only the vault's own legacy tokens table.)
+    const renameRefusal = tagChangeGuard(store, url, { kind: "rename", from: oldName, to: newName });
+    if (renameRefusal) return renameRefusal;
     // Vault#240: rename now cascades to tokens.scoped_tags (and every
     // other surface). The old fail-closed token-reference check has been
     // removed; the cascade rewrites the JSON allowlist atomically. See
@@ -4100,6 +4121,20 @@ export async function handleTags(
       );
       parentNamesPatch = cleaned.length > 0 ? cleaned : null;
     }
+    if (parentNamesPatch !== undefined) {
+      // Scope gap 6: a tag-scoped admin may put its tag only under tags it can
+      // see (else it could pour its notes into another key's reach), and a
+      // re-parent that changes what a key, private_tags or the published tag
+      // reaches needs `?force=true`.
+      const parents = (parentNamesPatch ?? []).map(stripTagHash);
+      if (tagScope.raw !== null && parents.some((p) => !tagVisibleInScope(p, tagScope.allowed, tagScope.raw))) {
+        return tagScopeForbidden(tagScope.raw);
+      }
+      if (parentsChange(store, putTagName, parents)) {
+        const reparentRefusal = tagChangeGuard(store, url, { kind: "reparent", tag: putTagName, parents });
+        if (reparentRefusal) return reparentRefusal;
+      }
+    }
 
     // Field merge mirrors MCP update-tag — preserves prior keys when the
     // payload only declares new ones. UNLESS `replace_fields: true`, in which
@@ -4283,6 +4318,9 @@ export async function handleTags(
     // required to delete a tag another tag's parent_names still references
     // (vault#552). Query params, not a DELETE body, so the flag is visible
     // in access logs and works with any HTTP client without body support.
+    // Scope gap 6: deleting a name a key, private_tags or the published tag uses.
+    const deleteRefusal = tagChangeGuard(store, url, { kind: "delete", tag: tagName });
+    if (deleteRefusal) return deleteRefusal;
     const cascade = parseBool(parseQuery(url, "cascade"), false);
     const detach = parseBool(parseQuery(url, "detach"), false);
     const result = await store.deleteTag(tagName, { cascade, detach });
