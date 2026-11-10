@@ -159,7 +159,8 @@
 {"key":"mcp/admin.tool.vault-info.words","value":"61960edd0cb2763f"}
 {"key":"mcp/cold.challenge","value":"Bearer resource_metadata=\"<door>/vault/<v>/.well-known/oauth-protected-resource\""}
 {"key":"mcp/create-note.result.shape","value":{"content":"string","createdAt":"string","createdBy":"string","createdVia":"string","extension":"string","id":"string","lastUpdatedBy":"string","lastUpdatedVia":"string","metadata":{"n":"number"},"path":"string","tags":["string"],"updatedAt":"string"}}
-{"key":"mcp/list-tags.result.shape","value":[{"count":"number","expanded_count":"number","name":"string"}]}
+{"key":"mcp/list-tags.item.shape","value":{"count":"number","expanded_count":"number","name":"string"}}
+{"key":"mcp/list-tags.result.envelope","value":"array"}
 {"key":"mcp/other-vault","value":{"status":401}}
 {"key":"mcp/protected-resource.at.vault-first","value":{"same":true,"status":200}}
 {"key":"mcp/protected-resource.at.well-known-first","value":{"same":true,"status":200}}
@@ -301,11 +302,11 @@
 {"key":"rest/vault.transcription","value":{"enabled":"boolean"}}
 {"key":"search/hit.shape","value":{"byteSize":"number","createdAt":"string","createdBy":"string","createdVia":"string","displayTitle":"string","extension":"string","id":"string","lastUpdatedBy":"string","lastUpdatedVia":"string","metadata":{},"path":"string","preview":"string","score":"number","tags":[],"updatedAt":"string"}}
 {"key":"search/odd-query","value":{"ok":true,"status":200}}
-{"key":"types/declare.shape","value":{"created_at":"string","description":"string","fields":{"due":{"type":"string"},"estimate":{"type":"string"},"status":{"enum":["string"],"strict":"boolean","type":"string"}},"tag":"string","updated_at":"string"}}
+{"key":"types/declare.shape","value":{"created_at":"string","description":"string","fields":{"door_rank":{"indexed":"boolean","type":"string"},"due":{"type":"string"},"estimate":{"type":"string"},"status":{"enum":["string"],"strict":"boolean","type":"string"}},"tag":"string","updated_at":"string"}}
 {"key":"types/delete.shape","value":{"deleted":"boolean","notes_untagged":"number"}}
-{"key":"types/effective","value":{"shape":{"effective_fields":{"due":{"type":"string"},"estimate":{"type":"string"},"status":{"enum":["string"],"strict":"boolean","type":"string"}},"effective_parents":[],"fields":{"due":{"type":"string"},"estimate":{"type":"string"},"status":{"enum":["string"],"strict":"boolean","type":"string"}},"indexed_fields":[],"name":"string","parents":[]},"status":200}}
-{"key":"types/get.shape","value":{"count":"number","created_at":"string","description":"string","expanded_count":"number","fields":{"due":{"type":"string"},"estimate":{"type":"string"},"status":{"enum":["string"],"strict":"boolean","type":"string"}},"name":"string","parent_names":"null","relationships":"null","updated_at":"string"}}
-{"key":"types/list.item.shape","value":{"count":"number","created_at":"string","description":"string","expanded_count":"number","fields":{"due":{"type":"string"},"estimate":{"type":"string"},"status":{"enum":["string"],"strict":"boolean","type":"string"}},"name":"string","parent_names":"null","relationships":"null","updated_at":"string"}}
+{"key":"types/effective","value":{"shape":{"effective_fields":{"door_rank":{"indexed":"boolean","type":"string"},"due":{"type":"string"},"estimate":{"type":"string"},"status":{"enum":["string"],"strict":"boolean","type":"string"}},"effective_parents":[],"fields":{"door_rank":{"indexed":"boolean","type":"string"},"due":{"type":"string"},"estimate":{"type":"string"},"status":{"enum":["string"],"strict":"boolean","type":"string"}},"indexed_fields":[{"name":"string","tags":["string"],"type":"string"}],"name":"string","parents":[]},"status":200}}
+{"key":"types/get.shape","value":{"count":"number","created_at":"string","description":"string","expanded_count":"number","fields":{"door_rank":{"indexed":"boolean","type":"string"},"due":{"type":"string"},"estimate":{"type":"string"},"status":{"enum":["string"],"strict":"boolean","type":"string"}},"name":"string","parent_names":"null","relationships":"null","updated_at":"string"}}
+{"key":"types/list.item.shape","value":{"count":"number","created_at":"string","description":"string","expanded_count":"number","fields":{"door_rank":{"indexed":"boolean","type":"string"},"due":{"type":"string"},"estimate":{"type":"string"},"status":{"enum":["string"],"strict":"boolean","type":"string"}},"name":"string","parent_names":"null","relationships":"null","updated_at":"string"}}
 {"key":"types/loose.warning.shape","value":{"schemas":["string"],"warnings":[{"field":"string","message":"string","reason":"string","schema":"string"}]}}
 {"key":"types/refusal.declare-without-admin","value":{"error":"Forbidden","hint":null,"keys":["error","error_type","granted_scopes","message","required_scope"],"status":403,"type":"insufficient_scope"}}
 {"key":"types/refusal.field-type-clash","value":{"error":"(text)","hint":null,"keys":["error","error_type"],"status":400,"type":"invalid_indexed_field"}}

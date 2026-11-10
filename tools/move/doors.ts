@@ -17,7 +17,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { digestFromBox, digestOverRest, type Digest } from "./digest.ts";
+import { boxDescription, digestFromBox, digestOverRest, type Digest } from "./digest.ts";
 import { isAttachment, tar, untar, type TarFile } from "./tar.ts";
 
 export interface HttpDoorFile {
@@ -66,7 +66,7 @@ export interface Door {
   /** Set the description again (the export carries it, the import doesn't apply it). False when this door can't here. */
   describe(vault: string, description: string): Promise<boolean>;
   /** Hand an operator-made vault to its owner. A no-op for an owner's own import. */
-  finish(vault: string, reference: string): Promise<void>;
+  finish(vault: string, reference: string, description?: string): Promise<void>;
   /** Remove a vault through the door's own delete. */
   remove(vault: string): Promise<void>;
   /** Who can still reach this vault, by name: connected apps and named keys. Null when the door can't say. */
@@ -256,13 +256,13 @@ export function httpDoor(f: HttpDoorFile, opts: { production?: boolean; asOperat
       return { notes };
     },
     async describe(vault, description) {
-      if (operator) return false; // the operator's finish restores it
+      if (operator) return false; // set by the door at the hand-over (`finish`), which reads it back itself
       const r = await vaultGet(vault, "admin")("/api/vault", { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ description }) });
       return r.ok;
     },
-    async finish(vault, reference) {
+    async finish(vault, reference, description) {
       if (!operator) return;
-      const r = await ops("/ops/vault-import/finish", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ email: ownerEmail(), confirm: ownerEmail(), vault_name: vault, reference }) });
+      const r = await ops("/ops/vault-import/finish", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ email: ownerEmail(), confirm: ownerEmail(), vault_name: vault, reference, ...(description ? { description } : {}) }) });
       if (!r.ok) throw new Error(`handing ${vault} to its owner gave ${r.status} ${((await r.json().catch(() => ({}))) as { error?: string }).error ?? ""}`);
     },
     async remove(vault) {
@@ -339,13 +339,7 @@ export function boxDoor(f: BoxDoorFile, opts: { scratch: string; liveBox?: boole
     },
     hasVault: async (name) => existsSync(vaultDir(name)),
     digest: (vault) => digestFromBox(join(vaultDir(vault), "vault.db"), join(vaultDir(vault), "assets"), vault),
-    async description(vault) {
-      const y = join(vaultDir(vault), "vault.yaml");
-      const m = existsSync(y) ? /^description:\s*(.*)$/m.exec(readFileSync(y, "utf8")) : null;
-      if (!m) return null;
-      const v = m[1]!.trim();
-      return /^".*"$/.test(v) ? (JSON.parse(v) as string) : v.replace(/^'(.*)'$/, "$1").replace(/''/g, "'") || null;
-    },
+    description: async (vault) => boxDescription(join(vaultDir(vault), "vault.yaml")),
     async export(vault) {
       const dir = join(opts.scratch, `box-export-${randomBytes(4).toString("hex")}`);
       const r = run(["export", dir, "--vault", vault]);
@@ -377,7 +371,19 @@ export function boxDoor(f: BoxDoorFile, opts: { scratch: string; liveBox?: boole
       }
       return { notes: null };
     },
-    describe: async () => false,
+    async describe(vault, description) {
+      // A box takes a description over its REST, which needs it serving; the import needs it stopped. So the
+      // description goes where the box itself keeps it: `vault.yaml`, as the block the box writes, right after the
+      // name. Only into a vault this move just made (it has no description yet); anything else is left alone.
+      const y = join(vaultDir(vault), "vault.yaml");
+      if (!existsSync(y)) return false;
+      const lines = readFileSync(y, "utf8").split("\n");
+      const name = lines.findIndex((l) => /^name:/.test(l));
+      if (name < 0 || lines.some((l) => /^description:/.test(l))) return false;
+      lines.splice(name + 1, 0, "description: |", ...description.replace(/\n+$/, "").split("\n").map((l) => `  ${l}`));
+      writeFileSync(y, lines.join("\n"));
+      return boxDescription(y) === description.replace(/\n+$/, "");
+    },
     finish: async () => {},
     async remove(vault) {
       const r = run(["remove", vault, "--yes"]);

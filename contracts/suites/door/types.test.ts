@@ -10,14 +10,16 @@ describe("types", () => {
     const tag = runId("task");
     const put = await api.put(`/tags/${enc(tag)}`, {
       description: "A thing to do",
-      fields: { status: { type: "string", enum: ["open", "done"], strict: true }, due: { type: "date" }, estimate: { type: "number" } },
+      // `door_rank` is indexed and declared nowhere else: the vault-wide list of indexed fields that a type's
+      // effective schema carries then always has an item, whatever other contracts have run before this one.
+      fields: { status: { type: "string", enum: ["open", "done"], strict: true }, due: { type: "date" }, estimate: { type: "number" }, door_rank: { type: "integer", indexed: true } },
     });
     expect(put.status, JSON.stringify(put.body)).toBe(200);
     fp("types/declare.shape", shape(put.body));
     const got = await api.get(`/tags/${enc(tag)}`);
     expect(got.status).toBe(200);
     expect(got.body.description).toBe("A thing to do");
-    expect(Object.keys(got.body.fields ?? {}).sort()).toEqual(["due", "estimate", "status"]);
+    expect(Object.keys(got.body.fields ?? {}).sort()).toEqual(["door_rank", "due", "estimate", "status"]);
     fp("types/get.shape", shape(got.body));
     const listed = await api.get(`/tags?include_schema=true`);
     const mine = listed.body.find((t: any) => t.name === tag);

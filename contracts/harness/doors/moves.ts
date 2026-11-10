@@ -245,7 +245,15 @@ try {
   // ── the other three directions ───────────────────────────────────────────────────────────────────────────
   await move("cloud-to-box", CLOUD, BOX_C, "atlas");
   // Entered as the operator, the way a vault is moved for someone (the path proven for the friends box).
-  await move("box-to-personal", BOX_A, PERSONAL_OP, "fieldnotes", ["--operator"]);
+  const m5 = await move("box-to-personal", BOX_A, PERSONAL_OP, "fieldnotes", ["--operator"]);
+  if (m5.ok) {
+    // The operator can't read a vault once it is handed over, and the door sets the description at that moment. The
+    // owner can: read as the owner, every section must equal the box's, the description too.
+    const asOwner = await restDigest(personal, "fieldnotes");
+    const c = compareDigests(viaDb, asOwner, { names: ["the box", "the personal door, as its owner"] });
+    writeFileSync(join(results, "05-box-to-personal", "as-owner.txt"), `${c.lines.join("\n")}\n`);
+    res(c.verdict === "DIGEST EQUAL", "after the operator's hand-over, the owner reads the same vault, description included", `all ${asOwner.digests.all.slice(0, 16)}`);
+  }
   const m6 = await move("personal-to-cloud", PERSONAL, CLOUD, "atlas", ["--as", "atlas-copy"]);
 
   // ── the proof can fail ───────────────────────────────────────────────────────────────────────────────────

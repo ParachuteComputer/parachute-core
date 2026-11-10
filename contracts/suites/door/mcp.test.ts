@@ -83,7 +83,11 @@ describe("the vault over MCP", () => {
       const info = await c.call("vault-info", {});
       fp("mcp/vault-info.result.keys", Object.keys(info).sort());
       const tags = await c.call("list-tags", {});
-      fp("mcp/list-tags.result.shape", shape(Array.isArray(tags) ? tags.slice(0, 1) : tags));
+      // This run's own tag, so the shape doesn't depend on which other tags the vault holds by now.
+      const mine = (Array.isArray(tags) ? tags : (tags.tags ?? [])).find((t: any) => t.name === "mcp-made");
+      expect(mine).toBeTruthy();
+      fp("mcp/list-tags.result.envelope", Array.isArray(tags) ? "array" : Object.keys(tags).sort());
+      fp("mcp/list-tags.item.shape", shape(mine));
     } finally {
       await c.close();
     }

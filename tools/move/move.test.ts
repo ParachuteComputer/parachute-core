@@ -2,7 +2,10 @@
 // plan flags before a move, and what the comparison excuses. The moves themselves run against real doors in
 // contracts/harness/doors/moves.ts.
 import { describe, expect, test } from "bun:test";
-import { compareDigests, formatRisks, sha, SECTIONS, type Digest, type Section } from "./digest.ts";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { boxDescription, compareDigests, formatRisks, sha, SECTIONS, type Digest, type Section } from "./digest.ts";
 import { filesFromExport } from "./doors.ts";
 import { tar, untar } from "./tar.ts";
 
@@ -48,6 +51,21 @@ describe("the comparison", () => {
     // Accepting one note doesn't cover a second that changed too.
     const two = { ...base, notes: [note("a", "one", { k: 1 }), note("b", "TWO")] };
     expect(compareDigests(src, digestOf(two), { acceptNotes: ["a"] }).ok).toBe(false);
+  });
+
+  test("a lost description fails", () => {
+    const withIt = digestOf({ ...base, description: [sha("A vault about the valley.")] });
+    expect(compareDigests(withIt, digestOf(base)).ok).toBe(false);
+    expect(compareDigests(withIt, digestOf({ ...base, description: [sha("Another text.")] })).ok).toBe(false);
+    expect(compareDigests(withIt, digestOf({ ...base, description: [sha("A vault about the valley.")] })).verdict).toBe("DIGEST EQUAL");
+  });
+
+  test("an operator's comparison leaves the description to the hand-over, and nothing else", () => {
+    const withIt = digestOf({ ...base, description: [sha("A vault about the valley.")] });
+    const c = compareDigests(withIt, digestOf(base), { descriptionAtHandOver: true });
+    expect(c.verdict).toBe("DIGEST EQUAL");
+    expect(c.lines.join("\n")).toContain("handed to its owner");
+    expect(compareDigests(withIt, digestOf({ ...base, links: [] }), { descriptionAtHandOver: true }).ok).toBe(false);
   });
 
   test("a lost duplicate (digests differ, no line differs) fails", () => {
@@ -126,5 +144,17 @@ describe("matching attached files to the export", () => {
     expect(filesFromExport(exported, src).map((f) => f.path)).toEqual(["2026-01-01/123-x.png"]);
     const wrong = digestOf({}, { files: [{ note: "a", path: "2026-01-01/123-x.png", mime: "image/png", size: 3, sha256: sha(new Uint8Array([9])) }] });
     expect(() => filesFromExport(exported, wrong)).toThrow(/doesn't hold the file/);
+  });
+});
+
+describe("a box's description", () => {
+  test("is read from the block the box writes, several lines and all", () => {
+    const dir = mkdtempSync(join(tmpdir(), "move-test-"));
+    const y = join(dir, "vault.yaml");
+    writeFileSync(y, 'name: atlas\ndescription: |\n  Atlas: a made-up vault.\n  Second line.\ncreated_at: "2026-11-01T00:00:00.000Z"\n');
+    expect(boxDescription(y)).toBe("Atlas: a made-up vault.\nSecond line.");
+    writeFileSync(y, 'name: atlas\ncreated_at: "2026-11-01T00:00:00.000Z"\n');
+    expect(boxDescription(y)).toBeNull();
+    expect(boxDescription(join(dir, "missing.yaml"))).toBeNull();
   });
 });

@@ -18,15 +18,16 @@
 //   attachment_meta  each file row's metadata, when it has any (transcripts live here)
 //   link_meta        each link's metadata, when it has any
 //   bare_types       0.9: names that are a type by declaration alone (no fields, no parents). 0.8 can't hold these.
+//   description      the vault's own description (what a connecting model is told first), when it has one
 // Not in any section, because the export format doesn't carry them: who wrote a note (counted as
 // `attributed_notes`), and a note's earlier versions.
 //
 // Lines hold ids, paths and tag names (never bodies), so a file of them is the owner's data: keep it private.
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
-export const SECTIONS = ["notes", "links", "attachments", "tags_in_use", "tag_schemas", "attachment_meta", "link_meta", "bare_types"] as const;
+export const SECTIONS = ["notes", "links", "attachments", "tags_in_use", "tag_schemas", "attachment_meta", "link_meta", "bare_types", "description"] as const;
 export type Section = (typeof SECTIONS)[number];
 
 export interface FileFact {
@@ -129,6 +130,7 @@ interface Gathered {
   attMeta: string[];
   linkMeta: string[];
   bareTypes: string[];
+  description: string | null;
   attributed: number;
   versions: number;
   files: FileFact[];
@@ -145,6 +147,7 @@ function pack(g: Gathered): Digest {
     attachment_meta: g.attMeta,
     link_meta: g.linkMeta,
     bare_types: g.bareTypes,
+    description: g.description && g.description.trim() ? [sha(g.description.trim())] : [],
   };
   const digests = Object.fromEntries(SECTIONS.map((s) => [s, section(lines[s])])) as Record<Section | "all", string>;
   digests.all = sha(SECTIONS.map((s) => digests[s]).join("|"));
@@ -152,6 +155,28 @@ function pack(g: Gathered): Digest {
   counts.attributed_notes = g.attributed;
   counts.versions = g.versions;
   return { vault: g.vault, reader: g.reader, counts, digests, lines, files: g.files, risks: g.risks };
+}
+
+/**
+ * A box keeps a vault's description in its `vault.yaml`, as the block the box itself writes:
+ *   description: |
+ *     first line
+ *     second line
+ */
+export function boxDescription(yamlFile: string): string | null {
+  if (!existsSync(yamlFile)) return null;
+  const lines = readFileSync(yamlFile, "utf8").split("\n");
+  const at = lines.findIndex((l) => /^description:/.test(l));
+  if (at < 0) return null;
+  const inline = lines[at]!.replace(/^description:\s*/, "");
+  if (inline && inline !== "|") return inline.replace(/^"(.*)"$/, "$1").replace(/^'(.*)'$/, "$1");
+  const body: string[] = [];
+  for (const l of lines.slice(at + 1)) {
+    if (l.startsWith("  ")) body.push(l.slice(2));
+    else if (l.trim() === "") body.push("");
+    else break;
+  }
+  return body.join("\n").replace(/\n+$/, "") || null;
 }
 
 /** A box's vault, from its database file and assets folder. Read-only; works with the box stopped or running. */
@@ -189,6 +214,7 @@ export async function digestFromBox(dbFile: string, assetsDir: string, vault: st
     return pack({
       vault,
       reader: "box-db",
+      description: boxDescription(join(dirname(dbFile), "vault.yaml")),
       noteLines,
       links,
       atts,
@@ -246,6 +272,9 @@ export async function digestOverRest(get: (path: string) => Promise<Response>, v
       atts.push(JSON.stringify([note, x.path, mime, r.ok ? sha(b) : r.status === 404 ? "MISSING" : `HTTP${r.status}`]));
     }
   }
+  const info = await get("/api/vault");
+  if (!info.ok) throw new Error(`digest: reading the vault's description gave ${info.status}`);
+  const description = ((await info.json()) as { description?: string | null }).description ?? null;
   const tagsRes = await get("/api/tags?include_schema=true");
   if (!tagsRes.ok) throw new Error(`digest: reading types gave ${tagsRes.status}`);
   const tagTable = (await tagsRes.json()) as any[];
@@ -254,6 +283,7 @@ export async function digestOverRest(get: (path: string) => Promise<Response>, v
   return pack({
     vault,
     reader: "rest",
+    description,
     noteLines,
     links: [...links],
     atts,
@@ -279,17 +309,26 @@ export interface Comparison {
 /**
  * Compare two digests. A difference passes only when it was named before the move:
  *   - `acceptNotes`: ids of notes the plan said the format can't carry exactly, accepted by the person moving;
- *   - `dropBareTypes`: the move goes down a release (0.9 to 0.8), where a type with no fields comes back as a tag.
+ *   - `dropBareTypes`: the move goes down a release (0.9 to 0.8), where a type with no fields comes back as a tag;
+ *   - `descriptionAtHandOver`: an operator's move, where the door sets the description after the operator's last read.
  * A count never excuses a difference: digests that differ with no line to show for it (a lost duplicate) fail.
  */
-export function compareDigests(a: Digest, b: Digest, opts: { acceptNotes?: string[]; dropBareTypes?: boolean; names?: [string, string] } = {}): Comparison {
+export function compareDigests(a: Digest, b: Digest, opts: { acceptNotes?: string[]; dropBareTypes?: boolean; descriptionAtHandOver?: boolean; names?: [string, string] } = {}): Comparison {
   const accept = new Set(opts.acceptNotes ?? []);
   const [an, bn] = opts.names ?? ["source", "target"];
   const out: string[] = [];
   let bad = 0;
   let reviewed = 0;
+  let allSame = true;
   for (const k of SECTIONS) {
+    // An operator moving a vault for its owner can read it only until it is handed over, and the door sets the
+    // description at the hand-over (and reads it back itself). So the operator's comparison leaves it out, and says so.
+    if (k === "description" && opts.descriptionAtHandOver) {
+      out.push(`LATER  ${k.padEnd(15)} set by the door when the vault is handed to its owner; not compared here`);
+      continue;
+    }
     const same = a.digests[k] === b.digests[k];
+    if (!same) allSame = false;
     let extra = "";
     if (!same) {
       const sa = new Set(a.lines[k]);
@@ -326,7 +365,7 @@ export function compareDigests(a: Digest, b: Digest, opts: { acceptNotes?: strin
     out.push(`${same ? "EQUAL " : "DIFFER"} ${k.padEnd(15)} ${an} ${a.counts[k]} / ${bn} ${b.counts[k]}  ${a.digests[k].slice(0, 16)} vs ${b.digests[k].slice(0, 16)}${extra}`);
   }
   out.push(`not carried by the format: written-by stamps on ${a.counts.attributed_notes} note(s) at ${an}; earlier versions${a.reader === "box-db" ? ` (${a.counts.versions} at ${an})` : ""}`);
-  const verdict = a.digests.all === b.digests.all ? "DIGEST EQUAL" : bad ? "DIGEST DIFFERS" : "DIGEST EQUAL EXCEPT REVIEWED ITEMS";
+  const verdict = allSame ? "DIGEST EQUAL" : bad ? "DIGEST DIFFERS" : "DIGEST EQUAL EXCEPT REVIEWED ITEMS";
   out.push(`${verdict}${verdict === "DIGEST EQUAL EXCEPT REVIEWED ITEMS" ? ` (${reviewed})` : ""} (all: ${a.digests.all.slice(0, 16)} vs ${b.digests.all.slice(0, 16)})`);
   return { verdict, ok: !bad, reviewed, lines: out };
 }

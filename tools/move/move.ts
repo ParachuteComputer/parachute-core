@@ -156,16 +156,20 @@ async function run(): Promise<void> {
     console.log("== import");
     await to.importNew(as!, exported, files, log);
 
+    // The export carries the description, but no door's import applies it: it is set again here, before the
+    // target is read, so the digest holds it too.
+    const described = description ? await to.describe(as!, description) : false;
+
     console.log("== verify");
     const target = await to.digest(as!);
     const again = await from.digest(vault!);
     const still = compareDigests(p.source, again, { names: ["source before", "source after"] });
-    const moved = compareDigests(p.source, target, { acceptNotes: p.accept, dropBareTypes: p.down, names: ["source", "target"] });
+    const atHandOver = operator && !!description;
+    const moved = compareDigests(p.source, target, { acceptNotes: p.accept, dropBareTypes: p.down, descriptionAtHandOver: atHandOver, names: ["source", "target"] });
     for (const l of moved.lines) console.log(l);
     if (!still.ok || still.verdict !== "DIGEST EQUAL") console.log("the source changed while it was being moved:\n" + still.lines.join("\n"));
-    const described = moved.ok && description ? await to.describe(as!, description) : false;
     const verified = moved.ok && still.verdict === "DIGEST EQUAL";
-    if (verified) await to.finish(as!, `move ${vault}`);
+    if (verified) await to.finish(as!, `move ${vault}`, description || undefined);
 
     const who = await from.whoHolds(vault!).catch(() => null);
     const manifest = {
@@ -182,7 +186,7 @@ async function run(): Promise<void> {
         history: "does not travel; the old door keeps it until it is closed",
         written_by: `does not travel (${p.source.counts.attributed_notes} note(s) carried a stamp at the source)`,
         credentials: "none travel; see REKEY.md",
-        description: description ? (described ? "set again at the target" : "not set by the move") : "none at the source",
+        description: description ? (described ? "set again at the target, and in the digest" : atHandOver ? "set by the door when the vault was handed to its owner" : "not set by the move") : "none at the source",
         ...(p.down ? { release: `0.9 to 0.8: ${p.source.counts.bare_types} type(s) with no fields become tags` } : {}),
       },
       accepted_before_the_move: p.accept.length ? { notes: p.accept.length, why: [...new Set(p.source.risks.map((r) => r.why))] } : null,
@@ -193,7 +197,7 @@ async function run(): Promise<void> {
       doors: { from: resolve(fromFile!), to: resolve(toFile!) },
     };
     writeFileSync(join(out, "MOVE.json"), `${JSON.stringify(manifest, null, 2)}\n`);
-    writeFileSync(join(out, "REKEY.md"), rekey(from, to, vault!, as!, who, described ? description : ""));
+    writeFileSync(join(out, "REKEY.md"), rekey(from, to, vault!, as!, who, described || atHandOver ? description : ""));
     // The lines hold ids, paths and tag names: the owner's data, kept beside the manifest and never printed.
     for (const [name, d] of [["source", p.source], ["source-after", again], ["target", target]] as const) {
       writeFileSync(join(priv, `${name}.digest.json`), JSON.stringify(d), { mode: 0o600 });
