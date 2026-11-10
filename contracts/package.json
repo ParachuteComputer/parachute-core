@@ -14,10 +14,14 @@
     "npm-package": "bun run harness/npm-package.ts",
     "mutants": "bun run harness/mutate.ts",
     "mutants:candidate": "bun run harness/mutate-candidate.ts",
+    "doors": "bun run harness/doors/run.ts",
+    "doors:keep": "bun run harness/doors/keep.ts",
+    "moves": "bun run harness/doors/moves.ts",
     "selftest": "bun test --timeout 120000 ./harness/selftest",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
+    "@noble/curves": "^2.3.0",
     "@types/bun": "^1.4.4",
     "fast-check": "^4.10.2",
     "typescript": "^7.0.2"

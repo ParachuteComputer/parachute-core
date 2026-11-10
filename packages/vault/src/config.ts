@@ -821,14 +821,19 @@ function parseVaultConfig(yaml: string, name: string): VaultConfig {
     if (v === "keep" || v === "until_transcribed" || v === "never") config.audio_retention = v;
   }
 
-  // Parse description (block scalar)
-  const descMatch = yaml.match(/^description:\s*\|\s*\n((?:\s{2}.+\n?)+)/m);
-  if (descMatch) {
-    config.description = descMatch[1]!
-      .split("\n")
-      .map((l) => l.replace(/^\s{2}/, ""))
-      .join("\n")
-      .trim();
+  // Parse description (block scalar): the indented lines after `description: |`, up to the next line that is
+  // neither indented nor blank. A blank line inside it is a paragraph break, written back by serializeVaultConfig as
+  // a line of two spaces: the old pattern wanted a character after the indent, so it stopped there and a description
+  // of two paragraphs came back as its first one after the next restart (found by the door contracts' move proof).
+  const descAt = yaml.split("\n").findIndex((l) => /^description:\s*\|\s*$/.test(l));
+  if (descAt >= 0) {
+    const body: string[] = [];
+    for (const l of yaml.split("\n").slice(descAt + 1)) {
+      if (l.startsWith("  ")) body.push(l.slice(2));
+      else if (l.trim() === "") body.push("");
+      else break;
+    }
+    config.description = body.join("\n").trim();
   } else {
     const descSimple = yaml.match(/^description:\s*(.+)/m);
     if (descSimple) config.description = descSimple[1]!.trim().replace(/^"(.*)"$/, "$1");
