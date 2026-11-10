@@ -22,7 +22,7 @@ import { Database } from "bun:sqlite";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { enc, mcp, must, operator, pass, rest, runId, safeFetch, services, type Reply } from "../lib.ts";
-import { claims, mintOverHttp, note, subscribe } from "./_lib.ts";
+import { claims, mintOverHttp, note, scopedAdmin, subscribe } from "./_lib.ts";
 
 const s = services();
 const op = operator();
@@ -274,7 +274,6 @@ describe("gap 6: changing a tag that a key's scope names is refused without forc
 
   test("a scoped admin can't put its tag under a tag outside its scope", async () => {
     // A pass an older hub minted (0.9.1 refuses to mint one, gap 4).
-    const { scopedAdmin } = await import("./_lib.ts");
     const admin = rest(s.vaultViaHub, await scopedAdmin([MINE]));
     const r = await admin.put(`/tags/${enc(MINE)}?force=true`, { parent_names: [OTHER] });
     must(r.status === 403 || r.status === 404, `a scoped admin named a parent outside its scope (status ${r.status})`);

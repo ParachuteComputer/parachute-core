@@ -68,7 +68,7 @@ import { bindPubkeyOperatorAttested, findPubkeyLink } from "../pubkey-links.ts";
 import { isNonRequestableScope } from "../scope-explanations.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
 import { generateTotpSecret, otpauthUrlFor, verifyTotpCode } from "../totp.ts";
-import { ENFORCED_PERMISSION_KEYS, unknownPermissionKeys } from "../permissions-claim.ts";
+import { ENFORCED_PERMISSION_KEYS, scopedAdminProblem, unknownPermissionKeys } from "../permissions-claim.ts";
 import {
   clearEnrollment,
   getTotpState,
@@ -1261,6 +1261,12 @@ async function runMintToken(args: readonly string[], deps: AuthDeps): Promise<nu
         console.error(
           `parachute auth mint-token: --permissions has unknown key(s) ${unknownKeys.join(", ")}; a vault enforces only ${ENFORCED_PERMISSION_KEYS.join(", ")}`,
         );
+        return 1;
+      }
+      // Scope gap 4: a tag limit narrows read and write, never admin.
+      const scopedAdmin = scopedAdminProblem(scopes, parsed);
+      if (scopedAdmin !== null) {
+        console.error(`parachute auth mint-token: ${scopedAdmin}`);
         return 1;
       }
       permissions = JSON.stringify(parsed);

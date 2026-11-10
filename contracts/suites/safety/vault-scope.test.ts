@@ -20,7 +20,7 @@
 //   verb. Now it needs read.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mcp, must, operator, pass, rest, runId, safeFetch, services, type Reply } from "../lib.ts";
-import { note, resignClaims } from "./_lib.ts";
+import { note, resignClaims, scopedAdmin } from "./_lib.ts";
 
 const s = services();
 const op = operator();
@@ -120,15 +120,15 @@ describe("PATCH /api/vault: description is admin, config stays write, tag-scoped
     expect(w.body.error_type).toBe("tag_scope_violation");
     expect((await vaultNow()).retention).toBe(before.retention);
 
-    const scopedAdmin = rest(s.vaultViaHub, await pass({ level: "admin", tags: [MINE] }));
-    const a = await scopedAdmin.patch("/vault", { description: `${R} scoped admin text` });
+    const adminScoped = rest(s.vaultViaHub, await scopedAdmin([MINE]));
+    const a = await adminScoped.patch("/vault", { description: `${R} scoped admin text` });
     must(a.status === 403, `a tag-scoped admin pass changed the vault description (status ${a.status})`);
     expect(a.body.error_type).toBe("tag_scope_violation");
     expect((await vaultNow()).description).toBe(before.description);
   });
 
   test("MCP vault-info: a tag-scoped admin session can't set the description", async () => {
-    const c = await mcp(`${s.vaultViaHub}/mcp`, await pass({ level: "admin", tags: [MINE] }));
+    const c = await mcp(`${s.vaultViaHub}/mcp`, await scopedAdmin([MINE]));
     let refused = false;
     try {
       await c.call("vault-info", { description: `${R} scoped mcp text` });
@@ -232,7 +232,7 @@ describe("a tag-scoped admin pass can't reach triggers, mirror, import or the va
   ];
 
   test("each route answers 403 tag_scope_violation", async () => {
-    const token = await pass({ level: "admin", tags: [MINE] });
+    const token = await scopedAdmin([MINE]);
     const reached: string[] = [];
     for (const [method, path, body] of routes) {
       const r = await raw(token, method, path, body);

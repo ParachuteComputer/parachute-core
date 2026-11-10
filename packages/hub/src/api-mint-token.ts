@@ -65,7 +65,7 @@ import {
   vaultScopeName,
 } from "./scope-explanations.ts";
 import { getUserById, resolveUser } from "./users.ts";
-import { bearerPermissionsProblem, ENFORCED_PERMISSION_KEYS, scopedTagsWiderThanMinter, unknownPermissionKeys } from "./permissions-claim.ts";
+import { bearerPermissionsProblem, ENFORCED_PERMISSION_KEYS, scopedAdminProblem, scopedTagsWiderThanMinter, unknownPermissionKeys } from "./permissions-claim.ts";
 
 // Re-export `canGrant` so existing importers (and the symmetric revoke path)
 // have a single name to reach for; the implementation lives in the shared
@@ -465,6 +465,9 @@ export async function handleApiMintToken(req: Request, deps: ApiMintTokenDeps): 
         `permissions has unknown key(s) ${unknownKeys.join(", ")}; a vault enforces only ${ENFORCED_PERMISSION_KEYS.join(", ")}`,
       );
     }
+    // Scope gap 4: a tag limit narrows read and write, never admin.
+    const scopedAdmin = scopedAdminProblem(scopes, permissionsClaim);
+    if (scopedAdmin !== null) return jsonError(400, "invalid_scope", scopedAdmin);
     permissionsCanonical = JSON.stringify(permissionsClaim);
   }
   // Never wider than the bearer, tags included (fix 13): the scope checks

@@ -63,3 +63,23 @@ export function scopedTagsWiderThanMinter(
   }
   return null;
 }
+
+/**
+ * Scope gap 4 (0.9.1, SPEC §3.3): a tag scope narrows read and write, never admin. An admin pass acts on the
+ * whole vault (triggers, mirror, import, the description every agent reads, the tag graph), so a "tag-scoped
+ * admin" can't be made coherent. Every mint refuses one: this check runs at the mint doors for a clear answer, and
+ * again in `signAccessToken` so no other path signs one. Passes minted before 0.9.1 live until they expire; the
+ * vault-wide routes refuse them and `parachute doctor` names their keys.
+ *
+ * Returns why `scopes` with `permissions` may not be minted, or null.
+ */
+export function scopedAdminProblem(scopes: readonly string[], permissions: unknown): string | null {
+  const tags =
+    permissions && typeof permissions === "object" && !Array.isArray(permissions)
+      ? (permissions as Record<string, unknown>).scoped_tags
+      : undefined;
+  if (!Array.isArray(tags) || tags.length === 0) return null;
+  const admin = scopes.filter((s) => /^vault:(?:[^:]+:)?admin$/.test(s));
+  if (admin.length === 0) return null;
+  return `a pass limited to tags (permissions.scoped_tags) can't hold vault admin (${admin.join(", ")}): admin acts on the whole vault. Mint it with read or write, or mint an admin pass with no tag limit.`;
+}
