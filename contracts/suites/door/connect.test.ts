@@ -87,7 +87,9 @@ describe.skipIf(lacks("oauth-approval"))("connecting an app (OAuth)", () => {
       const seen = await rest("read").get(`/notes/${encodeURIComponent(path)}`);
       expect(seen.status).toBe(200);
       expect(seen.body.content).toBe("written by the app");
-      fp("connect/written-by.stamp", { by: typeof seen.body.createdBy, via: seen.body.createdVia ?? null });
+      // An approved app is a named key (0.9.1's write stamp): its writes say `key:<its key's name>`, which on a box is
+      // its client id, so the id is replaced by a placeholder for the comparison.
+      fp("connect/written-by.stamp", { by: typeof seen.body.createdBy, via: typeof seen.body.createdVia === "string" ? seen.body.createdVia.replace(app.clientId, "<client>") : null });
     } finally {
       await c.close();
     }

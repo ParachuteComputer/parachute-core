@@ -47,6 +47,7 @@
 import type { Database } from "bun:sqlite";
 import { inferAudience } from "./jwt-audience.ts";
 import {
+  KeyNameTakenError,
   TokenMintPrincipalGoneError,
   recordTokenMint,
   signAccessToken,
@@ -65,7 +66,8 @@ import {
   vaultScopeName,
 } from "./scope-explanations.ts";
 import { getUserById, resolveUser } from "./users.ts";
-import { bearerPermissionsProblem, ENFORCED_PERMISSION_KEYS, scopedTagsWiderThanMinter, unknownPermissionKeys } from "./permissions-claim.ts";
+import { bearerPermissionsProblem, carriedPermissions, ENFORCED_PERMISSION_KEYS, HUB_SET_PERMISSION_KEYS, scopedTagsWiderThanMinter, unknownPermissionKeys } from "./permissions-claim.ts";
+import { KEY_NAME_RE, ownerOf } from "./keys.ts";
 
 // Re-export `canGrant` so existing importers (and the symmetric revoke path)
 // have a single name to reach for; the implementation lives in the shared
@@ -142,6 +144,8 @@ interface MintTokenRequest {
   user?: unknown;
   service?: unknown;
   permissions?: unknown;
+  /** The new key's name (the write stamp): its writes say `via key:<name>`. Only a minter with no name of its own. */
+  name?: unknown;
 }
 
 export async function handleApiMintToken(req: Request, deps: ApiMintTokenDeps): Promise<Response> {
@@ -164,6 +168,7 @@ export async function handleApiMintToken(req: Request, deps: ApiMintTokenDeps): 
   let bearerSub: string;
   let bearerScopes: string[];
   let bearerPermissions: unknown;
+  let bearerKey: unknown;
   try {
     const validated = await validateAccessToken(
       deps.db,
@@ -176,6 +181,7 @@ export async function handleApiMintToken(req: Request, deps: ApiMintTokenDeps): 
     }
     bearerSub = sub;
     bearerPermissions = (validated.payload as { permissions?: unknown }).permissions;
+    bearerKey = (validated.payload as { key?: unknown }).key;
     // A bearer carrying restrictions no vault enforces (a pass minted before
     // fix 14) is refused outright: the vault 401s it, and minting from it
     // would launder it into a clean pass without those restrictions.
@@ -457,6 +463,14 @@ export async function handleApiMintToken(req: Request, deps: ApiMintTokenDeps): 
       return jsonError(400, "invalid_request", "permissions must be a JSON object");
     }
     permissionsClaim = body.permissions as Record<string, unknown>;
+    const hubSet = Object.keys(permissionsClaim).filter((k) => HUB_SET_PERMISSION_KEYS.includes(k) || k === "key");
+    if (hubSet.length > 0) {
+      return jsonError(
+        400,
+        "invalid_request",
+        `permissions.${hubSet.join(", permissions.")} is set by the hub from the key that mints, never asked for: a pass a key mints carries that key's own name and on-behalf-of prefix`,
+      );
+    }
     const unknownKeys = unknownPermissionKeys(permissionsClaim);
     if (unknownKeys.length > 0) {
       return jsonError(
@@ -467,6 +481,40 @@ export async function handleApiMintToken(req: Request, deps: ApiMintTokenDeps): 
     }
     permissionsCanonical = JSON.stringify(permissionsClaim);
   }
+  // The write stamp (ROADMAP 0.9.1): a pass minted by a named key carries that key's name and on-behalf-of prefix
+  // unchanged, so a key can't mint itself out of its own stamp; a minter with no name may name the new key.
+  const carried = carriedPermissions(bearerPermissions);
+  // The minter's own key claim (top-level, `{name, kind}`), passed on unchanged. Its passes are listed as keys under
+  // its name (`<name>-2`, …), never under a label they choose, so a child can't squat another name.
+  let keyClaimOut: unknown = bearerKey;
+  if (bearerKey !== undefined) {
+    if (permissionsClaim && "principal_pubkey" in permissionsClaim) {
+      return jsonError(400, "invalid_request", "a pass a named key mints is stamped with that key's name; it can't name a signing key (principal_pubkey)");
+    }
+    const parentName = (bearerKey as { name?: unknown } | null)?.name;
+    if (typeof parentName === "string") subjectLabel = parentName;
+  }
+  let keyName: string | undefined;
+  if (body.name !== undefined) {
+    if (typeof body.name !== "string" || !KEY_NAME_RE.test(body.name)) {
+      return jsonError(400, "invalid_name", "name: letters, digits, '.', '_' and '-', up to 80, starting with a letter or digit");
+    }
+    if (bearerKey !== undefined) {
+      return jsonError(400, "invalid_request", "this pass is a named key, and what it mints carries its name; leave `name` out");
+    }
+    if (deps.db.prepare("SELECT 1 FROM keys WHERE name = ?").get(body.name)) {
+      return jsonError(409, "name_taken", `a key called "${body.name}" already exists (revoked keys keep their names); pick another`);
+    }
+    keyName = body.name;
+    subjectLabel = body.name;
+    const { owner_kind } = ownerOf({ user_id: mintUserId, client_id: API_MINT_TOKEN_CLIENT_ID, created_via: "cli_mint", subject: subjectLabel });
+    keyClaimOut = { name: keyName, kind: owner_kind };
+  }
+  if (Object.keys(carried).length > 0) {
+    permissionsClaim = { ...(permissionsClaim ?? {}), ...carried };
+    permissionsCanonical = JSON.stringify(permissionsClaim);
+  }
+
   // Never wider than the bearer, tags included (fix 13): the scope checks
   // above attenuate scope strings only.
   const widerTags = scopedTagsWiderThanMinter(bearerPermissions, permissionsClaim);
@@ -526,7 +574,9 @@ export async function handleApiMintToken(req: Request, deps: ApiMintTokenDeps): 
     // ALSO gets `vault_scope:[]` — only its `vault:work:admin` mints (rule 2)
     // are pinned.
     vaultScope: vaultScopePin,
-    ...(permissionsClaim !== undefined ? { extraClaims: { permissions: permissionsClaim } } : {}),
+    ...(permissionsClaim !== undefined || keyClaimOut !== undefined
+      ? { extraClaims: { ...(permissionsClaim !== undefined ? { permissions: permissionsClaim } : {}), ...(keyClaimOut !== undefined ? { key: keyClaimOut } : {}) } }
+      : {}),
     ...(deps.now !== undefined ? { now: deps.now } : {}),
   });
 
@@ -539,6 +589,7 @@ export async function handleApiMintToken(req: Request, deps: ApiMintTokenDeps): 
       jti: minted.jti,
       createdVia: "cli_mint",
       subject: subjectLabel,
+      ...(keyName !== undefined ? { keyName } : {}),
       ...(mintUserId
         ? { userId: mintUserId, ...(mintUserUpdatedAt ? { userUpdatedAt: mintUserUpdatedAt } : {}) }
         : {}),
@@ -552,6 +603,7 @@ export async function handleApiMintToken(req: Request, deps: ApiMintTokenDeps): 
     if (err instanceof TokenMintPrincipalGoneError) {
       return jsonError(409, "conflict", err.message);
     }
+    if (err instanceof KeyNameTakenError) return jsonError(409, "name_taken", `${err.message}; pick another`);
     throw err;
   }
 

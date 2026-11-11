@@ -203,7 +203,7 @@
    "old": "parachute auth mint-token",
    "new": "parachute keys new <name>",
    "action": "rename",
-   "reason": "every key has a name and an owner; --scope stays, narrowed by --types and --deny; --ephemeral stays",
+   "reason": "every key has a name and an owner; its writes say via key:<name>, and --on-behalf-of lets it stamp by <name>:<id> (0.9.1); --scope stays, narrowed by --types and --deny; --ephemeral stays",
    "since": "0.9",
    "removed_in": "1.0",
    "state": "live"
@@ -863,7 +863,7 @@
    "old": "manage-token",
    "new": "manage-keys",
    "action": "rename",
-   "reason": "mint, list, revoke, each with scopes; admin only",
+   "reason": "mint, list, revoke, each with scopes; by name from 0.9.1 (a named key's writes say via key:<name>); admin only",
    "since": "0.9",
    "removed_in": "1.0",
    "state": "live"

@@ -46,10 +46,10 @@
 {"key":"connect/registration.reply.keys","value":["client_id","client_id_issued_at","client_name","grant_types","redirect_uris","response_types","same_hub","status","token_endpoint_auth_method"]}
 {"key":"connect/revocation-list","value":{"shape":{"generated_at":"string","jtis":[]},"status":200}}
 {"key":"connect/revoke.access-still-works","value":"stops at once"}
-{"key":"connect/token.claims","value":["aud","client_id","exp","iat","iss","jti","scope","sub","vault_scope"]}
+{"key":"connect/token.claims","value":["aud","client_id","exp","iat","iss","jti","key","scope","sub","vault_scope"]}
 {"key":"connect/token.lifetime","value":900}
 {"key":"connect/token.reply.shape","value":{"access_token":"string","expires_in":"number","refresh_token":"string","scope":"string","services":{"vault":{"url":"string","version":"string"},"vault:<v>":{"url":"string","version":"string"}},"token_type":"string","vault":"string"}}
-{"key":"connect/written-by.stamp","value":{"by":"string","via":"mcp"}}
+{"key":"connect/written-by.stamp","value":{"by":"string","via":"key:<client>"}}
 {"key":"exit/file..parachute/schemas/exitfixture.yaml","value":"description: A made-up type for the exit contract\nfields:\n  due:\n    type: date\n  points:\n    indexed: true\n    type: integer\n  status:\n    enum:\n      - open\n      - done\n      - 'a:b'\n    strict: true\n    type: string\nname: exitfixture\n"}
 {"key":"exit/file.attachment","value":{"name":".parachute/attachments/<att>/<stored>.png","sha256":"a88873d7c64f89b94d073cababf05929ebac1bcea3df01c4dc44eebe22927e92"}}
 {"key":"exit/file.exit-fixture/plan.md","value":"---\nid: <id>\npath: exit-fixture/plan\ntags:\n  - exit/nested-tag\n  - exitfixture\nmetadata:\n  done: false\n  due: 2027-02-03\n  empty_text: ''\n  multi: \"line one\\nline two\"\n  nested:\n    deep:\n      list:\n        - 1\n        - 2\n        - 3\n      yes: true\n  people:\n    - address: mailto:sam@example.org\n      name: Sam\n  points: 5\n  quote: it's \"quoted\"\n  status: a:b\n  urls:\n    - 'https://example.org/a'\n    - plain\n    - 'http://example.org:8080/b?c=d#e'\nlinks:\n  - relationship: depends-on\n    target: <id>\ncreated_at: <time>\nupdated_at: <time>\n---\n# Plan\n\nSee [[exit-fixture/target]] and [[exit-fixture/not-yet]].\n\nUmlauts stay: Grüße, 東京, 🪂.\n"}
@@ -75,25 +75,33 @@
 {"key":"files/upload.txt","value":{"status":201}}
 {"key":"has/export-over-http","value":false}
 {"key":"has/oauth-approval","value":true}
+{"key":"has/on-behalf-of","value":true}
 {"key":"has/records-over-rest","value":true}
+{"key":"has/revision-key-kind","value":true}
 {"key":"has/sign-in-keys-on-the-account-door","value":false}
 {"key":"history/deleted.shape","value":{"notes":[{"deleted_at":"string","extension":"string","id":"string","path":"string","versions":"number"}],"total":"number"}}
 {"key":"history/refusal.blind-restore","value":{"error":null,"hint":null,"keys":["error_type","message","note_id"],"status":428,"type":"precondition_required"}}
 {"key":"history/refusal.forget-without-admin","value":{"error":"Forbidden","hint":null,"keys":["error","error_type","granted_scopes","message","required_scope"],"status":403,"type":"insufficient_scope"}}
 {"key":"history/restore.reply.shape","value":{"content":"string","createdAt":"string","createdBy":"string","createdVia":"string","extension":"string","id":"string","lastUpdatedBy":"string","lastUpdatedVia":"string","metadata":{},"path":"string","recreated":"boolean","restored_from":"number","tags":[],"types":[],"updatedAt":"string"}}
-{"key":"history/version.shape","value":{"actor":"string","content":"string","content_hash":"string","content_len":"number","created_at":"string","encoding":"null","extension":"string","metadata":{},"note_id":"string","op":"string","path":"string","superseded_at":"string","version_ix":"number","via":"string"}}
-{"key":"history/versions.shape","value":{"total":"number","versions":[{"actor":"string","content_hash":"string","content_len":"number","created_at":"string","encoding":"null","extension":"string","metadata":{},"note_id":"string","op":"string","path":"string","superseded_at":"string","version_ix":"number","via":"string"}]}}
+{"key":"history/version.shape","value":{"actor":"string","content":"string","content_hash":"string","content_len":"number","created_at":"string","encoding":"null","extension":"string","metadata":{},"note_id":"string","op":"string","path":"string","superseded_at":"string","version_ix":"number","via":"string","via_kind":"null"}}
+{"key":"history/versions.shape","value":{"total":"number","versions":[{"actor":"string","content_hash":"string","content_len":"number","created_at":"string","encoding":"null","extension":"string","metadata":{},"note_id":"string","op":"string","path":"string","superseded_at":"string","version_ix":"number","via":"string","via_kind":"null"}]}}
 {"key":"keys/app-key.lifetime-days","value":365}
 {"key":"keys/app-key.list.item.shape","value":{"can":"string","created_at":"string","expires_at":"string","last_used_at":"string","name":"string","revoked_at":"null","status":"string","vault":"string"}}
 {"key":"keys/app-key.mint.shape","value":{"can":"string","created_at":"string","expires_at":"string","last_used_at":"null","name":"string","revoked_at":"null","scopes":["string"],"status":"string","token":"string","vault":"string"}}
 {"key":"keys/app-key.revoke.shape","value":{"name":"string","revoked_at":"string"}}
-{"key":"keys/app-key.written-via","value":"api"}
+{"key":"keys/app-key.written-via","value":"key:<name>"}
+{"key":"keys/on-behalf.refusal.not-granted","value":{"error":"(text)","hint":"b5583e490ca4fb65","keys":["error","error_type","field","hint","message","status"],"status":403,"type":"on_behalf_not_allowed"}}
+{"key":"keys/on-behalf.refusal.reserved-name","value":{"error":"invalid_name","status":400}}
+{"key":"keys/on-behalf.stamp","value":{"by":"<name>:client-42","via":"key:<name>"}}
 {"key":"keys/owner-key.reply.shape","value":{"aud":"string","expires_at":"string","scopes":["string"],"token":"string"}}
 {"key":"keys/refusal.admin-key","value":{"error":"invalid_scope","status":400}}
 {"key":"keys/refusal.name-taken","value":{"error":"name_taken","status":409}}
 {"key":"keys/refusal.replayed-proof","value":{"error":"invalid_nostr_auth","status":401}}
 {"key":"keys/refusal.revoked-key","value":{"error":"invalid_token","hint":null,"keys":["error","error_description"],"status":401,"type":null}}
 {"key":"keys/refusal.unknown-key","value":{"error":"invalid_nostr_auth","status":401}}
+{"key":"keys/write-stamp.revision.kind","value":"app"}
+{"key":"keys/write-stamp.revision.via","value":"key:<name>"}
+{"key":"keys/write-stamp.via","value":[{"createdVia":"key:<name>","door":"notes","lastUpdatedVia":"key:<name>"},{"createdVia":"key:<name>","door":"records","lastUpdatedVia":"key:<name>"},{"createdVia":"key:<name>","door":"mcp","lastUpdatedVia":"key:<name>"}]}
 {"key":"links/find-path.none","value":{"shape":{"edges":[{"relationship":"string","source":"string","sourcePath":"string","target":"string","targetPath":"string"}],"nodes":[{"id":"string","path":"string"}],"path":["string"],"relationships":["string"]},"status":200}}
 {"key":"links/find-path.shape","value":{"edges":[{"relationship":"string","source":"string","sourcePath":"string","target":"string","targetPath":"string"}],"nodes":[{"id":"string","path":"string"}],"path":["string"],"relationships":["string"]}}
 {"key":"links/link.shape","value":{"createdAt":"string","relationship":"string","sourceId":"string","sourceNote":{"createdAt":"string","id":"string","path":"string","tags":[],"updatedAt":"string"},"targetId":"string","targetNote":{"createdAt":"string","id":"string","path":"string","tags":[],"updatedAt":"string"}}}
@@ -144,11 +152,11 @@
 {"key":"mcp/admin.tool.list-types.words","value":"0f65df46d485ab21"}
 {"key":"mcp/admin.tool.manage-keys.hints","value":null}
 {"key":"mcp/admin.tool.manage-keys.present","value":true}
-{"key":"mcp/admin.tool.manage-keys.schema","value":"c3e09b0e7ccb4e81"}
-{"key":"mcp/admin.tool.manage-keys.words","value":"4c6bbc7ee7fc27a2"}
+{"key":"mcp/admin.tool.manage-keys.schema","value":"64e302cdc4abf04d"}
+{"key":"mcp/admin.tool.manage-keys.words","value":"0c783b4fc7261218"}
 {"key":"mcp/admin.tool.manage-token.hints","value":null}
 {"key":"mcp/admin.tool.manage-token.present","value":true}
-{"key":"mcp/admin.tool.manage-token.schema","value":"c3e09b0e7ccb4e81"}
+{"key":"mcp/admin.tool.manage-token.schema","value":"64e302cdc4abf04d"}
 {"key":"mcp/admin.tool.manage-token.words","value":"1b73e2c7a3571c44"}
 {"key":"mcp/admin.tool.manage-types.hints","value":null}
 {"key":"mcp/admin.tool.manage-types.present","value":true}

@@ -26,6 +26,7 @@ import { getVaultStore } from "./vault-store.ts";
 import { hasScopeForVault, hasMigrateScopeForVault, parseScopes, validateMintedScopes, logStrictBypass } from "./scopes.ts";
 import type { AuthResult } from "./auth.ts";
 import { refineMcpVia } from "./auth.ts";
+import { KEY_NAME_RE, ON_BEHALF_PARAM, resolveBy } from "../core/src/write-stamp.ts";
 import {
   expandTokenTagScope,
   scrubTagCountsForPrivateTags,
@@ -363,8 +364,59 @@ export function generateScopedMcpTools(
   const shaped = byToolOrder(addRecordTools(applyElevenTools(tools, vaultName, auth), (name, kind) => countName(`mcp ${name}`, kind), recordCheck));
   applyRecordWordsToVaultInfo(shaped);
   applyParamTeaching(shaped, vaultName);
+  applyOnBehalf(shaped, auth, (by) => generateScopedMcpTools(vaultName, { ...auth!, actor: by, acts_for: null }, callerBearer, req));
 
   return shaped;
+}
+
+/** The MCP tools whose writes carry the write stamp, by the action that writes (manage-types: only rename does). */
+function stampsWriter(tool: string, params: Record<string, unknown>): boolean {
+  if (["create-note", "update-note", "delete-note", "create-record", "update-record", "delete-record", "rename-tag"].includes(tool)) return true;
+  return tool === "manage-types" && params.action === "rename";
+}
+const STAMP_TOOLS = ["create-note", "update-note", "delete-note", "create-record", "update-record", "delete-record", "rename-tag", "manage-types"];
+
+/**
+ * The write stamp on MCP (core write-stamp.ts). A key with the owner's on-behalf-of permission sees an
+ * `on_behalf_of` parameter on the write tools and may name who a write is for: it is stamped `by <prefix>:<id>`, the
+ * prefix from the token. Every other session never sees the parameter, and a supplied one is refused before
+ * anything runs, on every tool, so it is never ignored. The call runs on the same tools built for that "by" (the
+ * engine reads its stamp once, at build), with the token's own scope: on-behalf-of never opens anything.
+ */
+function applyOnBehalf(tools: McpToolDef[], auth: AuthResult | undefined, withBy: (by: string) => McpToolDef[]): void {
+  const actsFor = auth?.acts_for ?? null;
+  for (const tool of tools) {
+    if (actsFor !== null && STAMP_TOOLS.includes(tool.name)) {
+      const schema = tool.inputSchema as { properties?: Record<string, unknown> };
+      tool.inputSchema = {
+        ...tool.inputSchema,
+        properties: { ...(schema.properties ?? {}), [ON_BEHALF_PARAM]: { type: "string", description: `Who this write is for: your id for them; stamped by "${actsFor}:<id>"` } },
+      };
+    }
+    const execute = tool.execute;
+    tool.execute = async (params) => {
+      // A batch item has no on_behalf_of of its own: the call's applies to every item. One inside an item would
+      // otherwise be ignored, so it is refused.
+      const inItem = Object.values(params ?? {}).some((v) => Array.isArray(v) && v.some((it) => it && typeof it === "object" && ON_BEHALF_PARAM in it));
+      if (inItem) {
+        throw Object.assign(new Error(`${ON_BEHALF_PARAM} goes on the call, not inside a batch item: it stamps every item. Nothing was written.`), {
+          error_type: "invalid_on_behalf_of", field: ON_BEHALF_PARAM, hint: "move on_behalf_of to the top level",
+        });
+      }
+      if (!params || !(ON_BEHALF_PARAM in params)) return execute(params);
+      const { [ON_BEHALF_PARAM]: supplied, ...rest } = params;
+      const r = resolveBy(supplied, actsFor, auth?.actor ?? null, "mcp");
+      if ("refusal" in r) throw Object.assign(new Error(r.refusal.message), { error_type: r.refusal.error_type, field: r.refusal.field, hint: r.refusal.hint });
+      if (!stampsWriter(tool.name, rest)) {
+        throw Object.assign(new Error(`${tool.name} records no writer, so ${ON_BEHALF_PARAM} would be dropped. Nothing was done. Pass it on record writes only.`), {
+          error_type: "on_behalf_not_recorded", field: ON_BEHALF_PARAM, hint: "drop on_behalf_of on this call",
+        });
+      }
+      const twin = withBy(r.by!).find((t) => t.name === tool.name);
+      if (!twin) throw new Error(`${tool.name}: not available for an on-behalf-of write`);
+      return twin.execute(rest);
+    };
+  }
 }
 
 /**
@@ -1506,9 +1558,9 @@ export function manageTokenReference(vaultName: string): { name: string; descrip
       "`long_lived: true` raises the mint TTL cap to 90 days; a 90-day token is a " +
       "standing credential and meaningfully increases blast radius if leaked/misused.\n\n" +
       "Actions (discriminator: `action`):\n" +
-      "- `mint` — { scope: string|string[], ttl_seconds?: number, long_lived?: boolean, description?: string } → { action: \"mint\", token, jti, expires_at, scopes, scoped_tags, vault_name } (vault#555: scopes/scoped_tags/vault_name were previously undocumented here)\n" +
-      "- `revoke` — { jti: string } → { action: \"revoke\", ok: boolean, already_revoked?: boolean } — idempotent; a jti not in this session's ledger, or already revoked, still returns ok:true. A genuine failure additionally carries error/message (and, for a hub-side rejection, hub_status).\n" +
-      "- `list` — (no inputs) → { action: \"list\", tokens: [...] }",
+      "- `mint` — { scope: string|string[], ttl_seconds?: number, long_lived?: boolean, name?: string, description?: string } → { action: \"mint\", token, jti, expires_at, scopes, scoped_tags, vault_name, name? } (vault#555: scopes/scoped_tags/vault_name were previously undocumented here)\n" +
+      "- `revoke` — { name: string } or { jti: string } → { action: \"revoke\", ok: boolean, already_revoked?: boolean } — idempotent; a jti not in this session's ledger, or already revoked, still returns ok:true. A genuine failure additionally carries error/message (and, for a hub-side rejection, hub_status).\n" +
+      "- `list` — (no inputs) → { action: \"list\", tokens: [{ name, jti, scopes, expires_at, revoked_at, … }] }",
     inputSchema: {
       type: "object",
       properties: {
@@ -1537,6 +1589,10 @@ export function manageTokenReference(vaultName: string): { name: string; descrip
           type: "string",
           description: "(action=mint, optional) Free-text label surfaced in the token list + audit trail.",
         },
+        name: {
+          type: "string",
+          description: "(action=mint, optional) The key's name: its writes are stamped `via key:<name>`, and revoke takes the name. Letters, digits, '.', '_', '-'; one key per name, forever.",
+        },
         jti: {
           type: "string",
           description: "(action=revoke) The jti (e.g. `t_abc123…`) returned by a prior mint. Revoke is idempotent — second revoke also returns ok=true.",
@@ -1557,7 +1613,7 @@ function buildManageTokenTool(
     requiredVerb: "admin",
     description:
       "Mint, list or revoke short-lived keys for this vault. mint: `scope` (e.g. \"vault:" + vaultName + ":read\"), " +
-      "`ttl_seconds` (default 900, max 3600, or 90 days with `long_lived: true`), `description`. revoke: `jti`. " +
+      "`ttl_seconds` (default 900, max 3600, or 90 days with `long_lived: true`), `name`, `description`. revoke: `name` or `jti`. " +
       "Minted keys can't exceed yours. Every parameter: vault-info {help: \"manage-token\"}.",
     inputSchema: {
       type: "object",
@@ -1567,6 +1623,7 @@ function buildManageTokenTool(
         ttl_seconds: { type: "number" },
         long_lived: { type: "boolean" },
         description: { type: "string" },
+        name: { type: "string" },
         jti: { type: "string" },
       },
       required: ["action"],
@@ -1727,7 +1784,13 @@ async function mintAction(
   const description = typeof params.description === "string" && params.description.length > 0
     ? params.description
     : null;
-  const label = description ?? `mcp-mint (parent=${auth.caller_jti ?? "unknown"})`;
+  // Keys by name (ROADMAP 0.9.1): `name` names the key; its writes say `via key:<name>`, and list and revoke find it
+  // by that name. The hub refuses a taken name, and a name from a session that is itself a named key.
+  const name = params.name;
+  if (name !== undefined && (typeof name !== "string" || !KEY_NAME_RE.test(name))) {
+    return { action: "mint", error: "invalid_name", message: "manage-keys mint: `name` is letters, digits, '.', '_' and '-', up to 80, starting with a letter or digit." };
+  }
+  const label = (name as string | undefined) ?? description ?? `mcp-mint (parent=${auth.caller_jti ?? "unknown"})`;
 
   // Resolve hub origin (PARACHUTE_HUB_ORIGIN → expose-state FQDN → loopback).
   const hub = resolveHubOrigin();
@@ -1749,6 +1812,7 @@ async function mintAction(
     scope: narrowedScopes.join(" "),
     expiresInSeconds: ttl,
     ...(permissions !== undefined ? { permissions } : {}),
+    ...(typeof name === "string" ? { name } : {}),
   });
 
   if ("kind" in minted) {
@@ -1795,6 +1859,7 @@ async function mintAction(
     scopes: narrowedScopes,
     scoped_tags: auth.scoped_tags,
     vault_name: vaultName,
+    ...(typeof name === "string" ? { name } : {}),
   };
 }
 
@@ -1804,15 +1869,19 @@ async function revokeAction(
   auth: AuthResult,
   callerBearer: string | null,
 ): Promise<Record<string, unknown>> {
-  if (typeof params.jti !== "string" || params.jti.length === 0) {
+  if (params.name !== undefined && params.jti !== undefined) {
+    return { action: "revoke", ok: false, error: "invalid_request", message: "manage-keys revoke: give `name` or `jti`, not both." };
+  }
+  const byName = typeof params.name === "string" && params.name.length > 0;
+  if (!byName && (typeof params.jti !== "string" || params.jti.length === 0)) {
     return {
       action: "revoke",
       ok: false,
       error: "invalid_request",
-      message: "manage-token revoke: `jti` is required (string).",
+      message: "manage-keys revoke: name the key (`name`, as minted) or give its `jti`.",
     };
   }
-  const jti = params.jti;
+  let jti = byName ? "" : (params.jti as string);
 
   // Session-pin: revoke is restricted to hub JWTs THIS MCP session minted.
   // When auth.caller_jti is null (no stable session id — env-var operator,
@@ -1828,6 +1897,17 @@ async function revokeAction(
   }
 
   const store = getVaultStore(vaultName);
+  if (byName) {
+    const matches = listMcpMintedHubJwts(store.db, auth.caller_jti, vaultName).filter((t) => t.label === params.name);
+    if (matches.length > 1) {
+      return { action: "revoke", ok: false, error: "ambiguous", message: `manage-keys revoke: ${matches.length} of this session's keys are labelled "${String(params.name)}"; give the \`jti\` (list shows each).` };
+    }
+    const named = matches[0];
+    if (!named) {
+      return { action: "revoke", ok: false, error: "not_found", message: `manage-keys revoke: this session minted no key called "${String(params.name)}" (list shows the names).` };
+    }
+    jti = named.jti;
+  }
   const entry = findMcpMintLedgerEntry(store.db, jti, auth.caller_jti, vaultName);
   if (!entry) {
     // Idempotency: not-in-this-session's-ledger returns ok=true so the AI's
@@ -1901,6 +1981,7 @@ function listAction(vaultName: string, auth: AuthResult): Record<string, unknown
   // Read from the hub-JWT mint ledger (vault#403, MGT) — mints now live in
   // hub's registry, not the pvt_* tokens table; the ledger is the local
   // session-attribution index.
-  const tokens = listMcpMintedHubJwts(store.db, auth.caller_jti, vaultName);
+  // Each key by its name (the `name` it was minted with, else its description), which revoke also takes.
+  const tokens = listMcpMintedHubJwts(store.db, auth.caller_jti, vaultName).map((t) => ({ name: t.label, ...t }));
   return { action: "list", tokens };
 }
