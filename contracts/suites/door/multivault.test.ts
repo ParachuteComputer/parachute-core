@@ -130,6 +130,9 @@ describe.skipIf(!is091 || lacks("multi-vault-door"))("one multi-vault door", () 
       expect(stranger.ok, "a vault that doesn't exist").toBe(false);
       const nothing = await connectAccount({ appName: `mv-none-${runId("z")}`, levels: { [read]: "none" } });
       expect(nothing.ok, "every vault at none").toBe(false);
+      // The app can't choose a level itself: a per-vault scope in its own ask never reaches the token.
+      const smuggled = await connectAccount({ appName: `mv-ask-${runId("s")}`, scope: `account:vaults account:self:vaults:${write}:write`, levels: { [read]: "read", [write]: "none" } });
+      expect(smuggled.ok && smuggled.scope.includes(write), "a per-vault scope the app asked for itself").toBe(false);
 
       const got = await connectAccount({ appName: `mv-${runId("app")}`, levels: { [read]: "read", [write]: "write", [third]: "none" } });
       expect(got.ok, got.ok ? "" : got.refusal).toBe(true);

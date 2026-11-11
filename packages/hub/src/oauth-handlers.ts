@@ -670,6 +670,24 @@ function findNonRequestableScopes(scopes: readonly string[]): string[] {
   return scopes.filter(isNonRequestableScope);
 }
 
+/**
+ * `account:<id>:vaults:…` past the connection scope: a vault, or a vault and a level (T-446). Only the consent screen
+ * narrows the account door to vaults and levels; an app that asks for one itself would choose the level for the
+ * person. So the public flow drops it from the request and from `extra_scope` before anything reads them (drop, not
+ * refuse: the same answer the cap always gave a non-owner's pre-narrowed ask). Any casing.
+ */
+function isNarrowedAccountVaultsScope(scope: string): boolean {
+  const parts = scope.toLowerCase().split(":");
+  return parts[0] === "account" && parts[2] === "vaults" && parts.length > 3;
+}
+
+function withoutNarrowedAccountVaults(scope: string): string {
+  return scope
+    .split(" ")
+    .filter((s) => s.length > 0 && !isNarrowedAccountVaultsScope(s))
+    .join(" ");
+}
+
 /** Every `vault:<name>:<verb>` name actually present in `scopes` (verb ∈ VAULT_VERBS). */
 function namedVaultScopeNames(scopes: readonly string[]): Set<string> {
   const out = new Set<string>();
@@ -1291,6 +1309,11 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
   // No resource, or one that isn't an MCP resource we front (off-origin,
   // malformed, non-vault path) → neither branch fires and the flow is
   // byte-for-byte the pre-#461 behavior (manual picker, etc.).
+  // T-446: an app never names a vault or a level on the account door itself; the person chooses them at consent.
+  if (parsed.scope.split(" ").some(isNarrowedAccountVaultsScope)) {
+    parsed.scope = withoutNarrowedAccountVaults(parsed.scope);
+    url.searchParams.set("scope", parsed.scope);
+  }
   let rootNarrowedToEmpty = false;
   const boundOrigins = resolveBoundOrigins(deps);
   const boundVault = resolveResourceVault(parsed.resource, boundOrigins);
@@ -1743,7 +1766,7 @@ function isAccountVaultsConnectionScope(scope: string): boolean {
 /**
  * Consent per vault (0.9.1 "one multi-vault door", T-446): the account-door grant the consent screen mints when the
  * person chooses a level for each vault, `account:self:vaults:<vault>:<read|write>`. The account door holds each hop
- * to that level (key-level.ts `keyLevelOnVault`). Never requestable by a client (findNonRequestableScopes); minted
+ * to that level (key-level.ts `keyLevelOnVault`). Dropped from any client ask (isNarrowedAccountVaultsScope); minted
  * only from the consent form, and capped again at the choke-point (`capScopesToUserAuthority`).
  */
 const PER_VAULT_LEVELS = ["read", "write"] as const;
@@ -1870,7 +1893,15 @@ function capScopesToUserAuthority(
   opts: { userIsAdmin: boolean },
 ): string[] {
   if (opts.userIsAdmin) return [...scopes];
-  return scopes.filter((s) => {
+  // A per-vault account-door grant above the person's current role there narrows to read when they still read it
+  // (T-446), rather than losing the vault. Each mint caps again, so the token never holds more than the role now.
+  const narrowed = scopes.map((s) => {
+    const pv = parsePerVaultScope(s);
+    if (!pv || pv.level !== "write") return s;
+    const verbs = vaultVerbsForUserVault(db, userId, pv.vault) ?? [];
+    return !verbs.includes("write") && verbs.includes("read") ? `account:self:vaults:${pv.vault}:read` : s;
+  });
+  return narrowed.filter((s) => {
     // Account scopes are ACCOUNT-WIDE, and on self-host the account IS the box
     // (`account-api.ts`: "operator ≡ account ≡ box… the operator owns every
     // vault, so the ownership gate the cloud twin runs per-vault is trivially
@@ -2250,6 +2281,7 @@ async function handleConsentSubmit(
   csrfToken: string,
 ): Promise<Response> {
   const params = paramsFromForm(form);
+  params.scope = withoutNarrowedAccountVaults(params.scope); // T-446: see isNarrowedAccountVaultsScope
   // RFC 8707 resource binding — defense-in-depth (mirror of the GET handler).
   // The consent form's hidden inputs already carry the narrowed named scopes
   // (the GET handler rewrote `parsed.scope` before rendering), but a hand-
@@ -2347,7 +2379,7 @@ async function handleConsentSubmit(
   const extraScopes = form
     .getAll("extra_scope")
     .map((v) => String(v))
-    .filter((v) => v.length > 0);
+    .filter((v) => v.length > 0 && !isNarrowedAccountVaultsScope(v));
 
   // Per-scope consent (granular approval). The consent screen renders one
   // checkbox per REQUESTED scope, so a user can approve the notes access an

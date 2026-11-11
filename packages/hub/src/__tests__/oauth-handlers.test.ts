@@ -12107,8 +12107,8 @@ describe("account-door consent per vault (T-446)", () => {
   });
   const get = (db: Awaited<ReturnType<typeof makeDb>>["db"], sessionId: string, clientId: string, challenge: string) =>
     handleAuthorizeGet(db, new Request(authorizeUrl(base(clientId, challenge)), { headers: { cookie: cookie(sessionId) } }), deps);
-  const post = (db: Awaited<ReturnType<typeof makeDb>>["db"], sessionId: string, clientId: string, challenge: string, fields: [string, string][]) => {
-    const form = new URLSearchParams({ __action: "consent", __csrf: TEST_CSRF, approve: "yes", ...base(clientId, challenge) });
+  const post = (db: Awaited<ReturnType<typeof makeDb>>["db"], sessionId: string, clientId: string, challenge: string, fields: [string, string][], scope?: string) => {
+    const form = new URLSearchParams({ __action: "consent", __csrf: TEST_CSRF, approve: "yes", ...base(clientId, challenge), ...(scope ? { scope } : {}) });
     for (const [k, v] of fields) form.append(k, v);
     return handleAuthorizePost(
       db,
@@ -12200,6 +12200,54 @@ describe("account-door consent per vault (T-446)", () => {
       const skipped = get(db, session.id, reg.client.clientId, again.challenge);
       expect(skipped.status).toBe(302);
       expect((await redeem(db, skipped.headers.get("location")!, reg.client.clientId, again.verifier)).split(" ").sort().join(" ")).toBe(want);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("SECURITY: the app can't choose a level itself: a per-vault scope in its ask, extra_scope or granted_scope is dropped", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const session = await friendOnWorkReadOtherWrite(db);
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"], status: "approved" });
+      const asked = handleAuthorizeGet(
+        db,
+        new Request(authorizeUrl({ ...base(reg.client.clientId, makePkce().challenge), scope: "account:vaults account:self:vaults:other:write" }), { headers: { cookie: cookie(session.id) } }),
+        deps,
+      );
+      // Asked for: dropped from the page (no raw row for it), so the person's choice is the only level.
+      expect(asked.status).toBe(200);
+      expect(await asked.text()).not.toContain("account:self:vaults:other:write");
+      for (const field of ["extra_scope", "granted_scope", "scope"]) {
+        const pk = makePkce();
+        const res = await post(db, session.id, reg.client.clientId, pk.challenge, [
+          ["account_vault_levels", "1"],
+          ["vault_level:work", "read"],
+          ...(field === "scope" ? [] : ([[field, "account:self:vaults:other:write"]] as [string, string][])),
+          ...(field === "granted_scope" ? ([["granted_scope", "account:vaults"]] as [string, string][]) : []),
+        ], field === "scope" ? "account:vaults account:self:vaults:other:write" : undefined);
+        // Each is dropped: the token is the person's choice and nothing else.
+        expect(res.status, field).toBe(302);
+        expect(await redeem(db, res.headers.get("location")!, reg.client.clientId, pk.verifier), field).toBe("account:self:vaults:work:read");
+      }
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("a role lowered from write to read narrows the replayed grant to read, not dropping the vault", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const session = await friendOnWorkReadOtherWrite(db);
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"], status: "approved" });
+      const first = makePkce();
+      const res = await post(db, session.id, reg.client.clientId, first.challenge, [["account_vault_levels", "1"], ["vault_level:other", "write"]]);
+      expect(await redeem(db, res.headers.get("location")!, reg.client.clientId, first.verifier)).toBe("account:self:vaults:other:write");
+      db.prepare("UPDATE user_vaults SET role = 'read' WHERE vault_name = 'other'").run();
+      const again = makePkce();
+      const skipped = get(db, session.id, reg.client.clientId, again.challenge);
+      expect(skipped.status).toBe(302);
+      expect(await redeem(db, skipped.headers.get("location")!, reg.client.clientId, again.verifier)).toBe("account:self:vaults:other:read");
     } finally {
       cleanup();
     }

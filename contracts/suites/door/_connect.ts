@@ -130,7 +130,7 @@ export async function connect(opts: { scope?: (vault: string) => string; appName
  * none, read or write. The form posts `account_vault_levels=1` and one `vault_level:<vault>` = `none|read|write`
  * per vault; a vault not posted is none. Returns the token reply, or the refusal when the door refuses the choice.
  */
-export async function connectAccount(opts: { appName: string; levels: Record<string, string> }): Promise<
+export async function connectAccount(opts: { appName: string; levels: Record<string, string>; scope?: string }): Promise<
   { ok: true; access: string; scope: string } | { ok: false; refusal: string }
 > {
   const d = door();
@@ -161,7 +161,7 @@ export async function connectAccount(opts: { appName: string; levels: Record<str
     response_type: "code",
     code_challenge: createHash("sha256").update(verifier).digest("base64url"),
     code_challenge_method: "S256",
-    scope: "account:vaults",
+    scope: opts.scope ?? "account:vaults",
     state,
     resource,
   };
