@@ -119,7 +119,7 @@ Three credential types are accepted, in checking order:
 |---|---|---|---|
 | Hub-issued JWT | three dot-separated base64url segments | minted by `parachute-hub` after an OAuth flow, or via `parachute auth mint-token` / `parachute-vault mcp-install --mint` | resource-narrowed (`vault:<name>:<verb>`); broad `vault:<verb>` claims are rejected. Also carries a `vault_scope` claim — see below. |
 | Server-wide operator token | `VAULT_AUTH_TOKEN` env var | set by the operator at boot | implicit `vault:admin` against every vault |
-| Legacy `pvk_*` YAML key | bcrypt-hashed in `config.yaml` / `vault.yaml` `api_keys` | pre-0.3 deployments | mapped onto the modern scope set on the fly; emits a deprecation log line |
+| Legacy `pvk_*` YAML key | bcrypt-hashed in `config.yaml` / `vault.yaml` `api_keys` | pre-0.3 deployments, and first boots that named their vault before 0.9.1 (nothing mints one from 0.9.1) | mapped onto the modern scope set on the fly; emits a deprecation log line |
 
 The legacy `permission: "full" \| "read"` column and unscoped vault.yaml /
 config.yaml `pvk_*` api_keys still resolve for back-compat — they're mapped

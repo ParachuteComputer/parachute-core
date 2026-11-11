@@ -19,6 +19,7 @@ import type { Note } from "../core/src/types.ts";
 import {
   buildVaultProjection,
   projectionToMarkdown,
+  connectionReach,
   type VaultProjection,
 } from "../core/src/vault-projection.ts";
 import { readVaultConfig, writeVaultConfig } from "./config.ts";
@@ -149,6 +150,15 @@ export async function getServerInstruction(
     attachments: { ticketsEnabled: true, readEnabled: true, ticketTool: "attachment-url" },
     // T-407: this door lists the record tools first, so its brief speaks their words.
     words: recordWords,
+    // 0.9.1 (SPEC §3.4): say what this key can read. No auth (local stdio) is the owner's own process: no line.
+    ...(auth
+      ? {
+          reach: connectionReach(
+            hasScopeForVault(auth.scopes, vaultName, "admin") ? "admin" : hasScopeForVault(auth.scopes, vaultName, "write") ? "write" : "read",
+            auth.scoped_tags,
+          ),
+        }
+      : {}),
   });
 }
 

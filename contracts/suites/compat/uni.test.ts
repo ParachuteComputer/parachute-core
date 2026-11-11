@@ -89,7 +89,10 @@ function door(shape: "loopback" | "tailnet", encoding: "base64" | "base64url") {
       const r = await rpc("tools/call", { name, arguments: args });
       if (r.status !== 200) throw new Error(`${name}: HTTP ${r.status} ${r.text.slice(0, 300)}`);
       if (r.body?.error) throw new Error(`${name}: ${JSON.stringify(r.body.error).slice(0, 300)}`);
-      const text = (r.body.result.content ?? []).map((c: any) => c.text ?? "").join("");
+      // The Uni app reads the first text block as the JSON (parachute.rs: `find_map` over `content`), so a second
+      // block (the refresh nudge on the note-named tools, T-446) is words for a model, not part of the result.
+      const content = r.body.result.content ?? [];
+      const text = r.body.result.isError ? content.map((c: any) => c.text ?? "").join("") : (content.find((c: any) => c.type === "text")?.text ?? "");
       if (r.body.result.isError) throw new Error(`${name}: ${text.slice(0, 300)}`);
       try {
         return JSON.parse(text);

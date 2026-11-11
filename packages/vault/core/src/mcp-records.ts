@@ -82,6 +82,8 @@ export interface RecordToolDef {
   inputSchema: Record<string, unknown>;
   execute: (params: Record<string, unknown>) => unknown | Promise<unknown>;
   requiredVerb: "read" | "write" | "admin";
+  /** The MCP content blocks for a result, when not the one JSON text block (the note aliases' refresh nudge). */
+  resultContent?: (result: unknown) => ({ type: "text"; text: string } | { type: string; [k: string]: unknown })[];
 }
 
 /** What a use is counted as: `tool` for a tool name, `tool param` for a parameter on it. */
@@ -293,6 +295,15 @@ export function noteAliasDescription(noteTool: string): string {
 }
 
 /**
+ * The refresh nudge (0.9.1): the second content block on a successful call to a note-named tool. A client that
+ * cached 0.8's tool list (ChatGPT keeps one per connector) never sees the record tools, so it is told what to do
+ * either way. The first block, the JSON, stays exactly what it was.
+ */
+export function refreshNudge(noteTool: string): string {
+  return `\`${noteTool}\` is deprecated and goes away in 1.0. If \`create-record\` isn't among your tools, ask your user to refresh this connector so you get the new tools. Otherwise use \`${RECORD_TOOL_NAMES[noteTool]}\` from now on.`;
+}
+
+/**
  * A deprecated note tool's schema: its old top-level parameter names and their types, without descriptions or
  * nested shapes, so a 0.8 client still sees what it can pass while each alias stays inside the 400-token budget
  * (contracts/suites/mcp/budget.test.ts). The full shapes are in the record tool and in vault-info {help}.
@@ -356,6 +367,10 @@ export function addRecordTools<T extends RecordToolDef>(tools: T[], onUse?: OnUs
         onUse?.(t.name, "old");
         return execute(params);
       },
+      resultContent: (result: unknown) => [
+        { type: "text" as const, text: JSON.stringify(result, null, 2) },
+        { type: "text" as const, text: refreshNudge(t.name) },
+      ],
     });
   }
   return [...out, ...aliases];

@@ -17,7 +17,9 @@ export async function connect(url: string, token: string) {
     /** Parsed JSON result, or throws with the tool's error text. */
     async call<T = any>(name: string, args: Record<string, unknown>): Promise<T> {
       const r: any = await client.callTool({ name, arguments: args });
-      const text = (r.content ?? []).map((c: any) => c.text ?? "").join("");
+      // A tool's JSON is its first text block; a later block is words for the model (the refresh nudge on the five
+      // note-named tools, T-446), so it is never part of the JSON. An error's text is every block.
+      const text = r.isError ? (r.content ?? []).map((c: any) => c.text ?? "").join("") : ((r.content ?? []).find((c: any) => c.type === "text")?.text ?? "");
       if (r.isError) throw new Error(`${name}: ${text}`);
       try {
         return JSON.parse(text) as T;
