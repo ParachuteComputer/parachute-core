@@ -49,6 +49,11 @@
  *     one edit apart (case aside). Advice only (`info`): `meeting` and
  *     `meetings` may both be meant.
  *
+ *   - `indexed_field_limit`     — (0.9.2, unscoped only) the vault holds
+ *     INDEXED_FIELD_LIMIT (88) indexed fields or more: `info` at the limit,
+ *     `warning` over it. The report also carries `indexed_fields:
+ *     {count, limit}` on unscoped runs.
+ *
  *   The three 0.9.2 scans read every record's metadata once each (json_each);
  *   timed at 94k records, about 0.6 s and 0.5 s on a box.
  *
@@ -226,6 +231,8 @@ function makeNoteInScope(
 export function runDoctorScan(db: Database, opts?: DoctorScanOpts): DoctorReport {
   const allowedTags = opts?.allowedTags ?? null;
   if (opts?.deep && allowedTags !== null) throw new Error("deep history audit requires an unrestricted session");
+  // Vault-wide, so unscoped runs only; read once for the finding and the report.
+  const indexedCount = allowedTags === null ? countIndexedFields(db) : null;
   const findings: DoctorFinding[] = [
     ...scanDanglingParentNames(db, allowedTags),
     ...scanParentNamesCycles(db, allowedTags),
@@ -238,7 +245,7 @@ export function runDoctorScan(db: Database, opts?: DoctorScanOpts): DoctorReport
     ...(allowedTags === null ? scanCompactStateDrift(db) : []),
     ...(allowedTags === null ? scanTagsUsedLikeTypes(db) : []),
     ...scanFieldShapes(db, allowedTags, opts?.noteTagsInScope),
-    ...(allowedTags === null ? scanIndexedFieldLimit(db) : []),
+    ...(indexedCount !== null ? scanIndexedFieldLimit(db, indexedCount) : []),
   ];
 
   const audit = opts?.deep ? auditHistoryBlobs(db, opts.history_after, opts.history_max_blobs, opts.history_budget_ms) : undefined;
@@ -256,7 +263,7 @@ export function runDoctorScan(db: Database, opts?: DoctorScanOpts): DoctorReport
       : `${findings.length} finding(s): ${errors} error(s), ${warnings} warning(s), ${infos} info(s)`;
 
   return { findings, summary, scanned_at: new Date().toISOString(),
-    ...(allowedTags === null ? { indexed_fields: { count: countIndexedFields(db), limit: INDEXED_FIELD_LIMIT } } : {}),
+    ...(indexedCount !== null ? { indexed_fields: { count: indexedCount, limit: INDEXED_FIELD_LIMIT } } : {}),
     ...(audit ? { history_audit: audit } : {}) };
 }
 
@@ -266,8 +273,7 @@ export function runDoctorScan(db: Database, opts?: DoctorScanOpts): DoctorReport
 // the vault can't move to cloud until it's back under.
 // ---------------------------------------------------------------------------
 
-function scanIndexedFieldLimit(db: Database): DoctorFinding[] {
-  const count = countIndexedFields(db);
+function scanIndexedFieldLimit(db: Database, count: number): DoctorFinding[] {
   if (count < INDEXED_FIELD_LIMIT) return [];
   const unused = findUnusedIndexedFields(db).map((u) => u.field);
   const over = count > INDEXED_FIELD_LIMIT;
@@ -279,7 +285,7 @@ function scanIndexedFieldLimit(db: Database): DoctorFinding[] {
       ? `${count} indexed fields, over the limit of ${INDEXED_FIELD_LIMIT}: every one still works here, but a new indexed field is refused and the vault can't move to cloud (100 columns per table) until it's at ${INDEXED_FIELD_LIMIT} or fewer.`
       : `${count} indexed fields, at the limit of ${INDEXED_FIELD_LIMIT}: the next new indexed field is refused.`,
     remedy: unused.length > 0
-      ? `unused indexed fields: ${unused.slice(0, 20).join(", ")}${unused.length > 20 ? `, and ${unused.length - 20} more` : ""}. Run prune-schema for fields no type declares, or drop \`indexed\` from fields you don't filter or sort by (update-tag).`
+      ? `unused indexed fields: ${unused.slice(0, 20).join(", ")}${unused.length > 20 ? `, and ${unused.length - 20} more` : ""}. Run prune-schema for fields no type declares; for the others drop \`indexed\` (update-tag, on every type that declares the field).`
       : "drop `indexed` from fields you don't filter or sort by (update-tag); an unindexed field can still be filtered, by a scan.",
   }];
 }

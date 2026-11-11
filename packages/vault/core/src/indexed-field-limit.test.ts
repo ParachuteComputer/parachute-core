@@ -75,6 +75,21 @@ describe("indexed-field ceiling", () => {
     expect(countIndexedFields(db)).toBe(88);
   });
 
+  it("a write adding several new fields is counted once, before any column, with the vault's own numbers", async () => {
+    await store.upsertTagRecord("big", { fields: indexed("f", INDEXED_FIELD_LIMIT - 1) });
+    for (let i = 0; i < INDEXED_FIELD_LIMIT - 1; i++) await store.createNote(`n${i}`, { tags: ["big"], metadata: { [`f${i}`]: "v" } });
+    const err = await refusal(store.upsertTagRecord("more", { fields: indexed("g", 3) }));
+    expect(err.fields).toEqual(["g0", "g1", "g2"]);
+    expect(err.got).toBe(87);
+    expect(err.unused).toEqual([]); // not the write's own half-declared fields
+    expect(err.message).toContain("this write would add 3");
+    expect(err.message).toContain("room for 1 more");
+    expect(countIndexedFields(db)).toBe(87);
+    // One of them fits.
+    await store.upsertTagRecord("more", { fields: indexed("g", 1) });
+    expect(countIndexedFields(db)).toBe(88);
+  });
+
   it("a field no live type declares is listed as prune-schema's", async () => {
     await store.upsertTagRecord("big", { fields: indexed("f", INDEXED_FIELD_LIMIT - 1) });
     // An orphan: declarer tag gone without releasing (the gitcoin defect).
@@ -162,6 +177,32 @@ describe("indexed-field ceiling", () => {
       expect(countIndexedFields(target.db)).toBe(88);
       expect((await target.getTagRecord("late"))!.fields!.extra).toMatchObject({ type: "string", indexed: false });
       expect((await target.getNote("n1"))!.metadata).toMatchObject({ extra: "value" });
+    });
+
+    it("keeps what fits in one schema file and unindexes only the rest", async () => {
+      await store.upsertTagRecord("big", { fields: indexed("f", INDEXED_FIELD_LIMIT - 2) });
+      for (let i = 0; i < 5; i++) forceIndexed(db, `late${i}`, "late");
+      rawUpsertTagRecord(db, "late", { fields: indexed("late", 5) });
+      await exportVaultToDir(store, { outDir: dir });
+
+      const target = new SqliteStore(new Database(":memory:"));
+      const stats = await importPortableVault(target, { inDir: dir });
+      expect(countIndexedFields(target.db)).toBe(88);
+      expect(stats.unindexed_schema_fields).toHaveLength(3);
+      const late = (await target.getTagRecord("late"))!.fields!;
+      expect(Object.values(late).filter((f: any) => f.indexed === true)).toHaveLength(2);
+    });
+
+    it("blow-away drops orphaned indexed fields first, so they don't cost the export its indexes", async () => {
+      await store.upsertTagRecord("big", { fields: indexed("f", INDEXED_FIELD_LIMIT) });
+      await exportVaultToDir(store, { outDir: dir });
+
+      const target = new SqliteStore(new Database(":memory:"));
+      for (let i = 0; i < 5; i++) forceIndexed(target.db, `orphan${i}`, "gone-tag");
+      const stats = await importPortableVault(target, { inDir: dir, blowAway: true });
+      expect(stats.unindexed_schema_fields).toEqual([]);
+      expect(countIndexedFields(target.db)).toBe(88);
+      expect(getIndexedField(target.db, "orphan0")).toBeNull();
     });
   });
 });

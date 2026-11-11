@@ -101,34 +101,57 @@ export interface UnusedIndexedField {
   declarer_tags: string[];
 }
 
-/** Refusal for the indexed field past {@link INDEXED_FIELD_LIMIT}. */
+/**
+ * Refusal for a write that would take the vault past
+ * {@link INDEXED_FIELD_LIMIT}. `fields` are the new indexed fields the write
+ * asked for (`field` is the first); `got` is how many the vault holds now.
+ */
 export class IndexedFieldLimitError extends IndexedFieldError {
   override name = "IndexedFieldLimitError";
   override error_type = "indexed_field_limit" as const;
   readonly limit = INDEXED_FIELD_LIMIT;
   constructor(
-    field: string,
-    /** Indexed fields the vault holds now. */
+    readonly fields: string[],
     readonly got: number,
     readonly unused: UnusedIndexedField[],
+    /** Set by the tag-scope scrub when it held back unused fields the caller can't see. */
+    readonly hiddenUnused = false,
   ) {
-    super(indexedFieldLimitMessage(field, got, unused));
-    this.field = field;
+    super(indexedFieldLimitMessage(fields, got, unused, hiddenUnused));
+    this.field = fields[0];
   }
 }
 
-/** The refusal's words; rebuilt by the tag-scope scrub with a filtered `unused`. */
-export function indexedFieldLimitMessage(field: string, got: number, unused: UnusedIndexedField[]): string {
-  const head = `cannot index "${field}": this vault already has ${got} indexed fields and the limit is ${INDEXED_FIELD_LIMIT} on every Parachute.`;
+function indexedFieldLimitMessage(fields: string[], got: number, unused: UnusedIndexedField[], hiddenUnused: boolean): string {
+  const room = Math.max(0, INDEXED_FIELD_LIMIT - got);
+  const head =
+    fields.length === 1
+      ? `cannot index "${fields[0]}": this vault has ${got} indexed fields and the limit is ${INDEXED_FIELD_LIMIT} on every Parachute.`
+      : `cannot index ${fields.map((f) => `"${f}"`).join(", ")}: this vault has ${got} indexed fields, this write would add ${fields.length}, and the limit is ${INDEXED_FIELD_LIMIT} on every Parachute${room > 0 ? ` (room for ${room} more)` : ""}.`;
+  const hidden = hiddenUnused ? " Some unused indexed fields are outside this token's scope; an admin can prune them." : "";
   if (unused.length === 0) {
-    return `${head} No indexed field looks unused; drop \`indexed\` from a field you don't filter or sort by (update-tag), or leave "${field}" unindexed: it can still be filtered, by a scan.`;
+    return `${head}${hidden}${hiddenUnused ? "" : " No indexed field looks unused."} Drop \`indexed\` from a field you don't filter or sort by (update-tag, on every type that declares it), or leave the new field unindexed: it can still be filtered, by a scan.`;
   }
   const list = unused
     .slice(0, 20)
     .map((u) => `${u.field} (${u.reason === "no_live_declarer" ? "no type declares it; prune-schema drops it" : "no record holds a value"})`)
     .join(", ");
   const more = unused.length > 20 ? `, and ${unused.length - 20} more` : "";
-  return `${head} Unused indexed fields you can prune first: ${list}${more}. Run prune-schema for fields no type declares, or drop \`indexed\` from the others (update-tag).`;
+  return `${head} Unused indexed fields you can prune first: ${list}${more}.${hidden} Run prune-schema for fields no type declares; for the others drop \`indexed\` (update-tag, on every type that declares the field).`;
+}
+
+/**
+ * Refuse, before any column is added, a write whose new indexed fields would
+ * take the vault past the limit. `fields` may include fields already indexed;
+ * only the others count. Call after the write's releases.
+ */
+export function assertIndexedFieldRoom(db: Database, fields: Iterable<string>): void {
+  const fresh = [...fields].filter((f) => !getIndexedField(db, f));
+  if (fresh.length === 0) return;
+  const got = countIndexedFields(db);
+  if (got + fresh.length > INDEXED_FIELD_LIMIT) {
+    throw new IndexedFieldLimitError(fresh, got, findUnusedIndexedFields(db));
+  }
 }
 
 // Restrict field names to safe SQL identifiers. This also bounds the
@@ -280,10 +303,7 @@ export function declareField(
   validateFieldName(field);
   const existing = getIndexedField(db, field);
   if (!existing) {
-    const got = countIndexedFields(db);
-    if (got >= INDEXED_FIELD_LIMIT) {
-      throw new IndexedFieldLimitError(field, got, findUnusedIndexedFields(db));
-    }
+    assertIndexedFieldRoom(db, [field]);
     db.prepare(
       "INSERT INTO indexed_fields (field, sqlite_type, declarer_tags) VALUES (?, ?, ?)",
     ).run(field, sqliteType, JSON.stringify([tag]));

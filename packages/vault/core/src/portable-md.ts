@@ -82,7 +82,7 @@ import { basename, join, relative, extname, dirname, posix, resolve as resolvePa
 import type { Store, Note, Link, Attachment } from "./types.js";
 import type { TagRecord } from "./tag-schemas.js";
 import { ParentCycleError } from "./tag-schemas.js";
-import { IndexedFieldLimitError } from "./indexed-fields.js";
+import { IndexedFieldLimitError, pruneOrphanedIndexedFields } from "./indexed-fields.js";
 import { transactionAsync } from "./txn.js";
 import { timestampToMs } from "./cursor.js";
 import { computeDisplayTitle } from "./display-title.js";
@@ -2447,6 +2447,10 @@ async function importVaultReplay(
     for (const tag of tagRecords) {
       await store.deleteTag(tag.tag, { cascade: true });
     }
+    // Indexed fields whose declarer was already gone (the gitcoin defect)
+    // survive deleteTag; on a clean slate they'd count against the
+    // indexed-field limit and cost the export's own fields their index.
+    pruneOrphanedIndexedFields(store.db, { dryRun: false });
   }
 
   // 2. Tag schemas — restore before notes so any tag a note carries can
@@ -2501,12 +2505,23 @@ async function importVaultReplay(
         // still imports whole. The field and its values land; only its index
         // is left off (it stays filterable, by a scan). Same reason as above:
         // a throw here could leave a wiped vault empty.
-        const field = err instanceof IndexedFieldLimitError ? err.field : undefined;
-        const spec = field !== undefined ? (attempt.fields as Record<string, any> | null)?.[field] : undefined;
-        if (field !== undefined && spec?.indexed === true) {
-          stats.unindexed_schema_fields.push({ tag: tagName, field, reason: (err as Error).message });
-          attempt = { ...attempt, fields: { ...(attempt.fields as Record<string, any>), [field]: { ...spec, indexed: false } } };
-          continue;
+        // The refusal names every new field the write asked for and how many
+        // the vault holds, so one retry keeps what fits and turns off the rest.
+        if (err instanceof IndexedFieldLimitError && attempt.fields) {
+          const room = Math.max(0, err.limit - err.got);
+          const over = err.fields.slice(room);
+          const fields = { ...(attempt.fields as Record<string, any>) };
+          let changed = false;
+          for (const field of over) {
+            if (fields[field]?.indexed !== true) continue;
+            fields[field] = { ...fields[field], indexed: false };
+            stats.unindexed_schema_fields.push({ tag: tagName, field, reason: `the vault reached the limit of ${err.limit} indexed fields` });
+            changed = true;
+          }
+          if (changed) {
+            attempt = { ...attempt, fields };
+            continue;
+          }
         }
         throw err;
       }

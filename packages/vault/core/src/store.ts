@@ -1712,6 +1712,9 @@ export class BunSqliteStore implements Store {
               indexedFieldOps.releaseField(this.db, fieldName, tag);
             }
           }
+          // Count the write's new indexed fields together, before any column
+          // is added, so the refusal's numbers are the vault's own.
+          indexedFieldOps.assertIndexedFieldRoom(this.db, nextIndexed);
           for (const fieldName of nextIndexed) {
             const spec = nextFields![fieldName]!;
             // Type already validated above; non-null assertion is safe here.

@@ -3034,6 +3034,12 @@ async function cmdImport(args: string[]) {
     if (stats.skipped_attachments.length > 0) {
       console.log(`Skipped ${stats.skipped_attachments.length} attachment(s) — see warnings above.`);
     }
+    if (stats.unindexed_schema_fields.length > 0) {
+      console.log(
+        `Restored ${stats.unindexed_schema_fields.length} field(s) without their index (the vault reached the limit of 88 indexed fields; they still filter, by a scan): ` +
+        stats.unindexed_schema_fields.map((u) => `${u.tag}.${u.field}`).join(", "),
+      );
+    }
     if (stats.skipped_duplicate_ids.length > 0) {
       console.log(
         `Skipped ${stats.skipped_duplicate_ids.length} file(s) with duplicate/blank note id(s) — ` +

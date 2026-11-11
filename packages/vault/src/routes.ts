@@ -4300,7 +4300,7 @@ export async function handleTags(
           // 0.9.2 ceiling: the vault's state refuses it, not the request's
           // shape, so 409; `unused` is what to prune first.
           return json(
-            { error: scrubbed.message, error_type: scrubbed.error_type, field: scrubbed.field, limit: scrubbed.limit, got: scrubbed.got, unused: scrubbed.unused },
+            { error: scrubbed.message, error_type: scrubbed.error_type, field: scrubbed.field, fields: scrubbed.fields, limit: scrubbed.limit, got: scrubbed.got, unused: scrubbed.unused },
             409,
           );
         }

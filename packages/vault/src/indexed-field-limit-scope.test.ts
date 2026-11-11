@@ -75,6 +75,7 @@ describe("indexed-field ceiling on the doors", () => {
     const body: any = await res.json();
     expect(body.error_type).toBe("indexed_field_limit");
     expect(body.field).toBe("newcol");
+    expect(body.fields).toEqual(["newcol"]);
     expect(body.limit).toBe(88);
     expect(body.got).toBe(88);
     expect(body.unused.length).toBe(88);
@@ -95,6 +96,7 @@ describe("indexed-field ceiling on the doors", () => {
     expect(body.unused.map((u: any) => u.field)).toEqual(["mycol"]);
     expect(JSON.stringify(body)).not.toContain("secretfield");
     expect(JSON.stringify(body)).not.toContain("project-hidden");
+    expect(body.error).toContain("outside this token's scope");
   });
 
   test("MCP update-tag, scoped: same refusal, same scrub", async () => {

@@ -803,7 +803,7 @@ export function scrubIndexedFieldConflictError(
   if (err instanceof IndexedFieldLimitError) {
     const unused = err.unused.filter((u) => u.declarer_tags.length > 0 && u.declarer_tags.every((t) => allowed.has(t)));
     if (unused.length === err.unused.length) return err;
-    return new IndexedFieldLimitError(err.field ?? "?", err.got, unused);
+    return new IndexedFieldLimitError(err.fields, err.got, unused, true);
   }
   if (!Array.isArray(err.declarer_tags) || err.declarer_tags.length === 0) return err;
   if (err.declarer_tags.every((t) => allowed.has(t))) return err;
