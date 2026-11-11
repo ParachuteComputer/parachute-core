@@ -94,6 +94,7 @@ import {
 } from "../services-manifest.ts";
 import { migrateNotice } from "./migrate.ts";
 import { listKeys } from "../keys.ts";
+import { scopedAdminProblem } from "../permissions-claim.ts";
 
 // ---------------------------------------------------------------------------
 // Check model
@@ -1572,8 +1573,9 @@ export function checkScopedAdminKeys(configDir: string): CheckResult {
   let db: Database | undefined;
   try {
     db = new Database(path, { readonly: true });
+    // The mint's own test (scopedAdminProblem): `vault:<name>:admin` and the broad `vault:admin` alike.
     const found = listKeys(db).filter(
-      (k) => k.status === "active" && (k.allow_tags?.length ?? 0) > 0 && Object.values(k.levels).includes("admin"),
+      (k) => k.status === "active" && scopedAdminProblem(k.scopes, { scoped_tags: k.allow_tags ?? [] }) !== null,
     );
     if (found.length === 0) return { ...base, status: "pass", detail: "no live key holds vault admin with a tag limit" };
     const names = found.map((k) => k.name);
