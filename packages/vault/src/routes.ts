@@ -79,6 +79,7 @@ import {
   type EmbeddingCapability,
 } from "./embedding/capability.ts";
 import { getSharedEmbeddingProvider, getVaultNameForStore } from "./vault-store.ts";
+import { forceFlag, parentsChange, tagChangeRefusal, type TagChange } from "./tag-change-guard.ts";
 import { loadSchemaConfig } from "../core/src/schema-defaults.ts";
 import {
   buildExpandVisibility,
@@ -1077,6 +1078,31 @@ function parseSearchModeParam(url: URL): { mode?: SearchMode; error?: Response }
  * of this target's candidates can the reader see" is one question, and the
  * ambiguous (>=2 visible) and broken (0 visible) answers are two faces of it.
  */
+/**
+ * Scope gap 1: the store-write option that keeps a tag-scoped writer's links
+ * inside its scope. A structured link, `[[wikilink]]` or reference-field value
+ * naming a note the writer can't see resolves as one to nothing: queued, with
+ * the same `unresolved_link` warning, never a link into the hidden note.
+ * Unscoped: no option, unchanged. The same predicate goes to
+ * `resolveOrQueueLink`/`getContentWikilinkWarnings` on every write path.
+ */
+function linkOptFor(db: Database, tagScope: TagScopeCtx): { linkVisible?: (noteId: string) => boolean } {
+  const linkVisible = ambiguityVisibilityFor(db, tagScope);
+  return linkVisible ? { linkVisible } : {};
+}
+
+/**
+ * Scope gap 6: the 409 for a tag change that alters who sees what, unless the
+ * request says `?force=true` (src/tag-change-guard.ts). Null: go ahead.
+ */
+function tagChangeGuard(store: Store, url: URL, change: TagChange, tagScope: TagScopeCtx): Response | null {
+  if (forceFlag(url.searchParams.get("force"))) return null;
+  const vaultName = getVaultNameForStore(store);
+  if (!vaultName) return null; // a store outside the daemon (tests) has no keys or vault.yaml
+  const refusal = tagChangeRefusal(vaultName, store, change, { scoped: tagScope.raw !== null });
+  return refusal ? json(refusal, 409) : null;
+}
+
 function ambiguityVisibilityFor(
   db: Database,
   tagScope: TagScopeCtx,
@@ -2160,7 +2186,11 @@ async function handleNotesInner(
       let nextCursor: string | null = null;
       try {
         if (cursorMode) {
-          const page = await store.queryNotesPaged(queryOpts);
+          // Scope gap 2: a scoped page and its cursor follow only notes the caller may see.
+          const page = await store.queryNotesPaged(
+            queryOpts,
+            tagScope.raw === null ? undefined : (n) => noteWithinTagScope(n, tagScope.allowed, tagScope.raw),
+          );
           results = page.notes;
           nextCursor = page.next_cursor;
         } else {
@@ -2561,6 +2591,7 @@ async function handleNotesInner(
         if (Object.keys(updates).length > 0 || incomingTags.length > 0 || hasLinkMutation) {
           result = await store.updateNote(existingNote.id, {
             ...updates,
+            ...linkOptFor(db, tagScope),
             actor: writeCtx.actor,
             via: writeCtx.via,
           });
@@ -2641,6 +2672,7 @@ async function handleNotesInner(
           let note: Note;
           try {
             note = await store.createNote(item.content ?? "", {
+              ...linkOptFor(db, tagScope),
               id: item.id,
               path: item.path,
               tags: item.tags,
@@ -2693,7 +2725,7 @@ async function handleNotesInner(
         // surfaces a distinct `ambiguous_link` warning instead. Never silent.
         for (const { sourceId, links } of pendingLinks) {
           for (const link of links) {
-            const outcome = resolveOrQueueLink(db, sourceId, link.target, link.relationship);
+            const outcome = resolveOrQueueLink(db, sourceId, link.target, link.relationship, linkOptFor(db, tagScope).linkVisible);
             if (outcome.status === "resolved") {
               await store.createLink(sourceId, outcome.note_id, link.relationship);
             } else if (outcome.status === "ambiguous") {
@@ -2707,7 +2739,7 @@ async function handleNotesInner(
         // --- Content-wikilink warnings (vault#570) ---
         // Same forward-ref-aware timing as the structured-links pass above.
         for (const { noteId, content } of contentWikilinkNotes) {
-          for (const warning of getContentWikilinkWarnings(db, noteId, content)) {
+          for (const warning of getContentWikilinkWarnings(db, noteId, content, linkOptFor(db, tagScope).linkVisible)) {
             pushLinkWarning(noteId, warning);
           }
         }
@@ -3267,7 +3299,7 @@ async function handleNotesInner(
             metadata: createOpts.metadata,
             defaultTags: createOpts.tags,
           }, tagScope);
-          const created = await store.createNote(content, createOpts);
+          const created = await store.createNote(content, { ...createOpts, ...linkOptFor(db, tagScope) });
           if (tagsArr.length > 0) {
             await applySchemaDefaults(store, db, [created.id], tagsArr);
           }
@@ -3291,7 +3323,7 @@ async function handleNotesInner(
           const createWarnings: QueryWarning[] = [];
           if (linksAdd) {
             for (const link of linksAdd) {
-              const outcome = resolveOrQueueLink(db, created.id, link.target, link.relationship);
+              const outcome = resolveOrQueueLink(db, created.id, link.target, link.relationship, linkOptFor(db, tagScope).linkVisible);
               if (outcome.status === "resolved") {
                 await store.createLink(created.id, outcome.note_id, link.relationship, link.metadata);
               } else if (outcome.status === "ambiguous") {
@@ -3306,7 +3338,7 @@ async function handleNotesInner(
           // create path, so there's no batch-sibling forward-ref to wait for
           // — compute right away against the committed content.
           if (content) {
-            createWarnings.push(...getContentWikilinkWarnings(db, created.id, content));
+            createWarnings.push(...getContentWikilinkWarnings(db, created.id, content, linkOptFor(db, tagScope).linkVisible));
           }
           const scopedCreateWarnings = narrowWriteWarnings(db, createWarnings, tagScope);
           const final = await store.getNote(created.id);
@@ -3578,7 +3610,7 @@ async function handleNotesInner(
         // `skipUpdatedAt` isn't set, so this still issues a real UPDATE.
         updates.actor = writeCtx.actor;
         updates.via = writeCtx.via;
-        await store.updateNote(note.id, updates);
+        await store.updateNote(note.id, { ...updates, ...linkOptFor(db, tagScope) });
       }
 
       // --- Remove links (after core UPDATE; conflict would have thrown already) ---
@@ -3603,7 +3635,7 @@ async function handleNotesInner(
       const linkWarnings: QueryWarning[] = [];
       if (body.links?.add) {
         for (const link of body.links.add as { target: string; relationship: string; metadata?: Record<string, unknown> }[]) {
-          const outcome = resolveOrQueueLink(db, note.id, link.target, link.relationship);
+          const outcome = resolveOrQueueLink(db, note.id, link.target, link.relationship, linkOptFor(db, tagScope).linkVisible);
           if (outcome.status === "resolved") {
             await store.createLink(note.id, outcome.note_id, link.relationship, link.metadata);
           } else if (outcome.status === "ambiguous") {
@@ -3629,7 +3661,7 @@ async function handleNotesInner(
       // handles a single note (no batch-sibling forward-ref to wait for),
       // so compute right away against the committed content.
       if (contentChanged) {
-        linkWarnings.push(...getContentWikilinkWarnings(db, note.id, updatedNote.content));
+        linkWarnings.push(...getContentWikilinkWarnings(db, note.id, updatedNote.content, linkOptFor(db, tagScope).linkVisible));
       }
       let validated: any = attachValidationStatus(store, db, updatedNote, buildExpandVisibility(tagScope.allowed, tagScope.raw));
       // Tag-scope (vault#568): the update response echoes the STORED note, so
@@ -3857,6 +3889,9 @@ export async function handleTags(
         409,
       );
     }
+    // Scope gap 6: merging moves notes out of the sources' reach and into the target's.
+    const mergeRefusal = tagChangeGuard(store, url, { kind: "merge", sources: sources as string[], target }, tagScope);
+    if (mergeRefusal) return mergeRefusal;
     const result = await store.mergeTags(sources, target);
     return json(result);
   }
@@ -3875,6 +3910,11 @@ export async function handleTags(
     if (tagScope.allowed && (!tagScope.allowed.has(oldName) || !tagScope.allowed.has(newName))) {
       return tagScopeForbidden(tagScope.raw ?? []);
     }
+    // Scope gap 6: renaming a name a live key's scope, private_tags or the
+    // published tag uses changes who sees what; it needs `?force=true`.
+    // (The vault#240 cascade rewrites only the vault's own legacy tokens table.)
+    const renameRefusal = tagChangeGuard(store, url, { kind: "rename", from: oldName, to: newName }, tagScope);
+    if (renameRefusal) return renameRefusal;
     // Vault#240: rename now cascades to tokens.scoped_tags (and every
     // other surface). The old fail-closed token-reference check has been
     // removed; the cascade rewrites the JSON allowlist atomically. See
@@ -4081,6 +4121,20 @@ export async function handleTags(
       );
       parentNamesPatch = cleaned.length > 0 ? cleaned : null;
     }
+    if (parentNamesPatch !== undefined) {
+      // Scope gap 6: a tag-scoped admin may put its tag only under tags it can
+      // see (else it could pour its notes into another key's reach), and a
+      // re-parent that changes what a key, private_tags or the published tag
+      // reaches needs `?force=true`.
+      const parents = (parentNamesPatch ?? []).map(stripTagHash);
+      if (tagScope.raw !== null && parents.some((p) => !tagVisibleInScope(p, tagScope.allowed, tagScope.raw))) {
+        return tagScopeForbidden(tagScope.raw);
+      }
+      if (parentsChange(store, putTagName, parents)) {
+        const reparentRefusal = tagChangeGuard(store, url, { kind: "reparent", tag: putTagName, parents }, tagScope);
+        if (reparentRefusal) return reparentRefusal;
+      }
+    }
 
     // Field merge mirrors MCP update-tag — preserves prior keys when the
     // payload only declares new ones. UNLESS `replace_fields: true`, in which
@@ -4264,6 +4318,9 @@ export async function handleTags(
     // required to delete a tag another tag's parent_names still references
     // (vault#552). Query params, not a DELETE body, so the flag is visible
     // in access logs and works with any HTTP client without body support.
+    // Scope gap 6: deleting a name a key, private_tags or the published tag uses.
+    const deleteRefusal = tagChangeGuard(store, url, { kind: "delete", tag: tagName }, tagScope);
+    if (deleteRefusal) return deleteRefusal;
     const cascade = parseBool(parseQuery(url, "cascade"), false);
     const detach = parseBool(parseQuery(url, "detach"), false);
     const result = await store.deleteTag(tagName, { cascade, detach });

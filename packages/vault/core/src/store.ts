@@ -283,6 +283,8 @@ export class BunSqliteStore implements Store {
   private syncReferenceFieldLinks(
     note: Note,
     priorMetadata: Record<string, unknown> | undefined,
+    /** Scope gap 1: the writer's visibility; a hidden target resolves as a miss (see `resolveOrQueueLink`). */
+    linkVisible?: (noteId: string) => boolean,
   ): void {
     const resolution = resolveNoteSchemas(this.getSchemaConfig(), { tags: note.tags ?? [] });
     if (resolution.mergedFields.size === 0) return;
@@ -297,7 +299,7 @@ export class BunSqliteStore implements Store {
       const priorValue = prior[fieldName];
 
       if (Array.isArray(nextValue) || Array.isArray(priorValue)) {
-        this.syncReferenceFieldArrayLinks(note.id, fieldName, nextValue, priorValue);
+        this.syncReferenceFieldArrayLinks(note.id, fieldName, nextValue, priorValue, linkVisible);
         continue;
       }
 
@@ -329,7 +331,7 @@ export class BunSqliteStore implements Store {
         // treated the same as a miss here: no link is created, and nothing
         // is queued (mirrors `resolveOrQueueLink`'s own "don't guess"
         // contract for structured links).
-        const outcome = resolveOrQueueLink(this.db, note.id, nextValue, fieldName);
+        const outcome = resolveOrQueueLink(this.db, note.id, nextValue, fieldName, linkVisible);
         if (outcome.status === "resolved") {
           linkOps.createLink(this.db, note.id, outcome.note_id, fieldName);
         }
@@ -395,6 +397,7 @@ export class BunSqliteStore implements Store {
     fieldName: string,
     nextValue: unknown,
     priorValue: unknown,
+    linkVisible?: (noteId: string) => boolean,
   ): void {
     const nextSet = referenceValueToSet(nextValue);
     const priorSet = referenceValueToSet(priorValue);
@@ -403,16 +406,26 @@ export class BunSqliteStore implements Store {
 
     // Resolve the ENTIRE next-set (queuing misses) → the target ids the
     // field's edges under this relationship should point at right now.
+    const existing = linkOps.getLinks(this.db, noteId, { direction: "outbound" });
     const desiredTargetIds = new Set<string>();
     for (const value of nextSet) {
-      const outcome = resolveOrQueueLink(this.db, noteId, value, fieldName);
+      // Scope gap 1 (round-1 review): an element still in the list whose link,
+      // made by someone who could see its note, already exists is kept as it
+      // is. A tag-scoped writer's edit must not delete a link it can't see.
+      if (linkVisible) {
+        const held = resolveLinkTargetDetailed(this.db, value);
+        if (held.resolved && !linkVisible(held.note_id!) && existing.some((l) => l.relationship === fieldName && l.targetId === held.note_id)) {
+          desiredTargetIds.add(held.note_id!);
+          continue;
+        }
+      }
+      const outcome = resolveOrQueueLink(this.db, noteId, value, fieldName, linkVisible);
       if (outcome.status === "resolved") desiredTargetIds.add(outcome.note_id);
     }
 
     // Reconcile existing edges to the desired target set (see the doc comment
     // for why deleting by resolved TARGET, not by re-resolved raw value, is
     // what fixes the rename / ambiguous / aliasing corners).
-    const existing = linkOps.getLinks(this.db, noteId, { direction: "outbound" });
     for (const link of existing) {
       if (link.relationship !== fieldName) continue;
       if (!desiredTargetIds.has(link.targetId)) {
@@ -567,7 +580,7 @@ export class BunSqliteStore implements Store {
    * `syncWikilinks` recomputes a note's wikilink rows, unresolved and ambiguous
    * rows from scratch, so the final pass gives the same result.
    */
-  async createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string; extension?: string; actor?: string | null; via?: string | null; deferWikilinkSync?: boolean }): Promise<Note> {
+  async createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string; extension?: string; actor?: string | null; via?: string | null; deferWikilinkSync?: boolean; linkVisible?: (noteId: string) => boolean }): Promise<Note> {
     // Normalize `date`-typed field values to canonical UTC ISO form BEFORE
     // the write (vault#date-field-type — mixed-offset TEXT-compare
     // corruption). COPY-ON-WRITE (round 2) — reassign the local `opts`
@@ -586,7 +599,7 @@ export class BunSqliteStore implements Store {
     });
 
     if (content && !opts?.deferWikilinkSync) {
-      syncWikilinks(this.db, note.id, content);
+      syncWikilinks(this.db, note.id, content, opts?.linkVisible);
     }
 
     if (note.path) {
@@ -600,7 +613,7 @@ export class BunSqliteStore implements Store {
     // Reference-field auto-link (vault#typed-reference-field) — no prior
     // metadata on a fresh create. Cheap no-op when nothing on the note's
     // effective schema declares `type: "reference"`.
-    this.syncReferenceFieldLinks(note, undefined);
+    this.syncReferenceFieldLinks(note, undefined, opts?.linkVisible);
 
     this.invalidateConfigCachesForPath(note.path);
     // Inside a batch (transactionAsync) the note exists only once the batch commits: no hook may hear of it before,
@@ -672,8 +685,19 @@ export class BunSqliteStore implements Store {
        * verbatim. Ignored when `updates.metadata` is undefined.
        */
       tagsForSchemaResolution?: string[];
+      /**
+       * Scope gap 1: which notes a tag-scoped writer may see. A `[[wikilink]]`
+       * or reference-field value naming a note outside that set resolves as
+       * one that matched nothing (queued, no link). Never reaches SQL.
+       */
+      linkVisible?: (noteId: string) => boolean;
     },
   ): Promise<Note> {
+    const linkVisible = updates.linkVisible;
+    if (linkVisible) {
+      const { linkVisible: _drop, ...rest } = updates;
+      updates = rest;
+    }
     let oldPath: string | undefined;
     // Reference-field auto-link sync (vault#typed-reference-field) needs the
     // PRE-write metadata to detect which reference fields actually changed —
@@ -726,7 +750,7 @@ export class BunSqliteStore implements Store {
       // we don't have the new value pre-write — read it back off the returned
       // note so a `[[Foo]]` introduced via append still creates the link.
       if (updates.content !== undefined || updates.append !== undefined || updates.prepend !== undefined) {
-        syncWikilinks(this.db, id, note.content);
+        syncWikilinks(this.db, id, note.content, linkVisible);
       }
 
       if (updates.path !== undefined && note.path) {
@@ -750,7 +774,7 @@ export class BunSqliteStore implements Store {
       // when this call actually touched `metadata` — see the read above for
       // why a content/tags/path-only update is skipped.
       if (updates.metadata !== undefined) {
-        this.syncReferenceFieldLinks(note, priorMetadataForRefs);
+        this.syncReferenceFieldLinks(note, priorMetadataForRefs, linkVisible);
       }
 
       refreshCompactState(this.db, id);
@@ -1111,7 +1135,7 @@ export class BunSqliteStore implements Store {
     return noteOps.queryNotes(this.db, this.expandQueryTags(this.normalizeQueryTags(opts)));
   }
 
-  async queryNotesPaged(opts: QueryOpts): Promise<QueryNotesPage> {
+  async queryNotesPaged(opts: QueryOpts, visible?: (note: Note) => boolean): Promise<QueryNotesPage> {
     // Hierarchy expansion happens internally — but importantly the cursor's
     // query_hash is computed from the CALLER'S opts (pre-expansion), so a
     // tag hierarchy edit between calls invalidates the cursor (different
@@ -1122,7 +1146,8 @@ export class BunSqliteStore implements Store {
     // Bare-tag normalization runs first (before the hash is taken inside
     // queryNotesPaged) so a `#tag`-form page-1 and a bare `tag`-form follow-up
     // resolve to the same cursor query_hash.
-    return noteOps.queryNotesPaged(this.db, this.expandQueryTags(this.normalizeQueryTags(opts)));
+    // `visible` (scope gap 2): the page and its cursor follow only the notes the caller may see.
+    return noteOps.queryNotesPaged(this.db, this.expandQueryTags(this.normalizeQueryTags(opts)), visible);
   }
 
   async aggregateNotes(opts: QueryOpts): Promise<AggregateRow[]> {

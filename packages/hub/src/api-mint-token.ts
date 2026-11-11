@@ -66,7 +66,7 @@ import {
   vaultScopeName,
 } from "./scope-explanations.ts";
 import { getUserById, resolveUser } from "./users.ts";
-import { bearerPermissionsProblem, carriedPermissions, ENFORCED_PERMISSION_KEYS, HUB_SET_PERMISSION_KEYS, scopedTagsWiderThanMinter, unknownPermissionKeys } from "./permissions-claim.ts";
+import { bearerPermissionsProblem, carriedPermissions, ENFORCED_PERMISSION_KEYS, HUB_SET_PERMISSION_KEYS, scopedAdminProblem, scopedTagsWiderThanMinter, unknownPermissionKeys } from "./permissions-claim.ts";
 import { KEY_NAME_RE, ownerOf } from "./keys.ts";
 
 // Re-export `canGrant` so existing importers (and the symmetric revoke path)
@@ -479,6 +479,9 @@ export async function handleApiMintToken(req: Request, deps: ApiMintTokenDeps): 
         `permissions has unknown key(s) ${unknownKeys.join(", ")}; a vault enforces only ${ENFORCED_PERMISSION_KEYS.join(", ")}`,
       );
     }
+    // Scope gap 4: a tag limit narrows read and write, never admin.
+    const scopedAdmin = scopedAdminProblem(scopes, permissionsClaim);
+    if (scopedAdmin !== null) return jsonError(400, "invalid_scope", scopedAdmin);
     permissionsCanonical = JSON.stringify(permissionsClaim);
   }
   // The write stamp (ROADMAP 0.9.1): a pass minted by a named key carries that key's name and on-behalf-of prefix

@@ -408,6 +408,14 @@ GET /vault/default/api/notes?cursor=eyJxaC...
 only advances when rows were returned, so a polling client can persist a
 single string and keep calling without special-casing the empty case.
 
+**Tag-scoped passes (0.9.1, scope gap 2).** A scoped page holds the first
+`limit` notes the pass may see after the cursor (the vault reads past hidden
+rows), and `next_cursor` is built from those notes only. A cursor is base64
+JSON anyone holding it can read; before 0.9.1 a scoped cursor could carry a
+hidden note's id and time, and moved on a page of only hidden notes. Now a
+scoped answer is what an unscoped pass gets from a vault holding only the
+notes the scoped one can see. MCP `query-notes` with `cursor` does the same.
+
 **Error shapes.**
 
 ```json
@@ -1473,6 +1481,11 @@ equivalent `[[wikilink]]` in `content` behave the same:
   warning fired for a structured `links` miss but NOT for the equivalent
   content `[[wikilink]]` miss (both were queued identically — only the
   write-time signal was asymmetric).
+- **A note the writer can't see** (0.9.1, scope gap 1). For a tag-scoped
+  pass, a `links` entry, `[[wikilink]]` or `reference` field value that names
+  a note outside its scope is handled exactly like a target that matched
+  nothing: queued, with the same `unresolved_link` warning, and no link is
+  made into the hidden note. A link someone else already made stays.
 - **Genuinely unresolvable** (typo, or a target that will never exist)
   looks identical to the "later call" case on the wire — the write still
   queues it. Use `GET /vault/{name}/api/unresolved-wikilinks` to audit what's
@@ -2101,7 +2114,17 @@ leak for existing out-of-scope tags, vault#560).
 Same as the `?tag=` query — single-tag detail by path, same 404 shape.
 
 #### `PUT /vault/{name}/api/tags/{name}` — `vault:admin`
-Upsert a tag's identity row. Body accepts any combination of:
+Upsert a tag's identity row. A body that changes `parent_names` is a
+re-parent: it is refused with `409 tag_in_use` unless the request carries `?force=true` when the change
+alters who sees what: a live key's tag limit (`permissions.scoped_tags`, read
+from the hub's keys) names the tag, a tag the change moves notes into or out
+of, or (for a re-parent) a tag above it; or `private_tags` or the published
+tag does. The body names the keys (`keys: [name, ...]`, names only, never a
+token or its id), `private_tags` and `published_tag` it touches; check them
+with `parachute keys list` and vault.yaml, then repeat with `?force=true`. If
+the hub's keys can't be read, the change is refused the same way (fail
+closed). MCP takes `force: true` on the same tools. A name counts with every name under it, by `/` (`secret` reaches `secret/diary`) or through declared parents, as scopes and `private_tags` reach them. To a tag-scoped pass every such change needs `force`, and the refusal names no key or tag. A tag-scoped admin pass (minted before 0.9.1) may name only
+parents inside its scope (`403 tag_scope_violation`). Body accepts any combination of:
 
 ```json
 {
@@ -2315,8 +2338,19 @@ including the tag-scope generalization.
 #### `DELETE /vault/{name}/api/tags/{name}` — `vault:admin`
 Removes the tag, its identity row, and untags every note. Returns the
 delete result — `{ deleted: true, notes_untagged: number, parent_refs_detached?: number }`.
-Refused with `409 tag_in_use_by_tokens` if any tag-scoped token references
-this tag — revoke or re-mint the tokens first.
+Refused with `409 tag_in_use_by_tokens` if any token in the vault's legacy
+(pre-0.5) tokens table references this tag — revoke or re-mint the tokens first.
+
+**Keys, private tags and the published tag (0.9.1, scope gap 6).** Refused
+with `409 tag_in_use` unless the request carries `?force=true` when the change
+alters who sees what: a live key's tag limit (`permissions.scoped_tags`, read
+from the hub's keys) names the tag, a tag the change moves notes into or out
+of, or (for a re-parent) a tag above it; or `private_tags` or the published
+tag does. The body names the keys (`keys: [name, ...]`, names only, never a
+token or its id), `private_tags` and `published_tag` it touches; check them
+with `parachute keys list` and vault.yaml, then repeat with `?force=true`. If
+the hub's keys can't be read, the change is refused the same way (fail
+closed). MCP takes `force: true` on the same tools. A name counts with every name under it, by `/` (`secret` reaches `secret/diary`) or through declared parents, as scopes and `private_tags` reach them. To a tag-scoped pass every such change needs `force`, and the refusal names no key or tag.
 
 **Referential integrity (vault#552).** Also refused — with `409` and
 `error_type: "tag_referenced_as_parent"`, carrying `{ tag, referencing_tags: [...] }`
@@ -2348,6 +2382,20 @@ Errors:
 - `409 target_exists` — `new_name` (or one of its sub-tags) is already a
   tag. Caller should `POST /tags/merge` instead if combining the two tags
   is the intent.
+- `409 tag_in_use` — see below.
+
+The cascade rewrites only the vault's legacy tokens table: a hub key limited to
+the old name keeps that name, and so loses its notes (or gains the notes of a
+later tag of that name). **Hence: keys, private tags and the published tag (0.9.1, scope gap 6).** Refused
+with `409 tag_in_use` unless the request carries `?force=true` when the change
+alters who sees what: a live key's tag limit (`permissions.scoped_tags`, read
+from the hub's keys) names the tag, a tag the change moves notes into or out
+of, or (for a re-parent) a tag above it; or `private_tags` or the published
+tag does. The body names the keys (`keys: [name, ...]`, names only, never a
+token or its id), `private_tags` and `published_tag` it touches; check them
+with `parachute keys list` and vault.yaml, then repeat with `?force=true`. If
+the hub's keys can't be read, the change is refused the same way (fail
+closed). MCP takes `force: true` on the same tools. A name counts with every name under it, by `/` (`secret` reaches `secret/diary`) or through declared parents, as scopes and `private_tags` reach them. To a tag-scoped pass every such change needs `force`, and the refusal names no key or tag.
 
 **Does NOT rewrite metadata.** A metadata value that happens to equal the
 old tag name (e.g. `metadata.epic: "task"`) is left untouched — rename's
@@ -2379,7 +2427,18 @@ that carried a merged-away source tag has its `updated_at` bumped
 (vault#567), so cursor/sync consumers re-deliver those notes.
 
 Refused with `409 tag_in_use_by_tokens` if any source tag is referenced by
-a tag-scoped token.
+a token in the vault's legacy (pre-0.5) tokens table.
+
+**Keys, private tags and the published tag (0.9.1, scope gap 6).** Refused
+with `409 tag_in_use` unless the request carries `?force=true` when the change
+alters who sees what: a live key's tag limit (`permissions.scoped_tags`, read
+from the hub's keys) names the tag, a tag the change moves notes into or out
+of, or (for a re-parent) a tag above it; or `private_tags` or the published
+tag does. The body names the keys (`keys: [name, ...]`, names only, never a
+token or its id), `private_tags` and `published_tag` it touches; check them
+with `parachute keys list` and vault.yaml, then repeat with `?force=true`. If
+the hub's keys can't be read, the change is refused the same way (fail
+closed). MCP takes `force: true` on the same tools. A name counts with every name under it, by `/` (`secret` reaches `secret/diary`) or through declared parents, as scopes and `private_tags` reach them. To a tag-scoped pass every such change needs `force`, and the refusal names no key or tag. For a merge, the sources and the target count.
 
 **MCP parity (vault#552).** Exposed as the `merge-tags` MCP tool —
 `{ sources: string[], target: string }` — delegating to the SAME

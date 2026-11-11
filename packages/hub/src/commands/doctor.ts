@@ -93,6 +93,8 @@ import {
   writeManifest,
 } from "../services-manifest.ts";
 import { migrateNotice } from "./migrate.ts";
+import { listKeys } from "../keys.ts";
+import { scopedAdminProblem } from "../permissions-claim.ts";
 
 // ---------------------------------------------------------------------------
 // Check model
@@ -1558,6 +1560,42 @@ function checkVersionDrift(manifest: { services: ServiceEntry[] }): CheckResult 
  * + (stubbable) network, never mutates. The hub-reachability probe runs once
  * and gates the module-liveness check (a down hub means every child is down).
  */
+/**
+ * Scope gap 4 (0.9.1, SPEC §3.3): a tag limit narrows read and write, never admin, and the mint refuses a
+ * tag-limited admin pass. Keys minted before that live until they expire: name each live one (never its token or
+ * id) so the operator revokes it and mints read or write instead. The vault-wide routes already refuse them.
+ * Best-effort like the operator-token revocation probe: no hub.db, or one this hub can't read, passes.
+ */
+export function checkScopedAdminKeys(configDir: string): CheckResult {
+  const base = { name: "scoped-admin-keys", title: "No key is a vault admin limited to tags" };
+  const path = hubDbPath(configDir);
+  if (!existsSync(path)) return { ...base, status: "pass", detail: "no hub database yet" };
+  let db: Database | undefined;
+  try {
+    db = new Database(path, { readonly: true });
+    // The mint's own test (scopedAdminProblem): `vault:<name>:admin` and the broad `vault:admin` alike.
+    const found = listKeys(db).filter(
+      (k) => k.status === "active" && scopedAdminProblem(k.scopes, { scoped_tags: k.allow_tags ?? [] }) !== null,
+    );
+    if (found.length === 0) return { ...base, status: "pass", detail: "no live key holds vault admin with a tag limit" };
+    const names = found.map((k) => k.name);
+    return {
+      ...base,
+      status: "warn",
+      detail: `${names.length} live key${names.length === 1 ? " holds" : "s hold"} vault admin with a tag limit: ${names.join(", ")}. Admin acts on the whole vault, so the limit can't hold; since 0.9.1 such a key can't be minted.`,
+      fix: names.map((n) => `parachute keys revoke ${n}`).join(" && ") + "  (then mint a read or write key with the tags)",
+    };
+  } catch {
+    return { ...base, status: "pass", detail: "keys could not be read (an older hub database); nothing to check" };
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      // ignore
+    }
+  }
+}
+
 async function runChecks(
   configDir: string,
   manifestPath: string,
@@ -1580,6 +1618,7 @@ async function runChecks(
   const manifestCheck = checkServicesManifest(manifestPath);
   const portDrift = checkPortDrift(manifestPath);
   const operator = checkOperatorToken(configDir);
+  const scopedAdminKeys = checkScopedAdminKeys(configDir);
   const migration = checkMigration(configDir, manifestPath, deps);
   const grants = checkGrants(configDir, deps);
   const versionDrift = checkVersionDrift(manifest);
@@ -1590,7 +1629,7 @@ async function runChecks(
   };
   add("Hub", [hub, hijack]);
   add("Modules", [...modules, ...bins]);
-  add("Configuration", [manifestCheck, portDrift, operator]);
+  add("Configuration", [manifestCheck, portDrift, operator, scopedAdminKeys]);
   add("Grants", grants);
   add("Migration", migration);
   add("Exposure", [exposure, versionDrift]);

@@ -29,6 +29,7 @@ import {
 } from "jose";
 import { adoptRefreshToken, adoptToken } from "./keys.ts";
 import { attributionPubkey } from "./pubkey-links.ts";
+import { scopedAdminProblem } from "./permissions-claim.ts";
 import { renameVaultScopes, vaultScopeName } from "./scope-explanations.ts";
 import { getActiveSigningKey, getAllPublicKeys } from "./signing-keys.ts";
 import { vaultRenameReservedUntil } from "./vault-rename-guard.ts";
@@ -117,6 +118,9 @@ export async function signAccessToken(
   db: Database,
   opts: SignAccessTokenOpts,
 ): Promise<SignedAccessToken> {
+  // Scope gap 4: no path signs a tag-scoped admin pass (permissions-claim.ts).
+  const scopedAdmin = scopedAdminProblem(opts.scopes, opts.extraClaims?.permissions);
+  if (scopedAdmin !== null) throw new Error(scopedAdmin);
   const key = getActiveSigningKey(db);
   const priv = await importPKCS8(key.privateKeyPem, SIGNING_ALGORITHM);
   const jti = opts.jti ?? randomBytes(16).toString("base64url");

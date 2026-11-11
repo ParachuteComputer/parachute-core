@@ -132,7 +132,7 @@
 {"key":"mcp/admin.tool.delete-record.words","value":"0c9ad5a1f72c5345"}
 {"key":"mcp/admin.tool.delete-tag.hints","value":null}
 {"key":"mcp/admin.tool.delete-tag.present","value":true}
-{"key":"mcp/admin.tool.delete-tag.schema","value":"8e53baa1e0b4d998"}
+{"key":"mcp/admin.tool.delete-tag.schema","value":"cd73381db2de3295"}
 {"key":"mcp/admin.tool.delete-tag.words","value":"d99951ae9d44facc"}
 {"key":"mcp/admin.tool.doctor.hints","value":null}
 {"key":"mcp/admin.tool.doctor.present","value":true}
@@ -160,11 +160,11 @@
 {"key":"mcp/admin.tool.manage-token.words","value":"1b73e2c7a3571c44"}
 {"key":"mcp/admin.tool.manage-types.hints","value":null}
 {"key":"mcp/admin.tool.manage-types.present","value":true}
-{"key":"mcp/admin.tool.manage-types.schema","value":"9be55febab2088fb"}
+{"key":"mcp/admin.tool.manage-types.schema","value":"d4443ddeeda8021b"}
 {"key":"mcp/admin.tool.manage-types.words","value":"b129aff2aded199f"}
 {"key":"mcp/admin.tool.merge-tags.hints","value":null}
 {"key":"mcp/admin.tool.merge-tags.present","value":true}
-{"key":"mcp/admin.tool.merge-tags.schema","value":"acfea309e12b5fb5"}
+{"key":"mcp/admin.tool.merge-tags.schema","value":"17e70757685c08b1"}
 {"key":"mcp/admin.tool.merge-tags.words","value":"fb7539c7efcbd54f"}
 {"key":"mcp/admin.tool.prune-schema.hints","value":null}
 {"key":"mcp/admin.tool.prune-schema.present","value":true}
@@ -184,7 +184,7 @@
 {"key":"mcp/admin.tool.read-attachment.words","value":"c034adf0cd5e438b"}
 {"key":"mcp/admin.tool.rename-tag.hints","value":null}
 {"key":"mcp/admin.tool.rename-tag.present","value":true}
-{"key":"mcp/admin.tool.rename-tag.schema","value":"7e2fe9d41b356c74"}
+{"key":"mcp/admin.tool.rename-tag.schema","value":"c7668d8995009ba2"}
 {"key":"mcp/admin.tool.rename-tag.words","value":"94362aba41a60f53"}
 {"key":"mcp/admin.tool.request-attachment-download.hints","value":null}
 {"key":"mcp/admin.tool.request-attachment-download.present","value":true}
@@ -204,7 +204,7 @@
 {"key":"mcp/admin.tool.update-record.words","value":"cd1370f53159bc57"}
 {"key":"mcp/admin.tool.update-tag.hints","value":null}
 {"key":"mcp/admin.tool.update-tag.present","value":true}
-{"key":"mcp/admin.tool.update-tag.schema","value":"b26d8095f54f08ca"}
+{"key":"mcp/admin.tool.update-tag.schema","value":"dd532c7bd5eb6868"}
 {"key":"mcp/admin.tool.update-tag.words","value":"ea819175d0c1a284"}
 {"key":"mcp/admin.tool.vault-info.hints","value":null}
 {"key":"mcp/admin.tool.vault-info.present","value":true}

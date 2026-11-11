@@ -17,7 +17,7 @@
 // /history/compact). A plain delete is unchanged: it keeps the tombstone.
 import { describe, expect, test } from "bun:test";
 import { enc, mcp, operator, pass, rest, runId, services } from "../lib.ts";
-import { note } from "./_lib.ts";
+import { note, scopedAdmin } from "./_lib.ts";
 
 const s = services();
 const op = operator();
@@ -209,16 +209,16 @@ describe("a tag-scoped pass", () => {
     const mine = await noteWithHistory("scoped-mine");
     const theirs = await note(`${R}/scoped-theirs`, "made up", [OTHER]);
     for (const level of ["write", "admin"] as const) {
-      const scoped = await pass({ level, tags: [TAG] });
+      const scoped = level === "admin" ? await scopedAdmin([TAG]) : await pass({ level, tags: [TAG] });
       await expect(viaMcp(scoped, { ids: [mine, theirs] })).rejects.toThrow(/not_found|not found/i);
     }
-    await expect(viaMcp(await pass({ level: "admin", tags: [TAG] }), { ids: [mine, theirs], erase_history: true })).rejects.toThrow(/not_found|not found/i);
+    await expect(viaMcp(await scopedAdmin([TAG]), { ids: [mine, theirs], erase_history: true })).rejects.toThrow(/not_found|not found/i);
     expect((await op.get(`/notes/${mine}`)).status).toBe(200);
     expect((await op.get(`/notes/${theirs}`)).status).toBe(200);
   });
 
   test("an admin one erases a note in its tags, but can't name history a deleted note left", async () => {
-    const scoped = await pass({ level: "admin", tags: [TAG] });
+    const scoped = await scopedAdmin([TAG]);
     const live = await noteWithHistory("scoped-live");
     expect(await viaMcp(scoped, { ids: [live], erase_history: true })).toMatchObject({ deleted: 1 });
     const left = await noteWithHistory("scoped-left");
@@ -233,6 +233,6 @@ describe("who may list deleted notes", () => {
     const w = await rest(s.vaultViaHub, await pass({ level: "write" })).get("/history/deleted");
     expect(w.status).toBe(403);
     expect(w.body.error_type).toBe("insufficient_scope");
-    expect((await rest(s.vaultViaHub, await pass({ level: "admin", tags: [TAG] })).get("/history/deleted")).status).toBe(404);
+    expect((await rest(s.vaultViaHub, await scopedAdmin([TAG])).get("/history/deleted")).status).toBe(404);
   });
 });

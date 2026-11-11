@@ -115,7 +115,8 @@ describe("rename-tag / merge-tags — tag-scope gating (vault#552)", () => {
     const renameTag = tools.find((t) => t.name === "rename-tag")!;
     let caught: any;
     try {
-      await renameTag.execute({ old_name: "mine", new_name: "mine-other" });
+      // `force`: since 0.9.1 a tag-scoped session confirms every rename (scope gap 6, tag-change-guard.ts).
+      await renameTag.execute({ old_name: "mine", new_name: "mine-other", force: true });
     } catch (e) { caught = e; }
     expect(caught?.error_type).toBe("target_exists");
   });
@@ -173,10 +174,11 @@ describe("delete-tag cascade/detach — MCP wrapper pass-through (vault#552)", (
     const tools = await toolsFor("journal", ["mine"]); // "mine-child" is a descendant, also in-scope
     const deleteTag = tools.find((t) => t.name === "delete-tag")!;
 
-    const refused = await deleteTag.execute({ tag: "mine" }) as any;
+    // `force`: since 0.9.1 a tag-scoped session confirms every delete (scope gap 6, tag-change-guard.ts).
+    const refused = await deleteTag.execute({ tag: "mine", force: true }) as any;
     expect(refused.error).toBe("tag_referenced_as_parent");
 
-    const cascaded = await deleteTag.execute({ tag: "mine", cascade: true }) as any;
+    const cascaded = await deleteTag.execute({ tag: "mine", cascade: true, force: true }) as any;
     expect(cascaded.deleted).toBe(true);
     expect(await store.getTagRecord("mine")).toBeNull();
   });

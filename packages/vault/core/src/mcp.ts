@@ -653,6 +653,8 @@ export interface GenerateMcpToolsOpts {
      * internal callers) → every note/attachment is visible.
      */
     noteVisible?: (note: Note) => boolean | Promise<boolean>;
+    /** The session's tag scope, stamped on each ticket so its spend re-checks it (scope gap 7). */
+    scopedTags?: string[];
   };
   /**
    * `AttachmentBytesProvider` seam (Wave 2 model lane — D10, same "tools
@@ -703,6 +705,11 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
   const searchVisibility = opts?.searchVisibility;
   const resolveVisibility = opts?.resolveVisibility;
   const ambiguityVisible = opts?.ambiguityVisible;
+  // Scope gap 1: the same per-note predicate decides which notes a scoped
+  // writer may link to. A link or [[wikilink]] to a note outside it resolves
+  // as one to nothing (queued, `unresolved_link`), never a link into it.
+  const linkVisible = ambiguityVisible;
+  const linkOpt = linkVisible ? { linkVisible } : {};
   // Write-attribution (vault#298) — captured once at tool-generation time
   // (a fresh tool set is generated per MCP request, so this is request-scoped)
   // and folded into every create/update the tools perform.
@@ -1365,7 +1372,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             collectUnknownTagWarnings(db, queryOpts.tags, queryOpts.expand, store.getTagHierarchy()),
           );
           if (cursorMode) {
-            const page = await store.queryNotesPaged(queryOpts);
+            const page = await store.queryNotesPaged(queryOpts, searchVisibility);
             results = page.notes;
             nextCursor = page.next_cursor;
           } else {
@@ -1663,6 +1670,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           if (Object.keys(updates).length > 0 || incomingTags.length > 0 || hasLinkMutation) {
             result = await store.updateNote(existingNote.id, {
               ...updates,
+              ...linkOpt,
               actor: writeActor,
               via: writeVia,
               // `tagsForSchemaResolution` (vault#date-field-type review round
@@ -1765,6 +1773,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
                 // in a batch (the whole call came from one authenticated session).
                 actor: writeActor,
                 via: writeVia,
+                ...linkOpt,
               });
             } catch (err) {
               // Race backstop (vault#555): a concurrent writer's INSERT
@@ -1812,7 +1821,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           // surfaces a distinct `ambiguous_link` warning instead. Never silent.
           for (const { sourceId, links } of pendingLinks) {
             for (const link of links) {
-              const outcome = resolveOrQueueLink(db, sourceId, link.target, link.relationship);
+              const outcome = resolveOrQueueLink(db, sourceId, link.target, link.relationship, linkVisible);
               if (outcome.status === "resolved") {
                 await store.createLink(sourceId, outcome.note_id, link.relationship);
               } else if (outcome.status === "ambiguous") {
@@ -1830,7 +1839,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           // pending-wikilink backfill (`resolveUnresolvedWikilinks`, run
           // inside each `store.createNote`/`updateNote` call above).
           for (const { noteId, content } of contentWikilinkNotes) {
-            for (const warning of getContentWikilinkWarnings(db, noteId, content)) {
+            for (const warning of getContentWikilinkWarnings(db, noteId, content, linkVisible)) {
               pushLinkWarning(noteId, warning);
             }
           }
@@ -2072,7 +2081,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
                   metadata: createOpts.metadata,
                   defaultTags: createOpts.tags,
                 });
-                const created = await store.createNote(content, createOpts);
+                const created = await store.createNote(content, { ...createOpts, ...linkOpt });
                 await applySchemaDefaults(store, db, [created.id], created.tags ?? []);
                 // Defer links.add resolution to the second pass (vault#555)
                 // — same reasoning as create-note.
@@ -2328,7 +2337,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
               // `skipUpdatedAt` isn't set, so this still issues a real UPDATE
               // (not the true no-op/precondition-only branch, which only fires
               // when the caller passes ZERO fields AND no mutation is pending).
-              result = await store.updateNote(note.id, updates);
+              result = await store.updateNote(note.id, { ...updates, ...linkOpt });
             } else {
               result = note;
             }
@@ -2379,7 +2388,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           // never silently dropped.
           for (const { sourceId, links } of pendingLinks) {
             for (const link of links) {
-              const outcome = resolveOrQueueLink(db, sourceId, link.target, link.relationship);
+              const outcome = resolveOrQueueLink(db, sourceId, link.target, link.relationship, linkVisible);
               if (outcome.status === "resolved") {
                 await store.createLink(sourceId, outcome.note_id, link.relationship, link.metadata);
               } else if (outcome.status === "ambiguous") {
@@ -2393,7 +2402,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           // --- Content-wikilink warnings (vault#570) ---
           // Same forward-ref-aware timing as the structured-links pass above.
           for (const { noteId, content } of contentWikilinkNotes) {
-            for (const warning of getContentWikilinkWarnings(db, noteId, content)) {
+            for (const warning of getContentWikilinkWarnings(db, noteId, content, linkVisible)) {
               pushLinkWarning(noteId, warning);
             }
           }
@@ -2963,6 +2972,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             sizeBytes,
             transcribe: params.transcribe === true,
             ...(validSegment ? { segmentIndex: segIdx } : {}),
+            ...(ticketSeam.scopedTags ? { scopedTags: [...ticketSeam.scopedTags] } : {}),
           };
           await ticketSeam.provider.put(ticket);
 
@@ -3025,6 +3035,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             attachmentId: attachment.id,
             mimeType: downloadMime,
             sizeBytes: declaredSize,
+            ...(ticketSeam.scopedTags ? { scopedTags: [...ticketSeam.scopedTags] } : {}),
           };
           await ticketSeam.provider.put(ticket);
 
