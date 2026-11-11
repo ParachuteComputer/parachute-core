@@ -1,6 +1,8 @@
 // 0.9.2 row 2, "Safe schema change": a retype is refused while records disagree with it, and a dry-run migrate says
 // what a retype would change before anything is written. Today a retype is accepted with no check, and after it the
-// records that disagree can't be edited (T-378 perspective 8, measured); migrate is a CLI command only.
+// records that disagree can't be edited (T-378 perspective 8, measured); migrate is a CLI command only. The count a
+// refusal needs exists already: `POST /api/tags/<type>/conformance {fields}` (store.countTagConformance) counts the
+// records a proposed spec would violate. Build the refusal and the migrate plan on it, so the two can't disagree.
 // The other half of the row (a type PUT walks references only when a reference field changes) is timed by the bench:
 // at 94k a PUT on a type with a reference field returns in about 3 s today (BENCH-0.9.2.md).
 //
@@ -58,7 +60,7 @@ describe("0.9.2 safe schema change", () => {
     const plan = await api.post(`/tags/${enc(tag)}/migrate`, { field: count, transform: { kind: "to_string" } });
     must(plan.status !== 404, `no migrate over REST: ${plan.status}`);
     must(plan.status === 200, `migrate gave ${plan.status} ${said(plan.body).slice(0, 300)}`);
-    must(said(plan.body).match(/would_change"?:\s*3/), `the plan doesn't say 3 records would change: ${said(plan.body).slice(0, 300)}`);
+    must(said(plan.body).match(/would_change"?:\s*3\b/), `the plan doesn't say 3 records would change: ${said(plan.body).slice(0, 300)}`);
     const after = await writer.get(`/notes?tag=${tag}&meta[${count}][eq]=8`);
     must(after.body.length === 1 && after.body[0].metadata[count] === 8, `the dry run wrote: ${said(after.body).slice(0, 300)}`);
   });
@@ -78,7 +80,7 @@ describe("0.9.2 safe schema change", () => {
       } catch (err) {
         must(false, `no migrate over MCP: ${(err as Error).message.slice(0, 300)}`);
       }
-      must(said(plan).match(/would_change"?:\s*3/), `the plan doesn't say 3 records would change: ${said(plan).slice(0, 300)}`);
+      must(said(plan).match(/would_change"?:\s*3\b/), `the plan doesn't say 3 records would change: ${said(plan).slice(0, 300)}`);
     } finally {
       await m.close();
     }

@@ -192,7 +192,7 @@ deleted, a note the export format can't carry).
 
 Door contracts for ROADMAP 0.9.2, written before the code, one file per roadmap row. They use the door suite's
 client (`door/_door.ts`) and run on the box with `bun run doors -- --doors box suites/v092` (CI's `doors` job runs
-them after the door suite). Each is `red()` with the reason it fails today; the lane that makes one pass removes its
+them on a second box from the same build, after the door suite). Each is `red()` with the reason it fails today; the lane that makes one pass removes its
 `red()` in the same pull request. They record no fingerprint, so the kept box fingerprint doesn't move. Wire shapes
 not yet decided are written at the top of each file, marked proposed.
 

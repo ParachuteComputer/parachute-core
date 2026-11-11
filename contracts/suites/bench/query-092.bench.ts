@@ -95,12 +95,15 @@ async function seed(): Promise<{ seconds: number; rate: number }> {
   // `item` has no reference field: its PUTs and its retype are timed apart from the reference walk.
   const r2 = await put("item", { size: { type: "integer", indexed: true } });
   if (r2.status !== 200) throw new Error(`bench: declaring item gave ${r2.status}`);
-  for (let p = 0; p < 10; p++) await call("POST", "/notes", { path: `proj/p${p}`, content: "", if_exists: "ignore" });
+  for (let p = 0; p < 10; p++) {
+    const made = await call("POST", "/notes", { path: `proj/p${p}`, content: "", if_exists: "ignore" });
+    if (made.status < 200 || made.status >= 300) throw new Error(`bench: project record ${p} gave ${made.status}`);
+  }
   const t0 = performance.now();
   for (let have = 0; have < N; ) {
     const n = Math.min(500, N - have);
     const r = await call("POST", "/notes", { notes: Array.from({ length: n }, (_, k) => rec(have + k)), summary: true });
-    if (r.status >= 300) throw new Error(`bench: seeding at ${have} gave ${r.status} ${JSON.stringify(r.body).slice(0, 300)}`);
+    if (r.status < 200 || r.status >= 300) throw new Error(`bench: seeding at ${have} gave ${r.status} ${JSON.stringify(r.body).slice(0, 300)}`);
     have += n;
     if (have % 10_000 === 0) console.log(`[bench] seeded ${have} (${(have / ((performance.now() - t0) / 1000)).toFixed(0)} rec/s)`);
   }
@@ -126,7 +129,8 @@ function print(r: Row) {
   const t = r.p50 === undefined ? "" : `p50 ${r.p50.toFixed(1).padStart(9)} ms  p95 ${r.p95!.toFixed(1).padStart(9)} ms`;
   console.log(`[bench] ${`${r.group} | ${r.name}`.padEnd(70)} ${String(r.status).padStart(4)} ${t}${r.rows === undefined ? "" : `  rows ${r.rows}`}${r.note ? `  ${r.note}` : ""}`);
 }
-/** Run one GET `times` times; record p50/p95, the status and how many rows came back. */
+/** Run one GET `times` times; record p50/p95, the status and how many rows came back. With 5–10 calls, p95 is the
+ *  slowest call: read p50. */
 async function q(group: string, name: string, path: (i: number) => string, times = 10) {
   const ms: number[] = [];
   let last: Timed | null = null;

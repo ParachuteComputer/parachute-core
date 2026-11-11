@@ -15,6 +15,18 @@ const api = rest("admin");
 const writer = rest("write");
 const LANE = "0.9.2 doctor";
 
+/** Every number in a reply whose key path (or a string beside it, e.g. a finding's `type`) matches `topic`. */
+function numbersUnder(v: unknown, topic: RegExp, path = ""): number[] {
+  if (typeof v === "number") return topic.test(path) ? [v] : [];
+  if (Array.isArray(v)) return v.flatMap((x, i) => numbersUnder(x, topic, `${path}[${i}]`));
+  if (v && typeof v === "object") {
+    const o = v as Record<string, unknown>;
+    const here = `${path}/${Object.values(o).filter((x) => typeof x === "string").join(" ")}`;
+    return Object.entries(o).flatMap(([k, x]) => numbersUnder(x, topic, `${here}.${k}`));
+  }
+  return [];
+}
+
 describe("0.9.2 doctor additions", () => {
   test("setup: doctor answers an admin today", async () => {
     const doc = await api.get("/doctor");
@@ -68,7 +80,7 @@ describe("0.9.2 doctor additions", () => {
     const put = await other.put(`/tags/${enc(tag)}`, { fields });
     must(put.status === 200, `setup: declaring 88 indexed fields gave ${put.status} ${said(put.body).slice(0, 200)}`);
     const doc = await other.get("/doctor");
-    must(/"(count|indexed_fields?)"?[^}]{0,80}\b88\b/.test(said(doc.body)), `doctor: no indexed-field count of 88: ${said(doc.body).slice(0, 400)}`);
+    must(numbersUnder(doc.body, /indexed/).includes(88), `doctor: no indexed-field count of 88: ${said(doc.body).slice(0, 400)}`);
     const over = await other.put(`/tags/${enc(`${tag}b`)}`, { fields: { [`ix_over_${runId("f")}`]: { type: "string", indexed: true } } });
     must(over.status >= 400 && over.status < 500, `the 89th indexed field was accepted: ${over.status}`);
     must(/prune|unused/i.test(said(over.body)), `the refusal doesn't say what to prune: ${said(over.body).slice(0, 300)}`);

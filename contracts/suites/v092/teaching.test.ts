@@ -39,7 +39,7 @@ describe("0.9.2 teaching", () => {
   });
 
   red("vault-info's tag map is capped: with 700 types it fits in about 4,000 tokens and says how many there are", { reason: /^uncapped: /, lane: LANE }, async () => {
-    // The largest vault moving to cloud has 688 type names; at its shape the map is 5.7k of vault-info's 9k tokens.
+    // Vaults with hundreds of types exist; uncapped, the map is most of what vault-info costs an AI to read.
     // Filled on the run's second vault, so the other contracts' vault stays small.
     const m = await otherMcp();
     try {
@@ -49,11 +49,13 @@ describe("0.9.2 teaching", () => {
         await Promise.all(Array.from({ length: batch }, (_, k) => m.call("manage-types", { action: "update", tag: `${prefix}/t${String(i + k).padStart(3, "0")}`, description: "A made-up type with two fields", fields: { [`a${(i + k) % 40}`]: { type: "string" }, [`n${(i + k) % 40}`]: { type: "integer" } } })));
       }
       const vi: any = await m.call("vault-info", {});
-      const size = said(vi).length;
+      // The tag map's share: everything but the indexed-field list, which other contracts may fill on this vault.
+      const size = said({ ...vi, indexed_fields: undefined }).length;
       // 16,000 characters is about 4,000 tokens: the writer-list budget the 0.9.1 multi-vault door is held to.
-      must(size <= 16_000, `uncapped: vault-info is ${size} characters with 700 types`);
-      // The total is in the reply: a JSON number of 700 or more (the run's types plus the seed's), or "of 7xx" in words.
-      must(/:\s*7\d\d[,}\]]|\bof 7\d\d\b|\b7\d\d (types|in all)\b/.test(said(vi)), `capped, but it doesn't say how many types there are (700+)`);
+      must(size <= 16_000, `uncapped: vault-info (without its indexed-field list) is ${size} characters with 700 types`);
+      // The total is in the reply: a `…total…` or `…count…` key of 700 or more (the run's types plus the seed's), or
+      // "of 7xx" in words.
+      must(/"\w*(total|count)\w*"\s*:\s*7\d\d\b|\bof 7\d\d\b|\b7\d\d (types|in all)\b/.test(said(vi)), `capped, but it doesn't say how many types there are (700+)`);
     } finally {
       await m.close();
     }
