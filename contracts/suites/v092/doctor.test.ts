@@ -34,7 +34,7 @@ describe("0.9.2 doctor additions", () => {
     expect(Array.isArray(doc.body.findings)).toBe(true);
   });
 
-  red("doctor finds a field whose values name records but that no type declares a reference", { reason: /^doctor: no reference-gap finding/, lane: LANE }, async () => {
+  test("doctor finds a field whose values name records but that no type declares a reference", async () => {
     const r = runId("dr");
     const field = `project_${runId("f")}`;
     for (const p of ["alder", "birch"]) must((await writer.post("/notes", { content: "", path: `${r}/projects/${p}` })).status === 201, "setup: a project record");
@@ -46,7 +46,7 @@ describe("0.9.2 doctor additions", () => {
     must(mine.some((x) => /reference/.test(said({ ...x, type: undefined }))), `the finding doesn't say to declare it a reference: ${said(mine).slice(0, 300)}`);
   });
 
-  red("doctor finds two type names one letter apart", { reason: /^doctor: no near-name finding/, lane: LANE }, async () => {
+  test("doctor finds two type names one letter apart", async () => {
     // One letter deleted, so neither name contains the other and a finding must name both.
     const base = `ledger${runId("n")}`;
     const near = base.replace("ledger", "ledgr");
@@ -57,7 +57,7 @@ describe("0.9.2 doctor additions", () => {
     must(mine.length > 0, `doctor: no near-name finding for ${base} and ${near}: ${said(findings(doc.body).map((x) => x.type))}`);
   });
 
-  red("doctor finds two field names one letter apart", { reason: /^doctor: no near-name finding/, lane: LANE }, async () => {
+  test("doctor finds two field names one letter apart", async () => {
     const field = `due_on_${runId("f")}`;
     const near = field.replace("due_on", "dueon");
     const r = runId("dr");

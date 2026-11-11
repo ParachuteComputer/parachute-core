@@ -39,6 +39,19 @@
  *     longer drags the enum's OTHER legitimate values into a false
  *     "stale tag reference" finding.
  *
+ *   - `mixed_type_field`        — (0.9.2) a field that ISN'T indexed, declared
+ *     or not, holding values of more than one data type (string, number,
+ *     boolean, array, object). Indexed fields keep their own finding above.
+ *   - `declared_reference_gap`  — (0.9.2) a field whose text values name an
+ *     existing record (its path, `[[path]]`, or id) in most records that
+ *     carry it, but that no type declares `reference`.
+ *   - `near_names`              — (0.9.2) two type names, or two field names,
+ *     one edit apart (case aside). Advice only (`info`): `meeting` and
+ *     `meetings` may both be meant.
+ *
+ *   The three 0.9.2 scans read every record's metadata once each (json_each);
+ *   timed at 94k records, about 0.6 s and 0.5 s on a box.
+ *
  * Tag-scope (vault#552): pass `allowedTags` (the caller's EXPANDED
  * allowlist, e.g. from `expandTokenTagScope`) to restrict every finding to
  * in-scope tags/fields/notes. `null` (or omitted) — the default — scans the
@@ -50,12 +63,12 @@
 import { historyTablesPresent, deletedHistoryStats, historyStorageStats, topNotesByHistoryBytes } from "./history.js";
 import { readCompactState, type CompactState } from "./history-compact-state.js";
 import { Database } from "bun:sqlite";
-import { loadTagHierarchy, findHierarchyCycles } from "./tag-hierarchy.js";
+import { loadTagHierarchy, findHierarchyCycles, levenshtein } from "./tag-hierarchy.js";
 import { listIndexedFields } from "./indexed-fields.js";
 import { pruneOrphanedIndexedFields } from "./indexed-fields.js";
 import { loadSchemaConfig } from "./schema-defaults.js";
 import { readBlobContent, hashContent, HistoryDeltaOrphanError } from "./history.js";
-import { typeKindReport } from "./tag-kind.js";
+import { typeKindReport, KIND_SQL } from "./tag-kind.js";
 
 function scanCompactStateDrift(db: Database): DoctorFinding[] {
   if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='history_compact_state'").get()) return [];
@@ -122,7 +135,10 @@ export type DoctorFindingType =
   | "history_delta_orphan"
   | "history_content_audit"
   | "history_compact_state_drift"
-  | "tag_used_like_type";
+  | "tag_used_like_type"
+  | "mixed_type_field"
+  | "declared_reference_gap"
+  | "near_names";
 
 export type DoctorSeverity = "error" | "warning" | "info";
 
@@ -194,7 +210,7 @@ function makeNoteInScope(
   return (id: string): boolean => {
     const cached = cache.get(id);
     if (cached !== undefined) return cached;
-    const tags = (db.prepare("SELECT tag_name FROM note_tags WHERE note_id = ?").all(id) as { tag_name: string }[]).map((r) => r.tag_name);
+    const tags = (db.query("SELECT tag_name FROM note_tags WHERE note_id = ?").all(id) as { tag_name: string }[]).map((r) => r.tag_name);
     const inScope = admit(tags);
     cache.set(id, inScope);
     return inScope;
@@ -215,6 +231,7 @@ export function runDoctorScan(db: Database, opts?: DoctorScanOpts): DoctorReport
     ...(allowedTags === null ? scanDeltaOrphans(db) : []),
     ...(allowedTags === null ? scanCompactStateDrift(db) : []),
     ...(allowedTags === null ? scanTagsUsedLikeTypes(db) : []),
+    ...scanFieldShapes(db, allowedTags, opts?.noteTagsInScope),
   ];
 
   const audit = opts?.deep ? auditHistoryBlobs(db, opts.history_after, opts.history_max_blobs, opts.history_budget_ms) : undefined;
@@ -533,3 +550,261 @@ function scanTagsUsedLikeTypes(db: Database): DoctorFinding[] {
     remedy: `If it is: manage-types {tag: "${t.name}", kind: "type"}. If it is a label, nothing to do.`,
   }));
 }
+
+// ---------------------------------------------------------------------------
+// 0.9.2: field shapes (mixed data types, the reference gap, near names)
+// ---------------------------------------------------------------------------
+
+/** A field's data type as a person names it; JSON's integer and real are both a number. */
+const DATA_TYPE: Record<string, string> = {
+  text: "string", integer: "number", real: "number", true: "boolean", false: "boolean", array: "array", object: "object",
+};
+
+interface FieldStat {
+  key: string;
+  /** data type → number of records holding it */
+  types: Map<string, number>;
+  /** data type → one record id holding it */
+  examples: Map<string, string>;
+  records: number;
+}
+
+/**
+ * The ids of the notes a scoped doctor run may see, as a JSON array for
+ * `json_each`, or null for an unscoped run. Candidates are the notes holding
+ * an allowed tag; the server's predicate then applies the private-tag deny.
+ */
+function inScopeIdsJson(
+  db: Database,
+  allowedTags: Set<string> | null,
+  noteTagsInScope?: (tags: string[]) => boolean,
+): string | null {
+  if (!allowedTags) return null;
+  const inScope = makeNoteInScope(db, allowedTags, noteTagsInScope);
+  const ids = (db
+    .prepare("SELECT DISTINCT note_id AS id FROM note_tags WHERE tag_name IN (SELECT value FROM json_each(?))")
+    .all(JSON.stringify([...allowedTags])) as { id: string }[]).map((r) => r.id).filter(inScope);
+  return JSON.stringify(ids);
+}
+
+const META_ROWS = `FROM notes n, json_each(n.metadata) j
+  WHERE n.metadata IS NOT NULL AND n.metadata != '' AND json_valid(n.metadata) AND json_type(n.metadata) = 'object'`;
+
+function fieldStats(db: Database, scopeIds: string | null): FieldStat[] {
+  const scope = scopeIds === null ? "" : " AND n.id IN (SELECT value FROM json_each(?))";
+  const rows = db
+    .prepare(`SELECT j.key AS key, j.type AS type, COUNT(*) AS c, MIN(n.id) AS ex ${META_ROWS} AND j.type != 'null'${scope} GROUP BY j.key, j.type`)
+    .all(...(scopeIds === null ? [] : [scopeIds])) as { key: string; type: string; c: number; ex: string }[];
+  const byKey = new Map<string, FieldStat>();
+  for (const r of rows) {
+    let st = byKey.get(r.key);
+    if (!st) byKey.set(r.key, (st = { key: r.key, types: new Map(), examples: new Map(), records: 0 }));
+    const t = DATA_TYPE[r.type] ?? r.type;
+    st.types.set(t, (st.types.get(t) ?? 0) + r.c);
+    if (!st.examples.has(t)) st.examples.set(t, r.ex);
+    st.records += r.c;
+  }
+  return [...byKey.values()];
+}
+
+/** Field name → [type, its declared data type] for every type (in scope) that declares it. */
+function declaredFields(db: Database, allowedTags: Set<string> | null): Map<string, { tag: string; type?: string }[]> {
+  const out = new Map<string, { tag: string; type?: string }[]>();
+  const rows = db.prepare("SELECT name, fields FROM tags WHERE fields IS NOT NULL").all() as { name: string; fields: string }[];
+  for (const r of rows) {
+    if (allowedTags && !allowedTags.has(r.name)) continue;
+    let fields: unknown;
+    try { fields = JSON.parse(r.fields); } catch { continue; }
+    if (!fields || typeof fields !== "object" || Array.isArray(fields)) continue;
+    for (const [k, spec] of Object.entries(fields as Record<string, any>)) {
+      const list = out.get(k) ?? [];
+      list.push({ tag: r.name, type: typeof spec?.type === "string" ? spec.type : undefined });
+      out.set(k, list);
+    }
+  }
+  return out;
+}
+
+const plural = (n: number, one: string) => `${n} ${one}${n === 1 ? "" : "s"}`;
+
+function scanFieldShapes(
+  db: Database,
+  allowedTags: Set<string> | null,
+  noteTagsInScope?: (tags: string[]) => boolean,
+): DoctorFinding[] {
+  const scopeIds = inScopeIdsJson(db, allowedTags, noteTagsInScope);
+  const stats = fieldStats(db, scopeIds);
+  const declared = declaredFields(db, allowedTags);
+  return [
+    ...mixedTypeFields(db, stats, declared, allowedTags),
+    ...referenceGaps(db, scopeIds, declared, allowedTags),
+    ...nearNames(db, stats, declared, allowedTags, scopeIds),
+  ];
+}
+
+function mixedTypeFields(
+  db: Database,
+  stats: FieldStat[],
+  declared: Map<string, { tag: string; type?: string }[]>,
+  allowedTags: Set<string> | null,
+): DoctorFinding[] {
+  const indexed = new Set(listIndexedFields(db).map((f) => f.field));
+  const findings: DoctorFinding[] = [];
+  for (const st of stats) {
+    if (st.types.size < 2 || indexed.has(st.key)) continue;
+    const counts = [...st.types.entries()].sort((a, b) => b[1] - a[1]);
+    const decl = declared.get(st.key) ?? [];
+    const declText = decl.length > 0
+      ? `Declared by ${decl.map((d) => `${d.tag}${d.type ? ` (${d.type})` : ""}`).join(", ")}.`
+      : allowedTags ? "No type this pass can see declares it." : "No type declares it.";
+    findings.push({
+      type: "mixed_type_field",
+      severity: "warning",
+      subject: st.key,
+      detail: `field "${st.key}" holds values of ${counts.length} data types: ${counts.map(([t, c]) => `${t} (${plural(c, "record")})`).join(", ")}. ${declText} Examples: ${counts.map(([t]) => `${st.examples.get(t)} (${t})`).join(", ")}.`,
+      remedy: `Give "${st.key}" one data type: update the records holding the odd values${decl.length > 0 ? " to the declared type" : ""}, or, if they are different things, move one kind into a field of its own. A field holds one data type per vault in 1.0.`,
+    });
+  }
+  return findings;
+}
+
+function referenceGaps(
+  db: Database,
+  scopeIds: string | null,
+  declared: Map<string, { tag: string; type?: string }[]>,
+  allowedTags: Set<string> | null,
+): DoctorFinding[] {
+  // A value names a record when it is that record's path (any case, as
+  // wikilinks resolve), the path in `[[...]]`, or its id. A scoped run only
+  // counts records it may see, so the count can't reveal a hidden path.
+  // `[[path]]`, `[[path|alias]]` and `[[path#heading]]` all name `path`.
+  const inner = `(CASE WHEN j.value LIKE '[[%]]' THEN substr(j.value, 3, length(j.value) - 4) ELSE j.value END)`;
+  const noAlias = `(CASE WHEN instr(${inner}, '|') > 0 THEN substr(${inner}, 1, instr(${inner}, '|') - 1) ELSE ${inner} END)`;
+  const target = `(CASE WHEN instr(${noAlias}, '#') > 1 THEN substr(${noAlias}, 1, instr(${noAlias}, '#') - 1) ELSE ${noAlias} END)`;
+  const scope = scopeIds === null ? "" : " AND t.id IN (SELECT value FROM json_each(?))";
+  const scopeN = scopeIds === null ? "" : " AND n.id IN (SELECT value FROM json_each(?))";
+  const rows = db
+    .prepare(`SELECT j.key AS key, COUNT(*) AS total,
+        SUM(EXISTS (SELECT 1 FROM notes t WHERE t.path = ${target} COLLATE NOCASE${scope})
+            OR EXISTS (SELECT 1 FROM notes t WHERE t.id = j.value${scope})) AS hits
+      ${META_ROWS} AND j.type = 'text' AND length(j.value) BETWEEN 1 AND 512${scopeN}
+      GROUP BY j.key`)
+    .all(...(scopeIds === null ? [] : [scopeIds, scopeIds, scopeIds])) as { key: string; total: number; hits: number }[];
+  const findings: DoctorFinding[] = [];
+  for (const r of rows) {
+    // "Most": more than half the records holding text in this field, and at least two.
+    if (r.hits < 2 || r.hits * 2 <= r.total) continue;
+    const decl = declared.get(r.key) ?? [];
+    if (decl.some((d) => d.type === "reference")) continue;
+    const on = decl.length > 0 ? decl.map((d) => d.tag) : topTypeHolding(db, r.key, scopeIds, allowedTags);
+    const call = on.length > 0
+      ? `manage-types {tag: "${on[0]}", fields: {"${r.key}": {type: "reference"}}}${on.length > 1 ? ` (and on ${on.slice(1).join(", ")})` : ""}`
+      : `manage-types {tag: <the type its records carry>, fields: {"${r.key}": {type: "reference"}}}`;
+    findings.push({
+      type: "declared_reference_gap",
+      severity: "info",
+      subject: r.key,
+      detail: `field "${r.key}" names another record in ${r.hits} of ${plural(r.total, "record")} that hold text in it, but it isn't declared a reference${allowedTags ? " on any type this pass can see" : ""}, so the vault keeps it as plain text: it isn't a link, renames don't follow it, and near and backlinks don't see it.`,
+      remedy: `If it points at records, declare it a reference: ${call}.`,
+    });
+  }
+  return findings;
+}
+
+/**
+ * The type most of the records holding `key` carry (none when they carry no
+ * type). A scoped run looks only at in-scope records and names only an
+ * allowed type: a record it sees may also carry a type it may not.
+ */
+function topTypeHolding(db: Database, key: string, scopeIds: string | null, allowedTags: Set<string> | null): string[] {
+  if (/["\\]/.test(key)) return [];
+  const scope = scopeIds === null || allowedTags === null
+    ? ""
+    : " AND n.id IN (SELECT value FROM json_each(?)) AND nt.tag_name IN (SELECT value FROM json_each(?))";
+  const row = db
+    .prepare(`SELECT nt.tag_name AS name, COUNT(*) AS c FROM notes n JOIN note_tags nt ON nt.note_id = n.id JOIN tags t ON t.name = nt.tag_name
+      WHERE json_valid(n.metadata) AND json_type(n.metadata, '$."' || ? || '"') IS NOT NULL AND ${KIND_SQL} = 'type'${scope}
+      GROUP BY nt.tag_name ORDER BY c DESC LIMIT 1`)
+    .get(...(scopeIds === null || allowedTags === null ? [key] : [key, scopeIds, JSON.stringify([...allowedTags])])) as { name: string } | null;
+  return row ? [row.name] : [];
+}
+
+/**
+ * Two names one edit apart, case aside, that aren't the same name. Names
+ * that differ in one digit (`item1`, `item2`), add a number at the end
+ * (`item`, `item2`) or differ in a last letter after a separator (`phase-a`,
+ * `phase-b`) are a series, not a slip, and are left out, as are names under
+ * three characters.
+ */
+function nearPair(a: string, b: string): boolean {
+  if (a === b || Math.abs(a.length - b.length) > 1) return false;
+  // Short names (`x`, `y`, `id`) are one letter from many others by nature.
+  if (a.length < 3 || b.length < 3) return false;
+  const [x, y] = [a.toLowerCase(), b.toLowerCase()];
+  if (x === y) return true;
+  if (levenshtein(x, y) !== 1) return false;
+  // `item` and `item2`: a number added at the end starts a series.
+  const [short, long] = x.length < y.length ? [x, y] : [y, x];
+  if (long.length > short.length && long.startsWith(short) && /\d/.test(long[long.length - 1]!)) return false;
+  if (x.length === y.length) {
+    for (let i = 0; i < x.length; i++) {
+      if (x[i] === y[i]) continue;
+      if (/\d/.test(x[i]!) && /\d/.test(y[i]!)) return false;
+      if (i === x.length - 1 && i > 0 && /[-_/. ]/.test(x[i - 1]!)) return false;
+      return true;
+    }
+  }
+  return true;
+}
+
+const MAX_NEAR_NAMES = 25;
+
+function nearNames(
+  db: Database,
+  stats: FieldStat[],
+  declared: Map<string, { tag: string; type?: string }[]>,
+  allowedTags: Set<string> | null,
+  scopeIds: string | null,
+): DoctorFinding[] {
+  // A scoped run counts only the records it may see (a private co-tag hides one).
+  const inScope = scopeIds === null ? "" : " AND nt.note_id IN (SELECT value FROM json_each(?))";
+  const typeRows = db
+    .prepare(`SELECT t.name AS name, (SELECT COUNT(*) FROM note_tags nt WHERE nt.tag_name = t.name${inScope}) AS c FROM tags t WHERE ${KIND_SQL} = 'type'`)
+    .all(...(scopeIds === null ? [] : [scopeIds])) as { name: string; c: number }[];
+  const types = typeRows.filter((r) => !allowedTags || allowedTags.has(r.name)).map((r) => ({ name: r.name, c: r.c }));
+  const fieldUse = new Map<string, number>();
+  for (const st of stats) fieldUse.set(st.key, st.records);
+  for (const k of declared.keys()) if (!fieldUse.has(k)) fieldUse.set(k, 0);
+  const fields = [...fieldUse.entries()].map(([name, c]) => ({ name, c }));
+
+  const pairs: { kind: "type" | "field"; a: { name: string; c: number }; b: { name: string; c: number } }[] = [];
+  for (const [kind, list] of [["type", types], ["field", fields]] as const) {
+    const sorted = [...list].sort((p, q) => p.name.length - q.name.length || (p.name < q.name ? -1 : 1));
+    for (let i = 0; i < sorted.length; i++) {
+      for (let k = i + 1; k < sorted.length && sorted[k]!.name.length - sorted[i]!.name.length <= 1; k++) {
+        if (nearPair(sorted[i]!.name, sorted[k]!.name)) pairs.push({ kind, a: sorted[i]!, b: sorted[k]! });
+      }
+    }
+  }
+  pairs.sort((p, q) => q.a.c + q.b.c - (p.a.c + p.b.c));
+  const findings: DoctorFinding[] = pairs.slice(0, MAX_NEAR_NAMES).map(({ kind, a, b }) => ({
+    type: "near_names" as const,
+    severity: "info" as const,
+    subject: `${a.name}, ${b.name}`,
+    detail: `two ${kind} names ${a.name.toLowerCase() === b.name.toLowerCase() ? "that differ only in case" : "one letter apart"}: "${a.name}" (${plural(a.c, "record")}) and "${b.name}" (${plural(b.c, "record")}).`,
+    remedy: kind === "type"
+      ? `If they mean the same thing, merge them: manage-types {action: "merge", sources: ["${b.c > a.c ? a.name : b.name}"], target: "${b.c > a.c ? b.name : a.name}"}. If both are meant, nothing to do.`
+      : `If they mean the same thing, move the records holding "${b.c > a.c ? a.name : b.name}" to "${b.c > a.c ? b.name : a.name}" (update each record's fields). If both are meant, nothing to do.`,
+  }));
+  if (pairs.length > MAX_NEAR_NAMES) {
+    findings.push({
+      type: "near_names",
+      severity: "info",
+      subject: "more near names",
+      detail: `${pairs.length - MAX_NEAR_NAMES} more pairs of names one letter apart; the ${MAX_NEAR_NAMES} most used are listed.`,
+      remedy: "Look at the listed pairs first; run doctor again after merging.",
+    });
+  }
+  return findings;
+}
+

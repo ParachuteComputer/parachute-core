@@ -17,7 +17,7 @@ describe("0.9.2 one data type per field: warn", () => {
     expect((await api.put(`/tags/${enc(runId("tb"))}`, { fields: { [field]: { type: "string", enum: ["todo", "done"] } } })).status).toBe(200);
   });
 
-  red("a record with two types whose rules for a field disagree is checked against both, and warned by each it fails", { reason: /^not checked against/, lane: LANE }, async () => {
+  test("a record with two types whose rules for a field disagree is checked against both, and warned by each it fails", async () => {
     const [A, B] = [runId("ta"), runId("tb")];
     const field = `st_${runId("f")}`;
     must((await api.put(`/tags/${enc(A)}`, { fields: { [field]: { type: "string", enum: ["open", "done"] } } })).status === 200, "setup: type A");
@@ -35,7 +35,7 @@ describe("0.9.2 one data type per field: warn", () => {
     }
   });
 
-  red("doctor reports a field no type declares that holds two data types", { reason: /^doctor: no mixed-type finding/, lane: LANE }, async () => {
+  test("doctor reports a field no type declares that holds two data types", async () => {
     const field = `mixed_${runId("f")}`;
     const r = runId("ft");
     must((await writer.post("/notes", { content: "", path: `${r}/n`, metadata: { [field]: 5 } })).status === 201, "setup: the number");
@@ -47,7 +47,7 @@ describe("0.9.2 one data type per field: warn", () => {
     must(said(mine).match(/integer|number/) && said(mine).includes("string"), `the finding doesn't name both data types: ${said(mine).slice(0, 300)}`);
   });
 
-  red("doctor reports a declared field that isn't indexed and holds two data types", { reason: /^doctor: no mixed-type finding/, lane: LANE }, async () => {
+  test("doctor reports a declared field that isn't indexed and holds two data types", async () => {
     const tag = runId("ft");
     const field = `qty_${runId("f")}`;
     must((await api.put(`/tags/${enc(tag)}`, { fields: { [field]: { type: "integer" } } })).status === 200, "setup: the type");

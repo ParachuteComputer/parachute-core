@@ -216,8 +216,10 @@ export function countConformanceViolations(
     if (!status) continue;
     // Keep only violations on a field the PROPOSAL touches (ignore conflicts
     // + violations on inherited/other fields the operator isn't editing).
+    // Only the proposal's own violations (`schema === tag`): 0.9.2 also
+    // checks a record's other types (advisory), which this edit doesn't touch.
     const relevant = status.warnings.filter(
-      (w) => w.reason !== "schema_conflict" && checkedSet.has(w.field),
+      (w) => w.reason !== "schema_conflict" && checkedSet.has(w.field) && w.schema === tag,
     );
     if (relevant.length === 0) continue;
     violating++;

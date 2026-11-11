@@ -39,6 +39,8 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 - `query-notes` / `GET /notes`: `near.direction` (`both` | `inbound` | `outbound`, applied at every hop) for directed graph traversal (#777), with the REST `near` scope now applied before pagination (#778).
 - `near.then` / `near[then][relationship|direction|depth]`: optional second hop that walks from every first-hop note (anchor included), enabling a subtree rollup in one request (#779).
 - `aggregate` now composes with `near` (the neighborhood id set scopes the rollup before every other filter); it remains exclusive with `search`, `cursor` and `semantic` (#779).
+- **A record with two types is checked against both (0.9.2).** When two types on a record declare one field with different rules, the first in the walk still decides the write (and `schema_conflict` names both), but the value is now also checked against each other type's rules, and every type it fails warns with that type as `schema`. Those warnings never block, even when the other type's field is `strict`. A type that redefines a field its own ancestor declares still overrides it, unchecked.
+- **`doctor` finds field shapes (0.9.2):** `mixed_type_field` (a field that isn't indexed, declared or not, holding two data types), `declared_reference_gap` (a field naming records in most of its values that no type declares a `reference`) and `near_names` (two type or field names one letter apart). A tag-scoped run counts only what it may see.
 
 ### Changed
 - Typed-index coercion (v24) now runs when a vault upgrades past v24, not on every open. A field declared `indexed` over notes that already hold another type is reported by `doctor` (`mixed_type_indexed_field`), as before; a restart no longer coerces it (T-412).
