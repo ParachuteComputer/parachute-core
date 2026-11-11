@@ -34,6 +34,7 @@ import {
   verbForVault,
 } from "./account-mcp.ts";
 import { signAccessToken } from "./jwt-sign.ts";
+import { keyLevelOnVault } from "./key-level.ts";
 
 export interface ListedMcpTool {
   name: string;
@@ -297,16 +298,27 @@ export function listVaultModuleTools(ctx: AccountToolContext): Promise<readonly 
 }
 
 function coveredVault(ctx: AccountToolContext, raw: unknown): AccountVaultMeta {
-  if (typeof raw !== "string" || raw.length === 0) {
-    throw new AccountToolError("invalid_vault", "vault is required.");
-  }
   const coverage = resolveCoverage(ctx.db, ctx.principal, installedVaults(ctx));
+  // The refusal teaches: it names the vaults this key reaches and its level on each, so the next call can be right.
+  const reach = coverage.vaults
+    .map((v) => `${v.name} (${keyLevelOnVault(ctx.db, ctx.principal, v.name) ?? "read"})`)
+    .join(", ");
+  const names =
+    reach.length > 0 ? `This connection reaches: ${reach}.` : "This connection reaches no vault.";
+  if (typeof raw !== "string" || raw.length === 0) {
+    throw new AccountToolError(
+      "invalid_vault",
+      `vault is required: name the vault to use. ${names} list-vaults shows them.`,
+      { vaults: coverage.names },
+    );
+  }
   const wanted = raw.toLowerCase();
   const hit = coverage.vaults.find((v) => v.name === wanted);
   if (!hit) {
     throw new AccountToolError(
       "vault_not_covered",
-      `Vault "${raw}" is not among the vaults this connection can reach.`,
+      `Vault "${raw}" is not among the vaults this connection can reach. ${names}`,
+      { vaults: coverage.names },
     );
   }
   return hit;
@@ -336,14 +348,19 @@ async function queryOneVaultMcp(
   vault: AccountVaultMeta,
   args: Record<string, unknown>,
   tool: string,
-): Promise<{ vault: string; notes?: unknown; records?: unknown } | { vault: string; error: string }> {
+): Promise<
+  { vault: string; notes?: unknown; records?: unknown } | { vault: string; error: string }
+> {
   try {
     const result = await postVaultMcp(ctx, vault, "read", "tools/call", {
       name: tool,
       arguments: args,
     });
     // Each vault answers in the words of the tool called: `records` for query-records, `notes` for query-notes.
-    return { vault: vault.name, [tool === "query-records" ? "records" : "notes"]: notesFromMcpResult(result) };
+    return {
+      vault: vault.name,
+      [tool === "query-records" ? "records" : "notes"]: notesFromMcpResult(result),
+    };
   } catch (err) {
     return {
       vault: vault.name,
@@ -366,7 +383,9 @@ async function queryNotesOverlay(
     targets = [coveredVault(ctx, args.vault)];
   }
   const stripped = stripVaultArg(args);
-  const settled = await Promise.allSettled(targets.map((v) => queryOneVaultMcp(ctx, v, stripped, tool)));
+  const settled = await Promise.allSettled(
+    targets.map((v) => queryOneVaultMcp(ctx, v, stripped, tool)),
+  );
   return {
     vaults_queried: targets.map((v) => v.name),
     results: settled.map((s, i) =>
