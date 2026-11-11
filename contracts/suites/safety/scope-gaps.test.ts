@@ -453,6 +453,27 @@ describe("gap 6: changing a tag that a key's scope names is refused without forc
     expect(JSON.stringify((await op.get(`/tags/${enc(ITS)}`)).body?.parent_names ?? null)).toContain(FAM);
   });
 
+  // Review round 2: the store strips a leading `#` or whitespace from a rename's new name and a merge's target, so
+  // `#kept` is `kept`. The guard must read the name the store writes.
+  test("a `#` or a leading space on the name a change writes doesn't get past the guard (REST, /api/types, MCP)", async () => {
+    const key = keyName(keyed);
+    for (const door of ["tags", "types"]) {
+      refused(await op.post(`/${door}/merge`, { sources: [SPARE], target: `#${KEPT}` }), `/api/${door}: merging into #<a key's tag>`, key);
+      refused(await op.post(`/${door}/${enc(SPARE)}/rename`, { new_name: ` ${KEPT}/y` }), `/api/${door}: renaming to " <a key's tag>/y"`, key);
+      refused(await op.post(`/${door}/${enc(SPARE)}/rename`, { new_name: `#${PRIV}/x` }), `/api/${door}: renaming to #<a private tag>/x`);
+    }
+    const c = await mcp(`${s.vaultViaHub}/mcp`, await pass({ level: "admin" }));
+    try {
+      for (const [tool, args] of [["merge-tags", { sources: [SPARE], target: `#${KEPT}` }], ["rename-tag", { old_name: SPARE, new_name: ` #${KEPT}` }]] as const) {
+        const said = await c.call(tool, args).then((r) => JSON.stringify(r), (e) => (e as Error).message);
+        must(/force/.test(said) && said.includes(key), `MCP ${tool} with a decorated name went through without force: ${said.slice(0, 300)}`);
+      }
+    } finally {
+      await c.close();
+    }
+    expect((await rest(s.vaultViaHub, keyed).get(`/notes?tag=${enc(KEPT)}`)).body.length).toBe(1);
+  });
+
   test("REST: rename and delete of a private tag and of the published tag", async () => {
     refused(await op.post(`/tags/${enc(PRIV)}/rename`, { new_name: `${PRIV}x` }), "renaming a private tag");
     refused(await op.del(`/tags/${enc(PRIV)}`), "deleting a private tag");
