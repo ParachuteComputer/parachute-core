@@ -353,14 +353,14 @@ export function attachmentsInstructionBlock(opts: { ticketsEnabled: boolean; rea
 export function connectionReach(level: "read" | "write" | "admin", tags: readonly string[] | null | undefined): string {
   const can =
     level === "admin"
-      ? { whole: ", change its records, and manage its types, settings and keys.", scoped: " It can also change records and manage the vault's types, settings and keys." }
+      ? { whole: ", create, change and delete its records, and manage its types, settings and keys.", scoped: " It can also create, change and delete records and manage the vault's types, settings and keys." }
       : level === "write"
         ? { whole: ", and create, change and delete its records.", scoped: " It can also create, change and delete records." }
         : { whole: ". It can't change anything.", scoped: " It can't change anything." };
   if (!tags || tags.length === 0) return `This connection can read the whole vault${can.whole}`;
   const named = tags.map((t) => `\`${t}\``);
   const list = named.length === 1 ? named[0] : `${named.slice(0, -1).join(", ")} or ${named[named.length - 1]}`;
-  return `This connection can read only the records tagged ${list} (subtags included); the rest of the vault is hidden from it.${can.scoped}`;
+  return `This connection can read only the records tagged ${list} (subtags included); other records are hidden from it.${can.scoped}`;
 }
 
 export function projectionToMarkdown(args: {

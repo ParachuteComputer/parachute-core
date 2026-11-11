@@ -34,14 +34,14 @@ describe("mcp/connect-says", () => {
 
   test("the operator (admin): the whole vault, its records, and its types, settings and keys", async () => {
     expect(reach(await instructions(services().operatorToken))).toBe(
-      "This connection can read the whole vault, change its records, and manage its types, settings and keys.",
+      "This connection can read the whole vault, create, change and delete its records, and manage its types, settings and keys.",
     );
   });
 
   test("a tag-scoped key: only the records under its tags, named", async () => {
     const tag = runId("bakery").toLowerCase().replace(/[^a-z0-9-]/g, "-");
     expect(reach(await instructions(await pass({ level: "read", tags: [tag] })))).toBe(
-      `This connection can read only the records tagged \`${tag}\` (subtags included); the rest of the vault is hidden from it. It can't change anything.`,
+      `This connection can read only the records tagged \`${tag}\` (subtags included); other records are hidden from it. It can't change anything.`,
     );
   });
 
