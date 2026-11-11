@@ -23,6 +23,8 @@ import {
 import {
   REFRESH_GRACE_MS,
   findTokenRowByJti,
+  linkRotation,
+  revokeFamily,
   signRefreshToken,
   validateAccessToken,
 } from "../jwt-sign.ts";
@@ -12355,6 +12357,91 @@ describe("account-door consent per vault (T-446)", () => {
       // And the earlier refresh token is over.
       const stale = await refresh(db, reg.client.clientId, tokens.refresh_token);
       expect(stale.status).toBe(400);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("SECURITY: a refresh in flight when a narrower choice ends its family gets 400 and leaves no live row", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const session = await friendOnWorkReadOtherWrite(db);
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"], status: "approved" });
+      const first = makePkce();
+      const wide = await post(db, session.id, reg.client.clientId, first.challenge, [["account_vault_levels", "1"], ["vault_level:work", "read"], ["vault_level:other", "write"]]);
+      const tokens = await redeemWithRefresh(db, wide.headers.get("location")!, reg.client.clientId, first.verifier);
+      const familyId = db.query<{ family_id: string }, []>("SELECT family_id FROM tokens WHERE refresh_token_hash IS NOT NULL AND revoked_at IS NULL").get()!.family_id;
+      // The refresh reads its row, then asks the clock (first while signing): the narrower consent lands right there.
+      let landed = false;
+      const res = await handleToken(
+        db,
+        new Request(`${ISSUER}/oauth/token`, {
+          method: "POST",
+          body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: tokens.refresh_token, client_id: reg.client.clientId }),
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+        }),
+        {
+          ...deps,
+          now: () => {
+            const t = new Date();
+            if (!landed) {
+              landed = true;
+              revokeFamily(db, familyId, t); // what the narrower consent does to this family
+            }
+            return t;
+          },
+        },
+      );
+      expect(landed).toBe(true);
+      expect(res.status, await res.clone().text()).toBe(400);
+      const live = db
+        .query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM tokens WHERE family_id = ? AND revoked_at IS NULL")
+        .get(familyId);
+      expect(live?.n).toBe(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("a refresh that loses the race to a sibling refresh of the same token still converges (grace), one live row", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const session = await friendOnWorkReadOtherWrite(db);
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"], status: "approved" });
+      const first = makePkce();
+      const res0 = await post(db, session.id, reg.client.clientId, first.challenge, [["account_vault_levels", "1"], ["vault_level:other", "read"]]);
+      const tokens = await redeemWithRefresh(db, res0.headers.get("location")!, reg.client.clientId, first.verifier);
+      const row = db
+        .query<{ jti: string; family_id: string; user_id: string; scopes: string }, []>("SELECT jti, family_id, user_id, scopes FROM tokens WHERE refresh_token_hash IS NOT NULL AND revoked_at IS NULL")
+        .get()!;
+      // A sibling refresh of the same token commits while this one is signing.
+      let landed = false;
+      const res = await handleToken(
+        db,
+        new Request(`${ISSUER}/oauth/token`, {
+          method: "POST",
+          body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: tokens.refresh_token, client_id: reg.client.clientId }),
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+        }),
+        {
+          ...deps,
+          now: () => {
+            const t = new Date();
+            if (!landed) {
+              landed = true;
+              db.prepare("UPDATE tokens SET revoked_at = ? WHERE jti = ?").run(t.toISOString(), row.jti);
+              signRefreshToken(db, { jti: "sibling-tip", userId: row.user_id, clientId: reg.client.clientId, scopes: row.scopes.split(" "), familyId: row.family_id });
+              linkRotation(db, row.jti, "sibling-tip");
+            }
+            return t;
+          },
+        },
+      );
+      expect(res.status, await res.clone().text()).toBe(200);
+      const live = db
+        .query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM tokens WHERE family_id = ? AND revoked_at IS NULL AND refresh_token_hash IS NOT NULL")
+        .get(row.family_id);
+      expect(live?.n).toBe(1);
     } finally {
       cleanup();
     }

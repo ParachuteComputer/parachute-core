@@ -3274,56 +3274,7 @@ async function handleTokenRefresh(
   }
   const refreshUserId: string = row.userId;
   const now = deps.now?.() ?? new Date();
-  if (row.revokedAt) {
-    // Replay of an already-rotated refresh token. Per RFC 6819 §5.2.2.3 the
-    // working assumption is theft — the legitimate client received a new
-    // refresh token at the prior rotation, so anyone presenting the old one
-    // either lost a race or stole it (the case we must defend against).
-    //
-    // ONE-GENERATION GRACE WINDOW (hub#685). Benign concurrent/retried
-    // refreshes — a multi-tab SPA, a bfcache/stale-tab resume, a network
-    // retry — legitimately present the *just-rotated* token a moment after
-    // it rotated. To avoid forcing those real clients to re-login, we let
-    // through the SINGLE immediately-previous token, and ONLY it, for
-    // ~REFRESH_GRACE_MS. The grace case rotates the live tip and converges
-    // the replaying client onto the current token; it does NOT mint a
-    // second live token into a forked lineage.
-    //
-    // The window is narrow ON PURPOSE — both conditions must hold:
-    //   (a) WINDOW: this row was revoked within the last REFRESH_GRACE_MS.
-    //   (b) IMMEDIATE-PREDECESSOR: this row's recorded successor (rotated_to)
-    //       IS the family's single live refresh row. That proves it's the
-    //       direct parent of the current tip — not an older ancestor (whose
-    //       successor is itself revoked) and not a sibling fork.
-    //
-    // HARD SECURITY INVARIANT: anything outside (a)∧(b) — an OLDER/ancestor
-    // token, any replay past the window, a family with zero or multiple live
-    // tips (already a theft-revoked or forked family) — falls through to the
-    // unchanged zero-tolerance path: revokeFamily + invalid_grant. The grace
-    // window NEVER tolerates more than the one immediate predecessor, and
-    // never beyond REFRESH_GRACE_MS.
-    const live = liveFamilyRefreshRows(db, row.familyId, now);
-    const revokedAtMs = new Date(row.revokedAt).getTime();
-    const withinWindow =
-      now.getTime() - revokedAtMs <= REFRESH_GRACE_MS && now.getTime() >= revokedAtMs;
-    const tip = live.length === 1 ? live[0]! : null;
-    const isImmediatePredecessor =
-      tip !== null && row.rotatedTo !== null && row.rotatedTo === tip.jti;
-    if (withinWindow && isImmediatePredecessor && tip) {
-      // Benign replay of the immediate predecessor. Rotate the live tip and
-      // hand the client the new pair — it converges on the current lineage
-      // (single live token preserved), no family revocation. Equivalent to
-      // what the client would have received had it presented the tip itself.
-      return await rotateAndRespond(db, tip, deps, now, requestResource);
-    }
-    // Genuine theft (or a too-late replay): revoke every descendant so the
-    // attacker can't keep refreshing, and force re-authorization.
-    revokeFamily(db, row.familyId, now);
-    return jsonResponse(
-      { error: "invalid_grant", error_description: "refresh_token revoked" },
-      400,
-    );
-  }
+  if (row.revokedAt) return await refreshRevokedRow(db, row, deps, now, requestResource);
   if (now.getTime() > new Date(row.expiresAt).getTime()) {
     return jsonResponse(
       { error: "invalid_grant", error_description: "refresh_token expired" },
@@ -3332,6 +3283,70 @@ async function handleTokenRefresh(
   }
   return await rotateAndRespond(db, row, deps, now, requestResource);
 }
+
+/**
+ * A refresh token presented after its row was revoked: the one-generation grace window, else reuse detection
+ * (revoke the family, invalid_grant). Also where a refresh lands that lost the race to its own rotation.
+ */
+async function refreshRevokedRow(
+  db: Database,
+  row: RefreshTokenRow,
+  deps: OAuthDeps,
+  now: Date,
+  requestResource: string | null,
+): Promise<Response> {
+  // Replay of an already-rotated refresh token. Per RFC 6819 §5.2.2.3 the
+  // working assumption is theft — the legitimate client received a new
+  // refresh token at the prior rotation, so anyone presenting the old one
+  // either lost a race or stole it (the case we must defend against).
+  //
+  // ONE-GENERATION GRACE WINDOW (hub#685). Benign concurrent/retried
+  // refreshes — a multi-tab SPA, a bfcache/stale-tab resume, a network
+  // retry — legitimately present the *just-rotated* token a moment after
+  // it rotated. To avoid forcing those real clients to re-login, we let
+  // through the SINGLE immediately-previous token, and ONLY it, for
+  // ~REFRESH_GRACE_MS. The grace case rotates the live tip and converges
+  // the replaying client onto the current token; it does NOT mint a
+  // second live token into a forked lineage.
+  //
+  // The window is narrow ON PURPOSE — both conditions must hold:
+  //   (a) WINDOW: this row was revoked within the last REFRESH_GRACE_MS.
+  //   (b) IMMEDIATE-PREDECESSOR: this row's recorded successor (rotated_to)
+  //       IS the family's single live refresh row. That proves it's the
+  //       direct parent of the current tip — not an older ancestor (whose
+  //       successor is itself revoked) and not a sibling fork.
+  //
+  // HARD SECURITY INVARIANT: anything outside (a)∧(b) — an OLDER/ancestor
+  // token, any replay past the window, a family with zero or multiple live
+  // tips (already a theft-revoked or forked family) — falls through to the
+  // unchanged zero-tolerance path: revokeFamily + invalid_grant. The grace
+  // window NEVER tolerates more than the one immediate predecessor, and
+  // never beyond REFRESH_GRACE_MS.
+  const live = liveFamilyRefreshRows(db, row.familyId, now);
+  const revokedAtMs = new Date(row.revokedAt!).getTime(); // both callers pass a revoked row
+  const withinWindow =
+    now.getTime() - revokedAtMs <= REFRESH_GRACE_MS && now.getTime() >= revokedAtMs;
+  const tip = live.length === 1 ? live[0]! : null;
+  const isImmediatePredecessor =
+    tip !== null && row.rotatedTo !== null && row.rotatedTo === tip.jti;
+  if (withinWindow && isImmediatePredecessor && tip) {
+    // Benign replay of the immediate predecessor. Rotate the live tip and
+    // hand the client the new pair — it converges on the current lineage
+    // (single live token preserved), no family revocation. Equivalent to
+    // what the client would have received had it presented the tip itself.
+    return await rotateAndRespond(db, tip, deps, now, requestResource, false);
+  }
+  // Genuine theft (or a too-late replay): revoke every descendant so the
+  // attacker can't keep refreshing, and force re-authorization.
+  revokeFamily(db, row.familyId, now);
+  return jsonResponse(
+    { error: "invalid_grant", error_description: "refresh_token revoked" },
+    400,
+  );
+}
+
+/** The refresh row stopped being live between its read and the rotation; the transaction rolls back. */
+class RefreshRowNotLiveError extends Error {}
 
 /**
  * Rotate a single live refresh-token row: revoke it, mint + insert a new
@@ -3350,6 +3365,8 @@ async function rotateAndRespond(
   deps: OAuthDeps,
   now: Date,
   requestResource: string | null,
+  /** A row that stopped being live before it rotated goes through the replay path once (not again from there). */
+  replayIfNotLive = true,
 ): Promise<Response> {
   const refreshUserId = row.userId ?? "";
   // Mint the access token *before* opening the rotation transaction. JWT
@@ -3399,10 +3416,13 @@ async function rotateAndRespond(
     let refresh: ReturnType<typeof signRefreshToken>;
     try {
       refresh = db.transaction(() => {
-        db.prepare("UPDATE tokens SET revoked_at = ? WHERE jti = ?").run(
-          now.toISOString(),
-          row.jti,
-        );
+        // Only a row that is still live rotates. The row was read before the await above, and in that gap a
+        // narrower consent may have revoked its family (or a sibling refresh rotated it). Then mint nothing
+        // here: no new refresh row into an ended family (the catch below decides as for a replay).
+        const rotated = db
+          .prepare("UPDATE tokens SET revoked_at = ? WHERE jti = ? AND revoked_at IS NULL")
+          .run(now.toISOString(), row.jti);
+        if (rotated.changes === 0) throw new RefreshRowNotLiveError();
         const minted = signRefreshToken(db, {
           jti: access.jti,
           userId: refreshUserId,
@@ -3423,6 +3443,13 @@ async function rotateAndRespond(
       // RFC 6749 §5.2 — instead of letting the SQLite error bubble as a 500
       // (#108). The transaction is already rolled back at this point, so
       // the row's revoked_at is unchanged for the losing request.
+      if (err instanceof RefreshRowNotLiveError) {
+        // Nothing was written. Decide as for a replay of the now-revoked row: a sibling's rotation within the
+        // grace window converges on its tip; a row whose family was ended (no successor) gets invalid_grant.
+        const current = replayIfNotLive ? findTokenRowByJti(db, row.jti) : null;
+        if (current?.revokedAt) return await refreshRevokedRow(db, current, deps, now, requestResource);
+        return jsonResponse({ error: "invalid_grant", error_description: "refresh_token revoked" }, 400);
+      }
       if (err instanceof RefreshTokenInsertError) {
         return jsonResponse(
           { error: "invalid_grant", error_description: "refresh_token rotation conflict" },
