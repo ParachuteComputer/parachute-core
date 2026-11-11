@@ -27,7 +27,8 @@ most tests stand at the door and call it.
    parser, the merge of field changes, scope parsing. Tests that restate the code or check a mock was called get
    deleted.
 
-`v1/` holds contracts for decided behaviour that isn't built yet, marked failing. Building a feature means making one
+`v1/` holds contracts for decided behaviour that isn't built yet, marked failing (`door-v1/` holds the ones that
+run on a door). Building a feature means making one
 of them pass, then moving it to `today/`.
 
 ## 3. How a change lands

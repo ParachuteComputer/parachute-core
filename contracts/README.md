@@ -188,6 +188,25 @@ deleted, a note the export format can't carry).
 | `door/exit.test.ts` | The export: every note, type and file; the bytes of a fixed made-up note are compared across doors (a box's come from its own command). |
 | `door/records.test.ts`, `door/keys.test.ts` | 0.9 doors: the record door over MCP and REST. 0.9.1 doors: the owner's key (NIP-98), named app keys that stop when revoked. |
 
+### 0.9.2: the dial works (`suites/v092/`)
+
+Door contracts for ROADMAP 0.9.2, written before the code, one file per roadmap row. They use the door suite's
+client (`door/_door.ts`) and run on the box with `bun run doors -- --doors box suites/v092` (CI's `doors` job runs
+them on a second box from the same build, after the door suite). Each is `red()` with the reason it fails today; the lane that makes one pass removes its
+`red()` in the same pull request. They record no fingerprint, so the kept box fingerprint doesn't move. Wire shapes
+not yet decided are written at the top of each file, marked proposed.
+
+| File | What it holds |
+|---|---|
+| `v092/query.test.ts` | Filter and sort any field: every operator on a field that isn't indexed gives its indexed twin's rows, with a warning that it scanned (REST and MCP); a field no type declares; a word that is only in a field value is found by search. |
+| `v092/schema-change.test.ts` | A retype that would strand records is refused and says how many; a dry-run migrate over REST (admin) and MCP says what would change and writes nothing. |
+| `v092/field-types.test.ts` | A record with two types is checked against both; `doctor` reports a field holding two data types, declared or not. |
+| `v092/teaching.test.ts` | The nearest existing name on a new type or field (a warning); `vault-info`'s tag map capped (700 types fit in about 4,000 tokens); manage-types' own schema names `reference`, `required`, `strict`, `cardinality`; search says it needs every word. |
+| `v092/doctor.test.ts` | `doctor` finds a field that names records but isn't a declared reference, and names one letter apart; it counts indexed fields against 88, and the 89th is refused with what to prune. |
+
+`suites/bench/query-092.bench.ts` is the 0.9.2 bench, not a contract: made-up records at `BENCH_N` on the box, every
+operator, search, a type PUT and a retype, timed (`BENCH_N=94000 bun run doors -- --doors box suites/bench/query-092.bench.ts`).
+
 ## The contracts
 
 | File | What it holds |
@@ -213,10 +232,13 @@ deleted, a note the export format can't carry).
 | `lifecycle/identity.test.ts` | **The new name** (PLAN §2.5; the command `parachute`, Aaron 10-27): `@openparachute/core`, bins `parachute` and `parachute-core`, with `parachute-vault` inside the folder only; the vault serve starts is core's own even with the old one first on PATH (green on the core build); installing it with `parachute install --prefix` links `parachute` and `parachute-core`, leaves the old global packages byte-identical, and names `parachute-core` when the old hub's `parachute` comes first on PATH (green from lanes D and R). |
 | `v1/sharing.test.ts` | Grants (who × what × how much). A pass alone grants nothing. Grants add up. Private notes are the exception inside a shared page. Revoking takes effect at once. |
 | `v1/connector-attribution.test.ts` | When an app writes for a person, the note names both. |
+| `door-v1/*.test.ts` | **1.0 grants, as door contracts** (decided, not built; [`docs/SPEC-1.0-grants.md`](../docs/SPEC-1.0-grants.md)). An owner-signed grant opens named types and verbs to one key; expiry and a signed revoke; members, agents, applets and services; the link statement; what a narrow grant must never learn; what the export carries. Each is `red()` and runs on any door: `bun run doors -- --doors box,personal suites/door-v1`. See [`suites/door-v1/README.md`](suites/door-v1/README.md). |
 
 ### today and v1
 
 - **`today`** contracts must pass against the pins. CI runs them on every push and pull request.
+- **`door-v1`** is the same idea for behaviour that has to be shown on more than one door: door contracts wrapped
+  in `red()`, run by the door harness. CI runs them on the box.
 - **`v1`** contracts describe behaviour Aaron has decided for v1 that today's code lacks. They are `test.failing`:
   green while the behaviour is missing, red the day it works. That red is the signal to move the test to
   `today/` in its own pull request. `V1_SHOW=1 bun run v1` shows why each fails today. Each v1 file also has a
