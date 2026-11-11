@@ -12403,6 +12403,46 @@ describe("account-door consent per vault (T-446)", () => {
     }
   });
 
+  test("SECURITY: an unredeemed code from the wider consent doesn't redeem after a narrower one (or all-none)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const session = await friendOnWorkReadOtherWrite(db);
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"], status: "approved" });
+      const wideLevels: [string, string][] = [["account_vault_levels", "1"], ["vault_level:work", "read"], ["vault_level:other", "write"]];
+      const codeOf = (res: Response) => new URL(res.headers.get("location")!).searchParams.get("code")!;
+      const redeemCode = (code: string, verifier: string) =>
+        handleToken(
+          db,
+          new Request(`${ISSUER}/oauth/token`, {
+            method: "POST",
+            body: new URLSearchParams({ grant_type: "authorization_code", code, client_id: reg.client.clientId, redirect_uri: "https://app.example/cb", code_verifier: verifier }),
+            headers: { "content-type": "application/x-www-form-urlencoded" },
+          }),
+          deps,
+        );
+      // An equal choice leaves the earlier code redeemable.
+      const a0 = makePkce();
+      const codeA0 = codeOf(await post(db, session.id, reg.client.clientId, a0.challenge, wideLevels));
+      await post(db, session.id, reg.client.clientId, makePkce().challenge, wideLevels, "account:vaults account:self:read");
+      expect((await redeemCode(codeA0, a0.verifier)).status).toBe(200);
+      // A narrower choice: the wide code A, still unredeemed, is refused.
+      const a = makePkce();
+      const codeA = codeOf(await post(db, session.id, reg.client.clientId, a.challenge, wideLevels));
+      const b = makePkce();
+      const narrow = await post(db, session.id, reg.client.clientId, b.challenge, [["account_vault_levels", "1"], ["vault_level:other", "read"]], "account:vaults account:self:read");
+      const stale = await redeemCode(codeA, a.verifier);
+      expect(stale.status, await stale.clone().text()).toBe(400);
+      expect(await redeem(db, narrow.headers.get("location")!, reg.client.clientId, b.verifier)).toBe("account:self:vaults:other:read");
+      // All-none: an unredeemed code from before is refused too.
+      const c = makePkce();
+      const codeC = codeOf(await post(db, session.id, reg.client.clientId, c.challenge, [["account_vault_levels", "1"], ["vault_level:other", "read"]]));
+      await post(db, session.id, reg.client.clientId, makePkce().challenge, [["account_vault_levels", "1"], ["vault_level:work", "none"], ["vault_level:other", "none"]], "account:vaults account:self:read");
+      expect((await redeemCode(codeC, c.verifier)).status).toBe(400);
+    } finally {
+      cleanup();
+    }
+  });
+
   test("a refresh that loses the race to a sibling refresh of the same token still converges (grace), one live row", async () => {
     const { db, cleanup } = await makeDb();
     try {

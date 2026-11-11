@@ -1812,7 +1812,8 @@ function isAccountDoorChoiceScope(scope: string): boolean {
  * A later per-vault choice replaces the earlier one in the grant, but a refresh token re-mints from its own row's
  * scopes. So when the new choice removes or lowers any account-door scope a live refresh family of this (user, client)
  * carries (a vault dropped, write → read, or the level-less grant), that whole family is revoked: the app has to use
- * the new consent's tokens. A family the new choice covers on every vault (equal or wider) is left alone.
+ * the new consent's tokens. The (user, client)'s unredeemed auth codes that carry such a scope are deleted, so none
+ * redeems into a new wide family. A family or code the new choice covers on every vault (equal or wider) is left alone.
  */
 function revokeFamiliesWiderThanChoice(db: Database, userId: string, clientId: string, choice: readonly string[], now: Date): void {
   const chosen = new Map<string, PerVaultLevel>();
@@ -1831,9 +1832,19 @@ function revokeFamiliesWiderThanChoice(db: Database, userId: string, clientId: s
       "SELECT family_id, scopes FROM tokens WHERE user_id = ? AND client_id = ? AND revoked_at IS NULL AND refresh_token_hash IS NOT NULL AND expires_at > ?",
     )
     .all(userId, clientId, now.toISOString());
+  const wider = (scopes: string): boolean =>
+    scopes.split(" ").some((s) => s.length > 0 && isAccountDoorChoiceScope(s) && !covered(s));
   for (const row of rows) {
-    const scopes = row.scopes.split(" ").filter((s) => s.length > 0);
-    if (scopes.some((s) => isAccountDoorChoiceScope(s) && !covered(s))) revokeFamily(db, row.family_id, now);
+    if (wider(row.scopes)) revokeFamily(db, row.family_id, now);
+  }
+  // An unredeemed code from the earlier consent would mint a new family at the old levels (60 s TTL): drop it too.
+  const codes = db
+    .query<{ code: string; scopes: string }, [string, string]>(
+      "SELECT code, scopes FROM auth_codes WHERE user_id = ? AND client_id = ? AND used_at IS NULL",
+    )
+    .all(userId, clientId);
+  for (const c of codes) {
+    if (wider(c.scopes)) db.prepare("DELETE FROM auth_codes WHERE code = ?").run(c.code);
   }
 }
 
@@ -2157,8 +2168,8 @@ function issueAuthCodeRedirect(
   // skip-consent re-entry can never widen back to an un-held verb.
   // T-446: a per-vault account-door grant is the person's whole choice of vaults and levels. It replaces the earlier
   // per-vault and level-less account-door scopes instead of adding to them, so a narrower choice stays narrower.
-  // A refresh token from the earlier consent would keep the old levels, so the families the new choice narrows are
-  // revoked with it (revokeFamiliesWiderThanChoice).
+  // A refresh token or unredeemed code from the earlier consent would keep the old levels, so the families the new
+  // choice narrows are revoked with it and those codes deleted (revokeFamiliesWiderThanChoice).
   const perVaultChoice = dedupedScopes.some((s) => parsePerVaultScope(s) !== null);
   const grantNow = deps.now?.() ?? new Date();
   if (perVaultChoice) revokeFamiliesWiderThanChoice(db, userId, params.clientId, dedupedScopes, grantNow);
@@ -2709,7 +2720,7 @@ async function handleConsentSubmit(
     if ("error" in applied) return htmlError("Vault access not allowed", `vault_scope_mismatch: ${applied.error}.`, 400);
     if ("none" in applied) {
       // Every vault at none is a choice too: drop the earlier account-door choice from the grant and end its refresh
-      // families, so the next plain ask shows the page instead of replaying the old levels.
+      // families and unredeemed codes, so the next plain ask shows the page instead of replaying the old levels.
       const noneAt = deps.now?.() ?? new Date();
       revokeFamiliesWiderThanChoice(db, session.userId, params.clientId, [], noneAt);
       if (findGrant(db, session.userId, params.clientId)) {
