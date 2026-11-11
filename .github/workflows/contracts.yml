@@ -11,7 +11,8 @@
 #              lifecycle/upgrade: the 0.8 → 0.9 step on a home and its rollback.
 #   doors      the door contracts (suites/door) on the box this job builds: one suite for every way of running
 #              Parachute. The box's fingerprint must be the one kept in suites/door/golden, which parachute-cloud's
-#              CI compares its own door with. Then the move tool's own tests (tools/move).
+#              CI compares its own door with. Then the 0.9.2 contracts (suites/v092, red until built) on the same
+#              box, and the move tool's own tests (tools/move).
 #   prism      Benjamin's compatibility suite, unchanged, against the same build (the Nov 9 gate, PLAN §3.1)
 #   npm        the npm package (release/npm.ts) packed from the same build, installed with `npm i -g` and
 #              `bun add -g`, and his suite on the npm install; keeps the linux-x64 tarball and the .tgz as artifacts
@@ -182,10 +183,15 @@ jobs:
           CANDIDATE_DIR: ${{ runner.temp }}/build/candidate
           DOOR_RESULTS: ${{ runner.temp }}/doors
         run: bun run doors -- --doors box --check-golden
+      - name: the 0.9.2 contracts on the same box (suites/v092; each red() until its lane lands)
+        env:
+          CANDIDATE_DIR: ${{ runner.temp }}/build/candidate
+          DOOR_RESULTS: ${{ runner.temp }}/doors-v092
+        run: bun run doors -- --doors box suites/v092
       - name: what failed (the box's output and the comparison)
         if: failure()
         shell: bash
-        run: tail -n 120 "$RUNNER_TEMP"/doors/*/output.txt || true
+        run: tail -n 120 "$RUNNER_TEMP"/doors/*/output.txt "$RUNNER_TEMP"/doors-v092/*/output.txt || true
       - name: the move tool (tar, digest, what a comparison may excuse)
         working-directory: tools/move
         run: bun install --frozen-lockfile && bun run typecheck && bun test
