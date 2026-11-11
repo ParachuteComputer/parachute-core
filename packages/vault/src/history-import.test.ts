@@ -8,8 +8,9 @@ import { spawnSync } from "node:child_process";
 import { stageArchive, runHistoryImport, type ImportManifest, normalizeHistorySelections, type HistorySelections } from "./history-import.ts";
 import { writeVaultConfig, writeGlobalConfig, vaultDbPath } from "./config.ts";
 import { getVaultStore, clearVaultStoreCache } from "./vault-store.ts";
-import { getImportedVersion } from "../core/src/history-import.ts";
-import { historyMirrorStatePath, readHistoryMirrorPhase, mirrorConfigPath } from "./mirror-config.ts";
+import { getImportedVersion, canonicalJson } from "../core/src/history-import.ts";
+import { hashContent } from "../core/src/history.ts";
+import { historyMirrorStatePath, historyImportRecoveryPath, readHistoryMirrorPhase, mirrorConfigPath } from "./mirror-config.ts";
 const noteId = "01M2KT1VQBHNZ99V5KSGXP6VSE";
 for (const id of ["legacy:abc123", "2020-01-02-03-04-05", "shortid"]) {
   for (const sidecar of [false, true]) test(`legacy ID staging: ${id}, sidecar=${sidecar}`, () => {
@@ -483,3 +484,311 @@ test("mirror commits keep a hand-written relative attachment link as written (T-
     expect(rows.map(r => JSON.parse(r.row_json).content)).toEqual([body]);
   } finally { db.close(); rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("a mirror commit from the old exporter, with a string plain YAML refuses, is an observation and not a source issue", () => {
+  const dir = mkdtempSync(join(tmpdir(), "import-old-exporter-")), stage = new Database(":memory:");
+  try {
+    const repo = repoAt(join(dir, "repo"));
+    // Before FLOW_QUOTING_SINCE the exporter wrote this value as it stood: a quote that closes mid-line.
+    writeFileSync(join(repo, "entry.md"), `---\nid: ${noteId}\npath: entry\nmetadata:\n  saying: 'made up' and then some\n  kind: example\ncreated_at: 2026-01-01T00:00:00Z\n---\nbody\r\nkept`);
+    git(repo, "add", "."); git(repo, "commit", "-m", "old exporter");
+    stageArchive(repo, git(repo, "rev-parse", "HEAD"), stage);
+    expect(stage.query("SELECT * FROM issues").all()).toEqual([]);
+    expect(stage.query("SELECT * FROM quarantine").all()).toEqual([]);
+    const rows = stage.query("SELECT note_id, row_json FROM observations").all() as { note_id: string; row_json: string }[];
+    expect(rows.map(r => r.note_id)).toEqual([noteId]);
+    const row = JSON.parse(rows[0]!.row_json);
+    expect(row.metadata).toEqual({ saying: "'made up' and then some", kind: "example" });
+    expect(row.content).toBe("body\r\nkept");
+  } finally { stage.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("the walk's tree-entry bound holds unless plan raises it, and a raised bound is part of the run", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "import-bound-")), saved = process.env.PARACHUTE_HOME;
+  process.env.PARACHUTE_HOME = join(dir, "home");
+  try {
+    const probe = Bun.serve({ port: 0, fetch: () => new Response() }); const port = probe.port!; probe.stop(true);
+    writeGlobalConfig({ port });
+    writeVaultConfig({ name: "test", api_keys: [], created_at: new Date().toISOString() });
+    const store = getVaultStore("test"); const note = await store.createNote("native"); clearVaultStoreCache();
+    const repo = repoAt(join(dir, "repo")); commit(repo, "one", note.id); commit(repo, "two", note.id); const tip = commit(repo, "three", note.id);
+    const plan = (name: string, ...extra: string[]) => runHistoryImport(["plan", "--vault", "test", "--source", repo, "--through", tip, "--output", join(dir, name), ...extra]) as Promise<ImportManifest>;
+    // Three commits of one file are three tree entries: a bound of two refuses, loudly, and writes no manifest.
+    await expect(plan("low.json", "--max-tree-entries", "2")).rejects.toThrow("Archive object limit exceeded");
+    const usual = await plan("usual.json");
+    const raised = await plan("raised.json", "--max-tree-entries", "20000000");
+    expect(usual.max_tree_entries).toBeUndefined();
+    expect(raised.max_tree_entries).toBe(20_000_000);
+    expect(raised.notes.map(n => n.state_digest)).toEqual(usual.notes.map(n => n.state_digest));
+    expect(raised.options_digest).not.toBe(usual.options_digest);
+    for (const bad of ["0", "-1", "1.5", "many", "1000000001"]) await expect(plan(`bad-${bad}.json`, "--max-tree-entries", bad)).rejects.toThrow("--max-tree-entries");
+    await expect(runHistoryImport(["apply", "--vault", "test", "--manifest", join(dir, "usual.json"), "--archive", join(dir, "a.bundle"), "--max-tree-entries", "5"])).rejects.toThrow("only valid for plan/prepare");
+  } finally { clearVaultStoreCache(); if (saved === undefined) delete process.env.PARACHUTE_HOME; else process.env.PARACHUTE_HOME = saved; rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("one range entry stands for every tree that holds exactly its candidate set; a tree inside the range that differs quarantines", () => {
+  const dir = mkdtempSync(join(tmpdir(), "selection-range-"));
+  try {
+    const repo = repoAt(join(dir, "repo")), other = "01M2KT4GXMQDNB8ZFXY05MHT6B";
+    commit(repo, "old", noteId, "old.md");
+    const first = commit(repo, "moved", noteId, "new.md");            // old.md stays behind: a duplicate from here on
+    commit(repo, "elsewhere one", other, "other.md");
+    const last = commit(repo, "elsewhere two", other, "other.md");    // three trees, the same pair of files
+    const range = (through: string) => ({ ...selection(repo, first, "new.md", "old.md"), through });
+    const each = git(repo, "log", "--first-parent", "--reverse", "--format=%H", `${first}~1..${last}`).split("\n").map(c => selection(repo, c, "new.md", "old.md"));
+    const perCommit = selectedStage(repo, last, selectionFile(repo, last, each));
+    const ranged = selectedStage(repo, last, selectionFile(repo, last, [range(last)]));
+    expect(each).toHaveLength(3);
+    expect(perCommit.quarantine).toEqual([]);
+    expect(ranged).toEqual(perCommit);
+    expect(ranged.rows.filter(r => r.content === "moved")).toHaveLength(1);
+    // A range that stops one tree early leaves the last duplicate tree unlisted: the whole note quarantines.
+    const short = selectedStage(repo, last, selectionFile(repo, last, [range(git(repo, "rev-parse", `${last}~1`))]));
+    expect(short.quarantine).toEqual([{ note_id: noteId, reason: "duplicate_id" }]);
+    expect(short.failures).toEqual([{ note_id: noteId, commit_id: last, reason: "missing_selection" }]);
+    // The selected file changes inside the range: that tree's set is not the entry's, so it is refused there.
+    const changed = commit(repo, "moved, then edited", noteId, "new.md");
+    const stale = selectedStage(repo, changed, selectionFile(repo, changed, [range(changed)]));
+    expect(stale.quarantine).toEqual([{ note_id: noteId, reason: "duplicate_id" }]);
+    expect(stale.failures).toEqual([{ note_id: noteId, commit_id: changed, reason: "candidate_set_mismatch" }]);
+    // Two entries, each exact, cover it.
+    const both = selectedStage(repo, changed, selectionFile(repo, changed, [range(last), selection(repo, changed, "new.md", "old.md")]));
+    expect(both.quarantine).toEqual([]);
+    expect(both.rows.map(r => r.content)).toContain("moved, then edited");
+    expect(() => selectedStage(repo, changed, selectionFile(repo, changed, [range(last), selection(repo, last, "new.md", "old.md")]))).toThrow("overlap");
+    expect(() => selectedStage(repo, changed, selectionFile(repo, changed, [{ ...selection(repo, last, "new.md", "old.md"), through: first }]))).toThrow("ends before it starts");
+    expect(() => normalizeHistorySelections(selectionFile(repo, changed, [{ ...range(last), through: "not-a-commit" }]))).toThrow("range end");
+    // A range of one tree is the plain entry.
+    expect(normalizeHistorySelections(selectionFile(repo, changed, [range(first)]))).toEqual(normalizeHistorySelections(selectionFile(repo, changed, [selection(repo, first, "new.md", "old.md")])));
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}, 30_000);
+
+test("an audited ignore list passes over exactly its files; anything else stays a source issue", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "import-ignore-")), saved = process.env.PARACHUTE_HOME;
+  process.env.PARACHUTE_HOME = join(dir, "home");
+  try {
+    const probe = Bun.serve({ port: 0, fetch: () => new Response() }); const port = probe.port!; probe.stop(true);
+    writeGlobalConfig({ port });
+    writeVaultConfig({ name: "test", api_keys: [], created_at: new Date().toISOString() });
+    const store = getVaultStore("test"); const note = await store.createNote("native"); clearVaultStoreCache();
+    const repo = repoAt(join(dir, "repo"));
+    writeFileSync(join(repo, "left-behind.txt"), "a made-up file no note owns");
+    commit(repo, "one", note.id); const tip = commit(repo, "two", note.id);
+    const ignoreFile = (files: unknown[]) => { const { selections: _, ...header } = selectionFile(repo, tip, []); return { ...header, files }; };
+    const stage = (ignored?: unknown) => {
+      const db = new Database(":memory:");
+      try { const staged = stageArchive(repo, tip, db, null, undefined, ignored as never); return { staged, issues: db.query("SELECT path, reason FROM issues").all() }; } finally { db.close(); }
+    };
+    const stray = { ...pin(repo, tip, "left-behind.txt"), reason: "Old copy of a moved note; never changes" };
+    expect(stage().issues).toEqual([{ path: "left-behind.txt", reason: "unclassified_file" }, { path: "left-behind.txt", reason: "unclassified_file" }]);
+    const passed = stage(ignoreFile([stray]));
+    expect(passed.issues).toEqual([]);
+    expect(passed.staged.ignored_entries).toBe(2);
+    // Same path, other bytes: not the audited file.
+    expect(() => stage(ignoreFile([{ ...stray, blob: "0".repeat(40) }]))).toThrow("matches no file");
+    expect(() => stage(ignoreFile([stray, { ...stray, git_path: "never-there.txt" }]))).toThrow("matches no file");
+    expect(() => stage(ignoreFile([{ ...stray, reason: " " }]))).toThrow("audit reasons");
+    expect(() => stage(ignoreFile([stray, stray]))).toThrow("Duplicate ignore-files entry");
+    expect(() => stage({ ...ignoreFile([stray]), tip: "0".repeat(40) })).toThrow("tip differs");
+    // Through the CLI: the list is embedded in the manifest and is part of the run.
+    const listPath = join(dir, "ignore.json"); writeFileSync(listPath, JSON.stringify(ignoreFile([stray])));
+    const plan = (name: string, ...extra: string[]) => runHistoryImport(["plan", "--vault", "test", "--source", repo, "--through", tip, "--output", join(dir, name), ...extra]) as Promise<ImportManifest>;
+    const bare = await plan("bare.json"), listed = await plan("listed.json", "--ignore-files", listPath);
+    expect(bare.issues).toHaveLength(2); expect(bare.ignored_files).toBeUndefined();
+    expect(listed.issues).toEqual([]); expect(listed.ignored_files?.files).toEqual([stray]); expect(listed.ignored_entries).toBe(2);
+    expect(listed.options_digest).not.toBe(bare.options_digest);
+    await expect(runHistoryImport(["apply", "--vault", "test", "--manifest", join(dir, "listed.json"), "--archive", join(dir, "a.bundle"), "--ignore-files", listPath])).rejects.toThrow("only valid for plan/prepare");
+  } finally { clearVaultStoreCache(); if (saved === undefined) delete process.env.PARACHUTE_HOME; else process.env.PARACHUTE_HOME = saved; rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("export scalars are read as the vault's import reads them; every other unreadable frontmatter stays refused, and names its note when it can", () => {
+  const dir = mkdtempSync(join(tmpdir(), "import-strict-")), other = "01M2KT4GXMQDNB8ZFXY05MHT6B";
+  const stageOf = (frontmatterBlock: string, opts: { parser?: 1 | 2; date?: string } = {}) => {
+    const repo = repoAt(join(dir, crypto.randomUUID())), db = new Database(":memory:");
+    const saved = { a: process.env.GIT_AUTHOR_DATE, c: process.env.GIT_COMMITTER_DATE };
+    try {
+      writeFileSync(join(repo, "entry.md"), `---\n${frontmatterBlock}\n---\nbody`);
+      if (opts.date) { process.env.GIT_AUTHOR_DATE = opts.date; process.env.GIT_COMMITTER_DATE = opts.date; }
+      git(repo, "add", "."); git(repo, "commit", "-m", "case");
+      stageArchive(repo, git(repo, "rev-parse", "HEAD"), db, null, undefined, null, opts.parser);
+      return {
+        rows: (db.query("SELECT row_json FROM observations").all() as { row_json: string }[]).map(r => JSON.parse(r.row_json)),
+        quarantine: db.query("SELECT * FROM quarantine").all(), issues: db.query("SELECT reason FROM issues").all(),
+      };
+    } finally {
+      for (const [k, v] of [["GIT_AUTHOR_DATE", saved.a], ["GIT_COMMITTER_DATE", saved.c]] as const) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+      db.close();
+    }
+  };
+  const OLD = "2026-08-01T00:00:00Z", NEW = "2026-11-05T00:00:00Z"; // either side of FLOW_QUOTING_SINCE (2026-10-29)
+  try {
+    const block = [
+      `id: ${noteId}`, "path: entry", "metadata:",
+      "  saying: 'made up' and more",          // not YAML: the old exporter's bare string
+      '  heard: "so they said" twice',
+      "  link: [[Projects/Alpha]]",            // YAML would make a nested list of it; an export never holds one
+      "  set: {draft}",
+      "  word: 'single'",                      // the old exporter wrote the six-character string bare
+      "  shown: '[[Projects/Beta]]'",          // today's exporter quotes a leading bracket; the old one never wrote this
+      "  quoted: 'true'",                      // both exporters quote this: the string true
+      "  none: []", "  count: 3", "  flag: true",
+      "  list:", "    - 'one' of them", "    - [[Projects/Gamma]]", "    - plain",
+      "  apostrophe: it's fine",
+    ].join("\n");
+    const base = { saying: "'made up' and more", heard: '"so they said" twice', link: "[[Projects/Alpha]]", set: "{draft}", quoted: "true", none: [], count: 3, flag: true, list: ["'one' of them", "[[Projects/Gamma]]", "plain"], apostrophe: "it's fine" };
+    // A commit from before the exporter changed: a quoted scalar it could not have written is the literal text.
+    const old = stageOf(block, { date: OLD });
+    expect(old.issues).toEqual([]); expect(old.quarantine).toEqual([]);
+    expect(old.rows[0].metadata).toEqual({ ...base, word: "'single'", shown: "'[[Projects/Beta]]'" });
+    // A commit from after: quotes are today's exporter's.
+    const now = stageOf(block, { date: NEW });
+    expect(now.issues).toEqual([]); expect(now.quarantine).toEqual([]);
+    expect(now.rows[0].metadata).toEqual({ ...base, word: "single", shown: "[[Projects/Beta]]" });
+    // The old exporter wrote a string that opens a flow and never closes it as it stood, too.
+    expect(stageOf(`id: ${noteId}\npath: [A`, { date: OLD }).rows[0].path).toBe("[A");
+    // Parser 1 (a manifest from before this reader) stages the old way: strict YAML alone.
+    expect(stageOf(`id: ${noteId}\npath: entry\nmetadata:\n  saying: 'made up' and more`, { parser: 1 })).toEqual({ rows: [], quarantine: [], issues: [{ reason: "invalid_metadata_or_utf8" }] });
+    expect(stageOf(`id: ${noteId}\npath: entry\nmetadata:\n  link: [[Projects/Alpha]]`, { parser: 1 }).rows[0].metadata).toEqual({ link: [["Projects/Alpha"]] });
+    // Still refused. Each names one note, so that note quarantines (a waiver can then be reasoned about); nothing is staged.
+    const refused = [
+      `id: ${noteId}\n<<<<<<< ours\npath: A\n=======\npath: B\n>>>>>>> theirs`,          // a merge conflict
+      `id: ${noteId}\nmetadata:\n  a: 1\n   b: [`,                                         // indentation
+      `id: ${noteId}\nmetadata:\n  saying: 'made up' and more\n a: 1\n   b: 2`,            // a readable line beside a broken one
+      `id: ${noteId}\ntitle: 'a\u2028---\npath: A`,                                        // a line separator inside a value
+      `id: ${noteId}\nmetadata:\n  text: |\n    note: 'q' z\n  saying: 'made up' and more`, // a block scalar: not an export, so nothing is rewritten
+    ];
+    for (const b of refused) expect(stageOf(b), b.split("\n")[1]).toEqual({ rows: [], quarantine: [{ note_id: noteId, reason: "unreadable_frontmatter" }], issues: [] });
+    // A value that merely ends like a block-scalar indicator is ordinary exporter output: the block is still read.
+    expect(stageOf(`id: ${noteId}\nmetadata:\n  title: Q3 - >\n  pipe: a - |\n  link: [[X]]`).rows[0].metadata).toEqual({ title: "Q3 - >", pipe: "a - |", link: "[[X]]" });
+    // However a block scalar's header is written, the lines inside it are YAML's to read: the rewrite is not kept.
+    for (const header of ["text: |", '"odd key": |', "it's: |", "odd:  |", "odd: |  # a comment", "odd: |2-", "odd: >-", "odd: |+", "odd: !!str |", "odd: &a |", "odd: &a !!str >-"]) {
+      const key = /^"?([^":|>]+?)"?:/.exec(header)![1]!;
+      const got = stageOf(`id: ${noteId}\nmetadata:\n  ${header}\n      note: 'q'\n      - 'item'\n  link: [[A]]`, { date: OLD });
+      expect(got.issues, header).toEqual([]); expect(got.quarantine, header).toEqual([]);
+      expect(String(got.rows[0].metadata[key]).replace(/\s+/g, " ").trim(), header).toBe("note: 'q' - 'item'");
+      expect(got.rows[0].metadata.link, header).toEqual([["A"]]);
+    }
+    // What the exporter writes for a list of maps: the next key sits deeper than the `- ` line. A value there that ends
+    // like a block-scalar indicator is still a plain string, and the block is still read.
+    expect(stageOf(`id: ${noteId}\nmetadata:\n  items:\n    - a: x - >\n      b: [[L]]\n      c: 'q'`, { date: OLD }).rows[0].metadata).toEqual({ items: [{ a: "x - >", b: "[[L]]", c: "'q'" }] });
+    // A file that is not YAML as it stands AND holds a block scalar is refused, not guessed at, however the header is written.
+    for (const header of ["text: |", "text: !!str |", "? |", "a#b: |"]) {
+      expect(stageOf(`id: ${noteId}\nmetadata:\n  saying: 'made up' and more\n  ${header}\n      note: 'q'`, { date: OLD }), header).toEqual({ rows: [], quarantine: [{ note_id: noteId, reason: "unreadable_frontmatter" }], issues: [] });
+    }
+    // A block scalar whose rewritten text would equal a value rewritten elsewhere is still YAML's to read.
+    expect(stageOf(`id: ${noteId}\nmetadata:\n  a: |-\n    b: 'c'\n  z: "b: \\"c\\""`).rows[0].metadata).toEqual({ a: "b: 'c'", z: 'b: "c"' });
+    // A block scalar that is valid YAML is read by YAML alone: its lines are not rewritten.
+    expect(stageOf(`id: ${noteId}\nmetadata:\n  text: |\n    note: 'q' z\n  link: [[A]]`).rows[0].metadata).toEqual({ text: "note: 'q' z\n", link: [["A"]] });
+    // A list item that is a map with a quoted key stays a map.
+    expect(stageOf(`id: ${noteId}\nmetadata:\n  items:\n    - 'odd key': v`).rows[0].metadata).toEqual({ items: [{ "odd key": "v" }] });
+    // No single stated id: it stays an unidentified issue, as before.
+    expect(stageOf(`id: ${noteId}\nid: ${other}\n a: 1\n   b: 2`)).toEqual({ rows: [], quarantine: [], issues: [{ reason: "invalid_metadata_or_utf8" }] });
+    expect(stageOf(`path: A\n a: 1\n   b: 2`)).toEqual({ rows: [], quarantine: [], issues: [{ reason: "invalid_metadata_or_utf8" }] });
+    expect(stageOf(`  id: ${noteId}\n a: 1\n   b: 2`)).toEqual({ rows: [], quarantine: [], issues: [{ reason: "invalid_metadata_or_utf8" }] });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}, 60_000);
+
+test("a file is read by the commit that first held it: one unchanged across the exporter's date is one observation, inline or sidecar", () => {
+  const dir = mkdtempSync(join(tmpdir(), "import-reading-")), other = "01M2KT4GXMQDNB8ZFXY05MHT6B";
+  const saved = { a: process.env.GIT_AUTHOR_DATE, c: process.env.GIT_COMMITTER_DATE };
+  const stage = new Database(":memory:");
+  try {
+    const repo = repoAt(join(dir, "repo"));
+    const at = (date: string, message: string) => { process.env.GIT_AUTHOR_DATE = date; process.env.GIT_COMMITTER_DATE = date; git(repo, "add", "."); git(repo, "commit", "-m", message); };
+    // Written by the old exporter: a quoted scalar it could not have produced is the literal text, quotes and all.
+    mkdirSync(join(repo, ".parachute/notes-meta"), { recursive: true });
+    writeFileSync(join(repo, `.parachute/notes-meta/${other}.yaml`), `id: ${other}\npath: table\nextension: csv\nmetadata:\n  word: 'single'\n`);
+    writeFileSync(join(repo, "table.csv"), "a,b\n");
+    writeFileSync(join(repo, "entry.md"), `---\nid: ${noteId}\npath: entry\nmetadata:\n  word: 'single'\n---\nbody`);
+    at("2026-08-01T00:00:00Z", "before the exporter changed");
+    // Later commits, after the date, that leave both files as they were.
+    writeFileSync(join(repo, "unrelated.md"), `---\nid: 01M2KT5J3YV8Q4N6R7S8T9V0W1\npath: unrelated\n---\nx`);
+    at("2026-11-05T00:00:00Z", "after it, something else");
+    writeFileSync(join(repo, "unrelated.md"), `---\nid: 01M2KT5J3YV8Q4N6R7S8T9V0W1\npath: unrelated\n---\ny`);
+    at("2026-11-06T00:00:00Z", "and again");
+    stageArchive(repo, git(repo, "rev-parse", "HEAD"), stage);
+    const rows = stage.query("SELECT note_id, seq, row_json FROM observations WHERE note_id IN (?, ?) ORDER BY note_id, seq").all(noteId, other) as { note_id: string; seq: number; row_json: string }[];
+    expect(rows.map(r => [r.note_id, r.seq])).toEqual([[noteId, 0], [other, 0]].sort());
+    for (const r of rows) expect(JSON.parse(r.row_json).metadata).toEqual({ word: "'single'" });
+    expect(stage.query("SELECT * FROM issues").all()).toEqual([]);
+  } finally {
+    for (const [k, v] of [["GIT_AUTHOR_DATE", saved.a], ["GIT_COMMITTER_DATE", saved.c]] as const) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    stage.close(); rmSync(dir, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("a range is refused in a tree where its note is alone or gone; entries may come in any order", () => {
+  const dir = mkdtempSync(join(tmpdir(), "selection-range-edges-"));
+  try {
+    const repo = repoAt(join(dir, "repo"));
+    commit(repo, "old", noteId, "old.md");
+    const first = commit(repo, "moved", noteId, "new.md");
+    const second = commit(repo, "moved again", noteId, "new.md");
+    git(repo, "rm", "-q", "old.md"); git(repo, "commit", "-m", "old copy removed"); const alone = git(repo, "rev-parse", "HEAD");
+    const entries = [selection(repo, first, "new.md", "old.md"), selection(repo, second, "new.md", "old.md")];
+    const forward = selectedStage(repo, alone, selectionFile(repo, alone, entries));
+    expect(forward.quarantine).toEqual([]);
+    expect(selectedStage(repo, alone, selectionFile(repo, alone, [...entries].reverse()))).toEqual(forward);
+    // The range runs one tree too far, into the tree where the note has a single file again.
+    const far = selectedStage(repo, alone, selectionFile(repo, alone, [entries[0]!, { ...entries[1]!, through: alone }]));
+    expect(far.quarantine).toEqual([{ note_id: noteId, reason: "duplicate_id" }]);
+    expect(far.failures).toEqual([{ note_id: noteId, commit_id: alone, reason: "stale_selection" }]);
+    // ...and into a tree where the note is gone altogether.
+    git(repo, "rm", "-q", "new.md"); git(repo, "commit", "-m", "note removed"); const gone = git(repo, "rev-parse", "HEAD");
+    const further = selectedStage(repo, gone, selectionFile(repo, gone, [entries[0]!, { ...entries[1]!, through: gone }]));
+    expect(further.failures.map((f: any) => f.reason)).toEqual(["stale_selection", "stale_selection"]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}, 30_000);
+
+test("prepare, apply and retire carry a raised bound and an ignore list; an edited manifest is refused; a manifest from before parser 2 still finishes", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "import-embedded-")), saved = process.env.PARACHUTE_HOME;
+  process.env.PARACHUTE_HOME = join(dir, "home");
+  try {
+    const probe = Bun.serve({ port: 0, fetch: () => new Response() }); const port = probe.port!; probe.stop(true);
+    writeGlobalConfig({ port });
+    for (const name of ["now", "before"]) writeVaultConfig({ name, api_keys: [], created_at: new Date().toISOString() });
+    const ids: Record<string, string> = {};
+    for (const name of ["now", "before"]) { ids[name] = (await getVaultStore(name).createNote("native")).id; }
+    clearVaultStoreCache();
+    const make = (name: string, stray = true) => {
+      const repo = repoAt(join(dir, `repo-${name}`));
+      if (stray) writeFileSync(join(repo, "left-behind.txt"), "a made-up file no note owns");
+      commit(repo, "one", ids[name]); const tip = commit(repo, "two", ids[name]);
+      return { repo, tip };
+    };
+    // 1. Today's manifest, with both operator inputs embedded.
+    const { repo, tip } = make("now");
+    const { selections: _, ...header } = selectionFile(repo, tip, []);
+    const listPath = join(dir, "ignore.json");
+    writeFileSync(listPath, JSON.stringify({ ...header, files: [{ ...pin(repo, tip, "left-behind.txt"), reason: "Old copy of a moved note; never changes" }] }));
+    const manifest = join(dir, "final.json"), archive = join(dir, "a.bundle");
+    const m = await runHistoryImport(["prepare", "--vault", "now", "--source", repo, "--through", tip, "--archive", archive, "--output", manifest, "--ignore-files", listPath, "--max-tree-entries", "20000000"]) as ImportManifest;
+    expect(m.parser).toBe(2); expect(m.max_tree_entries).toBe(20_000_000); expect(m.ignored_files?.files).toHaveLength(1); expect(m.issues).toEqual([]);
+    // An edited manifest is not the run that was prepared.
+    const edits: [string, (x: any) => void][] = [
+      ["bound", x => { x.max_tree_entries = 30_000_000; }], ["ignore list", x => { x.ignored_files.files[0].reason = "Edited"; }],
+      ["ignore list dropped", x => { delete x.ignored_files; delete x.ignored_files_digest; }], ["parser", x => { x.parser = 1; }], ["parser dropped", x => { delete x.parser; }], ["parser 3", x => { x.parser = 3; }], ["parser null", x => { x.parser = null; }],
+    ];
+    for (const [what, edit] of edits) {
+      const copy = JSON.parse(readFileSync(manifest, "utf8")); edit(copy);
+      const path = join(dir, `edited-${what.replace(/ /g, "-")}.json`); writeFileSync(path, JSON.stringify(copy));
+      await expect(runHistoryImport(["apply", "--vault", "now", "--manifest", path, "--archive", archive]), what).rejects.toThrow();
+    }
+    expect(await runHistoryImport(["apply", "--vault", "now", "--manifest", manifest, "--archive", archive])).toMatchObject({ complete: true, notes: 1 });
+    expect(await runHistoryImport(["retire", "--vault", "now", "--manifest", manifest])).toMatchObject({ retired: true });
+    // 2. A manifest as the importer wrote it before parser 2: no `parser` field, digests made with parser 1.
+    const old = make("before", false), oldTip = old.tip;
+    const oldManifest = join(dir, "old.json"), oldArchive = join(dir, "old.bundle");
+    const fresh = await runHistoryImport(["prepare", "--vault", "before", "--source", old.repo, "--through", oldTip, "--archive", oldArchive, "--output", oldManifest]) as ImportManifest;
+    const { run_id: __, parser: ___, ...body } = fresh;
+    const legacyBody = { ...body, options_digest: hashContent(canonicalJson({ parser: 1, policy: fresh.policy, waivers: fresh.waivers })) };
+    const legacy = { ...legacyBody, run_id: hashContent(canonicalJson(legacyBody)) };
+    const legacyPath = join(dir, "legacy.json"); writeFileSync(legacyPath, JSON.stringify(legacy));
+    for (const path of [historyMirrorStatePath("before"), historyImportRecoveryPath("before")]) {
+      writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, "utf8")), run_id: legacy.run_id }));
+    }
+    expect(legacy.run_id).not.toBe(fresh.run_id);
+    expect(await runHistoryImport(["apply", "--vault", "before", "--manifest", legacyPath, "--archive", oldArchive])).toMatchObject({ complete: true, notes: 1 });
+    expect(await runHistoryImport(["retire", "--vault", "before", "--manifest", legacyPath])).toMatchObject({ retired: true });
+  } finally { clearVaultStoreCache(); if (saved === undefined) delete process.env.PARACHUTE_HOME; else process.env.PARACHUTE_HOME = saved; rmSync(dir, { recursive: true, force: true }); }
+}, 60_000);
