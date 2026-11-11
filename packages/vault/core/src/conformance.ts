@@ -30,14 +30,15 @@
 import { Database } from "bun:sqlite";
 import {
   loadSchemaConfig,
+  parseFieldsJson,
   validateNote,
   type SchemaField,
   type ResolvedSchemas,
-} from "./schema-defaults.ts";
-import type { TagFieldSchema } from "./tag-schemas.ts";
-import { getTagDescendants, loadTagHierarchy } from "./tag-hierarchy.ts";
-import { getNotes, getNoteTagsForNotes } from "./notes.ts";
-import { chunkForInClause } from "./sql-in.ts";
+} from "./schema-defaults.js";
+import type { TagFieldSchema } from "./tag-schemas.js";
+import { getTagDescendants, loadTagHierarchy } from "./tag-hierarchy.js";
+import { getNotes, getNoteTagsForNotes } from "./notes.js";
+import { chunkForInClause } from "./sql-in.js";
 
 export interface ConformanceViolation {
   /** Note id of a non-conforming note. */
@@ -241,4 +242,101 @@ export function countConformanceViolations(
     checked_fields: checkedFields,
     sample,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Retype refusal (0.9.2 "safe schema change")
+// ---------------------------------------------------------------------------
+
+/** One field a proposed type change would strand records on. */
+export interface RetypeConflict {
+  field: string;
+  /** The field's declared type today. */
+  from: string | null;
+  /** The type the proposal declares. */
+  to: string | null;
+  /** Records carrying the type (or a subtype) whose value the new spec refuses. */
+  count: number;
+  /** A few of them (id, path), for the person fixing the data. */
+  sample: { id: string; path: string | null }[];
+}
+
+/**
+ * The fields whose declared `type` this proposal changes, with the records
+ * the change would strand: records whose current value the NEW spec refuses
+ * as a strict violation, so their next edit would be refused (422) until the
+ * value is fixed. Counted with the write path's own `validateNote`, on the
+ * proposal overlaid as it would be saved (its real `strict` and `indexed`,
+ * not forced strict as the conformance warning above does), so a retype this
+ * accepts can't be followed by an edit the validator refuses, and the other
+ * way round.
+ *
+ * Only a change of `type` on a field the tag already declares is a retype. A
+ * new field, a removed field, or a tightened enum is not checked here (the
+ * conformance count above warns about those). A retype of a loose field
+ * (neither strict nor indexed) strands nothing: its records keep advisory
+ * warnings.
+ */
+export function findRetypeConflicts(
+  db: Database,
+  tag: string,
+  proposedFields: Record<string, TagFieldSchema> | null,
+  opts: { sampleLimit?: number } = {},
+): RetypeConflict[] {
+  if (!proposedFields) return [];
+  const row = db.prepare("SELECT fields FROM tags WHERE name = ?").get(tag) as { fields: string | null } | null;
+  const current = parseFieldsJson(row?.fields ?? null);
+  const proposed = parseFieldsJson(JSON.stringify(proposedFields));
+  const retyped = Object.keys(proposed).filter(
+    (f) => current[f] !== undefined && (current[f]!.type ?? null) !== (proposed[f]!.type ?? null),
+  );
+  if (retyped.length === 0) return [];
+
+  const hierarchy = loadTagHierarchy(db);
+  const tagSet = Array.from(getTagDescendants(hierarchy, tag));
+  const idSet = new Set<string>();
+  for (const chunk of chunkForInClause(tagSet)) {
+    const rows = db
+      .prepare(`SELECT DISTINCT note_id FROM note_tags WHERE tag_name IN (${chunk.map(() => "?").join(", ")})`)
+      .all(...chunk) as { note_id: string }[];
+    for (const r of rows) idSet.add(r.note_id);
+  }
+  const conflicts = new Map<string, RetypeConflict>(
+    retyped.map((f) => [f, { field: f, from: current[f]!.type ?? null, to: proposed[f]!.type ?? null, count: 0, sample: [] }]),
+  );
+  if (idSet.size > 0) {
+    const base = loadSchemaConfig(db);
+    const tagToFields = new Map(base.tagToFields);
+    tagToFields.set(tag, proposed);
+    const resolved: ResolvedSchemas = { ...base, allTags: new Set(base.allTags).add(tag), tagToFields };
+    const sampleLimit = opts.sampleLimit ?? 5;
+    for (const chunk of chunkForInClause(Array.from(idSet))) {
+      const notes = getNotes(db, chunk);
+      const tagsById = getNoteTagsForNotes(db, notes.map((n) => n.id));
+      for (const note of notes) {
+        const status = validateNote(resolved, {
+          path: note.path ?? null,
+          tags: tagsById.get(note.id) ?? note.tags ?? [],
+          metadata: note.metadata ?? {},
+        });
+        const stranded = new Set(
+          (status?.warnings ?? []).filter((w) => w.strict === true && conflicts.has(w.field)).map((w) => w.field),
+        );
+        for (const f of stranded) {
+          const c = conflicts.get(f)!;
+          c.count++;
+          if (c.sample.length < sampleLimit) c.sample.push({ id: note.id, path: note.path ?? null });
+        }
+      }
+    }
+  }
+  return [...conflicts.values()].filter((c) => c.count > 0);
+}
+
+/** The hint a retype refusal carries: what to run instead, on either door. */
+export function retypeHint(tag: string, c: RetypeConflict): string {
+  const kind = c.to === "string" ? "to_string" : c.to === "integer" ? "to_int" : c.to === "number" ? "to_number" : c.to === "boolean" ? "to_boolean" : null;
+  const transform = kind ? `{kind: "${kind}"}` : `{kind: "remap", map: {<old value>: <new value>}}`;
+  const n = `${c.count} record${c.count === 1 ? "" : "s"}`;
+  return `${n} hold a "${c.field}" value a ${c.to ?? "changed"} field refuses, and couldn't be edited after this change. Change the values first with migrate: manage-types {action: "migrate", tag: "${tag}", field: "${c.field}", transform: ${transform}} (or POST /api/types/${encodeURIComponent(tag)}/migrate with the same body). It is a dry run that says what would change; add apply: true to write. Then retype.`;
 }

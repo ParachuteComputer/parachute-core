@@ -1207,14 +1207,16 @@ export async function route(
   // `vault:write` here — a gap between doors (a `vault:write` token could
   // rename/merge/delete/update a tag over REST while MCP already refused
   // it). Matches PUT/DELETE `/tags/:name` (update-tag / delete-tag), POST
-  // `/tags/merge` (merge-tags), and POST `/tags/:name/rename` (rename-tag).
+  // `/tags/merge` (merge-tags), POST `/tags/:name/rename` (rename-tag), and
+  // POST `/tags/:name/migrate` (0.9.2; its dry run too: the plan lists
+  // records across the whole vault).
   // Deliberately does NOT match `/tags/:name/conformance` (2 path segments,
   // not 1 — see `isReadOnlyPost` above for that endpoint's own, lower tier)
   // or plain GET `/tags[/:name]` (read, unaffected).
   const isTagSchemaMutation =
     ((req.method === "PUT" || req.method === "DELETE") && /^\/tags\/[^/]+$/.test(apiSubpath)) ||
     (req.method === "POST" &&
-      (apiSubpath === "/tags/merge" || /^\/tags\/[^/]+\/rename$/.test(apiSubpath)));
+      (apiSubpath === "/tags/merge" || /^\/tags\/[^/]+\/(rename|migrate)$/.test(apiSubpath)));
   // Erasing note history is irreversible and requires admin (vault#524). So does a delete that erases it
   // (`?erase_history=`, T-412): any value but an absent or explicit false is gated here, and the handler refuses a
   // value it can't read. Listing deleted notes with history left is the same admin's job.

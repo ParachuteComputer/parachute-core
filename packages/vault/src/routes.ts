@@ -66,6 +66,8 @@ import {
 } from "../core/src/attachment/policy.ts";
 import type { ValidationWarning } from "../core/src/schema-defaults.ts";
 import { logStrictBypass, SCOPE_ADMIN } from "./scopes.ts";
+import { findRetypeConflicts, retypeHint, type RetypeConflict } from "../core/src/conformance.ts";
+import { MigrateRequestError, runMigrateRequest } from "../core/src/migrate-tag-field.ts";
 import * as linkOps from "../core/src/links.ts";
 import * as tagSchemaOps from "../core/src/tag-schemas.ts";
 import { IndexedFieldError } from "../core/src/indexed-fields.ts";
@@ -3941,6 +3943,37 @@ export async function handleTags(
     return json(result);
   }
 
+  // POST /tags/:name/migrate — 0.9.2: change a field's values on every record
+  // carrying the type (or a subtype): rename, remap, set_default, to_string,
+  // to_int, to_number, to_boolean. A dry run unless `apply: true`; admin
+  // (routing.ts), dry run included. The engine is the CLI's
+  // `schema migrate-field` (migrate-tag-field.ts): preflight, atomic unless
+  // `continue_on_error`, strict bypasses logged.
+  const migrateMatch = subpath.match(/^\/([^/]+)\/migrate$/);
+  if (migrateMatch) {
+    if (req.method !== "POST") return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
+    const mTag = decodeURIComponent(migrateMatch[1]!);
+    // A migration rewrites every record carrying the type, including ones a
+    // tag-scoped pass can't see, and its plan lists them: vault-wide, so a
+    // scoped pass is refused (as for the other vault-wide admin routes).
+    if (tagScope.allowed) return tagScopeForbidden(tagScope.raw ?? []);
+    const body = (await req.json().catch(() => null)) as Record<string, unknown> | null;
+    if (!body || typeof body !== "object" || Array.isArray(body)) return json({ error: "Invalid JSON body", error_type: "invalid_json" }, 400);
+    try {
+      const plan = await runMigrateRequest(store, mTag, body, {
+        actor: writeCtx.actor ?? null,
+        via: writeCtx.via ?? null,
+        onStrictBypass: (info) => logStrictBypass(info),
+      });
+      return json(plan);
+    } catch (e) {
+      if (e instanceof MigrateRequestError) {
+        return json({ error: e.message, error_type: "invalid_request", field: e.field }, 400);
+      }
+      throw e;
+    }
+  }
+
   // POST /tags/:name/conformance — count existing notes that would VIOLATE a
   // proposed field spec for the tag (vault#283 tightening warning). Read-only
   // (POST because it carries a proposed `fields` body). Must precede the
@@ -4210,6 +4243,15 @@ export async function handleTags(
           422,
         );
       }
+    }
+
+    // 0.9.2 safe schema change: a retype that would strand records (their
+    // value fails the new spec strictly, so their next edit would be refused)
+    // is refused before anything is written, with the count and how to
+    // migrate the values first. Same validator as writes (conformance.ts).
+    if (fieldsPatch !== undefined) {
+      const conflicts = findRetypeConflicts(store.db, putTagName, fieldsPatch);
+      if (conflicts.length > 0) return retypeConflictResponse(putTagName, conflicts, tagScope.allowed !== null);
     }
 
     // A bad indexed-field name (or an unindexable type, or a cross-tag type
@@ -5605,3 +5647,24 @@ function foldRestTypes(
 
 /** Types a REST write named, marked once it succeeded (T-318 §8a). */
 const PENDING_TYPES = new WeakMap<Request, { names: string[]; release: () => void }>();
+
+/** The 409 a retype that would strand records gets: the type is unchanged. */
+function retypeConflictResponse(tag: string, conflicts: RetypeConflict[], scoped: boolean): Response {
+  const first = conflicts[0]!;
+  return json(
+    {
+      error: "retype_conflict",
+      error_type: "retype_conflict",
+      message: `Not changed: retyping "${first.field}" on "${tag}" from ${first.from} to ${first.to} would strand ${first.count} record${first.count === 1 ? "" : "s"}.`,
+      tag,
+      field: first.field,
+      count: first.count,
+      // A tag-scoped admin gets the counts (the refusal must count every
+      // record), never the ids or paths of records it may not see.
+      conflicts: conflicts.map((c) => (scoped ? { field: c.field, from: c.from, to: c.to, count: c.count } : c)),
+      hint: retypeHint(tag, first),
+    },
+    409,
+  );
+}
+
