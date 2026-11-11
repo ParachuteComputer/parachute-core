@@ -770,6 +770,36 @@
   },
   {
    "kind": "mcp-tool",
+   "old": "query-notes {created_by, created_via, exclude_tag, excludeTags, exclude_path_prefix, excludePathPrefix, expand, expand_depth, expand_links, expand_mode, extension, has_ambiguous_links, has_broken_links, has_links, has_tags, include_ambiguous_links, include_broken_links, include_link_count, last_updated_by, last_updated_via, link_count_direction, near_text, order_by, search_mode, semantic} (parameters listed in tools/list)",
+   "new": "the same parameters on query-notes and query-records, listed by vault-info {help: \"query-notes\"} instead of tools/list",
+   "action": "keep",
+   "reason": "0.9's tool list is short (the description budget: query-records under 1,500 tokens, contracts/suites/mcp/budget.test.ts), so these rarer parameters left it. Each is still accepted and honoured, as on 0.8 (contracts/suites/mcp/old-params.test.ts); vault-info {help} lists them; a connector made on 0.8 keeps its own list; the short description names the commonest ones and where to find the rest",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "mcp-tool",
+   "old": "doctor {history_after, history_max_blobs, history_budget_ms} (parameters listed in tools/list)",
+   "new": "the same parameters on doctor, listed by vault-info {help: \"doctor\"} instead of tools/list",
+   "action": "keep",
+   "reason": "0.9's tool list is short (the description budget: query-records under 1,500 tokens, contracts/suites/mcp/budget.test.ts), so these rarer parameters left it. Each is still accepted and honoured, as on 0.8 (contracts/suites/mcp/old-params.test.ts); vault-info {help} lists them; a connector made on 0.8 keeps its own list",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "mcp-tool",
+   "old": "vault-info query_hints: query-notes { near: { id: \"...\" }, depth: 2 }",
+   "new": "query-notes { near: { note_id: \"...\", depth: 2 } } (query-records { near: { id: \"...\", depth: 2 } } in record words)",
+   "action": "keep",
+   "reason": "a corrected hint: 0.8's near hint showed a call 0.8 itself refused (it reads near.note_id, and depth inside near); 0.9's hint shows the call each tool takes. vault-info, its name and arguments are unchanged; query-notes {near: {id}} is still refused, now with its fix",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "mcp-tool",
    "old": "read-attachment",
    "new": "read-attachment",
    "action": "keep",
@@ -916,6 +946,16 @@
    "reason": "a type is not a label (from 0.9.1): ?type= is query-records' type (the type and its subtypes; with ?tag, records carrying both). /api/notes gains nothing new",
    "since": "0.9",
    "removed_in": "1.0",
+   "state": "live"
+  },
+  {
+   "kind": "endpoint",
+   "old": "a revision's actor and via (the versions routes on REST, query-notes {versions} on MCP)",
+   "new": "the same, plus via_kind: the kind of the key that made it (person, agent, app, service) or null",
+   "action": "keep",
+   "reason": "additive: the write stamp (0.9.1) adds via_kind beside actor and via; a revision written before it has null; nothing a 0.8 client reads changes, and tag-scoped sessions don't receive it, as with actor and via",
+   "since": "0.9",
+   "removed_in": null,
    "state": "live"
   },
   {
