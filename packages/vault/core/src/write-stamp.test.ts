@@ -13,7 +13,7 @@ describe("resolveBy", () => {
   test("a value without the permission is refused, never ignored, and names how the owner grants it", () => {
     const r = resolveBy("client-42", null, "u1", "rest") as { refusal: { status: number; error_type: string; message: string } };
     expect(r.refusal.status).toBe(403);
-    expect(r.refusal.error_type).toBe("on_behalf_not_granted");
+    expect(r.refusal.error_type).toBe("on_behalf_not_allowed");
     expect(r.refusal.message).toContain("Parachute-On-Behalf-Of");
     expect(r.refusal.message).toContain("on_behalf_of: true");
     // Even an empty or malformed value is refused, not dropped.
