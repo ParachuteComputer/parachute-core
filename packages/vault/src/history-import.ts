@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { isNoteIdShape } from "../core/src/ulid.ts";
 import { applyImportedNote, beginImportRun, canonicalJson, importObservationDigest, importTargetDigest, readImportReceipt, type ImportedObservation, type ImportRun } from "../core/src/history-import.ts";
 import { hashContent, resolveHistoryPolicy, VERSION_MAX_BYTES, type HistoryPolicy } from "../core/src/history.ts";
-import { fromExportedAttachmentLinks, parseFrontmatter } from "../core/src/portable-md.ts";
+import { fromExportedAttachmentLinks } from "../core/src/portable-md.ts";
 import { applyConnectionPragmas, initSchema } from "../core/src/schema.ts";
 import { DEFAULT_PORT, readGlobalConfig, readVaultConfig, vaultDbPath, vaultDir } from "./config.ts";
 import { checkHealth } from "./health.ts";
@@ -44,19 +44,58 @@ function mapping(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 function yaml(raw: string): Record<string, unknown> { return mapping(Bun.YAML.parse(raw)); }
-function inline(raw: string): { meta: Record<string, unknown>; content: string } {
+/** The staging reader's version, bound into the options digest. 1: strict YAML only. 2: also {@link repairOldExporterQuotes} and {@link statedId}. */
+const PARSER = 2;
+function parserVersion(value: unknown): 1 | 2 {
+  if (value === undefined || value === null) return 1; // a manifest written before the field existed
+  if (value !== 1 && value !== 2) throw new Error("Unsupported manifest parser version");
+  return value;
+}
+/**
+ * The exporter before `FLOW_QUOTING_SINCE` (portable-md.ts) wrote a string as it stood unless its `needsQuote` asked
+ * otherwise, and that did not ask for a leading quote. So a value like `'made up' and more` went out bare, and plain
+ * YAML refuses it. This rewrites exactly those lines and nothing else: a `key: value` or `- value` line whose value
+ * opens with a quote and is not, on its own, valid YAML becomes that same text as a double-quoted string. The caller
+ * parses the result strictly, so every other fault in the block (a conflict marker, bad indentation, an unclosed flow)
+ * still fails. Null when no line qualifies.
+ */
+function repairOldExporterQuotes(block: string): string | null {
+  let changed = false;
+  const lines = block.split("\n").map(raw => {
+    const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
+    const match = /^(\s*(?:- )?)(?:([^\s'"\[\]{},#&*!|>%@`-][^'"]*?): )?(['"].*)$/.exec(line);
+    if (!match) return raw;
+    const [, lead, key, value] = match;
+    if (key === undefined && !lead!.endsWith("- ")) return raw; // not `key: value`, not a list item
+    try { Bun.YAML.parse(`x: ${value}`); return raw; } catch { /* not a YAML scalar: the old exporter's bare string */ }
+    changed = true;
+    return `${lead}${key === undefined ? "" : `${key}: `}${JSON.stringify(value)}`;
+  });
+  return changed ? lines.join("\n") : null;
+}
+/** The one top-level `id:` line of a block that will not parse, when it names a note: so the failure quarantines that note instead of being an unidentified issue. */
+function statedId(block: string): string | undefined {
+  const ids = block.split(/\r?\n/).filter(line => /^id:(?:\s|$)/.test(line)).map(line => line.slice(3).trim());
+  return ids.length === 1 && isNoteIdShape(ids[0]) ? ids[0] : undefined;
+}
+class UnreadableFrontmatter extends Error {
+  constructor(readonly noteId: string) { super("unreadable_frontmatter"); }
+}
+function frontmatter(block: string, parser: 1 | 2): Record<string, unknown> {
+  try { return yaml(block); }
+  catch (strict) {
+    if (parser === 1) throw strict;
+    const repaired = repairOldExporterQuotes(block);
+    if (repaired !== null) { try { return yaml(repaired); } catch { /* something else is wrong with it too */ } }
+    const id = statedId(block);
+    if (id !== undefined) throw new UnreadableFrontmatter(id);
+    throw strict;
+  }
+}
+function inline(raw: string, parser: 1 | 2): { meta: Record<string, unknown>; content: string } {
   const match = /^(?:\uFEFF)?---\r?\n([\s\S]*?)^---(?:\r?\n|$)/m.exec(raw);
   if (!match || match.index !== 0) throw new Error("missing_frontmatter");
-  const content = raw.slice(match[0].length);
-  try { return { meta: yaml(match[1]!), content }; }
-  catch (strict) {
-    // The exporter before FLOW_QUOTING_SINCE left some strings unquoted that plain YAML refuses (one that opens with
-    // a quote and runs on past its close). The vault's own import reads those files, so a mirror commit of one is a
-    // real observation: read it as that import does. Anything it can't name a note from stays the strict failure.
-    const portable = parseFrontmatter(raw, "export").frontmatter;
-    if (!isNoteIdShape(portable.id)) throw strict;
-    return { meta: portable, content };
-  }
+  return { meta: frontmatter(match[1]!, parser), content: raw.slice(match[0].length) };
 }
 function observation(meta: Record<string, unknown>, content: string, commit: string, blob: string, time: string): { id: string; row: ImportedObservation } {
   if (!isNoteIdShape(meta.id)) throw new Error("invalid_id");
@@ -142,9 +181,9 @@ export function normalizeHistoryIgnoredFiles(input: unknown): HistoryIgnoredFile
   return result;
 }
 function ignoredDigest(ignored: HistoryIgnoredFiles | null): string | null { return ignored ? hashContent(canonicalJson(ignored)) : null; }
-/** Parser 2 reads old-exporter frontmatter that plain YAML refuses (see `inline`); a parser-1 manifest is a different run. */
-function optionsDigest(policy: HistoryPolicy, waivers: Record<string, string>, selections: HistorySelections | null, maxTreeEntries: number = MAX_OBJECTS, ignored: HistoryIgnoredFiles | null = null): string {
-  return hashContent(canonicalJson({ parser: 2, policy, waivers, ...(selections ? { selections_digest: selectionsDigest(selections) } : {}), ...(maxTreeEntries !== MAX_OBJECTS ? { max_tree_entries: maxTreeEntries } : {}), ...(ignored ? { ignored_files_digest: ignoredDigest(ignored) } : {}) }));
+/** The parser version is the manifest's own (`parser`, absent = 1), so a run prepared before parser 2 still resumes and retires as it was staged. */
+function optionsDigest(policy: HistoryPolicy, waivers: Record<string, string>, selections: HistorySelections | null, maxTreeEntries: number = MAX_OBJECTS, ignored: HistoryIgnoredFiles | null = null, parser: 1 | 2 = PARSER): string {
+  return hashContent(canonicalJson({ parser, policy, waivers, ...(selections ? { selections_digest: selectionsDigest(selections) } : {}), ...(maxTreeEntries !== MAX_OBJECTS ? { max_tree_entries: maxTreeEntries } : {}), ...(ignored ? { ignored_files_digest: ignoredDigest(ignored) } : {}) }));
 }
 function treeEntryLimit(value: unknown): number {
   if (value === undefined || value === null) return MAX_OBJECTS;
@@ -154,7 +193,7 @@ function treeEntryLimit(value: unknown): number {
 
 export interface StagedArchive { source_fingerprint: string; tip: string; commits: number; objects: number; bytes: number; /** Tree entries passed over by `--ignore-files`; absent when none were given. */ ignored_entries?: number; }
 /** Disk-backed staging bounds memory to one git tree and one note body. */
-export function stageArchive(repo: string, tip: string, stage: Database, inputSelections?: HistorySelections | null, maxTreeEntries = MAX_OBJECTS, inputIgnored?: HistoryIgnoredFiles | null): StagedArchive {
+export function stageArchive(repo: string, tip: string, stage: Database, inputSelections?: HistorySelections | null, maxTreeEntries = MAX_OBJECTS, inputIgnored?: HistoryIgnoredFiles | null, parser: 1 | 2 = PARSER): StagedArchive {
   if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(tip)) throw new Error("through must be a full commit hash");
   if (text(git(repo, ["rev-parse", "--is-shallow-repository"])).trim() !== "false") throw new Error("Shallow archives are not supported");
   if (text(git(repo, ["rev-parse", `${tip}^{commit}`])).trim() !== tip) throw new Error("Tip is not a commit");
@@ -251,7 +290,7 @@ export function stageArchive(repo: string, tip: string, stage: Database, inputSe
     for (const entry of entries.filter(e => /^\.parachute\/notes-meta\/[^/]+\.yaml$/.test(e.path))) {
       let meta: Record<string, unknown> | undefined;
       try {
-        meta = yaml(read(entry));
+        meta = frontmatter(read(entry), parser);
         const extension = meta.extension;
         if (!isNoteIdShape(meta.id) || typeof extension !== "string") throw new Error("invalid_sidecar");
         const contentPath = `${meta.path ?? `_unpathed/${meta.id}`}.${extension}`;
@@ -266,7 +305,7 @@ export function stageArchive(repo: string, tip: string, stage: Database, inputSe
         sidecarOwners.set(contentPath, meta.id);
         used.add(contentPath);
         accept(meta, read(body), body, { git_path: entry.path, blob: entry.hash });
-      } catch (error) { failure(entry, error, meta?.id ?? entry.path.split("/").pop()?.slice(0, -5)); }
+      } catch (error) { failure(entry, error, meta?.id ?? (error instanceof UnreadableFrontmatter ? error.noteId : entry.path.split("/").pop()?.slice(0, -5))); }
     }
     for (const entry of entries) {
       if (entry.path.startsWith(".parachute/") || entry.path.startsWith(".doctor/") || entry.path === ".gitkeep" || used.has(entry.path)) continue;
@@ -281,7 +320,7 @@ export function stageArchive(repo: string, tip: string, stage: Database, inputSe
         if (cached) {
           collect(cached.note_id, cached.state, () => JSON.parse((parsedBody.get(entry.hash) as { row_json: string }).row_json), { git_path: entry.path, blob: entry.hash });
         } else {
-          const parsed = inline(read(entry)); meta = parsed.meta;
+          const parsed = inline(read(entry), parser); meta = parsed.meta;
           // Mirror commits are exports (T-318 #8): undo the attachment links the
           // export rewrote, so a staged version is the body the vault stored.
           const extension = typeof meta.extension === "string" ? meta.extension : extname(entry.path).slice(1);
@@ -290,7 +329,7 @@ export function stageArchive(repo: string, tip: string, stage: Database, inputSe
           parsedPut.run(entry.hash, id, state, JSON.stringify(row));
           collect(id, state, () => JSON.parse((parsedBody.get(entry.hash) as { row_json: string }).row_json), { git_path: entry.path, blob: entry.hash });
         }
-      } catch (error) { failure(entry, error, meta?.id); }
+      } catch (error) { failure(entry, error, meta?.id ?? (error instanceof UnreadableFrontmatter ? error.noteId : undefined)); }
     }
     for (const selection of startsAt.get(seq) ?? []) requested.set(selection.note_id, selection);
     for (const id of [...new Set([...candidates.keys(), ...requested.keys()])].sort()) {
@@ -338,6 +377,8 @@ export interface ImportManifest extends StagedArchive {
   missing_at_tip: string[]; waivers: Record<string, string>; run_id: string;
   /** Present only when plan/prepare raised the walk's bound with `--max-tree-entries`; apply restages under it. */
   max_tree_entries?: number;
+  /** The staging reader this manifest was made with; absent in manifests from before parser 2 (read as 1). Apply restages with it. */
+  parser?: 1 | 2;
 }
 function digestManifest(manifest: Omit<ImportManifest, "run_id"> | ImportManifest): string {
   const { run_id: _, ...body } = manifest as ImportManifest;
@@ -395,7 +436,7 @@ function project(vault: string, repo: string, tip: string, dir: string, opts: { 
     const source = stageArchive(repo, tip, stage, selections, maxTreeEntries, ignored), policy = resolveHistoryPolicy(config.history);
     const waivers = opts.waivers ?? {};
     for (const [id, reason] of Object.entries(waivers)) if (!isNoteIdShape(id) || typeof reason !== "string" || !reason.trim()) throw new Error("Waivers require note IDs and reasons");
-    const options_digest = optionsDigest(policy, waivers, selections, maxTreeEntries, ignored);
+    const options_digest = optionsDigest(policy, waivers, selections, maxTreeEntries, ignored, PARSER);
     const run = { run_id: "projection", source_fingerprint: source.source_fingerprint, tip, options_digest };
     beginImportRun(db, run);
     const evaluated_at = Date.now(), notes: PlannedNote[] = [], skipped: string[] = [];
@@ -417,6 +458,7 @@ function project(vault: string, repo: string, tip: string, dir: string, opts: { 
       options_digest, target_ids_digest: hashContent(canonicalJson(live.map(r => r.id))), notes, skipped, missing_at_tip, waivers,
       quarantined: stage.prepare("SELECT * FROM quarantine ORDER BY note_id").all() as ImportManifest["quarantined"],
       issues: stage.prepare("SELECT * FROM issues ORDER BY commit_id,path,reason").all() as ImportManifest["issues"],
+      parser: PARSER,
       ...(maxTreeEntries !== MAX_OBJECTS ? { max_tree_entries: maxTreeEntries } : {}),
       ...(ignored ? { ignored_files: ignored, ignored_files_digest: ignoredDigest(ignored)! } : {}),
     };
@@ -443,9 +485,11 @@ function readManifest(vault: string, path: string): ImportManifest {
   if (m.format !== 1 || m.kind !== "final" || m.vault !== vault || m.run_id !== digestManifest(m) || !m.archive || !m.archive_hash || !m.backup) throw new Error("A matching final manifest is required");
   if (canonicalJson(resolveHistoryPolicy(readVaultConfig(vault)?.history)) !== canonicalJson(m.policy)) throw new Error("History policy differs from final manifest");
   const selections = m.selections == null ? null : normalizeHistorySelections(m.selections);
+  // One canonical form: the default bound is written by leaving the field out.
+  if (m.max_tree_entries !== undefined && treeEntryLimit(m.max_tree_entries) === MAX_OBJECTS) throw new Error("Manifest names the default tree-entry bound; a raised bound only");
   const ignored = m.ignored_files == null ? null : normalizeHistoryIgnoredFiles(m.ignored_files);
   if ((m.ignored_files_digest ?? null) !== ignoredDigest(ignored)) throw new Error("Manifest ignore-files digest mismatch");
-  if ((m.selections_digest ?? null) !== selectionsDigest(selections) || m.options_digest !== optionsDigest(m.policy, m.waivers, selections, treeEntryLimit(m.max_tree_entries), ignored)) throw new Error("Manifest selection/options digest mismatch");
+  if ((m.selections_digest ?? null) !== selectionsDigest(selections) || m.options_digest !== optionsDigest(m.policy, m.waivers, selections, treeEntryLimit(m.max_tree_entries), ignored, parserVersion(m.parser))) throw new Error("Manifest selection/options digest mismatch");
   return m;
 }
 function retirementReady(m: ImportManifest): void {
@@ -548,7 +592,7 @@ export async function runHistoryImport(args: string[]): Promise<unknown> {
       if (command === "apply") {
         const stage = openStage(join(dir, "apply-stage.db"));
         try {
-          const source = stageArchive(repo, m.tip, stage, m.selections, treeEntryLimit(m.max_tree_entries), m.ignored_files ?? null);
+          const source = stageArchive(repo, m.tip, stage, m.selections, treeEntryLimit(m.max_tree_entries), m.ignored_files ?? null, parserVersion(m.parser));
           if (source.source_fingerprint !== m.source_fingerprint) throw new Error("Bundle lineage differs from manifest");
           beginImportRun(db, run);
           for (const note of m.notes) {

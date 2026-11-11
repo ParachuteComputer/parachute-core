@@ -8,8 +8,9 @@ import { spawnSync } from "node:child_process";
 import { stageArchive, runHistoryImport, type ImportManifest, normalizeHistorySelections, type HistorySelections } from "./history-import.ts";
 import { writeVaultConfig, writeGlobalConfig, vaultDbPath } from "./config.ts";
 import { getVaultStore, clearVaultStoreCache } from "./vault-store.ts";
-import { getImportedVersion } from "../core/src/history-import.ts";
-import { historyMirrorStatePath, readHistoryMirrorPhase, mirrorConfigPath } from "./mirror-config.ts";
+import { getImportedVersion, canonicalJson } from "../core/src/history-import.ts";
+import { hashContent } from "../core/src/history.ts";
+import { historyMirrorStatePath, historyImportRecoveryPath, readHistoryMirrorPhase, mirrorConfigPath } from "./mirror-config.ts";
 const noteId = "01M2KT1VQBHNZ99V5KSGXP6VSE";
 for (const id of ["legacy:abc123", "2020-01-02-03-04-05", "shortid"]) {
   for (const sidecar of [false, true]) test(`legacy ID staging: ${id}, sidecar=${sidecar}`, () => {
@@ -599,3 +600,116 @@ test("an audited ignore list passes over exactly its files; anything else stays 
     await expect(runHistoryImport(["apply", "--vault", "test", "--manifest", join(dir, "listed.json"), "--archive", join(dir, "a.bundle"), "--ignore-files", listPath])).rejects.toThrow("only valid for plan/prepare");
   } finally { clearVaultStoreCache(); if (saved === undefined) delete process.env.PARACHUTE_HOME; else process.env.PARACHUTE_HOME = saved; rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("only the old exporter's bare leading quote is repaired; every other unreadable frontmatter stays refused, and names its note when it can", () => {
+  const dir = mkdtempSync(join(tmpdir(), "import-strict-")), other = "01M2KT4GXMQDNB8ZFXY05MHT6B";
+  const stageOf = (frontmatterBlock: string, parser?: 1 | 2) => {
+    const repo = repoAt(join(dir, crypto.randomUUID())), db = new Database(":memory:");
+    try {
+      writeFileSync(join(repo, "entry.md"), `---\n${frontmatterBlock}\n---\nbody`);
+      git(repo, "add", "."); git(repo, "commit", "-m", "case");
+      stageArchive(repo, git(repo, "rev-parse", "HEAD"), db, null, undefined, null, parser);
+      return {
+        rows: (db.query("SELECT row_json FROM observations").all() as { row_json: string }[]).map(r => JSON.parse(r.row_json)),
+        quarantine: db.query("SELECT * FROM quarantine").all(), issues: db.query("SELECT reason FROM issues").all(),
+      };
+    } finally { db.close(); }
+  };
+  try {
+    // Repaired: a key's value and a list item that open with a quote and are not YAML on their own.
+    const ok = stageOf(`id: ${noteId}\npath: entry\nmetadata:\n  saying: 'made up' and more\n  heard: "so they said" twice\n  list:\n    - 'one' of them\n    - plain\n  fine: 'already quoted'\n  apostrophe: it's fine`);
+    expect(ok.issues).toEqual([]); expect(ok.quarantine).toEqual([]);
+    expect(ok.rows[0].metadata).toEqual({ saying: "'made up' and more", heard: '"so they said" twice', list: ["'one' of them", "plain"], fine: "already quoted", apostrophe: "it's fine" });
+    // Parser 1 (a manifest from before this reader) stages it the old way: an unidentified issue.
+    expect(stageOf(`id: ${noteId}\npath: entry\nmetadata:\n  saying: 'made up' and more`, 1)).toEqual({ rows: [], quarantine: [], issues: [{ reason: "invalid_metadata_or_utf8" }] });
+    // Not repaired. Each names one note, so that note quarantines (a waiver can then be reasoned about); nothing is staged.
+    const refused = [
+      `id: ${noteId}\n<<<<<<< ours\npath: A\n=======\npath: B\n>>>>>>> theirs`,          // a merge conflict
+      `id: ${noteId}\nmetadata:\n  a: 1\n   b: [`,                                         // indentation, an unclosed flow
+      `id: ${noteId}\npath: [A`,                                                           // an unclosed flow
+      `id: ${noteId}\nmetadata:\n  saying: 'made up' and more\n  broken: {`,               // a repairable line beside one that is not
+      `id: ${noteId}\ntitle: 'a ---\npath: A`,                                        // a line separator inside a value
+    ];
+    for (const block of refused) expect(stageOf(block)).toEqual({ rows: [], quarantine: [{ note_id: noteId, reason: "unreadable_frontmatter" }], issues: [] });
+    // No single stated id: it stays an unidentified issue, as before.
+    expect(stageOf(`id: ${noteId}\nid: ${other}\npath: [A`)).toEqual({ rows: [], quarantine: [], issues: [{ reason: "invalid_metadata_or_utf8" }] });
+    expect(stageOf(`path: [A`)).toEqual({ rows: [], quarantine: [], issues: [{ reason: "invalid_metadata_or_utf8" }] });
+    expect(stageOf(`  id: ${noteId}\npath: [A`)).toEqual({ rows: [], quarantine: [], issues: [{ reason: "invalid_metadata_or_utf8" }] });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}, 60_000);
+
+test("a range is refused in a tree where its note is alone or gone; entries may come in any order", () => {
+  const dir = mkdtempSync(join(tmpdir(), "selection-range-edges-"));
+  try {
+    const repo = repoAt(join(dir, "repo"));
+    commit(repo, "old", noteId, "old.md");
+    const first = commit(repo, "moved", noteId, "new.md");
+    const second = commit(repo, "moved again", noteId, "new.md");
+    git(repo, "rm", "-q", "old.md"); git(repo, "commit", "-m", "old copy removed"); const alone = git(repo, "rev-parse", "HEAD");
+    const entries = [selection(repo, first, "new.md", "old.md"), selection(repo, second, "new.md", "old.md")];
+    const forward = selectedStage(repo, alone, selectionFile(repo, alone, entries));
+    expect(forward.quarantine).toEqual([]);
+    expect(selectedStage(repo, alone, selectionFile(repo, alone, [...entries].reverse()))).toEqual(forward);
+    // The range runs one tree too far, into the tree where the note has a single file again.
+    const far = selectedStage(repo, alone, selectionFile(repo, alone, [entries[0]!, { ...entries[1]!, through: alone }]));
+    expect(far.quarantine).toEqual([{ note_id: noteId, reason: "duplicate_id" }]);
+    expect(far.failures).toEqual([{ note_id: noteId, commit_id: alone, reason: "stale_selection" }]);
+    // ...and into a tree where the note is gone altogether.
+    git(repo, "rm", "-q", "new.md"); git(repo, "commit", "-m", "note removed"); const gone = git(repo, "rev-parse", "HEAD");
+    const further = selectedStage(repo, gone, selectionFile(repo, gone, [entries[0]!, { ...entries[1]!, through: gone }]));
+    expect(further.failures.map((f: any) => f.reason)).toEqual(["stale_selection", "stale_selection"]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}, 30_000);
+
+test("prepare, apply and retire carry a raised bound and an ignore list; an edited manifest is refused; a manifest from before parser 2 still finishes", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "import-embedded-")), saved = process.env.PARACHUTE_HOME;
+  process.env.PARACHUTE_HOME = join(dir, "home");
+  try {
+    const probe = Bun.serve({ port: 0, fetch: () => new Response() }); const port = probe.port!; probe.stop(true);
+    writeGlobalConfig({ port });
+    for (const name of ["now", "before"]) writeVaultConfig({ name, api_keys: [], created_at: new Date().toISOString() });
+    const ids: Record<string, string> = {};
+    for (const name of ["now", "before"]) { ids[name] = (await getVaultStore(name).createNote("native")).id; }
+    clearVaultStoreCache();
+    const make = (name: string, stray = true) => {
+      const repo = repoAt(join(dir, `repo-${name}`));
+      if (stray) writeFileSync(join(repo, "left-behind.txt"), "a made-up file no note owns");
+      commit(repo, "one", ids[name]); const tip = commit(repo, "two", ids[name]);
+      return { repo, tip };
+    };
+    // 1. Today's manifest, with both operator inputs embedded.
+    const { repo, tip } = make("now");
+    const { selections: _, ...header } = selectionFile(repo, tip, []);
+    const listPath = join(dir, "ignore.json");
+    writeFileSync(listPath, JSON.stringify({ ...header, files: [{ ...pin(repo, tip, "left-behind.txt"), reason: "Old copy of a moved note; never changes" }] }));
+    const manifest = join(dir, "final.json"), archive = join(dir, "a.bundle");
+    const m = await runHistoryImport(["prepare", "--vault", "now", "--source", repo, "--through", tip, "--archive", archive, "--output", manifest, "--ignore-files", listPath, "--max-tree-entries", "20000000"]) as ImportManifest;
+    expect(m.parser).toBe(2); expect(m.max_tree_entries).toBe(20_000_000); expect(m.ignored_files?.files).toHaveLength(1); expect(m.issues).toEqual([]);
+    // An edited manifest is not the run that was prepared.
+    const edits: [string, (x: any) => void][] = [
+      ["bound", x => { x.max_tree_entries = 30_000_000; }], ["ignore list", x => { x.ignored_files.files[0].reason = "Edited"; }],
+      ["ignore list dropped", x => { delete x.ignored_files; delete x.ignored_files_digest; }], ["parser", x => { x.parser = 1; }], ["parser dropped", x => { delete x.parser; }],
+    ];
+    for (const [what, edit] of edits) {
+      const copy = JSON.parse(readFileSync(manifest, "utf8")); edit(copy);
+      const path = join(dir, `edited-${what.replace(/ /g, "-")}.json`); writeFileSync(path, JSON.stringify(copy));
+      await expect(runHistoryImport(["apply", "--vault", "now", "--manifest", path, "--archive", archive]), what).rejects.toThrow();
+    }
+    expect(await runHistoryImport(["apply", "--vault", "now", "--manifest", manifest, "--archive", archive])).toMatchObject({ complete: true, notes: 1 });
+    expect(await runHistoryImport(["retire", "--vault", "now", "--manifest", manifest])).toMatchObject({ retired: true });
+    // 2. A manifest as the importer wrote it before parser 2: no `parser` field, digests made with parser 1.
+    const old = make("before", false), oldTip = old.tip;
+    const oldManifest = join(dir, "old.json"), oldArchive = join(dir, "old.bundle");
+    const fresh = await runHistoryImport(["prepare", "--vault", "before", "--source", old.repo, "--through", oldTip, "--archive", oldArchive, "--output", oldManifest]) as ImportManifest;
+    const { run_id: __, parser: ___, ...body } = fresh;
+    const legacyBody = { ...body, options_digest: hashContent(canonicalJson({ parser: 1, policy: fresh.policy, waivers: fresh.waivers })) };
+    const legacy = { ...legacyBody, run_id: hashContent(canonicalJson(legacyBody)) };
+    const legacyPath = join(dir, "legacy.json"); writeFileSync(legacyPath, JSON.stringify(legacy));
+    for (const path of [historyMirrorStatePath("before"), historyImportRecoveryPath("before")]) {
+      writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, "utf8")), run_id: legacy.run_id }));
+    }
+    expect(legacy.run_id).not.toBe(fresh.run_id);
+    expect(await runHistoryImport(["apply", "--vault", "before", "--manifest", legacyPath, "--archive", oldArchive])).toMatchObject({ complete: true, notes: 1 });
+    expect(await runHistoryImport(["retire", "--vault", "before", "--manifest", legacyPath])).toMatchObject({ retired: true });
+  } finally { clearVaultStoreCache(); if (saved === undefined) delete process.env.PARACHUTE_HOME; else process.env.PARACHUTE_HOME = saved; rmSync(dir, { recursive: true, force: true }); }
+}, 60_000);
