@@ -1713,7 +1713,8 @@ export class BunSqliteStore implements Store {
             }
           }
           // Count the write's new indexed fields together, before any column
-          // is added, so the refusal's numbers are the vault's own.
+          // is added and after its releases (so `got` is what the vault would
+          // hold without the new fields; the import retry relies on that).
           indexedFieldOps.assertIndexedFieldRoom(this.db, nextIndexed);
           for (const fieldName of nextIndexed) {
             const spec = nextFields![fieldName]!;

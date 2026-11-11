@@ -14,6 +14,7 @@ import { writeVaultConfig } from "./config.ts";
 import { getVaultStore, clearVaultStoreCache } from "./vault-store.ts";
 import { generateScopedMcpTools } from "./mcp-tools.ts";
 import { handleTags } from "./routes.ts";
+import { handleMcp } from "./mcp-http.ts";
 import type { AuthResult } from "./auth.ts";
 import { INDEXED_FIELD_LIMIT, IndexedFieldLimitError } from "../core/src/indexed-fields.ts";
 
@@ -125,5 +126,28 @@ describe("indexed-field ceiling on the doors", () => {
     }
     expect(viaTypes?.error_type).toBe("indexed_field_limit");
     expect(JSON.stringify({ m: viaTypes.message, u: viaTypes.unused })).not.toContain("secretfield");
+  });
+
+  test("MCP over the wire (JSON-RPC): error.data carries the same fields as REST's 409 body", async () => {
+    await atTheLimit();
+    const admin: AuthResult = { ...authFor("journal", null), scopes: ["vault:journal:read", "vault:journal:write", "vault:journal:admin"] };
+    const req = new Request("http://localhost/vault/journal/mcp", {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "manage-types", arguments: { action: "update", tag: "fresh", fields: { x1: { type: "string", indexed: true }, x2: { type: "string", indexed: true } } } },
+      }),
+    });
+    const res = await handleMcp(req, () => generateScopedMcpTools("journal", admin), "s", "journal", admin, "");
+    const reply: any = await res.json();
+    const data = reply.error?.data ?? {};
+    expect(data.error_type).toBe("indexed_field_limit");
+    expect(data.fields).toEqual(["x1", "x2"]);
+    expect(data.limit).toBe(88);
+    expect(data.got).toBe(88);
+    expect(Array.isArray(data.unused) && data.unused.length).toBe(88);
   });
 });
