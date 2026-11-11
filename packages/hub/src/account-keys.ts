@@ -330,7 +330,9 @@ async function mintAppKey(req: Request, deps: AccountKeysDeps): Promise<Response
  * multi-vault door", T-446): `{name, vaults: {<vault>: "read"|"write", …}, expires_in?}`. It carries
  * `account:self:vaults:<vault>:<can>` per vault with `aud=account`, so it opens the account door and no vault
  * directly; the account door mints each hop at that vault's level (key-level.ts). Never admin, never create-vault.
- * `on_behalf_of` is refused here: the account door's hop doesn't carry the key's stamp yet.
+ * Its writes are stamped `via key:<name>` like any key's: the account door's hop carries the key's signed `key` claim
+ * (account-mcp-backend.ts). `on_behalf_of` stays refused here: it would put `permissions.acts_for` on every hop, and
+ * a key that writes for other people across several vaults is a wider grant than 0.9.1 needs.
  */
 async function mintMultiVaultKey(
   body: Record<string, unknown>,
@@ -349,7 +351,7 @@ async function mintMultiVaultKey(
     return err(
       400,
       "invalid_request",
-      "on_behalf_of is for a one-vault key; a multi-vault key writes as you",
+      "on_behalf_of is for a one-vault key; a multi-vault key writes as you, stamped with its name",
     );
   }
   if (typeof name !== "string" || !KEY_NAME_RE.test(name)) {

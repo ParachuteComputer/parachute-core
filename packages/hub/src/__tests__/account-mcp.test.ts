@@ -36,7 +36,7 @@ import {
 import { ACCOUNT_MCP_TOOLS } from "../account-mcp.ts";
 import { type GrantCaller, callerCanAdminVault, grantAccess } from "../grant-access.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
-import { signAccessToken } from "../jwt-sign.ts";
+import { recordTokenMint, revokeTokenByJti, signAccessToken } from "../jwt-sign.ts";
 import { NOSTR_AUTH_KIND, type NostrEvent, nostrEventId } from "../nostr-event.ts";
 import { NostrReplayCache } from "../nostr-http-auth.ts";
 import { bindPubkeyFromHttpAuth, findPubkeyLink } from "../pubkey-links.ts";
@@ -2787,6 +2787,66 @@ describe("account MCP — hop JWT reuse (hub#918)", () => {
         expect(res.status).toBe(200);
       }
       expect(bearers.size).toBe(1);
+    } finally {
+      restoreHopEnv(prev);
+      h.cleanup();
+    }
+  });
+
+  // T-446: the hop carries the account credential's named key (the write stamp), so a cached hop belongs to the
+  // credential that caused it: never handed to another key of the same person, and unreachable once its key is revoked.
+  test("an account Bearer whose key claim is malformed is refused, not served unstamped", async () => {
+    const h = await makeHarness();
+    try {
+      for (const key of [{ name: "fernhill", kind: "root" }, { name: "../x", kind: "app" }, { name: "fernhill", kind: "app", acts_for: "x" }, "fernhill"]) {
+        const t = await signAccessToken(h.db, { sub: h.ownerId, scopes: ["account:self:vaults:beta:write"], audience: "account", clientId: "parachute-app-key", issuer: ISSUER, ttlSeconds: 600, extraClaims: { key } });
+        const res = await handleAccountMcp(bearerReq(t.token, rpc("tools/list")), mcpDeps(h));
+        expect(res.status, JSON.stringify(key)).toBe(401);
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("TTL=300: a cached hop is never reused by another key, and a revoked key reaches no vault", async () => {
+    const h = await makeHarness();
+    const prev = process.env[ACCOUNT_MCP_HOP_TTL_ENV];
+    process.env[ACCOUNT_MCP_HOP_TTL_ENV] = "300";
+    _resetAccountMcpHopCacheForTests();
+    const { bearers, fetchImpl } = countingFetch();
+    const keyOf = (auth: string) =>
+      (JSON.parse(Buffer.from(auth.replace(/^Bearer\s+/i, "").split(".")[1] ?? "", "base64url").toString()) as { key?: unknown }).key;
+    try {
+      const mintKey = async (name: string) =>
+        (await signAccessToken(h.db, {
+          sub: h.ownerId,
+          scopes: ["account:self:vaults:beta:write"],
+          audience: "account",
+          clientId: "parachute-app-key",
+          issuer: ISSUER,
+          ttlSeconds: 600,
+          extraClaims: { key: { name, kind: "app" } },
+        }).then((m) => {
+          recordTokenMint(h.db, { jti: m.jti, createdVia: "app_key", subject: h.ownerId, userId: h.ownerId, clientId: "parachute-app-key", scopes: ["account:self:vaults:beta:write"], expiresAt: m.expiresAt });
+          return m;
+        }));
+      const a = await mintKey("fernhill-a");
+      const b = await mintKey("fernhill-b");
+      const call = (token: string) =>
+        handleAccountMcp(
+          bearerReq(token, rpc("tools/call", { name: "list-tags", arguments: { vault: "beta" } })),
+          mcpDeps(h, { fetchImpl }),
+        );
+      expect((await call(a.token)).status).toBe(200);
+      expect((await call(b.token)).status).toBe(200);
+      // One hop per key, each naming its own key.
+      expect(bearers.size).toBe(2);
+      expect([...bearers].map(keyOf).map((k) => (k as { name: string }).name).sort()).toEqual(["fernhill-a", "fernhill-b"]);
+      // Revoke a: its next call is refused at the door and reaches no vault, cached hop or not.
+      expect(revokeTokenByJti(h.db, a.jti, new Date())).toBe(true);
+      const before = bearers.size;
+      expect((await call(a.token)).status).toBe(401);
+      expect(bearers.size).toBe(before);
     } finally {
       restoreHopEnv(prev);
       h.cleanup();

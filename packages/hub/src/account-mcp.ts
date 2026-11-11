@@ -45,6 +45,7 @@ import {
 } from "./grant-access.ts";
 import type { SignAccessTokenOpts } from "./jwt-sign.ts";
 import { keyLevelOnVault, levelSatisfies } from "./key-level.ts";
+import type { KeyClaim } from "./keys.ts";
 import { getUserById, isHubAdmin, vaultVerbsForUserVault } from "./users.ts";
 
 /** Hub account sentinel — account ≡ box. */
@@ -88,6 +89,19 @@ export interface AccountMcpPrincipal {
    * identifier whose format is a display choice.
    */
   pubkey?: string;
+  /**
+   * The named key this Bearer is (its signed top-level `key` claim, `{name, kind}`; keys.ts `KeyClaim`). The hop to
+   * each vault carries it unchanged, so a write through the account door is stamped `via key:<name>`, exactly as the
+   * same key writing at a vault door (vault core write-stamp.ts). Read only from the token the hub signed, never
+   * from the request. Absent for NIP-98 and for credentials that are not named keys.
+   */
+  key?: KeyClaim;
+  /**
+   * The `jti` of the Bearer this request came with. The hop cache is keyed by it (account-mcp-backend.ts), so a hop
+   * minted for one key is never handed to another, and a revoked key, refused at the door on every request, can
+   * never reach its cached hop again.
+   */
+  tokenId?: string;
   /** First-admin, or a Bearer that already carries host:admin. */
   isHubAdmin: boolean;
   /** Present on Bearer (null only for NIP-98). host:admin is a synthetic wildcard. */

@@ -74,6 +74,17 @@ describe.skipIf(!is091 || lacks("multi-vault-door"))("one multi-vault door", () 
       expect(back.status).toBe(200);
       expect(JSON.stringify(back.body)).toContain("written through the account door");
 
+      // The write stamp: a write through the account door is stamped with the key that made it, the same as that key
+      // writing at a vault door (`via` comes from the key the door authenticated, never from the client).
+      const stamped = (await rest("read", write).get(`/notes/${encodeURIComponent(path)}`)).body;
+      expect(stamped.createdVia, "created through the account door").toBe(`key:${name}`);
+      await c.call("update-note", { vault: write, id: path, content: "written through the account door, again", force: true });
+      const id = (await rest("read", write).get(`/notes/${encodeURIComponent(path)}`)).body.id;
+      const versions = (await rest("read", write).get(`/notes/${encodeURIComponent(id)}/versions`)).body.versions as any[];
+      expect(versions[0]?.via, "the revision the update made").toBe(`key:${name}`);
+      if (!lacks("revision-key-kind")) expect(versions[0]?.via_kind).toBe("app");
+      fp("multivault/write-stamp.via", { created: String(stamped.createdVia).replace(name, "<name>"), revision: String(versions[0]?.via).replace(name, "<name>") });
+
       // A query with no vault reads every covered vault, each at read.
       const q = await c.call("query-records", { search: "written through the account door", limit: 5 });
       expect([...q.vaults_queried].sort()).toEqual([read, write].sort());

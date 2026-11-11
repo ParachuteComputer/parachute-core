@@ -122,12 +122,17 @@ export async function mintVaultMcpToken(
   // second, reintroducing the exact misattribution this change fixes (and
   // silently, since the token is otherwise valid). `null` for non-NIP-98
   // connections keeps their key byte-identical to before.
+  // T-446: the hop carries the account credential's named key (its signed `key` claim), so the vault stamps the
+  // write `via key:<name>` as it does at its own door. The cache is keyed by that credential (its jti): a hop minted
+  // for one key is never handed to another, and a revoked key is refused at the door before it reaches the cache.
+  const stampKey = ctx.principal.key;
   const key = hopCacheKey(
     ctx.principal.userId,
     vault.name,
     verb,
     ctx.issuer,
     attribution?.permissions.principal_pubkey ?? null,
+    ctx.principal.tokenId ?? null,
   );
   if (hop.reuse) {
     const cached = lookupHopToken(key, nowMs);
@@ -148,7 +153,9 @@ export async function mintVaultMcpToken(
     // `permissions` rather than assign a second `extraClaims` — vault reads an
     // absent `scoped_tags` as UNSCOPED (`vault/src/auth.ts:470`), so clobbering
     // it would WIDEN the token to the full vault, not fail closed.
-    ...(attribution ? { extraClaims: attribution } : {}),
+    ...(attribution || stampKey
+      ? { extraClaims: { ...(attribution ?? {}), ...(stampKey ? { key: { name: stampKey.name, kind: stampKey.kind } } : {}) } }
+      : {}),
     ...(ctx.now !== undefined ? { now: ctx.now } : {}),
   });
   if (hop.reuse) {
