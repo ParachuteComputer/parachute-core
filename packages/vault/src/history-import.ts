@@ -69,10 +69,14 @@ function observation(meta: Record<string, unknown>, content: string, commit: str
 }
 export interface HistoryCandidateRef { git_path: string; blob: string; sidecar?: { git_path: string; blob: string }; }
 export interface HistorySelection {
-  note_id: string; commit: string; selected: HistoryCandidateRef;
+  /** `through` (optional) is a later commit on the walk: the entry then stands for every tree from `commit` to it, each of which must hold exactly this candidate set. */
+  note_id: string; commit: string; through?: string; selected: HistoryCandidateRef;
   rejected: (HistoryCandidateRef & { reason: string })[]; reason: string;
 }
 export interface HistorySelections { format: 1; tip: string; source_fingerprint: string; selections: HistorySelection[]; }
+/** A file that is not a note (no id, no sidecar) which the operator has audited: exactly this path holding exactly this blob is passed over, in any tree. */
+export interface HistoryIgnoredFile { git_path: string; blob: string; reason: string; }
+export interface HistoryIgnoredFiles { format: 1; tip: string; source_fingerprint: string; files: HistoryIgnoredFile[]; }
 const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const compareText = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
 function selectionObject(input: unknown, keys: string[]): Record<string, unknown> {
@@ -99,8 +103,9 @@ export function normalizeHistorySelections(input: unknown): HistorySelections {
   if (value.format !== 1 || typeof value.tip !== "string" || !OBJECT_ID.test(value.tip) || typeof value.source_fingerprint !== "string" || !/^[0-9a-f]{64}$/.test(value.source_fingerprint) || !Array.isArray(value.selections) || value.selections.length > 100_000) throw new Error("Invalid selections header or entry limit (100,000)");
   const seen = new Set<string>();
   const selections = value.selections.map(raw => {
-    const entry = selectionObject(raw, ["note_id", "commit", "selected", "rejected", "reason"]);
+    const entry = selectionObject(raw, ["note_id", "commit", "through", "selected", "rejected", "reason"]);
     if (!isNoteIdShape(entry.note_id) || typeof entry.commit !== "string" || !OBJECT_ID.test(entry.commit) || !Array.isArray(entry.rejected) || !entry.rejected.length) throw new Error("Invalid selection entry");
+    if (entry.through !== undefined && (typeof entry.through !== "string" || !OBJECT_ID.test(entry.through))) throw new Error("Invalid selection range end");
     const key = `${entry.note_id}:${entry.commit}`;
     if (seen.has(key)) throw new Error("Duplicate selection note/commit");
     seen.add(key);
@@ -111,16 +116,35 @@ export function normalizeHistorySelections(input: unknown): HistorySelections {
       paths.add(ref.git_path);
       return { ...ref, reason: selectionReason((raw as Record<string, unknown>).reason) };
     }).sort((a, b) => compareText(canonicalJson(candidateRef(a, true)), canonicalJson(candidateRef(b, true))));
-    return { note_id: entry.note_id, commit: entry.commit, selected, rejected, reason: selectionReason(entry.reason) };
+    // A range of one tree is the plain entry: one canonical form, one digest.
+    return { note_id: entry.note_id, commit: entry.commit, ...(entry.through !== undefined && entry.through !== entry.commit ? { through: entry.through as string } : {}), selected, rejected, reason: selectionReason(entry.reason) };
   }).sort((a, b) => compareText(`${a.note_id}:${a.commit}`, `${b.note_id}:${b.commit}`));
   const result: HistorySelections = { format: 1, tip: value.tip, source_fingerprint: value.source_fingerprint, selections };
   if (Buffer.byteLength(canonicalJson(result)) > MAX_OUTPUT) throw new Error("Selections exceed 32 MiB");
   return result;
 }
 function selectionsDigest(selections: HistorySelections | null): string | null { return selections ? hashContent(canonicalJson(selections)) : null; }
+/** Canonical ordering; one pin per path and blob, each with an audit reason. */
+export function normalizeHistoryIgnoredFiles(input: unknown): HistoryIgnoredFiles {
+  const value = selectionObject(input, ["format", "tip", "source_fingerprint", "files"]);
+  if (value.format !== 1 || typeof value.tip !== "string" || !OBJECT_ID.test(value.tip) || typeof value.source_fingerprint !== "string" || !/^[0-9a-f]{64}$/.test(value.source_fingerprint) || !Array.isArray(value.files) || !value.files.length || value.files.length > 100_000) throw new Error("Invalid ignore-files header or entry limit (100,000)");
+  const seen = new Set<string>();
+  const files = value.files.map(raw => {
+    const ref = candidateRef(selectionObject(raw, ["git_path", "blob", "reason"]), true);
+    if (ref.sidecar) throw new Error("Invalid ignore-files entry");
+    const key = `${ref.git_path}\0${ref.blob}`;
+    if (seen.has(key)) throw new Error("Duplicate ignore-files entry");
+    seen.add(key);
+    return { git_path: ref.git_path, blob: ref.blob, reason: selectionReason((raw as Record<string, unknown>).reason) };
+  }).sort((a, b) => compareText(`${a.git_path}\0${a.blob}`, `${b.git_path}\0${b.blob}`));
+  const result: HistoryIgnoredFiles = { format: 1, tip: value.tip, source_fingerprint: value.source_fingerprint, files };
+  if (Buffer.byteLength(canonicalJson(result)) > MAX_OUTPUT) throw new Error("Ignore-files exceed 32 MiB");
+  return result;
+}
+function ignoredDigest(ignored: HistoryIgnoredFiles | null): string | null { return ignored ? hashContent(canonicalJson(ignored)) : null; }
 /** Parser 2 reads old-exporter frontmatter that plain YAML refuses (see `inline`); a parser-1 manifest is a different run. */
-function optionsDigest(policy: HistoryPolicy, waivers: Record<string, string>, selections: HistorySelections | null, maxTreeEntries: number = MAX_OBJECTS): string {
-  return hashContent(canonicalJson({ parser: 2, policy, waivers, ...(selections ? { selections_digest: selectionsDigest(selections) } : {}), ...(maxTreeEntries !== MAX_OBJECTS ? { max_tree_entries: maxTreeEntries } : {}) }));
+function optionsDigest(policy: HistoryPolicy, waivers: Record<string, string>, selections: HistorySelections | null, maxTreeEntries: number = MAX_OBJECTS, ignored: HistoryIgnoredFiles | null = null): string {
+  return hashContent(canonicalJson({ parser: 2, policy, waivers, ...(selections ? { selections_digest: selectionsDigest(selections) } : {}), ...(maxTreeEntries !== MAX_OBJECTS ? { max_tree_entries: maxTreeEntries } : {}), ...(ignored ? { ignored_files_digest: ignoredDigest(ignored) } : {}) }));
 }
 function treeEntryLimit(value: unknown): number {
   if (value === undefined || value === null) return MAX_OBJECTS;
@@ -128,9 +152,9 @@ function treeEntryLimit(value: unknown): number {
   return value;
 }
 
-export interface StagedArchive { source_fingerprint: string; tip: string; commits: number; objects: number; bytes: number; }
+export interface StagedArchive { source_fingerprint: string; tip: string; commits: number; objects: number; bytes: number; /** Tree entries passed over by `--ignore-files`; absent when none were given. */ ignored_entries?: number; }
 /** Disk-backed staging bounds memory to one git tree and one note body. */
-export function stageArchive(repo: string, tip: string, stage: Database, inputSelections?: HistorySelections | null, maxTreeEntries = MAX_OBJECTS): StagedArchive {
+export function stageArchive(repo: string, tip: string, stage: Database, inputSelections?: HistorySelections | null, maxTreeEntries = MAX_OBJECTS, inputIgnored?: HistoryIgnoredFiles | null): StagedArchive {
   if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(tip)) throw new Error("through must be a full commit hash");
   if (text(git(repo, ["rev-parse", "--is-shallow-repository"])).trim() !== "false") throw new Error("Shallow archives are not supported");
   if (text(git(repo, ["rev-parse", `${tip}^{commit}`])).trim() !== tip) throw new Error("Tip is not a commit");
@@ -139,14 +163,27 @@ export function stageArchive(repo: string, tip: string, stage: Database, inputSe
   if (commits.length > MAX_COMMITS) throw new Error("Archive commit limit exceeded");
   const selections = inputSelections == null ? null : normalizeHistorySelections(inputSelections);
   if (selections && selections.tip !== tip) throw new Error("Selections tip differs from archive");
-  const commitIds = new Set(commits.map(c => c.split(" ")[0]!));
-  const byCommit = new Map<string, Map<string, HistorySelection>>();
-  for (const selection of selections?.selections ?? []) {
-    if (!commitIds.has(selection.commit)) throw new Error("Selection commit is not on the first-parent walk");
-    let entries = byCommit.get(selection.commit);
-    if (!entries) byCommit.set(selection.commit, entries = new Map());
-    entries.set(selection.note_id, selection);
+  const seqOf = new Map(commits.map((c, seq) => [c.split(" ")[0]!, seq]));
+  // Each entry stands for the trees from `commit` through `through` (itself when absent). Ranges are indexed by where
+  // they start and end, so a long-lived duplicate costs one entry, not one per commit.
+  const startsAt = new Map<number, HistorySelection[]>(), endsAt = new Map<number, string[]>(), lastEnd = new Map<string, number>();
+  const ordered = [...(selections?.selections ?? [])].map(selection => {
+    const start = seqOf.get(selection.commit), end = seqOf.get(selection.through ?? selection.commit);
+    if (start === undefined || end === undefined) throw new Error("Selection commit is not on the first-parent walk");
+    if (end < start) throw new Error("Selection range ends before it starts");
+    return { selection, start, end };
+  }).sort((a, b) => a.start - b.start);
+  for (const { selection, start, end } of ordered) {
+    if ((lastEnd.get(selection.note_id) ?? -1) >= start) throw new Error("Selection ranges overlap for one note");
+    lastEnd.set(selection.note_id, end);
+    startsAt.set(start, [...(startsAt.get(start) ?? []), selection]);
+    endsAt.set(end, [...(endsAt.get(end) ?? []), selection.note_id]);
   }
+  const requested = new Map<string, HistorySelection>();
+  const ignored = inputIgnored == null ? null : normalizeHistoryIgnoredFiles(inputIgnored);
+  if (ignored && ignored.tip !== tip) throw new Error("Ignore-files tip differs from archive");
+  const ignoredPins = new Map((ignored?.files ?? []).map(f => [`${f.git_path}\0${f.blob}`, 0]));
+  let ignoredEntries = 0;
   stage.exec("CREATE TABLE selection_failures(note_id TEXT, commit_id TEXT, reason TEXT); CREATE TABLE observations(note_id TEXT NOT NULL, seq INTEGER NOT NULL, state TEXT NOT NULL, row_json TEXT NOT NULL, PRIMARY KEY(note_id,seq)); CREATE TABLE quarantine(note_id TEXT PRIMARY KEY, reason TEXT NOT NULL); CREATE TABLE issues(commit_id TEXT, path TEXT, reason TEXT); CREATE TABLE tip_ids(note_id TEXT PRIMARY KEY); CREATE TABLE object_cache(hash TEXT PRIMARY KEY, content TEXT NOT NULL); CREATE TABLE parsed_cache(hash TEXT PRIMARY KEY, note_id TEXT NOT NULL, state TEXT NOT NULL, row_json TEXT NOT NULL)");
   const fingerprint = createHash("sha256");
   let objects = 0, bytes = 0;
@@ -233,7 +270,11 @@ export function stageArchive(repo: string, tip: string, stage: Database, inputSe
     }
     for (const entry of entries) {
       if (entry.path.startsWith(".parachute/") || entry.path.startsWith(".doctor/") || entry.path === ".gitkeep" || used.has(entry.path)) continue;
-      if (!/\.(md|mdx)$/.test(entry.path)) { stage.prepare("INSERT INTO issues VALUES(?,?,?)").run(commit, entry.path, "unclassified_file"); continue; }
+      if (!/\.(md|mdx)$/.test(entry.path)) {
+        const pin = `${entry.path}\0${entry.hash}`;
+        if (ignoredPins.has(pin)) { ignoredPins.set(pin, ignoredPins.get(pin)! + 1); ignoredEntries++; continue; }
+        stage.prepare("INSERT INTO issues VALUES(?,?,?)").run(commit, entry.path, "unclassified_file"); continue;
+      }
       let meta: Record<string, unknown> | undefined;
       try {
         const cached = parsedGet.get(entry.hash) as { note_id: string; state: string } | null;
@@ -251,9 +292,9 @@ export function stageArchive(repo: string, tip: string, stage: Database, inputSe
         }
       } catch (error) { failure(entry, error, meta?.id); }
     }
-    const requested = byCommit.get(commit);
-    for (const id of [...new Set([...candidates.keys(), ...(requested?.keys() ?? [])])].sort()) {
-      const group = candidates.get(id) ?? [], selection = requested?.get(id);
+    for (const selection of startsAt.get(seq) ?? []) requested.set(selection.note_id, selection);
+    for (const id of [...new Set([...candidates.keys(), ...requested.keys()])].sort()) {
+      const group = candidates.get(id) ?? [], selection = requested.get(id);
       if (group.length && seq === commits.length - 1) markTip.run(id);
       let selected = group.length === 1 && !selection ? group[0] : undefined;
       let refusal = selection ? "stale_selection" : "missing_selection";
@@ -273,11 +314,15 @@ export function stageArchive(repo: string, tip: string, stage: Database, inputSe
       lastStates.set(id, selected.state);
       insertObservation.run(id, seq, selected.state, JSON.stringify({ ...selected.row(), commit, observed_at: time }));
     }
+    for (const id of endsAt.get(seq) ?? []) requested.delete(id);
   }
   const sourceFingerprint = fingerprint.digest("hex");
   if (selections && selections.source_fingerprint !== sourceFingerprint) throw new Error("Selections source fingerprint differs from archive");
+  if (ignored && ignored.source_fingerprint !== sourceFingerprint) throw new Error("Ignore-files source fingerprint differs from archive");
+  // An audited pin is exact: one that matched no tree is a mistake in the audit, not something to carry.
+  if ([...ignoredPins.values()].some(n => n === 0)) throw new Error("An ignore-files entry matches no file in the archive");
   stage.exec("DELETE FROM observations WHERE note_id IN (SELECT note_id FROM quarantine)");
-  return { source_fingerprint: sourceFingerprint, tip, commits: commits.length, objects, bytes };
+  return { source_fingerprint: sourceFingerprint, tip, commits: commits.length, objects, bytes, ...(ignored ? { ignored_entries: ignoredEntries } : {}) };
 }
 
 interface PlannedNote { id: string; target_digest: string; state_digest: string; native_drops: number[]; imported: number; retained: number; pruned_imported: number; pruned_native: number; }
@@ -287,6 +332,8 @@ export interface ImportManifest extends StagedArchive {
   options_digest: string; target_ids_digest: string; notes: PlannedNote[]; skipped: string[];
   quarantined: { note_id: string; reason: string }[]; issues: { commit_id: string; path: string; reason: string }[];
   selections?: HistorySelections | null; selections_digest?: string | null;
+  /** Present only when plan/prepare were given `--ignore-files`; apply restages with this embedded list. */
+  ignored_files?: HistoryIgnoredFiles; ignored_files_digest?: string;
   selection_failures?: { note_id: string; commit_id: string; reason: string }[];
   missing_at_tip: string[]; waivers: Record<string, string>; run_id: string;
   /** Present only when plan/prepare raised the walk's bound with `--max-tree-entries`; apply restages under it. */
@@ -333,7 +380,7 @@ function openStage(path: string): Database {
   stage.exec("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF");
   return stage;
 }
-function project(vault: string, repo: string, tip: string, dir: string, opts: { archive?: string; backup?: string; waivers?: Record<string, string>; selections?: HistorySelections | null; maxTreeEntries?: number }): ImportManifest {
+function project(vault: string, repo: string, tip: string, dir: string, opts: { archive?: string; backup?: string; waivers?: Record<string, string>; selections?: HistorySelections | null; maxTreeEntries?: number; ignored?: HistoryIgnoredFiles | null }): ImportManifest {
   const config = readVaultConfig(vault);
   if (!config) throw new Error("Vault does not exist");
   const stage = openStage(join(dir, "stage.db"));
@@ -344,10 +391,11 @@ function project(vault: string, repo: string, tip: string, dir: string, opts: { 
     applyConnectionPragmas(db); initSchema(db);
     const selections = opts.selections ?? null;
     const maxTreeEntries = treeEntryLimit(opts.maxTreeEntries);
-    const source = stageArchive(repo, tip, stage, selections, maxTreeEntries), policy = resolveHistoryPolicy(config.history);
+    const ignored = opts.ignored ?? null;
+    const source = stageArchive(repo, tip, stage, selections, maxTreeEntries, ignored), policy = resolveHistoryPolicy(config.history);
     const waivers = opts.waivers ?? {};
     for (const [id, reason] of Object.entries(waivers)) if (!isNoteIdShape(id) || typeof reason !== "string" || !reason.trim()) throw new Error("Waivers require note IDs and reasons");
-    const options_digest = optionsDigest(policy, waivers, selections, maxTreeEntries);
+    const options_digest = optionsDigest(policy, waivers, selections, maxTreeEntries, ignored);
     const run = { run_id: "projection", source_fingerprint: source.source_fingerprint, tip, options_digest };
     beginImportRun(db, run);
     const evaluated_at = Date.now(), notes: PlannedNote[] = [], skipped: string[] = [];
@@ -370,6 +418,7 @@ function project(vault: string, repo: string, tip: string, dir: string, opts: { 
       quarantined: stage.prepare("SELECT * FROM quarantine ORDER BY note_id").all() as ImportManifest["quarantined"],
       issues: stage.prepare("SELECT * FROM issues ORDER BY commit_id,path,reason").all() as ImportManifest["issues"],
       ...(maxTreeEntries !== MAX_OBJECTS ? { max_tree_entries: maxTreeEntries } : {}),
+      ...(ignored ? { ignored_files: ignored, ignored_files_digest: ignoredDigest(ignored)! } : {}),
     };
     return { ...body, run_id: digestManifest(body) };
   } finally { db.close(); stage.close(); }
@@ -394,7 +443,9 @@ function readManifest(vault: string, path: string): ImportManifest {
   if (m.format !== 1 || m.kind !== "final" || m.vault !== vault || m.run_id !== digestManifest(m) || !m.archive || !m.archive_hash || !m.backup) throw new Error("A matching final manifest is required");
   if (canonicalJson(resolveHistoryPolicy(readVaultConfig(vault)?.history)) !== canonicalJson(m.policy)) throw new Error("History policy differs from final manifest");
   const selections = m.selections == null ? null : normalizeHistorySelections(m.selections);
-  if ((m.selections_digest ?? null) !== selectionsDigest(selections) || m.options_digest !== optionsDigest(m.policy, m.waivers, selections, treeEntryLimit(m.max_tree_entries))) throw new Error("Manifest selection/options digest mismatch");
+  const ignored = m.ignored_files == null ? null : normalizeHistoryIgnoredFiles(m.ignored_files);
+  if ((m.ignored_files_digest ?? null) !== ignoredDigest(ignored)) throw new Error("Manifest ignore-files digest mismatch");
+  if ((m.selections_digest ?? null) !== selectionsDigest(selections) || m.options_digest !== optionsDigest(m.policy, m.waivers, selections, treeEntryLimit(m.max_tree_entries), ignored)) throw new Error("Manifest selection/options digest mismatch");
   return m;
 }
 function retirementReady(m: ImportManifest): void {
@@ -408,10 +459,11 @@ export async function runHistoryImport(args: string[]): Promise<unknown> {
   const flags = new Map<string, string>();
   for (let i = 0; i < rest.length; i += 2) {
     const key = rest[i], value = rest[i + 1];
-    if (!key || !["--vault", "--source", "--through", "--output", "--archive", "--manifest", "--waivers", "--selections", "--max-tree-entries"].includes(key) || !value || flags.has(key)) throw new Error("Invalid history-import arguments");
+    if (!key || !["--vault", "--source", "--through", "--output", "--archive", "--manifest", "--waivers", "--selections", "--max-tree-entries", "--ignore-files"].includes(key) || !value || flags.has(key)) throw new Error("Invalid history-import arguments");
     flags.set(key, value);
   }
   if (flags.has("--selections") && command !== "plan" && command !== "prepare") throw new Error("--selections is only valid for plan/prepare; apply uses the embedded manifest");
+  if (flags.has("--ignore-files") && command !== "plan" && command !== "prepare") throw new Error("--ignore-files is only valid for plan/prepare; apply uses the embedded manifest");
   if (flags.has("--max-tree-entries") && command !== "plan" && command !== "prepare") throw new Error("--max-tree-entries is only valid for plan/prepare; apply uses the manifest's bound");
   const maxTreeEntries = flags.has("--max-tree-entries") ? treeEntryLimit(/^\d+$/.test(flags.get("--max-tree-entries")!) ? Number(flags.get("--max-tree-entries")) : NaN) : undefined;
   const required = (key: string) => { const value = flags.get(key); if (!value) throw new Error(`Required ${key}`); return value; };
@@ -436,8 +488,14 @@ export async function runHistoryImport(args: string[]): Promise<unknown> {
         if (statSync(path).size > MAX_OUTPUT) throw new Error("Selections exceed 32 MiB");
         selections = normalizeHistorySelections(JSON.parse(readFileSync(path, "utf8")));
       }
+      let ignored: HistoryIgnoredFiles | null = null;
+      if (flags.has("--ignore-files")) {
+        const path = required("--ignore-files");
+        if (statSync(path).size > MAX_OUTPUT) throw new Error("Ignore-files exceed 32 MiB");
+        ignored = normalizeHistoryIgnoredFiles(JSON.parse(readFileSync(path, "utf8")));
+      }
       if (command === "plan") {
-        const m = project(vault, repo, tip, dir, { waivers, selections, maxTreeEntries }); atomic(output, JSON.stringify(m, null, 2)); return m;
+        const m = project(vault, repo, tip, dir, { waivers, selections, maxTreeEntries, ignored }); atomic(output, JSON.stringify(m, null, 2)); return m;
       }
       if (readHistoryMirrorPhase(vault) !== "active" || existsSync(historyImportRecoveryPath(vault))) throw new Error("Existing cutover: resume or cancel using its recovery journal");
       if (text(git(repo, ["rev-parse", "--is-bare-repository"])).trim() !== "true" && text(git(repo, ["status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=all"])).length) throw new Error("Source working tree is dirty");
@@ -453,7 +511,7 @@ export async function runHistoryImport(args: string[]): Promise<unknown> {
       mkdirSync(dirname(archive), { recursive: true });
       git(repo, ["bundle", "create", archive, "--all"]); chmodSync(archive, 0o600);
       const objects = privateBundle(archive, fileHash(archive), dir);
-      const m = project(vault, objects, tip, dir, { archive, backup, waivers, selections, maxTreeEntries });
+      const m = project(vault, objects, tip, dir, { archive, backup, waivers, selections, maxTreeEntries, ignored });
       atomic(output, JSON.stringify(m, null, 2));
       atomic(historyImportRecoveryPath(vault), JSON.stringify({ ...journal, phase: "prepared", run_id: m.run_id }));
       atomic(historyMirrorStatePath(vault), JSON.stringify({ phase: "paused", run_id: m.run_id, source: repo, tip }));
@@ -490,7 +548,7 @@ export async function runHistoryImport(args: string[]): Promise<unknown> {
       if (command === "apply") {
         const stage = openStage(join(dir, "apply-stage.db"));
         try {
-          const source = stageArchive(repo, m.tip, stage, m.selections, treeEntryLimit(m.max_tree_entries));
+          const source = stageArchive(repo, m.tip, stage, m.selections, treeEntryLimit(m.max_tree_entries), m.ignored_files ?? null);
           if (source.source_fingerprint !== m.source_fingerprint) throw new Error("Bundle lineage differs from manifest");
           beginImportRun(db, run);
           for (const note of m.notes) {

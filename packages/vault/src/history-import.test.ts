@@ -524,3 +524,78 @@ test("the walk's tree-entry bound holds unless plan raises it, and a raised boun
     await expect(runHistoryImport(["apply", "--vault", "test", "--manifest", join(dir, "usual.json"), "--archive", join(dir, "a.bundle"), "--max-tree-entries", "5"])).rejects.toThrow("only valid for plan/prepare");
   } finally { clearVaultStoreCache(); if (saved === undefined) delete process.env.PARACHUTE_HOME; else process.env.PARACHUTE_HOME = saved; rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("one range entry stands for every tree that holds exactly its candidate set; a tree inside the range that differs quarantines", () => {
+  const dir = mkdtempSync(join(tmpdir(), "selection-range-"));
+  try {
+    const repo = repoAt(join(dir, "repo")), other = "01M2KT4GXMQDNB8ZFXY05MHT6B";
+    commit(repo, "old", noteId, "old.md");
+    const first = commit(repo, "moved", noteId, "new.md");            // old.md stays behind: a duplicate from here on
+    commit(repo, "elsewhere one", other, "other.md");
+    const last = commit(repo, "elsewhere two", other, "other.md");    // three trees, the same pair of files
+    const range = (through: string) => ({ ...selection(repo, first, "new.md", "old.md"), through });
+    const each = git(repo, "log", "--first-parent", "--reverse", "--format=%H", `${first}~1..${last}`).split("\n").map(c => selection(repo, c, "new.md", "old.md"));
+    const perCommit = selectedStage(repo, last, selectionFile(repo, last, each));
+    const ranged = selectedStage(repo, last, selectionFile(repo, last, [range(last)]));
+    expect(each).toHaveLength(3);
+    expect(perCommit.quarantine).toEqual([]);
+    expect(ranged).toEqual(perCommit);
+    expect(ranged.rows.filter(r => r.content === "moved")).toHaveLength(1);
+    // A range that stops one tree early leaves the last duplicate tree unlisted: the whole note quarantines.
+    const short = selectedStage(repo, last, selectionFile(repo, last, [range(git(repo, "rev-parse", `${last}~1`))]));
+    expect(short.quarantine).toEqual([{ note_id: noteId, reason: "duplicate_id" }]);
+    expect(short.failures).toEqual([{ note_id: noteId, commit_id: last, reason: "missing_selection" }]);
+    // The selected file changes inside the range: that tree's set is not the entry's, so it is refused there.
+    const changed = commit(repo, "moved, then edited", noteId, "new.md");
+    const stale = selectedStage(repo, changed, selectionFile(repo, changed, [range(changed)]));
+    expect(stale.quarantine).toEqual([{ note_id: noteId, reason: "duplicate_id" }]);
+    expect(stale.failures).toEqual([{ note_id: noteId, commit_id: changed, reason: "candidate_set_mismatch" }]);
+    // Two entries, each exact, cover it.
+    const both = selectedStage(repo, changed, selectionFile(repo, changed, [range(last), selection(repo, changed, "new.md", "old.md")]));
+    expect(both.quarantine).toEqual([]);
+    expect(both.rows.map(r => r.content)).toContain("moved, then edited");
+    expect(() => selectedStage(repo, changed, selectionFile(repo, changed, [range(last), selection(repo, last, "new.md", "old.md")]))).toThrow("overlap");
+    expect(() => selectedStage(repo, changed, selectionFile(repo, changed, [{ ...selection(repo, last, "new.md", "old.md"), through: first }]))).toThrow("ends before it starts");
+    expect(() => normalizeHistorySelections(selectionFile(repo, changed, [{ ...range(last), through: "not-a-commit" }]))).toThrow("range end");
+    // A range of one tree is the plain entry.
+    expect(normalizeHistorySelections(selectionFile(repo, changed, [range(first)]))).toEqual(normalizeHistorySelections(selectionFile(repo, changed, [selection(repo, first, "new.md", "old.md")])));
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}, 30_000);
+
+test("an audited ignore list passes over exactly its files; anything else stays a source issue", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "import-ignore-")), saved = process.env.PARACHUTE_HOME;
+  process.env.PARACHUTE_HOME = join(dir, "home");
+  try {
+    const probe = Bun.serve({ port: 0, fetch: () => new Response() }); const port = probe.port!; probe.stop(true);
+    writeGlobalConfig({ port });
+    writeVaultConfig({ name: "test", api_keys: [], created_at: new Date().toISOString() });
+    const store = getVaultStore("test"); const note = await store.createNote("native"); clearVaultStoreCache();
+    const repo = repoAt(join(dir, "repo"));
+    writeFileSync(join(repo, "left-behind.txt"), "a made-up file no note owns");
+    commit(repo, "one", note.id); const tip = commit(repo, "two", note.id);
+    const ignoreFile = (files: unknown[]) => { const { selections: _, ...header } = selectionFile(repo, tip, []); return { ...header, files }; };
+    const stage = (ignored?: unknown) => {
+      const db = new Database(":memory:");
+      try { const staged = stageArchive(repo, tip, db, null, undefined, ignored as never); return { staged, issues: db.query("SELECT path, reason FROM issues").all() }; } finally { db.close(); }
+    };
+    const stray = { ...pin(repo, tip, "left-behind.txt"), reason: "Old copy of a moved note; never changes" };
+    expect(stage().issues).toEqual([{ path: "left-behind.txt", reason: "unclassified_file" }, { path: "left-behind.txt", reason: "unclassified_file" }]);
+    const passed = stage(ignoreFile([stray]));
+    expect(passed.issues).toEqual([]);
+    expect(passed.staged.ignored_entries).toBe(2);
+    // Same path, other bytes: not the audited file.
+    expect(() => stage(ignoreFile([{ ...stray, blob: "0".repeat(40) }]))).toThrow("matches no file");
+    expect(() => stage(ignoreFile([stray, { ...stray, git_path: "never-there.txt" }]))).toThrow("matches no file");
+    expect(() => stage(ignoreFile([{ ...stray, reason: " " }]))).toThrow("audit reasons");
+    expect(() => stage(ignoreFile([stray, stray]))).toThrow("Duplicate ignore-files entry");
+    expect(() => stage({ ...ignoreFile([stray]), tip: "0".repeat(40) })).toThrow("tip differs");
+    // Through the CLI: the list is embedded in the manifest and is part of the run.
+    const listPath = join(dir, "ignore.json"); writeFileSync(listPath, JSON.stringify(ignoreFile([stray])));
+    const plan = (name: string, ...extra: string[]) => runHistoryImport(["plan", "--vault", "test", "--source", repo, "--through", tip, "--output", join(dir, name), ...extra]) as Promise<ImportManifest>;
+    const bare = await plan("bare.json"), listed = await plan("listed.json", "--ignore-files", listPath);
+    expect(bare.issues).toHaveLength(2); expect(bare.ignored_files).toBeUndefined();
+    expect(listed.issues).toEqual([]); expect(listed.ignored_files?.files).toEqual([stray]); expect(listed.ignored_entries).toBe(2);
+    expect(listed.options_digest).not.toBe(bare.options_digest);
+    await expect(runHistoryImport(["apply", "--vault", "test", "--manifest", join(dir, "listed.json"), "--archive", join(dir, "a.bundle"), "--ignore-files", listPath])).rejects.toThrow("only valid for plan/prepare");
+  } finally { clearVaultStoreCache(); if (saved === undefined) delete process.env.PARACHUTE_HOME; else process.env.PARACHUTE_HOME = saved; rmSync(dir, { recursive: true, force: true }); }
+});
