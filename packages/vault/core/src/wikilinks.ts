@@ -756,7 +756,7 @@ export function syncWikilinks(
   const ambiguous: AmbiguousWikilinkTarget[] = [];
 
   for (const [key, wl] of targetMap) {
-    const detail = resolveWikilinkDetailed(db, wl.target);
+    const detail = narrowForWriter(resolveWikilinkDetailed(db, wl.target), visible);
     if (detail.resolved) {
       // Don't create self-links — silently skipped, same as before.
       if (detail.note_id === noteId) continue;
@@ -1706,6 +1706,22 @@ export function clearQueuedLinkTarget(
 }
 
 /**
+ * Scope gap 1 (round-1 review): an ambiguous name, as the WRITER sees it. Of
+ * the notes sharing the name, only those it may see count: one left resolves
+ * to it (the writer means the note it can see), none left is a miss, two or
+ * more stay ambiguous among those. Otherwise one visible plus one hidden
+ * candidate made no link and, narrowed, no warning: telling the writer a
+ * hidden note shares the name. Unscoped (`visible` absent): unchanged.
+ */
+function narrowForWriter(detail: WikilinkResolution, visible?: (noteId: string) => boolean): WikilinkResolution {
+  if (!visible || !detail.ambiguous) return detail;
+  const seen = detail.candidates.filter((c) => visible(c.note_id));
+  if (seen.length === 1) return { resolved: true, note_id: seen[0]!.note_id, path: seen[0]!.path, candidates: [] };
+  if (seen.length === 0) return { resolved: false, ambiguous: false, candidates: [] };
+  return { ...detail, candidates: seen };
+}
+
+/**
  * Resolve a structured link NOW, or queue it for lazy resolution when the
  * target doesn't exist yet — mirroring the wikilink forward-ref contract
  * (a target created later, in this same batch or a future call, backfills
@@ -1740,7 +1756,7 @@ export function resolveOrQueueLink(
    */
   visible?: (noteId: string) => boolean,
 ): ResolveOrQueueOutcome {
-  const detail = resolveLinkTargetDetailed(db, target);
+  const detail = narrowForWriter(resolveLinkTargetDetailed(db, target), visible);
   if (detail.ambiguous) {
     // vault#581 — record the collision so it survives the response. Every
     // structured-link write path (MCP create/update-note, REST POST/PATCH,
@@ -1785,7 +1801,7 @@ export function getContentWikilinkWarnings(
   const warnings: QueryWarning[] = [];
 
   for (const [, wl] of targetMap) {
-    const detail = resolveWikilinkDetailed(db, wl.target);
+    const detail = narrowForWriter(resolveWikilinkDetailed(db, wl.target), visible);
     if (detail.resolved && visible && detail.note_id !== noteId && !visible(detail.note_id!)) {
       warnings.push(unresolvedLinkWarning(wl.target, WIKILINK_REL));
       continue;

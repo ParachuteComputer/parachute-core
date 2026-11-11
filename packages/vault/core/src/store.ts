@@ -406,8 +406,19 @@ export class BunSqliteStore implements Store {
 
     // Resolve the ENTIRE next-set (queuing misses) → the target ids the
     // field's edges under this relationship should point at right now.
+    const existing = linkOps.getLinks(this.db, noteId, { direction: "outbound" });
     const desiredTargetIds = new Set<string>();
     for (const value of nextSet) {
+      // Scope gap 1 (round-1 review): an element still in the list whose link,
+      // made by someone who could see its note, already exists is kept as it
+      // is. A tag-scoped writer's edit must not delete a link it can't see.
+      if (linkVisible) {
+        const held = resolveLinkTargetDetailed(this.db, value);
+        if (held.resolved && !linkVisible(held.note_id!) && existing.some((l) => l.relationship === fieldName && l.targetId === held.note_id)) {
+          desiredTargetIds.add(held.note_id!);
+          continue;
+        }
+      }
       const outcome = resolveOrQueueLink(this.db, noteId, value, fieldName, linkVisible);
       if (outcome.status === "resolved") desiredTargetIds.add(outcome.note_id);
     }
@@ -415,7 +426,6 @@ export class BunSqliteStore implements Store {
     // Reconcile existing edges to the desired target set (see the doc comment
     // for why deleting by resolved TARGET, not by re-resolved raw value, is
     // what fixes the rename / ambiguous / aliasing corners).
-    const existing = linkOps.getLinks(this.db, noteId, { direction: "outbound" });
     for (const link of existing) {
       if (link.relationship !== fieldName) continue;
       if (!desiredTargetIds.has(link.targetId)) {
