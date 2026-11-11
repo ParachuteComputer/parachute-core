@@ -658,6 +658,8 @@ test("export scalars are read as the vault's import reads them; every other unre
       `id: ${noteId}\nmetadata:\n  text: |\n    note: 'q' z\n  saying: 'made up' and more`, // a block scalar: not an export, so nothing is rewritten
     ];
     for (const b of refused) expect(stageOf(b), b.split("\n")[1]).toEqual({ rows: [], quarantine: [{ note_id: noteId, reason: "unreadable_frontmatter" }], issues: [] });
+    // A value that merely ends like a block-scalar indicator is ordinary exporter output: the block is still read.
+    expect(stageOf(`id: ${noteId}\nmetadata:\n  title: Q3 - >\n  pipe: a - |\n  link: [[X]]`).rows[0].metadata).toEqual({ title: "Q3 - >", pipe: "a - |", link: "[[X]]" });
     // A block scalar that is valid YAML is read by YAML alone: its lines are not rewritten.
     expect(stageOf(`id: ${noteId}\nmetadata:\n  text: |\n    note: 'q' z\n  link: [[A]]`).rows[0].metadata).toEqual({ text: "note: 'q' z\n", link: [["A"]] });
     // A list item that is a map with a quoted key stays a map.
@@ -668,6 +670,35 @@ test("export scalars are read as the vault's import reads them; every other unre
     expect(stageOf(`  id: ${noteId}\n a: 1\n   b: 2`)).toEqual({ rows: [], quarantine: [], issues: [{ reason: "invalid_metadata_or_utf8" }] });
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }, 60_000);
+
+test("a file is read by the commit that first held it: one unchanged across the exporter's date is one observation, inline or sidecar", () => {
+  const dir = mkdtempSync(join(tmpdir(), "import-reading-")), other = "01M2KT4GXMQDNB8ZFXY05MHT6B";
+  const saved = { a: process.env.GIT_AUTHOR_DATE, c: process.env.GIT_COMMITTER_DATE };
+  const stage = new Database(":memory:");
+  try {
+    const repo = repoAt(join(dir, "repo"));
+    const at = (date: string, message: string) => { process.env.GIT_AUTHOR_DATE = date; process.env.GIT_COMMITTER_DATE = date; git(repo, "add", "."); git(repo, "commit", "-m", message); };
+    // Written by the old exporter: a quoted scalar it could not have produced is the literal text, quotes and all.
+    mkdirSync(join(repo, ".parachute/notes-meta"), { recursive: true });
+    writeFileSync(join(repo, `.parachute/notes-meta/${other}.yaml`), `id: ${other}\npath: table\nextension: csv\nmetadata:\n  word: 'single'\n`);
+    writeFileSync(join(repo, "table.csv"), "a,b\n");
+    writeFileSync(join(repo, "entry.md"), `---\nid: ${noteId}\npath: entry\nmetadata:\n  word: 'single'\n---\nbody`);
+    at("2026-08-01T00:00:00Z", "before the exporter changed");
+    // Later commits, after the date, that leave both files as they were.
+    writeFileSync(join(repo, "unrelated.md"), `---\nid: 01M2KT5J3YV8Q4N6R7S8T9V0W1\npath: unrelated\n---\nx`);
+    at("2026-11-05T00:00:00Z", "after it, something else");
+    writeFileSync(join(repo, "unrelated.md"), `---\nid: 01M2KT5J3YV8Q4N6R7S8T9V0W1\npath: unrelated\n---\ny`);
+    at("2026-11-06T00:00:00Z", "and again");
+    stageArchive(repo, git(repo, "rev-parse", "HEAD"), stage);
+    const rows = stage.query("SELECT note_id, seq, row_json FROM observations WHERE note_id IN (?, ?) ORDER BY note_id, seq").all(noteId, other) as { note_id: string; seq: number; row_json: string }[];
+    expect(rows.map(r => [r.note_id, r.seq])).toEqual([[noteId, 0], [other, 0]].sort());
+    for (const r of rows) expect(JSON.parse(r.row_json).metadata).toEqual({ word: "'single'" });
+    expect(stage.query("SELECT * FROM issues").all()).toEqual([]);
+  } finally {
+    for (const [k, v] of [["GIT_AUTHOR_DATE", saved.a], ["GIT_COMMITTER_DATE", saved.c]] as const) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    stage.close(); rmSync(dir, { recursive: true, force: true });
+  }
+}, 30_000);
 
 test("a range is refused in a tree where its note is alone or gone; entries may come in any order", () => {
   const dir = mkdtempSync(join(tmpdir(), "selection-range-edges-"));

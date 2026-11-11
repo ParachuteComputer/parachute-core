@@ -72,7 +72,8 @@ function parserVersion(value: unknown): 1 | 2 {
  */
 export function readExportScalars(block: string, reading: "export" | "old-export"): string {
   const lines = block.split("\n");
-  if (lines.some(line => /(?:^|: |- )[|>][+-]?\d*\s*\r?$/.test(line))) return block;
+  // The indicator must be the whole value: `title: Q3 - >` is an ordinary string that happens to end like one.
+  if (lines.some(line => /^\s*(?:- )?(?:[^:'"]+: )?[|>][+-]?\d*\s*\r?$/.test(line))) return block;
   return lines.map(raw => {
     const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
     const match = /^(\s*(?:- )?)(?:([^\s'"\[\]{},#&*!|>%@`-][^'"]*?): )?(['"\[{].*)$/.exec(line);
@@ -238,6 +239,7 @@ export function stageArchive(repo: string, tip: string, stage: Database, inputSe
   const fingerprint = createHash("sha256");
   let objects = 0, bytes = 0;
   const lastStates = new Map<string, string>();
+  const firstReading = new Map<string, "export" | "old-export">(); // frontmatter blob -> how its first commit reads it
   const identities = new Set<string>();
   const parsedGet = stage.prepare("SELECT note_id,state FROM parsed_cache WHERE hash=?");
   const parsedBody = stage.prepare("SELECT row_json FROM parsed_cache WHERE hash=?");
@@ -249,8 +251,11 @@ export function stageArchive(repo: string, tip: string, stage: Database, inputSe
     const [commit, tree, time] = commits[seq]!.split(" ");
     if (!commit || !tree || !time || !Number.isFinite(Date.parse(time))) throw new Error("Invalid commit record");
     fingerprint.update(`${commit} ${tree}\n`);
-    // A blob is parsed once, in the first commit that holds it (the caches below), so this is the commit that wrote it.
-    const reading = Date.parse(time) < Date.parse(FLOW_QUOTING_SINCE) ? "old-export" as const : "export" as const;
+    // A file is read by the commit that first held those bytes: that is the exporter that wrote them. A later
+    // commit that still holds the same blob must not read it another way (a sidecar is parsed again in every
+    // commit; an unchanged one read two ways would look like a change on the day the exporter's rule changed).
+    const commitReading = Date.parse(time) < Date.parse(FLOW_QUOTING_SINCE) ? "old-export" as const : "export" as const;
+    const readingFor = (hash: string) => { let r = firstReading.get(hash); if (!r) firstReading.set(hash, r = commitReading); return r; };
     const entries = text(git(repo, ["ls-tree", "-rz", "--full-tree", commit])).split("\0").filter(Boolean).map(record => {
       const tab = record.indexOf("\t"), [mode, type, hash] = record.slice(0, tab).split(" ");
       if (tab < 0 || !hash) throw new Error("Invalid tree record");
@@ -303,7 +308,7 @@ export function stageArchive(repo: string, tip: string, stage: Database, inputSe
     for (const entry of entries.filter(e => /^\.parachute\/notes-meta\/[^/]+\.yaml$/.test(e.path))) {
       let meta: Record<string, unknown> | undefined;
       try {
-        meta = frontmatter(read(entry), parser, reading);
+        meta = frontmatter(read(entry), parser, readingFor(entry.hash));
         const extension = meta.extension;
         if (!isNoteIdShape(meta.id) || typeof extension !== "string") throw new Error("invalid_sidecar");
         const contentPath = `${meta.path ?? `_unpathed/${meta.id}`}.${extension}`;
@@ -333,7 +338,7 @@ export function stageArchive(repo: string, tip: string, stage: Database, inputSe
         if (cached) {
           collect(cached.note_id, cached.state, () => JSON.parse((parsedBody.get(entry.hash) as { row_json: string }).row_json), { git_path: entry.path, blob: entry.hash });
         } else {
-          const parsed = inline(read(entry), parser, reading); meta = parsed.meta;
+          const parsed = inline(read(entry), parser, readingFor(entry.hash)); meta = parsed.meta;
           // Mirror commits are exports (T-318 #8): undo the attachment links the
           // export rewrote, so a staged version is the body the vault stored.
           const extension = typeof meta.extension === "string" ? meta.extension : extname(entry.path).slice(1);
