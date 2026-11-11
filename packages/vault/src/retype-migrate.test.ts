@@ -55,8 +55,31 @@ describe("a retype that would strand records", () => {
     expect((await store.getNoteByPath("r/0"))?.metadata?.size).toBe("3");
 
     expect((await tags("PUT", "/item", { fields: { size: { type: "string", indexed: true } } })).status).toBe(200);
-    const r0 = (await store.getNoteByPath("r/0"))!;
-    await store.updateNote(r0.id, { metadata: { size: "4" } }); // editable: no 422
+    // Editable through the enforcing write path (MCP update-note checks strict and indexed types).
+    const update = generateMcpTools(store).find((t) => t.name === "update-note")!;
+    await update.execute({ id: "r/1", metadata: { label: "x" }, force: true });
+  });
+
+  it("counts a strict reference's target_tags, as the write path does", async () => {
+    await store.createNote("", { path: "places/x", tags: ["place"] });
+    expect((await tags("PUT", "/task", { fields: { owner: { type: "string", strict: true } } })).status).toBe(200);
+    await store.createNote("", { path: "t/1", tags: ["task"], metadata: { owner: "places/x" } });
+    const res = await tags("PUT", "/task", { fields: { owner: { type: "reference", strict: true, target_tags: ["person"] } } });
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as any).count).toBe(1);
+  });
+
+  it("counts a record with no tags when the type is _default", async () => {
+    expect((await tags("PUT", "/_default", { fields: { pri: { type: "integer", strict: true } } })).status).toBe(200);
+    await store.createNote("", { path: "u/1", metadata: { pri: 3 } });
+    const res = await tags("PUT", "/_default", { fields: { pri: { type: "string", strict: true } } });
+    expect(res.status).toBe(409);
+  });
+
+  it("doesn't count a record that was already refused before the change", async () => {
+    await seed({ type: "integer", strict: true, required: true }, [3]);
+    await store.createNote("", { path: "r/missing", tags: ["item"] }); // no size: refused under the type as it is
+    expect((await tags("PUT", "/item", { fields: { size: { type: "number", strict: true, required: true } } })).status).toBe(200);
   });
 
   it("a loose field (neither strict nor indexed) strands nothing: the retype is accepted", async () => {

@@ -2253,7 +2253,11 @@ enforced), the PUT answers `409 retype_conflict` and changes nothing:
 `{error_type: "retype_conflict", tag, field, count, conflicts: [{field,
 from, to, count, sample: [{id, path}]}], hint}`. Those records' next edit
 would be refused (422) until their value is fixed; the count uses the same
-validator writes use, so the two can't disagree. The `hint` names the
+validator writes use (reference targets and `_default` included), so a
+retype it accepts can't be followed by such a 422. Records already refused
+under the type as it is aren't counted: the change doesn't strand them. (A
+PUT that only turns on `strict` or `indexed` isn't a retype and isn't
+checked here; the conformance count warns about those.) The `hint` names the
 migrate call that converts the values first. A retype of a loose field
 (neither strict nor indexed) strands nothing and is accepted, as before. A
 tag-scoped admin gets the counts without `sample`.
@@ -2268,9 +2272,11 @@ default?}` or `{kind: "set_default", value, onlyInvalid?}` (the CLI's
 `schema migrate-field` engine). **A dry run unless `apply: true`**: it
 returns `{tag, field, transform, applied: false, scanned, would_change,
 unchanged, errored, sample, errors}` and writes nothing. With `apply:
-true` it returns `changed` instead of `would_change`; it is atomic (any
-value that can't be converted stops the run before a write, `applied:
-false`) unless `continue_on_error: true`. Writes that bypass a strict field
+true` it returns `changed` instead of `would_change`. Every value is
+converted before the first write, so one that can't be converted stops the
+run with nothing written (`applied: false`) unless `continue_on_error:
+true`. The writes themselves go record by record, not in one transaction:
+a record edited during the run keeps whichever write lands last. Writes that bypass a strict field
 are logged. Admin even for the dry run, and refused (403) to a tag-scoped
 pass: it rewrites, and lists, records beyond its tags. MCP:
 `manage-types {action: "migrate", tag, field, transform, apply?}`.

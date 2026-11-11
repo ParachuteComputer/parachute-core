@@ -34,7 +34,9 @@ import {
   validateNote,
   type SchemaField,
   type ResolvedSchemas,
+  type ReferenceTargetLookup,
 } from "./schema-defaults.js";
+import { resolveLinkTargetDetailed } from "./wikilinks.js";
 import type { TagFieldSchema } from "./tag-schemas.js";
 import { getTagDescendants, loadTagHierarchy } from "./tag-hierarchy.js";
 import { getNotes, getNoteTagsForNotes } from "./notes.js";
@@ -292,14 +294,19 @@ export function findRetypeConflicts(
   );
   if (retyped.length === 0) return [];
 
-  const hierarchy = loadTagHierarchy(db);
-  const tagSet = Array.from(getTagDescendants(hierarchy, tag));
+  // The records the tag's fields apply to: those carrying it or a subtype.
+  // `_default` applies to every record, tagged or not.
   const idSet = new Set<string>();
-  for (const chunk of chunkForInClause(tagSet)) {
-    const rows = db
-      .prepare(`SELECT DISTINCT note_id FROM note_tags WHERE tag_name IN (${chunk.map(() => "?").join(", ")})`)
-      .all(...chunk) as { note_id: string }[];
-    for (const r of rows) idSet.add(r.note_id);
+  if (tag === "_default") {
+    for (const r of db.prepare("SELECT id FROM notes").all() as { id: string }[]) idSet.add(r.id);
+  } else {
+    const tagSet = Array.from(getTagDescendants(loadTagHierarchy(db), tag));
+    for (const chunk of chunkForInClause(tagSet)) {
+      const rows = db
+        .prepare(`SELECT DISTINCT note_id FROM note_tags WHERE tag_name IN (${chunk.map(() => "?").join(", ")})`)
+        .all(...chunk) as { note_id: string }[];
+      for (const r of rows) idSet.add(r.note_id);
+    }
   }
   const conflicts = new Map<string, RetypeConflict>(
     retyped.map((f) => [f, { field: f, from: current[f]!.type ?? null, to: proposed[f]!.type ?? null, count: 0, sample: [] }]),
@@ -309,20 +316,30 @@ export function findRetypeConflicts(
     const tagToFields = new Map(base.tagToFields);
     tagToFields.set(tag, proposed);
     const resolved: ResolvedSchemas = { ...base, allTags: new Set(base.allTags).add(tag), tagToFields };
+    // The write path's reference check (store.validateNoteAgainstSchemas), so a
+    // strict `target_tags` is counted. Unscoped: the refusal counts every record.
+    const lookup: ReferenceTargetLookup = (value) => {
+      const hit = resolveLinkTargetDetailed(db, value);
+      if (!hit.resolved || !hit.note_id) return { status: "unresolved" };
+      const rows = db.prepare("SELECT tag_name FROM note_tags WHERE note_id = ?").all(hit.note_id) as { tag_name: string }[];
+      return { status: "resolved", tags: rows.map((r) => r.tag_name) };
+    };
+    const strictOn = (status: ReturnType<typeof validateNote>) =>
+      new Set((status?.warnings ?? []).filter((w) => w.strict === true && conflicts.has(w.field)).map((w) => w.field));
     const sampleLimit = opts.sampleLimit ?? 5;
     for (const chunk of chunkForInClause(Array.from(idSet))) {
       const notes = getNotes(db, chunk);
       const tagsById = getNoteTagsForNotes(db, notes.map((n) => n.id));
       for (const note of notes) {
-        const status = validateNote(resolved, {
-          path: note.path ?? null,
-          tags: tagsById.get(note.id) ?? note.tags ?? [],
-          metadata: note.metadata ?? {},
-        });
-        const stranded = new Set(
-          (status?.warnings ?? []).filter((w) => w.strict === true && conflicts.has(w.field)).map((w) => w.field),
-        );
-        for (const f of stranded) {
+        const n = { path: note.path ?? null, tags: tagsById.get(note.id) ?? note.tags ?? [], metadata: note.metadata ?? {} };
+        const after = strictOn(validateNote(resolved, n, lookup));
+        if (after.size === 0) continue;
+        // Stranded BY this change: refused under the proposal, not already
+        // refused under the type as it is (that record is stuck either way,
+        // and migrating can't be what frees it).
+        const before = strictOn(validateNote(base, n, lookup));
+        for (const f of after) {
+          if (before.has(f)) continue;
           const c = conflicts.get(f)!;
           c.count++;
           if (c.sample.length < sampleLimit) c.sample.push({ id: note.id, path: note.path ?? null });
@@ -337,6 +354,6 @@ export function findRetypeConflicts(
 export function retypeHint(tag: string, c: RetypeConflict): string {
   const kind = c.to === "string" ? "to_string" : c.to === "integer" ? "to_int" : c.to === "number" ? "to_number" : c.to === "boolean" ? "to_boolean" : null;
   const transform = kind ? `{kind: "${kind}"}` : `{kind: "remap", map: {<old value>: <new value>}}`;
-  const n = `${c.count} record${c.count === 1 ? "" : "s"}`;
-  return `${n} hold a "${c.field}" value a ${c.to ?? "changed"} field refuses, and couldn't be edited after this change. Change the values first with migrate: manage-types {action: "migrate", tag: "${tag}", field: "${c.field}", transform: ${transform}} (or POST /api/types/${encodeURIComponent(tag)}/migrate with the same body). It is a dry run that says what would change; add apply: true to write. Then retype.`;
+  const n = c.count === 1 ? "1 record holds" : `${c.count} records hold`;
+  return `${n} a "${c.field}" value a ${c.to ?? "changed"} field refuses, and couldn't be edited after this change. Change the values first with migrate: manage-types {action: "migrate", tag: "${tag}", field: "${c.field}", transform: ${transform}} (or POST /api/types/${encodeURIComponent(tag)}/migrate with the same body). It is a dry run that says what would change; add apply: true to write. Then retype.`;
 }
