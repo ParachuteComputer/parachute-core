@@ -120,6 +120,30 @@ describe("near_name on a scoped type update (0.9.2)", () => {
   });
 });
 
+describe("near_name on the type's own fields (0.9.2 follow-up)", () => {
+  test("adding `statu` to a type that declares `status`, or two near fields in one PUT, says so", async () => {
+    seedVault("v");
+    const store = getVaultStore("v");
+    await store.upsertTagRecord("task", { fields: { status: { type: "string" } } });
+    const r: any = await tool("v", "update-tag").execute({ tag: "task", fields: { statu: { type: "string" } } });
+    expect(r.warnings).toEqual([expect.objectContaining({ kind: "field", name: "statu", nearest: "status", declared_by: ["task"] })]);
+    const both: any = await tool("v", "update-tag").execute({ tag: "note", fields: { priority: { type: "integer" }, priorty: { type: "integer" } } });
+    expect(both.warnings.map((w: any) => w.name).sort()).toEqual(["priority", "priorty"]);
+  });
+});
+
+describe("the connect-time type list", () => {
+  test("a list that joins to exactly the cap is shown whole", async () => {
+    const { projectionToMarkdown } = await import("../core/src/vault-projection.ts");
+    // 99 names of 13 characters joined by ", " = 99*13 + 98*2 = 1483; then ", " and one of 15 = 1500.
+    const names = Array.from({ length: 99 }, (_, i) => `type${String(i).padStart(9, "0")}`).concat(["zzzzzzzzzzzzzzz"]);
+    expect(names.join(", ").length).toBe(1500);
+    const md = projectionToMarkdown({ vaultName: "v", projection: { tags: names.map((name) => ({ name, description: null, parents: [], effective_parents: [], fields: {}, effective_fields: {}, relationships: null })), indexed_fields: [], query_hints: [], map: { total_notes: 0, tags: [], path_buckets: [], unfiled_notes: 0 } } as any });
+    expect(md).not.toContain("more (list-types");
+    expect(md).toContain("zzzzzzzzzzzzzzz");
+  });
+});
+
 describe("vault-info's tag map (0.9.2)", () => {
   test("700 types fit the budget, most used first, with the totals and where the rest are", async () => {
     seedVault("v");
