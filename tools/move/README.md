@@ -97,6 +97,15 @@ A difference passes only when it was named before the move. A count never excuse
 - **What lives on a door, not in the vault:** a box's triggers and git mirror, cloud's snapshots, published links
   that name the old host. The vault's description is set again on an HTTP door, and by hand on a box.
 
+## Handing a vault to someone else, on a box
+
+0.9.1 lets a door with accounts (Parachute Cloud) hand a vault to another account in place. A box has nothing to hand
+between: its owner, the hub's first admin, owns every vault on it, and other accounts there are given access to a
+vault, never ownership. There is no in-place owner change on a box. To give someone a vault, move it to a door they
+own with this tool (or `parachute-vault export` and their own import). The notes, types, links and files travel and
+are checked; the vault's history and the via/by stamps of who wrote what don't travel yet (above), and stay at the
+old door until you close it.
+
 ## Limits
 
 - One file over 50 MiB can't enter an HTTP door (the import's limit; the same door accepts uploads up to 100 MiB).

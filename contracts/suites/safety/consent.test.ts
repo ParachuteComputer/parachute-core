@@ -362,6 +362,42 @@ describe("earlier trust in an app's name", () => {
   });
 });
 
+// ── 3b. the consent page says what the connection can read (0.9.1, T-446; SPEC §3.4) ─────────────────────
+// A vault scope reaches the whole vault at its level, and what an app reads goes to whoever runs it. The page says
+// both, for read and for write (a write grant reads everything too: never less than it can do). A snapshot of the
+// permissions section as a person reads it, with the vault's name written <vault>. Red before T-446: the read row
+// said "Read your notes, tags, attachments, and vault config.", the write row didn't say it reads, and nothing said
+// where what it reads goes.
+
+describe("the consent page says what the connection can read", () => {
+  let session: string;
+  const redirect = "https://fernhill-bakery.example/oauth/callback";
+  let id: string;
+  const permissions = async (scope: string) => {
+    const r = await authorize(session, authorizeParams(id, redirect, scope));
+    if (r.status !== 200 || !r.html.includes('value="consent"')) throw new Error(`setup: expected the consent page for ${scope}, got ${r.status}`);
+    const section = r.html.slice(r.html.indexOf('<section class="scopes"'), r.html.indexOf("</section>", r.html.indexOf('<section class="scopes"')));
+    return visibleText(section).trim().split(s.vaultName).join("<vault>");
+  };
+
+  test("setup: a made-up user signs in; an app registers itself", async () => {
+    session = await signIn(await newUser("consent-reach"));
+    id = await registered("Fernhill Planner", redirect);
+  });
+
+  test("read: the whole vault, and where it goes", async () => {
+    expect(await permissions(READ)).toBe(
+      "Permissions requested vault:<vault>:read read Read the whole vault: every note, tag and attachment, and its settings. What this app reads from your vault goes to the company that runs it.",
+    );
+  });
+
+  test("write: it reads the whole vault too", async () => {
+    expect(await permissions(`vault:${s.vaultName}:write`)).toBe(
+      "Permissions requested vault:<vault>:write write Read the whole vault. Create, edit, and delete notes and attachments, and apply existing tags to them. What this app reads from your vault goes to the company that runs it.",
+    );
+  });
+});
+
 // ── 4. the box's lockout holds under a parallel burst ───────────────────────────────────────────────────────
 
 describe("a parallel burst of wrong passwords locks the account out at the limit", () => {

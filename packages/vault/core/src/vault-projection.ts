@@ -345,6 +345,24 @@ export function attachmentsInstructionBlock(opts: { ticketsEnabled: boolean; rea
  * tags-with-schemas inline is the default; cap heuristics can be added if
  * a real test shape demands it.
  */
+/**
+ * What a connection can read, said plainly at connect (0.9.1, SPEC §3.4): the whole vault at its level, or only the
+ * records under a tag scope. Never less than the key can do: a write or admin key reads everything too. `level` is
+ * the highest verb the key holds on this vault; `tags` is its tag scope (null or empty: none).
+ */
+export function connectionReach(level: "read" | "write" | "admin", tags: readonly string[] | null | undefined): string {
+  const can =
+    level === "admin"
+      ? { whole: ", create, change and delete its records, and manage its types, settings and keys.", scoped: " It can also create, change and delete records and manage the vault's types, settings and keys." }
+      : level === "write"
+        ? { whole: ", and create, change and delete its records.", scoped: " It can also create, change and delete records." }
+        : { whole: ". It can't change anything.", scoped: " It can't change anything." };
+  if (!tags || tags.length === 0) return `This connection can read the whole vault${can.whole}`;
+  const named = tags.map((t) => `\`${t}\``);
+  const list = named.length === 1 ? named[0] : `${named.slice(0, -1).join(", ")} or ${named[named.length - 1]}`;
+  return `This connection can read only the records tagged ${list} (subtags included); other records are hidden from it.${can.scoped}`;
+}
+
 export function projectionToMarkdown(args: {
   vaultName: string;
   description?: string | null;
@@ -373,6 +391,10 @@ export function projectionToMarkdown(args: {
    * vault's description, names or paths. Omitted: the text as written.
    */
   words?: (s: string) => string;
+  /**
+   * What this connection can read, in one line under the vault's name (0.9.1; `connectionReach`). Omitted: no line.
+   */
+  reach?: string;
 }): string {
   const { vaultName, description, projection, coordinates } = args;
   const w = args.words ?? ((s: string) => s);
@@ -380,6 +402,7 @@ export function projectionToMarkdown(args: {
 
   const lines: string[] = [];
   lines.push(`You are connected to Parachute Vault "${vaultName}".`);
+  if (args.reach) lines.push(args.reach);
   // vault#669 / cloud#87 recovery: a non-string description (poisoned
   // via an unguarded write door) used to throw here (`description.trim
   // is not a function`) and take down MCP `initialize` — the first

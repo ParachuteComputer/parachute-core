@@ -956,7 +956,7 @@ cp .env.example .env   # edit with your config
 docker compose up -d
 ```
 
-Set `PARACHUTE_VAULT_NAME` to auto-create a first vault on startup (name: lowercase alphanumeric + hyphens or underscores, 2–32 chars). Without it the server boots with zero vaults — create one explicitly via the admin wizard, `parachute init --vault-name <name>`, or `parachute-vault create <name>`.
+Set `PARACHUTE_VAULT_NAME` to auto-create a first vault on startup (name: lowercase alphanumeric + hyphens or underscores, 2–32 chars). Without it the server boots with zero vaults — create one explicitly via the admin wizard, `parachute init --vault-name <name>`, or `parachute-vault create <name>`. First boot makes no API key (from 0.9.1): reach the vault with `VAULT_AUTH_TOKEN` (set it in `.env`) or a hub-signed token.
 
 ### Cloud platforms
 
@@ -985,7 +985,8 @@ Set `PARACHUTE_VAULT_NAME` to auto-create a first vault on startup (name:
 lowercase alphanumeric + hyphens or underscores, 2–32 chars). Without it
 the server boots with zero vaults — create one explicitly via the admin
 wizard, `parachute init --vault-name <name>`, or `parachute-vault create
-<name>`.
+<name>`. First boot makes no API key (from 0.9.1): reach the vault
+with `VAULT_AUTH_TOKEN` or a hub-signed token.
 
 #### Other platforms
 
