@@ -474,6 +474,17 @@ describe("gap 6: changing a tag that a key's scope names is refused without forc
     expect((await rest(s.vaultViaHub, keyed).get(`/notes?tag=${enc(KEPT)}`)).body.length).toBe(1);
   });
 
+  // Review round 3: a rename carries its sub-tags along matched without case (`team` takes `TEAM/a`), so the guard
+  // must see a key on `TEAM/a` when `team` is renamed.
+  test("renaming a tag whose sub-tag a key names, in another case, is refused too", async () => {
+    const UPPER = `${R}TEAM/a`;
+    const k = await pass({ level: "read", tags: [UPPER] });
+    await note(`${R}/g6/team`, "lower", [`${R}team`]);
+    await note(`${R}/g6/team-a`, "the key's", [UPPER]);
+    refused(await op.post(`/tags/${enc(`${R}team`)}/rename`, { new_name: `${R}team2` }), "renaming a tag whose sub-tag a key names in another case", keyName(k));
+    expect((await rest(s.vaultViaHub, k).get(`/notes?tag=${enc(UPPER)}`)).body.length).toBe(1);
+  });
+
   test("REST: rename and delete of a private tag and of the published tag", async () => {
     refused(await op.post(`/tags/${enc(PRIV)}/rename`, { new_name: `${PRIV}x` }), "renaming a private tag");
     refused(await op.del(`/tags/${enc(PRIV)}`), "deleting a private tag");
