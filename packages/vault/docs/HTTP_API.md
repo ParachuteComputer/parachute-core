@@ -216,7 +216,7 @@ Refusals, before anything is written:
 
 | When | Status | `error_type` |
 |---|---|---|
-| The header (or `on_behalf_of`) from a key without the permission | 403 | `on_behalf_not_granted` |
+| The header (or `on_behalf_of`) from a key without the permission | 403 | `on_behalf_not_allowed` |
 | An id outside the rule | 400 | `invalid_on_behalf_of` |
 | The header on a write that records no writer (attachments, history erases, tag schemas, vault config) | 400 | `on_behalf_not_recorded` |
 | A token whose `permissions` carry a key this vault doesn't enforce, or a malformed `key`/`acts_for` | 401 | — |

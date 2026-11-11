@@ -161,7 +161,7 @@ describe("safety/on-behalf: REST", () => {
     const path = `onbehalf/plain/${id()}`;
     const r = await api(plain.token, "POST", "/notes", { content: "no", path }, { [HEADER]: "client-42" });
     expect(r.status).toBe(403);
-    expect(r.body.error_type).toBe("on_behalf_not_granted");
+    expect(r.body.error_type).toBe("on_behalf_not_allowed");
     expect(r.body.message).toContain(HEADER);
     expect(r.body.message).toContain("on_behalf_of: true");
     expect((await record(path)).status).toBe(404);
@@ -197,7 +197,7 @@ describe("safety/on-behalf: REST", () => {
       expect(r.status, `${route}: ${r.text.slice(0, 120)}`).toBe(400);
       expect(r.body.error_type, route).toBe("on_behalf_not_recorded");
       const p = await api(plain.token, method, route, body, { [HEADER]: "client-42" });
-      expect(p.body?.error_type, route).toBe("on_behalf_not_granted");
+      expect(p.body?.error_type, route).toBe("on_behalf_not_allowed");
     }
     // The MCP transport never reads the REST header: refused there too.
     const m = await call(`/vault/${s.vaultName}/mcp`, {

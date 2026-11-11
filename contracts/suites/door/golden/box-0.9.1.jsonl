@@ -90,7 +90,7 @@
 {"key":"keys/app-key.mint.shape","value":{"can":"string","created_at":"string","expires_at":"string","last_used_at":"null","name":"string","revoked_at":"null","scopes":["string"],"status":"string","token":"string","vault":"string"}}
 {"key":"keys/app-key.revoke.shape","value":{"name":"string","revoked_at":"string"}}
 {"key":"keys/app-key.written-via","value":"key:<name>"}
-{"key":"keys/on-behalf.refusal.not-granted","value":{"error":"(text)","hint":"b5583e490ca4fb65","keys":["error","error_type","field","hint","message","status"],"status":403,"type":"on_behalf_not_granted"}}
+{"key":"keys/on-behalf.refusal.not-granted","value":{"error":"(text)","hint":"b5583e490ca4fb65","keys":["error","error_type","field","hint","message","status"],"status":403,"type":"on_behalf_not_allowed"}}
 {"key":"keys/on-behalf.refusal.reserved-name","value":{"error":"invalid_name","status":400}}
 {"key":"keys/on-behalf.stamp","value":{"by":"<name>:client-42","via":"key:<name>"}}
 {"key":"keys/owner-key.reply.shape","value":{"aud":"string","expires_at":"string","scopes":["string"],"token":"string"}}

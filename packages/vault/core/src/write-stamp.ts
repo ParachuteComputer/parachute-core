@@ -99,7 +99,7 @@ export class StampClaimError extends Error {}
 /** A refusal, shaped for either door. */
 export interface OnBehalfRefusal {
   status: 400 | 403;
-  error_type: "on_behalf_not_granted" | "invalid_on_behalf_of";
+  error_type: "on_behalf_not_allowed" | "invalid_on_behalf_of";
   message: string;
   field: string;
   hint: string;
@@ -122,7 +122,7 @@ export function resolveBy(
     return {
       refusal: {
         status: 403,
-        error_type: "on_behalf_not_granted",
+        error_type: "on_behalf_not_allowed",
         field,
         message:
           `${field} names the person a write is for, stamped as "by" <key name>:<id>. This key may not write on behalf ` +

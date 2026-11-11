@@ -4,8 +4,9 @@
 // name reads as that person's only after their own key claims it. Links and claims name the vault they are said in.
 //
 // Red today: no door takes a signed statement, so most contracts stop where `granted()` files one, and each of those
-// starts with a grant that must be taken. One is red for its own reason: today a write carrying the on-behalf header
-// from a credential without the permission is taken and the header ignored.
+// starts with a grant that must be taken. One is red for its own reason: since 0.9.1's write stamp, a write carrying
+// the on-behalf header from a credential without the permission is refused (403, nothing written), but the refusal has
+// the 0.9 REST shape (`error` is the sentence, `error_type` is `on_behalf_not_allowed`), not 1.0's (`error` is the code).
 //
 // Who carries a filing matters (§7.1): the owner is told §7.4's reasons; a service or a person carrying its own link
 // or claim gets the 401 an unknown vault gives for every failure. So every reason asserted here is carried by the
@@ -72,7 +73,7 @@ describe("setup holds today", () => {
 });
 
 describe("the on-behalf header", () => {
-  red("from a credential without the permission is refused, never ignored", { reason: /the on-behalf header was ignored, not refused/, lane: LANE }, async () => {
+  red("from a credential without the permission is refused, never ignored", { reason: /Expected: "on_behalf_not_allowed"/, lane: LANE }, async () => {
     const order = await declareType("order");
     const { r, path } = await writeFor(owner, order, "client-42");
     try {
