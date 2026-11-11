@@ -121,7 +121,8 @@ one that now passes.
 
 `bun run mutants:candidate` copies the workspace once, applies each mutant to `packages/vault`, `packages/hub` or
 `packages/cli` in a copy, rebuilds the core candidate, and requires the named contracts to go red
-(`harness/mutants.ts`). **Flips** go the other way: a small fix to today's code that must turn
+(`harness/mutants.ts`). A mutant whose suite is a door contract (`suites/door/…`) runs through `bun run doors` on
+that candidate as a box. **Flips** go the other way: a small fix to today's code that must turn
 named `red()` contracts "now green". A contract that is red today and green under the fix has a red/green proof
 that it tests the fix. When the real fix lands, its flip becomes mutants that put each bug back.
 

@@ -32,7 +32,6 @@ import {
   type ComposedVaultVerb,
   accountVaultsGrant,
   composedAccountGrant,
-  composedVerbSatisfies,
 } from "@openparachute/door-contract";
 import { type AccountVaultMeta, listVaultsWithMeta } from "./account-api.ts";
 import { HOST_ADMIN_SCOPE, provisionVault } from "./admin-vaults.ts";
@@ -253,10 +252,6 @@ export function installedVaults(ctx: AccountToolContext): AccountVaultMeta[] {
   return listVaultsWithMeta(ctx.manifestPath, ctx.issuer);
 }
 
-function isUnrestricted(db: Database, principal: AccountMcpPrincipal): boolean {
-  return principal.isHubAdmin || isHubAdmin(db, principal.userId);
-}
-
 /**
  * Per-call write check: the key's level on that vault is at least write (`keyLevelOnVault`, the 1.0 grants seam).
  * Opening the account door (list/query) is not write.
@@ -271,7 +266,10 @@ export function canWriteVault(
 
 /** The verb of the hop token for `vaultName`: the key's level there (`keyLevelOnVault`), never the person's role. */
 export function verbForVault(ctx: AccountToolContext, vaultName: string): ComposedVaultVerb {
-  return keyLevelOnVault(ctx.db, ctx.principal, vaultName) ?? "read";
+  const level = keyLevelOnVault(ctx.db, ctx.principal, vaultName);
+  // Coverage only lists vaults this connection reaches, so no level here is a bug: refuse rather than mint a guess.
+  if (level === null) throw new AccountToolError("forbidden", `this connection has no access to vault "${vaultName}"`);
+  return level;
 }
 
 const listVaultsTool: AccountMcpTool = {

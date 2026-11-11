@@ -1,6 +1,3 @@
-import type { Database } from "bun:sqlite";
-import { randomBytes } from "node:crypto";
-import { composedVerbSatisfies, isComposedVaultVerb } from "@openparachute/door-contract";
 /**
  * Grant / revoke / list vault access by Nostr pubkey.
  *
@@ -33,6 +30,8 @@ import { composedVerbSatisfies, isComposedVaultVerb } from "@openparachute/door-
  * Cloud's account-MCP twin is identity-worker shaped and does not grow these
  * tools. Hub-only on purpose.
  */
+import type { Database } from "bun:sqlite";
+import { randomBytes } from "node:crypto";
 import { keyLevelOnVault, levelSatisfies } from "./key-level.ts";
 import { decodeNpub } from "./nip19.ts";
 import { bindPubkeyOperatorAttested, findPubkeyLink, isPubkeyHex } from "./pubkey-links.ts";
@@ -45,7 +44,6 @@ import {
   isHubAdmin,
   removeUserVault,
   upsertUserVault,
-  vaultVerbsForUserVault,
 } from "./users.ts";
 
 /**

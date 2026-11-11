@@ -312,7 +312,7 @@ function coveredVault(ctx: AccountToolContext, raw: unknown): AccountVaultMeta {
   const coverage = resolveCoverage(ctx.db, ctx.principal, installedVaults(ctx));
   // The refusal teaches: it names the vaults this key reaches and its level on each, so the next call can be right.
   const reach = coverage.vaults
-    .map((v) => `${v.name} (${keyLevelOnVault(ctx.db, ctx.principal, v.name) ?? "read"})`)
+    .map((v) => `${v.name} (${keyLevelOnVault(ctx.db, ctx.principal, v.name) ?? "none"})`)
     .join(", ");
   const names =
     reach.length > 0 ? `This connection reaches: ${reach}.` : "This connection reaches no vault.";
