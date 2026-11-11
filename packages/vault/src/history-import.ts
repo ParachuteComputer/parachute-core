@@ -63,17 +63,25 @@ function parserVersion(value: unknown): 1 | 2 {
  * scalar, which strict YAML reads back as exactly that text. Nothing else is touched: structure, numbers, booleans
  * and every other fault in the block are still strict YAML's to accept or refuse.
  *
- * `reading` is "old-export" for a commit made before `FLOW_QUOTING_SINCE` (only the old exporter existed), else
- * "export". A box that kept the old exporter for a while after that date can still have written `'word'` meaning
+ * `reading` is "old-export" when the first commit that holds the file was made before `FLOW_QUOTING_SINCE` (only
+ * the old exporter existed), else "export". A box that kept the old exporter for a while after that date can still have written `'word'` meaning
  * the quoted string; that one shape, in that window, is read as today's exporter means it. See UPGRADING.md.
  *
- * The exporter writes one value per line and never a block scalar. A block that holds one (`key: |`, `key: >`) was
- * not written by it, so nothing is rewritten and strict YAML decides alone.
+ * The exporter writes one value per line and never a block scalar. A block that holds one (a line ending in `|` or
+ * `>` with deeper lines under it) was not written by it, so nothing is rewritten and strict YAML decides alone.
  */
 export function readExportScalars(block: string, reading: "export" | "old-export"): string {
   const lines = block.split("\n");
-  // The indicator must be the whole value: `title: Q3 - >` is an ordinary string that happens to end like one.
-  if (lines.some(line => /^\s*(?:- )?(?:[^:'"]+: )?[|>][+-]?\d*\s*\r?$/.test(line))) return block;
+  // A block scalar: a line that ends in an indicator (`|`, `>-`, `|2`, with or without a comment, whatever its key
+  // looks like) and whose next line with text is indented deeper. `title: Q3 - >` ends like one, but nothing deeper
+  // follows it: that is an ordinary string, and the block is still read.
+  const indent = (line: string) => line.length - line.trimStart().length;
+  const header = /(?:^|:[ \t]+|-[ \t]+)[|>](?:[1-9][+-]?|[+-][1-9]?)?[ \t]*(?:#.*)?\r?$/;
+  if (lines.some((line, i) => {
+    if (!header.test(line)) return false;
+    const next = lines.slice(i + 1).find(l => l.trim() !== "");
+    return next !== undefined && indent(next) > indent(line);
+  })) return block;
   return lines.map(raw => {
     const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
     const match = /^(\s*(?:- )?)(?:([^\s'"\[\]{},#&*!|>%@`-][^'"]*?): )?(['"\[{].*)$/.exec(line);
