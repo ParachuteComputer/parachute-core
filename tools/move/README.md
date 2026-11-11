@@ -88,6 +88,8 @@ A difference passes only when it was named before the move. A count never excuse
 ## What does not travel
 
 - **Earlier versions of notes.** The export doesn't carry history yet (0.9.4). The old door keeps it until closed.
+  Moving from a box to the hosted door, an operator can send the box's history after the move (its git mirror, imported
+  with `parachute-vault history-import`, and its native versions): parachute-cloud `HISTORY.md`, "Operator history import".
 - **Who wrote each note** (`created_by`, `created_via`). Counted in the manifest.
 - **Credentials.** A token names the door that signed it. `REKEY.md` lists every connected app and named key at the
   old door and the new addresses. Your own Nostr key signs in at any 0.9.1 door that lists it as the owner.

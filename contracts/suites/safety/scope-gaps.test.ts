@@ -485,6 +485,22 @@ describe("gap 6: changing a tag that a key's scope names is refused without forc
     expect((await rest(s.vaultViaHub, k).get(`/notes?tag=${enc(UPPER)}`)).body.length).toBe(1);
   });
 
+  // Final check: the fold goes both ways. A key on the parent in another case (`CREW`) reaches `CREW/a`, which a
+  // rename of `crew` takes along; a key on `GUILD` reaches `GUILD/x/y`, which a rename of `guild/x` takes along.
+  test("renaming a tag under or beside a key's tag in another case is refused too", async () => {
+    const parent = await pass({ level: "read", tags: [`${R}CREW`] });
+    await note(`${R}/g6/crew`, "lower", [`${R}crew`]);
+    await note(`${R}/g6/crew-a`, "the key's", [`${R}CREW/a`]);
+    refused(await op.post(`/tags/${enc(`${R}crew`)}/rename`, { new_name: `${R}crew2` }), "renaming a tag a key names in another case", keyName(parent));
+    expect((await rest(s.vaultViaHub, parent).get(`/notes?tag=${enc(`${R}CREW/a`)}`)).body.length).toBe(1);
+
+    const above = await pass({ level: "read", tags: [`${R}GUILD`] });
+    await note(`${R}/g6/guild-x`, "lower", [`${R}guild/x`]);
+    await note(`${R}/g6/guild-xy`, "the key's", [`${R}GUILD/x/y`]);
+    refused(await op.post(`/tags/${enc(`${R}guild/x`)}/rename`, { new_name: `${R}open` }), "renaming a tag under a key's tag in another case", keyName(above));
+    expect((await rest(s.vaultViaHub, above).get(`/notes?tag=${enc(`${R}GUILD/x/y`)}`)).body.length).toBe(1);
+  });
+
   test("REST: rename and delete of a private tag and of the published tag", async () => {
     refused(await op.post(`/tags/${enc(PRIV)}/rename`, { new_name: `${PRIV}x` }), "renaming a private tag");
     refused(await op.del(`/tags/${enc(PRIV)}`), "deleting a private tag");
