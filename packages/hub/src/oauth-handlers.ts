@@ -36,6 +36,7 @@ import {
   AuthCodePkceMismatchError,
   AuthCodeRedirectMismatchError,
   AuthCodeUsedError,
+  authCodeGeneration,
   issueAuthCode,
   redeemAuthCode,
 } from "./auth-codes.ts";
@@ -59,6 +60,14 @@ import {
   isCoveredByGrantForClientName,
   recordGrant,
 } from "./grants.ts";
+import {
+  GrantChangedError,
+  type PerVaultLevel,
+  bumpGrantGeneration,
+  isAccountDoorChoiceScope,
+  isAccountVaultsConnectionScope,
+  parsePerVaultScope,
+} from "./grant-generation.ts";
 import { consumeFirstClientAutoApproveWindow } from "./hub-settings.ts";
 import { VAULT_VERBS, inferAudience } from "./jwt-audience.ts";
 import {
@@ -71,6 +80,7 @@ import {
   findTokenRowByJti,
   linkRotation,
   liveFamilyRefreshRows,
+  refreshRowGeneration,
   revokeFamily,
   signAccessToken,
   signRefreshToken,
@@ -96,6 +106,7 @@ import {
 } from "./rate-limit.ts";
 import { isHttpsRequest } from "./request-protocol.ts";
 import {
+  isAccountMcpResource,
   isRootMcpResource,
   narrowResourceVaultScopes,
   narrowRootMcpScopes,
@@ -669,6 +680,24 @@ function findNonRequestableScopes(scopes: readonly string[]): string[] {
   return scopes.filter(isNonRequestableScope);
 }
 
+/**
+ * `account:<id>:vaults:…` past the connection scope: a vault, or a vault and a level (T-446). Only the consent screen
+ * narrows the account door to vaults and levels; an app that asks for one itself would choose the level for the
+ * person. So the public flow drops it from the request and from `extra_scope` before anything reads them (drop, not
+ * refuse: the same answer the cap always gave a non-owner's pre-narrowed ask). Any casing.
+ */
+function isNarrowedAccountVaultsScope(scope: string): boolean {
+  const parts = scope.toLowerCase().split(":");
+  return parts[0] === "account" && parts[2] === "vaults" && parts.length > 3;
+}
+
+function withoutNarrowedAccountVaults(scope: string): string {
+  return scope
+    .split(" ")
+    .filter((s) => s.length > 0 && !isNarrowedAccountVaultsScope(s))
+    .join(" ");
+}
+
 /** Every `vault:<name>:<verb>` name actually present in `scopes` (verb ∈ VAULT_VERBS). */
 function namedVaultScopeNames(scopes: readonly string[]): Set<string> {
   const out = new Set<string>();
@@ -745,6 +774,10 @@ function resolveTokenResourceAudience(
     const audience = resolveRootMcpTokenAudience(grantedVaultNames, fallbackAudience);
     if (audience === null) return { errorResponse: invalidTargetResponse(requestResource) };
     return { audience };
+  }
+  // The account door by its own URL: only an account-audience grant (no named vault scope) may bind to it.
+  if (isAccountMcpResource(requestResource, boundOrigins) && fallbackAudience === "account") {
+    return { audience: "account" };
   }
   return { errorResponse: invalidTargetResponse(requestResource) };
 }
@@ -1286,6 +1319,11 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
   // No resource, or one that isn't an MCP resource we front (off-origin,
   // malformed, non-vault path) → neither branch fires and the flow is
   // byte-for-byte the pre-#461 behavior (manual picker, etc.).
+  // T-446: an app never names a vault or a level on the account door itself; the person chooses them at consent.
+  if (parsed.scope.split(" ").some(isNarrowedAccountVaultsScope)) {
+    parsed.scope = withoutNarrowedAccountVaults(parsed.scope);
+    url.searchParams.set("scope", parsed.scope);
+  }
   let rootNarrowedToEmpty = false;
   const boundOrigins = resolveBoundOrigins(deps);
   const boundVault = resolveResourceVault(parsed.resource, boundOrigins);
@@ -1547,15 +1585,20 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
     client.clientId,
     requestedScopes,
   );
+  // T-446: a per-vault account-door grant covers a later `account:vaults` ask from the same app (its levels again).
+  const perVaultCovered = hasUnnamedVault
+    ? null
+    : perVaultGrantCovering(db, session.userId, client.clientId, requestedScopes);
   if (
     !hasStaleAssignment &&
     userHasVaultPosture &&
     ((!hasUnnamedVault && isCoveredByGrant(db, session.userId, client.clientId, requestedScopes)) ||
-      unnamedCoveredByAccountGrant)
+      unnamedCoveredByAccountGrant ||
+      perVaultCovered !== null)
   ) {
     const mintScopes = unnamedCoveredByAccountGrant
       ? replaceUnnamedVaultScopesWithAccountVaults(requestedScopes)
-      : requestedScopes;
+      : (perVaultCovered ?? requestedScopes);
     console.log(
       `consent skipped: existing grant covers requested scope client_id=${client.clientId} user_id=${session.userId} scopes=${mintScopes.join(" ")}`,
     );
@@ -1675,6 +1718,9 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
           requested: parsed.scope.split(" ").filter((s) => s.length > 0),
           vaultName: assignedVaults.length === 1 ? assignedVaults[0] : undefined,
         }),
+        requestedScopes.some(isAccountVaultsConnectionScope)
+          ? [...perVaultOffer(db, session.userId, userIsAdmin, assignedVaults, vaultNames)].map(([vault, max]) => ({ vault, max }))
+          : undefined,
       ),
     ),
     200,
@@ -1723,8 +1769,141 @@ function bindAccountVaultsScopes(scopes: readonly string[]): string[] {
   return scopes.map((s) => (s === ACCOUNT_VAULTS_UNNARROWED ? accountVaultsScope("self") : s));
 }
 
-function isAccountVaultsConnectionScope(scope: string): boolean {
-  return scope === ACCOUNT_VAULTS_UNNARROWED || scope === accountVaultsScope("self");
+/**
+ * What the person may offer per vault on the account-door consent: the vaults they reach on this box, each at the
+ * highest of read/write they hold there. The owner reaches every vault at write; anyone else, the vaults assigned to
+ * them that still exist, at their role (a role without read offers nothing).
+ */
+function perVaultOffer(
+  db: Database,
+  userId: string,
+  userIsAdmin: boolean,
+  assignedVaults: readonly string[],
+  vaultNames: readonly string[],
+): Map<string, PerVaultLevel> {
+  const out = new Map<string, PerVaultLevel>();
+  for (const v of userIsAdmin ? vaultNames : assignedVaults.filter((a) => vaultNames.includes(a))) {
+    if (userIsAdmin) {
+      out.set(v, "write");
+      continue;
+    }
+    const verbs = vaultVerbsForUserVault(db, userId, v) ?? [];
+    if (verbs.includes("write")) out.set(v, "write");
+    else if (verbs.includes("read")) out.set(v, "read");
+  }
+  return out;
+}
+
+/**
+ * A per-vault account-door choice (or all-none) for (user, client), applied in the caller's transaction BEFORE the
+ * grant write it goes with (round 7, grant-generation.ts). A refresh token re-mints from its own row's scopes and a
+ * code from its own, so when the new choice removes or lowers any account-door scope the prior grant, a live refresh
+ * row or an auth code of this (user, client) carries (a vault dropped, write → read, the level-less grant), the
+ * choice NARROWS, and then:
+ *   - the grant generation is bumped, so no mint in flight under the wider choice can insert (the check in
+ *     `signRefreshToken` re-reads its code's or row's generation after signing and refuses a stale one);
+ *   - the live refresh rows and codes the new choice covers on every vault move to the new generation, so they
+ *     keep working (an equal or wider family is left alone, as before);
+ *   - the ones it doesn't cover are tidied: their families revoked, unused codes deleted. That is a tidy-up now,
+ *     not the defence: the generation already stops them.
+ * An equal or wider choice bumps nothing and touches nothing.
+ */
+function applyAccountDoorChoice(db: Database, userId: string, clientId: string, choice: readonly string[], now: Date): void {
+  const chosen = new Map<string, PerVaultLevel>();
+  for (const s of choice) {
+    const p = parsePerVaultScope(s);
+    if (p && (p.level === "write" || !chosen.has(p.vault))) chosen.set(p.vault, p.level);
+  }
+  const covered = (scope: string): boolean => {
+    const p = parsePerVaultScope(scope);
+    if (!p) return false; // the level-less grant is wider than any per-vault choice
+    const level = chosen.get(p.vault);
+    return level === "write" || level === p.level;
+  };
+  const wider = (scopes: string): boolean =>
+    scopes.split(" ").some((s) => s.length > 0 && isAccountDoorChoiceScope(s) && !covered(s));
+  const rows = db
+    .query<{ jti: string; family_id: string; scopes: string }, [string, string, string]>(
+      "SELECT jti, family_id, scopes FROM tokens WHERE user_id = ? AND client_id = ? AND revoked_at IS NULL AND refresh_token_hash IS NOT NULL AND expires_at > ?",
+    )
+    .all(userId, clientId, now.toISOString());
+  // Every code of this (user, client), used ones included: a used code may be a redeem still signing.
+  const codes = db
+    .query<{ code: string; scopes: string; used_at: string | null }, [string, string]>(
+      "SELECT code, scopes, used_at FROM auth_codes WHERE user_id = ? AND client_id = ?",
+    )
+    .all(userId, clientId);
+  const prior = findGrant(db, userId, clientId);
+  const narrows =
+    (prior !== null && wider(prior.scopes.join(" "))) || rows.some((r) => wider(r.scopes)) || codes.some((c) => wider(c.scopes));
+  if (!narrows) return;
+  const generation = bumpGrantGeneration(db, userId, clientId);
+  const restampRow = db.prepare("UPDATE tokens SET grant_generation = ? WHERE jti = ?");
+  const restampCode = db.prepare("UPDATE auth_codes SET grant_generation = ? WHERE code = ?");
+  const deleteCode = db.prepare("DELETE FROM auth_codes WHERE code = ?");
+  for (const row of rows) {
+    if (wider(row.scopes)) revokeFamily(db, row.family_id, now);
+    else restampRow.run(generation, row.jti);
+  }
+  for (const c of codes) {
+    if (!wider(c.scopes)) restampCode.run(generation, c.code);
+    else if (c.used_at === null) deleteCode.run(c.code);
+  }
+}
+
+/**
+ * The per-vault form fields (`account_vault_levels=1`, `vault_level:<vault>` = none|read|write) turned into the
+ * grant. Every posted field must name a vault on offer, once, at a level no higher than offered; anything else is
+ * refused, never silently narrowed, so a forged form can't pass for a choice. A vault not posted is none. Without the
+ * marker (a consent page from before 0.9.1) the level-less grant stays as it was (Open 1, Aaron's decision).
+ */
+function applyPerVaultLevels(
+  scopes: readonly string[],
+  form: Awaited<ReturnType<Request["formData"]>>,
+  offer: ReadonlyMap<string, PerVaultLevel>,
+): { scopes: string[] } | { error: string } | { none: true } {
+  if (!scopes.some(isAccountVaultsConnectionScope)) return { scopes: [...scopes] };
+  if (String(form.get("account_vault_levels") ?? "") !== "1") return { scopes: [...scopes] };
+  const chosen: string[] = [];
+  const seen = new Set<string>();
+  for (const key of new Set([...form.keys()])) {
+    if (!key.startsWith("vault_level:")) continue;
+    const vault = key.slice("vault_level:".length);
+    const values = form.getAll(key).map(String);
+    const max = offer.get(vault);
+    if (max === undefined) return { error: `you can't grant access to a vault called "${vault}" here` };
+    if (values.length !== 1 || seen.has(vault)) return { error: `choose one level for ${vault}` };
+    seen.add(vault);
+    const level = values[0]!;
+    if (level === "none") continue;
+    if (level !== "read" && level !== "write") return { error: `${vault}: choose none, read or write` };
+    if (level === "write" && max !== "write") return { error: `${vault}: you hold read there, so you can grant read at most` };
+    chosen.push(`account:self:vaults:${vault}:${level}`);
+  }
+  if (chosen.length === 0) return { none: true };
+  return { scopes: [...scopes.filter((s) => !isAccountVaultsConnectionScope(s)), ...chosen.sort()] };
+}
+
+/**
+ * Skip-consent for a per-vault grant: an app that asks for the account door again (`account:vaults`) and already
+ * holds a per-vault grant from this person gets that grant again, not a fresh level-less one. Covered only when the
+ * stored grant has per-vault scopes and no level-less one, and holds every other scope asked for.
+ */
+function perVaultGrantCovering(
+  db: Database,
+  userId: string,
+  clientId: string,
+  requestedScopes: readonly string[],
+): string[] | null {
+  if (!requestedScopes.some(isAccountVaultsConnectionScope)) return null;
+  const grant = findGrant(db, userId, clientId);
+  if (!grant) return null;
+  const perVault = grant.scopes.filter((s) => parsePerVaultScope(s) !== null);
+  if (perVault.length === 0 || grant.scopes.some(isAccountVaultsConnectionScope)) return null;
+  const granted = new Set(grant.scopes);
+  const rest = requestedScopes.filter((s) => !isAccountVaultsConnectionScope(s));
+  if (!rest.every((s) => granted.has(s))) return null;
+  return [...rest, ...perVault];
 }
 
 function isAccountSelfRestScope(scope: string): boolean {
@@ -1739,7 +1918,7 @@ function isAccountSelfRestScope(scope: string): boolean {
  * mixing vault-audience scopes with `account:vaults`; it does not forbid
  * `account:self:{read,write,admin}` — they share the account audience. */
 function isAccountAudienceCompanion(scope: string): boolean {
-  return isAccountVaultsConnectionScope(scope) || isAccountSelfRestScope(scope);
+  return isAccountVaultsConnectionScope(scope) || isAccountSelfRestScope(scope) || parsePerVaultScope(scope) !== null;
 }
 
 function isNamedVaultScope(scope: string): boolean {
@@ -1750,7 +1929,7 @@ function isNamedVaultScope(scope: string): boolean {
 }
 
 function accountVaultsCombinedWithOtherScopes(scopes: readonly string[]): boolean {
-  const has = scopes.some(isAccountVaultsConnectionScope);
+  const has = scopes.some((s) => isAccountVaultsConnectionScope(s) || parsePerVaultScope(s) !== null);
   if (!has) return false;
   return scopes.some((s) => !isAccountAudienceCompanion(s));
 }
@@ -1762,7 +1941,16 @@ function capScopesToUserAuthority(
   opts: { userIsAdmin: boolean },
 ): string[] {
   if (opts.userIsAdmin) return [...scopes];
-  return scopes.filter((s) => {
+  // A per-vault account-door grant above the person's current role there narrows to read when they still read it
+  // (T-446), rather than losing the vault. The narrowed set is what gets recorded (it replaces the per-vault scopes),
+  // so raising the role again doesn't silently bring write back.
+  const narrowed = scopes.map((s) => {
+    const pv = parsePerVaultScope(s);
+    if (!pv || pv.level !== "write") return s;
+    const verbs = vaultVerbsForUserVault(db, userId, pv.vault) ?? [];
+    return !verbs.includes("write") && verbs.includes("read") ? `account:self:vaults:${pv.vault}:read` : s;
+  });
+  return narrowed.filter((s) => {
     // Account scopes are ACCOUNT-WIDE, and on self-host the account IS the box
     // (`account-api.ts`: "operator ≡ account ≡ box… the operator owns every
     // vault, so the ownership gate the cloud twin runs per-vault is trivially
@@ -1794,6 +1982,9 @@ function capScopesToUserAuthority(
     // as the door-contract. Detect the family case-insensitively so
     // `ACCOUNT:self:admin` is still dropped rather than passing through to
     // the vault-verb branch.
+    // A per-vault account-door grant (T-446): only at a level the person holds on that vault.
+    const perVault = parsePerVaultScope(s);
+    if (perVault) return (vaultVerbsForUserVault(db, userId, perVault.vault) ?? []).includes(perVault.level);
     if (s.toLowerCase().startsWith("account:")) return isRequestableAccountScope(s);
     const parts = s.split(":");
     if (parts.length !== 3 || parts[0] !== "vault") return true; // non-named — pass through
@@ -1909,7 +2100,12 @@ export function grantableExtraScopes(
  *      cap, not the grant lookup, is what blocks the mint).
  *   2. Grant recording (`recordGrant`) with the CAPPED scopes for THIS mint —
  *      so a later skip-consent flow re-entering with the same (user, client)
- *      can never replay an un-held verb. UNION semantics make this idempotent.
+ *      can never replay an un-held verb. Recording is a UNION, except that a
+ *      per-vault account-door choice replaces the earlier account-door scopes
+ *      and, when it narrows, bumps the grant generation in the same
+ *      transaction (applyAccountDoorChoice, grant-generation.ts), so a
+ *      narrower choice stays narrower and nothing minted under the wider one
+ *      mints again (T-446).
  *
  * Not the ONLY `recordGrant` call in this module, though: two other guarded
  * fast-path records exist — the trust-by-client_name auto-promote in
@@ -1975,17 +2171,26 @@ function issueAuthCodeRedirect(
 
   // Record the grant with the CAPPED scopes (single source of truth) so
   // skip-consent re-entry can never widen back to an un-held verb.
-  recordGrant(db, userId, params.clientId, dedupedScopes, deps.now?.() ?? new Date());
-
-  const code = issueAuthCode(db, {
-    clientId: params.clientId,
-    userId,
-    redirectUri: params.redirectUri,
-    scopes: dedupedScopes,
-    codeChallenge: params.codeChallenge,
-    codeChallengeMethod: params.codeChallengeMethod,
-    now: deps.now,
-  });
+  // T-446: a per-vault account-door grant is the person's whole choice of vaults and levels. It replaces the earlier
+  // per-vault and level-less account-door scopes instead of adding to them, so a narrower choice stays narrower.
+  // A refresh token or code from the earlier consent would keep the old levels, so a choice that narrows bumps the
+  // grant generation (applyAccountDoorChoice): nothing minted under the wider choice mints again, in flight or not.
+  // The choice, the grant write and the new code (stamped with the generation) are one synchronous transaction.
+  const perVaultChoice = dedupedScopes.some((s) => parsePerVaultScope(s) !== null);
+  const grantNow = deps.now?.() ?? new Date();
+  const code = db.transaction(() => {
+    if (perVaultChoice) applyAccountDoorChoice(db, userId, params.clientId, dedupedScopes, grantNow);
+    recordGrant(db, userId, params.clientId, dedupedScopes, grantNow, perVaultChoice ? isAccountDoorChoiceScope : undefined);
+    return issueAuthCode(db, {
+      clientId: params.clientId,
+      userId,
+      redirectUri: params.redirectUri,
+      scopes: dedupedScopes,
+      codeChallenge: params.codeChallenge,
+      codeChallengeMethod: params.codeChallengeMethod,
+      now: deps.now,
+    });
+  })();
   const u = new URL(params.redirectUri);
   u.searchParams.set("code", code.code);
   if (params.state) u.searchParams.set("state", params.state);
@@ -2139,6 +2344,7 @@ async function handleConsentSubmit(
   csrfToken: string,
 ): Promise<Response> {
   const params = paramsFromForm(form);
+  params.scope = withoutNarrowedAccountVaults(params.scope); // T-446: see isNarrowedAccountVaultsScope
   // RFC 8707 resource binding — defense-in-depth (mirror of the GET handler).
   // The consent form's hidden inputs already carry the narrowed named scopes
   // (the GET handler rewrote `parsed.scope` before rendering), but a hand-
@@ -2236,7 +2442,7 @@ async function handleConsentSubmit(
   const extraScopes = form
     .getAll("extra_scope")
     .map((v) => String(v))
-    .filter((v) => v.length > 0);
+    .filter((v) => v.length > 0 && !isNarrowedAccountVaultsScope(v));
 
   // Per-scope consent (granular approval). The consent screen renders one
   // checkbox per REQUESTED scope, so a user can approve the notes access an
@@ -2509,9 +2715,36 @@ async function handleConsentSubmit(
   // The grant is recorded (or extended) INSIDE issueAuthCodeRedirect with the
   // CAPPED scopes — the single mint choke-point owns both the anti-privesc cap
   // and the recordGrant so no path can record an un-held verb. UNION semantics
-  // there mean a subset re-flow still matches a prior grant, and an admin-only
+  // there (except the account door's per-vault choice, which replaces the
+  // earlier one) mean a subset re-flow still matches a prior grant, and an admin-only
   // request from a non-owner caps to empty → refused (no zero-scope token).
   // (#75 skip-consent depends on this recording.)
+  // Consent per vault (T-446): the levels the person chose replace the level-less account-door grant.
+  if (scopes.some(isAccountVaultsConnectionScope)) {
+    const manifest = (deps.loadServicesManifest ?? readServicesManifest)();
+    const offer = perVaultOffer(db, session.userId, userIsAdmin, assignedVaults, listVaultNames(manifest));
+    const applied = applyPerVaultLevels(scopes, form, offer);
+    if ("error" in applied) return htmlError("Vault access not allowed", `vault_scope_mismatch: ${applied.error}.`, 400);
+    if ("none" in applied) {
+      // Every vault at none is a choice too: drop the earlier account-door choice from the grant and bump the grant
+      // generation (applyAccountDoorChoice), in one step, so nothing minted under it mints again and the next plain
+      // ask shows the page instead of replaying the old levels.
+      const noneAt = deps.now?.() ?? new Date();
+      const userId = session.userId;
+      db.transaction(() => {
+        applyAccountDoorChoice(db, userId, params.clientId, [], noneAt);
+        if (findGrant(db, userId, params.clientId)) recordGrant(db, userId, params.clientId, [], noneAt, isAccountDoorChoiceScope);
+      })();
+      return oauthErrorRedirect(
+        params.redirectUri,
+        "access_denied",
+        "No vault was granted — every vault was left at none.",
+        params.state,
+      );
+    }
+    scopes = applied.scopes;
+  }
+
   return issueAuthCodeRedirect(db, params, scopes, session.userId, deps);
 }
 
@@ -2985,6 +3218,9 @@ async function handleTokenAuthorizationCode(
           clientId: redeemed.clientId,
           scopes: redeemed.scopes,
           ...("key" in appKey ? { keyName: appKeyName } : {}),
+          // Re-read from the code's row after signing: a narrowing that landed meanwhile has bumped the generation
+          // (and left this code behind unless the new choice covers it), so nothing is inserted or returned.
+          artifactGeneration: () => authCodeGeneration(db, code),
           now: deps.now,
         });
         break;
@@ -3010,7 +3246,7 @@ async function handleTokenAuthorizationCode(
       services,
     });
   } catch (err) {
-    if (err instanceof VaultNameReservedError)
+    if (err instanceof VaultNameReservedError || err instanceof GrantChangedError)
       return jsonResponse({ error: "invalid_grant", error_description: err.message }, 400);
     throw err;
   }
@@ -3061,56 +3297,7 @@ async function handleTokenRefresh(
   }
   const refreshUserId: string = row.userId;
   const now = deps.now?.() ?? new Date();
-  if (row.revokedAt) {
-    // Replay of an already-rotated refresh token. Per RFC 6819 §5.2.2.3 the
-    // working assumption is theft — the legitimate client received a new
-    // refresh token at the prior rotation, so anyone presenting the old one
-    // either lost a race or stole it (the case we must defend against).
-    //
-    // ONE-GENERATION GRACE WINDOW (hub#685). Benign concurrent/retried
-    // refreshes — a multi-tab SPA, a bfcache/stale-tab resume, a network
-    // retry — legitimately present the *just-rotated* token a moment after
-    // it rotated. To avoid forcing those real clients to re-login, we let
-    // through the SINGLE immediately-previous token, and ONLY it, for
-    // ~REFRESH_GRACE_MS. The grace case rotates the live tip and converges
-    // the replaying client onto the current token; it does NOT mint a
-    // second live token into a forked lineage.
-    //
-    // The window is narrow ON PURPOSE — both conditions must hold:
-    //   (a) WINDOW: this row was revoked within the last REFRESH_GRACE_MS.
-    //   (b) IMMEDIATE-PREDECESSOR: this row's recorded successor (rotated_to)
-    //       IS the family's single live refresh row. That proves it's the
-    //       direct parent of the current tip — not an older ancestor (whose
-    //       successor is itself revoked) and not a sibling fork.
-    //
-    // HARD SECURITY INVARIANT: anything outside (a)∧(b) — an OLDER/ancestor
-    // token, any replay past the window, a family with zero or multiple live
-    // tips (already a theft-revoked or forked family) — falls through to the
-    // unchanged zero-tolerance path: revokeFamily + invalid_grant. The grace
-    // window NEVER tolerates more than the one immediate predecessor, and
-    // never beyond REFRESH_GRACE_MS.
-    const live = liveFamilyRefreshRows(db, row.familyId, now);
-    const revokedAtMs = new Date(row.revokedAt).getTime();
-    const withinWindow =
-      now.getTime() - revokedAtMs <= REFRESH_GRACE_MS && now.getTime() >= revokedAtMs;
-    const tip = live.length === 1 ? live[0]! : null;
-    const isImmediatePredecessor =
-      tip !== null && row.rotatedTo !== null && row.rotatedTo === tip.jti;
-    if (withinWindow && isImmediatePredecessor && tip) {
-      // Benign replay of the immediate predecessor. Rotate the live tip and
-      // hand the client the new pair — it converges on the current lineage
-      // (single live token preserved), no family revocation. Equivalent to
-      // what the client would have received had it presented the tip itself.
-      return await rotateAndRespond(db, tip, deps, now, requestResource);
-    }
-    // Genuine theft (or a too-late replay): revoke every descendant so the
-    // attacker can't keep refreshing, and force re-authorization.
-    revokeFamily(db, row.familyId, now);
-    return jsonResponse(
-      { error: "invalid_grant", error_description: "refresh_token revoked" },
-      400,
-    );
-  }
+  if (row.revokedAt) return await refreshRevokedRow(db, row, deps, now, requestResource);
   if (now.getTime() > new Date(row.expiresAt).getTime()) {
     return jsonResponse(
       { error: "invalid_grant", error_description: "refresh_token expired" },
@@ -3121,14 +3308,83 @@ async function handleTokenRefresh(
 }
 
 /**
+ * A refresh token presented after its row was revoked: the one-generation grace window, else reuse detection
+ * (revoke the family, invalid_grant). Also where a refresh lands that lost the race to its own rotation.
+ * `now` must be read at the time of this decision, after the row was found revoked, never a clock from before an
+ * await: a sibling's `revoked_at` later than a stale `now` reads as outside the window and ends the family.
+ */
+async function refreshRevokedRow(
+  db: Database,
+  row: RefreshTokenRow,
+  deps: OAuthDeps,
+  now: Date,
+  requestResource: string | null,
+): Promise<Response> {
+  // Replay of an already-rotated refresh token. Per RFC 6819 §5.2.2.3 the
+  // working assumption is theft — the legitimate client received a new
+  // refresh token at the prior rotation, so anyone presenting the old one
+  // either lost a race or stole it (the case we must defend against).
+  //
+  // ONE-GENERATION GRACE WINDOW (hub#685). Benign concurrent/retried
+  // refreshes — a multi-tab SPA, a bfcache/stale-tab resume, a network
+  // retry — legitimately present the *just-rotated* token a moment after
+  // it rotated. To avoid forcing those real clients to re-login, we let
+  // through the SINGLE immediately-previous token, and ONLY it, for
+  // ~REFRESH_GRACE_MS. The grace case rotates the live tip and converges
+  // the replaying client onto the current token; it does NOT mint a
+  // second live token into a forked lineage.
+  //
+  // The window is narrow ON PURPOSE — both conditions must hold:
+  //   (a) WINDOW: this row was revoked within the last REFRESH_GRACE_MS.
+  //   (b) IMMEDIATE-PREDECESSOR: this row's recorded successor (rotated_to)
+  //       IS the family's single live refresh row. That proves it's the
+  //       direct parent of the current tip — not an older ancestor (whose
+  //       successor is itself revoked) and not a sibling fork.
+  //
+  // HARD SECURITY INVARIANT: anything outside (a)∧(b) — an OLDER/ancestor
+  // token, any replay past the window, a family with zero or multiple live
+  // tips (already a theft-revoked or forked family) — falls through to the
+  // unchanged zero-tolerance path: revokeFamily + invalid_grant. The grace
+  // window NEVER tolerates more than the one immediate predecessor, and
+  // never beyond REFRESH_GRACE_MS.
+  const live = liveFamilyRefreshRows(db, row.familyId, now);
+  const revokedAtMs = new Date(row.revokedAt!).getTime(); // both callers pass a revoked row
+  const withinWindow =
+    now.getTime() - revokedAtMs <= REFRESH_GRACE_MS && now.getTime() >= revokedAtMs;
+  const tip = live.length === 1 ? live[0]! : null;
+  const isImmediatePredecessor =
+    tip !== null && row.rotatedTo !== null && row.rotatedTo === tip.jti;
+  if (withinWindow && isImmediatePredecessor && tip) {
+    // Benign replay of the immediate predecessor. Rotate the live tip and
+    // hand the client the new pair — it converges on the current lineage
+    // (single live token preserved), no family revocation. Equivalent to
+    // what the client would have received had it presented the tip itself.
+    return await rotateAndRespond(db, tip, deps, now, requestResource, false);
+  }
+  // Genuine theft (or a too-late replay): revoke every descendant so the
+  // attacker can't keep refreshing, and force re-authorization.
+  revokeFamily(db, row.familyId, now);
+  return jsonResponse(
+    { error: "invalid_grant", error_description: "refresh_token revoked" },
+    400,
+  );
+}
+
+/** The refresh row stopped being live between its read and the rotation; the transaction rolls back. */
+class RefreshRowNotLiveError extends Error {}
+
+/**
  * Rotate a single live refresh-token row: revoke it, mint + insert a new
  * access + refresh pair bound to the same family, and link old→new
  * (`rotated_to`) so a future grace-window check can identify the direct
  * predecessor (hub#685). Returns the spec-shaped token response.
  *
- * Both call sites pass a row that is live at the moment of the call: the
+ * Both call sites pass a row that is live at the moment they read it: the
  * normal path passes the presented (non-revoked) token; the grace path
- * passes the family's single live tip. Used for both so the benign-replay
+ * passes the family's single live tip. It may stop being live during the
+ * signing await (a sibling rotation, a narrowing): then nothing is written
+ * and the request is judged as a replay, on a fresh clock. A narrowing
+ * that bumps the grant generation also refuses the mint (GrantChangedError). Used for both so the benign-replay
  * client receives exactly what a direct refresh of the tip would yield.
  */
 async function rotateAndRespond(
@@ -3137,6 +3393,8 @@ async function rotateAndRespond(
   deps: OAuthDeps,
   now: Date,
   requestResource: string | null,
+  /** A row that stopped being live before it rotated goes through the replay path once (not again from there). */
+  replayIfNotLive = true,
 ): Promise<Response> {
   const refreshUserId = row.userId ?? "";
   // Mint the access token *before* opening the rotation transaction. JWT
@@ -3186,16 +3444,24 @@ async function rotateAndRespond(
     let refresh: ReturnType<typeof signRefreshToken>;
     try {
       refresh = db.transaction(() => {
-        db.prepare("UPDATE tokens SET revoked_at = ? WHERE jti = ?").run(
-          now.toISOString(),
-          row.jti,
-        );
+        // Only a row that is still live rotates. The row was read before the await above, and in that gap a
+        // narrower consent may have revoked its family (or a sibling refresh rotated it). Then mint nothing
+        // here: no new refresh row into an ended family (the catch below decides as for a replay). The grant
+        // generation check inside signRefreshToken is the second gate: a narrowing that left this row behind
+        // refuses the mint even if the row is still live.
+        const rotated = db
+          .prepare("UPDATE tokens SET revoked_at = ? WHERE jti = ? AND revoked_at IS NULL")
+          .run(now.toISOString(), row.jti);
+        if (rotated.changes === 0) throw new RefreshRowNotLiveError();
         const minted = signRefreshToken(db, {
           jti: access.jti,
           userId: refreshUserId,
           clientId: row.clientId,
           scopes: row.scopes,
           familyId: row.familyId,
+          // The rotated row's generation, read now (after the await), not the copy read before it: a narrowing that
+          // covers this family moved it to the new generation; one that doesn't left it behind.
+          artifactGeneration: () => refreshRowGeneration(db, row.jti),
           now: deps.now,
         });
         // Link old→new so the grace-window check (hub#685) can tell the
@@ -3210,6 +3476,21 @@ async function rotateAndRespond(
       // RFC 6749 §5.2 — instead of letting the SQLite error bubble as a 500
       // (#108). The transaction is already rolled back at this point, so
       // the row's revoked_at is unchanged for the losing request.
+      if (err instanceof RefreshRowNotLiveError) {
+        // Nothing was written. Decide as for a replay of the now-revoked row: a sibling's rotation within the
+        // grace window converges on its tip; a row whose family was ended (no successor) gets invalid_grant.
+        // The grace window is judged on the clock read NOW, not this request's `now` from before its await: a
+        // sibling that rotated meanwhile stamped `revoked_at` with its own, later clock, and judging that against
+        // our stale `now` read it as "revoked in the future", outside the window, and ended the whole family
+        // (round 6: about 6% of simultaneous double refreshes).
+        const current = replayIfNotLive ? findTokenRowByJti(db, row.jti) : null;
+        if (current?.revokedAt) return await refreshRevokedRow(db, current, deps, deps.now?.() ?? new Date(), requestResource);
+        return jsonResponse({ error: "invalid_grant", error_description: "refresh_token revoked" }, 400);
+      }
+      if (err instanceof GrantChangedError) {
+        // The person narrowed this app's account-door choice while this rotation was signing: nothing was written.
+        return jsonResponse({ error: "invalid_grant", error_description: err.message }, 400);
+      }
       if (err instanceof RefreshTokenInsertError) {
         return jsonResponse(
           { error: "invalid_grant", error_description: "refresh_token rotation conflict" },
@@ -3609,6 +3890,7 @@ function consentProps(
   // Passed IN rather than computed here because it needs the db + userId,
   // which this pure props builder deliberately doesn't take.
   grantableExtras: readonly string[] = [],
+  vaultLevels?: ReadonlyArray<{ vault: string; max: "read" | "write" }>,
 ) {
   const requestedScopes = params.scope.split(" ").filter((s) => s.length > 0);
   const unnamedVerbs = unnamedVaultVerbs(requestedScopes);
@@ -3766,6 +4048,7 @@ function consentProps(
     // at DCR time (bearer hub:admin / same-origin session → true).
     sameHub: client.sameHub,
     grantableExtras,
+    ...(vaultLevels ? { vaultLevels } : {}),
   };
 }
 

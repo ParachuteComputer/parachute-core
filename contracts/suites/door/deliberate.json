@@ -314,6 +314,28 @@
       "status": "drift",
       "owner": "parachute-cloud 0.9.1: the vault worker's REST read (it drops its own records copy for the engine's `rest-records` then)",
       "why": "A box attaches `validation_status` to a typed record when it is read over REST, as both doors do on create and on MCP. A cloud-style door's hand-ported REST read leaves it out. The box's `/api/records` made the difference visible; `/api/notes` has had it since 0.8. Read `validation_status` as optional on a get."
+    },
+    {
+      "id": "multi-vault-door",
+      "keys": [
+        "has/multi-vault-door",
+        "multivault/*"
+      ],
+      "between": [
+        "box",
+        "cloud",
+        "personal"
+      ],
+      "releases": [
+        "0.9.1"
+      ],
+      "lacks": [
+        "cloud",
+        "personal"
+      ],
+      "status": "drift",
+      "owner": "parachute-cloud 0.9.1 multi-vault door (T-446)",
+      "why": "On a box one key can cover several vaults, each at its own level (`POST /account/keys {name, vaults: {<vault>: \"read\"|\"write\"}}`), and the account door (`/account/mcp`) serves the record tools plus `list-vaults` with it: `vault` named on every write, each vault reached at that key's level there. A cloud-style door's account door doesn't take such a key yet; an app that needs several vaults there holds one key per vault."
     }
   ]
 }

@@ -34,6 +34,7 @@ import {
   verbForVault,
 } from "./account-mcp.ts";
 import { signAccessToken } from "./jwt-sign.ts";
+import { keyLevelOnVault } from "./key-level.ts";
 
 export interface ListedMcpTool {
   name: string;
@@ -47,11 +48,13 @@ export interface ModuleMcpBackend {
   callTool(name: string, args: Record<string, unknown>, ctx: AccountToolContext): Promise<unknown>;
 }
 
-const UNION_CATALOG_LINE =
-  "Catalog caveat: advertised from one covered vault's live list (highest verb this connection holds). Calling this against a different covered vault may return Unknown tool if that vault grants a lower verb.";
-
-const VAULT_FIELD_DESCRIPTION =
-  "Target vault by name. Omit on query-records (or query-notes) to fan the query across every reachable vault; required on every other vault-shaped tool.";
+/**
+ * The vault selector's words. Kept short: they ride on every proxied tool, and a writer's whole list through the
+ * account door is held to the same 4,000-token budget as a per-vault door (contracts/suites/door/multivault.test.ts).
+ * The catalog caveat (the list comes from one vault's live list) is said once, on list-vaults.
+ */
+const VAULT_FIELD_REQUIRED = "Vault name (list-vaults shows them).";
+const VAULT_FIELD_FAN_OUT = "Vault name. Omit to query every vault you can read.";
 
 const listCache = new WeakMap<AccountToolContext, Promise<readonly ListedMcpTool[]>>();
 
@@ -119,12 +122,17 @@ export async function mintVaultMcpToken(
   // second, reintroducing the exact misattribution this change fixes (and
   // silently, since the token is otherwise valid). `null` for non-NIP-98
   // connections keeps their key byte-identical to before.
+  // T-446: the hop carries the account credential's named key (its signed `key` claim), so the vault stamps the
+  // write `via key:<name>` as it does at its own door. The cache is keyed by that credential (its jti): a hop minted
+  // for one key is never handed to another, and a revoked key is refused at the door before it reaches the cache.
+  const stampKey = ctx.principal.key;
   const key = hopCacheKey(
     ctx.principal.userId,
     vault.name,
     verb,
     ctx.issuer,
     attribution?.permissions.principal_pubkey ?? null,
+    ctx.principal.tokenId ?? null,
   );
   if (hop.reuse) {
     const cached = lookupHopToken(key, nowMs);
@@ -145,7 +153,9 @@ export async function mintVaultMcpToken(
     // `permissions` rather than assign a second `extraClaims` — vault reads an
     // absent `scoped_tags` as UNSCOPED (`vault/src/auth.ts:470`), so clobbering
     // it would WIDEN the token to the full vault, not fail closed.
-    ...(attribution ? { extraClaims: attribution } : {}),
+    ...(attribution || stampKey
+      ? { extraClaims: { ...(attribution ?? {}), ...(stampKey ? { key: { name: stampKey.name, kind: stampKey.kind } } : {}) } }
+      : {}),
     ...(ctx.now !== undefined ? { now: ctx.now } : {}),
   });
   if (hop.reuse) {
@@ -232,7 +242,10 @@ function injectVaultSelector(tool: {
     ...((rawSchema.properties && typeof rawSchema.properties === "object"
       ? rawSchema.properties
       : {}) as Record<string, unknown>),
-    vault: { type: "string", description: VAULT_FIELD_DESCRIPTION },
+    vault: {
+      type: "string",
+      description: FAN_OUT_TOOLS.has(tool.name) ? VAULT_FIELD_FAN_OUT : VAULT_FIELD_REQUIRED,
+    },
   };
   const schema: Record<string, unknown> = { ...rawSchema, properties };
   if (!FAN_OUT_TOOLS.has(tool.name)) {
@@ -241,8 +254,7 @@ function injectVaultSelector(tool: {
       : [];
     if (!req.includes("vault")) schema.required = [...req, "vault"];
   }
-  const base = typeof tool.description === "string" ? tool.description : tool.name;
-  const description = base.includes("Catalog caveat:") ? base : `${base}\n\n${UNION_CATALOG_LINE}`;
+  const description = typeof tool.description === "string" ? tool.description : tool.name;
   return { name: tool.name, description, inputSchema: schema };
 }
 
@@ -297,16 +309,27 @@ export function listVaultModuleTools(ctx: AccountToolContext): Promise<readonly 
 }
 
 function coveredVault(ctx: AccountToolContext, raw: unknown): AccountVaultMeta {
-  if (typeof raw !== "string" || raw.length === 0) {
-    throw new AccountToolError("invalid_vault", "vault is required.");
-  }
   const coverage = resolveCoverage(ctx.db, ctx.principal, installedVaults(ctx));
+  // The refusal teaches: it names the vaults this key reaches and its level on each, so the next call can be right.
+  const reach = coverage.vaults
+    .map((v) => `${v.name} (${keyLevelOnVault(ctx.db, ctx.principal, v.name) ?? "none"})`)
+    .join(", ");
+  const names =
+    reach.length > 0 ? `This connection reaches: ${reach}.` : "This connection reaches no vault.";
+  if (typeof raw !== "string" || raw.length === 0) {
+    throw new AccountToolError(
+      "invalid_vault",
+      `vault is required: name the vault to use. ${names} list-vaults shows them.`,
+      { vaults: coverage.names },
+    );
+  }
   const wanted = raw.toLowerCase();
   const hit = coverage.vaults.find((v) => v.name === wanted);
   if (!hit) {
     throw new AccountToolError(
       "vault_not_covered",
-      `Vault "${raw}" is not among the vaults this connection can reach.`,
+      `Vault "${raw}" is not among the vaults this connection can reach. ${names}`,
+      { vaults: coverage.names },
     );
   }
   return hit;
@@ -336,14 +359,19 @@ async function queryOneVaultMcp(
   vault: AccountVaultMeta,
   args: Record<string, unknown>,
   tool: string,
-): Promise<{ vault: string; notes?: unknown; records?: unknown } | { vault: string; error: string }> {
+): Promise<
+  { vault: string; notes?: unknown; records?: unknown } | { vault: string; error: string }
+> {
   try {
     const result = await postVaultMcp(ctx, vault, "read", "tools/call", {
       name: tool,
       arguments: args,
     });
     // Each vault answers in the words of the tool called: `records` for query-records, `notes` for query-notes.
-    return { vault: vault.name, [tool === "query-records" ? "records" : "notes"]: notesFromMcpResult(result) };
+    return {
+      vault: vault.name,
+      [tool === "query-records" ? "records" : "notes"]: notesFromMcpResult(result),
+    };
   } catch (err) {
     return {
       vault: vault.name,
@@ -366,7 +394,9 @@ async function queryNotesOverlay(
     targets = [coveredVault(ctx, args.vault)];
   }
   const stripped = stripVaultArg(args);
-  const settled = await Promise.allSettled(targets.map((v) => queryOneVaultMcp(ctx, v, stripped, tool)));
+  const settled = await Promise.allSettled(
+    targets.map((v) => queryOneVaultMcp(ctx, v, stripped, tool)),
+  );
   return {
     vaults_queried: targets.map((v) => v.name),
     results: settled.map((s, i) =>

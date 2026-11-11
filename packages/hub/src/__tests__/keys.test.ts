@@ -79,9 +79,9 @@ describe("keys: every live token becomes a key with the same scopes", () => {
     const { db, cleanup } = makeDb();
     try {
       const user = await createUser(db, "kit", "made-up-password-2");
-      const first = signRefreshToken(db, { jti: "r-1", userId: user.id, clientId: "claude-app", scopes: ["vault:uni:write"] });
+      const first = signRefreshToken(db, { artifactGeneration: () => 0, jti: "r-1", userId: user.id, clientId: "claude-app", scopes: ["vault:uni:write"] });
       expect(listKeys(db).map((k) => [k.name, k.owner, k.owner_kind])).toEqual([["claude-app", user.id, "app"]]);
-      signRefreshToken(db, { jti: "r-2", userId: user.id, clientId: "claude-app", scopes: ["vault:uni:write"], familyId: first.familyId });
+      signRefreshToken(db, { artifactGeneration: () => 0, jti: "r-2", userId: user.id, clientId: "claude-app", scopes: ["vault:uni:write"], familyId: first.familyId });
       db.prepare("UPDATE tokens SET rotated_to = 'r-2' WHERE jti = 'r-1'").run();
       const keys = listKeys(db);
       expect(keys).toHaveLength(1);
@@ -96,7 +96,7 @@ describe("keys: every live token becomes a key with the same scopes", () => {
       expect(listKeys(db).map((k) => [k.name, k.status])).toEqual([["claude-app", "active"]]);
       expect((db.prepare("SELECT jti FROM keys").get() as { jti: string }).jti).toBe("r-old-hub");
       // A second app's family is a second key.
-      signRefreshToken(db, { jti: "r-3", userId: user.id, clientId: "claude-app", scopes: ["vault:uni:read"] });
+      signRefreshToken(db, { artifactGeneration: () => 0, jti: "r-3", userId: user.id, clientId: "claude-app", scopes: ["vault:uni:read"] });
       expect(listKeys(db).map((k) => k.name).sort()).toEqual(["claude-app", "claude-app-2"]);
     } finally {
       cleanup();
@@ -107,7 +107,7 @@ describe("keys: every live token becomes a key with the same scopes", () => {
     const { db, cleanup } = makeDb();
     try {
       const user = await createUser(db, "jo", "made-up-password-3");
-      signRefreshToken(db, { jti: "r-old", userId: user.id, clientId: "notes-app", scopes: ["vault:old:read"] });
+      signRefreshToken(db, { artifactGeneration: () => 0, jti: "r-old", userId: user.id, clientId: "notes-app", scopes: ["vault:old:read"] });
       recordTokenMint(db, { jti: "t-old", createdVia: "cli_mint", subject: "door", clientId: "cli", scopes: ["vault:old:read"], expiresAt: FUTURE });
       renameTokensForVault(db, "old", "new", new Date());
       const keys = Object.fromEntries(listKeys(db).map((k) => [k.name, k]));

@@ -36,7 +36,7 @@ import {
 import { ACCOUNT_MCP_TOOLS } from "../account-mcp.ts";
 import { type GrantCaller, callerCanAdminVault, grantAccess } from "../grant-access.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
-import { signAccessToken } from "../jwt-sign.ts";
+import { recordTokenMint, revokeTokenByJti, signAccessToken } from "../jwt-sign.ts";
 import { NOSTR_AUTH_KIND, type NostrEvent, nostrEventId } from "../nostr-event.ts";
 import { NostrReplayCache } from "../nostr-http-auth.ts";
 import { bindPubkeyFromHttpAuth, findPubkeyLink } from "../pubkey-links.ts";
@@ -636,7 +636,9 @@ describe("account MCP — initialize + tools", () => {
       const qn = listBody.result.tools.find((t) => t.name === "query-notes");
       expect(qn?.inputSchema?.properties).toHaveProperty("vault");
       expect(qn?.inputSchema?.required ?? []).not.toContain("vault");
-      expect(qn?.description).toMatch(/Catalog caveat/);
+      // The catalog caveat is said once, on list-vaults, not on every proxied tool (the writer-list budget).
+      expect(listBody.result.tools.find((t) => t.name === "list-vaults")?.description).toMatch(/Catalog caveat/);
+      expect(qn?.description).not.toMatch(/Catalog caveat/);
       const del = listBody.result.tools.find((t) => t.name === "delete-note");
       expect(del?.inputSchema?.required).toContain("vault");
     } finally {
@@ -899,10 +901,15 @@ describe("account MCP — query-notes", () => {
           },
         });
       const res = await handleAccountMcp(
-        bearerReq(token, rpc("tools/call", { name: "query-records", arguments: { search: "hello" } })),
+        bearerReq(
+          token,
+          rpc("tools/call", { name: "query-records", arguments: { search: "hello" } }),
+        ),
         mcpDeps(h, { fetchImpl }),
       );
-      const payload = parseTool((await res.json()) as { result: { content: Array<{ text: string }> } }) as {
+      const payload = parseTool(
+        (await res.json()) as { result: { content: Array<{ text: string }> } },
+      ) as {
         vaults_queried: string[];
         results: Array<{ vault: string; records?: unknown; notes?: unknown }>;
       };
@@ -1033,7 +1040,9 @@ describe("account MCP — query-notes", () => {
       expect(qn?.inputSchema?.properties).toHaveProperty("order_by");
       expect(qn?.inputSchema?.properties).toHaveProperty("vault");
       expect(qn?.inputSchema?.required ?? []).not.toContain("vault");
-      expect(qn?.description).toMatch(/Catalog caveat/);
+      // The catalog caveat is said once, on list-vaults, not on every proxied tool (the writer-list budget).
+      expect(listBody.result.tools.find((t) => t.name === "list-vaults")?.description).toMatch(/Catalog caveat/);
+      expect(qn?.description).not.toMatch(/Catalog caveat/);
     } finally {
       h.cleanup();
     }
@@ -2780,6 +2789,202 @@ describe("account MCP — hop JWT reuse (hub#918)", () => {
       expect(bearers.size).toBe(1);
     } finally {
       restoreHopEnv(prev);
+      h.cleanup();
+    }
+  });
+
+  // T-446: the hop carries the account credential's named key (the write stamp), so a cached hop belongs to the
+  // credential that caused it: never handed to another key of the same person, and unreachable once its key is revoked.
+  test("an account Bearer whose key claim is malformed is refused, not served unstamped", async () => {
+    const h = await makeHarness();
+    try {
+      for (const key of [{ name: "fernhill", kind: "root" }, { name: "../x", kind: "app" }, { name: "fernhill", kind: "app", acts_for: "x" }, "fernhill"]) {
+        const t = await signAccessToken(h.db, { sub: h.ownerId, scopes: ["account:self:vaults:beta:write"], audience: "account", clientId: "parachute-app-key", issuer: ISSUER, ttlSeconds: 600, extraClaims: { key } });
+        const res = await handleAccountMcp(bearerReq(t.token, rpc("tools/list")), mcpDeps(h));
+        expect(res.status, JSON.stringify(key)).toBe(401);
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("TTL=300: a cached hop is never reused by another key, and a revoked key reaches no vault", async () => {
+    const h = await makeHarness();
+    const prev = process.env[ACCOUNT_MCP_HOP_TTL_ENV];
+    process.env[ACCOUNT_MCP_HOP_TTL_ENV] = "300";
+    _resetAccountMcpHopCacheForTests();
+    const { bearers, fetchImpl } = countingFetch();
+    const keyOf = (auth: string) =>
+      (JSON.parse(Buffer.from(auth.replace(/^Bearer\s+/i, "").split(".")[1] ?? "", "base64url").toString()) as { key?: unknown }).key;
+    try {
+      const mintKey = async (name: string) =>
+        (await signAccessToken(h.db, {
+          sub: h.ownerId,
+          scopes: ["account:self:vaults:beta:write"],
+          audience: "account",
+          clientId: "parachute-app-key",
+          issuer: ISSUER,
+          ttlSeconds: 600,
+          extraClaims: { key: { name, kind: "app" } },
+        }).then((m) => {
+          recordTokenMint(h.db, { jti: m.jti, createdVia: "app_key", subject: h.ownerId, userId: h.ownerId, clientId: "parachute-app-key", scopes: ["account:self:vaults:beta:write"], expiresAt: m.expiresAt });
+          return m;
+        }));
+      const a = await mintKey("fernhill-a");
+      const b = await mintKey("fernhill-b");
+      const call = (token: string) =>
+        handleAccountMcp(
+          bearerReq(token, rpc("tools/call", { name: "list-tags", arguments: { vault: "beta" } })),
+          mcpDeps(h, { fetchImpl }),
+        );
+      expect((await call(a.token)).status).toBe(200);
+      expect((await call(b.token)).status).toBe(200);
+      // One hop per key, each naming its own key.
+      expect(bearers.size).toBe(2);
+      expect([...bearers].map(keyOf).map((k) => (k as { name: string }).name).sort()).toEqual(["fernhill-a", "fernhill-b"]);
+      // Revoke a: its next call is refused at the door and reaches no vault, cached hop or not.
+      expect(revokeTokenByJti(h.db, a.jti, new Date())).toBe(true);
+      const before = bearers.size;
+      expect((await call(a.token)).status).toBe(401);
+      expect(bearers.size).toBe(before);
+    } finally {
+      restoreHopEnv(prev);
+      h.cleanup();
+    }
+  });
+});
+
+// ── 0.9.1 "one multi-vault door": the hop token is minted at the KEY's level on that vault (T-446) ─────────────
+// The vault behind the hop is a fake router here, but the hop token it reads is the real one the hub signed: these
+// read its claims (scope, aud, vault_scope), not a mock's call log.
+describe("account MCP — hop token at the key's level (T-446)", () => {
+  interface Hop {
+    vault: string;
+    method: string;
+    tool: string | undefined;
+    scope: string;
+    aud: unknown;
+    vaultScope: unknown;
+  }
+  function claims(auth: string | null): Record<string, unknown> {
+    const part = (auth ?? "").replace(/^Bearer\s+/i, "").split(".")[1] ?? "";
+    try {
+      return JSON.parse(Buffer.from(part, "base64url").toString()) as Record<string, unknown>;
+    } catch {
+      return {};
+    }
+  }
+  async function call(
+    h: Harness,
+    scopes: string[],
+    sub: string,
+    name: string,
+    args: Record<string, unknown>,
+  ) {
+    const hops: Hop[] = [];
+    const fetchImpl = (input: string | URL | Request, init?: RequestInit) => {
+      const headers = input instanceof Request ? input.headers : new Headers(init?.headers);
+      const c = claims(headers.get("authorization"));
+      return routeVaultMcp(input, init, {
+        // As the vault does: a write tool under a hop token without the write verb is not a tool it knows.
+        onCall: ({ scope, rpc }) =>
+          rpc.params?.name === "create-note" && !/:(write|admin)\b/.test(scope)
+            ? { content: [{ type: "text", text: "Unknown tool: create-note" }], isError: true }
+            : undefined,
+        onRequest: ({ vault, rpc }) =>
+          hops.push({
+            vault,
+            method: rpc.method ?? "",
+            tool: rpc.params?.name,
+            scope: String(c.scope ?? ""),
+            aud: c.aud,
+            vaultScope: c.vault_scope,
+          }),
+      });
+    };
+    const token = await bearer(h, scopes, sub);
+    const res = await handleAccountMcp(
+      bearerReq(token, rpc("tools/call", { name, arguments: args })),
+      mcpDeps(h, { fetchImpl }),
+    );
+    const body = (await res.json()) as {
+      result?: { isError?: boolean; content?: Array<{ text?: string }> };
+    };
+    return {
+      hops,
+      isError: body.result?.isError === true,
+      text: body.result?.content?.[0]?.text ?? "",
+    };
+  }
+
+  const writes = (hops: Hop[]) =>
+    hops.filter((x) => x.method === "tools/call" && x.tool === "create-note");
+
+  test("read on personal, write on beta: no write reaches personal, and each hop carries that vault's level", async () => {
+    const h = await makeHarness();
+    try {
+      const scopes = ["account:self:vaults:personal:read", "account:self:vaults:beta:write"];
+      const a = await call(h, scopes, h.ownerId, "create-note", {
+        vault: "personal",
+        content: "no",
+      });
+      expect(a.isError).toBe(true);
+      expect(a.hops.filter((x) => x.vault === "personal").length).toBeGreaterThan(0);
+      for (const hop of a.hops.filter((x) => x.vault === "personal"))
+        expect(hop.scope).toBe("vault:personal:read");
+      const b = await call(h, scopes, h.ownerId, "create-note", { vault: "beta", content: "yes" });
+      expect(b.isError).toBe(false);
+      const hop = writes(b.hops)[0]!;
+      expect(hop.scope).toBe("vault:beta:write");
+      expect(hop.aud).toBe("vault.beta");
+      expect(hop.vaultScope).toEqual(["beta"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("a key that is read on every vault (`*:read`) never mints above read, even for the owner", async () => {
+    const h = await makeHarness();
+    try {
+      const r = await call(h, ["account:self:vaults:*:read"], h.ownerId, "create-note", {
+        vault: "beta",
+        content: "no",
+      });
+      expect(r.isError).toBe(true);
+      expect(r.hops.length).toBeGreaterThan(0);
+      for (const hop of r.hops) expect(hop.scope).toBe(`vault:${hop.vault}:read`);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("a key that is write on every vault (`*:write`) mints write, not the owner's admin", async () => {
+    const h = await makeHarness();
+    try {
+      const r = await call(h, ["account:self:vaults:*:write"], h.ownerId, "create-note", {
+        vault: "beta",
+        content: "yes",
+      });
+      expect(r.isError).toBe(false);
+      for (const hop of r.hops) expect(hop.scope).toBe(`vault:${hop.vault}:write`);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("the key's level is capped by the person's role: a read-role friend's `*:write` key stays read", async () => {
+    const h = await makeHarness();
+    try {
+      h.db
+        .prepare("UPDATE user_vaults SET role = 'read' WHERE user_id = ? AND vault_name = 'beta'")
+        .run(h.friendId);
+      const r = await call(h, ["account:self:vaults:*:write"], h.friendId, "create-note", {
+        vault: "beta",
+        content: "no",
+      });
+      expect(r.isError).toBe(true);
+      for (const hop of r.hops) expect(hop.scope).toBe("vault:beta:read");
+    } finally {
       h.cleanup();
     }
   });

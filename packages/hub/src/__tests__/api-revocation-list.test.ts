@@ -129,7 +129,7 @@ describe("GET /.well-known/parachute-revocation.json (hub#212 Phase 1)", () => {
         const u = await createUser(db, "owner", "pw");
         // signRefreshToken writes a row with created_via='oauth_refresh';
         // revoking by jti must surface it the same way as cli_mint rows.
-        const refresh = signRefreshToken(db, {
+        const refresh = signRefreshToken(db, { artifactGeneration: () => 0,
           jti: "jti-oauth-refresh-1",
           userId: u.id,
           clientId: "parachute-hub",

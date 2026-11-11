@@ -981,6 +981,7 @@ export function migrate(db: Database): void {
     })();
   }
   ensureKeys(db);
+  ensureGrantGenerations(db);
 }
 
 /**
@@ -1031,5 +1032,39 @@ export function ensureKeys(db: Database): void {
     const cols = db.query("PRAGMA table_info(keys)").all() as { name: string }[];
     if (!cols.some((c) => c.name === "last_used_at")) db.exec("ALTER TABLE keys ADD COLUMN last_used_at TEXT");
     adoptLiveTokens(db);
+  }).immediate();
+}
+
+/**
+ * The grant generation (T-446, grant-generation.ts): a counter per (user, client) that a narrowing account-door
+ * choice bumps, and the generation each auth code and refresh row was minted under. Not a numbered migration, for
+ * the same reason as `keys`: it is additive (a new table, two columns defaulting to 0), an 0.8 hub ignores it, and
+ * hub.db keeps schema 24 so the 0.8 takeover's code-only rollback still opens it. A row an older hub writes gets 0;
+ * if that hub ran after a narrowing, those rows don't match the bumped generation and the app re-consents (fails
+ * safe). Idempotent at every open: check with a read, then take the write lock (IMMEDIATE) as `ensureKeys` does.
+ *
+ * `grant_generations` has no foreign keys on purpose: it must outlive the grant row (a revoke-then-reconsent must
+ * not reset it to 0), and an orphan row for a deleted user or client is a harmless number. A future numbered
+ * migration that rebuilds `tokens` or `auth_codes` must carry `grant_generation` across.
+ */
+export function ensureGrantGenerations(db: Database): void {
+  const hasCol = (table: string) =>
+    (db.query(`PRAGMA table_info(${table})`).all() as { name: string }[]).some((c) => c.name === "grant_generation");
+  const ready = () =>
+    !!db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'grant_generations'").get() &&
+    hasCol("tokens") &&
+    hasCol("auth_codes");
+  if (ready()) return;
+  db.transaction(() => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS grant_generations (
+        user_id TEXT NOT NULL,
+        client_id TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        PRIMARY KEY (user_id, client_id)
+      );
+    `);
+    if (!hasCol("tokens")) db.exec("ALTER TABLE tokens ADD COLUMN grant_generation INTEGER NOT NULL DEFAULT 0");
+    if (!hasCol("auth_codes")) db.exec("ALTER TABLE auth_codes ADD COLUMN grant_generation INTEGER NOT NULL DEFAULT 0");
   }).immediate();
 }

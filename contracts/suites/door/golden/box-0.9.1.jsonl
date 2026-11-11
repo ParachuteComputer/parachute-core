@@ -74,6 +74,7 @@
 {"key":"files/upload.reply.shape","value":{"mimeType":"string","path":"string","size":"number"}}
 {"key":"files/upload.txt","value":{"status":201}}
 {"key":"has/export-over-http","value":false}
+{"key":"has/multi-vault-door","value":true}
 {"key":"has/oauth-approval","value":true}
 {"key":"has/on-behalf-of","value":true}
 {"key":"has/records-over-rest","value":true}
@@ -349,6 +350,12 @@
 {"key":"mcp/write.tool.vault-info.present","value":true}
 {"key":"mcp/write.tool.vault-info.schema","value":"530ff43b9f863786"}
 {"key":"mcp/write.tool.vault-info.words","value":"dee3e40876423132"}
+{"key":"multivault/consent.scope","value":["account:self:vaults:<A>:read","account:self:vaults:<B>:write"]}
+{"key":"multivault/key.mint.keys","value":["created_at","expires_at","last_used_at","name","revoked_at","scopes","status","token","vaults"]}
+{"key":"multivault/query.fan-out.keys","value":["results","vaults_queried"]}
+{"key":"multivault/refusals","value":[400,404,400]}
+{"key":"multivault/write-stamp.via","value":{"created":"key:<name>","revision":"key:<name>"}}
+{"key":"multivault/writer.tools","value":["attachment-url","create-note","create-record","delete-note","delete-record","doctor","find-path","list-tags","list-types","list-vaults","query-notes","query-records","read-attachment","request-attachment-download","request-attachment-upload","update-note","update-record","vault-info"]}
 {"key":"records/mcp.create-record.shape","value":{"body":"string","createdAt":"string","createdBy":"string","createdVia":"string","extension":"string","fields":{"content":"string","door_trip_miles":"number"},"id":"string","lastUpdatedBy":"string","lastUpdatedVia":"string","path":"string","tags":["string"],"types":["string"],"updatedAt":"string","validation_status":{"schemas":["string"],"warnings":[]}}}
 {"key":"records/mcp.list-types.shape","value":{"count":"number","created_at":"string","description":"null","expanded_count":"number","fields":{"door_trip_miles":{"indexed":"boolean","type":"string"}},"kind":"string","name":"string","parent_names":"null","relationships":"null","updated_at":"string"}}
 {"key":"records/mcp.manage-types","value":{"created_at":"string","fields":{"door_trip_miles":{"indexed":"boolean","type":"string"}},"kind":"string","tag":"string","updated_at":"string"}}
