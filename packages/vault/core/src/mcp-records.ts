@@ -275,11 +275,11 @@ const HELP = (tool: string) => `Every parameter: vault-info {help: "${tool}"}.`;
 export const RECORD_DESCRIPTIONS: Readonly<Record<string, string>> = {
   "query-records": `Read records: one record, a filtered list, a search, a link neighbourhood or path, counts, or a record's history.
 - One record: \`id\` (id, path or title). Lists leave the ${BODY} out unless \`include_${BODY}: true\`.
-- Filters combine (AND). \`type\` matches a type and its subtypes (\`event\` finds \`event/meeting\`); \`tag\` matches a label. \`${FIELDS}\` operators need an indexed field (vault-info lists them).
+- Filters combine (AND). \`type\` matches a type and its subtypes (\`event\` finds \`event/meeting\`); \`tag\` matches a label. \`${FIELDS}\` operators work on any field: an indexed one (vault-info lists them) is fastest, any other is read in full and the reply warns \`scan\`.
 - Each record has \`types\` (what it is), \`tags\` (labels), \`${FIELDS}\` and a \`${BODY}\`.
 - Returns an array of records, or \`{records, next_cursor?, warnings?}\` with \`cursor\` or warnings, or \`[{group, value}]\` with \`aggregate\`. An empty page means done.
 Rarer filters (has_links, order_by, expand_links, created_by, search_mode, …) are accepted too. ${HELP("query-records")}`,
-  "create-record": `Create a record, or several with \`records: [...]\`. \`types\` names its types (existing types or new names); \`tags\` adds labels. If \`path\` is taken, \`if_exists\` decides: error (default), ignore, update (merge into it) or replace. ${HELP("create-record")}`,
+  "create-record": `Create a record, or several with \`records: [...]\`. \`types\` names its types (existing types or new names); \`tags\` adds labels. If \`path\` is taken, \`if_exists\` decides: error (default), ignore, update (merge into it) or replace. ${HELP("create-record")} If no existing type fits what the record is, name a new type for it rather than using the nearest one.`,
   "update-record": `Change a record (id, path or title), or several with \`records: [{id, …}]\`.
 - ${BODY[0]!.toUpperCase() + BODY.slice(1)}: \`${BODY}\` (replace all), \`append\`/\`prepend\`, or \`${BODY}_edit\` (old_text must occur once).
 - \`${FIELDS}\` merges (null deletes a key); \`types\`/\`tags\`/\`links\` take {add, remove}.

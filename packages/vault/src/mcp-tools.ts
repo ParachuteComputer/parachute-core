@@ -18,6 +18,7 @@ import { narrowLinkWarningsForVisibility } from "../core/src/wikilinks.ts";
 import type { Note } from "../core/src/types.ts";
 import {
   buildVaultProjection,
+  capVaultInfoTags,
   projectionToMarkdown,
   connectionReach,
   type VaultProjection,
@@ -359,6 +360,17 @@ export function generateScopedMcpTools(
   overrideVaultInfo(tools, vaultName, auth);
   applyTagDependencyGuards(tools, vaultName, scoped);
   applyTagScopeWrappers(tools, vaultName, auth, allowedHolder);
+  // 0.9.2: vault-info's tag map capped, after the scope filter (the totals count what the caller may see).
+  {
+    const info = tools.find((t) => t.name === "vault-info");
+    if (info) {
+      const execute = info.execute;
+      info.execute = async (params) => {
+        const r = await execute(params);
+        return params?.help === undefined && r && typeof r === "object" && !Array.isArray(r) ? capVaultInfoTags(r as Record<string, unknown>) : r;
+      };
+    }
+  }
 
   // manage-token is server-only (needs token-store + auth context), so it
   // lives here rather than in core. Always appended to the surface; the
@@ -821,6 +833,11 @@ function applyTagScopeWrappers(
   // is the unscoped/holder-absent path; `filterHydratedLinksByTagScope` then
   // keys off `rawTags` (non-null here) for the actual scope check.
   const scrubNoteForScope = (n: any): any => {
+    // 0.9.2: a near_name warning on a new type names an existing type; keep it only when that type is in scope.
+    if (n && Array.isArray(n.warnings)) {
+      const allowed = allowedHolder?.value ?? null;
+      n.warnings = n.warnings.filter((w: any) => w?.code !== "near_name" || w?.kind !== "type" || (allowed !== null && allowed.has(w.nearest)));
+    }
     if (n && Array.isArray(n.links)) {
       n.links = filterHydratedLinksByTagScope(n.links, allowedHolder?.value ?? null, rawTags);
     }
@@ -1260,7 +1277,22 @@ function applyTagScopeWrappers(
       return forbidden("update-tag: a parent in parent_names is outside the token's allowlist");
     }
     try {
-      return await orig(params);
+      const result: any = await orig(params);
+      // 0.9.2 near_name warnings come from core's vault-wide name lists: keep a
+      // type warning only when the existing type is in scope, a field warning
+      // only when a type the caller may see declares the field.
+      if (result && typeof result === "object" && Array.isArray(result.warnings)) {
+        const kept = result.warnings
+          .map((w: any) =>
+            w?.code === "near_name" && w.kind === "field" && Array.isArray(w.declared_by)
+              ? { ...w, declared_by: w.declared_by.filter((t: string) => allowed.has(t)) }
+              : w)
+          .filter((w: any) =>
+            w?.code !== "near_name" || (w.kind === "type" ? allowed.has(w.nearest) : Array.isArray(w.declared_by) && w.declared_by.length > 0));
+        const { warnings: _w, ...rest } = result;
+        return kept.length > 0 ? { ...rest, warnings: kept } : rest;
+      }
+      return result;
     } catch (err: any) {
       // Tag-scope scrub for cross-tag field conflicts (vault#554
       // auth-and-scope fold). Core's validation scans EVERY tag's schema

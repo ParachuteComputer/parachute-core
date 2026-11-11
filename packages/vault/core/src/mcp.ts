@@ -80,7 +80,7 @@ import {
   MAX_ATTACHMENT_IMAGE_BYTES,
   type AttachmentBytesProvider,
 } from "./attachment/bytes-provider.js";
-import { foldTypeFilter, holdTypes, markTypes, prepareCallTypes, refreshTypes, tagKinds } from "./tag-kind.js";
+import { attachNearTypeWarnings, foldTypeFilter, holdTypes, markTypes, nearSchemaWarnings, nearTypeWarnings, prepareCallTypes, refreshTypes, tagKinds } from "./tag-kind.js";
 
 /**
  * A single MCP tool-result content block. Mirrors the subset of the MCP SDK's
@@ -2741,6 +2741,8 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             );
           }
         }
+        // 0.9.2: a new type or field one letter from an existing one is made as written, with a warning.
+        const near = nearSchemaWarnings(db, tag, incomingFields);
         const result = await store.upsertTagRecord(tag, {
           ...(descriptionPatch !== undefined ? { description: descriptionPatch } : {}),
           ...(fieldsPatch !== undefined ? { fields: fieldsPatch } : {}),
@@ -2749,7 +2751,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           ...(params.kind !== undefined ? { kind: params.kind as "type" | "tag" } : {}),
         });
 
-        return result;
+        return near.length > 0 && result && typeof result === "object" ? { ...result, warnings: near } : result;
       },
     },
 
@@ -3239,12 +3241,14 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
       const batchTypes = Array.isArray(params.notes) && (params.notes as Record<string, unknown>[]).some((n) => n?.types !== undefined);
       if (params.types === undefined && !batchTypes) return execute(params);
       const prepared = prepareCallTypes(db, params, mode);
+      // 0.9.2: a new type one letter from an existing one is kept, with a warning naming it.
+      const near = nearTypeWarnings(db, prepared.types);
       const release = holdTypes(db, prepared.types);
       try {
         const out = await execute(prepared.params);
         if (!prepared.types.length) return out;
         markTypes(db, prepared.types);
-        return refreshTypes(db, out);
+        return attachNearTypeWarnings(refreshTypes(db, out), near);
       } finally {
         release();
       }

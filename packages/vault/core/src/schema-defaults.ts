@@ -42,6 +42,7 @@
 
 import { Database } from "bun:sqlite";
 import { timestampToMs } from "./cursor.js";
+import { nearestName } from "./tag-hierarchy.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -148,8 +149,14 @@ export interface ValidationWarning {
     | "cardinality_mismatch"
     | "target_tag_mismatch"
     | "unresolved_reference"
-    | "schema_conflict";
+    | "schema_conflict"
+    | "near_name";
   message: string;
+  /**
+   * `near_name` only (0.9.2) — the declared field `field` is one letter from.
+   * The value is kept under the name as written; this is advice, never strict.
+   */
+  nearest?: string;
   /**
    * `schema_conflict` only — the tag whose declaration was overridden. Set
    * when `reason === "schema_conflict"`; absent on other reasons.
@@ -664,6 +671,23 @@ export function validateNote(
         });
       }
     }
+  }
+
+  // 0.9.2: a key the note's types don't declare, one letter from one they do
+  // (`statu` beside `status`), is kept as written, with a warning naming the
+  // declared field. Never strict.
+  for (const key of Object.keys(m)) {
+    if (resolution.mergedFields.has(key)) continue;
+    const nearest = nearestName(resolution.mergedFields.keys(), key);
+    if (nearest === undefined) continue;
+    const sourceTag = resolution.mergedFields.get(nearest)!.sourceTag;
+    warnings.push({
+      field: key,
+      schema: sourceTag,
+      reason: "near_name",
+      nearest,
+      message: `'${key}' isn't a field of '${sourceTag}'; it declares '${nearest}'. Kept as '${key}': if you meant '${nearest}', move the value there.`,
+    });
   }
 
   for (const [fieldName, { spec, sourceTag, others }] of resolution.mergedFields) {

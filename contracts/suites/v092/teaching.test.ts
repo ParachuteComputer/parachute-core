@@ -14,7 +14,7 @@ const api = rest("admin");
 const LANE = "0.9.2 teaching";
 
 describe("0.9.2 teaching", () => {
-  red("a new type one letter from an existing type is accepted with a warning naming the existing one", { reason: /^no nearest-name warning/, lane: LANE }, async () => {
+  test("a new type one letter from an existing type is accepted with a warning naming the existing one", async () => {
     const base = `meeting${runId("n")}`;
     const near = base.replace("meeting", "meetng");
     expect((await api.put(`/tags/${enc(base)}`, { fields: { held_on: { type: "date" } } })).status).toBe(200);
@@ -27,7 +27,7 @@ describe("0.9.2 teaching", () => {
     }
   });
 
-  red("a new field one letter from a field the type declares is kept, with a warning naming the declared one", { reason: /^no nearest-name warning/, lane: LANE }, async () => {
+  test("a new field one letter from a field the type declares is kept, with a warning naming the declared one", async () => {
     const tag = runId("t");
     const field = `status_${runId("f")}`;
     const near = field.replace("status", "statu"); // one letter deleted
@@ -38,7 +38,7 @@ describe("0.9.2 teaching", () => {
     must(said(made.body.validation_status ?? made.body.warnings).includes(field), `no nearest-name warning for ${near}: ${said(made.body.validation_status ?? made.body.warnings ?? null).slice(0, 300)}`);
   });
 
-  red("vault-info's tag map is capped: with 700 types it fits in about 4,000 tokens and says how many there are", { reason: /^uncapped: /, lane: LANE }, async () => {
+  test("vault-info's tag map is capped: with 700 types it fits in about 4,000 tokens and says how many there are", async () => {
     // Vaults with hundreds of types exist; uncapped, the map is most of what vault-info costs an AI to read.
     // Filled on the run's second vault, so the other contracts' vault stays small.
     const m = await otherMcp();
@@ -61,10 +61,13 @@ describe("0.9.2 teaching", () => {
     }
   });
 
-  red("manage-types' own schema teaches reference, required, strict and cardinality, without a call to help", { reason: /^untaught: /, lane: LANE }, async () => {
+  test("manage-types' own schema teaches reference, required, strict and cardinality, without a call to help", async () => {
     // The full reference (`vault-info {help: "manage-types"}`) already has all four; an AI that doesn't ask for it
     // sees only the tool's description and input schema, and that is where they're missing today.
-    const m = await mcp("read");
+    // An admin session: manage-types changes types, so a read or write session isn't shown it at all (as written
+    // first, with "read", the tool was never found and every word read as missing).
+    const m = await mcp("admin");
+    must(!!(await m.tools()).find((t) => t.name === "manage-types"), "setup: an admin session lists manage-types");
     try {
       const tool = said((await m.tools()).find((t) => t.name === "manage-types"));
       const missing = ["reference", "required", "strict", "cardinality"].filter((w) => !tool.includes(w));
@@ -74,7 +77,7 @@ describe("0.9.2 teaching", () => {
     }
   });
 
-  red("query-records says that search needs every word", { reason: /^untaught: search/, lane: LANE }, async () => {
+  test("query-records says that search needs every word", async () => {
     const m = await mcp("read");
     try {
       const tool = (await m.tools()).find((t) => t.name === "query-records");

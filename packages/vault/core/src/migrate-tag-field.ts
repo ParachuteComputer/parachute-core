@@ -37,6 +37,7 @@
 
 import type { Store, Note } from "./types.js";
 import type { ValidationWarning } from "./schema-defaults.js";
+import { loadSchemaConfig, resolveNoteSchemas } from "./schema-defaults.js";
 import { enforceStrictWrite } from "./mcp.js";
 
 // Re-export for callers (tests, server layer) that work with the bypass
@@ -507,8 +508,12 @@ function makeFieldValidator(
       metadata: { [field]: v },
     });
     if (!status) return true;
+    // Only the rules of the type that decides the field (first in the walk)
+    // say "invalid": since 0.9.2 the record's other types are checked too,
+    // advisory, and a value they alone dislike isn't one to overwrite.
+    const decider = resolveNoteSchemas(loadSchemaConfig(store.db), { tags: [tag] }).mergedFields.get(field)?.sourceTag;
     return !status.warnings.some(
-      (w) => w.field === field && w.reason !== "schema_conflict" && w.reason !== "missing_required",
+      (w) => w.field === field && w.schema === decider && w.reason !== "schema_conflict" && w.reason !== "missing_required",
     );
   };
 }

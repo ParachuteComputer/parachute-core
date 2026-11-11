@@ -2249,6 +2249,15 @@ against the new type. `POST /vault/{name}/api/tags/{name}/conformance`
 (admin-SPA-internal, undocumented above) counts how many existing notes
 would fail the tightened type before you commit the schema edit.
 
+**Nearest existing name (0.9.2).** A PUT that makes a new type one letter
+from an existing type, or declares a new field one letter from a field
+another type declares, succeeds and adds `warnings: [{code: "near_name",
+kind: "type"|"field", name, nearest, message}]` to its reply. The same
+warning rides a note write that adds such a type (on the note's
+`warnings`), and a note field one letter from a field its types declare is
+warned in `validation_status.warnings` (`reason: "near_name"`, `nearest`).
+Never a refusal; a tag-scoped caller is only named types it may see.
+
 **A retype that would strand records is refused (0.9.2).** When a PUT
 changes the `type` of a field the tag already declares, and existing
 records carrying the tag (or a subtype) hold a value the NEW spec refuses
