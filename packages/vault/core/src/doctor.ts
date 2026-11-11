@@ -210,7 +210,7 @@ function makeNoteInScope(
   return (id: string): boolean => {
     const cached = cache.get(id);
     if (cached !== undefined) return cached;
-    const tags = (db.prepare("SELECT tag_name FROM note_tags WHERE note_id = ?").all(id) as { tag_name: string }[]).map((r) => r.tag_name);
+    const tags = (db.query("SELECT tag_name FROM note_tags WHERE note_id = ?").all(id) as { tag_name: string }[]).map((r) => r.tag_name);
     const inScope = admit(tags);
     cache.set(id, inScope);
     return inScope;
@@ -638,7 +638,7 @@ function scanFieldShapes(
   return [
     ...mixedTypeFields(db, stats, declared),
     ...referenceGaps(db, scopeIds, declared),
-    ...nearNames(db, stats, declared, allowedTags),
+    ...nearNames(db, stats, declared, allowedTags, scopeIds),
   ];
 }
 
@@ -675,7 +675,10 @@ function referenceGaps(
   // A value names a record when it is that record's path (any case, as
   // wikilinks resolve), the path in `[[...]]`, or its id. A scoped run only
   // counts records it may see, so the count can't reveal a hidden path.
-  const target = `CASE WHEN j.value LIKE '[[%]]' THEN substr(j.value, 3, length(j.value) - 4) ELSE j.value END`;
+  // `[[path]]`, `[[path|alias]]` and `[[path#heading]]` all name `path`.
+  const inner = `(CASE WHEN j.value LIKE '[[%]]' THEN substr(j.value, 3, length(j.value) - 4) ELSE j.value END)`;
+  const noAlias = `(CASE WHEN instr(${inner}, '|') > 0 THEN substr(${inner}, 1, instr(${inner}, '|') - 1) ELSE ${inner} END)`;
+  const target = `(CASE WHEN instr(${noAlias}, '#') > 1 THEN substr(${noAlias}, 1, instr(${noAlias}, '#') - 1) ELSE ${noAlias} END)`;
   const scope = scopeIds === null ? "" : " AND t.id IN (SELECT value FROM json_each(?))";
   const scopeN = scopeIds === null ? "" : " AND n.id IN (SELECT value FROM json_each(?))";
   const rows = db
@@ -691,28 +694,50 @@ function referenceGaps(
     if (r.hits < 2 || r.hits * 2 <= r.total) continue;
     const decl = declared.get(r.key) ?? [];
     if (decl.some((d) => d.type === "reference")) continue;
-    const on = decl.length > 0 ? decl.map((d) => d.tag) : ["<the type its records carry>"];
+    const on = decl.length > 0 ? decl.map((d) => d.tag) : topTypeHolding(db, r.key, scopeIds);
+    const call = on.length > 0
+      ? `manage-types {tag: "${on[0]}", fields: {"${r.key}": {type: "reference"}}}${on.length > 1 ? ` (and on ${on.slice(1).join(", ")})` : ""}`
+      : `manage-types {tag: <the type its records carry>, fields: {"${r.key}": {type: "reference"}}}`;
     findings.push({
       type: "declared_reference_gap",
       severity: "info",
       subject: r.key,
       detail: `field "${r.key}" names another record in ${r.hits} of ${plural(r.total, "record")} that hold text in it, but no type declares it a reference, so the vault keeps it as plain text: it isn't a link, renames don't follow it, and near and backlinks don't see it.`,
-      remedy: `If it points at records, declare it a reference: manage-types {tag: "${on[0]}", fields: {"${r.key}": {type: "reference"}}}${on.length > 1 ? ` (and on ${on.slice(1).join(", ")})` : ""}.`,
+      remedy: `If it points at records, declare it a reference: ${call}.`,
     });
   }
   return findings;
 }
 
+/** The type most of the records holding `key` carry (none when they carry no type). */
+function topTypeHolding(db: Database, key: string, scopeIds: string | null): string[] {
+  if (/["\\]/.test(key)) return [];
+  const scope = scopeIds === null ? "" : " AND n.id IN (SELECT value FROM json_each(?))";
+  const row = db
+    .prepare(`SELECT nt.tag_name AS name, COUNT(*) AS c FROM notes n JOIN note_tags nt ON nt.note_id = n.id JOIN tags t ON t.name = nt.tag_name
+      WHERE json_valid(n.metadata) AND json_type(n.metadata, '$."' || ? || '"') IS NOT NULL AND ${KIND_SQL} = 'type'${scope}
+      GROUP BY nt.tag_name ORDER BY c DESC LIMIT 1`)
+    .get(...(scopeIds === null ? [key] : [key, scopeIds])) as { name: string } | null;
+  return row ? [row.name] : [];
+}
+
 /**
  * Two names one edit apart, case aside, that aren't the same name. Names
- * that differ in one digit (`item1`, `item2`) or in a last letter after a
- * separator (`phase-a`, `phase-b`) are a series, not a slip, and are left out.
+ * that differ in one digit (`item1`, `item2`), add a number at the end
+ * (`item`, `item2`) or differ in a last letter after a separator (`phase-a`,
+ * `phase-b`) are a series, not a slip, and are left out, as are names under
+ * three characters.
  */
 function nearPair(a: string, b: string): boolean {
   if (a === b || Math.abs(a.length - b.length) > 1) return false;
+  // Short names (`x`, `y`, `id`) are one letter from many others by nature.
+  if (a.length < 3 || b.length < 3) return false;
   const [x, y] = [a.toLowerCase(), b.toLowerCase()];
   if (x === y) return true;
   if (levenshtein(x, y) !== 1) return false;
+  // `item` and `item2`: a number added at the end starts a series.
+  const [short, long] = x.length < y.length ? [x, y] : [y, x];
+  if (long.length > short.length && long.startsWith(short) && /\d/.test(long[long.length - 1]!)) return false;
   if (x.length === y.length) {
     for (let i = 0; i < x.length; i++) {
       if (x[i] === y[i]) continue;
@@ -731,10 +756,13 @@ function nearNames(
   stats: FieldStat[],
   declared: Map<string, { tag: string; type?: string }[]>,
   allowedTags: Set<string> | null,
+  scopeIds: string | null,
 ): DoctorFinding[] {
+  // A scoped run counts only the records it may see (a private co-tag hides one).
+  const inScope = scopeIds === null ? "" : " AND nt.note_id IN (SELECT value FROM json_each(?))";
   const typeRows = db
-    .prepare(`SELECT t.name AS name, (SELECT COUNT(*) FROM note_tags nt WHERE nt.tag_name = t.name) AS c FROM tags t WHERE ${KIND_SQL} = 'type'`)
-    .all() as { name: string; c: number }[];
+    .prepare(`SELECT t.name AS name, (SELECT COUNT(*) FROM note_tags nt WHERE nt.tag_name = t.name${inScope}) AS c FROM tags t WHERE ${KIND_SQL} = 'type'`)
+    .all(...(scopeIds === null ? [] : [scopeIds])) as { name: string; c: number }[];
   const types = typeRows.filter((r) => !allowedTags || allowedTags.has(r.name)).map((r) => ({ name: r.name, c: r.c }));
   const fieldUse = new Map<string, number>();
   for (const st of stats) fieldUse.set(st.key, st.records);
@@ -755,7 +783,7 @@ function nearNames(
     type: "near_names" as const,
     severity: "info" as const,
     subject: `${a.name}, ${b.name}`,
-    detail: `two ${kind} names one letter apart: "${a.name}" (${plural(a.c, "record")}) and "${b.name}" (${plural(b.c, "record")}).`,
+    detail: `two ${kind} names ${a.name.toLowerCase() === b.name.toLowerCase() ? "that differ only in case" : "one letter apart"}: "${a.name}" (${plural(a.c, "record")}) and "${b.name}" (${plural(b.c, "record")}).`,
     remedy: kind === "type"
       ? `If they mean the same thing, merge them: manage-types {action: "merge", sources: ["${b.c > a.c ? a.name : b.name}"], target: "${b.c > a.c ? b.name : a.name}"}. If both are meant, nothing to do.`
       : `If they mean the same thing, move the records holding "${b.c > a.c ? a.name : b.name}" to "${b.c > a.c ? b.name : a.name}" (update each record's fields). If both are meant, nothing to do.`,

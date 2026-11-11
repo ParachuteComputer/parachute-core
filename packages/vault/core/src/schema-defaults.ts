@@ -321,7 +321,8 @@ export function resolveNoteSchemas(
     if (!set) {
       const chain: string[] = [];
       walkAncestors(tag, resolved, new Set(), chain);
-      ancestorCache.set(tag, (set = new Set(chain)));
+      // `_default` is every note's implicit base, so every type overrides it.
+      ancestorCache.set(tag, (set = new Set([...chain, "_default"])));
     }
     return set;
   };
@@ -336,12 +337,13 @@ export function resolveNoteSchemas(
         continue;
       }
       if (fieldSpecsEqual(existing.spec, spec)) continue;
-      // A type that redefines a field its ancestor declares overrides it on
-      // purpose (vault#270): the ancestor's rules aren't checked. Any other
+      // A type that redefines a field its ancestor (or `_default`) declares
+      // overrides it on purpose (vault#270): the ancestor's rules aren't
+      // checked, whichever type on the note it is overridden by. Any other
       // type on the note that declares the field differently is.
-      if (!ancestorsOf(existing.sourceTag).has(tagName)) {
-        (existing.others ??= []).push({ spec, sourceTag: tagName });
-      }
+      const overridden = [existing.sourceTag, ...(existing.others ?? []).map((o) => o.sourceTag)]
+        .some((t) => ancestorsOf(t).has(tagName));
+      if (!overridden) (existing.others ??= []).push({ spec, sourceTag: tagName });
       conflicts.push({
         field: fieldName,
         schema: existing.sourceTag,

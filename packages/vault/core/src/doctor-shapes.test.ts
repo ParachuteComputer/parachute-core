@@ -66,10 +66,10 @@ describe("declared_reference_gap", () => {
   }
 
   it("finds a field whose values name records by path, [[path]] or id, and says to declare a reference", async () => {
-    await seed(["projects/alder", "[[projects/birch]]", "<birch id>", "Projects/Alder", "not a record"]);
+    await seed(["projects/alder", "[[projects/birch]]", "<birch id>", "Projects/Alder", "[[projects/alder|Alder]]", "[[projects/birch#notes]]", "not a record"]);
     const [f] = await of("declared_reference_gap");
     expect(f?.subject).toBe("project");
-    expect(f?.detail).toContain("4 of 5 records");
+    expect(f?.detail).toContain("6 of 7 records");
     expect(f?.remedy).toContain('{type: "reference"}');
   });
 
@@ -105,8 +105,8 @@ describe("near_names", () => {
     expect(subjects).toEqual(["dueon, due_on", "ledgr, ledger"]);
   });
 
-  it("leaves out a series (item1/item2, phase-a/phase-b) and plain labels", async () => {
-    await store.createNote("a", { metadata: { item1: 1, item2: 2, "phase-a": 1, "phase-b": 2 } });
+  it("leaves out a series (item1/item2, item/item2, phase-a/phase-b), short names and plain labels", async () => {
+    await store.createNote("a", { metadata: { item: 0, item1: 1, item2: 2, "phase-a": 1, "phase-b": 2, x: 1, y: 2, id: 3, ix: 4 } });
     await store.upsertTagRecord("todo", {});
     await store.upsertTagRecord("toto", {});
     expect(await of("near_names")).toEqual([]);
@@ -116,5 +116,55 @@ describe("near_names", () => {
     await store.upsertTagRecord("ledger", { fields: { amount: { type: "integer" } } });
     await store.upsertTagRecord("ledgr", { fields: { amount: { type: "integer" } } });
     expect(await of("near_names", { allowedTags: new Set(["ledger"]) })).toEqual([]);
+  });
+
+  it("a scoped run's counts leave out records a private co-tag hides", async () => {
+    await store.upsertTagRecord("ledger", { fields: { amount: { type: "integer" } } });
+    await store.upsertTagRecord("ledgr", { fields: { amount: { type: "integer" } } });
+    await store.createNote("seen", { tags: ["ledger"] });
+    for (let i = 0; i < 7; i++) await store.createNote(`hidden ${i}`, { tags: ["ledger", "secret"] });
+    await store.createNote("other", { tags: ["ledgr"] });
+    const scope = {
+      allowedTags: new Set(["ledger", "ledgr", "secret"]),
+      noteTagsInScope: (tags: string[]) => !tags.includes("secret"),
+    };
+    const [f] = await of("near_names", scope);
+    expect(f?.detail).toContain('"ledger" (1 record)');
+    expect(f?.detail).not.toContain("8 records");
+  });
+});
+
+describe("which types a record is checked against (0.9.2)", () => {
+  const warningsFor = async (tags: string[], metadata: Record<string, unknown>) => {
+    const { validateNote, loadSchemaConfig } = await import("./schema-defaults.js");
+    return (validateNote(loadSchemaConfig(store.db), { tags, metadata })?.warnings ?? [])
+      .filter((w) => w.reason !== "schema_conflict")
+      .map((w) => `${w.schema}:${w.reason}`);
+  };
+
+  it("a type overrides `_default` like an ancestor: _default's rules aren't checked", async () => {
+    await store.upsertTagRecord("_default", { fields: { status: { type: "string", enum: ["draft", "done"] } } });
+    await store.upsertTagRecord("task", { fields: { status: { type: "string", enum: ["open", "closed"] } } });
+    expect(await warningsFor(["task"], { status: "open" })).toEqual([]);
+  });
+
+  it("an ancestor overridden by one of the record's other types isn't checked either", async () => {
+    await store.upsertTagRecord("z", { fields: { st: { type: "string", enum: ["z1"] } } });
+    await store.upsertTagRecord("y", { parent_names: ["z"], fields: { st: { type: "string", enum: ["y1", "a1"] } } });
+    await store.upsertTagRecord("a", { fields: { st: { type: "string", enum: ["a1"] } } });
+    // a decides; y is checked (a1 is in its enum: fine); z is y's ancestor, which y overrides.
+    expect(await warningsFor(["a", "y"], { st: "a1" })).toEqual([]);
+    // A value y refuses is warned by y alone.
+    expect(await warningsFor(["a", "y"], { st: "zz" })).toEqual(["a:enum_mismatch", "y:enum_mismatch"]);
+  });
+
+  it("the conformance count counts only the proposal's own violations", async () => {
+    await store.upsertTagRecord("ta", { fields: { st: { type: "string", enum: ["open", "done"] } } });
+    await store.upsertTagRecord("tb", { fields: { st: { type: "string", enum: ["todo", "done"] } } });
+    // tb comes first and refuses "open"; ta (the one proposed below) accepts it.
+    await store.createNote("x", { tags: ["tb", "ta"], metadata: { st: "open" } });
+    expect((await store.countTagConformance("ta", { st: { type: "string", enum: ["open", "done"] } })).violating_notes).toBe(0);
+    // A proposal the record fails counts, even where ta isn't the type that decides.
+    expect((await store.countTagConformance("ta", { st: { type: "string", enum: ["done"] } })).violating_notes).toBe(1);
   });
 });
