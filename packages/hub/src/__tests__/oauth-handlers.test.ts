@@ -12278,6 +12278,65 @@ describe("account-door consent per vault (T-446)", () => {
     }
   });
 
+  async function redeemWithRefresh(db: Awaited<ReturnType<typeof makeDb>>["db"], location: string, clientId: string, verifier: string) {
+    const code = new URL(location).searchParams.get("code");
+    expect(code, location).toBeString();
+    const res = await handleToken(
+      db,
+      new Request(`${ISSUER}/oauth/token`, {
+        method: "POST",
+        body: new URLSearchParams({ grant_type: "authorization_code", code: code!, client_id: clientId, redirect_uri: "https://app.example/cb", code_verifier: verifier }),
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+      }),
+      deps,
+    );
+    expect(res.status).toBe(200);
+    return (await res.json()) as { scope: string; refresh_token: string };
+  }
+  const refresh = (db: Awaited<ReturnType<typeof makeDb>>["db"], clientId: string, refreshToken: string) =>
+    handleToken(
+      db,
+      new Request(`${ISSUER}/oauth/token`, {
+        method: "POST",
+        body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: refreshToken, client_id: clientId }),
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+      }),
+      deps,
+    );
+
+  test("SECURITY: a narrower choice ends the earlier consent's refresh tokens; an equal choice leaves them", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const session = await friendOnWorkReadOtherWrite(db);
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"], status: "approved" });
+      const wideLevels: [string, string][] = [["account_vault_levels", "1"], ["vault_level:work", "read"], ["vault_level:other", "write"]];
+      const first = makePkce();
+      const wide = await post(db, session.id, reg.client.clientId, first.challenge, wideLevels);
+      const wideTokens = await redeemWithRefresh(db, wide.headers.get("location")!, reg.client.clientId, first.verifier);
+      // The same choice again doesn't end the earlier tokens.
+      const same = makePkce();
+      const again = await post(db, session.id, reg.client.clientId, same.challenge, wideLevels, "account:vaults account:self:read");
+      await redeemWithRefresh(db, again.headers.get("location")!, reg.client.clientId, same.verifier);
+      const stillWide = await refresh(db, reg.client.clientId, wideTokens.refresh_token);
+      expect(stillWide.status).toBe(200);
+      const rotated = (await stillWide.json()) as { refresh_token: string };
+      // The friend narrows: other to read, work to none.
+      const second = makePkce();
+      const narrow = await post(db, session.id, reg.client.clientId, second.challenge, [["account_vault_levels", "1"], ["vault_level:work", "none"], ["vault_level:other", "read"]], "account:vaults account:self:read");
+      const narrowTokens = await redeemWithRefresh(db, narrow.headers.get("location")!, reg.client.clientId, second.verifier);
+      expect(narrowTokens.scope).toBe("account:self:vaults:other:read");
+      // The earlier consent's refresh token no longer mints the old levels.
+      const stale = await refresh(db, reg.client.clientId, rotated.refresh_token);
+      expect(stale.status, await stale.clone().text()).toBe(400);
+      // The new consent's refresh token still works, at the new level.
+      const fresh = await refresh(db, reg.client.clientId, narrowTokens.refresh_token);
+      expect(fresh.status).toBe(200);
+      expect(((await fresh.json()) as { scope: string }).scope).toBe("account:self:vaults:other:read");
+    } finally {
+      cleanup();
+    }
+  });
+
   test("a post without the per-vault fields (a page from before 0.9.1) keeps the level-less grant", async () => {
     const { db, cleanup } = await makeDb();
     try {

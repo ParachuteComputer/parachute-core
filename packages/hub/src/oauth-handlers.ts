@@ -1803,6 +1803,40 @@ function perVaultOffer(
   return out;
 }
 
+/** The account-door scopes a per-vault choice supersedes: the level-less connection scope and every per-vault level. */
+function isAccountDoorChoiceScope(scope: string): boolean {
+  return parsePerVaultScope(scope) !== null || isAccountVaultsConnectionScope(scope);
+}
+
+/**
+ * A later per-vault choice replaces the earlier one in the grant, but a refresh token re-mints from its own row's
+ * scopes. So when the new choice removes or lowers any account-door scope a live refresh family of this (user, client)
+ * carries (a vault dropped, write → read, or the level-less grant), that whole family is revoked: the app has to use
+ * the new consent's tokens. A family the new choice covers on every vault (equal or wider) is left alone.
+ */
+function revokeFamiliesWiderThanChoice(db: Database, userId: string, clientId: string, choice: readonly string[], now: Date): void {
+  const chosen = new Map<string, PerVaultLevel>();
+  for (const s of choice) {
+    const p = parsePerVaultScope(s);
+    if (p && (p.level === "write" || !chosen.has(p.vault))) chosen.set(p.vault, p.level);
+  }
+  const covered = (scope: string): boolean => {
+    const p = parsePerVaultScope(scope);
+    if (!p) return false; // the level-less grant is wider than any per-vault choice
+    const level = chosen.get(p.vault);
+    return level === "write" || level === p.level;
+  };
+  const rows = db
+    .query<{ family_id: string; scopes: string }, [string, string, string]>(
+      "SELECT family_id, scopes FROM tokens WHERE user_id = ? AND client_id = ? AND revoked_at IS NULL AND refresh_token_hash IS NOT NULL AND expires_at > ?",
+    )
+    .all(userId, clientId, now.toISOString());
+  for (const row of rows) {
+    const scopes = row.scopes.split(" ").filter((s) => s.length > 0);
+    if (scopes.some((s) => isAccountDoorChoiceScope(s) && !covered(s))) revokeFamily(db, row.family_id, now);
+  }
+}
+
 /**
  * The per-vault form fields (`account_vault_levels=1`, `vault_level:<vault>` = none|read|write) turned into the
  * grant. Every posted field must name a vault on offer, once, at a level no higher than offered; anything else is
@@ -2052,7 +2086,10 @@ export function grantableExtraScopes(
  *      cap, not the grant lookup, is what blocks the mint).
  *   2. Grant recording (`recordGrant`) with the CAPPED scopes for THIS mint —
  *      so a later skip-consent flow re-entering with the same (user, client)
- *      can never replay an un-held verb. UNION semantics make this idempotent.
+ *      can never replay an un-held verb. Recording is a UNION, except that a
+ *      per-vault account-door choice replaces the earlier account-door scopes
+ *      (and revokes the refresh families it narrows), so a narrower choice
+ *      stays narrower (T-446).
  *
  * Not the ONLY `recordGrant` call in this module, though: two other guarded
  * fast-path records exist — the trust-by-client_name auto-promote in
@@ -2120,15 +2157,12 @@ function issueAuthCodeRedirect(
   // skip-consent re-entry can never widen back to an un-held verb.
   // T-446: a per-vault account-door grant is the person's whole choice of vaults and levels. It replaces the earlier
   // per-vault and level-less account-door scopes instead of adding to them, so a narrower choice stays narrower.
+  // A refresh token from the earlier consent would keep the old levels, so the families the new choice narrows are
+  // revoked with it (revokeFamiliesWiderThanChoice).
   const perVaultChoice = dedupedScopes.some((s) => parsePerVaultScope(s) !== null);
-  recordGrant(
-    db,
-    userId,
-    params.clientId,
-    dedupedScopes,
-    deps.now?.() ?? new Date(),
-    perVaultChoice ? (s) => parsePerVaultScope(s) !== null || isAccountVaultsConnectionScope(s) : undefined,
-  );
+  const grantNow = deps.now?.() ?? new Date();
+  if (perVaultChoice) revokeFamiliesWiderThanChoice(db, userId, params.clientId, dedupedScopes, grantNow);
+  recordGrant(db, userId, params.clientId, dedupedScopes, grantNow, perVaultChoice ? isAccountDoorChoiceScope : undefined);
 
   const code = issueAuthCode(db, {
     clientId: params.clientId,
@@ -2663,7 +2697,8 @@ async function handleConsentSubmit(
   // The grant is recorded (or extended) INSIDE issueAuthCodeRedirect with the
   // CAPPED scopes — the single mint choke-point owns both the anti-privesc cap
   // and the recordGrant so no path can record an un-held verb. UNION semantics
-  // there mean a subset re-flow still matches a prior grant, and an admin-only
+  // there (except the account door's per-vault choice, which replaces the
+  // earlier one) mean a subset re-flow still matches a prior grant, and an admin-only
   // request from a non-owner caps to empty → refused (no zero-scope token).
   // (#75 skip-consent depends on this recording.)
   // Consent per vault (T-446): the levels the person chose replace the level-less account-door grant.

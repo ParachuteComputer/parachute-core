@@ -14,6 +14,13 @@
  * once and later approves only [a, b] for an incremental flow doesn't lose
  * their c grant; the next flow asking [a, c] still skips consent.
  *
+ * One exception (T-446): the account door's per-vault levels
+ * (`account:self:vaults:<vault>:<read|write>`) and the level-less
+ * `account:self:vaults` are the person's whole choice of vaults, so a later
+ * per-vault choice REPLACES them (the `replaces` predicate of `recordGrant`)
+ * instead of adding to them. Other scopes in the row, `account:self:read` /
+ * `account:self:write` included, still union.
+ *
  * Skip rule: a flow may skip consent iff every requested scope is already
  * in the grant's set. A strict superset (the client wants something new)
  * shows the consent screen with the full requested set so the user is
