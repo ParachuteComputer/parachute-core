@@ -126,6 +126,20 @@ function touches(store: Store, change: TagChange, holder: string): boolean {
   }
 }
 
+/** The change with every name as the store writes it: no leading `#` or whitespace. */
+function normalized(change: TagChange): TagChange {
+  switch (change.kind) {
+    case "rename":
+      return { kind: "rename", from: stripTagHash(change.from), to: stripTagHash(change.to) };
+    case "merge":
+      return { kind: "merge", sources: change.sources.map(stripTagHash), target: stripTagHash(change.target) };
+    case "delete":
+      return { kind: "delete", tag: stripTagHash(change.tag) };
+    case "reparent":
+      return { kind: "reparent", tag: stripTagHash(change.tag), parents: change.parents?.map(stripTagHash) ?? null };
+  }
+}
+
 /**
  * The refusal body for a guarded change, or null when nothing a key or setting names is touched.
  *
@@ -142,7 +156,9 @@ export function tagChangeRefusal(vaultName: string, store: Store, change: TagCha
       hint: "repeat with force: true",
     };
   }
-  const hits = (name: string) => touches(store, change, stripTagHash(name));
+  // Review 2: the store writes `#kept` or ` kept` as `kept`, so the guard reads the change's names that way too.
+  const named = normalized(change);
+  const hits = (name: string) => touches(store, named, stripTagHash(name));
   const keys = liveScopedKeys(vaultName);
   const priv = readPrivateTagsConfig(vaultName);
   const published = stripTagHash(readVaultConfig(vaultName)?.published_tag ?? "publish");
