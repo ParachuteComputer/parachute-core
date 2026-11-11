@@ -349,7 +349,7 @@ export function resolveNoteSchemas(
         schema: existing.sourceTag,
         loser_schema: tagName,
         reason: "schema_conflict",
-        message: `field '${fieldName}' has conflicting specs in ancestor tags '${existing.sourceTag}' (kept) and '${tagName}' (checked, warnings only)`,
+        message: `field '${fieldName}' has conflicting specs in ancestor tags '${existing.sourceTag}' (kept) and '${tagName}' (${overridden ? "overridden" : "checked, warnings only"})`,
       });
     }
   }

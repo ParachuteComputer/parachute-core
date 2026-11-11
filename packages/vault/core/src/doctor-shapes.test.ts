@@ -95,6 +95,22 @@ describe("declared_reference_gap", () => {
   });
 });
 
+describe("declared_reference_gap's remedy on a scoped run", () => {
+  it("never names a type the pass can't see, though an in-scope record carries it", async () => {
+    await store.upsertTagRecord("mine", {});
+    await store.upsertTagRecord("secretproj", { kind: "type" });
+    await store.createNote("", { path: "projects/alder", tags: ["mine"] });
+    for (let i = 0; i < 3; i++) {
+      await store.createNote("", { path: `t/${i}`, tags: ["mine", "secretproj"], metadata: { project: "projects/alder" } });
+    }
+    const open = await of("declared_reference_gap");
+    expect(open[0]?.remedy).toContain('tag: "secretproj"');
+    const scoped = await of("declared_reference_gap", { allowedTags: new Set(["mine"]) });
+    expect(scoped.map((f) => f.subject)).toEqual(["project"]);
+    expect(JSON.stringify(scoped)).not.toContain("secretproj");
+  });
+});
+
 describe("near_names", () => {
   it("finds two type names and two field names one letter apart", async () => {
     await store.upsertTagRecord("ledger", { fields: { amount: { type: "integer" } } });
