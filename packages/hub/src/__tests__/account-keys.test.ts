@@ -110,6 +110,21 @@ describe("/account/keys", () => {
     expect(listA.keys.map((k) => [k.name, k.status])).toEqual([["arcade", "active"]]);
   });
 
+  // T-446: the refusals of a multi-vault key the door contract (contracts/suites/door/multivault.test.ts) doesn't hold.
+  test("a multi-vault key refuses on_behalf_of, a vault name with a colon or a level in it, too many vaults, and a taken name", async () => {
+    const a = await createUser(db, "alice", "alice-passphrase-1");
+    const t = await accountBearer(a.id);
+    const refused = async (body: unknown) => (await call("/account/keys", t, "POST", body)).status;
+    expect(await refused({ name: "multi", vaults: { arcade: "write" }, on_behalf_of: true })).toBe(400);
+    expect(await refused({ name: "multi", vaults: { "arcade:write": "read" } })).toBe(400);
+    expect(await refused({ name: "multi", vaults: { "*": "read" } })).toBe(400);
+    expect(await refused({ name: "multi", vaults: {} })).toBe(400);
+    expect(await refused({ name: "multi", vaults: Object.fromEntries(Array.from({ length: 51 }, (_, i) => [`v${i}`, "read"])) })).toBe(400);
+    expect(listKeys(db).some((k) => k.name === "multi")).toBe(false);
+    expect(await refused({ name: "multi", vaults: { arcade: "read" } })).toBe(201);
+    expect(await refused({ name: "multi", vaults: { arcade: "read" } })).toBe(409);
+  });
+
   test("an OAuth app holding only account:self:admin can't mint, list or revoke app keys", async () => {
     const a = await createUser(db, "alice", "alice-passphrase-1");
     const thirdParty = await accountBearer(a.id, ["account:self:admin"]);

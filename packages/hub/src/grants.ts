@@ -14,6 +14,13 @@
  * once and later approves only [a, b] for an incremental flow doesn't lose
  * their c grant; the next flow asking [a, c] still skips consent.
  *
+ * One exception (T-446): the account door's per-vault levels
+ * (`account:self:vaults:<vault>:<read|write>`) and the level-less
+ * `account:self:vaults` are the person's whole choice of vaults, so a later
+ * per-vault choice REPLACES them (the `replaces` predicate of `recordGrant`)
+ * instead of adding to them. Other scopes in the row, `account:self:read` /
+ * `account:self:write` included, still union.
+ *
  * Skip rule: a flow may skip consent iff every requested scope is already
  * in the grant's set. A strict superset (the client wants something new)
  * shows the consent screen with the full requested set so the user is
@@ -89,7 +96,8 @@ export function findGrant(db: Database, userId: string, clientId: string): Grant
 
 /**
  * Record a consent approval. Merges `newScopes` into any existing grant for
- * (user, client) — UNION semantics — and bumps `granted_at` to `now`. Empty
+ * (user, client) — UNION semantics, except existing scopes `replaces` names,
+ * which are dropped first — and bumps `granted_at` to `now`. Empty
  * `newScopes` is a no-op (we don't want to insert empty rows).
  */
 export function recordGrant(
@@ -98,6 +106,8 @@ export function recordGrant(
   clientId: string,
   newScopes: readonly string[],
   now: Date = new Date(),
+  /** Existing scopes this consent supersedes rather than adds to (T-446: the account door's per-vault levels). */
+  replaces?: (scope: string) => boolean,
 ): Grant {
   // Wrapped in a transaction so the read-merge-write is atomic. Without
   // this, two concurrent consents for the same (user, client) could both
@@ -105,7 +115,7 @@ export function recordGrant(
   // later writer's UNION missing scopes the earlier writer added.
   return db.transaction(() => {
     const existing = findGrant(db, userId, clientId);
-    const merged = new Set<string>(existing?.scopes ?? []);
+    const merged = new Set<string>((existing?.scopes ?? []).filter((s) => !replaces?.(s)));
     for (const s of newScopes) {
       if (s.length > 0) merged.add(s);
     }

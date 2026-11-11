@@ -197,7 +197,9 @@ each kept revision (`actor`/`via`, plus `via_kind`):
   key from `POST /account/keys`, a key from `parachute keys new <name>`, or an approved OAuth app) writes as
   `key:<name>` on REST and MCP alike. A credential with no named key keeps the channel (`api`, `mcp`) or its class
   (`operator`, `nostr:<pubkey>`). A revision's `via_kind` is the kind of that key (`person`, `agent`, `app`,
-  `service`), or null; tag-scoped sessions don't receive it, as with `actor` and `via`.
+  `service`), or null; tag-scoped sessions don't receive it, as with `actor` and `via`. A key writing through the
+  account door (`/account/mcp`, including a key that covers several vaults) is stamped the same: the hub's hop to
+  the vault carries the key's name and kind.
 - **by** is the person the write was for: the token's subject (the key's owner), unless the vault's owner let the
   key write on behalf of others when minting it (`POST /account/keys {..., on_behalf_of: true}`, or
   `parachute keys new <name> --vault <v> --can write --on-behalf-of`). Then a write may send

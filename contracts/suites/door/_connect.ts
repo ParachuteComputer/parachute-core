@@ -49,7 +49,7 @@ const setCookie = (r: Response, name: string) => {
 };
 
 /** The person approves the app on the door's own consent screen. Returns where the door sends the browser. */
-async function approve(authorizeEndpoint: string, params: Record<string, string>): Promise<string> {
+async function approve(authorizeEndpoint: string, params: Record<string, string>, form: Record<string, string> = {}): Promise<string> {
   const d = door();
   if (d.signIn.how !== "cookie") throw new Error("approve: this door's owner signs in with a key; the consent screen needs a browser session");
   const first = await safeFetch(`${authorizeEndpoint}?${new URLSearchParams(params)}`, { headers: { cookie: d.signIn.cookie } });
@@ -62,16 +62,16 @@ async function approve(authorizeEndpoint: string, params: Record<string, string>
     const consent = await safeFetch(authorizeEndpoint, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded", cookie: `parachute_hub_session=${session}; parachute_hub_csrf=${csrf}` },
-      body: new URLSearchParams({ ...params, __action: "consent", __csrf: csrfIn(html) ?? csrf, approve: "yes", vault_pick: d.vault }),
+      body: new URLSearchParams({ ...params, __action: "consent", __csrf: csrfIn(html) ?? csrf, approve: "yes", vault_pick: d.vault, ...form }),
     });
-    expect(consent.status).toBe(302);
+    expect(consent.status, (await consent.clone().text()).slice(0, 300)).toBe(302);
     return consent.headers.get("location")!;
   }
   // Cloud-style: the consent form posts back to the same origin, which answers with a bridge page (or a redirect).
   const consent = await safeFetch(authorizeEndpoint, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded", origin: d.issuer, cookie: d.signIn.cookie },
-    body: new URLSearchParams({ ...params, __action: "consent", __csrf: d.signIn.csrf, decision: "approve" }),
+    body: new URLSearchParams({ ...params, __action: "consent", __csrf: d.signIn.csrf, decision: "approve", ...form }),
   });
   const body = await consent.text();
   const bridged = body.match(/location\.replace\((.*)\);<\/script>/)?.[1];
@@ -122,4 +122,66 @@ export async function connect(opts: { scope?: (vault: string) => string; appName
   const body = await tok.json();
   expect(body.token_type?.toLowerCase()).toBe("bearer");
   return { ...disc, clientId, access: body.access_token, refresh: body.refresh_token, scope: body.scope, tokenEndpoint: as.token_endpoint, revocationEndpoint: as.revocation_endpoint, tokenReply: body };
+}
+
+/**
+ * The account door's consent, per vault (0.9.1 "one multi-vault door"): an app asks for the account door
+ * (`account:vaults`, as its protected-resource document says), and the person chooses a level for each vault:
+ * none, read or write. The form posts `account_vault_levels=1` and one `vault_level:<vault>` = `none|read|write`
+ * per vault; a vault not posted is none. Returns the token reply, or the refusal when the door refuses the choice.
+ */
+export async function connectAccount(opts: { appName: string; levels: Record<string, string>; scope?: string }): Promise<
+  { ok: true; access: string; scope: string } | { ok: false; refusal: string }
+> {
+  const d = door();
+  const resource = `${d.issuer}/account/mcp`;
+  const cold = await safeFetch(resource, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+  });
+  expect(cold.status).toBe(401);
+  const prmUrl = (cold.headers.get("www-authenticate") ?? "").match(/resource_metadata="([^"]+)"/)?.[1];
+  expect(prmUrl).toBeString();
+  const prm = await (await safeFetch(prmUrl!)).json();
+  expect(prm.scopes_supported).toContain("account:vaults");
+  const as = await (await safeFetch(`${d.issuer}/.well-known/oauth-authorization-server`)).json();
+  const reg = await safeFetch(as.registration_endpoint, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ client_name: opts.appName, redirect_uris: [REDIRECT], token_endpoint_auth_method: "none", grant_types: ["authorization_code", "refresh_token"], response_types: ["code"] }),
+  });
+  expect([200, 201]).toContain(reg.status);
+  const clientId = (await reg.json()).client_id;
+  const verifier = randomBytes(32).toString("base64url");
+  const state = randomBytes(8).toString("hex");
+  const params = {
+    client_id: clientId,
+    redirect_uri: REDIRECT,
+    response_type: "code",
+    code_challenge: createHash("sha256").update(verifier).digest("base64url"),
+    code_challenge_method: "S256",
+    scope: opts.scope ?? "account:vaults",
+    state,
+    resource,
+  };
+  const form: Record<string, string> = { account_vault_levels: "1" };
+  for (const [v, level] of Object.entries(opts.levels)) form[`vault_level:${v}`] = level;
+  let location: string;
+  try {
+    location = await approve(as.authorization_endpoint, params, form);
+  } catch (e) {
+    return { ok: false, refusal: (e as Error).message };
+  }
+  const back = new URL(location);
+  const code = back.searchParams.get("code");
+  if (!code) return { ok: false, refusal: back.searchParams.get("error") ?? location };
+  const tok = await safeFetch(as.token_endpoint, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ grant_type: "authorization_code", code, client_id: clientId, redirect_uri: REDIRECT, code_verifier: verifier, resource }),
+  });
+  expect(tok.status, (await tok.clone().text()).slice(0, 300)).toBe(200);
+  const body = await tok.json();
+  return { ok: true, access: body.access_token, scope: body.scope };
 }
