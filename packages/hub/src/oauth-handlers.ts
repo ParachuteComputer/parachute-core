@@ -1894,7 +1894,8 @@ function capScopesToUserAuthority(
 ): string[] {
   if (opts.userIsAdmin) return [...scopes];
   // A per-vault account-door grant above the person's current role there narrows to read when they still read it
-  // (T-446), rather than losing the vault. Each mint caps again, so the token never holds more than the role now.
+  // (T-446), rather than losing the vault. The narrowed set is what gets recorded (it replaces the per-vault scopes),
+  // so raising the role again doesn't silently bring write back.
   const narrowed = scopes.map((s) => {
     const pv = parsePerVaultScope(s);
     if (!pv || pv.level !== "write") return s;
@@ -2117,7 +2118,17 @@ function issueAuthCodeRedirect(
 
   // Record the grant with the CAPPED scopes (single source of truth) so
   // skip-consent re-entry can never widen back to an un-held verb.
-  recordGrant(db, userId, params.clientId, dedupedScopes, deps.now?.() ?? new Date());
+  // T-446: a per-vault account-door grant is the person's whole choice of vaults and levels. It replaces the earlier
+  // per-vault and level-less account-door scopes instead of adding to them, so a narrower choice stays narrower.
+  const perVaultChoice = dedupedScopes.some((s) => parsePerVaultScope(s) !== null);
+  recordGrant(
+    db,
+    userId,
+    params.clientId,
+    dedupedScopes,
+    deps.now?.() ?? new Date(),
+    perVaultChoice ? (s) => parsePerVaultScope(s) !== null || isAccountVaultsConnectionScope(s) : undefined,
+  );
 
   const code = issueAuthCode(db, {
     clientId: params.clientId,

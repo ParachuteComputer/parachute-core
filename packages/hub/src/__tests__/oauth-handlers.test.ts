@@ -12235,7 +12235,7 @@ describe("account-door consent per vault (T-446)", () => {
     }
   });
 
-  test("a role lowered from write to read narrows the replayed grant to read, not dropping the vault", async () => {
+  test("a role lowered from write to read narrows the replayed grant to read, not dropping the vault, and records it so", async () => {
     const { db, cleanup } = await makeDb();
     try {
       const session = await friendOnWorkReadOtherWrite(db);
@@ -12248,6 +12248,31 @@ describe("account-door consent per vault (T-446)", () => {
       const skipped = get(db, session.id, reg.client.clientId, again.challenge);
       expect(skipped.status).toBe(302);
       expect(await redeem(db, skipped.headers.get("location")!, reg.client.clientId, again.verifier)).toBe("account:self:vaults:other:read");
+      // ...and recorded so: raising the role again doesn't silently bring write back.
+      expect(findGrant(db, getUserById(db, findSession(db, session.id)!.userId)!.id, reg.client.clientId)!.scopes).toEqual(["account:self:vaults:other:read"]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("SECURITY: a later, narrower choice replaces the earlier one: the next skip-consent doesn't bring the old levels back", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const session = await friendOnWorkReadOtherWrite(db);
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"], status: "approved" });
+      const first = makePkce();
+      const wide = await post(db, session.id, reg.client.clientId, first.challenge, [["account_vault_levels", "1"], ["vault_level:work", "read"], ["vault_level:other", "write"]]);
+      expect(wide.status).toBe(302);
+      // The app asks for something the grant doesn't cover, so the page shows again, and the friend narrows.
+      const second = makePkce();
+      const narrow = await post(db, session.id, reg.client.clientId, second.challenge, [["account_vault_levels", "1"], ["vault_level:work", "none"], ["vault_level:other", "read"]], "account:vaults account:self:read");
+      expect(narrow.status).toBe(302);
+      expect(await redeem(db, narrow.headers.get("location")!, reg.client.clientId, second.verifier)).toBe("account:self:vaults:other:read");
+      // Next plain ask skips the page: only the narrower choice.
+      const third = makePkce();
+      const skipped = get(db, session.id, reg.client.clientId, third.challenge);
+      expect(skipped.status).toBe(302);
+      expect(await redeem(db, skipped.headers.get("location")!, reg.client.clientId, third.verifier)).toBe("account:self:vaults:other:read");
     } finally {
       cleanup();
     }
