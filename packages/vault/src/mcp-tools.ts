@@ -346,7 +346,7 @@ export function generateScopedMcpTools(
   });
 
   overrideVaultInfo(tools, vaultName, auth);
-  applyTagDependencyGuards(tools, vaultName);
+  applyTagDependencyGuards(tools, vaultName, scoped);
   applyTagScopeWrappers(tools, vaultName, auth, allowedHolder);
 
   // manage-token is server-only (needs token-store + auth context), so it
@@ -613,7 +613,7 @@ function withParamWarnings(tool: string, result: unknown, unknown: ParamProblem[
  * `tag_in_use_by_tokens` envelope (routes.ts's DELETE /tags/:name and
  * POST /tags/merge run the identical check).
  */
-function applyTagDependencyGuards(tools: McpToolDef[], vaultName: string): void {
+function applyTagDependencyGuards(tools: McpToolDef[], vaultName: string, scoped: boolean): void {
   const store = getVaultStore(vaultName);
   // Scope gap 6: a rename, merge, delete or re-parent that changes what a live
   // key, private_tags or the published tag reaches is refused unless the call
@@ -623,7 +623,7 @@ function applyTagDependencyGuards(tools: McpToolDef[], vaultName: string): void 
     wrapReadTool(tools, name, async (orig, params) => {
       const p = (params ?? {}) as Record<string, any>;
       const c = forceFlag(p.force) ? null : change(p);
-      const refusal = c && tagChangeRefusal(vaultName, store, c);
+      const refusal = c && tagChangeRefusal(vaultName, store, c, { scoped });
       if (refusal) throw Object.assign(new Error(String(refusal.message)), refusal);
       return await orig(params);
     });

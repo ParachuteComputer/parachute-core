@@ -1095,11 +1095,11 @@ function linkOptFor(db: Database, tagScope: TagScopeCtx): { linkVisible?: (noteI
  * Scope gap 6: the 409 for a tag change that alters who sees what, unless the
  * request says `?force=true` (src/tag-change-guard.ts). Null: go ahead.
  */
-function tagChangeGuard(store: Store, url: URL, change: TagChange): Response | null {
+function tagChangeGuard(store: Store, url: URL, change: TagChange, tagScope: TagScopeCtx): Response | null {
   if (forceFlag(url.searchParams.get("force"))) return null;
   const vaultName = getVaultNameForStore(store);
   if (!vaultName) return null; // a store outside the daemon (tests) has no keys or vault.yaml
-  const refusal = tagChangeRefusal(vaultName, store, change);
+  const refusal = tagChangeRefusal(vaultName, store, change, { scoped: tagScope.raw !== null });
   return refusal ? json(refusal, 409) : null;
 }
 
@@ -3890,7 +3890,7 @@ export async function handleTags(
       );
     }
     // Scope gap 6: merging moves notes out of the sources' reach and into the target's.
-    const mergeRefusal = tagChangeGuard(store, url, { kind: "merge", sources: sources as string[], target });
+    const mergeRefusal = tagChangeGuard(store, url, { kind: "merge", sources: sources as string[], target }, tagScope);
     if (mergeRefusal) return mergeRefusal;
     const result = await store.mergeTags(sources, target);
     return json(result);
@@ -3913,7 +3913,7 @@ export async function handleTags(
     // Scope gap 6: renaming a name a live key's scope, private_tags or the
     // published tag uses changes who sees what; it needs `?force=true`.
     // (The vault#240 cascade rewrites only the vault's own legacy tokens table.)
-    const renameRefusal = tagChangeGuard(store, url, { kind: "rename", from: oldName, to: newName });
+    const renameRefusal = tagChangeGuard(store, url, { kind: "rename", from: oldName, to: newName }, tagScope);
     if (renameRefusal) return renameRefusal;
     // Vault#240: rename now cascades to tokens.scoped_tags (and every
     // other surface). The old fail-closed token-reference check has been
@@ -4131,7 +4131,7 @@ export async function handleTags(
         return tagScopeForbidden(tagScope.raw);
       }
       if (parentsChange(store, putTagName, parents)) {
-        const reparentRefusal = tagChangeGuard(store, url, { kind: "reparent", tag: putTagName, parents });
+        const reparentRefusal = tagChangeGuard(store, url, { kind: "reparent", tag: putTagName, parents }, tagScope);
         if (reparentRefusal) return reparentRefusal;
       }
     }
@@ -4319,7 +4319,7 @@ export async function handleTags(
     // (vault#552). Query params, not a DELETE body, so the flag is visible
     // in access logs and works with any HTTP client without body support.
     // Scope gap 6: deleting a name a key, private_tags or the published tag uses.
-    const deleteRefusal = tagChangeGuard(store, url, { kind: "delete", tag: tagName });
+    const deleteRefusal = tagChangeGuard(store, url, { kind: "delete", tag: tagName }, tagScope);
     if (deleteRefusal) return deleteRefusal;
     const cascade = parseBool(parseQuery(url, "cascade"), false);
     const detach = parseBool(parseQuery(url, "detach"), false);

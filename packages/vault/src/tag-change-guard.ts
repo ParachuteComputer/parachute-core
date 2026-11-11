@@ -19,7 +19,7 @@ import { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { Store } from "../core/src/types.ts";
-import { getTagDescendants, stripTagHash } from "../core/src/tag-hierarchy.ts";
+import { stripTagHash } from "../core/src/tag-hierarchy.ts";
 import { CONFIG_DIR, readPrivateTagsConfig, readVaultConfig } from "./config.ts";
 
 /** A live key for this vault and the tags it is limited to. */
@@ -68,15 +68,34 @@ export function liveScopedKeys(vaultName: string, now: Date = new Date()): Scope
   }
 }
 
-/** Every tag above `tag` in the hierarchy (not `tag` itself, not the universal `_default`). */
+/** Every tag above `tag` through declared parents (not `tag` itself, not the universal `_default`). */
 function ancestorsOf(store: Store, tag: string): Set<string> {
   const h = store.getTagHierarchy();
+  const parentsOf = new Map<string, string[]>();
+  for (const [parent, children] of h.childrenOf) {
+    for (const c of children) parentsOf.set(c, [...(parentsOf.get(c) ?? []), parent]);
+  }
   const out = new Set<string>();
-  for (const candidate of h.allTags) {
-    if (candidate === tag || candidate === "_default") continue;
-    if (getTagDescendants(h, candidate).has(tag)) out.add(candidate);
+  const walk = [tag];
+  while (walk.length > 0) {
+    for (const p of parentsOf.get(walk.pop()!) ?? []) {
+      if (p === tag || p === "_default" || out.has(p)) continue;
+      out.add(p);
+      walk.push(p);
+    }
   }
   return out;
+}
+
+/**
+ * Whether `holder` (a key's tag, a private tag, the published tag) reaches notes tagged `name`: the name itself, a
+ * name under it (`secret` reaches `secret/diary`, as scopes and private_tags do), or one under it through declared
+ * parents, at any depth, either way.
+ */
+function reaches(store: Store, holder: string, name: string): boolean {
+  if (holder === name || name.startsWith(`${holder}/`)) return true;
+  for (const a of ancestorsOf(store, name)) if (a === holder || a.startsWith(`${holder}/`)) return true;
+  return false;
 }
 
 /** What a tag change touches: the names whose reach it changes. */
@@ -86,36 +105,49 @@ export type TagChange =
   | { kind: "delete"; tag: string }
   | { kind: "reparent"; tag: string; parents: string[] | null };
 
-/** The names a change alters the reach of. Sub-tags follow a rename, so a name under the old one counts too. */
-function touchedNames(store: Store, change: TagChange): { exact: Set<string>; under: string[] } {
+/**
+ * Whether a change alters what `holder` reaches. The notes of a renamed, merged or deleted name (and, for a rename,
+ * of the names under it) change tags; the names they leave and the names they arrive at are both touched. A
+ * re-parented tag leaves its declared parents above it and joins its new ones.
+ */
+function touches(store: Store, change: TagChange, holder: string): boolean {
+  const under = (name: string) => holder === name || holder.startsWith(`${name}/`);
   switch (change.kind) {
     case "rename":
-      return { exact: new Set([change.from, change.to]), under: [change.from] };
+      return under(change.from) || under(change.to) || reaches(store, holder, change.from) || reaches(store, holder, change.to);
     case "merge":
-      return { exact: new Set([...change.sources, change.target]), under: [] };
+      return [...change.sources, change.target].some((n) => holder === n || reaches(store, holder, n));
     case "delete":
-      return { exact: new Set([change.tag]), under: [] };
+      return holder === change.tag || reaches(store, holder, change.tag);
     case "reparent": {
-      // Every tag above it now, and every tag it is put under (with theirs): their reach gains or loses its notes.
-      const names = ancestorsOf(store, change.tag);
-      for (const p of change.parents ?? []) {
-        names.add(p);
-        for (const a of ancestorsOf(store, p)) names.add(a);
-      }
-      return { exact: names, under: [] };
+      for (const a of ancestorsOf(store, change.tag)) if (a === holder || a.startsWith(`${holder}/`)) return true;
+      return (change.parents ?? []).some((p) => reaches(store, holder, p));
     }
   }
 }
 
-/** The refusal body for a guarded change, or null when nothing a key or setting names is touched. */
-export function tagChangeRefusal(vaultName: string, store: Store, change: TagChange): Record<string, unknown> | null {
-  const { exact, under } = touchedNames(store, change);
-  const hits = (name: string) => exact.has(name) || under.some((u) => name.startsWith(`${u}/`));
+/**
+ * The refusal body for a guarded change, or null when nothing a key or setting names is touched.
+ *
+ * `scoped`: the caller holds a tag-scoped pass (an admin one an older hub minted, gap 4). Its refusal must not name
+ * keys or tags outside its scope, nor say whether one reaches its tag, so for it every rename, merge, delete or
+ * re-parent needs force and the refusal names nothing.
+ */
+export function tagChangeRefusal(vaultName: string, store: Store, change: TagChange, opts: { scoped?: boolean } = {}): Record<string, unknown> | null {
+  if (opts.scoped) {
+    return {
+      error: "TagInUse",
+      error_type: "tag_in_use",
+      message: "A pass limited to tags must confirm a tag rename, merge, delete or re-parent: it may change what other keys or settings reach. Repeat with force: REST `?force=true`, MCP `force: true`.",
+      hint: "repeat with force: true",
+    };
+  }
+  const hits = (name: string) => touches(store, change, stripTagHash(name));
   const keys = liveScopedKeys(vaultName);
   const priv = readPrivateTagsConfig(vaultName);
   const published = stripTagHash(readVaultConfig(vaultName)?.published_tag ?? "publish");
 
-  const keyNames = Array.isArray(keys) ? keys.filter((k) => k.tags.some((t) => hits(stripTagHash(t)))).map((k) => k.name) : [];
+  const keyNames = Array.isArray(keys) ? keys.filter((k) => k.tags.some((t) => hits(t))).map((k) => k.name) : [];
   const privateTags = priv.kind === "ok" ? priv.tags.filter((t) => hits(t)) : [];
   const publishedHit = hits(published);
   const unreadable = !Array.isArray(keys) || priv.kind === "invalid";
