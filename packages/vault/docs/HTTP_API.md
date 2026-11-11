@@ -221,7 +221,10 @@ Refusals, before anything is written:
 | The header on a write that records no writer (attachments, history erases, tag schemas, vault config) | 400 | `on_behalf_not_recorded` |
 | A token whose `permissions` carry a key this vault doesn't enforce, or a malformed `key`/`acts_for` | 401 | — |
 
-A read (GET) with the header is answered as usual. On-behalf-of never opens access: scope and level are the token's.
+A read (GET) with the header is answered as usual by a key with the permission, and refused (403) from a key
+without it. The header is answered on the vault's authenticated routes; a few routes outside them (the server-level
+routes, an attachment ticket's spend) never read it and write no stamp. On MCP a batch's `on_behalf_of` goes on the
+call and stamps every item; inside an item it is refused. On-behalf-of never opens access: scope and level are the token's.
 Records written via `/api/notes` and `/api/records` (create, patch, delete, batch, restore) and tag renames carry
 the stamp; an attachment row has no writer.
 

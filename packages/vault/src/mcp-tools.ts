@@ -395,6 +395,14 @@ function applyOnBehalf(tools: McpToolDef[], auth: AuthResult | undefined, withBy
     }
     const execute = tool.execute;
     tool.execute = async (params) => {
+      // A batch item has no on_behalf_of of its own: the call's applies to every item. One inside an item would
+      // otherwise be ignored, so it is refused.
+      const inItem = Object.values(params ?? {}).some((v) => Array.isArray(v) && v.some((it) => it && typeof it === "object" && ON_BEHALF_PARAM in it));
+      if (inItem) {
+        throw Object.assign(new Error(`${ON_BEHALF_PARAM} goes on the call, not inside a batch item: it stamps every item. Nothing was written.`), {
+          error_type: "invalid_on_behalf_of", field: ON_BEHALF_PARAM, hint: "move on_behalf_of to the top level",
+        });
+      }
       if (!params || !(ON_BEHALF_PARAM in params)) return execute(params);
       const { [ON_BEHALF_PARAM]: supplied, ...rest } = params;
       const r = resolveBy(supplied, actsFor, auth?.actor ?? null, "mcp");

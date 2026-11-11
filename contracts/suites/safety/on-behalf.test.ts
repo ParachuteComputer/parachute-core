@@ -251,6 +251,11 @@ describe("safety/on-behalf: MCP", () => {
       expect(n.createdVia).toBe(`key:${granted.name}`);
       expect(n.lastUpdatedBy).toBe(`${granted.name}:client-43`);
       await expect(c.call("create-note", { content: "no", path: `${path}-bad`, on_behalf_of: "nostr:abc" })).rejects.toThrow(/on_behalf_of/);
+      // Inside a batch item it would be ignored, so it is refused; on the call it stamps every item.
+      await expect(c.call("create-note", { notes: [{ content: "no", path: `${path}-item`, on_behalf_of: "client-5" }] })).rejects.toThrow(/on_behalf_of/);
+      expect((await record(`${path}-item`)).status).toBe(404);
+      await c.call("create-note", { notes: [{ content: "a", path: `${path}-b1` }], on_behalf_of: "client-6" });
+      expect((await record(`${path}-b1`)).body.createdBy).toBe(`${granted.name}:client-6`);
       expect((await record(`${path}-bad`)).status).toBe(404);
     } finally {
       await c.close();
