@@ -601,40 +601,71 @@ test("an audited ignore list passes over exactly its files; anything else stays 
   } finally { clearVaultStoreCache(); if (saved === undefined) delete process.env.PARACHUTE_HOME; else process.env.PARACHUTE_HOME = saved; rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("only the old exporter's bare leading quote is repaired; every other unreadable frontmatter stays refused, and names its note when it can", () => {
+test("export scalars are read as the vault's import reads them; every other unreadable frontmatter stays refused, and names its note when it can", () => {
   const dir = mkdtempSync(join(tmpdir(), "import-strict-")), other = "01M2KT4GXMQDNB8ZFXY05MHT6B";
-  const stageOf = (frontmatterBlock: string, parser?: 1 | 2) => {
+  const stageOf = (frontmatterBlock: string, opts: { parser?: 1 | 2; date?: string } = {}) => {
     const repo = repoAt(join(dir, crypto.randomUUID())), db = new Database(":memory:");
+    const saved = { a: process.env.GIT_AUTHOR_DATE, c: process.env.GIT_COMMITTER_DATE };
     try {
       writeFileSync(join(repo, "entry.md"), `---\n${frontmatterBlock}\n---\nbody`);
+      if (opts.date) { process.env.GIT_AUTHOR_DATE = opts.date; process.env.GIT_COMMITTER_DATE = opts.date; }
       git(repo, "add", "."); git(repo, "commit", "-m", "case");
-      stageArchive(repo, git(repo, "rev-parse", "HEAD"), db, null, undefined, null, parser);
+      stageArchive(repo, git(repo, "rev-parse", "HEAD"), db, null, undefined, null, opts.parser);
       return {
         rows: (db.query("SELECT row_json FROM observations").all() as { row_json: string }[]).map(r => JSON.parse(r.row_json)),
         quarantine: db.query("SELECT * FROM quarantine").all(), issues: db.query("SELECT reason FROM issues").all(),
       };
-    } finally { db.close(); }
+    } finally {
+      for (const [k, v] of [["GIT_AUTHOR_DATE", saved.a], ["GIT_COMMITTER_DATE", saved.c]] as const) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+      db.close();
+    }
   };
+  const OLD = "2026-08-01T00:00:00Z", NEW = "2026-11-05T00:00:00Z"; // either side of FLOW_QUOTING_SINCE (2026-10-29)
   try {
-    // Repaired: a key's value and a list item that open with a quote and are not YAML on their own.
-    const ok = stageOf(`id: ${noteId}\npath: entry\nmetadata:\n  saying: 'made up' and more\n  heard: "so they said" twice\n  list:\n    - 'one' of them\n    - plain\n  fine: 'already quoted'\n  apostrophe: it's fine`);
-    expect(ok.issues).toEqual([]); expect(ok.quarantine).toEqual([]);
-    expect(ok.rows[0].metadata).toEqual({ saying: "'made up' and more", heard: '"so they said" twice', list: ["'one' of them", "plain"], fine: "already quoted", apostrophe: "it's fine" });
-    // Parser 1 (a manifest from before this reader) stages it the old way: an unidentified issue.
-    expect(stageOf(`id: ${noteId}\npath: entry\nmetadata:\n  saying: 'made up' and more`, 1)).toEqual({ rows: [], quarantine: [], issues: [{ reason: "invalid_metadata_or_utf8" }] });
-    // Not repaired. Each names one note, so that note quarantines (a waiver can then be reasoned about); nothing is staged.
+    const block = [
+      `id: ${noteId}`, "path: entry", "metadata:",
+      "  saying: 'made up' and more",          // not YAML: the old exporter's bare string
+      '  heard: "so they said" twice',
+      "  link: [[Projects/Alpha]]",            // YAML would make a nested list of it; an export never holds one
+      "  set: {draft}",
+      "  word: 'single'",                      // the old exporter wrote the six-character string bare
+      "  shown: '[[Projects/Beta]]'",          // today's exporter quotes a leading bracket; the old one never wrote this
+      "  quoted: 'true'",                      // both exporters quote this: the string true
+      "  none: []", "  count: 3", "  flag: true",
+      "  list:", "    - 'one' of them", "    - [[Projects/Gamma]]", "    - plain",
+      "  apostrophe: it's fine",
+    ].join("\n");
+    const base = { saying: "'made up' and more", heard: '"so they said" twice', link: "[[Projects/Alpha]]", set: "{draft}", quoted: "true", none: [], count: 3, flag: true, list: ["'one' of them", "[[Projects/Gamma]]", "plain"], apostrophe: "it's fine" };
+    // A commit from before the exporter changed: a quoted scalar it could not have written is the literal text.
+    const old = stageOf(block, { date: OLD });
+    expect(old.issues).toEqual([]); expect(old.quarantine).toEqual([]);
+    expect(old.rows[0].metadata).toEqual({ ...base, word: "'single'", shown: "'[[Projects/Beta]]'" });
+    // A commit from after: quotes are today's exporter's.
+    const now = stageOf(block, { date: NEW });
+    expect(now.issues).toEqual([]); expect(now.quarantine).toEqual([]);
+    expect(now.rows[0].metadata).toEqual({ ...base, word: "single", shown: "[[Projects/Beta]]" });
+    // The old exporter wrote a string that opens a flow and never closes it as it stood, too.
+    expect(stageOf(`id: ${noteId}\npath: [A`, { date: OLD }).rows[0].path).toBe("[A");
+    // Parser 1 (a manifest from before this reader) stages the old way: strict YAML alone.
+    expect(stageOf(`id: ${noteId}\npath: entry\nmetadata:\n  saying: 'made up' and more`, { parser: 1 })).toEqual({ rows: [], quarantine: [], issues: [{ reason: "invalid_metadata_or_utf8" }] });
+    expect(stageOf(`id: ${noteId}\npath: entry\nmetadata:\n  link: [[Projects/Alpha]]`, { parser: 1 }).rows[0].metadata).toEqual({ link: [["Projects/Alpha"]] });
+    // Still refused. Each names one note, so that note quarantines (a waiver can then be reasoned about); nothing is staged.
     const refused = [
       `id: ${noteId}\n<<<<<<< ours\npath: A\n=======\npath: B\n>>>>>>> theirs`,          // a merge conflict
-      `id: ${noteId}\nmetadata:\n  a: 1\n   b: [`,                                         // indentation, an unclosed flow
-      `id: ${noteId}\npath: [A`,                                                           // an unclosed flow
-      `id: ${noteId}\nmetadata:\n  saying: 'made up' and more\n  broken: {`,               // a repairable line beside one that is not
-      `id: ${noteId}\ntitle: 'a ---\npath: A`,                                        // a line separator inside a value
+      `id: ${noteId}\nmetadata:\n  a: 1\n   b: [`,                                         // indentation
+      `id: ${noteId}\nmetadata:\n  saying: 'made up' and more\n a: 1\n   b: 2`,            // a readable line beside a broken one
+      `id: ${noteId}\ntitle: 'a\u2028---\npath: A`,                                        // a line separator inside a value
+      `id: ${noteId}\nmetadata:\n  text: |\n    note: 'q' z\n  saying: 'made up' and more`, // a block scalar: not an export, so nothing is rewritten
     ];
-    for (const block of refused) expect(stageOf(block)).toEqual({ rows: [], quarantine: [{ note_id: noteId, reason: "unreadable_frontmatter" }], issues: [] });
+    for (const b of refused) expect(stageOf(b), b.split("\n")[1]).toEqual({ rows: [], quarantine: [{ note_id: noteId, reason: "unreadable_frontmatter" }], issues: [] });
+    // A block scalar that is valid YAML is read by YAML alone: its lines are not rewritten.
+    expect(stageOf(`id: ${noteId}\nmetadata:\n  text: |\n    note: 'q' z\n  link: [[A]]`).rows[0].metadata).toEqual({ text: "note: 'q' z\n", link: [["A"]] });
+    // A list item that is a map with a quoted key stays a map.
+    expect(stageOf(`id: ${noteId}\nmetadata:\n  items:\n    - 'odd key': v`).rows[0].metadata).toEqual({ items: [{ "odd key": "v" }] });
     // No single stated id: it stays an unidentified issue, as before.
-    expect(stageOf(`id: ${noteId}\nid: ${other}\npath: [A`)).toEqual({ rows: [], quarantine: [], issues: [{ reason: "invalid_metadata_or_utf8" }] });
-    expect(stageOf(`path: [A`)).toEqual({ rows: [], quarantine: [], issues: [{ reason: "invalid_metadata_or_utf8" }] });
-    expect(stageOf(`  id: ${noteId}\npath: [A`)).toEqual({ rows: [], quarantine: [], issues: [{ reason: "invalid_metadata_or_utf8" }] });
+    expect(stageOf(`id: ${noteId}\nid: ${other}\n a: 1\n   b: 2`)).toEqual({ rows: [], quarantine: [], issues: [{ reason: "invalid_metadata_or_utf8" }] });
+    expect(stageOf(`path: A\n a: 1\n   b: 2`)).toEqual({ rows: [], quarantine: [], issues: [{ reason: "invalid_metadata_or_utf8" }] });
+    expect(stageOf(`  id: ${noteId}\n a: 1\n   b: 2`)).toEqual({ rows: [], quarantine: [], issues: [{ reason: "invalid_metadata_or_utf8" }] });
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }, 60_000);
 
@@ -688,7 +719,7 @@ test("prepare, apply and retire carry a raised bound and an ignore list; an edit
     // An edited manifest is not the run that was prepared.
     const edits: [string, (x: any) => void][] = [
       ["bound", x => { x.max_tree_entries = 30_000_000; }], ["ignore list", x => { x.ignored_files.files[0].reason = "Edited"; }],
-      ["ignore list dropped", x => { delete x.ignored_files; delete x.ignored_files_digest; }], ["parser", x => { x.parser = 1; }], ["parser dropped", x => { delete x.parser; }],
+      ["ignore list dropped", x => { delete x.ignored_files; delete x.ignored_files_digest; }], ["parser", x => { x.parser = 1; }], ["parser dropped", x => { delete x.parser; }], ["parser 3", x => { x.parser = 3; }], ["parser null", x => { x.parser = null; }],
     ];
     for (const [what, edit] of edits) {
       const copy = JSON.parse(readFileSync(manifest, "utf8")); edit(copy);

@@ -75,12 +75,12 @@ Version history is the first self-hosted-first feature tracked in this table.
 
 | Param | Self-hosted (bun) | Hosted (cloud) | Note |
 |---|---|---|---|
-| `POST /api/history/compact` | honored | honored | Hosted compaction is bounded per request (250 ms, 50 notes). |
-| `GET /notes/:id/versions` | honored | honored | Same shapes on both doors; cloud's `workers/vault/test/history.test.ts` holds it. |
-| `GET /notes/:id/versions/:version_ix` | honored | honored | Same shapes on both doors; cloud's `workers/vault/test/history.test.ts` holds it. |
-| `POST /notes/:id/restore` | honored | honored | Same shapes on both doors; cloud's `workers/vault/test/history.test.ts` holds it. |
-| `DELETE /notes/:id/versions` | honored | honored | Same shapes on both doors; cloud's `workers/vault/test/history.test.ts` holds it. |
-| `query-notes versions (MCP)` | honored | honored | Same shapes on both doors; cloud's `workers/vault/test/history.test.ts` holds it. |
+| `POST /api/history/compact` | honored | honored since [cloud#304](https://github.com/ParachuteComputer/parachute-cloud/pull/304) | The hosted door bounds one request (its own limit; see parachute-cloud `HISTORY.md`). |
+| `GET /notes/:id/versions` | honored | honored since [cloud#304](https://github.com/ParachuteComputer/parachute-cloud/pull/304) | Same shapes; held by cloud's own suite, not by this repo. |
+| `GET /notes/:id/versions/:version_ix` | honored | honored since [cloud#304](https://github.com/ParachuteComputer/parachute-cloud/pull/304) | Same shapes; held by cloud's own suite, not by this repo. |
+| `POST /notes/:id/restore` | honored | honored since [cloud#304](https://github.com/ParachuteComputer/parachute-cloud/pull/304) | Same shapes; held by cloud's own suite, not by this repo. |
+| `DELETE /notes/:id/versions` | honored | honored since [cloud#304](https://github.com/ParachuteComputer/parachute-cloud/pull/304) | Same shapes; held by cloud's own suite, not by this repo. |
+| `query-notes versions (MCP)` | honored | honored since [cloud#304](https://github.com/ParachuteComputer/parachute-cloud/pull/304) | Same shapes; held by cloud's own suite, not by this repo. |
 | `DELETE /notes/:id?erase_history=true` | honored | honored once cloud pins core with T-412 | T-412 |
 | `GET /history/deleted` | honored | honored once cloud pins core with T-412 | T-412 |
 | `delete-note` `ids` / `erase_history` (MCP) | honored | honored once cloud pins core with T-412 | T-412; core's tool, so both doors get it from the pin |
@@ -1516,7 +1516,7 @@ Imported history appears in existing version lists with `origin: "git-import"` a
 
 MCP `query-notes` accepts `versions: {note_id, origin:"git-import", import_ix:0}` for reads. It preserves existing live-note and tag-scope restrictions. Corrupt imported content produces a JSON-RPC error with `error.data.error_type`, `origin`, and `import_ix`; it is not a successful tool result containing an error string. There is no new MCP restore operation.
 
-The hosted door reads imported history with these same shapes. It never reads a git archive itself: the archive is imported on a self-hosted copy with `parachute-vault history-import`, and an operator then sends the result behind the notes of the person's Cloud vault (parachute-cloud `HISTORY.md`, "Operator history import"). A vault that received one keeps all its history rather than the default retention.
+The hosted door reads imported history with these same shapes. It never reads a git archive itself: the archive is imported on a self-hosted copy with `parachute-vault history-import`, and an operator then sends the result behind the notes of the person's Cloud vault (parachute-cloud `HISTORY.md`, "Operator history import"). Retention on the hosted door is parachute-cloud's to state (its `HISTORY.md`).
 
 History erasure removes retained content through the existing GC rules. Minimal import receipts and commit/blob references remain to prevent re-import after erasure; a full vault wipe removes them. Git committer identity is not historical note authorship: imported rows have null actor and `via: "git-import"`.
 

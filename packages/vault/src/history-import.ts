@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { isNoteIdShape } from "../core/src/ulid.ts";
 import { applyImportedNote, beginImportRun, canonicalJson, importObservationDigest, importTargetDigest, readImportReceipt, type ImportedObservation, type ImportRun } from "../core/src/history-import.ts";
 import { hashContent, resolveHistoryPolicy, VERSION_MAX_BYTES, type HistoryPolicy } from "../core/src/history.ts";
-import { fromExportedAttachmentLinks } from "../core/src/portable-md.ts";
+import { FLOW_QUOTING_SINCE, fromExportedAttachmentLinks, parseFrontmatter } from "../core/src/portable-md.ts";
 import { applyConnectionPragmas, initSchema } from "../core/src/schema.ts";
 import { DEFAULT_PORT, readGlobalConfig, readVaultConfig, vaultDbPath, vaultDir } from "./config.ts";
 import { checkHealth } from "./health.ts";
@@ -44,34 +44,47 @@ function mapping(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 function yaml(raw: string): Record<string, unknown> { return mapping(Bun.YAML.parse(raw)); }
-/** The staging reader's version, bound into the options digest. 1: strict YAML only. 2: also {@link repairOldExporterQuotes} and {@link statedId}. */
+/** The staging reader's version, bound into the options digest. 1: strict YAML only. 2: export scalars read as the vault's import reads them ({@link readExportScalars}), and {@link statedId}. */
 const PARSER = 2;
 function parserVersion(value: unknown): 1 | 2 {
-  if (value === undefined || value === null) return 1; // a manifest written before the field existed
-  if (value !== 1 && value !== 2) throw new Error("Unsupported manifest parser version");
-  return value;
+  if (value === undefined) return 1; // a manifest written before the field existed: the one way to say parser 1
+  if (value !== PARSER) throw new Error("Unsupported manifest parser version");
+  return PARSER;
 }
 /**
- * The exporter before `FLOW_QUOTING_SINCE` (portable-md.ts) wrote a string as it stood unless its `needsQuote` asked
- * otherwise, and that did not ask for a leading quote. So a value like `'made up' and more` went out bare, and plain
- * YAML refuses it. This rewrites exactly those lines and nothing else: a `key: value` or `- value` line whose value
- * opens with a quote and is not, on its own, valid YAML becomes that same text as a double-quoted string. The caller
- * parses the result strictly, so every other fault in the block (a conflict marker, bad indentation, an unclosed flow)
- * still fails. Null when no line qualifies.
+ * Read an export's scalars the way the vault's own import reads them, then hand the block to strict YAML.
+ *
+ * An export never holds a non-empty flow collection, and before `FLOW_QUOTING_SINCE` (portable-md.ts) the exporter
+ * wrote a string as it stood unless its `needsQuote` asked otherwise, which it did not for a leading `[ ] { } , ' "`.
+ * So in a mirror commit `link: [[Projects/Alpha]]` is the string, not a nested list; `title: 'single'` from the old
+ * exporter is the six-character string with its quotes; and `saying: 'made up' and more` is not YAML at all. Core's
+ * import reader knows all three (`parseFrontmatter`'s "export" and "old-export" readings). This asks that reader for
+ * each such value, one `key: value` or `- value` line at a time, and writes the string it returns as a double-quoted
+ * scalar, which strict YAML reads back as exactly that text. Nothing else is touched: structure, numbers, booleans
+ * and every other fault in the block are still strict YAML's to accept or refuse.
+ *
+ * `reading` is "old-export" for a commit made before `FLOW_QUOTING_SINCE` (only the old exporter existed), else
+ * "export". A box that kept the old exporter for a while after that date can still have written `'word'` meaning
+ * the quoted string; that one shape, in that window, is read as today's exporter means it. See UPGRADING.md.
+ *
+ * The exporter writes one value per line and never a block scalar. A block that holds one (`key: |`, `key: >`) was
+ * not written by it, so nothing is rewritten and strict YAML decides alone.
  */
-function repairOldExporterQuotes(block: string): string | null {
-  let changed = false;
-  const lines = block.split("\n").map(raw => {
+export function readExportScalars(block: string, reading: "export" | "old-export"): string {
+  const lines = block.split("\n");
+  if (lines.some(line => /(?:^|: |- )[|>][+-]?\d*\s*\r?$/.test(line))) return block;
+  return lines.map(raw => {
     const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
-    const match = /^(\s*(?:- )?)(?:([^\s'"\[\]{},#&*!|>%@`-][^'"]*?): )?(['"].*)$/.exec(line);
+    const match = /^(\s*(?:- )?)(?:([^\s'"\[\]{},#&*!|>%@`-][^'"]*?): )?(['"\[{].*)$/.exec(line);
     if (!match) return raw;
     const [, lead, key, value] = match;
-    if (key === undefined && !lead!.endsWith("- ")) return raw; // not `key: value`, not a list item
-    try { Bun.YAML.parse(`x: ${value}`); return raw; } catch { /* not a YAML scalar: the old exporter's bare string */ }
-    changed = true;
-    return `${lead}${key === undefined ? "" : `${key}: `}${JSON.stringify(value)}`;
-  });
-  return changed ? lines.join("\n") : null;
+    if (key === undefined) {
+      if (!lead!.endsWith("- ")) return raw;                    // not `key: value`, not a list item
+      if (/^(['"]).*?\1: /.test(value!)) return raw;              // a list item that is a map with a quoted key
+    }
+    const read = parseFrontmatter(`---\nx: ${value}\n---\n`, reading).frontmatter.x;
+    return typeof read === "string" ? `${lead}${key === undefined ? "" : `${key}: `}${JSON.stringify(read)}` : raw;
+  }).join("\n");
 }
 /** The one top-level `id:` line of a block that will not parse, when it names a note: so the failure quarantines that note instead of being an unidentified issue. */
 function statedId(block: string): string | undefined {
@@ -81,21 +94,19 @@ function statedId(block: string): string | undefined {
 class UnreadableFrontmatter extends Error {
   constructor(readonly noteId: string) { super("unreadable_frontmatter"); }
 }
-function frontmatter(block: string, parser: 1 | 2): Record<string, unknown> {
-  try { return yaml(block); }
+function frontmatter(block: string, parser: 1 | 2, reading: "export" | "old-export"): Record<string, unknown> {
+  if (parser === 1) return yaml(block);
+  try { return yaml(readExportScalars(block, reading)); }
   catch (strict) {
-    if (parser === 1) throw strict;
-    const repaired = repairOldExporterQuotes(block);
-    if (repaired !== null) { try { return yaml(repaired); } catch { /* something else is wrong with it too */ } }
     const id = statedId(block);
     if (id !== undefined) throw new UnreadableFrontmatter(id);
     throw strict;
   }
 }
-function inline(raw: string, parser: 1 | 2): { meta: Record<string, unknown>; content: string } {
+function inline(raw: string, parser: 1 | 2, reading: "export" | "old-export"): { meta: Record<string, unknown>; content: string } {
   const match = /^(?:\uFEFF)?---\r?\n([\s\S]*?)^---(?:\r?\n|$)/m.exec(raw);
   if (!match || match.index !== 0) throw new Error("missing_frontmatter");
-  return { meta: frontmatter(match[1]!, parser), content: raw.slice(match[0].length) };
+  return { meta: frontmatter(match[1]!, parser, reading), content: raw.slice(match[0].length) };
 }
 function observation(meta: Record<string, unknown>, content: string, commit: string, blob: string, time: string): { id: string; row: ImportedObservation } {
   if (!isNoteIdShape(meta.id)) throw new Error("invalid_id");
@@ -238,6 +249,8 @@ export function stageArchive(repo: string, tip: string, stage: Database, inputSe
     const [commit, tree, time] = commits[seq]!.split(" ");
     if (!commit || !tree || !time || !Number.isFinite(Date.parse(time))) throw new Error("Invalid commit record");
     fingerprint.update(`${commit} ${tree}\n`);
+    // A blob is parsed once, in the first commit that holds it (the caches below), so this is the commit that wrote it.
+    const reading = Date.parse(time) < Date.parse(FLOW_QUOTING_SINCE) ? "old-export" as const : "export" as const;
     const entries = text(git(repo, ["ls-tree", "-rz", "--full-tree", commit])).split("\0").filter(Boolean).map(record => {
       const tab = record.indexOf("\t"), [mode, type, hash] = record.slice(0, tab).split(" ");
       if (tab < 0 || !hash) throw new Error("Invalid tree record");
@@ -290,7 +303,7 @@ export function stageArchive(repo: string, tip: string, stage: Database, inputSe
     for (const entry of entries.filter(e => /^\.parachute\/notes-meta\/[^/]+\.yaml$/.test(e.path))) {
       let meta: Record<string, unknown> | undefined;
       try {
-        meta = frontmatter(read(entry), parser);
+        meta = frontmatter(read(entry), parser, reading);
         const extension = meta.extension;
         if (!isNoteIdShape(meta.id) || typeof extension !== "string") throw new Error("invalid_sidecar");
         const contentPath = `${meta.path ?? `_unpathed/${meta.id}`}.${extension}`;
@@ -320,7 +333,7 @@ export function stageArchive(repo: string, tip: string, stage: Database, inputSe
         if (cached) {
           collect(cached.note_id, cached.state, () => JSON.parse((parsedBody.get(entry.hash) as { row_json: string }).row_json), { git_path: entry.path, blob: entry.hash });
         } else {
-          const parsed = inline(read(entry), parser); meta = parsed.meta;
+          const parsed = inline(read(entry), parser, reading); meta = parsed.meta;
           // Mirror commits are exports (T-318 #8): undo the attachment links the
           // export rewrote, so a staged version is the body the vault stored.
           const extension = typeof meta.extension === "string" ? meta.extension : extname(entry.path).slice(1);
