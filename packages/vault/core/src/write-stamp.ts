@@ -15,7 +15,8 @@
  * A "by" is a label, not an account id: nothing may look it up as one. When link statements arrive ("client-42 is
  * this Nostr key"), they attach beside the stamp, keyed by the whole "by" string; the stamp itself never changes.
  *
- * Pure: no store, no request. The box (packages/vault/src) and the cloud vault worker call the same rule.
+ * No store, no request: the box (packages/vault/src) and the cloud vault worker call the same rule. One piece of
+ * state: the kind of each named key seen (`rememberKeyKind`), a map bounded by the door's own keys.
  */
 
 /** The REST header that names who a write is for. */

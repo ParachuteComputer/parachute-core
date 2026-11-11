@@ -1861,7 +1861,10 @@ async function revokeAction(
   auth: AuthResult,
   callerBearer: string | null,
 ): Promise<Record<string, unknown>> {
-  const byName = typeof params.name === "string" && params.name.length > 0 && params.jti === undefined;
+  if (params.name !== undefined && params.jti !== undefined) {
+    return { action: "revoke", ok: false, error: "invalid_request", message: "manage-keys revoke: give `name` or `jti`, not both." };
+  }
+  const byName = typeof params.name === "string" && params.name.length > 0;
   if (!byName && (typeof params.jti !== "string" || params.jti.length === 0)) {
     return {
       action: "revoke",
@@ -1887,7 +1890,11 @@ async function revokeAction(
 
   const store = getVaultStore(vaultName);
   if (byName) {
-    const named = listMcpMintedHubJwts(store.db, auth.caller_jti, vaultName).find((t) => t.label === params.name);
+    const matches = listMcpMintedHubJwts(store.db, auth.caller_jti, vaultName).filter((t) => t.label === params.name);
+    if (matches.length > 1) {
+      return { action: "revoke", ok: false, error: "ambiguous", message: `manage-keys revoke: ${matches.length} of this session's keys are labelled "${String(params.name)}"; give the \`jti\` (list shows each).` };
+    }
+    const named = matches[0];
     if (!named) {
       return { action: "revoke", ok: false, error: "not_found", message: `manage-keys revoke: this session minted no key called "${String(params.name)}" (list shows the names).` };
     }

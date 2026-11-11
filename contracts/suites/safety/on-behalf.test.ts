@@ -183,6 +183,36 @@ describe("safety/on-behalf: REST", () => {
     }
   });
 
+  test("every route answers the header: recorded on a record write, refused where nothing records a writer", async () => {
+    // A route that records no writer refuses the header rather than dropping it, for any key.
+    const path = `onbehalf/routes/${id()}`;
+    expect((await api(granted.token, "POST", "/notes", { content: "x", path })).status).toBe(201);
+    const noWriter = [
+      ["POST", "/triggers", { name: `t${id()}`, url: "http://127.0.0.1:9/hook", events: ["created"] }],
+      ["POST", `/notes/${encodeURIComponent(path)}/retry-transcription`, {}],
+      ["POST", `/notes/${encodeURIComponent(path)}/attachments`, { path: "x.png", mimeType: "image/png" }],
+    ] as const;
+    for (const [method, route, body] of noWriter) {
+      const r = await api(granted.token, method, route, body, { [HEADER]: "client-42" });
+      expect(r.status, `${route}: ${r.text.slice(0, 120)}`).toBe(400);
+      expect(r.body.error_type, route).toBe("on_behalf_not_recorded");
+      const p = await api(plain.token, method, route, body, { [HEADER]: "client-42" });
+      expect(p.body?.error_type, route).toBe("on_behalf_not_granted");
+    }
+    // The MCP transport never reads the REST header: refused there too.
+    const m = await call(`/vault/${s.vaultName}/mcp`, {
+      method: "POST",
+      auth: `Bearer ${granted.token}`,
+      headers: { [HEADER]: "client-42", accept: "application/json, text/event-stream" },
+      body: { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "t", version: "0" } } },
+    });
+    expect(m.status).toBe(400);
+    // A record whose path is a word the routes use is still a record.
+    const named = `versions-${id()}`;
+    expect((await api(granted.token, "POST", "/notes", { content: "x", path: named }, { [HEADER]: "client-9" })).status).toBe(201);
+    expect((await api(granted.token, "PATCH", `/notes/${named}`, { content: "y", force: true }, { [HEADER]: "client-9" })).status).toBe(200);
+  });
+
   test("a via or by in the body or in any other header changes nothing", async () => {
     const forged = { "Parachute-Via": "key:other", "X-Parachute-Via": "key:other", "Parachute-By": "someone", "X-On-Behalf-Of": "client-1", "Parachute-Acts-For": "unforced.dev" };
     const body = (path: string) => ({ content: "forged?", path, createdBy: "someone", createdVia: "key:other", created_by: "someone", created_via: "key:other", actor: "someone", via: "key:other" });
