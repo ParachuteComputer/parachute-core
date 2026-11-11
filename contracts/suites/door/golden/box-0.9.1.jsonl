@@ -215,6 +215,18 @@
 {"key":"mcp/create-note.result.shape","value":{"content":"string","createdAt":"string","createdBy":"string","createdVia":"string","extension":"string","id":"string","lastUpdatedBy":"string","lastUpdatedVia":"string","metadata":{"n":"number"},"path":"string","tags":["string"],"types":[],"updatedAt":"string"}}
 {"key":"mcp/list-tags.item.shape","value":{"count":"number","expanded_count":"number","kind":"string","name":"string"}}
 {"key":"mcp/list-tags.result.envelope","value":"array"}
+{"key":"mcp/nudge.create-note.blocks","value":["text","text"]}
+{"key":"mcp/nudge.create-note.text","value":"`create-note` is deprecated and goes away in 1.0. If `create-record` isn't among your tools, ask your user to refresh this connector so you get the new tools. Otherwise use `create-record` from now on."}
+{"key":"mcp/nudge.create-record.blocks","value":["text"]}
+{"key":"mcp/nudge.delete-note.blocks","value":["text","text"]}
+{"key":"mcp/nudge.delete-note.text","value":"`delete-note` is deprecated and goes away in 1.0. If `create-record` isn't among your tools, ask your user to refresh this connector so you get the new tools. Otherwise use `delete-record` from now on."}
+{"key":"mcp/nudge.list-tags.blocks","value":["text","text"]}
+{"key":"mcp/nudge.list-tags.text","value":"`list-tags` is deprecated and goes away in 1.0. If `create-record` isn't among your tools, ask your user to refresh this connector so you get the new tools. Otherwise use `list-types` from now on."}
+{"key":"mcp/nudge.query-notes.blocks","value":["text","text"]}
+{"key":"mcp/nudge.query-notes.text","value":"`query-notes` is deprecated and goes away in 1.0. If `create-record` isn't among your tools, ask your user to refresh this connector so you get the new tools. Otherwise use `query-records` from now on."}
+{"key":"mcp/nudge.refused-call","value":{"isError":true,"nudged":false}}
+{"key":"mcp/nudge.update-note.blocks","value":["text","text"]}
+{"key":"mcp/nudge.update-note.text","value":"`update-note` is deprecated and goes away in 1.0. If `create-record` isn't among your tools, ask your user to refresh this connector so you get the new tools. Otherwise use `update-record` from now on."}
 {"key":"mcp/other-vault","value":{"status":401}}
 {"key":"mcp/protected-resource.at.vault-first","value":{"same":true,"status":200}}
 {"key":"mcp/protected-resource.at.well-known-first","value":{"same":true,"status":200}}
@@ -225,6 +237,9 @@
 {"key":"mcp/protected-resource.scopes_supported","value":["string"]}
 {"key":"mcp/query-notes.no-such-note","value":{"isError":false,"shape":{"error":"string","error_type":"string","id":"string"}}}
 {"key":"mcp/query-notes.result.shape","value":[{"byteSize":"number","createdAt":"string","createdBy":"string","createdVia":"string","displayTitle":"string","extension":"string","id":"string","lastUpdatedBy":"string","lastUpdatedVia":"string","metadata":{"n":"number"},"path":"string","preview":"string","score":"number","tags":["string"],"types":[],"updatedAt":"string"}]}
+{"key":"mcp/reach.admin","value":"This connection can read the whole vault, create, change and delete its records, and manage its types, settings and keys."}
+{"key":"mcp/reach.read","value":"This connection can read the whole vault. It can't change anything."}
+{"key":"mcp/reach.write","value":"This connection can read the whole vault, and create, change and delete its records."}
 {"key":"mcp/read-calls-write-tool","value":"no such tool"}
 {"key":"mcp/read.capabilities","value":["tools"]}
 {"key":"mcp/read.instructions.sections","value":["This vault's coordinates","Start here","Quick orientation (call `vault-info` for full schema)","Querying","Refreshing context","Attachments","Scripting & automation (beyond this session)"]}
