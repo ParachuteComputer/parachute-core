@@ -32,7 +32,8 @@ describe("mcp/old-params", () => {
       const help = await c.call("vault-info", { help: tool });
       expect(Object.keys(help.parameters.properties)).toEqual(expect.arrayContaining([...params]));
       // If one comes back into the short list, this row of changes-0.9.json is out of date: update both.
-      expect(params.filter((p) => (listed[tool] ?? []).includes(p))).toEqual([]);
+      expect(listed[tool]).toBeDefined();
+      expect(params.filter((p) => listed[tool]!.includes(p))).toEqual([]);
     }
     await c.close();
   });
