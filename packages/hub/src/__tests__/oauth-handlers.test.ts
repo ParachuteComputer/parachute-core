@@ -12337,6 +12337,29 @@ describe("account-door consent per vault (T-446)", () => {
     }
   });
 
+  test("SECURITY: every vault at none drops the stored choice and ends its refresh tokens: the next ask shows the page", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const session = await friendOnWorkReadOtherWrite(db);
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"], status: "approved" });
+      const first = makePkce();
+      const res = await post(db, session.id, reg.client.clientId, first.challenge, [["account_vault_levels", "1"], ["vault_level:other", "read"]]);
+      const tokens = await redeemWithRefresh(db, res.headers.get("location")!, reg.client.clientId, first.verifier);
+      expect(tokens.scope).toBe("account:self:vaults:other:read");
+      const none = await post(db, session.id, reg.client.clientId, makePkce().challenge, [["account_vault_levels", "1"], ["vault_level:work", "none"], ["vault_level:other", "none"]], "account:vaults account:self:read");
+      expect(none.status).toBe(302);
+      expect(new URL(none.headers.get("location")!).searchParams.get("error")).toBe("access_denied");
+      // The next plain ask doesn't skip the page with the old level.
+      const next = get(db, session.id, reg.client.clientId, makePkce().challenge);
+      expect(next.status, next.headers.get("location") ?? "").toBe(200);
+      // And the earlier refresh token is over.
+      const stale = await refresh(db, reg.client.clientId, tokens.refresh_token);
+      expect(stale.status).toBe(400);
+    } finally {
+      cleanup();
+    }
+  });
+
   test("a post without the per-vault fields (a page from before 0.9.1) keeps the level-less grant", async () => {
     const { db, cleanup } = await makeDb();
     try {

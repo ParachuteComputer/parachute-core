@@ -2708,6 +2708,13 @@ async function handleConsentSubmit(
     const applied = applyPerVaultLevels(scopes, form, offer);
     if ("error" in applied) return htmlError("Vault access not allowed", `vault_scope_mismatch: ${applied.error}.`, 400);
     if ("none" in applied) {
+      // Every vault at none is a choice too: drop the earlier account-door choice from the grant and end its refresh
+      // families, so the next plain ask shows the page instead of replaying the old levels.
+      const noneAt = deps.now?.() ?? new Date();
+      revokeFamiliesWiderThanChoice(db, session.userId, params.clientId, [], noneAt);
+      if (findGrant(db, session.userId, params.clientId)) {
+        recordGrant(db, session.userId, params.clientId, [], noneAt, isAccountDoorChoiceScope);
+      }
       return oauthErrorRedirect(
         params.redirectUri,
         "access_denied",
