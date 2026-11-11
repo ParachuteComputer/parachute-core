@@ -231,10 +231,13 @@ operator, search, a type PUT and a retype, timed (`BENCH_N=94000 bun run doors -
 | `lifecycle/identity.test.ts` | **The new name** (PLAN §2.5; the command `parachute`, Aaron 10-27): `@openparachute/core`, bins `parachute` and `parachute-core`, with `parachute-vault` inside the folder only; the vault serve starts is core's own even with the old one first on PATH (green on the core build); installing it with `parachute install --prefix` links `parachute` and `parachute-core`, leaves the old global packages byte-identical, and names `parachute-core` when the old hub's `parachute` comes first on PATH (green from lanes D and R). |
 | `v1/sharing.test.ts` | Grants (who × what × how much). A pass alone grants nothing. Grants add up. Private notes are the exception inside a shared page. Revoking takes effect at once. |
 | `v1/connector-attribution.test.ts` | When an app writes for a person, the note names both. |
+| `door-v1/*.test.ts` | **1.0 grants, as door contracts** (decided, not built; [`docs/SPEC-1.0-grants.md`](../docs/SPEC-1.0-grants.md)). An owner-signed grant opens named types and verbs to one key; expiry and a signed revoke; members, agents, applets and services; the link statement; what a narrow grant must never learn; what the export carries. Each is `red()` and runs on any door: `bun run doors -- --doors box,personal suites/door-v1`. See [`suites/door-v1/README.md`](suites/door-v1/README.md). |
 
 ### today and v1
 
 - **`today`** contracts must pass against the pins. CI runs them on every push and pull request.
+- **`door-v1`** is the same idea for behaviour that has to be shown on more than one door: door contracts wrapped
+  in `red()`, run by the door harness. CI runs them on the box.
 - **`v1`** contracts describe behaviour Aaron has decided for v1 that today's code lacks. They are `test.failing`:
   green while the behaviour is missing, red the day it works. That red is the signal to move the test to
   `today/` in its own pull request. `V1_SHOW=1 bun run v1` shows why each fails today. Each v1 file also has a
