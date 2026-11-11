@@ -82,10 +82,27 @@ function watermark(cursor: unknown): { at: unknown; id: unknown } {
   return { at: c.last_updated_at, id: c.last_id };
 }
 
+/**
+ * The two REST doors a note is reached through (SPEC §5.1): `/api/notes` and its record twin `/api/records`. A scoped
+ * pass must learn nothing new through either, so the REST leak contracts run on both. `words` puts a note-word body
+ * into the door's words (`content` → `body`, `metadata` → `fields` on the record door).
+ */
+const DOORS = [
+  { door: "notes", words: (b: Record<string, unknown>) => b },
+  {
+    door: "records",
+    words: (b: Record<string, unknown>) =>
+      Object.fromEntries(Object.entries(b).map(([k, v]) => [({ content: "body", metadata: "fields" } as Record<string, string>)[k] ?? k, v])),
+  },
+] as const;
+
 /** Whether the operator sees a link from `from` to `to` (either direction listed). */
 async function linked(from: string, to: string): Promise<boolean> {
   const r = await op.get(`/notes/${enc(from)}?include_links=true`);
-  return JSON.stringify(r.body?.links ?? []).includes(to);
+  // By the link's ends, not its text: a hydrated link carries its notes' metadata, which may name `to` as a value.
+  return ((r.body?.links ?? []) as { sourceId?: string; targetId?: string }[]).some(
+    (l) => (l.sourceId === from && l.targetId === to) || (l.sourceId === to && l.targetId === from),
+  );
 }
 
 describe("gap 1: a scoped writer can't link into a hidden note, or learn that it exists", () => {
@@ -109,14 +126,14 @@ describe("gap 1: a scoped writer can't link into a hidden note, or learn that it
     expect(await linked(r.body.id, visible)).toBe(true);
   });
 
-  for (const [i, [what, by]] of ([
+  for (const { door, words } of DOORS) for (const [i, [what, by]] of ([
     ["a structured link by id", (t: string) => ({ links: [{ target: t === hiddenPath ? hiddenId : missingId, relationship: "cites" }] })],
     ["a structured link by path", (t: string) => ({ links: [{ target: t, relationship: "cites" }] })],
     ["a [[wikilink]] in the content", (t: string) => ({ content: `see [[${t}]]` })],
   ] as const).entries()) {
-    test(`REST create: ${what} to a hidden note answers as one to nothing, and makes no link`, async () => {
+    test(`REST /api/${door} create: ${what} to a hidden note answers as one to nothing, and makes no link`, async () => {
       const w = rest(s.vaultViaHub, writerPass);
-      const make = (t: string, n: string) => w.post("/notes", { content: "a note", path: `${R}/g1/${n}`, tags: [MINE], ...by(t) });
+      const make = (t: string, n: string) => w.post(`/${door}`, words({ content: "a note", path: `${R}/g1/${door}-${n}`, tags: [MINE], ...by(t) }));
       const hidden = await make(hiddenPath, `rest-h${i}`);
       const missing = await make(missingPath, `rest-m${i}`);
       expect(hidden.status).toBe(201);
@@ -130,15 +147,47 @@ describe("gap 1: a scoped writer can't link into a hidden note, or learn that it
     });
   }
 
-  test("REST update: adding a link to a hidden note answers as one to nothing, and makes no link", async () => {
+  for (const { door } of DOORS) test(`REST /api/${door} update: adding a link to a hidden note answers as one to nothing, and makes no link`, async () => {
     const w = rest(s.vaultViaHub, writerPass);
-    const id = await note(`${R}/g1/patched`, "patched later", [MINE]);
-    const at = async () => (await w.get(`/notes/${id}`)).body.updatedAt as string;
-    const hidden = await w.patch(`/notes/${id}`, { links: { add: [{ target: hiddenId, relationship: "cites" }] }, if_updated_at: await at() });
-    const missing = await w.patch(`/notes/${id}`, { links: { add: [{ target: missingId, relationship: "cites" }] }, if_updated_at: await at() });
+    const id = await note(`${R}/g1/${door}-patched`, "patched later", [MINE]);
+    const at = async () => (await w.get(`/${door}/${id}`)).body.updatedAt as string;
+    const hidden = await w.patch(`/${door}/${id}`, { links: { add: [{ target: hiddenId, relationship: "cites" }] }, if_updated_at: await at() });
+    const missing = await w.patch(`/${door}/${id}`, { links: { add: [{ target: missingId, relationship: "cites" }] }, if_updated_at: await at() });
     expect(hidden.status).toBe(200);
     must(masked(hidden.body.warnings, hiddenId) === masked(missing.body.warnings, missingId), `PATCH: a link to a hidden note answered differently from a link to nothing: ${JSON.stringify(hidden.body.warnings)}`);
     must(!(await linked(id, hiddenId)), "a scoped writer's PATCH made a link into a hidden note");
+  });
+
+  // Round-1 review: with one visible and one hidden note of the same name, making no link (and no warning, since
+  // the writer sees only one) told the writer the hidden one exists. The writer means the note it can see.
+  for (const { door, words } of DOORS) test(`REST /api/${door}: a name one visible and one hidden note share links to the visible one`, async () => {
+    const name = `${R}g1dup${door}`;
+    await note(`${R}/g1/${door}-dup-hidden/${name}`, `hidden ${SECRET}`, [OTHER]);
+    const visibleId = await note(`${R}/g1/${door}-dup-visible/${name}`, "the one the writer sees", [MINE]);
+    const w = rest(s.vaultViaHub, writerPass);
+    const r = await w.post(`/${door}`, words({ content: `see [[${name}]]`, path: `${R}/g1/${door}-dup-from`, tags: [MINE], links: [{ target: name, relationship: "cites" }] }));
+    expect(r.status).toBe(201);
+    must(JSON.stringify(r.body.warnings ?? []) === "[]", `a name a hidden note shares warned the writer: ${JSON.stringify(r.body.warnings)}`);
+    must(await linked(r.body.id, visibleId), "a link to the one note the writer can see by that name was not made");
+  });
+
+  // Round-1 review: a reference field listing a hidden note (set by someone who can see it) lost that link when a
+  // scoped writer edited the list, so the writer's edit destroyed a link it never saw.
+  for (const { door, words } of DOORS) test(`REST /api/${door}: a scoped writer's edit of a reference list keeps another writer's link to a hidden note`, async () => {
+    const typed = `${MINE}/ref${door}`;
+    const put = await op.put(`/tags/${enc(typed)}`, { fields: { related: { type: "reference", cardinality: "many" } } });
+    if (put.status >= 300) throw new Error(`setup: declaring ${typed} gave ${put.status}: ${JSON.stringify(put.body).slice(0, 200)}`);
+    const visibleId = await note(`${R}/g1/${door}-ref-visible`, "visible", [MINE]);
+    const r = await op.post("/notes", { content: "has references", path: `${R}/g1/${door}-ref-from`, tags: [MINE, typed], metadata: { related: [hiddenId] } });
+    if (r.status !== 201) throw new Error(`setup: creating the referring note gave ${r.status}`);
+    const id = r.body.id as string;
+    must(await linked(id, hiddenId), "setup: the owner's reference didn't link");
+    const w = rest(s.vaultViaHub, writerPass);
+    const at = (await w.get(`/${door}/${id}`)).body.updatedAt;
+    const p = await w.patch(`/${door}/${id}`, { ...words({ metadata: { related: [hiddenId, visibleId] } }), if_updated_at: at });
+    expect(p.status).toBe(200);
+    expect(await linked(id, visibleId)).toBe(true);
+    must(await linked(id, hiddenId), "a scoped writer's edit deleted another writer's reference link to a note it can't see");
   });
 
   test("MCP create-note: a link and a wikilink to a hidden note answer as ones to nothing, and make no link", async () => {
@@ -167,10 +216,10 @@ describe("gap 1: a scoped writer can't link into a hidden note, or learn that it
 // the whole vault, so creating at a hidden note's path answers 409 path_conflict. That says something is there; it
 // must say nothing more. Fixing it needs a path namespace per scope (1.0's grants).
 describe("gap 9 (deliberate): a hidden note's path answers 409 on create, and names nothing of the note", () => {
-  test("409 path_conflict, with no id, tag or content of the hidden note", async () => {
-    const hiddenId = await note(`${R}/g9/taken`, `hidden ${SECRET}`, [OTHER]);
+  for (const { door, words } of DOORS) test(`/api/${door}: 409 path_conflict, with no id, tag or content of the hidden note`, async () => {
+    const hiddenId = await note(`${R}/g9/${door}-taken`, `hidden ${SECRET}`, [OTHER]);
     const w = rest(s.vaultViaHub, await pass({ level: "write", tags: [MINE] }));
-    const r = await w.post("/notes", { content: "mine", path: `${R}/g9/taken`, tags: [MINE] });
+    const r = await w.post(`/${door}`, words({ content: "mine", path: `${R}/g9/${door}-taken`, tags: [MINE] }));
     expect(r.status).toBe(409);
     expect(r.body.error_type).toBe("path_conflict");
     const said = JSON.stringify(r.body);
@@ -203,14 +252,16 @@ describe("gap 2: no truncation or paging signal tells a scoped reader that hidde
   test("REST and MCP cursor paging: a filter that matches only hidden notes gives the cursor a filter that matches nothing gets", async () => {
     const token = await pass({ level: "read", tags: [MINE] });
     const reader = rest(s.vaultViaHub, token);
-    const hidden = await reader.get(`/notes?path_prefix=${enc(`${R}/g2/Secret`)}&limit=1&cursor=`);
-    const none = await reader.get(`/notes?path_prefix=${enc(`${R}/g2/nothing`)}&limit=1&cursor=`);
-    expect(hidden.status).toBe(200);
-    expect(hidden.body.notes).toEqual([]);
-    must(
-      JSON.stringify(watermark(hidden.body.next_cursor)) === JSON.stringify(watermark(none.body.next_cursor)),
-      `REST: the cursor told a scoped reader about hidden notes: ${JSON.stringify(watermark(hidden.body.next_cursor))}`,
-    );
+    for (const { door } of DOORS) {
+      const hidden = await reader.get(`/${door}?path_prefix=${enc(`${R}/g2/Secret`)}&limit=1&cursor=`);
+      const none = await reader.get(`/${door}?path_prefix=${enc(`${R}/g2/nothing`)}&limit=1&cursor=`);
+      expect(hidden.status).toBe(200);
+      expect(hidden.body.notes ?? hidden.body.records).toEqual([]);
+      must(
+        JSON.stringify(watermark(hidden.body.next_cursor)) === JSON.stringify(watermark(none.body.next_cursor)),
+        `REST /api/${door}: the cursor told a scoped reader about hidden notes: ${JSON.stringify(watermark(hidden.body.next_cursor))}`,
+      );
+    }
     const c = await mcp(`${s.vaultViaHub}/mcp`, token);
     try {
       const h = await c.call("query-notes", { path_prefix: `${R}/g2/Secret`, limit: 1, cursor: "" });
@@ -226,15 +277,18 @@ describe("gap 2: no truncation or paging signal tells a scoped reader that hidde
 
   test("cursor paging walks every note a scoped reader can see, past pages of hidden ones", async () => {
     const reader = rest(s.vaultViaHub, await pass({ level: "read", tags: [MINE] }));
-    const seen: string[] = [];
-    let cursor = "";
-    for (let i = 0; i < 5; i++) {
-      const r = await reader.get(`/notes?path_prefix=${enc(`${R}/g2/`)}&limit=1&cursor=${enc(cursor)}`);
-      seen.push(...r.body.notes.map((n: any) => n.path));
-      if (r.body.notes.length === 0) break;
-      cursor = r.body.next_cursor;
+    for (const { door } of DOORS) {
+      const seen: string[] = [];
+      let cursor = "";
+      for (let i = 0; i < 5; i++) {
+        const r = await reader.get(`/${door}?path_prefix=${enc(`${R}/g2/`)}&limit=1&cursor=${enc(cursor)}`);
+        const page = r.body.notes ?? r.body.records;
+        seen.push(...page.map((n: any) => n.path));
+        if (page.length === 0) break;
+        cursor = r.body.next_cursor;
+      }
+      expect(seen.sort()).toEqual([`${R}/g2/mine/a`, `${R}/g2/mine/b`]);
     }
-    expect(seen.sort()).toEqual([`${R}/g2/mine/a`, `${R}/g2/mine/b`]);
   });
 });
 
@@ -276,6 +330,20 @@ describe("gap 4: a tag-scoped admin pass can't be minted, and doctor names one t
   });
 });
 
+test("gap 4: `parachute doctor` names a broad `vault:admin` key with a tag limit too", async () => {
+  const token = await pass({ level: "admin" });
+  const jti = claims(token).jti as string;
+  const db = hubDb(false);
+  try {
+    db.query("UPDATE tokens SET scopes = ?, permissions = ? WHERE jti = ?").run("vault:read vault:write vault:admin", JSON.stringify({ scoped_tags: [MINE] }), jti);
+  } finally {
+    db.close();
+  }
+  const name = keyName(token);
+  const said = await cli(["doctor", "--json"]).then((r) => r.out + r.err);
+  must(said.includes(name), `doctor didn't name the broad vault:admin key "${name}" with a tag limit: ${said.slice(0, 400)}`);
+});
+
 describe("gap 6: changing a tag that a key's scope names is refused without force, naming the keys", () => {
   let keyed: string; // a pass scoped to KEPT
   const KEPT = `${R}kept`;
@@ -314,6 +382,63 @@ describe("gap 6: changing a tag that a key's scope names is refused without forc
     refused(await op.del(`/tags/${enc(KEPT)}`), "deleting a key's tag", key);
     refused(await op.put(`/tags/${enc(SPARE)}`, { parent_names: [KEPT] }), "putting a tag under a key's tag", key);
     expect((await rest(s.vaultViaHub, keyed).get(`/notes?tag=${enc(KEPT)}`)).body.length).toBe(1);
+  });
+
+  test("/api/types: rename, merge, delete and re-parent of a tag a live key names (the record door's twin)", async () => {
+    const key = keyName(keyed);
+    refused(await op.post(`/types/${enc(KEPT)}/rename`, { new_name: `${KEPT}x` }), "renaming a key's tag on /api/types", key);
+    refused(await op.post("/types/merge", { sources: [SPARE], target: KEPT }), "merging into a key's tag on /api/types", key);
+    refused(await op.del(`/types/${enc(KEPT)}`), "deleting a key's tag on /api/types", key);
+    refused(await op.put(`/types/${enc(SPARE)}`, { parent_names: [KEPT] }), "putting a tag under a key's tag on /api/types", key);
+  });
+
+  // Round-1 review: a key's tags and private_tags reach names under them (`secret/diary`) and their declared
+  // children, so a change to such a name changes who sees what as much as one to the name itself.
+  test("REST: a change to a name under a key's or a private tag, by prefix or by parent, is refused too", async () => {
+    const key = keyName(keyed);
+    await note(`${R}/g6/priv-sub`, "private by prefix", [`${PRIV}/diary`]);
+    refused(await op.post(`/tags/${enc(`${PRIV}/diary`)}/rename`, { new_name: `${R}diary` }), "renaming a private tag's sub-tag out from under it");
+    refused(await op.post("/tags/merge", { sources: [`${PRIV}/diary`], target: SPARE }), "merging a private tag's sub-tag away");
+    expect((await op.put(`/tags/${enc(`${R}pchild`)}?force=true`, { parent_names: [PRIV] })).status).toBe(200);
+    await note(`${R}/g6/priv-child`, "private by parent", [`${R}pchild`]);
+    refused(await op.post("/tags/merge", { sources: [`${R}pchild`], target: SPARE }), "merging a private tag's child away");
+    refused(await op.del(`/tags/${enc(`${R}pchild`)}`), "deleting a private tag's child");
+    refused(await op.post("/tags/merge", { sources: [SPARE], target: `${KEPT}/sub` }), "merging into a name under a key's tag", key);
+    expect((await op.put(`/tags/${enc(`${R}kchild`)}?force=true`, { parent_names: [KEPT] })).status).toBe(200);
+    refused(await op.post("/tags/merge", { sources: [SPARE], target: `${R}kchild` }), "merging into a key's tag's child", key);
+    expect((await op.get(`/tags/${enc(`${PRIV}/diary`)}`)).status).toBe(200);
+  });
+
+  // Round-1 review: the refusal named every key and private tag the change touched, so a tag-scoped admin (minted
+  // before 0.9.1) learned the names of keys and tags outside its scope. To a scoped caller every such change needs
+  // force, and the refusal names nothing.
+  test("a tag-scoped admin's refusal names no key or tag, and doesn't say whether one reaches its tag", async () => {
+    const FAM = `${R}fam`;
+    const ITS = `${R}its`;
+    const LONE = `${R}lone`;
+    await note(`${R}/g6/fam`, "another key's", [FAM]);
+    expect((await op.put(`/tags/${enc(ITS)}?force=true`, { parent_names: [FAM] })).status).toBe(200);
+    expect((await op.put(`/tags/${enc(`${LONE}a`)}?force=true`, { parent_names: [LONE] })).status).toBe(200);
+    const famKey = keyName(await pass({ level: "read", tags: [FAM] }));
+    await note(`${R}/g6/its`, "the scoped admin's", [ITS]);
+    await note(`${R}/g6/lone`, "the scoped admin's, reached by no other key", [LONE]);
+    const token = await scopedAdmin([ITS, LONE]);
+    const admin = rest(s.vaultViaHub, token);
+    const reached = await admin.put(`/tags/${enc(ITS)}`, { parent_names: [] });
+    const free = await admin.del(`/tags/${enc(`${LONE}a`)}`);
+    for (const [what, r] of [["re-parenting its tag away from another key's", reached], ["deleting a tag no other key reaches", free]] as const) {
+      const body = JSON.stringify(r.body);
+      must(!body.includes(famKey) && !body.includes(FAM) && !body.includes(PRIV) && !body.includes(KEPT), `${what}: the refusal named a key or tag outside the scope: ${body.slice(0, 300)}`);
+    }
+    must(reached.status === free.status && JSON.stringify(reached.body?.keys ?? null) === JSON.stringify(free.body?.keys ?? null), `a scoped admin can tell whether another key reaches its tag: ${reached.status} ${JSON.stringify(reached.body).slice(0, 200)} vs ${free.status} ${JSON.stringify(free.body).slice(0, 200)}`);
+    const c = await mcp(`${s.vaultViaHub}/mcp`, token);
+    try {
+      const said = await c.call("update-tag", { tag: ITS, parent_names: [] }).then((r) => JSON.stringify(r), (e) => (e as Error).message);
+      must(!said.includes(famKey) && !said.includes(FAM), `MCP: the refusal named a key or tag outside the scope: ${said.slice(0, 300)}`);
+    } finally {
+      await c.close();
+    }
+    expect(JSON.stringify((await op.get(`/tags/${enc(ITS)}`)).body?.parent_names ?? null)).toContain(FAM);
   });
 
   test("REST: rename and delete of a private tag and of the published tag", async () => {
