@@ -4020,17 +4020,20 @@ describe("HTTP /notes", async () => {
       expect(body.map((n) => n.content)).toEqual(["hit"]);
     });
 
-    test("operator query on a non-indexed field returns 400 with FIELD_NOT_INDEXED", async () => {
-      // Don't declare the field — the engine's indexed-field gate should fire.
+    test("operator query on a non-indexed field scans, with a scan warning (0.9.2)", async () => {
+      // Don't declare the field: it is scanned, not refused.
       await store.createNote("x", { metadata: { mood: "great" } });
+      await store.createNote("y", { metadata: { mood: "fine" } });
       const res = await handleNotes(
-        mkReq("GET", "/notes?meta[mood][eq]=great"),
+        mkReq("GET", "/notes?meta[mood][eq]=great&include_content=true"),
         store,
         "",
       );
-      expect(res.status).toBe(400);
-      const body = await res.json() as any;
-      expect(body.code).toBe("FIELD_NOT_INDEXED");
+      expect(res.status).toBe(200);
+      const body = await res.json() as any[];
+      expect(body.map((n) => n.content)).toEqual(["x"]);
+      const warnings = JSON.parse(decodeURIComponent(res.headers.get("X-Parachute-Warnings") ?? "[]"));
+      expect(warnings.filter((w: any) => w.code === "scan").map((w: any) => w.fields)).toEqual([["mood"]]);
     });
 
     test("unknown operator returns 400 with UNKNOWN_OPERATOR", async () => {

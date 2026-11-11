@@ -15,6 +15,8 @@ import {
   ignoredParamWarning,
   truncatedResultsWarning,
   computeSearchDidYouMean,
+  collectScanWarnings,
+  assertNoAggregateScan,
   searchDidYouMeanWarning,
   embeddingsPendingWarning,
   type QueryWarning,
@@ -1053,6 +1055,8 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
               | { field?: string; from?: string; to?: string }
               | undefined,
           };
+          // Before the scoped branch, which lists the matches (a scan) and then aggregates their ids.
+          assertNoAggregateScan(db, aggFilterOpts);
           if (!aggregateVisibility) {
             return await store.aggregateNotes({ ...aggFilterOpts, aggregate: aggregateSpec });
           }
@@ -1208,6 +1212,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           // silent fallback to keyword search.
           const semanticResult = await store.semanticSearch(params.near_text, semanticOpts);
           results = semanticResult.notes;
+          queryWarnings.push(...collectScanWarnings(db, semanticOpts));
           if (semanticResult.pendingCount > 0) {
             queryWarnings.push(
               embeddingsPendingWarning(semanticResult.pendingCount, semanticResult.totalCandidates),
@@ -1287,6 +1292,12 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
               sort: params.sort as "asc" | "desc" | undefined,
               ...(searchVisibility ? { visible: searchVisibility } : {}),
             });
+            queryWarnings.push(
+              ...collectScanWarnings(db, {
+                metadata: params.metadata as Record<string, unknown> | undefined,
+                dateFilter: params.date_filter as { field?: string } | undefined,
+              }),
+            );
             // Zero-result `did_you_mean` (vault#551 WS2B) — cheap (a bounded
             // FTS5-vocabulary scan) and ONLY computed on the already-rare
             // empty-result path, mirroring `unknown_tag`'s did_you_mean.
@@ -1370,6 +1381,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           // above (vault#551).
           queryWarnings = queryWarnings.concat(
             collectUnknownTagWarnings(db, queryOpts.tags, queryOpts.expand, store.getTagHierarchy()),
+            collectScanWarnings(db, queryOpts),
           );
           if (cursorMode) {
             const page = await store.queryNotesPaged(queryOpts, searchVisibility);
