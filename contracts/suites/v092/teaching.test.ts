@@ -39,7 +39,7 @@ describe("0.9.2 teaching", () => {
   });
 
   red("vault-info's tag map is capped: with 700 types it fits in about 4,000 tokens and says how many there are", { reason: /^uncapped: /, lane: LANE }, async () => {
-    // Adam's largest vault has 688 names; at its shape the map is 5.7k of vault-info's 9k tokens (SPEC §4.5).
+    // The largest vault moving to cloud has 688 type names; at its shape the map is 5.7k of vault-info's 9k tokens.
     // Filled on the run's second vault, so the other contracts' vault stays small.
     const m = await otherMcp();
     try {
