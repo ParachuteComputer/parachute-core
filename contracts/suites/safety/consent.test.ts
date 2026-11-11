@@ -387,7 +387,7 @@ describe("the consent page says what the connection can read", () => {
 
   test("read: the whole vault, and where it goes", async () => {
     expect(await permissions(READ)).toBe(
-      "Permissions requested vault:<vault>:read read Read the whole vault: every note, tag and attachment, and the vault's settings. What this app reads from your vault goes to the company that runs it.",
+      "Permissions requested vault:<vault>:read read Read the whole vault: every note, tag and attachment, and its settings. What this app reads from your vault goes to the company that runs it.",
     );
   });
 

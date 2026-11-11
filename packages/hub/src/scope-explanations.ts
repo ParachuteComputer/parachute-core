@@ -72,7 +72,8 @@ export function riskForExplanation(e: ScopeExplanation): "low" | "elevated" | "h
 
 export const SCOPE_EXPLANATIONS: Record<string, ScopeExplanation> = {
   "vault:read": {
-    label: "Read your notes, tags, attachments, and vault config.",
+    // 0.9.1 (SPEC §3.4): say plainly that a vault grant reaches the whole vault at its level.
+    label: "Read the whole vault: every note, tag and attachment, and its settings.",
     level: "read",
   },
   "vault:write": {
@@ -82,7 +83,8 @@ export const SCOPE_EXPLANATIONS: Record<string, ScopeExplanation> = {
     // structure vs content, the same line that keeps create/update/delete-note
     // at write. A user reading the old label approved write expecting to manage
     // their taxonomy and then hit refusals the consent screen never warned of.
-    label: "Create, edit, and delete notes and attachments, and apply existing tags to them.",
+    // Write reads too (scope-guard's admin ⊇ write ⊇ read): the label says so, never less than the grant can do.
+    label: "Read the whole vault. Create, edit, and delete notes and attachments, and apply existing tags to them.",
     level: "write",
   },
   "vault:admin": {
