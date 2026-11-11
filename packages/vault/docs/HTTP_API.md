@@ -75,12 +75,12 @@ Version history is the first self-hosted-first feature tracked in this table.
 
 | Param | Self-hosted (bun) | Hosted (cloud) | Note |
 |---|---|---|---|
-| `POST /api/history/compact` | honored | not yet | Self-hosted only — hosted door is PR 4 of #524. |
-| `GET /notes/:id/versions` | honored | not yet | Self-hosted only — hosted door is PR 4 of #524 |
-| `GET /notes/:id/versions/:version_ix` | honored | not yet | Self-hosted only — hosted door is PR 4 of #524 |
-| `POST /notes/:id/restore` | honored | not yet | Self-hosted only — hosted door is PR 4 of #524 |
-| `DELETE /notes/:id/versions` | honored | not yet | Self-hosted only — hosted door is PR 4 of #524 |
-| `query-notes versions (MCP)` | honored | not yet | Self-hosted only — hosted door is PR 4 of #524 |
+| `POST /api/history/compact` | honored | honored | Hosted compaction is bounded per request (250 ms, 50 notes). |
+| `GET /notes/:id/versions` | honored | honored | Same shapes on both doors; cloud's `workers/vault/test/history.test.ts` holds it. |
+| `GET /notes/:id/versions/:version_ix` | honored | honored | Same shapes on both doors; cloud's `workers/vault/test/history.test.ts` holds it. |
+| `POST /notes/:id/restore` | honored | honored | Same shapes on both doors; cloud's `workers/vault/test/history.test.ts` holds it. |
+| `DELETE /notes/:id/versions` | honored | honored | Same shapes on both doors; cloud's `workers/vault/test/history.test.ts` holds it. |
+| `query-notes versions (MCP)` | honored | honored | Same shapes on both doors; cloud's `workers/vault/test/history.test.ts` holds it. |
 | `DELETE /notes/:id?erase_history=true` | honored | honored once cloud pins core with T-412 | T-412 |
 | `GET /history/deleted` | honored | honored once cloud pins core with T-412 | T-412 |
 | `delete-note` `ids` / `erase_history` (MCP) | honored | honored once cloud pins core with T-412 | T-412; core's tool, so both doors get it from the pin |
@@ -1515,6 +1515,8 @@ Imported history appears in existing version lists with `origin: "git-import"` a
 `GET /vault/{name}/api/notes/{idOrPath}/imports/{import_ix}` reads a retained imported observation. Paths use the same URL encoding and tag-scope checks as `/versions/{version_ix}`. Restore uses the existing POST `/notes/{idOrPath}/restore` with `{ "origin": "git-import", "import_ix": 0 }` and requires `if_updated_at` when the note currently exists (omit it for deleted-note recovery). `restored_from` is that reference object for imports. Native `{version_ix}` remains unchanged. Mixed, incomplete, negative, fractional or unsafe selectors are rejected. Pruned imports return 404 with their public reference; unrecoverable imports return 409 `history_unrecoverable` with the reference, never an internal storage index.
 
 MCP `query-notes` accepts `versions: {note_id, origin:"git-import", import_ix:0}` for reads. It preserves existing live-note and tag-scope restrictions. Corrupt imported content produces a JSON-RPC error with `error.data.error_type`, `origin`, and `import_ix`; it is not a successful tool result containing an error string. There is no new MCP restore operation.
+
+The hosted door reads imported history with these same shapes. It never reads a git archive itself: the archive is imported on a self-hosted copy with `parachute-vault history-import`, and an operator then sends the result behind the notes of the person's Cloud vault (parachute-cloud `HISTORY.md`, "Operator history import"). A vault that received one keeps all its history rather than the default retention.
 
 History erasure removes retained content through the existing GC rules. Minimal import receipts and commit/blob references remain to prevent re-import after erasure; a full vault wipe removes them. Git committer identity is not historical note authorship: imported rows have null actor and `via: "git-import"`.
 
