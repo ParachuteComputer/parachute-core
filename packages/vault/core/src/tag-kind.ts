@@ -479,8 +479,16 @@ export function nearSchemaWarnings(
       for (const k of keysOf(r.fields)) declared.set(k, [...(declared.get(k) ?? []), r.name]);
     }
     const ownKeys = new Set<string>(keysOf(rows.find((r) => r.name === tag)?.fields));
-    for (const name of Object.keys(fields)) {
+    const incoming = Object.keys(fields);
+    for (const name of incoming) {
       if (declared.has(name) || ownKeys.has(name)) continue;
+      // The type's own fields first (the commonest slip: adding `statu` beside its `status`), then the fields
+      // this same PUT declares, then other types'.
+      const own = nearestName([...ownKeys, ...incoming.filter((k) => k !== name)], name);
+      if (own !== undefined) {
+        out.push({ code: "near_name", kind: "field", name, nearest: own, declared_by: [tag], message: `"${name}" is a new field, one letter from "${own}" on this type. Declared as written: if you meant "${own}", use that name.` });
+        continue;
+      }
       const nearest = nearestName(declared.keys(), name);
       if (nearest === undefined) continue;
       out.push({ code: "near_name", kind: "field", name, nearest, declared_by: declared.get(nearest), message: `"${name}" is a new field, one letter from "${nearest}", which other types declare. Declared as written: if you meant "${nearest}", use that name.` });

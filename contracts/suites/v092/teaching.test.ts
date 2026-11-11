@@ -67,8 +67,8 @@ describe("0.9.2 teaching", () => {
     // An admin session: manage-types changes types, so a read or write session isn't shown it at all (as written
     // first, with "read", the tool was never found and every word read as missing).
     const m = await mcp("admin");
-    must(!!(await m.tools()).find((t) => t.name === "manage-types"), "setup: an admin session lists manage-types");
     try {
+      must(!!(await m.tools()).find((t) => t.name === "manage-types"), "setup: an admin session lists manage-types");
       const tool = said((await m.tools()).find((t) => t.name === "manage-types"));
       const missing = ["reference", "required", "strict", "cardinality"].filter((w) => !tool.includes(w));
       must(missing.length === 0, `untaught: ${missing.join(", ")}`);

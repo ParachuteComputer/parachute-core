@@ -484,9 +484,11 @@ export function projectionToMarkdown(args: {
     const shown: string[] = [];
     let len = 0;
     for (const n of all) {
-      if (len + n.length + 2 > 1500) break;
+      // The joined length: a separator before every name but the first.
+      const add = (shown.length > 0 ? 2 : 0) + n.length;
+      if (len + add > 1500) break;
       shown.push(n);
-      len += n.length + 2;
+      len += add;
     }
     const more = all.length - shown.length;
     const names = shown.join(", ") + (more > 0 ? `, and ${more} more (list-types lists them all)` : "");
