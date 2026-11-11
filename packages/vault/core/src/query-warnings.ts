@@ -35,6 +35,8 @@ import {
 } from "./tag-hierarchy.js";
 import { chunkForInClause } from "./sql-in.js";
 import { escapeFtsToken } from "./search-query.js";
+import { getIndexedField } from "./indexed-fields.js";
+import { isOperatorObject } from "./query-operators.js";
 
 export interface QueryWarning {
   code: string;
@@ -422,4 +424,50 @@ export function embeddingsPendingWarning(pending: number, totalCandidates: numbe
     pending,
     total_candidates: totalCandidates,
   };
+}
+
+/**
+ * The fields a structured query will scan rather than read from an index
+ * (0.9.2 "filter any field"): a `metadata` operator object, `orderBy` or
+ * `dateFilter.field` naming a field that isn't indexed. Mirrors the routing in
+ * `notes.ts:buildFilterConditions` and `queryNotes`'s order_by, so the warning
+ * appears exactly when a scan runs. Bare `{field: value}` equality is left
+ * out: it has always read the JSON, and stays unwarned.
+ */
+export function scanFields(
+  db: Database,
+  opts: { metadata?: Record<string, unknown>; orderBy?: string; dateFilter?: { field?: string } },
+): string[] {
+  const fields = new Set<string>();
+  for (const [key, value] of Object.entries(opts.metadata ?? {})) {
+    if (isOperatorObject(value) && !getIndexedField(db, key)) fields.add(key);
+  }
+  const ob = opts.orderBy;
+  if (ob && ob !== "updated_at" && ob !== "link_count" && !getIndexedField(db, ob)) fields.add(ob);
+  const df = opts.dateFilter?.field;
+  if (df && df !== "created_at" && df !== "updated_at" && !getIndexedField(db, df)) fields.add(df);
+  return [...fields];
+}
+
+/**
+ * `scan`: the query read every record its other filters left, because it
+ * filtered or sorted on fields that aren't indexed. It carries no tag or
+ * record information (only the caller's own field names), so it is safe on a
+ * tag-scoped session. On cloud a scan is billed as rows read; the warning is
+ * how a caller (or its developer) learns which fields to index.
+ */
+export function collectScanWarnings(
+  db: Database,
+  opts: { metadata?: Record<string, unknown>; orderBy?: string; dateFilter?: { field?: string } },
+): QueryWarning[] {
+  const fields = scanFields(db, opts);
+  if (fields.length === 0) return [];
+  const names = fields.map((f) => `"${f}"`).join(", ");
+  return [
+    {
+      code: "scan",
+      message: `${names} ${fields.length === 1 ? "isn't" : "aren't"} indexed, so this query read every record to answer. It's correct, only slower on a large vault. To make it fast, declare the field indexed: true on its type (a "number" field can't be indexed: store an integer instead).`,
+      fields,
+    },
+  ];
 }

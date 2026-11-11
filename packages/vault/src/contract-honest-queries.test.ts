@@ -67,11 +67,12 @@ describe("contract: honest queries — passing (lock in current behavior)", () =
     expect(body).toEqual([]);
   });
 
-  it("a metadata operator query on a non-indexed field errors loudly with FIELD_NOT_INDEXED (existing behavior)", async () => {
+  it("a metadata operator query on a non-indexed field answers and warns that it scanned (0.9.2)", async () => {
     const res = await getNotes("meta[not_a_real_field][gt]=5");
-    expect(res.status).toBe(400);
-    const body: any = await res.json();
-    expect(body.code).toBe("FIELD_NOT_INDEXED");
+    expect(res.status).toBe(200);
+    const warnings = JSON.parse(decodeURIComponent(res.headers.get("X-Parachute-Warnings") ?? "[]"));
+    expect(warnings.map((w: any) => w.code)).toContain("scan");
+    expect(warnings.find((w: any) => w.code === "scan").fields).toEqual(["not_a_real_field"]);
   });
 
   it("a `near` query against a nonexistent anchor note errors cleanly with 404, not a silent []", async () => {

@@ -21,6 +21,7 @@ import { holdTypes, markTypes, mergeTypesIntoTags, prepareCallTypes, refreshType
 import type { Store, Note, QueryOpts, AggregateSpec } from "../core/src/types.ts";
 import { TAG_EXPAND_MODES, stripTagHash, suggestSimilarTag, type TagExpandMode } from "../core/src/tag-hierarchy.ts";
 import {
+  collectScanWarnings,
   collectUnknownTagWarnings,
   emptySearchWarning,
   ignoredParamWarning,
@@ -2181,6 +2182,8 @@ async function handleNotesInner(
         ...(tagScope.allowed === null
           ? collectUnknownTagWarnings(db, queryOpts.tags, queryOpts.expand, store.getTagHierarchy())
           : []),
+        // `scan` names only the caller's own fields: safe on a scoped session.
+        ...collectScanWarnings(db, queryOpts),
       ];
       let results: Note[];
       let nextCursor: string | null = null;

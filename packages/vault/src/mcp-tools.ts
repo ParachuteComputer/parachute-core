@@ -1026,7 +1026,9 @@ function applyTagScopeWrappers(
           .filter((n: any) => noteWithinTagScope(n, allowed, rawTags))
           .map(scrubNoteForScope),
         ...("next_cursor" in r ? { next_cursor: r.next_cursor } : {}),
-        // `warnings` intentionally DROPPED for a tag-scoped session: core's
+        // `scan` is kept: it names only the caller's own fields (0.9.2).
+        ...scopeSafeWarnings(r.warnings),
+        // Every other warning is intentionally DROPPED for a tag-scoped session: core's
         // `collectUnknownTagWarnings` (core/src/query-warnings.ts) resolves
         // `did_you_mean` against the FULL vault-wide tag catalog, which
         // would leak an out-of-scope tag's existence/name to a token that
@@ -2034,4 +2036,11 @@ function listAction(vaultName: string, auth: AuthResult): Record<string, unknown
   // Each key by its name (the `name` it was minted with, else its description), which revoke also takes.
   const tokens = listMcpMintedHubJwts(store.db, auth.caller_jti, vaultName).map((t) => ({ name: t.label, ...t }));
   return { action: "list", tokens };
+}
+
+/** The warnings a tag-scoped session may see: those that carry no tag or record information (`scan`). */
+function scopeSafeWarnings(warnings: unknown): { warnings?: unknown[] } {
+  if (!Array.isArray(warnings)) return {};
+  const kept = warnings.filter((w) => (w as { code?: unknown } | null)?.code === "scan");
+  return kept.length > 0 ? { warnings: kept } : {};
 }

@@ -1478,21 +1478,7 @@ describe("queryNotes", async () => {
       expect(results.map((n) => n.content)).toEqual(["recently-synced new email"]);
     });
 
-    it("dateFilter on a non-indexed field rejects with FIELD_NOT_INDEXED", async () => {
-      await store.createNote("X", { metadata: { meeting_date: "2026-04-25T00:00:00.000Z" } });
-      // Note: not declared via declareField, so the field has no generated
-      // column. The error mirrors the metadata-operator + order_by gate.
-      try {
-        await store.queryNotes({
-          dateFilter: { field: "meeting_date", from: "2026-04-01" },
-        });
-        throw new Error("expected QueryError");
-      } catch (err: any) {
-        expect(err.name).toBe("QueryError");
-        expect(err.code).toBe("FIELD_NOT_INDEXED");
-        expect(err.message).toContain("meeting_date");
-      }
-    });
+    // A dateFilter on a field that isn't indexed scans (0.9.2): query-scan.test.ts.
 
     it("dateFilter combined with top-level dateFrom rejects with INVALID_QUERY", async () => {
       await declareEmailDate();
@@ -2269,17 +2255,8 @@ describe("queryNotes", async () => {
       expect(results.map((n) => n.content)).toEqual(["match"]);
     });
 
-    it("operator on a non-indexed field throws FIELD_NOT_INDEXED", async () => {
-      await store.createNote("x", { metadata: { foo: "bar" } });
-      expect(
-        store.queryNotes({ metadata: { foo: { eq: "bar" } } }),
-      ).rejects.toThrow(/not indexed/);
-    });
-
-    it("order_by on a non-indexed field throws FIELD_NOT_INDEXED", async () => {
-      await store.createNote("x", { metadata: { foo: 1 } });
-      expect(store.queryNotes({ orderBy: "foo" })).rejects.toThrow(/not indexed/);
-    });
+    // An operator or order_by on a field that isn't indexed scans and gives
+    // the indexed twin's rows (0.9.2): query-scan.test.ts.
 
     // ---- vault#585: order_by "updated_at" is a pseudo-field like link_count ----
     //

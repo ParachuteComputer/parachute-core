@@ -15,6 +15,7 @@ import {
   ignoredParamWarning,
   truncatedResultsWarning,
   computeSearchDidYouMean,
+  collectScanWarnings,
   searchDidYouMeanWarning,
   embeddingsPendingWarning,
   type QueryWarning,
@@ -1370,6 +1371,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           // above (vault#551).
           queryWarnings = queryWarnings.concat(
             collectUnknownTagWarnings(db, queryOpts.tags, queryOpts.expand, store.getTagHierarchy()),
+            collectScanWarnings(db, queryOpts),
           );
           if (cursorMode) {
             const page = await store.queryNotesPaged(queryOpts, searchVisibility);
