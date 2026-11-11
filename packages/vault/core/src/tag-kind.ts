@@ -347,8 +347,9 @@ export function refuseTypesInTags(
   const hit = named.find(([n]) => types.has(n));
   if (!hit) return;
   const [name, op] = hit;
-  const fix = op ? `types: {${op}: ["${name}"]}` : `types: ["${name}"]`;
-  throw kindError(`"${name}" is a type, and tags holds plain labels only: pass it as ${fix}.`, "tags", fix);
+  // The hint is the fix's shape, without the name (the message names it), so it reads the same for every type.
+  const fix = op ? `types: {${op}: [...]}` : "types: [...]";
+  throw kindError(`"${name}" is a type, and tags holds plain labels only: pass it as ${fix.replace("...", `"${name}"`)}.`, "tags", fix);
 }
 
 /** `types` belongs to each note of a batch, never beside `notes`: refused before anything is checked or made. */

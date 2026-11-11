@@ -876,7 +876,7 @@ A person's own field names are never renamed (a field called `content` stays `co
 
 - **Writes.** `types` names a record's types (`types: ["task"]`; on PATCH `types: {add, remove}`); `tags` takes plain
   labels only. A type's name in `tags` is refused with the fix: `422 {error_type: "tag_kind", field: "tags", hint:
-  'types: ["task"]'}`, and nothing is written (the MCP record tools refuse it the same way). A body that names an old
+  "types: [...]"}` (the error names the type), and nothing is written (the MCP record tools refuse it the same way). A body that names an old
   word beside its new one (`body` and `content`) is refused: `400 {error_type: "invalid_query", field: "body"}`.
   An old word alone is still taken.
 - **`GET /api/records?type=<name>`** — records of that type and its subtypes (`event` finds `event/meeting`); several

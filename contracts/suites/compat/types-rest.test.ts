@@ -152,7 +152,8 @@ describe("compat/types-rest: types", () => {
     expect(made.status).toBe(422);
     expect(made.body.error_type).toBe("tag_kind");
     expect(made.body.field).toBe("tags");
-    expect(made.body.hint).toBe(`types: ["${type}"]`);
+    expect(made.body.hint).toBe("types: [...]");
+    expect(made.body.error).toContain(`types: ["${type}"]`);
     expect((await readApi.get(`/records/${enc(path)}`)).status).toBe(404);
 
     const batch = await writeApi.post("/records", { records: [{ path: `${path}-1`, body: "x" }, { path: `${path}-2`, body: "y", tags: [type] }] });
@@ -169,7 +170,7 @@ describe("compat/types-rest: types", () => {
     expect(ok.status).toBe(201);
     const patched = await writeApi.patch(`/records/${enc(path)}`, { tags: { add: [type] }, force: true });
     expect(patched.status).toBe(422);
-    expect(patched.body.hint).toBe(`types: {add: ["${type}"]}`);
+    expect(patched.body.hint).toBe("types: {add: [...]}");
     const fixed = await writeApi.patch(`/records/${enc(path)}`, { types: { add: [type] }, force: true });
     expect(fixed.status).toBe(200);
     expect(fixed.body.types).toEqual([type]);

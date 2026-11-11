@@ -352,7 +352,7 @@
 {"key":"records/rest.get.shape","value":{"body":"string","createdAt":"string","createdBy":"string","createdVia":"string","extension":"string","fields":{"city":"string"},"id":"string","lastUpdatedBy":"string","lastUpdatedVia":"string","path":"string","tags":["string"],"types":["string"],"updatedAt":"string","validation_status":{"schemas":["string"],"warnings":[]}}}
 {"key":"records/rest.note-alias.says-leaving","value":{"body":false,"deprecation":"true"}}
 {"key":"records/rest.refusal.old-word-beside-new","value":{"error":"(text)","hint":"ba5bd279831f54a9","keys":["error","error_type","field","hint"],"status":400,"type":"invalid_query"}}
-{"key":"records/rest.type-in-tags","value":{"hint":"b1b844e9c0bd26e2","status":422,"type":"tag_kind"}}
+{"key":"records/rest.type-in-tags","value":{"hint":"b594715fe960c66d","status":422,"type":"tag_kind"}}
 {"key":"rest/cors.preflight","value":{"headers":["authorization","content-type","mcp-method","mcp-name","mcp-protocol-version","mcp-session-id","x-api-key"],"methods":["delete","get","options","patch","post","put"],"origin":"*","status":204}}
 {"key":"rest/cors.reply","value":{"origin":"*"}}
 {"key":"rest/cursor.page.shape","value":{"next_cursor":"string","notes":[{"byteSize":"number","createdAt":"string","createdBy":"string","createdVia":"string","displayTitle":"string","extension":"string","id":"string","lastUpdatedBy":"string","lastUpdatedVia":"string","metadata":{},"path":"string","preview":"string","tags":[],"types":[],"updatedAt":"string"}]}}
