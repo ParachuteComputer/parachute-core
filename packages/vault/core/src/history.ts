@@ -13,6 +13,7 @@
 import type { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { encodeDelta, decodeDelta } from "./delta.js";
+import { kindOfVia } from "./write-stamp.js";
 import { transaction } from "./txn.js";
 import { refreshCompactState } from "./history-compact-state.js";
 
@@ -90,6 +91,8 @@ export interface VersionRow {
   superseded_at: string;
   actor: string | null;
   via: string | null;
+  /** The kind of the key in `via` (person, agent, app, service), or null: the write stamp (write-stamp.ts). */
+  via_kind: string | null;
   op: HistoryOp;
   content_len: number;
   encoding: string | null;
@@ -200,7 +203,7 @@ export function captureVersion(
     const ix = nextIndex(db, prior.id);
     db.prepare(
       `INSERT INTO note_versions (note_id, version_ix, content_hash, path, metadata, extension,
-      superseded_at, actor, via, op, content_len, encoding, created_at) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, 'delete', ?, 'overflow', ?)`,
+      superseded_at, actor, via, via_kind, op, content_len, encoding, created_at) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, 'delete', ?, 'overflow', ?)`,
     ).run(
       prior.id,
       ix,
@@ -210,6 +213,7 @@ export function captureVersion(
       new Date().toISOString(),
       opts.actor,
       opts.via,
+      kindOfVia(opts.via),
       size,
       prior.created_at,
     );
@@ -223,7 +227,7 @@ export function captureVersion(
   const ix = nextIndex(db, prior.id);
   db.prepare(
     `INSERT INTO note_versions (note_id, version_ix, content_hash, path, metadata, extension,
-    superseded_at, actor, via, op, content_len, encoding, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
+    superseded_at, actor, via, via_kind, op, content_len, encoding, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
   ).run(
     prior.id,
     ix,
@@ -234,6 +238,7 @@ export function captureVersion(
     new Date().toISOString(),
     opts.actor,
     opts.via,
+    kindOfVia(opts.via),
     opts.op,
     size,
     prior.created_at,
@@ -251,14 +256,15 @@ export function appendRestoreMarker(
   const ix = nextIndex(db, noteId);
   db.prepare(
     `INSERT INTO note_versions (note_id, version_ix, content_hash, path, metadata, extension,
-    superseded_at, actor, via, op, content_len, encoding, created_at)
-    SELECT note_id, ?, content_hash, path, metadata, extension, ?, ?, ?, 'restore', content_len, encoding, created_at
+    superseded_at, actor, via, via_kind, op, content_len, encoding, created_at)
+    SELECT note_id, ?, content_hash, path, metadata, extension, ?, ?, ?, ?, 'restore', content_len, encoding, created_at
       FROM note_versions WHERE note_id = ? AND version_ix = ?`,
   ).run(
     ix,
     new Date().toISOString(),
     attr.actor,
     attr.via,
+    kindOfVia(attr.via),
     noteId,
     tombstone.version_ix,
   );
@@ -344,7 +350,7 @@ export function sweepDeletedHistory(
   });
 }
 const columns =
-  "note_id, version_ix, content_hash, path, metadata, extension, superseded_at, actor, via, op, content_len, encoding, created_at";
+  "note_id, version_ix, content_hash, path, metadata, extension, superseded_at, actor, via, via_kind, op, content_len, encoding, created_at";
 function parseRow(row: RawVersionRow): VersionRow {
   let metadata: Record<string, unknown> = {};
   try {

@@ -188,6 +188,46 @@ with a structured envelope:
 }
 ```
 
+### The write stamp: via and by (0.9.1)
+
+Every write records two facts, on the record (`createdBy`/`createdVia`, `lastUpdatedBy`/`lastUpdatedVia`) and on
+each kept revision (`actor`/`via`, plus `via_kind`):
+
+- **via** is the key that made the write, read from the signed token, never from the request. A named key (an app
+  key from `POST /account/keys`, a key from `parachute keys new <name>`, or an approved OAuth app) writes as
+  `key:<name>` on REST and MCP alike. A credential with no named key keeps the channel (`api`, `mcp`) or its class
+  (`operator`, `nostr:<pubkey>`). A revision's `via_kind` is the kind of that key (`person`, `agent`, `app`,
+  `service`), or null; tag-scoped sessions don't receive it, as with `actor` and `via`.
+- **by** is the person the write was for: the token's subject (the key's owner), unless the vault's owner let the
+  key write on behalf of others when minting it (`POST /account/keys {..., on_behalf_of: true}`, or
+  `parachute keys new <name> --vault <v> --can write --on-behalf-of`). Then a write may send
+
+  ```
+  Parachute-On-Behalf-Of: client-42
+  ```
+
+  (MCP: an `on_behalf_of` parameter on the write tools, shown only to such a key) and is stamped
+  `by <key name>:client-42`. The prefix comes from the token; the request gives only the id: 1–64 letters, digits,
+  `.`, `_`, `-`, no `:` or `@`. So a "by" a key sets can't be an account, a `nostr:` value or another key's people.
+  A key's name must fit the prefix rule (lowercase `[a-z0-9.-]`, at most 64, not `nostr`, `key`, `grant`, `agent`,
+  `applet`, `token`, `operator`, `migrate`, `surface`, `mcp`, `api`) to get the permission.
+
+Refusals, before anything is written:
+
+| When | Status | `error_type` |
+|---|---|---|
+| The header (or `on_behalf_of`) from a key without the permission | 403 | `on_behalf_not_granted` |
+| An id outside the rule | 400 | `invalid_on_behalf_of` |
+| The header on a write that records no writer (attachments, tag schemas, vault config) | 400 | `on_behalf_not_recorded` |
+| A token whose `permissions` carry a key this vault doesn't enforce, or a malformed `key`/`acts_for` | 401 | — |
+
+A read (GET) with the header is answered as usual. On-behalf-of never opens access: scope and level are the token's.
+Records written via `/api/notes` and `/api/records` (create, patch, delete, batch, restore) and tag renames carry
+the stamp; an attachment row has no writer.
+
+A "by" is a label, not an account id. Link statements ("client-42 is this Nostr key") are not built; when they are,
+they attach beside the stamp, keyed by the whole "by" string, and the stamp itself never changes.
+
 ## The shapes
 
 ### `Note`
@@ -1560,7 +1600,7 @@ History erasure removes retained content through the existing GC rules. Minimal 
 ### Version history
 
 Tag-restricted sessions receive version lists and native/imported version reads
-without top-level `actor` or `via`. Stored provenance and unrestricted reads are
+without top-level `actor`, `via` or `via_kind` (see [the write stamp](#the-write-stamp-via-and-by-091)). Stored provenance and unrestricted reads are
 unchanged. This does not anonymize note content or user-authored metadata; see
 [history privacy](history-privacy.md).
 

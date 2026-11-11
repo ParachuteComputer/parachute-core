@@ -32,6 +32,17 @@ function migrateToV32(db: Database): void {
  * in between are read by the same rule (tag-kind.ts KIND_SQL) until a full open
  * records them. No membership moves; note_tags is untouched.
  */
+/**
+ * The write stamp (0.9.1, core write-stamp.ts): `note_versions.via_kind`, the kind of the key that replaced a
+ * revision's content. Additive with no schema number, like ensureTagKinds: a 0.9.0 engine names the columns it
+ * writes and reads, so it opens the vault unchanged and ignores the column. Never backfilled.
+ */
+function ensureRevisionKeyKind(db: Database): void {
+  if (hasTable(db, "note_versions") && !hasColumn(db, "note_versions", "via_kind")) {
+    db.exec("ALTER TABLE note_versions ADD COLUMN via_kind TEXT");
+  }
+}
+
 function ensureTagKinds(db: Database): void {
   const added = !hasColumn(db, "tags", "kind");
   if (added) db.exec("ALTER TABLE tags ADD COLUMN kind TEXT");
@@ -272,6 +283,9 @@ CREATE TABLE IF NOT EXISTS note_versions (
   superseded_at TEXT NOT NULL,
   actor         TEXT,
   via           TEXT,
+  -- The write stamp (0.9.1): the kind of the key in via (person, agent, app, service), NULL when via is no named
+  -- key. Additive, with no schema number: see ensureRevisionKeyKind.
+  via_kind      TEXT,
   op            TEXT NOT NULL,
   content_len   INTEGER NOT NULL,
   encoding      TEXT,
@@ -680,7 +694,8 @@ function latestStamp(db: Database): number | null {
 export function unnumberedStepsDone(db: Database): boolean {
   return (
     hasIndex(db, "idx_notes_path_nocase") && // ensurePathNocaseIndex (T-412)
-    hasColumn(db, "tags", "kind") // ensureTagKinds (T-318 §8a, 0.9)
+    hasColumn(db, "tags", "kind") && // ensureTagKinds (T-318 §8a, 0.9)
+    (!hasTable(db, "note_versions") || hasColumn(db, "note_versions", "via_kind")) // ensureRevisionKeyKind (0.9.1)
   );
 }
 
@@ -843,6 +858,8 @@ export function initSchema(db: Database): void {
   ensureTagKinds(db);
   // A case-insensitive path index for the `path = ? COLLATE NOCASE` lookups (T-412).
   ensurePathNocaseIndex(db);
+  // The write stamp: each revision says what kind of key wrote it (0.9.1).
+  ensureRevisionKeyKind(db);
 
   // Rebuild any generated columns + indexes declared in indexed_fields.
   // No-op for a fresh vault; idempotent on existing vaults.

@@ -69,6 +69,7 @@ import {
   authenticateGlobalRequest,
   deriveVaultFromToken,
   extractApiKey,
+  type AuthResult,
 } from "./auth.ts";
 import { hasScopeForVault, hasMigrateScopeForVault, SCOPE_ADMIN, SCOPE_READ, scopeForMethod, verbForMethod } from "./scopes.ts";
 import { getSharedEmbeddingProvider, getVaultStore } from "./vault-store.ts";
@@ -133,6 +134,35 @@ import {
 import { getMirrorManager } from "./mirror-registry.ts";
 import { buildUsageReport } from "./usage.ts";
 import { handleTicketSpend } from "./attachment-tickets.ts";
+import { ON_BEHALF_HEADER, resolveBy } from "../core/src/write-stamp.ts";
+
+/**
+ * REST routes whose writes carry the write stamp: everything under /notes (and its /records twin), except
+ * attachments (an attachment row has no writer), and a tag rename (it rewrites notes). A supplied on-behalf-of on
+ * any other write is refused, so it is never silently dropped; a read carries nothing to stamp.
+ */
+function stampsWriter(method: string, apiPath: string): boolean {
+  if (method === "GET" || method === "HEAD" || method === "OPTIONS") return true;
+  if (/^\/(notes|records)(\/|$|\?)/.test(apiPath)) return !/\/attachments(\/|$)/.test(apiPath);
+  return /^\/(tags|types)\/[^/]+\/rename$/.test(apiPath);
+}
+
+/** The "by" a REST request writes with, or the refusal (as a Response). */
+export function restWriteStamp(req: Request, apiPath: string, auth: AuthResult): { by: string | null } | { refusal: Response } {
+  const supplied = req.headers.get(ON_BEHALF_HEADER);
+  const r = resolveBy(supplied, auth.acts_for ?? null, auth.actor, "rest");
+  const refuse = (status: number, body: Record<string, unknown>) => ({ refusal: Response.json({ error: body.message, ...body }, { status }) });
+  if ("refusal" in r) return refuse(r.refusal.status, { ...r.refusal });
+  if (supplied !== null && !stampsWriter(req.method, apiPath)) {
+    return refuse(400, {
+      error_type: "on_behalf_not_recorded",
+      field: ON_BEHALF_HEADER,
+      message: `${req.method} /api${apiPath} records no writer, so ${ON_BEHALF_HEADER} would be dropped. Nothing was written. Send it on record writes (create, change, delete, batch, restore) only.`,
+      hint: "drop the header on this call",
+    });
+  }
+  return r;
+}
 
 /**
  * Decorate a 401 response from the MCP endpoint with the RFC 9728 challenge
@@ -1223,8 +1253,14 @@ export async function route(
   // notes that violate `strict:true` field constraints (for backfill /
   // migration). Every bypassed write is logged. Orthogonal to read/write/admin
   // — an admin token does NOT bypass unless it also holds `migrate`.
+  // The write stamp (core write-stamp.ts): `via` is the token's (a named key says `key:<name>`); `by` is the
+  // token's subject unless the request names who the write is for (Parachute-On-Behalf-Of) and the token holds the
+  // owner's on-behalf-of permission. Refused, never ignored, when it doesn't; checked before any route runs, so a
+  // refused request writes nothing. On-behalf-of never opens access: scope and level stay the token's.
+  const stamp = restWriteStamp(req, apiPath, auth);
+  if ("refusal" in stamp) return stamp.refusal;
   const writeCtx: WriteCtx = {
-    actor: auth.actor,
+    actor: stamp.by,
     via: auth.via,
     bypassStrict: hasMigrateScopeForVault(auth.scopes, vaultName),
   };

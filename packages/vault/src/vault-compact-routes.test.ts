@@ -55,7 +55,7 @@ test("P9/P18 compacted REST and MCP versions roundtrip with exact keys", async (
   expect(get.status).toBe(200);
   expect(get.body.content).toBe(before.content);
   expect(get.body.encoding).toBe("fossil-delta");
-  expect(Object.keys(get.body).sort()).toEqual(["note_id", "version_ix", "content_hash", "path", "metadata", "extension", "superseded_at", "actor", "via", "op", "content_len", "encoding", "created_at", "content"].sort());
+  expect(Object.keys(get.body).sort()).toEqual(["note_id", "version_ix", "content_hash", "path", "metadata", "extension", "superseded_at", "actor", "via", "via_kind", "op", "content_len", "encoding", "created_at", "content"].sort());
   const list = await call(`/notes/${n.id}/versions?limit=2`);
   expect(list.body.total).toBe(await store.countNoteVersions(n.id));
   expect(list.body.versions).toHaveLength(2);

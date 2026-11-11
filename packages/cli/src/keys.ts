@@ -3,8 +3,10 @@
 //   keys list [--all] [--json]           every live key (the hub's `keys` table, PR #17); --all adds revoked and
 //                                        expired keys and the CLI's own operator credential
 //   keys list --pending                  apps waiting for approval (auth pending-clients)
-//   keys new <name> --vault <v> [--can read|write|admin] [--expires-in <s> | --ephemeral] [--json]
-//                                        auth mint-token, labelled with the name, so its key is called <name>
+//   keys new <name> --vault <v> [--can read|write|admin] [--expires-in <s> | --ephemeral] [--on-behalf-of] [--json]
+//                                        auth mint-token, labelled with the name, so its key is called <name> and its
+//                                        writes say "via key:<name>"; --on-behalf-of lets it write for people it
+//                                        names, stamped "by <name>:<id>" (the owner's grant; vault write-stamp.ts)
 //   keys revoke <name|jti> [--json]      auth revoke-token on the key's token
 //   keys approve <client>                auth approve-client
 //
@@ -15,7 +17,7 @@ import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { hubDbPath, openHubDb } from "@openparachute/hub/src/hub-db.ts";
-import { KEY_NAME_RE, listKeys, type KeyView } from "@openparachute/hub/src/keys.ts";
+import { KEY_NAME_RE, listKeys, onBehalfNameProblem, type KeyView } from "@openparachute/hub/src/keys.ts";
 import { KEYS_LOCK, takeFileLock } from "./file-lock.ts";
 import { homeDir } from "./home.ts";
 
@@ -35,12 +37,13 @@ export function holdKeysLock(): void {
 
 export type KeysResult = { exit: number } | { argv: string[] };
 
-const PASS_NEW = new Set(["--expires-in", "--ephemeral", "--json", "--user", "--service"]);
+const PASS_NEW = new Set(["--expires-in", "--ephemeral", "--json", "--user", "--service", "--on-behalf-of"]);
+const PASS_NEW_BARE = new Set(["--ephemeral", "--json", "--on-behalf-of"]);
 
 function usage(): string {
   return [
     "parachute keys list [--all] [--json] | list --pending",
-    "parachute keys new <name> --vault <vault> [--can read|write|admin] [--expires-in <seconds> | --ephemeral] [--json]",
+    "parachute keys new <name> --vault <vault> [--can read|write|admin] [--expires-in <seconds> | --ephemeral] [--on-behalf-of] [--json]",
     "parachute keys revoke <name|jti> [--json]",
     "parachute keys approve <client>",
   ].join("\n");
@@ -84,7 +87,7 @@ function keysNew(args: string[]): KeysResult {
         return { exit: 2 };
       } else if (PASS_NEW.has(a)) {
         pass.push(a);
-        if (a !== "--ephemeral" && a !== "--json") pass.push(value(rest, i++, a));
+        if (!PASS_NEW_BARE.has(a)) pass.push(value(rest, i++, a));
       } else {
         console.error(`parachute keys new: unknown argument '${a}'\nusage: ${usage().split("\n")[1]}`);
         return { exit: 2 };
@@ -102,6 +105,13 @@ function keysNew(args: string[]): KeysResult {
   if (!levels) {
     console.error("parachute keys new: --can is read, write or admin");
     return { exit: 2 };
+  }
+  if (pass.includes("--on-behalf-of")) {
+    const problem = onBehalfNameProblem(name);
+    if (problem) {
+      console.error(`parachute keys new: --on-behalf-of: ${problem}`);
+      return { exit: 2 };
+    }
   }
   holdKeysLock();
   const taken = withHubDb((db) => db.prepare("SELECT 1 FROM keys WHERE name = ?").get(name));

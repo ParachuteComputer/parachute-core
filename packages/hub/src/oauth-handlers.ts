@@ -138,6 +138,7 @@ import {
 } from "./users.ts";
 import { listVaultNames } from "./vault-names.ts";
 import { isVaultEntry, shortName, vaultInstanceNameFor } from "./well-known.ts";
+import { familyKeyName, keyClaim, nextKeyName } from "./keys.ts";
 
 /** Verbs whose unnamed `vault:<verb>` form needs picker disambiguation. */
 function unnamedVaultVerbs(scopes: string[]): string[] {
@@ -2940,12 +2941,17 @@ async function handleTokenAuthorizationCode(
   if ("errorResponse" in audienceResolution) return audienceResolution.errorResponse;
   const audience = audienceResolution.audience;
   try {
+    // The write stamp (ROADMAP 0.9.1): an approved app is a key named for its client, one per grant (refresh
+    // family), so the vault stamps its writes `via key:<name>`. Named before signing; the family's key gets it.
+    const appKeyName = nextKeyName(db, { subject: null, user_id: redeemed.userId, client_id: redeemed.clientId, created_via: "oauth_refresh" });
+    const appKey = keyClaim(appKeyName, "app");
     const access = await signAccessToken(db, {
       sub: redeemed.userId,
       scopes: redeemed.scopes,
       audience,
       clientId: redeemed.clientId,
       issuer: deps.issuer,
+      ...("key" in appKey ? { extraClaims: appKey } : {}),
       // vault_scope claim — Phase 2 per-user vault pin (Phase 1 had a single
       // `assigned_vault` column; Phase 2 PR 2 generalized to `assigned_vaults`
       // via `user_vaults`). Non-empty list for non-admin users with at least
@@ -2973,6 +2979,7 @@ async function handleTokenAuthorizationCode(
       userId: redeemed.userId,
       clientId: redeemed.clientId,
       scopes: redeemed.scopes,
+      ...("key" in appKey ? { keyName: appKeyName } : {}),
       now: deps.now,
     });
     const services = buildServicesCatalog(
@@ -3144,12 +3151,16 @@ async function rotateAndRespond(
   }
   const audience = audienceResolution.audience;
   try {
+    // The write stamp: the grant keeps its one key through rotation, so its writes keep its name.
+    const familyKey = row.familyId ? familyKeyName(db, row.familyId) : null;
+    const appKey = familyKey ? keyClaim(familyKey, "app") : {};
     const access = await signAccessToken(db, {
       sub: refreshUserId,
       scopes: row.scopes,
       audience,
       clientId: row.clientId,
       issuer: deps.issuer,
+      ...("key" in appKey ? { extraClaims: appKey } : {}),
       // vault_scope claim — re-derived from the user's *current*
       // `assigned_vaults` at refresh time (not snapshotted onto the refresh-
       // token row). An admin who changes a user's vault assignments between

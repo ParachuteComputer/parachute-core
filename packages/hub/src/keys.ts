@@ -112,8 +112,10 @@ function allowTags(permissions: string | null): string | null {
 const TOKEN_SELECT = `SELECT t.jti, t.family_id, t.user_id, t.client_id, t.scopes, t.permissions, t.created_via, t.subject, t.created_at, u.username
   FROM tokens t LEFT JOIN users u ON u.id = t.user_id`;
 
-function insertKey(db: Database, t: TokenRow): string {
-  const name = uniqueName(db, baseName(t));
+function insertKey(db: Database, t: TokenRow, exactName?: string): string {
+  // A token that carries its key's name (its `key` claim, the write stamp) gets exactly that name: the insert fails
+  // on a taken name rather than suffixing it, so a stamp never names another key.
+  const name = exactName ?? uniqueName(db, baseName(t));
   const { owner, owner_kind } = ownerOf(t);
   db.prepare(
     `INSERT INTO keys (name, jti, owner, owner_kind, types, denies, created_via, created_at)
@@ -126,21 +128,22 @@ function insertKey(db: Database, t: TokenRow): string {
  * An app's refresh token: one key per refresh family. A rotation moves the
  * family's key onto the new token row instead of making a key per rotation.
  */
-export function adoptRefreshToken(db: Database, jti: string, familyId: string): string | null {
+export function adoptRefreshToken(db: Database, jti: string, familyId: string, exactName?: string): string | null {
   const key = db
     .prepare(`SELECT k.name FROM keys k JOIN tokens t ON t.jti = k.jti WHERE t.family_id = ? AND k.jti != ?`)
     .get(familyId, jti) as { name: string } | null;
-  if (!key) return adoptToken(db, jti);
+  if (!key) return adoptToken(db, jti, exactName);
+  if (exactName !== undefined && key.name !== exactName) throw new Error(`refresh family ${familyId} is key ${key.name}, not ${exactName}`);
   db.prepare("UPDATE keys SET jti = ? WHERE name = ?").run(jti, key.name);
   return key.name;
 }
 
 /** Give the token `jti` its key, if it hasn't one. Returns the key's name. */
-export function adoptToken(db: Database, jti: string): string | null {
+export function adoptToken(db: Database, jti: string, exactName?: string): string | null {
   const existing = db.prepare("SELECT name FROM keys WHERE jti = ?").get(jti) as { name: string } | null;
   if (existing) return existing.name;
   const t = db.prepare(`${TOKEN_SELECT} WHERE t.jti = ?`).get(jti) as TokenRow | null;
-  return t ? insertKey(db, t) : null;
+  return t ? insertKey(db, t, exactName) : null;
 }
 
 /**
@@ -226,4 +229,46 @@ export function touchKey(db: Database, jti: string, now: Date = new Date()): boo
     .prepare("UPDATE keys SET last_used_at = ? WHERE jti = ? AND (last_used_at IS NULL OR last_used_at < ?)")
     .run(stamp, jti, since);
   return Number(r.changes) > 0;
+}
+
+/**
+ * The write stamp (ROADMAP 0.9.1; vault core `write-stamp.ts`): a key's name and kind, signed into its token as the
+ * top-level `key` claim (an older vault ignores it, so a rollback keeps the key working), so the vault stamps its writes `via key:<name>` and its revisions with the kind. Decided before
+ * signing; the mint then records the key under exactly this name (`recordTokenMint {keyName}`).
+ */
+export interface KeyClaim {
+  name: string;
+  kind: KeyOwnerKind;
+}
+
+/** The name a new key for this token would get: its label or app made unique, as the adoption names it. */
+export function nextKeyName(db: Database, t: { subject: string | null; user_id: string | null; client_id: string | null; created_via: string; username?: string | null }): string {
+  return uniqueName(db, baseName({ jti: "", family_id: null, scopes: "", permissions: null, created_at: "", username: t.username ?? null, ...t }));
+}
+
+/** The name of the key a refresh family already has, if any (an OAuth app keeps one key through rotation). */
+export function familyKeyName(db: Database, familyId: string): string | null {
+  const row = db.prepare(`SELECT k.name FROM keys k JOIN tokens t ON t.jti = k.jti WHERE t.family_id = ? LIMIT 1`).get(familyId) as { name: string } | null;
+  return row?.name ?? null;
+}
+
+/** The `key` claim for a token, when its key's name is a key name (a slug that isn't one stays unstamped). */
+export function keyClaim(name: string, kind: KeyOwnerKind): { key: KeyClaim } | Record<string, never> {
+  return KEY_NAME_RE.test(name) ? { key: { name, kind } } : {};
+}
+
+/** Names a prefix may never be (vault core write-stamp.ts RESERVED_PREFIXES; kept equal by safety/on-behalf). */
+const RESERVED_PREFIXES = ["nostr", "key", "grant", "agent", "applet", "token", "operator", "migrate", "surface", "mcp", "api"];
+
+/**
+ * Why a key called `name` can't be given the on-behalf-of permission, or null. Its name is the prefix its writes
+ * carry (`by <name>:<id>`), so it must fit the prefix rule: 1–64 lowercase letters, digits, '.', '-', not reserved.
+ * The same rule as vault core write-stamp.ts `grantNameProblem` (the hub doesn't import the vault).
+ */
+export function onBehalfNameProblem(name: string): string | null {
+  if (!/^[a-z0-9.-]{1,64}$/.test(name)) {
+    return `a key that writes on behalf of others is named for the prefix its writes carry ("by ${name}:<id>"), so its name is 1 to 64 lowercase letters, digits, '.' and '-': e.g. "fernhill-portal"`;
+  }
+  if (RESERVED_PREFIXES.includes(name)) return `"${name}" is reserved (${RESERVED_PREFIXES.join(", ")}); a key that writes on behalf of others needs another name`;
+  return null;
 }
