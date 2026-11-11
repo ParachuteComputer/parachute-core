@@ -5,6 +5,8 @@
  *
  * Single-use is enforced by stamping `used_at` on redemption — a replay
  * attempt sees the row but with `used_at` set and returns `AuthCodeUsedError`.
+ * Each code carries the grant generation it was minted under
+ * (grant-generation.ts); the token endpoint re-reads it after signing.
  * RFC 6749 §10.5 wants single-use plus revocation of any tokens already
  * issued from a replayed code; revocation is a follow-up.
  *

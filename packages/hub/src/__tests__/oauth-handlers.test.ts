@@ -12555,6 +12555,7 @@ describe("account-door consent per vault (T-446)", () => {
       .all(userId, clientId);
     return rows.flatMap((r) => r.scopes.split(" ").filter((s) => s.startsWith("account:self:vaults") && !covered(s)));
   }
+  const failedIterations = (failures: string[]) => new Set(failures.map((f) => /^#\d+/.exec(f)?.[0])).size;
   const tally = (seen: Map<string, number>, key: string) => seen.set(key, (seen.get(key) ?? 0) + 1);
   const outcome = async (res: Response) =>
     res.status === 200 ? "200" : `${res.status} ${((await res.clone().json().catch(() => ({}))) as { error_description?: string }).error_description ?? ""}`;
@@ -12596,7 +12597,7 @@ describe("account-door consent per vault (T-446)", () => {
         if (next.status !== 200) failures.push(`#${i}: the tip didn't refresh (${await outcome(next)})`);
       }
       console.log(`[race a] outcomes ${JSON.stringify(Object.fromEntries(seen))}`);
-      expect(failures, `${failures.length}/${RACE_ITERATIONS} iterations failed`).toEqual([]);
+      expect(failures, `${failedIterations(failures)}/${RACE_ITERATIONS} iterations failed`).toEqual([]);
     } finally {
       cleanup();
     }
@@ -12645,7 +12646,7 @@ describe("account-door consent per vault (T-446)", () => {
         }
       }
       console.log(`[race b] outcomes ${JSON.stringify(Object.fromEntries(seen))}`);
-      expect(failures, `${failures.length}/${RACE_ITERATIONS} iterations failed`).toEqual([]);
+      expect(failures, `${failedIterations(failures)}/${RACE_ITERATIONS} iterations failed`).toEqual([]);
     } finally {
       cleanup();
     }
@@ -12685,7 +12686,7 @@ describe("account-door consent per vault (T-446)", () => {
         }
       }
       console.log(`[race c] outcomes ${JSON.stringify(Object.fromEntries(seen))}`);
-      expect(failures, `${failures.length}/${RACE_ITERATIONS} iterations failed`).toEqual([]);
+      expect(failures, `${failedIterations(failures)}/${RACE_ITERATIONS} iterations failed`).toEqual([]);
     } finally {
       cleanup();
     }

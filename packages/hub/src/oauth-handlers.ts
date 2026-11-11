@@ -2102,8 +2102,10 @@ export function grantableExtraScopes(
  *      so a later skip-consent flow re-entering with the same (user, client)
  *      can never replay an un-held verb. Recording is a UNION, except that a
  *      per-vault account-door choice replaces the earlier account-door scopes
- *      (and revokes the refresh families it narrows), so a narrower choice
- *      stays narrower (T-446).
+ *      and, when it narrows, bumps the grant generation in the same
+ *      transaction (applyAccountDoorChoice, grant-generation.ts), so a
+ *      narrower choice stays narrower and nothing minted under the wider one
+ *      mints again (T-446).
  *
  * Not the ONLY `recordGrant` call in this module, though: two other guarded
  * fast-path records exist — the trust-by-client_name auto-promote in
@@ -3308,6 +3310,8 @@ async function handleTokenRefresh(
 /**
  * A refresh token presented after its row was revoked: the one-generation grace window, else reuse detection
  * (revoke the family, invalid_grant). Also where a refresh lands that lost the race to its own rotation.
+ * `now` must be read at the time of this decision, after the row was found revoked, never a clock from before an
+ * await: a sibling's `revoked_at` later than a stale `now` reads as outside the window and ends the family.
  */
 async function refreshRevokedRow(
   db: Database,
@@ -3375,9 +3379,12 @@ class RefreshRowNotLiveError extends Error {}
  * (`rotated_to`) so a future grace-window check can identify the direct
  * predecessor (hub#685). Returns the spec-shaped token response.
  *
- * Both call sites pass a row that is live at the moment of the call: the
+ * Both call sites pass a row that is live at the moment they read it: the
  * normal path passes the presented (non-revoked) token; the grace path
- * passes the family's single live tip. Used for both so the benign-replay
+ * passes the family's single live tip. It may stop being live during the
+ * signing await (a sibling rotation, a narrowing): then nothing is written
+ * and the request is judged as a replay, on a fresh clock. A narrowing
+ * that bumps the grant generation also refuses the mint (GrantChangedError). Used for both so the benign-replay
  * client receives exactly what a direct refresh of the tip would yield.
  */
 async function rotateAndRespond(
@@ -3439,7 +3446,9 @@ async function rotateAndRespond(
       refresh = db.transaction(() => {
         // Only a row that is still live rotates. The row was read before the await above, and in that gap a
         // narrower consent may have revoked its family (or a sibling refresh rotated it). Then mint nothing
-        // here: no new refresh row into an ended family (the catch below decides as for a replay).
+        // here: no new refresh row into an ended family (the catch below decides as for a replay). The grant
+        // generation check inside signRefreshToken is the second gate: a narrowing that left this row behind
+        // refuses the mint even if the row is still live.
         const rotated = db
           .prepare("UPDATE tokens SET revoked_at = ? WHERE jti = ? AND revoked_at IS NULL")
           .run(now.toISOString(), row.jti);

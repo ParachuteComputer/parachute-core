@@ -19,7 +19,11 @@
  * `account:self:vaults` are the person's whole choice of vaults, so a later
  * per-vault choice REPLACES them (the `replaces` predicate of `recordGrant`)
  * instead of adding to them. Other scopes in the row, `account:self:read` /
- * `account:self:write` included, still union.
+ * `account:self:write` included, still union. A choice that narrows also
+ * bumps the (user, client) grant generation in the same transaction
+ * (grant-generation.ts), which ends every code and refresh family minted
+ * under the wider one, including mints in flight. The generation lives in
+ * its own table: `revokeGrant` deleting this row does not reset it.
  *
  * Skip rule: a flow may skip consent iff every requested scope is already
  * in the grant's set. A strict superset (the client wants something new)
