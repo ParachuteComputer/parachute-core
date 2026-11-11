@@ -2078,7 +2078,7 @@ tag does. The body names the keys (`keys: [name, ...]`, names only, never a
 token or its id), `private_tags` and `published_tag` it touches; check them
 with `parachute keys list` and vault.yaml, then repeat with `?force=true`. If
 the hub's keys can't be read, the change is refused the same way (fail
-closed). MCP takes `force: true` on the same tools. A tag-scoped admin pass (minted before 0.9.1) may name only
+closed). MCP takes `force: true` on the same tools. A name counts with every name under it, by `/` (`secret` reaches `secret/diary`) or through declared parents, as scopes and `private_tags` reach them. To a tag-scoped pass every such change needs `force`, and the refusal names no key or tag. A tag-scoped admin pass (minted before 0.9.1) may name only
 parents inside its scope (`403 tag_scope_violation`). Body accepts any combination of:
 
 ```json
@@ -2305,7 +2305,7 @@ tag does. The body names the keys (`keys: [name, ...]`, names only, never a
 token or its id), `private_tags` and `published_tag` it touches; check them
 with `parachute keys list` and vault.yaml, then repeat with `?force=true`. If
 the hub's keys can't be read, the change is refused the same way (fail
-closed). MCP takes `force: true` on the same tools.
+closed). MCP takes `force: true` on the same tools. A name counts with every name under it, by `/` (`secret` reaches `secret/diary`) or through declared parents, as scopes and `private_tags` reach them. To a tag-scoped pass every such change needs `force`, and the refusal names no key or tag.
 
 **Referential integrity (vault#552).** Also refused — with `409` and
 `error_type: "tag_referenced_as_parent"`, carrying `{ tag, referencing_tags: [...] }`
@@ -2350,7 +2350,7 @@ tag does. The body names the keys (`keys: [name, ...]`, names only, never a
 token or its id), `private_tags` and `published_tag` it touches; check them
 with `parachute keys list` and vault.yaml, then repeat with `?force=true`. If
 the hub's keys can't be read, the change is refused the same way (fail
-closed). MCP takes `force: true` on the same tools.
+closed). MCP takes `force: true` on the same tools. A name counts with every name under it, by `/` (`secret` reaches `secret/diary`) or through declared parents, as scopes and `private_tags` reach them. To a tag-scoped pass every such change needs `force`, and the refusal names no key or tag.
 
 **Does NOT rewrite metadata.** A metadata value that happens to equal the
 old tag name (e.g. `metadata.epic: "task"`) is left untouched — rename's
@@ -2393,7 +2393,7 @@ tag does. The body names the keys (`keys: [name, ...]`, names only, never a
 token or its id), `private_tags` and `published_tag` it touches; check them
 with `parachute keys list` and vault.yaml, then repeat with `?force=true`. If
 the hub's keys can't be read, the change is refused the same way (fail
-closed). MCP takes `force: true` on the same tools. For a merge, the sources and the target count.
+closed). MCP takes `force: true` on the same tools. A name counts with every name under it, by `/` (`secret` reaches `secret/diary`) or through declared parents, as scopes and `private_tags` reach them. To a tag-scoped pass every such change needs `force`, and the refusal names no key or tag. For a merge, the sources and the target count.
 
 **MCP parity (vault#552).** Exposed as the `merge-tags` MCP tool —
 `{ sources: string[], target: string }` — delegating to the SAME

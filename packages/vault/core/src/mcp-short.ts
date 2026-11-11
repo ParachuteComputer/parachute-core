@@ -170,7 +170,7 @@ Rarer filters (has_links, order_by, expand_links, created_by, search_mode, …) 
         parent_names: { type: "array", items: { type: "string" } },
         relationships: { type: "object" },
         kind: { type: "string", enum: ["type", "tag"] },
-        force: bool("Go ahead although a key's tag limit, private_tags or the published tag uses this name (the refusal names them)"),
+        force: bool("Go ahead although a key's tag limit, private_tags or the published tag reaches this name (the refusal names them, except to a tag-scoped pass)"),
       },
       ["tag"],
     ),
@@ -178,17 +178,17 @@ Rarer filters (has_links, order_by, expand_links, created_by, search_mode, …) 
 
   "delete-tag": {
     description: "Delete a tag and untag its notes (the notes stay). If another tag names it as a parent, pass `detach: true`.",
-    inputSchema: obj({ tag: str(), detach: bool(), force: bool("Go ahead although a key's tag limit, private_tags or the published tag uses this name (the refusal names them)"), }, ["tag"]),
+    inputSchema: obj({ tag: str(), detach: bool(), force: bool("Go ahead although a key's tag limit, private_tags or the published tag reaches this name (the refusal names them, except to a tag-scoped pass)"), }, ["tag"]),
   },
 
   "rename-tag": {
-    description: "Rename a tag everywhere (notes, parents, #mentions); its sub-tags follow. If a key's tag limit, private_tags or the published tag uses it, refused until you pass `force: true` (the refusal names them).",
-    inputSchema: obj({ old_name: str(), new_name: str(), force: bool("Go ahead although a key's tag limit, private_tags or the published tag uses this name (the refusal names them)"), }, ["old_name", "new_name"]),
+    description: "Rename a tag everywhere (notes, parents, #mentions); its sub-tags follow. If a key's tag limit, private_tags or the published tag reaches it (or the caller is tag-scoped), refused until you pass `force: true` (the refusal names them).",
+    inputSchema: obj({ old_name: str(), new_name: str(), force: bool("Go ahead although a key's tag limit, private_tags or the published tag reaches this name (the refusal names them, except to a tag-scoped pass)"), }, ["old_name", "new_name"]),
   },
 
   "merge-tags": {
     description: "Retag every note of the `sources` with `target`, then drop the sources.",
-    inputSchema: obj({ sources: { type: "array", items: { type: "string" } }, target: str(), force: bool("Go ahead although a key's tag limit, private_tags or the published tag uses this name (the refusal names them)"), }, ["sources", "target"]),
+    inputSchema: obj({ sources: { type: "array", items: { type: "string" } }, target: str(), force: bool("Go ahead although a key's tag limit, private_tags or the published tag reaches this name (the refusal names them, except to a tag-scoped pass)"), }, ["sources", "target"]),
   },
 
   "find-path": {
@@ -377,7 +377,7 @@ export const NEW_TOOLS: Record<string, ShortTool & { folds: Record<string, strin
         target: str(),
         detach: bool(),
         apply: bool(),
-        force: bool("Go ahead although a key's tag limit, private_tags or the published tag uses this name (the refusal names them)"),
+        force: bool("Go ahead although a key's tag limit, private_tags or the published tag reaches this name (the refusal names them, except to a tag-scoped pass)"),
       },
     ),
     folds: { update: "update-tag", rename: "rename-tag", merge: "merge-tags", delete: "delete-tag", prune: "prune-schema" },

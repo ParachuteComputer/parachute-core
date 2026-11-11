@@ -10,12 +10,15 @@
 //  3. `PATCH /api/vault` and the MCP twin: guarded in vault-scope.test.ts (fixed by T-419, #53).
 //  4. Scoped admin passes: the mint refuses them, `parachute doctor` names any that exist; the vault-wide routes
 //     refusing one is guarded in vault-scope.test.ts.
-//  5. Vault-wide stats: guarded in vault-scope.test.ts (fixed by T-419).
+//  5. Vault-wide stats: guarded in vault-scope.test.ts (fixed by T-419); `/api/types` counts here.
 //  6. Renames, merges, deletes and re-parenting change who sees what: refused without `force`, naming the keys.
 //  7. A live subscription's scope is re-read on every event, and a note that leaves it is removed; an attachment
 //     ticket is re-checked when it is spent.
 //  8. The string sub-tag fallback: not closed (it would change what vault-scope.test.ts means; see the PR).
 //  9. Deliberate and documented: a hidden note's path answers 409 on create (pinned below: it names nothing more).
+//
+// The REST contracts run on `/api/notes` and on the record door (`/api/records`, `/api/types`, ROADMAP 0.9.1): a
+// scoped pass must learn nothing new through either. On `next` the record door doesn't exist yet (404).
 //
 // `private_tags` is set the only way an operator can: in the vault's vault.yaml (see scoped-write.test.ts).
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
@@ -273,6 +276,15 @@ describe("gap 2: no truncation or paging signal tells a scoped reader that hidde
     } finally {
       await c.close();
     }
+  });
+
+  test("/api/types counts for a scoped pass what /api/tags counts, and names no hidden tag (gap 5 on the record door)", async () => {
+    const reader = rest(s.vaultViaHub, await pass({ level: "read", tags: [MINE] }));
+    const [types, tags] = [await reader.get("/types"), await reader.get("/tags")];
+    expect(types.status).toBe(200);
+    const counts = (rows: any[]) => JSON.stringify(rows.map((r) => [r.name, r.count, r.expanded_count]).sort());
+    must(counts(types.body) === counts(tags.body), `/api/types counted differently from /api/tags: ${counts(types.body).slice(0, 300)} vs ${counts(tags.body).slice(0, 300)}`);
+    must(!JSON.stringify(types.body).includes(OTHER), "/api/types named a tag outside the pass's scope");
   });
 
   test("cursor paging walks every note a scoped reader can see, past pages of hidden ones", async () => {
