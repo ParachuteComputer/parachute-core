@@ -119,7 +119,7 @@
         "personal"
       ],
       "status": "deliberate",
-      "owner": "spec \u00a78 (keys): on cloud a key is an approved OAuth app, managed in the account",
+      "owner": "spec §8 (keys): on cloud a key is an approved OAuth app, managed in the account",
       "why": "A box's admin sees `manage-token` (and from 0.9 `manage-keys`) for the hub's own key store. Cloud-style doors have no hub key store: connections and named keys are listed and revoked through the account door."
     },
     {
@@ -242,22 +242,6 @@
       "why": "A note written over REST with a named app key says `createdVia: key:<name>` on the personal door and `api` on the 0.9.1 box, so on a box the list of who wrote what can't tell two apps apart."
     },
     {
-      "id": "box-cors-on-0.9",
-      "keys": [
-        "rest/cors.preflight"
-      ],
-      "between": [
-        "box",
-        "personal"
-      ],
-      "releases": [
-        "0.9.1"
-      ],
-      "status": "drift",
-      "owner": "this change, once the 0.9 branch takes `next`",
-      "why": "The box's missing MCP headers in CORS are fixed on `next` beside these contracts. The 0.9 branch was cut before that and gets it when it takes `next`."
-    },
-    {
       "id": "revoked-app-key-reply",
       "keys": [
         "keys/app-key.revoke.shape",
@@ -288,7 +272,23 @@
       ],
       "status": "drift",
       "owner": "parachute-cloud, at its next core pin: call refuseTypesInTags (core tag-kind.ts) in rest/records.ts and pass it to addRecordTools in mcp-09.ts, or move rest/records.ts onto core's rest-records.ts",
-      "why": "On the record door `tags` holds plain labels (SPEC \u00a72.4). From 0.9.1 a box refuses a type's name in `tags` with 422 `tag_kind` and the fix (`types: [...]`), on `/api/records` and on create-record/update-record, and writes nothing. The personal door still accepts it and files the name as the type. Send a type's name in `types`: that works on both."
+      "why": "On the record door `tags` holds plain labels (SPEC §2.4). From 0.9.1 a box refuses a type's name in `tags` with 422 `tag_kind` and the fix (`types: [...]`), on `/api/records` and on create-record/update-record, and writes nothing. The personal door still accepts it and files the name as the type. Send a type's name in `types`: that works on both."
+    },
+    {
+      "id": "typed-record-read-validation-status",
+      "keys": [
+        "records/rest.get.shape"
+      ],
+      "between": [
+        "box",
+        "personal"
+      ],
+      "releases": [
+        "0.9.1"
+      ],
+      "status": "drift",
+      "owner": "parachute-cloud 0.9.1: the vault worker's REST read (it drops its own records copy for the engine's `rest-records` then)",
+      "why": "A box attaches `validation_status` to a typed record when it is read over REST, as both doors do on create and on MCP. A cloud-style door's hand-ported REST read leaves it out. The box's `/api/records` made the difference visible; `/api/notes` has had it since 0.8. Read `validation_status` as optional on a get."
     }
   ]
 }
