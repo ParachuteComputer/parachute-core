@@ -4,6 +4,7 @@
 // where it may write (the hop to each vault carries that vault's level, never the owner's), must name the vault on a
 // write, and stops when revoked. HTTP and MCP only, so any door with an account door can be held to it.
 import { describe, expect, test } from "bun:test";
+import { connectAccount } from "./_connect.ts";
 import { accountToken, door, fp, lacks, mcp, rest, runId, safeFetch, vaultUrl } from "./_door.ts";
 
 const d = door();
@@ -112,5 +113,48 @@ describe.skipIf(!is091 || lacks("multi-vault-door"))("one multi-vault door", () 
     const both = await mint({ name: `door-multi-${runId("b")}`, vault: read, can: "read", vaults: { [write]: "write" } });
     expect(both.status).toBe(400);
     fp("multivault/refusals", [admin.status, missing.status, both.status]);
+  });
+
+  // Consent per vault: an app that asks for the account door gets each vault at the level the person chose on the
+  // consent screen (none, read or write), never the person's own role, and a vault left at none is not reachable.
+  test.skipIf(d.signIn.how !== "cookie")("consent per vault: A read, B write, C none; through the account door each is held to its level", async () => {
+    const owner = await bearer();
+    const third = `mv${runId("c")}`.toLowerCase().replace(/[^a-z0-9-]/g, "").slice(0, 30);
+    const made = await safeFetch(`${d.issuer}/account/vaults`, { method: "POST", headers: owner, body: JSON.stringify({ name: third }) });
+    expect(made.status).toBe(201);
+    try {
+      // A level above write, or a vault the person can't reach, is refused: no token.
+      const admin = await connectAccount({ appName: `mv-admin-${runId("a")}`, levels: { [read]: "admin" } });
+      expect(admin.ok, "a posted level above write").toBe(false);
+      const stranger = await connectAccount({ appName: `mv-nope-${runId("n")}`, levels: { [read]: "read", [`${runId("nope")}`.toLowerCase()]: "read" } });
+      expect(stranger.ok, "a vault that doesn't exist").toBe(false);
+      const nothing = await connectAccount({ appName: `mv-none-${runId("z")}`, levels: { [read]: "none" } });
+      expect(nothing.ok, "every vault at none").toBe(false);
+
+      const got = await connectAccount({ appName: `mv-${runId("app")}`, levels: { [read]: "read", [write]: "write", [third]: "none" } });
+      expect(got.ok, got.ok ? "" : got.refusal).toBe(true);
+      if (!got.ok) return;
+      fp("multivault/consent.scope", got.scope.split(" ").map((s) => s.replace(read, "<A>").replace(write, "<B>")).sort());
+      const c = await mcp("read", { url: accountMcp(), bearer: got.access });
+      try {
+        const listed = (await c.call("list-vaults", {})).vaults.map((v: { name: string }) => v.name).sort();
+        expect(listed).toEqual([read, write].sort());
+        const path = `${runId("consent")}/note`;
+        const onA = await c.call("create-record", { vault: read, path, body: "not on A" }).then(() => null, (e: Error) => e.message);
+        expect(onA, "a write on A (read)").not.toBeNull();
+        const onC = await c.call("create-record", { vault: third, path, body: "not on C" }).then(() => null, (e: Error) => e.message);
+        expect(onC, "a write on C (none)").not.toBeNull();
+        const readC = await c.call("query-records", { vault: third, limit: 1 }).then(() => null, (e: Error) => e.message);
+        expect(readC, "a read on C (none)").not.toBeNull();
+        expect(await c.call("create-record", { vault: write, path, body: "on B" })).toBeTruthy();
+        expect((await rest("read", write).get(`/records/${encodeURIComponent(path)}`)).status).toBe(200);
+        expect((await rest("read", read).get(`/records/${encodeURIComponent(path)}`)).status).toBe(404);
+        expect((await rest("read", third).get(`/records/${encodeURIComponent(path)}`)).status).toBe(404);
+      } finally {
+        await c.close();
+      }
+    } finally {
+      await safeFetch(`${d.issuer}/account/vaults/${third}`, { method: "DELETE", headers: owner, body: JSON.stringify({ confirm: third }) });
+    }
   });
 });

@@ -12074,3 +12074,148 @@ describe("retired verb selector form field", () => {
     }
   });
 });
+
+// ───────────────────────────────────────────────────────────────────────────
+// Consent per vault (0.9.1 "one multi-vault door", T-446). An app that asks
+// for the account door (`account:vaults`) gets each vault at the level the
+// person chose (none / read / write), capped by what the person holds there.
+// The door contract (contracts/suites/door/multivault.test.ts) holds the
+// owner's flow end to end; these hold the page and a friend's forged posts.
+// ───────────────────────────────────────────────────────────────────────────
+describe("account-door consent per vault (T-446)", () => {
+  const TTL_S = Math.floor(SESSION_TTL_MS / 1000);
+  const MANIFEST: ServicesManifest = {
+    services: [
+      {
+        name: "parachute-vault",
+        port: 1940,
+        paths: ["/vault/work", "/vault/other", "/vault/third"],
+        health: "/health",
+        version: "0.7.0",
+      },
+    ],
+  };
+  const deps = { issuer: ISSUER, loadServicesManifest: () => MANIFEST, hubBoundOrigins: () => [ISSUER] };
+  const cookie = (sessionId: string) => `${CSRF_COOKIE}; ${buildSessionCookie(sessionId, TTL_S)}`;
+  const base = (clientId: string, challenge: string) => ({
+    client_id: clientId,
+    redirect_uri: "https://app.example/cb",
+    response_type: "code",
+    scope: "account:vaults",
+    code_challenge: challenge,
+    code_challenge_method: "S256",
+  });
+  const get = (db: Awaited<ReturnType<typeof makeDb>>["db"], sessionId: string, clientId: string, challenge: string) =>
+    handleAuthorizeGet(db, new Request(authorizeUrl(base(clientId, challenge)), { headers: { cookie: cookie(sessionId) } }), deps);
+  const post = (db: Awaited<ReturnType<typeof makeDb>>["db"], sessionId: string, clientId: string, challenge: string, fields: [string, string][]) => {
+    const form = new URLSearchParams({ __action: "consent", __csrf: TEST_CSRF, approve: "yes", ...base(clientId, challenge) });
+    for (const [k, v] of fields) form.append(k, v);
+    return handleAuthorizePost(
+      db,
+      new Request(`${ISSUER}/oauth/authorize`, { method: "POST", body: form, headers: { "content-type": "application/x-www-form-urlencoded", cookie: cookie(sessionId) } }),
+      deps,
+    );
+  };
+  async function redeem(db: Awaited<ReturnType<typeof makeDb>>["db"], location: string, clientId: string, verifier: string): Promise<string> {
+    const code = new URL(location).searchParams.get("code");
+    expect(code, location).toBeString();
+    const res = await handleToken(
+      db,
+      new Request(`${ISSUER}/oauth/token`, {
+        method: "POST",
+        body: new URLSearchParams({ grant_type: "authorization_code", code: code!, client_id: clientId, redirect_uri: "https://app.example/cb", code_verifier: verifier }),
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+      }),
+      deps,
+    );
+    expect(res.status).toBe(200);
+    return ((await res.json()) as { scope: string }).scope;
+  }
+  async function friendOnWorkReadOtherWrite(db: Awaited<ReturnType<typeof makeDb>>["db"]) {
+    await createUser(db, "owner", "pw");
+    const friend = await createUser(db, "friend", "pw", { allowMulti: true });
+    setUserVaults(db, friend.id, ["other"]); // role=write
+    db.prepare("INSERT INTO user_vaults (user_id, vault_name, role, created_at) VALUES (?, 'work', 'read', ?)").run(friend.id, new Date().toISOString());
+    return createSession(db, { userId: friend.id });
+  }
+
+  test("the page lists each vault the person reaches, None / Read / Write, Write only where they hold it", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const session = await friendOnWorkReadOtherWrite(db);
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"], status: "approved" });
+      const res = get(db, session.id, reg.client.clientId, makePkce().challenge);
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain('<input type="hidden" name="account_vault_levels" value="1" />');
+      const row = (v: string) => html.slice(html.indexOf(`data-vault="${v}"`), html.indexOf("</div>", html.indexOf(`data-vault="${v}"`)));
+      expect(row("work")).toContain('name="vault_level:work" value="none"');
+      expect(row("work")).toContain('name="vault_level:work" value="read" checked');
+      expect(row("work")).toContain('name="vault_level:work" value="write" disabled');
+      expect(row("other")).toContain('name="vault_level:other" value="write" />');
+      expect(html).not.toContain('data-vault="third"');
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("SECURITY: a friend's forged post (write where they hold read, an unassigned vault, a name with a colon) mints nothing", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const session = await friendOnWorkReadOtherWrite(db);
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"], status: "approved" });
+      for (const fields of [
+        [["vault_level:work", "write"]],
+        [["vault_level:third", "read"]],
+        [["vault_level:work:write", "read"]],
+        [["vault_level:other", "admin"]],
+        [["vault_level:other", "read"], ["vault_level:other", "write"]],
+      ] as [string, string][][]) {
+        const res = await post(db, session.id, reg.client.clientId, makePkce().challenge, [["account_vault_levels", "1"], ...fields]);
+        expect(res.status, JSON.stringify(fields)).toBe(400);
+        expect(await res.text()).toContain("vault_scope_mismatch");
+      }
+      const codes = db.query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM auth_codes WHERE client_id = ?").get(reg.client.clientId);
+      expect(codes?.n ?? 0).toBe(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("the friend's choice is minted as chosen, and the app's next ask gets the same levels without the page", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const session = await friendOnWorkReadOtherWrite(db);
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"], status: "approved" });
+      const first = makePkce();
+      const res = await post(db, session.id, reg.client.clientId, first.challenge, [
+        ["account_vault_levels", "1"],
+        ["vault_level:work", "read"],
+        ["vault_level:other", "write"],
+      ]);
+      expect(res.status).toBe(302);
+      const want = "account:self:vaults:other:write account:self:vaults:work:read";
+      expect((await redeem(db, res.headers.get("location")!, reg.client.clientId, first.verifier)).split(" ").sort().join(" ")).toBe(want);
+      const again = makePkce();
+      const skipped = get(db, session.id, reg.client.clientId, again.challenge);
+      expect(skipped.status).toBe(302);
+      expect((await redeem(db, skipped.headers.get("location")!, reg.client.clientId, again.verifier)).split(" ").sort().join(" ")).toBe(want);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("a post without the per-vault fields (a page from before 0.9.1) keeps the level-less grant", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const session = await friendOnWorkReadOtherWrite(db);
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"], status: "approved" });
+      const p = makePkce();
+      const res = await post(db, session.id, reg.client.clientId, p.challenge, []);
+      expect(res.status).toBe(302);
+      expect(await redeem(db, res.headers.get("location")!, reg.client.clientId, p.verifier)).toBe("account:self:vaults");
+    } finally {
+      cleanup();
+    }
+  });
+});

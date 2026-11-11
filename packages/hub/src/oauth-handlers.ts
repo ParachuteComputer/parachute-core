@@ -96,6 +96,7 @@ import {
 } from "./rate-limit.ts";
 import { isHttpsRequest } from "./request-protocol.ts";
 import {
+  isAccountMcpResource,
   isRootMcpResource,
   narrowResourceVaultScopes,
   narrowRootMcpScopes,
@@ -745,6 +746,10 @@ function resolveTokenResourceAudience(
     const audience = resolveRootMcpTokenAudience(grantedVaultNames, fallbackAudience);
     if (audience === null) return { errorResponse: invalidTargetResponse(requestResource) };
     return { audience };
+  }
+  // The account door by its own URL: only an account-audience grant (no named vault scope) may bind to it.
+  if (isAccountMcpResource(requestResource, boundOrigins) && fallbackAudience === "account") {
+    return { audience: "account" };
   }
   return { errorResponse: invalidTargetResponse(requestResource) };
 }
@@ -1547,15 +1552,20 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
     client.clientId,
     requestedScopes,
   );
+  // T-446: a per-vault account-door grant covers a later `account:vaults` ask from the same app (its levels again).
+  const perVaultCovered = hasUnnamedVault
+    ? null
+    : perVaultGrantCovering(db, session.userId, client.clientId, requestedScopes);
   if (
     !hasStaleAssignment &&
     userHasVaultPosture &&
     ((!hasUnnamedVault && isCoveredByGrant(db, session.userId, client.clientId, requestedScopes)) ||
-      unnamedCoveredByAccountGrant)
+      unnamedCoveredByAccountGrant ||
+      perVaultCovered !== null)
   ) {
     const mintScopes = unnamedCoveredByAccountGrant
       ? replaceUnnamedVaultScopesWithAccountVaults(requestedScopes)
-      : requestedScopes;
+      : (perVaultCovered ?? requestedScopes);
     console.log(
       `consent skipped: existing grant covers requested scope client_id=${client.clientId} user_id=${session.userId} scopes=${mintScopes.join(" ")}`,
     );
@@ -1675,6 +1685,9 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
           requested: parsed.scope.split(" ").filter((s) => s.length > 0),
           vaultName: assignedVaults.length === 1 ? assignedVaults[0] : undefined,
         }),
+        requestedScopes.some(isAccountVaultsConnectionScope)
+          ? [...perVaultOffer(db, session.userId, userIsAdmin, assignedVaults, vaultNames)].map(([vault, max]) => ({ vault, max }))
+          : undefined,
       ),
     ),
     200,
@@ -1727,6 +1740,101 @@ function isAccountVaultsConnectionScope(scope: string): boolean {
   return scope === ACCOUNT_VAULTS_UNNARROWED || scope === accountVaultsScope("self");
 }
 
+/**
+ * Consent per vault (0.9.1 "one multi-vault door", T-446): the account-door grant the consent screen mints when the
+ * person chooses a level for each vault, `account:self:vaults:<vault>:<read|write>`. The account door holds each hop
+ * to that level (key-level.ts `keyLevelOnVault`). Never requestable by a client (findNonRequestableScopes); minted
+ * only from the consent form, and capped again at the choke-point (`capScopesToUserAuthority`).
+ */
+const PER_VAULT_LEVELS = ["read", "write"] as const;
+type PerVaultLevel = (typeof PER_VAULT_LEVELS)[number];
+const PER_VAULT_SCOPE_RE = /^account:self:vaults:([a-z0-9_-]+):(read|write)$/;
+
+function parsePerVaultScope(scope: string): { vault: string; level: PerVaultLevel } | null {
+  const m = PER_VAULT_SCOPE_RE.exec(scope);
+  return m ? { vault: m[1]!, level: m[2] as PerVaultLevel } : null;
+}
+
+/**
+ * What the person may offer per vault on the account-door consent: the vaults they reach on this box, each at the
+ * highest of read/write they hold there. The owner reaches every vault at write; anyone else, the vaults assigned to
+ * them that still exist, at their role (a role without read offers nothing).
+ */
+function perVaultOffer(
+  db: Database,
+  userId: string,
+  userIsAdmin: boolean,
+  assignedVaults: readonly string[],
+  vaultNames: readonly string[],
+): Map<string, PerVaultLevel> {
+  const out = new Map<string, PerVaultLevel>();
+  for (const v of userIsAdmin ? vaultNames : assignedVaults.filter((a) => vaultNames.includes(a))) {
+    if (userIsAdmin) {
+      out.set(v, "write");
+      continue;
+    }
+    const verbs = vaultVerbsForUserVault(db, userId, v) ?? [];
+    if (verbs.includes("write")) out.set(v, "write");
+    else if (verbs.includes("read")) out.set(v, "read");
+  }
+  return out;
+}
+
+/**
+ * The per-vault form fields (`account_vault_levels=1`, `vault_level:<vault>` = none|read|write) turned into the
+ * grant. Every posted field must name a vault on offer, once, at a level no higher than offered; anything else is
+ * refused, never silently narrowed, so a forged form can't pass for a choice. A vault not posted is none. Without the
+ * marker (a consent page from before 0.9.1) the level-less grant stays as it was (Open 1, Aaron's decision).
+ */
+function applyPerVaultLevels(
+  scopes: readonly string[],
+  form: Awaited<ReturnType<Request["formData"]>>,
+  offer: ReadonlyMap<string, PerVaultLevel>,
+): { scopes: string[] } | { error: string } | { none: true } {
+  if (!scopes.some(isAccountVaultsConnectionScope)) return { scopes: [...scopes] };
+  if (String(form.get("account_vault_levels") ?? "") !== "1") return { scopes: [...scopes] };
+  const chosen: string[] = [];
+  const seen = new Set<string>();
+  for (const key of new Set([...form.keys()])) {
+    if (!key.startsWith("vault_level:")) continue;
+    const vault = key.slice("vault_level:".length);
+    const values = form.getAll(key).map(String);
+    const max = offer.get(vault);
+    if (max === undefined) return { error: `you can't grant access to a vault called "${vault}" here` };
+    if (values.length !== 1 || seen.has(vault)) return { error: `choose one level for ${vault}` };
+    seen.add(vault);
+    const level = values[0]!;
+    if (level === "none") continue;
+    if (level !== "read" && level !== "write") return { error: `${vault}: choose none, read or write` };
+    if (level === "write" && max !== "write") return { error: `${vault}: you hold read there, so you can grant read at most` };
+    chosen.push(`account:self:vaults:${vault}:${level}`);
+  }
+  if (chosen.length === 0) return { none: true };
+  return { scopes: [...scopes.filter((s) => !isAccountVaultsConnectionScope(s)), ...chosen.sort()] };
+}
+
+/**
+ * Skip-consent for a per-vault grant: an app that asks for the account door again (`account:vaults`) and already
+ * holds a per-vault grant from this person gets that grant again, not a fresh level-less one. Covered only when the
+ * stored grant has per-vault scopes and no level-less one, and holds every other scope asked for.
+ */
+function perVaultGrantCovering(
+  db: Database,
+  userId: string,
+  clientId: string,
+  requestedScopes: readonly string[],
+): string[] | null {
+  if (!requestedScopes.some(isAccountVaultsConnectionScope)) return null;
+  const grant = findGrant(db, userId, clientId);
+  if (!grant) return null;
+  const perVault = grant.scopes.filter((s) => parsePerVaultScope(s) !== null);
+  if (perVault.length === 0 || grant.scopes.some(isAccountVaultsConnectionScope)) return null;
+  const granted = new Set(grant.scopes);
+  const rest = requestedScopes.filter((s) => !isAccountVaultsConnectionScope(s));
+  if (!rest.every((s) => granted.has(s))) return null;
+  return [...rest, ...perVault];
+}
+
 function isAccountSelfRestScope(scope: string): boolean {
   return (
     scope === ACCOUNT_SELF_READ_SCOPE ||
@@ -1739,7 +1847,7 @@ function isAccountSelfRestScope(scope: string): boolean {
  * mixing vault-audience scopes with `account:vaults`; it does not forbid
  * `account:self:{read,write,admin}` — they share the account audience. */
 function isAccountAudienceCompanion(scope: string): boolean {
-  return isAccountVaultsConnectionScope(scope) || isAccountSelfRestScope(scope);
+  return isAccountVaultsConnectionScope(scope) || isAccountSelfRestScope(scope) || parsePerVaultScope(scope) !== null;
 }
 
 function isNamedVaultScope(scope: string): boolean {
@@ -1750,7 +1858,7 @@ function isNamedVaultScope(scope: string): boolean {
 }
 
 function accountVaultsCombinedWithOtherScopes(scopes: readonly string[]): boolean {
-  const has = scopes.some(isAccountVaultsConnectionScope);
+  const has = scopes.some((s) => isAccountVaultsConnectionScope(s) || parsePerVaultScope(s) !== null);
   if (!has) return false;
   return scopes.some((s) => !isAccountAudienceCompanion(s));
 }
@@ -1794,6 +1902,9 @@ function capScopesToUserAuthority(
     // as the door-contract. Detect the family case-insensitively so
     // `ACCOUNT:self:admin` is still dropped rather than passing through to
     // the vault-verb branch.
+    // A per-vault account-door grant (T-446): only at a level the person holds on that vault.
+    const perVault = parsePerVaultScope(s);
+    if (perVault) return (vaultVerbsForUserVault(db, userId, perVault.vault) ?? []).includes(perVault.level);
     if (s.toLowerCase().startsWith("account:")) return isRequestableAccountScope(s);
     const parts = s.split(":");
     if (parts.length !== 3 || parts[0] !== "vault") return true; // non-named — pass through
@@ -2512,6 +2623,23 @@ async function handleConsentSubmit(
   // there mean a subset re-flow still matches a prior grant, and an admin-only
   // request from a non-owner caps to empty → refused (no zero-scope token).
   // (#75 skip-consent depends on this recording.)
+  // Consent per vault (T-446): the levels the person chose replace the level-less account-door grant.
+  if (scopes.some(isAccountVaultsConnectionScope)) {
+    const manifest = (deps.loadServicesManifest ?? readServicesManifest)();
+    const offer = perVaultOffer(db, session.userId, userIsAdmin, assignedVaults, listVaultNames(manifest));
+    const applied = applyPerVaultLevels(scopes, form, offer);
+    if ("error" in applied) return htmlError("Vault access not allowed", `vault_scope_mismatch: ${applied.error}.`, 400);
+    if ("none" in applied) {
+      return oauthErrorRedirect(
+        params.redirectUri,
+        "access_denied",
+        "No vault was granted — every vault was left at none.",
+        params.state,
+      );
+    }
+    scopes = applied.scopes;
+  }
+
   return issueAuthCodeRedirect(db, params, scopes, session.userId, deps);
 }
 
@@ -3609,6 +3737,7 @@ function consentProps(
   // Passed IN rather than computed here because it needs the db + userId,
   // which this pure props builder deliberately doesn't take.
   grantableExtras: readonly string[] = [],
+  vaultLevels?: ReadonlyArray<{ vault: string; max: "read" | "write" }>,
 ) {
   const requestedScopes = params.scope.split(" ").filter((s) => s.length > 0);
   const unnamedVerbs = unnamedVaultVerbs(requestedScopes);
@@ -3766,6 +3895,7 @@ function consentProps(
     // at DCR time (bearer hub:admin / same-origin session → true).
     sameHub: client.sameHub,
     grantableExtras,
+    ...(vaultLevels ? { vaultLevels } : {}),
   };
 }
 
