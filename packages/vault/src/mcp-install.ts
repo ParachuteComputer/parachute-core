@@ -383,6 +383,8 @@ export interface MintHubJwtOpts {
   permissions?: Record<string, unknown>;
   /** Test seam — defaults to global fetch. */
   fetchImpl?: typeof fetch;
+  /** The new key's name (hub `/api/auth/mint-token {name}`): its writes say `via key:<name>`. */
+  name?: string;
 }
 
 /**
@@ -403,6 +405,7 @@ export async function mintHubJwt(opts: MintHubJwtOpts): Promise<MintedHubJwt | M
     expires_in: opts.expiresInSeconds ?? HUB_MINT_DEFAULT_TTL_SECONDS,
   };
   if (opts.subject) body.subject = opts.subject;
+  if (opts.name) body.name = opts.name;
   if (opts.permissions !== undefined) body.permissions = opts.permissions;
 
   const fetchFn = opts.fetchImpl ?? fetch;

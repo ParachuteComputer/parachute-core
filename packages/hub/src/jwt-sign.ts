@@ -158,6 +158,8 @@ export interface SignRefreshTokenOpts {
    * replay detection can revoke every descendant in one query (#73).
    */
   familyId?: string;
+  /** The key's name signed into the access token (its `key` claim): the family's key gets exactly this name. */
+  keyName?: string;
   now?: () => Date;
 }
 
@@ -263,6 +265,7 @@ export function signRefreshToken(db: Database, opts: SignRefreshTokenOpts): Sign
   // Resolved at INSERT time so the row records what was true when the
   // credential was minted; a later unlink does not rewrite it.
   const subjectPubkey = attributionPubkey(db, { userId: opts.userId });
+  const insert = () => {
   try {
     db.prepare(
       `INSERT INTO tokens (jti, user_id, client_id, scopes, refresh_token_hash, family_id, expires_at, created_at, created_via, subject_pubkey)
@@ -284,13 +287,28 @@ export function signRefreshToken(db: Database, opts: SignRefreshTokenOpts): Sign
       err,
     );
   }
-  keyForMint(db, opts.jti, familyId);
+  keyForMint(db, opts.jti, familyId, opts.keyName);
+  };
+  if (opts.keyName === undefined) insert();
+  else {
+    // The access token already names this key: record the row and its key in one step, or nothing (a name another
+    // grant took meanwhile → KeyNameTakenError, and the caller signs again under the next name).
+    try {
+      db.transaction(insert).immediate();
+    } catch (err) {
+      if (err instanceof Error && /UNIQUE constraint failed: keys\.name/.test(err.message)) throw new KeyNameTakenError(opts.keyName);
+      throw err;
+    }
+  }
   return { token, refreshTokenHash, familyId, expiresAt };
 }
 
 export interface RecordTokenMintOpts {
   /** Same as the issued JWT's jti — keys the row. */
   jti: string;
+  /** The key's name signed into the token (its `key` claim, the write stamp): the key row gets exactly this name,
+   *  and the mint fails if it is taken, so a stamp never names another key. */
+  keyName?: string;
   /** Provenance tag — drives admin UI grouping and the registry semantics. */
   createdVia: Exclude<TokenCreatedVia, "oauth_refresh">;
   /** Subject identity for non-user mints. Operator-mint rows pass "operator"; service-mint rows pass the service short name. */
@@ -346,6 +364,27 @@ export interface RecordTokenMintOpts {
  * CLI again).
  */
 export function recordTokenMint(db: Database, opts: RecordTokenMintOpts): void {
+  // A token that names its key (the write stamp) is recorded with its key in one step: if the name was taken in the
+  // meantime, nothing is left behind and the caller can sign again under another name (KeyNameTakenError).
+  if (opts.keyName === undefined) return recordTokenMintRow(db, opts);
+  try {
+    // IMMEDIATE: take the write lock up front, so a concurrent mint waits (busy_timeout) instead of failing on upgrade.
+    db.transaction(() => recordTokenMintRow(db, opts)).immediate();
+  } catch (err) {
+    const cause = err instanceof RefreshTokenInsertError ? (err as { cause?: unknown }).cause ?? err : err;
+    if (cause instanceof Error && /UNIQUE constraint failed: keys\.name/.test(cause.message)) throw new KeyNameTakenError(opts.keyName);
+    throw err;
+  }
+}
+
+/** The key name a token was signed with was taken before its row was written; nothing was recorded. */
+export class KeyNameTakenError extends Error {
+  constructor(readonly keyName: string) {
+    super(`a key called "${keyName}" already exists`);
+  }
+}
+
+function recordTokenMintRow(db: Database, opts: RecordTokenMintOpts): void {
   const now = opts.now?.() ?? new Date();
   // Phase-1b attribution snapshot (hub#833). `undefined` → resolve from the
   // mint's principal; `null` → explicit opt-out. See `subjectPubkey`'s doc.
@@ -393,7 +432,7 @@ export function recordTokenMint(db: Database, opts: RecordTokenMintOpts): void {
           `account ${opts.userId} no longer exists (or was reset) at mint insert; refusing to register jti=${opts.jti}`,
         );
       }
-      keyForMint(db, opts.jti);
+      keyForMint(db, opts.jti, undefined, opts.keyName);
       return;
     }
     db.prepare(
@@ -413,7 +452,7 @@ export function recordTokenMint(db: Database, opts: RecordTokenMintOpts): void {
       opts.subject,
       subjectPubkey,
     );
-    keyForMint(db, opts.jti);
+    keyForMint(db, opts.jti, undefined, opts.keyName);
   } catch (err) {
     if (err instanceof TokenMintPrincipalGoneError) throw err;
     throw new RefreshTokenInsertError(
@@ -428,11 +467,13 @@ export function recordTokenMint(db: Database, opts: RecordTokenMintOpts): void {
  * the token, so failing to write one must never fail the mint: it is logged,
  * and the next start's migration-style adoption can fill it in.
  */
-function keyForMint(db: Database, jti: string, refreshFamily?: string): void {
+function keyForMint(db: Database, jti: string, refreshFamily?: string, exactName?: string): void {
   try {
-    if (refreshFamily) adoptRefreshToken(db, jti, refreshFamily);
-    else adoptToken(db, jti);
+    if (refreshFamily) adoptRefreshToken(db, jti, refreshFamily, exactName);
+    else adoptToken(db, jti, exactName);
   } catch (err) {
+    // A token whose key's name is signed into it must have that key: fail the mint (its transaction rolls back).
+    if (exactName !== undefined) throw err;
     console.error(`[hub] could not record a key for jti=${jti}: ${err instanceof Error ? err.message : String(err)}`);
   }
 }

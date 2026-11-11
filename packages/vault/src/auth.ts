@@ -21,6 +21,8 @@
  * audience to strict-check on the cross-vault surface.
  */
 
+import { decodeJwt } from "jose";
+import { keyVia, parseActsForClaim, parseKeyClaim, rememberKeyKind, StampClaimError } from "../core/src/write-stamp.ts";
 import { UnreadablePrivateTagsError, readGlobalConfig, writeVaultConfig, writeGlobalConfig, verifyKey } from "./config.ts";
 import type { VaultConfig, StoredKey } from "./config.ts";
 import type { TokenPermission } from "./token-store.ts";
@@ -176,6 +178,17 @@ export interface AuthResult {
    * determined the class (or `api`) stands.
    */
   via: string | null;
+  /**
+   * The named key the token was minted as (its `key` claim, set by the hub at mint; the write stamp, core
+   * `write-stamp.ts`): its name is `via` (`key:<name>`) and its kind rides each revision it writes. Null for a
+   * credential with no named key. Optional so call sites that build an AuthResult by hand needn't name it.
+   */
+  key?: { name: string; kind: string } | null;
+  /**
+   * The on-behalf-of prefix (`permissions.acts_for`), given only by the vault's owner at mint: a write may then name
+   * an id and is stamped `by <prefix>:<id>`. Null without the permission, and then a supplied id is refused.
+   */
+  acts_for?: string | null;
 }
 
 /**
@@ -439,7 +452,7 @@ class MalformedScopedTagsError extends Error {}
  * doors refuse such keys too; this catches tokens minted before that, until
  * they expire.
  */
-const ENFORCED_PERMISSION_KEYS = new Set(["scoped_tags", "principal_pubkey"]);
+const ENFORCED_PERMISSION_KEYS = new Set(["scoped_tags", "principal_pubkey", "acts_for"]);
 
 class UnknownPermissionKeysError extends Error {
   constructor(readonly keys: string[]) {
@@ -536,6 +549,8 @@ export function refineMcpVia(via: string | null | undefined): string {
   // TypeError at write time. Narrow on `typeof`, not on `!== null`.
   if (via === "operator") return "operator";
   if (typeof via === "string" && via.startsWith("nostr:")) return via;
+  // A named key's own name (the write stamp): the key is the more specific fact, as on the personal door.
+  if (typeof via === "string" && via.startsWith("key:")) return via;
   return "mcp";
 }
 
@@ -703,6 +718,12 @@ async function authenticateHubJwt(
     // Write-attribution axis 2 (vault#698): the NIP-98 signing pubkey, when
     // the hub stamped one. Fail-soft — see `parsePrincipalPubkey`.
     const principalPubkey = parsePrincipalPubkey(claims.permissions);
+    // The write stamp (core write-stamp.ts): the named key (a top-level claim, which scope-guard doesn't pass on, so
+    // read from the payload whose signature validateHubJwt just checked) and the on-behalf-of prefix. Fail closed on
+    // a present-but-malformed claim: a stamp the vault can't read must not become a generic one.
+    const key = parseKeyClaim(decodeJwt(token) as Record<string, unknown>);
+    const actsFor = parseActsForClaim(claims.permissions, key);
+    if (key !== null) rememberKeyKind(key);
     return {
       permission,
       scopes: claims.scopes,
@@ -730,7 +751,11 @@ async function authenticateHubJwt(
       // `actor` is untouched on purpose: it stays the hub USER id, so two
       // agents sharing a hub user keep one `created_by` and are told apart by
       // `created_via` / `last_updated_via`.
-      via: principalPubkey !== null ? nostrVia(principalPubkey) : "api",
+      // A named key wins over a signing pubkey: the key is what authenticated, and only the hub signs its name in.
+      // (A box never mints both; this keeps a pubkey asked for at a mint from hiding the key's name.)
+      via: key !== null ? keyVia(key.name) : principalPubkey !== null ? nostrVia(principalPubkey) : "api",
+      key,
+      acts_for: actsFor,
     };
   } catch (err) {
     if (err instanceof UnknownPermissionKeysError) {
@@ -741,6 +766,10 @@ async function authenticateHubJwt(
           { status: 401 },
         ),
       };
+    }
+    if (err instanceof StampClaimError) {
+      console.warn(`[auth] hub JWT rejected: ${err.message}`);
+      return { error: Response.json({ error: "Unauthorized", message: `token has a malformed write-stamp claim: ${err.message}` }, { status: 401 }) };
     }
     if (err instanceof MalformedScopedTagsError) {
       // Fail-closed (C0): a present-but-malformed `permissions.scoped_tags`

@@ -76,7 +76,9 @@ export function readImportReceipt(db: Database, id: string): ImportReceipt | nul
 export function importTargetDigest(db: Database, id: string): string {
   return hashContent(canonicalJson({
     note: db.prepare("SELECT id,content,path,metadata,extension,created_at,updated_at FROM notes WHERE id=?").get(id),
-    versions: db.prepare("SELECT * FROM note_versions WHERE note_id=? ORDER BY version_ix").all(id),
+    // The columns by name, as 0.9.0 had them: a column added later (0.9.1's via_kind) must not make a manifest planned
+    // before it stale.
+    versions: db.prepare("SELECT note_id,version_ix,content_hash,path,metadata,extension,superseded_at,actor,via,op,content_len,encoding,created_at FROM note_versions WHERE note_id=? ORDER BY version_ix").all(id),
   }));
 }
 export function importObservationDigest(rows: ImportedObservation[]): string {

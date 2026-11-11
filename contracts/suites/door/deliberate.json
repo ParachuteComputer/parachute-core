@@ -226,22 +226,6 @@
       "why": "A cloud-style door lists and links the account's sign-in keys at `/account/pubkeys` with the account credential. A box does it in its browser session at `/api/account/pubkeys` (a challenge, then the password again for the first key). Signing in with a linked key is the same call on both."
     },
     {
-      "id": "app-key-written-via",
-      "keys": [
-        "keys/app-key.written-via"
-      ],
-      "between": [
-        "box",
-        "personal"
-      ],
-      "releases": [
-        "0.9.1"
-      ],
-      "status": "drift",
-      "owner": "core 0.9.1 keys (T-414)",
-      "why": "A note written over REST with a named app key says `createdVia: key:<name>` on the personal door and `api` on the 0.9.1 box, so on a box the list of who wrote what can't tell two apps apart."
-    },
-    {
       "id": "box-cors-on-0.9",
       "keys": [
         "rest/cors.preflight"
@@ -289,6 +273,47 @@
       "status": "drift",
       "owner": "parachute-cloud, at its next core pin: call refuseTypesInTags (core tag-kind.ts) in rest/records.ts and pass it to addRecordTools in mcp-09.ts, or move rest/records.ts onto core's rest-records.ts",
       "why": "On the record door `tags` holds plain labels (SPEC \u00a72.4). From 0.9.1 a box refuses a type's name in `tags` with 422 `tag_kind` and the fix (`types: [...]`), on `/api/records` and on create-record/update-record, and writes nothing. The personal door still accepts it and files the name as the type. Send a type's name in `types`: that works on both."
+    },
+    {
+      "id": "on-behalf-of",
+      "keys": [
+        "has/on-behalf-of",
+        "keys/on-behalf.*"
+      ],
+      "between": [
+        "box",
+        "personal"
+      ],
+      "releases": [
+        "0.9.1"
+      ],
+      "lacks": [
+        "personal"
+      ],
+      "status": "drift",
+      "owner": "parachute-cloud 0.9.1 follow-up: the cloud vault worker's twin of the write stamp (call core write-stamp.ts resolveBy, read the top-level `key` claim (the personal door mints `permissions.app_key`) and enforce `permissions.acts_for`) and identity's mint of on_behalf_of",
+      "why": "A key the owner lets write on behalf of others (`POST /account/keys {..., on_behalf_of: true}`) stamps `by <key name>:<id>` from the `Parachute-On-Behalf-Of` header or the MCP `on_behalf_of` parameter, and a key without the grant is refused. The box has it; the personal door's mint refuses the field and its vault worker would accept a token carrying `acts_for` without enforcing it, so the contracts don't run there.",
+      "note": "When the cloud vault worker has the twin, delete this entry rather than narrowing it."
+    },
+    {
+      "id": "revision-key-kind",
+      "keys": [
+        "has/revision-key-kind",
+        "keys/write-stamp.revision.kind"
+      ],
+      "between": [
+        "box",
+        "personal"
+      ],
+      "releases": [
+        "0.9.1"
+      ],
+      "lacks": [
+        "personal"
+      ],
+      "status": "drift",
+      "owner": "parachute-cloud, at its next core pin: record the key's kind (core write-stamp.ts rememberKeyKind) when it reads the key's name; identity mints `permissions.app_key` with no kind yet",
+      "why": "Each kept revision says what kind of key replaced it (`via_kind`: person, agent, app, service) on the box. The personal door's revisions carry `via key:<name>` but no kind yet."
     }
   ]
 }
