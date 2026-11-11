@@ -423,6 +423,8 @@ export function renderConsent(props: ConsentViewProps): string {
         // only way this flow can produce a useful token.
         `<li class="scope scope-empty">This app didn't ask for any specific access. Choose what to grant below — without a selection its token won't be able to do anything.</li>`
       : uniqueScopes.map((wire, i) => renderScopeRow(wire, displayedScopes[i] ?? wire)).join("\n");
+  // 0.9.1 (SPEC §3.4): a vault grant reaches the whole vault at its level, and what the app reads leaves the box.
+  const readsVault = displayedScopes.some((sc) => sc.startsWith("vault:"));
   const extrasSection = renderGrantableExtras(grantableExtras ?? [], displayedScopes.length === 0);
   const pickerSection = vaultPicker ? renderVaultPicker(vaultPicker) : "";
   const levelsSection = vaultLevels ? renderVaultLevels(vaultLevels) : "";
@@ -520,6 +522,7 @@ export function renderConsent(props: ConsentViewProps): string {
       <section class="scopes">
         <h2 class="scopes-title">Permissions requested</h2>
         <ul class="scope-list">${scopeRows}</ul>
+        ${readsVault ? `<p class="scope-vendor-note">What this app reads from your vault goes to the company that runs it.</p>` : ""}
       </section>
       <form method="POST" action="/oauth/authorize" class="auth-form consent-form">
         <input type="hidden" name="__action" value="consent" />
@@ -1506,6 +1509,7 @@ const STYLES = `
     flex-direction: column;
     gap: 0.5rem;
   }
+  .scope-vendor-note { color: ${PALETTE.fgDim}; font-size: 0.85rem; margin: 0.6rem 0 0; }
   .scope {
     border: 1px solid ${PALETTE.border};
     border-radius: 6px;

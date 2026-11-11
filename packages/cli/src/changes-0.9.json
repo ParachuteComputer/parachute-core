@@ -683,7 +683,7 @@
    "old": "query-notes",
    "new": "query-records",
    "action": "rename",
-   "reason": "record is the noun (Aaron, 11-07): the old name is an alias through 0.9, counted per use",
+   "reason": "record is the noun (Aaron, 11-07): the old name is an alias through 0.9, counted per use; from 0.9.1 a successful call adds a second text block telling a client with a stale tool list to refresh (the JSON block is unchanged)",
    "since": "0.9",
    "removed_in": "1.0",
    "state": "live"
@@ -693,7 +693,7 @@
    "old": "create-note",
    "new": "create-record",
    "action": "rename",
-   "reason": "record is the noun (Aaron, 11-07): the old name is an alias through 0.9, counted per use",
+   "reason": "record is the noun (Aaron, 11-07): the old name is an alias through 0.9, counted per use; from 0.9.1 a successful call adds a second text block telling a client with a stale tool list to refresh (the JSON block is unchanged)",
    "since": "0.9",
    "removed_in": "1.0",
    "state": "live"
@@ -703,7 +703,7 @@
    "old": "update-note",
    "new": "update-record",
    "action": "rename",
-   "reason": "record is the noun (Aaron, 11-07): the old name is an alias through 0.9, counted per use",
+   "reason": "record is the noun (Aaron, 11-07): the old name is an alias through 0.9, counted per use; from 0.9.1 a successful call adds a second text block telling a client with a stale tool list to refresh (the JSON block is unchanged)",
    "since": "0.9",
    "removed_in": "1.0",
    "state": "live"
@@ -713,7 +713,7 @@
    "old": "delete-note",
    "new": "delete-record",
    "action": "rename",
-   "reason": "record is the noun (Aaron, 11-07): the old name is an alias through 0.9, counted per use",
+   "reason": "record is the noun (Aaron, 11-07): the old name is an alias through 0.9, counted per use; from 0.9.1 a successful call adds a second text block telling a client with a stale tool list to refresh (the JSON block is unchanged)",
    "since": "0.9",
    "removed_in": "1.0",
    "state": "live"
@@ -723,7 +723,7 @@
    "old": "list-tags",
    "new": "list-types",
    "action": "rename",
-   "reason": "record is the noun (Aaron, 11-07): the old name is an alias through 0.9, counted per use",
+   "reason": "record is the noun (Aaron, 11-07): the old name is an alias through 0.9, counted per use; from 0.9.1 a successful call adds a second text block telling a client with a stale tool list to refresh (the JSON block is unchanged)",
    "since": "0.9",
    "removed_in": "1.0",
    "state": "live"
@@ -1380,10 +1380,10 @@
   },
   {
    "kind": "credential",
-   "old": "pvk_ YAML API keys (still minted on first boot)",
+   "old": "pvk_ YAML API keys",
    "new": "a key with scopes",
    "action": "drop",
-   "reason": "stop minting in 0.9, warn on use, refuse at 1.0",
+   "reason": "first boot stopped minting one in 0.9.1; warn on use, refuse at 1.0",
    "since": "0.9",
    "removed_in": "1.0",
    "state": "planned"
