@@ -105,8 +105,8 @@ export interface OnBehalfRefusal {
 }
 
 /**
- * The "by" a write carries. `supplied` is the raw value the request gave (header or parameter; undefined/null when it
- * gave none), `actsFor` the token's prefix (null without the permission), `actor` the token's own principal.
+ * The "by" a write carries. `supplied` is the raw value the request gave (header or parameter; undefined when it gave
+ * none: a parameter sent as null is a value, and refused like any other), `actsFor` the token's prefix (null without the permission), `actor` the token's own principal.
  * A supplied value without the permission is refused, never ignored; a bad id is refused. Nothing here opens access.
  */
 export function resolveBy(
@@ -115,7 +115,7 @@ export function resolveBy(
   actor: string | null,
   channel: "rest" | "mcp",
 ): { by: string | null } | { refusal: OnBehalfRefusal } {
-  if (supplied === undefined || supplied === null) return { by: actor };
+  if (supplied === undefined) return { by: actor };
   const field = channel === "rest" ? ON_BEHALF_HEADER : ON_BEHALF_PARAM;
   if (actsFor === null) {
     return {

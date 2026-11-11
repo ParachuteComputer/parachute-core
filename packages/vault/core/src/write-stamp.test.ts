@@ -5,7 +5,9 @@ import { grantNameProblem, parseActsForClaim, parseKeyClaim, prefixProblem, reso
 describe("resolveBy", () => {
   test("no value: the token's own principal", () => {
     expect(resolveBy(undefined, null, "u1", "rest")).toEqual({ by: "u1" });
-    expect(resolveBy(null, "fernhill", "u1", "mcp")).toEqual({ by: "u1" });
+    // A parameter sent as null is a value, not an absence: refused like any other.
+    expect("refusal" in resolveBy(null, null, "u1", "mcp")).toBe(true);
+    expect("refusal" in resolveBy(null, "fernhill", "u1", "mcp")).toBe(true);
   });
 
   test("a value without the permission is refused, never ignored, and names how the owner grants it", () => {

@@ -74,6 +74,7 @@ import {
   revokeFamily,
   signAccessToken,
   signRefreshToken,
+  KeyNameTakenError,
 } from "./jwt-sign.ts";
 import {
   type AuthorizeFormParams,
@@ -2943,45 +2944,56 @@ async function handleTokenAuthorizationCode(
   try {
     // The write stamp (ROADMAP 0.9.1): an approved app is a key named for its client, one per grant (refresh
     // family), so the vault stamps its writes `via key:<name>`. Named before signing; the family's key gets it.
-    const appKeyName = nextKeyName(db, { subject: null, user_id: redeemed.userId, client_id: redeemed.clientId, created_via: "oauth_refresh" });
-    const appKey = keyClaim(appKeyName, "app");
-    const access = await signAccessToken(db, {
-      sub: redeemed.userId,
-      scopes: redeemed.scopes,
-      audience,
-      clientId: redeemed.clientId,
-      issuer: deps.issuer,
-      ...("key" in appKey ? { extraClaims: appKey } : {}),
-      // vault_scope claim — Phase 2 per-user vault pin (Phase 1 had a single
-      // `assigned_vault` column; Phase 2 PR 2 generalized to `assigned_vaults`
-      // via `user_vaults`). Non-empty list for non-admin users with at least
-      // one assigned vault; empty for first-admin (unrestricted sentinel).
-      // Zero-vault non-admin is also empty by `vaultScopeForUser`, but the
-      // OAuth flow refuses to mint a vault-scoped token for them upstream
-      // (see the zero-vault gate in `handleConsentSubmit` + the same-hub
-      // auto-trust posture check), so we never reach here with that user
-      // posture. The narrowing in `handleConsentSubmit` already rewrote
-      // `vault:<verb>` → `vault:<assigned>:<verb>`, so the auth code's
-      // scopes are pre-aligned; this claim is the explicit "owned vaults"
-      // signal PR 5 consumes downstream.
-      vaultScope: vaultScopeForUser(db, redeemed.userId),
-      now: deps.now,
-    });
-    // Phase 1 (#212) registry exemption: code-grant access tokens piggyback
-    // on the paired refresh token's `tokens` row (they share `jti` by
-    // design). We don't write a separate access-token row — revocation acts
-    // on the shared jti / family, and the 15-min access TTL bounds the
-    // window before per-jti re-validation is needed. A separate per-jti
-    // access-token row would double registry write volume on every OAuth
-    // grant + every refresh rotation; not worth the trade today.
-    const refresh = signRefreshToken(db, {
-      jti: access.jti,
-      userId: redeemed.userId,
-      clientId: redeemed.clientId,
-      scopes: redeemed.scopes,
-      ...("key" in appKey ? { keyName: appKeyName } : {}),
-      now: deps.now,
-    });
+    let access!: Awaited<ReturnType<typeof signAccessToken>>;
+    let refresh!: ReturnType<typeof signRefreshToken>;
+    for (let attempt = 1; ; attempt++) {
+      const appKeyName = nextKeyName(db, { subject: null, user_id: redeemed.userId, client_id: redeemed.clientId, created_via: "oauth_refresh" });
+      const appKey = keyClaim(appKeyName, "app");
+      access = await signAccessToken(db, {
+        sub: redeemed.userId,
+        scopes: redeemed.scopes,
+        audience,
+        clientId: redeemed.clientId,
+        issuer: deps.issuer,
+        ...("key" in appKey ? { extraClaims: appKey } : {}),
+        // vault_scope claim — Phase 2 per-user vault pin (Phase 1 had a single
+        // `assigned_vault` column; Phase 2 PR 2 generalized to `assigned_vaults`
+        // via `user_vaults`). Non-empty list for non-admin users with at least
+        // one assigned vault; empty for first-admin (unrestricted sentinel).
+        // Zero-vault non-admin is also empty by `vaultScopeForUser`, but the
+        // OAuth flow refuses to mint a vault-scoped token for them upstream
+        // (see the zero-vault gate in `handleConsentSubmit` + the same-hub
+        // auto-trust posture check), so we never reach here with that user
+        // posture. The narrowing in `handleConsentSubmit` already rewrote
+        // `vault:<verb>` → `vault:<assigned>:<verb>`, so the auth code's
+        // scopes are pre-aligned; this claim is the explicit "owned vaults"
+        // signal PR 5 consumes downstream.
+        vaultScope: vaultScopeForUser(db, redeemed.userId),
+        now: deps.now,
+      });
+      // Phase 1 (#212) registry exemption: code-grant access tokens piggyback
+      // on the paired refresh token's `tokens` row (they share `jti` by
+      // design). We don't write a separate access-token row — revocation acts
+      // on the shared jti / family, and the 15-min access TTL bounds the
+      // window before per-jti re-validation is needed. A separate per-jti
+      // access-token row would double registry write volume on every OAuth
+      // grant + every refresh rotation; not worth the trade today.
+      try {
+        refresh = signRefreshToken(db, {
+          jti: access.jti,
+          userId: redeemed.userId,
+          clientId: redeemed.clientId,
+          scopes: redeemed.scopes,
+          ...("key" in appKey ? { keyName: appKeyName } : {}),
+          now: deps.now,
+        });
+        break;
+      } catch (err) {
+        // Another grant took the predicted name between signing and recording: nothing was kept; sign again.
+        if (err instanceof KeyNameTakenError && attempt < 5) continue;
+        throw err;
+      }
+    }
     const services = buildServicesCatalog(
       (deps.loadServicesManifest ?? readServicesManifest)(),
       deps.issuer,

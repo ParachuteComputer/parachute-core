@@ -87,7 +87,8 @@ vault stamps that key's writes `via key:<name>` (kept on MCP, like `nostr:`). To
 older vault ignores it (stamping `api`) instead of refusing the key after a rollback; the vault reads it from the
 payload whose signature it has just checked. A key the owner let write on behalf of others also carries
 `permissions.acts_for`, which an older vault refuses, as it must. When a token has both a signing pubkey and a key,
-`nostr:<pubkey>` wins, as on the personal door. Unlike `principal_pubkey` both fail closed when malformed.
+the key wins (a box never mints both, and a pubkey asked for at a mint must not hide the key's name; the personal door
+still lets the pubkey win). Unlike `principal_pubkey` both fail closed when malformed.
 See [the write stamp](../HTTP_API.md#the-write-stamp-via-and-by-091) and `core/src/write-stamp.ts`.
 
 **The vault side must ship before the hub side.** A hub that emits the claim

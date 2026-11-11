@@ -484,8 +484,16 @@ export async function handleApiMintToken(req: Request, deps: ApiMintTokenDeps): 
   // The write stamp (ROADMAP 0.9.1): a pass minted by a named key carries that key's name and on-behalf-of prefix
   // unchanged, so a key can't mint itself out of its own stamp; a minter with no name may name the new key.
   const carried = carriedPermissions(bearerPermissions);
-  // The minter's own key claim (top-level, `{name, kind}`), passed on unchanged.
+  // The minter's own key claim (top-level, `{name, kind}`), passed on unchanged. Its passes are listed as keys under
+  // its name (`<name>-2`, …), never under a label they choose, so a child can't squat another name.
   let keyClaimOut: unknown = bearerKey;
+  if (bearerKey !== undefined) {
+    if (permissionsClaim && "principal_pubkey" in permissionsClaim) {
+      return jsonError(400, "invalid_request", "a pass a named key mints is stamped with that key's name; it can't name a signing key (principal_pubkey)");
+    }
+    const parentName = (bearerKey as { name?: unknown } | null)?.name;
+    if (typeof parentName === "string") subjectLabel = parentName;
+  }
   let keyName: string | undefined;
   if (body.name !== undefined) {
     if (typeof body.name !== "string" || !KEY_NAME_RE.test(body.name)) {

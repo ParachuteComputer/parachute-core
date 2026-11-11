@@ -111,6 +111,8 @@ describe("safety/on-behalf: the grant", () => {
     expect((await mint({ permissions: { acts_for: "unforced.dev" } })).status).toBe(400);
     expect((await mint({ permissions: { key: { name: "other", kind: "app" } } })).status).toBe(400);
     expect((await mint({ name: `renamed-${id()}` })).status).toBe(400);
+    // Nor can it name a signer: a signing key's `via` (nostr:<pubkey>) would hide the key's own name.
+    expect((await mint({ permissions: { principal_pubkey: "ab".repeat(32) } })).status).toBe(400);
     // Its child stamps the same way: by <name>:<id>, via key:<name>.
     const path = `onbehalf/child/${id()}`;
     expect((await api(child.body.token, "POST", "/notes", { content: "via the child", path }, { [HEADER]: "client-7" })).status).toBe(201);
@@ -234,10 +236,12 @@ describe("safety/on-behalf: MCP", () => {
         ["create-note", { content: "no", path: `onbehalf/mcp-plain/${id()}` }],
         ["create-record", { body: "no", path: `onbehalf/mcp-plain/${id()}` }],
       ] as const) {
-        const err = await c.call(tool, { ...args, on_behalf_of: "client-42" }).then(() => null, (e: Error) => e);
-        expect(err, tool).toBeInstanceOf(Error);
-        expect(err!.message, tool).toContain("on_behalf_of: true");
-        expect((await record(args.path)).status, tool).toBe(404);
+        for (const value of ["client-42", null]) {
+          const err = await c.call(tool, { ...args, on_behalf_of: value }).then(() => null, (e: Error) => e);
+          expect(err, `${tool} ${value}`).toBeInstanceOf(Error);
+          expect(err!.message, tool).toContain("on_behalf_of: true");
+          expect((await record(args.path)).status, tool).toBe(404);
+        }
       }
     } finally {
       await c.close();

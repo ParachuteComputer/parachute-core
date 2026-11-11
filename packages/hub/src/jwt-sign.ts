@@ -261,6 +261,7 @@ export function signRefreshToken(db: Database, opts: SignRefreshTokenOpts): Sign
   // Resolved at INSERT time so the row records what was true when the
   // credential was minted; a later unlink does not rewrite it.
   const subjectPubkey = attributionPubkey(db, { userId: opts.userId });
+  const insert = () => {
   try {
     db.prepare(
       `INSERT INTO tokens (jti, user_id, client_id, scopes, refresh_token_hash, family_id, expires_at, created_at, created_via, subject_pubkey)
@@ -283,6 +284,18 @@ export function signRefreshToken(db: Database, opts: SignRefreshTokenOpts): Sign
     );
   }
   keyForMint(db, opts.jti, familyId, opts.keyName);
+  };
+  if (opts.keyName === undefined) insert();
+  else {
+    // The access token already names this key: record the row and its key in one step, or nothing (a name another
+    // grant took meanwhile → KeyNameTakenError, and the caller signs again under the next name).
+    try {
+      db.transaction(insert).immediate();
+    } catch (err) {
+      if (err instanceof Error && /UNIQUE constraint failed: keys\.name/.test(err.message)) throw new KeyNameTakenError(opts.keyName);
+      throw err;
+    }
+  }
   return { token, refreshTokenHash, familyId, expiresAt };
 }
 

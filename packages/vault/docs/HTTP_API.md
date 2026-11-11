@@ -218,7 +218,7 @@ Refusals, before anything is written:
 |---|---|---|
 | The header (or `on_behalf_of`) from a key without the permission | 403 | `on_behalf_not_granted` |
 | An id outside the rule | 400 | `invalid_on_behalf_of` |
-| The header on a write that records no writer (attachments, tag schemas, vault config) | 400 | `on_behalf_not_recorded` |
+| The header on a write that records no writer (attachments, history erases, tag schemas, vault config) | 400 | `on_behalf_not_recorded` |
 | A token whose `permissions` carry a key this vault doesn't enforce, or a malformed `key`/`acts_for` | 401 | — |
 
 A read (GET) with the header is answered as usual. On-behalf-of never opens access: scope and level are the token's.

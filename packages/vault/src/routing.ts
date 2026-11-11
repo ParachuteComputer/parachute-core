@@ -143,17 +143,18 @@ import { ON_BEHALF_HEADER, resolveBy } from "../core/src/write-stamp.ts";
  */
 function stampsWriter(method: string, apiPath: string): boolean {
   if (method === "GET" || method === "HEAD" || method === "OPTIONS") return true;
-  if (/^\/(notes|records)(\/|$|\?)/.test(apiPath)) return !/\/attachments(\/|$)/.test(apiPath);
+  // Attachments and history erases (DELETE …/versions) record no writer; restore (POST …/restore) does.
+  if (/^\/(notes|records)(\/|$|\?)/.test(apiPath)) return !/\/(attachments|versions)(\/|$)/.test(apiPath);
   return /^\/(tags|types)\/[^/]+\/rename$/.test(apiPath);
 }
 
 /** The "by" a REST request writes with, or the refusal (as a Response). */
 export function restWriteStamp(req: Request, apiPath: string, auth: AuthResult): { by: string | null } | { refusal: Response } {
-  const supplied = req.headers.get(ON_BEHALF_HEADER);
+  const supplied = req.headers.get(ON_BEHALF_HEADER) ?? undefined;
   const r = resolveBy(supplied, auth.acts_for ?? null, auth.actor, "rest");
   const refuse = (status: number, body: Record<string, unknown>) => ({ refusal: Response.json({ error: body.message, ...body }, { status }) });
   if ("refusal" in r) return refuse(r.refusal.status, { ...r.refusal });
-  if (supplied !== null && !stampsWriter(req.method, apiPath)) {
+  if (supplied !== undefined && !stampsWriter(req.method, apiPath)) {
     return refuse(400, {
       error_type: "on_behalf_not_recorded",
       field: ON_BEHALF_HEADER,

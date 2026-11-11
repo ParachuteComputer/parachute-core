@@ -751,7 +751,9 @@ async function authenticateHubJwt(
       // `actor` is untouched on purpose: it stays the hub USER id, so two
       // agents sharing a hub user keep one `created_by` and are told apart by
       // `created_via` / `last_updated_via`.
-      via: principalPubkey !== null ? nostrVia(principalPubkey) : key !== null ? keyVia(key.name) : "api",
+      // A named key wins over a signing pubkey: the key is what authenticated, and only the hub signs its name in.
+      // (A box never mints both; this keeps a pubkey asked for at a mint from hiding the key's name.)
+      via: key !== null ? keyVia(key.name) : principalPubkey !== null ? nostrVia(principalPubkey) : "api",
       key,
       acts_for: actsFor,
     };
