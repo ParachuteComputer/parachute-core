@@ -1030,6 +1030,16 @@
   },
   {
    "kind": "endpoint",
+   "old": "hub /account/mcp: a connection reaches every vault at the person's role",
+   "new": "one multi-vault door: each vault at the key's level",
+   "action": "keep",
+   "reason": "from 0.9.1: POST /account/keys {name, vaults: {<v>: read|write}} mints one key for several vaults; the account door's OAuth consent offers none / read / write per vault; writes name the vault and are stamped via key:<name>. A grant from before 0.9.1 keeps the person's role (a decision for Aaron)",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "endpoint",
    "old": "root /mcp (vault from token), hub /account/mcp, /mcp",
    "new": "/mcp (account door, `vault` argument)",
    "action": "merge",

@@ -32,7 +32,6 @@ import {
   type ComposedVaultVerb,
   accountVaultsGrant,
   composedAccountGrant,
-  composedVerbSatisfies,
 } from "@openparachute/door-contract";
 import { type AccountVaultMeta, listVaultsWithMeta } from "./account-api.ts";
 import { HOST_ADMIN_SCOPE, provisionVault } from "./admin-vaults.ts";
@@ -44,6 +43,8 @@ import {
   revokeAccess,
 } from "./grant-access.ts";
 import type { SignAccessTokenOpts } from "./jwt-sign.ts";
+import { keyLevelOnVault, levelSatisfies } from "./key-level.ts";
+import type { KeyClaim } from "./keys.ts";
 import { getUserById, isHubAdmin, vaultVerbsForUserVault } from "./users.ts";
 
 /** Hub account sentinel — account ≡ box. */
@@ -59,6 +60,11 @@ export type AccountMcpAuthKind = "bearer" | "nostr";
 
 export interface AccountConnectionGrant {
   wildcard: ComposedVaultVerb | null;
+  /**
+   * True when the wildcard is a 0.9.0 coverage scope with no level (`account:vaults`, `account:self:vaults`):
+   * the person's role applies there. A verb-carrying `account:self:vaults:*:<verb>` caps at its verb (key-level.ts).
+   */
+  levelless: boolean;
   vaults: Map<string, ComposedVaultVerb>;
   create: boolean;
 }
@@ -82,6 +88,19 @@ export interface AccountMcpPrincipal {
    * identifier whose format is a display choice.
    */
   pubkey?: string;
+  /**
+   * The named key this Bearer is (its signed top-level `key` claim, `{name, kind}`; keys.ts `KeyClaim`). The hop to
+   * each vault carries it unchanged, so a write through the account door is stamped `via key:<name>`, exactly as the
+   * same key writing at a vault door (vault core write-stamp.ts). Read only from the token the hub signed, never
+   * from the request. Absent for NIP-98 and for credentials that are not named keys.
+   */
+  key?: KeyClaim;
+  /**
+   * The `jti` of the Bearer this request came with. The hop cache is keyed by it (account-mcp-backend.ts), so a hop
+   * minted for one key is never handed to another, and a revoked key, refused at the door on every request, can
+   * never reach its cached hop again.
+   */
+  tokenId?: string;
   /** First-admin, or a Bearer that already carries host:admin. */
   isHubAdmin: boolean;
   /** Present on Bearer (null only for NIP-98). host:admin is a synthetic wildcard. */
@@ -149,24 +168,27 @@ export function buildAccountConnectionGrant(
   let wildcard = composed.wildcard;
   const vaults = new Map(composed.vaults);
   let create = composed.create;
+  let levelless = false;
   if (scopes.includes(ACCOUNT_VAULTS_UNNARROWED)) {
     create = true;
+    levelless = true;
     if (wildcard === null) wildcard = "read";
   }
   const legacy = accountVaultsGrant(scopes, accountId);
   if (legacy !== null) {
     create = true;
     if ("blanket" in legacy) {
+      levelless = true;
       if (wildcard === null) wildcard = "read";
     } else {
       for (const name of legacy.vaults) raiseVaultVerb(vaults, name, "read");
     }
   }
   if (scopes.includes(HOST_ADMIN_SCOPE)) {
-    return { wildcard: "admin", vaults, create: true };
+    return { wildcard: "admin", levelless: false, vaults, create: true };
   }
   const opensDoor = wildcard !== null || vaults.size > 0 || create;
-  return opensDoor ? { wildcard, vaults, create } : null;
+  return opensDoor ? { wildcard, levelless, vaults, create } : null;
 }
 
 function canCreate(principal: AccountMcpPrincipal): boolean {
@@ -230,51 +252,32 @@ export function installedVaults(ctx: AccountToolContext): AccountVaultMeta[] {
   return listVaultsWithMeta(ctx.manifestPath, ctx.issuer);
 }
 
-function isUnrestricted(db: Database, principal: AccountMcpPrincipal): boolean {
-  return principal.isHubAdmin || isHubAdmin(db, principal.userId);
-}
-
 /**
- * Per-call write check. Opening the account door (list/query) is not write.
- * First-admin / host:admin are unrestricted. Everyone else needs the `write`
- * verb on that vault's `user_vaults` row. A Bearer named subset that does not
- * include the vault cannot write it even if assignment would allow.
+ * Per-call write check: the key's level on that vault is at least write (`keyLevelOnVault`, the 1.0 grants seam).
+ * Opening the account door (list/query) is not write.
  */
 export function canWriteVault(
   db: Database,
   principal: AccountMcpPrincipal,
   vaultName: string,
 ): boolean {
-  // Bearer coverage / named-verb BEFORE unrestricted — same order as
-  // callerCanAdminVault. A first-admin token named `…:beta:read` must not
-  // mint `vault:beta:write`. Coverage wildcards (`account:vaults`) are not
-  // a verb cap; first-admin still writes after the named-verb check.
-  if (principal.authKind === "bearer") {
-    const grant = principal.grant;
-    if (!grant) return false;
-    if (grant.wildcard === null && !grant.vaults.has(vaultName)) return false;
-    const named = grant.vaults.get(vaultName);
-    if (named !== undefined && !composedVerbSatisfies(named, "write")) return false;
-    if (grant.wildcard === "admin") return true;
-    if (isUnrestricted(db, principal)) return true;
-    return vaultVerbsForUserVault(db, principal.userId, vaultName)?.includes("write") === true;
-  }
-  if (isUnrestricted(db, principal)) return true;
-  return vaultVerbsForUserVault(db, principal.userId, vaultName)?.includes("write") === true;
+  return levelSatisfies(keyLevelOnVault(db, principal, vaultName), "write");
 }
 
-/** Highest verb this principal actually holds on `vaultName`. */
+/** The verb of the hop token for `vaultName`: the key's level there (`keyLevelOnVault`), never the person's role. */
 export function verbForVault(ctx: AccountToolContext, vaultName: string): ComposedVaultVerb {
-  if (callerCanAdminVault(ctx.db, ctx.principal, vaultName)) return "admin";
-  if (canWriteVault(ctx.db, ctx.principal, vaultName)) return "write";
-  return "read";
+  const level = keyLevelOnVault(ctx.db, ctx.principal, vaultName);
+  // Coverage only lists vaults this connection reaches, so no level here is a bug: refuse rather than mint a guess.
+  if (level === null) throw new AccountToolError("forbidden", `this connection has no access to vault "${vaultName}"`);
+  return level;
 }
 
 const listVaultsTool: AccountMcpTool = {
   name: "list-vaults",
   description:
     "List the vaults this connection can reach. Returns each vault's name, URL, and version, " +
-    "plus whether the grant covers ALL of the hub's vaults or a specific listed subset.",
+    "plus whether the grant covers ALL of the hub's vaults or a specific listed subset. " +
+    "Catalog caveat: the other tools are listed from your highest-level vault; a vault where you hold less may refuse one.",
   inputSchema: { type: "object", properties: {}, additionalProperties: false },
   async execute(_args, ctx) {
     const coverage = resolveCoverage(ctx.db, ctx.principal, installedVaults(ctx));

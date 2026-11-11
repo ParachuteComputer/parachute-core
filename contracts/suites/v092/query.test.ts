@@ -16,16 +16,18 @@ const tag = runId("q092");
 const f = runId("f");
 // Plain (declared, not indexed) and indexed twins with the same values; `colour` is declared by no type at all.
 const [stage, stageIx, points, pointsIx, colour] = [`stage_${f}`, `stageix_${f}`, `points_${f}`, `pointsix_${f}`, `colour_${f}`];
+// A float field can't be indexed, so it has no twin: its scan is checked against the numbers themselves.
+const price = `price_${f}`;
 const r = runId("q");
 const word = `quokka${runId("w")}`;
 
 const records = [
-  { name: "a", stage: "open", points: 1, colour: "blue" },
-  { name: "b", stage: "open", points: 5, colour: "red" },
-  { name: "c", stage: "done", points: 8, colour: "blue" },
-  { name: "d", stage: "review", points: 13 },
+  { name: "a", stage: "open", points: 1, colour: "blue", price: 4.25 },
+  { name: "b", stage: "open", points: 5, colour: "red", price: 4.5 },
+  { name: "c", stage: "done", points: 8, colour: "blue", price: 10 },
+  { name: "d", stage: "review", points: 13, price: 9.99 },
   { name: "e" }, // carries the type but none of the fields
-];
+] as { name: string; stage?: string; points?: number; colour?: string; price?: number }[];
 
 const OPS: [string, string][] = [
   ["eq", "open"],
@@ -43,7 +45,7 @@ const NUMERIC = new Set(["gt", "gte", "lt", "lte"]);
 
 beforeAll(async () => {
   const put = await api.put(`/tags/${enc(tag)}`, {
-    fields: { [stage]: { type: "string" }, [stageIx]: { type: "string", indexed: true }, [points]: { type: "integer" }, [pointsIx]: { type: "integer", indexed: true } },
+    fields: { [stage]: { type: "string" }, [stageIx]: { type: "string", indexed: true }, [points]: { type: "integer" }, [pointsIx]: { type: "integer", indexed: true }, [price]: { type: "number" } },
   });
   if (put.status !== 200) throw new Error(`setup: declaring ${tag} gave ${put.status} ${said(put.body)}`);
   for (const x of records) {
@@ -51,6 +53,7 @@ beforeAll(async () => {
     if (x.stage) Object.assign(metadata, { [stage]: x.stage, [stageIx]: x.stage });
     if (x.points !== undefined) Object.assign(metadata, { [points]: x.points, [pointsIx]: x.points });
     if (x.colour) metadata[colour] = x.colour;
+    if (x.price !== undefined) metadata[price] = x.price;
     if (x.name === "c") metadata.note_line = `filed under ${word}`;
     const made = await writer.post("/notes", { content: "", path: `${r}/${x.name}`, tags: [tag], metadata });
     if (made.status !== 201) throw new Error(`setup: record ${x.name} gave ${made.status} ${said(made.body)}`);
@@ -68,7 +71,7 @@ describe("0.9.2 query fixes", () => {
   });
 
   for (const [op, v] of OPS) {
-    red(`a field that isn't indexed can be filtered with ${op}=${v}: the indexed answer, and a warning that it scanned`, { reason: /^refused: 400 FIELD_NOT_INDEXED/, lane: LANE }, async () => {
+    test(`a field that isn't indexed can be filtered with ${op}=${v}: the indexed answer, and a warning that it scanned`, async () => {
       const [plain, ix] = NUMERIC.has(op) ? [points, pointsIx] : [stage, stageIx];
       const want = paths((await writer.get(`/notes?tag=${tag}&meta[${ix}][${op}]=${v}`)).body);
       const got = await writer.get(`/notes?tag=${tag}&meta[${plain}][${op}]=${v}`);
@@ -78,20 +81,28 @@ describe("0.9.2 query fixes", () => {
     });
   }
 
-  red("a field no type declares can be filtered too", { reason: /^refused: 400 FIELD_NOT_INDEXED/, lane: LANE }, async () => {
+  test("a field no type declares can be filtered too", async () => {
     const got = await writer.get(`/notes?tag=${tag}&meta[${colour}][eq]=blue`);
     must(got.status === 200, `refused: ${got.status} ${got.body?.code ?? got.body?.error}`);
     must(said(paths(got.body)) === said([`${r}/a`, `${r}/c`]), `wrong rows: ${said(paths(got.body))}`);
   });
 
-  red("a field that isn't indexed can be sorted on, in the indexed order", { reason: /^refused: 400 FIELD_NOT_INDEXED/, lane: LANE }, async () => {
+  test("a field that isn't indexed can be sorted on, in the indexed order", async () => {
     const want = (await writer.get(`/notes?tag=${tag}&order_by=${pointsIx}&sort=desc`)).body.map((n: any) => n.path);
     const got = await writer.get(`/notes?tag=${tag}&order_by=${points}&sort=desc`);
     must(got.status === 200, `refused: ${got.status} ${got.body?.code ?? got.body?.error}`);
     must(said(got.body.map((n: any) => n.path)) === said(want), `wrong order: ${said(got.body.map((n: any) => n.path))}, indexed gives ${said(want)}`);
   });
 
-  red("over MCP, query-records filters a field that isn't indexed and says it scanned", { reason: /^refused: .*not indexed/, lane: LANE }, async () => {
+  test("a float field compares as a number: gt 4.5 is 10 and 9.99, not the text order", async () => {
+    const got = await writer.get(`/notes?tag=${tag}&meta[${price}][gt]=4.5&order_by=${price}&sort=desc`);
+    must(got.status === 200, `refused: ${got.status} ${got.body?.code ?? got.body?.error}`);
+    const order = got.body.map((n: any) => n.path);
+    must(said(order) === said([`${r}/c`, `${r}/d`]), `wrong rows or order: ${said(order)}`);
+    must(restWarnings(got).some((w) => /scan/i.test(w.code)), `no warning that it scanned: ${said(restWarnings(got))}`);
+  });
+
+  test("over MCP, query-records filters a field that isn't indexed and says it scanned", async () => {
     const m = await mcp("write");
     try {
       let got: any;

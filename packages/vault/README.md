@@ -552,7 +552,7 @@ curl -H "Authorization: Bearer $VAULT_TOKEN" \
 
 ### Sort by a metadata field
 
-Sort by something other than `created_at`. The field must be declared `indexed: true` in some tag schema first — that's what materializes the backing generated column + B-tree index. The "tag authorizes the index" pattern lives in [`core/src/indexed-fields.ts`](./core/src/indexed-fields.ts).
+Sort by something other than `created_at`. Any field works. A field declared `indexed: true` in some tag schema sorts on its generated column and B-tree index (the "tag authorizes the index" pattern lives in [`core/src/indexed-fields.ts`](./core/src/indexed-fields.ts)); any other field is sorted by reading every matching record, and the reply carries a `scan` warning.
 
 ```bash
 curl -H "Authorization: Bearer $VAULT_TOKEN" \
@@ -623,7 +623,7 @@ curl -H "Authorization: Bearer $VAULT_TOKEN" \
   "http://localhost:1940/vault/default/api/notes?meta[meeting-type]=study-session&include_content=true"
 ```
 
-Range, `in`, `not_in`, and `exists` operators require the field to be declared `indexed: true` (same gate as `order_by`):
+Range, `in`, `not_in`, and `exists` operators work on any field. On a field declared `indexed: true` they use its index; on any other field they read every record the other filters leave, give the same rows, and add a `scan` warning (`X-Parachute-Warnings`) naming the field to index:
 
 ```bash
 # Range — both bounds AND together on one field

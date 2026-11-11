@@ -10,7 +10,11 @@ import {
   buildPlainEqualityClause,
   isOperatorObject,
   QueryError,
+  buildScanClause,
   requireIndexedField,
+  scanAffinityFor,
+  scanOrderSql,
+  scanValueSql,
 } from "./query-operators.js";
 import {
   CURSOR_VERSION,
@@ -23,6 +27,7 @@ import {
   type QueryHashInputs,
 } from "./cursor.js";
 import { getIndexedField, releaseField } from "./indexed-fields.js";
+import { assertNoAggregateScan } from "./query-warnings.js";
 import { computeExpandedTagCounts, loadTagHierarchy, stripTagHash } from "./tag-hierarchy.js";
 import { chunkForInClause, IN_VIA_JSON_EACH, jsonEachParam } from "./sql-in.js";
 import {
@@ -1391,13 +1396,21 @@ export function buildFilterConditions(db: Database, opts: QueryOpts): { conditio
   if (opts.metadata) {
     for (const [key, value] of Object.entries(opts.metadata)) {
       if (isOperatorObject(value)) {
-        const indexedField = requireIndexedField(db, key);
+        const indexedField = getIndexedField(db, key);
         const ops = value as Record<string, unknown>;
+        if (!indexedField) {
+          // 0.9.2: a field that isn't indexed is scanned, not refused; the
+          // caller learns it scanned from `collectScanWarnings`.
+          const { sql, params: opParams } = buildScanClause(key, ops, scanAffinityFor(db, key));
+          conditions.push(sql);
+          params.push(...opParams);
+          continue;
+        }
         if (ops.eq !== undefined && ops.eq !== null) indexedEqualityDriver = true;
         if (Array.isArray(ops.in) && ops.in.length > 0) indexedEqualityDriver = true;
         const { sql, params: opParams } = buildOperatorClause(
           key,
-          value as Record<string, unknown>,
+          ops,
           indexedField.sqliteType,
         );
         conditions.push(sql);
@@ -1471,10 +1484,10 @@ export function buildFilterConditions(db: Database, opts: QueryOpts): { conditio
     } else if (isUpdatedAt) {
       column = "n.updated_at_ms";
     } else {
-      // Re-uses the same indexed-field gate as `metadata` operator queries
-      // and `orderBy` so the error message and contract are consistent.
-      requireIndexedField(db, field);
-      column = `"meta_${field}"`;
+      // An indexed field compares on its column; any other field is scanned
+      // as text (dates are ISO-8601 text), with the same `scan` warning as
+      // `metadata` operators and `orderBy`.
+      column = getIndexedField(db, field) ? `"meta_${field}"` : `CAST(${scanValueSql(field)} AS TEXT)`;
     }
     if (filter.from !== undefined) {
       const label = field === "created_at" ? "date_filter.from" : `date_filter.from (${field})`;
@@ -1630,6 +1643,11 @@ export function queryNotes(db: Database, opts: QueryOpts, _outUpdatedAtMs?: Map<
     // shipped for it. `id` is the explicit tiebreak for stable ordering when
     // two notes share a millisecond, matching the cursor keyset's tiebreak.
     orderBy = `n.updated_at_ms ${direction}, n.id ${direction}`;
+  } else if (opts.orderBy === "created_at") {
+    // 0.9.2: `created_at` names the notes column (it used to be refused as a
+    // field that isn't indexed; a metadata key of that name would shadow
+    // nothing useful), so it is the default order made explicit.
+    orderBy = `n.created_at ${direction}, n.id ${direction}`;
   } else if (opts.orderBy === "link_count") {
     // `link_count` is a pseudo-field — like `created_at`/`updated_at` in the
     // dateFilter block above, it bypasses `requireIndexedField` (it's not a
@@ -1657,12 +1675,16 @@ export function queryNotes(db: Database, opts: QueryOpts, _outUpdatedAtMs?: Map<
       `+ (SELECT COUNT(*) FROM links WHERE target_id = n.id)) ${direction}, ` +
       `n.created_at ${direction}`;
   } else if (opts.orderBy) {
-    requireIndexedField(db, opts.orderBy);
-    // `orderBy` came from indexed_fields (validated on declaration), so
-    // the column name is safe to interpolate. Append created_at as a
-    // stable tiebreaker so two rows with the same indexed value have a
+    // An indexed `orderBy` came from indexed_fields (validated on
+    // declaration), so the column name is safe to interpolate. Any other
+    // field sorts on a scan key with the indexed column's conversions
+    // (`scanOrderSql`; the caller gets a `scan` warning). Append created_at
+    // as a stable tiebreaker so two rows with the same value have a
     // deterministic order.
-    orderBy = `"meta_${opts.orderBy}" ${direction}, n.created_at ${direction}, n.id ${direction}`;
+    const key = getIndexedField(db, opts.orderBy)
+      ? `"meta_${opts.orderBy}"`
+      : scanOrderSql(opts.orderBy, scanAffinityFor(db, opts.orderBy));
+    orderBy = `${key} ${direction}, n.created_at ${direction}, n.id ${direction}`;
   } else {
     // id tiebreaker: same-millisecond inserts get deterministic relative
     // order — load-bearing now that the two-phase page fetch makes
@@ -1795,6 +1817,7 @@ export function aggregateNotes(db: Database, opts: QueryOpts): AggregateRow[] {
     );
   }
 
+  assertNoAggregateScan(db, opts);
   const { conditions, params } = buildFilterConditions(db, opts);
   const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
 

@@ -190,7 +190,7 @@ describe("signRefreshToken", () => {
     const { db, cleanup } = makeDb();
     try {
       const u = await createUser(db, "owner", "pw");
-      const { token, refreshTokenHash, expiresAt } = signRefreshToken(db, {
+      const { token, refreshTokenHash, expiresAt } = signRefreshToken(db, { artifactGeneration: () => 0,
         jti: "jti-1",
         userId: u.id,
         clientId: "notes",
@@ -227,7 +227,7 @@ describe("signRefreshToken", () => {
     try {
       const u = await createUser(db, "owner", "pw");
       const fixed = new Date("2026-04-26T00:00:00.000Z");
-      const { expiresAt } = signRefreshToken(db, {
+      const { expiresAt } = signRefreshToken(db, { artifactGeneration: () => 0,
         jti: "j",
         userId: u.id,
         clientId: "c",
@@ -244,7 +244,7 @@ describe("signRefreshToken", () => {
     const { db, cleanup } = makeDb();
     try {
       const u = await createUser(db, "owner", "pw");
-      signRefreshToken(db, {
+      signRefreshToken(db, { artifactGeneration: () => 0,
         jti: "duplicate-jti",
         userId: u.id,
         clientId: "c",
@@ -252,7 +252,7 @@ describe("signRefreshToken", () => {
       });
       let caught: unknown;
       try {
-        signRefreshToken(db, {
+        signRefreshToken(db, { artifactGeneration: () => 0,
           jti: "duplicate-jti",
           userId: u.id,
           clientId: "c",
@@ -273,14 +273,14 @@ describe("signRefreshToken", () => {
     try {
       const u = await createUser(db, "owner", "pw");
       // Seed the row that simulates the pre-rotation refresh token.
-      signRefreshToken(db, {
+      signRefreshToken(db, { artifactGeneration: () => 0,
         jti: "old-jti",
         userId: u.id,
         clientId: "c",
         scopes: [],
       });
       // Pre-insert a row at the new jti so the rotation INSERT will collide.
-      signRefreshToken(db, {
+      signRefreshToken(db, { artifactGeneration: () => 0,
         jti: "new-jti",
         userId: u.id,
         clientId: "c",
@@ -295,7 +295,7 @@ describe("signRefreshToken", () => {
             new Date().toISOString(),
             "old-jti",
           );
-          signRefreshToken(db, {
+          signRefreshToken(db, { artifactGeneration: () => 0,
             jti: "new-jti",
             userId: u.id,
             clientId: "c",
@@ -326,7 +326,7 @@ describe("findRefreshToken", () => {
     const { db, cleanup } = makeDb();
     try {
       const u = await createUser(db, "owner", "pw");
-      const { token } = signRefreshToken(db, {
+      const { token } = signRefreshToken(db, { artifactGeneration: () => 0,
         jti: "jti-1",
         userId: u.id,
         clientId: "c",
@@ -655,7 +655,7 @@ describe("token registry (hub#212 Phase 1)", () => {
       rotateSigningKey(db);
       const u = await createUser(db, "owner", "pw");
       // OAuth refresh row: userId set, subject NULL.
-      const refresh = signRefreshToken(db, {
+      const refresh = signRefreshToken(db, { artifactGeneration: () => 0,
         jti: "jti-oauth",
         userId: u.id,
         clientId: "parachute-hub",
@@ -686,7 +686,7 @@ describe("token registry (hub#212 Phase 1)", () => {
     try {
       rotateSigningKey(db);
       const u = await createUser(db, "owner", "pw");
-      signRefreshToken(db, {
+      signRefreshToken(db, { artifactGeneration: () => 0,
         jti: "jti-oauth-stamped",
         userId: u.id,
         clientId: "parachute-hub",
@@ -709,7 +709,7 @@ describe("rotation grace primitives (hub#685)", () => {
     try {
       rotateSigningKey(db);
       const u = await createUser(db, "owner", "pw");
-      signRefreshToken(db, {
+      signRefreshToken(db, { artifactGeneration: () => 0,
         jti: "pred",
         userId: u.id,
         clientId: "parachute-hub",
@@ -718,7 +718,7 @@ describe("rotation grace primitives (hub#685)", () => {
       });
       expect(findTokenRowByJti(db, "pred")?.rotatedTo).toBeNull();
 
-      signRefreshToken(db, {
+      signRefreshToken(db, { artifactGeneration: () => 0,
         jti: "succ",
         userId: u.id,
         clientId: "parachute-hub",
@@ -741,7 +741,7 @@ describe("rotation grace primitives (hub#685)", () => {
       const u = await createUser(db, "owner", "pw");
       const t0 = new Date("2026-06-24T00:00:00Z");
       for (const jti of ["a", "b", "c"]) {
-        signRefreshToken(db, {
+        signRefreshToken(db, { artifactGeneration: () => 0,
           jti,
           userId: u.id,
           clientId: "parachute-hub",
@@ -751,7 +751,7 @@ describe("rotation grace primitives (hub#685)", () => {
         });
       }
       // A different family — must never leak in.
-      signRefreshToken(db, {
+      signRefreshToken(db, { artifactGeneration: () => 0,
         jti: "other",
         userId: u.id,
         clientId: "parachute-hub",

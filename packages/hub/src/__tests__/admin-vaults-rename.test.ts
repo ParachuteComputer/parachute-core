@@ -135,7 +135,7 @@ async function seed() {
     clientId: client.clientId,
     issuer,
   });
-  const refresh = signRefreshToken(db, {
+  const refresh = signRefreshToken(db, { artifactGeneration: () => 0,
     jti: access.jti,
     userId: user.id,
     clientId: client.clientId,

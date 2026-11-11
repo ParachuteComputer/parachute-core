@@ -197,7 +197,9 @@ each kept revision (`actor`/`via`, plus `via_kind`):
   key from `POST /account/keys`, a key from `parachute keys new <name>`, or an approved OAuth app) writes as
   `key:<name>` on REST and MCP alike. A credential with no named key keeps the channel (`api`, `mcp`) or its class
   (`operator`, `nostr:<pubkey>`). A revision's `via_kind` is the kind of that key (`person`, `agent`, `app`,
-  `service`), or null; tag-scoped sessions don't receive it, as with `actor` and `via`.
+  `service`), or null; tag-scoped sessions don't receive it, as with `actor` and `via`. A key writing through the
+  account door (`/account/mcp`, including a key that covers several vaults) is stamped the same: the hub's hop to
+  the vault carries the key's name and kind.
 - **by** is the person the write was for: the token's subject (the key's owner), unless the vault's owner let the
   key write on behalf of others when minting it (`POST /account/keys {..., on_behalf_of: true}`, or
   `parachute keys new <name> --vault <v> --can write --on-behalf-of`). Then a write may send
@@ -1100,16 +1102,18 @@ Query params:
 
   Mixing shorthand and operator form on the same field is rejected.
 
-  **Every operator, including `exists`, requires the field to be declared
-  `indexed: true`** in a tag schema (`PUT /api/tags/{name}`) — operators route
-  through the generated column backing the index, so an undeclared field
-  errors loudly (`400 INVALID_QUERY`) rather than scanning every row's JSON.
-  This applies to `exists` too, even though "does this field exist anywhere"
-  reads like it ought to work on any field: `exists` is answered from the
-  SAME generated column every other operator uses, so it needs the field
-  indexed just like `eq`/`gt`/`in`/etc. The plain shorthand
-  (`meta[field]=value`) is the ONLY form that falls back to a `json_extract`
-  scan and works on a non-indexed field.
+  **Every operator works on any field** (0.9.2). On a field declared
+  `indexed: true` in a tag schema (`PUT /api/tags/{name}`) operators route
+  through the generated column backing the index. On any other field they
+  read every record's JSON that the other filters leave and give the same
+  rows the indexed column would, comparing the way a column of the field's
+  declared type does (`string`/`date`/`reference` as text;
+  `integer`/`boolean`/`number` as numbers; an undeclared field compares a
+  number-like value as a number and other text as text). The reply carries a
+  `scan` warning in `X-Parachute-Warnings` naming the fields; declare them
+  `indexed: true` to make the query fast (a `number` field can't be indexed).
+  The plain shorthand (`meta[field]=value`) has always read the JSON and
+  carries no warning.
 
   A query string carries no types, so a shorthand value that is exactly how
   JSON writes a boolean or number reads as one: `meta[done]=true` finds a stored
@@ -1289,8 +1293,9 @@ Query params:
     MEMBERSHIP — a note carrying N of the tags present in the filtered
     result set contributes to N separate groups; a membership rollup, not a
     partition) or an indexed metadata field name. A non-`"tag"` value must
-    be declared `indexed: true` in a tag schema — same `FIELD_NOT_INDEXED`
-    contract `meta[field][op]=` operators and `order_by` use. Required for
+    be declared `indexed: true` in a tag schema, or the request 400s
+    `FIELD_NOT_INDEXED` (filters and `order_by` scan a field that isn't
+    indexed; an aggregate doesn't, since its reply has no warnings). Required for
     `sum`; optional for `count`.
   - `aggregate[op]=count` — number of matching notes per group, or the
     filtered total when `group_by` is omitted.
@@ -1351,11 +1356,10 @@ Query params:
     previously said "by `updated_at`"; that's only true in cursor mode,
     which forces `updated_at ASC` keyset ordering and rejects `sort=desc`
     outright. Outside cursor mode, `sort` orders by `created_at`.)
-  - `order_by=<indexed metadata field>` — sort by a metadata field instead
-    of `created_at`; the field must be declared `indexed: true` in a tag
-    schema or the request 400s `invalid_query` / `FIELD_NOT_INDEXED` (vault#555
-    fix — this previously listed `created_at`/`updated_at` as example valid
-    values; `created_at` is not a metadata field, so it still errors). Two
+  - `order_by=<metadata field>` — sort by a metadata field instead of
+    `created_at`. An indexed field sorts on its index; any other field is
+    sorted by a scan, in the order an indexed column would give, with a `scan`
+    warning (0.9.2; before, it 400'd `FIELD_NOT_INDEXED`). Two
     special values need no `indexed: true` declaration: `link_count` sorts by
     global link DEGREE (see `include_link_count` above), even under tag scope;
     that ordering may disagree with the scoped `linkCount` field.
@@ -1375,7 +1379,7 @@ Query params:
 
 Error shapes notable to callers:
 
-- `400 INVALID_QUERY` — non-indexed `order_by`, unknown operator, cursor +
+- `400 INVALID_QUERY` — unknown operator, cursor +
   incompatible param, a malformed `metadata=` JSON alias (parse failure, or a
   non-object value), or supplying both the `metadata=` alias and bracket
   `meta[...]` forms, etc.

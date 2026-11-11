@@ -349,8 +349,8 @@ export interface SemanticSearchResult {
 export interface AggregateSpec {
   /**
    * What to group by: an indexed metadata field name (declared
-   * `indexed: true` in a tag schema — same FIELD_NOT_INDEXED contract
-   * `metadata` operator queries and `order_by` use), or the special value
+   * `indexed: true` in a tag schema, else FIELD_NOT_INDEXED; since 0.9.2
+   * only aggregate needs it, filters and `order_by` scan), or the special value
    * `"tag"` to group by tag membership. Under `"tag"`, a note carrying N of
    * the tags in the (filtered) result set contributes to N separate groups
    * — this is a membership rollup, not a partition.
@@ -559,8 +559,9 @@ export interface Store {
    * an indexed metadata field) and returns `[{group, value}]` — one row per
    * group, count or sum per `opts.aggregate.op`. `cursor`/`orderBy`/`sort`/
    * `limit`/`offset` on `opts` are ignored. Throws `QueryError` (code
-   * `FIELD_NOT_INDEXED`) when `group_by`/`field` isn't a declared indexed
-   * field, or `INVALID_QUERY` for a malformed `aggregate` spec (missing
+   * `FIELD_NOT_INDEXED`) when `group_by`/`field`, or a `metadata` operator
+   * or `dateFilter` field, isn't a declared indexed field (an aggregate
+   * doesn't scan: its reply has no warnings), or `INVALID_QUERY` for a malformed `aggregate` spec (missing
    * `field` on a `"sum"`, a non-numeric `field`, ...).
    */
   aggregateNotes(opts: QueryOpts): Promise<AggregateRow[]>;

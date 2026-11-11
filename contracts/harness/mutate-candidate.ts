@@ -84,9 +84,14 @@ for (const m of all.filter((m) => only.length === 0 || only.includes(m.name))) {
     if (m.processModel) console.log(`[${m.kind} ${m.name}] built as the ${m.processModel} path`);
     // focus: only the named contracts (a regex of their names, escaped), so a long suite file runs only what counts.
     const focusArgs = m.kind === "mutant" && m.focus ? ["-t", m.catches.map((c) => c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")] : [];
-    child = Bun.spawn(["bun", "run", "harness/run-candidate.ts", ...m.suite.split(" "), ...focusArgs], {
+    // A door contract (suites/door/) runs through the door harness, on this candidate as a box (it needs a door file).
+    const doorSuite = m.suite.split(" ").every((f) => f.startsWith("suites/door/"));
+    const cmd = doorSuite
+      ? ["bun", "run", "harness/doors/run.ts", "--doors", "box", ...m.suite.split(" ")]
+      : ["bun", "run", "harness/run-candidate.ts", ...m.suite.split(" "), ...focusArgs];
+    child = Bun.spawn(cmd, {
       cwd: contracts,
-      env: { ...process.env, CANDIDATE_DIR: cand, CANDIDATE_SHA256: "", CONTRACT_SHOW_LOGS: "0" },
+      env: { ...process.env, CANDIDATE_DIR: cand, CANDIDATE_SHA256: "", CONTRACT_SHOW_LOGS: "0", ...(doorSuite ? { DOOR_RESULTS: join(dir, "doors") } : {}) },
       stdout: "pipe",
       stderr: "pipe",
     });
