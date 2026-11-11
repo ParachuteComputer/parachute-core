@@ -2483,6 +2483,22 @@ where each finding is `{ type, severity, subject, detail, remedy, heuristic? }`:
   vocabulary, so one of its values coincidentally matching an unrelated
   live tag name no longer drags the enum's OTHER legitimate values into a
   false positive.
+- `mixed_type_field` (`warning`, 0.9.2) — a field that isn't indexed,
+  declared or not, holds values of more than one data type (string,
+  number, boolean, array, object), with the count of each and one example
+  record per type. Indexed fields keep `mixed_type_indexed_field`.
+- `declared_reference_gap` (`info`, 0.9.2) — a field whose text values name
+  another record (its path in any case, `[[path]]`, or its id) in more than
+  half of the records holding text in it, and that no type declares a
+  `reference`. The remedy names the `manage-types` call.
+- `near_names` (`info`, 0.9.2) — two type names, or two field names, one
+  edit apart (case aside). A series (`item1`/`item2`, `phase-a`/`phase-b`)
+  is left out; at most 25 pairs, most used first. Advice: both may be meant.
+
+The three 0.9.2 scans read every record's metadata (timed at about 0.6 s
+and 0.5 s at 94,000 records on a box). A scoped run counts only the records
+it may see, and a reference counts only when its target is one of them, so
+the report can't reveal whether a hidden path exists.
 
 **Tag-scope.** A tag-scoped admin token's scan covers only in-scope
 tags/fields/notes — the report is re-run with the caller's expanded

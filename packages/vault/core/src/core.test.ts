@@ -8202,11 +8202,26 @@ describe("schema inheritance via parent_names (vault#270)", async () => {
     expect(conflict).toBeDefined();
     expect(conflict.field).toBe("status");
     expect(conflict.schema).toBe("task"); // winner
-    // No enum_mismatch — the value is valid under task's enum.
-    const enumMismatch = result.validation_status.warnings.find(
+    // 0.9.2: the other parent's rules are checked too, and warn (never
+    // block): "todo" is valid under task's enum and fails publication's.
+    const enumMismatch = result.validation_status.warnings.filter(
       (w: any) => w.reason === "enum_mismatch",
     );
-    expect(enumMismatch).toBeUndefined();
+    expect(enumMismatch.map((w: any) => w.schema)).toEqual(["publication"]);
+    expect(enumMismatch[0].strict).toBeUndefined();
+  });
+
+  it("0.9.2: a record's other type is checked advisory-only, even when its field is strict", async () => {
+    await store.upsertTagRecord("ta", { fields: { st: { type: "string", enum: ["open", "done"] } } });
+    await store.upsertTagRecord("tb", { fields: { st: { type: "string", enum: ["todo", "done"], strict: true } } });
+    // ta comes first, so its rules decide; tb's strict enum fails, and only warns.
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({ content: "y", tags: ["ta", "tb"], metadata: { st: "open" } }) as any;
+    const w = result.validation_status.warnings.filter((x: any) => x.reason === "enum_mismatch");
+    expect(w.map((x: any) => [x.schema, x.strict ?? false])).toEqual([["tb", false]]);
+    // In the other order tb's strict enum decides, and the write is refused.
+    await expect(create.execute({ content: "z", tags: ["tb", "ta"], metadata: { st: "open" } })).rejects.toThrow();
   });
 
   it("`_default` universal parent: untagged note picks up `_default`'s schema", async () => {
