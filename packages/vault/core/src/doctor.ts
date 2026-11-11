@@ -63,7 +63,7 @@
 import { historyTablesPresent, deletedHistoryStats, historyStorageStats, topNotesByHistoryBytes } from "./history.js";
 import { readCompactState, type CompactState } from "./history-compact-state.js";
 import { Database } from "bun:sqlite";
-import { loadTagHierarchy, findHierarchyCycles, levenshtein } from "./tag-hierarchy.js";
+import { loadTagHierarchy, findHierarchyCycles, nearName } from "./tag-hierarchy.js";
 import { listIndexedFields } from "./indexed-fields.js";
 import { pruneOrphanedIndexedFields } from "./indexed-fields.js";
 import { loadSchemaConfig } from "./schema-defaults.js";
@@ -729,34 +729,6 @@ function topTypeHolding(db: Database, key: string, scopeIds: string | null, allo
   return row ? [row.name] : [];
 }
 
-/**
- * Two names one edit apart, case aside, that aren't the same name. Names
- * that differ in one digit (`item1`, `item2`), add a number at the end
- * (`item`, `item2`) or differ in a last letter after a separator (`phase-a`,
- * `phase-b`) are a series, not a slip, and are left out, as are names under
- * three characters.
- */
-function nearPair(a: string, b: string): boolean {
-  if (a === b || Math.abs(a.length - b.length) > 1) return false;
-  // Short names (`x`, `y`, `id`) are one letter from many others by nature.
-  if (a.length < 3 || b.length < 3) return false;
-  const [x, y] = [a.toLowerCase(), b.toLowerCase()];
-  if (x === y) return true;
-  if (levenshtein(x, y) !== 1) return false;
-  // `item` and `item2`: a number added at the end starts a series.
-  const [short, long] = x.length < y.length ? [x, y] : [y, x];
-  if (long.length > short.length && long.startsWith(short) && /\d/.test(long[long.length - 1]!)) return false;
-  if (x.length === y.length) {
-    for (let i = 0; i < x.length; i++) {
-      if (x[i] === y[i]) continue;
-      if (/\d/.test(x[i]!) && /\d/.test(y[i]!)) return false;
-      if (i === x.length - 1 && i > 0 && /[-_/. ]/.test(x[i - 1]!)) return false;
-      return true;
-    }
-  }
-  return true;
-}
-
 const MAX_NEAR_NAMES = 25;
 
 function nearNames(
@@ -782,7 +754,7 @@ function nearNames(
     const sorted = [...list].sort((p, q) => p.name.length - q.name.length || (p.name < q.name ? -1 : 1));
     for (let i = 0; i < sorted.length; i++) {
       for (let k = i + 1; k < sorted.length && sorted[k]!.name.length - sorted[i]!.name.length <= 1; k++) {
-        if (nearPair(sorted[i]!.name, sorted[k]!.name)) pairs.push({ kind, a: sorted[i]!, b: sorted[k]! });
+        if (nearName(sorted[i]!.name, sorted[k]!.name)) pairs.push({ kind, a: sorted[i]!, b: sorted[k]! });
       }
     }
   }

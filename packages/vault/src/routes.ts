@@ -17,7 +17,7 @@ import { HistoryNotFoundError, latestTombstone } from "../core/src/history.js";
 import { projectHistoryProvenance } from "../core/src/history-visibility.js";
 import { isNoteIdShape } from "../core/src/ulid.js";
 import type { Database } from "bun:sqlite";
-import { holdTypes, markTypes, mergeTypesIntoTags, prepareCallTypes, refreshTypes } from "../core/src/tag-kind.ts";
+import { attachNearTypeWarnings, nearSchemaWarnings, holdTypes, markTypes, mergeTypesIntoTags, nearTypeWarnings, prepareCallTypes, refreshTypes, type NearTypeWarning } from "../core/src/tag-kind.ts";
 import type { Store, Note, QueryOpts, AggregateSpec } from "../core/src/types.ts";
 import { TAG_EXPAND_MODES, stripTagHash, suggestSimilarTag, type TagExpandMode } from "../core/src/tag-hierarchy.ts";
 import {
@@ -1508,7 +1508,7 @@ export async function handleNotes(
     markTypes(store.db, pending.names);
     // The body was built before the marking: read its notes' types again.
     if (!(res.headers.get("content-type") ?? "").includes("application/json")) return res;
-    const body = refreshTypes(store.db, await res.json());
+    const body = attachNearTypeWarnings(refreshTypes(store.db, await res.json()), pending.near);
     const headers = new Headers(res.headers);
     headers.delete("content-length");
     return new Response(JSON.stringify(body), { status: res.status, headers });
@@ -4269,6 +4269,13 @@ export async function handleTags(
     // mismatch) is a CLIENT error — return 400, not the catch-all 500. The
     // store pre-validates and is transactional, so the schema is left
     // unchanged on failure (no orphan/lying index). vault#478.
+    // 0.9.2: a new type or field one letter from an existing one is made as written, with a warning.
+    const near = nearSchemaWarnings(
+      store.db,
+      putTagName,
+      body.fields && typeof body.fields === "object" && !Array.isArray(body.fields) ? (body.fields as Record<string, unknown>) : null,
+      tagScope.allowed ? (t) => tagScope.allowed!.has(t) : undefined,
+    );
     let result;
     try {
       result = await store.upsertTagRecord(putTagName, {
@@ -4342,7 +4349,7 @@ export async function handleTags(
       }
       throw err;
     }
-    return json(result);
+    return json(near.length > 0 && result && typeof result === "object" ? { ...result, warnings: near } : result);
   }
 
   // DELETE /tags/:name — delete tag + identity row + remove from all notes
@@ -5648,7 +5655,11 @@ function foldRestTypes(
     });
     if (visible && !added.every(visible)) return notes ? { ...merged, notes } : merged;
     const prepared = prepareCallTypes(db, body as Record<string, unknown>, mode, { named });
-    if (prepared.types.length) PENDING_TYPES.set(req, { names: prepared.types, release: holdTypes(db, prepared.types) });
+    if (prepared.types.length) {
+      // 0.9.2: computed before the write (afterwards the new name exists); a scoped caller is named only types it may see.
+      const near = nearTypeWarnings(db, prepared.types, visible ?? undefined);
+      PENDING_TYPES.set(req, { names: prepared.types, near, release: holdTypes(db, prepared.types) });
+    }
     return prepared.params;
   } catch (err) {
     if ((err as { error_type?: string })?.error_type !== "tag_kind") throw err;
@@ -5657,7 +5668,7 @@ function foldRestTypes(
 }
 
 /** Types a REST write named, marked once it succeeded (T-318 §8a). */
-const PENDING_TYPES = new WeakMap<Request, { names: string[]; release: () => void }>();
+const PENDING_TYPES = new WeakMap<Request, { names: string[]; near: NearTypeWarning[]; release: () => void }>();
 
 /** The 409 a retype that would strand records gets: the type is unchanged. */
 function retypeConflictResponse(tag: string, conflicts: RetypeConflict[], scoped: boolean): Response {

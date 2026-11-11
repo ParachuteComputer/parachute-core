@@ -184,3 +184,16 @@ describe("which types a record is checked against (0.9.2)", () => {
     expect((await store.countTagConformance("ta", { st: { type: "string", enum: ["done"] } })).violating_notes).toBe(1);
   });
 });
+
+describe("migrate's set_default {onlyInvalid} (0.9.2)", () => {
+  it("overwrites only values the deciding type refuses, not ones only another type dislikes", async () => {
+    const { migrateTagField } = await import("./migrate-tag-field.js");
+    await store.upsertTagRecord("task", { fields: { st: { type: "string", enum: ["open", "done"] } } });
+    await store.upsertTagRecord("pub", { fields: { st: { type: "string", enum: ["draft"] } } });
+    await store.upsertTagRecord("article", { parent_names: ["task", "pub"] }); // task decides st
+    await store.createNote("", { path: "a/1", tags: ["article"], metadata: { st: "open" } });
+    await store.createNote("", { path: "a/2", tags: ["article"], metadata: { st: "zzz" } });
+    const plan = await migrateTagField(store, { tag: "article", field: "st", transform: { kind: "set_default", value: "done", onlyInvalid: true } });
+    expect(plan.sample.map((c) => c.path)).toEqual(["a/2"]);
+  });
+});

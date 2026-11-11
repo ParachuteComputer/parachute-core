@@ -357,5 +357,5 @@ export function retypeHint(tag: string, c: RetypeConflict): string {
   const kind = c.to === "string" ? "to_string" : c.to === "integer" ? "to_int" : c.to === "number" ? "to_number" : c.to === "boolean" ? "to_boolean" : null;
   const transform = kind ? `{kind: "${kind}"}` : `{kind: "remap", map: {<old value>: <new value>}}`;
   const n = c.count === 1 ? "1 record holds" : `${c.count} records hold`;
-  return `${n} a "${c.field}" value a ${c.to ?? "changed"} field refuses, and couldn't be edited after this change. Change the values first with migrate: manage-types {action: "migrate", tag: "${tag}", field: "${c.field}", transform: ${transform}} (or POST /api/types/${encodeURIComponent(tag)}/migrate with the same body). It is a dry run that says what would change; add apply: true to write. Then retype.`;
+  return `${n} a "${c.field}" value ${c.to ? `${/^[aeiou]/.test(c.to) ? "an" : "a"} ${c.to}` : "the changed"} field refuses, and couldn't be edited after this change. Change the values first with migrate: manage-types {action: "migrate", tag: "${tag}", field: "${c.field}", transform: ${transform}} (or POST /api/types/${encodeURIComponent(tag)}/migrate with the same body). It is a dry run that says what would change; add apply: true to write. Then retype.`;
 }
