@@ -950,7 +950,7 @@
   },
   {
    "kind": "endpoint",
-   "old": "a revision's actor and via (GET /vault/<n>/api/notes/<id>/versions, query-notes {versions})",
+   "old": "a revision's actor and via (the versions routes on REST, query-notes {versions} on MCP)",
    "new": "the same, plus via_kind: the kind of the key that made it (person, agent, app, service) or null",
    "action": "keep",
    "reason": "additive: the write stamp (0.9.1) adds via_kind beside actor and via; a revision written before it has null; nothing a 0.8 client reads changes, and tag-scoped sessions don't receive it, as with actor and via",
