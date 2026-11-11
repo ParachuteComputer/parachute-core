@@ -187,6 +187,7 @@ deleted, a note the export format can't carry).
 | `door/files.test.ts` | Upload, attach, byte-equal download, a ranged read, refused active content, tickets over MCP, `read-attachment` (an image block; a text window). |
 | `door/exit.test.ts` | The export: every note, type and file; the bytes of a fixed made-up note are compared across doors (a box's come from its own command). |
 | `door/records.test.ts`, `door/keys.test.ts` | 0.9 doors: the record door over MCP and REST. 0.9.1 doors: the owner's key (NIP-98), named app keys that stop when revoked. |
+| `door/multivault.test.ts` | 0.9.1, the one multi-vault door: a key covering several vaults, each at its own level, through the account door. It sees only its vaults, writes only where it holds write and must name the vault, queries fan out at read, the writer's tool list stays within 4,000 tokens, it opens no vault directly and stops when revoked. |
 
 ### 0.9.2: the dial works (`suites/v092/`)
 

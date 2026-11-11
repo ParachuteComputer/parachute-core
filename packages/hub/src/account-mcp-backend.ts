@@ -48,11 +48,13 @@ export interface ModuleMcpBackend {
   callTool(name: string, args: Record<string, unknown>, ctx: AccountToolContext): Promise<unknown>;
 }
 
-const UNION_CATALOG_LINE =
-  "Catalog caveat: advertised from one covered vault's live list (highest verb this connection holds). Calling this against a different covered vault may return Unknown tool if that vault grants a lower verb.";
-
-const VAULT_FIELD_DESCRIPTION =
-  "Target vault by name. Omit on query-records (or query-notes) to fan the query across every reachable vault; required on every other vault-shaped tool.";
+/**
+ * The vault selector's words. Kept short: they ride on every proxied tool, and a writer's whole list through the
+ * account door is held to the same 4,000-token budget as a per-vault door (contracts/suites/door/multivault.test.ts).
+ * The catalog caveat (the list comes from one vault's live list) is said once, on list-vaults.
+ */
+const VAULT_FIELD_REQUIRED = "Vault name (list-vaults shows them).";
+const VAULT_FIELD_FAN_OUT = "Vault name. Omit to query every vault you can read.";
 
 const listCache = new WeakMap<AccountToolContext, Promise<readonly ListedMcpTool[]>>();
 
@@ -233,7 +235,10 @@ function injectVaultSelector(tool: {
     ...((rawSchema.properties && typeof rawSchema.properties === "object"
       ? rawSchema.properties
       : {}) as Record<string, unknown>),
-    vault: { type: "string", description: VAULT_FIELD_DESCRIPTION },
+    vault: {
+      type: "string",
+      description: FAN_OUT_TOOLS.has(tool.name) ? VAULT_FIELD_FAN_OUT : VAULT_FIELD_REQUIRED,
+    },
   };
   const schema: Record<string, unknown> = { ...rawSchema, properties };
   if (!FAN_OUT_TOOLS.has(tool.name)) {
@@ -242,8 +247,7 @@ function injectVaultSelector(tool: {
       : [];
     if (!req.includes("vault")) schema.required = [...req, "vault"];
   }
-  const base = typeof tool.description === "string" ? tool.description : tool.name;
-  const description = base.includes("Catalog caveat:") ? base : `${base}\n\n${UNION_CATALOG_LINE}`;
+  const description = typeof tool.description === "string" ? tool.description : tool.name;
   return { name: tool.name, description, inputSchema: schema };
 }
 

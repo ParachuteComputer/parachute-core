@@ -264,7 +264,8 @@ const listVaultsTool: AccountMcpTool = {
   name: "list-vaults",
   description:
     "List the vaults this connection can reach. Returns each vault's name, URL, and version, " +
-    "plus whether the grant covers ALL of the hub's vaults or a specific listed subset.",
+    "plus whether the grant covers ALL of the hub's vaults or a specific listed subset. " +
+    "Catalog caveat: the other tools are listed from your highest-level vault; a vault where you hold less may refuse one.",
   inputSchema: { type: "object", properties: {}, additionalProperties: false },
   async execute(_args, ctx) {
     const coverage = resolveCoverage(ctx.db, ctx.principal, installedVaults(ctx));

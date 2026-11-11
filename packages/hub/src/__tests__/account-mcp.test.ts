@@ -636,7 +636,9 @@ describe("account MCP — initialize + tools", () => {
       const qn = listBody.result.tools.find((t) => t.name === "query-notes");
       expect(qn?.inputSchema?.properties).toHaveProperty("vault");
       expect(qn?.inputSchema?.required ?? []).not.toContain("vault");
-      expect(qn?.description).toMatch(/Catalog caveat/);
+      // The catalog caveat is said once, on list-vaults, not on every proxied tool (the writer-list budget).
+      expect(listBody.result.tools.find((t) => t.name === "list-vaults")?.description).toMatch(/Catalog caveat/);
+      expect(qn?.description).not.toMatch(/Catalog caveat/);
       const del = listBody.result.tools.find((t) => t.name === "delete-note");
       expect(del?.inputSchema?.required).toContain("vault");
     } finally {
@@ -1038,7 +1040,9 @@ describe("account MCP — query-notes", () => {
       expect(qn?.inputSchema?.properties).toHaveProperty("order_by");
       expect(qn?.inputSchema?.properties).toHaveProperty("vault");
       expect(qn?.inputSchema?.required ?? []).not.toContain("vault");
-      expect(qn?.description).toMatch(/Catalog caveat/);
+      // The catalog caveat is said once, on list-vaults, not on every proxied tool (the writer-list budget).
+      expect(listBody.result.tools.find((t) => t.name === "list-vaults")?.description).toMatch(/Catalog caveat/);
+      expect(qn?.description).not.toMatch(/Catalog caveat/);
     } finally {
       h.cleanup();
     }
