@@ -27,6 +27,7 @@ import {
   importSPKI,
   jwtVerify,
 } from "jose";
+import { assertMintedUnderCurrentGrant } from "./grant-generation.ts";
 import { adoptRefreshToken, adoptToken } from "./keys.ts";
 import { attributionPubkey } from "./pubkey-links.ts";
 import { scopedAdminProblem } from "./permissions-claim.ts";
@@ -160,6 +161,14 @@ export interface SignRefreshTokenOpts {
   familyId?: string;
   /** The key's name signed into the access token (its `key` claim): the family's key gets exactly this name. */
   keyName?: string;
+  /**
+   * The grant generation (grant-generation.ts) of the artifact this row is minted from, READ FROM THE DB: the auth
+   * code's row for a code redeem, the rotated refresh row for a rotation. Called inside the insert transaction,
+   * after the caller's await, so a narrowing that landed meanwhile is seen. Required so no mint path can skip the
+   * check: a mismatch on a row with an account-door choice scope throws `GrantChangedError` and inserts nothing.
+   * The new row carries this generation.
+   */
+  artifactGeneration: () => number;
   now?: () => Date;
 }
 
@@ -266,39 +275,43 @@ export function signRefreshToken(db: Database, opts: SignRefreshTokenOpts): Sign
   // credential was minted; a later unlink does not rewrite it.
   const subjectPubkey = attributionPubkey(db, { userId: opts.userId });
   const insert = () => {
-  try {
-    db.prepare(
-      `INSERT INTO tokens (jti, user_id, client_id, scopes, refresh_token_hash, family_id, expires_at, created_at, created_via, subject_pubkey)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'oauth_refresh', ?)`,
-    ).run(
-      opts.jti,
-      opts.userId,
-      opts.clientId,
-      opts.scopes.join(" "),
-      refreshTokenHash,
-      familyId,
-      expiresAt,
-      now.toISOString(),
-      subjectPubkey,
-    );
-  } catch (err) {
-    throw new RefreshTokenInsertError(
-      `failed to insert refresh token row: ${err instanceof Error ? err.message : String(err)}`,
-      err,
-    );
-  }
-  keyForMint(db, opts.jti, familyId, opts.keyName);
-  };
-  if (opts.keyName === undefined) insert();
-  else {
-    // The access token already names this key: record the row and its key in one step, or nothing (a name another
-    // grant took meanwhile → KeyNameTakenError, and the caller signs again under the next name).
+    // The grant-generation check, in the same transaction as the insert (grant-generation.ts).
+    const grantGeneration = opts.artifactGeneration();
+    assertMintedUnderCurrentGrant(db, { userId: opts.userId, clientId: opts.clientId, scopes: opts.scopes, artifactGeneration: grantGeneration });
     try {
-      db.transaction(insert).immediate();
+      db.prepare(
+        `INSERT INTO tokens (jti, user_id, client_id, scopes, refresh_token_hash, family_id, expires_at, created_at, created_via, subject_pubkey, grant_generation)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'oauth_refresh', ?, ?)`,
+      ).run(
+        opts.jti,
+        opts.userId,
+        opts.clientId,
+        opts.scopes.join(" "),
+        refreshTokenHash,
+        familyId,
+        expiresAt,
+        now.toISOString(),
+        subjectPubkey,
+        grantGeneration,
+      );
     } catch (err) {
-      if (err instanceof Error && /UNIQUE constraint failed: keys\.name/.test(err.message)) throw new KeyNameTakenError(opts.keyName);
-      throw err;
+      throw new RefreshTokenInsertError(
+        `failed to insert refresh token row: ${err instanceof Error ? err.message : String(err)}`,
+        err,
+      );
     }
+    keyForMint(db, opts.jti, familyId, opts.keyName);
+  };
+  // The check, the row and its key in one step, or nothing (a name another grant took meanwhile → KeyNameTakenError,
+  // and the caller signs again under the next name). Inside a caller's transaction (rotation) this is a savepoint;
+  // on its own it takes the write lock up front (IMMEDIATE).
+  const tx = db.transaction(insert);
+  try {
+    if (db.inTransaction) tx();
+    else tx.immediate();
+  } catch (err) {
+    if (opts.keyName !== undefined && err instanceof Error && /UNIQUE constraint failed: keys\.name/.test(err.message)) throw new KeyNameTakenError(opts.keyName);
+    throw err;
   }
   return { token, refreshTokenHash, familyId, expiresAt };
 }
@@ -909,6 +922,11 @@ export function findTokenRowByJti(db: Database, jti: string): RefreshTokenRow | 
  * theft signal (RFC 6819 §5.2.2.3). Idempotent: rows already revoked keep
  * their existing revoked_at.
  */
+/** The grant generation on a token row as it is now (a rotation's check reads it inside its insert transaction). */
+export function refreshRowGeneration(db: Database, jti: string): number {
+  return db.query<{ grant_generation: number }, [string]>("SELECT grant_generation FROM tokens WHERE jti = ?").get(jti)?.grant_generation ?? -1;
+}
+
 export function revokeFamily(db: Database, familyId: string, now: Date): number {
   const res = db
     .prepare("UPDATE tokens SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL")

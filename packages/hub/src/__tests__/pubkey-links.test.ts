@@ -582,7 +582,7 @@ describe("mint-time attribution snapshot", () => {
       proofEvent: proof(PK_A, challenge),
       now,
     });
-    signRefreshToken(db, {
+    signRefreshToken(db, { artifactGeneration: () => 0,
       jti: "jti-refresh",
       userId: alice,
       clientId: "client",

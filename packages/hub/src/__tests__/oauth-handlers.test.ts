@@ -4869,7 +4869,7 @@ describe("refresh-token rotation + /oauth/revoke (#73)", () => {
         // Inject a SECOND live refresh row into the same family — simulating a
         // family that has already forked into multiple live lineages (an
         // already-compromised state). Now live count != 1, so `tip` is null.
-        signRefreshToken(db, {
+        signRefreshToken(db, { artifactGeneration: () => 0,
           jti: "injected-fork-jti",
           userId: user.id,
           clientId: reg.client.clientId,
@@ -9852,7 +9852,7 @@ describe("RFC 8707 resource binding — vault-bound MCP (fix #461)", () => {
       approveClient(db, reg.client.clientId);
       const deps = { ...RESOURCE_DEPS, knownIssuers: () => ["https://old.example"] };
       const audienceFor = async (resource: string): Promise<unknown> => {
-        const minted = signRefreshToken(db, {
+        const minted = signRefreshToken(db, { artifactGeneration: () => 0,
           jti: `jti-${randomBytes(6).toString("hex")}`,
           userId: user.id,
           clientId: reg.client.clientId,
@@ -12339,6 +12339,36 @@ describe("account-door consent per vault (T-446)", () => {
     }
   });
 
+  test("a narrower choice keeps the refresh tokens and codes it still covers working (they move to the new generation)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const session = await friendOnWorkReadOtherWrite(db);
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"], status: "approved" });
+      const clientId = reg.client.clientId;
+      // An app holds other:read; later the friend widens (work too), then narrows back, dropping work.
+      const a = makePkce();
+      const first = await post(db, session.id, clientId, a.challenge, [["account_vault_levels", "1"], ["vault_level:other", "read"]]);
+      const kept = await redeemWithRefresh(db, first.headers.get("location")!, clientId, a.verifier);
+      const b = makePkce();
+      const widen = await post(db, session.id, clientId, b.challenge, [["account_vault_levels", "1"], ["vault_level:work", "read"], ["vault_level:other", "read"]], "account:vaults account:self:read");
+      await redeemWithRefresh(db, widen.headers.get("location")!, clientId, b.verifier);
+      // A code for other:read, issued before the narrowing and not yet redeemed.
+      const c = makePkce();
+      const pending = await post(db, session.id, clientId, c.challenge, [["account_vault_levels", "1"], ["vault_level:other", "read"]]);
+      const narrow = await post(db, session.id, clientId, makePkce().challenge, [["account_vault_levels", "1"], ["vault_level:work", "none"], ["vault_level:other", "read"]], "account:vaults account:self:read");
+      expect(narrow.status).toBe(302);
+      // The narrowing bumped the generation (the work:read family is the wider one)...
+      expect(db.query<{ generation: number }, [string]>("SELECT generation FROM grant_generations WHERE client_id = ?").get(clientId)?.generation).toBeGreaterThan(0);
+      // ...and the other:read family and code it covers still mint.
+      const r = await refresh(db, clientId, kept.refresh_token);
+      expect(r.status, await r.clone().text()).toBe(200);
+      expect(((await r.json()) as { scope: string }).scope).toBe("account:self:vaults:other:read");
+      expect(await redeem(db, pending.headers.get("location")!, clientId, c.verifier)).toBe("account:self:vaults:other:read");
+    } finally {
+      cleanup();
+    }
+  });
+
   test("SECURITY: every vault at none drops the stored choice and ends its refresh tokens: the next ask shows the page", async () => {
     const { db, cleanup } = await makeDb();
     try {
@@ -12470,7 +12500,7 @@ describe("account-door consent per vault (T-446)", () => {
             if (!landed) {
               landed = true;
               db.prepare("UPDATE tokens SET revoked_at = ? WHERE jti = ?").run(t.toISOString(), row.jti);
-              signRefreshToken(db, { jti: "sibling-tip", userId: row.user_id, clientId: reg.client.clientId, scopes: row.scopes.split(" "), familyId: row.family_id });
+              signRefreshToken(db, { artifactGeneration: () => 0, jti: "sibling-tip", userId: row.user_id, clientId: reg.client.clientId, scopes: row.scopes.split(" "), familyId: row.family_id });
               linkRotation(db, row.jti, "sibling-tip");
             }
             return t;

@@ -15,6 +15,7 @@
  */
 import type { Database } from "bun:sqlite";
 import { createHash, randomBytes } from "node:crypto";
+import { currentGrantGeneration } from "./grant-generation.ts";
 
 export const AUTH_CODE_TTL_SECONDS = 60;
 
@@ -29,6 +30,8 @@ export interface AuthCode {
   expiresAt: string;
   usedAt: string | null;
   createdAt: string;
+  /** The grant generation (grant-generation.ts) the code was minted under. */
+  grantGeneration: number;
 }
 
 export class AuthCodeNotFoundError extends Error {
@@ -77,6 +80,7 @@ interface Row {
   expires_at: string;
   used_at: string | null;
   created_at: string;
+  grant_generation: number;
 }
 
 function rowToAuthCode(r: Row): AuthCode {
@@ -91,6 +95,7 @@ function rowToAuthCode(r: Row): AuthCode {
     expiresAt: r.expires_at,
     usedAt: r.used_at,
     createdAt: r.created_at,
+    grantGeneration: r.grant_generation,
   };
 }
 
@@ -109,10 +114,13 @@ export function issueAuthCode(db: Database, opts: IssueAuthCodeOpts): AuthCode {
   const now = opts.now?.() ?? new Date();
   const createdAt = now.toISOString();
   const expiresAt = new Date(now.getTime() + AUTH_CODE_TTL_SECONDS * 1000).toISOString();
+  // Stamped with the (user, client)'s current grant generation, read here, in the same synchronous step as the grant
+  // write that precedes every call (issueAuthCodeRedirect): a later narrowing bumps it and this code stops minting.
+  const grantGeneration = currentGrantGeneration(db, opts.userId, opts.clientId);
   db.prepare(
     `INSERT INTO auth_codes
-     (code, client_id, user_id, redirect_uri, scopes, code_challenge, code_challenge_method, expires_at, used_at, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
+     (code, client_id, user_id, redirect_uri, scopes, code_challenge, code_challenge_method, expires_at, used_at, created_at, grant_generation)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
   ).run(
     code,
     opts.clientId,
@@ -123,6 +131,7 @@ export function issueAuthCode(db: Database, opts: IssueAuthCodeOpts): AuthCode {
     opts.codeChallengeMethod,
     expiresAt,
     createdAt,
+    grantGeneration,
   );
   return {
     code,
@@ -135,6 +144,7 @@ export function issueAuthCode(db: Database, opts: IssueAuthCodeOpts): AuthCode {
     expiresAt,
     usedAt: null,
     createdAt,
+    grantGeneration,
   };
 }
 
@@ -151,6 +161,8 @@ export interface RedeemAuthCodeOpts {
  * branch; the caller maps these to OAuth error codes (`invalid_grant` etc).
  */
 export function redeemAuthCode(db: Database, opts: RedeemAuthCodeOpts): AuthCode {
+  // The generation on the returned copy is as of now; the mint re-reads it from the row (authCodeGeneration) after
+  // signing, because a narrowing may move or leave it in between.
   const row = db.query<Row, [string]>("SELECT * FROM auth_codes WHERE code = ?").get(opts.code);
   if (!row) throw new AuthCodeNotFoundError();
   const code = rowToAuthCode(row);
@@ -186,4 +198,9 @@ function timingSafeEqualString(a: string, b: string): boolean {
     diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
   }
   return diff === 0;
+}
+
+/** The grant generation on a code's row as it is now (the mint's check reads it inside its insert transaction). */
+export function authCodeGeneration(db: Database, code: string): number {
+  return db.query<{ grant_generation: number }, [string]>("SELECT grant_generation FROM auth_codes WHERE code = ?").get(code)?.grant_generation ?? -1;
 }
