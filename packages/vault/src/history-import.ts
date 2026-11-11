@@ -52,7 +52,7 @@ function parserVersion(value: unknown): 1 | 2 {
   return PARSER;
 }
 /**
- * Read an export's scalars the way the vault's own import reads them, then hand the block to strict YAML.
+ * Read an export's scalars the way the vault's own import reads them.
  *
  * An export never holds a non-empty flow collection, and before `FLOW_QUOTING_SINCE` (portable-md.ts) the exporter
  * wrote a string as it stood unless its `needsQuote` asked otherwise, which it did not for a leading `[ ] { } , ' "`.
@@ -60,29 +60,17 @@ function parserVersion(value: unknown): 1 | 2 {
  * exporter is the six-character string with its quotes; and `saying: 'made up' and more` is not YAML at all. Core's
  * import reader knows all three (`parseFrontmatter`'s "export" and "old-export" readings). This asks that reader for
  * each such value, one `key: value` or `- value` line at a time, and writes the string it returns as a double-quoted
- * scalar, which strict YAML reads back as exactly that text. Nothing else is touched: structure, numbers, booleans
- * and every other fault in the block are still strict YAML's to accept or refuse.
+ * scalar, which strict YAML reads back as exactly that text. It returns the rewritten block and the strings it
+ * wrote; {@link frontmatter} decides whether the rewrite may stand.
  *
  * `reading` is "old-export" when the first commit that holds the file was made before `FLOW_QUOTING_SINCE` (only
- * the old exporter existed), else "export". A box that kept the old exporter for a while after that date can still have written `'word'` meaning
- * the quoted string; that one shape, in that window, is read as today's exporter means it. See UPGRADING.md.
- *
- * The exporter writes one value per line and never a block scalar. A block that holds one (a line ending in `|` or
- * `>` with deeper lines under it) was not written by it, so nothing is rewritten and strict YAML decides alone.
+ * the old exporter existed), else "export". A box that kept the old exporter for a while after that date can still
+ * have written `'word'` meaning the quoted string; that shape, in that window, is read as today's exporter means it.
+ * See UPGRADING.md.
  */
-export function readExportScalars(block: string, reading: "export" | "old-export"): string {
-  const lines = block.split("\n");
-  // A block scalar: a line that ends in an indicator (`|`, `>-`, `|2`, with or without a comment, whatever its key
-  // looks like) and whose next line with text is indented deeper. `title: Q3 - >` ends like one, but nothing deeper
-  // follows it: that is an ordinary string, and the block is still read.
-  const indent = (line: string) => line.length - line.trimStart().length;
-  const header = /(?:^|:[ \t]+|-[ \t]+)[|>](?:[1-9][+-]?|[+-][1-9]?)?[ \t]*(?:#.*)?\r?$/;
-  if (lines.some((line, i) => {
-    if (!header.test(line)) return false;
-    const next = lines.slice(i + 1).find(l => l.trim() !== "");
-    return next !== undefined && indent(next) > indent(line);
-  })) return block;
-  return lines.map(raw => {
+export function readExportScalars(block: string, reading: "export" | "old-export"): { text: string; values: Set<string> } {
+  const values = new Set<string>();
+  const text = block.split("\n").map(raw => {
     const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
     const match = /^(\s*(?:- )?)(?:([^\s'"\[\]{},#&*!|>%@`-][^'"]*?): )?(['"\[{].*)$/.exec(line);
     if (!match) return raw;
@@ -92,8 +80,37 @@ export function readExportScalars(block: string, reading: "export" | "old-export
       if (/^(['"]).*?\1: /.test(value!)) return raw;              // a list item that is a map with a quoted key
     }
     const read = parseFrontmatter(`---\nx: ${value}\n---\n`, reading).frontmatter.x;
-    return typeof read === "string" ? `${lead}${key === undefined ? "" : `${key}: `}${JSON.stringify(read)}` : raw;
+    if (typeof read !== "string") return raw;
+    values.add(read);
+    return `${lead}${key === undefined ? "" : `${key}: `}${JSON.stringify(read)}`;
   }).join("\n");
+  return { text, values };
+}
+/**
+ * Whether `read` (the rewritten block, parsed) differs from `strict` (the block as plain YAML reads it) ONLY where a
+ * rewritten value now stands. A line is one value only in what the exporter writes; in a hand-written file the same
+ * text can sit inside a block scalar, a folded string or a multi-line flow, and rewriting it there changes something
+ * that is not one of the values written. Then the rewrite does not stand.
+ */
+function accountsFor(read: unknown, strict: unknown, values: Set<string>): boolean {
+  if (typeof read === "string" && values.has(read)) return true;
+  if (Array.isArray(read)) return Array.isArray(strict) && read.length === strict.length && read.every((item, i) => accountsFor(item, strict[i], values));
+  if (read !== null && typeof read === "object" && !(read instanceof Date)) {
+    if (strict === null || typeof strict !== "object" || Array.isArray(strict) || strict instanceof Date) return false;
+    const a = Object.keys(read), b = Object.keys(strict as object);
+    return a.length === b.length && a.every(k => k in (strict as object) && accountsFor((read as Record<string, unknown>)[k], (strict as Record<string, unknown>)[k], values));
+  }
+  return canonicalJson({ v: read }) === canonicalJson({ v: strict });
+}
+/** A line that opens a block scalar (`key: |`, `- >-`, `key: !!str |2`, with or without a comment) with deeper lines under it. */
+function holdsBlockScalar(block: string): boolean {
+  const lines = block.split("\n"), indent = (line: string) => line.length - line.trimStart().length;
+  const header = /^[ \t]*(?:(?:-|\?)[ \t]+)*(?:[^\s#][^#]*?:[ \t]+)?(?:[!&][^ \t]*[ \t]+)*[|>](?:[1-9][+-]?|[+-][1-9]?)?[ \t]*(?:#.*)?\r?$/;
+  return lines.some((line, i) => {
+    if (!header.test(line)) return false;
+    const next = lines.slice(i + 1).find(l => l.trim() !== "");
+    return next !== undefined && indent(next) > indent(line);
+  });
 }
 /** The one top-level `id:` line of a block that will not parse, when it names a note: so the failure quarantines that note instead of being an unidentified issue. */
 function statedId(block: string): string | undefined {
@@ -103,15 +120,36 @@ function statedId(block: string): string | undefined {
 class UnreadableFrontmatter extends Error {
   constructor(readonly noteId: string) { super("unreadable_frontmatter"); }
 }
+/**
+ * Parser 2: strict YAML over the block with its export scalars read as the vault's import reads them, when that
+ * rewrite is accounted for; otherwise strict YAML alone.
+ *   - Nothing to rewrite: strict YAML.
+ *   - The block is YAML as it stands: the rewrite stands only if it changed nothing but the values it wrote
+ *     ({@link accountsFor}). If it changed anything else (text inside a block scalar, say), the file was not written
+ *     by the exporter, and strict YAML's reading is kept.
+ *   - The block is not YAML as it stands (the old exporter's bare leading quote): there is no reading to compare
+ *     with, so a block that holds a block scalar is refused rather than trusted, and any other is read rewritten.
+ * A block that fails names its note when it can ({@link statedId}).
+ */
 function frontmatter(block: string, parser: 1 | 2, reading: "export" | "old-export"): Record<string, unknown> {
   if (parser === 1) return yaml(block);
-  try { return yaml(readExportScalars(block, reading)); }
-  catch (strict) {
+  const refuse = (cause: unknown): never => {
     const id = statedId(block);
     if (id !== undefined) throw new UnreadableFrontmatter(id);
-    throw strict;
-  }
+    throw cause;
+  };
+  const { text, values } = readExportScalars(block, reading);
+  let strict: Record<string, unknown> | undefined, strictError: unknown;
+  try { strict = yaml(block); } catch (error) { strictError = error; }
+  if (text === block) return strict ?? refuse(strictError);
+  let read: Record<string, unknown>;
+  try { read = yaml(text); } catch (error) { return strict ?? refuse(error); }
+  if (strict !== undefined) return accountsFor(read, strict, values) ? read : strict;
+  if (holdsBlockScalar(block)) return refuse(strictError);
+  return read;
 }
+/** The parser-2 reading of one frontmatter block, for tools that measure it against a mirror. */
+export function parseExportFrontmatter(block: string, reading: "export" | "old-export"): Record<string, unknown> { return frontmatter(block, 2, reading); }
 function inline(raw: string, parser: 1 | 2, reading: "export" | "old-export"): { meta: Record<string, unknown>; content: string } {
   const match = /^(?:\uFEFF)?---\r?\n([\s\S]*?)^---(?:\r?\n|$)/m.exec(raw);
   if (!match || match.index !== 0) throw new Error("missing_frontmatter");
