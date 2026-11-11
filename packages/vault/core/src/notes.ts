@@ -27,6 +27,7 @@ import {
   type QueryHashInputs,
 } from "./cursor.js";
 import { getIndexedField, releaseField } from "./indexed-fields.js";
+import { assertNoAggregateScan } from "./query-warnings.js";
 import { computeExpandedTagCounts, loadTagHierarchy, stripTagHash } from "./tag-hierarchy.js";
 import { chunkForInClause, IN_VIA_JSON_EACH, jsonEachParam } from "./sql-in.js";
 import {
@@ -1642,6 +1643,11 @@ export function queryNotes(db: Database, opts: QueryOpts, _outUpdatedAtMs?: Map<
     // shipped for it. `id` is the explicit tiebreak for stable ordering when
     // two notes share a millisecond, matching the cursor keyset's tiebreak.
     orderBy = `n.updated_at_ms ${direction}, n.id ${direction}`;
+  } else if (opts.orderBy === "created_at") {
+    // 0.9.2: `created_at` names the notes column (it used to be refused as a
+    // field that isn't indexed; a metadata key of that name would shadow
+    // nothing useful), so it is the default order made explicit.
+    orderBy = `n.created_at ${direction}, n.id ${direction}`;
   } else if (opts.orderBy === "link_count") {
     // `link_count` is a pseudo-field — like `created_at`/`updated_at` in the
     // dateFilter block above, it bypasses `requireIndexedField` (it's not a
@@ -1811,6 +1817,7 @@ export function aggregateNotes(db: Database, opts: QueryOpts): AggregateRow[] {
     );
   }
 
+  assertNoAggregateScan(db, opts);
   const { conditions, params } = buildFilterConditions(db, opts);
   const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
 

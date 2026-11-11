@@ -64,4 +64,25 @@ describe("the scan warning on a tag-scoped MCP session (0.9.2)", () => {
     expect(scoped.notes.map((n: any) => n.path)).toEqual(["in"]);
     expect(scoped.warnings).toEqual([expect.objectContaining({ code: "scan", fields: ["mood"] })]);
   });
+
+  test("full-text search and its metadata filter warn too", async () => {
+    seedVault("v");
+    const store = getVaultStore("v");
+    await store.createNote("a wombat", { metadata: { mood: "ok" }, path: "a" });
+    const got: any = await (await queryNotesTool("v", null)).execute({ search: "wombat", metadata: { mood: { eq: "ok" } } });
+    expect(got.notes.map((n: any) => n.path)).toEqual(["a"]);
+    expect(got.warnings.map((w: any) => w.code)).toContain("scan");
+  });
+
+  test("aggregate refuses a filter on a field that isn't indexed, scoped or not", async () => {
+    seedVault("v");
+    const store = getVaultStore("v");
+    await store.createNote("in", { tags: ["health"], metadata: { mood: "ok" }, path: "in" });
+    for (const scope of [null, ["health"]]) {
+      const tool = await queryNotesTool("v", scope);
+      await expect(
+        (async () => tool.execute({ metadata: { mood: { eq: "ok" } }, aggregate: { op: "count" } }))(),
+      ).rejects.toThrow(/not indexed/);
+    }
+  });
 });

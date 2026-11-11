@@ -78,7 +78,7 @@ describe("a scan gives its indexed twin's rows", () => {
   it("on an integer field, for every operator and operand shape", async () => {
     await seed("integer", [1, 5, 8, 13, "5", "08", "abc", 2.5, -3, true, false, null, MISSING]);
     await expectTwins([
-      ...operands([5, "5", "8", 2.5, "2.5", "abc", true, false, 0, "-3", " 5 "]),
+      ...operands([5, "5", "8", 2.5, "2.5", "abc", "6x", "", true, false, 0, "-3", " 5 ", "1e1"]),
       { in: [5, 8] },
       { in: ["5", "13"] },
       { in: [true] },
@@ -92,8 +92,17 @@ describe("a scan gives its indexed twin's rows", () => {
     ]);
   });
 
+  it("in with text that isn't a number matches that text only", async () => {
+    // The indexed twin can't be the reference here: its IN list is CAST to
+    // INTEGER, so "abc" becomes 0 and matches a stored false. The scan
+    // compares the text as text.
+    await seed("integer", [5, "abc", false, MISSING]);
+    const got = sorted(await store.queryNotes({ tags: ["t"], metadata: { plain: { in: ["abc"] } } }));
+    expect(got).toEqual(["r/n01"]);
+  });
+
   it("order_by gives the indexed order, both directions", async () => {
-    await seed("integer", [13, 1, "5", 8, null, MISSING, 2]);
+    await seed("integer", [13, 1, "5", "08", " 7", "1e1", "1-2", "abc", 8, null, MISSING, 2]);
     for (const sort of ["asc", "desc"] as const) {
       const ix = (await store.queryNotes({ tags: ["t"], orderBy: "twin", sort })).map((n) => n.path);
       const scan = (await store.queryNotes({ tags: ["t"], orderBy: "plain", sort })).map((n) => n.path);
@@ -153,6 +162,25 @@ describe("fields with no twin", () => {
     await store.createNote("m2", { metadata: { met: "2026-03-01" }, path: "m/2" });
     const got = await store.queryNotes({ dateFilter: { field: "met", from: "2026-04-01" } });
     expect(sorted(got)).toEqual(["m/1"]);
+  });
+});
+
+describe("where a scan isn't allowed or isn't one", () => {
+  it("aggregate refuses a filter on a field that isn't indexed: its reply can't carry the warning", async () => {
+    await store.createNote("a", { metadata: { mood: "ok" } });
+    for (const opts of [{ metadata: { mood: { eq: "ok" } } }, { dateFilter: { field: "met", from: "2026-01-01" } }]) {
+      await expect(store.aggregateNotes({ ...opts, aggregate: { op: "count" } })).rejects.toThrow(/not indexed/);
+    }
+    // A bare equality still reads the JSON there, as it always did.
+    expect(await store.aggregateNotes({ metadata: { mood: "ok" }, aggregate: { op: "count" } })).toEqual([{ group: null, value: 1 }]);
+  });
+
+  it("order_by created_at is the notes column, not a scanned field", async () => {
+    await store.createNote("old", { created_at: "2026-01-01T00:00:00.000Z", path: "c/old" });
+    await store.createNote("new", { created_at: "2026-02-01T00:00:00.000Z", path: "c/new" });
+    const got = (await store.queryNotes({ orderBy: "created_at", sort: "desc", pathPrefix: "c/" })).map((n) => n.path);
+    expect(got).toEqual(["c/new", "c/old"]);
+    expect(collectScanWarnings(db, { orderBy: "created_at" })).toEqual([]);
   });
 });
 

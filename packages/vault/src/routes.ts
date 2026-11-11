@@ -21,6 +21,7 @@ import { holdTypes, markTypes, mergeTypesIntoTags, prepareCallTypes, refreshType
 import type { Store, Note, QueryOpts, AggregateSpec } from "../core/src/types.ts";
 import { TAG_EXPAND_MODES, stripTagHash, suggestSimilarTag, type TagExpandMode } from "../core/src/tag-hierarchy.ts";
 import {
+  assertNoAggregateScan,
   collectScanWarnings,
   collectUnknownTagWarnings,
   emptySearchWarning,
@@ -1667,7 +1668,8 @@ async function handleNotesInner(
         if (parsed.error) return parsed.error;
         try {
           const semanticResult = await store.semanticSearch(nearText, { ...parsed.queryOpts, cursor: undefined });
-          const semanticWarnings: QueryWarning[] = [];
+          // `scan` (0.9.2): a metadata operator or date_filter on a field that isn't indexed.
+          const semanticWarnings: QueryWarning[] = [...collectScanWarnings(db, { metadata: parsed.queryOpts?.metadata, dateFilter: parsed.queryOpts?.dateFilter })];
           if (semanticResult.pendingCount > 0) {
             semanticWarnings.push(
               embeddingsPendingWarning(semanticResult.pendingCount, semanticResult.totalCandidates),
@@ -1806,7 +1808,11 @@ async function handleNotesInner(
         if (searchModeParsed.error) return searchModeParsed.error;
         const mode: SearchMode = searchModeParsed.mode ?? "literal";
 
-        const searchWarnings: QueryWarning[] = [...nearTextIgnored];
+        const searchWarnings: QueryWarning[] = [
+          ...nearTextIgnored,
+          // `scan` (0.9.2): a metadata operator or date_filter on a field that isn't indexed.
+          ...collectScanWarnings(db, { metadata: parsed.queryOpts?.metadata, dateFilter: parsed.queryOpts?.dateFilter }),
+        ];
         // `offset` under full-text search (vault contracts-brief V1.2):
         // `searchNotes` has no offset parameter at all — FTS5 ranks by
         // relevance, not a stable row order, so paging by offset over it
@@ -2088,6 +2094,8 @@ async function handleNotesInner(
         }
         try {
           let rows;
+          // Before the scoped branch, which lists the matches (a scan) and then aggregates their ids.
+          assertNoAggregateScan(db, queryOpts);
           if (tagScope.raw === null) {
             rows = await store.aggregateNotes({ ...queryOpts, aggregate: aggregateParsed.aggregate });
           } else {

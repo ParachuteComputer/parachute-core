@@ -75,6 +75,20 @@ describe("contract: honest queries — passing (lock in current behavior)", () =
     expect(warnings.find((w: any) => w.code === "scan").fields).toEqual(["not_a_real_field"]);
   });
 
+  it("search with a metadata operator on a non-indexed field warns that it scanned (0.9.2)", async () => {
+    const res = await getNotes("search=anything&meta[not_a_real_field][eq]=x");
+    expect(res.status).toBe(200);
+    const warnings = JSON.parse(decodeURIComponent(res.headers.get("X-Parachute-Warnings") ?? "[]"));
+    expect(warnings.map((w: any) => w.code)).toContain("scan");
+  });
+
+  it("aggregate with a metadata operator on a non-indexed field is refused (0.9.2: its reply has no warnings)", async () => {
+    const res = await getNotes("aggregate[op]=count&meta[not_a_real_field][gt]=5");
+    expect(res.status).toBe(400);
+    const body: any = await res.json();
+    expect(body.code).toBe("FIELD_NOT_INDEXED");
+  });
+
   it("a `near` query against a nonexistent anchor note errors cleanly with 404, not a silent []", async () => {
     const res = await getNotes("near[note_id]=does-not-exist");
     expect(res.status).toBe(404);

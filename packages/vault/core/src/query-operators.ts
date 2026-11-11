@@ -479,6 +479,12 @@ export function buildScanClause(
   // only converts text that is a well-formed number).
   const lhs = affinity === "TEXT" ? `CAST(${raw} AS TEXT)` : raw;
   const rhs = (v: unknown) => (affinity === "NUMERIC" && numericLike(v) ? "CAST(? AS NUMERIC)" : "?");
+  // A NUMERIC field compared with text that isn't a number: no affinity
+  // applies, so the stored value is converted first (the sort key does
+  // exactly what the column's affinity does), and a stored "70" is the
+  // number 70 against "6x", as in an INTEGER column.
+  const converted = affinity === "NUMERIC" ? scanOrderSql(field, "NUMERIC") : lhs;
+  const lhsFor = (v: unknown) => (numericLike(v) ? lhs : converted);
   const parts: string[] = [];
   const params: SQLQueryBindings[] = [];
 
@@ -495,7 +501,7 @@ export function buildScanClause(
       params.push(jsonEachParam(nums));
     }
     if (rest.length > 0) {
-      ors.push(`${lhs} IN (SELECT value FROM json_each(?))`);
+      ors.push(`${converted} IN (SELECT value FROM json_each(?))`);
       params.push(jsonEachParam(rest));
     }
     return ors.length === 1 ? ors[0]! : `(${ors.join(" OR ")})`;
@@ -507,7 +513,7 @@ export function buildScanClause(
         if (value === null) {
           parts.push(`${raw} IS NULL`);
         } else {
-          parts.push(`${lhs} = ${rhs(value)}`);
+          parts.push(`${lhsFor(value)} = ${rhs(value)}`);
           params.push(toBinding(field, op, value));
         }
         break;
@@ -515,7 +521,7 @@ export function buildScanClause(
         if (value === null) {
           parts.push(`${raw} IS NOT NULL`);
         } else {
-          parts.push(`(${raw} IS NULL OR ${lhs} <> ${rhs(value)})`);
+          parts.push(`(${raw} IS NULL OR ${lhsFor(value)} <> ${rhs(value)})`);
           params.push(toBinding(field, op, value));
         }
         break;
@@ -524,7 +530,7 @@ export function buildScanClause(
       case "lt":
       case "lte": {
         const sym = op === "gt" ? ">" : op === "gte" ? ">=" : op === "lt" ? "<" : "<=";
-        parts.push(`${lhs} ${sym} ${rhs(value)}`);
+        parts.push(`${lhsFor(value)} ${sym} ${rhs(value)}`);
         params.push(toBinding(field, op, value));
         break;
       }
@@ -566,16 +572,20 @@ export function buildScanClause(
 /**
  * The sort key for `order_by` on a field that isn't indexed: the JSON value
  * converted the way the indexed column would hold it. TEXT: as text. NUMERIC:
- * text that round-trips as a number sorts as that number (`"5"` among 3 and
+ * text that NUMERIC affinity converts sorts as that number (`"5"` among 3 and
  * 8), anything else as itself, so numbers come before text as they do in an
- * INTEGER column. (Text such as `"5.0"`, which affinity would also convert,
- * sorts as text here; such a value in a numeric field is already a schema
- * warning.)
+ * INTEGER column.
  */
 export function scanOrderSql(field: string, affinity: ScanAffinity): string {
   const raw = scanValueSql(field);
   if (affinity === "TEXT") return `CAST(${raw} AS TEXT)`;
-  return `(CASE WHEN typeof(${raw}) = 'text' AND CAST(CAST(${raw} AS NUMERIC) AS TEXT) = ${raw} THEN CAST(${raw} AS NUMERIC) ELSE ${raw} END)`;
+  // `x = CAST(x AS NUMERIC)` is true for text exactly when NUMERIC affinity
+  // would convert it: the CAST side carries NUMERIC affinity, so SQLite
+  // applies that affinity to x before comparing, and text that isn't a
+  // well-formed number stays text and can't equal a number. So `"08"`, `" 5"`
+  // and `"1e2"` sort as 8, 5 and 100, as the filter (and an INTEGER column)
+  // reads them; `"1-2"` and `"abc"` stay text.
+  return `(CASE WHEN typeof(${raw}) = 'text' AND ${raw} = CAST(${raw} AS NUMERIC) THEN CAST(${raw} AS NUMERIC) ELSE ${raw} END)`;
 }
 
 // ---------------------------------------------------------------------------
