@@ -112,8 +112,14 @@ export type TagChange =
  */
 function touches(store: Store, change: TagChange, holder: string): boolean {
   const under = (name: string) => holder === name || holder.startsWith(`${name}/`);
-  // A rename takes its sub-tags along matched without case (notes.ts renameTag: `team` takes `TEAM/a`; review 3).
-  const underAnyCase = (name: string) => under(name) || holder.toLowerCase().startsWith(`${name.toLowerCase()}/`);
+  // A rename takes its sub-tags along matched without case (notes.ts renameTag: `team` takes `TEAM/a`), so the
+  // source is folded both ways: a holder at or under it (`TEAM`, `TEAM/a`) and a holder above it (`ORG` when `org/x`
+  // is renamed, which takes `ORG/x/y`). JS folds more than SQLite's ASCII `lower`, so this can only refuse more.
+  const underAnyCase = (name: string) => {
+    const lh = holder.toLowerCase();
+    const ln = name.toLowerCase();
+    return under(name) || lh === ln || lh.startsWith(`${ln}/`) || ln.startsWith(`${lh}/`);
+  };
   switch (change.kind) {
     case "rename":
       return underAnyCase(change.from) || under(change.to) || reaches(store, holder, change.from) || reaches(store, holder, change.to);
