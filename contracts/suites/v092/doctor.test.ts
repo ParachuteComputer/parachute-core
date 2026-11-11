@@ -1,19 +1,17 @@
 // 0.9.2 row 5, "`doctor` additions": the declared-reference gap, near names, and the indexed-field count with a
 // teaching refusal near 88 (SPEC §8: cloud keeps every indexed field as a column, 100 columns per table, 12 taken).
 //
-// Proposed, not decided: the refusal at the 89th indexed field holds on every door, not only cloud, so a vault never
-// meets the limit late when it moves from a box to cloud (one system). If the build keeps it cloud-only, this
-// contract needs a `lacks` entry for the box in suites/door/deliberate.json; a change of meaning, for the owners.
+// Decided (Aaron, 11-11: "every door"): the refusal at the 89th indexed field holds on every door, not only cloud,
+// so a vault never meets the limit late when it moves from a box to cloud (one system).
 //
 // The 700-type cap (teaching.test.ts) and the 88-index contract both fill the run's second vault. They rely on bun
 // running these files one after another in one process, as it does today.
 import { describe, expect, test } from "bun:test";
 import { door, enc, rest, runId } from "../door/_door.ts";
-import { findings, must, red, said } from "./_v092.ts";
+import { findings, must, said } from "./_v092.ts";
 
 const api = rest("admin");
 const writer = rest("write");
-const LANE = "0.9.2 doctor";
 
 /** Every number in a reply whose key path (or a string beside it, e.g. a finding's `type`) matches `topic`. */
 function numbersUnder(v: unknown, topic: RegExp, path = ""): number[] {
@@ -68,7 +66,7 @@ describe("0.9.2 doctor additions", () => {
     must(mine.length > 0, `doctor: no near-name finding for ${field} and ${near}: ${said(findings(doc.body).map((x) => x.type))}`);
   });
 
-  red("doctor counts indexed fields against the limit of 88, and the 89th is refused with what to prune", { reason: /^doctor: no indexed-field count/, lane: LANE }, async () => {
+  test("doctor counts indexed fields against the limit of 88, and the 89th is refused with what to prune", async () => {
     // On the run's second vault, so the 88 columns don't land on the vault the other contracts use.
     const other = rest("admin", door().otherVault);
     const tag = runId("ix");

@@ -64,7 +64,7 @@ import { historyTablesPresent, deletedHistoryStats, historyStorageStats, topNote
 import { readCompactState, type CompactState } from "./history-compact-state.js";
 import { Database } from "bun:sqlite";
 import { loadTagHierarchy, findHierarchyCycles, nearName } from "./tag-hierarchy.js";
-import { listIndexedFields } from "./indexed-fields.js";
+import { listIndexedFields, countIndexedFields, findUnusedIndexedFields, INDEXED_FIELD_LIMIT } from "./indexed-fields.js";
 import { pruneOrphanedIndexedFields } from "./indexed-fields.js";
 import { loadSchemaConfig } from "./schema-defaults.js";
 import { readBlobContent, hashContent, HistoryDeltaOrphanError } from "./history.js";
@@ -138,7 +138,8 @@ export type DoctorFindingType =
   | "tag_used_like_type"
   | "mixed_type_field"
   | "declared_reference_gap"
-  | "near_names";
+  | "near_names"
+  | "indexed_field_limit";
 
 export type DoctorSeverity = "error" | "warning" | "info";
 
@@ -162,6 +163,11 @@ export interface DoctorReport {
   findings: DoctorFinding[];
   summary: string;
   scanned_at: string;
+  /**
+   * (0.9.2) Indexed fields against the ceiling every Parachute holds
+   * (`INDEXED_FIELD_LIMIT`). Unscoped runs only: the count is vault-wide.
+   */
+  indexed_fields?: { count: number; limit: number };
   history_audit?: HistoryAuditPage;
 }
 
@@ -232,6 +238,7 @@ export function runDoctorScan(db: Database, opts?: DoctorScanOpts): DoctorReport
     ...(allowedTags === null ? scanCompactStateDrift(db) : []),
     ...(allowedTags === null ? scanTagsUsedLikeTypes(db) : []),
     ...scanFieldShapes(db, allowedTags, opts?.noteTagsInScope),
+    ...(allowedTags === null ? scanIndexedFieldLimit(db) : []),
   ];
 
   const audit = opts?.deep ? auditHistoryBlobs(db, opts.history_after, opts.history_max_blobs, opts.history_budget_ms) : undefined;
@@ -249,7 +256,32 @@ export function runDoctorScan(db: Database, opts?: DoctorScanOpts): DoctorReport
       : `${findings.length} finding(s): ${errors} error(s), ${warnings} warning(s), ${infos} info(s)`;
 
   return { findings, summary, scanned_at: new Date().toISOString(),
+    ...(allowedTags === null ? { indexed_fields: { count: countIndexedFields(db), limit: INDEXED_FIELD_LIMIT } } : {}),
     ...(audit ? { history_audit: audit } : {}) };
+}
+
+// ---------------------------------------------------------------------------
+// Indexed-field ceiling (0.9.2). At the limit the next new indexed field is
+// refused; over it (a vault that got there before 0.9.2) nothing breaks, but
+// the vault can't move to cloud until it's back under.
+// ---------------------------------------------------------------------------
+
+function scanIndexedFieldLimit(db: Database): DoctorFinding[] {
+  const count = countIndexedFields(db);
+  if (count < INDEXED_FIELD_LIMIT) return [];
+  const unused = findUnusedIndexedFields(db).map((u) => u.field);
+  const over = count > INDEXED_FIELD_LIMIT;
+  return [{
+    type: "indexed_field_limit",
+    severity: over ? "warning" : "info",
+    subject: "indexed fields",
+    detail: over
+      ? `${count} indexed fields, over the limit of ${INDEXED_FIELD_LIMIT}: every one still works here, but a new indexed field is refused and the vault can't move to cloud (100 columns per table) until it's at ${INDEXED_FIELD_LIMIT} or fewer.`
+      : `${count} indexed fields, at the limit of ${INDEXED_FIELD_LIMIT}: the next new indexed field is refused.`,
+    remedy: unused.length > 0
+      ? `unused indexed fields: ${unused.slice(0, 20).join(", ")}${unused.length > 20 ? `, and ${unused.length - 20} more` : ""}. Run prune-schema for fields no type declares, or drop \`indexed\` from fields you don't filter or sort by (update-tag).`
+      : "drop `indexed` from fields you don't filter or sort by (update-tag); an unindexed field can still be filtered, by a scan.",
+  }];
 }
 
 // ---------------------------------------------------------------------------

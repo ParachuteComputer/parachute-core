@@ -61,7 +61,7 @@ export class IndexedFieldError extends Error {
   // Stable error_type (vault#554) — additive; matches the string REST has
   // hardcoded in its json response since vault#478. Lets the generic MCP
   // domain-error mapping (src/mcp-http.ts) pick this class up.
-  error_type = "invalid_indexed_field" as const;
+  error_type: "invalid_indexed_field" | "indexed_field_limit" = "invalid_indexed_field";
   /**
    * Structured context for the CROSS-DECLARER sqlite-type conflict thrown
    * by `declareField` (vault#554 auth-and-scope fold): the message names
@@ -74,6 +74,61 @@ export class IndexedFieldError extends Error {
    */
   field?: string;
   declarer_tags?: string[];
+}
+
+/**
+ * The indexed-field ceiling (0.9.2, SPEC §8). Every indexed field is a
+ * generated column on `notes`; cloud's SQLite allows 100 columns per table
+ * and `notes` already uses 12, so 88 indexed fields is the most a vault can
+ * hold on every door. Held on the box too (Aaron, 11-11: "every door"), so a
+ * box vault can always move to cloud.
+ *
+ * Only a NEW field is refused: adding a declarer to an already-indexed field,
+ * re-declaring, or a sole declarer's retype doesn't add a column. A vault
+ * already over the ceiling keeps every column it has; `doctor` reports the
+ * excess.
+ */
+export const INDEXED_FIELD_LIMIT = 88;
+
+/** An indexed field the refusal suggests dropping, and why it's a candidate. */
+export interface UnusedIndexedField {
+  field: string;
+  /**
+   * `no_live_declarer`: every declaring type is gone (prune-schema drops it).
+   * `no_values`: no record holds a value for it (drop `indexed` on its type).
+   */
+  reason: "no_live_declarer" | "no_values";
+  declarer_tags: string[];
+}
+
+/** Refusal for the indexed field past {@link INDEXED_FIELD_LIMIT}. */
+export class IndexedFieldLimitError extends IndexedFieldError {
+  override name = "IndexedFieldLimitError";
+  override error_type = "indexed_field_limit" as const;
+  readonly limit = INDEXED_FIELD_LIMIT;
+  constructor(
+    field: string,
+    /** Indexed fields the vault holds now. */
+    readonly got: number,
+    readonly unused: UnusedIndexedField[],
+  ) {
+    super(indexedFieldLimitMessage(field, got, unused));
+    this.field = field;
+  }
+}
+
+/** The refusal's words; rebuilt by the tag-scope scrub with a filtered `unused`. */
+export function indexedFieldLimitMessage(field: string, got: number, unused: UnusedIndexedField[]): string {
+  const head = `cannot index "${field}": this vault already has ${got} indexed fields and the limit is ${INDEXED_FIELD_LIMIT} on every Parachute.`;
+  if (unused.length === 0) {
+    return `${head} No indexed field looks unused; drop \`indexed\` from a field you don't filter or sort by (update-tag), or leave "${field}" unindexed: it can still be filtered, by a scan.`;
+  }
+  const list = unused
+    .slice(0, 20)
+    .map((u) => `${u.field} (${u.reason === "no_live_declarer" ? "no type declares it; prune-schema drops it" : "no record holds a value"})`)
+    .join(", ");
+  const more = unused.length > 20 ? `, and ${unused.length - 20} more` : "";
+  return `${head} Unused indexed fields you can prune first: ${list}${more}. Run prune-schema for fields no type declares, or drop \`indexed\` from the others (update-tag).`;
 }
 
 // Restrict field names to safe SQL identifiers. This also bounds the
@@ -127,6 +182,37 @@ export function listIndexedFields(db: Database): IndexedField[] {
   return rows.map(rowToField);
 }
 
+export function countIndexedFields(db: Database): number {
+  return (db.prepare("SELECT COUNT(*) AS n FROM indexed_fields").get() as { n: number }).n;
+}
+
+/**
+ * Indexed fields that look safe to drop, surest first: no live declarer (what
+ * prune-schema drops), then no record holding a value (the column's index answers the
+ * `IS NOT NULL` probe, so this is one index seek per field).
+ */
+export function findUnusedIndexedFields(db: Database): UnusedIndexedField[] {
+  const liveTags = new Set(
+    (db.prepare("SELECT name FROM tags").all() as { name: string }[]).map((r) => r.name),
+  );
+  const out: UnusedIndexedField[] = [];
+  for (const f of listIndexedFields(db)) {
+    if (!f.declarerTags.some((t) => liveTags.has(t))) {
+      out.push({ field: f.field, reason: "no_live_declarer", declarer_tags: f.declarerTags });
+      continue;
+    }
+    let held = true;
+    try {
+      held = db.prepare(`SELECT 1 FROM notes WHERE "${columnName(f.field)}" IS NOT NULL LIMIT 1`).get() != null;
+    } catch {
+      // Column missing (a failed rebuild): don't guess, leave it out.
+    }
+    if (!held) out.push({ field: f.field, reason: "no_values", declarer_tags: f.declarerTags });
+  }
+  // prune-schema's own (no live declarer) first: the surest to drop.
+  return [...out.filter((u) => u.reason === "no_live_declarer"), ...out.filter((u) => u.reason === "no_values")];
+}
+
 export function getIndexedField(db: Database, field: string): IndexedField | null {
   const row = db
     .prepare("SELECT field, sqlite_type, declarer_tags FROM indexed_fields WHERE field = ?")
@@ -174,6 +260,8 @@ function dropColumnAndIndex(db: Database, field: string): void {
  * Register `tag` as a declarer of indexed `field` with the given storage type.
  *
  * - First declarer: inserts the row, creates the generated column + index.
+ *   Refused with `IndexedFieldLimitError` when the vault already holds
+ *   `INDEXED_FIELD_LIMIT` indexed fields.
  * - Additional declarer (matching type): adds tag to the set. Idempotent if
  *   the tag is already a declarer.
  * - Type mismatch with an existing *other* declarer: throws. This is a
@@ -192,6 +280,10 @@ export function declareField(
   validateFieldName(field);
   const existing = getIndexedField(db, field);
   if (!existing) {
+    const got = countIndexedFields(db);
+    if (got >= INDEXED_FIELD_LIMIT) {
+      throw new IndexedFieldLimitError(field, got, findUnusedIndexedFields(db));
+    }
     db.prepare(
       "INSERT INTO indexed_fields (field, sqlite_type, declarer_tags) VALUES (?, ?, ?)",
     ).run(field, sqliteType, JSON.stringify([tag]));

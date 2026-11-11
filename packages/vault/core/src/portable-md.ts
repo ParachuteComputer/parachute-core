@@ -82,6 +82,7 @@ import { basename, join, relative, extname, dirname, posix, resolve as resolvePa
 import type { Store, Note, Link, Attachment } from "./types.js";
 import type { TagRecord } from "./tag-schemas.js";
 import { ParentCycleError } from "./tag-schemas.js";
+import { IndexedFieldLimitError } from "./indexed-fields.js";
 import { transactionAsync } from "./txn.js";
 import { timestampToMs } from "./cursor.js";
 import { computeDisplayTitle } from "./display-title.js";
@@ -2128,6 +2129,13 @@ export interface ImportStats {
    */
   skipped_schema_parents: Array<{ tag: string; parent_names: string[]; reason: string }>;
   /**
+   * Fields restored WITHOUT their index because the vault reached
+   * `INDEXED_FIELD_LIMIT` (0.9.2). The field, its declaration and every
+   * value land; only `indexed` is turned off, so the import completes.
+   * Empty unless the export came from a vault over the limit.
+   */
+  unindexed_schema_fields: Array<{ tag: string; field: string; reason: string }>;
+  /**
    * Content files skipped because their frontmatter `id` couldn't be used as
    * a note key (vault#589 / FIX 3): a DUPLICATE id (a later file shares an id
    * with one already imported — the first wins, deterministically, since
@@ -2356,6 +2364,7 @@ export async function importVault(
     skipped_attachments: [],
     skipped_sidecars: [],
     skipped_schema_parents: [],
+    unindexed_schema_fields: [],
     skipped_duplicate_ids: [],
     notes_wiped: 0,
     indexes_declared: 0,
@@ -2462,27 +2471,43 @@ async function importVaultReplay(
       parent_names: parentNames,
       ...(frontmatter.kind === "type" ? { kind: "type" as const } : {}),
     };
-    try {
-      await store.upsertTagRecord(tagName, patch);
-    } catch (err) {
-      // vault#552: the write-time cycle guard rejects a `parent_names` that
-      // would close a hierarchy cycle. An OLD export carrying a mutual-cycle
-      // fixture (accepted before the guard shipped) must still import —
-      // dropping the offending `parent_names` and warning, not aborting the
-      // whole import mid-flight (import isn't atomic; on a blow-away replace
-      // the vault was already wiped in step 1, so an uncaught throw here
-      // would leave it EMPTY). Retry WITHOUT parent_names so the tag's
-      // description/fields/relationships still land; record a skip warning
-      // mirroring the skipped_links/skipped_attachments/skipped_sidecars
-      // precedent. Any OTHER error still propagates.
-      if (err instanceof ParentCycleError) {
-        stats.skipped_schema_parents.push({
-          tag: tagName,
-          parent_names: parentNames ?? [],
-          reason: `parent_names would create a hierarchy cycle (${err.cycle.join(" → ")}); dropped on import`,
-        });
-        await store.upsertTagRecord(tagName, { ...patch, parent_names: null });
-      } else {
+    // Retries until the schema lands. Each retry drops one thing, so it ends.
+    let attempt: typeof patch = patch;
+    for (;;) {
+      try {
+        await store.upsertTagRecord(tagName, attempt);
+        break;
+      } catch (err) {
+        // vault#552: the write-time cycle guard rejects a `parent_names` that
+        // would close a hierarchy cycle. An OLD export carrying a mutual-cycle
+        // fixture (accepted before the guard shipped) must still import —
+        // dropping the offending `parent_names` and warning, not aborting the
+        // whole import mid-flight (import isn't atomic; on a blow-away replace
+        // the vault was already wiped in step 1, so an uncaught throw here
+        // would leave it EMPTY). Retry WITHOUT parent_names so the tag's
+        // description/fields/relationships still land; record a skip warning
+        // mirroring the skipped_links/skipped_attachments/skipped_sidecars
+        // precedent. Any OTHER error still propagates.
+        if (err instanceof ParentCycleError && attempt.parent_names !== null) {
+          stats.skipped_schema_parents.push({
+            tag: tagName,
+            parent_names: parentNames ?? [],
+            reason: `parent_names would create a hierarchy cycle (${err.cycle.join(" → ")}); dropped on import`,
+          });
+          attempt = { ...attempt, parent_names: null };
+          continue;
+        }
+        // 0.9.2 ceiling: an export from a vault over INDEXED_FIELD_LIMIT
+        // still imports whole. The field and its values land; only its index
+        // is left off (it stays filterable, by a scan). Same reason as above:
+        // a throw here could leave a wiped vault empty.
+        const field = err instanceof IndexedFieldLimitError ? err.field : undefined;
+        const spec = field !== undefined ? (attempt.fields as Record<string, any> | null)?.[field] : undefined;
+        if (field !== undefined && spec?.indexed === true) {
+          stats.unindexed_schema_fields.push({ tag: tagName, field, reason: (err as Error).message });
+          attempt = { ...attempt, fields: { ...(attempt.fields as Record<string, any>), [field]: { ...spec, indexed: false } } };
+          continue;
+        }
         throw err;
       }
     }

@@ -22,7 +22,7 @@
 import type { Store, Note, HydratedLink, NoteSummary } from "../core/src/types.ts";
 import type { TagFieldViolation } from "../core/src/tag-schemas.ts";
 import { ParentCycleError } from "../core/src/tag-schemas.ts";
-import { IndexedFieldError } from "../core/src/indexed-fields.ts";
+import { IndexedFieldError, IndexedFieldLimitError } from "../core/src/indexed-fields.ts";
 import { getTagExpansion, stripTagHash } from "../core/src/tag-hierarchy.ts";
 import { getVaultNameForStore } from "./vault-store.ts";
 import { readPrivateTagsConfig } from "./config.ts";
@@ -797,6 +797,14 @@ export function scrubIndexedFieldConflictError(
   allowed: Set<string> | null,
 ): IndexedFieldError {
   if (allowed === null) return err;
+  // The 0.9.2 ceiling's refusal lists unused indexed fields vault-wide. A
+  // scoped caller hears only the ones every declarer of which it can read;
+  // the count and limit stay (the refusal needs them to make sense).
+  if (err instanceof IndexedFieldLimitError) {
+    const unused = err.unused.filter((u) => u.declarer_tags.length > 0 && u.declarer_tags.every((t) => allowed.has(t)));
+    if (unused.length === err.unused.length) return err;
+    return new IndexedFieldLimitError(err.field ?? "?", err.got, unused);
+  }
   if (!Array.isArray(err.declarer_tags) || err.declarer_tags.length === 0) return err;
   if (err.declarer_tags.every((t) => allowed.has(t))) return err;
   return new IndexedFieldError(

@@ -1703,16 +1703,20 @@ export class BunSqliteStore implements Store {
         const record = tagSchemaOps.upsertTagRecord(this.db, tag, patch);
 
         if (patch.fields !== undefined) {
+          // Release first (0.9.2 ceiling): a write that swaps one indexed
+          // field for another frees its column before the new one is counted
+          // against INDEXED_FIELD_LIMIT. The two sets are disjoint, so the
+          // order changes nothing else; a refusal rolls both back.
+          for (const fieldName of priorIndexed) {
+            if (!nextIndexed.has(fieldName)) {
+              indexedFieldOps.releaseField(this.db, fieldName, tag);
+            }
+          }
           for (const fieldName of nextIndexed) {
             const spec = nextFields![fieldName]!;
             // Type already validated above; non-null assertion is safe here.
             const mapped = indexedFieldOps.mapFieldType(spec.type)!;
             indexedFieldOps.declareField(this.db, fieldName, mapped, tag);
-          }
-          for (const fieldName of priorIndexed) {
-            if (!nextIndexed.has(fieldName)) {
-              indexedFieldOps.releaseField(this.db, fieldName, tag);
-            }
           }
         }
 
