@@ -41,7 +41,7 @@ describe("0.9.2 safe schema change", () => {
     expect(put.status, said(put.body)).toBe(200);
   });
 
-  red("a retype that would strand records is refused, says how many, and leaves the type as it was", { reason: /^accepted: 200/, lane: LANE }, async () => {
+  test("a retype that would strand records is refused, says how many, and leaves the type as it was", async () => {
     const put = await api.put(`/tags/${enc(tag)}`, { fields: { [count]: { type: "date", indexed: true }, [label]: { type: "string", strict: true } } });
     try {
       must(put.status >= 400 && put.status < 500, `accepted: ${put.status}`);
@@ -56,7 +56,7 @@ describe("0.9.2 safe schema change", () => {
     }
   });
 
-  red("a dry-run migrate over REST says what a retype would change, and writes nothing", { reason: /^no migrate over REST: 404/, lane: LANE }, async () => {
+  test("a dry-run migrate over REST says what a retype would change, and writes nothing", async () => {
     const plan = await api.post(`/tags/${enc(tag)}/migrate`, { field: count, transform: { kind: "to_string" } });
     must(plan.status !== 404, `no migrate over REST: ${plan.status}`);
     must(plan.status === 200, `migrate gave ${plan.status} ${said(plan.body).slice(0, 300)}`);
@@ -65,13 +65,13 @@ describe("0.9.2 safe schema change", () => {
     must(after.body.length === 1 && after.body[0].metadata[count] === 8, `the dry run wrote: ${said(after.body).slice(0, 300)}`);
   });
 
-  red("a dry-run migrate needs an admin credential", { reason: /^no migrate over REST: 404/, lane: LANE }, async () => {
+  test("a dry-run migrate needs an admin credential", async () => {
     const plan = await writer.post(`/tags/${enc(tag)}/migrate`, { field: count, transform: { kind: "to_string" } });
     must(plan.status !== 404, `no migrate over REST: ${plan.status}`);
     must(plan.status === 403, `a write credential got ${plan.status}`);
   });
 
-  red("over MCP, manage-types migrate gives the same dry-run plan", { reason: /^no migrate over MCP: .*manage-types has no parameter `field`/, lane: LANE }, async () => {
+  test("over MCP, manage-types migrate gives the same dry-run plan", async () => {
     const m = await mcp("admin");
     try {
       let plan: unknown;

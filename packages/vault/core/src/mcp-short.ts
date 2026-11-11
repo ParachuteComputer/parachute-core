@@ -206,6 +206,21 @@ Rarer filters (has_links, order_by, expand_links, created_by, search_mode, …) 
     inputSchema: obj({ apply: bool() }),
   },
 
+  // Reached only as manage-types {action: "migrate"} (FOLD_ONLY below); never listed.
+  "migrate-field": {
+    description: "Change a field's values on every record of a type. A dry run unless `apply: true`.",
+    inputSchema: obj(
+      {
+        tag: str(),
+        field: str(),
+        transform: { type: "object", description: '{kind: "to_string"|"to_int"|"to_number"|"to_boolean"|"rename"|"remap"|"set_default", ...}' },
+        apply: bool(),
+        continue_on_error: bool(),
+      },
+      ["tag", "field", "transform"],
+    ),
+  },
+
   doctor: {
     description: `Read-only check of types, tags and fields (dangling parents, cycles, mixed field types). Returns findings, each with a remedy; fixes nothing. ${HELP("doctor")}`,
     inputSchema: obj({ deep: bool("Also check history") }),
@@ -362,10 +377,10 @@ export function nestedParamProblem(tool: string, params: Record<string, unknown>
 /** The tools 0.9 adds; each runs the old tools underneath (src/mcp-tools.ts). */
 export const NEW_TOOLS: Record<string, ShortTool & { folds: Record<string, string> }> = {
   "manage-types": {
-    description: `Change the vault's types and tags. \`action\`: update (default: create or change one; \`fields\` and \`parent_names\` make it a type), rename {old_name, new_name}, merge {sources, target}, delete {tag, detach?}, prune (drop unused indexed columns; a dry run unless \`apply: true\`). ${HELP("manage-types")}`,
+    description: `Change the vault's types and tags. \`action\`: update (default: create or change one; \`fields\` and \`parent_names\` make it a type), rename {old_name, new_name}, merge {sources, target}, delete {tag, detach?}, prune (drop unused indexed columns; a dry run unless \`apply: true\`), migrate {tag, field, transform} (change a field's values, e.g. before a retype; a dry run unless \`apply: true\`). ${HELP("manage-types")}`,
     inputSchema: obj(
       {
-        action: { type: "string", enum: ["update", "rename", "merge", "delete", "prune"] },
+        action: { type: "string", enum: ["update", "rename", "merge", "delete", "prune", "migrate"] },
         tag: str(),
         kind: { type: "string", enum: ["type", "tag"], description: "type: has fields/parents; tag: a flat label" },
         description: str(),
@@ -376,11 +391,14 @@ export const NEW_TOOLS: Record<string, ShortTool & { folds: Record<string, strin
         sources: { type: "array", items: { type: "string" } },
         target: str(),
         detach: bool(),
+        field: str(),
+        transform: { type: "object", description: '{kind: "to_string"|"to_int"|"remap"|…}' },
+        continue_on_error: bool(),
         apply: bool(),
         force: bool("Go ahead although a key's tag limit, private_tags or the published tag reaches this name (the refusal names them, except to a tag-scoped pass)"),
       },
     ),
-    folds: { update: "update-tag", rename: "rename-tag", merge: "merge-tags", delete: "delete-tag", prune: "prune-schema" },
+    folds: { update: "update-tag", rename: "rename-tag", merge: "merge-tags", delete: "delete-tag", prune: "prune-schema", migrate: "migrate-field" },
   },
   "attachment-url": {
     description: `A one-use URL for an attachment's bytes. upload: \`record\`, \`filename\` and exact \`size_bytes\`, then PUT the bytes to \`url\`. download: \`attachment_id\` (from query-records \`include_attachments: true\`). ${HELP("attachment-url")}`,
@@ -402,6 +420,9 @@ export const NEW_TOOLS: Record<string, ShortTool & { folds: Record<string, strin
 
 /** `query-notes {path_between}` replaces find-path. */
 export const PATH_BETWEEN: Schema = PATH_BETWEEN_REF;
+
+/** Tools reached only through a 0.9 tool's `action`, never listed on their own. */
+export const FOLD_ONLY: ReadonlySet<string> = new Set(["migrate-field"]);
 
 /** The nine old names 0.9 keeps as listed, working aliases until 1.0 (Prism allow-lists some by name). */
 export const TOOL_ALIASES: Record<string, string> = {

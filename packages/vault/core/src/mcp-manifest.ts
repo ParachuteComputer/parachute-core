@@ -712,6 +712,30 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
       condition: "core",
     },
     {
+      name: "migrate-field",
+      // `admin` (0.9.2), like prune-schema: it rewrites a field on every
+      // record carrying the type. Reached only as manage-types {action:
+      // "migrate"}; not listed on its own (src/mcp-tools.ts FOLD_ONLY).
+      requiredVerb: "admin",
+      description:
+        "Change a field's values on every record carrying a type (and its subtypes), e.g. before retyping the field. A dry run unless apply: true: it returns {would_change, unchanged, errored, sample, errors}. Atomic: if any value can't be converted, nothing is written unless continue_on_error: true.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          tag: { type: "string", description: "The type whose records carry the field." },
+          field: { type: "string", description: "The field whose values change." },
+          transform: {
+            type: "object",
+            description: '{kind: "to_string"|"to_int"|"to_number"|"to_boolean"} converts each value; {kind: "rename", to} moves it to another field; {kind: "remap", map: {old: new}, default?}; {kind: "set_default", value, onlyInvalid?}.',
+          },
+          apply: { type: "boolean", description: "Write the change. Default false: a dry run." },
+          continue_on_error: { type: "boolean", description: "Write the values that convert and report the rest. Default false: all or nothing." },
+        },
+        required: ["tag", "field", "transform"],
+      },
+      condition: "core",
+    },
+    {
       name: "doctor",
       // `read` (was `admin` — the original reasoning: same tier as
       // prune-schema, a diagnostic over the WHOLE vault's taxonomy, not

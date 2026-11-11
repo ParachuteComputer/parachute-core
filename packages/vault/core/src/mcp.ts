@@ -60,6 +60,8 @@ import {
   alignByteWindow,
 } from "./content-range.js";
 import { MCP_TOOL_MANIFEST } from "./mcp-manifest.js";
+import { findRetypeConflicts, retypeHint } from "./conformance.js";
+import { MigrateRequestError, runMigrateRequest } from "./migrate-tag-field.js";
 import {
   BLOCKED_ATTACHMENT_EXTENSIONS,
   ATTACHMENT_MIME_TYPES,
@@ -2720,6 +2722,25 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
         // callers (MCP, REST PUT /tags/:name, import) share — so it can't be
         // bypassed. The cross-tag validation above stays here to surface a
         // clean error before persisting. See the gitcoin orphaned-fields bug.
+        // 0.9.2 safe schema change: refuse a retype that would strand records
+        // (same check, words and shape as REST's 409; conformance.ts).
+        if (fieldsPatch !== undefined) {
+          const conflicts = findRetypeConflicts(db, tag, fieldsPatch);
+          if (conflicts.length > 0) {
+            const first = conflicts[0]!;
+            throw structuredError(
+              `Not changed: retyping "${first.field}" on "${tag}" from ${first.from} to ${first.to} would strand ${first.count} record${first.count === 1 ? "" : "s"}.`,
+              {
+                error_type: "retype_conflict",
+                field: first.field,
+                tag,
+                count: first.count,
+                conflicts: conflicts.map((c) => ({ field: c.field, from: c.from, to: c.to, count: c.count })),
+                hint: retypeHint(tag, first),
+              },
+            );
+          }
+        }
         const result = await store.upsertTagRecord(tag, {
           ...(descriptionPatch !== undefined ? { description: descriptionPatch } : {}),
           ...(fieldsPatch !== undefined ? { fields: fieldsPatch } : {}),
@@ -2868,6 +2889,30 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             ? `pruned ${dropped.length} orphaned field(s); trimmed dead declarers on ${trimmed.length} co-declared field(s)`
             : `would prune ${dropped.length} orphaned field(s); would trim dead declarers on ${trimmed.length} co-declared field(s) — pass apply:true to execute`,
         };
+      },
+    },
+
+    // =====================================================================
+    // 10b. migrate-field — manage-types {action: "migrate"} (0.9.2): the
+    // CLI's `schema migrate-field` engine, a dry run unless apply: true.
+    // =====================================================================
+    {
+      name: "migrate-field",
+      execute: async (params) => {
+        const tag = params.tag;
+        if (typeof tag !== "string" || tag.length === 0) {
+          throw structuredError("migrate needs `tag`: the type whose records carry the field", { error_type: "invalid_request", field: "tag" });
+        }
+        try {
+          return await runMigrateRequest(store, tag, params, {
+            actor: writeActor,
+            via: writeVia,
+            ...(onStrictBypass ? { onStrictBypass } : {}),
+          });
+        } catch (e) {
+          if (e instanceof MigrateRequestError) throw structuredError(e.message, { error_type: "invalid_request", field: e.field });
+          throw e;
+        }
       },
     },
 

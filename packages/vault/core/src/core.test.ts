@@ -2628,7 +2628,10 @@ describe("MCP tools", async () => {
     // synthesize-notes retired in v17 — replicable with query-notes(near=) +
     // find-path + agent-side aggregation. See vault#268.
     expect(names).not.toContain("synthesize-notes");
-    expect(tools).toHaveLength(13);
+    // migrate-field (0.9.2): manage-types {action: "migrate"}; the server
+    // layer leaves it out of tools/list (mcp-short.ts FOLD_ONLY).
+    expect(names).toContain("migrate-field");
+    expect(tools).toHaveLength(14);
   });
 
   it("create-note tool works", async () => {

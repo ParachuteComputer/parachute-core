@@ -627,7 +627,7 @@ describe("deeper link queries", async () => {
 describe("MCP tools", async () => {
   test("generates the consolidated tool set", () => {
     const tools = generateMcpTools(store);
-    expect(tools.length).toBe(13);
+    expect(tools.length).toBe(14);
 
     const names = tools.map((t) => t.name);
     expect(names).toContain("query-notes");

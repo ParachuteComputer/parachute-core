@@ -12,7 +12,7 @@ import { MCP_TOOL_REFERENCE, acceptedParams } from "../core/src/mcp-manifest.ts"
 import { mergeTypesIntoTags, refuseTypesInTags } from "../core/src/tag-kind.ts";
 import { addRecordTools, NOTE_TOOL_NAMES, RECORD_TOOL_NAMES, recordParamNames, recordSchema, recordWords } from "../core/src/mcp-records.ts";
 import { countName } from "./name-usage.ts";
-import { nestedParamProblem, NEW_TOOLS, SHORT_TOOLS, TOOL_ALIASES, TOOL_ORDER, aliasDescription, unknownParams, REFUSES_UNKNOWN_PARAMS, type ParamProblem } from "../core/src/mcp-short.ts";
+import { FOLD_ONLY, nestedParamProblem, NEW_TOOLS, SHORT_TOOLS, TOOL_ALIASES, TOOL_ORDER, aliasDescription, unknownParams, REFUSES_UNKNOWN_PARAMS, type ParamProblem } from "../core/src/mcp-short.ts";
 import { getNote, getNoteTags, getVaultMap, getVaultStats } from "../core/src/notes.ts";
 import { narrowLinkWarningsForVisibility } from "../core/src/wikilinks.ts";
 import type { Note } from "../core/src/types.ts";
@@ -504,6 +504,7 @@ function applyElevenTools(tools: McpToolDef[], vaultName: string, auth: AuthResu
   }
 
   for (const t of tools) {
+    if (FOLD_ONLY.has(t.name)) continue;
     if (!(t.name in TOOL_ALIASES)) {
       out.push(t);
       continue;
@@ -1166,6 +1167,12 @@ function applyTagScopeWrappers(
     error_type: "tag_scope_violation",
     message: `${msg} (token tag-allowlist: ${rawTags.join(", ")})`,
     scoped_tags: rawTags,
+  });
+
+  // migrate (0.9.2) rewrites every record carrying the type, including ones
+  // outside the allowlist, and its plan lists them: vault-wide, refused.
+  wrapReadTool(tools, "migrate-field", async () => {
+    throw Object.assign(new Error("Forbidden: migrate changes every record of a type, beyond this pass's tags"), forbidden("migrate changes every record of the type, including ones outside the allowlist") as object);
   });
 
   wrapReadTool(tools, "create-note", async (orig, params) => {

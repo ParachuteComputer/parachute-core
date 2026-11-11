@@ -178,7 +178,7 @@ export interface ValidationStatus {
 // Loading
 // ---------------------------------------------------------------------------
 
-function parseFieldsJson(raw: string | null): Record<string, SchemaField> {
+export function parseFieldsJson(raw: string | null): Record<string, SchemaField> {
   if (!raw) return {};
   let parsed: unknown;
   try {
