@@ -44,7 +44,8 @@ describe("0.9.2 safe schema change", () => {
     try {
       must(put.status >= 400 && put.status < 500, `accepted: ${put.status}`);
       must(said(put.body).includes(count), `the refusal doesn't name the field: ${said(put.body).slice(0, 300)}`);
-      must(said(put.body).includes("3"), `the refusal doesn't say how many records disagree (3): ${said(put.body).slice(0, 300)}`);
+      // The count, as a JSON number or in words: not a digit inside a name.
+      must(/:\s*3[,}\]]|\b3 records?\b/.test(said(put.body)), `the refusal doesn't say how many records disagree (3): ${said(put.body).slice(0, 300)}`);
       const now = await api.get(`/tags/${enc(tag)}`);
       must(now.body.fields?.[count]?.type === "integer", `the type changed anyway: ${said(now.body.fields)}`);
     } finally {
@@ -68,7 +69,7 @@ describe("0.9.2 safe schema change", () => {
     must(plan.status === 403, `a write credential got ${plan.status}`);
   });
 
-  red("over MCP, manage-types migrate gives the same dry-run plan", { reason: /^no migrate over MCP/, lane: LANE }, async () => {
+  red("over MCP, manage-types migrate gives the same dry-run plan", { reason: /^no migrate over MCP: .*manage-types has no parameter `field`/, lane: LANE }, async () => {
     const m = await mcp("admin");
     try {
       let plan: unknown;

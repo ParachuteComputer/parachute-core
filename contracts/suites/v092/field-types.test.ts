@@ -20,8 +20,8 @@ describe("0.9.2 one data type per field: warn", () => {
   red("a record with two types whose rules for a field disagree is checked against both, and warned by each it fails", { reason: /^not checked against/, lane: LANE }, async () => {
     const [A, B] = [runId("ta"), runId("tb")];
     const field = `st_${runId("f")}`;
-    await api.put(`/tags/${enc(A)}`, { fields: { [field]: { type: "string", enum: ["open", "done"] } } });
-    await api.put(`/tags/${enc(B)}`, { fields: { [field]: { type: "string", enum: ["todo", "done"] } } });
+    must((await api.put(`/tags/${enc(A)}`, { fields: { [field]: { type: "string", enum: ["open", "done"] } } })).status === 200, "setup: type A");
+    must((await api.put(`/tags/${enc(B)}`, { fields: { [field]: { type: "string", enum: ["todo", "done"] } } })).status === 200, "setup: type B");
     const r = runId("ft");
     // "open" meets A and fails B; "todo" meets B and fails A. Whichever type comes first, each failure is warned.
     for (const [value, fails] of [["open", B], ["todo", A]] as const) {
@@ -38,8 +38,8 @@ describe("0.9.2 one data type per field: warn", () => {
   red("doctor reports a field no type declares that holds two data types", { reason: /^doctor: no mixed-type finding/, lane: LANE }, async () => {
     const field = `mixed_${runId("f")}`;
     const r = runId("ft");
-    await writer.post("/notes", { content: "", path: `${r}/n`, metadata: { [field]: 5 } });
-    await writer.post("/notes", { content: "", path: `${r}/s`, metadata: { [field]: "five" } });
+    must((await writer.post("/notes", { content: "", path: `${r}/n`, metadata: { [field]: 5 } })).status === 201, "setup: the number");
+    must((await writer.post("/notes", { content: "", path: `${r}/s`, metadata: { [field]: "five" } })).status === 201, "setup: the string");
     const doc = await api.get("/doctor");
     must(doc.status === 200, `doctor gave ${doc.status}`);
     const mine = findings(doc.body).filter((x) => /mixed/.test(x.type) && said(x).includes(field));
@@ -50,10 +50,11 @@ describe("0.9.2 one data type per field: warn", () => {
   red("doctor reports a declared field that isn't indexed and holds two data types", { reason: /^doctor: no mixed-type finding/, lane: LANE }, async () => {
     const tag = runId("ft");
     const field = `qty_${runId("f")}`;
-    await api.put(`/tags/${enc(tag)}`, { fields: { [field]: { type: "integer" } } });
+    must((await api.put(`/tags/${enc(tag)}`, { fields: { [field]: { type: "integer" } } })).status === 200, "setup: the type");
     const r = runId("ft");
-    await writer.post("/notes", { content: "", path: `${r}/n`, tags: [tag], metadata: { [field]: 5 } });
-    await writer.post("/notes", { content: "", path: `${r}/s`, tags: [tag], metadata: { [field]: "a few" } });
+    must((await writer.post("/notes", { content: "", path: `${r}/n`, tags: [tag], metadata: { [field]: 5 } })).status === 201, "setup: the number");
+    // A loose field: the wrong type is kept, with a warning.
+    must((await writer.post("/notes", { content: "", path: `${r}/s`, tags: [tag], metadata: { [field]: "a few" } })).status === 201, "setup: the string");
     const doc = await api.get("/doctor");
     const mine = findings(doc.body).filter((x) => /mixed/.test(x.type) && said(x).includes(field));
     must(mine.length > 0, `doctor: no mixed-type finding for ${field}: ${said(findings(doc.body).map((x) => x.type))}`);

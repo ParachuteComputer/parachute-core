@@ -30,7 +30,7 @@ describe("0.9.2 teaching", () => {
   red("a new field one letter from a field the type declares is kept, with a warning naming the declared one", { reason: /^no nearest-name warning/, lane: LANE }, async () => {
     const tag = runId("t");
     const field = `status_${runId("f")}`;
-    const near = field.replace("status", "stauts");
+    const near = field.replace("status", "statu"); // one letter deleted
     expect((await api.put(`/tags/${enc(tag)}`, { fields: { [field]: { type: "string" } } })).status).toBe(200);
     const made = await rest("write").post("/notes", { content: "", path: `${runId("t")}/y`, tags: [tag], metadata: { [near]: "open" } });
     expect(made.status).toBe(201);
@@ -52,8 +52,8 @@ describe("0.9.2 teaching", () => {
       const size = said(vi).length;
       // 16,000 characters is about 4,000 tokens: the writer-list budget the 0.9.1 multi-vault door is held to.
       must(size <= 16_000, `uncapped: vault-info is ${size} characters with 700 types`);
-      // The total is a number somewhere in the reply (a JSON value of 700 or more: the run's types plus the seed's).
-      must(/:\s*7\d\d[,}\]]/.test(said(vi)), `capped, but it doesn't say how many types there are (700+)`);
+      // The total is in the reply: a JSON number of 700 or more (the run's types plus the seed's), or "of 7xx" in words.
+      must(/:\s*7\d\d[,}\]]|\bof 7\d\d\b|\b7\d\d (types|in all)\b/.test(said(vi)), `capped, but it doesn't say how many types there are (700+)`);
     } finally {
       await m.close();
     }

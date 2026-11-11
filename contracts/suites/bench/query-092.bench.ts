@@ -8,7 +8,7 @@
 // search for a word that is only in a field value, the tag list and sorts, a type PUT and a retype. It writes
 // `bench-<N>.json` to DOOR_RESULTS and prints one line per measurement. ROADMAP 0.9.2 row 1 and 2: "bench at 3k and
 // 94k". The record shape follows the T-378 perspective 8 bench, so its numbers can be compared.
-import { test } from "bun:test";
+import { afterAll, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { door, enc, safeFetch, token, vaultUrl } from "../door/_door.ts";
@@ -158,10 +158,20 @@ async function once(group: string, name: string, method: string, path: string, b
   return r;
 }
 
+// Written even when the run stops part-way, so what was measured isn't lost; `complete` says whether it finished.
+const meta: Record<string, unknown> = { complete: false };
+afterAll(() => {
+  const out = { label: LABEL, door: process.env.CONTRACT_DOOR ? door().label : null, N, cap_ms: CAP_MS, at: new Date().toISOString(), ...meta, rows };
+  const file = join(process.env.DOOR_RESULTS ?? "/tmp", `bench-${LABEL}.json`);
+  writeFileSync(file, JSON.stringify(out, null, 1));
+  console.log(`[bench] wrote ${file}${meta.complete ? "" : " (incomplete)"}`);
+});
+
 test(`query bench at ${N} records`, async () => {
   const d = door();
   console.log(`[bench] ${d.label}, N=${N}`);
   const seeded = await seed();
+  Object.assign(meta, { seeded_seconds: seeded.seconds, seed_rate: seeded.rate });
   console.log(`[bench] seeded ${N} in ${seeded.seconds.toFixed(0)} s (${seeded.rate.toFixed(0)} rec/s)`);
   const total = (await call("GET", "/notes?aggregate[op]=count&tag=rec")).body?.[0]?.value;
   if (total !== N) throw new Error(`bench: expected ${N} rec records, the vault counts ${total}`);
@@ -194,7 +204,7 @@ test(`query bench at ${N} records`, async () => {
     const numeric = ["gt", "gte", "lt", "lte"].includes(op);
     const [ix, plain] = numeric ? ["priority", "rank"] : ["customer", "owner"];
     await q("operator, indexed", `${ix} ${op} ${sv}, limit 50`, () => `/notes?meta[${ix}][${op}]=${sv}&limit=50`);
-    await q("operator, plain field", `${plain} ${op} ${numeric ? pv : pv}, limit 50`, () => `/notes?meta[${plain}][${op}]=${pv}&limit=50`, 5);
+    await q("operator, plain field", `${plain} ${op} ${pv}, limit 50`, () => `/notes?meta[${plain}][${op}]=${pv}&limit=50`, 5);
   }
   await q("operator, indexed", "customer eq, no match", (i) => `/notes?meta[customer][eq]=zz${i}&limit=50`);
   await q("operator, indexed", "customer eq + tag", (i) => `/notes?tag=rec&meta[customer][eq]=c${i}&limit=50`);
@@ -214,12 +224,22 @@ test(`query bench at ${N} records`, async () => {
   // Writes.
   const ids: string[] = (await call("GET", "/notes?tag=rec&limit=20")).body.map((n: any) => n.id);
   const patch: number[] = [];
-  for (const [k, id] of ids.entries()) patch.push((await call("PATCH", `/notes/${id}`, { metadata: { a8: `y${k}` }, force: true })).ms);
-  rows.push({ group: "write", name: "PATCH one plain field", p50: pct(patch, 0.5), p95: pct(patch, 0.95), status: 200 });
+  let patchStatus = 200;
+  for (const [k, id] of ids.entries()) {
+    const p = await call("PATCH", `/notes/${id}`, { metadata: { a8: `y${k}` }, force: true });
+    patch.push(p.ms);
+    if (p.status !== 200) patchStatus = p.status;
+  }
+  rows.push({ group: "write", name: "PATCH one plain field", p50: pct(patch, 0.5), p95: pct(patch, 0.95), status: patchStatus });
   print(rows.at(-1)!);
   const post: number[] = [];
-  for (let k = 0; k < 20; k++) post.push((await call("POST", "/notes", { ...rec(9_000_000 + k), path: undefined })).ms);
-  rows.push({ group: "write", name: "POST one record (with a reference)", p50: pct(post, 0.5), p95: pct(post, 0.95), status: 201 });
+  let postStatus = 201;
+  for (let k = 0; k < 20; k++) {
+    const p = await call("POST", "/notes", { ...rec(9_000_000 + k), path: undefined });
+    post.push(p.ms);
+    if (p.status !== 201) postStatus = p.status;
+  }
+  rows.push({ group: "write", name: "POST one record (with a reference)", p50: pct(post, 0.5), p95: pct(post, 0.95), status: postStatus });
   print(rows.at(-1)!);
 
   // Schema changes, last: a slow one keeps the vault busy after the client gives up.
@@ -234,8 +254,5 @@ test(`query bench at ${N} records`, async () => {
   const recFields = (await call("GET", "/tags/rec")).body.fields;
   await once("type PUT", "rec (has a reference field): add a plain field", "PUT", "/tags/rec", { fields: { ...recFields, colour: { type: "string" } } });
 
-  const out = { label: LABEL, door: d.label, N, cap_ms: CAP_MS, seeded_seconds: seeded.seconds, seed_rate: seeded.rate, at: new Date().toISOString(), rows };
-  const dir = process.env.DOOR_RESULTS ?? "/tmp";
-  writeFileSync(join(dir, `bench-${LABEL}.json`), JSON.stringify(out, null, 1));
-  console.log(`[bench] wrote ${join(dir, `bench-${LABEL}.json`)}`);
+  meta.complete = true;
 }, 6 * 3600_000);
