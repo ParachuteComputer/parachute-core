@@ -112,9 +112,11 @@ export type TagChange =
  */
 function touches(store: Store, change: TagChange, holder: string): boolean {
   const under = (name: string) => holder === name || holder.startsWith(`${name}/`);
+  // A rename takes its sub-tags along matched without case (notes.ts renameTag: `team` takes `TEAM/a`; review 3).
+  const underAnyCase = (name: string) => under(name) || holder.toLowerCase().startsWith(`${name.toLowerCase()}/`);
   switch (change.kind) {
     case "rename":
-      return under(change.from) || under(change.to) || reaches(store, holder, change.from) || reaches(store, holder, change.to);
+      return underAnyCase(change.from) || under(change.to) || reaches(store, holder, change.from) || reaches(store, holder, change.to);
     case "merge":
       return [...change.sources, change.target].some((n) => holder === n || reaches(store, holder, n));
     case "delete":
@@ -126,7 +128,10 @@ function touches(store: Store, change: TagChange, holder: string): boolean {
   }
 }
 
-/** The change with every name as the store writes it: no leading `#` or whitespace. */
+/**
+ * The change with every name stripped of a leading `#` or whitespace, as the store writes a new name and a merge's
+ * target. (A rename's source the store reads literally; stripping it here can only refuse more.)
+ */
 function normalized(change: TagChange): TagChange {
   switch (change.kind) {
     case "rename":
