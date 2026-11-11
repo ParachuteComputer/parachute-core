@@ -206,27 +206,6 @@
       "note": "Covers every fact the approval contracts record, because none of them can run on a personal door today. When the personal door gains a browser sign-in, delete this entry rather than narrowing it: each of those facts must then be equal or named on its own."
     },
     {
-      "id": "records-over-rest",
-      "keys": [
-        "has/records-over-rest",
-        "records/rest.*"
-      ],
-      "between": [
-        "box",
-        "personal"
-      ],
-      "releases": [
-        "0.9",
-        "0.9.1"
-      ],
-      "lacks": [
-        "box"
-      ],
-      "status": "drift",
-      "owner": "core 0.9.1 (`/api/records` is on the roadmap for the box; T-430 built it on the personal door first)",
-      "why": "The personal door answers `/api/records` (the record words over REST). The 0.9.1 box does not yet: there the record words exist over MCP only, and REST is still `/api/notes`. An app written against `/api/records` runs on a personal door and not on a box."
-    },
-    {
       "id": "sign-in-keys-on-the-account-door",
       "keys": [
         "has/sign-in-keys-on-the-account-door",
@@ -294,6 +273,22 @@
       "status": "drift",
       "owner": "core 0.9.1 keys (T-414)",
       "why": "A revoked app key gets 401 at once on both doors. The body differs: a box's hub answers `{error: \"invalid_token\", error_description}`, a cloud-style door's vault answers `{error: \"Unauthorized\", message}`; and the revoke reply carries `refused_now` on a cloud-style door only. Branch on the 401."
+    },
+    {
+      "id": "type-in-tags-on-the-record-door",
+      "keys": [
+        "records/rest.type-in-tags"
+      ],
+      "between": [
+        "box",
+        "personal"
+      ],
+      "releases": [
+        "0.9.1"
+      ],
+      "status": "drift",
+      "owner": "parachute-cloud, at its next core pin: call refuseTypesInTags (core tag-kind.ts) in rest/records.ts and pass it to addRecordTools in mcp-09.ts, or move rest/records.ts onto core's rest-records.ts",
+      "why": "On the record door `tags` holds plain labels (SPEC \u00a72.4). From 0.9.1 a box refuses a type's name in `tags` with 422 `tag_kind` and the fix (`types: [...]`), on `/api/records` and on create-record/update-record, and writes nothing. The personal door still accepts it and files the name as the type. Send a type's name in `types`: that works on both."
     }
   ]
 }

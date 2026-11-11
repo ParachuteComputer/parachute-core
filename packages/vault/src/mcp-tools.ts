@@ -9,7 +9,7 @@ import { generateMcpTools, resolveNote } from "../core/src/mcp.ts";
 import { projectHistoryProvenance } from "../core/src/history-visibility.js";
 import type { McpToolDef, GenerateMcpToolsOpts } from "../core/src/mcp.ts";
 import { MCP_TOOL_REFERENCE, acceptedParams } from "../core/src/mcp-manifest.ts";
-import { mergeTypesIntoTags } from "../core/src/tag-kind.ts";
+import { mergeTypesIntoTags, refuseTypesInTags } from "../core/src/tag-kind.ts";
 import { addRecordTools, NOTE_TOOL_NAMES, RECORD_TOOL_NAMES, recordParamNames, recordSchema, recordWords } from "../core/src/mcp-records.ts";
 import { countName } from "./name-usage.ts";
 import { nestedParamProblem, NEW_TOOLS, SHORT_TOOLS, TOOL_ALIASES, TOOL_ORDER, aliasDescription, unknownParams, REFUSES_UNKNOWN_PARAMS, type ParamProblem } from "../core/src/mcp-short.ts";
@@ -355,7 +355,14 @@ export function generateScopedMcpTools(
   // callers. See vault#376. The raw caller bearer (vault#403, MGT) is
   // forwarded to hub's mint-token attenuation proxy on mint.
   tools.push(buildManageTokenTool(vaultName, auth, callerBearer ?? null));
-  const shaped = byToolOrder(addRecordTools(applyElevenTools(tools, vaultName, auth), (name, kind) => countName(`mcp ${name}`, kind)));
+  // The record door's `tags` hold plain labels (SPEC §2.4): a type's name there is refused with the fix. A name a
+  // tag-scoped session can't see is left to the scope check, so its kind isn't told.
+  const recordCheck = async (tool: string, call: Record<string, unknown>) => {
+    if (tool !== "create-record" && tool !== "update-record") return;
+    const allowed = scoped ? await expandTokenTagScope(store, rawTags) : null;
+    refuseTypesInTags(store.db, call, tool === "create-record" ? "create" : "update", scoped ? (t) => tagVisibleInScope(t, allowed, rawTags) : undefined);
+  };
+  const shaped = byToolOrder(addRecordTools(applyElevenTools(tools, vaultName, auth), (name, kind) => countName(`mcp ${name}`, kind), recordCheck));
   applyRecordWordsToVaultInfo(shaped);
   applyParamTeaching(shaped, vaultName);
 

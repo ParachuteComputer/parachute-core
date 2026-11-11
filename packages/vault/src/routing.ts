@@ -52,7 +52,9 @@
  * UX audit, 2026-05-25).
  */
 
-import { countName, restRouteName } from "./name-usage.ts";
+import { countName, restRouteName, typesRouteName } from "./name-usage.ts";
+import { recordsRoute } from "../core/src/rest-records.ts";
+import { handleRecordsRest } from "./records-rest.ts";
 import pkg from "../package.json" with { type: "json" };
 import type { VaultConfig } from "./config.ts";
 import type { Note, Store } from "../core/src/types.ts";
@@ -1081,6 +1083,11 @@ export async function route(
   if (!apiMatch) {
     return Response.json({ error: "Not found" }, { status: 404 });
   }
+  // The record door over REST (SPEC §5.1): `/api/records…` runs as its `/api/notes…` twin and `/api/types…` as
+  // `/api/tags…`, so every gate below (scopes, admin routes, tag scope) is the twin's, under the new name too.
+  // The words move in records-rest.ts.
+  const recordsDoor = recordsRoute(apiMatch[1] ?? "");
+  if (recordsDoor) apiMatch[1] = recordsDoor.twin;
 
   // /api/triggers — runtime trigger-registration API. Dispatched BEFORE the
   // generic method→verb scope gate below because it's ADMIN-scoped on EVERY
@@ -1222,6 +1229,13 @@ export async function route(
     bypassStrict: hasMigrateScopeForVault(auth.scopes, vaultName),
   };
 
+  if (apiPath.startsWith("/notes") && recordsDoor) {
+    // /api/records: the same route under its record name, counted as adopted (never as deprecated).
+    const route = restRouteName(req.method, apiPath);
+    if (route) countName(route.replace(" /api/notes", " /api/records"), "new");
+    return handleRecordsRest(req, recordsDoor, `/vault/${vaultName}/api`, store, tagScope, (twin) =>
+      handleNotes(twin, store, apiPath.slice(6), vaultName, tagScope, writeCtx));
+  }
   if (apiPath.startsWith("/notes")) {
     // T-407: /api/notes is note-named; count each route's use for the 1.0 decision (names only, never ids).
     const route = restRouteName(req.method, apiPath);
@@ -1246,6 +1260,11 @@ export async function route(
       },
       { status: 410 },
     );
+  }
+  if (apiPath.startsWith("/tags") && recordsDoor) {
+    countName(typesRouteName(req.method, apiPath), "new");
+    return handleRecordsRest(req, recordsDoor, `/vault/${vaultName}/api`, store, tagScope, (twin) =>
+      handleTags(twin, store, apiPath.slice(5), tagScope, writeCtx));
   }
   if (apiPath.startsWith("/tags")) return handleTags(req, store, apiPath.slice(5), tagScope, writeCtx);
   if (isHistoryCompact) return handleHistoryCompact(req, store, tagScope);
