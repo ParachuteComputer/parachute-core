@@ -713,9 +713,17 @@ export async function startVault(opts: StartVaultOptions = {}): Promise<RunningV
           // back. (Claude Code is a CLI → no CORS → unaffected. The hub already
           // exposes WWW-Authenticate; this matches it on the resource server.)
           "Access-Control-Expose-Headers": "WWW-Authenticate, Mcp-Session-Id, Deprecation, Link",
-          // Every /api/notes answer, success or error, says the route is leaving (SPEC §5.1; gone at 1.0):
-          // `Deprecation: true` and a `Link` to its /api/records successor. A browser app can read both (above).
-          ...(notesDeprecationHeaders(path) ?? {}),
+        };
+        // Every /api/notes answer, success or error, says the route is leaving (SPEC §5.1; gone at 1.0):
+        // `Deprecation: true` and a `Link` to its /api/records successor (added to any Link the route set). A browser
+        // app can read both (Expose-Headers above).
+        const leaving = notesDeprecationHeaders(path);
+        const said = (r: Response): Response => {
+          if (leaving) {
+            r.headers.set("Deprecation", leaving.Deprecation);
+            r.headers.append("Link", leaving.Link);
+          }
+          return r;
         };
 
         if (req.method === "OPTIONS") {
@@ -728,7 +736,7 @@ export async function startVault(opts: StartVaultOptions = {}): Promise<RunningV
           try { assertVaultNotPaused(vaultSegment); }
           catch (err) {
             if (!(err instanceof VaultImportPausedError)) throw err;
-            return Response.json({ error_type: err.error_type, message: err.message }, { status: 503, headers: corsHeaders });
+            return said(Response.json({ error_type: err.error_type, message: err.message }, { status: 503, headers: corsHeaders }));
           }
         }
 
@@ -756,16 +764,16 @@ export async function startVault(opts: StartVaultOptions = {}): Promise<RunningV
           for (const [k, v] of Object.entries(corsHeaders)) {
             response.headers.set(k, v);
           }
-          return response;
+          return said(response);
         } catch (err) {
           if (err instanceof VaultImportPausedError || err instanceof MirrorRetiredError) {
-            return Response.json({ error_type: err.error_type, message: err.message }, { status: err.status, headers: corsHeaders });
+            return said(Response.json({ error_type: err.error_type, message: err.message }, { status: err.status, headers: corsHeaders }));
           }
           console.error(`[${req.method} ${path}]`, err);
-          return Response.json(
+          return said(Response.json(
             { error: "Internal server error" },
             { status: 500, headers: corsHeaders },
-          );
+          ));
         }
       },
     });

@@ -165,6 +165,11 @@ describe("compat/types-rest: types", () => {
     const same = await writeApi.post("/records", { records: [{ path: `${path}-3`, body: "x", types: [fresh] }, { path: `${path}-4`, body: "y", tags: [fresh] }] });
     expect(same.status).toBe(422);
     expect((await readApi.get(`/records/${enc(`${path}-3`)}`)).status).toBe(404);
+    // A record that makes a new type in its own `types` and also lists it in `tags` isn't refused: it makes the type.
+    const own = `${R}-own-type`;
+    const both = await writeApi.post("/records", { path: `${path}-5`, body: "z", types: [own], tags: [own] });
+    expect(both.status, JSON.stringify(both.body).slice(0, 200)).toBe(201);
+    expect(both.body.types).toEqual([own]);
 
     const ok = await writeApi.post("/records", { path, body: "x", tags: ["pinned"] });
     expect(ok.status).toBe(201);

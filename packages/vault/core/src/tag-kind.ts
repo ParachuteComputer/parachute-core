@@ -318,9 +318,10 @@ export function refuseTypesInTags(
   mode: "create" | "update",
   visible?: (name: string) => boolean,
 ): void {
-  const named: [name: string, op: string][] = [];
-  for (const item of [params, ...(Array.isArray(params?.notes) ? (params.notes as unknown[]) : [])]) {
-    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+  const named: [name: string, op: string, at: number][] = [];
+  const items = Array.isArray(params?.notes) ? (params.notes as unknown[]) : [];
+  [params, ...items].forEach((item, i) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return;
     const tags = (item as Record<string, unknown>).tags;
     // A create takes a list; an update a list (its add) or {add, remove}.
     const lists: [string, unknown][] = Array.isArray(tags) || typeof tags === "string"
@@ -331,20 +332,24 @@ export function refuseTypesInTags(
     for (const [op, list] of lists) {
       for (const raw of Array.isArray(list) ? list : [list]) {
         const name = typeof raw === "string" ? stripTagHash(raw) : "";
-        if (name && (!visible || visible(name))) named.push([name, op]);
+        if (name && (!visible || visible(name))) named.push([name, op, i - 1]);
       }
     }
-  }
+  });
   if (!named.length) return;
   const types = typeNamesAmong(db, [...new Set(named.map(([n]) => n))]);
-  // A name this call makes a type (another item's `types`), or another write is making one right now, counts too.
-  for (const n of PENDING.get(db)?.keys() ?? []) types.add(n);
-  for (const item of [params, ...(Array.isArray(params?.notes) ? (params.notes as unknown[]) : [])]) {
+  // A name another record of the same batch makes a type (its `types`) counts too, unless it is a plain tag already
+  // (that record's own write is refused for it). A record naming a new type in its own `types` and `tags` isn't
+  // refused: it makes the type.
+  const typesOf = (item: unknown): string[] => {
     const t = item && typeof item === "object" && !Array.isArray(item) ? (item as Record<string, unknown>).types : undefined;
     const list = Array.isArray(t) || typeof t === "string" ? t : t && typeof t === "object" ? (t as { add?: unknown }).add : undefined;
-    for (const n of Array.isArray(list) ? list : [list]) if (typeof n === "string" && stripTagHash(n)) types.add(stripTagHash(n));
-  }
-  const hit = named.find(([n]) => types.has(n));
+    return (Array.isArray(list) ? list : [list]).filter((n): n is string => typeof n === "string").map(stripTagHash).filter(Boolean);
+  };
+  let kinds: Map<string, TagKind> | null = null;
+  const madeByAnother = (n: string, at: number) =>
+    at >= 0 && items.some((x, j) => j !== at && typesOf(x).includes(n)) && (kinds ??= tagKinds(db)).get(n) !== "tag";
+  const hit = named.find(([n, , at]) => types.has(n) || madeByAnother(n, at));
   if (!hit) return;
   const [name, op] = hit;
   // The hint is the fix's shape, without the name (the message names it), so it reads the same for every type.
