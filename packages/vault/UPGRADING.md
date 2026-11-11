@@ -64,6 +64,10 @@ Keep the daemon stopped from prepare through retire, including interruptions. Pr
 
 Inspect the manifest before apply: policy runs `pruneVersions` then `compactNote`, with a frozen evaluation time. It can remove imported **and native** rows; the manifest lists native indices to be removed and separate imported/native counts. Surviving native indices are never renumbered. Configure retention explicitly before prepare if needed. Do not mistake retained SQLite history for the complete archive.
 
+A long-lived mirror can pass the walk's bound of 10,000,000 tree entries (commits × files): `plan` and `prepare` then fail with `Archive object limit exceeded`. For an archive you have audited, raise it on both with `--max-tree-entries N` (up to 1,000,000,000). The walk holds one tree at a time, so a higher bound costs time, not memory. The manifest records a raised bound, it is part of the run's options digest, and `apply` restages under it; the flag is rejected on apply, retire and cancel.
+
+A mirror commit written by the exporter before 2026-10-29 can carry a metadata string plain YAML refuses (one that opens with a quote and runs on past its close). The importer reads such a file the way the vault's own import does, so it is an observation and not a source issue. Manifests made before this reader (parser 1) are a different run: plan and prepare again.
+
 Duplicate IDs and oversized revisions quarantine the entire note. Missing live IDs are reported and skipped; no deleted note or deletion event is invented. Quarantined IDs and live IDs missing at the final tip block cutover unless explicitly waived before prepare using `--waivers FILE` (JSON object mapping note ID to an operator's reason). Unidentified source issues must be resolved. A waiver excludes the note from import while preserving it in the archive; it is not an import success.
 
 ### Resolving duplicate exported paths

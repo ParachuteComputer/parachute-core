@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { isNoteIdShape } from "../core/src/ulid.ts";
 import { applyImportedNote, beginImportRun, canonicalJson, importObservationDigest, importTargetDigest, readImportReceipt, type ImportedObservation, type ImportRun } from "../core/src/history-import.ts";
 import { hashContent, resolveHistoryPolicy, VERSION_MAX_BYTES, type HistoryPolicy } from "../core/src/history.ts";
-import { fromExportedAttachmentLinks } from "../core/src/portable-md.ts";
+import { fromExportedAttachmentLinks, parseFrontmatter } from "../core/src/portable-md.ts";
 import { applyConnectionPragmas, initSchema } from "../core/src/schema.ts";
 import { DEFAULT_PORT, readGlobalConfig, readVaultConfig, vaultDbPath, vaultDir } from "./config.ts";
 import { checkHealth } from "./health.ts";
@@ -17,6 +17,8 @@ import { defaultMirrorConfig, historyImportRecoveryPath, historyMirrorStatePath,
 const MAX_OUTPUT = 32 * 1024 * 1024;
 const MAX_COMMITS = 100_000;
 const MAX_OBJECTS = 10_000_000;
+/** The ceiling `--max-tree-entries` accepts. The walk holds one tree at a time, so a higher count costs time, not memory. */
+const MAX_OBJECTS_CEILING = 1_000_000_000;
 const MAX_BYTES = 2 * 1024 * 1024 * 1024;
 const decoder = new TextDecoder("utf-8", { fatal: true });
 class GitArchiveError extends Error {}
@@ -45,7 +47,16 @@ function yaml(raw: string): Record<string, unknown> { return mapping(Bun.YAML.pa
 function inline(raw: string): { meta: Record<string, unknown>; content: string } {
   const match = /^(?:\uFEFF)?---\r?\n([\s\S]*?)^---(?:\r?\n|$)/m.exec(raw);
   if (!match || match.index !== 0) throw new Error("missing_frontmatter");
-  return { meta: yaml(match[1]!), content: raw.slice(match[0].length) };
+  const content = raw.slice(match[0].length);
+  try { return { meta: yaml(match[1]!), content }; }
+  catch (strict) {
+    // The exporter before FLOW_QUOTING_SINCE left some strings unquoted that plain YAML refuses (one that opens with
+    // a quote and runs on past its close). The vault's own import reads those files, so a mirror commit of one is a
+    // real observation: read it as that import does. Anything it can't name a note from stays the strict failure.
+    const portable = parseFrontmatter(raw, "export").frontmatter;
+    if (!isNoteIdShape(portable.id)) throw strict;
+    return { meta: portable, content };
+  }
 }
 function observation(meta: Record<string, unknown>, content: string, commit: string, blob: string, time: string): { id: string; row: ImportedObservation } {
   if (!isNoteIdShape(meta.id)) throw new Error("invalid_id");
@@ -107,13 +118,19 @@ export function normalizeHistorySelections(input: unknown): HistorySelections {
   return result;
 }
 function selectionsDigest(selections: HistorySelections | null): string | null { return selections ? hashContent(canonicalJson(selections)) : null; }
-function optionsDigest(policy: HistoryPolicy, waivers: Record<string, string>, selections: HistorySelections | null): string {
-  return hashContent(canonicalJson({ parser: 1, policy, waivers, ...(selections ? { selections_digest: selectionsDigest(selections) } : {}) }));
+/** Parser 2 reads old-exporter frontmatter that plain YAML refuses (see `inline`); a parser-1 manifest is a different run. */
+function optionsDigest(policy: HistoryPolicy, waivers: Record<string, string>, selections: HistorySelections | null, maxTreeEntries: number = MAX_OBJECTS): string {
+  return hashContent(canonicalJson({ parser: 2, policy, waivers, ...(selections ? { selections_digest: selectionsDigest(selections) } : {}), ...(maxTreeEntries !== MAX_OBJECTS ? { max_tree_entries: maxTreeEntries } : {}) }));
+}
+function treeEntryLimit(value: unknown): number {
+  if (value === undefined || value === null) return MAX_OBJECTS;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1 || value > MAX_OBJECTS_CEILING) throw new Error(`--max-tree-entries must be a whole number from 1 to ${MAX_OBJECTS_CEILING}`);
+  return value;
 }
 
 export interface StagedArchive { source_fingerprint: string; tip: string; commits: number; objects: number; bytes: number; }
 /** Disk-backed staging bounds memory to one git tree and one note body. */
-export function stageArchive(repo: string, tip: string, stage: Database, inputSelections?: HistorySelections | null): StagedArchive {
+export function stageArchive(repo: string, tip: string, stage: Database, inputSelections?: HistorySelections | null, maxTreeEntries = MAX_OBJECTS): StagedArchive {
   if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(tip)) throw new Error("through must be a full commit hash");
   if (text(git(repo, ["rev-parse", "--is-shallow-repository"])).trim() !== "false") throw new Error("Shallow archives are not supported");
   if (text(git(repo, ["rev-parse", `${tip}^{commit}`])).trim() !== tip) throw new Error("Tip is not a commit");
@@ -151,7 +168,7 @@ export function stageArchive(repo: string, tip: string, stage: Database, inputSe
       return { mode, type, hash, path: record.slice(tab + 1) };
     });
     objects += entries.length;
-    if (objects > MAX_OBJECTS) throw new Error("Archive object limit exceeded");
+    if (objects > maxTreeEntries) throw new Error("Archive object limit exceeded; an audited archive can raise it with --max-tree-entries on plan and prepare");
     const files = new Map(entries.map(e => [e.path, e]));
     const used = new Set<string>(), sidecarOwners = new Map<string, string>();
     const candidates = new Map<string, { ref: HistoryCandidateRef; state: string; row: () => ImportedObservation }[]>();
@@ -272,6 +289,8 @@ export interface ImportManifest extends StagedArchive {
   selections?: HistorySelections | null; selections_digest?: string | null;
   selection_failures?: { note_id: string; commit_id: string; reason: string }[];
   missing_at_tip: string[]; waivers: Record<string, string>; run_id: string;
+  /** Present only when plan/prepare raised the walk's bound with `--max-tree-entries`; apply restages under it. */
+  max_tree_entries?: number;
 }
 function digestManifest(manifest: Omit<ImportManifest, "run_id"> | ImportManifest): string {
   const { run_id: _, ...body } = manifest as ImportManifest;
@@ -314,7 +333,7 @@ function openStage(path: string): Database {
   stage.exec("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF");
   return stage;
 }
-function project(vault: string, repo: string, tip: string, dir: string, opts: { archive?: string; backup?: string; waivers?: Record<string, string>; selections?: HistorySelections | null }): ImportManifest {
+function project(vault: string, repo: string, tip: string, dir: string, opts: { archive?: string; backup?: string; waivers?: Record<string, string>; selections?: HistorySelections | null; maxTreeEntries?: number }): ImportManifest {
   const config = readVaultConfig(vault);
   if (!config) throw new Error("Vault does not exist");
   const stage = openStage(join(dir, "stage.db"));
@@ -324,10 +343,11 @@ function project(vault: string, repo: string, tip: string, dir: string, opts: { 
   try {
     applyConnectionPragmas(db); initSchema(db);
     const selections = opts.selections ?? null;
-    const source = stageArchive(repo, tip, stage, selections), policy = resolveHistoryPolicy(config.history);
+    const maxTreeEntries = treeEntryLimit(opts.maxTreeEntries);
+    const source = stageArchive(repo, tip, stage, selections, maxTreeEntries), policy = resolveHistoryPolicy(config.history);
     const waivers = opts.waivers ?? {};
     for (const [id, reason] of Object.entries(waivers)) if (!isNoteIdShape(id) || typeof reason !== "string" || !reason.trim()) throw new Error("Waivers require note IDs and reasons");
-    const options_digest = optionsDigest(policy, waivers, selections);
+    const options_digest = optionsDigest(policy, waivers, selections, maxTreeEntries);
     const run = { run_id: "projection", source_fingerprint: source.source_fingerprint, tip, options_digest };
     beginImportRun(db, run);
     const evaluated_at = Date.now(), notes: PlannedNote[] = [], skipped: string[] = [];
@@ -349,6 +369,7 @@ function project(vault: string, repo: string, tip: string, dir: string, opts: { 
       options_digest, target_ids_digest: hashContent(canonicalJson(live.map(r => r.id))), notes, skipped, missing_at_tip, waivers,
       quarantined: stage.prepare("SELECT * FROM quarantine ORDER BY note_id").all() as ImportManifest["quarantined"],
       issues: stage.prepare("SELECT * FROM issues ORDER BY commit_id,path,reason").all() as ImportManifest["issues"],
+      ...(maxTreeEntries !== MAX_OBJECTS ? { max_tree_entries: maxTreeEntries } : {}),
     };
     return { ...body, run_id: digestManifest(body) };
   } finally { db.close(); stage.close(); }
@@ -373,7 +394,7 @@ function readManifest(vault: string, path: string): ImportManifest {
   if (m.format !== 1 || m.kind !== "final" || m.vault !== vault || m.run_id !== digestManifest(m) || !m.archive || !m.archive_hash || !m.backup) throw new Error("A matching final manifest is required");
   if (canonicalJson(resolveHistoryPolicy(readVaultConfig(vault)?.history)) !== canonicalJson(m.policy)) throw new Error("History policy differs from final manifest");
   const selections = m.selections == null ? null : normalizeHistorySelections(m.selections);
-  if ((m.selections_digest ?? null) !== selectionsDigest(selections) || m.options_digest !== optionsDigest(m.policy, m.waivers, selections)) throw new Error("Manifest selection/options digest mismatch");
+  if ((m.selections_digest ?? null) !== selectionsDigest(selections) || m.options_digest !== optionsDigest(m.policy, m.waivers, selections, treeEntryLimit(m.max_tree_entries))) throw new Error("Manifest selection/options digest mismatch");
   return m;
 }
 function retirementReady(m: ImportManifest): void {
@@ -387,10 +408,12 @@ export async function runHistoryImport(args: string[]): Promise<unknown> {
   const flags = new Map<string, string>();
   for (let i = 0; i < rest.length; i += 2) {
     const key = rest[i], value = rest[i + 1];
-    if (!key || !["--vault", "--source", "--through", "--output", "--archive", "--manifest", "--waivers", "--selections"].includes(key) || !value || flags.has(key)) throw new Error("Invalid history-import arguments");
+    if (!key || !["--vault", "--source", "--through", "--output", "--archive", "--manifest", "--waivers", "--selections", "--max-tree-entries"].includes(key) || !value || flags.has(key)) throw new Error("Invalid history-import arguments");
     flags.set(key, value);
   }
   if (flags.has("--selections") && command !== "plan" && command !== "prepare") throw new Error("--selections is only valid for plan/prepare; apply uses the embedded manifest");
+  if (flags.has("--max-tree-entries") && command !== "plan" && command !== "prepare") throw new Error("--max-tree-entries is only valid for plan/prepare; apply uses the manifest's bound");
+  const maxTreeEntries = flags.has("--max-tree-entries") ? treeEntryLimit(/^\d+$/.test(flags.get("--max-tree-entries")!) ? Number(flags.get("--max-tree-entries")) : NaN) : undefined;
   const required = (key: string) => { const value = flags.get(key); if (!value) throw new Error(`Required ${key}`); return value; };
   const vault = required("--vault");
   if (!/^[a-zA-Z0-9_-]+$/.test(vault) || !readVaultConfig(vault)) throw new Error("Unknown vault");
@@ -414,7 +437,7 @@ export async function runHistoryImport(args: string[]): Promise<unknown> {
         selections = normalizeHistorySelections(JSON.parse(readFileSync(path, "utf8")));
       }
       if (command === "plan") {
-        const m = project(vault, repo, tip, dir, { waivers, selections }); atomic(output, JSON.stringify(m, null, 2)); return m;
+        const m = project(vault, repo, tip, dir, { waivers, selections, maxTreeEntries }); atomic(output, JSON.stringify(m, null, 2)); return m;
       }
       if (readHistoryMirrorPhase(vault) !== "active" || existsSync(historyImportRecoveryPath(vault))) throw new Error("Existing cutover: resume or cancel using its recovery journal");
       if (text(git(repo, ["rev-parse", "--is-bare-repository"])).trim() !== "true" && text(git(repo, ["status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=all"])).length) throw new Error("Source working tree is dirty");
@@ -430,7 +453,7 @@ export async function runHistoryImport(args: string[]): Promise<unknown> {
       mkdirSync(dirname(archive), { recursive: true });
       git(repo, ["bundle", "create", archive, "--all"]); chmodSync(archive, 0o600);
       const objects = privateBundle(archive, fileHash(archive), dir);
-      const m = project(vault, objects, tip, dir, { archive, backup, waivers, selections });
+      const m = project(vault, objects, tip, dir, { archive, backup, waivers, selections, maxTreeEntries });
       atomic(output, JSON.stringify(m, null, 2));
       atomic(historyImportRecoveryPath(vault), JSON.stringify({ ...journal, phase: "prepared", run_id: m.run_id }));
       atomic(historyMirrorStatePath(vault), JSON.stringify({ phase: "paused", run_id: m.run_id, source: repo, tip }));
@@ -467,7 +490,7 @@ export async function runHistoryImport(args: string[]): Promise<unknown> {
       if (command === "apply") {
         const stage = openStage(join(dir, "apply-stage.db"));
         try {
-          const source = stageArchive(repo, m.tip, stage, m.selections);
+          const source = stageArchive(repo, m.tip, stage, m.selections, treeEntryLimit(m.max_tree_entries));
           if (source.source_fingerprint !== m.source_fingerprint) throw new Error("Bundle lineage differs from manifest");
           beginImportRun(db, run);
           for (const note of m.notes) {

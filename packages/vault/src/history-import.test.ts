@@ -483,3 +483,44 @@ test("mirror commits keep a hand-written relative attachment link as written (T-
     expect(rows.map(r => JSON.parse(r.row_json).content)).toEqual([body]);
   } finally { db.close(); rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("a mirror commit from the old exporter, with a string plain YAML refuses, is an observation and not a source issue", () => {
+  const dir = mkdtempSync(join(tmpdir(), "import-old-exporter-")), stage = new Database(":memory:");
+  try {
+    const repo = repoAt(join(dir, "repo"));
+    // Before FLOW_QUOTING_SINCE the exporter wrote this value as it stood: a quote that closes mid-line.
+    writeFileSync(join(repo, "entry.md"), `---\nid: ${noteId}\npath: entry\nmetadata:\n  saying: 'made up' and then some\n  kind: example\ncreated_at: 2026-01-01T00:00:00Z\n---\nbody\r\nkept`);
+    git(repo, "add", "."); git(repo, "commit", "-m", "old exporter");
+    stageArchive(repo, git(repo, "rev-parse", "HEAD"), stage);
+    expect(stage.query("SELECT * FROM issues").all()).toEqual([]);
+    expect(stage.query("SELECT * FROM quarantine").all()).toEqual([]);
+    const rows = stage.query("SELECT note_id, row_json FROM observations").all() as { note_id: string; row_json: string }[];
+    expect(rows.map(r => r.note_id)).toEqual([noteId]);
+    const row = JSON.parse(rows[0]!.row_json);
+    expect(row.metadata).toEqual({ saying: "'made up' and then some", kind: "example" });
+    expect(row.content).toBe("body\r\nkept");
+  } finally { stage.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("the walk's tree-entry bound holds unless plan raises it, and a raised bound is part of the run", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "import-bound-")), saved = process.env.PARACHUTE_HOME;
+  process.env.PARACHUTE_HOME = join(dir, "home");
+  try {
+    const probe = Bun.serve({ port: 0, fetch: () => new Response() }); const port = probe.port!; probe.stop(true);
+    writeGlobalConfig({ port });
+    writeVaultConfig({ name: "test", api_keys: [], created_at: new Date().toISOString() });
+    const store = getVaultStore("test"); const note = await store.createNote("native"); clearVaultStoreCache();
+    const repo = repoAt(join(dir, "repo")); commit(repo, "one", note.id); commit(repo, "two", note.id); const tip = commit(repo, "three", note.id);
+    const plan = (name: string, ...extra: string[]) => runHistoryImport(["plan", "--vault", "test", "--source", repo, "--through", tip, "--output", join(dir, name), ...extra]) as Promise<ImportManifest>;
+    // Three commits of one file are three tree entries: a bound of two refuses, loudly, and writes no manifest.
+    await expect(plan("low.json", "--max-tree-entries", "2")).rejects.toThrow("Archive object limit exceeded");
+    const usual = await plan("usual.json");
+    const raised = await plan("raised.json", "--max-tree-entries", "20000000");
+    expect(usual.max_tree_entries).toBeUndefined();
+    expect(raised.max_tree_entries).toBe(20_000_000);
+    expect(raised.notes.map(n => n.state_digest)).toEqual(usual.notes.map(n => n.state_digest));
+    expect(raised.options_digest).not.toBe(usual.options_digest);
+    for (const bad of ["0", "-1", "1.5", "many", "1000000001"]) await expect(plan(`bad-${bad}.json`, "--max-tree-entries", bad)).rejects.toThrow("--max-tree-entries");
+    await expect(runHistoryImport(["apply", "--vault", "test", "--manifest", join(dir, "usual.json"), "--archive", join(dir, "a.bundle"), "--max-tree-entries", "5"])).rejects.toThrow("only valid for plan/prepare");
+  } finally { clearVaultStoreCache(); if (saved === undefined) delete process.env.PARACHUTE_HOME; else process.env.PARACHUTE_HOME = saved; rmSync(dir, { recursive: true, force: true }); }
+});
