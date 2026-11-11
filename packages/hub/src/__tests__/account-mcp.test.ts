@@ -899,10 +899,15 @@ describe("account MCP — query-notes", () => {
           },
         });
       const res = await handleAccountMcp(
-        bearerReq(token, rpc("tools/call", { name: "query-records", arguments: { search: "hello" } })),
+        bearerReq(
+          token,
+          rpc("tools/call", { name: "query-records", arguments: { search: "hello" } }),
+        ),
         mcpDeps(h, { fetchImpl }),
       );
-      const payload = parseTool((await res.json()) as { result: { content: Array<{ text: string }> } }) as {
+      const payload = parseTool(
+        (await res.json()) as { result: { content: Array<{ text: string }> } },
+      ) as {
         vaults_queried: string[];
         results: Array<{ vault: string; records?: unknown; notes?: unknown }>;
       };
@@ -2780,6 +2785,142 @@ describe("account MCP — hop JWT reuse (hub#918)", () => {
       expect(bearers.size).toBe(1);
     } finally {
       restoreHopEnv(prev);
+      h.cleanup();
+    }
+  });
+});
+
+// ── 0.9.1 "one multi-vault door": the hop token is minted at the KEY's level on that vault (T-446) ─────────────
+// The vault behind the hop is a fake router here, but the hop token it reads is the real one the hub signed: these
+// read its claims (scope, aud, vault_scope), not a mock's call log.
+describe("account MCP — hop token at the key's level (T-446)", () => {
+  interface Hop {
+    vault: string;
+    method: string;
+    tool: string | undefined;
+    scope: string;
+    aud: unknown;
+    vaultScope: unknown;
+  }
+  function claims(auth: string | null): Record<string, unknown> {
+    const part = (auth ?? "").replace(/^Bearer\s+/i, "").split(".")[1] ?? "";
+    try {
+      return JSON.parse(Buffer.from(part, "base64url").toString()) as Record<string, unknown>;
+    } catch {
+      return {};
+    }
+  }
+  async function call(
+    h: Harness,
+    scopes: string[],
+    sub: string,
+    name: string,
+    args: Record<string, unknown>,
+  ) {
+    const hops: Hop[] = [];
+    const fetchImpl = (input: string | URL | Request, init?: RequestInit) => {
+      const headers = input instanceof Request ? input.headers : new Headers(init?.headers);
+      const c = claims(headers.get("authorization"));
+      return routeVaultMcp(input, init, {
+        // As the vault does: a write tool under a hop token without the write verb is not a tool it knows.
+        onCall: ({ scope, rpc }) =>
+          rpc.params?.name === "create-note" && !/:(write|admin)\b/.test(scope)
+            ? { content: [{ type: "text", text: "Unknown tool: create-note" }], isError: true }
+            : undefined,
+        onRequest: ({ vault, rpc }) =>
+          hops.push({
+            vault,
+            method: rpc.method ?? "",
+            tool: rpc.params?.name,
+            scope: String(c.scope ?? ""),
+            aud: c.aud,
+            vaultScope: c.vault_scope,
+          }),
+      });
+    };
+    const token = await bearer(h, scopes, sub);
+    const res = await handleAccountMcp(
+      bearerReq(token, rpc("tools/call", { name, arguments: args })),
+      mcpDeps(h, { fetchImpl }),
+    );
+    const body = (await res.json()) as {
+      result?: { isError?: boolean; content?: Array<{ text?: string }> };
+    };
+    return {
+      hops,
+      isError: body.result?.isError === true,
+      text: body.result?.content?.[0]?.text ?? "",
+    };
+  }
+
+  const writes = (hops: Hop[]) =>
+    hops.filter((x) => x.method === "tools/call" && x.tool === "create-note");
+
+  test("read on personal, write on beta: no write reaches personal, and each hop carries that vault's level", async () => {
+    const h = await makeHarness();
+    try {
+      const scopes = ["account:self:vaults:personal:read", "account:self:vaults:beta:write"];
+      const a = await call(h, scopes, h.ownerId, "create-note", {
+        vault: "personal",
+        content: "no",
+      });
+      expect(a.isError).toBe(true);
+      expect(a.hops.filter((x) => x.vault === "personal").length).toBeGreaterThan(0);
+      for (const hop of a.hops.filter((x) => x.vault === "personal"))
+        expect(hop.scope).toBe("vault:personal:read");
+      const b = await call(h, scopes, h.ownerId, "create-note", { vault: "beta", content: "yes" });
+      expect(b.isError).toBe(false);
+      const hop = writes(b.hops)[0]!;
+      expect(hop.scope).toBe("vault:beta:write");
+      expect(hop.aud).toBe("vault.beta");
+      expect(hop.vaultScope).toEqual(["beta"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("a key that is read on every vault (`*:read`) never mints above read, even for the owner", async () => {
+    const h = await makeHarness();
+    try {
+      const r = await call(h, ["account:self:vaults:*:read"], h.ownerId, "create-note", {
+        vault: "beta",
+        content: "no",
+      });
+      expect(r.isError).toBe(true);
+      expect(r.hops.length).toBeGreaterThan(0);
+      for (const hop of r.hops) expect(hop.scope).toBe(`vault:${hop.vault}:read`);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("a key that is write on every vault (`*:write`) mints write, not the owner's admin", async () => {
+    const h = await makeHarness();
+    try {
+      const r = await call(h, ["account:self:vaults:*:write"], h.ownerId, "create-note", {
+        vault: "beta",
+        content: "yes",
+      });
+      expect(r.isError).toBe(false);
+      for (const hop of r.hops) expect(hop.scope).toBe(`vault:${hop.vault}:write`);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("the key's level is capped by the person's role: a read-role friend's `*:write` key stays read", async () => {
+    const h = await makeHarness();
+    try {
+      h.db
+        .prepare("UPDATE user_vaults SET role = 'read' WHERE user_id = ? AND vault_name = 'beta'")
+        .run(h.friendId);
+      const r = await call(h, ["account:self:vaults:*:write"], h.friendId, "create-note", {
+        vault: "beta",
+        content: "no",
+      });
+      expect(r.isError).toBe(true);
+      for (const hop of r.hops) expect(hop.scope).toBe("vault:beta:read");
+    } finally {
       h.cleanup();
     }
   });

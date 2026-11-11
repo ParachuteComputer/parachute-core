@@ -1,3 +1,6 @@
+import type { Database } from "bun:sqlite";
+import { randomBytes } from "node:crypto";
+import { composedVerbSatisfies, isComposedVaultVerb } from "@openparachute/door-contract";
 /**
  * Grant / revoke / list vault access by Nostr pubkey.
  *
@@ -30,9 +33,7 @@
  * Cloud's account-MCP twin is identity-worker shaped and does not grow these
  * tools. Hub-only on purpose.
  */
-import type { Database } from "bun:sqlite";
-import { randomBytes } from "node:crypto";
-import { composedVerbSatisfies, isComposedVaultVerb } from "@openparachute/door-contract";
+import { keyLevelOnVault, levelSatisfies } from "./key-level.ts";
 import { decodeNpub } from "./nip19.ts";
 import { bindPubkeyOperatorAttested, findPubkeyLink, isPubkeyHex } from "./pubkey-links.ts";
 import {
@@ -86,6 +87,8 @@ export interface GrantCaller {
   via?: GrantVia;
   grant: {
     wildcard: string | null;
+    /** A 0.9.0 coverage scope with no level: the person's role applies (key-level.ts). */
+    levelless?: boolean;
     vaults: { has(name: string): boolean; get(name: string): string | undefined };
   } | null;
 }
@@ -172,45 +175,14 @@ export function parseGrantVault(raw: unknown): string {
   return raw.trim().toLowerCase();
 }
 
-function bearerCoversVaultForGrant(
-  grant: NonNullable<GrantCaller["grant"]>,
-  vaultName: string,
-): boolean {
-  // host:admin synthesizes wildcard admin — unrestricted.
-  if (grant.wildcard === "admin") return true;
-  if (grant.wildcard !== null) {
-    // Legacy/composed coverage wildcard (`account:vaults`, `account:self:vaults`,
-    // `account:self:vaults:*:<verb>`). This is coverage, not a per-vault verb
-    // cap — assignment (or first-admin) still has to allow the grant.
-    return true;
-  }
-  const named = grant.vaults.get(vaultName);
-  if (named === undefined) return false;
-  return isComposedVaultVerb(named) && composedVerbSatisfies(named, "admin");
-}
-
 /**
- * True when the caller may grant/revoke/list this vault.
- *
- * NIP-98 hub admins are unrestricted across installed vaults. Bearer
- * `parachute:host:admin` (wildcard `admin`) is too. A Bearer that names a
- * vault subset cannot grant outside it; a named composed verb must satisfy
- * `admin`. Everyone else needs the `admin` verb on the vault — only
- * `role = 'write'` carries it; `member` and `read` do not.
+ * True when the caller may grant/revoke/list this vault: its level there is admin (`keyLevelOnVault`, the seam 1.0
+ * grants replace). NIP-98 hub admins and the operator credential (`parachute:host:admin`) are admin everywhere. A
+ * Bearer is capped by the level it names for that vault (or for every vault, `account:self:vaults:*:<verb>`), and
+ * never above the person's role: only `role = 'write'` carries admin; `member` and `read` do not.
  */
 export function callerCanAdminVault(db: Database, caller: GrantCaller, vaultName: string): boolean {
-  if (caller.authKind === "bearer") {
-    const grant = caller.grant;
-    if (!grant) return false;
-    if (!bearerCoversVaultForGrant(grant, vaultName)) return false;
-    if (grant.wildcard === "admin") return true;
-    if (isHubAdmin(db, caller.userId)) return true;
-    const verbs = vaultVerbsForUserVault(db, caller.userId, vaultName);
-    return verbs?.includes("admin") === true;
-  }
-  if (caller.isHubAdmin || isHubAdmin(db, caller.userId)) return true;
-  const verbs = vaultVerbsForUserVault(db, caller.userId, vaultName);
-  return verbs?.includes("admin") === true;
+  return levelSatisfies(keyLevelOnVault(db, caller, vaultName), "admin");
 }
 
 /**
