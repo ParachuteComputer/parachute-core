@@ -93,7 +93,9 @@ try {
   await client.connect(new StreamableHTTPClientTransport(new URL(`${origin}/vault/${vault}/mcp`), { requestInit: { headers: { authorization: `Bearer ${token}` } } }));
   const call = async (name: string, args: Record<string, unknown>) => {
     const r: any = await client.callTool({ name, arguments: args });
-    const text = (r.content ?? []).map((c: any) => c.text ?? "").join("");
+    // A tool's JSON is its first text block; a later block is words for the model (the refresh nudge on the five
+    // note-named tools, T-446), so it is never part of the JSON. An error's text is every block.
+    const text = r.isError ? (r.content ?? []).map((c: any) => c.text ?? "").join("") : ((r.content ?? []).find((c: any) => c.type === "text")?.text ?? "");
     if (r.isError) throw new Error(`seed ${name}: ${text.slice(0, 500)}`);
     try {
       return JSON.parse(text);
