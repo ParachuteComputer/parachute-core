@@ -311,7 +311,8 @@ export function changes(args: string[], home: string, out = console.log, err = c
       if (words.length) out(`    ${c.reason}${c.removed_in ? `; the old name goes in ${c.removed_in}` : ""}`);
     }
   }
-  // REST routes are counted too (T-407), apart: /api/notes is kept through 0.9, and its future is the spec's call.
+  // REST routes are counted too (T-407), apart: /api/notes answers through 0.9 with a Deprecation header; its routes
+  // are under /api/records from 0.9.1, and 1.0 removes it once these counts read 0 (SPEC v2 §5.1).
   const usedNames = Object.entries(used).filter(([name]) => !name.startsWith("rest "));
   const restNames = Object.entries(used).filter(([name]) => name.startsWith("rest "));
   if (!words.length && usedNames.length) {
@@ -320,7 +321,7 @@ export function changes(args: string[], home: string, out = console.log, err = c
     for (const [name, u] of usedNames.sort((a, b) => b[1].count - a[1].count)) out(`  ${name}: ${u.count}, last ${u.last_seen}`);
   }
   if (!words.length && restNames.length) {
-    out("Note-named REST routes used on this home (kept in 0.9):");
+    out("Note-named REST routes used on this home (/api/notes: use /api/records; it goes in 1.0):");
     for (const [name, u] of restNames.sort((a, b) => b[1].count - a[1].count)) out(`  ${name.slice(5)}: ${u.count}, last ${u.last_seen}`);
   }
   // The vault counts its record names too (T-407), so the move to them can be watched next to the old names.

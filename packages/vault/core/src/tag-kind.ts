@@ -202,10 +202,16 @@ export function assertTypes(db: Database, names: string[]): void {
  * tag filter, which already expands subtypes: several types match any of them;
  * `type` with `tag` matches all of them.
  */
-export function foldTypeFilter(db: Database, params: Record<string, unknown>): Record<string, unknown> {
+export function foldTypeFilter(
+  db: Database,
+  params: Record<string, unknown>,
+  visible?: (name: string) => boolean,
+): Record<string, unknown> {
   if (params.type === undefined) return params;
   const types = (Array.isArray(params.type) ? params.type : [params.type]).map(String);
-  assertTypes(db, types);
+  // `visible`: a tag-scoped caller's names. A name it can't see is never checked, so its kind isn't told; it
+  // filters as `tag` would (matching nothing the caller can read).
+  assertTypes(db, visible ? types.filter((t) => visible(stripTagHash(t))) : types);
   if (params.expand !== undefined && params.expand !== "subtypes") {
     throw kindError("type always includes subtypes; drop expand, or use tag.", "expand", "drop expand");
   }
@@ -296,6 +302,59 @@ export function mergeTypesIntoTags(item: Record<string, unknown>, mode: "create"
   const tagAdd = Array.isArray(tags) ? asList(tags) : asList(tags?.add);
   const tagRemove = Array.isArray(tags) ? [] : asList(tags?.remove);
   return { ...rest, tags: { add: [...new Set([...tagAdd, ...add])], remove: [...new Set([...tagRemove, ...remove])] } };
+}
+
+/**
+ * The record door's `tags` hold plain labels only (SPEC §2.4): a type's name there is refused with the fix, so the
+ * field that promises nothing can't apply a type's contract. Checked on a record-door write (MCP create-record and
+ * update-record, REST `/api/records`) after its words are translated: `params` is the note-door call, with `tags`
+ * (a list, or `{add, remove}`) and a batch in `notes`. The note door keeps 0.8's behaviour (a type in `tags` lands
+ * as the type) until 1.0. `visible`: a tag-scoped caller's names; one it can't see is left to the scope check, so
+ * its kind isn't told. Reads only.
+ */
+export function refuseTypesInTags(
+  db: Database,
+  params: Record<string, unknown>,
+  mode: "create" | "update",
+  visible?: (name: string) => boolean,
+): void {
+  const named: [name: string, op: string, at: number][] = [];
+  const items = Array.isArray(params?.notes) ? (params.notes as unknown[]) : [];
+  [params, ...items].forEach((item, i) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return;
+    const tags = (item as Record<string, unknown>).tags;
+    // A create takes a list; an update a list (its add) or {add, remove}.
+    const lists: [string, unknown][] = Array.isArray(tags) || typeof tags === "string"
+      ? [[mode === "create" ? "" : "add", tags]]
+      : tags && typeof tags === "object"
+        ? [["add", (tags as { add?: unknown }).add], ["remove", (tags as { remove?: unknown }).remove]]
+        : [];
+    for (const [op, list] of lists) {
+      for (const raw of Array.isArray(list) ? list : [list]) {
+        const name = typeof raw === "string" ? stripTagHash(raw) : "";
+        if (name && (!visible || visible(name))) named.push([name, op, i - 1]);
+      }
+    }
+  });
+  if (!named.length) return;
+  const types = typeNamesAmong(db, [...new Set(named.map(([n]) => n))]);
+  // A name another record of the same batch makes a type (its `types`) counts too, unless it is a plain tag already
+  // (that record's own write is refused for it). A record naming a new type in its own `types` and `tags` isn't
+  // refused: it makes the type.
+  const typesOf = (item: unknown): string[] => {
+    const t = item && typeof item === "object" && !Array.isArray(item) ? (item as Record<string, unknown>).types : undefined;
+    const list = Array.isArray(t) || typeof t === "string" ? t : t && typeof t === "object" ? (t as { add?: unknown }).add : undefined;
+    return (Array.isArray(list) ? list : [list]).filter((n): n is string => typeof n === "string").map(stripTagHash).filter(Boolean);
+  };
+  let kinds: Map<string, TagKind> | null = null;
+  const madeByAnother = (n: string, at: number) =>
+    at >= 0 && items.some((x, j) => j !== at && typesOf(x).includes(n)) && (kinds ??= tagKinds(db)).get(n) !== "tag";
+  const hit = named.find(([n, , at]) => types.has(n) || madeByAnother(n, at));
+  if (!hit) return;
+  const [name, op] = hit;
+  // The hint is the fix's shape, without the name (the message names it), so it reads the same for every type.
+  const fix = op ? `types: {${op}: [...]}` : "types: [...]";
+  throw kindError(`"${name}" is a type, and tags holds plain labels only: pass it as ${fix.replace("...", `"${name}"`)}.`, "tags", fix);
 }
 
 /** `types` belongs to each note of a batch, never beside `notes`: refused before anything is checked or made. */

@@ -309,12 +309,18 @@ export function noteAliasSchema(schema: unknown): Record<string, unknown> {
 }
 
 /**
+ * A check a record tool runs on its translated call before the note tool does (the runtime's: the record door's
+ * `tags` refusing a type's name needs the vault and the caller's scope, tag-kind.ts refuseTypesInTags).
+ */
+export type RecordCheck = (tool: string, translated: Record<string, unknown>) => void | Promise<void>;
+
+/**
  * The five record tools, built over the note tools in `tools` (each a wrapper:
  * a record tool can never do more than its note tool), and the note tools
  * relisted as aliases. `shortSchema` gives a note tool's advertised schema.
  * Returns the new list: record tools where the note tools were, aliases at the end.
  */
-export function addRecordTools<T extends RecordToolDef>(tools: T[], onUse?: OnUse): T[] {
+export function addRecordTools<T extends RecordToolDef>(tools: T[], onUse?: OnUse, check?: RecordCheck): T[] {
   const out: T[] = [];
   const aliases: T[] = [];
   for (const t of tools) {
@@ -334,6 +340,7 @@ export function addRecordTools<T extends RecordToolDef>(tools: T[], onUse?: OnUs
         const translated = paramsIn(name, params ?? {}, onUse); // its own refusals are already in record words
         let result: unknown;
         try {
+          await check?.(name, translated);
           result = await execute(translated);
         } catch (err) {
           throw errorOut(err, name);

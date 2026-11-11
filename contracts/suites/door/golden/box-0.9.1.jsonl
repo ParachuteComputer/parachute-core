@@ -75,7 +75,7 @@
 {"key":"files/upload.txt","value":{"status":201}}
 {"key":"has/export-over-http","value":false}
 {"key":"has/oauth-approval","value":true}
-{"key":"has/records-over-rest","value":false}
+{"key":"has/records-over-rest","value":true}
 {"key":"has/sign-in-keys-on-the-account-door","value":false}
 {"key":"history/deleted.shape","value":{"notes":[{"deleted_at":"string","extension":"string","id":"string","path":"string","versions":"number"}],"total":"number"}}
 {"key":"history/refusal.blind-restore","value":{"error":null,"hint":null,"keys":["error_type","message","note_id"],"status":428,"type":"precondition_required"}}
@@ -347,6 +347,12 @@
 {"key":"records/mcp.old-word-beside-new","value":{"code":-32602,"refused":true,"type":"invalid_query"}}
 {"key":"records/mcp.order","value":["query-records","create-record","update-record","delete-record","list-types","vault-info","doctor","read-attachment","attachment-url","manage-types","query-notes","create-note","update-note","delete-note","list-tags","find-path","update-tag","rename-tag","merge-tags","delete-tag","prune-schema","request-attachment-upload","request-attachment-download"]}
 {"key":"records/mcp.query-records.shape","value":{"body":"string","createdAt":"string","createdBy":"string","createdVia":"string","extension":"string","fields":{"content":"string","door_trip_miles":"number"},"id":"string","lastUpdatedBy":"string","lastUpdatedVia":"string","path":"string","tags":["string"],"types":["string"],"updatedAt":"string","validation_status":{"schemas":["string"],"warnings":[]}}}
+{"key":"records/rest.create.shape","value":{"body":"string","createdAt":"string","createdBy":"string","createdVia":"string","extension":"string","fields":{"city":"string"},"id":"string","lastUpdatedBy":"string","lastUpdatedVia":"string","path":"string","tags":["string"],"types":["string"],"updatedAt":"string","validation_status":{"schemas":["string"],"warnings":[]},"warnings":"undefined"}}
+{"key":"records/rest.create.status","value":201}
+{"key":"records/rest.get.shape","value":{"body":"string","createdAt":"string","createdBy":"string","createdVia":"string","extension":"string","fields":{"city":"string"},"id":"string","lastUpdatedBy":"string","lastUpdatedVia":"string","path":"string","tags":["string"],"types":["string"],"updatedAt":"string","validation_status":{"schemas":["string"],"warnings":[]}}}
+{"key":"records/rest.note-alias.says-leaving","value":{"body":false,"deprecation":"true"}}
+{"key":"records/rest.refusal.old-word-beside-new","value":{"error":"(text)","hint":"ba5bd279831f54a9","keys":["error","error_type","field","hint"],"status":400,"type":"invalid_query"}}
+{"key":"records/rest.type-in-tags","value":{"hint":"b594715fe960c66d","status":422,"type":"tag_kind"}}
 {"key":"rest/cors.preflight","value":{"headers":["authorization","content-type","mcp-method","mcp-name","mcp-protocol-version","mcp-session-id","x-api-key"],"methods":["delete","get","options","patch","post","put"],"origin":"*","status":204}}
 {"key":"rest/cors.reply","value":{"origin":"*"}}
 {"key":"rest/cursor.page.shape","value":{"next_cursor":"string","notes":[{"byteSize":"number","createdAt":"string","createdBy":"string","createdVia":"string","displayTitle":"string","extension":"string","id":"string","lastUpdatedBy":"string","lastUpdatedVia":"string","metadata":{},"path":"string","preview":"string","tags":[],"types":[],"updatedAt":"string"}]}}
