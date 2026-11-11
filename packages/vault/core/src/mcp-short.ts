@@ -377,7 +377,7 @@ export function nestedParamProblem(tool: string, params: Record<string, unknown>
 /** The tools 0.9 adds; each runs the old tools underneath (src/mcp-tools.ts). */
 export const NEW_TOOLS: Record<string, ShortTool & { folds: Record<string, string> }> = {
   "manage-types": {
-    description: `Change the vault's types and tags. \`action\`: update (default: create or change one; \`fields\` and \`parent_names\` make it a type), rename {old_name, new_name}, merge {sources, target}, delete {tag, detach?}, prune (drop unused indexed columns; a dry run unless \`apply: true\`), migrate {tag, field, transform} (change a field's values on every record of the type, e.g. before a retype; a dry run unless \`apply: true\`). ${HELP("manage-types")}`,
+    description: `Change the vault's types and tags. \`action\`: update (default: create or change one; \`fields\` and \`parent_names\` make it a type), rename {old_name, new_name}, merge {sources, target}, delete {tag, detach?}, prune (drop unused indexed columns; a dry run unless \`apply: true\`), migrate {tag, field, transform} (change a field's values, e.g. before a retype; a dry run unless \`apply: true\`). ${HELP("manage-types")}`,
     inputSchema: obj(
       {
         action: { type: "string", enum: ["update", "rename", "merge", "delete", "prune", "migrate"] },
@@ -391,9 +391,9 @@ export const NEW_TOOLS: Record<string, ShortTool & { folds: Record<string, strin
         sources: { type: "array", items: { type: "string" } },
         target: str(),
         detach: bool(),
-        field: str("migrate: the field whose values change"),
-        transform: { type: "object", description: 'migrate: {kind: "to_string"|"to_int"|"to_number"|"to_boolean"|"rename"|"remap"|"set_default", ...}' },
-        continue_on_error: bool("migrate: write what converts, report the rest"),
+        field: str(),
+        transform: { type: "object", description: '{kind: "to_string"|"to_int"|"remap"|…}' },
+        continue_on_error: bool(),
         apply: bool(),
         force: bool("Go ahead although a key's tag limit, private_tags or the published tag reaches this name (the refusal names them, except to a tag-scoped pass)"),
       },
