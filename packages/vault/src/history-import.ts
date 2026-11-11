@@ -105,7 +105,7 @@ function accountsFor(read: unknown, strict: unknown, values: Set<string>): boole
 /** A line that opens a block scalar (`key: |`, `- >-`, `key: !!str |2`, with or without a comment) with deeper lines under it. */
 function holdsBlockScalar(block: string): boolean {
   const lines = block.split("\n"), indent = (line: string) => line.length - line.trimStart().length;
-  const header = /^[ \t]*(?:(?:-|\?)[ \t]+)*(?:[^\s#][^#]*?:[ \t]+)?(?:[!&][^ \t]*[ \t]+)*[|>](?:[1-9][+-]?|[+-][1-9]?)?[ \t]*(?:#.*)?\r?$/;
+  const header = /^[ \t]*(?:(?:-|\?)[ \t]+)*(?:(?:[^\s#]|\S#)(?:[^#]|\S#)*?:[ \t]+)?(?:[!&][^ \t]*[ \t]+)*[|>](?:[1-9][+-]?|[+-][1-9]?)?[ \t]*(?:#.*)?\r?$/;
   return lines.some((line, i) => {
     if (!header.test(line)) return false;
     const next = lines.slice(i + 1).find(l => l.trim() !== "");
@@ -124,11 +124,14 @@ class UnreadableFrontmatter extends Error {
  * Parser 2: strict YAML over the block with its export scalars read as the vault's import reads them, when that
  * rewrite is accounted for; otherwise strict YAML alone.
  *   - Nothing to rewrite: strict YAML.
- *   - The block is YAML as it stands: the rewrite stands only if it changed nothing but the values it wrote
- *     ({@link accountsFor}). If it changed anything else (text inside a block scalar, say), the file was not written
- *     by the exporter, and strict YAML's reading is kept.
+ *   - The block is YAML as it stands: the rewrite stands only if the block holds no block scalar that
+ *     {@link holdsBlockScalar} can see and the two readings have the same shape, differing only where the rewritten
+ *     reading holds one of the strings written ({@link accountsFor}). Otherwise the file was not written by the
+ *     exporter, and strict YAML's reading is kept.
  *   - The block is not YAML as it stands (the old exporter's bare leading quote): there is no reading to compare
- *     with, so a block that holds a block scalar is refused rather than trusted, and any other is read rewritten.
+ *     with, so a block in which a block scalar is seen is refused rather than trusted, and any other is read rewritten.
+ * Both checks are exact for what an exporter writes (one value per line, no block scalars); for a hand-written file
+ * they are a best effort, and such a file is read as an export.
  * A block that fails names its note when it can ({@link statedId}).
  */
 function frontmatter(block: string, parser: 1 | 2, reading: "export" | "old-export"): Record<string, unknown> {
@@ -144,7 +147,8 @@ function frontmatter(block: string, parser: 1 | 2, reading: "export" | "old-expo
   if (text === block) return strict ?? refuse(strictError);
   let read: Record<string, unknown>;
   try { read = yaml(text); } catch (error) { return strict ?? refuse(error); }
-  if (strict !== undefined) return accountsFor(read, strict, values) ? read : strict;
+  // A block scalar means no exporter wrote this file: YAML's own reading, whatever the rewrite came to.
+  if (strict !== undefined) return !holdsBlockScalar(block) && accountsFor(read, strict, values) ? read : strict;
   if (holdsBlockScalar(block)) return refuse(strictError);
   return read;
 }

@@ -660,7 +660,7 @@ test("export scalars are read as the vault's import reads them; every other unre
     for (const b of refused) expect(stageOf(b), b.split("\n")[1]).toEqual({ rows: [], quarantine: [{ note_id: noteId, reason: "unreadable_frontmatter" }], issues: [] });
     // A value that merely ends like a block-scalar indicator is ordinary exporter output: the block is still read.
     expect(stageOf(`id: ${noteId}\nmetadata:\n  title: Q3 - >\n  pipe: a - |\n  link: [[X]]`).rows[0].metadata).toEqual({ title: "Q3 - >", pipe: "a - |", link: "[[X]]" });
-    // However a block scalar's header is written, the lines inside it are YAML's to read: nothing in the block is rewritten.
+    // However a block scalar's header is written, the lines inside it are YAML's to read: the rewrite is not kept.
     for (const header of ["text: |", '"odd key": |', "it's: |", "odd:  |", "odd: |  # a comment", "odd: |2-", "odd: >-", "odd: |+", "odd: !!str |", "odd: &a |", "odd: &a !!str >-"]) {
       const key = /^"?([^":|>]+?)"?:/.exec(header)![1]!;
       const got = stageOf(`id: ${noteId}\nmetadata:\n  ${header}\n      note: 'q'\n      - 'item'\n  link: [[A]]`, { date: OLD });
@@ -672,9 +672,11 @@ test("export scalars are read as the vault's import reads them; every other unre
     // like a block-scalar indicator is still a plain string, and the block is still read.
     expect(stageOf(`id: ${noteId}\nmetadata:\n  items:\n    - a: x - >\n      b: [[L]]\n      c: 'q'`, { date: OLD }).rows[0].metadata).toEqual({ items: [{ a: "x - >", b: "[[L]]", c: "'q'" }] });
     // A file that is not YAML as it stands AND holds a block scalar is refused, not guessed at, however the header is written.
-    for (const header of ["text: |", "text: !!str |", "? |"]) {
+    for (const header of ["text: |", "text: !!str |", "? |", "a#b: |"]) {
       expect(stageOf(`id: ${noteId}\nmetadata:\n  saying: 'made up' and more\n  ${header}\n      note: 'q'`, { date: OLD }), header).toEqual({ rows: [], quarantine: [{ note_id: noteId, reason: "unreadable_frontmatter" }], issues: [] });
     }
+    // A block scalar whose rewritten text would equal a value rewritten elsewhere is still YAML's to read.
+    expect(stageOf(`id: ${noteId}\nmetadata:\n  a: |-\n    b: 'c'\n  z: "b: \\"c\\""`).rows[0].metadata).toEqual({ a: "b: 'c'", z: 'b: "c"' });
     // A block scalar that is valid YAML is read by YAML alone: its lines are not rewritten.
     expect(stageOf(`id: ${noteId}\nmetadata:\n  text: |\n    note: 'q' z\n  link: [[A]]`).rows[0].metadata).toEqual({ text: "note: 'q' z\n", link: [["A"]] });
     // A list item that is a map with a quoted key stays a map.
