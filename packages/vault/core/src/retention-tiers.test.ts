@@ -119,3 +119,46 @@ test("marking: set, kept by the byte ceiling, shown on reads, cleared; a missing
   expect(cleared && "marked_at" in cleared).toBe(false);
   expect(await store.markNoteVersion(n.id, 99, { marked: true })).toBeNull();
 });
+
+test("captures keep the hints exact without reading the history: shared bodies, repeats, deletes", async () => {
+  const { readCompactState } = await import("./history-compact-state.js");
+  const db = new Database(":memory:");
+  const store = new SqliteStore(db);
+  const a = await store.createNote("shared body ".repeat(40));
+  const b = await store.createNote("shared body ".repeat(40)); // same body as a: one blob, two notes
+  for (let k = 0; k < 30; k++) {
+    await store.updateNote(a.id, { content: k % 3 === 0 ? "shared body ".repeat(40) : `a ${k} `.repeat(30) });
+    await store.updateNote(b.id, { content: `b ${k % 4} `.repeat(30) }); // repeats: bodies the note already holds
+  }
+  for (const id of [a.id, b.id]) {
+    const hint = db.prepare("SELECT versions, stored, live, legacy FROM history_compact_state WHERE note_id = ?").get(id);
+    const truth = readCompactState(db, id)!;
+    expect(hint).toEqual({ versions: truth.versions, stored: truth.stored, live: truth.live, legacy: truth.legacy });
+  }
+});
+
+test("an edited note is swept too: a capture doesn't move the sweep's clock; one failing note doesn't stop the sweep", async () => {
+  const db = new Database(":memory:");
+  const store = new SqliteStore(db, { history: { compact_budget_ms: 250 } });
+  const busy = await longNote(store, db, 200);
+  const quiet = await longNote(store, db, 200);
+  db.prepare("UPDATE history_compact_state SET refreshed_at = ?").run(Date.now() - 2 * DAY);
+  await store.updateNote(busy, { content: "edited today" });
+  expect((db.prepare("SELECT refreshed_at FROM history_compact_state WHERE note_id = ?").get(busy) as { refreshed_at: number }).refreshed_at).toBeLessThan(Date.now() - DAY);
+  // The oldest-swept note can't be thinned (a trigger refuses its deletes); the other still is, and so is compaction.
+  db.exec(`CREATE TRIGGER refuse_busy BEFORE DELETE ON note_versions WHEN OLD.note_id = '${busy}' BEGIN SELECT RAISE(ABORT, 'injected'); END`);
+  const pass = store.compactHistory({ maxNotes: null });
+  expect(pass.notes_thinned).toBe(1);
+  expect((db.prepare("SELECT COUNT(*) AS n FROM note_versions WHERE note_id = ?").get(quiet) as { n: number }).n).toBeLessThan(600);
+  expect(pass.thin_remaining).toBe(0); // both were visited; the failing one waits for tomorrow
+});
+
+test("a history-import manifest is checked only on the settings vault.yaml sets, so a release's new defaults don't strand it", async () => {
+  const { samePlannedPolicy } = await import("../../src/history-import.ts");
+  const planned = { ...resolveHistoryPolicy({}), max_versions: 100, max_age_days: 180, compact_ratio: 3, compact_min_versions: 10 } as Record<string, unknown>;
+  delete planned.keep_all_days; delete planned.keep_daily_days;
+  expect(samePlannedPolicy(undefined, planned as never)).toBe(true); // nothing configured: defaults may move
+  expect(samePlannedPolicy({ max_versions: 100 }, planned as never)).toBe(true);
+  expect(samePlannedPolicy({ max_versions: 50 }, planned as never)).toBe(false); // the operator changed it since
+  expect(samePlannedPolicy({ keep_all_days: 30 }, planned as never)).toBe(true); // a key the manifest doesn't carry
+});

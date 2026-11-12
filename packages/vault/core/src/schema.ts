@@ -77,6 +77,8 @@ function ensureRevisionKeyKind(db: Database): void {
  * pruning) and older ones ignore it.
  */
 function ensureVersionMarks(db: Database): void {
+  // The tiers' daily sweep picks notes by when it last swept them.
+  if (hasTable(db, "history_compact_state")) db.exec("CREATE INDEX IF NOT EXISTS idx_history_compact_refreshed ON history_compact_state(refreshed_at)");
   if (!hasTable(db, "note_versions")) return;
   if (!hasColumn(db, "note_versions", "marked_at")) db.exec("ALTER TABLE note_versions ADD COLUMN marked_at TEXT");
   if (!hasColumn(db, "note_versions", "marked_by")) db.exec("ALTER TABLE note_versions ADD COLUMN marked_by TEXT");
@@ -747,7 +749,8 @@ export function unnumberedStepsDone(db: Database): boolean {
     hasColumn(db, "tags", "kind") && // ensureTagKinds (T-318 §8a, 0.9)
     (!hasTable(db, "note_versions") || hasColumn(db, "note_versions", "via_kind")) && // ensureRevisionKeyKind (0.9.1)
     compactHintsCurrent(db) && // ensureCompactHintsLegacy (T-460)
-    (!hasTable(db, "note_versions") || hasColumn(db, "note_versions", "marked_by")) // ensureVersionMarks (T-460, 1.0)
+    (!hasTable(db, "note_versions") || hasColumn(db, "note_versions", "marked_by")) && // ensureVersionMarks (T-460, 1.0)
+    (!hasTable(db, "history_compact_state") || hasIndex(db, "idx_history_compact_refreshed"))
   );
 }
 

@@ -1736,7 +1736,9 @@ each note's newest 20 (`min_versions`), delete tombstones, and marked versions.
 Imported history is thinned by the same rule. A capture prunes its note; the
 maintenance pass at vault open also sweeps notes nobody edits, each at most once
 a day, the one swept longest ago first (`notes_thinned`, `versions_thinned`,
-`thin_remaining` in the summary). `keep_all_days: null` turns the tiers off.
+`thin_remaining` in the summary). On a box the pass runs when a vault opens, so
+a daemon that runs for weeks sweeps on its next restart; a capture prunes only
+when a cap the vault sets is reached, so a long history costs a write nothing. `keep_all_days: null` turns the tiers off.
 `max_versions` and `max_age_days` still apply on top when a vault sets them;
 their defaults are no cap (1,000,000 and 36,500 days). The ceiling is at least 1
 and at least the floor; both age settings are capped at 36,500 days. Delete
@@ -1750,7 +1752,11 @@ tombstones are exempt from this pruning.
   keeps the first mark. A marked version is never pruned, thinned, dropped by the
   byte ceiling or swept with a deleted note's history; erasing the note's history
   (`DELETE /notes/{id}/versions`) still erases it. Same lookup and tag-scope rules
-  as reading a version; 404 when there is no such version. `history.deleted_retention_days: null` retains deleted-note history
+  as reading a version; 404 when there is no such version. Any key that can write
+  the note can mark, and marked versions count toward nothing the byte ceiling
+  can drop, so many marks can keep a note over `max_bytes_per_note`.
+
+`history.deleted_retention_days: null` retains deleted-note history
 until explicit erasure; a number enables sweeping on open. A `history:`
 config change in the vault's **`vault.yaml`** takes effect at the next daemon
 restart.

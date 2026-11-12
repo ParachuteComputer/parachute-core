@@ -778,7 +778,7 @@ export class BunSqliteStore implements Store {
         this.syncReferenceFieldLinks(note, priorMetadataForRefs, linkVisible);
       }
 
-      refreshCompactState(this.db, id);
+      refreshCompactState(this.db, id, { liveOnly: true });
       return note;
     });
 
@@ -998,7 +998,7 @@ export class BunSqliteStore implements Store {
     const budget = opts?.budgetMs === undefined ? this.historyPolicy.compact_budget_ms : opts.budgetMs;
     const whole = opts?.noteId === undefined && (budget === null || budget > 0);
     // The tiers' sweep first: it picks notes by when they were last swept, which compacting them would reset.
-    const thinned = whole ? thinVault(this.db, this.historyPolicy, { budgetMs: budget, maxNotes: opts?.maxNotes ?? 1_000 }) : null;
+    const thinned = whole ? thinVault(this.db, this.historyPolicy, { budgetMs: budget, maxNotes: opts?.maxNotes === undefined ? this.historyPolicy.compact_max_notes : opts.maxNotes ?? 10_000 }) : null;
     const summary = compactVault(this.db, this.historyPolicy, opts);
     if (!thinned) return summary;
     return {

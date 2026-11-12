@@ -255,7 +255,7 @@ export function captureVersion(
       size,
       prior.created_at,
     );
-    pruneVersions(db, prior.id, opts.policy, Date.now(), false);
+    pruneAtCapture(db, prior.id, opts.policy, Date.now());
     return;
   }
   const hash = hashContent(text);
@@ -279,7 +279,27 @@ export function captureVersion(
     size,
     prior.created_at,
   );
-  pruneVersions(db, prior.id, opts.policy, Date.now(), false);
+  // The hints follow the capture incrementally (T-460): with 90 days kept whole a note can hold thousands of versions,
+  // so nothing on the write path may read them all. A blob this note already held adds a version, not bytes.
+  const blob = db.prepare("SELECT byte_size, encoding FROM note_blobs WHERE hash = ?").get(hash) as { byte_size: number; encoding: string | null } | null;
+  const held = !!db.prepare("SELECT 1 FROM note_versions WHERE note_id = ? AND content_hash = ? AND version_ix <> ? LIMIT 1").get(prior.id, hash, ix);
+  const legacy = blob && !held && (blob.encoding === "fossil-delta" || (blob.encoding === null && blob.byte_size >= COMPRESS_MIN_BYTES)) ? 1 : 0;
+  db.prepare("UPDATE history_compact_state SET versions = versions + 1, stored = stored + ?, legacy = legacy + ?, refused = 0 WHERE note_id = ?")
+    .run(held || !blob ? 0 : blob.byte_size, legacy, prior.id);
+  pruneAtCapture(db, prior.id, opts.policy, Date.now());
+}
+/**
+ * The prune a capture runs: only when a cap the vault sets is reached (`max_versions`, `max_age_days`), checked from
+ * the hints' count and the oldest row by index, so a long history costs a write nothing. The tiers themselves are
+ * applied by the daily sweep (thinVault), which reaches every note.
+ */
+function pruneAtCapture(db: Database, noteId: string, policy: HistoryPolicy, now: number): void {
+  const hint = db.prepare("SELECT versions FROM history_compact_state WHERE note_id = ?").get(noteId) as { versions: number } | null;
+  const oldest = db.prepare("SELECT superseded_at FROM note_versions WHERE note_id = ? ORDER BY version_ix ASC LIMIT 1").get(noteId) as { superseded_at: string } | null;
+  const cutoff = new Date(now - policy.max_age_days * 86_400_000).toISOString();
+  if (hint && hint.versions < policy.max_versions && (!oldest || oldest.superseded_at >= cutoff)) return;
+  const r = pruneVersions(db, noteId, { ...policy, keep_all_days: null }, now, false);
+  if (r.versionsDeleted > 0) refreshCompactState(db, noteId);
 }
 export function appendRestoreMarker(
   db: Database,
@@ -446,15 +466,22 @@ export function thinVault(db: Database, policy: HistoryPolicy, opts: { budgetMs:
   for (const c of candidates) {
     if (visited > 0 && opts.budgetMs !== null && performance.now() - started >= opts.budgetMs) break;
     visited++;
-    transaction(db, () => {
-      const r = pruneVersions(db, c.note_id, policy, now, false);
-      if (r.versionsDeleted > 0) {
-        out.notes_thinned++;
-        out.versions_thinned += r.versionsDeleted;
-        refreshCompactState(db, c.note_id, { refused: c.refused === 1 });
-      }
-      db.prepare("UPDATE history_compact_state SET refreshed_at = ? WHERE note_id = ?").run(Date.now(), c.note_id);
-    });
+    try {
+      transaction(db, () => {
+        const r = pruneVersions(db, c.note_id, policy, now, false);
+        if (r.versionsDeleted > 0) {
+          out.notes_thinned++;
+          out.versions_thinned += r.versionsDeleted;
+          refreshCompactState(db, c.note_id, { refused: c.refused === 1 });
+        }
+      });
+    }
+    catch (err) {
+      // One note that can't be thinned waits for tomorrow; it never stops the pass or the maintenance after it.
+      console.warn("[history] thinning failed", c.note_id, err);
+    }
+    // Only the sweep moves `refreshed_at`, so every note, edited or not, comes round once a day.
+    db.prepare("UPDATE history_compact_state SET refreshed_at = ? WHERE note_id = ?").run(Date.now(), c.note_id);
   }
   out.remaining = (db.prepare("SELECT COUNT(*) AS n FROM history_compact_state WHERE refreshed_at < ?").get(due) as { n: number }).n;
   return out;

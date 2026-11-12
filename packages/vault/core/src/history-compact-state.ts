@@ -14,6 +14,7 @@ export function rebuildCompactState(db: Database): number {
       legacy INTEGER NOT NULL DEFAULT 0
     );
     CREATE INDEX idx_history_compact_candidates ON history_compact_state(refused, stored DESC);
+    CREATE INDEX idx_history_compact_refreshed ON history_compact_state(refreshed_at);
     CREATE INDEX IF NOT EXISTS idx_note_versions_note_hash ON note_versions(note_id, content_hash);`);
     db.prepare(`INSERT INTO history_compact_state(note_id,versions,stored,live,refused,refreshed_at,legacy)
       SELECT note_id,versions,stored,live,0,?,legacy FROM (${COMPACT_STATE_AGGREGATE.replace("__FILTER__", "")})`).run(Date.now());
@@ -38,10 +39,17 @@ export function readCompactState(db: Database, noteId: string): CompactState | n
 }
 
 /** Caller owns the enclosing write transaction; run after the live-row mutation. */
-export function refreshCompactState(db: Database, noteId: string, opts?: { refused?: boolean }): void {
+export function refreshCompactState(db: Database, noteId: string, opts?: { refused?: boolean; liveOnly?: boolean }): void {
   // Keep the existing graceful behavior of writes before history tables exist.
   const tables = db.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name IN ('note_versions','note_blobs','history_compact_state')").get() as { n: number };
   if (tables.n !== 3) return;
+  // A note's ordinary write (T-460): its capture already moved versions/stored/legacy (captureVersion), so only the
+  // live size is new. Reading every version here would make each write cost grow with the note's history.
+  if (opts?.liveOnly) {
+    const changed = db.prepare(`UPDATE history_compact_state SET live = COALESCE((SELECT LENGTH(CAST(content AS BLOB)) FROM notes WHERE id = ?),
+      (SELECT content_len FROM note_versions WHERE note_id = ? ORDER BY version_ix DESC LIMIT 1), 0) WHERE note_id = ?`).run(noteId, noteId, noteId).changes;
+    if (changed > 0 && db.prepare("SELECT 1 FROM history_compact_state WHERE note_id = ?").get(noteId)) return;
+  }
   const state = readCompactState(db, noteId);
   if (!state) {
     db.prepare("DELETE FROM history_compact_state WHERE note_id=?").run(noteId);
@@ -50,6 +58,6 @@ export function refreshCompactState(db: Database, noteId: string, opts?: { refus
   db.prepare(`INSERT INTO history_compact_state(note_id,versions,stored,live,refused,refreshed_at,legacy)
     VALUES(?,?,?,?,?,?,?) ON CONFLICT(note_id) DO UPDATE SET
     versions=excluded.versions,stored=excluded.stored,live=excluded.live,
-    refused=excluded.refused,refreshed_at=excluded.refreshed_at,legacy=excluded.legacy`)
+    refused=excluded.refused,legacy=excluded.legacy`)
     .run(noteId, state.versions, state.stored, state.live, opts?.refused ? 1 : 0, Date.now(), state.legacy);
 }
