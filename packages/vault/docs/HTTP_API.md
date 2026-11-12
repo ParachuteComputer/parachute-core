@@ -1674,8 +1674,9 @@ Versions are **not** full-text searchable.
 - `POST /vault/{name}/api/history/compact` requires **`vault:admin`** and
   returns a compaction summary, including `remaining_candidates` and
   `notes_failed`. A whole-vault run (no `note_id`) also converts search vectors
-  stored as float32 to int8 (stored under the model name with `::int8` added), with a second budget of the same size
-  (no `budget_ms`: up to 20,000 rows): `vectors_converted`, `vectors_failed`
+  stored as float32 to int8 (stored under the model name with `::int8` added),
+  with its own budget of the same size (no `budget_ms`: up to 20,000 rows; on
+  open, `compact_budget_ms: 0` turns the whole pass off): `vectors_converted`, `vectors_failed`
   (rows that don't decode, left as they are and out of search) and
   `vectors_remaining`. Optional JSON `{note_id, budget_ms, max_notes}` restricts the
   run; absent bounds mean unbounded, while explicit zero bounds are 400

@@ -107,8 +107,10 @@ export function convertVectorsToInt8(db: Database, opts: { budgetMs: number | nu
     WHERE ${FLOAT32_ROW_SQL} AND (note_id, chunk_ix) > (?, ?) ORDER BY note_id, chunk_ix LIMIT ?`);
   const update = db.prepare(`UPDATE note_vectors SET vector = ?, model = ? WHERE note_id = ? AND chunk_ix = ? AND model = ?`);
   let converted = 0, failed = 0, afterNote = "", afterIx = -1;
-  while (converted + failed < opts.maxRows) {
-    const rows = select.all(afterNote, afterIx, Math.min(100, opts.maxRows - converted - failed)) as { note_id: string; chunk_ix: number; vector: Uint8Array; model: string }[];
+  // Failed rows don't count toward maxRows (only the time budget bounds them), so undecodable rows at the head of
+  // the key order can't keep the rest from converting.
+  while (converted < opts.maxRows) {
+    const rows = select.all(afterNote, afterIx, Math.min(100, opts.maxRows - converted)) as { note_id: string; chunk_ix: number; vector: Uint8Array; model: string }[];
     if (rows.length === 0) break;
     transaction(db, () => {
       for (const r of rows) {

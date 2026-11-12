@@ -113,3 +113,17 @@ test("a row that doesn't decode is left as it is and never stops the rest, over 
   expect(db.prepare("SELECT COUNT(*) AS n FROM note_vectors WHERE model = 'fake-bge'").get()).toEqual({ n: 2 });
   expect((await store.semanticSearch("gardens", { limit: 5 })).notes.length).toBe(5);
 });
+
+test("many undecodable rows ahead of the good ones don't starve the conversion", async () => {
+  const { convertVectorsToInt8 } = await import("./embedding/vectors.js");
+  const db = new Database(":memory:");
+  const store = new SqliteStore(db, { embeddingProvider: new Fake() });
+  for (let i = 0; i < 160; i++) {
+    const n = await store.createNote(`n ${i}`, { id: `n-${String(i).padStart(3, "0")}`, path: `p${i}` });
+    const ok = new Uint8Array(new Float32Array(normalize(fakeVector(`n ${i}`))).buffer);
+    db.prepare(`INSERT OR REPLACE INTO note_vectors (note_id, chunk_ix, vector, dims, model, content_hash, embedded_at) VALUES (?, 0, ?, ?, 'fake-bge', 'x', 'now')`)
+      .run(n.id, i < 150 ? ok.subarray(0, ok.length - 1) : ok, DIMS); // the first 150 in key order are damaged
+  }
+  const r = convertVectorsToInt8(db, { budgetMs: null, maxRows: 100 });
+  expect(r).toMatchObject({ converted: 10, failed: 150, remaining: 150 });
+});
