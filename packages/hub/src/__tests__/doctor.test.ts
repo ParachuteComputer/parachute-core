@@ -1347,3 +1347,48 @@ describe("doctor — Grants group (inventory + two advisories)", () => {
     }
   });
 });
+
+describe("doctor --fix — data housekeeping gate (stale history hints, unused OAuth clients)", () => {
+  const stale = { vault: "v1", checked: 3, drifted: 2 };
+  const oldClient = { clientId: "c-old", clientName: "Made-up client", registeredAt: "2026-01-01T00:00:00.000Z", status: "approved" as const, ageDays: 90 };
+  function dataDeps() {
+    const calls: string[] = [];
+    return {
+      calls,
+      data: {
+        listVaults: () => ["v1"],
+        historyDrift: () => ({ checked: stale.checked, drifted: stale.drifted }),
+        rebuildHistory: (_: string, v: string) => (calls.push(`rebuild ${v}`), true),
+        findReapable: () => [oldClient],
+        reapClients: (_: string, ids: string[]) => (calls.push(`reap ${ids.join(",")}`), ids),
+      },
+    };
+  }
+
+  test("a terminal: 'n' at the prompt changes nothing, 'y' runs both fixers", async () => {
+    const h = makeHarness();
+    try {
+      const d = dataDeps();
+      const no = await runFix(h, { isInteractive: () => true, readLine: async () => "n", data: d.data });
+      expect(no.code).toBe(1);
+      expect(d.calls).toEqual([]);
+      const yes = await runFix(h, { isInteractive: () => true, readLine: async () => "y", data: d.data });
+      expect(yes.code).toBe(0);
+      expect(d.calls).toEqual(["rebuild v1", "reap c-old"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("a failed rebuild makes --fix exit 1 and says which vault", async () => {
+    const h = makeHarness();
+    try {
+      const d = dataDeps();
+      const { code, lines } = await runFix(h, { data: { ...d.data, rebuildHistory: () => false } }, { yes: true });
+      expect(code).toBe(1);
+      expect(lines.join("\n")).toContain('Could not rebuild the compaction hints of vault "v1"');
+    } finally {
+      h.cleanup();
+    }
+  });
+});

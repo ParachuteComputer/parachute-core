@@ -253,10 +253,11 @@
    "old": "parachute auth reap-clients",
    "new": "parachute doctor --fix",
    "action": "merge",
-   "reason": "housekeeping",
+   "reason": "housekeeping: `parachute doctor` names OAuth clients nothing uses (none for 30 days, no grants, live tokens or open codes) and `parachute doctor --fix --yes` removes them; `auth reap-clients` keeps working",
    "since": "0.9",
    "removed_in": "1.0",
-   "state": "planned"
+   "state": "live",
+   "release": "0.9.3"
   },
   {
    "kind": "command",
@@ -583,10 +584,11 @@
    "old": "parachute-vault history rebuild-state",
    "new": "parachute doctor --fix",
    "action": "merge",
-   "reason": "a repair doctor already detects",
+   "reason": "a repair doctor already detects: `parachute doctor` names a vault whose history hints are stale and `parachute doctor --fix --yes` rebuilds them; `history rebuild-state` keeps working",
    "since": "0.9",
    "removed_in": "1.0",
-   "state": "planned"
+   "state": "live",
+   "release": "0.9.3"
   },
   {
    "kind": "command",

@@ -34,6 +34,28 @@ export function readCompactState(db: Database, noteId: string): CompactState | n
   return db.prepare(COMPACT_STATE_AGGREGATE.replace("__FILTER__", "AND note_id=?")).get(noteId) as CompactState | null;
 }
 
+/**
+ * Every note's hint row against what history says it should be (the full audit `scanCompactStateDrift` in doctor.ts
+ * only samples). Read-only. A hint row for a note with no history, or a missing one, counts as drift. The `refused`
+ * flag is a real decision, not derived, so it is not compared.
+ */
+export function compactStateDrift(db: Database): { checked: number; drifted: number } {
+  const has = (name: string) => !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name);
+  if (!has("note_versions") || !has("note_blobs")) return { checked: 0, drifted: 0 };
+  const actual = db.prepare(COMPACT_STATE_AGGREGATE.replace("__FILTER__", "")).all() as CompactState[];
+  const stored = new Map<string, CompactState>();
+  if (has("history_compact_state")) {
+    for (const row of db.prepare("SELECT note_id,versions,stored,live FROM history_compact_state").all() as CompactState[]) stored.set(row.note_id, row);
+  }
+  let drifted = 0;
+  for (const a of actual) {
+    const s = stored.get(a.note_id);
+    if (!s || s.versions !== a.versions || s.stored !== a.stored || s.live !== a.live) drifted++;
+    stored.delete(a.note_id);
+  }
+  return { checked: actual.length, drifted: drifted + stored.size };
+}
+
 /** Caller owns the enclosing write transaction; run after the live-row mutation. */
 export function refreshCompactState(db: Database, noteId: string, opts?: { refused?: boolean }): void {
   // Keep the existing graceful behavior of writes before history tables exist.

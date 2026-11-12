@@ -119,6 +119,8 @@ const OLD: { match: string[]; now: string | null; entry: string; when?: (rest: s
   { match: ["vault", "mcp-install"], now: "setup mcp", entry: "parachute-vault mcp-install" },
   { match: ["vault", "transcription", "install"], now: "setup transcription", entry: "parachute-vault transcription install" },
   { match: ["vault", "tokens"], now: "keys", entry: "parachute-vault tokens list|revoke" },
+  { match: ["auth", "reap-clients"], now: "doctor --fix", entry: "parachute auth reap-clients" },
+  { match: ["vault", "history", "rebuild-state"], now: "doctor --fix", entry: "parachute-vault history rebuild-state" },
   { match: ["vault", "backup"], now: "backup", entry: "parachute-vault backup [status] [--schedule]" },
 ];
 
