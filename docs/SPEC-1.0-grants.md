@@ -42,7 +42,7 @@ Bakery, the `recipes` vault.
 
 | # | The question | Lean | Why it's yours |
 |---|---|---|---|
-| A | The four event numbers (§2.1). The shell can't sign a grant until they are fixed, and a signed one is honoured for good. | 37440 grant, 7440 revoke, 37441 link, 37442 claim. None is taken in the Nostr list today. | Permanent. Benjamin should see it. |
+| A | The five event numbers and their layout (§2.1): the meaning in canonical JSON content, the grant frame Uni's keys use too. The shell can't sign a grant until they are fixed, and a signed one is honoured for good. | 37440 grant, 7440 revoke, 37441 link, 37442 claim, 37443 the vault's own record. None is taken in the Nostr list today. Freeze after one fresh security pass with Benjamin. | Permanent. Benjamin should see it. |
 | B | Can someone with only an email (most of Cloud today) share a vault? | Yes. With no key to sign, the door vouches for the grant, the list says so, and it doesn't carry to another door. | It makes "signed by the owner" untrue for those vaults, plainly marked. |
 | C | After a move, do your friends' grants work at the new door at once? | One tap, once: "bring these 5 grants over". Revokes apply at once with no tap. | A copy left at the old door would keep honouring them. The tap is you saying the old one is retired. |
 | D | The longest a grant may last. | A year. The shell reminds you a month ahead. | Shorter is safer and asks you more often. |
@@ -52,9 +52,9 @@ Bakery, the `recipes` vault.
 
 **Two more, for Benjamin as much as you**
 
-- **H. Give every vault its own id before 1.0** (lean: in 0.9.3, it is one additive field). A grant names a vault by
-  id, and a box has none today. Until it does, a grant the shell signs can't be filed at 1.0 and is signed again
-  once (§10).
+- **H. Every vault's id is its own Nostr key [decided, Aaron 11-12].** §2.3 says where the private key lives, how
+  it moves, rotates and is retired after a leak. What is still open is only when: lean, in 0.9.3, as one additive
+  field and one key file, so a grant the shell signs before 1.0 doesn't have to be signed again (§10).
 - **I. A token carries the grant's id, not its rules** (§7.2). The 0.9 spec said the narrowing travels in the
   token. Here the vault reads the rules from the signed grant on every request, so a revoke or a narrower grant
   bites at once. The cost: a verifier that isn't the vault (Prism's) can't apply a grant itself; it refuses, or
@@ -75,81 +75,228 @@ Bakery, the `recipes` vault.
 
 ## 2. The grant
 
-### 2.1 The event [decided: an addressable Nostr event, signed by the owner; the shape is this spec's]
+### 2.1 The event [decided: an addressable Nostr event, signed by the owner; the layout is this spec's lean]
+
+**The meaning is in the content; the tags only address it.** A grant's content is one JSON object in one allowed
+spelling. Its two tags repeat two of its fields so relays and clients can address and expire it, and a vault
+refuses the event if they disagree. The same object, the *grant frame*, is what Uni's key minter and the shell's
+card read for keys and applets (T-462), so the bytes the owner signs are the bytes every party reads.
 
 ```
-kind        37440            addressable: (kind, pubkey, d) is one grant; a newer event replaces an older
+kind        37440          addressable: (kind, pubkey, d) is one grant's address; a newer event replaces an older
 pubkey      the grantor's key
 created_at  when it was signed
-tags
-  ["d", "<id>"]                        1 to 64 of [A-Za-z0-9._-]. One id is one grantee, for good.
-  ["vault", "<vault id>"]              the vault's own id (§2.3). Never its name.
-  ["p", "<grantee key>"]               the grantee, when it is a key …
-  ["applet", "<applet id>", "<author key>"]    … or an applet in the grantor's shell. Exactly one of the two.
-  ["by", "signer"]                     whose name its writes carry (§5): "signer", "self",
-                                       or ["by", "names", "<prefix>"]
-  ["type", "<type>", "<verb>", …]      one per type. "*" is every record, typed or not.
-  ["deny", "<tag>"]                    zero or more: records carrying this tag are outside the grant
-  ["was", "<stamp>"]                   zero or more: earlier stamps this grant carries on from (§4.3).
-                                       Owner-signed grants only.
-  ["under", "<the member's grant id>"] on a member-signed grant: the grant it hangs from (§5.2). Required there.
-  ["expiration", "<unix seconds>"]     required. NIP-40's tag, so relays and clients read it the same way.
-content     one plain sentence saying what signing this allows. The vault never parses it.
+tags        exactly [["d", "<id>"], ["expiration", "<until>"]], in that order
+content     the grant, canonical JSON (below)
 ```
 
-The verbs are **`read`, `create`, `update`, `delete`** [decided]. `read`, `update` and `delete` may each be written
-`read:own`, `update:own`, `delete:own`: only records this grantee made [decided: own-records-only]. A type covers its
-subtypes as the vault defines them today: a type declared under it, or named `parent/child` [decided, SPEC §3.5].
+The content, laid out for reading (the signed text has no spaces or line breaks):
 
-Four kinds are reserved together [lean, open decision A]: `37440` grant, `7440` revoke (a regular event, never
-replaced), `37441` link statement, `37442` link claim. None appears in the kinds table of
-nostr-protocol/nips as fetched on 11-10. A signature covers the kind, so these are fixed before the shell signs its
+```json
+{
+  "v": 1,
+  "id": "<the d tag's value>",
+  "at": "parachute",
+  "honors": "<the vault's id: its own public key, 64 lowercase hex (§2.3)>",
+  "gives": "access",
+  "to": {
+    "kind": "key",
+    "id": "<the grantee's public key, 64 lowercase hex>",
+    "by": "self | signer | names:<prefix>",
+    "was": ["key:<name>", "grant:<id>", "applet:<id>"]
+  },
+  "allow": [
+    {"on": {"type": "<type> | *"}, "can": ["create", "delete", "read", "update"]},
+    {"on": {"type": "<type>"}, "can": ["delete", "read", "update"], "only": {"own": true}}
+  ],
+  "deny": [{"tag": "<marker tag>"}],
+  "under": "<on a member-signed grant: the member's own grant id>",
+  "until": 1826000000,
+  "purpose": "<one line saying what signing this allows; never read by a check>"
+}
+```
+
+An applet grant's `to` is `{"kind": "applet", "id": "<applet id>", "author": "<author key>", "by": "signer"}`.
+
+| Field | Meaning | Rule |
+|---|---|---|
+| `v` | the frame's version | `1`. Any other is refused (§2.2 line 4) |
+| `id` | the grant's id, equal to the `d` tag | 1 to 64 of `[A-Za-z0-9._-]`. One id is one grantee, for good (line 6) |
+| `at`, `gives` | which reader, what kind of thing | exactly `parachute` and `access`. Kind 37440 also carries the shell's own grants (devices, rooms), so a vault checks both |
+| `honors` | the vault | equals this vault's id byte for byte. Never its name |
+| `to` | the grantee | `kind` is `key` or `applet`. A key is 64 lowercase hex. An applet has an `id` in the `id` charset and the `author` key the shell pins |
+| `to.by` | whose name its writes carry (§5) | required: `self`, `signer`, or `names:<prefix>` (§6.1's prefix rule; it holds no colon) |
+| `to.was` | earlier stamps it carries on from (§4.3) | 1 to 8, sorted, different; `key:`, `grant:` or `applet:` stamps. Owner-signed grants only |
+| `allow` | rows: `on` one type (`*` is every record, typed or not), `can` its verbs, `only.own` for own records only | 1 to 64 rows, each different, sorted by their canonical text; verbs sorted. An own row is `"only": {"own": true}` exactly and carries only `read`, `update`, `delete` |
+| `deny` | records carrying any of these tags are outside the grant, for every verb | optional; 1 to 16 `{"tag": …}`, sorted, different. Grant-wide, never on a row: grants only add, so a deny on one row would leave another row showing the record |
+| `under` | on a member-signed grant: the member's own grant it hangs from (§5.2) | required there, refused elsewhere; an id with no dot |
+| `until` | when it ends | unix seconds; equal to the `expiration` tag (NIP-40's, written as a decimal with no leading zero) |
+| `purpose` | the asker's words, shown last on the card | 1 to 200 code points; no C0 or C1 control, no U+061C, U+200B–U+200F, U+2028–U+202E, U+2060–U+2069, U+FEFF, or the frame's fixed list of blanks. No check reads it |
+
+The verbs are **`read`, `create`, `update`, `delete`** [decided]. `read`, `update` and `delete` may each sit in an
+own row: only records this grantee made [decided: own-records-only]. A type covers its subtypes as the vault defines
+them today: a type declared under it, or named `parent/child` [decided, SPEC §3.5]. The 1.0 vocabulary is exactly
+this: `on` holds `type` only, `only` holds `own` only, `deny` holds `tag` only. Anything else is refused (line 4),
+including `on.path` (sharing a subtree is 1.1).
+
+**One spelling.** The content is canonical JSON: keys sorted by code point, no spaces, characters as themselves
+(no `\u` escapes but those JSON requires), whole numbers only, verbs and rows sorted as above. A content that isn't
+the canonical spelling of what it says is refused, so one meaning has one digest. Everything a check reads (ids,
+keys, types, tags, verbs) is printable ASCII; only `purpose` may be in any script. Type and tag names outside ASCII
+can't be granted or denied by name at 1.0 (§13). Test vectors for the spelling ship with this spec; every signer
+and every vault runs them.
+
+**Size.** The content is at most 6,000 bytes of UTF-8 and the event at most 8,192 bytes. Both are checked: the
+event escapes the content's quotes, so it is 1.25 to 1.9 times larger.
+
+Five kinds are reserved together [lean, open decision A]: `37440` grant, `7440` revoke (a regular event, never
+replaced), `37441` link statement, `37442` link claim, and `37443` the vault's own record (§2.3). The grant frame's
+other carriers keep their own numbers beside these, outside this spec: `24335` an order (one key or one act,
+honoured once), `24337` a receipt, `37449` the owner's signed account lists. None appears in the kinds table of
+nostr-protocol/nips as fetched on 11-12. A signature covers the kind, so these are fixed before the shell signs its
 first grant.
 
 ### 2.2 When a vault takes a grant
 
 A vault files a grant only if every line holds. It checks again on every request. Anything else is refused, with
 the reason. The lines are checked in this order and the first that fails names the refusal. Lines 1, 2 and 4 hold
-for every statement (a revoke, a link, a claim), and no event over 8 KB is taken.
+for every statement (a revoke, a link, a claim, a vault record), and no event over the size limits of §2.1 is taken.
 
 1. **The event is whole:** the id is the hash of its fields and the signature verifies (BIP-340).
-2. **It names this vault:** the `vault` tag equals the vault's own id.
+2. **It names this vault:** `at` is `parachute`, `gives` is `access`, and `honors` equals the vault's own id byte
+   for byte.
 3. **The signer has standing.** It is one of the vault's owner keys today; or it is a member's key, under §5.2's
-   limits. An admin key that signs in *as* the owner (a personal door's `ADMIN_PUBKEYS`) has none.
-4. **It knows every tag and verb.** A grant with a tag or a verb the vault doesn't know is refused, never read
-   around: an unknown tag may be a limit the signer meant, and skipping it would open more than was signed.
-5. **It ends:** `expiration` is present, in the future, and at most 366 days after `created_at` [lean, open
-   decision D]. `created_at` is no more than ten minutes ahead of the vault's clock.
+   limits. An admin key that signs in *as* the owner (a personal door's `ADMIN_PUBKEYS`) has none. The vault's own
+   key has none (§2.3).
+4. **It is in its one spelling and knows every field, verb and tag.** The tags are exactly `d` then `expiration`,
+   equal to the content's `id` and `until`. The content is canonical. A grant with a field, a key, a verb or a tag
+   the vault doesn't know is refused, never read around: an unknown field may be a limit the signer meant, and
+   skipping it would open more than was signed.
+5. **It ends:** `until` is in the future and at most 366 days after `created_at` [lean, open decision D].
+   `created_at` is no more than ten minutes ahead of the vault's clock.
 6. **The id is free or the same:** no revoke stands against its address (§3). Ids are one namespace per vault,
-   shared with door grants (§7.3), and an id is never reused: a `d` that was **ever** on file under another
+   shared with door grants (§7.3), and an id is never reused: an `id` that was **ever** on file under another
    signer or for another grantee is taken, ended or not, because `grant:<id>` stays on what it wrote. A member's
    own grant (`by self`) has an id with no dot. A member's agents' ids start with that id and a dot (`bo.claude`),
    and nobody else may use that start, so a member can't take an id the owner will want. If an event with this
-   address is on file, this one is newer by `created_at` (on a tie the lower event id wins, as in NIP-01, so two copies
-   always merge to the same answer), it is signed by the same key, and its grantee, `by`, `was` and `under` tags
-   are identical. An owner with two keys replaces a grant with the key that signed it. A replacement may change types, verbs, denies and the date. It may never change who the grant is
-   for or what it counts as its own.
+   address is on file, this one is newer by `created_at` (on a tie the lower event id wins, as in NIP-01, so two
+   copies always merge to the same answer), it is signed by the same key, and its `to` and `under` are
+   byte-identical to the last event the vault filed at that address. An owner with two keys replaces a grant with
+   the key that signed it. A replacement may change rows, denies, the date and the purpose. It may never change who
+   the grant is for, whose name it writes in, or what it counts as its own.
 7. **One grant per grantee:** a key holds at most one grant in force in a vault, and a signer's applet id likewise.
    A second is refused until the first has ended. So a token never has two grants to choose between. An owner-signed
    grant for a key ends a member-signed one that key holds, so a member can't block the owner. A grantee is
-   never one of the vault's owner keys. To a member, a refusal about the grantee's key reads the same as
-   `exceeds_grantor`, so a member can't use filing to learn which keys hold grants.
-8. **It is coherent:** exactly one grantee. `update` or `delete` on a type comes with `read` or `read:own` on it.
-   An applet grant doesn't name `*`. No verb reaches admin (§4.4).
+   never one of the vault's owner keys, nor the vault's own key. To a member, a refusal about the grantee's key
+   reads the same as `exceeds_grantor`, so a member can't use filing to learn which keys hold grants.
+8. **It is coherent:** `update` or `delete` on a type comes with a `read` row on that type, own or not. An applet
+   grant doesn't name `*`. `was` only on an owner-signed grant; `under` only, and always, on a member-signed one.
+   A `names:` prefix is lowercase `[a-z0-9.-]`, holds a letter or a digit, and isn't reserved (§6.1). No verb
+   reaches admin (§4.4).
 
-A grant is **in force** while it is filed, valid by these lines, not past its date, not revoked, and its signer
-still has standing.
+A grant is **in force** while it is filed, valid by these lines, not past its date, not revoked, not suspended
+(below), and its signer still has standing.
 
-### 2.3 The vault's own id
+**A newer grant the vault can't take suspends the address** [lean]. Replacement plus refusal has one gap: a
+narrowing replacement that this vault refuses, for any reason (a field from a later version, `v: 2`, a size or date
+limit, a rule a later version relaxes), would leave the older, wider grant in force, and a rollback makes every
+vault an older one. So: an event at an address that passes lines 1 and 3, is at most ten minutes ahead of the
+vault's clock when it arrives, is newer than the event in force there, and passes a minimal read, but is not filed
+for any other reason, takes the address out of force. The vault never falls back to the older event. The minimal
+read is frozen for every later version: the content is a JSON object with no duplicate keys, its `at` is
+`parachute`, its `honors` is this vault byte for byte, and its `id` equals the `d` tag. An event that fails it is
+refused and suspends nothing, so an owner's grant at the same address for another vault, or a shell grant on the
+same kind, never touches this one. The address comes back only with a newer event the vault files. The vault keeps
+the newest unfiled event per address (signature checked, up to 64 KB), lists the grant as `suspended`, and carries
+it with the statements (§3, §9). Only the grantor's key can sign at its address, so nobody else can suspend a grant.
+A shell narrows with fields every vault it names knows, or by a revoke and a new id.
+
+### 2.3 The vault's own key [decided 11-12: a vault's id is its own Nostr key]
 
 A grant has to name a vault that is still the same vault after a rename or a move. Today nothing fits: a box has no
 vault id, and Cloud's lives at the door, not in the vault [code: no `vault_id` in core `packages/`; cloud
 `workers/identity/migrations/0020_vault_id.sql`].
 
-1.0 gives every vault an id: 32 hex characters, random, made with the vault (or at the 1.0 upgrade), stored in the
-vault, shown as `id` in the vault's info, and written to the export's `vault.yaml`. Cloud's existing `vault_id`
-becomes it. An import that is a **move** keeps the id. An import that is a **copy** gets a new one, and the grants
-it carries are history only.
+**The id.** 1.0 gives every vault a Nostr key pair, made with the vault (or at the 1.0 upgrade). The vault's id is
+the public key it was born with: 64 lowercase hex, stored in the vault, shown as `id` in the vault's info, and
+written to the export's `vault.yaml`. **The id never changes,** even when the key that signs for the vault does
+(below), so grants never have to be signed again because of a key. Cloud's existing `vault_id` stays an internal
+row id. An import that is a **move** keeps the id. An import that is a **copy** gets a new key and so a new id, and
+the grants it carries are history only.
+
+**What the key is for, and what it isn't.** It names the vault, and it signs one thing at 1.0: the vault's own
+record (kind 37443, below), which says which key currently signs for the vault and, for the vault map at 1.1, where
+it lives. It never authorises: it has no standing to sign a grant or a revoke, it can't be a grantee, and nothing
+in §2.2 needs it, because the vault checks the owner's signature itself. So the vault's private key reaches no
+record. Losing it costs one owner tap (rotation); leaking it lets someone claim to be the vault, which an owner
+ends (below).
+
+**Where the private key lives.**
+
+| Door | Where | Not |
+|---|---|---|
+| A box | a file per vault in the hub's home, `vault-keys/<id>`, mode 0600, owned by the hub's user | in the vault's database or data folder, in an export, or in `--restore`'s backups. A box that loses the file asks the owner to rotate |
+| Parachute Cloud | the identity worker's database, encrypted under a key held as a Worker secret | in the vault's Durable Object: the engine that serves every request never holds it |
+| A personal door | the same as Cloud, under that door's own Worker secret | the same |
+
+The door signs for the vault. That changes nothing in §8's rule 3: the door mints every token and is trusted
+anyway.
+
+**The vault's record** (kind 37443, addressable, `d` = the vault id):
+
+```json
+{"v": 1, "honors": "<vault id>", "key": "<the key that signs for this vault now>", "lives": "<https URL, or absent>"}
+```
+
+Two kinds of signer may sign one, with different weight:
+
+- **The vault** (its current key) signs its own: at birth (`key` = the id), when it moves door, and when `lives`
+  changes. A vault's record may not change `key` to a key other than its own signer, except in a move handover
+  (below).
+- **An owner override** is the same kind signed by one of the vault's owner keys. It may name any `key` and any
+  `lives`. This is how an owner rotates the key, and how an owner takes a vault back from a host that leaked or
+  misused it.
+
+**Which record counts** (every reader, the same rule): take the newest owner override for this vault id from a key
+the reader knows as an owner (the owner's own shell knows its key; a grantee knows the key that signed its grant,
+and a member's agent the owner key that signed the member's grant). It names a key K; with no override, K is the id. Then follow handovers newer than that override (or from the start):
+a vault record signed by K that names another key moves K to it. Records signed by the final K count only if newer
+than the override. **Once an owner override names a new key,
+nothing the old key signs counts again, whatever date it carries,** so a leaked key can't backdate its way back. On
+a tie the lower event id wins, as in §2.2 line 6.
+
+**How it travels in an export.** The export carries the vault id and every 37443 record, word for word, in
+`.parachute/statements.jsonl`. It never carries the private key: an export is a file people copy, and a copy
+holding the key could speak as the vault. On a **move**, the arriving door makes a new key pair. Then:
+
+- *An owner with a key:* the owner's one tap that brings the grants over (§9) also signs an override naming the new
+  door's key and `lives`. The id, and so every grant, stays.
+- *An owner with no key* (open decision B): `tools/move` asks the arriving door for its new public key and has the
+  leaving door sign a vault record naming it (the handover). This is the only record a vault signs naming a key
+  other than its own, and only `tools/move` asks for one. Such an owner trusts the door already; the list says so.
+
+**How it rotates.** An owner rotates at any time by signing an override naming a key the door made for the vault
+(the door shows it; the owner's shell signs). The door installs the new private key when it files the override and
+deletes the old one. A door asked to file an override naming a key it doesn't hold files it and stops signing as
+the vault: that is how an owner retires a host.
+
+**If a host leaks the key.** Whoever holds a leaked key can sign vault records: claim the vault lives elsewhere
+(the vault map would send readers there) or claim a new key. They can't sign or end a grant, read a record, or
+mint a token at a door that doesn't hold the vault. The owner ends it with one override: a new `key` (made by the
+door they trust), and `lives` where the vault really is. From then on the leaked key counts for nothing. The vault
+lists every record it holds, with which counts, so an owner sees a stray one. An owner with no key can't override:
+for them a leak is the door's to clean up, which is the plain cost of open decision B.
+
+**Restores.** The door's copy (§3) keeps vault records like every statement, so a restore can't bring back a
+record an override retired.
+
+### 2.4 The grant frame and other readers
+
+The content above is one instance of a frame that also carries Uni's keys (a Cloudflare or GitHub key handed to one
+job, `gives: key`) and one-off actions (`gives: act`), read by a minter that knows no vault. A vault reads only
+`at: parachute` and refuses the rest (line 2); a minter refuses `at: parachute`. Both read the same spelling, so a
+card drawn from the bytes means the same thing at every honouring party. The frame's own spec and code live with
+the key minter; this spec owns the vault's fields and vocabulary.
 
 ## 3. Ending a grant
 
@@ -159,10 +306,24 @@ it carries are history only.
   ```
   kind     7440
   pubkey   who ends it (below)
-  tags     ["a", "37440:<grantor key>:<id>"]   the grant's address, exactly
-           ["vault", "<vault id>"]
-  content  one plain sentence
+  tags     none
+  content  {"ends":"37440:<grantor key>:<id>","honors":"<vault id>","purpose":"<optional>","v":1}
   ```
+
+  `ends` is the grant's address, exactly: the kind, the grantor's key (64 lowercase hex) and the id. It has one
+  other form, `name:<prefix>:<name>`, the owner's void of a linked name (§6.2). None of an id, a prefix or a name
+  holds a colon, so `ends` parses one way. (The grant frame's minter also reads a third form, a bare event id that
+  ends an order; a vault refuses it.)
+- **A revoke always reaches an older vault.** A revoke's `v`, `honors` and `ends` keep their names and spellings in
+  every later version. A vault acts on a validly signed 7440 whose `honors` is itself and whose `ends` parses, from
+  a key with standing for that address, even if the rest of its content is unknown, `v` is higher, it carries
+  tags, or it isn't in canonical spelling: a revoke only closes, so it must never fail open because a vault is older
+  than the shell. That read is still strict where it matters: the content is a JSON object with no duplicate keys,
+  `v` is a whole number of at least 1, and `honors` and `ends` are strings in their pinned spellings. A vault reads
+  a revoke of up to 64 KB this way; a shell never signs one over 1 KB.
+- **A revoke is scoped by its vault.** An address doesn't name a vault, and an owner may use the id `claude` in
+  two vaults. So a vault takes only a revoke whose `honors` is its own id, and keeps revokes per vault and address.
+  The owner's revoke of `claude` in one vault, carried to another, is refused there (`wrong_vault`).
 
 - **A revoke ends one address and nothing else.** The address is the kind, the grantor's key and the id together.
   A revoke that names `37440:<some other key>:claude` does nothing to the owner's `claude`.
@@ -177,7 +338,8 @@ it carries are history only.
   kept: a key that puts itself in an address nobody has filed has no standing. A member's early revokes count
   toward their cap (§5.2).
 - **A restore can't undo a statement.** The door keeps its own copy of every statement it has passed to a vault,
-  and of every door grant row (§7.3), by vault id, apart from the vault. Statements only ever add: a newer event
+  and of every door grant row (§7.3), by vault id, apart from the vault. Statements include unfiled events holding an
+address suspended (§2.2) and vault records (§2.3). Statements only ever add: a newer event
   replaces an older, a revoke is final. So two sets merge safely. After any restore from a backup or import of an
   older export, before the vault serves a request, the door files its copy again, overwrites each door grant row
   with its current one, ends any door grant row it doesn't hold, and tells the vault its owner keys again. A grant
@@ -193,7 +355,7 @@ it carries are history only.
 - **It works on the next request.** Tokens already handed out under it are refused, and its live sockets close.
   The vault checks its own table each time, so nothing waits for a token to run out.
 - **Ending a member ends their agents.** A member-signed grant hangs from one grant of the member's (its `under`
-  tag) and is in force only while that one is. Bringing the member back under a new id doesn't revive them.
+  field) and is in force only while that one is. Bringing the member back under a new id doesn't revive them.
 - **Nothing is deleted.** A revoked, replaced or expired grant stays in the vault, marked, because `grant:<id>`
   stays on everything it wrote. A relay may drop such events; a vault can't.
 - **Never published.** Statements say who shares what with whom. They go to the vault and nowhere else.
@@ -249,11 +411,11 @@ A record is a grant's **own** when its *created* stamps are the grant's:
 - for a member (`by self`): created *by* `nostr:<their key>`. It stays theirs across any new grant, and it counts
   what their own agents wrote for them;
 - for an agent or an applet (`by signer`): created *by* its signer's stamp **and** *via* this grant's stamp (or one
-  in its `was` tags). Both, because `applet:arcade` in Bo's shell and in yours are the same *via*;
-- for a service (`by names`): created *via* this grant's stamp, or one in its `was` tags.
+  in its `to.was`). Both, because `applet:arcade` in Bo's shell and in yours are the same *via*;
+- for a service (`by names`): created *via* this grant's stamp, or one in its `to.was`.
 
 `was` exists because stamps change: a named key `claude` that becomes a signed grant keeps what it made by carrying
-`["was", "key:claude"]`. Only `key:`, `grant:` and `applet:` stamps may be named. Only an owner-signed grant may
+`"was": ["key:claude"]`. Only `key:`, `grant:` and `applet:` stamps may be named. Only an owner-signed grant may
 carry it, and a replacement can't change it: it says "treat those records as this grantee's", and that is the
 owner's to say. A member's agent passes a request only if the member's own grant passes it too (§5.2), so its
 `:own` can never reach past the member's.
@@ -270,15 +432,15 @@ among records.
 
 ## 5. Who: three kinds of grantee, one event
 
-The `by` tag says whose name the grantee's writes carry. It is the only difference between a friend, an AI and a
+The `to.by` field says whose name the grantee's writes carry. It is the only difference between a friend, an AI and a
 service [decided 11-10: one primitive, "by" reused].
 
-| Grantee | `by` tag | "By" on its writes | "Via" on its writes | Who may sign |
+| Grantee | `to.by` | "By" on its writes | "Via" on its writes | Who may sign |
 |---|---|---|---|---|
 | **A member** (Bo) | `self` | `nostr:<Bo's key>` | `grant:<id>` | the vault's owner |
 | **An agent** (your Claude, Uni) | `signer` | the signer's own stamp | `grant:<id>` | the owner; or a member, for their own agent |
 | **An applet** in your shell | `signer` | the signer's own stamp | `applet:<applet id>` | whoever holds the shell: owner or member |
-| **A service** (a client portal) | `names <prefix>` | `<prefix>:<name>` when it names one; else the owner's stamp | `grant:<id>` | the vault's owner |
+| **A service** (a client portal) | `names:<prefix>` | `<prefix>:<name>` when it names one; else the owner's stamp | `grant:<id>` | the vault's owner |
 
 Stamps 0.9.1 writes keep their meaning: the owner signed in is `nostr:<key>`, `api` or `mcp`; a named key or an
 approved OAuth app is `key:<name>`. `grant:` and `applet:` are added, and both are reserved prefixes.
@@ -301,7 +463,7 @@ today.
 - **Its person signs for it.** The vault's owner signs for their agents. A member signs for theirs [lean, open
   decision E], and only `by signer` grants: a member can't make a member or a service.
 - **It can never reach more than its person.** A member-signed grant names the member's own grant in its `under`
-  tag. Without one it is malformed; one that names a grant that isn't the signer's own gives no standing. At filing, one that names a type, a verb or a date beyond that grant is refused (`read` is beyond
+  field. Without one it is malformed; one that names a grant that isn't the signer's own gives no standing. At filing, one that names a type, a verb or a date beyond that grant is refused (`read` is beyond
   `read:own`). On every request the vault passes it only if **both** grants pass it: types, verbs, `:own` and
   denies. So narrowing the member narrows their agents at once, and a member's denied tag is denied to their agents
   whatever the agent's grant says.
@@ -341,7 +503,7 @@ A web app, `portal.example`, runs a portal for Mara of Fernhill Bakery. Its serv
 says who each write was for.
 
 - **Only the vault's owner allows it.** In 0.9.1 the permission sits on a named key. At 1.0 it is the grant's
-  `["by", "names", "<prefix>"]`, and 0.9.1's keys carry over as they are (§10).
+  `"by": "names:<prefix>"`, and 0.9.1's keys carry over as they are (§10).
 - **How a write says it.** REST: the header `Parachute-On-Behalf-Of: client-42`. MCP: `on_behalf_of`. The vault
   adds the prefix itself, from the grant. A request never names one. The stamp reads *by* `portal.example:client-42`.
 - **Refused, never ignored.** The header from a grantee without the permission is refused with the fix, so a
@@ -358,15 +520,18 @@ says who each write was for.
 
 Mara later gets a Nostr key.
 
+Like a grant, a link's meaning is its canonical JSON content; its one tag, `d`, addresses it and equals the
+content's `name`.
+
 ```
 kind 37441, signed by the service's key        "client-42 is this key"
-  ["d", "portal.example:client-42"]   the name
-  ["vault", "<vault id>"]             the vault it is said in
-  ["p", "<Mara's key>"]               who it is. No "p": the service takes the link back.
+  tags     [["d", "portal.example:client-42"]]
+  content  {"honors":"<vault id>","is":"<Mara's key>","name":"portal.example:client-42","v":1}
+           no "is": the service takes the link back
 kind 37442, signed by Mara's key               "that is me" / "that is not me"
-  ["d", "portal.example:client-42"]   the same name
-  ["vault", "<vault id>"]
-  ["claim", "mine"]                   or "not-mine"
+  tags     [["d", "portal.example:client-42"]]
+  content  {"claim":"mine","honors":"<vault id>","name":"portal.example:client-42","v":1}
+           or "not-mine"
 ```
 
 - **Both name the vault.** One service key may serve many vaults, so without the vault a claim made in one
@@ -384,8 +549,8 @@ kind 37442, signed by Mara's key               "that is me" / "that is not me"
 - **A claim counts only from the key the link names.** From any other key, or before any link names that key, it
   is refused.
 - **Undone three ways.** The service signs a newer link with no person. Mara signs `not-mine`; her newest claim
-  counts, so she can also take that back. The owner voids the name with a revoke (kind 7440) that
-  carries `["name", "portal.example:client-42"]` in place of the `a` tag. Only an owner key may sign that form. It
+  counts, so she can also take that back. The owner voids the name with a revoke (kind 7440) whose
+  `ends` is `name:portal.example:client-42`. Only an owner key may sign that form. It
   is final for the name, whichever service key signs a link next.
 - **A link never opens a vault and never moves one.** It is a label on stamps.
 
@@ -396,16 +561,17 @@ kind 37442, signed by Mara's key               "that is me" / "that is not me"
 | Call | Who | Answer |
 |---|---|---|
 | `POST <issuer>/account/vaults/<name>/statements` `{event}` | the owner's account credential; or NIP-98 from the event's signer or the grantee it names | `201 {kind, id, state}` |
-| `GET <issuer>/account/vaults/<name>/statements` | the owner: every row. A grantee: its own. | `{grants: [...], links: [...]}` |
+| `GET <issuer>/account/vaults/<name>/statements` | the owner: every row. A grantee: its own. | `{grants: [...], links: [...], records: [...]}` (`records`: the vault's own records, §2.3, each marked whether it counts; owner only) |
 | `GET /vault/<name>/api/vault` | anyone with access | gains `id`; under a grant, also `grant: {id, types, deny, expires_at}` |
 | `GET /vault/<name>/api/stamps` | anyone with access | `{stamps: [{name, key, state}]}`: the names with a link, among records the caller can see (none without `read`) |
 | the record list with `by_person=<key>` | anyone with `read` | records written by that key, or for a name with a `confirmed` link to it |
 
-A grant row: `{id, origin, state, signer, grantee, by, types, deny, expires_at, event}`. `types` is
-`{<type>: [<verb>, …]}`; `by` is `"signer"`, `"self"` or `{names: "<prefix>"}`; `event` is the signed event, or
+A grant row: `{id, origin, state, signer, grantee, by, types, deny, expires_at, event}`. `types` is a summary the
+vault derives from the signed rows, `{<type>: [<verb>, …]}`, with an own row's verbs written `read:own`,
+`update:own`, `delete:own`; `deny` is the list of denied tags; `by` is `"signer"`, `"self"` or `{names: "<prefix>"}`; `event` is the signed event, or
 null for a door grant. `origin` is `signed` or
-`door` (§7.3). `state` is `in_force`, `expired`, `revoked`, `replaced`, `carried` (§9) or `ended` (its signer lost
-standing).
+`door` (§7.3). `state` is `in_force`, `expired`, `revoked`, `replaced`, `suspended` (§2.2: a newer event the vault couldn't take;
+the row carries that event too), `carried` (§9) or `ended` (its signer lost standing).
 
 **What a carrier is told.** The owner (the account credential, or NIP-98 from an owner key) gets the refusals of
 §7.4. A member filing their own agent's grant gets them too. Anyone else, including the grantee carrying its own
@@ -462,17 +628,19 @@ that the signed-in owner agreed.
 
 | When | Status and `error` |
 |---|---|
-| malformed event; unknown tag or verb; no date, a date already past or more than 366 days out; incoherent verbs; a reserved or malformed prefix; `was` or a missing `under` on a member-signed grant; a dot in a member's own id | 400 `invalid_statement` |
+| malformed event; tags other than exactly `d` and `expiration`, or tags that disagree with the content; content not in its canonical spelling; an unknown field, key or verb; over the size limits; no date, a date already past or more than 366 days out; incoherent verbs; a reserved or malformed prefix; `was` or a missing `under` on a member-signed grant; a dot in a member's own id | 400 `invalid_statement` |
 | the id or signature doesn't verify | 400 `bad_signature` |
-| it names another vault | 400 `wrong_vault` |
+| it names another vault (`honors`), or isn't `at: parachute`, `gives: access`; a revoke for another vault | 400 `wrong_vault` |
 | the signer has no standing here; a member signing `self` or `names`; an `under` that isn't the signer's own grant; a revoke from a key that may not end that address; a claim from a key the link doesn't name | 403 `no_standing` |
-| the grantee already holds a grant in force here, or is an owner key (told to the owner; a member sees `exceeds_grantor`) | 409 `grantee_has_grant` |
+| the grantee already holds a grant in force here, or is an owner key or the vault's own key (told to the owner; a member sees `exceeds_grantor`) | 409 `grantee_has_grant` |
 | any failure, told to a carrier who isn't the owner or the member who signed | 401, as for an unknown vault |
 | a member's grant reaches past the member's own | 403 `exceeds_grantor` |
 | a revoke stands against the address, or against the name (a link) | 409 `revoked` |
 | a newer event for the id is on file | 409 `superseded` |
-| the id was ever another signer's or another grantee's; the `by`, `was` or `under` tag changed; a member's id outside their own start | 409 `id_taken` |
-| a request under a grant that has ended | 401 `grant_ended` |
+| the id was ever another signer's or another grantee's; `to` or `under` changed; a member's id outside their own start | 409 `id_taken` |
+| a request under a grant that has ended or is suspended | 401 `grant_ended` |
+| a newer event at a filed address that this vault can't take (§2.2): refused with its own reason, and the address is suspended | the reason's status; the row's `state` is `suspended` |
+| a vault record (§2.3) not signed by the vault's current key or an owner key; a handover not asked for by `tools/move` | 403 `no_standing` |
 | a visible record, a verb the grant lacks; a denied tag attached or detached | 403 `not_granted`, naming the verb and the type |
 | a form (create, no read) naming its own path | 400 `path_not_allowed` |
 | asking as an applet with no grant in force, or from a caller with access who isn't the grantor (§5.3) | 403 `not_granted` |
@@ -490,6 +658,7 @@ they must still build.
 | **The owner's key** | a key linked to the owner's account, with its signed proof | a key linked to the account (arrives with 0.9.1's keys); many owners have none (decision B) | `OWNER_PUBKEY`, set at deploy |
 | **Verifies a statement** | the hub, then the vault again | the identity worker, then the vault's Durable Object again | the same as Cloud |
 | **Holds the grants** | the vault's database; the hub keeps an index of key → vaults | the vault's Durable Object; identity keeps the index | the same as Cloud |
+| **Holds the vault's private key** (§2.3) | a 0600 file per vault in the hub's home, apart from the vault | identity's database, encrypted under a Worker secret; never the Durable Object | the same as Cloud |
 | **A grantee signs in** | NIP-98 at the hub. The hub already takes NIP-98 for people it knows [code: `nostr-http-auth.ts`] | NIP-98 at identity: **new**. Today there is no key sign-in on Cloud `next` | NIP-98 at identity. Today any key but the owner's is `unknown_pubkey`; at 1.0 a key with a grant in force gets a token for that vault and nothing else |
 | **Who can reach it** | the tailnet, unless the owner exposes it | anyone | anyone |
 | **Still to build** | a vault owner per vault (today any `write`-role user is an admin); roles, pubkey roles and room rosters become door grants (§10) | accounts hold keys; key sign-in; the unknown-permission refusal; used NIP-98 ids shared across copies; `list-vaults` shows vaults a key was granted | the unknown-permission refusal; the grantee sign-in; used NIP-98 ids shared across copies |
@@ -514,7 +683,9 @@ things under `.parachute/`: stamps, history and links. 1.0 adds statements to th
 | Records, types, files, links between records | as today |
 | The four stamps and the history | carried, marked with the import that brought them (0.9.4) |
 | The vault's id | kept on a move, new on a copy (§2.3) |
-| Every statement, word for word: grants, revokes, links, claims | in `.parachute/statements.jsonl`, one signed event per line. Filed again and verified again on arrival, then merged with any copy the arriving door already keeps for that vault id (§3): its revokes apply; its grants don't come into force by themselves (below) |
+| The vault's private key | **never.** The arriving door makes a new key pair. The owner's tap below also signs an override naming it; for an owner with no key, `tools/move` asks the leaving door for a handover record (§2.3). Until one of those is filed, the arriving vault serves but doesn't sign as itself |
+| The vault's records (kind 37443) | in `statements.jsonl` with every statement, so readers can still follow the key from the id |
+| Every statement, word for word: grants, revokes, links, claims, vault records, and the unfiled events that hold an address suspended | in `.parachute/statements.jsonl`, one signed event per line. Filed again and verified again on arrival, then merged with any copy the arriving door already keeps for that vault id (§3): its revokes apply; its grants don't come into force by themselves (below) |
 | The owner-key list and each prefix's service keys, with dates | for reading history only: so an old statement can still be checked. A carried key has no standing at the new door |
 | **Revokes** | **in force at once.** Carrying a revoke can only close. |
 | **Links and claims** | **in force at once.** They open nothing. |
@@ -525,7 +696,7 @@ things under `.parachute/`: stamps, history and links. 1.0 adds statements to th
 
 Why the tap: the export is a copy, so the old door may still hold a live vault with the same id that honours the
 same grants, and a revoke filed at one never reaches the other. The owner's confirmation is the statement that
-this is now the vault. `tools/move` already refuses to finish while the source is written to; it gains this step,
+this is now the vault, and the override it signs (§2.3) means the old door's key no longer speaks for it. `tools/move` already refuses to finish while the source is written to; it gains this step,
 and it compares the two doors' statement lists before it finishes, so a revoke filed at the source after the export
 was cut isn't left behind.
 
@@ -548,7 +719,8 @@ Nobody has to act on the day [decided, ROADMAP "How a cloud vault and each conne
 | A named key (0.9.1), with or without the on-behalf permission | a door grant with the same reach; its stamps stay `key:<name>` |
 | A box user with a role on a vault; a pubkey given a role; a room roster | door grants: `read` is `* read`; `member` is `* read create update delete`; an admin role stays an admin, outside grants |
 | A token with a tag scope | not converted. Tag scopes end at 1.0 [decided, SPEC §10]. `doctor` lists them through 0.9; the 1.0 refusal names the fix: a grant by type. On our own box 0 of 29 tokens had one; Cloud refuses them already |
-| The shell's signed grant records (shell-enforced since the applet contract v2) | filed as they are **if** they are in §2.1's shape: one event per vault, naming the vault's id. The shell note sketched one event naming several vaults; that changes to one per vault (two lines on the card). A grant signed before its vault had an id can't be filed, and is signed again once. Open decision H ships the id early so that is rare |
+| A vault with no id | at the 1.0 upgrade, the vault makes its key pair; its id is the public key (§2.3). Open decision H ships this early, in 0.9.3, as one additive field and one key file |
+| The shell's signed grant records (shell-enforced since the applet contract v2) | filed as they are **if** they are in §2.1's layout: content in the grant frame, one event per vault, `honors` naming the vault's id. The shell's frame today puts the vault in each row; a vault grant drops that and gains `to.by`. A grant signed before its vault had an id can't be filed, and is signed again once |
 
 ## 11. What this stops, and what it doesn't
 
@@ -556,7 +728,12 @@ Nobody has to act on the day [decided, ROADMAP "How a cloud vault and each conne
 |---|---|
 | A script holding a write token editing or deleting a grant | statements aren't records; only a valid signed event changes one |
 | A replayed, back-dated or future-dated grant after a revoke | revokes are final and order-free (§3) |
-| A grant quietly widened by a tag an old vault doesn't know | unknown tags and unknown token permissions are refused (§2.2, §7.2) |
+| A grant quietly widened by a field an old vault doesn't know | unknown tags, fields and token permissions are refused (§2.2, §7.2) |
+| A narrowing an old vault can't read leaving the wide grant in force | the newer event suspends the address (§2.2) |
+| A revoke an old vault can't fully read failing open | a revoke's three fields act whatever else it carries (§3) |
+| One meaning signed in two spellings, read two ways | one canonical spelling, vectors run by every signer and vault (§2.1) |
+| A revoke or grant for one vault used at another with the same owner | `honors` on every statement; revokes kept per vault (§2.2, §3) |
+| A leaked vault key speaking for the vault | it can't sign or end a grant; an owner override retires it, whatever it backdates (§2.3) |
 | A narrow key learning what it can't read | one checkpoint; hidden is the same as missing, but for a taken path (§4.1) |
 | A service naming someone outside its prefix, or a real account | the vault builds the name; reserved prefixes (§6.1) |
 | A custodian pinning its history on someone's key, here or in another vault it serves | unconfirmed links don't read as the person's; links and claims name the vault (§6.2) |
@@ -572,6 +749,7 @@ Nobody has to act on the day [decided, ROADMAP "How a cloud vault and each conne
 | A hostile or broken door | the door mints tokens and names the owner key. Signed grants make its record checkable afterwards; they don't confine it. Self-hosting is the answer to distrust of a door. |
 | A door lost together with its vault | later revokes and narrowings that only that door held are gone. An old export then carries old grants; they wait for the owner's tap (§9). |
 | A stolen grantee key | it reaches what the grant names until the date or a revoke. Short dates; revoke by one tap; every write still says `grant:<id>`, and 0.9.4's undo takes a write set back. |
+| A leaked vault key, before the owner acts | it can claim where the vault lives or which key is current; readers that follow the vault map could be pointed elsewhere until the owner's override. It reaches no record and no grant. An owner with no key can't override (decision B) |
 | A stolen owner key | everything. Recovery for a lost or stolen owner key is the shell's open item, not solved here. |
 | A custodian lying about which of its people did something | "always both": the prefix is in *by* and a link never replaces it. |
 | A shell lying about which applet ran | the stamp names; the vault confines the request, not the frame. |
@@ -589,9 +767,9 @@ behaviour works. They run on any door: `bun run doors -- --doors box,personal su
 
 | File | The behaviour it holds | Spec |
 |---|---|---|
-| `grant.test.ts` | an owner-signed grant opens exactly the types it names to the key it names; a grant that isn't the owner's, is tampered with, names another vault, has no date or carries an unknown tag is refused; a write key can't file one; every credential shows as a grant row | §2, §4.4, §7 |
+| `grant.test.ts` | an owner-signed grant opens exactly the types it names to the key it names; a grant that isn't the owner's, is tampered with, names another vault, has no date, carries an unknown field or tag, has tags that disagree with its content, or isn't in its one spelling is refused, and so is a revoke for another vault; a write key can't file one; every credential shows as a grant row; the vault's own key can't be a grantee and an owner's override names the key that signs for it | §2, §4.4, §7 |
 | `verbs.test.ts` | each verb alone; create without read is a form; `:own`; a denied tag; adding and removing a type | §4 |
-| `ending.test.ts` | a grant stops at its date; a signed revoke stops it on the next request and is final; a stranger's revoke does nothing | §3 |
+| `ending.test.ts` | a grant stops at its date; a signed revoke stops it on the next request and is final; a stranger's revoke does nothing; a newer grant the vault can't take suspends the address | §2.2, §3 |
 | `people.test.ts` | a member writes as themselves; an agent writes for its person; a member's agent never passes the member and ends with them | §5.1, §5.2 |
 | `applets.test.ts` | the owner's shell asks as an applet: held to the applet's grant, stamped `applet:<id>` | §5.3 |
 | `custodial.test.ts` | a `names` grant stamps its prefix; the header without it is refused; a link shows as the person's only after their own key confirms | §6 |
@@ -614,7 +792,8 @@ owner-signed grant ending a member-signed one for the same key, and a claim that
 Groups. Links for anyone. Sharing one page or subtree. Comment and suggest levels. Field-level read rules (never,
 SPEC §1). A member inviting a member. One event naming several vaults (an applet that reads two vaults has two
 grants and two lines on its card). Taking your own history out of a shared vault (attribution note §2.5). Recovery
-of a lost owner key.
+of a lost owner key. Granting or denying a type or tag whose name isn't ASCII (it needs a grantable id; none of four
+of Uni's own vaults has one). The vault map that reads `lives` (§2.3) and signed receipts from the vault's key.
 
 ---
 
@@ -628,7 +807,13 @@ of a lost owner key.
   custodial "by" under the key's own name with the owner's permission (attribution note, 11-10). Allow by type,
   deny by marker, `submit`, agents as principals, one checkpoint, every verifier fails closed, narrowing never
   reaches admin (0.9 SPEC §3.5, ROADMAP 1.0).
-- **This spec's own, all marked [lean]:** the tag layout and kind numbers; revoke as its own final event; refusing
+- **Decided 11-12 (Aaron):** a vault's id is its own Nostr key (open decision H, as §2.3 specifies it).
+- **From T-462, 11-12:** the content layout: the grant frame of Uni's keys work (`v at honors gives to allow until
+  purpose`, one canonical spelling) with this spec's vault fields (`to.by`, `to.was`, `deny`, `under`, `id`); the
+  two-tag rule; a revoke's frozen fields and its scope by vault; suspension by an unreadable newer event; the size
+  limits in bytes; the fixed `purpose` rule; the vault's own record, overrides, handovers and where its key lives.
+  Weighed and reviewed in T-462 (three fresh reviewers, then one on this text: §D).
+- **This spec's own, all marked [lean]:** the kind numbers; revoke as its own final event; refusing
   unknown tags; the vault id; `by signer | self | names`; member-signed agent grants; `applet:<id>` as the via
   stamp; `was`; the wire; door grants; the one-tap carry on a move; a year's limit.
 - **Changed from the attribution note §2.9:** the note had an applet hold a named key (`key:applet.arcade`).

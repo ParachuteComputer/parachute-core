@@ -4,7 +4,7 @@
 // Red today: no door takes a signed statement, so each contract stops where `granted()` files one. Every body
 // starts with a grant that must be taken, so a refusal further down can't pass because nothing is ever taken.
 import { describe, expect, test } from "bun:test";
-import { KIND, LANE, NO_GRANTS, declareType, door, file, grantEvent, granted, ids, must, newKey, ownerKey, rec, records, red, rest, revokeEvent, sign, statements, tokenAs, tokenReply, vaultId } from "./_grants.ts";
+import { KIND, LANE, NO_GRANTS, declareType, door, file, grantEvent, grantRow, granted, ids, must, newKey, ownerKey, rec, records, red, rest, revokeEvent, sign, statements, tokenAs, tokenReply, vaultId, vaultRecordEvent } from "./_grants.ts";
 import { lacks } from "../door/_door.ts";
 
 const owner = records("write");
@@ -25,8 +25,30 @@ describe("setup holds today", () => {
 describe("a signed grant", () => {
   red("a vault says its own id, the same after a rename would be, so a grant can name it", { reason: /the vault has no id of its own/, lane: LANE }, async () => {
     const info = await rest("read").get("/vault");
-    must(typeof info.body?.id === "string" && /^[0-9a-f]{32}$/.test(info.body.id), `the vault has no id of its own: GET /api/vault has keys ${Object.keys(info.body ?? {}).join(",")}`);
+    must(typeof info.body?.id === "string" && /^[0-9a-f]{64}$/.test(info.body.id), `the vault has no id of its own: GET /api/vault has keys ${Object.keys(info.body ?? {}).join(",")}`);
     expect(info.body.id).not.toBe((await rest("read", door().otherVault).get("/vault")).body.id);
+  });
+
+  red("the vault's own key names it, can't be a grantee, and an owner's override names the key that signs for it now", { reason: NO_GRANTS, lane: LANE }, async () => {
+    const recipe = await declareType("recipe");
+    await granted({ to: await newKey(), types: { [recipe]: ["read"] } });
+    const id = await vaultId();
+    // The vault's id is its own public key (§2.3). It has no standing, so it can't hold a grant either.
+    const asGrantee = await file(await grantEvent({ to: { secretKey: "", pubkey: id }, types: { [recipe]: ["read"] } }));
+    expect(asGrantee.status).toBe(409);
+    expect(asGrantee.body.error).toBe("grantee_has_grant");
+    // The owner rotates: an override names a new key. The vault's birth record (key = id) no longer counts.
+    const fresh = await newKey();
+    const override = await file(await vaultRecordEvent(await ownerKey(), { key: fresh.pubkey }));
+    expect(override.status, override.text.slice(0, 200)).toBe(201);
+    const listed = (await statements()).body?.records ?? [];
+    const counts = listed.filter((r: any) => r.counts).map((r: any) => r.key);
+    expect(counts).toEqual([fresh.pubkey]);
+    // A stranger's record for this vault has no standing.
+    const stranger = await newKey();
+    const theirs = await file(await vaultRecordEvent(stranger, { key: stranger.pubkey }));
+    expect(theirs.status).toBe(403);
+    expect(theirs.body.error).toBe("no_standing");
   });
 
   red("opens the types it names to the key it names, and nothing else", { reason: NO_GRANTS, lane: LANE }, async () => {
@@ -172,7 +194,7 @@ describe("what a vault refuses to file", () => {
     await control(recipe);
     const key = await newKey();
     const e = await grantEvent({ to: key, types: { [recipe]: ["read"] } });
-    const widened = { ...e, tags: e.tags.map((t) => (t[0] === "type" ? ["type", journal, "read"] : t)) };
+    const widened = { ...e, content: e.content.split(JSON.stringify(recipe)).join(JSON.stringify(journal)) };
     const r = await file(widened);
     expect(r.status).toBe(400);
     expect(r.body.error).toBe("bad_signature");
@@ -184,12 +206,16 @@ describe("what a vault refuses to file", () => {
     const recipe = await declareType("recipe");
     await control(recipe);
     const key = await newKey();
-    // Signed for the other vault, carried to this one.
-    const tags = [["d", "elsewhere"], ["vault", await vaultId(door().otherVault)], ["p", key.pubkey], ["by", "signer"], ["type", "*", "read"], ["expiration", String(Math.floor(Date.now() / 1000) + 3600)]];
-    const e = await sign(await ownerKey(), { kind: KIND.grant, tags });
+    // Signed for the other vault, carried to this one; and a revoke signed for the other vault (§3).
+    const e = await grantEvent({ id: "elsewhere", to: key, types: { "*": ["read"] }, vault: door().otherVault });
     const r = await file(e);
     expect(r.status).toBe(400);
     expect(r.body.error).toBe("wrong_vault");
+    const mine = await granted({ to: await newKey(), types: { [recipe]: ["read"] } });
+    const there = await file(await revokeEvent(mine, { vault: door().otherVault }));
+    expect(there.status).toBe(400);
+    expect(there.body.error).toBe("wrong_vault");
+    expect((await grantRow(mine.grantId))?.state).toBe("in_force");
     expect((await tokenReply(key)).status).toBe(401);
   });
 
@@ -209,10 +235,24 @@ describe("what a vault refuses to file", () => {
     const recipe = await declareType("recipe");
     await control(recipe);
     const key = await newKey();
-    // A limit from some later version. A vault that skipped it would open more than was signed.
-    const future = await file(await grantEvent({ to: key, types: { [recipe]: ["read"] }, extraTags: [["only-field", "title"]] }));
-    expect(future.status).toBe(400);
-    expect(future.body.error).toBe("invalid_statement");
+    // A limit from some later version, in the content or as a tag. A vault that skipped it would open more than was
+    // signed. And the same grant spelled a second way, or with tags that disagree with its content (§2.1).
+    for (const e of [
+      await grantEvent({ to: key, types: { [recipe]: ["read"] }, extraFields: { only_fields: ["title"] } }),
+      await grantEvent({ to: key, types: { [recipe]: ["read"] }, extraTags: [["only-field", "title"]] }),
+    ]) {
+      const future = await file(e);
+      expect(future.status).toBe(400);
+      expect(future.body.error).toBe("invalid_statement");
+    }
+    const plain = await grantEvent({ to: key, types: { [recipe]: ["read"] } });
+    const spaced = await sign(await ownerKey(), { kind: KIND.grant, tags: plain.tags, content: JSON.stringify(JSON.parse(plain.content), null, 1) });
+    const disagreeing = await sign(await ownerKey(), { kind: KIND.grant, tags: [plain.tags[0], ["expiration", String(Number(plain.tags[1][1]) + 60)]], content: plain.content });
+    for (const e of [spaced, disagreeing]) {
+      const r = await file(e);
+      expect(r.status).toBe(400);
+      expect(r.body.error).toBe("invalid_statement");
+    }
     const verb = await file(await grantEvent({ to: key, types: { [recipe]: ["read", "admin" as any] } }));
     expect(verb.status).toBe(400);
     expect(verb.body.error).toBe("invalid_statement");

@@ -26,10 +26,11 @@ describe("setup holds today", () => {
     const soup = await owner.make({ types: [recipe], body: "soup" });
     expect(soup.status).toBe(201);
     expect(rec((await owner.get(soup.body.id)).body).body).toBe("soup");
-    // The revoke the contracts file names the grant by its address (§3).
+    // The revoke the contracts file names the grant by its address, and the vault, in its content (§3).
     const g = await grantEvent({ to: await newKey(), types: { [recipe]: ["read"] } });
     const r = await revokeEvent(g);
-    expect(r.tags[0]).toEqual(["a", `37440:${(await ownerKey()).pubkey}:${g.grantId}`]);
+    expect(r.tags).toEqual([]);
+    expect(JSON.parse(r.content)).toEqual({ v: 1, honors: await vaultId(), ends: `37440:${(await ownerKey()).pubkey}:${g.grantId}`, purpose: "I end this grant." });
     expect((await tokenReply(await newKey())).status).toBe(401);
   });
 });
@@ -121,6 +122,30 @@ describe("by a signed revoke", () => {
     expect(await state(g.grantId)).toBe("revoked");
   });
 
+  red("a newer grant the vault can't take suspends the address; it never falls back to the older, wider one", { reason: NO_GRANTS, lane: LANE }, async () => {
+    const recipe = await declareType("recipe");
+    const soup = await owner.make({ types: [recipe], body: "soup" });
+    const key = await newKey();
+    const g = await granted({ to: key, types: { [recipe]: ["read", "update"] } });
+    const bearer = await tokenAs(key);
+    // The owner narrows with a field from some later version: this vault refuses it, so the wide grant must stop.
+    const narrower = await grantEvent({ id: g.grantId, to: key, types: { [recipe]: ["read"] }, created_at: g.created_at + 1, extraFields: { only_fields: ["title"] } });
+    const r = await file(narrower);
+    expect(r.status).toBe(400);
+    expect(r.body.error).toBe("invalid_statement");
+    expect(await state(g.grantId)).toBe("suspended");
+    ended(await records({ bearer }).get(soup.body.id));
+    // A grant at the same address for another vault suspends nothing here.
+    const h = await granted({ to: await newKey(), types: { [recipe]: ["read"] } });
+    const elsewhere = await grantEvent({ id: h.grantId, to: await newKey(), types: { [recipe]: ["read"] }, created_at: h.created_at + 1, honors: "f".repeat(64) });
+    expect((await file(elsewhere)).status).toBe(400);
+    expect(await state(h.grantId)).toBe("in_force");
+    // A readable newer event brings the address back.
+    const back = await grantEvent({ id: g.grantId, to: key, types: { [recipe]: ["read"] }, created_at: g.created_at + 2 });
+    expect((await file(back)).status).toBe(201);
+    expect(await state(g.grantId)).toBe("in_force");
+  });
+
   red("a revoke ends one exact address, and only its owner, its signer or its grantee may sign it", { reason: NO_GRANTS, lane: LANE }, async () => {
     const recipe = await declareType("recipe");
     const soup = await owner.make({ types: [recipe], body: "soup" });
@@ -128,8 +153,7 @@ describe("by a signed revoke", () => {
     const a = await granted({ to: k1, types: { [recipe]: ["read"] } });
     await granted({ to: k2, types: { [recipe]: ["read"] } });
     const bearer = await tokenAs(k1);
-    const vault = await vaultId();
-    const revokeOf = (address: string) => sign(k2, { kind: KIND.revoke, tags: [["a", address], ["vault", vault]], content: "I end this grant." });
+    const revokeOf = (ends: string) => revokeEvent({ ends }, { signer: k2 });
     // K2 holds a grant of its own, but A is neither its address nor its grant: refused, told only to the owner.
     const real = await revokeOf(`${KIND.grant}:${a.pubkey}:${a.grantId}`);
     const told = await file(real);
