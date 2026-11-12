@@ -106,7 +106,7 @@ export async function handleAdminVaultApi(req: Request, deps: AdminVaultApiDeps)
   let outgoing: Headers;
   if (bearer) {
     // A script's own vault key; the vault decides. The cookie, if any, is not looked at.
-    if (!deps.vaultExists(parsed.vault)) return jsonError(404, "not_found", `no vault named ${parsed.vault}`);
+    if (!deps.vaultExists(parsed.vault)) return jsonError(404, "not_found", "no such vault");
     outgoing = new Headers(req.headers);
     outgoing.delete("cookie");
     outgoing.delete(CSRF_HEADER_NAME);
@@ -127,7 +127,7 @@ export async function handleAdminVaultApi(req: Request, deps: AdminVaultApiDeps)
         return jsonError(403, "csrf_failed", `send the CSRF token as ${CSRF_HEADER_NAME} (it matches the parachute_hub_csrf cookie)`);
       }
     }
-    if (!deps.vaultExists(parsed.vault)) return jsonError(404, "not_found", `no vault named ${parsed.vault}`);
+    if (!deps.vaultExists(parsed.vault)) return jsonError(404, "not_found", "no such vault");
     const minted = await signAccessToken(deps.db, {
       sub: session.userId,
       scopes: [`vault:${parsed.vault}:admin`],
@@ -156,5 +156,5 @@ export async function handleAdminVaultApi(req: Request, deps: AdminVaultApiDeps)
     signal: req.signal,
   } as RequestInit);
   const res = await deps.forward(forwarded);
-  return res ?? jsonError(404, "not_found", `no vault named ${parsed.vault}`);
+  return res ?? jsonError(404, "not_found", "no such vault");
 }

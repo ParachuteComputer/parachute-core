@@ -1111,7 +1111,9 @@ async function proxyToVault(
     effectivePublicExposure(match.entry) === "loopback" &&
     layerOf(req, peerAddr) !== "loopback"
   ) {
-    return new Response("not found", { status: 404 });
+    // Hidden is the same answer as missing: the caller (`/vault/*` branch, the admin API) turns undefined into
+    // its own plain 404, so nothing marks a hidden vault apart (not even a Deprecation header).
+    return undefined;
   }
   // Bare `/vault/<name>` POST → point at `/vault/<name>/mcp` (#525). Operators
   // paste the bare vault URL (no `/mcp` suffix) into MCP clients; OAuth completes
@@ -4757,7 +4759,9 @@ export function hubFetch(
           boundOrigins: oauthDeps(req).hubBoundOrigins(),
           vaultExists: (name) => {
             const m = findVaultUpstream(readManifestLenient(manifestPath).services, `/vault/${name}`);
-            return !!m && m.mount === `/vault/${name}`;
+            if (!m || m.mount !== `/vault/${name}`) return false;
+            // A loopback-only vault does not exist for a caller who is not on loopback.
+            return !(effectivePublicExposure(m.entry) === "loopback" && layerOf(req, peerAddr) !== "loopback");
           },
           forward: (fwd) =>
             throughKeyDoor(fwd, getDb, () => proxyToVault(fwd, manifestPath, deps?.supervisor, peerAddr)),

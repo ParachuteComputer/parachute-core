@@ -127,4 +127,55 @@ describe("the admin API under one login", () => {
     // The new route is not marked either.
     expect((await call("GET", `${NEW}/config`, { cookie: true })).headers.get("deprecation")).toBeNull();
   });
+
+  // The two checks a session must pass before the hub vouches for it to the vault. A box can have a second user and
+  // a screen lock, so both are signed in for real (the way the hub's own admin page would).
+  async function logIn(username: string, password: string) {
+    const page = await safeFetch(`${d.issuer}/login`);
+    const csrf = page.headers.getSetCookie().find((c) => c.startsWith("parachute_hub_csrf="))!.split(";")[0]!.split("=")[1]!;
+    const field = (await page.text()).match(/name="__csrf"\s+value="([^"]+)"/)?.[1] ?? csrf;
+    const r = await safeFetch(`${d.issuer}/login`, {
+      method: "POST",
+      redirect: "manual",
+      headers: { "content-type": "application/x-www-form-urlencoded", cookie: `parachute_hub_csrf=${csrf}` },
+      body: new URLSearchParams({ __csrf: field, username, password }),
+    });
+    const sess = r.headers.getSetCookie().find((c) => c.startsWith("parachute_hub_session="))?.split(";")[0];
+    if (!sess) throw new Error(`setup: ${username} could not sign in (${r.status})`);
+    return { cookie: `${sess}; parachute_hub_csrf=${csrf}`, csrf };
+  }
+
+  test("a signed-in user who is not the hub admin is 403, for reads and writes", async () => {
+    const host = await call("GET", `${d.issuer}/admin/host-admin-token`, { cookie: true });
+    expect(host.status, host.text.slice(0, 120)).toBe(200);
+    const name = `friend${Date.now().toString(36)}`;
+    const pw = "Temp-pass-123456!";
+    const made = await call("POST", `${d.issuer}/api/users`, { bearer: host.body.token, body: { username: name, password: pw, assigned_vaults: null } });
+    expect(made.status, made.text.slice(0, 160)).toBeLessThan(300);
+    const friend = await logIn(name, pw);
+    const get = await safeFetch(`${NEW}/config`, { headers: { cookie: friend.cookie } });
+    expect(get.status).toBe(403);
+    const put = await safeFetch(`${NEW}/embeddings`, {
+      method: "PUT",
+      headers: { cookie: friend.cookie, origin: d.issuer, "x-csrf-token": friend.csrf, "content-type": "application/json" },
+      body: JSON.stringify({ enabled: false }),
+    });
+    expect(put.status).toBe(403);
+  });
+
+  test("a session behind the admin screen lock is 423 until it is unlocked", async () => {
+    const lock = (path: string, body: object) =>
+      call("POST", `${d.issuer}/api/admin-lock${path}`, { cookie: true, csrf: true, body: { __csrf: signIn.csrf, ...body } });
+    const pin = "4321";
+    expect((await lock("/set", { pin })).status).toBeLessThan(300);
+    try {
+      expect((await lock("/lock", {})).status).toBeLessThan(300);
+      const locked = await call("GET", `${NEW}/config`, { cookie: true });
+      expect(locked.status, locked.text.slice(0, 120)).toBe(423);
+      expect((await lock("/unlock", { pin })).status).toBeLessThan(300);
+      expect((await call("GET", `${NEW}/config`, { cookie: true })).status).toBe(200);
+    } finally {
+      await lock("/remove", { pin });
+    }
+  });
 });
