@@ -115,3 +115,57 @@ test("an imported history is stored compressed too, and reads back exact", async
   const bodies = [...(await everyBody()).values()].sort();
   expect(bodies).toEqual([prose(1), prose(2), prose(3)].sort());
 });
+
+test("a pass after every write keeps the star: the base stays until it slides out of the newest run", async () => {
+  const s2 = new BunSqliteStore(db, { history: { compact_budget_ms: 0, max_versions: 1000 } });
+  const page = (k: number) => Array.from({ length: 500 }, (_, i) => `row ${i}: a made-up ledger line${i === k % 500 ? `, edited ${k}` : ""}`).join("\n");
+  const n = await s2.createNote(page(0));
+  for (let k = 1; k <= 96; k++) {
+    await s2.updateNote(n.id, { content: page(k) });
+    s2.compactHistory({ budgetMs: null, maxNotes: null });
+  }
+  const whole = (db.prepare("SELECT COUNT(*) AS n FROM note_blobs WHERE encoding IS NULL OR encoding = 'deflate'").get() as { n: number }).n;
+  expect(whole).toBeLessThanOrEqual(6);
+  for (let ix = 0; ix < 96; ix += 7) expect((await s2.getNoteVersion(n.id, ix))!.content).toBe(page(ix));
+});
+
+test("a note whose pass fails waits for its next write instead of taking every pass", async () => {
+  const n = await store.createNote(prose(1));
+  for (let k = 2; k <= 6; k++) await store.updateNote(n.id, { content: prose(k) });
+  // A depth-two chain (damage the old engine could leave): compactNote refuses the note.
+  const [a, b] = (db.prepare("SELECT content_hash AS h FROM note_versions WHERE note_id = ? ORDER BY version_ix DESC LIMIT 2").all(n.id) as { h: string }[]).map((r) => r.h);
+  db.prepare("UPDATE note_blobs SET encoding = 'fossil-delta-z', delta_of = ? WHERE hash = ?").run(b, a);
+  db.prepare("UPDATE note_blobs SET encoding = 'fossil-delta-z', delta_of = ? WHERE hash = ?").run(a, b);
+  expect(store.compactHistory({ budgetMs: null, maxNotes: null })).toMatchObject({ notes_scanned: 1, notes_failed: 1 });
+  expect(store.compactHistory({ budgetMs: null, maxNotes: null }).notes_scanned).toBe(0);
+});
+
+test("the hints table the engine before 33 rebuilt (no legacy column) is healed on the next open, and writes work", async () => {
+  const n = await store.createNote(prose(1));
+  await store.updateNote(n.id, { content: prose(2) });
+  // What `history rebuild-state` on the engine before 33 leaves in a v33 vault: the old table, the stamp still 33.
+  db.exec(`DROP TABLE history_compact_state; CREATE TABLE history_compact_state (note_id TEXT PRIMARY KEY, versions INTEGER NOT NULL,
+    stored INTEGER NOT NULL, live INTEGER NOT NULL, refused INTEGER NOT NULL DEFAULT 0, refreshed_at INTEGER NOT NULL)`);
+  initSchema(db);
+  await store.updateNote(n.id, { content: prose(3) });
+  expect(store.compactHistory({ budgetMs: null, maxNotes: null }).notes_failed).toBe(0);
+  expect((await store.getNoteVersion(n.id, 0))!.content).toBe(prose(1));
+});
+
+test("a re-encode that doesn't read back is never written: the blob keeps its old bytes", async () => {
+  const codec = await import("./blob-codec.js");
+  await legacyVault(2, 4);
+  const before = await everyBody();
+  const raw = db.prepare("SELECT hash, content, encoding FROM note_blobs ORDER BY hash").all();
+  const { spyOn } = await import("bun:test");
+  const real = codec.deflateBytes;
+  const mock = spyOn(codec, "deflateBytes").mockImplementation((b: Uint8Array) => real(b).subarray(0, 3));
+  try {
+    initSchema(db);
+    const r = store.compactHistory({ budgetMs: null, maxNotes: null });
+    expect(r.notes_failed).toBe(0);
+    expect(r.blobs_compressed + r.blobs_deltified).toBe(0);
+  } finally { mock.mockRestore(); }
+  expect(db.prepare("SELECT hash, content, encoding FROM note_blobs ORDER BY hash").all()).toEqual(raw);
+  expect(await everyBody()).toEqual(before);
+});

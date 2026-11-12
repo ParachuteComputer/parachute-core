@@ -1762,9 +1762,12 @@ stored the old way (text, or a base64 `fossil-delta`). A pass compacts a note
 whose version bodies add up to more than `compact_ratio` times its live body
 (logical sizes, not stored ones), or that holds old blobs: it re-stores those
 compressed (`blobs_compressed` in the summary) and stores the
-rest of each run of `compact_run_length` as a compressed delta
-(`fossil-delta-z`, `blobs_deltified`) against the run's first body when that is
-smaller. A completed pass marks the note refused until its next write. Schema 33
+rest of each run of `compact_run_length` (newest first) as a compressed delta
+(`fossil-delta-z`, `blobs_deltified`) against one base when that is smaller:
+a body in the run that deltas already rest on, else the run's newest, so the
+base moves about once per run however often passes come. Every re-encoded blob
+is read back and hash-checked before it replaces the old bytes. A completed
+pass, or a failed one, marks the note refused until its next write. Schema 33
 rebuilds the hints once and clears every refusal, so the boot pass works
 through an existing vault a few notes at a time.
 Compaction runs synchronously at first vault open, with budgets checked between

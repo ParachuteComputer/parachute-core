@@ -736,8 +736,21 @@ export function compactNote(db: Database, noteId: string, policy: HistoryPolicy)
     return finish();
   type Blob = { hash: string; content: StoredContent; byte_size: number; encoding: string | null; delta_of: string | null };
   const getBlob = db.prepare("SELECT hash, content, byte_size, encoding, delta_of FROM note_blobs WHERE hash = ?");
+  const getEncoding = db.prepare("SELECT encoding FROM note_blobs WHERE hash = ?");
   const isBase = db.prepare("SELECT 1 FROM note_blobs WHERE delta_of = ? LIMIT 1");
-  const store = (hash: string, before: Blob, content: string | Uint8Array, size: number, encoding: string | null, deltaOf: string | null) => {
+  /**
+   * Overwrite a blob in place, but only once the new bytes have been read back through the read path itself
+   * (materialise: decode, apply, hash): a codec fault then skips a blob instead of damaging its only copy.
+   */
+  const store = (hash: string, before: Blob, content: Uint8Array, size: number, encoding: string, deltaOf: string | null) => {
+    try {
+      if (materialise(db, hash, { content, blob_encoding: encoding, delta_of: deltaOf }) === null) return false;
+    }
+    catch (err) {
+      if (!(err instanceof HistoryDeltaOrphanError)) throw err;
+      console.warn("[history] a re-encoded blob did not read back; left as it was", { hash, encoding, reason: err.reason });
+      return false;
+    }
     // Guarded on what was read, so a row changed under us (never, inside this transaction) is left alone.
     const changed = db.prepare("UPDATE note_blobs SET content = ?, byte_size = ?, encoding = ?, delta_of = ? WHERE hash = ? AND encoding IS ? AND byte_size = ?")
       .run(content, size, encoding, deltaOf, hash, before.encoding, before.byte_size).changes;
@@ -748,12 +761,24 @@ export function compactNote(db: Database, noteId: string, policy: HistoryPolicy)
   const compressWhole = (b: Blob, text: string) => {
     if (b.encoding !== null) return;
     const w = encodeWhole(text, b.byte_size);
-    if (w.encoding === "deflate" && store(b.hash, b, w.content, w.byte_size, w.encoding, null)) result.blobs_compressed++;
+    if (w.encoding === "deflate" && store(b.hash, b, w.content as Uint8Array, w.byte_size, w.encoding, null)) result.blobs_compressed++;
   };
+  // Runs of 24, newest first. A run's base is a whole blob in it that deltas already rest on, if there is one, else
+  // its newest body. Reusing a standing base keeps the star when passes come after every write or two (as on Cloud,
+  // one per wake): otherwise each pass made its newest version a new base and left every second version whole. The
+  // base moves on once the standing one has slid out of the newest run, about every 24 versions.
+  const standing = (run: typeof rows) => run.find((r) => isBase.get(r.content_hash) && isWhole((getEncoding.get(r.content_hash) as { encoding: string | null } | null)?.encoding ?? "missing"));
   const seen = new Set<string>();
   for (let start = 0; start < rows.length; start += policy.compact_run_length) {
     const run = rows.slice(start, start + policy.compact_run_length);
-    const baseRow = getBlob.get(run[0]!.content_hash) as Blob | null;
+    // The run's newest body must resolve to a whole base before anything in the run is touched: a pre-existing
+    // depth-two chain stops the note (P23), whichever base the run then uses.
+    const first = getBlob.get(run[0]!.content_hash) as Blob | null;
+    const firstBase = first ? (isWhole(first.encoding) ? first : first.delta_of ? getBlob.get(first.delta_of) as Blob | null : null) : null;
+    if (first && firstBase && !isWhole(firstBase.encoding))
+      throw new HistoryDeltaOrphanError(first.hash, firstBase.hash, "base_not_whole");
+    const pick = standing(run);
+    const baseRow = pick ? getBlob.get(pick.content_hash) as Blob | null : first;
     if (!baseRow)
       continue;
     const baseHash = isWhole(baseRow.encoding) ? baseRow.hash : baseRow.delta_of;
@@ -776,11 +801,11 @@ export function compactNote(db: Database, noteId: string, policy: HistoryPolicy)
       if (r.content_hash === baseHash || seen.has(r.content_hash))
         continue;
       seen.add(r.content_hash);
-      const b = getBlob.get(r.content_hash) as Blob | null;
-      if (!b)
+      // Settled blobs (compressed deltas) are passed over without loading their bytes.
+      const encoding = (getEncoding.get(r.content_hash) as { encoding: string | null } | null)?.encoding;
+      if (encoding === undefined || encoding === "fossil-delta-z")
         continue;
-      if (b.encoding === "fossil-delta-z")
-        continue;
+      const b = getBlob.get(r.content_hash) as Blob;
       if (b.encoding === "fossil-delta") {
         // A legacy delta keeps its base; only its bytes move: base64 text to raw bytes, deflated.
         if (typeof b.content !== "string") continue;
@@ -798,9 +823,9 @@ export function compactNote(db: Database, noteId: string, policy: HistoryPolicy)
         compressWhole(b, body);
         continue;
       }
-      const whole = encodeWhole(body, byteLength(body));
+      const wholeSize = b.encoding === "deflate" ? b.byte_size : encodeWhole(body, byteLength(body)).byte_size;
       const dz = deflateBytes(createDeltaBytes(text, body));
-      if (dz.byteLength < whole.byte_size * 0.9) {
+      if (dz.byteLength < wholeSize * 0.9) {
         if (store(b.hash, b, dz, dz.byteLength, "fossil-delta-z", baseHash)) result.blobs_deltified++;
       }
       else {
@@ -875,6 +900,11 @@ export function compactVault(db: Database, policy: HistoryPolicy, opts?: {
     catch (err) {
       result.notes_failed++;
       console.warn("[history] compaction failed", candidate.note_id, err);
+      // Not again until the note's next write: a note that always fails must not take every pass's budget.
+      try {
+        db.prepare("UPDATE history_compact_state SET refused = 1 WHERE note_id = ?").run(candidate.note_id);
+      }
+      catch {}
     }
   }
   result.remaining_candidates = total - result.notes_scanned;

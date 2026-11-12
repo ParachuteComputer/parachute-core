@@ -23,6 +23,14 @@ export const READABLE_SCHEMA_VERSION = 33;
  * refusal under the old rules must not hide a note from the new ones. Schema 33's data is readable by the engine
  * before this one (READABLE_SCHEMA_VERSION there), so a rollback still reads it.
  */
+/**
+ * Whether the compaction hints have v33's `legacy` column. The engine before v33 rebuilds the table without it (its
+ * `history rebuild-state`) and leaves the stamp at 33, so a re-upgrade must look, not trust the stamp.
+ */
+function compactHintsCurrent(db: Database): boolean {
+  return !hasTable(db, "history_compact_state") || hasColumn(db, "history_compact_state", "legacy");
+}
+
 function migrateToV33(db: Database): void {
   const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='history_compact_state'").get();
   const previous = latestStamp(db);
@@ -757,7 +765,7 @@ export function initSchema(db: Database): void {
     rebuildIndexes(db);
     return;
   }
-  if (latestStamp(db) === SCHEMA_VERSION && unnumberedStepsDone(db)) {
+  if (latestStamp(db) === SCHEMA_VERSION && unnumberedStepsDone(db) && compactHintsCurrent(db)) {
     // Still heal declared indexed fields (a column or index missing after a restore): a few catalog reads, no
     // writes when nothing is missing.
     rebuildIndexes(db);

@@ -226,8 +226,8 @@ describe("v5 and v18 against each state of the path indexes", () => {
 /** sha256 of SCHEMA_SQL as of SCHEMA_VERSION 33: 32 with T-412 (idx_notes_path left out of it), 0.9's `kind` on tags, 0.9.1's `via_kind` on revisions, and 33's compressed blob encodings (T-460, comments only). */
 const SCHEMA_SQL_HASH_AT_33 = "5fc415652d7443a59174f54666a94016d96f01eac3e41838658bee6edde9384f";
 
-/** sha256 of initSchema's code and its fast-path check (comments and spacing left out) as of SCHEMA_VERSION 33: 32 with T-412, 0.9's ensureTagKinds and 0.9.1's ensureRevisionKeyKind, T-460's open-as-is of a newer readable schema, and v33's compaction hints. */
-const INIT_SCHEMA_HASH_AT_33 = "5082c5697becac9168abd043c033d2db776cacaef7dd746167f40834525411b3";
+/** sha256 of initSchema's code and its fast-path check (comments and spacing left out) as of SCHEMA_VERSION 33: 32 with T-412, 0.9's ensureTagKinds and 0.9.1's ensureRevisionKeyKind, T-460's open-as-is of a newer readable schema, v33's compaction hints and their column check on the fast path. */
+const INIT_SCHEMA_HASH_AT_33 = "b51aa0c934492e1e21b186d626e5c4ce85fc96e0d4e13caec3340fbb37480021";
 
 describe("the fast path's promise", () => {
   // initSchema skips SCHEMA_SQL and every migration on a vault stamped SCHEMA_VERSION (with the path index). So a
