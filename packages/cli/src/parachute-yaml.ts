@@ -45,7 +45,7 @@ export interface KeyInfo {
 const FIXED: Record<string, KeyInfo> = {
   "server.port": { pattern: "server.port", kind: "port", env: "PORT", default: "1939" },
   "server.bind": { pattern: "server.bind", kind: "host", env: "PARACHUTE_BIND_HOST", default: "127.0.0.1" },
-  "server.origin": { pattern: "server.origin", kind: "origin", env: "PARACHUTE_HUB_ORIGIN", default: "(not set)" },
+  "server.origin": { pattern: "server.origin", kind: "origin", env: "PARACHUTE_HUB_ORIGIN", default: "(not set: the hub uses the exposed or request origin)" },
   "server.accepted_issuers": { pattern: "server.accepted_issuers", kind: "origins", env: "PARACHUTE_HUB_ORIGINS", default: "(not set)" },
 };
 const VAULT_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
@@ -198,7 +198,8 @@ function flowList(text: string, line: number): string[] {
   return items.map((i) => i.trim()).filter(Boolean).map((i) => scalar(i, line));
 }
 
-const KEY_LINE = /^([A-Za-z0-9_][A-Za-z0-9_.-]*)\s*:(?:\s+(.*))?$/;
+const KEY_LINE = /^([A-Za-z0-9_][A-Za-z0-9_-]*)\s*:(?:\s+(.*))?$/;
+const DOTTED_KEY = /^[A-Za-z0-9_][A-Za-z0-9_-]*\.[A-Za-z0-9_.-]*\s*:/;
 
 /** Parse the text. Throws SettingsError naming the line for anything outside the subset. */
 export function parse(text: string): Parsed {
@@ -240,6 +241,7 @@ export function parse(text: string): Parsed {
       prevWasLeaf = false;
       continue;
     }
+    if (DOTTED_KEY.test(content)) throw new SettingsError(`${FILE_NAME}: line ${n}: a key cannot contain "." (write it nested: "server:" then an indented "port: …")`, n);
     const m = KEY_LINE.exec(content);
     if (!m) throw new SettingsError(`${FILE_NAME}: line ${n}: expected "key: value", got "${content}"`, n);
     const key = m[1]!;
@@ -341,7 +343,7 @@ export function getSetting(home: string, key: string): string | string[] | undef
 
 const QUOTE_FREE = /^[A-Za-z0-9_./:@+-]+$/;
 function render(v: string): string {
-  return QUOTE_FREE.test(v) && !/^(true|false|null|yes|no|on|off|~)$/i.test(v) ? v : JSON.stringify(v);
+  return QUOTE_FREE.test(v) && !/^(true|false|null|yes|no|on|off|~)$/i.test(v) ? v : JSON.stringify(v).replace(/\u2028/g, "\\u2028").replace(/\u2029/g, "\\u2029");
 }
 
 function entryLines(segs: string[], value: string | string[], indent: number): string[] {
@@ -373,7 +375,9 @@ export function setInText(text: string, key: string, value: string | string[]): 
     if (!anc) continue;
     if (!anc.frame || p.values.has(segs.slice(0, k).join(".")))
       throw new SettingsError(`${FILE_NAME}: line ${anc.start + 1}: "${segs.slice(0, k).join(".")}" already has a value, so "${key}" cannot go under it`, anc.start + 1);
-    lines.splice(anc.end, 0, ...entryLines(segs.slice(k), value, anc.indent + 2));
+    const first = lines[anc.start + 1];
+    const childIndent = anc.end > anc.start + 1 && first ? /^ */.exec(first)![0].length : anc.indent + 2;
+    lines.splice(anc.end, 0, ...entryLines(segs.slice(k), value, childIndent));
     return `${lines.join("\n")}\n`;
   }
   lines.push(...entryLines(segs, value, 0));
@@ -406,7 +410,11 @@ export function setSetting(home: string, key: string, raw: string | string[]): s
   const value = checkValue(key, raw);
   const text = readText(home);
   parse(text); // refuse to edit a file that is already broken: the error names its line
-  writeText(home, setInText(text, key, value));
+  const next = setInText(text, key, value);
+  // Never write a file this module cannot read back to what was asked.
+  const back = settingsOf(parse(next)).get(key);
+  if (JSON.stringify(back) !== JSON.stringify(value)) throw new SettingsError(`could not write ${key} so that it reads back; the file was not changed`);
+  writeText(home, next);
   return value;
 }
 
@@ -416,6 +424,21 @@ export function unsetSetting(home: string, key: string): boolean {
   const text = readText(home);
   const next = unsetInText(text, key);
   if (next === text) return false;
+  settingsOf(parse(next)); // the result must still read
   writeText(home, next);
   return true;
+}
+
+/** Notes on keys under `server` or `vaults.<name>` that no setting uses (a misspelling), each with the nearest name. */
+export function fileWarnings(text: string): string[] {
+  const p = parse(text);
+  const out: string[] = [];
+  for (const [path, sp] of p.spans) {
+    const segs = path.split(".");
+    const leafLevel = (segs[0] === "server" && segs.length === 2) || (segs[0] === "vaults" && segs.length === 3);
+    if (!leafLevel || keyInfo(path)) continue;
+    const msg = unknownKey(path).message.replace(/ Known settings:.*$/, "");
+    out.push(`${FILE_NAME}: line ${sp.start + 1}: ${msg}; ignored`);
+  }
+  return out;
 }

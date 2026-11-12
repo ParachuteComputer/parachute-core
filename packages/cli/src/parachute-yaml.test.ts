@@ -9,6 +9,7 @@ import { SettingsError, checkValue, getSetting, parse, setInText, setSetting, se
 // settings.ts loads the vault's config module, which refuses to run under `bun test` without a PARACHUTE_HOME.
 process.env.PARACHUTE_HOME ??= mkdtempSync(join(tmpdir(), "pyaml-vault-home-"));
 const { applyParachuteYaml, effective } = await import("./settings.ts");
+const { fileWarnings } = await import("./parachute-yaml.ts");
 
 let home = "";
 beforeEach(() => {
@@ -171,5 +172,30 @@ describe("precedence: env, then parachute.yaml, then the default", () => {
     write("server:\n  port: 47000\n");
     expect(effective(home, "server.port", {})).toMatchObject({ value: "47000", source: "parachute.yaml" });
     expect(effective(home, "server.port", { PORT: "1" })).toMatchObject({ value: "1", source: "env", overrides: "parachute.yaml 47000" });
+  });
+});
+
+describe("review round 1", () => {
+  test("a dotted key in the file is refused with its line (it would be rewritten wrong)", () => {
+    expect(() => parse("server.port: 1\n")).toThrow(/line 1: .*nest/);
+  });
+
+  test("U+2028 and U+2029 in a value are written escaped and read back", () => {
+    const v = "caf\u00e9\u2028x\u2029y";
+    setSetting(home, "vaults.a.description", v);
+    expect(read()).not.toMatch(/[\u2028\u2029]/);
+    expect(getSetting(home, "vaults.a.description")).toBe(v);
+  });
+
+  test("unknown keys under server and vaults.<n> are warned about with the nearest name", () => {
+    const w = fileWarnings("server:\n  prot: 47000\nvaults:\n  notes:\n    descripton: x\nfuture:\n  thing: 1\n");
+    expect(w).toHaveLength(2);
+    expect(w[0]).toMatch(/line 2: unknown setting "server.prot".*Did you mean "server.port"/);
+    expect(w[1]).toMatch(/line 5.*vaults.notes.description/);
+  });
+
+  test("set writes under a parent at the parent's own child indent", () => {
+    const t = setInText("server:\n    bind: 0.0.0.0\n", "server.port", "47000");
+    expect(t).toBe("server:\n    bind: 0.0.0.0\n    port: 47000\n");
   });
 });

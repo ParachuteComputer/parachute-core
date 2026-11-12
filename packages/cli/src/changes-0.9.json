@@ -433,11 +433,10 @@
    "old": "parachute-vault config [set|unset]",
    "new": "parachute config [get|set|unset]",
    "action": "merge",
-   "reason": "one settings file (§5): parachute config covers the keys parachute.yaml has; parachute-vault config keeps the rest until they move",
+   "reason": "one settings file (§5): `parachute config` handles the parachute.yaml keys only; it does not take parachute-vault config's old keys yet",
    "since": "0.9",
    "removed_in": "1.0",
-   "state": "live",
-   "release": "0.9.3"
+   "state": "planned"
   },
   {
    "kind": "command",

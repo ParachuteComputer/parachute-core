@@ -11,6 +11,7 @@ import { dirname } from "node:path";
 import { candidate, cli, freePort, newHome, until } from "../candidate-lib.ts";
 import { candidateEnv } from "../../harness/candidate.ts";
 import { randomBytes } from "node:crypto";
+import { embeddedHome } from "../embedded/_lib.ts";
 
 // A box's vault listens on 1940 and the run's own box already holds it in the sandbox, so each serve here runs in a
 // network namespace of its own (`unshare --net`, as shutdown.test.ts does) and is asked over HTTP from inside it
@@ -184,12 +185,34 @@ describe("parachute config get / set / unset", () => {
     expect(await Bun.file(join(h, "parachute.yaml")).exists()).toBe(false);
   }, 120_000);
 
-  test("a file that is not valid YAML names the line, and serve refuses to start on it", async () => {
+  test("a file that is not valid YAML names the line; get refuses and serve exits 2 without starting", async () => {
     const h = newHome("yaml-broken");
     await cli(h, ["config", "set", "server.port", "47123"]);
     writeFileSync(join(h, "parachute.yaml"), "server:\n  port: 47123\n  bind 127.0.0.1\n", { mode: 0o600 });
     const g = await cli(h, ["config", "get", "server.port"]);
     expect(g.code).not.toBe(0);
     expect(g.stderr).toMatch(/parachute\.yaml.*line 3/);
+    const s = serveInNs(h);
+    try {
+      const code = await Promise.race([s.proc.exited, Bun.sleep(30_000).then(() => null)]);
+      expect(code, tail(s.log())).toBe(2);
+      expect(s.log()).toMatch(/parachute\.yaml: line 3/);
+    } finally {
+      await s.stop();
+    }
   }, 120_000);
+
+  test("a host-managed home (serve --embedded and its vault) ignores parachute.yaml, even a broken one", async () => {
+    const h = newHome("yaml-embedded");
+    // The home is bootstrapped and served by embeddedHome; the file goes in first so the vault child would read it.
+    const { mkdirSync } = await import("node:fs");
+    mkdirSync(h, { recursive: true, mode: 0o700 });
+    writeFileSync(join(h, "parachute.yaml"), "server:\n  port: 47123\n  bind 127.0.0.1\n", { mode: 0o600 });
+    const e = await embeddedHome(h);
+    try {
+      expect(e.proc.exitCode).toBeNull();
+    } finally {
+      await e.stop();
+    }
+  }, 180_000);
 });

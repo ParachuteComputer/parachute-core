@@ -11,6 +11,7 @@ import {
   FIXED_KEYS,
   SettingsError,
   checkValue,
+  fileWarnings,
   keyInfo,
   loadSettings,
   parse,
@@ -31,6 +32,7 @@ const unset = (v: string | undefined) => v === undefined || v === "";
 export function applyParachuteYaml(home: string, opts: { env?: NodeJS.ProcessEnv; server?: boolean } = {}): string[] {
   const env = opts.env ?? process.env;
   const settings = loadSettings(home);
+  for (const w of fileWarnings(readText(home))) console.error(`parachute: ${w}`);
   const applied: string[] = [];
   const descriptions = new Map<string, { description?: string }>();
   for (const [key, value] of settings) {
@@ -120,6 +122,7 @@ export function configCommand(args: string[], home: string, env: NodeJS.ProcessE
     }
     if (verb === "get") {
       if (rest.length > 1) throw new SettingsError("get takes at most one key");
+      for (const w of fileWarnings(readText(home))) console.error(`parachute config: ${w}`);
       for (const key of rest.length ? rest : listedKeys(home)) console.log(line(effective(home, key, env)));
       return 0;
     }

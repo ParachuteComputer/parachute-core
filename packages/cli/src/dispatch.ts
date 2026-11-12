@@ -279,7 +279,8 @@ export async function dispatch(role: Role, notice?: Notice): Promise<void> {
   }
   // parachute.yaml (settings.ts): its settings go into effect before the hub or the vault reads any (env still wins).
   // A broken file stops `serve`, which must not start on settings it could not read; other commands say so and go on.
-  {
+  // Not in the vault a host-managed `serve --embedded` starts (PARACHUTE_EMBEDDED_PARENT): the host's flags and env rule.
+  if (process.env.PARACHUTE_EMBEDDED_PARENT === undefined) {
     const { applyParachuteYaml, SettingsError } = await import("./settings.ts");
     try {
       applyParachuteYaml(home, { server: r.cli === "hub" });
