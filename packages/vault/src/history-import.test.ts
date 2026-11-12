@@ -792,3 +792,33 @@ test("prepare, apply and retire carry a raised bound and an ignore list; an edit
     expect(await runHistoryImport(["retire", "--vault", "before", "--manifest", legacyPath])).toMatchObject({ retired: true });
   } finally { clearVaultStoreCache(); if (saved === undefined) delete process.env.PARACHUTE_HOME; else process.env.PARACHUTE_HOME = saved; rmSync(dir, { recursive: true, force: true }); }
 }, 60_000);
+
+// YAML-special keys (#75): the repair read `it's: [[X]]` as a nested list, and `@at: v` failed the whole block.
+test("export scalars: a key that is not a plain word is requoted, and its value read as the exporter means it", async () => {
+  const { parseExportFrontmatter } = await import("./history-import.ts");
+  const id = "01M66HE43WKN0Z7EZ0766D7S6N";
+  const old = `id: ${id}\nmetadata:\n  it's: [[X]]\n  @at: plain\n  [x]: [draft]\n  -dash: 'single'\n  say "hi": {y}\n  nested:\n    it's: [[Y]]\n  l:\n    - it's: [[Z]]\n      b: 1\n  plain: ok\n`;
+  const read = parseExportFrontmatter(old, "old-export").metadata as Record<string, any>;
+  expect(read["it's"]).toBe("[[X]]");
+  expect(read["@at"]).toBe("plain");
+  expect(read["[x]"]).toBe("[draft]");
+  expect(read["-dash"]).toBe("'single'");
+  expect(read['say "hi"']).toBe("{y}");
+  expect(read.nested["it's"]).toBe("[[Y]]");
+  expect(read.l).toEqual([{ "it's": "[[Z]]", b: 1 }]);
+  expect(read.plain).toBe("ok");
+  // The current exporter quotes both key and value; that reads the same.
+  const now = `id: ${id}\nmetadata:\n  'it''s': '[[X]]'\n  '@at': plain\n  'a: b': v\n  "x\\ny": 1\n`;
+  expect(parseExportFrontmatter(now, "export").metadata).toEqual({ "it's": "[[X]]", "@at": "plain", "a: b": "v", "x\ny": 1 });
+});
+
+// A bare `[x]` or `{y}` key alone (no other line that strict YAML refuses): strict YAML parses it as a flow collection
+// (`[x]` keys "x", `{y}` keys "[object Object]"), so its reading must not overrule the requoted one (review of #92).
+test("export scalars: a bare [x] or {y} key is read as written even when the rest of the block is plain YAML", async () => {
+  const { parseExportFrontmatter } = await import("./history-import.ts");
+  const id = "01M66HE43WKN0Z7EZ0766D7S6N";
+  for (const reading of ["export", "old-export"] as const) {
+    expect(parseExportFrontmatter(`id: ${id}\nmetadata:\n  [x]: [[X]]\n  z: 1\n`, reading).metadata).toEqual({ "[x]": "[[X]]", z: 1 });
+    expect(parseExportFrontmatter(`id: ${id}\nmetadata:\n  {y}: plain\n  z: 1\n`, reading).metadata).toEqual({ "{y}": "plain", z: 1 });
+  }
+});

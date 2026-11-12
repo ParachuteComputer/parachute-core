@@ -51,6 +51,10 @@ function parserVersion(value: unknown): 1 | 2 {
   if (value !== PARSER) throw new Error("Unsupported manifest parser version");
   return PARSER;
 }
+/** A `key: value` or `key:` line: the lead (indent, an optional `- `), then a quoted key or a bare one (up to its first `: `), then the colon and the value. */
+const KEY_LINE = /^(\s*(?:- )?)(?:('(?:[^']|'')*'|"(?:[^"\\]|\\.)*")|((?![\s#'"])(?:(?!: ).)+?))(?::( .*)?)$/;
+/** A bare key strict YAML can't read as a key: it starts with an indicator, or holds a quote. */
+const SPECIAL_BARE_KEY = /^[-?:&*!|>%@`\[\]{},]|['"]/;
 /**
  * Read an export's scalars the way the vault's own import reads them.
  *
@@ -61,30 +65,51 @@ function parserVersion(value: unknown): 1 | 2 {
  * import reader knows all three (`parseFrontmatter`'s "export" and "old-export" readings). This asks that reader for
  * each such value, one `key: value` or `- value` line at a time, and writes the string it returns as a double-quoted
  * scalar, which strict YAML reads back as exactly that text. It returns the rewritten block and the strings it
- * wrote; {@link frontmatter} decides whether the rewrite may stand.
+ * wrote; {@link frontmatter} decides whether the rewrite may stand. A bare key that strict YAML cannot read as a key
+ * (`it's`, `@at`, `[x]`, `-dash`, from the exporter before #75) is requoted the same way.
  *
  * `reading` is "old-export" when the first commit that holds the file was made before `FLOW_QUOTING_SINCE` (only
  * the old exporter existed), else "export". A box that kept the old exporter for a while after that date can still
  * have written `'word'` meaning the quoted string; that shape, in that window, is read as today's exporter means it.
  * See UPGRADING.md.
  */
-export function readExportScalars(block: string, reading: "export" | "old-export"): { text: string; values: Set<string> } {
+export function readExportScalars(block: string, reading: "export" | "old-export"): { text: string; values: Set<string>; flowKey: boolean } {
   const values = new Set<string>();
+  // A bare key opening with `[` or `{` is a flow collection to strict YAML, which still parses (`[x]: v` keys "x",
+  // `{y}: v` keys "[object Object]"), so strict YAML's reading of such a block can't be the one to compare with.
+  let flowKey = false;
   const text = block.split("\n").map(raw => {
     const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
-    const match = /^(\s*(?:- )?)(?:([^\s'"\[\]{},#&*!|>%@`-][^'"]*?): )?(['"\[{].*)$/.exec(line);
-    if (!match) return raw;
-    const [, lead, key, value] = match;
-    if (key === undefined) {
-      if (!lead!.endsWith("- ")) return raw;                    // not `key: value`, not a list item
-      if (/^(['"]).*?\1: /.test(value!)) return raw;              // a list item that is a map with a quoted key
+    const keyed = KEY_LINE.exec(line);
+    if (keyed) {
+      const [, lead, quotedKey, bareKey, colonValue] = keyed;
+      const inItem = lead!.endsWith("- ");
+      // A bare key that is YAML syntax or holds a quote (`it's`, `@at`, `[x]`, `-dash`) is not a key to strict YAML: the
+      // exporter before #75 wrote them as they stood. Quote it. In a list item a leading quote or bracket is the item's
+      // own value (`- [a: b]`), not a key.
+      const bare = bareKey !== undefined && !(inItem && /^[\[{'"]/.test(bareKey)) ? bareKey : undefined;
+      if (quotedKey !== undefined || bare !== undefined) {
+        const key = quotedKey ?? (SPECIAL_BARE_KEY.test(bare!) ? JSON.stringify(bare) : bare!);
+        if (bare !== undefined && /^[\[{]/.test(bare)) flowKey = true;
+        if (colonValue === undefined) return key === bare ? raw : `${lead}${key}:`;
+        const value = colonValue.slice(1);
+        let out = value;
+        if (/^['"\[{]/.test(value)) {
+          const read = parseFrontmatter(`---\nx: ${value}\n---\n`, reading).frontmatter.x;
+          if (typeof read === "string") { values.add(read); out = JSON.stringify(read); }
+        }
+        return out === value && key === (quotedKey ?? bare) ? raw : `${lead}${key}: ${out}`;
+      }
     }
+    const item = /^(\s*- )(['"\[{].*)$/.exec(line);
+    if (!item) return raw;
+    const [, lead, value] = item;
     const read = parseFrontmatter(`---\nx: ${value}\n---\n`, reading).frontmatter.x;
     if (typeof read !== "string") return raw;
     values.add(read);
-    return `${lead}${key === undefined ? "" : `${key}: `}${JSON.stringify(read)}`;
+    return `${lead}${JSON.stringify(read)}`;
   }).join("\n");
-  return { text, values };
+  return { text, values, flowKey };
 }
 /**
  * Whether `read` (the rewritten block, parsed) differs from `strict` (the block as plain YAML reads it) ONLY where a
@@ -141,14 +166,16 @@ function frontmatter(block: string, parser: 1 | 2, reading: "export" | "old-expo
     if (id !== undefined) throw new UnreadableFrontmatter(id);
     throw cause;
   };
-  const { text, values } = readExportScalars(block, reading);
+  const { text, values, flowKey } = readExportScalars(block, reading);
   let strict: Record<string, unknown> | undefined, strictError: unknown;
   try { strict = yaml(block); } catch (error) { strictError = error; }
   if (text === block) return strict ?? refuse(strictError);
   let read: Record<string, unknown>;
   try { read = yaml(text); } catch (error) { return strict ?? refuse(error); }
   // A block scalar means no exporter wrote this file: YAML's own reading, whatever the rewrite came to.
-  if (strict !== undefined) return !holdsBlockScalar(block) && accountsFor(read, strict, values) ? read : strict;
+  // A requoted `[x]`/`{y}` key: strict YAML read it as a flow collection, so its reading is wrong where the key is and
+  // can't vouch for the rewrite; the rewrite stands unless a block scalar says no exporter wrote this file.
+  if (strict !== undefined) return !holdsBlockScalar(block) && (flowKey || accountsFor(read, strict, values)) ? read : strict;
   if (holdsBlockScalar(block)) return refuse(strictError);
   return read;
 }
