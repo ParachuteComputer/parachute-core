@@ -295,12 +295,12 @@ export function pruneVersions(
 ): { versionsDeleted: number; blobsDeleted: number } {
   const rows = db
     .prepare(
-      "SELECT version_ix, superseded_at, op, content_hash FROM note_versions WHERE note_id = ? ORDER BY version_ix DESC",
+      `SELECT version_ix, superseded_at, op, content_hash, ${markedSql(db)} AS marked FROM note_versions WHERE note_id = ? ORDER BY version_ix DESC`,
     )
-    .all(noteId) as Pick<
+    .all(noteId) as (Pick<
     VersionRow,
     "version_ix" | "superseded_at" | "op" | "content_hash"
-  >[];
+  > & { marked: number })[];
   const cutoff = new Date(
     now - policy.max_age_days * 86_400_000,
   ).toISOString();
@@ -308,6 +308,7 @@ export function pruneVersions(
     (r, i) =>
       i >= policy.min_versions &&
       r.op !== "delete" &&
+      !r.marked &&
       (i >= policy.max_versions || r.superseded_at < cutoff),
   );
   let versionsDeleted = 0,
@@ -345,6 +346,20 @@ function dropUnusedBlob(db: Database, hash: string): number {
     next = row.delta_of;
   }
   return gone;
+}
+const marksSeen = new WeakMap<Database, boolean>();
+/**
+ * The SQL for "this version is marked": `marked_at IS NOT NULL` once `note_versions` has the column (the 1.0 marks,
+ * an additive column), else 0. Read here, a release before marks are written already keeps a marked version through
+ * pruning and the byte ceiling, so a rollback from the release that writes them keeps what its people marked.
+ */
+export function markedSql(db: Database): string {
+  if (!marksSeen.get(db)) {
+    const has = (db.prepare("SELECT name FROM pragma_table_info('note_versions')").all() as { name: string }[]).some((c) => c.name === "marked_at");
+    if (!has) return "0";
+    marksSeen.set(db, true);
+  }
+  return "(marked_at IS NOT NULL)";
 }
 export function gcBlobs(db: Database): { blobsDeleted: number } {
   let blobsDeleted = 0;
@@ -861,8 +876,8 @@ export function compactNote(db: Database, noteId: string, policy: HistoryPolicy)
 function enforceByteCeiling(db: Database, noteId: string, policy: HistoryPolicy): number {
   let dropped = 0;
   while (policy.max_bytes_per_note !== null && noteHistoryBytes(db, noteId) > policy.max_bytes_per_note) {
-    const rows = db.prepare("SELECT version_ix, op, content_hash FROM note_versions WHERE note_id = ? ORDER BY version_ix ASC").all(noteId) as Pick<VersionRow, "version_ix" | "op" | "content_hash">[];
-    const victim = rows.find((r, i) => r.op !== "delete" && rows.length - 1 - i >= policy.min_versions);
+    const rows = db.prepare(`SELECT version_ix, op, content_hash, ${markedSql(db)} AS marked FROM note_versions WHERE note_id = ? ORDER BY version_ix ASC`).all(noteId) as (Pick<VersionRow, "version_ix" | "op" | "content_hash"> & { marked: number })[];
+    const victim = rows.find((r, i) => r.op !== "delete" && !r.marked && rows.length - 1 - i >= policy.min_versions);
     if (!victim)
       break;
     dropped += db.prepare("DELETE FROM note_versions WHERE note_id = ? AND version_ix = ?").run(noteId, victim.version_ix).changes;

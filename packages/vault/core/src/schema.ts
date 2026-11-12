@@ -13,9 +13,11 @@ export const SCHEMA_VERSION = 32;
  * The newest schema this engine can open (T-460). Above SCHEMA_VERSION only for a schema whose new data this engine
  * already reads, so a rollback to it still opens and reads every vault; such a vault is opened as it is: no
  * migration runs and no older stamp is written over it. (T-460 writes compressed version bodies without a schema
- * number: see ensureCompactHintsLegacy.)
+ * number: see ensureCompactHintsLegacy.) This engine reads 34 (search vectors stored as int8, a `codec` column on
+ * note_vectors; vector-codec.ts) without writing it, and keeps marked versions (a `marked_at` column) through
+ * pruning, so the release that writes those can be rolled back to this one.
  */
-export const READABLE_SCHEMA_VERSION = 33;
+export const READABLE_SCHEMA_VERSION = 34;
 
 /**
  * Whether the compaction hints have T-460's `legacy` column (blobs stored the old way, which the maintenance pass
