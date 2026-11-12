@@ -847,8 +847,8 @@ owner-signed grant ending a member-signed one for the same key, and a claim that
 Groups. Links for anyone. Sharing one page or subtree. Comment and suggest levels. Field-level read rules (never,
 SPEC §1). A member inviting a member. One event naming several vaults (an applet that reads two vaults has two
 grants and two lines on its card). Taking your own history out of a shared vault (attribution note §2.5). Recovery
-of a lost owner key. Granting or denying a type or tag whose name isn't ASCII (it needs a grantable id; none of four
-of Uni's own vaults has one). The vault map that reads `lives` (§2.3) and signed receipts from the vault's key.
+of a lost owner key. Granting or denying a type or tag whose name isn't ASCII (it needs a grantable id; no vault we
+checked has such a name). The vault map that reads `lives` (§2.3) and signed receipts from the vault's key.
 
 ---
 
