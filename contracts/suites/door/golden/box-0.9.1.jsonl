@@ -177,7 +177,7 @@
 {"key":"mcp/admin.tool.query-notes.words","value":"8b6c408e946520e0"}
 {"key":"mcp/admin.tool.query-records.hints","value":null}
 {"key":"mcp/admin.tool.query-records.present","value":true}
-{"key":"mcp/admin.tool.query-records.schema","value":"d9bc4b1340a4019f"}
+{"key":"mcp/admin.tool.query-records.schema","value":"f353f5d274cfc5b9"}
 {"key":"mcp/admin.tool.query-records.words","value":"ec107db1320fbfc3"}
 {"key":"mcp/admin.tool.read-attachment.hints","value":null}
 {"key":"mcp/admin.tool.read-attachment.present","value":true}
@@ -271,7 +271,7 @@
 {"key":"mcp/read.tool.query-notes.words","value":"8b6c408e946520e0"}
 {"key":"mcp/read.tool.query-records.hints","value":null}
 {"key":"mcp/read.tool.query-records.present","value":true}
-{"key":"mcp/read.tool.query-records.schema","value":"d9bc4b1340a4019f"}
+{"key":"mcp/read.tool.query-records.schema","value":"f353f5d274cfc5b9"}
 {"key":"mcp/read.tool.query-records.words","value":"ec107db1320fbfc3"}
 {"key":"mcp/read.tool.read-attachment.hints","value":null}
 {"key":"mcp/read.tool.read-attachment.present","value":true}
@@ -339,7 +339,7 @@
 {"key":"mcp/write.tool.query-notes.words","value":"8b6c408e946520e0"}
 {"key":"mcp/write.tool.query-records.hints","value":null}
 {"key":"mcp/write.tool.query-records.present","value":true}
-{"key":"mcp/write.tool.query-records.schema","value":"d9bc4b1340a4019f"}
+{"key":"mcp/write.tool.query-records.schema","value":"f353f5d274cfc5b9"}
 {"key":"mcp/write.tool.query-records.words","value":"ec107db1320fbfc3"}
 {"key":"mcp/write.tool.read-attachment.hints","value":null}
 {"key":"mcp/write.tool.read-attachment.present","value":true}
