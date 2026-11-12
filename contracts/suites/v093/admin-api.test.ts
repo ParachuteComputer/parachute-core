@@ -11,8 +11,8 @@ import { describe, expect, test } from "bun:test";
 import { door, safeFetch, token } from "../door/_door.ts";
 
 const d = door();
-const signIn = d.signIn;
-if (signIn.how !== "cookie") throw new Error("these contracts run on a box, signed in with the hub's session cookie");
+if (d.signIn.how !== "cookie") throw new Error("these contracts run on a box, signed in with the hub's session cookie");
+const signIn: { cookie: string; csrf: string } = d.signIn;
 const NEW = `${d.issuer}/admin/api/vaults/${d.vault}`;
 const OLD = `${d.vaultOrigin}/vault/${d.vault}`;
 
@@ -97,7 +97,7 @@ describe("the admin API under one login", () => {
   });
 
   test("a header that claims an admin identity, from outside, opens nothing", async () => {
-    for (const h of [
+    for (const h of <Record<string, string>[]>[
       { "x-parachute-internal-admin": d.vault },
       { "x-parachute-admin": "1" },
       { "x-parachute-vault-admin": d.vault },
