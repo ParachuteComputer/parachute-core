@@ -87,6 +87,20 @@ export function loadVaultTriggers(vaultName: string, store: SqliteStore): number
   return triggers.length;
 }
 
+/** Unregister every live trigger of one vault (the vault was deleted); the others keep theirs. */
+export function unloadVaultTriggers(vaultName: string): void {
+  const prefix = liveKey(vaultName, "");
+  for (const key of [...liveTriggers.keys()]) {
+    if (!key.startsWith(prefix)) continue;
+    try {
+      liveTriggers.get(key)?.();
+    } catch {
+      /* swallow */
+    }
+    liveTriggers.delete(key);
+  }
+}
+
 /** Clear the live registry (unregistering each hook): tests, and a vault stopping inside a longer-lived process. */
 export function clearLiveTriggers(): void {
   for (const [, fn] of liveTriggers) {
