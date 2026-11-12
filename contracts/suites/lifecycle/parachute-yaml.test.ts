@@ -17,8 +17,14 @@ import { randomBytes } from "node:crypto";
 // (`nsenter` + bun), never from outside. Made-up data only.
 const UNSHARE = Bun.which("unshare") ?? "/usr/bin/unshare";
 const NSENTER = Bun.which("nsenter") ?? "/usr/bin/nsenter";
-const ASK = `const r = await fetch(process.argv[1], { headers: process.argv[2] ? { authorization: "Bearer " + process.argv[2] } : {} });
-console.log(JSON.stringify({ status: r.status, body: await r.text() }));`;
+// Runs inside the box's namespace: one GET with node:http (a harness file never calls fetch itself, see guard.test.ts).
+const ASK = `const http = require("node:http");
+const headers = process.argv[2] ? { authorization: "Bearer " + process.argv[2] } : {};
+http.get(process.argv[1], { headers }, (res) => {
+  let body = "";
+  res.on("data", (d) => (body += d));
+  res.on("end", () => console.log(JSON.stringify({ status: res.statusCode, body })));
+}).on("error", () => console.log(JSON.stringify({ status: 0, body: "" })));`;
 
 interface NsServe {
   proc: ReturnType<typeof Bun.spawn>;
