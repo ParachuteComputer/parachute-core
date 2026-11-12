@@ -1677,10 +1677,10 @@ Versions are **not** full-text searchable.
   run; absent bounds mean unbounded, while explicit zero bounds are 400
   `invalid_request`. Tag-scoped callers and every other method receive 404.
 
-Older version bodies may be stored as deltas against a newer body. Reads are
-transparent: the content returned is always the full body. A deltified version's
-`encoding` is `"fossil-delta"` on the individual GET, but null in the list view,
-which does not resolve storage. A missing base or unknown encoding returns 409
+Older version bodies may be stored compressed, or as deltas against a newer body. Reads are
+transparent: the content returned is always the full body. The individual GET's `encoding` names how the
+body is stored: null (whole text), `"deflate"` (whole, compressed), `"fossil-delta"` or `"fossil-delta-z"`
+(a delta, the second compressed). The list view shows null, since it does not resolve storage. A missing base or unknown encoding returns 409
 `history_unrecoverable`; unscoped doctor reports `history_delta_orphan`.
 The default doctor census checks structure, not content checksums. Opt in to
 `GET /api/doctor?deep=true` (unrestricted sessions only; scoped sessions get 403)
