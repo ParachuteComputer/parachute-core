@@ -33,7 +33,7 @@ import {
   type QueryWarning,
 } from "../core/src/query-warnings.ts";
 import { SEARCH_MODES, buildLiteralSearchQuery, isValidSearchMode, type SearchMode } from "../core/src/search-query.ts";
-import { anyTermsQuery, effectiveHybridAuto, HYBRID_TEXT } from "../core/src/hybrid.ts";
+import { anyTermsQuery, effectiveHybridAuto } from "../core/src/hybrid.ts";
 import {
   listUnresolvedWikilinks,
   resolveOrQueueLink,
@@ -1032,7 +1032,7 @@ function parseSearchModeParam(url: URL): { mode?: SearchMode; error?: Response }
           error_type: "invalid_query",
           field: "search_mode",
           got: raw,
-          hint: HYBRID_TEXT.hint,
+          hint: 'pass "literal", "advanced" or "hybrid", or omit for the default ("literal": REST answers 4+ word searches literally too)',
         },
         400,
       ),

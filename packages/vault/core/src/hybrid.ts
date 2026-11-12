@@ -18,7 +18,7 @@ export const RRF_K = 60;
 
 /**
  * Whether a search with no `search_mode` is answered by hybrid when it reads as a question (the 0.9.3 "auto" default,
- * T-461). On since Aaron's yes (DECIDED-HYBRID, 11-12). It is the default only: a call's `search_mode` always wins,
+ * T-461). On by default (0.9.3). It is the default only: a call's `search_mode` always wins,
  * and a vault's `search.auto_hybrid` in vault.yaml (true or false, set by an admin over PATCH /api/vault) overrides it.
  * Changing it also changes what `HYBRID_TEXT` says ("the default").
  */

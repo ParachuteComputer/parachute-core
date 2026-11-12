@@ -8,7 +8,7 @@
 // no-provider contract. Each run proves which mode it is in first, so a box set up wrong fails loudly rather than
 // skipping. REST = MCP runs in both.
 //
-// `auto` (a question with no search_mode answered by hybrid) is the default since Aaron's yes (DECIDED-HYBRID, 11-12;
+// `auto` (a question with no search_mode answered by hybrid) is on by default (0.9.3;
 // the constant HYBRID_AUTO_DEFAULT in core/src/hybrid.ts). A call's search_mode always wins, and a vault can turn it
 // off with `search.auto_hybrid: false` (PATCH /api/vault, admin).
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";

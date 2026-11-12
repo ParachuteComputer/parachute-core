@@ -925,7 +925,7 @@ function parseVaultConfig(yaml: string, name: string): VaultConfig {
     const after = yaml.slice((searchStart.index ?? 0) + searchStart[0].length);
     for (const line of after.split("\n")) {
       if (line.match(/^\S/) && line.trim().length > 0) break; // next top-level key
-      const m = line.match(/^\s+auto_hybrid:\s*(true|false)\s*$/);
+      const m = line.match(/^\s+auto_hybrid:\s*(true|false)\s*(?:#.*)?$/);
       if (m) {
         config.search = { auto_hybrid: m[1]! === "true" };
         break;

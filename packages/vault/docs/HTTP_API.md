@@ -706,7 +706,7 @@ actually affected by the bug — only the message string could double.
 |---|---|---|---|
 | `invalid_audio_retention` | 400 | `field`, `got`, `hint` | `config.audio_retention` isn't one of `keep`, `until_transcribed`, `never`. |
 | `invalid_auto_transcribe` | 400 | `field`, `got`, `hint` | `config.auto_transcribe.enabled` isn't a boolean. |
-| `invalid_search_auto_hybrid` | 400 | `field`, `got`, `hint` | `config.search.auto_hybrid` isn't `true`, `false` or `null`. |
+| `invalid_search_auto_hybrid` | 400 | `field`, `got`, `hint` | `config.search.auto_hybrid` isn't `true`, `false` or `null`. A `PATCH` body carrying `config.search` from a non-admin is `403 insufficient_scope`. |
 | `insufficient_scope` | 403 | `required_scope: "vault:admin"`, `granted_scopes` | The body carries `description` (any value, `null` included) and the token lacks admin for this vault. |
 | `tag_scope_violation` | 403 | `scoped_tags` | The token is tag-scoped. Description and config are vault-wide, so a tag-scoped token can't PATCH here at any verb. |
 

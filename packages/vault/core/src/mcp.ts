@@ -1113,7 +1113,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
         if (params.search_mode !== undefined && params.search_mode !== null) {
           if (typeof params.search_mode !== "string" || !isValidSearchMode(params.search_mode)) {
             throw new QueryError(
-              `invalid \`search_mode\` value ${JSON.stringify(params.search_mode)} — must be one of ${SEARCH_MODES.map((m) => `"${m}"`).join(", ")}. Omit for the default ("literal").`,
+              `invalid \`search_mode\` value ${JSON.stringify(params.search_mode)} — must be one of ${SEARCH_MODES.map((m) => `"${m}"`).join(", ")}.`,
               "INVALID_QUERY",
               {
                 error_type: "invalid_query",
@@ -1343,13 +1343,14 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
               // searches (ids, URLs, codes, titles, names) stay literal, so exact lookups and existence checks are
               // unchanged; `search_mode: "literal"` keeps today's answer for any search. If the meaning arm can't
               // answer (provider not ready), the literal answer is used. Not with `sort`. A tag-scoped session gets it too: both arms run under its `visible`.
+              // The vault's setting is checked last: it reads vault.yaml, which short, literal and no-embedding searches skip.
               const auto =
-                effectiveHybridAuto(typeof opts?.hybridAuto === "function" ? opts.hybridAuto() : opts?.hybridAuto) &&
                 searchMode === undefined &&
                 store.hybridSearch &&
-                store.hasMeaningSearch?.() &&
                 params.sort === undefined &&
-                isQuestionShaped(params.search as string)
+                isQuestionShaped(params.search as string) &&
+                store.hasMeaningSearch?.() &&
+                effectiveHybridAuto(typeof opts?.hybridAuto === "function" ? opts.hybridAuto() : opts?.hybridAuto)
                   ? await runHybrid()
                   : undefined;
               if (auto?.meaning === "ok") {

@@ -6,7 +6,7 @@
  */
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdirSync, rmSync, existsSync, readFileSync } from "fs";
+import { mkdirSync, rmSync, existsSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { readVaultConfig, vaultConfigPath, writeVaultConfig } from "./config.ts";
@@ -42,6 +42,13 @@ describe("search.auto_hybrid in vault.yaml", () => {
     expect(readVaultConfig("v")?.search).toBeUndefined();
     expect(readFileSync(vaultConfigPath("v"), "utf8")).not.toContain("search:");
   });
+});
+
+test("a trailing comment on the value is accepted", () => {
+  writeVaultConfig(fresh());
+  const path = vaultConfigPath("v");
+  writeFileSync(path, readFileSync(path, "utf8") + "search:\n  auto_hybrid: false  # keep exact words\n");
+  expect(readVaultConfig("v")?.search).toEqual({ auto_hybrid: false });
 });
 
 describe("PATCH and GET /api/vault, config.search.auto_hybrid", () => {
