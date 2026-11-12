@@ -495,8 +495,9 @@ A key that can only download the vault's export lets your own scheduler take bac
 
 ```bash
 parachute keys new nightly-backup --vault <n> --can export     # prints the key once
-# crontab: every night at 03:10
-10 3 * * *  curl -fsS -H "Authorization: Bearer $KEY" https://my-box.example.ts.net/vault/<n>/api/export -o backup-$(date +%F).tar
+# save the key in a file only you can read: ~/.parachute-backup-key (chmod 600)
+# crontab: every night at 03:10 (cron needs % written as \%)
+10 3 * * *  curl -fsS -H "Authorization: Bearer $(cat $HOME/.parachute-backup-key)" https://my-box.example.ts.net/vault/<n>/api/export -o $HOME/backups/vault-$(date +\%F).tar
 ```
 
 The tar holds the same files as `parachute-vault export` and imports into any Parachute. `parachute-vault status` shows `last export` per vault, so you can see the job ran. See [HTTP_API.md](docs/HTTP_API.md#export).

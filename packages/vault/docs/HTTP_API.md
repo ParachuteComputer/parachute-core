@@ -2618,7 +2618,9 @@ cron job:
 
 ```bash
 # crontab: every night at 03:10, one tar per day
-10 3 * * *  curl -fsS -H "Authorization: Bearer $KEY" https://my-box.example.ts.net/vault/<n>/api/export -o backup-$(date +%F).tar
+# save the key in a file only you can read: ~/.parachute-backup-key (chmod 600)
+# crontab: every night at 03:10 (cron needs % written as \%)
+10 3 * * *  curl -fsS -H "Authorization: Bearer $(cat $HOME/.parachute-backup-key)" https://my-box.example.ts.net/vault/<n>/api/export -o $HOME/backups/vault-$(date +\%F).tar
 ```
 
 (`-f` makes curl fail on a 401 or 403 instead of saving the error as a backup.) Mint the
