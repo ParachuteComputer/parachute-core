@@ -971,7 +971,7 @@
   {
    "kind": "endpoint",
    "old": "a note's validation_status warning schema_conflict: \"field 'f' has conflicting specs in ancestor tags 'a' (kept) and 'b' (ignored)\" (REST and MCP)",
-   "new": "the same warning ending \"(overridden)\" when b redefines a field its ancestor declares, else \"(checked, warnings only)\": b's rules are now checked too, as warnings",
+   "new": "the same warning ending \"(overridden)\" when a type on the note descends from b and redefines its field, else \"(checked, warnings only)\": b's rules are now checked too, as warnings",
    "action": "keep",
    "reason": "0.9.2 one data type per field, warned (core #77): every type on a record now checks its fields, so the losing type's rules are no longer ignored; the old word would have been false. Same reason code, field, schema and loser_schema; only the last words change. A write is still decided by the first type's rules",
    "since": "0.9",
@@ -983,7 +983,7 @@
    "old": "a note's validation_status warnings (REST and MCP, on reads and writes)",
    "new": "the same, plus near_name: a field the note's types don't declare, one letter from one they do, is kept as written, with a warning naming the declared field (nearest)",
    "action": "keep",
-   "reason": "0.9.2 teaching (core #79, #80): `statu` beside a declared `status` was silently a new field. Advisory, never strict, nothing stored changes; a 0.8 client that lists the warnings sees one more",
+   "reason": "0.9.2 teaching (core #79, #80): `statu` beside a declared `status` was silently a new field. Advisory, never strict, nothing stored changes; a 0.8 client that lists the warnings sees one more for each such field",
    "since": "0.9",
    "removed_in": null,
    "state": "live"
