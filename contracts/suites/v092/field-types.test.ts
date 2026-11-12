@@ -35,6 +35,33 @@ describe("0.9.2 one data type per field: warn", () => {
     }
   });
 
+  test("a schema_conflict warning says what happens to the other type's rules, no longer that they are ignored", async () => {
+    // changes-0.9.json, the schema_conflict row (T-456 day-2 shadow): 0.8 ended this warning "(ignored)"; since every
+    // type is checked, the losing type's rules are "(checked, warnings only)", or "(overridden)" when the winner is a
+    // subtype redefining its ancestor's field on purpose. Same reason, field, schema and loser_schema.
+    const [A, B, P] = [runId("ta"), runId("tb"), runId("tp")];
+    const C = `${P}_kid`;
+    const field = `st_${runId("f")}`;
+    const spec = (e: string[]) => ({ fields: { [field]: { type: "string", enum: e } } });
+    for (const [t, body] of [[A, spec(["open", "done"])], [B, spec(["todo", "done"])], [P, spec(["a", "b"])],
+      [C, { ...spec(["a", "b", "c"]), parent_names: [P] }]] as const) {
+      must((await api.put(`/tags/${enc(t)}`, body)).status === 200, `setup: type ${t}`);
+    }
+    const r = runId("ft");
+    const conflict = async (path: string, tags: string[]) => {
+      const made = await writer.post("/notes", { content: "", path: `${r}/${path}`, tags, metadata: { [field]: "done" } });
+      must(made.status === 201, `setup: ${made.status} ${said(made.body)}`);
+      const ws: any[] = made.body.validation_status?.warnings ?? made.body.warnings ?? [];
+      return ws.find((w) => w.reason === "schema_conflict" && w.field === field);
+    };
+    const two = await conflict("two", [A, B]);
+    expect(two).toMatchObject({ schema: A, loser_schema: B });
+    expect(two.message).toBe(`field '${field}' has conflicting specs in ancestor tags '${A}' (kept) and '${B}' (checked, warnings only)`);
+    const kid = await conflict("kid", [C]);
+    expect(kid).toMatchObject({ schema: C, loser_schema: P });
+    expect(kid.message).toBe(`field '${field}' has conflicting specs in ancestor tags '${C}' (kept) and '${P}' (overridden)`);
+  });
+
   test("doctor reports a field no type declares that holds two data types", async () => {
     const field = `mixed_${runId("f")}`;
     const r = runId("ft");
