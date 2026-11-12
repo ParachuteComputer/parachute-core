@@ -153,16 +153,17 @@ core (branch `t335-frame-1.0`): 150 signed cases, each with its event id and out
 party. It meets the precondition once its two cases "a newer event for another grantee" and "a newer event under
 another grant" end with nothing in force (they were written before line 6 held such an event, and expect the older
 grant to stay), and it also carries a meaning in a second spelling (keys out of order, a space, a `\u` or `\/`
-escape, `1.0` or `01`, rows or verbs unsorted), a grant 8,193 bytes as sent but not as hashed (below), and a
-statement whose tags hold a number. Until then the precondition is unmet.
+escape, `1.0` or `01`, rows or verbs unsorted), a grant 8,193 bytes as sent but not as hashed (below), a
+statement whose tags hold a number, and a newer event whose `to` repeats a key (line 6 compares raw bytes). Until then the precondition is unmet.
 
 **Size.** The content is at most 6,000 bytes of UTF-8 and the event at most 8,192 bytes. Both are checked: the
 event escapes the content's quotes and backslashes, so it is larger than the content. **An event's size**, here
 and in every limit in this spec, is the length of the event as sent, which the vault computes itself from the
 event's fields, whatever spelling the request used: one compact JSON object of its seven fields (`id`, `pubkey`,
 `created_at`, `kind`, `tags`, `content`, `sig`), with no whitespace, strings escaped exactly as NIP-01's id
-serialisation escapes them, and every other character written as itself in UTF-8 (never `\u` for non-ASCII). It is
-not NIP-01's serialisation for the id, which leaves out `id` and `sig` and is 253 bytes shorter for a grant. A KB is
+serialisation escapes them (`\"`, `\\`, `\n`, `\r`, `\t`, `\b`, `\f`), and every other character, any other
+control included, written as itself in UTF-8 (never `\u`). It is not NIP-01's serialisation for the id, which
+leaves out `id` and `sig` and is 253 bytes shorter. A KB is
 1,024 bytes.
 
 Five kinds are reserved together [lean, open decision A]: `37440` grant, `7440` revoke (a regular event, never
@@ -965,3 +966,16 @@ restore). Its text fixes (line 7 judged again after revokes; who may sign a hand
 a retired key) are applied and not reviewed again. Left open: a member's cap and held events, a narrowing arriving
 after an import from a not-yet-linked key, and re-filing as the grantee's lever (§2.2), plus contracts for a
 delisted override and for a changed `to` suspending.
+
+**Round 6 (T-462, 11-12): #systems' pushback.** #systems built the frame into the shell's key core and sent seven
+points, read against 91480cd6. #1 (a changed `to` fails open) was already closed by round 5's line 6; the replace
+contract now asserts the address is suspended. Adopted: an applet's `to.by` is `signer` (line 8); one size measure,
+the event as sent, computed by the vault (§2.1); DEL is a control; the frozen reads look for a repeated key only at
+the top level; the minimal read takes the first `d` tag; tags are lists of strings and strings well-formed (line 1).
+The spelling-vector precondition names #systems' `frame-1.0.json` and what it still lacks. A fresh adversarial Fable
+reviewer on these changes: **SHIP WITH FIXES**, 1 blocking (the named vectors still expected a changed `to` to leave
+the old grant in force) and 7 more; the blocking one and six others fixed (line 6 compares raw value bytes; size
+escapes pinned; well-formed Unicode; the size contract's ids). One re-check: **SHIP**, all closed; its last nit
+(which form a control takes in the size) is applied and not reviewed again. Left for the security pass: whether
+1.0 says outright that no later version adds a key inside `to` (a key added there, or a `to` respelled, suspends the
+address for good: it fails closed).
