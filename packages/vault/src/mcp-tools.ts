@@ -2077,9 +2077,10 @@ function listAction(vaultName: string, auth: AuthResult): Record<string, unknown
   return { action: "list", tokens };
 }
 
-/** The warnings a tag-scoped session may see: those that carry no tag or record information (`scan`). */
+/** The warnings a tag-scoped session may see: those that carry no tag or record information (`scan`, and how a hybrid search ran). */
 function scopeSafeWarnings(warnings: unknown): { warnings?: unknown[] } {
   if (!Array.isArray(warnings)) return {};
-  const kept = warnings.filter((w) => (w as { code?: unknown } | null)?.code === "scan");
+  // `search_auto` and `semantic_unavailable` (hybrid search) say how the search ran, not what is in the vault.
+  const kept = warnings.filter((w) => ["scan", "search_auto", "semantic_unavailable"].includes((w as { code?: unknown } | null)?.code as string));
   return kept.length > 0 ? { warnings: kept } : {};
 }

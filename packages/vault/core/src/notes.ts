@@ -2422,7 +2422,7 @@ function searchVisibleOnly(
 export function semanticSearchNotes(
   db: Database,
   queryVector: Float32Array,
-  opts: QueryOpts,
+  opts: QueryOpts & { visible?: (note: Note) => boolean },
   model: string,
 ): SemanticSearchResult {
   const limit = typeof opts.limit === "number" ? opts.limit : 10;
@@ -2438,7 +2438,15 @@ export function semanticSearchNotes(
   const idRows = db.prepare(`SELECT n.id FROM notes n ${whereClause}`).all(...params) as {
     id: string;
   }[];
-  const candidateIds = idRows.map((r) => r.id);
+  let candidateIds = idRows.map((r) => r.id);
+  // A caller who sees only some notes (`visible`, a tag-scoped session): the candidates are narrowed to those it can
+  // see BEFORE ranking and the limit, so its page is full, nothing it can't see takes a place on it, and the
+  // pending/total counts are over what it can see.
+  if (opts.visible && candidateIds.length > 0) {
+    const tagsById = getNoteTagsForNotes(db, candidateIds);
+    const visible = opts.visible;
+    candidateIds = candidateIds.filter((id) => visible({ id, tags: tagsById.get(id) ?? [] } as Note));
+  }
   if (candidateIds.length === 0) {
     return { notes: [], pendingCount: 0, totalCandidates: 0 };
   }
@@ -3350,6 +3358,7 @@ export function toNoteIndex(note: Note): NoteIndex {
     preview,
     displayTitle: computeDisplayTitle(note.content),
     ...(note.score !== undefined ? { score: note.score } : {}),
+    ...(note.matched_by ? { matched_by: note.matched_by } : {}),
   };
 }
 

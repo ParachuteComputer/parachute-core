@@ -26,7 +26,7 @@
  * inherit it from the same shared library.
  */
 
-export const SEARCH_MODES = ["literal", "advanced"] as const;
+export const SEARCH_MODES = ["literal", "advanced", "hybrid"] as const;
 export type SearchMode = (typeof SEARCH_MODES)[number];
 
 /**

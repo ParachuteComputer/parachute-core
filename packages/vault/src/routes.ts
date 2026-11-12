@@ -33,6 +33,7 @@ import {
   type QueryWarning,
 } from "../core/src/query-warnings.ts";
 import { SEARCH_MODES, buildLiteralSearchQuery, isValidSearchMode, type SearchMode } from "../core/src/search-query.ts";
+import { anyTermsQuery, HYBRID_TEXT } from "../core/src/hybrid.ts";
 import {
   listUnresolvedWikilinks,
   resolveOrQueueLink,
@@ -1011,7 +1012,8 @@ export function parseExpandParam(url: URL): { expand?: TagExpandMode; error?: Re
  * turned into an FTS5 query. "literal" (default, omit or pass explicitly):
  * escape + phrase-quote so punctuation is literal content, not FTS5
  * syntax. "advanced": raw FTS5 passthrough (pre-#551 behavior) for
- * boolean/phrase/prefix operators. Same validation shape as
+ * boolean/phrase/prefix operators. "hybrid" (T-461): keyword and meaning
+ * together, fused by rank; the same answer as MCP's. Same validation shape as
  * `parseExpandParam` — loud 400 on an unknown value rather than a silent
  * fallback to the default.
  *
@@ -1030,7 +1032,7 @@ function parseSearchModeParam(url: URL): { mode?: SearchMode; error?: Response }
           error_type: "invalid_query",
           field: "search_mode",
           got: raw,
-          hint: `pass "literal" or "advanced", or omit for the default ("literal")`,
+          hint: HYBRID_TEXT.hint,
         },
         400,
       ),
@@ -1669,7 +1671,12 @@ async function handleNotesInner(
         const parsed = parseNotesQueryOpts(url, tagScope);
         if (parsed.error) return parsed.error;
         try {
-          const semanticResult = await store.semanticSearch(nearText, { ...parsed.queryOpts, cursor: undefined });
+          // A scoped pass ranks over the notes it can see, so its page is full (0.9.3; it used to be cut after the limit).
+          const semanticResult = await store.semanticSearch(nearText, {
+            ...parsed.queryOpts,
+            cursor: undefined,
+            visible: buildExpandVisibility(tagScope.allowed, tagScope.raw),
+          });
           // `scan` (0.9.2): a metadata operator or date_filter on a field that isn't indexed.
           const semanticWarnings: QueryWarning[] = [...collectScanWarnings(db, { metadata: parsed.queryOpts?.metadata, dateFilter: parsed.queryOpts?.dateFilter })];
           if (semanticResult.pendingCount > 0) {
@@ -1836,7 +1843,7 @@ async function handleNotesInner(
         // "Only whitespace/quotes" (vault#551 edge case) — short-circuit
         // BEFORE ever calling FTS5 rather than risk a syntax error (or a
         // meaningless always-empty query) on a degenerate escaped phrase.
-        if (mode === "literal" && buildLiteralSearchQuery(search).isEmpty) {
+        if ((mode === "literal" && buildLiteralSearchQuery(search).isEmpty) || (mode === "hybrid" && anyTermsQuery(search) === "")) {
           rawResults = [];
           searchWarnings.push(emptySearchWarning());
         } else {
@@ -1845,7 +1852,7 @@ async function handleNotesInner(
             // (structured `invalid_search_syntax`, vault#551) instead of
             // the pre-#551 silent `[]` — caught below and formatted the
             // same way the structured-query path formats a `QueryError`.
-            rawResults = await store.searchNotes(search, {
+            const searchOpts = {
               ...parsed.queryOpts,
               mode,
               // Search has no offset/cursor/orderBy contract (offset is
@@ -1855,7 +1862,30 @@ async function handleNotesInner(
               orderBy: undefined,
               // Fix 8: a scoped pass's answer is ranked over what it can see.
               visible: buildExpandVisibility(tagScope.allowed, tagScope.raw),
-            });
+            };
+            if (mode === "hybrid") {
+              // T-461: keyword + meaning, fused by rank: the same call MCP makes (core/src/store.ts hybridSearch), so
+              // the two doors answer the same ids. Both arms run under `visible`; sort doesn't apply (ranked by relevance).
+              if (!store.hybridSearch) {
+                return json(
+                  { error: 'search_mode "hybrid" isn\'t supported by this vault\'s store; use "literal".', code: "INVALID_QUERY", error_type: "invalid_query", field: "search_mode", hint: 'pass search_mode=literal' },
+                  400,
+                );
+              }
+              if (parseQuery(url, "sort") !== null) {
+                searchWarnings.push(ignoredParamWarning("sort", 'search_mode "hybrid" ranks by relevance; pass search_mode=literal to sort by date'));
+              }
+              const { mode: _m, sort: _s, ...hybridOpts } = searchOpts;
+              const h = await store.hybridSearch(search, hybridOpts);
+              rawResults = h.notes;
+              if (h.meaning === "unavailable") {
+                searchWarnings.push({ code: "semantic_unavailable", message: `hybrid search ranked by keyword only: ${h.meaningReason ?? "no embedding provider"}` });
+              } else if (h.pendingCount > 0) {
+                searchWarnings.push(embeddingsPendingWarning(h.pendingCount, h.totalCandidates));
+              }
+            } else {
+              rawResults = await store.searchNotes(search, searchOpts);
+            }
           } catch (e: any) {
             if (e && e.name === "QueryError") {
               return json(

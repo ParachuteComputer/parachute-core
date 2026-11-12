@@ -94,7 +94,7 @@ Version history is the first self-hosted-first feature tracked in this table.
 | `aggregate[op]` / `aggregate[group_by]` / `aggregate[field]` | honored; `search`+`aggregate` → 400 `invalid_query` | honored; same exclusions as bun (`search`, `semantic`, `cursor` → 400 `invalid_query`); `aggregate`+`near` only after cloud repins the vault | [cloud#291](https://github.com/ParachuteComputer/parachute-cloud/pull/291) (B2) |
 | `if_exists` (POST `/notes`) | honored (`error`/`ignore`/`update`/`replace`) | honored (`error`/`ignore`/`update`/`replace`); `existed` returned only in the three engaged modes | [cloud#300](https://github.com/ParachuteComputer/parachute-cloud/pull/300) (B8) |
 | `summary` (batch POST `/notes`) | honored — `{created, ids, failed}` | honored — `{created, ids, failed}`; `created` excludes collision hits, `failed` is always `[]` | [cloud#298](https://github.com/ParachuteComputer/parachute-cloud/pull/298) (B7), [cloud#300](https://github.com/ParachuteComputer/parachute-cloud/pull/300) (B8) |
-| `search_mode` | honored (`literal`/`advanced`) | 200 + `unsupported_param` warning | cloud v1 is literal-only |
+| `search_mode` | honored (`literal`/`advanced`/`hybrid`) | 200 + `unsupported_param` warning | cloud v1 is literal-only; `hybrid` (0.9.3: keyword + meaning, see `matched_by`) lands on cloud with its twin (T-463) |
 | `sort` under `?search=` | honored | 200 + `unsupported_param` warning | cloud v1 always ranks by relevance |
 | `{idOrPath}` note addressing (H1-title fallback) | honored | honored — every REST note address, incl. `find-path`'s `source`/`target` | [cloud#302](https://github.com/ParachuteComputer/parachute-cloud/pull/302) (B9) |
 | `unresolved_link` / `ambiguous_link` write warnings (POST/PATCH `/notes`) | honored — in the response body as `warnings` | honored — in the response body as `warnings`, never the `X-Parachute-Warnings` header | [cloud#302](https://github.com/ParachuteComputer/parachute-cloud/pull/302) (B9); a `links.remove` miss never queues on either door |
@@ -535,7 +535,7 @@ the existing `error`/`code`:
   lexicographic string comparison against real ISO timestamps and quietly
   match nothing, or everything, depending on how the garbage happened to
   sort.
-- `search_mode` set to anything other than `literal` / `advanced`.
+- `search_mode` set to anything other than `literal` / `advanced` / `hybrid`.
 
 ```json
 {
@@ -1159,8 +1159,13 @@ Query params:
     manual phrase quoting (`"exact phrase"`), and prefix matching
     (`term*`) are honored as syntax. A malformed advanced query now throws
     a structured `400 invalid_search_syntax` (see above) instead of
-    silently returning `[]`. `search_mode` values other than
-    `literal`/`advanced` are `400 invalid_query`; passing `search_mode`
+    silently returning `[]`. `search_mode=hybrid` (0.9.3) ranks by keyword
+    (any content word) and meaning together, fused by rank: each note carries
+    `matched_by` and an RRF `score`; with no embedding provider it answers by
+    keyword alone with a `semantic_unavailable` warning; `sort` is ignored
+    (warning); a tag-scoped pass is ranked over the notes it can see. It is
+    the same answer MCP gives. `search_mode` values other than
+    `literal`/`advanced`/`hybrid` are `400 invalid_query`; passing `search_mode`
     without `search` is a no-op that surfaces an `ignored_param` warning.
   - **Breaking change / migration.** A caller who relied on raw FTS5 syntax
     working under the DEFAULT `search=` (no `search_mode`) — e.g. manual

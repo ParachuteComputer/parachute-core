@@ -6,6 +6,7 @@
 //   bun run doors -- --doors box --check-golden          the box must match the fingerprint kept in suites/door/golden
 //   bun run doors -- --doors cloud --with-golden box-0.8 compare cloud with the box's kept fingerprint (another
 //                                                        repo's CI: it runs its own door and needs no box)
+//   bun run doors -- --doors box --embeddings suites/v093  the box with meaning search on (the bundled model)
 //   bun run doors:keep box-0.8                           keep the last run's fingerprint as the golden one
 //   bun run doors -- --remote <door.json>                a deployed door, from a door file written by hand; no
 //                                                        sandbox (it needs the network), DOOR_REMOTE_HOSTS names it
@@ -61,6 +62,9 @@ const has = (name: string) => {
 };
 const withGolden = flag("--with-golden");
 const checkGolden = has("--check-golden");
+// The box with meaning search on (the bundled model): for the suites that need embeddings (suites/v093/hybrid). The
+// suites see it as DOOR_EMBEDDINGS=on.
+if (has("--embeddings")) process.env.DOOR_EMBEDDINGS = "on";
 const goldenDir = join(contracts, "suites", "door", "golden");
 const want = remoteFile ? ["remote"] : (flag("--doors") ?? ["box", process.env.CLOUD_REPO ? "cloud" : "", process.env.PERSONAL_REPO ? "personal" : ""].filter(Boolean).join(",")).split(",");
 const files = args.filter((a) => a.startsWith("suites/"));
@@ -102,7 +106,7 @@ async function startBox(): Promise<Started> {
   const dir = resolve(process.env.CANDIDATE_DIR ?? join(contracts, ".cache", "candidate-core"));
   const { manifest, sha256 } = await loadCandidate(dir);
   const info = prepareInfo(dir, manifest, sha256);
-  const box = await startBoxDoor(info);
+  const box = await startBoxDoor(info, { embeddings: process.env.DOOR_EMBEDDINGS === "on" });
   const other = `other${randomBytes(3).toString("hex")}`;
   await ensureVault(box.issuer, await accountBearer(box.issuer, box.session), other);
   // The release line decides which contracts apply and which doors are compared with each other. 0.9.1 is 0.9 with
