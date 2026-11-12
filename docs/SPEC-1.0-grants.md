@@ -149,12 +149,15 @@ tags, verbs) is printable ASCII; only `purpose` may be in any script. Type and t
 can't be granted or denied by name at 1.0 (§13). Test vectors for the spelling (accepted and refused, with
 their digests) are a precondition of the freeze (open decision A): they are written and run by the shell, the
 minter and every door before the first signature. They are #systems' `vectors/frame-1.0.json` in the shell-keys
-core (branch `t335-frame-1.0`, at bf607e4: 198 signed cases, sha256 `9cba3adf18e39baf85d6d7d9ef0fd9aa80786c74e2c1cae69689151268b17faf`); its README section "The
+core (branch `t335-frame-1.0`, at ba7a6bd794a1c0c26241a4fdac15aa1ebd6f4a14: 242 signed cases, sha256
+`2c1410eef289319f3aec2b4c72cd10cea79ed73c25117e43e256f0bab1bc659b`); its README section "The
 vectors, for a vault" says how a vault replays it. A door pins a commit and the file's sha256 when it takes it.
-Round 7 (Appendix D) changed four answers the file pinned at bf607e4: a disagreeing event ends its address in any
-order, a member's `under` that isn't their own is `invalid_statement`, a control character other than NIP-01's
-five makes an event malformed, and a grantee may give up a suspended grant. The file meets the precondition once
-it carries those.
+This pin carries round 7's four answers, so the vector precondition is met.
+
+**The split mark fails closed.** When a door sees an older event that disagrees on `to` or `under`, it records
+the address as ended in the same write that files or refuses that event. If that write fails, the door refuses the
+event and files nothing else at that address until the mark is written; it never files a newer agreeing event over
+an unrecorded split.
 
 **Size.** The content is at most 6,000 bytes of UTF-8 and the event at most 8,192 bytes. Both are checked: the
 event escapes the content's quotes and backslashes, so it is larger than the content. **An event's size**, here
