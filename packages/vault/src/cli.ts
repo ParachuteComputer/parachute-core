@@ -3561,7 +3561,9 @@ async function cmdHistory(args: string[]) {
       const { compactStateDrift } = await import("../core/src/history-compact-state.js");
       const ro = new Database(path, { readonly: true });
       try {
-        const { checked, drifted } = compactStateDrift(ro);
+        // One read transaction, so the notes' real values and the stored hints come from the same snapshot even
+        // while the server writes (two separate reads showed hundreds of false drifted notes under a writer).
+        const { checked, drifted } = ro.transaction(() => compactStateDrift(ro)).deferred();
         console.log(asJson ? JSON.stringify({ vault: vaultName, checked_notes: checked, drifted_notes: drifted }) :
           `${drifted} of ${checked} notes in vault "${vaultName}" have compaction hints that differ from history.`);
       } finally { ro.close(); }

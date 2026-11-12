@@ -10,7 +10,7 @@
  */
 import { Database } from "bun:sqlite";
 import { existsSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { type ReapableClient, findReapableClients, reapClient } from "../clients.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 
@@ -21,22 +21,24 @@ export interface DataDeps {
   historyDrift?: (configDir: string, vault: string) => { checked: number; drifted: number } | null;
   /** Rebuild one vault's hints. True when it worked. */
   rebuildHistory?: (configDir: string, vault: string) => boolean;
-  /** Clients nothing uses, or null when there is no hub.db or it can't be read. */
+  /** Clients nothing uses; [] with no hub.db yet; null when hub.db exists but can't be read. */
   findReapable?: (configDir: string) => ReapableClient[] | null;
-  /** Delete these clients; returns the ids deleted. */
+  /** Delete these clients, re-checking each is still unused at that moment; returns the ids deleted (the rest are now in use and kept). */
   reapClients?: (configDir: string, clientIds: string[]) => string[];
 }
 
 export interface StaleHistory {
   vault: string;
   checked: number;
-  drifted: number;
+  /** Notes whose hints differ; null when the vault could not be asked. */
+  drifted: number | null;
 }
 
 export interface DataFindings {
   /** Every vault the vault command could be asked about, with how many notes differ (0 = fine). */
   history: StaleHistory[];
-  reapable: ReapableClient[];
+  /** Null when hub.db exists but can't be read (reported as "could not check"). */
+  reapable: ReapableClient[] | null;
 }
 
 export interface DataCheck {
@@ -58,9 +60,21 @@ function defaultListVaults(configDir: string): string[] {
   }
 }
 
-/** Ask this install's own `parachute-vault` (bin/ puts itself first on PATH). Null when there is none. */
+/**
+ * This install's own `parachute-vault`: the one in the bin folder of the running program (packages/cli/bin, next to
+ * `parachute`), else the first on PATH. Null when there is none.
+ */
+function vaultBin(): string | null {
+  const script = process.argv[1];
+  if (script) {
+    const own = join(dirname(script), "..", "bin", "parachute-vault");
+    if (existsSync(own)) return own;
+  }
+  return Bun.which("parachute-vault");
+}
+
 function runVault(configDir: string, args: string[]): { code: number; out: string } | null {
-  const bin = Bun.which("parachute-vault");
+  const bin = vaultBin();
   if (!bin) return null;
   try {
     const r = Bun.spawnSync([bin, "history", "rebuild-state", ...args], {
@@ -92,7 +106,8 @@ function defaultRebuildHistory(configDir: string, vault: string): boolean {
 
 function defaultFindReapable(configDir: string): ReapableClient[] | null {
   const path = hubDbPath(configDir);
-  if (!existsSync(path)) return null;
+  // No hub.db yet is a fresh install (doctor stays green there); one that exists and can't be read is "could not check".
+  if (!existsSync(path)) return [];
   let db: Database | undefined;
   try {
     // Read-only: doctor never migrates or writes a database it only reports on.
@@ -108,7 +123,14 @@ function defaultFindReapable(configDir: string): ReapableClient[] | null {
 function defaultReapClients(configDir: string, clientIds: string[]): string[] {
   const db = openHubDb(hubDbPath(configDir));
   try {
-    return clientIds.filter((id) => reapClient(db, id));
+    // The list was made before a prompt that can wait any time: under one write lock, ask the gate again and delete
+    // only what is still unused (a client that got a grant meanwhile is kept).
+    return db
+      .transaction(() => {
+        const still = new Set(findReapableClients(db).map((c) => c.clientId));
+        return clientIds.filter((id) => still.has(id) && reapClient(db, id));
+      })
+      .immediate();
   } finally {
     db.close();
   }
@@ -118,9 +140,9 @@ export function findDataProblems(configDir: string, d: DataDeps | undefined): Da
   const history: StaleHistory[] = [];
   for (const vault of (d?.listVaults ?? defaultListVaults)(configDir)) {
     const drift = (d?.historyDrift ?? defaultHistoryDrift)(configDir, vault);
-    if (drift) history.push({ vault, ...drift });
+    history.push({ vault, ...(drift ?? { checked: 0, drifted: null }) });
   }
-  return { history, reapable: (d?.findReapable ?? defaultFindReapable)(configDir) ?? [] };
+  return { history, reapable: (d?.findReapable ?? defaultFindReapable)(configDir) };
 }
 
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
@@ -128,7 +150,15 @@ const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one :
 /** The report's "Data" group. Always one `oauth-clients` check, and one `history-state:<vault>` per vault asked. */
 export function dataChecks(f: DataFindings): DataCheck[] {
   const out: DataCheck[] = f.history.map((h) =>
-    h.drifted > 0
+    h.drifted === null
+      ? {
+          name: `history-state:${h.vault}`,
+          title: `History hints of vault "${h.vault}" match its history`,
+          status: "warn" as const,
+          detail: `could not check: this install's parachute-vault did not answer \`history rebuild-state --check\` (missing, older, timed out or refused the home)`,
+          fix: `parachute-vault history rebuild-state --vault ${h.vault} --check`,
+        }
+      : h.drifted > 0
       ? {
           name: `history-state:${h.vault}`,
           title: `History hints of vault "${h.vault}" match its history`,
@@ -143,6 +173,16 @@ export function dataChecks(f: DataFindings): DataCheck[] {
           detail: `${plural(h.checked, "note", "notes")} with history, hints match`,
         },
   );
+  if (f.reapable === null) {
+    out.push({
+      name: "oauth-clients",
+      title: "No unused OAuth clients",
+      status: "warn",
+      detail: "could not check: hub.db exists but can't be read",
+      fix: "parachute auth reap-clients",
+    });
+    return out;
+  }
   out.push(
     f.reapable.length > 0
       ? {
@@ -160,16 +200,16 @@ export function dataChecks(f: DataFindings): DataCheck[] {
 }
 
 export function hasDataFixes(f: DataFindings): boolean {
-  return f.reapable.length > 0 || f.history.some((h) => h.drifted > 0);
+  return (f.reapable?.length ?? 0) > 0 || f.history.some((h) => (h.drifted ?? 0) > 0);
 }
 
 /** What `--fix` would do, one line each. */
 export function describeDataFixes(f: DataFindings): string[] {
   const lines: string[] = [];
-  for (const h of f.history.filter((x) => x.drifted > 0)) {
-    lines.push(`  vault "${h.vault}": rebuild the compaction hints of ${plural(h.drifted, "note", "notes")} (history itself is not changed)`);
+  for (const h of f.history.filter((x) => (x.drifted ?? 0) > 0)) {
+    lines.push(`  vault "${h.vault}": rebuild the compaction hints of ${plural(h.drifted!, "note", "notes")} (history itself is not changed)`);
   }
-  for (const c of f.reapable) {
+  for (const c of f.reapable ?? []) {
     lines.push(`  OAuth client "${c.clientName ?? c.clientId}" (${c.clientId}, ${c.ageDays} days old, unused): delete it`);
   }
   return lines;
@@ -178,18 +218,24 @@ export function describeDataFixes(f: DataFindings): string[] {
 /** Run the fixers. Returns the number that failed. */
 export function applyDataFixes(configDir: string, f: DataFindings, d: DataDeps | undefined, print: (line: string) => void): number {
   let failed = 0;
-  for (const h of f.history.filter((x) => x.drifted > 0)) {
+  for (const h of f.history.filter((x) => (x.drifted ?? 0) > 0)) {
     if ((d?.rebuildHistory ?? defaultRebuildHistory)(configDir, h.vault)) print(`Rebuilt the compaction hints of vault "${h.vault}".`);
     else {
       failed++;
       print(`Could not rebuild the compaction hints of vault "${h.vault}": run \`parachute-vault history rebuild-state --vault ${h.vault}\` to see why.`);
     }
   }
-  if (f.reapable.length > 0) {
-    const ids = f.reapable.map((c) => c.clientId);
-    const gone = (d?.reapClients ?? defaultReapClients)(configDir, ids);
-    print(`Removed ${plural(gone.length, "unused OAuth client", "unused OAuth clients")}.`);
-    if (gone.length < ids.length) failed++;
+  if (f.reapable && f.reapable.length > 0) {
+    const gone = new Set((d?.reapClients ?? defaultReapClients)(configDir, f.reapable.map((c) => c.clientId)));
+    for (const c of f.reapable) {
+      // The same audit line `parachute auth reap-clients` writes.
+      if (gone.has(c.clientId)) {
+        print(`client reaped: client_id=${c.clientId} client_name=${c.clientName ?? ""} age_days=${c.ageDays} status=${c.status}`);
+      } else {
+        print(`client kept: client_id=${c.clientId} client_name=${c.clientName ?? ""} is in use now`);
+      }
+    }
+    print(`Removed ${plural(gone.size, "unused OAuth client", "unused OAuth clients")}.`);
   }
   return failed;
 }

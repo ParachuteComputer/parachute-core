@@ -37,7 +37,8 @@ export function readCompactState(db: Database, noteId: string): CompactState | n
 /**
  * Every note's hint row against what history says it should be (the full audit `scanCompactStateDrift` in doctor.ts
  * only samples). Read-only. A hint row for a note with no history, or a missing one, counts as drift. The `refused`
- * flag is a real decision, not derived, so it is not compared.
+ * flag is a real decision, not derived, so it is not compared. The two reads are NOT one snapshot by themselves:
+ * the caller runs this inside a read transaction (a write between them would count as drift).
  */
 export function compactStateDrift(db: Database): { checked: number; drifted: number } {
   const has = (name: string) => !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name);
