@@ -183,10 +183,11 @@ function frontmatter(block: string, parser: 1 | 2, reading: "export" | "old-expo
   // A bare `[x]`/`{y}` key: strict YAML read it as a flow collection, so its reading is wrong where the key is. Compare
   // with its reading of the block with only those keys requoted instead, so every other line is still checked.
   if (strict !== undefined) {
+    if (holdsBlockScalar(block)) return strict;
     let basis = strict;
     if (keysOnly !== undefined) { try { basis = yaml(keysOnly); } catch { return strict; } }
     // When the rewrite does not stand, that reading (keys right, values as plain YAML has them) is the answer.
-    return !holdsBlockScalar(block) && accountsFor(read, basis, values) ? read : basis;
+    return accountsFor(read, basis, values) ? read : basis;
   }
   if (holdsBlockScalar(block)) return refuse(strictError);
   return read;

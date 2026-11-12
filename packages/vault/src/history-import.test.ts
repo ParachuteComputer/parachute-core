@@ -834,3 +834,13 @@ test("export scalars: a bare [x] key leaves the other lines checked against plai
     expect(read.note).toBe("line one - [[Y]]");
   }
 });
+
+// A bare `[x]`/`{y}` key next to a block scalar: the scalar's text is YAML's reading, never requoted (review of #102).
+test("export scalars: a block scalar beside a bare [x] or {y} key keeps its text as written", async () => {
+  const { parseExportFrontmatter } = await import("./history-import.ts");
+  for (const reading of ["export", "old-export"] as const) {
+    expect(parseExportFrontmatter(`id: n1\n[x]: v\nbody: |\n  [y]: '[[Z]]'\n  more\n`, reading).body).toBe("[y]: '[[Z]]'\nmore\n");
+    expect(parseExportFrontmatter(`id: n1\n{y}: plain\nbody: |\n  {y}: '[[Z]]'\n  more\n`, reading).body).toBe("{y}: '[[Z]]'\nmore\n");
+    expect(parseExportFrontmatter(`id: n1\n[x]: v\nbody: >\n  [y]: '[[Z]]'\n  more\n`, reading).body).toBe("[y]: '[[Z]]' more\n");
+  }
+});
