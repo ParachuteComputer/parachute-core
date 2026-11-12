@@ -3124,6 +3124,7 @@ async function cmdExport(args: string[]) {
   let gitMessageTemplate = DEFAULT_COMMIT_TEMPLATE;
   let gitPush = false;
   let strictCaseCollision = false;
+  let format: 1 | 2 = 1;
 
   const positional: string[] = [];
   for (let i = 0; i < args.length; i++) {
@@ -3177,6 +3178,13 @@ async function cmdExport(args: string[]) {
       gitPush = true;
     } else if (arg === "--strict-case-collision") {
       strictCaseCollision = true;
+    } else if (arg === "--format") {
+      const v = args[++i];
+      if (v !== "1" && v !== "2") {
+        console.error("--format must be 1 (the default) or 2.");
+        process.exit(1);
+      }
+      format = v === "2" ? 2 : 1;
     } else {
       positional.push(arg);
     }
@@ -3185,7 +3193,7 @@ async function cmdExport(args: string[]) {
 
   if (!outputPath) {
     console.error(
-      "Usage: parachute-vault export <dir> [--since <iso>] [--vault <name>]\n" +
+      "Usage: parachute-vault export <dir> [--since <iso>] [--vault <name>] [--format 1|2]\n" +
         "                                  [--watch [--interval <seconds>]]\n" +
         "                                  [--git-commit [--git-message-template <tpl>] [--git-push]]",
     );
@@ -3195,6 +3203,11 @@ async function cmdExport(args: string[]) {
     console.error("  --vault <name>              Source vault (default: 'default')");
     console.error("  --since <iso>               Only export notes whose updated_at >= ISO timestamp");
     console.error("                              (incremental — useful for git-projection cadences)");
+    console.error("  --format <1|2>              Export format (default 1). 2 writes record fields flat in the");
+    console.error("                              frontmatter (Obsidian properties), Parachute's own keys under");
+    console.error("                              `parachute:`, and files body-less records by type and month.");
+    console.error("                              A whole-vault export: not with --since, --watch or --git-commit.");
+    console.error("                              Import reads both formats.");
     console.error("  --watch                     Stay alive; re-export incrementally on every");
     console.error("                              vault write. Polls every --interval seconds.");
     console.error("  --interval <seconds>        Watch poll interval (default: 5)");
@@ -3224,8 +3237,32 @@ async function cmdExport(args: string[]) {
     process.exit(1);
   }
 
+  if (format === 2 && (since !== undefined || watch || gitCommit)) {
+    console.error(
+      "--format 2 is a whole-vault export: it does not combine with --since, --watch or --git-commit " +
+      "(a record that moves to another folder would leave its old file behind). Use the default format for those.",
+    );
+    process.exit(1);
+  }
+
   const { resolve: resolvePath } = await import("path");
   const fullPath = resolvePath(outputPath);
+
+  // One folder holds one format: files of the other would import beside the new ones as duplicate ids.
+  {
+    const { existsSync: exists, readFileSync: readText } = await import("fs");
+    const manifest = `${fullPath}/.parachute/vault.yaml`;
+    if (exists(manifest)) {
+      const was = /^export_format_version:\s*(\d+)/m.exec(readText(manifest, "utf8"))?.[1];
+      if (was !== undefined && Number(was) !== format) {
+        console.error(
+          `${fullPath} already holds a format ${was} export; this one is format ${format}. ` +
+          `Export into an empty folder, so the two don't mix.`,
+        );
+        process.exit(1);
+      }
+    }
+  }
 
   const config = readVaultConfig(vaultName);
   if (!config) {
@@ -3271,6 +3308,7 @@ async function cmdExport(args: string[]) {
       ...(vaultDescription ? { vaultDescription } : {}),
       ...(opts.sinceCursor ? { since: opts.sinceCursor } : {}),
       ...(strictCaseCollision ? { failOnCaseCollision: true } : {}),
+      ...(format === 2 ? { format } : {}),
     });
 
     if (opts.isInitial) {

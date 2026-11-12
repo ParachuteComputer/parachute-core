@@ -30,6 +30,9 @@ parachute-vault export <dir> --vault <name>
 # Incremental — only notes whose updated_at >= ISO timestamp.
 # Useful as the "since-cursor" half of a projection cadence.
 parachute-vault export <dir> --since 2026-05-12T00:00:00Z
+
+# Format 2 (opt-in): fields flat, see "Format 2" below. Whole-vault only.
+parachute-vault export <dir> --format 2
 ```
 
 Output (per [`exportVaultToDir`](https://github.com/ParachuteComputer/parachute-vault/blob/main/core/src/portable-md.ts) in `core/src/portable-md.ts`):
@@ -123,6 +126,35 @@ Exporting a vault, blowing it away, and re-importing the export reproduces byte-
 - **Attachment links in note bodies.** When the binaries are copied, a markdown note's link or embed whose target is exactly `/api/storage/<att.path>` for one of its own copied attachments (the `![name](/api/storage/...)` / `[name](/api/storage/...)` the app inserts) is written as the relative path to the copied file, for example `../../.parachute/attachments/<att-id>/<basename>` (percent-encoded), so the exported note's images and links open in a file browser or markdown previewer. That attachment's frontmatter entry records the target it wrote, as `attachments[].body_link`; import turns exactly that target back into the storage link (only a value of that shape: `../` steps, then the attachment's own sidecar path) and drops the key, so the imported body and attachment row equal the original. An attachment gets no `body_link`, and its links stay as stored, when its binary wasn't copied, when the body has no storage link to it, or when the body already holds its relative path (a link typed by hand). So a body without `body_link` entries, including every export made before this key, imports as written. Importers older than this key ignore it and keep the relative links in the body.
 - **Idempotency.** Re-export an unchanged vault → byte-identical bytes (modulo `exported_at` in `vault.yaml`, which callers wanting strict byte-equivalence can pin via the `exportedAt` API option). Clean git diffs.
 
+## Format 2 (opt-in)
+
+`parachute-vault export <dir> --format 2` writes `export_format_version: 2` in `.parachute/vault.yaml`. Format 1 stays the default and is unchanged. Import reads both (it reads the version from the manifest; a version it does not know is refused, naming the two it reads). Format 2 is a whole-vault export: `--format 2` is refused with `--watch`, `--git-commit` and `--since`, because a record that moves folder would leave its old file behind, and refused into a folder that already holds a format 1 export, so the two never mix. The mirror and the nightly git projection stay on format 1. Git-history import (`history-import`) reads format 1 only and refuses a format 2 export with a message that says so.
+
+```yaml
+---
+status: open                 # a record's fields, flat: Obsidian shows them as properties
+due: 2027-02-03
+people:
+  - name: Sam
+tags:                        # a plain list of names (types are tags: kind lives in .parachute/schemas)
+  - event
+parachute:                   # everything Parachute keeps for itself
+  created_at: 2026-05-12T10:00:00.000Z
+  id: 01HGZ9...
+  links:                     # typed links, as in format 1
+    - relationship: cites
+      target: 01HGZA...
+  path: Contacts/Sam         # the record's own path, always
+  updated_at: 2026-05-12T11:23:45.123Z
+---
+```
+
+- **Reserved names.** Two top-level keys are Parachute's: `tags` and `parachute`. A record field with either name, with any number of `_` in front, is written with one more `_` and read back with one less (`tags` as `_tags`, `_parachute` as `__parachute`), so a field can never be taken for a reserved key. Every other field name, `id`, `path` and `created_at` included, is a plain field.
+- **Layout.** A markdown record with no body and at least one type is written to `<type>/<YYYY-MM>/<name>.md`: its first type (a type named `a/b` is the folder `a/b`), the month of its `created_at`, and the last segment of its path (its id when it has none); a name another file holds gets ` 2`, ` 3`. The real path is `parachute.path`, so the folder is only a place to look and a record comes back at its own path. Every other note keeps the place format 1 gives it. A record's files for sidecar formats (`.csv`…) use the same flat shape in `.parachute/notes-meta/<id>.yaml`.
+- **What format 2 carries that format 1 cannot** (the four things `tools/move/digest.ts` `formatRisks` lists): field names with anything but letters, digits, `_`, `.` or `-` (quoted keys); a list inside a list (`- - a`) and `{}` or `[]` inside a list; U+2028, U+2029, U+0085 and other line or control characters in a string (a double-quoted scalar with `"+B+"uXXXX` escapes, which every YAML 1.1 and 1.2 reader reads the same way); and CRLF bodies (the body is written as it is and read back as it is, byte for byte).
+- **Strings.** Quoted when any YAML 1.1 or 1.2 reader would read them as something else: `yes`, `no`, `on`, `off`, `y`, `n`, `~`, `null`, numbers in any notation, a leading indicator character, `: ` or ` #` inside, a trailing `:`.
+- **Round trip.** v1 to v2 to v1 is the same vault by digest (`contracts/suites/safety/export-v2.test.ts`). "Opens in real Obsidian with its properties searchable" is a manual check, not run in CI.
+
 ## Recipe: nightly git projection
 
 The webhook-driven version of Gitcoin Brain's vault-as-primary / git-as-projection architecture. One trigger, one cron, one git repo.
@@ -194,7 +226,7 @@ Restore: untar somewhere, then `parachute-vault import <untarred-dir> --blow-awa
 - **`exported_at` is the one timestamp that won't be byte-identical across runs.** It lives in `.parachute/vault.yaml`. Callers wanting strict byte-equivalence (tests, fixture diffing) pass `exportedAt` to the `exportVaultToDir` API; the CLI always stamps live. If you're git-projecting and want minimal diff noise, the `vault.yaml` file changing every run is the cost.
 - **Schema drift on import.** `import` without `--blow-away` warns on schema conflicts (export claims `fields.amount.type: number`, vault already has `fields.amount.type: string`). `--blow-away` replays the export's schemas exactly. Choose the verb that matches your intent.
 - **`--since` regenerates schemas every run, even if no tag schema changed.** The filter only narrows the *notes* set; schema sidecars are always written fully. For a git-projection cadence that produces tight diffs, expect schema files to surface in incremental commits even when the underlying schemas are unchanged.
-- **The hand-rolled YAML parser is intentionally narrow.** It handles the subset of YAML the emitter produces plus the legacy Obsidian shapes the importer needs. It does *not* handle anchors, references, multi-document streams, or YAML 1.2 `\u<4hex>`/`\U<8hex>` escapes — none of which the emitter produces. If you hand-edit sidecar `.yaml` files, stay inside that subset.
+- **The hand-rolled YAML parser is intentionally narrow.** It handles the subset of YAML the emitter produces plus the legacy Obsidian shapes the importer needs. It does *not* handle anchors, references or multi-document streams, none of which the emitter produces. (It reads the YAML 1.2 double-quoted escapes, including `\uXXXX` and `\UXXXXXXXX`, which format 2 writes.) If you hand-edit sidecar `.yaml` files, stay inside that subset.
 - **The 1M-note bulk-load ceiling.** `exportVaultToDir` materializes the full vault in memory before iterating. Defensive — the cap is a follow-up at vault#317 F5 if a real >>100k-note workload surfaces.
 
 ## Worked example — Gitcoin Brain
