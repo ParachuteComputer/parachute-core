@@ -28,7 +28,7 @@ export const KIND = { grant: 37440, revoke: 7440, link: 37441, confirm: 37442, v
  * refuses any other. An object field that is `undefined` is left out; anything the spelling can't hold throws.
  */
 export function canonical(x: unknown): string {
-  if (Array.isArray(x)) return `[${x.map((v) => (v === undefined ? bad("an undefined array item") : canonical(v))).join(",")}]`;
+  if (Array.isArray(x)) return `[${Array.from(x, (v) => (v === undefined ? bad("an undefined array item") : canonical(v))).join(",")}]`;
   if (x !== null && typeof x === "object") {
     const keys = Object.keys(x as object).filter((k) => (x as any)[k] !== undefined);
     for (const k of keys) if (!/^[\x20-\x7e]+$/.test(k)) bad(`a key that isn't printable ASCII: ${JSON.stringify(k)}`);
