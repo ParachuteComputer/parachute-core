@@ -178,7 +178,7 @@ describe("mcp/old-params", () => {
       expect(Object.keys(help.parameters.properties)).toEqual(expect.arrayContaining(wanted));
       // If one comes back into the short list, its row of changes-0.9.json is out of date: update both.
       expect(listed[tool]).toBeDefined();
-      expect(wanted.filter((p) => listed[tool]!.includes(p) && p !== "tag")).toEqual([]);
+      expect(wanted.filter((p) => listed[tool]!.includes(p))).toEqual([]);
     }
     // manage-types and attachment-url list each action's parameters under the tool it replaces.
     const acts = async (tool: string, action: string) => Object.keys((await c.call("vault-info", { help: tool })).actions[action].parameters.properties);
@@ -243,7 +243,7 @@ describe("mcp/old-params", () => {
       const flip = { field: "status", from: "todo", to: "done" };
       const moved: any = await c.call(tool, { id, state_transition: flip });
       expect(moved.metadata?.status ?? moved.fields?.status).toBe("done");
-      await expect(c.call(tool, { id, state_transition: flip })).rejects.toThrow(/transition_conflict|transition/i);
+      await expect(c.call(tool, { id, state_transition: flip })).rejects.toThrow(/transition_conflict/);
       const now: any = await c.call("query-notes", { id });
       expect((Array.isArray(now) ? now[0] : now).metadata.status).toBe("done");
     }

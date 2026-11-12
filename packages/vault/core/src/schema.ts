@@ -80,6 +80,18 @@ function fieldTextSql(m: string): string {
 }
 
 /**
+ * The insert trigger of the search index. It starts by clearing any field-text row left for the new id (a leftover can
+ * only come from outside this code), so the new note's own text, or none, is what gets indexed. A DELETE has no
+ * conflict clause for an outer `INSERT OR IGNORE` to override. ensureFtsInsertTrigger brings a vault that has the
+ * earlier form of this trigger to this one.
+ */
+const FTS_INSERT_TRIGGER_SQL = `CREATE TRIGGER IF NOT EXISTS notes_fts_insert AFTER INSERT ON notes BEGIN
+  DELETE FROM notes_field_text WHERE note_id = new.id;
+  INSERT INTO notes_field_text(note_id, text) SELECT new.id, t FROM (SELECT ${fieldTextSql("new.metadata")} AS t) WHERE t <> '';
+  INSERT INTO notes_fts(rowid, path, content, fields) VALUES (new.rowid, COALESCE(new.path, ''), new.content, COALESCE((SELECT text FROM notes_field_text WHERE note_id = new.id), ''));
+END;`;
+
+/**
  * The search index over path, content and field values, as DDL. Column order matters: bm25(notes_fts, w0, w1, w2) in
  * core/src/notes.ts is positional (path, content, fields; weights in search-query.ts).
  *
@@ -117,10 +129,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
   tokenize='porter unicode61'
 );
 
-CREATE TRIGGER IF NOT EXISTS notes_fts_insert AFTER INSERT ON notes BEGIN
-  INSERT OR REPLACE INTO notes_field_text(note_id, text) SELECT new.id, t FROM (SELECT ${fieldTextSql("new.metadata")} AS t) WHERE t <> '';
-  INSERT INTO notes_fts(rowid, path, content, fields) VALUES (new.rowid, COALESCE(new.path, ''), new.content, COALESCE((SELECT text FROM notes_field_text WHERE note_id = new.id), ''));
-END;
+${FTS_INSERT_TRIGGER_SQL}
 
 CREATE TRIGGER IF NOT EXISTS notes_fts_delete AFTER DELETE ON notes BEGIN
   INSERT INTO notes_fts(notes_fts, rowid, path, content, fields) VALUES('delete', old.rowid, COALESCE(old.path, ''), old.content, COALESCE((SELECT text FROM notes_field_text WHERE note_id = old.id), ''));
@@ -538,7 +547,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
   applied_at TEXT NOT NULL
 );
 
--- Full-text search on a note's path (title), content (body) AND field values (0.9.2). See NOTES_FTS_SQL above this
+-- Full-text search on a note's path (title), content (body) AND field values (0.9.3). See NOTES_FTS_SQL above this
 -- string: the three columns, the view that feeds them and the three sync triggers are one piece of DDL, shared
 -- with ensureFtsFields (the step that brings an older vault to this shape without a schema number).
 ${NOTES_FTS_SQL}
@@ -741,7 +750,8 @@ export function unnumberedStepsDone(db: Database): boolean {
     hasIndex(db, "idx_notes_path_nocase") && // ensurePathNocaseIndex (T-412)
     hasColumn(db, "tags", "kind") && // ensureTagKinds (T-318 §8a, 0.9)
     (!hasTable(db, "note_versions") || hasColumn(db, "note_versions", "via_kind")) && // ensureRevisionKeyKind (0.9.1)
-    (!hasTable(db, "notes") || hasColumn(db, "notes_fts", "fields")) // ensureFtsFields (0.9.2)
+    (!hasTable(db, "notes") || hasColumn(db, "notes_fts", "fields")) && // ensureFtsFields (0.9.3)
+    (!hasTable(db, "notes") || ftsInsertTriggerIsCurrent(db)) // ensureFtsInsertTrigger (0.9.3)
   );
 }
 
@@ -767,6 +777,7 @@ export function initSchema(db: Database): void {
       ensurePathNocaseIndex(db);
       ensureRevisionKeyKind(db);
       ensureFtsFields(db);
+      ensureFtsInsertTrigger(db);
     }
     rebuildIndexes(db);
     return;
@@ -921,8 +932,10 @@ export function initSchema(db: Database): void {
   ensurePathNocaseIndex(db);
   // The write stamp: each revision says what kind of key wrote it (0.9.1).
   ensureRevisionKeyKind(db);
-  // Field values in the search index (0.9.2): a third notes_fts column, rebuilt once.
+  // Field values in the search index (0.9.3): a third notes_fts column, rebuilt once.
   ensureFtsFields(db);
+  // The insert trigger clears a leftover field-text row first (0.9.3).
+  ensureFtsInsertTrigger(db);
 
   // Rebuild any generated columns + indexes declared in indexed_fields.
   // No-op for a fresh vault; idempotent on existing vaults.
@@ -936,7 +949,7 @@ export function initSchema(db: Database): void {
 }
 
 /**
- * Field values in search (0.9.2): bring notes_fts to the three-column shape of NOTES_FTS_SQL and index every note's
+ * Field values in search (0.9.3): bring notes_fts to the three-column shape of NOTES_FTS_SQL and index every note's
  * field text, once. Deliberately NOT a SCHEMA_VERSION bump, like ensurePathNocaseIndex: an older engine of this
  * schema number still opens the vault, reads its search index (its bm25 call names two weights; the third column
  * gets the default 1.0, so it ranks a field hit like a body hit until that engine is updated) and edits it through
@@ -959,6 +972,27 @@ function ensureFtsFields(db: Database): void {
     db.exec(NOTES_FTS_SQL);
     db.exec(`INSERT OR REPLACE INTO notes_field_text(note_id, text) SELECT id, t FROM (SELECT id, ${fieldTextSql("metadata")} AS t FROM notes) WHERE t <> ''`);
     db.exec("INSERT INTO notes_fts(notes_fts) VALUES('rebuild')");
+  });
+}
+
+function ftsInsertTriggerIsCurrent(db: Database): boolean {
+  const row = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'notes_fts_insert'").get() as
+    | { sql: string }
+    | undefined;
+  return !!row && row.sql.includes("DELETE FROM notes_field_text WHERE note_id = new.id");
+}
+
+/**
+ * Give a vault that has the earlier insert trigger (which left a stale field-text row in place for a record with no
+ * field values) the current one. Unnumbered like ensureFtsFields, with its check in unnumberedStepsDone. Only the
+ * trigger changes: it writes no data and the index stays as it is.
+ */
+function ensureFtsInsertTrigger(db: Database): void {
+  if (!hasTable(db, "notes") || !hasColumn(db, "notes_fts", "fields")) return;
+  if (ftsInsertTriggerIsCurrent(db)) return;
+  transaction(db, () => {
+    db.exec("DROP TRIGGER IF EXISTS notes_fts_insert");
+    db.exec(FTS_INSERT_TRIGGER_SQL);
   });
 }
 

@@ -822,3 +822,15 @@ test("export scalars: a bare [x] or {y} key is read as written even when the res
     expect(parseExportFrontmatter(`id: ${id}\nmetadata:\n  {y}: plain\n  z: 1\n`, reading).metadata).toEqual({ "{y}": "plain", z: 1 });
   }
 });
+
+// A bare `[x]` key must not turn off the check on the rest of the block: a plain multi-line scalar whose continuation
+// line starts `- [[` is still the text plain YAML reads (review of #92, round 2).
+test("export scalars: a bare [x] key leaves the other lines checked against plain YAML", async () => {
+  const { parseExportFrontmatter } = await import("./history-import.ts");
+  const id = "01M66HE43WKN0Z7EZ0766D7S6N";
+  for (const reading of ["export", "old-export"] as const) {
+    const read = parseExportFrontmatter(`id: ${id}\n[x]: v\nnote: line one\n  - [[Y]]\n`, reading);
+    expect(read["[x]"]).toBe("v");
+    expect(read.note).toBe("line one - [[Y]]");
+  }
+});
