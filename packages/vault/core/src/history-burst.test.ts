@@ -10,7 +10,7 @@ let db: Database, store: BunSqliteStore;
 beforeEach(() => { db = new Database(":memory:"); store = new BunSqliteStore(db); });
 afterEach(() => db.close());
 
-const ann = { actor: "ann", via: "key-a" };
+const ann = { actor: "ann", via: "key:a" };
 const count = (id: string) => (db.prepare("SELECT COUNT(*) AS n FROM note_versions WHERE note_id = ?").get(id) as { n: number }).n;
 const ageNewest = (id: string, ms: number) =>
   db.prepare("UPDATE note_versions SET superseded_at = ? WHERE note_id = ? AND version_ix = (SELECT MAX(version_ix) FROM note_versions WHERE note_id = ?)")
@@ -42,8 +42,8 @@ test("another writer, another key, or no actor at all starts a new version", asy
   const n = await store.createNote("v0", ann);
   await store.updateNote(n.id, { content: "v1", ...ann });
   await store.updateNote(n.id, { content: "v2", ...ann }); // collapsed into v0's row
-  await store.updateNote(n.id, { content: "v3", actor: "bob", via: "key-a" });
-  await store.updateNote(n.id, { content: "v4", actor: "ann", via: "key-b" });
+  await store.updateNote(n.id, { content: "v3", actor: "bob", via: "key:a" });
+  await store.updateNote(n.id, { content: "v4", actor: "ann", via: "key:b" });
   await store.updateNote(n.id, { content: "v5" }); // no actor: an API writer, never collapsed
   await store.updateNote(n.id, { content: "v6" });
   const bodies = await Promise.all((await store.listNoteVersions(n.id)).reverse().map(async (v) => (await store.getNoteVersion(n.id, v.version_ix))!.content));
@@ -86,4 +86,47 @@ test("an oversized body still fails the write inside a burst", async () => {
   await store.updateNote(n.id, { content: big, ...ann });
   await expect(store.updateNote(n.id, { content: "small again", ...ann })).rejects.toMatchObject({ code: "HISTORY_OVERFLOW" });
   expect((await store.getNote(n.id))!.content).toBe(big);
+});
+
+test("only a via that names one credential makes a burst: a channel, the operator or a legacy token never does", async () => {
+  for (const via of ["api", "mcp", "operator", "token:abc123"]) {
+    const n = await store.createNote("v0");
+    for (let i = 1; i <= 3; i++) await store.updateNote(n.id, { content: `v${i}`, actor: "hub-user", via });
+    expect(count(n.id)).toBe(3);
+  }
+  const n = await store.createNote("v0");
+  for (let i = 1; i <= 3; i++) await store.updateNote(n.id, { content: `v${i}`, actor: "nostr:ab12", via: "nostr:ab12" });
+  expect(count(n.id)).toBe(1);
+});
+
+test("after a cascade-rename row, an extension change, an imported-only history, or a delete and re-create, the next edit captures", async () => {
+  // A cascade-rename capture: renaming B rewrites A's [[B]] link.
+  const b = await store.createNote("target", { path: "B" });
+  const a = await store.createNote("see [[B]]", { path: "A", ...ann });
+  await store.updateNote(a.id, { content: "see [[B]] again", ...ann });
+  await store.updateNote(b.id, { path: "C", ...ann });
+  const ops = () => (db.prepare("SELECT op FROM note_versions WHERE note_id = ? ORDER BY version_ix").all(a.id) as { op: string }[]).map((r) => r.op);
+  expect(ops().at(-1)).toBe("cascade-rename");
+  const before = count(a.id);
+  await store.updateNote(a.id, { content: "see [[C]] now", ...ann });
+  expect(count(a.id)).toBe(before + 1);
+  // An extension-only change.
+  const e = await store.createNote("x0", ann);
+  await store.updateNote(e.id, { content: "x1", ...ann });
+  await store.updateNote(e.id, { extension: "txt", ...ann });
+  expect(count(e.id)).toBe(2);
+  // A note whose only rows are imported (actor NULL, negative index): the first named edit captures.
+  const i = await store.createNote("i0");
+  db.prepare(`INSERT INTO note_blobs (hash, content, byte_size) VALUES ('${"0".repeat(64)}', 'old', 3)`).run();
+  db.prepare(`INSERT INTO note_versions (note_id, version_ix, content_hash, path, metadata, extension, superseded_at, actor, via, op, content_len, encoding, created_at)
+    VALUES (?, -1, '${"0".repeat(64)}', NULL, '{}', 'md', ?, NULL, 'git-import', 'import', 3, NULL, NULL)`).run(i.id, new Date().toISOString());
+  await store.updateNote(i.id, { content: "i1", ...ann });
+  expect(count(i.id)).toBe(2);
+  // Delete, then re-create with the same id: the newest row is the tombstone.
+  const d = await store.createNote("d0", { id: "same-id", ...ann });
+  await store.updateNote(d.id, { content: "d1", ...ann });
+  await store.deleteNote(d.id, ann);
+  await store.createNote("d2", { id: "same-id", ...ann });
+  await store.updateNote("same-id", { content: "d3", ...ann });
+  expect(count("same-id")).toBe(3);
 });

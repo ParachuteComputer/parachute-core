@@ -77,7 +77,9 @@ export function resolveHistoryPolicy(
   if (p.max_bytes_per_note !== null) p.max_bytes_per_note = Math.max(65_536, p.max_bytes_per_note);
   p.compact_budget_ms = Math.min(60_000, Math.max(0, p.compact_budget_ms));
   p.compact_max_notes = Math.min(10_000, Math.max(0, p.compact_max_notes));
-  p.burst_window_seconds = Number.isFinite(p.burst_window_seconds) ? Math.min(86_400, Math.max(0, p.burst_window_seconds)) : DEFAULT_HISTORY_POLICY.burst_window_seconds;
+  // An untyped caller may pass a string or null: "0" and null turn it off; anything unreadable keeps the default.
+  const burst = p.burst_window_seconds === null ? 0 : Number(p.burst_window_seconds);
+  p.burst_window_seconds = Number.isFinite(burst) ? Math.floor(Math.min(86_400, Math.max(0, burst))) : DEFAULT_HISTORY_POLICY.burst_window_seconds;
   return p;
 }
 export const VERSION_MAX_BYTES = 2_000_000;
@@ -260,9 +262,17 @@ export function captureVersion(
 }
 const BURST_OPS: ReadonlySet<string> = new Set(["update", "append", "prepend"]);
 /**
+ * Whether a write stamp's `via` names one credential (write-stamp.ts): a named key (`key:<name>`) or a Nostr key
+ * (`nostr:<pubkey>`). Other vias are a channel (`api`, `mcp`) or a class (`operator`, a legacy `token:<hash>`) that
+ * several writers can share under one actor, so they never make a burst.
+ */
+function namesOneCredential(via: string | null): boolean {
+  return via !== null && (via.startsWith("key:") || via.startsWith("nostr:"));
+}
+/**
  * Whether this capture is part of a burst and writes nothing (T-460). All must hold: a window is set; this write and
  * the note's newest version are both an update, append or prepend; both by the same non-null actor through the same
- * via; this write keeps the path and extension, which the newest version also had; and the newest version was
+ * via, and that via names one credential (a named key or a Nostr key); this write keeps the path and extension, which the newest version also had; and the newest version was
  * captured no more than the window ago, and not in the future (a row from a clock ahead, a grafted box's say, never
  * starts a skip run). The newest row holds the body from before the burst, so a read "as of" a time inside the burst
  * is late by at most one burst.
@@ -274,7 +284,7 @@ function inBurst(
   now: number,
 ): boolean {
   const window = opts.policy.burst_window_seconds * 1000;
-  if (!(window > 0) || opts.actor === null || !BURST_OPS.has(opts.op)) return false;
+  if (!(window > 0) || opts.actor === null || !BURST_OPS.has(opts.op) || !namesOneCredential(opts.via)) return false;
   if (opts.next?.path !== undefined && opts.next.path !== prior.path) return false;
   if (opts.next?.extension !== undefined && opts.next.extension !== prior.extension) return false;
   const newest = db.prepare(
