@@ -507,20 +507,20 @@ export function buildExpandVisibility(
   rawRoots: string[] | null,
 ): ((note: Note) => boolean) | undefined {
   if (rawRoots === null) return undefined;
-  return withTagRule((note: Note) => noteWithinTagScope(note, allowed, rawRoots), () => ({ allowed, rawRoots }));
+  return tagScopeVisibility(() => ({ allowed, rawRoots }));
 }
 
 /**
- * Attach `NoteVisible.byTag` to a `noteWithinTagScope` predicate: what one tag does to a note under the scope
- * `scope()` returns now (read at each call, for a predicate whose allowlist is filled in later). It is the same rule
- * `noteWithinTagScope` applies tag by tag (admit: `tagVisibleInScope`; deny: `tagDeniedByPrivateTags`), so core can
- * run the predicate as SQL over note_tags (the scoped keyword arm).
+ * The tag-scope visibility predicate and its per-tag rule, built together from ONE scope source, so they cannot
+ * disagree: the function is `noteWithinTagScope` under the scope `scope()` returns now (read at each call, for a
+ * scope filled in later), and `byTag` says what a single tag does under that same scope (admit: `tagVisibleInScope`;
+ * deny: `tagDeniedByPrivateTags`). Core runs the rule as SQL over note_tags (the scoped keyword arm).
  */
-export function withTagRule(
-  fn: (note: Note) => boolean,
-  scope: () => { allowed: Set<string> | null; rawRoots: string[] | null },
-): NoteVisible {
-  const visible = fn as NoteVisible;
+export function tagScopeVisibility(scope: () => { allowed: Set<string> | null; rawRoots: string[] | null }): NoteVisible {
+  const visible = ((note: Note) => {
+    const { allowed, rawRoots } = scope();
+    return noteWithinTagScope(note, allowed, rawRoots);
+  }) as NoteVisible;
   visible.byTag = (tag: string) => {
     const { allowed, rawRoots } = scope();
     return { admits: tagVisibleInScope(tag, allowed, rawRoots), denies: tagDeniedByPrivateTags(tag, allowed) };
