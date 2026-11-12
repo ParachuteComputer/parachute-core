@@ -1201,8 +1201,8 @@ Query params:
     note that merely references it once in passing body text. This is the
     fix for a repeatedly-observed harness finding: a clearly-on-topic
     dedicated note buried at position #3–4 behind incidental mentions.
-  - **Field values are searched too (0.9.2).** `search=` also matches the text
-    of a note's metadata values (strings as they are, numbers and booleans as
+  - **Field values are searched too (0.9.3).** `search=` also matches the text
+    of a note's metadata values (strings as they are, booleans as the words true/false, numbers as
     text, lists and nested objects by their leaves; field names and nulls are
     left out). They sit in a third indexed column, `fields`, below the body:
     a note found only through a field value comes after every note found in

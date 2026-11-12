@@ -70,13 +70,13 @@ function ensureTagKinds(db: Database): void {
 const UNPARSEABLE_UPDATED_AT_MS = 0;
 
 /**
- * The text of a note's field values, for the search index (0.9.2): every leaf of the metadata JSON, joined with
- * spaces. Strings as they are, numbers and booleans as their text, a list or nested object by its leaves; null and the
+ * The text of a note's field values, for the search index (0.9.3): every leaf of the metadata JSON, joined with
+ * spaces. Strings as they are, numbers as their text, booleans as `true`/`false` (json_tree's value for them is 1/0), a list or nested object by its leaves; null and the
  * field NAMES are left out. `m` is the SQL expression holding the metadata (`new.metadata`, `old.metadata`, or the
  * column). Malformed JSON gives '' rather than an error, so a bad value can't make a write fail.
  */
 function fieldTextSql(m: string): string {
-  return `COALESCE(CASE WHEN json_valid(${m}) THEN (SELECT group_concat(value, ' ') FROM json_tree(${m}) WHERE type NOT IN ('object', 'array')) END, '')`;
+  return `COALESCE(CASE WHEN json_valid(${m}) THEN (SELECT group_concat(CASE type WHEN 'true' THEN 'true' WHEN 'false' THEN 'false' ELSE value END, ' ') FROM json_tree(${m}) WHERE type NOT IN ('object', 'array')) END, '')`;
 }
 
 /**
@@ -118,7 +118,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
 );
 
 CREATE TRIGGER IF NOT EXISTS notes_fts_insert AFTER INSERT ON notes BEGIN
-  INSERT INTO notes_field_text(note_id, text) SELECT new.id, t FROM (SELECT ${fieldTextSql("new.metadata")} AS t) WHERE t <> '';
+  INSERT OR REPLACE INTO notes_field_text(note_id, text) SELECT new.id, t FROM (SELECT ${fieldTextSql("new.metadata")} AS t) WHERE t <> '';
   INSERT INTO notes_fts(rowid, path, content, fields) VALUES (new.rowid, COALESCE(new.path, ''), new.content, COALESCE((SELECT text FROM notes_field_text WHERE note_id = new.id), ''));
 END;
 
@@ -131,7 +131,7 @@ CREATE TRIGGER IF NOT EXISTS notes_fts_update AFTER UPDATE OF content, path, met
 WHEN old.content IS NOT new.content OR old.path IS NOT new.path OR old.metadata IS NOT new.metadata BEGIN
   INSERT INTO notes_fts(notes_fts, rowid, path, content, fields) VALUES('delete', old.rowid, COALESCE(old.path, ''), old.content, COALESCE((SELECT text FROM notes_field_text WHERE note_id = old.id), ''));
   DELETE FROM notes_field_text WHERE note_id = old.id;
-  INSERT INTO notes_field_text(note_id, text) SELECT new.id, t FROM (SELECT ${fieldTextSql("new.metadata")} AS t) WHERE t <> '';
+  INSERT OR REPLACE INTO notes_field_text(note_id, text) SELECT new.id, t FROM (SELECT ${fieldTextSql("new.metadata")} AS t) WHERE t <> '';
   INSERT INTO notes_fts(rowid, path, content, fields) VALUES (new.rowid, COALESCE(new.path, ''), new.content, COALESCE((SELECT text FROM notes_field_text WHERE note_id = new.id), ''));
 END;
 `;
@@ -957,7 +957,7 @@ function ensureFtsFields(db: Database): void {
     db.exec("DROP VIEW IF EXISTS notes_fts_source");
     db.exec("DROP TABLE IF EXISTS notes_field_text");
     db.exec(NOTES_FTS_SQL);
-    db.exec(`INSERT INTO notes_field_text(note_id, text) SELECT id, t FROM (SELECT id, ${fieldTextSql("metadata")} AS t FROM notes) WHERE t <> ''`);
+    db.exec(`INSERT OR REPLACE INTO notes_field_text(note_id, text) SELECT id, t FROM (SELECT id, ${fieldTextSql("metadata")} AS t FROM notes) WHERE t <> ''`);
     db.exec("INSERT INTO notes_fts(notes_fts) VALUES('rebuild')");
   });
 }

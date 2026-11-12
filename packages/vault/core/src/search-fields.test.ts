@@ -51,7 +51,18 @@ describe("notes_fts field values", () => {
     expect(ids(db, "quokkathree")).toEqual(["b"]);
     expect(ids(db, "48172")).toEqual(["b"]);
     expect(ids(db, "deep")).toEqual([]); // names aren't searched, values are
-    db.exec("INSERT INTO notes_fts(notes_fts) VALUES('integrity-check')");
+    db.exec("INSERT INTO notes_fts(notes_fts, rank) VALUES('integrity-check', 1)");
+  });
+
+  it("a boolean field is indexed as the word true or false, not 1 or 0", () => {
+    const db = vaultAsLeftBy092();
+    initSchema(db);
+    noteOps.createNote(db, "plain", { id: "t", path: "r/t", metadata: { done: true } });
+    noteOps.createNote(db, "plain", { id: "f", path: "r/f", metadata: { done: false } });
+    expect(ids(db, "true")).toEqual(["t"]);
+    expect(ids(db, "false")).toEqual(["f"]);
+    expect(ids(db, "1")).toEqual([]);
+    expect(ids(db, "0")).toEqual([]);
   });
 
   it("a metadata-only edit re-indexes at once; the old word stops matching; delete leaves nothing", () => {
@@ -62,11 +73,11 @@ describe("notes_fts field values", () => {
     noteOps.updateNote(db, "a", { metadata: { stage: "lemurnew" } });
     expect(ids(db, "lemurnew")).toEqual(["a"]);
     expect(ids(db, "tapirold")).toEqual([]);
-    db.exec("INSERT INTO notes_fts(notes_fts) VALUES('integrity-check')");
+    db.exec("INSERT INTO notes_fts(notes_fts, rank) VALUES('integrity-check', 1)");
     noteOps.deleteNote(db, "a");
     expect(ids(db, "lemurnew")).toEqual([]);
     expect(db.prepare("SELECT count(*) c FROM notes_field_text").get()).toEqual({ c: 0 });
-    db.exec("INSERT INTO notes_fts(notes_fts) VALUES('integrity-check')");
+    db.exec("INSERT INTO notes_fts(notes_fts, rank) VALUES('integrity-check', 1)");
   });
 
   it("'rebuild' and 'integrity-check' work, so the index can always be rebuilt from the notes", () => {
@@ -74,7 +85,7 @@ describe("notes_fts field values", () => {
     initSchema(db);
     noteOps.createNote(db, "plain", { id: "a", metadata: { stage: "gnuone" } });
     db.exec("INSERT INTO notes_fts(notes_fts) VALUES('rebuild')");
-    db.exec("INSERT INTO notes_fts(notes_fts) VALUES('integrity-check')");
+    db.exec("INSERT INTO notes_fts(notes_fts, rank) VALUES('integrity-check', 1)");
     expect(ids(db, "gnuone")).toEqual(["a"]);
   });
 

@@ -253,7 +253,7 @@ describe("v5 and v18 against each state of the path indexes", () => {
 });
 
 /** sha256 of SCHEMA_SQL as of SCHEMA_VERSION 32 with T-412 (idx_notes_path left out of it) and 0.9's `kind` on tags, 0.9.1's `via_kind` on revisions, 0.9.2's field values in search (notes_fts_source, notes_field_text, three-column notes_fts). */
-const SCHEMA_SQL_HASH_AT_32 = "e98f20522b9f2ca3887657289e8b75130949c31265805bf99496b4665e63a24e";
+const SCHEMA_SQL_HASH_AT_32 = "0efa51337a1154b81f839494da1ee7b1ca4449cc7e0d320e49ca216f68181539";
 
 /** sha256 of initSchema's code and its fast-path check (comments and spacing left out) as of SCHEMA_VERSION 32 with T-412, 0.9's ensureTagKinds 0.9.1's ensureRevisionKeyKind and 0.9.2's ensureFtsFields, and T-460's open-as-is of a newer readable schema. */
 const INIT_SCHEMA_HASH_AT_32 = "b56b203af8c45b490ddb1ef001ba84f2b3ffa19eec62dd48242330c860cd0099";
