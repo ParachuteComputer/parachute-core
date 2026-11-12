@@ -64,8 +64,8 @@ describe("the refresh nudge and the read sentence", () => {
 
   test("a reply with a top-level `content` key also goes out as structuredContent, the nudge inside; no other does", async () => {
     const c = await mcp("write");
+    const path = `${runId("nudge")}/three`;
     try {
-      const path = `${runId("nudge")}/three`;
       const calls: [string, Record<string, unknown>][] = [
         ["create-note", { path, content: "Hollow Oak Farm: 12 crates for client-7.", tags: ["nudge-sc"] }],
         ["query-notes", { id: path, include_content: true }],
@@ -96,8 +96,8 @@ describe("the refresh nudge and the read sentence", () => {
       expect(carried).toBeGreaterThanOrEqual(1);
       const byId = await blocks(c, "query-notes", { id: path, include_content: true });
       expect(byId.structured?.content).toBe("Hollow Oak Farm: 12 crates for client-7.\nPaid.");
-      await blocks(c, "delete-note", { id: path });
     } finally {
+      await blocks(c, "delete-note", { id: path }).catch(() => {});
       await c.close();
     }
   });

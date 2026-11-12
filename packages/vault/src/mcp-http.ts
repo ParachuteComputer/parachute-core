@@ -173,8 +173,10 @@ export async function handleMcp(
     hasScopeForVault(auth.scopes, vaultName, requiredVerbForTool(t)),
   );
 
-  // The caller's level here: two tools reach further at a higher one (mcp-annotations.ts BY_LEVEL).
-  const level = hasScopeForVault(auth.scopes, vaultName, "admin") ? "admin" : hasScopeForVault(auth.scopes, vaultName, "write") ? "write" : "read";
+  // The caller's level here: two tools reach further at a higher one (mcp-annotations.ts BY_LEVEL). A tag-scoped admin
+  // can't set the vault-wide description, so for the hints it counts as a writer.
+  const tagScoped = (auth.scoped_tags?.length ?? 0) > 0;
+  const level = hasScopeForVault(auth.scopes, vaultName, "admin") && !tagScoped ? "admin" : hasScopeForVault(auth.scopes, vaultName, "write") ? "write" : "read";
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: visibleTools.map((t) => ({
       name: t.name,

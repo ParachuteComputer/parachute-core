@@ -110,8 +110,9 @@ describe("files", () => {
         fp("files/read-attachment.text", shape(window));
         expect(String(window.content)).toStartWith("line one");
         // A text window's JSON has a top-level `content` key, which ChatGPT reads as `{}`: it also goes out as
-        // structuredContent, the same object (T-456, suites/door/nudge.test.ts). The image reply above doesn't: a
-        // client that prefers structuredContent would drop the picture.
+        // structuredContent, the same object (T-456, suites/door/nudge.test.ts). The image reply above carries none (a
+        // client that prefers structuredContent would drop the picture); its row has no `content` key today, so this
+        // checks the reply, not mcp-result.ts's image guard.
         const raw: any = await c.client.callTool({ name: "read-attachment", arguments: { attachment_id: tatt.body.id, content_offset: 0, content_length: 64 } });
         expect(raw.structuredContent).toEqual(JSON.parse(raw.content[0].text));
         expect(seen.structuredContent).toBeUndefined();

@@ -1,3 +1,4 @@
+import type { ResultDeprecation } from "./mcp-result.js";
 import { getImportedVersion, parseHistorySelector, projectHistoryRow } from "./history-import.js";
 import { Database } from "bun:sqlite";
 import type { Store, Note, QueryOpts, Attachment } from "./types.js";
@@ -124,7 +125,7 @@ export interface McpToolDef {
    */
   resultContent?: (result: unknown) => McpContentBlock[];
   /** A deprecated note tool's refresh nudge, for `structuredContent` (mcp-result.ts, mcp-records.ts). */
-  deprecation?: { tool: string; use: string; removed_in: string; notice: string };
+  deprecation?: ResultDeprecation;
 }
 
 /**

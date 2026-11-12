@@ -283,12 +283,15 @@ export function schemaSourceCandidates(
 }
 
 // The tools' annotations come with this list, from the covered vault where the key's level is highest, so a key that
-// is admin anywhere sees vault-info as a change (the safe side). If that vault's list fails and a lower one answers,
-// the hints are that vault's: vault-info would read as read-only while an admin call on the other vault still works.
+// is admin anywhere sees vault-info as a change (the safe side). If that vault's list fails and a vault where the key
+// holds less answers, its hints would say read-only for a tool the key can still change on the other vault, so they
+// are dropped: with no hints a client treats every tool as a change.
 async function listVaultToolsUncached(ctx: AccountToolContext): Promise<readonly ListedMcpTool[]> {
   const coverage = resolveCoverage(ctx.db, ctx.principal, installedVaults(ctx));
   if (coverage.vaults.length === 0) return [];
-  for (const vault of schemaSourceCandidates(ctx, coverage.vaults)) {
+  const candidates = schemaSourceCandidates(ctx, coverage.vaults);
+  const topRank = COMPOSED_VERB_RANK[verbForVault(ctx, candidates[0]!.name)];
+  for (const vault of candidates) {
     try {
       const result = await postVaultMcp(ctx, vault, verbForVault(ctx, vault.name), "tools/list");
       const tools =
@@ -302,7 +305,7 @@ async function listVaultToolsUncached(ctx: AccountToolContext): Promise<readonly
             !!t && typeof t === "object" && typeof (t as { name?: unknown }).name === "string",
         )
         .filter((t) => !HUB_NATIVE_TOOL_NAMES.has(t.name))
-        .map(injectVaultSelector);
+        .map((t) => injectVaultSelector(COMPOSED_VERB_RANK[verbForVault(ctx, vault.name)] < topRank ? { ...t, annotations: undefined } : t));
     } catch {
       // Try the next covered vault (highest-verb first). Empty catch continues.
     }
