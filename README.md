@@ -35,7 +35,7 @@ say what that program must do, written so they ran against **today's** code firs
 ## Install
 
 **npm** (needs Bun 1.4+): `npm i -g @openparachute/core` or `bun add -g @openparachute/core` gives the stable
-release (0.8.0 and later); `@next` gives the newest prerelease. **The bundle** (its own Bun, nothing else needed): download
+release (0.8.0 and later); `@next` gives the newest prerelease, which may be older than the stable release. **The bundle** (its own Bun, nothing else needed): download
 `parachute-core-<version>-<platform>.tar.gz` and `SHA256SUMS` from a
 [release](https://github.com/ParachuteComputer/parachute-core/releases), check, unpack, and run
 `bin/parachute install` (it links `parachute` and `parachute-core` into `~/.local/share/parachute-core/bin`).

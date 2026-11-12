@@ -76,7 +76,7 @@ of serve, run from this install, never from `PATH`) and stops it with itself.
 
   ```json
   {"ready": true, "pid": 4242, "listen": "127.0.0.1:5100", "vault_listen": "127.0.0.1:5101",
-   "issuer": "http://127.0.0.1:5100", "version": "0.8.0-pre.2", "started_at": "2026-11-05T09:00:00.000Z"}
+   "issuer": "http://127.0.0.1:5100", "version": "0.8.0", "started_at": "2026-11-05T09:00:00.000Z"}
   ```
 - While it holds the home, a second serve, `parachute-vault serve`, and the install, upgrade, expose, migrate and
   module commands exit 2 with `managed_by_host`; the matching HTTP routes answer 409
@@ -150,6 +150,8 @@ Read against Prism main `55ac3df`, and run on Linux in a private network namespa
 
 ## What else is in this build, and what comes next
 
+- **Since 0.8.0-pre.2:** see [CHANGELOG.md](../CHANGELOG.md) (semantic search ships in the bundle, safety fixes,
+  `parachute probe`).
 - **Since 0.8.0-pre.1:** wikilinks longer than 48 bytes resolve on Durable Objects (#23); import resolves wikilinks
   once from a title index and commits in chunks (#25); tag queries over 100+ child tags, `path_prefix` and
   `rename-tag` stay under Durable Object SQLite's caps (#27, #28); a rename's cascade writes reach live subscribers

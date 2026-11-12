@@ -3,7 +3,7 @@
 Two ways out, both built by CI from the same commit:
 
 - **npm:** `@openparachute/core`, commands `parachute` and `parachute-core`. For a person with Bun:
-  `npm i -g @openparachute/core` or `bun add -g @openparachute/core` (`@next` for the newest prerelease). Built by `release/npm.ts`.
+  `npm i -g @openparachute/core` or `bun add -g @openparachute/core` (`@next` for the newest prerelease, which may be older than the stable release). Built by `release/npm.ts`.
 - **The bundle:** `parachute-core-<version>-<platform>.tar.gz` plus `SHA256SUMS`, with its own pinned Bun. What Prism
   ships. Built by `release/bundle.ts`, attached to a GitHub release.
 
@@ -59,7 +59,7 @@ JSON
 4. `publish-next` (a prerelease) or `publish-latest` (a stable, after approval) runs
    `npm publish package.tgz --tag <next|latest> --access public --provenance`. No token: npm trusted publishing
    (OIDC). Provenance is added because the repository is public.
-5. `tag-record` tags `v<version>` (kept if the GitHub pre-release already made it).
+5. `tag-record` tags `v<version>` (kept if the GitHub release already made it).
 
 To cut a prerelease: a PR that bumps `version` in `package.json`, `packages/cli/package.json`,
 `packages/hub/package.json` and `packages/vault/package.json` (and those lines in `bun.lock`) to the next `0.8.x-pre.N`,
@@ -138,7 +138,7 @@ From then on, the next `0.8.x-pre.N` merged to `release/0.8` publishes itself to
 - `plan` refused "older than next": two prerelease PRs merged out of order. Bump past the published one, merge again.
 - `plan` skipped "never had this package": the one-time setup hasn't been done.
 
-## The GitHub pre-release (the bundle)
+## The GitHub release (the bundle)
 
 The tarballs come from CI, never from a laptop: `bundle-macos` keeps the signed darwin-arm64 tarball and its
 `SHA256SUMS`; the contracts job `npm` keeps the linux-x64 tarball, its `SHA256SUMS` and the npm `.tgz` (14 days).
@@ -153,4 +153,6 @@ gh release create v<version> --prerelease --target <release/0.8 commit> --title 
   dist/openparachute-core-<version>.tgz dist/npm-SHA256SUMS
 ```
 
-A GitHub pre-release is not an npm publish and sends nothing to anyone.
+For a stable (`X.Y.Z`), drop `--prerelease`, and take the npm file from the release run's `npm-package` artifact
+(`package.tgz`, the bytes it published) rather than the contracts job's. A GitHub release is not an npm publish and
+sends nothing to anyone.
