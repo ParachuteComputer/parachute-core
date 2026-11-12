@@ -1756,11 +1756,12 @@ counts compressed bytes.
 `compact_enabled: false` also disables byte-ceiling enforcement.
 
 Since schema 33 every body is stored compressed (`deflate`) when that is
-smaller, and compaction is always on: a note is a candidate when it has at least
-`compact_min_versions` versions whose bodies add up to more than
-`compact_ratio` times its live body (logical sizes, not stored ones), or when it
-holds blobs stored the old way (text, or a base64 `fossil-delta`). A pass
-re-stores those compressed (`blobs_compressed` in the summary) and stores the
+smaller, and compaction is always on: a note with at least
+`compact_min_versions` versions is a candidate, and so is one holding blobs
+stored the old way (text, or a base64 `fossil-delta`). A pass compacts a note
+whose version bodies add up to more than `compact_ratio` times its live body
+(logical sizes, not stored ones), or that holds old blobs: it re-stores those
+compressed (`blobs_compressed` in the summary) and stores the
 rest of each run of `compact_run_length` as a compressed delta
 (`fossil-delta-z`, `blobs_deltified`) against the run's first body when that is
 smaller. A completed pass marks the note refused until its next write. Schema 33
@@ -1768,8 +1769,7 @@ rebuilds the hints once and clears every refusal, so the boot pass works
 through an existing vault a few notes at a time.
 Compaction runs synchronously at first vault open, with budgets checked between
 notes: one note can overshoot the time budget. Zero boot budget skips the pass.
-Schema 32 backfills per-note scheduling hints once (33 again, with `logical` and
-`legacy`). Later opens select hints by stored size without aggregating all
+Schema 32 backfills per-note scheduling hints once (33 again, adding `legacy`). Later opens select hints by stored size without aggregating all
 history. An attempt marks a note refused; new capture, pruning or import re-arms
 it. Notes with zero live bytes are excluded
 from ratio-based selection, but remain eligible when over the byte ceiling.

@@ -74,7 +74,7 @@ test("the maintenance pass re-encodes a legacy vault in bounded batches: nothing
   const before = await everyBody();
   const bytesBefore = stored();
   expect(encodings()).toEqual({ text: 29, "fossil-delta": 20 });
-  initSchema(db); // v33: the hints gain logical/legacy and every refusal is cleared
+  initSchema(db); // v33: the hints gain `legacy` and every refusal is cleared
   const passes: h.CompactSummary[] = [];
   for (let i = 0; i < 20; i++) {
     const p = store.compactHistory({ maxNotes: 3, budgetMs: null });

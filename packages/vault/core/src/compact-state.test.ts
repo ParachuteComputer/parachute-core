@@ -9,7 +9,7 @@ import { applyImportedNote, beginImportRun, importTargetDigest } from "./history
 let db: Database, store: BunSqliteStore;
 beforeEach(() => { db = new Database(":memory:"); store = new BunSqliteStore(db, { history: { compact_min_versions: 2, compact_ratio: 1 } }); });
 afterEach(() => db.close());
-const state = (id: string) => db.query("SELECT versions,stored,live,refused,logical,legacy FROM history_compact_state WHERE note_id=?").get(id) as { versions: number; stored: number; live: number; refused: number; logical: number; legacy: number } | null;
+const state = (id: string) => db.query("SELECT versions,stored,live,refused,legacy FROM history_compact_state WHERE note_id=?").get(id) as { versions: number; stored: number; live: number; refused: number; legacy: number } | null;
 test("live bytes refresh after mutation, empty histories are excluded and nonempty edits re-arm", async () => {
   const n = await store.createNote("large".repeat(1000));
   await store.updateNote(n.id, { append: "changed" });
@@ -50,7 +50,7 @@ test("v31 migration backfills deleted and live history once and preserves bodies
   const before = db.query("SELECT * FROM note_versions").all();
   db.exec("DROP TABLE history_compact_state; UPDATE schema_version SET version=31");
   initSchema(db);
-  expect(state(n.id)).toEqual({ versions: 2, stored: 6, live: 3, refused: 0, logical: 6, legacy: 0 });
+  expect(state(n.id)).toEqual({ versions: 2, stored: 6, live: 3, refused: 0, legacy: 0 });
   expect(db.query("PRAGMA foreign_key_list(history_compact_state)").all()).toEqual([]);
   expect(db.query("SELECT * FROM note_versions").all()).toEqual(before);
   expect((await store.getNoteVersion(n.id, 0))?.content).toBe("old");
@@ -74,7 +74,7 @@ test("prune, imported observations, deleted compaction and sweep maintain exact 
   const n = await store.createNote("body".repeat(1000));
   const exact = () => {
     const actual = readCompactState(db, n.id)!;
-    expect(state(n.id)).toMatchObject({ versions: actual.versions, stored: actual.stored, live: actual.live, logical: actual.logical, legacy: actual.legacy });
+    expect(state(n.id)).toMatchObject({ versions: actual.versions, stored: actual.stored, live: actual.live, legacy: actual.legacy });
   };
   for (let i=0;i<4;i++) { await store.updateNote(n.id, { append: String(i) }); exact(); }
   const policy = resolveHistoryPolicy({ min_versions: 1, max_versions: 2, compact_min_versions: 2, compact_ratio: 1 });

@@ -19,8 +19,7 @@ export const READABLE_SCHEMA_VERSION = 33;
 
 /**
  * v33 (T-460): version bodies are written compressed (blob-codec.ts) and compaction is always on. The compaction
- * hints gain `logical` (the bodies' own sizes, since stored sizes are now compressed) and `legacy` (blobs stored the
- * old way, which the maintenance pass re-encodes). Rebuilt here, which also clears every `refused`: an earlier
+ * hints gain `legacy` (blobs stored the old way, which the maintenance pass re-encodes). Rebuilt here, which also clears every `refused`: an earlier
  * refusal under the old rules must not hide a note from the new ones. Schema 33's data is readable by the engine
  * before this one (READABLE_SCHEMA_VERSION there), so a rollback still reads it.
  */

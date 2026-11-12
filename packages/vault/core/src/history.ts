@@ -842,10 +842,11 @@ export function compactVault(db: Database, policy: HistoryPolicy, opts?: {
   if (budget !== null && budget <= 0)
     return { ...result, stopped_by: "budget" };
   const started = performance.now();
-  // Logical sizes and the legacy count come from the compaction hints (v33). A row an older engine refreshed has
-  // logical 0: it is a candidate on its count alone, and compactNote decides.
-  const predicate = `refused=0 AND (legacy > 0 OR (live>0 AND versions >= ? AND (logical > ? * MAX(live,1) OR logical = 0)) OR (? IS NOT NULL AND stored > ?))`;
-  const args = [policy.compact_min_versions, policy.compact_ratio, policy.max_bytes_per_note, policy.max_bytes_per_note];
+  // Always on (T-460): a note with enough versions is a candidate until a pass leaves it refused; compactNote applies
+  // the size rule on logical sizes itself, so the hints refreshed on every write stay cheap. `legacy` (v33) adds
+  // notes holding blobs stored the old way, whatever their count.
+  const predicate = `refused=0 AND (legacy > 0 OR (live>0 AND versions >= ?) OR (? IS NOT NULL AND stored > ?))`;
+  const args = [policy.compact_min_versions, policy.max_bytes_per_note, policy.max_bytes_per_note];
   const total = opts?.noteId !== undefined ? 1 : (db.prepare(`SELECT COUNT(*) AS n FROM history_compact_state WHERE ${predicate}`).get(...args) as { n: number }).n;
   const candidates = opts?.noteId !== undefined ? [{ note_id: opts.noteId }] : db.prepare(`SELECT note_id FROM history_compact_state WHERE ${predicate} ORDER BY stored DESC LIMIT ?`).all(...args, max === null ? -1 : max * 4) as {
     note_id: string;
