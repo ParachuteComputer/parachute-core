@@ -6,6 +6,9 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+### Added
+- **Search finds words in field values.** `search` (REST and MCP) also matches the text of a record's metadata values: strings, numbers, list items and nested values (field names are not searched). A record found only through a field value comes after every record found in its title or body, and a tag-scoped caller still finds only what its tags let it read. Editing only a field makes the new word searchable at once and the old word stops matching. In advanced mode the column is `fields`. No schema version bump: the first open after upgrading rebuilds the search index once (2.1 s at 94,000 records on the build machine; the vault file grows about 40% in the bench shape, where the records are nothing but fields), and a 0.9.2 program still opens, reads and edits the vault, keeping the index right (0.9.3, T-463).
+
 ### Security
 - `PATCH /api/vault` with a `description` now needs admin, as MCP `vault-info` already did. Any write token could rewrite the description, which every MCP `initialize` hands every AI connection: a lasting prompt injection. A `config`-only PATCH (the Notes app's audio retention) still needs only write. A tag-scoped token can't PATCH `/api/vault` at all, nor set the description through `vault-info`: both are vault-wide (403 `tag_scope_violation`) (T-419, audit L3-01).
 - A tag-scoped admin token gets 403 `tag_scope_violation` on `/api/triggers`, every `/.parachute/mirror` route (config, run-now, push-now, history, import, auth), `/.parachute/config`, `/.parachute/embeddings` and `/.parachute/transcription`. A trigger fires on hidden notes and a webhook sends them out; mirror and import export or replace the whole vault; the last three read or set the vault's and the host's settings (T-419, audit L3-10 #4).

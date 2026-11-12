@@ -33,8 +33,7 @@ import { chunkForInClause, IN_VIA_JSON_EACH, jsonEachParam } from "./sql-in.js";
 import {
   buildLiteralSearchQuery,
   extractLiteralBoostTerms,
-  SEARCH_WEIGHT_PATH,
-  SEARCH_WEIGHT_CONTENT,
+  SEARCH_BM25_WEIGHTS,
   type SearchMode,
 } from "./search-query.js";
 import { generateUlid } from "./ulid.js";
@@ -2130,7 +2129,7 @@ export function queryNotesPaged(db: Database, opts: QueryOpts, visible?: (note: 
  * generically off the FTS5 error text (`/no such column:/i`) rather than
  * re-parsing the query ourselves, since the SAME message also covers the
  * other real cause (an explicit `column:term` filter naming a column that
- * isn't one of `notes_fts`'s declared columns, `path`/`content`) — the hint
+ * isn't one of `notes_fts`'s declared columns, `path`/`content`/`fields`) — the hint
  * below covers both without claiming to know which one happened.
  */
 function advancedModeColumnHint(causeMessage: string): string | null {
@@ -2138,7 +2137,7 @@ function advancedModeColumnHint(causeMessage: string): string | null {
   return (
     `FTS5 read part of this query as column-filter syntax ("column:term") or as a ` +
     `leading "-" with no term to its left — NOT/"-" is a BINARY operator in FTS5 ` +
-    `("good -bad", not "-bad" alone). Indexed columns are "path" and "content". ` +
+    `("good -bad", not "-bad" alone). Indexed columns are "path", "content" and "fields". ` +
     `Add a preceding positive term before a NOT, quote the phrase to search it ` +
     `literally, or use search_mode:"literal" (the default) to skip advanced syntax entirely.`
   );
@@ -2244,7 +2243,7 @@ export function searchNotes(
 
   // Weighted bm25 relevance expression (vault#551 WS2C, schema v25):
   // `notes_fts` now indexes `path` (title, column 0) then `content` (body,
-  // column 1) — SEARCH_WEIGHT_PATH/SEARCH_WEIGHT_CONTENT bias ranking so a
+  // column 1, then `fields` (0.9.2), column 2) — SEARCH_BM25_WEIGHTS bias ranking so a
   // title match outranks a passing body mention. Raw SQLite bm25 is
   // negative-is-better; `-1.0 * bm25(...)` flips it so bigger is more
   // relevant (see `Note.score`'s doc comment for the external contract).
@@ -2259,7 +2258,7 @@ export function searchNotes(
   // not a third FTS column. The two are complementary, not redundant — a
   // note can have a matching path with a non-matching first line, or vice
   // versa.
-  const scoreExpr = `(-1.0 * bm25(notes_fts, ${SEARCH_WEIGHT_PATH}, ${SEARCH_WEIGHT_CONTENT}))`;
+  const scoreExpr = `(-1.0 * bm25(notes_fts, ${SEARCH_BM25_WEIGHTS}))`;
 
   // `sort` honored under search (vault#551 WS2A item 3): default stays FTS5
   // relevance (the weighted `score` expression); an EXPLICIT
@@ -2271,6 +2270,11 @@ export function searchNotes(
   // identical weighted score (relevance branch — much more likely than
   // with unweighted `rank`, since many notes share "zero path matches")
   // would otherwise return in arbitrary/unstable order.
+  // Field values rank below the title and body (0.9.2): a record found only through its fields comes after every
+  // record found in its path or content. bm25 alone can't promise that: it normalises by the length of the whole row,
+  // so a hit in a short record's fields can outscore a hit in a long body. Relevance order only, literal mode only
+  // (advanced text is raw FTS5; its author can say `fields:` or `content:` themselves).
+  const tier = mode === "literal" && opts?.sort === undefined ? fieldTierOf(ftsQuery) : null;
   const orderBy =
     opts?.sort === "asc"
       ? "n.created_at ASC, n.id ASC"
@@ -2294,15 +2298,15 @@ export function searchNotes(
 
   try {
     const rows = opts?.visible
-      ? searchVisibleOnly(db, ftsQuery, extraWhere, params, orderBy, limit, opts.visible)
+      ? searchVisibleOnly(db, ftsQuery, extraWhere, params, orderBy, limit, opts.visible, tier)
       : db.prepare(`
-      SELECT n.*, ${scoreExpr} AS score FROM notes n
+      SELECT n.*, ${scoreExpr} AS score${tier ? `, ${tier.select("n.rowid", "notes_fts")} AS tier` : ""} FROM notes n
       JOIN notes_fts fts ON fts.rowid = n.rowid
       WHERE notes_fts MATCH ?
         ${extraWhere}
-      ORDER BY ${orderBy}
+      ORDER BY ${tier ? "tier DESC, " : ""}${orderBy}
       LIMIT ?
-    `).all(ftsQuery, ...params, limit) as (NoteRow & { score: number })[];
+    `).all(...(tier ? [tier.param] : []), ftsQuery, ...params, limit) as (NoteRow & { score: number })[];
     return applySearchTitleBoost(notesWithTags(db, rows, scoresById(rows)), mode, query, opts?.sort);
   } catch (err) {
     // Surface EVERY FTS5 error structured, never a raw rethrow (vault#551):
@@ -2314,6 +2318,22 @@ export function searchNotes(
     if (err instanceof QueryError) throw err;
     throw searchSyntaxError(query, err, mode);
   }
+}
+
+/**
+ * The "found in the title or body" tier of a literal search: 1 when the same words all match within path/content
+ * alone, 0 when a field value is needed to match. `select(rowid, table)` is the SQL expression for one candidate row
+ * in `table`; `param` is its one bound value.
+ */
+interface FieldTier {
+  select(rowidExpr: string, table: string): string;
+  param: string;
+}
+function fieldTierOf(ftsQuery: string): FieldTier {
+  return {
+    param: `{path content} : (${ftsQuery})`,
+    select: (rowidExpr, table) => `CASE WHEN ${rowidExpr} IN (SELECT rowid FROM ${table} AS tier_fts WHERE tier_fts.${table} MATCH ?) THEN 1 ELSE 0 END`,
+  };
 }
 
 let visibleSearchSeq = 0;
@@ -2338,6 +2358,7 @@ function searchVisibleOnly(
   orderBy: string,
   limit: number,
   visible: (note: Note) => boolean,
+  tier: FieldTier | null,
 ): (NoteRow & { score: number })[] {
   const matched = db.prepare(`
     SELECT n.rowid AS rowid, n.id AS id FROM notes n
@@ -2352,19 +2373,19 @@ function searchVisibleOnly(
   const ftsSql = (db.prepare("SELECT sql FROM sqlite_master WHERE name = 'notes_fts'").get() as { sql: string } | null)?.sql ?? "";
   const tokenize = /tokenize\s*=\s*'([^']*)'/i.exec(ftsSql)?.[1] ?? "porter unicode61";
   const table = `visible_search_${++visibleSearchSeq}`;
-  db.run(`CREATE VIRTUAL TABLE temp.${table} USING fts5(path, content, tokenize='${tokenize.replace(/'/g, "''")}')`);
+  db.run(`CREATE VIRTUAL TABLE temp.${table} USING fts5(path, content, fields, tokenize='${tokenize.replace(/'/g, "''")}')`);
   try {
     db.prepare(`
-      INSERT INTO temp.${table}(rowid, path, content)
-      SELECT rowid, COALESCE(path, ''), content FROM notes WHERE rowid IN (SELECT value FROM json_each(?))
+      INSERT INTO temp.${table}(rowid, path, content, fields)
+      SELECT rid, path, content, fields FROM notes_fts_source WHERE rid IN (SELECT value FROM json_each(?))
     `).run(JSON.stringify(keep.map((r) => r.rowid)));
     return db.prepare(`
-      SELECT n.*, (-1.0 * bm25(${table}, ${SEARCH_WEIGHT_PATH}, ${SEARCH_WEIGHT_CONTENT})) AS score
+      SELECT n.*, (-1.0 * bm25(${table}, ${SEARCH_BM25_WEIGHTS})) AS score${tier ? `, ${tier.select(`${table}.rowid`, table)} AS tier` : ""}
       FROM ${table} JOIN notes n ON n.rowid = ${table}.rowid
       WHERE ${table} MATCH ?
-      ORDER BY ${orderBy}
+      ORDER BY ${tier ? "tier DESC, " : ""}${orderBy}
       LIMIT ?
-    `).all(ftsQuery, limit) as (NoteRow & { score: number })[];
+    `).all(...(tier ? [tier.param] : []), ftsQuery, limit) as (NoteRow & { score: number })[];
   } finally {
     db.run(`DROP TABLE temp.${table}`);
   }

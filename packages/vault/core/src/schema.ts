@@ -69,6 +69,73 @@ function ensureTagKinds(db: Database): void {
  */
 const UNPARSEABLE_UPDATED_AT_MS = 0;
 
+/**
+ * The text of a note's field values, for the search index (0.9.2): every leaf of the metadata JSON, joined with
+ * spaces. Strings as they are, numbers and booleans as their text, a list or nested object by its leaves; null and the
+ * field NAMES are left out. `m` is the SQL expression holding the metadata (`new.metadata`, `old.metadata`, or the
+ * column). Malformed JSON gives '' rather than an error, so a bad value can't make a write fail.
+ */
+function fieldTextSql(m: string): string {
+  return `COALESCE(CASE WHEN json_valid(${m}) THEN (SELECT group_concat(value, ' ') FROM json_tree(${m}) WHERE type NOT IN ('object', 'array')) END, '')`;
+}
+
+/**
+ * The search index over path, content and field values, as DDL. Column order matters: bm25(notes_fts, w0, w1, w2) in
+ * core/src/notes.ts is positional (path, content, fields; weights in search-query.ts).
+ *
+ * External content, read from the view `notes_fts_source` (notes joined to `notes_field_text`, which holds each
+ * record's field text, one small row per record that has any). FTS5 needs every one of its columns in the content
+ * table for 'rebuild', 'integrity-check', snippet() and highlight(), and `notes` has no field-text column; a column
+ * on `notes` would change the shape of the table every older engine reads with `SELECT n.*`, and a second FTS table
+ * would need two indexes ranked against each other. A view that computes the text from the metadata would be simplest,
+ * but FTS5 reads a view with a schema-qualified name, under which SQLite can't find json_tree ("no such table:
+ * main.json_tree"), so 'rebuild' would fail; the stored text is also what makes the 'delete' commands exact.
+ *
+ * The triggers are the only writers of `notes_field_text`. FTS5's 'delete' needs the exact values that were indexed,
+ * so they read the old text from the table, not from OLD.metadata. They live in the database file, so an older
+ * engine that opens a vault of this shape keeps the index right through its own writes.
+ *
+ * UPDATE OF content, path, metadata, with a WHEN so a write that changes none of them (or sets metadata to what it
+ * was) doesn't rewrite the index entry.
+ */
+const NOTES_FTS_SQL = `
+CREATE TABLE IF NOT EXISTS notes_field_text (
+  note_id TEXT PRIMARY KEY,
+  text TEXT NOT NULL
+) WITHOUT ROWID;
+
+CREATE VIEW IF NOT EXISTS notes_fts_source AS
+  SELECT n.rowid AS rid, COALESCE(n.path, '') AS path, n.content AS content, COALESCE(f.text, '') AS fields
+  FROM notes n LEFT JOIN notes_field_text f ON f.note_id = n.id;
+
+CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
+  path,
+  content,
+  fields,
+  content='notes_fts_source',
+  content_rowid='rid',
+  tokenize='porter unicode61'
+);
+
+CREATE TRIGGER IF NOT EXISTS notes_fts_insert AFTER INSERT ON notes BEGIN
+  INSERT INTO notes_field_text(note_id, text) SELECT new.id, t FROM (SELECT ${fieldTextSql("new.metadata")} AS t) WHERE t <> '';
+  INSERT INTO notes_fts(rowid, path, content, fields) VALUES (new.rowid, COALESCE(new.path, ''), new.content, COALESCE((SELECT text FROM notes_field_text WHERE note_id = new.id), ''));
+END;
+
+CREATE TRIGGER IF NOT EXISTS notes_fts_delete AFTER DELETE ON notes BEGIN
+  INSERT INTO notes_fts(notes_fts, rowid, path, content, fields) VALUES('delete', old.rowid, COALESCE(old.path, ''), old.content, COALESCE((SELECT text FROM notes_field_text WHERE note_id = old.id), ''));
+  DELETE FROM notes_field_text WHERE note_id = old.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS notes_fts_update AFTER UPDATE OF content, path, metadata ON notes
+WHEN old.content IS NOT new.content OR old.path IS NOT new.path OR old.metadata IS NOT new.metadata BEGIN
+  INSERT INTO notes_fts(notes_fts, rowid, path, content, fields) VALUES('delete', old.rowid, COALESCE(old.path, ''), old.content, COALESCE((SELECT text FROM notes_field_text WHERE note_id = old.id), ''));
+  DELETE FROM notes_field_text WHERE note_id = old.id;
+  INSERT INTO notes_field_text(note_id, text) SELECT new.id, t FROM (SELECT ${fieldTextSql("new.metadata")} AS t) WHERE t <> '';
+  INSERT INTO notes_fts(rowid, path, content, fields) VALUES (new.rowid, COALESCE(new.path, ''), new.content, COALESCE((SELECT text FROM notes_field_text WHERE note_id = new.id), ''));
+END;
+`;
+
 export const SCHEMA_SQL = `
 -- Notes: the universal record.
 --
@@ -471,44 +538,10 @@ CREATE TABLE IF NOT EXISTS schema_version (
   applied_at TEXT NOT NULL
 );
 
--- Full-text search on note title (path) AND content (v25, vault#551 WS2B/C).
--- Two columns, declared in this order — bm25(notes_fts, w_path, w_content)
--- calls in core/src/notes.ts positionally match column 0 = path, column 1 =
--- content, weighted so a TITLE match outranks a passing body mention (see
--- SEARCH_WEIGHT_PATH/SEARCH_WEIGHT_CONTENT in core/src/search-query.ts).
--- Pre-v25, only content was indexed — a note's title/path was completely
--- unsearchable, which both defeated any title-biased ranking (nothing to
--- bias) and was a plain recall gap. tokenize='porter unicode61' adds
--- Porter stemming on top of the v3-era default unicode61 tokenizer so
--- regular-affix variants (firefighter/firefighters, microbe/microbes) match
--- each other; irregular plurals with a consonant change (wolf/wolves) are a
--- known Porter limitation, not fixed by this — see docs/HTTP_API.md.
--- Existing vaults upgrade via migrateToV25 (rebuild + repopulate); this
--- CREATE only reaches its new shape directly on a fresh vault.
-CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
-  path,
-  content,
-  content='notes',
-  content_rowid='rowid',
-  tokenize='porter unicode61'
-);
-
--- FTS triggers. UPDATE OF content, path (not content alone, pre-v25) —
--- either column changing must resync the index now that path is indexed too;
--- a path-only rename (content untouched) used to be silently invisible to
--- notes_fts because the trigger's column list didn't include it.
-CREATE TRIGGER IF NOT EXISTS notes_fts_insert AFTER INSERT ON notes BEGIN
-  INSERT INTO notes_fts(rowid, path, content) VALUES (new.rowid, COALESCE(new.path, ''), new.content);
-END;
-
-CREATE TRIGGER IF NOT EXISTS notes_fts_delete AFTER DELETE ON notes BEGIN
-  INSERT INTO notes_fts(notes_fts, rowid, path, content) VALUES('delete', old.rowid, COALESCE(old.path, ''), old.content);
-END;
-
-CREATE TRIGGER IF NOT EXISTS notes_fts_update AFTER UPDATE OF content, path ON notes BEGIN
-  INSERT INTO notes_fts(notes_fts, rowid, path, content) VALUES('delete', old.rowid, COALESCE(old.path, ''), old.content);
-  INSERT INTO notes_fts(rowid, path, content) VALUES (new.rowid, COALESCE(new.path, ''), new.content);
-END;
+-- Full-text search on a note's path (title), content (body) AND field values (0.9.2). See NOTES_FTS_SQL above this
+-- string: the three columns, the view that feeds them and the three sync triggers are one piece of DDL, shared
+-- with ensureFtsFields (the step that brings an older vault to this shape without a schema number).
+${NOTES_FTS_SQL}
 
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_notes_created ON notes(created_at);
@@ -707,7 +740,8 @@ export function unnumberedStepsDone(db: Database): boolean {
   return (
     hasIndex(db, "idx_notes_path_nocase") && // ensurePathNocaseIndex (T-412)
     hasColumn(db, "tags", "kind") && // ensureTagKinds (T-318 §8a, 0.9)
-    (!hasTable(db, "note_versions") || hasColumn(db, "note_versions", "via_kind")) // ensureRevisionKeyKind (0.9.1)
+    (!hasTable(db, "note_versions") || hasColumn(db, "note_versions", "via_kind")) && // ensureRevisionKeyKind (0.9.1)
+    (!hasTable(db, "notes") || hasColumn(db, "notes_fts", "fields")) // ensureFtsFields (0.9.2)
   );
 }
 
@@ -732,6 +766,7 @@ export function initSchema(db: Database): void {
       ensureTagKinds(db);
       ensurePathNocaseIndex(db);
       ensureRevisionKeyKind(db);
+      ensureFtsFields(db);
     }
     rebuildIndexes(db);
     return;
@@ -886,6 +921,8 @@ export function initSchema(db: Database): void {
   ensurePathNocaseIndex(db);
   // The write stamp: each revision says what kind of key wrote it (0.9.1).
   ensureRevisionKeyKind(db);
+  // Field values in the search index (0.9.2): a third notes_fts column, rebuilt once.
+  ensureFtsFields(db);
 
   // Rebuild any generated columns + indexes declared in indexed_fields.
   // No-op for a fresh vault; idempotent on existing vaults.
@@ -896,6 +933,33 @@ export function initSchema(db: Database): void {
     SCHEMA_VERSION,
     new Date().toISOString(),
   );
+}
+
+/**
+ * Field values in search (0.9.2): bring notes_fts to the three-column shape of NOTES_FTS_SQL and index every note's
+ * field text, once. Deliberately NOT a SCHEMA_VERSION bump, like ensurePathNocaseIndex: an older engine of this
+ * schema number still opens the vault, reads its search index (its bm25 call names two weights; the third column
+ * gets the default 1.0, so it ranks a field hit like a body hit until that engine is updated) and edits it through
+ * these same triggers. initSchema's fast path checks for the `fields` column instead.
+ *
+ * One transaction (drop, create, rebuild) so a crash leaves the old shape and the next open does it again, never a
+ * new but empty index that looks done (the migrateToV25 lesson). The drop makes the old index's pages free and the
+ * rebuild writes the new ones: on a Durable Object that is one row write per note plus the index segments, once.
+ */
+function ensureFtsFields(db: Database): void {
+  if (!hasTable(db, "notes")) return;
+  if (hasColumn(db, "notes_fts", "fields")) return;
+  transaction(db, () => {
+    db.exec("DROP TRIGGER IF EXISTS notes_fts_insert");
+    db.exec("DROP TRIGGER IF EXISTS notes_fts_delete");
+    db.exec("DROP TRIGGER IF EXISTS notes_fts_update");
+    db.exec("DROP TABLE IF EXISTS notes_fts");
+    db.exec("DROP VIEW IF EXISTS notes_fts_source");
+    db.exec("DROP TABLE IF EXISTS notes_field_text");
+    db.exec(NOTES_FTS_SQL);
+    db.exec(`INSERT INTO notes_field_text(note_id, text) SELECT id, t FROM (SELECT id, ${fieldTextSql("metadata")} AS t FROM notes) WHERE t <> ''`);
+    db.exec("INSERT INTO notes_fts(notes_fts) VALUES('rebuild')");
+  });
 }
 
 function hasColumn(db: Database, table: string, column: string): boolean {

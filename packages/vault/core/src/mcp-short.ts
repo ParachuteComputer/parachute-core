@@ -67,7 +67,7 @@ Rarer filters (has_links, order_by, expand_links, created_by, search_mode, …) 
       exclude_tags: strs("Leave out notes with these tags"),
       path: str("Exact path"),
       path_prefix: str('e.g. "Projects/"'),
-      search: str("Full-text search over title and content: finds notes holding every word"),
+      search: str("Full-text search over title, content and field values: finds notes holding every word"),
       metadata: { type: "object", description: "{field: value} or {field: {eq|ne|gt|gte|lt|lte|in|not_in|exists: v}}" },
       since: str("What changed: updated_at on or after (ISO date)"),
       date_from: str("created_at on or after (ISO date)"),

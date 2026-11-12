@@ -200,7 +200,7 @@ not yet decided are written at the top of each file, marked proposed.
 
 | File | What it holds |
 |---|---|
-| `v092/query.test.ts` | Filter and sort any field: every operator on a field that isn't indexed gives its indexed twin's rows, with a warning that it scanned (REST and MCP); a field no type declares; a word that is only in a field value is found by search. |
+| `v092/query.test.ts` | Filter and sort any field: every operator on a field that isn't indexed gives its indexed twin's rows, with a warning that it scanned (REST and MCP); a field no type declares; a word that is only in a field value is found by search (REST and MCP), ranks below a title or body hit, is searchable at once after a field-only edit and not by its old value, and a list, number or nested value is searchable by its text. `safety/search-fields.test.ts` adds the tag-scoped side. |
 | `v092/schema-change.test.ts` | A retype that would strand records is refused and says how many; a dry-run migrate over REST (admin) and MCP says what would change and writes nothing. |
 | `v092/field-types.test.ts` | A record with two types is checked against both; `doctor` reports a field holding two data types, declared or not. |
 | `v092/teaching.test.ts` | The nearest existing name on a new type or field (a warning); `vault-info`'s tag map capped (700 types fit in about 4,000 tokens); manage-types' own schema names `reference`, `required`, `strict`, `cardinality`; search says it needs every word. |
