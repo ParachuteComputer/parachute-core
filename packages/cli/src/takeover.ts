@@ -849,6 +849,8 @@ export async function detect(home: string): Promise<Detected> {
     const name = basename(dirname(path));
     const notes = readOnly(path, (db) => (db.query("SELECT COUNT(*) AS n FROM notes").get() as { n: number }).n);
     vaults.push({ name, notes, schema });
+    // Below SCHEMA_VERSION is what this release migrates. A vault above it (up to READABLE_SCHEMA_VERSION) is opened
+    // as it is; the newer-data check before this refuses anything newer.
     if (schema < SCHEMA_VERSION) migrations.push(`vault ${name}: schema ${schema} → ${SCHEMA_VERSION}`);
     if (!d.rel.startsWith(join("vault", "data"))) migrations.push(`vault ${name}: moved from ${dirname(d.rel)} to vault/data/${name}`);
   }

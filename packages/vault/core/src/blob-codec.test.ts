@@ -100,3 +100,41 @@ test("this release's compaction works on a history the next release wrote: defla
   expect(await readAll(id, [...bodies.keys()])).toEqual(bodies);
   expect(h.historyStorageStats(db).orphan_deltas).toBe(0);
 });
+
+test("a Durable Object hands BLOBs back as an ArrayBuffer (and a Uint8Array may be a view): both decode", async () => {
+  const { wholeText, deltaBytes } = await import("./blob-codec.js");
+  const text = "a body from a DO, with ☕ in it\n".repeat(50);
+  const z = deflateBytes(utf8(text));
+  const padded = new Uint8Array(z.byteLength + 8);
+  padded.set(z, 4);
+  expect(wholeText(z.slice().buffer, "deflate", 1 << 20)).toBe(text);
+  expect(wholeText(padded.subarray(4, 4 + z.byteLength), "deflate", 1 << 20)).toBe(text);
+  const d = createDeltaBytes(text, text + "more");
+  expect([...deltaBytes(deflateBytes(d).slice().buffer, "fossil-delta-z", 1 << 20)]).toEqual([...d]);
+  expect(wholeText(utf8(text).slice().buffer, null, 1 << 20)).toBe(text);
+});
+
+test("this release writing into a vault the next release stamped 33: edits, restore and compaction read back, the stamp stays", async () => {
+  const { initSchema, READABLE_SCHEMA_VERSION } = await import("./schema.js");
+  const { id, versions, bodies } = await seed(12);
+  // What the next release leaves: every whole blob deflated, the vault stamped 33.
+  for (const v of versions) set(v.content_hash!, deflateBytes(utf8(bodies.get(v.version_ix)!)), "deflate", null);
+  db.prepare("INSERT INTO schema_version (version, applied_at) VALUES (?, ?)").run(READABLE_SCHEMA_VERSION, "2999-01-01T00:00:00.000Z");
+  const stamps = () => db.prepare("SELECT version, applied_at FROM schema_version ORDER BY version").all();
+  const before = stamps();
+  initSchema(db);
+  // Re-capturing a body the vault already holds deflated, a new body, and a restore.
+  const oldest = versions[0]!;
+  await store.updateNote(id, { content: bodies.get(oldest.version_ix)! });
+  await store.updateNote(id, { content: "a new body after the rollback" });
+  const latest = (await store.listNoteVersions(id))[0]!;
+  await store.restoreNoteVersion(id, latest.version_ix, { if_updated_at: (await store.getNote(id))!.updatedAt });
+  h.compactNote(db, id, h.resolveHistoryPolicy({ compact_min_versions: 2, compact_ratio: 1 }));
+  const all = (await store.listNoteVersions(id, { limit: 100 })).map((v) => v.version_ix);
+  const read = await readAll(id, all);
+  for (const [ix, text] of bodies) expect(read.get(ix)).toBe(text);
+  expect(h.historyStorageStats(db).orphan_deltas).toBe(0);
+  expect(auditHistoryBlobs(db, "", 500, 1000).corrupt).toBe(0);
+  initSchema(db);
+  expect(stamps()).toEqual(before);
+});

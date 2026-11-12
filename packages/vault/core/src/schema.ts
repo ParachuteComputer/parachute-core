@@ -726,6 +726,13 @@ export function initSchema(db: Database): void {
   // that engine ran every step below already. Open it as it is, and never stamp it back to an older version.
   const highest = highestStamp(db);
   if (highest !== null && highest > SCHEMA_VERSION) {
+    // Its un-numbered steps are this engine's to check, though: a later patch on this line may add one the newer
+    // engine lacks (audit L2-01). Each is additive and idempotent.
+    if (!unnumberedStepsDone(db)) {
+      ensureTagKinds(db);
+      ensurePathNocaseIndex(db);
+      ensureRevisionKeyKind(db);
+    }
     rebuildIndexes(db);
     return;
   }
