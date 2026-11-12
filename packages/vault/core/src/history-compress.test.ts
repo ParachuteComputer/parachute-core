@@ -169,3 +169,18 @@ test("a re-encode that doesn't read back is never written: the blob keeps its ol
   expect(db.prepare("SELECT hash, content, encoding FROM note_blobs ORDER BY hash").all()).toEqual(raw);
   expect(await everyBody()).toEqual(before);
 });
+
+test("pruning a hot note past its ceiling leaves no stranded bases: a freed delta's base goes too", async () => {
+  const s2 = new BunSqliteStore(db, { history: { compact_budget_ms: 0, max_versions: 30, min_versions: 5 } });
+  const page = (k: number) => Array.from({ length: 300 }, (_, i) => `row ${i}: a made-up ledger line${i === k % 300 ? `, edited ${k}` : ""}`).join("\n");
+  const n = await s2.createNote(page(0));
+  for (let k = 1; k <= 200; k++) {
+    await s2.updateNote(n.id, { content: page(k) });
+    s2.compactHistory({ budgetMs: null, maxNotes: null });
+  }
+  const stranded = db.prepare(`SELECT COUNT(*) AS n FROM note_blobs b WHERE NOT EXISTS (SELECT 1 FROM note_versions v WHERE v.content_hash = b.hash)
+    AND NOT EXISTS (SELECT 1 FROM note_blobs d WHERE d.delta_of = b.hash)`).get() as { n: number };
+  expect(stranded.n).toBe(0);
+  expect(await s2.countNoteVersions(n.id)).toBe(30);
+  for (const v of await s2.listNoteVersions(n.id, { limit: 100 })) expect((await s2.getNoteVersion(n.id, v.version_ix))!.content).toBe(page(v.version_ix));
+});

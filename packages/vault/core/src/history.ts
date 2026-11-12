@@ -318,15 +318,33 @@ export function pruneVersions(
       .run(noteId, r.version_ix).changes;
   for (const hash of new Set(
     doomed.map((r) => r.content_hash).filter((h) => h !== null),
-  )) {
-    blobsDeleted += db
-      .prepare(
-        "DELETE FROM note_blobs WHERE hash = ? AND NOT EXISTS (SELECT 1 FROM note_versions WHERE content_hash = ?) AND NOT EXISTS (SELECT 1 FROM note_blobs WHERE delta_of = ?)",
-      )
-      .run(hash, hash, hash).changes;
-  }
+  ))
+    blobsDeleted += dropUnusedBlob(db, hash);
   if (refresh) refreshCompactState(db, noteId);
   return { versionsDeleted, blobsDeleted };
+}
+/**
+ * Delete a blob no version holds and no delta rests on; when it was a delta, then try its base the same way (T-460).
+ * A base whose own version was pruned while deltas still rested on it would otherwise stay for good: with compaction
+ * always on, every hot note left one behind per run. Counted by looking, not by `.changes` (see eraseNoteVersions).
+ * Returns how many blobs went (0, 1 or 2).
+ */
+function dropUnusedBlob(db: Database, hash: string): number {
+  const get = db.prepare("SELECT delta_of FROM note_blobs WHERE hash = ?");
+  const drop = db.prepare(
+    "DELETE FROM note_blobs WHERE hash = ? AND NOT EXISTS (SELECT 1 FROM note_versions WHERE content_hash = ?) AND NOT EXISTS (SELECT 1 FROM note_blobs WHERE delta_of = ?)",
+  );
+  let gone = 0;
+  let next: string | null = hash;
+  for (let depth = 0; depth < 2 && next; depth++) {
+    const row = get.get(next) as { delta_of: string | null } | null;
+    if (!row) break;
+    drop.run(next, next, next);
+    if (get.get(next)) break;
+    gone++;
+    next = row.delta_of;
+  }
+  return gone;
 }
 export function gcBlobs(db: Database): { blobsDeleted: number } {
   let blobsDeleted = 0;
@@ -848,7 +866,7 @@ function enforceByteCeiling(db: Database, noteId: string, policy: HistoryPolicy)
     if (!victim)
       break;
     dropped += db.prepare("DELETE FROM note_versions WHERE note_id = ? AND version_ix = ?").run(noteId, victim.version_ix).changes;
-    db.prepare("DELETE FROM note_blobs WHERE hash = ? AND NOT EXISTS (SELECT 1 FROM note_versions WHERE content_hash = ?) AND NOT EXISTS (SELECT 1 FROM note_blobs WHERE delta_of = ?)").run(victim.content_hash, victim.content_hash, victim.content_hash);
+    if (victim.content_hash) dropUnusedBlob(db, victim.content_hash);
   }
   return dropped;
 }
