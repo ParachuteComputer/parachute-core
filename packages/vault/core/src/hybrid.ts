@@ -18,11 +18,16 @@ export const RRF_K = 60;
 
 /**
  * Whether a search with no `search_mode` is answered by hybrid when it reads as a question (the 0.9.3 "auto" default,
- * T-461). The ONE switch: `false` keeps today's answer for every search without `search_mode`, byte for byte. It stays
- * `false` until Aaron says yes (DECIDED-HYBRID); flipping it is a one-line change that also removes the `red()` around
- * contracts/suites/v093/hybrid.test.ts "auto".
+ * T-461). On since Aaron's yes (DECIDED-HYBRID, 11-12). It is the default only: a call's `search_mode` always wins,
+ * and a vault's `search.auto_hybrid` in vault.yaml (true or false, set by an admin over PATCH /api/vault) overrides it.
+ * Changing it also changes what `HYBRID_TEXT` says ("the default").
  */
-export const HYBRID_AUTO_DEFAULT = false;
+export const HYBRID_AUTO_DEFAULT = true;
+
+/** The effective auto setting: the vault's own `search.auto_hybrid` when set, else `HYBRID_AUTO_DEFAULT`. */
+export function effectiveHybridAuto(vaultSetting: boolean | null | undefined): boolean {
+  return vaultSetting ?? HYBRID_AUTO_DEFAULT;
+}
 
 /** Each arm fetches this many candidates before fusing (the fused page is cut to the caller's `limit`). */
 export const HYBRID_POOL = 50;
@@ -75,31 +80,21 @@ export function isQuestionShaped(raw: string): boolean {
 }
 
 /**
- * The words an AI reads about hybrid search, true for whichever way `HYBRID_AUTO_DEFAULT` is set, so flipping it
- * changes them with it (and the eval gate re-runs on them). Used by the short tool schemas and the full reference.
+ * The words an AI reads about hybrid search: used by the short tool schemas and the full reference. They stay true
+ * when a vault turns auto off ("its auto setting is on (the default)"), so they don't depend on the vault.
  */
-export const HYBRID_TEXT = HYBRID_AUTO_DEFAULT
-  ? {
-      // The line in a tool's description.
-      line: '`search`: a question in plain words ("when did I write about…", "have we decided…") is ranked by keyword and meaning together when the vault has meaning search; 1–3 words (a name, an id) match exactly. `search_mode: "literal"` forces exact words.',
-      // The short schema's `search` parameter.
-      param: "Search over title, content and field values. 1–3 words: notes holding every word. A 4+ word question: ranked by keyword and meaning when the vault has meaning search",
-      mode: "hybrid: keyword + meaning, for questions in plain words",
-      // The reference's `search` parameter (a sentence inside it) and `search_mode` ending.
-      refSearch: "Literal-by-default for 1–3 words; a 4+ word question is ranked by keyword and meaning together (see search_mode)",
-      refMode:
-        '"hybrid": rank by keyword (any of the content words) and meaning together, fused by rank; each result says `matched_by`; answers keyword-only with a `semantic_unavailable` warning when the vault has no embeddings. With search_mode omitted, a search of 4+ words (2+ content words) on a vault with meaning search, without sort, is answered by hybrid with a `search_auto` warning; shorter searches stay literal; pass "literal" for the exact-words answer. Has no effect without `search` (an `ignored_param` warning fires if you pass it without `search`). Omit for the default (literal, or hybrid for a 4+ word question).',
-      hint: 'pass "literal", "advanced" or "hybrid", or omit for the default (literal; hybrid for a 4+ word question on a vault with meaning search)',
-    }
-  : {
-      line: '`search`: finds notes holding every word. For a question in plain words ("when did I write about…", "have we decided…") pass `search_mode: "hybrid"`: ranked by keyword and meaning together (keyword only if the vault has no meaning search).',
-      param: 'Search over title, content and field values: finds notes holding every word. For a question in plain words, add search_mode "hybrid"',
-      mode: "hybrid: keyword + meaning, for questions in plain words",
-      refSearch: 'Literal-by-default; pass `search_mode: "hybrid"` for a question in plain words (keyword and meaning together)',
-      refMode:
-        '"hybrid": rank by keyword (any of the content words) and meaning together, fused by rank; each result says `matched_by`; answers keyword-only with a `semantic_unavailable` warning when the vault has no embeddings. Has no effect without `search` (an `ignored_param` warning fires if you pass it without `search`). Omit for the default ("literal").',
-      hint: 'pass "literal", "advanced" or "hybrid", or omit for the default ("literal")',
-    };
+export const HYBRID_TEXT = {
+  // The line in a tool's description.
+  line: '`search`: a question in plain words ("when did I write about…", "have we decided…") is ranked by keyword and meaning together when the vault has meaning search and its auto setting is on (the default); 1–3 words (a name, an id) match exactly. `search_mode: "literal"` forces exact words.',
+  // The short schema's `search` parameter.
+  param: "Search over title, content and field values. 1–3 words: notes holding every word. A 4+ word question: ranked by keyword and meaning when the vault has meaning search and its auto setting is on (the default)",
+  mode: "hybrid: keyword + meaning, for questions in plain words",
+  // The reference's `search` parameter (a sentence inside it) and `search_mode` ending.
+  refSearch: "Literal for 1–3 words; a 4+ word question is ranked by keyword and meaning together when the vault has meaning search and its auto setting is on (the default; see search_mode)",
+  refMode:
+    '"hybrid": rank by keyword (any of the content words) and meaning together, fused by rank; each result says `matched_by`; answers keyword-only with a `semantic_unavailable` warning when the vault has no embeddings. With search_mode omitted, a search of 4+ words (2+ content words) on a vault with meaning search, without sort, is answered by hybrid with a `search_auto` warning, unless the vault turned its auto setting off (`search.auto_hybrid` false); shorter searches stay literal; pass "literal" for the exact-words answer. A search_mode you pass always wins over the vault\'s setting. Has no effect without `search` (an `ignored_param` warning fires if you pass it without `search`). Omit for the default (hybrid for a 4+ word question on a vault with meaning search, else literal).',
+  hint: 'pass "literal", "advanced" or "hybrid", or omit for the default (hybrid for a 4+ word question on a vault with meaning search, else literal)',
+};
 
 export interface FusedHit {
   id: string;

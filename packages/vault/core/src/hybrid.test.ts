@@ -104,7 +104,7 @@ describe("query-notes search_mode: hybrid (MCP door)", () => {
     const provider = new AxisProvider();
     const store = new SqliteStore(db, { embeddingProvider: provider });
     await seed(store, db, provider);
-    const query = generateMcpTools(store, { hybridAuto: true }).find((t) => t.name === "query-notes")!;
+    const query = generateMcpTools(store).find((t) => t.name === "query-notes")!;
     const res = (await query.execute({ search: "when did I work on the vegetables" })) as {
       notes: { path: string; matched_by: string[] }[];
       warnings: { code: string }[];
@@ -124,20 +124,33 @@ describe("query-notes search_mode: hybrid (MCP door)", () => {
     expect(found[0]!.matched_by).toBeUndefined();
   });
 
-  it("the shipped default is off: HYBRID_AUTO_DEFAULT is false and a question without search_mode gets exactly the literal answer", async () => {
-    expect(HYBRID_AUTO_DEFAULT).toBe(false);
+  it("the shipped default is on, a vault's setting overrides it either way, and a call's search_mode always wins", async () => {
+    expect(HYBRID_AUTO_DEFAULT).toBe(true);
     const db = new Database(":memory:");
     const provider = new AxisProvider();
     const store = new SqliteStore(db, { embeddingProvider: provider });
     await seed(store, db, provider);
-    const query = generateMcpTools(store).find((t) => t.name === "query-notes")!;
-    for (const search of ["when did I work on the vegetables", "plan the garden beds for next year"]) {
-      const plain = await query.execute({ search });
-      const literal = await query.execute({ search, search_mode: "literal" });
-      expect(JSON.stringify(plain)).toBe(JSON.stringify(literal));
-      expect(JSON.stringify(plain)).not.toContain("search_auto");
-      expect(JSON.stringify(plain)).not.toContain("matched_by");
-    }
+    const search = "when did I work on the vegetables";
+    const run = async (hybridAuto: boolean | null | undefined, params: Record<string, unknown> = {}) => {
+      const query = generateMcpTools(store, { hybridAuto }).find((t) => t.name === "query-notes")!;
+      return JSON.stringify(await query.execute({ search, ...params }));
+    };
+    const literal = await run(undefined, { search_mode: "literal" });
+    expect(await run(undefined)).toContain("search_auto"); // unset: the default (on)
+    expect(await run(null)).toContain("search_auto");
+    expect(await run(true)).toContain("search_auto");
+    const off = await run(false);
+    expect(off).toBe(literal); // the vault turned it off: exactly the literal answer
+    expect(off).not.toContain("search_auto");
+    expect(off).not.toContain("matched_by");
+    expect(await run(true, { search_mode: "literal" })).toBe(literal); // the call wins over the vault's "on"
+    expect(await run(false, { search_mode: "hybrid" })).toContain("matched_by"); // and over its "off"
+    // The setting is read at each search: a function gives a session already open the new value.
+    let setting: boolean | undefined = false;
+    const live = generateMcpTools(store, { hybridAuto: () => setting }).find((t) => t.name === "query-notes")!;
+    expect(JSON.stringify(await live.execute({ search }))).not.toContain("search_auto");
+    setting = true;
+    expect(JSON.stringify(await live.execute({ search }))).toContain("search_auto");
   });
 
   it("a short search (an id, a code, a typo) keeps its empty answer; blank hybrid text is an empty search", async () => {
@@ -187,7 +200,7 @@ describe("query-notes search_mode: hybrid (MCP door)", () => {
     provider.embed = async () => {
       throw new Error("model failed to load");
     };
-    const query = generateMcpTools(store, { hybridAuto: true }).find((t) => t.name === "query-notes")!;
+    const query = generateMcpTools(store).find((t) => t.name === "query-notes")!;
     const r = await query.execute({ search: "plan the garden beds for next year" });
     const notes = (Array.isArray(r) ? r : (r as { notes: { path: string; matched_by?: string[] }[] }).notes) as { path: string; matched_by?: string[] }[];
     expect(notes.map((n) => n.path)).toEqual(["note-4"]);

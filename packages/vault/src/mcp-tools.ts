@@ -328,6 +328,8 @@ export function generateScopedMcpTools(
 
   const tools = generateMcpTools(store, {
     ...(expandVisibility ? { expandVisibility } : {}),
+    // 0.9.3: the vault's own `search.auto_hybrid`, read at each search (unset follows the default).
+    hybridAuto: () => readVaultConfig(vaultName)?.search?.auto_hybrid,
     ...(nearTraversable ? { nearTraversable } : {}),
     ...(ifExistsVisible ? { ifExistsVisible } : {}),
     ...(aggregateVisibility ? { aggregateVisibility, searchVisibility: aggregateVisibility, resolveVisibility: aggregateVisibility } : {}),

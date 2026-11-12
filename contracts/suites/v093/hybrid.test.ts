@@ -8,12 +8,12 @@
 // no-provider contract. Each run proves which mode it is in first, so a box set up wrong fails loudly rather than
 // skipping. REST = MCP runs in both.
 //
-// `auto` (a question with no search_mode answered by hybrid) is built but off behind HYBRID_AUTO_DEFAULT (core/src/
-// hybrid.ts) until Aaron says yes (DECIDED-HYBRID): its contract is `red()` and the "auto is off" contract guards the
-// default. Flipping the constant removes the red() and replaces the "auto is off" contract in the same pull request.
+// `auto` (a question with no search_mode answered by hybrid) is the default since Aaron's yes (DECIDED-HYBRID, 11-12;
+// the constant HYBRID_AUTO_DEFAULT in core/src/hybrid.ts). A call's search_mode always wins, and a vault can turn it
+// off with `search.auto_hybrid: false` (PATCH /api/vault, admin).
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { door, mcp, rest, runId, safeFetch, token, vaultUrl } from "../door/_door.ts";
-import { must, red } from "../lib.ts";
+import { must } from "../lib.ts";
 
 const EMBEDDED = process.env.DOOR_EMBEDDINGS === "on";
 const writer = rest("write");
@@ -132,30 +132,70 @@ describe.skipIf(!EMBEDDED)("hybrid, with the bundled embeddings", () => {
     expect(hybrid.rows[0]!.matched_by).toContain("keyword");
   });
 
-  test("with auto off, a search without search_mode answers exactly as search_mode literal (and says nothing of auto)", async () => {
-    // The guard on the default (HYBRID_AUTO_DEFAULT = false): byte for byte, for a question, a rare word and a short search.
-    for (const search of [QUESTION, `what did we do about ${rare}`, "weekly team check-in", "lentil stew"]) {
+  test("auto: a 4+ word question with no search_mode is answered by hybrid and says so (search_auto)", async () => {
+    const got = await ask(reader, { search: QUESTION, tag: T });
+    must(got.warnings.some((w) => w.code === "search_auto"), `no search_auto warning: ${JSON.stringify(got.warnings)}; first: ${got.rows[0]?.path}`);
+    expect(got.rows[0]!.id).toBe(idOf.schedule);
+    expect(got.rows[0]!.matched_by).toEqual(["meaning"]);
+  });
+
+  test("what auto does not change: 1-3 word searches, search_mode literal and a search with sort answer exactly as literal, with no search_auto", async () => {
+    for (const search of ["weekly team check-in", "lentil stew", rare]) {
       const plain = await ask(reader, { search, tag: T });
       const literal = await ask(reader, { search_mode: "literal", search, tag: T });
       expect(JSON.stringify(plain.raw)).toBe(JSON.stringify(literal.raw));
       expect(JSON.stringify(plain.raw)).not.toContain("search_auto");
       expect(JSON.stringify(plain.raw)).not.toContain("matched_by");
     }
+    // The per-call override: "literal" on a 4+ word question beats the default.
+    for (const search of [QUESTION, `what did we do about ${rare}`]) {
+      const forced = await ask(reader, { search_mode: "literal", search, tag: T });
+      expect(JSON.stringify(forced.raw)).not.toContain("search_auto");
+      expect(JSON.stringify(forced.raw)).not.toContain("matched_by");
+    }
+    expect((await ask(reader, { search: QUESTION, search_mode: "literal", tag: T })).rows).toEqual([]);
+    // With sort, the question stays literal (hybrid ranks by relevance and would ignore the sort).
+    const sorted = await ask(reader, { search: `what did we do about ${rare}`, sort: "desc", tag: T });
+    const sortedLiteral = await ask(reader, { search: `what did we do about ${rare}`, sort: "desc", search_mode: "literal", tag: T });
+    expect(JSON.stringify(sorted.raw)).toBe(JSON.stringify(sortedLiteral.raw));
+    expect(JSON.stringify(sorted.raw)).not.toContain("search_auto");
   });
 
-  red(
-    "auto: a 4+ word question with no search_mode is answered by hybrid and says so (search_auto)",
-    { reason: /no search_auto warning/, lane: "0.9.3 hybrid auto default off until Aaron's yes" },
-    async () => {
-      const got = await ask(reader, { search: QUESTION, tag: T });
-      must(got.warnings.some((w) => w.code === "search_auto"), `no search_auto warning: ${JSON.stringify(got.warnings)}; first: ${got.rows[0]?.path}`);
-      expect(got.rows[0]!.id).toBe(idOf.schedule);
-      // A short search stays literal, exactly as search_mode literal answers it.
-      const short = await ask(reader, { search: "lentil stew", tag: T });
-      expect(JSON.stringify(short.raw)).toBe(JSON.stringify((await ask(reader, { search: "lentil stew", search_mode: "literal", tag: T })).raw));
-    },
-    120_000,
-  );
+  test("the vault's own setting: search.auto_hybrid false answers a question literally, true answers it by hybrid, unset follows the default; only admin sets it", async () => {
+    const setting = async (v: boolean | null) => admin.patch("/vault", { config: { search: { auto_hybrid: v } } });
+    const autoOf = async () => (await ask(reader, { search: QUESTION, tag: T })).warnings.some((w) => w.code === "search_auto");
+    try {
+      const off = await setting(false);
+      expect(off.status).toBe(200);
+      expect(off.body.config.search.auto_hybrid).toBe(false);
+      must(!(await autoOf()), "search.auto_hybrid false still answered by hybrid");
+      const literal = await ask(reader, { search: QUESTION, search_mode: "literal", tag: T });
+      const plain = await ask(reader, { search: QUESTION, tag: T });
+      expect(JSON.stringify(plain.raw)).toBe(JSON.stringify(literal.raw));
+      // The per-call word still wins over the vault's setting.
+      const forced = await ask(reader, { search: QUESTION, search_mode: "hybrid", tag: T });
+      expect(forced.rows[0]?.id).toBe(idOf.schedule);
+      expect((await admin.get("/vault")).body.config.search.auto_hybrid).toBe(false);
+
+      expect((await setting(true)).status).toBe(200);
+      must(await autoOf(), "search.auto_hybrid true did not answer by hybrid");
+
+      expect((await setting(null)).status).toBe(200);
+      must(await autoOf(), "unset did not follow the default (on)");
+      expect((await admin.get("/vault")).body.config.search.auto_hybrid).toBe(true);
+
+      // Only an admin sets it; a bad value is refused; nothing changed.
+      const denied = await writer.patch("/vault", { config: { search: { auto_hybrid: false } } });
+      expect(denied.status).toBe(403);
+      const bad = await admin.patch("/vault", { config: { search: { auto_hybrid: "no" } } });
+      expect(bad.status).toBe(400);
+      must(await autoOf(), "a refused write changed the setting");
+      // A non-admin does not see it.
+      expect(JSON.stringify((await writer.get("/vault")).body)).not.toContain("auto_hybrid");
+    } finally {
+      await setting(null);
+    }
+  });
 });
 
 describe.skipIf(EMBEDDED)("hybrid, with no embedding provider", () => {
@@ -216,6 +256,14 @@ describe.skipIf(!EMBEDDED)("hybrid and tag scope (box: the scoped pass is minted
   test("a scoped session gets a full page of in-scope notes from hybrid, and nothing out of scope shows anywhere in the reply", async () => {
     const got = await ask(scopedMcp, { search: QUESTION, search_mode: "hybrid", limit: 5 });
     must(got.rows.length === 5, `a scoped caller's page is not full: ${got.rows.length} of 5 (${JSON.stringify(got.rows.map((n) => n.path))})`);
+    expect(got.rows.every((n) => mineIds.has(n.id))).toBe(true);
+    const text = JSON.stringify(got.raw);
+    for (const leak of [OTHER, `${r}/other`, rareOther, ...hiddenIds]) expect(text).not.toContain(leak);
+  });
+
+  test("auto answers a scoped session over what it can see too: a full page, nothing out of scope anywhere in the reply", async () => {
+    const got = await ask(scopedMcp, { search: QUESTION, limit: 5 });
+    must(got.rows.length === 5, `a scoped caller's auto page is not full: ${got.rows.length} of 5`);
     expect(got.rows.every((n) => mineIds.has(n.id))).toBe(true);
     const text = JSON.stringify(got.raw);
     for (const leak of [OTHER, `${r}/other`, rareOther, ...hiddenIds]) expect(text).not.toContain(leak);
