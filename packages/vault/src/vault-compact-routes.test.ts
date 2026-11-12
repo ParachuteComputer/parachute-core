@@ -54,7 +54,7 @@ test("P9/P18 compacted REST and MCP versions roundtrip with exact keys", async (
   const get = await call(`/notes/${n.id}/versions/0`);
   expect(get.status).toBe(200);
   expect(get.body.content).toBe(before.content);
-  expect(get.body.encoding).toBe("fossil-delta");
+  expect(get.body.encoding).toBe("fossil-delta-z");
   expect(Object.keys(get.body).sort()).toEqual(["note_id", "version_ix", "content_hash", "path", "metadata", "extension", "superseded_at", "actor", "via", "via_kind", "op", "content_len", "encoding", "created_at", "content"].sort());
   const list = await call(`/notes/${n.id}/versions?limit=2`);
   expect(list.body.total).toBe(await store.countNoteVersions(n.id));
@@ -165,11 +165,11 @@ for (const corruption of ["missing", "unknown", "checksum"]) {
     else if (corruption === "unknown")
       store.db.prepare("UPDATE note_blobs SET encoding='fossil-delta-v9' WHERE hash=?").run(v.content_hash);
     else {
-      const base = store.db.prepare("SELECT content FROM note_blobs WHERE hash=?").get(blob.delta_of) as any;
-      const damaged = base.content.replaceAll("a", "Z");
-      expect(codec).not.toBeNull();
-      expect(() => codec!.decodeDelta(damaged, blob.content)).toThrow("bad checksum");
-      store.db.prepare("UPDATE note_blobs SET content=? WHERE hash=?").run(damaged, blob.delta_of);
+      // The base is stored compressed (schema 33): damage its body and store it the same way.
+      const damaged = history.readBlobContent(store.db, blob.delta_of)!.replaceAll("a", "Z");
+      const w = history.encodeWhole(damaged);
+      expect(w.encoding).toBe("deflate");
+      store.db.prepare("UPDATE note_blobs SET content=?, byte_size=? WHERE hash=?").run(w.content, w.byte_size, blob.delta_of);
       let failure: unknown;
       try { history.readBlobContent(store.db, v.content_hash!); } catch (err) { failure = err; }
       expect(failure).toBeInstanceOf(history.HistoryDeltaOrphanError);

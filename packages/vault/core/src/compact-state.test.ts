@@ -9,7 +9,7 @@ import { applyImportedNote, beginImportRun, importTargetDigest } from "./history
 let db: Database, store: BunSqliteStore;
 beforeEach(() => { db = new Database(":memory:"); store = new BunSqliteStore(db, { history: { compact_min_versions: 2, compact_ratio: 1 } }); });
 afterEach(() => db.close());
-const state = (id: string) => db.query("SELECT versions,stored,live,refused FROM history_compact_state WHERE note_id=?").get(id) as { versions: number; stored: number; live: number; refused: number } | null;
+const state = (id: string) => db.query("SELECT versions,stored,live,refused,legacy FROM history_compact_state WHERE note_id=?").get(id) as { versions: number; stored: number; live: number; refused: number; legacy: number } | null;
 test("live bytes refresh after mutation, empty histories are excluded and nonempty edits re-arm", async () => {
   const n = await store.createNote("large".repeat(1000));
   await store.updateNote(n.id, { append: "changed" });
@@ -50,7 +50,7 @@ test("v31 migration backfills deleted and live history once and preserves bodies
   const before = db.query("SELECT * FROM note_versions").all();
   db.exec("DROP TABLE history_compact_state; UPDATE schema_version SET version=31");
   initSchema(db);
-  expect(state(n.id)).toEqual({ versions: 2, stored: 6, live: 3, refused: 0 });
+  expect(state(n.id)).toEqual({ versions: 2, stored: 6, live: 3, refused: 0, legacy: 0 });
   expect(db.query("PRAGMA foreign_key_list(history_compact_state)").all()).toEqual([]);
   expect(db.query("SELECT * FROM note_versions").all()).toEqual(before);
   expect((await store.getNoteVersion(n.id, 0))?.content).toBe("old");
@@ -74,7 +74,7 @@ test("prune, imported observations, deleted compaction and sweep maintain exact 
   const n = await store.createNote("body".repeat(1000));
   const exact = () => {
     const actual = readCompactState(db, n.id)!;
-    expect(state(n.id)).toMatchObject({ versions: actual.versions, stored: actual.stored, live: actual.live });
+    expect(state(n.id)).toMatchObject({ versions: actual.versions, stored: actual.stored, live: actual.live, legacy: actual.legacy });
   };
   for (let i=0;i<4;i++) { await store.updateNote(n.id, { append: String(i) }); exact(); }
   const policy = resolveHistoryPolicy({ min_versions: 1, max_versions: 2, compact_min_versions: 2, compact_ratio: 1 });
@@ -87,7 +87,7 @@ test("prune, imported observations, deleted compaction and sweep maintain exact 
   expect(store.compactNote(n.id).blobs_deltified).toBeGreaterThan(0); exact();
   const remaining = await store.listNoteVersions(n.id);
   for (const v of remaining) expect((await store.getNoteVersion(n.id, v.version_ix))?.content).not.toBeNull();
-  expect(db.query("SELECT 1 FROM note_blobs b JOIN note_blobs base ON base.hash=b.delta_of WHERE base.encoding IS NOT NULL").all()).toEqual([]);
+  expect(db.query("SELECT 1 FROM note_blobs b JOIN note_blobs base ON base.hash=b.delta_of WHERE NOT (base.encoding IS NULL OR base.encoding = 'deflate')").all()).toEqual([]);
   expect(db.query("PRAGMA foreign_key_check").all()).toEqual([]);
   sweepDeletedHistory(db, resolveHistoryPolicy({ deleted_retention_days: 1 }), new Date(Date.now()+3*86400000));
   expect(state(n.id)).toBeNull();
@@ -120,10 +120,14 @@ test("empty live content still obeys the history byte ceiling", async () => {
   const n = await store.createNote(body());
   for(let i=0;i<5;i++) await store.updateNote(n.id, { content: body() });
   await store.updateNote(n.id, { content: "" });
-  expect(state(n.id)?.stored).toBe(180000);
+  // Stored bytes are compressed now (hex is about half), the ceiling counts them, and still holds with live 0.
+  const stored = (db.query("SELECT SUM(b.byte_size) AS n FROM (SELECT DISTINCT content_hash FROM note_versions WHERE note_id=?) v JOIN note_blobs b ON b.hash=v.content_hash").get(n.id) as { n: number }).n;
+  expect(state(n.id)?.stored).toBe(stored);
+  expect(stored).toBeGreaterThan(65536);
   const pass = store.compactHistory({ budgetMs: null, maxNotes: null });
   expect(pass.notes_scanned).toBe(1);
-  expect(pass.versions_dropped).toBe(4);
-  expect(state(n.id)).toMatchObject({ stored: 60000, live: 0, refused: 0 });
+  expect(pass.versions_dropped).toBeGreaterThan(0);
+  expect(state(n.id)).toMatchObject({ live: 0, refused: 1 });
+  expect(state(n.id)!.stored).toBeLessThanOrEqual(65536);
   expect(store.compactHistory({ budgetMs: null, maxNotes: null }).notes_scanned).toBe(0);
 });

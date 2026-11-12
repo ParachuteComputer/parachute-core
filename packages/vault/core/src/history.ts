@@ -12,8 +12,8 @@
  */
 import type { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { encodeDelta, applyDeltaBytes } from "./delta.js";
-import { isWhole, isDelta, wholeText, deltaBytes, wholeSql, BlobDecodeError, type StoredContent } from "./blob-codec.js";
+import { applyDeltaBytes, createDeltaBytes, fromBase64 } from "./delta.js";
+import { isWhole, isDelta, wholeText, deltaBytes, wholeSql, deflateBytes, BlobDecodeError, COMPRESS_MIN_BYTES, LEGACY_BLOB_SQL, type StoredContent } from "./blob-codec.js";
 import { kindOfVia } from "./write-stamp.js";
 import { transaction } from "./txn.js";
 import { refreshCompactState } from "./history-compact-state.js";
@@ -38,20 +38,33 @@ export interface HistoryPolicy {
   compact_min_versions: number;
   compact_run_length: number;
   max_bytes_per_note: number | null;
+  /**
+   * Retention tiers (T-460, 1.0): every version for `keep_all_days`, then the first version of each UTC day up to
+   * `keep_daily_days`, then the first of each ISO week, for good. The newest `min_versions`, delete tombstones and
+   * marked versions are always kept. `null` turns tiers off. `max_versions` / `max_age_days` still apply on top
+   * when a vault sets them (their 1.0 defaults are no cap).
+   */
+  keep_all_days: number | null;
+  keep_daily_days: number;
   compact_budget_ms: number;
   compact_max_notes: number;
 }
 export const DEFAULT_HISTORY_POLICY: HistoryPolicy = {
   enabled: true,
   min_versions: 20,
-  max_versions: 100,
-  max_age_days: 180,
+  // 1.0 (T-460): the retention tiers decide what goes; no count or age cap unless a vault sets one.
+  max_versions: 1_000_000,
+  max_age_days: 36_500,
   deleted_retention_days: null,
   compact_enabled: true,
-  compact_ratio: 3,
-  compact_min_versions: 10,
+  // T-460: always on. A note with two versions whose bodies add up to more than its live body is a candidate; the
+  // pass compresses every blob and stores the rest of each run of 24 as a delta against its first.
+  compact_ratio: 1,
+  compact_min_versions: 2,
   compact_run_length: 24,
   max_bytes_per_note: 8_388_608,
+  keep_all_days: 90,
+  keep_daily_days: 365,
   compact_budget_ms: 250,
   compact_max_notes: 50,
 };
@@ -69,6 +82,12 @@ export function resolveHistoryPolicy(
   p.compact_run_length = Math.min(100, Math.max(2, p.compact_run_length));
   if (p.max_bytes_per_note !== null) p.max_bytes_per_note = Math.max(65_536, p.max_bytes_per_note);
   p.compact_budget_ms = Math.min(60_000, Math.max(0, p.compact_budget_ms));
+  if (p.keep_all_days !== null) {
+    const all = Number(p.keep_all_days);
+    p.keep_all_days = Number.isFinite(all) ? Math.floor(Math.min(36_500, Math.max(0, all))) : DEFAULT_HISTORY_POLICY.keep_all_days;
+  }
+  const daily = Number(p.keep_daily_days);
+  p.keep_daily_days = Math.floor(Math.min(36_500, Math.max(p.keep_all_days ?? 0, Number.isFinite(daily) ? daily : DEFAULT_HISTORY_POLICY.keep_daily_days)));
   p.compact_max_notes = Math.min(10_000, Math.max(0, p.compact_max_notes));
   return p;
 }
@@ -94,6 +113,9 @@ export interface VersionRow {
   via: string | null;
   /** The kind of the key in `via` (person, agent, app, service), or null: the write stamp (write-stamp.ts). */
   via_kind: string | null;
+  /** Set only on a marked version (T-460, 1.0): when it was marked and by whom. */
+  marked_at?: string;
+  marked_by?: string | null;
   op: HistoryOp;
   content_len: number;
   encoding: string | null;
@@ -153,6 +175,21 @@ export function hashContent(text: string): string {
 export function byteLength(text: string): number {
   return new TextEncoder().encode(text).length;
 }
+/** A whole body as stored (T-460): deflated when that is smaller, else text. */
+export function encodeWhole(text: string, size = byteLength(text)): { content: string | Uint8Array; byte_size: number; encoding: "deflate" | null } {
+  if (size >= COMPRESS_MIN_BYTES) {
+    const z = deflateBytes(new TextEncoder().encode(text));
+    if (z.byteLength < size) return { content: z, byte_size: z.byteLength, encoding: "deflate" };
+  }
+  return { content: text, byte_size: size, encoding: null };
+}
+/** Store a whole body under its hash, unless the vault already holds that hash (in any encoding). */
+export function insertWholeBlob(db: Database, hash: string, text: string, size = byteLength(text)): void {
+  if (db.prepare("SELECT 1 FROM note_blobs WHERE hash = ?").get(hash)) return;
+  const w = encodeWhole(text, size);
+  db.prepare("INSERT OR IGNORE INTO note_blobs (hash, content, byte_size, encoding) VALUES (?, ?, ?, ?)").run(hash, w.content, w.byte_size, w.encoding);
+}
+
 const present = new WeakMap<Database, boolean>();
 export function historyTablesPresent(db: Database): boolean {
   if (present.get(db)) return true;
@@ -218,13 +255,11 @@ export function captureVersion(
       size,
       prior.created_at,
     );
-    pruneVersions(db, prior.id, opts.policy, Date.now(), false);
+    pruneAtCapture(db, prior.id, opts.policy, Date.now());
     return;
   }
   const hash = hashContent(text);
-  db.prepare(
-    "INSERT OR IGNORE INTO note_blobs (hash, content, byte_size) VALUES (?, ?, ?)",
-  ).run(hash, text, size);
+  insertWholeBlob(db, hash, text, size);
   const ix = nextIndex(db, prior.id);
   db.prepare(
     `INSERT INTO note_versions (note_id, version_ix, content_hash, path, metadata, extension,
@@ -244,7 +279,27 @@ export function captureVersion(
     size,
     prior.created_at,
   );
-  pruneVersions(db, prior.id, opts.policy, Date.now(), false);
+  // The hints follow the capture incrementally (T-460): with 90 days kept whole a note can hold thousands of versions,
+  // so nothing on the write path may read them all. A blob this note already held adds a version, not bytes.
+  const blob = db.prepare("SELECT byte_size, encoding FROM note_blobs WHERE hash = ?").get(hash) as { byte_size: number; encoding: string | null } | null;
+  const held = !!db.prepare("SELECT 1 FROM note_versions WHERE note_id = ? AND content_hash = ? AND version_ix <> ? LIMIT 1").get(prior.id, hash, ix);
+  const legacy = blob && !held && (blob.encoding === "fossil-delta" || (blob.encoding === null && blob.byte_size >= COMPRESS_MIN_BYTES)) ? 1 : 0;
+  db.prepare("UPDATE history_compact_state SET versions = versions + 1, stored = stored + ?, legacy = legacy + ?, refused = 0 WHERE note_id = ?")
+    .run(held || !blob ? 0 : blob.byte_size, legacy, prior.id);
+  pruneAtCapture(db, prior.id, opts.policy, Date.now());
+}
+/**
+ * The prune a capture runs: only when a cap the vault sets is reached (`max_versions`, `max_age_days`), checked from
+ * the hints' count and the oldest row by index, so a long history costs a write nothing. The tiers themselves are
+ * applied by the daily sweep (thinVault), which reaches every note.
+ */
+function pruneAtCapture(db: Database, noteId: string, policy: HistoryPolicy, now: number): void {
+  const hint = db.prepare("SELECT versions FROM history_compact_state WHERE note_id = ?").get(noteId) as { versions: number } | null;
+  const oldest = db.prepare("SELECT superseded_at FROM note_versions WHERE note_id = ? ORDER BY version_ix ASC LIMIT 1").get(noteId) as { superseded_at: string } | null;
+  const cutoff = new Date(now - policy.max_age_days * 86_400_000).toISOString();
+  if (hint && hint.versions < policy.max_versions && (!oldest || oldest.superseded_at >= cutoff)) return;
+  const r = pruneVersions(db, noteId, { ...policy, keep_all_days: null }, now, false);
+  if (r.versionsDeleted > 0) refreshCompactState(db, noteId);
 }
 export function appendRestoreMarker(
   db: Database,
@@ -280,20 +335,23 @@ export function pruneVersions(
 ): { versionsDeleted: number; blobsDeleted: number } {
   const rows = db
     .prepare(
-      "SELECT version_ix, superseded_at, op, content_hash FROM note_versions WHERE note_id = ? ORDER BY version_ix DESC",
+      `SELECT version_ix, superseded_at, op, content_hash, ${markedSql(db)} AS marked FROM note_versions WHERE note_id = ? ORDER BY version_ix DESC`,
     )
-    .all(noteId) as Pick<
+    .all(noteId) as (Pick<
     VersionRow,
     "version_ix" | "superseded_at" | "op" | "content_hash"
-  >[];
+  > & { marked: number })[];
   const cutoff = new Date(
     now - policy.max_age_days * 86_400_000,
   ).toISOString();
+  // A policy without the key (a history-import manifest planned before 1.0) prunes as it was planned: no tiers.
+  const kept = policy.keep_all_days == null ? null : tierKeepers(rows, policy, now);
   const doomed = rows.filter(
     (r, i) =>
       i >= policy.min_versions &&
       r.op !== "delete" &&
-      (i >= policy.max_versions || r.superseded_at < cutoff),
+      !r.marked &&
+      ((kept !== null && !kept.has(r.version_ix)) || i >= policy.max_versions || r.superseded_at < cutoff),
   );
   let versionsDeleted = 0,
     blobsDeleted = 0;
@@ -303,15 +361,130 @@ export function pruneVersions(
       .run(noteId, r.version_ix).changes;
   for (const hash of new Set(
     doomed.map((r) => r.content_hash).filter((h) => h !== null),
-  )) {
-    blobsDeleted += db
-      .prepare(
-        "DELETE FROM note_blobs WHERE hash = ? AND NOT EXISTS (SELECT 1 FROM note_versions WHERE content_hash = ?) AND NOT EXISTS (SELECT 1 FROM note_blobs WHERE delta_of = ?)",
-      )
-      .run(hash, hash, hash).changes;
-  }
+  ))
+    blobsDeleted += dropUnusedBlob(db, hash);
   if (refresh) refreshCompactState(db, noteId);
   return { versionsDeleted, blobsDeleted };
+}
+/**
+ * Delete a blob no version holds and no delta rests on; when it was a delta, then try its base the same way (T-460).
+ * A base whose own version was pruned while deltas still rested on it would otherwise stay for good: with compaction
+ * always on, every hot note left one behind per run. Counted by looking, not by `.changes` (see eraseNoteVersions).
+ * Returns how many blobs went (0, 1 or 2).
+ */
+function dropUnusedBlob(db: Database, hash: string): number {
+  const get = db.prepare("SELECT delta_of FROM note_blobs WHERE hash = ?");
+  const drop = db.prepare(
+    "DELETE FROM note_blobs WHERE hash = ? AND NOT EXISTS (SELECT 1 FROM note_versions WHERE content_hash = ?) AND NOT EXISTS (SELECT 1 FROM note_blobs WHERE delta_of = ?)",
+  );
+  let gone = 0;
+  let next: string | null = hash;
+  for (let depth = 0; depth < 2 && next; depth++) {
+    const row = get.get(next) as { delta_of: string | null } | null;
+    if (!row) break;
+    drop.run(next, next, next);
+    if (get.get(next)) break;
+    gone++;
+    next = row.delta_of;
+  }
+  return gone;
+}
+const marksSeen = new WeakMap<Database, boolean>();
+/**
+ * The SQL for "this version is marked": `marked_at IS NOT NULL` once `note_versions` has the column (the 1.0 marks,
+ * an additive column), else 0. Read here, a release before marks are written already keeps a marked version through
+ * pruning and the byte ceiling, so a rollback from the release that writes them keeps what its people marked.
+ */
+export function markedSql(db: Database): string {
+  if (!marksSeen.get(db)) {
+    const has = (db.prepare("SELECT name FROM pragma_table_info('note_versions')").all() as { name: string }[]).some((c) => c.name === "marked_at");
+    if (!has) return "0";
+    marksSeen.set(db, true);
+  }
+  return "(marked_at IS NOT NULL)";
+}
+/**
+ * Set or clear a version's mark (T-460). A marked version is kept by pruning, the tiers, the byte ceiling and the
+ * deleted-history sweep; erasing a note's history still erases it. Returns the row after, or null when there is no
+ * such version.
+ */
+export function markVersion(db: Database, noteId: string, versionIx: number, mark: { by: string | null } | null): VersionRow | null {
+  const changed = mark
+    ? db.prepare("UPDATE note_versions SET marked_at = COALESCE(marked_at, ?), marked_by = CASE WHEN marked_at IS NULL THEN ? ELSE marked_by END WHERE note_id = ? AND version_ix = ?").run(new Date().toISOString(), mark.by, noteId, versionIx)
+    : db.prepare("UPDATE note_versions SET marked_at = NULL, marked_by = NULL WHERE note_id = ? AND version_ix = ?").run(noteId, versionIx);
+  void changed;
+  const row = db.prepare(`SELECT ${columns}, marked_at, marked_by FROM note_versions WHERE note_id = ? AND version_ix = ?`).get(noteId, versionIx) as (RawVersionRow & { marked_at: string | null; marked_by: string | null }) | null;
+  return row ? withMark(parseRow(row), row) : null;
+}
+/** A version row with its mark: `marked_at` and `marked_by` appear only on a marked version. */
+function withMark<T extends object>(row: T, raw: { marked_at?: string | null; marked_by?: string | null }): T {
+  const { marked_at: _a, marked_by: _b, ...rest } = row as T & { marked_at?: unknown; marked_by?: unknown };
+  return raw.marked_at ? { ...(rest as T), marked_at: raw.marked_at, marked_by: raw.marked_by ?? null } : (rest as T);
+}
+const DAY_MS = 86_400_000;
+/**
+ * The versions the tiers keep (T-460): every one newer than `keep_all_days`; past that, up to `keep_daily_days`, the
+ * earliest of each UTC day; past that, the earliest of each ISO week (Monday to Sunday, UTC). The earliest version
+ * in a day or week holds the note as it stood when that day or week began. A version with an unreadable time is
+ * kept. The floor, tombstones and marks are the caller's.
+ */
+export function tierKeepers(rows: readonly { version_ix: number; superseded_at: string }[], policy: Pick<HistoryPolicy, "keep_all_days" | "keep_daily_days">, now: number): Set<number> {
+  const keep = new Set<number>();
+  const seen = new Set<string>();
+  const allAfter = now - (policy.keep_all_days ?? 0) * DAY_MS;
+  const dailyAfter = now - policy.keep_daily_days * DAY_MS;
+  const oldestFirst = [...rows].sort((a, b) => (a.superseded_at < b.superseded_at ? -1 : a.superseded_at > b.superseded_at ? 1 : a.version_ix - b.version_ix));
+  for (const r of oldestFirst) {
+    const t = Date.parse(r.superseded_at);
+    if (!Number.isFinite(t) || t >= allAfter) {
+      keep.add(r.version_ix);
+      continue;
+    }
+    const day = Math.floor(t / DAY_MS);
+    // 1970-01-01 was a Thursday: shifting by three days makes weeks start on Monday.
+    const bucket = t >= dailyAfter ? `d${day}` : `w${Math.floor((day + 3) / 7)}`;
+    if (seen.has(bucket)) continue;
+    seen.add(bucket);
+    keep.add(r.version_ix);
+  }
+  return keep;
+}
+/**
+ * The tiers' sweep (T-460): thinning must reach notes nobody edits, so the maintenance pass visits each note with
+ * history at most once a day, the one swept longest ago first (the hints' `refreshed_at`), and applies the same
+ * pruning a capture does. Bounded by `budgetMs` (checked between notes; one note is always tried) and `maxNotes`.
+ */
+export function thinVault(db: Database, policy: HistoryPolicy, opts: { budgetMs: number | null; maxNotes: number; now?: number }): { notes_thinned: number; versions_thinned: number; remaining: number } {
+  const out = { notes_thinned: 0, versions_thinned: 0, remaining: 0 };
+  if (!policy.enabled || policy.keep_all_days == null || !historyTablesPresent(db)) return out;
+  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='history_compact_state'").get()) return out;
+  const now = opts.now ?? Date.now();
+  const started = performance.now();
+  const due = now - DAY_MS;
+  const candidates = db.prepare("SELECT note_id, refused FROM history_compact_state WHERE refreshed_at < ? ORDER BY refreshed_at LIMIT ?").all(due, Math.max(0, opts.maxNotes)) as { note_id: string; refused: number }[];
+  let visited = 0;
+  for (const c of candidates) {
+    if (visited > 0 && opts.budgetMs !== null && performance.now() - started >= opts.budgetMs) break;
+    visited++;
+    try {
+      transaction(db, () => {
+        const r = pruneVersions(db, c.note_id, policy, now, false);
+        if (r.versionsDeleted > 0) {
+          out.notes_thinned++;
+          out.versions_thinned += r.versionsDeleted;
+          refreshCompactState(db, c.note_id, { refused: c.refused === 1 });
+        }
+      });
+    }
+    catch (err) {
+      // One note that can't be thinned waits for tomorrow; it never stops the pass or the maintenance after it.
+      console.warn("[history] thinning failed", c.note_id, err);
+    }
+    // Only the sweep moves `refreshed_at`, so every note, edited or not, comes round once a day.
+    db.prepare("UPDATE history_compact_state SET refreshed_at = ? WHERE note_id = ?").run(Date.now(), c.note_id);
+  }
+  out.remaining = (db.prepare("SELECT COUNT(*) AS n FROM history_compact_state WHERE refreshed_at < ?").get(due) as { n: number }).n;
+  return out;
 }
 export function gcBlobs(db: Database): { blobsDeleted: number } {
   let blobsDeleted = 0;
@@ -342,16 +515,23 @@ export function sweepDeletedHistory(
   return transaction(db, () => {
     let versionsDeleted = 0;
     for (const v of victims) {
+      // A marked version is kept for good, past a deleted note's retention too (T-460); its note's other rows go.
       versionsDeleted += db
-        .prepare("DELETE FROM note_versions WHERE note_id = ?")
+        .prepare(`DELETE FROM note_versions WHERE note_id = ? AND NOT ${markedSql(db)}`)
         .run(v.note_id).changes;
-      db.prepare("DELETE FROM history_compact_state WHERE note_id=?").run(v.note_id);
+      if (!db.prepare("SELECT 1 FROM note_versions WHERE note_id = ? LIMIT 1").get(v.note_id))
+        db.prepare("DELETE FROM history_compact_state WHERE note_id=?").run(v.note_id);
+      else refreshCompactState(db, v.note_id);
     }
     return { notesSwept: victims.length, versionsDeleted, ...gcBlobs(db) };
   });
 }
 const columns =
   "note_id, version_ix, content_hash, path, metadata, extension, superseded_at, actor, via, via_kind, op, content_len, encoding, created_at";
+/** The mark columns to select, when the vault has them. */
+function markColumns(db: Database): string {
+  return markedSql(db) === "0" ? "" : ", marked_at, marked_by";
+}
 function parseRow(row: RawVersionRow): VersionRow {
   let metadata: Record<string, unknown> = {};
   try {
@@ -367,10 +547,10 @@ export function listVersions(
   return (
     db
       .prepare(
-        `SELECT ${columns} FROM note_versions WHERE note_id = ? ORDER BY version_ix DESC LIMIT ? OFFSET ?`,
+        `SELECT ${columns}${markColumns(db)} FROM note_versions WHERE note_id = ? ORDER BY version_ix DESC LIMIT ? OFFSET ?`,
       )
-      .all(noteId, opts?.limit ?? 50, opts?.offset ?? 0) as RawVersionRow[]
-  ).map(parseRow);
+      .all(noteId, opts?.limit ?? 50, opts?.offset ?? 0) as (RawVersionRow & { marked_at?: string | null; marked_by?: string | null })[]
+  ).map((r) => withMark(parseRow(r), r));
 }
 export function getVersion(
   db: Database,
@@ -382,7 +562,7 @@ export function getVersion(
       `SELECT ${columns
         .split(", ")
         .map((c) => "v." + c)
-        .join(", ")}, b.content, b.encoding AS blob_encoding, b.delta_of
+        .join(", ")}${markColumns(db).replaceAll(" marked", " v.marked")}, b.content, b.encoding AS blob_encoding, b.delta_of
     FROM note_versions v LEFT JOIN note_blobs b ON b.hash = v.content_hash WHERE v.note_id = ? AND v.version_ix = ?`,
     )
     .get(noteId, versionIx) as
@@ -392,7 +572,7 @@ export function getVersion(
   const { content, blob_encoding, delta_of, ...verCols } = row;
   try {
     const reconstructed = materialise(db, verCols.content_hash!, { content, blob_encoding, delta_of });
-    return { ...parseRow(verCols), content: reconstructed, encoding: verCols.encoding ?? blob_encoding };
+    return { ...withMark(parseRow(verCols), verCols as { marked_at?: string | null; marked_by?: string | null }), content: reconstructed, encoding: verCols.encoding ?? blob_encoding };
   } catch (err) {
     if (!(err instanceof HistoryDeltaOrphanError)) throw err;
     console.warn("[history] unrecoverable delta", { hash: err.hash, delta_of: err.delta_of, reason: err.reason });
@@ -651,7 +831,10 @@ export function topNotesByHistoryBytes(db: Database, limit: number): {
   }[];
 }
 export interface CompactResult {
+  /** Blobs stored as a delta against their run's base this pass. */
   blobs_deltified: number;
+  /** Blobs re-stored compressed this pass: a whole body deflated, or an old base64 delta as deflated bytes (T-460). */
+  blobs_compressed: number;
   blobs_skipped_too_large: number;
   versions_dropped: number;
   bytes_before: number;
@@ -662,15 +845,20 @@ export interface CompactSummary {
   notes_compacted: number;
   notes_failed: number;
   blobs_deltified: number;
+  blobs_compressed: number;
   versions_dropped: number;
   bytes_before: number;
   bytes_after: number;
   remaining_candidates: number;
   duration_ms: number;
   stopped_by: "complete" | "budget" | "max_notes" | "disabled";
+  /** A whole-vault maintenance pass (Store.compactHistory) also applies the retention tiers to notes not swept for a day (T-460). */
+  notes_thinned?: number;
+  versions_thinned?: number;
+  thin_remaining?: number;
 }
 export function compactNote(db: Database, noteId: string, policy: HistoryPolicy): CompactResult {
-  const result: CompactResult = { blobs_deltified: 0, blobs_skipped_too_large: 0, versions_dropped: 0, bytes_before: 0, bytes_after: 0 };
+  const result: CompactResult = { blobs_deltified: 0, blobs_compressed: 0, blobs_skipped_too_large: 0, versions_dropped: 0, bytes_before: 0, bytes_after: 0 };
   if (!policy.enabled || !policy.compact_enabled || !historyTablesPresent(db))
     return result;
   return transaction(db, () => {
@@ -687,7 +875,9 @@ export function compactNote(db: Database, noteId: string, policy: HistoryPolicy)
       const prior = db.prepare("SELECT refused FROM history_compact_state WHERE note_id=?").get(id) as { refused: number } | null;
       refreshCompactState(db, id, { refused: prior?.refused === 1 });
     }
-    refreshCompactState(db, noteId, { refused: result.blobs_deltified === 0 && result.versions_dropped === 0 });
+    // A pass leaves the note as compact as these rules make it, so it waits for its next write (T-460: the logical
+    // trigger would otherwise keep a compacted note a candidate for ever).
+    refreshCompactState(db, noteId, { refused: true });
     return result;
   };
   const rows = db.prepare("SELECT version_ix, content_hash, content_len FROM note_versions WHERE note_id = ? AND content_hash IS NOT NULL ORDER BY version_ix DESC").all(noteId) as {
@@ -705,56 +895,114 @@ export function compactNote(db: Database, noteId: string, policy: HistoryPolicy)
     : null;
   const live = current?.content == null ? newest?.content_len ?? 0 : byteLength(current.content);
   const overBytes = policy.max_bytes_per_note !== null && stored > policy.max_bytes_per_note;
-  if (!overBytes && rows.length < policy.compact_min_versions)
+  // Logical sizes (T-460): stored bytes are compressed, so comparing them with the live body would rarely fire.
+  const logical = (db.prepare(`SELECT COALESCE(SUM(content_len), 0) AS n FROM (SELECT DISTINCT content_hash, content_len
+    FROM note_versions WHERE note_id = ? AND content_hash IS NOT NULL)`).get(noteId) as { n: number }).n;
+  const legacy = !!db.prepare(`SELECT 1 FROM note_versions v JOIN note_blobs b ON b.hash = v.content_hash
+    WHERE v.note_id = ? AND ${LEGACY_BLOB_SQL} LIMIT 1`).get(noteId);
+  const due = rows.length >= policy.compact_min_versions && logical > policy.compact_ratio * Math.max(live, 1);
+  if (!overBytes && !legacy && !due)
     return finish();
-  if (!overBytes && stored <= policy.compact_ratio * Math.max(live, 1))
-    return finish();
-    for (let start = 0; start < rows.length; start += policy.compact_run_length) {
-      const run = rows.slice(start, start + policy.compact_run_length);
-      const baseRow = db.prepare("SELECT hash, encoding, delta_of FROM note_blobs WHERE hash = ?").get(run[0]!.content_hash) as {
-        hash: string;
-        encoding: string | null;
-        delta_of: string | null;
-      } | null;
-      if (!baseRow)
+  type Blob = { hash: string; content: StoredContent; byte_size: number; encoding: string | null; delta_of: string | null };
+  const getBlob = db.prepare("SELECT hash, content, byte_size, encoding, delta_of FROM note_blobs WHERE hash = ?");
+  const getEncoding = db.prepare("SELECT encoding FROM note_blobs WHERE hash = ?");
+  const isBase = db.prepare("SELECT 1 FROM note_blobs WHERE delta_of = ? LIMIT 1");
+  /**
+   * Overwrite a blob in place, but only once the new bytes have been read back through the read path itself
+   * (materialise: decode, apply, hash): a codec fault then skips a blob instead of damaging its only copy.
+   */
+  const store = (hash: string, before: Blob, content: Uint8Array, size: number, encoding: string, deltaOf: string | null) => {
+    try {
+      if (materialise(db, hash, { content, blob_encoding: encoding, delta_of: deltaOf }) === null) return false;
+    }
+    catch (err) {
+      if (!(err instanceof HistoryDeltaOrphanError)) throw err;
+      console.warn("[history] a re-encoded blob did not read back; left as it was", { hash, encoding, reason: err.reason });
+      return false;
+    }
+    // Guarded on what was read, so a row changed under us (never, inside this transaction) is left alone.
+    const changed = db.prepare("UPDATE note_blobs SET content = ?, byte_size = ?, encoding = ?, delta_of = ? WHERE hash = ? AND encoding IS ? AND byte_size = ?")
+      .run(content, size, encoding, deltaOf, hash, before.encoding, before.byte_size).changes;
+    if (changed) changedHashes.add(hash);
+    return changed > 0;
+  };
+  /** Re-store a whole blob deflated when it is text and deflate is smaller. */
+  const compressWhole = (b: Blob, text: string) => {
+    if (b.encoding !== null) return;
+    const w = encodeWhole(text, b.byte_size);
+    if (w.encoding === "deflate" && store(b.hash, b, w.content as Uint8Array, w.byte_size, w.encoding, null)) result.blobs_compressed++;
+  };
+  // Runs of 24, newest first. A run's base is a whole blob in it that deltas already rest on, if there is one, else
+  // its newest body. Reusing a standing base keeps the star when passes come after every write or two (as on Cloud,
+  // one per wake): otherwise each pass made its newest version a new base and left every second version whole. The
+  // base moves on once the standing one has slid out of the newest run, about every 24 versions.
+  const standing = (run: typeof rows) => run.find((r) => isBase.get(r.content_hash) && isWhole((getEncoding.get(r.content_hash) as { encoding: string | null } | null)?.encoding ?? "missing"));
+  const seen = new Set<string>();
+  for (let start = 0; start < rows.length; start += policy.compact_run_length) {
+    const run = rows.slice(start, start + policy.compact_run_length);
+    // The run's newest body must resolve to a whole base before anything in the run is touched: a pre-existing
+    // depth-two chain stops the note (P23), whichever base the run then uses.
+    const first = getBlob.get(run[0]!.content_hash) as Blob | null;
+    const firstBase = first ? (isWhole(first.encoding) ? first : first.delta_of ? getBlob.get(first.delta_of) as Blob | null : null) : null;
+    if (first && firstBase && !isWhole(firstBase.encoding))
+      throw new HistoryDeltaOrphanError(first.hash, firstBase.hash, "base_not_whole");
+    const pick = standing(run);
+    const baseRow = pick ? getBlob.get(pick.content_hash) as Blob | null : first;
+    if (!baseRow)
+      continue;
+    const baseHash = isWhole(baseRow.encoding) ? baseRow.hash : baseRow.delta_of;
+    if (!baseHash)
+      continue;
+    const base = getBlob.get(baseHash) as Blob | null;
+    if (!base)
+      continue;
+    // Never propagate a pre-existing depth-two chain into healthy blobs.
+    if (!isWhole(base.encoding))
+      throw new HistoryDeltaOrphanError(baseRow.hash, baseHash, "base_not_whole");
+    const text = readBlobContent(db, baseHash);
+    if (text === null)
+      continue;
+    if (!seen.has(baseHash)) {
+      seen.add(baseHash);
+      compressWhole(base, text);
+    }
+    for (const r of run) {
+      if (r.content_hash === baseHash || seen.has(r.content_hash))
         continue;
-      const baseHash = isWhole(baseRow.encoding) ? baseRow.hash : baseRow.delta_of;
-      if (!baseHash)
+      seen.add(r.content_hash);
+      // Settled blobs (compressed deltas) are passed over without loading their bytes.
+      const encoding = (getEncoding.get(r.content_hash) as { encoding: string | null } | null)?.encoding;
+      if (encoding === undefined || encoding === "fossil-delta-z")
         continue;
-      const base = db.prepare("SELECT encoding FROM note_blobs WHERE hash = ?").get(baseHash) as {
-        encoding: string | null;
-      } | null;
-      if (!base)
+      const b = getBlob.get(r.content_hash) as Blob;
+      if (b.encoding === "fossil-delta") {
+        // A legacy delta keeps its base; only its bytes move: base64 text to raw bytes, deflated.
+        if (typeof b.content !== "string") continue;
+        const z = deflateBytes(fromBase64(b.content));
+        if (store(b.hash, b, z, z.byteLength, "fossil-delta-z", b.delta_of)) result.blobs_compressed++;
         continue;
-      // Never propagate a pre-existing depth-two chain into healthy blobs.
-      if (!isWhole(base.encoding))
-        throw new HistoryDeltaOrphanError(baseRow.hash, baseHash, "base_not_whole");
-      const text = readBlobContent(db, baseHash);
-      if (text === null)
+      }
+      if (!isWhole(b.encoding))
         continue;
-      for (const r of run.slice(1)) {
-        if (r.content_hash === baseHash)
-          continue;
-        const b = db.prepare("SELECT hash, content, byte_size, encoding FROM note_blobs WHERE hash = ?").get(r.content_hash) as {
-          hash: string;
-          content: string;
-          byte_size: number;
-          encoding: string | null;
-        } | null;
-        if (!b || b.encoding !== null)
-          continue;
-        if (db.prepare("SELECT 1 FROM note_blobs WHERE delta_of = ? LIMIT 1").get(b.hash))
-          continue;
-        const payload = encodeDelta(text, b.content);
-        if (payload.length >= b.byte_size * 0.9) {
-          result.blobs_skipped_too_large++;
-          continue;
-        }
-        const changed = db.prepare("UPDATE note_blobs SET content = ?, byte_size = ?, encoding = 'fossil-delta', delta_of = ? WHERE hash = ? AND encoding IS NULL").run(payload, payload.length, baseHash, b.hash).changes;
-        result.blobs_deltified += changed;
-        if (changed) changedHashes.add(b.hash);
+      const body = readBlobContent(db, b.hash);
+      if (body === null)
+        continue;
+      // A blob other deltas rest on stays whole (depth one); it can still be compressed.
+      if (isBase.get(b.hash)) {
+        compressWhole(b, body);
+        continue;
+      }
+      const wholeSize = b.encoding === "deflate" ? b.byte_size : encodeWhole(body, byteLength(body)).byte_size;
+      const dz = deflateBytes(createDeltaBytes(text, body));
+      if (dz.byteLength < wholeSize * 0.9) {
+        if (store(b.hash, b, dz, dz.byteLength, "fossil-delta-z", baseHash)) result.blobs_deltified++;
+      }
+      else {
+        result.blobs_skipped_too_large++;
+        compressWhole(b, body);
       }
     }
+  }
     if (policy.max_bytes_per_note !== null)
       result.versions_dropped = enforceByteCeiling(db, noteId, policy);
     result.bytes_after = noteHistoryBytes(db, noteId);
@@ -764,12 +1012,12 @@ export function compactNote(db: Database, noteId: string, policy: HistoryPolicy)
 function enforceByteCeiling(db: Database, noteId: string, policy: HistoryPolicy): number {
   let dropped = 0;
   while (policy.max_bytes_per_note !== null && noteHistoryBytes(db, noteId) > policy.max_bytes_per_note) {
-    const rows = db.prepare("SELECT version_ix, op, content_hash FROM note_versions WHERE note_id = ? ORDER BY version_ix ASC").all(noteId) as Pick<VersionRow, "version_ix" | "op" | "content_hash">[];
-    const victim = rows.find((r, i) => r.op !== "delete" && rows.length - 1 - i >= policy.min_versions);
+    const rows = db.prepare(`SELECT version_ix, op, content_hash, ${markedSql(db)} AS marked FROM note_versions WHERE note_id = ? ORDER BY version_ix ASC`).all(noteId) as (Pick<VersionRow, "version_ix" | "op" | "content_hash"> & { marked: number })[];
+    const victim = rows.find((r, i) => r.op !== "delete" && !r.marked && rows.length - 1 - i >= policy.min_versions);
     if (!victim)
       break;
     dropped += db.prepare("DELETE FROM note_versions WHERE note_id = ? AND version_ix = ?").run(noteId, victim.version_ix).changes;
-    db.prepare("DELETE FROM note_blobs WHERE hash = ? AND NOT EXISTS (SELECT 1 FROM note_versions WHERE content_hash = ?) AND NOT EXISTS (SELECT 1 FROM note_blobs WHERE delta_of = ?)").run(victim.content_hash, victim.content_hash, victim.content_hash);
+    if (victim.content_hash) dropUnusedBlob(db, victim.content_hash);
   }
   return dropped;
 }
@@ -778,7 +1026,7 @@ export function compactVault(db: Database, policy: HistoryPolicy, opts?: {
   budgetMs?: number | null;
   maxNotes?: number | null;
 }): CompactSummary {
-  const result: CompactSummary = { notes_scanned: 0, notes_compacted: 0, notes_failed: 0, blobs_deltified: 0, versions_dropped: 0, bytes_before: 0, bytes_after: 0, remaining_candidates: 0, duration_ms: 0, stopped_by: "complete" };
+  const result: CompactSummary = { notes_scanned: 0, notes_compacted: 0, notes_failed: 0, blobs_deltified: 0, blobs_compressed: 0, versions_dropped: 0, bytes_before: 0, bytes_after: 0, remaining_candidates: 0, duration_ms: 0, stopped_by: "complete" };
   if (!historyTablesPresent(db) || !policy.enabled || !policy.compact_enabled)
     return { ...result, stopped_by: "disabled" };
   const budget = opts?.budgetMs === undefined ? policy.compact_budget_ms : opts.budgetMs;
@@ -788,8 +1036,11 @@ export function compactVault(db: Database, policy: HistoryPolicy, opts?: {
   if (budget !== null && budget <= 0)
     return { ...result, stopped_by: "budget" };
   const started = performance.now();
-  const predicate = `refused=0 AND ((live>0 AND versions >= ? AND stored > ? * MAX(live,1)) OR (? IS NOT NULL AND stored > ?))`;
-  const args = [policy.compact_min_versions, policy.compact_ratio, policy.max_bytes_per_note, policy.max_bytes_per_note];
+  // Always on (T-460): a note with enough versions is a candidate until a pass leaves it refused; compactNote applies
+  // the size rule on logical sizes itself, so the hints refreshed on every write stay cheap. `legacy` (v33) adds
+  // notes holding blobs stored the old way, whatever their count.
+  const predicate = `refused=0 AND (legacy > 0 OR (live>0 AND versions >= ?) OR (? IS NOT NULL AND stored > ?))`;
+  const args = [policy.compact_min_versions, policy.max_bytes_per_note, policy.max_bytes_per_note];
   const total = opts?.noteId !== undefined ? 1 : (db.prepare(`SELECT COUNT(*) AS n FROM history_compact_state WHERE ${predicate}`).get(...args) as { n: number }).n;
   const candidates = opts?.noteId !== undefined ? [{ note_id: opts.noteId }] : db.prepare(`SELECT note_id FROM history_compact_state WHERE ${predicate} ORDER BY stored DESC LIMIT ?`).all(...args, max === null ? -1 : max * 4) as {
     note_id: string;
@@ -807,9 +1058,10 @@ export function compactVault(db: Database, policy: HistoryPolicy, opts?: {
     result.notes_scanned++;
     try {
       const r = compactNote(db, candidate.note_id, policy);
-      if (r.blobs_deltified || r.versions_dropped)
+      if (r.blobs_deltified || r.blobs_compressed || r.versions_dropped)
         result.notes_compacted++;
       result.blobs_deltified += r.blobs_deltified;
+      result.blobs_compressed += r.blobs_compressed;
       result.versions_dropped += r.versions_dropped;
       result.bytes_before += r.bytes_before;
       result.bytes_after += r.bytes_after;
@@ -817,6 +1069,11 @@ export function compactVault(db: Database, policy: HistoryPolicy, opts?: {
     catch (err) {
       result.notes_failed++;
       console.warn("[history] compaction failed", candidate.note_id, err);
+      // Not again until the note's next write: a note that always fails must not take every pass's budget.
+      try {
+        db.prepare("UPDATE history_compact_state SET refused = 1 WHERE note_id = ?").run(candidate.note_id);
+      }
+      catch {}
     }
   }
   result.remaining_candidates = total - result.notes_scanned;
