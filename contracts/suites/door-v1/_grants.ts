@@ -184,18 +184,18 @@ export async function grantEvent(g: GrantSpec): Promise<Event & { grantId: strin
 
 /**
  * An event's size (§2.1): the bytes of the event as sent, one compact JSON object of its seven fields, non-ASCII
- * written as itself, controls too. Not NIP-01's id serialisation, which leaves out `id` and `sig` and is about 250 bytes shorter.
+ * written as itself, controls too. Not NIP-01's id serialisation, which leaves out `id` and `sig` and is 253 bytes shorter.
  */
-export const eventSize = (e: Event) => {
-  // NIP-01's escapes and nothing else: JSON.stringify would write other controls as six-byte `\u00XX`.
-  const esc: Record<string, string> = { '"': '\\"', "\\": "\\\\", "\n": "\\n", "\r": "\\r", "\t": "\\t", "\b": "\\b", "\f": "\\f" };
-  const str = (x: string) => `"${x.replace(/["\\\n\r\t\b\f]/g, (c) => esc[c])}"`;
-  const tags = `[${e.tags.map((t) => `[${t.map(str).join(",")}]`).join(",")}]`;
-  return Buffer.byteLength(`{"id":${str(e.id)},"pubkey":${str(e.pubkey)},"created_at":${e.created_at},"kind":${e.kind},"tags":${tags},"content":${str(e.content)},"sig":${str(e.sig)}}`);
-};
+export const eventSize = (e: Event) =>
+  Buffer.byteLength(`{"id":${nip01(e.id)},"pubkey":${nip01(e.pubkey)},"created_at":${e.created_at},"kind":${e.kind},"tags":${nip01Tags(e.tags)},"content":${nip01(e.content)},"sig":${nip01(e.sig)}}`);
+
+// NIP-01's seven escapes and nothing else: JSON.stringify would write other controls as six-byte `\u00XX`.
+const ESC: Record<string, string> = { '"': '\\"', "\\": "\\\\", "\n": "\\n", "\r": "\\r", "\t": "\\t", "\b": "\\b", "\f": "\\f" };
+const nip01 = (x: string) => `"${x.replace(/["\\\n\r\t\b\f]/g, (c) => ESC[c])}"`;
+const nip01Tags = (tags: string[][]) => `[${tags.map((t) => `[${t.map(nip01).join(",")}]`).join(",")}]`;
 
 /** The bytes NIP-01 hashes for an event's id. */
-export const hashedSize = (e: Event) => Buffer.byteLength(JSON.stringify([0, e.pubkey, e.created_at, e.kind, e.tags, e.content]));
+export const hashedSize = (e: Event) => Buffer.byteLength(`[0,${nip01(e.pubkey)},${e.created_at},${e.kind},${nip01Tags(e.tags)},${nip01(e.content)}]`);
 
 /** A grant's address (§3): kind, grantor key, id. */
 export const address = (grant: { pubkey: string; grantId: string }) => `${KIND.grant}:${grant.pubkey}:${grant.grantId}`;
