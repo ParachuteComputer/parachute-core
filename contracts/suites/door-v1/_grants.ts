@@ -23,16 +23,28 @@ export const NO_GRANTS = /no grants at this door: POST \S+\/statements answered 
 export const KIND = { grant: 37440, revoke: 7440, link: 37441, confirm: 37442, vaultRecord: 37443 } as const;
 
 /**
- * The one spelling (§2.1): keys sorted by code point, no spaces, characters as themselves. Every statement's
- * content is this spelling of a JSON object; a vault refuses any other.
+ * The one spelling (§2.1): ASCII keys sorted byte by byte, no whitespace, whole numbers 0 to 2^53-1 as plain
+ * digits, strings escaping only `"` and `\\`. Every statement's content is this spelling of a JSON object; a vault
+ * refuses any other. An object field that is `undefined` is left out; anything the spelling can't hold throws.
  */
 export function canonical(x: unknown): string {
-  if (Array.isArray(x)) return `[${x.map(canonical).join(",")}]`;
+  if (Array.isArray(x)) return `[${x.map((v) => (v === undefined ? bad("an undefined array item") : canonical(v))).join(",")}]`;
   if (x !== null && typeof x === "object") {
-    const keys = Object.keys(x as object).filter((k) => (x as any)[k] !== undefined).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-    return `{${keys.map((k) => `${JSON.stringify(k)}:${canonical((x as any)[k])}`).join(",")}}`;
+    const keys = Object.keys(x as object).filter((k) => (x as any)[k] !== undefined);
+    for (const k of keys) if (!/^[\x20-\x7e]+$/.test(k)) bad(`a key that isn't printable ASCII: ${JSON.stringify(k)}`);
+    keys.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)); // ASCII: code unit order is byte order
+    return `{${keys.map((k) => `${canonical(k)}:${canonical((x as any)[k])}`).join(",")}}`;
   }
-  return JSON.stringify(x);
+  if (typeof x === "number") return Number.isSafeInteger(x) && x >= 0 && !Object.is(x, -0) ? String(x) : bad(`a number that isn't whole and 0 to 2^53-1: ${x}`);
+  if (typeof x === "string") {
+    if (/[\u0000-\u001f\u007f]/.test(x) || !x.isWellFormed()) bad("a string with a control character or a lone surrogate");
+    return `"${x.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+  }
+  if (typeof x === "boolean") return String(x);
+  return bad(`a value the spelling can't hold: ${String(x)}`);
+}
+function bad(what: string): never {
+  throw new Error(`canonical: ${what}`);
 }
 
 // ── Keys and events ─────────────────────────────────────────────────────────────────────────────────────────
@@ -171,11 +183,15 @@ export async function grantEvent(g: GrantSpec): Promise<Event & { grantId: strin
 export const address = (grant: { pubkey: string; grantId: string }) => `${KIND.grant}:${grant.pubkey}:${grant.grantId}`;
 
 /** A signed revoke (§3): no tags; the content names the address it ends and the vault it is for. */
-export async function revokeEvent(grant: { pubkey: string; grantId: string } | { ends: string }, opts: { signer?: Key; vault?: string; honors?: string } = {}): Promise<Event> {
+export async function revokeEvent(
+  grant: { pubkey: string; grantId: string } | { ends: string },
+  opts: { signer?: Key; vault?: string; honors?: string; v?: number; extraFields?: Record<string, unknown>; tags?: string[][]; spaced?: boolean } = {},
+): Promise<Event> {
   const signer = opts.signer ?? (await ownerKey());
   const ends = "ends" in grant ? grant.ends : address(grant);
-  const content = { v: 1, honors: opts.honors ?? (await vaultId(opts.vault)), ends, purpose: "I end this grant." };
-  return sign(signer, { kind: KIND.revoke, tags: [], content: canonical(content) });
+  const content = { v: opts.v ?? 1, honors: opts.honors ?? (await vaultId(opts.vault)), ends, purpose: "I end this grant.", ...(opts.extraFields ?? {}) };
+  // `spaced` and `tags` make a revoke from some later shell: a vault still acts on its three frozen fields (§3).
+  return sign(signer, { kind: KIND.revoke, tags: opts.tags ?? [], content: opts.spaced ? JSON.stringify(content, null, 1) : canonical(content) });
 }
 
 /**

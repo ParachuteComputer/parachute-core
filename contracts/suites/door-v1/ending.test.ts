@@ -7,7 +7,7 @@
 // Red today: no door takes a signed statement, so each contract stops where `granted()` files one. Every body
 // starts with a grant that must be taken, so a refusal further down can't pass because nothing is ever taken.
 import { describe, expect, test } from "bun:test";
-import { KIND, LANE, NO_GRANTS, declareType, file, grantEvent, grantRow, granted, newKey, ownerKey, rec, records, red, revokeEvent, sign, tokenAs, tokenReply, vaultId, type Reply } from "./_grants.ts";
+import { KIND, LANE, NO_GRANTS, declareType, file, grantEvent, grantRow, granted, newKey, ownerKey, rec, records, red, revokeEvent, runId, sign, tokenAs, tokenReply, vaultId, type Reply } from "./_grants.ts";
 
 const owner = records("write");
 
@@ -143,6 +143,29 @@ describe("by a signed revoke", () => {
     // A readable newer event brings the address back.
     const back = await grantEvent({ id: g.grantId, to: key, types: { [recipe]: ["read"] }, created_at: g.created_at + 2 });
     expect((await file(back)).status).toBe(201);
+    expect(await state(g.grantId)).toBe("in_force");
+  });
+
+  red("a revoke from a later shell still ends the grant: a vault acts on its three frozen fields", { reason: NO_GRANTS, lane: LANE }, async () => {
+    const recipe = await declareType("recipe");
+    const soup = await owner.make({ types: [recipe], body: "soup" });
+    for (const later of [{ v: 2 }, { extraFields: { note: "from a later shell" } }, { tags: [["client", "later"]] }, { spaced: true }]) {
+      const key = await newKey();
+      const g = await granted({ to: key, types: { [recipe]: ["read"] } });
+      const bearer = await tokenAs(key);
+      const r = await file(await revokeEvent(g, later));
+      expect(r.status, `${JSON.stringify(later)}: ${r.text.slice(0, 200)}`).toBe(201);
+      ended(await records({ bearer }).get(soup.body.id));
+      expect(await state(g.grantId)).toBe("revoked");
+    }
+    // Two `ends` in one revoke can be read two ways, so it is refused and ends nothing.
+    const key = await newKey();
+    const g = await granted({ to: key, types: { [recipe]: ["read"] } });
+    const other = `${KIND.grant}:${g.pubkey}:${runId("other")}`;
+    const twice = `{"ends":${JSON.stringify(other)},"ends":${JSON.stringify(`${KIND.grant}:${g.pubkey}:${g.grantId}`)},"honors":${JSON.stringify(await vaultId())},"v":1}`;
+    const dup = await file(await sign(await ownerKey(), { kind: KIND.revoke, tags: [], content: twice }));
+    expect(dup.status).toBe(400);
+    expect(dup.body.error).toBe("invalid_statement");
     expect(await state(g.grantId)).toBe("in_force");
   });
 
