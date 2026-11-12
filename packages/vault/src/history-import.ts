@@ -73,8 +73,11 @@ const SPECIAL_BARE_KEY = /^[-?:&*!|>%@`\[\]{},]|['"]/;
  * have written `'word'` meaning the quoted string; that shape, in that window, is read as today's exporter means it.
  * See UPGRADING.md.
  */
-export function readExportScalars(block: string, reading: "export" | "old-export"): { text: string; values: Set<string> } {
+export function readExportScalars(block: string, reading: "export" | "old-export"): { text: string; values: Set<string>; flowKey: boolean } {
   const values = new Set<string>();
+  // A bare key opening with `[` or `{` is a flow collection to strict YAML, which still parses (`[x]: v` keys "x",
+  // `{y}: v` keys "[object Object]"), so strict YAML's reading of such a block can't be the one to compare with.
+  let flowKey = false;
   const text = block.split("\n").map(raw => {
     const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
     const keyed = KEY_LINE.exec(line);
@@ -87,6 +90,7 @@ export function readExportScalars(block: string, reading: "export" | "old-export
       const bare = bareKey !== undefined && !(inItem && /^[\[{'"]/.test(bareKey)) ? bareKey : undefined;
       if (quotedKey !== undefined || bare !== undefined) {
         const key = quotedKey ?? (SPECIAL_BARE_KEY.test(bare!) ? JSON.stringify(bare) : bare!);
+        if (bare !== undefined && /^[\[{]/.test(bare)) flowKey = true;
         if (colonValue === undefined) return key === bare ? raw : `${lead}${key}:`;
         const value = colonValue.slice(1);
         let out = value;
@@ -105,7 +109,7 @@ export function readExportScalars(block: string, reading: "export" | "old-export
     values.add(read);
     return `${lead}${JSON.stringify(read)}`;
   }).join("\n");
-  return { text, values };
+  return { text, values, flowKey };
 }
 /**
  * Whether `read` (the rewritten block, parsed) differs from `strict` (the block as plain YAML reads it) ONLY where a
@@ -162,14 +166,16 @@ function frontmatter(block: string, parser: 1 | 2, reading: "export" | "old-expo
     if (id !== undefined) throw new UnreadableFrontmatter(id);
     throw cause;
   };
-  const { text, values } = readExportScalars(block, reading);
+  const { text, values, flowKey } = readExportScalars(block, reading);
   let strict: Record<string, unknown> | undefined, strictError: unknown;
   try { strict = yaml(block); } catch (error) { strictError = error; }
   if (text === block) return strict ?? refuse(strictError);
   let read: Record<string, unknown>;
   try { read = yaml(text); } catch (error) { return strict ?? refuse(error); }
   // A block scalar means no exporter wrote this file: YAML's own reading, whatever the rewrite came to.
-  if (strict !== undefined) return !holdsBlockScalar(block) && accountsFor(read, strict, values) ? read : strict;
+  // A requoted `[x]`/`{y}` key: strict YAML read it as a flow collection, so its reading is wrong where the key is and
+  // can't vouch for the rewrite; the rewrite stands unless a block scalar says no exporter wrote this file.
+  if (strict !== undefined) return !holdsBlockScalar(block) && (flowKey || accountsFor(read, strict, values)) ? read : strict;
   if (holdsBlockScalar(block)) return refuse(strictError);
   return read;
 }

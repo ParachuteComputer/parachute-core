@@ -811,3 +811,14 @@ test("export scalars: a key that is not a plain word is requoted, and its value 
   const now = `id: ${id}\nmetadata:\n  'it''s': '[[X]]'\n  '@at': plain\n  'a: b': v\n  "x\\ny": 1\n`;
   expect(parseExportFrontmatter(now, "export").metadata).toEqual({ "it's": "[[X]]", "@at": "plain", "a: b": "v", "x\ny": 1 });
 });
+
+// A bare `[x]` or `{y}` key alone (no other line that strict YAML refuses): strict YAML parses it as a flow collection
+// (`[x]` keys "x", `{y}` keys "[object Object]"), so its reading must not overrule the requoted one (review of #92).
+test("export scalars: a bare [x] or {y} key is read as written even when the rest of the block is plain YAML", async () => {
+  const { parseExportFrontmatter } = await import("./history-import.ts");
+  const id = "01M66HE43WKN0Z7EZ0766D7S6N";
+  for (const reading of ["export", "old-export"] as const) {
+    expect(parseExportFrontmatter(`id: ${id}\nmetadata:\n  [x]: [[X]]\n  z: 1\n`, reading).metadata).toEqual({ "[x]": "[[X]]", z: 1 });
+    expect(parseExportFrontmatter(`id: ${id}\nmetadata:\n  {y}: plain\n  z: 1\n`, reading).metadata).toEqual({ "{y}": "plain", z: 1 });
+  }
+});
