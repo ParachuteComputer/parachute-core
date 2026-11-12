@@ -3,7 +3,7 @@
 Two ways out, both built by CI from the same commit:
 
 - **npm:** `@openparachute/core`, commands `parachute` and `parachute-core`. For a person with Bun:
-  `npm i -g @openparachute/core@next` or `bun add -g @openparachute/core@next`. Built by `release/npm.ts`.
+  `npm i -g @openparachute/core` or `bun add -g @openparachute/core` (`@next` for the newest prerelease). Built by `release/npm.ts`.
 - **The bundle:** `parachute-core-<version>-<platform>.tar.gz` plus `SHA256SUMS`, with its own pinned Bun. What Prism
   ships. Built by `release/bundle.ts`, attached to a GitHub release.
 
@@ -23,8 +23,7 @@ The npm name `parachute` belongs to someone else, so the package stays `@openpar
   0.9 may merge into `main` before then (Aaron merges next→main only).
 - A fix both lines need lands on `release/0.8` and is cherry-picked to `next` (or the other way), one PR each.
 
-Before anything merges into this branch, a repository admin does two things (Uni asks Aaron; neither is done
-yet):
+Before anything merged into this branch, a repository admin did two things (both in place, read back 2026-11-12):
 
 ```bash
 # 1. let the npm-latest gate deploy from release/0.8 (until then publish-latest fails closed there)
@@ -112,9 +111,9 @@ trust is set. Until then `plan` skips every merge with that reason.
    ```
 
    npm asks for a one-time password (2FA). This one has no provenance (it was not published from CI); every later
-   version has. Afterwards `npm dist-tag ls @openparachute/core` shows `next: 0.8.0-pre.1`. [inferred, check:] npm
-   may also point `latest` at it, being the package's only version. Then a plain `npm i @openparachute/core` stays
-   on 0.8.0-pre.1 until 0.8.0 ships (`latest` can't be removed, only moved): until then, tell people `@next`.
+   version has. Afterwards `npm dist-tag ls @openparachute/core` shows `next: 0.8.0-pre.1`. npm also pointed `latest` at
+   it, being the package's only version, and `latest` stayed at 0.8.0-pre.1 until 0.8.0 shipped (`latest` can't be
+   removed, only moved).
 3. **Trust the workflow.** On npmjs.com → `@openparachute/core` → **Settings** → **Trusted Publisher** → "Select your
    publisher": **GitHub Actions**. Fill in exactly (case-sensitive; npm doesn't check them until a publish):
    - Organization or user: `ParachuteComputer`

@@ -10,20 +10,20 @@ and on the signed macOS tree, at 0 FAIL).
 v0.8 is one program, the npm package `@openparachute/core`. Its command is **`parachute`** (`parachute-core` is the
 same program under another name, kept for now). `parachute-vault` is there too, for `PARACHUTE_VAULT_BIN`.
 
-**The bundle** (what Prism ships): a GitHub pre-release of
+**The bundle** (what Prism ships): a GitHub release of
 [ParachuteComputer/parachute-core](https://github.com/ParachuteComputer/parachute-core/releases), built by CI:
 
 ```
-parachute-core-0.8.0-pre.2-darwin-arm64.tar.gz   signed ad hoc with the hardened runtime (bundle-macos)
-parachute-core-0.8.0-pre.2-linux-x64.tar.gz
+parachute-core-0.8.0-darwin-arm64.tar.gz   signed ad hoc with the hardened runtime (bundle-macos)
+parachute-core-0.8.0-linux-x64.tar.gz
 SHA256SUMS
 ```
 
 ```bash
 grep darwin-arm64 SHA256SUMS | shasum -a 256 -c     # on Linux: grep linux-x64 SHA256SUMS | sha256sum -c
-tar -xzf parachute-core-0.8.0-pre.2-darwin-arm64.tar.gz
-PARACHUTE_BIN="$PWD/parachute-core-0.8.0-pre.2-darwin-arm64/bin/parachute"
-PARACHUTE_VAULT_BIN="$PWD/parachute-core-0.8.0-pre.2-darwin-arm64/bin/parachute-vault"
+tar -xzf parachute-core-0.8.0-darwin-arm64.tar.gz
+PARACHUTE_BIN="$PWD/parachute-core-0.8.0-darwin-arm64/bin/parachute"
+PARACHUTE_VAULT_BIN="$PWD/parachute-core-0.8.0-darwin-arm64/bin/parachute-vault"
 ```
 
 The tree: `bin/parachute`, `bin/parachute-core`, `bin/parachute-vault` (links into `lib/`); `runtime/bun` (Bun 1.4.4,
@@ -38,19 +38,18 @@ It runs from any folder, a path with spaces included.
 When Prism re-signs the payload, please treat `parachute/runtime/bun` like your Node runtime (the hardened runtime
 plus `allow-jit`); nothing else in the tree needs an entitlement.
 
-**npm** (for a machine with Bun 1.4+): each prerelease goes to the `next` tag, and `latest` stays at `0.8.0-pre.1`
-until 0.8.0 ships, so ask for `@next`: `npm i @openparachute/core@next` gives `0.8.0-pre.2`, and a bare
-`npm i @openparachute/core` still gives `0.8.0-pre.1`. The package on npm is byte-identical to the release's
-`openparachute-core-0.8.0-pre.2.tgz`; to install from that file instead, check it with `sha256sum -c npm-SHA256SUMS`
-(macOS: `shasum -a 256 -c npm-SHA256SUMS`), then `npm i ./openparachute-core-0.8.0-pre.2.tgz`. It runs on the Bun on
+**npm** (for a machine with Bun 1.4+): `latest` is the stable release, so a bare `npm i @openparachute/core` gives
+0.8.0; prereleases go to `next`. The release also carries the npm package as `openparachute-core-0.8.0.tgz`; to
+install from that file, check it with `sha256sum -c npm-SHA256SUMS` (macOS: `shasum -a 256 -c npm-SHA256SUMS`), then
+`npm i ./openparachute-core-0.8.0.tgz`. It runs on the Bun on
 `PATH` (without one, `parachute` exits 127, `bun: not found`). `parachute-vault` is not linked into a `bin` folder;
 it is in the package:
 
 | Install | `parachute` | `parachute-vault` |
 |---|---|---|
-| `npm i @openparachute/core@next` (in a project) | `node_modules/.bin/parachute` | `node_modules/@openparachute/core/packages/cli/bin/parachute-vault` |
-| `npm i -g @openparachute/core@next` | `<prefix>/bin/parachute` | `<prefix>/lib/node_modules/@openparachute/core/packages/cli/bin/parachute-vault` |
-| `bun add -g @openparachute/core@next` | `$BUN_INSTALL/bin/parachute` | `$BUN_INSTALL/install/global/node_modules/@openparachute/core/packages/cli/bin/parachute-vault` |
+| `npm i @openparachute/core` (in a project) | `node_modules/.bin/parachute` | `node_modules/@openparachute/core/packages/cli/bin/parachute-vault` |
+| `npm i -g @openparachute/core` | `<prefix>/bin/parachute` | `<prefix>/lib/node_modules/@openparachute/core/packages/cli/bin/parachute-vault` |
+| `bun add -g @openparachute/core` | `$BUN_INSTALL/bin/parachute` | `$BUN_INSTALL/install/global/node_modules/@openparachute/core/packages/cli/bin/parachute-vault` |
 
 ## Run it embedded
 
