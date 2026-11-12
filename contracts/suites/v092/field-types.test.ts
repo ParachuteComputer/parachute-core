@@ -37,8 +37,8 @@ describe("0.9.2 one data type per field: warn", () => {
 
   test("a schema_conflict warning says what happens to the other type's rules, no longer that they are ignored", async () => {
     // changes-0.9.json, the schema_conflict row (T-456 day-2 shadow): 0.8 ended this warning "(ignored)"; since every
-    // type is checked, the losing type's rules are "(checked, warnings only)", or "(overridden)" when the winner is a
-    // subtype redefining its ancestor's field on purpose. Same reason, field, schema and loser_schema.
+    // type is checked, the losing type's rules are "(checked, warnings only)", or "(overridden)" when a type on the note
+    // descends from the loser and redefines its field (here: a subtype over its parent). Same reason, field, schema and loser_schema.
     const [A, B, P] = [runId("ta"), runId("tb"), runId("tp")];
     const C = `${P}_kid`;
     const field = `st_${runId("f")}`;
