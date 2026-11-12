@@ -656,3 +656,36 @@ test("T-460: POST /versions/:ix/mark keeps a version for good, DELETE clears it,
   // A tag-scoped caller can't mark a note outside its scope.
   expect((await call(note.id, "/versions/1/mark", "POST", undefined, true)).status).toBe(404);
 });
+
+test("T-460: an open vault runs the maintenance pass hourly, so a long-running daemon still thins; it stops when the store closes", async () => {
+  clearVaultStoreCache();
+  const ticks: (() => void)[] = [];
+  const cleared: unknown[] = [];
+  const set = spyOn(globalThis, "setInterval").mockImplementation(((fn: () => void, ms: number) => { if (ms === 3_600_000) ticks.push(fn); return { unref() {} } as never; }) as never);
+  const clear = spyOn(globalThis, "clearInterval").mockImplementation(((t: unknown) => { cleared.push(t); }) as never);
+  try {
+    const s = getVaultStore("history");
+    expect(ticks.length).toBe(1);
+    const db = (s as any).db;
+    const n = await s.createNote("now", { path: "hourly" });
+    const { hashContent } = await import("../core/src/history.ts");
+    for (let k = 0; k < 300; k++) {
+      const body = `v${k}`;
+      db.prepare("INSERT OR IGNORE INTO note_blobs (hash, content, byte_size) VALUES (?, ?, ?)").run(hashContent(body), body, body.length);
+      db.prepare(`INSERT INTO note_versions (note_id, version_ix, content_hash, path, metadata, extension, superseded_at, actor, via, op, content_len, encoding, created_at)
+        VALUES (?, ?, ?, NULL, '{}', 'md', ?, NULL, 'api', 'update', ?, NULL, NULL)`).run(n.id, k, hashContent(body), new Date(Date.now() - (300 - k) * 2 * 86_400_000).toISOString(), body.length); // two days apart: past a year, weekly
+    }
+    const { refreshCompactState } = await import("../core/src/history-compact-state.ts");
+    refreshCompactState(db, n.id);
+    db.prepare("UPDATE history_compact_state SET refreshed_at = ? WHERE note_id = ?").run(Date.now() - 2 * 86_400_000, n.id);
+    ticks[0]!(); // an hour later
+    expect((db.prepare("SELECT COUNT(*) AS n FROM note_versions WHERE note_id = ?").get(n.id) as { n: number }).n).toBeLessThan(300);
+    clearVaultStoreCache();
+    ticks[0]!(); // the store is closed: the timer stops itself
+    expect(cleared.length).toBe(1);
+  } finally {
+    set.mockRestore();
+    clear.mockRestore();
+  }
+  store = getVaultStore("history");
+});

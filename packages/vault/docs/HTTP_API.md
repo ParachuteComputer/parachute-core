@@ -1733,12 +1733,12 @@ first of each ISO week (Monday to Sunday, UTC) for good. The first version in a
 day or week holds the note as it stood when that day or week began, so an old
 read "as of" a moment comes back at most a day (or a week) early. Always kept:
 each note's newest 20 (`min_versions`), delete tombstones, and marked versions.
-Imported history is thinned by the same rule. A capture prunes its note; the
-maintenance pass at vault open also sweeps notes nobody edits, each at most once
-a day, the one swept longest ago first (`notes_thinned`, `versions_thinned`,
-`thin_remaining` in the summary). On a box the pass runs when a vault opens, so
-a daemon that runs for weeks sweeps on its next restart; a capture prunes only
-when a cap the vault sets is reached, so a long history costs a write nothing. `keep_all_days: null` turns the tiers off.
+Imported history is thinned by the same rule, by the maintenance pass: it sweeps
+every note with history at most once a day, the one swept longest ago first (`notes_thinned`, `versions_thinned`,
+`thin_remaining` in the summary). It runs when a vault opens and, on a box,
+hourly while it stays open (Cloud: when the vault wakes); each run is bounded by
+`compact_budget_ms` and `compact_max_notes`. A capture prunes only when a cap the
+vault sets is reached, so a long history costs a write nothing. `keep_all_days: null` turns the tiers off.
 `max_versions` and `max_age_days` still apply on top when a vault sets them;
 their defaults are no cap (1,000,000 and 36,500 days). The ceiling is at least 1
 and at least the floor; both age settings are capped at 36,500 days. Delete
