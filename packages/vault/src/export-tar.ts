@@ -60,9 +60,10 @@ class CollectingSink implements ExportSink {
       return { ok: false, reason: `path-traversal: source "${src}" escapes assetsDir "${this.assets}"` };
     }
     let size: number;
+    let real: string;
     try {
       // Follow links before the containment check too: a link inside the assets folder that leads out of it is skipped.
-      const real = realpathSync(src);
+      real = realpathSync(src);
       const root = realpathSync(this.assets);
       if (real !== root && !real.startsWith(root + sep)) {
         return { ok: false, reason: `path-traversal: source "${src}" resolves outside assetsDir "${this.assets}"` };
@@ -73,7 +74,7 @@ class CollectingSink implements ExportSink {
     } catch {
       return { ok: false, reason: `source file missing at "${src}"` };
     }
-    this.entries.push({ name: normalize(destRelPath), path: realpathSync(src), size });
+    this.entries.push({ name: normalize(destRelPath), path: real, size });
     return { ok: true };
   }
 }

@@ -209,15 +209,16 @@ describe.skipIf(door().release !== "0.9.1" || lacks("export-key"))("the backup k
     expect(pulled.status, (await pulled.clone().text()).slice(0, 200)).toBe(200);
     expect(untar(new Uint8Array(await pulled.arrayBuffer())).map((f) => f.name)).toContain(`${FIXTURE}/plan.md`);
     expect((await call(minted.token, "GET", "/api/notes")).status).toBe(403);
-    // A read session can't hand it out.
+    // A read session can't hand it out: the tool refuses, or isn't in its list at all. Either way no token comes back.
     const reader = await mcp("read");
+    let handedOut = false;
     try {
-      await expect(reader.call("manage-keys", { action: "mint", scope: `vault:${d.vault}:export` })).rejects.toThrow();
-    } catch {
-      // The tool may be absent from a read session's list: either way nothing was minted.
+      const r = await reader.call("manage-keys", { action: "mint", scope: `vault:${d.vault}:export` }).catch(() => null);
+      handedOut = !!(r && typeof r === "object" && "token" in r);
     } finally {
       await reader.close();
     }
+    expect(handedOut).toBe(false);
   });
 
   test("a revoked export key stops", async () => {
