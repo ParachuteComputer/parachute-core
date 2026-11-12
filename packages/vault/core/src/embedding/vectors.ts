@@ -8,7 +8,7 @@
  */
 
 import { Database } from "bun:sqlite";
-import { encodeVector } from "./vector-codec.js";
+import { encodeVector, int8Model, baseModel } from "./vector-codec.js";
 import type { Chunk } from "./chunker.js";
 import type { ExistingVectorRow } from "./staleness.js";
 
@@ -37,11 +37,14 @@ export function nonBlankContentClause(colRef: string): string {
   return `TRIM(COALESCE(${colRef}, ''), char(32,9,10,11,12,13)) != ''`;
 }
 
-/** Read a note's existing `note_vectors` rows — the shape `planStaleness` diffs against. */
+/**
+ * Read a note's existing `note_vectors` rows — the shape `planStaleness` diffs against. A row's model is given
+ * without the int8 marker (T-460): an int8 row is as fresh as the float32 row it replaced.
+ */
 export function getNoteVectorRows(db: Database, noteId: string): ExistingVectorRow[] {
-  return db
+  return (db
     .prepare("SELECT chunk_ix, model, content_hash FROM note_vectors WHERE note_id = ?")
-    .all(noteId) as ExistingVectorRow[];
+    .all(noteId) as ExistingVectorRow[]).map((r) => ({ ...r, model: baseModel(r.model) }));
 }
 
 /**
@@ -57,19 +60,6 @@ export function deleteObsoleteVectorRows(db: Database, noteId: string, obsoleteI
     noteId,
     ...obsoleteIxs,
   );
-}
-
-const codecSeen = new WeakMap<Database, boolean>();
-/**
- * Whether note_vectors has schema 34's `codec` column (a newer release's vault). This release writes float32, so a
- * re-embed over a row the newer release wrote as int8 must reset its codec to NULL, or float32 bytes would be read as
- * int8 (T-460).
- */
-function hasCodecColumn(db: Database): boolean {
-  if (codecSeen.get(db)) return true;
-  const has = (db.prepare("SELECT name FROM pragma_table_info('note_vectors')").all() as { name: string }[]).some((c) => c.name === "codec");
-  if (has) codecSeen.set(db, true);
-  return has;
 }
 
 /**
@@ -95,7 +85,7 @@ export function upsertNoteVector(
        dims = excluded.dims,
        model = excluded.model,
        content_hash = excluded.content_hash,
-       embedded_at = excluded.embedded_at${hasCodecColumn(db) ? ",\n       codec = NULL" : ""}`,
+       embedded_at = excluded.embedded_at`,
   ).run(noteId, chunk.ix, encodeVector(vector), vector.length, model, contentHash, new Date().toISOString());
 }
 
@@ -114,8 +104,8 @@ export function countNotesPendingEmbedding(db: Database, model: string): { total
   ).n;
   const embedded = (
     db
-      .prepare("SELECT COUNT(DISTINCT note_id) AS n FROM note_vectors WHERE model = ?")
-      .get(model) as { n: number }
+      .prepare("SELECT COUNT(DISTINCT note_id) AS n FROM note_vectors WHERE model IN (?, ?)")
+      .get(model, int8Model(model)) as { n: number }
   ).n;
   return { total, pending: Math.max(0, total - embedded) };
 }
@@ -141,8 +131,8 @@ export function getNotesPendingEmbedding(
   limit?: number,
 ): { id: string; content: string }[] {
   const sql = `SELECT id, content FROM notes
-    WHERE id NOT IN (SELECT DISTINCT note_id FROM note_vectors WHERE model = ?)
+    WHERE id NOT IN (SELECT DISTINCT note_id FROM note_vectors WHERE model IN (?, ?))
       AND ${nonBlankContentClause("content")}${typeof limit === "number" ? " LIMIT ?" : ""}`;
-  const params: (string | number)[] = typeof limit === "number" ? [model, limit] : [model];
+  const params: (string | number)[] = typeof limit === "number" ? [model, int8Model(model), limit] : [model, int8Model(model)];
   return db.prepare(sql).all(...params) as { id: string; content: string }[];
 }

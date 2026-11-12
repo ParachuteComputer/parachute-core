@@ -1,6 +1,6 @@
 import { Database, type SQLQueryBindings } from "bun:sqlite";
 import type { Note, NoteIndex, QueryOpts, QueryNotesPage, VaultStats, VaultMap, AggregateSpec, AggregateRow, SemanticSearchResult } from "./types.js";
-import { decodeStoredVector, dot } from "./embedding/vector-codec.js";
+import { decodeStoredVector, dot, int8Model } from "./embedding/vector-codec.js";
 import { nonBlankContentClause } from "./embedding/vectors.js";
 import { normalizePath } from "./paths.js";
 import { computeDisplayTitle, skipLeadingFrontmatter } from "./display-title.js";
@@ -2425,14 +2425,13 @@ export function semanticSearchNotes(
   // Pull every candidate's vector rows for the ACTIVE model, batched to
   // stay under the DO 100-bound-param cap (same chunking `fetchNotesByIdsOrdered`
   // uses). A note absent from this map has no fresh vector yet — pending.
-  const vecRowsByNote = new Map<string, { chunk_ix: number; vector: Uint8Array; dims: number; codec?: string | null }[]>();
-  // Schema 34 says per row which codec stored the vector (vector-codec.ts); before it every row is float32.
-  const codecColumn = vectorCodecColumn(db) ? ", codec" : "";
+  // A row's model says how its vector is stored: `model` is float32, `model::int8` int8 (T-460, vector-codec.ts).
+  const vecRowsByNote = new Map<string, { chunk_ix: number; vector: Uint8Array; dims: number; model: string }[]>();
   for (const idChunk of chunkForInClause(candidateIds)) {
     const placeholders = idChunk.map(() => "?").join(", ");
     const rows = db.prepare(
-      `SELECT note_id, chunk_ix, vector, dims${codecColumn} FROM note_vectors WHERE model = ? AND note_id IN (${placeholders})`,
-    ).all(model, ...idChunk) as { note_id: string; chunk_ix: number; vector: Uint8Array; dims: number; codec?: string | null }[];
+      `SELECT note_id, chunk_ix, vector, dims, model FROM note_vectors WHERE model IN (?, ?) AND note_id IN (${placeholders})`,
+    ).all(model, int8Model(model), ...idChunk) as { note_id: string; chunk_ix: number; vector: Uint8Array; dims: number; model: string }[];
     for (const row of rows) {
       let list = vecRowsByNote.get(row.note_id);
       if (!list) {
@@ -2455,9 +2454,9 @@ export function semanticSearchNotes(
     for (const row of rows) {
       let vector: Float32Array;
       try {
-        vector = decodeStoredVector(row.vector, row.codec, row.dims);
+        vector = decodeStoredVector(row.vector, row.model, row.dims);
       } catch {
-        continue; // a codec this engine doesn't know, or a damaged row: that chunk is left out, not the search
+        continue; // a damaged row: that chunk is left out, not the search
       }
       readable = true;
       const score = dot(vector, queryVector);
@@ -3819,13 +3818,4 @@ function rowToNote(row: NoteRow): Note {
     lastUpdatedBy: row.last_updated_by ?? null,
     lastUpdatedVia: row.last_updated_via ?? null,
   };
-}
-
-const vectorCodecSeen = new WeakMap<Database, boolean>();
-/** Whether `note_vectors` has schema 34's `codec` column. Once seen it stays (columns are never dropped). */
-function vectorCodecColumn(db: Database): boolean {
-  if (vectorCodecSeen.get(db)) return true;
-  const has = (db.prepare("SELECT name FROM pragma_table_info('note_vectors')").all() as { name: string }[]).some((c) => c.name === "codec");
-  if (has) vectorCodecSeen.set(db, true);
-  return has;
 }

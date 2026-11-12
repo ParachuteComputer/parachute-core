@@ -62,10 +62,25 @@ export function decodeVector(blob: Uint8Array): Float32Array {
 /**
  * The int8 codec (T-460): a little-endian float32 scale, then one signed byte per dimension; a value reads back as
  * byte × scale. The scale is the largest magnitude over 127, so a 1,024-dimension vector takes 1,028 bytes instead of
- * 4,096. On real bge-m3 vectors it kept 98% of each top 10 (evidence in the T-460 run). A row says which codec wrote
- * it (`note_vectors.codec`, NULL for float32, from schema 34); every engine from the one that can open 34 reads both.
+ * 4,096. On real bge-m3 vectors it kept 98% of each top 10 (evidence in the T-460 run).
+ *
+ * An int8 row is stored under its model's name with {@link INT8_MODEL_SUFFIX} added (`bge-m3::int8`), not under a new
+ * column or schema number. This release reads such rows; the next one (1.0) writes them. An older engine looks for rows under the plain model name only, so it never reads an int8
+ * row as float32: it sees those notes as not embedded yet and embeds them again, writing float32 over the same row.
+ * No schema bump, so every older release (the 0.8 code-only rollback, a 0.7 takeover's rollback) still opens the vault.
  */
-export const INT8_CODEC = "int8";
+export const INT8_MODEL_SUFFIX = "::int8";
+/** The model name an int8 row of `model` is stored under. */
+export function int8Model(model: string): string {
+  return isInt8Model(model) ? model : model + INT8_MODEL_SUFFIX;
+}
+export function isInt8Model(stored: string): boolean {
+  return stored.endsWith(INT8_MODEL_SUFFIX);
+}
+/** The model a stored row's vector came from, with the int8 marker taken off. */
+export function baseModel(stored: string): string {
+  return isInt8Model(stored) ? stored.slice(0, -INT8_MODEL_SUFFIX.length) : stored;
+}
 export function encodeInt8(v: Float32Array): Uint8Array {
   let max = 0;
   for (let i = 0; i < v.length; i++) {
@@ -90,15 +105,13 @@ export function decodeInt8(blob: Uint8Array | ArrayBuffer): Float32Array {
   return out;
 }
 /**
- * Decode a stored vector by the codec its row names: NULL is float32, `int8` is {@link encodeInt8}'s. With `dims`
- * (the row's own column), a vector of another length is refused: bytes that don't match their label are never
- * scored.
+ * Decode a stored vector by the model name its row carries: `…::int8` is {@link encodeInt8}'s, anything else float32.
+ * With `dims` (the row's own column), a vector of another length is refused: bytes that don't match their label are
+ * never scored.
  */
-export function decodeStoredVector(blob: Uint8Array | ArrayBuffer, codec: string | null | undefined, dims?: number): Float32Array {
-  let v: Float32Array;
-  if (codec == null) v = decodeVector(blob instanceof Uint8Array ? blob : new Uint8Array(blob));
-  else if (codec === INT8_CODEC) v = decodeInt8(blob);
-  else throw new RangeError(`unknown vector codec: ${codec}`);
-  if (dims !== undefined && v.length !== dims) throw new RangeError(`a ${codec ?? "float32"} vector of ${v.length} values where the row says ${dims}`);
+export function decodeStoredVector(blob: Uint8Array | ArrayBuffer, storedModel: string, dims?: number): Float32Array {
+  const int8 = isInt8Model(storedModel);
+  const v = int8 ? decodeInt8(blob) : decodeVector(blob instanceof Uint8Array ? blob : new Uint8Array(blob));
+  if (dims !== undefined && v.length !== dims) throw new RangeError(`a ${int8 ? "int8" : "float32"} vector of ${v.length} values where the row says ${dims}`);
   return v;
 }
