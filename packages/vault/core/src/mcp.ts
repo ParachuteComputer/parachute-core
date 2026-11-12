@@ -123,6 +123,8 @@ export interface McpToolDef {
    * one wrapper change").
    */
   resultContent?: (result: unknown) => McpContentBlock[];
+  /** A deprecated note tool's refresh nudge, for `structuredContent` (mcp-result.ts, mcp-records.ts). */
+  deprecation?: { tool: string; use: string; removed_in: string; notice: string };
 }
 
 /**

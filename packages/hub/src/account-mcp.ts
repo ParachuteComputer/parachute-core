@@ -140,10 +140,20 @@ export interface AccountToolContext {
   signToken?: (db: Database, opts: SignAccessTokenOpts) => Promise<{ token: string }>;
 }
 
+/** MCP tool annotations (T-456): what a tool does to the account, so a client can tell a read from a change. */
+export interface AccountToolAnnotations {
+  readOnlyHint: boolean;
+  destructiveHint: boolean;
+  idempotentHint: boolean;
+  openWorldHint: boolean;
+}
+const READ_ONLY: AccountToolAnnotations = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
+
 export interface AccountMcpTool {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
+  annotations: AccountToolAnnotations;
   execute(args: Record<string, unknown>, ctx: AccountToolContext): Promise<unknown>;
 }
 
@@ -274,6 +284,7 @@ export function verbForVault(ctx: AccountToolContext, vaultName: string): Compos
 
 const listVaultsTool: AccountMcpTool = {
   name: "list-vaults",
+  annotations: READ_ONLY,
   description:
     "List the vaults this connection can reach. Returns each vault's name, URL, and version, " +
     "plus whether the grant covers ALL of the hub's vaults or a specific listed subset. " +
@@ -290,6 +301,7 @@ const listVaultsTool: AccountMcpTool = {
 
 const createVaultTool: AccountMcpTool = {
   name: "create-vault",
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   description:
     "Create a new vault on this hub. Returns the new vault's name and URL. " +
     "Does not return a vault token — mint one out of band if you need a credential.",
@@ -349,6 +361,7 @@ function throwGrant(err: unknown): never {
 
 const grantAccessTool: AccountMcpTool = {
   name: "grant-access",
+  annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false }, // can lower a role already there
   description:
     "Give a Nostr pubkey access to one vault. Creates a key-only hub user if the " +
     "pubkey is not yet linked. Writes one user_vaults row — does not replace the " +
@@ -396,6 +409,7 @@ const grantAccessTool: AccountMcpTool = {
 
 const revokeAccessTool: AccountMcpTool = {
   name: "revoke-access",
+  annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
   description:
     "Remove one vault grant from a Nostr pubkey. Leaves the hub user and any other " +
     "vaults in place. Refuses the hub owner (unrestricted by construction).",
@@ -424,6 +438,7 @@ const revokeAccessTool: AccountMcpTool = {
 
 const listAccessTool: AccountMcpTool = {
   name: "list-access",
+  annotations: READ_ONLY,
   description:
     "List pubkey → vault grants this connection can admin. Omit `vault` for every " +
     "such grant; pass it to filter to one vault. Password-only users without a " +

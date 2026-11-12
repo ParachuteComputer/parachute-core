@@ -40,6 +40,8 @@ export interface ListedMcpTool {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
+  /** The vault's own MCP annotations (readOnlyHint …), passed through as the vault sent them (T-456). */
+  annotations?: Record<string, unknown>;
 }
 
 export interface ModuleMcpBackend {
@@ -233,6 +235,7 @@ function injectVaultSelector(tool: {
   name: string;
   description?: unknown;
   inputSchema?: unknown;
+  annotations?: unknown;
 }): ListedMcpTool {
   const rawSchema =
     tool.inputSchema && typeof tool.inputSchema === "object"
@@ -255,7 +258,11 @@ function injectVaultSelector(tool: {
     if (!req.includes("vault")) schema.required = [...req, "vault"];
   }
   const description = typeof tool.description === "string" ? tool.description : tool.name;
-  return { name: tool.name, description, inputSchema: schema };
+  const annotations =
+    tool.annotations && typeof tool.annotations === "object" && !Array.isArray(tool.annotations)
+      ? { annotations: tool.annotations as Record<string, unknown> }
+      : {};
+  return { name: tool.name, description, inputSchema: schema, ...annotations };
 }
 
 /**
@@ -287,7 +294,7 @@ async function listVaultToolsUncached(ctx: AccountToolContext): Promise<readonly
       if (!tools) continue;
       return tools
         .filter(
-          (t): t is { name: string; description?: unknown; inputSchema?: unknown } =>
+          (t): t is { name: string; description?: unknown; inputSchema?: unknown; annotations?: unknown } =>
             !!t && typeof t === "object" && typeof (t as { name?: unknown }).name === "string",
         )
         .filter((t) => !HUB_NATIVE_TOOL_NAMES.has(t.name))

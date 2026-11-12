@@ -84,6 +84,8 @@ export interface RecordToolDef {
   requiredVerb: "read" | "write" | "admin";
   /** The MCP content blocks for a result, when not the one JSON text block (the note aliases' refresh nudge). */
   resultContent?: (result: unknown) => ({ type: "text"; text: string } | { type: string; [k: string]: unknown })[];
+  /** A note alias's nudge, for a reply that also goes out as `structuredContent` (mcp-result.ts). */
+  deprecation?: { tool: string; use: string; removed_in: string; notice: string };
 }
 
 /** What a use is counted as: `tool` for a tool name, `tool param` for a parameter on it. */
@@ -297,7 +299,8 @@ export function noteAliasDescription(noteTool: string): string {
 /**
  * The refresh nudge (0.9.1): the second content block on a successful call to a note-named tool. A client that
  * cached 0.8's tool list (ChatGPT keeps one per connector) never sees the record tools, so it is told what to do
- * either way. The first block, the JSON, stays exactly what it was.
+ * either way. The first block, the JSON, stays exactly what it was. A reply that also goes out as
+ * `structuredContent` (a note read by id, mcp-result.ts) carries it there as `deprecation.notice`.
  */
 export function refreshNudge(noteTool: string): string {
   return `\`${noteTool}\` is deprecated and goes away in 1.0. If \`create-record\` isn't among your tools, ask your user to refresh this connector so you get the new tools. Otherwise use \`${RECORD_TOOL_NAMES[noteTool]}\` from now on.`;
@@ -371,6 +374,8 @@ export function addRecordTools<T extends RecordToolDef>(tools: T[], onUse?: OnUs
         { type: "text" as const, text: JSON.stringify(result, null, 2) },
         { type: "text" as const, text: refreshNudge(t.name) },
       ],
+      // ChatGPT reads only structuredContent when there is one (a note read by id: mcp-result.ts), so the nudge rides there too.
+      deprecation: { tool: t.name, use: name, removed_in: "1.0", notice: refreshNudge(t.name) },
     });
   }
   return [...out, ...aliases];

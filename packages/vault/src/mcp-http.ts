@@ -16,6 +16,8 @@
  */
 
 import { NOTE_TOOL_NAMES, recordWords } from "../core/src/mcp-records.ts";
+import { toolAnnotations } from "../core/src/mcp-annotations.ts";
+import { mcpCallResult } from "../core/src/mcp-result.ts";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import {
@@ -176,6 +178,7 @@ export async function handleMcp(
       name: t.name,
       description: t.description,
       inputSchema: t.inputSchema,
+      annotations: toolAnnotations(t.name), // T-456: a client can tell a read from a change (mcp-annotations.ts)
     })),
   }));
 
@@ -213,10 +216,9 @@ export async function handleMcp(
       // blocks instead of the universal single-text-block default —
       // `read-attachment`'s image branch is the only current user (needs a
       // REAL {type:"image"} block alongside the row-JSON text block).
-      const content = tool.resultContent
-        ? tool.resultContent(result)
-        : [{ type: "text" as const, text: JSON.stringify(result, null, 2) }];
-      return { content };
+      // T-456: mcpCallResult adds `structuredContent` where ChatGPT would otherwise read the reply as `{}` (a JSON
+      // object with a top-level `content` key: a note by id). Every other reply is these blocks alone.
+      return mcpCallResult(tool, result);
     } catch (err) {
       // vault#555 fix 6 — never re-wrap an already-formed McpError. Passing
       // the SAME instance straight through is strictly correct (no
