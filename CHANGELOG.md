@@ -12,10 +12,12 @@ someone running Parachute. Pull request numbers are in brackets.
   `sharp`) and the model it uses (`Xenova/bge-small-en-v1.5`, q8, pinned by revision and sha256). The vault reads the
   shipped model and never downloads it, so it embeds offline. 0.8.0-pre.1 left the stack out, so a home with semantic
   search on failed every embed with one log line per note while it looked healthy (#50).
-- When it can't embed, it says so: `/health` carries `embeddings.state` (`off`, `loading`, `ready` or `failing`), and
-  the vault's info and `/vault/<name>/api/health` add the reason. The anonymous `/health` shows only the state (#50).
+- When it can't embed, it says so. The vault's own `/health` carries `embeddings.state` (`off`, `loading`, `ready`
+  or `failing`); the vault's info (`/vault/<name>/api/vault`) and `/vault/<name>/api/health` add the reason. The
+  hub's `/health` on a box doesn't carry it (#50).
 - The cost: the linux-x64 tarball grows from about 62 MB to 118 MB. The npm package makes the stack an optional
-  dependency, so a machine where sharp can't build still installs and `/health` says why search is failing (#50).
+  dependency (about 650 MB across platforms; on linux-x64 onnxruntime-node's install script also downloads), so a
+  machine where sharp can't build still installs, and the vault's info says why search is failing (#50).
 
 **Safer by default** (from the 11-08 audit):
 - Changing a vault's description needs an admin pass. Every AI connection reads it, so a write pass could plant
@@ -28,13 +30,16 @@ someone running Parachute. Pull request numbers are in brackets.
 
 **Right answers.**
 - A bare metadata filter finds booleans, numbers and null (`{done: true}`, `{streak: 4}` found nothing before).
-  A stored string that reads the same still matches (#47).
+  A stored string that reads the same still matches. A live subscription's bare filter now accepts exactly what
+  the query finds; it used to take a stored 5 for `"5"` (#47).
 - List items with a colon round-trip; `since` means "changed since" (#47).
 - A batch that fails part-way keeps nothing on a Durable Object (cloud), as it already did on a box. Its hooks run
   after the commit (#58). Cloud and the box run the same live-update matcher (#59).
 - A vault description of several paragraphs is read back whole (#63).
 
 **Lighter and easier to run.**
+- Restarting no longer renames a note whose path differs from another's only by case or extension (the second
+  became `<path>-1`). Notes already renamed that way stay renamed (#48).
 - Waking a vault writes nothing and path lookups use an index, which cuts the rows cloud bills for. An admin can
   now delete a note together with its history, on request; a plain delete still keeps it (#48).
 - `parachute probe` opens one vault through the hub (REST and MCP) and prints one line, ok or the step that failed.
