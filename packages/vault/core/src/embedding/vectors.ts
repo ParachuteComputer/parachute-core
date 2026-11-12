@@ -8,9 +8,10 @@
  */
 
 import { Database } from "bun:sqlite";
-import { encodeVector, int8Model, baseModel } from "./vector-codec.js";
+import { decodeVector, encodeInt8, int8Model, baseModel, INT8_MODEL_SUFFIX } from "./vector-codec.js";
 import type { Chunk } from "./chunker.js";
 import type { ExistingVectorRow } from "./staleness.js";
+import { transaction } from "../txn.js";
 
 /**
  * SQL fragment: `<colRef>` (a `content` column reference — bare `content`
@@ -46,6 +47,9 @@ export function getNoteVectorRows(db: Database, noteId: string): ExistingVectorR
     .prepare("SELECT chunk_ix, model, content_hash FROM note_vectors WHERE note_id = ?")
     .all(noteId) as ExistingVectorRow[]).map((r) => ({ ...r, model: baseModel(r.model) }));
 }
+
+/** The SQL test for a row that isn't int8 yet: what the conversion walks, and its partial index's WHERE. */
+export const FLOAT32_ROW_SQL = `model NOT LIKE '%${INT8_MODEL_SUFFIX}'`;
 
 /**
  * Delete specific obsolete chunk rows for a note — the "cheap sync write"
@@ -86,7 +90,44 @@ export function upsertNoteVector(
        model = excluded.model,
        content_hash = excluded.content_hash,
        embedded_at = excluded.embedded_at`,
-  ).run(noteId, chunk.ix, encodeVector(vector), vector.length, model, contentHash, new Date().toISOString());
+  ).run(noteId, chunk.ix, encodeInt8(vector), vector.length, int8Model(model), contentHash, new Date().toISOString());
+}
+
+/**
+ * Convert float32 rows to int8 in place (T-460), part of the bounded maintenance pass: up to `maxRows` rows, stopping
+ * once `budgetMs` is spent (checked between batches of 100). Each row is re-encoded from its own stored float32, so
+ * nothing is re-embedded; the row moves to its model's int8 name (vector-codec.ts). A row that doesn't decode (a length
+ * that isn't whole floats, a non-finite value) is left as it is and counted in `failed`: search already leaves it
+ * out, and it never stops the rest. Walks the partial index of float32 rows in key order (empty once converted).
+ * Returns how many it converted, how many failed, and how many float32 rows are left (the failed ones included).
+ */
+export function convertVectorsToInt8(db: Database, opts: { budgetMs: number | null; maxRows: number }): { converted: number; failed: number; remaining: number } {
+  const started = performance.now();
+  const select = db.prepare(`SELECT note_id, chunk_ix, vector, model FROM note_vectors INDEXED BY idx_note_vectors_float32
+    WHERE ${FLOAT32_ROW_SQL} AND (note_id, chunk_ix) > (?, ?) ORDER BY note_id, chunk_ix LIMIT ?`);
+  const update = db.prepare(`UPDATE note_vectors SET vector = ?, model = ? WHERE note_id = ? AND chunk_ix = ? AND model = ?`);
+  let converted = 0, failed = 0, afterNote = "", afterIx = -1;
+  while (converted + failed < opts.maxRows) {
+    const rows = select.all(afterNote, afterIx, Math.min(100, opts.maxRows - converted - failed)) as { note_id: string; chunk_ix: number; vector: Uint8Array; model: string }[];
+    if (rows.length === 0) break;
+    transaction(db, () => {
+      for (const r of rows) {
+        afterNote = r.note_id;
+        afterIx = r.chunk_ix;
+        let bytes: Uint8Array;
+        try {
+          bytes = encodeInt8(decodeVector(new Uint8Array(r.vector)));
+        } catch {
+          failed++;
+          continue;
+        }
+        if (update.run(bytes, int8Model(r.model), r.note_id, r.chunk_ix, r.model).changes > 0) converted++;
+      }
+    });
+    if (opts.budgetMs !== null && performance.now() - started >= opts.budgetMs) break;
+  }
+  const remaining = (db.prepare(`SELECT COUNT(*) AS n FROM note_vectors INDEXED BY idx_note_vectors_float32 WHERE ${FLOAT32_ROW_SQL}`).get() as { n: number }).n;
+  return { converted, failed, remaining };
 }
 
 /**

@@ -65,7 +65,7 @@ export function decodeVector(blob: Uint8Array): Float32Array {
  * 4,096. On real bge-m3 vectors it kept 98% of each top 10 (evidence in the T-460 run).
  *
  * An int8 row is stored under its model's name with {@link INT8_MODEL_SUFFIX} added (`bge-m3::int8`), not under a new
- * column or schema number. This release reads such rows; the next one (1.0) writes them. An older engine looks for rows under the plain model name only, so it never reads an int8
+ * column or schema number. 0.9.4 and later read such rows; 1.0 writes them. An older engine looks for rows under the plain model name only, so it never reads an int8
  * row as float32: it sees those notes as not embedded yet and embeds them again, writing float32 over the same row.
  * No schema bump, so every older release (the 0.8 code-only rollback, a 0.7 takeover's rollback) still opens the vault.
  */

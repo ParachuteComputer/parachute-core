@@ -7,14 +7,15 @@ import { timestampToMs } from "./cursor.js";
 import { ensureRelationshipColumn } from "./wikilinks.js";
 import { rebuildCompactState } from "./history-compact-state.js";
 import { recordTagKinds } from "./tag-kind.js";
+import { FLOAT32_ROW_SQL } from "./embedding/vectors.js";
 
 export const SCHEMA_VERSION = 32;
 /**
  * The newest schema this engine can open (T-460). Above SCHEMA_VERSION only for a schema whose new data this engine
  * already reads, so a rollback to it still opens and reads every vault; such a vault is opened as it is: no
  * migration runs and no older stamp is written over it. (T-460 writes compressed version bodies without a schema
- * number: see ensureCompactHintsLegacy. 1.0's int8 search vectors and marked versions need none either: this engine
- * reads `model::int8` rows (vector-codec.ts) and keeps a version whose `marked_at` is set.)
+ * number: see ensureCompactHintsLegacy. 1.0's int8 search vectors and marked versions need none either: int8 rows
+ * live under `model::int8` (vector-codec.ts; see ensureFloat32VectorIndex) and marks are an additive column.)
  */
 export const READABLE_SCHEMA_VERSION = 33;
 
@@ -36,6 +37,16 @@ function compactHintsCurrent(db: Database): boolean {
  */
 function ensureCompactHintsLegacy(db: Database): void {
   if (hasTable(db, "note_versions") && !compactHintsCurrent(db)) rebuildCompactState(db);
+}
+
+/**
+ * T-460 (1.0): search vectors are stored as int8 under their model's int8 name (`bge-m3::int8`; embedding/
+ * vector-codec.ts), so no column and no schema number: an older engine looks only under the plain model name and
+ * embeds those notes again rather than misreading them. Un-numbered: the float32 rows left to convert, which the
+ * maintenance pass walks (empty once a vault is converted). Older engines' writes keep it current.
+ */
+function ensureFloat32VectorIndex(db: Database): void {
+  if (hasTable(db, "note_vectors")) db.exec(`CREATE INDEX IF NOT EXISTS idx_note_vectors_float32 ON note_vectors(note_id, chunk_ix) WHERE ${FLOAT32_ROW_SQL}`);
 }
 
 function migrateToV32(db: Database): void {
@@ -750,7 +761,8 @@ export function unnumberedStepsDone(db: Database): boolean {
     (!hasTable(db, "note_versions") || hasColumn(db, "note_versions", "via_kind")) && // ensureRevisionKeyKind (0.9.1)
     compactHintsCurrent(db) && // ensureCompactHintsLegacy (T-460)
     (!hasTable(db, "note_versions") || hasColumn(db, "note_versions", "marked_by")) && // ensureVersionMarks (T-460, 1.0)
-    (!hasTable(db, "history_compact_state") || hasIndex(db, "idx_history_compact_refreshed"))
+    (!hasTable(db, "history_compact_state") || hasIndex(db, "idx_history_compact_refreshed")) &&
+    (!hasTable(db, "note_vectors") || hasIndex(db, "idx_note_vectors_float32")) // ensureFloat32VectorIndex (T-460, 1.0)
   );
 }
 
@@ -777,6 +789,7 @@ export function initSchema(db: Database): void {
       ensureRevisionKeyKind(db);
       ensureCompactHintsLegacy(db);
       ensureVersionMarks(db);
+      ensureFloat32VectorIndex(db);
     }
     rebuildIndexes(db);
     return;
@@ -935,6 +948,8 @@ export function initSchema(db: Database): void {
   ensureCompactHintsLegacy(db);
   // Marked versions (T-460, 1.0).
   ensureVersionMarks(db);
+  // int8 search vectors (T-460, 1.0): the index the conversion walks.
+  ensureFloat32VectorIndex(db);
 
   // Rebuild any generated columns + indexes declared in indexed_fields.
   // No-op for a fresh vault; idempotent on existing vaults.

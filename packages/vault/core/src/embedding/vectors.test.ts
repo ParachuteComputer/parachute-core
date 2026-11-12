@@ -8,7 +8,7 @@ import {
   countNotesPendingEmbedding,
   getNotesPendingEmbedding,
 } from "./vectors.js";
-import { normalize, decodeVector } from "./vector-codec.js";
+import { normalize, decodeVector, decodeStoredVector } from "./vector-codec.js";
 
 const MODEL = "test-model";
 
@@ -45,7 +45,7 @@ describe("upsertNoteVector / getNoteVectorRows", () => {
     const raw = db.prepare("SELECT vector FROM note_vectors WHERE note_id = ? AND chunk_ix = 0").get(note.id) as {
       vector: Uint8Array;
     };
-    const decoded = decodeVector(raw.vector);
+    const decoded = decodeStoredVector(raw.vector, `${MODEL}::int8`);
     expect(decoded[1]).toBeCloseTo(1, 5); // the v2 vector, not v1
   });
 

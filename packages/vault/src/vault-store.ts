@@ -146,6 +146,7 @@ function runMaintenance(name: string, store: SqliteStore): void {
     // Synchronous like the sweep: bounds are checked between notes, so one note may overshoot.
     const summary = store.compactHistory();
     if (summary.notes_scanned > 0 || summary.remaining_candidates > 0) console.log(`[vault] history compaction for ${name}: scanned ${summary.notes_scanned}, compacted ${summary.notes_compacted}, failed ${summary.notes_failed}, deltified ${summary.blobs_deltified}, ${summary.bytes_before}->${summary.bytes_after} bytes in ${summary.duration_ms}ms (stopped_by ${summary.stopped_by}, ${summary.remaining_candidates} candidate(s) remaining)`);
+    if (summary.vectors_converted || summary.vectors_failed) console.log(`[vault] search vectors for ${name}: ${summary.vectors_converted} converted to int8, ${summary.vectors_failed} unreadable, ${summary.vectors_remaining} left`);
     if (summary.versions_thinned) console.log(`[vault] history tiers for ${name}: ${summary.versions_thinned} version(s) thinned from ${summary.notes_thinned} note(s), ${summary.thin_remaining} note(s) due`);
   } catch (error) { console.warn(`[vault] history compaction failed for ${name}:`, error); }
 }

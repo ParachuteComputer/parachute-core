@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { HistoryPreconditionRequiredError } from "./history.js";
 import { thinVault, markVersion } from "./history.js";
+import { convertVectorsToInt8 } from "./embedding/vectors.js";
 import type { Store, Note, Link, Attachment, QueryOpts, QueryNotesPage, AggregateRow, SemanticSearchResult } from "./types.js";
 import { compactNote, compactVault, countNoteVersions, type CompactResult, type CompactSummary, captureVersion, readPriorNoteRow, resolveHistoryPolicy, appendRestoreMarker, listVersions, getVersion, latestTombstone, eraseHistory, eraseNoteVersions, listDeletedNotes, sweepDeletedHistory, deletedHistoryStats, HistoryNotFoundError, HistoryOverflowError, HistoryUnrecoverableError, DEFAULT_HISTORY_POLICY, VERSION_MAX_BYTES, type VersionRow, type HistoryPolicy, type HistoryOp } from "./history.js";
 import { initSchema } from "./schema.js";
@@ -991,8 +992,9 @@ export class BunSqliteStore implements Store {
   async countNoteVersions(id: string) { return countNoteVersions(this.db, id); }
   compactNote(id: string) { return compactNote(this.db, id, this.historyPolicy); }
   /**
-   * The bounded maintenance pass: (for a whole-vault pass) the retention tiers' sweep, then history compaction, each
-   * with its own budget of the same size (T-460). Box and Cloud both run it when a vault opens.
+   * The bounded maintenance pass: (for a whole-vault pass) the retention tiers' sweep, then history compaction, then
+   * converting float32 search vectors to int8, each with its own budget of the same size (T-460). Box and Cloud both
+   * run it when a vault opens.
    */
   compactHistory(opts?: { noteId?: string; budgetMs?: number | null; maxNotes?: number | null }) {
     const budget = opts?.budgetMs === undefined ? this.historyPolicy.compact_budget_ms : opts.budgetMs;
@@ -1001,8 +1003,10 @@ export class BunSqliteStore implements Store {
     const thinned = whole ? thinVault(this.db, this.historyPolicy, { budgetMs: budget, maxNotes: opts?.maxNotes === undefined ? this.historyPolicy.compact_max_notes : opts.maxNotes ?? 10_000 }) : null;
     const summary = compactVault(this.db, this.historyPolicy, opts);
     if (!thinned) return summary;
+    const vectors = convertVectorsToInt8(this.db, { budgetMs: budget, maxRows: 20_000 });
     return {
-      ...summary, notes_thinned: thinned.notes_thinned, versions_thinned: thinned.versions_thinned, thin_remaining: thinned.remaining,
+      ...summary, vectors_converted: vectors.converted, vectors_failed: vectors.failed, vectors_remaining: vectors.remaining,
+      notes_thinned: thinned.notes_thinned, versions_thinned: thinned.versions_thinned, thin_remaining: thinned.remaining,
     };
   }
   /** Mark a version to keep for good, or clear the mark (T-460). Returns the row, or null when there is no such version. */

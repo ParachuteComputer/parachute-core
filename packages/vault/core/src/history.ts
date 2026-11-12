@@ -852,6 +852,10 @@ export interface CompactSummary {
   remaining_candidates: number;
   duration_ms: number;
   stopped_by: "complete" | "budget" | "max_notes" | "disabled";
+  /** A whole-vault maintenance pass (Store.compactHistory) also converts float32 search vectors to int8 (T-460). */
+  vectors_converted?: number;
+  vectors_failed?: number;
+  vectors_remaining?: number;
   /** A whole-vault maintenance pass (Store.compactHistory) also applies the retention tiers to notes not swept for a day (T-460). */
   notes_thinned?: number;
   versions_thinned?: number;
