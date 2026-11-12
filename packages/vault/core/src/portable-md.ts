@@ -345,6 +345,17 @@ function emitListItem(value: unknown): string {
   return typeof value === "string" && value.includes(":") ? quoteString(value) : emitScalar(value);
 }
 
+/**
+ * A mapping key as written. A plain word (`[\w][\w.-]*`) goes out bare, as it
+ * always has; any other key (`it's`, `@at`, `#hash`, `[x]`, `-dash`, `a: b`,
+ * a space, a non-ASCII letter) is quoted, or the reader would skip the line or
+ * read the key as YAML syntax (#75).
+ */
+function emitKey(key: string): string {
+  return PLAIN_KEY.test(key) ? key : quoteString(key);
+}
+const PLAIN_KEY = /^[\w][\w.-]*$/;
+
 function emitScalar(value: unknown): string {
   if (value === null) return "null";
   if (value === undefined) return "null";
@@ -369,12 +380,12 @@ function emitObject(obj: Record<string, unknown>, indent: number): string {
   const pad = "  ".repeat(indent);
   const lines: string[] = [];
   for (const key of keys) {
-    lines.push(`${pad}${key}: ${emitValueInline(obj[key], indent + 1) ?? ""}`);
+    lines.push(`${pad}${emitKey(key)}: ${emitValueInline(obj[key], indent + 1) ?? ""}`);
     const block = emitValueBlock(obj[key], indent + 1);
     if (block !== null) {
       // Block form was used — replace the inline placeholder above with the
       // block form. Done by overwriting the last pushed line with key: only.
-      lines[lines.length - 1] = `${pad}${key}:`;
+      lines[lines.length - 1] = `${pad}${emitKey(key)}:`;
       lines.push(block);
     }
   }
@@ -420,9 +431,9 @@ function emitValueBlock(value: unknown, indent: number): string | null {
           const prefix = first ? `${pad}- ` : `${pad}  `;
           const inline = emitValueInline(obj[key], indent + 2);
           if (inline !== null) {
-            lines.push(`${prefix}${key}: ${inline}`);
+            lines.push(`${prefix}${emitKey(key)}: ${inline}`);
           } else {
-            lines.push(`${prefix}${key}:`);
+            lines.push(`${prefix}${emitKey(key)}:`);
             const block = emitValueBlock(obj[key], indent + 2);
             if (block !== null) lines.push(block);
           }
@@ -2455,12 +2466,12 @@ async function importVaultReplay(
 
   // 2. Tag schemas — restore before notes so any tag a note carries can
   // validate against its schema on insert.
-  for (const { text } of source.readSchemaFiles()) {
+  for (const { name, text } of source.readSchemaFiles()) {
     // Reuse the frontmatter parser by wrapping the doc in `---`s. The schema
     // file is a YAML doc (no `---` markers); pad with them so
     // `parseFrontmatter` can chew on it via the same code path.
     const wrapped = `---\n${text}${text.endsWith("\n") ? "" : "\n"}---\n`;
-    const { frontmatter } = parseFrontmatter(wrapped, reading);
+    const { frontmatter } = parseFrontmatter(wrapped, reading, importKeyWarning(`schema ${name}`));
     const tagName = typeof frontmatter.name === "string" ? frontmatter.name : null;
     if (!tagName) continue;
     if (opts.dryRun) {
@@ -2551,7 +2562,7 @@ async function importVaultReplay(
     // The sidecar is a bare YAML doc (no `---`); wrap to reuse the shared
     // frontmatter parser.
     const wrapped = `---\n${text}${text.endsWith("\n") ? "" : "\n"}---\n`;
-    const { frontmatter } = parseFrontmatter(wrapped, reading);
+    const { frontmatter } = parseFrontmatter(wrapped, reading, importKeyWarning("a notes-meta sidecar"));
     const sidecarId = typeof frontmatter.id === "string" ? frontmatter.id : null;
     const sidecarPath = typeof frontmatter.path === "string" ? frontmatter.path : null;
     const sidecarExt = typeof frontmatter.extension === "string" ? frontmatter.extension : null;
@@ -2589,7 +2600,7 @@ async function importVaultReplay(
     let content: string;
     if (supportsInlineFrontmatter(fileExt)) {
       const raw = source.readContentFile(relPath);
-      const parsed = parseFrontmatter(raw, reading);
+      const parsed = parseFrontmatter(raw, reading, importKeyWarning(`"${relPath}"`));
       frontmatter = parsed.frontmatter;
       content = parsed.content;
     } else {
@@ -2962,7 +2973,7 @@ export async function importPortableVault(
  * This is the canonical parser for the portable-md format. The legacy
  * `parseFrontmatter` in `obsidian.ts` delegates here.
  */
-export function parseFrontmatter(raw: string, reading: ScalarReading = "yaml"): {
+export function parseFrontmatter(raw: string, reading: ScalarReading = "yaml", warn?: (message: string) => void): {
   frontmatter: Record<string, unknown>;
   content: string;
 } {
@@ -2989,7 +3000,13 @@ export function parseFrontmatter(raw: string, reading: ScalarReading = "yaml"): 
 
   const yamlBlock = lines.slice(1, closeIdx).join("\n");
   const content = lines.slice(closeIdx + 1).join("\n");
-  return { frontmatter: parseBlock(yamlBlock, 0, reading).value, content };
+  return { frontmatter: parseBlock(yamlBlock, 0, reading, warn).value, content };
+}
+
+/** The import's warning for a frontmatter line whose key could not be read: names the file and the key (#75). */
+function importKeyWarning(file: string): (message: string) => void {
+  // eslint-disable-next-line no-console
+  return (message) => console.warn(`[import] ${file}: ${message}`);
 }
 
 /**
@@ -3040,7 +3057,7 @@ interface ParseResult {
  * (anchors, references, multi-document streams, multi-line strings) are
  * not supported — out of scope for the export format.
  */
-function parseBlock(text: string, baseIndent: number, reading: ScalarReading): ParseResult {
+function parseBlock(text: string, baseIndent: number, reading: ScalarReading, warn?: (message: string) => void): ParseResult {
   const lines = text.split("\n");
   const result: Record<string, unknown> = {};
   let i = 0;
@@ -3056,10 +3073,10 @@ function parseBlock(text: string, baseIndent: number, reading: ScalarReading): P
 
     // Key regex (contract C2 / §1.2): dots allowed in keys, optional
     // whitespace before the colon (`created.at:` / `key :` both parse).
-    const kv = line.slice(baseIndent).match(/^([\w][\w.-]*)\s*:\s*(.*)$/);
-    if (!kv) { i++; continue; }
-    const key = kv[1]!;
-    const valueText = kv[2]!.trim();
+    const kv = matchKey(line.slice(baseIndent), false);
+    if (!kv) { unreadableKey(line.slice(baseIndent), warn); i++; continue; }
+    const key = kv.key;
+    const valueText = kv.rest.trim();
 
     if (valueText === "") {
       // Block-form value follows. Could be either an object or an array.
@@ -3080,12 +3097,12 @@ function parseBlock(text: string, baseIndent: number, reading: ScalarReading): P
         continue;
       }
       if (peekLine.slice(peekIndent).startsWith("- ")) {
-        const { value, consumed } = parseArrayBlock(lines, i + 1, peekIndent, reading);
+        const { value, consumed } = parseArrayBlock(lines, i + 1, peekIndent, reading, warn);
         result[key] = value;
         i = i + 1 + consumed;
       } else {
         const block = lines.slice(i + 1).join("\n");
-        const { value, consumed } = parseBlock(block, peekIndent, reading);
+        const { value, consumed } = parseBlock(block, peekIndent, reading, warn);
         result[key] = value;
         i = i + 1 + consumed;
       }
@@ -3095,6 +3112,28 @@ function parseBlock(text: string, baseIndent: number, reading: ScalarReading): P
     }
   }
   return { value: result, consumed: i };
+}
+
+/**
+ * A `key: value` line's key and the text after the colon. A plain word key
+ * (`[\w][\w.-]*`, what every exporter wrote before #75) or a single- or
+ * double-quoted key (what the exporter writes for any other key). `strict` is
+ * the list-item rule: the colon needs a space or the end of the line after it,
+ * so `- https://x` stays a string. Anything else is null: the caller reports it.
+ */
+function matchKey(s: string, strict: boolean): { key: string; rest: string } | null {
+  const plain = (strict ? /^([\w][\w.-]*)\s*:(?:\s+(.*))?$/ : /^([\w][\w.-]*)\s*:\s*(.*)$/).exec(s);
+  if (plain) return { key: plain[1]!, rest: plain[2] ?? "" };
+  const quoted = (strict ? /^('(?:[^']|'')*'|"(?:[^"\\]|\\.)*")\s*:(?:\s+(.*))?$/ : /^('(?:[^']|'')*'|"(?:[^"\\]|\\.)*")\s*:\s*(.*)$/).exec(s);
+  if (quoted) return { key: String(unquoteYaml(quoted[1]!)), rest: quoted[2] ?? "" };
+  return null;
+}
+
+/** A line at a key's place that no key rule takes: say so, with the key as far as it can be told, instead of dropping it. */
+function unreadableKey(line: string, warn?: (message: string) => void): void {
+  const text = line.trim();
+  const colon = text.search(/:(?:\s|$)/);
+  warn?.(`cannot read the key ${JSON.stringify(colon > 0 ? text.slice(0, colon) : text)}: quote it ('key': value), the line was skipped`);
 }
 
 function peekNextContent(lines: string[], from: number): number {
@@ -3123,6 +3162,7 @@ function parseArrayBlock(
   start: number,
   arrayIndent: number,
   reading: ScalarReading,
+  warn?: (message: string) => void,
 ): { value: unknown[]; consumed: number } {
   const result: unknown[] = [];
   let i = start;
@@ -3141,14 +3181,12 @@ function parseArrayBlock(
     // in YAML, a key's colon has a space or the end of the line after it, so
     // `- https://x` and `- 2027-02-03T17:00:00Z` are strings. The exporter wrote
     // those unquoted until T-395, and this is what restores those exports. An
-    // object whose first key holds a colon (keys aren't quoted) still reads as
+    // object whose first key holds a colon (older exports didn't quote keys) still reads as
     // it always did, or the keys under it are lost: a string item never has
     // lines under it, and every exporter quotes a string holding `: `.
     const nextLine = peekNextContent(lines, i + 1);
     const cannotBeString = /:\s/.test(after) || (nextLine !== -1 && countLeadingSpaces(lines[nextLine]!) > indent);
-    const objMatch =
-      after.match(/^([\w][\w.-]*)\s*:(?:\s+(.*))?$/) ??
-      (cannotBeString ? after.match(/^([\w][\w.-]*)\s*:\s*(.*)$/) : null);
+    const objMatch = matchKey(after, true) ?? (cannotBeString ? matchKey(after, false) : null);
     if (!objMatch) {
       result.push(parseScalarOrInline(after, reading));
       i++;
@@ -3159,8 +3197,8 @@ function parseArrayBlock(
     // indent+2, and subsequent lines at indent+2 are siblings. We
     // synthesize a normalized block string and recurse.
     const itemIndent = indent + 2;
-    const itemKey = objMatch[1]!;
-    const itemValue = (objMatch[2] ?? "").trim();
+    const itemKey = objMatch.key;
+    const itemValue = objMatch.rest.trim();
     const itemObj: Record<string, unknown> = {};
     if (itemValue === "") {
       // First key's value is a nested block — look at next line.
@@ -3171,12 +3209,12 @@ function parseArrayBlock(
         if (peekIndent > itemIndent) {
           // Nested block under this first key.
           if (peekLine.slice(peekIndent).startsWith("- ")) {
-            const { value, consumed } = parseArrayBlock(lines, i + 1, peekIndent, reading);
+            const { value, consumed } = parseArrayBlock(lines, i + 1, peekIndent, reading, warn);
             itemObj[itemKey] = value;
             i = i + 1 + consumed;
           } else {
             const block = lines.slice(i + 1).join("\n");
-            const { value, consumed } = parseBlock(block, peekIndent, reading);
+            const { value, consumed } = parseBlock(block, peekIndent, reading, warn);
             itemObj[itemKey] = value;
             i = i + 1 + consumed;
           }
@@ -3200,10 +3238,15 @@ function parseArrayBlock(
       const sibIndent = countLeadingSpaces(sib);
       if (sibIndent !== itemIndent) break;
       if (sib.slice(sibIndent).startsWith("- ")) break;
-      const sibKv = sib.slice(sibIndent).match(/^([\w][\w.-]*)\s*:\s*(.*)$/);
-      if (!sibKv) break;
-      const sibKey = sibKv[1]!;
-      const sibValue = sibKv[2]!.trim();
+      const sibKv = matchKey(sib.slice(sibIndent), false);
+      if (!sibKv) {
+        if (sib.trimStart().startsWith("#")) { i++; continue; }
+        unreadableKey(sib.slice(sibIndent), warn);
+        i++;
+        continue;
+      }
+      const sibKey = sibKv.key;
+      const sibValue = sibKv.rest.trim();
       if (sibValue === "") {
         const peekIdx = peekNextContent(lines, i + 1);
         if (peekIdx !== -1) {
@@ -3211,12 +3254,12 @@ function parseArrayBlock(
           const peekIndent = countLeadingSpaces(peekLine);
           if (peekIndent > itemIndent) {
             if (peekLine.slice(peekIndent).startsWith("- ")) {
-              const { value, consumed } = parseArrayBlock(lines, i + 1, peekIndent, reading);
+              const { value, consumed } = parseArrayBlock(lines, i + 1, peekIndent, reading, warn);
               itemObj[sibKey] = value;
               i = i + 1 + consumed;
             } else {
               const block = lines.slice(i + 1).join("\n");
-              const { value, consumed } = parseBlock(block, peekIndent, reading);
+              const { value, consumed } = parseBlock(block, peekIndent, reading, warn);
               itemObj[sibKey] = value;
               i = i + 1 + consumed;
             }
