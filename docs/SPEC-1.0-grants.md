@@ -140,7 +140,7 @@ this: `on` holds `type` only, `only` holds `own` only, `deny` holds `tag` only. 
 including `on.path` (sharing a subtree is 1.1).
 
 **One spelling.** The content is canonical JSON (RFC 8259, no duplicate keys): object keys are ASCII and sorted
-byte by byte; no whitespace outside strings; numbers are whole, 0 to 2^53−1, written as plain decimal digits with
+byte by byte; no whitespace outside strings; `true` is the only literal (for `only.own`); numbers are whole, 0 to 2^53−1, written as plain decimal digits with
 no sign, fraction, exponent or leading zero; in strings the only escapes are `\"` and `\\`, and every other
 character is written as itself in well-formed UTF-8 (no control character can occur: §2.1's `purpose` rule and the
 ASCII rule leave none); arrays of verbs, rows and denies are sorted as above. A content that isn't the canonical
@@ -198,7 +198,10 @@ this vault. What else each kind must carry:
    and nobody else may use that start, so a member can't take an id the owner will want. If an event with this
    address is on file, this one is newer by `created_at` (on a tie the lower event id wins, as in NIP-01, so two
    copies always merge to the same answer), it is signed by the same key, and its `to` and `under` are
-   byte-identical to the last event the vault filed at that address. An owner with two keys replaces a grant with
+   byte-identical to every event the vault has seen at that address, filed or held. One that differs is refused
+   (`id_taken`) and is neither filed nor held. When statements are filed in bulk (a restore, an import, the door
+   filing its copy), they go in oldest first by `created_at`, ties by the lower event id, so the same set always
+   gives the same answer. An owner with two keys replaces a grant with
    the key that signed it. A replacement may change rows, denies, the date and the purpose. It may never change who
    the grant is for, whose name it writes in, or what it counts as its own.
 7. **One grant per grantee:** a key holds at most one grant in force in a vault, and a signer's applet id likewise.
@@ -227,11 +230,18 @@ is `superseded` and never in force again, whether it arrived before or after, an
 event that fails the minimal read is refused and suspends nothing, so an owner's grant at the same address for
 another vault, or a shell grant on the same kind, never touches this one.
 
-The held event is judged again whenever its refusal may have cleared: after the vault is upgraded, when it is filed
-again, and when another grant of the grantee's ends (line 7). If it can now be filed, it is, and the address is in
-force under it. Otherwise the address comes back only with a newer event the vault files. A vault reads an event of
-up to 64 KB for the minimal read; a door refuses a larger request body, and a shell never signs a grant over 8 KB, so
-a narrowing can't be lost to its size. The vault lists the grant as `suspended`, with the held event, and carries
+Standing (line 3) for holding is judged as for filing; at an import it is judged against the carried owner-key list
+and its dates, so a narrowing isn't dropped because the owner's key isn't linked at the new door yet. A held event is
+judged again in two cases only: after the vault is upgraded, and when someone files it again. If it can then be
+filed, it is, and the address is in force under it. Nothing else brings a held event into force, so a grant the
+owner meant to stay refused never arrives on its own. Otherwise the address comes back only with a newer event the
+vault files. A member's held events count toward their cap of 20 (§5.2). A vault reads an event of up to 64 KB of
+serialized event for the minimal read, and a door accepts a request body of up to 72 KB; a shell never signs a grant
+over 8 KB. Those three numbers are frozen for every later version, so a narrowing can't be lost to its size.
+
+A signed event the owner handed out can be filed by whoever holds it until its date, as §3 says of a grant never
+filed. That holds for a newer replacement too, wider or narrower: to take back one that was handed over and not
+filed, sign a newer event at the address or revoke the address. The vault lists the grant as `suspended`, with the held event, and carries
 held events with the statements (§3, §9). Only the grantor's key can sign at its address, so nobody else can suspend
 a grant. A shell narrows with fields every vault it names knows, or by a revoke and a new id.
 
@@ -286,7 +296,9 @@ with their dates (§8 rule 2). Every record must be no more than ten minutes ahe
 arrives, so none can be dated out of reach.
 
 1. Take the newest owner override signed by a key that is on the vault's owner list now. It names a key K. With no
-   such override, K is the id. An override from a key taken off the list stops counting, as its grants do.
+   such override, K is the id. An override from a key taken off the list stops counting, as its grants do. After a
+   move, until the owner's tap files an override from a key listed at the new door, no record counts and the vault
+   signs nothing as itself (§9); it never falls back to an earlier key.
 2. Then follow handovers newer than that override (or from the start): of the records K signed naming another
    key, the newest moves K to it. Repeat from the new K.
 3. Records signed by the final K, newer than the override, say where the vault lives.
@@ -312,8 +324,9 @@ holding the key could speak as the vault. On a **move**, the arriving door makes
   list says so.
 
 **How it rotates.** An owner rotates at any time by signing an override naming a key the door made for the vault
-(the door shows it; the owner's shell signs). The door installs the new private key when it files the override and
-deletes the old one. A door asked to file an override naming a key it doesn't hold files it and stops signing as
+(the door shows it; the owner's shell signs). The door installs the new private key when it files the override. It keeps
+earlier private keys it made for the vault, unused, so an owner can rotate back, until the owner asks it to delete
+one; it signs only with the key the rule names. A door asked to file an override naming a key it doesn't hold files it and stops signing as
 the vault: that is how an owner retires a host.
 
 **If a host leaks the key.** Whoever holds a leaked key can sign vault records: claim the vault lives elsewhere
@@ -509,7 +522,7 @@ today.
   denies. So narrowing the member narrows their agents at once, and a member's denied tag is denied to their agents
   whatever the agent's grant says.
 - **One level.** An agent can't sign for another key.
-- **A cap.** A member may have at most 20 grants and early revokes on file that aren't ended, since nothing is
+- **A cap.** A member may have at most 20 grants, held events and early revokes on file that aren't ended, since nothing is
   deleted.
 
 ### 5.3 Applets [decided: in-shell applets write with the owner's or Uni's key; attribution travels in created_via]
@@ -680,7 +693,7 @@ that the signed-in owner agreed.
 | a newer event for the id is on file | 409 `superseded` |
 | the id was ever another signer's or another grantee's; `to` or `under` changed; a member's id outside their own start | 409 `id_taken` |
 | a request under a grant that has ended or is suspended | 401 `grant_ended` |
-| a newer event at a filed address that this vault can't take (§2.2): refused with its own reason, and the address is suspended | the reason's status; the row's `state` is `suspended`; an older event arriving later is 409 `superseded` |
+| a newer event at an address that this vault can't take (§2.2): refused with its own reason, and the address is suspended | the reason's status; the row's `state` is `suspended`; an older event arriving later is 409 `superseded` |
 | the grantee is the vault's id or any key that has signed for the vault | 400 `invalid_statement` |
 | a vault record (§2.3) not signed by the vault's current key or an owner key; a handover filed outside an import | 403 `no_standing` |
 | a visible record, a verb the grant lacks; a denied tag attached or detached | 403 `not_granted`, naming the verb and the type |
@@ -726,7 +739,7 @@ things under `.parachute/`: stamps, history and links. 1.0 adds statements to th
 | The four stamps and the history | carried, marked with the import that brought them (0.9.4) |
 | The vault's id | kept on a move, new on a copy (§2.3) |
 | The vault's private key | **never.** The arriving door makes a new key pair. The owner's tap below also signs an override naming it; for an owner with no key, `tools/move` asks the leaving door for a handover record (§2.3). Until one of those is filed, the arriving vault serves but doesn't sign as itself |
-| The vault's records (kind 37443) | in `statements.jsonl` with every statement, so readers can still follow the key from the id |
+| The vault's records (kind 37443) | in `statements.jsonl` with every statement, so the arriving vault can still follow the key from the id |
 | Every statement, word for word: grants, revokes, links, claims, vault records, and the unfiled events that hold an address suspended | in `.parachute/statements.jsonl`, one signed event per line. Filed again and verified again on arrival, then merged with any copy the arriving door already keeps for that vault id (§3): its revokes apply; its grants don't come into force by themselves (below) |
 | The owner-key list and each prefix's service keys, with dates | for reading history only: so an old statement can still be checked. A carried key has no standing at the new door |
 | **Revokes** | **in force at once.** Carrying a revoke can only close. A carried revoke is judged against the carried owner-key list and its dates: if its signer had standing for that address when it was signed, it applies, though that key has no standing at the new door. The arriving door files the carried grants (as `carried`) before it judges the carried revokes, so a grantee's own giving-up and an early revoke find their address |
@@ -773,7 +786,7 @@ Nobody has to act on the day [decided, ROADMAP "How a cloud vault and each conne
 | A grant quietly widened by a field an old vault doesn't know | unknown tags, fields and token permissions are refused (§2.2, §7.2) |
 | A narrowing an old vault can't read leaving the wide grant in force | the newer event suspends the address (§2.2) |
 | A revoke an old vault can't fully read failing open | a revoke's three fields act whatever else it carries (§3) |
-| One meaning signed in two spellings, read two ways | one canonical spelling, vectors run by every signer and vault (§2.1) |
+| One meaning signed in two spellings, read two ways | one canonical spelling (§2.1); its vectors, a precondition of the freeze, are run by every signer and vault |
 | A revoke or grant for one vault used at another with the same owner | `honors` on every statement; revokes kept per vault (§2.2, §3) |
 | A leaked vault key speaking for the vault | it can't sign or end a grant; an owner override retires it, whatever it backdates (§2.3) |
 | A narrow key learning what it can't read | one checkpoint; hidden is the same as missing, but for a taken path (§4.1) |
@@ -899,3 +912,14 @@ at the round-3 changes. No reviewer has taken a fresh adversarial pass over the 
 own review: a fresh Fable reviewer ran them on both doors (round 1 NO-SHIP for two gaps: a narrow grantee could
 export, and one status was over-tight; round 2 SHIP).
 
+**Round 4, the respelling (T-462, 11-12).** The layout above (§2.1 content in the grant frame, §2.2's suspension,
+§2.3 the vault's own key, §3's revoke) was weighed in T-462 by three fresh Fable reviewers on a verdict note, then
+written into this file and reviewed here:
+
+| Pass | Verdict | What it found, and what changed |
+|---|---|---|
+| A fresh adversarial Fable reviewer, the whole file | **NO-SHIP**, 10 findings | Suspension depended on arrival order; vault-record overrides had no date bound and handover forks no rule, and a keyless owner's retained key had no cure; readers away from the vault can't see the owner list; carried revokes from a key without standing at the new door were refused; §2.2's preamble contradicted revokes and links; the spelling was under-specified and the helper disagreed; suspension had no way back; a revoke could later grow narrowing fields; stale tag-layout text; a contract that retired the shared vault's host. All fixed (§2.1, §2.2, §2.3, §3, §9; `_grants.ts`). |
+| A fresh Fable check of those fixes only | **SHIP WITH FIXES**: 4 closed, 6 partly, 6 new | Line 6 still depended on order; held events dropped at import; a refused grant could come into force on its own; held events uncounted; an earlier key after a move; unfiled replacements. All fixed (§2.2 line 6 and bulk filing oldest first, holding against the carried owner list, re-judging only on upgrade or re-file, the member cap, §2.3 step 1, the take-back sentence). |
+
+The second pass's fixes were made after it and have not been reviewed again. Not a freeze yet: the spelling
+vectors don't exist, and open decision A asks for one more security pass with Benjamin.
