@@ -11,6 +11,11 @@
  * `deprecation.notice` (the nine other old names already carry a `deprecation` field in their JSON).
  *
  * Only for that case: every other reply stays as it was, one block (or a tool's own blocks), no `structuredContent`.
+ * On a note tool the two differ by that one `deprecation` key (MCP says the text SHOULD be the serialised object; no
+ * tool declares an outputSchema, so nothing checks). A client that prefers structuredContent shows such a reply as
+ * one object with `deprecation.notice` where it showed two blocks: the same words. Not covered (structuredContent is
+ * an object, and these weren't seen to fail): arrays of notes with `content` (a batch create, a list with
+ * `include_content`), and the account door's fan-out, which nests notes under `results`.
  * Pure: no imports, so the cloud runtime answers the same.
  */
 

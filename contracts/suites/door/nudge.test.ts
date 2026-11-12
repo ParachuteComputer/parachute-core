@@ -66,8 +66,8 @@ describe("the refresh nudge and the read sentence", () => {
     const c = await mcp("write");
     try {
       const path = `${runId("nudge")}/three`;
-      await blocks(c, "create-note", { path, content: "Hollow Oak Farm: 12 crates for client-7.", tags: ["nudge-sc"] });
       const calls: [string, Record<string, unknown>][] = [
+        ["create-note", { path, content: "Hollow Oak Farm: 12 crates for client-7.", tags: ["nudge-sc"] }],
         ["query-notes", { id: path, include_content: true }],
         ["update-note", { id: path, append: "\nPaid." }],
         ["query-notes", { tag: "nudge-sc" }],

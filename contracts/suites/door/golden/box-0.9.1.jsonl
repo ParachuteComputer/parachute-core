@@ -26,9 +26,9 @@
 {"key":"account/vaults.item.url","value":"string"}
 {"key":"account/vaults.item.version","value":"string"}
 {"key":"account/vaults.reply.envelope","value":["vaults"]}
-{"key":"annotations/account.read-only.tools","value":["doctor","find-path","list-access","list-tags","list-types","list-vaults","query-notes","query-records","read-attachment","request-attachment-download","vault-info"]}
-{"key":"annotations/destructive.tools","value":["create-note","create-record","delete-note","delete-record","delete-tag","manage-keys","manage-token","manage-types","merge-tags","prune-schema","rename-tag","update-note","update-record","update-tag"]}
-{"key":"annotations/read-only.tools","value":["doctor","find-path","list-tags","list-types","query-notes","query-records","read-attachment","request-attachment-download","vault-info"]}
+{"key":"annotations/account.read-only.tools","value":["doctor","find-path","list-access","list-tags","list-types","list-vaults","query-notes","query-records","read-attachment","request-attachment-download"]}
+{"key":"annotations/destructive.tools","value":["create-note","create-record","delete-note","delete-record","delete-tag","manage-keys","manage-token","manage-types","merge-tags","prune-schema","rename-tag","update-note","update-record","update-tag","vault-info"]}
+{"key":"annotations/read-only.tools","value":["attachment-url","doctor","find-path","list-tags","list-types","query-notes","query-records","read-attachment","request-attachment-download","vault-info"]}
 {"key":"connect/admin-scope","value":{"granted":"admin read write"}}
 {"key":"connect/admin-scope.advertised","value":true}
 {"key":"connect/authorization-server.authorization_endpoint","value":"string"}
@@ -211,7 +211,7 @@
 {"key":"mcp/admin.tool.update-tag.present","value":true}
 {"key":"mcp/admin.tool.update-tag.schema","value":"ca7b0b3fc10294db"}
 {"key":"mcp/admin.tool.update-tag.words","value":"ea819175d0c1a284"}
-{"key":"mcp/admin.tool.vault-info.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
+{"key":"mcp/admin.tool.vault-info.hints","value":{"destructiveHint":true,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/admin.tool.vault-info.present","value":true}
 {"key":"mcp/admin.tool.vault-info.schema","value":"530ff43b9f863786"}
 {"key":"mcp/admin.tool.vault-info.words","value":"dee3e40876423132"}
@@ -249,7 +249,7 @@
 {"key":"mcp/read.instructions.sections","value":["This vault's coordinates","Start here","Quick orientation (call `vault-info` for full schema)","Querying","Refreshing context","Attachments","Scripting & automation (beyond this session)"]}
 {"key":"mcp/read.server.name","value":"parachute-vault/<v>"}
 {"key":"mcp/read.tool-count","value":10}
-{"key":"mcp/read.tool.attachment-url.hints","value":{"destructiveHint":false,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
+{"key":"mcp/read.tool.attachment-url.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/read.tool.attachment-url.present","value":true}
 {"key":"mcp/read.tool.attachment-url.schema","value":"1f4b89515c1f6f99"}
 {"key":"mcp/read.tool.attachment-url.words","value":"9b3181a3240b803a"}
@@ -295,6 +295,7 @@
 {"key":"mcp/root.cold","value":{"challenge":"Bearer resource_metadata=\"…\"","status":401}}
 {"key":"mcp/root.connect","value":"connected"}
 {"key":"mcp/root.same-tools-as-the-vault","value":true}
+{"key":"mcp/structured.create-note.content+path+tags","value":{"contentKey":true,"structured":true}}
 {"key":"mcp/structured.list-tags.none","value":{"contentKey":false,"structured":false}}
 {"key":"mcp/structured.query-notes.id+include_content","value":{"contentKey":true,"structured":true}}
 {"key":"mcp/structured.query-notes.tag","value":{"contentKey":false,"structured":false}}

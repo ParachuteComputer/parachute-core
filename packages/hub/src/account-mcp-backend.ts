@@ -52,7 +52,8 @@ export interface ModuleMcpBackend {
 
 /**
  * The vault selector's words. Kept short: they ride on every proxied tool, and a writer's whole list through the
- * account door is held to the same 4,000-token budget as a per-vault door (contracts/suites/door/multivault.test.ts).
+ * account door is held to the same 4,000-token budget as a per-vault door (contracts/suites/door/multivault.test.ts;
+ * like it, the budget leaves out the tools' MCP annotations, which the model never reads).
  * The catalog caveat (the list comes from one vault's live list) is said once, on list-vaults.
  */
 const VAULT_FIELD_REQUIRED = "Vault name (list-vaults shows them).";
