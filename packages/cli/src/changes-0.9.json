@@ -800,6 +800,16 @@
   },
   {
    "kind": "mcp-tool",
+   "old": "vault-info tags and map.tags (every type and every tag, on every call)",
+   "new": "the same entries, the most used first, capped to about 4,000 tokens: tags_total and map.tags_total count them all, tags_more says how many more types and names list-types (list-types {name} gives one in full); a vault whose reply fits is unchanged",
+   "action": "keep",
+   "reason": "0.9.2 teaching (core #79): a vault with hundreds of types spent most of each vault-info on its tag map (5.7k of 9k tokens at one real shape). Each kept entry is whole and as 0.8 gave it; the rest are one list-types away. The connect-time list in the server instructions is capped the same way (about 1,500 characters, the most used first). vault-info, its name and arguments are unchanged",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "mcp-tool",
    "old": "read-attachment",
    "new": "read-attachment",
    "action": "keep",
@@ -954,6 +964,36 @@
    "new": "the same, plus via_kind: the kind of the key that made it (person, agent, app, service) or null",
    "action": "keep",
    "reason": "additive: the write stamp (0.9.1) adds via_kind beside actor and via; a revision written before it has null; nothing a 0.8 client reads changes, and tag-scoped sessions don't receive it, as with actor and via",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "endpoint",
+   "old": "a note's validation_status warning schema_conflict: \"field 'f' has conflicting specs in ancestor tags 'a' (kept) and 'b' (ignored)\" (REST and MCP)",
+   "new": "the same warning ending \"(overridden)\" when a type on the note descends from b and redefines its field, else \"(checked, warnings only)\", where b's rules are now checked too, as warnings (an overridden field's rules on b stay unchecked)",
+   "action": "keep",
+   "reason": "0.9.2 one data type per field, warned (core #77): every type on a record now checks its fields, so the losing type's rules are no longer ignored unless a descendant overrides the field; the old word would have been false. Same reason code, field, schema and loser_schema; only the last words change. A write is still decided by the first type's rules",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "endpoint",
+   "old": "a note's validation_status warnings (REST and MCP, on reads and writes)",
+   "new": "the same, plus near_name: a field the note's types don't declare, one letter from one they do (or differing only in case), is kept as written, with a warning naming the declared field (nearest)",
+   "action": "keep",
+   "reason": "0.9.2 teaching (core #79, #80): `statu` beside a declared `status` was silently a new field. Advisory, never strict, nothing stored changes; a 0.8 client that lists the warnings sees one more for each such field",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "endpoint",
+   "old": "GET /health and /vault/<n>/api/health: {status, vault} (or vaults)",
+   "new": "the same, plus embeddings: {enabled, state} (state off, failing, loading or ready); on /vault/<n>/api/health a caller with a pass for the vault also gets provider, model and the error",
+   "action": "keep",
+   "reason": "additive (T-418, core #50): semantic search turned on with a model that couldn't load looked healthy while every note's embed failed; /health now says the embedder's state. Nothing a 0.8 client reads changes",
    "since": "0.9",
    "removed_in": null,
    "state": "live"
