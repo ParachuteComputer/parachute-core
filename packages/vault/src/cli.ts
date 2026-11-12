@@ -3254,6 +3254,13 @@ async function cmdExport(args: string[]) {
     const manifest = `${fullPath}/.parachute/vault.yaml`;
     if (exists(manifest)) {
       const was = /^export_format_version:\s*(\d+)/m.exec(readText(manifest, "utf8"))?.[1];
+      if (format === 2 && was !== undefined && Number(was) === 2) {
+        console.error(
+          `${fullPath} already holds an export. A format 2 export goes into an empty folder: a record that gains a body ` +
+          `or changes type moves to another file, and the old one would be read as its current state.`,
+        );
+        process.exit(1);
+      }
       if (was !== undefined && Number(was) !== format) {
         console.error(
           `${fullPath} already holds a format ${was} export; this one is format ${format}. ` +

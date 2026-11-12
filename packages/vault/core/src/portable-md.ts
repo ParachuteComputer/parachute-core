@@ -507,7 +507,7 @@ function v2Escape(ch: string): string {
 /** Plain-scalar words that YAML 1.1 or 1.2 readers take for something other than a string. */
 const V2_WORDS = /^(?:true|false|yes|no|on|off|y|n|null|~)$/i;
 /** Numbers in YAML 1.1 and 1.2: decimal, float, exponent, hex, octal, inf, nan, and `_` digit groups. */
-const V2_NUMBERS = /^(?:[-+]?(?:\.\d+|\d[\d_]*(?:\.[\d_]*)?)(?:[eE][-+]?\d+)?|0[xX][0-9a-fA-F_]+|0[oO]?[0-7_]+|[-+]?\.(?:inf|Inf|INF)|\.(?:nan|NaN|NAN))$/;
+const V2_NUMBERS = /^(?:[-+]?(?:\.\d+|\d[\d_]*(?:\.[\d_]*)?)(?:[eE][-+]?\d+)?|[-+]?0[xX][0-9a-fA-F_]+|[-+]?0[oO]?[0-7_]+|[-+]?0[bB][01_]+|[-+]?\d+(?::[0-5]?\d)+(?:\.\d*)?|[-+]?\.(?:inf|Inf|INF)|\.(?:nan|NaN|NAN))$/;
 
 function v2NeedsQuote(s: string): boolean {
   if (s === "" || s !== s.trim()) return true;
@@ -1402,24 +1402,30 @@ function safeFileStem(raw: string): string {
  */
 async function planFormat2Layout(store: Store): Promise<Map<string, string>> {
   const held = new Set<string>();
-  const moving: Note[] = [];
+  // Only what the claim needs is kept, not the notes: a vault of records is mostly body-less.
+  const moving: Array<{ id: string; type: string; createdAt: string; path?: string; ext: string }> = [];
   for await (const note of iterateAllNotes(store)) {
     const ext = note.extension ?? "md";
-    if (supportsInlineFrontmatter(ext) && note.content.trim() === "" && (note.types?.[0] ?? "") !== "") moving.push(note);
-    else if (note.path) held.add(fileNameKey(`${note.path}.${ext}`));
+    if (supportsInlineFrontmatter(ext) && note.content.trim() === "" && (note.types?.[0] ?? "") !== "") {
+      moving.push({ id: note.id, type: [...note.types!].sort()[0]!, createdAt: note.createdAt, path: note.path, ext });
+    } else if (note.path) held.add(fileNameKey(`${note.path}.${ext}`));
   }
   const out = new Map<string, string>();
+  // Per wanted name, the next number to try: records that share a name cost one probe each, not one per record before them.
+  const nextTry = new Map<string, number>();
   for (const note of moving) {
-    const type = [...note.types!].sort()[0]!.split("/").map(safeFileStem).filter((p) => p !== "").join("/") || "untyped";
+    const type = note.type.split("/").map(safeFileStem).filter((p) => p !== "").join("/") || "untyped";
     const month = /^\d{4}-\d{2}/.test(note.createdAt) ? note.createdAt.slice(0, 7) : "undated";
     const stem = (note.path ? safeFileStem(note.path.split("/").pop()!) : "") || note.id;
-    const ext = note.extension ?? "md";
-    let n = 1;
+    const base = `${type}/${month}/${stem}`;
+    const baseKey = fileNameKey(`${base}.${note.ext}`);
+    let n = nextTry.get(baseKey) ?? 1;
     let rel: string;
     do {
-      rel = `${type}/${month}/${n === 1 ? stem : `${stem} ${n}`}.${ext}`;
+      rel = `${n === 1 ? base : `${base} ${n}`}.${note.ext}`;
       n++;
     } while (held.has(fileNameKey(rel)));
+    nextTry.set(baseKey, n);
     held.add(fileNameKey(rel));
     out.set(note.id, rel);
   }
@@ -1752,6 +1758,13 @@ export async function exportVaultToDir(
   store: Store,
   opts: ExportOptions,
 ): Promise<ExportStats> {
+  if (opts.format === 2 && existsSync(join(opts.outDir, SIDECAR_DIR, "vault.yaml"))) {
+    // A record that gains a body, or changes type, moves to another file; the old one would stay and import first.
+    throw new Error(
+      `${opts.outDir} already holds an export. A format 2 export goes into an empty folder, so no file of an earlier ` +
+      `one is left behind to be read as the note's current state.`,
+    );
+  }
   const sink = new FsExportSink({
     outDir: opts.outDir,
     assetsDir: opts.assetsDir,
@@ -2656,6 +2669,8 @@ async function importVaultReplay(
   // snapshot the old exporter wrote restores its metadata exactly.
   const reading = exportScalarReading(source);
   const format = exportFormatOf(source);
+  // Notes of a format 2 export are read for numbers in exponent form too; its schema files stay as written.
+  const noteReading: ScalarReading = format === 2 ? "export-2" : reading;
   // 1. Optional wipe. Notes are deleted via the public Store API so hooks
   // fire (callers depend on `attachment.deleted` hooks for assets-dir
   // cleanup; we don't bypass that on blow-away). Deleted in bounded batches
@@ -2790,7 +2805,7 @@ async function importVaultReplay(
     // The sidecar is a bare YAML doc (no `---`); wrap to reuse the shared
     // frontmatter parser.
     const wrapped = `---\n${text}${text.endsWith("\n") ? "" : "\n"}---\n`;
-    const parsedSidecar = parseFrontmatter(wrapped, reading, importKeyWarning("a notes-meta sidecar"), { verbatimBody: format === 2 });
+    const parsedSidecar = parseFrontmatter(wrapped, noteReading, importKeyWarning("a notes-meta sidecar"), { verbatimBody: format === 2 });
     const frontmatter = format === 2 ? decodeFrontmatterV2(parsedSidecar.frontmatter) : parsedSidecar.frontmatter;
     const sidecarId = typeof frontmatter.id === "string" ? frontmatter.id : null;
     const sidecarPath = typeof frontmatter.path === "string" ? frontmatter.path : null;
@@ -2811,6 +2826,7 @@ async function importVaultReplay(
   // Track per-import (id → portable) so we can replay typed links after all
   // notes exist.
   const seenNotes = new Map<string, PortableNote>();
+  const fileOfId = new Map<string, string>();
   let sinceCheckpoint = 0;
   for (const relPath of source.listContentFiles()) {
     if (opts.checkpoint && ++sinceCheckpoint >= IMPORT_CHECKPOINT_NOTES) {
@@ -2830,7 +2846,7 @@ async function importVaultReplay(
     if (supportsInlineFrontmatter(fileExt)) {
       const raw = source.readContentFile(relPath);
       // Format 2 keeps the body's bytes as written (CRLF included); format 1 has always read it line by line.
-      const parsed = parseFrontmatter(raw, reading, importKeyWarning(`"${relPath}"`), { verbatimBody: format === 2 });
+      const parsed = parseFrontmatter(raw, noteReading, importKeyWarning(`"${relPath}"`), { verbatimBody: format === 2 });
       frontmatter = format === 2 ? decodeFrontmatterV2(parsed.frontmatter) : parsed.frontmatter;
       content = parsed.content;
     } else {
@@ -2951,6 +2967,15 @@ async function importVaultReplay(
       console.warn(`[import] skipped "${relPath}": blank (whitespace-only) \`id\` in frontmatter`);
       continue;
     }
+    if (format === 2 && fileOfId.has(id)) {
+      // Two files of one format 2 export for one note: a stale copy from an earlier export into the same folder.
+      // Taking either would restore a note that is out of date, so the import stops (a blow-away rolls back).
+      throw new Error(
+        `two files of this export hold the note ${id}: "${fileOfId.get(id)}" and "${relPath}". ` +
+        `One is left over from an earlier export into the same folder. Remove the stale one, or export again into an empty folder.`,
+      );
+    }
+    fileOfId.set(id, relPath);
     if (seenNotes.has(id)) {
       const kept = seenNotes.get(id)!;
       stats.skipped_duplicate_ids.push({
@@ -3266,7 +3291,7 @@ function importKeyWarning(file: string): (message: string) => void {
  * double-quoted only strings with control characters, so a quoted scalar it
  * could not have produced is the literal value.
  */
-export type ScalarReading = "yaml" | "export" | "old-export";
+export type ScalarReading = "yaml" | "export" | "old-export" | "export-2";
 
 /**
  * The exporter quotes strings that start with `[ ] { } , ' "` since 2ca5178
@@ -3452,13 +3477,16 @@ function parseArrayBlock(
     // it always did, or the keys under it are lost: a string item never has
     // lines under it, and every exporter quotes a string holding `: `.
     // A list inside a list: `- - a`. Read it as a list at the column where the inner `- ` sits.
-    if (after === "-" || after.startsWith("- ")) {
-      const inner = lines.slice();
-      inner[i] = " ".repeat(indent + 2) + after;
-      const { value, consumed } = parseArrayBlock(inner, i, indent + 2, reading, warn);
-      result.push(value);
-      i += consumed;
-      continue;
+    // A lone `-` is not one (it stays the string "-", as it always read); only `- x` is.
+    if (after.startsWith("- ")) {
+      lines[i] = " ".repeat(indent + 2) + after; // in place: this line is read once, here
+      const { value, consumed } = parseArrayBlock(lines, i, indent + 2, reading, warn);
+      if (consumed > 0) {
+        result.push(value);
+        i += consumed;
+        continue;
+      }
+      lines[i] = line; // nothing read: take it as a plain item, and move on
     }
     const nextLine = peekNextContent(lines, i + 1);
     const cannotBeString = /:\s/.test(after) || (nextLine !== -1 && countLeadingSpaces(lines[nextLine]!) > indent);
@@ -3635,6 +3663,8 @@ function oldExporterNeedsQuote(s: string): boolean {
 
 function unquote(s: string, reading: ScalarReading): unknown {
   const value = unquoteYaml(s);
+  // Format 2 quotes every string that looks like a number, so a plain `1e+21` is the number JSON.stringify wrote.
+  if (reading === "export-2" && value === s && /^-?\d+(?:\.\d+)?[eE][-+]?\d+$/.test(s)) return Number(s);
   if (reading !== "old-export" || s.length < 2 || typeof value !== "string") return value;
   // A quoted scalar the old exporter could not have written is the literal
   // string: it single-quoted only what its needsQuote asked for (and not

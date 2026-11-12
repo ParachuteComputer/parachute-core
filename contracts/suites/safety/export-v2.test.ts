@@ -179,6 +179,9 @@ describe("--format 2: what the CLI refuses", () => {
     const mixed = await cli(s.home, ["export", v1Dir, "--vault", s.vaultName, "--format", "2"], { vault: true });
     expect(mixed.code).not.toBe(0);
     expect(mixed.stderr).toContain("already holds a format 1 export");
+    const again = await cli(s.home, ["export", v2Dir, "--vault", s.vaultName, "--format", "2"], { vault: true });
+    expect(again.code).not.toBe(0);
+    expect(again.stderr).toContain("already holds an export");
     const bad = await cli(s.home, ["export", join(SCRATCH, "bad"), "--vault", s.vaultName, "--format", "3"], { vault: true });
     expect(bad.code).not.toBe(0);
   });

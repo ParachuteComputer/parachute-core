@@ -290,3 +290,56 @@ describe("the reader", () => {
     expect(content).toBe("body\r\nmore\r\n");
   });
 });
+
+describe("review fixes (PR 104, round 1)", () => {
+  it("a list item that is a lone dash is read, as the string it always was, and does not hang", () => {
+    for (const text of ["---\nl:\n  - -\n---\n", "---\nl:\n  - - \n---\n", "---\nl:\n  - -\n    - a\n---\n"]) {
+      const started = Date.now();
+      const { frontmatter } = parseFrontmatter(text, "export");
+      expect(Date.now() - started).toBeLessThan(1000);
+      expect(Array.isArray(frontmatter.l)).toBe(true);
+    }
+    expect(parseFrontmatter("---\nl:\n  - -\n---\n", "export").frontmatter.l).toEqual(["-"]);
+  });
+
+  it("a second format 2 export into the same folder is refused, so no stale file is read as the record", async () => {
+    const { store } = await fixture();
+    await exportVaultToDir(store, { outDir: root, format: 2, exportedAt: "2026-11-12T00:00:00.000Z" });
+    await expect(exportVaultToDir(store, { outDir: root, format: 2 })).rejects.toThrow(/already holds an export/);
+  });
+
+  it("import stops when two files of a format 2 export hold one note, naming both", async () => {
+    const { store, ids } = await fixture();
+    await exportVaultToDir(store, { outDir: root, format: 2, exportedAt: "2026-11-12T00:00:00.000Z" });
+    // What a repeat export into the same folder used to leave: the record gained a body and moved, its old file stayed.
+    const stale = readFileSync(join(root, "event", "2026-05", "Sam.md"), "utf8");
+    writeFileSync(join(root, "Contacts-Sam.md"), stale);
+    expect(stale).toContain(ids.sam!);
+    const copy = new SqliteStore(new Database(":memory:"));
+    await expect(importPortableVault(copy, { inDir: root })).rejects.toThrow(/two files of this export hold the note .*Contacts-Sam\.md/s);
+  });
+
+  it("numbers in exponent form, and signed hex or base 60 looking strings, come back as they were", async () => {
+    const store = new SqliteStore(new Database(":memory:"));
+    const metadata = { big: 1e21, small: 1e-7, neg: -2.5e-9, list: [1.5e300, "1e+21", "+0x1f", "-0x1F", "0b101", "12:30", "1:30.5", "1e5"], str: "1e-7" };
+    const n = await store.createNote("b\n", { path: "Fake/exp", metadata });
+    await exportVaultToDir(store, { outDir: root, format: 2, exportedAt: "2026-11-12T00:00:00.000Z" });
+    const fm = yamlFrontmatter(join(root, "Fake", "exp.md"));
+    for (const [k, v] of Object.entries(metadata)) expect(fm[k]).toEqual(v as any);
+    const copy = new SqliteStore(new Database(":memory:"));
+    await importPortableVault(copy, { inDir: root });
+    expect((await copy.getNote(n.id))!.metadata).toEqual(metadata);
+  });
+
+  it("records that share one file name are named in linear time, each its own file", async () => {
+    const store = new SqliteStore(new Database(":memory:"));
+    await store.upsertTagRecord("event", { fields: { status: { type: "string" } } });
+    const N = 6000;
+    for (let i = 0; i < N; i++) await store.createNote("", { path: `P${i}/index`, tags: ["event"], created_at: "2026-05-12T10:00:00.000Z" });
+    const started = Date.now();
+    await exportVaultToDir(store, { outDir: root, format: 2, exportedAt: "2026-11-12T00:00:00.000Z" });
+    const took = Date.now() - started;
+    expect(readdirSync(join(root, "event", "2026-05")).length).toBe(N);
+    expect(took).toBeLessThan(4000);
+  }, 60000);
+});
