@@ -71,6 +71,17 @@ function ensureRevisionKeyKind(db: Database): void {
   }
 }
 
+/**
+ * Marked versions (T-460, 1.0): a version someone marked to keep is never pruned, thinned or dropped by the byte
+ * ceiling. Additive and unnumbered, like via_kind: the release before reads the column (it keeps marked rows through
+ * pruning) and older ones ignore it.
+ */
+function ensureVersionMarks(db: Database): void {
+  if (!hasTable(db, "note_versions")) return;
+  if (!hasColumn(db, "note_versions", "marked_at")) db.exec("ALTER TABLE note_versions ADD COLUMN marked_at TEXT");
+  if (!hasColumn(db, "note_versions", "marked_by")) db.exec("ALTER TABLE note_versions ADD COLUMN marked_by TEXT");
+}
+
 function ensureTagKinds(db: Database): void {
   const added = !hasColumn(db, "tags", "kind");
   if (added) db.exec("ALTER TABLE tags ADD COLUMN kind TEXT");
@@ -735,7 +746,8 @@ export function unnumberedStepsDone(db: Database): boolean {
     hasIndex(db, "idx_notes_path_nocase") && // ensurePathNocaseIndex (T-412)
     hasColumn(db, "tags", "kind") && // ensureTagKinds (T-318 §8a, 0.9)
     (!hasTable(db, "note_versions") || hasColumn(db, "note_versions", "via_kind")) && // ensureRevisionKeyKind (0.9.1)
-    compactHintsCurrent(db) // ensureCompactHintsLegacy (T-460)
+    compactHintsCurrent(db) && // ensureCompactHintsLegacy (T-460)
+    (!hasTable(db, "note_versions") || hasColumn(db, "note_versions", "marked_by")) // ensureVersionMarks (T-460, 1.0)
   );
 }
 
@@ -761,6 +773,7 @@ export function initSchema(db: Database): void {
       ensurePathNocaseIndex(db);
       ensureRevisionKeyKind(db);
       ensureCompactHintsLegacy(db);
+      ensureVersionMarks(db);
     }
     rebuildIndexes(db);
     return;
@@ -917,6 +930,8 @@ export function initSchema(db: Database): void {
   ensureRevisionKeyKind(db);
   // Compressed history and always-on compaction (T-460): the hints' legacy column.
   ensureCompactHintsLegacy(db);
+  // Marked versions (T-460, 1.0).
+  ensureVersionMarks(db);
 
   // Rebuild any generated columns + indexes declared in indexed_fields.
   // No-op for a fresh vault; idempotent on existing vaults.

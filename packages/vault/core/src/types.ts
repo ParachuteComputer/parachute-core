@@ -527,6 +527,8 @@ export interface Store {
   deleteNote(id: string, opts?: { actor?: string | null; via?: string | null; captureHistory?: boolean }): Promise<void>;
   listNoteVersions(id: string, opts?: { limit?: number; offset?: number }): Promise<VersionRow[]>;
   getNoteVersion(id: string, versionIx: number): Promise<(VersionRow & { content: string | null }) | null>;
+  /** Mark a version to keep for good, or clear the mark (T-460, 1.0); null when there is no such version. */
+  markNoteVersion(id: string, versionIx: number, opts: { marked: boolean; actor?: string | null }): Promise<VersionRow | null>;
   restoreNoteVersion(id: string, versionIx: number, opts: { actor?: string | null; via?: string | null; if_updated_at?: string }): Promise<Note>;
   eraseNoteHistory(id: string): Promise<{ versionsDeleted: number; blobsDeleted: number }>;
   /**

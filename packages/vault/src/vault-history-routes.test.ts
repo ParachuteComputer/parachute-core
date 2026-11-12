@@ -626,3 +626,33 @@ test("P7e/P15 full routing requires admin for irreversible erasure", async () =>
     resetRevocationCache();
   }
 });
+
+test("T-460: POST /versions/:ix/mark keeps a version for good, DELETE clears it, reads show it; imports too; bad and missing refused", async () => {
+  const note = await store.createNote("v0", { path: "marks" });
+  await store.updateNote(note.id, { content: "v1" });
+  await store.updateNote(note.id, { content: "v2" });
+  const marked = await call(note.id, "/versions/0/mark", "POST", undefined, false, { actor: "ann", via: "key:ann" });
+  expect(marked.status).toBe(200);
+  expect(marked.body).toMatchObject({ version_ix: 0, marked_by: "ann" });
+  expect((await call(note.id, "/versions/0")).body).toMatchObject({ marked_by: "ann", content: "v0" });
+  const list = (await call(note.id, "/versions")).body.versions as any[];
+  expect(list.find((v) => v.version_ix === 0)).toMatchObject({ marked_by: "ann" });
+  expect("marked_at" in list.find((v) => v.version_ix === 1)).toBe(false);
+  const cleared = await call(note.id, "/versions/0/mark", "DELETE");
+  expect(cleared.status).toBe(200);
+  expect("marked_at" in cleared.body).toBe(false);
+  expect((await call(note.id, "/versions/9/mark", "POST")).status).toBe(404);
+  expect((await call(note.id, "/versions/-1/mark", "POST")).status).toBe(400);
+  expect((await call(note.id, "/imports/0/mark", "POST")).status).toBe(404);
+  // An imported observation is marked by its import index.
+  const db = (store as any).db;
+  const run = { run_id: "r", source_fingerprint: "s", tip: "t", options_digest: "o" };
+  beginImportRun(db, run);
+  applyImportedNote(db, { run, noteId: note.id, targetDigest: importTargetDigest(db, note.id), policy: resolveHistoryPolicy({}), now: Date.now(),
+    observations: [{ content: "old", path: null, metadata: {}, extension: "md", created_at: null, observed_at: "2020-01-01T00:00:00.000Z", commit: "c1", blob: "b1" }] });
+  const imported = await call(note.id, "/imports/0/mark", "POST", undefined, false, { actor: "ann", via: "key:ann" });
+  expect(imported.status).toBe(200);
+  expect(imported.body).toMatchObject({ origin: "git-import", import_ix: 0, marked_by: "ann" });
+  // A tag-scoped caller can't mark a note outside its scope.
+  expect((await call(note.id, "/versions/1/mark", "POST", undefined, true)).status).toBe(404);
+});

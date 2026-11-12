@@ -1727,10 +1727,30 @@ A note over 2 MB cannot be updated while history is on (413
 whose content is unrecoverable. Reading that version returns `content:null`
 and `encoding:"overflow"`; restoring it is 409 `history_unrecoverable`.
 
-The defaults are enabled, a 20-version floor, a 100-version ceiling and
-180-day maximum age above the floor. The ceiling is at least 1 and at least
-the floor; both age settings are capped at 36,500 days. Delete tombstones are exempt from this
-pruning. `history.deleted_retention_days: null` retains deleted-note history
+Retention (1.0): every version is kept for 90 days (`keep_all_days`), then the
+first version of each UTC day up to a year (`keep_daily_days`, 365), then the
+first of each ISO week (Monday to Sunday, UTC) for good. The first version in a
+day or week holds the note as it stood when that day or week began, so an old
+read "as of" a moment comes back at most a day (or a week) early. Always kept:
+each note's newest 20 (`min_versions`), delete tombstones, and marked versions.
+Imported history is thinned by the same rule. A capture prunes its note; the
+maintenance pass at vault open also sweeps notes nobody edits, each at most once
+a day, the one swept longest ago first (`notes_thinned`, `versions_thinned`,
+`thin_remaining` in the summary). `keep_all_days: null` turns the tiers off.
+`max_versions` and `max_age_days` still apply on top when a vault sets them;
+their defaults are no cap (1,000,000 and 36,500 days). The ceiling is at least 1
+and at least the floor; both age settings are capped at 36,500 days. Delete
+tombstones are exempt from this pruning.
+
+- `POST /vault/{name}/api/notes/{idOrPath}/versions/{version_ix}/mark`
+  (`vault:write`) marks a version to keep for good; `DELETE` on the same path
+  clears the mark. `/imports/{import_ix}/mark` does the same for an imported
+  observation. Answers the version row, which then carries `marked_at` and
+  `marked_by` (the writer); an unmarked row has neither field. Marking twice
+  keeps the first mark. A marked version is never pruned, thinned, dropped by the
+  byte ceiling or swept with a deleted note's history; erasing the note's history
+  (`DELETE /notes/{id}/versions`) still erases it. Same lookup and tag-scope rules
+  as reading a version; 404 when there is no such version. `history.deleted_retention_days: null` retains deleted-note history
 until explicit erasure; a number enables sweeping on open. A `history:`
 config change in the vault's **`vault.yaml`** takes effect at the next daemon
 restart.

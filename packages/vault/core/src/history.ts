@@ -38,14 +38,23 @@ export interface HistoryPolicy {
   compact_min_versions: number;
   compact_run_length: number;
   max_bytes_per_note: number | null;
+  /**
+   * Retention tiers (T-460, 1.0): every version for `keep_all_days`, then the first version of each UTC day up to
+   * `keep_daily_days`, then the first of each ISO week, for good. The newest `min_versions`, delete tombstones and
+   * marked versions are always kept. `null` turns tiers off. `max_versions` / `max_age_days` still apply on top
+   * when a vault sets them (their 1.0 defaults are no cap).
+   */
+  keep_all_days: number | null;
+  keep_daily_days: number;
   compact_budget_ms: number;
   compact_max_notes: number;
 }
 export const DEFAULT_HISTORY_POLICY: HistoryPolicy = {
   enabled: true,
   min_versions: 20,
-  max_versions: 100,
-  max_age_days: 180,
+  // 1.0 (T-460): the retention tiers decide what goes; no count or age cap unless a vault sets one.
+  max_versions: 1_000_000,
+  max_age_days: 36_500,
   deleted_retention_days: null,
   compact_enabled: true,
   // T-460: always on. A note with two versions whose bodies add up to more than its live body is a candidate; the
@@ -54,6 +63,8 @@ export const DEFAULT_HISTORY_POLICY: HistoryPolicy = {
   compact_min_versions: 2,
   compact_run_length: 24,
   max_bytes_per_note: 8_388_608,
+  keep_all_days: 90,
+  keep_daily_days: 365,
   compact_budget_ms: 250,
   compact_max_notes: 50,
 };
@@ -71,6 +82,12 @@ export function resolveHistoryPolicy(
   p.compact_run_length = Math.min(100, Math.max(2, p.compact_run_length));
   if (p.max_bytes_per_note !== null) p.max_bytes_per_note = Math.max(65_536, p.max_bytes_per_note);
   p.compact_budget_ms = Math.min(60_000, Math.max(0, p.compact_budget_ms));
+  if (p.keep_all_days !== null) {
+    const all = Number(p.keep_all_days);
+    p.keep_all_days = Number.isFinite(all) ? Math.floor(Math.min(36_500, Math.max(0, all))) : DEFAULT_HISTORY_POLICY.keep_all_days;
+  }
+  const daily = Number(p.keep_daily_days);
+  p.keep_daily_days = Math.floor(Math.min(36_500, Math.max(p.keep_all_days ?? 0, Number.isFinite(daily) ? daily : DEFAULT_HISTORY_POLICY.keep_daily_days)));
   p.compact_max_notes = Math.min(10_000, Math.max(0, p.compact_max_notes));
   return p;
 }
@@ -96,6 +113,9 @@ export interface VersionRow {
   via: string | null;
   /** The kind of the key in `via` (person, agent, app, service), or null: the write stamp (write-stamp.ts). */
   via_kind: string | null;
+  /** Set only on a marked version (T-460, 1.0): when it was marked and by whom. */
+  marked_at?: string;
+  marked_by?: string | null;
   op: HistoryOp;
   content_len: number;
   encoding: string | null;
@@ -304,12 +324,14 @@ export function pruneVersions(
   const cutoff = new Date(
     now - policy.max_age_days * 86_400_000,
   ).toISOString();
+  // A policy without the key (a history-import manifest planned before 1.0) prunes as it was planned: no tiers.
+  const kept = policy.keep_all_days == null ? null : tierKeepers(rows, policy, now);
   const doomed = rows.filter(
     (r, i) =>
       i >= policy.min_versions &&
       r.op !== "delete" &&
       !r.marked &&
-      (i >= policy.max_versions || r.superseded_at < cutoff),
+      ((kept !== null && !kept.has(r.version_ix)) || i >= policy.max_versions || r.superseded_at < cutoff),
   );
   let versionsDeleted = 0,
     blobsDeleted = 0;
@@ -361,6 +383,82 @@ export function markedSql(db: Database): string {
   }
   return "(marked_at IS NOT NULL)";
 }
+/**
+ * Set or clear a version's mark (T-460). A marked version is kept by pruning, the tiers, the byte ceiling and the
+ * deleted-history sweep; erasing a note's history still erases it. Returns the row after, or null when there is no
+ * such version.
+ */
+export function markVersion(db: Database, noteId: string, versionIx: number, mark: { by: string | null } | null): VersionRow | null {
+  const changed = mark
+    ? db.prepare("UPDATE note_versions SET marked_at = COALESCE(marked_at, ?), marked_by = CASE WHEN marked_at IS NULL THEN ? ELSE marked_by END WHERE note_id = ? AND version_ix = ?").run(new Date().toISOString(), mark.by, noteId, versionIx)
+    : db.prepare("UPDATE note_versions SET marked_at = NULL, marked_by = NULL WHERE note_id = ? AND version_ix = ?").run(noteId, versionIx);
+  void changed;
+  const row = db.prepare(`SELECT ${columns}, marked_at, marked_by FROM note_versions WHERE note_id = ? AND version_ix = ?`).get(noteId, versionIx) as (RawVersionRow & { marked_at: string | null; marked_by: string | null }) | null;
+  return row ? withMark(parseRow(row), row) : null;
+}
+/** A version row with its mark: `marked_at` and `marked_by` appear only on a marked version. */
+function withMark<T extends object>(row: T, raw: { marked_at?: string | null; marked_by?: string | null }): T {
+  const { marked_at: _a, marked_by: _b, ...rest } = row as T & { marked_at?: unknown; marked_by?: unknown };
+  return raw.marked_at ? { ...(rest as T), marked_at: raw.marked_at, marked_by: raw.marked_by ?? null } : (rest as T);
+}
+const DAY_MS = 86_400_000;
+/**
+ * The versions the tiers keep (T-460): every one newer than `keep_all_days`; past that, up to `keep_daily_days`, the
+ * earliest of each UTC day; past that, the earliest of each ISO week (Monday to Sunday, UTC). The earliest version
+ * in a day or week holds the note as it stood when that day or week began. A version with an unreadable time is
+ * kept. The floor, tombstones and marks are the caller's.
+ */
+export function tierKeepers(rows: readonly { version_ix: number; superseded_at: string }[], policy: Pick<HistoryPolicy, "keep_all_days" | "keep_daily_days">, now: number): Set<number> {
+  const keep = new Set<number>();
+  const seen = new Set<string>();
+  const allAfter = now - (policy.keep_all_days ?? 0) * DAY_MS;
+  const dailyAfter = now - policy.keep_daily_days * DAY_MS;
+  const oldestFirst = [...rows].sort((a, b) => (a.superseded_at < b.superseded_at ? -1 : a.superseded_at > b.superseded_at ? 1 : a.version_ix - b.version_ix));
+  for (const r of oldestFirst) {
+    const t = Date.parse(r.superseded_at);
+    if (!Number.isFinite(t) || t >= allAfter) {
+      keep.add(r.version_ix);
+      continue;
+    }
+    const day = Math.floor(t / DAY_MS);
+    // 1970-01-01 was a Thursday: shifting by three days makes weeks start on Monday.
+    const bucket = t >= dailyAfter ? `d${day}` : `w${Math.floor((day + 3) / 7)}`;
+    if (seen.has(bucket)) continue;
+    seen.add(bucket);
+    keep.add(r.version_ix);
+  }
+  return keep;
+}
+/**
+ * The tiers' sweep (T-460): thinning must reach notes nobody edits, so the maintenance pass visits each note with
+ * history at most once a day, the one swept longest ago first (the hints' `refreshed_at`), and applies the same
+ * pruning a capture does. Bounded by `budgetMs` (checked between notes; one note is always tried) and `maxNotes`.
+ */
+export function thinVault(db: Database, policy: HistoryPolicy, opts: { budgetMs: number | null; maxNotes: number; now?: number }): { notes_thinned: number; versions_thinned: number; remaining: number } {
+  const out = { notes_thinned: 0, versions_thinned: 0, remaining: 0 };
+  if (!policy.enabled || policy.keep_all_days == null || !historyTablesPresent(db)) return out;
+  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='history_compact_state'").get()) return out;
+  const now = opts.now ?? Date.now();
+  const started = performance.now();
+  const due = now - DAY_MS;
+  const candidates = db.prepare("SELECT note_id, refused FROM history_compact_state WHERE refreshed_at < ? ORDER BY refreshed_at LIMIT ?").all(due, Math.max(0, opts.maxNotes)) as { note_id: string; refused: number }[];
+  let visited = 0;
+  for (const c of candidates) {
+    if (visited > 0 && opts.budgetMs !== null && performance.now() - started >= opts.budgetMs) break;
+    visited++;
+    transaction(db, () => {
+      const r = pruneVersions(db, c.note_id, policy, now, false);
+      if (r.versionsDeleted > 0) {
+        out.notes_thinned++;
+        out.versions_thinned += r.versionsDeleted;
+        refreshCompactState(db, c.note_id, { refused: c.refused === 1 });
+      }
+      db.prepare("UPDATE history_compact_state SET refreshed_at = ? WHERE note_id = ?").run(Date.now(), c.note_id);
+    });
+  }
+  out.remaining = (db.prepare("SELECT COUNT(*) AS n FROM history_compact_state WHERE refreshed_at < ?").get(due) as { n: number }).n;
+  return out;
+}
 export function gcBlobs(db: Database): { blobsDeleted: number } {
   let blobsDeleted = 0;
   // Depth one needs two deletion waves; bounded even in a corrupt database.
@@ -403,6 +501,10 @@ export function sweepDeletedHistory(
 }
 const columns =
   "note_id, version_ix, content_hash, path, metadata, extension, superseded_at, actor, via, via_kind, op, content_len, encoding, created_at";
+/** The mark columns to select, when the vault has them. */
+function markColumns(db: Database): string {
+  return markedSql(db) === "0" ? "" : ", marked_at, marked_by";
+}
 function parseRow(row: RawVersionRow): VersionRow {
   let metadata: Record<string, unknown> = {};
   try {
@@ -418,10 +520,10 @@ export function listVersions(
   return (
     db
       .prepare(
-        `SELECT ${columns} FROM note_versions WHERE note_id = ? ORDER BY version_ix DESC LIMIT ? OFFSET ?`,
+        `SELECT ${columns}${markColumns(db)} FROM note_versions WHERE note_id = ? ORDER BY version_ix DESC LIMIT ? OFFSET ?`,
       )
-      .all(noteId, opts?.limit ?? 50, opts?.offset ?? 0) as RawVersionRow[]
-  ).map(parseRow);
+      .all(noteId, opts?.limit ?? 50, opts?.offset ?? 0) as (RawVersionRow & { marked_at?: string | null; marked_by?: string | null })[]
+  ).map((r) => withMark(parseRow(r), r));
 }
 export function getVersion(
   db: Database,
@@ -433,7 +535,7 @@ export function getVersion(
       `SELECT ${columns
         .split(", ")
         .map((c) => "v." + c)
-        .join(", ")}, b.content, b.encoding AS blob_encoding, b.delta_of
+        .join(", ")}${markColumns(db).replaceAll(" marked", " v.marked")}, b.content, b.encoding AS blob_encoding, b.delta_of
     FROM note_versions v LEFT JOIN note_blobs b ON b.hash = v.content_hash WHERE v.note_id = ? AND v.version_ix = ?`,
     )
     .get(noteId, versionIx) as
@@ -443,7 +545,7 @@ export function getVersion(
   const { content, blob_encoding, delta_of, ...verCols } = row;
   try {
     const reconstructed = materialise(db, verCols.content_hash!, { content, blob_encoding, delta_of });
-    return { ...parseRow(verCols), content: reconstructed, encoding: verCols.encoding ?? blob_encoding };
+    return { ...withMark(parseRow(verCols), verCols as { marked_at?: string | null; marked_by?: string | null }), content: reconstructed, encoding: verCols.encoding ?? blob_encoding };
   } catch (err) {
     if (!(err instanceof HistoryDeltaOrphanError)) throw err;
     console.warn("[history] unrecoverable delta", { hash: err.hash, delta_of: err.delta_of, reason: err.reason });
@@ -723,6 +825,10 @@ export interface CompactSummary {
   remaining_candidates: number;
   duration_ms: number;
   stopped_by: "complete" | "budget" | "max_notes" | "disabled";
+  /** A whole-vault maintenance pass (Store.compactHistory) also applies the retention tiers to notes not swept for a day (T-460). */
+  notes_thinned?: number;
+  versions_thinned?: number;
+  thin_remaining?: number;
 }
 export function compactNote(db: Database, noteId: string, policy: HistoryPolicy): CompactResult {
   const result: CompactResult = { blobs_deltified: 0, blobs_compressed: 0, blobs_skipped_too_large: 0, versions_dropped: 0, bytes_before: 0, bytes_after: 0 };

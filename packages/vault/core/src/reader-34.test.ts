@@ -9,6 +9,12 @@ import { resolveHistoryPolicy, pruneVersions, compactNote } from "./history.js";
 import type { EmbeddingProvider, EmbedInput, EmbedResult } from "./embedding/provider.js";
 
 const DIMS = 64;
+/** The marks columns: 1.0 adds them; a reader release's vault gets them as 1.0 would. */
+function addMarkColumns(db: Database) {
+  const cols = (db.prepare("SELECT name FROM pragma_table_info('note_versions')").all() as { name: string }[]).map((c) => c.name);
+  if (!cols.includes("marked_at")) db.exec("ALTER TABLE note_versions ADD COLUMN marked_at TEXT");
+  if (!cols.includes("marked_by")) db.exec("ALTER TABLE note_versions ADD COLUMN marked_by TEXT");
+}
 /** A made-up embedding: deterministic per text, so a query ranks notes the same way every run. */
 function fakeVector(text: string): Float32Array {
   const v = new Float32Array(DIMS);
@@ -63,7 +69,7 @@ test("a marked version survives pruning and the byte ceiling once the marks colu
   const big = (k: number) => `${k} ` + Buffer.from(crypto.getRandomValues(new Uint8Array(30_000))).toString("hex");
   const n = await store.createNote(big(0));
   for (let k = 1; k <= 12; k++) await store.updateNote(n.id, { content: big(k) });
-  db.exec("ALTER TABLE note_versions ADD COLUMN marked_at TEXT; ALTER TABLE note_versions ADD COLUMN marked_by TEXT");
+  addMarkColumns(db);
   db.prepare("UPDATE note_versions SET marked_at = 'now', marked_by = 'ann' WHERE note_id = ? AND version_ix = 1").run(n.id);
   pruneVersions(db, n.id, resolveHistoryPolicy({ min_versions: 1, max_versions: 3 }));
   const left = () => (db.prepare("SELECT version_ix FROM note_versions WHERE note_id = ? ORDER BY version_ix").all(n.id) as { version_ix: number }[]).map((r) => r.version_ix);
@@ -122,7 +128,7 @@ test("the deleted-history sweep keeps a marked version", async () => {
   await store.updateNote(n.id, { content: "v1" });
   await store.updateNote(n.id, { content: "v2" });
   await store.deleteNote(n.id);
-  db.exec("ALTER TABLE note_versions ADD COLUMN marked_at TEXT; ALTER TABLE note_versions ADD COLUMN marked_by TEXT");
+  addMarkColumns(db);
   db.prepare("UPDATE note_versions SET marked_at = 'now' WHERE note_id = ? AND version_ix = 0").run(n.id);
   sweepDeletedHistory(db, resolveHistoryPolicy({ deleted_retention_days: 1 }), new Date(Date.now() + 3 * 86_400_000));
   expect((db.prepare("SELECT version_ix FROM note_versions WHERE note_id = ?").all(n.id) as { version_ix: number }[]).map((r) => r.version_ix)).toEqual([0]);
