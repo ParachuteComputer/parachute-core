@@ -109,6 +109,13 @@ describe("files", () => {
         const window: any = await c.call("read-attachment", { attachment_id: tatt.body.id, content_offset: 0, content_length: 64 });
         fp("files/read-attachment.text", shape(window));
         expect(String(window.content)).toStartWith("line one");
+        // A text window's JSON has a top-level `content` key, which ChatGPT reads as `{}`: it also goes out as
+        // structuredContent, the same object (T-456, suites/door/nudge.test.ts). The image reply above doesn't: a
+        // client that prefers structuredContent would drop the picture.
+        const raw: any = await c.client.callTool({ name: "read-attachment", arguments: { attachment_id: tatt.body.id, content_offset: 0, content_length: 64 } });
+        expect(raw.structuredContent).toEqual(JSON.parse(raw.content[0].text));
+        expect(seen.structuredContent).toBeUndefined();
+        fp("files/read-attachment.structured", { text: raw.structuredContent !== undefined, image: seen.structuredContent !== undefined });
       }
 
       const listed = await reader.get(`/notes/${note.body.id}/attachments`);
