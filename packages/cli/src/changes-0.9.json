@@ -790,6 +790,56 @@
   },
   {
    "kind": "mcp-tool",
+   "old": "create-note {extension, summary} (parameters listed in tools/list)",
+   "new": "the same parameters on create-note and create-record: extension (the file type: csv, yaml, json…) and, on a batch, summary: true for {created, ids, failed} in place of the notes",
+   "action": "keep",
+   "reason": "0.8 listed both on create-note; 0.9 honours both on create-note and create-record (contracts/suites/mcp/old-params.test.ts). 0.9's short tool list leaves them out, on both names (the description budget); vault-info {help} lists them",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "mcp-tool",
+   "old": "update-note {created_at, extension, include_content, include_links, state_transition} (parameters listed in tools/list)",
+   "new": "the same parameters, by the same names, on update-note and update-record (update-record keeps the name include_content; query-records says include_body)",
+   "action": "keep",
+   "reason": "0.8 listed all five on update-note (include_content too, the lean answer shape); 0.9 honours each on both names (contracts/suites/mcp/old-params.test.ts): created_at and extension are written, include_content: false drops the body from the answer, include_links adds the link set, state_transition commits once and conflicts on a stale from. vault-info {help} lists them",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "mcp-tool",
+   "old": "delete-tag {cascade} (parameter listed in tools/list)",
+   "new": "delete-tag {cascade} and manage-types {action: delete, cascade}",
+   "action": "keep",
+   "reason": "0.8's delete-tag refuses a tag another tag names as a parent, and cascade (or detach) proceeds and strips that reference. 0.9 does the same on the old name and on manage-types (contracts/suites/mcp/old-params.test.ts)",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "mcp-tool",
+   "old": "rename-tag {from, tag, to} (parameters listed in tools/list)",
+   "new": "rename-tag {old_name, new_name} and manage-types {action: rename, old_name, new_name}; from, tag and to are still read as aliases on both",
+   "action": "keep",
+   "reason": "0.8's rename-tag listed from and tag as old_name's aliases and to as new_name's. 0.9 reads all three on rename-tag and on manage-types {action: rename} (contracts/suites/mcp/old-params.test.ts)",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "mcp-tool",
+   "old": "request-attachment-upload {segment_index} (parameter listed in tools/list)",
+   "new": "request-attachment-upload {segment_index} and attachment-url {action: upload, segment_index}",
+   "action": "keep",
+   "reason": "0.8's upload ticket takes segment_index to mark one part of a split recording; the stored attachment carries it. 0.9 does the same on the old name and on attachment-url; a malformed value is ignored, as before (contracts/suites/mcp/old-params.test.ts)",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "mcp-tool",
    "old": "vault-info query_hints: query-notes { near: { id: \"...\" }, depth: 2 }",
    "new": "query-notes { near: { note_id: \"...\", depth: 2 } } (query-records { near: { id: \"...\", depth: 2 } } in record words)",
    "action": "keep",
