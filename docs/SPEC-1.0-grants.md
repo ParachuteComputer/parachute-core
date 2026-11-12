@@ -131,7 +131,7 @@ An applet grant's `to` is `{"kind": "applet", "id": "<applet id>", "author": "<a
 | `deny` | records carrying any of these tags are outside the grant, for every verb | optional; 1 to 16 `{"tag": …}`, sorted, different. Grant-wide, never on a row: grants only add, so a deny on one row would leave another row showing the record |
 | `under` | on a member-signed grant: the member's own grant it hangs from (§5.2) | required there, refused elsewhere; an id with no dot |
 | `until` | when it ends | unix seconds; equal to the `expiration` tag (NIP-40's, written as a decimal with no leading zero) |
-| `purpose` | the asker's words, shown last on the card | 1 to 200 code points; no C0 or C1 control, no U+061C, U+200B–U+200F, U+2028–U+202E, U+2060–U+2069, U+FEFF, or the frame's fixed list of blanks. No check reads it |
+| `purpose` | the asker's words, shown last on the card | 1 to 200 code points; no control (U+0000–U+001F, U+007F–U+009F), no U+061C, U+200B–U+200F, U+2028–U+202E, U+2060–U+2069, U+FEFF, or the frame's fixed list of blanks. No check reads it |
 
 The verbs are **`read`, `create`, `update`, `delete`** [decided]. `read`, `update` and `delete` may each sit in an
 own row: only records this grantee made [decided: own-records-only]. A type covers its subtypes as the vault defines
@@ -148,10 +148,18 @@ spelling of what it says is refused, so one meaning has one digest. Everything a
 tags, verbs) is printable ASCII; only `purpose` may be in any script. Type and tag names outside ASCII
 can't be granted or denied by name at 1.0 (§13). Test vectors for the spelling (accepted and refused, with
 their digests) are a precondition of the freeze (open decision A): they are written and run by the shell, the
-minter and every door before the first signature. They don't exist yet.
+minter and every door before the first signature. They are #systems' `vectors/frame-1.0.json` in the shell-keys
+core (branch `t335-frame-1.0`): 150 signed cases, each with its event id and outcome, replayed against a fresh
+party. It meets the precondition once it also carries a meaning in a second spelling (keys out of order, a space,
+a `\u` or `\/` escape, `1.0` or `01`, rows or verbs unsorted), a grant 8,193 bytes as sent but not as hashed
+(below), and a statement whose tags hold a number. Until then the precondition is unmet.
 
 **Size.** The content is at most 6,000 bytes of UTF-8 and the event at most 8,192 bytes. Both are checked: the
-event escapes the content's quotes, so it is 1.25 to 1.9 times larger.
+event escapes the content's quotes and backslashes, so it is 1.25 to 1.9 times larger. **An event's size**, here
+and in every limit in this spec, is the bytes of the event as sent: one compact JSON object of its seven fields
+(`id`, `pubkey`, `created_at`, `kind`, `tags`, `content`, `sig`), with no whitespace, and every character a string
+needn't escape written as itself in UTF-8 (never `\u` for non-ASCII). It is not NIP-01's serialisation for the id,
+which leaves out `id` and `sig` and is about 250 bytes shorter. A KB is 1,024 bytes.
 
 Five kinds are reserved together [lean, open decision A]: `37440` grant, `7440` revoke (a regular event, never
 replaced), `37441` link statement, `37442` link claim, and `37443` the vault's own record (§2.3). The grant frame's
@@ -179,7 +187,10 @@ this vault. What else each kind must carry:
 "Strict" is line 4's rule for that kind: its tags, canonical content, and no unknown field. Size: a grant within
 §2.1's limits; any other statement within 8,192 bytes, but for a revoke, read up to 64 KB (§3).
 
-1. **The event is whole:** the id is the hash of its fields and the signature verifies (BIP-340).
+1. **The event is whole:** its tags are a list of lists of strings, as NIP-01 has them (an empty tag is fine), and
+   anything else is malformed (`invalid_statement`), whatever the kind: the id is a hash over the tags, and a number
+   or an object in them hashes to other bytes in another language. The id is the hash of its fields and the
+   signature verifies (BIP-340).
 2. **It names this vault:** `at` is `parachute`, `gives` is `access`, and `honors` equals the vault's own id byte
    for byte.
 3. **The signer has standing.** It is one of the vault's owner keys today; or it is a member's key, under §5.2's
@@ -215,7 +226,7 @@ this vault. What else each kind must carry:
    never one of the vault's owner keys, nor the vault's id or any key that has signed for the vault (refused as `invalid_statement`). To a member, a refusal about the grantee's key
    reads the same as `exceeds_grantor`, so a member can't use filing to learn which keys hold grants.
 8. **It is coherent:** `update` or `delete` on a type comes with a `read` row on that type, own or not. An applet
-   grant doesn't name `*`. `was` only on an owner-signed grant; `under` only, and always, on a member-signed one.
+   grant's `to.by` is `signer`, and it doesn't name `*`. `was` only on an owner-signed grant; `under` only, and always, on a member-signed one.
    A `names:` prefix is lowercase `[a-z0-9.-]`, holds a letter or a digit, and isn't reserved (§6.1). No verb
    reaches admin (§4.4).
 
@@ -227,8 +238,9 @@ one gap: a narrowing replacement that this vault refuses, for any reason (a fiel
 size or date limit, a rule a later version relaxes), would leave the older, wider grant in force, and a rollback
 makes every vault an older one. So, per address, the vault keeps the newest event it has seen that passes line 1,
 line 3, the ten-minute bound on arrival, and a **minimal read**, filed or not. The minimal read is frozen for every
-later version: the content is a JSON object with no duplicate keys, its `at` is `parachute`, its `honors` is this
-vault byte for byte, and its `id` equals the `d` tag. The names and spelling of `to` and `under` are frozen with it,
+later version: the content is a JSON object with no key twice at its top level (inside a field, a repeat isn't
+looked for), its `at` is `parachute`, its `honors` is this vault byte for byte, and its `id` equals the first `d`
+tag's value (NIP-01's address). The names and spelling of `to` and `under` are frozen with it,
 so every later version's events can still be compared under line 6. An address is in force only while that newest event is one the
 vault filed. If the newest is one it couldn't file, the address is **suspended**; every older event at the address
 is `superseded` and never in force again, whether it arrived before or after, and whether the address was empty,
@@ -241,8 +253,8 @@ and its dates, so a narrowing isn't dropped because the owner's key isn't linked
 judged again in two cases only: after the vault is upgraded, and when someone files it again. If it can then be
 filed, it is, and the address is in force under it. Nothing else brings a held event into force, so a grant the
 owner meant to stay refused never arrives on its own. Otherwise the address comes back only with a newer event the
-vault files. A member's held events count toward their cap of 20 (§5.2). A vault reads an event of up to 64 KB of
-serialized event for the minimal read, and a door accepts a request body of up to 72 KB; a shell never signs a grant
+vault files. A member's held events count toward their cap of 20 (§5.2). A vault reads an event of up to 64 KB (as sent, §2.1) for
+the minimal read, and a door accepts a request body of up to 72 KB; a shell never signs a grant
 over 8 KB. Those three numbers are frozen for every later version, so a narrowing can't be lost to its size.
 
 A signed event the owner handed out can be filed by whoever holds it until its date, as §3 says of a grant never
@@ -381,8 +393,9 @@ the key minter; this spec owns the vault's fields and vocabulary.
 - **A revoke always reaches an older vault.** A revoke's `v`, `honors` and `ends` keep their names and spellings in
   every later version. A vault acts on a validly signed 7440 whose `honors` is itself and whose `ends` parses, from
   a key with standing for that address, even if the rest of its content is unknown, `v` is higher, it carries
-  tags, or it isn't in canonical spelling: a revoke only closes, so it must never fail open because a vault is older
-  than the shell. That read is still strict where it matters: the content is a JSON object with no duplicate keys,
+  tags (lists of strings, line 1), or it isn't in canonical spelling: a revoke only closes, so it must never fail open because a vault is older
+  than the shell. That read is still strict where it matters: the content is a JSON object with no key twice at its top level
+  (inside a field it doesn't read, a repeat isn't looked for, so two vaults can't disagree on it),
   `v` is a whole number of at least 1, and `honors` and `ends` are strings in their pinned spellings. A vault reads
   a revoke of up to 64 KB this way; a shell never signs one over 1 KB. `v` is a JSON integer literal (`1`, not `1.0`).
   Because an older vault applies a revoke whole, **no later version may add a field that narrows a revoke**: a

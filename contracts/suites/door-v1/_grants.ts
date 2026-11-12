@@ -126,6 +126,8 @@ export interface GrantSpec {
   extraFields?: Record<string, unknown>;
   /** Put in the content as given, for contracts about refusals; the tags still say what was meant. */
   honors?: string;
+  /** Rewrite the content's text after the one spelling, for contracts about what a reader does with other text. */
+  respell?: (text: string) => string;
 }
 
 const byText = (by: GrantSpec["by"]) => (by === undefined ? "signer" : typeof by === "string" ? by : `names:${by.names}`);
@@ -175,9 +177,20 @@ export async function grantEvent(g: GrantSpec): Promise<Event & { grantId: strin
   const id = g.id ?? (g.under ? `${g.under}.${runId("a")}` : runId("g"));
   const signer = g.signer ?? (await ownerKey());
   const content = await grantContent({ ...g, id });
-  const e = await sign(signer, { kind: KIND.grant, tags: grantTags(content, g.extraTags), content: canonical(content), created_at: g.created_at });
+  const text = canonical(content);
+  const e = await sign(signer, { kind: KIND.grant, tags: grantTags(content, g.extraTags), content: g.respell ? g.respell(text) : text, created_at: g.created_at });
   return { ...e, grantId: id };
 }
+
+/**
+ * An event's size (§2.1): the bytes of the event as sent, one compact JSON object of its seven fields, non-ASCII
+ * written as itself. Not NIP-01's id serialisation, which leaves out `id` and `sig` and is about 250 bytes shorter.
+ */
+export const eventSize = (e: Event) =>
+  Buffer.byteLength(JSON.stringify({ id: e.id, pubkey: e.pubkey, created_at: e.created_at, kind: e.kind, tags: e.tags, content: e.content, sig: e.sig }));
+
+/** The bytes NIP-01 hashes for an event's id. */
+export const hashedSize = (e: Event) => Buffer.byteLength(JSON.stringify([0, e.pubkey, e.created_at, e.kind, e.tags, e.content]));
 
 /** A grant's address (§3): kind, grantor key, id. */
 export const address = (grant: { pubkey: string; grantId: string }) => `${KIND.grant}:${grant.pubkey}:${grant.grantId}`;
@@ -185,13 +198,14 @@ export const address = (grant: { pubkey: string; grantId: string }) => `${KIND.g
 /** A signed revoke (§3): no tags; the content names the address it ends and the vault it is for. */
 export async function revokeEvent(
   grant: { pubkey: string; grantId: string } | { ends: string },
-  opts: { signer?: Key; vault?: string; honors?: string; v?: number; extraFields?: Record<string, unknown>; tags?: string[][]; spaced?: boolean } = {},
+  opts: { signer?: Key; vault?: string; honors?: string; v?: number; extraFields?: Record<string, unknown>; tags?: unknown[][]; spaced?: boolean; respell?: (text: string) => string } = {},
 ): Promise<Event> {
   const signer = opts.signer ?? (await ownerKey());
   const ends = "ends" in grant ? grant.ends : address(grant);
   const content = { v: opts.v ?? 1, honors: opts.honors ?? (await vaultId(opts.vault)), ends, purpose: "I end this grant.", ...(opts.extraFields ?? {}) };
   // `spaced` and `tags` make a revoke from some later shell: a vault still acts on its three frozen fields (§3).
-  return sign(signer, { kind: KIND.revoke, tags: opts.tags ?? [], content: opts.spaced ? JSON.stringify(content, null, 1) : canonical(content) });
+  const text = opts.spaced ? JSON.stringify(content, null, 1) : canonical(content);
+  return sign(signer, { kind: KIND.revoke, tags: (opts.tags ?? []) as string[][], content: opts.respell ? opts.respell(text) : text });
 }
 
 /**

@@ -122,6 +122,20 @@ describe("by a signed revoke", () => {
     expect(await state(g.grantId)).toBe("revoked");
   });
 
+  red("a revoke whose tags aren't lists of strings is malformed, and the grant stays", { reason: NO_GRANTS, lane: LANE }, async () => {
+    const recipe = await declareType("recipe");
+    const key = await newKey();
+    const g = await granted({ to: key, types: { [recipe]: ["read"] } });
+    // The event id is a hash over the tags, and a number or an object hashes to other bytes in another language, so
+    // vaults would disagree on whether the signature is good (§2.2 line 1).
+    for (const tags of [[["n", 1]], [["n", { a: "b" }]], [["n", null]]]) {
+      const r = await file(await revokeEvent(g, { tags }));
+      expect(r.status, JSON.stringify(tags)).toBe(400);
+      expect(r.body.error).toBe("invalid_statement");
+    }
+    expect(await state(g.grantId)).toBe("in_force");
+  });
+
   red("a newer grant the vault can't take suspends the address; it never falls back to the older, wider one", { reason: NO_GRANTS, lane: LANE }, async () => {
     const recipe = await declareType("recipe");
     const soup = await owner.make({ types: [recipe], body: "soup" });
@@ -144,12 +158,33 @@ describe("by a signed revoke", () => {
     const back = await grantEvent({ id: g.grantId, to: key, types: { [recipe]: ["read"] }, created_at: g.created_at + 2 });
     expect((await file(back)).status).toBe(201);
     expect(await state(g.grantId)).toBe("in_force");
+    // The minimal read looks for a key given twice only at the top: one repeated inside an unknown field still
+    // suspends (§2.2), or the wider grant would stay in force.
+    const k2 = await newKey();
+    const g2 = await granted({ to: k2, types: { [recipe]: ["read", "update"] } });
+    const deep = await grantEvent({ id: g2.grantId, to: k2, types: { [recipe]: ["read"] }, created_at: g2.created_at + 1, extraFields: { later: { a: 1 } }, respell: (t) => t.replace('{"a":1}', '{"a":1,"a":2}') });
+    expect((await file(deep)).status).toBe(400);
+    expect(await state(g2.grantId)).toBe("suspended");
+    // It takes the first `d` tag, as NIP-01 does. First right: held, and it suspends. First wrong: it fails the
+    // minimal read and suspends nothing.
+    for (const [first, suspends] of [[true, true], [false, false]] as const) {
+      const k = await newKey();
+      const h = await granted({ to: k, types: { [recipe]: ["read"] } });
+      const newer = await grantEvent({ id: h.grantId, to: k, types: { [recipe]: ["read"] }, created_at: h.created_at + 1 });
+      const tags = first ? [newer.tags[0], ["d", "other"], newer.tags[1]] : [["d", "other"], ...newer.tags];
+      const two = await sign(await ownerKey(), { kind: KIND.grant, tags, content: newer.content, created_at: newer.created_at });
+      expect((await file(two)).status, `first d ${first ? "right" : "wrong"}`).toBe(400);
+      expect(await state(h.grantId)).toBe(suspends ? "suspended" : "in_force");
+    }
   });
 
   red("a revoke from a later shell still ends the grant: a vault acts on its three frozen fields", { reason: NO_GRANTS, lane: LANE }, async () => {
     const recipe = await declareType("recipe");
     const soup = await owner.make({ types: [recipe], body: "soup" });
-    for (const later of [{ v: 2 }, { extraFields: { note: "from a later shell" } }, { tags: [["client", "later"]] }, { spaced: true }]) {
+    // A key repeated inside a field the vault doesn't read isn't looked for (§3: no key twice at the top level), and
+    // an empty tag is still a list of strings (§2.2 line 1).
+    const nested = { extraFields: { note: { a: 1 } }, respell: (t: string) => t.replace('{"a":1}', '{"a":1,"a":2}') };
+    for (const later of [{ v: 2 }, { extraFields: { note: "from a later shell" } }, { tags: [["client", "later"]] }, { spaced: true }, nested, { tags: [[]] }]) {
       const key = await newKey();
       const g = await granted({ to: key, types: { [recipe]: ["read"] } });
       const bearer = await tokenAs(key);
