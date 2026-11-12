@@ -2,10 +2,10 @@
   "comment": "Every difference between doors that the door contracts allow. An entry names the facts it excuses (harness/doors/compare.ts), says why in words a person building an app can act on, and names who decides whether it stays. `deliberate` is meant; `drift` is not meant and not yet fixed. An entry that excuses nothing fails the comparison, so this list can't outlive the differences.",
   "differences": [
     {
-      "id": "export-over-http",
+      "id": "export-key",
       "keys": [
-        "has/export-over-http",
-        "exit/http.headers"
+        "has/export-key",
+        "exit/export-key.*"
       ],
       "between": [
         "box",
@@ -13,11 +13,12 @@
         "personal"
       ],
       "lacks": [
-        "box"
+        "cloud",
+        "personal"
       ],
       "status": "drift",
-      "owner": "0.9.3 \"the exit\"",
-      "why": "A box exports with its own command (`parachute-vault export`); cloud-style doors stream the same files from `GET /api/export`. The files themselves are compared and equal (exit/file.*). An app that offers \"download my vault\" can do it over HTTP on cloud only."
+      "owner": "0.9.3 \"the exit\" (cloud twin)",
+      "why": "A box can give out a key that holds only the export permission (`vault:<v>:export`): it downloads the vault's full export from `GET /api/export` and nothing else, and the vault records when it last did (`last_export_at`, `last_export_by` on `GET /api/vault` for an admin). Cloud's export route takes a read key and records no stamp yet; its twin is the scope on that route and the console's \"last backup\" time from the same stamp."
     },
     {
       "id": "account-unknown-vault",

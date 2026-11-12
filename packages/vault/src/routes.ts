@@ -4604,6 +4604,8 @@ export async function handleVault(
    * Notes app sets audio_retention with a read+write token).
    */
   descriptionForbidden: (() => Response) | null = () => descriptionNeedsAdmin(vaultConfig.name, []),
+  /** When the last full export went out and to which key (export-stamp.ts). Passed for an admin only. */
+  lastExport: { last_export_at: string | null; last_export_by: string | null } | null = null,
 ): Promise<Response> {
   const url = new URL(req.url);
 
@@ -4612,6 +4614,7 @@ export async function handleVault(
     // Transcription capability flag — `enabled` iff a provider is configured
     // and available. `minutes_remaining` is omitted (cloud/plan concern;
     // self-host is unmetered). This is the field Notes gates the mic on.
+    if (lastExport) Object.assign(result, lastExport);
     result.transcription = await resolveCapability();
     // Embeddings capability flag (semantic search MVP, EXPERIMENTAL) — same
     // "configured AND available" contract as transcription above. This is

@@ -23,14 +23,12 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { randomBytes } from "node:crypto";
 import { join, resolve } from "node:path";
 import { enterSandbox, inSandbox } from "../sandbox.ts";
-import { loadCandidate, prepareInfo, runCli } from "../candidate.ts";
+import { loadCandidate, prepareInfo } from "../candidate.ts";
 import { safeFetch } from "../guard.ts";
 import type { Door } from "../../suites/door/_door.ts";
 import { linkOwnerKeyOnBox, startBoxDoor } from "./box.ts";
 import { makeOwnerKey, nostrAuthorization, signUp, startWorkersDoor } from "./workers.ts";
 import { compare, matrix, readFingerprint, readJunit, serializeFingerprint, type Deliberate } from "./compare.ts";
-import { recordExport } from "../../suites/door/_exit.ts";
-import { appendFileSync, readdirSync, statSync } from "node:fs";
 
 const contracts = resolve(import.meta.dir, "..", "..");
 if (!inSandbox() && !process.env.PCORE_SANDBOX) {
@@ -96,8 +94,6 @@ async function accountBearer(issuer: string, s: { cookie: string; csrf: string }
 interface Started {
   door: Door;
   provenance: string;
-  /** A door with no export over HTTP: its own export of the vault, as files (the box's CLI). */
-  exportFiles?: () => Promise<{ name: string; bytes: Uint8Array }[]>;
   stop(): Promise<void>;
   logs(): Promise<string> | string;
 }
@@ -123,15 +119,6 @@ async function startBox(): Promise<Started> {
   return {
     door: { kind: "box", label: `box-${release}`, release, issuer: box.issuer, vaultOrigin: box.vaultOrigin, vault: box.vault, otherVault: other, signIn: { how: "cookie", ...box.session }, ...(ownerKey ? { ownerKey } : {}) },
     provenance: `box: candidate ${sha256.slice(0, 16)} (${manifest.name}, profile ${manifest.profile}, core ${manifest.core_commit})`,
-    exportFiles: async () => {
-      const dir = join(info.scratch, `export-${randomBytes(3).toString("hex")}`);
-      const s = box.running.services;
-      const r = await runCli(info, s.home, ["export", dir, "--vault", box.vault], { bin: info.vaultBin });
-      if (r.code !== 0) throw new Error(`door: the box's export failed (${r.code}): ${r.stderr.slice(-400)}`);
-      const walk = (d: string, rel = ""): { name: string; bytes: Uint8Array }[] =>
-        readdirSync(d).flatMap((n) => (statSync(join(d, n)).isDirectory() ? walk(join(d, n), `${rel}${n}/`) : [{ name: `${rel}${n}`, bytes: new Uint8Array(readFileSync(join(d, n))) }]));
-      return walk(dir);
-    },
     stop: async () => {
       await box.running.stop();
       rmSync(info.scratch, { recursive: true, force: true });
@@ -278,15 +265,6 @@ for (const name of want) {
   const summary = `${so}${se}`.split("\n").filter((l) => /^\s*\d+ (pass|fail|skip)|^Ran \d+ tests/.test(l)).map((l) => l.trim()).join(", ");
   console.log(`[doors] ${label}: ${code === 0 ? "PASS" : "FAIL"} (${summary})`);
   lines.push(`${code === 0 ? "PASS" : "FAIL"} ${label} (${summary})`);
-  // The box's exit is its own command: record what it exports under the same keys the HTTP exit records.
-  if (s.exportFiles && !files.length) {
-    try {
-      recordExport(await s.exportFiles(), (key, value) => appendFileSync(fingerprint, `${JSON.stringify({ key, value })}\n`));
-    } catch (err) {
-      console.error(`[doors] ${label}: ${(err as Error).message}`);
-      failed++;
-    }
-  }
   if (code !== 0) {
     failed++;
     console.log(`${so}${se}`.split("\n").filter((l) => /\(fail\)|error:|Expected|Received|^\s+at /.test(l)).slice(0, 80).join("\n"));

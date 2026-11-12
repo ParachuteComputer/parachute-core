@@ -50,12 +50,17 @@
 {"key":"connect/token.lifetime","value":900}
 {"key":"connect/token.reply.shape","value":{"access_token":"string","expires_in":"number","refresh_token":"string","scope":"string","services":{"vault":{"url":"string","version":"string"},"vault:<v>":{"url":"string","version":"string"}},"token_type":"string","vault":"string"}}
 {"key":"connect/written-by.stamp","value":{"by":"string","via":"key:<client>"}}
+{"key":"exit/export-key.headers","value":{"type":"application/x-tar"}}
+{"key":"exit/export-key.mcp-refusal","value":{"status":403}}
+{"key":"exit/export-key.mint.shape","value":{"can":"string","created_at":"string","expires_at":"string","last_used_at":"null","name":"string","revoked_at":"null","scopes":["string"],"status":"string","token":"string","vault":"string"}}
+{"key":"exit/export-key.stamp.shape","value":{"last_export_at":"string","last_export_by":"string"}}
 {"key":"exit/file..parachute/schemas/exitfixture.yaml","value":"description: A made-up type for the exit contract\nfields:\n  due:\n    type: date\n  points:\n    indexed: true\n    type: integer\n  status:\n    enum:\n      - open\n      - done\n      - 'a:b'\n    strict: true\n    type: string\nname: exitfixture\n"}
 {"key":"exit/file.attachment","value":{"name":".parachute/attachments/<att>/<stored>.png","sha256":"a88873d7c64f89b94d073cababf05929ebac1bcea3df01c4dc44eebe22927e92"}}
 {"key":"exit/file.exit-fixture/plan.md","value":"---\nid: <id>\npath: exit-fixture/plan\ntags:\n  - exit/nested-tag\n  - exitfixture\nmetadata:\n  done: false\n  due: 2027-02-03\n  empty_text: ''\n  multi: \"line one\\nline two\"\n  nested:\n    deep:\n      list:\n        - 1\n        - 2\n        - 3\n      yes: true\n  people:\n    - address: mailto:sam@example.org\n      name: Sam\n  points: 5\n  quote: it's \"quoted\"\n  status: a:b\n  urls:\n    - 'https://example.org/a'\n    - plain\n    - 'http://example.org:8080/b?c=d#e'\nlinks:\n  - relationship: depends-on\n    target: <id>\ncreated_at: <time>\nupdated_at: <time>\n---\n# Plan\n\nSee [[exit-fixture/target]] and [[exit-fixture/not-yet]].\n\nUmlauts stay: Grüße, 東京, 🪂.\n"}
 {"key":"exit/file.exit-fixture/target.md","value":"---\nid: <id>\npath: exit-fixture/target\nattachments:\n  - id: <id>\n    mime_type: image/png\n    path: <stored>.png\ncreated_at: <time>\nupdated_at: <time>\n---\nThe target.\n"}
 {"key":"exit/file.pathless","value":{"name":"_unpathed/exit-fixture pathless note.md","text":"---\nid: <id>\ntags:\n  - exit/nested-tag\ncreated_at: <time>\nupdated_at: <time>\n---\nexit-fixture pathless note\n"}}
-{"key":"exit/file.vault.yaml.keys","value":["description","export_format_version","exported_at","name"]}
+{"key":"exit/file.vault.yaml.keys","value":["export_format_version","exported_at","name"]}
+{"key":"exit/http.headers","value":{"disposition":"attachment; filename=\"vault-<v>-<time>.tar\"","type":"application/x-tar"}}
 {"key":"files/attach.reply.shape","value":{"createdAt":"string","id":"string","mimeType":"string","noteId":"string","path":"string"}}
 {"key":"files/attachments.list.shape","value":[{"createdAt":"string","id":"string","mimeType":"string","noteId":"string","path":"string"}]}
 {"key":"files/detach.reply","value":{"shape":"null","status":204}}
@@ -73,7 +78,8 @@
 {"key":"files/upload.pdf","value":{"status":201}}
 {"key":"files/upload.reply.shape","value":{"mimeType":"string","path":"string","size":"number"}}
 {"key":"files/upload.txt","value":{"status":201}}
-{"key":"has/export-over-http","value":false}
+{"key":"has/export-key","value":true}
+{"key":"has/export-over-http","value":true}
 {"key":"has/multi-vault-door","value":true}
 {"key":"has/oauth-approval","value":true}
 {"key":"has/on-behalf-of","value":true}

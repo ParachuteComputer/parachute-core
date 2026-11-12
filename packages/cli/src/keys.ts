@@ -3,10 +3,12 @@
 //   keys list [--all] [--json]           every live key (the hub's `keys` table, PR #17); --all adds revoked and
 //                                        expired keys and the CLI's own operator credential
 //   keys list --pending                  apps waiting for approval (auth pending-clients)
-//   keys new <name> --vault <v> [--can read|write|admin] [--expires-in <s> | --ephemeral] [--on-behalf-of] [--json]
+//   keys new <name> --vault <v> [--can read|write|admin|export] [--expires-in <s> | --ephemeral] [--on-behalf-of] [--json]
 //                                        auth mint-token, labelled with the name, so its key is called <name> and its
 //                                        writes say "via key:<name>"; --on-behalf-of lets it write for people it
 //                                        names, stamped "by <name>:<id>" (the owner's grant; vault write-stamp.ts)
+//                                        --can export is the backup key: it downloads the vault's full export
+//                                        (GET /api/export, for a cron pull) and can do nothing else
 //   keys revoke <name|jti> [--json]      auth revoke-token on the key's token
 //   keys approve <client>                auth approve-client
 //
@@ -43,7 +45,7 @@ const PASS_NEW_BARE = new Set(["--ephemeral", "--json", "--on-behalf-of"]);
 function usage(): string {
   return [
     "parachute keys list [--all] [--json] | list --pending",
-    "parachute keys new <name> --vault <vault> [--can read|write|admin] [--expires-in <seconds> | --ephemeral] [--on-behalf-of] [--json]",
+    "parachute keys new <name> --vault <vault> [--can read|write|admin|export] [--expires-in <seconds> | --ephemeral] [--on-behalf-of] [--json]",
     "parachute keys revoke <name|jti> [--json]",
     "parachute keys approve <client>",
   ].join("\n");
@@ -101,9 +103,9 @@ function keysNew(args: string[]): KeysResult {
     console.error("parachute keys new: --vault <name> is required (which vault the key opens)");
     return { exit: 2 };
   }
-  const levels = ({ read: ["read"], write: ["read", "write"], admin: ["read", "write", "admin"] } as Record<string, string[]>)[can];
+  const levels = ({ read: ["read"], write: ["read", "write"], admin: ["read", "write", "admin"], export: ["export"] } as Record<string, string[]>)[can];
   if (!levels) {
-    console.error("parachute keys new: --can is read, write or admin");
+    console.error("parachute keys new: --can is read, write, admin or export");
     return { exit: 2 };
   }
   if (pass.includes("--on-behalf-of")) {
@@ -135,7 +137,7 @@ function keysRevoke(args: string[]): KeysResult {
 }
 
 function show(keys: KeyView[], users: Map<string, string>): string[] {
-  if (!keys.length) return ["No keys. Make one: parachute keys new <name> --vault <vault> --can read|write|admin"];
+  if (!keys.length) return ["No keys. Make one: parachute keys new <name> --vault <vault> --can read|write|admin|export"];
   const rows = keys.map((k) => [
     k.name,
     `${k.owner_kind}${k.owner ? ` ${users.get(k.owner) ?? k.owner}` : ""}`,
