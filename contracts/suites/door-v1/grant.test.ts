@@ -44,14 +44,16 @@ describe("a signed grant", () => {
     const listed = (await statements()).body?.records ?? [];
     const counts = listed.filter((r: any) => r.counts).map((r: any) => r.key);
     expect(counts).toEqual([fresh.pubkey]);
-    // The owner rotates back to the birth key. The retired key's records count no more, dated before or after.
-    const back = await file(await vaultRecordEvent(await ownerKey(), { key: id }));
-    expect(back.status, back.text.slice(0, 200)).toBe(201);
+    // The owner rotates again, to a fresh key: a retired key is never named again. The retired key's records count
+    // no more, dated before or after, and neither do the birth key's.
+    const later = await newKey();
+    const next = await file(await vaultRecordEvent(await ownerKey(), { key: later.pubkey }));
+    expect(next.status, next.text.slice(0, 200)).toBe(201);
     for (const created_at of [Math.floor(Date.now() / 1000) - 3600, Math.floor(Date.now() / 1000) + 60]) {
       await file(await vaultRecordEvent(fresh, { key: fresh.pubkey, lives: "https://elsewhere.example" }, { created_at }));
     }
     const now = ((await statements()).body?.records ?? []).filter((r: any) => r.counts).map((r: any) => r.key);
-    expect(now).toEqual([id]);
+    expect(now).toEqual([later.pubkey]);
     // A stranger's record for this vault has no standing.
     const stranger = await newKey();
     const theirs = await file(await vaultRecordEvent(stranger, { key: stranger.pubkey }));
