@@ -1,4 +1,4 @@
-// v093/hot-vault: a vault made or deleted on a running box needs no restart (0.9.3, T-463 PR 6).
+// lifecycle/hot-vault: a vault made or deleted on a running box needs no restart (0.9.3, T-463 PR 6).
 //
 // The box is the run's own (`bun run candidate`): `parachute serve`, the default process model. With a host-admin
 // pass, `POST /vaults {name}` makes a second vault; at once, with no wait and no retry:
@@ -39,7 +39,7 @@ const vaultStarts = () => {
   return { started: (log.match(/Parachute Vault server listening/g) ?? []).length, stopped: (log.match(/vault shutting down/g) ?? []).length };
 };
 
-describe("v093/hot-vault", () => {
+describe("lifecycle/hot-vault", () => {
   test("a vault made and deleted on a running box: usable at once, nothing restarts, the first vault never misses a request", async () => {
     // The box's operator token (written by `auth rotate-operator`, which the run did) is the host-admin pass.
     const admin = readFileSync(join(s.home, "operator.token"), "utf8").trim();
