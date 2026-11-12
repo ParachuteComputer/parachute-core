@@ -7,7 +7,7 @@
 // (harness/doors/run.ts) records the same facts from the box's own export after the run; the comparison is the same.
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { accountToken, door, fp, lacks, mcpUrl, rest, runId, safeFetch, shape, token, vaultUrl } from "./_door.ts";
+import { accountToken, door, fp, lacks, mcp, mcpUrl, rest, runId, safeFetch, shape, token, vaultUrl } from "./_door.ts";
 import { FIXTURE, FIXTURE_FILE, recordExport } from "./_exit.ts";
 import { untar } from "./_tar.ts";
 
@@ -126,6 +126,13 @@ describe.skipIf(door().release !== "0.9.1" || lacks("export-key"))("the backup k
     expect((await (await call(key.token, "GET", "/api/export")).arrayBuffer()).byteLength).toBeGreaterThan(0);
     expect(Date.parse((await lastExport()).last_export_at!)).toBeGreaterThan(Date.parse(after.last_export_at!));
 
+    // A `?since=` pull is a piece of the vault, not a backup: it hands over a tar and leaves the stamp alone.
+    const stamp = (await lastExport()).last_export_at;
+    const partial = await call(key.token, "GET", "/api/export?since=2999-01-01T00:00:00Z");
+    expect(partial.status).toBe(200);
+    await partial.arrayBuffer();
+    expect((await lastExport()).last_export_at).toBe(stamp);
+
     // A read key still exports, as on cloud, and no key at all is refused.
     const asRead = await call(await token("read"), "GET", "/api/export");
     expect(asRead.status).toBe(200);
@@ -184,6 +191,33 @@ describe.skipIf(door().release !== "0.9.1" || lacks("export-key"))("the backup k
     const anon = await call(null, "GET", `/view/${FIXTURE}%2Fplan`);
     expect(view.status).toBe(anon.status);
     expect(view.status).not.toBe(200);
+  });
+
+  test("an admin session mints it with manage-keys, the other way a person gets one, and that key works the same", async () => {
+    await writeFixture();
+    const name = `door-backup-${runId("m")}`;
+    const admin = await mcp("admin");
+    let minted: any;
+    try {
+      minted = await admin.call("manage-keys", { action: "mint", scope: `vault:${d.vault}:export`, name });
+    } finally {
+      await admin.close();
+    }
+    expect(minted.token, JSON.stringify(minted).slice(0, 300)).toBeString();
+    expect(minted.scopes).toEqual([`vault:${d.vault}:export`]);
+    const pulled = await call(minted.token, "GET", "/api/export");
+    expect(pulled.status, (await pulled.clone().text()).slice(0, 200)).toBe(200);
+    expect(untar(new Uint8Array(await pulled.arrayBuffer())).map((f) => f.name)).toContain(`${FIXTURE}/plan.md`);
+    expect((await call(minted.token, "GET", "/api/notes")).status).toBe(403);
+    // A read session can't hand it out.
+    const reader = await mcp("read");
+    try {
+      await expect(reader.call("manage-keys", { action: "mint", scope: `vault:${d.vault}:export` })).rejects.toThrow();
+    } catch {
+      // The tool may be absent from a read session's list: either way nothing was minted.
+    } finally {
+      await reader.close();
+    }
   });
 
   test("a revoked export key stops", async () => {

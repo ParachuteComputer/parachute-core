@@ -265,7 +265,8 @@ async function dispatchScopedMcp(
  * GET /api/export: stream the whole vault as one tar (`export-tar.ts`; the same files as `parachute-vault export`).
  * `by` is the key that pulled it. The vault records the time and `by` once the last byte has gone out
  * (`last_export_at`, shown on `GET /api/vault` to an admin and by `parachute vault status`); a pull the client
- * abandons records nothing. `?since=<iso>` and `?exported_at=<iso>` are the engine's, as on Parachute Cloud.
+ * abandons records nothing, and neither does a `?since=` pull (a piece of the vault, not a backup).
+ * `?since=<iso>` and `?exported_at=<iso>` are the engine's, as on Parachute Cloud.
  */
 async function handleExport(req: Request, store: Store, vaultConfig: VaultConfig, by: string | null): Promise<Response> {
   const url = new URL(req.url);
@@ -284,11 +285,13 @@ async function handleExport(req: Request, store: Store, vaultConfig: VaultConfig
     return Response.json({ error: "export_failed", message: "Export could not be assembled. Please retry." }, { status: 500 });
   }
   const ts = new Date().toISOString().replace(/[:.]/g, "-");
-  return new Response(tarStream(entries, () => recordExport(name, by)), {
+  // A `?since=` pull is a piece of the vault, not a backup: it does not move the stamp.
+  return new Response(tarStream(entries, () => { if (!since) recordExport(name, by); }), {
     status: 200,
     headers: {
       "Content-Type": "application/x-tar",
       "Content-Disposition": `attachment; filename="vault-${name}-${ts}.tar"`,
+      // Bun sends a streamed body chunked and drops this; a cut-off pull still fails for the client (the stream errors).
       "Content-Length": String(tarSize(entries)),
       "Cache-Control": "no-store",
     },

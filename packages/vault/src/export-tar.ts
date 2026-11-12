@@ -8,7 +8,7 @@
  * bytes). Text is held in memory (notes are small); each attachment is streamed from disk when its turn comes, never
  * read whole, so the memory a pull needs does not grow with the size of the files.
  */
-import { createReadStream, statSync } from "node:fs";
+import { createReadStream, realpathSync, statSync } from "node:fs";
 import { join, resolve as resolvePath, sep } from "node:path";
 import { exportVault, type ExportEngineOptions, type ExportSink, type ExportStats, type SinkWriteResult } from "../core/src/portable-md.ts";
 import type { Store } from "../core/src/types.ts";
@@ -43,7 +43,13 @@ class CollectingSink implements ExportSink {
   }
 
   writeText(relPath: string, content: string): SinkWriteResult {
-    this.entries.push({ name: normalize(relPath), bytes: this.enc.encode(content) });
+    // The folder export refuses a path that leaves its root; a tar entry that is absolute or climbs with ".." would
+    // land outside wherever it is extracted, so it is refused here the same way (the engine records the skip).
+    const name = normalize(relPath);
+    if (name.startsWith("/") || name.split("/").includes("..")) {
+      return { ok: false, reason: `path-traversal: "${relPath}" would leave the export root` };
+    }
+    this.entries.push({ name, bytes: this.enc.encode(content) });
     return { ok: true };
   }
 
@@ -55,13 +61,19 @@ class CollectingSink implements ExportSink {
     }
     let size: number;
     try {
-      const st = statSync(src);
+      // Follow links before the containment check too: a link inside the assets folder that leads out of it is skipped.
+      const real = realpathSync(src);
+      const root = realpathSync(this.assets);
+      if (real !== root && !real.startsWith(root + sep)) {
+        return { ok: false, reason: `path-traversal: source "${src}" resolves outside assetsDir "${this.assets}"` };
+      }
+      const st = statSync(real);
       if (!st.isFile()) return { ok: false, reason: `source is not a file at "${src}"` };
       size = st.size;
     } catch {
       return { ok: false, reason: `source file missing at "${src}"` };
     }
-    this.entries.push({ name: normalize(destRelPath), path: src, size });
+    this.entries.push({ name: normalize(destRelPath), path: realpathSync(src), size });
     return { ok: true };
   }
 }
@@ -150,7 +162,7 @@ function entryHeader(entryName: string, size: number): Uint8Array {
   return out;
 }
 
-/** The exact size of the archive, for Content-Length (the curl on the other end can tell a cut-off pull). */
+/** The exact size of the archive in bytes (sent as Content-Length, and what the stream must add up to). */
 export function tarSize(entries: readonly TarEntry[]): number {
   let total = BLOCK * 2;
   for (const e of entries) {

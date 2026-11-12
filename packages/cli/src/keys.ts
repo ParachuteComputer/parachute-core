@@ -108,6 +108,10 @@ function keysNew(args: string[]): KeysResult {
     console.error("parachute keys new: --can is read, write, admin or export");
     return { exit: 2 };
   }
+  if (can === "export" && pass.includes("--on-behalf-of")) {
+    console.error("parachute keys new: --on-behalf-of: an export key writes nothing, so it has nobody to write for");
+    return { exit: 2 };
+  }
   if (pass.includes("--on-behalf-of")) {
     const problem = onBehalfNameProblem(name);
     if (problem) {

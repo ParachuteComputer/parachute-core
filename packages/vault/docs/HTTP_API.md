@@ -2596,7 +2596,7 @@ counts never reflect out-of-scope activity.
 
 #### `GET /vault/{name}/api/export` — `vault:read` or `vault:export`
 The whole vault as one tar (`application/x-tar`, `Content-Disposition: attachment;
-filename="vault-<name>-<time>.tar"`, `Content-Length` set): the same files as
+filename="vault-<name>-<time>.tar"`, streamed): the same files as
 `parachute-vault export` (notes as markdown, `.parachute/vault.yaml`, one
 `.parachute/schemas/<type>.yaml` per type, each attachment under
 `.parachute/attachments/<id>/`), in the same layout Parachute Cloud gives, so the
@@ -2612,7 +2612,8 @@ every route. No key gets 401; any other method gets 405 (403 for the export-only
 When the last byte has gone out the vault records the time and the key
 (`last_export_at`, `last_export_by`, e.g. `key:nightly-backup`). An admin sees both on
 `GET /api/vault`; `parachute-vault status` shows them per vault. A pull the client
-abandons records nothing, so the stamp means a whole tar was handed over. A pull from a
+abandons records nothing, so the stamp means a whole tar was handed over; a `?since=` pull
+is a piece of the vault and doesn't move it. A pull from a
 cron job:
 
 ```bash
