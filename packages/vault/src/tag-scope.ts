@@ -20,6 +20,7 @@
  */
 
 import type { Store, Note, HydratedLink, NoteSummary } from "../core/src/types.ts";
+import type { NoteVisible } from "../core/src/notes.ts";
 import type { TagFieldViolation } from "../core/src/tag-schemas.ts";
 import { ParentCycleError } from "../core/src/tag-schemas.ts";
 import { IndexedFieldError, IndexedFieldLimitError } from "../core/src/indexed-fields.ts";
@@ -506,7 +507,25 @@ export function buildExpandVisibility(
   rawRoots: string[] | null,
 ): ((note: Note) => boolean) | undefined {
   if (rawRoots === null) return undefined;
-  return (note: Note) => noteWithinTagScope(note, allowed, rawRoots);
+  return withTagRule((note: Note) => noteWithinTagScope(note, allowed, rawRoots), () => ({ allowed, rawRoots }));
+}
+
+/**
+ * Attach `NoteVisible.byTag` to a `noteWithinTagScope` predicate: what one tag does to a note under the scope
+ * `scope()` returns now (read at each call, for a predicate whose allowlist is filled in later). It is the same rule
+ * `noteWithinTagScope` applies tag by tag (admit: `tagVisibleInScope`; deny: `tagDeniedByPrivateTags`), so core can
+ * run the predicate as SQL over note_tags (the scoped keyword arm).
+ */
+export function withTagRule(
+  fn: (note: Note) => boolean,
+  scope: () => { allowed: Set<string> | null; rawRoots: string[] | null },
+): NoteVisible {
+  const visible = fn as NoteVisible;
+  visible.byTag = (tag: string) => {
+    const { allowed, rawRoots } = scope();
+    return { admits: tagVisibleInScope(tag, allowed, rawRoots), denies: tagDeniedByPrivateTags(tag, allowed) };
+  };
+  return visible;
 }
 
 /**

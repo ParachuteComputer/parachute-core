@@ -2339,6 +2339,38 @@ function fieldTierOf(ftsQuery: string): FieldTier {
 let visibleSearchSeq = 0;
 
 /**
+ * A visibility predicate that also says, one tag at a time, what the tag does: `admits` (a note carrying it may be
+ * seen) and `denies` (a note carrying it is hidden, whatever else it carries). Then the predicate is exactly
+ * "has a tag that admits and none that denies" (no tags: not visible), which SQL can state over note_tags.
+ * `byTag` MUST agree with the function it is attached to; the tag-scope builders attach it
+ * (src/tag-scope.ts) and a property test compares the two.
+ */
+export type NoteVisible = ((note: Note) => boolean) & { byTag?: (tag: string) => { admits: boolean; denies: boolean } };
+
+/**
+ * The SQL form of a `NoteVisible` over `n` (the notes table), or null when the predicate has no `byTag`. The rule is
+ * applied to every tag name in use (one DISTINCT read of note_tags' tag index), so SQL tests set membership of a
+ * name, never re-states the rule.
+ */
+function tagRuleSql(db: Database, visible: (note: Note) => boolean): { sql: string; params: string[] } | null {
+  const byTag = (visible as NoteVisible).byTag;
+  if (!byTag) return null;
+  const admits: string[] = [];
+  const denies: string[] = [];
+  for (const { tag_name } of db.prepare("SELECT DISTINCT tag_name FROM note_tags").all() as { tag_name: string }[]) {
+    const r = byTag(tag_name);
+    if (r.admits) admits.push(tag_name);
+    if (r.denies) denies.push(tag_name);
+  }
+  return {
+    sql:
+      "EXISTS (SELECT 1 FROM note_tags vt WHERE vt.note_id = n.id AND vt.tag_name IN (SELECT value FROM json_each(?))) " +
+      "AND NOT EXISTS (SELECT 1 FROM note_tags vd WHERE vd.note_id = n.id AND vd.tag_name IN (SELECT value FROM json_each(?)))",
+    params: [JSON.stringify(admits), JSON.stringify(denies)],
+  };
+}
+
+/**
  * Full-text search for a caller who sees only some notes (a tag-scoped pass,
  * via `searchNotes`'s `visible`): the answer depends on the visible notes
  * alone (fix 8). Ranking over `notes_fts` can't give that: bm25 reads
@@ -2360,15 +2392,23 @@ function searchVisibleOnly(
   visible: (note: Note) => boolean,
   tier: FieldTier | null,
 ): (NoteRow & { score: number })[] {
+  // A predicate that can say, tag by tag, what admits or denies a note (`NoteVisible.byTag`) is applied inside the
+  // match query as an EXISTS over note_tags: no per-note tag read and no per-note call. Same set as the line-by-line
+  // path below (`tagRuleSql` builds it from the predicate's own rule); anything else takes that path.
+  const inSql = tagRuleSql(db, visible);
   const matched = db.prepare(`
     SELECT n.rowid AS rowid, n.id AS id FROM notes n
     JOIN notes_fts fts ON fts.rowid = n.rowid
     WHERE notes_fts MATCH ?
       ${extraWhere}
-  `).all(ftsQuery, ...params) as { rowid: number; id: string }[];
+      ${inSql ? `AND ${inSql.sql}` : ""}
+  `).all(ftsQuery, ...params, ...(inSql?.params ?? [])) as { rowid: number; id: string }[];
   if (matched.length === 0) return [];
-  const tagsById = getNoteTagsForNotes(db, matched.map((r) => r.id));
-  const keep = matched.filter((r) => visible({ id: r.id, tags: tagsById.get(r.id) ?? [] } as Note));
+  let keep = matched;
+  if (!inSql) {
+    const tagsById = getNoteTagsForNotes(db, matched.map((r) => r.id));
+    keep = matched.filter((r) => visible({ id: r.id, tags: tagsById.get(r.id) ?? [] } as Note));
+  }
   if (keep.length === 0) return [];
   const ftsSql = (db.prepare("SELECT sql FROM sqlite_master WHERE name = 'notes_fts'").get() as { sql: string } | null)?.sql ?? "";
   const tokenize = /tokenize\s*=\s*'([^']*)'/i.exec(ftsSql)?.[1] ?? "porter unicode61";

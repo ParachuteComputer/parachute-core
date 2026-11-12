@@ -38,6 +38,7 @@ import {
   doctorNoteTagsPredicate,
   filterHydratedLinksByTagScope,
   noteWithinTagScope,
+  withTagRule,
   scopeQueryTagParam,
   scrubIndexedFieldConflictError,
   scrubNoteTagsByScope,
@@ -231,7 +232,7 @@ export function generateScopedMcpTools(
   // use of this) execute. Unscoped sessions install no predicate → the
   // aggregate runs core's fast direct-SQL path.
   const aggregateVisibility = scoped
-    ? (note: Note) => noteWithinTagScope(note, allowedHolder.value, rawTags)
+    ? withTagRule((note: Note) => noteWithinTagScope(note, allowedHolder.value, rawTags), () => ({ allowed: allowedHolder.value, rawRoots: rawTags }))
     : undefined;
 
   // Tag-scope hop-guard for `near[]` (vault#439): a per-note predicate the
