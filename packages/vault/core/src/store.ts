@@ -742,7 +742,7 @@ export class BunSqliteStore implements Store {
     const note = this.transaction(() => {
       if (willWriteNoteRow(updates)) {
         const prior = readPriorNoteRow(this.db, id);
-        if (prior) captureVersion(this.db, prior, { actor: updates.actor ?? null, via: updates.via ?? null, op: historyOpFor(updates), policy: this.historyPolicy });
+        if (prior) captureVersion(this.db, prior, { actor: updates.actor ?? null, via: updates.via ?? null, op: historyOpFor(updates), policy: this.historyPolicy, next: { path: updates.path, extension: updates.extension } });
       }
       const note = noteOps.updateNote(this.db, id, updates);
 

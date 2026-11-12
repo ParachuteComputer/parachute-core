@@ -40,6 +40,12 @@ export interface HistoryPolicy {
   max_bytes_per_note: number | null;
   compact_budget_ms: number;
   compact_max_notes: number;
+  /**
+   * Burst collapse (T-460): an edit by the same named writer (actor and via) within this many seconds of the note's
+   * newest version captures nothing, so a burst of edits leaves one version (the body from before the burst). 0 is
+   * off. Never applied to deletes, restores, renames, imports, or writers with no actor.
+   */
+  burst_window_seconds: number;
 }
 export const DEFAULT_HISTORY_POLICY: HistoryPolicy = {
   enabled: true,
@@ -54,6 +60,7 @@ export const DEFAULT_HISTORY_POLICY: HistoryPolicy = {
   max_bytes_per_note: 8_388_608,
   compact_budget_ms: 250,
   compact_max_notes: 50,
+  burst_window_seconds: 900,
 };
 export function resolveHistoryPolicy(
   partial?: Partial<HistoryPolicy>,
@@ -70,6 +77,7 @@ export function resolveHistoryPolicy(
   if (p.max_bytes_per_note !== null) p.max_bytes_per_note = Math.max(65_536, p.max_bytes_per_note);
   p.compact_budget_ms = Math.min(60_000, Math.max(0, p.compact_budget_ms));
   p.compact_max_notes = Math.min(10_000, Math.max(0, p.compact_max_notes));
+  p.burst_window_seconds = Number.isFinite(p.burst_window_seconds) ? Math.min(86_400, Math.max(0, p.burst_window_seconds)) : DEFAULT_HISTORY_POLICY.burst_window_seconds;
   return p;
 }
 export const VERSION_MAX_BYTES = 2_000_000;
@@ -192,6 +200,8 @@ export function captureVersion(
     via: string | null;
     op: HistoryOp;
     policy: HistoryPolicy;
+    /** The path and extension this write sets, when it sets them: a rename is never part of a burst. */
+    next?: { path?: string | null; extension?: string | null };
   },
 ): void {
   if (!opts.policy.enabled) return;
@@ -221,6 +231,8 @@ export function captureVersion(
     pruneVersions(db, prior.id, opts.policy, Date.now(), false);
     return;
   }
+  // After the size refusal, so an oversized body still fails the write.
+  if (inBurst(db, prior, opts, Date.now())) return;
   const hash = hashContent(text);
   db.prepare(
     "INSERT OR IGNORE INTO note_blobs (hash, content, byte_size) VALUES (?, ?, ?)",
@@ -245,6 +257,33 @@ export function captureVersion(
     prior.created_at,
   );
   pruneVersions(db, prior.id, opts.policy, Date.now(), false);
+}
+const BURST_OPS: ReadonlySet<string> = new Set(["update", "append", "prepend"]);
+/**
+ * Whether this capture is part of a burst and writes nothing (T-460). All must hold: a window is set; this write and
+ * the note's newest version are both an update, append or prepend; both by the same non-null actor through the same
+ * via; this write keeps the path and extension, which the newest version also had; and the newest version was
+ * captured no more than the window ago, and not in the future (a row from a clock ahead, a grafted box's say, never
+ * starts a skip run). The newest row holds the body from before the burst, so a read "as of" a time inside the burst
+ * is late by at most one burst.
+ */
+function inBurst(
+  db: Database,
+  prior: PriorNoteRow,
+  opts: { actor: string | null; via: string | null; op: HistoryOp; policy: HistoryPolicy; next?: { path?: string | null; extension?: string | null } },
+  now: number,
+): boolean {
+  const window = opts.policy.burst_window_seconds * 1000;
+  if (!(window > 0) || opts.actor === null || !BURST_OPS.has(opts.op)) return false;
+  if (opts.next?.path !== undefined && opts.next.path !== prior.path) return false;
+  if (opts.next?.extension !== undefined && opts.next.extension !== prior.extension) return false;
+  const newest = db.prepare(
+    "SELECT actor, via, op, path, extension, superseded_at FROM note_versions WHERE note_id = ? ORDER BY version_ix DESC LIMIT 1",
+  ).get(prior.id) as { actor: string | null; via: string | null; op: string; path: string | null; extension: string | null; superseded_at: string } | null;
+  if (!newest || newest.actor !== opts.actor || newest.via !== opts.via || !BURST_OPS.has(newest.op)) return false;
+  if (newest.path !== prior.path || newest.extension !== prior.extension) return false;
+  const age = now - Date.parse(newest.superseded_at);
+  return age >= 0 && age <= window;
 }
 export function appendRestoreMarker(
   db: Database,

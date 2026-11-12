@@ -266,6 +266,8 @@ export interface VaultConfig {
     max_bytes_per_note?: number | null;
     compact_budget_ms?: number;
     compact_max_notes?: number;
+    /** Burst collapse (T-460): seconds within which one named writer's edits make one version. Default 900; 0 off. */
+    burst_window_seconds?: number;
   };
 }
 
@@ -581,7 +583,7 @@ function serializeVaultConfig(config: VaultConfig): string {
   // Per-vault history policy: serialize only explicitly configured fields.
   if (config.history) {
     lines.push("history:");
-    for (const key of ["enabled", "min_versions", "max_versions", "max_age_days", "deleted_retention_days", "compact_enabled", "compact_ratio", "compact_min_versions", "compact_run_length", "max_bytes_per_note", "compact_budget_ms", "compact_max_notes"] as const) {
+    for (const key of ["enabled", "min_versions", "max_versions", "max_age_days", "deleted_retention_days", "compact_enabled", "compact_ratio", "compact_min_versions", "compact_run_length", "max_bytes_per_note", "compact_budget_ms", "compact_max_notes", "burst_window_seconds"] as const) {
       if (config.history[key] !== undefined) lines.push(`  ${key}: ${config.history[key]}`);
     }
   }
@@ -912,8 +914,8 @@ function parseVaultConfig(yaml: string, name: string): VaultConfig {
       if (line.match(/^\S/) && line.trim().length > 0) break;
       const enabled = line.match(/^\s+(enabled|compact_enabled):\s*(true|false)\s*$/);
       if (enabled) config.history[enabled[1] as "enabled" | "compact_enabled"] = enabled[2] === "true";
-      const number = line.match(/^\s+(min_versions|max_versions|max_age_days|compact_min_versions|compact_run_length|compact_budget_ms|compact_max_notes):\s*(\d+)\s*$/);
-      if (number) config.history[number[1] as "min_versions" | "max_versions" | "max_age_days" | "compact_min_versions" | "compact_run_length" | "compact_budget_ms" | "compact_max_notes"] = Number(number[2]);
+      const number = line.match(/^\s+(min_versions|max_versions|max_age_days|compact_min_versions|compact_run_length|compact_budget_ms|compact_max_notes|burst_window_seconds):\s*(\d+)\s*$/);
+      if (number) config.history[number[1] as "min_versions" | "max_versions" | "max_age_days" | "compact_min_versions" | "compact_run_length" | "compact_budget_ms" | "compact_max_notes" | "burst_window_seconds"] = Number(number[2]);
       const ratio = line.match(/^\s+compact_ratio:\s*(\d+(?:\.\d+)?)\s*$/);
       if (ratio) config.history.compact_ratio = Number(ratio[1]);
       const bytes = line.match(/^\s+max_bytes_per_note:\s*(null|\d+)\s*$/);
