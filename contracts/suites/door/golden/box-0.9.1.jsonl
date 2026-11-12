@@ -40,6 +40,7 @@
 {"key":"connect/authorization-server.scopes_supported","value":["string"]}
 {"key":"connect/authorization-server.token_endpoint","value":"string"}
 {"key":"connect/authorization-server.token_endpoint_auth_methods_supported","value":["string"]}
+{"key":"connect/changes-map","value":{"keys":["schema","from","to","version","status","rule","upgrade_policy","waypoint","changes"],"kinds":["command","credential","endpoint","mcp-tool","setting"]}}
 {"key":"connect/jwks.key","value":{"alg":"RS256","kty":"RSA","use":"sig"}}
 {"key":"connect/refresh.reply.shape","value":{"access_token":"string","expires_in":"number","refresh_token":"string","scope":"string","services":{"vault":{"url":"string","version":"string"},"vault:<v>":{"url":"string","version":"string"}},"token_type":"string","vault":"string"}}
 {"key":"connect/refusal.bad-redirect","value":{"error":"invalid_redirect_uri","status":400}}

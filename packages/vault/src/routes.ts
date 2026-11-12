@@ -1491,6 +1491,31 @@ function invalidIfUpdatedAtResponse(): Response {
   );
 }
 
+/** A HEAD answer made from a GET answer: its status and headers, a Content-Length for the body it holds back. */
+export async function headOf(res: Response): Promise<Response> {
+  const h = new Headers(res.headers);
+  h.set("content-length", String((await res.arrayBuffer()).byteLength));
+  return new Response(null, { status: res.status, statusText: res.statusText, headers: h });
+}
+
+/**
+ * Validators for one record's answer (0.9.3): a strong ETag (a hash of the answer's own bytes, so it changes with any
+ * change to the representation this key is shown: body, fields, tags in scope, links, query options) and Last-Modified
+ * (the record's update time; the ETag, not this, is what catches a tag-only change). A 200 JSON answer only.
+ */
+export async function withValidators(res: Response): Promise<Response> {
+  if (res.status !== 200 || !(res.headers.get("content-type") ?? "").includes("application/json")) return res;
+  const bytes = await res.arrayBuffer();
+  const h = new Headers(res.headers);
+  h.set("etag", `"${new Bun.CryptoHasher("sha256").update(bytes).digest("hex").slice(0, 32)}"`);
+  try {
+    const doc = JSON.parse(new TextDecoder().decode(bytes)) as { updatedAt?: string; updated_at?: string };
+    const at = Date.parse(doc.updatedAt ?? doc.updated_at ?? "");
+    if (!Number.isNaN(at)) h.set("last-modified", new Date(at).toUTCString());
+  } catch {}
+  return new Response(bytes, { status: res.status, statusText: res.statusText, headers: h });
+}
+
 export async function handleNotes(
   req: Request,
   store: Store,
@@ -1499,6 +1524,22 @@ export async function handleNotes(
   tagScope: TagScopeCtx = NO_TAG_SCOPE,
   writeCtx: WriteCtx = NO_WRITE_CTX,
 ): Promise<Response> {
+  const res = await handleNotesBase(req, store, subpath, vault, tagScope, writeCtx);
+  return req.method === "GET" && /^\/[^/]+$/.test(subpath) ? withValidators(res) : res;
+}
+
+async function handleNotesBase(
+  req: Request,
+  store: Store,
+  subpath: string,
+  vault?: string,
+  tagScope: TagScopeCtx = NO_TAG_SCOPE,
+  writeCtx: WriteCtx = NO_WRITE_CTX,
+): Promise<Response> {
+  // HEAD on one note is GET's answer without the body (0.9.3): same lookup, same tag scope, same headers.
+  if (req.method === "HEAD" && /^\/[^/]+$/.test(subpath)) {
+    return headOf(await handleNotes(new Request(req.url, { method: "GET", headers: req.headers }), store, subpath, vault, tagScope, writeCtx));
+  }
   try {
     const res = await handleNotesInner(req, store, subpath, vault, tagScope, writeCtx);
     const pending = PENDING_TYPES.get(req);

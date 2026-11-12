@@ -1190,6 +1190,28 @@
   },
   {
    "kind": "endpoint",
+   "old": "HEAD /vault/<n>/api/records/<id> (and /api/notes/<id>): passed through, no answer",
+   "new": "200 with GET's headers (Content-Type, Content-Length of the GET body) and no body; 404 for a missing or hidden record; the same key and tag scope as GET",
+   "action": "keep",
+   "reason": "additive (0.9.3): a client can ask whether a record is there without fetching it. A 0.8 client never sent HEAD",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live",
+   "release": "0.9.3"
+  },
+  {
+   "kind": "endpoint",
+   "old": "(none) the change map was only in `parachute changes --json`",
+   "new": "GET /.well-known/parachute-changes.json (hub, no auth): the same bytes",
+   "action": "keep",
+   "reason": "additive (0.9.3): an app or agent reads what changed from the hub it talks to, with no CLI on the machine",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live",
+   "release": "0.9.3"
+  },
+  {
+   "kind": "endpoint",
    "old": "11 legacy 301 redirects",
    "new": null,
    "action": "drop",

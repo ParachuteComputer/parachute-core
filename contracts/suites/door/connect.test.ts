@@ -244,3 +244,20 @@ describe("the account door (a person's own app)", () => {
     expect(gone.status).toBeLessThan(300);
   });
 });
+
+// 0.9.3: the change map is served where an app already talks, no sign-in, the same bytes `parachute changes --json` prints.
+describe.skipIf(door().kind !== "box" || !door().release.startsWith("0.9"))("the change map at /.well-known", () => {
+  test("GET /.well-known/parachute-changes.json serves the map as JSON, no credential", async () => {
+    const r = await safeFetch(`${door().issuer}/.well-known/parachute-changes.json`);
+    expect(r.status).toBe(200);
+    expect((r.headers.get("content-type") ?? "").split(";")[0]).toBe("application/json");
+    expect(r.headers.get("cache-control") ?? "").toMatch(/max-age=\d+/);
+    const text = await r.text();
+    const map = JSON.parse(text);
+    expect(map.schema).toBe(1);
+    expect(map.changes.length).toBeGreaterThan(10);
+    expect(map.changes.some((c: any) => c.new?.includes("/.well-known/parachute-changes.json") && c.release === "0.9.3" && c.state === "live")).toBe(true);
+    fp("connect/changes-map", { keys: Object.keys(map), kinds: [...new Set(map.changes.map((c: any) => c.kind))].sort() });
+    expect(text.endsWith("\n")).toBe(true);
+  });
+});

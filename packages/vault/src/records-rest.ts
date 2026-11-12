@@ -9,7 +9,7 @@
 import { recordsAnswerOut, recordsBodyIn, recordsQueryIn, type RecordsRefusal, type RecordsRoute } from "../core/src/rest-records.ts";
 import { foldTypeFilter, refuseTypesInTags, tagKinds } from "../core/src/tag-kind.ts";
 import type { Store } from "../core/src/types.ts";
-import type { TagScopeCtx } from "./routes.ts";
+import { headOf, withValidators, type TagScopeCtx } from "./routes.ts";
 import { tagVisibleInScope } from "./tag-scope.ts";
 
 const refusal = (r: RecordsRefusal) => Response.json(r.body, { status: r.status });
@@ -33,6 +33,10 @@ export async function handleRecordsRest(
   tagScope: TagScopeCtx,
   run: (twin: Request) => Promise<Response>,
 ): Promise<Response> {
+  // HEAD on one record: the GET answer (words and all) without its body.
+  if (req.method === "HEAD" && route.kind === "records" && /^\/notes\/[^/]+$/.test(route.twin)) {
+    return headOf(await handleRecordsRest(new Request(req.url, { method: "GET", headers: req.headers }), route, apiBase, store, tagScope, run));
+  }
   const url = new URL(req.url);
   const visible = tagScope.raw === null ? undefined : (t: string) => tagVisibleInScope(t, tagScope.allowed, tagScope.raw);
   const twinUrl = new URL(url);
@@ -115,7 +119,10 @@ export async function handleRecordsRest(
   const out = route.kind === "records" ? recordsAnswerOut(req.method, answer) : res.ok && req.method === "GET" ? withKinds(store, answer) : answer;
   const h = new Headers(res.headers);
   h.delete("content-length");
-  return new Response(JSON.stringify(out), { status: res.status, statusText: res.statusText, headers: h });
+  h.delete("etag"); // the twin's validators describe its note-worded bytes; this answer is in record words
+  h.delete("last-modified");
+  const answer2 = new Response(JSON.stringify(out), { status: res.status, statusText: res.statusText, headers: h });
+  return route.kind === "records" && req.method === "GET" && /^\/notes\/[^/]+$/.test(route.twin) ? withValidators(answer2) : answer2;
 }
 
 /** `/api/types` rows say their kind, as MCP list-types does (`/api/tags` rows don't, and keep their 0.8 shape). */

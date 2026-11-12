@@ -16,6 +16,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { join } from "node:path";
 import core from "../../../package.json" with { type: "json" };
 import changesMap from "./changes-0.9.json" with { type: "json" };
+import { changesJson } from "./changes-json.ts";
 import { embeddedHolder } from "./managed.ts";
 import { namesModule } from "./primary.ts";
 
@@ -28,6 +29,8 @@ export interface Change {
   since: string;
   removed_in: string | null;
   state: "live" | "planned";
+  /** The release that made this entry live, when the map says (from 0.9.3). */
+  release?: string;
 }
 
 export interface ChangeMap {
@@ -284,8 +287,7 @@ export function changes(args: string[], home: string, out = console.log, err = c
     }
   }
   if (json) {
-    const { changes: _all, ...head } = CHANGES;
-    out(JSON.stringify({ ...head, changes: list }));
+    out(changesJson(list));
     return 0;
   }
   if (forAgent) {
