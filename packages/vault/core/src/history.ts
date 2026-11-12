@@ -41,9 +41,10 @@ export interface HistoryPolicy {
   compact_budget_ms: number;
   compact_max_notes: number;
   /**
-   * Burst collapse (T-460): an edit by the same named writer (actor and via) within this many seconds of the note's
-   * newest version captures nothing, so a burst of edits leaves one version (the body from before the burst). 0 is
-   * off. Never applied to deletes, restores, renames, imports, or writers with no actor.
+   * Burst collapse (T-460): an edit by the same writer through the same named key (actor and a `via` of `key:` or
+   * `nostr:`) within this many seconds of the note's newest version captures nothing, so a burst of edits leaves one
+   * version (the body from before the burst). 0 is off. Never applied to deletes, restores, renames, imports, writers
+   * with no actor, or a shared channel (`api`, `mcp`, the operator, a legacy token).
    */
   burst_window_seconds: number;
 }
