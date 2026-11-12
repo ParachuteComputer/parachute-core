@@ -149,7 +149,7 @@ tags, verbs) is printable ASCII; only `purpose` may be in any script. Type and t
 can't be granted or denied by name at 1.0 (§13). Test vectors for the spelling (accepted and refused, with
 their digests) are a precondition of the freeze (open decision A): they are written and run by the shell, the
 minter and every door before the first signature. They are #systems' `vectors/frame-1.0.json` in the shell-keys
-core (branch `t335-frame-1.0`, at bf607e4: 198 signed cases, sha256 `9cba3adf…b17faf`); its README section "The
+core (branch `t335-frame-1.0`, at bf607e4: 198 signed cases, sha256 `9cba3adf18e39baf85d6d7d9ef0fd9aa80786c74e2c1cae69689151268b17faf`); its README section "The
 vectors, for a vault" says how a vault replays it. A door pins a commit and the file's sha256 when it takes it.
 Round 7 (Appendix D) changed four answers the file pinned at bf607e4: a disagreeing event ends its address in any
 order, a member's `under` that isn't their own is `invalid_statement`, a control character other than NIP-01's
@@ -195,10 +195,11 @@ this vault. What else each kind must carry:
 1. **The event is whole:** its tags are a list of lists of strings, as NIP-01 has them (an empty tag is fine), and
    every string in the event, the content included, is well-formed Unicode (no lone surrogate). Anything else is
    malformed (`invalid_statement`), whatever the kind: the id is a hash over these, and a number, an object or a
-   lone surrogate hashes to other bytes in another language, or doesn't hash at all. For the same reason no string
-   holds a control character (U+0000–U+001F) other than tab, line feed, carriage return, backspace and form feed:
+   lone surrogate hashes to other bytes in another language, or doesn't hash at all. For the same reason none of the event's
+   own strings (tag values, the content's text as sent) holds a control character (U+0000–U+001F) other than tab, line feed, carriage return, backspace and form feed:
    NIP-01's text writes the rest as themselves, and `JSON.stringify` and `json.dumps` (so nostr-tools) write them as
-   `\u00XX`. With them refused the two never meet, and the id is NIP-01's serialisation. The id is the hash of its
+   `\u00XX`. With them refused the two never meet, and the id is NIP-01's serialisation. A shell never signs one. These
+   checks of line 1 come before the hash is computed. The id is the hash of its
    fields and the signature verifies (BIP-340).
 2. **It names this vault:** `at` is `parachute`, `gives` is `access`, and `honors` equals the vault's own id as
    the string JSON reads (escapes undone; no case folding, no trimming). For a grant in its one spelling that is the
@@ -222,12 +223,14 @@ this vault. What else each kind must carry:
    byte-identical to every event at that address the vault has seen that passes what holding needs (below), whatever
    its date: filed, held or superseded. They are compared as the bytes of each value as they stand in the event's
    content, never parsed and written again. One that differs is refused
-   (`id_taken`) and is never filed; but like any event the vault can't take, if it is the newest at its address it
+   (`id_taken`, which outranks `superseded` within this line) and is never filed; but like any event the vault can't take, if it is the newest at its address it
    is held and suspends the address (below), so a changed `to` or `under` can never leave an older, wider grant in
    force. Once any two events at one address disagree on `to` or `under`, in whatever order they arrived (an older
    one arriving after a newer is counted too), nothing at the address is in force again; it lists as `suspended`,
-   and comes back only by a revoke and a new id. So the grantor who signs two grantees under one id ends that id. When statements are filed in bulk (a restore, an import, the door filing its copy), grants and held
-   events go in first, oldest first by `created_at`, ties by the lower event id; then every revoke, whatever its
+   and comes back only by a revoke and a new id. So the grantor who signs two grantees under one id ends that id.
+   Such an older event is kept with the statements (§3, §9), so the ending survives a restore or a move. When
+   statements are filed in bulk (a restore, an import, the door filing its copy), grants, held events and those
+   disagreeing events go in first, oldest first by `created_at`, ties by the lower event id; then every revoke, whatever its
    date; then line 7 (one grant per grantee) is judged again for every event held only because of it. So the same
    set always gives the same answer, a revoke always finds its address, and a key granted again after a revoke keeps
    its new grant. An owner with two keys replaces a grant with
@@ -240,7 +243,7 @@ this vault. What else each kind must carry:
    reads the same as `exceeds_grantor`, so a member can't use filing to learn which keys hold grants.
 8. **It is coherent:** `update` or `delete` on a type comes with a `read` row on that type, own or not. An applet
    grant's `to.by` is `signer`, and it doesn't name `*`. `was` only on an owner-signed grant; `under` only, and always, on a member-signed one, and it names the
-   signer's own grant.
+   signer's own grant. A member-signed grant's `to.by` is `signer`.
    A `names:` prefix is lowercase `[a-z0-9.-]`, holds a letter or a digit, and isn't reserved (§6.1). No verb
    reaches admin (§4.4).
 
@@ -254,11 +257,13 @@ size or date limit, a rule a later version relaxes), would leave the older, wide
 makes every vault an older one. So, per address, the vault keeps the newest event it has seen that passes line 1,
 line 3, the ten-minute bound on arrival, and a **minimal read**, filed or not. The minimal read is frozen for every
 later version: the content is a JSON object with no key twice at its top level (inside a field, a repeat isn't
-looked for), its `at` is `parachute`, its `honors` is this vault (line 2: the string JSON reads), and its `id` equals the
-first `d` tag's value (NIP-01's address). The fields it doesn't use are checked to be valid JSON without being
+looked for), its `at` is `parachute`, its `honors` is this vault, and its `id` equals the first `d` tag's value (NIP-01's
+address). Every key and string a frozen read uses (here and in §3) is read as JSON reads it, escapes undone (line
+2); only line 6 compares the values of `to` and `under` as raw bytes. The fields it doesn't use are checked to be valid JSON without being
 built, so a very long number or a very deep array in one can't make one parser refuse what another holds. The names and spelling of `to` and `under` are frozen with it,
 so every later version's events can still be compared under line 6. An address is in force only while that newest event is one the
-vault filed. If the newest is one it couldn't file, the address is **suspended**; every older event at the address
+vault filed. If the newest is one it couldn't file, or events at the address disagree on `to` or `under` (line 6), the address
+is **suspended**; every older event at the address
 is `superseded` and never in force again, whether it arrived before or after, and whether the address was empty,
 `carried` (§9) or suspended. So an order of arrival, a restore, or a move's tap can't revive the older grant. An
 event that fails the minimal read is refused and suspends nothing, so an owner's grant at the same address for
@@ -425,7 +430,8 @@ the key minter; this spec owns the vault's fields and vocabulary.
 - **A revoke ends one address and nothing else.** The address is the kind, the grantor's key and the id together.
   A revoke that names `37440:<some other key>:claude` does nothing to the owner's `claude`.
 - **Who may sign one.** One of the vault's owner keys. The signer of the grant on file at that address. Or its
-  grantee, giving it up: the key the filed events at the address name in `to`, whether the grant is in force,
+  grantee, giving it up: the `to.id` of the filed events at the address, for a key grant (an applet grant has no
+  grantee key), whether the grant is in force,
   suspended or past its date (so a held event filed after an upgrade can't hand a grant back to a grantee who left).
   From anyone else it is refused.
 - **A revoke is final and needs no ordering.** Once a vault holds a valid revoke for an address, no event under
@@ -438,7 +444,8 @@ the key minter; this spec owns the vault's fields and vocabulary.
   toward their cap (§5.2).
 - **A restore can't undo a statement.** The door keeps its own copy of every statement it has passed to a vault,
   and of every door grant row (§7.3), by vault id, apart from the vault. Statements include unfiled events holding an
-address suspended (§2.2) and vault records (§2.3). Statements only ever add: a newer event
+address suspended (§2.2), every event line 6 counted that disagrees on `to` or `under` (so a split address stays
+ended after a restore or a move), and vault records (§2.3). Statements only ever add: a newer event
   replaces an older, a revoke is final. So two sets merge safely. After any restore from a backup or import of an
   older export, before the vault serves a request, the door files its copy again, overwrites each door grant row
   with its current one, ends any door grant row it doesn't hold, and tells the vault its owner keys again. A grant
@@ -560,7 +567,7 @@ An agent is a key with a `by signer` grant. Its writes are *by* its person and *
 today.
 
 - **Its person signs for it.** The vault's owner signs for their agents. A member signs for theirs [lean, open
-  decision E], and only `by signer` grants: a member can't make a member or a service.
+  decision E], and only `by signer` grants: a member can't make a member or a service (line 8).
 - **It can never reach more than its person.** A member-signed grant names the member's own grant in its `under`
   field. Without one it is malformed; one that names a grant that isn't the signer's own is incoherent (line 8,
   `invalid_statement`). The member's key keeps its standing, so a newer event that changes `under` is held and
@@ -729,10 +736,10 @@ that the signed-in owner agreed.
 
 | When | Status and `error` |
 |---|---|
-| malformed event (any kind: tags that aren't lists of strings, a string that isn't well-formed Unicode or holds a control other than tab, line feed, carriage return, backspace or form feed, §2.2 line 1); tags other than exactly `d` and `expiration`, or tags that disagree with the content; content not in its canonical spelling; an unknown field, key or verb; over the size limits; no date, a date already past or more than 366 days out; incoherent verbs; a reserved or malformed prefix; `was` or a missing `under` on a member-signed grant, or an `under` that isn't the signer's own grant; a dot in a member's own id | 400 `invalid_statement` |
+| malformed event (any kind: tags that aren't lists of strings, a string that isn't well-formed Unicode or holds a control other than tab, line feed, carriage return, backspace or form feed, §2.2 line 1); tags other than exactly `d` and `expiration`, or tags that disagree with the content; content not in its canonical spelling; an unknown field, key or verb; over the size limits; no date, a date already past or more than 366 days out; incoherent verbs; a reserved or malformed prefix; `was` or a missing `under` on a member-signed grant, an `under` that isn't the signer's own grant, or a `to.by` other than `signer` on one; a dot in a member's own id | 400 `invalid_statement` |
 | the id or signature doesn't verify | 400 `bad_signature` |
 | it names another vault (`honors`), or isn't `at: parachute`, `gives: access`; a revoke for another vault | 400 `wrong_vault` |
-| the signer has no standing here; a member signing `self` or `names`; a revoke from a key that may not end that address; a claim from a key the link doesn't name | 403 `no_standing` |
+| the signer has no standing here; a revoke from a key that may not end that address; a claim from a key the link doesn't name | 403 `no_standing` |
 | the grantee already holds a grant in force here, or is an owner key (told to the owner; a member sees `exceeds_grantor`) | 409 `grantee_has_grant` |
 | any failure, told to a carrier who isn't the owner or the member who signed | 401, as for an unknown vault |
 | a member's grant reaches past the member's own | 403 `exceeds_grantor` |
@@ -788,7 +795,7 @@ things under `.parachute/`: stamps, history and links. 1.0 adds statements to th
 | The vault's id | kept on a move, new on a copy (§2.3) |
 | The vault's private key | **never.** The arriving door makes a new key pair. The owner's tap below also signs an override naming it; for an owner with no key, `tools/move` asks the leaving door for a handover record (§2.3). Until one of those is filed, the arriving vault serves but doesn't sign as itself. The leaving door deletes every private key it held for the vault |
 | The vault's records (kind 37443) | in `statements.jsonl` with every statement, so the arriving vault can still follow the key from the id |
-| Every statement, word for word: grants, revokes, links, claims, vault records, and the unfiled events that hold an address suspended | in `.parachute/statements.jsonl`, one signed event per line. Filed again and verified again on arrival, then merged with any copy the arriving door already keeps for that vault id (§3): its revokes apply; its grants don't come into force by themselves (below) |
+| Every statement, word for word: grants, revokes, links, claims, vault records, the unfiled events that hold an address suspended, and every event line 6 counted that disagrees on `to` or `under` | in `.parachute/statements.jsonl`, one signed event per line. Filed again and verified again on arrival, then merged with any copy the arriving door already keeps for that vault id (§3): its revokes apply; its grants don't come into force by themselves (below) |
 | The owner-key list and each prefix's service keys, with dates | for reading history only: so an old statement can still be checked. A carried key has no standing at the new door |
 | **Revokes** | **in force at once.** Carrying a revoke can only close. A carried revoke is judged against the carried owner-key list and its dates: if its signer had standing for that address when it was signed, it applies, though that key has no standing at the new door. The arriving door files the carried grants (as `carried`) before it judges the carried revokes, so a grantee's own giving-up and an early revoke find their address |
 | **Links and claims** | **in force at once.** They open nothing. |
@@ -994,3 +1001,14 @@ escapes pinned; well-formed Unicode; the size contract's ids). One re-check: **S
 (which form a control takes in the size) is applied and not reviewed again. Left for the security pass: whether
 1.0 says outright that no later version adds a key inside `to` (a key added there, or a `to` respelled, suspends the
 address for good: it fails closed).
+
+**Round 7 (T-462, 11-12): #systems' five follow-up questions.** #systems built round 6 and pinned the vectors
+(bf607e4). Answers, each the fewest rules that stays fail-closed: (1) line 6 counts every event seen at an address,
+older ones too, so events disagreeing on `to` or `under` end it in any arrival order, and they are carried so the
+ending survives a restore or a move; (2) a member's key keeps its standing, and an `under` that isn't theirs, or a
+`to.by` other than `signer`, is line 8 (`invalid_statement`), so a changed one is held and suspends; (3) every key
+and string a frozen read uses is read as JSON reads it; only `to` and `under` are compared raw; (4) a control
+character other than NIP-01's five in the event's own strings makes it malformed, so the id's serialisation can't
+differ; (5) a key grantee may give up a suspended or expired grant. A fresh adversarial Fable reviewer on these
+changes: **SHIP WITH FIXES**, 2 blocking (a split address's older event wasn't carried, so a restore revived it;
+`to.by` still read as standing) and 5 more, all fixed. ROUND7_RECHECK

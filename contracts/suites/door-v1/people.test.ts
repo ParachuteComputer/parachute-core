@@ -61,21 +61,20 @@ describe("a member", () => {
     expect(later.via).not.toBe(`grant:${g.grantId}`);
   });
 
-  red("can't make a member or a service (403 no_standing to the member who signed)", { reason: NO_GRANTS, lane: LANE }, async () => {
+  red("can't make a member or a service (400 invalid_statement to the member who signed)", { reason: NO_GRANTS, lane: LANE }, async () => {
     const recipe = await declareType("recipe");
     const mara = await newKey();
     const m = await granted({ to: mara, by: "self", types: { [recipe]: ["read", "create"] } });
     // Mara may sign for her own agent: the control, so the refusals below aren't "nothing is taken".
     await granted({ signer: mara, under: m.grantId, to: await newKey(), by: "signer", types: { [recipe]: ["read"] }, endsIn: HOUR }, { as: mara });
 
-    // A `by self` grant's id has no dot (§2.2 line 6), so the member's would-be member gets a dotless one: then the
-    // only thing wrong with it is the member's standing (line 3), not its shape.
+    // Her key has standing (line 3); a member-signed grant's `to.by` other than `signer` is incoherent (line 8), so
+    // a newer event changing it is held like any other (§5.2). The id is inside her own start, so line 6 passes.
     for (const by of ["self", { names: "portal.example" }] as const) {
       const friend = await newKey();
-      const id = by === "self" ? runId("friend") : undefined;
-      const r = await file(await grantEvent({ id, signer: mara, under: m.grantId, to: friend, by, types: { [recipe]: ["read"] }, endsIn: HOUR }), { as: mara });
-      expect(r.status, JSON.stringify(by)).toBe(403);
-      expect(r.body.error, JSON.stringify(by)).toBe("no_standing");
+      const r = await file(await grantEvent({ id: `${m.grantId}.${runId("f")}`, signer: mara, under: m.grantId, to: friend, by, types: { [recipe]: ["read"] }, endsIn: HOUR }), { as: mara });
+      expect(r.status, JSON.stringify(by)).toBe(400);
+      expect(r.body.error, JSON.stringify(by)).toBe("invalid_statement");
       expect((await tokenReply(friend)).status).toBe(401);
     }
   });
