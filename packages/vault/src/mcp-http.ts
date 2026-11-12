@@ -256,6 +256,8 @@ export async function handleMcp(
         violations?: unknown;
         error_type?: string;
         got?: unknown;
+        unused?: unknown;
+        fields?: unknown;
         hint?: string;
         path?: string;
         candidates?: unknown;
@@ -466,6 +468,9 @@ export async function handleMcp(
           // this backstop.
           ...(e.limit !== undefined ? { limit: e.limit } : {}),
           ...(e.got !== undefined ? { got: e.got } : {}),
+          // The indexed-field ceiling's refusal (0.9.2): what to prune first.
+          ...(e.unused !== undefined ? { unused: e.unused } : {}),
+          ...(e.fields !== undefined ? { fields: e.fields } : {}),
           ...(e.extension !== undefined ? { extension: e.extension } : {}),
           ...(e.how_to !== undefined ? { how_to: e.how_to } : {}),
           // read-attachment (Wave 2) refusal fields — same forward-when-present

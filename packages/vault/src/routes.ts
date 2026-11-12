@@ -72,7 +72,7 @@ import { findRetypeConflicts, retypeHint, type RetypeConflict } from "../core/sr
 import { MigrateRequestError, runMigrateRequest } from "../core/src/migrate-tag-field.ts";
 import * as linkOps from "../core/src/links.ts";
 import * as tagSchemaOps from "../core/src/tag-schemas.ts";
-import { IndexedFieldError } from "../core/src/indexed-fields.ts";
+import { IndexedFieldError, IndexedFieldLimitError } from "../core/src/indexed-fields.ts";
 import { buildVaultProjection, resolveTagInheritance } from "../core/src/vault-projection.ts";
 import {
   resolveTranscriptionCapability,
@@ -4296,6 +4296,14 @@ export async function handleTags(
         // caller's allowlist. No-op for unscoped callers and for the solo
         // own-field errors (no declarer_tags). Status/error_type unchanged.
         const scrubbed = scrubIndexedFieldConflictError(err, tagScope.allowed);
+        if (scrubbed instanceof IndexedFieldLimitError) {
+          // 0.9.2 ceiling: the vault's state refuses it, not the request's
+          // shape, so 409; `unused` is what to prune first.
+          return json(
+            { error: scrubbed.message, error_type: scrubbed.error_type, field: scrubbed.field, fields: scrubbed.fields, limit: scrubbed.limit, got: scrubbed.got, unused: scrubbed.unused },
+            409,
+          );
+        }
         return json(
           { error: scrubbed.message, error_type: "invalid_indexed_field" },
           400,
