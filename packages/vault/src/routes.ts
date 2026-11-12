@@ -187,7 +187,7 @@ import {
 } from "../core/src/expand.ts";
 import { join, extname, normalize } from "path";
 import { existsSync, mkdirSync, statSync, unlinkSync, writeFileSync } from "fs";
-import { assetsDir, readGlobalConfig, readVaultConfig } from "./config.ts";
+import { assetsDir, readGlobalConfig, readVaultConfig, servedDescription } from "./config.ts";
 import {
   NO_PROVIDER_ERROR,
   noProviderErrorFor,
@@ -4579,7 +4579,7 @@ function resolveAutoTranscribeEnabled(vaultConfig: VaultConfigLike): boolean {
 function vaultResponse(vaultConfig: VaultConfigLike): Record<string, unknown> {
   return {
     name: vaultConfig.name,
-    description: vaultConfig.description ?? null,
+    description: servedDescription(vaultConfig.name, vaultConfig.description) ?? null,
     config: {
       audio_retention: vaultConfig.audio_retention ?? "keep",
       auto_transcribe: {

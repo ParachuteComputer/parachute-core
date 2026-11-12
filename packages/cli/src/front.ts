@@ -212,6 +212,7 @@ export function frontHelp(): string {
     "  serve                         run in the foreground (units, containers, Prism)",
     "  start|stop|restart            the background service",
     "  upgrade [--rollback]          this program, or back to the release before",
+    "  config get|set|unset          the settings file, parachute.yaml (port, origin, vault descriptions)",
     "",
     "Safety",
     "  backup [now|list|schedule]    the vaults' backups",

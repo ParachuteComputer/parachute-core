@@ -1818,6 +1818,22 @@ export function readVaultConfig(name: string): VaultConfig | null {
   return null;
 }
 
+/**
+ * Settings the home's parachute.yaml gives a vault, set once at start-up by the program that reads that file
+ * (core's cli, packages/cli/src/parachute-yaml.ts). Only what a vault *serves* is overlaid (see
+ * `servedDescription`); vault.yaml is never rewritten from it.
+ */
+const servedOverrides = new Map<string, { description?: string }>();
+export function setVaultOverrides(overrides: Map<string, { description?: string }>): void {
+  servedOverrides.clear();
+  for (const [name, o] of overrides) servedOverrides.set(name, o);
+}
+
+/** The description a vault serves: parachute.yaml's if it sets one, else the stored one (vault.yaml). */
+export function servedDescription(name: string, stored: string | null | undefined): string | undefined {
+  return servedOverrides.get(name)?.description ?? stored ?? undefined;
+}
+
 export class UnreadablePrivateTagsError extends Error {
   constructor() {
     super("vault.yaml has an unreadable private_tags key; fix it by hand before editing this vault's config");
