@@ -1727,6 +1727,18 @@ A note over 2 MB cannot be updated while history is on (413
 whose content is unrecoverable. Reading that version returns `content:null`
 and `encoding:"overflow"`; restoring it is 409 `history_unrecoverable`.
 
+Edits in a burst make one version (`history.burst_window_seconds`, default 900,
+0 off): an update, append or prepend (a metadata-only change too) by the same
+writer through the same named key (the same `actor`, and the same `via` naming a
+key, `key:<name>` or `nostr:<pubkey>`) within 15 minutes of the note's newest
+version, which was also such an edit at the same path, captures nothing. Writes
+through a channel (`api`, `mcp`), the operator or a legacy token never do,
+since several writers can share one. The newest version keeps the
+body from before the burst, so a version read "as of" a moment inside a burst is
+late by at most one burst. A writer with no actor, a rename, a delete or restore,
+an import, and a newest version stamped in the future always capture. An
+oversized body is still refused inside a burst.
+
 The defaults are enabled, a 20-version floor, a 100-version ceiling and
 180-day maximum age above the floor. The ceiling is at least 1 and at least
 the floor; both age settings are capped at 36,500 days. Delete tombstones are exempt from this

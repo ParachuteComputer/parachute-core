@@ -76,10 +76,13 @@ describe("search", () => {
 });
 
 describe("history", () => {
+  // Two writers take turns: one named key's edits within 15 minutes make one version (T-460's burst rule, a
+  // Parachute that has it), so each change here comes from a different writer than the one before it.
   test("each change keeps the version before it, readable in full", async () => {
+    const other = rest(services().vaultViaHub, await pass({ level: "write" }));
     let note = (await api.post("/notes", { content: "first", path: `${runId("hist")}/n`, metadata: { v: 1 } })).body;
-    for (const [content, v] of [["second", 2], ["third", 3]] as const) {
-      note = (await api.patch(`/notes/${note.id}`, { content, metadata: { v }, if_updated_at: note.updatedAt })).body;
+    for (const [content, v, writer] of [["second", 2, other], ["third", 3, api]] as const) {
+      note = (await writer.patch(`/notes/${note.id}`, { content, metadata: { v }, if_updated_at: note.updatedAt })).body;
     }
     const list = await api.get(`/notes/${note.id}/versions`);
     expect(list.status).toBe(200);

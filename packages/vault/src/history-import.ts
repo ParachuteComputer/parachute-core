@@ -548,10 +548,19 @@ function privateBundle(archive: string, expected: string, dir: string): string {
   git(repo, ["fetch", "--no-tags", "--", copy, "+refs/*:refs/*"]);
   return repo;
 }
+/**
+ * The policy keys that decide what an import keeps. A manifest is checked against the vault's policy on these only,
+ * and only on those it carries: a release that adds a key (burst_window_seconds, T-460) or changes how compaction
+ * stores what is kept must not strand a run planned before it. `apply` itself always uses the manifest's policy.
+ */
+const RETENTION_KEYS = ["enabled", "min_versions", "max_versions", "max_age_days", "deleted_retention_days", "max_bytes_per_note"] as const;
+export function sameRetention(now: HistoryPolicy, planned: HistoryPolicy): boolean {
+  return RETENTION_KEYS.every((k) => !(k in planned) || canonicalJson(now[k]) === canonicalJson(planned[k]));
+}
 function readManifest(vault: string, path: string): ImportManifest {
   const m = JSON.parse(readFileSync(path, "utf8")) as ImportManifest;
   if (m.format !== 1 || m.kind !== "final" || m.vault !== vault || m.run_id !== digestManifest(m) || !m.archive || !m.archive_hash || !m.backup) throw new Error("A matching final manifest is required");
-  if (canonicalJson(resolveHistoryPolicy(readVaultConfig(vault)?.history)) !== canonicalJson(m.policy)) throw new Error("History policy differs from final manifest");
+  if (!sameRetention(resolveHistoryPolicy(readVaultConfig(vault)?.history), m.policy)) throw new Error("History policy differs from final manifest");
   const selections = m.selections == null ? null : normalizeHistorySelections(m.selections);
   // One canonical form: the default bound is written by leaving the field out.
   if (m.max_tree_entries !== undefined && treeEntryLimit(m.max_tree_entries) === MAX_OBJECTS) throw new Error("Manifest names the default tree-entry bound; a raised bound only");
