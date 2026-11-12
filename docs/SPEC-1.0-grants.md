@@ -1011,4 +1011,4 @@ and string a frozen read uses is read as JSON reads it; only `to` and `under` ar
 character other than NIP-01's five in the event's own strings makes it malformed, so the id's serialisation can't
 differ; (5) a key grantee may give up a suspended or expired grant. A fresh adversarial Fable reviewer on these
 changes: **SHIP WITH FIXES**, 2 blocking (a split address's older event wasn't carried, so a restore revived it;
-`to.by` still read as standing) and 5 more, all fixed. ROUND7_RECHECK
+`to.by` still read as standing) and 5 more, all fixed. One re-check: **SHIP**, all seven closed, nothing new opened. The vectors at bf607e4 still pin the four old answers; the precondition is met once #systems updates them.
