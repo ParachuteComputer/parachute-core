@@ -68,7 +68,10 @@ export function decodeVector(blob: Uint8Array): Float32Array {
 export const INT8_CODEC = "int8";
 export function encodeInt8(v: Float32Array): Uint8Array {
   let max = 0;
-  for (let i = 0; i < v.length; i++) max = Math.max(max, Math.abs(v[i]!));
+  for (let i = 0; i < v.length; i++) {
+    if (!Number.isFinite(v[i]!)) throw new RangeError("encodeInt8: a vector with a non-finite value");
+    max = Math.max(max, Math.abs(v[i]!));
+  }
   const scale = max > 0 ? max / 127 : 1;
   const out = new Uint8Array(4 + v.length);
   new DataView(out.buffer).setFloat32(0, scale, true);
@@ -86,9 +89,16 @@ export function decodeInt8(blob: Uint8Array | ArrayBuffer): Float32Array {
   for (let i = 0; i < q.length; i++) out[i] = q[i]! * scale;
   return out;
 }
-/** Decode a stored vector by the codec its row names: NULL is float32, `int8` is {@link encodeInt8}'s. */
-export function decodeStoredVector(blob: Uint8Array | ArrayBuffer, codec: string | null | undefined): Float32Array {
-  if (codec == null) return decodeVector(blob instanceof Uint8Array ? blob : new Uint8Array(blob));
-  if (codec === INT8_CODEC) return decodeInt8(blob);
-  throw new RangeError(`unknown vector codec: ${codec}`);
+/**
+ * Decode a stored vector by the codec its row names: NULL is float32, `int8` is {@link encodeInt8}'s. With `dims`
+ * (the row's own column), a vector of another length is refused: bytes that don't match their label are never
+ * scored.
+ */
+export function decodeStoredVector(blob: Uint8Array | ArrayBuffer, codec: string | null | undefined, dims?: number): Float32Array {
+  let v: Float32Array;
+  if (codec == null) v = decodeVector(blob instanceof Uint8Array ? blob : new Uint8Array(blob));
+  else if (codec === INT8_CODEC) v = decodeInt8(blob);
+  else throw new RangeError(`unknown vector codec: ${codec}`);
+  if (dims !== undefined && v.length !== dims) throw new RangeError(`a ${codec ?? "float32"} vector of ${v.length} values where the row says ${dims}`);
+  return v;
 }

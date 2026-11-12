@@ -390,10 +390,13 @@ export function sweepDeletedHistory(
   return transaction(db, () => {
     let versionsDeleted = 0;
     for (const v of victims) {
+      // A marked version is kept for good, past a deleted note's retention too (T-460); its note's other rows go.
       versionsDeleted += db
-        .prepare("DELETE FROM note_versions WHERE note_id = ?")
+        .prepare(`DELETE FROM note_versions WHERE note_id = ? AND NOT ${markedSql(db)}`)
         .run(v.note_id).changes;
-      db.prepare("DELETE FROM history_compact_state WHERE note_id=?").run(v.note_id);
+      if (!db.prepare("SELECT 1 FROM note_versions WHERE note_id = ? LIMIT 1").get(v.note_id))
+        db.prepare("DELETE FROM history_compact_state WHERE note_id=?").run(v.note_id);
+      else refreshCompactState(db, v.note_id);
     }
     return { notesSwept: victims.length, versionsDeleted, ...gcBlobs(db) };
   });

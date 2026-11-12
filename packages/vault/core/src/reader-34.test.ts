@@ -72,3 +72,53 @@ test("a marked version survives pruning and the byte ceiling once the marks colu
   expect(left()).not.toContain(9);
   expect((await store.getNoteVersion(n.id, 1))!.content!.startsWith("1 ")).toBe(true);
 });
+
+test("this release re-embedding over a row the newer release stored as int8 writes float32 and says so", async () => {
+  const { upsertNoteVector } = await import("./embedding/vectors.js");
+  const db = new Database(":memory:");
+  const store = new SqliteStore(db, { embeddingProvider: new Fake() });
+  db.exec("ALTER TABLE note_vectors ADD COLUMN codec TEXT");
+  const words = ["garden soil compost", "invoice payment due", "meeting notes plan"];
+  for (const [i, w] of words.entries()) {
+    const n = await store.createNote(`${w} ${i}`, { path: `n${i}` });
+    db.prepare(`INSERT INTO note_vectors (note_id, chunk_ix, vector, dims, model, content_hash, embedded_at, codec) VALUES (?, 0, ?, ?, 'fake-model', 'x', 'now', 'int8')`)
+      .run(n.id, encodeInt8(normalize(fakeVector(`${w} ${i}`))), DIMS);
+  }
+  const n0 = (db.prepare("SELECT id FROM notes WHERE path = 'n0'").get() as { id: string }).id;
+  upsertNoteVector(db, n0, { ix: 0, text: "garden soil compost 0" }, normalize(fakeVector("garden soil compost 0")), "fake-model", "y");
+  expect(db.prepare("SELECT codec, length(vector) AS len FROM note_vectors WHERE note_id = ?").get(n0)).toEqual({ codec: null, len: DIMS * 4 });
+  const r = await store.semanticSearch("garden soil", { limit: 3 });
+  expect(r.notes.filter((n) => n.score !== undefined).length).toBe(3);
+  expect(r.notes[0]!.path).toBe("n0");
+});
+
+test("a vector whose length doesn't match its row's dims is never scored: left out and counted pending", async () => {
+  const db = new Database(":memory:");
+  const store = new SqliteStore(db, { embeddingProvider: new Fake() });
+  db.exec("ALTER TABLE note_vectors ADD COLUMN codec TEXT");
+  for (const [i, w] of ["alpha beta", "gamma delta"].entries()) {
+    const n = await store.createNote(w, { path: `m${i}` });
+    // m1: float32 bytes labelled int8, the shape a mislabelled row would have.
+    const bytes = i === 0 ? encodeInt8(normalize(fakeVector(w))) : new Uint8Array(new Float32Array(normalize(fakeVector(w))).buffer);
+    db.prepare(`INSERT INTO note_vectors (note_id, chunk_ix, vector, dims, model, content_hash, embedded_at, codec) VALUES (?, 0, ?, ?, 'fake-model', 'x', 'now', 'int8')`).run(n.id, bytes, DIMS);
+  }
+  const r = await store.semanticSearch("alpha", { limit: 5 });
+  expect(r.notes.filter((n) => n.score !== undefined).map((n) => n.path)).toEqual(["m0"]);
+  expect(r.pendingCount).toBe(1);
+  expect(() => encodeInt8(new Float32Array([0.5, NaN]))).toThrow();
+});
+
+test("the deleted-history sweep keeps a marked version", async () => {
+  const { sweepDeletedHistory } = await import("./history.js");
+  const db = new Database(":memory:");
+  const store = new SqliteStore(db);
+  const n = await store.createNote("v0");
+  await store.updateNote(n.id, { content: "v1" });
+  await store.updateNote(n.id, { content: "v2" });
+  await store.deleteNote(n.id);
+  db.exec("ALTER TABLE note_versions ADD COLUMN marked_at TEXT; ALTER TABLE note_versions ADD COLUMN marked_by TEXT");
+  db.prepare("UPDATE note_versions SET marked_at = 'now' WHERE note_id = ? AND version_ix = 0").run(n.id);
+  sweepDeletedHistory(db, resolveHistoryPolicy({ deleted_retention_days: 1 }), new Date(Date.now() + 3 * 86_400_000));
+  expect((db.prepare("SELECT version_ix FROM note_versions WHERE note_id = ?").all(n.id) as { version_ix: number }[]).map((r) => r.version_ix)).toEqual([0]);
+  expect((await store.getNoteVersion(n.id, 0))!.content).toBe("v0");
+});

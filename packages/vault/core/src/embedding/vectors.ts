@@ -59,6 +59,19 @@ export function deleteObsoleteVectorRows(db: Database, noteId: string, obsoleteI
   );
 }
 
+const codecSeen = new WeakMap<Database, boolean>();
+/**
+ * Whether note_vectors has schema 34's `codec` column (a newer release's vault). This release writes float32, so a
+ * re-embed over a row the newer release wrote as int8 must reset its codec to NULL, or float32 bytes would be read as
+ * int8 (T-460).
+ */
+function hasCodecColumn(db: Database): boolean {
+  if (codecSeen.get(db)) return true;
+  const has = (db.prepare("SELECT name FROM pragma_table_info('note_vectors')").all() as { name: string }[]).some((c) => c.name === "codec");
+  if (has) codecSeen.set(db, true);
+  return has;
+}
+
 /**
  * Write (insert or replace) one chunk's embedded vector. Replace-by-PK
  * semantics — a re-embed (content changed, or the model changed)
@@ -82,7 +95,7 @@ export function upsertNoteVector(
        dims = excluded.dims,
        model = excluded.model,
        content_hash = excluded.content_hash,
-       embedded_at = excluded.embedded_at`,
+       embedded_at = excluded.embedded_at${hasCodecColumn(db) ? ",\n       codec = NULL" : ""}`,
   ).run(noteId, chunk.ix, encodeVector(vector), vector.length, model, contentHash, new Date().toISOString());
 }
 

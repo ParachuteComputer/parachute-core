@@ -2425,14 +2425,14 @@ export function semanticSearchNotes(
   // Pull every candidate's vector rows for the ACTIVE model, batched to
   // stay under the DO 100-bound-param cap (same chunking `fetchNotesByIdsOrdered`
   // uses). A note absent from this map has no fresh vector yet — pending.
-  const vecRowsByNote = new Map<string, { chunk_ix: number; vector: Uint8Array; codec?: string | null }[]>();
+  const vecRowsByNote = new Map<string, { chunk_ix: number; vector: Uint8Array; dims: number; codec?: string | null }[]>();
   // Schema 34 says per row which codec stored the vector (vector-codec.ts); before it every row is float32.
   const codecColumn = vectorCodecColumn(db) ? ", codec" : "";
   for (const idChunk of chunkForInClause(candidateIds)) {
     const placeholders = idChunk.map(() => "?").join(", ");
     const rows = db.prepare(
-      `SELECT note_id, chunk_ix, vector${codecColumn} FROM note_vectors WHERE model = ? AND note_id IN (${placeholders})`,
-    ).all(model, ...idChunk) as { note_id: string; chunk_ix: number; vector: Uint8Array; codec?: string | null }[];
+      `SELECT note_id, chunk_ix, vector, dims${codecColumn} FROM note_vectors WHERE model = ? AND note_id IN (${placeholders})`,
+    ).all(model, ...idChunk) as { note_id: string; chunk_ix: number; vector: Uint8Array; dims: number; codec?: string | null }[];
     for (const row of rows) {
       let list = vecRowsByNote.get(row.note_id);
       if (!list) {
@@ -2451,17 +2451,19 @@ export function semanticSearchNotes(
     const rows = vecRowsByNote.get(id);
     if (!rows || rows.length === 0) continue;
     let best = -Infinity;
+    let readable = false;
     for (const row of rows) {
       let vector: Float32Array;
       try {
-        vector = decodeStoredVector(row.vector, row.codec);
+        vector = decodeStoredVector(row.vector, row.codec, row.dims);
       } catch {
         continue; // a codec this engine doesn't know, or a damaged row: that chunk is left out, not the search
       }
+      readable = true;
       const score = dot(vector, queryVector);
       if (score > best) best = score;
     }
-    if (best === -Infinity) continue; // no chunk of it could be read: unscored, like a note not embedded yet
+    if (!readable) continue; // no chunk of it could be read: counted as pending below, like a note not embedded yet
     scored.push({ id, score: best });
   }
   scored.sort((a, b) => b.score - a.score);
@@ -2482,7 +2484,7 @@ export function semanticSearchNotes(
 
   return {
     notes,
-    pendingCount: candidateIds.length - vecRowsByNote.size,
+    pendingCount: candidateIds.length - scored.length,
     totalCandidates: candidateIds.length,
   };
 }
