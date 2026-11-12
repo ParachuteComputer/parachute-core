@@ -3,9 +3,13 @@
 The 0.8 line ships from `release/0.8` (RELEASING.md). Each section says what changed since the one below it, for
 someone running Parachute. Pull request numbers are in brackets.
 
-## 0.8.0-pre.4 (the code 0.8.0 ships)
+## 0.8.0
 
-0.8.0 is this prerelease with the suffix dropped: the same code, only the version lines and these notes change.
+The first stable 0.8: 0.8.0-pre.4 with the suffix dropped. The same code; only the version lines and these notes
+changed. npm's `latest` moves from 0.8.0-pre.1 to 0.8.0, so a plain `npm i -g @openparachute/core` (or
+`bun add -g`) gets it.
+
+## 0.8.0-pre.4
 
 **Semantic search works from a fresh install.**
 - The bundle carries the embedding stack for its own platform (`@huggingface/transformers`, `onnxruntime-node`,
