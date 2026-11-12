@@ -90,10 +90,11 @@ describe("a member", () => {
     await granted({ signer: mara, under: m.grantId, to: await newKey(), by: "signer", types: { [recipe]: ["read"] }, endsIn: HOUR }, { as: mara });
 
     // No `under` (the id still starts with hers, so only the missing tag is wrong): a malformed grant (§2.1, required
-    // there). `under` naming Bo's grant: Mara has no standing to hang a grant from his.
+    // there). `under` naming Bo's grant: incoherent (§2.2 line 8). Mara's key keeps its standing (line 3), so such an
+    // event can still be held (§5.2).
     const cases = [
       { why: "no under", under: undefined, status: 400, error: "invalid_statement" },
-      { why: "under Bo's grant", under: b.grantId, status: 403, error: "no_standing" },
+      { why: "under Bo's grant", under: b.grantId, status: 400, error: "invalid_statement" },
     ];
     for (const c of cases) {
       const agent = await newKey();
@@ -109,6 +110,28 @@ describe("a member", () => {
     expect(r.status).toBe(400);
     expect(r.body.error).toBe("invalid_statement");
     expect((await tokenReply(agent)).status).toBe(401);
+  });
+
+  red("a newer event that changes a member's `under` leaves nothing in force at the address", { reason: NO_GRANTS, lane: LANE }, async () => {
+    const recipe = await declareType("recipe");
+    const soup = await owner.make({ types: [recipe], body: "soup" });
+    const mara = await newKey();
+    const m = await granted({ to: mara, by: "self", types: { [recipe]: ["read", "create"] } });
+    const m2 = await granted({ to: await newKey(), by: "self", types: { [recipe]: ["read"] } });
+    const agent = await newKey();
+    const a = await granted({ signer: mara, under: m.grantId, to: agent, by: "signer", types: { [recipe]: ["read"] }, endsIn: HOUR }, { as: mara });
+    const bearer = await tokenAs(agent);
+    expect((await records({ bearer }).get(soup.body.id)).status).toBe(200);
+    // Mara signs a newer event at her agent's address hanging from another grant (§2.2 line 6, §5.2): refused, and
+    // because her key has standing it is held and suspends the address, rather than leaving the older grant in force.
+    const moved = await grantEvent({ id: a.grantId, signer: mara, under: m2.grantId, to: agent, by: "signer", types: { [recipe]: ["read"] }, endsIn: HOUR, created_at: a.created_at + 1 });
+    const r = await file(moved, { as: mara });
+    expect(r.status).toBe(409);
+    expect(r.body.error).toBe("id_taken");
+    expect((await grantRow(a.grantId))?.state).toBe("suspended");
+    const after = await records({ bearer }).get(soup.body.id);
+    expect(after.status).toBe(401);
+    expect(after.body.error).toBe("grant_ended");
   });
 
   red("ids: a member's start with their grant's id and a dot, and nobody else may use that start", { reason: NO_GRANTS, lane: LANE }, async () => {
