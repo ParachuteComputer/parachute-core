@@ -1,4 +1,5 @@
 import { SEARCH_MODES } from "./search-query.js";
+import { HYBRID_TEXT } from "./hybrid.js";
 import { MIN_CONTENT_LENGTH } from "./content-range-constants.js";
 import { MAX_TICKET_UPLOAD_BYTES } from "./attachment/tickets.js";
 import { SHORT_TOOLS } from "./mcp-short.js";
@@ -158,13 +159,13 @@ Response shape (vault#550 — three variants, pick by what you passed):
           search: {
             type: "string",
             description:
-              'Full-text search query, matched against a note\'s title (path), its content and its field values — a title match ranks far above a passing body mention, and a field-only match comes after title and body matches. Literal-by-default (vault#551): your text is escaped and phrase-quoted before reaching FTS5, so punctuation ("didn\'t", "eleven-day", "18.6") is matched as literal content rather than parsed as FTS5 query syntax. Pass `search_mode: "advanced"` for raw FTS5 syntax (boolean/phrase/prefix operators). `sort` is honored under search (see below) — default is relevance ranking. Matching stems regular affixes ("firefighter"/"firefighters") but not irregular plurals ("wolf"/"wolves"). Results carry a `score` field (higher = more relevant, relative within this result set only). A zero-result search may carry a `search_did_you_mean` warning (unscoped sessions only).',
+              'Full-text search query, matched against a note\'s title (path), its content and its field values — a title match ranks far above a passing body mention, and a field-only match comes after title and body matches. (vault#551): your text is escaped and phrase-quoted before reaching FTS5, so punctuation ("didn\'t", "eleven-day", "18.6") is matched as literal content rather than parsed as FTS5 query syntax. Pass `search_mode: "advanced"` for raw FTS5 syntax (boolean/phrase/prefix operators). `sort` is honored under a literal or advanced search (see below) — default is relevance ranking. ' + HYBRID_TEXT.refSearch + '. Matching stems regular affixes ("firefighter"/"firefighters") but not irregular plurals ("wolf"/"wolves"). Results carry a `score` field (higher = more relevant, relative within this result set only). A zero-result search may carry a `search_did_you_mean` warning (unscoped sessions only).',
           },
           search_mode: {
             type: "string",
             enum: [...SEARCH_MODES],
             description:
-              'How `search` text is turned into an FTS5 query (vault#551). "literal" (DEFAULT): escape + phrase-quote the text so punctuation is literal content, not FTS5 syntax — the fix for `search: "didn\'t"` / "eleven-day" / "18.6" silently returning `[]`. "advanced": pass the text through to FTS5 raw, for callers who want boolean (AND/OR/NOT), manual phrase quoting, or prefix (`*`) syntax — a malformed advanced query throws a structured error (`error_type: "invalid_search_syntax"`) instead of silently returning `[]`. Has no effect without `search` (an `ignored_param` warning fires if you pass it without `search`). Omit for the default ("literal").',
+              'How `search` text is turned into an FTS5 query (vault#551). "literal": escape + phrase-quote the text so punctuation is literal content, not FTS5 syntax — the fix for `search: "didn\'t"` / "eleven-day" / "18.6" silently returning `[]`. "advanced": pass the text through to FTS5 raw, for callers who want boolean (AND/OR/NOT), manual phrase quoting, or prefix (`*`) syntax — a malformed advanced query throws a structured error (`error_type: "invalid_search_syntax"`) instead of silently returning `[]`. ' + HYBRID_TEXT.refMode,
           },
           near_text: {
             type: "string",

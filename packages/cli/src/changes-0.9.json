@@ -771,7 +771,7 @@
   {
    "kind": "mcp-tool",
    "old": "query-notes {created_by, created_via, exclude_tag, excludeTags, exclude_path_prefix, excludePathPrefix, expand, expand_depth, expand_links, expand_mode, extension, has_ambiguous_links, has_broken_links, has_links, has_tags, include_ambiguous_links, include_broken_links, include_link_count, last_updated_by, last_updated_via, link_count_direction, near_text, order_by, search_mode, semantic} (parameters listed in tools/list)",
-   "new": "the same parameters on query-notes and query-records, listed by vault-info {help: \"query-notes\"} instead of tools/list",
+   "new": "the same parameters on query-notes and query-records, listed by vault-info {help: \"query-notes\"} instead of tools/list (search_mode is in the short list again since 0.9.3: it carries \"hybrid\")",
    "action": "keep",
    "reason": "0.9's tool list is short (the description budget: query-records under 1,500 tokens, contracts/suites/mcp/budget.test.ts), so these rarer parameters left it. Each is still accepted and honoured, as on 0.8 (contracts/suites/mcp/old-params.test.ts); vault-info {help} lists them; a connector made on 0.8 keeps its own list; the short description names the commonest ones and where to find the rest",
    "since": "0.9",

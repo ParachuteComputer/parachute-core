@@ -22,6 +22,7 @@ import {
   type QueryWarning,
 } from "./query-warnings.js";
 import { SEARCH_MODES, buildLiteralSearchQuery, isValidSearchMode, type SearchMode } from "./search-query.js";
+import { anyTermsQuery, HYBRID_AUTO_DEFAULT, HYBRID_TEXT, isQuestionShaped } from "./hybrid.js";
 import * as linkOps from "./links.js";
 import {
   resolveOrQueueLink,
@@ -600,6 +601,8 @@ export interface GenerateMcpToolsOpts {
    * (fix 8, see `searchNotes`). Omitted (unscoped) → the plain FTS path.
    */
   searchVisibility?: (note: Note) => boolean;
+  /** Test seam for the "auto" default; production passes nothing and `HYBRID_AUTO_DEFAULT` (core/src/hybrid.ts) decides. */
+  hybridAuto?: boolean;
   /**
    * `ambiguityVisible` (vault#581 auth review) is an OPTIONAL per-note
    * predicate gating everything the ambiguous-links surface discloses.
@@ -1112,7 +1115,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
                 error_type: "invalid_query",
                 field: "search_mode",
                 got: params.search_mode,
-                hint: `pass "literal" or "advanced", or omit for the default ("literal")`,
+                hint: HYBRID_TEXT.hint,
               },
             );
           }
@@ -1180,7 +1183,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           const tags = normalizeTags(params.tag);
           const excludeTagsRaw = params.exclude_tags ?? params.excludeTags ?? params.exclude_tag;
           const excludeTags = normalizeTags(excludeTagsRaw);
-          const semanticOpts: QueryOpts = {
+          const semanticOpts: QueryOpts & { visible?: (note: Note) => boolean } = {
             tags,
             tagMatch: (params.tag_match as "all" | "any") ?? (tags && tags.length > 1 ? "any" : undefined),
             expand,
@@ -1207,6 +1210,9 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
               | { field?: string; from?: string; to?: string }
               | undefined,
             limit: (params.limit as number) ?? 50,
+            // A tag-scoped session ranks over the notes it can see, so its page is full (0.9.3: this used to be
+            // filtered after the limit, by the wrapper in src/mcp-tools.ts).
+            ...(searchVisibility ? { visible: searchVisibility } : {}),
           };
           // Uncaught on purpose: `semantic_unavailable` (no/not-ready
           // provider) propagates to src/mcp-http.ts's QueryError → JSON-RPC
@@ -1247,7 +1253,10 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           // be a syntax error (or a meaningless always-empty query)
           // depending on exactly how it degenerates, so this is checked
           // here rather than left to the DB layer to (maybe) reject.
-          if (mode === "literal" && buildLiteralSearchQuery(params.search as string).isEmpty) {
+          if (
+            (mode === "literal" && buildLiteralSearchQuery(params.search as string).isEmpty) ||
+            (mode === "hybrid" && anyTermsQuery(params.search as string) === "") // blank or stopwords only: nothing to rank on
+          ) {
             results = [];
             queryWarnings.push(emptySearchWarning());
           } else {
@@ -1265,7 +1274,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             // expand/mode/sort reached searchNotes, so exclude_tags and
             // date_from were silently dropped (a well-formed result set
             // answering a different question).
-            results = await store.searchNotes(params.search as string, {
+            const searchOpts = {
               tags,
               tagMatch: (params.tag_match as "all" | "any") ?? (tags && tags.length > 1 ? "any" : undefined),
               expand,
@@ -1293,7 +1302,64 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
               mode,
               sort: params.sort as "asc" | "desc" | undefined,
               ...(searchVisibility ? { visible: searchVisibility } : {}),
-            });
+            };
+            // T-461: keyword + meaning, fused by rank (core/src/hybrid.ts). Same filters and default limit as
+            // `search`; sort and mode don't apply to the fused page. `visible` (a tag-scoped session) does: both arms
+            // run under it before they rank and limit.
+            const runHybrid = () => {
+              const { mode: _m, sort: _s, ...hybridOpts } = searchOpts;
+              return store.hybridSearch!(params.search as string, hybridOpts);
+            };
+            if (mode === "hybrid") {
+              if (!store.hybridSearch) {
+                throw new QueryError('search_mode "hybrid" isn\'t supported by this vault\'s store; use "literal".', "INVALID_QUERY", {
+                  error_type: "invalid_query",
+                  field: "search_mode",
+                  hint: 'pass search_mode: "literal"',
+                });
+              }
+              if (params.sort !== undefined) {
+                queryWarnings.push(ignoredParamWarning("sort", 'search_mode "hybrid" ranks by relevance; pass search_mode "literal" to sort by date'));
+              }
+              const h = await runHybrid();
+              results = h.notes;
+              if (h.meaning === "unavailable") {
+                queryWarnings.push({
+                  code: "semantic_unavailable",
+                  message: `hybrid search ranked by keyword only: ${h.meaningReason ?? "no embedding provider"}`,
+                });
+              } else if (h.pendingCount > 0) {
+                queryWarnings.push(embeddingsPendingWarning(h.pendingCount, h.totalCandidates));
+              }
+            } else {
+              // T-461 (0.9.3 default, "auto"): a search that reads as a question in plain words (4+ words, 2+ content
+              // words), on a vault with meaning search, is answered by hybrid, and says so (`search_auto`), but only while
+              // HYBRID_AUTO_DEFAULT is on (off until Aaron's yes). Measured on
+              // a real 10k-note vault: +0.23 nDCG@10 over literal on 40 recall questions, 27 wins, 2 losses. Shorter
+              // searches (ids, URLs, codes, titles, names) stay literal, so exact lookups and existence checks are
+              // unchanged; `search_mode: "literal"` keeps today's answer for any search. If the meaning arm can't
+              // answer (provider not ready), the literal answer is used. Not with `sort`. A tag-scoped session gets it too: both arms run under its `visible`.
+              const auto =
+                (opts?.hybridAuto ?? HYBRID_AUTO_DEFAULT) &&
+                searchMode === undefined &&
+                store.hybridSearch &&
+                store.hasMeaningSearch?.() &&
+                params.sort === undefined &&
+                isQuestionShaped(params.search as string)
+                  ? await runHybrid()
+                  : undefined;
+              if (auto?.meaning === "ok") {
+                results = auto.notes;
+                queryWarnings.push({
+                  code: "search_auto",
+                  message:
+                    'This search reads as a question, so it is ranked by keyword and meaning together (search_mode "hybrid"; see matched_by). Pass search_mode: "literal" for notes holding every word.',
+                });
+                if (auto.pendingCount > 0) queryWarnings.push(embeddingsPendingWarning(auto.pendingCount, auto.totalCandidates));
+              } else {
+                results = await store.searchNotes(params.search as string, searchOpts);
+              }
+            }
             queryWarnings.push(
               ...collectScanWarnings(db, {
                 metadata: params.metadata as Record<string, unknown> | undefined,

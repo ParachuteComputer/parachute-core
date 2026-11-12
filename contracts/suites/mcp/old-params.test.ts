@@ -17,6 +17,9 @@ const QUERY = [
   "has_tags", "include_ambiguous_links", "include_broken_links", "include_link_count", "last_updated_by",
   "last_updated_via", "link_count_direction", "near_text", "order_by", "search_mode", "semantic",
 ];
+// Back in the short list on purpose (0.9.3 hybrid search: `search_mode` carries "hybrid"). Still checked in the full
+// reference and for being honoured; just not required to be absent from tools/list.
+const LISTED_AGAIN = ["search_mode"];
 const DOCTOR = ["history_after", "history_max_blobs", "history_budget_ms"];
 // The twelve more (#82): 0.8 listed them on the write tools, and the review of #81 found no row and no test for them.
 const WRITE_TOOLS: Record<string, string[]> = {
@@ -43,7 +46,7 @@ describe("mcp/old-params", () => {
       expect(Object.keys(help.parameters.properties)).toEqual(expect.arrayContaining([...params]));
       // If one comes back into the short list, this row of changes-0.9.json is out of date: update both.
       expect(listed[tool]).toBeDefined();
-      expect(params.filter((p) => listed[tool]!.includes(p))).toEqual([]);
+      expect(params.filter((p) => !LISTED_AGAIN.includes(p) && listed[tool]!.includes(p))).toEqual([]);
     }
     await c.close();
   });
