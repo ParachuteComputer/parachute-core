@@ -38,7 +38,7 @@
 // are refused with managed_by_host, exit 2 (managed.ts, PLAN §3).
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { SCHEMA_VERSION } from "@openparachute/vault/core/src/schema.ts";
+import { READABLE_SCHEMA_VERSION, SCHEMA_VERSION } from "@openparachute/vault/core/src/schema.ts";
 import core from "../../../package.json" with { type: "json" };
 import { homeDir, newerData, repairModes } from "./home.ts";
 import type { Notice } from "./front.ts";
@@ -188,7 +188,7 @@ export async function dispatch(role: Role, notice?: Notice): Promise<void> {
   const name = role === "core" ? "parachute-core" : role === "hub" ? "parachute" : "parachute-vault";
   /** The newer-data check: the exit code to stop with (having said why), or null. Run again under the release lock. */
   const newerCheck = (): number | null => {
-    const { newer, unchecked } = newerData(home, { hub: HUB_SCHEMA_VERSION, vault: SCHEMA_VERSION });
+    const { newer, unchecked } = newerData(home, { hub: HUB_SCHEMA_VERSION, vault: READABLE_SCHEMA_VERSION });
     if (newer.length > 0) {
       console.error(`${name}: this home was written by a newer Parachute (${core.name} ${core.version} here):`);
       for (const line of newer) console.error(`  ${line}`);

@@ -9,6 +9,13 @@ import { rebuildCompactState } from "./history-compact-state.js";
 import { recordTagKinds } from "./tag-kind.js";
 
 export const SCHEMA_VERSION = 32;
+/**
+ * The newest schema this engine can open (T-460). Above SCHEMA_VERSION only for a schema whose new data this engine
+ * already reads: 33 stores version bodies compressed (blob-codec.ts), which this engine reads but doesn't write. So
+ * rolling back from the engine that writes 33 to this one still opens and reads every vault. Such a vault is opened
+ * as it is: no migration runs and no older stamp is written over it.
+ */
+export const READABLE_SCHEMA_VERSION = 33;
 
 function migrateToV32(db: Database): void {
     const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='history_compact_state'").get();
@@ -665,11 +672,16 @@ export class NewerSchemaError extends Error {
   }
 }
 
-/** Throw NewerSchemaError if the database records a schema newer than SCHEMA_VERSION. Reads only. */
+/** Throw NewerSchemaError if the database records a schema newer than READABLE_SCHEMA_VERSION. Reads only. */
 export function assertNotNewer(db: Database): void {
-  if (!hasTable(db, "schema_version")) return;
+  const v = highestStamp(db);
+  if (v !== null && v > READABLE_SCHEMA_VERSION) throw new NewerSchemaError(v, READABLE_SCHEMA_VERSION);
+}
+
+function highestStamp(db: Database): number | null {
+  if (!hasTable(db, "schema_version")) return null;
   const row = db.prepare("SELECT MAX(version) AS v FROM schema_version").get() as { v: number | null } | null;
-  if (row?.v != null && row.v > SCHEMA_VERSION) throw new NewerSchemaError(row.v);
+  return row?.v ?? null;
 }
 
 /**
@@ -710,6 +722,13 @@ export function initSchema(db: Database): void {
   // last, so an open that stopped part way runs everything again. The steps that came without a version bump are
   // checked too (unnumberedStepsDone): an engine of the same SCHEMA_VERSION from before one of them, or a rollback
   // to one, stamps the vault current without making it.
+  // A vault a newer engine brought past SCHEMA_VERSION, to a schema this engine reads (READABLE_SCHEMA_VERSION):
+  // that engine ran every step below already. Open it as it is, and never stamp it back to an older version.
+  const highest = highestStamp(db);
+  if (highest !== null && highest > SCHEMA_VERSION) {
+    rebuildIndexes(db);
+    return;
+  }
   if (latestStamp(db) === SCHEMA_VERSION && unnumberedStepsDone(db)) {
     // Still heal declared indexed fields (a column or index missing after a restore): a few catalog reads, no
     // writes when nothing is missing.

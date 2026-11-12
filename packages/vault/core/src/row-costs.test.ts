@@ -226,8 +226,8 @@ describe("v5 and v18 against each state of the path indexes", () => {
 /** sha256 of SCHEMA_SQL as of SCHEMA_VERSION 32 with T-412 (idx_notes_path left out of it) and 0.9's `kind` on tags, 0.9.1's `via_kind` on revisions. */
 const SCHEMA_SQL_HASH_AT_32 = "ade9b08b66e61a3975f03b23b80466122607f4ca715821bcda17b3c8563e2dc7";
 
-/** sha256 of initSchema's code and its fast-path check (comments and spacing left out) as of SCHEMA_VERSION 32 with T-412, 0.9's ensureTagKinds and 0.9.1's ensureRevisionKeyKind. */
-const INIT_SCHEMA_HASH_AT_32 = "7e431f947b227dec2bdfb76dfa0612d755aad717bc5184476f4d702cc588f92b";
+/** sha256 of initSchema's code and its fast-path check (comments and spacing left out) as of SCHEMA_VERSION 32 with T-412, 0.9's ensureTagKinds and 0.9.1's ensureRevisionKeyKind, and T-460's open-as-is of a newer readable schema. */
+const INIT_SCHEMA_HASH_AT_32 = "21e0f38254abb09bfdb2b7a2d20249f66bdc172a9730e3ba55004e40579a6738";
 
 describe("the fast path's promise", () => {
   // initSchema skips SCHEMA_SQL and every migration on a vault stamped SCHEMA_VERSION (with the path index). So a
