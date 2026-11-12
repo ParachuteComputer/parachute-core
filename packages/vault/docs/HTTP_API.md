@@ -592,7 +592,7 @@ is rewritten for this specific pattern instead of forwarding it verbatim:
   "error_type": "invalid_search_syntax",
   "field": "search",
   "got": "-espresso",
-  "hint": "FTS5 read part of this query as column-filter syntax (\"column:term\") or as a leading \"-\" with no term to its left — NOT/\"-\" is a BINARY operator in FTS5 (\"good -bad\", not \"-bad\" alone). Indexed columns are \"path\" and \"content\". Add a preceding positive term before a NOT, quote the phrase to search it literally, or use search_mode:\"literal\" (the default) to skip advanced syntax entirely."
+  "hint": "FTS5 read part of this query as column-filter syntax (\"column:term\") or as a leading \"-\" with no term to its left — NOT/\"-\" is a BINARY operator in FTS5 (\"good -bad\", not \"-bad\" alone). Indexed columns are \"path\", \"content\" and \"fields\". Add a preceding positive term before a NOT, quote the phrase to search it literally, or use search_mode:\"literal\" (the default) to skip advanced syntax entirely."
 }
 ```
 
@@ -1201,6 +1201,12 @@ Query params:
     note that merely references it once in passing body text. This is the
     fix for a repeatedly-observed harness finding: a clearly-on-topic
     dedicated note buried at position #3–4 behind incidental mentions.
+  - **Field values are searched too (0.9.3).** `search=` also matches the text
+    of a note's metadata values (strings as they are, booleans as the words true/false, numbers as
+    text, lists and nested objects by their leaves; field names and nulls are
+    left out). They sit in a third indexed column, `fields`, below the body:
+    a note found only through a field value comes after every note found in
+    its title or body. An edit that changes only metadata re-indexes at once.
   - **`score` field.** Every search result (`Note` or `NoteIndex` — carried
     onto the lean shape too, since search's default response IS
     `NoteIndex[]`) now carries a `score: number`. Higher is more relevant;

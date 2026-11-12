@@ -74,7 +74,7 @@ export interface Note {
    * ONLY present on results from `search=`/`query-notes{search}` — every
    * other read path (structured `queryNotes`, `getNoteById`, ...) leaves
    * this `undefined`. Higher is more relevant — the sign-flipped weighted
-   * `bm25(notes_fts, SEARCH_WEIGHT_PATH, SEARCH_WEIGHT_CONTENT)` value (raw
+   * `bm25(notes_fts, SEARCH_BM25_WEIGHTS)` value (raw
    * SQLite bm25 is negative-is-better; flipped here so external callers get
    * the more intuitive "bigger number wins" convention). Meaningful only
    * for RELATIVE comparison within one result set — the absolute magnitude
