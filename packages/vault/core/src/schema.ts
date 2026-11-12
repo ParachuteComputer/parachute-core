@@ -8,36 +8,33 @@ import { ensureRelationshipColumn } from "./wikilinks.js";
 import { rebuildCompactState } from "./history-compact-state.js";
 import { recordTagKinds } from "./tag-kind.js";
 
-export const SCHEMA_VERSION = 33;
+export const SCHEMA_VERSION = 32;
 /**
  * The newest schema this engine can open (T-460). Above SCHEMA_VERSION only for a schema whose new data this engine
  * already reads, so a rollback to it still opens and reads every vault; such a vault is opened as it is: no
- * migration runs and no older stamp is written over it. The engine before this one read 33 (compressed version
- * bodies, blob-codec.ts) without writing it; this one writes it.
+ * migration runs and no older stamp is written over it. (T-460 writes compressed version bodies without a schema
+ * number: see ensureCompactHintsLegacy.)
  */
 export const READABLE_SCHEMA_VERSION = 33;
 
 /**
- * v33 (T-460): version bodies are written compressed (blob-codec.ts) and compaction is always on. The compaction
- * hints gain `legacy` (blobs stored the old way, which the maintenance pass re-encodes). Rebuilt here, which also clears every `refused`: an earlier
- * refusal under the old rules must not hide a note from the new ones. Schema 33's data is readable by the engine
- * before this one (READABLE_SCHEMA_VERSION there), so a rollback still reads it.
- */
-/**
- * Whether the compaction hints have v33's `legacy` column. The engine before v33 rebuilds the table without it (its
- * `history rebuild-state`) and leaves the stamp at 33, so a re-upgrade must look, not trust the stamp.
+ * Whether the compaction hints have T-460's `legacy` column (blobs stored the old way, which the maintenance pass
+ * re-encodes). An older engine rebuilds the table without it (its `history rebuild-state`), so every open looks.
  */
 function compactHintsCurrent(db: Database): boolean {
   return !hasTable(db, "history_compact_state") || hasColumn(db, "history_compact_state", "legacy");
 }
 
-function migrateToV33(db: Database): void {
-  const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='history_compact_state'").get();
-  const previous = latestStamp(db);
-  // As in v32: no ledger rows are not evidence of an older writer, but a table without the new columns needs them.
-  if (exists && (previous === null || previous >= 33) && hasColumn(db, "history_compact_state", "legacy")) return;
-  if (!hasTable(db, "note_versions")) return;
-  rebuildCompactState(db);
+/**
+ * T-460: version bodies are written compressed (blob-codec.ts) and compaction is always on; the hints gain `legacy`.
+ * An un-numbered step, deliberately, not a schema bump: every older engine still opens the vault and serves every
+ * note (the 0.8 code-only rollback and the 0.7 takeover's rollback keep working). It never misreads a compressed
+ * version either: it refuses an encoding it doesn't know (409 history_unrecoverable) and checks every body's hash, so
+ * those versions wait, unchanged, for the next upgrade. The rebuild also clears every `refused`, so an earlier refusal
+ * under the old rules doesn't hide a note from the new ones.
+ */
+function ensureCompactHintsLegacy(db: Database): void {
+  if (hasTable(db, "note_versions") && !compactHintsCurrent(db)) rebuildCompactState(db);
 }
 
 function migrateToV32(db: Database): void {
@@ -263,7 +260,7 @@ CREATE INDEX IF NOT EXISTS idx_note_vectors_stale ON note_vectors(model, content
 -- note_blobs.encoding IS NULL  -> \`content\` is the literal body, \`byte_size\`
 --   is its UTF-8 byte length, and \`hash\` = sha256(content). This is every row
 --   v29 ever wrote.
--- note_blobs.encoding = 'deflate' (v33) -> \`content\` is a BLOB, the UTF-8 body
+-- note_blobs.encoding = 'deflate' (T-460) -> \`content\` is a BLOB, the UTF-8 body
 --   compressed with raw deflate; \`byte_size\` is the stored (compressed) length.
 --   Whole, like NULL: it may be a delta's base.
 -- note_blobs.encoding = 'fossil-delta' -> \`content\` is the BASE64 of a Fossil
@@ -275,7 +272,7 @@ CREATE INDEX IF NOT EXISTS idx_note_vectors_stale ON note_vectors(model, content
 --   The LOGICAL byte length is note_versions.content_len, which PR 1
 --   denormalised for exactly this moment (PR 1 §2.1: "it must stay readable
 --   after PR 2 deltifies the blob").
--- note_blobs.encoding = 'fossil-delta-z' (v33) -> \`content\` is a BLOB, the raw
+-- note_blobs.encoding = 'fossil-delta-z' (T-460) -> \`content\` is a BLOB, the raw
 --   Fossil delta bytes compressed with raw deflate; otherwise as 'fossil-delta'.
 --   blob-codec.ts reads all four.
 -- ANY OTHER \`encoding\` VALUE IS CORRUPTION. It is not a future format marker to
@@ -736,7 +733,8 @@ export function unnumberedStepsDone(db: Database): boolean {
   return (
     hasIndex(db, "idx_notes_path_nocase") && // ensurePathNocaseIndex (T-412)
     hasColumn(db, "tags", "kind") && // ensureTagKinds (T-318 §8a, 0.9)
-    (!hasTable(db, "note_versions") || hasColumn(db, "note_versions", "via_kind")) // ensureRevisionKeyKind (0.9.1)
+    (!hasTable(db, "note_versions") || hasColumn(db, "note_versions", "via_kind")) && // ensureRevisionKeyKind (0.9.1)
+    compactHintsCurrent(db) // ensureCompactHintsLegacy (T-460)
   );
 }
 
@@ -761,11 +759,12 @@ export function initSchema(db: Database): void {
       ensureTagKinds(db);
       ensurePathNocaseIndex(db);
       ensureRevisionKeyKind(db);
+      ensureCompactHintsLegacy(db);
     }
     rebuildIndexes(db);
     return;
   }
-  if (latestStamp(db) === SCHEMA_VERSION && unnumberedStepsDone(db) && compactHintsCurrent(db)) {
+  if (latestStamp(db) === SCHEMA_VERSION && unnumberedStepsDone(db)) {
     // Still heal declared indexed fields (a column or index missing after a restore): a few catalog reads, no
     // writes when nothing is missing.
     rebuildIndexes(db);
@@ -908,7 +907,6 @@ export function initSchema(db: Database): void {
   migrateToV30(db);
   migrateToV31(db);
   migrateToV32(db);
-  migrateToV33(db);
   // Steps with no version bump. Each has its check in unnumberedStepsDone, or the fast path skips it.
   // Types and tags: the `kind` column and a kind for every row (T-318 §8a).
   ensureTagKinds(db);
@@ -916,6 +914,8 @@ export function initSchema(db: Database): void {
   ensurePathNocaseIndex(db);
   // The write stamp: each revision says what kind of key wrote it (0.9.1).
   ensureRevisionKeyKind(db);
+  // Compressed history and always-on compaction (T-460): the hints' legacy column.
+  ensureCompactHintsLegacy(db);
 
   // Rebuild any generated columns + indexes declared in indexed_fields.
   // No-op for a fresh vault; idempotent on existing vaults.
