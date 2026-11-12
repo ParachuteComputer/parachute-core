@@ -68,7 +68,7 @@ describe("every tag record gets a kind (an additive column, no schema number)", 
   test("the other way: the file keeps its schema number, and an older vault's own writes still work on it", async () => {
     const { db, store } = fresh();
     await store.upsertTagRecord("task", { fields: { state: { type: "string" } } });
-    expect((db.prepare("SELECT MAX(version) AS v FROM schema_version").get() as { v: number }).v).toBe(32);
+    expect((db.prepare("SELECT MAX(version) AS v FROM schema_version").get() as { v: number }).v).toBe(SCHEMA_VERSION);
     // What a 0.7/0.8 vault writes: it names its columns and knows nothing of kind.
     db.prepare("INSERT INTO tags (name, description, fields, relationships, parent_names, created_at, updated_at) VALUES ('older', NULL, '{\"a\":{\"type\":\"string\"}}', NULL, NULL, 'x', 'x')").run();
     db.prepare("INSERT OR IGNORE INTO tags (name) VALUES ('label')").run();

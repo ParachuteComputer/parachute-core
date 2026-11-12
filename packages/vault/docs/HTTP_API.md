@@ -1740,8 +1740,8 @@ Compaction adds these `history:` defaults:
 | Key | Default |
 |---|---:|
 | `compact_enabled` | `true` |
-| `compact_ratio` | `3` |
-| `compact_min_versions` | `10` |
+| `compact_ratio` | `1` |
+| `compact_min_versions` | `2` |
 | `compact_run_length` | `24` |
 | `max_bytes_per_note` | `8388608` (8 MiB) |
 | `compact_budget_ms` | `250` |
@@ -1750,13 +1750,28 @@ Compaction adds these `history:` defaults:
 History has three ceilings: count, age and `max_bytes_per_note`. The
 `min_versions` floor outranks all three, includes tombstones, and can leave a
 note over its byte ceiling. `max_bytes_per_note: null` disables the byte ceiling;
-numeric values, including zero, are clamped to at least 65,536 bytes.
+numeric values, including zero, are clamped to at least 65,536 bytes. Byte sizes
+are stored bytes: since schema 33 bodies are stored compressed, so the ceiling
+counts compressed bytes.
 `compact_enabled: false` also disables byte-ceiling enforcement.
+
+Since schema 33 every body is stored compressed (`deflate`) when that is
+smaller, and compaction is always on: a note is a candidate when it has at least
+`compact_min_versions` versions whose bodies add up to more than
+`compact_ratio` times its live body (logical sizes, not stored ones), or when it
+holds blobs stored the old way (text, or a base64 `fossil-delta`). A pass
+re-stores those compressed (`blobs_compressed` in the summary) and stores the
+rest of each run of `compact_run_length` as a compressed delta
+(`fossil-delta-z`, `blobs_deltified`) against the run's first body when that is
+smaller. A completed pass marks the note refused until its next write. Schema 33
+rebuilds the hints once and clears every refusal, so the boot pass works
+through an existing vault a few notes at a time.
 Compaction runs synchronously at first vault open, with budgets checked between
 notes: one note can overshoot the time budget. Zero boot budget skips the pass.
-Schema 32 backfills per-note scheduling hints once. Later opens select hints by
-stored size without aggregating all history. A no-op attempt marks a note refused;
-new capture, pruning or import re-arms it. Notes with zero live bytes are excluded
+Schema 32 backfills per-note scheduling hints once (33 again, with `logical` and
+`legacy`). Later opens select hints by stored size without aggregating all
+history. An attempt marks a note refused; new capture, pruning or import re-arms
+it. Notes with zero live bytes are excluded
 from ratio-based selection, but remain eligible when over the byte ceiling.
 The bounded selection window is four times the note budget; `remaining_candidates`
 is the total eligible count at selection time minus notes attempted, not the window

@@ -223,20 +223,20 @@ describe("v5 and v18 against each state of the path indexes", () => {
   });
 });
 
-/** sha256 of SCHEMA_SQL as of SCHEMA_VERSION 32 with T-412 (idx_notes_path left out of it) and 0.9's `kind` on tags, 0.9.1's `via_kind` on revisions. */
-const SCHEMA_SQL_HASH_AT_32 = "ade9b08b66e61a3975f03b23b80466122607f4ca715821bcda17b3c8563e2dc7";
+/** sha256 of SCHEMA_SQL as of SCHEMA_VERSION 33: 32 with T-412 (idx_notes_path left out of it), 0.9's `kind` on tags, 0.9.1's `via_kind` on revisions, and 33's compressed blob encodings (T-460, comments only). */
+const SCHEMA_SQL_HASH_AT_33 = "5fc415652d7443a59174f54666a94016d96f01eac3e41838658bee6edde9384f";
 
-/** sha256 of initSchema's code and its fast-path check (comments and spacing left out) as of SCHEMA_VERSION 32 with T-412, 0.9's ensureTagKinds and 0.9.1's ensureRevisionKeyKind, and T-460's open-as-is of a newer readable schema. */
-const INIT_SCHEMA_HASH_AT_32 = "1a3aa88a2a3f71de260def99a2e057e86eaf3ddea36b5a58a7af401bb24f75e3";
+/** sha256 of initSchema's code and its fast-path check (comments and spacing left out) as of SCHEMA_VERSION 33: 32 with T-412, 0.9's ensureTagKinds and 0.9.1's ensureRevisionKeyKind, T-460's open-as-is of a newer readable schema, and v33's compaction hints. */
+const INIT_SCHEMA_HASH_AT_33 = "5082c5697becac9168abd043c033d2db776cacaef7dd746167f40834525411b3";
 
 describe("the fast path's promise", () => {
   // initSchema skips SCHEMA_SQL and every migration on a vault stamped SCHEMA_VERSION (with the path index). So a
   // change to SCHEMA_SQL that doesn't bump SCHEMA_VERSION would reach only new vaults, silently. If this fails: bump
   // SCHEMA_VERSION (and give the change a migration), or, for something an older engine must still open with no
   // bump, add its own check to initSchema's fast path as ensurePathNocaseIndex did. Then update the hash.
-  test("SCHEMA_SQL is the one SCHEMA_VERSION 32 was stamped with", () => {
+  test("SCHEMA_SQL is the one SCHEMA_VERSION 33 was stamped with", () => {
     const hash = new Bun.CryptoHasher("sha256").update(SCHEMA_SQL).digest("hex");
-    expect({ version: SCHEMA_VERSION, hash }).toEqual({ version: 32, hash: SCHEMA_SQL_HASH_AT_32 });
+    expect({ version: SCHEMA_VERSION, hash }).toEqual({ version: 33, hash: SCHEMA_SQL_HASH_AT_33 });
   });
 
   // The same promise for the steps initSchema runs: a migration or every-open step added without a bump (as
@@ -244,10 +244,10 @@ describe("the fast path's promise", () => {
   // out of the hash; any change to the calls or to the fast path's condition (unnumberedStepsDone) shows here. If
   // this fails for a new un-numbered step: give it its check in unnumberedStepsDone and a test like "a vault 0.8
   // opened last" above, then update the hash.
-  test("initSchema's steps are the ones SCHEMA_VERSION 32 was stamped with", () => {
+  test("initSchema's steps are the ones SCHEMA_VERSION 33 was stamped with", () => {
     const code = (initSchema.toString() + unnumberedStepsDone.toString()).replace(/\/\/[^\n]*/g, "").replace(/\s+/g, " ");
     const hash = new Bun.CryptoHasher("sha256").update(code).digest("hex");
-    expect({ version: SCHEMA_VERSION, hash }).toEqual({ version: 32, hash: INIT_SCHEMA_HASH_AT_32 });
+    expect({ version: SCHEMA_VERSION, hash }).toEqual({ version: 33, hash: INIT_SCHEMA_HASH_AT_33 });
   });
 });
 

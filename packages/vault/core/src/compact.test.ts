@@ -33,7 +33,7 @@ test("P3/P8 stars roll over, preserve all bodies and rerun idempotently", async 
 test("P4/P5 GC removes orphan deltas, protects bases, and drains two waves", async () => {
   const n = await seed();
   store.compactNote(n.id);
-  const first = db.prepare("SELECT v.version_ix,b.hash,b.delta_of FROM note_versions v JOIN note_blobs b ON b.hash=v.content_hash WHERE b.encoding='fossil-delta' ORDER BY v.version_ix LIMIT 1").get() as any;
+  const first = db.prepare("SELECT v.version_ix,b.hash,b.delta_of FROM note_versions v JOIN note_blobs b ON b.hash=v.content_hash WHERE b.encoding='fossil-delta-z' ORDER BY v.version_ix LIMIT 1").get() as any;
   expect(() => db.prepare("DELETE FROM note_blobs WHERE hash=?").run(first.delta_of)).toThrow("FOREIGN KEY");
   db.prepare("DELETE FROM note_versions WHERE note_id=? AND version_ix=?").run(n.id, first.version_ix);
   h.gcBlobs(db);
@@ -53,10 +53,10 @@ test("P4 shared base survives erasure of another note", async () => {
   expect(h.readBlobContent(db, base.content_hash!)).toBe(text);
   expect((await store.getNoteVersion(other.id, 0))!.content).toBe(text);
 });
-test("P6 triggers and off switch leave blobs unchanged; writes never compact", async () => {
+test("P6 triggers and off switch leave blobs unchanged; writes compress but never deltify", async () => {
   const n = await seed(9);
   let before = blobs();
-  expect(store.compactNote(n.id).blobs_deltified).toBe(0);
+  expect(h.compactNote(db, n.id, h.resolveHistoryPolicy({ compact_min_versions: 50 })).blobs_deltified).toBe(0);
   expect(blobs()).toEqual(before);
   expect(h.compactNote(db, n.id, h.resolveHistoryPolicy({ compact_min_versions: 2, compact_ratio: 100 })).blobs_deltified).toBe(0);
   expect(blobs()).toEqual(before);
@@ -66,7 +66,7 @@ test("P6 triggers and off switch leave blobs unchanged; writes never compact", a
   expect(blobs()).toEqual(before);
   for (let i = 0; i < 200; i++)
     await store.updateNote(n.id, { append: `ordinary ${i}` });
-  expect(db.prepare("SELECT hash FROM note_blobs WHERE encoding IS NOT NULL").all()).toEqual([]);
+  expect(db.prepare("SELECT hash FROM note_blobs WHERE delta_of IS NOT NULL OR encoding IS NOT 'deflate'").all()).toEqual([]);
   // A live empty body has size zero, not the newest retained body's size.
   const emptyDb = new Database(":memory:");
   try {
@@ -81,9 +81,9 @@ test("P7 third encode failure rolls back all changes", async () => {
   const n = await seed();
   const b = blobs(), v = versions();
   expect(codec).not.toBeNull();
-  const original = codec!.encodeDelta;
+  const original = codec!.createDeltaBytes;
   let count = 0;
-  const mock = spyOn(codec!, "encodeDelta").mockImplementation((a, b) => { if (++count === 3)
+  const mock = spyOn(codec!, "createDeltaBytes").mockImplementation((a, b) => { if (++count === 3)
     throw Error("injected"); return original(a, b); });
   try {
     expect(() => store.compactNote(n.id)).toThrow("injected");
@@ -175,7 +175,7 @@ test("P15 over-byte trigger works below minimum count and null disables dropping
 test("P15 attribution drops while indirect base remains on disk", async () => {
   const n = await seed();
   store.compactNote(n.id);
-  const base = db.prepare("SELECT delta_of FROM note_blobs WHERE encoding='fossil-delta' LIMIT 1").get() as any;
+  const base = db.prepare("SELECT delta_of FROM note_blobs WHERE encoding='fossil-delta-z' LIMIT 1").get() as any;
   const before = h.noteHistoryBytes(db, n.id), count = blobs().length;
   db.prepare("DELETE FROM note_versions WHERE note_id=? AND content_hash=?").run(n.id, base.delta_of);
   h.gcBlobs(db);

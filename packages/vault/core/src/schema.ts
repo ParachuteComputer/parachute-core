@@ -8,14 +8,30 @@ import { ensureRelationshipColumn } from "./wikilinks.js";
 import { rebuildCompactState } from "./history-compact-state.js";
 import { recordTagKinds } from "./tag-kind.js";
 
-export const SCHEMA_VERSION = 32;
+export const SCHEMA_VERSION = 33;
 /**
  * The newest schema this engine can open (T-460). Above SCHEMA_VERSION only for a schema whose new data this engine
- * already reads: 33 stores version bodies compressed (blob-codec.ts), which this engine reads but doesn't write. So
- * rolling back from the engine that writes 33 to this one still opens and reads every vault. Such a vault is opened
- * as it is: no migration runs and no older stamp is written over it.
+ * already reads, so a rollback to it still opens and reads every vault; such a vault is opened as it is: no
+ * migration runs and no older stamp is written over it. The engine before this one read 33 (compressed version
+ * bodies, blob-codec.ts) without writing it; this one writes it.
  */
 export const READABLE_SCHEMA_VERSION = 33;
+
+/**
+ * v33 (T-460): version bodies are written compressed (blob-codec.ts) and compaction is always on. The compaction
+ * hints gain `logical` (the bodies' own sizes, since stored sizes are now compressed) and `legacy` (blobs stored the
+ * old way, which the maintenance pass re-encodes). Rebuilt here, which also clears every `refused`: an earlier
+ * refusal under the old rules must not hide a note from the new ones. Schema 33's data is readable by the engine
+ * before this one (READABLE_SCHEMA_VERSION there), so a rollback still reads it.
+ */
+function migrateToV33(db: Database): void {
+  const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='history_compact_state'").get();
+  const previous = latestStamp(db);
+  // As in v32: no ledger rows are not evidence of an older writer, but a table without the new columns needs them.
+  if (exists && (previous === null || previous >= 33) && hasColumn(db, "history_compact_state", "legacy")) return;
+  if (!hasTable(db, "note_versions")) return;
+  rebuildCompactState(db);
+}
 
 function migrateToV32(db: Database): void {
     const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='history_compact_state'").get();
@@ -240,6 +256,9 @@ CREATE INDEX IF NOT EXISTS idx_note_vectors_stale ON note_vectors(model, content
 -- note_blobs.encoding IS NULL  -> \`content\` is the literal body, \`byte_size\`
 --   is its UTF-8 byte length, and \`hash\` = sha256(content). This is every row
 --   v29 ever wrote.
+-- note_blobs.encoding = 'deflate' (v33) -> \`content\` is a BLOB, the UTF-8 body
+--   compressed with raw deflate; \`byte_size\` is the stored (compressed) length.
+--   Whole, like NULL: it may be a delta's base.
 -- note_blobs.encoding = 'fossil-delta' -> \`content\` is the BASE64 of a Fossil
 --   delta that reconstructs this row's logical body from the body of the blob
 --   named by \`delta_of\`; \`byte_size\` is the length of that base64 payload, i.e.
@@ -249,13 +268,16 @@ CREATE INDEX IF NOT EXISTS idx_note_vectors_stale ON note_vectors(model, content
 --   The LOGICAL byte length is note_versions.content_len, which PR 1
 --   denormalised for exactly this moment (PR 1 §2.1: "it must stay readable
 --   after PR 2 deltifies the blob").
+-- note_blobs.encoding = 'fossil-delta-z' (v33) -> \`content\` is a BLOB, the raw
+--   Fossil delta bytes compressed with raw deflate; otherwise as 'fossil-delta'.
+--   blob-codec.ts reads all four.
 -- ANY OTHER \`encoding\` VALUE IS CORRUPTION. It is not a future format marker to
 --   be tolerated: a read of such a row answers 409 (materialise's
 --   "unknown_encoding" branch) and the doctor counts it (historyStorageStats's
 --   unknown_encoding_blobs). A later format adds its value here AND to both.
 --
 -- DEPTH IS EXACTLY ONE, AND THAT IS AN INVARIANT, NOT A TUNING CHOICE.
---   delta_of MUST name a row whose \`encoding IS NULL\`. A delta is never the
+--   delta_of MUST name a whole row (encoding NULL or 'deflate'). A delta is never the
 --   base of another delta. Rebuilding any version is therefore ONE applyDelta,
 --   measured p95 3.73 ms / p99 4.68 ms on a 116 KB note, against 38.98 ms /
 --   49.99 ms for a 24-link chain on the same note -- the chain sits ON the
@@ -879,6 +901,7 @@ export function initSchema(db: Database): void {
   migrateToV30(db);
   migrateToV31(db);
   migrateToV32(db);
+  migrateToV33(db);
   // Steps with no version bump. Each has its check in unnumberedStepsDone, or the fast path skips it.
   // Types and tags: the `kind` column and a kind for every row (T-318 §8a).
   ensureTagKinds(db);

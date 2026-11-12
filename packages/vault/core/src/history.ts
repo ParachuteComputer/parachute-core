@@ -12,8 +12,8 @@
  */
 import type { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { encodeDelta, applyDeltaBytes } from "./delta.js";
-import { isWhole, isDelta, wholeText, deltaBytes, wholeSql, BlobDecodeError, type StoredContent } from "./blob-codec.js";
+import { applyDeltaBytes, createDeltaBytes, fromBase64 } from "./delta.js";
+import { isWhole, isDelta, wholeText, deltaBytes, wholeSql, deflateBytes, BlobDecodeError, COMPRESS_MIN_BYTES, LEGACY_BLOB_SQL, type StoredContent } from "./blob-codec.js";
 import { kindOfVia } from "./write-stamp.js";
 import { transaction } from "./txn.js";
 import { refreshCompactState } from "./history-compact-state.js";
@@ -48,8 +48,10 @@ export const DEFAULT_HISTORY_POLICY: HistoryPolicy = {
   max_age_days: 180,
   deleted_retention_days: null,
   compact_enabled: true,
-  compact_ratio: 3,
-  compact_min_versions: 10,
+  // T-460: always on. A note with two versions whose bodies add up to more than its live body is a candidate; the
+  // pass compresses every blob and stores the rest of each run of 24 as a delta against its first.
+  compact_ratio: 1,
+  compact_min_versions: 2,
   compact_run_length: 24,
   max_bytes_per_note: 8_388_608,
   compact_budget_ms: 250,
@@ -153,6 +155,21 @@ export function hashContent(text: string): string {
 export function byteLength(text: string): number {
   return new TextEncoder().encode(text).length;
 }
+/** A whole body as stored (T-460): deflated when that is smaller, else text. */
+export function encodeWhole(text: string, size = byteLength(text)): { content: string | Uint8Array; byte_size: number; encoding: "deflate" | null } {
+  if (size >= COMPRESS_MIN_BYTES) {
+    const z = deflateBytes(new TextEncoder().encode(text));
+    if (z.byteLength < size) return { content: z, byte_size: z.byteLength, encoding: "deflate" };
+  }
+  return { content: text, byte_size: size, encoding: null };
+}
+/** Store a whole body under its hash, unless the vault already holds that hash (in any encoding). */
+export function insertWholeBlob(db: Database, hash: string, text: string, size = byteLength(text)): void {
+  if (db.prepare("SELECT 1 FROM note_blobs WHERE hash = ?").get(hash)) return;
+  const w = encodeWhole(text, size);
+  db.prepare("INSERT OR IGNORE INTO note_blobs (hash, content, byte_size, encoding) VALUES (?, ?, ?, ?)").run(hash, w.content, w.byte_size, w.encoding);
+}
+
 const present = new WeakMap<Database, boolean>();
 export function historyTablesPresent(db: Database): boolean {
   if (present.get(db)) return true;
@@ -222,9 +239,7 @@ export function captureVersion(
     return;
   }
   const hash = hashContent(text);
-  db.prepare(
-    "INSERT OR IGNORE INTO note_blobs (hash, content, byte_size) VALUES (?, ?, ?)",
-  ).run(hash, text, size);
+  insertWholeBlob(db, hash, text, size);
   const ix = nextIndex(db, prior.id);
   db.prepare(
     `INSERT INTO note_versions (note_id, version_ix, content_hash, path, metadata, extension,
@@ -651,7 +666,10 @@ export function topNotesByHistoryBytes(db: Database, limit: number): {
   }[];
 }
 export interface CompactResult {
+  /** Blobs stored as a delta against their run's base this pass. */
   blobs_deltified: number;
+  /** Blobs re-stored compressed this pass: a whole body deflated, or an old base64 delta as deflated bytes (T-460). */
+  blobs_compressed: number;
   blobs_skipped_too_large: number;
   versions_dropped: number;
   bytes_before: number;
@@ -662,6 +680,7 @@ export interface CompactSummary {
   notes_compacted: number;
   notes_failed: number;
   blobs_deltified: number;
+  blobs_compressed: number;
   versions_dropped: number;
   bytes_before: number;
   bytes_after: number;
@@ -670,7 +689,7 @@ export interface CompactSummary {
   stopped_by: "complete" | "budget" | "max_notes" | "disabled";
 }
 export function compactNote(db: Database, noteId: string, policy: HistoryPolicy): CompactResult {
-  const result: CompactResult = { blobs_deltified: 0, blobs_skipped_too_large: 0, versions_dropped: 0, bytes_before: 0, bytes_after: 0 };
+  const result: CompactResult = { blobs_deltified: 0, blobs_compressed: 0, blobs_skipped_too_large: 0, versions_dropped: 0, bytes_before: 0, bytes_after: 0 };
   if (!policy.enabled || !policy.compact_enabled || !historyTablesPresent(db))
     return result;
   return transaction(db, () => {
@@ -687,7 +706,9 @@ export function compactNote(db: Database, noteId: string, policy: HistoryPolicy)
       const prior = db.prepare("SELECT refused FROM history_compact_state WHERE note_id=?").get(id) as { refused: number } | null;
       refreshCompactState(db, id, { refused: prior?.refused === 1 });
     }
-    refreshCompactState(db, noteId, { refused: result.blobs_deltified === 0 && result.versions_dropped === 0 });
+    // A pass leaves the note as compact as these rules make it, so it waits for its next write (T-460: the logical
+    // trigger would otherwise keep a compacted note a candidate for ever).
+    refreshCompactState(db, noteId, { refused: true });
     return result;
   };
   const rows = db.prepare("SELECT version_ix, content_hash, content_len FROM note_versions WHERE note_id = ? AND content_hash IS NOT NULL ORDER BY version_ix DESC").all(noteId) as {
@@ -705,56 +726,89 @@ export function compactNote(db: Database, noteId: string, policy: HistoryPolicy)
     : null;
   const live = current?.content == null ? newest?.content_len ?? 0 : byteLength(current.content);
   const overBytes = policy.max_bytes_per_note !== null && stored > policy.max_bytes_per_note;
-  if (!overBytes && rows.length < policy.compact_min_versions)
+  // Logical sizes (T-460): stored bytes are compressed, so comparing them with the live body would rarely fire.
+  const logical = (db.prepare(`SELECT COALESCE(SUM(content_len), 0) AS n FROM (SELECT DISTINCT content_hash, content_len
+    FROM note_versions WHERE note_id = ? AND content_hash IS NOT NULL)`).get(noteId) as { n: number }).n;
+  const legacy = !!db.prepare(`SELECT 1 FROM note_versions v JOIN note_blobs b ON b.hash = v.content_hash
+    WHERE v.note_id = ? AND ${LEGACY_BLOB_SQL} LIMIT 1`).get(noteId);
+  const due = rows.length >= policy.compact_min_versions && logical > policy.compact_ratio * Math.max(live, 1);
+  if (!overBytes && !legacy && !due)
     return finish();
-  if (!overBytes && stored <= policy.compact_ratio * Math.max(live, 1))
-    return finish();
-    for (let start = 0; start < rows.length; start += policy.compact_run_length) {
-      const run = rows.slice(start, start + policy.compact_run_length);
-      const baseRow = db.prepare("SELECT hash, encoding, delta_of FROM note_blobs WHERE hash = ?").get(run[0]!.content_hash) as {
-        hash: string;
-        encoding: string | null;
-        delta_of: string | null;
-      } | null;
-      if (!baseRow)
+  type Blob = { hash: string; content: StoredContent; byte_size: number; encoding: string | null; delta_of: string | null };
+  const getBlob = db.prepare("SELECT hash, content, byte_size, encoding, delta_of FROM note_blobs WHERE hash = ?");
+  const isBase = db.prepare("SELECT 1 FROM note_blobs WHERE delta_of = ? LIMIT 1");
+  const store = (hash: string, before: Blob, content: string | Uint8Array, size: number, encoding: string | null, deltaOf: string | null) => {
+    // Guarded on what was read, so a row changed under us (never, inside this transaction) is left alone.
+    const changed = db.prepare("UPDATE note_blobs SET content = ?, byte_size = ?, encoding = ?, delta_of = ? WHERE hash = ? AND encoding IS ? AND byte_size = ?")
+      .run(content, size, encoding, deltaOf, hash, before.encoding, before.byte_size).changes;
+    if (changed) changedHashes.add(hash);
+    return changed > 0;
+  };
+  /** Re-store a whole blob deflated when it is text and deflate is smaller. */
+  const compressWhole = (b: Blob, text: string) => {
+    if (b.encoding !== null) return;
+    const w = encodeWhole(text, b.byte_size);
+    if (w.encoding === "deflate" && store(b.hash, b, w.content, w.byte_size, w.encoding, null)) result.blobs_compressed++;
+  };
+  const seen = new Set<string>();
+  for (let start = 0; start < rows.length; start += policy.compact_run_length) {
+    const run = rows.slice(start, start + policy.compact_run_length);
+    const baseRow = getBlob.get(run[0]!.content_hash) as Blob | null;
+    if (!baseRow)
+      continue;
+    const baseHash = isWhole(baseRow.encoding) ? baseRow.hash : baseRow.delta_of;
+    if (!baseHash)
+      continue;
+    const base = getBlob.get(baseHash) as Blob | null;
+    if (!base)
+      continue;
+    // Never propagate a pre-existing depth-two chain into healthy blobs.
+    if (!isWhole(base.encoding))
+      throw new HistoryDeltaOrphanError(baseRow.hash, baseHash, "base_not_whole");
+    const text = readBlobContent(db, baseHash);
+    if (text === null)
+      continue;
+    if (!seen.has(baseHash)) {
+      seen.add(baseHash);
+      compressWhole(base, text);
+    }
+    for (const r of run) {
+      if (r.content_hash === baseHash || seen.has(r.content_hash))
         continue;
-      const baseHash = isWhole(baseRow.encoding) ? baseRow.hash : baseRow.delta_of;
-      if (!baseHash)
+      seen.add(r.content_hash);
+      const b = getBlob.get(r.content_hash) as Blob | null;
+      if (!b)
         continue;
-      const base = db.prepare("SELECT encoding FROM note_blobs WHERE hash = ?").get(baseHash) as {
-        encoding: string | null;
-      } | null;
-      if (!base)
+      if (b.encoding === "fossil-delta-z")
         continue;
-      // Never propagate a pre-existing depth-two chain into healthy blobs.
-      if (!isWhole(base.encoding))
-        throw new HistoryDeltaOrphanError(baseRow.hash, baseHash, "base_not_whole");
-      const text = readBlobContent(db, baseHash);
-      if (text === null)
+      if (b.encoding === "fossil-delta") {
+        // A legacy delta keeps its base; only its bytes move: base64 text to raw bytes, deflated.
+        if (typeof b.content !== "string") continue;
+        const z = deflateBytes(fromBase64(b.content));
+        if (store(b.hash, b, z, z.byteLength, "fossil-delta-z", b.delta_of)) result.blobs_compressed++;
         continue;
-      for (const r of run.slice(1)) {
-        if (r.content_hash === baseHash)
-          continue;
-        const b = db.prepare("SELECT hash, content, byte_size, encoding FROM note_blobs WHERE hash = ?").get(r.content_hash) as {
-          hash: string;
-          content: string;
-          byte_size: number;
-          encoding: string | null;
-        } | null;
-        if (!b || b.encoding !== null)
-          continue;
-        if (db.prepare("SELECT 1 FROM note_blobs WHERE delta_of = ? LIMIT 1").get(b.hash))
-          continue;
-        const payload = encodeDelta(text, b.content);
-        if (payload.length >= b.byte_size * 0.9) {
-          result.blobs_skipped_too_large++;
-          continue;
-        }
-        const changed = db.prepare("UPDATE note_blobs SET content = ?, byte_size = ?, encoding = 'fossil-delta', delta_of = ? WHERE hash = ? AND encoding IS NULL").run(payload, payload.length, baseHash, b.hash).changes;
-        result.blobs_deltified += changed;
-        if (changed) changedHashes.add(b.hash);
+      }
+      if (!isWhole(b.encoding))
+        continue;
+      const body = readBlobContent(db, b.hash);
+      if (body === null)
+        continue;
+      // A blob other deltas rest on stays whole (depth one); it can still be compressed.
+      if (isBase.get(b.hash)) {
+        compressWhole(b, body);
+        continue;
+      }
+      const whole = encodeWhole(body, byteLength(body));
+      const dz = deflateBytes(createDeltaBytes(text, body));
+      if (dz.byteLength < whole.byte_size * 0.9) {
+        if (store(b.hash, b, dz, dz.byteLength, "fossil-delta-z", baseHash)) result.blobs_deltified++;
+      }
+      else {
+        result.blobs_skipped_too_large++;
+        compressWhole(b, body);
       }
     }
+  }
     if (policy.max_bytes_per_note !== null)
       result.versions_dropped = enforceByteCeiling(db, noteId, policy);
     result.bytes_after = noteHistoryBytes(db, noteId);
@@ -778,7 +832,7 @@ export function compactVault(db: Database, policy: HistoryPolicy, opts?: {
   budgetMs?: number | null;
   maxNotes?: number | null;
 }): CompactSummary {
-  const result: CompactSummary = { notes_scanned: 0, notes_compacted: 0, notes_failed: 0, blobs_deltified: 0, versions_dropped: 0, bytes_before: 0, bytes_after: 0, remaining_candidates: 0, duration_ms: 0, stopped_by: "complete" };
+  const result: CompactSummary = { notes_scanned: 0, notes_compacted: 0, notes_failed: 0, blobs_deltified: 0, blobs_compressed: 0, versions_dropped: 0, bytes_before: 0, bytes_after: 0, remaining_candidates: 0, duration_ms: 0, stopped_by: "complete" };
   if (!historyTablesPresent(db) || !policy.enabled || !policy.compact_enabled)
     return { ...result, stopped_by: "disabled" };
   const budget = opts?.budgetMs === undefined ? policy.compact_budget_ms : opts.budgetMs;
@@ -788,7 +842,9 @@ export function compactVault(db: Database, policy: HistoryPolicy, opts?: {
   if (budget !== null && budget <= 0)
     return { ...result, stopped_by: "budget" };
   const started = performance.now();
-  const predicate = `refused=0 AND ((live>0 AND versions >= ? AND stored > ? * MAX(live,1)) OR (? IS NOT NULL AND stored > ?))`;
+  // Logical sizes and the legacy count come from the compaction hints (v33). A row an older engine refreshed has
+  // logical 0: it is a candidate on its count alone, and compactNote decides.
+  const predicate = `refused=0 AND (legacy > 0 OR (live>0 AND versions >= ? AND (logical > ? * MAX(live,1) OR logical = 0)) OR (? IS NOT NULL AND stored > ?))`;
   const args = [policy.compact_min_versions, policy.compact_ratio, policy.max_bytes_per_note, policy.max_bytes_per_note];
   const total = opts?.noteId !== undefined ? 1 : (db.prepare(`SELECT COUNT(*) AS n FROM history_compact_state WHERE ${predicate}`).get(...args) as { n: number }).n;
   const candidates = opts?.noteId !== undefined ? [{ note_id: opts.noteId }] : db.prepare(`SELECT note_id FROM history_compact_state WHERE ${predicate} ORDER BY stored DESC LIMIT ?`).all(...args, max === null ? -1 : max * 4) as {
@@ -807,9 +863,10 @@ export function compactVault(db: Database, policy: HistoryPolicy, opts?: {
     result.notes_scanned++;
     try {
       const r = compactNote(db, candidate.note_id, policy);
-      if (r.blobs_deltified || r.versions_dropped)
+      if (r.blobs_deltified || r.blobs_compressed || r.versions_dropped)
         result.notes_compacted++;
       result.blobs_deltified += r.blobs_deltified;
+      result.blobs_compressed += r.blobs_compressed;
       result.versions_dropped += r.versions_dropped;
       result.bytes_before += r.bytes_before;
       result.bytes_after += r.bytes_after;
