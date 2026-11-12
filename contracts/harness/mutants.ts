@@ -364,6 +364,9 @@ export const CANDIDATE_MUTANTS: Mutant[] = [
   {"name": "consent-no-vendor-note", "why": "T-446: the consent page stops saying where what the app reads goes", "repo": "hub", "file": "src/oauth-ui.ts", "find": "${readsVault ? `<p class=\"scope-vendor-note\">", "replace": "${false ? `<p class=\"scope-vendor-note\">", "suite": "suites/safety/consent.test.ts", "catches": ["read: the whole vault, and where it goes", "write: it reads the whole vault too"]},
   // T-446: the one multi-vault door. The hop to each vault at the key's level, never the person's role.
   {"name": "hop-at-person-role", "why": "T-446: the account door mints each hop at the person's role, not the key's level there: the owner's read key writes", "repo": "hub", "file": "src/key-level.ts", "find": "  return cap === null ? null : lower(cap, role);", "replace": "  return cap === null ? null : role;", "suite": "suites/door/multivault.test.ts", "catches": ["a key read on one vault and write on another", "consent per vault"]},
+  // T-463 (0.9.3): the admin API under one login. Each puts one promise back.
+  {"name": "admin-api-no-csrf", "why": "T-463: a cookie write to /admin/api/vaults/<n>/... needs no CSRF token", "repo": "hub", "file": "src/admin-vault-api.ts", "find": "if (!verifyCsrfToken(req, req.headers.get(CSRF_HEADER_NAME))) {", "replace": "if (false) {", "suite": "suites/v093/admin-api.test.ts", "catches": ["a write with the session but no CSRF token is refused; with it, it works (PUT and POST/DELETE)"]},
+  {"name": "admin-api-old-route-quiet", "why": "T-463: the old vault admin routes stop saying they are going", "repo": "hub", "file": "src/hub-server.ts", "find": "if (proxied && successor) return markDeprecated(proxied, successor);", "replace": "", "suite": "suites/v093/admin-api.test.ts", "catches": ["the old routes still answer, and say they are going"]},
 ];
 
 /** Fixes that must flip red contracts to "now green" (`catches` lists the red contracts that must flip). */
