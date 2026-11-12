@@ -282,6 +282,9 @@ export function schemaSourceCandidates(
   });
 }
 
+// The tools' annotations come with this list, from the covered vault where the key's level is highest, so a key that
+// is admin anywhere sees vault-info as a change (the safe side). If that vault's list fails and a lower one answers,
+// the hints are that vault's: vault-info would read as read-only while an admin call on the other vault still works.
 async function listVaultToolsUncached(ctx: AccountToolContext): Promise<readonly ListedMcpTool[]> {
   const coverage = resolveCoverage(ctx.db, ctx.principal, installedVaults(ctx));
   if (coverage.vaults.length === 0) return [];

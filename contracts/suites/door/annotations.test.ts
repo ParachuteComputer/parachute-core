@@ -75,8 +75,8 @@ describe.skipIf(!is091)("tools say what they do", () => {
     try {
       await a.call("vault-info", { description: "set by an admin" });
       expect((await rest("read").get("/vault")).body.description).toBe("set by an admin");
-      await a.call("vault-info", { description: before });
     } finally {
+      await a.call("vault-info", { description: before }).catch(() => {}); // later files read the door's description
       await a.close();
     }
     expect((await rest("read").get("/vault")).body.description).toBe(before);
