@@ -22,8 +22,8 @@
 import type { Store, Note, HydratedLink, NoteSummary } from "../core/src/types.ts";
 import type { TagFieldViolation } from "../core/src/tag-schemas.ts";
 import { ParentCycleError } from "../core/src/tag-schemas.ts";
-import { IndexedFieldError } from "../core/src/indexed-fields.ts";
-import { stripTagHash } from "../core/src/tag-hierarchy.ts";
+import { IndexedFieldError, IndexedFieldLimitError } from "../core/src/indexed-fields.ts";
+import { getTagExpansion, stripTagHash } from "../core/src/tag-hierarchy.ts";
 import { getVaultNameForStore } from "./vault-store.ts";
 import { readPrivateTagsConfig } from "./config.ts";
 
@@ -94,24 +94,50 @@ export async function expandTokenTagScope(
   privateTags?: string[] | null,
 ): Promise<TagScopeSet | null> {
   if (!scoped_tags || scoped_tags.length === 0) return null;
-  let priv: string[];
-  if (privateTags) priv = privateTags;
-  else {
-    const res = resolvePrivateTags(store);
-    if (!res.ok) {
-      const denied = new TagScopeSet();
-      denied.denyAll = true;
-      return denied;
-    }
-    priv = res.tags;
-  }
-  const out = new TagScopeSet(await store.expandTagsWithDescendants(scoped_tags));
+  const priv = privateTags ?? resolvePrivateTagsOrNull(store);
+  if (priv === null) return deniedScope();
+  return buildScope(scoped_tags, priv, await store.expandTagsWithDescendants(scoped_tags), priv.length > 0 ? await store.expandTagsWithDescendants(priv) : new Set());
+}
+
+/**
+ * `expandTokenTagScope` read synchronously from the store's cached tag
+ * hierarchy and the vault's current `private_tags` (scope gap 7). For a
+ * caller that must re-read the scope as it is NOW inside synchronous code: a
+ * live subscription re-expands it on every event, so a sub-tag declared or
+ * re-parented after the socket subscribed is seen, or dropped, at once.
+ */
+export function expandTokenTagScopeNow(store: Store, scoped_tags: string[] | null): TagScopeSet | null {
+  if (!scoped_tags || scoped_tags.length === 0) return null;
+  const priv = resolvePrivateTagsOrNull(store);
+  if (priv === null) return deniedScope();
+  const hierarchy = store.getTagHierarchy();
+  const expand = (tags: string[]) => {
+    const out = new Set<string>();
+    for (const t of tags) for (const x of getTagExpansion(hierarchy, t, "subtypes")) out.add(x);
+    return out;
+  };
+  return buildScope(scoped_tags, priv, expand(scoped_tags), expand(priv));
+}
+
+function resolvePrivateTagsOrNull(store: Store): string[] | null {
+  const res = resolvePrivateTags(store);
+  return res.ok ? res.tags : null;
+}
+
+function deniedScope(): TagScopeSet {
+  const denied = new TagScopeSet();
+  denied.denyAll = true;
+  return denied;
+}
+
+function buildScope(scoped_tags: string[], priv: string[], expanded: Set<string>, privExpanded: Set<string>): TagScopeSet {
+  const out = new TagScopeSet(expanded);
   out.scopedRoots = [...scoped_tags];
   if (priv.length > 0) {
     // Exempt = covered by the token itself: in the expanded allowlist, or
     // equal to / under a raw `scoped_tags` entry (string-form sub-tags).
     const named = (t: string) => out.has(t) || scoped_tags.some((s) => t === s || t.startsWith(`${s}/`));
-    for (const t of await store.expandTagsWithDescendants(priv)) {
+    for (const t of privExpanded) {
       if (!named(t)) out.privateTags.add(t);
     }
     out.privateRoots = priv.filter((p) => !named(p));
@@ -771,6 +797,14 @@ export function scrubIndexedFieldConflictError(
   allowed: Set<string> | null,
 ): IndexedFieldError {
   if (allowed === null) return err;
+  // The 0.9.2 ceiling's refusal lists unused indexed fields vault-wide. A
+  // scoped caller hears only the ones every declarer of which it can read;
+  // the count and limit stay (the refusal needs them to make sense).
+  if (err instanceof IndexedFieldLimitError) {
+    const unused = err.unused.filter((u) => u.declarer_tags.length > 0 && u.declarer_tags.every((t) => allowed.has(t)));
+    if (unused.length === err.unused.length) return err;
+    return new IndexedFieldLimitError(err.fields, err.got, unused, true);
+  }
   if (!Array.isArray(err.declarer_tags) || err.declarer_tags.length === 0) return err;
   if (err.declarer_tags.every((t) => allowed.has(t))) return err;
   return new IndexedFieldError(

@@ -88,12 +88,23 @@ A difference passes only when it was named before the move. A count never excuse
 ## What does not travel
 
 - **Earlier versions of notes.** The export doesn't carry history yet (0.9.4). The old door keeps it until closed.
+  Moving from a box to the hosted door, an operator can send the box's history after the move (its git mirror, imported
+  with `parachute-vault history-import`, and its native versions): parachute-cloud `HISTORY.md`, "Operator history import".
 - **Who wrote each note** (`created_by`, `created_via`). Counted in the manifest.
 - **Credentials.** A token names the door that signed it. `REKEY.md` lists every connected app and named key at the
   old door and the new addresses. Your own Nostr key signs in at any 0.9.1 door that lists it as the owner.
 - **A file's id.** Files keep their paths and bytes; their ids are new.
 - **What lives on a door, not in the vault:** a box's triggers and git mirror, cloud's snapshots, published links
   that name the old host. The vault's description is set again on an HTTP door, and by hand on a box.
+
+## Handing a vault to someone else, on a box
+
+0.9.1 lets a door with accounts (Parachute Cloud) hand a vault to another account in place. A box has nothing to hand
+between: its owner, the hub's first admin, owns every vault on it, and other accounts there are given access to a
+vault, never ownership. There is no in-place owner change on a box. To give someone a vault, move it to a door they
+own with this tool (or `parachute-vault export` and their own import). The notes, types, links and files travel and
+are checked; the vault's history and the via/by stamps of who wrote what don't travel yet (above), and stay at the
+old door until you close it.
 
 ## Limits
 

@@ -6,7 +6,8 @@ A flat reference for the Parachute Vault REST surface. Intended for humans
 All endpoints serve JSON. Every per-vault resource lives under a vault-scoped
 root:
 
-- `/vault/{name}/api/...` — the REST surface for one vault
+- `/vault/{name}/api/...` — the REST surface for one vault (`/api/records` is the record door
+  from 0.9.1; `/api/notes` is its deprecated alias through 0.9, see "Records" below)
 - `/vault/{name}/mcp[/*]` — the MCP endpoint (not covered here; see
   `core/src/mcp.ts`)
 - `/vault/{name}/.well-known/oauth-{protected-resource,authorization-server}`
@@ -75,12 +76,12 @@ Version history is the first self-hosted-first feature tracked in this table.
 
 | Param | Self-hosted (bun) | Hosted (cloud) | Note |
 |---|---|---|---|
-| `POST /api/history/compact` | honored | not yet | Self-hosted only — hosted door is PR 4 of #524. |
-| `GET /notes/:id/versions` | honored | not yet | Self-hosted only — hosted door is PR 4 of #524 |
-| `GET /notes/:id/versions/:version_ix` | honored | not yet | Self-hosted only — hosted door is PR 4 of #524 |
-| `POST /notes/:id/restore` | honored | not yet | Self-hosted only — hosted door is PR 4 of #524 |
-| `DELETE /notes/:id/versions` | honored | not yet | Self-hosted only — hosted door is PR 4 of #524 |
-| `query-notes versions (MCP)` | honored | not yet | Self-hosted only — hosted door is PR 4 of #524 |
+| `POST /api/history/compact` | honored | honored since [cloud#304](https://github.com/ParachuteComputer/parachute-cloud/pull/304) | The hosted door bounds one request (its own limit; see parachute-cloud `HISTORY.md`). |
+| `GET /notes/:id/versions` | honored | honored since [cloud#304](https://github.com/ParachuteComputer/parachute-cloud/pull/304) | Same shapes; held by cloud's own suite, not by this repo. |
+| `GET /notes/:id/versions/:version_ix` | honored | honored since [cloud#304](https://github.com/ParachuteComputer/parachute-cloud/pull/304) | Same shapes; held by cloud's own suite, not by this repo. |
+| `POST /notes/:id/restore` | honored | honored since [cloud#304](https://github.com/ParachuteComputer/parachute-cloud/pull/304) | Same shapes; held by cloud's own suite, not by this repo. |
+| `DELETE /notes/:id/versions` | honored | honored since [cloud#304](https://github.com/ParachuteComputer/parachute-cloud/pull/304) | Same shapes; held by cloud's own suite, not by this repo. |
+| `query-notes versions (MCP)` | honored | honored since [cloud#304](https://github.com/ParachuteComputer/parachute-cloud/pull/304) | Same shapes; held by cloud's own suite, not by this repo. |
 | `DELETE /notes/:id?erase_history=true` | honored | honored once cloud pins core with T-412 | T-412 |
 | `GET /history/deleted` | honored | honored once cloud pins core with T-412 | T-412 |
 | `delete-note` `ids` / `erase_history` (MCP) | honored | honored once cloud pins core with T-412 | T-412; core's tool, so both doors get it from the pin |
@@ -118,7 +119,7 @@ Three credential types are accepted, in checking order:
 |---|---|---|---|
 | Hub-issued JWT | three dot-separated base64url segments | minted by `parachute-hub` after an OAuth flow, or via `parachute auth mint-token` / `parachute-vault mcp-install --mint` | resource-narrowed (`vault:<name>:<verb>`); broad `vault:<verb>` claims are rejected. Also carries a `vault_scope` claim — see below. |
 | Server-wide operator token | `VAULT_AUTH_TOKEN` env var | set by the operator at boot | implicit `vault:admin` against every vault |
-| Legacy `pvk_*` YAML key | bcrypt-hashed in `config.yaml` / `vault.yaml` `api_keys` | pre-0.3 deployments | mapped onto the modern scope set on the fly; emits a deprecation log line |
+| Legacy `pvk_*` YAML key | bcrypt-hashed in `config.yaml` / `vault.yaml` `api_keys` | pre-0.3 deployments, and first boots that named their vault before 0.9.1 (nothing mints one from 0.9.1) | mapped onto the modern scope set on the fly; emits a deprecation log line |
 
 The legacy `permission: "full" \| "read"` column and unscoped vault.yaml /
 config.yaml `pvk_*` api_keys still resolve for back-compat — they're mapped
@@ -186,6 +187,51 @@ with a structured envelope:
   "granted_scopes": ["vault:read"]
 }
 ```
+
+### The write stamp: via and by (0.9.1)
+
+Every write records two facts, on the record (`createdBy`/`createdVia`, `lastUpdatedBy`/`lastUpdatedVia`) and on
+each kept revision (`actor`/`via`, plus `via_kind`):
+
+- **via** is the key that made the write, read from the signed token, never from the request. A named key (an app
+  key from `POST /account/keys`, a key from `parachute keys new <name>`, or an approved OAuth app) writes as
+  `key:<name>` on REST and MCP alike. A credential with no named key keeps the channel (`api`, `mcp`) or its class
+  (`operator`, `nostr:<pubkey>`). A revision's `via_kind` is the kind of that key (`person`, `agent`, `app`,
+  `service`), or null; tag-scoped sessions don't receive it, as with `actor` and `via`. A key writing through the
+  account door (`/account/mcp`, including a key that covers several vaults) is stamped the same: the hub's hop to
+  the vault carries the key's name and kind.
+- **by** is the person the write was for: the token's subject (the key's owner), unless the vault's owner let the
+  key write on behalf of others when minting it (`POST /account/keys {..., on_behalf_of: true}`, or
+  `parachute keys new <name> --vault <v> --can write --on-behalf-of`). Then a write may send
+
+  ```
+  Parachute-On-Behalf-Of: client-42
+  ```
+
+  (MCP: an `on_behalf_of` parameter on the write tools, shown only to such a key) and is stamped
+  `by <key name>:client-42`. The prefix comes from the token; the request gives only the id: 1–64 letters, digits,
+  `.`, `_`, `-`, no `:` or `@`. So a "by" a key sets can't be an account, a `nostr:` value or another key's people.
+  A key's name must fit the prefix rule (lowercase `[a-z0-9.-]`, at most 64, not `nostr`, `key`, `grant`, `agent`,
+  `applet`, `token`, `operator`, `migrate`, `surface`, `mcp`, `api`) to get the permission.
+
+Refusals, before anything is written:
+
+| When | Status | `error_type` |
+|---|---|---|
+| The header (or `on_behalf_of`) from a key without the permission | 403 | `on_behalf_not_allowed` |
+| An id outside the rule | 400 | `invalid_on_behalf_of` |
+| The header on a write that records no writer (attachments, history erases, tag schemas, vault config) | 400 | `on_behalf_not_recorded` |
+| A token whose `permissions` carry a key this vault doesn't enforce, or a malformed `key`/`acts_for` | 401 | — |
+
+A read (GET) with the header is answered as usual by a key with the permission, and refused (403) from a key
+without it. The header is answered on the vault's authenticated routes; a few routes outside them (the server-level
+routes, an attachment ticket's spend) never read it and write no stamp. On MCP a batch's `on_behalf_of` goes on the
+call and stamps every item; inside an item it is refused. On-behalf-of never opens access: scope and level are the token's.
+Records written via `/api/notes` and `/api/records` (create, patch, delete, batch, restore) and tag renames carry
+the stamp; an attachment row has no writer.
+
+A "by" is a label, not an account id. Link statements ("client-42 is this Nostr key") are not built; when they are,
+they attach beside the stamp, keyed by the whole "by" string, and the stamp itself never changes.
 
 ## The shapes
 
@@ -363,6 +409,14 @@ GET /vault/default/api/notes?cursor=eyJxaC...
 `next_cursor` is **always present**, even on an empty page — the watermark
 only advances when rows were returned, so a polling client can persist a
 single string and keep calling without special-casing the empty case.
+
+**Tag-scoped passes (0.9.1, scope gap 2).** A scoped page holds the first
+`limit` notes the pass may see after the cursor (the vault reads past hidden
+rows), and `next_cursor` is built from those notes only. A cursor is base64
+JSON anyone holding it can read; before 0.9.1 a scoped cursor could carry a
+hidden note's id and time, and moved on a page of only hidden notes. Now a
+scoped answer is what an unscoped pass gets from a vault holding only the
+notes the scoped one can see. MCP `query-notes` with `cursor` does the same.
 
 **Error shapes.**
 
@@ -606,9 +660,11 @@ actually affected by the bug — only the message string could double.
 
 | `error_type` | HTTP | Key fields | Meaning |
 |---|---|---|---|
+| `retype_conflict` | 409 | `tag`, `field`, `count`, `conflicts[]`, `hint` | 0.9.2: a type PUT changes a field's `type` and existing records hold values the new spec refuses strictly; nothing was changed. `hint` names the migrate call to convert them first (see `PUT /tags/{name}`). |
 | `tag_field_conflict` | 422 | `tag`, `violations[]` (`{field, reason, message, other_tag?}`) | One or more fields in this call conflict with another tag's declaration, OR a field's declared `default` doesn't conform to its own `type`/`enum` (vault#553 Decision B), OR a field declares a `type` outside the recognized vocabulary (vault#555 fix 4). Carries EVERY violation found in one response (vault#553; extended to `invalid_default`/`invalid_type` by vault#555 fix 5 — both REST and MCP used to report only the FIRST bad field of these two classes) and states explicitly that **no changes were applied**. `reason` is `type_conflict` (NON-indexed incoming fields only — see `invalid_indexed_field` for the both-indexed case), `indexed_flag_conflict`, `invalid_default`, or `invalid_type` (the latter two are own-field — no `other_tag`, nothing to scope-scrub); `other_tag` names the conflicting declarer for the cross-tag reasons. **Tag-scope generalization:** for a tag-scoped session, a violation whose conflicting declarer is outside the token's allowlist is generalized — the write is still rejected, but the message names no tag and reveals no declared type/flag, and `other_tag` is omitted. In-scope declarers keep full detail; own-field violations (`invalid_default`/`invalid_type`) are never scrubbed (they never named another tag). |
 | `invalid_indexed_field` | 400 | (message only) | An indexed-field declaration failed: an unsupported type for indexing (only string/integer/boolean/reference/date — this ALSO covers a recognized-but-unindexable type like `array`/`object`/`number`, a different case from a genuinely unrecognized type string, which is `invalid_field_type` below), an invalid identifier (must match `[A-Za-z_][A-Za-z0-9_]{0,62}`), or a cross-tag TYPE conflict where the incoming field is itself `indexed: true` (the pre-existing vault#478 contract — this case stays 400 here rather than joining `tag_field_conflict`'s 422). **Tag-scope generalization:** the cross-declarer message names the other declarer tag(s) + their storage type; for a tag-scoped session with any out-of-scope declarer, the message is generalized (no tag names, no existing type) — same status, same `error_type`. |
 | `invalid_field_default` | 400 | `field` | vault#553 Decision B: a field's declared `default` doesn't match its own `type` (or isn't one of its own `enum` values). Own-field error — a DEFENSE-IN-DEPTH path only as of vault#555 fix 5: both REST's `PUT /api/tags/:name` and MCP's `update-tag` now pre-validate every field and report this bundled as `tag_field_conflict`'s `invalid_default` reason instead (every invalid field in the call, not just the first); this single-violation 400 only surfaces for a caller that bypasses that pre-check (e.g. a direct `store.upsertTagRecord` call from outside REST/MCP). **BREAKING (vault#555 fix 5):** a REST `PUT /api/tags/:name` client that previously pinned on a **400 `invalid_field_default`** for the single-bad-default case now receives **422 `tag_field_conflict`** (with the bad default in `violations[]` as reason `invalid_default`). Re-key on the `tag_field_conflict` 422 + its `violations[]`; the 400 path above is now unreachable from REST/MCP. This aligns REST with MCP's already-bundled reporting. |
+| `indexed_field_limit` | 409 | `field`, `fields[]`, `limit`, `got`, `unused[]` (`{field, reason, declarer_tags}`) | 0.9.2: a write whose new indexed fields (`fields`; `field` is the first) would take the vault past `limit` (88) is refused whole, counted before any column is added; `got` is how many the vault holds. This holds on every Parachute (cloud keeps each as a column, 100 per table, 12 taken). Only a field that would add a column is refused: a second declarer of an indexed field, a re-declare, a sole declarer's retype, and a write that drops one indexed field while adding another all pass. `unused` lists what to drop first: `reason: "no_live_declarer"` (no type declares it; `prune-schema` drops it) before `"no_values"` (no record holds a value; drop `indexed` on every type that declares it). Nothing is written. **Tag-scope:** a scoped session's `unused` (and message) names only fields every declarer of which it can read, and the message says when some were held back. The refusal still tells a scoped caller the vault-wide `got` and, by which of its fields it lists in `fields`, whether a name is already indexed by a type it can't see (as the cross-type conflict errors already do). MCP `update-tag`/`manage-types` carry the same `error_type`, `fields`, `limit`, `got` and `unused`. Importing an export from a vault over the limit restores the fields that fit with their index and the rest unindexed (an import warning) rather than failing; a blow-away import first drops indexed fields no type declares. |
 | `invalid_field_type` | 400 | `field`, `type`, `valid_types[]` | vault#555 fix 4: a field's declared `type` isn't one of the recognized values (`string`/`number`/`integer`/`boolean`/`array`/`object`/`reference`/`date`) — e.g. `type: "frobnicator"`. Before this fix a NON-indexed field's `type` was never validated at all and a bogus type was silently accepted and persisted verbatim (indexed fields already got a type check, but scoped to "unsupported for indexing," not "unrecognized"). Same defense-in-depth posture as `invalid_field_default` — the normal path reports this bundled as `tag_field_conflict`'s `invalid_type` reason (see that row); this single-violation 400 only surfaces for a caller that bypasses the pre-check. |
 | `invalid_relationships` | 400 | (message only) | `relationships` isn't a JSON object, or isn't JSON-serializable. |
 | `invalid_parent_names` | 400 | `field: "parent_names"` | `parent_names` isn't an array of tag-name strings. |
@@ -856,7 +912,45 @@ Current effective config values, with `writeOnly` fields (`scribeBearer`,
 }
 ```
 
+### Records (`/api/records`, `/api/types`) — from 0.9.1
+
+"Record" is the noun. `/vault/{name}/api/records[/...]` is every `/api/notes` route below under its new name
+(list, get, create, patch, delete, batch, versions and restore, attachments, retry-transcription), with the same
+scopes and gates, in the words of the MCP record tools (`query-records`, `create-record`, `update-record`,
+`delete-record`; one translator serves both, `core/src/rest-records.ts`):
+
+| `/api/notes` | `/api/records` |
+|---|---|
+| `content`, `metadata`, `content_edit` | `body`, `fields`, `body_edit` |
+| a batch `{notes: [...]}` / `{notes, next_cursor}` | `{records: [...]}` / `{records, next_cursor}` |
+| `?include_content`, `?include_metadata`, `?content_offset`, `?content_length` | `?include_body`, `?include_fields`, `?body_offset`, `?body_length` |
+| `note_id` in an answer (a version row, a conflict) | `record_id` |
+| `tags`: every name on the note, `types` beside it | `tags`: plain labels only; `types`: what it is |
+
+A person's own field names are never renamed (a field called `content` stays `content` inside `fields`).
+
+- **Writes.** `types` names a record's types (`types: ["task"]`; on PATCH `types: {add, remove}`); `tags` takes plain
+  labels only. A type's name in `tags` is refused with the fix: `422 {error_type: "tag_kind", field: "tags", hint:
+  "types: [...]"}` (the error names the type), and nothing is written (the MCP record tools refuse it the same way). A body that names an old
+  word beside its new one (`body` and `content`) is refused: `400 {error_type: "invalid_query", field: "body"}`.
+  An old word alone is still taken.
+- **`GET /api/records?type=<name>`** — records of that type and its subtypes (`event` finds `event/meeting`); several
+  types match any of them (`&tag_match=all`: all of them); with `?tag=`, records carrying all of them. A plain tag's name is refused with the fix
+  (`422 tag_kind`, use `?tag=`). An empty `?type=` is no filter.
+- **`GET /api/types`** — every type and tag with its `kind` (`"type"` or `"tag"`), `count` and `expanded_count`, as
+  MCP `list-types`; `?include_schema=true` adds each one's fields and parents. **`GET /api/types/{name}`** (or
+  `?name=`) — one in full, as `list-types {name}`. **`PUT` / `DELETE /api/types/{name}`**, `POST /api/types/merge`
+  and `POST /api/types/{name}/rename` are `/api/tags`' writes under the new name, and need `vault:admin`.
+  `/api/tags` keeps its 0.8 shape (no `kind`) through 0.9.
+
+**`/api/notes` is leaving.** It answers as before through 0.9, and every answer (success or error) carries
+`Deprecation: true` and `Link: </vault/{name}/api/records/...>; rel="successor-version"`. Each `/api/notes` route's
+use is counted in the home's `run/deprecations.json` (under `names`); `/api/records` and `/api/types` are counted
+under `adopted`. At 1.0 `/api/notes` answers `410 Gone` with the route to use (SPEC v2 §5.1).
+
 ### Notes
+
+The routes below are 0.8's note door; each one is also served under `/api/records` in record words (above).
 
 #### `GET /vault/{name}/api/notes` — `vault:read`
 Query notes. Returns `NoteIndex[]` by default (lean shape). Many filter
@@ -1010,16 +1104,18 @@ Query params:
 
   Mixing shorthand and operator form on the same field is rejected.
 
-  **Every operator, including `exists`, requires the field to be declared
-  `indexed: true`** in a tag schema (`PUT /api/tags/{name}`) — operators route
-  through the generated column backing the index, so an undeclared field
-  errors loudly (`400 INVALID_QUERY`) rather than scanning every row's JSON.
-  This applies to `exists` too, even though "does this field exist anywhere"
-  reads like it ought to work on any field: `exists` is answered from the
-  SAME generated column every other operator uses, so it needs the field
-  indexed just like `eq`/`gt`/`in`/etc. The plain shorthand
-  (`meta[field]=value`) is the ONLY form that falls back to a `json_extract`
-  scan and works on a non-indexed field.
+  **Every operator works on any field** (0.9.2). On a field declared
+  `indexed: true` in a tag schema (`PUT /api/tags/{name}`) operators route
+  through the generated column backing the index. On any other field they
+  read every record's JSON that the other filters leave and give the same
+  rows the indexed column would, comparing the way a column of the field's
+  declared type does (`string`/`date`/`reference` as text;
+  `integer`/`boolean`/`number` as numbers; an undeclared field compares a
+  number-like value as a number and other text as text). The reply carries a
+  `scan` warning in `X-Parachute-Warnings` naming the fields; declare them
+  `indexed: true` to make the query fast (a `number` field can't be indexed).
+  The plain shorthand (`meta[field]=value`) has always read the JSON and
+  carries no warning.
 
   A query string carries no types, so a shorthand value that is exactly how
   JSON writes a boolean or number reads as one: `meta[done]=true` finds a stored
@@ -1199,8 +1295,9 @@ Query params:
     MEMBERSHIP — a note carrying N of the tags present in the filtered
     result set contributes to N separate groups; a membership rollup, not a
     partition) or an indexed metadata field name. A non-`"tag"` value must
-    be declared `indexed: true` in a tag schema — same `FIELD_NOT_INDEXED`
-    contract `meta[field][op]=` operators and `order_by` use. Required for
+    be declared `indexed: true` in a tag schema, or the request 400s
+    `FIELD_NOT_INDEXED` (filters and `order_by` scan a field that isn't
+    indexed; an aggregate doesn't, since its reply has no warnings). Required for
     `sum`; optional for `count`.
   - `aggregate[op]=count` — number of matching notes per group, or the
     filtered total when `group_by` is omitted.
@@ -1261,11 +1358,10 @@ Query params:
     previously said "by `updated_at`"; that's only true in cursor mode,
     which forces `updated_at ASC` keyset ordering and rejects `sort=desc`
     outright. Outside cursor mode, `sort` orders by `created_at`.)
-  - `order_by=<indexed metadata field>` — sort by a metadata field instead
-    of `created_at`; the field must be declared `indexed: true` in a tag
-    schema or the request 400s `invalid_query` / `FIELD_NOT_INDEXED` (vault#555
-    fix — this previously listed `created_at`/`updated_at` as example valid
-    values; `created_at` is not a metadata field, so it still errors). Two
+  - `order_by=<metadata field>` — sort by a metadata field instead of
+    `created_at`. An indexed field sorts on its index; any other field is
+    sorted by a scan, in the order an indexed column would give, with a `scan`
+    warning (0.9.2; before, it 400'd `FIELD_NOT_INDEXED`). Two
     special values need no `indexed: true` declaration: `link_count` sorts by
     global link DEGREE (see `include_link_count` above), even under tag scope;
     that ordering may disagree with the scoped `linkCount` field.
@@ -1285,7 +1381,7 @@ Query params:
 
 Error shapes notable to callers:
 
-- `400 INVALID_QUERY` — non-indexed `order_by`, unknown operator, cursor +
+- `400 INVALID_QUERY` — unknown operator, cursor +
   incompatible param, a malformed `metadata=` JSON alias (parse failure, or a
   non-object value), or supplying both the `metadata=` alias and bracket
   `meta[...]` forms, etc.
@@ -1391,6 +1487,11 @@ equivalent `[[wikilink]]` in `content` behave the same:
   warning fired for a structured `links` miss but NOT for the equivalent
   content `[[wikilink]]` miss (both were queued identically — only the
   write-time signal was asymmetric).
+- **A note the writer can't see** (0.9.1, scope gap 1). For a tag-scoped
+  pass, a `links` entry, `[[wikilink]]` or `reference` field value that names
+  a note outside its scope is handled exactly like a target that matched
+  nothing: queued, with the same `unresolved_link` warning, and no link is
+  made into the hidden note. A link someone else already made stays.
 - **Genuinely unresolvable** (typo, or a target that will never exist)
   looks identical to the "later call" case on the wire — the write still
   queues it. Use `GET /vault/{name}/api/unresolved-wikilinks` to audit what's
@@ -1516,12 +1617,14 @@ Imported history appears in existing version lists with `origin: "git-import"` a
 
 MCP `query-notes` accepts `versions: {note_id, origin:"git-import", import_ix:0}` for reads. It preserves existing live-note and tag-scope restrictions. Corrupt imported content produces a JSON-RPC error with `error.data.error_type`, `origin`, and `import_ix`; it is not a successful tool result containing an error string. There is no new MCP restore operation.
 
+The hosted door reads imported history with these same shapes. It never reads a git archive itself: the archive is imported on a self-hosted copy with `parachute-vault history-import`, and an operator then sends the result behind the notes of the person's Cloud vault (parachute-cloud `HISTORY.md`, "Operator history import"). Retention on the hosted door is parachute-cloud's to state (its `HISTORY.md`).
+
 History erasure removes retained content through the existing GC rules. Minimal import receipts and commit/blob references remain to prevent re-import after erasure; a full vault wipe removes them. Git committer identity is not historical note authorship: imported rows have null actor and `via: "git-import"`.
 
 ### Version history
 
 Tag-restricted sessions receive version lists and native/imported version reads
-without top-level `actor` or `via`. Stored provenance and unrestricted reads are
+without top-level `actor`, `via` or `via_kind` (see [the write stamp](#the-write-stamp-via-and-by-091)). Stored provenance and unrestricted reads are
 unchanged. This does not anonymize note content or user-authored metadata; see
 [history privacy](history-privacy.md).
 
@@ -1574,10 +1677,10 @@ Versions are **not** full-text searchable.
   run; absent bounds mean unbounded, while explicit zero bounds are 400
   `invalid_request`. Tag-scoped callers and every other method receive 404.
 
-Older version bodies may be stored as deltas against a newer body. Reads are
-transparent: the content returned is always the full body. A deltified version's
-`encoding` is `"fossil-delta"` on the individual GET, but null in the list view,
-which does not resolve storage. A missing base or unknown encoding returns 409
+Older version bodies may be stored compressed, or as deltas against a newer body. Reads are
+transparent: the content returned is always the full body. The individual GET's `encoding` names how the
+body is stored: null (whole text), `"deflate"` (whole, compressed), `"fossil-delta"` or `"fossil-delta-z"`
+(a delta, the second compressed). The list view shows null, since it does not resolve storage. A missing base or unknown encoding returns 409
 `history_unrecoverable`; unscoped doctor reports `history_delta_orphan`.
 The default doctor census checks structure, not content checksums. Opt in to
 `GET /api/doctor?deep=true` (unrestricted sessions only; scoped sessions get 403)
@@ -2017,7 +2120,17 @@ leak for existing out-of-scope tags, vault#560).
 Same as the `?tag=` query — single-tag detail by path, same 404 shape.
 
 #### `PUT /vault/{name}/api/tags/{name}` — `vault:admin`
-Upsert a tag's identity row. Body accepts any combination of:
+Upsert a tag's identity row. A body that changes `parent_names` is a
+re-parent: it is refused with `409 tag_in_use` unless the request carries `?force=true` when the change
+alters who sees what: a live key's tag limit (`permissions.scoped_tags`, read
+from the hub's keys) names the tag, a tag the change moves notes into or out
+of, or (for a re-parent) a tag above it; or `private_tags` or the published
+tag does. The body names the keys (`keys: [name, ...]`, names only, never a
+token or its id), `private_tags` and `published_tag` it touches; check them
+with `parachute keys list` and vault.yaml, then repeat with `?force=true`. If
+the hub's keys can't be read, the change is refused the same way (fail
+closed). MCP takes `force: true` on the same tools. A name counts with every name under it, by `/` (`secret` reaches `secret/diary`) or through declared parents, as scopes and `private_tags` reach them. To a tag-scoped pass every such change needs `force`, and the refusal names no key or tag. A tag-scoped admin pass (minted before 0.9.1) may name only
+parents inside its scope (`403 tag_scope_violation`). Body accepts any combination of:
 
 ```json
 {
@@ -2137,6 +2250,51 @@ against the new type. `POST /vault/{name}/api/tags/{name}/conformance`
 (admin-SPA-internal, undocumented above) counts how many existing notes
 would fail the tightened type before you commit the schema edit.
 
+**Nearest existing name (0.9.2).** A PUT that makes a new type one letter
+from an existing type, or declares a new field one letter from a field
+another type declares, succeeds and adds `warnings: [{code: "near_name",
+kind: "type"|"field", name, nearest, message}]` to its reply. The same
+warning rides a note write that adds such a type (on the note's
+`warnings`), and a note field one letter from a field its types declare is
+warned in `validation_status.warnings` (`reason: "near_name"`, `nearest`).
+Never a refusal; a tag-scoped caller is only named types it may see.
+
+**A retype that would strand records is refused (0.9.2).** When a PUT
+changes the `type` of a field the tag already declares, and existing
+records carrying the tag (or a subtype) hold a value the NEW spec refuses
+strictly (the field is `strict`, or `indexed`, whose type is always
+enforced), the PUT answers `409 retype_conflict` and changes nothing:
+`{error_type: "retype_conflict", tag, field, count, conflicts: [{field,
+from, to, count, sample: [{id, path}]}], hint}`. Those records' next edit
+would be refused (422) until their value is fixed; the count uses the same
+validator writes use (reference targets and `_default` included), so a
+retype it accepts can't be followed by such a 422. Records already refused
+under the type as it is aren't counted: the change doesn't strand them. (A
+PUT that only turns on `strict` or `indexed` isn't a retype and isn't
+checked here; the conformance count warns about those.) The `hint` names the
+migrate call that converts the values first. A retype of a loose field
+(neither strict nor indexed) strands nothing and is accepted, as before. A
+tag-scoped admin gets the counts without `sample`.
+
+#### `POST /vault/{name}/api/tags/{name}/migrate` — `vault:admin` (0.9.2)
+
+Change a field's values on every record carrying the type (descendants
+included), e.g. before a retype. Body `{field, transform, apply?,
+continue_on_error?}`; `transform` is `{kind: "to_string"|"to_int"|
+"to_number"|"to_boolean"}`, `{kind: "rename", to}`, `{kind: "remap", map,
+default?}` or `{kind: "set_default", value, onlyInvalid?}` (the CLI's
+`schema migrate-field` engine). **A dry run unless `apply: true`**: it
+returns `{tag, field, transform, applied: false, scanned, would_change,
+unchanged, errored, sample, errors}` and writes nothing. With `apply:
+true` it returns `changed` instead of `would_change`. Every value is
+converted before the first write, so one that can't be converted stops the
+run with nothing written (`applied: false`) unless `continue_on_error:
+true`. The writes themselves go record by record, not in one transaction:
+a record edited during the run keeps whichever write lands last. Writes that bypass a strict field
+are logged. Admin even for the dry run, and refused (403) to a tag-scoped
+pass: it rewrites, and lists, records beyond its tags. MCP:
+`manage-types {action: "migrate", tag, field, transform, apply?}`.
+
 **Startup migration (schema v24).** Existing vaults get a one-time,
 idempotent startup pass (`migrateToV24`) that reuses `doctor`'s
 `mixed_type_indexed_field` detector: a poisoned value that can be coerced
@@ -2231,8 +2389,19 @@ including the tag-scope generalization.
 #### `DELETE /vault/{name}/api/tags/{name}` — `vault:admin`
 Removes the tag, its identity row, and untags every note. Returns the
 delete result — `{ deleted: true, notes_untagged: number, parent_refs_detached?: number }`.
-Refused with `409 tag_in_use_by_tokens` if any tag-scoped token references
-this tag — revoke or re-mint the tokens first.
+Refused with `409 tag_in_use_by_tokens` if any token in the vault's legacy
+(pre-0.5) tokens table references this tag — revoke or re-mint the tokens first.
+
+**Keys, private tags and the published tag (0.9.1, scope gap 6).** Refused
+with `409 tag_in_use` unless the request carries `?force=true` when the change
+alters who sees what: a live key's tag limit (`permissions.scoped_tags`, read
+from the hub's keys) names the tag, a tag the change moves notes into or out
+of, or (for a re-parent) a tag above it; or `private_tags` or the published
+tag does. The body names the keys (`keys: [name, ...]`, names only, never a
+token or its id), `private_tags` and `published_tag` it touches; check them
+with `parachute keys list` and vault.yaml, then repeat with `?force=true`. If
+the hub's keys can't be read, the change is refused the same way (fail
+closed). MCP takes `force: true` on the same tools. A name counts with every name under it, by `/` (`secret` reaches `secret/diary`) or through declared parents, as scopes and `private_tags` reach them. To a tag-scoped pass every such change needs `force`, and the refusal names no key or tag.
 
 **Referential integrity (vault#552).** Also refused — with `409` and
 `error_type: "tag_referenced_as_parent"`, carrying `{ tag, referencing_tags: [...] }`
@@ -2264,6 +2433,20 @@ Errors:
 - `409 target_exists` — `new_name` (or one of its sub-tags) is already a
   tag. Caller should `POST /tags/merge` instead if combining the two tags
   is the intent.
+- `409 tag_in_use` — see below.
+
+The cascade rewrites only the vault's legacy tokens table: a hub key limited to
+the old name keeps that name, and so loses its notes (or gains the notes of a
+later tag of that name). **Hence: keys, private tags and the published tag (0.9.1, scope gap 6).** Refused
+with `409 tag_in_use` unless the request carries `?force=true` when the change
+alters who sees what: a live key's tag limit (`permissions.scoped_tags`, read
+from the hub's keys) names the tag, a tag the change moves notes into or out
+of, or (for a re-parent) a tag above it; or `private_tags` or the published
+tag does. The body names the keys (`keys: [name, ...]`, names only, never a
+token or its id), `private_tags` and `published_tag` it touches; check them
+with `parachute keys list` and vault.yaml, then repeat with `?force=true`. If
+the hub's keys can't be read, the change is refused the same way (fail
+closed). MCP takes `force: true` on the same tools. A name counts with every name under it, by `/` (`secret` reaches `secret/diary`) or through declared parents, as scopes and `private_tags` reach them. To a tag-scoped pass every such change needs `force`, and the refusal names no key or tag.
 
 **Does NOT rewrite metadata.** A metadata value that happens to equal the
 old tag name (e.g. `metadata.epic: "task"`) is left untouched — rename's
@@ -2295,7 +2478,18 @@ that carried a merged-away source tag has its `updated_at` bumped
 (vault#567), so cursor/sync consumers re-deliver those notes.
 
 Refused with `409 tag_in_use_by_tokens` if any source tag is referenced by
-a tag-scoped token.
+a token in the vault's legacy (pre-0.5) tokens table.
+
+**Keys, private tags and the published tag (0.9.1, scope gap 6).** Refused
+with `409 tag_in_use` unless the request carries `?force=true` when the change
+alters who sees what: a live key's tag limit (`permissions.scoped_tags`, read
+from the hub's keys) names the tag, a tag the change moves notes into or out
+of, or (for a re-parent) a tag above it; or `private_tags` or the published
+tag does. The body names the keys (`keys: [name, ...]`, names only, never a
+token or its id), `private_tags` and `published_tag` it touches; check them
+with `parachute keys list` and vault.yaml, then repeat with `?force=true`. If
+the hub's keys can't be read, the change is refused the same way (fail
+closed). MCP takes `force: true` on the same tools. A name counts with every name under it, by `/` (`secret` reaches `secret/diary`) or through declared parents, as scopes and `private_tags` reach them. To a tag-scoped pass every such change needs `force`, and the refusal names no key or tag. For a merge, the sources and the target count.
 
 **MCP parity (vault#552).** Exposed as the `merge-tags` MCP tool —
 `{ sources: string[], target: string }` — delegating to the SAME
@@ -2312,8 +2506,11 @@ tag-scope-restricted, so a read-scoped monitoring/tending caller doesn't
 need an admin credential over either door), gated BEFORE the generic
 read/write scope check — same dispatch shape as `/api/triggers`.
 
-Never mutates. Returns `{ findings: [...], summary: string, scanned_at: string }`,
-where each finding is `{ type, severity, subject, detail, remedy, heuristic? }`:
+Never mutates. Returns `{ findings: [...], summary: string, scanned_at: string, indexed_fields? }`,
+where each finding is `{ type, severity, subject, detail, remedy, heuristic? }`.
+`indexed_fields` (0.9.2) is `{ count, limit }`: the vault's indexed fields
+against the limit of 88 every Parachute holds (see `indexed_field_limit` in
+the error table); unscoped runs only, since the count is vault-wide.
 
 - `dangling_parent_name` (`warning`) — a `parent_names` entry naming a tag
   with no identity row.
@@ -2340,6 +2537,28 @@ where each finding is `{ type, severity, subject, detail, remedy, heuristic? }`:
   vocabulary, so one of its values coincidentally matching an unrelated
   live tag name no longer drags the enum's OTHER legitimate values into a
   false positive.
+- `mixed_type_field` (`warning`, 0.9.2) — a field that isn't indexed,
+  declared or not, holds values of more than one data type (string,
+  number, boolean, array, object), with the count of each and one example
+  record per type. Indexed fields keep `mixed_type_indexed_field`.
+- `declared_reference_gap` (`info`, 0.9.2) — a field whose text values name
+  another record (its path in any case, `[[path]]`, or its id) in more than
+  half of the records holding text in it, and that no type declares a
+  `reference`. The remedy names the `manage-types` call.
+- `near_names` (`info`, 0.9.2) — two type names, or two field names, one
+  edit apart (case aside). A series (`item1`/`item2`, `phase-a`/`phase-b`)
+  is left out; at most 25 pairs, most used first. Advice: both may be meant.
+- `indexed_field_limit` (`info` at the limit, `warning` over it; 0.9.2,
+  unscoped runs only) — the vault holds 88 indexed fields or more. At 88 the
+  next new indexed field is refused; over 88 (a vault that got there before
+  0.9.2) every field still works, but no new one can be indexed and the
+  vault can't move to cloud until it is back at 88. The remedy lists unused
+  indexed fields.
+
+The three 0.9.2 scans read every record's metadata (timed at about 0.6 s
+and 0.5 s at 94,000 records on a box). A scoped run counts only the records
+it may see, and a reference counts only when its target is one of them, so
+the report can't reveal whether a hidden path exists.
 
 **Tag-scope.** A tag-scoped admin token's scan covers only in-scope
 tags/fields/notes — the report is re-run with the caller's expanded

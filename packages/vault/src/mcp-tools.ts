@@ -9,23 +9,28 @@ import { generateMcpTools, resolveNote } from "../core/src/mcp.ts";
 import { projectHistoryProvenance } from "../core/src/history-visibility.js";
 import type { McpToolDef, GenerateMcpToolsOpts } from "../core/src/mcp.ts";
 import { MCP_TOOL_REFERENCE, acceptedParams } from "../core/src/mcp-manifest.ts";
-import { mergeTypesIntoTags } from "../core/src/tag-kind.ts";
+import { mergeTypesIntoTags, refuseTypesInTags } from "../core/src/tag-kind.ts";
 import { addRecordTools, NOTE_TOOL_NAMES, RECORD_TOOL_NAMES, recordParamNames, recordSchema, recordWords } from "../core/src/mcp-records.ts";
 import { countName } from "./name-usage.ts";
-import { nestedParamProblem, NEW_TOOLS, SHORT_TOOLS, TOOL_ALIASES, TOOL_ORDER, aliasDescription, unknownParams, REFUSES_UNKNOWN_PARAMS, type ParamProblem } from "../core/src/mcp-short.ts";
+import { FOLD_ONLY, nestedParamProblem, NEW_TOOLS, SHORT_TOOLS, TOOL_ALIASES, TOOL_ORDER, aliasDescription, unknownParams, REFUSES_UNKNOWN_PARAMS, type ParamProblem } from "../core/src/mcp-short.ts";
 import { getNote, getNoteTags, getVaultMap, getVaultStats } from "../core/src/notes.ts";
 import { narrowLinkWarningsForVisibility } from "../core/src/wikilinks.ts";
 import type { Note } from "../core/src/types.ts";
 import {
   buildVaultProjection,
+  capVaultInfoTags,
   projectionToMarkdown,
+  connectionReach,
   type VaultProjection,
 } from "../core/src/vault-projection.ts";
 import { readVaultConfig, writeVaultConfig } from "./config.ts";
+import { forceFlag, parentsChange, tagChangeRefusal, type TagChange } from "./tag-change-guard.ts";
+import { stripTagHash } from "../core/src/tag-hierarchy.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { hasScopeForVault, hasMigrateScopeForVault, parseScopes, validateMintedScopes, logStrictBypass } from "./scopes.ts";
 import type { AuthResult } from "./auth.ts";
 import { refineMcpVia } from "./auth.ts";
+import { KEY_NAME_RE, ON_BEHALF_PARAM, resolveBy } from "../core/src/write-stamp.ts";
 import {
   expandTokenTagScope,
   scrubTagCountsForPrivateTags,
@@ -146,6 +151,15 @@ export async function getServerInstruction(
     attachments: { ticketsEnabled: true, readEnabled: true, ticketTool: "attachment-url" },
     // T-407: this door lists the record tools first, so its brief speaks their words.
     words: recordWords,
+    // 0.9.1 (SPEC §3.4): say what this key can read. No auth (local stdio) is the owner's own process: no line.
+    ...(auth
+      ? {
+          reach: connectionReach(
+            hasScopeForVault(auth.scopes, vaultName, "admin") ? "admin" : hasScopeForVault(auth.scopes, vaultName, "write") ? "write" : "read",
+            auth.scoped_tags,
+          ),
+        }
+      : {}),
   });
 }
 
@@ -330,7 +344,7 @@ export function generateScopedMcpTools(
       provider: getSharedAttachmentTicketProvider(),
       vaultName,
       urlBase: ticketUrlBase,
-      ...(ticketNoteVisible ? { noteVisible: ticketNoteVisible } : {}),
+      ...(ticketNoteVisible ? { noteVisible: ticketNoteVisible, scopedTags: rawTags! } : {}),
     },
     // Attachment bytes (Wave 2 model lane): bun always wires a fresh fs
     // provider per session — cheap (stateless), unlike the ticket
@@ -344,8 +358,19 @@ export function generateScopedMcpTools(
   });
 
   overrideVaultInfo(tools, vaultName, auth);
-  applyTagDependencyGuards(tools, vaultName);
+  applyTagDependencyGuards(tools, vaultName, scoped);
   applyTagScopeWrappers(tools, vaultName, auth, allowedHolder);
+  // 0.9.2: vault-info's tag map capped, after the scope filter (the totals count what the caller may see).
+  {
+    const info = tools.find((t) => t.name === "vault-info");
+    if (info) {
+      const execute = info.execute;
+      info.execute = async (params) => {
+        const r = await execute(params);
+        return params?.help === undefined && r && typeof r === "object" && !Array.isArray(r) ? capVaultInfoTags(r as Record<string, unknown>) : r;
+      };
+    }
+  }
 
   // manage-token is server-only (needs token-store + auth context), so it
   // lives here rather than in core. Always appended to the surface; the
@@ -353,11 +378,69 @@ export function generateScopedMcpTools(
   // callers. See vault#376. The raw caller bearer (vault#403, MGT) is
   // forwarded to hub's mint-token attenuation proxy on mint.
   tools.push(buildManageTokenTool(vaultName, auth, callerBearer ?? null));
-  const shaped = byToolOrder(addRecordTools(applyElevenTools(tools, vaultName, auth), (name, kind) => countName(`mcp ${name}`, kind)));
+  // The record door's `tags` hold plain labels (SPEC §2.4): a type's name there is refused with the fix. A name a
+  // tag-scoped session can't see is left to the scope check, so its kind isn't told.
+  const recordCheck = async (tool: string, call: Record<string, unknown>) => {
+    if (tool !== "create-record" && tool !== "update-record") return;
+    const allowed = scoped ? await expandTokenTagScope(store, rawTags) : null;
+    refuseTypesInTags(store.db, call, tool === "create-record" ? "create" : "update", scoped ? (t) => tagVisibleInScope(t, allowed, rawTags) : undefined);
+  };
+  const shaped = byToolOrder(addRecordTools(applyElevenTools(tools, vaultName, auth), (name, kind) => countName(`mcp ${name}`, kind), recordCheck));
   applyRecordWordsToVaultInfo(shaped);
   applyParamTeaching(shaped, vaultName);
+  applyOnBehalf(shaped, auth, (by) => generateScopedMcpTools(vaultName, { ...auth!, actor: by, acts_for: null }, callerBearer, req));
 
   return shaped;
+}
+
+/** The MCP tools whose writes carry the write stamp, by the action that writes (manage-types: only rename does). */
+function stampsWriter(tool: string, params: Record<string, unknown>): boolean {
+  if (["create-note", "update-note", "delete-note", "create-record", "update-record", "delete-record", "rename-tag"].includes(tool)) return true;
+  return tool === "manage-types" && params.action === "rename";
+}
+const STAMP_TOOLS = ["create-note", "update-note", "delete-note", "create-record", "update-record", "delete-record", "rename-tag", "manage-types"];
+
+/**
+ * The write stamp on MCP (core write-stamp.ts). A key with the owner's on-behalf-of permission sees an
+ * `on_behalf_of` parameter on the write tools and may name who a write is for: it is stamped `by <prefix>:<id>`, the
+ * prefix from the token. Every other session never sees the parameter, and a supplied one is refused before
+ * anything runs, on every tool, so it is never ignored. The call runs on the same tools built for that "by" (the
+ * engine reads its stamp once, at build), with the token's own scope: on-behalf-of never opens anything.
+ */
+function applyOnBehalf(tools: McpToolDef[], auth: AuthResult | undefined, withBy: (by: string) => McpToolDef[]): void {
+  const actsFor = auth?.acts_for ?? null;
+  for (const tool of tools) {
+    if (actsFor !== null && STAMP_TOOLS.includes(tool.name)) {
+      const schema = tool.inputSchema as { properties?: Record<string, unknown> };
+      tool.inputSchema = {
+        ...tool.inputSchema,
+        properties: { ...(schema.properties ?? {}), [ON_BEHALF_PARAM]: { type: "string", description: `Who this write is for: your id for them; stamped by "${actsFor}:<id>"` } },
+      };
+    }
+    const execute = tool.execute;
+    tool.execute = async (params) => {
+      // A batch item has no on_behalf_of of its own: the call's applies to every item. One inside an item would
+      // otherwise be ignored, so it is refused.
+      const inItem = Object.values(params ?? {}).some((v) => Array.isArray(v) && v.some((it) => it && typeof it === "object" && ON_BEHALF_PARAM in it));
+      if (inItem) {
+        throw Object.assign(new Error(`${ON_BEHALF_PARAM} goes on the call, not inside a batch item: it stamps every item. Nothing was written.`), {
+          error_type: "invalid_on_behalf_of", field: ON_BEHALF_PARAM, hint: "move on_behalf_of to the top level",
+        });
+      }
+      if (!params || !(ON_BEHALF_PARAM in params)) return execute(params);
+      const { [ON_BEHALF_PARAM]: supplied, ...rest } = params;
+      const r = resolveBy(supplied, actsFor, auth?.actor ?? null, "mcp");
+      if ("refusal" in r) throw Object.assign(new Error(r.refusal.message), { error_type: r.refusal.error_type, field: r.refusal.field, hint: r.refusal.hint });
+      if (!stampsWriter(tool.name, rest)) {
+        throw Object.assign(new Error(`${tool.name} records no writer, so ${ON_BEHALF_PARAM} would be dropped. Nothing was done. Pass it on record writes only.`), {
+          error_type: "on_behalf_not_recorded", field: ON_BEHALF_PARAM, hint: "drop on_behalf_of on this call",
+        });
+      }
+      const twin = withBy(r.by!).find((t) => t.name === tool.name);
+      if (!twin) throw new Error(`${tool.name}: not available for an on-behalf-of write`);
+      return twin.execute(rest);
+    };
+  }
 }
 
 /**
@@ -433,6 +516,7 @@ function applyElevenTools(tools: McpToolDef[], vaultName: string, auth: AuthResu
   }
 
   for (const t of tools) {
+    if (FOLD_ONLY.has(t.name)) continue;
     if (!(t.name in TOOL_ALIASES)) {
       out.push(t);
       continue;
@@ -604,8 +688,41 @@ function withParamWarnings(tool: string, result: unknown, unknown: ParamProblem[
  * `tag_in_use_by_tokens` envelope (routes.ts's DELETE /tags/:name and
  * POST /tags/merge run the identical check).
  */
-function applyTagDependencyGuards(tools: McpToolDef[], vaultName: string): void {
+function applyTagDependencyGuards(tools: McpToolDef[], vaultName: string, scoped: boolean): void {
   const store = getVaultStore(vaultName);
+  // Scope gap 6: a rename, merge, delete or re-parent that changes what a live
+  // key, private_tags or the published tag reaches is refused unless the call
+  // passes `force: true`; the refusal names the keys (src/tag-change-guard.ts,
+  // the same check as the REST tag routes).
+  const guard = (name: string, change: (p: Record<string, any>) => TagChange | null) =>
+    wrapReadTool(tools, name, async (orig, params) => {
+      const p = (params ?? {}) as Record<string, any>;
+      const c = forceFlag(p.force) ? null : change(p);
+      const refusal = c && tagChangeRefusal(vaultName, store, c, { scoped });
+      if (refusal) throw Object.assign(new Error(String(refusal.message)), refusal);
+      return await orig(params);
+    });
+  guard("rename-tag", (p) => {
+    const from = p.old_name ?? p.from ?? p.tag;
+    const to = p.new_name ?? p.to;
+    return typeof from === "string" && typeof to === "string" ? { kind: "rename", from, to } : null;
+  });
+  guard("merge-tags", (p) =>
+    Array.isArray(p.sources) && typeof p.target === "string"
+      ? { kind: "merge", sources: p.sources.filter((x: unknown): x is string => typeof x === "string"), target: p.target }
+      : null);
+  guard("delete-tag", (p) => {
+    const tag = p.tag ?? p.name;
+    return typeof tag === "string" ? { kind: "delete", tag } : null;
+  });
+  guard("update-tag", (p) => {
+    const tag = typeof p.tag === "string" ? stripTagHash(p.tag) : null;
+    if (!tag || p.parent_names === undefined) return null;
+    const parents = Array.isArray(p.parent_names)
+      ? p.parent_names.filter((x: unknown): x is string => typeof x === "string" && x.length > 0).map(stripTagHash)
+      : [];
+    return parentsChange(store, tag, parents) ? { kind: "reparent", tag, parents } : null;
+  });
   wrapReadTool(tools, "delete-tag", async (orig, params) => {
     const tag = (params as any).tag ?? (params as any).name;
     if (typeof tag === "string") {
@@ -716,6 +833,11 @@ function applyTagScopeWrappers(
   // is the unscoped/holder-absent path; `filterHydratedLinksByTagScope` then
   // keys off `rawTags` (non-null here) for the actual scope check.
   const scrubNoteForScope = (n: any): any => {
+    // 0.9.2: a near_name warning on a new type names an existing type; keep it only when that type is in scope.
+    if (n && Array.isArray(n.warnings)) {
+      const allowed = allowedHolder?.value ?? null;
+      n.warnings = n.warnings.filter((w: any) => w?.code !== "near_name" || w?.kind !== "type" || (allowed !== null && allowed.has(w.nearest)));
+    }
     if (n && Array.isArray(n.links)) {
       n.links = filterHydratedLinksByTagScope(n.links, allowedHolder?.value ?? null, rawTags);
     }
@@ -922,7 +1044,9 @@ function applyTagScopeWrappers(
           .filter((n: any) => noteWithinTagScope(n, allowed, rawTags))
           .map(scrubNoteForScope),
         ...("next_cursor" in r ? { next_cursor: r.next_cursor } : {}),
-        // `warnings` intentionally DROPPED for a tag-scoped session: core's
+        // `scan` is kept: it names only the caller's own fields (0.9.2).
+        ...scopeSafeWarnings(r.warnings),
+        // Every other warning is intentionally DROPPED for a tag-scoped session: core's
         // `collectUnknownTagWarnings` (core/src/query-warnings.ts) resolves
         // `did_you_mean` against the FULL vault-wide tag catalog, which
         // would leak an out-of-scope tag's existence/name to a token that
@@ -1062,6 +1186,12 @@ function applyTagScopeWrappers(
     scoped_tags: rawTags,
   });
 
+  // migrate (0.9.2) rewrites every record carrying the type, including ones
+  // outside the allowlist, and its plan lists them: vault-wide, refused.
+  wrapReadTool(tools, "migrate-field", async () => {
+    throw Object.assign(new Error("Forbidden: migrate changes every record of a type, beyond this pass's tags"), forbidden("migrate changes every record of the type, including ones outside the allowlist") as object);
+  });
+
   wrapReadTool(tools, "create-note", async (orig, params) => {
     const allowed = await getAllowed();
     if (!allowed) return await orig(params);
@@ -1141,8 +1271,28 @@ function applyTagScopeWrappers(
     if (typeof tag === "string" && !allowed.has(tag)) {
       return forbidden(`update-tag: tag "${tag}" is outside the token's allowlist`);
     }
+    // Scope gap 6: its parents too, or it could pour its notes into another key's reach.
+    const parents = (params as any).parent_names;
+    if (Array.isArray(parents) && parents.some((p) => typeof p !== "string" || !tagVisibleInScope(stripTagHash(p), allowed, rawTags))) {
+      return forbidden("update-tag: a parent in parent_names is outside the token's allowlist");
+    }
     try {
-      return await orig(params);
+      const result: any = await orig(params);
+      // 0.9.2 near_name warnings come from core's vault-wide name lists: keep a
+      // type warning only when the existing type is in scope, a field warning
+      // only when a type the caller may see declares the field.
+      if (result && typeof result === "object" && Array.isArray(result.warnings)) {
+        const kept = result.warnings
+          .map((w: any) =>
+            w?.code === "near_name" && w.kind === "field" && Array.isArray(w.declared_by)
+              ? { ...w, declared_by: w.declared_by.filter((t: string) => allowed.has(t)) }
+              : w)
+          .filter((w: any) =>
+            w?.code !== "near_name" || (w.kind === "type" ? allowed.has(w.nearest) : Array.isArray(w.declared_by) && w.declared_by.length > 0));
+        const { warnings: _w, ...rest } = result;
+        return kept.length > 0 ? { ...rest, warnings: kept } : rest;
+      }
+      return result;
     } catch (err: any) {
       // Tag-scope scrub for cross-tag field conflicts (vault#554
       // auth-and-scope fold). Core's validation scans EVERY tag's schema
@@ -1499,9 +1649,9 @@ export function manageTokenReference(vaultName: string): { name: string; descrip
       "`long_lived: true` raises the mint TTL cap to 90 days; a 90-day token is a " +
       "standing credential and meaningfully increases blast radius if leaked/misused.\n\n" +
       "Actions (discriminator: `action`):\n" +
-      "- `mint` — { scope: string|string[], ttl_seconds?: number, long_lived?: boolean, description?: string } → { action: \"mint\", token, jti, expires_at, scopes, scoped_tags, vault_name } (vault#555: scopes/scoped_tags/vault_name were previously undocumented here)\n" +
-      "- `revoke` — { jti: string } → { action: \"revoke\", ok: boolean, already_revoked?: boolean } — idempotent; a jti not in this session's ledger, or already revoked, still returns ok:true. A genuine failure additionally carries error/message (and, for a hub-side rejection, hub_status).\n" +
-      "- `list` — (no inputs) → { action: \"list\", tokens: [...] }",
+      "- `mint` — { scope: string|string[], ttl_seconds?: number, long_lived?: boolean, name?: string, description?: string } → { action: \"mint\", token, jti, expires_at, scopes, scoped_tags, vault_name, name? } (vault#555: scopes/scoped_tags/vault_name were previously undocumented here)\n" +
+      "- `revoke` — { name: string } or { jti: string } → { action: \"revoke\", ok: boolean, already_revoked?: boolean } — idempotent; a jti not in this session's ledger, or already revoked, still returns ok:true. A genuine failure additionally carries error/message (and, for a hub-side rejection, hub_status).\n" +
+      "- `list` — (no inputs) → { action: \"list\", tokens: [{ name, jti, scopes, expires_at, revoked_at, … }] }",
     inputSchema: {
       type: "object",
       properties: {
@@ -1530,6 +1680,10 @@ export function manageTokenReference(vaultName: string): { name: string; descrip
           type: "string",
           description: "(action=mint, optional) Free-text label surfaced in the token list + audit trail.",
         },
+        name: {
+          type: "string",
+          description: "(action=mint, optional) The key's name: its writes are stamped `via key:<name>`, and revoke takes the name. Letters, digits, '.', '_', '-'; one key per name, forever.",
+        },
         jti: {
           type: "string",
           description: "(action=revoke) The jti (e.g. `t_abc123…`) returned by a prior mint. Revoke is idempotent — second revoke also returns ok=true.",
@@ -1550,7 +1704,7 @@ function buildManageTokenTool(
     requiredVerb: "admin",
     description:
       "Mint, list or revoke short-lived keys for this vault. mint: `scope` (e.g. \"vault:" + vaultName + ":read\"), " +
-      "`ttl_seconds` (default 900, max 3600, or 90 days with `long_lived: true`), `description`. revoke: `jti`. " +
+      "`ttl_seconds` (default 900, max 3600, or 90 days with `long_lived: true`), `name`, `description`. revoke: `name` or `jti`. " +
       "Minted keys can't exceed yours. Every parameter: vault-info {help: \"manage-token\"}.",
     inputSchema: {
       type: "object",
@@ -1560,6 +1714,7 @@ function buildManageTokenTool(
         ttl_seconds: { type: "number" },
         long_lived: { type: "boolean" },
         description: { type: "string" },
+        name: { type: "string" },
         jti: { type: "string" },
       },
       required: ["action"],
@@ -1720,7 +1875,13 @@ async function mintAction(
   const description = typeof params.description === "string" && params.description.length > 0
     ? params.description
     : null;
-  const label = description ?? `mcp-mint (parent=${auth.caller_jti ?? "unknown"})`;
+  // Keys by name (ROADMAP 0.9.1): `name` names the key; its writes say `via key:<name>`, and list and revoke find it
+  // by that name. The hub refuses a taken name, and a name from a session that is itself a named key.
+  const name = params.name;
+  if (name !== undefined && (typeof name !== "string" || !KEY_NAME_RE.test(name))) {
+    return { action: "mint", error: "invalid_name", message: "manage-keys mint: `name` is letters, digits, '.', '_' and '-', up to 80, starting with a letter or digit." };
+  }
+  const label = (name as string | undefined) ?? description ?? `mcp-mint (parent=${auth.caller_jti ?? "unknown"})`;
 
   // Resolve hub origin (PARACHUTE_HUB_ORIGIN → expose-state FQDN → loopback).
   const hub = resolveHubOrigin();
@@ -1742,6 +1903,7 @@ async function mintAction(
     scope: narrowedScopes.join(" "),
     expiresInSeconds: ttl,
     ...(permissions !== undefined ? { permissions } : {}),
+    ...(typeof name === "string" ? { name } : {}),
   });
 
   if ("kind" in minted) {
@@ -1788,6 +1950,7 @@ async function mintAction(
     scopes: narrowedScopes,
     scoped_tags: auth.scoped_tags,
     vault_name: vaultName,
+    ...(typeof name === "string" ? { name } : {}),
   };
 }
 
@@ -1797,15 +1960,19 @@ async function revokeAction(
   auth: AuthResult,
   callerBearer: string | null,
 ): Promise<Record<string, unknown>> {
-  if (typeof params.jti !== "string" || params.jti.length === 0) {
+  if (params.name !== undefined && params.jti !== undefined) {
+    return { action: "revoke", ok: false, error: "invalid_request", message: "manage-keys revoke: give `name` or `jti`, not both." };
+  }
+  const byName = typeof params.name === "string" && params.name.length > 0;
+  if (!byName && (typeof params.jti !== "string" || params.jti.length === 0)) {
     return {
       action: "revoke",
       ok: false,
       error: "invalid_request",
-      message: "manage-token revoke: `jti` is required (string).",
+      message: "manage-keys revoke: name the key (`name`, as minted) or give its `jti`.",
     };
   }
-  const jti = params.jti;
+  let jti = byName ? "" : (params.jti as string);
 
   // Session-pin: revoke is restricted to hub JWTs THIS MCP session minted.
   // When auth.caller_jti is null (no stable session id — env-var operator,
@@ -1821,6 +1988,17 @@ async function revokeAction(
   }
 
   const store = getVaultStore(vaultName);
+  if (byName) {
+    const matches = listMcpMintedHubJwts(store.db, auth.caller_jti, vaultName).filter((t) => t.label === params.name);
+    if (matches.length > 1) {
+      return { action: "revoke", ok: false, error: "ambiguous", message: `manage-keys revoke: ${matches.length} of this session's keys are labelled "${String(params.name)}"; give the \`jti\` (list shows each).` };
+    }
+    const named = matches[0];
+    if (!named) {
+      return { action: "revoke", ok: false, error: "not_found", message: `manage-keys revoke: this session minted no key called "${String(params.name)}" (list shows the names).` };
+    }
+    jti = named.jti;
+  }
   const entry = findMcpMintLedgerEntry(store.db, jti, auth.caller_jti, vaultName);
   if (!entry) {
     // Idempotency: not-in-this-session's-ledger returns ok=true so the AI's
@@ -1894,6 +2072,14 @@ function listAction(vaultName: string, auth: AuthResult): Record<string, unknown
   // Read from the hub-JWT mint ledger (vault#403, MGT) — mints now live in
   // hub's registry, not the pvt_* tokens table; the ledger is the local
   // session-attribution index.
-  const tokens = listMcpMintedHubJwts(store.db, auth.caller_jti, vaultName);
+  // Each key by its name (the `name` it was minted with, else its description), which revoke also takes.
+  const tokens = listMcpMintedHubJwts(store.db, auth.caller_jti, vaultName).map((t) => ({ name: t.label, ...t }));
   return { action: "list", tokens };
+}
+
+/** The warnings a tag-scoped session may see: those that carry no tag or record information (`scan`). */
+function scopeSafeWarnings(warnings: unknown): { warnings?: unknown[] } {
+  if (!Array.isArray(warnings)) return {};
+  const kept = warnings.filter((w) => (w as { code?: unknown } | null)?.code === "scan");
+  return kept.length > 0 ? { warnings: kept } : {};
 }

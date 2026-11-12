@@ -17,7 +17,7 @@
  */
 import { chunkForInClause } from "./sql-in.js";
 import type { Database } from "bun:sqlite";
-import { stripTagHash } from "./tag-hierarchy.js";
+import { nearestName, stripTagHash } from "./tag-hierarchy.js";
 
 export type TagKind = "type" | "tag";
 
@@ -202,10 +202,16 @@ export function assertTypes(db: Database, names: string[]): void {
  * tag filter, which already expands subtypes: several types match any of them;
  * `type` with `tag` matches all of them.
  */
-export function foldTypeFilter(db: Database, params: Record<string, unknown>): Record<string, unknown> {
+export function foldTypeFilter(
+  db: Database,
+  params: Record<string, unknown>,
+  visible?: (name: string) => boolean,
+): Record<string, unknown> {
   if (params.type === undefined) return params;
   const types = (Array.isArray(params.type) ? params.type : [params.type]).map(String);
-  assertTypes(db, types);
+  // `visible`: a tag-scoped caller's names. A name it can't see is never checked, so its kind isn't told; it
+  // filters as `tag` would (matching nothing the caller can read).
+  assertTypes(db, visible ? types.filter((t) => visible(stripTagHash(t))) : types);
   if (params.expand !== undefined && params.expand !== "subtypes") {
     throw kindError("type always includes subtypes; drop expand, or use tag.", "expand", "drop expand");
   }
@@ -298,6 +304,59 @@ export function mergeTypesIntoTags(item: Record<string, unknown>, mode: "create"
   return { ...rest, tags: { add: [...new Set([...tagAdd, ...add])], remove: [...new Set([...tagRemove, ...remove])] } };
 }
 
+/**
+ * The record door's `tags` hold plain labels only (SPEC §2.4): a type's name there is refused with the fix, so the
+ * field that promises nothing can't apply a type's contract. Checked on a record-door write (MCP create-record and
+ * update-record, REST `/api/records`) after its words are translated: `params` is the note-door call, with `tags`
+ * (a list, or `{add, remove}`) and a batch in `notes`. The note door keeps 0.8's behaviour (a type in `tags` lands
+ * as the type) until 1.0. `visible`: a tag-scoped caller's names; one it can't see is left to the scope check, so
+ * its kind isn't told. Reads only.
+ */
+export function refuseTypesInTags(
+  db: Database,
+  params: Record<string, unknown>,
+  mode: "create" | "update",
+  visible?: (name: string) => boolean,
+): void {
+  const named: [name: string, op: string, at: number][] = [];
+  const items = Array.isArray(params?.notes) ? (params.notes as unknown[]) : [];
+  [params, ...items].forEach((item, i) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return;
+    const tags = (item as Record<string, unknown>).tags;
+    // A create takes a list; an update a list (its add) or {add, remove}.
+    const lists: [string, unknown][] = Array.isArray(tags) || typeof tags === "string"
+      ? [[mode === "create" ? "" : "add", tags]]
+      : tags && typeof tags === "object"
+        ? [["add", (tags as { add?: unknown }).add], ["remove", (tags as { remove?: unknown }).remove]]
+        : [];
+    for (const [op, list] of lists) {
+      for (const raw of Array.isArray(list) ? list : [list]) {
+        const name = typeof raw === "string" ? stripTagHash(raw) : "";
+        if (name && (!visible || visible(name))) named.push([name, op, i - 1]);
+      }
+    }
+  });
+  if (!named.length) return;
+  const types = typeNamesAmong(db, [...new Set(named.map(([n]) => n))]);
+  // A name another record of the same batch makes a type (its `types`) counts too, unless it is a plain tag already
+  // (that record's own write is refused for it). A record naming a new type in its own `types` and `tags` isn't
+  // refused: it makes the type.
+  const typesOf = (item: unknown): string[] => {
+    const t = item && typeof item === "object" && !Array.isArray(item) ? (item as Record<string, unknown>).types : undefined;
+    const list = Array.isArray(t) || typeof t === "string" ? t : t && typeof t === "object" ? (t as { add?: unknown }).add : undefined;
+    return (Array.isArray(list) ? list : [list]).filter((n): n is string => typeof n === "string").map(stripTagHash).filter(Boolean);
+  };
+  let kinds: Map<string, TagKind> | null = null;
+  const madeByAnother = (n: string, at: number) =>
+    at >= 0 && items.some((x, j) => j !== at && typesOf(x).includes(n)) && (kinds ??= tagKinds(db)).get(n) !== "tag";
+  const hit = named.find(([n, , at]) => types.has(n) || madeByAnother(n, at));
+  if (!hit) return;
+  const [name, op] = hit;
+  // The hint is the fix's shape, without the name (the message names it), so it reads the same for every type.
+  const fix = op ? `types: {${op}: [...]}` : "types: [...]";
+  throw kindError(`"${name}" is a type, and tags holds plain labels only: pass it as ${fix.replace("...", `"${name}"`)}.`, "tags", fix);
+}
+
 /** `types` belongs to each note of a batch, never beside `notes`: refused before anything is checked or made. */
 function assertNoBatchLevelTypes(item: Record<string, unknown>): void {
   if (Array.isArray(item.notes)) {
@@ -319,4 +378,121 @@ export function refreshTypes<T>(db: Database, out: T): T {
     return n;
   };
   return fix(out) as T;
+}
+
+/** A write that adds a new type one letter from an existing one (0.9.2): kept, with this warning. */
+export interface NearTypeWarning {
+  code: "near_name";
+  kind: "type";
+  name: string;
+  nearest: string;
+  message: string;
+}
+
+/**
+ * For each type name a write adds that the vault doesn't have yet: the
+ * existing type one letter from it ({@link nearName}), if any. Called before
+ * the write (afterwards the new name exists). `visible` limits the existing
+ * names a tag-scoped caller may be shown.
+ */
+export function nearTypeWarnings(db: Database, names: string[], visible?: (tag: string) => boolean): NearTypeWarning[] {
+  if (names.length === 0) return [];
+  const known = new Set((db.prepare("SELECT name FROM tags").all() as { name: string }[]).map((r) => r.name));
+  const fresh = [...new Set(names)].filter((n) => !known.has(n));
+  if (fresh.length === 0) return [];
+  const types = [...typeNames(db)].filter((t) => !visible || visible(t));
+  const out: NearTypeWarning[] = [];
+  for (const name of fresh) {
+    const nearest = nearestName(types, name);
+    if (nearest === undefined) continue;
+    out.push({
+      code: "near_name",
+      kind: "type",
+      name,
+      nearest,
+      message: `"${name}" is a new type, one letter from the existing type "${nearest}". Kept as written: if you meant "${nearest}", use it instead (types: {add: ["${nearest}"], remove: ["${name}"]}).`,
+    });
+  }
+  return out;
+}
+
+/** Add each warning to the `warnings` of every note in `out` that carries its name. */
+export function attachNearTypeWarnings<T>(out: T, warnings: NearTypeWarning[]): T {
+  if (warnings.length === 0) return out;
+  const fix = (n: unknown): unknown => {
+    if (Array.isArray(n)) return n.map(fix);
+    if (!n || typeof n !== "object") return n;
+    const o = n as Record<string, unknown>;
+    if (Array.isArray(o.notes)) return { ...o, notes: o.notes.map(fix) };
+    if (!Array.isArray(o.tags)) return n;
+    const mine = warnings.filter((w) => (o.tags as string[]).includes(w.name));
+    if (mine.length === 0) return n;
+    return { ...o, warnings: [...(Array.isArray(o.warnings) ? o.warnings : []), ...mine] };
+  };
+  return fix(out) as T;
+}
+
+/** A type PUT naming a new type, or a new field, one letter from an existing one (0.9.2). */
+export interface NearSchemaWarning {
+  code: "near_name";
+  kind: "type" | "field";
+  name: string;
+  nearest: string;
+  /** kind "field": the types that declare `nearest` (a tag-scoped reply keeps the warning only if it may see one). */
+  declared_by?: string[];
+  message: string;
+}
+
+/**
+ * The type PUT's nearest-name warnings, computed before the write: the tag if
+ * it is new and one letter from an existing type, and each field it declares
+ * that no type declares yet and that is one letter from a field some type
+ * does. `visible` (a tag-scoped caller) limits the types, and the types whose
+ * fields, it may be shown.
+ */
+export function nearSchemaWarnings(
+  db: Database,
+  tag: string,
+  fields: Record<string, unknown> | null | undefined,
+  visible?: (tag: string) => boolean,
+): NearSchemaWarning[] {
+  const out: NearSchemaWarning[] = [];
+  const rows = db.prepare("SELECT name, fields FROM tags").all() as { name: string; fields: string | null }[];
+  if (!rows.some((r) => r.name === tag)) {
+    const nearest = nearestName([...typeNames(db)].filter((t) => !visible || visible(t)), tag);
+    if (nearest !== undefined) {
+      out.push({ code: "near_name", kind: "type", name: tag, nearest, message: `"${tag}" is new, one letter from the existing type "${nearest}". Made as written: if you meant "${nearest}", change that one instead.` });
+    }
+  }
+  if (fields && typeof fields === "object") {
+    const declared = new Map<string, string[]>();
+    const keysOf = (raw: string | null | undefined): string[] => {
+      try {
+        const f = raw ? JSON.parse(raw) : null;
+        return f && typeof f === "object" && !Array.isArray(f) ? Object.keys(f) : [];
+      } catch {
+        return []; // a malformed fields row is doctor's business
+      }
+    };
+    for (const r of rows) {
+      if (!r.fields || (visible && !visible(r.name)) || r.name === tag) continue;
+      for (const k of keysOf(r.fields)) declared.set(k, [...(declared.get(k) ?? []), r.name]);
+    }
+    const ownKeys = new Set<string>(keysOf(rows.find((r) => r.name === tag)?.fields));
+    const incoming = Object.keys(fields);
+    for (const name of incoming) {
+      if (declared.has(name) || ownKeys.has(name)) continue;
+      // The type's own fields first (the commonest slip: adding `statu` beside its `status`), then the fields
+      // this same PUT declares, then other types'.
+      const own = nearestName([...ownKeys, ...incoming.filter((k) => k !== name)], name);
+      if (own !== undefined) {
+        out.push({ code: "near_name", kind: "field", name, nearest: own, declared_by: [tag], message: `"${name}" is a new field, one letter from "${own}" on this type. Declared as written: if you meant "${own}", use that name.` });
+        continue;
+      }
+      const nearest = nearestName(declared.keys(), name);
+      if (nearest === undefined) continue;
+      out.push({ code: "near_name", kind: "field", name, nearest, declared_by: declared.get(nearest), message: `"${name}" is a new field, one letter from "${nearest}", which other types declare. Declared as written: if you meant "${nearest}", use that name.` });
+    }
+  }
+  return out;
 }

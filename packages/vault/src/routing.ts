@@ -52,7 +52,9 @@
  * UX audit, 2026-05-25).
  */
 
-import { countName, restRouteName } from "./name-usage.ts";
+import { countName, restRouteName, typesRouteName } from "./name-usage.ts";
+import { recordsRoute } from "../core/src/rest-records.ts";
+import { handleRecordsRest } from "./records-rest.ts";
 import pkg from "../package.json" with { type: "json" };
 import type { VaultConfig } from "./config.ts";
 import type { Note, Store } from "../core/src/types.ts";
@@ -67,6 +69,7 @@ import {
   authenticateGlobalRequest,
   deriveVaultFromToken,
   extractApiKey,
+  type AuthResult,
 } from "./auth.ts";
 import { hasScopeForVault, hasMigrateScopeForVault, SCOPE_ADMIN, SCOPE_READ, scopeForMethod, verbForMethod } from "./scopes.ts";
 import { getSharedEmbeddingProvider, getVaultStore } from "./vault-store.ts";
@@ -131,6 +134,38 @@ import {
 import { getMirrorManager } from "./mirror-registry.ts";
 import { buildUsageReport } from "./usage.ts";
 import { handleTicketSpend } from "./attachment-tickets.ts";
+import { ON_BEHALF_HEADER, resolveBy } from "../core/src/write-stamp.ts";
+
+/**
+ * REST routes whose writes carry the write stamp: everything under /notes (and its /records twin), except
+ * attachments (an attachment row has no writer), and a tag rename (it rewrites notes). A supplied on-behalf-of on
+ * any other write is refused, so it is never silently dropped; a read carries nothing to stamp.
+ */
+function stampsWriter(method: string, apiPath: string | null): boolean {
+  if (method === "GET" || method === "HEAD" || method === "OPTIONS") return true;
+  if (apiPath === null) return false; // not the REST API: /view, the vault root, …
+  // A record's attachments, history erases (DELETE …/versions) and a transcription retry record no writer; restore
+  // (POST …/restore) does. Matched after the id, so a record whose id is "versions" is still a record.
+  if (/^\/(notes|records)(\/|$|\?)/.test(apiPath)) return !/^\/(notes|records)\/[^/]+\/(attachments|versions|retry-transcription)(\/|$)/.test(apiPath);
+  return /^\/(tags|types)\/[^/]+\/rename$/.test(apiPath);
+}
+
+/** The "by" a REST request writes with, or the refusal (as a Response). `apiPath` is the path under /api, or null. */
+export function restWriteStamp(req: Request, apiPath: string | null, auth: AuthResult): { by: string | null } | { refusal: Response } {
+  const supplied = req.headers.get(ON_BEHALF_HEADER) ?? undefined;
+  const r = resolveBy(supplied, auth.acts_for ?? null, auth.actor, "rest");
+  const refuse = (status: number, body: Record<string, unknown>) => ({ refusal: Response.json({ error: body.message, ...body }, { status }) });
+  if ("refusal" in r) return refuse(r.refusal.status, { ...r.refusal });
+  if (supplied !== undefined && !stampsWriter(req.method, apiPath)) {
+    return refuse(400, {
+      error_type: "on_behalf_not_recorded",
+      field: ON_BEHALF_HEADER,
+      message: `${req.method} ${apiPath === null ? "this route" : `/api${apiPath}`} records no writer, so ${ON_BEHALF_HEADER} would be dropped. Nothing was written. Send it on record writes (create, change, delete, batch, restore) only.`,
+      hint: "drop the header on this call",
+    });
+  }
+  return r;
+}
 
 /**
  * Decorate a 401 response from the MCP endpoint with the RFC 9728 challenge
@@ -203,6 +238,15 @@ async function dispatchScopedMcp(
 ): Promise<Response> {
   const auth = await authenticateVaultRequest(req, vaultConfig);
   if ("error" in auth) return withMcpChallenge(auth.error, req, vaultName);
+  // The write stamp on MCP rides each write tool's `on_behalf_of` (mcp-tools.ts applyOnBehalf). The REST header is
+  // never read here, so it is refused rather than dropped.
+  if (req.headers.has(ON_BEHALF_HEADER)) {
+    return Response.json({
+      error: `${ON_BEHALF_HEADER} is the REST header; on MCP, pass on_behalf_of on the write tool (shown to a key the vault's owner let write on behalf of others). Nothing was done.`,
+      error_type: "on_behalf_not_recorded",
+      field: ON_BEHALF_HEADER,
+    }, { status: 400 });
+  }
   // Thread the RAW caller bearer (the exact credential the session presented)
   // into the MCP layer so the manage-token tool can forward it to hub's
   // mint-token attenuation proxy (vault#403, MGT). Only the raw validated
@@ -672,6 +716,12 @@ export async function route(
   if ("error" in auth) {
     return auth.error;
   }
+  // The write stamp, decided once for every authenticated route below (core write-stamp.ts): `by` is the token's
+  // subject unless the request names who the write is for (Parachute-On-Behalf-Of) and the token holds the owner's
+  // on-behalf-of permission. Refused, never ignored, when it doesn't, or when the route records no writer; checked
+  // before any route runs, so a refused request writes nothing. On-behalf-of never opens access.
+  const stamp = restWriteStamp(req, subpath.match(/^\/api(\/.*)?$/) ? (subpath.slice(4) || "/") : null, auth);
+  if ("refusal" in stamp) return stamp.refusal;
 
   // Bare `/vault/<name>` — single-vault root. Returns name, description,
   // createdAt, and stats. One round trip for a viz landing page. Read-gated
@@ -1081,6 +1131,11 @@ export async function route(
   if (!apiMatch) {
     return Response.json({ error: "Not found" }, { status: 404 });
   }
+  // The record door over REST (SPEC §5.1): `/api/records…` runs as its `/api/notes…` twin and `/api/types…` as
+  // `/api/tags…`, so every gate below (scopes, admin routes, tag scope) is the twin's, under the new name too.
+  // The words move in records-rest.ts.
+  const recordsDoor = recordsRoute(apiMatch[1] ?? "");
+  if (recordsDoor) apiMatch[1] = recordsDoor.twin;
 
   // /api/triggers — runtime trigger-registration API. Dispatched BEFORE the
   // generic method→verb scope gate below because it's ADMIN-scoped on EVERY
@@ -1152,14 +1207,16 @@ export async function route(
   // `vault:write` here — a gap between doors (a `vault:write` token could
   // rename/merge/delete/update a tag over REST while MCP already refused
   // it). Matches PUT/DELETE `/tags/:name` (update-tag / delete-tag), POST
-  // `/tags/merge` (merge-tags), and POST `/tags/:name/rename` (rename-tag).
+  // `/tags/merge` (merge-tags), POST `/tags/:name/rename` (rename-tag), and
+  // POST `/tags/:name/migrate` (0.9.2; its dry run too: the plan lists
+  // records across the whole vault).
   // Deliberately does NOT match `/tags/:name/conformance` (2 path segments,
   // not 1 — see `isReadOnlyPost` above for that endpoint's own, lower tier)
   // or plain GET `/tags[/:name]` (read, unaffected).
   const isTagSchemaMutation =
     ((req.method === "PUT" || req.method === "DELETE") && /^\/tags\/[^/]+$/.test(apiSubpath)) ||
     (req.method === "POST" &&
-      (apiSubpath === "/tags/merge" || /^\/tags\/[^/]+\/rename$/.test(apiSubpath)));
+      (apiSubpath === "/tags/merge" || /^\/tags\/[^/]+\/(rename|migrate)$/.test(apiSubpath)));
   // Erasing note history is irreversible and requires admin (vault#524). So does a delete that erases it
   // (`?erase_history=`, T-412): any value but an absent or explicit false is gated here, and the handler refuses a
   // value it can't read. Listing deleted notes with history left is the same admin's job.
@@ -1216,12 +1273,20 @@ export async function route(
   // notes that violate `strict:true` field constraints (for backfill /
   // migration). Every bypassed write is logged. Orthogonal to read/write/admin
   // — an admin token does NOT bypass unless it also holds `migrate`.
+  // The write stamp: `via` is the token's (a named key says `key:<name>`); `by` was settled above (`stamp`).
   const writeCtx: WriteCtx = {
-    actor: auth.actor,
+    actor: stamp.by,
     via: auth.via,
     bypassStrict: hasMigrateScopeForVault(auth.scopes, vaultName),
   };
 
+  if (apiPath.startsWith("/notes") && recordsDoor) {
+    // /api/records: the same route under its record name, counted as adopted (never as deprecated).
+    const route = restRouteName(req.method, apiPath);
+    if (route) countName(route.replace(" /api/notes", " /api/records"), "new");
+    return handleRecordsRest(req, recordsDoor, `/vault/${vaultName}/api`, store, tagScope, (twin) =>
+      handleNotes(twin, store, apiPath.slice(6), vaultName, tagScope, writeCtx));
+  }
   if (apiPath.startsWith("/notes")) {
     // T-407: /api/notes is note-named; count each route's use for the 1.0 decision (names only, never ids).
     const route = restRouteName(req.method, apiPath);
@@ -1246,6 +1311,11 @@ export async function route(
       },
       { status: 410 },
     );
+  }
+  if (apiPath.startsWith("/tags") && recordsDoor) {
+    countName(typesRouteName(req.method, apiPath), "new");
+    return handleRecordsRest(req, recordsDoor, `/vault/${vaultName}/api`, store, tagScope, (twin) =>
+      handleTags(twin, store, apiPath.slice(5), tagScope, writeCtx));
   }
   if (apiPath.startsWith("/tags")) return handleTags(req, store, apiPath.slice(5), tagScope, writeCtx);
   if (isHistoryCompact) return handleHistoryCompact(req, store, tagScope);

@@ -29,6 +29,7 @@ import {
   warnNoTranscriptionProvider,
 } from "./auto-transcribe.ts";
 import { invalidateUsageCache } from "./usage.ts";
+import { expandTokenTagScope, noteWithinTagScope } from "./tag-scope.ts";
 
 function json(data: unknown, status = 200): Response {
   return Response.json(data, { status });
@@ -168,6 +169,20 @@ async function takeValidTicket(
   return ticket;
 }
 
+/**
+ * Scope gap 7: a ticket minted by a tag-scoped session is spent only while its
+ * note is still inside that scope, as the scope is at spend time (the note may
+ * have been retagged, its tag re-parented, or made private since the mint).
+ * Otherwise the spend answers the same 404 as an unknown ticket. A ticket
+ * minted without a scope is unaffected.
+ */
+async function ticketNoteInScope(store: Store, ticket: AttachmentTicket, noteId: string): Promise<boolean> {
+  if (!ticket.scopedTags) return true;
+  const note = await store.getNote(noteId);
+  if (!note) return false;
+  return noteWithinTagScope(note, await expandTokenTagScope(store, ticket.scopedTags), ticket.scopedTags);
+}
+
 function ticketNotFound(): Response {
   return json(
     {
@@ -214,6 +229,7 @@ async function handleUploadSpend(
 ): Promise<Response> {
   const ticket = await takeValidTicket(provider, ticketId, vaultName, "upload");
   if (!ticket || !ticket.noteId || !ticket.filename || !ticket.mimeType) return ticketNotFound();
+  if (!(await ticketNoteInScope(store, ticket, ticket.noteId))) return ticketNotFound();
 
   // Declared size at mint IS the enforced cap here — tighter than the flat
   // REST ceiling, per the ticket's own promise (`max_bytes` in the mint
@@ -351,6 +367,7 @@ async function handleDownloadSpend(
   // slow curl); fold that into the same uniform 404 rather than a 500.
   const attachment = await store.getAttachment(ticket.attachmentId);
   if (!attachment) return ticketNotFound();
+  if (!(await ticketNoteInScope(store, ticket, attachment.noteId))) return ticketNotFound();
 
   const assets = assetsDir(vaultName);
   const filePath = normalize(join(assets, attachment.path));

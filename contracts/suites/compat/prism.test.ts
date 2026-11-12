@@ -16,9 +16,9 @@
 import { beforeAll, describe, expect, test } from "bun:test";
 import { hubCli } from "../../harness/services.ts";
 import { enc, mcp, rest, runId, safeFetch, services } from "../lib.ts";
+import { firstDifference, type Logged, type Prefix, PREFIXES, prefixed } from "./_prefix.ts";
 
 const s = services();
-const R = runId("prism");
 const AUD = `vault.${s.vaultName}`;
 
 // Copied from Prism, apps/server/src/agent-profiles.ts:34-51 (snapshot 55ac3df). If Prism changes them, change them here.
@@ -112,16 +112,21 @@ describe("compat/prism: tokens", () => {
   });
 });
 
-describe("compat/prism: REST", () => {
-  let api: ReturnType<typeof rest>;
+// Once per prefix: /api/notes as Prism calls it today, and /api/records as it calls it once moved (vault-door.ts);
+// the two must answer alike (ROADMAP 0.9.1). _prefix.ts says how the record words are sent and read back.
+const restLogs: Record<Prefix, Logged[]> = { notes: [], records: [] };
+
+for (const prefix of PREFIXES) describe(`compat/prism: REST on /api/${prefix}`, () => {
+  const R = runId(`prism-${prefix}`);
+  let api: ReturnType<typeof prefixed>;
   let id = "";
   let stamp = "";
   beforeAll(() => {
-    api = rest(s.vaultViaHub, tokens.write);
+    api = prefixed(s.vaultViaHub, tokens.write, prefix, restLogs[prefix], [R]);
   });
 
   test("no token → 401", async () => {
-    const r = await safeFetch(`${s.vaultViaHub}/api/notes?limit=1`);
+    const r = await api.anonymous("?limit=1");
     expect(r.status).toBe(401);
   });
 
@@ -182,7 +187,7 @@ describe("compat/prism: REST", () => {
   });
 
   test("a read pass cannot write", async () => {
-    const ro = await rest(s.vaultViaHub, tokens.read).patch(`/notes/${enc(id)}`, { content: "ro", force: true });
+    const ro = await prefixed(s.vaultViaHub, tokens.read, prefix).patch(`/notes/${enc(id)}`, { content: "ro", force: true });
     expect([401, 403]).toContain(ro.status);
   });
 
@@ -198,6 +203,13 @@ describe("compat/prism: REST", () => {
     const del = await api.del(`/notes/${enc(id)}`);
     expect(del.status).toBeLessThan(300);
     expect((await api.get(`/notes/${enc(id)}`)).status).toBe(404);
+  });
+});
+
+describe("compat/prism: REST, both prefixes", () => {
+  test("/api/notes and /api/records answered every call alike (status, and the answer's shape in note words)", () => {
+    expect(restLogs.notes.length).toBeGreaterThan(0);
+    expect(firstDifference(restLogs.notes, restLogs.records)).toBeNull();
   });
 });
 

@@ -12,7 +12,9 @@
  */
 import type { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { encodeDelta, decodeDelta } from "./delta.js";
+import { encodeDelta, applyDeltaBytes } from "./delta.js";
+import { isWhole, isDelta, wholeText, deltaBytes, wholeSql, BlobDecodeError, type StoredContent } from "./blob-codec.js";
+import { kindOfVia } from "./write-stamp.js";
 import { transaction } from "./txn.js";
 import { refreshCompactState } from "./history-compact-state.js";
 
@@ -90,6 +92,8 @@ export interface VersionRow {
   superseded_at: string;
   actor: string | null;
   via: string | null;
+  /** The kind of the key in `via` (person, agent, app, service), or null: the write stamp (write-stamp.ts). */
+  via_kind: string | null;
   op: HistoryOp;
   content_len: number;
   encoding: string | null;
@@ -200,7 +204,7 @@ export function captureVersion(
     const ix = nextIndex(db, prior.id);
     db.prepare(
       `INSERT INTO note_versions (note_id, version_ix, content_hash, path, metadata, extension,
-      superseded_at, actor, via, op, content_len, encoding, created_at) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, 'delete', ?, 'overflow', ?)`,
+      superseded_at, actor, via, via_kind, op, content_len, encoding, created_at) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, 'delete', ?, 'overflow', ?)`,
     ).run(
       prior.id,
       ix,
@@ -210,6 +214,7 @@ export function captureVersion(
       new Date().toISOString(),
       opts.actor,
       opts.via,
+      kindOfVia(opts.via),
       size,
       prior.created_at,
     );
@@ -223,7 +228,7 @@ export function captureVersion(
   const ix = nextIndex(db, prior.id);
   db.prepare(
     `INSERT INTO note_versions (note_id, version_ix, content_hash, path, metadata, extension,
-    superseded_at, actor, via, op, content_len, encoding, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
+    superseded_at, actor, via, via_kind, op, content_len, encoding, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
   ).run(
     prior.id,
     ix,
@@ -234,6 +239,7 @@ export function captureVersion(
     new Date().toISOString(),
     opts.actor,
     opts.via,
+    kindOfVia(opts.via),
     opts.op,
     size,
     prior.created_at,
@@ -251,14 +257,15 @@ export function appendRestoreMarker(
   const ix = nextIndex(db, noteId);
   db.prepare(
     `INSERT INTO note_versions (note_id, version_ix, content_hash, path, metadata, extension,
-    superseded_at, actor, via, op, content_len, encoding, created_at)
-    SELECT note_id, ?, content_hash, path, metadata, extension, ?, ?, ?, 'restore', content_len, encoding, created_at
+    superseded_at, actor, via, via_kind, op, content_len, encoding, created_at)
+    SELECT note_id, ?, content_hash, path, metadata, extension, ?, ?, ?, ?, 'restore', content_len, encoding, created_at
       FROM note_versions WHERE note_id = ? AND version_ix = ?`,
   ).run(
     ix,
     new Date().toISOString(),
     attr.actor,
     attr.via,
+    kindOfVia(attr.via),
     noteId,
     tombstone.version_ix,
   );
@@ -344,7 +351,7 @@ export function sweepDeletedHistory(
   });
 }
 const columns =
-  "note_id, version_ix, content_hash, path, metadata, extension, superseded_at, actor, via, op, content_len, encoding, created_at";
+  "note_id, version_ix, content_hash, path, metadata, extension, superseded_at, actor, via, via_kind, op, content_len, encoding, created_at";
 function parseRow(row: RawVersionRow): VersionRow {
   let metadata: Record<string, unknown> = {};
   try {
@@ -526,45 +533,65 @@ export function deletedHistoryStats(db: Database): {
 
 export class HistoryDeltaOrphanError extends Error {
   readonly code = "HISTORY_UNRECOVERABLE";
-  constructor(readonly hash: string, readonly delta_of: string | null, readonly reason: "unknown_encoding" | "base_missing" | "base_not_whole" | "bad_delta" | "identity_mismatch") {
+  constructor(readonly hash: string, readonly delta_of: string | null, readonly reason: "unknown_encoding" | "base_missing" | "base_not_whole" | "bad_delta" | "bad_encoding" | "identity_mismatch") {
     super(`History delta cannot be reconstructed: ${reason}`);
     this.name = "HistoryDeltaOrphanError";
   }
 }
 interface BlobReadRow {
-  content: string | null;
+  content: StoredContent | null;
   blob_encoding: string | null;
   delta_of: string | null;
 }
+/**
+ * Decode one blob to its body (blob-codec.ts lists the encodings): inflate when deflated, refuse a body over
+ * VERSION_MAX_BYTES, apply the delta against its whole base when there is one, then check the hash.
+ */
 function materialise(db: Database, hash: string, row: BlobReadRow): string | null {
   if (row.content === null)
     return null;
-  if (row.blob_encoding === null) {
-    if (hashContent(row.content) !== hash)
-      throw new HistoryDeltaOrphanError(hash, row.delta_of, "identity_mismatch");
-    return row.content;
-  }
-  if (row.blob_encoding !== "fossil-delta")
-    throw new HistoryDeltaOrphanError(hash, row.delta_of, "unknown_encoding");
-  const base = row.delta_of ? db.prepare("SELECT content, encoding FROM note_blobs WHERE hash = ?").get(row.delta_of) as {
-    content: string;
-    encoding: string | null;
-  } | null : null;
-  if (!base)
-    throw new HistoryDeltaOrphanError(hash, row.delta_of, "base_missing");
-  if (base.encoding !== null)
-    throw new HistoryDeltaOrphanError(hash, row.delta_of, "base_not_whole");
   let text: string;
-  try {
-    text = decodeDelta(base.content, row.content);
+  if (isWhole(row.blob_encoding)) {
+    try {
+      text = wholeText(row.content, row.blob_encoding, VERSION_MAX_BYTES);
+    }
+    catch {
+      throw new HistoryDeltaOrphanError(hash, row.delta_of, "bad_encoding");
+    }
   }
-  catch {
-    throw new HistoryDeltaOrphanError(hash, row.delta_of, "bad_delta");
+  else {
+    if (!isDelta(row.blob_encoding))
+      throw new HistoryDeltaOrphanError(hash, row.delta_of, "unknown_encoding");
+    const base = row.delta_of ? db.prepare("SELECT content, encoding FROM note_blobs WHERE hash = ?").get(row.delta_of) as {
+      content: StoredContent;
+      encoding: string | null;
+    } | null : null;
+    if (!base)
+      throw new HistoryDeltaOrphanError(hash, row.delta_of, "base_missing");
+    if (!isWhole(base.encoding))
+      throw new HistoryDeltaOrphanError(hash, row.delta_of, "base_not_whole");
+    let baseText: string, delta: Uint8Array;
+    try {
+      baseText = wholeText(base.content, base.encoding, VERSION_MAX_BYTES);
+      delta = deltaBytes(row.content, row.blob_encoding!, VERSION_MAX_BYTES + DELTA_SLACK_BYTES);
+    }
+    catch (err) {
+      if (!(err instanceof BlobDecodeError)) throw err;
+      throw new HistoryDeltaOrphanError(hash, row.delta_of, "bad_encoding");
+    }
+    try {
+      text = applyDeltaBytes(baseText, delta, VERSION_MAX_BYTES);
+    }
+    catch {
+      throw new HistoryDeltaOrphanError(hash, row.delta_of, "bad_delta");
+    }
   }
   if (hashContent(text) !== hash)
     throw new HistoryDeltaOrphanError(hash, row.delta_of, "identity_mismatch");
   return text;
 }
+/** A delta of a body under VERSION_MAX_BYTES can carry a little more than the body itself (headers, a checksum). */
+const DELTA_SLACK_BYTES = 65_536;
 export function readBlobContent(db: Database, hash: string): string | null {
   const row = db.prepare("SELECT content, encoding AS blob_encoding, delta_of FROM note_blobs WHERE hash = ?").get(hash) as BlobReadRow | null;
   return row ? materialise(db, hash, row) : null;
@@ -592,19 +619,19 @@ export function historyStorageStats(db: Database) {
     bytes: number;
   }[];
   for (const g of groups) {
-    if (g.encoding === null) {
-      stats.whole_blobs = g.n;
-      stats.whole_bytes = g.bytes;
+    if (isWhole(g.encoding)) {
+      stats.whole_blobs += g.n;
+      stats.whole_bytes += g.bytes;
     }
-    else if (g.encoding === "fossil-delta") {
-      stats.delta_blobs = g.n;
-      stats.delta_bytes = g.bytes;
+    else if (isDelta(g.encoding)) {
+      stats.delta_blobs += g.n;
+      stats.delta_bytes += g.bytes;
     }
     else
       stats.unknown_encoding_blobs += g.n;
   }
-  stats.orphan_deltas = (db.prepare(`SELECT COUNT(*) AS n FROM note_blobs d WHERE d.encoding = 'fossil-delta'
-  AND (d.delta_of IS NULL OR NOT EXISTS (SELECT 1 FROM note_blobs b WHERE b.hash = d.delta_of AND b.encoding IS NULL))`).get() as {
+  stats.orphan_deltas = (db.prepare(`SELECT COUNT(*) AS n FROM note_blobs d WHERE d.encoding IN ('fossil-delta', 'fossil-delta-z')
+  AND (d.delta_of IS NULL OR NOT EXISTS (SELECT 1 FROM note_blobs b WHERE b.hash = d.delta_of AND ${wholeSql("b")}))`).get() as {
     n: number;
   }).n;
   return stats;
@@ -691,7 +718,7 @@ export function compactNote(db: Database, noteId: string, policy: HistoryPolicy)
       } | null;
       if (!baseRow)
         continue;
-      const baseHash = baseRow.encoding === null ? baseRow.hash : baseRow.delta_of;
+      const baseHash = isWhole(baseRow.encoding) ? baseRow.hash : baseRow.delta_of;
       if (!baseHash)
         continue;
       const base = db.prepare("SELECT encoding FROM note_blobs WHERE hash = ?").get(baseHash) as {
@@ -700,7 +727,7 @@ export function compactNote(db: Database, noteId: string, policy: HistoryPolicy)
       if (!base)
         continue;
       // Never propagate a pre-existing depth-two chain into healthy blobs.
-      if (base.encoding !== null)
+      if (!isWhole(base.encoding))
         throw new HistoryDeltaOrphanError(baseRow.hash, baseHash, "base_not_whole");
       const text = readBlobContent(db, baseHash);
       if (text === null)

@@ -45,6 +45,7 @@ import { resolveHubIssuer } from "../hub-issuer.ts";
 import { inferAudience } from "../jwt-audience.ts";
 import {
   type RevokeActor,
+  KeyNameTakenError,
   TokenMintPrincipalGoneError,
   findTokenRowByJti,
   recordTokenMint,
@@ -67,8 +68,9 @@ import { logPath as hubLogPath } from "../process-state.ts";
 import { bindPubkeyOperatorAttested, findPubkeyLink } from "../pubkey-links.ts";
 import { isNonRequestableScope } from "../scope-explanations.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
+import { keyClaim, nextKeyName, onBehalfNameProblem, ownerOf } from "../keys.ts";
 import { generateTotpSecret, otpauthUrlFor, verifyTotpCode } from "../totp.ts";
-import { ENFORCED_PERMISSION_KEYS, unknownPermissionKeys } from "../permissions-claim.ts";
+import { ENFORCED_PERMISSION_KEYS, scopedAdminProblem, unknownPermissionKeys } from "../permissions-claim.ts";
 import {
   clearEnrollment,
   getTotpState,
@@ -151,7 +153,7 @@ Usage:
                                             [--ephemeral | --expires-in <seconds>]
                                             [--label <label>] [--user <username|id>]
                                             [--service <name>] [--permissions <json>]
-                                            [--json]
+                                            [--on-behalf-of] [--json]
                                        Mint a scope-narrow JWT. Person-mint
                                        JWT sub is the hub account id (stdout =
                                        JWT). --label is the display label
@@ -164,6 +166,10 @@ Usage:
                                        lifetime is 90d. --ttl is the deprecated
                                        lifetime alias. --json prints
                                        {token, jti, exp, scopes, aud}.
+                                       A --label names the key: its writes
+                                       say "via key:<label>". --on-behalf-of
+                                       (with --label) lets it write for
+                                       people it names: "by <label>:<id>".
   parachute auth revoke-token <jti> [--break-glass] [--json]
                                        Mark a registry-row token revoked
                                        by jti. Idempotent: a re-revoke
@@ -1032,6 +1038,8 @@ interface MintTokenFlags {
   ephemeral?: boolean;
   /** --json: print {token, jti, exp, scopes, aud} instead of the bare JWT (PLAN §3, Benjamin's E5). */
   json?: boolean;
+  /** --on-behalf-of: the named key (--label) may write on behalf of people it names, as `<label>:<id>`. */
+  onBehalfOf?: boolean;
   error?: string;
 }
 
@@ -1048,6 +1056,7 @@ function parseMintTokenFlags(args: readonly string[]): MintTokenFlags {
   let ttlDeprecationSeen = false;
   let ephemeral = false;
   let json = false;
+  let onBehalfOf = false;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === "--scope") {
@@ -1119,6 +1128,8 @@ function parseMintTokenFlags(args: readonly string[]): MintTokenFlags {
       ephemeral = true;
     } else if (a === "--json") {
       json = true;
+    } else if (a === "--on-behalf-of") {
+      onBehalfOf = true;
     } else {
       return { error: `unknown flag "${a}"` };
     }
@@ -1153,6 +1164,7 @@ function parseMintTokenFlags(args: readonly string[]): MintTokenFlags {
     ttlDeprecationSeen,
     ephemeral,
     json,
+    onBehalfOf,
   };
 }
 
@@ -1261,6 +1273,12 @@ async function runMintToken(args: readonly string[], deps: AuthDeps): Promise<nu
         console.error(
           `parachute auth mint-token: --permissions has unknown key(s) ${unknownKeys.join(", ")}; a vault enforces only ${ENFORCED_PERMISSION_KEYS.join(", ")}`,
         );
+        return 1;
+      }
+      // Scope gap 4: a tag limit narrows read and write, never admin.
+      const scopedAdmin = scopedAdminProblem(scopes, parsed);
+      if (scopedAdmin !== null) {
+        console.error(`parachute auth mint-token: ${scopedAdmin}`);
         return 1;
       }
       permissions = JSON.stringify(parsed);
@@ -1413,47 +1431,84 @@ async function runMintToken(args: readonly string[], deps: AuthDeps): Promise<nu
       subjectLabel = asLabel ?? bearerUser.id;
     }
 
-    const minted = await signAccessToken(db, {
-      sub: jwtSub,
-      scopes,
-      audience,
-      clientId: OPERATOR_TOKEN_CLIENT_ID,
-      issuer,
-      ttlSeconds,
-      vaultScope: [], // CLI-mint tokens are operator-scoped; no per-user vault pin
-      ...(permissionsClaim !== undefined ? { extraClaims: { permissions: permissionsClaim } } : {}),
-    });
-
-    if (deps.afterSign) {
-      await deps.afterSign({ token: minted.token, jti: minted.jti, userId: mintUserId });
+    // The write stamp (ROADMAP 0.9.1): a labelled pass is a named key, so its name and kind are signed into it and
+    // the vault stamps its writes `via key:<name>`; with --on-behalf-of it may also say who a write is for, as
+    // `<name>:<id>` (vault core write-stamp.ts). A pass with no label keeps today's stamps.
+    if (flags.onBehalfOf && !asLabel) {
+      console.error("parachute auth mint-token: --on-behalf-of needs --label <name>: the key's name is the prefix its writes carry");
+      return 1;
     }
-
-    // Write a registry row (hub#212 Phase 1 / hub#833). Person-mint JWT
-    // sub is users.id and user_id is set; tokens.subject is the display
-    // label. Service mints leave user_id NULL. The JWT is its own access
-    // token, so refresh_token_hash + family_id stay NULL.
-    try {
-      recordTokenMint(db, {
-        jti: minted.jti,
-        createdVia: "cli_mint",
-        subject: subjectLabel,
-        ...(mintUserId
-          ? {
-              userId: mintUserId,
-              ...(mintUserUpdatedAt ? { userUpdatedAt: mintUserUpdatedAt } : {}),
-            }
-          : {}),
-        clientId: OPERATOR_TOKEN_CLIENT_ID,
-        scopes,
-        expiresAt: minted.expiresAt,
-        ...(permissions !== undefined ? { permissions } : {}),
-      });
-    } catch (err) {
-      if (err instanceof TokenMintPrincipalGoneError) {
-        console.error(`parachute auth mint-token: ${err.message}`);
-        return 1;
+    let minted: Awaited<ReturnType<typeof signAccessToken>>;
+    // The key's name is picked before signing; if another mint takes it before this one is recorded, sign again
+    // under the next free name (nothing of the first attempt is kept, KeyNameTakenError).
+    for (let attempt = 1; ; attempt++) {
+      let keyName: string | undefined;
+      let topKey: Record<string, unknown> = {};
+      const stampClaims: Record<string, unknown> = {};
+      if (asLabel) {
+        const name = nextKeyName(db, { subject: subjectLabel, user_id: mintUserId, client_id: OPERATOR_TOKEN_CLIENT_ID, created_via: "cli_mint" });
+        const claim = keyClaim(name, ownerOf({ user_id: mintUserId, client_id: OPERATOR_TOKEN_CLIENT_ID, created_via: "cli_mint", subject: subjectLabel }).owner_kind);
+        if ("key" in claim) {
+          keyName = name;
+          topKey = { ...claim };
+        }
+        if (flags.onBehalfOf) {
+          const problem = keyName === asLabel ? onBehalfNameProblem(asLabel) : `a key called "${asLabel}" already exists (revoked keys keep their names); pick another name`;
+          if (problem) {
+            console.error(`parachute auth mint-token: --on-behalf-of: ${problem}`);
+            return 1;
+          }
+          stampClaims.acts_for = asLabel;
+        }
       }
-      throw err;
+      const mergedPermissions = Object.keys(stampClaims).length > 0 ? { ...(permissionsClaim ?? {}), ...stampClaims } : permissionsClaim;
+      const rowPermissions = mergedPermissions !== undefined ? JSON.stringify(mergedPermissions) : undefined;
+
+      minted = await signAccessToken(db, {
+        sub: jwtSub,
+        scopes,
+        audience,
+        clientId: OPERATOR_TOKEN_CLIENT_ID,
+        issuer,
+        ttlSeconds,
+        vaultScope: [], // CLI-mint tokens are operator-scoped; no per-user vault pin
+        ...(mergedPermissions !== undefined || keyName !== undefined ? { extraClaims: { ...topKey, ...(mergedPermissions !== undefined ? { permissions: mergedPermissions } : {}) } } : {}),
+      });
+
+      if (deps.afterSign) {
+        await deps.afterSign({ token: minted.token, jti: minted.jti, userId: mintUserId });
+      }
+
+      // Write a registry row (hub#212 Phase 1 / hub#833). Person-mint JWT
+      // sub is users.id and user_id is set; tokens.subject is the display
+      // label. Service mints leave user_id NULL. The JWT is its own access
+      // token, so refresh_token_hash + family_id stay NULL.
+      try {
+        recordTokenMint(db, {
+          jti: minted.jti,
+          createdVia: "cli_mint",
+          subject: subjectLabel,
+          ...(mintUserId
+            ? {
+                userId: mintUserId,
+                ...(mintUserUpdatedAt ? { userUpdatedAt: mintUserUpdatedAt } : {}),
+              }
+            : {}),
+          clientId: OPERATOR_TOKEN_CLIENT_ID,
+          scopes,
+          expiresAt: minted.expiresAt,
+          ...(rowPermissions !== undefined ? { permissions: rowPermissions } : {}),
+          ...(keyName !== undefined ? { keyName } : {}),
+        });
+        break;
+      } catch (err) {
+        if (err instanceof KeyNameTakenError && attempt < 5) continue;
+        if (err instanceof TokenMintPrincipalGoneError || err instanceof KeyNameTakenError) {
+          console.error(`parachute auth mint-token: ${err.message}`);
+          return 1;
+        }
+        throw err;
+      }
     }
 
     if (flags.json) {

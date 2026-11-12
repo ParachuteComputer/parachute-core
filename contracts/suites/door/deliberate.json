@@ -119,7 +119,7 @@
         "personal"
       ],
       "status": "deliberate",
-      "owner": "spec \u00a78 (keys): on cloud a key is an approved OAuth app, managed in the account",
+      "owner": "spec §8 (keys): on cloud a key is an approved OAuth app, managed in the account",
       "why": "A box's admin sees `manage-token` (and from 0.9 `manage-keys`) for the hub's own key store. Cloud-style doors have no hub key store: connections and named keys are listed and revoked through the account door."
     },
     {
@@ -206,27 +206,6 @@
       "note": "Covers every fact the approval contracts record, because none of them can run on a personal door today. When the personal door gains a browser sign-in, delete this entry rather than narrowing it: each of those facts must then be equal or named on its own."
     },
     {
-      "id": "records-over-rest",
-      "keys": [
-        "has/records-over-rest",
-        "records/rest.*"
-      ],
-      "between": [
-        "box",
-        "personal"
-      ],
-      "releases": [
-        "0.9",
-        "0.9.1"
-      ],
-      "lacks": [
-        "box"
-      ],
-      "status": "drift",
-      "owner": "core 0.9.1 (`/api/records` is on the roadmap for the box; T-430 built it on the personal door first)",
-      "why": "The personal door answers `/api/records` (the record words over REST). The 0.9.1 box does not yet: there the record words exist over MCP only, and REST is still `/api/notes`. An app written against `/api/records` runs on a personal door and not on a box."
-    },
-    {
       "id": "sign-in-keys-on-the-account-door",
       "keys": [
         "has/sign-in-keys-on-the-account-door",
@@ -247,38 +226,6 @@
       "why": "A cloud-style door lists and links the account's sign-in keys at `/account/pubkeys` with the account credential. A box does it in its browser session at `/api/account/pubkeys` (a challenge, then the password again for the first key). Signing in with a linked key is the same call on both."
     },
     {
-      "id": "app-key-written-via",
-      "keys": [
-        "keys/app-key.written-via"
-      ],
-      "between": [
-        "box",
-        "personal"
-      ],
-      "releases": [
-        "0.9.1"
-      ],
-      "status": "drift",
-      "owner": "core 0.9.1 keys (T-414)",
-      "why": "A note written over REST with a named app key says `createdVia: key:<name>` on the personal door and `api` on the 0.9.1 box, so on a box the list of who wrote what can't tell two apps apart."
-    },
-    {
-      "id": "box-cors-on-0.9",
-      "keys": [
-        "rest/cors.preflight"
-      ],
-      "between": [
-        "box",
-        "personal"
-      ],
-      "releases": [
-        "0.9.1"
-      ],
-      "status": "drift",
-      "owner": "this change, once the 0.9 branch takes `next`",
-      "why": "The box's missing MCP headers in CORS are fixed on `next` beside these contracts. The 0.9 branch was cut before that and gets it when it takes `next`."
-    },
-    {
       "id": "revoked-app-key-reply",
       "keys": [
         "keys/app-key.revoke.shape",
@@ -294,6 +241,60 @@
       "status": "drift",
       "owner": "core 0.9.1 keys (T-414)",
       "why": "A revoked app key gets 401 at once on both doors. The body differs: a box's hub answers `{error: \"invalid_token\", error_description}`, a cloud-style door's vault answers `{error: \"Unauthorized\", message}`; and the revoke reply carries `refused_now` on a cloud-style door only. Branch on the 401."
+    },
+    {
+      "id": "type-in-tags-on-the-record-door",
+      "keys": [
+        "records/rest.type-in-tags"
+      ],
+      "between": [
+        "box",
+        "personal"
+      ],
+      "releases": [
+        "0.9.1"
+      ],
+      "status": "drift",
+      "owner": "parachute-cloud, at its next core pin: call refuseTypesInTags (core tag-kind.ts) in rest/records.ts and pass it to addRecordTools in mcp-09.ts, or move rest/records.ts onto core's rest-records.ts",
+      "why": "On the record door `tags` holds plain labels (SPEC §2.4). From 0.9.1 a box refuses a type's name in `tags` with 422 `tag_kind` and the fix (`types: [...]`), on `/api/records` and on create-record/update-record, and writes nothing. The personal door still accepts it and files the name as the type. Send a type's name in `types`: that works on both."
+    },
+    {
+      "id": "typed-record-read-validation-status",
+      "keys": [
+        "records/rest.get.shape"
+      ],
+      "between": [
+        "box",
+        "personal"
+      ],
+      "releases": [
+        "0.9.1"
+      ],
+      "status": "drift",
+      "owner": "parachute-cloud 0.9.1: the vault worker's REST read (it drops its own records copy for the engine's `rest-records` then)",
+      "why": "A box attaches `validation_status` to a typed record when it is read over REST, as both doors do on create and on MCP. A cloud-style door's hand-ported REST read leaves it out. The box's `/api/records` made the difference visible; `/api/notes` has had it since 0.8. Read `validation_status` as optional on a get."
+    },
+    {
+      "id": "multi-vault-door",
+      "keys": [
+        "has/multi-vault-door",
+        "multivault/*"
+      ],
+      "between": [
+        "box",
+        "cloud",
+        "personal"
+      ],
+      "releases": [
+        "0.9.1"
+      ],
+      "lacks": [
+        "cloud",
+        "personal"
+      ],
+      "status": "drift",
+      "owner": "parachute-cloud 0.9.1 multi-vault door (T-446)",
+      "why": "On a box one key can cover several vaults, each at its own level (`POST /account/keys {name, vaults: {<vault>: \"read\"|\"write\"}}`), and the account door (`/account/mcp`) serves the record tools plus `list-vaults` with it: `vault` named on every write, each vault reached at that key's level there. A cloud-style door's account door doesn't take such a key yet; an app that needs several vaults there holds one key per vault."
     }
   ]
 }

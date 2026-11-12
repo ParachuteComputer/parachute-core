@@ -2988,6 +2988,7 @@ async function cmdImport(args: string[]) {
   if (isPortableMd) {
     // New lossless path. Supports --blow-away for disaster recovery.
     const { importPortableVault } = await import("../core/src/portable-md.ts");
+    const { INDEXED_FIELD_LIMIT } = await import("../core/src/indexed-fields.ts");
     const { getVaultStore } = await import("./vault-store.ts");
     const { assetsDir } = await import("./routes.ts");
 
@@ -3033,6 +3034,12 @@ async function cmdImport(args: string[]) {
     }
     if (stats.skipped_attachments.length > 0) {
       console.log(`Skipped ${stats.skipped_attachments.length} attachment(s) — see warnings above.`);
+    }
+    if (stats.unindexed_schema_fields.length > 0) {
+      console.log(
+        `Restored ${stats.unindexed_schema_fields.length} field(s) without their index (the vault reached the limit of ${INDEXED_FIELD_LIMIT} indexed fields; they still filter, by a scan): ` +
+        stats.unindexed_schema_fields.map((u) => `${u.tag}.${u.field}`).join(", "),
+      );
     }
     if (stats.skipped_duplicate_ids.length > 0) {
       console.log(

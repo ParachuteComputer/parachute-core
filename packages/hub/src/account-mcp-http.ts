@@ -39,6 +39,7 @@ import {
 import { HOST_ADMIN_SCOPE } from "./admin-vaults.ts";
 import { SERVICES_MANIFEST_PATH } from "./config.ts";
 import { validateAccessToken } from "./jwt-sign.ts";
+import { KEY_NAME_RE, type KeyClaim } from "./keys.ts";
 import { mcpToolErrorLine } from "./mcp-error-log.ts";
 import {
   NostrHttpAuthError,
@@ -201,6 +202,25 @@ function authFailure(
   );
 }
 
+const KEY_KINDS: ReadonlySet<string> = new Set(["person", "agent", "app", "service"]);
+
+/**
+ * The signed `key` claim of an account-door Bearer: `{name, kind}` with a key name and a known kind, or absent.
+ * Present but malformed refuses the token (as the vault does, write-stamp.ts `parseKeyClaim`): a stamp the door
+ * can't read must not silently become no stamp.
+ */
+function bearerKeyClaim(payload: Record<string, unknown>): KeyClaim | null {
+  if (!("key" in payload) || payload.key === undefined) return null;
+  const raw = payload.key as { name?: unknown; kind?: unknown } | null;
+  if (
+    !raw || typeof raw !== "object" || Array.isArray(raw) || Object.keys(raw).some((k) => k !== "name" && k !== "kind") ||
+    typeof raw.name !== "string" || !KEY_NAME_RE.test(raw.name) || typeof raw.kind !== "string" || !KEY_KINDS.has(raw.kind)
+  ) {
+    throw new AdminAuthError(401, "invalid token: the key claim is not {name, kind}");
+  }
+  return { name: raw.name, kind: raw.kind as KeyClaim["kind"] };
+}
+
 async function authenticateBearer(
   db: Database,
   req: Request,
@@ -236,11 +256,15 @@ async function authenticateBearer(
   }
   const clientIdRaw = (validated.payload as { client_id?: unknown }).client_id;
   const clientId = typeof clientIdRaw === "string" ? clientIdRaw : undefined;
+  const key = bearerKeyClaim(validated.payload as Record<string, unknown>);
+  const jti = (validated.payload as { jti?: unknown }).jti;
   return {
     userId: sub,
     scopes,
     authKind: "bearer",
     clientId,
+    ...(key ? { key } : {}),
+    ...(typeof jti === "string" ? { tokenId: jti } : {}),
     isHubAdmin: isHubAdmin(db, sub) || hostAdmin,
     grant,
   };

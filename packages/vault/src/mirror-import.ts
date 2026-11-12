@@ -711,6 +711,11 @@ function importResultFromStats(
       `Dropped parent_names on tag "${sp.tag}": ${sp.reason}`,
     );
   }
+  for (const uf of stats.unindexed_schema_fields) {
+    warnings.push(
+      `Restored field "${uf.field}" on tag "${uf.tag}" without its index: the vault reached the indexed-field limit`,
+    );
+  }
   for (const sd of stats.skipped_duplicate_ids) {
     warnings.push(
       `Skipped file (id "${sd.id}", path=${sd.path ?? "—"}): ${sd.reason}`,

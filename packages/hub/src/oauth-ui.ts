@@ -164,6 +164,12 @@ export interface ConsentViewProps {
    */
   grantableExtras?: readonly string[];
   /**
+   * Consent per vault (0.9.1, T-446). Present when the app asks for the account door (`account:vaults`): each vault
+   * the person reaches, with the highest level they may grant there. The page lists each with none / read / write;
+   * the grant carries each chosen vault at its level, and a vault left at none is not reachable.
+   */
+  vaultLevels?: ReadonlyArray<{ vault: string; max: "read" | "write" }>;
+  /**
    * hub#314 — same-hub vs external trust marker. True when the requesting
    * client was registered through this hub's own flow / first-party install
    * (`OAuthClient.sameHub` — bearer `hub:admin` OR session-cookie +
@@ -394,6 +400,7 @@ export function renderConsent(props: ConsentViewProps): string {
     userCanAuthorizeRequest,
     grantableExtras,
     sameHub,
+    vaultLevels,
   } = props;
   // Substitute unnamed `vault:<verb>` rows with the resolved named form so
   // the operator sees the scope shape that will appear in the token. Raw
@@ -416,8 +423,11 @@ export function renderConsent(props: ConsentViewProps): string {
         // only way this flow can produce a useful token.
         `<li class="scope scope-empty">This app didn't ask for any specific access. Choose what to grant below — without a selection its token won't be able to do anything.</li>`
       : uniqueScopes.map((wire, i) => renderScopeRow(wire, displayedScopes[i] ?? wire)).join("\n");
+  // 0.9.1 (SPEC §3.4): a vault grant reaches the whole vault at its level, and what the app reads leaves the box.
+  const readsVault = displayedScopes.some((sc) => sc.startsWith("vault:"));
   const extrasSection = renderGrantableExtras(grantableExtras ?? [], displayedScopes.length === 0);
   const pickerSection = vaultPicker ? renderVaultPicker(vaultPicker) : "";
+  const levelsSection = vaultLevels ? renderVaultLevels(vaultLevels) : "";
   // Approve is disabled when the picker can't yield a valid vault. The
   // empty-vault branch (no vaults registered) is the original case. A
   // locked-vault picker (multi-user Phase 1) always has a valid value via
@@ -443,6 +453,7 @@ export function renderConsent(props: ConsentViewProps): string {
       vaultPicker.lockedVault === undefined &&
       vaultPicker.availableVaults.length === 0) ||
     blockApproveForStaleAssignment === true ||
+    (vaultLevels !== undefined && vaultLevels.length === 0) ||
     cannotAuthorize
       ? " disabled"
       : "";
@@ -511,12 +522,14 @@ export function renderConsent(props: ConsentViewProps): string {
       <section class="scopes">
         <h2 class="scopes-title">Permissions requested</h2>
         <ul class="scope-list">${scopeRows}</ul>
+        ${readsVault ? `<p class="scope-vendor-note">What this app reads from your vault goes to the company that runs it.</p>` : ""}
       </section>
       <form method="POST" action="/oauth/authorize" class="auth-form consent-form">
         <input type="hidden" name="__action" value="consent" />
         ${renderCsrfHiddenInput(csrfToken)}
         ${renderHiddenInputs(params)}
         ${pickerSection}
+        ${levelsSection}
         ${extrasSection}
         <div class="button-row">
           <button type="submit" name="approve" value="yes" class="btn btn-primary"${approveDisabled}>Approve</button>
@@ -525,6 +538,41 @@ export function renderConsent(props: ConsentViewProps): string {
       </form>
     </div>`;
   return baseDocument(`Approve ${clientName}`, body);
+}
+
+/**
+ * The account door's per-vault levels: one row per vault, none / read / write, read chosen to start (the narrowest
+ * level that still connects). Write is offered only where the person holds it. Posts `vault_level:<vault>`.
+ */
+function renderVaultLevels(levels: ReadonlyArray<{ vault: string; max: "read" | "write" }>): string {
+  if (levels.length === 0) {
+    return `
+        <section class="vault-levels vault-levels-empty">
+          <h2 class="scopes-title">Vaults</h2>
+          <p class="picker-help">You have no vaults on this hub to share yet.</p>
+        </section>`;
+  }
+  const rows = levels
+    .map(({ vault, max }) => {
+      const name = escapeHtml(vault);
+      const field = `vault_level:${name}`;
+      const choice = (level: string, label: string, checked: boolean, disabled: boolean) =>
+        `<label class="vault-level-choice"><input type="radio" name="${field}" value="${level}"${checked ? " checked" : ""}${disabled ? " disabled" : ""} /> ${label}</label>`;
+      return `
+            <div class="vault-level-row" data-vault="${name}">
+              <span class="vault-option-name"><code>${name}</code></span>
+              <span class="vault-level-choices">${choice("none", "None", false, false)}${choice("read", "Read", true, false)}${choice("write", "Write", false, max !== "write")}</span>
+            </div>`;
+    })
+    .join("");
+  return `
+        <section class="vault-levels">
+          <h2 class="scopes-title">Vaults</h2>
+          <p class="picker-help">Choose what this app may do in each vault. A vault left at None stays out of its reach.</p>
+          <input type="hidden" name="account_vault_levels" value="1" />
+          <div class="vault-level-rows">${rows}
+          </div>
+        </section>`;
 }
 
 function renderAccountVaultOption(checked: boolean): string {
@@ -1461,6 +1509,7 @@ const STYLES = `
     flex-direction: column;
     gap: 0.5rem;
   }
+  .scope-vendor-note { color: ${PALETTE.fgDim}; font-size: 0.85rem; margin: 0.6rem 0 0; }
   .scope {
     border: 1px solid ${PALETTE.border};
     border-radius: 6px;
@@ -1576,6 +1625,16 @@ const STYLES = `
     border-radius: 4px;
     color: ${PALETTE.fg};
   }
+  .vault-level-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 8px 0;
+    border-bottom: 1px solid ${PALETTE.border};
+  }
+  .vault-level-choices { display: flex; gap: 12px; }
+  .vault-level-choice input[disabled] + * { opacity: 0.5; }
   .vault-options {
     display: flex;
     flex-direction: column;

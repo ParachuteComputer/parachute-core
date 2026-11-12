@@ -10,7 +10,11 @@ import {
   buildPlainEqualityClause,
   isOperatorObject,
   QueryError,
+  buildScanClause,
   requireIndexedField,
+  scanAffinityFor,
+  scanOrderSql,
+  scanValueSql,
 } from "./query-operators.js";
 import {
   CURSOR_VERSION,
@@ -23,6 +27,7 @@ import {
   type QueryHashInputs,
 } from "./cursor.js";
 import { getIndexedField, releaseField } from "./indexed-fields.js";
+import { assertNoAggregateScan } from "./query-warnings.js";
 import { computeExpandedTagCounts, loadTagHierarchy, stripTagHash } from "./tag-hierarchy.js";
 import { chunkForInClause, IN_VIA_JSON_EACH, jsonEachParam } from "./sql-in.js";
 import {
@@ -1391,13 +1396,21 @@ export function buildFilterConditions(db: Database, opts: QueryOpts): { conditio
   if (opts.metadata) {
     for (const [key, value] of Object.entries(opts.metadata)) {
       if (isOperatorObject(value)) {
-        const indexedField = requireIndexedField(db, key);
+        const indexedField = getIndexedField(db, key);
         const ops = value as Record<string, unknown>;
+        if (!indexedField) {
+          // 0.9.2: a field that isn't indexed is scanned, not refused; the
+          // caller learns it scanned from `collectScanWarnings`.
+          const { sql, params: opParams } = buildScanClause(key, ops, scanAffinityFor(db, key));
+          conditions.push(sql);
+          params.push(...opParams);
+          continue;
+        }
         if (ops.eq !== undefined && ops.eq !== null) indexedEqualityDriver = true;
         if (Array.isArray(ops.in) && ops.in.length > 0) indexedEqualityDriver = true;
         const { sql, params: opParams } = buildOperatorClause(
           key,
-          value as Record<string, unknown>,
+          ops,
           indexedField.sqliteType,
         );
         conditions.push(sql);
@@ -1471,10 +1484,10 @@ export function buildFilterConditions(db: Database, opts: QueryOpts): { conditio
     } else if (isUpdatedAt) {
       column = "n.updated_at_ms";
     } else {
-      // Re-uses the same indexed-field gate as `metadata` operator queries
-      // and `orderBy` so the error message and contract are consistent.
-      requireIndexedField(db, field);
-      column = `"meta_${field}"`;
+      // An indexed field compares on its column; any other field is scanned
+      // as text (dates are ISO-8601 text), with the same `scan` warning as
+      // `metadata` operators and `orderBy`.
+      column = getIndexedField(db, field) ? `"meta_${field}"` : `CAST(${scanValueSql(field)} AS TEXT)`;
     }
     if (filter.from !== undefined) {
       const label = field === "created_at" ? "date_filter.from" : `date_filter.from (${field})`;
@@ -1630,6 +1643,11 @@ export function queryNotes(db: Database, opts: QueryOpts, _outUpdatedAtMs?: Map<
     // shipped for it. `id` is the explicit tiebreak for stable ordering when
     // two notes share a millisecond, matching the cursor keyset's tiebreak.
     orderBy = `n.updated_at_ms ${direction}, n.id ${direction}`;
+  } else if (opts.orderBy === "created_at") {
+    // 0.9.2: `created_at` names the notes column (it used to be refused as a
+    // field that isn't indexed; a metadata key of that name would shadow
+    // nothing useful), so it is the default order made explicit.
+    orderBy = `n.created_at ${direction}, n.id ${direction}`;
   } else if (opts.orderBy === "link_count") {
     // `link_count` is a pseudo-field — like `created_at`/`updated_at` in the
     // dateFilter block above, it bypasses `requireIndexedField` (it's not a
@@ -1657,12 +1675,16 @@ export function queryNotes(db: Database, opts: QueryOpts, _outUpdatedAtMs?: Map<
       `+ (SELECT COUNT(*) FROM links WHERE target_id = n.id)) ${direction}, ` +
       `n.created_at ${direction}`;
   } else if (opts.orderBy) {
-    requireIndexedField(db, opts.orderBy);
-    // `orderBy` came from indexed_fields (validated on declaration), so
-    // the column name is safe to interpolate. Append created_at as a
-    // stable tiebreaker so two rows with the same indexed value have a
+    // An indexed `orderBy` came from indexed_fields (validated on
+    // declaration), so the column name is safe to interpolate. Any other
+    // field sorts on a scan key with the indexed column's conversions
+    // (`scanOrderSql`; the caller gets a `scan` warning). Append created_at
+    // as a stable tiebreaker so two rows with the same value have a
     // deterministic order.
-    orderBy = `"meta_${opts.orderBy}" ${direction}, n.created_at ${direction}, n.id ${direction}`;
+    const key = getIndexedField(db, opts.orderBy)
+      ? `"meta_${opts.orderBy}"`
+      : scanOrderSql(opts.orderBy, scanAffinityFor(db, opts.orderBy));
+    orderBy = `${key} ${direction}, n.created_at ${direction}, n.id ${direction}`;
   } else {
     // id tiebreaker: same-millisecond inserts get deterministic relative
     // order — load-bearing now that the two-phase page fetch makes
@@ -1795,6 +1817,7 @@ export function aggregateNotes(db: Database, opts: QueryOpts): AggregateRow[] {
     );
   }
 
+  assertNoAggregateScan(db, opts);
   const { conditions, params } = buildFilterConditions(db, opts);
   const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
 
@@ -1938,6 +1961,65 @@ function toQueryHashInputs(opts: QueryOpts): QueryHashInputs {
 }
 
 /**
+ * Cursor paging for a caller that sees only some notes (scope gap 2): the
+ * page is the first `limit` notes it may see after the cursor, and the
+ * cursor it gets back is built from those notes only. Unfiltered, the
+ * watermark advanced over hidden rows too and so carried a hidden note's id
+ * and timestamp (base64 JSON, readable by anyone), and a page of only hidden
+ * notes still moved it: a yes/no answer to "does a hidden note match". Here
+ * the scan walks the keyset past hidden rows in batches until it has `limit`
+ * visible notes or the rows run out; hidden rows after the last visible one
+ * are scanned again by the next call, which is what keeps the watermark
+ * honest. The answer is exactly what an unscoped caller gets on a vault
+ * holding only the notes this caller may see.
+ */
+function queryVisibleNotesPaged(db: Database, opts: QueryOpts, visible: (note: Note) => boolean): QueryNotesPage {
+  // A bad limit gets queryNotes' own error, before anything is read.
+  if (opts.limit !== undefined && !(typeof opts.limit === "number" && Number.isInteger(opts.limit) && opts.limit >= 0)) {
+    return queryNotesPaged(db, opts);
+  }
+  const limit = typeof opts.limit === "number" ? opts.limit : 100; // queryNotes' default
+  const batch = Math.max(limit, 200);
+  const queryHash = computeQueryHash(toQueryHashInputs(opts));
+  let lastUpdatedAt = 0;
+  let lastId = "";
+  if (opts.cursor !== undefined && opts.cursor !== "") {
+    const prior = decodeCursor(opts.cursor);
+    lastUpdatedAt = prior.last_updated_at;
+    lastId = prior.last_id;
+  }
+  const encode = (ms: number, id: string) =>
+    encodeCursor({ v: CURSOR_VERSION, last_updated_at: ms, last_id: id, query_hash: queryHash });
+  const notes: Note[] = [];
+  if (limit === 0) return { notes, next_cursor: encode(lastUpdatedAt, lastId) };
+  // The scan's own position, over every row; the returned watermark follows visible rows only.
+  let scanCursor = opts.cursor ?? "";
+  let scanMs = lastUpdatedAt;
+  let scanId = lastId;
+  for (;;) {
+    const keys = new Map<string, number>();
+    const rows = queryNotes(db, { ...opts, cursor: scanCursor, limit: batch, offset: undefined }, keys);
+    for (const note of rows) {
+      const ms = keys.get(note.id) ?? 0;
+      if (ms > scanMs || (ms === scanMs && note.id > scanId)) {
+        scanMs = ms;
+        scanId = note.id;
+      }
+      if (!visible(note)) continue;
+      notes.push(note);
+      if (ms > lastUpdatedAt || (ms === lastUpdatedAt && note.id > lastId)) {
+        lastUpdatedAt = ms;
+        lastId = note.id;
+      }
+      if (notes.length === limit) return { notes, next_cursor: encode(lastUpdatedAt, lastId) };
+    }
+    if (rows.length < batch) break;
+    scanCursor = encode(scanMs, scanId);
+  }
+  return { notes, next_cursor: encode(lastUpdatedAt, lastId) };
+}
+
+/**
  * Cursor-paginated wrapper around `queryNotes` (vault#313).
  *
  * Always returns `{ notes, next_cursor }`. `next_cursor` advances even on
@@ -1961,7 +2043,8 @@ function toQueryHashInputs(opts: QueryOpts): QueryHashInputs {
  * `updated_at > 0 OR (updated_at = 0 AND id > "")` matches every row
  * with a non-null `updated_at` greater than the unix epoch).
  */
-export function queryNotesPaged(db: Database, opts: QueryOpts): QueryNotesPage {
+export function queryNotesPaged(db: Database, opts: QueryOpts, visible?: (note: Note) => boolean): QueryNotesPage {
+  if (visible) return queryVisibleNotesPaged(db, opts, visible);
   // Capture each page row's integer keyset key (vault#586) from the SAME
   // phase-1 statement that ordered + sliced the page — one consistent
   // snapshot, so the watermark can't leapfrog rows a cross-process writer

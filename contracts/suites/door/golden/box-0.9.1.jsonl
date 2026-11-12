@@ -46,10 +46,10 @@
 {"key":"connect/registration.reply.keys","value":["client_id","client_id_issued_at","client_name","grant_types","redirect_uris","response_types","same_hub","status","token_endpoint_auth_method"]}
 {"key":"connect/revocation-list","value":{"shape":{"generated_at":"string","jtis":[]},"status":200}}
 {"key":"connect/revoke.access-still-works","value":"stops at once"}
-{"key":"connect/token.claims","value":["aud","client_id","exp","iat","iss","jti","scope","sub","vault_scope"]}
+{"key":"connect/token.claims","value":["aud","client_id","exp","iat","iss","jti","key","scope","sub","vault_scope"]}
 {"key":"connect/token.lifetime","value":900}
 {"key":"connect/token.reply.shape","value":{"access_token":"string","expires_in":"number","refresh_token":"string","scope":"string","services":{"vault":{"url":"string","version":"string"},"vault:<v>":{"url":"string","version":"string"}},"token_type":"string","vault":"string"}}
-{"key":"connect/written-by.stamp","value":{"by":"string","via":"mcp"}}
+{"key":"connect/written-by.stamp","value":{"by":"string","via":"key:<client>"}}
 {"key":"exit/file..parachute/schemas/exitfixture.yaml","value":"description: A made-up type for the exit contract\nfields:\n  due:\n    type: date\n  points:\n    indexed: true\n    type: integer\n  status:\n    enum:\n      - open\n      - done\n      - 'a:b'\n    strict: true\n    type: string\nname: exitfixture\n"}
 {"key":"exit/file.attachment","value":{"name":".parachute/attachments/<att>/<stored>.png","sha256":"a88873d7c64f89b94d073cababf05929ebac1bcea3df01c4dc44eebe22927e92"}}
 {"key":"exit/file.exit-fixture/plan.md","value":"---\nid: <id>\npath: exit-fixture/plan\ntags:\n  - exit/nested-tag\n  - exitfixture\nmetadata:\n  done: false\n  due: 2027-02-03\n  empty_text: ''\n  multi: \"line one\\nline two\"\n  nested:\n    deep:\n      list:\n        - 1\n        - 2\n        - 3\n      yes: true\n  people:\n    - address: mailto:sam@example.org\n      name: Sam\n  points: 5\n  quote: it's \"quoted\"\n  status: a:b\n  urls:\n    - 'https://example.org/a'\n    - plain\n    - 'http://example.org:8080/b?c=d#e'\nlinks:\n  - relationship: depends-on\n    target: <id>\ncreated_at: <time>\nupdated_at: <time>\n---\n# Plan\n\nSee [[exit-fixture/target]] and [[exit-fixture/not-yet]].\n\nUmlauts stay: Grüße, 東京, 🪂.\n"}
@@ -74,26 +74,35 @@
 {"key":"files/upload.reply.shape","value":{"mimeType":"string","path":"string","size":"number"}}
 {"key":"files/upload.txt","value":{"status":201}}
 {"key":"has/export-over-http","value":false}
+{"key":"has/multi-vault-door","value":true}
 {"key":"has/oauth-approval","value":true}
-{"key":"has/records-over-rest","value":false}
+{"key":"has/on-behalf-of","value":true}
+{"key":"has/records-over-rest","value":true}
+{"key":"has/revision-key-kind","value":true}
 {"key":"has/sign-in-keys-on-the-account-door","value":false}
 {"key":"history/deleted.shape","value":{"notes":[{"deleted_at":"string","extension":"string","id":"string","path":"string","versions":"number"}],"total":"number"}}
 {"key":"history/refusal.blind-restore","value":{"error":null,"hint":null,"keys":["error_type","message","note_id"],"status":428,"type":"precondition_required"}}
 {"key":"history/refusal.forget-without-admin","value":{"error":"Forbidden","hint":null,"keys":["error","error_type","granted_scopes","message","required_scope"],"status":403,"type":"insufficient_scope"}}
 {"key":"history/restore.reply.shape","value":{"content":"string","createdAt":"string","createdBy":"string","createdVia":"string","extension":"string","id":"string","lastUpdatedBy":"string","lastUpdatedVia":"string","metadata":{},"path":"string","recreated":"boolean","restored_from":"number","tags":[],"types":[],"updatedAt":"string"}}
-{"key":"history/version.shape","value":{"actor":"string","content":"string","content_hash":"string","content_len":"number","created_at":"string","encoding":"null","extension":"string","metadata":{},"note_id":"string","op":"string","path":"string","superseded_at":"string","version_ix":"number","via":"string"}}
-{"key":"history/versions.shape","value":{"total":"number","versions":[{"actor":"string","content_hash":"string","content_len":"number","created_at":"string","encoding":"null","extension":"string","metadata":{},"note_id":"string","op":"string","path":"string","superseded_at":"string","version_ix":"number","via":"string"}]}}
+{"key":"history/version.shape","value":{"actor":"string","content":"string","content_hash":"string","content_len":"number","created_at":"string","encoding":"null","extension":"string","metadata":{},"note_id":"string","op":"string","path":"string","superseded_at":"string","version_ix":"number","via":"string","via_kind":"null"}}
+{"key":"history/versions.shape","value":{"total":"number","versions":[{"actor":"string","content_hash":"string","content_len":"number","created_at":"string","encoding":"null","extension":"string","metadata":{},"note_id":"string","op":"string","path":"string","superseded_at":"string","version_ix":"number","via":"string","via_kind":"null"}]}}
 {"key":"keys/app-key.lifetime-days","value":365}
 {"key":"keys/app-key.list.item.shape","value":{"can":"string","created_at":"string","expires_at":"string","last_used_at":"string","name":"string","revoked_at":"null","status":"string","vault":"string"}}
 {"key":"keys/app-key.mint.shape","value":{"can":"string","created_at":"string","expires_at":"string","last_used_at":"null","name":"string","revoked_at":"null","scopes":["string"],"status":"string","token":"string","vault":"string"}}
 {"key":"keys/app-key.revoke.shape","value":{"name":"string","revoked_at":"string"}}
-{"key":"keys/app-key.written-via","value":"api"}
+{"key":"keys/app-key.written-via","value":"key:<name>"}
+{"key":"keys/on-behalf.refusal.not-granted","value":{"error":"(text)","hint":"b5583e490ca4fb65","keys":["error","error_type","field","hint","message","status"],"status":403,"type":"on_behalf_not_allowed"}}
+{"key":"keys/on-behalf.refusal.reserved-name","value":{"error":"invalid_name","status":400}}
+{"key":"keys/on-behalf.stamp","value":{"by":"<name>:client-42","via":"key:<name>"}}
 {"key":"keys/owner-key.reply.shape","value":{"aud":"string","expires_at":"string","scopes":["string"],"token":"string"}}
 {"key":"keys/refusal.admin-key","value":{"error":"invalid_scope","status":400}}
 {"key":"keys/refusal.name-taken","value":{"error":"name_taken","status":409}}
 {"key":"keys/refusal.replayed-proof","value":{"error":"invalid_nostr_auth","status":401}}
 {"key":"keys/refusal.revoked-key","value":{"error":"invalid_token","hint":null,"keys":["error","error_description"],"status":401,"type":null}}
 {"key":"keys/refusal.unknown-key","value":{"error":"invalid_nostr_auth","status":401}}
+{"key":"keys/write-stamp.revision.kind","value":"app"}
+{"key":"keys/write-stamp.revision.via","value":"key:<name>"}
+{"key":"keys/write-stamp.via","value":[{"createdVia":"key:<name>","door":"notes","lastUpdatedVia":"key:<name>"},{"createdVia":"key:<name>","door":"records","lastUpdatedVia":"key:<name>"},{"createdVia":"key:<name>","door":"mcp","lastUpdatedVia":"key:<name>"}]}
 {"key":"links/find-path.none","value":{"shape":{"edges":[{"relationship":"string","source":"string","sourcePath":"string","target":"string","targetPath":"string"}],"nodes":[{"id":"string","path":"string"}],"path":["string"],"relationships":["string"]},"status":200}}
 {"key":"links/find-path.shape","value":{"edges":[{"relationship":"string","source":"string","sourcePath":"string","target":"string","targetPath":"string"}],"nodes":[{"id":"string","path":"string"}],"path":["string"],"relationships":["string"]}}
 {"key":"links/link.shape","value":{"createdAt":"string","relationship":"string","sourceId":"string","sourceNote":{"createdAt":"string","id":"string","path":"string","tags":[],"updatedAt":"string"},"targetId":"string","targetNote":{"createdAt":"string","id":"string","path":"string","tags":[],"updatedAt":"string"}}}
@@ -113,7 +122,7 @@
 {"key":"mcp/admin.tool.create-record.hints","value":null}
 {"key":"mcp/admin.tool.create-record.present","value":true}
 {"key":"mcp/admin.tool.create-record.schema","value":"a622c4d624114f3f"}
-{"key":"mcp/admin.tool.create-record.words","value":"23a563eac1dd4dc7"}
+{"key":"mcp/admin.tool.create-record.words","value":"8c786f200d2b1c15"}
 {"key":"mcp/admin.tool.delete-note.hints","value":null}
 {"key":"mcp/admin.tool.delete-note.present","value":true}
 {"key":"mcp/admin.tool.delete-note.schema","value":"2656caccbe8c4d2b"}
@@ -124,12 +133,12 @@
 {"key":"mcp/admin.tool.delete-record.words","value":"0c9ad5a1f72c5345"}
 {"key":"mcp/admin.tool.delete-tag.hints","value":null}
 {"key":"mcp/admin.tool.delete-tag.present","value":true}
-{"key":"mcp/admin.tool.delete-tag.schema","value":"8e53baa1e0b4d998"}
+{"key":"mcp/admin.tool.delete-tag.schema","value":"cd73381db2de3295"}
 {"key":"mcp/admin.tool.delete-tag.words","value":"d99951ae9d44facc"}
 {"key":"mcp/admin.tool.doctor.hints","value":null}
 {"key":"mcp/admin.tool.doctor.present","value":true}
 {"key":"mcp/admin.tool.doctor.schema","value":"be7c2882c96356b3"}
-{"key":"mcp/admin.tool.doctor.words","value":"892f9a8db44a9e24"}
+{"key":"mcp/admin.tool.doctor.words","value":"1f64afae4ae60517"}
 {"key":"mcp/admin.tool.find-path.hints","value":null}
 {"key":"mcp/admin.tool.find-path.present","value":true}
 {"key":"mcp/admin.tool.find-path.schema","value":"9067a8cde9db075a"}
@@ -144,19 +153,19 @@
 {"key":"mcp/admin.tool.list-types.words","value":"0f65df46d485ab21"}
 {"key":"mcp/admin.tool.manage-keys.hints","value":null}
 {"key":"mcp/admin.tool.manage-keys.present","value":true}
-{"key":"mcp/admin.tool.manage-keys.schema","value":"c3e09b0e7ccb4e81"}
-{"key":"mcp/admin.tool.manage-keys.words","value":"4c6bbc7ee7fc27a2"}
+{"key":"mcp/admin.tool.manage-keys.schema","value":"64e302cdc4abf04d"}
+{"key":"mcp/admin.tool.manage-keys.words","value":"0c783b4fc7261218"}
 {"key":"mcp/admin.tool.manage-token.hints","value":null}
 {"key":"mcp/admin.tool.manage-token.present","value":true}
-{"key":"mcp/admin.tool.manage-token.schema","value":"c3e09b0e7ccb4e81"}
+{"key":"mcp/admin.tool.manage-token.schema","value":"64e302cdc4abf04d"}
 {"key":"mcp/admin.tool.manage-token.words","value":"1b73e2c7a3571c44"}
 {"key":"mcp/admin.tool.manage-types.hints","value":null}
 {"key":"mcp/admin.tool.manage-types.present","value":true}
-{"key":"mcp/admin.tool.manage-types.schema","value":"9be55febab2088fb"}
-{"key":"mcp/admin.tool.manage-types.words","value":"b129aff2aded199f"}
+{"key":"mcp/admin.tool.manage-types.schema","value":"a23cacde509d9a91"}
+{"key":"mcp/admin.tool.manage-types.words","value":"734a31132a668e68"}
 {"key":"mcp/admin.tool.merge-tags.hints","value":null}
 {"key":"mcp/admin.tool.merge-tags.present","value":true}
-{"key":"mcp/admin.tool.merge-tags.schema","value":"acfea309e12b5fb5"}
+{"key":"mcp/admin.tool.merge-tags.schema","value":"17e70757685c08b1"}
 {"key":"mcp/admin.tool.merge-tags.words","value":"fb7539c7efcbd54f"}
 {"key":"mcp/admin.tool.prune-schema.hints","value":null}
 {"key":"mcp/admin.tool.prune-schema.present","value":true}
@@ -168,15 +177,15 @@
 {"key":"mcp/admin.tool.query-notes.words","value":"8b6c408e946520e0"}
 {"key":"mcp/admin.tool.query-records.hints","value":null}
 {"key":"mcp/admin.tool.query-records.present","value":true}
-{"key":"mcp/admin.tool.query-records.schema","value":"8e5f9bb58764f75e"}
-{"key":"mcp/admin.tool.query-records.words","value":"48f43f37b5849dae"}
+{"key":"mcp/admin.tool.query-records.schema","value":"9da550d332eb3825"}
+{"key":"mcp/admin.tool.query-records.words","value":"9e9a0c4cd32719d5"}
 {"key":"mcp/admin.tool.read-attachment.hints","value":null}
 {"key":"mcp/admin.tool.read-attachment.present","value":true}
 {"key":"mcp/admin.tool.read-attachment.schema","value":"d8a9d97eaf912aa4"}
 {"key":"mcp/admin.tool.read-attachment.words","value":"c034adf0cd5e438b"}
 {"key":"mcp/admin.tool.rename-tag.hints","value":null}
 {"key":"mcp/admin.tool.rename-tag.present","value":true}
-{"key":"mcp/admin.tool.rename-tag.schema","value":"7e2fe9d41b356c74"}
+{"key":"mcp/admin.tool.rename-tag.schema","value":"c7668d8995009ba2"}
 {"key":"mcp/admin.tool.rename-tag.words","value":"94362aba41a60f53"}
 {"key":"mcp/admin.tool.request-attachment-download.hints","value":null}
 {"key":"mcp/admin.tool.request-attachment-download.present","value":true}
@@ -196,7 +205,7 @@
 {"key":"mcp/admin.tool.update-record.words","value":"cd1370f53159bc57"}
 {"key":"mcp/admin.tool.update-tag.hints","value":null}
 {"key":"mcp/admin.tool.update-tag.present","value":true}
-{"key":"mcp/admin.tool.update-tag.schema","value":"b26d8095f54f08ca"}
+{"key":"mcp/admin.tool.update-tag.schema","value":"ca7b0b3fc10294db"}
 {"key":"mcp/admin.tool.update-tag.words","value":"ea819175d0c1a284"}
 {"key":"mcp/admin.tool.vault-info.hints","value":null}
 {"key":"mcp/admin.tool.vault-info.present","value":true}
@@ -206,6 +215,18 @@
 {"key":"mcp/create-note.result.shape","value":{"content":"string","createdAt":"string","createdBy":"string","createdVia":"string","extension":"string","id":"string","lastUpdatedBy":"string","lastUpdatedVia":"string","metadata":{"n":"number"},"path":"string","tags":["string"],"types":[],"updatedAt":"string"}}
 {"key":"mcp/list-tags.item.shape","value":{"count":"number","expanded_count":"number","kind":"string","name":"string"}}
 {"key":"mcp/list-tags.result.envelope","value":"array"}
+{"key":"mcp/nudge.create-note.blocks","value":["text","text"]}
+{"key":"mcp/nudge.create-note.text","value":"`create-note` is deprecated and goes away in 1.0. If `create-record` isn't among your tools, ask your user to refresh this connector so you get the new tools. Otherwise use `create-record` from now on."}
+{"key":"mcp/nudge.create-record.blocks","value":["text"]}
+{"key":"mcp/nudge.delete-note.blocks","value":["text","text"]}
+{"key":"mcp/nudge.delete-note.text","value":"`delete-note` is deprecated and goes away in 1.0. If `create-record` isn't among your tools, ask your user to refresh this connector so you get the new tools. Otherwise use `delete-record` from now on."}
+{"key":"mcp/nudge.list-tags.blocks","value":["text","text"]}
+{"key":"mcp/nudge.list-tags.text","value":"`list-tags` is deprecated and goes away in 1.0. If `create-record` isn't among your tools, ask your user to refresh this connector so you get the new tools. Otherwise use `list-types` from now on."}
+{"key":"mcp/nudge.query-notes.blocks","value":["text","text"]}
+{"key":"mcp/nudge.query-notes.text","value":"`query-notes` is deprecated and goes away in 1.0. If `create-record` isn't among your tools, ask your user to refresh this connector so you get the new tools. Otherwise use `query-records` from now on."}
+{"key":"mcp/nudge.refused-call","value":{"isError":true,"nudged":false}}
+{"key":"mcp/nudge.update-note.blocks","value":["text","text"]}
+{"key":"mcp/nudge.update-note.text","value":"`update-note` is deprecated and goes away in 1.0. If `create-record` isn't among your tools, ask your user to refresh this connector so you get the new tools. Otherwise use `update-record` from now on."}
 {"key":"mcp/other-vault","value":{"status":401}}
 {"key":"mcp/protected-resource.at.vault-first","value":{"same":true,"status":200}}
 {"key":"mcp/protected-resource.at.well-known-first","value":{"same":true,"status":200}}
@@ -216,6 +237,9 @@
 {"key":"mcp/protected-resource.scopes_supported","value":["string"]}
 {"key":"mcp/query-notes.no-such-note","value":{"isError":false,"shape":{"error":"string","error_type":"string","id":"string"}}}
 {"key":"mcp/query-notes.result.shape","value":[{"byteSize":"number","createdAt":"string","createdBy":"string","createdVia":"string","displayTitle":"string","extension":"string","id":"string","lastUpdatedBy":"string","lastUpdatedVia":"string","metadata":{"n":"number"},"path":"string","preview":"string","score":"number","tags":["string"],"types":[],"updatedAt":"string"}]}
+{"key":"mcp/reach.admin","value":"This connection can read the whole vault, create, change and delete its records, and manage its types, settings and keys."}
+{"key":"mcp/reach.read","value":"This connection can read the whole vault. It can't change anything."}
+{"key":"mcp/reach.write","value":"This connection can read the whole vault, and create, change and delete its records."}
 {"key":"mcp/read-calls-write-tool","value":"no such tool"}
 {"key":"mcp/read.capabilities","value":["tools"]}
 {"key":"mcp/read.instructions.sections","value":["This vault's coordinates","Start here","Quick orientation (call `vault-info` for full schema)","Querying","Refreshing context","Attachments","Scripting & automation (beyond this session)"]}
@@ -228,7 +252,7 @@
 {"key":"mcp/read.tool.doctor.hints","value":null}
 {"key":"mcp/read.tool.doctor.present","value":true}
 {"key":"mcp/read.tool.doctor.schema","value":"be7c2882c96356b3"}
-{"key":"mcp/read.tool.doctor.words","value":"892f9a8db44a9e24"}
+{"key":"mcp/read.tool.doctor.words","value":"1f64afae4ae60517"}
 {"key":"mcp/read.tool.find-path.hints","value":null}
 {"key":"mcp/read.tool.find-path.present","value":true}
 {"key":"mcp/read.tool.find-path.schema","value":"9067a8cde9db075a"}
@@ -247,8 +271,8 @@
 {"key":"mcp/read.tool.query-notes.words","value":"8b6c408e946520e0"}
 {"key":"mcp/read.tool.query-records.hints","value":null}
 {"key":"mcp/read.tool.query-records.present","value":true}
-{"key":"mcp/read.tool.query-records.schema","value":"8e5f9bb58764f75e"}
-{"key":"mcp/read.tool.query-records.words","value":"48f43f37b5849dae"}
+{"key":"mcp/read.tool.query-records.schema","value":"9da550d332eb3825"}
+{"key":"mcp/read.tool.query-records.words","value":"9e9a0c4cd32719d5"}
 {"key":"mcp/read.tool.read-attachment.hints","value":null}
 {"key":"mcp/read.tool.read-attachment.present","value":true}
 {"key":"mcp/read.tool.read-attachment.schema","value":"d8a9d97eaf912aa4"}
@@ -284,7 +308,7 @@
 {"key":"mcp/write.tool.create-record.hints","value":null}
 {"key":"mcp/write.tool.create-record.present","value":true}
 {"key":"mcp/write.tool.create-record.schema","value":"a622c4d624114f3f"}
-{"key":"mcp/write.tool.create-record.words","value":"23a563eac1dd4dc7"}
+{"key":"mcp/write.tool.create-record.words","value":"8c786f200d2b1c15"}
 {"key":"mcp/write.tool.delete-note.hints","value":null}
 {"key":"mcp/write.tool.delete-note.present","value":true}
 {"key":"mcp/write.tool.delete-note.schema","value":"2656caccbe8c4d2b"}
@@ -296,7 +320,7 @@
 {"key":"mcp/write.tool.doctor.hints","value":null}
 {"key":"mcp/write.tool.doctor.present","value":true}
 {"key":"mcp/write.tool.doctor.schema","value":"be7c2882c96356b3"}
-{"key":"mcp/write.tool.doctor.words","value":"892f9a8db44a9e24"}
+{"key":"mcp/write.tool.doctor.words","value":"1f64afae4ae60517"}
 {"key":"mcp/write.tool.find-path.hints","value":null}
 {"key":"mcp/write.tool.find-path.present","value":true}
 {"key":"mcp/write.tool.find-path.schema","value":"9067a8cde9db075a"}
@@ -315,8 +339,8 @@
 {"key":"mcp/write.tool.query-notes.words","value":"8b6c408e946520e0"}
 {"key":"mcp/write.tool.query-records.hints","value":null}
 {"key":"mcp/write.tool.query-records.present","value":true}
-{"key":"mcp/write.tool.query-records.schema","value":"8e5f9bb58764f75e"}
-{"key":"mcp/write.tool.query-records.words","value":"48f43f37b5849dae"}
+{"key":"mcp/write.tool.query-records.schema","value":"9da550d332eb3825"}
+{"key":"mcp/write.tool.query-records.words","value":"9e9a0c4cd32719d5"}
 {"key":"mcp/write.tool.read-attachment.hints","value":null}
 {"key":"mcp/write.tool.read-attachment.present","value":true}
 {"key":"mcp/write.tool.read-attachment.schema","value":"d8a9d97eaf912aa4"}
@@ -341,12 +365,24 @@
 {"key":"mcp/write.tool.vault-info.present","value":true}
 {"key":"mcp/write.tool.vault-info.schema","value":"530ff43b9f863786"}
 {"key":"mcp/write.tool.vault-info.words","value":"dee3e40876423132"}
+{"key":"multivault/consent.scope","value":["account:self:vaults:<A>:read","account:self:vaults:<B>:write"]}
+{"key":"multivault/key.mint.keys","value":["created_at","expires_at","last_used_at","name","revoked_at","scopes","status","token","vaults"]}
+{"key":"multivault/query.fan-out.keys","value":["results","vaults_queried"]}
+{"key":"multivault/refusals","value":[400,404,400]}
+{"key":"multivault/write-stamp.via","value":{"created":"key:<name>","revision":"key:<name>"}}
+{"key":"multivault/writer.tools","value":["attachment-url","create-note","create-record","delete-note","delete-record","doctor","find-path","list-tags","list-types","list-vaults","query-notes","query-records","read-attachment","request-attachment-download","request-attachment-upload","update-note","update-record","vault-info"]}
 {"key":"records/mcp.create-record.shape","value":{"body":"string","createdAt":"string","createdBy":"string","createdVia":"string","extension":"string","fields":{"content":"string","door_trip_miles":"number"},"id":"string","lastUpdatedBy":"string","lastUpdatedVia":"string","path":"string","tags":["string"],"types":["string"],"updatedAt":"string","validation_status":{"schemas":["string"],"warnings":[]}}}
 {"key":"records/mcp.list-types.shape","value":{"count":"number","created_at":"string","description":"null","expanded_count":"number","fields":{"door_trip_miles":{"indexed":"boolean","type":"string"}},"kind":"string","name":"string","parent_names":"null","relationships":"null","updated_at":"string"}}
 {"key":"records/mcp.manage-types","value":{"created_at":"string","fields":{"door_trip_miles":{"indexed":"boolean","type":"string"}},"kind":"string","tag":"string","updated_at":"string"}}
 {"key":"records/mcp.old-word-beside-new","value":{"code":-32602,"refused":true,"type":"invalid_query"}}
 {"key":"records/mcp.order","value":["query-records","create-record","update-record","delete-record","list-types","vault-info","doctor","read-attachment","attachment-url","manage-types","query-notes","create-note","update-note","delete-note","list-tags","find-path","update-tag","rename-tag","merge-tags","delete-tag","prune-schema","request-attachment-upload","request-attachment-download"]}
 {"key":"records/mcp.query-records.shape","value":{"body":"string","createdAt":"string","createdBy":"string","createdVia":"string","extension":"string","fields":{"content":"string","door_trip_miles":"number"},"id":"string","lastUpdatedBy":"string","lastUpdatedVia":"string","path":"string","tags":["string"],"types":["string"],"updatedAt":"string","validation_status":{"schemas":["string"],"warnings":[]}}}
+{"key":"records/rest.create.shape","value":{"body":"string","createdAt":"string","createdBy":"string","createdVia":"string","extension":"string","fields":{"city":"string"},"id":"string","lastUpdatedBy":"string","lastUpdatedVia":"string","path":"string","tags":["string"],"types":["string"],"updatedAt":"string","validation_status":{"schemas":["string"],"warnings":[]},"warnings":"undefined"}}
+{"key":"records/rest.create.status","value":201}
+{"key":"records/rest.get.shape","value":{"body":"string","createdAt":"string","createdBy":"string","createdVia":"string","extension":"string","fields":{"city":"string"},"id":"string","lastUpdatedBy":"string","lastUpdatedVia":"string","path":"string","tags":["string"],"types":["string"],"updatedAt":"string","validation_status":{"schemas":["string"],"warnings":[]}}}
+{"key":"records/rest.note-alias.says-leaving","value":{"body":false,"deprecation":"true"}}
+{"key":"records/rest.refusal.old-word-beside-new","value":{"error":"(text)","hint":"ba5bd279831f54a9","keys":["error","error_type","field","hint"],"status":400,"type":"invalid_query"}}
+{"key":"records/rest.type-in-tags","value":{"hint":"b594715fe960c66d","status":422,"type":"tag_kind"}}
 {"key":"rest/cors.preflight","value":{"headers":["authorization","content-type","mcp-method","mcp-name","mcp-protocol-version","mcp-session-id","x-api-key"],"methods":["delete","get","options","patch","post","put"],"origin":"*","status":204}}
 {"key":"rest/cors.reply","value":{"origin":"*"}}
 {"key":"rest/cursor.page.shape","value":{"next_cursor":"string","notes":[{"byteSize":"number","createdAt":"string","createdBy":"string","createdVia":"string","displayTitle":"string","extension":"string","id":"string","lastUpdatedBy":"string","lastUpdatedVia":"string","metadata":{},"path":"string","preview":"string","tags":[],"types":[],"updatedAt":"string"}]}}

@@ -349,8 +349,8 @@ export interface SemanticSearchResult {
 export interface AggregateSpec {
   /**
    * What to group by: an indexed metadata field name (declared
-   * `indexed: true` in a tag schema — same FIELD_NOT_INDEXED contract
-   * `metadata` operator queries and `order_by` use), or the special value
+   * `indexed: true` in a tag schema, else FIELD_NOT_INDEXED; since 0.9.2
+   * only aggregate needs it, filters and `order_by` scan), or the special value
    * `"tag"` to group by tag membership. Under `"tag"`, a note carrying N of
    * the tags in the (filtered) result set contributes to N separate groups
    * — this is a membership rollup, not a partition.
@@ -474,7 +474,7 @@ export interface Store {
   // Notes. `actor` / `via` carry write-attribution (vault#298) — the
   // principal + interface stamped onto created_by/created_via (and mirrored
   // into the last_updated_* pair on create). Omitted → attribution NULL.
-  createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string; extension?: string; actor?: string | null; via?: string | null; /** Bulk import only; see SqliteStore.createNote. */ deferWikilinkSync?: boolean }): Promise<Note>;
+  createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string; extension?: string; actor?: string | null; via?: string | null; /** Bulk import only; see SqliteStore.createNote. */ deferWikilinkSync?: boolean; /** Scope gap 1: the writer's visibility (see SqliteStore.updateNote). */ linkVisible?: (noteId: string) => boolean }): Promise<Note>;
   getNote(id: string): Promise<Note | null>;
   /**
    * Look up a note by path. Pass `extension` to disambiguate when
@@ -506,7 +506,7 @@ export interface Store {
        * update-note executor must not either. §10.24 pins that.
        */
       historyOp?: HistoryOp;
-      actor?: string | null; via?: string | null; if_updated_at?: string; tagsForSchemaResolution?: string[] }): Promise<Note>;
+      actor?: string | null; via?: string | null; if_updated_at?: string; tagsForSchemaResolution?: string[]; /** Scope gap 1: the writer's visibility (see SqliteStore.updateNote). */ linkVisible?: (noteId: string) => boolean }): Promise<Note>;
   /**
    * Set a note's `created_at` and `updated_at` explicitly. Import-only:
    * used by the portable-md round-trip path to restore timestamps from
@@ -550,7 +550,8 @@ export interface Store {
    * always present in the response — even on an empty page — so an
    * agent loop can persist a single watermark and keep polling.
    */
-  queryNotesPaged(opts: QueryOpts): Promise<QueryNotesPage>;
+  /** `visible`: page and cursor over only the notes a scoped caller may see (scope gap 2). */
+  queryNotesPaged(opts: QueryOpts, visible?: (note: Note) => boolean): Promise<QueryNotesPage>;
   /**
    * Aggregation / rollup query. Applies every OTHER filter in `opts` (tags,
    * metadata, date range, write-attribution, `ids`, ...) exactly as
@@ -558,8 +559,9 @@ export interface Store {
    * an indexed metadata field) and returns `[{group, value}]` — one row per
    * group, count or sum per `opts.aggregate.op`. `cursor`/`orderBy`/`sort`/
    * `limit`/`offset` on `opts` are ignored. Throws `QueryError` (code
-   * `FIELD_NOT_INDEXED`) when `group_by`/`field` isn't a declared indexed
-   * field, or `INVALID_QUERY` for a malformed `aggregate` spec (missing
+   * `FIELD_NOT_INDEXED`) when `group_by`/`field`, or a `metadata` operator
+   * or `dateFilter` field, isn't a declared indexed field (an aggregate
+   * doesn't scan: its reply has no warnings), or `INVALID_QUERY` for a malformed `aggregate` spec (missing
    * `field` on a `"sum"`, a non-numeric `field`, ...).
    */
   aggregateNotes(opts: QueryOpts): Promise<AggregateRow[]>;

@@ -121,7 +121,8 @@ one that now passes.
 
 `bun run mutants:candidate` copies the workspace once, applies each mutant to `packages/vault`, `packages/hub` or
 `packages/cli` in a copy, rebuilds the core candidate, and requires the named contracts to go red
-(`harness/mutants.ts`). **Flips** go the other way: a small fix to today's code that must turn
+(`harness/mutants.ts`). A mutant whose suite is a door contract (`suites/door/…`) runs through `bun run doors` on
+that candidate as a box. **Flips** go the other way: a small fix to today's code that must turn
 named `red()` contracts "now green". A contract that is red today and green under the fix has a red/green proof
 that it tests the fix. When the real fix lands, its flip becomes mutants that put each bug back.
 
@@ -187,6 +188,26 @@ deleted, a note the export format can't carry).
 | `door/files.test.ts` | Upload, attach, byte-equal download, a ranged read, refused active content, tickets over MCP, `read-attachment` (an image block; a text window). |
 | `door/exit.test.ts` | The export: every note, type and file; the bytes of a fixed made-up note are compared across doors (a box's come from its own command). |
 | `door/records.test.ts`, `door/keys.test.ts` | 0.9 doors: the record door over MCP and REST. 0.9.1 doors: the owner's key (NIP-98), named app keys that stop when revoked. |
+| `door/multivault.test.ts` | 0.9.1, the one multi-vault door: a key covering several vaults, each at its own level, through the account door. It sees only its vaults, writes only where it holds write and must name the vault, its writes are stamped with its name, queries fan out at read, the writer's tool list stays within 4,000 tokens, it opens no vault directly and stops when revoked. The account door's consent per vault (none / read / write), with a level above write or an unknown vault refused. |
+
+### 0.9.2: the dial works (`suites/v092/`)
+
+Door contracts for ROADMAP 0.9.2, written before the code, one file per roadmap row. They use the door suite's
+client (`door/_door.ts`) and run on the box with `bun run doors -- --doors box suites/v092` (CI's `doors` job runs
+them on a second box from the same build, after the door suite). Each is `red()` with the reason it fails today; the lane that makes one pass removes its
+`red()` in the same pull request. They record no fingerprint, so the kept box fingerprint doesn't move. Wire shapes
+not yet decided are written at the top of each file, marked proposed.
+
+| File | What it holds |
+|---|---|
+| `v092/query.test.ts` | Filter and sort any field: every operator on a field that isn't indexed gives its indexed twin's rows, with a warning that it scanned (REST and MCP); a field no type declares; a word that is only in a field value is found by search. |
+| `v092/schema-change.test.ts` | A retype that would strand records is refused and says how many; a dry-run migrate over REST (admin) and MCP says what would change and writes nothing. |
+| `v092/field-types.test.ts` | A record with two types is checked against both; `doctor` reports a field holding two data types, declared or not. |
+| `v092/teaching.test.ts` | The nearest existing name on a new type or field (a warning); `vault-info`'s tag map capped (700 types fit in about 4,000 tokens); manage-types' own schema names `reference`, `required`, `strict`, `cardinality`; search says it needs every word. |
+| `v092/doctor.test.ts` | `doctor` finds a field that names records but isn't a declared reference, and names one letter apart; it counts indexed fields against 88, and the 89th is refused with what to prune. |
+
+`suites/bench/query-092.bench.ts` is the 0.9.2 bench, not a contract: made-up records at `BENCH_N` on the box, every
+operator, search, a type PUT and a retype, timed (`BENCH_N=94000 bun run doors -- --doors box suites/bench/query-092.bench.ts`).
 
 ## The contracts
 
@@ -197,8 +218,9 @@ deleted, a note the export format can't carry).
 | `today/links-search-history.test.ts` | `[[wikilinks]]` become links both ends see. A link to a missing note resolves when the note is made, and goes away when the text does. The neighbourhood is followed two steps out. Search finds by body and forgets old words and deleted notes. Every change keeps the version before it, readable and restorable, with who made it. |
 | `today/access.test.ts` | **Property tests** (fast-check). Random populations of notes with random tags. Every tag-scoped pass must see exactly the notes under its tags on list, search, get, history, links and MCP, never learn hidden tags, and never see less than a narrower pass ("only adds up", for today's passes). Scoped writers can't touch or create outside their scope; read passes can't write. A failure prints its seed; `FC_SEED=<n>` replays it, `FC_RUNS=<n>` runs more. |
 | `today/consumer-connector.test.ts` | **The consumer connector**, end to end, as a consumer AI app does it: MCP 401 → protected-resource metadata → server metadata → dynamic registration → sign in and consent → PKCE code → token. Then it writes, searches, reads and updates over MCP with the official SDK. It refreshes the token, and checks that replaying a used refresh token after the 30-second retry window ends the session. A read-only approval can't write. A forged token gets 401. |
-| `compat/prism.test.ts` | **What Prism relies on**, from its code: passes as it mints them, its JWT check, REST shapes and 409/428s, tag-schema rights, MCP tools per scope against its allowlists, revocation. Green today; must stay green. Candidate only. |
-| `compat/uni.test.ts` | **One probe per client of uni's box** (`uni-writers.json`: call shapes only), NIP-98 in both shapes, single-use events and tickets, one process per `vault.db`, config files unchanged across a restart. Green today. Candidate only. |
+| `compat/prism.test.ts` | **What Prism relies on**, from its code: passes as it mints them, its JWT check, REST shapes and 409/428s, tag-schema rights, MCP tools per scope against its allowlists, revocation. The REST part runs once on `/api/notes` and once on `/api/records` (`compat/_prefix.ts`: record words sent and read back at the test's edge, the record door's promises checked on each answer), and both must answer alike. Green today; must stay green. Candidate only. |
+| `compat/uni.test.ts` | **One probe per client of uni's box** (`uni-writers.json`: call shapes only), NIP-98 in both shapes, single-use events and tickets, one process per `vault.db`, config files unchanged across a restart. The REST clients run once per prefix (`/api/notes`, `/api/records`) with equal results. Green today. Candidate only. |
+| `compat/types-rest.test.ts` | **The record door over REST** (0.9.1): Prism's probe, `?type=`, `/api/types` and `/api/types/<name>` against MCP `list-types`, admin-only type writes, a type's name in `tags` refused (REST and MCP), old and new words together refused after auth, the `Deprecation` header on every `/api/notes` answer, and the usage counts. Candidate only. |
 | `safety/*.test.ts` | **Fixes 2, 5–8, 13–15** (PLAN §5): loopback by default, `/view` scope, scoped writes attach or detach no tag the pass can't read and can't publish (REST and MCP), every reference resolves among the notes the caller may read, deletes only to subscribers who could see the note, search answers that don't depend on hidden notes, a mint never widens, unknown permission keys refused. Fixes 5–8 and 13–15 are green on the core build (lane F, in `packages/vault` and `packages/hub`) and red on the stock build (`CANDIDATE_DIR=.cache/candidate-stock`); loopback (fix 2) is green too since lane C. They stay here, not in `today/`, because `today/` runs against the pinned stock code. |
 | `safety/bare-equality.test.ts`, `safety/since.test.ts`, `safety/export-roundtrip.test.ts` | **Three things that returned a wrong answer with no error** (T-395). A bare filter finds a stored boolean or number (`{done: true}`, `?meta[done]=true`), and a string filter still means the string. `since` on MCP `query-notes` finds notes edited since then, and `date_from` still means `created_at`. Export then import gives equal digests when a list item holds a colon, and an export written before the fix restores right. Here because the pinned stock code has all three bugs. |
 | `safety/forget.test.ts` | **Deleting can forget** (T-412). `DELETE /notes/:id?erase_history=true` and MCP `delete-note` with `erase_history` (and `ids`) delete a note and every version of it, need admin, and delete nothing when a list names a missing note; `GET /history/deleted` lists what plain deletes left, for an unscoped admin only. A plain delete still keeps its tombstone. Here because the pinned stock code has none of it. The wake and path-index fixes of the same task are pinned by engine tests (`packages/vault/core/src/row-costs.test.ts`) and by cloud's billed-row test, since rows read aren't visible at the door. |
@@ -212,10 +234,13 @@ deleted, a note the export format can't carry).
 | `lifecycle/identity.test.ts` | **The new name** (PLAN §2.5; the command `parachute`, Aaron 10-27): `@openparachute/core`, bins `parachute` and `parachute-core`, with `parachute-vault` inside the folder only; the vault serve starts is core's own even with the old one first on PATH (green on the core build); installing it with `parachute install --prefix` links `parachute` and `parachute-core`, leaves the old global packages byte-identical, and names `parachute-core` when the old hub's `parachute` comes first on PATH (green from lanes D and R). |
 | `v1/sharing.test.ts` | Grants (who × what × how much). A pass alone grants nothing. Grants add up. Private notes are the exception inside a shared page. Revoking takes effect at once. |
 | `v1/connector-attribution.test.ts` | When an app writes for a person, the note names both. |
+| `door-v1/*.test.ts` | **1.0 grants, as door contracts** (decided, not built; [`docs/SPEC-1.0-grants.md`](../docs/SPEC-1.0-grants.md)). An owner-signed grant opens named types and verbs to one key; expiry and a signed revoke; members, agents, applets and services; the link statement; what a narrow grant must never learn; what the export carries. Each is `red()` and runs on any door: `bun run doors -- --doors box,personal suites/door-v1`. See [`suites/door-v1/README.md`](suites/door-v1/README.md). |
 
 ### today and v1
 
 - **`today`** contracts must pass against the pins. CI runs them on every push and pull request.
+- **`door-v1`** is the same idea for behaviour that has to be shown on more than one door: door contracts wrapped
+  in `red()`, run by the door harness. CI runs them on the box.
 - **`v1`** contracts describe behaviour Aaron has decided for v1 that today's code lacks. They are `test.failing`:
   green while the behaviour is missing, red the day it works. That red is the signal to move the test to
   `today/` in its own pull request. `V1_SHOW=1 bun run v1` shows why each fails today. Each v1 file also has a

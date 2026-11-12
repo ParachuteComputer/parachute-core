@@ -15,6 +15,8 @@ import {
   ignoredParamWarning,
   truncatedResultsWarning,
   computeSearchDidYouMean,
+  collectScanWarnings,
+  assertNoAggregateScan,
   searchDidYouMeanWarning,
   embeddingsPendingWarning,
   type QueryWarning,
@@ -58,6 +60,8 @@ import {
   alignByteWindow,
 } from "./content-range.js";
 import { MCP_TOOL_MANIFEST } from "./mcp-manifest.js";
+import { findRetypeConflicts, retypeHint } from "./conformance.js";
+import { MigrateRequestError, runMigrateRequest } from "./migrate-tag-field.js";
 import {
   BLOCKED_ATTACHMENT_EXTENSIONS,
   ATTACHMENT_MIME_TYPES,
@@ -76,7 +80,7 @@ import {
   MAX_ATTACHMENT_IMAGE_BYTES,
   type AttachmentBytesProvider,
 } from "./attachment/bytes-provider.js";
-import { foldTypeFilter, holdTypes, markTypes, prepareCallTypes, refreshTypes, tagKinds } from "./tag-kind.js";
+import { attachNearTypeWarnings, foldTypeFilter, holdTypes, markTypes, nearSchemaWarnings, nearTypeWarnings, prepareCallTypes, refreshTypes, tagKinds } from "./tag-kind.js";
 
 /**
  * A single MCP tool-result content block. Mirrors the subset of the MCP SDK's
@@ -653,6 +657,8 @@ export interface GenerateMcpToolsOpts {
      * internal callers) → every note/attachment is visible.
      */
     noteVisible?: (note: Note) => boolean | Promise<boolean>;
+    /** The session's tag scope, stamped on each ticket so its spend re-checks it (scope gap 7). */
+    scopedTags?: string[];
   };
   /**
    * `AttachmentBytesProvider` seam (Wave 2 model lane — D10, same "tools
@@ -703,6 +709,11 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
   const searchVisibility = opts?.searchVisibility;
   const resolveVisibility = opts?.resolveVisibility;
   const ambiguityVisible = opts?.ambiguityVisible;
+  // Scope gap 1: the same per-note predicate decides which notes a scoped
+  // writer may link to. A link or [[wikilink]] to a note outside it resolves
+  // as one to nothing (queued, `unresolved_link`), never a link into it.
+  const linkVisible = ambiguityVisible;
+  const linkOpt = linkVisible ? { linkVisible } : {};
   // Write-attribution (vault#298) — captured once at tool-generation time
   // (a fresh tool set is generated per MCP request, so this is request-scoped)
   // and folded into every create/update the tools perform.
@@ -1046,6 +1057,8 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
               | { field?: string; from?: string; to?: string }
               | undefined,
           };
+          // Before the scoped branch, which lists the matches (a scan) and then aggregates their ids.
+          assertNoAggregateScan(db, aggFilterOpts);
           if (!aggregateVisibility) {
             return await store.aggregateNotes({ ...aggFilterOpts, aggregate: aggregateSpec });
           }
@@ -1201,6 +1214,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           // silent fallback to keyword search.
           const semanticResult = await store.semanticSearch(params.near_text, semanticOpts);
           results = semanticResult.notes;
+          queryWarnings.push(...collectScanWarnings(db, semanticOpts));
           if (semanticResult.pendingCount > 0) {
             queryWarnings.push(
               embeddingsPendingWarning(semanticResult.pendingCount, semanticResult.totalCandidates),
@@ -1280,6 +1294,12 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
               sort: params.sort as "asc" | "desc" | undefined,
               ...(searchVisibility ? { visible: searchVisibility } : {}),
             });
+            queryWarnings.push(
+              ...collectScanWarnings(db, {
+                metadata: params.metadata as Record<string, unknown> | undefined,
+                dateFilter: params.date_filter as { field?: string } | undefined,
+              }),
+            );
             // Zero-result `did_you_mean` (vault#551 WS2B) — cheap (a bounded
             // FTS5-vocabulary scan) and ONLY computed on the already-rare
             // empty-result path, mirroring `unknown_tag`'s did_you_mean.
@@ -1363,9 +1383,10 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           // above (vault#551).
           queryWarnings = queryWarnings.concat(
             collectUnknownTagWarnings(db, queryOpts.tags, queryOpts.expand, store.getTagHierarchy()),
+            collectScanWarnings(db, queryOpts),
           );
           if (cursorMode) {
-            const page = await store.queryNotesPaged(queryOpts);
+            const page = await store.queryNotesPaged(queryOpts, searchVisibility);
             results = page.notes;
             nextCursor = page.next_cursor;
           } else {
@@ -1663,6 +1684,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           if (Object.keys(updates).length > 0 || incomingTags.length > 0 || hasLinkMutation) {
             result = await store.updateNote(existingNote.id, {
               ...updates,
+              ...linkOpt,
               actor: writeActor,
               via: writeVia,
               // `tagsForSchemaResolution` (vault#date-field-type review round
@@ -1765,6 +1787,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
                 // in a batch (the whole call came from one authenticated session).
                 actor: writeActor,
                 via: writeVia,
+                ...linkOpt,
               });
             } catch (err) {
               // Race backstop (vault#555): a concurrent writer's INSERT
@@ -1812,7 +1835,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           // surfaces a distinct `ambiguous_link` warning instead. Never silent.
           for (const { sourceId, links } of pendingLinks) {
             for (const link of links) {
-              const outcome = resolveOrQueueLink(db, sourceId, link.target, link.relationship);
+              const outcome = resolveOrQueueLink(db, sourceId, link.target, link.relationship, linkVisible);
               if (outcome.status === "resolved") {
                 await store.createLink(sourceId, outcome.note_id, link.relationship);
               } else if (outcome.status === "ambiguous") {
@@ -1830,7 +1853,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           // pending-wikilink backfill (`resolveUnresolvedWikilinks`, run
           // inside each `store.createNote`/`updateNote` call above).
           for (const { noteId, content } of contentWikilinkNotes) {
-            for (const warning of getContentWikilinkWarnings(db, noteId, content)) {
+            for (const warning of getContentWikilinkWarnings(db, noteId, content, linkVisible)) {
               pushLinkWarning(noteId, warning);
             }
           }
@@ -2072,7 +2095,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
                   metadata: createOpts.metadata,
                   defaultTags: createOpts.tags,
                 });
-                const created = await store.createNote(content, createOpts);
+                const created = await store.createNote(content, { ...createOpts, ...linkOpt });
                 await applySchemaDefaults(store, db, [created.id], created.tags ?? []);
                 // Defer links.add resolution to the second pass (vault#555)
                 // — same reasoning as create-note.
@@ -2328,7 +2351,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
               // `skipUpdatedAt` isn't set, so this still issues a real UPDATE
               // (not the true no-op/precondition-only branch, which only fires
               // when the caller passes ZERO fields AND no mutation is pending).
-              result = await store.updateNote(note.id, updates);
+              result = await store.updateNote(note.id, { ...updates, ...linkOpt });
             } else {
               result = note;
             }
@@ -2379,7 +2402,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           // never silently dropped.
           for (const { sourceId, links } of pendingLinks) {
             for (const link of links) {
-              const outcome = resolveOrQueueLink(db, sourceId, link.target, link.relationship);
+              const outcome = resolveOrQueueLink(db, sourceId, link.target, link.relationship, linkVisible);
               if (outcome.status === "resolved") {
                 await store.createLink(sourceId, outcome.note_id, link.relationship, link.metadata);
               } else if (outcome.status === "ambiguous") {
@@ -2393,7 +2416,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           // --- Content-wikilink warnings (vault#570) ---
           // Same forward-ref-aware timing as the structured-links pass above.
           for (const { noteId, content } of contentWikilinkNotes) {
-            for (const warning of getContentWikilinkWarnings(db, noteId, content)) {
+            for (const warning of getContentWikilinkWarnings(db, noteId, content, linkVisible)) {
               pushLinkWarning(noteId, warning);
             }
           }
@@ -2699,6 +2722,27 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
         // callers (MCP, REST PUT /tags/:name, import) share — so it can't be
         // bypassed. The cross-tag validation above stays here to surface a
         // clean error before persisting. See the gitcoin orphaned-fields bug.
+        // 0.9.2 safe schema change: refuse a retype that would strand records
+        // (same check, words and shape as REST's 409; conformance.ts).
+        if (fieldsPatch !== undefined) {
+          const conflicts = findRetypeConflicts(db, tag, fieldsPatch);
+          if (conflicts.length > 0) {
+            const first = conflicts[0]!;
+            throw structuredError(
+              `Not changed: retyping "${first.field}" on "${tag}" from ${first.from} to ${first.to} would strand ${first.count} record${first.count === 1 ? "" : "s"}.`,
+              {
+                error_type: "retype_conflict",
+                field: first.field,
+                tag,
+                count: first.count,
+                conflicts: conflicts.map((c) => ({ field: c.field, from: c.from, to: c.to, count: c.count })),
+                hint: retypeHint(tag, first),
+              },
+            );
+          }
+        }
+        // 0.9.2: a new type or field one letter from an existing one is made as written, with a warning.
+        const near = nearSchemaWarnings(db, tag, incomingFields);
         const result = await store.upsertTagRecord(tag, {
           ...(descriptionPatch !== undefined ? { description: descriptionPatch } : {}),
           ...(fieldsPatch !== undefined ? { fields: fieldsPatch } : {}),
@@ -2707,7 +2751,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           ...(params.kind !== undefined ? { kind: params.kind as "type" | "tag" } : {}),
         });
 
-        return result;
+        return near.length > 0 && result && typeof result === "object" ? { ...result, warnings: near } : result;
       },
     },
 
@@ -2851,6 +2895,30 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
     },
 
     // =====================================================================
+    // 10b. migrate-field — manage-types {action: "migrate"} (0.9.2): the
+    // CLI's `schema migrate-field` engine, a dry run unless apply: true.
+    // =====================================================================
+    {
+      name: "migrate-field",
+      execute: async (params) => {
+        const tag = params.tag;
+        if (typeof tag !== "string" || tag.length === 0) {
+          throw structuredError("migrate needs `tag`: the type whose records carry the field", { error_type: "invalid_request", field: "tag" });
+        }
+        try {
+          return await runMigrateRequest(store, tag, params, {
+            actor: writeActor,
+            via: writeVia,
+            ...(onStrictBypass ? { onStrictBypass } : {}),
+          });
+        } catch (e) {
+          if (e instanceof MigrateRequestError) throw structuredError(e.message, { error_type: "invalid_request", field: e.field });
+          throw e;
+        }
+      },
+    },
+
+    // =====================================================================
     // 11. doctor — read-only taxonomy/metadata integrity scan (vault#552)
     // =====================================================================
     {
@@ -2963,6 +3031,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             sizeBytes,
             transcribe: params.transcribe === true,
             ...(validSegment ? { segmentIndex: segIdx } : {}),
+            ...(ticketSeam.scopedTags ? { scopedTags: [...ticketSeam.scopedTags] } : {}),
           };
           await ticketSeam.provider.put(ticket);
 
@@ -3025,6 +3094,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             attachmentId: attachment.id,
             mimeType: downloadMime,
             sizeBytes: declaredSize,
+            ...(ticketSeam.scopedTags ? { scopedTags: [...ticketSeam.scopedTags] } : {}),
           };
           await ticketSeam.provider.put(ticket);
 
@@ -3171,12 +3241,14 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
       const batchTypes = Array.isArray(params.notes) && (params.notes as Record<string, unknown>[]).some((n) => n?.types !== undefined);
       if (params.types === undefined && !batchTypes) return execute(params);
       const prepared = prepareCallTypes(db, params, mode);
+      // 0.9.2: a new type one letter from an existing one is kept, with a warning naming it.
+      const near = nearTypeWarnings(db, prepared.types);
       const release = holdTypes(db, prepared.types);
       try {
         const out = await execute(prepared.params);
         if (!prepared.types.length) return out;
         markTypes(db, prepared.types);
-        return refreshTypes(db, out);
+        return attachNearTypeWarnings(refreshTypes(db, out), near);
       } finally {
         release();
       }

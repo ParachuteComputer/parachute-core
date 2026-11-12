@@ -48,11 +48,15 @@ const LINKS = {
   items: obj({ target: str("Note path or id"), relationship: str() }, ["target"]),
 };
 
+/** A type's field options, in its own schema (0.9.2: an AI that doesn't ask for help still sees all of them). */
+const FIELD_SPEC =
+  '{name: {type: "string"|"integer"|"number"|"boolean"|"date"|"reference", enum?, indexed?, default?, required?, strict?, cardinality?, target_tags?}}. reference: points at a record (target_tags: its types). required: should be set (refused only if strict). strict: refuse a wrong value. cardinality "many": a list.';
+
 export const SHORT_TOOLS: Record<string, ShortTool> = {
   "query-notes": {
     description: `Read notes: one note, a filtered list, a search, a link neighbourhood or path, counts, or a note's history.
 - One note: \`id\` (id, path or title). Lists leave content out unless \`include_content: true\`.
-- Filters combine (AND). \`tag\` also matches subtypes (\`event\` finds \`event/meeting\`). \`metadata\` operators need an indexed field (vault-info lists them).
+- Filters combine (AND). \`tag\` also matches subtypes (\`event\` finds \`event/meeting\`). \`metadata\` operators work on any field: an indexed one (vault-info lists them) is fastest, any other is read in full and the reply warns \`scan\`.
 - Returns an array of notes, or \`{notes, next_cursor?, warnings?}\` with \`cursor\` or warnings, or \`[{group, value}]\` with \`aggregate\`.
 Rarer filters (has_links, order_by, expand_links, created_by, search_mode, …) are accepted too. ${HELP("query-notes")}`,
     inputSchema: obj({
@@ -63,7 +67,7 @@ Rarer filters (has_links, order_by, expand_links, created_by, search_mode, …) 
       exclude_tags: strs("Leave out notes with these tags"),
       path: str("Exact path"),
       path_prefix: str('e.g. "Projects/"'),
-      search: str("Full-text search over title and content"),
+      search: str("Full-text search over title and content: finds notes holding every word"),
       metadata: { type: "object", description: "{field: value} or {field: {eq|ne|gt|gte|lt|lte|in|not_in|exists: v}}" },
       since: str("What changed: updated_at on or after (ISO date)"),
       date_from: str("created_at on or after (ISO date)"),
@@ -166,10 +170,11 @@ Rarer filters (has_links, order_by, expand_links, created_by, search_mode, …) 
       {
         tag: str(),
         description: str(),
-        fields: { type: "object", description: '{name: {type: "string"|"integer"|"boolean"|"date"|…, enum?, indexed?, default?, strict?}}' },
+        fields: { type: "object", description: FIELD_SPEC },
         parent_names: { type: "array", items: { type: "string" } },
         relationships: { type: "object" },
         kind: { type: "string", enum: ["type", "tag"] },
+        force: bool("Go ahead although a key's tag limit, private_tags or the published tag reaches this name (the refusal names them, except to a tag-scoped pass)"),
       },
       ["tag"],
     ),
@@ -177,17 +182,17 @@ Rarer filters (has_links, order_by, expand_links, created_by, search_mode, …) 
 
   "delete-tag": {
     description: "Delete a tag and untag its notes (the notes stay). If another tag names it as a parent, pass `detach: true`.",
-    inputSchema: obj({ tag: str(), detach: bool() }, ["tag"]),
+    inputSchema: obj({ tag: str(), detach: bool(), force: bool("Go ahead although a key's tag limit, private_tags or the published tag reaches this name (the refusal names them, except to a tag-scoped pass)"), }, ["tag"]),
   },
 
   "rename-tag": {
-    description: "Rename a tag everywhere (notes, parents, keys, #mentions); its sub-tags follow.",
-    inputSchema: obj({ old_name: str(), new_name: str() }, ["old_name", "new_name"]),
+    description: "Rename a tag everywhere (notes, parents, #mentions); its sub-tags follow. If a key's tag limit, private_tags or the published tag reaches it (or the caller is tag-scoped), refused until you pass `force: true` (the refusal names them).",
+    inputSchema: obj({ old_name: str(), new_name: str(), force: bool("Go ahead although a key's tag limit, private_tags or the published tag reaches this name (the refusal names them, except to a tag-scoped pass)"), }, ["old_name", "new_name"]),
   },
 
   "merge-tags": {
     description: "Retag every note of the `sources` with `target`, then drop the sources.",
-    inputSchema: obj({ sources: { type: "array", items: { type: "string" } }, target: str() }, ["sources", "target"]),
+    inputSchema: obj({ sources: { type: "array", items: { type: "string" } }, target: str(), force: bool("Go ahead although a key's tag limit, private_tags or the published tag reaches this name (the refusal names them, except to a tag-scoped pass)"), }, ["sources", "target"]),
   },
 
   "find-path": {
@@ -205,8 +210,23 @@ Rarer filters (has_links, order_by, expand_links, created_by, search_mode, …) 
     inputSchema: obj({ apply: bool() }),
   },
 
+  // Reached only as manage-types {action: "migrate"} (FOLD_ONLY below); never listed.
+  "migrate-field": {
+    description: "Change a field's values on every record of a type. A dry run unless `apply: true`.",
+    inputSchema: obj(
+      {
+        tag: str(),
+        field: str(),
+        transform: { type: "object", description: '{kind: "to_string"|"to_int"|"to_number"|"to_boolean"|"rename"|"remap"|"set_default", ...}' },
+        apply: bool(),
+        continue_on_error: bool(),
+      },
+      ["tag", "field", "transform"],
+    ),
+  },
+
   doctor: {
-    description: `Read-only check of types, tags and fields (dangling parents, cycles, mixed field types). Returns findings, each with a remedy; fixes nothing. ${HELP("doctor")}`,
+    description: `Read-only check of types, tags and fields (dangling parents, cycles, a field holding two data types, a field that names records but isn't a reference, names one letter apart). Returns findings, each with a remedy; fixes nothing. ${HELP("doctor")}`,
     inputSchema: obj({ deep: bool("Also check history") }),
   },
 
@@ -361,24 +381,28 @@ export function nestedParamProblem(tool: string, params: Record<string, unknown>
 /** The tools 0.9 adds; each runs the old tools underneath (src/mcp-tools.ts). */
 export const NEW_TOOLS: Record<string, ShortTool & { folds: Record<string, string> }> = {
   "manage-types": {
-    description: `Change the vault's types and tags. \`action\`: update (default: create or change one; \`fields\` and \`parent_names\` make it a type), rename {old_name, new_name}, merge {sources, target}, delete {tag, detach?}, prune (drop unused indexed columns; a dry run unless \`apply: true\`). ${HELP("manage-types")}`,
+    description: `Change the vault's types and tags. \`action\`: update (default: create or change one; \`fields\` and \`parent_names\` make it a type), rename {old_name, new_name}, merge {sources, target}, delete {tag, detach?}, prune (drop unused indexed columns), migrate {tag, field, transform} (change a field's values, e.g. before a retype); both a dry run unless \`apply: true\`. ${HELP("manage-types")}`,
     inputSchema: obj(
       {
-        action: { type: "string", enum: ["update", "rename", "merge", "delete", "prune"] },
+        action: { type: "string", enum: ["update", "rename", "merge", "delete", "prune", "migrate"] },
         tag: str(),
         kind: { type: "string", enum: ["type", "tag"], description: "type: has fields/parents; tag: a flat label" },
         description: str(),
-        fields: { type: "object", description: '{name: {type: "string"|"integer"|"boolean"|"date"|…, enum?, indexed?, default?}}' },
+        fields: { type: "object", description: FIELD_SPEC },
         parent_names: { type: "array", items: { type: "string" } },
         old_name: str(),
         new_name: str(),
         sources: { type: "array", items: { type: "string" } },
         target: str(),
         detach: bool(),
+        field: str(),
+        transform: { type: "object", description: '{kind: "to_string"|"to_int"|"remap"|…}' },
+        continue_on_error: bool(),
         apply: bool(),
+        force: bool(),
       },
     ),
-    folds: { update: "update-tag", rename: "rename-tag", merge: "merge-tags", delete: "delete-tag", prune: "prune-schema" },
+    folds: { update: "update-tag", rename: "rename-tag", merge: "merge-tags", delete: "delete-tag", prune: "prune-schema", migrate: "migrate-field" },
   },
   "attachment-url": {
     description: `A one-use URL for an attachment's bytes. upload: \`record\`, \`filename\` and exact \`size_bytes\`, then PUT the bytes to \`url\`. download: \`attachment_id\` (from query-records \`include_attachments: true\`). ${HELP("attachment-url")}`,
@@ -400,6 +424,9 @@ export const NEW_TOOLS: Record<string, ShortTool & { folds: Record<string, strin
 
 /** `query-notes {path_between}` replaces find-path. */
 export const PATH_BETWEEN: Schema = PATH_BETWEEN_REF;
+
+/** Tools reached only through a 0.9 tool's `action`, never listed on their own. */
+export const FOLD_ONLY: ReadonlySet<string> = new Set(["migrate-field"]);
 
 /** The nine old names 0.9 keeps as listed, working aliases until 1.0 (Prism allow-lists some by name). */
 export const TOOL_ALIASES: Record<string, string> = {

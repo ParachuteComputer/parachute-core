@@ -1478,21 +1478,7 @@ describe("queryNotes", async () => {
       expect(results.map((n) => n.content)).toEqual(["recently-synced new email"]);
     });
 
-    it("dateFilter on a non-indexed field rejects with FIELD_NOT_INDEXED", async () => {
-      await store.createNote("X", { metadata: { meeting_date: "2026-04-25T00:00:00.000Z" } });
-      // Note: not declared via declareField, so the field has no generated
-      // column. The error mirrors the metadata-operator + order_by gate.
-      try {
-        await store.queryNotes({
-          dateFilter: { field: "meeting_date", from: "2026-04-01" },
-        });
-        throw new Error("expected QueryError");
-      } catch (err: any) {
-        expect(err.name).toBe("QueryError");
-        expect(err.code).toBe("FIELD_NOT_INDEXED");
-        expect(err.message).toContain("meeting_date");
-      }
-    });
+    // A dateFilter on a field that isn't indexed scans (0.9.2): query-scan.test.ts.
 
     it("dateFilter combined with top-level dateFrom rejects with INVALID_QUERY", async () => {
       await declareEmailDate();
@@ -2269,17 +2255,8 @@ describe("queryNotes", async () => {
       expect(results.map((n) => n.content)).toEqual(["match"]);
     });
 
-    it("operator on a non-indexed field throws FIELD_NOT_INDEXED", async () => {
-      await store.createNote("x", { metadata: { foo: "bar" } });
-      expect(
-        store.queryNotes({ metadata: { foo: { eq: "bar" } } }),
-      ).rejects.toThrow(/not indexed/);
-    });
-
-    it("order_by on a non-indexed field throws FIELD_NOT_INDEXED", async () => {
-      await store.createNote("x", { metadata: { foo: 1 } });
-      expect(store.queryNotes({ orderBy: "foo" })).rejects.toThrow(/not indexed/);
-    });
+    // An operator or order_by on a field that isn't indexed scans and gives
+    // the indexed twin's rows (0.9.2): query-scan.test.ts.
 
     // ---- vault#585: order_by "updated_at" is a pseudo-field like link_count ----
     //
@@ -2651,7 +2628,10 @@ describe("MCP tools", async () => {
     // synthesize-notes retired in v17 — replicable with query-notes(near=) +
     // find-path + agent-side aggregation. See vault#268.
     expect(names).not.toContain("synthesize-notes");
-    expect(tools).toHaveLength(13);
+    // migrate-field (0.9.2): manage-types {action: "migrate"}; the server
+    // layer leaves it out of tools/list (mcp-short.ts FOLD_ONLY).
+    expect(names).toContain("migrate-field");
+    expect(tools).toHaveLength(14);
   });
 
   it("create-note tool works", async () => {
@@ -8202,11 +8182,26 @@ describe("schema inheritance via parent_names (vault#270)", async () => {
     expect(conflict).toBeDefined();
     expect(conflict.field).toBe("status");
     expect(conflict.schema).toBe("task"); // winner
-    // No enum_mismatch — the value is valid under task's enum.
-    const enumMismatch = result.validation_status.warnings.find(
+    // 0.9.2: the other parent's rules are checked too, and warn (never
+    // block): "todo" is valid under task's enum and fails publication's.
+    const enumMismatch = result.validation_status.warnings.filter(
       (w: any) => w.reason === "enum_mismatch",
     );
-    expect(enumMismatch).toBeUndefined();
+    expect(enumMismatch.map((w: any) => w.schema)).toEqual(["publication"]);
+    expect(enumMismatch[0].strict).toBeUndefined();
+  });
+
+  it("0.9.2: a record's other type is checked advisory-only, even when its field is strict", async () => {
+    await store.upsertTagRecord("ta", { fields: { st: { type: "string", enum: ["open", "done"] } } });
+    await store.upsertTagRecord("tb", { fields: { st: { type: "string", enum: ["todo", "done"], strict: true } } });
+    // ta comes first, so its rules decide; tb's strict enum fails, and only warns.
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({ content: "y", tags: ["ta", "tb"], metadata: { st: "open" } }) as any;
+    const w = result.validation_status.warnings.filter((x: any) => x.reason === "enum_mismatch");
+    expect(w.map((x: any) => [x.schema, x.strict ?? false])).toEqual([["tb", false]]);
+    // In the other order tb's strict enum decides, and the write is refused.
+    await expect(create.execute({ content: "z", tags: ["tb", "ta"], metadata: { st: "open" } })).rejects.toThrow();
   });
 
   it("`_default` universal parent: untagged note picks up `_default`'s schema", async () => {

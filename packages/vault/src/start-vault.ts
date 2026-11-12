@@ -19,7 +19,7 @@ import { assertVaultNotPaused, VaultImportPausedError, MirrorRetiredError } from
  * or the hub's vault child) is a few lines around the same call.
  */
 
-import { readVaultConfig, readGlobalConfig, writeGlobalConfig, writeVaultConfig, listVaults, DEFAULT_PORT, ensureConfigDirSync, loadEnvFile, generateApiKey, hashKey, stopSignalPath, bootAutoCreateAllowed } from "./config.ts";
+import { readVaultConfig, readGlobalConfig, writeGlobalConfig, writeVaultConfig, listVaults, DEFAULT_PORT, ensureConfigDirSync, loadEnvFile, stopSignalPath, bootAutoCreateAllowed } from "./config.ts";
 import { existsSync, rmSync } from "fs";
 import { migrateVaultKeys } from "./token-store.ts";
 import { resolveFirstBootVaultName, reservedNameSquatWarnings } from "./vault-name.ts";
@@ -31,6 +31,7 @@ import { defaultHookRegistry } from "../core/src/hooks.ts";
 import { registerTriggers } from "./triggers.ts";
 import { clearLiveTriggers, loadVaultTriggers } from "./triggers-api.ts";
 import { route } from "./routing.ts";
+import { notesDeprecationHeaders } from "../core/src/rest-records.ts";
 import { startTranscriptionWorker, registerTranscriptionHook, type TranscriptionWorker } from "./transcription-worker.ts";
 import { setTranscriptionWorker } from "./transcription-registry.ts";
 import { assetsDir, MAX_REQUEST_BODY_BYTES } from "./routes.ts";
@@ -134,11 +135,9 @@ export interface StartVaultOptions {
   firstBootVaultName?: string;
   /**
    * Create a first vault when there are none (default true). `false` under `serve --embedded`: the host bootstraps
-   * the home, and first boot would log a full API key (PLAN §2.2 item 3, §3).
+   * the home (PLAN §2.2 item 3, §3).
    */
   firstBoot?: boolean;
-  /** Print the first-boot vault's full API key in the log, as `parachute-vault serve` did. Default true. */
-  logFirstBootKey?: boolean;
   /** Called when `parachute-vault stop` writes the stop file. Default: nothing but the log line. */
   onStopFile?: () => void;
 }
@@ -466,7 +465,7 @@ export async function startVault(opts: StartVaultOptions = {}): Promise<RunningV
     warnLegacyGlobalApiKeys(readGlobalConfig().api_keys);
 
     const createdOnFirstBoot =
-      opts.firstBoot === false ? false : await firstBootCreate(opts.firstBootVaultName ?? process.env.PARACHUTE_VAULT_NAME, opts.logFirstBootKey ?? true);
+      opts.firstBoot === false ? false : await firstBootCreate(opts.firstBootVaultName ?? process.env.PARACHUTE_VAULT_NAME);
 
     // vault#266 — self-register manifest + installDir into services.json so
     // hub's discovery / admin SPA can find vault without a `parachute install
@@ -711,7 +710,18 @@ export async function startVault(opts: StartVaultOptions = {}): Promise<RunningV
           // `Mcp-Session-Id` is the streamable-HTTP MCP session the client echoes
           // back. (Claude Code is a CLI → no CORS → unaffected. The hub already
           // exposes WWW-Authenticate; this matches it on the resource server.)
-          "Access-Control-Expose-Headers": "WWW-Authenticate, Mcp-Session-Id",
+          "Access-Control-Expose-Headers": "WWW-Authenticate, Mcp-Session-Id, Deprecation, Link",
+        };
+        // Every /api/notes answer, success or error, says the route is leaving (SPEC §5.1; gone at 1.0):
+        // `Deprecation: true` and a `Link` to its /api/records successor (added to any Link the route set). A browser
+        // app can read both (Expose-Headers above).
+        const leaving = notesDeprecationHeaders(path);
+        const said = (r: Response): Response => {
+          if (leaving) {
+            r.headers.set("Deprecation", leaving.Deprecation);
+            r.headers.append("Link", leaving.Link);
+          }
+          return r;
         };
 
         if (req.method === "OPTIONS") {
@@ -724,7 +734,7 @@ export async function startVault(opts: StartVaultOptions = {}): Promise<RunningV
           try { assertVaultNotPaused(vaultSegment); }
           catch (err) {
             if (!(err instanceof VaultImportPausedError)) throw err;
-            return Response.json({ error_type: err.error_type, message: err.message }, { status: 503, headers: corsHeaders });
+            return said(Response.json({ error_type: err.error_type, message: err.message }, { status: 503, headers: corsHeaders }));
           }
         }
 
@@ -752,16 +762,16 @@ export async function startVault(opts: StartVaultOptions = {}): Promise<RunningV
           for (const [k, v] of Object.entries(corsHeaders)) {
             response.headers.set(k, v);
           }
-          return response;
+          return said(response);
         } catch (err) {
           if (err instanceof VaultImportPausedError || err instanceof MirrorRetiredError) {
-            return Response.json({ error_type: err.error_type, message: err.message }, { status: err.status, headers: corsHeaders });
+            return said(Response.json({ error_type: err.error_type, message: err.message }, { status: err.status, headers: corsHeaders }));
           }
           console.error(`[${req.method} ${path}]`, err);
-          return Response.json(
+          return said(Response.json(
             { error: "Internal server error" },
             { status: 500, headers: corsHeaders },
-          );
+          ));
         }
       },
     });
@@ -819,7 +829,7 @@ export async function startVault(opts: StartVaultOptions = {}): Promise<RunningV
  * installs have no config.yaml — no marker — so the env-var-driven path
  * still works on a clean box.
  */
-export async function firstBootCreate(requestedName: string | undefined, logKey: boolean): Promise<boolean> {
+export async function firstBootCreate(requestedName: string | undefined): Promise<boolean> {
   if (listVaults().length > 0) return false;
   const globalConfig = readGlobalConfig();
   if (!bootAutoCreateAllowed(globalConfig)) {
@@ -832,31 +842,15 @@ export async function firstBootCreate(requestedName: string | undefined, logKey:
       // PARACHUTE_VAULT_NAME explicitly set + valid — create the named vault.
       console.log(`[vault first-boot] PARACHUTE_VAULT_NAME=${firstBoot.name} — creating vault`);
       const vaultName = firstBoot.name;
-      const { fullKey, keyId } = generateApiKey();
-      writeVaultConfig({
-        name: vaultName,
-        api_keys: [{
-          id: keyId,
-          label: "default",
-          scope: "write",
-          key_hash: hashKey(fullKey),
-          created_at: new Date().toISOString(),
-        }],
-        created_at: new Date().toISOString(),
-      });
+      // No key (0.9.1, T-446): first boot used to mint a write-level `pvk_` key into vault.yaml AND config.yaml and
+      // print it here. The way in is the account (sign in, OAuth, named keys) on a box, and VAULT_AUTH_TOKEN or a
+      // hub-signed token on a standalone vault, the same as for `parachute-vault create`.
+      writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
       globalConfig.default_vault = vaultName;
-      if (!globalConfig.api_keys?.length) {
-        globalConfig.api_keys = [{
-          id: keyId,
-          label: "default",
-          scope: "write",
-          key_hash: hashKey(fullKey),
-          created_at: new Date().toISOString(),
-        }];
-      }
       writeGlobalConfig(globalConfig);
-      // `parachute-core serve` never prints the key (PLAN §2.2 item 3): its log is a box's journal.
-      console.log(logKey ? `Auto-created vault "${vaultName}" (API key: ${fullKey})` : `Auto-created vault "${vaultName}" (its API key is not logged)`);
+      console.log(
+        `Auto-created vault "${vaultName}" (no API key is made: sign in on the hub and connect with OAuth or a named key, or set VAULT_AUTH_TOKEN on a vault without a hub)`,
+      );
       // Seed the default packs (welcome web + capture tag, Getting Started
       // guide) so a connected AI can self-orient and help set the vault up —
       // same as the `create`/`init` CLI path. Idempotent + best-effort (never

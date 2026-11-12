@@ -27,8 +27,10 @@ import {
   importSPKI,
   jwtVerify,
 } from "jose";
+import { assertMintedUnderCurrentGrant } from "./grant-generation.ts";
 import { adoptRefreshToken, adoptToken } from "./keys.ts";
 import { attributionPubkey } from "./pubkey-links.ts";
+import { scopedAdminProblem } from "./permissions-claim.ts";
 import { renameVaultScopes, vaultScopeName } from "./scope-explanations.ts";
 import { getActiveSigningKey, getAllPublicKeys } from "./signing-keys.ts";
 import { vaultRenameReservedUntil } from "./vault-rename-guard.ts";
@@ -117,6 +119,9 @@ export async function signAccessToken(
   db: Database,
   opts: SignAccessTokenOpts,
 ): Promise<SignedAccessToken> {
+  // Scope gap 4: no path signs a tag-scoped admin pass (permissions-claim.ts).
+  const scopedAdmin = scopedAdminProblem(opts.scopes, opts.extraClaims?.permissions);
+  if (scopedAdmin !== null) throw new Error(scopedAdmin);
   const key = getActiveSigningKey(db);
   const priv = await importPKCS8(key.privateKeyPem, SIGNING_ALGORITHM);
   const jti = opts.jti ?? randomBytes(16).toString("base64url");
@@ -154,6 +159,16 @@ export interface SignRefreshTokenOpts {
    * replay detection can revoke every descendant in one query (#73).
    */
   familyId?: string;
+  /** The key's name signed into the access token (its `key` claim): the family's key gets exactly this name. */
+  keyName?: string;
+  /**
+   * The grant generation (grant-generation.ts) of the artifact this row is minted from, READ FROM THE DB: the auth
+   * code's row for a code redeem, the rotated refresh row for a rotation. Called inside the insert transaction,
+   * after the caller's await, so a narrowing that landed meanwhile is seen. Required so no mint path can skip the
+   * check: a mismatch on a row with an account-door choice scope throws `GrantChangedError` and inserts nothing.
+   * The new row carries this generation.
+   */
+  artifactGeneration: () => number;
   now?: () => Date;
 }
 
@@ -259,34 +274,54 @@ export function signRefreshToken(db: Database, opts: SignRefreshTokenOpts): Sign
   // Resolved at INSERT time so the row records what was true when the
   // credential was minted; a later unlink does not rewrite it.
   const subjectPubkey = attributionPubkey(db, { userId: opts.userId });
+  const insert = () => {
+    // The grant-generation check, in the same transaction as the insert (grant-generation.ts).
+    const grantGeneration = opts.artifactGeneration();
+    assertMintedUnderCurrentGrant(db, { userId: opts.userId, clientId: opts.clientId, scopes: opts.scopes, artifactGeneration: grantGeneration });
+    try {
+      db.prepare(
+        `INSERT INTO tokens (jti, user_id, client_id, scopes, refresh_token_hash, family_id, expires_at, created_at, created_via, subject_pubkey, grant_generation)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'oauth_refresh', ?, ?)`,
+      ).run(
+        opts.jti,
+        opts.userId,
+        opts.clientId,
+        opts.scopes.join(" "),
+        refreshTokenHash,
+        familyId,
+        expiresAt,
+        now.toISOString(),
+        subjectPubkey,
+        grantGeneration,
+      );
+    } catch (err) {
+      throw new RefreshTokenInsertError(
+        `failed to insert refresh token row: ${err instanceof Error ? err.message : String(err)}`,
+        err,
+      );
+    }
+    keyForMint(db, opts.jti, familyId, opts.keyName);
+  };
+  // The check, the row and its key in one step, or nothing (a name another grant took meanwhile → KeyNameTakenError,
+  // and the caller signs again under the next name). Inside a caller's transaction (rotation) this is a savepoint;
+  // on its own it takes the write lock up front (IMMEDIATE).
+  const tx = db.transaction(insert);
   try {
-    db.prepare(
-      `INSERT INTO tokens (jti, user_id, client_id, scopes, refresh_token_hash, family_id, expires_at, created_at, created_via, subject_pubkey)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'oauth_refresh', ?)`,
-    ).run(
-      opts.jti,
-      opts.userId,
-      opts.clientId,
-      opts.scopes.join(" "),
-      refreshTokenHash,
-      familyId,
-      expiresAt,
-      now.toISOString(),
-      subjectPubkey,
-    );
+    if (db.inTransaction) tx();
+    else tx.immediate();
   } catch (err) {
-    throw new RefreshTokenInsertError(
-      `failed to insert refresh token row: ${err instanceof Error ? err.message : String(err)}`,
-      err,
-    );
+    if (opts.keyName !== undefined && err instanceof Error && /UNIQUE constraint failed: keys\.name/.test(err.message)) throw new KeyNameTakenError(opts.keyName);
+    throw err;
   }
-  keyForMint(db, opts.jti, familyId);
   return { token, refreshTokenHash, familyId, expiresAt };
 }
 
 export interface RecordTokenMintOpts {
   /** Same as the issued JWT's jti — keys the row. */
   jti: string;
+  /** The key's name signed into the token (its `key` claim, the write stamp): the key row gets exactly this name,
+   *  and the mint fails if it is taken, so a stamp never names another key. */
+  keyName?: string;
   /** Provenance tag — drives admin UI grouping and the registry semantics. */
   createdVia: Exclude<TokenCreatedVia, "oauth_refresh">;
   /** Subject identity for non-user mints. Operator-mint rows pass "operator"; service-mint rows pass the service short name. */
@@ -342,6 +377,27 @@ export interface RecordTokenMintOpts {
  * CLI again).
  */
 export function recordTokenMint(db: Database, opts: RecordTokenMintOpts): void {
+  // A token that names its key (the write stamp) is recorded with its key in one step: if the name was taken in the
+  // meantime, nothing is left behind and the caller can sign again under another name (KeyNameTakenError).
+  if (opts.keyName === undefined) return recordTokenMintRow(db, opts);
+  try {
+    // IMMEDIATE: take the write lock up front, so a concurrent mint waits (busy_timeout) instead of failing on upgrade.
+    db.transaction(() => recordTokenMintRow(db, opts)).immediate();
+  } catch (err) {
+    const cause = err instanceof RefreshTokenInsertError ? (err as { cause?: unknown }).cause ?? err : err;
+    if (cause instanceof Error && /UNIQUE constraint failed: keys\.name/.test(cause.message)) throw new KeyNameTakenError(opts.keyName);
+    throw err;
+  }
+}
+
+/** The key name a token was signed with was taken before its row was written; nothing was recorded. */
+export class KeyNameTakenError extends Error {
+  constructor(readonly keyName: string) {
+    super(`a key called "${keyName}" already exists`);
+  }
+}
+
+function recordTokenMintRow(db: Database, opts: RecordTokenMintOpts): void {
   const now = opts.now?.() ?? new Date();
   // Phase-1b attribution snapshot (hub#833). `undefined` → resolve from the
   // mint's principal; `null` → explicit opt-out. See `subjectPubkey`'s doc.
@@ -389,7 +445,7 @@ export function recordTokenMint(db: Database, opts: RecordTokenMintOpts): void {
           `account ${opts.userId} no longer exists (or was reset) at mint insert; refusing to register jti=${opts.jti}`,
         );
       }
-      keyForMint(db, opts.jti);
+      keyForMint(db, opts.jti, undefined, opts.keyName);
       return;
     }
     db.prepare(
@@ -409,7 +465,7 @@ export function recordTokenMint(db: Database, opts: RecordTokenMintOpts): void {
       opts.subject,
       subjectPubkey,
     );
-    keyForMint(db, opts.jti);
+    keyForMint(db, opts.jti, undefined, opts.keyName);
   } catch (err) {
     if (err instanceof TokenMintPrincipalGoneError) throw err;
     throw new RefreshTokenInsertError(
@@ -424,11 +480,13 @@ export function recordTokenMint(db: Database, opts: RecordTokenMintOpts): void {
  * the token, so failing to write one must never fail the mint: it is logged,
  * and the next start's migration-style adoption can fill it in.
  */
-function keyForMint(db: Database, jti: string, refreshFamily?: string): void {
+function keyForMint(db: Database, jti: string, refreshFamily?: string, exactName?: string): void {
   try {
-    if (refreshFamily) adoptRefreshToken(db, jti, refreshFamily);
-    else adoptToken(db, jti);
+    if (refreshFamily) adoptRefreshToken(db, jti, refreshFamily, exactName);
+    else adoptToken(db, jti, exactName);
   } catch (err) {
+    // A token whose key's name is signed into it must have that key: fail the mint (its transaction rolls back).
+    if (exactName !== undefined) throw err;
     console.error(`[hub] could not record a key for jti=${jti}: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
@@ -864,6 +922,11 @@ export function findTokenRowByJti(db: Database, jti: string): RefreshTokenRow | 
  * theft signal (RFC 6819 §5.2.2.3). Idempotent: rows already revoked keep
  * their existing revoked_at.
  */
+/** The grant generation on a token row as it is now (a rotation's check reads it inside its insert transaction). */
+export function refreshRowGeneration(db: Database, jti: string): number {
+  return db.query<{ grant_generation: number }, [string]>("SELECT grant_generation FROM tokens WHERE jti = ?").get(jti)?.grant_generation ?? -1;
+}
+
 export function revokeFamily(db: Database, familyId: string, now: Date): number {
   const res = db
     .prepare("UPDATE tokens SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL")

@@ -345,6 +345,24 @@ export function attachmentsInstructionBlock(opts: { ticketsEnabled: boolean; rea
  * tags-with-schemas inline is the default; cap heuristics can be added if
  * a real test shape demands it.
  */
+/**
+ * What a connection can read, said plainly at connect (0.9.1, SPEC §3.4): the whole vault at its level, or only the
+ * records under a tag scope. Never less than the key can do: a write or admin key reads everything too. `level` is
+ * the highest verb the key holds on this vault; `tags` is its tag scope (null or empty: none).
+ */
+export function connectionReach(level: "read" | "write" | "admin", tags: readonly string[] | null | undefined): string {
+  const can =
+    level === "admin"
+      ? { whole: ", create, change and delete its records, and manage its types, settings and keys.", scoped: " It can also create, change and delete records and manage the vault's types, settings and keys." }
+      : level === "write"
+        ? { whole: ", and create, change and delete its records.", scoped: " It can also create, change and delete records." }
+        : { whole: ". It can't change anything.", scoped: " It can't change anything." };
+  if (!tags || tags.length === 0) return `This connection can read the whole vault${can.whole}`;
+  const named = tags.map((t) => `\`${t}\``);
+  const list = named.length === 1 ? named[0] : `${named.slice(0, -1).join(", ")} or ${named[named.length - 1]}`;
+  return `This connection can read only the records tagged ${list} (subtags included); other records are hidden from it.${can.scoped}`;
+}
+
 export function projectionToMarkdown(args: {
   vaultName: string;
   description?: string | null;
@@ -373,6 +391,10 @@ export function projectionToMarkdown(args: {
    * vault's description, names or paths. Omitted: the text as written.
    */
   words?: (s: string) => string;
+  /**
+   * What this connection can read, in one line under the vault's name (0.9.1; `connectionReach`). Omitted: no line.
+   */
+  reach?: string;
 }): string {
   const { vaultName, description, projection, coordinates } = args;
   const w = args.words ?? ((s: string) => s);
@@ -380,6 +402,7 @@ export function projectionToMarkdown(args: {
 
   const lines: string[] = [];
   lines.push(`You are connected to Parachute Vault "${vaultName}".`);
+  if (args.reach) lines.push(args.reach);
   // vault#669 / cloud#87 recovery: a non-string description (poisoned
   // via an unguarded write door) used to throw here (`description.trim
   // is not a function`) and take down MCP `initialize` — the first
@@ -450,7 +473,25 @@ export function projectionToMarkdown(args: {
   if (projection.tags.length === 0) {
     lines.push(w(`- No tag schemas declared yet — every note is freeform.`));
   } else {
-    const names = projection.tags.map((t) => t.name).join(", ");
+    // 0.9.2: the most used first, and at most about 1,500 characters of them
+    // (a vault with hundreds of types sent them all on every connect).
+    // Below the cap the list is as it always was.
+    const uses = new Map((projection.map?.tags ?? []).map((t) => [t.name, t.count]));
+    const plain = projection.tags.map((t) => t.name);
+    const all = plain.join(", ").length <= 1500
+      ? plain
+      : [...plain].sort((a, b) => (uses.get(b) ?? 0) - (uses.get(a) ?? 0) || (a < b ? -1 : 1));
+    const shown: string[] = [];
+    let len = 0;
+    for (const n of all) {
+      // The joined length: a separator before every name but the first.
+      const add = (shown.length > 0 ? 2 : 0) + n.length;
+      if (len + add > 1500) break;
+      shown.push(n);
+      len += add;
+    }
+    const more = all.length - shown.length;
+    const names = shown.join(", ") + (more > 0 ? `, and ${more} more (list-types lists them all)` : "");
     lines.push(`- ${projection.tags.length} tag${projection.tags.length === 1 ? "" : "s"} with schemas: ${names}`);
   }
 
@@ -513,4 +554,62 @@ export function projectionToMarkdown(args: {
   );
 
   return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// The tag map's cap (0.9.2)
+// ---------------------------------------------------------------------------
+
+/**
+ * About 4,000 tokens: the most `vault-info` (without its indexed-field list)
+ * may spend on an AI's context. Uncapped, a vault with hundreds of types sent
+ * most of its reply as the tag map (5.7k of 9k tokens at one real shape).
+ */
+export const VAULT_INFO_BUDGET_CHARS = 16_000;
+
+/**
+ * Cap `vault-info`'s two tag lists, `tags` (types with their fields) and
+ * `map.tags` (every tag with its count), to fit {@link VAULT_INFO_BUDGET_CHARS}
+ * with everything else in the reply. The most used come first and are kept
+ * whole; the reply then says how many there are (`tags_total`,
+ * `map.tags_total`) and where the rest are (`tags_more`). A reply that fits
+ * is returned unchanged. Apply it last, after any tag-scope filtering, so the
+ * totals count what the caller may see.
+ */
+export function capVaultInfoTags<T extends Record<string, unknown>>(reply: T, budget = VAULT_INFO_BUDGET_CHARS): T {
+  const tags = Array.isArray(reply.tags) ? (reply.tags as { name?: string }[]) : null;
+  const map = reply.map && typeof reply.map === "object" ? (reply.map as { tags?: { name: string; count: number }[] }) : null;
+  const mapTags = Array.isArray(map?.tags) ? map!.tags! : null;
+  const size = (v: unknown) => JSON.stringify(v ?? null).length;
+  const outside = { ...reply, indexed_fields: undefined };
+  if (size(outside) <= budget) return reply;
+
+  const rest = size({ ...outside, tags: [], map: map ? { ...map, tags: [] } : map });
+  const room = Math.max(0, budget - rest - 400); // 400: the totals and the pointer added below
+  const uses = new Map((mapTags ?? []).map((t) => [t.name, t.count]));
+  const take = <E>(list: E[], cap: number, len: (e: E) => number): E[] => {
+    const out: E[] = [];
+    let used = 0;
+    for (const e of list) {
+      const n = len(e) + 1;
+      if (used + n > cap) break;
+      out.push(e);
+      used += n;
+    }
+    return out;
+  };
+  // A quarter for the counts list (short entries), the rest for the types.
+  const keptMap = mapTags ? take(mapTags, Math.floor(room / 4), size) : null;
+  const byUse = tags ? [...tags].sort((a, b) => (uses.get(b.name ?? "") ?? 0) - (uses.get(a.name ?? "") ?? 0)) : null;
+  const keptTags = byUse ? take(byUse, room - (keptMap ? size(keptMap) : 0), size) : null;
+  const out: Record<string, unknown> = { ...reply };
+  if (tags && keptTags && keptTags.length < tags.length) {
+    out.tags = keptTags;
+    out.tags_total = tags.length;
+    out.tags_more = `${tags.length - keptTags.length} more types (the ${keptTags.length} most used are above). list-types lists every one; list-types {name} gives one in full.`;
+  }
+  if (map && mapTags && keptMap && keptMap.length < mapTags.length) {
+    out.map = { ...map, tags: keptMap, tags_total: mapTags.length };
+  }
+  return out as T;
 }

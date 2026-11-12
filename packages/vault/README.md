@@ -507,7 +507,12 @@ published_tag: public
 Every vault-touching path is scoped under `/vault/{name}/` — substitute your vault name (e.g. `default`) for `{name}`:
 
 ```
-GET/POST       /vault/{name}/api/notes                           query or create notes
+GET/POST       /vault/{name}/api/records                         query or create records (?type= filters by type)
+GET/PATCH/DEL  /vault/{name}/api/records/:idOrPath                read, update, delete a single record
+GET/POST       /vault/{name}/api/records/:id/attachments          list or add attachments
+GET            /vault/{name}/api/types                            every type and tag with its kind
+GET/PUT/DEL    /vault/{name}/api/types/:name                      get, update (admin) or delete (admin) a type
+GET/POST       /vault/{name}/api/notes                           0.8's name for /api/records (deprecated, gone in 1.0)
 GET/PATCH/DEL  /vault/{name}/api/notes/:idOrPath                  read, update, delete a single note
 GET/POST       /vault/{name}/api/notes/:id/attachments            list or add attachments
 GET            /vault/{name}/api/tags                             list tags (?include_schema=true for schemas)
@@ -547,7 +552,7 @@ curl -H "Authorization: Bearer $VAULT_TOKEN" \
 
 ### Sort by a metadata field
 
-Sort by something other than `created_at`. The field must be declared `indexed: true` in some tag schema first — that's what materializes the backing generated column + B-tree index. The "tag authorizes the index" pattern lives in [`core/src/indexed-fields.ts`](./core/src/indexed-fields.ts).
+Sort by something other than `created_at`. Any field works. A field declared `indexed: true` in some tag schema sorts on its generated column and B-tree index (the "tag authorizes the index" pattern lives in [`core/src/indexed-fields.ts`](./core/src/indexed-fields.ts)); any other field is sorted by reading every matching record, and the reply carries a `scan` warning.
 
 ```bash
 curl -H "Authorization: Bearer $VAULT_TOKEN" \
@@ -618,7 +623,7 @@ curl -H "Authorization: Bearer $VAULT_TOKEN" \
   "http://localhost:1940/vault/default/api/notes?meta[meeting-type]=study-session&include_content=true"
 ```
 
-Range, `in`, `not_in`, and `exists` operators require the field to be declared `indexed: true` (same gate as `order_by`):
+Range, `in`, `not_in`, and `exists` operators work on any field. On a field declared `indexed: true` they use its index; on any other field they read every record the other filters leave, give the same rows, and add a `scan` warning (`X-Parachute-Warnings`) naming the field to index:
 
 ```bash
 # Range — both bounds AND together on one field
@@ -951,7 +956,7 @@ cp .env.example .env   # edit with your config
 docker compose up -d
 ```
 
-Set `PARACHUTE_VAULT_NAME` to auto-create a first vault on startup (name: lowercase alphanumeric + hyphens or underscores, 2–32 chars). Without it the server boots with zero vaults — create one explicitly via the admin wizard, `parachute init --vault-name <name>`, or `parachute-vault create <name>`.
+Set `PARACHUTE_VAULT_NAME` to auto-create a first vault on startup (name: lowercase alphanumeric + hyphens or underscores, 2–32 chars). Without it the server boots with zero vaults — create one explicitly via the admin wizard, `parachute init --vault-name <name>`, or `parachute-vault create <name>`. First boot makes no API key (from 0.9.1): reach the vault with `VAULT_AUTH_TOKEN` (set it in `.env`) or a hub-signed token.
 
 ### Cloud platforms
 
@@ -980,7 +985,8 @@ Set `PARACHUTE_VAULT_NAME` to auto-create a first vault on startup (name:
 lowercase alphanumeric + hyphens or underscores, 2–32 chars). Without it
 the server boots with zero vaults — create one explicitly via the admin
 wizard, `parachute init --vault-name <name>`, or `parachute-vault create
-<name>`.
+<name>`. First boot makes no API key (from 0.9.1): reach the vault
+with `VAULT_AUTH_TOKEN` or a hub-signed token.
 
 #### Other platforms
 

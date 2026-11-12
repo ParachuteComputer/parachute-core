@@ -46,15 +46,20 @@ export async function mintOverHttp(bearer: string, body: Record<string, unknown>
   return { status: r.status, body: parsed, headers: r.headers };
 }
 
-/** A tag-scoped vault admin pass for the box's admin account: a minter that holds only some tags. */
+/**
+ * A tag-scoped vault admin pass for the box's admin account: a minter that holds only some tags. Since 0.9.1 no mint
+ * issues one (scope gap 4, scope-gaps.test.ts), but passes minted before live until they expire, so the vault must
+ * still treat one right. This makes it the way an older hub did: an admin pass for the same account, re-signed with
+ * the tags by the box's own key (`resign`). Its key row keeps the pass's own `jti`.
+ */
 export async function scopedAdmin(tags: string[]): Promise<string> {
   const s = services();
-  return mintToken(s, {
+  const admin = await mintToken(s, {
     scope: ["read", "write", "admin"].map((l) => `vault:${s.vaultName}:${l}`).join(" "),
-    permissions: { scoped_tags: tags },
     label: "contracts-scoped-minter",
     user: s.admin.username,
   });
+  return resign(admin, { scoped_tags: tags });
 }
 
 export { pass };

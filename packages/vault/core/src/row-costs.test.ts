@@ -187,6 +187,30 @@ describe("v5 and v18 against each state of the path indexes", () => {
     db.close();
   });
 
+  test("a vault 0.9.0 opened last (current stamp, no via_kind on revisions) gets the column once, and its revisions read", async () => {
+    // What 0.9.0 leaves: SCHEMA_VERSION stamped and note_versions with no `via_kind` (0.9.1's write stamp adds it with
+    // no version bump). The fast path must not take that vault as current, or every revision read would fail.
+    await makeVault(5);
+    let db = new Database(file);
+    const store = new SqliteStore(db);
+    const n = await store.createNote("made up", { path: "notes/one" });
+    await store.updateNote(n.id, { content: "again", actor: "u", via: "api" });
+    db.exec("ALTER TABLE note_versions DROP COLUMN via_kind");
+    db.query("INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)").run(SCHEMA_VERSION, "2999-01-01T00:00:00.000Z");
+    db.close();
+    db = new Database(file);
+    const reopened = new SqliteStore(db);
+    const cols = (db.query("PRAGMA table_info(note_versions)").all() as { name: string }[]).map((c) => c.name);
+    expect(cols).toContain("via_kind");
+    expect((await reopened.listNoteVersions(n.id)).map((v) => [v.via, v.via_kind])).toEqual([["api", null]]);
+    const after = cookie(db);
+    db.close();
+    db = new Database(file);
+    new SqliteStore(db);
+    expect(cookie(db)).toBe(after);
+    db.close();
+  });
+
   test("uniqueness is unchanged: same path and extension refused; another extension or a case variant allowed", async () => {
     const db = new Database(file);
     const store = new SqliteStore(db);
@@ -199,11 +223,11 @@ describe("v5 and v18 against each state of the path indexes", () => {
   });
 });
 
-/** sha256 of SCHEMA_SQL as of SCHEMA_VERSION 32 with T-412 (idx_notes_path left out of it) and 0.9's `kind` on tags. */
-const SCHEMA_SQL_HASH_AT_32 = "4761ed052920ee81919b0d192c2ac5f314b465bb19861b62d2bec1cec5739599";
+/** sha256 of SCHEMA_SQL as of SCHEMA_VERSION 32 with T-412 (idx_notes_path left out of it) and 0.9's `kind` on tags, 0.9.1's `via_kind` on revisions. */
+const SCHEMA_SQL_HASH_AT_32 = "ade9b08b66e61a3975f03b23b80466122607f4ca715821bcda17b3c8563e2dc7";
 
-/** sha256 of initSchema's code and its fast-path check (comments and spacing left out) as of SCHEMA_VERSION 32 with T-412 and 0.9's ensureTagKinds. */
-const INIT_SCHEMA_HASH_AT_32 = "348f0488a94b7e38046789773549ed12faccca81feacd5373ceeee634a99e428";
+/** sha256 of initSchema's code and its fast-path check (comments and spacing left out) as of SCHEMA_VERSION 32 with T-412, 0.9's ensureTagKinds and 0.9.1's ensureRevisionKeyKind, and T-460's open-as-is of a newer readable schema. */
+const INIT_SCHEMA_HASH_AT_32 = "1a3aa88a2a3f71de260def99a2e057e86eaf3ddea36b5a58a7af401bb24f75e3";
 
 describe("the fast path's promise", () => {
   // initSchema skips SCHEMA_SQL and every migration on a vault stamped SCHEMA_VERSION (with the path index). So a

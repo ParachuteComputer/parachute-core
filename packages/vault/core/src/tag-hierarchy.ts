@@ -291,8 +291,43 @@ export function suggestSimilarTag(
   return best;
 }
 
+/**
+ * Two names one edit apart, case aside, that aren't the same name (0.9.2: the
+ * doctor's `near_names` and the nearest-name warning on writes). Names that
+ * differ in one digit (`item1`, `item2`), add a number at the end (`item`,
+ * `item2`) or differ in a last letter after a separator (`phase-a`,
+ * `phase-b`) are a series, not a slip, and are left out, as are names under
+ * three characters.
+ */
+export function nearName(a: string, b: string): boolean {
+  if (a === b || Math.abs(a.length - b.length) > 1) return false;
+  // Short names (`x`, `y`, `id`) are one letter from many others by nature.
+  if (a.length < 3 || b.length < 3) return false;
+  const [x, y] = [a.toLowerCase(), b.toLowerCase()];
+  if (x === y) return true;
+  if (levenshtein(x, y) !== 1) return false;
+  // `item` and `item2`: a number added at the end starts a series.
+  const [short, long] = x.length < y.length ? [x, y] : [y, x];
+  if (long.length > short.length && long.startsWith(short) && /\d/.test(long[long.length - 1]!)) return false;
+  if (x.length === y.length) {
+    for (let i = 0; i < x.length; i++) {
+      if (x[i] === y[i]) continue;
+      if (/\d/.test(x[i]!) && /\d/.test(y[i]!)) return false;
+      if (i === x.length - 1 && i > 0 && /[-_/. ]/.test(x[i - 1]!)) return false;
+      return true;
+    }
+  }
+  return true;
+}
+
+/** The first of `candidates` one edit from `name` ({@link nearName}), or undefined. */
+export function nearestName(candidates: Iterable<string>, name: string): string | undefined {
+  for (const c of candidates) if (nearName(name, c)) return c;
+  return undefined;
+}
+
 /** Classic Levenshtein edit distance, O(m·n) time / O(n) space. */
-function levenshtein(a: string, b: string): number {
+export function levenshtein(a: string, b: string): number {
   const m = a.length;
   const n = b.length;
   if (m === 0) return n;

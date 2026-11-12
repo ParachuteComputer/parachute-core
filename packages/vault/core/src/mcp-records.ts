@@ -82,6 +82,8 @@ export interface RecordToolDef {
   inputSchema: Record<string, unknown>;
   execute: (params: Record<string, unknown>) => unknown | Promise<unknown>;
   requiredVerb: "read" | "write" | "admin";
+  /** The MCP content blocks for a result, when not the one JSON text block (the note aliases' refresh nudge). */
+  resultContent?: (result: unknown) => ({ type: "text"; text: string } | { type: string; [k: string]: unknown })[];
 }
 
 /** What a use is counted as: `tool` for a tool name, `tool param` for a parameter on it. */
@@ -273,11 +275,11 @@ const HELP = (tool: string) => `Every parameter: vault-info {help: "${tool}"}.`;
 export const RECORD_DESCRIPTIONS: Readonly<Record<string, string>> = {
   "query-records": `Read records: one record, a filtered list, a search, a link neighbourhood or path, counts, or a record's history.
 - One record: \`id\` (id, path or title). Lists leave the ${BODY} out unless \`include_${BODY}: true\`.
-- Filters combine (AND). \`type\` matches a type and its subtypes (\`event\` finds \`event/meeting\`); \`tag\` matches a label. \`${FIELDS}\` operators need an indexed field (vault-info lists them).
+- Filters combine (AND). \`type\` matches a type and its subtypes (\`event\` finds \`event/meeting\`); \`tag\` matches a label. \`${FIELDS}\` operators work on any field: an indexed one (vault-info lists them) is fastest, any other is read in full and the reply warns \`scan\`.
 - Each record has \`types\` (what it is), \`tags\` (labels), \`${FIELDS}\` and a \`${BODY}\`.
 - Returns an array of records, or \`{records, next_cursor?, warnings?}\` with \`cursor\` or warnings, or \`[{group, value}]\` with \`aggregate\`. An empty page means done.
 Rarer filters (has_links, order_by, expand_links, created_by, search_mode, …) are accepted too. ${HELP("query-records")}`,
-  "create-record": `Create a record, or several with \`records: [...]\`. \`types\` names its types (existing types or new names); \`tags\` adds labels. If \`path\` is taken, \`if_exists\` decides: error (default), ignore, update (merge into it) or replace. ${HELP("create-record")}`,
+  "create-record": `Create a record, or several with \`records: [...]\`. \`types\` names its types (existing types or new names); \`tags\` adds labels. If \`path\` is taken, \`if_exists\` decides: error (default), ignore, update (merge into it) or replace. ${HELP("create-record")} If no existing type fits what the record is, name a new type for it rather than using the nearest one.`,
   "update-record": `Change a record (id, path or title), or several with \`records: [{id, …}]\`.
 - ${BODY[0]!.toUpperCase() + BODY.slice(1)}: \`${BODY}\` (replace all), \`append\`/\`prepend\`, or \`${BODY}_edit\` (old_text must occur once).
 - \`${FIELDS}\` merges (null deletes a key); \`types\`/\`tags\`/\`links\` take {add, remove}.
@@ -290,6 +292,15 @@ Rarer filters (has_links, order_by, expand_links, created_by, search_mode, …) 
 /** A deprecated note-named tool's description: one line, as #21's other aliases have. */
 export function noteAliasDescription(noteTool: string): string {
   return `Deprecated (gone in 1.0): use ${RECORD_TOOL_NAMES[noteTool]}. Same parameters as before.`;
+}
+
+/**
+ * The refresh nudge (0.9.1): the second content block on a successful call to a note-named tool. A client that
+ * cached 0.8's tool list (ChatGPT keeps one per connector) never sees the record tools, so it is told what to do
+ * either way. The first block, the JSON, stays exactly what it was.
+ */
+export function refreshNudge(noteTool: string): string {
+  return `\`${noteTool}\` is deprecated and goes away in 1.0. If \`create-record\` isn't among your tools, ask your user to refresh this connector so you get the new tools. Otherwise use \`${RECORD_TOOL_NAMES[noteTool]}\` from now on.`;
 }
 
 /**
@@ -309,12 +320,18 @@ export function noteAliasSchema(schema: unknown): Record<string, unknown> {
 }
 
 /**
+ * A check a record tool runs on its translated call before the note tool does (the runtime's: the record door's
+ * `tags` refusing a type's name needs the vault and the caller's scope, tag-kind.ts refuseTypesInTags).
+ */
+export type RecordCheck = (tool: string, translated: Record<string, unknown>) => void | Promise<void>;
+
+/**
  * The five record tools, built over the note tools in `tools` (each a wrapper:
  * a record tool can never do more than its note tool), and the note tools
  * relisted as aliases. `shortSchema` gives a note tool's advertised schema.
  * Returns the new list: record tools where the note tools were, aliases at the end.
  */
-export function addRecordTools<T extends RecordToolDef>(tools: T[], onUse?: OnUse): T[] {
+export function addRecordTools<T extends RecordToolDef>(tools: T[], onUse?: OnUse, check?: RecordCheck): T[] {
   const out: T[] = [];
   const aliases: T[] = [];
   for (const t of tools) {
@@ -334,6 +351,7 @@ export function addRecordTools<T extends RecordToolDef>(tools: T[], onUse?: OnUs
         const translated = paramsIn(name, params ?? {}, onUse); // its own refusals are already in record words
         let result: unknown;
         try {
+          await check?.(name, translated);
           result = await execute(translated);
         } catch (err) {
           throw errorOut(err, name);
@@ -349,6 +367,10 @@ export function addRecordTools<T extends RecordToolDef>(tools: T[], onUse?: OnUs
         onUse?.(t.name, "old");
         return execute(params);
       },
+      resultContent: (result: unknown) => [
+        { type: "text" as const, text: JSON.stringify(result, null, 2) },
+        { type: "text" as const, text: refreshNudge(t.name) },
+      ],
     });
   }
   return [...out, ...aliases];

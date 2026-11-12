@@ -44,7 +44,7 @@ created_via = last_updated_via = "nostr:<64-hex>"
 ```
 
 `nostr:<pubkey>` joins the existing open-ended `via` vocabulary (`mcp` ·
-`surface:<name>` · `agent:<id>` · `operator` · `api`) — same `<class>:<id>`
+`key:<name>` · `surface:<name>` · `agent:<id>` · `operator` · `api`) — same `<class>:<id>`
 shape as `agent:<id>`. The columns are plain TEXT with exact-match filters
 (`created_via` / `last_updated_via` on `query-notes` and `GET /api/notes`), so
 no filter, index, or schema changes.
@@ -81,6 +81,15 @@ a 401. `scoped_tags` is an access decision; `principal_pubkey` is only a label,
 so a bad value must not reject a legitimate write — nor be stored verbatim.
 
 ## Deployment ordering
+
+**Named keys (0.9.1).** The hub signs a top-level `key` claim (`{name, kind}`) into a named key's token, and the
+vault stamps that key's writes `via key:<name>` (kept on MCP, like `nostr:`). Top-level, not in `permissions`, so an
+older vault ignores it (stamping `api`) instead of refusing the key after a rollback; the vault reads it from the
+payload whose signature it has just checked. A key the owner let write on behalf of others also carries
+`permissions.acts_for`, which an older vault refuses, as it must. When a token has both a signing pubkey and a key,
+the key wins (a box never mints both, and a pubkey asked for at a mint must not hide the key's name; the personal door
+still lets the pubkey win). Unlike `principal_pubkey` both fail closed when malformed.
+See [the write stamp](../HTTP_API.md#the-write-stamp-via-and-by-091) and `core/src/write-stamp.ts`.
 
 **The vault side must ship before the hub side.** A hub that emits the claim
 against an older vault is harmless: the only pre-existing reader of

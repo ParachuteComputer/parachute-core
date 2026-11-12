@@ -17,10 +17,12 @@ import { HistoryNotFoundError, latestTombstone } from "../core/src/history.js";
 import { projectHistoryProvenance } from "../core/src/history-visibility.js";
 import { isNoteIdShape } from "../core/src/ulid.js";
 import type { Database } from "bun:sqlite";
-import { holdTypes, markTypes, mergeTypesIntoTags, prepareCallTypes, refreshTypes } from "../core/src/tag-kind.ts";
+import { attachNearTypeWarnings, nearSchemaWarnings, holdTypes, markTypes, mergeTypesIntoTags, nearTypeWarnings, prepareCallTypes, refreshTypes, type NearTypeWarning } from "../core/src/tag-kind.ts";
 import type { Store, Note, QueryOpts, AggregateSpec } from "../core/src/types.ts";
 import { TAG_EXPAND_MODES, stripTagHash, suggestSimilarTag, type TagExpandMode } from "../core/src/tag-hierarchy.ts";
 import {
+  assertNoAggregateScan,
+  collectScanWarnings,
   collectUnknownTagWarnings,
   emptySearchWarning,
   ignoredParamWarning,
@@ -66,9 +68,11 @@ import {
 } from "../core/src/attachment/policy.ts";
 import type { ValidationWarning } from "../core/src/schema-defaults.ts";
 import { logStrictBypass, SCOPE_ADMIN } from "./scopes.ts";
+import { findRetypeConflicts, retypeHint, type RetypeConflict } from "../core/src/conformance.ts";
+import { MigrateRequestError, runMigrateRequest } from "../core/src/migrate-tag-field.ts";
 import * as linkOps from "../core/src/links.ts";
 import * as tagSchemaOps from "../core/src/tag-schemas.ts";
-import { IndexedFieldError } from "../core/src/indexed-fields.ts";
+import { IndexedFieldError, IndexedFieldLimitError } from "../core/src/indexed-fields.ts";
 import { buildVaultProjection, resolveTagInheritance } from "../core/src/vault-projection.ts";
 import {
   resolveTranscriptionCapability,
@@ -79,6 +83,7 @@ import {
   type EmbeddingCapability,
 } from "./embedding/capability.ts";
 import { getSharedEmbeddingProvider, getVaultNameForStore } from "./vault-store.ts";
+import { forceFlag, parentsChange, tagChangeRefusal, type TagChange } from "./tag-change-guard.ts";
 import { loadSchemaConfig } from "../core/src/schema-defaults.ts";
 import {
   buildExpandVisibility,
@@ -1077,6 +1082,31 @@ function parseSearchModeParam(url: URL): { mode?: SearchMode; error?: Response }
  * of this target's candidates can the reader see" is one question, and the
  * ambiguous (>=2 visible) and broken (0 visible) answers are two faces of it.
  */
+/**
+ * Scope gap 1: the store-write option that keeps a tag-scoped writer's links
+ * inside its scope. A structured link, `[[wikilink]]` or reference-field value
+ * naming a note the writer can't see resolves as one to nothing: queued, with
+ * the same `unresolved_link` warning, never a link into the hidden note.
+ * Unscoped: no option, unchanged. The same predicate goes to
+ * `resolveOrQueueLink`/`getContentWikilinkWarnings` on every write path.
+ */
+function linkOptFor(db: Database, tagScope: TagScopeCtx): { linkVisible?: (noteId: string) => boolean } {
+  const linkVisible = ambiguityVisibilityFor(db, tagScope);
+  return linkVisible ? { linkVisible } : {};
+}
+
+/**
+ * Scope gap 6: the 409 for a tag change that alters who sees what, unless the
+ * request says `?force=true` (src/tag-change-guard.ts). Null: go ahead.
+ */
+function tagChangeGuard(store: Store, url: URL, change: TagChange, tagScope: TagScopeCtx): Response | null {
+  if (forceFlag(url.searchParams.get("force"))) return null;
+  const vaultName = getVaultNameForStore(store);
+  if (!vaultName) return null; // a store outside the daemon (tests) has no keys or vault.yaml
+  const refusal = tagChangeRefusal(vaultName, store, change, { scoped: tagScope.raw !== null });
+  return refusal ? json(refusal, 409) : null;
+}
+
 function ambiguityVisibilityFor(
   db: Database,
   tagScope: TagScopeCtx,
@@ -1478,7 +1508,7 @@ export async function handleNotes(
     markTypes(store.db, pending.names);
     // The body was built before the marking: read its notes' types again.
     if (!(res.headers.get("content-type") ?? "").includes("application/json")) return res;
-    const body = refreshTypes(store.db, await res.json());
+    const body = attachNearTypeWarnings(refreshTypes(store.db, await res.json()), pending.near);
     const headers = new Headers(res.headers);
     headers.delete("content-length");
     return new Response(JSON.stringify(body), { status: res.status, headers });
@@ -1640,7 +1670,8 @@ async function handleNotesInner(
         if (parsed.error) return parsed.error;
         try {
           const semanticResult = await store.semanticSearch(nearText, { ...parsed.queryOpts, cursor: undefined });
-          const semanticWarnings: QueryWarning[] = [];
+          // `scan` (0.9.2): a metadata operator or date_filter on a field that isn't indexed.
+          const semanticWarnings: QueryWarning[] = [...collectScanWarnings(db, { metadata: parsed.queryOpts?.metadata, dateFilter: parsed.queryOpts?.dateFilter })];
           if (semanticResult.pendingCount > 0) {
             semanticWarnings.push(
               embeddingsPendingWarning(semanticResult.pendingCount, semanticResult.totalCandidates),
@@ -1779,7 +1810,11 @@ async function handleNotesInner(
         if (searchModeParsed.error) return searchModeParsed.error;
         const mode: SearchMode = searchModeParsed.mode ?? "literal";
 
-        const searchWarnings: QueryWarning[] = [...nearTextIgnored];
+        const searchWarnings: QueryWarning[] = [
+          ...nearTextIgnored,
+          // `scan` (0.9.2): a metadata operator or date_filter on a field that isn't indexed.
+          ...collectScanWarnings(db, { metadata: parsed.queryOpts?.metadata, dateFilter: parsed.queryOpts?.dateFilter }),
+        ];
         // `offset` under full-text search (vault contracts-brief V1.2):
         // `searchNotes` has no offset parameter at all — FTS5 ranks by
         // relevance, not a stable row order, so paging by offset over it
@@ -2061,6 +2096,8 @@ async function handleNotesInner(
         }
         try {
           let rows;
+          // Before the scoped branch, which lists the matches (a scan) and then aggregates their ids.
+          assertNoAggregateScan(db, queryOpts);
           if (tagScope.raw === null) {
             rows = await store.aggregateNotes({ ...queryOpts, aggregate: aggregateParsed.aggregate });
           } else {
@@ -2155,12 +2192,18 @@ async function handleNotesInner(
         ...(tagScope.allowed === null
           ? collectUnknownTagWarnings(db, queryOpts.tags, queryOpts.expand, store.getTagHierarchy())
           : []),
+        // `scan` names only the caller's own fields: safe on a scoped session.
+        ...collectScanWarnings(db, queryOpts),
       ];
       let results: Note[];
       let nextCursor: string | null = null;
       try {
         if (cursorMode) {
-          const page = await store.queryNotesPaged(queryOpts);
+          // Scope gap 2: a scoped page and its cursor follow only notes the caller may see.
+          const page = await store.queryNotesPaged(
+            queryOpts,
+            tagScope.raw === null ? undefined : (n) => noteWithinTagScope(n, tagScope.allowed, tagScope.raw),
+          );
           results = page.notes;
           nextCursor = page.next_cursor;
         } else {
@@ -2561,6 +2604,7 @@ async function handleNotesInner(
         if (Object.keys(updates).length > 0 || incomingTags.length > 0 || hasLinkMutation) {
           result = await store.updateNote(existingNote.id, {
             ...updates,
+            ...linkOptFor(db, tagScope),
             actor: writeCtx.actor,
             via: writeCtx.via,
           });
@@ -2641,6 +2685,7 @@ async function handleNotesInner(
           let note: Note;
           try {
             note = await store.createNote(item.content ?? "", {
+              ...linkOptFor(db, tagScope),
               id: item.id,
               path: item.path,
               tags: item.tags,
@@ -2693,7 +2738,7 @@ async function handleNotesInner(
         // surfaces a distinct `ambiguous_link` warning instead. Never silent.
         for (const { sourceId, links } of pendingLinks) {
           for (const link of links) {
-            const outcome = resolveOrQueueLink(db, sourceId, link.target, link.relationship);
+            const outcome = resolveOrQueueLink(db, sourceId, link.target, link.relationship, linkOptFor(db, tagScope).linkVisible);
             if (outcome.status === "resolved") {
               await store.createLink(sourceId, outcome.note_id, link.relationship);
             } else if (outcome.status === "ambiguous") {
@@ -2707,7 +2752,7 @@ async function handleNotesInner(
         // --- Content-wikilink warnings (vault#570) ---
         // Same forward-ref-aware timing as the structured-links pass above.
         for (const { noteId, content } of contentWikilinkNotes) {
-          for (const warning of getContentWikilinkWarnings(db, noteId, content)) {
+          for (const warning of getContentWikilinkWarnings(db, noteId, content, linkOptFor(db, tagScope).linkVisible)) {
             pushLinkWarning(noteId, warning);
           }
         }
@@ -3267,7 +3312,7 @@ async function handleNotesInner(
             metadata: createOpts.metadata,
             defaultTags: createOpts.tags,
           }, tagScope);
-          const created = await store.createNote(content, createOpts);
+          const created = await store.createNote(content, { ...createOpts, ...linkOptFor(db, tagScope) });
           if (tagsArr.length > 0) {
             await applySchemaDefaults(store, db, [created.id], tagsArr);
           }
@@ -3291,7 +3336,7 @@ async function handleNotesInner(
           const createWarnings: QueryWarning[] = [];
           if (linksAdd) {
             for (const link of linksAdd) {
-              const outcome = resolveOrQueueLink(db, created.id, link.target, link.relationship);
+              const outcome = resolveOrQueueLink(db, created.id, link.target, link.relationship, linkOptFor(db, tagScope).linkVisible);
               if (outcome.status === "resolved") {
                 await store.createLink(created.id, outcome.note_id, link.relationship, link.metadata);
               } else if (outcome.status === "ambiguous") {
@@ -3306,7 +3351,7 @@ async function handleNotesInner(
           // create path, so there's no batch-sibling forward-ref to wait for
           // — compute right away against the committed content.
           if (content) {
-            createWarnings.push(...getContentWikilinkWarnings(db, created.id, content));
+            createWarnings.push(...getContentWikilinkWarnings(db, created.id, content, linkOptFor(db, tagScope).linkVisible));
           }
           const scopedCreateWarnings = narrowWriteWarnings(db, createWarnings, tagScope);
           const final = await store.getNote(created.id);
@@ -3578,7 +3623,7 @@ async function handleNotesInner(
         // `skipUpdatedAt` isn't set, so this still issues a real UPDATE.
         updates.actor = writeCtx.actor;
         updates.via = writeCtx.via;
-        await store.updateNote(note.id, updates);
+        await store.updateNote(note.id, { ...updates, ...linkOptFor(db, tagScope) });
       }
 
       // --- Remove links (after core UPDATE; conflict would have thrown already) ---
@@ -3603,7 +3648,7 @@ async function handleNotesInner(
       const linkWarnings: QueryWarning[] = [];
       if (body.links?.add) {
         for (const link of body.links.add as { target: string; relationship: string; metadata?: Record<string, unknown> }[]) {
-          const outcome = resolveOrQueueLink(db, note.id, link.target, link.relationship);
+          const outcome = resolveOrQueueLink(db, note.id, link.target, link.relationship, linkOptFor(db, tagScope).linkVisible);
           if (outcome.status === "resolved") {
             await store.createLink(note.id, outcome.note_id, link.relationship, link.metadata);
           } else if (outcome.status === "ambiguous") {
@@ -3629,7 +3674,7 @@ async function handleNotesInner(
       // handles a single note (no batch-sibling forward-ref to wait for),
       // so compute right away against the committed content.
       if (contentChanged) {
-        linkWarnings.push(...getContentWikilinkWarnings(db, note.id, updatedNote.content));
+        linkWarnings.push(...getContentWikilinkWarnings(db, note.id, updatedNote.content, linkOptFor(db, tagScope).linkVisible));
       }
       let validated: any = attachValidationStatus(store, db, updatedNote, buildExpandVisibility(tagScope.allowed, tagScope.raw));
       // Tag-scope (vault#568): the update response echoes the STORED note, so
@@ -3857,6 +3902,9 @@ export async function handleTags(
         409,
       );
     }
+    // Scope gap 6: merging moves notes out of the sources' reach and into the target's.
+    const mergeRefusal = tagChangeGuard(store, url, { kind: "merge", sources: sources as string[], target }, tagScope);
+    if (mergeRefusal) return mergeRefusal;
     const result = await store.mergeTags(sources, target);
     return json(result);
   }
@@ -3875,6 +3923,11 @@ export async function handleTags(
     if (tagScope.allowed && (!tagScope.allowed.has(oldName) || !tagScope.allowed.has(newName))) {
       return tagScopeForbidden(tagScope.raw ?? []);
     }
+    // Scope gap 6: renaming a name a live key's scope, private_tags or the
+    // published tag uses changes who sees what; it needs `?force=true`.
+    // (The vault#240 cascade rewrites only the vault's own legacy tokens table.)
+    const renameRefusal = tagChangeGuard(store, url, { kind: "rename", from: oldName, to: newName }, tagScope);
+    if (renameRefusal) return renameRefusal;
     // Vault#240: rename now cascades to tokens.scoped_tags (and every
     // other surface). The old fail-closed token-reference check has been
     // removed; the cascade rewrites the JSON allowlist atomically. See
@@ -3899,6 +3952,37 @@ export async function handleTags(
       }
     }
     return json(result);
+  }
+
+  // POST /tags/:name/migrate — 0.9.2: change a field's values on every record
+  // carrying the type (or a subtype): rename, remap, set_default, to_string,
+  // to_int, to_number, to_boolean. A dry run unless `apply: true`; admin
+  // (routing.ts), dry run included. The engine is the CLI's
+  // `schema migrate-field` (migrate-tag-field.ts): preflight, atomic unless
+  // `continue_on_error`, strict bypasses logged.
+  const migrateMatch = subpath.match(/^\/([^/]+)\/migrate$/);
+  if (migrateMatch) {
+    if (req.method !== "POST") return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
+    const mTag = decodeURIComponent(migrateMatch[1]!);
+    // A migration rewrites every record carrying the type, including ones a
+    // tag-scoped pass can't see, and its plan lists them: vault-wide, so a
+    // scoped pass is refused (as for the other vault-wide admin routes).
+    if (tagScope.allowed) return tagScopeForbidden(tagScope.raw ?? []);
+    const body = (await req.json().catch(() => null)) as Record<string, unknown> | null;
+    if (!body || typeof body !== "object" || Array.isArray(body)) return json({ error: "Invalid JSON body", error_type: "invalid_json" }, 400);
+    try {
+      const plan = await runMigrateRequest(store, mTag, body, {
+        actor: writeCtx.actor ?? null,
+        via: writeCtx.via ?? null,
+        onStrictBypass: (info) => logStrictBypass(info),
+      });
+      return json(plan);
+    } catch (e) {
+      if (e instanceof MigrateRequestError) {
+        return json({ error: e.message, error_type: "invalid_request", field: e.field }, 400);
+      }
+      throw e;
+    }
   }
 
   // POST /tags/:name/conformance — count existing notes that would VIOLATE a
@@ -4081,6 +4165,20 @@ export async function handleTags(
       );
       parentNamesPatch = cleaned.length > 0 ? cleaned : null;
     }
+    if (parentNamesPatch !== undefined) {
+      // Scope gap 6: a tag-scoped admin may put its tag only under tags it can
+      // see (else it could pour its notes into another key's reach), and a
+      // re-parent that changes what a key, private_tags or the published tag
+      // reaches needs `?force=true`.
+      const parents = (parentNamesPatch ?? []).map(stripTagHash);
+      if (tagScope.raw !== null && parents.some((p) => !tagVisibleInScope(p, tagScope.allowed, tagScope.raw))) {
+        return tagScopeForbidden(tagScope.raw);
+      }
+      if (parentsChange(store, putTagName, parents)) {
+        const reparentRefusal = tagChangeGuard(store, url, { kind: "reparent", tag: putTagName, parents }, tagScope);
+        if (reparentRefusal) return reparentRefusal;
+      }
+    }
 
     // Field merge mirrors MCP update-tag — preserves prior keys when the
     // payload only declares new ones. UNLESS `replace_fields: true`, in which
@@ -4158,10 +4256,26 @@ export async function handleTags(
       }
     }
 
+    // 0.9.2 safe schema change: a retype that would strand records (their
+    // value fails the new spec strictly, so their next edit would be refused)
+    // is refused before anything is written, with the count and how to
+    // migrate the values first. Same validator as writes (conformance.ts).
+    if (fieldsPatch !== undefined) {
+      const conflicts = findRetypeConflicts(store.db, putTagName, fieldsPatch);
+      if (conflicts.length > 0) return retypeConflictResponse(putTagName, conflicts, tagScope.allowed !== null);
+    }
+
     // A bad indexed-field name (or an unindexable type, or a cross-tag type
     // mismatch) is a CLIENT error — return 400, not the catch-all 500. The
     // store pre-validates and is transactional, so the schema is left
     // unchanged on failure (no orphan/lying index). vault#478.
+    // 0.9.2: a new type or field one letter from an existing one is made as written, with a warning.
+    const near = nearSchemaWarnings(
+      store.db,
+      putTagName,
+      body.fields && typeof body.fields === "object" && !Array.isArray(body.fields) ? (body.fields as Record<string, unknown>) : null,
+      tagScope.allowed ? (t) => tagScope.allowed!.has(t) : undefined,
+    );
     let result;
     try {
       result = await store.upsertTagRecord(putTagName, {
@@ -4182,6 +4296,14 @@ export async function handleTags(
         // caller's allowlist. No-op for unscoped callers and for the solo
         // own-field errors (no declarer_tags). Status/error_type unchanged.
         const scrubbed = scrubIndexedFieldConflictError(err, tagScope.allowed);
+        if (scrubbed instanceof IndexedFieldLimitError) {
+          // 0.9.2 ceiling: the vault's state refuses it, not the request's
+          // shape, so 409; `unused` is what to prune first.
+          return json(
+            { error: scrubbed.message, error_type: scrubbed.error_type, field: scrubbed.field, fields: scrubbed.fields, limit: scrubbed.limit, got: scrubbed.got, unused: scrubbed.unused },
+            409,
+          );
+        }
         return json(
           { error: scrubbed.message, error_type: "invalid_indexed_field" },
           400,
@@ -4235,7 +4357,7 @@ export async function handleTags(
       }
       throw err;
     }
-    return json(result);
+    return json(near.length > 0 && result && typeof result === "object" ? { ...result, warnings: near } : result);
   }
 
   // DELETE /tags/:name — delete tag + identity row + remove from all notes
@@ -4264,6 +4386,9 @@ export async function handleTags(
     // required to delete a tag another tag's parent_names still references
     // (vault#552). Query params, not a DELETE body, so the flag is visible
     // in access logs and works with any HTTP client without body support.
+    // Scope gap 6: deleting a name a key, private_tags or the published tag uses.
+    const deleteRefusal = tagChangeGuard(store, url, { kind: "delete", tag: tagName }, tagScope);
+    if (deleteRefusal) return deleteRefusal;
     const cascade = parseBool(parseQuery(url, "cascade"), false);
     const detach = parseBool(parseQuery(url, "detach"), false);
     const result = await store.deleteTag(tagName, { cascade, detach });
@@ -5538,7 +5663,11 @@ function foldRestTypes(
     });
     if (visible && !added.every(visible)) return notes ? { ...merged, notes } : merged;
     const prepared = prepareCallTypes(db, body as Record<string, unknown>, mode, { named });
-    if (prepared.types.length) PENDING_TYPES.set(req, { names: prepared.types, release: holdTypes(db, prepared.types) });
+    if (prepared.types.length) {
+      // 0.9.2: computed before the write (afterwards the new name exists); a scoped caller is named only types it may see.
+      const near = nearTypeWarnings(db, prepared.types, visible ?? undefined);
+      PENDING_TYPES.set(req, { names: prepared.types, near, release: holdTypes(db, prepared.types) });
+    }
     return prepared.params;
   } catch (err) {
     if ((err as { error_type?: string })?.error_type !== "tag_kind") throw err;
@@ -5547,4 +5676,25 @@ function foldRestTypes(
 }
 
 /** Types a REST write named, marked once it succeeded (T-318 §8a). */
-const PENDING_TYPES = new WeakMap<Request, { names: string[]; release: () => void }>();
+const PENDING_TYPES = new WeakMap<Request, { names: string[]; near: NearTypeWarning[]; release: () => void }>();
+
+/** The 409 a retype that would strand records gets: the type is unchanged. */
+function retypeConflictResponse(tag: string, conflicts: RetypeConflict[], scoped: boolean): Response {
+  const first = conflicts[0]!;
+  return json(
+    {
+      error: "retype_conflict",
+      error_type: "retype_conflict",
+      message: `Not changed: retyping "${first.field}" on "${tag}" from ${first.from} to ${first.to} would strand ${first.count} record${first.count === 1 ? "" : "s"}.`,
+      tag,
+      field: first.field,
+      count: first.count,
+      // A tag-scoped admin gets the counts (the refusal must count every
+      // record), never the ids or paths of records it may not see.
+      conflicts: conflicts.map((c) => (scoped ? { field: c.field, from: c.from, to: c.to, count: c.count } : c)),
+      hint: retypeHint(tag, first),
+    },
+    409,
+  );
+}
+

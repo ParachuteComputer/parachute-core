@@ -50,6 +50,34 @@ describe("openHubDb + migrate", () => {
     }
   });
 
+  test("the grant generation is added at open, not as a numbered migration: schema stays put, rows from before read 0", () => {
+    const h = makeHarness();
+    try {
+      openHubDb(h.dbPath).close();
+      // A hub.db as an 0.8 hub leaves it: no grant_generations table, no grant_generation columns.
+      const raw = new Database(h.dbPath);
+      raw.exec("DROP TABLE grant_generations");
+      raw.exec("ALTER TABLE tokens DROP COLUMN grant_generation");
+      raw.exec("ALTER TABLE auth_codes DROP COLUMN grant_generation");
+      raw.run("INSERT INTO users (id, username, password_hash, created_at, updated_at) VALUES ('u-mara', 'mara', 'x', 't', 't')");
+      raw.run("INSERT INTO tokens (jti, user_id, client_id, scopes, expires_at, created_at) VALUES ('t-old', 'u-mara', 'c', 'account:self:vaults:work:read', 't', 't')");
+      raw.close();
+      for (let open = 0; open < 2; open++) {
+        const db = openHubDb(h.dbPath); // twice: idempotent
+        try {
+          expect((db.query("SELECT MAX(version) AS v FROM schema_version").get() as { v: number }).v).toBe(HUB_SCHEMA_VERSION);
+          expect((db.query("SELECT grant_generation AS g FROM tokens WHERE jti = 't-old'").get() as { g: number }).g).toBe(0);
+          expect((db.query("PRAGMA table_info(auth_codes)").all() as { name: string }[]).some((c) => c.name === "grant_generation")).toBe(true);
+          expect(db.query("SELECT COUNT(*) AS n FROM grant_generations").get()).toEqual({ n: 0 });
+        } finally {
+          db.close();
+        }
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("creates schema_version + signing_keys on a fresh db", () => {
     const h = makeHarness();
     try {

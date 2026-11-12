@@ -228,6 +228,10 @@ auth), `/.parachute/config`, `/.parachute/embeddings` and
 with admin (MCP: an in-band `isError` result). A tag-scoped token's stats
 (bare vault root, `/.parachute/usage`, `GET /api/vault?include_stats`, MCP
 `vault-info`, the connect-time instructions) count only the notes it can see.
+Since 0.9.1 no mint issues a tag-scoped admin token (scope gap 4: the hub's
+mint doors and its signer refuse `vault:…:admin` with `permissions.scoped_tags`),
+and `parachute doctor` names any such key still live. See
+`docs/contracts/tag-scoped-tokens.md` for the other 0.9.1 scope fixes.
 
 **Scope inheritance:** every `403` above resolves against
 `admin ⊇ write ⊇ read`. A token with `vault:admin` passes every scope

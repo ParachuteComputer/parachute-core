@@ -9,6 +9,13 @@ import { rebuildCompactState } from "./history-compact-state.js";
 import { recordTagKinds } from "./tag-kind.js";
 
 export const SCHEMA_VERSION = 32;
+/**
+ * The newest schema this engine can open (T-460). Above SCHEMA_VERSION only for a schema whose new data this engine
+ * already reads: 33 stores version bodies compressed (blob-codec.ts), which this engine reads but doesn't write. So
+ * rolling back from the engine that writes 33 to this one still opens and reads every vault. Such a vault is opened
+ * as it is: no migration runs and no older stamp is written over it.
+ */
+export const READABLE_SCHEMA_VERSION = 33;
 
 function migrateToV32(db: Database): void {
     const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='history_compact_state'").get();
@@ -32,6 +39,17 @@ function migrateToV32(db: Database): void {
  * in between are read by the same rule (tag-kind.ts KIND_SQL) until a full open
  * records them. No membership moves; note_tags is untouched.
  */
+/**
+ * The write stamp (0.9.1, core write-stamp.ts): `note_versions.via_kind`, the kind of the key that replaced a
+ * revision's content. Additive with no schema number, like ensureTagKinds: a 0.9.0 engine names the columns it
+ * writes and reads, so it opens the vault unchanged and ignores the column. Never backfilled.
+ */
+function ensureRevisionKeyKind(db: Database): void {
+  if (hasTable(db, "note_versions") && !hasColumn(db, "note_versions", "via_kind")) {
+    db.exec("ALTER TABLE note_versions ADD COLUMN via_kind TEXT");
+  }
+}
+
 function ensureTagKinds(db: Database): void {
   const added = !hasColumn(db, "tags", "kind");
   if (added) db.exec("ALTER TABLE tags ADD COLUMN kind TEXT");
@@ -272,6 +290,9 @@ CREATE TABLE IF NOT EXISTS note_versions (
   superseded_at TEXT NOT NULL,
   actor         TEXT,
   via           TEXT,
+  -- The write stamp (0.9.1): the kind of the key in via (person, agent, app, service), NULL when via is no named
+  -- key. Additive, with no schema number: see ensureRevisionKeyKind.
+  via_kind      TEXT,
   op            TEXT NOT NULL,
   content_len   INTEGER NOT NULL,
   encoding      TEXT,
@@ -651,11 +672,16 @@ export class NewerSchemaError extends Error {
   }
 }
 
-/** Throw NewerSchemaError if the database records a schema newer than SCHEMA_VERSION. Reads only. */
+/** Throw NewerSchemaError if the database records a schema newer than READABLE_SCHEMA_VERSION. Reads only. */
 export function assertNotNewer(db: Database): void {
-  if (!hasTable(db, "schema_version")) return;
+  const v = highestStamp(db);
+  if (v !== null && v > READABLE_SCHEMA_VERSION) throw new NewerSchemaError(v, READABLE_SCHEMA_VERSION);
+}
+
+function highestStamp(db: Database): number | null {
+  if (!hasTable(db, "schema_version")) return null;
   const row = db.prepare("SELECT MAX(version) AS v FROM schema_version").get() as { v: number | null } | null;
-  if (row?.v != null && row.v > SCHEMA_VERSION) throw new NewerSchemaError(row.v);
+  return row?.v ?? null;
 }
 
 /**
@@ -680,7 +706,8 @@ function latestStamp(db: Database): number | null {
 export function unnumberedStepsDone(db: Database): boolean {
   return (
     hasIndex(db, "idx_notes_path_nocase") && // ensurePathNocaseIndex (T-412)
-    hasColumn(db, "tags", "kind") // ensureTagKinds (T-318 §8a, 0.9)
+    hasColumn(db, "tags", "kind") && // ensureTagKinds (T-318 §8a, 0.9)
+    (!hasTable(db, "note_versions") || hasColumn(db, "note_versions", "via_kind")) // ensureRevisionKeyKind (0.9.1)
   );
 }
 
@@ -695,6 +722,20 @@ export function initSchema(db: Database): void {
   // last, so an open that stopped part way runs everything again. The steps that came without a version bump are
   // checked too (unnumberedStepsDone): an engine of the same SCHEMA_VERSION from before one of them, or a rollback
   // to one, stamps the vault current without making it.
+  // A vault a newer engine brought past SCHEMA_VERSION, to a schema this engine reads (READABLE_SCHEMA_VERSION):
+  // that engine ran every step below already. Open it as it is, and never stamp it back to an older version.
+  const highest = highestStamp(db);
+  if (highest !== null && highest > SCHEMA_VERSION) {
+    // Its un-numbered steps are this engine's to check, though: a later patch on this line may add one the newer
+    // engine lacks (audit L2-01). Each is additive and idempotent.
+    if (!unnumberedStepsDone(db)) {
+      ensureTagKinds(db);
+      ensurePathNocaseIndex(db);
+      ensureRevisionKeyKind(db);
+    }
+    rebuildIndexes(db);
+    return;
+  }
   if (latestStamp(db) === SCHEMA_VERSION && unnumberedStepsDone(db)) {
     // Still heal declared indexed fields (a column or index missing after a restore): a few catalog reads, no
     // writes when nothing is missing.
@@ -843,6 +884,8 @@ export function initSchema(db: Database): void {
   ensureTagKinds(db);
   // A case-insensitive path index for the `path = ? COLLATE NOCASE` lookups (T-412).
   ensurePathNocaseIndex(db);
+  // The write stamp: each revision says what kind of key wrote it (0.9.1).
+  ensureRevisionKeyKind(db);
 
   // Rebuild any generated columns + indexes declared in indexed_fields.
   // No-op for a fresh vault; idempotent on existing vaults.
