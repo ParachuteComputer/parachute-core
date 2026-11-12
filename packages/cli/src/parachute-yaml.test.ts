@@ -5,7 +5,10 @@ import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SettingsError, checkValue, getSetting, parse, setInText, setSetting, settingsOf, unsetInText, unsetSetting } from "./parachute-yaml.ts";
-import { applyParachuteYaml, effective } from "./settings.ts";
+
+// settings.ts loads the vault's config module, which refuses to run under `bun test` without a PARACHUTE_HOME.
+process.env.PARACHUTE_HOME ??= mkdtempSync(join(tmpdir(), "pyaml-vault-home-"));
+const { applyParachuteYaml, effective } = await import("./settings.ts");
 
 let home = "";
 beforeEach(() => {
