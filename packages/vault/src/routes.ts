@@ -3089,7 +3089,8 @@ async function handleNotesInner(
 
   const verMatch = sub.match(/^\/versions\/([^/]+)$/);
   const importMatch = sub.match(/^\/imports\/([^/]+)$/);
-  if (sub === "/versions" || verMatch || importMatch || sub === "/restore") {
+  const markMatch = sub.match(/^\/(versions|imports)\/([^/]+)\/mark$/);
+  if (sub === "/versions" || verMatch || importMatch || markMatch || sub === "/restore") {
     // Erasing a live note's history takes only an exact id or path (T-412); reading and restoring keep the usual lookup.
     let note: Note | null;
     if (sub === "/versions" && method === "DELETE") {
@@ -3142,6 +3143,18 @@ async function handleNotesInner(
         if (response) return response;
         throw e;
       }
+    } else if (markMatch && (method === "POST" || method === "DELETE")) {
+      // Mark a version to keep for good (POST), or clear the mark (DELETE) (T-460, 1.0). A marked version is never
+      // pruned, thinned by the retention tiers or dropped by the byte ceiling; erasing the note's history still erases it.
+      const imported = markMatch[1] === "imports";
+      const raw = markMatch[2]!;
+      const index = Number(raw);
+      if (!/^\d+$/.test(raw) || !Number.isSafeInteger(index) || index < 0) return json({ error: `Invalid ${imported ? "import_ix" : "version_ix"}`, error_type: "invalid_request" }, 400);
+      if (imported && !db.prepare("SELECT 1 FROM history_import_refs WHERE note_id = ? AND import_ix = ?").get(id, index))
+        return json({ error: "Not found", error_type: "not_found", origin: "git-import", import_ix: index }, 404);
+      const row = await store.markNoteVersion(id, imported ? importStorageIndex(index) : index, { marked: method === "POST", actor: writeCtx.actor });
+      if (!row) return json({ error: "Not found", error_type: "not_found" }, 404);
+      return json(projectHistoryProvenance(projectHistoryRow(row), tagScope.allowed !== null));
     } else if (sub === "/restore" && method === "POST") {
       const parsed = await parseJsonBody(req);
       if (!parsed.ok) return parsed.response;

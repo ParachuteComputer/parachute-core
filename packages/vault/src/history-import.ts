@@ -548,10 +548,20 @@ function privateBundle(archive: string, expected: string, dir: string): string {
   git(repo, ["fetch", "--no-tags", "--", copy, "+refs/*:refs/*"]);
   return repo;
 }
+/**
+ * Whether the vault's history settings still say what the manifest was planned with. Only the keys the vault's
+ * `vault.yaml` sets, and only those the manifest carries, are compared: an operator who changes a setting between
+ * plan and apply is refused, but a release that adds a policy key or changes a default (T-460: compaction, bursts,
+ * the 1.0 tiers) doesn't strand a run planned before it. `apply` always uses the manifest's own policy.
+ */
+export function samePlannedPolicy(configured: Partial<HistoryPolicy> | undefined, planned: HistoryPolicy): boolean {
+  const now = resolveHistoryPolicy(configured);
+  return Object.keys(configured ?? {}).every((k) => !(k in planned) || canonicalJson(now[k as keyof HistoryPolicy]) === canonicalJson(planned[k as keyof HistoryPolicy]));
+}
 function readManifest(vault: string, path: string): ImportManifest {
   const m = JSON.parse(readFileSync(path, "utf8")) as ImportManifest;
   if (m.format !== 1 || m.kind !== "final" || m.vault !== vault || m.run_id !== digestManifest(m) || !m.archive || !m.archive_hash || !m.backup) throw new Error("A matching final manifest is required");
-  if (canonicalJson(resolveHistoryPolicy(readVaultConfig(vault)?.history)) !== canonicalJson(m.policy)) throw new Error("History policy differs from final manifest");
+  if (!samePlannedPolicy(readVaultConfig(vault)?.history, m.policy)) throw new Error("History policy differs from final manifest");
   const selections = m.selections == null ? null : normalizeHistorySelections(m.selections);
   // One canonical form: the default bound is written by leaving the field out.
   if (m.max_tree_entries !== undefined && treeEntryLimit(m.max_tree_entries) === MAX_OBJECTS) throw new Error("Manifest names the default tree-entry bound; a raised bound only");

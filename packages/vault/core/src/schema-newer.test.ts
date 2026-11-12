@@ -24,7 +24,8 @@ test("initSchema still opens a vault.db at this SCHEMA_VERSION", () => {
 
 // T-460: the engine that writes compressed version bodies stamps 33. This one reads them, so a rollback to it must
 // still open such a vault, as it is: no migration, and no older stamp written after the newer one.
-test("initSchema opens a vault.db stamped newer than SCHEMA_VERSION but readable, and stamps nothing", () => {
+// Runs while READABLE_SCHEMA_VERSION is above SCHEMA_VERSION (a reader release, as 0.9.3 was for 33); skipped otherwise.
+test.skipIf(READABLE_SCHEMA_VERSION === SCHEMA_VERSION)("initSchema opens a vault.db stamped newer than SCHEMA_VERSION but readable, and stamps nothing", () => {
   expect(READABLE_SCHEMA_VERSION).toBeGreaterThan(SCHEMA_VERSION);
   const db = new Database(":memory:");
   initSchema(db);

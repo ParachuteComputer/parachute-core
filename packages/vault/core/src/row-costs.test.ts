@@ -223,11 +223,11 @@ describe("v5 and v18 against each state of the path indexes", () => {
   });
 });
 
-/** sha256 of SCHEMA_SQL as of SCHEMA_VERSION 32 with T-412 (idx_notes_path left out of it) and 0.9's `kind` on tags, 0.9.1's `via_kind` on revisions. */
-const SCHEMA_SQL_HASH_AT_32 = "ade9b08b66e61a3975f03b23b80466122607f4ca715821bcda17b3c8563e2dc7";
+/** sha256 of SCHEMA_SQL as of SCHEMA_VERSION 32: T-412 (idx_notes_path left out of it), 0.9's `kind` on tags, 0.9.1's `via_kind` on revisions, and T-460's compressed blob encodings (comments only). */
+const SCHEMA_SQL_HASH_AT_32 = "38eefa80f85f86d03de7d0604ab3e656bde4a3c5f6e5fa6d11ebf60fa277f30d";
 
-/** sha256 of initSchema's code and its fast-path check (comments and spacing left out) as of SCHEMA_VERSION 32 with T-412, 0.9's ensureTagKinds and 0.9.1's ensureRevisionKeyKind, and T-460's open-as-is of a newer readable schema. */
-const INIT_SCHEMA_HASH_AT_32 = "1a3aa88a2a3f71de260def99a2e057e86eaf3ddea36b5a58a7af401bb24f75e3";
+/** sha256 of initSchema's code and its fast-path check (comments and spacing left out) as of SCHEMA_VERSION 32: T-412, 0.9's ensureTagKinds and 0.9.1's ensureRevisionKeyKind, T-460's open-as-is of a newer readable schema, T-460's ensureCompactHintsLegacy, and 1.0's ensureVersionMarks with the sweep's index (un-numbered steps, checked in unnumberedStepsDone), and 1.0's ensureFloat32VectorIndex. */
+const INIT_SCHEMA_HASH_AT_32 = "b20afb3345bb95c2336821915cef6f417d32e7abed579669958449ab817d2071";
 
 describe("the fast path's promise", () => {
   // initSchema skips SCHEMA_SQL and every migration on a vault stamped SCHEMA_VERSION (with the path index). So a

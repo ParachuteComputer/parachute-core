@@ -145,7 +145,9 @@ function stampsWriter(method: string, apiPath: string | null): boolean {
   if (method === "GET" || method === "HEAD" || method === "OPTIONS") return true;
   if (apiPath === null) return false; // not the REST API: /view, the vault root, …
   // A record's attachments, history erases (DELETE …/versions) and a transcription retry record no writer; restore
-  // (POST …/restore) does. Matched after the id, so a record whose id is "versions" is still a record.
+  // (POST …/restore) and a mark do. Matched after the id, so a record whose id is "versions" is still a record.
+  // A mark on a version or an imported observation (T-460) records who marked it, so it takes on-behalf-of like restore.
+  if (/^\/(notes|records)\/[^/]+\/(versions|imports)\/[^/]+\/mark$/.test(apiPath)) return true;
   if (/^\/(notes|records)(\/|$|\?)/.test(apiPath)) return !/^\/(notes|records)\/[^/]+\/(attachments|versions|retry-transcription)(\/|$)/.test(apiPath);
   return /^\/(tags|types)\/[^/]+\/rename$/.test(apiPath);
 }

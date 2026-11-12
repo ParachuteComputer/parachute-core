@@ -1673,7 +1673,12 @@ Versions are **not** full-text searchable.
 
 - `POST /vault/{name}/api/history/compact` requires **`vault:admin`** and
   returns a compaction summary, including `remaining_candidates` and
-  `notes_failed`. Optional JSON `{note_id, budget_ms, max_notes}` restricts the
+  `notes_failed`. A whole-vault run (no `note_id`) also converts search vectors
+  stored as float32 to int8 (stored under the model name with `::int8` added),
+  with its own budget of the same size (no `budget_ms`: up to 20,000 rows; on
+  open, `compact_budget_ms: 0` turns the whole pass off): `vectors_converted`, `vectors_failed`
+  (rows that don't decode, left as they are and out of search) and
+  `vectors_remaining`. Optional JSON `{note_id, budget_ms, max_notes}` restricts the
   run; absent bounds mean unbounded, while explicit zero bounds are 400
   `invalid_request`. Tag-scoped callers and every other method receive 404.
 
@@ -1727,10 +1732,36 @@ A note over 2 MB cannot be updated while history is on (413
 whose content is unrecoverable. Reading that version returns `content:null`
 and `encoding:"overflow"`; restoring it is 409 `history_unrecoverable`.
 
-The defaults are enabled, a 20-version floor, a 100-version ceiling and
-180-day maximum age above the floor. The ceiling is at least 1 and at least
-the floor; both age settings are capped at 36,500 days. Delete tombstones are exempt from this
-pruning. `history.deleted_retention_days: null` retains deleted-note history
+Retention (1.0): every version is kept for 90 days (`keep_all_days`), then the
+first version of each UTC day up to a year (`keep_daily_days`, 365), then the
+first of each ISO week (Monday to Sunday, UTC) for good. The first version in a
+day or week holds the note as it stood when that day or week began, so an old
+read "as of" a moment comes back at most a day (or a week) early. Always kept:
+each note's newest 20 (`min_versions`), delete tombstones, and marked versions.
+Imported history is thinned by the same rule, by the maintenance pass: it sweeps
+every note with history at most once a day, the one swept longest ago first (`notes_thinned`, `versions_thinned`,
+`thin_remaining` in the summary). It runs when a vault opens and, on a box,
+hourly while it stays open (Cloud: when the vault wakes); each run is bounded by
+`compact_budget_ms` and `compact_max_notes`. A capture prunes only when a cap the
+vault sets is reached, so a long history costs a write nothing. `keep_all_days: null` turns the tiers off.
+`max_versions` and `max_age_days` still apply on top when a vault sets them;
+their defaults are no cap (1,000,000 and 36,500 days). The ceiling is at least 1
+and at least the floor; both age settings are capped at 36,500 days. Delete
+tombstones are exempt from this pruning.
+
+- `POST /vault/{name}/api/notes/{idOrPath}/versions/{version_ix}/mark`
+  (`vault:write`) marks a version to keep for good; `DELETE` on the same path
+  clears the mark. `/imports/{import_ix}/mark` does the same for an imported
+  observation. Answers the version row, which then carries `marked_at` and
+  `marked_by` (the writer); an unmarked row has neither field. Marking twice
+  keeps the first mark. A marked version is never pruned, thinned, dropped by the
+  byte ceiling or swept with a deleted note's history; erasing the note's history
+  (`DELETE /notes/{id}/versions`) still erases it. Same lookup and tag-scope rules
+  as reading a version; 404 when there is no such version. Any key that can write
+  the note can mark, and marked versions count toward nothing the byte ceiling
+  can drop, so many marks can keep a note over `max_bytes_per_note`.
+
+`history.deleted_retention_days: null` retains deleted-note history
 until explicit erasure; a number enables sweeping on open. A `history:`
 config change in the vault's **`vault.yaml`** takes effect at the next daemon
 restart.
@@ -1740,8 +1771,8 @@ Compaction adds these `history:` defaults:
 | Key | Default |
 |---|---:|
 | `compact_enabled` | `true` |
-| `compact_ratio` | `3` |
-| `compact_min_versions` | `10` |
+| `compact_ratio` | `1` |
+| `compact_min_versions` | `2` |
 | `compact_run_length` | `24` |
 | `max_bytes_per_note` | `8388608` (8 MiB) |
 | `compact_budget_ms` | `250` |
@@ -1750,13 +1781,31 @@ Compaction adds these `history:` defaults:
 History has three ceilings: count, age and `max_bytes_per_note`. The
 `min_versions` floor outranks all three, includes tombstones, and can leave a
 note over its byte ceiling. `max_bytes_per_note: null` disables the byte ceiling;
-numeric values, including zero, are clamped to at least 65,536 bytes.
+numeric values, including zero, are clamped to at least 65,536 bytes. Byte sizes
+are stored bytes: since schema 33 bodies are stored compressed, so the ceiling
+counts compressed bytes.
 `compact_enabled: false` also disables byte-ceiling enforcement.
+
+Since schema 33 every body is stored compressed (`deflate`) when that is
+smaller, and compaction is always on: a note with at least
+`compact_min_versions` versions is a candidate, and so is one holding blobs
+stored the old way (text, or a base64 `fossil-delta`). A pass compacts a note
+whose version bodies add up to more than `compact_ratio` times its live body
+(logical sizes, not stored ones), or that holds old blobs: it re-stores those
+compressed (`blobs_compressed` in the summary) and stores the
+rest of each run of `compact_run_length` (newest first) as a compressed delta
+(`fossil-delta-z`, `blobs_deltified`) against one base when that is smaller:
+a body in the run that deltas already rest on, else the run's newest, so the
+base moves about once per run however often passes come. Every re-encoded blob
+is read back and hash-checked before it replaces the old bytes. A completed
+pass, or a failed one, marks the note refused until its next write. Schema 33
+rebuilds the hints once and clears every refusal, so the boot pass works
+through an existing vault a few notes at a time.
 Compaction runs synchronously at first vault open, with budgets checked between
 notes: one note can overshoot the time budget. Zero boot budget skips the pass.
-Schema 32 backfills per-note scheduling hints once. Later opens select hints by
-stored size without aggregating all history. A no-op attempt marks a note refused;
-new capture, pruning or import re-arms it. Notes with zero live bytes are excluded
+Schema 32 backfills per-note scheduling hints once (33 again, adding `legacy`). Later opens select hints by stored size without aggregating all
+history. An attempt marks a note refused; new capture, pruning or import re-arms
+it. Notes with zero live bytes are excluded
 from ratio-based selection, but remain eligible when over the byte ceiling.
 The bounded selection window is four times the note budget; `remaining_candidates`
 is the total eligible count at selection time minus notes attempted, not the window

@@ -266,6 +266,10 @@ export interface VaultConfig {
     max_bytes_per_note?: number | null;
     compact_budget_ms?: number;
     compact_max_notes?: number;
+    /** Retention tiers (T-460, 1.0): every version for this many days (default 90; null turns tiers off)... */
+    keep_all_days?: number | null;
+    /** ...then the first of each day to this many days (default 365), then the first of each week. */
+    keep_daily_days?: number;
   };
 }
 
@@ -581,7 +585,7 @@ function serializeVaultConfig(config: VaultConfig): string {
   // Per-vault history policy: serialize only explicitly configured fields.
   if (config.history) {
     lines.push("history:");
-    for (const key of ["enabled", "min_versions", "max_versions", "max_age_days", "deleted_retention_days", "compact_enabled", "compact_ratio", "compact_min_versions", "compact_run_length", "max_bytes_per_note", "compact_budget_ms", "compact_max_notes"] as const) {
+    for (const key of ["enabled", "min_versions", "max_versions", "max_age_days", "deleted_retention_days", "compact_enabled", "compact_ratio", "compact_min_versions", "compact_run_length", "max_bytes_per_note", "compact_budget_ms", "compact_max_notes", "keep_all_days", "keep_daily_days"] as const) {
       if (config.history[key] !== undefined) lines.push(`  ${key}: ${config.history[key]}`);
     }
   }
@@ -918,6 +922,10 @@ function parseVaultConfig(yaml: string, name: string): VaultConfig {
       if (ratio) config.history.compact_ratio = Number(ratio[1]);
       const bytes = line.match(/^\s+max_bytes_per_note:\s*(null|\d+)\s*$/);
       if (bytes) config.history.max_bytes_per_note = bytes[1] === "null" ? null : Number(bytes[1]);
+      const keepAll = line.match(/^\s+keep_all_days:\s*(null|-?\d+(?:\.\d+)?)\s*$/);
+      if (keepAll) config.history.keep_all_days = keepAll[1] === "null" ? null : Number(keepAll[1]);
+      const keepDaily = line.match(/^\s+keep_daily_days:\s*(-?\d+(?:\.\d+)?)\s*$/);
+      if (keepDaily) config.history.keep_daily_days = Number(keepDaily[1]);
       const deleted = line.match(/^\s+deleted_retention_days:\s*(null|\d+)\s*$/);
       if (deleted) config.history.deleted_retention_days = deleted[1] === "null" ? null : Number(deleted[1]);
     }
