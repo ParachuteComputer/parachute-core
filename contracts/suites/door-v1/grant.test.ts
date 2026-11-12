@@ -4,7 +4,7 @@
 // Red today: no door takes a signed statement, so each contract stops where `granted()` files one. Every body
 // starts with a grant that must be taken, so a refusal further down can't pass because nothing is ever taken.
 import { describe, expect, test } from "bun:test";
-import { KIND, LANE, NO_GRANTS, declareType, door, eventSize, file, grantEvent, grantRow, granted, hashedSize, ids, must, newKey, ownerKey, rec, records, red, rest, revokeEvent, sign, statements, tokenAs, tokenReply, vaultId, vaultRecordEvent, type Event, type Key } from "./_grants.ts";
+import { KIND, LANE, NO_GRANTS, declareType, door, eventSize, file, grantEvent, grantRow, granted, hashedSize, ids, must, newKey, ownerKey, rec, records, red, rest, revokeEvent, runId, sign, statements, tokenAs, tokenReply, vaultId, vaultRecordEvent, type Event, type Key } from "./_grants.ts";
 import { lacks } from "../door/_door.ts";
 
 const owner = records("write");
@@ -257,9 +257,10 @@ describe("what a vault refuses to file", () => {
     const deny = Array.from({ length: 16 }, (_, i) => `held-back-${String(i).padStart(2, "0")}-${"\\".repeat(100)}`);
     const at = Math.floor(Date.now() / 1000);
     async function sized(target: number, key: Key): Promise<Event> {
-      const make = (purpose: string) => grantEvent({ id: `size${target}`, to: key, types: { [recipe]: ["read"] }, deny, created_at: at, extraFields: { purpose } });
+      const id = runId("size"); // fresh each run, all the same length
+      const make = (purpose: string) => grantEvent({ id, to: key, types: { [recipe]: ["read"] }, deny, created_at: at, extraFields: { purpose } });
       const extra = target - eventSize(await make("x"));
-      must(extra >= 0 && extra <= 4 * 150, `setup: the denies leave ${extra} bytes to fill; change their length`);
+      must(extra >= 0 && extra <= 4 * 190, `setup: the denies leave ${extra} bytes to fill; change their length`);
       const e = await make(`${'"'.repeat(Math.floor(extra / 4))}x${"a".repeat(extra % 4)}`);
       must(eventSize(e) === target, `setup: sized ${eventSize(e)}, not ${target}`);
       must(Buffer.byteLength(e.content) <= 6000, `setup: the content is ${Buffer.byteLength(e.content)} bytes`);

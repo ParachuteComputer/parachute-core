@@ -150,16 +150,20 @@ can't be granted or denied by name at 1.0 (§13). Test vectors for the spelling 
 their digests) are a precondition of the freeze (open decision A): they are written and run by the shell, the
 minter and every door before the first signature. They are #systems' `vectors/frame-1.0.json` in the shell-keys
 core (branch `t335-frame-1.0`): 150 signed cases, each with its event id and outcome, replayed against a fresh
-party. It meets the precondition once it also carries a meaning in a second spelling (keys out of order, a space,
-a `\u` or `\/` escape, `1.0` or `01`, rows or verbs unsorted), a grant 8,193 bytes as sent but not as hashed
-(below), and a statement whose tags hold a number. Until then the precondition is unmet.
+party. It meets the precondition once its two cases "a newer event for another grantee" and "a newer event under
+another grant" end with nothing in force (they were written before line 6 held such an event, and expect the older
+grant to stay), and it also carries a meaning in a second spelling (keys out of order, a space, a `\u` or `\/`
+escape, `1.0` or `01`, rows or verbs unsorted), a grant 8,193 bytes as sent but not as hashed (below), and a
+statement whose tags hold a number. Until then the precondition is unmet.
 
 **Size.** The content is at most 6,000 bytes of UTF-8 and the event at most 8,192 bytes. Both are checked: the
-event escapes the content's quotes and backslashes, so it is 1.25 to 1.9 times larger. **An event's size**, here
-and in every limit in this spec, is the bytes of the event as sent: one compact JSON object of its seven fields
-(`id`, `pubkey`, `created_at`, `kind`, `tags`, `content`, `sig`), with no whitespace, and every character a string
-needn't escape written as itself in UTF-8 (never `\u` for non-ASCII). It is not NIP-01's serialisation for the id,
-which leaves out `id` and `sig` and is about 250 bytes shorter. A KB is 1,024 bytes.
+event escapes the content's quotes and backslashes, so it is larger than the content. **An event's size**, here
+and in every limit in this spec, is the length of the event as sent, which the vault computes itself from the
+event's fields, whatever spelling the request used: one compact JSON object of its seven fields (`id`, `pubkey`,
+`created_at`, `kind`, `tags`, `content`, `sig`), with no whitespace, strings escaped exactly as NIP-01's id
+serialisation escapes them, and every other character written as itself in UTF-8 (never `\u` for non-ASCII). It is
+not NIP-01's serialisation for the id, which leaves out `id` and `sig` and is 253 bytes shorter for a grant. A KB is
+1,024 bytes.
 
 Five kinds are reserved together [lean, open decision A]: `37440` grant, `7440` revoke (a regular event, never
 replaced), `37441` link statement, `37442` link claim, and `37443` the vault's own record (§2.3). The grant frame's
@@ -188,8 +192,9 @@ this vault. What else each kind must carry:
 §2.1's limits; any other statement within 8,192 bytes, but for a revoke, read up to 64 KB (§3).
 
 1. **The event is whole:** its tags are a list of lists of strings, as NIP-01 has them (an empty tag is fine), and
-   anything else is malformed (`invalid_statement`), whatever the kind: the id is a hash over the tags, and a number
-   or an object in them hashes to other bytes in another language. The id is the hash of its fields and the
+   every string in the event, the content included, is well-formed Unicode (no lone surrogate). Anything else is
+   malformed (`invalid_statement`), whatever the kind: the id is a hash over these, and a number, an object or a
+   lone surrogate hashes to other bytes in another language, or doesn't hash at all. The id is the hash of its fields and the
    signature verifies (BIP-340).
 2. **It names this vault:** `at` is `parachute`, `gives` is `access`, and `honors` equals the vault's own id byte
    for byte.
@@ -209,7 +214,8 @@ this vault. What else each kind must carry:
    and nobody else may use that start, so a member can't take an id the owner will want. If an event with this
    address is on file, this one is newer by `created_at` (on a tie the lower event id wins, as in NIP-01, so two
    copies always merge to the same answer), it is signed by the same key, and its `to` and `under` are
-   byte-identical to every event the vault has seen at that address, filed or held. One that differs is refused
+   byte-identical to every event the vault has seen at that address, filed or held: the bytes of each value as they
+   stand in the event's content, never parsed and written again. One that differs is refused
    (`id_taken`) and is never filed; but like any event the vault can't take, if it is the newest at its address it
    is held and suspends the address (below), so a changed `to` or `under` can never leave an older, wider grant in
    force. Once events at one address disagree on `to` or `under`, the address comes back only by a revoke and a
@@ -707,7 +713,7 @@ that the signed-in owner agreed.
 
 | When | Status and `error` |
 |---|---|
-| malformed event; tags other than exactly `d` and `expiration`, or tags that disagree with the content; content not in its canonical spelling; an unknown field, key or verb; over the size limits; no date, a date already past or more than 366 days out; incoherent verbs; a reserved or malformed prefix; `was` or a missing `under` on a member-signed grant; a dot in a member's own id | 400 `invalid_statement` |
+| malformed event (any kind: tags that aren't lists of strings, a string that isn't well-formed Unicode, §2.2 line 1); tags other than exactly `d` and `expiration`, or tags that disagree with the content; content not in its canonical spelling; an unknown field, key or verb; over the size limits; no date, a date already past or more than 366 days out; incoherent verbs; a reserved or malformed prefix; `was` or a missing `under` on a member-signed grant; a dot in a member's own id | 400 `invalid_statement` |
 | the id or signature doesn't verify | 400 `bad_signature` |
 | it names another vault (`honors`), or isn't `at: parachute`, `gives: access`; a revoke for another vault | 400 `wrong_vault` |
 | the signer has no standing here; a member signing `self` or `names`; an `under` that isn't the signer's own grant; a revoke from a key that may not end that address; a claim from a key the link doesn't name | 403 `no_standing` |
@@ -948,7 +954,8 @@ written into this file and reviewed here:
 | A fresh Fable check of those fixes only | **SHIP WITH FIXES**: 4 closed, 6 partly, 6 new | Line 6 still depended on order; held events dropped at import; a refused grant could come into force on its own; held events uncounted; an earlier key after a move; unfiled replacements. All fixed (§2.2 line 6 and bulk filing oldest first, holding against the carried owner list, re-judging only on upgrade or re-file, the member cap, §2.3 step 1, the take-back sentence). |
 
 The second pass's fixes were made after it and have not been reviewed again. Not a freeze yet: the spelling
-vectors don't exist, and open decision A asks for one more security pass with Benjamin.
+vectors were missing then (round 6 names them, §2.1, still short of the precondition), and open decision A asks for
+one more security pass with Benjamin.
 
 **Round 5 (T-462, 11-12).** A fresh adversarial Fable reviewer, on the round-4 check's fixes only: **SHIP WITH
 FIXES**, 4 blocking (a changed `to` failed open; bulk filing dropped early revokes; a keyless owner's handover never
