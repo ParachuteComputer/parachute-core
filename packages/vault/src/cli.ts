@@ -17,6 +17,7 @@
  *   parachute-vault status                  — show full status
  */
 
+import { readLastExport } from "./export-stamp.ts";
 import { resolve, join, dirname } from "path";
 import { homedir } from "os";
 import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync, copyFileSync, chmodSync, readdirSync, statSync, renameSync } from "fs";
@@ -2071,6 +2072,13 @@ async function cmdStatus() {
     const config = readVaultConfig(name);
     const desc = config?.description ? ` — ${config.description}` : "";
     console.log(`            ${name}${desc}`);
+    // When a full export last went out (GET /api/export, the backup key's cron pull), so a person can see it ran.
+    const last = readLastExport(name);
+    console.log(
+      last.last_export_at
+        ? `              last export: ${last.last_export_at}${last.last_export_by ? ` (${last.last_export_by})` : ""}`
+        : `              last export: never (a backup key: parachute keys new <name> --vault ${name} --can export)`,
+    );
   }
 
   // Triggers
