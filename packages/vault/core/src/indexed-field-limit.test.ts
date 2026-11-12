@@ -171,15 +171,18 @@ describe("indexed-field ceiling", () => {
 
       const target = new SqliteStore(new Database(":memory:"));
       const stats = await importPortableVault(target, { inDir: dir });
-      expect(stats.unindexed_schema_fields).toEqual([
-        expect.objectContaining({ tag: "late", field: "extra" }),
-      ]);
+      // Which field loses its index depends on the order schema files are
+      // read (the filesystem's); that exactly one does, and keeps its
+      // declaration and values, doesn't.
+      expect(stats.unindexed_schema_fields).toHaveLength(1);
+      const lost = stats.unindexed_schema_fields[0]!;
       expect(countIndexedFields(target.db)).toBe(88);
-      expect((await target.getTagRecord("late"))!.fields!.extra).toMatchObject({ type: "string", indexed: false });
+      expect((await target.getTagRecord(lost.tag))!.fields![lost.field]).toMatchObject({ type: "string", indexed: false });
+      expect(getIndexedField(target.db, lost.field)).toBeNull();
       expect((await target.getNote("n1"))!.metadata).toMatchObject({ extra: "value" });
     });
 
-    it("keeps what fits in one schema file and unindexes only the rest", async () => {
+    it("keeps what fits and unindexes only the excess", async () => {
       await store.upsertTagRecord("big", { fields: indexed("f", INDEXED_FIELD_LIMIT - 2) });
       for (let i = 0; i < 5; i++) forceIndexed(db, `late${i}`, "late");
       rawUpsertTagRecord(db, "late", { fields: indexed("late", 5) });
@@ -188,9 +191,10 @@ describe("indexed-field ceiling", () => {
       const target = new SqliteStore(new Database(":memory:"));
       const stats = await importPortableVault(target, { inDir: dir });
       expect(countIndexedFields(target.db)).toBe(88);
+      // 91 declared, 88 fit: three lose their index, whichever file came last.
       expect(stats.unindexed_schema_fields).toHaveLength(3);
-      const late = (await target.getTagRecord("late"))!.fields!;
-      expect(Object.values(late).filter((f: any) => f.indexed === true)).toHaveLength(2);
+      const declared = [...Object.values((await target.getTagRecord("big"))!.fields!), ...Object.values((await target.getTagRecord("late"))!.fields!)];
+      expect(declared.filter((f: any) => f.indexed === true)).toHaveLength(88);
     });
 
     it("blow-away drops orphaned indexed fields first, so they don't cost the export its indexes", async () => {
