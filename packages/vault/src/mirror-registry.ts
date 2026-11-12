@@ -91,6 +91,13 @@ export function getMirrorManager(vaultName: string): MirrorManager | null {
   return built;
 }
 
+/** Remove and return a vault's manager without building one (the vault was deleted). */
+export function takeMirrorManager(vaultName: string): MirrorManager | null {
+  const m = managers.get(vaultName) ?? null;
+  managers.delete(vaultName);
+  return m;
+}
+
 /** Snapshot of vault names with a live manager. Used by shutdown drain. */
 export function listMirrorManagers(): MirrorManager[] {
   return Array.from(managers.values());

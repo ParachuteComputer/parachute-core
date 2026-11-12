@@ -23,13 +23,13 @@ import { readVaultConfig, readGlobalConfig, writeGlobalConfig, writeVaultConfig,
 import { existsSync, rmSync } from "fs";
 import { migrateVaultKeys } from "./token-store.ts";
 import { resolveFirstBootVaultName, reservedNameSquatWarnings } from "./vault-name.ts";
-import { getVaultStore, getVaultNameForStore, getSharedEmbeddingProvider, closeAllStores, resetSharedEmbeddingProvider } from "./vault-store.ts";
+import { getVaultStore, getVaultNameForStore, getSharedEmbeddingProvider, closeAllStores, resetSharedEmbeddingProvider, evictVaultStore, vaultIdentity, setVaultReplacedHandler } from "./vault-store.ts";
 import { EmbeddingWorker, registerEmbeddingHook } from "./embedding-worker.ts";
 import { startAttachmentTicketSweep, stopAttachmentTicketSweep } from "./attachment-tickets.ts";
 import { seedOnboardingNotesBestEffort } from "./onboarding-seed.ts";
 import { defaultHookRegistry } from "../core/src/hooks.ts";
 import { registerTriggers } from "./triggers.ts";
-import { clearLiveTriggers, loadVaultTriggers } from "./triggers-api.ts";
+import { clearLiveTriggers, loadVaultTriggers, unloadVaultTriggers } from "./triggers-api.ts";
 import { route } from "./routing.ts";
 import { notesDeprecationHeaders } from "../core/src/rest-records.ts";
 import { startTranscriptionWorker, registerTranscriptionHook, type TranscriptionWorker } from "./transcription-worker.ts";
@@ -58,6 +58,7 @@ import { MirrorManager } from "./mirror-manager.ts";
 import {
   setMirrorManager,
   setMirrorManagerFactory,
+  takeMirrorManager,
   listMirrorManagers,
 } from "./mirror-registry.ts";
 import { buildMirrorDeps, resolveMirrorVaultName } from "./mirror-deps.ts";
@@ -155,6 +156,92 @@ export interface RunningVault {
   stop(opts?: { reason?: string; deadline?: number }): Promise<void>;
 }
 
+/** How often a running server looks for vaults made or deleted behind its back (a request that names a vault looks too). */
+const VAULT_SYNC_MS = 2_000;
+
+/** Tag schemas from vault.yaml into the database, only those not there yet. Throws what isn't a paused import. */
+async function migrateTagSchemasFor(vaultName: string): Promise<void> {
+  try {
+    const vaultConfig = readVaultConfig(vaultName);
+    if (vaultConfig?.tag_schemas && Object.keys(vaultConfig.tag_schemas).length > 0) {
+      const store = getVaultStore(vaultName);
+      const existingTags = new Set((await store.listTagSchemas()).map((s) => s.tag));
+      let migrated = 0;
+      for (const [tag, schema] of Object.entries(vaultConfig.tag_schemas)) {
+        if (!existingTags.has(tag)) {
+          await store.upsertTagSchema(tag, schema);
+          migrated++;
+        }
+      }
+      if (migrated > 0) {
+        console.log(`[migration] migrated ${migrated} tag schema(s) from vault.yaml to DB for vault "${vaultName}"`);
+      } else {
+        console.log(`[migration] vault "${vaultName}" has tag_schemas in vault.yaml (already in DB — vault.yaml section can be removed)`);
+      }
+    }
+  } catch (err) {
+    if (!(err instanceof VaultImportPausedError)) throw err;
+    console.warn(`[history-import] vault "${vaultName}" is paused; skipping tag-schema migration`);
+  }
+}
+
+/** API keys from config.yaml into the vault's token table (idempotent). Never throws. */
+function migrateKeysFor(vaultName: string, globalCfg: ReturnType<typeof readGlobalConfig>): void {
+  try {
+    const vc = readVaultConfig(vaultName);
+    if (!vc) return;
+    const store = getVaultStore(vaultName);
+    const migrated = migrateVaultKeys(store.db, vc.api_keys, globalCfg.api_keys);
+    if (migrated > 0) {
+      console.log(`[tokens] migrated ${migrated} API key(s) into vault "${vaultName}"`);
+    }
+  } catch (err) {
+    console.error(`[tokens] migration error for vault "${vaultName}":`, err);
+  }
+}
+
+/** A vault's persisted runtime triggers, registered vault-scoped. Returns how many; never throws. */
+function loadTriggersFor(vaultName: string): number {
+  try {
+    const n = loadVaultTriggers(vaultName, getVaultStore(vaultName));
+    if (n > 0) {
+      console.log(`[triggers] loaded ${n} runtime trigger(s) for vault "${vaultName}"`);
+    }
+    return n;
+  } catch (err) {
+    console.error(`[triggers] failed to load runtime triggers for vault "${vaultName}":`, err);
+    return 0;
+  }
+}
+
+/** What start-up did for each vault, for one that appeared while the server runs. Failures are logged, never thrown. */
+async function bootNewVault(name: string, startMirror: (name: string) => void, stillHere: () => boolean): Promise<void> {
+  try {
+    console.log(`[vaults] "${name}" is new: setting it up (no restart)`);
+    getVaultStore(name);
+    await migrateTagSchemasFor(name);
+    if (!stillHere()) return; // deleted while setting up: nothing more to start
+    migrateKeysFor(name, readGlobalConfig());
+    loadTriggersFor(name);
+    startMirror(name);
+  } catch (err) {
+    if (err instanceof VaultImportPausedError) return;
+    console.error(`[vaults] setting up "${name}" failed:`, err);
+  }
+}
+
+/** What a deleted vault held in this process: its open database, its triggers, its mirror. */
+function forgetVault(name: string, closeSockets: (name: string) => void): void {
+  console.log(`[vaults] "${name}" is gone: letting go of it (no restart)`);
+  closeSockets(name);
+  unloadVaultTriggers(name);
+  const mirror = takeMirrorManager(name);
+  if (mirror) {
+    void mirror.stop().catch((err) => console.warn(`[mirror] stop for deleted vault "${name}" threw (non-fatal): ${(err as Error).message ?? err}`));
+  }
+  evictVaultStore(name);
+}
+
 /**
  * Start the vault. Throws if it can't: a vault database that won't open, a port in use. On a throw, whatever had
  * started is stopped again and every database closed, so the caller can exit cleanly.
@@ -168,6 +255,8 @@ export async function startVault(opts: StartVaultOptions = {}): Promise<RunningV
   let stopTimer: ReturnType<typeof setInterval> | null = null;
   /** Mirror managers still starting (initial export): stop waits for them, so none subscribes after it. */
   const mirrorStarts: Promise<unknown>[] = [];
+  /** Stands up a vault's mirror manager when its config is enabled (set when the mirror block of start-up runs). */
+  let startMirrorFor: (name: string) => void = () => {};
   let stopping: Promise<void> | null = null;
 
   const stop = (stopOpts: { reason?: string; deadline?: number } = {}): Promise<void> =>
@@ -498,47 +587,12 @@ export async function startVault(opts: StartVaultOptions = {}): Promise<RunningV
 
     // Migrate tag schemas from vault.yaml → DB for each vault.
     // Only inserts schemas that don't already exist in the DB (safe across restarts).
-    for (const vaultName of listVaults()) {
-      try {
-        const vaultConfig = readVaultConfig(vaultName);
-        if (vaultConfig?.tag_schemas && Object.keys(vaultConfig.tag_schemas).length > 0) {
-          const store = getVaultStore(vaultName);
-          const existingTags = new Set((await store.listTagSchemas()).map((s) => s.tag));
-          let migrated = 0;
-          for (const [tag, schema] of Object.entries(vaultConfig.tag_schemas)) {
-            if (!existingTags.has(tag)) {
-              await store.upsertTagSchema(tag, schema);
-              migrated++;
-            }
-          }
-          if (migrated > 0) {
-            console.log(`[migration] migrated ${migrated} tag schema(s) from vault.yaml to DB for vault "${vaultName}"`);
-          } else {
-            console.log(`[migration] vault "${vaultName}" has tag_schemas in vault.yaml (already in DB — vault.yaml section can be removed)`);
-          }
-        }
-      } catch (err) {
-        if (!(err instanceof VaultImportPausedError)) throw err;
-        console.warn(`[history-import] vault "${vaultName}" is paused; skipping tag-schema migration`);
-      }
-    }
+    for (const vaultName of listVaults()) await migrateTagSchemasFor(vaultName);
 
     // Migrate existing API keys from config.yaml → per-vault token tables (idempotent)
     {
       const globalCfg = readGlobalConfig();
-      for (const vaultName of listVaults()) {
-        try {
-          const vc = readVaultConfig(vaultName);
-          if (!vc) continue;
-          const store = getVaultStore(vaultName);
-          const migrated = migrateVaultKeys(store.db, vc.api_keys, globalCfg.api_keys);
-          if (migrated > 0) {
-            console.log(`[tokens] migrated ${migrated} API key(s) into vault "${vaultName}"`);
-          }
-        } catch (err) {
-          console.error(`[tokens] migration error for vault "${vaultName}":`, err);
-        }
-      }
+      for (const vaultName of listVaults()) migrateKeysFor(vaultName, globalCfg);
     }
 
     // Load persisted runtime triggers for each vault and register them
@@ -549,18 +603,7 @@ export async function startVault(opts: StartVaultOptions = {}): Promise<RunningV
     // is isolated so one bad vault can't block the others.
     {
       let totalTriggers = 0;
-      for (const vaultName of listVaults()) {
-        try {
-          const store = getVaultStore(vaultName);
-          const n = loadVaultTriggers(vaultName, store);
-          totalTriggers += n;
-          if (n > 0) {
-            console.log(`[triggers] loaded ${n} runtime trigger(s) for vault "${vaultName}"`);
-          }
-        } catch (err) {
-          console.error(`[triggers] failed to load runtime triggers for vault "${vaultName}":`, err);
-        }
-      }
+      for (const vaultName of listVaults()) totalTriggers += loadTriggersFor(vaultName);
       if (totalTriggers === 0) {
         console.log("[triggers] no persisted runtime triggers");
       }
@@ -638,17 +681,17 @@ export async function startVault(opts: StartVaultOptions = {}): Promise<RunningV
       // server startup on slow initial exports — kick each off in the background.
       const vaults = listVaults();
       if (vaults.length === 0) {
-        console.log("[mirror] no vaults yet — managers stand up on next restart after a vault exists");
+        console.log("[mirror] no vaults yet — managers stand up when a vault is made");
       }
-      for (const name of vaults) {
+      startMirrorFor = (name) => {
         let cfg;
         try {
           cfg = readMirrorConfigForVault(name);
         } catch (err) {
           console.warn(`[mirror] could not read config for vault "${name}" (skipping): ${(err as Error).message ?? err}`);
-          continue;
+          return;
         }
-        if (!cfg?.enabled) continue; // unconfigured / disabled → no manager work
+        if (!cfg?.enabled) return; // unconfigured / disabled → no manager work
         try {
           const mgr = new MirrorManager(buildMirrorDeps(name));
           setMirrorManager(name, mgr);
@@ -667,8 +710,50 @@ export async function startVault(opts: StartVaultOptions = {}): Promise<RunningV
           // Isolated per-vault: one vault's failure never touches others.
           console.warn(`[mirror] vault "${name}" manager construction failed: ${(err as Error).message ?? err}`);
         }
-      }
+      };
+      for (const name of vaults) startMirrorFor(name);
     }
+
+    // Vaults made or deleted while this server runs (a person's `parachute-vault create`, the hub's POST and DELETE
+    // /vaults): the filesystem is the registry, so each is noticed on the next request that names a vault, or within
+    // a few seconds. A new vault gets what boot gave the others (its migrations, its triggers, its mirror); a deleted
+    // one lets go of its open database, triggers and mirror, so the same name made again starts empty. No restart.
+    // Each vault is known by its identity (its database file's device, inode and birth time), so a delete and a
+    // make again under one name between two looks is still seen: forget the old, then set up the new.
+    const known = new Map<string, string | null>(listVaults().map((n) => [n, vaultIdentity(n)]));
+    const syncVaults = (now: string[] = listVaults()): void => {
+      const present = new Set(now);
+      for (const name of [...known.keys()]) {
+        const id = present.has(name) ? vaultIdentity(name) : null;
+        if (present.has(name) && (id === null || known.get(name) === null || id === known.get(name))) {
+          if (known.get(name) === null && id !== null) known.set(name, id);
+          continue;
+        }
+        known.delete(name);
+        forgetVault(name, (n) => subscribeWs.closeVault(n));
+      }
+      for (const name of present) {
+        if (known.has(name)) continue;
+        known.set(name, vaultIdentity(name));
+        void bootNewVault(name, startMirrorFor, () => known.has(name));
+      }
+    };
+    // A store opened for a vault whose files were replaced (any door: root /mcp, a worker): forget the old vault's
+    // triggers, mirror and sockets before the new store is handed out, then set the new vault up.
+    setVaultReplacedHandler((name) => {
+      known.delete(name);
+      forgetVault(name, (n) => subscribeWs.closeVault(n));
+      known.set(name, null);
+      void Promise.resolve().then(() => {
+        if (!listVaults().includes(name)) { known.delete(name); return; }
+        known.set(name, vaultIdentity(name));
+        return bootNewVault(name, startMirrorFor, () => known.has(name));
+      });
+    });
+    undo.push(() => setVaultReplacedHandler(null));
+    const syncTimer = setInterval(() => syncVaults(), VAULT_SYNC_MS);
+    syncTimer.unref?.();
+    undo.push(() => clearInterval(syncTimer));
 
     // Live-query WebSocket binding (WS-hibernation migration Phase 3). Same
     // subscription contract as the SSE route, WebSocket transport. Handlers +
@@ -730,7 +815,9 @@ export async function startVault(opts: StartVaultOptions = {}): Promise<RunningV
 
         // Refuse before WS upgrade and before any route can open/maintain a paused DB.
         const vaultSegment = /^\/vault\/([^/]+)/.exec(path)?.[1];
-        if (vaultSegment && listVaults().includes(vaultSegment)) {
+        const vaultsNow = vaultSegment ? listVaults() : null;
+        if (vaultsNow) syncVaults(vaultsNow);
+        if (vaultSegment && vaultsNow!.includes(vaultSegment)) {
           try { assertVaultNotPaused(vaultSegment); }
           catch (err) {
             if (!(err instanceof VaultImportPausedError)) throw err;
