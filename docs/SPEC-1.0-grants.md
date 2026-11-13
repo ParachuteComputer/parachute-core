@@ -4,7 +4,8 @@ Uni, 2026-11-10 (T-448). The spec for 1.0's access model: who may do what in a v
 it ends. Nothing here is built. The contracts that hold it are in `contracts/suites/door-v1/` (§12).
 
 **Marks.** **[decided]** Aaron's decisions of 11-07 and 11-10, or a requirement the 0.9 spec already recorded for
-1.0. **[lean]** this spec's proposal, open until Aaron or Benjamin says otherwise. **[code]** read in code on core
+1.0. **[lean]** this spec's proposal, open until Aaron or Benjamin says otherwise. **[frozen, decision A]** fixed
+for good with decision A: a signed event is honoured for good, so these never change. **[code]** read in code on core
 `next` at `1af67d2d` or parachute-cloud `door/0.9` at `f2d1b8a`. Every name below is made up: Bo, Mara, Fernhill
 Bakery, the `recipes` vault.
 
@@ -42,7 +43,7 @@ Bakery, the `recipes` vault.
 
 | # | The question | Lean | Why it's yours |
 |---|---|---|---|
-| A | The five event numbers and their layout (§2.1): the meaning in canonical JSON content, the grant frame Uni's keys use too. The shell can't sign a grant until they are fixed, and a signed one is honoured for good. Freezing fixes: the numbers; §2.1's grant layout; the fields older vaults read forever (a grant's `at`, `honors`, `id`, `to`, `under`; a revoke's `v`, `honors`, `ends`); the minimal read; the 8 KB / 64 KB / 72 KB limits; the vector pin. A link's, a claim's and a vault record's contents stay [lean]. | 37440 grant, 7440 revoke, 37441 link, 37442 claim, 37443 the vault's own record. None is taken in the Nostr list today. Freeze after our own security rounds (Aaron, 11-12: no pass from Benjamin is needed). Round 8 (§D) ended NO-SHIP on the freeze wording; fixed, waiting on one fresh check. D and E are decided as leaned (Aaron, 11-13), as the pin answers them. | Permanent. |
+| A | The five event numbers and their layout (§2.1): the meaning in canonical JSON content, the grant frame Uni's keys use too. The shell can't sign a grant until they are fixed, and a signed one is honoured for good. Freezing fixes: the numbers; §2.1's grant layout; the fields older vaults read forever (a grant's `at`, `honors`, `id`, `to`, `under`; a revoke's `v`, `honors`, `ends`); the minimal read; the 8 KB / 64 KB / 72 KB limits; the vector pin. A link's, a claim's and a vault record's kind numbers freeze; their contents are strict and carry `v`, so a later layout is a new `v`, which an older vault refuses (§2.3 says the same of the record). | 37440 grant, 7440 revoke, 37441 link, 37442 claim, 37443 the vault's own record. None is taken in the Nostr list today. Freeze after our own security rounds (Aaron, 11-12: no pass from Benjamin is needed). Rounds 8 and 9 (§D) ended NO-SHIP on wording; fixed, round 10 is the check. D and E are decided as leaned (Aaron, 11-13), as the pin answers them. | Permanent. |
 | B | Can someone with only an email (most of Cloud today) share a vault? | Yes. With no key to sign, the door vouches for the grant, the list says so, and it doesn't carry to another door. | It makes "signed by the owner" untrue for those vaults, plainly marked. |
 | C | After a move, do your friends' grants work at the new door at once? | One tap, once: "bring these 5 grants over". Revokes apply at once with no tap. | A copy left at the old door would keep honouring them. The tap is you saying the old one is retired. |
 | F | The first shared vault lives where? | Parachute Cloud, once it has key sign-in (it rides 0.9.1's keys). | From the shell note; friends aren't on the tailnet. |
@@ -78,7 +79,7 @@ Bakery, the `recipes` vault.
 
 ## 2. The grant
 
-### 2.1 The event [decided: an addressable Nostr event, signed by the owner; the layout is this spec's lean, frozen by open decision A]
+### 2.1 The event [decided: an addressable Nostr event, signed by the owner; the layout frozen, decision A]
 
 **The meaning is in the content; the tags only address it.** A grant's content is one JSON object in one allowed
 spelling. Its two tags repeat two of its fields so relays and clients can address and expire it, and a vault
@@ -134,7 +135,7 @@ An applet grant's `to` is `{"kind": "applet", "id": "<applet id>", "author": "<a
 | `deny` | records carrying any of these tags, or a tag under one of them, are outside the grant, for every verb | optional; 1 to 16 `{"tag": …}`, sorted, different. Grant-wide, never on a row: grants only add, so a deny on one row would leave another row showing the record |
 | `under` | on a member-signed grant: the member's own grant it hangs from (§5.2) | required there, refused elsewhere; an id with no dot |
 | `until` | when it ends | unix seconds; equal to the `expiration` tag (NIP-40's, written as a decimal with no leading zero) |
-| `purpose` | the asker's words, shown last on the card | 1 to 200 code points; no control (U+0000–U+001F, U+007F–U+009F), no U+061C, U+200B–U+200F, U+2028–U+202E, U+2060–U+2069, U+FEFF, or the frame's fixed list of blanks. No check reads it |
+| `purpose` | the asker's words, shown last on the card | 1 to 200 code points; no control (U+0000–U+001F, U+007F–U+009F), no U+061C, U+200B–U+200F, U+2028–U+202E, U+2060–U+2069, U+FEFF, or the frame's fixed list of blanks and fillers: U+034F, U+115F, U+1160, U+17B4, U+17B5, U+180B–U+180F, U+2800, U+3164, U+FE00–U+FE0F, U+FFA0, U+FFFC, U+E0100–U+E01EF; nor a lone surrogate (U+D800–U+DFFF). A list of code points, not Unicode categories, so parties on different Unicode versions agree. No check reads it |
 
 The verbs are **`read`, `create`, `update`, `delete`** [decided]. `read`, `update` and `delete` may each sit in an
 own row: only records this grantee made [decided: own-records-only]. A type covers its subtypes as the vault defines
@@ -152,7 +153,7 @@ ASCII rule leave none); arrays of verbs, rows and denies are sorted as above. A 
 spelling of what it says is refused, so one meaning has one digest. Everything a check reads (ids, keys, types,
 tags, verbs) is printable ASCII; only `purpose` may be in any script. Type and tag names outside ASCII
 can't be granted or denied by name at 1.0 (§13). Test vectors for the spelling (accepted and refused, with
-their digests) are a precondition of the freeze (open decision A): they are run by the shell, the
+their digests) are the freeze's precondition (decision A): they are run by the shell, the
 minter and every door before the first signature. They are #systems' `vectors/frame-1.0.json` in the shell-keys
 core (branch `t335-frame-1.0`, at ba7a6bd794a1c0c26241a4fdac15aa1ebd6f4a14: 242 signed cases, sha256
 `2c1410eef289319f3aec2b4c72cd10cea79ed73c25117e43e256f0bab1bc659b`); its README section "The
@@ -179,7 +180,7 @@ itself in UTF-8 (never `\u`; line 1 leaves no other control). It is not NIP-01's
 leaves out `id` and `sig` and is 253 bytes shorter. A KB is
 1,024 bytes.
 
-Five kinds are reserved together [lean, open decision A]: `37440` grant, `7440` revoke (a regular event, never
+Five kinds are reserved together [frozen, decision A]: `37440` grant, `7440` revoke (a regular event, never
 replaced), `37441` link statement, `37442` link claim, and `37443` the vault's own record (§2.3). The grant frame's
 other carriers keep their own numbers beside these, outside this spec: `24335` an order (one key or one act,
 honoured once), `24337` a receipt, `37449` the owner's signed account lists. None appears in the kinds table of
@@ -274,7 +275,7 @@ that key is listed again: a key listed again signs anew, under new ids. The door
 ended, so a restore that tells the vault its owner keys again doesn't bring it back, and nothing filed at it later
 is in force.
 
-**The newest event at an address decides, whatever order events arrive in** [lean], except that events
+**The newest event at an address decides, whatever order events arrive in** [frozen, decision A, with the minimal read below], except that events
 disagreeing on `to` or `under` end the address in any order (line 6). Replacement plus refusal has
 one gap: a narrowing replacement that this vault refuses, for any reason (a field from a later version, `v: 2`, a
 size or date limit, a rule a later version relaxes), would leave the older, wider grant in force, and a rollback
@@ -377,7 +378,8 @@ On a tie the lower event id wins, as in §2.2 line 6. **Once an owner override n
 key signs counts again, whatever date it carries,** so a leaked key can't backdate its way back past the override.
 
 **Readers away from the vault** (the vault map at 1.1, a grantee's shell finding the vault) can't see the owner list
-the vault holds, so they don't learn that an owner key was removed. 1.0 freezes the record's kind and layout only;
+the vault holds, so they don't learn that an owner key was removed. 1.0 freezes the record's kind number only; its content is strict and carries `v`, so a later layout is a new
+`v`, which an older vault refuses (row A says the same of links and claims);
 how a reader away from the vault trusts an override (lean: only as served by the vault at the `lives` it already
 reached, with the owner list and its dates) is settled with the vault map. At 1.0 no reader routes by `lives`.
 
@@ -961,9 +963,9 @@ checked has such a name). The vault map that reads `lives` (§2.3) and signed re
   two-tag rule; a revoke's frozen fields and its scope by vault; suspension by an unreadable newer event; the size
   limits in bytes; the fixed `purpose` rule; the vault's own record, overrides, handovers and where its key lives.
   Weighed and reviewed in T-462 (three fresh reviewers, then one on this text: §D).
-- **This spec's own, all marked [lean]:** the kind numbers; revoke as its own final event; refusing
-  unknown tags; the vault id; `by signer | self | names`; `applet:<id>` as the via
-  stamp; `was`; the wire; door grants; the one-tap carry on a move.
+- **This spec's own, frozen with decision A:** the kind numbers; revoke as its own final event; refusing unknown
+  tags; `by signer | self | names` and `was` (inside `to`). **Still [lean]:** `applet:<id>` as the via stamp; the
+  wire; door grants; the one-tap carry on a move. The vault id is decided (H).
 - **Changed from the attribution note §2.9:** the note had an applet hold a named key (`key:applet.arcade`).
   Aaron's reply the same day was that in-shell applets write with his key or Uni's, so here an applet grant has no
   key and its stamp is `applet:<id>`. The note said a re-grant "may narrow"; here a replacement may also widen,
@@ -1094,3 +1096,9 @@ event is dropped for its date (§2.2); a grant whose signer left the carried own
 key as grantee is `grantee_has_grant` (line 7). Left: the stale [lean]/open marks on the frozen surface and row A's
 scope for 37443 (they change at the freeze); the `purpose` blank list written out in §2.1 (fails closed); one vector
 `why` text (#systems). **The round cap was 1, so these fixes are not reviewed again and decision A stays open.**
+
+**Round 10 (T-462, 11-13): to finish the freeze.** Closed first what round 9 left: the frozen surface is marked
+**[frozen, decision A]** instead of [lean] or open (§2.1, the five kinds, the newest-event rule with the minimal read,
+Appendix A); row A and §2.3 agree that the link, claim and vault-record kinds freeze while their strict, versioned
+contents change only by a new `v`; §2.1 writes out the `purpose` blank list (the shell-keys core's `_BLANKS` at
+ba7a6bd). Result of the fresh check: below.
