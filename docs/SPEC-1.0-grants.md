@@ -5,7 +5,8 @@ it ends. Nothing here is built. The contracts that hold it are in `contracts/sui
 
 **Marks.** **[decided]** Aaron's decisions of 11-07 and 11-10, or a requirement the 0.9 spec already recorded for
 1.0. **[lean]** this spec's proposal, open until Aaron or Benjamin says otherwise. **[frozen, decision A]** fixed
-for good with decision A: a signed event is honoured for good, so these never change. **[code]** read in code on core
+for good with decision A (decided 11-13): what a v1 vault answers, and what every later version still reads, never
+changes; a later `v` adds only as §2.1's pin paragraph allows. **[code]** read in code on core
 `next` at `1af67d2d` or parachute-cloud `door/0.9` at `f2d1b8a`. Every name below is made up: Bo, Mara, Fernhill
 Bakery, the `recipes` vault.
 
@@ -43,11 +44,20 @@ Bakery, the `recipes` vault.
 
 | # | The question | Lean | Why it's yours |
 |---|---|---|---|
-| A | The five event numbers and their layout (§2.1): the meaning in canonical JSON content, the grant frame Uni's keys use too. The shell can't sign a grant until they are fixed, and a signed one is honoured for good. Freezing fixes: the numbers; §2.1's grant layout; the fields older vaults read forever (a grant's `at`, `honors`, `id`, `to`, `under`; a revoke's `v`, `honors`, `ends`); the minimal read; the 8 KB / 64 KB / 72 KB limits; the vector pin. A link's, a claim's and a vault record's kind numbers freeze; their contents are strict and carry `v`, so a later layout is a new `v`, which an older vault refuses (§2.3 says the same of the record). | 37440 grant, 7440 revoke, 37441 link, 37442 claim, 37443 the vault's own record. None is taken in the Nostr list today. Freeze after our own security rounds (Aaron, 11-12: no pass from Benjamin is needed). Rounds 8 and 9 (§D) ended NO-SHIP on wording; fixed, round 10 is the check. D and E are decided as leaned (Aaron, 11-13), as the pin answers them. | Permanent. |
 | B | Can someone with only an email (most of Cloud today) share a vault? | Yes. With no key to sign, the door vouches for the grant, the list says so, and it doesn't carry to another door. | It makes "signed by the owner" untrue for those vaults, plainly marked. |
 | C | After a move, do your friends' grants work at the new door at once? | One tap, once: "bring these 5 grants over". Revokes apply at once with no tap. | A copy left at the old door would keep honouring them. The tap is you saying the old one is retired. |
 | F | The first shared vault lives where? | Parachute Cloud, once it has key sign-in (it rides 0.9.1's keys). | From the shell note; friends aren't on the tailnet. |
 | G | The sharing contract already in core (`v1/sharing.test.ts`) describes a different model: levels (view, comment, suggest, edit, manage), groups, links for anyone, pages. Does this spec replace it for 1.0? | Yes. 1.0 is keys, types and verbs. Groups, public links, page-level sharing and comment or suggest levels wait for 1.1. | It changes what an existing contract means, which is yours or Benjamin's call. |
+
+**Decided 11-13: A, the freeze.** Fixed for good: the five event numbers (37440 grant, 7440 revoke, 37441 link, 37442
+claim, 37443 the vault's own record); §2.1's grant layout (the meaning in canonical JSON content, the grant frame
+Uni's keys use too); the fields older vaults read forever (a grant's `at`, `honors`, `id`, `to`, `under`; a revoke's
+`v`, `honors`, `ends`); the minimal read; the 8 KB / 64 KB / 72 KB limits; and the vector pin (§2.1). A link's, a
+claim's and a vault record's kind numbers freeze; their contents are strict and carry `v`, so a later layout is a new
+`v`. A signed grant is honoured for good, which is why these can't change. Closed by our own security rounds, not
+Benjamin's (Appendix D, rounds 1 to 10; round 10's last fresh check said SHIP). Aaron, 11-12: "I don't think we need
+a security pass from Benjamin. We're discussing some high level parachute ideas with him but we should probably be
+good to go on that work." Aaron, 11-13, on D and E: "Both as leaned".
 
 **Decided 11-13 (Aaron: "Both as leaned")**
 
@@ -158,7 +168,7 @@ minter and every door before the first signature. They are #systems' `vectors/fr
 core (branch `t335-frame-1.0`, at ba7a6bd794a1c0c26241a4fdac15aa1ebd6f4a14: 242 signed cases, sha256
 `2c1410eef289319f3aec2b4c72cd10cea79ed73c25117e43e256f0bab1bc659b`); its README section "The
 vectors, for a vault" says how a vault replays it. A door pins a commit and the file's sha256 when it takes it.
-This pin carries round 7's four answers, so the vector precondition is met. When decision A freezes the pin, the
+This pin carries round 7's four answers, so the vector precondition is met. Decision A froze the pin [frozen, decision A]: the
 file never changes: every door, minter and shell replays it, at this commit and sha256, before it files or signs.
 Its answers are a v1 vault's. A later version may answer a case differently only where this spec lets it: by filing an
 event v1 held (the address was suspended at v1, so no older grant returns), or by taking a revoke v1 refused for its
@@ -194,7 +204,7 @@ A vault files a grant only if every line holds. It checks again on every request
 the reason. The lines are checked in this order and the first that fails names the refusal.
 
 Every statement passes line 1, is no more than ten minutes ahead of the vault's clock when it arrives on the wire
-(a revoke from the door's copy or an import is filed whatever its date, §3; at a bulk filing no other event is
+(a revoke from the door's copy or an import is filed whatever its date, §3; at a bulk filing no grant is
 dropped for its date either: one dated ahead is held and suspends its address), and names this vault. What else each kind must carry:
 
 | Kind | Tags | Content | Names this vault by | Spelling |
@@ -306,7 +316,7 @@ filed, it is, and the address is in force under it. Nothing else brings a held e
 owner meant to stay refused never arrives on its own. Otherwise the address comes back only with a newer event the
 vault files. A member's held events count toward their cap of 20 (§5.2). A vault reads an event of up to 64 KB (as sent, §2.1) for
 the minimal read, and a door accepts a request body of up to 72 KB; a shell never signs a grant
-over 8 KB. Those three numbers are frozen for every later version, so a narrowing can't be lost to its size.
+over 8 KB. Those three numbers are frozen for every later version [frozen, decision A], so a narrowing can't be lost to its size.
 
 A signed event the owner handed out can be filed by whoever holds it until its date, as §3 says of a grant never
 filed. That holds for a newer replacement too, wider or narrower: to take back one that was handed over and not
@@ -442,7 +452,7 @@ the key minter; this spec owns the vault's fields and vocabulary.
   other form, `name:<prefix>:<name>`, the owner's void of a linked name (§6.2). None of an id, a prefix or a name
   holds a colon, so `ends` parses one way. (The grant frame's minter also reads a third form, a bare event id that
   ends an order; a vault refuses it.)
-- **A revoke always reaches an older vault.** A revoke's `v`, `honors` and `ends` keep their names and spellings in
+- **A revoke always reaches an older vault** [frozen, decision A]. A revoke's `v`, `honors` and `ends` keep their names and spellings in
   every later version. A vault acts on a validly signed 7440 whose `honors` is itself and whose `ends` parses, from
   a key with standing for that address, even if the rest of its content is unknown, `v` is higher, it carries
   tags (lists of strings, line 1), or it isn't in canonical spelling: a revoke only closes, so it must never fail open because a vault is older
@@ -958,9 +968,10 @@ checked has such a name). The vault map that reads `lives` (§2.3) and signed re
 - **Decided 11-12 (Aaron):** a vault's id is its own Nostr key (open decision H, as §2.3 specifies it).
 - **Decided 11-13 (Aaron, "Both as leaned"):** D, a grant lasts at most a year; E, a member signs for their own
   agents, which never reach past the member.
-- **Decided 11-12 (Aaron): decision A waits on our own security rounds, not Benjamin's.** "I don't think we need a
-  security pass from Benjamin. We're discussing some high level parachute ideas with him but we should probably be
-  good to go on that work."
+- **Decided 11-13 (decision A, the freeze):** the five kind numbers, the §2.1 layout, the frozen reads, the size
+  limits and the vector pin, fixed for good after our own security rounds (§D, round 10). Aaron, 11-12: "I don't
+  think we need a security pass from Benjamin. We're discussing some high level parachute ideas with him but we
+  should probably be good to go on that work."
 - **From T-462, 11-12:** the content layout: the grant frame of Uni's keys work (`v at honors gives to allow until
   purpose`, one canonical spelling) with this spec's vault fields (`to.by`, `to.was`, `deny`, `under`, `id`); the
   two-tag rule; a revoke's frozen fields and its scope by vault; suspension by an unreadable newer event; the size
@@ -1021,7 +1032,7 @@ written into this file and reviewed here:
 | A fresh Fable check of those fixes only | **SHIP WITH FIXES**: 4 closed, 6 partly, 6 new | Line 6 still depended on order; held events dropped at import; a refused grant could come into force on its own; held events uncounted; an earlier key after a move; unfiled replacements. All fixed (§2.2 line 6 and bulk filing oldest first, holding against the carried owner list, re-judging only on upgrade or re-file, the member cap, §2.3 step 1, the take-back sentence). |
 
 The second pass's fixes were made after it and have not been reviewed again. Not a freeze yet: the spelling
-vectors were missing then (round 6 names them, §2.1, still short of the precondition), and decision A waits on
+vectors were missing then (round 6 names them, §2.1, still short of the precondition), and decision A waited on
 our own security rounds (round 8 below; not Benjamin's, by Aaron's word of 11-12).
 
 **Round 5 (T-462, 11-12).** A fresh adversarial Fable reviewer, on the round-4 check's fixes only: **SHIP WITH
@@ -1113,4 +1124,15 @@ round 9's bar, fixed, with five text points: line 6 now gives the pin's whole or
 member rules `under`, `to.by`, `was`, then the start rule); a later version may also refuse what v1 filed (held,
 suspends); §9 ends an address, not a grant, when a signer left the owner list; a dotted member id names its refusal;
 the spelling `applet:<id>` is frozen. Left for a later `v`: a v2 vault record has no hold rule (only its kind
-freezes). Second fresh check: below.
+freezes). Second fresh check: a fresh adversarial Fable reviewer, not used before, on 48ec9254..ff423264: **SHIP**, no
+contradiction with any pinned refusal word. It walked every pinned member, `under`, start-rule and split case
+through line 6's order and matched the reference code; the `purpose` list equals `PURPOSE_BAD` (2,407 code points).
+Five non-blocking: the Marks definition was wider than what freezes, and three frozen items lacked the mark (both
+fixed in the freeze commit); "no other event" at a bulk filing now says "no grant". Left for a later `v`, before
+1.0 is built: a newer link, claim or vault record a vault can't read should be held and end what is older at its
+address (today a v2 override is refused by a v1 vault, so an older override still counts; the vault key authorises
+nothing, so it opens no record). Recorded so a door follows the spec, not the Python: with two faults in one event
+the reference code can name a different refusal (a line-8 fault before `grantee_has_grant`; a member's bad start
+before an unknown verb); no pinned case has two faults, and whether the event is held is the same.
+
+**Decision A is decided (11-13): frozen for good.**
