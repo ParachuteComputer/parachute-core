@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,6 +14,11 @@ import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { recordTokenMint, revokeTokenByJti } from "../jwt-sign.ts";
 import { writePid } from "../process-state.ts";
 import { createUser, upsertUserVault } from "../users.ts";
+
+// doctor reads PORT (the hub port serve uses); a PORT exported in the shell must not change these tests.
+const SAVED_PORT = process.env.PORT;
+beforeAll(() => { delete process.env.PORT; });
+afterAll(() => { if (SAVED_PORT !== undefined) process.env.PORT = SAVED_PORT; });
 
 /**
  * Doctor tests. The headline is the fresh-install-green guard (#717): a
