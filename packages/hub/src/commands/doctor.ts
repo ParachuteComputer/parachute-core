@@ -515,7 +515,8 @@ function resolveDeps(d: DoctorDeps | undefined): ResolvedDeps {
  * (parachute.yaml's server.port is copied there before any hub command runs, 0.9.3); then the default.
  */
 function doctorHubPort(configDir: string): number {
-  const envPort = Number.parseInt(process.env.PORT ?? "", 10);
+  const raw = process.env.PORT ?? "";
+  const envPort = /^\d+$/.test(raw) ? Number(raw) : NaN;
   return readHubPort(configDir) ?? (envPort > 0 && envPort <= 65535 ? envPort : HUB_UNIT_DEFAULT_PORT);
 }
 

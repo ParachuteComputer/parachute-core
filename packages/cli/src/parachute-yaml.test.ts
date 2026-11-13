@@ -103,6 +103,15 @@ describe("set and unset edit the text and keep the rest", () => {
     expect(settingsOf(parse(out)).get("server.accepted_issuers")).toHaveLength(2);
   });
 
+  test("a new child goes at the indent of the parent's first real child, past blank lines and column-0 comments", () => {
+    for (const between of ["\n", "# port: 1939\n", "\n# a note\n\n"]) {
+      const t = setInText(`server:\n${between}  port: 47000\n`, "server.origin", "http://127.0.0.1:47000");
+      const m = settingsOf(parse(t));
+      expect(m.get("server.origin")).toBe("http://127.0.0.1:47000");
+      expect(m.get("server.port")).toBe("47000");
+    }
+  });
+
   test("set adds missing keys under the right parent, or at the end", () => {
     let t = setInText("# only a comment\n", "server.bind", "0.0.0.0");
     expect(t).toBe("# only a comment\nserver:\n  bind: 0.0.0.0\n");

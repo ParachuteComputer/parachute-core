@@ -245,6 +245,11 @@ describe("doctor — failure modes (each detected in isolation; others stay gree
       expect(probed[0]).toBe(47311);
       expect(byName(checks, "hub-reachable")?.status).toBe("pass");
       expect(byName(checks, "hub-reachable")?.title).toContain(":47311");
+      // A PORT that isn't a plain number isn't a port serve would take: doctor stays on the default.
+      process.env.PORT = "47311abc";
+      const probed2: number[] = [];
+      await runDoctor(h, healthyDeps({ probeHubHealth: async (port: number) => { probed2.push(port); return true; } }));
+      expect(probed2[0]).toBe(1939);
     } finally {
       if (saved === undefined) delete process.env.PORT; else process.env.PORT = saved;
       h.cleanup();

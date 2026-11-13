@@ -375,8 +375,14 @@ export function setInText(text: string, key: string, value: string | string[]): 
     if (!anc) continue;
     if (!anc.frame || p.values.has(segs.slice(0, k).join(".")))
       throw new SettingsError(`${FILE_NAME}: line ${anc.start + 1}: "${segs.slice(0, k).join(".")}" already has a value, so "${key}" cannot go under it`, anc.start + 1);
-    const first = lines[anc.start + 1];
-    const childIndent = anc.end > anc.start + 1 && first ? /^ */.exec(first)![0].length : anc.indent + 2;
+    // The parent's children's indent: from its first child line, skipping blank lines and comments (a column-0 comment
+    // or a blank line under `server:` says nothing about where children go).
+    let first: string | undefined;
+    for (let j = anc.start + 1; j < anc.end; j++) {
+      const t = lines[j]!.trim();
+      if (t !== "" && !t.startsWith("#")) { first = lines[j]; break; }
+    }
+    const childIndent = first ? /^ */.exec(first)![0].length : anc.indent + 2;
     lines.splice(anc.end, 0, ...entryLines(segs.slice(k), value, childIndent));
     return `${lines.join("\n")}\n`;
   }
