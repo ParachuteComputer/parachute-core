@@ -8,7 +8,8 @@
 //                                                        repo's CI: it runs its own door and needs no box)
 //   bun run doors -- --doors box --embeddings suites/v093  the box with meaning search on (the bundled model)
 //   bun run doors:keep box-0.8                           keep the last run's fingerprint as the golden one
-//   bun run doors -- --remote <door.json>                a deployed door, from a door file written by hand; no
+//   bun run doors -- --remote <door.json>                a deployed door, from a door file written by hand (or by
+//                                                        harness/doors/remote-cloud.ts for a staging cloud); no
 //                                                        sandbox (it needs the network), DOOR_REMOTE_HOSTS names it
 //
 //   CANDIDATE_DIR=<dir>     the box: a built candidate (default .cache/candidate-core, from `bun run build:core`)
@@ -216,8 +217,11 @@ async function startPersonal(): Promise<Started> {
  * account door and removes them at the end. DOOR_REMOTE_HOSTS must name the door's hosts (suites/door/_door.ts).
  */
 async function startRemote(): Promise<Started> {
-  const d = JSON.parse(readFileSync(remoteFile!, "utf8")) as Door;
-  if (d.signIn?.how !== "nostr" || !d.signIn.secretKeyFile) throw new Error("door: a remote door file signs in with a key file: signIn {how: \"nostr\", secretKeyFile}");
+  const d = JSON.parse(readFileSync(remoteFile!, "utf8")) as Door & { signIn: { how: string; secretKeyFile?: string; cookieFile?: string }; ownerKeyFile?: string };
+  const byCookie = d.signIn?.how === "cookie" && !!d.signIn.cookieFile;
+  if (!byCookie && (d.signIn?.how !== "nostr" || !d.signIn.secretKeyFile)) {
+    throw new Error('door: a remote door file signs in with a key file (signIn {how: "nostr", secretKeyFile}) or a session file (signIn {how: "cookie", cookieFile})');
+  }
   const { allowOrigins } = await import("../guard.ts");
   for (const url of [d.issuer, d.vaultOrigin]) {
     const host = new URL(url).hostname;
@@ -225,17 +229,23 @@ async function startRemote(): Promise<Started> {
     if (!(process.env.DOOR_REMOTE_HOSTS ?? "").split(",").map((h) => h.trim()).includes(host)) throw new Error(`refused: name ${host} in DOOR_REMOTE_HOSTS to run against it`);
   }
   allowOrigins(d.issuer, d.vaultOrigin);
-  const secretKey = readFileSync(d.signIn.secretKeyFile, "utf8").trim();
+  // A session file (a cloud door's browser sign-in, for the approval contracts) holds {cookie, csrf}; its owner key, if
+  // any, is in ownerKeyFile. Neither is ever written into a door file or a result.
+  const session = byCookie ? (JSON.parse(readFileSync(d.signIn.cookieFile!, "utf8")) as { cookie: string; csrf: string }) : null;
+  const secretKey = byCookie ? null : readFileSync(d.signIn.secretKeyFile!, "utf8").trim();
+  const ownerKey = d.ownerKeyFile ? readFileSync(d.ownerKeyFile, "utf8").trim() : (secretKey ?? undefined);
+  const bearerNow = () => (session ? accountBearer(d.issuer, session) : accountBearerByKey(d.issuer, secretKey!));
   const id = randomBytes(3).toString("hex");
   const [vault, other] = [`doorrun${id}`, `doorother${id}`];
-  const bearer = await accountBearerByKey(d.issuer, secretKey);
+  const bearer = await bearerNow();
   await ensureVault(d.issuer, bearer, vault);
   await ensureVault(d.issuer, bearer, other);
+  const { ownerKeyFile: _k, ...door } = d;
   return {
-    door: { ...d, vault, otherVault: other },
+    door: { ...door, vault, otherVault: other, ...(session ? { signIn: { how: "cookie" as const, ...session } } : {}), ...(ownerKey ? { ownerKey } : {}) } as Door,
     provenance: `remote: ${d.label} at ${new URL(d.issuer).host} and ${new URL(d.vaultOrigin).host}`,
     stop: async () => {
-      const b = await accountBearerByKey(d.issuer, secretKey);
+      const b = await bearerNow();
       for (const name of [vault, other]) {
         await safeFetch(`${d.issuer}/account/vaults/${name}`, { method: "DELETE", headers: { authorization: `Bearer ${b}`, "content-type": "application/json" }, body: JSON.stringify({ confirm: name }) }).catch(() => {});
       }
