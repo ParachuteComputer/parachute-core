@@ -212,9 +212,11 @@ async function startPersonal(): Promise<Started> {
 }
 
 /**
- * A deployed door, from a door file written by hand: kind, label, release, issuer, vaultOrigin, and a sign-in whose
- * key is in a file (`signIn: {how: "nostr", secretKeyFile}`). The run makes its own two vaults there through the
- * account door and removes them at the end. DOOR_REMOTE_HOSTS must name the door's hosts (suites/door/_door.ts).
+ * A deployed door, from a door file written by hand (or by remote-cloud.ts): kind, label, release, issuer,
+ * vaultOrigin, and a sign-in kept in a file, a key (`signIn: {how: "nostr", secretKeyFile}`) or a browser session
+ * (`signIn: {how: "cookie", cookieFile}`, with the owner key in `ownerKeyFile`). Use absolute paths: the suite reads
+ * them again from its own folder (suites/door/_door.ts). The run makes its own two vaults there through the account
+ * door and removes them at the end. DOOR_REMOTE_HOSTS must name the door's hosts.
  */
 async function startRemote(): Promise<Started> {
   const d = JSON.parse(readFileSync(remoteFile!, "utf8")) as Door & { signIn: { how: string; secretKeyFile?: string; cookieFile?: string }; ownerKeyFile?: string };
