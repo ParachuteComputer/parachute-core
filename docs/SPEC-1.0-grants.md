@@ -51,8 +51,9 @@ Bakery, the `recipes` vault.
 
 **Decided 11-13: A, the freeze.** Fixed for good: the five event numbers (37440 grant, 7440 revoke, 37441 link, 37442
 claim, 37443 the vault's own record); §2.1's grant layout (the meaning in canonical JSON content, the grant frame
-Uni's keys use too); the fields older vaults read forever (a grant's `at`, `honors`, `id`, `to`, `under`; a revoke's
-`v`, `honors`, `ends`); the minimal read; the 8 KB / 64 KB / 72 KB limits; and the vector pin (§2.1). A link's, a
+Uni's keys use too, with `to`'s fields `by` and `was` and the spelling `applet:<id>`, and the refusal of an unknown
+field or tag); a revoke as its own final event; the fields older vaults read forever (a grant's `at`, `honors`,
+`id`, `to`, `under`; a revoke's `v`, `honors`, `ends`); the newest-event rule with its minimal read (§2.2); the 8 KB / 64 KB / 72 KB limits; and the vector pin (§2.1). A link's, a
 claim's and a vault record's kind numbers freeze; their contents are strict and carry `v`, so a later layout is a new
 `v`. A signed grant is honoured for good, which is why these can't change. Closed by our own security rounds, not
 Benjamin's (Appendix D, rounds 1 to 10; round 10's last fresh check said SHIP). Aaron, 11-12: "I don't think we need
@@ -392,7 +393,7 @@ key signs counts again, whatever date it carries,** so a leaked key can't backda
 
 **Readers away from the vault** (the vault map at 1.1, a grantee's shell finding the vault) can't see the owner list
 the vault holds, so they don't learn that an owner key was removed. 1.0 freezes the record's kind number only; its content is strict and carries `v`, so a later layout is a new
-`v`, which an older vault refuses (row A says the same of links and claims);
+`v`, which an older vault refuses (the decision A block on the first page says the same of links and claims);
 how a reader away from the vault trusts an override (lean: only as served by the vault at the `lives` it already
 reached, with the owner list and its dates) is settled with the vault map. At 1.0 no reader routes by `lives`.
 
@@ -1114,7 +1115,7 @@ scope for 37443 (they change at the freeze); the `purpose` blank list written ou
 
 **Round 10 (T-462, 11-13): to finish the freeze.** Closed first what round 9 left: the frozen surface is marked
 **[frozen, decision A]** instead of [lean] or open (§2.1, the five kinds, the newest-event rule with the minimal read,
-Appendix A); row A and §2.3 agree that the link, claim and vault-record kinds freeze while their strict, versioned
+Appendix A); row A (now the decision A block) and §2.3 agree that the link, claim and vault-record kinds freeze while their strict, versioned
 contents change only by a new `v`; §2.1 writes out the `purpose` blank list (the shell-keys core's `_BLANKS` at
 ba7a6bd). A fresh adversarial Fable reviewer, not used before, on 48ec9254..508f6807 (pin sha256 checked; the blank
 list diffed against `PURPOSE_BAD`: equal): **SHIP**, with one point it called non-blocking but of round 9's class:
