@@ -159,9 +159,9 @@ core (branch `t335-frame-1.0`, at ba7a6bd794a1c0c26241a4fdac15aa1ebd6f4a14: 242 
 vectors, for a vault" says how a vault replays it. A door pins a commit and the file's sha256 when it takes it.
 This pin carries round 7's four answers, so the vector precondition is met. When decision A freezes the pin, the
 file never changes: every door, minter and shell replays it, at this commit and sha256, before it files or signs.
-Its answers are a v1 vault's. A later version may answer a case differently only where this spec lets it, and only
-by closing (a `v` or a field it has learned to read; the ten-minute bound on a revoke), and says so in a vector
-file of its own. The pin answers decisions D (a grant may run 366 days) and E (a member signs for their own
+Its answers are a v1 vault's. A later version may answer a case differently only where this spec lets it: by filing an
+event v1 held (the address was suspended at v1, so no older grant returns), or by taking a revoke v1 refused for its
+date. It never ignores a revoke or a `to`/`under` split that v1 acts on, and says so in a vector file of its own. The pin answers decisions D (a grant may run 366 days) and E (a member signs for their own
 agents) as Aaron decided them on 11-13, so nothing is re-pinned.
 
 **The split mark fails closed.** When a door sees an older event that disagrees on `to` or `under`, it records
@@ -192,7 +192,8 @@ A vault files a grant only if every line holds. It checks again on every request
 the reason. The lines are checked in this order and the first that fails names the refusal.
 
 Every statement passes line 1, is no more than ten minutes ahead of the vault's clock when it arrives on the wire
-(a revoke from the door's copy or an import is filed whatever its date, §3), and names this vault. What else each kind must carry:
+(a revoke from the door's copy or an import is filed whatever its date, §3; at a bulk filing no other event is
+dropped for its date either: one dated ahead is held and suspends its address), and names this vault. What else each kind must carry:
 
 | Kind | Tags | Content | Names this vault by | Spelling |
 |---|---|---|---|---|
@@ -230,7 +231,10 @@ Every statement passes line 1, is no more than ten minutes ahead of the vault's 
    shared with door grants (§7.3), and an id is never reused: an `id` that was **ever** on file under another
    signer or for another grantee is taken, ended or not, because `grant:<id>` stays on what it wrote. A member's
    own grant (`by self`) has an id with no dot. A member's agents' ids start with that id and a dot (`bo.claude`),
-   and nobody else may use that start, so a member can't take an id the owner will want. If an event with this
+   and nobody else may use that start, so a member can't take an id the owner will want (`id_taken`). For a
+   member-signed grant, line 8's rule for `under` is checked before this start rule: a missing `under`, or one that
+   isn't the signer's own grant, is `invalid_statement` whatever the id; with the right `under`, an id that doesn't
+   start with it and a dot is `id_taken`. If an event with this
    address is on file, this one is newer by `created_at` (on a tie the lower event id wins, as in NIP-01, so two
    copies always merge to the same answer), it is signed by the same key, and its `to` and `under` are
    byte-identical to every event at that address the vault has seen that passes what holding needs (below), whatever
@@ -256,7 +260,7 @@ Every statement passes line 1, is no more than ten minutes ahead of the vault's 
    and a signer's applet id likewise.
    A second is refused until the first has ended. So a token never has two grants to choose between. An owner-signed
    grant for a key ends a member-signed one that key holds, so a member can't block the owner. A grantee is
-   never one of the vault's owner keys, nor the vault's id or any key that has signed for the vault (refused as `invalid_statement`). To a member, a refusal about the grantee's key
+   never one of the vault's owner keys (`grantee_has_grant`), nor the vault's id or any key that has signed for the vault (`invalid_statement`). To a member, a refusal about the grantee's key
    reads the same as `exceeds_grantor`, so a member can't use filing to learn which keys hold grants.
 8. **It is coherent:** `update` or `delete` on a type comes with a `read` row on that type, own or not. An applet
    grant's `to.by` is `signer`, and it doesn't name `*`. `was` only on an owner-signed grant; `under` only, and always, on a member-signed one, and it names the
@@ -828,7 +832,7 @@ things under `.parachute/`: stamps, history and links. 1.0 adds statements to th
 | The owner-key list and each prefix's service keys, with dates | for reading history only: so an old statement can still be checked. A carried key has no standing at the new door |
 | **Revokes** | **in force at once.** Carrying a revoke can only close. A carried revoke is judged against the carried owner-key list and its dates: if its signer had standing for that address when it was signed, it applies, though that key has no standing at the new door. The arriving door files the carried grants (as `carried`) before it judges the carried revokes, so a grantee's own giving-up and an early revoke find their address |
 | **Links and claims** | **in force at once.** They open nothing. |
-| **Signed grants still within their date** | **`carried`, not in force,** until the owner brings them over: one confirmation for the whole import, no new grant signed [lean, open decision C]; the same tap signs the vault's new-key override (§2.3). Only grants whose signer is an owner key *at the new door* can come into force; the rest are `ended` |
+| **Signed grants still within their date** | **`carried`, not in force,** until the owner brings them over: one confirmation for the whole import, no new grant signed [lean, open decision C]; the same tap signs the vault's new-key override (§2.3). Only grants whose signer is an owner key *at the new door* can come into force; the rest are `ended`. A grant whose signer left the carried owner-key list at any time after it was signed arrives `ended` |
 | **A signed grant that turns up later** | At a vault that arrived by import, every signed grant dated before the arrival is filed as `carried`, whoever files it and whenever, whatever copy the door kept from an earlier stay. At a vault restored in place, the same holds for a signed grant the door's current copy doesn't hold as in force. Only the owner's confirmation brings a carried grant into force. So a grantee can't walk an old grant past the tap |
 | Door grants (OAuth apps, named keys, an email-only owner's grants) | history only. Each is made again at the new door. |
 | Tokens, keys, sessions | never |
@@ -1072,8 +1076,7 @@ rounds.
   now spares a carried revoke, and an export marks which statements the vault had filed (line 6, §9). **These
   fixes are not reviewed again: the cap was reached, so decision A stays open.**
 
-Left open, owner #parachute unless named: one fresh check of round 8b's fixes, then the freeze; Aaron's call on D
-and E, which the pin answers as their leans; the door's copy is kept by vault id alone and nothing proves an import
+Left open, owner #parachute unless named: the door's copy is kept by vault id alone and nothing proves an import
 is a move, so an import claiming another account's vault id must be refused and a copy filed only into the vault it
 came from (before Cloud builds); a member's storage per address (keep the newest filed, the newest held and one
 disagreeing event); a member still learns that a key holds a grant from `exceeds_grantor` (§11's limit); a carried
@@ -1081,4 +1084,13 @@ revoke's date is the signer's own word (it only closes); the vectors README's "a
 revoke and one `why` text are stale (owner: #systems).
 
 **Round 9 (T-462, 11-13).** Aaron, 11-13, on D and E: "Both as leaned". Both are marked decided; the pinned vectors
-already answer them that way, so nothing is re-pinned. Result of the fresh check: below.
+already answer them that way, so nothing is re-pinned. A fresh adversarial Fable reviewer, not used before, read
+17250d8e, 30ba57de and 71cff07e against the whole spec and the pin (sha256 checked): **NO-SHIP**, 1 blocking. The
+spec's line order named `id_taken` where the pin names `invalid_statement` for a member's grant under someone else's
+grant, so a door built to the spec would fail the pinned replay. It said: "The fix is one spec sentence with no
+re-pin; with it applied I would say SHIP." Fixed in line 6 (a member-signed grant's `under` is checked before the id's
+start). Also taken: the pin's permanence sentence names what a later version may file (§2.1); at a bulk filing no
+event is dropped for its date (§2.2); a grant whose signer left the carried owner list arrives `ended` (§9); an owner
+key as grantee is `grantee_has_grant` (line 7). Left: the stale [lean]/open marks on the frozen surface and row A's
+scope for 37443 (they change at the freeze); the `purpose` blank list written out in §2.1 (fails closed); one vector
+`why` text (#systems). **The round cap was 1, so these fixes are not reviewed again and decision A stays open.**
