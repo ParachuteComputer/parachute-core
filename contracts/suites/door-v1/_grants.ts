@@ -19,8 +19,33 @@ export const LANE = "1.0-grants";
  */
 export const NO_GRANTS = /no grants at this door: POST \S+\/statements answered 40[45]/;
 
-/** The four event kinds the spec reserves (§2.1). A signature covers the kind, so these are fixed with the spec. */
-export const KIND = { grant: 37440, revoke: 7440, link: 37441, confirm: 37442 } as const;
+/** The five event kinds the spec reserves (§2.1). A signature covers the kind, so these are fixed with the spec. */
+export const KIND = { grant: 37440, revoke: 7440, link: 37441, confirm: 37442, vaultRecord: 37443 } as const;
+
+/**
+ * The one spelling (§2.1): ASCII keys sorted byte by byte, no whitespace, whole numbers 0 to 2^53-1 as plain
+ * digits, strings escaping only `"` and `\\`. Every statement's content is this spelling of a JSON object; a vault
+ * refuses any other. An object field that is `undefined` is left out; anything the spelling can't hold throws.
+ */
+export function canonical(x: unknown): string {
+  if (Array.isArray(x)) return `[${Array.from(x, (v) => (v === undefined ? bad("an undefined array item") : canonical(v))).join(",")}]`;
+  if (x !== null && typeof x === "object") {
+    const keys = Object.keys(x as object).filter((k) => (x as any)[k] !== undefined);
+    for (const k of keys) if (!/^[\x20-\x7e]+$/.test(k)) bad(`a key that isn't printable ASCII: ${JSON.stringify(k)}`);
+    keys.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)); // ASCII: code unit order is byte order
+    return `{${keys.map((k) => `${canonical(k)}:${canonical((x as any)[k])}`).join(",")}}`;
+  }
+  if (typeof x === "number") return Number.isSafeInteger(x) && x >= 0 && !Object.is(x, -0) ? String(x) : bad(`a number that isn't whole and 0 to 2^53-1: ${x}`);
+  if (typeof x === "string") {
+    if (/[\u0000-\u001f\u007f]/.test(x) || !x.isWellFormed()) bad("a string with a control character or a lone surrogate");
+    return `"${x.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+  }
+  if (typeof x === "boolean") return String(x);
+  return bad(`a value the spelling can't hold: ${String(x)}`);
+}
+function bad(what: string): never {
+  throw new Error(`canonical: ${what}`);
+}
 
 // ── Keys and events ─────────────────────────────────────────────────────────────────────────────────────────
 
@@ -66,12 +91,13 @@ export async function sign(key: Key, e: { kind: number; tags: string[][]; conten
 }
 
 /**
- * The vault's own id (§2.3), which a grant names. Today's vaults have none, so this falls back to a fixed
- * placeholder and each contract goes on to its own assertion; `grant.test.ts` holds "a vault says its own id".
+ * The vault's own id (§2.3): its own public key, 64 lowercase hex, which a grant's `honors` names. Today's vaults
+ * have none, so this falls back to a fixed placeholder and each contract goes on to its own assertion;
+ * `grant.test.ts` holds "a vault says its own id".
  */
 export async function vaultId(name = door().vault): Promise<string> {
   const info = await rest("read", name).get("/vault");
-  return typeof info.body?.id === "string" ? info.body.id : "0".repeat(32);
+  return typeof info.body?.id === "string" ? info.body.id : "0".repeat(64);
 }
 
 export type Verb = "read" | "create" | "update" | "delete" | "read:own" | "update:own" | "delete:own";
@@ -94,22 +120,55 @@ export interface GrantSpec {
   endsIn?: number | null;
   vault?: string;
   created_at?: number;
-  /** Extra tags, for contracts about what a vault refuses. */
+  /** Extra tags beyond `d` and `expiration`, for contracts about what a vault refuses. */
   extraTags?: string[][];
+  /** Extra content fields, for contracts about what a vault refuses (an unknown field is never read around). */
+  extraFields?: Record<string, unknown>;
+  /** Put in the content as given, for contracts about refusals; the tags still say what was meant. */
+  honors?: string;
+  /** Rewrite the content's text after the one spelling, for contracts about what a reader does with other text. */
+  respell?: (text: string) => string;
 }
 
-/** The tags of a grant event, as §2.1 lays them out. */
-export async function grantTags(g: GrantSpec & { id: string }): Promise<string[][]> {
-  const by = g.by ?? "signer";
-  const tags: string[][] = [["d", g.id], ["vault", await vaultId(g.vault)]];
-  tags.push("applet" in g.to ? ["applet", g.to.applet, g.to.author.pubkey] : ["p", g.to.pubkey]);
-  tags.push(typeof by === "string" ? ["by", by] : ["by", "names", by.names]);
-  for (const [type, verbs] of Object.entries(g.types)) tags.push(["type", type, ...verbs]);
-  for (const t of g.deny ?? []) tags.push(["deny", t]);
-  for (const s of g.was ?? []) tags.push(["was", s]);
-  if (g.under) tags.push(["under", g.under]);
-  if (g.endsIn !== null) tags.push(["expiration", String((g.created_at ?? now()) + (g.endsIn ?? 86_400))]);
-  return [...tags, ...(g.extraTags ?? [])];
+const byText = (by: GrantSpec["by"]) => (by === undefined ? "signer" : typeof by === "string" ? by : `names:${by.names}`);
+
+/**
+ * The content of a grant (§2.1): the grant frame, `at: parachute`. A type's plain verbs make one row and its `:own`
+ * verbs a second row with `only: {own: true}`; verbs and rows are sorted, so the content is in its one spelling.
+ */
+export async function grantContent(g: GrantSpec & { id: string }): Promise<Record<string, unknown>> {
+  const rows: { on: { type: string }; can: string[]; only?: { own: true } }[] = [];
+  for (const [type, verbs] of Object.entries(g.types)) {
+    const plain = verbs.filter((v) => !v.endsWith(":own")).sort();
+    const own = verbs.filter((v) => v.endsWith(":own")).map((v) => v.slice(0, -4)).sort();
+    if (plain.length) rows.push({ on: { type }, can: plain });
+    if (own.length) rows.push({ on: { type }, can: own, only: { own: true } });
+  }
+  rows.sort((a, b) => (canonical(a) < canonical(b) ? -1 : 1));
+  const to = "applet" in g.to
+    ? { kind: "applet", id: g.to.applet, author: g.to.author.pubkey, by: byText(g.by), was: g.was?.slice().sort() }
+    : { kind: "key", id: g.to.pubkey, by: byText(g.by), was: g.was?.slice().sort() };
+  return {
+    v: 1,
+    id: g.id,
+    at: "parachute",
+    honors: g.honors ?? (await vaultId(g.vault)),
+    gives: "access",
+    to,
+    allow: rows,
+    deny: g.deny?.length ? g.deny.slice().sort().map((tag) => ({ tag })) : undefined,
+    under: g.under,
+    until: g.endsIn === null ? undefined : (g.created_at ?? now()) + (g.endsIn ?? 86_400),
+    purpose: "This key may use part of my vault until the date given.",
+    ...(g.extraFields ?? {}),
+  };
+}
+
+/** A grant's tags (§2.1): exactly `d` then `expiration`, repeating the content's `id` and `until`. */
+export function grantTags(content: Record<string, unknown>, extra: string[][] = []): string[][] {
+  const tags: string[][] = [["d", String(content.id)]];
+  if (content.until !== undefined) tags.push(["expiration", String(content.until)]);
+  return [...tags, ...extra];
 }
 
 /** A signed grant event. Not filed. */
@@ -117,35 +176,71 @@ export async function grantEvent(g: GrantSpec): Promise<Event & { grantId: strin
   // A member's ids start with their own grant's id and a dot (§2.2 line 6).
   const id = g.id ?? (g.under ? `${g.under}.${runId("a")}` : runId("g"));
   const signer = g.signer ?? (await ownerKey());
-  const e = await sign(signer, { kind: KIND.grant, tags: await grantTags({ ...g, id }), content: "This key may use part of my vault until the date given.", created_at: g.created_at });
+  const content = await grantContent({ ...g, id });
+  const text = canonical(content);
+  const e = await sign(signer, { kind: KIND.grant, tags: grantTags(content, g.extraTags), content: g.respell ? g.respell(text) : text, created_at: g.created_at });
   return { ...e, grantId: id };
 }
 
-/** A signed revoke of a grant (§3). */
-export async function revokeEvent(grant: { pubkey: string; grantId: string }, opts: { signer?: Key; vault?: string } = {}): Promise<Event> {
+/**
+ * An event's size (§2.1): the bytes of the event as sent, one compact JSON object of its seven fields, non-ASCII
+ * written as itself, controls too. Not NIP-01's id serialisation, which leaves out `id` and `sig` and is 253 bytes shorter.
+ */
+export const eventSize = (e: Event) =>
+  Buffer.byteLength(`{"id":${nip01(e.id)},"pubkey":${nip01(e.pubkey)},"created_at":${e.created_at},"kind":${e.kind},"tags":${nip01Tags(e.tags)},"content":${nip01(e.content)},"sig":${nip01(e.sig)}}`);
+
+// NIP-01's seven escapes and nothing else: JSON.stringify would write other controls as six-byte `\u00XX`.
+const ESC: Record<string, string> = { '"': '\\"', "\\": "\\\\", "\n": "\\n", "\r": "\\r", "\t": "\\t", "\b": "\\b", "\f": "\\f" };
+const nip01 = (x: string) => `"${x.replace(/["\\\n\r\t\b\f]/g, (c) => ESC[c])}"`;
+const nip01Tags = (tags: string[][]) => `[${tags.map((t) => `[${t.map(nip01).join(",")}]`).join(",")}]`;
+
+/** The bytes NIP-01 hashes for an event's id. */
+export const hashedSize = (e: Event) => Buffer.byteLength(`[0,${nip01(e.pubkey)},${e.created_at},${e.kind},${nip01Tags(e.tags)},${nip01(e.content)}]`);
+
+/** A grant's address (§3): kind, grantor key, id. */
+export const address = (grant: { pubkey: string; grantId: string }) => `${KIND.grant}:${grant.pubkey}:${grant.grantId}`;
+
+/** A signed revoke (§3): no tags; the content names the address it ends and the vault it is for. */
+export async function revokeEvent(
+  grant: { pubkey: string; grantId: string } | { ends: string },
+  opts: { signer?: Key; vault?: string; honors?: string; v?: number; extraFields?: Record<string, unknown>; tags?: unknown[][]; spaced?: boolean; respell?: (text: string) => string } = {},
+): Promise<Event> {
   const signer = opts.signer ?? (await ownerKey());
-  return sign(signer, { kind: KIND.revoke, tags: [["a", `${KIND.grant}:${grant.pubkey}:${grant.grantId}`], ["vault", await vaultId(opts.vault)]], content: "I end this grant." });
+  const ends = "ends" in grant ? grant.ends : address(grant);
+  const content = { v: opts.v ?? 1, honors: opts.honors ?? (await vaultId(opts.vault)), ends, purpose: "I end this grant.", ...(opts.extraFields ?? {}) };
+  // `spaced` and `tags` make a revoke from some later shell: a vault still acts on its three frozen fields (§3).
+  const text = opts.spaced ? JSON.stringify(content, null, 1) : canonical(content);
+  return sign(signer, { kind: KIND.revoke, tags: (opts.tags ?? []) as string[][], content: opts.respell ? opts.respell(text) : text });
 }
 
 /**
- * The owner's void of a linked name (§6.2): a revoke that carries `["name", …]` in place of the `a` tag, final for the
- * name whichever service key links it next. Only an owner key may sign that form; `signer` is for contracts about
- * who else tries.
+ * The owner's void of a linked name (§6.2): a revoke whose `ends` is `name:<prefix>:<name>`, final for the name
+ * whichever service key links it next. Only an owner key may sign that form; `signer` is for contracts about who
+ * else tries.
  */
 export async function voidNameEvent(name: string, opts: { signer?: Key; vault?: string } = {}): Promise<Event> {
-  const signer = opts.signer ?? (await ownerKey());
-  return sign(signer, { kind: KIND.revoke, tags: [["name", name], ["vault", await vaultId(opts.vault)]], content: "I void this name's link." });
+  return revokeEvent({ ends: `name:${name}` }, opts);
+}
+
+/**
+ * A vault record (§2.3), kind 37443, `d` = the vault id: which key signs for the vault now, and where it lives. Signed
+ * by an owner key it is an override: the owner rotates the vault's key or takes the vault back from a host.
+ */
+export async function vaultRecordEvent(signer: Key, record: { key: string; lives?: string }, opts: { vault?: string; created_at?: number } = {}): Promise<Event> {
+  const id = await vaultId(opts.vault);
+  return sign(signer, { kind: KIND.vaultRecord, tags: [["d", id]], content: canonical({ v: 1, honors: id, key: record.key, lives: record.lives }), created_at: opts.created_at });
 }
 
 /** A link statement (§6.2): the service says a name of its own is a person's key. No `person`: it takes the link back. */
 export async function linkEvent(service: Key, name: string, person: Key | null, opts: { vault?: string; created_at?: number } = {}): Promise<Event> {
-  const tags = [["d", name], ["vault", await vaultId(opts.vault)], ...(person ? [["p", person.pubkey]] : [])];
-  return sign(service, { kind: KIND.link, tags, content: "This name of ours is this key.", created_at: opts.created_at });
+  const content = { v: 1, honors: await vaultId(opts.vault), name, is: person?.pubkey };
+  return sign(service, { kind: KIND.link, tags: [["d", name]], content: canonical(content), created_at: opts.created_at });
 }
 
 /** A person's claim on a linked name (§6.2): "mine", or "not-mine". */
 export async function claimEvent(person: Key, name: string, claim: "mine" | "not-mine" = "mine", opts: { vault?: string; created_at?: number } = {}): Promise<Event> {
-  return sign(person, { kind: KIND.confirm, tags: [["d", name], ["vault", await vaultId(opts.vault)], ["claim", claim]], content: claim === "mine" ? "That name is me." : "That name is not me.", created_at: opts.created_at });
+  const content = { v: 1, honors: await vaultId(opts.vault), name, claim };
+  return sign(person, { kind: KIND.confirm, tags: [["d", name]], content: canonical(content), created_at: opts.created_at });
 }
 
 // ── The door's two new calls ────────────────────────────────────────────────────────────────────────────────
