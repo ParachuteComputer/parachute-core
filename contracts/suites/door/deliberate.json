@@ -105,7 +105,7 @@
       ],
       "status": "drift",
       "owner": "cloud on 0.8 only: from 0.9.1 the brief is the engine's on every door (T-456 cloud parity)",
-      "why": "On 0.8 a model connecting to a box is told the vault's address, how to query, how files move and how to script it (seven sections); on cloud it gets the description and one line. A refused tool call's message starts with `[error_type]` on a box only; the code and the structured `data` are the same on both. From 0.9.1 every door sends the same brief (core `projectionToMarkdown`) and the same message.",
+      "why": "On 0.8 a model connecting to a box is told the vault's address, how to query, how files move and how to script it (seven sections); on cloud it gets the description and one line. A refused tool call's message starts with `[error_type]` on a box only; the code and the structured `data` are the same on both. From 0.9.1 every door renders the brief with the engine's `projectionToMarkdown` (the same seven sections; only the scripting line is the door's own) and sends the same message.",
       "releases": [
         "0.8"
       ]

@@ -57,7 +57,8 @@ export interface RecordSurfaceOpts {
   onUse?: (name: string, kind: "old" | "new") => void;
   /** Count one unknown parameter, by tool and parameter name (caller-chosen text: the door bounds it). */
   onUnknownParam?: (tool: string, field: string, refused: boolean) => void;
-  /** A tag-scoped caller's view: does it see this tag name? Omitted: every name. */
+  /** A tag-scoped caller's view: does it see this tag name? Omitted: every name, so a door with tag-scoped keys MUST
+   *  pass it, or the type-in-tags refusal tells a scoped caller the kind of a tag it can't see. */
   tagVisible?: () => Promise<(name: string) => boolean>;
   /** References for tools the door adds itself (`manage-token`, `manage-keys`). */
   doorTool?: (name: string) => DoorToolReference | undefined;
