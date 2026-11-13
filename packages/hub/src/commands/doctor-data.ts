@@ -10,7 +10,7 @@
  */
 import { Database } from "bun:sqlite";
 import { existsSync, readdirSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { type ReapableClient, findReapableClients, reapClient } from "../clients.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 
@@ -65,11 +65,10 @@ function defaultListVaults(configDir: string): string[] {
  * `parachute`), else the first on PATH. Null when there is none.
  */
 function vaultBin(): string | null {
-  const script = process.argv[1];
-  if (script) {
-    const own = join(dirname(script), "..", "bin", "parachute-vault");
-    if (existsSync(own)) return own;
-  }
+  // This module sits at packages/hub/src/commands/ from source and in the bundle (lib/packages/…); the program's own
+  // `parachute-vault` is packages/cli/bin/. process.argv[1] can't be used: dispatch rewrites it to the hub's cli.ts.
+  const own = join(import.meta.dir, "..", "..", "..", "cli", "bin", "parachute-vault");
+  if (existsSync(own)) return own;
   return Bun.which("parachute-vault");
 }
 
