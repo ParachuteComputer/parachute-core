@@ -94,10 +94,13 @@ describe("a member", () => {
     const cases = [
       { why: "no under", under: undefined, status: 400, error: "invalid_statement" },
       { why: "under Bo's grant", under: b.grantId, status: 400, error: "invalid_statement" },
+      // The pinned vector "a member's grant under someone else's grant": the id sits in Bo's start, outside Mara's.
+      // `under` is judged before the id's start (§2.2 line 6), so this is still invalid_statement, not id_taken.
+      { why: "under Bo's grant, an id in Bo's start", under: b.grantId, id: `${b.grantId}.${runId("a")}`, status: 400, error: "invalid_statement" },
     ];
     for (const c of cases) {
       const agent = await newKey();
-      const r = await file(await grantEvent({ id: `${m.grantId}.${runId("a")}`, signer: mara, under: c.under, to: agent, by: "signer", types: { [recipe]: ["read"] }, endsIn: HOUR }), { as: mara });
+      const r = await file(await grantEvent({ id: (c as { id?: string }).id ?? `${m.grantId}.${runId("a")}`, signer: mara, under: c.under, to: agent, by: "signer", types: { [recipe]: ["read"] }, endsIn: HOUR }), { as: mara });
       expect(r.status, c.why).toBe(c.status);
       expect(r.body.error, c.why).toBe(c.error);
       expect((await tokenReply(agent)).status, c.why).toBe(401);
