@@ -1064,8 +1064,9 @@ rounds.
   [lean] list and the freeze's scope were unclear; and three nits. Fixed in the text after it: the pin's wording
   and its D and E answers (§2.1, and row A states the freeze's scope); the bound is for a revoke on the wire only
   (§2.2, §3); a relisted key's addresses stay ended in the door's copy (§2.2); declaring a tag under another is
-  admin; a new grantee field joins line 6. **These fixes are not reviewed again: the cap was reached, so decision A
-  stays open.**
+  admin; a new grantee field joins line 6. A code review of those fixes found two gaps, also fixed: §7.4's date row
+  now spares a carried revoke, and an export marks which statements the vault had filed (line 6, §9). **These
+  fixes are not reviewed again: the cap was reached, so decision A stays open.**
 
 Left open, owner #parachute unless named: one fresh check of round 8b's fixes, then the freeze; Aaron's call on D
 and E, which the pin answers as their leans; the door's copy is kept by vault id alone and nothing proves an import
