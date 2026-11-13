@@ -104,8 +104,11 @@
         "personal"
       ],
       "status": "drift",
-      "owner": "0.9.0 cloud parity (audit L1-01, delta 36): the AI-facing text moves into the engine",
-      "why": "A model connecting to a box is told the vault's address, how to query, how files move and how to script it (seven sections). On cloud it gets the description and one line. A refused tool call's message starts with `[error_type]` on a box only; the code and the structured `data` are the same on both."
+      "owner": "cloud on 0.8 only: from 0.9.1 the brief is the engine's on every door (T-456 cloud parity)",
+      "why": "On 0.8 a model connecting to a box is told the vault's address, how to query, how files move and how to script it (seven sections); on cloud it gets the description and one line. A refused tool call's message starts with `[error_type]` on a box only; the code and the structured `data` are the same on both. From 0.9.1 every door sends the same brief (core `projectionToMarkdown`) and the same message.",
+      "releases": [
+        "0.8"
+      ]
     },
     {
       "id": "manage-token-tool",
@@ -214,6 +217,7 @@
       ],
       "between": [
         "box",
+        "cloud",
         "personal"
       ],
       "releases": [
@@ -234,6 +238,7 @@
       ],
       "between": [
         "box",
+        "cloud",
         "personal"
       ],
       "releases": [
@@ -244,28 +249,13 @@
       "why": "A revoked app key gets 401 at once on both doors. The body differs: a box's hub answers `{error: \"invalid_token\", error_description}`, a cloud-style door's vault answers `{error: \"Unauthorized\", message}`; and the revoke reply carries `refused_now` on a cloud-style door only. Branch on the 401."
     },
     {
-      "id": "type-in-tags-on-the-record-door",
-      "keys": [
-        "records/rest.type-in-tags"
-      ],
-      "between": [
-        "box",
-        "personal"
-      ],
-      "releases": [
-        "0.9.1"
-      ],
-      "status": "drift",
-      "owner": "parachute-cloud, at its next core pin: call refuseTypesInTags (core tag-kind.ts) in rest/records.ts and pass it to addRecordTools in mcp-09.ts, or move rest/records.ts onto core's rest-records.ts",
-      "why": "On the record door `tags` holds plain labels (SPEC §2.4). From 0.9.1 a box refuses a type's name in `tags` with 422 `tag_kind` and the fix (`types: [...]`), on `/api/records` and on create-record/update-record, and writes nothing. The personal door still accepts it and files the name as the type. Send a type's name in `types`: that works on both."
-    },
-    {
       "id": "typed-record-read-validation-status",
       "keys": [
         "records/rest.get.shape"
       ],
       "between": [
         "box",
+        "cloud",
         "personal"
       ],
       "releases": [
@@ -274,6 +264,41 @@
       "status": "drift",
       "owner": "parachute-cloud 0.9.1: the vault worker's REST read (it drops its own records copy for the engine's `rest-records` then)",
       "why": "A box attaches `validation_status` to a typed record when it is read over REST, as both doors do on create and on MCP. A cloud-style door's hand-ported REST read leaves it out. The box's `/api/records` made the difference visible; `/api/notes` has had it since 0.8. Read `validation_status` as optional on a get."
+    },
+    {
+      "id": "oauth-app-is-a-key",
+      "keys": [
+        "connect/token.claims",
+        "connect/written-by.stamp",
+        "connect/revoke.access-still-works"
+      ],
+      "between": [
+        "box",
+        "cloud"
+      ],
+      "releases": [
+        "0.9.1"
+      ],
+      "status": "drift",
+      "owner": "parachute-cloud 0.9.1 keys by name (ROADMAP 0.9.1 \"Keys by name; the write stamp\": an approved OAuth app is a key)",
+      "why": "On a 0.9.1 box an app approved over OAuth is a named key: its token carries a `key` claim, its writes are stamped `via: \"key:<client>\"`, and revoking it stops its token at once. On cloud the approval is still an OAuth grant: no `key` claim, writes say `via: \"mcp\"`, and a revoked app's access token works until it expires (15 minutes). Read `via` as a label, and treat a revoked app as gone within 15 minutes."
+    },
+    {
+      "id": "changes-map",
+      "keys": [
+        "connect/changes-map"
+      ],
+      "between": [
+        "box",
+        "cloud",
+        "personal"
+      ],
+      "releases": [
+        "0.9.1"
+      ],
+      "status": "drift",
+      "owner": "parachute-cloud: serve the engine's change map at the issuer (0.9.3 on cloud)",
+      "why": "A box serves what 0.9 renamed at `/.well-known/parachute-changes.json` (the bytes `parachute changes --json` prints). A cloud-style door doesn't serve it yet: read the same list from the box's docs or the parachute-core repo."
     },
     {
       "id": "multi-vault-door",
