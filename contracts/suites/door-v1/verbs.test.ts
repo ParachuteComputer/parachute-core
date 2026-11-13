@@ -1,8 +1,8 @@
 // 1.0 grants: the verbs (docs/SPEC-1.0-grants.md §2.1, §4.1–4.3). `read`, `create`, `update`, `delete`, each alone;
 // `create` without `read` is a form, and a form can't choose a path; `:own` reaches only what the grantee made, and
 // `was` carries that across a new grant but can't be added or changed by a replacement; a type covers its subtypes;
-// a denied tag hides a record from every verb and can't be attached; adding a type needs `create` on it and removing
-// one needs `delete`; grants only add; `"*"` covers untyped records.
+// a denied tag (and every tag under it) hides a record from every verb and can't be attached; adding a type needs
+// `create` on it and removing one needs `delete`; grants only add; `"*"` covers untyped records.
 //
 // Red today: no door takes a signed statement, so each contract stops where `granted()` files one. Every body
 // starts with a grant that must be taken, so a refusal further down can't pass because nothing is ever taken. The
@@ -244,6 +244,24 @@ describe("which records a grant reaches", () => {
     }
     expect((await now(open.body.id)).names).toEqual([recipe]);
     expect(ids(await owner.list({ type: secret }))).toEqual([held.body.id]);
+  });
+
+  red("a denied tag covers the tags under it: a record tagged parent/child is hidden by a deny of parent (round 8)", { reason: NO_GRANTS, lane: LANE }, async () => {
+    const recipe = await declareType("recipe");
+    const secret = runId("private");
+    const child = `${secret}/medical`;
+    const held = await owner.make({ types: [recipe], tags: [child], body: "under the denied tag" });
+    expect(held.status, held.text.slice(0, 200)).toBe(201);
+    const open = await owner.make({ types: [recipe], body: "plain soup" });
+    const key = await newKey();
+    await granted({ to: key, types: { [recipe]: ["read", "create", "update"] }, deny: [secret] });
+    const bo = await as(key);
+    expect((await bo.get(held.body.id)).status).toBe(404);
+    expect(ids(await bo.list({ type: recipe }))).toEqual([open.body.id]);
+    // Attaching the child tag is attaching what the grant denies.
+    const r = await bo.edit(open.body.id, { add: [child] });
+    expect(r.status, r.text.slice(0, 200)).toBe(403);
+    expect(r.body.error).toBe("not_granted");
   });
 
   red("adding a type needs create on it and removing one needs delete on it, so a record can't be moved in or out", { reason: NO_GRANTS, lane: LANE }, async () => {

@@ -347,7 +347,7 @@ export function computeSearchDidYouMean(
  * #570's search polish item). `notes_fts` is porter-tokenized, so MATCHing
  * the bare stem finds any note carrying a word that stems to it (the stem
  * came FROM `notes_fts_vocab` in the first place, so at least one match is
- * guaranteed). From there, tokenize that note's own path/content text —
+ * guaranteed). From there, tokenize that note's own path/content/field text —
  * unstemmed, done here in JS with the same punctuation-stripping rule used
  * above — and return the first token that literally STARTS WITH the stem.
  * This works because Porter's rules are almost entirely suffix-stripping:
@@ -363,10 +363,10 @@ export function computeSearchDidYouMean(
 function resolveSurfaceForm(db: Database, stem: string): string | undefined {
   try {
     const rows = db
-      .prepare("SELECT path, content FROM notes_fts WHERE notes_fts MATCH ? LIMIT 5")
-      .all(escapeFtsToken(stem)) as { path: string | null; content: string | null }[];
+      .prepare("SELECT path, content, fields FROM notes_fts WHERE notes_fts MATCH ? LIMIT 5")
+      .all(escapeFtsToken(stem)) as { path: string | null; content: string | null; fields: string | null }[];
     for (const row of rows) {
-      const text = `${row.path ?? ""} ${row.content ?? ""}`;
+      const text = `${row.path ?? ""} ${row.content ?? ""} ${row.fields ?? ""}`;
       for (const raw of text.split(/[^\p{L}\p{N}]+/gu)) {
         if (!raw) continue;
         const lower = raw.toLowerCase();

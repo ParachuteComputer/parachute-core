@@ -26,13 +26,13 @@
  * inherit it from the same shared library.
  */
 
-export const SEARCH_MODES = ["literal", "advanced"] as const;
+export const SEARCH_MODES = ["literal", "advanced", "hybrid"] as const;
 export type SearchMode = (typeof SEARCH_MODES)[number];
 
 /**
  * bm25 column weights for `notes_fts` (vault#551 WS2C — ranking legibility,
  * schema v25). `notes_fts` indexes three columns, `path` (title), `content`
- * (body), then `fields` (field values, 0.9.2), in that declared order (`core/src/schema.ts`) —
+ * (body), then `fields` (field values, 0.9.3), in that declared order (`core/src/schema.ts`) —
  * `bm25(notes_fts, w0, w1, ...)`'s weight arguments are POSITIONAL, so
  * `SEARCH_WEIGHT_PATH` must be passed first, `SEARCH_WEIGHT_CONTENT`
  * second, matching column declaration order exactly.

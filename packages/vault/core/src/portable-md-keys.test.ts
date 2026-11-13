@@ -3,7 +3,12 @@
  * The reader used to skip any line whose key did not match `[\w][\w.-]*`, silently. Made-up data.
  */
 import { describe, it, expect } from "bun:test";
-import { toPortableMarkdown, parseFrontmatter } from "./portable-md.js";
+import { Database } from "bun:sqlite";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { join } from "path";
+import { tmpdir } from "os";
+import { SqliteStore } from "./store.js";
+import { toPortableMarkdown, parseFrontmatter, exportVaultToDir, importPortableVault, SIDECAR_DIR } from "./portable-md.js";
 
 const KEYS = ["it's", 'say "hi"', "@at", "#hash", "[x]", "{y}", "-dash", "a: b", "two words", "&amp", "*star", "!bang", "|pipe", ">gt", "%pct", "`tick", ",comma", "caf\u00e9", "line\nbreak"];
 
@@ -57,5 +62,28 @@ describe("a line the reader can't take is reported, not dropped", () => {
     const warned: string[] = [];
     parseFrontmatter(`---\nid: a\n# a comment\n---\n`, "yaml", (line) => warned.push(line));
     expect(warned).toEqual([]);
+  });
+});
+
+describe("the warning for a notes-meta sidecar names the file", () => {
+  it("an unreadable key in .parachute/notes-meta/<id>.yaml warns with that file name", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pkeys-sidecar-"));
+    const warns: string[] = [];
+    const orig = console.warn;
+    try {
+      const store = new SqliteStore(new Database(":memory:"));
+      await store.createNote("col1,col2\n1,2\n", { id: "01SIDECARKEY", path: "data/table", extension: "csv" });
+      await exportVaultToDir(store, { outDir: dir, vaultName: "t", exportedAt: "2026-01-01T00:00:00.000Z" });
+      const file = join(dir, SIDECAR_DIR, "notes-meta", "01SIDECARKEY.yaml");
+      writeFileSync(file, readFileSync(file, "utf-8") + "@at: lost\n");
+      console.warn = (m: string) => { warns.push(String(m)); };
+      await importPortableVault(new SqliteStore(new Database(":memory:")), { inDir: dir });
+    } finally {
+      console.warn = orig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+    const hit = warns.filter((w) => w.includes("@at"));
+    expect(hit.length).toBeGreaterThan(0);
+    expect(hit[0]).toContain("notes-meta/01SIDECARKEY.yaml");
   });
 });

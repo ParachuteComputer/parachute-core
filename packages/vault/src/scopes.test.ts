@@ -15,6 +15,9 @@ import {
   hasScope,
   hasScopeForVault,
   hasMigrateScopeForVault,
+  hasExportScopeForVault,
+  isExportOnly,
+  validateMintedScopes,
   findBroadVaultScopes,
   scopeForMethod,
   verbForMethod,
@@ -286,5 +289,42 @@ describe("serializeScopes — round-trips with parseScopes", () => {
   test("serialize then parse is the identity (for known scopes)", () => {
     const scopes = [SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN];
     expect(parseScopes(serializeScopes(scopes))).toEqual(scopes);
+  });
+});
+
+describe("vault:export, the backup scope (0.9.3)", () => {
+  test("a key holding only the export scope passes no read, write or admin check", () => {
+    for (const held of [["vault:v:export"], ["vault:export"]]) {
+      for (const verb of ["read", "write", "admin"] as const) expect(hasScopeForVault(held, "v", verb)).toBe(false);
+      expect(hasScope(held, SCOPE_READ)).toBe(false);
+      expect(hasMigrateScopeForVault(held, "v")).toBe(false);
+      expect(isExportOnly(held, "v")).toBe(true);
+    }
+  });
+
+  test("narrowed export names its vault; read, write and admin do not grant export", () => {
+    expect(hasExportScopeForVault(["vault:v:export"], "v")).toBe(true);
+    expect(hasExportScopeForVault(["vault:v:export"], "other")).toBe(false);
+    for (const s of ["vault:v:read", "vault:v:write", "vault:v:admin", SCOPE_ADMIN]) expect(hasExportScopeForVault([s], "v")).toBe(false);
+    // Lookalikes grant nothing.
+    for (const s of ["vault:v:EXPORT", "vault::export", "vault:v:export:x", "export"]) expect(hasExportScopeForVault([s], "v")).toBe(false);
+  });
+
+  test("a key with read as well as export is not export-only", () => {
+    expect(isExportOnly(["vault:v:read", "vault:v:export"], "v")).toBe(false);
+    // Read on another vault doesn't make it more than export-only here.
+    expect(isExportOnly(["vault:other:read", "vault:v:export"], "v")).toBe(true);
+  });
+
+  test("a hub token may not carry the broad form", () => {
+    expect(findBroadVaultScopes(["vault:export"])).toEqual(["vault:export"]);
+    expect(findBroadVaultScopes(["vault:v:export"])).toEqual([]);
+  });
+
+  test("only an admin of the vault may mint it, and only for that vault", () => {
+    expect(validateMintedScopes(["vault:v:export"], "v", ["vault:v:admin"])).toEqual({ ok: true });
+    expect(validateMintedScopes(["vault:v:export"], "v", ["vault:v:write"]).ok).toBe(false);
+    expect(validateMintedScopes(["vault:v:export"], "v", ["vault:v:read"]).ok).toBe(false);
+    expect(validateMintedScopes(["vault:other:export"], "v", ["vault:v:admin"]).ok).toBe(false);
   });
 });

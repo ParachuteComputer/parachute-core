@@ -310,7 +310,7 @@ export interface CandidateRunning extends Running {
  * supervising the vault, an admin seeded from the environment, an operator token rotated, and an admin pass minted
  * with the real CLI. Everything else the contracts do goes through HTTP and MCP.
  */
-export async function startCandidateBox(info: CandidateInfo, opts: { keep?: boolean } = {}): Promise<CandidateRunning> {
+export async function startCandidateBox(info: CandidateInfo, opts: { keep?: boolean; embeddings?: boolean } = {}): Promise<CandidateRunning> {
   const home = freshHome(info, "box");
   const user = dirname(home);
   const log = join(user, "serve.log");
@@ -330,7 +330,8 @@ export async function startCandidateBox(info: CandidateInfo, opts: { keep?: bool
     allowOrigins(hubOrigin);
     const vaultName = `cand${randomBytes(3).toString("hex")}`;
     const admin = { username: "owner", password: `pw-${randomBytes(12).toString("hex")}` };
-    const env = { PORT: String(hubPort), PARACHUTE_HUB_ORIGIN: hubOrigin, EMBEDDINGS_ENABLED: "false" };
+    // Meaning search is off unless a suite asks for it (`bun run doors -- --embeddings`): the bundled model loads on first use.
+    const env = { PORT: String(hubPort), PARACHUTE_HUB_ORIGIN: hubOrigin, EMBEDDINGS_ENABLED: opts.embeddings ? "true" : "false" };
 
     // 1. A vault, the way `parachute-vault create` makes one (registers it in services.json for the hub).
     const create = await runCli(info, home, ["create", vaultName, "--no-mirror", "--json"], { bin: info.vaultBin, env });

@@ -2424,8 +2424,8 @@ export interface ImportStats {
 export interface ImportSource {
   /** `*.yaml` schema docs under `.parachute/schemas/` (name + raw text). */
   readSchemaFiles(): Array<{ name: string; text: string }>;
-  /** Raw text of each `*.yaml` sidecar under `.parachute/notes-meta/`. */
-  readNotesMetaFiles(): string[];
+  /** Each `*.yaml` sidecar under `.parachute/notes-meta/` (file name + raw text); the name is for warnings. */
+  readNotesMetaFiles(): Array<{ name: string; text: string }>;
   /** Content files as export-root-relative POSIX paths (sorted, dot-dirs
    *  excluded, containment-guarded). */
   listContentFiles(): string[];
@@ -2510,10 +2510,8 @@ export class FsImportSource implements ImportSource {
     return this.readSidecarYamls(join(this.sidecar, "schemas"));
   }
 
-  readNotesMetaFiles(): string[] {
-    return this.readSidecarYamls(join(this.sidecar, NOTES_META_DIR))
-      .filter((f) => !f.name.startsWith("."))
-      .map((f) => f.text);
+  readNotesMetaFiles(): Array<{ name: string; text: string }> {
+    return this.readSidecarYamls(join(this.sidecar, NOTES_META_DIR)).filter((f) => !f.name.startsWith("."));
   }
 
   listContentFiles(): string[] {
@@ -2801,11 +2799,11 @@ async function importVaultReplay(
   // disambiguated-id-suffix heuristic.
   const sidecarByKey = new Map<string, Record<string, unknown>[]>();
   const sidecarByIdLeftover = new Map<string, Record<string, unknown>>();
-  for (const text of source.readNotesMetaFiles()) {
+  for (const { name, text } of source.readNotesMetaFiles()) {
     // The sidecar is a bare YAML doc (no `---`); wrap to reuse the shared
     // frontmatter parser.
     const wrapped = `---\n${text}${text.endsWith("\n") ? "" : "\n"}---\n`;
-    const parsedSidecar = parseFrontmatter(wrapped, noteReading, importKeyWarning("a notes-meta sidecar"), { verbatimBody: format === 2 });
+    const parsedSidecar = parseFrontmatter(wrapped, noteReading, importKeyWarning(`${NOTES_META_DIR}/${name}`), { verbatimBody: format === 2 });
     const frontmatter = format === 2 ? decodeFrontmatterV2(parsedSidecar.frontmatter) : parsedSidecar.frontmatter;
     const sidecarId = typeof frontmatter.id === "string" ? frontmatter.id : null;
     const sidecarPath = typeof frontmatter.path === "string" ? frontmatter.path : null;

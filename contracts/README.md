@@ -206,6 +206,18 @@ not yet decided are written at the top of each file, marked proposed.
 | `v092/teaching.test.ts` | The nearest existing name on a new type or field (a warning); `vault-info`'s tag map capped (700 types fit in about 4,000 tokens); manage-types' own schema names `reference`, `required`, `strict`, `cardinality`; search says it needs every word. |
 | `v092/doctor.test.ts` | `doctor` finds a field that names records but isn't a declared reference, and names one letter apart; it counts indexed fields against 88, and the 89th is refused with what to prune. |
 
+### 0.9.3: hybrid search (`suites/v093/`)
+
+Door contracts for 0.9.3, built red-first like v092's. `v093/hybrid.test.ts` is run twice on a box from the same build,
+because meaning search is opt-in and a box has it only when switched on: `bun run doors -- --doors box --embeddings
+suites/v093` (the bundled embedding model on the box; nothing faked) and `bun run doors -- --doors box suites/v093`
+(no embedding provider, the default). Each run first checks which mode it is in. `--embeddings` makes the runner
+start the box with `EMBEDDINGS_ENABLED=true`; a suite sees it as `DOOR_EMBEDDINGS=on`.
+
+| File | What it holds |
+|---|---|
+| `v093/hybrid.test.ts` | `search_mode: "hybrid"` finds a plain-words question that literal search misses, with `matched_by: ["meaning"]`, and puts a rare exact word first with `"keyword"`; with no provider it answers by keyword alone with a `semantic_unavailable` warning; a tag-scoped pass (minted by attenuation over the hub's HTTP mint, so box only) gets a full page of in-scope notes through either arm, plain meaning search included, with nothing out of scope in the reply and the same answer whether or not hidden notes exist; REST (`/api/notes`, `/api/records`) answers the same ids as MCP; with `HYBRID_AUTO_DEFAULT` off a search without `search_mode` is byte-identical to `search_mode: "literal"`. The `auto` contract (a 4+ word question answered by hybrid, with `search_auto`) is `red()` until Aaron says yes; the flip removes it and the byte-identical one. |
+
 `suites/bench/query-092.bench.ts` is the 0.9.2 bench, not a contract: made-up records at `BENCH_N` on the box, every
 operator, search, a type PUT and a retype, timed (`BENCH_N=94000 bun run doors -- --doors box suites/bench/query-092.bench.ts`).
 

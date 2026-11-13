@@ -2175,11 +2175,14 @@ function searchSyntaxError(rawQuery: string, err: unknown, mode: SearchMode): Qu
  * the ratified title model (title = first line of CONTENT, not path).
  * This function is the one that boosts by the content-derived title.
  */
-function boostTitleMatches(notes: Note[], terms: string[]): Note[] {
+function boostTitleMatches(notes: Note[], terms: string[], tierById?: Map<string, number>): Note[] {
   if (terms.length === 0) return notes;
+  // The boost works inside a tier only: a record found through its field values alone (tier 0) stays below every
+  // title or body hit, however its first line reads.
   return notes
-    .map((note, index) => ({ note, index, titleMatch: titleMatchesAllTerms(note.content, terms) }))
+    .map((note, index) => ({ note, index, tier: tierById?.get(note.id) ?? 0, titleMatch: titleMatchesAllTerms(note.content, terms) }))
     .sort((a, b) => {
+      if (a.tier !== b.tier) return b.tier - a.tier;
       if (a.titleMatch === b.titleMatch) return a.index - b.index; // stable
       return a.titleMatch ? -1 : 1;
     })
@@ -2209,9 +2212,10 @@ function applySearchTitleBoost(
   mode: SearchMode,
   rawQuery: string,
   sort: "asc" | "desc" | undefined,
+  tierById?: Map<string, number>,
 ): Note[] {
   if (sort !== undefined || mode !== "literal") return notes;
-  return boostTitleMatches(notes, extractLiteralBoostTerms(rawQuery));
+  return boostTitleMatches(notes, extractLiteralBoostTerms(rawQuery), tierById);
 }
 
 export function searchNotes(
@@ -2243,7 +2247,7 @@ export function searchNotes(
 
   // Weighted bm25 relevance expression (vault#551 WS2C, schema v25):
   // `notes_fts` now indexes `path` (title, column 0) then `content` (body,
-  // column 1, then `fields` (0.9.2), column 2) — SEARCH_BM25_WEIGHTS bias ranking so a
+  // column 1, then `fields` (0.9.3), column 2) — SEARCH_BM25_WEIGHTS bias ranking so a
   // title match outranks a passing body mention. Raw SQLite bm25 is
   // negative-is-better; `-1.0 * bm25(...)` flips it so bigger is more
   // relevant (see `Note.score`'s doc comment for the external contract).
@@ -2270,7 +2274,7 @@ export function searchNotes(
   // identical weighted score (relevance branch — much more likely than
   // with unweighted `rank`, since many notes share "zero path matches")
   // would otherwise return in arbitrary/unstable order.
-  // Field values rank below the title and body (0.9.2): a record found only through its fields comes after every
+  // Field values rank below the title and body (0.9.3): a record found only through its fields comes after every
   // record found in its path or content. bm25 alone can't promise that: it normalises by the length of the whole row,
   // so a hit in a short record's fields can outscore a hit in a long body. Relevance order only, literal mode only
   // (advanced text is raw FTS5; its author can say `fields:` or `content:` themselves).
@@ -2307,7 +2311,8 @@ export function searchNotes(
       ORDER BY ${tier ? "tier DESC, " : ""}${orderBy}
       LIMIT ?
     `).all(...(tier ? [tier.param] : []), ftsQuery, ...params, limit) as (NoteRow & { score: number })[];
-    return applySearchTitleBoost(notesWithTags(db, rows, scoresById(rows)), mode, query, opts?.sort);
+    const tierById = tier ? new Map(rows.map((r) => [r.id, (r as { tier?: number }).tier ?? 0])) : undefined;
+    return applySearchTitleBoost(notesWithTags(db, rows, scoresById(rows)), mode, query, opts?.sort, tierById);
   } catch (err) {
     // Surface EVERY FTS5 error structured, never a raw rethrow (vault#551):
     // advanced mode expects it (the caller passed raw syntax); literal
@@ -2422,7 +2427,7 @@ function searchVisibleOnly(
 export function semanticSearchNotes(
   db: Database,
   queryVector: Float32Array,
-  opts: QueryOpts,
+  opts: QueryOpts & { visible?: (note: Note) => boolean },
   model: string,
 ): SemanticSearchResult {
   const limit = typeof opts.limit === "number" ? opts.limit : 10;
@@ -2438,7 +2443,15 @@ export function semanticSearchNotes(
   const idRows = db.prepare(`SELECT n.id FROM notes n ${whereClause}`).all(...params) as {
     id: string;
   }[];
-  const candidateIds = idRows.map((r) => r.id);
+  let candidateIds = idRows.map((r) => r.id);
+  // A caller who sees only some notes (`visible`, a tag-scoped session): the candidates are narrowed to those it can
+  // see BEFORE ranking and the limit, so its page is full, nothing it can't see takes a place on it, and the
+  // pending/total counts are over what it can see.
+  if (opts.visible && candidateIds.length > 0) {
+    const tagsById = getNoteTagsForNotes(db, candidateIds);
+    const visible = opts.visible;
+    candidateIds = candidateIds.filter((id) => visible({ id, tags: tagsById.get(id) ?? [] } as Note));
+  }
   if (candidateIds.length === 0) {
     return { notes: [], pendingCount: 0, totalCandidates: 0 };
   }
@@ -3350,6 +3363,7 @@ export function toNoteIndex(note: Note): NoteIndex {
     preview,
     displayTitle: computeDisplayTitle(note.content),
     ...(note.score !== undefined ? { score: note.score } : {}),
+    ...(note.matched_by ? { matched_by: note.matched_by } : {}),
   };
 }
 

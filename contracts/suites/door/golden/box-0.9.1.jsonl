@@ -40,6 +40,7 @@
 {"key":"connect/authorization-server.scopes_supported","value":["string"]}
 {"key":"connect/authorization-server.token_endpoint","value":"string"}
 {"key":"connect/authorization-server.token_endpoint_auth_methods_supported","value":["string"]}
+{"key":"connect/changes-map","value":{"keys":["schema","from","to","version","status","rule","upgrade_policy","waypoint","changes"],"kinds":["command","credential","endpoint","mcp-tool","setting"]}}
 {"key":"connect/jwks.key","value":{"alg":"RS256","kty":"RSA","use":"sig"}}
 {"key":"connect/refresh.reply.shape","value":{"access_token":"string","expires_in":"number","refresh_token":"string","scope":"string","services":{"vault":{"url":"string","version":"string"},"vault:<v>":{"url":"string","version":"string"}},"token_type":"string","vault":"string"}}
 {"key":"connect/refusal.bad-redirect","value":{"error":"invalid_redirect_uri","status":400}}
@@ -50,12 +51,17 @@
 {"key":"connect/token.lifetime","value":900}
 {"key":"connect/token.reply.shape","value":{"access_token":"string","expires_in":"number","refresh_token":"string","scope":"string","services":{"vault":{"url":"string","version":"string"},"vault:<v>":{"url":"string","version":"string"}},"token_type":"string","vault":"string"}}
 {"key":"connect/written-by.stamp","value":{"by":"string","via":"key:<client>"}}
+{"key":"exit/export-key.headers","value":{"type":"application/x-tar"}}
+{"key":"exit/export-key.mcp-refusal","value":{"status":403}}
+{"key":"exit/export-key.mint.shape","value":{"can":"string","created_at":"string","expires_at":"string","last_used_at":"null","name":"string","revoked_at":"null","scopes":["string"],"status":"string","token":"string","vault":"string"}}
+{"key":"exit/export-key.stamp.shape","value":{"last_export_at":"string","last_export_by":"string"}}
 {"key":"exit/file..parachute/schemas/exitfixture.yaml","value":"description: A made-up type for the exit contract\nfields:\n  due:\n    type: date\n  points:\n    indexed: true\n    type: integer\n  status:\n    enum:\n      - open\n      - done\n      - 'a:b'\n    strict: true\n    type: string\nname: exitfixture\n"}
 {"key":"exit/file.attachment","value":{"name":".parachute/attachments/<att>/<stored>.png","sha256":"a88873d7c64f89b94d073cababf05929ebac1bcea3df01c4dc44eebe22927e92"}}
 {"key":"exit/file.exit-fixture/plan.md","value":"---\nid: <id>\npath: exit-fixture/plan\ntags:\n  - exit/nested-tag\n  - exitfixture\nmetadata:\n  done: false\n  due: 2027-02-03\n  empty_text: ''\n  multi: \"line one\\nline two\"\n  nested:\n    deep:\n      list:\n        - 1\n        - 2\n        - 3\n      yes: true\n  people:\n    - address: mailto:sam@example.org\n      name: Sam\n  points: 5\n  quote: it's \"quoted\"\n  status: a:b\n  urls:\n    - 'https://example.org/a'\n    - plain\n    - 'http://example.org:8080/b?c=d#e'\nlinks:\n  - relationship: depends-on\n    target: <id>\ncreated_at: <time>\nupdated_at: <time>\n---\n# Plan\n\nSee [[exit-fixture/target]] and [[exit-fixture/not-yet]].\n\nUmlauts stay: Grüße, 東京, 🪂.\n"}
 {"key":"exit/file.exit-fixture/target.md","value":"---\nid: <id>\npath: exit-fixture/target\nattachments:\n  - id: <id>\n    mime_type: image/png\n    path: <stored>.png\ncreated_at: <time>\nupdated_at: <time>\n---\nThe target.\n"}
 {"key":"exit/file.pathless","value":{"name":"_unpathed/exit-fixture pathless note.md","text":"---\nid: <id>\ntags:\n  - exit/nested-tag\ncreated_at: <time>\nupdated_at: <time>\n---\nexit-fixture pathless note\n"}}
-{"key":"exit/file.vault.yaml.keys","value":["description","export_format_version","exported_at","name"]}
+{"key":"exit/file.vault.yaml.keys","value":["export_format_version","exported_at","name"]}
+{"key":"exit/http.headers","value":{"disposition":"attachment; filename=\"vault-<v>-<time>.tar\"","type":"application/x-tar"}}
 {"key":"files/attach.reply.shape","value":{"createdAt":"string","id":"string","mimeType":"string","noteId":"string","path":"string"}}
 {"key":"files/attachments.list.shape","value":[{"createdAt":"string","id":"string","mimeType":"string","noteId":"string","path":"string"}]}
 {"key":"files/detach.reply","value":{"shape":"null","status":204}}
@@ -73,7 +79,8 @@
 {"key":"files/upload.pdf","value":{"status":201}}
 {"key":"files/upload.reply.shape","value":{"mimeType":"string","path":"string","size":"number"}}
 {"key":"files/upload.txt","value":{"status":201}}
-{"key":"has/export-over-http","value":false}
+{"key":"has/export-key","value":true}
+{"key":"has/export-over-http","value":true}
 {"key":"has/multi-vault-door","value":true}
 {"key":"has/oauth-approval","value":true}
 {"key":"has/on-behalf-of","value":true}
@@ -173,12 +180,12 @@
 {"key":"mcp/admin.tool.prune-schema.words","value":"b6f951d0545b4847"}
 {"key":"mcp/admin.tool.query-notes.hints","value":null}
 {"key":"mcp/admin.tool.query-notes.present","value":true}
-{"key":"mcp/admin.tool.query-notes.schema","value":"0af43247c7d9edf4"}
+{"key":"mcp/admin.tool.query-notes.schema","value":"5a7f80c4914c713f"}
 {"key":"mcp/admin.tool.query-notes.words","value":"8b6c408e946520e0"}
 {"key":"mcp/admin.tool.query-records.hints","value":null}
 {"key":"mcp/admin.tool.query-records.present","value":true}
-{"key":"mcp/admin.tool.query-records.schema","value":"8aef84137a1884f2"}
-{"key":"mcp/admin.tool.query-records.words","value":"9e9a0c4cd32719d5"}
+{"key":"mcp/admin.tool.query-records.schema","value":"f353f5d274cfc5b9"}
+{"key":"mcp/admin.tool.query-records.words","value":"ec107db1320fbfc3"}
 {"key":"mcp/admin.tool.read-attachment.hints","value":null}
 {"key":"mcp/admin.tool.read-attachment.present","value":true}
 {"key":"mcp/admin.tool.read-attachment.schema","value":"d8a9d97eaf912aa4"}
@@ -267,12 +274,12 @@
 {"key":"mcp/read.tool.list-types.words","value":"0f65df46d485ab21"}
 {"key":"mcp/read.tool.query-notes.hints","value":null}
 {"key":"mcp/read.tool.query-notes.present","value":true}
-{"key":"mcp/read.tool.query-notes.schema","value":"0af43247c7d9edf4"}
+{"key":"mcp/read.tool.query-notes.schema","value":"5a7f80c4914c713f"}
 {"key":"mcp/read.tool.query-notes.words","value":"8b6c408e946520e0"}
 {"key":"mcp/read.tool.query-records.hints","value":null}
 {"key":"mcp/read.tool.query-records.present","value":true}
-{"key":"mcp/read.tool.query-records.schema","value":"8aef84137a1884f2"}
-{"key":"mcp/read.tool.query-records.words","value":"9e9a0c4cd32719d5"}
+{"key":"mcp/read.tool.query-records.schema","value":"f353f5d274cfc5b9"}
+{"key":"mcp/read.tool.query-records.words","value":"ec107db1320fbfc3"}
 {"key":"mcp/read.tool.read-attachment.hints","value":null}
 {"key":"mcp/read.tool.read-attachment.present","value":true}
 {"key":"mcp/read.tool.read-attachment.schema","value":"d8a9d97eaf912aa4"}
@@ -335,12 +342,12 @@
 {"key":"mcp/write.tool.list-types.words","value":"0f65df46d485ab21"}
 {"key":"mcp/write.tool.query-notes.hints","value":null}
 {"key":"mcp/write.tool.query-notes.present","value":true}
-{"key":"mcp/write.tool.query-notes.schema","value":"0af43247c7d9edf4"}
+{"key":"mcp/write.tool.query-notes.schema","value":"5a7f80c4914c713f"}
 {"key":"mcp/write.tool.query-notes.words","value":"8b6c408e946520e0"}
 {"key":"mcp/write.tool.query-records.hints","value":null}
 {"key":"mcp/write.tool.query-records.present","value":true}
-{"key":"mcp/write.tool.query-records.schema","value":"8aef84137a1884f2"}
-{"key":"mcp/write.tool.query-records.words","value":"9e9a0c4cd32719d5"}
+{"key":"mcp/write.tool.query-records.schema","value":"f353f5d274cfc5b9"}
+{"key":"mcp/write.tool.query-records.words","value":"ec107db1320fbfc3"}
 {"key":"mcp/write.tool.read-attachment.hints","value":null}
 {"key":"mcp/write.tool.read-attachment.present","value":true}
 {"key":"mcp/write.tool.read-attachment.schema","value":"d8a9d97eaf912aa4"}

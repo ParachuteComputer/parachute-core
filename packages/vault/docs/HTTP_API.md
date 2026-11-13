@@ -94,7 +94,7 @@ Version history is the first self-hosted-first feature tracked in this table.
 | `aggregate[op]` / `aggregate[group_by]` / `aggregate[field]` | honored; `search`+`aggregate` → 400 `invalid_query` | honored; same exclusions as bun (`search`, `semantic`, `cursor` → 400 `invalid_query`); `aggregate`+`near` only after cloud repins the vault | [cloud#291](https://github.com/ParachuteComputer/parachute-cloud/pull/291) (B2) |
 | `if_exists` (POST `/notes`) | honored (`error`/`ignore`/`update`/`replace`) | honored (`error`/`ignore`/`update`/`replace`); `existed` returned only in the three engaged modes | [cloud#300](https://github.com/ParachuteComputer/parachute-cloud/pull/300) (B8) |
 | `summary` (batch POST `/notes`) | honored — `{created, ids, failed}` | honored — `{created, ids, failed}`; `created` excludes collision hits, `failed` is always `[]` | [cloud#298](https://github.com/ParachuteComputer/parachute-cloud/pull/298) (B7), [cloud#300](https://github.com/ParachuteComputer/parachute-cloud/pull/300) (B8) |
-| `search_mode` | honored (`literal`/`advanced`) | 200 + `unsupported_param` warning | cloud v1 is literal-only |
+| `search_mode` | honored (`literal`/`advanced`/`hybrid`) | 200 + `unsupported_param` warning | cloud v1 is literal-only; `hybrid` (0.9.3: keyword + meaning, see `matched_by`) lands on cloud with its twin (T-463) |
 | `sort` under `?search=` | honored | 200 + `unsupported_param` warning | cloud v1 always ranks by relevance |
 | `{idOrPath}` note addressing (H1-title fallback) | honored | honored — every REST note address, incl. `find-path`'s `source`/`target` | [cloud#302](https://github.com/ParachuteComputer/parachute-cloud/pull/302) (B9) |
 | `unresolved_link` / `ambiguous_link` write warnings (POST/PATCH `/notes`) | honored — in the response body as `warnings` | honored — in the response body as `warnings`, never the `X-Parachute-Warnings` header | [cloud#302](https://github.com/ParachuteComputer/parachute-cloud/pull/302) (B9); a `links.remove` miss never queues on either door |
@@ -141,6 +141,10 @@ token's scope list. Verbs and inheritance:
 | `read` | `GET`, `HEAD`, `OPTIONS` on `/api/*` | `write`, `admin` |
 | `write` | `POST`, `PATCH`, `PUT`, `DELETE` on `/api/*` | `admin` |
 | `admin` | `/.parachute/config` (read), `/.parachute/mirror` (read+write) | — |
+
+`vault:<name>:export` (0.9.3) is off this ladder: it grants one route, `GET /api/export`, and
+nothing else. A key holding only it gets 403 on every other route (REST reads and writes,
+MCP, `/view`, attachments, the vault root, admin routes). See [Export](#get-vaultnameapiexport--vaultread-or-vaultexport).
 
 A grant satisfies a (vault, verb) request if either:
 
@@ -535,7 +539,7 @@ the existing `error`/`code`:
   lexicographic string comparison against real ISO timestamps and quietly
   match nothing, or everything, depending on how the garbage happened to
   sort.
-- `search_mode` set to anything other than `literal` / `advanced`.
+- `search_mode` set to anything other than `literal` / `advanced` / `hybrid`.
 
 ```json
 {
@@ -1159,8 +1163,13 @@ Query params:
     manual phrase quoting (`"exact phrase"`), and prefix matching
     (`term*`) are honored as syntax. A malformed advanced query now throws
     a structured `400 invalid_search_syntax` (see above) instead of
-    silently returning `[]`. `search_mode` values other than
-    `literal`/`advanced` are `400 invalid_query`; passing `search_mode`
+    silently returning `[]`. `search_mode=hybrid` (0.9.3) ranks by keyword
+    (any content word) and meaning together, fused by rank: each note carries
+    `matched_by` and an RRF `score`; with no embedding provider it answers by
+    keyword alone with a `semantic_unavailable` warning; `sort` is ignored
+    (warning); a tag-scoped pass is ranked over the notes it can see. It is
+    the same answer MCP gives. `search_mode` values other than
+    `literal`/`advanced`/`hybrid` are `400 invalid_query`; passing `search_mode`
     without `search` is a no-op that surfaces an `ignored_param` warning.
   - **Breaking change / migration.** A caller who relied on raw FTS5 syntax
     working under the DEFAULT `search=` (no `search_mode`) — e.g. manual
@@ -2583,11 +2592,49 @@ tags/fields/notes — the report is re-run with the caller's expanded
 allowlist rather than filtered after the fact, so aggregate `summary`
 counts never reflect out-of-scope activity.
 
+### Export
+
+#### `GET /vault/{name}/api/export` — `vault:read` or `vault:export`
+The whole vault as one tar (`application/x-tar`, `Content-Disposition: attachment;
+filename="vault-<name>-<time>.tar"`, streamed): the same files as
+`parachute-vault export` (notes as markdown, `.parachute/vault.yaml`, one
+`.parachute/schemas/<type>.yaml` per type, each attachment under
+`.parachute/attachments/<id>/`), in the same layout Parachute Cloud gives, so the
+archive imports into either. Attachments stream from disk; memory does not grow with
+their size. `?since=<iso>` keeps only notes changed since then, as on Cloud.
+
+A read key (or better) may pull it, and so may a key that holds only `vault:<name>:export`
+(`parachute keys new <name> --vault <v> --can export`, or `POST /account/keys` with
+`can: "export"`). A tag-scoped key may not (403 `tag_scope_violation`): the export is the
+whole vault, and a token that carries both the export scope and a tag scope is refused on
+every route. No key gets 401; any other method gets 405 (403 for the export-only key).
+
+When the last byte has gone out the vault records the time and the key
+(`last_export_at`, `last_export_by`, e.g. `key:nightly-backup`). An admin sees both on
+`GET /api/vault`; `parachute-vault status` shows them per vault. A pull the client
+abandons records nothing, so the stamp means a whole tar was handed over; a `?since=` pull
+is a piece of the vault and doesn't move it. A pull from a
+cron job:
+
+```bash
+# crontab: every night at 03:10, one tar per day
+# save the key in a file only you can read: ~/.parachute-backup-key (chmod 600)
+# crontab: every night at 03:10 (cron needs % written as \%)
+10 3 * * *  curl -fsS -H "Authorization: Bearer $(cat $HOME/.parachute-backup-key)" https://my-box.example.ts.net/vault/<n>/api/export -o $HOME/backups/vault-$(date +\%F).tar
+```
+
+(`-f` makes curl fail on a 401 or 403 instead of saving the error as a backup.) Mint the
+key once with `parachute keys new nightly-backup --vault <n> --can export` and keep it in
+the job's environment; revoke it with `parachute keys revoke nightly-backup`. It can do
+nothing else, so a leaked backup key leaks the vault's contents (as the tars do) but can't
+change or delete anything.
+
 ### Vault config
 
 #### `GET /vault/{name}/api/vault` — `vault:read`
 Returns the vault's identity plus a nested `config` block for mutable
-settings, and a `map` — a compact, counts-only structural rollup meant to
+settings (an admin also gets `last_export_at` and `last_export_by`: when the last
+full export went out and to which key, `null` before the first), and a `map` — a compact, counts-only structural rollup meant to
 orient a fresh reader in this ONE call, no `?include_stats=true` needed:
 
 ```json

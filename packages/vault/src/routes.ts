@@ -33,6 +33,7 @@ import {
   type QueryWarning,
 } from "../core/src/query-warnings.ts";
 import { SEARCH_MODES, buildLiteralSearchQuery, isValidSearchMode, type SearchMode } from "../core/src/search-query.ts";
+import { anyTermsQuery, HYBRID_TEXT } from "../core/src/hybrid.ts";
 import {
   listUnresolvedWikilinks,
   resolveOrQueueLink,
@@ -1011,7 +1012,8 @@ export function parseExpandParam(url: URL): { expand?: TagExpandMode; error?: Re
  * turned into an FTS5 query. "literal" (default, omit or pass explicitly):
  * escape + phrase-quote so punctuation is literal content, not FTS5
  * syntax. "advanced": raw FTS5 passthrough (pre-#551 behavior) for
- * boolean/phrase/prefix operators. Same validation shape as
+ * boolean/phrase/prefix operators. "hybrid" (T-461): keyword and meaning
+ * together, fused by rank; the same answer as MCP's. Same validation shape as
  * `parseExpandParam` — loud 400 on an unknown value rather than a silent
  * fallback to the default.
  *
@@ -1030,7 +1032,7 @@ function parseSearchModeParam(url: URL): { mode?: SearchMode; error?: Response }
           error_type: "invalid_query",
           field: "search_mode",
           got: raw,
-          hint: `pass "literal" or "advanced", or omit for the default ("literal")`,
+          hint: HYBRID_TEXT.hint,
         },
         400,
       ),
@@ -1491,6 +1493,31 @@ function invalidIfUpdatedAtResponse(): Response {
   );
 }
 
+/** A HEAD answer made from a GET answer: its status and headers, a Content-Length for the body it holds back. */
+export async function headOf(res: Response): Promise<Response> {
+  const h = new Headers(res.headers);
+  h.set("content-length", String((await res.arrayBuffer()).byteLength));
+  return new Response(null, { status: res.status, statusText: res.statusText, headers: h });
+}
+
+/**
+ * Validators for one record's answer (0.9.3): a strong ETag (a hash of the answer's own bytes, so it changes with any
+ * change to the representation this key is shown: body, fields, tags in scope, links, query options) and Last-Modified
+ * (the record's update time; the ETag, not this, is what catches a tag-only change). A 200 JSON answer only.
+ */
+export async function withValidators(res: Response): Promise<Response> {
+  if (res.status !== 200 || !(res.headers.get("content-type") ?? "").includes("application/json")) return res;
+  const bytes = await res.arrayBuffer();
+  const h = new Headers(res.headers);
+  h.set("etag", `"${new Bun.CryptoHasher("sha256").update(bytes).digest("hex").slice(0, 32)}"`);
+  try {
+    const doc = JSON.parse(new TextDecoder().decode(bytes)) as { updatedAt?: string; updated_at?: string };
+    const at = Date.parse(doc.updatedAt ?? doc.updated_at ?? "");
+    if (!Number.isNaN(at)) h.set("last-modified", new Date(at).toUTCString());
+  } catch {}
+  return new Response(bytes, { status: res.status, statusText: res.statusText, headers: h });
+}
+
 export async function handleNotes(
   req: Request,
   store: Store,
@@ -1499,6 +1526,22 @@ export async function handleNotes(
   tagScope: TagScopeCtx = NO_TAG_SCOPE,
   writeCtx: WriteCtx = NO_WRITE_CTX,
 ): Promise<Response> {
+  const res = await handleNotesBase(req, store, subpath, vault, tagScope, writeCtx);
+  return req.method === "GET" && /^\/[^/]+$/.test(subpath) ? withValidators(res) : res;
+}
+
+async function handleNotesBase(
+  req: Request,
+  store: Store,
+  subpath: string,
+  vault?: string,
+  tagScope: TagScopeCtx = NO_TAG_SCOPE,
+  writeCtx: WriteCtx = NO_WRITE_CTX,
+): Promise<Response> {
+  // HEAD on one note is GET's answer without the body (0.9.3): same lookup, same tag scope, same headers.
+  if (req.method === "HEAD" && /^\/[^/]+$/.test(subpath)) {
+    return headOf(await handleNotes(new Request(req.url, { method: "GET", headers: req.headers }), store, subpath, vault, tagScope, writeCtx));
+  }
   try {
     const res = await handleNotesInner(req, store, subpath, vault, tagScope, writeCtx);
     const pending = PENDING_TYPES.get(req);
@@ -1669,7 +1712,12 @@ async function handleNotesInner(
         const parsed = parseNotesQueryOpts(url, tagScope);
         if (parsed.error) return parsed.error;
         try {
-          const semanticResult = await store.semanticSearch(nearText, { ...parsed.queryOpts, cursor: undefined });
+          // A scoped pass ranks over the notes it can see, so its page is full (0.9.3; it used to be cut after the limit).
+          const semanticResult = await store.semanticSearch(nearText, {
+            ...parsed.queryOpts,
+            cursor: undefined,
+            visible: buildExpandVisibility(tagScope.allowed, tagScope.raw),
+          });
           // `scan` (0.9.2): a metadata operator or date_filter on a field that isn't indexed.
           const semanticWarnings: QueryWarning[] = [...collectScanWarnings(db, { metadata: parsed.queryOpts?.metadata, dateFilter: parsed.queryOpts?.dateFilter })];
           if (semanticResult.pendingCount > 0) {
@@ -1836,7 +1884,7 @@ async function handleNotesInner(
         // "Only whitespace/quotes" (vault#551 edge case) — short-circuit
         // BEFORE ever calling FTS5 rather than risk a syntax error (or a
         // meaningless always-empty query) on a degenerate escaped phrase.
-        if (mode === "literal" && buildLiteralSearchQuery(search).isEmpty) {
+        if ((mode === "literal" && buildLiteralSearchQuery(search).isEmpty) || (mode === "hybrid" && anyTermsQuery(search) === "")) {
           rawResults = [];
           searchWarnings.push(emptySearchWarning());
         } else {
@@ -1845,7 +1893,7 @@ async function handleNotesInner(
             // (structured `invalid_search_syntax`, vault#551) instead of
             // the pre-#551 silent `[]` — caught below and formatted the
             // same way the structured-query path formats a `QueryError`.
-            rawResults = await store.searchNotes(search, {
+            const searchOpts = {
               ...parsed.queryOpts,
               mode,
               // Search has no offset/cursor/orderBy contract (offset is
@@ -1855,7 +1903,30 @@ async function handleNotesInner(
               orderBy: undefined,
               // Fix 8: a scoped pass's answer is ranked over what it can see.
               visible: buildExpandVisibility(tagScope.allowed, tagScope.raw),
-            });
+            };
+            if (mode === "hybrid") {
+              // T-461: keyword + meaning, fused by rank: the same call MCP makes (core/src/store.ts hybridSearch), so
+              // the two doors answer the same ids. Both arms run under `visible`; sort doesn't apply (ranked by relevance).
+              if (!store.hybridSearch) {
+                return json(
+                  { error: 'search_mode "hybrid" isn\'t supported by this vault\'s store; use "literal".', code: "INVALID_QUERY", error_type: "invalid_query", field: "search_mode", hint: 'pass search_mode=literal' },
+                  400,
+                );
+              }
+              if (parseQuery(url, "sort") !== null) {
+                searchWarnings.push(ignoredParamWarning("sort", 'search_mode "hybrid" ranks by relevance; pass search_mode=literal to sort by date'));
+              }
+              const { mode: _m, sort: _s, ...hybridOpts } = searchOpts;
+              const h = await store.hybridSearch(search, hybridOpts);
+              rawResults = h.notes;
+              if (h.meaning === "unavailable") {
+                searchWarnings.push({ code: "semantic_unavailable", message: `hybrid search ranked by keyword only: ${h.meaningReason ?? "no embedding provider"}` });
+              } else if (h.pendingCount > 0) {
+                searchWarnings.push(embeddingsPendingWarning(h.pendingCount, h.totalCandidates));
+              }
+            } else {
+              rawResults = await store.searchNotes(search, searchOpts);
+            }
           } catch (e: any) {
             if (e && e.name === "QueryError") {
               return json(
@@ -4574,6 +4645,8 @@ export async function handleVault(
    * Notes app sets audio_retention with a read+write token).
    */
   descriptionForbidden: (() => Response) | null = () => descriptionNeedsAdmin(vaultConfig.name, []),
+  /** When the last full export went out and to which key (export-stamp.ts). Passed for an admin only. */
+  lastExport: { last_export_at: string | null; last_export_by: string | null } | null = null,
 ): Promise<Response> {
   const url = new URL(req.url);
 
@@ -4582,6 +4655,7 @@ export async function handleVault(
     // Transcription capability flag — `enabled` iff a provider is configured
     // and available. `minutes_remaining` is omitted (cloud/plan concern;
     // self-host is unmetered). This is the field Notes gates the mic on.
+    if (lastExport) Object.assign(result, lastExport);
     result.transcription = await resolveCapability();
     // Embeddings capability flag (semantic search MVP, EXPERIMENTAL) — same
     // "configured AND available" contract as transcription above. This is
