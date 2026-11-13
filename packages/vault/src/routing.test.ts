@@ -3270,7 +3270,13 @@ describe("GET /api/export concurrency cap (0.9.3, T-463)", () => {
     expect(c.status).toBe(429);
     expect(c.headers.get("Retry-After")).toBe("5");
     await a.arrayBuffer(); // read to the end: the slot is released
-    expect((await pull()).status).toBe(200);
+    const d = await pull();
+    expect(d.status).toBe(200); // b and d now hold both slots
+    expect((await pull()).status).toBe(429);
     await b.body!.cancel(); // an abandoned pull frees its slot too
+    const e = await pull();
+    expect(e.status).toBe(200);
+    await d.body!.cancel();
+    await e.body!.cancel();
   });
 });
