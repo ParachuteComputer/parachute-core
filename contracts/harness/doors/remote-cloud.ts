@@ -7,7 +7,7 @@
 // staging deploy), links a made-up owner key to it (0.9.1), and writes <dir>/door.json for `bun run doors -- --remote`
 // with the session in <dir>/session.json and the key in <dir>/owner.key (all mode 600; never printed). A
 // `parachute.computer` host is refused: the contracts make and delete vaults.
-import { mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { allowOrigins, safeFetch } from "../guard.ts";
 import { linkOwnerKeyOnCloud, makeOwnerKey, signUp } from "./workers.ts";
@@ -41,8 +41,13 @@ const owner = await makeOwnerKey();
 if (release.startsWith("0.9")) await linkOwnerKeyOnCloud(issuer, bearer, owner.secretKey);
 
 mkdirSync(out, { recursive: true, mode: 0o700 });
-writeFileSync(join(out, "session.json"), JSON.stringify({ cookie: me.cookie, csrf: me.csrf }), { mode: 0o600 });
-writeFileSync(join(out, "owner.key"), `${owner.secretKey}\n`, { mode: 0o600 });
+// `mode` applies only to a new file: chmod too, so a reused folder's older, wider file is narrowed.
+const secret = (name: string, text: string) => {
+  writeFileSync(join(out, name), text, { mode: 0o600 });
+  chmodSync(join(out, name), 0o600);
+};
+secret("session.json", JSON.stringify({ cookie: me.cookie, csrf: me.csrf }));
+secret("owner.key", `${owner.secretKey}\n`);
 const door = {
   kind: "cloud",
   label: `cloud-${release}`,
@@ -52,5 +57,5 @@ const door = {
   signIn: { how: "cookie", cookieFile: join(out, "session.json") },
   ...(release.startsWith("0.9") ? { ownerKeyFile: join(out, "owner.key") } : {}),
 };
-writeFileSync(join(out, "door.json"), `${JSON.stringify(door, null, 2)}\n`, { mode: 0o600 });
+secret("door.json", `${JSON.stringify(door, null, 2)}\n`);
 console.log(`door file: ${join(out, "door.json")} (account ${me.email.replace(/\+.*@/, "+…@")}, ${release})`);

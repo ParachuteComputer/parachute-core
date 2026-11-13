@@ -233,16 +233,15 @@ async function startRemote(): Promise<Started> {
   // any, is in ownerKeyFile. Neither is ever written into a door file or a result.
   const session = byCookie ? (JSON.parse(readFileSync(d.signIn.cookieFile!, "utf8")) as { cookie: string; csrf: string }) : null;
   const secretKey = byCookie ? null : readFileSync(d.signIn.secretKeyFile!, "utf8").trim();
-  const ownerKey = d.ownerKeyFile ? readFileSync(d.ownerKeyFile, "utf8").trim() : (secretKey ?? undefined);
   const bearerNow = () => (session ? accountBearer(d.issuer, session) : accountBearerByKey(d.issuer, secretKey!));
   const id = randomBytes(3).toString("hex");
   const [vault, other] = [`doorrun${id}`, `doorother${id}`];
   const bearer = await bearerNow();
   await ensureVault(d.issuer, bearer, vault);
   await ensureVault(d.issuer, bearer, other);
-  const { ownerKeyFile: _k, ...door } = d;
   return {
-    door: { ...door, vault, otherVault: other, ...(session ? { signIn: { how: "cookie" as const, ...session } } : {}), ...(ownerKey ? { ownerKey } : {}) } as Door,
+    // The door file the suite reads keeps the file paths, never what they hold (suites/door/_door.ts reads them).
+    door: { ...d, vault, otherVault: other } as Door,
     provenance: `remote: ${d.label} at ${new URL(d.issuer).host} and ${new URL(d.vaultOrigin).host}`,
     stop: async () => {
       const b = await bearerNow();
