@@ -510,8 +510,17 @@ function resolveDeps(d: DoctorDeps | undefined): ResolvedDeps {
  *   - manager `inactive`/`no-unit` + no `/health` → FAIL ("hub is not running").
  * Never throws — a manager-query failure degrades to the `/health` verdict.
  */
+/**
+ * The hub port doctor checks: the running hub's own record first; then PORT, which `serve` takes its port from
+ * (parachute.yaml's server.port is copied there before any hub command runs, 0.9.3); then the default.
+ */
+function doctorHubPort(configDir: string): number {
+  const envPort = Number.parseInt(process.env.PORT ?? "", 10);
+  return readHubPort(configDir) ?? (envPort > 0 && envPort <= 65535 ? envPort : HUB_UNIT_DEFAULT_PORT);
+}
+
 async function checkHubReachable(configDir: string, deps: ResolvedDeps): Promise<CheckResult> {
-  const port = readHubPort(configDir) ?? HUB_UNIT_DEFAULT_PORT;
+  const port = doctorHubPort(configDir);
   let healthy = false;
   try {
     healthy = await deps.probeHubHealth(port);
@@ -590,7 +599,7 @@ async function checkHubReachable(configDir: string, deps: ResolvedDeps): Promise
  * Never throws — every read is bounded + degrades to a benign verdict.
  */
 async function checkLoopbackHijack(configDir: string, deps: ResolvedDeps): Promise<CheckResult> {
-  const port = readHubPort(configDir) ?? HUB_UNIT_DEFAULT_PORT;
+  const port = doctorHubPort(configDir);
   const title = `No loopback hijack on :${port}`;
 
   let record: HubInstanceRecord | null = null;
@@ -1097,7 +1106,7 @@ function checkOperatorToken(
   // Build the issuer set the live auth path validates against (loopback aliases
   // ∪ expose-state public origin ∪ platform origin). Seed with the resolved
   // loopback issuer so a never-exposed box still has its own loopback in the set.
-  const seedIssuer = `http://127.0.0.1:${readHubPort(configDir) ?? HUB_UNIT_DEFAULT_PORT}`;
+  const seedIssuer = `http://127.0.0.1:${doctorHubPort(configDir)}`;
   let knownIssuers: readonly string[] = [];
   try {
     knownIssuers = buildKnownIssuersForOperatorToken(configDir, seedIssuer);

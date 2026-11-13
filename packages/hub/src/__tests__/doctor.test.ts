@@ -228,6 +228,24 @@ describe("doctor — failure modes (each detected in isolation; others stay gree
     }
   });
 
+  test("the hub's port from PORT (parachute.yaml's server.port is copied there) is the one probed, not 1939", async () => {
+    const h = makeHarness();
+    const saved = process.env.PORT;
+    process.env.PORT = "47311";
+    try {
+      seedCurrentManifest(h.manifestPath);
+      seedOperatorToken(h.configDir);
+      const probed: number[] = [];
+      const { checks } = await runDoctor(h, healthyDeps({ probeHubHealth: async (port: number) => { probed.push(port); return port === 47311; } }));
+      expect(probed[0]).toBe(47311);
+      expect(byName(checks, "hub-reachable")?.status).toBe("pass");
+      expect(byName(checks, "hub-reachable")?.title).toContain(":47311");
+    } finally {
+      if (saved === undefined) delete process.env.PORT; else process.env.PORT = saved;
+      h.cleanup();
+    }
+  });
+
   test("a configured module that doesn't answer /health on a healthy hub → that module FAILs", async () => {
     const h = makeHarness();
     try {
