@@ -23,7 +23,7 @@ import { readVaultConfig, readGlobalConfig, writeGlobalConfig, writeVaultConfig,
 import { existsSync, rmSync } from "fs";
 import { migrateVaultKeys } from "./token-store.ts";
 import { resolveFirstBootVaultName, reservedNameSquatWarnings } from "./vault-name.ts";
-import { getVaultStore, getVaultNameForStore, getSharedEmbeddingProvider, closeAllStores, resetSharedEmbeddingProvider, evictVaultStore, vaultIdentity, setVaultReplacedHandler } from "./vault-store.ts";
+import { beingMadeResponse, getVaultStore, getVaultNameForStore, getSharedEmbeddingProvider, closeAllStores, resetSharedEmbeddingProvider, evictVaultStore, vaultIdentity, setVaultReplacedHandler } from "./vault-store.ts";
 import { EmbeddingWorker, registerEmbeddingHook } from "./embedding-worker.ts";
 import { startAttachmentTicketSweep, stopAttachmentTicketSweep } from "./attachment-tickets.ts";
 import { seedOnboardingNotesBestEffort } from "./onboarding-seed.ts";
@@ -854,6 +854,8 @@ export async function startVault(opts: StartVaultOptions = {}): Promise<RunningV
           if (err instanceof VaultImportPausedError || err instanceof MirrorRetiredError) {
             return said(Response.json({ error_type: err.error_type, message: err.message }, { status: err.status, headers: corsHeaders }));
           }
+          const beingMade = beingMadeResponse(err, corsHeaders);
+          if (beingMade) return said(beingMade);
           console.error(`[${req.method} ${path}]`, err);
           return said(Response.json(
             { error: "Internal server error" },

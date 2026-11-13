@@ -134,7 +134,7 @@ import {
 } from "./transcription-routes.ts";
 import { getMirrorManager } from "./mirror-registry.ts";
 import { buildUsageReport } from "./usage.ts";
-import { collectExportEntries, tarSize, tarStream } from "./export-tar.ts";
+import { collectExportEntries, tarSize, tarStream, tryAcquireExport } from "./export-tar.ts";
 import { readLastExport, recordExport } from "./export-stamp.ts";
 import { handleTicketSpend } from "./attachment-tickets.ts";
 import { ON_BEHALF_HEADER, resolveBy } from "../core/src/write-stamp.ts";
@@ -273,6 +273,14 @@ async function handleExport(req: Request, store: Store, vaultConfig: VaultConfig
   const since = url.searchParams.get("since") ?? undefined;
   const exportedAt = url.searchParams.get("exported_at") ?? undefined;
   const name = vaultConfig.name;
+  // At most a few pulls of one vault at once: each holds all the note text in memory before its first byte.
+  const release = tryAcquireExport(name);
+  if (!release) {
+    return Response.json(
+      { error: "too_many_exports", message: "Too many exports of this vault are running. Try again shortly." },
+      { status: 429, headers: { "Retry-After": "5" } },
+    );
+  }
   let entries;
   try {
     ({ entries } = await collectExportEntries(
@@ -281,12 +289,13 @@ async function handleExport(req: Request, store: Store, vaultConfig: VaultConfig
       assetsDir(name),
     ));
   } catch (err) {
+    release();
     console.error(`[export ${name}] failed: ${(err as Error).message}`);
     return Response.json({ error: "export_failed", message: "Export could not be assembled. Please retry." }, { status: 500 });
   }
   const ts = new Date().toISOString().replace(/[:.]/g, "-");
   // A `?since=` pull is a piece of the vault, not a backup: it does not move the stamp.
-  return new Response(tarStream(entries, () => { if (!since) recordExport(name, by); }), {
+  return new Response(tarStream(entries, () => { if (!since) recordExport(name, by); }, release), {
     status: 200,
     headers: {
       "Content-Type": "application/x-tar",
