@@ -251,6 +251,14 @@ export interface VaultConfig {
   auto_transcribe?: {
     enabled?: boolean;
   };
+  /**
+   * Search settings for this vault (0.9.3). `auto_hybrid`: true/false overrides the default for whether a 4+ word
+   * question with no `search_mode` is ranked by keyword and meaning together (core's `HYBRID_AUTO_DEFAULT`); unset
+   * follows the default. Vault-wide: set by an admin, never by a tag-scoped key.
+   */
+  search?: {
+    auto_hybrid?: boolean;
+  };
   /** Note history policy; read once when the vault store opens (vault#524). */
   history?: {
     enabled?: boolean;
@@ -595,6 +603,11 @@ function serializeVaultConfig(config: VaultConfig): string {
     lines.push(`  enabled: ${config.auto_transcribe.enabled}`);
   }
 
+  if (config.search?.auto_hybrid !== undefined) {
+    lines.push("search:");
+    lines.push(`  auto_hybrid: ${config.search.auto_hybrid}`);
+  }
+
   if (config.transcription?.context?.length) {
     lines.push("transcription:");
     lines.push("  context:");
@@ -901,6 +914,20 @@ function parseVaultConfig(yaml: string, name: string): VaultConfig {
       const m = line.match(/^\s+enabled:\s*(true|false)/);
       if (m) {
         config.auto_transcribe = { enabled: m[1]! === "true" };
+        break;
+      }
+    }
+  }
+
+  // Per-vault search settings: `search:` with an indented `auto_hybrid: true|false`.
+  const searchStart = yaml.match(/^search:\s*$/m);
+  if (searchStart) {
+    const after = yaml.slice((searchStart.index ?? 0) + searchStart[0].length);
+    for (const line of after.split("\n")) {
+      if (line.match(/^\S/) && line.trim().length > 0) break; // next top-level key
+      const m = line.match(/^\s+auto_hybrid:\s*(true|false)\s*(?:#.*)?$/);
+      if (m) {
+        config.search = { auto_hybrid: m[1]! === "true" };
         break;
       }
     }

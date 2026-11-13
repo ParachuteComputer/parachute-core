@@ -1398,7 +1398,7 @@ export async function route(
     // description edit unless this is null (admin).
     const descriptionForbidden = hasScopeForVault(auth.scopes, vaultName, "admin")
       ? null
-      : () => descriptionNeedsAdmin(vaultName, auth.scopes);
+      : (what?: string) => descriptionNeedsAdmin(vaultName, auth.scopes, what);
     return handleVault(
       req,
       store,
