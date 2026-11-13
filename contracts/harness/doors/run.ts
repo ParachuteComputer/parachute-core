@@ -12,7 +12,8 @@
 //                                                        sandbox (it needs the network), DOOR_REMOTE_HOSTS names it
 //
 //   CANDIDATE_DIR=<dir>     the box: a built candidate (default .cache/candidate-core, from `bun run build:core`)
-//   CLOUD_REPO=<dir>        cloud: a parachute-cloud checkout, dependencies installed, engine pin materialised
+//   CLOUD_REPO=<dir>        cloud: a parachute-cloud checkout, dependencies installed, engine pin materialised; its
+//                           pin's version picks the release line (0.8, or 0.9.1 with a linked owner key)
 //   PERSONAL_REPO=<dir>     personal: a checkout that has the single-owner profile (OWNER_PUBKEY)
 //   DOOR_RESULTS=<dir>      where the results go (default .cache/doors); the only thing a run leaves behind
 //
