@@ -243,7 +243,8 @@ Every statement passes line 1, is no more than ten minutes ahead of the vault's 
    statements are filed in bulk (a restore, an import, the door filing its copy), grants, held events and those
    disagreeing events go in first, oldest first by `created_at`, ties by the lower event id; then every revoke, whatever its
    date; then line 7 (one grant per grantee) is judged again for every event held only because of it that the
-   vault had filed before (the door's copy marks each statement it saw filed). An event line 7 refused when it
+   vault had filed before (the door's copy and an export mark each statement the vault had filed; one with no mark,
+   as in an older export, counts as not filed). An event line 7 refused when it
    arrived stays held, as it would on a live vault; it comes into force only when someone files it again (below).
    So the same set always gives the same answer, a revoke always finds its address, and a key granted again after a revoke keeps
    its new grant. An owner with two keys replaces a grant with
@@ -762,7 +763,7 @@ that the signed-in owner agreed.
 
 | When | Status and `error` |
 |---|---|
-| malformed event (any kind: tags that aren't lists of strings, a string that isn't well-formed Unicode or holds a control other than tab, line feed, carriage return, backspace or form feed, §2.2 line 1); tags other than exactly `d` and `expiration`, or tags that disagree with the content; content not in its canonical spelling; an unknown field, key or verb; over the size limits; no date, a date already past or more than 366 days out; a statement created more than ten minutes ahead of the vault's clock; incoherent verbs; a reserved or malformed prefix; `was` or a missing `under` on a member-signed grant, an `under` that isn't the signer's own grant, or a `to.by` other than `signer` on one; a dot in a member's own id | 400 `invalid_statement` |
+| malformed event (any kind: tags that aren't lists of strings, a string that isn't well-formed Unicode or holds a control other than tab, line feed, carriage return, backspace or form feed, §2.2 line 1); tags other than exactly `d` and `expiration`, or tags that disagree with the content; content not in its canonical spelling; an unknown field, key or verb; over the size limits; no date, a date already past or more than 366 days out; a statement arriving on the wire created more than ten minutes ahead of the vault's clock (a revoke from the door's copy or an import is filed whatever its date, §3); incoherent verbs; a reserved or malformed prefix; `was` or a missing `under` on a member-signed grant, an `under` that isn't the signer's own grant, or a `to.by` other than `signer` on one; a dot in a member's own id | 400 `invalid_statement` |
 | the id or signature doesn't verify | 400 `bad_signature` |
 | it names another vault (`honors`), or isn't `at: parachute`, `gives: access`; a revoke for another vault | 400 `wrong_vault` |
 | the signer has no standing here; a revoke from a key that may not end that address; a claim from a key the link doesn't name | 403 `no_standing` |
@@ -821,7 +822,7 @@ things under `.parachute/`: stamps, history and links. 1.0 adds statements to th
 | The vault's id | kept on a move, new on a copy (§2.3) |
 | The vault's private key | **never.** The arriving door makes a new key pair. The owner's tap below also signs an override naming it; for an owner with no key, `tools/move` asks the leaving door for a handover record (§2.3). Until one of those is filed, the arriving vault serves but doesn't sign as itself. The leaving door deletes every private key it held for the vault |
 | The vault's records (kind 37443) | in `statements.jsonl` with every statement, so the arriving vault can still follow the key from the id |
-| Every statement, word for word: grants, revokes, links, claims, vault records, the unfiled events that hold an address suspended, and every event line 6 counted that disagrees on `to` or `under` | in `.parachute/statements.jsonl`, one signed event per line. Filed again and verified again on arrival, then merged with any copy the arriving door already keeps for that vault id (§3): its revokes apply; its grants don't come into force by themselves (below) |
+| Every statement, word for word: grants, revokes, links, claims, vault records, the unfiled events that hold an address suspended, and every event line 6 counted that disagrees on `to` or `under` | in `.parachute/statements.jsonl`, one signed event per line, each marked with whether the vault had filed it (§2.2 line 6). Filed again and verified again on arrival, then merged with any copy the arriving door already keeps for that vault id (§3): its revokes apply; its grants don't come into force by themselves (below) |
 | The owner-key list and each prefix's service keys, with dates | for reading history only: so an old statement can still be checked. A carried key has no standing at the new door |
 | **Revokes** | **in force at once.** Carrying a revoke can only close. A carried revoke is judged against the carried owner-key list and its dates: if its signer had standing for that address when it was signed, it applies, though that key has no standing at the new door. The arriving door files the carried grants (as `carried`) before it judges the carried revokes, so a grantee's own giving-up and an early revoke find their address |
 | **Links and claims** | **in force at once.** They open nothing. |
