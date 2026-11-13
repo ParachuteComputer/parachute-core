@@ -1,11 +1,12 @@
 /**
- * Field values in search (0.9.2): the index step that adds a `fields` column to notes_fts without a schema number, and
+ * Field values in search (0.9.3): the index step that adds a `fields` column to notes_fts without a schema number, and
  * the triggers that keep it right. The cross-engine part (a 0.9.2 engine editing a vault this build migrated) is
  * proven against a real build of the previous code, see the PR; here a vault in the 0.9.2 shape is made by hand.
  */
 import { describe, expect, it } from "bun:test";
 import { Database } from "bun:sqlite";
 import { initSchema, SCHEMA_VERSION, unnumberedStepsDone } from "./schema.js";
+import { computeSearchDidYouMean } from "./query-warnings.js";
 import * as noteOps from "./notes.js";
 
 /** A vault the way a 0.9.2 engine leaves it: two-column index, triggers that watch content and path only. */
@@ -113,6 +114,49 @@ describe("notes_fts field values", () => {
     noteOps.createNote(db, "", { id: "f", path: "r/f", metadata: { line: "narwhalq" } });
     noteOps.createNote(db, `intro\n\n${"filler words about nothing much ".repeat(300)} narwhalq`, { id: "b", path: "r/b" });
     expect(ids(db, "narwhalq")).toEqual(["b", "f"]);
+  });
+
+  it("a title that holds the word does not lift a field-only hit above a body hit", () => {
+    const db = new Database(":memory:");
+    initSchema(db);
+    noteOps.createNote(db, "Party planning\n\nnothing here", { id: "f", path: "r/f", metadata: { kind: "art" } });
+    noteOps.createNote(db, "Notes\n\nthis is about art and more", { id: "b", path: "r/b" });
+    noteOps.createNote(db, "Art club\n\nsomething", { id: "t", path: "r/t" });
+    expect(ids(db, "art")).toEqual(["t", "b", "f"]);
+  });
+
+  it("did_you_mean for a typo of a field-only word suggests the word, not its stem", () => {
+    const db = new Database(":memory:");
+    initSchema(db);
+    noteOps.createNote(db, "", { id: "p", path: "r/p", metadata: { plant: "propolis harvesting" } });
+    expect(computeSearchDidYouMean(db, "propolsi")).toBe("propolis");
+  });
+
+  it("a leftover field-text row for a record with no field values is cleared on insert", () => {
+    const db = new Database(":memory:");
+    initSchema(db);
+    db.prepare("INSERT INTO notes_field_text(note_id, text) VALUES ('y', 'ghostwordzz')").run();
+    noteOps.createNote(db, "plain", { id: "y", path: "r/y" });
+    expect(ids(db, "ghostwordzz")).toEqual([]);
+    expect(db.prepare("SELECT count(*) c FROM notes_field_text").get()).toEqual({ c: 0 });
+    db.exec("INSERT INTO notes_fts(notes_fts, rank) VALUES('integrity-check', 1)");
+  });
+
+  it("a vault that has the earlier insert trigger is given the current one on the next open", () => {
+    const db = new Database(":memory:");
+    initSchema(db);
+    db.exec(`DROP TRIGGER notes_fts_insert;
+      CREATE TRIGGER notes_fts_insert AFTER INSERT ON notes BEGIN
+        INSERT OR REPLACE INTO notes_field_text(note_id, text) SELECT new.id, t FROM (SELECT json_extract(new.metadata, '$.a') AS t) WHERE t <> '';
+        INSERT INTO notes_fts(rowid, path, content, fields) VALUES (new.rowid, COALESCE(new.path, ''), new.content, COALESCE((SELECT text FROM notes_field_text WHERE note_id = new.id), ''));
+      END;`);
+    expect(unnumberedStepsDone(db)).toBe(false);
+    initSchema(db);
+    expect(unnumberedStepsDone(db)).toBe(true);
+    db.prepare("INSERT INTO notes_field_text(note_id, text) VALUES ('y', 'ghostwordzz')").run();
+    noteOps.createNote(db, "plain", { id: "y", path: "r/y" });
+    expect(ids(db, "ghostwordzz")).toEqual([]);
+    db.exec("INSERT INTO notes_fts(notes_fts, rank) VALUES('integrity-check', 1)");
   });
 
   it("a scoped search (throwaway index over visible notes) finds field words and hides the rest", () => {
