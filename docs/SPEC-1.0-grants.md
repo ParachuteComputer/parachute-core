@@ -162,7 +162,8 @@ This pin carries round 7's four answers, so the vector precondition is met. When
 file never changes: every door, minter and shell replays it, at this commit and sha256, before it files or signs.
 Its answers are a v1 vault's. A later version may answer a case differently only where this spec lets it: by filing an
 event v1 held (the address was suspended at v1, so no older grant returns), or by taking a revoke v1 refused for its
-date. It never ignores a revoke or a `to`/`under` split that v1 acts on, and says so in a vector file of its own. The pin answers decisions D (a grant may run 366 days) and E (a member signs for their own
+date; or by refusing what v1 filed (that event is then held and suspends its address). It never ignores a revoke
+or a `to`/`under` split that v1 acts on. Each such change is said in a vector file of its own. The pin answers decisions D (a grant may run 366 days) and E (a member signs for their own
 agents) as Aaron decided them on 11-13, so nothing is re-pinned.
 
 **The split mark fails closed.** When a door sees an older event that disagrees on `to` or `under`, it records
@@ -231,11 +232,13 @@ dropped for its date either: one dated ahead is held and suspends its address), 
 6. **The id is free or the same:** no revoke stands against its address (§3). Ids are one namespace per vault,
    shared with door grants (§7.3), and an id is never reused: an `id` that was **ever** on file under another
    signer or for another grantee is taken, ended or not, because `grant:<id>` stays on what it wrote. A member's
-   own grant (`by self`) has an id with no dot. A member's agents' ids start with that id and a dot (`bo.claude`),
+   own grant (`by self`) has an id with no dot (`invalid_statement`, line 8). A member's agents' ids start with that id and a dot (`bo.claude`),
    and nobody else may use that start, so a member can't take an id the owner will want (`id_taken`). For a
-   member-signed grant, line 8's rule for `under` is checked before this start rule: a missing `under`, or one that
-   isn't the signer's own grant, is `invalid_statement` whatever the id; with the right `under`, an id that doesn't
-   start with it and a dot is `id_taken`. If an event with this
+   member-signed grant the order within this line is, as the pinned vectors have it: first the answers about the
+   address (a revoke stands, a newer event is on file, an id that was another signer's or grantee's, or a `to` or
+   `under` that differs from an event seen there), each as below; then line 8's member rules (`under` missing or not
+   the signer's own grant, `to.by` other than `signer`, a `was`), `invalid_statement`; then the start rule, an id
+   that doesn't start with the `under` and a dot, `id_taken`. If an event with this
    address is on file, this one is newer by `created_at` (on a tie the lower event id wins, as in NIP-01, so two
    copies always merge to the same answer), it is signed by the same key, and its `to` and `under` are
    byte-identical to every event at that address the vault has seen that passes what holding needs (below), whatever
@@ -834,7 +837,7 @@ things under `.parachute/`: stamps, history and links. 1.0 adds statements to th
 | The owner-key list and each prefix's service keys, with dates | for reading history only: so an old statement can still be checked. A carried key has no standing at the new door |
 | **Revokes** | **in force at once.** Carrying a revoke can only close. A carried revoke is judged against the carried owner-key list and its dates: if its signer had standing for that address when it was signed, it applies, though that key has no standing at the new door. The arriving door files the carried grants (as `carried`) before it judges the carried revokes, so a grantee's own giving-up and an early revoke find their address |
 | **Links and claims** | **in force at once.** They open nothing. |
-| **Signed grants still within their date** | **`carried`, not in force,** until the owner brings them over: one confirmation for the whole import, no new grant signed [lean, open decision C]; the same tap signs the vault's new-key override (§2.3). Only grants whose signer is an owner key *at the new door* can come into force; the rest are `ended`. A grant whose signer left the carried owner-key list at any time after it was signed arrives `ended` |
+| **Signed grants still within their date** | **`carried`, not in force,** until the owner brings them over: one confirmation for the whole import, no new grant signed [lean, open decision C]; the same tap signs the vault's new-key override (§2.3). Only grants whose signer is an owner key *at the new door* can come into force; the rest are `ended`. An address any of whose events' signer left the carried owner-key list at any time after signing it arrives `ended`, as on a live vault (§2.2) |
 | **A signed grant that turns up later** | At a vault that arrived by import, every signed grant dated before the arrival is filed as `carried`, whoever files it and whenever, whatever copy the door kept from an earlier stay. At a vault restored in place, the same holds for a signed grant the door's current copy doesn't hold as in force. Only the owner's confirmation brings a carried grant into force. So a grantee can't walk an old grant past the tap |
 | Door grants (OAuth apps, named keys, an email-only owner's grants) | history only. Each is made again at the new door. |
 | Tokens, keys, sessions | never |
@@ -964,7 +967,8 @@ checked has such a name). The vault map that reads `lives` (§2.3) and signed re
   limits in bytes; the fixed `purpose` rule; the vault's own record, overrides, handovers and where its key lives.
   Weighed and reviewed in T-462 (three fresh reviewers, then one on this text: §D).
 - **This spec's own, frozen with decision A:** the kind numbers; revoke as its own final event; refusing unknown
-  tags; `by signer | self | names` and `was` (inside `to`). **Still [lean]:** `applet:<id>` as the via stamp; the
+  tags; `by signer | self | names` and `was` (inside `to`), with the spelling `applet:<id>` a `was` may carry.
+  **Still [lean]:** the use of `applet:<id>` as the via stamp; the
   wire; door grants; the one-tap carry on a move. The vault id is decided (H).
 - **Changed from the attribution note §2.9:** the note had an applet hold a named key (`key:applet.arcade`).
   Aaron's reply the same day was that in-shell applets write with his key or Uni's, so here an applet grant has no
@@ -1101,4 +1105,12 @@ scope for 37443 (they change at the freeze); the `purpose` blank list written ou
 **[frozen, decision A]** instead of [lean] or open (§2.1, the five kinds, the newest-event rule with the minimal read,
 Appendix A); row A and §2.3 agree that the link, claim and vault-record kinds freeze while their strict, versioned
 contents change only by a new `v`; §2.1 writes out the `purpose` blank list (the shell-keys core's `_BLANKS` at
-ba7a6bd). Result of the fresh check: below.
+ba7a6bd). A fresh adversarial Fable reviewer, not used before, on 48ec9254..508f6807 (pin sha256 checked; the blank
+list diffed against `PURPOSE_BAD`: equal): **SHIP**, with one point it called non-blocking but of round 9's class:
+"If your bar is round 9's … finding 1 makes this NO-SHIP until its one-clause fix lands". Line 6's new `under`
+sentence said "whatever the id", where the pin answers a split address `id_taken` before the member rules. Held to
+round 9's bar, fixed, with five text points: line 6 now gives the pin's whole order (address answers, then line 8's
+member rules `under`, `to.by`, `was`, then the start rule); a later version may also refuse what v1 filed (held,
+suspends); §9 ends an address, not a grant, when a signer left the owner list; a dotted member id names its refusal;
+the spelling `applet:<id>` is frozen. Left for a later `v`: a v2 vault record has no hold rule (only its kind
+freezes). Second fresh check: below.
