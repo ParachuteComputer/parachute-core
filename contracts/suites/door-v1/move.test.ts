@@ -60,7 +60,7 @@ describe.skipIf(lacks("export-over-http"))("the export a move is made of", () =>
 
     // The vault's own id, the one its info shows.
     const id = (await rest("read").get("/vault")).body?.id;
-    expect(id).toMatch(/^[0-9a-f]{32}$/);
+    expect(id).toMatch(/^[0-9a-f]{64}$/);
     expect(text(byName.get(".parachute/vault.yaml")!)).toMatch(new RegExp(`^id: ["']?${id}["']?$`, "m"));
 
     // No credential anywhere: no token, no key, no session.

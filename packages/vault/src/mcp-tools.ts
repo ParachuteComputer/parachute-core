@@ -23,7 +23,7 @@ import {
   connectionReach,
   type VaultProjection,
 } from "../core/src/vault-projection.ts";
-import { readVaultConfig, writeVaultConfig } from "./config.ts";
+import { readVaultConfig, servedDescription, writeVaultConfig } from "./config.ts";
 import { forceFlag, parentsChange, tagChangeRefusal, type TagChange } from "./tag-change-guard.ts";
 import { stripTagHash } from "../core/src/tag-hierarchy.ts";
 import { getVaultStore } from "./vault-store.ts";
@@ -38,6 +38,7 @@ import {
   doctorNoteTagsPredicate,
   filterHydratedLinksByTagScope,
   noteWithinTagScope,
+  tagScopeVisibility,
   scopeQueryTagParam,
   scrubIndexedFieldConflictError,
   scrubNoteTagsByScope,
@@ -140,7 +141,7 @@ export async function getServerInstruction(
 
   return projectionToMarkdown({
     vaultName,
-    description: config?.description ?? null,
+    description: servedDescription(vaultName, config?.description) ?? null,
     projection,
     coordinates: resolveVaultCoordinates(),
     // Bun always wires an in-process AttachmentTicketProvider AND a fresh
@@ -231,7 +232,7 @@ export function generateScopedMcpTools(
   // use of this) execute. Unscoped sessions install no predicate → the
   // aggregate runs core's fast direct-SQL path.
   const aggregateVisibility = scoped
-    ? (note: Note) => noteWithinTagScope(note, allowedHolder.value, rawTags)
+    ? tagScopeVisibility(() => ({ allowed: allowedHolder.value, rawRoots: rawTags }))
     : undefined;
 
   // Tag-scope hop-guard for `near[]` (vault#439): a per-note predicate the
@@ -328,6 +329,8 @@ export function generateScopedMcpTools(
 
   const tools = generateMcpTools(store, {
     ...(expandVisibility ? { expandVisibility } : {}),
+    // 0.9.3: the vault's own `search.auto_hybrid`, read at each search (unset follows the default).
+    hybridAuto: () => readVaultConfig(vaultName)?.search?.auto_hybrid,
     ...(nearTraversable ? { nearTraversable } : {}),
     ...(ifExistsVisible ? { ifExistsVisible } : {}),
     ...(aggregateVisibility ? { aggregateVisibility, searchVisibility: aggregateVisibility, resolveVisibility: aggregateVisibility } : {}),
@@ -1533,7 +1536,7 @@ function overrideVaultInfo(
 
     const result: Record<string, unknown> = {
       name: config.name,
-      description: config.description ?? null,
+      description: servedDescription(config.name, config.description) ?? null,
       coordinates: {
         name: config.name,
         base_url: coords.hubOriginKnown ? `${coordBase}/vault/${config.name}` : null,

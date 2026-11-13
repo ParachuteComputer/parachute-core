@@ -61,6 +61,7 @@ import { assetsDir } from "./config.ts";
 import type { Note, Store } from "../core/src/types.ts";
 import {
   readVaultConfig,
+  servedDescription,
   readGlobalConfig,
   writeVaultConfig,
   listVaults,
@@ -551,7 +552,7 @@ export async function route(
       const config = readVaultConfig(name);
       return {
         name,
-        description: config?.description,
+        description: servedDescription(name, config?.description),
         created_at: config?.created_at,
       };
     });
@@ -792,7 +793,7 @@ export async function route(
     );
     return Response.json({
       name: vaultName,
-      description: vaultConfig.description,
+      description: servedDescription(vaultName, vaultConfig.description),
       createdAt: vaultConfig.created_at,
       stats,
     });
@@ -1398,7 +1399,7 @@ export async function route(
     // description edit unless this is null (admin).
     const descriptionForbidden = hasScopeForVault(auth.scopes, vaultName, "admin")
       ? null
-      : () => descriptionNeedsAdmin(vaultName, auth.scopes);
+      : (what?: string) => descriptionNeedsAdmin(vaultName, auth.scopes, what);
     return handleVault(
       req,
       store,

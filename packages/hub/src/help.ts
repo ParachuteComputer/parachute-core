@@ -435,14 +435,19 @@ What it does:
     - Exposure: if exposed, is the public origin reachable? If not exposed,
       "loopback only" is reported as benign info, never a warning.
     - Version freshness (cosmetic) — drift is WARN at most, never a failure.
+    - Data: each vault's history hints match its history; no OAuth client
+      registered over 30 days ago sits unused (warnings, fixed by --fix).
 
 Flags:
   --json     emit a single JSON object instead of the human report
-  --fix      repair canonical-port drift in services.json — and ONLY that.
-             It is NOT a "fix everything" flag; every other check stays
-             report-only. Shows the old→new diff first, then confirms before
-             writing (a TTY prompts; --yes skips the prompt; a non-TTY without
-             --yes bails without writing). Idempotent: a clean file is a no-op.
+  --fix      repair canonical-port drift in services.json, rebuild stale
+             history hints of a vault (was \`parachute-vault history
+             rebuild-state\`) and delete OAuth clients nothing uses (was
+             \`parachute auth reap-clients\`) — and ONLY those. It is NOT a
+             "fix everything" flag; every other check stays report-only.
+             Shows what changes first, then confirms before writing (a TTY
+             prompts; --yes skips the prompt; a non-TTY without --yes lists
+             what it would do and changes nothing). Idempotent.
              Duplicate-port collisions are reported, not auto-resolved.
   --yes      skip the --fix confirmation prompt (required to apply in a
              non-interactive shell)

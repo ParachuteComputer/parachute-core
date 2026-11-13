@@ -22,7 +22,7 @@ import {
   type QueryWarning,
 } from "./query-warnings.js";
 import { SEARCH_MODES, buildLiteralSearchQuery, isValidSearchMode, type SearchMode } from "./search-query.js";
-import { anyTermsQuery, HYBRID_AUTO_DEFAULT, HYBRID_TEXT, isQuestionShaped } from "./hybrid.js";
+import { anyTermsQuery, effectiveHybridAuto, HYBRID_TEXT, isQuestionShaped } from "./hybrid.js";
 import * as linkOps from "./links.js";
 import {
   resolveOrQueueLink,
@@ -601,8 +601,12 @@ export interface GenerateMcpToolsOpts {
    * (fix 8, see `searchNotes`). Omitted (unscoped) → the plain FTS path.
    */
   searchVisibility?: (note: Note) => boolean;
-  /** Test seam for the "auto" default; production passes nothing and `HYBRID_AUTO_DEFAULT` (core/src/hybrid.ts) decides. */
-  hybridAuto?: boolean;
+  /**
+   * The vault's own "auto" setting (`search.auto_hybrid`): true or false, or null/undefined to follow
+   * `HYBRID_AUTO_DEFAULT` (core/src/hybrid.ts). A function is read at each search, so a change to the setting
+   * applies to a session already open. Also the test seam.
+   */
+  hybridAuto?: boolean | null | (() => boolean | null | undefined);
   /**
    * `ambiguityVisible` (vault#581 auth review) is an OPTIONAL per-note
    * predicate gating everything the ambiguous-links surface discloses.
@@ -1109,7 +1113,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
         if (params.search_mode !== undefined && params.search_mode !== null) {
           if (typeof params.search_mode !== "string" || !isValidSearchMode(params.search_mode)) {
             throw new QueryError(
-              `invalid \`search_mode\` value ${JSON.stringify(params.search_mode)} — must be one of ${SEARCH_MODES.map((m) => `"${m}"`).join(", ")}. Omit for the default ("literal").`,
+              `invalid \`search_mode\` value ${JSON.stringify(params.search_mode)} — must be one of ${SEARCH_MODES.map((m) => `"${m}"`).join(", ")}.`,
               "INVALID_QUERY",
               {
                 error_type: "invalid_query",
@@ -1334,18 +1338,19 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             } else {
               // T-461 (0.9.3 default, "auto"): a search that reads as a question in plain words (4+ words, 2+ content
               // words), on a vault with meaning search, is answered by hybrid, and says so (`search_auto`), but only while
-              // HYBRID_AUTO_DEFAULT is on (off until Aaron's yes). Measured on
+              // the vault's auto setting is on (the default). Measured on
               // a real 10k-note vault: +0.23 nDCG@10 over literal on 40 recall questions, 27 wins, 2 losses. Shorter
               // searches (ids, URLs, codes, titles, names) stay literal, so exact lookups and existence checks are
               // unchanged; `search_mode: "literal"` keeps today's answer for any search. If the meaning arm can't
               // answer (provider not ready), the literal answer is used. Not with `sort`. A tag-scoped session gets it too: both arms run under its `visible`.
+              // The vault's setting is checked last: it reads vault.yaml, which short, literal and no-embedding searches skip.
               const auto =
-                (opts?.hybridAuto ?? HYBRID_AUTO_DEFAULT) &&
                 searchMode === undefined &&
                 store.hybridSearch &&
-                store.hasMeaningSearch?.() &&
                 params.sort === undefined &&
-                isQuestionShaped(params.search as string)
+                isQuestionShaped(params.search as string) &&
+                store.hasMeaningSearch?.() &&
+                effectiveHybridAuto(typeof opts?.hybridAuto === "function" ? opts.hybridAuto() : opts?.hybridAuto)
                   ? await runHybrid()
                   : undefined;
               if (auto?.meaning === "ok") {

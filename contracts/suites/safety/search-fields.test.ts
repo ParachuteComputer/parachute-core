@@ -1,4 +1,4 @@
-// Field values are searchable (0.9.2 query fixes), and a tag-scoped pass finds no record it can't see by a word in one
+// Field values are searchable (0.9.3 query fixes), and a tag-scoped pass finds no record it can't see by a word in one
 // of that record's field values. The field text sits in the same index as the body, so the scoped search (a throwaway
 // index over the visible notes only, notes.ts searchVisibleOnly) has to carry it too: a visible record is found by
 // its field word, a hidden one isn't, and the hidden one doesn't move the visible one's score.
