@@ -89,7 +89,7 @@ const tagLine = (name: string, parts: unknown[]): string | null => {
 const section = (lines: string[]) => sha([...lines].sort().join("\n"));
 
 /**
- * What the export format (portable-md v1) is known not to carry exactly (audit L2-04, L2-13; fixed by format v2).
+ * What the export format (portable-md v1) is known not to carry exactly (audit L2-04, L2-13; carried by `export --format 2`).
  * Found before a move, so a loss is refused or accepted in advance, never discovered after:
  *   - a field name with anything but letters, digits, `_`, `.` or `-` (a colon, a space, a non-ASCII letter);
  *   - a list directly inside a list, or an empty object inside a list;

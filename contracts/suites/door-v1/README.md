@@ -66,7 +66,7 @@ change them there first, then in the places that call a route or build an event 
 | Call | Shape |
 |---|---|
 | File a statement | `POST <issuer>/account/vaults/<name>/statements` `{event}` → `201 {kind, id, state}` |
-| List them | `GET <issuer>/account/vaults/<name>/statements` → `{grants, links}` |
+| List them | `GET <issuer>/account/vaults/<name>/statements` → `{grants, links, records}` |
 | A grantee's token | `POST <issuer>/account/vaults/<name>/token` with NIP-98 by the grantee key; or the signed-in grantor with `{applet}` |
 | Writing for a person | header `Parachute-On-Behalf-Of: <name>` |
 | Names in stamps | `GET /vault/<name>/api/stamps` → `{stamps: [{name, key, state}]}` |
