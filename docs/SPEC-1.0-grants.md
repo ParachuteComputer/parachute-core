@@ -42,13 +42,16 @@ Bakery, the `recipes` vault.
 
 | # | The question | Lean | Why it's yours |
 |---|---|---|---|
-| A | The five event numbers and their layout (§2.1): the meaning in canonical JSON content, the grant frame Uni's keys use too. The shell can't sign a grant until they are fixed, and a signed one is honoured for good. Freezing fixes: the numbers; §2.1's grant layout; the fields older vaults read forever (a grant's `at`, `honors`, `id`, `to`, `under`; a revoke's `v`, `honors`, `ends`); the minimal read; the 8 KB / 64 KB / 72 KB limits; the vector pin. A link's, a claim's and a vault record's contents stay [lean]. | 37440 grant, 7440 revoke, 37441 link, 37442 claim, 37443 the vault's own record. None is taken in the Nostr list today. Freeze after our own security rounds (Aaron, 11-12: no pass from Benjamin is needed). Round 8 (§D) ended NO-SHIP on the freeze wording; fixed, waiting on one fresh check. The pin also answers D and E as their leans, so freezing it decides them. | Permanent. |
+| A | The five event numbers and their layout (§2.1): the meaning in canonical JSON content, the grant frame Uni's keys use too. The shell can't sign a grant until they are fixed, and a signed one is honoured for good. Freezing fixes: the numbers; §2.1's grant layout; the fields older vaults read forever (a grant's `at`, `honors`, `id`, `to`, `under`; a revoke's `v`, `honors`, `ends`); the minimal read; the 8 KB / 64 KB / 72 KB limits; the vector pin. A link's, a claim's and a vault record's contents stay [lean]. | 37440 grant, 7440 revoke, 37441 link, 37442 claim, 37443 the vault's own record. None is taken in the Nostr list today. Freeze after our own security rounds (Aaron, 11-12: no pass from Benjamin is needed). Round 8 (§D) ended NO-SHIP on the freeze wording; fixed, waiting on one fresh check. D and E are decided as leaned (Aaron, 11-13), as the pin answers them. | Permanent. |
 | B | Can someone with only an email (most of Cloud today) share a vault? | Yes. With no key to sign, the door vouches for the grant, the list says so, and it doesn't carry to another door. | It makes "signed by the owner" untrue for those vaults, plainly marked. |
 | C | After a move, do your friends' grants work at the new door at once? | One tap, once: "bring these 5 grants over". Revokes apply at once with no tap. | A copy left at the old door would keep honouring them. The tap is you saying the old one is retired. |
-| D | The longest a grant may last. | A year. The shell reminds you a month ahead. | Shorter is safer and asks you more often. |
-| E | Who signs for a friend's AI in your shared vault? | The friend does, for their own AI, and it can never reach more than the friend can. | The other way, you approve every friend's every AI. |
 | F | The first shared vault lives where? | Parachute Cloud, once it has key sign-in (it rides 0.9.1's keys). | From the shell note; friends aren't on the tailnet. |
 | G | The sharing contract already in core (`v1/sharing.test.ts`) describes a different model: levels (view, comment, suggest, edit, manage), groups, links for anyone, pages. Does this spec replace it for 1.0? | Yes. 1.0 is keys, types and verbs. Groups, public links, page-level sharing and comment or suggest levels wait for 1.1. | It changes what an existing contract means, which is yours or Benjamin's call. |
+
+**Decided 11-13 (Aaron: "Both as leaned")**
+
+- **D. A grant lasts at most a year** (366 days after it is signed, §2.2 line 5). The shell reminds you a month ahead.
+- **E. A friend signs for their own AI** in your shared vault (§5.2), and it can never reach more than the friend can.
 
 **Two more, for Benjamin as much as you**
 
@@ -158,9 +161,8 @@ This pin carries round 7's four answers, so the vector precondition is met. When
 file never changes: every door, minter and shell replays it, at this commit and sha256, before it files or signs.
 Its answers are a v1 vault's. A later version may answer a case differently only where this spec lets it, and only
 by closing (a `v` or a field it has learned to read; the ten-minute bound on a revoke), and says so in a vector
-file of its own. The pin also answers two open decisions as their leans: a grant may run 366 days (D), and a
-member signs for their own agents (E). Freezing the pin decides both; deciding either another way first means
-#systems re-pins before the freeze.
+file of its own. The pin answers decisions D (a grant may run 366 days) and E (a member signs for their own
+agents) as Aaron decided them on 11-13, so nothing is re-pinned.
 
 **The split mark fails closed.** When a door sees an older event that disagrees on `to` or `under`, it records
 the address as ended in the same write that files or refuses that event. If that write fails, the door refuses the
@@ -222,7 +224,7 @@ Every statement passes line 1, is no more than ten minutes ahead of the vault's 
    equal to the content's `id` and `until`. The content is canonical. A grant with a field, a key, a verb or a tag
    the vault doesn't know is refused, never read around: an unknown field may be a limit the signer meant, and
    skipping it would open more than was signed.
-5. **It ends:** `until` is in the future and at most 366 days after `created_at` [lean, open decision D].
+5. **It ends:** `until` is in the future and at most 366 days after `created_at` [decided 11-13, decision D].
    `created_at` is no more than ten minutes ahead of the vault's clock.
 6. **The id is free or the same:** no revoke stands against its address (§3). Ids are one namespace per vault,
    shared with door grants (§7.3), and an id is never reused: an `id` that was **ever** on file under another
@@ -592,7 +594,7 @@ A member can't make another member, change types or see the grant list beyond th
 An agent is a key with a `by signer` grant. Its writes are *by* its person and *via* its grant, as an AI's are
 today.
 
-- **Its person signs for it.** The vault's owner signs for their agents. A member signs for theirs [lean, open
+- **Its person signs for it.** The vault's owner signs for their agents. A member signs for theirs [decided 11-13,
   decision E], and only `by signer` grants: a member can't make a member or a service (line 8).
 - **It can never reach more than its person.** A member-signed grant names the member's own grant in its `under`
   field. Without one it is malformed; one that names a grant that isn't the signer's own is incoherent (line 8,
@@ -945,6 +947,8 @@ checked has such a name). The vault map that reads `lives` (§2.3) and signed re
   deny by marker, `submit`, agents as principals, one checkpoint, every verifier fails closed, narrowing never
   reaches admin (0.9 SPEC §3.5, ROADMAP 1.0).
 - **Decided 11-12 (Aaron):** a vault's id is its own Nostr key (open decision H, as §2.3 specifies it).
+- **Decided 11-13 (Aaron, "Both as leaned"):** D, a grant lasts at most a year; E, a member signs for their own
+  agents, which never reach past the member.
 - **Decided 11-12 (Aaron): decision A waits on our own security rounds, not Benjamin's.** "I don't think we need a
   security pass from Benjamin. We're discussing some high level parachute ideas with him but we should probably be
   good to go on that work."
@@ -954,8 +958,8 @@ checked has such a name). The vault map that reads `lives` (§2.3) and signed re
   limits in bytes; the fixed `purpose` rule; the vault's own record, overrides, handovers and where its key lives.
   Weighed and reviewed in T-462 (three fresh reviewers, then one on this text: §D).
 - **This spec's own, all marked [lean]:** the kind numbers; revoke as its own final event; refusing
-  unknown tags; the vault id; `by signer | self | names`; member-signed agent grants; `applet:<id>` as the via
-  stamp; `was`; the wire; door grants; the one-tap carry on a move; a year's limit.
+  unknown tags; the vault id; `by signer | self | names`; `applet:<id>` as the via
+  stamp; `was`; the wire; door grants; the one-tap carry on a move.
 - **Changed from the attribution note §2.9:** the note had an applet hold a named key (`key:applet.arcade`).
   Aaron's reply the same day was that in-shell applets write with his key or Uni's, so here an applet grant has no
   key and its stamp is `applet:<id>`. The note said a re-grant "may narrow"; here a replacement may also widen,
@@ -1075,3 +1079,6 @@ came from (before Cloud builds); a member's storage per address (keep the newest
 disagreeing event); a member still learns that a key holds a grant from `exceeds_grantor` (§11's limit); a carried
 revoke's date is the signer's own word (it only closes); the vectors README's "a grant in force" for a grantee's
 revoke and one `why` text are stale (owner: #systems).
+
+**Round 9 (T-462, 11-13).** Aaron, 11-13, on D and E: "Both as leaned". Both are marked decided; the pinned vectors
+already answer them that way, so nothing is re-pinned. Result of the fresh check: below.
