@@ -42,13 +42,19 @@ Bakery, the `recipes` vault.
 
 | # | The question | Lean | Why it's yours |
 |---|---|---|---|
-| A | The five event numbers and their layout (§2.1): the meaning in canonical JSON content, the grant frame Uni's keys use too. The shell can't sign a grant until they are fixed, and a signed one is honoured for good. | 37440 grant, 7440 revoke, 37441 link, 37442 claim, 37443 the vault's own record. None is taken in the Nostr list today. Freeze after one fresh security pass with Benjamin. | Permanent. Benjamin should see it. |
 | B | Can someone with only an email (most of Cloud today) share a vault? | Yes. With no key to sign, the door vouches for the grant, the list says so, and it doesn't carry to another door. | It makes "signed by the owner" untrue for those vaults, plainly marked. |
 | C | After a move, do your friends' grants work at the new door at once? | One tap, once: "bring these 5 grants over". Revokes apply at once with no tap. | A copy left at the old door would keep honouring them. The tap is you saying the old one is retired. |
 | D | The longest a grant may last. | A year. The shell reminds you a month ahead. | Shorter is safer and asks you more often. |
 | E | Who signs for a friend's AI in your shared vault? | The friend does, for their own AI, and it can never reach more than the friend can. | The other way, you approve every friend's every AI. |
 | F | The first shared vault lives where? | Parachute Cloud, once it has key sign-in (it rides 0.9.1's keys). | From the shell note; friends aren't on the tailnet. |
 | G | The sharing contract already in core (`v1/sharing.test.ts`) describes a different model: levels (view, comment, suggest, edit, manage), groups, links for anyone, pages. Does this spec replace it for 1.0? | Yes. 1.0 is keys, types and verbs. Groups, public links, page-level sharing and comment or suggest levels wait for 1.1. | It changes what an existing contract means, which is yours or Benjamin's call. |
+
+**Decided 11-12: A, the freeze.** The five event numbers (37440 grant, 7440 revoke, 37441 link, 37442 claim, 37443
+the vault's own record), the §2.1 layout (the meaning in canonical JSON content, the grant frame Uni's keys use too)
+and the spelling-vector pin (§2.1) are fixed for good. A signed grant is honoured for good, so they can't change.
+They were fixed after our own security rounds (Appendix D, rounds 1 to 8). Aaron, 11-12: "I don't think we need a
+security pass from Benjamin. We're discussing some high level parachute ideas with him but we should probably be
+good to go on that work."
 
 **Two more, for Benjamin as much as you**
 
@@ -75,7 +81,7 @@ Bakery, the `recipes` vault.
 
 ## 2. The grant
 
-### 2.1 The event [decided: an addressable Nostr event, signed by the owner; the layout is this spec's lean]
+### 2.1 The event [decided: an addressable Nostr event, signed by the owner; the layout decided 11-12, fixed for good (decision A)]
 
 **The meaning is in the content; the tags only address it.** A grant's content is one JSON object in one allowed
 spelling. Its two tags repeat two of its fields so relays and clients can address and expire it, and a vault
@@ -128,7 +134,7 @@ An applet grant's `to` is `{"kind": "applet", "id": "<applet id>", "author": "<a
 | `to.by` | whose name its writes carry (§5) | required: `self`, `signer`, or `names:<prefix>` (§6.1's prefix rule; it holds no colon) |
 | `to.was` | earlier stamps it carries on from (§4.3) | 1 to 8, sorted, different; `key:`, `grant:` or `applet:` stamps. Owner-signed grants only |
 | `allow` | rows: `on` one type (`*` is every record, typed or not), `can` its verbs, `only.own` for own records only | 1 to 64 rows, each different, sorted by their canonical text; verbs sorted. An own row is `"only": {"own": true}` exactly and carries only `read`, `update`, `delete` |
-| `deny` | records carrying any of these tags are outside the grant, for every verb | optional; 1 to 16 `{"tag": …}`, sorted, different. Grant-wide, never on a row: grants only add, so a deny on one row would leave another row showing the record |
+| `deny` | records carrying any of these tags, or a tag under one of them, are outside the grant, for every verb | optional; 1 to 16 `{"tag": …}`, sorted, different. Grant-wide, never on a row: grants only add, so a deny on one row would leave another row showing the record |
 | `under` | on a member-signed grant: the member's own grant it hangs from (§5.2) | required there, refused elsewhere; an id with no dot |
 | `until` | when it ends | unix seconds; equal to the `expiration` tag (NIP-40's, written as a decimal with no leading zero) |
 | `purpose` | the asker's words, shown last on the card | 1 to 200 code points; no control (U+0000–U+001F, U+007F–U+009F), no U+061C, U+200B–U+200F, U+2028–U+202E, U+2060–U+2069, U+FEFF, or the frame's fixed list of blanks. No check reads it |
@@ -136,7 +142,9 @@ An applet grant's `to` is `{"kind": "applet", "id": "<applet id>", "author": "<a
 The verbs are **`read`, `create`, `update`, `delete`** [decided]. `read`, `update` and `delete` may each sit in an
 own row: only records this grantee made [decided: own-records-only]. A type covers its subtypes as the vault defines
 them today: a type declared under it, or named `parent/child` [decided, SPEC §3.5]. The 1.0 vocabulary is exactly
-this: `on` holds `type` only, `only` holds `own` only, `deny` holds `tag` only. Anything else is refused (line 4),
+this: `on` holds `type` only, `only` holds `own` only, `deny` holds `tag` only. A denied tag covers the tags under
+it as the vault defines them at each request, as a type covers its subtypes: a tag declared under it, or named
+`parent/child`. Anything else is refused (line 4),
 including `on.path` (sharing a subtree is 1.1).
 
 **One spelling.** The content is canonical JSON (RFC 8259, no duplicate keys): object keys are ASCII and sorted
@@ -147,12 +155,14 @@ ASCII rule leave none); arrays of verbs, rows and denies are sorted as above. A 
 spelling of what it says is refused, so one meaning has one digest. Everything a check reads (ids, keys, types,
 tags, verbs) is printable ASCII; only `purpose` may be in any script. Type and tag names outside ASCII
 can't be granted or denied by name at 1.0 (§13). Test vectors for the spelling (accepted and refused, with
-their digests) are a precondition of the freeze (open decision A): they are written and run by the shell, the
+their digests) were the freeze's precondition (decision A, decided 11-12): they are run by the shell, the
 minter and every door before the first signature. They are #systems' `vectors/frame-1.0.json` in the shell-keys
 core (branch `t335-frame-1.0`, at ba7a6bd794a1c0c26241a4fdac15aa1ebd6f4a14: 242 signed cases, sha256
 `2c1410eef289319f3aec2b4c72cd10cea79ed73c25117e43e256f0bab1bc659b`); its README section "The
 vectors, for a vault" says how a vault replays it. A door pins a commit and the file's sha256 when it takes it.
-This pin carries round 7's four answers, so the vector precondition is met.
+This pin carries round 7's four answers, so the vector precondition is met. The pin is fixed for good with the
+layout (decision A): every door, minter and shell replays this file, at this commit and sha256, before it files
+or signs. A later version may add cases in a file of its own; it never changes this one's answers.
 
 **The split mark fails closed.** When a door sees an older event that disagrees on `to` or `under`, it records
 the address as ended in the same write that files or refuses that event. If that write fails, the door refuses the
@@ -169,7 +179,7 @@ itself in UTF-8 (never `\u`; line 1 leaves no other control). It is not NIP-01's
 leaves out `id` and `sig` and is 253 bytes shorter. A KB is
 1,024 bytes.
 
-Five kinds are reserved together [lean, open decision A]: `37440` grant, `7440` revoke (a regular event, never
+Five kinds are reserved together [decided 11-12, decision A: fixed for good]: `37440` grant, `7440` revoke (a regular event, never
 replaced), `37441` link statement, `37442` link claim, and `37443` the vault's own record (§2.3). The grant frame's
 other carriers keep their own numbers beside these, outside this spec: `24335` an order (one key or one act,
 honoured once), `24337` a receipt, `37449` the owner's signed account lists. None appears in the kinds table of
@@ -234,12 +244,15 @@ this vault. What else each kind must carry:
    Such an older event is kept with the statements (§3, §9), so the ending survives a restore or a move. When
    statements are filed in bulk (a restore, an import, the door filing its copy), grants, held events and those
    disagreeing events go in first, oldest first by `created_at`, ties by the lower event id; then every revoke, whatever its
-   date; then line 7 (one grant per grantee) is judged again for every event held only because of it. So the same
-   set always gives the same answer, a revoke always finds its address, and a key granted again after a revoke keeps
+   date; then line 7 (one grant per grantee) is judged again for every event held only because of it that the
+   vault had filed before (the door's copy marks each statement it saw filed). An event line 7 refused when it
+   arrived stays held, as it would on a live vault; it comes into force only when someone files it again (below).
+   So the same set always gives the same answer, a revoke always finds its address, and a key granted again after a revoke keeps
    its new grant. An owner with two keys replaces a grant with
    the key that signed it. A replacement may change rows, denies, the date and the purpose. It may never change who
    the grant is for, whose name it writes in, or what it counts as its own.
-7. **One grant per grantee:** a key holds at most one grant in force in a vault, and a signer's applet id likewise.
+7. **One grant per grantee:** a key holds at most one grant in force in a vault, signed or a door grant (§7.3),
+   and a signer's applet id likewise.
    A second is refused until the first has ended. So a token never has two grants to choose between. An owner-signed
    grant for a key ends a member-signed one that key holds, so a member can't block the owner. A grantee is
    never one of the vault's owner keys, nor the vault's id or any key that has signed for the vault (refused as `invalid_statement`). To a member, a refusal about the grantee's key
@@ -251,7 +264,8 @@ this vault. What else each kind must carry:
    reaches admin (§4.4).
 
 A grant is **in force** while it is filed, valid by these lines, not past its date, not revoked, not suspended
-(below), and its signer still has standing.
+(below), and its signer still has standing. A grant that ended because its signer lost standing stays `ended` if
+that key is listed again: a key listed again signs anew.
 
 **The newest event at an address decides, whatever order events arrive in** [lean], except that events
 disagreeing on `to` or `under` end the address in any order (line 6). Replacement plus refusal has
@@ -264,7 +278,8 @@ looked for), its `at` is `parachute`, its `honors` is this vault, and its `id` e
 address). Every key and string a frozen read uses (here and in §3) is read as JSON reads it, escapes undone (line
 2); only line 6 compares the values of `to` and `under` as raw bytes. The fields it doesn't use are checked to be valid JSON without being
 built, so a very long number or a very deep array in one can't make one parser refuse what another holds. The names and spelling of `to` and `under` are frozen with it,
-so every later version's events can still be compared under line 6. An address is in force only while that newest event is one the
+so every later version's events can still be compared under line 6: no later version adds, removes or respells a
+key inside `to` or `under`; a new grantee property is a new top-level field, or a new id. An address is in force only while that newest event is one the
 vault filed. If the newest is one it couldn't file, or events at the address disagree on `to` or `under` (line 6), the address
 is **suspended**; every older event at the address
 is `superseded` and never in force again, whether it arrived before or after, and whether the address was empty,
@@ -437,6 +452,10 @@ the key minter; this spec owns the vault's fields and vocabulary.
   grantee key), whether the grant is in force,
   suspended or past its date (so a held event filed after an upgrade can't hand a grant back to a grantee who left).
   From anyone else it is refused.
+- **A revoke dated ahead.** A revoke more than ten minutes ahead of the vault's clock is refused (`invalid_statement`, §2.2),
+  and the grant stays as it was until a revoke is filed. The refusal is never silent: the shell signs the revoke
+  again dated by the vault's clock (the refusal's `Date` header) and files that, and says so if it can't. A door
+  keeps a carried revoke refused for its date in its copy and files it again at each bulk filing.
 - **A revoke is final and needs no ordering.** Once a vault holds a valid revoke for an address, no event under
   that address is ever in force again, whatever its date. So a replayed old grant, a grant dated in the future, or
   a deleted relay copy can't bring access back. A new grant needs a new id; revoking an id doesn't ban the key.
@@ -492,7 +511,8 @@ carries no denied tag. Everything else behaves as if it didn't exist:
 **Grants only add** [decided, SPEC §3.5]. A record with two types is visible when either is granted. To hold one
 record back, mark it: a grant's `deny` names tags, and a record carrying one is outside that grant for every verb.
 A grantee can't attach a tag its grant denies (`not_granted`). It can't detach one either: a record carrying it
-is hidden, so the answer is 404. Renaming, merging and deleting tags are admin (§4.4), since a deny works by tag.
+is hidden, so the answer is 404. Renaming, merging, deleting and re-parenting tags are admin (§4.4), since a deny works by tag and covers the tags
+under it.
 
 **One place where hidden is not the same as missing** [code: scope gap 9, 0.9 SPEC §3.3]. Paths are one namespace,
 so creating or renaming onto a hidden record's path answers 409, and a grantee who can create can learn that a path
@@ -534,7 +554,7 @@ writes, whichever of their keys or sign-ins was used; for a member, `nostr:<thei
 
 ### 4.4 What no grant opens
 
-Type management, renaming, merging or deleting tags, keys, vault settings, connect instructions, export, deleting
+Type management, renaming, merging, deleting or re-parenting tags, keys, vault settings, connect instructions, export, deleting
 history, and filing or reading other grantees' statements. Narrowing applies to read and write, never admin [decided, SPEC §3.5]. A grantee can't sign a
 grant for someone else's key, and a write key can't edit a grant: statements sit in the vault's own table, not
 among records.
@@ -579,7 +599,8 @@ today.
   denies. So narrowing the member narrows their agents at once, and a member's denied tag is denied to their agents
   whatever the agent's grant says.
 - **One level.** An agent can't sign for another key.
-- **A cap.** A member may have at most 20 grants, held events and early revokes on file that aren't ended, since nothing is
+- **A cap.** A member may have at most 20 addresses on file that aren't ended (a grant, a held event or an early
+  revoke each; a newer event at an address already counted adds nothing), since nothing is
   deleted.
 
 ### 5.3 Applets [decided: in-shell applets write with the owner's or Uni's key; attribution travels in created_via]
@@ -739,7 +760,7 @@ that the signed-in owner agreed.
 
 | When | Status and `error` |
 |---|---|
-| malformed event (any kind: tags that aren't lists of strings, a string that isn't well-formed Unicode or holds a control other than tab, line feed, carriage return, backspace or form feed, §2.2 line 1); tags other than exactly `d` and `expiration`, or tags that disagree with the content; content not in its canonical spelling; an unknown field, key or verb; over the size limits; no date, a date already past or more than 366 days out; incoherent verbs; a reserved or malformed prefix; `was` or a missing `under` on a member-signed grant, an `under` that isn't the signer's own grant, or a `to.by` other than `signer` on one; a dot in a member's own id | 400 `invalid_statement` |
+| malformed event (any kind: tags that aren't lists of strings, a string that isn't well-formed Unicode or holds a control other than tab, line feed, carriage return, backspace or form feed, §2.2 line 1); tags other than exactly `d` and `expiration`, or tags that disagree with the content; content not in its canonical spelling; an unknown field, key or verb; over the size limits; no date, a date already past or more than 366 days out; a statement created more than ten minutes ahead of the vault's clock; incoherent verbs; a reserved or malformed prefix; `was` or a missing `under` on a member-signed grant, an `under` that isn't the signer's own grant, or a `to.by` other than `signer` on one; a dot in a member's own id | 400 `invalid_statement` |
 | the id or signature doesn't verify | 400 `bad_signature` |
 | it names another vault (`honors`), or isn't `at: parachute`, `gives: access`; a revoke for another vault | 400 `wrong_vault` |
 | the signer has no standing here; a revoke from a key that may not end that address; a claim from a key the link doesn't name | 403 `no_standing` |
@@ -921,12 +942,16 @@ checked has such a name). The vault map that reads `lives` (§2.3) and signed re
   deny by marker, `submit`, agents as principals, one checkpoint, every verifier fails closed, narrowing never
   reaches admin (0.9 SPEC §3.5, ROADMAP 1.0).
 - **Decided 11-12 (Aaron):** a vault's id is its own Nostr key (open decision H, as §2.3 specifies it).
+- **Decided 11-12 (decision A, the freeze):** the five kind numbers, the §2.1 layout and the vector pin, fixed for
+  good after our own security rounds (§D, round 8). Aaron, 11-12: "I don't think we need a security pass from
+  Benjamin. We're discussing some high level parachute ideas with him but we should probably be good to go on that
+  work."
 - **From T-462, 11-12:** the content layout: the grant frame of Uni's keys work (`v at honors gives to allow until
   purpose`, one canonical spelling) with this spec's vault fields (`to.by`, `to.was`, `deny`, `under`, `id`); the
   two-tag rule; a revoke's frozen fields and its scope by vault; suspension by an unreadable newer event; the size
   limits in bytes; the fixed `purpose` rule; the vault's own record, overrides, handovers and where its key lives.
   Weighed and reviewed in T-462 (three fresh reviewers, then one on this text: §D).
-- **This spec's own, all marked [lean]:** the kind numbers; revoke as its own final event; refusing
+- **This spec's own, all marked [lean]:** revoke as its own final event; refusing
   unknown tags; the vault id; `by signer | self | names`; member-signed agent grants; `applet:<id>` as the via
   stamp; `was`; the wire; door grants; the one-tap carry on a move; a year's limit.
 - **Changed from the attribution note §2.9:** the note had an applet hold a named key (`key:applet.arcade`).
@@ -980,8 +1005,8 @@ written into this file and reviewed here:
 | A fresh Fable check of those fixes only | **SHIP WITH FIXES**: 4 closed, 6 partly, 6 new | Line 6 still depended on order; held events dropped at import; a refused grant could come into force on its own; held events uncounted; an earlier key after a move; unfiled replacements. All fixed (§2.2 line 6 and bulk filing oldest first, holding against the carried owner list, re-judging only on upgrade or re-file, the member cap, §2.3 step 1, the take-back sentence). |
 
 The second pass's fixes were made after it and have not been reviewed again. Not a freeze yet: the spelling
-vectors were missing then (round 6 names them, §2.1, still short of the precondition), and open decision A asks for
-one more security pass with Benjamin.
+vectors were missing then (round 6 names them, §2.1, still short of the precondition), and decision A waited on
+one more security pass (round 8 below: our own security rounds, not Benjamin's, by Aaron's word of 11-12).
 
 **Round 5 (T-462, 11-12).** A fresh adversarial Fable reviewer, on the round-4 check's fixes only: **SHIP WITH
 FIXES**, 4 blocking (a changed `to` failed open; bulk filing dropped early revokes; a keyless owner's handover never
@@ -1015,3 +1040,21 @@ character other than NIP-01's five in the event's own strings makes it malformed
 differ; (5) a key grantee may give up a suspended or expired grant. A fresh adversarial Fable reviewer on these
 changes: **SHIP WITH FIXES**, 2 blocking (a split address's older event wasn't carried, so a restore revived it;
 `to.by` still read as standing) and 5 more, all fixed. One re-check: **SHIP**, all seven closed, nothing new opened. The vectors at bf607e4 still pinned the four old answers; #systems updated them at ba7a6bd (242 cases, 126 tests, a fresh security re-review SHIP), which §2.1 now pins, with the split mark failing closed.
+
+**Round 8 (T-462, 11-12): the last pass before the freeze.** Aaron, 11-12: "Benjamins security pass for what? I
+don't think we need a security pass from Benjamin. We're discussing some high level parachute ideas with him but we
+should probably be good to go on that work." So the freeze waited on our own security rounds, not Benjamin's. A
+fresh adversarial Fable reviewer, not used before, read the whole spec at 90f9ccdc (not just the deltas), and the
+pinned vectors (sha256 checked): **SHIP**, nothing blocking, 8 findings. Fixed in the text: a denied tag covers the
+tags under it, and re-parenting a tag is admin (§2.1, §4.1, §4.4); a grant line 7 refused on arrival doesn't come
+into force by itself at a restore (line 6's bulk filing); line 7 counts door grants; a key listed again doesn't
+revive the grants it signed before (§2.2); no later version adds, removes or respells a key inside `to` or `under`
+(the minimal read); a member's cap counts addresses (§5.2). Decided, not taken: a revoke dated more than ten minutes
+ahead stays refused (`invalid_statement`), as the pinned vectors say ("a revoke dated more than ten minutes
+ahead"); the shell signs it again by the vault's clock,
+and a door files a carried one again at each bulk filing (§3). A later version may relax that, which only ends a
+grant sooner. Left open, before Cloud builds: the door's copy is kept by vault id alone and nothing proves an
+import is a move, so an import claiming another account's vault id must be refused and a copy filed only into the
+vault it came from (owner: #parachute, at build); a member still learns that a key holds a grant from
+`exceeds_grantor` (§11's limit); a carried revoke's date is the signer's own word (it only closes); the vectors
+README's "a grant in force" for a grantee's revoke is stale (owner: #systems). Round 8's re-check: below.
