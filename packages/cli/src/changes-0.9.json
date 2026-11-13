@@ -1212,6 +1212,17 @@
   },
   {
    "kind": "endpoint",
+   "old": "query-notes {search} and ?search= (which records match, in what order, with what score)",
+   "new": "the same title and body matches, plus records whose field values hold the words, ranked after every title or body match; scores from bm25 over path, body and field text (weights 10, 1, 0.5), comparable within that tier only; the title boost works inside a tier; a search of four or more words also ranks by meaning when the vault has embeddings (search_mode and the vault's search.auto_hybrid choose otherwise)",
+   "action": "keep",
+   "reason": "0.9.3 (core #93 field values in search, #102 the title boost within a tier, #103 hybrid auto): a word kept in a field (a status, a person's name, a list item) was not findable. Every score moves, because bm25 now normalises over three columns; Note.score only ever promised relative meaning. A 0.8 client gets the same records it got and more, in a different order",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live",
+   "release": "0.9.3"
+  },
+  {
+   "kind": "endpoint",
    "old": "11 legacy 301 redirects",
    "new": null,
    "action": "drop",
