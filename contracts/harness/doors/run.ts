@@ -27,7 +27,7 @@ import { loadCandidate, prepareInfo } from "../candidate.ts";
 import { safeFetch } from "../guard.ts";
 import type { Door } from "../../suites/door/_door.ts";
 import { linkOwnerKeyOnBox, startBoxDoor } from "./box.ts";
-import { makeOwnerKey, nostrAuthorization, signUp, startWorkersDoor } from "./workers.ts";
+import { linkOwnerKeyOnCloud, makeOwnerKey, nostrAuthorization, signUp, startWorkersDoor } from "./workers.ts";
 import { compare, matrix, readFingerprint, readJunit, serializeFingerprint, type Deliberate } from "./compare.ts";
 
 const contracts = resolve(import.meta.dir, "..", "..");
@@ -132,6 +132,12 @@ function gitHead(repo: string): string {
   const dirty = Bun.spawnSync(["git", "-C", repo, "status", "--porcelain", "--untracked-files=no"], { stdout: "pipe", stderr: "ignore" }).stdout.toString().trim();
   return `${r.stdout.toString().trim() || "?"}${dirty ? " (edited)" : ""}`;
 }
+/** The release line a cloud checkout runs: its engine pin's version says (0.8.x, or 0.9 with owner keys, 0.9.1). */
+function cloudRelease(repo: string): string {
+  const f = join(repo, "scripts", "core-source.env");
+  const v = existsSync(f) ? readFileSync(f, "utf8").match(/^PARACHUTE_CORE_VERSION="([^"]+)"/m)?.[1] : undefined;
+  return v && /^0\.9\./.test(v) ? "0.9.1" : "0.8";
+}
 function corePin(repo: string): string {
   const f = join(repo, "scripts", "core-source.env");
   return existsSync(f) ? (readFileSync(f, "utf8").match(/^PARACHUTE_CORE_REF="([0-9a-f]{7})/m)?.[1] ?? "?") : "?";
@@ -149,8 +155,16 @@ async function startCloud(): Promise<Started> {
     const other = `other${id}`;
     await ensureVault(w.issuer, bearer, vault);
     await ensureVault(w.issuer, bearer, other);
+    // A 0.9.1 cloud door: link a made-up key to the account, as its owner would.
+    const release = cloudRelease(repo);
+    let ownerKey: string | undefined;
+    if (release === "0.9.1") {
+      const owner = await makeOwnerKey();
+      await linkOwnerKeyOnCloud(w.issuer, bearer, owner.secretKey);
+      ownerKey = owner.secretKey;
+    }
     return {
-      door: { kind: "cloud", label: "cloud-0.8", release: "0.8", issuer: w.issuer, vaultOrigin: w.vaultOrigin, vault, otherVault: other, signIn: { how: "cookie", cookie: me.cookie, csrf: me.csrf } },
+      door: { kind: "cloud", label: `cloud-${release}`, release, issuer: w.issuer, vaultOrigin: w.vaultOrigin, vault, otherVault: other, signIn: { how: "cookie", cookie: me.cookie, csrf: me.csrf }, ...(ownerKey ? { ownerKey } : {}) },
       provenance: `cloud: parachute-cloud ${gitHead(repo)}, core pin ${corePin(repo)}, local workerd`,
       stop: w.stop,
       logs: w.logs,

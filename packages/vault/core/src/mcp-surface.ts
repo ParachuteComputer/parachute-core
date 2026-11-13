@@ -347,3 +347,23 @@ function withParamWarnings(tool: string, result: unknown, unknown: ParamProblem[
   const r = result as Record<string, unknown>;
   return { ...r, warnings: [...(Array.isArray(r.warnings) ? r.warnings : []), ...warnings] };
 }
+
+/**
+ * A refusal's JSON-RPC message names its kind, `[error_type] message` (vault#555), so a person reading only the text
+ * knows which kind of refusal it is; the kind is also `data.error_type`, which an app reads.
+ */
+export function typedMessage(message: string, data: Record<string, unknown> | undefined): string {
+  const errorType = typeof data?.error_type === "string" ? data.error_type : undefined;
+  return errorType ? `[${errorType}] ${message}` : message;
+}
+
+/** A record tool's refusal data in record words (T-407): the hint and how_to, and `record_id` for `note_id`. */
+export function recordErrorData(data: Record<string, unknown>): Record<string, unknown> {
+  const out = { ...data };
+  for (const k of ["hint", "how_to"]) if (typeof out[k] === "string") out[k] = recordWords(out[k] as string);
+  if ("note_id" in out) {
+    out.record_id = out.note_id;
+    delete out.note_id;
+  }
+  return out;
+}
