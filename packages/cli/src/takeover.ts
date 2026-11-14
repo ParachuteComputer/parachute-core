@@ -724,7 +724,7 @@ function moveFile(from: string, to: string): void {
     if ((err as NodeJS.ErrnoException).code !== "EXDEV") throw err;
     // Across volumes: a whole copy under a scratch name, renamed into place, then the original goes. A cut leaves
     // either nothing at `to` or the same bytes in both places (resumeAgent finishes that).
-    const tmp = `${to}.${process.pid}.tmp`;
+    const tmp = join(dirname(to), `.${basename(to)}.${process.pid}.moving`);
     copyFileSync(from, tmp);
     renameSync(tmp, to);
     unlinkSync(from);
@@ -1961,8 +1961,11 @@ async function stopCoreAgent(home: string, aside: string): Promise<string | null
     const r = launchctl("bootout", `${guiDomain()}/${CORE_AGENT}`);
     if (r.code !== 0 && coreJob() !== false) return `stopping ${CORE_AGENT} failed: ${(r.stderr || r.stdout).trim()}`;
   }
-  if (!(await waitUntil(() => coreJob() === false && holders(home).length === 0, 20_000, 250))) {
-    const still = holders(home);
+  // Only core's own processes (or one no agent runs) are in the way: on a retried rollback, an old agent it already put
+  // back has the data open again.
+  const inTheWay = () => heldBy(home, []).filter((h) => !h.unit || h.unit === CORE_AGENT);
+  if (!(await waitUntil(() => coreJob() === false && inTheWay().length === 0, 20_000, 250))) {
+    const still = inTheWay();
     return `${CORE_AGENT} is not confirmed stopped${still.length ? ` (still holding the data: ${still.map((h) => `pid ${h.pid}`).join(", ")})` : ""}`;
   }
   if (existsSync(coreAgentFile()) && coreAgentMark() === home) moveFile(coreAgentFile(), freeName(aside, `${CORE_AGENT}.plist`));
@@ -2393,12 +2396,13 @@ async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ ba
     if (hubUnit?.manager === "launchd") {
       say(`Starting v0.8 as the launchd agent ${CORE_AGENT} …`);
       try {
-        const agent = writeCoreAgent(d, hubUnit);
+        // Named in the record before its plist exists (a plist in ~/Library/LaunchAgents starts at login), so a
+        // rollback after a cut or a failed start knows to stop it and move it aside.
         unitTried = true;
-        // Named in the record before it starts, so a rollback after a failed start knows to stop it.
         record.core_unit = CORE_AGENT;
         record.core_manager = "launchd";
         writeRecord(d.home, record);
+        const agent = writeCoreAgent(d, hubUnit);
         const r = launchctl("bootstrap", guiDomain(), agent.path);
         if (r.code !== 0) throw new Error(`launchctl bootstrap ${guiDomain()} ${agent.path} exited ${r.code}: ${(r.stderr || r.stdout).trim()}`);
         const down = await coreUnitUp(agent.port, d, say, "launchd");
@@ -2556,7 +2560,7 @@ export async function takeover(args: string[]): Promise<number> {
     // and the old units, which name the real folder, would reopen the data the restore was meant to replace.
     const home = realHome(resolve(f.home ?? homeDir()));
     // Agents load into their user's login domain (gui/<uid>); as root (sudo) every launchctl call would ask gui/0.
-    if (process.platform === "darwin" && process.getuid?.() === 0 && agentFiles().length) {
+    if (process.platform === "darwin" && process.getuid?.() === 0 && launchdHere()) {
       throw new Exit(EXIT.failed, "run takeover as the user whose launchd agents these are, not as root (sudo): agents load into that user's login domain. Nothing was changed.");
     }
     const out = (s: string) => (f.json ? console.error(s) : console.log(s));
