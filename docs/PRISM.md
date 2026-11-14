@@ -162,7 +162,11 @@ Read against Prism main `55ac3df`, and run on Linux in a private network namespa
   found, backs up, pauses the old programs, starts v0.8 on the same data and checks it, and keeps the old programs
   installed but off; `parachute-core takeover --rollback` goes back. A box `serve` on such a home refuses with exit 7
   until then. Embedded homes are not touched by it: Prism adopts in place, as above, and `serve --embedded` never
-  refuses for this reason.
+  refuses for this reason. On a Mac (since 0.8.1) the old hub's agent `computer.parachute.hub` is unloaded and its
+  plist moved into the takeover's backup folder, v0.8 runs as the agent `computer.parachute.core`, and the rollback
+  puts the plist back and loads it; `computer.parachute.cloudflared.*` and any agent whose plist name lacks
+  "parachute" (Prism's own `<prefix>.hub`) are left alone, so a home Prism's own hub agent serves is refused (exit 7)
+  until that agent is stopped.
 - **A signed macOS tarball every night**, so the Nov 9 build isn't the first you see. The `bundle-macos` workflow
   builds main every night and on every merge, runs your suite on the signed tree, and keeps the tarball and `SHA256SUMS` as an Actions
   artifact for 14 days: `gh run download <run id> -R ParachuteComputer/parachute-core -n

@@ -353,6 +353,16 @@ export async function newMachine(
           process.kill(Number(readFileSync(join(state, f), "utf8")), "SIGKILL");
         } catch {}
       }
+      // Agents the fake launchctl started (withLaunchd), each in a session of its own: the whole group.
+      const agents = join(user, ".fake", "launchd");
+      for (const f of existsSync(agents) ? readdirSync(agents).filter((n) => n.endsWith(".pid")) : []) {
+        const pid = Number(readFileSync(join(agents, f), "utf8"));
+        for (const target of [-pid, pid]) {
+          try {
+            process.kill(target, "SIGKILL");
+          } catch {}
+        }
+      }
       for (const p of procs.reverse()) await p.stop("SIGTERM", 10_000);
       for (const s of servers) s.close();
       holder.kill("SIGKILL");
@@ -658,4 +668,164 @@ export function holders(file: string | ((link: string) => boolean)): { pid: numb
     } catch {}
   }
   return out;
+}
+
+// ── the fake launchctl (macOS) ───────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Fake launchctl for the contracts (an outside system, as the fake systemctl is): what macOS's does for the verbs a
+ * takeover uses, answered from STATE and logged to STATE/calls.log.
+ * - `bootstrap gui/<uid> <plist>` loads the plist (exit 5 when its label is loaded already) and runs its
+ *   ProgramArguments for real, as launchd runs an agent: in a clean environment (HOME, launchd's default PATH, then the
+ *   plist's EnvironmentVariables), in a session of its own, output to StandardOutPath; STATE/<label>.pid.
+ * - `bootout gui/<uid>/<label>` stops the agent's processes, all of them (its group and every descendant), then
+ *   unloads it (exit 3 when it isn't loaded).
+ * - `list` prints launchctl's table: `PID<tab>Status<tab>Label`, the pid "-" once its process is gone.
+ * Anything else exits 1, so a takeover that used another verb would fail here. KeepAlive isn't emulated.
+ * The plist is read the way launchd reads one (Label, ProgramArguments, EnvironmentVariables, StandardOutPath), by
+ * a reader of its own here: core's plist reader is the code under test.
+ */
+const FAKE_LAUNCHCTL = `
+import { appendFileSync, existsSync, openSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+const STATE = __STATE__;
+const HOME = __HOME__;
+const SETSID = __SETSID__;
+const ENV = __ENV__;
+const args = process.argv.slice(2);
+appendFileSync(join(STATE, "calls.log"), args.join(" ") + "\\n");
+const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+const pidOf = (label) => { const f = join(STATE, label + ".pid"); const pid = existsSync(f) ? Number(readFileSync(f, "utf8")) : 0; return pid && alive(pid) ? pid : 0; };
+const loaded = (label) => existsSync(join(STATE, label + ".loaded"));
+const dec = (s) => s.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, "&");
+const children = (pid) => { const r = Bun.spawnSync(["ps", "-o", "pid=", "--ppid", String(pid)]); return r.stdout.toString().split(/\\s+/).filter(Boolean).map(Number); };
+const tree = (pid) => [pid, ...children(pid).flatMap(tree)];
+const [verb, ...rest] = args;
+if (verb === "list" && rest.length === 0) {
+  let out = "PID\\tStatus\\tLabel\\n";
+  for (const f of readdirSync(STATE).filter((n) => n.endsWith(".loaded"))) { const label = f.slice(0, -".loaded".length); const pid = pidOf(label); out += (pid ? pid : "-") + "\\t0\\t" + label + "\\n"; }
+  process.stdout.write(out);
+  process.exit(0);
+}
+if (verb === "bootstrap" && rest.length === 2 && /^gui\\/\\d+$/.test(rest[0])) {
+  const text = readFileSync(rest[1], "utf8");
+  const label = dec(/<key>Label<\\/key>\\s*<string>([^<]*)<\\/string>/.exec(text)?.[1] ?? "");
+  if (!label) { console.error("Bootstrap failed: 22: Invalid argument"); process.exit(22); }
+  if (loaded(label)) { console.error("Bootstrap failed: 5: Input/output error"); process.exit(5); }
+  const argv = [.../<key>ProgramArguments<\\/key>\\s*<array>([\\s\\S]*?)<\\/array>/.exec(text)?.[1].matchAll(/<string>([^<]*)<\\/string>/g) ?? []].map((m) => dec(m[1]));
+  const envBlock = /<key>EnvironmentVariables<\\/key>\\s*<dict>([\\s\\S]*?)<\\/dict>/.exec(text)?.[1] ?? "";
+  const env = { ...ENV, HOME, PATH: "/usr/bin:/bin:/usr/sbin:/sbin" };
+  for (const m of envBlock.matchAll(/<key>([^<]*)<\\/key>\\s*<string>([^<]*)<\\/string>/g)) env[dec(m[1])] = dec(m[2]);
+  const out = dec(/<key>StandardOutPath<\\/key>\\s*<string>([^<]*)<\\/string>/.exec(text)?.[1] ?? join(STATE, label + ".log"));
+  writeFileSync(join(STATE, label + ".loaded"), rest[1]);
+  try {
+    const fd = openSync(out, "a");
+    const p = Bun.spawn([SETSID, ...argv], { env, cwd: HOME, stdin: "ignore", stdout: fd, stderr: fd });
+    p.unref();
+    writeFileSync(join(STATE, label + ".pid"), String(p.pid));
+  } catch (e) { appendFileSync(join(STATE, label + ".log"), "spawn failed: " + e + "\\n"); }
+  process.exit(0);
+}
+if (verb === "bootout" && rest.length === 1 && /^gui\\/\\d+\\/.+/.test(rest[0])) {
+  const label = rest[0].split("/").slice(2).join("/");
+  if (!loaded(label)) { console.error("Boot-out failed: 3: No such process"); process.exit(3); }
+  const pid = pidOf(label);
+  if (pid) {
+    const all = tree(pid);
+    try { process.kill(-pid, "SIGTERM"); } catch {}
+    for (const q of all) { try { process.kill(q, "SIGTERM"); } catch {} }
+    for (let i = 0; i < 150 && all.some(alive); i++) Bun.sleepSync(100);
+    for (const q of all) { try { process.kill(q, "SIGKILL"); } catch {} }
+  }
+  rmSync(join(STATE, label + ".pid"), { force: true });
+  rmSync(join(STATE, label + ".loaded"), { force: true });
+  process.exit(0);
+}
+console.error("fake launchctl: '" + args.join(" ") + "' is not supported by the contracts' fake");
+process.exit(1);
+`;
+
+export interface Launchd {
+  /** ~/Library/LaunchAgents */
+  agentsDir: string;
+  /** Loaded, and the pid of its process (0: none). */
+  agent(label: string): { loaded: boolean; pid: number };
+  calls(): string[];
+  /** Write a plist into ~/Library/LaunchAgents and (unless `load: false`) bootstrap it, as login would. */
+  install(label: string, plist: string, opts?: { load?: boolean }): Promise<string>;
+}
+
+/** Give the machine launchd: the fake launchctl first on its PATH, and ~/Library/LaunchAgents. */
+export function withLaunchd(m: Machine): Launchd {
+  const state = join(m.user, ".fake", "launchd");
+  const agentsDir = join(m.user, "Library", "LaunchAgents");
+  mkdirSync(state, { recursive: true });
+  mkdirSync(agentsDir, { recursive: true });
+  writeFileSync(join(state, "calls.log"), "");
+  const setsid = Bun.which("setsid");
+  must(!!setsid, "setup: setsid (util-linux) is needed for the fake launchctl");
+  // An agent gets launchd's environment, never the caller's: LANG and TMPDIR here, as a session has them.
+  const base = { LANG: "C.UTF-8", TMPDIR: join(m.user, "tmp") };
+  const script = FAKE_LAUNCHCTL.replace("__STATE__", JSON.stringify(state))
+    .replace("__HOME__", JSON.stringify(m.user))
+    .replace("__SETSID__", JSON.stringify(setsid))
+    .replace("__ENV__", JSON.stringify(base));
+  writeFileSync(join(m.user, ".fake", "bin", "launchctl"), `#!${process.execPath}\n${script}`, { mode: 0o755 });
+  const agent = (label: string) => {
+    const loaded = existsSync(join(state, `${label}.loaded`));
+    const f = join(state, `${label}.pid`);
+    let pid = existsSync(f) ? Number(readFileSync(f, "utf8")) : 0;
+    try {
+      if (pid) process.kill(pid, 0);
+    } catch {
+      pid = 0;
+    }
+    return { loaded, pid };
+  };
+  return {
+    agentsDir,
+    agent,
+    calls: () => readFileSync(join(state, "calls.log"), "utf8").split("\n").filter(Boolean),
+    async install(label, plist, opts = {}) {
+      const file = join(agentsDir, `${label}.plist`);
+      writeFileSync(file, plist, { mode: 0o644 });
+      if (opts.load !== false) {
+        const r = await m.run(["launchctl", "bootstrap", "gui/501", file]);
+        must(r.code === 0, `setup: launchctl bootstrap ${label} exited ${r.code}: ${r.stderr}`);
+      }
+      return file;
+    },
+  };
+}
+
+/** A plist as Parachute's own code writes one (renderManagedLaunchdPlist): label, program, environment, keep-alive, log. */
+export function agentPlist(label: string, argv: string[], env: Record<string, string>, log: string): string {
+  const x = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const envXml = Object.entries(env)
+    .map(([k, v]) => `    <key>${x(k)}</key>\n    <string>${x(v)}</string>`)
+    .join("\n");
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Generated by parachute — do not edit by hand. (made up for the contracts) -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${x(label)}</string>
+  <key>ProgramArguments</key>
+  <array>
+${argv.map((a) => `    <string>${x(a)}</string>`).join("\n")}
+  </array>
+${envXml ? `  <key>EnvironmentVariables</key>\n  <dict>\n${envXml}\n  </dict>\n` : ""}  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>${x(log)}</string>
+  <key>StandardErrorPath</key>
+  <string>${x(log)}</string>
+</dict>
+</plist>
+`;
 }
