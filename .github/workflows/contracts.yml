@@ -318,6 +318,8 @@ jobs:
       - *repos
       - run: bun install --frozen-lockfile
       - *stock
+      - name: build the previous release (0.8) where the suites look for it; lifecycle/upgrade's mutants run on it
+        run: bun run build:previous
       - name: each mutant caught, each flip flipped
         env:
           OLD_STOCK_SHA256: ${{ steps.stock.outputs.sha256 }}

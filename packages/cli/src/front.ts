@@ -213,7 +213,7 @@ export function frontHelp(): string {
     "  setup [expose|mcp|transcription|--embedded]   make something work, once",
     "  serve                         run in the foreground (units, containers, Prism)",
     "  start|stop|restart            the background service",
-    "  upgrade [--rollback]          this program, or back to the release before",
+    "  upgrade [--check|--rollback]  try the step to this release on a copy, or go back to the release before",
     "  config get|set|unset          the settings file, parachute.yaml (port, origin, vault descriptions)",
     "",
     "Safety",

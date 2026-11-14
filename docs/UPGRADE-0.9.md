@@ -1,7 +1,7 @@
 # 0.8 → 0.9 on a home, and back
 
 What happens to a Parachute home when 0.9 first opens it, how to go back, and the rule for when a release may move a
-schema number. Code: `packages/cli/src/release.ts`. Contract: `contracts/suites/lifecycle/upgrade.test.ts`, which runs
+schema number. Code: `packages/cli/src/release.ts` and `upgrade.ts`. Contract: `contracts/suites/lifecycle/upgrade.test.ts`, which runs
 the real 0.8 (`pins.json` `previous_core`, built by `bun run build:previous`).
 
 ## The rule: a schema number moves only when an older program would misread the data unsafely
@@ -24,6 +24,40 @@ database above its own number (exit 6). So a number is a promise to older progra
 - **Something an older program would misread unsafely → a number.** The first is planned for 0.9.1: keys enforced by
   type, with explicit denies. 0.8 would ignore a key's type scope and let its token read the whole vault. That is
   a leak, so 0.9.1 must move the hub's number (25), and 0.8 must refuse that `hub.db`.
+
+## Try it first: `parachute upgrade --check [--json]`
+
+Run 0.9's own `parachute` (the unpacked bundle's `bin/parachute`, or `bunx @openparachute/core@<0.9> upgrade --check`)
+on the home, also while 0.8 is serving it. It runs the step below on a **throwaway copy** and reports:
+
+1. a scratch folder beside the home (`.parachute-upgrade-check-*`, removed however the command ends, and by the next
+   check if this one was killed);
+2. every database copied consistently (`VACUUM INTO`, read the way the newer-data check reads, so not a byte of the
+   home changes) and the small files a command reads (settings). Attachments, mirrors and logs are left out: the
+   step doesn't read them. The release record goes along without its paths: it names the home's real backup
+   folder, and nothing on the copy may write there;
+3. 0.9 run on the copy as the home's first command would run: the newer-data check, the backup, the record, then
+   every database opened by this release;
+4. the report: the backup taken, each vault's notes, types and tags, the hub's keys, any schema number that moved
+   (which would make the way back a restore), the old names the home's usage log has seen, and anything the step
+   would refuse (a database it can't read, a broken `parachute.yaml`). A home the 0.7 programs still own is
+   judged on the home itself, before any copy: it is the takeover's, and the check says so (exit 1).
+
+The home itself gets no backup, no `run/release.json` and no lock, and its existing upgrade backups are not written
+to. No server starts, so nothing listens and no module runs. It needs room for the databases twice (the copy, then
+the step's backup of it). Exit 0: the step ran clean on the copy; 1: it failed or would be refused; 5: no room; 6:
+the home was written by a newer release. Every vault database it copied must also have been opened: one it could not try (its folder is a link, or has no
+`vault.yaml`) is a problem, not a pass; so is a home whose parent can't be written, where the real backup would
+have nowhere to go. A database being written hard while it is copied can read as torn; the
+copy is tried three times, then reported as unreadable (the home is never changed by the attempt).
+
+**`upgrade` reads its arguments before it touches anything.** An unknown flag or service exits 2 with the home byte
+for byte as it was. Found by the 0.9 beta rehearsal (2026-11-13): before `--check` was built, `upgrade --check`
+backed the home up, recorded it as moved to 0.9 (`state: current`), and only then said `unknown service "--check"`.
+The hub's own upgrade (a module by name, or its sweep) is handed the arguments as they were understood, and its own
+lookup is asked first whether it will find the service and can read `services.json` (the same code the command
+runs, without its write-back), so it can't refuse them after the step. `vault upgrade` is
+refused the same way (the vault is part of this program). Every other command still takes the step first, as below.
 
 ## What 0.9 does the first time it opens a home
 
