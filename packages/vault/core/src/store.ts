@@ -162,6 +162,7 @@ export class BunSqliteStore implements Store {
     public readonly db: Database,
     opts?: { history?: Partial<HistoryPolicy>; hooks?: HookRegistry; embeddingProvider?: EmbeddingProvider; embeddingDisabledReason?: string },
   ) {
+    cachePreparedStatements(db);
     initSchema(db);
     this.historyPolicy = resolveHistoryPolicy(opts?.history);
     this.hooks = opts?.hooks ?? new HookRegistry();
@@ -2156,6 +2157,34 @@ export class BunSqliteStore implements Store {
 }
 
 /** @deprecated Renamed to `BunSqliteStore` to make the runtime split explicit. Kept as an alias for backward compatibility. */
+/**
+ * Keeps prepared statements per connection (0.9.4). SQLite compiles every trigger on a table into each statement that
+ * writes it, and the change log added triggers on notes, note_tags and links; core prepares most statements afresh
+ * on each call, so a write paid that compile every time (half an import's time went to `prepare`). The same SQL text
+ * now reuses its statement (SQLite re-prepares one by itself after a schema change). Bounded: the least recently used
+ * statements beyond 2,000 are dropped (SQL with a variable IN list makes many texts). Nothing in core finalizes or
+ * iterates a statement, so sharing one is safe. Only a bun Database: a Durable Object's handle has its own.
+ */
+function cachePreparedStatements(db: Database): void {
+  if (!(db instanceof Database) || (db as { __preparedCache?: boolean }).__preparedCache) return;
+  const prepare = db.prepare.bind(db);
+  const cache = new Map<string, ReturnType<Database["prepare"]>>();
+  (db as { __preparedCache?: boolean }).__preparedCache = true;
+  (db as { prepare: Database["prepare"] }).prepare = ((sql: string, ...rest: unknown[]) => {
+    if (rest.length) return (prepare as (...a: unknown[]) => ReturnType<Database["prepare"]>)(sql, ...rest);
+    const hit = cache.get(sql);
+    if (hit) {
+      cache.delete(sql);
+      cache.set(sql, hit);
+      return hit;
+    }
+    const st = prepare(sql);
+    cache.set(sql, st);
+    if (cache.size > 2000) cache.delete(cache.keys().next().value!);
+    return st;
+  }) as Database["prepare"];
+}
+
 export const SqliteStore = BunSqliteStore;
 /** @deprecated Renamed to `BunSqliteStore`. */
 export type SqliteStore = BunSqliteStore;
