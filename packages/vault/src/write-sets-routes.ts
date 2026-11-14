@@ -15,7 +15,7 @@ import { standingUndo, undoWriteSet, UndoRefusal, type UndoConflict } from "../c
 import type { Store } from "../core/src/types.ts";
 import { WHY_HEADER, withWriteSet } from "./write-set-edge.ts";
 import type { Note } from "../core/src/types.ts";
-import { noteWithinTagScope } from "./tag-scope.ts";
+import { noteWithinTagScope, tagVisibleInScope } from "./tag-scope.ts";
 import type { TagScopeCtx } from "./routes.ts";
 
 export interface WriteSetsAuth {
@@ -152,7 +152,20 @@ export async function handleUndo(
   const undoId = newWriteSetId();
   try {
     const result = await withWriteSet(store, { id: undoId, actor: auth.actor, via: auth.via, why, undoes: id }, () =>
-      undoWriteSet(store, id, { force: body.force === true, actor: auth.actor, via: auth.via }),
+      undoWriteSet(store, id, {
+        force: body.force === true,
+        actor: auth.actor,
+        via: auth.via,
+        ...(tagScope.raw !== null
+          ? {
+              tagWritable: (t: string) => tagVisibleInScope(t, tagScope.allowed, tagScope.raw),
+              targetVisible: (noteId: string) => {
+                const tags = (db.prepare("SELECT tag_name FROM note_tags WHERE note_id = ?").all(noteId) as { tag_name: string }[]).map((r) => r.tag_name);
+                return noteWithinTagScope({ tags } as unknown as Note, tagScope.allowed, tagScope.raw);
+              },
+            }
+          : {}),
+      }),
     );
     if (tagScope.raw !== null) {
       // A scoped caller learns nothing beyond its scope: no other key's provenance on a forced write, and no id of a

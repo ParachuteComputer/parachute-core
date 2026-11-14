@@ -95,6 +95,17 @@ export function sayWriter(
       .prepare("INSERT OR IGNORE INTO write_sets (id, at, actor, via, via_kind, why) VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?, ?, ?, ?)")
       .run(supplied, writer.actor, writer.via, kindOfVia(writer.via), why);
     const existing = getWriteSet(store.db, supplied);
+    if (existing && store.db.prepare("SELECT 1 FROM write_sets WHERE undoes = ?").get(supplied)) {
+      return {
+        status: 409,
+        body: {
+          error: `Write set ${supplied} has been undone, so this request can't add to it. Nothing was written.`,
+          error_type: "write_set_undone",
+          field: WRITE_SET_HEADER,
+          hint: "use a new id",
+        },
+      };
+    }
     if (existing && existing.via !== writer.via) {
       return {
         status: 409,

@@ -80,10 +80,15 @@ export function standingUndo(db: Database, setId: string, depth = 0): string | n
 }
 
 /**
- * Later writes to the set's records: any change by another set (or by none) placed after this set's newest touch of
- * the record in the log's order (positions move with every touch, so a set opened earlier that writes again later
- * counts). A row not yet placed (a raw write since the last Store transaction) counts when it came after.
+ * Later writes to the set's records: any change by another set (or by none) placed after this set's FIRST touch of the
+ * record in the log's order. Undo puts back the set's first snapshot, so a write that landed between two requests of
+ * the same set (several requests sharing one Parachute-Write-Set id) would be undone too: it counts. A row not yet
+ * placed (a raw write since the last Store transaction) counts when it came after.
  */
+function firstPosition(db: Database, setId: string, r: ChangeRow): number | null {
+  const row = db.prepare("SELECT position FROM record_changes WHERE write_set = ? AND note_id = ? ORDER BY seq LIMIT 1").get(setId, r.note_id) as { position: number | null } | null;
+  return row?.position ?? null;
+}
 export function undoConflicts(db: Database, setId: string): UndoConflict[] {
   const out: UndoConflict[] = [];
   for (const r of rowsOf(db, setId)) {
@@ -95,7 +100,7 @@ export function undoConflicts(db: Database, setId: string): UndoConflict[] {
            AND (rc.position > ? OR (rc.position IS NULL AND rc.seq > ?))
          ORDER BY COALESCE(rc.position, 9e18) DESC LIMIT 1`,
       )
-      .get(r.note_id, setId, r.last_position ?? r.last_seq, r.last_seq) as { write_set: string | null; at: string; actor: string | null; via: string | null } | null;
+      .get(r.note_id, setId, firstPosition(db, setId, r) ?? r.first_seq, r.first_seq) as { write_set: string | null; at: string; actor: string | null; via: string | null } | null;
     if (!later) continue;
     out.push({ id: r.note_id, path: pathNowOrBefore(db, r), write_set: later.write_set, by: later.actor, via: later.via, at: later.at });
   }
@@ -132,7 +137,19 @@ const linkKey = (target: string, relationship: string) => `${target}\u0000${rela
  * Undoes one write set. The caller has already decided the caller may (its own set, or admin; a scoped caller only
  * a set it can see whole) and has set the Store's write set source to the undo's own set (`undoes: setId`).
  */
-export async function undoWriteSet(store: Store, setId: string, opts: { force?: boolean; actor?: string | null; via?: string | null } = {}): Promise<UndoResult> {
+export async function undoWriteSet(
+  store: Store,
+  setId: string,
+  opts: {
+    force?: boolean;
+    actor?: string | null;
+    via?: string | null;
+    /** A tag-scoped caller: only tags it may write are put back or taken away; the rest are left as they are. */
+    tagWritable?: (tag: string) => boolean;
+    /** A tag-scoped caller: only links to records it can see are put back or taken away. */
+    targetVisible?: (noteId: string) => boolean;
+  } = {},
+): Promise<UndoResult> {
   const db = store.db;
   // Everything is read inside the transaction, so no write can land between a check and the undo.
   return transactionAsync(db, async () => {
@@ -214,8 +231,9 @@ export async function undoWriteSet(store: Store, setId: string, opts: { force?: 
         await guardPath(r, before?.path, () => store.updateNote(r.note_id, updates as Parameters<Store["updateNote"]>[1]));
         if (r.before_tags !== null) {
           const now = (db.prepare("SELECT tag_name FROM note_tags WHERE note_id = ?").all(r.note_id) as { tag_name: string }[]).map((t) => t.tag_name);
-          const extra = now.filter((t) => !tags.includes(t));
-          const missing = tags.filter((t) => !now.includes(t));
+          const writable = opts.tagWritable ?? (() => true);
+          const extra = now.filter((t) => !tags.includes(t) && writable(t));
+          const missing = tags.filter((t) => !now.includes(t) && writable(t));
           if (extra.length) await store.untagNote(r.note_id, extra);
           if (missing.length) await store.tagNote(r.note_id, missing);
         }
@@ -226,13 +244,16 @@ export async function undoWriteSet(store: Store, setId: string, opts: { force?: 
     for (const { id, links } of linkWork) {
       const now = db.prepare("SELECT target_id, relationship, metadata FROM links WHERE source_id = ?").all(id) as { target_id: string; relationship: string; metadata: string | null }[];
       const want = new Map(links.map((l) => [linkKey(l.target, l.relationship), l]));
+      const visible = opts.targetVisible ?? (() => true);
       for (const l of now) {
+        if (!visible(l.target_id)) continue;
         const w = want.get(linkKey(l.target_id, l.relationship));
         if (!w || canonical(parseJson(l.metadata, {})) !== canonical(w.metadata ?? {})) await store.deleteLink(id, l.target_id, l.relationship);
       }
       const after = new Set((db.prepare("SELECT target_id, relationship FROM links WHERE source_id = ?").all(id) as { target_id: string; relationship: string }[]).map((l) => linkKey(l.target_id, l.relationship)));
       for (const l of links) {
         if (after.has(linkKey(l.target, l.relationship))) continue;
+        if (exists(l.target) && !visible(l.target)) continue;
         if (!exists(l.target)) {
           result.links_skipped.push({ id, target: l.target, relationship: l.relationship });
           continue;

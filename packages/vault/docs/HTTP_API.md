@@ -1686,6 +1686,11 @@ links_skipped}`: `write_set` is the undo's own set (`undoes: <id>`), so undoing 
 - Another key's set, a set a tag-scoped key can't see whole, an unknown set, or one past the change log's horizon:
   **404** (as GET answers). Admin may undo any key's set. A body key other than `force` and `why`: 400
   `unknown_parameter`. A `Parachute-Write-Set` header is ignored here: an undo is always its own set.
+- A write by another key between two requests of the same set counts as a later write (undo puts back the set's first
+  snapshot). A tag-scoped key's undo puts back and takes away only tags in its scope, and links to records it can
+  see; the rest are left as they are. An undone set takes no more writes (409 `write_set_undone`).
+- Not put back: attachments, and tag records (a tag's description and fields after a rename). A set that moved paths
+  among its own records (a swap; a delete and a create at the same path) can't be undone: 409 `undo_path_taken`.
 
 ### Version history
 

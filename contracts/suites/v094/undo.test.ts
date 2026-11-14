@@ -220,6 +220,44 @@ describe("v094/undo: review round 1 cases", () => {
   });
 });
 
+describe("v094/undo: review round 2 cases", () => {
+  test("another key's write between two requests of the set counts: 409, nothing changed", async () => {
+    const id = (await writer.api("POST", "/notes", { path: `mid/${shortId()}`, content: "a", metadata: { k: 0 } })).body.id;
+    const setId = `mid-${shortId()}${shortId()}`;
+    await writer.api("PATCH", `/notes/${id}`, { content: "b", force: true }, { "Parachute-Write-Set": setId });
+    await other.api("PATCH", `/notes/${id}`, { metadata: { k: 1 }, force: true });
+    const theirs = await newestSet(other);
+    await writer.api("PATCH", `/notes/${id}`, { tags: { add: ["midtag"] }, force: true }, { "Parachute-Write-Set": setId });
+    const r = await undo(writer, setId);
+    expect(r.status).toBe(409);
+    expect(r.body.conflicts.map((c: any) => c.write_set)).toEqual([theirs]);
+    expect((await snapshot(writer, id))?.metadata).toEqual({ k: 1 });
+  });
+
+  test("a tag-scoped key's undo leaves tags outside its scope as they are", async () => {
+    const t = `us${shortId()}`;
+    const scoped = rest(services().vaultViaHub, await pass({ level: "write", tags: [t] }));
+    const id = (await admin.api("POST", "/notes", { path: `${t}/r`, content: "one", tags: [t, `hidden${t}`] })).body.id;
+    expect((await scoped.patch(`/notes/${id}`, { content: "two", force: true })).status).toBe(200);
+    const mine = (await scoped.get("/write-sets?by=me&limit=1")).body.write_sets[0].id;
+    await admin.api("PATCH", `/notes/${id}`, { tags: { remove: [`hidden${t}`], add: [`other${t}`] }, force: true });
+    const r = await scoped.post(`/write-sets/${enc(mine)}/undo`, { force: true });
+    expect(r.status).toBe(200);
+    const now = await snapshot(admin, id);
+    expect(now?.content).toBe("one");
+    expect(now?.tags).toEqual([`other${t}`, t].sort());
+  });
+
+  test("an undone set takes no more writes: 409 write_set_undone", async () => {
+    const setId = `done-${shortId()}${shortId()}`;
+    await writer.api("POST", "/notes", { path: `done/${shortId()}`, content: "x" }, { "Parachute-Write-Set": setId });
+    expect((await undo(writer, setId)).status).toBe(200);
+    const r = await writer.api("POST", "/notes", { path: `done/${shortId()}`, content: "y" }, { "Parachute-Write-Set": setId });
+    expect(r.status).toBe(409);
+    expect(r.body.error_type).toBe("write_set_undone");
+  });
+});
+
 describe("v094/undo: who may undo", () => {
   test("a key can't undo another key's set (404, as reading it); admin can", async () => {
     const id = (await other.api("POST", "/notes", { path: `who/${shortId()}`, content: "theirs" })).body.id;
