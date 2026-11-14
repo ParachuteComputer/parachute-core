@@ -17,6 +17,8 @@
 
 import { NOTE_TOOL_NAMES } from "../core/src/mcp-records.ts";
 import { recordErrorData, typedMessage } from "../core/src/mcp-surface.ts";
+import { toolAnnotations } from "../core/src/mcp-annotations.ts";
+import { mcpCallResult } from "../core/src/mcp-result.ts";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import {
@@ -162,11 +164,16 @@ export async function handleMcp(
     hasScopeForVault(auth.scopes, vaultName, requiredVerbForTool(t)),
   );
 
+  // The caller's level here: two tools reach further at a higher one (mcp-annotations.ts BY_LEVEL). A tag-scoped admin
+  // can't set the vault-wide description, so for the hints it counts as a writer.
+  const tagScoped = (auth.scoped_tags?.length ?? 0) > 0;
+  const level = hasScopeForVault(auth.scopes, vaultName, "admin") && !tagScoped ? "admin" : hasScopeForVault(auth.scopes, vaultName, "write") ? "write" : "read";
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: visibleTools.map((t) => ({
       name: t.name,
       description: t.description,
       inputSchema: t.inputSchema,
+      annotations: toolAnnotations(t.name, level), // T-456: a client can tell a read from a change (mcp-annotations.ts)
     })),
   }));
 
@@ -201,13 +208,13 @@ export async function handleMcp(
       const result = await tool.execute((args ?? {}) as Record<string, unknown>);
       // The one wrapper change (attachments-for-agents design, Wave 2):
       // `resultContent`, when a tool defines it, decides the MCP content
-      // blocks instead of the universal single-text-block default —
-      // `read-attachment`'s image branch is the only current user (needs a
-      // REAL {type:"image"} block alongside the row-JSON text block).
-      const content = tool.resultContent
-        ? tool.resultContent(result)
-        : [{ type: "text" as const, text: JSON.stringify(result, null, 2) }];
-      return { content };
+      // blocks instead of the universal single-text-block default:
+      // `read-attachment`'s image branch (a REAL {type:"image"} block
+      // alongside the row-JSON text block) and the five note aliases (the
+      // refresh nudge as a second block).
+      // T-456: mcpCallResult adds `structuredContent` where ChatGPT would otherwise read the reply as `{}` (a JSON
+      // object with a top-level `content` key: a note by id). Every other reply is these blocks alone.
+      return mcpCallResult(tool, result);
     } catch (err) {
       // vault#555 fix 6 — never re-wrap an already-formed McpError. Passing
       // the SAME instance straight through is strictly correct (no

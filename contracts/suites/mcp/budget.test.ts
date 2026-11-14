@@ -8,11 +8,18 @@ import { describe, expect, test } from "bun:test";
 import { mcp, pass, services } from "../lib.ts";
 
 const tokens = (x: unknown) => Math.ceil((typeof x === "string" ? x : JSON.stringify(x)).length / 4);
+// What the model reads of a tool. Its MCP annotations (readOnlyHint …, T-456) are for the client's own decisions
+// (whether to ask before a call): a model's tool definition (Anthropic: name, description, input_schema; OpenAI:
+// name, description, parameters) has no place for them, so they are not counted.
+const read = <T extends { annotations?: unknown }>(t: T): Omit<T, "annotations"> => {
+  const { annotations: _client, ...forModel } = t;
+  return forModel;
+};
 
 async function session(level: "read" | "write" | "admin") {
   const s = services();
   const c = await mcp(`${s.vaultViaHub}/mcp`, level === "admin" ? s.operatorToken : await pass({ level }));
-  const tools = (await c.client.listTools()).tools;
+  const tools = (await c.client.listTools()).tools.map(read);
   return { c, tools, instructions: c.client.getInstructions() ?? "" };
 }
 

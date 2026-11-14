@@ -362,11 +362,12 @@ function toolCrash(id: JsonRpcId, name: string, err: unknown): JsonRpcMessage {
 
 async function listedTools(
   ctx: AccountToolContext,
-): Promise<Array<{ name: string; description: string; inputSchema: Record<string, unknown> }>> {
+): Promise<Array<{ name: string; description: string; inputSchema: Record<string, unknown>; annotations?: Record<string, unknown> }>> {
   const hub = toolsForPrincipal(ctx).map((t) => ({
     name: t.name,
     description: t.description,
     inputSchema: t.inputSchema,
+    annotations: { ...t.annotations },
   }));
   const vault = await listVaultModuleTools(ctx);
   return [...hub, ...vault];

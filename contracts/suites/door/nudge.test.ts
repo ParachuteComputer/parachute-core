@@ -5,6 +5,12 @@
 // Every other tool answers with one block, and a refused call carries no nudge. The read sentence: the server
 // instructions say, on one line near the vault's name, what this connection can read at its level.
 // Both are product text for an AI client, so every door must say them, and say them the same.
+//
+// structuredContent (T-456): ChatGPT reads a JSON text block whose object has a top-level `content` key as `{}`, and a
+// note read by id is exactly that (proven 11-12 through a rewriting proxy: renaming the key, or sending the same
+// object as structuredContent, makes it read; the second block plays no part). So such a reply also goes out as
+// structuredContent, the text unchanged. ChatGPT then gives its model structuredContent alone, so the nudge rides
+// inside it as `deprecation.notice`. No other reply carries structuredContent.
 import { describe, expect, test } from "bun:test";
 import { fp, mcp, runId } from "./_door.ts";
 
@@ -18,9 +24,9 @@ const ALIASES: Record<string, string> = {
 
 type Block = { type: string; text?: string };
 
-async function blocks(c: Awaited<ReturnType<typeof mcp>>, name: string, args: Record<string, unknown>): Promise<{ isError: boolean; content: Block[] }> {
+async function blocks(c: Awaited<ReturnType<typeof mcp>>, name: string, args: Record<string, unknown>): Promise<{ isError: boolean; content: Block[]; structured?: Record<string, unknown> }> {
   const r: any = await c.client.callTool({ name, arguments: args });
-  return { isError: r.isError ?? false, content: r.content ?? [] };
+  return { isError: r.isError ?? false, content: r.content ?? [], structured: r.structuredContent };
 }
 
 describe("the refresh nudge and the read sentence", () => {
@@ -52,6 +58,46 @@ describe("the refresh nudge and the read sentence", () => {
         fp(`mcp/nudge.${name}.text`, nudge);
       }
     } finally {
+      await c.close();
+    }
+  });
+
+  test("a reply with a top-level `content` key also goes out as structuredContent, the nudge inside; no other does", async () => {
+    const c = await mcp("write");
+    const path = `${runId("nudge")}/three`;
+    try {
+      const calls: [string, Record<string, unknown>][] = [
+        ["create-note", { path, content: "Hollow Oak Farm: 12 crates for client-7.", tags: ["nudge-sc"] }],
+        ["query-notes", { id: path, include_content: true }],
+        ["update-note", { id: path, append: "\nPaid." }],
+        ["query-notes", { tag: "nudge-sc" }],
+        ["list-tags", {}],
+        ["query-records", { id: path, include_body: true }],
+      ];
+      let carried = 0;
+      for (const [name, args] of calls) {
+        const r = await blocks(c, name, args);
+        expect({ name, isError: r.isError }).toEqual({ name, isError: false });
+        const parsed = JSON.parse(r.content[0]!.text!);
+        const hasContentKey = !!parsed && typeof parsed === "object" && !Array.isArray(parsed) && "content" in parsed;
+        fp(`mcp/structured.${name}.${Object.keys(args).sort().join("+") || "none"}`, { contentKey: hasContentKey, structured: r.structured !== undefined });
+        if (!hasContentKey) {
+          expect({ name, structured: r.structured }).toEqual({ name, structured: undefined });
+          continue;
+        }
+        carried++;
+        // The same object as the text, plus the nudge's words where ChatGPT's model will read them.
+        const nudge = r.content[1]?.text;
+        const deprecation = ALIASES[name] ? { tool: name, use: ALIASES[name], removed_in: "1.0", notice: nudge } : undefined;
+        expect({ name, structured: r.structured }).toEqual({ name, structured: deprecation ? { ...parsed, deprecation } : parsed });
+        if (deprecation) expect(nudge).toMatch(/refresh this connector/);
+      }
+      // The note read by id is the case that broke in ChatGPT: it must be one of them.
+      expect(carried).toBeGreaterThanOrEqual(1);
+      const byId = await blocks(c, "query-notes", { id: path, include_content: true });
+      expect(byId.structured?.content).toBe("Hollow Oak Farm: 12 crates for client-7.\nPaid.");
+    } finally {
+      await blocks(c, "delete-note", { id: path }).catch(() => {});
       await c.close();
     }
   });

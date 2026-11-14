@@ -12,6 +12,8 @@ const is091 = d.release === "0.9.1";
 const accountMcp = () => `${d.issuer}/account/mcp`;
 const bearer = async () => ({ authorization: `Bearer ${await accountToken()}`, "content-type": "application/json" });
 const tokens = (x: unknown) => Math.ceil((typeof x === "string" ? x : JSON.stringify(x)).length / 4);
+// What the model reads of a tool list: not the tools' MCP annotations, which are for the client (mcp/budget).
+const forModel = (tools: { annotations?: unknown }[]) => tools.map(({ annotations: _client, ...t }) => t);
 const claimsOf = (jwt: string) => JSON.parse(Buffer.from(jwt.split(".")[1]!, "base64url").toString());
 const mint = async (body: unknown) =>
   safeFetch(`${d.issuer}/account/keys`, { method: "POST", headers: await bearer(), body: JSON.stringify(body) });
@@ -47,7 +49,7 @@ describe.skipIf(!is091 || lacks("multi-vault-door"))("one multi-vault door", () 
       const names = tools.map((t) => t.name);
       for (const t of ["list-vaults", "query-records", "create-record", "update-record", "delete-record"]) expect(names).toContain(t);
       for (const t of ["create-vault", "grant-access", "revoke-access", "list-access", "manage-token"]) expect(names).not.toContain(t);
-      expect(tokens(tools)).toBeLessThanOrEqual(4000);
+      expect(tokens(forModel(tools))).toBeLessThanOrEqual(4000);
       fp("multivault/writer.tools", names);
       const create = tools.find((t) => t.name === "create-record")!;
       expect((create.inputSchema as { required?: string[] }).required ?? []).toContain("vault");
@@ -90,6 +92,9 @@ describe.skipIf(!is091 || lacks("multi-vault-door"))("one multi-vault door", () 
       const q = await c.call("query-records", { search: "written through the account door", limit: 5 });
       expect([...q.vaults_queried].sort()).toEqual([read, write].sort());
       fp("multivault/query.fan-out.keys", Object.keys(q).sort());
+      // Leave the second vault as it was: rest's "a new vault starts with the same notes" reads it, in whatever order
+      // the files run.
+      expect((await rest("write", write).del(`/notes/${encodeURIComponent(path)}`)).status).toBeLessThan(300);
     } finally {
       await c.close();
     }
@@ -153,6 +158,7 @@ describe.skipIf(!is091 || lacks("multi-vault-door"))("one multi-vault door", () 
         expect((await rest("read", write).get(`/records/${encodeURIComponent(path)}`)).status).toBe(200);
         expect((await rest("read", read).get(`/records/${encodeURIComponent(path)}`)).status).toBe(404);
         expect((await rest("read", third).get(`/records/${encodeURIComponent(path)}`)).status).toBe(404);
+        expect((await rest("write", write).del(`/notes/${encodeURIComponent(path)}`)).status).toBeLessThan(300);
       } finally {
         await c.close();
       }

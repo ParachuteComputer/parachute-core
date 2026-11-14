@@ -1542,6 +1542,36 @@ describe("account MCP — vault module proxy", () => {
     }
   });
 
+  test("schema-source fallback: a lower vault's hints are dropped, an equal one's kept (T-456)", async () => {
+    // The vault's list carries MCP annotations. vault-info is read-only below admin, so a key that is admin on beta
+    // and read on personal must not take personal's "read-only" when beta is down: vault-info still changes beta.
+    const hints = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
+    const listWith = (fail: string) => (input: string | URL | Request, init?: RequestInit) =>
+      routeVaultMcp(input, init, {
+        onList: ({ vault }) => {
+          if (vault === fail) throw new Error(`${fail} down`);
+          return { tools: toolsForMintedScope(`vault:${vault}:read`).map((t) => ({ ...t, annotations: hints })) };
+        },
+      });
+    const vaultInfo = async (token: string, fail: string) => {
+      const listed = await handleAccountMcp(bearerReq(token, rpc("tools/list")), mcpDeps(h, { fetchImpl: listWith(fail) }));
+      const tools = ((await listed.json()) as { result: { tools: Array<{ name: string; annotations?: unknown }> } }).result.tools;
+      return { vaultInfo: tools.find((t) => t.name === "vault-info"), listVaults: tools.find((t) => t.name === "list-vaults") };
+    };
+    const h = await makeHarness();
+    try {
+      const mixed = await bearer(h, ["account:self:vaults:beta:admin", "account:self:vaults:personal:read"], h.ownerId);
+      const lower = await vaultInfo(mixed, "beta");
+      expect(lower.vaultInfo).toBeDefined();
+      expect(lower.vaultInfo!.annotations).toBeUndefined();
+      expect(lower.listVaults!.annotations).toBeDefined(); // the hub's own tools keep theirs
+      const even = await bearer(h, [HOST_ADMIN_SCOPE]);
+      expect((await vaultInfo(even, "beta")).vaultInfo!.annotations).toEqual(hints);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("schema-source all down degrades to hub-native only", async () => {
     const h = await makeHarness();
     try {
