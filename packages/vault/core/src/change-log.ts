@@ -384,8 +384,8 @@ export function listWriteSets(
       .prepare(
         `SELECT ws.id, ws.at, ws.actor, ws.via, ws.via_kind, ws.why, ws.undoes,
           (SELECT COUNT(*) FROM (SELECT rc.note_id FROM record_changes rc WHERE rc.write_set = ws.id GROUP BY rc.note_id
-             HAVING NOT (MIN(rc.seq) = MIN(CASE WHEN rc.existed = 0 THEN rc.seq END)
-               AND MAX(rc.seq) = MAX(CASE WHEN rc.op = 'delete' THEN rc.seq END)))) AS records,
+             HAVING NOT (MIN(rc.seq) IS MIN(CASE WHEN rc.existed = 0 THEN rc.seq END)
+               AND MAX(rc.seq) IS MAX(CASE WHEN rc.op = 'delete' THEN rc.seq END)))) AS records,
           (SELECT u.id FROM write_sets u WHERE u.undoes = ws.id ORDER BY u.at DESC LIMIT 1) AS undone_by
          FROM write_sets ws WHERE ${pageWhere.join(" AND ")} ORDER BY ws.at DESC, ws.id DESC LIMIT ?`,
       )
