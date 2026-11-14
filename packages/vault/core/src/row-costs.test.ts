@@ -518,3 +518,136 @@ describe("a meaning search reads each candidate's vectors once", () => {
     }, 120_000);
   }
 });
+
+// T-463: a meaning search holds one batch of vectors at a time, so its memory doesn't grow with the vault.
+//
+// `semanticSearchNotes` used to read every candidate's vectors into one map and score them after: at 24,000 notes of
+// 1024-dim vectors that peaked ~190 MB in a bun process and ~104 MB in a local Durable Object (whose limit is
+// 128 MB). It now scores each batch as it reads it and keeps only the best `limit` scores.
+//
+// The meter: while the search runs, each statement it executes forces a full GC and samples the live heap before it
+// runs and again when it returns, with its rows still in hand (`heapUsed` counts the vector blobs bun:sqlite hands
+// back). The peak minus the heap before the search is what the search held at once. Vectors here are 256-dim (1 KB):
+// the old read held 30.6 MB at 20,000 notes; one batch is ~100 KB. The bound leaves room for the candidate id list and
+// the hits (~1 MB at 20,000 notes). Memory taken and dropped between two statements is not seen.
+describe("a meaning search holds one batch of vectors at a time", () => {
+  const MODEL = "made-up-model";
+  const DIMS = 256;
+  /** One of 64 made-up unit vectors, so many notes tie and the tie order is held too. */
+  function vec(seed: number): Float32Array {
+    const v = new Float32Array(DIMS);
+    let x = (((seed % 64) + 1) * 2654435761) >>> 0;
+    for (let i = 0; i < DIMS; i++) {
+      x = (x * 1103515245 + 12345) >>> 0;
+      v[i] = (x / 2 ** 32) * 2 - 1;
+    }
+    return normalize(v);
+  }
+  class MadeUpProvider implements EmbeddingProvider {
+    readonly name = "made-up";
+    readonly model = MODEL;
+    readonly dims = DIMS;
+    async embed(input: EmbedInput): Promise<EmbedResult> {
+      return { vectors: input.texts.map((t) => vec(t.length)), model: MODEL, dims: DIMS };
+    }
+    async available() {
+      return { ok: true };
+    }
+  }
+  /** Samples the live heap, after a full GC, before and after every statement while `sampling` is on. */
+  class HeapMeter extends Database {
+    sampling = false;
+    peak = 0;
+    override prepare(sql: string, ...rest: any[]): any {
+      const stmt = (super.prepare as any)(sql, ...rest);
+      const meter = this;
+      return new Proxy(stmt, {
+        get(target, key) {
+          const v = target[key];
+          if (key === "all" || key === "get" || key === "iterate" || key === "values" || key === "run") {
+            return (...params: unknown[]) => {
+              if (meter.sampling) meter.sample();
+              const out = v.apply(target, params);
+              if (meter.sampling) meter.sample();
+              return out;
+            };
+          }
+          return typeof v === "function" ? v.bind(target) : v;
+        },
+      });
+    }
+    sample(): void {
+      Bun.gc(true);
+      this.peak = Math.max(this.peak, process.memoryUsage().heapUsed);
+    }
+    async held<T>(fn: () => Promise<T>): Promise<{ result: T; mb: number }> {
+      Bun.gc(true);
+      const before = process.memoryUsage().heapUsed;
+      this.peak = before;
+      this.sampling = true;
+      try {
+        const result = await fn();
+        this.sample();
+        return { result, mb: (this.peak - before) / 2 ** 20 };
+      } finally {
+        this.sampling = false;
+      }
+    }
+  }
+
+  test("a chunk that scores NaN (a corrupt vector) never hides the note's real best chunk", async () => {
+    const db = new Database(file);
+    const store = new SqliteStore(db, { embeddingProvider: new MadeUpProvider() });
+    const q = "what did I write about the garden and the rain";
+    const qv = (await new MadeUpProvider().embed({ texts: [q] })).vectors[0]!;
+    const [a, b] = await store.createNotes([{ content: "note a", path: "seed/a" }, { content: "note b", path: "seed/b" }]);
+    const put = db.prepare("INSERT INTO note_vectors (note_id, chunk_ix, vector, dims, model, content_hash, embedded_at) VALUES (?, ?, ?, ?, ?, 'h', '2026-11-14T00:00:00.000Z')");
+    put.run(a!.id, 0, encodeVector(new Float32Array(DIMS).fill(Number.NaN)), DIMS, MODEL);
+    put.run(a!.id, 1, encodeVector(qv), DIMS, MODEL);
+    put.run(b!.id, 0, encodeVector(vec(q.length + 1)), DIMS, MODEL);
+    const { notes } = await store.semanticSearch(q, { limit: 10 });
+    expect(notes.map((x) => x.id)).toEqual([a!.id, b!.id]);
+    expect(notes[0]!.score).toBeCloseTo(1, 5);
+    db.close();
+  });
+
+  const BOUND_MB = 6;
+  for (const n of [2_000, 20_000]) {
+    test(`at ${n.toLocaleString("en")} notes: semantic and auto-hybrid questions hold under ${BOUND_MB} MB, same ranking`, async () => {
+      const db = new HeapMeter(file);
+      const store = new SqliteStore(db, { embeddingProvider: new MadeUpProvider() });
+      const notes = await store.createNotes(Array.from({ length: n }, (_, i) => ({ content: `made up note ${i} about the garden and the rain`, path: `seed/n${i}` })));
+      const put = db.prepare("INSERT INTO note_vectors (note_id, chunk_ix, vector, dims, model, content_hash, embedded_at) VALUES (?, ?, ?, ?, ?, 'h', '2026-11-14T00:00:00.000Z')");
+      db.transaction(() => {
+        notes.forEach((note, i) => {
+          put.run(note.id, 0, encodeVector(vec(i)), DIMS, MODEL);
+          if (i % 10 === 0) put.run(note.id, 1, encodeVector(vec(i + 7)), DIMS, MODEL);
+        });
+      })();
+      const query = generateMcpTools(store).find((t) => t.name === "query-notes")!;
+      const q = "what did I write about the garden and the rain";
+      await store.semanticSearch(q, { limit: 10 }); // warm: compiled statements and code aren't the search's to hold
+
+      const semantic = await db.held(() => store.semanticSearch(q, { limit: 10 }));
+      const auto = await db.held(() => query.execute({ search: q }) as Promise<{ notes?: { matched_by?: string[] }[] } | { matched_by?: string[] }[]>);
+      const hits = Array.isArray(auto.result) ? auto.result : auto.result.notes ?? [];
+      expect(hits.some((h) => h.matched_by?.includes("meaning"))).toBe(true);
+
+      // The ranking by brute force, straight from the table: best chunk per note, ties in candidate (rowid) order.
+      const qv = normalize((await new MadeUpProvider().embed({ texts: [q] })).vectors[0]!);
+      const best = new Map<string, number>();
+      for (const r of db.query("SELECT v.note_id AS id, v.vector AS vector FROM note_vectors v JOIN notes n ON n.id = v.note_id ORDER BY n.rowid, v.chunk_ix").all() as { id: string; vector: Uint8Array }[]) {
+        const s = dot(decodeVector(r.vector), qv);
+        if (!best.has(r.id) || s > best.get(r.id)!) best.set(r.id, s);
+      }
+      const reference = [...best.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10);
+      expect(semantic.result.notes.map((x) => [x.id, x.score])).toEqual(reference);
+      expect(semantic.result.totalCandidates).toBe(n);
+      expect(semantic.result.pendingCount).toBe(0);
+
+      console.log(`[T-463 memory] ${n} notes: semantic held ${semantic.mb.toFixed(2)} MB, auto hybrid ${auto.mb.toFixed(2)} MB (bound ${BOUND_MB})`);
+      expect({ semantic: semantic.mb <= BOUND_MB, auto: auto.mb <= BOUND_MB }).toEqual({ semantic: true, auto: true });
+      db.close();
+    }, 120_000);
+  }
+});

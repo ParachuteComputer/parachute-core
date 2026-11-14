@@ -51,8 +51,8 @@ export interface StalenessPlan {
  * rows for the ACTIVE `model`. Rows recorded under a different model are
  * always obsolete (a `note_vectors` row's `model` never mixes with the
  * configured provider's model within one scan — see
- * `core/src/notes.ts:semanticSearchNotes`, which filters `WHERE model =
- * ?`) — so a model change surfaces as "every existing row is obsolete,
+ * `core/src/notes.ts:semanticSearchNotes`, which reads only rows whose
+ * `model` is the active one) — so a model change surfaces as "every existing row is obsolete,
  * every current chunk is stale," i.e. a full re-embed sweep, matching the
  * plan's "model change → stale sweep (re-embed)."
  */
