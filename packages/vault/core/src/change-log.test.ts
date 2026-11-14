@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { SqliteStore } from "./store.ts";
 import { SCHEMA_VERSION } from "./schema.ts";
-import { encodeSnapshot, forgetLoggedPast, pruneChangeLog, setRecordStates, writeSetRecords } from "./change-log.ts";
+import { encodeSnapshot, forgetLoggedPast, pruneChangeLog, setRecordStates, snapshotText, writeSetRecords } from "./change-log.ts";
 import { readBlobText } from "./history.ts";
 
 function fresh() {
@@ -235,9 +235,10 @@ describe("change log: positions and what history keeps", () => {
     expect(JSON.parse(setRecordStates(db, "ws_drift0003")[0]!.before_row!).metadata).toContain("lorem ipsum");
   });
 
-  test("the sweep frees a base only once no remaining row names it; erasing a record's history frees its bases", async () => {
+  test("the sweep keeps no snapshot past the horizon in a base: rows still naming one are re-based; erasing a record's history frees its bases", async () => {
     const { db, store, as } = fresh();
-    const fields = (i: number) => ({ summary: "stable text ".repeat(40), step: i });
+    const prose = Array.from({ length: 90 }, (_, k) => ((k * 7919) % 104729).toString(36)).join(" ");
+    const fields = (i: number) => ({ summary: prose, step: i, ...(i === 0 ? { gone: "only-before-the-horizon" } : {}) });
     as({ id: "ws_sweep0000" });
     const n = await store.createNote("b", { path: "sweep", metadata: fields(0) });
     const other = await store.createNote("o", { path: "other", metadata: fields(0) });
@@ -249,13 +250,18 @@ describe("change log: positions and what history keeps", () => {
     const baseOf = (set: string, id: string) => (db.prepare("SELECT before_base AS b FROM record_changes WHERE write_set = ? AND note_id = ?").get(set, id) as { b: number }).b;
     const base = baseOf("ws_sweep0001", n.id);
     expect(baseOf("ws_sweep0004", n.id)).toBe(base);
-    // The first two sets age past the horizon; the rows that held the base when it was made go, the base stays.
+    const before = setRecordStates(db, "ws_sweep0004").map((r) => r.before_row);
+    // The first two sets age past the horizon: the row the base was made of goes, and later rows still name the base.
     db.prepare("UPDATE record_changes SET at = '2000-01-01T00:00:00.000Z' WHERE write_set IN ('ws_sweep0000', 'ws_sweep0001', 'ws_sweep0002')").run();
     db.prepare("UPDATE write_sets SET at = '2000-01-01T00:00:00.000Z' WHERE id IN ('ws_sweep0000', 'ws_sweep0001', 'ws_sweep0002')").run();
     pruneChangeLog(db, 30);
-    expect(db.prepare("SELECT id FROM record_change_bases WHERE id = ?").get(base)).not.toBeNull();
-    const want = JSON.parse(setRecordStates(db, "ws_sweep0004")[0]!.before_row!);
-    expect(JSON.parse(want.metadata).step).toBe(3);
+    // The old base is gone; what the remaining rows read is unchanged; no base holds the value only the swept rows had.
+    expect(db.prepare("SELECT id FROM record_change_bases WHERE id = ?").get(base)).toBeNull();
+    expect(setRecordStates(db, "ws_sweep0004").map((r) => r.before_row)).toEqual(before);
+    expect(JSON.parse(JSON.parse(before[0]!).metadata).step).toBe(3);
+    const bases = db.prepare("SELECT content FROM record_change_bases").all() as { content: Uint8Array | string }[];
+    expect(bases.length).toBeGreaterThan(0);
+    for (const b of bases) expect(snapshotText(b.content)).not.toContain("only-before-the-horizon");
     // Every row past the horizon: the bases go too.
     pruneChangeLog(db, 1, new Date(Date.now() + 3 * 86_400_000));
     expect((db.prepare("SELECT COUNT(*) AS n FROM record_change_bases").get() as { n: number }).n).toBe(0);
@@ -278,6 +284,32 @@ describe("change log: positions and what history keeps", () => {
     store.writeSetSource = () => ({ id: "ws_upgrade02" });
     await store.updateNote(n.id, { metadata: { a: "z" } });
     expect(JSON.parse(JSON.parse(setRecordStates(db, "ws_upgrade02")[0]!.before_row!).metadata).a).toBe("y".repeat(300));
+  });
+
+  test("an upgrade cut short after the bases table, before the column, is finished at the next open", async () => {
+    const db = new Database(":memory:");
+    new SqliteStore(db);
+    db.exec("ALTER TABLE record_changes DROP COLUMN before_base;");
+    const store = new SqliteStore(db);
+    store.writeSetSource = () => ({ id: "ws_cutshort1" });
+    const n = await store.createNote("b", { path: "cut", metadata: { a: "y".repeat(300) } });
+    store.writeSetSource = () => ({ id: "ws_cutshort2" });
+    await store.updateNote(n.id, { metadata: { a: "z" } });
+    expect(JSON.parse(JSON.parse(setRecordStates(db, "ws_cutshort2")[0]!.before_row!).metadata).a).toBe("y".repeat(300));
+  });
+
+  test("a compressed row settled again keeps the base it names", async () => {
+    const { db, store, as } = fresh();
+    as({ id: "ws_again0001" });
+    const n = await store.createNote("b", { path: "again", metadata: { a: "q".repeat(300) } });
+    as({ id: "ws_again0002" });
+    await store.updateNote(n.id, { metadata: { a: "r" } });
+    const want = setRecordStates(db, "ws_again0002")[0]!.before_row;
+    // As if the row were touched again: long links text to compress, its fields already a delta.
+    db.prepare("UPDATE record_changes SET touched = 1, before_links = ? WHERE write_set = 'ws_again0002'").run(JSON.stringify([{ target: "x".repeat(200) }]));
+    as({ id: "ws_again0003" });
+    await store.createNote("c", { path: "other" });
+    expect(setRecordStates(db, "ws_again0002")[0]!.before_row).toBe(want);
   });
 
   test("a snapshot written as text (an older engine's row) still reads", async () => {

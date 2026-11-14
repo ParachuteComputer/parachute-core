@@ -28,7 +28,8 @@
  * - Short snapshots stay text. The column's type says which: TEXT is the JSON, a BLOB is compressed.
  * Readers go through {@link setRecordStates}, so undo and the write-set routes see byte-equal text either way.
  * `before_tags` stays text: the feed reads it on every page. A base is freed by the sweep once no row of its record can
- * name it, and with the record's past (forgetLoggedPast).
+ * name it, re-based where a remaining row still does (so no base outlives the horizon), and with the record's past
+ * (forgetLoggedPast).
  */
 import type { Database } from "bun:sqlite";
 import { deflateBytes, inflateBytes, BlobDecodeError, type StoredContent } from "./blob-codec.js";
@@ -250,17 +251,22 @@ export function changeLogPresent(db: Database): boolean {
   const names = new Set(
     (db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table', 'trigger') AND (name IN ('write_context', 'write_sets', 'record_changes', 'record_change_bodies', 'record_change_bases', 'change_log_state') OR name LIKE 'rc\\_%' ESCAPE '\\')").all() as { name: string }[]).map((r) => r.name),
   );
-  return ["write_context", "write_sets", "record_changes", "record_change_bodies", "record_change_bases", "change_log_state", ...CHANGE_LOG_TRIGGERS].every((n) => names.has(n));
+  return ["write_context", "write_sets", "record_changes", "record_change_bodies", "record_change_bases", "change_log_state", ...CHANGE_LOG_TRIGGERS].every((n) => names.has(n))
+    && hasBeforeBase(db);
+}
+
+function hasBeforeBase(db: Database): boolean {
+  return !!db.prepare("SELECT 1 FROM pragma_table_info('record_changes') WHERE name = 'before_base'").get();
 }
 
 /** The un-numbered step: creates the change log on a vault that lacks it (no-op otherwise). */
 export function ensureChangeLog(db: Database): void {
   if (changeLogPresent(db)) return;
+  // A log made by an earlier 0.9.4 build has no before_base (CREATE TABLE IF NOT EXISTS would leave its table as it
+  // is). The column goes first, and changeLogPresent checks it, so a step cut short is redone at the next open.
+  const hasLog = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'record_changes'").get();
+  if (hasLog && !hasBeforeBase(db)) db.exec("ALTER TABLE record_changes ADD COLUMN before_base INTEGER");
   db.exec(CHANGE_LOG_SQL);
-  // A log made by an earlier 0.9.4 build has no before_base (CREATE TABLE IF NOT EXISTS left its table as it was).
-  if (!db.prepare("SELECT 1 FROM pragma_table_info('record_changes') WHERE name = 'before_base'").get()) {
-    db.exec("ALTER TABLE record_changes ADD COLUMN before_base INTEGER");
-  }
 }
 
 /** What one write says about itself. */
@@ -378,6 +384,34 @@ export function rowSnapshotText(db: Database, stored: StoredContent | null, base
 }
 
 /**
+ * Stores one row's `before_row` text compressed: a delta against the base its record's nearest earlier compressed row
+ * names, or, when there is none or the delta isn't small, against a new base made of this text (a delta of nothing, a
+ * few bytes, so every compressed row reads the same way). A new base's text is always a row's own snapshot, so no base
+ * holds anything older than the oldest row naming it.
+ */
+function storeRowSnapshot(db: Database, seq: number, noteId: string, text: string, links: string | Uint8Array | null): void {
+  const update = cached(db, "UPDATE record_changes SET before_row = ?, before_links = ?, before_base = ? WHERE seq = ?");
+  const whole = encodeSnapshot(text);
+  const wholeSize = typeof whole === "string" ? utf8.encode(whole).length : whole.length;
+  const prior = cached(
+    db,
+    `SELECT b.id, b.content FROM record_change_bases b
+     WHERE b.id = (SELECT before_base FROM record_changes WHERE note_id = ? AND seq < ? AND before_base IS NOT NULL ORDER BY seq DESC LIMIT 1)`,
+  ).get(noteId, seq) as { id: number; content: StoredContent } | null;
+  if (prior) {
+    const delta = deflateBytes(createDeltaBytes(snapshotText(prior.content)!, text));
+    if (delta.length < wholeSize * DELTA_MAX_SHARE) {
+      update.run(delta, links, prior.id, seq);
+      return;
+    }
+  }
+  const id = Number(cached(db, "INSERT INTO record_change_bases (note_id, content) VALUES (?, ?)").run(noteId, whole).lastInsertRowid);
+  update.run(deflateBytes(createDeltaBytes(text, text)), links, id, seq);
+}
+
+const asBytes = (v: StoredContent | null): string | Uint8Array | null => (v instanceof ArrayBuffer ? new Uint8Array(v) : v);
+
+/**
  * Compresses the field snapshots of the rows still to be placed (the open transaction's), in seq order. Runs before
  * they're placed, inside the same transaction, while the rows sit at the table's end: a row that shrinks there leaves
  * its room to the next rows written, not a hole in a page already full.
@@ -385,37 +419,20 @@ export function rowSnapshotText(db: Database, stored: StoredContent | null, base
 function compressTouchedSnapshots(db: Database): void {
   const rows = cached(
     db,
-    `SELECT seq, note_id, before_row, before_links FROM record_changes WHERE touched = 1
+    `SELECT seq, note_id, before_row, before_base, before_links FROM record_changes WHERE touched = 1
        AND ((typeof(before_row) = 'text' AND length(CAST(before_row AS BLOB)) >= ${SNAPSHOT_COMPRESS_MIN_BYTES})
          OR (typeof(before_links) = 'text' AND length(CAST(before_links AS BLOB)) >= ${SNAPSHOT_COMPRESS_MIN_BYTES}))
      ORDER BY seq`,
-  ).all() as { seq: number; note_id: string; before_row: StoredContent | null; before_links: StoredContent | null }[];
+  ).all() as { seq: number; note_id: string; before_row: StoredContent | null; before_base: number | null; before_links: StoredContent | null }[];
   if (!rows.length) return;
-  const update = cached(db, "UPDATE record_changes SET before_row = ?, before_links = ?, before_base = ? WHERE seq = ?");
-  const newestBase = cached(db, "SELECT id, content FROM record_change_bases WHERE note_id = ? ORDER BY id DESC LIMIT 1");
-  const addBase = cached(db, "INSERT INTO record_change_bases (note_id, content) VALUES (?, ?)");
-  const same = (v: StoredContent | null) => (v instanceof ArrayBuffer ? new Uint8Array(v) : v);
   for (const r of rows) {
-    const links = typeof r.before_links === "string" ? encodeSnapshot(r.before_links) : same(r.before_links);
-    if (typeof r.before_row !== "string" || utf8.encode(r.before_row).length < SNAPSHOT_COMPRESS_MIN_BYTES) {
-      update.run(same(r.before_row), links, null, r.seq);
-      continue;
+    const links = typeof r.before_links === "string" ? encodeSnapshot(r.before_links) : asBytes(r.before_links);
+    if (typeof r.before_row === "string" && utf8.encode(r.before_row).length >= SNAPSHOT_COMPRESS_MIN_BYTES) {
+      storeRowSnapshot(db, r.seq, r.note_id, r.before_row, links);
+    } else {
+      // Fields short or already stored: left as they are, with the base they name (if any).
+      cached(db, "UPDATE record_changes SET before_row = ?, before_links = ?, before_base = ? WHERE seq = ?").run(asBytes(r.before_row), links, r.before_base, r.seq);
     }
-    const text = r.before_row;
-    const whole = encodeSnapshot(text);
-    const wholeSize = typeof whole === "string" ? utf8.encode(whole).length : whole.length;
-    const base = newestBase.get(r.note_id) as { id: number; content: StoredContent } | null;
-    if (base) {
-      const delta = deflateBytes(createDeltaBytes(snapshotText(base.content)!, text));
-      if (delta.length < wholeSize * DELTA_MAX_SHARE) {
-        update.run(delta, links, base.id, r.seq);
-        continue;
-      }
-    }
-    // No base, or this snapshot has drifted from it: it becomes the record's newest base, and the row a delta of
-    // nothing against it (a few bytes), so every compressed row reads the same way.
-    const id = Number(addBase.run(r.note_id, whole).lastInsertRowid);
-    update.run(deflateBytes(createDeltaBytes(text, text)), links, id, r.seq);
   }
 }
 
@@ -613,12 +630,12 @@ export function pruneChangeLog(db: Database, days: number, now = new Date()): { 
   // The feed's horizon: the highest position dropped, kept in the same step (a row's position can be above its seq's
   // neighbours': its set touched the record again later, so it is the largest of the prefix's).
   if (last) db.prepare("UPDATE change_log_state SET horizon = MAX(horizon, COALESCE((SELECT MAX(position) FROM record_changes WHERE seq <= ?), 0)) WHERE slot = 1").run(last.seq);
-  // The records whose rows go: their bases are freed below once no remaining row can name them.
+  // The bases the rows going name: none may outlive them with what it holds (below).
   const swept = last
-    ? (db.prepare("SELECT DISTINCT note_id FROM record_changes WHERE seq <= ? AND before_base IS NOT NULL").all(last.seq) as { note_id: string }[]).map((r) => r.note_id)
+    ? (db.prepare("SELECT DISTINCT note_id, before_base FROM record_changes WHERE seq <= ? AND before_base IS NOT NULL").all(last.seq) as { note_id: string; before_base: number }[])
     : [];
   const changes = last ? db.prepare("DELETE FROM record_changes WHERE seq <= ?").run(last.seq).changes : 0;
-  freeUnusedBases(db, swept);
+  sweepBases(db, swept);
   const sets = db.prepare("DELETE FROM write_sets WHERE at < ? AND NOT EXISTS (SELECT 1 FROM record_changes rc WHERE rc.write_set = write_sets.id)").run(cutoff).changes;
   return { changes, sets, hashes };
 }
@@ -640,17 +657,28 @@ export function forgetLoggedPast(db: Database, noteId: string): string[] {
 }
 
 /**
- * Frees each of these records' bases that no remaining row names. A row names only a base of its own record, so a
- * record's bases below the smallest one its remaining rows name are free (all of them, when none names one). The
- * scan is by record (idx_record_changes_note), so the log needs no index on before_base.
+ * After the sweep: a base a dropped row named holds a snapshot from past the horizon (a base is made of the first row
+ * naming it). Where remaining rows still name it, they're re-encoded, in seq order, against bases made of their own
+ * snapshots; then every base of these records that no remaining row names is freed. Each re-encoded row reads back the
+ * same text. A row names only a base of its own record, so the work is per record (idx_record_changes_note).
  */
-function freeUnusedBases(db: Database, noteIds: string[]): void {
-  if (!noteIds.length) return;
-  const lowest = db.prepare("SELECT MIN(before_base) AS b FROM record_changes WHERE note_id = ?");
-  const free = db.prepare("DELETE FROM record_change_bases WHERE note_id = ? AND id < ?");
-  for (const id of noteIds) {
-    const b = (lowest.get(id) as { b: number | null } | null)?.b ?? null;
-    free.run(id, b ?? Number.MAX_SAFE_INTEGER);
+function sweepBases(db: Database, swept: { note_id: string; before_base: number }[]): void {
+  if (!swept.length) return;
+  const byNote = new Map<string, Set<number>>();
+  for (const r of swept) (byNote.get(r.note_id) ?? byNote.set(r.note_id, new Set()).get(r.note_id)!).add(r.before_base);
+  const naming = db.prepare("SELECT seq, before_row, before_base, before_links FROM record_changes WHERE note_id = ? AND before_base IS NOT NULL ORDER BY seq");
+  const clear = db.prepare("UPDATE record_changes SET before_base = NULL WHERE seq = ?");
+  const free = db.prepare(
+    "DELETE FROM record_change_bases WHERE note_id = ? AND id NOT IN (SELECT before_base FROM record_changes WHERE note_id = ? AND before_base IS NOT NULL)",
+  );
+  for (const [noteId, stale] of byNote) {
+    const rows = (naming.all(noteId) as { seq: number; before_row: StoredContent; before_base: number; before_links: StoredContent | null }[])
+      .filter((r) => stale.has(r.before_base));
+    // Read every text first (their bases are still there), then let go of the stale bases, then store them again.
+    const texts = rows.map((r) => ({ seq: r.seq, text: rowSnapshotText(db, r.before_row, r.before_base)!, links: asBytes(r.before_links) }));
+    for (const r of texts) clear.run(r.seq);
+    for (const r of texts) storeRowSnapshot(db, r.seq, noteId, r.text, r.links);
+    free.run(noteId, noteId);
   }
 }
 
