@@ -71,8 +71,8 @@ function restoredVersions(home: string, vault: string, id: string): Array<Record
   try {
     const rows = db
       .query(
-        `SELECT v.*, b.content AS body, b.encoding AS blob_encoding, w.why AS set_why FROM note_versions v
-         LEFT JOIN note_blobs b ON b.hash = v.content_hash LEFT JOIN write_sets w ON w.id = v.write_set
+        `SELECT v.*, b.content AS body, b.encoding AS blob_encoding FROM note_versions v
+         LEFT JOIN note_blobs b ON b.hash = v.content_hash
          WHERE v.note_id = ? ORDER BY v.version_ix`,
       )
       .all(id) as any[];
@@ -80,7 +80,7 @@ function restoredVersions(home: string, vault: string, id: string): Array<Record
       must(r.blob_encoding === null, `restored body of ${id} v${r.version_ix} is stored ${r.blob_encoding}; this suite reads whole bodies`);
       const json = (t: string | null) => (t === null ? null : JSON.parse(t));
       return {
-        ...pick({ ...r, metadata: r.metadata ? JSON.parse(r.metadata) : {}, types: json(r.types), tags: json(r.tags), links: json(r.links), why: r.set_why }),
+        ...pick({ ...r, metadata: r.metadata ? JSON.parse(r.metadata) : {}, types: json(r.types), tags: json(r.tags), links: json(r.links) }),
         content: r.body === null ? null : typeof r.body === "string" ? r.body : new TextDecoder().decode(r.body),
       };
     });
