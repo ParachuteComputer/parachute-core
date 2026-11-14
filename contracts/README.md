@@ -163,7 +163,9 @@ bun run moves                                    # a made-up vault through all t
   change, `bun run doors:keep box-0.9` and commit the diff). parachute-cloud's CI runs its own door from its pin of
   this folder and compares with the kept box of the release it runs (`box-0.8.jsonl` while cloud is on 0.8; that
   file was kept from `next` at 53f956f plus this suite's one fix to the box, the last 0.8 on `next`, and is checked
-  again by building `release/0.8`: `CANDIDATE_DIR=<that build> bun run doors -- --doors box --check-golden`).
+  again by building `release/0.8`: `CANDIDATE_DIR=<that build> bun run doors -- --doors box --check-golden`). A cloud checkout
+  pinned to a 0.9 engine (`PARACHUTE_CORE_VERSION` 0.9.x in its `scripts/core-source.env`) runs as `cloud-0.9.1`
+  against `box-0.9.1.jsonl`, with a made-up owner key linked to its account at `/account/pubkeys`.
   Neither repo builds the other's door.
 - **A deployed door** is run from a door file written by hand (`kind`, `label`, `release`, `issuer`, `vaultOrigin`,
   `signIn: {how: "nostr", secretKeyFile}`), with `DOOR_REMOTE_HOSTS` naming its hosts. The run makes two vaults of
