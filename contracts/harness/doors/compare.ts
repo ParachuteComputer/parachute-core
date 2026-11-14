@@ -69,6 +69,11 @@ export function compare(prints: Record<string, Fingerprint>, deliberate: Deliber
     for (let j = i + 1; j < labels.length; j++) {
       const [a, b] = [labels[i]!, labels[j]!];
       if (releaseOf(a) !== releaseOf(b)) continue;
+      // With a box on the release line, every other door is compared with the box, never with each other: the
+      // differences deliberate.json names are differences from a box (two cloud-style doors would otherwise be held
+      // to entries that only ever apply against one).
+      const boxHere = labels.some((l) => kindOf(l) === "box" && releaseOf(l) === releaseOf(a));
+      if (boxHere && kindOf(a) !== "box" && kindOf(b) !== "box") continue;
       pairs++;
       compared.push([a, b]);
       const keys = [...new Set([...prints[a]!.keys(), ...prints[b]!.keys()])].sort();

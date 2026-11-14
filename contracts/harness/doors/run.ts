@@ -8,11 +8,13 @@
 //                                                        repo's CI: it runs its own door and needs no box)
 //   bun run doors -- --doors box --embeddings suites/v093  the box with meaning search on (the bundled model)
 //   bun run doors:keep box-0.8                           keep the last run's fingerprint as the golden one
-//   bun run doors -- --remote <door.json>                a deployed door, from a door file written by hand; no
+//   bun run doors -- --remote <door.json>                a deployed door, from a door file written by hand (or by
+//                                                        harness/doors/remote-cloud.ts for a staging cloud); no
 //                                                        sandbox (it needs the network), DOOR_REMOTE_HOSTS names it
 //
 //   CANDIDATE_DIR=<dir>     the box: a built candidate (default .cache/candidate-core, from `bun run build:core`)
-//   CLOUD_REPO=<dir>        cloud: a parachute-cloud checkout, dependencies installed, engine pin materialised
+//   CLOUD_REPO=<dir>        cloud: a parachute-cloud checkout, dependencies installed, engine pin materialised; its
+//                           pin's version picks the release line (0.8, or 0.9.1 with a linked owner key)
 //   PERSONAL_REPO=<dir>     personal: a checkout that has the single-owner profile (OWNER_PUBKEY)
 //   DOOR_RESULTS=<dir>      where the results go (default .cache/doors); the only thing a run leaves behind
 //
@@ -27,7 +29,7 @@ import { loadCandidate, prepareInfo } from "../candidate.ts";
 import { safeFetch } from "../guard.ts";
 import type { Door } from "../../suites/door/_door.ts";
 import { linkOwnerKeyOnBox, startBoxDoor } from "./box.ts";
-import { makeOwnerKey, nostrAuthorization, signUp, startWorkersDoor } from "./workers.ts";
+import { linkOwnerKeyOnCloud, makeOwnerKey, nostrAuthorization, signUp, startWorkersDoor } from "./workers.ts";
 import { compare, matrix, readFingerprint, readJunit, serializeFingerprint, type Deliberate } from "./compare.ts";
 
 const contracts = resolve(import.meta.dir, "..", "..");
@@ -132,6 +134,12 @@ function gitHead(repo: string): string {
   const dirty = Bun.spawnSync(["git", "-C", repo, "status", "--porcelain", "--untracked-files=no"], { stdout: "pipe", stderr: "ignore" }).stdout.toString().trim();
   return `${r.stdout.toString().trim() || "?"}${dirty ? " (edited)" : ""}`;
 }
+/** The release line a cloud checkout runs: its engine pin's version says (0.8.x, or 0.9 with owner keys, 0.9.1). */
+function cloudRelease(repo: string): string {
+  const f = join(repo, "scripts", "core-source.env");
+  const v = existsSync(f) ? readFileSync(f, "utf8").match(/^PARACHUTE_CORE_VERSION="([^"]+)"/m)?.[1] : undefined;
+  return v && /^0\.9\./.test(v) ? "0.9.1" : "0.8";
+}
 function corePin(repo: string): string {
   const f = join(repo, "scripts", "core-source.env");
   return existsSync(f) ? (readFileSync(f, "utf8").match(/^PARACHUTE_CORE_REF="([0-9a-f]{7})/m)?.[1] ?? "?") : "?";
@@ -149,8 +157,16 @@ async function startCloud(): Promise<Started> {
     const other = `other${id}`;
     await ensureVault(w.issuer, bearer, vault);
     await ensureVault(w.issuer, bearer, other);
+    // A 0.9.1 cloud door: link a made-up key to the account, as its owner would.
+    const release = cloudRelease(repo);
+    let ownerKey: string | undefined;
+    if (release === "0.9.1") {
+      const owner = await makeOwnerKey();
+      await linkOwnerKeyOnCloud(w.issuer, bearer, owner.secretKey);
+      ownerKey = owner.secretKey;
+    }
     return {
-      door: { kind: "cloud", label: "cloud-0.8", release: "0.8", issuer: w.issuer, vaultOrigin: w.vaultOrigin, vault, otherVault: other, signIn: { how: "cookie", cookie: me.cookie, csrf: me.csrf } },
+      door: { kind: "cloud", label: `cloud-${release}`, release, issuer: w.issuer, vaultOrigin: w.vaultOrigin, vault, otherVault: other, signIn: { how: "cookie", cookie: me.cookie, csrf: me.csrf }, ...(ownerKey ? { ownerKey } : {}) },
       provenance: `cloud: parachute-cloud ${gitHead(repo)}, core pin ${corePin(repo)}, local workerd`,
       stop: w.stop,
       logs: w.logs,
@@ -196,13 +212,18 @@ async function startPersonal(): Promise<Started> {
 }
 
 /**
- * A deployed door, from a door file written by hand: kind, label, release, issuer, vaultOrigin, and a sign-in whose
- * key is in a file (`signIn: {how: "nostr", secretKeyFile}`). The run makes its own two vaults there through the
- * account door and removes them at the end. DOOR_REMOTE_HOSTS must name the door's hosts (suites/door/_door.ts).
+ * A deployed door, from a door file written by hand (or by remote-cloud.ts): kind, label, release, issuer,
+ * vaultOrigin, and a sign-in kept in a file, a key (`signIn: {how: "nostr", secretKeyFile}`) or a browser session
+ * (`signIn: {how: "cookie", cookieFile}`, with the owner key in `ownerKeyFile`). Use absolute paths: the suite reads
+ * them again from its own folder (suites/door/_door.ts). The run makes its own two vaults there through the account
+ * door and removes them at the end. DOOR_REMOTE_HOSTS must name the door's hosts.
  */
 async function startRemote(): Promise<Started> {
-  const d = JSON.parse(readFileSync(remoteFile!, "utf8")) as Door;
-  if (d.signIn?.how !== "nostr" || !d.signIn.secretKeyFile) throw new Error("door: a remote door file signs in with a key file: signIn {how: \"nostr\", secretKeyFile}");
+  const d = JSON.parse(readFileSync(remoteFile!, "utf8")) as Door & { signIn: { how: string; secretKeyFile?: string; cookieFile?: string }; ownerKeyFile?: string };
+  const byCookie = d.signIn?.how === "cookie" && !!d.signIn.cookieFile;
+  if (!byCookie && (d.signIn?.how !== "nostr" || !d.signIn.secretKeyFile)) {
+    throw new Error('door: a remote door file signs in with a key file (signIn {how: "nostr", secretKeyFile}) or a session file (signIn {how: "cookie", cookieFile})');
+  }
   const { allowOrigins } = await import("../guard.ts");
   for (const url of [d.issuer, d.vaultOrigin]) {
     const host = new URL(url).hostname;
@@ -210,17 +231,22 @@ async function startRemote(): Promise<Started> {
     if (!(process.env.DOOR_REMOTE_HOSTS ?? "").split(",").map((h) => h.trim()).includes(host)) throw new Error(`refused: name ${host} in DOOR_REMOTE_HOSTS to run against it`);
   }
   allowOrigins(d.issuer, d.vaultOrigin);
-  const secretKey = readFileSync(d.signIn.secretKeyFile, "utf8").trim();
+  // A session file (a cloud door's browser sign-in, for the approval contracts) holds {cookie, csrf}; its owner key, if
+  // any, is in ownerKeyFile. Neither is ever written into a door file or a result.
+  const session = byCookie ? (JSON.parse(readFileSync(d.signIn.cookieFile!, "utf8")) as { cookie: string; csrf: string }) : null;
+  const secretKey = byCookie ? null : readFileSync(d.signIn.secretKeyFile!, "utf8").trim();
+  const bearerNow = () => (session ? accountBearer(d.issuer, session) : accountBearerByKey(d.issuer, secretKey!));
   const id = randomBytes(3).toString("hex");
   const [vault, other] = [`doorrun${id}`, `doorother${id}`];
-  const bearer = await accountBearerByKey(d.issuer, secretKey);
+  const bearer = await bearerNow();
   await ensureVault(d.issuer, bearer, vault);
   await ensureVault(d.issuer, bearer, other);
   return {
-    door: { ...d, vault, otherVault: other },
+    // The door file the suite reads keeps the file paths, never what they hold (suites/door/_door.ts reads them).
+    door: { ...d, vault, otherVault: other } as Door,
     provenance: `remote: ${d.label} at ${new URL(d.issuer).host} and ${new URL(d.vaultOrigin).host}`,
     stop: async () => {
-      const b = await accountBearerByKey(d.issuer, secretKey);
+      const b = await bearerNow();
       for (const name of [vault, other]) {
         await safeFetch(`${d.issuer}/account/vaults/${name}`, { method: "DELETE", headers: { authorization: `Bearer ${b}`, "content-type": "application/json" }, body: JSON.stringify({ confirm: name }) }).catch(() => {});
       }

@@ -394,7 +394,12 @@ export function stageArchive(repo: string, tip: string, stage: Database, inputSe
       else stage.prepare("INSERT INTO issues VALUES(?,?,?)").run(commit, entry.path, reason);
     };
     const format = files.get(".parachute/vault.yaml");
-    if (format && yaml(read(format)).export_format_version !== 1) throw new Error("Unsupported portable export format");
+    if (format) {
+      const version = yaml(read(format)).export_format_version;
+      // Format 2 (flat fields, `parachute:` block) is read by the vault import, not by history import yet.
+      if (version === 2) throw new Error("Unsupported portable export format: this is a format 2 export, and git history import reads format 1 only. Export with the default format to keep history.");
+      if (version !== 1) throw new Error("Unsupported portable export format");
+    }
     for (const entry of entries.filter(e => /^\.parachute\/notes-meta\/[^/]+\.yaml$/.test(e.path))) {
       let meta: Record<string, unknown> | undefined;
       try {

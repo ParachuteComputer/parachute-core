@@ -213,6 +213,23 @@ export async function signUp(issuer: string): Promise<{ cookie: string; csrf: st
   return { cookie: `parachute_id_session=${session}; parachute_id_csrf=${csrf}`, csrf, email, password };
 }
 
+/**
+ * Link a made-up key to a cloud account, as its owner would (`POST /account/pubkeys`, 0.9.1): the account's own
+ * credential, and an event the key signed for that request naming the account.
+ */
+export async function linkOwnerKeyOnCloud(issuer: string, accountBearer: string, secretKey: string): Promise<void> {
+  const url = `${issuer}/account/pubkeys`;
+  const account = JSON.parse(Buffer.from(accountBearer.split(".")[1]!, "base64url").toString()).sub as string;
+  const header = await nostrAuthorization(secretKey, url, "POST", undefined, [["account", account]]);
+  const event = JSON.parse(Buffer.from(header.slice("Nostr ".length), "base64").toString());
+  const r = await safeFetch(url, {
+    method: "POST",
+    headers: { authorization: `Bearer ${accountBearer}`, "content-type": "application/json" },
+    body: JSON.stringify({ event, label: "door contracts" }),
+  });
+  if (r.status !== 201 && r.status !== 200) throw new Error(`door: linking the owner key gave ${r.status}: ${(await r.text()).slice(0, 200)}`);
+}
+
 /** A made-up owner key for one run: 32 random bytes, and its public half. */
 export async function makeOwnerKey(): Promise<{ secretKey: string; pubkey: string }> {
   const { schnorr } = await import("@noble/curves/secp256k1.js");
