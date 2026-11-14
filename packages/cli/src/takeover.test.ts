@@ -5,7 +5,7 @@ import { describe, expect, test } from "bun:test";
 import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { backup, entries, launchdProgram, managerValue, oldOwner, restore, systemdWords, unitHome as readHome } from "./takeover.ts";
+import { backup, entries, managerValue, oldOwner, restore, systemdWords, unitHome as readHome } from "./takeover.ts";
 
 // The user manager's environment sets no PARACHUTE_HOME here, unless a test says so.
 const unitHome = (text: string, manager: () => string | undefined | null = () => undefined) => readHome(text, manager);
@@ -147,23 +147,6 @@ describe("managerValue: a value as systemctl show-environment prints it", () => 
     expect(managerValue("$'\\q'")).toBeNull();
     expect(managerValue("$'\\'")).toBeNull();
     expect(managerValue("$'\\777'")).toBeNull();
-  });
-});
-
-describe("launchdProgram", () => {
-  const plist = (args: string[], path: string) =>
-    `<plist><dict><key>Label</key><string>computer.parachute.hub</string><key>ProgramArguments</key><array>${args
-      .map((a) => `<string>${a}</string>`)
-      .join("")}</array><key>EnvironmentVariables</key><dict><key>PATH</key><string>${path}</string></dict></dict></plist>`;
-
-  test("a fresh 0.8 agent runs parachute-core: what takeover's launchd check exempts", () => {
-    const core = "/Users/op/.bun/install/global/node_modules/@openparachute/core";
-    expect(launchdProgram(plist(["/Users/op/.bun/bin/bun", `${core}/packages/cli/src/parachute-core.ts`, "serve"], `${core}/packages/cli/bin:/usr/bin`))).toContain("parachute-core");
-  });
-
-  test("a 0.7 agent is judged by its program, not by core's folder on its PATH", () => {
-    const text = plist(["/Users/op/.bun/bin/bun", "/Users/op/.bun/install/global/node_modules/@openparachute/hub/src/cli.ts", "serve"], "/x/parachute-core/bin:/usr/bin");
-    expect(launchdProgram(text)).not.toContain("parachute-core");
   });
 });
 

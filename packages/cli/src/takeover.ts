@@ -13,21 +13,26 @@
 //    - refuse with exit 7, changing nothing, if an old process holds the data outside a unit it can pause (it
 //      names the pid);
 //    - pause the old units (stop, then disable; never mask, never edit their files), and wait until nothing holds
-//      the data. Pausing comes before the backup so the backup is the bytes as they rest, copied exactly;
+//      the data. On macOS an old launchd agent is unloaded (`launchctl bootout`) and its plist moved out of
+//      ~/Library/LaunchAgents into the backup folder's launchd/, so it doesn't start at login (launchd.ts says which
+//      agents are old; a cloudflared tunnel never is). Pausing comes before the backup so the backup is the bytes as
+//      they rest, copied exactly;
 //    - back up every file of the home to <home>/../parachute-takeover/<timestamp>/home/, with manifest.json (a
 //      sha256 per file, checked against the copy);
 //    - start v0.8 on the same home (a check run on a free loopback port, with the old issuer) and check every
 //      answer: /api/ready, the issuer, every live signing key in the JWKS, and per vault a read pass, its note count
 //      and a read; then stop it;
 //    - write <home>/takeover.json (the record), and if a unit ran the old hub, hand the home to a new unit,
-//      parachute-core.service, and check it is up.
+//      parachute-core.service (on macOS the launchd agent computer.parachute.core, with the old agent's environment),
+//      and check it is up.
 //    If a check fails it puts everything back (the backup too, when the check run migrated data) and exits 8.
 // 4. The old programs stay installed, byte-identical, and off. Nothing is converted beyond the named migrations.
-// 5. --rollback stops v0.8 (its unit) and puts the old units back as they were. Code-only when there were no
+// 5. --rollback stops v0.8 (its unit; on macOS its agent, whose plist moves into the backup folder) and puts the old
+//    units back as they were (an agent's plist back in ~/Library/LaunchAgents, loaded again if it was). Code-only when there were no
 //    migrations, so every write made under v0.8 is kept; otherwise it first exports every note changed since the
 //    takeover, then restores the backup.
 //
-// Exit codes: 0 done · 1 another error (nothing to roll back, a platform not built yet) · 2 flags, or no --yes
+// Exit codes: 0 done · 1 another error (nothing to roll back, a unit or agent it can't see) · 2 flags, or no --yes
 // where nobody can be asked · 5 no room for the backup · 6 newer data (dispatch) · 7 an old process holds the data
 // · 8 a check failed after start (it put everything back).
 //
@@ -50,6 +55,7 @@ import {
   statfsSync,
   statSync,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -59,6 +65,19 @@ import { dlopen, FFIType } from "bun:ffi";
 import core from "../../../package.json" with { type: "json" };
 import { databases, homeDir, readDatabase, schemaOf } from "./home.ts";
 import { bundleRoot } from "./install.ts";
+import {
+  CORE_AGENT,
+  LAUNCHD_PATH,
+  agentEnabled,
+  agentEnv,
+  agentHome,
+  agentLooksOld,
+  parseLaunchctlPrint,
+  plistComment,
+  readAgentPlist,
+  renderPlist,
+  type PlistDict,
+} from "./launchd.ts";
 
 export const EXIT = { ok: 0, failed: 1, usage: 2, noRoom: 5, held: 7, checkFailed: 8 } as const;
 export const RECORD_FILE = "takeover.json";
@@ -94,6 +113,8 @@ export interface Unit {
   active: boolean;
   enabled: boolean;
   file?: string;
+  /** A launchd agent's process (0: loaded with none, or not loaded; `active` says whether it is loaded). */
+  pid?: number;
   /** Runs the old hub or vault: the takeover pauses it. Other Parachute units (a tunnel, scribe) are left alone. */
   old: boolean;
   /**
@@ -106,7 +127,7 @@ export interface Unit {
 export interface Holder {
   pid: number;
   cmd: string;
-  /** The systemd unit the process belongs to, if any. */
+  /** The systemd unit (or Parachute launchd agent) the process belongs to, if any. */
   unit?: string;
   /** It also has another home's databases open (a hub.db or vault.db that isn't this home's). */
   other?: boolean;
@@ -169,10 +190,22 @@ interface Record_ {
   backup: string;
   rollback: "code-only" | "restore-backup";
   migrations: string[];
-  paused: { name: string; manager: "systemd"; active: boolean; enabled: boolean }[];
+  paused: Paused[];
   core_unit: string | null;
+  /** Which manager core_unit is under; absent in records from before launchd agents were taken over: systemd. */
+  core_manager?: "systemd" | "launchd";
   issuer: string;
 }
+
+/**
+ * An old unit the takeover paused, as it was. systemd: `active` it ran (started again on the way back), `enabled` it
+ * started at boot. launchd: `active` it ran with this home's data open (put back, it must have it open again),
+ * `loaded` launchd had it loaded (bootstrapped again on the way back), `file` its plist in ~/Library/LaunchAgents and
+ * `aside` where the takeover moved it (moved back on the way back).
+ */
+type Paused =
+  | { name: string; manager: "systemd"; active: boolean; enabled: boolean }
+  | { name: string; manager: "launchd"; active: boolean; enabled: boolean; loaded: boolean; file: string; aside: string };
 
 const userHome = () => process.env.HOME || homedir();
 
@@ -551,28 +584,157 @@ function systemdUnits(home: string, held: Holder[]): Unit[] {
   return out;
 }
 
-/** A plist's ProgramArguments, the part runsOld() would call its ExecStart. */
-export function launchdProgram(plist: string): string {
-  return /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/.exec(plist)?.[1] ?? "";
+// ── launchd (macOS) ──────────────────────────────────────────────────────────────────────────────────────────
+// Looked for wherever there is a `launchctl`: macOS (/bin/launchctl), or the contracts' fake one on Linux. A Linux box
+// has none, so nothing here runs there.
+
+const agentsDir = () => join(userHome(), "Library", "LaunchAgents");
+const coreAgentFile = () => join(agentsDir(), `${CORE_AGENT}.plist`);
+
+function launchctlBin(): string | null {
+  return Bun.which("launchctl") ?? (process.platform === "darwin" && existsSync("/bin/launchctl") ? "/bin/launchctl" : null);
 }
 
-/** Parachute's launchd agents (macOS): reported; pausing them is not built yet. */
-function launchdUnits(): Unit[] {
-  if (process.platform !== "darwin") return [];
-  const dir = join(userHome(), "Library", "LaunchAgents");
-  let files: string[] = [];
+const launchdHere = () => launchctlBin() !== null;
+/** The domain a person's agents load into (the one ~/Library/LaunchAgents loads into at login). */
+const guiDomain = () => `gui/${process.getuid?.() ?? 501}`;
+
+function launchctl(...args: string[]): { code: number; stdout: string; stderr: string } {
+  const bin = launchctlBin();
+  return bin ? run([bin, ...args]) : { code: 127, stdout: "", stderr: "launchctl: not found" };
+}
+
+/**
+ * One agent in the person's login domain (gui/<uid>, where ~/Library/LaunchAgents loads): its pid (0: loaded, no
+ * process), false when it isn't loaded, null when launchctl can't say. Asked by label (`launchctl print`), never with
+ * `launchctl list`, which lists the caller's own domain: over ssh that isn't gui/<uid>.
+ */
+function agentJob(label: string): number | false | null {
+  const r = launchctl("print", `${guiDomain()}/${label}`);
+  if (r.code === 0) return parseLaunchctlPrint(r.stdout);
+  if (r.code === 113 || /could not find service/i.test(r.stderr + r.stdout)) return false;
+  return null;
+}
+
+/**
+ * The loaded agents among `labels` (by default every Parachute agent in ~/Library/LaunchAgents, and core's), each with
+ * its pid (0: none); null when launchctl can't say for one of them.
+ */
+function launchdJobs(labels: string[] = [...agentFiles().map((a) => a.label), CORE_AGENT]): Map<string, number> | null {
+  if (!launchdHere()) return null;
+  // The domain first: with no login session (ssh, nobody logged in at the Mac) there is no gui/<uid>, and every
+  // agent would read as not loaded.
+  if (launchctl("print", guiDomain()).code !== 0) return null;
+  const jobs = new Map<string, number>();
+  for (const label of new Set(labels)) {
+    const pid = agentJob(label);
+    if (pid === null) return null;
+    if (pid !== false) jobs.set(label, pid);
+  }
+  return jobs;
+}
+
+interface AgentFile {
+  label: string;
+  file: string;
+  /** null: not an XML plist with a top-level dict (binary, or not well formed): its home can't be read. */
+  plist: PlistDict | null;
+}
+
+/** Parachute's agents in ~/Library/LaunchAgents (a plist whose name has "parachute" in it), core's own not included. */
+function agentFiles(): AgentFile[] {
+  if (!launchdHere()) return [];
+  let names: string[] = [];
   try {
-    files = readdirSync(dir).filter((f) => /parachute/i.test(f) && f.endsWith(".plist"));
+    names = readdirSync(agentsDir()).filter((f) => /parachute/i.test(f) && f.endsWith(".plist"));
   } catch {}
-  return files.sort().map((f) => {
-    const label = f.replace(/\.plist$/, "");
+  const out: AgentFile[] = [];
+  for (const f of names.sort()) {
+    const file = join(agentsDir(), f);
     let text = "";
     try {
-      text = readFileSync(join(dir, f), "utf8");
+      text = readFileSync(file, "utf8");
     } catch {}
-    const active = run(["launchctl", "list", label]).code === 0;
-    return { name: label, manager: "launchd" as const, active, enabled: true, file: join(dir, f), old: !/parachute-core/.test(launchdProgram(text)) && (OLD_COMMAND.test(text) || /hub|vault/i.test(label)) };
+    const plist = readAgentPlist(text);
+    const label = typeof plist?.Label === "string" ? plist.Label : f.replace(/\.plist$/, "");
+    if (label !== CORE_AGENT) out.push({ label, file, plist });
+  }
+  return out;
+}
+
+/**
+ * Parachute's launchd agents, with state, and which of them run the old programs on `home`: the same evidence as
+ * systemd's (a process of the agent has this home's data open), and one thing more, since a plist is the whole of an
+ * agent's configuration: an agent that isn't running but whose plist starts the old program itself on this home at
+ * login (agentHome) is paused too, so it can't start beside v0.8 at the next login. One that looks old and isn't
+ * running, whose home its plist doesn't say (a wrapper script, an unreadable plist), is `unseen`: takeover refuses.
+ * Any other agent (a cloudflared tunnel, a backup schedule) is left alone, whatever its name.
+ */
+function launchdUnits(home: string, held: Holder[]): Unit[] {
+  const files = agentFiles();
+  if (!files.length) return [];
+  const jobs = launchdJobs(files.map((a) => a.label));
+  return files.map((a) => {
+    const loaded = jobs?.has(a.label) ?? false;
+    const pid = jobs?.get(a.label) ?? 0;
+    const enabled = agentEnabled(a.plist);
+    const holds = held.some((h) => h.unit === a.label);
+    const looksOld = agentLooksOld(a.label, a.plist);
+    const theirs = agentHome(a.plist, userHome());
+    // Not running (or launchctl can't say), so only its plist can tell what it would serve at login.
+    const idle = !holds && (pid === 0 || jobs === null) && looksOld && enabled;
+    const atLogin = idle && jobs !== null && theirs !== "unknown" && sameHome(theirs, home);
+    return {
+      name: a.label,
+      manager: "launchd" as const,
+      active: loaded,
+      enabled,
+      file: a.file,
+      pid,
+      old: holds || atLogin,
+      ...(idle && (jobs === null || theirs === "unknown") ? { unseen: true } : {}),
+    };
   });
+}
+
+/** The pid of every loaded Parachute agent (core's own included) that has a process: holders are attributed to them. */
+function agentRoots(): [string, number][] {
+  if (!launchdHere()) return [];
+  return [...(launchdJobs() ?? new Map<string, number>())].filter(([, pid]) => pid > 0);
+}
+
+/** The home named on the mark comment of core's agent plist, if it has one (as writeCoreAgent wrote it). */
+function coreAgentMark(): string | undefined {
+  try {
+    const c = plistComment(readFileSync(coreAgentFile(), "utf8")) ?? "";
+    if (!c.startsWith(`${CORE_UNIT_MARK} `)) return undefined;
+    const m = /^"(?:[^"\\]|\\.)*"/.exec(c.slice(CORE_UNIT_MARK.length + 1));
+    return m ? (JSON.parse(m[0]) as string) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Move a file (a plist) to `to`, making its folder; across file systems by copy, then removing the original. */
+function moveFile(from: string, to: string): void {
+  mkdirSync(dirname(to), { recursive: true, mode: 0o700 });
+  try {
+    renameSync(from, to);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EXDEV") throw err;
+    // Across volumes: a whole copy under a scratch name, renamed into place, then the original goes. A cut leaves
+    // either nothing at `to` or the same bytes in both places (resumeAgent finishes that).
+    const tmp = join(dirname(to), `.${basename(to)}.${process.pid}.moving`);
+    copyFileSync(from, tmp);
+    renameSync(tmp, to);
+    unlinkSync(from);
+  }
+}
+
+/** Where a file goes in `dir` without replacing one there: its own name, else with a time on it. */
+function freeName(dir: string, name: string): string {
+  const p = join(dir, name);
+  return existsSync(p) ? join(dir, `${name}.${stamp()}`) : p;
 }
 
 /** Every SQLite file of the home's databases (with -wal and -shm). */
@@ -652,9 +814,16 @@ export function holders(home: string): Holder[] {
   return out;
 }
 
-/** The parent of every process (Linux). */
+/** The parent of every process (Linux: /proc; elsewhere `ps`). */
 function parents(): Map<number, number> {
   const parent = new Map<number, number>();
+  if (process.platform !== "linux") {
+    for (const line of run(["ps", "-A", "-o", "pid=", "-o", "ppid="]).stdout.split("\n")) {
+      const m = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
+      if (m) parent.set(Number(m[1]), Number(m[2]));
+    }
+    return parent;
+  }
   for (const name of readdirSync("/proc")) {
     if (!/^\d+$/.test(name)) continue;
     try {
@@ -688,9 +857,37 @@ function unitProcesses(unit: string): number[] {
 /**
  * Is it safe to stop and disable `unit` for `home`? Each of its processes (not only the ones holding this home's data)
  * is checked for another home's databases, and systemd must answer, completely, which other units a stop or disable
- * would reach (`allowed` may be reached). Returns what is wrong, or null.
+ * would reach (`allowed` may be reached). A launchd agent reaches no other agent: only its processes are checked.
+ * Returns what is wrong, or null.
  */
-function unsafeToStop(unit: string, home: string, allowed: Set<string>): string | null {
+function unsafeToStop(unit: string, home: string, allowed: Set<string>, manager: Unit["manager"] = "systemd"): string | null {
+  if (manager === "launchd") return otherHomeDb(unit, agentProcesses(unit), home);
+  return otherHomeDb(unit, unitProcesses(unit), home) ?? reachOf(unit, allowed);
+}
+
+/** Every process of a launchd agent: its pid and that pid's descendants. */
+function agentProcesses(label: string): number[] {
+  const root = launchdJobs([label])?.get(label) ?? 0;
+  if (root <= 0) return [];
+  const parent = parents();
+  const out: number[] = [];
+  for (const pid of parent.keys()) {
+    for (let p: number | undefined = pid, hops = 0; p && p > 1 && hops < 64; p = parent.get(p), hops++) {
+      if (p === root) {
+        out.push(pid);
+        break;
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Does any of `pids` have another home's database (a hub.db or vault.db that isn't this home's) open? What is wrong, or
+ * null. Compared by device and inode: Linux reads each open file through /proc; elsewhere `lsof` names it.
+ */
+function otherHomeDb(unit: string, pids: number[], home: string): string | null {
+  if (!pids.length) return null;
   const ours = new Set<string>();
   for (const f of dataFiles(home)) {
     try {
@@ -698,23 +895,42 @@ function unsafeToStop(unit: string, home: string, allowed: Set<string>): string 
       ours.add(`${st.dev}:${st.ino}`);
     } catch {}
   }
-  for (const pid of unitProcesses(unit)) {
-    let fds: string[] = [];
-    try {
-      fds = readdirSync(`/proc/${pid}/fd`);
-    } catch {
-      continue;
-    }
-    for (const fd of fds) {
+  const isDb = (p: string) => /(^|\/)(hub|vault)\.db(-wal|-shm)?$/.test(p);
+  const theirs = (pid: number, path: string) => `${unit} also has another home's database open (pid ${pid}: ${path}); stopping it would stop that home too`;
+  if (process.platform === "linux") {
+    for (const pid of pids) {
+      let fds: string[] = [];
       try {
-        const link = readlinkSync(`/proc/${pid}/fd/${fd}`);
-        if (!/(^|\/)(hub|vault)\.db(-wal|-shm)?$/.test(link)) continue;
-        const st = statSync(`/proc/${pid}/fd/${fd}`);
-        if (!ours.has(`${st.dev}:${st.ino}`)) return `${unit} also has another home's database open (pid ${pid}: ${link}); stopping it would stop that home too`;
-      } catch {}
+        fds = readdirSync(`/proc/${pid}/fd`);
+      } catch {
+        continue;
+      }
+      for (const fd of fds) {
+        try {
+          const link = readlinkSync(`/proc/${pid}/fd/${fd}`);
+          if (!isDb(link)) continue;
+          const st = statSync(`/proc/${pid}/fd/${fd}`);
+          if (!ours.has(`${st.dev}:${st.ino}`)) return theirs(pid, link);
+        } catch {}
+      }
+    }
+    return null;
+  }
+  // lsof -F: "p<pid>" starts each process, "n<name>" each open file.
+  const r = run(["lsof", "-n", "-P", "-F", "pn", "-p", pids.join(",")]);
+  let pid = 0;
+  for (const line of r.stdout.split("\n")) {
+    if (line.startsWith("p")) pid = Number(line.slice(1));
+    else if (line.startsWith("n") && isDb(line.slice(1))) {
+      try {
+        const st = statSync(line.slice(1));
+        if (!ours.has(`${st.dev}:${st.ino}`)) return theirs(pid, line.slice(1));
+      } catch {
+        return theirs(pid, line.slice(1)); // open, but not where its name says: not provably this home's
+      }
     }
   }
-  return reachOf(unit, allowed);
+  return null;
 }
 
 /**
@@ -743,9 +959,11 @@ function reachOf(unit: string, allowed: Set<string>): string | null {
  */
 export function heldBy(home: string, units: string[]): Holder[] {
   const held = holders(home);
-  if (held.length === 0 || process.platform !== "linux") return held;
+  if (held.length === 0) return held;
+  // systemd units (as asked) on Linux; and every Parachute launchd agent that has a process, wherever launchctl is.
+  const roots = [...(process.platform === "linux" ? units.map((u) => [u, mainPid(u)] as [string, number]) : []), ...agentRoots()].filter(([, pid]) => pid > 0);
+  if (!roots.length) return held;
   const parent = parents();
-  const roots = units.map((u) => [u, mainPid(u)] as const).filter(([, pid]) => pid > 0);
   for (const h of held) {
     for (let p: number | undefined = h.pid, hops = 0; p && p > 1 && hops < 64; p = parent.get(p), hops++) {
       const root = roots.find(([, pid]) => pid === p);
@@ -819,8 +1037,11 @@ export function oldOwner(home: string): string | null {
     const text = unitText(name);
     if (runsOld(name, text) && unitServes(text, home, true)) why.push(`the unit ${name}`);
   }
-  if (process.platform === "darwin") {
-    for (const u of launchdUnits()) if (u.old) why.push(`the launchd agent ${u.name}`);
+  // An agent that looks like the old hub or vault and serves this home by its plist, or might (a wrapper).
+  for (const a of agentFiles()) {
+    if (!agentLooksOld(a.label, a.plist)) continue;
+    const theirs = agentHome(a.plist, userHome());
+    if (theirs === "unknown" || sameHome(theirs, home)) why.push(`the launchd agent ${a.label}`);
   }
   return why.length ? [...new Set(why)].join(", ") : null;
 }
@@ -851,9 +1072,9 @@ export async function detect(home: string): Promise<Detected> {
   const rows = readJson(join(home, "services.json"))?.services;
   const moduleRows: any[] = Array.isArray(rows) ? rows.filter((r: any) => r?.name && r.name !== "parachute-vault" && r.name !== "parachute-hub") : [];
   const others = moduleRows.map((r) => String(r.name));
-  const units = [...systemdUnits(home, held), ...launchdUnits()];
+  const units = [...systemdUnits(home, held), ...launchdUnits(home, held)];
   const record = readRecord(home);
-  const from = handOverUnit(units, record?.state === "taking-over" ? record.paused.map((u) => u.name) : []);
+  const from = handOverUnit(units, record?.state === "taking-over" ? record.paused : []);
   return {
     home,
     old: oldInstalls(),
@@ -868,7 +1089,7 @@ export async function detect(home: string): Promise<Detected> {
     uncopyable: entries(home).other,
     others,
     unfound: await unfoundModules(moduleRows, corePath(handOverEnv(from).env.PATH ?? "")),
-    path_from: from ?? null,
+    path_from: from?.name ?? null,
     record,
   };
 }
@@ -909,16 +1130,37 @@ const cutOff = (d: Detected) => (d.record?.state === "taking-over" ? d.record.pa
 
 function plan(d: Detected): string[] {
   const back = cutOff(d);
-  const pause = [...new Set([...d.units.filter((u) => u.old).map((u) => u.name), ...back])];
+  const cut = d.record?.state === "taking-over" ? d.record.paused : [];
+  const managed = [...d.units.filter((u) => u.old).map((u) => [u.name, u.manager] as const), ...cut.map((u) => [u.name, u.manager] as const)];
+  const pause = (m: Unit["manager"]) => [...new Set(managed.filter(([, x]) => x === m).map(([n]) => n))];
+  const [units, agents] = [pause("systemd"), pause("launchd")];
+  const backupRoot = tilde(join(dirname(d.home), "parachute-takeover"));
   const steps = [
     ...(back.length ? [`put ${back.join(" and ")} back as before, since the interrupted takeover paused ${back.length === 1 ? "it" : "them"}`] : []),
-    pause.length ? `pause ${pause.join(" and ")} (stop and disable; the unit files stay)` : "nothing to pause: no old unit is on",
-    `back up the home to ${tilde(join(dirname(d.home), "parachute-takeover"))}/<time>/, with a sha256 for every file`,
+    ...(units.length ? [`pause ${units.join(" and ")} (stop and disable; the unit files stay)`] : []),
+    ...(agents.length
+      ? [`pause ${agents.join(" and ")} (unload, and move ${agents.length === 1 ? "its plist" : "their plists"} out of ~/Library/LaunchAgents into ${backupRoot}/<time>/launchd/, so ${agents.length === 1 ? "it doesn't" : "they don't"} start at login; rollback moves ${agents.length === 1 ? "it" : "them"} back)`]
+      : []),
+    ...(units.length || agents.length ? [] : ["nothing to pause: no old unit is on"]),
+    `back up the home to ${backupRoot}/<time>/, with a sha256 for every file`,
     `start v0.8 (${core.name} ${core.version}) on the same home and check every vault answers with the same notes`,
   ];
-  if (d.units.some((u) => u.old && u.manager === "systemd") || back.length) steps.push(`run it from now on as ${CORE_UNIT}`);
+  const from = handOverUnit(d.units, cut);
+  if (from?.manager === "systemd") steps.push(`run it from now on as ${CORE_UNIT}`);
+  if (from?.manager === "launchd") steps.push(`run it from now on as the launchd agent ${CORE_AGENT} (${tilde(coreAgentFile())}, with ${from.name}'s environment)`);
   steps.push("leave the old programs installed, as they are, and off");
   return steps;
+}
+
+const agentState = (u: Unit) =>
+  `${u.active ? (u.pid ? `running (pid ${u.pid})` : "loaded, not running") : "not loaded"}, ${u.enabled ? "loads at login" : "off at login (Disabled)"}`;
+
+function agentWhy(u: Unit, cut: string[]): string {
+  if (u.old && u.pid) return " (has this home's data open: it will be paused, its plist moved aside)";
+  if (u.old) return " (not running, but its plist starts the old programs on this home at login: its plist will be moved aside)";
+  if (cut.includes(u.name)) return " (paused by the interrupted takeover: put back first, then paused again)";
+  if (u.unseen) return " (looks like the old hub or vault, but isn't running and its plist doesn't say which home it serves: load it, or move it out of ~/Library/LaunchAgents, before taking over)";
+  return " (doesn't have this home's data open: left alone)";
 }
 
 export function describe(d: Detected): string {
@@ -928,6 +1170,10 @@ export function describe(d: Detected): string {
   const where = [...new Set([d.old.hub, d.old.vault].filter((p): p is OldProgram => !!p).map((p) => tilde(p.path.split("/install/global/")[0]!.split("/lib/node_modules/")[0]!)))];
   lines.push(found.length ? `Found Parachute ${found.join(" and ")} installed in ${where.join(" and ")}.` : "No old Parachute programs are installed globally (bun or npm).");
   for (const u of d.units) {
+    if (u.manager === "launchd") {
+      lines.push(`  launchd agent ${u.name}: ${agentState(u)}${agentWhy(u, cutOff(d))}`);
+      continue;
+    }
     const state = `${u.active ? "running" : "not running"}, ${u.enabled ? "starts at login" : "off at login"}`;
     const why = u.old
       ? " (has this home's data open: it will be paused)"
@@ -1002,6 +1248,10 @@ It finds the home (--home, PARACHUTE_HOME, ~/.parachute), the old programs (inst
 units, and says what it found. With your yes it pauses the old units, backs the home up to
 <home>/../parachute-takeover/<time>/, starts v0.8 on the same data and checks every vault answers, then hands
 the home to v0.8. The old programs stay installed and off. --rollback goes back.
+
+On macOS the old hub's launchd agent (computer.parachute.hub) is unloaded and its plist moved into the backup
+folder (launchd/), and v0.8 runs as the agent computer.parachute.core. Other agents (a cloudflared tunnel) are
+left alone. --rollback moves the plist back and loads it again.
 
   --dry-run   say what it found and would do; change nothing
   --yes       go ahead without asking
@@ -1196,7 +1446,7 @@ async function stopCheckLeftovers(home: string): Promise<number[]> {
  * Start v0.8 on the home (a check run: this program's own `serve` on a free loopback port, with the old issuer)
  * and check every answer. Returns the problems found (empty when all is well); it always stops the check run.
  */
-async function checkRun(d: Detected, kids: string[], from: string | undefined, log: (s: string) => void): Promise<string[]> {
+async function checkRun(d: Detected, kids: string[], from: From | undefined, log: (s: string) => void): Promise<string[]> {
   // Anything marked as this home's check run now is an earlier run's (this one hasn't started): it would hold the
   // modules' ports this check run needs.
   const stale = await stopCheckLeftovers(d.home);
@@ -1205,7 +1455,7 @@ async function checkRun(d: Detected, kids: string[], from: string | undefined, l
   const hub = `http://127.0.0.1:${port}`;
   // The environment parachute-core.service will have (the old unit's: its PATH finds the modules' programs), then:
   const { env, unread } = handOverEnv(from);
-  if (from) log(`  with ${from}'s environment, as ${CORE_UNIT} will have it${unread.length ? ` (not read exactly, so left out here: ${unread.join(", ")})` : ""}`);
+  if (from) log(`  with ${from.name}'s environment, as ${from.manager === "launchd" ? CORE_AGENT : CORE_UNIT} will have it${unread.length ? ` (not read exactly, so left out here: ${unread.join(", ")})` : ""}`);
   // the old issuer, so tokens issued before carry it; keys and revocations from this check run's own hub, whatever
   // the caller's shell says (a JWKS origin left over from the old box points where nothing listens now).
   Object.assign(env, { PARACHUTE_HOME: d.home, PARACHUTE_HUB_ORIGIN: d.issuer, PARACHUTE_HUB_JWKS_ORIGIN: hub, PARACHUTE_TAKEOVER_CHECK: "1" });
@@ -1351,8 +1601,12 @@ function unitPort(env: string[], home: string): number {
   return 1939;
 }
 
-/** The TCP ports a process listens on (Linux: its socket inodes against /proc/net/tcp and tcp6). */
+/** The TCP ports a process listens on (Linux: its socket inodes against /proc/net/tcp and tcp6; elsewhere lsof). */
 function listeningPorts(pid: number): number[] {
+  if (process.platform !== "linux") {
+    const r = run(["lsof", "-n", "-P", "-a", "-p", String(pid), "-iTCP", "-sTCP:LISTEN", "-F", "n"]);
+    return [...new Set(r.stdout.split("\n").map((l) => /^n.*:(\d+)$/.exec(l)?.[1]).filter((p): p is string => !!p).map(Number))];
+  }
   const inodes = new Set<string>();
   try {
     for (const fd of readdirSync(`/proc/${pid}/fd`)) {
@@ -1432,11 +1686,20 @@ export function unitEnvironment(unit: string): string[] {
  * `unread`: what couldn't be read exactly (an environment file, see envFileVars; a manager value, see managerValue),
  * left out here; systemd still gives it to the unit. No unit (a home a hand-run process served): the caller's environment, as it is.
  */
-export function handOverEnv(from: string | undefined, base: NodeJS.ProcessEnv = process.env): { env: Record<string, string>; unread: string[] } {
+export function handOverEnv(given: string | From | undefined, base: NodeJS.ProcessEnv = process.env): { env: Record<string, string>; unread: string[] } {
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(base)) if (v !== undefined) env[k] = v;
   const unread: string[] = [];
-  if (!from) return { env, unread };
+  if (!given) return { env, unread };
+  if (typeof given !== "string" && given.manager === "launchd") {
+    // launchd gives an agent its plist's EnvironmentVariables over the user's session, and its own PATH when the
+    // plist sets none (an agent never gets a shell's PATH).
+    env.PATH = LAUNCHD_PATH;
+    if (given.plist) Object.assign(env, agentEnv(given.plist));
+    else unread.push(`${given.name}'s plist`);
+    return { env, unread };
+  }
+  const from = typeof given === "string" ? given : given.name;
   for (const [k, raw] of managerEnv() ?? []) {
     const v = managerValue(raw);
     if (v === null) unread.push(`the user manager's ${k}`); // the caller's stays for that name
@@ -1571,10 +1834,27 @@ function glob3Component(p: string): ((name: string) => boolean) | null {
   return (name) => (dot || !name.startsWith(".")) && rx.test(name);
 }
 
-/** The old unit core's unit takes over from (and takes its environment from): the old hub's, else the first one paused. */
-function handOverUnit(units: Unit[], cut: string[] = []): string | undefined {
-  const names = [...new Set([...units.filter((u) => u.old && u.manager === "systemd").map((u) => u.name), ...cut])];
-  return names.find((n) => /hub/.test(n)) ?? names[0];
+/** The old unit (or agent) core's takes over from, and takes its environment from; an agent's plist as it was read. */
+export type From = { manager: "systemd"; name: string } | { manager: "launchd"; name: string; plist: PlistDict | null };
+
+/**
+ * The old unit core's unit takes over from (and takes its environment from): the old hub's, else the first one paused.
+ * `cut`: what an interrupted takeover paused (an agent's plist is then where that run moved it).
+ */
+function handOverUnit(units: Unit[], cut: Paused[] = []): From | undefined {
+  const old = new Map<string, { manager: Unit["manager"]; file?: string }>();
+  for (const u of units.filter((x) => x.old)) old.set(u.name, { manager: u.manager, file: u.file });
+  for (const p of cut) if (!old.has(p.name)) old.set(p.name, p.manager === "launchd" ? { manager: "launchd", file: existsSync(p.aside) ? p.aside : p.file } : { manager: "systemd" });
+  const names = [...old.keys()];
+  const name = names.find((n) => /hub/.test(n)) ?? names[0];
+  if (name === undefined) return undefined;
+  const u = old.get(name)!;
+  if (u.manager === "systemd") return { manager: "systemd", name };
+  let text = "";
+  try {
+    text = u.file ? readFileSync(u.file, "utf8") : "";
+  } catch {}
+  return { manager: "launchd", name, plist: readAgentPlist(text) };
 }
 
 function writeCoreUnit(d: Detected, from: string): { path: string; port: number } {
@@ -1601,17 +1881,46 @@ function writeCoreUnit(d: Detected, from: string): { path: string; port: number 
   return { path, port: unitPort(env, d.home) };
 }
 
+/**
+ * Core's launchd agent, in ~/Library/LaunchAgents, in place of the old hub's: core's command, and the old agent's
+ * environment, log files, working folder and throttle (as core's systemd unit takes the old unit's environment), with
+ * PARACHUTE_HOME when that had none. Started at login, and again when it exits with a failure.
+ */
+function writeCoreAgent(d: Detected, from: Extract<From, { manager: "launchd" }>): { path: string; port: number } {
+  const old = from.plist ?? {};
+  const env = agentEnv(old);
+  if (!env.PARACHUTE_HOME) env.PARACHUTE_HOME = d.home;
+  const dict: PlistDict = {
+    Label: CORE_AGENT,
+    ProgramArguments: [...coreCommand(), "serve"],
+    EnvironmentVariables: env,
+    RunAtLoad: true,
+    KeepAlive: { SuccessfulExit: false },
+  };
+  for (const k of ["WorkingDirectory", "StandardOutPath", "StandardErrorPath", "ThrottleInterval"]) if (old[k] !== undefined) dict[k] = old[k]!;
+  const path = coreAgentFile();
+  const mark = `${CORE_UNIT_MARK} ${JSON.stringify(d.home)}; took over from ${JSON.stringify(from.name)} on ${new Date().toISOString().slice(0, 10)}`;
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, renderPlist(dict, mark), { mode: 0o644 });
+  const port = /^\d{1,5}$/.test(env.PORT ?? "") ? Number(env.PORT) : unitPort([], d.home);
+  return { path, port };
+}
+
 const mainPid = (unit: string) => Number(/MainPID=(\d+)/.exec(run(["systemctl", "--user", "show", unit, "-p", "MainPID"]).stdout)?.[1] ?? 0);
 
 /**
  * Is core's unit up: active, with a process systemd names, answering /api/ready on its port, and still the same
  * process a few seconds later (not crash-looping). Anything less is a failed hand-over.
  */
-async function coreUnitUp(port: number, d: Detected, log: (s: string) => void): Promise<string | null> {
-  const active = () => run(["systemctl", "--user", "is-active", CORE_UNIT]).stdout.trim() === "active";
-  const failed = () => run(["systemctl", "--user", "is-active", CORE_UNIT]).stdout.trim() === "failed";
-  if (!(await waitUntil(() => failed() || (active() && mainPid(CORE_UNIT) > 0), 30_000, 500)) || failed()) return `${CORE_UNIT} did not start a process that stays up`;
-  const pid = mainPid(CORE_UNIT);
+async function coreUnitUp(port: number, d: Detected, log: (s: string) => void, manager: Unit["manager"] = "systemd"): Promise<string | null> {
+  const CORE = manager === "launchd" ? CORE_AGENT : CORE_UNIT;
+  // launchd: loaded with a process is up; unloaded is failed (KeepAlive restarts a crash: the pid check below sees it).
+  const agentPid = () => launchdJobs([CORE_AGENT])?.get(CORE_AGENT) ?? 0;
+  const active = manager === "launchd" ? () => agentPid() > 0 : () => run(["systemctl", "--user", "is-active", CORE_UNIT]).stdout.trim() === "active";
+  const failed = manager === "launchd" ? () => launchdJobs([CORE_AGENT])?.has(CORE_AGENT) === false : () => run(["systemctl", "--user", "is-active", CORE_UNIT]).stdout.trim() === "failed";
+  const corePid = manager === "launchd" ? agentPid : () => mainPid(CORE_UNIT);
+  if (!(await waitUntil(() => failed() || (active() && corePid() > 0), 30_000, 500)) || failed()) return `${CORE} did not start a process that stays up`;
+  const pid = corePid();
   // Where it listens is asked of its own process (the configuration's PORT is only the first guess): the port that
   // answers /api/ready with ready:true is the hub's.
   let hub = "";
@@ -1627,12 +1936,12 @@ async function coreUnitUp(port: number, d: Detected, log: (s: string) => void): 
     }
     return false;
   }, 60_000, 500);
-  if (!ok || !active() || !hub) return `${CORE_UNIT} (pid ${pid}) is not ready (tried port ${port} and the ports it listens on)`;
-  if (!heldBy(d.home, [CORE_UNIT]).some((h) => h.unit === CORE_UNIT)) return `${CORE_UNIT} (pid ${pid}) answers, but none of its processes has this home's data open`;
+  if (!ok || !active() || !hub) return `${CORE} (pid ${pid}) is not ready (tried port ${port} and the ports it listens on)`;
+  if (!heldBy(d.home, [CORE_UNIT]).some((h) => h.unit === CORE)) return `${CORE} (pid ${pid}) answers, but none of its processes has this home's data open`;
   const problems = await checkVaults(hub, d, log, false);
-  if (problems.length) return `${CORE_UNIT} answers, but ${problems.join("; ")}`;
+  if (problems.length) return `${CORE} answers, but ${problems.join("; ")}`;
   await Bun.sleep(3000);
-  if (!active() || mainPid(CORE_UNIT) !== pid) return `${CORE_UNIT} stopped or restarted within 3 s of answering`;
+  if (!active() || corePid() !== pid) return `${CORE} stopped or restarted within 3 s of answering`;
   return null;
 }
 
@@ -1640,6 +1949,29 @@ async function coreUnitUp(port: number, d: Detected, log: (s: string) => void): 
  * Stop core's unit and confirm it: the stop command succeeded, systemd reports it inactive (or failed) with no
  * process, and nothing holds the home's data. Returns what is still wrong, or null when it is stopped.
  */
+/**
+ * Stop core's launchd agent and confirm it: unloaded, and nothing holds the home's data. Then its plist (only one this
+ * takeover wrote for this home) moves out of ~/Library/LaunchAgents into `aside`, so it doesn't load at login.
+ * Returns what is still wrong, or null when it is stopped.
+ */
+async function stopCoreAgent(home: string, aside: string): Promise<string | null> {
+  const coreJob = () => launchdJobs([CORE_AGENT])?.has(CORE_AGENT);
+  if (coreJob() === undefined) return `launchctl didn't say whether ${CORE_AGENT} is loaded (\`launchctl print ${guiDomain()}/${CORE_AGENT}\` failed)`;
+  if (coreJob()) {
+    const r = launchctl("bootout", `${guiDomain()}/${CORE_AGENT}`);
+    if (r.code !== 0 && coreJob() !== false) return `stopping ${CORE_AGENT} failed: ${(r.stderr || r.stdout).trim()}`;
+  }
+  // Only core's own processes (or one no agent runs) are in the way: on a retried rollback, an old agent it already put
+  // back has the data open again.
+  const inTheWay = () => heldBy(home, []).filter((h) => !h.unit || h.unit === CORE_AGENT);
+  if (!(await waitUntil(() => coreJob() === false && inTheWay().length === 0, 20_000, 250))) {
+    const still = inTheWay();
+    return `${CORE_AGENT} is not confirmed stopped${still.length ? ` (still holding the data: ${still.map((h) => `pid ${h.pid}`).join(", ")})` : ""}`;
+  }
+  if (existsSync(coreAgentFile()) && coreAgentMark() === home) moveFile(coreAgentFile(), freeName(aside, `${CORE_AGENT}.plist`));
+  return null;
+}
+
 async function stopCoreUnit(home: string): Promise<string | null> {
   const r = run(["systemctl", "--user", "disable", "--now", CORE_UNIT]);
   if (r.code !== 0) return `stopping ${CORE_UNIT} failed: ${(r.stderr || r.stdout).trim()}`;
@@ -1673,13 +2005,44 @@ function resumeUnits(paused: Record_["paused"]): string[] {
   const errors: string[] = [];
   for (const u of paused) {
     try {
-      if (u.enabled) systemctl("enable", u.name);
-      if (u.active) systemctl("start", u.name);
+      if (u.manager === "launchd") resumeAgent(u);
+      else {
+        if (u.enabled) systemctl("enable", u.name);
+        if (u.active) systemctl("start", u.name);
+      }
     } catch (err) {
       errors.push((err as Error).message);
     }
   }
   return errors;
+}
+
+/** A paused agent as it was: its plist back in ~/Library/LaunchAgents (unless one is there again), loaded if it was. */
+function resumeAgent(u: Extract<Paused, { manager: "launchd" }>): void {
+  // A move cut off between its copy and its unlink (across volumes) leaves the same bytes in both places.
+  if (existsSync(u.aside) && existsSync(u.file) && sha256(u.aside) === sha256(u.file)) unlinkSync(u.aside);
+  if (existsSync(u.aside)) {
+    if (existsSync(u.file)) throw new Error(`${u.file} is there again, so ${u.aside} wasn't moved back over it; compare them and move the right one into place`);
+    moveFile(u.aside, u.file);
+  }
+  if (!existsSync(u.file)) throw new Error(`${u.name}'s plist is neither in ${u.file} nor in ${u.aside}`);
+  if (!u.loaded) return;
+  const jobs = launchdJobs([u.name]);
+  if (jobs === null) throw new Error(`launchctl didn't say whether ${u.name} is loaded; load it with \`launchctl bootstrap ${guiDomain()} ${u.file}\``);
+  if (jobs.has(u.name)) return;
+  const r = launchctl("bootstrap", guiDomain(), u.file);
+  if (r.code !== 0 && !launchdJobs([u.name])?.has(u.name)) throw new Error(`launchctl bootstrap ${guiDomain()} ${u.file} exited ${r.code}: ${(r.stderr || r.stdout).trim()}`);
+}
+
+/** Pause an agent: unload it if it is loaded, then move its plist aside (`u.aside`). */
+function pauseAgent(u: Extract<Paused, { manager: "launchd" }>): void {
+  const job = () => launchdJobs([u.name])?.has(u.name);
+  if (job() === undefined) throw new Error(`launchctl didn't say whether ${u.name} is loaded (\`launchctl print ${guiDomain()}/${u.name}\` failed)`);
+  if (job()) {
+    const r = launchctl("bootout", `${guiDomain()}/${u.name}`);
+    if (r.code !== 0 && job() !== false) throw new Error(`launchctl bootout ${guiDomain()}/${u.name} exited ${r.code}: ${(r.stderr || r.stdout).trim()}`);
+  }
+  moveFile(u.file, u.aside);
 }
 
 /**
@@ -1752,6 +2115,20 @@ function holdTakeoverLock(home: string): boolean {
   return lib.symbols.flock(fd, LOCK_EX | LOCK_NB) === 0;
 }
 
+/** What a person does to put paused units back by hand: systemd's enable and start; an agent's plist moved back, loaded. */
+function backBy(paused: Paused[]): string {
+  const units = paused.filter((u) => u.manager === "systemd").map((u) => u.name);
+  const agents = paused.flatMap((u) => (u.manager === "launchd" ? [`move ${u.aside} back to ${u.file}${u.loaded ? ` and \`launchctl bootstrap ${guiDomain()} ${u.file}\`` : ""}`] : []));
+  return [...(units.length ? [`enable and start ${units.join(" and ")}`] : []), ...agents].join(", then ");
+}
+
+/** Where a takeover moves plists (the old agents', and core's on the way back): `launchd/` in its backup folder. */
+function asideOf(rec: Record_, home: string): string {
+  const agent = rec.paused.find((u) => u.manager === "launchd");
+  if (agent?.manager === "launchd") return dirname(agent.aside);
+  return join(rec.backup || join(dirname(home), "parachute-takeover", stamp()), "launchd");
+}
+
 /**
  * Put back a takeover that was cut off (its record still says "taking-over"): stop core's unit if that run had
  * started it, restore the backup if v0.8 may have migrated the data, then enable and start the old units it paused
@@ -1761,13 +2138,16 @@ async function putBackInterrupted(home: string, rec: Record_, say: (s: string) =
   if (rec.pid && rec.pid !== process.pid) {
     let cmd = "";
     try {
-      cmd = readFileSync(`/proc/${rec.pid}/cmdline`, "utf8");
+      cmd = process.platform === "linux" ? readFileSync(`/proc/${rec.pid}/cmdline`, "utf8") : run(["ps", "-o", "command=", "-p", String(rec.pid)]).stdout;
     } catch {}
     if (cmd.includes("takeover")) throw new Exit(EXIT.held, `a takeover of this home is running now (pid ${rec.pid}, started ${rec.at}); let it finish. Nothing was changed.`);
   }
   const units = rec.paused.map((u) => u.name);
   say(`A takeover of this home started on ${rec.at} was interrupted; putting ${units.join(" and ") || "the old programs"} back first …`);
-  if (rec.core_unit && readCoreUnitMark() === home) {
+  if (rec.core_unit && rec.core_manager === "launchd" && coreAgentMark() === home) {
+    const left = await stopCoreAgent(home, asideOf(rec, home));
+    if (left) throw new Exit(EXIT.failed, `${left}; stop it, then run takeover again.`);
+  } else if (rec.core_unit && rec.core_manager !== "launchd" && readCoreUnitMark() === home) {
     const left = await stopCoreUnit(home);
     if (left) throw new Exit(EXIT.failed, `${left}; stop it, then run takeover again.`);
   }
@@ -1811,8 +2191,8 @@ async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ ba
   if (shape(d) !== shape(asked)) {
     throw new Exit(EXIT.failed, "what takeover found changed since it was shown (a unit or a process holding the data); nothing was changed. Run takeover again to see what it finds now.");
   }
-  if (d.units.some((u) => u.old && u.manager === "launchd" && (u.active || u.enabled))) {
-    throw new Exit(EXIT.failed, "the old programs run as launchd agents; taking those over isn't built yet (macOS). Nothing was changed.");
+  if (d.units.some((u) => u.old && u.manager === "launchd") && d.units.some((u) => u.old && u.manager === "systemd")) {
+    throw new Exit(EXIT.failed, "the old programs run under both systemd and launchd here; takeover hands a home to one of them. Nothing was changed.");
   }
   if (d.uncopyable.length) {
     throw new Exit(EXIT.failed, `the home has entries the backup can't copy as they are (${d.uncopyable.slice(0, 5).join(", ")}): links that lead out of it, or sockets. Replace them with the real files, or back up yourself. Nothing was changed.`);
@@ -1832,19 +2212,38 @@ async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ ba
       throw new Exit(EXIT.failed, `${CORE_UNIT} already exists (${tilde(coreUnitFile)})${on ? " and is on" : " and wasn't written by a takeover of this home"}; this takeover won't replace it. Nothing was changed.`);
     }
   }
-  const toPause = d.units.filter((u) => u.old && u.manager === "systemd");
+  if (launchdHere()) {
+    // Core's agent is written only where none is loaded, and over a plist only one a takeover of this home wrote.
+    const jobs = launchdJobs();
+    if (jobs === null && (existsSync(coreAgentFile()) || d.units.some((u) => u.manager === "launchd" && u.old))) {
+      throw new Exit(EXIT.failed, "launchctl didn't say which agents are loaded (`launchctl print` failed); takeover won't pause or start agents it can't see. Nothing was changed.");
+    }
+    if (jobs?.has(CORE_AGENT)) throw new Exit(EXIT.failed, `the launchd agent ${CORE_AGENT} is already loaded; this takeover won't replace it. Nothing was changed.`);
+    if (existsSync(coreAgentFile()) && coreAgentMark() !== d.home) {
+      throw new Exit(EXIT.failed, `${CORE_AGENT} already exists (${tilde(coreAgentFile())}) and wasn't written by a takeover of this home; this takeover won't replace it. Nothing was changed.`);
+    }
+  }
+  const toPause = d.units.filter((u) => u.old);
   // The unit core's unit replaces: its environment is the check run's and then core's unit's.
   const hubUnit = handOverUnit(d.units);
   const pausable = new Set(toPause.map((u) => u.name));
   // Stopping or disabling a unit can reach another home: another home's databases in any of its processes, or units
   // a stop or disable would reach (Also=, PropagatesStopTo=, units that require, bind to or are part of it).
   for (const u of toPause) {
-    const why = unsafeToStop(u.name, d.home, pausable);
+    const why = unsafeToStop(u.name, d.home, pausable, u.manager);
     if (why) throw new Exit(EXIT.held, `${why}. Nothing was changed.`);
   }
   const outside = d.running.filter((h) => !h.unit || !pausable.has(h.unit));
   if (outside.length) {
     throw new Exit(EXIT.held, `an old process holds the data and isn't run by a unit this can pause: ${outside.map((h) => `pid ${h.pid} (${h.cmd.slice(0, 80)})`).join(", ")}. Stop it, then run takeover again. Nothing was changed.`);
+  }
+  const unseenAgents = d.units.filter((u) => u.unseen && u.manager === "launchd");
+  if (unseenAgents.length) {
+    const one = unseenAgents.length === 1;
+    throw new Exit(
+      EXIT.failed,
+      `${unseenAgents.map((u) => u.name).join(" and ")} ${one ? "looks" : "look"} like the old hub or vault, ${one ? "isn't" : "aren't"} running, and ${one ? "its plist doesn't" : "their plists don't"} say which home ${one ? "it serves" : "they serve"} (launchd starts ${one ? "it" : "them"} at login). Load ${one ? "it" : "them"} (\`launchctl bootstrap ${guiDomain()} ${unseenAgents[0]!.file}\`) so takeover can see, or move ${one ? "its plist" : "their plists"} out of ~/Library/LaunchAgents if ${one ? "it doesn't" : "they don't"} serve this home; then run takeover again. Nothing was changed.`,
+    );
   }
   const unseen = d.units.filter((u) => u.unseen);
   if (unseen.length) {
@@ -1861,6 +2260,13 @@ async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ ba
   }
 
   const paused: Record_["paused"] = [];
+  // The backup's folder, named now: a paused agent's plist goes into its launchd/ folder.
+  const dest = join(backupRoot, stamp());
+  const asideDir = join(dest, "launchd");
+  const toPauseAs = (u: Unit): Paused =>
+    u.manager === "launchd"
+      ? { name: u.name, manager: "launchd", active: !!u.pid, enabled: u.enabled, loaded: u.active, file: u.file!, aside: join(asideDir, basename(u.file!)) }
+      : { name: u.name, manager: "systemd", active: true, enabled: u.enabled };
   // Written before anything is paused: if this run is cut off (an ssh drop, a reboot), the next takeover or --rollback
   // finds it and puts the old units back (and the backup, once v0.8 may have migrated the data).
   const progress: Record_ = {
@@ -1872,7 +2278,7 @@ async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ ba
     backup: "",
     rollback: d.rollback,
     migrations: d.migrations,
-    paused: toPause.map((u) => ({ name: u.name, manager: "systemd" as const, active: true, enabled: u.enabled })),
+    paused: toPause.map(toPauseAs),
     core_unit: null,
     issuer: d.issuer,
     pid: process.pid,
@@ -1889,12 +2295,18 @@ async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ ba
   };
   for (const u of toPause) {
     say(`Pausing ${u.name} …`);
-    // It has the data open, so it runs (whatever systemd's word for it: active, activating, reloading): stopped, and
-    // started again on rollback.
-    paused.push({ name: u.name, manager: "systemd", active: true, enabled: u.enabled });
+    // systemd: it has the data open, so it runs (whatever systemd's word for it: active, activating, reloading):
+    // stopped, and started again on rollback. launchd: unloaded, and its plist moved aside (pauseAgent).
+    const entry = toPauseAs(u);
+    paused.push(entry);
     try {
-      systemctl("stop", u.name);
-      if (u.enabled) systemctl("disable", u.name);
+      if (entry.manager === "launchd") {
+        pauseAgent(entry);
+        say(`  unloaded, and its plist moved to ${tilde(entry.aside)}`);
+      } else {
+        systemctl("stop", u.name);
+        if (u.enabled) systemctl("disable", u.name);
+      }
     } catch (err) {
       throw new Exit(EXIT.failed, await putBack(`pausing ${u.name} failed: ${(err as Error).message}`));
     }
@@ -1904,7 +2316,6 @@ async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ ba
     throw new Exit(EXIT.held, await putBack(`after pausing the old units, still holding the data: ${still.map((h) => `pid ${h.pid} (${h.cmd.slice(0, 80)})`).join(", ")}; the old units were put back`));
   }
 
-  const dest = join(backupRoot, stamp());
   say(`Backing up ${tilde(d.home)} to ${tilde(dest)} …`);
   let copied: { files: number; bytes: number };
   try {
@@ -1921,7 +2332,7 @@ async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ ba
   const undo = async (why: string): Promise<Exit> => {
     const still = holders(d.home);
     if (still.length) {
-      return new Exit(EXIT.checkFailed, `${why}; v0.8 still holds the data (${still.map((h) => `pid ${h.pid}`).join(", ")}), so the old units stay paused. Stop it, then enable and start ${paused.map((u) => u.name).join(" and ") || "the old programs"} yourself; the backup is in ${dest}`);
+      return new Exit(EXIT.checkFailed, `${why}; v0.8 still holds the data (${still.map((h) => `pid ${h.pid}`).join(", ")}), so the old units stay paused. Stop it, then ${backBy(paused) || "start the old programs"} yourself; the backup is in ${dest}`);
     }
     let msg = why;
     if (d.migrations.length) {
@@ -1933,7 +2344,7 @@ async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ ba
         const aside = restore(d.home, dest, (a) => ({ ...progress, stage: "checking", backup: dest, restored_at: new Date().toISOString(), moved_aside: a }));
         msg += `; the backup was restored (what v0.8 left is in ${aside})`;
       } catch (err) {
-        return new Exit(EXIT.checkFailed, `${why}; restoring the backup failed: ${(err as Error).message}. The old units stay paused, because the data may be migrated. Restore ${dest}/home over ${d.home} (manifest.json has every sha256), then enable and start ${paused.map((u) => u.name).join(" and ")}.`);
+        return new Exit(EXIT.checkFailed, `${why}; restoring the backup failed: ${(err as Error).message}. The old units stay paused, because the data may be migrated. Restore ${dest}/home over ${d.home} (manifest.json has every sha256), then ${backBy(paused)}.`);
       }
     }
     const back = await putBack(msg);
@@ -1943,19 +2354,21 @@ async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ ba
   // From here every failure, expected or not, puts everything back: the unit, the record, the backup if v0.8
   // migrated the data, and the old units.
   let unitTried = false;
+  const coreManager: Unit["manager"] = hubUnit?.manager === "launchd" ? "launchd" : "systemd";
+  const coreName = coreManager === "launchd" ? CORE_AGENT : CORE_UNIT;
   try {
     return await startAndHandOver();
   } catch (err) {
-    const left = unitTried ? await stopCoreUnit(d.home) : null;
+    const left = unitTried ? (coreManager === "launchd" ? await stopCoreAgent(d.home, asideDir) : await stopCoreUnit(d.home)) : null;
     if (left) {
       // v0.8 may still start or write: nothing is restored and the old units stay paused, so two servers never
       // share the data. The record stays too, so `takeover --rollback` can finish the job once it is stopped.
-      throw new Exit(EXIT.checkFailed, `${(err as Error).message}; then ${left}. The old units stay paused and nothing was restored; stop ${CORE_UNIT}, then run \`parachute-core takeover --rollback\`. The backup is in ${dest}`);
+      throw new Exit(EXIT.checkFailed, `${(err as Error).message}; then ${left}. The old units stay paused and nothing was restored; stop ${coreName}, then run \`parachute-core takeover --rollback\`. The backup is in ${dest}`);
     }
     if (err instanceof Exit) throw err; // from undo(), which has already put back what it could
     // Not finished (a "taken-over" record may be there already) until undo() has put the old units back; it then
     // removes the record, or leaves this one for the next run to finish.
-    writeRecord(d.home, { ...progress, stage: unitTried ? "handing-over" : "checking", backup: dest, core_unit: unitTried ? CORE_UNIT : null });
+    writeRecord(d.home, { ...progress, stage: unitTried ? "handing-over" : "checking", backup: dest, core_unit: unitTried ? coreName : null, ...(unitTried ? { core_manager: coreManager } : {}) });
     throw await undo(`${(err as Error).message}`);
   }
 
@@ -1980,10 +2393,27 @@ async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ ba
     };
     writeRecord(d.home, record);
 
-    if (hubUnit) {
+    if (hubUnit?.manager === "launchd") {
+      say(`Starting v0.8 as the launchd agent ${CORE_AGENT} …`);
+      try {
+        // Named in the record before its plist exists (a plist in ~/Library/LaunchAgents starts at login), so a
+        // rollback after a cut or a failed start knows to stop it and move it aside.
+        unitTried = true;
+        record.core_unit = CORE_AGENT;
+        record.core_manager = "launchd";
+        writeRecord(d.home, record);
+        const agent = writeCoreAgent(d, hubUnit);
+        const r = launchctl("bootstrap", guiDomain(), agent.path);
+        if (r.code !== 0) throw new Error(`launchctl bootstrap ${guiDomain()} ${agent.path} exited ${r.code}: ${(r.stderr || r.stdout).trim()}`);
+        const down = await coreUnitUp(agent.port, d, say, "launchd");
+        if (down) throw new Error(down);
+      } catch (err) {
+        throw new Error(`starting ${CORE_AGENT} failed: ${(err as Error).message}`);
+      }
+    } else if (hubUnit) {
       say(`Starting v0.8 as ${CORE_UNIT} …`);
       try {
-        const unit = writeCoreUnit(d, hubUnit);
+        const unit = writeCoreUnit(d, hubUnit.name);
         systemctl("daemon-reload");
         // A drop-in the unit already had (Also=, a stop that propagates) could make enabling, stopping or disabling
         // it reach another unit: checked before it is ever enabled, so the cleanup's disable is safe too.
@@ -2039,7 +2469,25 @@ async function rollBack(home: string, say: (s: string) => void): Promise<Record<
     return { rolled_back: true, rollback: "interrupted", exported_notes: exported, units };
   }
   if (!record || record.state !== "taken-over") throw new Exit(EXIT.failed, `${tilde(home)} has no takeover to roll back${record ? ` (it was rolled back on ${record.rolled_back_at})` : ""}`);
-  if (record.core_unit) {
+  if (record.core_unit && record.core_manager === "launchd") {
+    // Still this home's? Running: one of its processes has this home's data open and none another home's. Not
+    // running: its plist still carries the mark this takeover wrote. Anything launchctl won't say: not touched.
+    const label = record.core_unit;
+    const jobs = launchdJobs([label]);
+    if (jobs === null) throw new Exit(EXIT.failed, `launchctl didn't say whether ${label} runs (\`launchctl print\` failed); rollback won't touch it.`);
+    const pid = jobs.get(label) ?? 0;
+    let why: string | null = null;
+    if (pid === 0) why = existsSync(coreAgentFile()) && coreAgentMark() !== home ? "no longer carries this takeover's mark for this home" : null;
+    else if (!heldBy(home, []).some((h) => h.unit === label)) why = "is running but none of its processes has this home's data open";
+    else why = unsafeToStop(label, home, new Set(), "launchd");
+    if (why) {
+      const what = why.startsWith(label) ? why : `${label} ${why}`;
+      throw new Exit(EXIT.failed, `${what}; it may serve another home now, so rollback won't touch it. Stop it yourself if it is this home's, then run takeover --rollback again.`);
+    }
+    say(`Stopping ${label} …`);
+    const left = await stopCoreAgent(home, asideOf(record, home));
+    if (left) throw new Exit(EXIT.failed, left);
+  } else if (record.core_unit) {
     // Still this home's? Running: one of its processes has this home's data open, none another home's, and stopping it
     // reaches no other unit. Stopped: it still carries the mark this takeover wrote. Anything systemd won't say, or
     // a unit that runs with no process named: not touched.
@@ -2088,7 +2536,10 @@ async function rollBack(home: string, say: (s: string) => void): Promise<Record<
     writeRecord(home, record);
     say(`Restored the backup; what v0.8 left is in ${tilde(record.moved_aside)}`);
   }
-  for (const u of record.paused) say(`Putting ${u.name} back (${u.enabled ? "enabled" : "disabled"}, ${u.active ? "running" : "stopped"}) …`);
+  for (const u of record.paused) {
+    if (u.manager === "launchd") say(`Putting ${u.name} back (its plist into ${tilde(dirname(u.file))}${u.loaded ? ", loaded" : ", not loaded, as it was"}) …`);
+    else say(`Putting ${u.name} back (${u.enabled ? "enabled" : "disabled"}, ${u.active ? "running" : "stopped"}) …`);
+  }
   const errors = resumeUnits(record.paused);
   if (errors.length) {
     throw new Exit(EXIT.failed, `putting the old units back failed: ${errors.join("; ")}. v0.8 is stopped${record.restored_at ? " and the backup is restored" : ""}; fix that and run \`parachute-core takeover --rollback\` again`);
@@ -2108,6 +2559,10 @@ export async function takeover(args: string[]): Promise<number> {
     // The real folder, once, for everything from here: a restore through a link to the home would replace the link,
     // and the old units, which name the real folder, would reopen the data the restore was meant to replace.
     const home = realHome(resolve(f.home ?? homeDir()));
+    // Agents load into their user's login domain (gui/<uid>); as root (sudo) every launchctl call would ask gui/0.
+    if (process.platform === "darwin" && process.getuid?.() === 0 && launchdHere()) {
+      throw new Exit(EXIT.failed, "run takeover as the user whose launchd agents these are, not as root (sudo): agents load into that user's login domain. Nothing was changed.");
+    }
     const out = (s: string) => (f.json ? console.error(s) : console.log(s));
     if (f.rollback) {
       if (!holdTakeoverLock(home)) throw new Exit(EXIT.held, `another takeover or rollback of ${tilde(home)} is running now; nothing was changed`);
