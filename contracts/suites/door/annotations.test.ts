@@ -10,7 +10,7 @@
 // (which tools each level sees, which calls it refuses), not on a copy of the table.
 // Red before T-456: no tool carried annotations (`tools/list` had none).
 import { describe, expect, test } from "bun:test";
-import { accountToken, door, fp, mcp, rest } from "./_door.ts";
+import { accountToken, door, fp, lacks, mcp, rest } from "./_door.ts";
 
 const is091 = door().release === "0.9.1";
 const HINTS = ["readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"] as const;
@@ -92,7 +92,9 @@ describe.skipIf(!is091)("tools say what they do", () => {
     expect({ read: hint(read, "attachment-url"), write: hint(write, "attachment-url") }).toEqual({ read: true, write: false });
   });
 
-  test("the account door's tools carry them too, and a vault tool keeps the vault's own", async () => {
+  // The box's account door (`/account/mcp` with an account credential, the five tools below): a door without it is
+  // named in deliberate.json (multi-vault-door). Cloud's own account door carries hints too, held by its own tests.
+  test.skipIf(lacks("multi-vault-door"))("the account door's tools carry them too, and a vault tool keeps the vault's own", async () => {
     const d = door();
     const tools = await listed("admin", { url: `${d.issuer}/account/mcp`, bearer: await accountToken() });
     expect(tools.length).toBeGreaterThan(0);

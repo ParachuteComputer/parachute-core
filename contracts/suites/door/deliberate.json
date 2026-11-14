@@ -115,7 +115,8 @@
       "keys": [
         "mcp/admin.tool.manage-token.*",
         "mcp/admin.tool.manage-keys.*",
-        "mcp/admin.tool-count"
+        "mcp/admin.tool-count",
+        "annotations/destructive.tools"
       ],
       "between": [
         "box",
@@ -304,7 +305,8 @@
       "id": "multi-vault-door",
       "keys": [
         "has/multi-vault-door",
-        "multivault/*"
+        "multivault/*",
+        "annotations/account.*"
       ],
       "between": [
         "box",
@@ -320,7 +322,7 @@
       ],
       "status": "drift",
       "owner": "parachute-cloud 0.9.1 multi-vault door (T-446)",
-      "why": "On a box one key can cover several vaults, each at its own level (`POST /account/keys {name, vaults: {<vault>: \"read\"|\"write\"}}`), and the account door (`/account/mcp`) serves the record tools plus `list-vaults` with it: `vault` named on every write, each vault reached at that key's level there. A cloud-style door's account door doesn't take such a key yet; an app that needs several vaults there holds one key per vault."
+      "why": "On a box one key can cover several vaults, each at its own level (`POST /account/keys {name, vaults: {<vault>: \"read\"|\"write\"}}`), and the account door (`/account/mcp`) serves the record tools plus `list-vaults` with it: `vault` named on every write, each vault reached at that key's level there. A cloud-style door's account door doesn't take such a key yet; an app that needs several vaults there holds one key per vault. The same entry gates the account door's tool hints check (annotations.test.ts): it reaches `/account/mcp` with the account credential, which a cloud-style account door refuses (it takes an OAuth connection with `account:<id>:vaults`); parachute-cloud holds its own account door's hints (workers/identity/test/account-door-hints.test.ts, account-mcp.test.ts)."
     }
   ]
 }
