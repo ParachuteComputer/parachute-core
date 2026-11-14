@@ -2,7 +2,7 @@
 import type { Database } from "bun:sqlite";
 import { transaction } from "./txn.js";
 import { refreshCompactState } from "./history-compact-state.js";
-import { HistoryUnrecoverableError, hashContent, byteLength, VERSION_MAX_BYTES, pruneVersions, compactNote, getVersion, type HistoryPolicy, type VersionRow } from "./history.js";
+import { HistoryUnrecoverableError, hashContent, byteLength, VERSION_MAX_BYTES, pruneVersions, compactNote, getVersion, insertWholeBlob, type HistoryPolicy, type VersionRow } from "./history.js";
 
 export interface ImportedObservation {
   content: string;
@@ -110,7 +110,7 @@ export function applyImportedNote(db: Database, opts: {
       const index = opts.observations.length - i - 1;
       const storage = importStorageIndex(index);
       const hash = hashContent(row.content);
-      db.prepare("INSERT OR IGNORE INTO note_blobs(hash,content,byte_size) VALUES(?,?,?)").run(hash, row.content, size);
+      insertWholeBlob(db, hash, row.content, size);
       db.prepare(`INSERT INTO note_versions(note_id,version_ix,content_hash,path,metadata,extension,superseded_at,actor,via,op,content_len,encoding,created_at)
         VALUES(?,?,?,?,?,?,?,NULL,'git-import','import',?,NULL,?)`).run(opts.noteId, storage, hash, row.path, canonicalJson(row.metadata), row.extension, row.observed_at, size, row.created_at);
       db.prepare("INSERT INTO history_import_refs VALUES(?,?,?,?)").run(opts.noteId, index, row.commit, row.blob);

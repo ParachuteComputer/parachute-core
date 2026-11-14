@@ -23,6 +23,14 @@ export function wholeSql(alias?: string): string {
   return `(${col} IS NULL OR ${col} = 'deflate')`;
 }
 
+/** Bodies shorter than this are stored as text: deflate's own framing would eat most of the saving. */
+export const COMPRESS_MIN_BYTES = 128;
+/**
+ * The SQL test, on a `note_blobs` row aliased `b`, for a blob stored the old way, which the maintenance pass
+ * re-encodes: a base64 delta, or text long enough to compress.
+ */
+export const LEGACY_BLOB_SQL = `(b.encoding = 'fossil-delta' OR (b.encoding IS NULL AND b.byte_size >= ${COMPRESS_MIN_BYTES}))`;
+
 /** Whether a blob of this encoding holds a whole body (not a delta). */
 export function isWhole(encoding: string | null | undefined): boolean {
   return encoding == null || encoding === "deflate";

@@ -7,6 +7,7 @@
 import { Database } from "bun:sqlite";
 import { beforeEach, expect, test } from "bun:test";
 import { SqliteStore } from "./store.ts";
+import { readBlobContent } from "./history.ts";
 
 let db: Database;
 let store: SqliteStore;
@@ -16,8 +17,9 @@ beforeEach(() => {
 });
 
 const blobCount = () => (db.query("SELECT COUNT(*) AS n FROM note_blobs").get() as { n: number }).n;
+// Blobs are stored compressed, so look at each one's decoded body, not at the stored bytes.
 const blobsHolding = (needle: string) =>
-  (db.query("SELECT COUNT(*) AS n FROM note_blobs WHERE instr(content, ?) > 0").get(needle) as { n: number }).n;
+  (db.query("SELECT hash FROM note_blobs").all() as { hash: string }[]).filter((b) => readBlobContent(db, b.hash)?.includes(needle)).length;
 
 /** A note edited `n` times over a long shared body, so compaction stores deltas against a base. */
 async function longHistory(word: string, n: number): Promise<string> {
