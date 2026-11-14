@@ -52,6 +52,8 @@
  * UX audit, 2026-05-25).
  */
 
+import { sayWriter, withRequestScope } from "./write-set-edge.ts";
+import { handleWriteSets } from "./write-sets-routes.ts";
 import { countName, restRouteName, typesRouteName } from "./name-usage.ts";
 import { recordsRoute } from "../core/src/rest-records.ts";
 import { handleRecordsRest } from "./records-rest.ts";
@@ -387,6 +389,14 @@ export function filterVaultListForBinding(
 }
 
 export async function route(
+  req: Request,
+  path: string,
+): Promise<Response> {
+  // The change log (0.9.4): each request is its own scope, so its writes are one write set (write-set-edge.ts).
+  return withRequestScope(() => routeRequest(req, path));
+}
+
+async function routeRequest(
   req: Request,
   path: string,
 ): Promise<Response> {
@@ -1341,6 +1351,11 @@ export async function route(
     via: auth.via,
     bypassStrict: hasMigrateScopeForVault(auth.scopes, vaultName),
   };
+  // The change log (0.9.4): this request's writes are one write set, written by this writer, for its `why`.
+  {
+    const refusal = sayWriter(store, req, { actor: writeCtx.actor ?? null, via: writeCtx.via ?? null });
+    if (refusal) return Response.json(refusal.body, { status: refusal.status });
+  }
 
   if (apiPath.startsWith("/notes") && recordsDoor) {
     // /api/records: the same route under its record name, counted as adopted (never as deprecated).
@@ -1355,6 +1370,11 @@ export async function route(
     if (route) countName(route, "old");
   }
   if (apiPath.startsWith("/notes")) return handleNotes(req, store, apiPath.slice(6), vaultName, tagScope, writeCtx);
+  // The change log (0.9.4): which writes a key made, with who and why.
+  if (apiPath === "/write-sets" || apiPath.startsWith("/write-sets/")) {
+    const res = handleWriteSets(req, store.db, apiPath.slice("/write-sets".length), { via: writeCtx.via ?? null, admin: hasScopeForVault(auth.scopes, vaultName, "admin") }, tagScope);
+    if (res) return res;
+  }
   // Live-query SSE transport REMOVED (WS-hibernation migration Phase 5). The
   // WebSocket binding (an `Upgrade: websocket` GET /subscribe, handled in
   // server.ts before this pipeline) is now the SOLE live transport; polling

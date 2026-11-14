@@ -1637,10 +1637,32 @@ The hosted door reads imported history with these same shapes. It never reads a 
 
 History erasure removes retained content through the existing GC rules. Minimal import receipts and commit/blob references remain to prevent re-import after erasure; a full vault wipe removes them. Git committer identity is not historical note authorship: imported rows have null actor and `via: "git-import"`.
 
+### Write sets: who wrote what, and why (0.9.4)
+
+Every write is a **write set**: one REST call, or one MCP tool call. A client groups several requests into one set
+by sending the same `Parachute-Write-Set: <id>` header (8 to 64 of `A-Z a-z 0-9 _ -`); only the key that opened a
+set may add to it (409 `write_set_not_yours` otherwise). A write says why with `Parachute-Why: <reason>` (at most
+280 characters; percent-encode non-ASCII text) or, on MCP, an optional `why` on `create-record`, `update-record`
+and `delete-record` (and their note-named aliases); a longer one is 400 `invalid_why` and nothing is written.
+
+- `GET /vault/{name}/api/write-sets?by=me|<key name>&limit=20&before=<at>` (`vault:read`), newest first:
+  `{write_sets: [{id, at, by, via, via_kind, why, records, undoes, undone_by}]}`. `records` counts the records the
+  set changed. A key that isn't admin lists its own sets (`by` defaults to `me`; another key's name is 403); admin
+  lists any key's, and every key's when `by` is left out. `limit` is at most 200.
+- `GET /vault/{name}/api/write-sets/{id}` (`vault:read`): one set and `records: [{id, op, path}]`, `op` one of
+  `create`, `update`, `delete`, in the order the set first touched them. Another key's set is 404.
+- A **tag-scoped** key sees a set only when it can see every record in it (a live record by its tags now, a deleted
+  one by the tags it had); otherwise the set is left out of the list and is 404.
+- Every record a write changes is counted, including writes no record call made: a tag rename lists every record
+  whose tags it rewrote; links made by a record's `[[wikilinks]]` belong to the write that made them.
+- The log is kept for `history.change_log_days` (default 30); older sets are swept daily.
+
 ### Version history
 
-Tag-restricted sessions receive version lists and native/imported version reads
-without top-level `actor`, `via` or `via_kind` (see [the write stamp](#the-write-stamp-via-and-by-091)). Stored provenance and unrestricted reads are
+Each version names the write set that replaced it (`write_set`, with its `why`) and keeps the record's `types`,
+`tags` and outgoing `links` (`[{target, relationship, metadata}]`) as they were then (0.9.4; null on versions made
+before). Tag-restricted sessions receive version lists and native/imported version reads
+without top-level `actor`, `via`, `via_kind`, `write_set`, `why` or `links` (see [the write stamp](#the-write-stamp-via-and-by-091)). Stored provenance and unrestricted reads are
 unchanged. This does not anonymize note content or user-authored metadata; see
 [history privacy](history-privacy.md).
 

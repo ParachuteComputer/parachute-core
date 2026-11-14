@@ -126,6 +126,7 @@ Rarer filters (has_links, order_by, expand_links, created_by, …) are accepted 
       created_at: str("ISO timestamp, default now"),
       if_exists: { type: "string", enum: ["error", "ignore", "update", "replace"] },
       notes: { type: "array", items: { type: "object" }, description: "Batch: each item takes the fields above" },
+      why: str("Why, in a few words: kept with the change in history"),
     }),
   },
 
@@ -151,6 +152,7 @@ Rarer filters (has_links, order_by, expand_links, created_by, …) are accepted 
         force: bool(),
         if_missing: { type: "string", enum: ["fail", "create"] },
         notes: { type: "array", items: { type: "object" } },
+        why: str("Why, in a few words: kept with the change in history"),
       },
     ),
   },
@@ -159,7 +161,7 @@ Rarer filters (has_links, order_by, expand_links, created_by, …) are accepted 
     description: "Delete a note (by id, path or title), with its tags and links.",
     // T-412 (next): `ids` deletes several, `erase_history` (admin) forgets every version too. The merge with next
     // kept them in the reference schema but not here, so a client reading tools/list couldn't find them.
-    inputSchema: obj({ id: str(), ids: { type: "array", items: { type: "string" } }, erase_history: bool() }),
+    inputSchema: obj({ id: str(), ids: { type: "array", items: { type: "string" } }, erase_history: bool(), why: str("Why, in a few words: kept with the change in history") }),
   },
 
   "list-tags": {

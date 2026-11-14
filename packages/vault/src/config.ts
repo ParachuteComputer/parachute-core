@@ -276,6 +276,8 @@ export interface VaultConfig {
     compact_max_notes?: number;
     /** Burst collapse (T-460): seconds within which one named writer's edits make one version. Default 900; 0 off. */
     burst_window_seconds?: number;
+    /** The change log's horizon (0.9.4): days write sets are kept for the feed and undo. Default 30. */
+    change_log_days?: number;
   };
 }
 
@@ -591,7 +593,7 @@ function serializeVaultConfig(config: VaultConfig): string {
   // Per-vault history policy: serialize only explicitly configured fields.
   if (config.history) {
     lines.push("history:");
-    for (const key of ["enabled", "min_versions", "max_versions", "max_age_days", "deleted_retention_days", "compact_enabled", "compact_ratio", "compact_min_versions", "compact_run_length", "max_bytes_per_note", "compact_budget_ms", "compact_max_notes", "burst_window_seconds"] as const) {
+    for (const key of ["enabled", "min_versions", "max_versions", "max_age_days", "deleted_retention_days", "compact_enabled", "compact_ratio", "compact_min_versions", "compact_run_length", "max_bytes_per_note", "compact_budget_ms", "compact_max_notes", "burst_window_seconds", "change_log_days"] as const) {
       if (config.history[key] !== undefined) lines.push(`  ${key}: ${config.history[key]}`);
     }
   }
@@ -941,8 +943,8 @@ function parseVaultConfig(yaml: string, name: string): VaultConfig {
       if (line.match(/^\S/) && line.trim().length > 0) break;
       const enabled = line.match(/^\s+(enabled|compact_enabled):\s*(true|false)\s*$/);
       if (enabled) config.history[enabled[1] as "enabled" | "compact_enabled"] = enabled[2] === "true";
-      const number = line.match(/^\s+(min_versions|max_versions|max_age_days|compact_min_versions|compact_run_length|compact_budget_ms|compact_max_notes):\s*(\d+)\s*$/);
-      if (number) config.history[number[1] as "min_versions" | "max_versions" | "max_age_days" | "compact_min_versions" | "compact_run_length" | "compact_budget_ms" | "compact_max_notes"] = Number(number[2]);
+      const number = line.match(/^\s+(min_versions|max_versions|max_age_days|compact_min_versions|compact_run_length|compact_budget_ms|compact_max_notes|change_log_days):\s*(\d+)\s*$/);
+      if (number) config.history[number[1] as "min_versions" | "max_versions" | "max_age_days" | "compact_min_versions" | "compact_run_length" | "compact_budget_ms" | "compact_max_notes" | "change_log_days"] = Number(number[2]);
       // Any number: resolveHistoryPolicy clamps it (a negative one turns bursts off), rather than a typo silently
       // falling back to the default.
       const burst = line.match(/^\s+burst_window_seconds:\s*(-?\d+(?:\.\d+)?)\s*$/);

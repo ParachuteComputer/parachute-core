@@ -175,6 +175,8 @@ export function getVaultStore(name: string): SqliteStore {
     storeToVault.set(store, name);
     try { store.sweepDeletedHistory(); }
     catch (error) { console.warn(`[vault] deleted history sweep failed for ${name}:`, error); }
+    // The change log's horizon (0.9.4): swept here, then at most once a day after a write.
+    store.pruneChangeLogDaily();
     try {
       // Synchronous like the sweep: bounds are checked between notes, so one
       // note may overshoot. Cached opens do not repeat this maintenance pass.
