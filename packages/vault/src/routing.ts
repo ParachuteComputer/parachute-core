@@ -1352,7 +1352,8 @@ async function routeRequest(
     bypassStrict: hasMigrateScopeForVault(auth.scopes, vaultName),
   };
   // The change log (0.9.4): this request's writes are one write set, written by this writer, for its `why`.
-  {
+  // An undo is always its own set (handleUndo opens it), so its request's Parachute-Write-Set header is ignored.
+  if (!(req.method === "POST" && /^\/write-sets\/[^/]+\/undo$/.test(apiPath))) {
     const refusal = sayWriter(store, req, { actor: writeCtx.actor ?? null, via: writeCtx.via ?? null });
     if (refusal) return Response.json(refusal.body, { status: refusal.status });
   }

@@ -8,6 +8,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { getWriteSet, newWriteSetId, normaliseWhy, WRITE_SET_ID_RE, type WriteSetContext } from "../core/src/change-log.ts";
 import type { Store } from "../core/src/types.ts";
 import { HookRegistry } from "../core/src/hooks.ts";
+import { standingUndo } from "../core/src/undo.ts";
 import { kindOfVia } from "../core/src/write-stamp.ts";
 
 /** A client groups several requests into one set by sending the same id. */
@@ -95,7 +96,8 @@ export function sayWriter(
       .prepare("INSERT OR IGNORE INTO write_sets (id, at, actor, via, via_kind, why) VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?, ?, ?, ?)")
       .run(supplied, writer.actor, writer.via, kindOfVia(writer.via), why);
     const existing = getWriteSet(store.db, supplied);
-    if (existing && store.db.prepare("SELECT 1 FROM write_sets WHERE undoes = ?").get(supplied)) {
+    // Undone and still undone (an undo of its undo makes it stand again).
+    if (existing && standingUndo(store.db, supplied) !== null) {
       return {
         status: 409,
         body: {

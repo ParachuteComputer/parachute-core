@@ -1680,15 +1680,15 @@ links_skipped}`: `write_set` is the undo's own set (`undoes: <id>`), so undoing 
 
 - A later write to one of the records: **409 `undo_conflict`** with `conflicts: [{id, path, write_set, by, via,
   at}]` (the newest later write per record) and nothing changed. `force: true` puts the set's "before" back over
-  it; those writes are listed in `forced` and stay in history and the log (undo them in turn). A tag-scoped key's
-  conflicts carry only `id`, `path` and `at`.
+  it; those writes are listed in `forced` and stay in history and the log (undo them in turn).
 - Already undone (by a set that still stands): **409 `already_undone`** with `undone_by`.
-- Another key's set, a set a tag-scoped key can't see whole, an unknown set, or one past the change log's horizon:
-  **404** (as GET answers). Admin may undo any key's set. A body key other than `force` and `why`: 400
+- Another key's set, an unknown set, or one past the change log's horizon: **404** (as GET answers). Admin may undo any key's set. A body key other than `force` and `why`: 400
   `unknown_parameter`. A `Parachute-Write-Set` header is ignored here: an undo is always its own set.
 - A write by another key between two requests of the same set counts as a later write (undo puts back the set's first
-  snapshot). A tag-scoped key's undo puts back and takes away only tags in its scope, and links to records it can
-  see; the rest are left as they are. An undone set takes no more writes (409 `write_set_undone`).
+  snapshot). A set that is undone takes no more writes (409 `write_set_undone`) until its undo is undone.
+- **A tag-scoped key can't undo** (403 `undo_scoped_not_supported`): putting back a set's "before" exactly can cross
+  its scope, and filtering it can lose what the set owes. 1.0's grants decide this; until then, undo with a key
+  without a tag scope, or the admin.
 - Not put back: attachments, and tag records (a tag's description and fields after a rename). A set that moved paths
   among its own records (a swap; a delete and a create at the same path) can't be undone: 409 `undo_path_taken`.
 

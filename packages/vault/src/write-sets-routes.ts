@@ -11,11 +11,11 @@
  */
 import type { Database } from "bun:sqlite";
 import { getWriteSet, listWriteSets, newWriteSetId, setRecordStates, normaliseWhy, writeSetRecords, type WriteSetRow } from "../core/src/change-log.ts";
-import { standingUndo, undoWriteSet, UndoRefusal, type UndoConflict } from "../core/src/undo.ts";
+import { standingUndo, undoWriteSet, UndoRefusal } from "../core/src/undo.ts";
 import type { Store } from "../core/src/types.ts";
 import { WHY_HEADER, withWriteSet } from "./write-set-edge.ts";
 import type { Note } from "../core/src/types.ts";
-import { noteWithinTagScope, tagVisibleInScope } from "./tag-scope.ts";
+import { noteWithinTagScope } from "./tag-scope.ts";
 import type { TagScopeCtx } from "./routes.ts";
 
 export interface WriteSetsAuth {
@@ -124,6 +124,15 @@ export async function handleUndo(
   tagScope: TagScopeCtx,
 ): Promise<Response> {
   const db = store.db;
+  // A tag-scoped key can't undo yet: putting back a set's "before" exactly can cross its scope (a link into a record
+  // it can't see, tags outside it), and filtering it can lose what the set owes. 1.0's grants decide this properly.
+  if (tagScope.raw !== null) {
+    return json({
+      error: "A tag-scoped key can't undo a write set yet (1.0's grants will allow it). Nothing was changed. Ask a key without a tag scope, or the vault's admin.",
+      error_type: "undo_scoped_not_supported",
+      hint: "undo with an unscoped key",
+    }, 403);
+  }
   const set = getWriteSet(db, id);
   if (!set || !setOwnedOrAdmin(set, auth) || !setVisible(db, id, tagScope)) {
     return json({ error: `No write set ${id} that this key may undo (or it is older than the change log keeps).`, error_type: "not_found" }, 404);
@@ -156,36 +165,12 @@ export async function handleUndo(
         force: body.force === true,
         actor: auth.actor,
         via: auth.via,
-        ...(tagScope.raw !== null
-          ? {
-              tagWritable: (t: string) => tagVisibleInScope(t, tagScope.allowed, tagScope.raw),
-              targetVisible: (noteId: string) => {
-                const tags = (db.prepare("SELECT tag_name FROM note_tags WHERE note_id = ?").all(noteId) as { tag_name: string }[]).map((r) => r.tag_name);
-                return noteWithinTagScope({ tags } as unknown as Note, tagScope.allowed, tagScope.raw);
-              },
-            }
-          : {}),
       }),
     );
-    if (tagScope.raw !== null) {
-      // A scoped caller learns nothing beyond its scope: no other key's provenance on a forced write, and no id of a
-      // missing link target (it may have been a record outside the scope), only how many links were skipped.
-      return json({
-        write_set: undoId,
-        ...result,
-        forced: result.forced.map((c) => ({ id: c.id, path: c.path, at: c.at })),
-        links_skipped: result.links_skipped.length,
-      });
-    }
     return json({ write_set: undoId, ...result });
   } catch (e) {
     if (e instanceof UndoRefusal) {
-      // A scoped caller never learns about records outside its scope through a conflict (it can see the whole set,
-      // but a later write's key is provenance, which scoped reads don't show).
-      const extra = tagScope.raw !== null && Array.isArray(e.extra.conflicts)
-        ? { conflicts: (e.extra.conflicts as UndoConflict[]).map((c) => ({ id: c.id, path: c.path, at: c.at })) }
-        : e.extra;
-      return json({ error: e.message, error_type: e.error_type, ...extra }, e.status);
+      return json({ error: e.message, error_type: e.error_type, ...e.extra }, e.status);
     }
     throw e;
   }

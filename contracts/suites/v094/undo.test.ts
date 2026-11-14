@@ -234,18 +234,28 @@ describe("v094/undo: review round 2 cases", () => {
     expect((await snapshot(writer, id))?.metadata).toEqual({ k: 1 });
   });
 
-  test("a tag-scoped key's undo leaves tags outside its scope as they are", async () => {
+  test("a tag-scoped key can't undo (403 undo_scoped_not_supported), even its own set; nothing changes", async () => {
     const t = `us${shortId()}`;
     const scoped = rest(services().vaultViaHub, await pass({ level: "write", tags: [t] }));
     const id = (await admin.api("POST", "/notes", { path: `${t}/r`, content: "one", tags: [t, `hidden${t}`] })).body.id;
     expect((await scoped.patch(`/notes/${id}`, { content: "two", force: true })).status).toBe(200);
     const mine = (await scoped.get("/write-sets?by=me&limit=1")).body.write_sets[0].id;
-    await admin.api("PATCH", `/notes/${id}`, { tags: { remove: [`hidden${t}`], add: [`other${t}`] }, force: true });
-    const r = await scoped.post(`/write-sets/${enc(mine)}/undo`, { force: true });
-    expect(r.status).toBe(200);
-    const now = await snapshot(admin, id);
-    expect(now?.content).toBe("one");
-    expect(now?.tags).toEqual([`other${t}`, t].sort());
+    for (const body of [{}, { force: true }]) {
+      const r = await scoped.post(`/write-sets/${enc(mine)}/undo`, body);
+      expect(r.status).toBe(403);
+      expect(r.body.error_type).toBe("undo_scoped_not_supported");
+    }
+    expect((await snapshot(admin, id))?.content).toBe("two");
+  });
+
+  test("undone, then redone: the set takes writes again; an undo request's own Parachute-Write-Set header is ignored", async () => {
+    const setId = `redo-${shortId()}${shortId()}`;
+    await writer.api("POST", "/notes", { path: `redo/${shortId()}`, content: "x" }, { "Parachute-Write-Set": setId });
+    const u = await writer.api("POST", `/write-sets/${enc(setId)}/undo`, {}, { "Parachute-Write-Set": setId });
+    expect(u.status).toBe(200);
+    expect((await writer.api("POST", "/notes", { path: `redo/${shortId()}`, content: "y" }, { "Parachute-Write-Set": setId })).status).toBe(409);
+    expect((await undo(writer, u.body.write_set)).status).toBe(200);
+    expect((await writer.api("POST", "/notes", { path: `redo/${shortId()}`, content: "z" }, { "Parachute-Write-Set": setId })).status).toBe(201);
   });
 
   test("an undone set takes no more writes: 409 write_set_undone", async () => {
@@ -275,17 +285,6 @@ describe("v094/undo: who may undo", () => {
     const set = await newestSet(writer);
     expect((await reader.post(`/write-sets/${enc(set)}/undo`, {})).status).toBe(403);
     expect(await snapshot(writer, id)).not.toBeNull();
-  });
-
-  test("a tag-scoped key can't undo its set once a record in it has left its scope", async () => {
-    const t = `sk${shortId()}`;
-    const scoped = rest(services().vaultViaHub, await pass({ level: "write", tags: [t] }));
-    const made = await scoped.post("/notes", { path: `${t}/r`, content: "in scope", tags: [t] });
-    must(made.status === 201, `scoped create: ${made.status}`);
-    const mine = (await scoped.get("/write-sets?by=me&limit=1")).body.write_sets[0].id;
-    await admin.api("PATCH", `/notes/${made.body.id}`, { tags: { remove: [t], add: [`${t}-out`] }, force: true });
-    expect((await scoped.post(`/write-sets/${enc(mine)}/undo`, { force: true })).status).toBe(404);
-    expect(await snapshot(admin, made.body.id)).not.toBeNull();
   });
 
   test("an unknown set is 404; a body with anything but force and why is 400", async () => {

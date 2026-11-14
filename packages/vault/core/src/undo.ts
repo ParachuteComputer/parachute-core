@@ -134,8 +134,7 @@ function parseJson<T>(raw: string | null, fallback: T): T {
 const linkKey = (target: string, relationship: string) => `${target}\u0000${relationship}`;
 
 /**
- * Undoes one write set. The caller has already decided the caller may (its own set, or admin; a scoped caller only
- * a set it can see whole) and has set the Store's write set source to the undo's own set (`undoes: setId`).
+ * Undoes one write set. The caller has already decided the caller may (its own set, or admin; never a tag-scoped key) and has set the Store's write set source to the undo's own set (`undoes: setId`).
  */
 export async function undoWriteSet(
   store: Store,
@@ -144,10 +143,6 @@ export async function undoWriteSet(
     force?: boolean;
     actor?: string | null;
     via?: string | null;
-    /** A tag-scoped caller: only tags it may write are put back or taken away; the rest are left as they are. */
-    tagWritable?: (tag: string) => boolean;
-    /** A tag-scoped caller: only links to records it can see are put back or taken away. */
-    targetVisible?: (noteId: string) => boolean;
   } = {},
 ): Promise<UndoResult> {
   const db = store.db;
@@ -231,9 +226,8 @@ export async function undoWriteSet(
         await guardPath(r, before?.path, () => store.updateNote(r.note_id, updates as Parameters<Store["updateNote"]>[1]));
         if (r.before_tags !== null) {
           const now = (db.prepare("SELECT tag_name FROM note_tags WHERE note_id = ?").all(r.note_id) as { tag_name: string }[]).map((t) => t.tag_name);
-          const writable = opts.tagWritable ?? (() => true);
-          const extra = now.filter((t) => !tags.includes(t) && writable(t));
-          const missing = tags.filter((t) => !now.includes(t) && writable(t));
+          const extra = now.filter((t) => !tags.includes(t));
+          const missing = tags.filter((t) => !now.includes(t));
           if (extra.length) await store.untagNote(r.note_id, extra);
           if (missing.length) await store.tagNote(r.note_id, missing);
         }
@@ -244,16 +238,13 @@ export async function undoWriteSet(
     for (const { id, links } of linkWork) {
       const now = db.prepare("SELECT target_id, relationship, metadata FROM links WHERE source_id = ?").all(id) as { target_id: string; relationship: string; metadata: string | null }[];
       const want = new Map(links.map((l) => [linkKey(l.target, l.relationship), l]));
-      const visible = opts.targetVisible ?? (() => true);
       for (const l of now) {
-        if (!visible(l.target_id)) continue;
         const w = want.get(linkKey(l.target_id, l.relationship));
         if (!w || canonical(parseJson(l.metadata, {})) !== canonical(w.metadata ?? {})) await store.deleteLink(id, l.target_id, l.relationship);
       }
       const after = new Set((db.prepare("SELECT target_id, relationship FROM links WHERE source_id = ?").all(id) as { target_id: string; relationship: string }[]).map((l) => linkKey(l.target_id, l.relationship)));
       for (const l of links) {
         if (after.has(linkKey(l.target, l.relationship))) continue;
-        if (exists(l.target) && !visible(l.target)) continue;
         if (!exists(l.target)) {
           result.links_skipped.push({ id, target: l.target, relationship: l.relationship });
           continue;
