@@ -13,7 +13,6 @@
 import type { Database } from "bun:sqlite";
 import type { Store } from "./types.js";
 import { byteLength, hashContent, historyTablesPresent, VERSION_MAX_BYTES, type VersionRow } from "./history.js";
-import { changeLogPresent } from "./change-log.js";
 
 /** The history folder under the export's `.parachute/`. */
 export const HISTORY_DIR = "history";
@@ -139,8 +138,8 @@ function hasRevisionColumns(db: Database): boolean {
 
 /**
  * Reads one record's history file into `db`: each version lands behind the record's current state, with its stamps,
- * write set (a `write_sets` row is made for a set the vault doesn't have, carrying the version's stamp and why, so
- * `why` reads back) and body (stored as a captured version stores its body, deduplicated by hash).
+ * write set and why (both on the version itself, as #114 keeps them) and body (stored as a captured version stores
+ * its body, deduplicated by hash). No write_sets row is made: a set from another vault has nothing to undo here.
  *
  * Append, never overwrite: a line the vault already holds (same `superseded_at`, op and body hash) is skipped, so
  * importing the same export twice adds nothing. Into a record with no versions the lines keep their numbers; into
@@ -179,12 +178,9 @@ export function importHistoryFile(db: Database, noteId: string, text: string): H
   const insertBlob = db.prepare("INSERT OR IGNORE INTO note_blobs (hash, content, byte_size) VALUES (?, ?, ?)");
   const insertVersion = db.prepare(
     `INSERT INTO note_versions (note_id, version_ix, content_hash, path, metadata, extension, superseded_at, actor, via,
-      via_kind, op, content_len, encoding, created_at, write_set, types, tags, links)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      via_kind, op, content_len, encoding, created_at, write_set, why, types, tags, links)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
-  const insertSet = changeLogPresent(db)
-    ? db.prepare("INSERT OR IGNORE INTO write_sets (id, at, actor, via, via_kind, why, undoes) VALUES (?, ?, ?, ?, ?, ?, NULL)")
-    : null;
 
   for (const { n, v } of parsed) {
     const content = v.content;
@@ -224,7 +220,6 @@ export function importHistoryFile(db: Database, noteId: string, text: string): H
     held.add(key);
     if (hash !== null) insertBlob.run(hash, content as string, len);
     const writeSet = str(v.write_set);
-    if (writeSet !== null && insertSet) insertSet.run(writeSet, at, str(v.actor), str(v.via), str(v.via_kind), str(v.why));
     insertVersion.run(
       noteId,
       ix,
@@ -241,6 +236,7 @@ export function importHistoryFile(db: Database, noteId: string, text: string): H
       encoding,
       str(v.created_at),
       writeSet,
+      str(v.why),
       list(v.types),
       list(v.tags),
       list(v.links),
