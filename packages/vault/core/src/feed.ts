@@ -142,9 +142,11 @@ export type FeedOp = "upsert" | "delete" | "removed";
  * - *Visible now*: the record exists and its tags are in scope.
  *
  * Then: visible at the end and now → `upsert`. Visible at the end but not now → nothing yet (the next page starts
- * from that end, and its first row says `delete` or `removed`). Not visible at the end: visible before → `delete`
- * (gone at the end) or `removed` (still there); else nothing, so a record never in scope at either end leaves no
- * trace. Writes outside any write set (write_set NULL) get one row per change with the tags saved, so they are judged
+ * from that end, and its first row says `delete` or `removed`). Not visible at the end: visible at any point the
+ * page covers (any of its rows, so a reader that read an earlier page and didn't commit hears it too) → `delete`
+ * (gone at the end) or `removed` (still there); else nothing, so a record never in scope since the position leaves no
+ * trace. (With this rule the page-end lookup no longer changes what a reader ends up holding; it only spares an
+ * `upsert` the next page would take back.) Writes outside any write set (write_set NULL) get one row per change with the tags saved, so they are judged
  * the same way. A row with no saved tags for a record that existed isn't written today; a scoped reader would count
  * it as not visible.
  *

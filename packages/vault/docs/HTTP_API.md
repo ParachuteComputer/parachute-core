@@ -1711,8 +1711,9 @@ sweep), a touch of the reader's row (at most once a day), and the day's sweep of
   behind, so start every reader by committing `"now"` (see Starting).
 - **A tag-scoped key** sees only records in its scope, read as the scope is now (a tag put under it later brings its
   records in, as on a live subscription). A record that was in scope at your position and has since left it comes as
-  `removed`; one that was in scope and was deleted comes as `delete`; a record that was not in scope at your
-  position and isn't now leaves no id and no content, even if it was in scope in between. Positions, though, count
+  `removed`; one that was in scope and was deleted comes as `delete`. A record that was in scope at some point after
+  your position but isn't now comes as `removed` or `delete` too (its id only: a reader that read it then, without
+  committing, may hold it). A record never in your scope since your position leaves no id and no content. Positions, though, count
   every change in the vault: `seq`, `next_position` and `"now"` move with changes outside your scope too, so a scoped
   key can see how many changes happen and when, never to what. `next_position` and `more` depend only on the log,
   never on the scope, so an empty page moves on exactly as a scope-blind reader's would. Its changes carry no `by`, `via` or `write_set`, as its versions don't. Whether a record was in scope at
