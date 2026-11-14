@@ -29,7 +29,7 @@ const isFile = (e: TarEntry): e is FileEntry => "path" in e;
 const normalize = (p: string) => p.replace(/\\/g, "/").replace(/^\.\//, "");
 
 /** An `ExportSink` that collects the export's files in emission order. */
-class CollectingSink implements ExportSink {
+export class CollectingSink implements ExportSink {
   // A tar is extracted wherever the person takes it; the engine's case-collision handling is the one cloud uses.
   readonly caseSensitive = true;
   readonly attachmentsEnabled: boolean;
@@ -77,6 +77,25 @@ class CollectingSink implements ExportSink {
     this.entries.push({ name: normalize(destRelPath), path: real, size });
     return { ok: true };
   }
+}
+
+/** How many pulls of one vault's export may run at once; more are answered 429 (each holds all note text in memory). */
+export const MAX_CONCURRENT_EXPORTS = 2;
+const activeExports = new Map<string, number>();
+
+/** Take a pull slot for this vault: a release function (safe to call twice), or null when the vault is at the cap. */
+export function tryAcquireExport(vault: string): (() => void) | null {
+  const n = activeExports.get(vault) ?? 0;
+  if (n >= MAX_CONCURRENT_EXPORTS) return null;
+  activeExports.set(vault, n + 1);
+  let done = false;
+  return () => {
+    if (done) return;
+    done = true;
+    const left = (activeExports.get(vault) ?? 1) - 1;
+    if (left <= 0) activeExports.delete(vault);
+    else activeExports.set(vault, left);
+  };
 }
 
 /** Run the engine into the collecting sink: the ordered entries and the engine's stats. */
@@ -178,7 +197,7 @@ export function tarSize(entries: readonly TarEntry[]): number {
  * download, never a quietly wrong archive). `onDone` runs once, after the last byte has been handed to the client; it
  * does not run when the client goes away or the stream fails.
  */
-export function tarStream(entries: readonly TarEntry[], onDone: () => void): ReadableStream<Uint8Array> {
+export function tarStream(entries: readonly TarEntry[], onDone: () => void, onEnd?: () => void): ReadableStream<Uint8Array> {
   const pad = (size: number) => new Uint8Array((BLOCK - (size % BLOCK)) % BLOCK);
   async function* chunks(): AsyncGenerator<Uint8Array> {
     for (const e of entries) {
@@ -212,13 +231,19 @@ export function tarStream(entries: readonly TarEntry[], onDone: () => void): Rea
         if (n.done) {
           controller.close();
           onDone();
+          onEnd?.();
         } else controller.enqueue(n.value);
       } catch (err) {
         controller.error(err);
+        onEnd?.();
       }
     },
     async cancel() {
-      await it.return(undefined);
+      try {
+        await it.return(undefined);
+      } finally {
+        onEnd?.();
+      }
     },
   });
 }

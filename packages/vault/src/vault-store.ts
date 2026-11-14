@@ -132,6 +132,26 @@ export function evictVaultStore(name: string): void {
   try { store.db.close(); } catch {}
 }
 
+/** A vault is being made over an old one right now; the caller should retry in a moment (served as 503 + Retry-After). */
+export class VaultBeingMadeError extends Error {
+  readonly error_type = "vault_being_made";
+  readonly status = 503;
+  readonly retryAfterSeconds = 1;
+  constructor(name: string) {
+    super(`vault "${name}" is being made; try again in a moment`);
+    this.name = "VaultBeingMadeError";
+  }
+}
+
+/** The answer for a `VaultBeingMadeError` (503, `Retry-After: 1`), or null for any other error. */
+export function beingMadeResponse(err: unknown, headers: Record<string, string> = {}): Response | null {
+  if (!(err instanceof VaultBeingMadeError)) return null;
+  return Response.json(
+    { error_type: err.error_type, message: err.message },
+    { status: err.status, headers: { ...headers, "Retry-After": String(err.retryAfterSeconds) } },
+  );
+}
+
 /** Get or create a store for a vault. */
 export function getVaultStore(name: string): SqliteStore {
   assertVaultNotPaused(name);
@@ -147,7 +167,7 @@ export function getVaultStore(name: string): SqliteStore {
       // Settings file there, database not yet: a vault is being made over the old one. Never serve the old handle.
       evictVaultStore(name);
       replacedHandler?.(name);
-      throw new Error(`vault "${name}" is being made; try again in a moment`);
+      throw new VaultBeingMadeError(name);
     }
   }
   if (!store) {

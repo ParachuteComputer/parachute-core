@@ -405,6 +405,7 @@ import {
   rootMcpProtectedResourceMetadata,
 } from "./oauth-handlers.ts";
 import { renderNotFoundPage } from "./oauth-ui.ts";
+import { ADMIN_API_PREFIX, handleAdminVaultApi, markDeprecated, successorFor } from "./admin-vault-api.ts";
 import { assertSameOriginForCookieMutation, buildHubBoundOrigins } from "./origin-check.ts";
 import { clearPid, writePid } from "./process-state.ts";
 import { toResponse as proxyErrorToResponse, renderProxyError } from "./proxy-error-ui.ts";
@@ -1110,7 +1111,9 @@ async function proxyToVault(
     effectivePublicExposure(match.entry) === "loopback" &&
     layerOf(req, peerAddr) !== "loopback"
   ) {
-    return new Response("not found", { status: 404 });
+    // Hidden is the same answer as missing: the caller (`/vault/*` branch, the admin API) turns undefined into
+    // its own plain 404, so nothing marks a hidden vault apart (not even a Deprecation header).
+    return undefined;
   }
   // Bare `/vault/<name>` POST → point at `/vault/<name>/mcp` (#525). Operators
   // paste the bare vault URL (no `/mcp` suffix) into MCP clients; OAuth completes
@@ -4710,6 +4713,9 @@ export function hubFetch(
         // The key door (0.9.1, T-414): a revoked key is refused here at once, rather than when the vault's
         // 60 s revocation cache next refreshes; and a key the vault accepted gets its last-used time.
         const proxied = await throughKeyDoor(req, getDb, () => proxyToVault(req, manifestPath, deps?.supervisor, peerAddr));
+        // The vault's admin routes moved to /admin/api/vaults/<n>/... (0.9.3): the old address still answers.
+        const successor = proxied ? successorFor(pathname) : null;
+        if (proxied && successor) return markDeprecated(proxied, successor);
         if (proxied) return decorateWithChrome(proxied, req, pathname, getDb);
         return new Response("not found", { status: 404 });
       }
@@ -4743,6 +4749,25 @@ export function hubFetch(
       // makes it here under /admin/* is a SPA route or asset request; the
       // SPA's own router renders the page and handles 404 client-side for
       // unknown sub-paths.
+      // /admin/api/vaults/<n>/... — a vault's admin routes under the hub's one login (admin-vault-api.ts).
+      if (pathname.startsWith(ADMIN_API_PREFIX)) {
+        if (!getDb) return dbNotConfigured();
+        const db = getDb();
+        return handleAdminVaultApi(req, {
+          db,
+          issuer: oauthDeps(req).issuer,
+          boundOrigins: oauthDeps(req).hubBoundOrigins(),
+          vaultExists: (name) => {
+            const m = findVaultUpstream(readManifestLenient(manifestPath).services, `/vault/${name}`);
+            if (!m || m.mount !== `/vault/${name}`) return false;
+            // A loopback-only vault does not exist for a caller who is not on loopback.
+            return !(effectivePublicExposure(m.entry) === "loopback" && layerOf(req, peerAddr) !== "loopback");
+          },
+          forward: (fwd) =>
+            throughKeyDoor(fwd, getDb, () => proxyToVault(fwd, manifestPath, deps?.supervisor, peerAddr)),
+        });
+      }
+
       if (pathname === "/admin" || pathname === "/admin/") {
         // Unprefixed /admin → SPA shell at its index route. The SPA's
         // basename is /admin, so the router lands on / and renders Home
