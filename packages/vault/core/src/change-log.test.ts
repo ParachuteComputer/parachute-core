@@ -138,6 +138,23 @@ describe("change log: positions and what history keeps", () => {
     expect(pos("ws_third0001").position).toBeGreaterThan(raw);
   });
 
+  test("each write saves only what it changes: a tag write keeps no fields or links; a later row change in the set keeps the row from before the set", async () => {
+    const { db, store, as } = fresh();
+    as({ id: "ws_seed00002" });
+    const target = await store.createNote("t", { path: "target" });
+    const n = await store.createNote("body", { path: "p", tags: ["a"], metadata: { k: 1 } });
+    await store.createLink(n.id, target.id, "cites");
+    as({ id: "ws_tagonly01" });
+    await store.tagNote(n.id, ["b"]);
+    const row = () => db.prepare("SELECT before_row, before_tags, before_links FROM record_changes WHERE write_set = 'ws_tagonly01'").get() as any;
+    expect(row()).toEqual({ before_row: null, before_tags: '["a"]', before_links: null });
+    await store.updateNote(n.id, { metadata: { k: 2 } });
+    expect(JSON.parse(row().before_row).metadata).toBe('{"k":1}');
+    expect(row().before_tags).toBe('["a"]'); // the first snapshot stands
+    await store.deleteLink(n.id, target.id, "cites");
+    expect(JSON.parse(row().before_links)).toEqual([{ target: target.id, relationship: "cites", metadata: {} }]);
+  });
+
   test("with history off the log keeps no old bodies; an import keeps none either", async () => {
     const db = new Database(":memory:");
     const off = new SqliteStore(db, { history: { enabled: false } });

@@ -45,15 +45,18 @@ const LINKS_OF = (id: string, extra = "") =>
   `(SELECT json_group_array(${LINK_JSON}) FROM (SELECT target_id, relationship, metadata FROM links WHERE source_id = ${id}${extra} ORDER BY 1, 2))`;
 
 /**
- * A first touch from a tag or link row. The note row is unchanged so far in this set, so it is read as it is; the
- * tag or link list is today's with this one change undone. A later touch in the same set keeps the first snapshot and only marks
- * the row touched. With no context the row's write set is NULL, which never conflicts: one row per change.
+ * A touch from a tag or link row. Each trigger saves only what its own write changes, the first time the set changes
+ * it (COALESCE keeps the first): tags (always, as the feed judges scope by them) and, from a link row, the links, each
+ * list as today's with this one change undone. The row's fields are saved by the row's own trigger, the first time
+ * the set changes the row; a set that never changes the row leaves them null (undo leaves the row as it is). With no
+ * context the row's write set is NULL, which never conflicts: one row per change.
  */
-function childTouch(noteId: string, tagsBefore: string, linksBefore: string): string {
-  return `INSERT INTO record_changes (write_set, note_id, op, existed, at, before_row, before_tags, before_links)
-    SELECT c.write_set, n.id, 'update', 1, ${NOW}, ${rowJson("n")}, ${tagsBefore}, ${linksBefore}
+function childTouch(noteId: string, tagsBefore: string, linksBefore: string | null): string {
+  return `INSERT INTO record_changes (write_set, note_id, op, existed, at, before_tags${linksBefore ? ", before_links" : ""})
+    SELECT c.write_set, n.id, 'update', 1, ${NOW}, ${tagsBefore}${linksBefore ? `, ${linksBefore}` : ""}
     FROM notes n LEFT JOIN write_context c ON c.slot = 1 WHERE n.id = ${noteId}
-    ON CONFLICT (write_set, note_id) DO UPDATE SET touched = 1;`;
+    ON CONFLICT (write_set, note_id) DO UPDATE SET touched = 1,
+      before_tags = COALESCE(before_tags, excluded.before_tags)${linksBefore ? ",\n      before_links = COALESCE(before_links, excluded.before_links)" : ""};`;
 }
 
 /** The tables, indexes and triggers. Idempotent. */
@@ -124,13 +127,15 @@ CREATE TRIGGER IF NOT EXISTS rc_notes_update BEFORE UPDATE ON notes
 WHEN OLD.content IS NOT NEW.content OR OLD.metadata IS NOT NEW.metadata OR OLD.path IS NOT NEW.path
   OR OLD.extension IS NOT NEW.extension OR OLD.updated_at IS NOT NEW.updated_at OR OLD.created_at IS NOT NEW.created_at
 BEGIN
-  INSERT INTO record_changes (write_set, note_id, op, existed, at, before_content, content_saved, before_row, before_tags, before_links)
+  INSERT INTO record_changes (write_set, note_id, op, existed, at, before_content, content_saved, before_row, before_tags)
   SELECT c.write_set, OLD.id, 'update', 1, ${NOW},
     CASE WHEN OLD.content IS NOT NEW.content AND ${KEEP} THEN OLD.content END,
     OLD.content IS NOT NEW.content AND ${KEEP},
-    ${rowJson("OLD")}, ${TAGS_OF("OLD.id")}, ${LINKS_OF("OLD.id")}
+    ${rowJson("OLD")}, ${TAGS_OF("OLD.id")}
   FROM ${CTX} WHERE true
   ON CONFLICT (write_set, note_id) DO UPDATE SET touched = 1,
+    before_row = COALESCE(before_row, excluded.before_row),
+    before_tags = COALESCE(before_tags, excluded.before_tags),
     before_content = CASE WHEN existed = 1 AND content_saved = 0 THEN excluded.before_content ELSE before_content END,
     content_saved = CASE WHEN existed = 1 AND content_saved = 0 THEN excluded.content_saved ELSE content_saved END;
 END;
@@ -142,22 +147,25 @@ CREATE TRIGGER IF NOT EXISTS rc_notes_delete BEFORE DELETE ON notes BEGIN
     ${rowJson("OLD")}, ${TAGS_OF("OLD.id")}, ${LINKS_OF("OLD.id")}
   FROM ${CTX} WHERE true
   ON CONFLICT (write_set, note_id) DO UPDATE SET op = 'delete', touched = 1,
+    before_row = COALESCE(before_row, excluded.before_row),
+    before_tags = COALESCE(before_tags, excluded.before_tags),
+    before_links = COALESCE(before_links, excluded.before_links),
     before_content = CASE WHEN existed = 1 AND content_saved = 0 THEN excluded.before_content ELSE before_content END,
     content_saved = CASE WHEN existed = 1 AND content_saved = 0 THEN excluded.content_saved ELSE content_saved END;
 END;
 
 CREATE TRIGGER IF NOT EXISTS rc_note_tags_insert AFTER INSERT ON note_tags BEGIN
-  ${childTouch("NEW.note_id", TAGS_OF("NEW.note_id", " AND tag_name IS NOT NEW.tag_name"), LINKS_OF("NEW.note_id"))}
+  ${childTouch("NEW.note_id", TAGS_OF("NEW.note_id", " AND tag_name IS NOT NEW.tag_name"), null)}
 END;
 
 CREATE TRIGGER IF NOT EXISTS rc_note_tags_delete AFTER DELETE ON note_tags BEGIN
-  ${childTouch("OLD.note_id", `(SELECT json_group_array(tag_name) FROM (SELECT tag_name FROM note_tags WHERE note_id = OLD.note_id UNION SELECT OLD.tag_name ORDER BY 1))`, LINKS_OF("OLD.note_id"))}
+  ${childTouch("OLD.note_id", `(SELECT json_group_array(tag_name) FROM (SELECT tag_name FROM note_tags WHERE note_id = OLD.note_id UNION SELECT OLD.tag_name ORDER BY 1))`, null)}
 END;
 
 CREATE TRIGGER IF NOT EXISTS rc_note_tags_update AFTER UPDATE ON note_tags
 WHEN OLD.note_id IS NOT NEW.note_id OR OLD.tag_name IS NOT NEW.tag_name
 BEGIN
-  ${childTouch("NEW.note_id", `(SELECT json_group_array(tag_name) FROM (SELECT tag_name FROM note_tags WHERE note_id = NEW.note_id AND tag_name IS NOT NEW.tag_name UNION SELECT OLD.tag_name WHERE OLD.note_id = NEW.note_id ORDER BY 1))`, LINKS_OF("NEW.note_id"))}
+  ${childTouch("NEW.note_id", `(SELECT json_group_array(tag_name) FROM (SELECT tag_name FROM note_tags WHERE note_id = NEW.note_id AND tag_name IS NOT NEW.tag_name UNION SELECT OLD.tag_name WHERE OLD.note_id = NEW.note_id ORDER BY 1))`, null)}
 END;
 
 CREATE TRIGGER IF NOT EXISTS rc_links_insert AFTER INSERT ON links BEGIN
