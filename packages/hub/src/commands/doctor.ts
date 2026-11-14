@@ -95,6 +95,14 @@ import {
 import { migrateNotice } from "./migrate.ts";
 import { listKeys } from "../keys.ts";
 import { scopedAdminProblem } from "../permissions-claim.ts";
+import {
+  type DataDeps,
+  applyDataFixes,
+  dataChecks,
+  describeDataFixes,
+  findDataProblems,
+  hasDataFixes,
+} from "./doctor-data.ts";
 
 // ---------------------------------------------------------------------------
 // Check model
@@ -115,7 +123,7 @@ export interface CheckResult {
 }
 
 /** A logical group of checks in the human report. */
-const GROUP_ORDER = ["Hub", "Modules", "Configuration", "Grants", "Migration", "Exposure"] as const;
+const GROUP_ORDER = ["Hub", "Modules", "Configuration", "Grants", "Migration", "Exposure", "Data"] as const;
 type Group = (typeof GROUP_ORDER)[number];
 
 interface GroupedCheck extends CheckResult {
@@ -204,6 +212,8 @@ export interface DoctorDeps {
    * snapshot so the group runs without a real hub.db.
    */
   readGrants?: (configDir: string) => GrantsSnapshot | null;
+  /** The data housekeeping group (stale history hints, unused OAuth clients); see doctor-data.ts. */
+  data?: DataDeps;
 }
 
 /** One `user_vaults` assignment, as the Grants group reports it. */
@@ -473,6 +483,7 @@ interface ResolvedDeps {
   probeLoopbackInstance: (port: number) => Promise<LoopbackProbe>;
   countHubListeners: (port: number) => number | undefined;
   readGrants: (configDir: string) => GrantsSnapshot | null;
+  data: DataDeps | undefined;
 }
 
 function resolveDeps(d: DoctorDeps | undefined): ResolvedDeps {
@@ -491,6 +502,7 @@ function resolveDeps(d: DoctorDeps | undefined): ResolvedDeps {
     probeLoopbackInstance: d?.probeLoopbackInstance ?? probeLoopbackInstance,
     countHubListeners: d?.countHubListeners ?? defaultCountHubListeners,
     readGrants: d?.readGrants ?? defaultReadGrants,
+    data: d?.data,
   };
 }
 
@@ -1643,6 +1655,7 @@ async function runChecks(
   add("Grants", grants);
   add("Migration", migration);
   add("Exposure", [exposure, versionDrift]);
+  add("Data", dataChecks(findDataProblems(configDir, deps.data)));
   return grouped;
 }
 
@@ -1831,7 +1844,8 @@ async function fixPortDrift(
  * diagnostic regardless of the box's state.
  *
  * `--fix` is the one writing mode: it repairs canonical-port drift in
- * services.json (and ONLY that) behind a show-diff + confirmation gate, then
+ * services.json, stale history hints and unused OAuth clients (doctor-data.ts)
+ * and ONLY those, behind a show-what-changes + confirmation gate, then
  * returns its own exit code without running the full diagnostic report.
  */
 export async function doctor(opts: DoctorOpts = {}): Promise<number> {
@@ -1841,6 +1855,30 @@ export async function doctor(opts: DoctorOpts = {}): Promise<number> {
   const deps = resolveDeps(opts.deps);
 
   if (opts.fix) {
+    // Data housekeeping first (stale history hints, unused OAuth clients), behind the same gate as the port repair:
+    // `--yes`, or a yes at the prompt. With no terminal and no `--yes` it lists what it would do and changes nothing.
+    const found = findDataProblems(configDir, deps.data);
+    if (hasDataFixes(found)) {
+      print("Data to repair:");
+      for (const line of describeDataFixes(found)) print(line);
+      print("");
+      if (!opts.yes) {
+        if (!deps.isInteractive()) {
+          print("Refusing to change data without confirmation in a non-interactive shell.");
+          print("Re-run with --yes to apply, or run interactively to confirm.");
+          await fixPortDrift(manifestPath, { yes: false, print, deps });
+          return 1;
+        }
+        const answer = (await deps.readLine("Apply these data repairs? [y/N] ")).trim().toLowerCase();
+        if (answer !== "y" && answer !== "yes") {
+          print("Aborted — data unchanged.");
+          return 1;
+        }
+      }
+      const failed = applyDataFixes(configDir, found, deps.data, print);
+      const ports = await fixPortDrift(manifestPath, { yes: opts.yes ?? false, print, deps });
+      return failed > 0 ? 1 : ports;
+    }
     return await fixPortDrift(manifestPath, { yes: opts.yes ?? false, print, deps });
   }
 

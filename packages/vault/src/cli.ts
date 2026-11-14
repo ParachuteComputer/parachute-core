@@ -3523,6 +3523,7 @@ async function cmdExport(args: string[]) {
 async function cmdHistory(args: string[]) {
   const rebuild = args[0] === "rebuild-state";
   if (rebuild) args = args.slice(1);
+  let checkOnly = false;
   let vaultName = "default";
   let notePath: string | undefined;
   let limit: number | undefined;
@@ -3566,6 +3567,8 @@ async function cmdHistory(args: string[]) {
       showSha = v;
     } else if (arg === "--json") {
       asJson = true;
+    } else if (arg === "--check" && rebuild) {
+      checkOnly = true;
     } else if (arg === "--help" || arg === "-h") {
       printHistoryUsage();
       return;
@@ -3577,7 +3580,7 @@ async function cmdHistory(args: string[]) {
   }
 
   if (rebuild && (showSha || notePath || limit !== undefined)) {
-    console.error("rebuild-state accepts only --vault and --json.");
+    console.error("rebuild-state accepts only --vault, --check and --json.");
     process.exit(1);
   }
   if (showSha && !notePath) {
@@ -3598,6 +3601,19 @@ async function cmdHistory(args: string[]) {
       process.exit(1);
     }
     const { Database } = await import("bun:sqlite");
+    if (checkOnly) {
+      // What `parachute doctor` asks: read-only, no schema upgrade, nothing written.
+      const { compactStateDrift } = await import("../core/src/history-compact-state.js");
+      const ro = new Database(path, { readonly: true });
+      try {
+        // One read transaction, so the notes' real values and the stored hints come from the same snapshot even
+        // while the server writes (two separate reads showed hundreds of false drifted notes under a writer).
+        const { checked, drifted } = ro.transaction(() => compactStateDrift(ro)).deferred();
+        console.log(asJson ? JSON.stringify({ vault: vaultName, checked_notes: checked, drifted_notes: drifted }) :
+          `${drifted} of ${checked} notes in vault "${vaultName}" have compaction hints that differ from history.`);
+      } finally { ro.close(); }
+      return;
+    }
     const { initSchema } = await import("../core/src/schema.js");
     const { rebuildCompactState } = await import("../core/src/history-compact-state.js");
     const db = new Database(path, { readwrite: true, create: false });
@@ -3672,8 +3688,9 @@ async function cmdHistory(args: string[]) {
 }
 
 function printHistoryUsage(): void {
-  console.error("Usage: parachute-vault history rebuild-state [--vault <name>] [--json]");
+  console.error("Usage: parachute-vault history rebuild-state [--vault <name>] [--check] [--json]");
   console.error("Rebuild compaction hints and reset refusals; does not compact or change history.");
+  console.error("--check only counts the notes whose hints differ from history and writes nothing (`parachute doctor` runs this, and `parachute doctor --fix` the rebuild).");
   console.error("The current server may stay running: writes serialize with the rebuild transaction.");
   console.error("Stop the server optionally to avoid write contention; do not run older writers concurrently.\n");
   console.error(

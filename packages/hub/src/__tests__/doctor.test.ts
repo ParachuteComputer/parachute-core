@@ -1347,3 +1347,94 @@ describe("doctor — Grants group (inventory + two advisories)", () => {
     }
   });
 });
+
+describe("doctor --fix — data housekeeping gate (stale history hints, unused OAuth clients)", () => {
+  const stale = { vault: "v1", checked: 3, drifted: 2 };
+  const oldClient = { clientId: "c-old", clientName: "Made-up client", registeredAt: "2026-01-01T00:00:00.000Z", status: "approved" as const, ageDays: 90 };
+  function dataDeps() {
+    const calls: string[] = [];
+    return {
+      calls,
+      data: {
+        listVaults: () => ["v1"],
+        historyDrift: () => ({ checked: stale.checked, drifted: stale.drifted }),
+        rebuildHistory: (_: string, v: string) => (calls.push(`rebuild ${v}`), true),
+        findReapable: () => [oldClient],
+        reapClients: (_: string, ids: string[]) => (calls.push(`reap ${ids.join(",")}`), ids),
+      },
+    };
+  }
+
+  test("a terminal: 'n' at the prompt changes nothing, 'y' runs both fixers", async () => {
+    const h = makeHarness();
+    try {
+      const d = dataDeps();
+      const no = await runFix(h, { isInteractive: () => true, readLine: async () => "n", data: d.data });
+      expect(no.code).toBe(1);
+      expect(d.calls).toEqual([]);
+      const yes = await runFix(h, { isInteractive: () => true, readLine: async () => "y", data: d.data });
+      expect(yes.code).toBe(0);
+      expect(d.calls).toEqual(["rebuild v1", "reap c-old"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("a client that stopped being unused while the prompt waited is kept, and each reaped client is logged", async () => {
+    const { openHubDb, hubDbPath } = await import("../hub-db.ts");
+    const { registerClient } = await import("../clients.ts");
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.configDir));
+      const old = new Date(Date.now() - 60 * 86_400_000);
+      const gone = registerClient(db, { clientName: "Made-up gone", redirectUris: ["http://127.0.0.1:9/cb"], now: () => old });
+      const busy = registerClient(db, { clientName: "Made-up busy", redirectUris: ["http://127.0.0.1:9/cb"], now: () => old });
+      const listed = [gone, busy].map((c) => ({ clientId: c.client.clientId, clientName: c.client.clientName ?? null, registeredAt: old.toISOString(), status: "approved" as const, ageDays: 60 }));
+      // The list was made; then the user finished connecting "busy" (here: it is registered again, so it is new).
+      db.prepare("UPDATE clients SET registered_at = ? WHERE client_id = ?").run(new Date().toISOString(), busy.client.clientId);
+      db.close();
+      const { lines, code } = await runFix(h, { data: { listVaults: () => [], findReapable: () => listed } }, { yes: true });
+      expect(code).toBe(0);
+      const out = lines.join("\n");
+      expect(out).toContain(`client reaped: client_id=${gone.client.clientId} client_name=Made-up gone age_days=60`);
+      expect(out).toContain(`client kept: client_id=${busy.client.clientId}`);
+      const after = openHubDb(hubDbPath(h.configDir));
+      expect((after.query("SELECT client_name FROM clients").all() as { client_name: string }[]).map((r) => r.client_name)).toEqual(["Made-up busy"]);
+      after.close();
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("a vault that can't be asked, and a hub.db that can't be read, are findings, not silence", async () => {
+    const h = makeHarness();
+    try {
+      const lines: string[] = [];
+      await doctor({
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        print: (l) => lines.push(l),
+        json: true,
+        deps: healthyDeps({ data: { listVaults: () => ["v1"], historyDrift: () => null, findReapable: () => null } }),
+      });
+      const checks = JSON.parse(lines.join("\n")).checks as { name: string; status: string; detail: string }[];
+      expect(checks.find((c) => c.name === "history-state:v1")).toMatchObject({ status: "warn" });
+      expect(checks.find((c) => c.name === "history-state:v1")?.detail).toContain("could not check");
+      expect(checks.find((c) => c.name === "oauth-clients")).toMatchObject({ status: "warn" });
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("a failed rebuild makes --fix exit 1 and says which vault", async () => {
+    const h = makeHarness();
+    try {
+      const d = dataDeps();
+      const { code, lines } = await runFix(h, { data: { ...d.data, rebuildHistory: () => false } }, { yes: true });
+      expect(code).toBe(1);
+      expect(lines.join("\n")).toContain('Could not rebuild the compaction hints of vault "v1"');
+    } finally {
+      h.cleanup();
+    }
+  });
+});
