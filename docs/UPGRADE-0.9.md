@@ -46,14 +46,17 @@ on the home, also while 0.8 is serving it. It runs the step below on a **throwaw
 The home itself gets no backup, no `run/release.json` and no lock, and its existing upgrade backups are not written
 to. No server starts, so nothing listens and no module runs. It needs room for the databases twice (the copy, then
 the step's backup of it). Exit 0: the step ran clean on the copy; 1: it failed or would be refused; 5: no room; 6:
-the home was written by a newer release. A database being written hard while it is copied can read as torn; the
+the home was written by a newer release. Every vault database it copied must also have been opened: one it could not try (its folder is a link, or has no
+`vault.yaml`) is a problem, not a pass; so is a home whose parent can't be written, where the real backup would
+have nowhere to go. A database being written hard while it is copied can read as torn; the
 copy is tried three times, then reported as unreadable (the home is never changed by the attempt).
 
 **`upgrade` reads its arguments before it touches anything.** An unknown flag or service exits 2 with the home byte
 for byte as it was. Found by the 0.9 beta rehearsal (2026-11-13): before `--check` was built, `upgrade --check`
 backed the home up, recorded it as moved to 0.9 (`state: current`), and only then said `unknown service "--check"`.
-The hub's own upgrade (a module by name, or its sweep) is handed the arguments as they were understood, and a
-service is accepted only where the hub will find it, so it can't refuse them after the step. `vault upgrade` is
+The hub's own upgrade (a module by name, or its sweep) is handed the arguments as they were understood, and its own
+lookup is asked first whether it will find the service and can read `services.json` (the same code the command
+runs, without its write-back), so it can't refuse them after the step. `vault upgrade` is
 refused the same way (the vault is part of this program). Every other command still takes the step first, as below.
 
 ## What 0.9 does the first time it opens a home

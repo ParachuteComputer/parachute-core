@@ -88,8 +88,11 @@ import {
 } from "../service-spec.ts";
 import {
   type ServiceEntry,
+  ServicesManifestError,
+  type ServicesManifest,
   findService,
   readManifest,
+  readManifestUnchanged,
   upsertService,
 } from "../services-manifest.ts";
 import { type LifecycleOpts, restart as lifecycleRestart } from "./lifecycle.ts";
@@ -449,8 +452,9 @@ function hubTarget(): ResolvedTarget {
 async function resolveTargets(
   svc: string | undefined,
   manifestPath: string,
+  read: (path: string) => ServicesManifest = readManifest,
 ): Promise<{ targets: ResolvedTarget[] } | { error: string }> {
-  const manifest = readManifest(manifestPath);
+  const manifest = read(manifestPath);
 
   if (svc !== undefined) {
     if (svc === HUB_SVC) return { targets: [hubTarget()] };
@@ -956,6 +960,25 @@ async function upgradeOne(target: ResolvedTarget, r: Resolved): Promise<number> 
     return await upgradeLinked(target, sourceDir, r);
   }
   return await upgradeNpm(target, sourceDir, r);
+}
+
+/**
+ * Why `upgrade [svc]` would stop before it upgrades anything (services.json can't be read as this command reads
+ * it, the service isn't one it finds), or null. The same lookup `upgrade` itself makes (resolveTargets), reading
+ * services.json without writing to it: core asks this before it lets any step be taken on the home, so that this
+ * command never refuses its target afterwards (packages/cli/src/upgrade.ts).
+ */
+export async function upgradeTargetProblem(
+  svc: string | undefined,
+  manifestPath: string = SERVICES_MANIFEST_PATH,
+): Promise<string | null> {
+  try {
+    const picked = await resolveTargets(svc, manifestPath, readManifestUnchanged);
+    return "error" in picked ? picked.error : null;
+  } catch (err) {
+    if (err instanceof ServicesManifestError) return err.message;
+    throw err;
+  }
 }
 
 /**

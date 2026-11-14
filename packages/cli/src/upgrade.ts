@@ -44,7 +44,7 @@ export type UpgradeAsk =
   | { kind: "check"; json: boolean }
   | { kind: "rollback" }
   /** The hub's own upgrade (a module, or its sweep), with the arguments to hand it. */
-  | { kind: "hub"; argv: string[] };
+  | { kind: "hub"; service: string | undefined; argv: string[] };
 
 export function upgradeUsage(): string {
   return [
@@ -72,29 +72,16 @@ export function upgradeHelp(): string {
   ].join("\n");
 }
 
-/** What the hub's own upgrade will find in services.json: its rows, or why it can't be read. */
-function serviceRows(home: string): { name: string; installDir?: unknown }[] | "unreadable" {
-  const path = join(home, "services.json");
-  if (!existsSync(path)) return [];
-  try {
-    const rows = JSON.parse(readFileSync(path, "utf8"))?.services;
-    return Array.isArray(rows) ? rows.filter((r) => typeof r?.name === "string") : "unreadable";
-  } catch {
-    return "unreadable";
-  }
-}
-
 /**
- * What `parachute upgrade <args>` asks for. It reads services.json and nothing else, and changes nothing, so
- * dispatch calls it before any check or step on the home.
+ * What `parachute upgrade <args>` asks for. Pure: it reads nothing and changes nothing, so dispatch calls it before
+ * any check or step on the home.
  *
  * The hub's own upgrade is handed `argv`, rebuilt here from what was understood, never the words as typed: whatever
- * this lets through, the hub's parser accepts, so nothing is refused as a usage error after the step. For the same
- * reason a service is accepted here only where the hub will find it (commands/upgrade.ts resolveTargets): the hub
- * itself, a module the hub knows that has a row in services.json (`manifestName`: its row's name), or a row that
- * names its install folder.
+ * this lets through, the hub's parser accepts, so nothing is refused as a usage error after the step. Whether the
+ * hub will find the service named (`service`) is the hub's own to say, and dispatch asks it, also before the step
+ * (hub commands/upgrade.ts upgradeTargetProblem: the lookup the command itself makes, without its writes).
  */
-export function parseUpgrade(args: string[], home: string, manifestName: (short: string) => string | undefined): UpgradeAsk {
+export function parseUpgrade(args: string[]): UpgradeAsk {
   const usage = (message: string): UpgradeAsk => ({ kind: "usage", message });
   if (args.some((a) => a === "--help" || a === "-h")) return { kind: "help" };
   const has = (flag: string) => args.includes(flag);
@@ -128,18 +115,8 @@ export function parseUpgrade(args: string[], home: string, manifestName: (short:
     else services.push(a);
   }
   if (services.length > 1) return usage(`one service at a time ("${services[0]}", "${services[1]}")`);
-  const rows = serviceRows(home);
-  if (rows === "unreadable") return usage(`${join(home, "services.json")} can't be read, so no module can be upgraded; fix or remove it`);
   const svc = services[0];
-  if (svc !== undefined && svc !== "hub") {
-    const row = manifestName(svc);
-    if (row !== undefined) {
-      if (!rows.some((r) => r.name === row)) return usage(`${svc} isn't installed on this home (\`parachute install ${svc}\` first)`);
-    } else if (!rows.some((r) => r.name === svc && typeof r.installDir === "string" && r.installDir)) {
-      return usage(`unknown service "${svc}"`);
-    }
-  }
-  return { kind: "hub", argv: [...(svc !== undefined ? [svc] : []), ...(channel ? ["--channel", channel] : []), ...(tag ? ["--tag", tag] : []), ...(allowDowngrade ? ["--allow-downgrade"] : [])] };
+  return { kind: "hub", service: svc, argv: [...(svc !== undefined ? [svc] : []), ...(channel ? ["--channel", channel] : []), ...(tag ? ["--tag", tag] : []), ...(allowDowngrade ? ["--allow-downgrade"] : [])] };
 }
 
 // ── --check ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -153,6 +130,8 @@ const COPY_WORD_ENV = "PARACHUTE_UPGRADE_CHECK_WORD";
 const SCRATCH_PREFIX = ".parachute-upgrade-check-";
 /** Folders the step never reads: a vault's attachments and its git mirror, logs, and package trees. */
 const LEFT_OUT = new Set(["assets", "mirror", "logs", "node_modules", ".git"]);
+/** Where a folder's children are vaults by name, whatever the name (a vault may be called `logs`). */
+const VAULT_FOLDERS = new Set([join("vault", "data"), "vaults", join("vault", "vaults")]);
 /** Larger files are not settings: left out of the copy (and counted). */
 const SMALL = 1024 * 1024;
 
@@ -291,11 +270,12 @@ function copySmallFiles(home: string, to: string, dbFiles: Set<string>): number 
       const r = rel ? join(rel, name) : name;
       const st = lstatSync(join(home, r));
       if (st.isDirectory()) {
-        if (LEFT_OUT.has(name) || name.startsWith(SCRATCH_PREFIX)) continue;
+        if ((LEFT_OUT.has(name) && !VAULT_FOLDERS.has(rel)) || name.startsWith(SCRATCH_PREFIX)) continue;
         mkdirSync(join(to, r), { recursive: true, mode: 0o700 });
         walk(r);
       } else if (st.isFile()) {
-        if (dbFiles.has(r)) continue;
+        // Never another check's mark (a home restored from a killed check's leftovers): this copy has its own.
+        if (dbFiles.has(r) || r === COPY_MARK) continue;
         // run/ holds this machine's running state (locks, pids, sockets); only the usage log travels as it is.
         if (rel === "run" && r !== USAGE_LOG) continue;
         if (st.size > SMALL) {
@@ -377,6 +357,8 @@ export async function check(asked: string, opts: { json: boolean }): Promise<num
   } catch {
     place = tmpdir(); // the home's parent can't be written: the system's temp folder
     clearStale(place);
+    // The real step puts its backup beside the home, and would stop there.
+    problems.push(`${parent} can't be written: the step's backup goes to ${join(parent, "parachute-upgrade")}, so the first command of ${core.version} on this home would fail before it backs up`);
   }
   const free = statfsSync(place);
   if (free.bavail * free.bsize < bytes * 2.2 + 100e6) {
@@ -457,13 +439,20 @@ export async function check(asked: string, opts: { json: boolean }): Promise<num
       say(`  ${from ?? "an older release"} → ${core.version}: the step backs up ${n} database${n === 1 ? "" : "s"} first, then records the release (${seconds(stepMs)} on the copy, opening included)`);
     } else {
       out.backup = { databases: 0, skipped: [] };
-      say(`  no backup would be taken: ${rel ? "this release made the home, or its own takeover just moved it" : "nothing here can be recorded yet"}`);
+      say(`  no backup would be taken: ${rel ? "this release made the home, or its own takeover just moved it" : existsSync(join(home, "embedded.json")) ? "a host application manages this home and keeps its own backups" : "nothing here can be recorded yet"}`);
     }
     out.hub = report.hub;
     if (!report.hub.opens) problems.push(`hub.db does not open with ${core.version}: ${report.hub.error}`);
     else if (report.hub.keys === undefined) say("  hub.db: none here yet");
     else say(`  hub.db: opens; ${report.hub.keys} key${report.hub.keys === 1 ? "" : "s"} (a token an older release minted becomes a key)`);
     out.vaults = report.vaults;
+    // Every vault database that was copied must have been opened: one the run on the copy didn't find (its folder
+    // is a link, or has no vault.yaml) was not tried, and saying nothing would pass it as clean.
+    const opened = new Set(report.vaults.map((v) => v.name));
+    for (const d of dbs) {
+      if (d.rel === "hub.db" || !(d.rel in before) || opened.has(basename(dirname(d.rel)))) continue;
+      problems.push(`${d.rel} was copied but not opened on the copy (its folder is a link, an older layout, or has no vault.yaml): not checked`);
+    }
     for (const v of report.vaults) {
       if (v.opens) say(`  vault ${v.name}: opens; ${v.notes} note${v.notes === 1 ? "" : "s"}, ${v.types} type${v.types === 1 ? "" : "s"}, ${v.tags} tag${v.tags === 1 ? "" : "s"}`);
       else problems.push(`vault ${v.name} does not open with ${core.version}: ${v.error}`);

@@ -22,7 +22,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createHash, randomBytes } from "node:crypto";
 import { Database } from "bun:sqlite";
-import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { candidate, freePort, newHome, until } from "../candidate-lib.ts";
 import { cli } from "../candidate-lib.ts";
@@ -236,29 +236,63 @@ describe("lifecycle/upgrade", () => {
 
   test("upgrade names a service only where the hub will find it; a home named by a relative path is checked all the same", async () => {
     const home = await homeBy08("up-services", ["goodv"]);
-    // The hub resolves a row of services.json only by its install folder: without one it said `unknown service`
-    // after the step. And a services.json it can't read stopped its sweep after the step.
+    // Whether a service is there is the hub's own lookup, asked before the step. Each of these the hub refused only
+    // after the home was backed up and recorded (reviews of #119): it resolves a third-party row by its install
+    // folder and takes the first row of a name; it drops a retired module's row; it stops on a row it can't
+    // validate, and on a file it can't parse, even for `upgrade hub` and the sweep.
     const services = join(home, "services.json");
-    const rows = JSON.parse(readFileSync(services, "utf8"));
-    must(rows.services?.length >= 1 && rows.services.every((r: any) => r.installDir), "setup: 0.8 registered its vault with an install folder");
-    const row = rows.services[0].name as string;
-    writeFileSync(services, JSON.stringify({ ...rows, services: rows.services.map(({ installDir: _dir, ...rest }: any) => rest) }, null, 2));
-    let before = footprint(home);
-    expect((await cli(home, ["upgrade", row])).code).toBe(2);
-    expect(footprint(home)).toEqual(before);
-    writeFileSync(services, "Made-up bytes that are not JSON.\n");
-    before = footprint(home);
-    for (const args of [["upgrade"], ["upgrade", "vault"]]) {
-      expect(`${args.join(" ")}: exit ${(await cli(home, args)).code}`).toBe(`${args.join(" ")}: exit 2`);
-      expect(footprint(home)).toEqual(before);
+    const good = JSON.parse(readFileSync(services, "utf8"));
+    must(good.services?.length >= 1, "setup: 0.8 registered its vault");
+    const row = (name: string, port: number, extra: Record<string, unknown> = {}) => ({ name, port, paths: [`/${name}`], health: `/${name}/health`, version: "1.0.0", ...extra });
+    const cases: [string, unknown[] | string, string[][]][] = [
+      ["a row without an install folder", [...good.services, row("made-up-module", 47991)], [["made-up-module"]]],
+      ["two rows of one name, the first without a folder", [...good.services, row("made-up-module", 47991), row("made-up-module", 47992, { installDir: dirname(home) })], [["made-up-module"]]],
+      ["a retired module's row", [row("parachute-agent", 47993, { installDir: dirname(home) })], [["parachute-agent"]]],
+      ["a row the hub can't validate", [...good.services, row("made-up-module", 0)], [["hub"], [], ["vault"]]],
+      ["a file that isn't JSON", "Made-up bytes that are not JSON.\n", [["hub"], [], ["vault"]]],
+    ];
+    for (const [what, rows, argvs] of cases) {
+      writeFileSync(services, typeof rows === "string" ? rows : JSON.stringify({ ...good, services: rows }, null, 2));
+      const before = footprint(home);
+      for (const args of argvs) {
+        const r = await cli(home, ["upgrade", ...args]);
+        expect(`${what}: upgrade ${args.join(" ")}: exit ${r.code}`).toBe(`${what}: upgrade ${args.join(" ")}: exit 2`);
+        expect(footprint(home)).toEqual(before); // services.json too: the lookup heals nothing on the way
+      }
     }
-    writeFileSync(services, JSON.stringify(rows, null, 2));
-    before = footprint(home);
+    writeFileSync(services, JSON.stringify(good, null, 2));
+    const before = footprint(home);
     // cli() runs in the home's parent, so the home's own name is a relative path to it.
     const r = await cli(home, ["upgrade", "--check", "--json"], { env: { PARACHUTE_HOME: basename(home) } });
     must(r.code === 0, `upgrade --check with a relative PARACHUTE_HOME exited ${r.code}: ${r.stderr.slice(-800)}`);
     expect(JSON.parse(r.stdout.trim().split("\n").pop()!)).toMatchObject({ check: "ok", home, from: "0.8" });
     expect(footprint(home)).toEqual(before);
+  }, 120_000);
+
+  test("upgrade --check opens every vault it copied, whatever its name; leftovers of a killed check are swept, and never recursed into", async () => {
+    // `logs` and `mirror` are folder names the copy leaves out elsewhere; as vaults they must be copied and opened.
+    const home = await homeBy08("up-check-names", ["logs", "mirror", "plainv"]);
+    // What a check killed outright leaves beside the home: its copy, its mark, and the pid of a process now gone.
+    const gone = Bun.spawnSync(["true"]).pid;
+    const stale = join(dirname(home), ".parachute-upgrade-check-stale1");
+    const other = join(dirname(home), ".parachute-upgrade-check-other1"); // no pid it can read: not its to remove
+    for (const [dir, pid] of [[stale, `${gone}\n`], [other, "not a pid\n"]] as const) {
+      mkdirSync(join(dir, "home"), { recursive: true });
+      writeFileSync(join(dir, "home", ".parachute-upgrade-check-copy"), "an earlier check's word\n");
+      writeFileSync(join(dir, "pid"), pid);
+    }
+    // And a home put back from such a leftover carries the old mark: the check must not take its copy for a home.
+    writeFileSync(join(home, ".parachute-upgrade-check-copy"), "an earlier check's word\n");
+    const before = footprint(home);
+    const r = await cli(home, ["upgrade", "--check", "--json"]);
+    must(r.code === 0, `upgrade --check exited ${r.code}: ${r.stderr.slice(-1200)}`);
+    const out = JSON.parse(r.stdout.trim().split("\n").pop()!);
+    expect(out).toMatchObject({ check: "ok", problems: [], refusals: [] });
+    expect(out.vaults.map((v: any) => [v.name, v.opens]).sort()).toEqual([["logs", true], ["mirror", true], ["plainv", true]]);
+    expect(existsSync(stale)).toBe(false);
+    expect(existsSync(other)).toBe(true);
+    rmSync(other, { recursive: true });
+    expect({ ...footprint(home), beside: footprint(home).beside.filter((n) => n !== basename(stale)) }).toEqual({ ...before, beside: before.beside.filter((n) => n !== basename(stale) && n !== basename(other)) });
   }, 120_000);
 
   test("upgrade --check on a home the old 0.7 programs still own says so (exit 1): it is the takeover's, and no step would be taken", async () => {

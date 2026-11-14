@@ -36,7 +36,7 @@
 // checks on the home it names. `parachute-core takeover` (takeover.ts) moves a home the old programs keep onto v0.8,
 // and a box `serve` on such a home refuses with exit 7 until it has. While it holds a home, the commands that install, upgrade, expose, migrate or drive modules
 // are refused with managed_by_host, exit 2 (managed.ts, PLAN §3).
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { READABLE_SCHEMA_VERSION, SCHEMA_VERSION } from "@openparachute/vault/core/src/schema.ts";
 import core from "../../../package.json" with { type: "json" };
@@ -189,8 +189,14 @@ export async function dispatch(role: Role, notice?: Notice): Promise<void> {
   let upgradeAsk: import("./upgrade.ts").UpgradeAsk | undefined;
   if ("cli" in r && r.cli === "hub" && r.argv[0] === "upgrade") {
     const { parseUpgrade, upgradeHelp, upgradeUsage } = await import("./upgrade.ts");
-    const { getSpec } = await import("@openparachute/hub/src/service-spec.ts");
-    upgradeAsk = parseUpgrade(r.argv.slice(1), home, (short) => getSpec(short)?.manifestName);
+    upgradeAsk = parseUpgrade(r.argv.slice(1));
+    if (upgradeAsk.kind === "hub") {
+      // Will the hub's upgrade find what it was asked for? Its own lookup says, reading services.json without
+      // writing to it: an unknown service, or a services.json it can't read, is refused here, not after the step.
+      const { upgradeTargetProblem } = await import("@openparachute/hub/src/commands/upgrade.ts");
+      const problem = await upgradeTargetProblem(upgradeAsk.service, join(home, "services.json"));
+      if (problem) upgradeAsk = { kind: "usage", message: problem };
+    }
     if (upgradeAsk.kind === "usage") {
       console.error(`parachute upgrade: ${upgradeAsk.message}\n${upgradeUsage()}`);
       process.exit(2);
@@ -276,6 +282,11 @@ export async function dispatch(role: Role, notice?: Notice): Promise<void> {
   if (upgradeAsk?.kind === "check") {
     const { check, isCheckCopy } = await import("./upgrade.ts");
     checkCopy = isCheckCopy(home);
+    if (!checkCopy && process.env.PARACHUTE_UPGRADE_CHECK_COPY !== undefined) {
+      // Started as a check's run on its copy, but this home isn't that copy: never a check of a check.
+      console.error("parachute upgrade --check: this is not the copy this run was started for; nothing was opened");
+      process.exit(2);
+    }
     if (!checkCopy) {
       const refusal = managedRefusal("hub", ["upgrade"]);
       if (refusal) {
