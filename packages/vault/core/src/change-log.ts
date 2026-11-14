@@ -474,6 +474,9 @@ export function writeSetRecords(db: Database, id: string): WriteSetRecord[] {
 /** Drops log rows older than `days` (and sets left with no rows). Returns the rows dropped. */
 export function pruneChangeLog(db: Database, days: number, now = new Date()): { changes: number; sets: number; hashes: string[] } {
   if (!changeLogPresent(db)) return { changes: 0, sets: 0, hashes: [] };
+  // Place rows still waiting for a position first (an older engine's writes), so none is dropped below the horizon
+  // unseen by a feed reader.
+  settleChangeLogPositions(db);
   const cutoff = new Date(now.getTime() - days * 86_400_000).toISOString();
   // seq follows time (one writer at a time), so the rows past the horizon are a prefix of seq: found from the newest
   // end, with no index on at.
