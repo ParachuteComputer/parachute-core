@@ -75,9 +75,10 @@ home with data:
 **Never under a running server.** While a Parachute server holds the home's databases, the command that would take
 the step stops with exit 7 and changes nothing: a home is not recorded as moved while the older release still
 serves it, and gets nothing from this one, not even a lock file. (`upgrade --check` is the way to try the step
-meanwhile.) `stop`, `restart`, `status` and `logs` still run from the newer release without taking the step: right
-after `parachute upgrade` installed it, the links name the newer release while the older server runs, and those
-are the commands that stop it. Its next start, as the newer release, takes the step.
+meanwhile.) `stop` and `restart` of the whole service, and `logs`, still run from the newer release without
+taking the step: right after `parachute upgrade` installed it, the links name the newer release while the older
+server runs, and those are the commands that stop it. They open no database. Its next start, as the newer
+release, takes the step. (`status`, and `stop <module>`, open hub.db and are refused like the rest.)
 3. **A database that can't be read** is named on stderr, listed as `skipped` in the manifest and left out of the
    backup. Every readable one is still backed up first, and a restore leaves a skipped one where it is. The command
    then goes on and fails its own way if it needs the broken database (a vault that can't open stops `serve` with
@@ -120,8 +121,10 @@ command on a home that doesn't exist yet, or on a home the 0.7 programs still ow
   (`<prefix>/bin/parachute-core` → `../<version>/bin/…`), the rollback points `<prefix>/bin` at the previous copy
   again, so a unit that runs `<prefix>/bin/parachute-core serve` (the takeover's unit) runs it at its next start,
   unchanged. A unit that starts a fixed copy instead (`parachute init` writes
-  `ExecStart=<bun> <prefix>/.store/<version>-<id>/…`) does not follow the links: the rollback and `upgrade` name
-  such a unit and say what to set its ExecStart to. Run again on a home already rolled back, `--rollback` only
+  `ExecStart=<bun> <prefix>/.store/<version>-<id>/…`) does not follow the links: the rollback and `upgrade`
+  (the step, and after installing a newer release) name such a unit and say what to set its ExecStart to. Only
+  the user's own systemd units are looked at, not system units or macOS launchd agents. Open: `init` should write
+  the `<prefix>/bin` form itself. Run again on a home already rolled back, `--rollback` only
   finishes the links if they couldn't be moved the first time. Links in `<prefix>/bin` that this installer didn't
   make are never replaced. Where no previous copy is kept (an npm
   or bun install, an unpacked tarball), it says exactly what to reinstall. The contract goes through a unit

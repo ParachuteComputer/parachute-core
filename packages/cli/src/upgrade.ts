@@ -50,7 +50,7 @@ import core from "../../../package.json" with { type: "json" };
 import { USAGE_LOG, readUsage } from "./front.ts";
 import { databases, readDatabase, schemaOf } from "./home.ts";
 import { bundleRoot, hasVersion, installedPrefix } from "./install.ts";
-import { defaultChannel, Exit, fixedUnitsNote, RELEASE_FILE, readRelease, stepForward, withReleaseLock, writeRelease, type Recheck, type Release } from "./release.ts";
+import { defaultChannel, Exit, fixedUnits, fixedUnitsNote, RELEASE_FILE, readRelease, stepForward, withReleaseLock, writeRelease, type Recheck, type Release } from "./release.ts";
 
 export type UpgradeAsk =
   | { kind: "usage"; message: string }
@@ -696,6 +696,13 @@ export async function upgradeCore(home: string, ask: { channel?: string; json: b
       if (run.exitCode !== 0) throw new Exit(EXIT.problems, `${cmd.join(" ")} exited ${run.exitCode}; ${core.version} is still what runs`);
     }
     Object.assign(out, { upgraded: true, to: pick.version, how: kind.how });
+    // A unit that starts a fixed copy would go on starting this release, whatever the links say.
+    const fixed: { moved: boolean; prefix?: string; units_fixed?: string[] } = kind.how === "bundle" ? { moved: true, prefix: kind.base, ...fixedUnits(kind.base) } : { moved: false };
+    const unitNote = fixedUnitsNote(fixed);
+    if (unitNote) {
+      out.units_fixed = fixed.units_fixed;
+      say(unitNote);
+    }
     say(`Parachute ${pick.version} is installed${kind.how === "bundle" ? `; ${core.version} is kept beside it` : ""}. What is running now is still ${core.version}: restart Parachute (\`parachute restart\`, or its unit) to run ${pick.version}.`);
     say(`Its first start backs every database up before it opens one. \`parachute upgrade --check\` with ${pick.version} tries that on a copy first.`);
     return done(EXIT.ok);

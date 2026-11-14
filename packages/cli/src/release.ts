@@ -279,9 +279,10 @@ function recheckOrStop(recheck: Recheck): void {
 export function beforeOpen(home: string, say: (s: string) => void = (s) => console.error(s), recheck: Recheck = () => null, forward = false, lifecycle = false): Release | undefined {
   if (process.env.PARACHUTE_TAKEOVER_CHECK === "1") return undefined;
   if (!existsSync(home) || existsSync(join(home, "embedded.json"))) return undefined;
-  // `stop`, `restart`, `status` and `logs` (`lifecycle`) are how the older release's server is stopped or looked
-  // at from here: a newer release was just installed and the links name it, but the old server still runs. They
-  // take no step and record nothing while it does; the server's next start (this release's) takes the step.
+  // `stop` and `restart` of the whole service, and `logs` (`lifecycle`: dispatch says which), are how the older
+  // release's server is stopped from here: a newer release was just installed and the links name it, but the old
+  // server still runs. They open no database, take no step and record nothing while it does; the server's next
+  // start (this release's) takes the step.
   if (lifecycle && !forward) {
     const r = readRelease(home);
     if ((!r || r.version !== core.version || r.state !== "current") && !rolledBackRefusal(r) && r?.state !== "restoring" && servedBy(home).length) return undefined;
@@ -504,9 +505,10 @@ export function beforeOpenOrExit(home: string, recheck: Recheck = () => null, fo
 /**
  * systemd user units that start a fixed copy under this prefix (`…/.store/<version>-<id>/…`) instead of
  * `<prefix>/bin/parachute-core`: `parachute init` writes such a unit. Moving the links doesn't change what they
- * start, so whoever moved the links is told. (The takeover's unit runs `<prefix>/bin/parachute-core`.)
+ * start, so whoever moved the links is told. (The takeover's unit runs `<prefix>/bin/parachute-core`.) Only the
+ * user's own systemd units are looked at: a system unit or a macOS launchd agent is not seen.
  */
-function fixedUnits(base: string): { units_fixed?: string[] } {
+export function fixedUnits(base: string): { units_fixed?: string[] } {
   const dir = join(process.env.XDG_CONFIG_HOME || join(process.env.HOME || homedir(), ".config"), "systemd", "user");
   const found: string[] = [];
   try {
@@ -693,7 +695,8 @@ export function keepRevocations(staged: string, sources: string[], outside: stri
       } catch (err) {
         throw new SourceUnusable(source, `can't be read (${String((err as Error)?.message ?? err).split("\n")[0]})`);
       }
-      if (!(after.rows.signing_keys ?? []).some((k) => kids.has(k.kid))) throw new SourceUnusable(source, "shares no signing key with the backup's hub.db: it is not the same hub");
+      // (A backup whose hub never made a signing key can't be told apart by one: taken for the same hub.)
+      if (kids.size > 0 && !(after.rows.signing_keys ?? []).some((k) => kids.has(k.kid))) throw new SourceUnusable(source, "shares no signing key with the backup's hub.db: it is not the same hub");
       const by = (table: string, key: (r: any) => string) => new Map((after.rows[table] ?? []).map((r) => [key(r), r]));
       const shared = (table: string) => (after.cols[table] ?? []).filter((c) => mine.has(table) && columns(db, table).includes(c));
       db.transaction(() => {
@@ -866,6 +869,7 @@ export async function rollback(home: string, args: string[]): Promise<number> {
           if (json) console.log(JSON.stringify({ rolled_back: true, from: r.version, to: r.previous, mode: "links-only", links }));
           return EXIT.ok;
         }
+        throw new Exit(EXIT.failed, `this home was rolled back to ${r.previous} on ${r.rolled_back_at}, but ${join(base, "bin")} still runs ${core.version}. ${links.why ?? ""} ${links.next ?? ""}`.trim());
       }
     }
     if (!r || (r.state !== "current" && !resuming) || !r.previous) {

@@ -323,8 +323,11 @@ export async function dispatch(role: Role, notice?: Notice): Promise<void> {
     // first (release.ts). Not a host's (embedded) home, nor one the old 0.7 programs still own. A home marked
     // rolled back is refused here (exit 7); only `upgrade` above, and its check on a copy, take the step on one.
     const { beforeOpenOrExit } = await import("./release.ts");
-    // `stop`, `restart`, `status` and `logs` take no step while another release's server still runs on the home.
-    const lifecycle = r.cli === "hub" && ["stop", "restart", "status", "logs"].includes(r.argv[0] ?? "");
+    // `stop` and `restart` of the whole service, and `logs`, take no step while another release's server still runs
+    // on the home: they only talk to the service manager or read log files. Not `status`, nor `stop <module>`:
+    // those open hub.db, and this release opening it adds its tables to a database the other is serving.
+    const lifecycle = r.cli === "hub" && (r.argv[0] === "logs" ||
+      (["stop", "restart"].includes(r.argv[0] ?? "") && (r.argv[1] === undefined || r.argv[1] === "hub")));
     const code = beforeOpenOrExit(home, newerCheck, checkCopy, lifecycle);
     if (code !== null) process.exit(code);
   }

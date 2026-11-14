@@ -218,9 +218,15 @@ describe("lifecycle/upgrade", () => {
       expect(cmd.code).toBe(7);
       expect(cmd.stderr).toContain("a Parachute server is running");
       expect(existsSync(join(m.home, "run", "release.json"))).toBe(false);
-      const status = await core(["status"]);
-      expect(status.code).not.toBe(7);
-      expect(status.stderr).not.toContain("a Parachute server is running");
+      const logs = await core(["logs"]);
+      expect(logs.code).not.toBe(7);
+      expect(logs.stderr).not.toContain("a Parachute server is running");
+      // `status` opens hub.db, and 0.9 opening it adds its tables to the database 0.8 is serving: refused too.
+      expect((await core(["status"])).code).toBe(7);
+      expect((await core(["stop", "vault"])).code).toBe(7);
+      const hubDb = new Database(join(m.home, "hub.db"), { readonly: true });
+      expect(hubDb.query("SELECT 1 FROM sqlite_master WHERE name = 'keys'").get()).toBeNull(); // 0.9 never opened it
+      hubDb.close();
       expect(existsSync(join(m.home, "run", "release.json"))).toBe(false);
       expect(backups()).toEqual([]);
       expect((await api(writer).get(`/notes/${ids.plan}`)).status).toBe(200); // and 0.8 still serves
