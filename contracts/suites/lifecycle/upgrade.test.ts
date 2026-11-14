@@ -247,6 +247,7 @@ describe("lifecycle/upgrade", () => {
     const cases: [string, unknown[] | string, string[][]][] = [
       ["a row without an install folder", [...good.services, row("made-up-module", 47991)], [["made-up-module"]]],
       ["two rows of one name, the first without a folder", [...good.services, row("made-up-module", 47991), row("made-up-module", 47992, { installDir: dirname(home) })], [["made-up-module"]]],
+      ["a module the hub knows, with a row and no install", [...good.services, row("parachute-scribe", 47994)], [["scribe"]]],
       ["a retired module's row", [row("parachute-agent", 47993, { installDir: dirname(home) })], [["parachute-agent"]]],
       ["a row the hub can't validate", [...good.services, row("made-up-module", 0)], [["hub"], ["vault"]]],
       ["a file that isn't JSON", "Made-up bytes that are not JSON.\n", [["hub"], ["vault"]]],

@@ -183,7 +183,8 @@ describe("lifecycle/upgrade through the service unit", () => {
     must(stopped, `0.9's serve kept running on a rolled-back home:\n${box.log().slice(-1200)}`);
     expect(box.proc.exitCode).toBe(7);
     expect(box.log()).toContain(`rolled back to ${v08}`);
-    expect((await safeFetch(`${origin}/health`)).status).not.toBe(200);
+    // Nothing serves: no answer at all, or none from a server.
+    expect(await safeFetch(`${origin}/health`).then((r) => r.status, () => 0)).not.toBe(200);
     expect({ files: Object.fromEntries(fileHashes(m.home)), backups: backups() }).toEqual(before);
   }, 120_000);
 

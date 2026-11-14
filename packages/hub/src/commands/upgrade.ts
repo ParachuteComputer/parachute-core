@@ -463,6 +463,10 @@ async function resolveTargets(
       return { error: "No services installed yet. Try: parachute install <service>" };
     }
 
+    // A first-party module is the same module by its short name (`vault`) and by its row's name
+    // (`parachute-vault`): the row name must not slip past the part-of-core guard as a third-party row.
+    const rowShort = getSpec(svc) ? undefined : shortNameForManifest(svc);
+    if (rowShort && getSpec(rowShort)) svc = rowShort;
     const firstPartySpec = getSpec(svc);
     if (firstPartySpec) {
       const entry = manifest.services.find((s) => s.name === firstPartySpec.manifestName);
@@ -974,7 +978,18 @@ export async function upgradeTargetProblem(
 ): Promise<string | null> {
   try {
     const picked = await resolveTargets(svc, manifestPath, readManifestUnchanged);
-    return "error" in picked ? picked.error : null;
+    if ("error" in picked) return picked.error;
+    // One service asked for by name: its install must be there to upgrade (upgradeOne's own two checks). In the
+    // sweep a module without one is reported and passed over, as before.
+    if (svc !== undefined) {
+      const r = resolve({ manifestPath, configDir: dirname(manifestPath) });
+      const target = picked.targets[0]!;
+      if (coreRoot() && (target.packageName === HUB_PACKAGE || runsBundled(target, r))) return null;
+      const dir = resolveSourceDir(target.packageName, r.findGlobalInstall, target.entry.installDir);
+      if (!dir) return `can't locate install dir for ${target.packageName}. Try \`parachute install ${target.short}\` first.`;
+      if (!existsSync(dir)) return `${target.short}: install dir ${dir} does not exist.`;
+    }
+    return null;
   } catch (err) {
     if (err instanceof ServicesManifestError) return err.message;
     throw err;

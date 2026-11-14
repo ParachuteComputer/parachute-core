@@ -67,7 +67,14 @@ home with data:
 1. **Back up first.** Every database is copied with `VACUUM INTO` (a consistent copy even beside a `-wal`) to
    `<home>/../parachute-upgrade/<from>-to-<to>-<time>/home/<same path>`, with `manifest.json`: a sha256 and the
    schema number per file. It refuses with exit 5, changing nothing, when there is no room.
-2. **Record the step** in `run/release.json`: `{version, previous, since, backup, state}`.
+2. **Record the step** in `run/release.json`: `{version, previous, since, backup, state, channel}`. `previous` is
+   the exact version where the install knows it (the versioned installer records which version its links ran
+   before: `<prefix>/.store/links.json`), else the line (`0.8`). `channel` is the npm dist-tag `parachute upgrade`
+   follows.
+
+**Never under a running server.** While a Parachute server holds the home's databases, the command that would take
+the step stops with exit 7 and changes nothing: a home is not recorded as moved while the older release still
+serves it. (`upgrade --check` is the way to try the step meanwhile.)
 3. **A database that can't be read** is named on stderr, listed as `skipped` in the manifest and left out of the
    backup. Every readable one is still backed up first, and a restore leaves a skipped one where it is. The command
    then goes on and fails its own way if it needs the broken database (a vault that can't open stops `serve` with
@@ -103,7 +110,31 @@ command on a home that doesn't exist yet, or on a home the 0.7 programs still ow
      export) and checks again that nothing has started;
   4. it records `restoring`, moves the live databases aside (`after-<version>-<time>/`) and puts the staged ones
      in place. Every command refuses a home left `restoring` until the restore is run again to finish.
-- Any 0.9 command on a rolled-back home moves it forward again, with a new backup first.
+- **The links go back too.** Where 0.9 was installed beside the previous release by the versioned installer
+  (`<prefix>/bin/parachute-core` → `../<version>/bin/…`), the rollback points `<prefix>/bin` at the previous copy
+  again, so the unit's next start runs it: nothing about the unit changes. Where no previous copy is kept (an npm
+  or bun install, an unpacked tarball), it says exactly what to reinstall. The contract goes through a unit
+  (`lifecycle/upgrade-unit`): after `--rollback` and a restart the unit runs 0.8 and serves every record 0.9 wrote.
+- **0.9 refuses a rolled-back home.** Every 0.9 command, `serve` included, stops with exit 7 and opens nothing, so
+  a unit still pointing at 0.9 can't move the home forward again at its next restart. The release the home was
+  rolled back to serves it as its own.
+- **Forward again is `parachute upgrade`, run with 0.9** (`<prefix>/<version>/bin/parachute upgrade`): refused
+  while a server holds the data, then a new backup, the record, and the links on 0.9.
+
+## Upgrading: `parachute upgrade [--channel latest|next|beta] [--json]`
+
+With no service named, `upgrade` is this program's own (a module the hub installed is `upgrade <service>`):
+
+- **On a home this release serves**, it asks the npm registry which version the home's channel names
+  (`run/release.json` `channel`; a prerelease made or moved the home: `beta`, a stable: `latest`; `--channel`
+  changes it) and installs it when it is newer. A prerelease channel also looks at `latest`, so a box on `beta`
+  reaches the stable release when it ships. It never installs an older version.
+  - Installed under a prefix: it downloads that version's bundle and `SHA256SUMS` from the GitHub release, checks
+    the sum, and runs the new bundle's own `install --prefix`. The links switch; the old copy stays (the way
+    back). A wrong sum, or a release with no bundle yet, changes nothing.
+  - Installed with npm or bun: it runs `bun add -g` / `npm install -g` with the exact version.
+  - It does not restart the server. The next start runs the new release, which backs up first.
+- **On a home another release served last, or one rolled back**, it takes the step with this release, as above.
 
 ## What 0.9.1's number needs (not built; for Aaron and Benjamin)
 
