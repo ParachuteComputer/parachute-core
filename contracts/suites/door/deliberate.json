@@ -115,7 +115,8 @@
       "keys": [
         "mcp/admin.tool.manage-token.*",
         "mcp/admin.tool.manage-keys.*",
-        "mcp/admin.tool-count"
+        "mcp/admin.tool-count",
+        "annotations/destructive.tools"
       ],
       "between": [
         "box",
@@ -304,7 +305,8 @@
       "id": "multi-vault-door",
       "keys": [
         "has/multi-vault-door",
-        "multivault/*"
+        "multivault/*",
+        "annotations/account.*"
       ],
       "between": [
         "box",
