@@ -259,7 +259,7 @@ export function changeLogPresent(db: Database): boolean {
 }
 
 function hasBeforeBase(db: Database): boolean {
-  return !!db.prepare("SELECT 1 FROM pragma_table_info('record_changes') WHERE name = 'before_base'").get();
+  return !!cached(db, "SELECT 1 FROM pragma_table_info('record_changes') WHERE name = 'before_base'").get();
 }
 
 /** The un-numbered step: creates the change log on a vault that lacks it (no-op otherwise). */
@@ -399,8 +399,17 @@ function storeRowSnapshot(db: Database, seq: number, noteId: string, text: strin
     `SELECT b.id, b.content, b.uses FROM record_change_bases b
      WHERE b.id = (SELECT before_base FROM record_changes WHERE note_id = ? AND seq < ? AND before_base IS NOT NULL ORDER BY seq DESC LIMIT 1)`,
   ).get(noteId, seq) as { id: number; content: StoredContent; uses: number } | null;
+  let priorText: string | null = null;
   if (prior && prior.uses < BASE_MAX_USES) {
-    const delta = deflateBytes(createDeltaBytes(snapshotText(prior.content)!, text));
+    try {
+      priorText = snapshotText(prior.content);
+    } catch (err) {
+      // A damaged base is never written against again: this row makes a new one, so a write never fails on it.
+      if (!(err instanceof BlobDecodeError)) throw err;
+    }
+  }
+  if (prior && priorText !== null) {
+    const delta = deflateBytes(createDeltaBytes(priorText, text));
     if (delta.length < wholeSize * DELTA_MAX_SHARE) {
       update.run(delta, links, prior.id, seq);
       cached(db, "UPDATE record_change_bases SET uses = uses + 1 WHERE id = ?").run(prior.id);
@@ -683,21 +692,23 @@ export function forgetLoggedPast(db: Database, noteId: string): string[] {
  * naming it). Where remaining rows still name it, they're re-encoded, in seq order, against bases made of their own
  * snapshots; then every base of these records that no remaining row names is freed. Each re-encoded row reads back the
  * same text. A row names only a base of its own record, so the work is per record (idx_record_changes_note), and at
- * most BASE_MAX_USES rows a stale base. Call inside a transaction (pruneChangeLog's caller's): between letting go of a
- * base and storing its rows again, they don't read.
+ * most BASE_MAX_USES rows a stale base. Call inside a transaction (pruneChangeLog's caller's), so the sweep is all or
+ * nothing; each step leaves every row readable all the same.
  */
 function sweepBases(db: Database, swept: { note_id: string; before_base: number }[]): void {
   if (!swept.length) return;
   const byNote = new Map<string, Set<number>>();
   for (const r of swept) (byNote.get(r.note_id) ?? byNote.set(r.note_id, new Set()).get(r.note_id)!).add(r.before_base);
-  const naming = db.prepare("SELECT seq, before_row, before_base, before_links FROM record_changes WHERE note_id = ? AND before_base IS NOT NULL ORDER BY seq");
-  const clear = db.prepare("UPDATE record_changes SET before_base = NULL WHERE seq = ?");
+  const naming = db.prepare(
+    "SELECT seq, before_row, before_base, before_links FROM record_changes WHERE note_id = ? AND before_base IN (SELECT value FROM json_each(?)) ORDER BY seq",
+  );
+  // In between, a row holds its snapshot as text: it reads right at every step, even if the work stops part-way.
+  const clear = db.prepare("UPDATE record_changes SET before_row = ?, before_base = NULL WHERE seq = ?");
   const free = db.prepare(
     "DELETE FROM record_change_bases WHERE note_id = ? AND id NOT IN (SELECT before_base FROM record_changes WHERE note_id = ? AND before_base IS NOT NULL)",
   );
   for (const [noteId, stale] of byNote) {
-    const rows = (naming.all(noteId) as { seq: number; before_row: StoredContent; before_base: number; before_links: StoredContent | null }[])
-      .filter((r) => stale.has(r.before_base));
+    const rows = naming.all(noteId, JSON.stringify([...stale])) as { seq: number; before_row: StoredContent; before_base: number; before_links: StoredContent | null }[];
     // Read every text first (their bases are still there), then let go of the stale bases, then store them again.
     let texts: { seq: number; text: string; links: string | Uint8Array | null }[];
     try {
@@ -709,7 +720,7 @@ function sweepBases(db: Database, swept: { note_id: string; before_base: number 
       console.warn(`[vault] change log: the sweep can't re-encode ${noteId}'s snapshots (${err.message}); left as they are`);
       continue;
     }
-    for (const r of texts) clear.run(r.seq);
+    for (const r of texts) clear.run(r.text, r.seq);
     for (const r of texts) storeRowSnapshot(db, r.seq, noteId, r.text, r.links);
     free.run(noteId, noteId);
   }

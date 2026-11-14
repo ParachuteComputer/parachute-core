@@ -1662,8 +1662,8 @@ and `delete-record` (and their note-named aliases); a longer one is 400 `invalid
   record's past too; the log keeps only that the record changed, and the tags it had.
 - **What the log keeps of fields and links is stored compressed.** A record's fields, path and stamps from before a
   write are kept as a small delta against a whole copy of the same record's fields (Fossil delta, then deflate, as
-  version history stores bodies); a record's links are kept deflated. Reads are unchanged: undo, the write-set routes,
-  the feed and export see the same text. On a replay of a heavy writer's last 30 days (71,486 writes, fields on nearly
+  version history stores bodies); a record's links are kept deflated. Reads are unchanged: undo and the write-set routes
+  read the same text (the feed reads only the tags, which stay text). On a replay of a heavy writer's last 30 days (71,486 writes, fields on nearly
   every one) the log is 54 MB instead of 109 MB. The default is the 30-day log with compression; it can't be turned off.
   `history.change_log_days` (1 to 36,500; default 30) is the per-vault choice: a vault that writes heavily can keep a
   shorter log (its size follows the days kept), at the cost of undo and the feed's resume reaching back less far.

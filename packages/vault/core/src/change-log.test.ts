@@ -362,6 +362,19 @@ describe("change log: positions and what history keeps", () => {
     }
   });
 
+  test("a damaged base never fails a write: the record's next row makes a new one", async () => {
+    const { db, store, as } = fresh();
+    as({ id: "ws_badbase01" });
+    const n = await store.createNote("b", { path: "badbase", metadata: { a: "m".repeat(300) } });
+    as({ id: "ws_badbase02" });
+    await store.updateNote(n.id, { metadata: { a: "n".repeat(300) } });
+    db.prepare("UPDATE record_change_bases SET content = X'00ff00ff'").run();
+    as({ id: "ws_badbase03" });
+    await store.updateNote(n.id, { metadata: { a: "o".repeat(300) } });
+    expect(JSON.parse(JSON.parse(setRecordStates(db, "ws_badbase03")[0]!.before_row!).metadata).a).toBe("n".repeat(300));
+    expect((db.prepare("SELECT COUNT(*) AS n FROM record_change_bases").get() as { n: number }).n).toBe(2);
+  });
+
   test("a snapshot written as text (an older engine's row) still reads", async () => {
     const { db, store, as } = fresh();
     as({ id: "ws_oldtext01" });
@@ -445,7 +458,7 @@ describe("change log: an older engine's vault", () => {
     let db = new Database(file);
     new SqliteStore(db);
     for (const t of ["rc_notes_insert", "rc_notes_update", "rc_notes_delete", "rc_note_tags_insert", "rc_note_tags_delete", "rc_note_tags_update", "rc_links_insert", "rc_links_delete", "rc_links_update"]) db.exec(`DROP TRIGGER ${t}`);
-    for (const t of ["record_changes", "record_change_bodies", "write_sets", "write_context", "change_log_state"]) db.exec(`DROP TABLE ${t}`);
+    for (const t of ["record_changes", "record_change_bodies", "record_change_bases", "write_sets", "write_context", "change_log_state"]) db.exec(`DROP TABLE ${t}`);
     for (const c of ["write_set", "types", "tags", "links"]) db.exec(`ALTER TABLE note_versions DROP COLUMN ${c}`);
     db.query("INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)").run(SCHEMA_VERSION, "2999-01-01T00:00:00.000Z");
     db.close();
