@@ -1613,6 +1613,28 @@
    "removed_in": null,
    "state": "live",
    "release": "0.9.4"
+  },
+  {
+   "kind": "endpoint",
+   "old": "(none) a reader found changes by polling GET /api/notes?cursor= or since and re-reading records",
+   "new": "GET /vault/<n>/api/feed?reader=<name>&limit=&ack=<position>: the changes after the reader's held position, each record once at its newest change (upsert with the record in record words, delete, or removed for a tag-scoped key), with position, next_position and more. 410 feed_position_expired past the change log's horizon",
+   "action": "keep",
+   "reason": "additive (0.9.4): the feed replaces change polling for readers that want changes; ?cursor= and since are unchanged",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live",
+   "release": "0.9.4"
+  },
+  {
+   "kind": "endpoint",
+   "old": "(none)",
+   "new": "POST /vault/<n>/api/feed/position {reader, position}: commit a feed position (a number up to the newest, \"now\", or 0). Held per (key, reader); needs read only",
+   "action": "keep",
+   "reason": "additive (0.9.4): a read never moves the position, so a reader that stops before committing reads the same page again",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live",
+   "release": "0.9.4"
   }
  ]
 }

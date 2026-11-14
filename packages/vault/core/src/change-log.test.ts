@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { SqliteStore } from "./store.ts";
 import { SCHEMA_VERSION } from "./schema.ts";
 import { pruneChangeLog, writeSetRecords } from "./change-log.ts";
+import { FEED_TRIGGERS } from "./feed.ts";
 
 function fresh() {
   const db = new Database(":memory:");
@@ -95,6 +96,9 @@ describe("change log: an older engine's vault", () => {
     const file = join(mkdtempSync(join(tmpdir(), "changelog-")), "v.db");
     let db = new Database(file);
     new SqliteStore(db);
+    // A 0.9.3 vault has neither the change log nor the feed that rides on it (feed.ts).
+    for (const t of FEED_TRIGGERS) db.exec(`DROP TRIGGER ${t}`);
+    for (const t of ["feed_readers", "feed_state"]) db.exec(`DROP TABLE ${t}`);
     for (const t of ["rc_notes_insert", "rc_notes_update", "rc_notes_delete", "rc_note_tags_insert", "rc_note_tags_delete", "rc_note_tags_update", "rc_links_insert", "rc_links_delete", "rc_links_update"]) db.exec(`DROP TRIGGER ${t}`);
     for (const t of ["record_changes", "write_sets", "write_context"]) db.exec(`DROP TABLE ${t}`);
     for (const c of ["write_set", "types", "tags", "links"]) db.exec(`ALTER TABLE note_versions DROP COLUMN ${c}`);

@@ -3264,56 +3264,8 @@ async function handleNotesInner(
     if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
       return json({ error: "Not found", error_type: "not_found" }, 404);
     }
-    const includeContent = parseBool(parseQuery(url, "include_content"), true);
-    const contentRange = parseContentRangeQuery(url, includeContent);
-    if (contentRange.error) return contentRange.error;
-    let result: any = includeContent ? { ...note } : toNoteIndex(note);
-    // Tag-scope (vault#568): filter `.tags` to the in-scope subset. Placed
-    // before the validation_status block on purpose — that block reads
-    // `note.tags` (the full set) to COMPUTE the status and then scrubs the
-    // status itself, so the two scrubs are independent.
-    result = scrubNoteTagsByScope(result, tagScope.allowed, tagScope.raw);
-    // vault#555 fix 3 — mirror the MCP query-notes fix: attach
-    // validation_status on reads too, not just on the one-time create/update
-    // write response. See core/src/mcp.ts's query-notes handler for the
-    // full rationale. Scrubbed for a tag-scoped caller (vault#555 auth
-    // review) so an out-of-scope co-tag's schema shape doesn't leak — no-op
-    // for unscoped callers (tagScope.raw === null).
-    {
-      const status = scrubValidationStatusByScope(
-        store.validateNoteAgainstSchemas({
-          path: note.path,
-          tags: note.tags,
-          metadata: note.metadata as Record<string, unknown> | undefined,
-        }, vis(tagScope)),
-        tagScope.allowed,
-        tagScope.raw,
-      );
-      if (status) result.validation_status = status;
-    }
-    const expand = parseExpandParams(url, db, tagScope);
-    if (expand && includeContent && typeof result.content === "string") {
-      expand.ctx.expanded.add(note.id);
-      result.content = expandContent(result.content, expand.ctx, expand.depth);
-    }
-    // Content range applies to the FINAL returned content (post-expansion).
-    if (contentRange.range && includeContent) applyContentRange(result, contentRange.range);
-    result = filterMetadata(result, parseIncludeMetadata(url));
-    if (parseBool(parseQuery(url, "include_links"), false)) {
-      // Tag-scope: drop out-of-scope-neighbor links (no-op unscoped).
-      result.links = filterHydratedLinksByTagScope(
-        linkOps.getLinksHydrated(db, note.id),
-        tagScope.allowed,
-        tagScope.raw,
-      );
-    }
-    if (parseBool(parseQuery(url, "include_attachments"), false)) {
-      result.attachments = await store.getAttachments(note.id);
-    }
-    if (parseBool(parseQuery(url, "include_link_count"), false)) {
-      result.linkCount = linkOps.getLinkCounts(db, [note.id], parseLinkCountDirection(url), ambiguityVisibilityFor(db, tagScope)).get(note.id) ?? 0;
-    }
-    return json(result);
+    const out = await noteReadAnswer(store, note, url, tagScope);
+    return out instanceof Response ? out : json(out);
   }
 
   // PATCH /notes/:idOrPath — update (content, path, metadata, tags, links)
@@ -5798,3 +5750,62 @@ function retypeConflictResponse(tag: string, conflicts: RetypeConflict[], scoped
   );
 }
 
+/**
+ * One note as `GET /notes/:idOrPath` answers it, for a caller already shown it is in scope: the read options in `url`
+ * (`include_content`, a content range, `expand`, `include_metadata`, `include_links`, …), tags scrubbed to the
+ * caller's scope, validation status. A Response when the options are refused. The feed (0.9.4) renders each upsert
+ * with this, then in record words, so it is byte for byte what `GET /api/records/<id>` would answer.
+ */
+export async function noteReadAnswer(store: Store, note: Note, url: URL, tagScope: TagScopeCtx): Promise<Response | Record<string, unknown>> {
+  const db = store.db;
+  const includeContent = parseBool(parseQuery(url, "include_content"), true);
+  const contentRange = parseContentRangeQuery(url, includeContent);
+  if (contentRange.error) return contentRange.error;
+  let result: any = includeContent ? { ...note } : toNoteIndex(note);
+  // Tag-scope (vault#568): filter `.tags` to the in-scope subset. Placed
+  // before the validation_status block on purpose — that block reads
+  // `note.tags` (the full set) to COMPUTE the status and then scrubs the
+  // status itself, so the two scrubs are independent.
+  result = scrubNoteTagsByScope(result, tagScope.allowed, tagScope.raw);
+  // vault#555 fix 3 — mirror the MCP query-notes fix: attach
+  // validation_status on reads too, not just on the one-time create/update
+  // write response. See core/src/mcp.ts's query-notes handler for the
+  // full rationale. Scrubbed for a tag-scoped caller (vault#555 auth
+  // review) so an out-of-scope co-tag's schema shape doesn't leak — no-op
+  // for unscoped callers (tagScope.raw === null).
+  {
+    const status = scrubValidationStatusByScope(
+      store.validateNoteAgainstSchemas({
+        path: note.path,
+        tags: note.tags,
+        metadata: note.metadata as Record<string, unknown> | undefined,
+      }, vis(tagScope)),
+      tagScope.allowed,
+      tagScope.raw,
+    );
+    if (status) result.validation_status = status;
+  }
+  const expand = parseExpandParams(url, db, tagScope);
+  if (expand && includeContent && typeof result.content === "string") {
+    expand.ctx.expanded.add(note.id);
+    result.content = expandContent(result.content, expand.ctx, expand.depth);
+  }
+  // Content range applies to the FINAL returned content (post-expansion).
+  if (contentRange.range && includeContent) applyContentRange(result, contentRange.range);
+  result = filterMetadata(result, parseIncludeMetadata(url));
+  if (parseBool(parseQuery(url, "include_links"), false)) {
+    // Tag-scope: drop out-of-scope-neighbor links (no-op unscoped).
+    result.links = filterHydratedLinksByTagScope(
+      linkOps.getLinksHydrated(db, note.id),
+      tagScope.allowed,
+      tagScope.raw,
+    );
+  }
+  if (parseBool(parseQuery(url, "include_attachments"), false)) {
+    result.attachments = await store.getAttachments(note.id);
+  }
+  if (parseBool(parseQuery(url, "include_link_count"), false)) {
+    result.linkCount = linkOps.getLinkCounts(db, [note.id], parseLinkCountDirection(url), ambiguityVisibilityFor(db, tagScope)).get(note.id) ?? 0;
+  }
+  return result;
+}

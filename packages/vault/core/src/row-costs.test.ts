@@ -255,8 +255,8 @@ describe("v5 and v18 against each state of the path indexes", () => {
 /** sha256 of SCHEMA_SQL as of SCHEMA_VERSION 32 with T-412 (idx_notes_path left out of it) and 0.9's `kind` on tags, 0.9.1's `via_kind` on revisions, 0.9.3's field values in search (notes_fts_source, notes_field_text, three-column notes_fts; its insert trigger clears a leftover field-text row). */
 const SCHEMA_SQL_HASH_AT_32 = "303461b150891f04e27e0ba7aa5651109df704ed42707956f043ae5c3e26cb67";
 
-/** sha256 of initSchema's code and its fast-path check (comments and spacing left out) as of SCHEMA_VERSION 32 with T-412, 0.9's ensureTagKinds 0.9.1's ensureRevisionKeyKind and 0.9.2's ensureFtsFields, T-460's open-as-is of a newer readable schema, and 0.9.4's ensureRevisionWriteSet and ensureChangeLogStep (the change log). */
-const INIT_SCHEMA_HASH_AT_32 = "4ab7dc27a0ff957d6903f213036a27066a1e20a810cfd0fc06c606a3b8c4c894";
+/** sha256 of initSchema's code and its fast-path check (comments and spacing left out) as of SCHEMA_VERSION 32 with T-412, 0.9's ensureTagKinds 0.9.1's ensureRevisionKeyKind and 0.9.2's ensureFtsFields, T-460's open-as-is of a newer readable schema, and 0.9.4's ensureRevisionWriteSet, ensureChangeLogStep (the change log) and ensureFeedStep (the feed's reader positions, horizon and feed_seq; an additive step, no schema number). */
+const INIT_SCHEMA_HASH_AT_32 = "9b072548f4ee26832dec82faf5546f99d73e7f7debba67c0ecc156d58e6c86c3";
 
 describe("the fast path's promise", () => {
   // initSchema skips SCHEMA_SQL and every migration on a vault stamped SCHEMA_VERSION (with the path index). So a

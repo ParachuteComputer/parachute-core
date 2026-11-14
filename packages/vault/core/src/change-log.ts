@@ -346,9 +346,22 @@ export function pruneChangeLog(db: Database, days: number, now = new Date()): { 
   // seq follows time (one writer at a time), so the rows past the horizon are a prefix of seq: found from the newest
   // end, with no index on at.
   const last = db.prepare("SELECT seq FROM record_changes WHERE at < ? ORDER BY seq DESC LIMIT 1").get(cutoff) as { seq: number } | null;
-  const changes = last ? db.prepare("DELETE FROM record_changes WHERE seq <= ?").run(last.seq).changes : 0;
-  const sets = db.prepare("DELETE FROM write_sets WHERE at < ? AND NOT EXISTS (SELECT 1 FROM record_changes rc WHERE rc.write_set = write_sets.id)").run(cutoff).changes;
-  return { changes, sets };
+  return db.transaction(() => {
+    let changes = 0;
+    if (last) {
+      // The feed's horizon (feed.ts): the highest feed position dropped, kept in the same step, so a reader holding a
+      // position below it is told it may have missed changes rather than silently skipping them. A row's feed
+      // position can be above its seq (its set touched the record again later), so it is the largest of the prefix's.
+      if (db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'feed_state'").get()) {
+        db.prepare(
+          "UPDATE feed_state SET horizon = MAX(horizon, COALESCE((SELECT MAX(COALESCE(feed_seq, seq)) FROM record_changes WHERE seq <= ?), 0)) WHERE slot = 1",
+        ).run(last.seq);
+      }
+      changes = db.prepare("DELETE FROM record_changes WHERE seq <= ?").run(last.seq).changes;
+    }
+    const sets = db.prepare("DELETE FROM write_sets WHERE at < ? AND NOT EXISTS (SELECT 1 FROM record_changes rc WHERE rc.write_set = write_sets.id)").run(cutoff).changes;
+    return { changes, sets };
+  })();
 }
 
 /** Normalises a `why`: trimmed, at most WHY_MAX_CHARS characters, null when empty. Throws on a non-string. */
