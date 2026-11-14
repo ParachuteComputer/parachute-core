@@ -2437,6 +2437,55 @@ function searchVisibleOnly(
 }
 
 /**
+ * The best `limit` of a stream of scored notes, held in a bounded min-heap (T-463), so a meaning search keeps
+ * `limit` scores rather than one per candidate. `ranked()` is score descending, ties by `at` (the candidate's
+ * position) ascending: the order a stable descending sort of every score gives. A `limit` that isn't a finite
+ * non-negative number keeps everything, and the caller's `slice(0, limit)` then does what it always did.
+ */
+class TopScores {
+  private readonly k: number;
+  private readonly heap: { id: string; score: number; at: number }[] = [];
+  constructor(limit: number) {
+    this.k = Number.isFinite(limit) && limit >= 0 ? Math.trunc(limit) : Infinity;
+  }
+  /** Whether `a` ranks below `b`. */
+  private static worse(a: { score: number; at: number }, b: { score: number; at: number }): boolean {
+    return a.score < b.score || (a.score === b.score && a.at > b.at);
+  }
+  offer(id: string, score: number, at: number): void {
+    const h = this.heap;
+    const item = { id, score, at };
+    if (h.length < this.k) {
+      h.push(item);
+      let i = h.length - 1;
+      while (i > 0) {
+        const p = (i - 1) >> 1;
+        if (!TopScores.worse(h[i]!, h[p]!)) break;
+        [h[i], h[p]] = [h[p]!, h[i]!];
+        i = p;
+      }
+      return;
+    }
+    if (h.length === 0 || !TopScores.worse(h[0]!, item)) return;
+    h[0] = item;
+    let i = 0;
+    for (;;) {
+      const l = 2 * i + 1;
+      const r = l + 1;
+      let m = i;
+      if (l < h.length && TopScores.worse(h[l]!, h[m]!)) m = l;
+      if (r < h.length && TopScores.worse(h[r]!, h[m]!)) m = r;
+      if (m === i) break;
+      [h[i], h[m]] = [h[m]!, h[i]!];
+      i = m;
+    }
+  }
+  ranked(): { id: string; score: number }[] {
+    return [...this.heap].sort((a, b) => b.score - a.score || a.at - b.at);
+  }
+}
+
+/**
  * Semantic-search scan (EXPERIMENTAL — `SEMANTIC-MVP-PLAN.md`). Structural
  * sibling of `searchNotes`: text-shaped filters compose the same way, but
  * ranking is cosine similarity over `note_vectors` instead of FTS5 bm25.
@@ -2496,52 +2545,47 @@ export function semanticSearchNotes(
     return { notes: [], pendingCount: 0, totalCandidates: 0 };
   }
 
-  // Pull every candidate's vector rows for the ACTIVE model, batched to
-  // stay under the DO 100-bound-param cap (same chunking `fetchNotesByIdsOrdered`
-  // uses). A note absent from this map has no fresh vector yet — pending.
+  // Read the candidates' vector rows for the ACTIVE model in batches of ids, staying under the DO 100-bound-param cap
+  // (same chunking `fetchNotesByIdsOrdered` uses), and score each batch as it is read: only one batch of vectors and
+  // the best `limit` scores are held at once, never every candidate's vectors (T-463: 24,000 notes of 1024-dim vectors
+  // were ~98 MB against a Durable Object's 128 MB). A note with no row here has no fresh vector yet — pending.
   // `+model` keeps SQLite on the primary key (note_id, chunk_ix): bare `model = ?` lets it pick
   // idx_note_vectors_stale (model, content_hash), which walks EVERY vector of the model once per batch, so a
-  // question read N × N/90 rows (1.1 M at 10,000 notes on Cloud). Guarded by row-costs.test.ts (T-463).
-  const vecRowsByNote = new Map<string, { chunk_ix: number; vector: Uint8Array }[]>();
+  // question read N × N/90 rows (1.1 M at 10,000 notes on Cloud). Both guarded by row-costs.test.ts (T-463).
+  //
+  // Ranking is best-CHUNK-per-note (max cosine over the note's chunks): a long note whose 3rd section matches
+  // outranks a note with weak whole-note similarity, the point of per-section chunking. A note's chunks all come in
+  // its own batch. Order is score descending, ties in candidate order, exactly what a stable sort of every score gave.
+  const top = new TopScores(limit);
+  let embedded = 0;
+  let at = 0;
   for (const idChunk of chunkForInClause(candidateIds)) {
     const placeholders = idChunk.map(() => "?").join(", ");
     const rows = db.prepare(
       `SELECT note_id, chunk_ix, vector FROM note_vectors WHERE +model = ? AND note_id IN (${placeholders})`,
     ).all(model, ...idChunk) as { note_id: string; chunk_ix: number; vector: Uint8Array }[];
-    for (const row of rows) {
-      let list = vecRowsByNote.get(row.note_id);
-      if (!list) {
-        list = [];
-        vecRowsByNote.set(row.note_id, list);
-      }
-      list.push(row);
-    }
-  }
-
-  // Best-chunk-per-note cosine (max over the note's chunks) — a long note
-  // whose 3rd section matches outranks a note with weak whole-note
-  // similarity, which is the whole point of per-section chunking.
-  const scored: { id: string; score: number }[] = [];
-  for (const id of candidateIds) {
-    const rows = vecRowsByNote.get(id);
-    if (!rows || rows.length === 0) continue;
-    let best = -Infinity;
+    const best = new Map<string, number>();
     for (const row of rows) {
       const score = dot(decodeVector(row.vector), queryVector);
-      if (score > best) best = score;
+      const prev = best.get(row.note_id);
+      if (prev === undefined || score > prev) best.set(row.note_id, score);
     }
-    scored.push({ id, score: best });
+    embedded += best.size;
+    for (const id of idChunk) {
+      const score = best.get(id);
+      if (score !== undefined) top.offer(id, score, at);
+      at++;
+    }
   }
-  scored.sort((a, b) => b.score - a.score);
-  const top = scored.slice(0, limit);
+  const ranked = top.ranked().slice(0, limit);
 
   // Reuse the existing hydration machinery — same as every other id-list
   // fetch path (tags batched, no N+1).
-  const hydrated = fetchNotesByIdsOrdered(db, top.map((t) => t.id));
+  const hydrated = fetchNotesByIdsOrdered(db, ranked.map((t) => t.id));
   const byId = new Map(hydrated.map((n) => [n.id, n]));
-  const scoreById = new Map(top.map((t) => [t.id, t.score]));
+  const scoreById = new Map(ranked.map((t) => [t.id, t.score]));
   const notes: Note[] = [];
-  for (const t of top) {
+  for (const t of ranked) {
     const note = byId.get(t.id);
     if (!note) continue; // defensive: row vanished between the two queries
     note.score = scoreById.get(t.id);
@@ -2550,7 +2594,7 @@ export function semanticSearchNotes(
 
   return {
     notes,
-    pendingCount: candidateIds.length - vecRowsByNote.size,
+    pendingCount: candidateIds.length - embedded,
     totalCandidates: candidateIds.length,
   };
 }
