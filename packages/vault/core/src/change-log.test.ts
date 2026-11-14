@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { SqliteStore } from "./store.ts";
 import { SCHEMA_VERSION } from "./schema.ts";
-import { pruneChangeLog, setRecordStates, writeSetRecords } from "./change-log.ts";
+import { encodeSnapshot, forgetLoggedPast, pruneChangeLog, setRecordStates, snapshotText, writeSetRecords } from "./change-log.ts";
 import { readBlobText } from "./history.ts";
 
 function fresh() {
@@ -169,6 +169,223 @@ describe("change log: positions and what history keeps", () => {
     expect(JSON.parse(row().before_links)).toEqual([{ target: target.id, relationship: "cites", metadata: {} }]);
   });
 
+  test("field snapshots are stored compressed and read back as the same text", async () => {
+    const { db, store, as } = fresh();
+    as({ id: "ws_seedz0001" });
+    const target = await store.createNote("t", { path: "target" });
+    const big = { summary: "a field long enough to compress ".repeat(12), status: "open", owner: "someone" };
+    const n = await store.createNote("body", { path: "zipped", tags: ["a"], metadata: big });
+    for (let i = 0; i < 6; i++) await store.createLink(n.id, target.id, `cites-${i}`);
+    const small = await store.createNote("s", { path: "s", metadata: { k: 1 } });
+    // What the triggers would have written as text, read before the set changes anything.
+    const rowText = db.prepare("SELECT json_object('path', path, 'extension', extension, 'metadata', metadata, 'created_at', created_at, 'created_by', created_by, 'created_via', created_via) AS j FROM notes WHERE id = ?");
+    const want = (rowText.get(n.id) as { j: string }).j;
+    const wantSmall = (rowText.get(small.id) as { j: string }).j;
+    as({ id: "ws_zipped001" });
+    await store.updateNote(n.id, { metadata: { ...big, status: "done" } });
+    await store.deleteLink(n.id, target.id, "cites-0");
+    await store.updateNote(small.id, { metadata: { k: 2 } });
+    const stored = db
+      .prepare("SELECT note_id, typeof(before_row) AS row_type, length(before_row) AS row_len, typeof(before_links) AS links_type FROM record_changes WHERE write_set = 'ws_zipped001' ORDER BY seq")
+      .all() as { note_id: string; row_type: string; row_len: number; links_type: string }[];
+    // Each request of the set is its own transaction: the fields' row, then the links' row.
+    const [fieldsRow, linksRow] = stored.filter((r) => r.note_id === n.id);
+    expect(fieldsRow!.row_type).toBe("blob");
+    expect(fieldsRow!.row_len).toBeLessThan(Buffer.byteLength(want));
+    expect(linksRow!.links_type).toBe("blob");
+    // Under 128 bytes, deflate gains little: kept as text.
+    expect(encodeSnapshot('{"path":"s"}')).toBe('{"path":"s"}');
+    const states = new Map(setRecordStates(db, "ws_zipped001").map((r) => [r.note_id, r]));
+    expect(states.get(n.id)!.before_row).toBe(want);
+    expect(JSON.parse(states.get(n.id)!.before_links!)).toHaveLength(6);
+    expect(states.get(small.id)!.before_row).toBe(wantSmall);
+  });
+
+  test("a record's later snapshots are deltas against one whole base; each reads back as the text the trigger wrote", async () => {
+    const { db, store, as } = fresh();
+    as({ id: "ws_dseed00001" });
+    // Text deflate can't shrink much on its own (as a real record's fields), the same on every write.
+    const prose = Array.from({ length: 90 }, (_, k) => ((k * 7919) % 104729).toString(36)).join(" ");
+    const fields = (i: number) => ({ summary: prose, step: i, status: i % 2 ? "open" : "done" });
+    const n = await store.createNote("b", { path: "deltas", metadata: fields(0) });
+    const rowText = db.prepare("SELECT json_object('path', path, 'extension', extension, 'metadata', metadata, 'created_at', created_at, 'created_by', created_by, 'created_via', created_via) AS j FROM notes WHERE id = ?");
+    const want: string[] = [];
+    for (let i = 1; i <= 8; i++) {
+      want.push((rowText.get(n.id) as { j: string }).j);
+      as({ id: `ws_delta0000${i}` });
+      await store.updateNote(n.id, { metadata: fields(i) });
+    }
+    const stored = db.prepare("SELECT before_base, length(before_row) AS len FROM record_changes WHERE write_set LIKE 'ws_delta%' ORDER BY seq").all() as { before_base: number; len: number }[];
+    expect(new Set(stored.map((r) => r.before_base)).size).toBe(1); // one base serves them all
+    expect((db.prepare("SELECT COUNT(*) AS n FROM record_change_bases").get() as { n: number }).n).toBe(1);
+    for (const r of stored) expect(r.len).toBeLessThan(60); // a few dozen bytes, not the ~600 of the text
+    for (let i = 1; i <= 8; i++) expect(setRecordStates(db, `ws_delta0000${i}`)[0]!.before_row).toBe(want[i - 1]);
+  });
+
+  test("a base serves at most 16 rows, so the sweep never has many to re-encode", async () => {
+    const { db, store, as } = fresh();
+    const prose = Array.from({ length: 90 }, (_, k) => ((k * 7919) % 104729).toString(36)).join(" ");
+    as({ id: "ws_uses00000" });
+    const n = await store.createNote("b", { path: "uses", metadata: { summary: prose, step: 0 } });
+    for (let i = 1; i <= 40; i++) {
+      as({ id: `ws_uses${String(i).padStart(5, "0")}` });
+      await store.updateNote(n.id, { metadata: { summary: prose, step: i } });
+    }
+    const per = db.prepare("SELECT before_base AS b, COUNT(*) AS n FROM record_changes WHERE before_base IS NOT NULL GROUP BY 1").all() as { b: number; n: number }[];
+    expect(per.length).toBe(3);
+    expect(Math.max(...per.map((r) => r.n))).toBe(16);
+  });
+
+  test("a snapshot that drifted from its base becomes the record's new base", async () => {
+    const { db, store, as } = fresh();
+    as({ id: "ws_drift0001" });
+    const n = await store.createNote("b", { path: "drift", metadata: { a: "x".repeat(400) } });
+    as({ id: "ws_drift0002" });
+    await store.updateNote(n.id, { metadata: { b: "lorem ipsum dolor sit amet, consectetur ".repeat(20) } });
+    as({ id: "ws_drift0003" });
+    await store.updateNote(n.id, { metadata: { c: 1 } });
+    const bases = db.prepare("SELECT before_base FROM record_changes WHERE write_set IN ('ws_drift0002', 'ws_drift0003') ORDER BY seq").all() as { before_base: number }[];
+    expect(bases[0]!.before_base).not.toBe(bases[1]!.before_base);
+    expect(JSON.parse(setRecordStates(db, "ws_drift0003")[0]!.before_row!).metadata).toContain("lorem ipsum");
+  });
+
+  test("the sweep keeps no snapshot past the horizon in a base: rows still naming one are re-based; erasing a record's history frees its bases", async () => {
+    const { db, store, as } = fresh();
+    const prose = Array.from({ length: 90 }, (_, k) => ((k * 7919) % 104729).toString(36)).join(" ");
+    const fields = (i: number) => ({ summary: prose, step: i, ...(i === 0 ? { gone: "only-before-the-horizon" } : {}) });
+    as({ id: "ws_sweep0000" });
+    const n = await store.createNote("b", { path: "sweep", metadata: fields(0) });
+    const other = await store.createNote("o", { path: "other", metadata: fields(0) });
+    for (let i = 1; i <= 4; i++) {
+      as({ id: `ws_sweep000${i}` });
+      await store.updateNote(n.id, { metadata: fields(i) });
+      await store.updateNote(other.id, { metadata: fields(i) });
+    }
+    const baseOf = (set: string, id: string) => (db.prepare("SELECT before_base AS b FROM record_changes WHERE write_set = ? AND note_id = ?").get(set, id) as { b: number }).b;
+    const base = baseOf("ws_sweep0001", n.id);
+    expect(baseOf("ws_sweep0004", n.id)).toBe(base);
+    const before = setRecordStates(db, "ws_sweep0004").map((r) => r.before_row);
+    // The first two sets age past the horizon: the row the base was made of goes, and later rows still name the base.
+    db.prepare("UPDATE record_changes SET at = '2000-01-01T00:00:00.000Z' WHERE write_set IN ('ws_sweep0000', 'ws_sweep0001', 'ws_sweep0002')").run();
+    db.prepare("UPDATE write_sets SET at = '2000-01-01T00:00:00.000Z' WHERE id IN ('ws_sweep0000', 'ws_sweep0001', 'ws_sweep0002')").run();
+    pruneChangeLog(db, 30);
+    // The old base is gone; what the remaining rows read is unchanged; no base holds the value only the swept rows had.
+    expect(db.prepare("SELECT id FROM record_change_bases WHERE id = ?").get(base)).toBeNull();
+    expect(setRecordStates(db, "ws_sweep0004").map((r) => r.before_row)).toEqual(before);
+    expect(JSON.parse(JSON.parse(before[0]!).metadata).step).toBe(3);
+    const bases = db.prepare("SELECT content FROM record_change_bases").all() as { content: Uint8Array | string }[];
+    expect(bases.length).toBeGreaterThan(0);
+    for (const b of bases) expect(snapshotText(b.content)).not.toContain("only-before-the-horizon");
+    // Every row past the horizon: the bases go too.
+    pruneChangeLog(db, 1, new Date(Date.now() + 3 * 86_400_000));
+    expect((db.prepare("SELECT COUNT(*) AS n FROM record_change_bases").get() as { n: number }).n).toBe(0);
+    // Erasing a record's history takes its bases with it, and leaves another record's.
+    as({ id: "ws_sweep0005" });
+    await store.updateNote(n.id, { metadata: fields(5) });
+    await store.updateNote(other.id, { metadata: fields(5) });
+    expect((db.prepare("SELECT COUNT(*) AS n FROM record_change_bases").get() as { n: number }).n).toBe(2);
+    forgetLoggedPast(db, n.id);
+    expect(db.prepare("SELECT note_id FROM record_change_bases").all()).toEqual([{ note_id: other.id }]);
+  });
+
+  test("a log made by an earlier 0.9.4 build gets the bases table and column on open", async () => {
+    const db = new Database(":memory:");
+    new SqliteStore(db);
+    db.exec("DROP INDEX idx_record_change_bases_note; DROP TABLE record_change_bases; ALTER TABLE record_changes DROP COLUMN before_base;");
+    const store = new SqliteStore(db);
+    store.writeSetSource = () => ({ id: "ws_upgrade01" });
+    const n = await store.createNote("b", { path: "up", metadata: { a: "y".repeat(300) } });
+    store.writeSetSource = () => ({ id: "ws_upgrade02" });
+    await store.updateNote(n.id, { metadata: { a: "z" } });
+    expect(JSON.parse(JSON.parse(setRecordStates(db, "ws_upgrade02")[0]!.before_row!).metadata).a).toBe("y".repeat(300));
+  });
+
+  test("an upgrade cut short after the bases table, before the column, is finished at the next open", async () => {
+    const db = new Database(":memory:");
+    new SqliteStore(db);
+    db.exec("ALTER TABLE record_changes DROP COLUMN before_base;");
+    const store = new SqliteStore(db);
+    store.writeSetSource = () => ({ id: "ws_cutshort1" });
+    const n = await store.createNote("b", { path: "cut", metadata: { a: "y".repeat(300) } });
+    store.writeSetSource = () => ({ id: "ws_cutshort2" });
+    await store.updateNote(n.id, { metadata: { a: "z" } });
+    expect(JSON.parse(JSON.parse(setRecordStates(db, "ws_cutshort2")[0]!.before_row!).metadata).a).toBe("y".repeat(300));
+  });
+
+  test("a compressed row settled again keeps the base it names", async () => {
+    const { db, store, as } = fresh();
+    as({ id: "ws_again0001" });
+    const n = await store.createNote("b", { path: "again", metadata: { a: "q".repeat(300) } });
+    as({ id: "ws_again0002" });
+    await store.updateNote(n.id, { metadata: { a: "r" } });
+    const want = setRecordStates(db, "ws_again0002")[0]!.before_row;
+    // As if the row were touched again: long links text to compress, its fields already a delta.
+    db.prepare("UPDATE record_changes SET touched = 1, before_links = ? WHERE write_set = 'ws_again0002'").run(JSON.stringify([{ target: "x".repeat(200) }]));
+    as({ id: "ws_again0003" });
+    await store.createNote("c", { path: "other" });
+    expect(setRecordStates(db, "ws_again0002")[0]!.before_row).toBe(want);
+  });
+
+  test("a damaged snapshot reads as not kept, never as a later row's; the sweep still runs past it", async () => {
+    const { db, store, as } = fresh();
+    as({ id: "ws_dmgseed01" });
+    const n = await store.createNote("b", { path: "dmg", metadata: { a: "p".repeat(300) } });
+    const other = await store.createNote("o", { path: "dmg-other", metadata: { a: "o".repeat(300) } });
+    // A set whose rows make both records' bases, which the damaged set's rows then name.
+    as({ id: "ws_dmgpre001" });
+    await store.updateNote(n.id, { metadata: { a: "p".repeat(299) } });
+    await store.updateNote(other.id, { metadata: { a: "o".repeat(299) } });
+    // One set over two requests: the first row holds the set's before, the second the record part-way through.
+    as({ id: "ws_damaged01" });
+    await store.updateNote(n.id, { metadata: { a: "q".repeat(300) } });
+    await store.updateNote(n.id, { metadata: { a: "r".repeat(300) } });
+    await store.updateNote(other.id, { metadata: { a: "s" } });
+    const [first] = db.prepare("SELECT seq FROM record_changes WHERE write_set = 'ws_damaged01' AND note_id = ? ORDER BY seq").all(n.id) as { seq: number }[];
+    db.prepare("UPDATE record_changes SET before_row = X'00ff00ff' WHERE seq = ?").run(first!.seq);
+    const warn = console.warn;
+    console.warn = () => {};
+    try {
+      const states = new Map(setRecordStates(db, "ws_damaged01").map((r) => [r.note_id, r]));
+      expect(states.get(n.id)!.before_row).toBeNull();
+      expect(JSON.parse(JSON.parse(states.get(other.id)!.before_row!).metadata).a).toBe("o".repeat(299));
+      // The sets that made the bases age past the horizon: the sweep re-bases the other record, leaves the damaged one
+      // as it is, and finishes.
+      const named = (id: string) => (db.prepare("SELECT before_base AS b FROM record_changes WHERE write_set = 'ws_damaged01' AND note_id = ? ORDER BY seq DESC").get(id) as { b: number }).b;
+      const otherBase = named(other.id);
+      db.prepare("UPDATE record_changes SET at = '2000-01-01T00:00:00.000Z' WHERE write_set IN ('ws_dmgseed01', 'ws_dmgpre001')").run();
+      db.prepare("UPDATE write_sets SET at = '2000-01-01T00:00:00.000Z' WHERE id IN ('ws_dmgseed01', 'ws_dmgpre001')").run();
+      expect(pruneChangeLog(db, 30).changes).toBe(4);
+      expect(named(other.id)).not.toBe(otherBase);
+      expect(JSON.parse(JSON.parse(setRecordStates(db, "ws_damaged01").find((r) => r.note_id === other.id)!.before_row!).metadata).a).toBe("o".repeat(299));
+    } finally {
+      console.warn = warn;
+    }
+  });
+
+  test("a damaged base never fails a write: the record's next row makes a new one", async () => {
+    const { db, store, as } = fresh();
+    as({ id: "ws_badbase01" });
+    const n = await store.createNote("b", { path: "badbase", metadata: { a: "m".repeat(300) } });
+    as({ id: "ws_badbase02" });
+    await store.updateNote(n.id, { metadata: { a: "n".repeat(300) } });
+    db.prepare("UPDATE record_change_bases SET content = X'00ff00ff'").run();
+    as({ id: "ws_badbase03" });
+    await store.updateNote(n.id, { metadata: { a: "o".repeat(300) } });
+    expect(JSON.parse(JSON.parse(setRecordStates(db, "ws_badbase03")[0]!.before_row!).metadata).a).toBe("n".repeat(300));
+    expect((db.prepare("SELECT COUNT(*) AS n FROM record_change_bases").get() as { n: number }).n).toBe(2);
+  });
+
+  test("a snapshot written as text (an older engine's row) still reads", async () => {
+    const { db, store, as } = fresh();
+    as({ id: "ws_oldtext01" });
+    const n = await store.createNote("b", { path: "old", metadata: { k: 1 } });
+    as({ id: "ws_oldtext02" });
+    await store.updateNote(n.id, { metadata: { k: 2 } });
+    const text = JSON.stringify({ path: "old", metadata: "x".repeat(500) });
+    db.prepare("UPDATE record_changes SET before_row = ?, before_base = NULL WHERE write_set = 'ws_oldtext02'").run(text);
+    expect(setRecordStates(db, "ws_oldtext02")[0]!.before_row).toBe(text);
+  });
+
   test("with history off the log keeps no old bodies; an import keeps none either", async () => {
     const db = new Database(":memory:");
     const off = new SqliteStore(db, { history: { enabled: false } });
@@ -241,7 +458,7 @@ describe("change log: an older engine's vault", () => {
     let db = new Database(file);
     new SqliteStore(db);
     for (const t of ["rc_notes_insert", "rc_notes_update", "rc_notes_delete", "rc_note_tags_insert", "rc_note_tags_delete", "rc_note_tags_update", "rc_links_insert", "rc_links_delete", "rc_links_update"]) db.exec(`DROP TRIGGER ${t}`);
-    for (const t of ["record_changes", "record_change_bodies", "write_sets", "write_context", "change_log_state"]) db.exec(`DROP TABLE ${t}`);
+    for (const t of ["record_changes", "record_change_bodies", "record_change_bases", "write_sets", "write_context", "change_log_state"]) db.exec(`DROP TABLE ${t}`);
     for (const c of ["write_set", "types", "tags", "links"]) db.exec(`ALTER TABLE note_versions DROP COLUMN ${c}`);
     db.query("INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)").run(SCHEMA_VERSION, "2999-01-01T00:00:00.000Z");
     db.close();
