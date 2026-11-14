@@ -74,7 +74,10 @@ home with data:
 
 **Never under a running server.** While a Parachute server holds the home's databases, the command that would take
 the step stops with exit 7 and changes nothing: a home is not recorded as moved while the older release still
-serves it. (`upgrade --check` is the way to try the step meanwhile.)
+serves it, and gets nothing from this one, not even a lock file. (`upgrade --check` is the way to try the step
+meanwhile.) `stop`, `restart`, `status` and `logs` still run from the newer release without taking the step: right
+after `parachute upgrade` installed it, the links name the newer release while the older server runs, and those
+are the commands that stop it. Its next start, as the newer release, takes the step.
 3. **A database that can't be read** is named on stderr, listed as `skipped` in the manifest and left out of the
    backup. Every readable one is still backed up first, and a restore leaves a skipped one where it is. The command
    then goes on and fails its own way if it needs the broken database (a vault that can't open stops `serve` with
@@ -97,7 +100,7 @@ Parachute), and a command waits while a backup or rollback runs. Once it holds t
 newer-data check (exit 6) again, because a newer release may have moved the home while it waited. Known limits: a
 command on a home that doesn't exist yet, or on a home the 0.7 programs still own (the takeover's), takes no lock.
 
-## Going back: `parachute upgrade --rollback [--restore] [--yes] [--json]`
+## Going back: `parachute upgrade --rollback [--restore [--forget-revocations]] [--yes] [--json]`
 
 - **Code-only (the default).** It checks that every database is at a number the previous release opens (the number
   it had in the backup) and that nothing holds the data (exit 7 names the pid). Then it changes nothing on disk,
@@ -115,10 +118,16 @@ command on a home that doesn't exist yet, or on a home the 0.7 programs still ow
      in place. Every command refuses a home left `restoring` until the restore is run again to finish.
 - **The links go back too.** Where 0.9 was installed beside the previous release by the versioned installer
   (`<prefix>/bin/parachute-core` → `../<version>/bin/…`), the rollback points `<prefix>/bin` at the previous copy
-  again, so the unit's next start runs it: nothing about the unit changes. Where no previous copy is kept (an npm
+  again, so a unit that runs `<prefix>/bin/parachute-core serve` (the takeover's unit) runs it at its next start,
+  unchanged. A unit that starts a fixed copy instead (`parachute init` writes
+  `ExecStart=<bun> <prefix>/.store/<version>-<id>/…`) does not follow the links: the rollback and `upgrade` name
+  such a unit and say what to set its ExecStart to. Run again on a home already rolled back, `--rollback` only
+  finishes the links if they couldn't be moved the first time. Links in `<prefix>/bin` that this installer didn't
+  make are never replaced. Where no previous copy is kept (an npm
   or bun install, an unpacked tarball), it says exactly what to reinstall. The contract goes through a unit
   (`lifecycle/upgrade-unit`): after `--rollback` and a restart the unit runs 0.8 and serves every record 0.9 wrote.
-- **0.9 refuses a rolled-back home.** Every 0.9 command, `serve` included, stops with exit 7 and opens nothing, so
+- **0.9 refuses a rolled-back home.** Every 0.9 command, `serve`, the host's `serve --embedded` and `bootstrap`,
+  and `config` included, stops with exit 7 and opens or writes nothing, so
   a unit still pointing at 0.9 can't move the home forward again at its next restart. The release the home was
   rolled back to serves it as its own.
 - **Forward again is `parachute upgrade`, run with 0.9** (`<prefix>/<version>/bin/parachute upgrade`): refused
@@ -134,7 +143,10 @@ With no service named, `upgrade` is this program's own (a module the hub install
   reaches the stable release when it ships. It never installs an older version.
   - Installed under a prefix: it downloads that version's bundle and `SHA256SUMS` from the GitHub release, checks
     the sum, and runs the new bundle's own `install --prefix`. The links switch; the old copy stays (the way
-    back). A wrong sum, or a release with no bundle yet, changes nothing.
+    back). A wrong sum, or a release with no bundle yet, installs nothing. The registry and the release host
+    must be https (loopback excepted). The sum guards the download's integrity; the bundle is not signed, so
+    its authenticity rests on GitHub's release, as a download by hand does (open: sign `SHA256SUMS`, or take the
+    hash from the npm package, which has provenance).
   - Installed with npm or bun: it runs `bun add -g` / `npm install -g` with the exact version.
   - It does not restart the server. The next start runs the new release, which backs up first.
 - **On a home another release served last, or one rolled back**, it takes the step with this release, as above.
@@ -151,14 +163,20 @@ earlier attempt moved aside), only if it is the same hub (it shares a signing ke
 - **sign-ins ended** (sessions), **invites revoked or used**, and each account's current **password and two-factor**
   secrets, so an old password doesn't work again.
 
+A sign-in key (a Nostr pubkey) unlinked from an account since is unlinked too.
+
+**If the later hub.db can't say what was revoked** (it can't be read, or it shares no signing key with the backup's:
+another hub), the restore stops before anything moves. `--forget-revocations` restores anyway, and says that
+whatever was revoked since works again.
+
 What is not kept: whatever was *made* since the backup is gone from the hub: keys, approved apps, consents, refresh
 tokens and accounts, so connectors and apps added since need adding again. A key or token minted since and still
 live is revoked by the restore (`made_since` in `revocations_kept_by_kind`): the restored hub has no record of it,
 so nobody could list or revoke it, and a vault would otherwise take it until it expired. Also not carried, on purpose:
 
-- **accounts deleted since** come back (their tokens and sign-ins stay revoked). Deleting an account touches every
+- **accounts deleted since** come back, and the command names them (`not_carried` in `--json`) (their tokens and sign-ins stay revoked). Deleting an account touches every
   table that names it; delete it again after the restore;
-- **changes to an account's vaults or role**. Removing an account's last vault row means "no narrowing" to the hub,
+- **changes to an account's vaults or role** (named the same way). Removing an account's last vault row means "no narrowing" to the hub,
   so carrying a removal could widen access; set them again after the restore;
 - **the vault's own `tokens` table and `mcp_mint_ledger`**: vestigial since vault 0.5 (no path validates them); the
   hub's registry is what counts, and that is carried.

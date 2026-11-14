@@ -211,6 +211,19 @@ describe("lifecycle/upgrade", () => {
       must(live.code === 0, `upgrade --check beside a running 0.8 exited ${live.code}: ${live.stderr.slice(-1200)}`);
       expect(JSON.parse(live.stdout.trim().split("\n").pop()!)).toMatchObject({ check: "ok", from: "0.8" });
       expect((await api(writer).get(`/notes/${ids.plan}`)).status).toBe(200);
+      // No other 0.9 command takes the step under 0.8's server: the home is not recorded as moved while 0.8 serves
+      // it. But the commands that stop or look at that server still run from here (a newer release was just
+      // installed, the links name it, and the old server is what runs), and they record nothing either.
+      const cmd = await core(["keys", "list"]);
+      expect(cmd.code).toBe(7);
+      expect(cmd.stderr).toContain("a Parachute server is running");
+      expect(existsSync(join(m.home, "run", "release.json"))).toBe(false);
+      const status = await core(["status"]);
+      expect(status.code).not.toBe(7);
+      expect(status.stderr).not.toContain("a Parachute server is running");
+      expect(existsSync(join(m.home, "run", "release.json"))).toBe(false);
+      expect(backups()).toEqual([]);
+      expect((await api(writer).get(`/notes/${ids.plan}`)).status).toBe(200); // and 0.8 still serves
     } finally {
       await box.stop();
     }

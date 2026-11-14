@@ -50,7 +50,7 @@ import core from "../../../package.json" with { type: "json" };
 import { USAGE_LOG, readUsage } from "./front.ts";
 import { databases, readDatabase, schemaOf } from "./home.ts";
 import { bundleRoot, hasVersion, installedPrefix } from "./install.ts";
-import { defaultChannel, Exit, RELEASE_FILE, readRelease, stepForward, withReleaseLock, writeRelease, type Recheck, type Release } from "./release.ts";
+import { defaultChannel, Exit, fixedUnitsNote, RELEASE_FILE, readRelease, stepForward, withReleaseLock, writeRelease, type Recheck, type Release } from "./release.ts";
 
 export type UpgradeAsk =
   | { kind: "usage"; message: string }
@@ -69,7 +69,7 @@ export function upgradeUsage(): string {
   return [
     "usage: parachute upgrade [--channel latest|next|beta] [--json]",
     "       parachute upgrade --check [--json]",
-    "       parachute upgrade --rollback [--restore] [--yes] [--json]",
+    "       parachute upgrade --rollback [--restore [--forget-revocations]] [--yes] [--json]",
     "       parachute upgrade <service> [--channel rc|latest] [--tag <name>] [--allow-downgrade]",
   ].join("\n");
 }
@@ -117,8 +117,9 @@ export function parseUpgrade(args: string[]): UpgradeAsk {
     return { kind: "check", json: has("--json") };
   }
   if (has("--rollback")) {
-    const other = args.find((a) => !["--rollback", "--restore", "--yes", "-y", "--json"].includes(a));
+    const other = args.find((a) => !["--rollback", "--restore", "--yes", "-y", "--json", "--forget-revocations"].includes(a));
     if (other !== undefined) return usage(`unknown argument '${other}' with --rollback`);
+    if (has("--forget-revocations") && !has("--restore")) return usage("--forget-revocations goes with --restore");
     return { kind: "rollback" };
   }
   // A service named: the hub's own upgrade of that module, with the flags it has, each with the value it needs.
@@ -525,10 +526,13 @@ const FETCH_PREFIX = ".fetch-";
 /** Where versions are looked up and bundles downloaded: npm's own setting and ours, else the public ones. */
 function sources(env: NodeJS.ProcessEnv = process.env): { registry: string; releases: string } {
   const trim = (u: string) => u.replace(/\/+$/, "");
-  return {
-    registry: trim(env.npm_config_registry || env.NPM_CONFIG_REGISTRY || REGISTRY),
-    releases: trim(env.PARACHUTE_RELEASES_URL || RELEASES),
-  };
+  const out = { registry: trim(env.npm_config_registry || env.NPM_CONFIG_REGISTRY || REGISTRY), releases: trim(env.PARACHUTE_RELEASES_URL || RELEASES) };
+  // Never over plain http, but to this machine itself: a bundle and the sum it is checked against come from there.
+  for (const [what, url] of Object.entries(out)) {
+    const u = new URL(url);
+    if (u.protocol !== "https:" && !["127.0.0.1", "localhost", "[::1]"].includes(u.hostname)) throw new Error(`${what} ${url} is not https`);
+  }
+  return out;
 }
 
 /** The versions the registry's dist-tags name for this package: {latest: "0.8.0", beta: "0.9.0-pre.1", …}. */
@@ -639,6 +643,9 @@ export async function upgradeCore(home: string, ask: { channel?: string; json: b
       if (ask.channel && release.channel !== ask.channel) withReleaseLock(home, () => writeRelease(home, { ...readRelease(home)!, channel: ask.channel }));
       Object.assign(out, { upgraded: true, step: true, from: release.previous, to: core.version, backup: release.backup, channel: ask.channel ?? release.channel, links });
       say(`This home is on ${core.version}${release.backup ? `; its databases as ${release.previous} left them are in ${release.backup}` : ""}.`);
+      const unitNote = fixedUnitsNote(links);
+      if (unitNote) say(unitNote);
+      if (!links.moved && links.why) say(`${links.why} ${links.next ?? ""}`);
       say(links.moved ? `${links.bin} runs ${core.version}: start it (its unit, or \`parachute serve\`).` : `Start ${core.version} on it now (\`parachute serve\`, or its unit once that runs ${core.version}).`);
       return done(EXIT.ok);
     }
@@ -646,19 +653,25 @@ export async function upgradeCore(home: string, ask: { channel?: string; json: b
     const channel = ask.channel ?? was?.channel ?? defaultChannel();
     out.channel = channel;
     if (ask.channel && was && was.channel !== ask.channel) {
-      withReleaseLock(home, () => {
-        const r = readRelease(home);
-        if (r) writeRelease(home, { ...r, channel: ask.channel });
-      });
-      say(`This home follows ${ask.channel} now${was.channel ? ` (it followed ${was.channel})` : ""}.`);
+      try {
+        // Not waited for: a running server holds this lock for as long as it runs.
+        withReleaseLock(home, () => {
+          const r = readRelease(home);
+          if (r) writeRelease(home, { ...r, channel: ask.channel });
+        }, 1_500);
+        say(`This home follows ${ask.channel} now${was.channel ? ` (it followed ${was.channel})` : ""}.`);
+      } catch (err) {
+        if (!(err instanceof Exit) || err.code !== 7) throw err;
+        say(`Following ${ask.channel} for this run. Parachute is running on this home, so the channel isn't recorded: it still follows ${was.channel ?? defaultChannel()} (stop it and pass --channel again to change that).`);
+      }
     }
-    if (process.env.PARACHUTE_OFFLINE === "1") throw new Exit(EXIT.problems, "PARACHUTE_OFFLINE=1: not asking the registry. Nothing was changed.");
+    if (process.env.PARACHUTE_OFFLINE === "1") throw new Exit(EXIT.problems, "PARACHUTE_OFFLINE=1: not asking the registry. Nothing was installed.");
     const { registry, releases } = sources();
     let tags: Record<string, string>;
     try {
       tags = await distTags(registry);
     } catch (err) {
-      throw new Exit(EXIT.problems, `couldn't ask ${registry} which version ${channel} is (${oneLine(err)}). Nothing was changed.`);
+      throw new Exit(EXIT.problems, `couldn't ask ${registry} which version ${channel} is (${oneLine(err)}). Nothing was installed.`);
     }
     const pick = pickVersion(tags, channel, core.version);
     if (!pick) {
@@ -667,12 +680,12 @@ export async function upgradeCore(home: string, ask: { channel?: string; json: b
     }
     say(`parachute upgrade: ${core.version} → ${pick.version} (${pick.tag === channel ? channel : `${pick.tag}, newer than ${channel}`})`);
     const kind = installKind();
-    if (kind.how === "none") throw new Exit(EXIT.problems, `${pick.version} is out, but ${kind.why}. Nothing was changed.`);
+    if (kind.how === "none") throw new Exit(EXIT.problems, `${pick.version} is out, but ${kind.why}. Nothing was installed.`);
     if (kind.how === "bundle") {
       try {
         await installBundle(kind.base, pick.version, releases, say);
       } catch (err) {
-        throw new Exit(EXIT.problems, `${oneLine(err)}. Nothing was changed: ${join(kind.base, "bin", "parachute")} still runs ${core.version}.`);
+        throw new Exit(EXIT.problems, `${oneLine(err)}. Nothing was installed: ${join(kind.base, "bin", "parachute")} still runs ${core.version}.`);
       }
       if (!hasVersion(kind.base, pick.version)) throw new Exit(EXIT.problems, `${pick.version} did not land in ${kind.base}`);
       out.prefix = kind.base;

@@ -67,7 +67,8 @@ beforeAll(async () => {
   server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
-    fetch(req) {
+    // (named so, not written as a method: the guard's self-test reads any `name(` spelled like the global as a call)
+    fetch: (req: Request) => {
       const path = decodeURIComponent(new URL(req.url).pathname);
       asked.push(path);
       if (path === "/registry/@openparachute/core") return Response.json({ name: "@openparachute/core", "dist-tags": tags });
@@ -108,7 +109,7 @@ describe("lifecycle/upgrade from the home's channel", () => {
       return { code: await p.exited, stderr: await new Response(p.stderr).text() };
     });
     expect(offline.code).toBe(1);
-    expect(offline.stderr).toContain("Nothing was changed");
+    expect(offline.stderr).toContain("Nothing was installed");
   }, 120_000);
 
   test("a download that doesn't match SHA256SUMS is not installed: the prefix is as it was", async () => {

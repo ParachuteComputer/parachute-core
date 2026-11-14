@@ -171,7 +171,10 @@ describe("lifecycle/upgrade through the service unit", () => {
 
   test("0.9 refuses the rolled-back home (a command, and the server a unit still on 0.9 would start) and changes nothing", async () => {
     const before = { files: Object.fromEntries(fileHashes(m.home)), backups: backups() };
-    for (const args of [["keys", "list"], ["status"], ["doctor"]]) {
+    // Every way in: ordinary commands, the vault's own name, the settings file, an old name (its use is counted in
+    // the home), and the host's two commands, which check a home their own way.
+    const ways: string[][] = [["keys", "list"], ["status"], ["doctor"], ["config", "set", "server.port", "1"], ["auth", "list-users"], ["vault", "list"], ["bootstrap", "--embedded", "--home", m.home, "--json"], ["serve", "--embedded", "--home", m.home]];
+    for (const args of ways) {
       const r = await m.run([binOf(v09), ...args], { env: base });
       expect(`${args.join(" ")}: exit ${r.code}`).toBe(`${args.join(" ")}: exit 7`);
       expect(r.stderr).toContain("parachute upgrade");

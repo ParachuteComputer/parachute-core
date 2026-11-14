@@ -41,6 +41,7 @@
 // --yes where nobody can be asked · 5 no room for the backup · 7 a process holds the data.
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statfsSync, statSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { Database } from "bun:sqlite";
 import core from "../../../package.json" with { type: "json" };
@@ -180,7 +181,7 @@ export function defaultChannel(version: string = core.version): string {
 }
 
 /** Whether `version` is a release of `line` ("0.8.0-pre.3" and "0.8.0" are of "0.8"; "0.80.0" is not). */
-const ofLine = (version: string, line: string) => version === line || version.startsWith(`${line}.`) || version.startsWith(`${line}-`);
+const ofLine = (version: string, line: string) => version === line || version.startsWith(`${line}.`);
 
 /**
  * The exact version that served a home before this release, where the install knows: this program is installed
@@ -196,6 +197,20 @@ function exactPrevious(line: string): string {
 export function rolledBackRefusal(r: Release | undefined): string | null {
   if (!r || r.state !== "rolled-back" || r.previous === core.version) return null;
   return `this home was rolled back to ${r.previous}${r.rolled_back_at ? ` on ${r.rolled_back_at}` : ""}: ${r.previous} serves it, and ${core.version} leaves it alone. Nothing was opened or changed. To move it to ${core.version} again, stop Parachute and run \`parachute upgrade\` with ${core.version}.`;
+}
+
+/**
+ * Why no command of this release may open `home` at all, whatever the command: it is marked rolled back to another
+ * release, or a restore on it was cut off. For the commands that never reach beforeOpen (the host's `serve
+ * --embedded` and `bootstrap`, `config`, an old name's usage count): dispatch asks this first.
+ */
+export function homeRefusal(home: string): { code: number; message: string } | null {
+  if (process.env.PARACHUTE_TAKEOVER_CHECK === "1") return null;
+  const r = readRelease(home);
+  const rolled = rolledBackRefusal(r);
+  if (rolled) return { code: EXIT.held, message: rolled };
+  if (r?.state === "restoring") return { code: EXIT.failed, message: `a restore on this home was interrupted; what ${r.version} left is in ${r.moved_aside}. Run \`parachute upgrade --rollback --restore --yes\` again to finish it.` };
+  return null;
 }
 
 /** Stop (exit 7) while any other process holds the home's databases: nothing is recorded under a running server. */
@@ -214,10 +229,12 @@ const SERVER = /(^|[\s/])(parachute|parachute-core|parachute-vault)(\.ts)? serve
  * server counts here (a backup tool or a script reading a database doesn't make the home anyone's), so the unit's
  * own first start is never stopped by a reader.
  */
+const servedBy = (home: string) => holders(home).filter((h) => SERVER.test(h.cmd));
+
 function notServed(home: string, doing: string): void {
-  const served = holders(home).filter((h) => SERVER.test(h.cmd));
+  const served = servedBy(home);
   if (served.length) {
-    throw new Exit(EXIT.held, `${doing}, but a Parachute server is running on it: ${served.map((h) => `pid ${h.pid} (${h.cmd.slice(0, 80)})`).join(", ")}. Nothing was changed: a home is not recorded as moved while another release serves it. Stop it (parachute stop, or its unit), then run this again; \`parachute upgrade --check\` tries the step on a copy meanwhile.`);
+    throw new Exit(EXIT.held, `${doing}, but a Parachute server is running on it: ${served.map((h) => `pid ${h.pid} (${h.cmd.slice(0, 80)})`).join(", ")}. Nothing was changed: a home is not recorded as moved while another release serves it. Stop it (\`parachute stop\` and \`parachute restart\` still work from here, or use its unit), then run this again; \`parachute upgrade --check\` tries the step on a copy meanwhile.`);
   }
 }
 
@@ -259,9 +276,16 @@ function recheckOrStop(recheck: Recheck): void {
   if (code !== null) throw new Exit(code, "");
 }
 
-export function beforeOpen(home: string, say: (s: string) => void = (s) => console.error(s), recheck: Recheck = () => null, forward = false): Release | undefined {
+export function beforeOpen(home: string, say: (s: string) => void = (s) => console.error(s), recheck: Recheck = () => null, forward = false, lifecycle = false): Release | undefined {
   if (process.env.PARACHUTE_TAKEOVER_CHECK === "1") return undefined;
   if (!existsSync(home) || existsSync(join(home, "embedded.json"))) return undefined;
+  // `stop`, `restart`, `status` and `logs` (`lifecycle`) are how the older release's server is stopped or looked
+  // at from here: a newer release was just installed and the links name it, but the old server still runs. They
+  // take no step and record nothing while it does; the server's next start (this release's) takes the step.
+  if (lifecycle && !forward) {
+    const r = readRelease(home);
+    if ((!r || r.version !== core.version || r.state !== "current") && !rolledBackRefusal(r) && r?.state !== "restoring" && servedBy(home).length) return undefined;
+  }
   // A home the old 0.7 programs still own is the takeover's: nothing is written to it, not even the lock.
   if (!readRelease(home) && serveRefusal(home) !== null) return undefined;
   // A rolled-back home is the previous release's until `parachute upgrade` asks for the step again (`forward`):
@@ -270,6 +294,9 @@ export function beforeOpen(home: string, say: (s: string) => void = (s) => conso
     const refusal = rolledBackRefusal(readRelease(home));
     if (refusal) throw new Exit(EXIT.held, refusal);
   }
+  // A step that would be refused under a running server is refused here, before the lock: the home of a release
+  // that is still serving gets nothing from this one, not even an empty lock file. (Decided again under the lock.)
+  if (stepNeeded(home, readRelease(home))) notServed(home, `${core.version} would back this home up and record the step`);
   for (let attempt = 0; attempt < 3; attempt++) {
     // Every command holds the lock shared while it runs, so no rollback can move a database under it. Once held, the
     // newer-data check runs again: a newer release may have moved the home while this one waited.
@@ -317,6 +344,27 @@ export function beforeOpen(home: string, say: (s: string) => void = (s) => conso
     }
   }
   throw new Exit(EXIT.failed, "this home's release record kept changing while this command started; run it again");
+}
+
+/**
+ * Whether the locked step below would back the home up and record this release (the part never done under a
+ * running server). Reads only, and follows beforeOpenLocked's own order of cases.
+ */
+function stepNeeded(home: string, was: Release | undefined): boolean {
+  try {
+    if (was && (was.state === "restoring" || (was.version === core.version && was.state === "current"))) return false;
+    if (was?.state === "rolled-back" && was.previous === core.version) return false;
+    if (serveRefusal(home) !== null) return false;
+    const all = databases(home, { hub: 0, vault: 0 });
+    const dbs = all.filter((d) => readable(join(home, d.rel), dirname(home)));
+    if (dbs.length === 0) return false;
+    if (!was && madeByThisLine(home, dbs)) return false;
+    const takeover = readJson(join(home, RECORD_FILE));
+    if (!was && takeover?.state === "taken-over" && takeover.version === core.version) return false;
+    return true;
+  } catch {
+    return false; // can't tell without the lock: the locked step decides
+  }
 }
 
 /** What the locked step did: the record now in force, or why it recorded nothing. */
@@ -440,9 +488,9 @@ function madeByThisLine(home: string, dbs: { rel: string }[]): boolean {
  * `beforeOpen` for dispatch: the exit code to stop with, or null to go on. Every command goes through it, help
  * flags included: some commands read `--help` as a value and open the data anyway.
  */
-export function beforeOpenOrExit(home: string, recheck: Recheck = () => null, forward = false): number | null {
+export function beforeOpenOrExit(home: string, recheck: Recheck = () => null, forward = false, lifecycle = false): number | null {
   try {
-    beforeOpen(home, undefined, recheck, forward);
+    beforeOpen(home, undefined, recheck, forward, lifecycle);
     return null;
   } catch (err) {
     if (err instanceof Exit) {
@@ -453,8 +501,34 @@ export function beforeOpenOrExit(home: string, recheck: Recheck = () => null, fo
   }
 }
 
+/**
+ * systemd user units that start a fixed copy under this prefix (`…/.store/<version>-<id>/…`) instead of
+ * `<prefix>/bin/parachute-core`: `parachute init` writes such a unit. Moving the links doesn't change what they
+ * start, so whoever moved the links is told. (The takeover's unit runs `<prefix>/bin/parachute-core`.)
+ */
+function fixedUnits(base: string): { units_fixed?: string[] } {
+  const dir = join(process.env.XDG_CONFIG_HOME || join(process.env.HOME || homedir(), ".config"), "systemd", "user");
+  const found: string[] = [];
+  try {
+    for (const name of readdirSync(dir)) {
+      if (!name.endsWith(".service")) continue;
+      const exec = /^ExecStart=(.*)$/m.exec(readFileSync(join(dir, name), "utf8"))?.[1] ?? "";
+      if (exec.includes(`${base}/.store/`)) found.push(name);
+    }
+  } catch {}
+  return found.length ? { units_fixed: found } : {};
+}
+
+/** What to say when a unit won't follow the links (fixedUnits). */
+export function fixedUnitsNote(links: LinksMove): string | null {
+  if (!links.units_fixed?.length || !links.prefix) return null;
+  return `${links.units_fixed.join(", ")} ${links.units_fixed.length > 1 ? "start" : "starts"} a fixed copy, not ${join(links.prefix, "bin", "parachute-core")}: moving the links doesn't change what ${links.units_fixed.length > 1 ? "they run" : "it runs"}. Set ${links.units_fixed.length > 1 ? "their" : "its"} ExecStart to \`${join(links.prefix, "bin", "parachute-core")} serve\`, then \`systemctl --user daemon-reload\`.`;
+}
+
 export interface LinksMove {
   moved: boolean;
+  /** Units that start a fixed copy and so don't follow the links. */
+  units_fixed?: string[];
   prefix?: string;
   bin?: string;
   to?: string;
@@ -491,7 +565,7 @@ function linksBack(previous: string): LinksMove {
     const to = previousCopy(base, previous);
     if (!to) return { moved: false, prefix: base, why: `No copy of ${previous} is kept in ${base}.`, next: reinstall };
     if (linkedVersion(base) !== to) pointLinks(base, to);
-    return { moved: true, prefix: base, bin, to };
+    return { moved: true, prefix: base, bin, to, ...fixedUnits(base) };
   } catch (err) {
     return { moved: false, prefix: base, why: `The links in ${join(base, "bin")} could not be pointed back (${(err as Error)?.message ?? err}).`, next: `Point them at ${previous} by hand, or run its own \`parachute install --prefix ${base}\`, then start it.` };
   }
@@ -507,9 +581,14 @@ export function stepForward(home: string, say: (s: string) => void, recheck: Rec
   letGoShared();
   const base = installedPrefix();
   let links: LinksMove = { moved: false };
-  if (base && hasVersion(base, core.version)) {
-    if (linkedVersion(base) !== core.version) pointLinks(base, core.version);
-    links = { moved: true, prefix: base, bin: join(base, "bin", "parachute-core"), to: core.version };
+  // Only once the step is recorded: links that name this release on a home it hasn't taken would start it there.
+  if (release?.version === core.version && release.state === "current" && base && hasVersion(base, core.version)) {
+    try {
+      if (linkedVersion(base) !== core.version) pointLinks(base, core.version);
+      links = { moved: true, prefix: base, bin: join(base, "bin", "parachute-core"), to: core.version, ...fixedUnits(base) };
+    } catch (err) {
+      links = { moved: false, prefix: base, why: `The links in ${join(base, "bin")} could not be pointed at ${core.version} (${(err as Error)?.message ?? err}).`, next: `Run \`${join(base, core.version, "bin", "parachute")} install --prefix ${base}\`.` };
+    }
   }
   return { release, links };
 }
@@ -541,6 +620,26 @@ export interface KeptRevocations {
   sessions: number;
   invites: number;
   sign_ins: number;
+  /** Sign-in keys (Nostr pubkeys) unlinked from an account since: unlinked here too. */
+  pubkeys: number;
+}
+
+/** What a restore brings back though it was taken away since, and can't safely undo itself: said, never silent. */
+export interface NotCarried {
+  /** Accounts deleted since the backup, by name: they are back (their tokens and sessions stay revoked). */
+  accounts_back: string[];
+  /** Accounts whose role or vault list changed since: they have the backup's again. */
+  access_changed: string[];
+}
+
+/** A hub.db that came after the backup and can't tell what was revoked since: unreadable, or another hub's. */
+export class SourceUnusable extends Error {
+  constructor(
+    readonly source: string,
+    readonly why: string,
+  ) {
+    super(`${source}: ${why}`);
+  }
 }
 
 /**
@@ -561,10 +660,15 @@ export interface KeptRevocations {
  *   invites       revoked or used since: revoked or used here.
  *   sign-ins      an account's password or two-factor secrets changed since: the current ones here, so an old
  *                 password doesn't work again.
- * Not carried, said in docs/UPGRADE-0.9.md: accounts deleted since, and changes to an account's vaults or role.
+ *   sign-in keys  a Nostr pubkey unlinked from an account since: unlinked here too (it can sign in).
+ * Not carried (`notCarried` names them, the command says them, docs/UPGRADE-0.9.md says why): accounts deleted
+ * since, and changes to an account's vaults or role.
+ *
+ * A source that can't be read, or isn't this hub, can't say what was revoked: it throws SourceUnusable, and the
+ * caller stops before anything moves unless it was told to go on without (`--forget-revocations`).
  */
-export function keepRevocations(staged: string, sources: string[], outside: string): KeptRevocations {
-  const kept: KeptRevocations = { tokens: 0, made_since: 0, signing_keys: 0, clients: 0, grants: 0, sessions: 0, invites: 0, sign_ins: 0 };
+export function keepRevocations(staged: string, sources: string[], outside: string, notCarried: NotCarried = { accounts_back: [], access_changed: [] }): KeptRevocations {
+  const kept: KeptRevocations = { tokens: 0, made_since: 0, signing_keys: 0, clients: 0, grants: 0, sessions: 0, invites: 0, sign_ins: 0, pubkeys: 0 };
   const now = new Date().toISOString();
   const db = new Database(staged);
   try {
@@ -579,17 +683,17 @@ export function keepRevocations(staged: string, sources: string[], outside: stri
           const has = tables(s);
           const cols: Record<string, string[]> = {};
           const rows: Record<string, any[]> = {};
-          for (const t of ["signing_keys", "tokens", "clients", "grants", "sessions", "invites", "users"]) {
+          for (const t of ["signing_keys", "tokens", "clients", "grants", "sessions", "invites", "users", "user_pubkeys", "user_vaults"]) {
             if (!has.has(t)) continue;
             cols[t] = columns(s, t);
             rows[t] = s.query(`SELECT * FROM ${t}`).all() as any[];
           }
           return { has, cols, rows };
         }, outside);
-      } catch {
-        continue; // can't be read: nothing to learn from it
+      } catch (err) {
+        throw new SourceUnusable(source, `can't be read (${String((err as Error)?.message ?? err).split("\n")[0]})`);
       }
-      if (!(after.rows.signing_keys ?? []).some((k) => kids.has(k.kid))) continue; // not this hub
+      if (!(after.rows.signing_keys ?? []).some((k) => kids.has(k.kid))) throw new SourceUnusable(source, "shares no signing key with the backup's hub.db: it is not the same hub");
       const by = (table: string, key: (r: any) => string) => new Map((after.rows[table] ?? []).map((r) => [key(r), r]));
       const shared = (table: string) => (after.cols[table] ?? []).filter((c) => mine.has(table) && columns(db, table).includes(c));
       db.transaction(() => {
@@ -685,6 +789,31 @@ export function keepRevocations(staged: string, sources: string[], outside: stri
             if (revoked || used) kept.invites++;
           }
         }
+        if (mine.has("user_pubkeys") && after.has.has("user_pubkeys")) {
+          const later = new Set(after.rows.user_pubkeys!.map((r) => `${r.pubkey} ${r.user_id}`));
+          for (const k of db.query("SELECT pubkey, user_id FROM user_pubkeys").all() as { pubkey: string; user_id: string }[]) {
+            if (later.has(`${k.pubkey} ${k.user_id}`)) continue;
+            db.run("DELETE FROM user_pubkeys WHERE pubkey = ?", [k.pubkey]);
+            kept.pubkeys++;
+          }
+        }
+        if (mine.has("users") && after.has.has("users")) {
+          // Said, not undone: an account deleted since is back, and a role or vault list changed since is the
+          // backup's again.
+          const later = by("users", (r) => r.id);
+          const vaultsOf = (rows: any[], id: string) => rows.filter((v) => v.user_id === id).map((v) => `${v.vault_name}:${v.role ?? ""}`).sort().join(" ");
+          const mineVaults = mine.has("user_vaults") ? (db.query("SELECT * FROM user_vaults").all() as any[]) : [];
+          const userCols = columns(db, "users");
+          for (const u of db.query("SELECT * FROM users").all() as any[]) {
+            const name = String(u.username ?? u.id);
+            const l = later.get(u.id);
+            if (!l) {
+              if (!notCarried.accounts_back.includes(name)) notCarried.accounts_back.push(name);
+            } else if ((userCols.includes("role") && u.role !== l.role) || (after.has.has("user_vaults") && vaultsOf(mineVaults, u.id) !== vaultsOf(after.rows.user_vaults ?? [], u.id))) {
+              if (!notCarried.access_changed.includes(name)) notCarried.access_changed.push(name);
+            }
+          }
+        }
         if (mine.has("users") && after.has.has("users")) {
           const cols = shared("users").filter((c) => ["password_hash", "password_changed", "totp_secret", "totp_backup_codes", "totp_enrolled_at"].includes(c));
           for (const u of after.rows.users!) {
@@ -715,15 +844,30 @@ export async function rollback(home: string, args: string[]): Promise<number> {
   const json = args.includes("--json");
   const restore = args.includes("--restore");
   const yes = args.includes("--yes") || args.includes("-y");
-  const unknown = args.find((a) => !["--rollback", "--restore", "--yes", "-y", "--json"].includes(a));
+  const forget = args.includes("--forget-revocations");
+  const unknown = args.find((a) => !["--rollback", "--restore", "--yes", "-y", "--json", "--forget-revocations"].includes(a)) ?? (forget && !restore ? "--forget-revocations (it goes with --restore)" : undefined);
   const say = (s: string) => (json ? console.error(s) : console.log(s));
   try {
-    if (unknown) throw new Exit(EXIT.usage, `unknown argument '${unknown}'\nusage: parachute upgrade --rollback [--restore] [--yes] [--json]`);
+    if (unknown) throw new Exit(EXIT.usage, `unknown argument '${unknown}'\nusage: parachute upgrade --rollback [--restore [--forget-revocations]] [--yes] [--json]`);
     const r = readRelease(home);
     const asked = r ?? undefined;
     if (r?.via === "takeover") throw new Exit(EXIT.failed, "this home came over from 0.7 by the takeover; `parachute takeover --rollback` goes back");
     const resuming = r?.state === "restoring";
     if (resuming && !restore) throw new Exit(EXIT.failed, "a restore on this home was interrupted; finish it with --restore --yes");
+    if (r?.state === "rolled-back" && r.previous && r.previous !== core.version) {
+      // Rolled back already. If the links couldn't be moved then (and can be now), finish that; else nothing to do.
+      const base = installedPrefix();
+      if (base && linkedVersion(base) === core.version) {
+        const links = linksBack(r.previous);
+        if (links.moved) {
+          say(`This home was rolled back to ${r.previous} on ${r.rolled_back_at}; ${links.bin} runs ${links.to} again now: start it (its unit, or \`parachute serve\`).`);
+          const note = fixedUnitsNote(links);
+          if (note) say(note);
+          if (json) console.log(JSON.stringify({ rolled_back: true, from: r.version, to: r.previous, mode: "links-only", links }));
+          return EXIT.ok;
+        }
+      }
+    }
     if (!r || (r.state !== "current" && !resuming) || !r.previous) {
       throw new Exit(EXIT.failed, r?.state === "rolled-back" ? `this home was rolled back to ${r.previous} on ${r.rolled_back_at}; nothing to roll back` : `no earlier release served this home (run/release.json says ${r ? `${r.version}, first` : "nothing"}); nothing to roll back`);
     }
@@ -780,12 +924,29 @@ export async function rollback(home: string, args: string[]): Promise<number> {
         // Checked, then given every revocation made since the backup. Every attempt stages afresh and applies them
         // again, from the live hub.db and from what an interrupted attempt moved aside (its live hub.db may be there).
         const asidesBefore = [...(r.moved_aside ? [r.moved_aside] : []), ...(r.moved_aside_retries ?? [])];
-        const kept = "hub.db" in files ? keepRevocations(join(staged, "hub.db"), [home, ...asidesBefore].map((d) => join(d, "hub.db")).filter((p) => existsSync(p)), dirname(home)) : undefined;
-        const total = kept ? Object.values(kept).reduce((a, b) => a + b, 0) : 0;
-        out.revocations_kept = total;
-        if (kept) out.revocations_kept_by_kind = kept;
-        const kinds = kept ? Object.entries(kept).filter(([, v]) => v > 0).map(([k, v]) => `${v} ${k.replace("_", " ")}`) : [];
-        say(`Kept ${total} revocations made since the backup${kinds.length ? ` (${kinds.join(", ")})` : ""}: nothing revoked since works again`);
+        const notCarried: NotCarried = { accounts_back: [], access_changed: [] };
+        let kept: KeptRevocations | undefined;
+        if ("hub.db" in files && forget) {
+          out.revocations_kept = null;
+          say("--forget-revocations: the backup's hub.db goes back as it was. Whatever was revoked since the backup works again; revoke it again once the previous release runs.");
+        } else if ("hub.db" in files) {
+          try {
+            kept = keepRevocations(join(staged, "hub.db"), [home, ...asidesBefore].map((d) => join(d, "hub.db")).filter((p) => existsSync(p)), dirname(home), notCarried);
+          } catch (err) {
+            if (!(err instanceof SourceUnusable)) throw err;
+            rmSync(staged, { recursive: true, force: true });
+            // Nothing has moved. Putting the backup back now would make everything revoked since work again.
+            throw new Exit(EXIT.failed, `${err.source.replace(`${home}/`, "")} ${err.why}, so what was revoked since the backup can't be carried over. Nothing was changed. To restore anyway, knowing that keys, sessions and apps revoked since the backup will work again, add --forget-revocations.`);
+          }
+          const total = Object.values(kept).reduce((a, b) => a + b, 0);
+          out.revocations_kept = total;
+          out.revocations_kept_by_kind = kept;
+          const kinds = Object.entries(kept).filter(([, v]) => v > 0).map(([k, v]) => `${v} ${k.replace("_", " ")}`);
+          say(`Kept ${total} revocations made since the backup${kinds.length ? ` (${kinds.join(", ")})` : ""}: no key, session or app revoked since works again`);
+          out.not_carried = notCarried;
+          if (notCarried.accounts_back.length) say(`Back, though deleted since the backup (delete again once the previous release runs): account${notCarried.accounts_back.length > 1 ? "s" : ""} ${notCarried.accounts_back.join(", ")}`);
+          if (notCarried.access_changed.length) say(`With the backup's role and vaults again, though changed since (set again): ${notCarried.access_changed.join(", ")}`);
+        }
         // 2. Export every note that differs from the backup, then check again that nothing has started since.
         const dir = join(r.backup!, `changed-since-${stamp()}`);
         // Always, a resumed restore too: what an interrupted one left (or an older release wrote since) is compared
@@ -824,6 +985,8 @@ export async function rollback(home: string, args: string[]): Promise<number> {
       say(`Rolled back: ${home} is ${r.previous}'s again, and ${r.version} now leaves it alone.`);
       if (links.moved) say(`${links.bin} runs ${links.to} again: start it (its unit, or \`parachute serve\`).`);
       else say(`${links.why} ${links.next}`);
+      const unitNote = fixedUnitsNote(links);
+      if (unitNote) say(unitNote);
       say(`To move this home to ${r.version} again later, run \`parachute upgrade\` with ${r.version}${links.moved ? ` (${join(links.prefix!, r.version, "bin", "parachute")})` : ""}: it backs up first.`);
       if (json) console.log(JSON.stringify(out));
       return EXIT.ok;

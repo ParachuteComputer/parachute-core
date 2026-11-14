@@ -117,6 +117,9 @@ export function pointLinks(base: string, version: string): string[] {
   const bin = join(base, "bin");
   const before = linkedVersion(base);
   const out: string[] = [];
+  // Only links this installer made are replaced, as `install` itself insists: anything else by those names stays.
+  const foreign = LINKED.map((n) => join(bin, n)).filter((at) => lstatSync(at, { throwIfNoEntry: false }) && !ourLink(at, base));
+  if (foreign.length) throw new Error(`${foreign.join(", ")} ${foreign.length > 1 ? "are" : "is"} not this installer's`);
   for (const name of LINKED) {
     const target = relative(bin, join(base, version, "bin", name));
     const tmpLink = join(bin, `.${name}.${randomBytes(4).toString("hex")}`);
