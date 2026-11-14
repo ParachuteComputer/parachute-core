@@ -52,11 +52,12 @@ function ensureRevisionKeyKind(db: Database): void {
 }
 
 /**
- * Revisions say who and why (0.9.4, T-471): each version names the write set that superseded it (whose `why` is on
- * `write_sets`), and keeps the types, tags and outgoing links the record had, as JSON. Additive, with no schema
+ * Revisions say who and why (0.9.4, T-471): each version names the write set that superseded it and keeps its `why`
+ * (on the version itself: the set's row is swept with the change log, the version stays), and keeps the types, tags
+ * and outgoing links the record had, as JSON. Additive, with no schema
  * number, like ensureRevisionKeyKind: an older engine writes NULL there and reads around them. Never backfilled.
  */
-const REVISION_SET_COLUMNS = ["write_set", "types", "tags", "links"] as const;
+const REVISION_SET_COLUMNS = ["write_set", "why", "types", "tags", "links"] as const;
 function revisionColumnsPresent(db: Database): boolean {
   return !hasTable(db, "note_versions") || REVISION_SET_COLUMNS.every((c) => hasColumn(db, "note_versions", c));
 }

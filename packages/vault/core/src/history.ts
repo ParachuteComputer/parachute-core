@@ -17,7 +17,7 @@ import { isWhole, isDelta, wholeText, deltaBytes, wholeSql, BlobDecodeError, typ
 import { kindOfVia } from "./write-stamp.js";
 import { transaction } from "./txn.js";
 import { refreshCompactState } from "./history-compact-state.js";
-import { currentWriteSet, forgetLoggedPast } from "./change-log.js";
+import { forgetLoggedPast, writeContextOf } from "./change-log.js";
 import { typeNamesAmong } from "./tag-kind.js";
 
 export type HistoryOp =
@@ -127,7 +127,7 @@ export interface VersionRow {
   tags?: string[] | null;
   links?: { target: string; relationship: string; metadata: unknown }[] | null;
 }
-type RawVersionRow = Omit<VersionRow, "metadata" | "types" | "tags" | "links" | "why"> & { metadata: string | null; types?: string | null; tags?: string | null; links?: string | null };
+type RawVersionRow = Omit<VersionRow, "metadata" | "types" | "tags" | "links"> & { metadata: string | null; types?: string | null; tags?: string | null; links?: string | null };
 export class HistoryOverflowError extends Error {
   readonly code = "HISTORY_OVERFLOW";
   constructor(
@@ -361,7 +361,7 @@ function stampRevisionSet(db: Database, noteId: string, ix: number): void {
   let known = revisionColumnsKnown.get(db);
   if (known === undefined) {
     const cols = new Set((db.prepare("PRAGMA table_info(note_versions)").all() as { name: string }[]).map((c) => c.name));
-    known = cols.has("write_set") && cols.has("links");
+    known = cols.has("write_set") && cols.has("why") && cols.has("links");
     revisionColumnsKnown.set(db, known);
   }
   if (!known) return;
@@ -372,8 +372,10 @@ function stampRevisionSet(db: Database, noteId: string, ix: number): void {
     try { metadata = l.metadata ? JSON.parse(l.metadata) : {}; } catch {}
     return { target: l.target_id, relationship: l.relationship, metadata };
   });
-  db.prepare("UPDATE note_versions SET write_set = ?, types = ?, tags = ?, links = ? WHERE note_id = ? AND version_ix = ?").run(
-    currentWriteSet(db),
+  const ctx = writeContextOf(db);
+  db.prepare("UPDATE note_versions SET write_set = ?, why = ?, types = ?, tags = ?, links = ? WHERE note_id = ? AND version_ix = ?").run(
+    ctx.write_set,
+    ctx.why,
     JSON.stringify(types),
     JSON.stringify(tags.filter((t) => !types.includes(t))),
     JSON.stringify(links),
@@ -523,7 +525,7 @@ export function sweepDeletedHistory(
   });
 }
 const columns =
-  "note_id, version_ix, content_hash, path, metadata, extension, superseded_at, actor, via, via_kind, op, content_len, encoding, created_at, write_set, types, tags, links";
+  "note_id, version_ix, content_hash, path, metadata, extension, superseded_at, actor, via, via_kind, op, content_len, encoding, created_at, write_set, why, types, tags, links";
 const jsonList = <T,>(raw: string | null | undefined): T[] | null => {
   if (raw === null || raw === undefined) return null;
   try {
@@ -533,20 +535,6 @@ const jsonList = <T,>(raw: string | null | undefined): T[] | null => {
     return null;
   }
 };
-/** The reasons of the write sets these rows name (0.9.4); one read per page. */
-function attachWhy(db: Database, rows: VersionRow[]): VersionRow[] {
-  const ids = [...new Set(rows.map((r) => r.write_set).filter((x): x is string => typeof x === "string"))];
-  const why = new Map<string, string | null>();
-  if (ids.length) {
-    try {
-      for (const id of ids) {
-        const r = db.prepare("SELECT why FROM write_sets WHERE id = ?").get(id) as { why: string | null } | null;
-        why.set(id, r?.why ?? null);
-      }
-    } catch {}
-  }
-  return rows.map((r) => ({ ...r, why: r.write_set ? (why.get(r.write_set) ?? null) : null }));
-}
 function parseRow(row: RawVersionRow): VersionRow {
   let metadata: Record<string, unknown> = {};
   try {
@@ -556,6 +544,7 @@ function parseRow(row: RawVersionRow): VersionRow {
     ...row,
     metadata,
     write_set: row.write_set ?? null,
+    why: row.why ?? null,
     types: jsonList<string>(row.types),
     tags: jsonList<string>(row.tags),
     links: jsonList<{ target: string; relationship: string; metadata: unknown }>(row.links),
@@ -573,7 +562,7 @@ export function listVersions(
       )
       .all(noteId, opts?.limit ?? 50, opts?.offset ?? 0) as RawVersionRow[]
   ).map(parseRow);
-  return attachWhy(db, rows);
+  return rows;
 }
 export function getVersion(
   db: Database,
@@ -595,7 +584,7 @@ export function getVersion(
   const { content, blob_encoding, delta_of, ...verCols } = row;
   try {
     const reconstructed = materialise(db, verCols.content_hash!, { content, blob_encoding, delta_of });
-    return { ...attachWhy(db, [parseRow(verCols)])[0]!, content: reconstructed, encoding: verCols.encoding ?? blob_encoding };
+    return { ...parseRow(verCols), content: reconstructed, encoding: verCols.encoding ?? blob_encoding };
   } catch (err) {
     if (!(err instanceof HistoryDeltaOrphanError)) throw err;
     console.warn("[history] unrecoverable delta", { hash: err.hash, delta_of: err.delta_of, reason: err.reason });

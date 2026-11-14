@@ -9,7 +9,7 @@
  * a deleted one by the tags it had. Anything else answers as if the set weren't there.
  */
 import type { Database } from "bun:sqlite";
-import { getWriteSet, listWriteSets, writeSetRecords, type WriteSetRow } from "../core/src/change-log.ts";
+import { getWriteSet, listWriteSets, setRecordStates, writeSetRecords, type WriteSetRow } from "../core/src/change-log.ts";
 import type { Note } from "../core/src/types.ts";
 import { noteWithinTagScope } from "./tag-scope.ts";
 import type { TagScopeCtx } from "./routes.ts";
@@ -102,9 +102,8 @@ export function handleWriteSets(req: Request, db: Database, subpath: string, aut
   if (!set || !setOwnedOrAdmin(set, auth) || !setVisible(db, id, tagScope)) {
     return json({ error: "Not found", error_type: "not_found" }, 404);
   }
-  const rows = db
-    .prepare("SELECT note_id, op, existed, before_row FROM record_changes WHERE write_set = ? ORDER BY seq")
-    .all(id) as { note_id: string; op: string; existed: number; before_row: string | null }[];
+  // One entry per record (a set spanning several transactions has a row per transaction for a record).
+  const rows = setRecordStates(db, id);
   const records = rows
     .filter((r) => !(r.op === "delete" && r.existed === 0))
     .map((r) => ({ id: r.note_id, op: r.op, path: recordPath(db, r.note_id, r.before_row) }));

@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { SqliteStore } from "./store.ts";
 import { SCHEMA_VERSION } from "./schema.ts";
-import { pruneChangeLog, writeSetRecords } from "./change-log.ts";
+import { pruneChangeLog, setRecordStates, writeSetRecords } from "./change-log.ts";
 import { readBlobText } from "./history.ts";
 
 function fresh() {
@@ -16,11 +16,19 @@ function fresh() {
   store.writeSetSource = () => ctx;
   return { db, store, as: (c: typeof ctx) => (ctx = c) };
 }
-/** A set's log rows, the saved body read back from its blob (bodies move to note_blobs at the end of the transaction). */
+/**
+ * What a set did to each record (its rows aggregated, as undo reads them: setRecordStates), the saved body read back
+ * from its blob; for writes outside any set (NULL), the raw rows.
+ */
 const rows = (db: Database, set: string | null) =>
-  (db.prepare(`SELECT note_id, op, existed, content_saved, before_hash, before_tags FROM record_changes WHERE write_set ${set === null ? "IS NULL" : "= ?"} ORDER BY seq`).all(...(set === null ? [] : [set])) as any[]).map(
-    ({ before_hash, ...r }) => ({ ...r, before_content: before_hash ? readBlobText(db, before_hash) : null }),
-  );
+  set === null
+    ? (db.prepare("SELECT note_id, op, existed, content_saved, before_hash, before_tags FROM record_changes WHERE write_set IS NULL ORDER BY seq").all() as any[]).map(
+        ({ before_hash, ...r }) => ({ ...r, before_content: before_hash ? readBlobText(db, before_hash) : null }),
+      )
+    : setRecordStates(db, set).map((r) => ({
+        note_id: r.note_id, op: r.op, existed: r.existed, content_saved: r.content_saved,
+        before_content: r.before_hash ? readBlobText(db, r.before_hash) : null, before_tags: r.before_tags,
+      }));
 
 describe("change log: what one write set records", () => {
   test("the body is kept only when the set changes it, from before the set's first change", async () => {
@@ -116,26 +124,29 @@ describe("change log: bodies are blobs", () => {
 });
 
 describe("change log: positions and what history keeps", () => {
-  test("a set that touches a record again moves to the end of the log, past a later set's touch", async () => {
+  test("a set that writes a record again in a later transaction adds a row after the other set's; placed rows never move", async () => {
     const { db, store, as } = fresh();
     as({ id: "ws_first0001" });
     const n = await store.createNote("x", { path: "pos" });
+    const placed = (db.prepare("SELECT position, before_tags FROM record_changes WHERE write_set = 'ws_first0001'").get() as any);
     as({ id: "ws_second001" });
     await store.updateNote(n.id, { content: "y" });
     as({ id: "ws_first0001" }); // the first set again (several requests sharing one Parachute-Write-Set id)
     await store.updateNote(n.id, { content: "z" });
-    const pos = (id: string) => db.prepare("SELECT position, first_position, touched FROM record_changes WHERE write_set = ?").get(id) as any;
-    expect(pos("ws_first0001").position).toBeGreaterThan(pos("ws_second001").position);
-    expect(pos("ws_first0001").first_position).toBeLessThan(pos("ws_second001").position);
-    expect(pos("ws_first0001").touched).toBe(0);
+    const first = db.prepare("SELECT position, touched FROM record_changes WHERE write_set = 'ws_first0001' ORDER BY seq").all() as any[];
+    const second = (db.prepare("SELECT position FROM record_changes WHERE write_set = 'ws_second001'").get() as any).position;
+    expect(first.length).toBe(2);
+    expect(first[0].position).toBe(placed.position); // never moved
+    expect(first[1].position).toBeGreaterThan(second);
+    expect(first.every((r) => r.touched === 0)).toBe(true);
     // A raw write (an older engine) waits for the next Store transaction to get its position, then sorts after.
     db.prepare("UPDATE notes SET content = 'raw', updated_at = 'later' WHERE id = ?").run(n.id);
     expect((db.prepare("SELECT position FROM record_changes WHERE write_set IS NULL").get() as any).position).toBeNull();
     as({ id: "ws_third0001" });
     await store.createNote("other", { path: "pos2" });
     const raw = (db.prepare("SELECT position FROM record_changes WHERE write_set IS NULL").get() as any).position;
-    expect(raw).toBeGreaterThan(pos("ws_first0001").position);
-    expect(pos("ws_third0001").position).toBeGreaterThan(raw);
+    expect(raw).toBeGreaterThan(first[1].position);
+    expect((db.prepare("SELECT position FROM record_changes WHERE write_set = 'ws_third0001'").get() as any).position).toBeGreaterThan(raw);
   });
 
   test("each write saves only what it changes: a tag write keeps no fields or links; a later row change in the set keeps the row from before the set", async () => {
@@ -146,7 +157,10 @@ describe("change log: positions and what history keeps", () => {
     await store.createLink(n.id, target.id, "cites");
     as({ id: "ws_tagonly01" });
     await store.tagNote(n.id, ["b"]);
-    const row = () => db.prepare("SELECT before_row, before_tags, before_links FROM record_changes WHERE write_set = 'ws_tagonly01'").get() as any;
+    const row = () => {
+      const [r] = setRecordStates(db, "ws_tagonly01");
+      return { before_row: r!.before_row, before_tags: r!.before_tags, before_links: r!.before_links };
+    };
     expect(row()).toEqual({ before_row: null, before_tags: '["a"]', before_links: null });
     await store.updateNote(n.id, { metadata: { k: 2 } });
     expect(JSON.parse(row().before_row).metadata).toBe('{"k":1}');
@@ -181,6 +195,23 @@ describe("change log: the horizon", () => {
     db.prepare("UPDATE write_sets SET at = '2000-01-01T00:00:00.000Z' WHERE id = 'ws_old000001'").run();
     expect(pruneChangeLog(db, 30)).toMatchObject({ changes: 1, sets: 1 });
     expect((db.prepare("SELECT id FROM write_sets").all() as any[]).map((r) => r.id)).toEqual(["ws_new000001"]);
+  });
+});
+
+describe("change log: what outlives the horizon", () => {
+  test("a version keeps its write set's why after the log is swept", async () => {
+    const { db, store, as } = fresh();
+    as({ id: "ws_mk0000003" });
+    const n = await store.createNote("one", { path: "w" });
+    as({ id: "ws_why000001", why: "fixing a typo" });
+    await store.updateNote(n.id, { content: "two", actor: "u", via: "api" });
+    db.prepare("UPDATE record_changes SET at = '2000-01-01T00:00:00.000Z'").run();
+    db.prepare("UPDATE write_sets SET at = '2000-01-01T00:00:00.000Z'").run();
+    (store as any).changeLogPrunedAt = 0;
+    store.pruneChangeLogDaily();
+    expect((db.prepare("SELECT COUNT(*) AS n FROM write_sets").get() as any).n).toBe(0);
+    const [v] = await store.listNoteVersions(n.id);
+    expect(v).toMatchObject({ write_set: "ws_why000001", why: "fixing a typo" });
   });
 });
 
