@@ -57,9 +57,11 @@ import { recordsRoute } from "../core/src/rest-records.ts";
 import { handleRecordsRest } from "./records-rest.ts";
 import pkg from "../package.json" with { type: "json" };
 import type { VaultConfig } from "./config.ts";
+import { assetsDir } from "./config.ts";
 import type { Note, Store } from "../core/src/types.ts";
 import {
   readVaultConfig,
+  servedDescription,
   readGlobalConfig,
   writeVaultConfig,
   listVaults,
@@ -71,7 +73,7 @@ import {
   extractApiKey,
   type AuthResult,
 } from "./auth.ts";
-import { hasScopeForVault, hasMigrateScopeForVault, SCOPE_ADMIN, SCOPE_READ, scopeForMethod, verbForMethod } from "./scopes.ts";
+import { hasScopeForVault, hasMigrateScopeForVault, hasExportScopeForVault, SCOPE_ADMIN, SCOPE_READ, scopeForMethod, verbForMethod } from "./scopes.ts";
 import { getSharedEmbeddingProvider, getVaultStore } from "./vault-store.ts";
 import { resolveEmbeddingCapability } from "./embedding/capability.ts";
 import { handleScopedMcp } from "./mcp-http.ts";
@@ -133,6 +135,8 @@ import {
 } from "./transcription-routes.ts";
 import { getMirrorManager } from "./mirror-registry.ts";
 import { buildUsageReport } from "./usage.ts";
+import { collectExportEntries, tarSize, tarStream, tryAcquireExport } from "./export-tar.ts";
+import { readLastExport, recordExport } from "./export-stamp.ts";
 import { handleTicketSpend } from "./attachment-tickets.ts";
 import { ON_BEHALF_HEADER, resolveBy } from "../core/src/write-stamp.ts";
 
@@ -256,6 +260,52 @@ async function dispatchScopedMcp(
   // forwards JWT-shaped bearers).
   const callerBearer = extractApiKey(req);
   return handleScopedMcp(req, vaultName, auth, callerBearer);
+}
+
+/**
+ * GET /api/export: stream the whole vault as one tar (`export-tar.ts`; the same files as `parachute-vault export`).
+ * `by` is the key that pulled it. The vault records the time and `by` once the last byte has gone out
+ * (`last_export_at`, shown on `GET /api/vault` to an admin and by `parachute vault status`); a pull the client
+ * abandons records nothing, and neither does a `?since=` pull (a piece of the vault, not a backup).
+ * `?since=<iso>` and `?exported_at=<iso>` are the engine's, as on Parachute Cloud.
+ */
+async function handleExport(req: Request, store: Store, vaultConfig: VaultConfig, by: string | null): Promise<Response> {
+  const url = new URL(req.url);
+  const since = url.searchParams.get("since") ?? undefined;
+  const exportedAt = url.searchParams.get("exported_at") ?? undefined;
+  const name = vaultConfig.name;
+  // At most a few pulls of one vault at once: each holds all the note text in memory before its first byte.
+  const release = tryAcquireExport(name);
+  if (!release) {
+    return Response.json(
+      { error: "too_many_exports", message: "Too many exports of this vault are running. Try again shortly." },
+      { status: 429, headers: { "Retry-After": "5" } },
+    );
+  }
+  let entries;
+  try {
+    ({ entries } = await collectExportEntries(
+      store,
+      { vaultName: name, ...(vaultConfig.description ? { vaultDescription: vaultConfig.description } : {}), ...(since ? { since } : {}), ...(exportedAt ? { exportedAt } : {}) },
+      assetsDir(name),
+    ));
+  } catch (err) {
+    release();
+    console.error(`[export ${name}] failed: ${(err as Error).message}`);
+    return Response.json({ error: "export_failed", message: "Export could not be assembled. Please retry." }, { status: 500 });
+  }
+  const ts = new Date().toISOString().replace(/[:.]/g, "-");
+  // A `?since=` pull is a piece of the vault, not a backup: it does not move the stamp.
+  return new Response(tarStream(entries, () => { if (!since) recordExport(name, by); }, release), {
+    status: 200,
+    headers: {
+      "Content-Type": "application/x-tar",
+      "Content-Disposition": `attachment; filename="vault-${name}-${ts}.tar"`,
+      // Bun sends a streamed body chunked and drops this; a cut-off pull still fails for the client (the stream errors).
+      "Content-Length": String(tarSize(entries)),
+      "Cache-Control": "no-store",
+    },
+  });
 }
 
 /**
@@ -511,7 +561,7 @@ export async function route(
       const config = readVaultConfig(name);
       return {
         name,
-        description: config?.description,
+        description: servedDescription(name, config?.description),
         created_at: config?.created_at,
       };
     });
@@ -712,7 +762,10 @@ export async function route(
   // ---------------------------------------------------------------------
 
   const store = getVaultStore(vaultName);
-  const auth = await authenticateVaultRequest(req, vaultConfig);
+  // The backup key (export scope, nothing else) gets past authentication for `GET /api/export` only; everywhere else
+  // authenticateVaultRequest refuses it.
+  const isExportPull = req.method === "GET" && subpath === "/api/export";
+  const auth = await authenticateVaultRequest(req, vaultConfig, { allowExportOnly: isExportPull });
   if ("error" in auth) {
     return auth.error;
   }
@@ -749,7 +802,7 @@ export async function route(
     );
     return Response.json({
       name: vaultName,
-      description: vaultConfig.description,
+      description: servedDescription(vaultName, vaultConfig.description),
       createdAt: vaultConfig.created_at,
       stats,
     });
@@ -1131,6 +1184,25 @@ export async function route(
   if (!apiMatch) {
     return Response.json({ error: "Not found" }, { status: 404 });
   }
+  // GET /api/export: the whole vault as one tar. A read key (or better) or the export key may pull it; a tag-scoped
+  // key may not (the export is the whole vault). Dispatched before the generic verb gate, which would ask for read.
+  if (apiMatch[1] === "/export") {
+    if (req.method !== "GET") return Response.json({ error: "Method not allowed", error_type: "method_not_allowed" }, { status: 405 });
+    if (!hasScopeForVault(auth.scopes, vaultName, "read") && !hasExportScopeForVault(auth.scopes, vaultName)) {
+      return Response.json(
+        {
+          error: "Forbidden",
+          error_type: "insufficient_scope",
+          message: `This endpoint requires the '${SCOPE_READ}' scope (or '${SCOPE_READ.replace("vault:", `vault:${vaultName}:`)}'), or the export scope.`,
+          required_scope: SCOPE_READ,
+          granted_scopes: auth.scopes,
+        },
+        { status: 403 },
+      );
+    }
+    if (auth.scoped_tags !== null) return tagScopedVaultWideForbidden(auth.scoped_tags);
+    return handleExport(req, store, vaultConfig, auth.via ?? auth.actor ?? null);
+  }
   // The record door over REST (SPEC §5.1): `/api/records…` runs as its `/api/notes…` twin and `/api/types…` as
   // `/api/tags…`, so every gate below (scopes, admin routes, tag scope) is the twin's, under the new name too.
   // The words move in records-rest.ts.
@@ -1336,7 +1408,7 @@ export async function route(
     // description edit unless this is null (admin).
     const descriptionForbidden = hasScopeForVault(auth.scopes, vaultName, "admin")
       ? null
-      : () => descriptionNeedsAdmin(vaultName, auth.scopes);
+      : (what?: string) => descriptionNeedsAdmin(vaultName, auth.scopes, what);
     return handleVault(
       req,
       store,
@@ -1348,6 +1420,8 @@ export async function route(
       tagScope,
       undefined, // resolveEmbeddingCap — keep the production default
       descriptionForbidden,
+      // When the last full export went out and to which key: an admin's view, and not a tag-scoped one.
+      hasScopeForVault(auth.scopes, vaultName, "admin") && tagScope.raw === null ? readLastExport(vaultName) : null,
     );
   }
   if (apiPath === "/unresolved-wikilinks") return handleUnresolvedWikilinks(req, store, tagScope);

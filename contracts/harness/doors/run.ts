@@ -6,12 +6,15 @@
 //   bun run doors -- --doors box --check-golden          the box must match the fingerprint kept in suites/door/golden
 //   bun run doors -- --doors cloud --with-golden box-0.8 compare cloud with the box's kept fingerprint (another
 //                                                        repo's CI: it runs its own door and needs no box)
+//   bun run doors -- --doors box --embeddings suites/v093  the box with meaning search on (the bundled model)
 //   bun run doors:keep box-0.8                           keep the last run's fingerprint as the golden one
-//   bun run doors -- --remote <door.json>                a deployed door, from a door file written by hand; no
+//   bun run doors -- --remote <door.json>                a deployed door, from a door file written by hand (or by
+//                                                        harness/doors/remote-cloud.ts for a staging cloud); no
 //                                                        sandbox (it needs the network), DOOR_REMOTE_HOSTS names it
 //
 //   CANDIDATE_DIR=<dir>     the box: a built candidate (default .cache/candidate-core, from `bun run build:core`)
-//   CLOUD_REPO=<dir>        cloud: a parachute-cloud checkout, dependencies installed, engine pin materialised
+//   CLOUD_REPO=<dir>        cloud: a parachute-cloud checkout, dependencies installed, engine pin materialised; its
+//                           pin's version picks the release line (0.8, or 0.9.1 with a linked owner key)
 //   PERSONAL_REPO=<dir>     personal: a checkout that has the single-owner profile (OWNER_PUBKEY)
 //   DOOR_RESULTS=<dir>      where the results go (default .cache/doors); the only thing a run leaves behind
 //
@@ -22,14 +25,12 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { randomBytes } from "node:crypto";
 import { join, resolve } from "node:path";
 import { enterSandbox, inSandbox } from "../sandbox.ts";
-import { loadCandidate, prepareInfo, runCli } from "../candidate.ts";
+import { loadCandidate, prepareInfo } from "../candidate.ts";
 import { safeFetch } from "../guard.ts";
 import type { Door } from "../../suites/door/_door.ts";
 import { linkOwnerKeyOnBox, startBoxDoor } from "./box.ts";
-import { makeOwnerKey, nostrAuthorization, signUp, startWorkersDoor } from "./workers.ts";
+import { linkOwnerKeyOnCloud, makeOwnerKey, nostrAuthorization, signUp, startWorkersDoor } from "./workers.ts";
 import { compare, matrix, readFingerprint, readJunit, serializeFingerprint, type Deliberate } from "./compare.ts";
-import { recordExport } from "../../suites/door/_exit.ts";
-import { appendFileSync, readdirSync, statSync } from "node:fs";
 
 const contracts = resolve(import.meta.dir, "..", "..");
 if (!inSandbox() && !process.env.PCORE_SANDBOX) {
@@ -61,6 +62,9 @@ const has = (name: string) => {
 };
 const withGolden = flag("--with-golden");
 const checkGolden = has("--check-golden");
+// The box with meaning search on (the bundled model): for the suites that need embeddings (suites/v093/hybrid). The
+// suites see it as DOOR_EMBEDDINGS=on.
+if (has("--embeddings")) process.env.DOOR_EMBEDDINGS = "on";
 const goldenDir = join(contracts, "suites", "door", "golden");
 const want = remoteFile ? ["remote"] : (flag("--doors") ?? ["box", process.env.CLOUD_REPO ? "cloud" : "", process.env.PERSONAL_REPO ? "personal" : ""].filter(Boolean).join(",")).split(",");
 const files = args.filter((a) => a.startsWith("suites/"));
@@ -92,8 +96,6 @@ async function accountBearer(issuer: string, s: { cookie: string; csrf: string }
 interface Started {
   door: Door;
   provenance: string;
-  /** A door with no export over HTTP: its own export of the vault, as files (the box's CLI). */
-  exportFiles?: () => Promise<{ name: string; bytes: Uint8Array }[]>;
   stop(): Promise<void>;
   logs(): Promise<string> | string;
 }
@@ -102,7 +104,7 @@ async function startBox(): Promise<Started> {
   const dir = resolve(process.env.CANDIDATE_DIR ?? join(contracts, ".cache", "candidate-core"));
   const { manifest, sha256 } = await loadCandidate(dir);
   const info = prepareInfo(dir, manifest, sha256);
-  const box = await startBoxDoor(info);
+  const box = await startBoxDoor(info, { embeddings: process.env.DOOR_EMBEDDINGS === "on" });
   const other = `other${randomBytes(3).toString("hex")}`;
   await ensureVault(box.issuer, await accountBearer(box.issuer, box.session), other);
   // The release line decides which contracts apply and which doors are compared with each other. 0.9.1 is 0.9 with
@@ -119,15 +121,6 @@ async function startBox(): Promise<Started> {
   return {
     door: { kind: "box", label: `box-${release}`, release, issuer: box.issuer, vaultOrigin: box.vaultOrigin, vault: box.vault, otherVault: other, signIn: { how: "cookie", ...box.session }, ...(ownerKey ? { ownerKey } : {}) },
     provenance: `box: candidate ${sha256.slice(0, 16)} (${manifest.name}, profile ${manifest.profile}, core ${manifest.core_commit})`,
-    exportFiles: async () => {
-      const dir = join(info.scratch, `export-${randomBytes(3).toString("hex")}`);
-      const s = box.running.services;
-      const r = await runCli(info, s.home, ["export", dir, "--vault", box.vault], { bin: info.vaultBin });
-      if (r.code !== 0) throw new Error(`door: the box's export failed (${r.code}): ${r.stderr.slice(-400)}`);
-      const walk = (d: string, rel = ""): { name: string; bytes: Uint8Array }[] =>
-        readdirSync(d).flatMap((n) => (statSync(join(d, n)).isDirectory() ? walk(join(d, n), `${rel}${n}/`) : [{ name: `${rel}${n}`, bytes: new Uint8Array(readFileSync(join(d, n))) }]));
-      return walk(dir);
-    },
     stop: async () => {
       await box.running.stop();
       rmSync(info.scratch, { recursive: true, force: true });
@@ -140,6 +133,12 @@ function gitHead(repo: string): string {
   const r = Bun.spawnSync(["git", "-C", repo, "rev-parse", "--short", "HEAD"], { stdout: "pipe", stderr: "ignore" });
   const dirty = Bun.spawnSync(["git", "-C", repo, "status", "--porcelain", "--untracked-files=no"], { stdout: "pipe", stderr: "ignore" }).stdout.toString().trim();
   return `${r.stdout.toString().trim() || "?"}${dirty ? " (edited)" : ""}`;
+}
+/** The release line a cloud checkout runs: its engine pin's version says (0.8.x, or 0.9 with owner keys, 0.9.1). */
+function cloudRelease(repo: string): string {
+  const f = join(repo, "scripts", "core-source.env");
+  const v = existsSync(f) ? readFileSync(f, "utf8").match(/^PARACHUTE_CORE_VERSION="([^"]+)"/m)?.[1] : undefined;
+  return v && /^0\.9\./.test(v) ? "0.9.1" : "0.8";
 }
 function corePin(repo: string): string {
   const f = join(repo, "scripts", "core-source.env");
@@ -158,8 +157,16 @@ async function startCloud(): Promise<Started> {
     const other = `other${id}`;
     await ensureVault(w.issuer, bearer, vault);
     await ensureVault(w.issuer, bearer, other);
+    // A 0.9.1 cloud door: link a made-up key to the account, as its owner would.
+    const release = cloudRelease(repo);
+    let ownerKey: string | undefined;
+    if (release === "0.9.1") {
+      const owner = await makeOwnerKey();
+      await linkOwnerKeyOnCloud(w.issuer, bearer, owner.secretKey);
+      ownerKey = owner.secretKey;
+    }
     return {
-      door: { kind: "cloud", label: "cloud-0.8", release: "0.8", issuer: w.issuer, vaultOrigin: w.vaultOrigin, vault, otherVault: other, signIn: { how: "cookie", cookie: me.cookie, csrf: me.csrf } },
+      door: { kind: "cloud", label: `cloud-${release}`, release, issuer: w.issuer, vaultOrigin: w.vaultOrigin, vault, otherVault: other, signIn: { how: "cookie", cookie: me.cookie, csrf: me.csrf }, ...(ownerKey ? { ownerKey } : {}) },
       provenance: `cloud: parachute-cloud ${gitHead(repo)}, core pin ${corePin(repo)}, local workerd`,
       stop: w.stop,
       logs: w.logs,
@@ -205,13 +212,18 @@ async function startPersonal(): Promise<Started> {
 }
 
 /**
- * A deployed door, from a door file written by hand: kind, label, release, issuer, vaultOrigin, and a sign-in whose
- * key is in a file (`signIn: {how: "nostr", secretKeyFile}`). The run makes its own two vaults there through the
- * account door and removes them at the end. DOOR_REMOTE_HOSTS must name the door's hosts (suites/door/_door.ts).
+ * A deployed door, from a door file written by hand (or by remote-cloud.ts): kind, label, release, issuer,
+ * vaultOrigin, and a sign-in kept in a file, a key (`signIn: {how: "nostr", secretKeyFile}`) or a browser session
+ * (`signIn: {how: "cookie", cookieFile}`, with the owner key in `ownerKeyFile`). Use absolute paths: the suite reads
+ * them again from its own folder (suites/door/_door.ts). The run makes its own two vaults there through the account
+ * door and removes them at the end. DOOR_REMOTE_HOSTS must name the door's hosts.
  */
 async function startRemote(): Promise<Started> {
-  const d = JSON.parse(readFileSync(remoteFile!, "utf8")) as Door;
-  if (d.signIn?.how !== "nostr" || !d.signIn.secretKeyFile) throw new Error("door: a remote door file signs in with a key file: signIn {how: \"nostr\", secretKeyFile}");
+  const d = JSON.parse(readFileSync(remoteFile!, "utf8")) as Door & { signIn: { how: string; secretKeyFile?: string; cookieFile?: string }; ownerKeyFile?: string };
+  const byCookie = d.signIn?.how === "cookie" && !!d.signIn.cookieFile;
+  if (!byCookie && (d.signIn?.how !== "nostr" || !d.signIn.secretKeyFile)) {
+    throw new Error('door: a remote door file signs in with a key file (signIn {how: "nostr", secretKeyFile}) or a session file (signIn {how: "cookie", cookieFile})');
+  }
   const { allowOrigins } = await import("../guard.ts");
   for (const url of [d.issuer, d.vaultOrigin]) {
     const host = new URL(url).hostname;
@@ -219,17 +231,22 @@ async function startRemote(): Promise<Started> {
     if (!(process.env.DOOR_REMOTE_HOSTS ?? "").split(",").map((h) => h.trim()).includes(host)) throw new Error(`refused: name ${host} in DOOR_REMOTE_HOSTS to run against it`);
   }
   allowOrigins(d.issuer, d.vaultOrigin);
-  const secretKey = readFileSync(d.signIn.secretKeyFile, "utf8").trim();
+  // A session file (a cloud door's browser sign-in, for the approval contracts) holds {cookie, csrf}; its owner key, if
+  // any, is in ownerKeyFile. Neither is ever written into a door file or a result.
+  const session = byCookie ? (JSON.parse(readFileSync(d.signIn.cookieFile!, "utf8")) as { cookie: string; csrf: string }) : null;
+  const secretKey = byCookie ? null : readFileSync(d.signIn.secretKeyFile!, "utf8").trim();
+  const bearerNow = () => (session ? accountBearer(d.issuer, session) : accountBearerByKey(d.issuer, secretKey!));
   const id = randomBytes(3).toString("hex");
   const [vault, other] = [`doorrun${id}`, `doorother${id}`];
-  const bearer = await accountBearerByKey(d.issuer, secretKey);
+  const bearer = await bearerNow();
   await ensureVault(d.issuer, bearer, vault);
   await ensureVault(d.issuer, bearer, other);
   return {
-    door: { ...d, vault, otherVault: other },
+    // The door file the suite reads keeps the file paths, never what they hold (suites/door/_door.ts reads them).
+    door: { ...d, vault, otherVault: other } as Door,
     provenance: `remote: ${d.label} at ${new URL(d.issuer).host} and ${new URL(d.vaultOrigin).host}`,
     stop: async () => {
-      const b = await accountBearerByKey(d.issuer, secretKey);
+      const b = await bearerNow();
       for (const name of [vault, other]) {
         await safeFetch(`${d.issuer}/account/vaults/${name}`, { method: "DELETE", headers: { authorization: `Bearer ${b}`, "content-type": "application/json" }, body: JSON.stringify({ confirm: name }) }).catch(() => {});
       }
@@ -274,15 +291,6 @@ for (const name of want) {
   const summary = `${so}${se}`.split("\n").filter((l) => /^\s*\d+ (pass|fail|skip)|^Ran \d+ tests/.test(l)).map((l) => l.trim()).join(", ");
   console.log(`[doors] ${label}: ${code === 0 ? "PASS" : "FAIL"} (${summary})`);
   lines.push(`${code === 0 ? "PASS" : "FAIL"} ${label} (${summary})`);
-  // The box's exit is its own command: record what it exports under the same keys the HTTP exit records.
-  if (s.exportFiles && !files.length) {
-    try {
-      recordExport(await s.exportFiles(), (key, value) => appendFileSync(fingerprint, `${JSON.stringify({ key, value })}\n`));
-    } catch (err) {
-      console.error(`[doors] ${label}: ${(err as Error).message}`);
-      failed++;
-    }
-  }
   if (code !== 0) {
     failed++;
     console.log(`${so}${se}`.split("\n").filter((l) => /\(fail\)|error:|Expected|Received|^\s+at /.test(l)).slice(0, 80).join("\n"));

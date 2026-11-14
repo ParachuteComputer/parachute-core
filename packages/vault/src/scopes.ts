@@ -41,6 +41,15 @@ export const SCOPE_ADMIN = "vault:admin" as const;
  */
 export const SCOPE_MIGRATE = "vault:migrate" as const;
 
+/**
+ * The backup scope (0.9.3 "the exit"): download this vault's full export, nothing else. Like `migrate` it is NOT on
+ * the read ⊇ write ⊇ admin ladder, and unlike migrate it grants no read either: `decomposeVaultScope` returns null
+ * for it, so every `hasScopeForVault` check (read, write, admin) is false for a key that holds only this. Only
+ * `GET /api/export` looks for it (`hasExportScopeForVault`), and `authenticateVaultRequest` refuses an export-only
+ * key everywhere else, so a route that checks "is this key authenticated" and not a verb can't open to it either.
+ */
+export const SCOPE_EXPORT = "vault:export" as const;
+
 /** All first-class vault scopes in inheritance order (lowest → highest). */
 export const VAULT_SCOPES = [SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN] as const;
 export type VaultScope = (typeof VAULT_SCOPES)[number];
@@ -167,6 +176,27 @@ export function hasMigrateScopeForVault(granted: string[], vaultName: string): b
 }
 
 /**
+ * Does `granted` hold the export capability for `vaultName`? Broad `vault:export` (any vault, a vault-pinned
+ * credential) or narrowed `vault:<name>:export` (this vault only). Matched by exact shape, like migrate; a read,
+ * write or admin grant does NOT satisfy it here (those reach the export route through their read check).
+ */
+export function hasExportScopeForVault(granted: string[], vaultName: string): boolean {
+  for (const s of granted) {
+    if (s === SCOPE_EXPORT) return true;
+    if (s === `vault:${vaultName}:export`) return true;
+  }
+  return false;
+}
+
+/**
+ * True when the key can export this vault but read nothing in it: the backup key. Such a key is let into one route
+ * only (`GET /api/export`); see `authenticateVaultRequest`.
+ */
+export function isExportOnly(granted: string[], vaultName: string): boolean {
+  return hasExportScopeForVault(granted, vaultName) && !hasScopeForVault(granted, vaultName, "read");
+}
+
+/**
  * Structured log line for a migration-bypassed write (vault#299 settled lead
  * #2). Records WHO bypassed (actor/via from MW1 attribution), WHAT note, and
  * WHICH strict violations were waived — enough to reconstruct the bypass for
@@ -239,6 +269,16 @@ export function validateMintedScopes(
 ): { ok: true } | { ok: false; rejected: { scope: string; reason: string }[] } {
   const rejected: { scope: string; reason: string }[] = [];
   for (const s of requested) {
+    // The backup scope: only an admin of this vault may hand it out, and only for this vault.
+    const exportMatch = /^vault:([^:]+):export$/.exec(s);
+    if (exportMatch) {
+      if (exportMatch[1] !== vaultName) {
+        rejected.push({ scope: s, reason: `cross-vault scope not allowed (this endpoint mints for vault '${vaultName}')` });
+      } else if (!hasScopeForVault(callerScopes, vaultName, "admin")) {
+        rejected.push({ scope: s, reason: `caller lacks 'admin' on vault '${vaultName}' — cannot grant a stronger scope than held` });
+      }
+      continue;
+    }
     const d = decomposeVaultScope(s);
     if (!d) {
       rejected.push({ scope: s, reason: "unknown or unsupported scope" });
@@ -295,7 +335,7 @@ export function findBroadVaultScopes(granted: string[]): string[] {
   const out: string[] = [];
   for (const s of granted) {
     const d = decomposeVaultScope(s);
-    if (d && d.vault === null) out.push(s);
+    if ((d && d.vault === null) || s === SCOPE_EXPORT) out.push(s);
   }
   return out;
 }

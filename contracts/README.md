@@ -163,7 +163,9 @@ bun run moves                                    # a made-up vault through all t
   change, `bun run doors:keep box-0.9` and commit the diff). parachute-cloud's CI runs its own door from its pin of
   this folder and compares with the kept box of the release it runs (`box-0.8.jsonl` while cloud is on 0.8; that
   file was kept from `next` at 53f956f plus this suite's one fix to the box, the last 0.8 on `next`, and is checked
-  again by building `release/0.8`: `CANDIDATE_DIR=<that build> bun run doors -- --doors box --check-golden`).
+  again by building `release/0.8`: `CANDIDATE_DIR=<that build> bun run doors -- --doors box --check-golden`). A cloud checkout
+  pinned to a 0.9 engine (`PARACHUTE_CORE_VERSION` 0.9.x in its `scripts/core-source.env`) runs as `cloud-0.9.1`
+  against `box-0.9.1.jsonl`, with a made-up owner key linked to its account at `/account/pubkeys`.
   Neither repo builds the other's door.
 - **A deployed door** is run from a door file written by hand (`kind`, `label`, `release`, `issuer`, `vaultOrigin`,
   `signIn: {how: "nostr", secretKeyFile}`), with `DOOR_REMOTE_HOSTS` naming its hosts. The run makes two vaults of
@@ -201,11 +203,23 @@ not yet decided are written at the top of each file, marked proposed.
 
 | File | What it holds |
 |---|---|
-| `v092/query.test.ts` | Filter and sort any field: every operator on a field that isn't indexed gives its indexed twin's rows, with a warning that it scanned (REST and MCP); a field no type declares; a word that is only in a field value is found by search. |
+| `v092/query.test.ts` | Filter and sort any field: every operator on a field that isn't indexed gives its indexed twin's rows, with a warning that it scanned (REST and MCP); a field no type declares; a word that is only in a field value is found by search (REST and MCP), ranks below a title or body hit, is searchable at once after a field-only edit and not by its old value, and a list, number or nested value is searchable by its text. `safety/search-fields.test.ts` adds the tag-scoped side. |
 | `v092/schema-change.test.ts` | A retype that would strand records is refused and says how many; a dry-run migrate over REST (admin) and MCP says what would change and writes nothing. |
 | `v092/field-types.test.ts` | A record with two types is checked against both; `doctor` reports a field holding two data types, declared or not. |
 | `v092/teaching.test.ts` | The nearest existing name on a new type or field (a warning); `vault-info`'s tag map capped (700 types fit in about 4,000 tokens); manage-types' own schema names `reference`, `required`, `strict`, `cardinality`; search says it needs every word. |
 | `v092/doctor.test.ts` | `doctor` finds a field that names records but isn't a declared reference, and names one letter apart; it counts indexed fields against 88, and the 89th is refused with what to prune. |
+
+### 0.9.3: hybrid search (`suites/v093/`)
+
+Door contracts for 0.9.3, built red-first like v092's. `v093/hybrid.test.ts` is run twice on a box from the same build,
+because meaning search is opt-in and a box has it only when switched on: `bun run doors -- --doors box --embeddings
+suites/v093` (the bundled embedding model on the box; nothing faked) and `bun run doors -- --doors box suites/v093`
+(no embedding provider, the default). Each run first checks which mode it is in. `--embeddings` makes the runner
+start the box with `EMBEDDINGS_ENABLED=true`; a suite sees it as `DOOR_EMBEDDINGS=on`.
+
+| File | What it holds |
+|---|---|
+| `v093/hybrid.test.ts` | `search_mode: "hybrid"` finds a plain-words question that literal search misses, with `matched_by: ["meaning"]`, and puts a rare exact word first with `"keyword"`; with no provider it answers by keyword alone with a `semantic_unavailable` warning; a tag-scoped pass (minted by attenuation over the hub's HTTP mint, so box only) gets a full page of in-scope notes through either arm, plain meaning search included, with nothing out of scope in the reply and the same answer whether or not hidden notes exist; REST (`/api/notes`, `/api/records`) answers the same ids as MCP; `auto` is on by default: a 4+ word question with no `search_mode` is answered by hybrid with `search_auto` (also for a tag-scoped pass); 1–3 word searches, `search_mode: "literal"` and a search with `sort` are byte-identical to literal; a call's `search_mode` beats the vault's `search.auto_hybrid`, which an admin sets over `PATCH /api/vault` (true, false, null) and only an admin reads. |
 
 `suites/bench/query-092.bench.ts` is the 0.9.2 bench, not a contract: made-up records at `BENCH_N` on the box, every
 operator, search, a type PUT and a retype, timed (`BENCH_N=94000 bun run doors -- --doors box suites/bench/query-092.bench.ts`).

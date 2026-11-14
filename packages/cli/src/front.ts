@@ -16,6 +16,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { join } from "node:path";
 import core from "../../../package.json" with { type: "json" };
 import changesMap from "./changes-0.9.json" with { type: "json" };
+import { changesJson } from "./changes-json.ts";
 import { embeddedHolder } from "./managed.ts";
 import { namesModule } from "./primary.ts";
 
@@ -28,6 +29,8 @@ export interface Change {
   since: string;
   removed_in: string | null;
   state: "live" | "planned";
+  /** The release that made this entry live, when the map says (from 0.9.3). */
+  release?: string;
 }
 
 export interface ChangeMap {
@@ -116,6 +119,8 @@ const OLD: { match: string[]; now: string | null; entry: string; when?: (rest: s
   { match: ["vault", "mcp-install"], now: "setup mcp", entry: "parachute-vault mcp-install" },
   { match: ["vault", "transcription", "install"], now: "setup transcription", entry: "parachute-vault transcription install" },
   { match: ["vault", "tokens"], now: "keys", entry: "parachute-vault tokens list|revoke" },
+  { match: ["auth", "reap-clients"], now: "doctor --fix", entry: "parachute auth reap-clients" },
+  { match: ["vault", "history", "rebuild-state"], now: "doctor --fix", entry: "parachute-vault history rebuild-state" },
   { match: ["vault", "backup"], now: "backup", entry: "parachute-vault backup [status] [--schedule]" },
 ];
 
@@ -209,6 +214,7 @@ export function frontHelp(): string {
     "  serve                         run in the foreground (units, containers, Prism)",
     "  start|stop|restart            the background service",
     "  upgrade [--rollback]          this program, or back to the release before",
+    "  config get|set|unset          the settings file, parachute.yaml (port, origin, vault descriptions)",
     "",
     "Safety",
     "  backup [now|list|schedule]    the vaults' backups",
@@ -284,8 +290,7 @@ export function changes(args: string[], home: string, out = console.log, err = c
     }
   }
   if (json) {
-    const { changes: _all, ...head } = CHANGES;
-    out(JSON.stringify({ ...head, changes: list }));
+    out(changesJson(list));
     return 0;
   }
   if (forAgent) {

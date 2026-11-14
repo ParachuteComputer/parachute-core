@@ -1,10 +1,10 @@
 /**
  * `/account/keys` — named app keys (0.9.1 "keys by name", T-414). The owner mints a long-lived key for one vault at
- * `read` or `write` for an app (Taste Arcade's worker, a script), lists them with when each was last used, and
+ * `read`, `write` or `export` (the full export only) for an app (Taste Arcade's worker, a script), lists them with when each was last used, and
  * revokes one by name. The same wire shapes are cloud's account door (parachute-cloud workers/identity
  * `account-keys.ts`), so one client works against a box and a cloud or own-Cloudflare hub.
  *
- *   POST   /account/keys          {name, vault, can: "read"|"write", expires_in?, on_behalf_of?: true}
+ *   POST   /account/keys          {name, vault, can: "read"|"write"|"export", expires_in?, on_behalf_of?: true}
  *                                 → 201 {name, vault, can, scopes, token, created_at, expires_at, last_used_at}
  *   POST   /account/keys          {name, vaults: {<vault>: "read"|"write", …}, expires_in?}   (0.9.1, T-446)
  *                                 → 201 {name, vaults, scopes, token, …}: a key for the account door (`/account/mcp`)
@@ -14,7 +14,7 @@
  *   DELETE /account/keys/<name>   → 200 {name, revoked_at}   (idempotent; 404 for a name that isn't yours)
  *
  * What holds it safe:
- *   - **Never admin.** `can` is `read` or `write`, nothing else, and the body may carry no other field: a `scopes`
+ *   - **Never admin.** `can` is `read`, `write` or `export` (the backup key: the full export, nothing else), and the body may carry no other field: a `scopes`
  *     list, `admin` or a typo is refused with 400 before anything is signed. The scopes are built here:
  *     `vault:<v>:read`, plus `vault:<v>:write` for write, with `vault_scope` pinned to `<v>` and `aud=vault.<v>`.
  *   - **Only the owner mints.** Every route needs `parachute:host:admin`: the hub's own account token (session or
@@ -58,7 +58,9 @@ export const APP_KEY_MAX_TTL_SECONDS = 365 * 24 * 60 * 60;
 /** The shortest key worth naming. */
 export const APP_KEY_MIN_TTL_SECONDS = 60;
 
-const LEVELS = { read: ["read"], write: ["read", "write"] } as const;
+// `export` is the backup key (0.9.3): the one scope `vault:<v>:export`, no read with it. Vault auth.ts lets it into
+// `GET /api/export` and refuses it everywhere else.
+const LEVELS = { read: ["read"], write: ["read", "write"], export: ["export"] } as const;
 type Can = keyof typeof LEVELS;
 const BODY_FIELDS = new Set(["name", "vault", "can", "vaults", "expires_in", "on_behalf_of"]);
 /** A multi-vault key covers at most this many vaults (the 10-vault power user, with room). */
@@ -107,7 +109,7 @@ function view(r: AppKeyRow, now: Date) {
   const scopes = r.scopes.split(/\s+/).filter(Boolean);
   const levels = vaultLevels(scopes);
   const vault = scopes[0]?.split(":")[1] ?? null;
-  const can: Can = scopes.some((s) => s.endsWith(":write")) ? "write" : "read";
+  const can: Can = scopes.some((s) => s.endsWith(":write")) ? "write" : scopes.some((s) => s.endsWith(":export")) ? "export" : "read";
   const status = r.revoked_at
     ? "revoked"
     : r.expires_at <= now.toISOString()
@@ -200,10 +202,10 @@ async function mintAppKey(req: Request, deps: AccountKeysDeps): Promise<Response
   try {
     raw = await req.json();
   } catch {
-    return err(400, "invalid_request", 'send JSON: {name, vault, can: "read"|"write"}');
+    return err(400, "invalid_request", 'send JSON: {name, vault, can: "read"|"write"|"export"}');
   }
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-    return err(400, "invalid_request", 'send JSON: {name, vault, can: "read"|"write"}');
+    return err(400, "invalid_request", 'send JSON: {name, vault, can: "read"|"write"|"export"}');
   }
   const body = raw as Record<string, unknown>;
   const extra = Object.keys(body).filter((k) => !BODY_FIELDS.has(k));
@@ -226,8 +228,8 @@ async function mintAppKey(req: Request, deps: AccountKeysDeps): Promise<Response
   if (typeof vault !== "string" || !VAULT_NAME_CHARSET_RE.test(vault)) {
     return err(400, "invalid_request", "vault: the name of one vault");
   }
-  if (can !== "read" && can !== "write") {
-    return err(400, "invalid_scope", 'can: "read" or "write"; an app key is never admin');
+  if (can !== "read" && can !== "write" && can !== "export") {
+    return err(400, "invalid_scope", 'can: "read", "write" or "export" (the export key downloads the full export and nothing else); an app key is never admin');
   }
   const onBehalf = body.on_behalf_of;
   if (onBehalf !== undefined && typeof onBehalf !== "boolean") {
@@ -236,6 +238,9 @@ async function mintAppKey(req: Request, deps: AccountKeysDeps): Promise<Response
       "invalid_request",
       'on_behalf_of: true lets the key write on behalf of people it names (stamped "by <name>:<id>"); false or absent, it writes as you',
     );
+  }
+  if (onBehalf === true && can === "export") {
+    return err(400, "invalid_request", "on_behalf_of: an export key writes nothing, so it has nobody to write for");
   }
   if (onBehalf === true) {
     const problem = onBehalfNameProblem(name);

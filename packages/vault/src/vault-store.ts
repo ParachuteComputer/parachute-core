@@ -6,7 +6,7 @@ import { assertVaultNotPaused } from "./mirror-config.ts";
  * implementation to avoid duplicating wikilink hooks and other behavior.
  */
 
-import { readVaultConfig } from "./config.ts";
+import { readVaultConfig, vaultDbPath, vaultConfigPath } from "./config.ts";
 import { SqliteStore } from "../core/src/store.ts";
 import { defaultHookRegistry } from "../core/src/hooks.ts";
 import type { Store } from "../core/src/types.ts";
@@ -14,6 +14,7 @@ import type { EmbeddingProvider } from "../core/src/embedding/provider.ts";
 import { buildEmbeddingProvider } from "./embedding/select.ts";
 import { readGlobalConfig } from "./config.ts";
 import { openVaultDb } from "./db.ts";
+import { existsSync, statSync } from "node:fs";
 
 /**
  * The honest hint `semanticSearch` surfaces when semantic search is OFF
@@ -99,10 +100,76 @@ export function resetSharedEmbeddingProviderForTests(): void {
   resetSharedEmbeddingProvider();
 }
 
+/** The database file's inode when each cached store was opened: a file deleted and made again under one name is a different vault. */
+const storeFile = new Map<string, string>();
+
+/** Who this vault's database file is: device, inode and birth time. A deleted and re-made vault differs even if the filesystem reuses the inode. Null when there is no file. */
+export function vaultIdentity(name: string): string | null {
+  try {
+    const st = statSync(vaultDbPath(name));
+    return `${st.dev}:${st.ino}:${st.birthtimeMs}`;
+  } catch {
+    return null;
+  }
+}
+
+let replacedHandler: ((name: string) => void) | null = null;
+
+/**
+ * The running server's cleanup for a vault whose files were replaced (triggers, mirror, sockets of the old one).
+ * `getVaultStore` calls it before handing out the new store, so every door that opens a store is covered.
+ */
+export function setVaultReplacedHandler(fn: ((name: string) => void) | null): void {
+  replacedHandler = fn;
+}
+
+/** Close and forget a vault's cached store (the vault was deleted). The files are not touched. */
+export function evictVaultStore(name: string): void {
+  const store = stores.get(name);
+  stores.delete(name);
+  storeFile.delete(name);
+  if (!store) return;
+  try { store.db.close(); } catch {}
+}
+
+/** A vault is being made over an old one right now; the caller should retry in a moment (served as 503 + Retry-After). */
+export class VaultBeingMadeError extends Error {
+  readonly error_type = "vault_being_made";
+  readonly status = 503;
+  readonly retryAfterSeconds = 1;
+  constructor(name: string) {
+    super(`vault "${name}" is being made; try again in a moment`);
+    this.name = "VaultBeingMadeError";
+  }
+}
+
+/** The answer for a `VaultBeingMadeError` (503, `Retry-After: 1`), or null for any other error. */
+export function beingMadeResponse(err: unknown, headers: Record<string, string> = {}): Response | null {
+  if (!(err instanceof VaultBeingMadeError)) return null;
+  return Response.json(
+    { error_type: err.error_type, message: err.message },
+    { status: err.status, headers: { ...headers, "Retry-After": String(err.retryAfterSeconds) } },
+  );
+}
+
 /** Get or create a store for a vault. */
 export function getVaultStore(name: string): SqliteStore {
   assertVaultNotPaused(name);
   let store = stores.get(name);
+  if (store) {
+    // The vault was deleted and made again under this name while the old handle stayed open: forget the old one.
+    const now = vaultIdentity(name);
+    if (now !== null && now !== storeFile.get(name)) {
+      evictVaultStore(name);
+      replacedHandler?.(name);
+      store = undefined;
+    } else if (now === null && existsSync(vaultConfigPath(name))) {
+      // Settings file there, database not yet: a vault is being made over the old one. Never serve the old handle.
+      evictVaultStore(name);
+      replacedHandler?.(name);
+      throw new VaultBeingMadeError(name);
+    }
+  }
   if (!store) {
     const db = openVaultDb(name);
     // Share the process-wide hook registry so features can register
@@ -123,6 +190,8 @@ export function getVaultStore(name: string): SqliteStore {
       embeddingDisabledReason: embeddingProvider ? undefined : EMBEDDINGS_DISABLED_REASON,
     });
     stores.set(name, store);
+    const ino = vaultIdentity(name);
+    if (ino !== null) storeFile.set(name, ino);
     storeToVault.set(store, name);
     try { store.sweepDeletedHistory(); }
     catch (error) { console.warn(`[vault] deleted history sweep failed for ${name}:`, error); }
@@ -162,6 +231,7 @@ export function closeAllStores(silent = false): void {
     }
   }
   stores.clear();
+  storeFile.clear();
 }
 
 /**

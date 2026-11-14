@@ -128,8 +128,8 @@ describe("buildLiteralSearchQuery", () => {
 });
 
 describe("isValidSearchMode / SEARCH_MODES", () => {
-  it("SEARCH_MODES is exactly literal + advanced", () => {
-    expect(SEARCH_MODES).toEqual(["literal", "advanced"]);
+  it("SEARCH_MODES is exactly literal + advanced + hybrid (T-461 prototype)", () => {
+    expect(SEARCH_MODES).toEqual(["literal", "advanced", "hybrid"]);
   });
 
   it("accepts literal and advanced", () => {

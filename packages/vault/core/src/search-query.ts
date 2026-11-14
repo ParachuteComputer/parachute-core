@@ -26,13 +26,13 @@
  * inherit it from the same shared library.
  */
 
-export const SEARCH_MODES = ["literal", "advanced"] as const;
+export const SEARCH_MODES = ["literal", "advanced", "hybrid"] as const;
 export type SearchMode = (typeof SEARCH_MODES)[number];
 
 /**
  * bm25 column weights for `notes_fts` (vault#551 WS2C — ranking legibility,
- * schema v25). `notes_fts` indexes two columns, `path` (title) then
- * `content` (body), in that declared order (`core/src/schema.ts`) —
+ * schema v25). `notes_fts` indexes three columns, `path` (title), `content`
+ * (body), then `fields` (field values, 0.9.3), in that declared order (`core/src/schema.ts`) —
  * `bm25(notes_fts, w0, w1, ...)`'s weight arguments are POSITIONAL, so
  * `SEARCH_WEIGHT_PATH` must be passed first, `SEARCH_WEIGHT_CONTENT`
  * second, matching column declaration order exactly.
@@ -49,6 +49,13 @@ export type SearchMode = (typeof SEARCH_MODES)[number];
  */
 export const SEARCH_WEIGHT_PATH = 10.0;
 export const SEARCH_WEIGHT_CONTENT = 1.0;
+/**
+ * Field values rank below the body: a word that is only in a record's fields is a weaker sign it is what the caller
+ * wants than a word in its text or title. Third column, so third weight argument.
+ */
+export const SEARCH_WEIGHT_FIELDS = 0.5;
+/** The weight arguments for `bm25(<table>, ...)` in column order (path, content, fields). */
+export const SEARCH_BM25_WEIGHTS = `${SEARCH_WEIGHT_PATH}, ${SEARCH_WEIGHT_CONTENT}, ${SEARCH_WEIGHT_FIELDS}`;
 
 /**
  * Control characters — the C0 range (U+0000–U+001F) plus DEL (U+007F) —

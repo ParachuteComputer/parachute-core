@@ -211,6 +211,35 @@ describe("v5 and v18 against each state of the path indexes", () => {
     db.close();
   });
 
+  test("a vault 0.9.1 opened last (current stamp, a two-column search index) gets field values in search once", async () => {
+    // What 0.9.1 and the 0.9.2 builds before field search leave: SCHEMA_VERSION stamped and notes_fts with path and
+    // content only. Field values in search are an un-numbered step, so the fast path must not take that vault as
+    // current, or a field word would never be found on it.
+    await makeVault(5);
+    let db = new Database(file);
+    const store = new SqliteStore(db);
+    await store.createNote("made up", { path: "notes/one", metadata: { line: "quokkaword" } });
+    db.exec(`
+      DROP TRIGGER notes_fts_insert; DROP TRIGGER notes_fts_delete; DROP TRIGGER notes_fts_update;
+      DROP TABLE notes_fts; DROP VIEW notes_fts_source; DROP TABLE notes_field_text;
+      CREATE VIRTUAL TABLE notes_fts USING fts5(path, content, content='notes', content_rowid='rowid', tokenize='porter unicode61');
+      INSERT INTO notes_fts(rowid, path, content) SELECT rowid, COALESCE(path, ''), content FROM notes;
+    `);
+    db.query("INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)").run(SCHEMA_VERSION, "2999-01-01T00:00:00.000Z");
+    db.close();
+    db = new Database(file);
+    const reopened = new SqliteStore(db);
+    expect((db.query("PRAGMA table_info(notes_fts)").all() as { name: string }[]).map((c) => c.name)).toEqual(["path", "content", "fields"]);
+    expect((await reopened.searchNotes("quokkaword")).map((n) => n.path)).toEqual(["notes/one"]);
+    const after = cookie(db);
+    db.close();
+    // And the open after that is a no-op again: the index is rebuilt once, not on every wake.
+    db = new Database(file);
+    new SqliteStore(db);
+    expect(cookie(db)).toBe(after);
+    db.close();
+  });
+
   test("uniqueness is unchanged: same path and extension refused; another extension or a case variant allowed", async () => {
     const db = new Database(file);
     const store = new SqliteStore(db);
@@ -223,11 +252,11 @@ describe("v5 and v18 against each state of the path indexes", () => {
   });
 });
 
-/** sha256 of SCHEMA_SQL as of SCHEMA_VERSION 32 with T-412 (idx_notes_path left out of it) and 0.9's `kind` on tags, 0.9.1's `via_kind` on revisions. */
-const SCHEMA_SQL_HASH_AT_32 = "ade9b08b66e61a3975f03b23b80466122607f4ca715821bcda17b3c8563e2dc7";
+/** sha256 of SCHEMA_SQL as of SCHEMA_VERSION 32 with T-412 (idx_notes_path left out of it) and 0.9's `kind` on tags, 0.9.1's `via_kind` on revisions, 0.9.3's field values in search (notes_fts_source, notes_field_text, three-column notes_fts; its insert trigger clears a leftover field-text row). */
+const SCHEMA_SQL_HASH_AT_32 = "303461b150891f04e27e0ba7aa5651109df704ed42707956f043ae5c3e26cb67";
 
-/** sha256 of initSchema's code and its fast-path check (comments and spacing left out) as of SCHEMA_VERSION 32 with T-412, 0.9's ensureTagKinds and 0.9.1's ensureRevisionKeyKind, and T-460's open-as-is of a newer readable schema. */
-const INIT_SCHEMA_HASH_AT_32 = "1a3aa88a2a3f71de260def99a2e057e86eaf3ddea36b5a58a7af401bb24f75e3";
+/** sha256 of initSchema's code and its fast-path check (comments and spacing left out) as of SCHEMA_VERSION 32 with T-412, 0.9's ensureTagKinds 0.9.1's ensureRevisionKeyKind and 0.9.2's ensureFtsFields, and T-460's open-as-is of a newer readable schema. */
+const INIT_SCHEMA_HASH_AT_32 = "71617c162343267c81c438e85a90787ac57cecf569d9f96f51d318f5898999df";
 
 describe("the fast path's promise", () => {
   // initSchema skips SCHEMA_SQL and every migration on a vault stamped SCHEMA_VERSION (with the path index). So a

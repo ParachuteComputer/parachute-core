@@ -253,10 +253,11 @@
    "old": "parachute auth reap-clients",
    "new": "parachute doctor --fix",
    "action": "merge",
-   "reason": "housekeeping",
+   "reason": "housekeeping: `parachute doctor` names OAuth clients nothing uses (none for 30 days, no grants, live tokens or open codes) and `parachute doctor --fix --yes` removes them; `auth reap-clients` keeps working",
    "since": "0.9",
    "removed_in": "1.0",
-   "state": "planned"
+   "state": "live",
+   "release": "0.9.3"
   },
   {
    "kind": "command",
@@ -433,7 +434,7 @@
    "old": "parachute-vault config [set|unset]",
    "new": "parachute config [get|set|unset]",
    "action": "merge",
-   "reason": "one settings file (§5)",
+   "reason": "one settings file (§5): `parachute config` handles the parachute.yaml keys only; it does not take parachute-vault config's old keys yet",
    "since": "0.9",
    "removed_in": "1.0",
    "state": "planned"
@@ -583,10 +584,11 @@
    "old": "parachute-vault history rebuild-state",
    "new": "parachute doctor --fix",
    "action": "merge",
-   "reason": "a repair doctor already detects",
+   "reason": "a repair doctor already detects: `parachute doctor` names a vault whose history hints are stale and `parachute doctor --fix --yes` rebuilds them; `history rebuild-state` keeps working",
    "since": "0.9",
    "removed_in": "1.0",
-   "state": "planned"
+   "state": "live",
+   "release": "0.9.3"
   },
   {
    "kind": "command",
@@ -771,7 +773,7 @@
   {
    "kind": "mcp-tool",
    "old": "query-notes {created_by, created_via, exclude_tag, excludeTags, exclude_path_prefix, excludePathPrefix, expand, expand_depth, expand_links, expand_mode, extension, has_ambiguous_links, has_broken_links, has_links, has_tags, include_ambiguous_links, include_broken_links, include_link_count, last_updated_by, last_updated_via, link_count_direction, near_text, order_by, search_mode, semantic} (parameters listed in tools/list)",
-   "new": "the same parameters on query-notes and query-records, listed by vault-info {help: \"query-notes\"} instead of tools/list",
+   "new": "the same parameters on query-notes and query-records, listed by vault-info {help: \"query-notes\"} instead of tools/list (search_mode is in the short list again since 0.9.3: it carries \"hybrid\")",
    "action": "keep",
    "reason": "0.9's tool list is short (the description budget: query-records under 1,500 tokens, contracts/suites/mcp/budget.test.ts), so these rarer parameters left it. Each is still accepted and honoured, as on 0.8 (contracts/suites/mcp/old-params.test.ts); vault-info {help} lists them; a connector made on 0.8 keeps its own list; the short description names the commonest ones and where to find the rest",
    "since": "0.9",
@@ -1126,7 +1128,8 @@
    "reason": "admin belongs in the one admin API",
    "since": "0.9",
    "removed_in": "1.0",
-   "state": "planned"
+   "state": "live",
+   "release": "0.9.3"
   },
   {
    "kind": "endpoint",
@@ -1136,7 +1139,8 @@
    "reason": "admin only today",
    "since": "0.9",
    "removed_in": "1.0",
-   "state": "planned"
+   "state": "live",
+   "release": "0.9.3"
   },
   {
    "kind": "endpoint",
@@ -1190,6 +1194,39 @@
   },
   {
    "kind": "endpoint",
+   "old": "HEAD /vault/<n>/api/records/<id> (and /api/notes/<id>): passed through, no answer",
+   "new": "200 with GET's headers (Content-Type, Content-Length of the GET body) and no body; 404 for a missing or hidden record; the same key and tag scope as GET",
+   "action": "keep",
+   "reason": "additive (0.9.3): a client can ask whether a record is there without fetching it. A 0.8 client never sent HEAD",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live",
+   "release": "0.9.3"
+  },
+  {
+   "kind": "endpoint",
+   "old": "(none) the change map was only in `parachute changes --json`",
+   "new": "GET /.well-known/parachute-changes.json (hub, no auth): the same bytes",
+   "action": "keep",
+   "reason": "additive (0.9.3): an app or agent reads what changed from the hub it talks to, with no CLI on the machine",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live",
+   "release": "0.9.3"
+  },
+  {
+   "kind": "endpoint",
+   "old": "query-notes {search} and ?search= (which records match, in what order, with what score)",
+   "new": "a literal search (every REST search; on MCP, 1-3 words or any search with sort or a search_mode) matches the same title and body records, plus records whose field values hold the words. With no sort and not in advanced mode, field-only matches rank after every title or body match, scores come from bm25 over path, body and field text (weights 10, 1, 0.5), comparable within that tier only, and the title boost works inside a tier. Once hybrid auto ships (#103): an MCP search of 4+ words (2+ content words) with no sort and no search_mode, on a vault with meaning search, is ranked by keyword (any of the content words) and meaning together, with matched_by on each result and a search_auto warning, so it may leave out records holding every word and add records holding none; search_mode literal, the vault's search.auto_hybrid false, or a meaning search that doesn't answer gives the literal answer",
+   "action": "keep",
+   "reason": "0.9.3 (core #93 field values in search, #102 the title boost within a tier, #103 hybrid auto): a word kept in a field (a status, a person's name, a list item) was not findable, and a question in plain words found little. Every literal score moves, because bm25 now normalises over three columns; Note.score only ever promised relative meaning. A 0.8 client's 1-3 word search gets the records it got and more, in a different order",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live",
+   "release": "0.9.3"
+  },
+  {
+   "kind": "endpoint",
    "old": "11 legacy 301 redirects",
    "new": null,
    "action": "drop",
@@ -1240,10 +1277,21 @@
   },
   {
    "kind": "setting",
-   "old": "PORT / PARACHUTE_BIND_HOST / VAULT_BIND",
+   "old": "PORT / PARACHUTE_BIND_HOST",
    "new": "server.port / server.bind",
    "action": "merge",
-   "reason": "one listener",
+   "reason": "one place for the listener; an env var still wins",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live",
+   "release": "0.9.3"
+  },
+  {
+   "kind": "setting",
+   "old": "VAULT_BIND",
+   "new": "server.port / server.bind",
+   "action": "merge",
+   "reason": "one listener; the vault's own bind address is not read from parachute.yaml yet",
    "since": "0.9",
    "removed_in": "1.0",
    "state": "planned"
@@ -1253,20 +1301,22 @@
    "old": "PARACHUTE_HUB_ORIGIN",
    "new": "server.origin",
    "action": "move",
-   "reason": "the issuer",
+   "reason": "the issuer; an env var still wins",
    "since": "0.9",
    "removed_in": "1.0",
-   "state": "planned"
+   "state": "live",
+   "release": "0.9.3"
   },
   {
    "kind": "setting",
    "old": "PARACHUTE_HUB_ORIGINS",
    "new": "server.accepted_issuers",
    "action": "move",
-   "reason": "old issuers that stay valid (uni's t137 drop-in)",
+   "reason": "old issuers that stay valid (uni's t137 drop-in); an env var still wins",
    "since": "0.9",
    "removed_in": "1.0",
-   "state": "planned"
+   "state": "live",
+   "release": "0.9.3"
   },
   {
    "kind": "setting",
@@ -1420,7 +1470,18 @@
   },
   {
    "kind": "setting",
-   "old": "vault/data/<n>/vault.yaml (description, private_tags, published_tag, transcription, history)",
+   "old": "vault/data/<n>/vault.yaml description",
+   "new": "parachute.yaml vaults.<n>.description",
+   "action": "merge",
+   "reason": "parachute.yaml wins while it is set",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live",
+   "release": "0.9.3"
+  },
+  {
+   "kind": "setting",
+   "old": "vault/data/<n>/vault.yaml (private_tags, published_tag, transcription, history)",
    "new": "parachute.yaml vaults.<n>",
    "action": "merge",
    "reason": "tag schemas stay in the vault: they are data",

@@ -395,6 +395,11 @@ export function projectionToMarkdown(args: {
    * What this connection can read, in one line under the vault's name (0.9.1; `connectionReach`). Omitted: no line.
    */
   reach?: string;
+  /**
+   * How this door's owner makes a key for a script, the line under "Scripting & automation". Omitted: a box's
+   * (`parachute auth mint-token`). A door without that command (cloud: keys are made in the account) says its own.
+   */
+  scripting?: string;
 }): string {
   const { vaultName, description, projection, coordinates } = args;
   const w = args.words ?? ((s: string) => s);
@@ -550,7 +555,8 @@ export function projectionToMarkdown(args: {
   lines.push("## Scripting & automation (beyond this session)");
   lines.push("");
   lines.push(
-    `For a script or cron job, mint a key (\`parachute auth mint-token --scope vault:${vaultName}:read --ephemeral\`) and call the REST API at \`<hub-origin>/vault/${vaultName}/api/...\`; guide: https://parachute.computer/scripting/`,
+    args.scripting ??
+      `For a script or cron job, mint a key (\`parachute auth mint-token --scope vault:${vaultName}:read --ephemeral\`) and call the REST API at \`<hub-origin>/vault/${vaultName}/api/...\`; guide: https://parachute.computer/scripting/`,
   );
 
   return lines.join("\n");

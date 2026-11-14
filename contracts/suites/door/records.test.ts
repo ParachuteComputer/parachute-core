@@ -1,7 +1,7 @@
 // Surface H: the record door (0.9). "Record" is the noun: `body`, `fields`, `types`, plain `tags`. The note door of
 // 0.8 keeps answering over the same data through 0.9. Runs only on a 0.9 door.
 import { describe, expect, test } from "bun:test";
-import { door, enc, fp, lacks, mcp, refusal, rest, runId, sha, shape } from "./_door.ts";
+import { door, enc, fp, lacks, mcp, refusal, rest, runId, safeFetch, sha, shape, token, vaultUrl } from "./_door.ts";
 
 const is09 = door().release.startsWith("0.9");
 const one = (r: any) => (Array.isArray(r) ? r[0] : r);
@@ -103,5 +103,58 @@ describe.skipIf(!is09 || lacks("records-over-rest"))("the record door over REST"
     // the comparison instead of failing alone.
     fp("records/rest.type-in-tags", { status: r.status, type: r.body?.error_type ?? null, hint: typeof r.body?.hint === "string" ? sha(r.body.hint) : null });
     expect(r.status).toBeLessThan(500);
+  });
+});
+
+// HEAD on one record: the same answer as GET without the body, so a client can ask "is it there, and has it changed?"
+// cheaply. Same keys as GET (0.9.3, T-463). The tag-scope case (hidden is 404) is in packages/vault/src/head-record.test.ts.
+describe.skipIf(!is09 || lacks("records-over-rest"))("HEAD on one record", () => {
+  const api = rest("write");
+  // `identity`: the length compared is the representation's own. A door behind a compressing edge (Cloudflare brotli)
+  // sends no Content-Length for a compressed answer, on GET and HEAD alike.
+  const plain = { "accept-encoding": "identity" };
+  const head = async (path: string, bearer: string | null) => {
+    const r = await safeFetch(`${vaultUrl()}/api${path}`, { method: "HEAD", headers: bearer ? { authorization: `Bearer ${bearer}`, ...plain } : plain });
+    return { status: r.status, headers: r.headers, text: await r.text() };
+  };
+
+  test("HEAD answers 200 with GET's headers and an empty body, on both doors, and 404 for a missing id", async () => {
+    const made = await api.post("/records", { path: `records/${runId("h")}`, body: "Head me, please." });
+    expect(made.status).toBe(201);
+    const bearer = await token("read");
+    for (const door of ["records", "notes"]) {
+      const url = `${vaultUrl()}/api/${door}/${made.body.id}`;
+      const get = await safeFetch(url, { headers: { authorization: `Bearer ${bearer}`, ...plain } });
+      const getText = await get.text();
+      const h = await head(`/${door}/${made.body.id}`, bearer);
+      expect({ door, status: h.status }).toEqual({ door, status: 200 });
+      expect(h.text).toBe("");
+      expect(h.headers.get("content-type")).toBe(get.headers.get("content-type"));
+      expect(h.headers.get("content-length")).toBe(String(new TextEncoder().encode(getText).length));
+      expect(get.headers.get("etag") ?? "").toMatch(/^"[0-9a-f]+"$/);
+      expect(Number.isNaN(Date.parse(get.headers.get("last-modified") ?? ""))).toBe(false);
+      for (const name of ["etag", "last-modified"]) expect(h.headers.get(name)).toBe(get.headers.get(name));
+      expect((await head(`/${door}/no-such-${runId("x")}`, bearer)).status).toBe(404);
+    }
+  });
+
+  test("the ETag and Last-Modified change when the record is changed", async () => {
+    const made = await api.post("/records", { path: `records/${runId("v")}`, body: "first" });
+    expect(made.status).toBe(201);
+    const bearer = await token("read");
+    const before = await head(`/records/${made.body.id}`, bearer);
+    await new Promise((r) => setTimeout(r, 1100)); // Last-Modified counts whole seconds
+    expect((await api.patch(`/records/${made.body.id}`, { body: "second", if_updated_at: (await api.get(`/records/${made.body.id}`)).body.updatedAt })).status).toBe(200);
+    const after = await head(`/records/${made.body.id}`, bearer);
+    expect(after.headers.get("etag")).not.toBe(before.headers.get("etag"));
+    expect(Date.parse(after.headers.get("last-modified")!)).toBeGreaterThan(Date.parse(before.headers.get("last-modified")!));
+    const again = await head(`/records/${made.body.id}`, bearer);
+    expect(again.headers.get("etag")).toBe(after.headers.get("etag"));
+  });
+
+  test("HEAD needs a credential", async () => {
+    const made = await api.post("/records", { path: `records/${runId("h")}`, body: "private" });
+    expect(made.status).toBe(201);
+    expect((await head(`/records/${made.body.id}`, null)).status).toBe(401);
   });
 });
