@@ -22,31 +22,110 @@ const inScope = (tags: string[]) => tags.includes("in");
 
 describe("feed: which change a reader is told", () => {
   test("unscoped: there now is an upsert; gone is a delete unless it was made in the page", () => {
-    expect(feedOp([row({ existed: 0 })], { tags: [] }, null)).toBe("upsert");
-    expect(feedOp([row({})], null, null)).toBe("delete");
-    expect(feedOp([row({ existed: 0, pos: 5 }), row({ pos: 6 })], null, null)).toBe(null);
+    expect(feedOp([row({ existed: 0 })], { tags: [] }, { tags: [] }, null)).toBe("upsert");
+    expect(feedOp([row({})], null, null, null)).toBe("delete");
+    expect(feedOp([row({ existed: 0, pos: 5 }), row({ pos: 6 })], null, null, null)).toBe(null);
   });
 
   test("scoped: in scope now is an upsert; moved out is removed; gone from scope is a delete; never in scope is nothing", () => {
-    expect(feedOp([row({ before_tags: '["out"]' })], { tags: ["in"] }, inScope)).toBe("upsert");
-    expect(feedOp([row({})], { tags: ["out"] }, inScope)).toBe("removed");
-    expect(feedOp([row({})], null, inScope)).toBe("delete");
-    expect(feedOp([row({ before_tags: '["out"]' })], null, inScope)).toBe(null);
-    expect(feedOp([row({ before_tags: '["out"]' })], { tags: ["out"] }, inScope)).toBe(null);
-    expect(feedOp([row({ existed: 0, before_tags: null })], { tags: ["out"] }, inScope)).toBe(null);
+    expect(feedOp([row({ before_tags: '["out"]' })], { tags: ["in"] }, { tags: ["in"] }, inScope)).toBe("upsert");
+    expect(feedOp([row({})], { tags: ["out"] }, { tags: ["out"] }, inScope)).toBe("removed");
+    expect(feedOp([row({})], null, null, inScope)).toBe("delete");
+    expect(feedOp([row({ before_tags: '["out"]' })], null, null, inScope)).toBe(null);
+    expect(feedOp([row({ before_tags: '["out"]' })], { tags: ["out"] }, { tags: ["out"] }, inScope)).toBe(null);
+    expect(feedOp([row({ existed: 0, before_tags: null })], { tags: ["out"] }, { tags: ["out"] }, inScope)).toBe(null);
   });
 
   test("visible before is the first row in the page: what the reader saw at its position", () => {
     // The record was in scope at the reader's position; a write moved it out; a later one edited it, still out.
-    expect(feedOp([row({ pos: 5, before_tags: '["in"]' }), row({ pos: 7, before_tags: '["out"]' })], { tags: ["out"] }, inScope)).toBe("removed");
+    expect(feedOp([row({ pos: 5, before_tags: '["in"]' }), row({ pos: 7, before_tags: '["out"]' })], { tags: ["out"] }, { tags: ["out"] }, inScope)).toBe("removed");
     // Out of scope at the position; brought in, then out again, inside the page: never named.
-    expect(feedOp([row({ pos: 5, before_tags: '["out"]' }), row({ pos: 7, before_tags: '["in"]' })], { tags: ["out"] }, inScope)).toBe(null);
+    expect(feedOp([row({ pos: 5, before_tags: '["out"]' }), row({ pos: 7, before_tags: '["in"]' })], { tags: ["out"] }, { tags: ["out"] }, inScope)).toBe(null);
   });
 
   test("a row with no saved tags for a record that existed is not visible to a scoped reader (none is written today)", () => {
-    expect(feedOp([row({ write_set: null, before_tags: null })], { tags: ["out"] }, inScope)).toBe(null);
-    expect(feedOp([row({ write_set: null, before_tags: null })], null, inScope)).toBe(null);
-    expect(feedOp([row({ write_set: null, before_tags: null })], null, null)).toBe("delete");
+    expect(feedOp([row({ write_set: null, before_tags: null })], { tags: ["out"] }, { tags: ["out"] }, inScope)).toBe(null);
+    expect(feedOp([row({ write_set: null, before_tags: null })], null, null, inScope)).toBe(null);
+    expect(feedOp([row({ write_set: null, before_tags: null })], null, null, null)).toBe("delete");
+  });
+});
+
+describe("feed: a reader more than one page behind (each page judged at its own end)", () => {
+  /** A reader that holds what it's told and commits each page it reads. */
+  function reader(db: Database, start: number, limit: number, scope: ((tags: string[]) => boolean) | null, held = new Set<string>()) {
+    let pos = start;
+    const one = (size = limit) => {
+      const page = readFeedPage(db, pos, size, scope);
+      for (const c of page.changes) c.op === "upsert" ? held.add(c.id) : held.delete(c.id);
+      pos = page.next_position;
+      return page.more;
+    };
+    // Catching up reads big pages, as a reader back from a pause does.
+    return { held, one, drain: () => { for (let i = 0; i < 1000 && one(500); i++); } };
+  }
+
+  test("scoped: made out of scope and brought in, a page read, then deleted: the reader ends without it", async () => {
+    const { db, store } = fresh();
+    const r1 = reader(db, newestPosition(db), 1, inScope);
+    const r = await store.createNote("x", { path: "r", tags: ["out"] });
+    await store.tagNote(r.id, ["in"]);
+    expect(r1.one()).toBe(true); // a page of one, more after it
+    await store.deleteNote(r.id);
+    r1.drain();
+    expect([...r1.held]).toEqual([]);
+  });
+
+  test("scoped: brought in, a page read, then moved out: the reader ends without it", async () => {
+    const { db, store } = fresh();
+    const r1 = reader(db, newestPosition(db), 1, inScope);
+    const r = await store.createNote("x", { path: "r", tags: ["out"] });
+    await store.tagNote(r.id, ["in"]);
+    expect(r1.one()).toBe(true);
+    await store.untagNote(r.id, ["in"]);
+    r1.drain();
+    expect([...r1.held]).toEqual([]);
+  });
+
+  test("unscoped: an id deleted and made again, a page read, then deleted again: the reader ends without it", async () => {
+    const { db, store } = fresh();
+    const r = await store.createNote("x", { path: "r" });
+    const r1 = reader(db, newestPosition(db), 1, null, new Set([r.id]));
+    await store.deleteNote(r.id);
+    await store.createNote("again", { id: r.id, path: "r2" });
+    expect(r1.one()).toBe(true);
+    await store.deleteNote(r.id);
+    r1.drain();
+    expect([...r1.held]).toEqual([]);
+  });
+
+  test("whatever the page size, readers that read between writes end up holding the same records", async () => {
+    const { db, store } = fresh();
+    const start = newestPosition(db);
+    const scopes = [inScope, null];
+    const readers = scopes.flatMap((scope) => [500, 1, 2, 3].map((limit) => ({ scope, limit, r: reader(db, start, limit, scope) })));
+    const ids: string[] = [];
+    const steps: (() => Promise<unknown>)[] = [];
+    for (let i = 0; i < 6; i++) steps.push(async () => ids.push((await store.createNote(`n${i}`, { path: `n${i}`, tags: i % 2 ? ["in"] : ["out"] })).id));
+    steps.push(
+      () => store.tagNote(ids[0]!, ["in"]),
+      () => store.untagNote(ids[1]!, ["in"]),
+      () => store.deleteNote(ids[3]!),
+      () => store.tagNote(ids[2]!, ["in"]),
+      () => store.deleteNote(ids[2]!),
+      () => store.updateNote(ids[5]!, { content: "edited" }),
+      () => store.untagNote(ids[0]!, ["in"]),
+      () => store.tagNote(ids[0]!, ["in"]),
+      () => store.untagNote(ids[5]!, ["in"]),
+    );
+    for (const step of steps) {
+      await step();
+      for (const x of readers) x.r.one(); // one page each, then the next write
+    }
+    for (const x of readers) x.r.drain();
+    for (const scope of scopes) {
+      const own = readers.filter((x) => x.scope === scope).map((x) => [...x.r.held].sort());
+      for (const h of own) expect(h).toEqual(own[0]!);
+    }
   });
 });
 

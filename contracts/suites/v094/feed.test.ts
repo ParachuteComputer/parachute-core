@@ -312,6 +312,81 @@ describe("v094/feed: a write set that spans several requests, read by a tag-scop
   });
 });
 
+describe("v094/feed: a reader more than one page behind", () => {
+  // A reader that commits each page and holds what it is told: upsert adds the record, delete and removed drop it.
+  function holder(k: Key, name: string, ids: () => string[]) {
+    const held = new Set<string>();
+    const apply = (page: Answer) => {
+      for (const c of page.body.changes as any[]) if (ids().includes(c.id)) c.op === "upsert" ? held.add(c.id) : held.delete(c.id);
+    };
+    return {
+      held,
+      /** One page of `limit`, committed. */
+      async one(limit: number) {
+        const page = await feed(k, name, `&limit=${limit}`);
+        apply(page);
+        await commit(k, name, page.body.next_position);
+        return page.body.more as boolean;
+      },
+      async drain() {
+        for (let i = 0; i < 100 && (await this.one(500)); i++);
+      },
+    };
+  }
+
+  for (const [label, last] of [
+    ["deleted", async (id: string) => remove(id)],
+    ["moved out", async (id: string, mine: string) => edit(id, { tags: { remove: [mine] } })],
+  ] as const) {
+    test(`a record brought into scope, a page of one read, then ${label}: the reader ends without it`, async () => {
+      const t = `fb${shortId()}`;
+      const mine = `${t}mine`;
+      const scoped = asKey(await pass({ level: "read", tags: [mine] }));
+      const name = readerName("behind");
+      await commit(scoped, name, "now");
+      const r = await create(`${t}/r`, "outside the scope at first", [`${t}else`]);
+      await edit(r, { tags: { add: [mine] } });
+      const h = holder(scoped, name, () => [r]);
+      expect(await h.one(1)).toBe(true); // more after it: the reader is behind
+      await last(r, mine);
+      await h.drain();
+      expect([...h.held]).toEqual([]);
+    });
+  }
+
+  test("a reader paging by one between writes ends up holding what a reader of 500 holds", async () => {
+    const t = `fb${shortId()}`;
+    const mine = `${t}mine`;
+    const other = `${t}else`;
+    const scoped = asKey(await pass({ level: "read", tags: [mine] }));
+    const ids: string[] = [];
+    const [small, big] = [readerName("small"), readerName("big")];
+    const p = await commit(scoped, small, "now");
+    await commit(scoped, big, p);
+    const hs = holder(scoped, small, () => ids);
+    const hb = holder(scoped, big, () => ids);
+    const steps: (() => Promise<unknown>)[] = [];
+    for (let i = 0; i < 4; i++) steps.push(async () => ids.push(await create(`${t}/n${i}`, `n${i}`, [i % 2 ? mine : other])));
+    steps.push(
+      () => edit(ids[0]!, { tags: { add: [mine] } }),
+      () => edit(ids[1]!, { tags: { remove: [mine], add: [other] } }),
+      () => edit(ids[2]!, { tags: { add: [mine] } }),
+      () => remove(ids[2]!),
+      () => remove(ids[3]!),
+      () => edit(ids[0]!, { content: "edited" }),
+      () => edit(ids[1]!, { tags: { add: [mine] } }),
+    );
+    for (const step of steps) {
+      await step();
+      await hs.one(1);
+    }
+    await hs.drain();
+    await hb.drain();
+    expect([...hs.held].sort()).toEqual([...hb.held].sort());
+    expect([...hb.held].sort()).toEqual([ids[0]!, ids[1]!].sort());
+  });
+});
+
 describe("v094/feed: positions are per key and per reader", () => {
   test("two readers on one key keep separate positions", async () => {
     const t = `fp${shortId()}`;

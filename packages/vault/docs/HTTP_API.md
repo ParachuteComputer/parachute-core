@@ -1694,25 +1694,35 @@ sweep), a touch of the reader's row (at most once a day), and the day's sweep of
 - Each change: `{seq, op, id, record, write_set, by, via, at}`. `seq` is its position. `op` is `upsert` (the record
   exists and you can see it; `record` is what `GET /api/records/<id>` answers, in record words), `delete` (it is
   gone; no `record`), or `removed` (it still exists but has left a tag-scoped key's scope: `{seq, op, id}` and nothing
-  else). A record appears **once per page, at its newest change**, and changes are in `seq` order. A smaller page
-  may repeat what a larger one says once (a `removed` per transaction that wrote the record); the reader ends in the
-  same state.
+  else). A record appears **once per page, at its newest change**, and changes are in `seq` order. Each page says
+  what a record was at the page's own end (what the next page starts from), so a reader that pages through a backlog
+  ends holding the same records whatever its page size. A smaller page may repeat what a larger one says once (a
+  `removed` per transaction that wrote the record).
 - **Positions belong to one credential.** They are held per (owner, reader name). The owner is a named key
   (`key:<name>`) for a key; for any other credential (a legacy YAML key, the operator bearer, a hub token without a
   key) it is the credential's kind and the principal it acts for; a tag-scoped credential's owner also includes its
-  scope. So no two credentials share a position, and none can read or move another's.
-- **Unused readers.** A reader neither read nor committed for longer than the log keeps is marked expired: its next
-  read answers 410 (below), and committing `"now"` starts it again. It is marked, not removed, so it never silently
-  starts over at `0`; a key name that is revoked and later reused doesn't inherit the old key's position either.
+  scope. So no two credentials share a position, and none can read or move another's. A credential with neither a
+  key nor a principal is refused (403 `feed_no_owner`).
+- **Unused readers.** A reader neither read nor committed for longer than the log keeps (plus a day) is marked
+  expired, never removed: its next
+  read answers 410 (below), and committing `"now"` starts it again. Being marked, it never silently starts over at
+  `0`; a key name that is revoked and later reused doesn't inherit the old key's position either. A reader that has
+  never committed holds `0`, which never expires: if it stops for longer than the log keeps, it is not told it fell
+  behind, so start every reader by committing `"now"` (see Starting).
 - **A tag-scoped key** sees only records in its scope, read as the scope is now (a tag put under it later brings its
   records in, as on a live subscription). A record that was in scope at your position and has since left it comes as
   `removed`; one that was in scope and was deleted comes as `delete`; a record that was not in scope at your
-  position and isn't now leaves no trace (no id, no count), even if it was in scope in between. `next_position` and
-  `more` depend only on the log, never on the scope, so an empty page moves on exactly as a scope-blind reader's
-  would. Its changes carry no `by`, `via` or `write_set`, as its versions don't. Whether a record was in scope at
+  position and isn't now leaves no id and no content, even if it was in scope in between. Positions, though, count
+  every change in the vault: `seq`, `next_position` and `"now"` move with changes outside your scope too, so a scoped
+  key can see how many changes happen and when, never to what. `next_position` and `more` depend only on the log,
+  never on the scope, so an empty page moves on exactly as a scope-blind reader's would. Its changes carry no `by`, `via` or `write_set`, as its versions don't. Whether a record was in scope at
   your position is read from the tags its first row after your position saved: the record as that write found it
-  (writes outside any write set save them too). A scope change made in the tag hierarchy alone (re-parenting a tag)
-  changes no record, so it sends nothing until those records change.
+  (writes outside any write set save them too), judged against your scope as it is now. So the tag hierarchy, which
+  the log doesn't record, has two edges. A tag put under your scope brings its records in from their next change,
+  and a record that carried it and was deleted before then can come as a `delete` you were never sent an `upsert`
+  for (its id and when; nothing more). A scope that shrinks through the hierarchy (a tag taken from under it) sends
+  no `removed` and no `delete` for its records at all, now or later: after such a change, resync (commit `"now"`,
+  then read the records).
 - **The horizon.** The log keeps `history.change_log_days` (default 30). A held position older than what was swept,
   or a reader marked expired, answers **410 `feed_position_expired`** (`{reader, position, horizon, hint}`;
   `position` is null for an expired reader): commit `"now"` first, then read the records you need again, then read

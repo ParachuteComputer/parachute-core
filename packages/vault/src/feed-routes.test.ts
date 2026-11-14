@@ -61,6 +61,17 @@ describe("feed routes: an expired position", () => {
   });
 });
 
+describe("feed routes: the reader sweep", () => {
+  test("with change_log_days 1, a reader touched a day and a poll ago is not marked", () => {
+    const { db } = fresh();
+    setPosition(db, OWNER, "polling", 0);
+    const now = new Date("2030-01-02T00:00:30.000Z");
+    db.prepare("UPDATE feed_readers SET updated_at = '2030-01-01T00:00:00.000Z'").run();
+    expect(sweepReaders(db, 1, now)).toBe(0);
+    expect(sweepReaders(db, 1, new Date("2030-01-03T00:00:01.000Z"))).toBe(1);
+  });
+});
+
 describe("feed routes: whose positions", () => {
   test("a named key by its name; any other credential by kind and principal; a tag-scoped one also by its scope", () => {
     expect(feedOwner("key:claude", "u1", null)).toBe("key:claude");
@@ -72,5 +83,9 @@ describe("feed routes: whose positions", () => {
     expect(scoped).toBe(feedOwner("api", "u1", ["home", "work"]));
     expect(scoped).not.toBe(feedOwner("api", "u1", ["work"]));
     expect(feedOwner("key:claude", "u1", ["work"])).not.toBe("key:claude");
+    // Neither a key nor a principal: refused, never a shared "api|".
+    expect(feedOwner("api", null, null)).toBeNull();
+    expect(feedOwner(null, null, null)).toBeNull();
+    expect(feedOwner("key:claude", null, null)).toBe("key:claude");
   });
 });

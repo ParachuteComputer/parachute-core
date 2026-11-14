@@ -46,8 +46,10 @@ import { readVaultConfig } from "./config.ts";
  * operator bearer, a hub token with no key) by its kind and the principal it acts for; and a tag-scoped credential
  * also by its scope (a hash of its sorted tags), so a scoped and an unscoped credential of one person never share.
  */
-export function feedOwner(via: string | null, actor: string | null, scopedTags: string[] | null): string {
-  const base = via?.startsWith("key:") ? via : `${via ?? ""}|${actor ?? ""}`;
+export function feedOwner(via: string | null, actor: string | null, scopedTags: string[] | null): string | null {
+  // A credential with neither a key nor a principal has nothing of its own to hold a position by: refused.
+  if (!via?.startsWith("key:") && !actor) return null;
+  const base = via?.startsWith("key:") ? via : `${via ?? ""}|${actor}`;
   if (!scopedTags || scopedTags.length === 0) return base;
   const hash = new Bun.CryptoHasher("sha256").update(JSON.stringify([...scopedTags].sort())).digest("hex").slice(0, 16);
   return `${base}|scope:${hash}`;
@@ -109,12 +111,15 @@ function expired(store: Store, reader: string, position: number): Response {
   );
 }
 
-export async function handleFeed(req: Request, store: Store, vaultName: string, subpath: string, owner: string, tagScope: TagScopeCtx): Promise<Response | null> {
+export async function handleFeed(req: Request, store: Store, vaultName: string, subpath: string, owner: string | null, tagScope: TagScopeCtx): Promise<Response | null> {
   const db = store.db;
   const url = new URL(req.url);
   const isRead = (subpath === "" || subpath === "/") && req.method === "GET";
   const isCommit = subpath === "/position" && req.method === "POST";
   if (!isRead && !isCommit) return null;
+  if (owner === null) {
+    return json({ error: "This credential names no key and no principal, so it has no feed positions of its own.", error_type: "feed_no_owner", hint: "use a named key" }, 403);
+  }
   placePending(store);
 
   if (subpath === "/position") {
