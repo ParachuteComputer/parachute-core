@@ -16,6 +16,7 @@ import type { Database } from "bun:sqlite";
 import type { Store } from "./types.js";
 import { transactionAsync } from "./txn.js";
 import { getWriteSet, type WriteSetRow } from "./change-log.js";
+import { readBlobText } from "./history.js";
 
 export interface UndoConflict {
   id: string;
@@ -53,6 +54,7 @@ interface ChangeRow {
   op: "create" | "update" | "delete";
   existed: number;
   before_content: string | null;
+  before_hash: string | null;
   content_saved: number;
   before_row: string | null;
   before_tags: string | null;
@@ -73,7 +75,7 @@ type LinkSpec = { target: string; relationship: string; metadata: Record<string,
 function rowsOf(db: Database, setId: string): ChangeRow[] {
   return db
     .prepare(
-      "SELECT seq, note_id, op, existed, before_content, content_saved, before_row, before_tags, before_links FROM record_changes WHERE write_set = ? ORDER BY seq",
+      "SELECT seq, note_id, op, existed, before_content, before_hash, content_saved, before_row, before_tags, before_links FROM record_changes WHERE write_set = ? ORDER BY seq",
     )
     .all(setId) as ChangeRow[];
 }
@@ -169,7 +171,7 @@ export async function undoWriteSet(store: Store, setId: string, opts: { force?: 
       const links = parseJson<LinkSpec[]>(r.before_links, []);
       if (!exists(r.note_id)) {
         // The set deleted it (or, forced, a later write did). Its body: saved by the set, else the newest tombstone's.
-        const content = r.content_saved ? (r.before_content ?? "") : await tombstoneBody(store, r.note_id);
+        const content = r.content_saved ? savedBody(db, r) : await tombstoneBody(store, r.note_id);
         if (content === null) {
           result.records.push({ id: r.note_id, op: "unchanged" });
           continue;
@@ -191,7 +193,10 @@ export async function undoWriteSet(store: Store, setId: string, opts: { force?: 
         result.records.push({ id: r.note_id, op: "recreated" });
       } else {
         const updates: Record<string, unknown> = { ...stamp };
-        if (r.content_saved) updates.content = r.before_content ?? "";
+        if (r.content_saved) {
+          const body = savedBody(db, r);
+          if (body !== null) updates.content = body;
+        }
         if (before) {
           updates.metadata = parseJson<Record<string, unknown>>(before.metadata, {});
           if (before.path !== null) updates.path = before.path;
@@ -235,6 +240,12 @@ export async function undoWriteSet(store: Store, setId: string, opts: { force?: 
     }
     return result;
   });
+}
+
+/** The body the set saved: a blob once its transaction ended (inline only inside it). Null if it is gone. */
+function savedBody(db: Database, r: ChangeRow): string | null {
+  if (r.before_hash) return readBlobText(db, r.before_hash);
+  return r.before_content;
 }
 
 /** A deleted record's last body, from its newest tombstone (null when there is none, or it was too big to keep). */
