@@ -91,8 +91,9 @@ EOF
 gh api -X POST repos/ParachuteComputer/parachute-core/environments/npm-latest/deployment-branch-policies -f name=main -f type=branch
 ```
 
-`npm-prerelease` the same way. It is needed before any prerelease publishes; until it exists, `publish-prerelease`
-fails closed. Not made yet (T-421 left it to Aaron or Uni):
+`npm-prerelease` the same way. It is needed before any prerelease publishes; without it `publish-prerelease` fails
+closed. Made 2026-11-10 (read back 2026-11-14 with `gh api repos/ParachuteComputer/parachute-core/environments/npm-prerelease`:
+required reviewer `unforcedagi`, self-review allowed, deploys from `main` only), with:
 
 ```bash
 gh api -X PUT repos/ParachuteComputer/parachute-core/environments/npm-prerelease --input - <<'JSON'
