@@ -23,11 +23,11 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createHash, randomBytes } from "node:crypto";
 import { Database } from "bun:sqlite";
 import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { candidate, freePort, newHome, until } from "../candidate-lib.ts";
 import { cli } from "../candidate-lib.ts";
 import { must, rest, safeFetch } from "../lib.ts";
-import { dbHolders, fileHashes, newMachine, type Machine, type Proc } from "./_takeover-lib.ts";
+import { dbHolders, fileHashes, makeStockHome, newMachine, core as coreOn, type Machine, type Proc } from "./_takeover-lib.ts";
 
 let m: Machine;
 const vault = `up${randomBytes(3).toString("hex")}`;
@@ -137,9 +137,13 @@ afterAll(async () => {
   await m?.dispose();
 });
 
-/** Every file of the home by hash, and what sits beside it: what a command that "touches nothing" must leave equal. */
+/**
+ * Every file of the home by hash, what sits beside it, and every file of its upgrade backups by hash: what a command
+ * that "touches nothing" must leave equal.
+ */
 const footprint = (home: string) => ({
   files: existsSync(home) ? Object.fromEntries(fileHashes(home)) : null,
+  backups: existsSync(join(dirname(home), "parachute-upgrade")) ? Object.fromEntries(fileHashes(join(dirname(home), "parachute-upgrade"))) : null,
   // (the machine keeps the log of each server the test itself starts there)
   beside: readdirSync(dirname(home)).filter((n) => !/^parachute-serve-\d+\.log$/.test(n)).sort(),
 });
@@ -149,10 +153,19 @@ describe("lifecycle/upgrade", () => {
     const before = footprint(m.home);
     // `--chekc` and `--dry-run` are flags it doesn't have; `nosuch` is no service; the rest pair a real flag with
     // one that doesn't go with it. Each used to be answered only after the home had been backed up and recorded.
-    for (const args of [["--chekc"], ["--dry-run"], ["nosuch"], ["--check", "--bogus"], ["--check", "vault"], ["--check", "--rollback"], ["--rollback", "--bogus"], ["--channel"], ["vault", "--channel", "nightly"]]) {
+    // An empty --tag, and `scribe` (a module the hub knows, not installed here), passed a first parser and were
+    // refused by the hub's own after the step (review of #119).
+    for (const args of [["--chekc"], ["--dry-run"], ["nosuch"], ["--check", "--bogus"], ["--check", "vault"], ["--check", "--rollback"], ["--rollback", "--bogus"], ["--channel"], ["vault", "--channel", "nightly"], ["--tag", ""], ["vault", "--tag", ""], ["scribe"], [""]]) {
       const r = await core(["upgrade", ...args]);
       expect(`${args.join(" ")}: exit ${r.code}`).toBe(`${args.join(" ")}: exit 2`);
       expect(r.stderr).toContain("usage: parachute upgrade");
+      expect(footprint(m.home)).toEqual(before);
+    }
+    // The vault has no upgrade of its own; asked under its names, the answer is the same, and as early.
+    for (const argv of [[info.bin, "vault", "upgrade", "--check"], [info.vaultBin, "upgrade", "--check"], [join(info.dir, "bin", "parachute-core"), "vault", "upgrade", "--chekc"]]) {
+      const r = await run(argv[0]!, argv.slice(1));
+      expect(`${argv.slice(1).join(" ")}: exit ${r.code}`).toBe(`${argv.slice(1).join(" ")}: exit 2`);
+      expect(r.stderr).toContain("parachute upgrade");
       expect(footprint(m.home)).toEqual(before);
     }
     // Asking how it works is not a step either.
@@ -173,7 +186,7 @@ describe("lifecycle/upgrade", () => {
     must(r.code === 0, `upgrade --check exited ${r.code}: ${r.stderr.slice(-1200)}`);
     expect(footprint(m.home)).toEqual(before); // every byte of the home, and nothing new beside it (the copy is gone)
     const out = JSON.parse(r.stdout.trim().split("\n").pop()!);
-    expect(out).toMatchObject({ check: "ok", from: "0.8", changed: false, refusals: [], problems: [] });
+    expect(out).toMatchObject({ check: "ok", from: "0.8", refusals: [], problems: [] });
     expect(out.to).toBe(JSON.parse((await core(["version", "--json"])).stdout).version);
     // What the step did, on the copy: backed both databases up, then opened them with this release.
     expect(out.backup.databases).toBe(2);
@@ -215,11 +228,54 @@ describe("lifecycle/upgrade", () => {
     const r = await cli(home, ["upgrade", "--check", "--json"]);
     expect(r.code).toBe(1);
     const out = JSON.parse(r.stdout.trim().split("\n").pop()!);
-    expect(out).toMatchObject({ check: "problems", changed: false });
+    expect(out).toMatchObject({ check: "problems" });
     expect(out.problems.join("\n")).toContain("vault/data/brokenv/vault.db");
     expect(out.vaults).toEqual(expect.arrayContaining([expect.objectContaining({ name: "goodv", opens: true })]));
     expect(footprint(home)).toEqual(before);
   }, 120_000);
+
+  test("upgrade names a service only where the hub will find it; a home named by a relative path is checked all the same", async () => {
+    const home = await homeBy08("up-services", ["goodv"]);
+    // The hub resolves a row of services.json only by its install folder: without one it said `unknown service`
+    // after the step. And a services.json it can't read stopped its sweep after the step.
+    const services = join(home, "services.json");
+    const rows = JSON.parse(readFileSync(services, "utf8"));
+    must(rows.services?.length >= 1 && rows.services.every((r: any) => r.installDir), "setup: 0.8 registered its vault with an install folder");
+    const row = rows.services[0].name as string;
+    writeFileSync(services, JSON.stringify({ ...rows, services: rows.services.map(({ installDir: _dir, ...rest }: any) => rest) }, null, 2));
+    let before = footprint(home);
+    expect((await cli(home, ["upgrade", row])).code).toBe(2);
+    expect(footprint(home)).toEqual(before);
+    writeFileSync(services, "Made-up bytes that are not JSON.\n");
+    before = footprint(home);
+    for (const args of [["upgrade"], ["upgrade", "vault"]]) {
+      expect(`${args.join(" ")}: exit ${(await cli(home, args)).code}`).toBe(`${args.join(" ")}: exit 2`);
+      expect(footprint(home)).toEqual(before);
+    }
+    writeFileSync(services, JSON.stringify(rows, null, 2));
+    before = footprint(home);
+    // cli() runs in the home's parent, so the home's own name is a relative path to it.
+    const r = await cli(home, ["upgrade", "--check", "--json"], { env: { PARACHUTE_HOME: basename(home) } });
+    must(r.code === 0, `upgrade --check with a relative PARACHUTE_HOME exited ${r.code}: ${r.stderr.slice(-800)}`);
+    expect(JSON.parse(r.stdout.trim().split("\n").pop()!)).toMatchObject({ check: "ok", home, from: "0.8" });
+    expect(footprint(home)).toEqual(before);
+  }, 120_000);
+
+  test("upgrade --check on a home the old 0.7 programs still own says so (exit 1): it is the takeover's, and no step would be taken", async () => {
+    const old = await newMachine("up-old-owner");
+    try {
+      await makeStockHome(old);
+      const before = footprint(old.home);
+      const r = await coreOn(old, ["upgrade", "--check", "--json"]);
+      expect(r.code).toBe(1);
+      const out = JSON.parse(r.stdout.trim().split("\n").pop()!);
+      expect(out).toMatchObject({ check: "refused", problems: [] });
+      expect(out.refusals.join("\n")).toContain("takeover");
+      expect(footprint(old.home)).toEqual(before);
+    } finally {
+      await old.dispose();
+    }
+  }, 240_000);
   test("0.9's first command on a 0.8 home backs its databases up first, outside the home, and only once", async () => {
     const before = dbHashes();
     const r = await core(["keys", "list", "--json"]);
@@ -244,6 +300,14 @@ describe("lifecycle/upgrade", () => {
 
     await core(["keys", "list"]);
     expect(backups().length).toBe(1);
+
+    // The check on a home this release already serves: no step to report, and the real backup is not touched.
+    const now = footprint(m.home);
+    const again = await core(["upgrade", "--check", "--json"]);
+    must(again.code === 0, `upgrade --check on a current home exited ${again.code}: ${again.stderr.slice(-800)}`);
+    expect(JSON.parse(again.stdout.trim().split("\n").pop()!)).toMatchObject({ check: "ok", from: "0.8", backup: { databases: 0 } });
+    expect(again.stderr).toContain("already");
+    expect(footprint(m.home)).toEqual(now);
   }, 120_000);
 
   test("0.9 serves the 0.8 home: 0.8's key reads, a tag with fields is a type, 0.9 writes; rollback waits for it to stop", async () => {
@@ -371,6 +435,13 @@ describe("lifecycle/upgrade", () => {
     expect(Object.keys(manifest().files).sort()).toEqual(["hub.db", "vault/data/goodv/vault.db"]);
 
     writeFileSync(db, healthy); // repaired: the 0.8 bytes are back
+    // The check on this home must not do the catching up: the record names the real backup folder, and the step on
+    // the copy used to write the repaired vault into it (review of #119), saying "nothing here was changed".
+    const before = footprint(home);
+    const checked = await cli(home, ["upgrade", "--check", "--json"]);
+    must(checked.code === 0, `upgrade --check on a home with a skipped database exited ${checked.code}: ${checked.stderr.slice(-800)}`);
+    expect(JSON.parse(checked.stdout.trim().split("\n").pop()!).backup.skipped).toEqual(["vault/data/laterv/vault.db"]);
+    expect(footprint(home)).toEqual(before);
     const second = await cli(home, ["user", "list"]);
     expect(second.stderr).toContain("vault/data/laterv/vault.db can be read now; backed it up first");
     expect(Object.keys(manifest().files).sort()).toEqual(["hub.db", "vault/data/goodv/vault.db", "vault/data/laterv/vault.db"]);

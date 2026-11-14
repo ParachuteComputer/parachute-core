@@ -17,8 +17,10 @@
 //   1. a scratch folder beside the home (the same filesystem, where the real backup will go), removed at the end
 //      however the command ends, and at the next check if this one was killed;
 //   2. every database copied consistently (VACUUM INTO, read the way the newer-data check reads: never a byte of
-//      the home changed, also while a server has it open), and the small files a command reads (settings, the
-//      release record). Attachments, mirrors and logs are left out: the step doesn't read them;
+//      the home changed, also while a server has it open), and the small files a command reads (settings).
+//      Attachments, mirrors and logs are left out: the step doesn't read them. The release record goes along
+//      without its paths (copyRecord): it names the home's real backup folder, and nothing on the copy may write
+//      there;
 //   3. this same program run on the copy, as the first command on the home would run: the newer-data check, the
 //      backup, the record, then every database opened by this release (the hub's keys, each vault's types and tags);
 //   4. the report: what the step did on the copy, what it would refuse, and what moved a schema number (which makes
@@ -26,21 +28,23 @@
 // It starts no server, so nothing listens, no module starts and nothing leaves the machine.
 // Exit codes: 0 the step ran clean on the copy · 1 it failed or would be refused (the report says what) · 2 usage ·
 // 5 no room for the copy · 6 the home was written by a newer release.
+import { randomBytes } from "node:crypto";
 import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statfsSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import core from "../../../package.json" with { type: "json" };
 import { USAGE_LOG, readUsage } from "./front.ts";
 import { databases, readDatabase, schemaOf } from "./home.ts";
 import { bundleRoot } from "./install.ts";
-import { RELEASE_FILE, readRelease } from "./release.ts";
+import { RELEASE_FILE, readRelease, type Release } from "./release.ts";
 
 export type UpgradeAsk =
   | { kind: "usage"; message: string }
   | { kind: "help" }
   | { kind: "check"; json: boolean }
   | { kind: "rollback" }
-  | { kind: "hub" };
+  /** The hub's own upgrade (a module, or its sweep), with the arguments to hand it. */
+  | { kind: "hub"; argv: string[] };
 
 export function upgradeUsage(): string {
   return [
@@ -68,71 +72,84 @@ export function upgradeHelp(): string {
   ].join("\n");
 }
 
-/** The services `upgrade <service>` may name: the hub, the modules the hub knows, and the rows of services.json. */
-function knownServiceNames(home: string, known: string[]): Set<string> {
-  const names = new Set<string>(["hub", ...known]);
+/** What the hub's own upgrade will find in services.json: its rows, or why it can't be read. */
+function serviceRows(home: string): { name: string; installDir?: unknown }[] | "unreadable" {
+  const path = join(home, "services.json");
+  if (!existsSync(path)) return [];
   try {
-    const rows = JSON.parse(readFileSync(join(home, "services.json"), "utf8"))?.services;
-    if (Array.isArray(rows)) for (const row of rows) if (typeof row?.name === "string") names.add(row.name);
+    const rows = JSON.parse(readFileSync(path, "utf8"))?.services;
+    return Array.isArray(rows) ? rows.filter((r) => typeof r?.name === "string") : "unreadable";
   } catch {
-    // No services.json, or one that can't be read: only the names every hub knows.
+    return "unreadable";
   }
-  return names;
 }
 
 /**
- * What `parachute upgrade <args>` asks for. Pure but for one read of services.json: it changes nothing, so dispatch
- * calls it before any check or step on the home. `known`: the module names the hub knows (service-spec.ts).
+ * What `parachute upgrade <args>` asks for. It reads services.json and nothing else, and changes nothing, so
+ * dispatch calls it before any check or step on the home.
+ *
+ * The hub's own upgrade is handed `argv`, rebuilt here from what was understood, never the words as typed: whatever
+ * this lets through, the hub's parser accepts, so nothing is refused as a usage error after the step. For the same
+ * reason a service is accepted here only where the hub will find it (commands/upgrade.ts resolveTargets): the hub
+ * itself, a module the hub knows that has a row in services.json (`manifestName`: its row's name), or a row that
+ * names its install folder.
  */
-export function parseUpgrade(args: string[], home: string, known: string[]): UpgradeAsk {
+export function parseUpgrade(args: string[], home: string, manifestName: (short: string) => string | undefined): UpgradeAsk {
   const usage = (message: string): UpgradeAsk => ({ kind: "usage", message });
   if (args.some((a) => a === "--help" || a === "-h")) return { kind: "help" };
   const has = (flag: string) => args.includes(flag);
   if (has("--check")) {
     const other = args.find((a) => a !== "--check" && a !== "--json");
-    if (other) return usage(other.startsWith("-") ? `--check doesn't go with ${other}` : `--check takes no service name ("${other}"): it checks the whole home`);
+    if (other !== undefined) return usage(other.startsWith("-") ? `--check doesn't go with ${other}` : `--check takes no service name ("${other}"): it checks the whole home`);
     return { kind: "check", json: has("--json") };
   }
   if (has("--rollback")) {
     const other = args.find((a) => !["--rollback", "--restore", "--yes", "-y", "--json"].includes(a));
-    if (other) return usage(`unknown argument '${other}' with --rollback`);
+    if (other !== undefined) return usage(`unknown argument '${other}' with --rollback`);
     return { kind: "rollback" };
   }
   // The hub's own upgrade: at most one service, and only the flags it has, each with the value it needs.
   const services: string[] = [];
+  let channel: string | undefined;
+  let tag: string | undefined;
+  let allowDowngrade = false;
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
-    if (a === "--allow-downgrade") continue;
-    if (a === "--channel" || a === "--tag") {
-      const value = args[++i];
-      if (value === undefined || value.startsWith("-")) return usage(`${a} needs a value`);
-      if (a === "--channel" && value !== "rc" && value !== "latest") return usage(`--channel must be "rc" or "latest" (got "${value}")`);
-      continue;
-    }
-    if (a.startsWith("--channel=") || a.startsWith("--tag=")) {
-      const value = a.slice(a.indexOf("=") + 1);
-      if (!value) return usage(`${a.slice(0, a.indexOf("="))} needs a value`);
-      if (a.startsWith("--channel=") && value !== "rc" && value !== "latest") return usage(`--channel must be "rc" or "latest" (got "${value}")`);
-      continue;
-    }
-    if (a.startsWith("-")) return usage(`unknown flag ${a}`);
-    services.push(a);
+    const eq = a.startsWith("--channel=") || a.startsWith("--tag=") ? a.indexOf("=") : -1;
+    const name = eq > 0 ? a.slice(0, eq) : a;
+    if (name === "--allow-downgrade") allowDowngrade = true;
+    else if (name === "--channel" || name === "--tag") {
+      const value = eq > 0 ? a.slice(eq + 1) : args[++i];
+      if (!value || value.startsWith("-")) return usage(`${name} needs a value`);
+      if (name === "--channel" && value !== "rc" && value !== "latest") return usage(`--channel must be "rc" or "latest" (got "${value}")`);
+      if (name === "--channel") channel = value;
+      else tag = value;
+    } else if (a.startsWith("-") || a === "") return usage(a === "" ? "an empty argument" : `unknown flag ${a}`);
+    else services.push(a);
   }
   if (services.length > 1) return usage(`one service at a time ("${services[0]}", "${services[1]}")`);
-  if (services.length === 1) {
-    const names = knownServiceNames(home, known);
-    if (!names.has(services[0]!)) return usage(`unknown service "${services[0]}" (known: ${[...names].sort().join(", ")})`);
+  const rows = serviceRows(home);
+  if (rows === "unreadable") return usage(`${join(home, "services.json")} can't be read, so no module can be upgraded; fix or remove it`);
+  const svc = services[0];
+  if (svc !== undefined && svc !== "hub") {
+    const row = manifestName(svc);
+    if (row !== undefined) {
+      if (!rows.some((r) => r.name === row)) return usage(`${svc} isn't installed on this home (\`parachute install ${svc}\` first)`);
+    } else if (!rows.some((r) => r.name === svc && typeof r.installDir === "string" && r.installDir)) {
+      return usage(`unknown service "${svc}"`);
+    }
   }
-  return { kind: "hub" };
+  return { kind: "hub", argv: [...(svc !== undefined ? [svc] : []), ...(channel ? ["--channel", channel] : []), ...(tag ? ["--tag", tag] : []), ...(allowDowngrade ? ["--allow-downgrade"] : [])] };
 }
 
 // ── --check ──────────────────────────────────────────────────────────────────────────────────────────────────
 
 export const EXIT = { ok: 0, problems: 1, usage: 2, noRoom: 5 } as const;
-/** Written into a copy made by --check, and only there: the run on the copy refuses any home without it. */
+/** Written into a copy made by --check, and only there, holding that check's own word (COPY_WORD_ENV). */
 const COPY_MARK = ".parachute-upgrade-check-copy";
-/** The copy the run on the copy was started for; with COPY_MARK in that home, this process is that run. */
+/** The copy the run on the copy was started for, and the word its mark holds. */
 const COPY_ENV = "PARACHUTE_UPGRADE_CHECK_COPY";
+const COPY_WORD_ENV = "PARACHUTE_UPGRADE_CHECK_WORD";
 const SCRATCH_PREFIX = ".parachute-upgrade-check-";
 /** Folders the step never reads: a vault's attachments and its git mirror, logs, and package trees. */
 const LEFT_OUT = new Set(["assets", "mirror", "logs", "node_modules", ".git"]);
@@ -142,9 +159,19 @@ const SMALL = 1024 * 1024;
 const size = (n: number) => (n > 1e9 ? `${(n / 1e9).toFixed(1)} GB` : `${Math.max(1, Math.round(n / 1e6))} MB`);
 const seconds = (ms: number) => `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)} s`;
 
-/** Whether this process is the run on a copy that `--check` started (and `home` is that copy). */
+/**
+ * Whether this process is the run on a copy that `--check` started, and `home` is that copy: the environment names
+ * it, it sits where a check puts its copy (`<scratch>/home`), and its mark holds the word that check made up. A home
+ * that fails any of these is never taken for a copy, so the step on a copy can't be reached on a real home.
+ */
 export function isCheckCopy(home: string): boolean {
-  return process.env[COPY_ENV] === home && existsSync(join(home, COPY_MARK));
+  const word = process.env[COPY_WORD_ENV];
+  if (!word || process.env[COPY_ENV] !== home || basename(home) !== "home" || !basename(dirname(home)).startsWith(SCRATCH_PREFIX)) return false;
+  try {
+    return readFileSync(join(home, COPY_MARK), "utf8").trim() === word;
+  } catch {
+    return false;
+  }
 }
 
 interface VaultReport {
@@ -178,10 +205,8 @@ export async function openCopy(home: string): Promise<number> {
   const report: CopyReport = { release: null, hub: { opens: false }, vaults: [], refusals: [] };
   const r = readRelease(home);
   if (r) report.release = { version: r.version, previous: r.previous, backup: r.backup, state: r.state };
-  // What `serve` checks before it opens anything: a home the old 0.7 programs still own, and parachute.yaml.
-  const { serveRefusal } = await import("./takeover.ts");
-  const refused = serveRefusal(home);
-  if (refused) report.refusals.push(`serve would refuse this home: ${oneLine(refused)}`);
+  // What `serve` checks before it opens anything: parachute.yaml. (Whether the old 0.7 programs still own the home
+  // is judged on the home itself, by the check that started this run: nothing names this copy.)
   const { applyParachuteYaml, SettingsError } = await import("./settings.ts");
   try {
     applyParachuteYaml(home, { server: true });
@@ -202,7 +227,7 @@ export async function openCopy(home: string): Promise<number> {
     } catch (err) {
       report.hub = { opens: false, error: oneLine(err) };
     }
-  } else report.hub = { opens: true, keys: 0 };
+  } else report.hub = { opens: true }; // no hub.db yet: nothing to open
   const { listVaults } = await import("@openparachute/vault/src/config.ts");
   const { getVaultStore, closeAllStores } = await import("@openparachute/vault/src/vault-store.ts");
   for (const name of listVaults()) {
@@ -239,14 +264,14 @@ function clearStale(parent: string): void {
     const dir = join(parent, n);
     try {
       if (!lstatSync(dir).isDirectory() || !existsSync(join(dir, "home", COPY_MARK))) continue;
-      const pid = Number(readFileSync(join(dir, "pid"), "utf8"));
-      if (Number.isInteger(pid) && pid > 1) {
-        try {
-          process.kill(pid, 0);
-          continue; // that check is still running
-        } catch (err) {
-          if ((err as NodeJS.ErrnoException).code === "EPERM") continue;
-        }
+      const pid = Number(readFileSync(join(dir, "pid"), "utf8").trim());
+      // Only a folder that names a process, and whose process is gone, is removed. Anything else is left.
+      if (!Number.isInteger(pid) || pid <= 1) continue;
+      try {
+        process.kill(pid, 0);
+        continue; // that check is still running
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ESRCH") continue;
       }
       rmSync(dir, { recursive: true, force: true });
     } catch {
@@ -255,7 +280,10 @@ function clearStale(parent: string): void {
   }
 }
 
-/** Copy the home's small files (settings, records) into `to`; never a database, a lock, a socket or a link. */
+/**
+ * Copy the home's small files (settings) into `to`; never a database, a lock, a socket or a link. The release record
+ * is not copied as it is (copyRecord): it names the home's real backup folder.
+ */
 function copySmallFiles(home: string, to: string, dbFiles: Set<string>): number {
   let left = 0;
   const walk = (rel: string) => {
@@ -268,8 +296,8 @@ function copySmallFiles(home: string, to: string, dbFiles: Set<string>): number 
         walk(r);
       } else if (st.isFile()) {
         if (dbFiles.has(r)) continue;
-        // run/ holds this machine's running state (locks, pids, sockets); only the records travel.
-        if (rel === "run" && r !== RELEASE_FILE && r !== USAGE_LOG) continue;
+        // run/ holds this machine's running state (locks, pids, sockets); only the usage log travels as it is.
+        if (rel === "run" && r !== USAGE_LOG) continue;
         if (st.size > SMALL) {
           left++;
           continue;
@@ -283,20 +311,44 @@ function copySmallFiles(home: string, to: string, dbFiles: Set<string>): number 
   return left;
 }
 
+/**
+ * The copy's release record: the home's own, without the paths that lead back out of the copy. The record names
+ * the real backup folder (and, after a restore, where the live databases were moved), and the step writes there:
+ * it copies a database the backup had skipped into that backup once it can be read. On the copy that must not
+ * happen, so the copy's record names no backup and no skipped database, and the report says what waits instead.
+ */
+function copyRecord(was: Release | undefined, copy: string): void {
+  if (!was) return;
+  const { skipped: _skipped, moved_aside: _aside, moved_aside_retries: _retries, ...rest } = was;
+  mkdirSync(join(copy, "run"), { recursive: true, mode: 0o700 });
+  writeFileSync(join(copy, RELEASE_FILE), `${JSON.stringify({ ...rest, backup: null }, null, 2)}\n`, { mode: 0o600 });
+}
+
+/** A consistent copy of one database, tried again when a writer's checkpoint tore the read (home.ts readDatabase). */
+function copyDatabase(from: string, to: string, outside: string): void {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      rmSync(to, { force: true });
+      readDatabase(from, (db) => db.run("VACUUM INTO ?", [to]), outside);
+      return;
+    } catch (err) {
+      if (attempt >= 3 || !/malformed|locked|busy|disk I\/O/i.test(String((err as Error)?.message))) throw err;
+      Bun.sleepSync(300 * attempt);
+    }
+  }
+}
+
 /** `parachute upgrade --check [--json]` on `home`: the exit code. */
-export async function check(home: string, opts: { json: boolean }): Promise<number> {
+export async function check(asked: string, opts: { json: boolean }): Promise<number> {
+  const home = resolve(asked);
   const say = (s: string) => (opts.json ? console.error(s) : console.log(s));
-  const out: Record<string, unknown> = { check: "problems", home, from: null, to: core.version, changed: false, refusals: [], problems: [] };
+  const out: Record<string, unknown> = { check: "problems", home, from: null, to: core.version, refusals: [], problems: [] };
   const problems: string[] = [];
   const finish = (code: number, verdict: "ok" | "problems" | "refused" | "no-room", refusals: string[] = []) => {
     Object.assign(out, { check: verdict, refusals, problems });
     for (const p of refusals) say(`  would refuse: ${p}`);
     for (const p of problems) say(`  problem: ${p}`);
-    say(
-      code === EXIT.ok
-        ? `The step to ${core.version} ran clean on the copy. Nothing here was changed: no backup, no release record.`
-        : `Nothing here was changed: no backup, no release record.`,
-    );
+    say(code === EXIT.ok ? `The step to ${core.version} ran clean on the copy. Nothing here was changed: no backup, no release record.` : "Nothing here was changed: no backup, no release record.");
     if (opts.json) console.log(JSON.stringify(out));
     return code;
   };
@@ -304,6 +356,15 @@ export async function check(home: string, opts: { json: boolean }): Promise<numb
     problems.push(`there is no Parachute home at ${home} (set PARACHUTE_HOME to check another)`);
     return finish(EXIT.problems, "problems");
   }
+  const was = readRelease(home);
+  // A home the old 0.7 programs still own is the takeover's: this release takes no step on it and its serve refuses
+  // it. Judged here, on the home itself: the copy has another path, so nothing on this machine would name it.
+  if (!was) {
+    const { serveRefusal } = await import("./takeover.ts");
+    const refused = serveRefusal(home);
+    if (refused) return finish(EXIT.problems, "refused", [`${oneLine(refused)} \`parachute takeover --dry-run\` says what it would do.`]);
+  }
+  if (was?.state === "restoring") return finish(EXIT.problems, "refused", [`a restore on this home was interrupted; \`parachute upgrade --rollback --restore --yes\` finishes it`]);
   const parent = dirname(home);
   const dbs = databases(home, { hub: 0, vault: 0 });
   const dbFiles = new Set(dbs.flatMap((d) => [d.rel, `${d.rel}-wal`, `${d.rel}-shm`, `${d.rel}-journal`]));
@@ -323,31 +384,35 @@ export async function check(home: string, opts: { json: boolean }): Promise<numb
     return finish(EXIT.noRoom, "no-room");
   }
   const scratch = mkdtempSync(join(place, SCRATCH_PREFIX));
+  let child: ReturnType<typeof Bun.spawn> | undefined;
   const gone = () => rmSync(scratch, { recursive: true, force: true });
+  // A signal ends the run on the copy and removes the copy before this process goes.
   const onSignal = () => {
+    child?.kill("SIGKILL");
     gone();
     process.exit(130);
   };
-  process.once("SIGINT", onSignal);
-  process.once("SIGTERM", onSignal);
+  const signals = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
+  for (const sig of signals) process.once(sig, onSignal);
   try {
     chmodSync(scratch, 0o700);
     writeFileSync(join(scratch, "pid"), `${process.pid}\n`, { mode: 0o600 });
     const copy = join(scratch, "home");
+    const word = randomBytes(16).toString("hex");
     mkdirSync(copy, { mode: 0o700 });
-    writeFileSync(join(copy, COPY_MARK), "made by `parachute upgrade --check`; safe to delete\n", { mode: 0o600 });
-    const was = readRelease(home);
+    writeFileSync(join(copy, COPY_MARK), `${word}\n`, { mode: 0o600 });
     say(`parachute upgrade --check: the step to ${core.version} on a copy of ${home}. Nothing here is changed.`);
     // 1. The copy.
     const t0 = Date.now();
     const left = copySmallFiles(home, copy, dbFiles);
+    copyRecord(was, copy);
     const before: Record<string, number | null> = {};
     let copied = 0;
     for (const d of dbs) {
       const to = join(copy, d.rel);
       mkdirSync(dirname(to), { recursive: true, mode: 0o700 });
       try {
-        readDatabase(join(home, d.rel), (db) => db.run("VACUUM INTO ?", [to]), parent);
+        copyDatabase(join(home, d.rel), to, parent);
         chmodSync(to, 0o600);
         before[d.rel] = schemaOf(to, scratch) ?? null;
         copied++;
@@ -355,45 +420,49 @@ export async function check(home: string, opts: { json: boolean }): Promise<numb
         rmSync(to, { force: true });
         problems.push(`can't read ${d.rel} (${oneLine(err)}): the step would leave it out of its backup, and the command that needs it would fail`);
       }
+      await Bun.sleep(0); // let a signal in between databases
     }
     say(`  copied ${copied} of ${dbs.length} database${dbs.length === 1 ? "" : "s"} (${size(bytes)}) in ${seconds(Date.now() - t0)}${left ? `; ${left} larger file${left === 1 ? "" : "s"} left out (not settings)` : ""}`);
     Object.assign(out, { databases: dbs.length, bytes, copy_ms: Date.now() - t0 });
     // 2. This program on the copy, as the home's first command would run. Its environment names the copy only.
-    const env: Record<string, string> = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: scratch, PARACHUTE_HOME: copy, [COPY_ENV]: copy, PARACHUTE_OFFLINE: "1", EMBEDDINGS_ENABLED: "false", PARACHUTE_DEPRECATIONS: "0" };
+    const env: Record<string, string> = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: scratch, PARACHUTE_HOME: copy, [COPY_ENV]: copy, [COPY_WORD_ENV]: word, PARACHUTE_OFFLINE: "1", EMBEDDINGS_ENABLED: "false", PARACHUTE_DEPRECATIONS: "0" };
     for (const k of ["LANG", "LC_ALL", "TZ", "TMPDIR"]) if (process.env[k]) env[k] = process.env[k]!;
     const t1 = Date.now();
-    const run = Bun.spawnSync([...self(), "upgrade", "--check", "--json"], { env, cwd: scratch, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+    child = Bun.spawn([...self(), "upgrade", "--check", "--json"], { env, cwd: scratch, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+    const [stdout, errText, exitCode] = await Promise.all([new Response(child.stdout as ReadableStream).text(), new Response(child.stderr as ReadableStream).text(), child.exited]);
+    child = undefined;
     const stepMs = Date.now() - t1;
-    const stderr = run.stderr.toString().split(scratch).join("<copy>");
+    const stderr = errText.split(scratch).join("<copy>");
     let report: CopyReport | undefined;
     try {
-      report = JSON.parse(run.stdout.toString().trim().split("\n").pop() ?? "") as CopyReport;
+      report = JSON.parse(stdout.trim().split("\n").pop() ?? "") as CopyReport;
     } catch {}
-    if (run.exitCode !== 0 || !report) {
+    if (exitCode !== 0 || !report) {
       const why = stderr.trim().split("\n").filter(Boolean).slice(-6).join(" / ");
-      const refusal = `the step stopped on the copy with exit ${run.exitCode}: ${why || "no message"}`;
-      return finish(run.exitCode === 6 ? 6 : EXIT.problems, "refused", [refusal]);
+      return finish(exitCode === 6 ? 6 : EXIT.problems, "refused", [`the step stopped on the copy with exit ${exitCode}: ${why || "no message"}`]);
     }
     // 3. The report.
     const rel = report.release;
-    const from = rel?.previous ?? (rel ? null : (was?.version ?? null));
+    const current = !!was && was.version === core.version && was.state === "current";
+    const from = current ? was.previous : (rel?.previous ?? was?.version ?? null);
     Object.assign(out, { from, step_ms: stepMs });
-    if (rel?.backup) {
+    if (current) {
+      out.backup = { databases: 0, skipped: was.skipped ?? [] };
+      say(`  this home is on ${core.version} already: no step to take, no new backup`);
+      if (was.skipped?.length) say(`  still waiting to be backed up (unreadable when the step was taken): ${was.skipped.join(", ")}. The next command that can read it backs it up first.`);
+    } else if (rel?.backup) {
       const manifest = JSON.parse(readFileSync(join(rel.backup, "manifest.json"), "utf8")) as { files: Record<string, string>; skipped?: string[] };
       const n = Object.keys(manifest.files).length;
       out.backup = { databases: n, skipped: manifest.skipped ?? [] };
       say(`  ${from ?? "an older release"} → ${core.version}: the step backs up ${n} database${n === 1 ? "" : "s"} first, then records the release (${seconds(stepMs)} on the copy, opening included)`);
     } else {
       out.backup = { databases: 0, skipped: [] };
-      say(
-        was && was.version === core.version && was.state === "current"
-          ? `  this home is on ${core.version} already: no step to take, no backup`
-          : `  no backup would be taken: ${rel ? "this release made the home, or its own takeover just moved it" : "nothing here can be recorded yet"}`,
-      );
+      say(`  no backup would be taken: ${rel ? "this release made the home, or its own takeover just moved it" : "nothing here can be recorded yet"}`);
     }
     out.hub = report.hub;
-    if (report.hub.opens) say(`  hub.db: opens; ${report.hub.keys} key${report.hub.keys === 1 ? "" : "s"} (a token an older release minted becomes a key)`);
-    else problems.push(`hub.db does not open with ${core.version}: ${report.hub.error}`);
+    if (!report.hub.opens) problems.push(`hub.db does not open with ${core.version}: ${report.hub.error}`);
+    else if (report.hub.keys === undefined) say("  hub.db: none here yet");
+    else say(`  hub.db: opens; ${report.hub.keys} key${report.hub.keys === 1 ? "" : "s"} (a token an older release minted becomes a key)`);
     out.vaults = report.vaults;
     for (const v of report.vaults) {
       if (v.opens) say(`  vault ${v.name}: opens; ${v.notes} note${v.notes === 1 ? "" : "s"}, ${v.types} type${v.types === 1 ? "" : "s"}, ${v.tags} tag${v.tags === 1 ? "" : "s"}`);
@@ -410,15 +479,14 @@ export async function check(home: string, opts: { json: boolean }): Promise<numb
       if ((after ?? 0) > (before[d.rel] ?? 0)) moved.push(`${d.rel} (${before[d.rel] ?? "none"} → ${after})`);
     }
     out.schema_moved = moved;
-    say(moved.length ? `  schema numbers move: ${moved.join(", ")}. The older release can't open these afterwards: the way back is \`upgrade --rollback --restore\`` : "  no schema number moves: the older release still opens every database, so the way back keeps every write (`upgrade --rollback`)");
+    if (!current) say(moved.length ? `  schema numbers move: ${moved.join(", ")}. The older release can't open these afterwards: the way back is \`upgrade --rollback --restore\`` : "  no schema number moves: the older release still opens every database, so the way back keeps every write (`upgrade --rollback`)");
     const old = Object.entries(readUsage(home).names).map(([name, row]) => ({ name, count: row.count, last_seen: row.last_seen }));
     out.old_names = old;
     if (old.length) say(`  old names this home's usage log has seen (\`parachute changes\` says what each is now): ${old.map((o) => `${o.name} ×${o.count}`).join(", ")}`);
     const ok = problems.length === 0 && report.refusals.length === 0;
     return finish(ok ? EXIT.ok : EXIT.problems, ok ? "ok" : "problems", report.refusals);
   } finally {
-    process.off("SIGINT", onSignal);
-    process.off("SIGTERM", onSignal);
+    for (const sig of signals) process.off(sig, onSignal);
     gone();
   }
 }

@@ -189,8 +189,8 @@ export async function dispatch(role: Role, notice?: Notice): Promise<void> {
   let upgradeAsk: import("./upgrade.ts").UpgradeAsk | undefined;
   if ("cli" in r && r.cli === "hub" && r.argv[0] === "upgrade") {
     const { parseUpgrade, upgradeHelp, upgradeUsage } = await import("./upgrade.ts");
-    const { knownServices } = await import("@openparachute/hub/src/service-spec.ts");
-    upgradeAsk = parseUpgrade(r.argv.slice(1), home, knownServices());
+    const { getSpec } = await import("@openparachute/hub/src/service-spec.ts");
+    upgradeAsk = parseUpgrade(r.argv.slice(1), home, (short) => getSpec(short)?.manifestName);
     if (upgradeAsk.kind === "usage") {
       console.error(`parachute upgrade: ${upgradeAsk.message}\n${upgradeUsage()}`);
       process.exit(2);
@@ -199,6 +199,15 @@ export async function dispatch(role: Role, notice?: Notice): Promise<void> {
       console.log(upgradeHelp());
       return;
     }
+    // The hub's own upgrade gets the arguments as understood, not as typed: its parser can't then refuse them.
+    if (upgradeAsk.kind === "hub") r.argv = ["upgrade", ...upgradeAsk.argv];
+  }
+  // The vault has no `upgrade` of its own (it is part of this program), and its CLI would say so only after the
+  // step: `vault upgrade --check` must not back the home up and record it either.
+  if ("cli" in r && ((r.cli === "vault" && r.argv[0] === "upgrade") || (r.cli === "hub" && r.argv[0] === "vault" && r.argv[1] === "upgrade"))) {
+    const { upgradeUsage } = await import("./upgrade.ts");
+    console.error(`parachute vault upgrade: the vault is part of this program; upgrade it with \`parachute upgrade\`\n${upgradeUsage()}`);
+    process.exit(2);
   }
   // Every command but `version` (answered above) runs behind the check, help included: the moved CLIs do work on
   // the home before they read their arguments (the vault moves older layouts first), so `serve --help` is a command.
