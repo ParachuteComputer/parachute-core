@@ -44,7 +44,7 @@ describe("feed: which change a reader is told", () => {
     expect(feedOp([b, a], 6, { tags: ["out"] }, inScope)).toBe(null); // at 6 it had already left
   });
 
-  test("unknown is not visible to a scoped reader: a write outside any set, or only rows that began before the position", () => {
+  test("unknown is not visible to a scoped reader: a row with no saved tags, or only rows that began before the position", () => {
     expect(feedOp([row({ write_set: null, before_tags: null })], 0, { tags: ["out"] }, inScope)).toBe(null);
     expect(feedOp([row({ write_set: null, before_tags: null })], 0, null, inScope)).toBe(null);
     expect(feedOp([row({ first: 3, pos: 8 })], 5, { tags: ["out"] }, inScope)).toBe(null);
@@ -92,6 +92,21 @@ describe("feed: positions", () => {
     const page = readFeedPage(db, held, 100, null);
     expect(page.changes.map((c) => [c.id, c.op])).toEqual([[n.id, "delete"], [target.id, "upsert"]]);
     expect(page.next_position).toBe(newestPosition(db));
+  });
+
+  test("a write outside any write set is judged by the tags it saved: moved out is removed, never-in is nothing", async () => {
+    const { db, store, as } = fresh();
+    as({ id: "ws_seed000001" });
+    const inside = await store.createNote("in", { path: "in", tags: ["in"] });
+    const outside = await store.createNote("out", { path: "out", tags: ["out"] });
+    const held = newestPosition(db);
+    // Raw statements: no Store transaction, so no write context (write_set NULL).
+    db.prepare("DELETE FROM note_tags WHERE note_id = ? AND tag_name = 'in'").run(inside.id);
+    db.prepare("INSERT INTO note_tags (note_id, tag_name) VALUES (?, 'out')").run(inside.id);
+    db.prepare("UPDATE notes SET content = 'still out' WHERE id = ?").run(outside.id);
+    expect((db.prepare("SELECT COUNT(*) AS n FROM record_changes WHERE write_set IS NULL").get() as { n: number }).n).toBe(3);
+    const page = readFeedPage(db, held, 100, inScope);
+    expect(page.changes.map((c) => [c.id, c.op])).toEqual([[inside.id, "removed"]]);
   });
 
   test("a page reads past rows the reader isn't told of, the same as a scope-blind reader", async () => {

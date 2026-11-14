@@ -25,24 +25,23 @@ export const FEED_LIMIT_MAX = 500;
 /** A reader's name: what a client calls one of its readers (`default` when it doesn't say). */
 export const FEED_READER_RE = /^[A-Za-z0-9_-]{1,64}$/;
 
-const CTX_SET = `(SELECT write_set FROM write_context WHERE slot = 1)`;
 const NEWEST = `(SELECT newest FROM feed_state WHERE slot = 1)`;
 
 /**
- * Moves the current write set's row for a record to a new, newest position. Runs on every touch: on a first touch the
- * row may already be newest, and a number is spent for nothing; that keeps the rule simple (no case where a reader that
- * committed this row's position misses a later change in the same set). A write outside any set writes a fresh row
- * each time, so it needs nothing here.
+ * Moves the current write set's row for a record to a new, newest position (rcf_newest then advances the counter).
+ * Runs on every touch: on a first touch the row may already be newest, and a number is spent for nothing; that keeps
+ * the rule simple (no case where a reader that committed this row's position misses a later change in the same set).
+ * A write outside any set writes a fresh row each time (its write set is NULL), so the update matches nothing. One
+ * statement per trigger, as change-log.ts's: SQLite compiles every trigger into each statement that writes its table.
  */
 function bump(noteId: string): string {
-  return `
-    UPDATE feed_state SET newest = newest + 1 WHERE slot = 1
-      AND EXISTS (SELECT 1 FROM record_changes WHERE write_set = ${CTX_SET} AND note_id = ${noteId});
-    UPDATE record_changes SET feed_seq = ${NEWEST} WHERE write_set = ${CTX_SET} AND note_id = ${noteId};`;
+  return `UPDATE record_changes SET feed_seq = ${NEWEST} + 1
+    WHERE write_set = (SELECT write_set FROM write_context WHERE slot = 1) AND note_id = ${noteId};`;
 }
 
 export const FEED_TRIGGERS = [
   "rcf_position",
+  "rcf_newest",
   "rcf_notes_insert",
   "rcf_notes_update",
   "rcf_notes_delete",
@@ -75,8 +74,10 @@ INSERT OR IGNORE INTO feed_state (slot, newest, horizon)
 CREATE INDEX IF NOT EXISTS idx_record_changes_feed ON record_changes(feed_seq);
 
 CREATE TRIGGER IF NOT EXISTS rcf_position AFTER INSERT ON record_changes WHEN NEW.feed_seq IS NULL BEGIN
-  UPDATE feed_state SET newest = newest + 1 WHERE slot = 1;
-  UPDATE record_changes SET feed_seq = ${NEWEST}, feed_first = ${NEWEST} WHERE seq = NEW.seq;
+  UPDATE record_changes SET feed_seq = ${NEWEST} + 1, feed_first = ${NEWEST} + 1 WHERE seq = NEW.seq;
+END;
+CREATE TRIGGER IF NOT EXISTS rcf_newest AFTER UPDATE OF feed_seq ON record_changes WHEN NEW.feed_seq > ${NEWEST} BEGIN
+  UPDATE feed_state SET newest = NEW.feed_seq WHERE slot = 1;
 END;
 CREATE TRIGGER IF NOT EXISTS rcf_notes_insert AFTER INSERT ON notes BEGIN ${bump("NEW.id")} END;
 CREATE TRIGGER IF NOT EXISTS rcf_notes_update AFTER UPDATE ON notes
@@ -174,9 +175,11 @@ export type FeedOp = "upsert" | "delete" | "removed";
  * - *Visible before* (at the reader's position): read from the record's row with the smallest `first` above the
  *   position; that row's `existed` and `before_tags` are the record as it was there. A row whose `first` is at or below
  *   the position is a write set that began before it and touched the record again later: its `before_tags` describe
- *   an older state. When no row says what the record was at the position, or the row has no `before_tags` (a write
- *   made outside any write set, by a raw statement or an older engine), the state is unknown, and a scoped reader
- *   counts it as not visible: the feed never names a record it can't show the reader could see. The cost is a missed
+ *   an older state. Writes outside any write set (write_set NULL: a raw statement, or an engine that runs the
+ *   triggers without setting a context) get one row per change, with the tags saved like any other, so they are
+ *   judged the same way. When no row says what the record was at the position, or a row has no saved tags (none is
+ *   written that way today; kept as the safe answer), the state is unknown, and a scoped reader counts it as not
+ *   visible: the feed never names a record it can't show the reader could see. The cost is a missed
  *   `removed` (or `delete`) for a record the reader held, in those rare cases. An unscoped reader sees every record,
  *   so for it "before" is only whether the record existed (unknown counts as existing: a delete of something it may
  *   hold is safe to send).

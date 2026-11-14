@@ -1684,9 +1684,9 @@ again (each change at least once, none skipped).
   leaves no trace (no id, no count). `next_position` and `more` depend only on the log, never on the scope, so an
   empty page moves on exactly as a scope-blind reader's would. Its changes carry no `by`, `via` or `write_set`, as its
   versions don't. Whether a record was in scope at your position is read from the tags the change log saved before
-  the first write after it. A write made outside any write set (a raw statement, an engine before 0.9.4) saves no
-  tags; for such a record, and in the rare case where one write set began before your position and touched the record
-  again after it, the feed can't say, and counts the record as not seen: it may then miss a `removed` or `delete` for
+  the first write after it (a write made outside any write set saves them too). In the rare case where one write set
+  began before your position and touched the record again after it, the feed can't say, and counts the record as not
+  seen: it may then miss a `removed` or `delete` for
   it, rather than ever name a record you may not have been able to see. A scope change made in the tag hierarchy
   alone (re-parenting a tag) changes no record, so it sends nothing until those records change.
 - **The horizon.** The log keeps `history.change_log_days` (default 30). A held position older than what was swept
