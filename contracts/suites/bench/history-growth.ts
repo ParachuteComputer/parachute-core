@@ -11,7 +11,8 @@
 // record (5%); the vault's maintenance pass runs once a day. Whatever this build's policy is (bursts, compression,
 // compaction, the change log) is what it measures: run it against two builds to compare them. Only the simulated days'
 // change log is counted (the starting import is cleared from it). `measure` reads page sizes, so free space inside a
-// table counts: what the file costs, not just the payload. Byte counts only; nothing reads note text.
+// table counts (the file can be a little larger: its free pages aren't in dbstat). Byte counts only; nothing reads note
+// text. Not counted in either group: git-history import tables (history_import_*), which only an import fills.
 //
 // It imports the vault engine from this checkout (packages/vault/core), so it measures the code beside it.
 import { setSystemTime } from "bun:test";
@@ -35,7 +36,7 @@ export function measure(db: Database): Record<string, number> {
   const by = (pred: (n: string) => boolean) => rows.filter((r) => pred(r.name)).reduce((a, r) => a + r.bytes, 0);
   const history = (n: string) =>
     ["note_blobs", "note_versions", "history_compact_state"].includes(n) ||
-    /^(idx_note_versions|idx_note_blobs|sqlite_autoindex_note_blobs|sqlite_autoindex_note_versions|sqlite_autoindex_history_compact_state)/.test(n);
+    /^(idx_note_versions|idx_note_blobs|idx_history_compact|sqlite_autoindex_note_blobs|sqlite_autoindex_note_versions|sqlite_autoindex_history_compact_state)/.test(n);
   const log = (n: string) =>
     ["record_changes", "record_change_bodies", "write_sets", "write_context", "change_log_state", "feed_readers"].includes(n) ||
     /^(idx_record_changes|idx_write_sets|sqlite_autoindex_record_changes|sqlite_autoindex_write_sets|sqlite_autoindex_record_change_bodies|sqlite_autoindex_feed_readers)/.test(n);
@@ -90,6 +91,11 @@ function text(bytes: number): string {
   return out.slice(0, bytes);
 }
 
+// A fixture is made in a new file only: it clears the change log of the file it is given.
+if (await Bun.file(file).exists()) {
+  console.error(`${file} exists; fixture writes a new file only`);
+  process.exit(2);
+}
 let clock = Date.parse("2026-10-01T08:00:00Z");
 setSystemTime(new Date(clock));
 const db = new Database(file);
@@ -154,6 +160,16 @@ for (let d = 0; d < DAYS; d++) {
   }
   clock += 3_600_000;
   setSystemTime(new Date(clock));
+  // SQLite stamps the change log with its own clock; move today's rows to the fake day, so the log's sweep (30 days)
+  // drops them on time in a run longer than that.
+  const day = new Date(clock).toISOString();
+  for (const t of ["record_changes", "write_sets"]) {
+    try {
+      db.prepare(`UPDATE ${t} SET at = ? WHERE at > ?`).run(day, day);
+    } catch {}
+  }
+  const sweep = (store as { pruneChangeLogDaily?: (now?: number) => unknown }).pruneChangeLogDaily;
+  if (sweep) sweep.call(store, clock);
   if (typeof store.compactHistory === "function") store.compactHistory();
 }
 console.log(JSON.stringify({ records: ids.length, writes, days: DAYS, ...measure(db) }));
