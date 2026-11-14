@@ -17,8 +17,22 @@
  *
  * Additive, with no schema number (ensureChangeLog, checked in unnumberedStepsDone): an older engine ignores the
  * tables, and its writes, which the triggers still see, are logged with a NULL write set.
+ *
+ * Field snapshots are stored compressed (T-471), as history stores version bodies (blob-codec.ts): the triggers can't
+ * compress, so they write JSON text, and the end of the transaction (settleChangeLogPositions) re-encodes it.
+ * - `before_row` (a record's fields, path and stamps) long enough to gain: a Fossil delta, deflated, against a whole
+ *   snapshot of the same record in `record_change_bases` (`before_base` names it). Depth one: a base is always whole.
+ *   A record's writes mostly change a field or two, so the delta is a few dozen bytes. A new base is made when the
+ *   record has none, or when the delta against its newest one is no longer small.
+ * - `before_links`: deflated whole (it changes only on a link write).
+ * - Short snapshots stay text. The column's type says which: TEXT is the JSON, a BLOB is compressed.
+ * Readers go through {@link setRecordStates}, so undo and the write-set routes see byte-equal text either way.
+ * `before_tags` stays text: the feed reads it on every page. A base is freed by the sweep once no row of its record can
+ * name it, and with the record's past (forgetLoggedPast).
  */
 import type { Database } from "bun:sqlite";
+import { deflateBytes, inflateBytes, BlobDecodeError, type StoredContent } from "./blob-codec.js";
+import { applyDeltaBytes, createDeltaBytes } from "./delta.js";
 import { kindOfVia } from "./write-stamp.js";
 
 /** Rows older than this many days are swept (the feed's and undo's horizon). */
@@ -120,8 +134,18 @@ CREATE TABLE IF NOT EXISTS record_changes (
   -- check compares it.
   position INTEGER,
   touched INTEGER NOT NULL DEFAULT 1,
+  -- The whole snapshot before_row is a delta against (record_change_bases.id), or NULL when before_row stands alone.
+  before_base INTEGER,
   UNIQUE (write_set, note_id, txn)
 );
+-- Whole field snapshots that before_row deltas are taken against (T-471): one record's each, made by settle, freed by
+-- the sweep once no row of the record can name them. content is the JSON deflated (a BLOB) or, when short, the text.
+CREATE TABLE IF NOT EXISTS record_change_bases (
+  id INTEGER PRIMARY KEY,
+  note_id TEXT NOT NULL,
+  content NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_record_change_bases_note ON record_change_bases(note_id, id);
 CREATE INDEX IF NOT EXISTS idx_record_changes_position ON record_changes(position);
 -- A body undo needs, staged here by the triggers for the length of the writing transaction; its end moves it into
 -- note_blobs (history.ts settleLogBodies) and empties this table. Kept apart from record_changes so a log row is
@@ -224,15 +248,19 @@ export const CHANGE_LOG_TRIGGERS = [
 /** Whether the change log's tables and triggers are all present. */
 export function changeLogPresent(db: Database): boolean {
   const names = new Set(
-    (db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table', 'trigger') AND (name IN ('write_context', 'write_sets', 'record_changes', 'record_change_bodies', 'change_log_state') OR name LIKE 'rc\\_%' ESCAPE '\\')").all() as { name: string }[]).map((r) => r.name),
+    (db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table', 'trigger') AND (name IN ('write_context', 'write_sets', 'record_changes', 'record_change_bodies', 'record_change_bases', 'change_log_state') OR name LIKE 'rc\\_%' ESCAPE '\\')").all() as { name: string }[]).map((r) => r.name),
   );
-  return ["write_context", "write_sets", "record_changes", "record_change_bodies", "change_log_state", ...CHANGE_LOG_TRIGGERS].every((n) => names.has(n));
+  return ["write_context", "write_sets", "record_changes", "record_change_bodies", "record_change_bases", "change_log_state", ...CHANGE_LOG_TRIGGERS].every((n) => names.has(n));
 }
 
 /** The un-numbered step: creates the change log on a vault that lacks it (no-op otherwise). */
 export function ensureChangeLog(db: Database): void {
   if (changeLogPresent(db)) return;
   db.exec(CHANGE_LOG_SQL);
+  // A log made by an earlier 0.9.4 build has no before_base (CREATE TABLE IF NOT EXISTS left its table as it was).
+  if (!db.prepare("SELECT 1 FROM pragma_table_info('record_changes') WHERE name = 'before_base'").get()) {
+    db.exec("ALTER TABLE record_changes ADD COLUMN before_base INTEGER");
+  }
 }
 
 /** What one write says about itself. */
@@ -299,6 +327,98 @@ export function clearWriteContext(db: Database, recordSet = true): void {
   cached(db, "DELETE FROM write_context WHERE slot = 1").run();
 }
 
+/** Snapshots shorter than this stay text: deflate's own framing would eat most of the saving (as for version bodies). */
+export const SNAPSHOT_COMPRESS_MIN_BYTES = 128;
+/** A delta is kept while it is under this share of the snapshot's own deflate; past it, the snapshot becomes a base. */
+const DELTA_MAX_SHARE = 0.25;
+/** A guard against a corrupt stream, far above any real snapshot (a record's fields, path and stamps; its links). */
+const SNAPSHOT_MAX_BYTES = 64 * 1024 * 1024;
+const utf8 = new TextEncoder();
+const strictUtf8 = new TextDecoder("utf-8", { fatal: true });
+
+/** A snapshot as stored whole: its deflate as bytes when that is shorter, else the text itself. */
+export function encodeSnapshot(text: string): string | Uint8Array {
+  const bytes = utf8.encode(text);
+  if (bytes.length < SNAPSHOT_COMPRESS_MIN_BYTES) return text;
+  const z = deflateBytes(bytes);
+  return z.length < bytes.length ? z : text;
+}
+
+function inflateText(stored: StoredContent): string {
+  try {
+    return strictUtf8.decode(inflateBytes(stored, SNAPSHOT_MAX_BYTES));
+  } catch (err) {
+    if (err instanceof BlobDecodeError) throw err;
+    throw new BlobDecodeError("a compressed change-log snapshot is not UTF-8");
+  }
+}
+
+/** A whole stored snapshot's JSON text: TEXT as it is, a BLOB inflated. Throws BlobDecodeError on a bad stream. */
+export function snapshotText(stored: StoredContent | null): string | null {
+  if (stored === null || typeof stored === "string") return stored;
+  return inflateText(stored);
+}
+
+/**
+ * A row's `before_row` as the JSON text the trigger wrote: whole, or its delta applied to its base. Throws
+ * BlobDecodeError when the base is gone or the delta doesn't apply (never a wrong snapshot: Fossil deltas carry a
+ * checksum).
+ */
+export function rowSnapshotText(db: Database, stored: StoredContent | null, base: number | null): string | null {
+  // TEXT is always the snapshot itself (the trigger's own, or an earlier build's row).
+  if (base === null || stored === null || typeof stored === "string") return snapshotText(stored);
+  const row = cached(db, "SELECT content FROM record_change_bases WHERE id = ?").get(base) as { content: StoredContent } | null;
+  if (!row) throw new BlobDecodeError(`a change-log snapshot's base ${base} is gone`);
+  try {
+    return applyDeltaBytes(snapshotText(row.content)!, inflateBytes(stored, SNAPSHOT_MAX_BYTES), SNAPSHOT_MAX_BYTES);
+  } catch (err) {
+    if (err instanceof BlobDecodeError) throw err;
+    throw new BlobDecodeError(`a change-log snapshot's delta doesn't apply: ${(err as Error).message}`);
+  }
+}
+
+/**
+ * Compresses the field snapshots of the rows still to be placed (the open transaction's), in seq order. Runs before
+ * they're placed, inside the same transaction, while the rows sit at the table's end: a row that shrinks there leaves
+ * its room to the next rows written, not a hole in a page already full.
+ */
+function compressTouchedSnapshots(db: Database): void {
+  const rows = cached(
+    db,
+    `SELECT seq, note_id, before_row, before_links FROM record_changes WHERE touched = 1
+       AND ((typeof(before_row) = 'text' AND length(CAST(before_row AS BLOB)) >= ${SNAPSHOT_COMPRESS_MIN_BYTES})
+         OR (typeof(before_links) = 'text' AND length(CAST(before_links AS BLOB)) >= ${SNAPSHOT_COMPRESS_MIN_BYTES}))
+     ORDER BY seq`,
+  ).all() as { seq: number; note_id: string; before_row: StoredContent | null; before_links: StoredContent | null }[];
+  if (!rows.length) return;
+  const update = cached(db, "UPDATE record_changes SET before_row = ?, before_links = ?, before_base = ? WHERE seq = ?");
+  const newestBase = cached(db, "SELECT id, content FROM record_change_bases WHERE note_id = ? ORDER BY id DESC LIMIT 1");
+  const addBase = cached(db, "INSERT INTO record_change_bases (note_id, content) VALUES (?, ?)");
+  const same = (v: StoredContent | null) => (v instanceof ArrayBuffer ? new Uint8Array(v) : v);
+  for (const r of rows) {
+    const links = typeof r.before_links === "string" ? encodeSnapshot(r.before_links) : same(r.before_links);
+    if (typeof r.before_row !== "string" || utf8.encode(r.before_row).length < SNAPSHOT_COMPRESS_MIN_BYTES) {
+      update.run(same(r.before_row), links, null, r.seq);
+      continue;
+    }
+    const text = r.before_row;
+    const whole = encodeSnapshot(text);
+    const wholeSize = typeof whole === "string" ? utf8.encode(whole).length : whole.length;
+    const base = newestBase.get(r.note_id) as { id: number; content: StoredContent } | null;
+    if (base) {
+      const delta = deflateBytes(createDeltaBytes(snapshotText(base.content)!, text));
+      if (delta.length < wholeSize * DELTA_MAX_SHARE) {
+        update.run(delta, links, base.id, r.seq);
+        continue;
+      }
+    }
+    // No base, or this snapshot has drifted from it: it becomes the record's newest base, and the row a delta of
+    // nothing against it (a few bytes), so every compressed row reads the same way.
+    const id = Number(addBase.run(r.note_id, whole).lastInsertRowid);
+    update.run(deflateBytes(createDeltaBytes(text, text)), links, id, r.seq);
+  }
+}
+
 /**
  * Gives every row a transaction touched the newest positions, in seq order (0.9.4): the feed's order, and what undo
  * compares. Runs at the end of each Store transaction (inside it), so positions follow commit order (one writer at a
@@ -308,6 +428,7 @@ export function clearWriteContext(db: Database, recordSet = true): void {
 export function settleChangeLogPositions(db: Database): void {
   const touched = (cached(db, "SELECT COUNT(*) AS n FROM record_changes WHERE touched = 1").get() as { n: number }).n;
   if (!touched) return;
+  compressTouchedSnapshots(db);
   cached(
     db,
     `UPDATE record_changes SET position = s.newest + t.rn, touched = 0
@@ -437,10 +558,12 @@ export interface SetRecordState {
 
 export function setRecordStates(db: Database, setId: string): SetRecordState[] {
   const rows = db
-    .prepare("SELECT seq, position, note_id, op, existed, content_saved, before_hash, before_row, before_tags, before_links FROM record_changes WHERE write_set = ? ORDER BY seq")
-    .all(setId) as { seq: number; position: number | null; note_id: string; op: SetRecordState["op"]; existed: number; content_saved: number; before_hash: string | null; before_row: string | null; before_tags: string | null; before_links: string | null }[];
+    .prepare("SELECT seq, position, note_id, op, existed, content_saved, before_hash, before_row, before_base, before_tags, before_links FROM record_changes WHERE write_set = ? ORDER BY seq")
+    .all(setId) as { seq: number; position: number | null; note_id: string; op: SetRecordState["op"]; existed: number; content_saved: number; before_hash: string | null; before_row: StoredContent | null; before_base: number | null; before_tags: string | null; before_links: StoredContent | null }[];
   const by = new Map<string, SetRecordState>();
-  for (const r of rows) {
+  for (const stored of rows) {
+    // Snapshots may be stored compressed: read back as the JSON text the triggers wrote.
+    const r = { ...stored, before_row: rowSnapshotText(db, stored.before_row, stored.before_base), before_links: snapshotText(stored.before_links) };
     const cur = by.get(r.note_id);
     if (!cur) {
       by.set(r.note_id, {
@@ -490,7 +613,12 @@ export function pruneChangeLog(db: Database, days: number, now = new Date()): { 
   // The feed's horizon: the highest position dropped, kept in the same step (a row's position can be above its seq's
   // neighbours': its set touched the record again later, so it is the largest of the prefix's).
   if (last) db.prepare("UPDATE change_log_state SET horizon = MAX(horizon, COALESCE((SELECT MAX(position) FROM record_changes WHERE seq <= ?), 0)) WHERE slot = 1").run(last.seq);
+  // The records whose rows go: their bases are freed below once no remaining row can name them.
+  const swept = last
+    ? (db.prepare("SELECT DISTINCT note_id FROM record_changes WHERE seq <= ? AND before_base IS NOT NULL").all(last.seq) as { note_id: string }[]).map((r) => r.note_id)
+    : [];
   const changes = last ? db.prepare("DELETE FROM record_changes WHERE seq <= ?").run(last.seq).changes : 0;
+  freeUnusedBases(db, swept);
   const sets = db.prepare("DELETE FROM write_sets WHERE at < ? AND NOT EXISTS (SELECT 1 FROM record_changes rc WHERE rc.write_set = write_sets.id)").run(cutoff).changes;
   return { changes, sets, hashes };
 }
@@ -504,9 +632,26 @@ export function forgetLoggedPast(db: Database, noteId: string): string[] {
   if (!changeLogPresent(db)) return [];
   const hashes = (db.prepare("SELECT DISTINCT before_hash FROM record_changes WHERE note_id = ? AND before_hash IS NOT NULL").all(noteId) as { before_hash: string }[]).map((r) => r.before_hash);
   // content_saved stays as it is: a later transaction of the same set must not save an in-between body in its place.
-  db.prepare("UPDATE record_changes SET before_hash = NULL, before_row = NULL, before_links = NULL WHERE note_id = ?").run(noteId);
+  db.prepare("UPDATE record_changes SET before_hash = NULL, before_row = NULL, before_base = NULL, before_links = NULL WHERE note_id = ?").run(noteId);
   db.prepare("DELETE FROM record_change_bodies WHERE note_id = ?").run(noteId);
+  // The record's whole snapshots go with the rest of its past.
+  db.prepare("DELETE FROM record_change_bases WHERE note_id = ?").run(noteId);
   return hashes;
+}
+
+/**
+ * Frees each of these records' bases that no remaining row names. A row names only a base of its own record, so a
+ * record's bases below the smallest one its remaining rows name are free (all of them, when none names one). The
+ * scan is by record (idx_record_changes_note), so the log needs no index on before_base.
+ */
+function freeUnusedBases(db: Database, noteIds: string[]): void {
+  if (!noteIds.length) return;
+  const lowest = db.prepare("SELECT MIN(before_base) AS b FROM record_changes WHERE note_id = ?");
+  const free = db.prepare("DELETE FROM record_change_bases WHERE note_id = ? AND id < ?");
+  for (const id of noteIds) {
+    const b = (lowest.get(id) as { b: number | null } | null)?.b ?? null;
+    free.run(id, b ?? Number.MAX_SAFE_INTEGER);
+  }
 }
 
 /** Normalises a `why`: trimmed, at most WHY_MAX_CHARS characters, null when empty. Throws on a non-string. */

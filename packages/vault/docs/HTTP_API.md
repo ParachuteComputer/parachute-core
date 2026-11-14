@@ -1660,6 +1660,13 @@ and `delete-record` (and their note-named aliases); a longer one is 400 `invalid
   (shared with a version holding the same text), and freed with the log. Erasing a record's history
   (`DELETE /notes/{id}/versions`, `erase_history`) and the deleted-history sweep forget the log's copies of that
   record's past too; the log keeps only that the record changed, and the tags it had.
+- **What the log keeps of fields and links is stored compressed.** A record's fields, path and stamps from before a
+  write are kept as a small delta against a whole copy of the same record's fields (Fossil delta, then deflate, as
+  version history stores bodies); a record's links are kept deflated. Reads are unchanged: undo, the write-set routes,
+  the feed and export see the same text. On a replay of a heavy writer's last 30 days (71,486 writes, fields on nearly
+  every one) the log is 54 MB instead of 109 MB. The default is the 30-day log with compression; it can't be turned off.
+  `history.change_log_days` (1 to 36,500; default 30) is the per-vault choice: a vault that writes heavily can keep a
+  shorter log (its size follows the days kept), at the cost of undo and the feed's resume reaching back less far.
 - With history off (`history.enabled: false`) the log keeps no old bodies; an import keeps none either (it records
   which records it changed). Work a request leaves running (hooks, webhook triggers, transcription) writes as its own
   set, never the request's. Not yet stamped with a key: writes by an attachment ticket's upload and by a mirror import
