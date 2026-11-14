@@ -2499,11 +2499,14 @@ export function semanticSearchNotes(
   // Pull every candidate's vector rows for the ACTIVE model, batched to
   // stay under the DO 100-bound-param cap (same chunking `fetchNotesByIdsOrdered`
   // uses). A note absent from this map has no fresh vector yet — pending.
+  // `+model` keeps SQLite on the primary key (note_id, chunk_ix): bare `model = ?` lets it pick
+  // idx_note_vectors_stale (model, content_hash), which walks EVERY vector of the model once per batch, so a
+  // question read N × N/87 rows (1.1 M at 10,000 notes on Cloud). Guarded by row-costs.test.ts (T-463).
   const vecRowsByNote = new Map<string, { chunk_ix: number; vector: Uint8Array }[]>();
   for (const idChunk of chunkForInClause(candidateIds)) {
     const placeholders = idChunk.map(() => "?").join(", ");
     const rows = db.prepare(
-      `SELECT note_id, chunk_ix, vector FROM note_vectors WHERE model = ? AND note_id IN (${placeholders})`,
+      `SELECT note_id, chunk_ix, vector FROM note_vectors WHERE +model = ? AND note_id IN (${placeholders})`,
     ).all(model, ...idChunk) as { note_id: string; chunk_ix: number; vector: Uint8Array }[];
     for (const row of rows) {
       let list = vecRowsByNote.get(row.note_id);
