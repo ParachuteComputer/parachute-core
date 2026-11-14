@@ -4,7 +4,7 @@
 // overwritten, and bad lines are left out with a reason.
 import { afterEach, beforeEach, expect, it } from "bun:test";
 import { Database } from "bun:sqlite";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { BunSqliteStore } from "./store.js";
@@ -83,18 +83,29 @@ it("importing the same export twice adds no versions", async () => {
   expect(count(dstDb)).toBe(first);
 });
 
-it("into a record that has history already: appended after its newest, never overwritten", async () => {
+it("into a record that has history already: only lines newer than its own land, after it; older ones are left out with a reason", async () => {
   const n = await dst.createNote("mine v0", { id: "01J0000000000000000000000A" });
   await dst.updateNote(n.id, { content: "mine v1" });
   const line = (ix: number, at: string, content: string) =>
     JSON.stringify({ version_ix: ix, op: "update", superseded_at: at, actor: "sam", via: "key:one", write_set: `ws_${ix}`, why: `w${ix}`, path: null, metadata: {}, content });
-  const r = importHistoryFile(dstDb, n.id, [line(0, "2026-01-01T00:00:00.000Z", "theirs 0"), line(1, "2026-01-02T00:00:00.000Z", "theirs 1")].join("\n"));
-  expect(r).toMatchObject({ added: 2, present: 0 });
+  const r = importHistoryFile(dstDb, n.id, [line(0, "2026-01-01T00:00:00.000Z", "theirs 0"), line(1, "2999-01-02T00:00:00.000Z", "theirs 1")].join("\n"));
+  expect(r).toMatchObject({ added: 1, present: 0 });
+  expect(r.skipped.map((x) => x.line)).toEqual([1]);
+  expect(r.skipped[0]!.reason).toContain("older than this record's own history");
   const rows = (await dst.listNoteVersions(n.id)).reverse();
-  expect(rows.map((v) => v.version_ix)).toEqual([0, 1, 2]);
+  expect(rows.map((v) => v.version_ix)).toEqual([0, 1]);
   expect((await dst.getNoteVersion(n.id, 0))!.content).toBe("mine v0");
-  expect((await dst.getNoteVersion(n.id, 2))!.content).toBe("theirs 1");
-  expect(rows[2]!.why).toBe("w1");
+  expect((await dst.getNoteVersion(n.id, 1))!.content).toBe("theirs 1");
+  expect(rows[1]!.why).toBe("w1");
+});
+
+it("versions that look alike (same time, op and body; a fields-only change by different keys) all land, and a re-import adds none", () => {
+  const id = "01J0000000000000000000000C";
+  const lines = Array.from({ length: 6 }, (_, i) =>
+    JSON.stringify({ version_ix: i, op: "update", superseded_at: "2026-01-01T00:00:00.000Z", actor: `k${i % 3}`, via: `key:k${i % 3}`, metadata: { n: i }, content: "same body" }),
+  ).join("\n");
+  expect(importHistoryFile(dstDb, id, lines)).toMatchObject({ added: 6, present: 0 });
+  expect(importHistoryFile(dstDb, id, lines)).toMatchObject({ added: 0, present: 6 });
 });
 
 it("bad lines are left out with a reason; the good ones land", () => {
@@ -123,4 +134,29 @@ it("off by default, and a later export clears history an earlier one left in the
   writeFileSync(join(dir, "x", "n.md"), "---\nid: 01J0000000000000000000000C\npath: x/n\n---\nbody\n");
   const r = await importVault(dst, new FsImportSource({ inDir: dir }));
   expect(r).toMatchObject({ history_versions_added: 0, skipped_history: [] });
+});
+
+it("a folder export never deletes history through a .parachute that links outside the folder", async () => {
+  const outside = join(dir, "elsewhere");
+  mkdirSync(join(outside, "history"), { recursive: true });
+  writeFileSync(join(outside, "history", "precious.txt"), "keep me");
+  const out = join(dir, "out-link");
+  mkdirSync(out);
+  symlinkSync(outside, join(out, ".parachute"));
+  await src.createNote("a", { path: "a" });
+  await exportVaultToDir(src, { outDir: out });
+  expect(readFileSync(join(outside, "history", "precious.txt"), "utf8")).toBe("keep me");
+});
+
+it("a history file for a record the vault doesn't hold is left out, unless it ends in a delete", async () => {
+  const out = join(dir, "orphans");
+  await src.createNote("a", { path: "a" });
+  await exportVaultToDir(src, { outDir: out });
+  mkdirSync(join(out, ".parachute", "history"), { recursive: true });
+  const line = (op: string) => JSON.stringify({ version_ix: 0, op, superseded_at: "2026-01-01T00:00:00.000Z", content: "x" });
+  writeFileSync(join(out, ".parachute", "history", "01J0000000000000000000NOPE.jsonl"), line("update"));
+  writeFileSync(join(out, ".parachute", "history", "01J0000000000000000000GONE.jsonl"), line("delete"));
+  const stats = await importVault(dst, new FsImportSource({ inDir: out }), {});
+  expect(stats.skipped_history.map((s) => s.file)).toEqual(["01J0000000000000000000NOPE.jsonl"]);
+  expect((dstDb.prepare("SELECT note_id FROM note_versions").all() as { note_id: string }[]).map((r) => r.note_id)).toEqual(["01J0000000000000000000GONE"]);
 });

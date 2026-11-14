@@ -167,10 +167,16 @@ export function importHistoryFile(db: Database, noteId: string, text: string): H
   parsed.sort((a, b) => (a.v.version_ix as number) - (b.v.version_ix as number));
 
   const existing = db
-    .prepare("SELECT version_ix, superseded_at, op, content_hash FROM note_versions WHERE note_id = ?")
-    .all(noteId) as { version_ix: number; superseded_at: string; op: string; content_hash: string | null }[];
-  const keyOf = (at: string, op: string, hash: string | null) => `${at}\u0000${op}\u0000${hash ?? ""}`;
-  const held = new Set(existing.map((r) => keyOf(r.superseded_at, r.op, r.content_hash)));
+    .prepare("SELECT version_ix, superseded_at, op, content_hash, actor, via, write_set, metadata FROM note_versions WHERE note_id = ?")
+    .all(noteId) as { version_ix: number; superseded_at: string; op: string; content_hash: string | null; actor: string | null; via: string | null; write_set: string | null; metadata: string | null }[];
+  // A version is the same as one the record already holds when all of these agree. Only rows held before this import
+  // count: two lines of one file are two versions, even when they look alike (same time, a fields-only change).
+  const keyOf = (at: string, op: string, hash: string | null, actor: unknown, via: unknown, set: unknown, metadata: string | null) =>
+    [at, op, hash ?? "", actor ?? "", via ?? "", set ?? "", metadata ?? ""].join("\u0000");
+  const held = new Set(existing.map((r) => keyOf(r.superseded_at, r.op, r.content_hash, r.actor, r.via, r.write_set, r.metadata)));
+  // History lands behind the record's own: a line older than its newest version is not slipped under it (version
+  // numbers are the order, and retention keeps the highest).
+  const newest = existing.filter((r) => r.version_ix >= 0).reduce<string | null>((m, r) => (m === null || r.superseded_at > m ? r.superseded_at : m), null);
   const usedIx = new Set(existing.map((r) => r.version_ix));
   const keepNumbers = !existing.some((r) => r.version_ix >= 0);
   let next = Math.max(-1, ...existing.map((r) => r.version_ix)) + 1;
@@ -208,16 +214,20 @@ export function importHistoryFile(db: Database, noteId: string, text: string): H
       continue;
     }
     const at = v.superseded_at as string;
-    const key = keyOf(at, v.op as string, hash);
+    const metadataText = v.metadata && typeof v.metadata === "object" && !Array.isArray(v.metadata) ? JSON.stringify(v.metadata) : null;
+    const key = keyOf(at, v.op as string, hash, str(v.actor), str(v.via), str(v.write_set), metadataText);
     if (held.has(key)) {
       out.present++;
+      continue;
+    }
+    if (newest !== null && at <= newest) {
+      out.skipped.push({ line: n, reason: "older than this record's own history (it would land under newer versions)" });
       continue;
     }
     let ix = v.version_ix as number;
     if (!keepNumbers || usedIx.has(ix)) ix = next;
     next = Math.max(next, ix + 1);
     usedIx.add(ix);
-    held.add(key);
     if (hash !== null) insertBlob.run(hash, content as string, len);
     const writeSet = str(v.write_set);
     insertVersion.run(
@@ -225,7 +235,7 @@ export function importHistoryFile(db: Database, noteId: string, text: string): H
       ix,
       hash,
       str(v.path),
-      v.metadata && typeof v.metadata === "object" && !Array.isArray(v.metadata) ? JSON.stringify(v.metadata) : null,
+      metadataText,
       str(v.extension),
       at,
       str(v.actor),

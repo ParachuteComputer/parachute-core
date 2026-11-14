@@ -1727,6 +1727,11 @@ export async function exportVault(
     const writeHistory = async (id: string): Promise<void> => {
       const file = await recordHistoryFile(store, id);
       if (!file) return;
+      // An id the importer can't read back from a file name (a slash, a leading dot) is reported, never written.
+      if (recordIdOfHistoryFile(`${id}.jsonl`) !== id) {
+        history!.skipped.push({ id, version_ix: null, reason: "the record's id can't be a history file name (a slash or a leading dot)" });
+        return;
+      }
       for (const s of file.skipped) history!.skipped.push({ id, version_ix: s.version_ix, reason: s.reason });
       const written = sink.writeText(join(SIDECAR_DIR, HISTORY_DIR, `${id}.jsonl`), file.text);
       if (!written.ok) {
@@ -1811,8 +1816,17 @@ export async function exportVaultToDir(
   }
   // History an earlier export left in this folder goes first: a record's history erased since then, or an export
   // without history now, must not leave the old file to be read back on import.
+  // Only inside the export root: a `.parachute` that is a link elsewhere is left alone, with a warning.
   const historyDir = join(opts.outDir, SIDECAR_DIR, HISTORY_DIR);
-  if (existsSync(historyDir)) rmSync(historyDir, { recursive: true, force: true });
+  if (existsSync(historyDir)) {
+    const real = realpathSync(historyDir);
+    if (isWithinDir(real, realpathSync(opts.outDir)) && !lstatSync(join(opts.outDir, SIDECAR_DIR)).isSymbolicLink()) {
+      rmSync(historyDir, { recursive: true, force: true });
+    } else {
+      // eslint-disable-next-line no-console
+      console.warn(`[export] "${real}" is outside the export root (symlink?); an earlier export's history there was not removed`);
+    }
+  }
   const sink = new FsExportSink({
     outDir: opts.outDir,
     assetsDir: opts.assetsDir,
@@ -3247,6 +3261,17 @@ async function importVaultReplay(
       if (opts.dryRun) {
         stats.history_versions_added += text.split("\n").filter((l) => l.trim() !== "").length;
         continue;
+      }
+      // A file for a record the vault doesn't hold is history of nothing, unless it ends in a delete (a real
+      // tombstone: the record was deleted with its history kept).
+      if (!store.db.prepare("SELECT 1 FROM notes WHERE id = ?").get(id)) {
+        const lines = text.split("\n").filter((l) => l.trim() !== "");
+        let lastOp: unknown = null;
+        try { lastOp = JSON.parse(lines[lines.length - 1] ?? "null")?.op; } catch {}
+        if (lastOp !== "delete") {
+          stats.skipped_history.push({ file: name, line: 0, reason: "no such record in this vault, and its history doesn't end in a delete" });
+          continue;
+        }
       }
       // One transaction per record: its versions land together, and a big history isn't one commit per line.
       const result = transaction(store.db, () => importHistoryFile(store.db, id, text));
