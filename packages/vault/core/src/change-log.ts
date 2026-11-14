@@ -32,7 +32,7 @@
  * (forgetLoggedPast).
  */
 import type { Database } from "bun:sqlite";
-import { deflateBytes, inflateBytes, BlobDecodeError, type StoredContent } from "./blob-codec.js";
+import { deflateBytes, inflateBytes, wholeText, BlobDecodeError, type StoredContent } from "./blob-codec.js";
 import { applyDeltaBytes, createDeltaBytes } from "./delta.js";
 import { kindOfVia } from "./write-stamp.js";
 
@@ -340,7 +340,6 @@ const DELTA_MAX_SHARE = 0.25;
 /** A guard against a corrupt stream, far above any real snapshot (a record's fields, path and stamps; its links). */
 const SNAPSHOT_MAX_BYTES = 64 * 1024 * 1024;
 const utf8 = new TextEncoder();
-const strictUtf8 = new TextDecoder("utf-8", { fatal: true });
 
 /** A snapshot as stored whole: its deflate as bytes when that is shorter, else the text itself. */
 export function encodeSnapshot(text: string): string | Uint8Array {
@@ -350,19 +349,10 @@ export function encodeSnapshot(text: string): string | Uint8Array {
   return z.length < bytes.length ? z : text;
 }
 
-function inflateText(stored: StoredContent): string {
-  try {
-    return strictUtf8.decode(inflateBytes(stored, SNAPSHOT_MAX_BYTES));
-  } catch (err) {
-    if (err instanceof BlobDecodeError) throw err;
-    throw new BlobDecodeError("a compressed change-log snapshot is not UTF-8");
-  }
-}
-
 /** A whole stored snapshot's JSON text: TEXT as it is, a BLOB inflated. Throws BlobDecodeError on a bad stream. */
 export function snapshotText(stored: StoredContent | null): string | null {
   if (stored === null || typeof stored === "string") return stored;
-  return inflateText(stored);
+  return wholeText(stored, "deflate", SNAPSHOT_MAX_BYTES);
 }
 
 /**
@@ -370,13 +360,19 @@ export function snapshotText(stored: StoredContent | null): string | null {
  * BlobDecodeError when the base is gone or the delta doesn't apply (never a wrong snapshot: Fossil deltas carry a
  * checksum).
  */
-export function rowSnapshotText(db: Database, stored: StoredContent | null, base: number | null): string | null {
+export function rowSnapshotText(db: Database, stored: StoredContent | null, base: number | null, bases?: Map<number, string>): string | null {
   // TEXT is always the snapshot itself (the trigger's own, or an earlier build's row).
   if (base === null || stored === null || typeof stored === "string") return snapshotText(stored);
-  const row = cached(db, "SELECT content FROM record_change_bases WHERE id = ?").get(base) as { content: StoredContent } | null;
-  if (!row) throw new BlobDecodeError(`a change-log snapshot's base ${base} is gone`);
+  // `bases` keeps each base's text for the length of one call that reads many rows (a set, a sweep).
+  let baseText = bases?.get(base);
+  if (baseText === undefined) {
+    const row = cached(db, "SELECT content FROM record_change_bases WHERE id = ?").get(base) as { content: StoredContent } | null;
+    if (!row) throw new BlobDecodeError(`a change-log snapshot's base ${base} is gone`);
+    baseText = snapshotText(row.content)!;
+    bases?.set(base, baseText);
+  }
   try {
-    return applyDeltaBytes(snapshotText(row.content)!, inflateBytes(stored, SNAPSHOT_MAX_BYTES), SNAPSHOT_MAX_BYTES);
+    return applyDeltaBytes(baseText, inflateBytes(stored, SNAPSHOT_MAX_BYTES), SNAPSHOT_MAX_BYTES);
   } catch (err) {
     if (err instanceof BlobDecodeError) throw err;
     throw new BlobDecodeError(`a change-log snapshot's delta doesn't apply: ${(err as Error).message}`);
@@ -578,9 +574,29 @@ export function setRecordStates(db: Database, setId: string): SetRecordState[] {
     .prepare("SELECT seq, position, note_id, op, existed, content_saved, before_hash, before_row, before_base, before_tags, before_links FROM record_changes WHERE write_set = ? ORDER BY seq")
     .all(setId) as { seq: number; position: number | null; note_id: string; op: SetRecordState["op"]; existed: number; content_saved: number; before_hash: string | null; before_row: StoredContent | null; before_base: number | null; before_tags: string | null; before_links: StoredContent | null }[];
   const by = new Map<string, SetRecordState>();
+  const bases = new Map<number, string>();
+  // A record whose snapshot can't be read (a damaged row): no later row's snapshot may stand in for it, since that is
+  // the record part-way through the set. Its fields (or links) read as not kept: undo leaves them as they are.
+  const lostRow = new Set<string>();
+  const lostLinks = new Set<string>();
+  const decode = (lost: Set<string>, noteId: string, read: () => string | null): string | null => {
+    if (lost.has(noteId)) return null;
+    try {
+      return read();
+    } catch (err) {
+      if (!(err instanceof BlobDecodeError)) throw err;
+      console.warn(`[vault] change log: a snapshot of ${noteId} in write set ${setId} can't be read (${err.message}); read as not kept`);
+      lost.add(noteId);
+      return null;
+    }
+  };
   for (const stored of rows) {
     // Snapshots may be stored compressed: read back as the JSON text the triggers wrote.
-    const r = { ...stored, before_row: rowSnapshotText(db, stored.before_row, stored.before_base), before_links: snapshotText(stored.before_links) };
+    const r = {
+      ...stored,
+      before_row: decode(lostRow, stored.note_id, () => rowSnapshotText(db, stored.before_row, stored.before_base, bases)),
+      before_links: decode(lostLinks, stored.note_id, () => snapshotText(stored.before_links)),
+    };
     const cur = by.get(r.note_id);
     if (!cur) {
       by.set(r.note_id, {
@@ -675,7 +691,16 @@ function sweepBases(db: Database, swept: { note_id: string; before_base: number 
     const rows = (naming.all(noteId) as { seq: number; before_row: StoredContent; before_base: number; before_links: StoredContent | null }[])
       .filter((r) => stale.has(r.before_base));
     // Read every text first (their bases are still there), then let go of the stale bases, then store them again.
-    const texts = rows.map((r) => ({ seq: r.seq, text: rowSnapshotText(db, r.before_row, r.before_base)!, links: asBytes(r.before_links) }));
+    let texts: { seq: number; text: string; links: string | Uint8Array | null }[];
+    try {
+      const bases = new Map<number, string>();
+      texts = rows.map((r) => ({ seq: r.seq, text: rowSnapshotText(db, r.before_row, r.before_base, bases)!, links: asBytes(r.before_links) }));
+    } catch (err) {
+      if (!(err instanceof BlobDecodeError)) throw err;
+      // A damaged row: this record is left as it is (its stale base stays), so the rest of the sweep still runs.
+      console.warn(`[vault] change log: the sweep can't re-encode ${noteId}'s snapshots (${err.message}); left as they are`);
+      continue;
+    }
     for (const r of texts) clear.run(r.seq);
     for (const r of texts) storeRowSnapshot(db, r.seq, noteId, r.text, r.links);
     free.run(noteId, noteId);

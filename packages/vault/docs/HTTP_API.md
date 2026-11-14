@@ -1667,6 +1667,8 @@ and `delete-record` (and their note-named aliases); a longer one is 400 `invalid
   every one) the log is 54 MB instead of 109 MB. The default is the 30-day log with compression; it can't be turned off.
   `history.change_log_days` (1 to 36,500; default 30) is the per-vault choice: a vault that writes heavily can keep a
   shorter log (its size follows the days kept), at the cost of undo and the feed's resume reaching back less far.
+  The sweep re-encodes what it must so no copy of a record's fields outlives `change_log_days`. A snapshot that
+  can't be read (a damaged row) reads as not kept: undo leaves those fields as they are.
 - With history off (`history.enabled: false`) the log keeps no old bodies; an import keeps none either (it records
   which records it changed). Work a request leaves running (hooks, webhook triggers, transcription) writes as its own
   set, never the request's. Not yet stamped with a key: writes by an attachment ticket's upload and by a mirror import

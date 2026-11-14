@@ -312,6 +312,42 @@ describe("change log: positions and what history keeps", () => {
     expect(setRecordStates(db, "ws_again0002")[0]!.before_row).toBe(want);
   });
 
+  test("a damaged snapshot reads as not kept, never as a later row's; the sweep still runs past it", async () => {
+    const { db, store, as } = fresh();
+    as({ id: "ws_dmgseed01" });
+    const n = await store.createNote("b", { path: "dmg", metadata: { a: "p".repeat(300) } });
+    const other = await store.createNote("o", { path: "dmg-other", metadata: { a: "o".repeat(300) } });
+    // A set whose rows make both records' bases, which the damaged set's rows then name.
+    as({ id: "ws_dmgpre001" });
+    await store.updateNote(n.id, { metadata: { a: "p".repeat(299) } });
+    await store.updateNote(other.id, { metadata: { a: "o".repeat(299) } });
+    // One set over two requests: the first row holds the set's before, the second the record part-way through.
+    as({ id: "ws_damaged01" });
+    await store.updateNote(n.id, { metadata: { a: "q".repeat(300) } });
+    await store.updateNote(n.id, { metadata: { a: "r".repeat(300) } });
+    await store.updateNote(other.id, { metadata: { a: "s" } });
+    const [first] = db.prepare("SELECT seq FROM record_changes WHERE write_set = 'ws_damaged01' AND note_id = ? ORDER BY seq").all(n.id) as { seq: number }[];
+    db.prepare("UPDATE record_changes SET before_row = X'00ff00ff' WHERE seq = ?").run(first!.seq);
+    const warn = console.warn;
+    console.warn = () => {};
+    try {
+      const states = new Map(setRecordStates(db, "ws_damaged01").map((r) => [r.note_id, r]));
+      expect(states.get(n.id)!.before_row).toBeNull();
+      expect(JSON.parse(JSON.parse(states.get(other.id)!.before_row!).metadata).a).toBe("o".repeat(299));
+      // The sets that made the bases age past the horizon: the sweep re-bases the other record, leaves the damaged one
+      // as it is, and finishes.
+      const named = (id: string) => (db.prepare("SELECT before_base AS b FROM record_changes WHERE write_set = 'ws_damaged01' AND note_id = ? ORDER BY seq DESC").get(id) as { b: number }).b;
+      const otherBase = named(other.id);
+      db.prepare("UPDATE record_changes SET at = '2000-01-01T00:00:00.000Z' WHERE write_set IN ('ws_dmgseed01', 'ws_dmgpre001')").run();
+      db.prepare("UPDATE write_sets SET at = '2000-01-01T00:00:00.000Z' WHERE id IN ('ws_dmgseed01', 'ws_dmgpre001')").run();
+      expect(pruneChangeLog(db, 30).changes).toBe(4);
+      expect(named(other.id)).not.toBe(otherBase);
+      expect(JSON.parse(JSON.parse(setRecordStates(db, "ws_damaged01").find((r) => r.note_id === other.id)!.before_row!).metadata).a).toBe("o".repeat(299));
+    } finally {
+      console.warn = warn;
+    }
+  });
+
   test("a snapshot written as text (an older engine's row) still reads", async () => {
     const { db, store, as } = fresh();
     as({ id: "ws_oldtext01" });
