@@ -59,6 +59,18 @@ function childTouch(noteId: string, tagsBefore: string, linksBefore: string | nu
       before_tags = COALESCE(before_tags, excluded.before_tags)${linksBefore ? ",\n      before_links = COALESCE(before_links, excluded.before_links)" : ""};`;
 }
 
+/**
+ * Stages a record's body for undo the first time a set changes it (or deletes the record): only in a set, only when
+ * bodies are kept, never for a record the set created, never twice (a body saved earlier in the set, in this
+ * transaction or a settled one, stands). Runs before the log row's own statement, which then marks it saved.
+ */
+function stageBody(when: string): string {
+  return `INSERT OR IGNORE INTO record_change_bodies (write_set, note_id, content)
+    SELECT c.write_set, OLD.id, OLD.content FROM write_context c
+    WHERE c.slot = 1 AND ${KEEP} AND ${when}
+      AND NOT EXISTS (SELECT 1 FROM record_changes r WHERE r.write_set = c.write_set AND r.note_id = OLD.id AND (r.content_saved = 1 OR r.existed = 0));`;
+}
+
 /** The tables, indexes and triggers. Idempotent. */
 export const CHANGE_LOG_SQL = `
 CREATE TABLE IF NOT EXISTS write_context (
@@ -90,7 +102,6 @@ CREATE TABLE IF NOT EXISTS record_changes (
   op TEXT NOT NULL,
   existed INTEGER NOT NULL,
   at TEXT NOT NULL,
-  before_content TEXT,
   before_hash TEXT,
   content_saved INTEGER NOT NULL DEFAULT 0,
   before_row TEXT,
@@ -106,6 +117,15 @@ CREATE TABLE IF NOT EXISTS record_changes (
   UNIQUE (write_set, note_id)
 );
 CREATE INDEX IF NOT EXISTS idx_record_changes_position ON record_changes(position);
+-- A body undo needs, staged here by the triggers for the length of the writing transaction; its end moves it into
+-- note_blobs (history.ts settleLogBodies) and empties this table. Kept apart from record_changes so a log row is
+-- written once at its final size: a row that shrank after its body moved out left most of its page empty.
+CREATE TABLE IF NOT EXISTS record_change_bodies (
+  write_set TEXT NOT NULL,
+  note_id TEXT NOT NULL,
+  content TEXT,
+  PRIMARY KEY (write_set, note_id)
+) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS idx_record_changes_touched ON record_changes(seq) WHERE touched = 1;
 CREATE TABLE IF NOT EXISTS change_log_state (
   slot INTEGER PRIMARY KEY CHECK (slot = 1),
@@ -127,30 +147,29 @@ CREATE TRIGGER IF NOT EXISTS rc_notes_update BEFORE UPDATE ON notes
 WHEN OLD.content IS NOT NEW.content OR OLD.metadata IS NOT NEW.metadata OR OLD.path IS NOT NEW.path
   OR OLD.extension IS NOT NEW.extension OR OLD.updated_at IS NOT NEW.updated_at OR OLD.created_at IS NOT NEW.created_at
 BEGIN
-  INSERT INTO record_changes (write_set, note_id, op, existed, at, before_content, content_saved, before_row, before_tags)
+  ${stageBody("OLD.content IS NOT NEW.content")}
+  INSERT INTO record_changes (write_set, note_id, op, existed, at, content_saved, before_row, before_tags)
   SELECT c.write_set, OLD.id, 'update', 1, ${NOW},
-    CASE WHEN OLD.content IS NOT NEW.content AND ${KEEP} THEN OLD.content END,
     OLD.content IS NOT NEW.content AND ${KEEP},
     ${rowJson("OLD")}, ${TAGS_OF("OLD.id")}
   FROM ${CTX} WHERE true
   ON CONFLICT (write_set, note_id) DO UPDATE SET touched = 1,
     before_row = COALESCE(before_row, excluded.before_row),
     before_tags = COALESCE(before_tags, excluded.before_tags),
-    before_content = CASE WHEN existed = 1 AND content_saved = 0 THEN excluded.before_content ELSE before_content END,
     content_saved = CASE WHEN existed = 1 AND content_saved = 0 THEN excluded.content_saved ELSE content_saved END;
 END;
 
 CREATE TRIGGER IF NOT EXISTS rc_notes_delete BEFORE DELETE ON notes BEGIN
-  INSERT INTO record_changes (write_set, note_id, op, existed, at, before_content, content_saved, before_row, before_tags, before_links)
+  ${stageBody("1")}
+  INSERT INTO record_changes (write_set, note_id, op, existed, at, content_saved, before_row, before_tags, before_links)
   SELECT c.write_set, OLD.id, 'delete', 1, ${NOW},
-    CASE WHEN ${KEEP} THEN OLD.content END, ${KEEP},
+    ${KEEP},
     ${rowJson("OLD")}, ${TAGS_OF("OLD.id")}, ${LINKS_OF("OLD.id")}
   FROM ${CTX} WHERE true
   ON CONFLICT (write_set, note_id) DO UPDATE SET op = 'delete', touched = 1,
     before_row = COALESCE(before_row, excluded.before_row),
     before_tags = COALESCE(before_tags, excluded.before_tags),
     before_links = COALESCE(before_links, excluded.before_links),
-    before_content = CASE WHEN existed = 1 AND content_saved = 0 THEN excluded.before_content ELSE before_content END,
     content_saved = CASE WHEN existed = 1 AND content_saved = 0 THEN excluded.content_saved ELSE content_saved END;
 END;
 
@@ -199,9 +218,9 @@ export const CHANGE_LOG_TRIGGERS = [
 /** Whether the change log's tables and triggers are all present. */
 export function changeLogPresent(db: Database): boolean {
   const names = new Set(
-    (db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table', 'trigger') AND (name IN ('write_context', 'write_sets', 'record_changes', 'change_log_state') OR name LIKE 'rc\\_%' ESCAPE '\\')").all() as { name: string }[]).map((r) => r.name),
+    (db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table', 'trigger') AND (name IN ('write_context', 'write_sets', 'record_changes', 'record_change_bodies', 'change_log_state') OR name LIKE 'rc\\_%' ESCAPE '\\')").all() as { name: string }[]).map((r) => r.name),
   );
-  return ["write_context", "write_sets", "record_changes", "change_log_state", ...CHANGE_LOG_TRIGGERS].every((n) => names.has(n));
+  return ["write_context", "write_sets", "record_changes", "record_change_bodies", "change_log_state", ...CHANGE_LOG_TRIGGERS].every((n) => names.has(n));
 }
 
 /** The un-numbered step: creates the change log on a vault that lacks it (no-op otherwise). */
@@ -414,7 +433,8 @@ export function forgetLoggedPast(db: Database, noteId: string): string[] {
   if (!changeLogPresent(db)) return [];
   const hashes = (db.prepare("SELECT DISTINCT before_hash FROM record_changes WHERE note_id = ? AND before_hash IS NOT NULL").all(noteId) as { before_hash: string }[]).map((r) => r.before_hash);
   // content_saved stays as it is: a later transaction of the same set must not save an in-between body in its place.
-  db.prepare("UPDATE record_changes SET before_content = NULL, before_hash = NULL, before_row = NULL, before_links = NULL WHERE note_id = ?").run(noteId);
+  db.prepare("UPDATE record_changes SET before_hash = NULL, before_row = NULL, before_links = NULL WHERE note_id = ?").run(noteId);
+  db.prepare("DELETE FROM record_change_bodies WHERE note_id = ?").run(noteId);
   return hashes;
 }
 

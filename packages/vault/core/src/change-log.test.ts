@@ -18,8 +18,8 @@ function fresh() {
 }
 /** A set's log rows, the saved body read back from its blob (bodies move to note_blobs at the end of the transaction). */
 const rows = (db: Database, set: string | null) =>
-  (db.prepare(`SELECT note_id, op, existed, content_saved, before_content, before_hash, before_tags FROM record_changes WHERE write_set ${set === null ? "IS NULL" : "= ?"} ORDER BY seq`).all(...(set === null ? [] : [set])) as any[]).map(
-    ({ before_hash, before_content, ...r }) => ({ ...r, before_content: before_hash ? readBlobText(db, before_hash) : before_content }),
+  (db.prepare(`SELECT note_id, op, existed, content_saved, before_hash, before_tags FROM record_changes WHERE write_set ${set === null ? "IS NULL" : "= ?"} ORDER BY seq`).all(...(set === null ? [] : [set])) as any[]).map(
+    ({ before_hash, ...r }) => ({ ...r, before_content: before_hash ? readBlobText(db, before_hash) : null }),
   );
 
 describe("change log: what one write set records", () => {
@@ -87,8 +87,8 @@ describe("change log: bodies are blobs", () => {
     const n = await store.createNote("first body", { path: "b" });
     as({ id: "ws_ed0000001" });
     await store.updateNote(n.id, { content: "second body", actor: "u", via: "api" });
-    const [row] = db.prepare("SELECT before_content, before_hash FROM record_changes WHERE write_set = 'ws_ed0000001'").all() as any[];
-    expect(row.before_content).toBeNull();
+    const [row] = db.prepare("SELECT before_hash FROM record_changes WHERE write_set = 'ws_ed0000001'").all() as any[];
+    expect((db.prepare("SELECT COUNT(*) AS n FROM record_change_bodies").get() as any).n).toBe(0); // staged only within the transaction
     const version = (db.prepare("SELECT content_hash FROM note_versions").get() as any).content_hash;
     expect(row.before_hash).toBe(version); // one blob, held twice
     expect((db.prepare("SELECT COUNT(*) AS n FROM note_blobs").get() as any).n).toBe(1);
@@ -108,9 +108,9 @@ describe("change log: bodies are blobs", () => {
     as({ id: "ws_ed0000002" });
     await store.updateNote(n.id, { content: "public", metadata: {} });
     await store.eraseNoteHistory(n.id);
-    const [row] = db.prepare("SELECT before_content, before_hash, before_row, content_saved FROM record_changes WHERE write_set = 'ws_ed0000002'").all() as any[];
+    const [row] = db.prepare("SELECT before_hash, before_row, content_saved FROM record_changes WHERE write_set = 'ws_ed0000002'").all() as any[];
     // Still marked saved, so a later transaction of the same set can't save an in-between body in its place.
-    expect(row).toEqual({ before_content: null, before_hash: null, before_row: null, content_saved: 1 });
+    expect(row).toEqual({ before_hash: null, before_row: null, content_saved: 1 });
     expect((db.prepare("SELECT COUNT(*) AS n FROM note_blobs").get() as any).n).toBe(0);
   });
 });
@@ -190,7 +190,7 @@ describe("change log: an older engine's vault", () => {
     let db = new Database(file);
     new SqliteStore(db);
     for (const t of ["rc_notes_insert", "rc_notes_update", "rc_notes_delete", "rc_note_tags_insert", "rc_note_tags_delete", "rc_note_tags_update", "rc_links_insert", "rc_links_delete", "rc_links_update"]) db.exec(`DROP TRIGGER ${t}`);
-    for (const t of ["record_changes", "write_sets", "write_context", "change_log_state"]) db.exec(`DROP TABLE ${t}`);
+    for (const t of ["record_changes", "record_change_bodies", "write_sets", "write_context", "change_log_state"]) db.exec(`DROP TABLE ${t}`);
     for (const c of ["write_set", "types", "tags", "links"]) db.exec(`ALTER TABLE note_versions DROP COLUMN ${c}`);
     db.query("INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)").run(SCHEMA_VERSION, "2999-01-01T00:00:00.000Z");
     db.close();

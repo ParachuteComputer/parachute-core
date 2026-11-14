@@ -197,33 +197,32 @@ export function logHolds(db: Database): string {
 export function settleLogBodies(db: Database, writeSet: string | null): void {
   if (writeSet === null) return;
   const st = settleStatements(db);
-  const rows = st.rows.all(writeSet) as { seq: number; before_content: string }[];
+  const rows = st.rows.all(writeSet) as { note_id: string; content: string | null }[];
   if (!rows.length) return;
   for (const r of rows) {
     // Nowhere to keep it (a vault without the history tables), or past the version size limit (a version keeps
-    // nothing of an oversized body either): the body is dropped, still marked saved, so a later transaction of the
-    // same set can't put an in-between body in its place. Undo then leaves that body as it is.
-    if (!historyTablesPresent(db) || byteLength(r.before_content) > VERSION_MAX_BYTES) {
-      st.drop.run(r.seq);
-      continue;
+    // nothing of an oversized body either): the body is dropped. The row stays marked saved, so a later transaction
+    // of the same set can't put an in-between body in its place; undo then leaves that body as it is.
+    if (r.content !== null && historyTablesPresent(db) && byteLength(r.content) <= VERSION_MAX_BYTES) {
+      const hash = hashContent(r.content);
+      // As a captured version stores its body.
+      st.insert ??= db.prepare("INSERT OR IGNORE INTO note_blobs (hash, content, byte_size) VALUES (?, ?, ?)");
+      st.insert.run(hash, r.content, byteLength(r.content));
+      st.move.run(hash, writeSet, r.note_id);
     }
-    const hash = hashContent(r.before_content);
-    // As a captured version stores its body.
-    st.insert ??= db.prepare("INSERT OR IGNORE INTO note_blobs (hash, content, byte_size) VALUES (?, ?, ?)");
-    st.insert.run(hash, r.before_content, byteLength(r.before_content));
-    st.move.run(hash, r.seq);
   }
+  st.clear.run(writeSet);
 }
 // Prepared once per connection (they run in every Store transaction). The blob insert is prepared only once a body
 // needs it and the history tables are there: probing them earlier would memoise their presence (historyTablesPresent).
-const settleCache = new WeakMap<Database, { rows: ReturnType<Database["prepare"]>; move: ReturnType<Database["prepare"]>; drop: ReturnType<Database["prepare"]>; insert: ReturnType<Database["prepare"]> | null }>();
+const settleCache = new WeakMap<Database, { rows: ReturnType<Database["prepare"]>; move: ReturnType<Database["prepare"]>; clear: ReturnType<Database["prepare"]>; insert: ReturnType<Database["prepare"]> | null }>();
 function settleStatements(db: Database) {
   let st = settleCache.get(db);
   if (!st) {
     st = {
-      rows: db.prepare("SELECT seq, before_content FROM record_changes WHERE write_set = ? AND before_content IS NOT NULL"),
-      move: db.prepare("UPDATE record_changes SET before_hash = ?, before_content = NULL WHERE seq = ?"),
-      drop: db.prepare("UPDATE record_changes SET before_content = NULL WHERE seq = ?"),
+      rows: db.prepare("SELECT note_id, content FROM record_change_bodies WHERE write_set = ?"),
+      move: db.prepare("UPDATE record_changes SET before_hash = ? WHERE write_set = ? AND note_id = ?"),
+      clear: db.prepare("DELETE FROM record_change_bodies WHERE write_set = ?"),
       insert: null,
     };
     settleCache.set(db, st);
