@@ -1128,7 +1128,8 @@
    "reason": "admin belongs in the one admin API",
    "since": "0.9",
    "removed_in": "1.0",
-   "state": "planned"
+   "state": "live",
+   "release": "0.9.3"
   },
   {
    "kind": "endpoint",
@@ -1138,7 +1139,8 @@
    "reason": "admin only today",
    "since": "0.9",
    "removed_in": "1.0",
-   "state": "planned"
+   "state": "live",
+   "release": "0.9.3"
   },
   {
    "kind": "endpoint",

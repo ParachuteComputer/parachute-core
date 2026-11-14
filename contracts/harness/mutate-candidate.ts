@@ -85,7 +85,7 @@ for (const m of all.filter((m) => only.length === 0 || only.includes(m.name))) {
     // focus: only the named contracts (a regex of their names, escaped), so a long suite file runs only what counts.
     const focusArgs = m.kind === "mutant" && m.focus ? ["-t", m.catches.map((c) => c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")] : [];
     // A door contract (suites/door/) runs through the door harness, on this candidate as a box (it needs a door file).
-    const doorSuite = m.suite.split(" ").every((f) => f.startsWith("suites/door/"));
+    const doorSuite = m.suite.split(" ").every((f) => /^suites\/(door|v093)\//.test(f));
     const cmd = doorSuite
       ? ["bun", "run", "harness/doors/run.ts", "--doors", "box", ...m.suite.split(" ")]
       : ["bun", "run", "harness/run-candidate.ts", ...m.suite.split(" "), ...focusArgs];
