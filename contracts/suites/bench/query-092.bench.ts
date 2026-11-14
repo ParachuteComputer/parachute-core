@@ -246,6 +246,33 @@ test(`query bench at ${N} records`, async () => {
   rows.push({ group: "write", name: "POST one record (with a reference)", p50: pct(post, 0.5), p95: pct(post, 0.95), status: postStatus });
   print(rows.at(-1)!);
 
+  // Version history (T-460): every body edit captures the prior body as a version, so these time the capture path
+  // on bodies of the sizes notes have, then the compaction pass and a read of the oldest version after it.
+  for (const kb of [4, 40]) {
+    const body = (k: number) => `# Bench body ${kb} kB\n\n` + Array.from({ length: kb * 16 }, (_, i) => `line ${i} of a made-up note, edit ${i % 50 === 0 ? k : 0}`).join("\n").slice(0, kb * 1024);
+    const created = await call("POST", "/notes", { content: body(0), path: `bench/history-${kb}k` });
+    const id = created.body?.id as string;
+    const edits: number[] = [];
+    let editStatus = 200;
+    for (let k = 1; k <= 30; k++) {
+      const p = await call("PATCH", `/notes/${id}`, { content: body(k), force: true });
+      edits.push(p.ms);
+      if (p.status !== 200) editStatus = p.status;
+    }
+    rows.push({ group: "history", name: `PATCH a ${kb} kB body (captures a version)`, p50: pct(edits, 0.5), p95: pct(edits, 0.95), status: editStatus });
+    print(rows.at(-1)!);
+    await once("history", `compact one ${kb} kB note's 30 versions`, "POST", "/history/compact", { note_id: id });
+    const reads: number[] = [];
+    let readStatus = 200;
+    for (let k = 0; k < 10; k++) {
+      const r = await call("GET", `/notes/${id}/versions/0`);
+      reads.push(r.ms);
+      if (r.status !== 200) readStatus = r.status;
+    }
+    rows.push({ group: "history", name: `read the oldest of a ${kb} kB note's versions`, p50: pct(reads, 0.5), p95: pct(reads, 0.95), status: readStatus });
+    print(rows.at(-1)!);
+  }
+
   // Schema changes, last: a slow one keeps the vault busy after the client gives up.
   const item = (await call("GET", "/tags/item")).body.fields;
   await once("type PUT", "item (no reference field): add a plain field", "PUT", "/tags/item", { fields: { ...item, colour: { type: "string" } } });

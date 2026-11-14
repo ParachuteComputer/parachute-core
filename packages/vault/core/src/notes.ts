@@ -1,6 +1,6 @@
 import { Database, type SQLQueryBindings } from "bun:sqlite";
 import type { Note, NoteIndex, QueryOpts, QueryNotesPage, VaultStats, VaultMap, AggregateSpec, AggregateRow, SemanticSearchResult } from "./types.js";
-import { decodeVector, dot } from "./embedding/vector-codec.js";
+import { decodeStoredVector, dot, int8Model } from "./embedding/vector-codec.js";
 import { nonBlankContentClause } from "./embedding/vectors.js";
 import { normalizePath } from "./paths.js";
 import { computeDisplayTitle, skipLeadingFrontmatter } from "./display-title.js";
@@ -2499,12 +2499,13 @@ export function semanticSearchNotes(
   // Pull every candidate's vector rows for the ACTIVE model, batched to
   // stay under the DO 100-bound-param cap (same chunking `fetchNotesByIdsOrdered`
   // uses). A note absent from this map has no fresh vector yet — pending.
-  const vecRowsByNote = new Map<string, { chunk_ix: number; vector: Uint8Array }[]>();
+  // A row's model says how its vector is stored: `model` is float32, `model::int8` int8 (T-460, vector-codec.ts).
+  const vecRowsByNote = new Map<string, { chunk_ix: number; vector: Uint8Array; dims: number; model: string }[]>();
   for (const idChunk of chunkForInClause(candidateIds)) {
     const placeholders = idChunk.map(() => "?").join(", ");
     const rows = db.prepare(
-      `SELECT note_id, chunk_ix, vector FROM note_vectors WHERE model = ? AND note_id IN (${placeholders})`,
-    ).all(model, ...idChunk) as { note_id: string; chunk_ix: number; vector: Uint8Array }[];
+      `SELECT note_id, chunk_ix, vector, dims, model FROM note_vectors WHERE model IN (?, ?) AND note_id IN (${placeholders})`,
+    ).all(model, int8Model(model), ...idChunk) as { note_id: string; chunk_ix: number; vector: Uint8Array; dims: number; model: string }[];
     for (const row of rows) {
       let list = vecRowsByNote.get(row.note_id);
       if (!list) {
@@ -2523,10 +2524,19 @@ export function semanticSearchNotes(
     const rows = vecRowsByNote.get(id);
     if (!rows || rows.length === 0) continue;
     let best = -Infinity;
+    let readable = false;
     for (const row of rows) {
-      const score = dot(decodeVector(row.vector), queryVector);
+      let vector: Float32Array;
+      try {
+        vector = decodeStoredVector(row.vector, row.model, row.dims);
+      } catch {
+        continue; // a damaged row: that chunk is left out, not the search
+      }
+      readable = true;
+      const score = dot(vector, queryVector);
       if (score > best) best = score;
     }
+    if (!readable) continue; // no chunk of it could be read: counted as pending below, like a note not embedded yet
     scored.push({ id, score: best });
   }
   scored.sort((a, b) => b.score - a.score);
@@ -2547,7 +2557,7 @@ export function semanticSearchNotes(
 
   return {
     notes,
-    pendingCount: candidateIds.length - vecRowsByNote.size,
+    pendingCount: candidateIds.length - scored.length,
     totalCandidates: candidateIds.length,
   };
 }

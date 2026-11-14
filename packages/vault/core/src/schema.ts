@@ -11,11 +11,32 @@ import { recordTagKinds } from "./tag-kind.js";
 export const SCHEMA_VERSION = 32;
 /**
  * The newest schema this engine can open (T-460). Above SCHEMA_VERSION only for a schema whose new data this engine
- * already reads: 33 stores version bodies compressed (blob-codec.ts), which this engine reads but doesn't write. So
- * rolling back from the engine that writes 33 to this one still opens and reads every vault. Such a vault is opened
- * as it is: no migration runs and no older stamp is written over it.
+ * already reads, so a rollback to it still opens and reads every vault; such a vault is opened as it is: no
+ * migration runs and no older stamp is written over it. (T-460 writes compressed version bodies without a schema
+ * number: see ensureCompactHintsLegacy. 1.0's int8 search vectors and marked versions need none either: this engine
+ * reads `model::int8` rows (vector-codec.ts) and keeps a version whose `marked_at` is set.)
  */
 export const READABLE_SCHEMA_VERSION = 33;
+
+/**
+ * Whether the compaction hints have T-460's `legacy` column (blobs stored the old way, which the maintenance pass
+ * re-encodes). An older engine rebuilds the table without it (its `history rebuild-state`), so every open looks.
+ */
+function compactHintsCurrent(db: Database): boolean {
+  return !hasTable(db, "history_compact_state") || hasColumn(db, "history_compact_state", "legacy");
+}
+
+/**
+ * T-460: version bodies are written compressed (blob-codec.ts) and compaction is always on; the hints gain `legacy`.
+ * An un-numbered step, deliberately, not a schema bump: every older engine still opens the vault and serves every
+ * note (the 0.8 code-only rollback and the 0.7 takeover's rollback keep working). It never misreads a compressed
+ * version either: it refuses an encoding it doesn't know (409 history_unrecoverable) and checks every body's hash, so
+ * those versions wait, unchanged, for the next upgrade. The rebuild also clears every `refused`, so an earlier refusal
+ * under the old rules doesn't hide a note from the new ones.
+ */
+function ensureCompactHintsLegacy(db: Database): void {
+  if (hasTable(db, "note_versions") && !compactHintsCurrent(db)) rebuildCompactState(db);
+}
 
 function migrateToV32(db: Database): void {
     const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='history_compact_state'").get();
@@ -316,6 +337,9 @@ CREATE INDEX IF NOT EXISTS idx_note_vectors_stale ON note_vectors(model, content
 -- note_blobs.encoding IS NULL  -> \`content\` is the literal body, \`byte_size\`
 --   is its UTF-8 byte length, and \`hash\` = sha256(content). This is every row
 --   v29 ever wrote.
+-- note_blobs.encoding = 'deflate' (T-460) -> \`content\` is a BLOB, the UTF-8 body
+--   compressed with raw deflate; \`byte_size\` is the stored (compressed) length.
+--   Whole, like NULL: it may be a delta's base.
 -- note_blobs.encoding = 'fossil-delta' -> \`content\` is the BASE64 of a Fossil
 --   delta that reconstructs this row's logical body from the body of the blob
 --   named by \`delta_of\`; \`byte_size\` is the length of that base64 payload, i.e.
@@ -325,13 +349,16 @@ CREATE INDEX IF NOT EXISTS idx_note_vectors_stale ON note_vectors(model, content
 --   The LOGICAL byte length is note_versions.content_len, which PR 1
 --   denormalised for exactly this moment (PR 1 §2.1: "it must stay readable
 --   after PR 2 deltifies the blob").
+-- note_blobs.encoding = 'fossil-delta-z' (T-460) -> \`content\` is a BLOB, the raw
+--   Fossil delta bytes compressed with raw deflate; otherwise as 'fossil-delta'.
+--   blob-codec.ts reads all four.
 -- ANY OTHER \`encoding\` VALUE IS CORRUPTION. It is not a future format marker to
 --   be tolerated: a read of such a row answers 409 (materialise's
 --   "unknown_encoding" branch) and the doctor counts it (historyStorageStats's
 --   unknown_encoding_blobs). A later format adds its value here AND to both.
 --
 -- DEPTH IS EXACTLY ONE, AND THAT IS AN INVARIANT, NOT A TUNING CHOICE.
---   delta_of MUST name a row whose \`encoding IS NULL\`. A delta is never the
+--   delta_of MUST name a whole row (encoding NULL or 'deflate'). A delta is never the
 --   base of another delta. Rebuilding any version is therefore ONE applyDelta,
 --   measured p95 3.73 ms / p99 4.68 ms on a 116 KB note, against 38.98 ms /
 --   49.99 ms for a 24-link chain on the same note -- the chain sits ON the
@@ -751,7 +778,8 @@ export function unnumberedStepsDone(db: Database): boolean {
     hasColumn(db, "tags", "kind") && // ensureTagKinds (T-318 §8a, 0.9)
     (!hasTable(db, "note_versions") || hasColumn(db, "note_versions", "via_kind")) && // ensureRevisionKeyKind (0.9.1)
     (!hasTable(db, "notes") || hasColumn(db, "notes_fts", "fields")) && // ensureFtsFields (0.9.3)
-    (!hasTable(db, "notes") || ftsInsertTriggerIsCurrent(db)) // ensureFtsInsertTrigger (0.9.3)
+    (!hasTable(db, "notes") || ftsInsertTriggerIsCurrent(db)) && // ensureFtsInsertTrigger (0.9.3)
+    compactHintsCurrent(db) // ensureCompactHintsLegacy (T-460)
   );
 }
 
@@ -778,6 +806,7 @@ export function initSchema(db: Database): void {
       ensureRevisionKeyKind(db);
       ensureFtsFields(db);
       ensureFtsInsertTrigger(db);
+      ensureCompactHintsLegacy(db);
     }
     rebuildIndexes(db);
     return;
@@ -936,6 +965,8 @@ export function initSchema(db: Database): void {
   ensureFtsFields(db);
   // The insert trigger clears a leftover field-text row first (0.9.3).
   ensureFtsInsertTrigger(db);
+  // Compressed history and always-on compaction (T-460): the hints' legacy column.
+  ensureCompactHintsLegacy(db);
 
   // Rebuild any generated columns + indexes declared in indexed_fields.
   // No-op for a fresh vault; idempotent on existing vaults.

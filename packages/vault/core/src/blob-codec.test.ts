@@ -114,8 +114,10 @@ test("a Durable Object hands BLOBs back as an ArrayBuffer (and a Uint8Array may 
   expect(wholeText(utf8(text).slice().buffer, null, 1 << 20)).toBe(text);
 });
 
-test("this release writing into a vault the next release stamped 33: edits, restore and compaction read back, the stamp stays", async () => {
-  const { initSchema, READABLE_SCHEMA_VERSION } = await import("./schema.js");
+// The reader release's own case (READABLE_SCHEMA_VERSION above SCHEMA_VERSION); skipped in the release that writes 33.
+const schema = await import("./schema.js");
+test.skipIf(schema.READABLE_SCHEMA_VERSION === schema.SCHEMA_VERSION)("this release writing into a vault a newer release stamped (READABLE_SCHEMA_VERSION): edits, restore and compaction read back, the stamp stays", async () => {
+  const { initSchema, READABLE_SCHEMA_VERSION } = schema;
   const { id, versions, bodies } = await seed(12);
   // What the next release leaves: every whole blob deflated, the vault stamped 33.
   for (const v of versions) set(v.content_hash!, deflateBytes(utf8(bodies.get(v.version_ix)!)), "deflate", null);
