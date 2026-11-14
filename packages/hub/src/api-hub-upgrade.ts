@@ -262,7 +262,7 @@ export async function handleHubUpgrade(req: Request, deps: ApiHubUpgradeDeps): P
     return jsonError(
       409,
       "part_of_core",
-      "the hub is part of @openparachute/core: upgrade core itself (`bun add -g @openparachute/core@beta` while 0.9 is in beta; the installer and `@next` give 0.8), then `parachute restart`",
+      "the hub is part of @openparachute/core: upgrade core itself with `parachute upgrade` (it follows this home's channel), then `parachute restart`",
     );
   }
 

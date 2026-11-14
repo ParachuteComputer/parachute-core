@@ -18,7 +18,7 @@
 // alone. A copy left half-done by an interrupted install (`.store/*.tmp`) is removed by the next install.
 //
 // It installs a bundle, not a source checkout: from the repository, build one with `bun run candidate`.
-import { accessSync, constants as fsConstants, cpSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync } from "node:fs";
+import { accessSync, constants as fsConstants, cpSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { dlopen, FFIType } from "bun:ffi";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { homedir } from "node:os";
@@ -67,6 +67,70 @@ function copyAndSwitch(root: string, base: string, store: string, version: strin
 
 /** The names install links into <prefix>/bin: the command and its alias. Never `parachute-vault`. */
 export const LINKED = ["parachute", "parachute-core"];
+
+/** In <prefix>/.store: which version <prefix>/bin was switched to last, and the version it ran before. */
+export const LINKS_RECORD = "links.json";
+
+/**
+ * The prefix this program is installed under (`<prefix>/.store/<version>-<id>/` is the bundle it runs from), or null:
+ * an unpacked tarball that was never installed, an npm or bun install, a source checkout.
+ */
+export function installedPrefix(root: string | null = bundleRoot()): string | null {
+  if (!root || basename(dirname(root)) !== ".store") return null;
+  return dirname(dirname(root));
+}
+
+/** The version <prefix>/bin/parachute-core runs (`../<version>/bin/parachute-core`), when the link is this installer's. */
+export function linkedVersion(base: string): string | null {
+  const at = join(base, "bin", "parachute-core");
+  try {
+    return ourLink(at, base) ? readlinkSync(at).split("/")[1]! : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Whether <prefix>/<version> is a complete copy this installer made, so <prefix>/bin can run it. */
+export function hasVersion(base: string, version: string): boolean {
+  const dir = join(base, version);
+  if (!/^\d[^/]*$/.test(version) || !lstatSync(dir, { throwIfNoEntry: false })?.isSymbolicLink() || !existsSync(dir)) return false;
+  const copy = realpathSync(dir);
+  return dirname(copy) === join(realpathSync(base), ".store") && ["VERSION", "runtime/bun", "bin/parachute-core", "lib/packages/cli/bin/parachute"].every((f) => existsSync(join(copy, f)));
+}
+
+/** What <prefix>/.store/links.json says: the version the links were last switched to, and the one before it. */
+export function readLinksRecord(base: string): { current: string; previous: string; at: string } | null {
+  try {
+    const r = JSON.parse(readFileSync(join(base, ".store", LINKS_RECORD), "utf8"));
+    return typeof r?.current === "string" && typeof r?.previous === "string" ? r : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Point <prefix>/bin/parachute and parachute-core at <prefix>/<version>, each in one rename, and record the switch
+ * (the version they ran before) when it changes the version. The unit runs <prefix>/bin/parachute-core, so this is
+ * what decides which release its next start runs. Returns the links' targets.
+ */
+export function pointLinks(base: string, version: string): string[] {
+  const bin = join(base, "bin");
+  const before = linkedVersion(base);
+  const out: string[] = [];
+  for (const name of LINKED) {
+    const target = relative(bin, join(base, version, "bin", name));
+    const tmpLink = join(bin, `.${name}.${randomBytes(4).toString("hex")}`);
+    symlinkSync(target, tmpLink);
+    renameSync(tmpLink, join(bin, name));
+    out.push(target);
+  }
+  if (before && before !== version) {
+    const path = join(base, ".store", LINKS_RECORD);
+    writeFileSync(`${path}.tmp`, `${JSON.stringify({ current: version, previous: before, at: new Date().toISOString() }, null, 2)}\n`);
+    renameSync(`${path}.tmp`, path);
+  }
+  return out;
+}
 
 function usage(): string {
   return [
@@ -194,14 +258,10 @@ export function install(argv: string[]): number {
   }
   const previous = r.previous;
   console.log(`parachute ${version} installed in ${dest}`);
-  // <prefix>/bin/<name> → ../<version>/bin/<name>, each switched in one rename too.
-  for (const name of LINKED) {
-    const target = relative(bin, join(dest, "bin", name));
-    const tmpLink = join(bin, `.${name}.${randomBytes(4).toString("hex")}`);
-    symlinkSync(target, tmpLink);
-    renameSync(tmpLink, join(bin, name));
-    console.log(`linked ${join(bin, name)} → ${target}`);
-  }
+  // <prefix>/bin/<name> → ../<version>/bin/<name>, each switched in one rename too. The version they ran before is
+  // recorded (.store/links.json): `upgrade --rollback` points them back at it.
+  const targets = pointLinks(base, version);
+  LINKED.forEach((name, i) => console.log(`linked ${join(bin, name)} → ${targets[i]}`));
   const onPath = (process.env.PATH ?? "").split(":").some((d) => d && resolve(d) === bin);
   const other = otherParachuteFirst(join(bin, "parachute"));
   if (other) {

@@ -276,11 +276,23 @@ export async function dispatch(role: Role, notice?: Notice): Promise<void> {
       process.exit(await check(home, upgradeAsk));
     }
   }
+  if (upgradeAsk?.kind === "core") {
+    // This program's own upgrade (upgrade.ts): the step asked for by name on a home another release served last
+    // (the only way a rolled-back home moves forward), else the newer release from the home's channel.
+    const refusal = managedRefusal("hub", ["upgrade"]);
+    if (refusal) {
+      console.error(refusal);
+      process.exit(2);
+    }
+    const { upgradeCore } = await import("./upgrade.ts");
+    process.exit(await upgradeCore(home, upgradeAsk, newerCheck));
+  }
   {
     // The first time this release opens a home an older one served: record the step and back the databases up
-    // first (release.ts). Not a host's (embedded) home, nor one the old 0.7 programs still own.
+    // first (release.ts). Not a host's (embedded) home, nor one the old 0.7 programs still own. A home marked
+    // rolled back is refused here (exit 7); only `upgrade` above, and its check on a copy, take the step on one.
     const { beforeOpenOrExit } = await import("./release.ts");
-    const code = beforeOpenOrExit(home, newerCheck);
+    const code = beforeOpenOrExit(home, newerCheck, checkCopy);
     if (code !== null) process.exit(code);
   }
   if (checkCopy) {
