@@ -74,7 +74,7 @@ export interface Note {
    * ONLY present on results from `search=`/`query-notes{search}` — every
    * other read path (structured `queryNotes`, `getNoteById`, ...) leaves
    * this `undefined`. Higher is more relevant — the sign-flipped weighted
-   * `bm25(notes_fts, SEARCH_WEIGHT_PATH, SEARCH_WEIGHT_CONTENT)` value (raw
+   * `bm25(notes_fts, SEARCH_BM25_WEIGHTS)` value (raw
    * SQLite bm25 is negative-is-better; flipped here so external callers get
    * the more intuitive "bigger number wins" convention). Meaningful only
    * for RELATIVE comparison within one result set — the absolute magnitude
@@ -84,6 +84,8 @@ export interface Note {
    * longer determines the result order.
    */
   score?: number;
+  /** search_mode "hybrid" (T-461 prototype): which arms found the note, "keyword" and/or "meaning". */
+  matched_by?: string[];
 }
 
 // ---- Link ----
@@ -593,7 +595,14 @@ export interface Store {
    * provider is configured or the configured one isn't ready — never a
    * silent fallback to keyword search.
    */
-  semanticSearch(nearText: string, opts?: QueryOpts): Promise<SemanticSearchResult>;
+  semanticSearch(nearText: string, opts?: QueryOpts & { visible?: (note: Note) => boolean }): Promise<SemanticSearchResult>;
+  /** T-461 prototype: whether meaning search can answer at all (an embedding provider is configured). Cheap. */
+  hasMeaningSearch?(): boolean;
+  /** T-461 prototype: keyword + meaning fused by rank (core/src/hybrid.ts). Optional while it's a prototype. */
+  hybridSearch?(
+    text: string,
+    opts?: QueryOpts & { visible?: (note: Note) => boolean },
+  ): Promise<{ notes: Note[]; meaning: "ok" | "unavailable"; meaningReason?: string; pendingCount: number; totalCandidates: number }>;
 
   // Tags
   tagNote(noteId: string, tags: string[]): Promise<void>;

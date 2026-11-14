@@ -50,6 +50,7 @@
  *   /.well-known/parachute.json                → built dynamically from services.json
  *   /.well-known/parachute-revocation.json     → revoked-jti list (hub#212 Phase 1)
  *   /.well-known/jwks.json                     → JWKS from hub.db
+ *   /.well-known/parachute-changes.json        → the 0.9 change map (public; same bytes as `parachute changes --json`)
  *   /.well-known/parachute-account             → account-door capabilities descriptor (public, H2)
  *   /.well-known/oauth-authorization-server    → RFC 8414 metadata (issuer, endpoints)
  *   /.well-known/oauth-protected-resource/mcp  → RFC 9728 PRM for root /mcp,
@@ -440,6 +441,11 @@ import {
   isVaultEntry,
   vaultInstanceNameFor,
 } from "./well-known.ts";
+import { changesJson } from "../../cli/src/changes-json.ts";
+
+// The change map is fixed for the life of the process: serialise it once.
+const CHANGES_BODY = `${changesJson()}\n`;
+const CHANGES_LENGTH = String(new TextEncoder().encode(CHANGES_BODY).length);
 import { type WsBridgeData, createWsBridgeHandlers } from "./ws-bridge.ts";
 import { type WsConnectionTracker, defaultWsConnectionTracker } from "./ws-connection-caps.ts";
 
@@ -3257,6 +3263,24 @@ export function hubFetch(
         const merged = new Headers(res.headers);
         for (const [k, v] of Object.entries(corsHeaders)) merged.set(k, v);
         return new Response(res.body, { status: res.status, headers: merged });
+      }
+
+      // GET /.well-known/parachute-changes.json — what 0.9 renamed and what replaced it: the change map, the same
+      // bytes `parachute changes --json` prints. Public, no auth, wildcard CORS, a short cache (it changes per release).
+      if (pathname === "/.well-known/parachute-changes.json") {
+        const headers = {
+          "content-type": "application/json",
+          "cache-control": "public, max-age=300",
+          "access-control-allow-origin": "*",
+          "access-control-allow-methods": "GET, HEAD, OPTIONS",
+        };
+        if (req.method === "OPTIONS") return new Response(null, { status: 204, headers });
+        if (req.method !== "GET" && req.method !== "HEAD") return new Response('{"error":"method not allowed"}', { status: 405, headers });
+        const body = CHANGES_BODY;
+        return new Response(req.method === "HEAD" ? null : body, {
+          status: 200,
+          headers: { ...headers, "content-length": CHANGES_LENGTH },
+        });
       }
 
       // GET /.well-known/parachute-account — the account-door capabilities

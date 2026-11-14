@@ -6,6 +6,11 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [Unreleased]
+
+### Added
+- `GET /.well-known/parachute-changes.json`: the 0.9 change map (what was renamed, what replaced it, which release made each change live), with no sign-in, the same bytes `parachute changes --json` prints. Served with `content-type: application/json`, a five-minute cache and open CORS (0.9.3, T-463).
+
 ## [0.7.19] - 2026-09-22
 
 **Stable promotion of 0.7.19-rc.5.** No new code. Suffix-drop only. npm `@rc`

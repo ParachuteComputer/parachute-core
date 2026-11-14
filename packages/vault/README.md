@@ -489,6 +489,19 @@ Destination kinds shipping in this release: `local` (any filesystem path — inc
 
 On Linux, scheduled runs via systemd timers are a follow-up; for now `parachute-vault backup` works on Linux but you'll need to wire the cron yourself.
 
+#### Pull a backup with cron (0.9.3)
+
+A key that can only download the vault's export lets your own scheduler take backups without holding a key that could read or change anything else:
+
+```bash
+parachute keys new nightly-backup --vault <n> --can export     # prints the key once
+# save the key in a file only you can read: ~/.parachute-backup-key (chmod 600)
+# crontab: every night at 03:10 (cron needs % written as \%)
+10 3 * * *  curl -fsS -H "Authorization: Bearer $(cat $HOME/.parachute-backup-key)" https://my-box.example.ts.net/vault/<n>/api/export -o $HOME/backups/vault-$(date +\%F).tar
+```
+
+The tar holds the same files as `parachute-vault export` and imports into any Parachute. `parachute-vault status` shows `last export` per vault, so you can see the job ran. See [HTTP_API.md](docs/HTTP_API.md#export).
+
 ### View endpoint
 
 Serve notes as clean HTML pages at `/view/:noteId`:

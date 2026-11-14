@@ -21,6 +21,8 @@
  */
 
 /** A record's text on the record tools. "content" puts the old wire word back. */
+import { HYBRID_TEXT } from "./hybrid.js";
+
 export const BODY = "body";
 /** A record's data on the record tools. "metadata" puts the old wire word back. */
 export const FIELDS = "fields";
@@ -278,7 +280,8 @@ export const RECORD_DESCRIPTIONS: Readonly<Record<string, string>> = {
 - Filters combine (AND). \`type\` matches a type and its subtypes (\`event\` finds \`event/meeting\`); \`tag\` matches a label. \`${FIELDS}\` operators work on any field: an indexed one (vault-info lists them) is fastest, any other is read in full and the reply warns \`scan\`.
 - Each record has \`types\` (what it is), \`tags\` (labels), \`${FIELDS}\` and a \`${BODY}\`.
 - Returns an array of records, or \`{records, next_cursor?, warnings?}\` with \`cursor\` or warnings, or \`[{group, value}]\` with \`aggregate\`. An empty page means done.
-Rarer filters (has_links, order_by, expand_links, created_by, search_mode, …) are accepted too. ${HELP("query-records")}`,
+- ${HYBRID_TEXT.line}
+Rarer filters (has_links, order_by, expand_links, created_by, …) are accepted too. ${HELP("query-records")}`,
   "create-record": `Create a record, or several with \`records: [...]\`. \`types\` names its types (existing types or new names); \`tags\` adds labels. If \`path\` is taken, \`if_exists\` decides: error (default), ignore, update (merge into it) or replace. ${HELP("create-record")} If no existing type fits what the record is, name a new type for it rather than using the nearest one.`,
   "update-record": `Change a record (id, path or title), or several with \`records: [{id, …}]\`.
 - ${BODY[0]!.toUpperCase() + BODY.slice(1)}: \`${BODY}\` (replace all), \`append\`/\`prepend\`, or \`${BODY}_edit\` (old_text must occur once).

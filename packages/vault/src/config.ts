@@ -251,6 +251,14 @@ export interface VaultConfig {
   auto_transcribe?: {
     enabled?: boolean;
   };
+  /**
+   * Search settings for this vault (0.9.3). `auto_hybrid`: true/false overrides the default for whether a 4+ word
+   * question with no `search_mode` is ranked by keyword and meaning together (core's `HYBRID_AUTO_DEFAULT`); unset
+   * follows the default. Vault-wide: set by an admin, never by a tag-scoped key.
+   */
+  search?: {
+    auto_hybrid?: boolean;
+  };
   /** Note history policy; read once when the vault store opens (vault#524). */
   history?: {
     enabled?: boolean;
@@ -266,6 +274,8 @@ export interface VaultConfig {
     max_bytes_per_note?: number | null;
     compact_budget_ms?: number;
     compact_max_notes?: number;
+    /** Burst collapse (T-460): seconds within which one named writer's edits make one version. Default 900; 0 off. */
+    burst_window_seconds?: number;
   };
 }
 
@@ -581,7 +591,7 @@ function serializeVaultConfig(config: VaultConfig): string {
   // Per-vault history policy: serialize only explicitly configured fields.
   if (config.history) {
     lines.push("history:");
-    for (const key of ["enabled", "min_versions", "max_versions", "max_age_days", "deleted_retention_days", "compact_enabled", "compact_ratio", "compact_min_versions", "compact_run_length", "max_bytes_per_note", "compact_budget_ms", "compact_max_notes"] as const) {
+    for (const key of ["enabled", "min_versions", "max_versions", "max_age_days", "deleted_retention_days", "compact_enabled", "compact_ratio", "compact_min_versions", "compact_run_length", "max_bytes_per_note", "compact_budget_ms", "compact_max_notes", "burst_window_seconds"] as const) {
       if (config.history[key] !== undefined) lines.push(`  ${key}: ${config.history[key]}`);
     }
   }
@@ -591,6 +601,11 @@ function serializeVaultConfig(config: VaultConfig): string {
   if (config.auto_transcribe?.enabled !== undefined) {
     lines.push("auto_transcribe:");
     lines.push(`  enabled: ${config.auto_transcribe.enabled}`);
+  }
+
+  if (config.search?.auto_hybrid !== undefined) {
+    lines.push("search:");
+    lines.push(`  auto_hybrid: ${config.search.auto_hybrid}`);
   }
 
   if (config.transcription?.context?.length) {
@@ -904,6 +919,20 @@ function parseVaultConfig(yaml: string, name: string): VaultConfig {
     }
   }
 
+  // Per-vault search settings: `search:` with an indented `auto_hybrid: true|false`.
+  const searchStart = yaml.match(/^search:\s*$/m);
+  if (searchStart) {
+    const after = yaml.slice((searchStart.index ?? 0) + searchStart[0].length);
+    for (const line of after.split("\n")) {
+      if (line.match(/^\S/) && line.trim().length > 0) break; // next top-level key
+      const m = line.match(/^\s+auto_hybrid:\s*(true|false)\s*(?:#.*)?$/);
+      if (m) {
+        config.search = { auto_hybrid: m[1]! === "true" };
+        break;
+      }
+    }
+  }
+
   const historyStart = yaml.match(/^history:\s*$/m);
   if (historyStart) {
     const after = yaml.slice((historyStart.index ?? 0) + historyStart[0].length);
@@ -914,6 +943,10 @@ function parseVaultConfig(yaml: string, name: string): VaultConfig {
       if (enabled) config.history[enabled[1] as "enabled" | "compact_enabled"] = enabled[2] === "true";
       const number = line.match(/^\s+(min_versions|max_versions|max_age_days|compact_min_versions|compact_run_length|compact_budget_ms|compact_max_notes):\s*(\d+)\s*$/);
       if (number) config.history[number[1] as "min_versions" | "max_versions" | "max_age_days" | "compact_min_versions" | "compact_run_length" | "compact_budget_ms" | "compact_max_notes"] = Number(number[2]);
+      // Any number: resolveHistoryPolicy clamps it (a negative one turns bursts off), rather than a typo silently
+      // falling back to the default.
+      const burst = line.match(/^\s+burst_window_seconds:\s*(-?\d+(?:\.\d+)?)\s*$/);
+      if (burst) config.history.burst_window_seconds = Number(burst[1]);
       const ratio = line.match(/^\s+compact_ratio:\s*(\d+(?:\.\d+)?)\s*$/);
       if (ratio) config.history.compact_ratio = Number(ratio[1]);
       const bytes = line.match(/^\s+max_bytes_per_note:\s*(null|\d+)\s*$/);

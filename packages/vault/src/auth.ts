@@ -31,9 +31,12 @@ import {
   findBroadVaultScopes,
   hasScope,
   hasScopeForVault,
+  isExportOnly,
+  hasExportScopeForVault,
   legacyPermissionToScopes,
   narrowedVaultNames,
   SCOPE_ADMIN,
+  SCOPE_EXPORT,
   SCOPE_READ,
   SCOPE_WRITE,
 } from "./scopes.ts";
@@ -348,6 +351,43 @@ function validateKey(keys: StoredKey[], providedKey: string): StoredKey | null {
  *     so it falls through to the 401 — pvt_* is unvalidatable post-DROP.
  */
 export async function authenticateVaultRequest(
+  req: Request,
+  vaultConfig: VaultConfig,
+  opts: { allowExportOnly?: boolean } = {},
+): Promise<{ error: Response } | AuthResult> {
+  const auth = await authenticateVaultCredential(req, vaultConfig);
+  if ("error" in auth) return auth;
+  // The backup key (`vault:<name>:export`, nothing else) is let in by `GET /api/export` alone. Every other caller of
+  // this function, a route that only asks "is this key valid", the MCP door, /view, the websocket, gets a 403, so a
+  // new route can't open to it by forgetting a check. A key that carries export AND a tag scope is refused
+  // everywhere (the export is the whole vault; a tag-scoped key may see only part of it).
+  const name = vaultConfig.name;
+  if (hasExportScopeForVault(auth.scopes, name) && auth.scoped_tags !== null) {
+    return {
+      error: Response.json(
+        { error: "Forbidden", error_type: "insufficient_scope", message: "A key that can export the vault can't also be limited to some tags: the export is the whole vault." },
+        { status: 403 },
+      ),
+    };
+  }
+  if (isExportOnly(auth.scopes, name) && !opts.allowExportOnly) {
+    return {
+      error: Response.json(
+        {
+          error: "Forbidden",
+          error_type: "insufficient_scope",
+          message: `This key can only download the vault's export (GET /api/export). It holds the '${SCOPE_EXPORT}' scope and nothing else.`,
+          required_scope: SCOPE_READ,
+          granted_scopes: auth.scopes,
+        },
+        { status: 403 },
+      ),
+    };
+  }
+  return auth;
+}
+
+async function authenticateVaultCredential(
   req: Request,
   vaultConfig: VaultConfig,
 ): Promise<{ error: Response } | AuthResult> {

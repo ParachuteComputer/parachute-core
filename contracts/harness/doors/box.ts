@@ -27,7 +27,7 @@ export async function signInAdmin(hub: string, admin: { username: string; passwo
   return { cookie: `parachute_hub_session=${session}; parachute_hub_csrf=${csrf}`, csrf };
 }
 
-export async function startBoxDoor(info: CandidateInfo, opts: { keep?: boolean } = {}) {
+export async function startBoxDoor(info: CandidateInfo, opts: { keep?: boolean; embeddings?: boolean } = {}) {
   const running = await startCandidateBox(info, opts);
   try {
     const s = running.services;

@@ -771,7 +771,7 @@
   {
    "kind": "mcp-tool",
    "old": "query-notes {created_by, created_via, exclude_tag, excludeTags, exclude_path_prefix, excludePathPrefix, expand, expand_depth, expand_links, expand_mode, extension, has_ambiguous_links, has_broken_links, has_links, has_tags, include_ambiguous_links, include_broken_links, include_link_count, last_updated_by, last_updated_via, link_count_direction, near_text, order_by, search_mode, semantic} (parameters listed in tools/list)",
-   "new": "the same parameters on query-notes and query-records, listed by vault-info {help: \"query-notes\"} instead of tools/list",
+   "new": "the same parameters on query-notes and query-records, listed by vault-info {help: \"query-notes\"} instead of tools/list (search_mode is in the short list again since 0.9.3: it carries \"hybrid\")",
    "action": "keep",
    "reason": "0.9's tool list is short (the description budget: query-records under 1,500 tokens, contracts/suites/mcp/budget.test.ts), so these rarer parameters left it. Each is still accepted and honoured, as on 0.8 (contracts/suites/mcp/old-params.test.ts); vault-info {help} lists them; a connector made on 0.8 keeps its own list; the short description names the commonest ones and where to find the rest",
    "since": "0.9",
@@ -790,10 +790,70 @@
   },
   {
    "kind": "mcp-tool",
+   "old": "create-note {extension, summary} (parameters listed in tools/list)",
+   "new": "the same parameters on create-note and create-record: extension (the file type: csv, yaml, json…) and, on a batch, summary: true for {created, ids, failed} in place of the notes",
+   "action": "keep",
+   "reason": "0.8 listed both on create-note; 0.9 honours both on create-note and create-record (contracts/suites/mcp/old-params.test.ts). 0.9's short tool list leaves them out, on both names (the description budget); vault-info {help} lists them",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "mcp-tool",
+   "old": "update-note {created_at, extension, include_content, include_links, state_transition} (parameters listed in tools/list)",
+   "new": "the same parameters, by the same names, on update-note and update-record (update-record keeps the name include_content; query-records says include_body)",
+   "action": "keep",
+   "reason": "0.8 listed all five on update-note (include_content too, the lean answer shape); 0.9 honours each on both names (contracts/suites/mcp/old-params.test.ts): created_at and extension are written, include_content: false drops the body from the answer, include_links adds the link set, state_transition commits once and conflicts on a stale from. vault-info {help} lists them",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "mcp-tool",
+   "old": "delete-tag {cascade} (parameter listed in tools/list)",
+   "new": "delete-tag {cascade} and manage-types {action: delete, cascade}",
+   "action": "keep",
+   "reason": "0.8's delete-tag refuses a tag another tag names as a parent, and cascade (or detach) proceeds and strips that reference. 0.9 does the same on the old name and on manage-types (contracts/suites/mcp/old-params.test.ts)",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "mcp-tool",
+   "old": "rename-tag {from, tag, to} (parameters listed in tools/list)",
+   "new": "rename-tag {old_name, new_name} and manage-types {action: rename, old_name, new_name}; from, tag and to are still read as aliases on both",
+   "action": "keep",
+   "reason": "0.8's rename-tag listed from and tag as old_name's aliases and to as new_name's. 0.9 reads all three on rename-tag and on manage-types {action: rename} (contracts/suites/mcp/old-params.test.ts)",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "mcp-tool",
+   "old": "request-attachment-upload {segment_index} (parameter listed in tools/list)",
+   "new": "request-attachment-upload {segment_index} and attachment-url {action: upload, segment_index}",
+   "action": "keep",
+   "reason": "0.8's upload ticket takes segment_index to mark one part of a split recording; the stored attachment carries it. 0.9 does the same on the old name and on attachment-url; a malformed value is ignored, as before (contracts/suites/mcp/old-params.test.ts)",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "mcp-tool",
    "old": "vault-info query_hints: query-notes { near: { id: \"...\" }, depth: 2 }",
    "new": "query-notes { near: { note_id: \"...\", depth: 2 } } (query-records { near: { id: \"...\", depth: 2 } } in record words)",
    "action": "keep",
    "reason": "a corrected hint: 0.8's near hint showed a call 0.8 itself refused (it reads near.note_id, and depth inside near); 0.9's hint shows the call each tool takes. vault-info, its name and arguments are unchanged; query-notes {near: {id}} is still refused, now with its fix",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "mcp-tool",
+   "old": "vault-info tags and map.tags (every type and every tag, on every call)",
+   "new": "the same entries, the most used first, capped to about 4,000 tokens: tags_total and map.tags_total count them all, tags_more says how many more types and names list-types (list-types {name} gives one in full); a vault whose reply fits is unchanged",
+   "action": "keep",
+   "reason": "0.9.2 teaching (core #79): a vault with hundreds of types spent most of each vault-info on its tag map (5.7k of 9k tokens at one real shape). Each kept entry is whole and as 0.8 gave it; the rest are one list-types away. The connect-time list in the server instructions is capped the same way (about 1,500 characters, the most used first). vault-info, its name and arguments are unchanged",
    "since": "0.9",
    "removed_in": null,
    "state": "live"
@@ -960,6 +1020,36 @@
   },
   {
    "kind": "endpoint",
+   "old": "a note's validation_status warning schema_conflict: \"field 'f' has conflicting specs in ancestor tags 'a' (kept) and 'b' (ignored)\" (REST and MCP)",
+   "new": "the same warning ending \"(overridden)\" when a type on the note descends from b and redefines its field, else \"(checked, warnings only)\", where b's rules are now checked too, as warnings (an overridden field's rules on b stay unchecked)",
+   "action": "keep",
+   "reason": "0.9.2 one data type per field, warned (core #77): every type on a record now checks its fields, so the losing type's rules are no longer ignored unless a descendant overrides the field; the old word would have been false. Same reason code, field, schema and loser_schema; only the last words change. A write is still decided by the first type's rules",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "endpoint",
+   "old": "a note's validation_status warnings (REST and MCP, on reads and writes)",
+   "new": "the same, plus near_name: a field the note's types don't declare, one letter from one they do (or differing only in case), is kept as written, with a warning naming the declared field (nearest)",
+   "action": "keep",
+   "reason": "0.9.2 teaching (core #79, #80): `statu` beside a declared `status` was silently a new field. Advisory, never strict, nothing stored changes; a 0.8 client that lists the warnings sees one more for each such field",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "endpoint",
+   "old": "GET /health and /vault/<n>/api/health: {status, vault} (or vaults)",
+   "new": "the same, plus embeddings: {enabled, state} (state off, failing, loading or ready); on /vault/<n>/api/health a caller with a pass for the vault also gets provider, model and the error",
+   "action": "keep",
+   "reason": "additive (T-418, core #50): semantic search turned on with a model that couldn't load looked healthy while every note's embed failed; /health now says the embedder's state. Nothing a 0.8 client reads changes",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live"
+  },
+  {
+   "kind": "endpoint",
    "old": "GET/PUT/DELETE /vault/<n>/api/tags/<name> (type records: fields, parents)",
    "new": "GET/PUT/DELETE /vault/<n>/api/types/<name>",
    "action": "rename",
@@ -1097,6 +1187,28 @@
    "since": "0.9",
    "removed_in": null,
    "state": "live"
+  },
+  {
+   "kind": "endpoint",
+   "old": "HEAD /vault/<n>/api/records/<id> (and /api/notes/<id>): passed through, no answer",
+   "new": "200 with GET's headers (Content-Type, Content-Length of the GET body) and no body; 404 for a missing or hidden record; the same key and tag scope as GET",
+   "action": "keep",
+   "reason": "additive (0.9.3): a client can ask whether a record is there without fetching it. A 0.8 client never sent HEAD",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live",
+   "release": "0.9.3"
+  },
+  {
+   "kind": "endpoint",
+   "old": "(none) the change map was only in `parachute changes --json`",
+   "new": "GET /.well-known/parachute-changes.json (hub, no auth): the same bytes",
+   "action": "keep",
+   "reason": "additive (0.9.3): an app or agent reads what changed from the hub it talks to, with no CLI on the machine",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live",
+   "release": "0.9.3"
   },
   {
    "kind": "endpoint",

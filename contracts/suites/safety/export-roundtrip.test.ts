@@ -116,12 +116,17 @@ describe("export, then import into a new vault", () => {
 });
 
 describe("an object item whose first key holds a colon", () => {
-  test("an object item keeps its other keys, and stays an object, though the exporter doesn't quote that first key", async () => {
+  test("an object item keeps its other keys, and stays an object, in an export written before keys were quoted", async () => {
     const op = operator();
     const made = await op.post("/notes", { path: `${R}/colon-key`, content: "made up", metadata: { items: [{ "x:y": 1, z: 2 }, { "x:y": 3 }] } });
     expect(made.status).toBe(201);
     const dir = join(SCRATCH, "colon-key");
     await run(s.home, ["export", dir, "--vault", s.vaultName]);
+    // Since #75 the exporter quotes this key ('x:y'); an export written before that holds it bare. Restore that one.
+    const file = join(dir, `${R}/colon-key.md`);
+    const written = readFileSync(file, "utf8");
+    expect(written).toContain("'x:y': 1");
+    writeFileSync(file, written.replaceAll("'x:y':", "x:y:"));
     const target = await restoreTarget("rt-key");
     await run(target.home, ["import", dir, "--vault", target.vault, "--blow-away", "--yes"]);
     const db = new Database(dbFile(target.home, target.vault), { readonly: true });
@@ -179,5 +184,62 @@ body
     } finally {
       db.close();
     }
+  });
+});
+
+// YAML-special keys (#75). The exporter wrote a key as it stood, so `it's`, `@at`, `#hash`, `[x]`, `-dash` and `a: b`
+// went out bare; the importer's key rule (`[\w][\w.-]*`) skipped the line with no word, and the whole value was lost.
+// The exporter now quotes such a key, the importer reads a quoted key, and a key line it still can't take is a warning
+// that names the file and the key.
+const KEYS: Record<string, unknown> = {
+  "it's": "[[X]]",
+  "@at": "plain",
+  "#hash": "tagged",
+  "[x]": ["one", "two"],
+  "-dash": 7,
+  "a: b": "colon in the key",
+  "two words": "spaced",
+  plain_key: "stays bare",
+};
+
+describe("keys that are not plain YAML words", () => {
+  test("export then import gives equal digests, keys and values intact", async () => {
+    const op = operator();
+    const made = await op.post("/notes", {
+      path: `${R}/keys`,
+      content: "made up",
+      metadata: { ...KEYS, nested: { "it's": { "@at": "deep" } }, items: [{ "#hash": 1, "[x]": 2 }, { "a: b": 3 }] },
+    });
+    expect(made.status).toBe(201);
+    const dir = join(SCRATCH, "keys");
+    await run(s.home, ["export", dir, "--vault", s.vaultName]);
+    const text = readFileSync(join(dir, `${R}/keys.md`), "utf8");
+    expect(text).toContain("  'it''s': '[[X]]'\n");
+    expect(text).toContain("  '@at': plain\n");
+    expect(text).toContain("  plain_key: stays bare\n");
+    const target = await restoreTarget("rt-keys");
+    await run(target.home, ["import", dir, "--vault", target.vault, "--blow-away", "--yes"]);
+    const db = new Database(dbFile(target.home, target.vault), { readonly: true });
+    try {
+      const row = db.query("SELECT metadata FROM notes WHERE id = ?").get(made.body.id) as { metadata: string };
+      expect(canon(JSON.parse(row.metadata))).toEqual(
+        canon({ ...KEYS, nested: { "it's": { "@at": "deep" } }, items: [{ "#hash": 1, "[x]": 2 }, { "a: b": 3 }] }),
+      );
+    } finally {
+      db.close();
+    }
+  });
+
+  test("a bare key the reader can't take is a warning naming the file and the key, never a silent drop", async () => {
+    const dir = join(SCRATCH, "bare-key");
+    mkdirSync(join(dir, ".parachute"), { recursive: true });
+    writeFileSync(join(dir, ".parachute", "vault.yaml"), "exported_at: 2027-01-01T00:00:00.000Z\nformat_version: 1\nname: old\n");
+    const id = "01M66HE43WKN0Z7EZ0766D7S6P";
+    writeFileSync(join(dir, "bare.md"), `---\nid: ${id}\npath: ${R}/bare\nmetadata:\n  kept: yes\n  @bare: lost\ncreated_at: 2026-10-27T13:54:21.437Z\n---\nbody\n`);
+    const target = await restoreTarget("rt-bare");
+    const r = await run(target.home, ["import", dir, "--vault", target.vault, "--blow-away", "--yes"]);
+    const out = r.stdout + r.stderr;
+    expect(out).toContain("bare.md");
+    expect(out).toContain("@bare");
   });
 });

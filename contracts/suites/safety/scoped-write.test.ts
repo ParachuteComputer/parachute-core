@@ -360,3 +360,33 @@ describe("a nested private tag hides its sub-tags from a scoped reader (fix 15)"
     must(!v.text.includes(WORD), `/view rendered a note under the nested private tag (status ${v.status})`);
   });
 });
+
+// T-463 (0.9.3, the scoped keyword search applies the scope in SQL): a private tag beside an admitted one denies the
+// note there too, so a small limit is filled with what the reader may see. Mutant "search-sql-deny-dropped" (the SQL
+// rule forgets the denying tags) puts the bug back: the private notes, which rank higher, take the visible ones' places.
+describe("a small limit is filled with what a scoped reader sees, not notes a private tag hides (T-463)", () => {
+  const WORD = `zq${R}denyfill`;
+  beforeAll(async () => {
+    await note(`${R}/fill-v1`, `${WORD} once, in a longer note than the private ones`, [MINE]);
+    await note(`${R}/fill-v2`, `${WORD} and again ${WORD}, the second visible note`, [MINE]);
+    // Short notes holding the word three times: they outrank both visible notes.
+    for (let i = 0; i < 4; i++) await note(`${R}/fill-p${i}`, `${WORD} ${WORD} ${WORD} ${i}`, [MINE, PRIVATE]);
+  });
+
+  test("REST and MCP search with limit=2 return both visible notes", async () => {
+    const r = await reader.get(`/notes?search=${WORD}&limit=2`);
+    expect(r.status).toBe(200);
+    const restGot = (r.body as any[]).map((n) => n.path).sort();
+    must(restGot.length === 2, `REST search with limit=2 returned ${restGot.length} of the 2 visible notes: notes a private tag hides took their places`);
+    expect(restGot).toEqual([`${R}/fill-v1`, `${R}/fill-v2`]);
+    const c = await mcp(`${s.vaultViaHub}/mcp`, readerPass);
+    try {
+      const q = await c.call("query-notes", { search: WORD, limit: 2 });
+      const mcpGot = ((Array.isArray(q) ? q : (q.notes ?? [])) as any[]).map((n) => n.path).sort();
+      must(mcpGot.length === 2, `MCP search with limit=2 returned ${mcpGot.length} of the 2 visible notes: notes a private tag hides took their places`);
+      expect(mcpGot).toEqual([`${R}/fill-v1`, `${R}/fill-v2`]);
+    } finally {
+      await c.close();
+    }
+  });
+});

@@ -225,7 +225,9 @@ describe("the vault itself", () => {
     const d = door();
     const fresh = await rest("read", d.otherVault).get("/notes?limit=100&sort=asc");
     expect(fresh.status).toBe(200);
-    fp("rest/new-vault.notes", paths(fresh.body));
+    // Other suites (consent, multivault) write run-scoped notes (`<label><8 hex>/…`) into this vault; which ran first
+    // depends on file order, so only the vault's own starting notes are the fact.
+    fp("rest/new-vault.notes", paths(fresh.body).filter((p: string) => !/^[a-z]+-?[0-9a-f]{8}\//.test(p)));
     const tags = await rest("read", d.otherVault).get("/tags");
     fp("rest/new-vault.tags", tags.body.map((t: any) => t.name).sort());
   });

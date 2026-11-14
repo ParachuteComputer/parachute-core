@@ -724,13 +724,9 @@ export interface DeleteVaultDeps {
   /** Test seam: run `parachute-vault remove` — same Runner seam as create. */
   runCommand?: CreateVaultDeps["runCommand"];
   /**
-   * Supervisor-restart the vault module — the daemon-eviction cascade step.
-   * The running daemon caches open store handles, so rmSync alone leaves the
-   * deleted vault SERVING from the open fd; and vault's boot `selfRegister`
-   * rebuilds services.json paths from `listVaults()`, dropping the deleted
-   * path. Wired to the same supervisor machinery the lifecycle verbs use.
-   * Absent: delete records a warning; rename refuses before the CLI.
-   * (The boundary-conformant per-daemon store-eviction endpoint is tracked as E9.)
+   * Supervisor-restart the vault module. Rename uses it (it refuses before the
+   * CLI when absent); delete no longer does (0.9.3): the running vault server
+   * lets go of a deleted vault by itself.
    */
   restartVaultModule?: () => Promise<void>;
   /** Stop all vault stores before offline rename. Delete ignores this dep. */
@@ -769,6 +765,7 @@ interface CascadeSummary {
    */
   orphaned_channels: string[];
   vault_removed: boolean;
+  /** Always false since 0.9.3 (a delete restarts nothing); kept so older readers of the summary still parse it. */
   module_restarted: boolean;
 }
 
@@ -848,8 +845,9 @@ export function listVaultInstanceNames(manifestPath: string): Set<string> {
  *   6. mechanics: shell to `parachute-vault remove <name> --yes` (the module
  *      CLI stays the single source of truth for vault destruction,
  *      mirroring create);
- *   7. daemon eviction: supervisor-restart the vault module (open
- *      store-handle eviction + `selfRegister` services.json path rebuild).
+ *   7. (no restart: the vault server lets go of the deleted vault by itself —
+ *      its open database, triggers and mirror — and the CLI's remove
+ *      already rewrote services.json.)
  *
  * Response: 200 with a structured per-step summary (counts +
  * `orphaned_channels` + warnings). A mechanics failure responds 500 with
@@ -1093,24 +1091,10 @@ export async function handleDeleteVault(
     });
   }
 
-  // --- 7. Daemon eviction: supervisor-restart the vault module. -------------
-  if (deps.restartVaultModule) {
-    try {
-      await deps.restartVaultModule();
-      summary.module_restarted = true;
-    } catch (err) {
-      warnings.push({
-        step: "module_restart",
-        detail: `vault module restart failed: ${err instanceof Error ? err.message : String(err)} — the running daemon may still serve the deleted vault from its open store handle until restarted (parachute restart vault)`,
-      });
-    }
-  } else {
-    warnings.push({
-      step: "module_restart",
-      detail:
-        "no supervisor available — restart the vault module (parachute restart vault) to evict the deleted vault's open store handle and refresh services.json",
-    });
-  }
+  // --- 7. No daemon restart (0.9.3). ---------------------------------------
+  // The running vault server notices the vault is gone on its next request that names a vault, or within seconds,
+  // and lets go of its open database, triggers and mirror itself (vault start-vault.ts `syncVaults`); the CLI's
+  // remove already rewrote services.json. So nothing restarts and the other vaults never blink.
 
   return new Response(
     JSON.stringify({
