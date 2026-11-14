@@ -452,7 +452,9 @@ export function setRecordStates(db: Database, setId: string): SetRecordState[] {
     }
     cur.last_seq = r.seq;
     cur.last_position = cur.last_position === null || r.position === null ? null : Math.max(cur.last_position, r.position);
-    cur.op = cur.existed === 0 && r.op !== "delete" ? "create" : r.op;
+    // The op across the set: a record it found missing and left standing was created; one it found standing and left
+    // standing (even deleted and made again in between) was updated; one it left gone was deleted.
+    cur.op = r.op === "delete" ? "delete" : cur.existed === 0 ? "create" : "update";
     if (!cur.content_saved && r.content_saved) {
       cur.content_saved = 1;
       cur.before_hash = r.before_hash;

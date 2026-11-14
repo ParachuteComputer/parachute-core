@@ -198,6 +198,26 @@ describe("change log: the horizon", () => {
   });
 });
 
+describe("change log: review round 2", () => {
+  test("a record deleted and made again across two transactions of a set reads as an update", async () => {
+    const { db, store, as } = fresh();
+    as({ id: "ws_mk0000004" });
+    const n = await store.createNote("one", { id: "01JXREMADE00000000000000AA", path: "remade" });
+    as({ id: "ws_remade001" });
+    await store.deleteNote(n.id);
+    await store.createNote("two", { id: n.id, path: "remade" });
+    expect(writeSetRecords(db, "ws_remade001").map((r) => r.op)).toEqual(["update"]);
+  });
+
+  test("restoring an imported note's timestamps is part of the import's set, not a write by nobody", async () => {
+    const { db, store, as } = fresh();
+    as({ id: "ws_import001" });
+    const n = await store.createNote("imported", { path: "imp2" });
+    await store.restoreNoteTimestamps(n.id, "2020-01-01T00:00:00.000Z", "2020-01-02T00:00:00.000Z");
+    expect((db.prepare("SELECT COUNT(*) AS n FROM record_changes WHERE write_set IS NULL").get() as any).n).toBe(0);
+  });
+});
+
 describe("change log: what outlives the horizon", () => {
   test("a version keeps its write set's why after the log is swept", async () => {
     const { db, store, as } = fresh();

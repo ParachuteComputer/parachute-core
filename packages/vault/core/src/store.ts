@@ -213,7 +213,11 @@ export class BunSqliteStore implements Store {
     try {
       return this.transaction(() => {
         const pruned = pruneChangeLog(this.db, this.historyPolicy.change_log_days, new Date(now));
-        dropBlobsIfUnheld(this.db, pruned.hashes);
+        // A vault without the history tables has no blobs to free (and the log keeps none there). Checked directly, not
+        // through historyTablesPresent, which would memoise the answer for this handle.
+        if (pruned.hashes.length && this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'note_blobs'").get()) {
+          dropBlobsIfUnheld(this.db, pruned.hashes);
+        }
         return { changes: pruned.changes, sets: pruned.sets };
       });
     } catch (error) {
@@ -1121,9 +1125,12 @@ export class BunSqliteStore implements Store {
     // NOT read space-form as local time. A genuinely unparseable `updated_at`
     // falls back to `created_at`'s ms, then to 0 — never NULL, never a throw.
     const updatedAtMs = timestampToMs(updatedAt) ?? timestampToMs(createdAt) ?? 0;
-    this.db
-      .prepare("UPDATE notes SET created_at = ?, updated_at = ?, updated_at_ms = ? WHERE id = ?")
-      .run(createdAt, updatedAt, updatedAtMs, id);
+    // In a Store transaction, so the change log counts it in the import's write set (0.9.4), not as a write by nobody.
+    this.transaction(() =>
+      this.db
+        .prepare("UPDATE notes SET created_at = ?, updated_at = ?, updated_at_ms = ? WHERE id = ?")
+        .run(createdAt, updatedAt, updatedAtMs, id),
+    );
   }
 
   async listDeletedNotes(opts?: { limit?: number; offset?: number }) { return listDeletedNotes(this.db, opts); }
