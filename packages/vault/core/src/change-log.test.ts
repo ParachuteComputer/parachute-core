@@ -61,7 +61,8 @@ describe("change log: what one write set records", () => {
     const n = await store.createNote("x", { path: "raw" });
     expect(db.prepare("SELECT COUNT(*) AS n FROM write_context").get()).toEqual({ n: 0 });
     db.prepare("UPDATE notes SET content = 'raw edit', updated_at = 'later' WHERE id = ?").run(n.id); // an older engine's write
-    expect(rows(db, null)).toEqual([{ note_id: n.id, op: "update", existed: 1, content_saved: 0, before_content: null, before_tags: null }]);
+    // Its tags as they were are kept (the feed reads them for scope); its body isn't (no set: nothing to undo).
+    expect(rows(db, null)).toEqual([{ note_id: n.id, op: "update", existed: 1, content_saved: 0, before_content: null, before_tags: "[]" }]);
     expect(db.prepare("SELECT COUNT(*) AS n FROM write_sets WHERE id IS NULL").get()).toEqual({ n: 0 });
   });
 

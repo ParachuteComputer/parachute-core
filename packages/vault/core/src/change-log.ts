@@ -27,31 +27,32 @@ export const CHANGE_LOG_DAYS_DEFAULT = 30;
 export const WHY_MAX_CHARS = 280;
 
 const NOW = `strftime('%Y-%m-%dT%H:%M:%fZ','now')`;
-const CTX_SET = `(SELECT write_set FROM write_context WHERE slot = 1)`;
-const KEEP_BEFORE = `COALESCE((SELECT keep_before FROM write_context WHERE slot = 1), 1)`;
+/**
+ * The context row, joined once. SQLite compiles every trigger into each statement that writes its table, so each
+ * trigger is one short statement (a statement that writes a note compiles in ~20 µs more, not ~75).
+ */
+const CTX = `(SELECT 1) LEFT JOIN write_context c ON c.slot = 1`;
+/** Bodies are kept for a set's undo only: a write outside any set can't be undone, so its body isn't kept. */
+const KEEP = `(c.write_set IS NOT NULL AND COALESCE(c.keep_before, 1) = 1)`;
 
 /** The row columns undo puts back (not the body, which is saved only when the set changes it). */
-const rowJson = (r: "OLD" | "n") =>
+const rowJson = (r: string) =>
   `json_object('path', ${r}.path, 'extension', ${r}.extension, 'metadata', ${r}.metadata, 'created_at', ${r}.created_at, 'created_by', ${r}.created_by, 'created_via', ${r}.created_via)`;
-const TAGS_OF = (id: string) => `(SELECT json_group_array(tag_name) FROM (SELECT tag_name FROM note_tags WHERE note_id = ${id} ORDER BY tag_name))`;
-const LINKS_OF = (id: string) =>
-  `(SELECT json_group_array(json_object('target', target_id, 'relationship', relationship, 'metadata', json(COALESCE(metadata, '{}')))) FROM (SELECT target_id, relationship, metadata FROM links WHERE source_id = ${id} ORDER BY target_id, relationship))`;
-
-/** Records the write set itself (once), from the context row. */
-const OPEN_SET = `INSERT OR IGNORE INTO write_sets (id, at, actor, via, via_kind, why, undoes)
-    SELECT write_set, ${NOW}, actor, via, via_kind, why, undoes FROM write_context WHERE slot = 1 AND write_set IS NOT NULL;`;
+const TAGS_OF = (id: string, extra = "") =>
+  `(SELECT json_group_array(tag_name) FROM (SELECT tag_name FROM note_tags WHERE note_id = ${id}${extra} ORDER BY 1))`;
+const LINK_JSON = `json_object('target', target_id, 'relationship', relationship, 'metadata', json(COALESCE(metadata, '{}')))`;
+const LINKS_OF = (id: string, extra = "") =>
+  `(SELECT json_group_array(${LINK_JSON}) FROM (SELECT target_id, relationship, metadata FROM links WHERE source_id = ${id}${extra} ORDER BY 1, 2))`;
 
 /**
- * A first touch from a link or tag row: the note row itself is unchanged so far in this set, so it is read as it is;
- * the tag or link list is today's list with this one change undone.
+ * A first touch from a tag or link row. The note row is unchanged so far in this set, so it is read as it is; the
+ * tag or link list is today's with this one change undone. A later touch in the same set is ignored (the first
+ * snapshot stands). With no context the row's write set is NULL, which never conflicts: one row per change.
  */
-function firstTouchFromChild(noteId: string, tagsBefore: string, linksBefore: string): string {
-  return `${OPEN_SET}
-    INSERT OR IGNORE INTO record_changes (write_set, note_id, op, existed, at, before_row, before_tags, before_links)
-    SELECT ${CTX_SET}, n.id, 'update', 1, ${NOW}, ${rowJson("n")}, ${tagsBefore}, ${linksBefore}
-    FROM notes n WHERE n.id = ${noteId} AND ${CTX_SET} IS NOT NULL;
-    INSERT INTO record_changes (write_set, note_id, op, existed, at)
-    SELECT NULL, ${noteId}, 'update', 1, ${NOW} WHERE ${CTX_SET} IS NULL;`;
+function childTouch(noteId: string, tagsBefore: string, linksBefore: string): string {
+  return `INSERT OR IGNORE INTO record_changes (write_set, note_id, op, existed, at, before_row, before_tags, before_links)
+    SELECT c.write_set, n.id, 'update', 1, ${NOW}, ${rowJson("n")}, ${tagsBefore}, ${linksBefore}
+    FROM notes n LEFT JOIN write_context c ON c.slot = 1 WHERE n.id = ${noteId};`;
 }
 
 /** The tables, indexes and triggers. Idempotent. */
@@ -93,12 +94,10 @@ CREATE TABLE IF NOT EXISTS record_changes (
   UNIQUE (write_set, note_id)
 );
 CREATE INDEX IF NOT EXISTS idx_record_changes_note ON record_changes(note_id, seq);
-CREATE INDEX IF NOT EXISTS idx_record_changes_at ON record_changes(at);
 
 CREATE TRIGGER IF NOT EXISTS rc_notes_insert AFTER INSERT ON notes BEGIN
-  ${OPEN_SET}
   INSERT INTO record_changes (write_set, note_id, op, existed, at)
-  VALUES (${CTX_SET}, NEW.id, 'create', 0, ${NOW})
+  SELECT c.write_set, NEW.id, 'create', 0, ${NOW} FROM ${CTX} WHERE true
   ON CONFLICT (write_set, note_id) DO UPDATE SET op = CASE WHEN existed = 1 THEN 'update' ELSE 'create' END;
 END;
 
@@ -106,83 +105,54 @@ CREATE TRIGGER IF NOT EXISTS rc_notes_update BEFORE UPDATE ON notes
 WHEN OLD.content IS NOT NEW.content OR OLD.metadata IS NOT NEW.metadata OR OLD.path IS NOT NEW.path
   OR OLD.extension IS NOT NEW.extension OR OLD.updated_at IS NOT NEW.updated_at OR OLD.created_at IS NOT NEW.created_at
 BEGIN
-  ${OPEN_SET}
-  INSERT OR IGNORE INTO record_changes (write_set, note_id, op, existed, at, before_row, before_tags, before_links)
-  SELECT ${CTX_SET}, OLD.id, 'update', 1, ${NOW}, ${rowJson("OLD")}, ${TAGS_OF("OLD.id")}, ${LINKS_OF("OLD.id")}
-  WHERE ${CTX_SET} IS NOT NULL;
-  UPDATE record_changes SET before_content = OLD.content, content_saved = 1
-  WHERE write_set = ${CTX_SET} AND note_id = OLD.id AND existed = 1 AND content_saved = 0
-    AND OLD.content IS NOT NEW.content AND ${KEEP_BEFORE} = 1;
-  INSERT INTO record_changes (write_set, note_id, op, existed, at)
-  SELECT NULL, OLD.id, 'update', 1, ${NOW} WHERE ${CTX_SET} IS NULL;
+  INSERT INTO record_changes (write_set, note_id, op, existed, at, before_content, content_saved, before_row, before_tags, before_links)
+  SELECT c.write_set, OLD.id, 'update', 1, ${NOW},
+    CASE WHEN OLD.content IS NOT NEW.content AND ${KEEP} THEN OLD.content END,
+    OLD.content IS NOT NEW.content AND ${KEEP},
+    ${rowJson("OLD")}, ${TAGS_OF("OLD.id")}, ${LINKS_OF("OLD.id")}
+  FROM ${CTX} WHERE true
+  ON CONFLICT (write_set, note_id) DO UPDATE SET
+    before_content = CASE WHEN existed = 1 AND content_saved = 0 THEN excluded.before_content ELSE before_content END,
+    content_saved = CASE WHEN existed = 1 AND content_saved = 0 THEN excluded.content_saved ELSE content_saved END;
 END;
 
 CREATE TRIGGER IF NOT EXISTS rc_notes_delete BEFORE DELETE ON notes BEGIN
-  ${OPEN_SET}
-  INSERT OR IGNORE INTO record_changes (write_set, note_id, op, existed, at, before_row, before_tags, before_links)
-  SELECT ${CTX_SET}, OLD.id, 'delete', 1, ${NOW}, ${rowJson("OLD")}, ${TAGS_OF("OLD.id")}, ${LINKS_OF("OLD.id")}
-  WHERE ${CTX_SET} IS NOT NULL;
-  UPDATE record_changes SET op = 'delete' WHERE write_set = ${CTX_SET} AND note_id = OLD.id;
-  UPDATE record_changes SET before_content = OLD.content, content_saved = 1
-  WHERE write_set = ${CTX_SET} AND note_id = OLD.id AND existed = 1 AND content_saved = 0 AND ${KEEP_BEFORE} = 1;
-  INSERT INTO record_changes (write_set, note_id, op, existed, at, before_tags)
-  SELECT NULL, OLD.id, 'delete', 1, ${NOW}, ${TAGS_OF("OLD.id")} WHERE ${CTX_SET} IS NULL;
+  INSERT INTO record_changes (write_set, note_id, op, existed, at, before_content, content_saved, before_row, before_tags, before_links)
+  SELECT c.write_set, OLD.id, 'delete', 1, ${NOW},
+    CASE WHEN ${KEEP} THEN OLD.content END, ${KEEP},
+    ${rowJson("OLD")}, ${TAGS_OF("OLD.id")}, ${LINKS_OF("OLD.id")}
+  FROM ${CTX} WHERE true
+  ON CONFLICT (write_set, note_id) DO UPDATE SET op = 'delete',
+    before_content = CASE WHEN existed = 1 AND content_saved = 0 THEN excluded.before_content ELSE before_content END,
+    content_saved = CASE WHEN existed = 1 AND content_saved = 0 THEN excluded.content_saved ELSE content_saved END;
 END;
 
 CREATE TRIGGER IF NOT EXISTS rc_note_tags_insert AFTER INSERT ON note_tags BEGIN
-  ${firstTouchFromChild(
-    "NEW.note_id",
-    `(SELECT json_group_array(tag_name) FROM (SELECT tag_name FROM note_tags WHERE note_id = NEW.note_id AND tag_name IS NOT NEW.tag_name ORDER BY tag_name))`,
-    LINKS_OF("NEW.note_id"),
-  )}
+  ${childTouch("NEW.note_id", TAGS_OF("NEW.note_id", " AND tag_name IS NOT NEW.tag_name"), LINKS_OF("NEW.note_id"))}
 END;
 
-CREATE TRIGGER IF NOT EXISTS rc_note_tags_delete AFTER DELETE ON note_tags
-WHEN EXISTS (SELECT 1 FROM notes WHERE id = OLD.note_id)
-BEGIN
-  ${firstTouchFromChild(
-    "OLD.note_id",
-    `(SELECT json_group_array(tag_name) FROM (SELECT tag_name FROM note_tags WHERE note_id = OLD.note_id UNION SELECT OLD.tag_name ORDER BY 1))`,
-    LINKS_OF("OLD.note_id"),
-  )}
+CREATE TRIGGER IF NOT EXISTS rc_note_tags_delete AFTER DELETE ON note_tags BEGIN
+  ${childTouch("OLD.note_id", `(SELECT json_group_array(tag_name) FROM (SELECT tag_name FROM note_tags WHERE note_id = OLD.note_id UNION SELECT OLD.tag_name ORDER BY 1))`, LINKS_OF("OLD.note_id"))}
 END;
 
 CREATE TRIGGER IF NOT EXISTS rc_note_tags_update AFTER UPDATE ON note_tags
 WHEN OLD.note_id IS NOT NEW.note_id OR OLD.tag_name IS NOT NEW.tag_name
 BEGIN
-  ${firstTouchFromChild(
-    "NEW.note_id",
-    `(SELECT json_group_array(tag_name) FROM (SELECT tag_name FROM note_tags WHERE note_id = NEW.note_id AND tag_name IS NOT NEW.tag_name UNION SELECT OLD.tag_name WHERE OLD.note_id = NEW.note_id ORDER BY 1))`,
-    LINKS_OF("NEW.note_id"),
-  )}
+  ${childTouch("NEW.note_id", `(SELECT json_group_array(tag_name) FROM (SELECT tag_name FROM note_tags WHERE note_id = NEW.note_id AND tag_name IS NOT NEW.tag_name UNION SELECT OLD.tag_name WHERE OLD.note_id = NEW.note_id ORDER BY 1))`, LINKS_OF("NEW.note_id"))}
+END;
+
+CREATE TRIGGER IF NOT EXISTS rc_links_insert AFTER INSERT ON links BEGIN
+  ${childTouch("NEW.source_id", TAGS_OF("NEW.source_id"), LINKS_OF("NEW.source_id", " AND NOT (target_id = NEW.target_id AND relationship = NEW.relationship)"))}
+END;
+
+CREATE TRIGGER IF NOT EXISTS rc_links_delete AFTER DELETE ON links BEGIN
+  ${childTouch("OLD.source_id", TAGS_OF("OLD.source_id"), `(SELECT json_group_array(${LINK_JSON}) FROM (SELECT target_id, relationship, metadata FROM links WHERE source_id = OLD.source_id UNION ALL SELECT OLD.target_id, OLD.relationship, OLD.metadata ORDER BY 1, 2))`)}
 END;
 
 CREATE TRIGGER IF NOT EXISTS rc_links_update AFTER UPDATE ON links
 WHEN OLD.target_id IS NOT NEW.target_id OR OLD.relationship IS NOT NEW.relationship OR OLD.metadata IS NOT NEW.metadata OR OLD.source_id IS NOT NEW.source_id
 BEGIN
-  ${firstTouchFromChild(
-    "NEW.source_id",
-    TAGS_OF("NEW.source_id"),
-    `(SELECT json_group_array(json_object('target', target_id, 'relationship', relationship, 'metadata', json(COALESCE(metadata, '{}')))) FROM (SELECT target_id, relationship, metadata FROM links WHERE source_id = NEW.source_id AND NOT (target_id = NEW.target_id AND relationship = NEW.relationship) UNION ALL SELECT OLD.target_id, OLD.relationship, OLD.metadata WHERE OLD.source_id = NEW.source_id ORDER BY 1, 2))`,
-  )}
-END;
-
-CREATE TRIGGER IF NOT EXISTS rc_links_insert AFTER INSERT ON links BEGIN
-  ${firstTouchFromChild(
-    "NEW.source_id",
-    TAGS_OF("NEW.source_id"),
-    `(SELECT json_group_array(json_object('target', target_id, 'relationship', relationship, 'metadata', json(COALESCE(metadata, '{}')))) FROM (SELECT target_id, relationship, metadata FROM links WHERE source_id = NEW.source_id AND NOT (target_id = NEW.target_id AND relationship = NEW.relationship) ORDER BY target_id, relationship))`,
-  )}
-END;
-
-CREATE TRIGGER IF NOT EXISTS rc_links_delete AFTER DELETE ON links
-WHEN EXISTS (SELECT 1 FROM notes WHERE id = OLD.source_id)
-BEGIN
-  ${firstTouchFromChild(
-    "OLD.source_id",
-    TAGS_OF("OLD.source_id"),
-    `(SELECT json_group_array(json_object('target', target_id, 'relationship', relationship, 'metadata', json(COALESCE(metadata, '{}')))) FROM (SELECT target_id, relationship, metadata FROM links WHERE source_id = OLD.source_id UNION ALL SELECT OLD.target_id, OLD.relationship, OLD.metadata ORDER BY 1, 2))`,
-  )}
+  ${childTouch("NEW.source_id", TAGS_OF("NEW.source_id"), `(SELECT json_group_array(${LINK_JSON}) FROM (SELECT target_id, relationship, metadata FROM links WHERE source_id = NEW.source_id AND NOT (target_id = NEW.target_id AND relationship = NEW.relationship) UNION ALL SELECT OLD.target_id, OLD.relationship, OLD.metadata WHERE OLD.source_id = NEW.source_id ORDER BY 1, 2))`)}
 END;
 `;
 
@@ -239,11 +209,22 @@ export function newWriteSetId(): string {
 /** A client-supplied write set id is short and plain. */
 export const WRITE_SET_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
 
+const statements = new WeakMap<Database, Map<string, ReturnType<Database["prepare"]>>>();
+/** A prepared statement kept per connection: these run in every Store transaction. */
+function cached(db: Database, sql: string): ReturnType<Database["prepare"]> {
+  let m = statements.get(db);
+  if (!m) statements.set(db, (m = new Map()));
+  let st = m.get(sql);
+  if (!st) m.set(sql, (st = db.prepare(sql)));
+  return st;
+}
+
 /** Sets the context row the triggers read; returns the id used. */
 export function setWriteContext(db: Database, ctx: WriteSetContext): string {
   const id = ctx.id ?? newWriteSetId();
   const via = ctx.via ?? null;
-  db.prepare(
+  cached(
+    db,
     `INSERT INTO write_context (slot, write_set, actor, via, via_kind, why, undoes, keep_before) VALUES (1, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT (slot) DO UPDATE SET write_set = excluded.write_set, actor = excluded.actor, via = excluded.via,
        via_kind = excluded.via_kind, why = excluded.why, undoes = excluded.undoes, keep_before = excluded.keep_before`,
@@ -251,9 +232,18 @@ export function setWriteContext(db: Database, ctx: WriteSetContext): string {
   return id;
 }
 
-/** Clears the context row, so a later write outside any context isn't counted into this set. */
+/**
+ * Ends the context: records the write set itself when it changed a record (once; a set spanning several
+ * transactions keeps its first time), then clears the row so a later write outside any context isn't counted in.
+ */
 export function clearWriteContext(db: Database): void {
-  db.prepare("DELETE FROM write_context WHERE slot = 1").run();
+  cached(
+    db,
+    `INSERT OR IGNORE INTO write_sets (id, at, actor, via, via_kind, why, undoes)
+     SELECT c.write_set, (SELECT MIN(at) FROM record_changes WHERE write_set = c.write_set), c.actor, c.via, c.via_kind, c.why, c.undoes
+     FROM write_context c WHERE c.slot = 1 AND c.write_set IS NOT NULL AND EXISTS (SELECT 1 FROM record_changes WHERE write_set = c.write_set)`,
+  ).run();
+  cached(db, "DELETE FROM write_context WHERE slot = 1").run();
 }
 
 /** The write set the open transaction writes under, if any. */
@@ -353,7 +343,10 @@ export function writeSetRecords(db: Database, id: string): WriteSetRecord[] {
 export function pruneChangeLog(db: Database, days: number, now = new Date()): { changes: number; sets: number } {
   if (!changeLogPresent(db)) return { changes: 0, sets: 0 };
   const cutoff = new Date(now.getTime() - days * 86_400_000).toISOString();
-  const changes = db.prepare("DELETE FROM record_changes WHERE at < ?").run(cutoff).changes;
+  // seq follows time (one writer at a time), so the rows past the horizon are a prefix of seq: found from the newest
+  // end, with no index on at.
+  const last = db.prepare("SELECT seq FROM record_changes WHERE at < ? ORDER BY seq DESC LIMIT 1").get(cutoff) as { seq: number } | null;
+  const changes = last ? db.prepare("DELETE FROM record_changes WHERE seq <= ?").run(last.seq).changes : 0;
   const sets = db.prepare("DELETE FROM write_sets WHERE at < ? AND NOT EXISTS (SELECT 1 FROM record_changes rc WHERE rc.write_set = write_sets.id)").run(cutoff).changes;
   return { changes, sets };
 }
