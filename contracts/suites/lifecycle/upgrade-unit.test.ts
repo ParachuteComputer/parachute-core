@@ -88,8 +88,14 @@ beforeAll(async () => {
     join(m.unitDir, UNIT),
     `[Unit]\nDescription=Parachute (a made-up unit for the contracts)\n\n[Service]\nExecStart=${join(prefix, "bin", "parachute-core")} serve\n${Object.entries(env).map(([k, v]) => `Environment=${k}=${v}\n`).join("")}Restart=on-failure\n\n[Install]\nWantedBy=default.target\n`,
   );
+  // And what a takeover from a supervised 0.7 hub leaves beside it: the old hub's unit file, stopped and disabled.
+  // The hub's own `restart` knows only this name, and would start that old hub on the home core serves.
+  writeFileSync(join(m.unitDir, "parachute-hub.service"), `[Unit]\nDescription=The 0.7 hub (a made-up leftover)\n\n[Service]\nExecStart=%h/.bun/bin/parachute serve\n\n[Install]\nWantedBy=default.target\n`);
   const made = await m.run([prevVaultBin, "create", vault, "--no-mirror", "--json"], { env: { ...base, EMBEDDINGS_ENABLED: "false" } });
   must(made.code === 0, `setup: 0.8 parachute-vault create exited ${made.code}: ${made.stderr.slice(-600)}`);
+  // The home says so too, as a takeover leaves it (its record; without it a hub unit naming this home means the old
+  // programs still own it, and serve refuses).
+  writeFileSync(join(m.home, "takeover.json"), `${JSON.stringify({ state: "taken-over", version: v08, at: new Date().toISOString(), paused: [{ name: "parachute-hub.service", enabled: true, active: true }] }, null, 2)}\n`);
   await m.expose(port);
   const unit = await unitUp("0.8 through the unit");
   try {
@@ -110,12 +116,37 @@ afterAll(async () => {
 });
 
 describe("lifecycle/upgrade through the service unit", () => {
-  test("0.9 installed beside 0.8: the unit's next start runs it, backs up first, and records the exact version before", async () => {
+  test("0.9 installed beside 0.8 while 0.8 serves: `parachute restart` is the unit's, and its next start runs 0.9, backs up first, and records the exact version before", async () => {
+    // As it goes on a live box: 0.8 serves through the unit while 0.9 is installed beside it.
+    const old = await unitUp("0.8 through the unit");
+    expect(old.runs().startsWith(`${v08}-`)).toBe(true);
     const r = await m.run([join(info.dir, "bin", "parachute"), "install", "--prefix", prefix], { env: base });
     must(r.code === 0, `0.9's install exited ${r.code}: ${r.stderr.slice(-600)}`);
     expect(link()).toBe(`../${v09}/bin/parachute-core`);
     expect(existsSync(binOf(v08))).toBe(true); // the copy to go back to is kept
-    const unit = await unitUp("0.9 through the unit");
+    // `parachute` is 0.9 now, and 0.8 still serves. No step is taken under it, and an old name refused there is not
+    // counted in the home either.
+    expect((await linked(["auth", "list-users"])).code).toBe(7);
+    expect(existsSync(join(m.home, "run"))).toBe(false);
+    expect(backups()).toEqual([]);
+    // The service is core's own unit, so `restart` is that unit's (the hub's restart knows only a hub unit, and on
+    // such a box said none was installed): through the service manager, opening nothing itself.
+    const calls = m.systemctlCalls().length;
+    const restarted = await linked(["restart"]);
+    must(restarted.code === 0, `parachute restart exited ${restarted.code}: ${restarted.stderr.slice(-600)} ${restarted.stdout.slice(-300)}`);
+    expect(m.systemctlCalls().slice(calls).join("\n")).toContain(`restart ${UNIT}`);
+    // With a flag riding along it is still the whole service's, and still core's unit.
+    const flagged = await linked(["start", "--hub-origin", origin]);
+    expect(flagged.code).toBe(0);
+    expect(m.systemctlCalls().slice(calls).join("\n")).toContain(`start ${UNIT}`);
+    // The 0.7 cutover, asked for by name, would rewrite the leftover to run the hub alone, stop what holds the port
+    // (core) and start it: refused in this program, before anything.
+    const leftover = readFileSync(join(m.unitDir, "parachute-hub.service"), "utf8");
+    const cutover = await linked(["migrate", "--to-supervised"]);
+    expect(cutover.code).toBe(2);
+    expect(readFileSync(join(m.unitDir, "parachute-hub.service"), "utf8")).toBe(leftover);
+    expect(m.systemctlCalls().join("\n")).not.toMatch(/(start|restart|enable) parachute-hub/); // the leftover stays paused
+    const unit = { ...(await serving(m, { vaultName: vault, origin }, UNIT)), runs: old.runs };
     try {
       expect(unit.runs().startsWith(`${v09}-`)).toBe(true);
       expect(release()).toMatchObject({ version: v09, previous: v08, state: "current" }); // not just "0.8"

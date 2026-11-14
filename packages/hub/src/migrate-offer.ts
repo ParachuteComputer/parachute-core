@@ -36,6 +36,7 @@ import { HUB_SVC } from "./hub-control.ts";
 import { type HubUnitDeps, defaultHubUnitDeps, isHubUnitInstalled } from "./hub-unit.ts";
 import { readPid } from "./process-state.ts";
 import { shortNameForManifest } from "./service-spec.ts";
+import { coreRoot } from "./core-host.ts";
 import { readManifestLenient } from "./services-manifest.ts";
 
 /**
@@ -156,6 +157,10 @@ export async function offerMigrateToSupervised(
   const prompt = opts.prompt ?? defaultOfferPrompt;
   const isTty = opts.isTty ?? Boolean(process.stdin.isTTY);
 
+  // Inside @openparachute/core there is nothing to offer: the cutover writes a unit that runs this hub's own
+  // serve, which skips what core's serve does first (the release step and its backup, the refusal of a rolled-back
+  // home). Core's boxes are served by core's unit (the takeover's parachute-core.service) or by `parachute init`.
+  if (coreRoot()) return { outcome: "no-offer" };
   // (a) no hub unit installed — only offer on the detached box.
   if (unitInstalledFn(hubUnitDeps)) return { outcome: "no-offer" };
   // (b) prior-detached evidence — don't pester a clean box.

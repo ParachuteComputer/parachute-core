@@ -52,6 +52,8 @@ import {
   launchdPlistPathForLabel,
   systemdUnitPathForName,
 } from "./managed-unit.ts";
+import { readFileSync } from "node:fs";
+import { coreRoot, unitStartsCore } from "./core-host.ts";
 import { type PortListeningFn, defaultPortListening } from "./port-probe.ts";
 import { enrichedUnitPath } from "./spawn-path.ts";
 
@@ -214,9 +216,23 @@ export function isHubUnitInstalled(deps: HubUnitDeps): boolean {
   }
   if (deps.platform === "linux") {
     const root = (deps.getuid() ?? 1000) === 0;
-    return deps.exists(systemdUnitPathForName(HUB_SYSTEMD_UNIT_NAME, home, root));
+    const path = systemdUnitPathForName(HUB_SYSTEMD_UNIT_NAME, home, root);
+    if (!deps.exists(path)) return false;
+    // Inside core, a hub unit that starts the 0.7 hub is not installed as far as any verb here goes: it is the
+    // takeover's paused leftover, and starting or restarting it would put the old hub on a home core serves.
+    if (coreRoot() && !hubUnitStartsCore(path)) return false;
+    return true;
   }
   return false;
+}
+
+/** Whether the hub unit file at `path` starts core (core-host.ts unitStartsCore); unreadable counts as not. */
+function hubUnitStartsCore(path: string): boolean {
+  try {
+    return unitStartsCore(readFileSync(path, "utf8"));
+  } catch {
+    return false;
+  }
 }
 
 /**

@@ -703,7 +703,7 @@ export async function upgradeCore(home: string, ask: { channel?: string; json: b
       out.units_fixed = fixed.units_fixed;
       say(unitNote);
     }
-    say(`Parachute ${pick.version} is installed${kind.how === "bundle" ? `; ${core.version} is kept beside it` : ""}. What is running now is still ${core.version}: restart Parachute (\`parachute restart\`, or its unit) to run ${pick.version}.`);
+    say(`Parachute ${pick.version} is installed${kind.how === "bundle" ? `; ${core.version} is kept beside it` : ""}. What is running now is still ${core.version}: restart Parachute to run ${pick.version}: \`parachute restart\` where a unit serves this home, else stop its \`parachute serve\` and start it again.`);
     say(`Its first start backs every database up before it opens one. \`parachute upgrade --check\` with ${pick.version} tries that on a copy first.`);
     return done(EXIT.ok);
   } catch (caught) {

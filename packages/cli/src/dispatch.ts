@@ -240,6 +240,13 @@ export async function dispatch(role: Role, notice?: Notice): Promise<void> {
     const stop = newerCheck();
     if (stop !== null) process.exit(stop);
   }
+  // The 0.7 cutover is not for core: it writes a unit that runs the hub's own serve (no release step, no backup, no
+  // refusal of a rolled-back home), stops whatever holds the hub's port (core, when it is serving) and starts that
+  // unit. Inside core the hub makes no such offer (migrate-offer.ts); asked for by name, it is refused here, first.
+  if ("cli" in r && r.cli === "hub" && r.argv[0] === "migrate" && r.argv.includes("--to-supervised")) {
+    console.error("parachute migrate --to-supervised: not in this program. It was the 0.7 hub's move to a supervised unit, and its unit runs the hub alone. This home is served by `parachute serve`: under core's own unit after a takeover (`systemctl --user status parachute-core`), or the unit `parachute init` writes. Nothing was changed.");
+    process.exit(2);
+  }
   // A home marked rolled back to another release (or cut off mid-restore) is opened by no command of this one, the
   // host's `serve --embedded` and `bootstrap`, `config` and an old name's usage count included (release.ts
   // homeRefusal). Only `upgrade` (it is the way forward, and the way to finish a restore), `takeover` and help go on.
@@ -251,10 +258,15 @@ export async function dispatch(role: Role, notice?: Notice): Promise<void> {
       process.exit(refused.code);
     }
   }
-  if (notice) {
+  // An old name is said, and counted in the home's usage log, only once the command is going to run: for a command
+  // of the moved CLIs that is after the release step below, so one refused there leaves nothing in the home.
+  const sayNotice = async () => {
+    if (!notice) return;
     const { announce } = await import("./front.ts");
     announce(notice, home);
-  }
+    notice = undefined;
+  };
+  if (!("cli" in r)) await sayNotice();
   if ("frontHelp" in r) {
     const { frontHelp } = await import("./front.ts");
     console.log(frontHelp());
@@ -318,6 +330,12 @@ export async function dispatch(role: Role, notice?: Notice): Promise<void> {
     const { upgradeCore } = await import("./upgrade.ts");
     process.exit(await upgradeCore(home, upgradeAsk, newerCheck));
   }
+  // `stop`, `start` and `restart` of the whole service, where core's own unit serves this home (unit.ts): the
+  // unit's, through systemctl. No database is opened and no step taken here; the unit's serve takes it at its start.
+  if (r.cli === "hub" && ["stop", "start", "restart"].includes(r.argv[0] ?? "") && !["--help", "-h"].includes(r.argv[1] ?? "")) {
+    const { coreUnitServes, coreUnitVerb, wholeService } = await import("./unit.ts");
+    if (wholeService(r.argv.slice(1)) && coreUnitServes(home) && !managedRefusal("hub", r.argv)) process.exit(coreUnitVerb(r.argv[0]!));
+  }
   {
     // The first time this release opens a home an older one served: record the step and back the databases up
     // first (release.ts). Not a host's (embedded) home, nor one the old 0.7 programs still own. A home marked
@@ -335,6 +353,7 @@ export async function dispatch(role: Role, notice?: Notice): Promise<void> {
     const { openCopy } = await import("./upgrade.ts");
     process.exit(await openCopy(home));
   }
+  await sayNotice();
   if (r.cli === "hub" && r.argv[0] === "keys") {
     // `keys` (and its alias `tokens`) is core's (keys.ts): answered here, or mapped onto the hub's auth commands.
     const { keysCommand } = await import("./keys.ts");
