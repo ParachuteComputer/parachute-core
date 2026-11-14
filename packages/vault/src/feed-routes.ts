@@ -6,12 +6,14 @@
  * - `POST /api/feed/position {reader, position}`: commit. `position` is a number up to the newest, `"now"` (skip to the
  *   newest), or `0` (from the start of what the change log keeps).
  *
- * Positions are held per (the caller's `via`, reader): a named key's are its own; callers that share a `via` (hub
- * tokens say `api`) share positions by reader name. Both routes need `read` only: committing moves the caller's own
- * bookmark, never a record.
+ * Positions are held per (owner, reader). The owner is the credential (feedOwner): a named key by its name, any other
+ * credential by its kind and who it acts for, and a tag-scoped one also by its scope, so two credentials never share a
+ * position. Both routes need `read` only: committing moves the caller's own bookmark, never a record.
  *
  * Before either answers, rows written outside any Store transaction (a raw statement, an older engine) are given their
- * positions (placePending), so a page or "now" doesn't stop short of them: a feed read may write that bookkeeping.
+ * positions (placePending), so a page or "now" doesn't stop short of them. So a feed read may write that bookkeeping
+ * (and, through the Store transaction, run the change log's daily sweep), touch the reader's row (at most once a day),
+ * and mark readers unused for longer than the log keeps as expired (sweepReaders, at most once a day per vault).
  *
  * A tag-scoped caller's scope is the one routing expanded for this request (expandTokenTagScope), so a tag put under
  * the scope since the last read brings its records in, as gap 7's rule asks. Its entries carry no `by`, `via` or
@@ -22,17 +24,46 @@ import {
   FEED_LIMIT_MAX,
   FEED_READER_RE,
   feedHorizon,
+  EXPIRED_POSITION,
   getPosition,
   newestPosition,
   placePending,
   positionExpired,
   readFeedPage,
   setPosition,
+  sweepReaders,
+  touchReader,
 } from "../core/src/feed.ts";
+import { resolveHistoryPolicy } from "../core/src/history.ts";
 import { recordsAnswerOut } from "../core/src/rest-records.ts";
 import type { Note, Store } from "../core/src/types.ts";
 import { noteReadAnswer, type TagScopeCtx } from "./routes.ts";
 import { noteWithinTagScope } from "./tag-scope.ts";
+import { readVaultConfig } from "./config.ts";
+
+/**
+ * Whose positions these are. A named key (`via` `key:<name>`) by its name; any other credential (legacy keys, the
+ * operator bearer, a hub token with no key) by its kind and the principal it acts for; and a tag-scoped credential
+ * also by its scope (a hash of its sorted tags), so a scoped and an unscoped credential of one person never share.
+ */
+export function feedOwner(via: string | null, actor: string | null, scopedTags: string[] | null): string {
+  const base = via?.startsWith("key:") ? via : `${via ?? ""}|${actor ?? ""}`;
+  if (!scopedTags || scopedTags.length === 0) return base;
+  const hash = new Bun.CryptoHasher("sha256").update(JSON.stringify([...scopedTags].sort())).digest("hex").slice(0, 16);
+  return `${base}|scope:${hash}`;
+}
+
+const sweptAt = new WeakMap<Store, number>();
+/** Marks long-unused readers expired, at most once a day per open store (the vault's history.change_log_days). */
+function sweepReadersDaily(store: Store, vaultName: string, now = Date.now()): void {
+  if (now - (sweptAt.get(store) ?? 0) < 86_400_000) return;
+  sweptAt.set(store, now);
+  try {
+    sweepReaders(store.db, resolveHistoryPolicy(readVaultConfig(vaultName)?.history).change_log_days, new Date(now));
+  } catch (error) {
+    console.warn("[vault] feed reader sweep failed:", error);
+  }
+}
 
 const json = (body: unknown, status = 200) => Response.json(body, { status });
 const bad = (error: string, error_type: string, field: string, hint?: string) =>
@@ -61,22 +92,25 @@ function positionOf(store: Store, raw: unknown, field: string): number | Respons
 }
 
 function expired(store: Store, reader: string, position: number): Response {
+  const swept = position === EXPIRED_POSITION;
   return json(
     {
-      error: `Position ${position} is older than the change log keeps, so changes after it may be gone. Nothing was read.`,
+      error: swept
+        ? `Reader ${reader} went unused for longer than the change log keeps, so changes after its position may be gone. Nothing was read.`
+        : `Position ${position} is older than the change log keeps, so changes after it may be gone. Nothing was read.`,
       error_type: "feed_position_expired",
       reader,
-      position,
+      position: swept ? null : position,
       horizon: feedHorizon(store.db),
-      hint: 'read the records you need again (GET /api/records), then POST /api/feed/position {"reader": "' + reader + '", "position": "now"}',
+      hint:
+        'first POST /api/feed/position {"reader": "' + reader + '", "position": "now"}, then read the records you need again (GET /api/records), then read the feed: in that order nothing is missed',
     },
     410,
   );
 }
 
-export async function handleFeed(req: Request, store: Store, subpath: string, via: string | null, tagScope: TagScopeCtx): Promise<Response | null> {
+export async function handleFeed(req: Request, store: Store, vaultName: string, subpath: string, owner: string, tagScope: TagScopeCtx): Promise<Response | null> {
   const db = store.db;
-  const owner = via ?? "";
   const url = new URL(req.url);
   const isRead = (subpath === "" || subpath === "/") && req.method === "GET";
   const isCommit = subpath === "/position" && req.method === "POST";
@@ -99,6 +133,7 @@ export async function handleFeed(req: Request, store: Store, subpath: string, vi
     if (position instanceof Response) return position;
     if (positionExpired(db, position)) return expired(store, reader, position);
     setPosition(db, owner, reader, position);
+    sweepReadersDaily(store, vaultName);
     return json({ reader, position });
   }
 
@@ -121,6 +156,8 @@ export async function handleFeed(req: Request, store: Store, subpath: string, vi
   }
   const position = getPosition(db, owner, reader);
   if (positionExpired(db, position)) return expired(store, reader, position);
+  touchReader(db, owner, reader);
+  sweepReadersDaily(store, vaultName); // after the touch: the reader in use is never the one swept
 
   const scoped = tagScope.raw !== null;
   const inScope = scoped ? (tags: string[]) => noteWithinTagScope({ tags } as unknown as Note, tagScope.allowed, tagScope.raw) : null;
@@ -135,7 +172,8 @@ export async function handleFeed(req: Request, store: Store, subpath: string, vi
     const entry: Record<string, unknown> = { seq: c.seq, op: c.op, id: c.id };
     if (c.op === "upsert") {
       const note = await store.getNote(c.id);
-      if (!note) continue; // gone since the page was read: the next page carries its delete
+      // Gone, or out of scope, since the page was read: the next page carries its delete or removed.
+      if (!note || !noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) continue;
       const answer = await noteReadAnswer(store, note, plain, tagScope);
       if (answer instanceof Response) continue;
       entry.record = recordsAnswerOut("GET", JSON.parse(JSON.stringify(answer)));

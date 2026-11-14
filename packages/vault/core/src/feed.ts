@@ -1,15 +1,17 @@
 /**
  * The feed (0.9.4, T-471): the changes after a reader's position, read from the change log (change-log.ts).
  *
- * - **Positions** are the change log's own (`record_changes.position`): the newest touch of a record by a write set,
- *   in log order, given when the writing Store transaction ends (settleChangeLogPositions). A set that touches a record
- *   again moves its row to the end, so a reader that committed past it still hears of the later change.
- *   `first_position` is where the set first touched it; the scope rule below reads it. A row written outside any Store
- *   transaction (a raw statement, an older engine) has no position until the next one places it; the feed places
- *   pending rows before it reads (placePending), so they aren't hidden until the next write.
- * - **Readers** hold a position per (credential `via`, reader name) in `feed_readers`, the feed's one table. A read
- *   never moves it; a commit does. A key can only name its own positions (they are keyed by the `via` it
- *   authenticates as).
+ * - **Positions** are the change log's own (`record_changes.position`): one row per record per Store transaction
+ *   that changed it, placed once in log order when that transaction ends (settleChangeLogPositions), and never moved.
+ *   A write set that spans several transactions writes a row in each, so a reader that committed between them still
+ *   hears of the later change. Each row's snapshot (`existed`, `before_tags`) is the record as its transaction found
+ *   it: exactly what a reader at the position just before that row saw. A row written outside any Store transaction
+ *   (a raw statement, an older engine) has no position until the next one places it; the feed places pending rows
+ *   before it reads (placePending), so they aren't hidden until the next write.
+ * - **Readers** hold a position per owner and reader name in `feed_readers`, the feed's one table. The owner is the
+ *   credential (feedOwner, in the server: a named key, else the credential kind and who it acts for, plus the tag
+ *   scope of a scoped token), so different credentials never share a position. A read never moves it; a commit does.
+ *   Readers untouched for longer than the log's horizon are swept (sweepReaders).
  * - **The horizon** is `change_log_state.horizon`: the highest position the change log's sweep has dropped, raised in
  *   the same step. A held position below it may have missed changes: the feed answers 410.
  *
@@ -66,29 +68,52 @@ export function placePending(store: Store): void {
   store.transaction(() => settleChangeLogPositions(store.db));
 }
 
-/** A held position that may have missed changes the sweep dropped. 0 means "from the start of what is kept". */
+/** A position a reader holds that is no longer good: swept (unused for longer than the log keeps). */
+export const EXPIRED_POSITION = -1;
+
+/**
+ * A held position that may have missed changes: below the sweep's horizon, or marked expired by sweepReaders. 0 means
+ * "from the start of what the log keeps" and never expires.
+ */
 export function positionExpired(db: Database, position: number): boolean {
-  return position > 0 && position < feedHorizon(db);
+  return position < 0 || (position > 0 && position < feedHorizon(db));
 }
 
-export function getPosition(db: Database, via: string, reader: string): number {
-  const row = db.prepare("SELECT position FROM feed_readers WHERE via = ? AND reader = ?").get(via, reader) as { position: number } | null;
+export function getPosition(db: Database, owner: string, reader: string): number {
+  const row = db.prepare("SELECT position FROM feed_readers WHERE via = ? AND reader = ?").get(owner, reader) as { position: number } | null;
   return row?.position ?? 0;
 }
 
-export function setPosition(db: Database, via: string, reader: string, position: number): void {
+const NOW = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
+
+export function setPosition(db: Database, owner: string, reader: string, position: number): void {
   db.prepare(
-    `INSERT INTO feed_readers (via, reader, position, updated_at) VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    `INSERT INTO feed_readers (via, reader, position, updated_at) VALUES (?, ?, ?, ${NOW})
      ON CONFLICT (via, reader) DO UPDATE SET position = excluded.position, updated_at = excluded.updated_at`,
-  ).run(via, reader, position);
+  ).run(owner, reader, position);
+}
+
+/** A read counts as use: the reader's row is touched, at most once a day, so the sweep leaves a reader in use alone. */
+export function touchReader(db: Database, owner: string, reader: string, now = new Date()): void {
+  const dayAgo = new Date(now.getTime() - 86_400_000).toISOString();
+  db.prepare("UPDATE feed_readers SET updated_at = ? WHERE via = ? AND reader = ? AND updated_at < ? AND position >= 0").run(now.toISOString(), owner, reader, dayAgo);
+}
+
+/**
+ * Marks readers unused (no read, no commit) for longer than the log keeps (`days`) as expired: their next read answers
+ * 410 and they start again with "now". Marked, not deleted: a deleted reader would come back at 0 (the start of what
+ * the log keeps) and silently miss the changes swept in between, where the mark says to resync. It also stops a key
+ * name that is revoked and later reused from picking up the old key's position. Returns the readers marked.
+ */
+export function sweepReaders(db: Database, days: number, now = new Date()): number {
+  const cutoff = new Date(now.getTime() - days * 86_400_000).toISOString();
+  return db.prepare("UPDATE feed_readers SET position = ? WHERE updated_at < ? AND position >= 0").run(EXPIRED_POSITION, cutoff).changes;
 }
 
 /** One change log row, as the feed reads it. */
 export interface FeedRow {
-  /** The row's position (its write set's newest touch of the record). */
+  /** The row's position (placed once, at the end of its transaction). */
   pos: number;
-  /** Where its write set first touched the record (first_position; never moves). */
-  first: number;
   note_id: string;
   write_set: string | null;
   existed: number;
@@ -107,30 +132,23 @@ export type FeedOp = "upsert" | "delete" | "removed";
  * `inScope` is the reader's tag scope (null: unscoped, every record is in it).
  *
  * - *Visible now*: the record exists and its tags are in scope.
- * - *Visible before* (at the reader's position): read from the record's row with the smallest `first` above the
- *   position; that row's `existed` and `before_tags` are the record as it was there. A row whose `first` is at or below
- *   the position is a write set that began before it and touched the record again later: its `before_tags` describe
- *   an older state. Writes outside any write set (write_set NULL: a raw statement, or an engine that runs the
- *   triggers without setting a context) get one row per change, with the tags saved like any other, so they are
- *   judged the same way. When no row says what the record was at the position, or a row has no saved tags (none is
- *   written that way today; kept as the safe answer), the state is unknown, and a scoped reader counts it as not
- *   visible: the feed never names a record it can't show the reader could see. The cost is a missed
- *   `removed` (or `delete`) for a record the reader held, in those rare cases. An unscoped reader sees every record,
- *   so for it "before" is only whether the record existed (unknown counts as existing: a delete of something it may
- *   hold is safe to send).
+ * - *Visible before* (at the reader's position): the record's first row in the page (rows after the position, in
+ *   position order). Its `existed` and `before_tags` are the record as that row's transaction found it, and nothing
+ *   changed the record between the position and that row, so they are the record as the reader saw it. Writes outside
+ *   any write set (write_set NULL) get one row per change with the tags saved, so they are judged the same way. A row
+ *   with no saved tags for a record that existed isn't written today; were one met, a scoped reader would count it as
+ *   not visible (the feed never names a record it can't show the reader could see).
  *
  * Then: visible now → `upsert`; else gone and visible before → `delete`; else still there, visible before →
  * `removed`; else nothing. A record that was never in scope across the page leaves no trace.
+ *
+ * `rows` are the record's rows in the page, in position order.
  */
-export function feedOp(rows: FeedRow[], position: number, now: RecordNow, inScope: ((tags: string[]) => boolean) | null): FeedOp | null {
+export function feedOp(rows: FeedRow[], now: RecordNow, inScope: ((tags: string[]) => boolean) | null): FeedOp | null {
   if (now !== null && (inScope === null || inScope(now.tags))) return "upsert";
-  let before: FeedRow | null = null;
-  for (const r of rows) if (r.first > position && (before === null || r.first < before.first)) before = r;
-  let visibleBefore: boolean;
-  if (inScope === null) visibleBefore = before === null ? true : before.existed === 1;
-  else if (before === null || before.existed !== 1 || before.before_tags === null) visibleBefore = false;
-  else visibleBefore = inScope(parseTags(before.before_tags));
-  if (!visibleBefore) return null;
+  const before = rows[0];
+  if (!before || before.existed !== 1) return null;
+  if (inScope !== null && (before.before_tags === null || !inScope(parseTags(before.before_tags)))) return null;
   return now === null ? "delete" : "removed";
 }
 
@@ -175,7 +193,7 @@ export function readFeedPage(
 ): FeedPage {
   const rows = db
     .prepare(
-      `SELECT position AS pos, first_position AS first, note_id, write_set, existed, before_tags, at FROM record_changes
+      `SELECT position AS pos, note_id, write_set, existed, before_tags, at FROM record_changes
        WHERE position > ? ORDER BY position LIMIT ?`,
     )
     .all(position, limit + 1) as FeedRow[];
@@ -193,7 +211,7 @@ export function readFeedPage(
   const changes: FeedChange[] = [];
   for (const [id, list] of byNote) {
     const now: RecordNow = exists.get(id) ? { tags: (tagsOf.all(id) as { tag_name: string }[]).map((t) => t.tag_name) } : null;
-    const op = feedOp(list, position, now, inScope);
+    const op = feedOp(list, now, inScope);
     if (op === null) continue;
     const newest = list[list.length - 1]!;
     const set = newest.write_set ? (setOf.get(newest.write_set) as { actor: string | null; via: string | null } | null) : null;

@@ -17,44 +17,41 @@ function fresh(db = new Database(":memory:")) {
   store.writeSetSource = () => ctx;
   return { db, store, as: (c: typeof ctx) => (ctx = c) };
 }
-const row = (over: Partial<FeedRow>): FeedRow => ({ pos: 1, first: 1, note_id: "n", write_set: "ws_x", existed: 1, before_tags: '["in"]', at: "", ...over });
+const row = (over: Partial<FeedRow>): FeedRow => ({ pos: 1, note_id: "n", write_set: "ws_x", existed: 1, before_tags: '["in"]', at: "", ...over });
 const inScope = (tags: string[]) => tags.includes("in");
 
 describe("feed: which change a reader is told", () => {
   test("unscoped: there now is an upsert; gone is a delete unless it was made in the page", () => {
-    expect(feedOp([row({ existed: 0 })], 0, { tags: [] }, null)).toBe("upsert");
-    expect(feedOp([row({})], 0, null, null)).toBe("delete");
-    expect(feedOp([row({ existed: 0, first: 5 }), row({ first: 6 })], 4, null, null)).toBe(null);
+    expect(feedOp([row({ existed: 0 })], { tags: [] }, null)).toBe("upsert");
+    expect(feedOp([row({})], null, null)).toBe("delete");
+    expect(feedOp([row({ existed: 0, pos: 5 }), row({ pos: 6 })], null, null)).toBe(null);
   });
 
   test("scoped: in scope now is an upsert; moved out is removed; gone from scope is a delete; never in scope is nothing", () => {
-    expect(feedOp([row({ before_tags: '["out"]' })], 0, { tags: ["in"] }, inScope)).toBe("upsert");
-    expect(feedOp([row({})], 0, { tags: ["out"] }, inScope)).toBe("removed");
-    expect(feedOp([row({})], 0, null, inScope)).toBe("delete");
-    expect(feedOp([row({ before_tags: '["out"]' })], 0, null, inScope)).toBe(null);
-    expect(feedOp([row({ before_tags: '["out"]' })], 0, { tags: ["out"] }, inScope)).toBe(null);
-    expect(feedOp([row({ existed: 0, before_tags: null })], 0, { tags: ["out"] }, inScope)).toBe(null);
+    expect(feedOp([row({ before_tags: '["out"]' })], { tags: ["in"] }, inScope)).toBe("upsert");
+    expect(feedOp([row({})], { tags: ["out"] }, inScope)).toBe("removed");
+    expect(feedOp([row({})], null, inScope)).toBe("delete");
+    expect(feedOp([row({ before_tags: '["out"]' })], null, inScope)).toBe(null);
+    expect(feedOp([row({ before_tags: '["out"]' })], { tags: ["out"] }, inScope)).toBe(null);
+    expect(feedOp([row({ existed: 0, before_tags: null })], { tags: ["out"] }, inScope)).toBe(null);
   });
 
-  test("visible before is read from the row first written after the position, not the first in the page", () => {
-    // Set A (first at 5) moved the record out; set B (at 7) wrote it again; A touched it once more and moved to 9.
-    const a = row({ first: 5, pos: 9, before_tags: '["in"]' });
-    const b = row({ first: 7, pos: 7, before_tags: '["out"]' });
-    expect(feedOp([b, a], 4, { tags: ["out"] }, inScope)).toBe("removed"); // at 4 the reader saw it in scope
-    expect(feedOp([b, a], 6, { tags: ["out"] }, inScope)).toBe(null); // at 6 it had already left
+  test("visible before is the first row in the page: what the reader saw at its position", () => {
+    // The record was in scope at the reader's position; a write moved it out; a later one edited it, still out.
+    expect(feedOp([row({ pos: 5, before_tags: '["in"]' }), row({ pos: 7, before_tags: '["out"]' })], { tags: ["out"] }, inScope)).toBe("removed");
+    // Out of scope at the position; brought in, then out again, inside the page: never named.
+    expect(feedOp([row({ pos: 5, before_tags: '["out"]' }), row({ pos: 7, before_tags: '["in"]' })], { tags: ["out"] }, inScope)).toBe(null);
   });
 
-  test("unknown is not visible to a scoped reader: a row with no saved tags, or only rows that began before the position", () => {
-    expect(feedOp([row({ write_set: null, before_tags: null })], 0, { tags: ["out"] }, inScope)).toBe(null);
-    expect(feedOp([row({ write_set: null, before_tags: null })], 0, null, inScope)).toBe(null);
-    expect(feedOp([row({ first: 3, pos: 8 })], 5, { tags: ["out"] }, inScope)).toBe(null);
-    // An unscoped reader is told of the delete either way.
-    expect(feedOp([row({ write_set: null, before_tags: null })], 0, null, null)).toBe("delete");
+  test("a row with no saved tags for a record that existed is not visible to a scoped reader (none is written today)", () => {
+    expect(feedOp([row({ write_set: null, before_tags: null })], { tags: ["out"] }, inScope)).toBe(null);
+    expect(feedOp([row({ write_set: null, before_tags: null })], null, inScope)).toBe(null);
+    expect(feedOp([row({ write_set: null, before_tags: null })], null, null)).toBe("delete");
   });
 });
 
 describe("feed: positions", () => {
-  test("a set that touches a record again after a reader committed moves it past the reader", async () => {
+  test("a set's later transaction writes its own row after a reader committed past the first", async () => {
     const { db, store, as } = fresh();
     as({ id: "ws_long00001", via: "key:a" });
     const n = await store.createNote("v1", { path: "n" });
@@ -68,8 +65,8 @@ describe("feed: positions", () => {
     await store.updateNote(n.id, { content: "v2" });
     const next = readFeedPage(db, committed, 100, null);
     expect(next.changes.map((c) => [c.id, c.op, c.write_set])).toEqual([[n.id, "upsert", "ws_long00001"]]);
-    // Where the set first touched it didn't move (the scope rule reads first_position).
-    expect((db.prepare("SELECT first_position AS f FROM record_changes WHERE write_set = 'ws_long00001'").get() as { f: number }).f).toBeLessThan(committed);
+    // The first row stayed where it was placed.
+    expect((db.prepare("SELECT MIN(position) AS f FROM record_changes WHERE write_set = 'ws_long00001'").get() as { f: number }).f).toBeLessThan(committed);
     // Positions stay unique.
     const all = db.prepare("SELECT position FROM record_changes").all() as { position: number }[];
     expect(new Set(all.map((r) => r.position)).size).toBe(all.length);

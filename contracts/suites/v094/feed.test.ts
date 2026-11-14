@@ -51,12 +51,12 @@ async function create(path: string, content: string, tags: string[] = []): Promi
   must(r.status === 201, `create ${path}: ${r.status} ${r.text.slice(0, 300)}`);
   return r.body.id as string;
 }
-async function edit(id: string, body: Record<string, unknown>): Promise<void> {
-  const r = await writer.api("PATCH", `/notes/${enc(id)}`, { ...body, force: true });
+async function edit(id: string, body: Record<string, unknown>, headers: Record<string, string> = {}): Promise<void> {
+  const r = await writer.api("PATCH", `/notes/${enc(id)}`, { ...body, force: true }, headers);
   must(r.status === 200, `edit ${id}: ${r.status} ${r.text.slice(0, 300)}`);
 }
-async function remove(id: string): Promise<void> {
-  const r = await writer.api("DELETE", `/notes/${enc(id)}`);
+async function remove(id: string, headers: Record<string, string> = {}): Promise<void> {
+  const r = await writer.api("DELETE", `/notes/${enc(id)}`, undefined, headers);
   must(r.status === 200, `delete ${id}: ${r.status} ${r.text.slice(0, 300)}`);
 }
 /** The page's entries about these records, in page order. */
@@ -240,6 +240,75 @@ describe("v094/feed: a tag-scoped reader sees its scope and nothing else", () =>
     await edit(brought, { content: "now under the scope" });
     const after = await feed(scoped, name);
     expect(about(after, [brought]).map((c) => [c.op, c.record?.body])).toEqual([["upsert", "now under the scope"]]);
+  });
+});
+
+describe("v094/feed: a write set that spans several requests, read by a tag-scoped reader", () => {
+  // A client groups several requests into one write set with Parachute-Write-Set. Each request's writes are placed
+  // in the log when they commit, so a reader that committed between two of them still hears of the later ones.
+  const setHeader = () => ({ "Parachute-Write-Set": `feedset-${shortId()}${shortId()}` });
+  const ops = (changes: any[], id: string) => changes.filter((c) => c.id === id).map((c) => c.op);
+
+  test("a commit between two requests of one set: the later delete and move out still arrive", async () => {
+    const t = `fw${shortId()}`;
+    const mine = `${t}mine`;
+    const scoped = asKey(await pass({ level: "read", tags: [mine] }));
+    const name = readerName("spans");
+    const r1 = await create(`${t}/r1`, "one", [mine]);
+    const r2 = await create(`${t}/r2`, "two", [mine]);
+    await commit(scoped, name, "now");
+    const h = setHeader();
+    await edit(r1, { content: "one, edited" }, h);
+    await edit(r2, { content: "two, edited" }, h);
+    const first = await feed(scoped, name);
+    expect(about(first, [r1, r2]).map((c) => [c.id, c.op])).toEqual([[r1, "upsert"], [r2, "upsert"]]);
+    await commit(scoped, name, first.body.next_position);
+    await remove(r1, h);
+    await edit(r2, { tags: { add: [`${t}else`], remove: [mine] } }, h);
+    const second = await feed(scoped, name);
+    expect(about(second, [r1, r2]).map((c) => [c.id, c.op])).toEqual([[r1, "delete"], [r2, "removed"]]);
+  });
+
+  test("paging by one ends where one page of 500 does", async () => {
+    const t = `fw${shortId()}`;
+    const mine = `${t}mine`;
+    const scoped = asKey(await pass({ level: "read", tags: [mine] }));
+    const [big, small] = [readerName("big"), readerName("small")];
+    const r = await create(`${t}/r`, "in scope", [mine]);
+    const p = await commit(scoped, big, "now");
+    await commit(scoped, small, p);
+    const h = setHeader();
+    await edit(r, { tags: { add: [`${t}else`], remove: [mine] } }, h); // the set moves it out
+    await edit(r, { content: "edited by another write" }); // another set, still out
+    await edit(r, { content: "edited by the first set again" }, h); // the set again
+    const whole = ops((await feed(scoped, big)).body.changes, r);
+    expect(whole).toEqual(["removed"]);
+    const paged: string[] = [];
+    let page = await feed(scoped, small, "&limit=1");
+    for (let i = 0; i < 50; i++) {
+      paged.push(...ops(page.body.changes, r));
+      if (!page.body.more) break;
+      page = await feed(scoped, small, `&limit=1&ack=${page.body.next_position}`);
+    }
+    // A page of one may say the same thing more than once (each transaction of a request is its own row); what the
+    // reader ends up knowing must be the same.
+    expect(paged.length).toBeGreaterThan(0);
+    expect(paged.at(-1)).toBe(whole.at(-1));
+  });
+
+  test("a record out of scope at the reader's position, in scope only in between, leaves no id", async () => {
+    const t = `fw${shortId()}`;
+    const mine = `${t}mine`;
+    const scoped = asKey(await pass({ level: "read", tags: [mine] }));
+    const name = readerName("between");
+    const r = await create(`${t}/r`, "out of scope", [`${t}else`]);
+    const h = setHeader();
+    await edit(r, { content: "the set's first edit" }, h);
+    await commit(scoped, name, "now");
+    await edit(r, { tags: { add: [mine] } }, h); // the set brings it in
+    await edit(r, { tags: { remove: [mine] } }); // another write takes it out
+    const page = await feed(scoped, name);
+    must(!page.text.includes(r), `the feed named a record that was out of scope at the reader's position: ${page.text.slice(0, 400)}`);
   });
 });
 

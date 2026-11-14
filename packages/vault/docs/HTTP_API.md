@@ -1672,11 +1672,12 @@ and `delete-record` (and their note-named aliases); a longer one is 400 `invalid
 
 The changes after a reader's position, read from the change log above. The server holds the position, so a client
 keeps no cursor of its own; a read never moves it, so a reader that stops before committing reads the same page
-again (each change at least once, none skipped). A position is the change log's: when a write set changes a record
-again (a later request sending the same `Parachute-Write-Set`), the record moves to the newest position, so a
-reader that already committed past it still hears of the change. Rows written outside the server (a raw SQL
-statement, an older engine) get their positions at the next write, or when a feed request finds them first: a feed
-read may write that bookkeeping.
+again (each change at least once, none skipped). A position is the change log's: each transaction that changes a
+record writes its own row, placed once at the end of the log when it commits, so a write set that spans several
+requests (one `Parachute-Write-Set`) is heard in full even by a reader that committed between them. Rows written
+outside the server (a raw SQL statement, an older engine) get their positions at the next write, or when a feed
+request finds them first. So a feed read may write: that bookkeeping (which can also run the change log's daily
+sweep), a touch of the reader's row (at most once a day), and the day's sweep of unused readers.
 
 - `GET /vault/{name}/api/feed?reader=<name>&limit=100&ack=<position>` (`vault:read`):
   `{changes: [...], position, next_position, more}`. `reader` is 1 to 64 of `A-Z a-z 0-9 _ -` (default `default`);
@@ -1684,29 +1685,38 @@ read may write that bookkeeping.
   `ack` commits first, then reads, in one trip). Commit `next_position` once the page is handled; `more` says there
   is more to read now. A fresh reader holds `0`.
 - `POST /vault/{name}/api/feed/position {reader, position}` (`vault:read`: it moves your own bookmark, never a
-  record): `position` is a number at most the newest (400 `invalid_position` otherwise), `"now"` (skip to the newest:
-  how a new reader starts from here), or `0` (from the start of what the log keeps). Answers `{reader, position}`.
+  record): `position` is a number at most the newest (400 `invalid_position` otherwise), `"now"` (skip to the
+  newest), or `0`. Answers `{reader, position}`.
+- **Starting.** Position `0` is the start of what the log keeps (`history.change_log_days`, and nothing from before
+  the vault ran 0.9.4), not the whole vault. To start a reader with a full copy: commit `"now"` first, then read the
+  records (`GET /api/records`), then read the feed. In that order nothing is missed; a change made while you read the
+  records arrives again in the feed.
 - Each change: `{seq, op, id, record, write_set, by, via, at}`. `seq` is its position. `op` is `upsert` (the record
   exists and you can see it; `record` is what `GET /api/records/<id>` answers, in record words), `delete` (it is
   gone; no `record`), or `removed` (it still exists but has left a tag-scoped key's scope: `{seq, op, id}` and nothing
-  else). A record appears **once per page, at its newest change**, and changes are in `seq` order.
-- **Positions are per key and reader.** They are held per (the credential's `via`, reader name): a named key's
-  (`key:<name>`) are its own and no other key can read or move them. Credentials that share a `via` share positions by
-  reader name: hub-minted tokens are all `api`, so give each such reader its own name.
+  else). A record appears **once per page, at its newest change**, and changes are in `seq` order. A smaller page
+  may repeat what a larger one says once (a `removed` per transaction that wrote the record); the reader ends in the
+  same state.
+- **Positions belong to one credential.** They are held per (owner, reader name). The owner is a named key
+  (`key:<name>`) for a key; for any other credential (a legacy YAML key, the operator bearer, a hub token without a
+  key) it is the credential's kind and the principal it acts for; a tag-scoped credential's owner also includes its
+  scope. So no two credentials share a position, and none can read or move another's.
+- **Unused readers.** A reader neither read nor committed for longer than the log keeps is marked expired: its next
+  read answers 410 (below), and committing `"now"` starts it again. It is marked, not removed, so it never silently
+  starts over at `0`; a key name that is revoked and later reused doesn't inherit the old key's position either.
 - **A tag-scoped key** sees only records in its scope, read as the scope is now (a tag put under it later brings its
   records in, as on a live subscription). A record that was in scope at your position and has since left it comes as
-  `removed`; one that was in scope and was deleted comes as `delete`; a record that was never in scope across the page
-  leaves no trace (no id, no count). `next_position` and `more` depend only on the log, never on the scope, so an
-  empty page moves on exactly as a scope-blind reader's would. Its changes carry no `by`, `via` or `write_set`, as its
-  versions don't. Whether a record was in scope at your position is read from the tags the change log saved before
-  the first write after it (a write made outside any write set saves them too). In the rare case where one write set
-  began before your position and touched the record again after it, the feed can't say, and counts the record as not
-  seen: it may then miss a `removed` or `delete` for
-  it, rather than ever name a record you may not have been able to see. A scope change made in the tag hierarchy
-  alone (re-parenting a tag) changes no record, so it sends nothing until those records change.
-- **The horizon.** The log keeps `history.change_log_days` (default 30). A held position older than what was swept
-  answers **410 `feed_position_expired`** (`{reader, position, horizon, hint}`): read the records you need again
-  (`GET /api/records`), then `POST /api/feed/position {"reader": ..., "position": "now"}`.
+  `removed`; one that was in scope and was deleted comes as `delete`; a record that was not in scope at your
+  position and isn't now leaves no trace (no id, no count), even if it was in scope in between. `next_position` and
+  `more` depend only on the log, never on the scope, so an empty page moves on exactly as a scope-blind reader's
+  would. Its changes carry no `by`, `via` or `write_set`, as its versions don't. Whether a record was in scope at
+  your position is read from the tags its first row after your position saved: the record as that write found it
+  (writes outside any write set save them too). A scope change made in the tag hierarchy alone (re-parenting a tag)
+  changes no record, so it sends nothing until those records change.
+- **The horizon.** The log keeps `history.change_log_days` (default 30). A held position older than what was swept,
+  or a reader marked expired, answers **410 `feed_position_expired`** (`{reader, position, horizon, hint}`;
+  `position` is null for an expired reader): commit `"now"` first, then read the records you need again, then read
+  the feed.
 - **What it replaces:** for a reader that wants changes, the feed replaces polling `GET /api/records?cursor=` or
   `since=` and re-reading every record to find what moved. Those stay as they are: the cursor for paging a query, and
   the WebSocket subscription for a live push.

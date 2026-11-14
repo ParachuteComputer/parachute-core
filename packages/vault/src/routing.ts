@@ -54,7 +54,7 @@
 
 import { sayWriter, withRequestScope } from "./write-set-edge.ts";
 import { handleWriteSets } from "./write-sets-routes.ts";
-import { handleFeed } from "./feed-routes.ts";
+import { feedOwner, handleFeed } from "./feed-routes.ts";
 import { countName, restRouteName, typesRouteName } from "./name-usage.ts";
 import { recordsRoute } from "../core/src/rest-records.ts";
 import { handleRecordsRest } from "./records-rest.ts";
@@ -1379,7 +1379,7 @@ async function routeRequest(
   }
   // The feed (0.9.4): the changes after a reader's position, held per (via, reader).
   if (apiPath === "/feed" || apiPath.startsWith("/feed/")) {
-    const res = await handleFeed(req, store, apiPath.slice("/feed".length), writeCtx.via ?? null, tagScope);
+    const res = await handleFeed(req, store, vaultName, apiPath.slice("/feed".length), feedOwner(auth.via ?? null, auth.actor ?? null, auth.scoped_tags), tagScope);
     if (res) return res;
   }
   // Live-query SSE transport REMOVED (WS-hibernation migration Phase 5). The
