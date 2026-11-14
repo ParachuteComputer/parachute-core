@@ -2501,7 +2501,7 @@ export function semanticSearchNotes(
   // uses). A note absent from this map has no fresh vector yet — pending.
   // `+model` keeps SQLite on the primary key (note_id, chunk_ix): bare `model = ?` lets it pick
   // idx_note_vectors_stale (model, content_hash), which walks EVERY vector of the model once per batch, so a
-  // question read N × N/87 rows (1.1 M at 10,000 notes on Cloud). Guarded by row-costs.test.ts (T-463).
+  // question read N × N/90 rows (1.1 M at 10,000 notes on Cloud). Guarded by row-costs.test.ts (T-463).
   const vecRowsByNote = new Map<string, { chunk_ix: number; vector: Uint8Array }[]>();
   for (const idChunk of chunkForInClause(candidateIds)) {
     const placeholders = idChunk.map(() => "?").join(", ");

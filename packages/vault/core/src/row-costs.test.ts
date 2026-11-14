@@ -390,7 +390,7 @@ describe("a tag filter beside an indexed equality", () => {
 // T-463: a meaning search reads each candidate's vectors once, so its cost grows with the vault, not its square.
 //
 // `semanticSearchNotes` reads the candidates' vectors in batches of ids (`model = ? AND note_id IN (…)`). SQLite chose
-// idx_note_vectors_stale (model, content_hash) for that, so every batch walked every vector of the model: N × N/87 rows
+// idx_note_vectors_stale (model, content_hash) for that, so every batch walked every vector of the model: N × N/90 rows
 // a question. On Cloud that was 46,000 billed rows a question at 2,000 notes and 1.1 million at 10,000 (about 3 s);
 // a box pays the same in time. Auto hybrid (0.9.3) sends every question-shaped search through this read.
 //
