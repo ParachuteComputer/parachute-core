@@ -36,6 +36,8 @@ test("P4/P5 GC removes orphan deltas, protects bases, and drains two waves", asy
   const first = db.prepare("SELECT v.version_ix,b.hash,b.delta_of FROM note_versions v JOIN note_blobs b ON b.hash=v.content_hash WHERE b.encoding='fossil-delta' ORDER BY v.version_ix LIMIT 1").get() as any;
   expect(() => db.prepare("DELETE FROM note_blobs WHERE hash=?").run(first.delta_of)).toThrow("FOREIGN KEY");
   db.prepare("DELETE FROM note_versions WHERE note_id=? AND version_ix=?").run(n.id, first.version_ix);
+  // The change log (0.9.4) holds the seed's "before" bodies until its horizon; this test is about versions.
+  db.exec("DELETE FROM record_changes");
   h.gcBlobs(db);
   expect(db.prepare("SELECT hash FROM note_blobs WHERE hash=?").get(first.hash)).toBeNull();
   expect(db.prepare("SELECT hash FROM note_blobs WHERE hash=?").get(first.delta_of)).not.toBeNull();
