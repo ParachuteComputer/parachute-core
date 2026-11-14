@@ -4,12 +4,16 @@
  * - `GET /api/write-sets?by=me|<key name>&limit=&before=`: newest first. A key that isn't admin sees its own sets
  *   only (`by` defaults to `me`); admin sees any, and every key's when `by` is left out.
  * - `GET /api/write-sets/<id>`: one set and its records (`id`, `op`, `path`).
+ * - `POST /api/write-sets/<id>/undo`: undo it (handleUndo).
  *
  * A tag-scoped key sees a set only when it can see every record in it: a record that still exists by its tags now,
  * a deleted one by the tags it had. Anything else answers as if the set weren't there.
  */
 import type { Database } from "bun:sqlite";
-import { getWriteSet, listWriteSets, setRecordStates, writeSetRecords, type WriteSetRow } from "../core/src/change-log.ts";
+import { getWriteSet, listWriteSets, newWriteSetId, setRecordStates, normaliseWhy, writeSetRecords, type WriteSetRow } from "../core/src/change-log.ts";
+import { undoWriteSet, UndoRefusal, type UndoConflict } from "../core/src/undo.ts";
+import type { Store } from "../core/src/types.ts";
+import { WHY_HEADER, withWriteSet } from "./write-set-edge.ts";
 import type { Note } from "../core/src/types.ts";
 import { noteWithinTagScope } from "./tag-scope.ts";
 import type { TagScopeCtx } from "./routes.ts";
@@ -108,4 +112,60 @@ export function handleWriteSets(req: Request, db: Database, subpath: string, aut
     .filter((r) => !(r.op === "delete" && r.existed === 0))
     .map((r) => ({ id: r.note_id, op: r.op, path: recordPath(db, r.note_id, r.before_row) }));
   return json({ ...project(db, set), records });
+}
+
+/**
+ * `POST /api/write-sets/<id>/undo {force?, why?}` (0.9.4): undo one set, as a write set of its own. Own sets only,
+ * or admin; a tag-scoped key only a set it can see whole (else 404, as GET answers).
+ */
+export async function handleUndo(
+  req: Request,
+  store: Store,
+  id: string,
+  auth: WriteSetsAuth & { actor: string | null },
+  tagScope: TagScopeCtx,
+): Promise<Response> {
+  const db = store.db;
+  const set = getWriteSet(db, id);
+  if (!set || !setOwnedOrAdmin(set, auth) || !setVisible(db, id, tagScope)) {
+    return json({ error: `No write set ${id} that this key may undo (or it is older than the change log keeps).`, error_type: "not_found" }, 404);
+  }
+  let body: Record<string, unknown> = {};
+  const text = await req.text();
+  if (text.trim()) {
+    try {
+      const parsed = JSON.parse(text);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
+      body = parsed as Record<string, unknown>;
+    } catch {
+      return json({ error: "The body is a JSON object: {force?, why?}.", error_type: "invalid_request" }, 400);
+    }
+  }
+  for (const k of Object.keys(body)) {
+    if (k !== "force" && k !== "why") return json({ error: `undo takes force and why, not ${k}.`, error_type: "unknown_parameter", field: k }, 400);
+  }
+  if (body.force !== undefined && typeof body.force !== "boolean") return json({ error: "force is true or false.", error_type: "invalid_request", field: "force" }, 400);
+  let why: string | null;
+  try {
+    why = normaliseWhy(body.why) ?? normaliseWhy(req.headers.get(WHY_HEADER));
+  } catch (e) {
+    return json({ error: (e as Error).message, error_type: "invalid_why", field: "why" }, 400);
+  }
+  const undoId = newWriteSetId();
+  try {
+    const result = await withWriteSet(store, { id: undoId, actor: auth.actor, via: auth.via, why, undoes: id }, () =>
+      undoWriteSet(store, id, { force: body.force === true, actor: auth.actor, via: auth.via }),
+    );
+    return json({ write_set: undoId, ...result });
+  } catch (e) {
+    if (e instanceof UndoRefusal) {
+      // A scoped caller never learns about records outside its scope through a conflict (it can see the whole set,
+      // but a later write's key is provenance, which scoped reads don't show).
+      const extra = tagScope.raw !== null && Array.isArray(e.extra.conflicts)
+        ? { conflicts: (e.extra.conflicts as UndoConflict[]).map((c) => ({ id: c.id, path: c.path, at: c.at })) }
+        : e.extra;
+      return json({ error: e.message, error_type: e.error_type, ...extra }, e.status);
+    }
+    throw e;
+  }
 }

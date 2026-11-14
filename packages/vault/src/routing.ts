@@ -53,7 +53,7 @@
  */
 
 import { sayWriter, withRequestScope } from "./write-set-edge.ts";
-import { handleWriteSets } from "./write-sets-routes.ts";
+import { handleUndo, handleWriteSets } from "./write-sets-routes.ts";
 import { countName, restRouteName, typesRouteName } from "./name-usage.ts";
 import { recordsRoute } from "../core/src/rest-records.ts";
 import { handleRecordsRest } from "./records-rest.ts";
@@ -1371,6 +1371,12 @@ async function routeRequest(
   }
   if (apiPath.startsWith("/notes")) return handleNotes(req, store, apiPath.slice(6), vaultName, tagScope, writeCtx);
   // The change log (0.9.4): which writes a key made, with who and why.
+  {
+    const undo = req.method === "POST" ? apiPath.match(/^\/write-sets\/([^/]+)\/undo$/) : null;
+    if (undo) {
+      return handleUndo(req, store, decodeURIComponent(undo[1]!), { via: writeCtx.via ?? null, actor: writeCtx.actor ?? null, admin: hasScopeForVault(auth.scopes, vaultName, "admin") }, tagScope);
+    }
+  }
   if (apiPath === "/write-sets" || apiPath.startsWith("/write-sets/")) {
     const res = handleWriteSets(req, store.db, apiPath.slice("/write-sets".length), { via: writeCtx.via ?? null, admin: hasScopeForVault(auth.scopes, vaultName, "admin") }, tagScope);
     if (res) return res;
