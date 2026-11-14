@@ -17,6 +17,8 @@ import { join } from "node:path";
 import { SCHEMA_SQL, SCHEMA_VERSION, initSchema, unnumberedStepsDone } from "./schema.ts";
 import { SqliteStore } from "./store.ts";
 import { generateMcpTools } from "./mcp.ts";
+import type { EmbeddingProvider, EmbedInput, EmbedResult } from "./embedding/provider.ts";
+import { decodeVector, dot, encodeVector, normalize } from "./embedding/vector-codec.ts";
 
 let dir: string;
 let file: string;
@@ -383,4 +385,136 @@ describe("a tag filter beside an indexed equality", () => {
     expect(plan.some((d) => /^SCAN n\b/.test(d) && !/USING/.test(d))).toBe(false);
     db.close();
   });
+});
+
+// T-463: a meaning search reads each candidate's vectors once, so its cost grows with the vault, not its square.
+//
+// `semanticSearchNotes` reads the candidates' vectors in batches of ids (`model = ? AND note_id IN (…)`). SQLite chose
+// idx_note_vectors_stale (model, content_hash) for that, so every batch walked every vector of the model: N × N/90 rows
+// a question. On Cloud that was 46,000 billed rows a question at 2,000 notes and 1.1 million at 10,000 (about 3 s);
+// a box pays the same in time. Auto hybrid (0.9.3) sends every question-shaped search through this read.
+//
+// The meter: every statement the search runs on note_vectors is recorded with its parameters, and the rows its
+// note_vectors loop walks are counted from SQLite's own plan for it (a SCAN walks the table; a SEARCH walks the rows
+// matching its equality columns, counted with the same values bound). At 2,000 notes it gives the 46,000 workerd billed
+// for the vector rows before the fix. The ceiling is twice the vault's vector rows: linear, with room for chunked notes.
+describe("a meaning search reads each candidate's vectors once", () => {
+  const MODEL = "made-up-model";
+  const DIMS = 8;
+  /** A deterministic made-up unit vector (the embedder is outside our control; its output shape is all that matters). */
+  function vec(seed: number): Float32Array {
+    const v = new Float32Array(DIMS);
+    let x = (seed * 2654435761) >>> 0;
+    for (let i = 0; i < DIMS; i++) {
+      x = (x * 1103515245 + 12345) >>> 0;
+      v[i] = (x / 2 ** 32) * 2 - 1;
+    }
+    return normalize(v);
+  }
+  class AxisFreeProvider implements EmbeddingProvider {
+    readonly name = "made-up";
+    readonly model = MODEL;
+    readonly dims = DIMS;
+    async embed(input: EmbedInput): Promise<EmbedResult> {
+      return { vectors: input.texts.map((t) => vec(t.length * 31 + t.charCodeAt(0))), model: MODEL, dims: DIMS };
+    }
+    async available() {
+      return { ok: true };
+    }
+  }
+
+  /** Records every execution of a statement that reads note_vectors, with its parameters. */
+  class VectorMeter extends Database {
+    runs: { sql: string; params: unknown[] }[] = [];
+    override prepare(sql: string, ...rest: any[]): any {
+      const stmt = (super.prepare as any)(sql, ...rest);
+      if (!/\bFROM note_vectors\b/i.test(sql)) return stmt;
+      const runs = this.runs;
+      return new Proxy(stmt, {
+        get(target, key) {
+          const v = target[key];
+          if (key === "all" || key === "get" || key === "iterate" || key === "values") {
+            return (...params: unknown[]) => {
+              runs.push({ sql, params });
+              return v.apply(target, params);
+            };
+          }
+          return typeof v === "function" ? v.bind(target) : v;
+        },
+      });
+    }
+    /** Rows the recorded statements' note_vectors loops walked. */
+    rowsRead(): number {
+      let total = 0;
+      for (const { sql, params } of this.runs) {
+        const shape = sql.replace(/\s+/g, " ").match(/WHERE \+?model = \? AND note_id IN \(([?, ]+)\)$/);
+        if (!shape) throw new Error(`the meter doesn't know this note_vectors statement; teach it: ${sql}`);
+        const plan = (this.query(`EXPLAIN QUERY PLAN ${sql}`).all(...(params as any[])) as { detail: string }[]).map((p) => p.detail);
+        const loop = plan.find((d) => /^(SCAN|SEARCH) note_vectors\b/.test(d));
+        if (!loop) throw new Error(`no note_vectors loop in the plan: ${plan.join(" | ")}`);
+        const [model, ...ids] = params as string[];
+        const eq = loop.match(/\((.*)\)$/)?.[1] ?? "";
+        let n: number;
+        if (/^SCAN/.test(loop)) n = (this.query("SELECT COUNT(*) AS n FROM note_vectors").get() as { n: number }).n;
+        else if (/^note_id=\?/.test(eq)) n = (this.query(`SELECT COUNT(*) AS n FROM note_vectors WHERE note_id IN (SELECT value FROM json_each(?))`).get(JSON.stringify(ids)) as { n: number }).n;
+        else if (/^model=\?/.test(eq)) n = (this.query("SELECT COUNT(*) AS n FROM note_vectors WHERE model = ?").get(model) as { n: number }).n;
+        else throw new Error(`the meter doesn't know this plan step; teach it: ${loop}`);
+        total += n;
+      }
+      return total;
+    }
+  }
+
+  /** `n` made-up notes, one vector each under the active model; every tenth also has a second chunk and every
+   *  seventh a leftover row from an older model (what a model change leaves until the backfill drains it). */
+  async function vault(n: number) {
+    const db = new VectorMeter(file);
+    const store = new SqliteStore(db, { embeddingProvider: new AxisFreeProvider() });
+    const notes = await store.createNotes(Array.from({ length: n }, (_, i) => ({ content: `made up note ${i} about the garden and the rain`, path: `seed/n${i}` })));
+    const put = db.prepare("INSERT INTO note_vectors (note_id, chunk_ix, vector, dims, model, content_hash, embedded_at) VALUES (?, ?, ?, ?, ?, 'h', '2026-11-14T00:00:00.000Z')");
+    db.transaction(() => {
+      notes.forEach((note, i) => {
+        put.run(note.id, 0, encodeVector(vec(i)), DIMS, i % 7 === 3 ? "older-model" : MODEL);
+        if (i % 10 === 0) put.run(note.id, 1, encodeVector(vec(i + 1_000_000)), DIMS, MODEL);
+      });
+    })();
+    const vectorRows = (db.query("SELECT COUNT(*) AS n FROM note_vectors").get() as { n: number }).n;
+    return { db, store, notes, vectorRows };
+  }
+
+  /** The ranking by brute force, straight from the table: best chunk per note, ties in candidate (rowid) order. */
+  function reference(db: Database, q: Float32Array, limit: number): string[] {
+    const rows = db.query("SELECT v.note_id AS id, v.vector AS vector FROM note_vectors v JOIN notes n ON n.id = v.note_id WHERE v.model = ? ORDER BY n.rowid, v.chunk_ix").all(MODEL) as { id: string; vector: Uint8Array }[];
+    const best = new Map<string, number>();
+    for (const r of rows) {
+      const s = dot(decodeVector(r.vector), q);
+      if (!best.has(r.id) || s > best.get(r.id)!) best.set(r.id, s);
+    }
+    return [...best.entries()].sort((a, b) => b[1] - a[1]).slice(0, limit).map(([id]) => id);
+  }
+
+  for (const n of [2_000, 20_000]) {
+    test(`at ${n.toLocaleString("en")} notes: semantic and auto-hybrid questions read the vectors linearly, same ranking`, async () => {
+      const { db, store, vectorRows } = await vault(n);
+      const query = generateMcpTools(store).find((t) => t.name === "query-notes")!;
+      const ceiling = 2 * vectorRows;
+
+      db.runs = [];
+      const q = "what did I write about the garden and the rain";
+      const semantic = await store.semanticSearch(q, { limit: 10 });
+      const semanticRows = db.rowsRead();
+      expect(semantic.notes.map((x) => x.id)).toEqual(reference(db, normalize((await new AxisFreeProvider().embed({ texts: [q] })).vectors[0]!), 10));
+      expect(semantic.totalCandidates).toBe(n);
+
+      db.runs = [];
+      const auto = (await query.execute({ search: q })) as { notes?: { matched_by?: string[] }[] } | { matched_by?: string[] }[];
+      const autoRows = db.rowsRead();
+      const hits = Array.isArray(auto) ? auto : auto.notes ?? [];
+      expect(hits.some((h) => h.matched_by?.includes("meaning"))).toBe(true); // the question went through the meaning arm
+
+      console.log(`[T-463] ${n} notes, ${vectorRows} vector rows: semantic read ${semanticRows}, auto hybrid read ${autoRows} (ceiling ${ceiling})`);
+      expect({ semanticRows: semanticRows <= ceiling, autoRows: autoRows <= ceiling }).toEqual({ semanticRows: true, autoRows: true });
+      db.close();
+    }, 120_000);
+  }
 });
