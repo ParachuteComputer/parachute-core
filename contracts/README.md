@@ -220,6 +220,9 @@ start the box with `EMBEDDINGS_ENABLED=true`; a suite sees it as `DOOR_EMBEDDING
 
 `suites/bench/query-092.bench.ts` is the 0.9.2 bench, not a contract: made-up records at `BENCH_N` on the box, every
 operator, search, a type PUT and a retype, timed (`BENCH_N=94000 bun run doors -- --doors box suites/bench/query-092.bench.ts`).
+`suites/bench/history-growth.ts` is the 0.9.4 storage bench, not a contract: made-up records of a given shape, then days
+of writes through this checkout's Store on a fake clock, and the bytes of version history and the change log per vault
+(`bun suites/bench/history-growth.ts fixture /tmp/v.db --records 2775 --per-day 73 --days 30`; `measure` on any vault file).
 
 ## The contracts
 
