@@ -132,6 +132,8 @@ const SUBSCRIBE_PATH = /^\/vault\/([^/]+)\/api\/subscribe$/;
 export function createSubscribeWsBinding(deps: SubscribeWsDeps = {}): {
   tryUpgrade: (req: Request, server: Server<SubscribeWsData>, path: string) => WsUpgradeVerdict;
   handlers: WebSocketHandler<SubscribeWsData>;
+  /** Close every live socket of one vault (it was deleted), as a server restart did: 1001. */
+  closeVault: (vaultName: string) => void;
 } {
   const getStore = deps.getStore ?? getVaultStore;
   const getVaultConfig = deps.getVaultConfig ?? readVaultConfig;
@@ -436,5 +438,9 @@ export function createSubscribeWsBinding(deps: SubscribeWsDeps = {}): {
     },
   };
 
-  return { tryUpgrade, handlers };
+  const closeVault = (vaultName: string): void => {
+    for (const ws of [...(liveSockets.get(vaultName) ?? [])]) closeWs(ws, 1001, "Server closed");
+  };
+
+  return { tryUpgrade, handlers, closeVault };
 }

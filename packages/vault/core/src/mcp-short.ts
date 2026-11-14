@@ -22,6 +22,7 @@
  */
 
 import { BODY, FIELDS } from "./mcp-records.js";
+import { HYBRID_TEXT } from "./hybrid.js";
 
 type Schema = Record<string, unknown>;
 
@@ -58,7 +59,8 @@ export const SHORT_TOOLS: Record<string, ShortTool> = {
 - One note: \`id\` (id, path or title). Lists leave content out unless \`include_content: true\`.
 - Filters combine (AND). \`tag\` also matches subtypes (\`event\` finds \`event/meeting\`). \`metadata\` operators work on any field: an indexed one (vault-info lists them) is fastest, any other is read in full and the reply warns \`scan\`.
 - Returns an array of notes, or \`{notes, next_cursor?, warnings?}\` with \`cursor\` or warnings, or \`[{group, value}]\` with \`aggregate\`.
-Rarer filters (has_links, order_by, expand_links, created_by, search_mode, …) are accepted too. ${HELP("query-notes")}`,
+- ${HYBRID_TEXT.line}
+Rarer filters (has_links, order_by, expand_links, created_by, …) are accepted too. ${HELP("query-notes")}`,
     inputSchema: obj({
       id: str("One note by id, path or title"),
       tag: strs("Tag(s), subtypes included"),
@@ -67,7 +69,8 @@ Rarer filters (has_links, order_by, expand_links, created_by, search_mode, …) 
       exclude_tags: strs("Leave out notes with these tags"),
       path: str("Exact path"),
       path_prefix: str('e.g. "Projects/"'),
-      search: str("Full-text search over title and content: finds notes holding every word"),
+      search: str(HYBRID_TEXT.param),
+      search_mode: { type: "string", enum: ["literal", "advanced", "hybrid"], description: HYBRID_TEXT.mode },
       metadata: { type: "object", description: "{field: value} or {field: {eq|ne|gt|gte|lt|lte|in|not_in|exists: v}}" },
       since: str("What changed: updated_at on or after (ISO date)"),
       date_from: str("created_at on or after (ISO date)"),

@@ -96,6 +96,26 @@ describe("/account/keys", () => {
       { db, issuer: ISSUER, manifestPath },
     ) as Promise<Response>;
 
+  test("the backup key carries the one export scope and no read, and takes nothing that would widen it", async () => {
+    const a = await createUser(db, "alice", "alice-passphrase-1");
+    const bearer = await accountBearer(a.id);
+    const made = await call("/account/keys", bearer, "POST", { name: "nightly-backup", vault: "arcade", can: "export" });
+    expect(made.status).toBe(201);
+    const key = (await made.json()) as { can: string; scopes: string[]; token: string };
+    expect(key.can).toBe("export");
+    expect(key.scopes).toEqual(["vault:arcade:export"]);
+    const claims = JSON.parse(Buffer.from(key.token.split(".")[1]!, "base64url").toString()) as { scope: string; aud: string };
+    expect(claims.scope).toBe("vault:arcade:export");
+    expect(claims.aud).toBe("vault.arcade");
+    // Listed as an export key, and the hub's key list shows its level.
+    const listed = (await (await call("/account/keys", bearer)).json()) as { keys: { name: string; can: string }[] };
+    expect(listed.keys.find((k) => k.name === "nightly-backup")?.can).toBe("export");
+    expect(listKeys(db).find((k) => k.name === "nightly-backup")?.levels).toEqual({ arcade: "export" });
+    // Writing on someone's behalf is meaningless for it; a multi-vault key is read or write only.
+    expect((await call("/account/keys", bearer, "POST", { name: "b2", vault: "arcade", can: "export", on_behalf_of: true })).status).toBe(400);
+    expect((await call("/account/keys", bearer, "POST", { name: "b3", vaults: { arcade: "export" } })).status).toBe(400);
+  });
+
   test("one account's app keys are invisible and unrevocable to another", async () => {
     const a = await createUser(db, "alice", "alice-passphrase-1");
     const b = await createUser(db, "bob", "bob-passphrase-1", { allowMulti: true });

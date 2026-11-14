@@ -4,7 +4,7 @@
 // Red today: no door takes a signed statement, so each contract stops where `granted()` files one. Every body
 // starts with a grant that must be taken, so a refusal further down can't pass because nothing is ever taken.
 import { describe, expect, test } from "bun:test";
-import { KIND, LANE, NO_GRANTS, declareType, door, file, grantEvent, granted, ids, must, newKey, ownerKey, rec, records, red, rest, revokeEvent, sign, statements, tokenAs, tokenReply, vaultId } from "./_grants.ts";
+import { KIND, LANE, NO_GRANTS, declareType, door, eventSize, file, grantEvent, grantRow, granted, hashedSize, ids, must, newKey, ownerKey, rec, records, red, rest, revokeEvent, runId, sign, statements, tokenAs, tokenReply, vaultId, vaultRecordEvent, type Event, type Key } from "./_grants.ts";
 import { lacks } from "../door/_door.ts";
 
 const owner = records("write");
@@ -25,8 +25,40 @@ describe("setup holds today", () => {
 describe("a signed grant", () => {
   red("a vault says its own id, the same after a rename would be, so a grant can name it", { reason: /the vault has no id of its own/, lane: LANE }, async () => {
     const info = await rest("read").get("/vault");
-    must(typeof info.body?.id === "string" && /^[0-9a-f]{32}$/.test(info.body.id), `the vault has no id of its own: GET /api/vault has keys ${Object.keys(info.body ?? {}).join(",")}`);
+    must(typeof info.body?.id === "string" && /^[0-9a-f]{64}$/.test(info.body.id), `the vault has no id of its own: GET /api/vault has keys ${Object.keys(info.body ?? {}).join(",")}`);
     expect(info.body.id).not.toBe((await rest("read", door().otherVault).get("/vault")).body.id);
+  });
+
+  red("the vault's own key names it, can't be a grantee, and an owner's override names the key that signs for it now", { reason: NO_GRANTS, lane: LANE }, async () => {
+    const recipe = await declareType("recipe");
+    await granted({ to: await newKey(), types: { [recipe]: ["read"] } });
+    const id = await vaultId();
+    // The vault's id is its own public key (§2.3). It has no standing, so it can't hold a grant either.
+    const asGrantee = await file(await grantEvent({ to: { secretKey: "", pubkey: id }, types: { [recipe]: ["read"] } }));
+    expect(asGrantee.status).toBe(400);
+    expect(asGrantee.body.error).toBe("invalid_statement");
+    // The owner rotates: an override names a new key. The vault's birth record (key = id) no longer counts.
+    const fresh = await newKey();
+    const override = await file(await vaultRecordEvent(await ownerKey(), { key: fresh.pubkey }));
+    expect(override.status, override.text.slice(0, 200)).toBe(201);
+    const listed = (await statements()).body?.records ?? [];
+    const counts = listed.filter((r: any) => r.counts).map((r: any) => r.key);
+    expect(counts).toEqual([fresh.pubkey]);
+    // The owner rotates again, to a fresh key: a retired key is never named again. The retired key's records count
+    // no more, dated before or after, and neither do the birth key's.
+    const later = await newKey();
+    const next = await file(await vaultRecordEvent(await ownerKey(), { key: later.pubkey }));
+    expect(next.status, next.text.slice(0, 200)).toBe(201);
+    for (const created_at of [Math.floor(Date.now() / 1000) - 3600, Math.floor(Date.now() / 1000) + 60]) {
+      await file(await vaultRecordEvent(fresh, { key: fresh.pubkey, lives: "https://elsewhere.example" }, { created_at }));
+    }
+    const now = ((await statements()).body?.records ?? []).filter((r: any) => r.counts).map((r: any) => r.key);
+    expect(now).toEqual([later.pubkey]);
+    // A stranger's record for this vault has no standing.
+    const stranger = await newKey();
+    const theirs = await file(await vaultRecordEvent(stranger, { key: stranger.pubkey }));
+    expect(theirs.status).toBe(403);
+    expect(theirs.body.error).toBe("no_standing");
   });
 
   red("opens the types it names to the key it names, and nothing else", { reason: NO_GRANTS, lane: LANE }, async () => {
@@ -74,6 +106,7 @@ describe("a signed grant", () => {
     const key = await newKey();
     const first = await granted({ to: key, types: { [recipe]: ["read"], [log]: ["read"] } });
     const inLog = await owner.make({ types: [log], body: "cooked it" });
+    const inRecipe = await owner.make({ types: [recipe], body: "soup" });
     const bearer = await tokenAs(key);
     expect((await records({ bearer }).get(inLog.body.id)).status).toBe(200);
     // Narrowed: the token already held follows the new event at once.
@@ -86,6 +119,12 @@ describe("a signed grant", () => {
     const r = await file(moved);
     expect(r.status).toBe(409);
     expect(r.body.error).toBe("id_taken");
+    // Refused, but it is the newest at the address: it is held and suspends it (§2.2 line 6), so a changed `to`
+    // never leaves the older grant in force.
+    expect((await grantRow(first.grantId))?.state).toBe("suspended");
+    const after = await records({ bearer }).get(inRecipe.body.id);
+    expect(after.status).toBe(401);
+    expect(after.body.error).toBe("grant_ended");
   });
 });
 
@@ -172,7 +211,7 @@ describe("what a vault refuses to file", () => {
     await control(recipe);
     const key = await newKey();
     const e = await grantEvent({ to: key, types: { [recipe]: ["read"] } });
-    const widened = { ...e, tags: e.tags.map((t) => (t[0] === "type" ? ["type", journal, "read"] : t)) };
+    const widened = { ...e, content: e.content.split(JSON.stringify(recipe)).join(JSON.stringify(journal)) };
     const r = await file(widened);
     expect(r.status).toBe(400);
     expect(r.body.error).toBe("bad_signature");
@@ -184,12 +223,16 @@ describe("what a vault refuses to file", () => {
     const recipe = await declareType("recipe");
     await control(recipe);
     const key = await newKey();
-    // Signed for the other vault, carried to this one.
-    const tags = [["d", "elsewhere"], ["vault", await vaultId(door().otherVault)], ["p", key.pubkey], ["by", "signer"], ["type", "*", "read"], ["expiration", String(Math.floor(Date.now() / 1000) + 3600)]];
-    const e = await sign(await ownerKey(), { kind: KIND.grant, tags });
+    // Signed for the other vault, carried to this one; and a revoke signed for the other vault (§3).
+    const e = await grantEvent({ id: "elsewhere", to: key, types: { "*": ["read"] }, vault: door().otherVault });
     const r = await file(e);
     expect(r.status).toBe(400);
     expect(r.body.error).toBe("wrong_vault");
+    const mine = await granted({ to: await newKey(), types: { [recipe]: ["read"] } });
+    const there = await file(await revokeEvent(mine, { vault: door().otherVault }));
+    expect(there.status).toBe(400);
+    expect(there.body.error).toBe("wrong_vault");
+    expect((await grantRow(mine.grantId))?.state).toBe("in_force");
     expect((await tokenReply(key)).status).toBe(401);
   });
 
@@ -205,19 +248,72 @@ describe("what a vault refuses to file", () => {
     }
   });
 
+  red("the 8,192-byte cap counts the event as sent, not the bytes its id is hashed over", { reason: NO_GRANTS, lane: LANE }, async () => {
+    const recipe = await declareType("recipe");
+    await control(recipe);
+    // Only a name full of escapes brings a grant past 8,192 bytes with its content under 6,000: a `\` is 2 bytes of
+    // content and 4 of the event as sent. Sixteen denied marker tags (printable ASCII; no record carries them) bring
+    // it near the cap, and the purpose then sets its size to the byte.
+    const deny = Array.from({ length: 16 }, (_, i) => `held-back-${String(i).padStart(2, "0")}-${"\\".repeat(100)}`);
+    const at = Math.floor(Date.now() / 1000);
+    async function sized(target: number, key: Key): Promise<Event> {
+      const id = runId("size"); // fresh each run, all the same length
+      const make = (purpose: string) => grantEvent({ id, to: key, types: { [recipe]: ["read"] }, deny, created_at: at, extraFields: { purpose } });
+      const extra = target - eventSize(await make("x"));
+      must(extra >= 0 && extra <= 4 * 190, `setup: the denies leave ${extra} bytes to fill; change their length`);
+      const e = await make(`${'"'.repeat(Math.floor(extra / 4))}x${"a".repeat(extra % 4)}`);
+      must(eventSize(e) === target, `setup: sized ${eventSize(e)}, not ${target}`);
+      must(Buffer.byteLength(e.content) <= 6000, `setup: the content is ${Buffer.byteLength(e.content)} bytes`);
+      return e;
+    }
+    const [inside, outside] = [await newKey(), await newKey()];
+    const over = await sized(8193, outside);
+    must(hashedSize(over) <= 8192, `setup: NIP-01's serialisation is ${hashedSize(over)} bytes, so this can't tell the two apart`);
+    const r = await file(over);
+    expect(r.status, r.text.slice(0, 200)).toBe(400);
+    expect(r.body.error).toBe("invalid_statement");
+    expect((await tokenReply(outside)).status).toBe(401);
+    // One byte less is filed: the size alone decided.
+    expect((await file(await sized(8192, inside))).status).toBe(201);
+  });
+
   red("a grant carrying a tag or a verb the vault doesn't know: refused, never read around", { reason: NO_GRANTS, lane: LANE }, async () => {
     const recipe = await declareType("recipe");
     await control(recipe);
     const key = await newKey();
-    // A limit from some later version. A vault that skipped it would open more than was signed.
-    const future = await file(await grantEvent({ to: key, types: { [recipe]: ["read"] }, extraTags: [["only-field", "title"]] }));
-    expect(future.status).toBe(400);
-    expect(future.body.error).toBe("invalid_statement");
+    // A limit from some later version, in the content or as a tag. A vault that skipped it would open more than was
+    // signed. And the same grant spelled a second way, or with tags that disagree with its content (§2.1).
+    for (const e of [
+      await grantEvent({ to: key, types: { [recipe]: ["read"] }, extraFields: { only_fields: ["title"] } }),
+      await grantEvent({ to: key, types: { [recipe]: ["read"] }, extraTags: [["only-field", "title"]] }),
+    ]) {
+      const future = await file(e);
+      expect(future.status).toBe(400);
+      expect(future.body.error).toBe("invalid_statement");
+    }
+    const plain = await grantEvent({ to: key, types: { [recipe]: ["read"] } });
+    const spaced = await sign(await ownerKey(), { kind: KIND.grant, tags: plain.tags, content: JSON.stringify(JSON.parse(plain.content), null, 1) });
+    const disagreeing = await sign(await ownerKey(), { kind: KIND.grant, tags: [plain.tags[0], ["expiration", String(Number(plain.tags[1][1]) + 60)]], content: plain.content });
+    // DEL (U+007F) is a control too, though in neither C0 nor C1 as usually written (§2.1 `purpose`).
+    const del = await grantEvent({ to: key, types: { [recipe]: ["read"] }, extraFields: { purpose: "delete me~" }, respell: (t) => t.replace("delete me~", "delete me\x7f") });
+    must(del.content.includes("\x7f"), "setup: the purpose carries no DEL");
+    for (const e of [spaced, disagreeing, del]) {
+      const r = await file(e);
+      expect(r.status).toBe(400);
+      expect(r.body.error).toBe("invalid_statement");
+    }
     const verb = await file(await grantEvent({ to: key, types: { [recipe]: ["read", "admin" as any] } }));
     expect(verb.status).toBe(400);
     expect(verb.body.error).toBe("invalid_statement");
     // update with no read on the type, and an applet grant over every record, are incoherent (§2.2 line 8).
-    for (const e of [await grantEvent({ to: key, types: { [recipe]: ["update"] } }), await grantEvent({ to: { applet: "arcade", author: await newKey() }, types: { "*": ["read"] } })]) {
+    // An applet writes in its signer's name only: never its own, never a service's people (§2.2 line 8, §5.3).
+    const author = await newKey();
+    for (const e of [
+      await grantEvent({ to: key, types: { [recipe]: ["update"] } }),
+      await grantEvent({ to: { applet: "arcade", author }, types: { "*": ["read"] } }),
+      await grantEvent({ to: { applet: "arcade", author }, by: "self", types: { [recipe]: ["read"] } }),
+      await grantEvent({ to: { applet: "arcade", author }, by: { names: "portal.example" }, types: { [recipe]: ["read"] } }),
+    ]) {
       const r = await file(e);
       expect(r.status).toBe(400);
       expect(r.body.error).toBe("invalid_statement");

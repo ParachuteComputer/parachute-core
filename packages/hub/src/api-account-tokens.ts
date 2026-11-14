@@ -181,7 +181,7 @@ async function handleMint(
     return jsonError(
       400,
       "invalid_scope",
-      `malformed vault scope ${malformed.join(", ")}; expected vault:<name>:<read|write|admin>`,
+      `malformed vault scope ${malformed.join(", ")}; expected vault:<name>:<read|write|admin|export>`,
     );
   }
   const blocked = scopes.filter((s) => !canAccountSelfMint(deps.db, user, s));

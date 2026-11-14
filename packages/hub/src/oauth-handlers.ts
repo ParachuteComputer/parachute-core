@@ -1934,7 +1934,7 @@ function accountVaultsCombinedWithOtherScopes(scopes: readonly string[]): boolea
   return scopes.some((s) => !isAccountAudienceCompanion(s));
 }
 
-function capScopesToUserAuthority(
+export function capScopesToUserAuthority(
   db: Database,
   userId: string,
   scopes: readonly string[],
@@ -1990,6 +1990,9 @@ function capScopesToUserAuthority(
     if (parts.length !== 3 || parts[0] !== "vault") return true; // non-named — pass through
     const name = parts[1];
     const verb = parts[2];
+    // The backup key (`vault:<name>:export`, 0.9.3) reads the whole vault as one download. It is not a verb a role
+    // holds, so a non-owner can't consent into it, whatever vault it names.
+    if (verb === "export") return false;
     if (name === undefined || verb === undefined || !VAULT_VERBS.has(verb)) return true;
     // Named vault verb requested by a non-owner: admit only if the user holds
     // it. `vaultVerbsForUserVault` returns null for an unassigned vault (drop)

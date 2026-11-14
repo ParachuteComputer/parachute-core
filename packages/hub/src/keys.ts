@@ -45,7 +45,7 @@ export interface KeyView {
   /** The token's scopes, read live from the registry. */
   scopes: string[];
   /** Per vault, the highest level the scopes grant: `{uni: "write"}`. */
-  levels: Record<string, "read" | "write" | "admin">;
+  levels: Record<string, "read" | "write" | "admin" | "export">;
   /** Today's tag scope (`permissions.scoped_tags`) as an explicit allow list, read live: it behaves exactly as today. */
   allow_tags: string[] | null;
   types: string[] | null;
@@ -71,7 +71,8 @@ interface TokenRow {
 }
 
 const AGENT_VIA = new Set(["agent_grant", "connection_provision", "connection_credential"]);
-const LEVEL_RANK = { read: 0, write: 1, admin: 2 } as const;
+// `export` (the backup key) is off the ladder: any real level on the same vault outranks it.
+const LEVEL_RANK = { export: -1, read: 0, write: 1, admin: 2 } as const;
 
 /** Who a token's key belongs to, by how the token was made. */
 export function ownerOf(t: Pick<TokenRow, "user_id" | "client_id" | "created_via" | "subject">): { owner: string | null; owner_kind: KeyOwnerKind } {
@@ -189,11 +190,11 @@ export function listKeys(db: Database, now: Date = new Date()): KeyView[] {
   const list = (v: string | null) => (v ? (JSON.parse(v) as string[]) : null);
   return rows.map((r) => {
     const scopes = (r.scopes ?? "").split(/\s+/).filter(Boolean);
-    const levels: Record<string, "read" | "write" | "admin"> = {};
+    const levels: Record<string, "read" | "write" | "admin" | "export"> = {};
     for (const s of scopes) {
-      const m = s.match(/^vault:([^:]+):(read|write|admin)$/);
+      const m = s.match(/^vault:([^:]+):(read|write|admin|export)$/);
       if (!m) continue;
-      const [, vault, level] = m as unknown as [string, string, "read" | "write" | "admin"];
+      const [, vault, level] = m as unknown as [string, string, "read" | "write" | "admin" | "export"];
       if (!levels[vault] || LEVEL_RANK[level] > LEVEL_RANK[levels[vault]!]) levels[vault] = level;
     }
     return {

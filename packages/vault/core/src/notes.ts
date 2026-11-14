@@ -33,8 +33,7 @@ import { chunkForInClause, IN_VIA_JSON_EACH, jsonEachParam } from "./sql-in.js";
 import {
   buildLiteralSearchQuery,
   extractLiteralBoostTerms,
-  SEARCH_WEIGHT_PATH,
-  SEARCH_WEIGHT_CONTENT,
+  SEARCH_BM25_WEIGHTS,
   type SearchMode,
 } from "./search-query.js";
 import { generateUlid } from "./ulid.js";
@@ -2130,7 +2129,7 @@ export function queryNotesPaged(db: Database, opts: QueryOpts, visible?: (note: 
  * generically off the FTS5 error text (`/no such column:/i`) rather than
  * re-parsing the query ourselves, since the SAME message also covers the
  * other real cause (an explicit `column:term` filter naming a column that
- * isn't one of `notes_fts`'s declared columns, `path`/`content`) — the hint
+ * isn't one of `notes_fts`'s declared columns, `path`/`content`/`fields`) — the hint
  * below covers both without claiming to know which one happened.
  */
 function advancedModeColumnHint(causeMessage: string): string | null {
@@ -2138,7 +2137,7 @@ function advancedModeColumnHint(causeMessage: string): string | null {
   return (
     `FTS5 read part of this query as column-filter syntax ("column:term") or as a ` +
     `leading "-" with no term to its left — NOT/"-" is a BINARY operator in FTS5 ` +
-    `("good -bad", not "-bad" alone). Indexed columns are "path" and "content". ` +
+    `("good -bad", not "-bad" alone). Indexed columns are "path", "content" and "fields". ` +
     `Add a preceding positive term before a NOT, quote the phrase to search it ` +
     `literally, or use search_mode:"literal" (the default) to skip advanced syntax entirely.`
   );
@@ -2176,11 +2175,14 @@ function searchSyntaxError(rawQuery: string, err: unknown, mode: SearchMode): Qu
  * the ratified title model (title = first line of CONTENT, not path).
  * This function is the one that boosts by the content-derived title.
  */
-function boostTitleMatches(notes: Note[], terms: string[]): Note[] {
+function boostTitleMatches(notes: Note[], terms: string[], tierById?: Map<string, number>): Note[] {
   if (terms.length === 0) return notes;
+  // The boost works inside a tier only: a record found through its field values alone (tier 0) stays below every
+  // title or body hit, however its first line reads.
   return notes
-    .map((note, index) => ({ note, index, titleMatch: titleMatchesAllTerms(note.content, terms) }))
+    .map((note, index) => ({ note, index, tier: tierById?.get(note.id) ?? 0, titleMatch: titleMatchesAllTerms(note.content, terms) }))
     .sort((a, b) => {
+      if (a.tier !== b.tier) return b.tier - a.tier;
       if (a.titleMatch === b.titleMatch) return a.index - b.index; // stable
       return a.titleMatch ? -1 : 1;
     })
@@ -2210,9 +2212,10 @@ function applySearchTitleBoost(
   mode: SearchMode,
   rawQuery: string,
   sort: "asc" | "desc" | undefined,
+  tierById?: Map<string, number>,
 ): Note[] {
   if (sort !== undefined || mode !== "literal") return notes;
-  return boostTitleMatches(notes, extractLiteralBoostTerms(rawQuery));
+  return boostTitleMatches(notes, extractLiteralBoostTerms(rawQuery), tierById);
 }
 
 export function searchNotes(
@@ -2244,7 +2247,7 @@ export function searchNotes(
 
   // Weighted bm25 relevance expression (vault#551 WS2C, schema v25):
   // `notes_fts` now indexes `path` (title, column 0) then `content` (body,
-  // column 1) — SEARCH_WEIGHT_PATH/SEARCH_WEIGHT_CONTENT bias ranking so a
+  // column 1, then `fields` (0.9.3), column 2) — SEARCH_BM25_WEIGHTS bias ranking so a
   // title match outranks a passing body mention. Raw SQLite bm25 is
   // negative-is-better; `-1.0 * bm25(...)` flips it so bigger is more
   // relevant (see `Note.score`'s doc comment for the external contract).
@@ -2259,7 +2262,7 @@ export function searchNotes(
   // not a third FTS column. The two are complementary, not redundant — a
   // note can have a matching path with a non-matching first line, or vice
   // versa.
-  const scoreExpr = `(-1.0 * bm25(notes_fts, ${SEARCH_WEIGHT_PATH}, ${SEARCH_WEIGHT_CONTENT}))`;
+  const scoreExpr = `(-1.0 * bm25(notes_fts, ${SEARCH_BM25_WEIGHTS}))`;
 
   // `sort` honored under search (vault#551 WS2A item 3): default stays FTS5
   // relevance (the weighted `score` expression); an EXPLICIT
@@ -2271,6 +2274,11 @@ export function searchNotes(
   // identical weighted score (relevance branch — much more likely than
   // with unweighted `rank`, since many notes share "zero path matches")
   // would otherwise return in arbitrary/unstable order.
+  // Field values rank below the title and body (0.9.3): a record found only through its fields comes after every
+  // record found in its path or content. bm25 alone can't promise that: it normalises by the length of the whole row,
+  // so a hit in a short record's fields can outscore a hit in a long body. Relevance order only, literal mode only
+  // (advanced text is raw FTS5; its author can say `fields:` or `content:` themselves).
+  const tier = mode === "literal" && opts?.sort === undefined ? fieldTierOf(ftsQuery) : null;
   const orderBy =
     opts?.sort === "asc"
       ? "n.created_at ASC, n.id ASC"
@@ -2294,16 +2302,17 @@ export function searchNotes(
 
   try {
     const rows = opts?.visible
-      ? searchVisibleOnly(db, ftsQuery, extraWhere, params, orderBy, limit, opts.visible)
+      ? searchVisibleOnly(db, ftsQuery, extraWhere, params, orderBy, limit, opts.visible, tier)
       : db.prepare(`
-      SELECT n.*, ${scoreExpr} AS score FROM notes n
+      SELECT n.*, ${scoreExpr} AS score${tier ? `, ${tier.select("n.rowid", "notes_fts")} AS tier` : ""} FROM notes n
       JOIN notes_fts fts ON fts.rowid = n.rowid
       WHERE notes_fts MATCH ?
         ${extraWhere}
-      ORDER BY ${orderBy}
+      ORDER BY ${tier ? "tier DESC, " : ""}${orderBy}
       LIMIT ?
-    `).all(ftsQuery, ...params, limit) as (NoteRow & { score: number })[];
-    return applySearchTitleBoost(notesWithTags(db, rows, scoresById(rows)), mode, query, opts?.sort);
+    `).all(...(tier ? [tier.param] : []), ftsQuery, ...params, limit) as (NoteRow & { score: number })[];
+    const tierById = tier ? new Map(rows.map((r) => [r.id, (r as { tier?: number }).tier ?? 0])) : undefined;
+    return applySearchTitleBoost(notesWithTags(db, rows, scoresById(rows)), mode, query, opts?.sort, tierById);
   } catch (err) {
     // Surface EVERY FTS5 error structured, never a raw rethrow (vault#551):
     // advanced mode expects it (the caller passed raw syntax); literal
@@ -2316,7 +2325,55 @@ export function searchNotes(
   }
 }
 
+/**
+ * The "found in the title or body" tier of a literal search: 1 when the same words all match within path/content
+ * alone, 0 when a field value is needed to match. `select(rowid, table)` is the SQL expression for one candidate row
+ * in `table`; `param` is its one bound value.
+ */
+interface FieldTier {
+  select(rowidExpr: string, table: string): string;
+  param: string;
+}
+function fieldTierOf(ftsQuery: string): FieldTier {
+  return {
+    param: `{path content} : (${ftsQuery})`,
+    select: (rowidExpr, table) => `CASE WHEN ${rowidExpr} IN (SELECT rowid FROM ${table} AS tier_fts WHERE tier_fts.${table} MATCH ?) THEN 1 ELSE 0 END`,
+  };
+}
+
 let visibleSearchSeq = 0;
+
+/**
+ * A visibility predicate that also says, one tag at a time, what the tag does: `admits` (a note carrying it may be
+ * seen) and `denies` (a note carrying it is hidden, whatever else it carries). Then the predicate is exactly
+ * "has a tag that admits and none that denies" (no tags: not visible), which SQL can state over note_tags.
+ * `byTag` MUST agree with the function it is attached to; the tag-scope builders attach it
+ * (src/tag-scope.ts) and a property test compares the two.
+ */
+export type NoteVisible = ((note: Note) => boolean) & { byTag?: (tag: string) => { admits: boolean; denies: boolean } };
+
+/**
+ * The SQL form of a `NoteVisible` over `n` (the notes table), or null when the predicate has no `byTag`. The rule is
+ * applied to every tag name in use (one DISTINCT read of note_tags' tag index), so SQL tests set membership of a
+ * name, never re-states the rule.
+ */
+function tagRuleSql(db: Database, visible: (note: Note) => boolean): { sql: string; params: string[] } | null {
+  const byTag = (visible as NoteVisible).byTag;
+  if (!byTag) return null;
+  const admits: string[] = [];
+  const denies: string[] = [];
+  for (const { tag_name } of db.prepare("SELECT DISTINCT tag_name FROM note_tags").all() as { tag_name: string }[]) {
+    const r = byTag(tag_name);
+    if (r.admits) admits.push(tag_name);
+    if (r.denies) denies.push(tag_name);
+  }
+  return {
+    sql:
+      "EXISTS (SELECT 1 FROM note_tags vt WHERE vt.note_id = n.id AND vt.tag_name IN (SELECT value FROM json_each(?))) " +
+      "AND NOT EXISTS (SELECT 1 FROM note_tags vd WHERE vd.note_id = n.id AND vd.tag_name IN (SELECT value FROM json_each(?)))",
+    params: [JSON.stringify(admits), JSON.stringify(denies)],
+  };
+}
 
 /**
  * Full-text search for a caller who sees only some notes (a tag-scoped pass,
@@ -2338,33 +2395,42 @@ function searchVisibleOnly(
   orderBy: string,
   limit: number,
   visible: (note: Note) => boolean,
+  tier: FieldTier | null,
 ): (NoteRow & { score: number })[] {
+  // A predicate that can say, tag by tag, what admits or denies a note (`NoteVisible.byTag`) is applied inside the
+  // match query as an EXISTS over note_tags: no per-note tag read and no per-note call. Same set as the line-by-line
+  // path below (`tagRuleSql` builds it from the predicate's own rule); anything else takes that path.
+  const inSql = tagRuleSql(db, visible);
   const matched = db.prepare(`
     SELECT n.rowid AS rowid, n.id AS id FROM notes n
     JOIN notes_fts fts ON fts.rowid = n.rowid
     WHERE notes_fts MATCH ?
       ${extraWhere}
-  `).all(ftsQuery, ...params) as { rowid: number; id: string }[];
+      ${inSql ? `AND ${inSql.sql}` : ""}
+  `).all(ftsQuery, ...params, ...(inSql?.params ?? [])) as { rowid: number; id: string }[];
   if (matched.length === 0) return [];
-  const tagsById = getNoteTagsForNotes(db, matched.map((r) => r.id));
-  const keep = matched.filter((r) => visible({ id: r.id, tags: tagsById.get(r.id) ?? [] } as Note));
+  let keep = matched;
+  if (!inSql) {
+    const tagsById = getNoteTagsForNotes(db, matched.map((r) => r.id));
+    keep = matched.filter((r) => visible({ id: r.id, tags: tagsById.get(r.id) ?? [] } as Note));
+  }
   if (keep.length === 0) return [];
   const ftsSql = (db.prepare("SELECT sql FROM sqlite_master WHERE name = 'notes_fts'").get() as { sql: string } | null)?.sql ?? "";
   const tokenize = /tokenize\s*=\s*'([^']*)'/i.exec(ftsSql)?.[1] ?? "porter unicode61";
   const table = `visible_search_${++visibleSearchSeq}`;
-  db.run(`CREATE VIRTUAL TABLE temp.${table} USING fts5(path, content, tokenize='${tokenize.replace(/'/g, "''")}')`);
+  db.run(`CREATE VIRTUAL TABLE temp.${table} USING fts5(path, content, fields, tokenize='${tokenize.replace(/'/g, "''")}')`);
   try {
     db.prepare(`
-      INSERT INTO temp.${table}(rowid, path, content)
-      SELECT rowid, COALESCE(path, ''), content FROM notes WHERE rowid IN (SELECT value FROM json_each(?))
+      INSERT INTO temp.${table}(rowid, path, content, fields)
+      SELECT rid, path, content, fields FROM notes_fts_source WHERE rid IN (SELECT value FROM json_each(?))
     `).run(JSON.stringify(keep.map((r) => r.rowid)));
     return db.prepare(`
-      SELECT n.*, (-1.0 * bm25(${table}, ${SEARCH_WEIGHT_PATH}, ${SEARCH_WEIGHT_CONTENT})) AS score
+      SELECT n.*, (-1.0 * bm25(${table}, ${SEARCH_BM25_WEIGHTS})) AS score${tier ? `, ${tier.select(`${table}.rowid`, table)} AS tier` : ""}
       FROM ${table} JOIN notes n ON n.rowid = ${table}.rowid
       WHERE ${table} MATCH ?
-      ORDER BY ${orderBy}
+      ORDER BY ${tier ? "tier DESC, " : ""}${orderBy}
       LIMIT ?
-    `).all(ftsQuery, limit) as (NoteRow & { score: number })[];
+    `).all(...(tier ? [tier.param] : []), ftsQuery, limit) as (NoteRow & { score: number })[];
   } finally {
     db.run(`DROP TABLE temp.${table}`);
   }
@@ -2401,7 +2467,7 @@ function searchVisibleOnly(
 export function semanticSearchNotes(
   db: Database,
   queryVector: Float32Array,
-  opts: QueryOpts,
+  opts: QueryOpts & { visible?: (note: Note) => boolean },
   model: string,
 ): SemanticSearchResult {
   const limit = typeof opts.limit === "number" ? opts.limit : 10;
@@ -2417,7 +2483,15 @@ export function semanticSearchNotes(
   const idRows = db.prepare(`SELECT n.id FROM notes n ${whereClause}`).all(...params) as {
     id: string;
   }[];
-  const candidateIds = idRows.map((r) => r.id);
+  let candidateIds = idRows.map((r) => r.id);
+  // A caller who sees only some notes (`visible`, a tag-scoped session): the candidates are narrowed to those it can
+  // see BEFORE ranking and the limit, so its page is full, nothing it can't see takes a place on it, and the
+  // pending/total counts are over what it can see.
+  if (opts.visible && candidateIds.length > 0) {
+    const tagsById = getNoteTagsForNotes(db, candidateIds);
+    const visible = opts.visible;
+    candidateIds = candidateIds.filter((id) => visible({ id, tags: tagsById.get(id) ?? [] } as Note));
+  }
   if (candidateIds.length === 0) {
     return { notes: [], pendingCount: 0, totalCandidates: 0 };
   }
@@ -3339,6 +3413,7 @@ export function toNoteIndex(note: Note): NoteIndex {
     preview,
     displayTitle: computeDisplayTitle(note.content),
     ...(note.score !== undefined ? { score: note.score } : {}),
+    ...(note.matched_by ? { matched_by: note.matched_by } : {}),
   };
 }
 

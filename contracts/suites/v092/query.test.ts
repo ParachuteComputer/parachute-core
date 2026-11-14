@@ -119,13 +119,13 @@ describe("0.9.2 query fixes", () => {
     }
   });
 
-  red("search finds a word that is only in a field value", { reason: /^not found by search/, lane: LANE }, async () => {
+  test("search finds a word that is only in a field value", async () => {
     const got = await writer.get(`/notes?search=${enc(word)}`);
     must(got.status === 200, `search gave ${got.status}`);
     must(paths(got.body).includes(`${r}/c`), `not found by search: ${said(paths(got.body))}`);
   });
 
-  red("over MCP, query-records search finds a word that is only in a field value", { reason: /^not found by search/, lane: LANE }, async () => {
+  test("over MCP, query-records search finds a word that is only in a field value", async () => {
     const m = await mcp("write");
     try {
       const got: any = await m.call("query-records", { search: word });
@@ -134,5 +134,48 @@ describe("0.9.2 query fixes", () => {
     } finally {
       await m.close();
     }
+  });
+
+  // Field values in search, past the first hit: where it ranks, that an edit shows at once, and which value shapes count.
+  const found = async (w: string) => paths((await writer.get(`/notes?search=${enc(w)}&limit=50`)).body);
+
+  test("a title or body hit ranks above a field-only hit", async () => {
+    const w = `okapi${runId("r")}`;
+    // The field note is made first and is shorter, so only the ranking rule can put the body note ahead.
+    for (const [name, content, metadata] of [
+      ["fieldonly", "", { note_line: `seen near ${w}` }],
+      ["body", `a longer line that mentions ${w} once, among several other plain words`, {}],
+      // A long body: bm25 alone scores a hit in a long text below a hit in a short field, so only a rule can keep it ahead.
+      ["long", `intro\n\n${"filler words about nothing much ".repeat(300)} ${w}`, {}],
+      ["title", "", {}],
+    ] as [string, string, Record<string, unknown>][]) {
+      const made = await writer.post("/notes", { content, path: name === "title" ? `${r}/${w}` : `${r}/rk-${name}`, tags: [tag], metadata });
+      must(made.status === 201, `setup: ${name} gave ${made.status}`);
+    }
+    // `paths` sorts, so read the order as the server gave it.
+    const order = ((await writer.get(`/notes?search=${enc(w)}&limit=50`)).body as { path: string }[]).map((n) => n.path);
+    must(order.length === 4 && order[3] === `${r}/rk-fieldonly`, `the field-only hit should come after the title, body and long-body hits: ${said(order)}`);
+  });
+
+  test("editing only a field makes the new word searchable at once and the old word stops finding it", async () => {
+    const [oldWord, newWord] = [`tapir${runId("o")}`, `lemur${runId("n")}`];
+    const made = await writer.post("/notes", { content: "plain", path: `${r}/edit`, tags: [tag], metadata: { note_line: oldWord } });
+    must(made.status === 201, `setup: gave ${made.status}`);
+    must((await found(oldWord)).includes(`${r}/edit`), "the old word wasn't found before the edit");
+    const edit = await writer.patch(`/notes/${made.body.id}`, { metadata: { note_line: newWord }, if_updated_at: made.body.updatedAt });
+    must(edit.status === 200, `edit gave ${edit.status} ${said(edit.body)}`);
+    must((await found(newWord)).includes(`${r}/edit`), `the new word isn't found: ${said(await found(newWord))}`);
+    must(!(await found(oldWord)).includes(`${r}/edit`), "the old word still finds it");
+  });
+
+  test("a field holding a list, a number or a nested value is searchable by its text", async () => {
+    const [a, b, c] = [`ibex${runId("a")}`, `ibex${runId("b")}`, `ibex${runId("c")}`];
+    const made = await writer.post("/notes", { content: "", path: `${r}/shapes`, tags: [tag], metadata: { kinds: ["one", a], count: 4817203, nest: { deeper: [{ label: b }] }, flag: true, gone: null } });
+    must(made.status === 201, `setup: gave ${made.status} ${said(made.body)}`);
+    for (const [what, w] of [["a list item", a], ["a number", "4817203"], ["a nested value", b]]) {
+      must((await found(w)).includes(`${r}/shapes`), `${what} isn't found by ${w}: ${said(await found(w))}`);
+    }
+    must(!(await found(c)).includes(`${r}/shapes`), "an unrelated word found it");
+    must(!(await found("deeper")).includes(`${r}/shapes`), "a field NAME found it: only values are searched");
   });
 });

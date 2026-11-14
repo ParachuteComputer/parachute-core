@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import { anyTermsQuery, fuseRanks, HYBRID_POOL } from "./hybrid.js";
 import { HistoryPreconditionRequiredError } from "./history.js";
 import type { Store, Note, Link, Attachment, QueryOpts, QueryNotesPage, AggregateRow, SemanticSearchResult } from "./types.js";
 import { compactNote, compactVault, countNoteVersions, type CompactResult, type CompactSummary, captureVersion, readPriorNoteRow, resolveHistoryPolicy, appendRestoreMarker, listVersions, getVersion, latestTombstone, eraseHistory, eraseNoteVersions, listDeletedNotes, sweepDeletedHistory, deletedHistoryStats, HistoryNotFoundError, HistoryOverflowError, HistoryUnrecoverableError, DEFAULT_HISTORY_POLICY, VERSION_MAX_BYTES, type VersionRow, type HistoryPolicy, type HistoryOp } from "./history.js";
@@ -742,7 +743,7 @@ export class BunSqliteStore implements Store {
     const note = this.transaction(() => {
       if (willWriteNoteRow(updates)) {
         const prior = readPriorNoteRow(this.db, id);
-        if (prior) captureVersion(this.db, prior, { actor: updates.actor ?? null, via: updates.via ?? null, op: historyOpFor(updates), policy: this.historyPolicy });
+        if (prior) captureVersion(this.db, prior, { actor: updates.actor ?? null, via: updates.via ?? null, op: historyOpFor(updates), policy: this.historyPolicy, next: { path: updates.path, extension: updates.extension } });
       }
       const note = noteOps.updateNote(this.db, id, updates);
 
@@ -1261,7 +1262,7 @@ export class BunSqliteStore implements Store {
    * (MCP/REST) let this propagate uncaught, same as
    * `invalid_search_syntax` above.
    */
-  async semanticSearch(nearText: string, opts?: QueryOpts): Promise<SemanticSearchResult> {
+  async semanticSearch(nearText: string, opts?: QueryOpts & { visible?: (note: Note) => boolean }): Promise<SemanticSearchResult> {
     if (!this.embeddingProvider) {
       // Honest either way: if the caller told us WHY (operator explicitly
       // set EMBEDDINGS_ENABLED=false), say that — not generic provider-setup
@@ -1308,6 +1309,58 @@ export class BunSqliteStore implements Store {
 
     const filterOpts = this.expandQueryTags(this.normalizeQueryTags(opts ?? {}));
     return noteOps.semanticSearchNotes(this.db, queryVector, filterOpts, this.embeddingProvider.model);
+  }
+
+  /**
+   * Hybrid search (T-461 prototype for 0.9.3): the keyword arm (any of the
+   * question's terms, bm25) and the meaning arm (`semanticSearch`) each take
+   * `HYBRID_POOL` candidates under the same filters, fused by reciprocal rank
+   * (`core/src/hybrid.ts`). With no embedding provider (or one not ready) the
+   * answer is the keyword arm alone and `meaning` says why, never a silent
+   * swap: the caller turns it into a warning.
+   *
+   * `opts.visible` (a tag-scoped session): BOTH arms run under it before they rank and take their candidates, so a
+   * scoped caller's page is full and only in-scope notes reach the fusion, the scores, or the counts. The keyword arm
+   * ranks over the visible notes only (`searchNotes`'s `visible`); the meaning arm narrows its candidates first
+   * (`semanticSearchNotes`).
+   */
+  /** Until when (ms) the meaning arm is known to be failing, so `auto` doesn't retry it on every search. */
+  private meaningDownUntil = 0;
+
+  /** Whether meaning search can answer: a provider is configured and it hasn't failed in the last minute. */
+  hasMeaningSearch(): boolean {
+    return this.embeddingProvider !== undefined && Date.now() >= this.meaningDownUntil;
+  }
+
+  async hybridSearch(
+    text: string,
+    opts?: QueryOpts & { visible?: (note: Note) => boolean },
+  ): Promise<{ notes: Note[]; meaning: "ok" | "unavailable"; meaningReason?: string; pendingCount: number; totalCandidates: number }> {
+    const limit = typeof opts?.limit === "number" ? opts.limit : 50; // the same default as `search`
+    const pool = { ...(opts ?? {}), limit: Math.max(HYBRID_POOL, limit) };
+    const anyQuery = anyTermsQuery(text);
+    // Start the meaning arm first (its embed call may be a network round-trip), then run FTS while it waits.
+    const meaningP = this.semanticSearch(text, pool);
+    meaningP.catch(() => {}); // handled below; keeps an early rejection from being reported as unhandled
+    const keyword = anyQuery ? await this.searchNotes(anyQuery, { ...pool, mode: "advanced" }) : [];
+    let meaningNotes: Note[] | undefined;
+    let meaningReason: string | undefined;
+    let pendingCount = 0;
+    let totalCandidates = 0;
+    try {
+      const r = await meaningP;
+      meaningNotes = r.notes;
+      pendingCount = r.pendingCount;
+      totalCandidates = r.totalCandidates;
+    } catch (err) {
+      if (!(err instanceof QueryError) || (err as QueryError & { error_type?: string }).error_type !== "semantic_unavailable") throw err;
+      meaningReason = err.message;
+      this.meaningDownUntil = Date.now() + 60_000; // a broken provider costs one try a minute, not one per search
+    }
+    const fused = fuseRanks({ keyword: keyword.map((n) => n.id), meaning: meaningNotes?.map((n) => n.id) }).slice(0, limit);
+    const byId = new Map<string, Note>([...keyword, ...(meaningNotes ?? [])].map((n) => [n.id, n]));
+    const notes: Note[] = fused.map((h) => ({ ...byId.get(h.id)!, score: h.score, matched_by: Object.keys(h.ranks) }));
+    return { notes, meaning: meaningNotes ? "ok" : "unavailable", meaningReason, pendingCount, totalCandidates };
   }
 
   // ---- Tags ----
