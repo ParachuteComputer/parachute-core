@@ -240,6 +240,17 @@ export async function dispatch(role: Role, notice?: Notice): Promise<void> {
     const stop = newerCheck();
     if (stop !== null) process.exit(stop);
   }
+  // A home marked rolled back to another release (or cut off mid-restore) is opened by no command of this one, the
+  // host's `serve --embedded` and `bootstrap`, `config` and an old name's usage count included (release.ts
+  // homeRefusal). Only `upgrade` (it is the way forward, and the way to finish a restore), `takeover` and help go on.
+  if (!upgradeAsk && !takeoverArgs && !("frontHelp" in r) && (!hostArgs || process.env.PARACHUTE_HOME)) {
+    const { homeRefusal } = await import("./release.ts");
+    const refused = homeRefusal(home);
+    if (refused) {
+      console.error(`${name}: ${refused.message}`);
+      process.exit(refused.code);
+    }
+  }
   if (notice) {
     const { announce } = await import("./front.ts");
     announce(notice, home);
@@ -296,11 +307,28 @@ export async function dispatch(role: Role, notice?: Notice): Promise<void> {
       process.exit(await check(home, upgradeAsk));
     }
   }
+  if (upgradeAsk?.kind === "core") {
+    // This program's own upgrade (upgrade.ts): the step asked for by name on a home another release served last
+    // (the only way a rolled-back home moves forward), else the newer release from the home's channel.
+    const refusal = managedRefusal("hub", ["upgrade"]);
+    if (refusal) {
+      console.error(refusal);
+      process.exit(2);
+    }
+    const { upgradeCore } = await import("./upgrade.ts");
+    process.exit(await upgradeCore(home, upgradeAsk, newerCheck));
+  }
   {
     // The first time this release opens a home an older one served: record the step and back the databases up
-    // first (release.ts). Not a host's (embedded) home, nor one the old 0.7 programs still own.
+    // first (release.ts). Not a host's (embedded) home, nor one the old 0.7 programs still own. A home marked
+    // rolled back is refused here (exit 7); only `upgrade` above, and its check on a copy, take the step on one.
     const { beforeOpenOrExit } = await import("./release.ts");
-    const code = beforeOpenOrExit(home, newerCheck);
+    // `stop` and `restart` of the whole service, and `logs`, take no step while another release's server still runs
+    // on the home: they only talk to the service manager or read log files. Not `status`, nor `stop <module>`:
+    // those open hub.db, and this release opening it adds its tables to a database the other is serving.
+    const lifecycle = r.cli === "hub" && (r.argv[0] === "logs" ||
+      (["stop", "restart"].includes(r.argv[0] ?? "") && (r.argv[1] === undefined || r.argv[1] === "hub")));
+    const code = beforeOpenOrExit(home, newerCheck, checkCopy, lifecycle);
     if (code !== null) process.exit(code);
   }
   if (checkCopy) {

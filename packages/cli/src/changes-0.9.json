@@ -103,7 +103,7 @@
    "old": "parachute upgrade [service]",
    "new": "parachute upgrade",
    "action": "keep",
-   "reason": "fetches the next bundle; no service argument",
+   "reason": "fetches the newer release from the home's channel (run/release.json); a module the hub installed is still `upgrade <service>`",
    "since": "0.9",
    "removed_in": null,
    "state": "live"

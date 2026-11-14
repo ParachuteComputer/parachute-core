@@ -15,15 +15,20 @@ describe("parachute upgrade: what it was asked", () => {
     expect(parseUpgrade(["--check", "-h"]).kind).toBe("help");
   });
 
-  test("the hub's own upgrade gets the arguments as understood: the sweep, one service, its three flags", () => {
-    expect(parseUpgrade([])).toEqual({ kind: "hub", service: undefined, argv: [] });
+  test("a service named is the hub's own upgrade, with the arguments as understood", () => {
     expect(parseUpgrade(["hub"])).toEqual({ kind: "hub", service: "hub", argv: ["hub"] });
     expect(parseUpgrade(["--channel=latest", "vault"])).toEqual({ kind: "hub", service: "vault", argv: ["vault", "--channel", "latest"] });
     expect(parseUpgrade(["--tag", "0.7.9", "vault", "--allow-downgrade"])).toEqual({ kind: "hub", service: "vault", argv: ["vault", "--tag", "0.7.9", "--allow-downgrade"] });
   });
 
+  test("no service named is this program's own upgrade, on one of its channels", () => {
+    expect(parseUpgrade([])).toEqual({ kind: "core", json: false });
+    expect(parseUpgrade(["--json", "--channel", "beta"])).toEqual({ kind: "core", channel: "beta", json: true });
+    expect(parseUpgrade(["--channel=next"])).toEqual({ kind: "core", channel: "next", json: false });
+  });
+
   test("anything else is a usage error", () => {
-    for (const args of [["--chekc"], ["--dry-run"], ["--json"], [""], ["vault", "hub"], ["--check", "vault"], ["--check", ""], ["--check", "--rollback"], ["--check", "--yes"], ["--rollback", "vault"], ["--rollback", ""], ["--channel"], ["--channel", "beta"], ["--tag"], ["--tag", ""], ["--tag="], ["vault", "--tag", ""], ["--channel", "--tag"], ["--tag", "-x"], ["-x"]]) {
+    for (const args of [["--chekc"], ["--dry-run"], [""], ["vault", "hub"], ["vault", "--json"], ["vault", "--channel", "beta"], ["--channel", "rc"], ["--allow-downgrade"], ["--tag", "0.9.0"], ["--check", "vault"], ["--check", ""], ["--check", "--rollback"], ["--check", "--yes"], ["--rollback", "vault"], ["--rollback", ""], ["--channel"], ["--channel", "nightly"], ["--tag"], ["--tag", ""], ["--tag="], ["vault", "--tag", ""], ["--channel", "--tag"], ["--tag", "-x"], ["-x"]]) {
       expect({ args, kind: parseUpgrade(args).kind }).toEqual({ args, kind: "usage" });
     }
   });
