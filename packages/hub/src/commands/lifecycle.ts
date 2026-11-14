@@ -35,6 +35,7 @@ import {
 import { type PortListeningFn, defaultPortListening } from "../port-probe.ts";
 import { type AliveFn, logPath as logPathFor, processState } from "../process-state.ts";
 import { getSpec, knownServices } from "../service-spec.ts";
+import { coreRoot } from "../core-host.ts";
 import { readManifest, readManifestUnchanged } from "../services-manifest.ts";
 
 /**
@@ -360,10 +361,16 @@ async function requireSupervisedOrOffer(r: Resolved): Promise<boolean> {
   // meant `parachute start <svc>` there exited 1 with nothing on stdout or
   // stderr.
   if (!attempt.surfaced) {
-    r.log(
-      "No supervised hub unit is installed. Run `parachute migrate --to-supervised` to install it,",
-    );
-    r.log("or run `parachute serve` in the foreground.");
+    if (coreRoot()) {
+      // Inside core the 0.7 cutover is not the way (its unit runs this hub's own serve): `init` writes core's.
+      r.log("No unit serves this home through this command. Run `parachute init` to install one,");
+      r.log("or stop and start `parachute serve` (or the unit that runs it) yourself.");
+    } else {
+      r.log(
+        "No supervised hub unit is installed. Run `parachute migrate --to-supervised` to install it,",
+      );
+      r.log("or run `parachute serve` in the foreground.");
+    }
   }
   return false;
 }

@@ -88,8 +88,14 @@ beforeAll(async () => {
     join(m.unitDir, UNIT),
     `[Unit]\nDescription=Parachute (a made-up unit for the contracts)\n\n[Service]\nExecStart=${join(prefix, "bin", "parachute-core")} serve\n${Object.entries(env).map(([k, v]) => `Environment=${k}=${v}\n`).join("")}Restart=on-failure\n\n[Install]\nWantedBy=default.target\n`,
   );
+  // And what a takeover from a supervised 0.7 hub leaves beside it: the old hub's unit file, stopped and disabled.
+  // The hub's own `restart` knows only this name, and would start that old hub on the home core serves.
+  writeFileSync(join(m.unitDir, "parachute-hub.service"), `[Unit]\nDescription=The 0.7 hub (a made-up leftover)\n\n[Service]\nExecStart=%h/.bun/bin/parachute serve\n\n[Install]\nWantedBy=default.target\n`);
   const made = await m.run([prevVaultBin, "create", vault, "--no-mirror", "--json"], { env: { ...base, EMBEDDINGS_ENABLED: "false" } });
   must(made.code === 0, `setup: 0.8 parachute-vault create exited ${made.code}: ${made.stderr.slice(-600)}`);
+  // The home says so too, as a takeover leaves it (its record; without it a hub unit naming this home means the old
+  // programs still own it, and serve refuses).
+  writeFileSync(join(m.home, "takeover.json"), `${JSON.stringify({ state: "taken-over", version: v08, at: new Date().toISOString(), paused: [{ name: "parachute-hub.service", enabled: true, active: true }] }, null, 2)}\n`);
   await m.expose(port);
   const unit = await unitUp("0.8 through the unit");
   try {
@@ -129,6 +135,7 @@ describe("lifecycle/upgrade through the service unit", () => {
     const restarted = await linked(["restart"]);
     must(restarted.code === 0, `parachute restart exited ${restarted.code}: ${restarted.stderr.slice(-600)} ${restarted.stdout.slice(-300)}`);
     expect(m.systemctlCalls().slice(calls).join("\n")).toContain(`restart ${UNIT}`);
+    expect(m.systemctlCalls().join("\n")).not.toMatch(/(start|restart) parachute-hub/); // the leftover stays paused
     const unit = { ...(await serving(m, { vaultName: vault, origin }, UNIT)), runs: old.runs };
     try {
       expect(unit.runs().startsWith(`${v09}-`)).toBe(true);
