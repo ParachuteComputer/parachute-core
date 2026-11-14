@@ -522,13 +522,14 @@ describe("a meaning search reads each candidate's vectors once", () => {
 // T-463: a meaning search holds one batch of vectors at a time, so its memory doesn't grow with the vault.
 //
 // `semanticSearchNotes` used to read every candidate's vectors into one map and score them after: at 24,000 notes of
-// 1024-dim vectors that was ~200 MB at the peak in a bun process and ~100 MB in a local Durable Object (whose limit is
+// 1024-dim vectors that peaked ~190 MB in a bun process and ~104 MB in a local Durable Object (whose limit is
 // 128 MB). It now scores each batch as it reads it and keeps only the best `limit` scores.
 //
-// The meter: while the search runs, every statement it executes first forces a full GC and samples the live heap
-// (`heapUsed` counts the vector blobs bun:sqlite hands back). The peak minus the heap before the search is what the
-// search held at once. Vectors here are 256-dim (1 KB): holding all of them is ~22 MB at 20,000 notes, one batch is
-// ~100 KB. The bound is what is left: the candidate id list and the hits, ~3 MB at 20,000 notes.
+// The meter: while the search runs, each statement it executes forces a full GC and samples the live heap before it
+// runs and again when it returns, with its rows still in hand (`heapUsed` counts the vector blobs bun:sqlite hands
+// back). The peak minus the heap before the search is what the search held at once. Vectors here are 256-dim (1 KB):
+// the old read held 30.6 MB at 20,000 notes; one batch is ~100 KB. The bound leaves room for the candidate id list and
+// the hits (~1 MB at 20,000 notes). Memory taken and dropped between two statements is not seen.
 describe("a meaning search holds one batch of vectors at a time", () => {
   const MODEL = "made-up-model";
   const DIMS = 256;
@@ -553,7 +554,7 @@ describe("a meaning search holds one batch of vectors at a time", () => {
       return { ok: true };
     }
   }
-  /** Samples the live heap, after a full GC, before every statement while `sampling` is on. */
+  /** Samples the live heap, after a full GC, before and after every statement while `sampling` is on. */
   class HeapMeter extends Database {
     sampling = false;
     peak = 0;
@@ -566,7 +567,9 @@ describe("a meaning search holds one batch of vectors at a time", () => {
           if (key === "all" || key === "get" || key === "iterate" || key === "values" || key === "run") {
             return (...params: unknown[]) => {
               if (meter.sampling) meter.sample();
-              return v.apply(target, params);
+              const out = v.apply(target, params);
+              if (meter.sampling) meter.sample();
+              return out;
             };
           }
           return typeof v === "function" ? v.bind(target) : v;
@@ -591,6 +594,22 @@ describe("a meaning search holds one batch of vectors at a time", () => {
       }
     }
   }
+
+  test("a chunk that scores NaN (a corrupt vector) never hides the note's real best chunk", async () => {
+    const db = new Database(file);
+    const store = new SqliteStore(db, { embeddingProvider: new MadeUpProvider() });
+    const q = "what did I write about the garden and the rain";
+    const qv = (await new MadeUpProvider().embed({ texts: [q] })).vectors[0]!;
+    const [a, b] = await store.createNotes([{ content: "note a", path: "seed/a" }, { content: "note b", path: "seed/b" }]);
+    const put = db.prepare("INSERT INTO note_vectors (note_id, chunk_ix, vector, dims, model, content_hash, embedded_at) VALUES (?, ?, ?, ?, ?, 'h', '2026-11-14T00:00:00.000Z')");
+    put.run(a!.id, 0, encodeVector(new Float32Array(DIMS).fill(Number.NaN)), DIMS, MODEL);
+    put.run(a!.id, 1, encodeVector(qv), DIMS, MODEL);
+    put.run(b!.id, 0, encodeVector(vec(q.length + 1)), DIMS, MODEL);
+    const { notes } = await store.semanticSearch(q, { limit: 10 });
+    expect(notes.map((x) => x.id)).toEqual([a!.id, b!.id]);
+    expect(notes[0]!.score).toBeCloseTo(1, 5);
+    db.close();
+  });
 
   const BOUND_MB = 6;
   for (const n of [2_000, 20_000]) {

@@ -2547,8 +2547,8 @@ export function semanticSearchNotes(
 
   // Read the candidates' vector rows for the ACTIVE model in batches of ids, staying under the DO 100-bound-param cap
   // (same chunking `fetchNotesByIdsOrdered` uses), and score each batch as it is read: only one batch of vectors and
-  // the best `limit` scores are held at once, never every candidate's vectors (T-463: 24,000 notes of 1024-dim vectors
-  // were ~98 MB against a Durable Object's 128 MB). A note with no row here has no fresh vector yet — pending.
+  // the best `limit` scores are held at once, never every candidate's vectors (T-463: holding them all, a question at
+  // 24,000 notes of 1024-dim vectors peaked ~190 MB on a box and ~104 MB in a Durable Object, whose limit is 128 MB). A note with no row here has no fresh vector yet — pending.
   // `+model` keeps SQLite on the primary key (note_id, chunk_ix): bare `model = ?` lets it pick
   // idx_note_vectors_stale (model, content_hash), which walks EVERY vector of the model once per batch, so a
   // question read N × N/90 rows (1.1 M at 10,000 notes on Cloud). Both guarded by row-costs.test.ts (T-463).
@@ -2567,8 +2567,9 @@ export function semanticSearchNotes(
     const best = new Map<string, number>();
     for (const row of rows) {
       const score = dot(decodeVector(row.vector), queryVector);
-      const prev = best.get(row.note_id);
-      if (prev === undefined || score > prev) best.set(row.note_id, score);
+      // From -Infinity and only on `>`, as before: a NaN chunk (a corrupt vector) never wins or hides a real one.
+      const prev = best.get(row.note_id) ?? -Infinity;
+      best.set(row.note_id, score > prev ? score : prev);
     }
     embedded += best.size;
     for (const id of idChunk) {
