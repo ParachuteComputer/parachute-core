@@ -31,7 +31,7 @@ export interface Door {
   /** A second vault of the same owner: a credential for `vault` must not open it. */
   otherVault: string;
   /** How this run is signed in as the owner. */
-  signIn: { how: "cookie"; cookie: string; csrf: string } | { how: "nostr"; secretKey: string; secretKeyFile?: string };
+  signIn: { how: "cookie"; cookie: string; csrf: string; cookieFile?: string } | { how: "nostr"; secretKey: string; secretKeyFile?: string };
   /** 0.9.1 doors: a made-up key the owner can sign in with (NIP-98), as hex. On a key-only door it is the sign-in. */
   ownerKey?: string;
   /** Where this run may write its fingerprint (one JSON object per line). */
@@ -52,8 +52,11 @@ export function door(): Door {
     if (/(^|\.)parachute\.computer$/.test(host)) throw new Error(`refused: ${host} is Parachute Cloud; the door contracts never run there`);
     if (host !== "127.0.0.1" && host !== "localhost" && !named.includes(host)) throw new Error(`refused: ${host} is not this machine and is not named in DOOR_REMOTE_HOSTS`);
   }
-  // A key kept in a file (a deployed door's made-up owner): read here, so a door file never holds it.
+  // A key or a session kept in a file (a deployed door's made-up owner): read here, so a door file never holds it.
   if (d.signIn.how === "nostr" && !d.signIn.secretKey && d.signIn.secretKeyFile) d.signIn.secretKey = readFileSync(d.signIn.secretKeyFile, "utf8").trim();
+  const files = d as Door & { signIn: { cookieFile?: string }; ownerKeyFile?: string };
+  if (d.signIn.how === "cookie" && !d.signIn.cookie && files.signIn.cookieFile) Object.assign(d.signIn, JSON.parse(readFileSync(files.signIn.cookieFile, "utf8")));
+  if (!d.ownerKey && files.ownerKeyFile) d.ownerKey = readFileSync(files.ownerKeyFile, "utf8").trim();
   if (!d.ownerKey && d.signIn.how === "nostr") d.ownerKey = d.signIn.secretKey;
   allowOrigins(d.issuer, d.vaultOrigin);
   cached = d;
