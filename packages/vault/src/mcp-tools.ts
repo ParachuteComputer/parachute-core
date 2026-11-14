@@ -5,6 +5,8 @@
  * tools operate on that vault and vault-info picks up its config directly.
  */
 
+import { withWriteSet } from "./write-set-edge.ts";
+import { normaliseWhy } from "../core/src/change-log.ts";
 import { generateMcpTools, resolveNote } from "../core/src/mcp.ts";
 import { projectHistoryProvenance } from "../core/src/history-visibility.js";
 import type { McpToolDef, GenerateMcpToolsOpts } from "../core/src/mcp.ts";
@@ -391,9 +393,42 @@ export function generateScopedMcpTools(
   const shaped = byToolOrder(addRecordTools(applyElevenTools(tools, vaultName, auth), (name, kind) => countName(`mcp ${name}`, kind), recordCheck));
   applyRecordWordsToVaultInfo(shaped);
   applyParamTeaching(shaped, vaultName);
+  // Before applyOnBehalf, so an on-behalf call's twin opens its own set with the stamped writer and keeps `why`.
+  applyWriteSets(shaped, store, writeContext);
   applyOnBehalf(shaped, auth, (by) => generateScopedMcpTools(vaultName, { ...auth!, actor: by, acts_for: null }, callerBearer, req));
 
   return shaped;
+}
+
+/** The tools that take `why` (0.9.4): the record writes and their note-named aliases. */
+const WHY_TOOLS = new Set(["create-note", "update-note", "delete-note", "create-record", "update-record", "delete-record"]);
+
+/**
+ * The change log's MCP edge (0.9.4): each tool call is one write set, written by this session's writer. `why` is
+ * read here and never reaches the tool. A batch item's own `why` is refused: the call's applies to every item.
+ */
+function applyWriteSets(tools: McpToolDef[], store: Parameters<typeof withWriteSet>[0], writer: { actor: string | null; via: string } | undefined): void {
+  for (const tool of tools) {
+    const execute = tool.execute;
+    tool.execute = async (params) => {
+      let args = params;
+      let why: string | null = null;
+      if (WHY_TOOLS.has(tool.name) && params && typeof params === "object") {
+        const inItem = Object.values(params).some((v) => Array.isArray(v) && v.some((it) => it && typeof it === "object" && "why" in it));
+        if (inItem) {
+          throw Object.assign(new Error("`why` goes on the call, not inside a batch item: it explains the whole write. Nothing was written."), {
+            error_type: "invalid_why", field: "why", hint: "move why to the top level",
+          });
+        }
+        if ("why" in params) {
+          const { why: raw, ...rest } = params;
+          why = normaliseWhy(raw);
+          args = rest;
+        }
+      }
+      return withWriteSet(store, { actor: writer?.actor ?? null, via: writer?.via ?? null, why }, () => execute(args));
+    };
+  }
 }
 
 /** The MCP tools whose writes carry the write stamp, by the action that writes (manage-types: only rename does). */

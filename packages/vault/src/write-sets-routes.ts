@@ -1,0 +1,112 @@
+/**
+ * `/api/write-sets` (0.9.4, T-471): which writes a key made, with who, why and the records each changed.
+ *
+ * - `GET /api/write-sets?by=me|<key name>&limit=&before=`: newest first. A key that isn't admin sees its own sets
+ *   only (`by` defaults to `me`); admin sees any, and every key's when `by` is left out.
+ * - `GET /api/write-sets/<id>`: one set and its records (`id`, `op`, `path`).
+ *
+ * A tag-scoped key sees a set only when it can see every record in it: a record that still exists by its tags now,
+ * a deleted one by the tags it had. Anything else answers as if the set weren't there.
+ */
+import type { Database } from "bun:sqlite";
+import { getWriteSet, listWriteSets, writeSetRecords, type WriteSetRow } from "../core/src/change-log.ts";
+import type { Note } from "../core/src/types.ts";
+import { noteWithinTagScope } from "./tag-scope.ts";
+import type { TagScopeCtx } from "./routes.ts";
+
+export interface WriteSetsAuth {
+  /** The caller's credential, as revisions stamp it (`key:<name>`, `api`, …). */
+  via: string | null;
+  admin: boolean;
+}
+
+const json = (body: unknown, status = 200) => Response.json(body, { status });
+
+/** Whether a scoped caller can see every record of a set. */
+export function setVisible(db: Database, id: string, tagScope: TagScopeCtx): boolean {
+  if (tagScope.raw === null) return true;
+  for (const r of writeSetRecords(db, id)) {
+    const tags = currentTags(db, r.id) ?? r.tags_before ?? [];
+    if (!noteWithinTagScope({ tags } as unknown as Note, tagScope.allowed, tagScope.raw)) return false;
+  }
+  return true;
+}
+
+function currentTags(db: Database, id: string): string[] | null {
+  if (!db.prepare("SELECT 1 FROM notes WHERE id = ?").get(id)) return null;
+  return (db.prepare("SELECT tag_name FROM note_tags WHERE note_id = ? ORDER BY tag_name").all(id) as { tag_name: string }[]).map((r) => r.tag_name);
+}
+
+/** Whether this caller may read (or undo) this set at all, before scope. */
+export function setOwnedOrAdmin(set: WriteSetRow, auth: WriteSetsAuth): boolean {
+  return auth.admin || (auth.via !== null && set.via === auth.via);
+}
+
+function project(db: Database, set: WriteSetRow & { records?: number; undone_by?: string | null }) {
+  const undoneBy =
+    set.undone_by !== undefined
+      ? set.undone_by
+      : ((db.prepare("SELECT id FROM write_sets WHERE undoes = ? ORDER BY at DESC LIMIT 1").get(set.id) as { id: string } | null)?.id ?? null);
+  return {
+    id: set.id,
+    at: set.at,
+    by: set.actor,
+    via: set.via,
+    via_kind: set.via_kind,
+    why: set.why,
+    ...(set.records !== undefined ? { records: set.records } : {}),
+    undoes: set.undoes,
+    undone_by: undoneBy,
+  };
+}
+
+function recordPath(db: Database, id: string, beforeRow: string | null): string | null {
+  const now = db.prepare("SELECT path FROM notes WHERE id = ?").get(id) as { path: string | null } | null;
+  if (now) return now.path;
+  try {
+    return beforeRow ? ((JSON.parse(beforeRow) as { path?: string | null }).path ?? null) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function handleWriteSets(req: Request, db: Database, subpath: string, auth: WriteSetsAuth, tagScope: TagScopeCtx): Response | null {
+  const url = new URL(req.url);
+  if (subpath === "" || subpath === "/") {
+    if (req.method !== "GET") return null;
+    const by = url.searchParams.get("by");
+    let via: string | undefined;
+    if (by === null) via = auth.admin ? undefined : (auth.via ?? "\u0000none");
+    else if (by === "me") via = auth.via ?? "\u0000none";
+    else {
+      via = `key:${by}`;
+      if (!auth.admin && via !== auth.via) {
+        return json({ error: "Only an admin key lists another key's write sets.", error_type: "insufficient_scope", hint: "use by=me" }, 403);
+      }
+    }
+    const limitRaw = Number.parseInt(url.searchParams.get("limit") ?? "20", 10);
+    const limit = Number.isNaN(limitRaw) ? 20 : Math.min(200, Math.max(1, limitRaw));
+    const before = url.searchParams.get("before") ?? undefined;
+    const sets = listWriteSets(db, {
+      ...(via !== undefined ? { via } : {}),
+      limit,
+      ...(before ? { before } : {}),
+      ...(tagScope.raw !== null ? { visible: (setId: string) => setVisible(db, setId, tagScope) } : {}),
+    });
+    return json({ write_sets: sets.map((s) => project(db, s)) });
+  }
+  const m = subpath.match(/^\/([^/]+)$/);
+  if (!m || req.method !== "GET") return null;
+  const id = decodeURIComponent(m[1]!);
+  const set = getWriteSet(db, id);
+  if (!set || !setOwnedOrAdmin(set, auth) || !setVisible(db, id, tagScope)) {
+    return json({ error: "Not found", error_type: "not_found" }, 404);
+  }
+  const rows = db
+    .prepare("SELECT note_id, op, existed, before_row FROM record_changes WHERE write_set = ? ORDER BY seq")
+    .all(id) as { note_id: string; op: string; existed: number; before_row: string | null }[];
+  const records = rows
+    .filter((r) => !(r.op === "delete" && r.existed === 0))
+    .map((r) => ({ id: r.note_id, op: r.op, path: recordPath(db, r.note_id, r.before_row) }));
+  return json({ ...project(db, set), records });
+}
