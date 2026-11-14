@@ -530,6 +530,186 @@ function plan(home: string, r: Release, restore: boolean) {
   return { manifest, now, moved, mode: restore ? ("restore" as const) : ("code-only" as const) };
 }
 
+/** What a restore kept of the revocations made since the backup, by kind. */
+export interface KeptRevocations {
+  tokens: number;
+  /** Tokens minted since the backup and still live: revoked, since the restored hub would not know them. */
+  made_since: number;
+  signing_keys: number;
+  clients: number;
+  grants: number;
+  sessions: number;
+  invites: number;
+  sign_ins: number;
+}
+
+/**
+ * Carry every revocation made since the backup into the staged copy of the backup's hub.db, before it takes the live
+ * one's place: putting the backup back must never make a revoked credential work again. Read from each hub.db that
+ * came after the backup (the live one, and on a retried restore what earlier attempts moved aside), each only if it
+ * is the same hub (it shares a signing key with the backup), so a hub.db made afresh since can't revoke everything.
+ *
+ *   tokens        revoked since: revoked here too. Minted and revoked since: its row is copied in, revoked, so the
+ *                 revocation list names it (a vault takes any well-signed token the list doesn't name). Minted
+ *                 since and still live: copied in, revoked now (`made_since`): what was made since the backup is
+ *                 gone, and a key the hub has no record of must not go on working. Gone since
+ *                 (the client reaper deletes only dead rows): revoked here, if not yet expired.
+ *   signing keys  retired since: retired here too (the hub makes a new one when none is active).
+ *   clients       removed since: removed here, with their grants and codes. No longer approved: not approved here.
+ *   grants        removed since: removed here (the app asks for consent again). Narrowed: narrowed here.
+ *   sessions      ended since (sign-out, password change): ended here.
+ *   invites       revoked or used since: revoked or used here.
+ *   sign-ins      an account's password or two-factor secrets changed since: the current ones here, so an old
+ *                 password doesn't work again.
+ * Not carried, said in docs/UPGRADE-0.9.md: accounts deleted since, and changes to an account's vaults or role.
+ */
+export function keepRevocations(staged: string, sources: string[], outside: string): KeptRevocations {
+  const kept: KeptRevocations = { tokens: 0, made_since: 0, signing_keys: 0, clients: 0, grants: 0, sessions: 0, invites: 0, sign_ins: 0 };
+  const now = new Date().toISOString();
+  const db = new Database(staged);
+  try {
+    const tables = (d: Database) => new Set((d.query("SELECT name FROM sqlite_master WHERE type = 'table'").all() as { name: string }[]).map((t) => t.name));
+    const columns = (d: Database, table: string) => (d.query(`PRAGMA table_info(${table})`).all() as { name: string }[]).map((c) => c.name);
+    const mine = tables(db);
+    const kids = new Set(mine.has("signing_keys") ? (db.query("SELECT kid FROM signing_keys").all() as { kid: string }[]).map((k) => k.kid) : []);
+    for (const source of sources) {
+      let after: { has: Set<string>; cols: Record<string, string[]>; rows: Record<string, any[]> };
+      try {
+        after = readDatabase(source, (s) => {
+          const has = tables(s);
+          const cols: Record<string, string[]> = {};
+          const rows: Record<string, any[]> = {};
+          for (const t of ["signing_keys", "tokens", "clients", "grants", "sessions", "invites", "users"]) {
+            if (!has.has(t)) continue;
+            cols[t] = columns(s, t);
+            rows[t] = s.query(`SELECT * FROM ${t}`).all() as any[];
+          }
+          return { has, cols, rows };
+        }, outside);
+      } catch {
+        continue; // can't be read: nothing to learn from it
+      }
+      if (!(after.rows.signing_keys ?? []).some((k) => kids.has(k.kid))) continue; // not this hub
+      const by = (table: string, key: (r: any) => string) => new Map((after.rows[table] ?? []).map((r) => [key(r), r]));
+      const shared = (table: string) => (after.cols[table] ?? []).filter((c) => mine.has(table) && columns(db, table).includes(c));
+      db.transaction(() => {
+        if (mine.has("tokens") && after.has.has("tokens")) {
+          const later = by("tokens", (r) => r.jti);
+          const cols = shared("tokens");
+          const users = new Set((db.query("SELECT id FROM users").all() as { id: string }[]).map((u) => u.id));
+          for (const t of after.rows.tokens!) {
+            const here = db.query("SELECT revoked_at FROM tokens WHERE jti = ?").get(t.jti) as { revoked_at: string | null } | null;
+            if (here?.revoked_at) continue;
+            if (!t.revoked_at) {
+              // Live, and in the backup too: it goes on working. Live, and minted since: the restored hub has no
+              // record of it, so nobody could list or revoke it, yet a vault would take it (well-signed, not on
+              // the revocation list) until it expired. What was made since the backup is gone: its row goes in,
+              // revoked now.
+              if (here || !(t.expires_at > now)) continue;
+              const row = { ...t, user_id: t.user_id && users.has(t.user_id) ? t.user_id : null, revoked_at: now };
+              db.run(`INSERT INTO tokens (${cols.join(", ")}) VALUES (${cols.map(() => "?").join(", ")})`, cols.map((c) => row[c] ?? null));
+              kept.made_since++;
+              continue;
+            }
+            if (here) {
+              const set = ["revoked_at", "revoked_by", "revoked_via"].filter((c) => cols.includes(c));
+              db.run(`UPDATE tokens SET ${set.map((c) => `${c} = ?`).join(", ")} WHERE jti = ?`, [...set.map((c) => t[c] ?? null), t.jti]);
+            } else {
+              // Minted since the backup: its account may be newer than the backup too (user_id may be NULL).
+              const row = { ...t, user_id: t.user_id && users.has(t.user_id) ? t.user_id : null };
+              db.run(`INSERT INTO tokens (${cols.join(", ")}) VALUES (${cols.map(() => "?").join(", ")})`, cols.map((c) => row[c] ?? null));
+            }
+            kept.tokens++;
+          }
+          for (const t of db.query("SELECT jti FROM tokens WHERE revoked_at IS NULL AND expires_at > ?").all(now) as { jti: string }[]) {
+            if (later.has(t.jti)) continue;
+            db.run("UPDATE tokens SET revoked_at = ? WHERE jti = ?", [now, t.jti]);
+            kept.tokens++;
+          }
+        }
+        if (mine.has("signing_keys")) {
+          for (const k of after.rows.signing_keys!) {
+            if (!k.retired_at) continue;
+            kept.signing_keys += db.run("UPDATE signing_keys SET retired_at = ? WHERE kid = ? AND retired_at IS NULL", [k.retired_at, k.kid]).changes;
+          }
+        }
+        if (mine.has("clients") && after.has.has("clients")) {
+          const later = by("clients", (r) => r.client_id);
+          for (const c of db.query("SELECT client_id, status FROM clients").all() as { client_id: string; status: string }[]) {
+            const l = later.get(c.client_id);
+            if (!l) {
+              // As the hub removes a client (clients.ts deleteClient): its codes and grants first.
+              if (mine.has("auth_codes")) db.run("DELETE FROM auth_codes WHERE client_id = ?", [c.client_id]);
+              if (mine.has("grants")) db.run("DELETE FROM grants WHERE client_id = ?", [c.client_id]);
+              db.run("DELETE FROM clients WHERE client_id = ?", [c.client_id]);
+              kept.clients++;
+            } else if (c.status === "approved" && l.status !== "approved") {
+              db.run("UPDATE clients SET status = ? WHERE client_id = ?", [l.status, c.client_id]);
+              kept.clients++;
+            }
+          }
+        }
+        if (mine.has("grants") && after.has.has("grants")) {
+          const later = by("grants", (r) => `${r.user_id} ${r.client_id}`);
+          for (const g of db.query("SELECT user_id, client_id, scopes FROM grants").all() as { user_id: string; client_id: string; scopes: string }[]) {
+            const l = later.get(`${g.user_id} ${g.client_id}`);
+            const still = new Set(String(l?.scopes ?? "").split(" ").filter(Boolean));
+            const scopes = g.scopes.split(" ").filter(Boolean);
+            const left = scopes.filter((s) => still.has(s));
+            if (left.length === scopes.length) continue;
+            if (left.length) db.run("UPDATE grants SET scopes = ? WHERE user_id = ? AND client_id = ?", [left.join(" "), g.user_id, g.client_id]);
+            else db.run("DELETE FROM grants WHERE user_id = ? AND client_id = ?", [g.user_id, g.client_id]);
+            kept.grants++;
+          }
+        }
+        if (mine.has("sessions") && after.has.has("sessions")) {
+          const later = by("sessions", (r) => r.id);
+          for (const s of db.query("SELECT id FROM sessions WHERE expires_at > ?").all(now) as { id: string }[]) {
+            if (later.has(s.id)) continue;
+            db.run("DELETE FROM sessions WHERE id = ?", [s.id]);
+            kept.sessions++;
+          }
+        }
+        if (mine.has("invites") && after.has.has("invites")) {
+          const cols = shared("invites");
+          for (const i of after.rows.invites!) {
+            const here = db.query("SELECT * FROM invites WHERE token = ?").get(i.token) as any;
+            if (!here) continue;
+            const revoked = i.revoked_at && !here.revoked_at;
+            const used = cols.includes("used_count") ? (i.used_count ?? 0) > (here.used_count ?? 0) : !!i.used_at && !here.used_at;
+            if (revoked) db.run("UPDATE invites SET revoked_at = ? WHERE token = ?", [i.revoked_at, i.token]);
+            if (used) {
+              const set = ["used_at", "used_count"].filter((c) => cols.includes(c));
+              db.run(`UPDATE invites SET ${set.map((c) => `${c} = ?`).join(", ")} WHERE token = ?`, [...set.map((c) => i[c] ?? null), i.token]);
+            }
+            if (revoked || used) kept.invites++;
+          }
+        }
+        if (mine.has("users") && after.has.has("users")) {
+          const cols = shared("users").filter((c) => ["password_hash", "password_changed", "totp_secret", "totp_backup_codes", "totp_enrolled_at"].includes(c));
+          for (const u of after.rows.users!) {
+            const here = db.query("SELECT * FROM users WHERE id = ?").get(u.id) as any;
+            if (!here || cols.every((c) => here[c] === u[c])) continue;
+            db.run(`UPDATE users SET ${cols.map((c) => `${c} = ?`).join(", ")} WHERE id = ?`, [...cols.map((c) => u[c] ?? null), u.id]);
+            kept.sign_ins++;
+          }
+        }
+      })();
+    }
+    db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+  } finally {
+    db.close();
+  }
+  // Only the database file itself is moved into the home: nothing may be left in a WAL beside it.
+  for (const suffix of ["-wal", "-shm"]) {
+    const p = `${staged}${suffix}`;
+    if (!existsSync(p)) continue;
+    if (suffix === "-wal" && statSync(p).size > 0) throw new Exit(EXIT.failed, `the staged ${basename(staged)} kept a write-ahead log; nothing was changed`);
+    rmSync(p);
+  }
+  return kept;
+}
+
 /** `parachute upgrade --rollback [--restore] [--yes] [--json]`: back to the release before this one. */
 export async function rollback(home: string, args: string[]): Promise<number> {
   const json = args.includes("--json");
@@ -597,6 +777,15 @@ export async function rollback(home: string, args: string[]): Promise<number> {
           writeFileSync(to, readFileSync(join(r.backup!, "home", rel)), { mode: 0o600 });
           if (sha256(to) !== hash) throw new Exit(EXIT.failed, `the backup's ${rel} doesn't match its manifest; nothing was changed`);
         }
+        // Checked, then given every revocation made since the backup. Every attempt stages afresh and applies them
+        // again, from the live hub.db and from what an interrupted attempt moved aside (its live hub.db may be there).
+        const asidesBefore = [...(r.moved_aside ? [r.moved_aside] : []), ...(r.moved_aside_retries ?? [])];
+        const kept = "hub.db" in files ? keepRevocations(join(staged, "hub.db"), [home, ...asidesBefore].map((d) => join(d, "hub.db")).filter((p) => existsSync(p)), dirname(home)) : undefined;
+        const total = kept ? Object.values(kept).reduce((a, b) => a + b, 0) : 0;
+        out.revocations_kept = total;
+        if (kept) out.revocations_kept_by_kind = kept;
+        const kinds = kept ? Object.entries(kept).filter(([, v]) => v > 0).map(([k, v]) => `${v} ${k.replace("_", " ")}`) : [];
+        say(`Kept ${total} revocations made since the backup${kinds.length ? ` (${kinds.join(", ")})` : ""}: nothing revoked since works again`);
         // 2. Export every note that differs from the backup, then check again that nothing has started since.
         const dir = join(r.backup!, `changed-since-${stamp()}`);
         // Always, a resumed restore too: what an interrupted one left (or an older release wrote since) is compared

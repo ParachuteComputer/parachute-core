@@ -105,9 +105,12 @@ command on a home that doesn't exist yet, or on a home the 0.7 programs still ow
   and tags written under 0.9 (the contract reads them back through 0.8).
 - **`--restore`.** For a release that moved a number, or when 0.9 damaged data:
   1. it asks first (or takes `--yes`), then checks nothing holds the data;
-  2. it stages the backup's databases and checks each against the manifest, before anything moves;
+  2. it stages the backup's databases and checks each against the manifest, before anything moves; then it carries
+     every revocation made since the backup into the staged hub.db (below), and says how many (`revocations_kept`
+     in `--json`, with `revocations_kept_by_kind`);
   3. it exports every note that differs from the backup (`changed-since-<time>/<vault>.json`, the takeover's
-     export) and checks again that nothing has started;
+     export: each note's content, metadata, tags and outgoing links; a note whose only change is a tag or a link
+     counts) and checks again that nothing has started;
   4. it records `restoring`, moves the live databases aside (`after-<version>-<time>/`) and puts the staged ones
      in place. Every command refuses a home left `restoring` until the restore is run again to finish.
 - **The links go back too.** Where 0.9 was installed beside the previous release by the versioned installer
@@ -135,6 +138,30 @@ With no service named, `upgrade` is this program's own (a module the hub install
   - Installed with npm or bun: it runs `bun add -g` / `npm install -g` with the exact version.
   - It does not restart the server. The next start runs the new release, which backs up first.
 - **On a home another release served last, or one rolled back**, it takes the step with this release, as above.
+
+**What `--restore` keeps, and what it doesn't.** Putting the backup's hub.db back must not make anything revoked
+since work again (`release.ts` `keepRevocations`). It reads the live hub.db (and, on a retried restore, what an
+earlier attempt moved aside), only if it is the same hub (it shares a signing key with the backup), and carries:
+
+- **keys and tokens revoked since**, including refresh-token families revoked by a replay. A key minted *and* revoked
+  since has no row in the backup, and a vault accepts any well-signed token its revocation list doesn't name, so its
+  row is copied in, revoked. A token whose row is gone since (the client reaper deletes only dead rows) is revoked;
+- **signing keys retired since** (the hub makes a new one when none is active);
+- **approved apps removed or no longer approved**, with their grants; **consents removed or narrowed**;
+- **sign-ins ended** (sessions), **invites revoked or used**, and each account's current **password and two-factor**
+  secrets, so an old password doesn't work again.
+
+What is not kept: whatever was *made* since the backup is gone from the hub: keys, approved apps, consents, refresh
+tokens and accounts, so connectors and apps added since need adding again. A key or token minted since and still
+live is revoked by the restore (`made_since` in `revocations_kept_by_kind`): the restored hub has no record of it,
+so nobody could list or revoke it, and a vault would otherwise take it until it expired. Also not carried, on purpose:
+
+- **accounts deleted since** come back (their tokens and sign-ins stay revoked). Deleting an account touches every
+  table that names it; delete it again after the restore;
+- **changes to an account's vaults or role**. Removing an account's last vault row means "no narrowing" to the hub,
+  so carrying a removal could widen access; set them again after the restore;
+- **the vault's own `tokens` table and `mcp_mint_ledger`**: vestigial since vault 0.5 (no path validates them); the
+  hub's registry is what counts, and that is carried.
 
 ## What 0.9.1's number needs (not built; for Aaron and Benjamin)
 

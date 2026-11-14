@@ -2011,9 +2011,26 @@ async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ ba
 }
 
 /**
+ * A vault's notes with their tags (names, sorted) and outgoing links ({target_id, relationship}, sorted), so a note
+ * whose only change is a tag or a link differs from the backup too.
+ */
+function notesWithTagsAndLinks(path: string): any[] {
+  return readOnly(path, (db) => {
+    const notes = db.query("SELECT id, path, content, metadata, created_at, updated_at FROM notes").all() as any[];
+    const tags = new Map<string, string[]>();
+    for (const t of db.query("SELECT note_id, tag_name FROM note_tags ORDER BY note_id, tag_name").all() as any[]) tags.set(t.note_id, [...(tags.get(t.note_id) ?? []), t.tag_name]);
+    const links = new Map<string, { target_id: string; relationship: string }[]>();
+    for (const l of db.query("SELECT source_id, target_id, relationship FROM links ORDER BY source_id, target_id, relationship").all() as any[]) {
+      links.set(l.source_id, [...(links.get(l.source_id) ?? []), { target_id: l.target_id, relationship: l.relationship }]);
+    }
+    return notes.map((r) => ({ ...r, tags: tags.get(r.id) ?? [], links: links.get(r.id) ?? [] }));
+  });
+}
+
+/**
  * Every note that differs from the backup (new, changed or deleted since the takeover), per vault, exported to
- * `dir` as JSON before a restore puts the backup's notes back. Compared with the backup itself, not by timestamps,
- * which an import can set to anything.
+ * `dir` as JSON before a restore puts the backup's notes back: content, metadata, tags and links. Compared with the
+ * backup itself, not by timestamps, which an import can set to anything.
  */
 export function exportChanged(home: string, backupHome: string, dir: string, skip: string[] = []): number {
   let n = 0;
@@ -2023,14 +2040,15 @@ export function exportChanged(home: string, backupHome: string, dir: string, ski
     new Map(databases(root, { hub: 0, vault: 0 }).filter((d) => d.rel !== "hub.db" && !skip.includes(d.rel)).map((d) => [basename(dirname(d.rel)), join(root, d.rel)]));
   const before = byName(backupHome);
   const now = byName(home);
+  const key = (r: any) => JSON.stringify([r.updated_at, r.content, r.metadata, r.path, r.tags, r.links]);
   for (const name of new Set([...before.keys(), ...now.keys()])) {
     const path = now.get(name);
     const old = new Map<string, string>();
     const was = before.get(name);
-    if (was) for (const r of readOnly(was, (db) => db.query("SELECT id, updated_at, content, metadata, path FROM notes").all() as any[])) old.set(r.id, JSON.stringify([r.updated_at, r.content, r.metadata, r.path]));
+    if (was) for (const r of notesWithTagsAndLinks(was)) old.set(r.id, key(r));
     // A vault deleted since the takeover has no rows now: every note of it is reported deleted.
-    const rows = path ? (readOnly(path, (db) => db.query("SELECT id, path, content, metadata, created_at, updated_at FROM notes").all() as any[])) : [];
-    const changed = rows.filter((r) => old.get(r.id) !== JSON.stringify([r.updated_at, r.content, r.metadata, r.path]));
+    const rows = path ? notesWithTagsAndLinks(path) : [];
+    const changed = rows.filter((r) => old.get(r.id) !== key(r));
     const ids = new Set(rows.map((r) => r.id));
     const deleted = [...old.keys()].filter((id) => !ids.has(id));
     if (changed.length || deleted.length) writeFileSync(join(dir, `${name}.json`), `${JSON.stringify({ ...(path ? {} : { vault_deleted: true }), changed, deleted_ids: deleted }, null, 2)}\n`, { mode: 0o600 });

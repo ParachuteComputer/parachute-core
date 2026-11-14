@@ -9,8 +9,9 @@
 //   - `upgrade --rollback` refuses while anything holds the data (exit 7); stopped, it is code-only: 0.9's step
 //     moved no schema number, so nothing on disk changes, and 0.8 serves every 0.9 write. 0.9 then picks up what
 //     0.8 wrote meanwhile (and backs up again first);
-//   - `upgrade --rollback --restore --yes` exports the notes changed since the backup, then puts the backup back,
-//     and 0.8 serves that;
+//   - `upgrade --rollback --restore --yes` exports the notes changed since the backup (with their tags and links; a
+//     tag-only change counts), then puts the backup back, and 0.8 serves that. A key revoked under 0.9 since the
+//     backup stays refused, whether the backup held it or it was minted after; a key never revoked still reads;
 //   - a home 0.9 made has no earlier release: no backup, nothing to roll back.
 // Before any of that, on the home as 0.8 left it (the release blocker of 2026-11-13: `upgrade --check` wasn't built,
 // so 0.9 backed the home up, recorded it as moved, and only then said `unknown service "--check"`):
@@ -410,9 +411,29 @@ describe("lifecycle/upgrade", () => {
   }, 300_000);
 
   test("rollback --restore: notes changed since the backup are exported, the backup's databases go back, and 0.8 serves them", async () => {
+    // Since the second backup, under 0.9: a note with a tag and a link; a note whose only change is a tag; a key that
+    // existed at the backup is revoked; a key is minted and revoked. None of those revocations may be undone.
+    let late = "";
+    let madeSince = "";
     const box = await serve(info.bin, "0.9 serve");
     try {
-      await post(writer, "late", "Written under 0.9 after the second backup.");
+      await post(writer, "late", "Written under 0.9 after the second backup.", ["late-tag"]);
+      const linked = await api(writer).patch(`/notes/${ids.late}`, { links: { add: [{ target: ids.plan, relationship: "follows" }] }, force: true });
+      must(linked.status === 200, `linking the late note gave ${linked.status}: ${JSON.stringify(linked.body).slice(0, 300)}`);
+      const tagged = await api(writer).patch(`/notes/${ids.eight}`, { tags: { add: ["tagged-late"] }, force: true });
+      must(tagged.status === 200, `tagging the 0.8 note gave ${tagged.status}: ${JSON.stringify(tagged.body).slice(0, 300)}`);
+      must((await core(["keys", "revoke", "nine-writer"])).code === 0, "keys revoke nine-writer");
+      const made = await core(["keys", "new", "late-key", "--vault", vault, "--can", "read"]);
+      must(made.code === 0, `keys new late-key exited ${made.code}: ${made.stderr.slice(-600)}`);
+      late = made.stdout.trim().split("\n").pop()!.trim();
+      expect((await api(late).get(`/notes/${ids.plan}`)).status).toBe(200); // a real, working key
+      must((await core(["keys", "revoke", "late-key"])).code === 0, "keys revoke late-key");
+      // And a key minted since the backup and never revoked: the restored hub won't know it, so it must not go on
+      // working where nobody could list or revoke it.
+      const kept = await core(["keys", "new", "made-since", "--vault", vault, "--can", "read"]);
+      must(kept.code === 0, `keys new made-since exited ${kept.code}: ${kept.stderr.slice(-600)}`);
+      madeSince = kept.stdout.trim().split("\n").pop()!.trim();
+      expect((await api(madeSince).get(`/notes/${ids.plan}`)).status).toBe(200);
     } finally {
       await box.stop();
     }
@@ -422,13 +443,24 @@ describe("lifecycle/upgrade", () => {
     const out = JSON.parse(r.stdout.trim().split("\n").pop()!);
     expect(out).toMatchObject({ rolled_back: true, mode: "restore" });
     expect(out.exported_notes).toBeGreaterThanOrEqual(1);
+    expect(out.revocations_kept).toBeGreaterThanOrEqual(2);
     const exported = readdirSync(out.exported_to).map((f) => readFileSync(join(out.exported_to, f), "utf8")).join("\n");
     expect(exported).toContain("Written under 0.9 after the second backup.");
+    // The export holds tags and links too, and a note whose only change is a tag counts as changed.
+    const changed = readdirSync(out.exported_to).flatMap((f) => JSON.parse(readFileSync(join(out.exported_to, f), "utf8")).changed as any[]);
+    const lateRow = changed.find((n) => n.id === ids.late);
+    expect(lateRow?.tags).toContain("late-tag");
+    expect(lateRow?.links).toEqual(expect.arrayContaining([expect.objectContaining({ target_id: ids.plan, relationship: "follows" })]));
+    expect(changed.find((n) => n.id === ids.eight)?.tags).toContain("tagged-late");
 
     const back = await serve(prevBin, "0.8 serve on the restored home");
     try {
       expect((await api(writer).get(`/notes/${ids.late}`)).status).toBe(404);
-      expect((await api(writer).get(`/notes/${ids.eight}`)).status).toBe(200);
+      expect((await api(writer).get(`/notes/${ids.eight}`)).status).toBe(200); // a key never revoked still works
+      // A key revoked since the backup stays revoked, whether it was in the backup or minted after it.
+      expect((await api(nine).get(`/notes/${ids.plan}`)).status).toBe(401);
+      expect((await api(late).get(`/notes/${ids.plan}`)).status).toBe(401);
+      expect((await api(madeSince).get(`/notes/${ids.plan}`)).status).toBe(401); // made since the backup: gone
     } finally {
       await back.stop();
     }
