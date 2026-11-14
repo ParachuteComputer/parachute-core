@@ -315,6 +315,7 @@ A note's response carries \`existed\` (true/false) whenever ITS \`if_exists\` wa
       inputSchema: {
         type: "object",
         properties: {
+          why: { type: "string", description: "Why this change was made, in a few words (at most 280 characters). Kept with the write set: each revision it makes shows it, and GET /api/write-sets lists it." },
           // Single note fields
           content: { type: "string", description: "Note content (markdown). Wikilinks like [[Target]] auto-resolve." },
           path: { type: "string", description: "Note path (e.g., 'Projects/README')" },
@@ -386,6 +387,7 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
       inputSchema: {
         type: "object",
         properties: {
+          why: { type: "string", description: "Why this change was made, in a few words (at most 280 characters). Kept with the write set: each revision it makes shows it, and GET /api/write-sets lists it." },
           id: { type: "string", description: "Note ID, path, or (fallback, only when id/path both miss and exactly one note matches) its H1 title" },
           content: { type: "string", description: "New content (full replace). Mutually exclusive with `append`/`prepend` and `content_edit`." },
           append: { type: "string", description: "Text to append to the end of the note. Atomic at the SQL layer — concurrent appends are safe. Mutually exclusive with `content` and `content_edit`. No precondition required." },
@@ -521,6 +523,7 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
       inputSchema: {
         type: "object",
         properties: {
+          why: { type: "string", description: "Why this change was made, in a few words (at most 280 characters). Kept with the write set: each revision it makes shows it, and GET /api/write-sets lists it." },
           id: { type: "string", description: "Note ID, path, or (fallback, only when id/path both miss and exactly one note matches) its H1 title" },
           ids: { type: "array", items: { type: "string" }, description: "Several notes (IDs or paths), instead of `id`; up to 500" },
           erase_history: { type: "boolean", description: "Also erase every saved version, so the vault can't restore the note (default false; a git mirror or backup keeps its own copy). Needs admin scope. Takes only an exact id or path." },

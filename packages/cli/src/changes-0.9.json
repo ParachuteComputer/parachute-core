@@ -1569,6 +1569,50 @@
    "since": "0.9",
    "removed_in": "1.0",
    "state": "planned"
+  },
+  {
+   "kind": "endpoint",
+   "old": "(none) a write left no record of the call it came from",
+   "new": "GET /vault/<n>/api/write-sets?by=me|<key name>&limit=&before= and GET /api/write-sets/<id>: each write set (one REST call or MCP tool call) with by, via, via_kind, why, its records (id, op, path), undoes and undone_by. A key sees its own; admin any; a tag-scoped key only sets whose records it can see",
+   "action": "keep",
+   "reason": "additive (0.9.4): a person can ask which AI wrote what, and why. A 0.8 client never calls it",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live",
+   "release": "0.9.4"
+  },
+  {
+   "kind": "setting",
+   "old": "(none)",
+   "new": "request headers Parachute-Why (a reason, at most 280 characters; percent-encode non-ASCII) and Parachute-Write-Set (8-64 of [A-Za-z0-9_-]: several requests as one set; only the key that opened it may add)",
+   "action": "keep",
+   "reason": "additive (0.9.4): both are optional; a request without them is its own write set",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live",
+   "release": "0.9.4"
+  },
+  {
+   "kind": "mcp-tool",
+   "old": "create-note, update-note, delete-note (no reason for a write)",
+   "new": "an optional `why` on create-record, update-record and delete-record and their note-named aliases: kept with the write set and shown on each revision it makes",
+   "action": "keep",
+   "reason": "additive (0.9.4): a 0.8 client that never sends it writes as before",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live",
+   "release": "0.9.4"
+  },
+  {
+   "kind": "endpoint",
+   "old": "GET /api/notes/<id>/versions: a version says who (actor, via, via_kind)",
+   "new": "each version also carries write_set, why, types, tags and links (as the record had them); null on versions made before 0.9.4. A tag-scoped reader sees none of who, why, write_set or links",
+   "action": "keep",
+   "reason": "additive (0.9.4): revisions say who and why. Every existing field is unchanged",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live",
+   "release": "0.9.4"
   }
  ]
 }

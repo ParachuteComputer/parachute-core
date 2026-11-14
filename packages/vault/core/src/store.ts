@@ -1,3 +1,5 @@
+import { changeLogPresent, setWriteContext, clearWriteContext, currentWriteSet, forgetLoggedPast, pruneChangeLog, type WriteSetContext } from "./change-log.js";
+import { dropBlobsIfUnheld, settleLogBodies } from "./history.js";
 import { Database } from "bun:sqlite";
 import { anyTermsQuery, fuseRanks, HYBRID_POOL } from "./hybrid.js";
 import { HistoryPreconditionRequiredError } from "./history.js";
@@ -173,7 +175,52 @@ export class BunSqliteStore implements Store {
    * `ctx.storage.transactionSync`. Synchronous — `fn` must not await.
    */
   transaction<T>(fn: () => T): T {
-    return transaction(this.db, fn);
+    // The change log (0.9.4): the outermost Store transaction says which write set its writes belong to. The
+    // request edge supplies one through writeSetSource (one REST call or MCP tool call is one set); without one,
+    // each transaction is its own set.
+    if (this.writeContextOpen || !this.changeLogReady()) return transaction(this.db, fn);
+    const out = transaction(this.db, () => {
+      this.writeContextOpen = true;
+      try {
+        setWriteContext(this.db, this.writeSetSource?.() ?? {});
+        return fn();
+      } finally {
+        this.writeContextOpen = false;
+        settleLogBodies(this.db, currentWriteSet(this.db));
+        clearWriteContext(this.db);
+      }
+    });
+    this.pruneChangeLogDaily();
+    return out;
+  }
+
+  private changeLogPrunedAt = 0;
+  /** Sweeps the change log past its horizon (history.change_log_days), at most once a day per open store. */
+  pruneChangeLogDaily(now = Date.now()): { changes: number; sets: number } | null {
+    if (now - this.changeLogPrunedAt < 86_400_000) return null;
+    this.changeLogPrunedAt = now;
+    try {
+      return this.transaction(() => {
+        const pruned = pruneChangeLog(this.db, this.historyPolicy.change_log_days, new Date(now));
+        dropBlobsIfUnheld(this.db, pruned.hashes);
+        return { changes: pruned.changes, sets: pruned.sets };
+      });
+    } catch (error) {
+      console.warn("[vault] change log sweep failed:", error);
+      return null;
+    }
+  }
+
+  /**
+   * The write set the current request writes under (0.9.4). The server installs one backed by AsyncLocalStorage at
+   * the request edge; core stays free of node imports, and a Durable Object installs its own.
+   */
+  writeSetSource?: () => WriteSetContext | undefined;
+  private writeContextOpen = false;
+  private changeLogKnown: boolean | undefined;
+  private changeLogReady(): boolean {
+    if (this.changeLogKnown === undefined) this.changeLogKnown = changeLogPresent(this.db);
+    return this.changeLogKnown;
   }
 
   /**
@@ -592,29 +639,30 @@ export class BunSqliteStore implements Store {
       if (normalized !== opts.metadata) opts = { ...opts, metadata: normalized };
     }
 
+    // The note and the links it makes are one transaction, so they are one write set in the change log (0.9.4).
     const note = this.transaction(() => {
-      const created = noteOps.createNote(this.db, content, opts);
+      const note = noteOps.createNote(this.db, content, opts);
       // Explicit IDs may recreate a deleted note with retained history.
-      refreshCompactState(this.db, created.id);
-      return created;
+      refreshCompactState(this.db, note.id);
+
+      if (content && !opts?.deferWikilinkSync) {
+        syncWikilinks(this.db, note.id, content, opts?.linkVisible);
+      }
+
+      if (note.path) {
+        resolveUnresolvedWikilinks(this.db, note.path, note.id);
+        // vault#581 — this note becoming a NEW candidate can only make an
+        // existing ambiguity wider, but the recorded `candidate_count` has to
+        // stay honest. Bounded to rows whose target could name this note.
+        refreshAmbiguousLinks(this.db, noteResolutionKeys(note));
+      }
+
+      // Reference-field auto-link (vault#typed-reference-field) — no prior
+      // metadata on a fresh create. Cheap no-op when nothing on the note's
+      // effective schema declares `type: "reference"`.
+      this.syncReferenceFieldLinks(note, undefined, opts?.linkVisible);
+      return note;
     });
-
-    if (content && !opts?.deferWikilinkSync) {
-      syncWikilinks(this.db, note.id, content, opts?.linkVisible);
-    }
-
-    if (note.path) {
-      resolveUnresolvedWikilinks(this.db, note.path, note.id);
-      // vault#581 — this note becoming a NEW candidate can only make an
-      // existing ambiguity wider, but the recorded `candidate_count` has to
-      // stay honest. Bounded to rows whose target could name this note.
-      refreshAmbiguousLinks(this.db, noteResolutionKeys(note));
-    }
-
-    // Reference-field auto-link (vault#typed-reference-field) — no prior
-    // metadata on a fresh create. Cheap no-op when nothing on the note's
-    // effective schema declares `type: "reference"`.
-    this.syncReferenceFieldLinks(note, undefined, opts?.linkVisible);
 
     this.invalidateConfigCachesForPath(note.path);
     // Inside a batch (transactionAsync) the note exists only once the batch commits: no hook may hear of it before,
@@ -986,7 +1034,14 @@ export class BunSqliteStore implements Store {
 
   async listNoteVersions(id: string, opts?: { limit?: number; offset?: number }) { return listVersions(this.db, id, opts); }
   async getNoteVersion(id: string, versionIx: number) { return getVersion(this.db, id, versionIx); }
-  async eraseNoteHistory(id: string) { return eraseHistory(this.db, id); }
+  async eraseNoteHistory(id: string) {
+    // The change log's copies of this record's past go with its versions (0.9.4).
+    return this.transaction(() => {
+      const held = forgetLoggedPast(this.db, id);
+      const erased = eraseHistory(this.db, id);
+      return { ...erased, blobsDeleted: erased.blobsDeleted + dropBlobsIfUnheld(this.db, held) };
+    });
+  }
   sweepDeletedHistory() { return sweepDeletedHistory(this.db, this.historyPolicy); }
   async countNoteVersions(id: string) { return countNoteVersions(this.db, id); }
   compactNote(id: string) { return compactNote(this.db, id, this.historyPolicy); }
@@ -1053,7 +1108,9 @@ export class BunSqliteStore implements Store {
     const existing = noteOps.getNote(this.db, id);
     const erased = this.transaction(() => {
       if (existing) this.deleteNoteRows(id, existing, { ...opts, captureHistory: false });
-      return eraseNoteVersions(this.db, id);
+      const erased = eraseNoteVersions(this.db, id);
+      // The change log forgets its copies of this record's past too (0.9.4).
+      return { ...erased, blobsDeleted: erased.blobsDeleted + dropBlobsIfUnheld(this.db, forgetLoggedPast(this.db, id)) };
     });
     if (existing) this.afterDelete(id, existing);
     return { deleted: existing !== null, ...erased };
@@ -1366,11 +1423,11 @@ export class BunSqliteStore implements Store {
   // ---- Tags ----
 
   async tagNote(noteId: string, tags: string[]): Promise<void> {
-    noteOps.tagNote(this.db, noteId, tags);
+    this.transaction(() => noteOps.tagNote(this.db, noteId, tags));
   }
 
   async untagNote(noteId: string, tags: string[]): Promise<void> {
-    noteOps.untagNote(this.db, noteId, tags);
+    this.transaction(() => noteOps.untagNote(this.db, noteId, tags));
   }
 
   async expandTagsWithDescendants(tags: string[]): Promise<Set<string>> {
@@ -1394,7 +1451,7 @@ export class BunSqliteStore implements Store {
   }
 
   async deleteTag(name: string, opts?: noteOps.DeleteTagOpts): Promise<noteOps.DeleteTagResult> {
-    const result = noteOps.deleteTag(this.db, name, opts);
+    const result = this.transaction(() => noteOps.deleteTag(this.db, name, opts));
     // Referential-integrity refusal (vault#552) — nothing was written;
     // caches and hooks are untouched.
     if ("error" in result) return result;
@@ -1412,7 +1469,7 @@ export class BunSqliteStore implements Store {
   }
 
   async renameTag(oldName: string, newName: string, opts?: { actor?: string; via?: string }): Promise<noteOps.RenameTagResult> {
-    const result = noteOps.renameTag(this.db, oldName, newName, opts, this.historyPolicy);
+    const result = this.transaction(() => noteOps.renameTag(this.db, oldName, newName, opts, this.historyPolicy));
     // Vault#240: the cascade rewrites parent_names in OTHER tag rows as
     // part of the same transaction, plus tokens.scoped_tags and
     // indexed_fields.declarer_tags. Both caches are tag-keyed, so they
@@ -1437,7 +1494,7 @@ export class BunSqliteStore implements Store {
     sources: string[],
     target: string,
   ): Promise<{ merged: Record<string, number>; target: string }> {
-    const result = noteOps.mergeTags(this.db, sources, target);
+    const result = this.transaction(() => noteOps.mergeTags(this.db, sources, target));
     // Source tags drop out of the hierarchy; downstream callers asking
     // for descendants of target should pick up any merged children. Also
     // bust the schema cache — `fields` declarations follow tag identity.
@@ -1464,11 +1521,11 @@ export class BunSqliteStore implements Store {
   // ---- Links ----
 
   async createLink(sourceId: string, targetId: string, relationship: string, metadata?: Record<string, unknown>): Promise<Link> {
-    return linkOps.createLink(this.db, sourceId, targetId, relationship, metadata);
+    return this.transaction(() => linkOps.createLink(this.db, sourceId, targetId, relationship, metadata));
   }
 
   async deleteLink(sourceId: string, targetId: string, relationship: string): Promise<void> {
-    linkOps.deleteLink(this.db, sourceId, targetId, relationship);
+    this.transaction(() => linkOps.deleteLink(this.db, sourceId, targetId, relationship));
   }
 
   async getLinks(noteId: string, opts?: { direction?: "outbound" | "inbound" | "both" }): Promise<Link[]> {
@@ -1493,6 +1550,8 @@ export class BunSqliteStore implements Store {
       const normalized = normalizeDateFields(schemaConfig, { tags: input.tags, metadata: input.metadata });
       return normalized !== input.metadata ? { ...input, metadata: normalized } : input;
     });
+    // One transaction for the batch and its link syncs, so the batch is one write set (0.9.4).
+    return this.transaction(() => {
     const notes = noteOps.createNotes(this.db, normalizedInputs);
     for (const note of notes) {
       // Bulk path needs the same config-cache invalidation as singleton
@@ -1506,14 +1565,15 @@ export class BunSqliteStore implements Store {
       afterCommit(this.db, () => this.hooks.dispatch("created", note, this)); // after the batch commits, as createNote
     }
     return notes;
+    });
   }
 
   async batchTag(noteIds: string[], tags: string[]): Promise<number> {
-    return noteOps.batchTag(this.db, noteIds, tags);
+    return this.transaction(() => noteOps.batchTag(this.db, noteIds, tags));
   }
 
   async batchUntag(noteIds: string[], tags: string[]): Promise<number> {
-    return noteOps.batchUntag(this.db, noteIds, tags);
+    return this.transaction(() => noteOps.batchUntag(this.db, noteIds, tags));
   }
 
   // ---- Deeper Link Queries ----

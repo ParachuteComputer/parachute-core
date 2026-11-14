@@ -7,6 +7,7 @@ import { timestampToMs } from "./cursor.js";
 import { ensureRelationshipColumn } from "./wikilinks.js";
 import { rebuildCompactState } from "./history-compact-state.js";
 import { recordTagKinds } from "./tag-kind.js";
+import { changeLogPresent, ensureChangeLog } from "./change-log.js";
 
 export const SCHEMA_VERSION = 32;
 /**
@@ -48,6 +49,27 @@ function ensureRevisionKeyKind(db: Database): void {
   if (hasTable(db, "note_versions") && !hasColumn(db, "note_versions", "via_kind")) {
     db.exec("ALTER TABLE note_versions ADD COLUMN via_kind TEXT");
   }
+}
+
+/**
+ * Revisions say who and why (0.9.4, T-471): each version names the write set that superseded it (whose `why` is on
+ * `write_sets`), and keeps the types, tags and outgoing links the record had, as JSON. Additive, with no schema
+ * number, like ensureRevisionKeyKind: an older engine writes NULL there and reads around them. Never backfilled.
+ */
+const REVISION_SET_COLUMNS = ["write_set", "types", "tags", "links"] as const;
+function revisionColumnsPresent(db: Database): boolean {
+  return !hasTable(db, "note_versions") || REVISION_SET_COLUMNS.every((c) => hasColumn(db, "note_versions", c));
+}
+function ensureRevisionWriteSet(db: Database): void {
+  if (!hasTable(db, "note_versions")) return;
+  for (const c of REVISION_SET_COLUMNS) {
+    if (!hasColumn(db, "note_versions", c)) db.exec(`ALTER TABLE note_versions ADD COLUMN ${c} TEXT`);
+  }
+}
+
+/** The change log (0.9.4): its tables and triggers ride on notes, note_tags and links. See change-log.ts. */
+function ensureChangeLogStep(db: Database): void {
+  if (hasTable(db, "notes") && hasTable(db, "note_tags") && hasTable(db, "links")) ensureChangeLog(db);
 }
 
 function ensureTagKinds(db: Database): void {
@@ -751,7 +773,9 @@ export function unnumberedStepsDone(db: Database): boolean {
     hasColumn(db, "tags", "kind") && // ensureTagKinds (T-318 §8a, 0.9)
     (!hasTable(db, "note_versions") || hasColumn(db, "note_versions", "via_kind")) && // ensureRevisionKeyKind (0.9.1)
     (!hasTable(db, "notes") || hasColumn(db, "notes_fts", "fields")) && // ensureFtsFields (0.9.3)
-    (!hasTable(db, "notes") || ftsInsertTriggerIsCurrent(db)) // ensureFtsInsertTrigger (0.9.3)
+    (!hasTable(db, "notes") || ftsInsertTriggerIsCurrent(db)) && // ensureFtsInsertTrigger (0.9.3)
+    revisionColumnsPresent(db) && // ensureRevisionWriteSet (0.9.4)
+    (!hasTable(db, "notes") || changeLogPresent(db)) // ensureChangeLogStep (0.9.4)
   );
 }
 
@@ -778,6 +802,8 @@ export function initSchema(db: Database): void {
       ensureRevisionKeyKind(db);
       ensureFtsFields(db);
       ensureFtsInsertTrigger(db);
+      ensureRevisionWriteSet(db);
+      ensureChangeLogStep(db);
     }
     rebuildIndexes(db);
     return;
@@ -936,6 +962,10 @@ export function initSchema(db: Database): void {
   ensureFtsFields(db);
   // The insert trigger clears a leftover field-text row first (0.9.3).
   ensureFtsInsertTrigger(db);
+  // Revisions say who and why: the write set, types, tags and links on each version (0.9.4).
+  ensureRevisionWriteSet(db);
+  // The change log: write sets and record_changes, kept by triggers (0.9.4).
+  ensureChangeLogStep(db);
 
   // Rebuild any generated columns + indexes declared in indexed_fields.
   // No-op for a fresh vault; idempotent on existing vaults.

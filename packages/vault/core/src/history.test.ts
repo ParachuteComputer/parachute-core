@@ -98,6 +98,8 @@ describe("vault#524 history retention and blob integrity", () => {
     );
     expect(count("note_versions")).toBe(1);
     expect(count("note_blobs")).toBe(1);
+    // The change log (0.9.4) holds a's edit's "before" body too, until its horizon; this test is about versions.
+    db.exec("DELETE FROM record_changes");
     await store.eraseNoteHistory(b.id);
     expect(count("note_blobs")).toBe(0);
   });
@@ -185,6 +187,8 @@ describe("vault#524 history retention and blob integrity", () => {
     const second = await store.createNote("orphan");
     await store.updateNote(second.id, { content: "new" });
     db.prepare("DELETE FROM note_versions WHERE note_id=?").run(second.id);
+    // The change log (0.9.4) holds that edit's "before" body until its horizon; this test is about versions.
+    db.exec("DELETE FROM record_changes");
     expect(count("note_blobs")).toBe(1);
     const third = await store.createNote("third");
     await store.eraseNoteHistory(third.id);
