@@ -8,6 +8,7 @@ import { ensureRelationshipColumn } from "./wikilinks.js";
 import { rebuildCompactState } from "./history-compact-state.js";
 import { recordTagKinds } from "./tag-kind.js";
 import { changeLogPresent, ensureChangeLog } from "./change-log.js";
+import { ensureFeed, feedPresent } from "./feed.js";
 
 export const SCHEMA_VERSION = 32;
 /**
@@ -71,6 +72,11 @@ function ensureRevisionWriteSet(db: Database): void {
 /** The change log (0.9.4): its tables and triggers ride on notes, note_tags and links. See change-log.ts. */
 function ensureChangeLogStep(db: Database): void {
   if (hasTable(db, "notes") && hasTable(db, "note_tags") && hasTable(db, "links")) ensureChangeLog(db);
+}
+
+/** The feed (0.9.4): the readers' held positions (`feed_readers`). Positions and the horizon are the change log's. See feed.ts. */
+function ensureFeedStep(db: Database): void {
+  if (hasTable(db, "record_changes")) ensureFeed(db);
 }
 
 function ensureTagKinds(db: Database): void {
@@ -776,7 +782,8 @@ export function unnumberedStepsDone(db: Database): boolean {
     (!hasTable(db, "notes") || hasColumn(db, "notes_fts", "fields")) && // ensureFtsFields (0.9.3)
     (!hasTable(db, "notes") || ftsInsertTriggerIsCurrent(db)) && // ensureFtsInsertTrigger (0.9.3)
     revisionColumnsPresent(db) && // ensureRevisionWriteSet (0.9.4)
-    (!hasTable(db, "notes") || changeLogPresent(db)) // ensureChangeLogStep (0.9.4)
+    (!hasTable(db, "notes") || changeLogPresent(db)) && // ensureChangeLogStep (0.9.4)
+    (!hasTable(db, "record_changes") || feedPresent(db)) // ensureFeedStep (0.9.4)
   );
 }
 
@@ -805,6 +812,7 @@ export function initSchema(db: Database): void {
       ensureFtsInsertTrigger(db);
       ensureRevisionWriteSet(db);
       ensureChangeLogStep(db);
+      ensureFeedStep(db);
     }
     rebuildIndexes(db);
     return;
@@ -967,6 +975,8 @@ export function initSchema(db: Database): void {
   ensureRevisionWriteSet(db);
   // The change log: write sets and record_changes, kept by triggers (0.9.4).
   ensureChangeLogStep(db);
+  // The feed: the readers' held positions (0.9.4).
+  ensureFeedStep(db);
 
   // Rebuild any generated columns + indexes declared in indexed_fields.
   // No-op for a fresh vault; idempotent on existing vaults.

@@ -54,6 +54,7 @@
 
 import { sayWriter, withRequestScope } from "./write-set-edge.ts";
 import { handleWriteSets } from "./write-sets-routes.ts";
+import { handleFeed } from "./feed-routes.ts";
 import { countName, restRouteName, typesRouteName } from "./name-usage.ts";
 import { recordsRoute } from "../core/src/rest-records.ts";
 import { handleRecordsRest } from "./records-rest.ts";
@@ -1268,8 +1269,9 @@ async function routeRequest(
   // notes. Gate it on `read`, not `write`, so a read-scoped caller can
   // preview a schema tightening without holding a write credential.
   const apiSubpath = apiMatch[1] ?? "";
+  // The feed's commit (0.9.4) moves the caller's own bookmark, never a record: `read` is enough.
   const isReadOnlyPost =
-    req.method === "POST" && /^\/tags\/[^/]+\/conformance$/.test(apiSubpath);
+    req.method === "POST" && (/^\/tags\/[^/]+\/conformance$/.test(apiSubpath) || apiSubpath === "/feed/position");
   // Tag-schema/taxonomy mutation carve-out — mirrors the MCP-side
   // update-tag/delete-tag/rename-tag/merge-tags re-tier (write → admin):
   // these tools define a tag's SCHEMA or restructure the tag graph across
@@ -1373,6 +1375,11 @@ async function routeRequest(
   // The change log (0.9.4): which writes a key made, with who and why.
   if (apiPath === "/write-sets" || apiPath.startsWith("/write-sets/")) {
     const res = handleWriteSets(req, store.db, apiPath.slice("/write-sets".length), { via: writeCtx.via ?? null, admin: hasScopeForVault(auth.scopes, vaultName, "admin") }, tagScope);
+    if (res) return res;
+  }
+  // The feed (0.9.4): the changes after a reader's position, held per (via, reader).
+  if (apiPath === "/feed" || apiPath.startsWith("/feed/")) {
+    const res = await handleFeed(req, store, apiPath.slice("/feed".length), writeCtx.via ?? null, tagScope);
     if (res) return res;
   }
   // Live-query SSE transport REMOVED (WS-hibernation migration Phase 5). The
