@@ -35,7 +35,7 @@ import {
 import { type PortListeningFn, defaultPortListening } from "../port-probe.ts";
 import { type AliveFn, logPath as logPathFor, processState } from "../process-state.ts";
 import { getSpec, knownServices } from "../service-spec.ts";
-import { readManifest } from "../services-manifest.ts";
+import { readManifest, readManifestUnchanged } from "../services-manifest.ts";
 
 /**
  * Tiny seam over `Bun.spawn`, retained for the `parachute logs <svc> --follow`
@@ -714,7 +714,8 @@ export async function logs(svc: string, opts: LogsOpts = {}): Promise<number> {
   // name maps to something the CLI manages.
   const isFirstParty = getSpec(svc) !== undefined;
   if (!isFirstParty && svc !== HUB_SVC) {
-    const entry = readManifest(manifestPath).services.find((s) => s.name === svc);
+    // (read as it is: `logs` only looks, and must not heal services.json on the way)
+    const entry = readManifestUnchanged(manifestPath).services.find((s) => s.name === svc);
     if (!entry) {
       log(`unknown service "${svc}". known: ${[HUB_SVC, ...knownServices()].join(", ")}`);
       return 1;

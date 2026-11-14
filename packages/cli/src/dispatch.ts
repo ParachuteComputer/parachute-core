@@ -251,10 +251,15 @@ export async function dispatch(role: Role, notice?: Notice): Promise<void> {
       process.exit(refused.code);
     }
   }
-  if (notice) {
+  // An old name is said, and counted in the home's usage log, only once the command is going to run: for a command
+  // of the moved CLIs that is after the release step below, so one refused there leaves nothing in the home.
+  const sayNotice = async () => {
+    if (!notice) return;
     const { announce } = await import("./front.ts");
     announce(notice, home);
-  }
+    notice = undefined;
+  };
+  if (!("cli" in r)) await sayNotice();
   if ("frontHelp" in r) {
     const { frontHelp } = await import("./front.ts");
     console.log(frontHelp());
@@ -318,6 +323,12 @@ export async function dispatch(role: Role, notice?: Notice): Promise<void> {
     const { upgradeCore } = await import("./upgrade.ts");
     process.exit(await upgradeCore(home, upgradeAsk, newerCheck));
   }
+  // `stop`, `start` and `restart` of the whole service, where core's own unit serves this home (unit.ts): the
+  // unit's, through systemctl. No database is opened and no step taken here; the unit's serve takes it at its start.
+  if (r.cli === "hub" && ["stop", "start", "restart"].includes(r.argv[0] ?? "") && (r.argv[1] === undefined || r.argv[1] === "hub")) {
+    const { coreUnitServes, coreUnitVerb } = await import("./unit.ts");
+    if (coreUnitServes(home) && !managedRefusal("hub", r.argv)) process.exit(coreUnitVerb(r.argv[0]!));
+  }
   {
     // The first time this release opens a home an older one served: record the step and back the databases up
     // first (release.ts). Not a host's (embedded) home, nor one the old 0.7 programs still own. A home marked
@@ -335,6 +346,7 @@ export async function dispatch(role: Role, notice?: Notice): Promise<void> {
     const { openCopy } = await import("./upgrade.ts");
     process.exit(await openCopy(home));
   }
+  await sayNotice();
   if (r.cli === "hub" && r.argv[0] === "keys") {
     // `keys` (and its alias `tokens`) is core's (keys.ts): answered here, or mapped onto the hub's auth commands.
     const { keysCommand } = await import("./keys.ts");

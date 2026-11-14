@@ -234,7 +234,7 @@ const servedBy = (home: string) => holders(home).filter((h) => SERVER.test(h.cmd
 function notServed(home: string, doing: string): void {
   const served = servedBy(home);
   if (served.length) {
-    throw new Exit(EXIT.held, `${doing}, but a Parachute server is running on it: ${served.map((h) => `pid ${h.pid} (${h.cmd.slice(0, 80)})`).join(", ")}. Nothing was changed: a home is not recorded as moved while another release serves it. Stop it (\`parachute stop\` and \`parachute restart\` still work from here, or use its unit), then run this again; \`parachute upgrade --check\` tries the step on a copy meanwhile.`);
+    throw new Exit(EXIT.held, `${doing}, but a Parachute server is running on it: ${served.map((h) => `pid ${h.pid} (${h.cmd.slice(0, 80)})`).join(", ")}. Nothing was changed: a home is not recorded as moved while another release serves it. Stop it (\`parachute stop\` and \`parachute restart\` still work from here where a unit serves this home, or stop its unit or its \`parachute serve\` yourself), then run this again; \`parachute upgrade --check\` tries the step on a copy meanwhile.`);
   }
 }
 

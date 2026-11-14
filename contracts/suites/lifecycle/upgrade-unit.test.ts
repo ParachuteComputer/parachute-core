@@ -110,12 +110,26 @@ afterAll(async () => {
 });
 
 describe("lifecycle/upgrade through the service unit", () => {
-  test("0.9 installed beside 0.8: the unit's next start runs it, backs up first, and records the exact version before", async () => {
+  test("0.9 installed beside 0.8 while 0.8 serves: `parachute restart` is the unit's, and its next start runs 0.9, backs up first, and records the exact version before", async () => {
+    // As it goes on a live box: 0.8 serves through the unit while 0.9 is installed beside it.
+    const old = await unitUp("0.8 through the unit");
+    expect(old.runs().startsWith(`${v08}-`)).toBe(true);
     const r = await m.run([join(info.dir, "bin", "parachute"), "install", "--prefix", prefix], { env: base });
     must(r.code === 0, `0.9's install exited ${r.code}: ${r.stderr.slice(-600)}`);
     expect(link()).toBe(`../${v09}/bin/parachute-core`);
     expect(existsSync(binOf(v08))).toBe(true); // the copy to go back to is kept
-    const unit = await unitUp("0.9 through the unit");
+    // `parachute` is 0.9 now, and 0.8 still serves. No step is taken under it, and an old name refused there is not
+    // counted in the home either.
+    expect((await linked(["auth", "list-users"])).code).toBe(7);
+    expect(existsSync(join(m.home, "run"))).toBe(false);
+    expect(backups()).toEqual([]);
+    // The service is core's own unit, so `restart` is that unit's (the hub's restart knows only a hub unit, and on
+    // such a box said none was installed): through the service manager, opening nothing itself.
+    const calls = m.systemctlCalls().length;
+    const restarted = await linked(["restart"]);
+    must(restarted.code === 0, `parachute restart exited ${restarted.code}: ${restarted.stderr.slice(-600)} ${restarted.stdout.slice(-300)}`);
+    expect(m.systemctlCalls().slice(calls).join("\n")).toContain(`restart ${UNIT}`);
+    const unit = { ...(await serving(m, { vaultName: vault, origin }, UNIT)), runs: old.runs };
     try {
       expect(unit.runs().startsWith(`${v09}-`)).toBe(true);
       expect(release()).toMatchObject({ version: v09, previous: v08, state: "current" }); // not just "0.8"
