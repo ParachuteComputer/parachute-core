@@ -3037,6 +3037,13 @@ async function cmdImport(args: string[]) {
     if (stats.notes_wiped > 0) {
       console.log(`Blow-away: wiped ${stats.notes_wiped} pre-existing note(s).`);
     }
+    if (stats.history_versions_added > 0 || stats.history_versions_present > 0 || stats.skipped_history.length > 0) {
+      console.log(
+        `History: ${dryRun ? "would add" : "added"} ${stats.history_versions_added} version(s)` +
+        (stats.history_versions_present > 0 ? `, ${stats.history_versions_present} already here` : "") +
+        (stats.skipped_history.length > 0 ? `, ${stats.skipped_history.length} left out (see warnings above)` : "") + ".",
+      );
+    }
     if (stats.skipped_links.length > 0) {
       console.log(`Skipped ${stats.skipped_links.length} link(s) — target notes not in import set.`);
     }
@@ -3133,6 +3140,7 @@ async function cmdExport(args: string[]) {
   let gitPush = false;
   let strictCaseCollision = false;
   let format: 1 | 2 = 1;
+  let withHistory = false;
 
   const positional: string[] = [];
   for (let i = 0; i < args.length; i++) {
@@ -3193,6 +3201,8 @@ async function cmdExport(args: string[]) {
         process.exit(1);
       }
       format = v === "2" ? 2 : 1;
+    } else if (arg === "--with-history") {
+      withHistory = true;
     } else {
       positional.push(arg);
     }
@@ -3201,7 +3211,7 @@ async function cmdExport(args: string[]) {
 
   if (!outputPath) {
     console.error(
-      "Usage: parachute-vault export <dir> [--since <iso>] [--vault <name>] [--format 1|2]\n" +
+      "Usage: parachute-vault export <dir> [--since <iso>] [--vault <name>] [--format 1|2] [--with-history]\n" +
         "                                  [--watch [--interval <seconds>]]\n" +
         "                                  [--git-commit [--git-message-template <tpl>] [--git-push]]",
     );
@@ -3216,6 +3226,9 @@ async function cmdExport(args: string[]) {
     console.error("                              `parachute:`, and files body-less records by type and month.");
     console.error("                              A whole-vault export: not with --since, --watch or --git-commit.");
     console.error("                              Import reads both formats.");
+    console.error("  --with-history              Also write each record's versions (who, why, when, the body) to");
+    console.error("                              .parachute/history/<id>.jsonl; import reads them back. Off by");
+    console.error("                              default. A whole-vault export: not with --since, --watch or --git-commit.");
     console.error("  --watch                     Stay alive; re-export incrementally on every");
     console.error("                              vault write. Polls every --interval seconds.");
     console.error("  --interval <seconds>        Watch poll interval (default: 5)");
@@ -3242,6 +3255,13 @@ async function cmdExport(args: string[]) {
   }
   if ((gitPush || gitMessageTemplate !== DEFAULT_COMMIT_TEMPLATE) && !gitCommit) {
     console.error("--git-push / --git-message-template only apply with --git-commit.");
+    process.exit(1);
+  }
+
+  if (withHistory && (since !== undefined || watch || gitCommit)) {
+    console.error(
+      "--with-history is a whole-vault export: it does not combine with --since, --watch or --git-commit.",
+    );
     process.exit(1);
   }
 
@@ -3324,6 +3344,7 @@ async function cmdExport(args: string[]) {
       ...(opts.sinceCursor ? { since: opts.sinceCursor } : {}),
       ...(strictCaseCollision ? { failOnCaseCollision: true } : {}),
       ...(format === 2 ? { format } : {}),
+      ...(withHistory ? { history: true } : {}),
     });
 
     if (opts.isInitial) {
@@ -3331,6 +3352,12 @@ async function cmdExport(args: string[]) {
         `Exported ${stats.notes} note(s), ${stats.schemas} tag schema(s), ${stats.attachments} attachment(s).`,
       );
       console.log(`Sidecar: ${fullPath}/.parachute/`);
+      if (stats.history) {
+        console.log(
+          `History: ${stats.history.versions} version(s) of ${stats.history.records} record(s) in .parachute/history/` +
+          (stats.history.skipped.length > 0 ? ` (${stats.history.skipped.length} left out, see [export] warnings above)` : "") + ".",
+        );
+      }
       if (stats.filtered_by_since) {
         console.log(`Incremental: filtered by --since ${opts.sinceCursor}.`);
       }

@@ -33,6 +33,9 @@ parachute-vault export <dir> --since 2026-05-12T00:00:00Z
 
 # Format 2 (opt-in): fields flat, see "Format 2" below. Whole-vault only.
 parachute-vault export <dir> --format 2
+
+# With history (opt-in, 0.9.4): each record's versions too, see "History" below. Whole-vault only.
+parachute-vault export <dir> --with-history
 ```
 
 Output (per [`exportVaultToDir`](https://github.com/ParachuteComputer/parachute-vault/blob/main/core/src/portable-md.ts) in `core/src/portable-md.ts`):
@@ -43,6 +46,7 @@ Output (per [`exportVaultToDir`](https://github.com/ParachuteComputer/parachute-
     vault.yaml                # vault meta + export_format_version
     schemas/<tag>.yaml        # one file per schema-carrying tag
     attachments/<id>/...      # binary files, keyed by export-time att.id
+    history/<id>.jsonl        # only with --with-history: one record's versions, one JSON line each
   <note.path>.md              # one file per pathed note
   _unpathed/<title>.md        # one file per pathless note, named after its title
 ```
@@ -125,6 +129,21 @@ Exporting a vault, blowing it away, and re-importing the export reproduces byte-
 - **Attachments.** Frontmatter `attachments[].path` carries the original vault-internal path (relative to `assetsDir`); the binary is copied under `.parachute/attachments/<att-id>/<basename>`. Import restores the binary to the original path. *Caveat:* attachment IDs re-mint on import (no `restoreAttachment(id, ...)` Store surface yet), so round-trip with attachments produces byte-different `attachments[].id` values between original and re-export. Refs still resolve by `(note_id, path)`; operators expecting strict byte-equivalence including att-IDs should know.
 - **Attachment links in note bodies.** When the binaries are copied, a markdown note's link or embed whose target is exactly `/api/storage/<att.path>` for one of its own copied attachments (the `![name](/api/storage/...)` / `[name](/api/storage/...)` the app inserts) is written as the relative path to the copied file, for example `../../.parachute/attachments/<att-id>/<basename>` (percent-encoded), so the exported note's images and links open in a file browser or markdown previewer. That attachment's frontmatter entry records the target it wrote, as `attachments[].body_link`; import turns exactly that target back into the storage link (only a value of that shape: `../` steps, then the attachment's own sidecar path) and drops the key, so the imported body and attachment row equal the original. An attachment gets no `body_link`, and its links stay as stored, when its binary wasn't copied, when the body has no storage link to it, or when the body already holds its relative path (a link typed by hand). So a body without `body_link` entries, including every export made before this key, imports as written. Importers older than this key ignore it and keep the relative links in the body.
 - **Idempotency.** Re-export an unchanged vault → byte-identical bytes (modulo `exported_at` in `vault.yaml`, which callers wanting strict byte-equivalence can pin via the `exportedAt` API option). Clean git diffs.
+
+## History (opt-in, 0.9.4)
+
+`parachute-vault export <dir> --with-history` (and `GET /api/export?history=1`) adds `.parachute/history/<record id>.jsonl` for every record that has versions, deleted records included (their tombstones). One JSON line per version, oldest first:
+
+```json
+{"version_ix":0,"op":"update","superseded_at":"2027-01-02T10:00:00.000Z","created_at":"2027-01-01T09:00:00.000Z","actor":"sam","via":"key:claude","via_kind":"agent","write_set":"ws_…","why":"Sam asked to tidy the summary","path":"notes/plan","extension":"md","metadata":{},"types":["memo"],"tags":["draft"],"links":[],"content_hash":"<sha256 of content>","content_len":11,"content":"first draft"}
+```
+
+`write_set` and `why` name the write that replaced the version; `types`, `tags` and `links` are what the record had (null on versions made before 0.9.4). `content` is the body as text, whatever way the vault stores it (compressed, delta); it is null only for an overflow tombstone (a record over the version size limit, whose bytes were never kept).
+
+- **Off by default.** An export without the option is byte-identical to one from before. 1.0 is to make it the default.
+- **Import reads it back.** Each version lands behind the record's current state, with its stamps and write set (a write set the vault doesn't have is made, with its why, so `why` reads back). Append only: a version the vault already holds (same time, op and body) is skipped, so importing the same export twice adds nothing; into a record that has history already, the imported versions are numbered after its newest. The vault's own retention applies afterwards, as to any version. An export without the folder imports as before.
+- **Not in it.** Erased history (it is gone); the change log (which records each write set changed, for the feed and undo); versions brought in from git (`origin: git-import`).
+- **A folder export clears it.** Any `parachute-vault export` into a folder first removes the `.parachute/history` an earlier export left there, so history erased since then can't be read back from the folder.
 
 ## Format 2 (opt-in)
 

@@ -83,9 +83,10 @@ import type { Store, Note, Link, Attachment } from "./types.js";
 import type { TagRecord } from "./tag-schemas.js";
 import { ParentCycleError } from "./tag-schemas.js";
 import { IndexedFieldLimitError, pruneOrphanedIndexedFields } from "./indexed-fields.js";
-import { transactionAsync } from "./txn.js";
+import { transaction, transactionAsync } from "./txn.js";
 import { timestampToMs } from "./cursor.js";
 import { computeDisplayTitle } from "./display-title.js";
+import { HISTORY_DIR, importHistoryFile, recordHistoryFile, recordIdOfHistoryFile, storeKeepsHistory } from "./export-history.js";
 
 // ---------------------------------------------------------------------------
 // Format constants
@@ -270,6 +271,9 @@ export interface ExportStats {
    * uses this to distinguish expected-missing from data corruption.
    */
   skipped_attachments: Array<{ note_id: string; attachment_id: string; path: string; reason: string }>;
+  /** Only on an export with history (0.9.4): the records and versions written, and any left out (a body that can't be
+   *  rebuilt, a refused write; `version_ix` null when the record's whole file was refused). */
+  history?: { records: number; versions: number; skipped: Array<{ id: string; version_ix: number | null; reason: string }> };
 }
 
 // ---------------------------------------------------------------------------
@@ -1093,6 +1097,8 @@ export interface ExportOptions {
   failOnCaseCollision?: boolean;
   /** Export format (default 1). 2 is the flat-fields layout; see {@link ExportFormat}. A whole-vault export only. */
   format?: ExportFormat;
+  /** Add each record's versions as `.parachute/history/<id>.jsonl` (0.9.4; see export-history.ts). Off by default. */
+  history?: boolean;
 }
 
 /**
@@ -1442,6 +1448,8 @@ export interface ExportEngineOptions {
   exportedAt?: string;
   failOnCaseCollision?: boolean;
   format?: ExportFormat;
+  /** Add each record's versions as `.parachute/history/<id>.jsonl` (0.9.4). Off by default; a whole-vault export only. */
+  history?: boolean;
 }
 
 /**
@@ -1462,6 +1470,9 @@ export async function exportVault(
   }
   if (format === 2 && opts.since) {
     throw new Error("export format 2 is a whole vault export: a moved record's old file would stay behind, so --since is not offered");
+  }
+  if (opts.history && opts.since) {
+    throw new Error("an export with history is a whole vault export, so --since is not offered with it");
   }
   const layout = format === 2 ? await planFormat2Layout(store) : new Map<string, string>();
 
@@ -1707,6 +1718,38 @@ export async function exportVault(
     const note = await store.getNote(id);
     if (note) await exportNote(note);
   }
+  // 4. History (0.9.4, only when asked): each record's native versions, live records first in the walk's order,
+  // then deleted records that still have history (their tombstones). Read through the Store's version reads, which
+  // decode compressed and delta bodies.
+  let history: ExportStats["history"];
+  if (opts.history && storeKeepsHistory(store)) {
+    history = { records: 0, versions: 0, skipped: [] };
+    const writeHistory = async (id: string): Promise<void> => {
+      const file = await recordHistoryFile(store, id);
+      if (!file) return;
+      for (const s of file.skipped) history!.skipped.push({ id, version_ix: s.version_ix, reason: s.reason });
+      const written = sink.writeText(join(SIDECAR_DIR, HISTORY_DIR, `${id}.jsonl`), file.text);
+      if (!written.ok) {
+        history!.skipped.push({ id, version_ix: null, reason: written.reason });
+        return;
+      }
+      history!.records++;
+      history!.versions += file.versions;
+    };
+    for await (const note of iterateAllNotes(store)) await writeHistory(note.id);
+    const deleted: string[] = [];
+    for (let offset = 0; ; offset += 1000) {
+      const page = await store.listDeletedNotes({ limit: 1000, offset });
+      deleted.push(...page.notes.map((n) => n.id));
+      if (page.notes.length < 1000) break;
+    }
+    for (const id of deleted.sort()) await writeHistory(id);
+    for (const s of history.skipped) {
+      // eslint-disable-next-line no-console
+      console.warn(`[export] history of ${s.id}${s.version_ix === null ? "" : ` version ${s.version_ix}`} skipped: ${s.reason}`);
+    }
+  }
+
   if (skipped.length > 0) {
     // Surface to the caller without aborting — partial export is more useful
     // than no export. CLI prints the list; programmatic callers inspect the
@@ -1734,6 +1777,7 @@ export async function exportVault(
     skipped_traversal: skipped.length,
     skipped_notes: skipped,
     skipped_attachments: skippedAttachments,
+    ...(history ? { history } : {}),
   };
 }
 
@@ -1765,6 +1809,10 @@ export async function exportVaultToDir(
       `one is left behind to be read as the note's current state.`,
     );
   }
+  // History an earlier export left in this folder goes first: a record's history erased since then, or an export
+  // without history now, must not leave the old file to be read back on import.
+  const historyDir = join(opts.outDir, SIDECAR_DIR, HISTORY_DIR);
+  if (existsSync(historyDir)) rmSync(historyDir, { recursive: true, force: true });
   const sink = new FsExportSink({
     outDir: opts.outDir,
     assetsDir: opts.assetsDir,
@@ -1777,6 +1825,7 @@ export async function exportVaultToDir(
     exportedAt: opts.exportedAt,
     failOnCaseCollision: opts.failOnCaseCollision,
     format: opts.format,
+    ...(opts.history ? { history: true } : {}),
   });
 }
 
@@ -2407,6 +2456,11 @@ export interface ImportStats {
    * (queries fall back to full scans). See the import re-declare fix.
    */
   indexes_declared: number;
+  /** Versions read from `.parachute/history/` (0.9.4): added behind the current records, already present (an import
+   *  of the same export again), and lines or files left out with why. All zero for an export without history. */
+  history_versions_added: number;
+  history_versions_present: number;
+  skipped_history: Array<{ file: string; line: number; reason: string }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -2438,6 +2492,9 @@ export interface ImportSource {
    *  assets-relative (the note's `attachments[].path`). Only meaningful
    *  when `attachmentsEnabled`. */
   restoreAttachment(srcRelPath: string, destRelPath: string): SinkWriteResult;
+  /** The `*.jsonl` files under `.parachute/history/` (file name + raw text), one at a time (0.9.4). Optional: a
+   *  source without it imports no history, as before. */
+  readHistoryFiles?(): Iterable<{ name: string; text: string }>;
 }
 
 /**
@@ -2512,6 +2569,17 @@ export class FsImportSource implements ImportSource {
 
   readNotesMetaFiles(): Array<{ name: string; text: string }> {
     return this.readSidecarYamls(join(this.sidecar, NOTES_META_DIR)).filter((f) => !f.name.startsWith("."));
+  }
+
+  *readHistoryFiles(): Iterable<{ name: string; text: string }> {
+    const dir = join(this.sidecar, HISTORY_DIR);
+    if (!existsSync(dir)) return;
+    for (const entry of readdirSync(dir).sort()) {
+      if (!entry.endsWith(".jsonl") || entry.startsWith(".")) continue;
+      const real = this.fileIn(join(dir, entry), dir);
+      if (real === null) continue; // a link out of the export, or not a file
+      yield { name: entry, text: readFileSync(real, "utf-8") };
+    }
   }
 
   listContentFiles(): string[] {
@@ -2629,6 +2697,9 @@ async function importVaultRows(
     skipped_duplicate_ids: [],
     notes_wiped: 0,
     indexes_declared: 0,
+    history_versions_added: 0,
+    history_versions_present: 0,
+    skipped_history: [],
   };
 
   // Blow-away is all-or-nothing (vault#589 / FIX 1). A blow-away import wipes
@@ -3161,6 +3232,32 @@ async function importVaultReplay(
         }
       }
       stats.attachments_restored++;
+    }
+  }
+
+  // 5b. History (0.9.4): each `.parachute/history/<id>.jsonl` lands behind the record's current state; append only,
+  // and a version already held is skipped, so importing the same export twice adds nothing (export-history.ts).
+  if (source.readHistoryFiles) {
+    for (const { name, text } of source.readHistoryFiles()) {
+      const id = recordIdOfHistoryFile(name);
+      if (id === null) {
+        stats.skipped_history.push({ file: name, line: 0, reason: "not a record's history file" });
+        continue;
+      }
+      if (opts.dryRun) {
+        stats.history_versions_added += text.split("\n").filter((l) => l.trim() !== "").length;
+        continue;
+      }
+      // One transaction per record: its versions land together, and a big history isn't one commit per line.
+      const result = transaction(store.db, () => importHistoryFile(store.db, id, text));
+      stats.history_versions_added += result.added;
+      stats.history_versions_present += result.present;
+      for (const s of result.skipped) {
+        stats.skipped_history.push({ file: name, ...s });
+        // eslint-disable-next-line no-console
+        console.warn(`[import] history ${name}${s.line ? ` line ${s.line}` : ""} skipped: ${s.reason}`);
+      }
+      if (opts.checkpoint) await opts.checkpoint();
     }
   }
 

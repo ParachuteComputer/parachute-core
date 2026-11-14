@@ -2637,6 +2637,17 @@ filename="vault-<name>-<time>.tar"`, streamed): the same files as
 archive imports into either. Attachments stream from disk; memory does not grow with
 their size. `?since=<iso>` keeps only notes changed since then, as on Cloud.
 
+`?history=1` (0.9.4) adds each record's versions as `.parachute/history/<record id>.jsonl`,
+deleted records' included: one JSON line per version, oldest first, with who (`actor`, `via`,
+`via_kind`), the write set and its `why`, the op and times, path, fields, types, tags,
+links and the body (`content`, null for an overflow tombstone). `parachute-vault export
+<dir> --with-history` writes the same files, and `parachute-vault import` reads them back
+behind the current records (append only; importing the same export twice adds nothing).
+Off by default: without it (or with `history=0`) the tar is byte-identical to one from
+before. It doesn't combine with `since` (400 `invalid_request`), and any other value is
+400. Erased history isn't there, and nothing of the change log is. The export key gets it
+like a read key; a tag-scoped key can't export at all (below).
+
 A read key (or better) may pull it, and so may a key that holds only `vault:<name>:export`
 (`parachute keys new <name> --vault <v> --can export`, or `POST /account/keys` with
 `can: "export"`). A tag-scoped key may not (403 `tag_scope_violation`): the export is the

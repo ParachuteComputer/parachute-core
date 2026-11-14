@@ -268,18 +268,29 @@ async function dispatchScopedMcp(
  * `by` is the key that pulled it. The vault records the time and `by` once the last byte has gone out
  * (`last_export_at`, shown on `GET /api/vault` to an admin and by `parachute vault status`); a pull the client
  * abandons records nothing, and neither does a `?since=` pull (a piece of the vault, not a backup).
- * `?since=<iso>` and `?exported_at=<iso>` are the engine's, as on Parachute Cloud.
+ * `?since=<iso>` and `?exported_at=<iso>` are the engine's, as on Parachute Cloud; `?history=1` adds each record's
+ * versions (0.9.4). A tag-scoped key can't export at all (the dispatch below), so the history needs no scope filter.
  */
 async function handleExport(req: Request, store: Store, vaultConfig: VaultConfig, by: string | null): Promise<Response> {
   const url = new URL(req.url);
   const since = url.searchParams.get("since") ?? undefined;
   const exportedAt = url.searchParams.get("exported_at") ?? undefined;
+  // `?history=1` adds each record's versions (`.parachute/history/<id>.jsonl`, 0.9.4). Off by default, so an export
+  // without it is byte-equal to one from before.
+  const historyParam = url.searchParams.get("history");
+  if (historyParam !== null && !["0", "1", "false", "true"].includes(historyParam)) {
+    return Response.json({ error: "invalid_request", error_type: "invalid_request", message: "history is 1 or 0." }, { status: 400 });
+  }
+  const history = historyParam === "1" || historyParam === "true";
+  if (history && since) {
+    return Response.json({ error: "invalid_request", error_type: "invalid_request", message: "An export with history is the whole vault: history=1 does not combine with since." }, { status: 400 });
+  }
   const name = vaultConfig.name;
   let entries;
   try {
     ({ entries } = await collectExportEntries(
       store,
-      { vaultName: name, ...(vaultConfig.description ? { vaultDescription: vaultConfig.description } : {}), ...(since ? { since } : {}), ...(exportedAt ? { exportedAt } : {}) },
+      { vaultName: name, ...(vaultConfig.description ? { vaultDescription: vaultConfig.description } : {}), ...(since ? { since } : {}), ...(exportedAt ? { exportedAt } : {}), ...(history ? { history: true } : {}) },
       assetsDir(name),
     ));
   } catch (err) {

@@ -1613,6 +1613,28 @@
    "removed_in": null,
    "state": "live",
    "release": "0.9.4"
+  },
+  {
+   "kind": "endpoint",
+   "old": "GET /vault/<n>/api/export: notes, types and files, no history",
+   "new": "GET /vault/<n>/api/export?history=1 also carries .parachute/history/<record id>.jsonl: each record's versions, one JSON line each (who, via, why, write set, op, times, path, fields, types, tags, links, body). Off by default; not with since",
+   "action": "keep",
+   "reason": "additive (0.9.4): a vault's past can move with it. Without the parameter the tar is byte-identical to before",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live",
+   "release": "0.9.4"
+  },
+  {
+   "kind": "command",
+   "old": "parachute-vault export <dir> (no history); parachute-vault import <dir> (no history)",
+   "new": "parachute-vault export <dir> --with-history writes .parachute/history/<id>.jsonl; parachute-vault import reads it back behind the current records (append only, idempotent)",
+   "action": "keep",
+   "reason": "additive (0.9.4): off by default; an export without the folder imports as before",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live",
+   "release": "0.9.4"
   }
  ]
 }
