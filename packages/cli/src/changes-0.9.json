@@ -1613,6 +1613,17 @@
    "removed_in": null,
    "state": "live",
    "release": "0.9.4"
+  },
+  {
+   "kind": "endpoint",
+   "old": "(none) a write could be put back only record by record (POST /api/notes/<id>/restore)",
+   "new": "POST /vault/<n>/api/write-sets/<id>/undo {force?, why?}: puts back every record one write set changed, as its own write set (undoable); 409 undo_conflict with the later writes unless force; 409 already_undone; a key undoes its own sets, admin any",
+   "action": "keep",
+   "reason": "additive (0.9.4): undo by write set. Restore by version stays, per record",
+   "since": "0.9",
+   "removed_in": null,
+   "state": "live",
+   "release": "0.9.4"
   }
  ]
 }

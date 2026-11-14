@@ -1668,6 +1668,25 @@ and `delete-record` (and their note-named aliases); a longer one is 400 `invalid
   then leaves that body as it is), and its erase-history leaves the log's copy of an erased body until the log's
   horizon (30 days). Upgrading again heals neither; erase again to remove the copy.
 
+#### Undo a write set
+
+`POST /vault/{name}/api/write-sets/{id}/undo` (`vault:write`), body `{force?: boolean, why?: string}` (or the
+`Parachute-Why` header). It puts back every record the set changed, and nothing else: a record the set created is
+deleted (its tombstone kept); a record it deleted is made again with its id, body, fields, path, types, tags, links
+and creation stamp; a record it changed gets back its body (only if the set changed it), fields, path, tags and
+links. All or nothing, in one transaction. Answers `200 {write_set, undoes, records: [{id, op}], forced,
+links_skipped}`: `write_set` is the undo's own set (`undoes: <id>`), so undoing it puts the changes back; `op` is
+`deleted`, `recreated`, `reverted` or `unchanged`; `links_skipped` lists links whose target no longer exists.
+
+- A later write to one of the records: **409 `undo_conflict`** with `conflicts: [{id, path, write_set, by, via,
+  at}]` (the newest later write per record) and nothing changed. `force: true` puts the set's "before" back over
+  it; those writes are listed in `forced` and stay in history and the log (undo them in turn). A tag-scoped key's
+  conflicts carry only `id`, `path` and `at`.
+- Already undone (by a set that still stands): **409 `already_undone`** with `undone_by`.
+- Another key's set, a set a tag-scoped key can't see whole, an unknown set, or one past the change log's horizon:
+  **404** (as GET answers). Admin may undo any key's set. A body key other than `force` and `why`: 400
+  `unknown_parameter`. A `Parachute-Write-Set` header is ignored here: an undo is always its own set.
+
 ### Version history
 
 Each version names the write set that replaced it (`write_set`, with its `why`) and keeps the record's `types`,
