@@ -21,10 +21,12 @@ const row = (over: Partial<FeedRow>): FeedRow => ({ pos: 1, note_id: "n", write_
 const inScope = (tags: string[]) => tags.includes("in");
 
 describe("feed: which change a reader is told", () => {
-  test("unscoped: there now is an upsert; gone is a delete unless it was made in the page", () => {
+  test("unscoped: there now is an upsert; gone is a delete, unless the page never saw it standing", () => {
     expect(feedOp([row({ existed: 0 })], { tags: [] }, { tags: [] }, null)).toBe("upsert");
     expect(feedOp([row({})], null, null, null)).toBe("delete");
-    expect(feedOp([row({ existed: 0, pos: 5 }), row({ pos: 6 })], null, null, null)).toBe(null);
+    expect(feedOp([row({ existed: 0, pos: 5 })], null, null, null)).toBe(null);
+    // Made and later written in the page, then gone: a reader that read an earlier page uncommitted may hold it.
+    expect(feedOp([row({ existed: 0, pos: 5 }), row({ pos: 6 })], null, null, null)).toBe("delete");
   });
 
   test("scoped: in scope now is an upsert; moved out is removed; gone from scope is a delete; never in scope is nothing", () => {
@@ -36,11 +38,14 @@ describe("feed: which change a reader is told", () => {
     expect(feedOp([row({ existed: 0, before_tags: null })], { tags: ["out"] }, { tags: ["out"] }, inScope)).toBe(null);
   });
 
-  test("visible before is the first row in the page: what the reader saw at its position", () => {
+  test("gone is told when the record was visible at any point the page covers", () => {
     // The record was in scope at the reader's position; a write moved it out; a later one edited it, still out.
     expect(feedOp([row({ pos: 5, before_tags: '["in"]' }), row({ pos: 7, before_tags: '["out"]' })], { tags: ["out"] }, { tags: ["out"] }, inScope)).toBe("removed");
-    // Out of scope at the position; brought in, then out again, inside the page: never named.
-    expect(feedOp([row({ pos: 5, before_tags: '["out"]' }), row({ pos: 7, before_tags: '["in"]' })], { tags: ["out"] }, { tags: ["out"] }, inScope)).toBe(null);
+    // Out of scope at the position; brought in, then out again, inside the page: a reader that read it then (an
+    // earlier page, not committed) holds it, so it is named as removed (it was in scope: nothing new is told).
+    expect(feedOp([row({ pos: 5, before_tags: '["out"]' }), row({ pos: 7, before_tags: '["in"]' })], { tags: ["out"] }, { tags: ["out"] }, inScope)).toBe("removed");
+    // Never in scope in the page: never named.
+    expect(feedOp([row({ pos: 5, before_tags: '["out"]' }), row({ pos: 7, before_tags: '["out2"]' })], { tags: ["out"] }, { tags: ["out"] }, inScope)).toBe(null);
   });
 
   test("a row with no saved tags for a record that existed is not visible to a scoped reader (none is written today)", () => {

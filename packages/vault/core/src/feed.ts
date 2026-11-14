@@ -153,9 +153,11 @@ export type FeedOp = "upsert" | "delete" | "removed";
 export function feedOp(rows: FeedRow[], end: RecordNow, now: RecordNow, inScope: ((tags: string[]) => boolean) | null): FeedOp | null {
   const visible = (r: RecordNow) => r !== null && (inScope === null || inScope(r.tags));
   if (visible(end)) return visible(now) ? "upsert" : null;
-  const before = rows[0];
-  if (!before || before.existed !== 1) return null;
-  if (inScope !== null && (before.before_tags === null || !inScope(parseTags(before.before_tags)))) return null;
+  // Not visible at the page's end: tell the reader it's gone if it was visible at any point the page covers. A reader
+  // that read an earlier page and didn't commit reads this one again, and may hold the record from it; it must hear
+  // the delete or the move out. (Its id was in the reader's scope then, so naming it tells nothing new.)
+  const seen = rows.some((r) => r.existed === 1 && (inScope === null || (r.before_tags !== null && inScope(parseTags(r.before_tags)))));
+  if (!seen) return null;
   return end === null ? "delete" : "removed";
 }
 

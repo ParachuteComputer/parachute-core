@@ -296,7 +296,7 @@ describe("v094/feed: a write set that spans several requests, read by a tag-scop
     expect(paged.at(-1)).toBe(whole.at(-1));
   });
 
-  test("a record out of scope at the reader's position, in scope only in between, leaves no id", async () => {
+  test("a record out of scope at the reader's position, in scope only in between: at most `removed`, never its content", async () => {
     const t = `fw${shortId()}`;
     const mine = `${t}mine`;
     const scoped = asKey(await pass({ level: "read", tags: [mine] }));
@@ -308,7 +308,39 @@ describe("v094/feed: a write set that spans several requests, read by a tag-scop
     await edit(r, { tags: { add: [mine] } }, h); // the set brings it in
     await edit(r, { tags: { remove: [mine] } }); // another write takes it out
     const page = await feed(scoped, name);
-    must(!page.text.includes(r), `the feed named a record that was out of scope at the reader's position: ${page.text.slice(0, 400)}`);
+    // It was in the reader's scope in between (a reader that read then holds it), so it may be named as gone, but
+    // nothing more: no body, no fields.
+    expect(about(page, [r]).map((c: any) => c.op)).toEqual(["removed"]);
+    expect(page.text).not.toContain("the set's first edit");
+  });
+});
+
+describe("v094/feed: a page read and not committed is read again in full", () => {
+  test("unscoped: a record read as upsert, then deleted before the re-read, arrives as delete", async () => {
+    const reader = asKey(await pass({ level: "read" }));
+    const name = readerName("reread");
+    await commit(reader, name, "now");
+    const x = await create(`rr/${shortId()}`, "brief");
+    expect(about(await feed(reader, name), [x]).map((c: any) => c.op)).toEqual(["upsert"]);
+    await remove(x);
+    expect(about(await feed(reader, name), [x]).map((c: any) => c.op)).toEqual(["delete"]);
+  });
+
+  test("scoped: records read as upsert, then moved out and deleted before the re-read, arrive as removed and delete", async () => {
+    const t = `rs${shortId()}`;
+    const scoped = asKey(await pass({ level: "read", tags: [t] }));
+    const name = readerName("reread-s");
+    const a = await create(`${t}/a`, "a", [`${t}else`]);
+    const b = await create(`${t}/b`, "b", [`${t}else`]);
+    await commit(scoped, name, "now");
+    await edit(a, { tags: { add: [t] } });
+    await edit(b, { tags: { add: [t] } });
+    expect(about(await feed(scoped, name), [a, b]).map((c: any) => c.op).sort()).toEqual(["upsert", "upsert"]);
+    await edit(a, { tags: { remove: [t] } });
+    await remove(b);
+    const again = about(await feed(scoped, name), [a, b]);
+    expect(again.find((c: any) => c.id === a)?.op).toBe("removed");
+    expect(again.find((c: any) => c.id === b)?.op).toBe("delete");
   });
 });
 
