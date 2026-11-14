@@ -184,6 +184,22 @@ export async function dispatch(role: Role, notice?: Notice): Promise<void> {
     if (flag.home) process.env.PARACHUTE_HOME = resolve(flag.home);
   }
   const home = homeDir();
+  // `upgrade` says what it was asked before anything looks at the home (upgrade.ts): an unknown flag or service
+  // exits 2 with the home untouched. Every other path below starts with the step itself (the backup, the record).
+  let upgradeAsk: import("./upgrade.ts").UpgradeAsk | undefined;
+  if ("cli" in r && r.cli === "hub" && r.argv[0] === "upgrade") {
+    const { parseUpgrade, upgradeHelp, upgradeUsage } = await import("./upgrade.ts");
+    const { knownServices } = await import("@openparachute/hub/src/service-spec.ts");
+    upgradeAsk = parseUpgrade(r.argv.slice(1), home, knownServices());
+    if (upgradeAsk.kind === "usage") {
+      console.error(`parachute upgrade: ${upgradeAsk.message}\n${upgradeUsage()}`);
+      process.exit(2);
+    }
+    if (upgradeAsk.kind === "help") {
+      console.log(upgradeHelp());
+      return;
+    }
+  }
   // Every command but `version` (answered above) runs behind the check, help included: the moved CLIs do work on
   // the home before they read their arguments (the vault moves older layouts first), so `serve --help` is a command.
   const { HUB_SCHEMA_VERSION } = await import("@openparachute/hub/src/hub-db.ts");
@@ -241,9 +257,24 @@ export async function dispatch(role: Role, notice?: Notice): Promise<void> {
     process.exit(await takeover(takeoverArgs));
   }
   if (!("cli" in r)) return;
-  if (r.cli === "hub" && r.argv[0] === "upgrade" && r.argv.includes("--rollback")) {
+  if (upgradeAsk?.kind === "rollback") {
     const { rollback } = await import("./release.ts");
     process.exit(await rollback(home, r.argv.slice(1)));
+  }
+  // `upgrade --check` works on a copy (upgrade.ts): it must never reach the step below on the home it was asked
+  // about. Only its own run on that copy goes on (isCheckCopy), takes the step there and then opens the copy.
+  let checkCopy = false;
+  if (upgradeAsk?.kind === "check") {
+    const { check, isCheckCopy } = await import("./upgrade.ts");
+    checkCopy = isCheckCopy(home);
+    if (!checkCopy) {
+      const refusal = managedRefusal("hub", ["upgrade"]);
+      if (refusal) {
+        console.error(refusal);
+        process.exit(2);
+      }
+      process.exit(await check(home, upgradeAsk));
+    }
   }
   {
     // The first time this release opens a home an older one served: record the step and back the databases up
@@ -251,6 +282,10 @@ export async function dispatch(role: Role, notice?: Notice): Promise<void> {
     const { beforeOpenOrExit } = await import("./release.ts");
     const code = beforeOpenOrExit(home, newerCheck);
     if (code !== null) process.exit(code);
+  }
+  if (checkCopy) {
+    const { openCopy } = await import("./upgrade.ts");
+    process.exit(await openCopy(home));
   }
   if (r.cli === "hub" && r.argv[0] === "keys") {
     // `keys` (and its alias `tokens`) is core's (keys.ts): answered here, or mapped onto the hub's auth commands.

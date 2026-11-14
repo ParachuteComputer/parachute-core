@@ -12,6 +12,11 @@
 //   - `upgrade --rollback --restore --yes` exports the notes changed since the backup, then puts the backup back,
 //     and 0.8 serves that;
 //   - a home 0.9 made has no earlier release: no backup, nothing to roll back.
+// Before any of that, on the home as 0.8 left it (the release blocker of 2026-11-13: `upgrade --check` wasn't built,
+// so 0.9 backed the home up, recorded it as moved, and only then said `unknown service "--check"`):
+//   - `upgrade` with an unknown flag or service exits 2 before it touches the home: every byte is as it was;
+//   - `upgrade --check` runs the step on a throwaway copy (the backup, the record, every database opened by this
+//     release) and reports. The home itself gets no backup, no record and no lock, even while 0.8 serves it.
 // Each machine has its own network (the box holds 1940; _takeover-lib.ts). Red on 0.8 (no release record, no
 // rollback); green from 0.9's release.ts.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
@@ -22,7 +27,7 @@ import { dirname, join } from "node:path";
 import { candidate, freePort, newHome, until } from "../candidate-lib.ts";
 import { cli } from "../candidate-lib.ts";
 import { must, rest, safeFetch } from "../lib.ts";
-import { dbHolders, newMachine, type Machine, type Proc } from "./_takeover-lib.ts";
+import { dbHolders, fileHashes, newMachine, type Machine, type Proc } from "./_takeover-lib.ts";
 
 let m: Machine;
 const vault = `up${randomBytes(3).toString("hex")}`;
@@ -132,7 +137,89 @@ afterAll(async () => {
   await m?.dispose();
 });
 
+/** Every file of the home by hash, and what sits beside it: what a command that "touches nothing" must leave equal. */
+const footprint = (home: string) => ({
+  files: existsSync(home) ? Object.fromEntries(fileHashes(home)) : null,
+  // (the machine keeps the log of each server the test itself starts there)
+  beside: readdirSync(dirname(home)).filter((n) => !/^parachute-serve-\d+\.log$/.test(n)).sort(),
+});
+
 describe("lifecycle/upgrade", () => {
+  test("upgrade with an unknown flag or service exits 2 before it touches the home: no backup, no record, no lock", async () => {
+    const before = footprint(m.home);
+    // `--chekc` and `--dry-run` are flags it doesn't have; `nosuch` is no service; the rest pair a real flag with
+    // one that doesn't go with it. Each used to be answered only after the home had been backed up and recorded.
+    for (const args of [["--chekc"], ["--dry-run"], ["nosuch"], ["--check", "--bogus"], ["--check", "vault"], ["--check", "--rollback"], ["--rollback", "--bogus"], ["--channel"], ["vault", "--channel", "nightly"]]) {
+      const r = await core(["upgrade", ...args]);
+      expect(`${args.join(" ")}: exit ${r.code}`).toBe(`${args.join(" ")}: exit 2`);
+      expect(r.stderr).toContain("usage: parachute upgrade");
+      expect(footprint(m.home)).toEqual(before);
+    }
+    // Asking how it works is not a step either.
+    const help = await core(["upgrade", "--help"]);
+    expect(help.code).toBe(0);
+    expect(help.stdout).toContain("--check");
+    expect(footprint(m.home)).toEqual(before);
+  }, 120_000);
+
+  test("upgrade --check runs the step on a throwaway copy and reports; the home gets no backup, no record and no lock", async () => {
+    const db08 = new Database(vaultDb(), { readonly: true });
+    const count = (sql: string) => (db08.query(sql).get() as { n: number }).n;
+    // What 0.8 left: its notes (ours and the guides it seeds) and its tags, one of them with fields.
+    const [notes, allTags] = [count("SELECT count(*) AS n FROM notes"), count("SELECT count(*) AS n FROM tags")];
+    db08.close();
+    const before = footprint(m.home);
+    const r = await core(["upgrade", "--check", "--json"]);
+    must(r.code === 0, `upgrade --check exited ${r.code}: ${r.stderr.slice(-1200)}`);
+    expect(footprint(m.home)).toEqual(before); // every byte of the home, and nothing new beside it (the copy is gone)
+    const out = JSON.parse(r.stdout.trim().split("\n").pop()!);
+    expect(out).toMatchObject({ check: "ok", from: "0.8", changed: false, refusals: [], problems: [] });
+    expect(out.to).toBe(JSON.parse((await core(["version", "--json"])).stdout).version);
+    // What the step did, on the copy: backed both databases up, then opened them with this release.
+    expect(out.backup.databases).toBe(2);
+    // Every note is there, and the tag with fields is a type on the copy (0.8's vault has no kinds at all).
+    expect(out.vaults).toEqual([{ name: vault, opens: true, notes, types: 1, tags: allTags - 1 }]);
+    expect(out.hub).toMatchObject({ opens: true });
+    expect(out.hub.keys).toBeGreaterThanOrEqual(2); // 0.8's two tokens, adopted as keys on the copy
+
+    // In plain words too, and the same promise: nothing here was changed.
+    const plain = await core(["upgrade", "--check"]);
+    expect(plain.code).toBe(0);
+    expect(plain.stdout).toContain(`vault ${vault}: opens`);
+    expect(plain.stdout).toMatch(/nothing (here )?was changed/i);
+    expect(footprint(m.home)).toEqual(before);
+
+    // MIGRATION's first live step: 0.9's check while 0.8 still serves the home. It reports, and 0.8 keeps serving a
+    // home with no record and no backup (the server itself writes its databases, so bytes aren't compared here).
+    const box = await serve(prevBin, "0.8 serve");
+    try {
+      const live = await core(["upgrade", "--check", "--json"]);
+      must(live.code === 0, `upgrade --check beside a running 0.8 exited ${live.code}: ${live.stderr.slice(-1200)}`);
+      expect(JSON.parse(live.stdout.trim().split("\n").pop()!)).toMatchObject({ check: "ok", from: "0.8" });
+      expect((await api(writer).get(`/notes/${ids.plan}`)).status).toBe(200);
+    } finally {
+      await box.stop();
+    }
+    expect(existsSync(join(m.home, "run", "release.json"))).toBe(false);
+    expect(existsSync(join(m.home, "run", "release.lock"))).toBe(false);
+    expect(backups()).toEqual([]);
+    expect(footprint(m.home).beside).toEqual(before.beside);
+  }, 240_000);
+
+  test("upgrade --check says what the step would refuse, and exits 1: a database it can't read", async () => {
+    const home = await homeBy08("up-check-broken", ["goodv", "brokenv"]);
+    const db = join(home, "vault", "data", "brokenv", "vault.db");
+    for (const f of [`${db}-wal`, `${db}-shm`]) rmSync(f, { force: true });
+    writeFileSync(db, "Made-up bytes that are not a database.\n".repeat(200));
+    const before = footprint(home);
+    const r = await cli(home, ["upgrade", "--check", "--json"]);
+    expect(r.code).toBe(1);
+    const out = JSON.parse(r.stdout.trim().split("\n").pop()!);
+    expect(out).toMatchObject({ check: "problems", changed: false });
+    expect(out.problems.join("\n")).toContain("vault/data/brokenv/vault.db");
+    expect(out.vaults).toEqual(expect.arrayContaining([expect.objectContaining({ name: "goodv", opens: true })]));
+    expect(footprint(home)).toEqual(before);
+  }, 120_000);
   test("0.9's first command on a 0.8 home backs its databases up first, outside the home, and only once", async () => {
     const before = dbHashes();
     const r = await core(["keys", "list", "--json"]);
