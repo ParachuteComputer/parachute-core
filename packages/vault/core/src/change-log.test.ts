@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { SqliteStore } from "./store.ts";
 import { SCHEMA_VERSION } from "./schema.ts";
 import { pruneChangeLog, writeSetRecords } from "./change-log.ts";
+import { readBlobText } from "./history.ts";
 
 function fresh() {
   const db = new Database(":memory:");
@@ -15,8 +16,11 @@ function fresh() {
   store.writeSetSource = () => ctx;
   return { db, store, as: (c: typeof ctx) => (ctx = c) };
 }
+/** A set's log rows, the saved body read back from its blob (bodies move to note_blobs at the end of the transaction). */
 const rows = (db: Database, set: string | null) =>
-  db.prepare(`SELECT note_id, op, existed, content_saved, before_content, before_tags FROM record_changes WHERE write_set ${set === null ? "IS NULL" : "= ?"} ORDER BY seq`).all(...(set === null ? [] : [set])) as any[];
+  (db.prepare(`SELECT note_id, op, existed, content_saved, before_content, before_hash, before_tags FROM record_changes WHERE write_set ${set === null ? "IS NULL" : "= ?"} ORDER BY seq`).all(...(set === null ? [] : [set])) as any[]).map(
+    ({ before_hash, before_content, ...r }) => ({ ...r, before_content: before_hash ? readBlobText(db, before_hash) : before_content }),
+  );
 
 describe("change log: what one write set records", () => {
   test("the body is kept only when the set changes it, from before the set's first change", async () => {
@@ -76,6 +80,40 @@ describe("change log: what one write set records", () => {
   });
 });
 
+describe("change log: bodies are blobs", () => {
+  test("a saved body is a blob shared with the version holding the same text, and the sweep frees only what nobody holds", async () => {
+    const { db, store, as } = fresh();
+    as({ id: "ws_mk0000001" });
+    const n = await store.createNote("first body", { path: "b" });
+    as({ id: "ws_ed0000001" });
+    await store.updateNote(n.id, { content: "second body", actor: "u", via: "api" });
+    const [row] = db.prepare("SELECT before_content, before_hash FROM record_changes WHERE write_set = 'ws_ed0000001'").all() as any[];
+    expect(row.before_content).toBeNull();
+    const version = (db.prepare("SELECT content_hash FROM note_versions").get() as any).content_hash;
+    expect(row.before_hash).toBe(version); // one blob, held twice
+    expect((db.prepare("SELECT COUNT(*) AS n FROM note_blobs").get() as any).n).toBe(1);
+    db.exec("DELETE FROM note_versions"); // as if history pruned it: the log still holds the body
+    db.exec("DELETE FROM note_blobs WHERE 0"); // (nothing else frees it)
+    expect(readBlobText(db, row.before_hash)).toBe("first body");
+    db.prepare("UPDATE record_changes SET at = '2000-01-01T00:00:00.000Z'").run();
+    (store as any).changeLogPrunedAt = 0;
+    store.pruneChangeLogDaily();
+    expect((db.prepare("SELECT COUNT(*) AS n FROM note_blobs").get() as any).n).toBe(0);
+  });
+
+  test("erasing a record's history forgets the log's copy of its past too", async () => {
+    const { db, store, as } = fresh();
+    as({ id: "ws_mk0000002" });
+    const n = await store.createNote("private first draft", { path: "p", metadata: { k: "secret" } });
+    as({ id: "ws_ed0000002" });
+    await store.updateNote(n.id, { content: "public", metadata: {} });
+    await store.eraseNoteHistory(n.id);
+    const [row] = db.prepare("SELECT before_content, before_hash, before_row, content_saved FROM record_changes WHERE write_set = 'ws_ed0000002'").all() as any[];
+    expect(row).toEqual({ before_content: null, before_hash: null, before_row: null, content_saved: 0 });
+    expect((db.prepare("SELECT COUNT(*) AS n FROM note_blobs").get() as any).n).toBe(0);
+  });
+});
+
 describe("change log: the horizon", () => {
   test("rows past the horizon are swept, with sets left empty; newer ones stay", async () => {
     const { db, store, as } = fresh();
@@ -85,7 +123,7 @@ describe("change log: the horizon", () => {
     await store.createNote("new", { path: "new" });
     db.prepare("UPDATE record_changes SET at = '2000-01-01T00:00:00.000Z' WHERE write_set = 'ws_old000001'").run();
     db.prepare("UPDATE write_sets SET at = '2000-01-01T00:00:00.000Z' WHERE id = 'ws_old000001'").run();
-    expect(pruneChangeLog(db, 30)).toEqual({ changes: 1, sets: 1 });
+    expect(pruneChangeLog(db, 30)).toMatchObject({ changes: 1, sets: 1 });
     expect((db.prepare("SELECT id FROM write_sets").all() as any[]).map((r) => r.id)).toEqual(["ws_new000001"]);
   });
 });

@@ -1,4 +1,5 @@
-import { changeLogPresent, setWriteContext, clearWriteContext, pruneChangeLog, type WriteSetContext } from "./change-log.js";
+import { changeLogPresent, setWriteContext, clearWriteContext, currentWriteSet, forgetLoggedPast, pruneChangeLog, type WriteSetContext } from "./change-log.js";
+import { dropBlobsIfUnheld, settleLogBodies } from "./history.js";
 import { Database } from "bun:sqlite";
 import { anyTermsQuery, fuseRanks, HYBRID_POOL } from "./hybrid.js";
 import { HistoryPreconditionRequiredError } from "./history.js";
@@ -185,6 +186,7 @@ export class BunSqliteStore implements Store {
         return fn();
       } finally {
         this.writeContextOpen = false;
+        settleLogBodies(this.db, currentWriteSet(this.db));
         clearWriteContext(this.db);
       }
     });
@@ -198,7 +200,11 @@ export class BunSqliteStore implements Store {
     if (now - this.changeLogPrunedAt < 86_400_000) return null;
     this.changeLogPrunedAt = now;
     try {
-      return pruneChangeLog(this.db, this.historyPolicy.change_log_days, new Date(now));
+      return this.transaction(() => {
+        const pruned = pruneChangeLog(this.db, this.historyPolicy.change_log_days, new Date(now));
+        dropBlobsIfUnheld(this.db, pruned.hashes);
+        return { changes: pruned.changes, sets: pruned.sets };
+      });
     } catch (error) {
       console.warn("[vault] change log sweep failed:", error);
       return null;
@@ -1028,7 +1034,14 @@ export class BunSqliteStore implements Store {
 
   async listNoteVersions(id: string, opts?: { limit?: number; offset?: number }) { return listVersions(this.db, id, opts); }
   async getNoteVersion(id: string, versionIx: number) { return getVersion(this.db, id, versionIx); }
-  async eraseNoteHistory(id: string) { return eraseHistory(this.db, id); }
+  async eraseNoteHistory(id: string) {
+    // The change log's copies of this record's past go with its versions (0.9.4).
+    return this.transaction(() => {
+      const held = forgetLoggedPast(this.db, id);
+      const erased = eraseHistory(this.db, id);
+      return { ...erased, blobsDeleted: erased.blobsDeleted + dropBlobsIfUnheld(this.db, held) };
+    });
+  }
   sweepDeletedHistory() { return sweepDeletedHistory(this.db, this.historyPolicy); }
   async countNoteVersions(id: string) { return countNoteVersions(this.db, id); }
   compactNote(id: string) { return compactNote(this.db, id, this.historyPolicy); }
@@ -1095,7 +1108,9 @@ export class BunSqliteStore implements Store {
     const existing = noteOps.getNote(this.db, id);
     const erased = this.transaction(() => {
       if (existing) this.deleteNoteRows(id, existing, { ...opts, captureHistory: false });
-      return eraseNoteVersions(this.db, id);
+      const erased = eraseNoteVersions(this.db, id);
+      // The change log forgets its copies of this record's past too (0.9.4).
+      return { ...erased, blobsDeleted: erased.blobsDeleted + dropBlobsIfUnheld(this.db, forgetLoggedPast(this.db, id)) };
     });
     if (existing) this.afterDelete(id, existing);
     return { deleted: existing !== null, ...erased };

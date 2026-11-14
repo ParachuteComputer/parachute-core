@@ -17,7 +17,7 @@ import { isWhole, isDelta, wholeText, deltaBytes, wholeSql, BlobDecodeError, typ
 import { kindOfVia } from "./write-stamp.js";
 import { transaction } from "./txn.js";
 import { refreshCompactState } from "./history-compact-state.js";
-import { currentWriteSet } from "./change-log.js";
+import { currentWriteSet, forgetLoggedPast } from "./change-log.js";
 import { typeNamesAmong } from "./tag-kind.js";
 
 export type HistoryOp =
@@ -175,6 +175,60 @@ export class HistoryNotFoundError extends Error {
     this.note_id = noteId;
     this.version_ix = versionIx;
   }
+}
+const logTable = new WeakMap<Database, boolean>();
+/**
+ * The change log (0.9.4) holds bodies too: a write set's "before" body is a blob, shared with the versions that hold
+ * the same text. Every blob delete adds this clause, so no path frees a body undo still needs.
+ */
+export function logHolds(db: Database): string {
+  let has = logTable.get(db);
+  if (has === undefined) {
+    has = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'record_changes'").get();
+    if (has) logTable.set(db, true);
+  }
+  return has ? " AND NOT EXISTS (SELECT 1 FROM record_changes WHERE before_hash = note_blobs.hash)" : "";
+}
+/**
+ * Moves the bodies the change log's triggers saved inline for one write set into note_blobs (0.9.4): the triggers
+ * can't hash, so they keep the text; at the end of the transaction it becomes a blob, stored as versions store theirs
+ * (deduplicated by hash, so a body a version also keeps costs nothing more). Call inside the transaction.
+ */
+export function settleLogBodies(db: Database, writeSet: string | null): void {
+  if (writeSet === null) return;
+  const rows = db.prepare("SELECT seq, before_content FROM record_changes WHERE write_set = ? AND before_content IS NOT NULL").all(writeSet) as { seq: number; before_content: string }[];
+  if (!rows.length) return;
+  const move = db.prepare("UPDATE record_changes SET before_hash = ?, before_content = NULL WHERE seq = ?");
+  // Past the version size limit nothing is kept, as a version keeps nothing of an oversized body (undo then leaves
+  // that body as it is).
+  const drop = db.prepare("UPDATE record_changes SET before_content = NULL, content_saved = 0 WHERE seq = ?");
+  for (const r of rows) {
+    if (byteLength(r.before_content) > VERSION_MAX_BYTES) {
+      drop.run(r.seq);
+      continue;
+    }
+    const hash = hashContent(r.before_content);
+    // As a captured version stores its body (with T-460's writer: deflated when smaller).
+    db.prepare("INSERT OR IGNORE INTO note_blobs (hash, content, byte_size) VALUES (?, ?, ?)").run(hash, r.before_content, byteLength(r.before_content));
+    move.run(hash, r.seq);
+  }
+}
+/** One blob's full text (decoding and applying a delta as a version read does), or null when it is gone. */
+export function readBlobText(db: Database, hash: string): string | null {
+  const row = db.prepare("SELECT content, encoding AS blob_encoding, delta_of FROM note_blobs WHERE hash = ?").get(hash) as BlobReadRow | null;
+  if (!row) return null;
+  try {
+    return materialise(db, hash, row);
+  } catch {
+    return null;
+  }
+}
+/** Frees each blob nobody holds any more (a version, a delta, the change log). */
+export function dropBlobsIfUnheld(db: Database, hashes: Iterable<string>): number {
+  const drop = db.prepare("DELETE FROM note_blobs WHERE hash = ? AND NOT EXISTS (SELECT 1 FROM note_versions WHERE content_hash = ?) AND NOT EXISTS (SELECT 1 FROM note_blobs WHERE delta_of = ?)" + logHolds(db));
+  let n = 0;
+  for (const h of new Set(hashes)) n += drop.run(h, h, h).changes;
+  return n;
 }
 export function hashContent(text: string): string {
   return createHash("sha256").update(text, "utf8").digest("hex");
@@ -406,7 +460,7 @@ export function pruneVersions(
   )) {
     blobsDeleted += db
       .prepare(
-        "DELETE FROM note_blobs WHERE hash = ? AND NOT EXISTS (SELECT 1 FROM note_versions WHERE content_hash = ?) AND NOT EXISTS (SELECT 1 FROM note_blobs WHERE delta_of = ?)",
+        "DELETE FROM note_blobs WHERE hash = ? AND NOT EXISTS (SELECT 1 FROM note_versions WHERE content_hash = ?) AND NOT EXISTS (SELECT 1 FROM note_blobs WHERE delta_of = ?)" + logHolds(db),
       )
       .run(hash, hash, hash).changes;
   }
@@ -417,7 +471,7 @@ export function gcBlobs(db: Database): { blobsDeleted: number } {
   let blobsDeleted = 0;
   // Depth one needs two deletion waves; bounded even in a corrupt database.
   for (let pass = 0; pass < 4; pass++) {
-    const changed = db.prepare("DELETE FROM note_blobs WHERE hash NOT IN (SELECT content_hash FROM note_versions WHERE content_hash IS NOT NULL) AND hash NOT IN (SELECT delta_of FROM note_blobs WHERE delta_of IS NOT NULL)").run().changes;
+    const changed = db.prepare("DELETE FROM note_blobs WHERE hash NOT IN (SELECT content_hash FROM note_versions WHERE content_hash IS NOT NULL) AND hash NOT IN (SELECT delta_of FROM note_blobs WHERE delta_of IS NOT NULL)" + logHolds(db)).run().changes;
     blobsDeleted += changed;
     if (!changed) break;
   }
@@ -446,6 +500,8 @@ export function sweepDeletedHistory(
         .prepare("DELETE FROM note_versions WHERE note_id = ?")
         .run(v.note_id).changes;
       db.prepare("DELETE FROM history_compact_state WHERE note_id=?").run(v.note_id);
+      // The change log (0.9.4) forgets its copies of the swept record too, so the retention setting holds.
+      forgetLoggedPast(db, v.note_id);
     }
     return { notesSwept: victims.length, versionsDeleted, ...gcBlobs(db) };
   });
@@ -569,7 +625,7 @@ export function eraseNoteVersions(
   db.prepare("DELETE FROM history_compact_state WHERE note_id=?").run(noteId);
   const baseOf = db.prepare("SELECT delta_of FROM note_blobs WHERE hash = ?");
   const drop = db.prepare(
-    "DELETE FROM note_blobs WHERE hash = ? AND NOT EXISTS (SELECT 1 FROM note_versions WHERE content_hash = ?) AND NOT EXISTS (SELECT 1 FROM note_blobs WHERE delta_of = ?)",
+    "DELETE FROM note_blobs WHERE hash = ? AND NOT EXISTS (SELECT 1 FROM note_versions WHERE content_hash = ?) AND NOT EXISTS (SELECT 1 FROM note_blobs WHERE delta_of = ?)" + logHolds(db),
   );
   let blobsDeleted = 0;
   let wave = [...new Set(hashes)];
@@ -900,7 +956,7 @@ function enforceByteCeiling(db: Database, noteId: string, policy: HistoryPolicy)
     if (!victim)
       break;
     dropped += db.prepare("DELETE FROM note_versions WHERE note_id = ? AND version_ix = ?").run(noteId, victim.version_ix).changes;
-    db.prepare("DELETE FROM note_blobs WHERE hash = ? AND NOT EXISTS (SELECT 1 FROM note_versions WHERE content_hash = ?) AND NOT EXISTS (SELECT 1 FROM note_blobs WHERE delta_of = ?)").run(victim.content_hash, victim.content_hash, victim.content_hash);
+    db.prepare("DELETE FROM note_blobs WHERE hash = ? AND NOT EXISTS (SELECT 1 FROM note_versions WHERE content_hash = ?) AND NOT EXISTS (SELECT 1 FROM note_blobs WHERE delta_of = ?)" + logHolds(db)).run(victim.content_hash, victim.content_hash, victim.content_hash);
   }
   return dropped;
 }

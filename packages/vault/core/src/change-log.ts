@@ -87,6 +87,7 @@ CREATE TABLE IF NOT EXISTS record_changes (
   existed INTEGER NOT NULL,
   at TEXT NOT NULL,
   before_content TEXT,
+  before_hash TEXT,
   content_saved INTEGER NOT NULL DEFAULT 0,
   before_row TEXT,
   before_tags TEXT,
@@ -94,6 +95,7 @@ CREATE TABLE IF NOT EXISTS record_changes (
   UNIQUE (write_set, note_id)
 );
 CREATE INDEX IF NOT EXISTS idx_record_changes_note ON record_changes(note_id, seq);
+CREATE INDEX IF NOT EXISTS idx_record_changes_hash ON record_changes(before_hash) WHERE before_hash IS NOT NULL;
 
 CREATE TRIGGER IF NOT EXISTS rc_notes_insert AFTER INSERT ON notes BEGIN
   INSERT INTO record_changes (write_set, note_id, op, existed, at)
@@ -340,15 +342,31 @@ export function writeSetRecords(db: Database, id: string): WriteSetRecord[] {
 }
 
 /** Drops log rows older than `days` (and sets left with no rows). Returns the rows dropped. */
-export function pruneChangeLog(db: Database, days: number, now = new Date()): { changes: number; sets: number } {
-  if (!changeLogPresent(db)) return { changes: 0, sets: 0 };
+export function pruneChangeLog(db: Database, days: number, now = new Date()): { changes: number; sets: number; hashes: string[] } {
+  if (!changeLogPresent(db)) return { changes: 0, sets: 0, hashes: [] };
   const cutoff = new Date(now.getTime() - days * 86_400_000).toISOString();
   // seq follows time (one writer at a time), so the rows past the horizon are a prefix of seq: found from the newest
   // end, with no index on at.
   const last = db.prepare("SELECT seq FROM record_changes WHERE at < ? ORDER BY seq DESC LIMIT 1").get(cutoff) as { seq: number } | null;
+  // The bodies these rows held: the caller frees each blob nobody else holds (history.ts dropBlobsIfUnheld).
+  const hashes = last
+    ? (db.prepare("SELECT DISTINCT before_hash FROM record_changes WHERE seq <= ? AND before_hash IS NOT NULL").all(last.seq) as { before_hash: string }[]).map((r) => r.before_hash)
+    : [];
   const changes = last ? db.prepare("DELETE FROM record_changes WHERE seq <= ?").run(last.seq).changes : 0;
   const sets = db.prepare("DELETE FROM write_sets WHERE at < ? AND NOT EXISTS (SELECT 1 FROM record_changes rc WHERE rc.write_set = write_sets.id)").run(cutoff).changes;
-  return { changes, sets };
+  return { changes, sets, hashes };
+}
+
+/**
+ * Forgets what the log kept of one record's past (erase history, forget): its bodies, fields, path and links. The
+ * rows stay, with the tags they had, so the feed still reports the change to the readers who could see it. Returns
+ * the blobs the rows held, for the caller to free.
+ */
+export function forgetLoggedPast(db: Database, noteId: string): string[] {
+  if (!changeLogPresent(db)) return [];
+  const hashes = (db.prepare("SELECT DISTINCT before_hash FROM record_changes WHERE note_id = ? AND before_hash IS NOT NULL").all(noteId) as { before_hash: string }[]).map((r) => r.before_hash);
+  db.prepare("UPDATE record_changes SET before_content = NULL, before_hash = NULL, content_saved = 0, before_row = NULL, before_links = NULL WHERE note_id = ?").run(noteId);
+  return hashes;
 }
 
 /** Normalises a `why`: trimmed, at most WHY_MAX_CHARS characters, null when empty. Throws on a non-string. */

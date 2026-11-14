@@ -1655,7 +1655,11 @@ and `delete-record` (and their note-named aliases); a longer one is 400 `invalid
   one by the tags it had); otherwise the set is left out of the list and is 404.
 - Every record a write changes is counted, including writes no record call made: a tag rename lists every record
   whose tags it rewrote; links made by a record's `[[wikilinks]]` belong to the write that made them.
-- The log is kept for `history.change_log_days` (default 30); older sets are swept daily.
+- The log is kept for `history.change_log_days` (default 30); older sets are swept when the vault opens and then at
+  most daily. What undo needs is kept with it: a changed body is stored once, as version history stores bodies
+  (shared with a version holding the same text), and freed with the log. Erasing a record's history
+  (`DELETE /notes/{id}/versions`, `erase_history`) and the deleted-history sweep forget the log's copies of that
+  record's past too; the log keeps only that the record changed, and the tags it had.
 
 ### Version history
 
