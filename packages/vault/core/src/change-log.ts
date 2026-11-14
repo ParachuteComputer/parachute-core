@@ -144,7 +144,10 @@ CREATE TABLE IF NOT EXISTS record_changes (
 CREATE TABLE IF NOT EXISTS record_change_bases (
   id INTEGER PRIMARY KEY,
   note_id TEXT NOT NULL,
-  content NOT NULL
+  content NOT NULL,
+  -- How many rows were stored against it: past BASE_MAX_USES a record's next row makes a new base, so the sweep, which
+  -- re-encodes the rows still naming a base whose first row it drops, never has many to do.
+  uses INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_record_change_bases_note ON record_change_bases(note_id, id);
 CREATE INDEX IF NOT EXISTS idx_record_changes_position ON record_changes(position);
@@ -337,6 +340,8 @@ export function clearWriteContext(db: Database, recordSet = true): void {
 export const SNAPSHOT_COMPRESS_MIN_BYTES = 128;
 /** A delta is kept while it is under this share of the snapshot's own deflate; past it, the snapshot becomes a base. */
 const DELTA_MAX_SHARE = 0.25;
+/** Rows stored against one base at most: what the sweep may have to re-encode when it drops the base's first row. */
+const BASE_MAX_USES = 16;
 /** A guard against a corrupt stream, far above any real snapshot (a record's fields, path and stamps; its links). */
 const SNAPSHOT_MAX_BYTES = 64 * 1024 * 1024;
 const utf8 = new TextEncoder();
@@ -391,13 +396,14 @@ function storeRowSnapshot(db: Database, seq: number, noteId: string, text: strin
   const wholeSize = typeof whole === "string" ? utf8.encode(whole).length : whole.length;
   const prior = cached(
     db,
-    `SELECT b.id, b.content FROM record_change_bases b
+    `SELECT b.id, b.content, b.uses FROM record_change_bases b
      WHERE b.id = (SELECT before_base FROM record_changes WHERE note_id = ? AND seq < ? AND before_base IS NOT NULL ORDER BY seq DESC LIMIT 1)`,
-  ).get(noteId, seq) as { id: number; content: StoredContent } | null;
-  if (prior) {
+  ).get(noteId, seq) as { id: number; content: StoredContent; uses: number } | null;
+  if (prior && prior.uses < BASE_MAX_USES) {
     const delta = deflateBytes(createDeltaBytes(snapshotText(prior.content)!, text));
     if (delta.length < wholeSize * DELTA_MAX_SHARE) {
       update.run(delta, links, prior.id, seq);
+      cached(db, "UPDATE record_change_bases SET uses = uses + 1 WHERE id = ?").run(prior.id);
       return;
     }
   }
@@ -629,7 +635,7 @@ export function writeSetRecords(db: Database, id: string): WriteSetRecord[] {
     .map((r) => ({ id: r.note_id, op: r.op, seq: r.first_seq, tags_before: r.before_tags ? (JSON.parse(r.before_tags) as string[]) : null }));
 }
 
-/** Drops log rows older than `days` (and sets left with no rows). Returns the rows dropped. */
+/** Drops log rows older than `days` (and sets left with no rows). Returns the rows dropped. Call inside a transaction. */
 export function pruneChangeLog(db: Database, days: number, now = new Date()): { changes: number; sets: number; hashes: string[] } {
   if (!changeLogPresent(db)) return { changes: 0, sets: 0, hashes: [] };
   // Place rows still waiting for a position first (an older engine's writes), so none is dropped below the horizon
@@ -676,7 +682,9 @@ export function forgetLoggedPast(db: Database, noteId: string): string[] {
  * After the sweep: a base a dropped row named holds a snapshot from past the horizon (a base is made of the first row
  * naming it). Where remaining rows still name it, they're re-encoded, in seq order, against bases made of their own
  * snapshots; then every base of these records that no remaining row names is freed. Each re-encoded row reads back the
- * same text. A row names only a base of its own record, so the work is per record (idx_record_changes_note).
+ * same text. A row names only a base of its own record, so the work is per record (idx_record_changes_note), and at
+ * most BASE_MAX_USES rows a stale base. Call inside a transaction (pruneChangeLog's caller's): between letting go of a
+ * base and storing its rows again, they don't read.
  */
 function sweepBases(db: Database, swept: { note_id: string; before_base: number }[]): void {
   if (!swept.length) return;

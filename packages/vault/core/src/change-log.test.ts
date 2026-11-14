@@ -222,6 +222,20 @@ describe("change log: positions and what history keeps", () => {
     for (let i = 1; i <= 8; i++) expect(setRecordStates(db, `ws_delta0000${i}`)[0]!.before_row).toBe(want[i - 1]);
   });
 
+  test("a base serves at most 16 rows, so the sweep never has many to re-encode", async () => {
+    const { db, store, as } = fresh();
+    const prose = Array.from({ length: 90 }, (_, k) => ((k * 7919) % 104729).toString(36)).join(" ");
+    as({ id: "ws_uses00000" });
+    const n = await store.createNote("b", { path: "uses", metadata: { summary: prose, step: 0 } });
+    for (let i = 1; i <= 40; i++) {
+      as({ id: `ws_uses${String(i).padStart(5, "0")}` });
+      await store.updateNote(n.id, { metadata: { summary: prose, step: i } });
+    }
+    const per = db.prepare("SELECT before_base AS b, COUNT(*) AS n FROM record_changes WHERE before_base IS NOT NULL GROUP BY 1").all() as { b: number; n: number }[];
+    expect(per.length).toBe(3);
+    expect(Math.max(...per.map((r) => r.n))).toBe(16);
+  });
+
   test("a snapshot that drifted from its base becomes the record's new base", async () => {
     const { db, store, as } = fresh();
     as({ id: "ws_drift0001" });
