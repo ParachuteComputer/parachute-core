@@ -2603,6 +2603,18 @@ export async function importVault(
   source: ImportSource,
   opts: ImportEngineOptions = {},
 ): Promise<ImportStats> {
+  // An import is bulk operator work: the change log (0.9.4) records which records it changed but keeps none of the
+  // bodies it replaced (a blow-away import would otherwise keep a copy of the whole vault for the log's horizon).
+  const bulk = (store as Store & { bulkWrites?: <T>(fn: () => Promise<T>) => Promise<T> }).bulkWrites;
+  if (bulk) return bulk.call(store, () => importVaultRows(store, source, opts)) as Promise<ImportStats>;
+  return importVaultRows(store, source, opts);
+}
+
+async function importVaultRows(
+  store: Store,
+  source: ImportSource,
+  opts: ImportEngineOptions,
+): Promise<ImportStats> {
   const stats: ImportStats = {
     notes_created: 0,
     notes_updated: 0,

@@ -109,8 +109,47 @@ describe("change log: bodies are blobs", () => {
     await store.updateNote(n.id, { content: "public", metadata: {} });
     await store.eraseNoteHistory(n.id);
     const [row] = db.prepare("SELECT before_content, before_hash, before_row, content_saved FROM record_changes WHERE write_set = 'ws_ed0000002'").all() as any[];
-    expect(row).toEqual({ before_content: null, before_hash: null, before_row: null, content_saved: 0 });
+    // Still marked saved, so a later transaction of the same set can't save an in-between body in its place.
+    expect(row).toEqual({ before_content: null, before_hash: null, before_row: null, content_saved: 1 });
     expect((db.prepare("SELECT COUNT(*) AS n FROM note_blobs").get() as any).n).toBe(0);
+  });
+});
+
+describe("change log: positions and what history keeps", () => {
+  test("a set that touches a record again moves to the end of the log, past a later set's touch", async () => {
+    const { db, store, as } = fresh();
+    as({ id: "ws_first0001" });
+    const n = await store.createNote("x", { path: "pos" });
+    as({ id: "ws_second001" });
+    await store.updateNote(n.id, { content: "y" });
+    as({ id: "ws_first0001" }); // the first set again (several requests sharing one Parachute-Write-Set id)
+    await store.updateNote(n.id, { content: "z" });
+    const pos = (id: string) => db.prepare("SELECT position, first_position, touched FROM record_changes WHERE write_set = ?").get(id) as any;
+    expect(pos("ws_first0001").position).toBeGreaterThan(pos("ws_second001").position);
+    expect(pos("ws_first0001").first_position).toBeLessThan(pos("ws_second001").position);
+    expect(pos("ws_first0001").touched).toBe(0);
+    // A raw write (an older engine) waits for the next Store transaction to get its position, then sorts after.
+    db.prepare("UPDATE notes SET content = 'raw', updated_at = 'later' WHERE id = ?").run(n.id);
+    expect((db.prepare("SELECT position FROM record_changes WHERE write_set IS NULL").get() as any).position).toBeNull();
+    as({ id: "ws_third0001" });
+    await store.createNote("other", { path: "pos2" });
+    const raw = (db.prepare("SELECT position FROM record_changes WHERE write_set IS NULL").get() as any).position;
+    expect(raw).toBeGreaterThan(pos("ws_first0001").position);
+    expect(pos("ws_third0001").position).toBeGreaterThan(raw);
+  });
+
+  test("with history off the log keeps no old bodies; an import keeps none either", async () => {
+    const db = new Database(":memory:");
+    const off = new SqliteStore(db, { history: { enabled: false } });
+    const n = await off.createNote("secret v1", { path: "h" });
+    await off.updateNote(n.id, { content: "v2" });
+    expect((db.prepare("SELECT COUNT(*) AS n FROM record_changes WHERE content_saved = 1").get() as any).n).toBe(0);
+    const { db: db2, store } = fresh();
+    const m = await store.createNote("old body", { path: "imp" });
+    await store.bulkWrites(async () => {
+      await store.updateNote(m.id, { content: "imported body" });
+    });
+    expect((db2.prepare("SELECT COUNT(*) AS n FROM record_changes WHERE content_saved = 1").get() as any).n).toBe(0);
   });
 });
 
@@ -134,7 +173,7 @@ describe("change log: an older engine's vault", () => {
     let db = new Database(file);
     new SqliteStore(db);
     for (const t of ["rc_notes_insert", "rc_notes_update", "rc_notes_delete", "rc_note_tags_insert", "rc_note_tags_delete", "rc_note_tags_update", "rc_links_insert", "rc_links_delete", "rc_links_update"]) db.exec(`DROP TRIGGER ${t}`);
-    for (const t of ["record_changes", "write_sets", "write_context"]) db.exec(`DROP TABLE ${t}`);
+    for (const t of ["record_changes", "write_sets", "write_context", "change_log_state"]) db.exec(`DROP TABLE ${t}`);
     for (const c of ["write_set", "types", "tags", "links"]) db.exec(`ALTER TABLE note_versions DROP COLUMN ${c}`);
     db.query("INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)").run(SCHEMA_VERSION, "2999-01-01T00:00:00.000Z");
     db.close();

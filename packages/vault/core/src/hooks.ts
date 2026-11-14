@@ -243,6 +243,12 @@ export interface HookRegistryOptions {
 }
 
 export class HookRegistry {
+  /**
+   * Runs deferred hook work outside the request that caused it (0.9.4): the server installs one that leaves the
+   * request's write-set scope (src/write-set-edge.ts), so a hook's or trigger's later write is its own write set, not
+   * the caller's. Core stays free of node imports; the default runs `fn` as it is.
+   */
+  static detach: (fn: () => void) => void = (fn) => fn();
   private hooks: RegisteredHook[] = [];
   private attachmentHooks: RegisteredAttachmentHook[] = [];
   private tagHooks: RegisteredTagHook[] = [];
@@ -389,13 +395,13 @@ export class HookRegistry {
     // it defers real work behind an `await` (semaphore acquire) and does no
     // synchronous store write — but the invariant lives in txn.ts's header
     // ("shared-connection invariant"), not just this comment; keep it true.
-    queueMicrotask(() => {
+    queueMicrotask(() => HookRegistry.detach(() => {
       for (const hook of matches) {
         const task = this.runHandler(hook, event, note, store);
         this.inFlight.add(task);
         task.finally(() => this.inFlight.delete(task));
       }
-    });
+    }));
   }
 
   /**
@@ -426,13 +432,13 @@ export class HookRegistry {
     }
     if (matches.length === 0) return;
 
-    queueMicrotask(() => {
+    queueMicrotask(() => HookRegistry.detach(() => {
       for (const hook of matches) {
         const task = this.runAttachmentHandler(hook, event, attachment, store);
         this.inFlight.add(task);
         task.finally(() => this.inFlight.delete(task));
       }
-    });
+    }));
   }
 
   /**
@@ -460,13 +466,13 @@ export class HookRegistry {
     }
     if (matches.length === 0) return;
 
-    queueMicrotask(() => {
+    queueMicrotask(() => HookRegistry.detach(() => {
       for (const hook of matches) {
         const task = this.runTagHandler(hook, event, tag, store);
         this.inFlight.add(task);
         task.finally(() => this.inFlight.delete(task));
       }
-    });
+    }));
   }
 
   private async runHandler(

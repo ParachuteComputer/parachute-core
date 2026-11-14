@@ -1,4 +1,4 @@
-import { changeLogPresent, setWriteContext, clearWriteContext, currentWriteSet, forgetLoggedPast, pruneChangeLog, type WriteSetContext } from "./change-log.js";
+import { changeLogPresent, setWriteContext, clearWriteContext, currentWriteSet, settleChangeLogPositions, forgetLoggedPast, pruneChangeLog, type WriteSetContext } from "./change-log.js";
 import { dropBlobsIfUnheld, settleLogBodies } from "./history.js";
 import { Database } from "bun:sqlite";
 import { anyTermsQuery, fuseRanks, HYBRID_POOL } from "./hybrid.js";
@@ -181,13 +181,23 @@ export class BunSqliteStore implements Store {
     if (this.writeContextOpen || !this.changeLogReady()) return transaction(this.db, fn);
     const out = transaction(this.db, () => {
       this.writeContextOpen = true;
+      const source = this.writeSetSource?.() ?? {};
+      // Bodies are kept for undo only where history keeps them, and not for bulk operator work (an import).
+      const keepBefore = source.keepBefore !== false && this.historyPolicy.enabled && this.bulkDepth === 0;
+      let ok = false;
       try {
-        setWriteContext(this.db, this.writeSetSource?.() ?? {});
-        return fn();
+        setWriteContext(this.db, { ...source, keepBefore });
+        const result = fn();
+        ok = true;
+        return result;
       } finally {
         this.writeContextOpen = false;
-        settleLogBodies(this.db, currentWriteSet(this.db));
-        clearWriteContext(this.db);
+        // After a throw the transaction rolls back anyway; only the context is cleared, so its error is the one seen.
+        if (ok) {
+          settleLogBodies(this.db, currentWriteSet(this.db));
+          settleChangeLogPositions(this.db);
+        }
+        clearWriteContext(this.db, ok);
       }
     });
     this.pruneChangeLogDaily();
@@ -217,6 +227,19 @@ export class BunSqliteStore implements Store {
    */
   writeSetSource?: () => WriteSetContext | undefined;
   private writeContextOpen = false;
+  private bulkDepth = 0;
+  /**
+   * Runs bulk operator work (an import): the change log records which records changed, but keeps none of their old
+   * bodies (a blow-away import would otherwise keep a copy of the whole vault for the log's horizon).
+   */
+  async bulkWrites<T>(fn: () => Promise<T>): Promise<T> {
+    this.bulkDepth++;
+    try {
+      return await fn();
+    } finally {
+      this.bulkDepth--;
+    }
+  }
   private changeLogKnown: boolean | undefined;
   private changeLogReady(): boolean {
     if (this.changeLogKnown === undefined) this.changeLogKnown = changeLogPresent(this.db);

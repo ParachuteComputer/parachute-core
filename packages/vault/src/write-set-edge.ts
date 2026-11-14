@@ -7,6 +7,8 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { getWriteSet, newWriteSetId, normaliseWhy, WRITE_SET_ID_RE, type WriteSetContext } from "../core/src/change-log.ts";
 import type { Store } from "../core/src/types.ts";
+import { HookRegistry } from "../core/src/hooks.ts";
+import { kindOfVia } from "../core/src/write-stamp.ts";
 
 /** A client groups several requests into one set by sending the same id. */
 export const WRITE_SET_HEADER = "Parachute-Write-Set";
@@ -15,24 +17,41 @@ export const WHY_HEADER = "Parachute-Why";
 
 interface Holder {
   ctx?: WriteSetContext;
+  /** Set when the request (or tool call) has answered: anything it left running writes as its own set. */
+  closed?: boolean;
 }
 
 const scope = new AsyncLocalStorage<Holder>();
 
+// Hook handlers, webhook triggers and the workers they kick run outside the request that caused them, so their
+// writes are their own sets, never the caller's (and an undo of the caller's set never reverts them).
+HookRegistry.detach = (fn) => scope.exit(fn);
+
 /** What the Store reads: the context of the request it is serving, if any. */
 export function edgeWriteSetSource(): WriteSetContext | undefined {
-  return scope.getStore()?.ctx;
+  const h = scope.getStore();
+  return h && !h.closed ? h.ctx : undefined;
 }
 
 /** Runs `fn` in a fresh request scope (nothing said yet: writes get their own set until `sayWriter`). */
-export function withRequestScope<T>(fn: () => T): T {
-  return scope.run({}, fn);
+export async function withRequestScope<T>(fn: () => Promise<T>): Promise<T> {
+  const holder: Holder = {};
+  try {
+    return await scope.run(holder, fn);
+  } finally {
+    holder.closed = true;
+  }
 }
 
 /** Runs `fn` as one write set with this context (an MCP tool call), whatever scope surrounds it. */
-export function withWriteSet<T>(store: Store, ctx: WriteSetContext, fn: () => T): T {
+export async function withWriteSet<T>(store: Store, ctx: WriteSetContext, fn: () => Promise<T> | T): Promise<T> {
   installSource(store);
-  return scope.run({ ctx: { ...ctx, id: ctx.id ?? newWriteSetId() } }, fn);
+  const holder: Holder = { ctx: { ...ctx, id: ctx.id ?? newWriteSetId() } };
+  try {
+    return await scope.run(holder, fn);
+  } finally {
+    holder.closed = true;
+  }
 }
 
 function installSource(store: Store): void {
@@ -53,6 +72,8 @@ export function sayWriter(
 ): WriterRefusal | null {
   installSource(store);
   const holder = scope.getStore();
+  // A read writes nothing, so its headers mean nothing: never refuse one for them.
+  if (req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") return null;
   let why: string | null;
   try {
     const raw = req.headers.get(WHY_HEADER);
@@ -68,6 +89,11 @@ export function sayWriter(
         body: { error: `${WRITE_SET_HEADER} is 8 to 64 letters, digits, '-' or '_'.`, error_type: "invalid_write_set", field: WRITE_SET_HEADER },
       };
     }
+    // Claim the id now, atomically (one writer at a time): two keys sending the same new id at once can't both get
+    // in. A claimed set with no records is never listed, and is swept at the horizon.
+    store.db
+      .prepare("INSERT OR IGNORE INTO write_sets (id, at, actor, via, via_kind, why) VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?, ?, ?, ?)")
+      .run(supplied, writer.actor, writer.via, kindOfVia(writer.via), why);
     const existing = getWriteSet(store.db, supplied);
     if (existing && existing.via !== writer.via) {
       return {

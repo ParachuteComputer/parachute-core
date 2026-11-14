@@ -109,14 +109,19 @@ describe("v094/write-sets: revisions say who and why, with the types, tags and l
     expect(single).toMatchObject({ write_set: set.id, why: "fixing the summary", content: "v1" });
   });
 
-  test("a tag-scoped reader sees a record's versions but not who, why, the set or the links", async () => {
+  test("a tag-scoped reader sees a record's versions but not who, why, the set, the links or tags outside its scope", async () => {
     const t = `sc${shortId()}`;
-    const made = await writer.api("POST", "/notes", { path: `${t}/r`, content: "v1", tags: [t] });
+    const made = await writer.api("POST", "/notes", { path: `${t}/r`, content: "v1", tags: [t, `hidden${t}`] });
     await writer.api("PATCH", `/notes/${made.body.id}`, { content: "v2", force: true }, { "Parachute-Why": "private reason" });
     const scoped = rest(services().vaultViaHub, await pass({ level: "read", tags: [t] }));
     const v = (await scoped.get(`/notes/${made.body.id}/versions`)).body.versions as any[];
     expect(v.length).toBe(1);
     for (const k of ["actor", "via", "write_set", "why", "links"]) expect(Object.keys(v[0])).not.toContain(k);
+    // A version's tags are scrubbed to the scope, as the live record's are: no tag name outside it.
+    expect((await scoped.get(`/notes/${made.body.id}`)).body.tags).toEqual([t]);
+    expect(v[0].tags).toEqual([t]);
+    const one = (await scoped.get(`/notes/${made.body.id}/versions/${v[0].version_ix}`)).body;
+    expect(one.tags).toEqual([t]);
   });
 });
 

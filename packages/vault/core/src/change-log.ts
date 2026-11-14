@@ -46,13 +46,14 @@ const LINKS_OF = (id: string, extra = "") =>
 
 /**
  * A first touch from a tag or link row. The note row is unchanged so far in this set, so it is read as it is; the
- * tag or link list is today's with this one change undone. A later touch in the same set is ignored (the first
- * snapshot stands). With no context the row's write set is NULL, which never conflicts: one row per change.
+ * tag or link list is today's with this one change undone. A later touch in the same set keeps the first snapshot and only marks
+ * the row touched. With no context the row's write set is NULL, which never conflicts: one row per change.
  */
 function childTouch(noteId: string, tagsBefore: string, linksBefore: string): string {
-  return `INSERT OR IGNORE INTO record_changes (write_set, note_id, op, existed, at, before_row, before_tags, before_links)
+  return `INSERT INTO record_changes (write_set, note_id, op, existed, at, before_row, before_tags, before_links)
     SELECT c.write_set, n.id, 'update', 1, ${NOW}, ${rowJson("n")}, ${tagsBefore}, ${linksBefore}
-    FROM notes n LEFT JOIN write_context c ON c.slot = 1 WHERE n.id = ${noteId};`;
+    FROM notes n LEFT JOIN write_context c ON c.slot = 1 WHERE n.id = ${noteId}
+    ON CONFLICT (write_set, note_id) DO UPDATE SET touched = 1;`;
 }
 
 /** The tables, indexes and triggers. Idempotent. */
@@ -92,15 +93,31 @@ CREATE TABLE IF NOT EXISTS record_changes (
   before_row TEXT,
   before_tags TEXT,
   before_links TEXT,
+  -- The log's order (0.9.4): position is the newest touch of this record by this set, first_position the first.
+  -- NULL while the writing transaction is open; touched marks a row a transaction touched, until its end gives it
+  -- the newest position (settleChangeLogPositions). The feed reads in position order; undo's conflict check compares
+  -- positions (a set that touches a record again moves to the end).
+  position INTEGER,
+  first_position INTEGER,
+  touched INTEGER NOT NULL DEFAULT 1,
   UNIQUE (write_set, note_id)
 );
+CREATE INDEX IF NOT EXISTS idx_record_changes_position ON record_changes(position);
+CREATE INDEX IF NOT EXISTS idx_record_changes_touched ON record_changes(seq) WHERE touched = 1;
+CREATE TABLE IF NOT EXISTS change_log_state (
+  slot INTEGER PRIMARY KEY CHECK (slot = 1),
+  newest INTEGER NOT NULL DEFAULT 0,
+  -- The highest position the sweep has dropped: a feed reader below it may have missed changes.
+  horizon INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO change_log_state (slot, newest, horizon) VALUES (1, 0, 0);
 CREATE INDEX IF NOT EXISTS idx_record_changes_note ON record_changes(note_id, seq);
 CREATE INDEX IF NOT EXISTS idx_record_changes_hash ON record_changes(before_hash) WHERE before_hash IS NOT NULL;
 
 CREATE TRIGGER IF NOT EXISTS rc_notes_insert AFTER INSERT ON notes BEGIN
   INSERT INTO record_changes (write_set, note_id, op, existed, at)
   SELECT c.write_set, NEW.id, 'create', 0, ${NOW} FROM ${CTX} WHERE true
-  ON CONFLICT (write_set, note_id) DO UPDATE SET op = CASE WHEN existed = 1 THEN 'update' ELSE 'create' END;
+  ON CONFLICT (write_set, note_id) DO UPDATE SET op = CASE WHEN existed = 1 THEN 'update' ELSE 'create' END, touched = 1;
 END;
 
 CREATE TRIGGER IF NOT EXISTS rc_notes_update BEFORE UPDATE ON notes
@@ -113,7 +130,7 @@ BEGIN
     OLD.content IS NOT NEW.content AND ${KEEP},
     ${rowJson("OLD")}, ${TAGS_OF("OLD.id")}, ${LINKS_OF("OLD.id")}
   FROM ${CTX} WHERE true
-  ON CONFLICT (write_set, note_id) DO UPDATE SET
+  ON CONFLICT (write_set, note_id) DO UPDATE SET touched = 1,
     before_content = CASE WHEN existed = 1 AND content_saved = 0 THEN excluded.before_content ELSE before_content END,
     content_saved = CASE WHEN existed = 1 AND content_saved = 0 THEN excluded.content_saved ELSE content_saved END;
 END;
@@ -124,7 +141,7 @@ CREATE TRIGGER IF NOT EXISTS rc_notes_delete BEFORE DELETE ON notes BEGIN
     CASE WHEN ${KEEP} THEN OLD.content END, ${KEEP},
     ${rowJson("OLD")}, ${TAGS_OF("OLD.id")}, ${LINKS_OF("OLD.id")}
   FROM ${CTX} WHERE true
-  ON CONFLICT (write_set, note_id) DO UPDATE SET op = 'delete',
+  ON CONFLICT (write_set, note_id) DO UPDATE SET op = 'delete', touched = 1,
     before_content = CASE WHEN existed = 1 AND content_saved = 0 THEN excluded.before_content ELSE before_content END,
     content_saved = CASE WHEN existed = 1 AND content_saved = 0 THEN excluded.content_saved ELSE content_saved END;
 END;
@@ -174,9 +191,9 @@ export const CHANGE_LOG_TRIGGERS = [
 /** Whether the change log's tables and triggers are all present. */
 export function changeLogPresent(db: Database): boolean {
   const names = new Set(
-    (db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table', 'trigger') AND (name IN ('write_context', 'write_sets', 'record_changes') OR name LIKE 'rc\\_%' ESCAPE '\\')").all() as { name: string }[]).map((r) => r.name),
+    (db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table', 'trigger') AND (name IN ('write_context', 'write_sets', 'record_changes', 'change_log_state') OR name LIKE 'rc\\_%' ESCAPE '\\')").all() as { name: string }[]).map((r) => r.name),
   );
-  return ["write_context", "write_sets", "record_changes", ...CHANGE_LOG_TRIGGERS].every((n) => names.has(n));
+  return ["write_context", "write_sets", "record_changes", "change_log_state", ...CHANGE_LOG_TRIGGERS].every((n) => names.has(n));
 }
 
 /** The un-numbered step: creates the change log on a vault that lacks it (no-op otherwise). */
@@ -238,14 +255,33 @@ export function setWriteContext(db: Database, ctx: WriteSetContext): string {
  * Ends the context: records the write set itself when it changed a record (once; a set spanning several
  * transactions keeps its first time), then clears the row so a later write outside any context isn't counted in.
  */
-export function clearWriteContext(db: Database): void {
-  cached(
+export function clearWriteContext(db: Database, recordSet = true): void {
+  if (recordSet) cached(
     db,
     `INSERT OR IGNORE INTO write_sets (id, at, actor, via, via_kind, why, undoes)
      SELECT c.write_set, (SELECT MIN(at) FROM record_changes WHERE write_set = c.write_set), c.actor, c.via, c.via_kind, c.why, c.undoes
      FROM write_context c WHERE c.slot = 1 AND c.write_set IS NOT NULL AND EXISTS (SELECT 1 FROM record_changes WHERE write_set = c.write_set)`,
   ).run();
   cached(db, "DELETE FROM write_context WHERE slot = 1").run();
+}
+
+/**
+ * Gives every row a transaction touched the newest positions, in seq order (0.9.4): the feed's order, and what undo
+ * compares. Runs at the end of each Store transaction (inside it), so positions follow commit order (one writer at a
+ * time). Rows an older engine or a raw statement wrote (no Store transaction) get theirs at the next one; until then
+ * they have no position, so a feed reader can't pass them by.
+ */
+export function settleChangeLogPositions(db: Database): void {
+  const touched = (cached(db, "SELECT COUNT(*) AS n FROM record_changes WHERE touched = 1").get() as { n: number }).n;
+  if (!touched) return;
+  cached(
+    db,
+    `UPDATE record_changes SET position = s.newest + t.rn, first_position = COALESCE(first_position, s.newest + t.rn), touched = 0
+     FROM (SELECT seq, ROW_NUMBER() OVER (ORDER BY seq) AS rn FROM record_changes WHERE touched = 1) AS t,
+          (SELECT newest FROM change_log_state WHERE slot = 1) AS s
+     WHERE record_changes.seq = t.seq`,
+  ).run();
+  cached(db, "UPDATE change_log_state SET newest = newest + ? WHERE slot = 1").run(touched);
 }
 
 /** The write set the open transaction writes under, if any. */
@@ -295,14 +331,15 @@ export function listWriteSets(
   }
   const out: WriteSetSummary[] = [];
   // A scoped reader skips sets it can't see whole: page until the limit is met or the log ends.
-  let cursor: string | undefined;
+  let cursor: { at: string; id: string } | undefined;
   for (let page = 0; page < 50 && out.length < limit; page++) {
-    const pageWhere = cursor === undefined ? where : [...where, "ws.at < ?"];
-    const pageParams = cursor === undefined ? params : [...params, cursor];
+    // Keyset on (at, id): sets that share a millisecond are neither skipped nor repeated across pages.
+    const pageWhere = cursor === undefined ? where : [...where, "(ws.at < ? OR (ws.at = ? AND ws.id < ?))"];
+    const pageParams = cursor === undefined ? params : [...params, cursor.at, cursor.at, cursor.id];
     const rows = db
       .prepare(
         `SELECT ws.id, ws.at, ws.actor, ws.via, ws.via_kind, ws.why, ws.undoes,
-          (SELECT COUNT(*) FROM record_changes rc WHERE rc.write_set = ws.id) AS records,
+          (SELECT COUNT(*) FROM record_changes rc WHERE rc.write_set = ws.id AND NOT (rc.op = 'delete' AND rc.existed = 0)) AS records,
           (SELECT u.id FROM write_sets u WHERE u.undoes = ws.id ORDER BY u.at DESC LIMIT 1) AS undone_by
          FROM write_sets ws WHERE ${pageWhere.join(" AND ")} ORDER BY ws.at DESC, ws.id DESC LIMIT ?`,
       )
@@ -314,7 +351,7 @@ export function listWriteSets(
       out.push(r);
     }
     if (rows.length < limit) break;
-    cursor = rows[rows.length - 1]!.at;
+    cursor = { at: rows[rows.length - 1]!.at, id: rows[rows.length - 1]!.id };
   }
   return out;
 }
@@ -352,6 +389,9 @@ export function pruneChangeLog(db: Database, days: number, now = new Date()): { 
   const hashes = last
     ? (db.prepare("SELECT DISTINCT before_hash FROM record_changes WHERE seq <= ? AND before_hash IS NOT NULL").all(last.seq) as { before_hash: string }[]).map((r) => r.before_hash)
     : [];
+  // The feed's horizon: the highest position dropped, kept in the same step (a row's position can be above its seq's
+  // neighbours': its set touched the record again later, so it is the largest of the prefix's).
+  if (last) db.prepare("UPDATE change_log_state SET horizon = MAX(horizon, COALESCE((SELECT MAX(position) FROM record_changes WHERE seq <= ?), 0)) WHERE slot = 1").run(last.seq);
   const changes = last ? db.prepare("DELETE FROM record_changes WHERE seq <= ?").run(last.seq).changes : 0;
   const sets = db.prepare("DELETE FROM write_sets WHERE at < ? AND NOT EXISTS (SELECT 1 FROM record_changes rc WHERE rc.write_set = write_sets.id)").run(cutoff).changes;
   return { changes, sets, hashes };
@@ -365,7 +405,8 @@ export function pruneChangeLog(db: Database, days: number, now = new Date()): { 
 export function forgetLoggedPast(db: Database, noteId: string): string[] {
   if (!changeLogPresent(db)) return [];
   const hashes = (db.prepare("SELECT DISTINCT before_hash FROM record_changes WHERE note_id = ? AND before_hash IS NOT NULL").all(noteId) as { before_hash: string }[]).map((r) => r.before_hash);
-  db.prepare("UPDATE record_changes SET before_content = NULL, before_hash = NULL, content_saved = 0, before_row = NULL, before_links = NULL WHERE note_id = ?").run(noteId);
+  // content_saved stays as it is: a later transaction of the same set must not save an in-between body in its place.
+  db.prepare("UPDATE record_changes SET before_content = NULL, before_hash = NULL, before_row = NULL, before_links = NULL WHERE note_id = ?").run(noteId);
   return hashes;
 }
 

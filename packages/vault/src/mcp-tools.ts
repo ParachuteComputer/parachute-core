@@ -1055,9 +1055,10 @@ function applyTagScopeWrappers(
         return { error: "Note not found", error_type: "not_found", id };
       }
       if ("versions" in result && Array.isArray(result.versions)) {
-        return { ...result, versions: result.versions.map(row => projectHistoryProvenance(row, true)) };
+        // A version's tags and types (0.9.4) are scrubbed to the scope, as a live read's are.
+        return { ...result, versions: result.versions.map(row => projectHistoryProvenance(scrubNoteTagsByScope(row as any, allowed, rawTags), true)) };
       }
-      return projectHistoryProvenance(result, true);
+      return projectHistoryProvenance(scrubNoteTagsByScope(result as any, allowed, rawTags), true);
     }
     // Possible response shapes (vault#550 added the `warnings` variants):
     //   - Array (legacy list, no cursor, no warnings)

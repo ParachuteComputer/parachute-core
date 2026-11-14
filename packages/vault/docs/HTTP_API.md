@@ -1660,6 +1660,13 @@ and `delete-record` (and their note-named aliases); a longer one is 400 `invalid
   (shared with a version holding the same text), and freed with the log. Erasing a record's history
   (`DELETE /notes/{id}/versions`, `erase_history`) and the deleted-history sweep forget the log's copies of that
   record's past too; the log keeps only that the record changed, and the tags it had.
+- With history off (`history.enabled: false`) the log keeps no old bodies; an import keeps none either (it records
+  which records it changed). Work a request leaves running (hooks, webhook triggers, transcription) writes as its own
+  set, never the request's. Not yet stamped with a key: writes by an attachment ticket's upload and by a mirror import
+  (each transaction is its own set). A `Parachute-Write-Set` or `Parachute-Why` header on a read is ignored.
+- **Rolling back to 0.9.3:** 0.9.3 doesn't know the log. Its history clean-up may free a body the log points to (undo
+  then leaves that body as it is), and its erase-history leaves the log's copy of an erased body until the log's
+  horizon (30 days). Upgrading again heals neither; erase again to remove the copy.
 
 ### Version history
 
