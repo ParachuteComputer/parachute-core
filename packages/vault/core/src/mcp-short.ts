@@ -4,7 +4,8 @@
  * budget"). A writer session's whole tool list stays under 4,000 tokens,
  * `query-notes` under 1,500 and every other tool under 400; the contract
  * `contracts/suites/mcp/budget.test.ts` measures `tools/list` and fails over
- * budget.
+ * budget. It counts what the model reads: not a tool's MCP annotations,
+ * which are for the client (mcp-annotations.ts).
  *
  * Nothing is lost: the full text and every parameter stay in
  * `MCP_TOOL_REFERENCE` (mcp-manifest.ts), which `vault-info { help: "<tool>" }`

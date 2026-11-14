@@ -40,6 +40,8 @@ export interface ListedMcpTool {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
+  /** The vault's own MCP annotations (readOnlyHint …), passed through as the vault sent them (T-456). */
+  annotations?: Record<string, unknown>;
 }
 
 export interface ModuleMcpBackend {
@@ -50,7 +52,8 @@ export interface ModuleMcpBackend {
 
 /**
  * The vault selector's words. Kept short: they ride on every proxied tool, and a writer's whole list through the
- * account door is held to the same 4,000-token budget as a per-vault door (contracts/suites/door/multivault.test.ts).
+ * account door is held to the same 4,000-token budget as a per-vault door (contracts/suites/door/multivault.test.ts;
+ * like it, the budget leaves out the tools' MCP annotations, which the model never reads).
  * The catalog caveat (the list comes from one vault's live list) is said once, on list-vaults.
  */
 const VAULT_FIELD_REQUIRED = "Vault name (list-vaults shows them).";
@@ -233,6 +236,7 @@ function injectVaultSelector(tool: {
   name: string;
   description?: unknown;
   inputSchema?: unknown;
+  annotations?: unknown;
 }): ListedMcpTool {
   const rawSchema =
     tool.inputSchema && typeof tool.inputSchema === "object"
@@ -255,7 +259,11 @@ function injectVaultSelector(tool: {
     if (!req.includes("vault")) schema.required = [...req, "vault"];
   }
   const description = typeof tool.description === "string" ? tool.description : tool.name;
-  return { name: tool.name, description, inputSchema: schema };
+  const annotations =
+    tool.annotations && typeof tool.annotations === "object" && !Array.isArray(tool.annotations)
+      ? { annotations: tool.annotations as Record<string, unknown> }
+      : {};
+  return { name: tool.name, description, inputSchema: schema, ...annotations };
 }
 
 /**
@@ -274,10 +282,16 @@ export function schemaSourceCandidates(
   });
 }
 
+// The tools' annotations come with this list, from the covered vault where the key's level is highest, so a key that
+// is admin anywhere sees vault-info as a change (the safe side). If that vault's list fails and a vault where the key
+// holds less answers, its hints would say read-only for a tool the key can still change on the other vault, so they
+// are dropped: with no hints a client treats every tool as a change.
 async function listVaultToolsUncached(ctx: AccountToolContext): Promise<readonly ListedMcpTool[]> {
   const coverage = resolveCoverage(ctx.db, ctx.principal, installedVaults(ctx));
   if (coverage.vaults.length === 0) return [];
-  for (const vault of schemaSourceCandidates(ctx, coverage.vaults)) {
+  const candidates = schemaSourceCandidates(ctx, coverage.vaults);
+  const topRank = COMPOSED_VERB_RANK[verbForVault(ctx, candidates[0]!.name)];
+  for (const vault of candidates) {
     try {
       const result = await postVaultMcp(ctx, vault, verbForVault(ctx, vault.name), "tools/list");
       const tools =
@@ -287,11 +301,11 @@ async function listVaultToolsUncached(ctx: AccountToolContext): Promise<readonly
       if (!tools) continue;
       return tools
         .filter(
-          (t): t is { name: string; description?: unknown; inputSchema?: unknown } =>
+          (t): t is { name: string; description?: unknown; inputSchema?: unknown; annotations?: unknown } =>
             !!t && typeof t === "object" && typeof (t as { name?: unknown }).name === "string",
         )
         .filter((t) => !HUB_NATIVE_TOOL_NAMES.has(t.name))
-        .map(injectVaultSelector);
+        .map((t) => injectVaultSelector(COMPOSED_VERB_RANK[verbForVault(ctx, vault.name)] < topRank ? { ...t, annotations: undefined } : t));
     } catch {
       // Try the next covered vault (highest-verb first). Empty catch continues.
     }

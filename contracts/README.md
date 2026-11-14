@@ -187,10 +187,11 @@ deleted, a note the export format can't carry).
 | `door/links.test.ts` | Wikilinks both ways, typed links and find-path, search that forgets, versions and restore, what an admin can list and forget. |
 | `door/mcp.test.ts` | The cold 401 and both discovery addresses; per level, every tool with its schema and words; a write, a read and the refusals through the official SDK; the root `/mcp`. |
 | `door/connect.test.ts` | Discovery, registration, PKCE, the token and its claims, refresh rotation and replay, read-only and admin approvals, revoke, the published keys; the account door (credential, list, mint, make and remove a vault). |
-| `door/files.test.ts` | Upload, attach, byte-equal download, a ranged read, refused active content, tickets over MCP, `read-attachment` (an image block; a text window). |
+| `door/files.test.ts` | Upload, attach, byte-equal download, a ranged read, refused active content, tickets over MCP, `read-attachment` (an image block; a text window, which also goes out as `structuredContent`). |
 | `door/exit.test.ts` | The export: every note, type and file; the bytes of a fixed made-up note are compared across doors (a box's come from its own command). |
 | `door/records.test.ts`, `door/keys.test.ts` | 0.9 doors: the record door over MCP and REST. 0.9.1 doors: the owner's key (NIP-98), named app keys that stop when revoked. |
 | `door/multivault.test.ts` | 0.9.1, the one multi-vault door: a key covering several vaults, each at its own level, through the account door. It sees only its vaults, writes only where it holds write and must name the vault, its writes are stamped with its name, queries fan out at read, the writer's tool list stays within 4,000 tokens, it opens no vault directly and stops when revoked. The account door's consent per vault (none / read / write), with a level above write or an unknown vault refused. |
+| `door/nudge.test.ts`, `door/annotations.test.ts` | 0.9.1: the five note-named tools add the refresh nudge; a reply whose JSON has a top-level `content` key (ChatGPT reads it as `{}`) also goes out as `structuredContent`, the nudge inside; the read sentence per level. Every tool carries MCP annotations, honest for what the connection can do with it (vault-info changes the vault for an admin only, attachment-url for a writer), at the vault and the account door. |
 
 ### 0.9.2: the dial works (`suites/v092/`)
 
