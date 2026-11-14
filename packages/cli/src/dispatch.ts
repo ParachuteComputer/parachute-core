@@ -240,6 +240,13 @@ export async function dispatch(role: Role, notice?: Notice): Promise<void> {
     const stop = newerCheck();
     if (stop !== null) process.exit(stop);
   }
+  // The 0.7 cutover is not for core: it writes a unit that runs the hub's own serve (no release step, no backup, no
+  // refusal of a rolled-back home), stops whatever holds the hub's port (core, when it is serving) and starts that
+  // unit. Inside core the hub makes no such offer (migrate-offer.ts); asked for by name, it is refused here, first.
+  if ("cli" in r && r.cli === "hub" && r.argv[0] === "migrate" && r.argv.includes("--to-supervised")) {
+    console.error("parachute migrate --to-supervised: not in this program. It was the 0.7 hub's move to a supervised unit, and its unit runs the hub alone. This home is served by `parachute serve`: under core's own unit after a takeover (`systemctl --user status parachute-core`), or the unit `parachute init` writes. Nothing was changed.");
+    process.exit(2);
+  }
   // A home marked rolled back to another release (or cut off mid-restore) is opened by no command of this one, the
   // host's `serve --embedded` and `bootstrap`, `config` and an old name's usage count included (release.ts
   // homeRefusal). Only `upgrade` (it is the way forward, and the way to finish a restore), `takeover` and help go on.

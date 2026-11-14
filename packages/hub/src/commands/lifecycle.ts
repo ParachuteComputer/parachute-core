@@ -362,9 +362,9 @@ async function requireSupervisedOrOffer(r: Resolved): Promise<boolean> {
   // stderr.
   if (!attempt.surfaced) {
     if (coreRoot()) {
-      // Inside core the 0.7 cutover is not the way (its unit runs this hub's own serve): `init` writes core's.
-      r.log("No unit serves this home through this command. Run `parachute init` to install one,");
-      r.log("or stop and start `parachute serve` (or the unit that runs it) yourself.");
+      // Inside core the 0.7 cutover is not the way (its unit runs this hub's own serve).
+      r.log("No unit answers to this command for this home. Stop and start `parachute serve`,");
+      r.log("or the unit that runs it, yourself.");
     } else {
       r.log(
         "No supervised hub unit is installed. Run `parachute migrate --to-supervised` to install it,",

@@ -139,6 +139,12 @@ describe("lifecycle/upgrade through the service unit", () => {
     const flagged = await linked(["start", "--hub-origin", origin]);
     expect(flagged.code).toBe(0);
     expect(m.systemctlCalls().slice(calls).join("\n")).toContain(`start ${UNIT}`);
+    // The 0.7 cutover, asked for by name, would rewrite the leftover to run the hub alone, stop what holds the port
+    // (core) and start it: refused in this program, before anything.
+    const leftover = readFileSync(join(m.unitDir, "parachute-hub.service"), "utf8");
+    const cutover = await linked(["migrate", "--to-supervised"]);
+    expect(cutover.code).toBe(2);
+    expect(readFileSync(join(m.unitDir, "parachute-hub.service"), "utf8")).toBe(leftover);
     expect(m.systemctlCalls().join("\n")).not.toMatch(/(start|restart|enable) parachute-hub/); // the leftover stays paused
     const unit = { ...(await serving(m, { vaultName: vault, origin }, UNIT)), runs: old.runs };
     try {
