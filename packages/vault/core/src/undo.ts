@@ -40,7 +40,7 @@ export interface UndoResult {
 export class UndoRefusal extends Error {
   constructor(
     readonly status: number,
-    readonly error_type: "not_found" | "already_undone" | "undo_conflict" | "nothing_to_undo",
+    readonly error_type: "not_found" | "already_undone" | "undo_conflict" | "nothing_to_undo" | "undo_path_taken",
     message: string,
     readonly extra: Record<string, unknown> = {},
   ) {
@@ -50,6 +50,7 @@ export class UndoRefusal extends Error {
 
 interface ChangeRow {
   seq: number;
+  position: number | null;
   note_id: string;
   op: "create" | "update" | "delete";
   existed: number;
@@ -75,21 +76,29 @@ type LinkSpec = { target: string; relationship: string; metadata: Record<string,
 function rowsOf(db: Database, setId: string): ChangeRow[] {
   return db
     .prepare(
-      "SELECT seq, note_id, op, existed, before_content, before_hash, content_saved, before_row, before_tags, before_links FROM record_changes WHERE write_set = ? ORDER BY seq",
+      "SELECT seq, position, note_id, op, existed, before_content, before_hash, content_saved, before_row, before_tags, before_links FROM record_changes WHERE write_set = ? ORDER BY seq",
     )
     .all(setId) as ChangeRow[];
 }
 
-/** The set that undid this one, if that undo still stands (it hasn't been undone itself). */
-export function standingUndo(db: Database, setId: string): string | null {
-  const undos = db.prepare("SELECT id FROM write_sets WHERE undoes = ? ORDER BY at DESC").all(setId) as { id: string }[];
+/**
+ * The set that undid this one, if that undo still stands: an undo stands unless it is itself undone by an undo that
+ * stands, and so on down the chain (undo, redo, undo again …). Bounded: a chain longer than 64 is read as standing.
+ */
+export function standingUndo(db: Database, setId: string, depth = 0): string | null {
+  if (depth > 64) return null;
+  const undos = db.prepare("SELECT id FROM write_sets WHERE undoes = ? ORDER BY at DESC, id DESC").all(setId) as { id: string }[];
   for (const u of undos) {
-    if (!db.prepare("SELECT 1 FROM write_sets WHERE undoes = ?").get(u.id)) return u.id;
+    if (standingUndo(db, u.id, depth + 1) === null) return u.id;
   }
   return null;
 }
 
-/** Later writes to the set's records: any change logged after the set's own, by another set or by none. */
+/**
+ * Later writes to the set's records: any change by another set (or by none) placed after this set's newest touch of
+ * the record in the log's order (positions move with every touch, so a set opened earlier that writes again later
+ * counts). A row not yet placed (a raw write since the last Store transaction) counts when it came after.
+ */
 export function undoConflicts(db: Database, setId: string): UndoConflict[] {
   const out: UndoConflict[] = [];
   for (const r of rowsOf(db, setId)) {
@@ -97,9 +106,11 @@ export function undoConflicts(db: Database, setId: string): UndoConflict[] {
     const later = db
       .prepare(
         `SELECT rc.write_set, rc.at, ws.actor, ws.via FROM record_changes rc LEFT JOIN write_sets ws ON ws.id = rc.write_set
-         WHERE rc.note_id = ? AND rc.seq > ? AND (rc.write_set IS NULL OR rc.write_set <> ?) ORDER BY rc.seq DESC LIMIT 1`,
+         WHERE rc.note_id = ? AND (rc.write_set IS NULL OR rc.write_set <> ?)
+           AND (rc.position > ? OR (rc.position IS NULL AND rc.seq > ?))
+         ORDER BY COALESCE(rc.position, 9e18) DESC LIMIT 1`,
       )
-      .get(r.note_id, r.seq, setId) as { write_set: string | null; at: string; actor: string | null; via: string | null } | null;
+      .get(r.note_id, setId, r.position ?? r.seq, r.seq) as { write_set: string | null; at: string; actor: string | null; via: string | null } | null;
     if (!later) continue;
     out.push({ id: r.note_id, path: pathNowOrBefore(db, r), write_set: later.write_set, by: later.actor, via: later.via, at: later.at });
   }
@@ -138,17 +149,16 @@ const linkKey = (target: string, relationship: string) => `${target}\u0000${rela
  */
 export async function undoWriteSet(store: Store, setId: string, opts: { force?: boolean; actor?: string | null; via?: string | null } = {}): Promise<UndoResult> {
   const db = store.db;
-  const set: WriteSetRow | null = getWriteSet(db, setId);
-  if (!set) throw new UndoRefusal(404, "not_found", `No write set ${setId} (or it is older than the change log keeps).`);
-  const undoneBy = standingUndo(db, setId);
-  if (undoneBy) {
-    throw new UndoRefusal(409, "already_undone", `Write set ${setId} is already undone, by ${undoneBy}. Undo that set to put these changes back.`, { undone_by: undoneBy });
-  }
-  const rows = rowsOf(db, setId).filter((r) => !(r.op === "delete" && r.existed === 0));
-  if (!rows.length) throw new UndoRefusal(409, "nothing_to_undo", `Write set ${setId} changed no record that is still in the log.`);
-
+  // Everything is read inside the transaction, so no write can land between a check and the undo.
   return transactionAsync(db, async () => {
-    // Read inside the transaction, so no write can land between the check and the undo.
+    const set: WriteSetRow | null = getWriteSet(db, setId);
+    if (!set) throw new UndoRefusal(404, "not_found", `No write set ${setId} (or it is older than the change log keeps).`);
+    const undoneBy = standingUndo(db, setId);
+    if (undoneBy) {
+      throw new UndoRefusal(409, "already_undone", `Write set ${setId} is already undone, by ${undoneBy}. Undo that set to put these changes back.`, { undone_by: undoneBy });
+    }
+    const rows = rowsOf(db, setId).filter((r) => !(r.op === "delete" && r.existed === 0));
+    if (!rows.length) throw new UndoRefusal(409, "nothing_to_undo", `Write set ${setId} changed no record that is still in the log.`);
     const conflicts = undoConflicts(db, setId);
     if (conflicts.length && !opts.force) {
       throw new UndoRefusal(
@@ -161,6 +171,17 @@ export async function undoWriteSet(store: Store, setId: string, opts: { force?: 
     const stamp = { actor: opts.actor ?? null, via: opts.via ?? null };
     const result: UndoResult = { undoes: setId, records: [], forced: opts.force ? conflicts : [], links_skipped: [] };
     const exists = (id: string) => !!db.prepare("SELECT 1 FROM notes WHERE id = ?").get(id);
+    // A path the undo puts back may be held by another record by now: refused with the record, never a bare error.
+    const guardPath = async <T,>(r: ChangeRow, path: string | null | undefined, write: () => Promise<T>): Promise<T> => {
+      try {
+        return await write();
+      } catch (e) {
+        if ((e as { error_type?: string }).error_type === "path_conflict" || (e as { code?: string }).code === "PATH_CONFLICT") {
+          throw new UndoRefusal(409, "undo_path_taken", `Undoing ${setId} would put record ${r.note_id} back at "${path}", which another record holds now. Nothing was changed. Move that record first.`, { id: r.note_id, path: path ?? null });
+        }
+        throw e;
+      }
+    };
 
     // Records first (deleted ones made again before links point at them), then links, then the set's creations go.
     const linkWork: { id: string; links: LinkSpec[] }[] = [];
@@ -168,27 +189,29 @@ export async function undoWriteSet(store: Store, setId: string, opts: { force?: 
       if (r.existed === 0) continue;
       const before = parseBefore(r);
       const tags = parseJson<string[]>(r.before_tags, []);
-      const links = parseJson<LinkSpec[]>(r.before_links, []);
+      // Null after the record's history was erased: what is gone isn't put back (its links are left as they are).
+      const links = r.before_links === null ? null : parseJson<LinkSpec[]>(r.before_links, []);
       if (!exists(r.note_id)) {
         // The set deleted it (or, forced, a later write did). Its body: saved by the set, else the newest tombstone's.
         const content = r.content_saved ? savedBody(db, r) : await tombstoneBody(store, r.note_id);
-        if (content === null) {
+        if (content === null || before === null) {
           result.records.push({ id: r.note_id, op: "unchanged" });
           continue;
         }
-        await store.createNote(content, {
-          id: r.note_id,
-          ...(before?.path ? { path: before.path } : {}),
-          ...(before?.extension ? { extension: before.extension } : {}),
-          metadata: parseJson<Record<string, unknown>>(before?.metadata ?? null, {}),
-          ...(before?.created_at ? { created_at: before.created_at } : {}),
-          tags,
-          ...stamp,
-          deferWikilinkSync: true,
-        });
+        await guardPath(r, before.path, () =>
+          store.createNote(content, {
+            id: r.note_id,
+            ...(before.path ? { path: before.path } : {}),
+            ...(before.extension ? { extension: before.extension } : {}),
+            metadata: parseJson<Record<string, unknown>>(before.metadata, {}),
+            ...(before.created_at ? { created_at: before.created_at } : {}),
+            tags,
+            ...stamp,
+          }),
+        );
         // The creation stamp is the original writer's, not the undoer's.
         store.transaction(() =>
-          db.prepare("UPDATE notes SET created_by = ?, created_via = ? WHERE id = ?").run(before?.created_by ?? null, before?.created_via ?? null, r.note_id),
+          db.prepare("UPDATE notes SET created_by = ?, created_via = ? WHERE id = ?").run(before.created_by ?? null, before.created_via ?? null, r.note_id),
         );
         result.records.push({ id: r.note_id, op: "recreated" });
       } else {
@@ -199,18 +222,21 @@ export async function undoWriteSet(store: Store, setId: string, opts: { force?: 
         }
         if (before) {
           updates.metadata = parseJson<Record<string, unknown>>(before.metadata, {});
-          if (before.path !== null) updates.path = before.path;
+          // A path the set gave a record that had none is taken away again (null clears it).
+          updates.path = before.path;
           if (before.extension) updates.extension = before.extension;
         }
-        await store.updateNote(r.note_id, updates as Parameters<Store["updateNote"]>[1]);
-        const now = (db.prepare("SELECT tag_name FROM note_tags WHERE note_id = ?").all(r.note_id) as { tag_name: string }[]).map((t) => t.tag_name);
-        const extra = now.filter((t) => !tags.includes(t));
-        const missing = tags.filter((t) => !now.includes(t));
-        if (extra.length) await store.untagNote(r.note_id, extra);
-        if (missing.length) await store.tagNote(r.note_id, missing);
+        await guardPath(r, before?.path, () => store.updateNote(r.note_id, updates as Parameters<Store["updateNote"]>[1]));
+        if (r.before_tags !== null) {
+          const now = (db.prepare("SELECT tag_name FROM note_tags WHERE note_id = ?").all(r.note_id) as { tag_name: string }[]).map((t) => t.tag_name);
+          const extra = now.filter((t) => !tags.includes(t));
+          const missing = tags.filter((t) => !now.includes(t));
+          if (extra.length) await store.untagNote(r.note_id, extra);
+          if (missing.length) await store.tagNote(r.note_id, missing);
+        }
         result.records.push({ id: r.note_id, op: "reverted" });
       }
-      linkWork.push({ id: r.note_id, links });
+      if (links !== null) linkWork.push({ id: r.note_id, links });
     }
     for (const { id, links } of linkWork) {
       const now = db.prepare("SELECT target_id, relationship, metadata FROM links WHERE source_id = ?").all(id) as { target_id: string; relationship: string; metadata: string | null }[];

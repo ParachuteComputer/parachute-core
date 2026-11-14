@@ -11,7 +11,7 @@
  */
 import type { Database } from "bun:sqlite";
 import { getWriteSet, listWriteSets, newWriteSetId, setRecordStates, normaliseWhy, writeSetRecords, type WriteSetRow } from "../core/src/change-log.ts";
-import { undoWriteSet, UndoRefusal, type UndoConflict } from "../core/src/undo.ts";
+import { standingUndo, undoWriteSet, UndoRefusal, type UndoConflict } from "../core/src/undo.ts";
 import type { Store } from "../core/src/types.ts";
 import { WHY_HEADER, withWriteSet } from "./write-set-edge.ts";
 import type { Note } from "../core/src/types.ts";
@@ -47,10 +47,8 @@ export function setOwnedOrAdmin(set: WriteSetRow, auth: WriteSetsAuth): boolean 
 }
 
 function project(db: Database, set: WriteSetRow & { records?: number; undone_by?: string | null }) {
-  const undoneBy =
-    set.undone_by !== undefined
-      ? set.undone_by
-      : ((db.prepare("SELECT id FROM write_sets WHERE undoes = ? ORDER BY at DESC LIMIT 1").get(set.id) as { id: string } | null)?.id ?? null);
+  // The undo that stands (undo, redo, undo again … : the same rule undo itself uses), not merely the newest.
+  const undoneBy = standingUndo(db, set.id);
   return {
     id: set.id,
     at: set.at,
@@ -156,6 +154,16 @@ export async function handleUndo(
     const result = await withWriteSet(store, { id: undoId, actor: auth.actor, via: auth.via, why, undoes: id }, () =>
       undoWriteSet(store, id, { force: body.force === true, actor: auth.actor, via: auth.via }),
     );
+    if (tagScope.raw !== null) {
+      // A scoped caller learns nothing beyond its scope: no other key's provenance on a forced write, and no id of a
+      // missing link target (it may have been a record outside the scope), only how many links were skipped.
+      return json({
+        write_set: undoId,
+        ...result,
+        forced: result.forced.map((c) => ({ id: c.id, path: c.path, at: c.at })),
+        links_skipped: result.links_skipped.length,
+      });
+    }
     return json({ write_set: undoId, ...result });
   } catch (e) {
     if (e instanceof UndoRefusal) {

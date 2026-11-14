@@ -144,6 +144,69 @@ describe("v094/undo: a later write makes it refuse, all or nothing", () => {
   });
 });
 
+describe("v094/undo: review round 1 cases", () => {
+  test("a later write from a set opened earlier still counts: 409 listing it", async () => {
+    const id = (await writer.api("POST", "/notes", { path: `early/${shortId()}`, content: "one" })).body.id;
+    const theirs = `early-${shortId()}${shortId()}`;
+    await other.api("PATCH", `/notes/${id}`, { content: "two", force: true }, { "Parachute-Write-Set": theirs });
+    await writer.api("PATCH", `/notes/${id}`, { content: "three", force: true });
+    const mine = await newestSet(writer);
+    await other.api("PATCH", `/notes/${id}`, { content: "four", force: true }, { "Parachute-Write-Set": theirs });
+    const r = await undo(writer, mine);
+    expect(r.status).toBe(409);
+    expect(r.body.conflicts.map((c: any) => c.write_set)).toEqual([theirs]);
+    expect((await snapshot(writer, id))?.content).toBe("four");
+  });
+
+  test("after the record's history is erased, undo leaves its links as they are", async () => {
+    const t = `er${shortId()}`;
+    const target = (await writer.api("POST", "/notes", { path: `${t}/target`, content: "t" })).body.id;
+    const id = (await writer.api("POST", "/notes", { path: `${t}/r`, content: `see [[${t}/target]]`, links: [{ target, relationship: "cites" }] })).body.id;
+    await writer.api("PATCH", `/notes/${id}`, { metadata: { k: 1 }, force: true });
+    const set = await newestSet(writer);
+    const linksBefore = (await snapshot(writer, id))!.links;
+    expect((await admin.api("DELETE", `/notes/${id}/versions`)).status).toBe(200);
+    const r = await undo(writer, set);
+    expect(r.status).toBe(200);
+    expect((await snapshot(writer, id))!.links).toEqual(linksBefore);
+  });
+
+  test("a path the set gave a record that had none is taken away again", async () => {
+    const id = (await writer.api("POST", "/notes", { content: `pathless ${shortId()}` })).body.id;
+    expect((await snapshot(writer, id))!.path ?? null).toBeNull();
+    await writer.api("PATCH", `/notes/${id}`, { path: `given/${shortId()}`, force: true });
+    const set = await newestSet(writer);
+    expect((await undo(writer, set)).status).toBe(200);
+    expect((await snapshot(writer, id))!.path ?? null).toBeNull();
+  });
+
+  test("a path another record holds now: 409 undo_path_taken naming it, nothing changed, even with force", async () => {
+    const a = `pa/${shortId()}`;
+    const id = (await writer.api("POST", "/notes", { path: a, content: "moving" })).body.id;
+    await writer.api("PATCH", `/notes/${id}`, { path: `${a}-moved`, force: true });
+    const set = await newestSet(writer);
+    await other.api("POST", "/notes", { path: a, content: "squatter" });
+    const r = await undo(writer, set, { force: true });
+    expect(r.status).toBe(409);
+    expect(r.body).toMatchObject({ error_type: "undo_path_taken", id, path: a });
+    expect((await snapshot(writer, id))!.path).toBe(`${a}-moved`);
+  });
+
+  test("undo, redo, undo again: the set reads as undone, by the undo that stands", async () => {
+    const id = (await writer.api("POST", "/notes", { path: `chain/${shortId()}`, content: "a" })).body.id;
+    await writer.api("PATCH", `/notes/${id}`, { content: "b", force: true });
+    const s = await newestSet(writer);
+    const u1 = (await undo(writer, s)).body.write_set;
+    const u2 = (await undo(writer, u1)).body.write_set;
+    const u3 = await undo(writer, u2);
+    expect(u3.status).toBe(200);
+    expect((await snapshot(writer, id))?.content).toBe("a");
+    const again = await undo(writer, s);
+    expect(again.status).toBe(409);
+    expect(again.body).toMatchObject({ error_type: "already_undone", undone_by: u1 });
+  });
+});
+
 describe("v094/undo: who may undo", () => {
   test("a key can't undo another key's set (404, as reading it); admin can", async () => {
     const id = (await other.api("POST", "/notes", { path: `who/${shortId()}`, content: "theirs" })).body.id;
