@@ -12,11 +12,11 @@
 // faked. The machine is the same as takeover.test.ts's (the stock 0.7 programs from `bun add -g`, a stock home,
 // a network of its own), with no systemd units.
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { freePort, until } from "../candidate-lib.ts";
 import { rest, safeFetch } from "../lib.ts";
-import { agentPlist, core, json, makeStockHome, must, newMachine, readNotes, requireCore, withLaunchd, type Launchd, type Machine, type StockHome } from "./_takeover-lib.ts";
+import { agentPlist, core, dbHolders, json, makeStockHome, must, newMachine, readNotes, requireCore, withLaunchd, type Launchd, type Machine, type StockHome } from "./_takeover-lib.ts";
 
 const HUB = "computer.parachute.hub";
 // A tunnel named so that a rule reading "hub" or "vault" in a label would take it for the old programs.
@@ -49,8 +49,9 @@ async function waitServing(s: StockHome, what: string, log: () => string): Promi
 const readLog = (p: string) => () => (existsSync(p) ? readFileSync(p, "utf8").replace(/pvk_[A-Za-z0-9_-]+/g, "pvk_<redacted>") : "");
 
 /**
- * A Mac as Prism's hosts have it: the old hub as Parachute's own agent (the 0.7 hub's plist: bun, the hub's cli.ts,
- * serve, with the home's settings), loaded and serving the stock home; a tunnel agent loaded beside it.
+ * A Mac as Prism's hosts have it: the old hub as Parachute's own agent, loaded and serving the stock home, its plist
+ * as the 0.7 hub writes it (buildHubManagedUnit: bun, the hub's cli.ts, serve; bind host, home, port, PATH and
+ * BUN_INSTALL, plus the origins a non-default port needs); a tunnel agent loaded beside it.
  */
 async function macBox(label: string): Promise<Box> {
   const m = await newMachine(label, { units: {} });
@@ -68,6 +69,8 @@ async function macBox(label: string): Promise<Box> {
         PARACHUTE_BIND_HOST: "127.0.0.1",
         PARACHUTE_HOME: m.home,
         PORT: String(s.port),
+        // Not in a real 0.7 plist, where the port is 1939: here it is a free one, and the old hub only verifies its own
+        // passes on it when told its origin and where its keys are (as makeStockHome and the systemd units tell it).
         PARACHUTE_HUB_ORIGIN: s.origin,
         PARACHUTE_HUB_JWKS_ORIGIN: s.origin,
         PATH: `${m.bunDir}/bin:/usr/local/bin:/usr/bin:/bin`,
@@ -85,8 +88,8 @@ async function macBox(label: string): Promise<Box> {
   return { m, s, l, hubFile, tunnelFile };
 }
 
-/** launchctl calls since `from` that name `label`. */
-const callsFor = (l: Launchd, label: string, from: number) => l.calls().slice(from).filter((c) => c.includes(label));
+/** launchctl calls since `from` that name `label` and change something (anything but a read-only `print`). */
+const callsFor = (l: Launchd, label: string, from: number) => l.calls().slice(from).filter((c) => c.includes(label) && !c.startsWith("print "));
 
 describe("takeover with launchd agents (macOS)", () => {
   test("the dry run names the old hub's agent as the one it pauses, leaves the tunnel alone, and changes nothing; serve refuses, naming that agent only", async () => {
@@ -116,8 +119,8 @@ describe("takeover with launchd agents (macOS)", () => {
     expect(text.stdout).toContain(`launchd agent ${HUB}: running (pid ${hubPid}), loads at login (has this home's data open: it will be paused, its plist moved aside)`);
     expect(text.stdout).toContain(`launchd agent ${TUNNEL}: running (pid ${tunnelPid}), loads at login (doesn't have this home's data open: left alone)`);
 
-    // Nothing changed: no launchctl call but `list`, both agents as they were, the plists byte for byte, no core agent.
-    expect(l.calls().slice(calls).filter((c) => c !== "list")).toEqual([]);
+    // Nothing changed: no launchctl call but `print`, both agents as they were, the plists byte for byte, no core agent.
+    expect(l.calls().slice(calls).filter((c) => !c.startsWith("print "))).toEqual([]);
     expect(l.agent(HUB)).toEqual({ loaded: true, pid: hubPid });
     expect(l.agent(TUNNEL)).toEqual({ loaded: true, pid: tunnelPid });
     expect(readFileSync(hubFile, "utf8")).toBe(hubText);
@@ -139,7 +142,9 @@ describe("takeover with launchd agents (macOS)", () => {
     const hubText = readFileSync(hubFile, "utf8");
     const tunnelText = readFileSync(tunnelFile, "utf8");
     const tunnelPid = l.agent(TUNNEL).pid;
-    const notesBefore = (await readNotes(s.origin, s.vaultName, s.readPass)).notes;
+    const before = await readNotes(s.origin, s.vaultName, s.readPass);
+    must(before.status === 200 && before.notes.length >= s.notes.length, `setup: the old hub's agent listed ${before.status} / ${before.notes.length} notes`);
+    const notesBefore = before.notes;
     const calls = l.calls().length;
 
     const t = await core(m, ["takeover", "--home", m.home, "--yes", "--json"]);
@@ -192,10 +197,48 @@ describe("takeover with launchd agents (macOS)", () => {
     expect(back.status).toBe(200);
     expect(back.body.content).toBe("Sowed broad beans along the fence in November.");
 
-    // The tunnel ran throughout, untouched: same process, same plist, never named in a launchctl call.
+    // The tunnel ran throughout, untouched: same process, same plist, never named in a launchctl call that changes anything.
     expect(l.agent(TUNNEL)).toEqual({ loaded: true, pid: tunnelPid });
     expect(readFileSync(tunnelFile, "utf8")).toBe(tunnelText);
     expect(callsFor(l, TUNNEL, calls)).toEqual([]);
+  }, 240_000);
+
+  test("a takeover cut off during its check run (an ssh drop) is put back by --rollback: the hub's plist back in place and loaded, serving again", async () => {
+    const { m, s, l, hubFile } = await macBox("tkl-cut");
+    const hubText = readFileSync(hubFile, "utf8");
+    const run = m.spawn([requireCore(m.info), "takeover", "--home", m.home, "--yes", "--json"]);
+    const checking = await until(() => dbHolders(m.home).some((h) => h.cmd.includes("--listen")), 90_000, 50);
+    must(checking, `setup: the takeover's check run never opened the data:\n${run.log().slice(-1500)}`);
+    // The session drops: the takeover and its check run die together, mid-check, with the hub's plist moved aside.
+    const cut = [
+      ...readdirSync("/proc").filter((p) => /^\d+$/.test(p)).filter((p) => {
+        try {
+          const cmd = readFileSync(`/proc/${p}/cmdline`, "utf8");
+          return cmd.includes("takeover") && cmd.includes(m.home);
+        } catch {
+          return false;
+        }
+      }).map(Number),
+      ...dbHolders(m.home).filter((h) => h.cmd.includes("--listen")).map((h) => h.pid),
+    ];
+    for (const pid of cut) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {}
+    }
+    await run.stop("SIGKILL");
+    must(await until(() => dbHolders(m.home).length === 0, 15_000, 100), "setup: the cut-off check run still holds the data");
+    expect(existsSync(hubFile)).toBe(false); // what the cut left: the old agent unloaded, its plist aside
+    expect(l.agent(HUB).loaded).toBe(false);
+
+    const r = await core(m, ["takeover", "--rollback", "--yes", "--json"]);
+    must(r.code === 0, `takeover --rollback --yes after the cut exited ${r.code}: ${r.stderr.slice(-1500)}`);
+    expect(json(r, "takeover --rollback --json").rollback).toBe("interrupted");
+    expect(readFileSync(hubFile, "utf8")).toBe(hubText);
+    expect(l.agent(HUB).loaded).toBe(true);
+    expect(existsSync(join(l.agentsDir, `${CORE}.plist`))).toBe(false);
+    await waitServing(s, `${HUB} after putting the cut-off takeover back`, readLog(join(m.home, "hub", "logs", "hub.log")));
+    expect(existsSync(join(m.home, "takeover.json"))).toBe(false);
   }, 240_000);
 
   test("an old agent that isn't running and whose plist doesn't say which home it serves (the 0.7 vault's wrapper) is refused before anything changes", async () => {
@@ -210,7 +253,7 @@ describe("takeover with launchd agents (macOS)", () => {
     expect(r.code).toBe(1);
     expect(r.stderr).toContain("computer.parachute.vault looks like the old hub or vault, isn't running, and its plist doesn't say which home it serves");
     expect(r.stderr).toContain("Nothing was changed.");
-    expect(l.calls().slice(calls).filter((c) => c !== "list")).toEqual([]);
+    expect(l.calls().slice(calls).filter((c) => !c.startsWith("print "))).toEqual([]);
     expect(l.agent(HUB)).toEqual({ loaded: true, pid: hubPid });
     expect(existsSync(hubFile)).toBe(true);
     expect(existsSync(vaultFile)).toBe(true);

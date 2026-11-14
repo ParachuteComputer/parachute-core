@@ -72,7 +72,7 @@ import {
   agentEnv,
   agentHome,
   agentLooksOld,
-  parseLaunchctlList,
+  parseLaunchctlPrint,
   plistComment,
   readAgentPlist,
   renderPlist,
@@ -604,11 +604,34 @@ function launchctl(...args: string[]): { code: number; stdout: string; stderr: s
   return bin ? run([bin, ...args]) : { code: 127, stdout: "", stderr: "launchctl: not found" };
 }
 
-/** Every loaded launchd job with its pid (0: none), from `launchctl list`; null when launchctl can't say. */
-function launchdJobs(): Map<string, number> | null {
+/**
+ * One agent in the person's login domain (gui/<uid>, where ~/Library/LaunchAgents loads): its pid (0: loaded, no
+ * process), false when it isn't loaded, null when launchctl can't say. Asked by label (`launchctl print`), never with
+ * `launchctl list`, which lists the caller's own domain: over ssh that isn't gui/<uid>.
+ */
+function agentJob(label: string): number | false | null {
+  const r = launchctl("print", `${guiDomain()}/${label}`);
+  if (r.code === 0) return parseLaunchctlPrint(r.stdout);
+  if (r.code === 113 || /could not find service/i.test(r.stderr + r.stdout)) return false;
+  return null;
+}
+
+/**
+ * The loaded agents among `labels` (by default every Parachute agent in ~/Library/LaunchAgents, and core's), each with
+ * its pid (0: none); null when launchctl can't say for one of them.
+ */
+function launchdJobs(labels: string[] = [...agentFiles().map((a) => a.label), CORE_AGENT]): Map<string, number> | null {
   if (!launchdHere()) return null;
-  const r = launchctl("list");
-  return r.code === 0 ? parseLaunchctlList(r.stdout) : null;
+  // The domain first: with no login session (ssh, nobody logged in at the Mac) there is no gui/<uid>, and every
+  // agent would read as not loaded.
+  if (launchctl("print", guiDomain()).code !== 0) return null;
+  const jobs = new Map<string, number>();
+  for (const label of new Set(labels)) {
+    const pid = agentJob(label);
+    if (pid === null) return null;
+    if (pid !== false) jobs.set(label, pid);
+  }
+  return jobs;
 }
 
 interface AgentFile {
@@ -650,7 +673,7 @@ function agentFiles(): AgentFile[] {
 function launchdUnits(home: string, held: Holder[]): Unit[] {
   const files = agentFiles();
   if (!files.length) return [];
-  const jobs = launchdJobs();
+  const jobs = launchdJobs(files.map((a) => a.label));
   return files.map((a) => {
     const loaded = jobs?.has(a.label) ?? false;
     const pid = jobs?.get(a.label) ?? 0;
@@ -677,8 +700,7 @@ function launchdUnits(home: string, held: Holder[]): Unit[] {
 /** The pid of every loaded Parachute agent (core's own included) that has a process: holders are attributed to them. */
 function agentRoots(): [string, number][] {
   if (!launchdHere()) return [];
-  const labels = new Set([...agentFiles().map((a) => a.label), CORE_AGENT]);
-  return [...(launchdJobs() ?? new Map<string, number>())].filter(([label, pid]) => labels.has(label) && pid > 0);
+  return [...(launchdJobs() ?? new Map<string, number>())].filter(([, pid]) => pid > 0);
 }
 
 /** The home named on the mark comment of core's agent plist, if it has one (as writeCoreAgent wrote it). */
@@ -700,7 +722,11 @@ function moveFile(from: string, to: string): void {
     renameSync(from, to);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "EXDEV") throw err;
-    copyFileSync(from, to);
+    // Across volumes: a whole copy under a scratch name, renamed into place, then the original goes. A cut leaves
+    // either nothing at `to` or the same bytes in both places (resumeAgent finishes that).
+    const tmp = `${to}.${process.pid}.tmp`;
+    copyFileSync(from, tmp);
+    renameSync(tmp, to);
     unlinkSync(from);
   }
 }
@@ -841,7 +867,7 @@ function unsafeToStop(unit: string, home: string, allowed: Set<string>, manager:
 
 /** Every process of a launchd agent: its pid and that pid's descendants. */
 function agentProcesses(label: string): number[] {
-  const root = launchdJobs()?.get(label) ?? 0;
+  const root = launchdJobs([label])?.get(label) ?? 0;
   if (root <= 0) return [];
   const parent = parents();
   const out: number[] = [];
@@ -1889,9 +1915,9 @@ const mainPid = (unit: string) => Number(/MainPID=(\d+)/.exec(run(["systemctl", 
 async function coreUnitUp(port: number, d: Detected, log: (s: string) => void, manager: Unit["manager"] = "systemd"): Promise<string | null> {
   const CORE = manager === "launchd" ? CORE_AGENT : CORE_UNIT;
   // launchd: loaded with a process is up; unloaded is failed (KeepAlive restarts a crash: the pid check below sees it).
-  const agentPid = () => launchdJobs()?.get(CORE_AGENT) ?? 0;
+  const agentPid = () => launchdJobs([CORE_AGENT])?.get(CORE_AGENT) ?? 0;
   const active = manager === "launchd" ? () => agentPid() > 0 : () => run(["systemctl", "--user", "is-active", CORE_UNIT]).stdout.trim() === "active";
-  const failed = manager === "launchd" ? () => !launchdJobs()?.has(CORE_AGENT) : () => run(["systemctl", "--user", "is-active", CORE_UNIT]).stdout.trim() === "failed";
+  const failed = manager === "launchd" ? () => launchdJobs([CORE_AGENT])?.has(CORE_AGENT) === false : () => run(["systemctl", "--user", "is-active", CORE_UNIT]).stdout.trim() === "failed";
   const corePid = manager === "launchd" ? agentPid : () => mainPid(CORE_UNIT);
   if (!(await waitUntil(() => failed() || (active() && corePid() > 0), 30_000, 500)) || failed()) return `${CORE} did not start a process that stays up`;
   const pid = corePid();
@@ -1929,11 +1955,13 @@ async function coreUnitUp(port: number, d: Detected, log: (s: string) => void, m
  * Returns what is still wrong, or null when it is stopped.
  */
 async function stopCoreAgent(home: string, aside: string): Promise<string | null> {
-  if (launchdJobs()?.has(CORE_AGENT)) {
+  const coreJob = () => launchdJobs([CORE_AGENT])?.has(CORE_AGENT);
+  if (coreJob() === undefined) return `launchctl didn't say whether ${CORE_AGENT} is loaded (\`launchctl print ${guiDomain()}/${CORE_AGENT}\` failed)`;
+  if (coreJob()) {
     const r = launchctl("bootout", `${guiDomain()}/${CORE_AGENT}`);
-    if (r.code !== 0 && launchdJobs()?.has(CORE_AGENT) !== false) return `stopping ${CORE_AGENT} failed: ${(r.stderr || r.stdout).trim()}`;
+    if (r.code !== 0 && coreJob() !== false) return `stopping ${CORE_AGENT} failed: ${(r.stderr || r.stdout).trim()}`;
   }
-  if (!(await waitUntil(() => launchdJobs()?.has(CORE_AGENT) === false && holders(home).length === 0, 20_000, 250))) {
+  if (!(await waitUntil(() => coreJob() === false && holders(home).length === 0, 20_000, 250))) {
     const still = holders(home);
     return `${CORE_AGENT} is not confirmed stopped${still.length ? ` (still holding the data: ${still.map((h) => `pid ${h.pid}`).join(", ")})` : ""}`;
   }
@@ -1988,24 +2016,28 @@ function resumeUnits(paused: Record_["paused"]): string[] {
 
 /** A paused agent as it was: its plist back in ~/Library/LaunchAgents (unless one is there again), loaded if it was. */
 function resumeAgent(u: Extract<Paused, { manager: "launchd" }>): void {
+  // A move cut off between its copy and its unlink (across volumes) leaves the same bytes in both places.
+  if (existsSync(u.aside) && existsSync(u.file) && sha256(u.aside) === sha256(u.file)) unlinkSync(u.aside);
   if (existsSync(u.aside)) {
     if (existsSync(u.file)) throw new Error(`${u.file} is there again, so ${u.aside} wasn't moved back over it; compare them and move the right one into place`);
     moveFile(u.aside, u.file);
   }
   if (!existsSync(u.file)) throw new Error(`${u.name}'s plist is neither in ${u.file} nor in ${u.aside}`);
   if (!u.loaded) return;
-  const jobs = launchdJobs();
+  const jobs = launchdJobs([u.name]);
   if (jobs === null) throw new Error(`launchctl didn't say whether ${u.name} is loaded; load it with \`launchctl bootstrap ${guiDomain()} ${u.file}\``);
   if (jobs.has(u.name)) return;
   const r = launchctl("bootstrap", guiDomain(), u.file);
-  if (r.code !== 0 && !launchdJobs()?.has(u.name)) throw new Error(`launchctl bootstrap ${guiDomain()} ${u.file} exited ${r.code}: ${(r.stderr || r.stdout).trim()}`);
+  if (r.code !== 0 && !launchdJobs([u.name])?.has(u.name)) throw new Error(`launchctl bootstrap ${guiDomain()} ${u.file} exited ${r.code}: ${(r.stderr || r.stdout).trim()}`);
 }
 
 /** Pause an agent: unload it if it is loaded, then move its plist aside (`u.aside`). */
 function pauseAgent(u: Extract<Paused, { manager: "launchd" }>): void {
-  if (launchdJobs()?.has(u.name)) {
+  const job = () => launchdJobs([u.name])?.has(u.name);
+  if (job() === undefined) throw new Error(`launchctl didn't say whether ${u.name} is loaded (\`launchctl print ${guiDomain()}/${u.name}\` failed)`);
+  if (job()) {
     const r = launchctl("bootout", `${guiDomain()}/${u.name}`);
-    if (r.code !== 0 && launchdJobs()?.has(u.name) !== false) throw new Error(`launchctl bootout ${guiDomain()}/${u.name} exited ${r.code}: ${(r.stderr || r.stdout).trim()}`);
+    if (r.code !== 0 && job() !== false) throw new Error(`launchctl bootout ${guiDomain()}/${u.name} exited ${r.code}: ${(r.stderr || r.stdout).trim()}`);
   }
   moveFile(u.file, u.aside);
 }
@@ -2181,7 +2213,7 @@ async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ ba
     // Core's agent is written only where none is loaded, and over a plist only one a takeover of this home wrote.
     const jobs = launchdJobs();
     if (jobs === null && (existsSync(coreAgentFile()) || d.units.some((u) => u.manager === "launchd" && u.old))) {
-      throw new Exit(EXIT.failed, "launchctl didn't say which agents are loaded (`launchctl list` failed); takeover won't pause or start agents it can't see. Nothing was changed.");
+      throw new Exit(EXIT.failed, "launchctl didn't say which agents are loaded (`launchctl print` failed); takeover won't pause or start agents it can't see. Nothing was changed.");
     }
     if (jobs?.has(CORE_AGENT)) throw new Exit(EXIT.failed, `the launchd agent ${CORE_AGENT} is already loaded; this takeover won't replace it. Nothing was changed.`);
     if (existsSync(coreAgentFile()) && coreAgentMark() !== d.home) {
@@ -2437,8 +2469,8 @@ async function rollBack(home: string, say: (s: string) => void): Promise<Record<
     // Still this home's? Running: one of its processes has this home's data open and none another home's. Not
     // running: its plist still carries the mark this takeover wrote. Anything launchctl won't say: not touched.
     const label = record.core_unit;
-    const jobs = launchdJobs();
-    if (jobs === null) throw new Exit(EXIT.failed, `launchctl didn't say whether ${label} runs (\`launchctl list\` failed); rollback won't touch it.`);
+    const jobs = launchdJobs([label]);
+    if (jobs === null) throw new Exit(EXIT.failed, `launchctl didn't say whether ${label} runs (\`launchctl print\` failed); rollback won't touch it.`);
     const pid = jobs.get(label) ?? 0;
     let why: string | null = null;
     if (pid === 0) why = existsSync(coreAgentFile()) && coreAgentMark() !== home ? "no longer carries this takeover's mark for this home" : null;
@@ -2523,6 +2555,10 @@ export async function takeover(args: string[]): Promise<number> {
     // The real folder, once, for everything from here: a restore through a link to the home would replace the link,
     // and the old units, which name the real folder, would reopen the data the restore was meant to replace.
     const home = realHome(resolve(f.home ?? homeDir()));
+    // Agents load into their user's login domain (gui/<uid>); as root (sudo) every launchctl call would ask gui/0.
+    if (process.platform === "darwin" && process.getuid?.() === 0 && agentFiles().length) {
+      throw new Exit(EXIT.failed, "run takeover as the user whose launchd agents these are, not as root (sudo): agents load into that user's login domain. Nothing was changed.");
+    }
     const out = (s: string) => (f.json ? console.error(s) : console.log(s));
     if (f.rollback) {
       if (!holdTakeoverLock(home)) throw new Exit(EXIT.held, `another takeover or rollback of ${tilde(home)} is running now; nothing was changed`);

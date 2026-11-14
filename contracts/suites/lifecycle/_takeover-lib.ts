@@ -680,7 +680,10 @@ export function holders(file: string | ((link: string) => boolean)): { pid: numb
  *   plist's EnvironmentVariables), in a session of its own, output to StandardOutPath; STATE/<label>.pid.
  * - `bootout gui/<uid>/<label>` stops the agent's processes, all of them (its group and every descendant), then
  *   unloads it (exit 3 when it isn't loaded).
- * - `list` prints launchctl's table: `PID<tab>Status<tab>Label`, the pid "-" once its process is gone.
+ * - `print gui/<uid>` describes the login domain (always there here: a person is logged in).
+ * - `print gui/<uid>/<label>` describes a loaded agent (`state = running`, `pid = N` while its process lives), and
+ *   exits 113 ("Could not find service") for one that isn't loaded. There is no `list`: it answers for the
+ *   caller's own domain, which over ssh isn't gui/<uid>, so a takeover must not rely on it.
  * Anything else exits 1, so a takeover that used another verb would fail here. KeepAlive isn't emulated.
  * The plist is read the way launchd reads one (Label, ProgramArguments, EnvironmentVariables, StandardOutPath), by
  * a reader of its own here: core's plist reader is the code under test.
@@ -701,10 +704,15 @@ const dec = (s) => s.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;
 const children = (pid) => { const r = Bun.spawnSync(["ps", "-o", "pid=", "--ppid", String(pid)]); return r.stdout.toString().split(/\\s+/).filter(Boolean).map(Number); };
 const tree = (pid) => [pid, ...children(pid).flatMap(tree)];
 const [verb, ...rest] = args;
-if (verb === "list" && rest.length === 0) {
-  let out = "PID\\tStatus\\tLabel\\n";
-  for (const f of readdirSync(STATE).filter((n) => n.endsWith(".loaded"))) { const label = f.slice(0, -".loaded".length); const pid = pidOf(label); out += (pid ? pid : "-") + "\\t0\\t" + label + "\\n"; }
-  process.stdout.write(out);
+if (verb === "print" && rest.length === 1 && /^gui\\/\\d+$/.test(rest[0])) {
+  process.stdout.write(rest[0] + " = {\\n\\ttype = gui\\n}\\n");
+  process.exit(0);
+}
+if (verb === "print" && rest.length === 1 && /^gui\\/\\d+\\/.+/.test(rest[0])) {
+  const label = rest[0].split("/").slice(2).join("/");
+  if (!loaded(label)) { console.error('Could not find service "' + label + '" in domain for user gui: ' + rest[0].split("/")[1]); process.exit(113); }
+  const pid = pidOf(label);
+  process.stdout.write(rest[0] + " = {\\n\\tactive count = " + (pid ? 1 : 0) + "\\n\\tpath = " + readFileSync(join(STATE, label + ".loaded"), "utf8") + "\\n\\tstate = " + (pid ? "running" : "not running") + "\\n" + (pid ? "\\tpid = " + pid + "\\n" : "") + "}\\n");
   process.exit(0);
 }
 if (verb === "bootstrap" && rest.length === 2 && /^gui\\/\\d+$/.test(rest[0])) {

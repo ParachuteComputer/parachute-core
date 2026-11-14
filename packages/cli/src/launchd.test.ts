@@ -13,7 +13,7 @@ import {
   agentHome,
   agentLooksOld,
   agentProgram,
-  parseLaunchctlList,
+  parseLaunchctlPrint,
   parsePlist,
   plistComment,
   readAgentPlist,
@@ -140,6 +140,16 @@ describe("which agents are the old hub or vault", () => {
     expect(agentHome(d, USER)).toBe("unknown");
   });
 
+  test("the old hub's agent running a hub from a folder named parachute-core (a checkout of this repo) isn't taken for core", () => {
+    const d = dict(renderPlist({ Label: "computer.parachute.hub", ProgramArguments: [`${USER}/.bun/bin/bun`, `${USER}/Code/parachute-core/packages/hub/src/cli.ts`, "serve"] }));
+    expect(agentLooksOld("computer.parachute.hub", d)).toBe(true);
+    const core = dict(renderPlist({ Label: "x", ProgramArguments: [`${USER}/.bun/bin/bun`, `${USER}/Code/parachute-core/packages/cli/src/parachute-core.ts`, "serve"] }));
+    expect(agentLooksOld("computer.parachute.hub", core)).toBe(false);
+    for (const args of [["/bin/sh", "-c", "exec ~/.bun/bin/parachute-core serve"], ["bunx", "parachute-core@0.8", "serve"], ["node", "/opt/core/dist/parachute-core.mjs", "serve"]]) {
+      expect(agentLooksOld("computer.parachute.hub", dict(renderPlist({ Label: "computer.parachute.hub", ProgramArguments: args })))).toBe(false);
+    }
+  });
+
   test("an unreadable plist under the old hub's label still looks old (so takeover refuses rather than guess its home)", () => {
     expect(agentLooksOld("computer.parachute.hub", null)).toBe(true);
     expect(agentHome(null, USER)).toBe("unknown");
@@ -147,13 +157,17 @@ describe("which agents are the old hub or vault", () => {
   });
 });
 
-describe("parseLaunchctlList", () => {
-  test("every loaded label with its pid, 0 for none", () => {
-    const out = "PID\tStatus\tLabel\n412\t0\tcomputer.parachute.hub\n-\t0\tcomputer.parachute.cloudflared.vault\n-\t-9\tcom.apple.x\n";
-    expect(parseLaunchctlList(out)).toEqual(new Map([["computer.parachute.hub", 412], ["computer.parachute.cloudflared.vault", 0], ["com.apple.x", 0]]));
+describe("parseLaunchctlPrint", () => {
+  test("a loaded job's pid, from its top-level pid line; 0 when it has no process", () => {
+    const running = "gui/501/computer.parachute.hub = {\n\tactive count = 1\n\tpath = /Users/op/Library/LaunchAgents/computer.parachute.hub.plist\n\tstate = running\n\n\tprogram = /Users/op/.bun/bin/bun\n\tenvironment = {\n\t\tPORT => 1939\n\t}\n\n\tpid = 412\n\timmediate reason = speculative\n}\n";
+    expect(parseLaunchctlPrint(running)).toBe(412);
+    expect(parseLaunchctlPrint("gui/501/computer.parachute.hub = {\n\tstate = not running\n\tlast exit code = 1\n}\n")).toBe(0);
   });
-  test("output that isn't that table is null (takeover then can't see what is loaded)", () => {
-    expect(parseLaunchctlList("")).toBeNull();
-    expect(parseLaunchctlList('{\n\t"PID" = 412;\n};')).toBeNull();
+  test("a pid line inside a nested block isn't the job's", () => {
+    expect(parseLaunchctlPrint("gui/501/x = {\n\tstate = not running\n\tendpoints = {\n\t\tpid = 99\n\t}\n}\n")).toBe(0);
+  });
+  test("output that isn't a job's description is null (takeover then can't see whether it is loaded)", () => {
+    expect(parseLaunchctlPrint("")).toBeNull();
+    expect(parseLaunchctlPrint("PID\tStatus\tLabel\n412\t0\tcomputer.parachute.hub\n")).toBeNull();
   });
 });

@@ -195,9 +195,14 @@ export function agentEnv(plist: PlistDict): Record<string, string> {
   return env;
 }
 
-/** Runs core (any copy of parachute-core): never the old programs, whatever its PATH holds. */
+/**
+ * Runs core: an argument (or a word of one, as in `sh -c '… parachute-core serve'`) is core's entry point:
+ * `…/bin/parachute-core`, `…/parachute-core.ts` (or .js, .mjs), `parachute-core@0.8`. Never the old programs, whatever
+ * its PATH holds. A path that only passes through a folder named parachute-core (a checkout of this repo running the
+ * old hub's cli.ts) isn't core.
+ */
 export function runsCore(plist: PlistDict): boolean {
-  return agentProgram(plist).some((a) => /parachute-core/.test(a));
+  return agentProgram(plist).some((a) => /(^|[/\s])parachute-core(@[^\s/]*)?(\.[cm]?[jt]s)?(\s|$)/.test(a));
 }
 
 /**
@@ -241,17 +246,11 @@ export function agentEnabled(plist: PlistDict | null): boolean {
 }
 
 /**
- * `launchctl list` (no label): a header, then `PID<tab>Status<tab>Label` per loaded job, PID "-" when it has no
- * process. Every loaded label with its pid (0: none). null when the output isn't that table.
+ * `launchctl print <domain>/<label>` for a loaded job: its pid (the top-level `pid = N` line), 0 when it has no
+ * process. null when the output isn't a job's description.
  */
-export function parseLaunchctlList(out: string): Map<string, number> | null {
-  const lines = out.split("\n").filter((l) => l.trim());
-  if (!lines.length || !/^PID\s+Status\s+Label$/.test(lines[0]!.trim())) return null;
-  const jobs = new Map<string, number>();
-  for (const line of lines.slice(1)) {
-    const m = /^(-|\d+)\t(-|-?\d+)\t(.+)$/.exec(line);
-    if (!m) return null;
-    jobs.set(m[3]!, m[1] === "-" ? 0 : Number(m[1]));
-  }
-  return jobs;
+export function parseLaunchctlPrint(out: string): number | null {
+  if (!/^\S.* = \{\s*$/m.test(out)) return null;
+  const m = /^\tpid = (\d+)\s*$/m.exec(out);
+  return m ? Number(m[1]) : 0;
 }
