@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,6 +14,11 @@ import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { recordTokenMint, revokeTokenByJti } from "../jwt-sign.ts";
 import { writePid } from "../process-state.ts";
 import { createUser, upsertUserVault } from "../users.ts";
+
+// doctor reads PORT (the hub port serve uses); a PORT exported in the shell must not change these tests.
+const SAVED_PORT = process.env.PORT;
+beforeAll(() => { delete process.env.PORT; });
+afterAll(() => { if (SAVED_PORT !== undefined) process.env.PORT = SAVED_PORT; });
 
 /**
  * Doctor tests. The headline is the fresh-install-green guard (#717): a
@@ -224,6 +229,29 @@ describe("doctor — failure modes (each detected in isolation; others stay gree
       // Everything else stays green.
       expectNoUnexpectedNonPass(checks, ["hub-reachable", "modules-alive"]);
     } finally {
+      h.cleanup();
+    }
+  });
+
+  test("the hub's port from PORT (parachute.yaml's server.port is copied there) is the one probed, not 1939", async () => {
+    const h = makeHarness();
+    const saved = process.env.PORT;
+    process.env.PORT = "47311";
+    try {
+      seedCurrentManifest(h.manifestPath);
+      seedOperatorToken(h.configDir);
+      const probed: number[] = [];
+      const { checks } = await runDoctor(h, healthyDeps({ probeHubHealth: async (port: number) => { probed.push(port); return port === 47311; } }));
+      expect(probed[0]).toBe(47311);
+      expect(byName(checks, "hub-reachable")?.status).toBe("pass");
+      expect(byName(checks, "hub-reachable")?.title).toContain(":47311");
+      // A PORT that isn't a plain number isn't a port serve would take: doctor stays on the default.
+      process.env.PORT = "47311abc";
+      const probed2: number[] = [];
+      await runDoctor(h, healthyDeps({ probeHubHealth: async (port: number) => { probed2.push(port); return true; } }));
+      expect(probed2[0]).toBe(1939);
+    } finally {
+      if (saved === undefined) delete process.env.PORT; else process.env.PORT = saved;
       h.cleanup();
     }
   });

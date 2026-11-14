@@ -23,7 +23,7 @@ import {
   connectionReach,
   type VaultProjection,
 } from "../core/src/vault-projection.ts";
-import { readVaultConfig, writeVaultConfig } from "./config.ts";
+import { readVaultConfig, servedDescription, writeVaultConfig } from "./config.ts";
 import { forceFlag, parentsChange, tagChangeRefusal, type TagChange } from "./tag-change-guard.ts";
 import { stripTagHash } from "../core/src/tag-hierarchy.ts";
 import { getVaultStore } from "./vault-store.ts";
@@ -141,7 +141,7 @@ export async function getServerInstruction(
 
   return projectionToMarkdown({
     vaultName,
-    description: config?.description ?? null,
+    description: servedDescription(vaultName, config?.description) ?? null,
     projection,
     coordinates: resolveVaultCoordinates(),
     // Bun always wires an in-process AttachmentTicketProvider AND a fresh
@@ -1536,7 +1536,7 @@ function overrideVaultInfo(
 
     const result: Record<string, unknown> = {
       name: config.name,
-      description: config.description ?? null,
+      description: servedDescription(config.name, config.description) ?? null,
       coordinates: {
         name: config.name,
         base_url: coords.hubOriginKnown ? `${coordBase}/vault/${config.name}` : null,
