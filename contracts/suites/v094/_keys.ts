@@ -34,7 +34,7 @@ export async function call(path: string, init: { method?: string; auth?: string;
 }
 
 let account: Promise<string> | null = null;
-function accountToken(): Promise<string> {
+export function accountToken(): Promise<string> {
   account ??= (async () => {
     const owner = nostrKey();
     await hubCli(s, ["auth", "link-pubkey", "--user", s.admin.username, owner.pubkey]);
