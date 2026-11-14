@@ -15,7 +15,7 @@
 import type { Database } from "bun:sqlite";
 import type { Store } from "./types.js";
 import { transactionAsync } from "./txn.js";
-import { getWriteSet, type WriteSetRow } from "./change-log.js";
+import { getWriteSet, setRecordStates, type SetRecordState, type WriteSetRow } from "./change-log.js";
 import { readBlobText } from "./history.js";
 
 export interface UndoConflict {
@@ -48,19 +48,8 @@ export class UndoRefusal extends Error {
   }
 }
 
-interface ChangeRow {
-  seq: number;
-  position: number | null;
-  note_id: string;
-  op: "create" | "update" | "delete";
-  existed: number;
-  before_content: string | null;
-  before_hash: string | null;
-  content_saved: number;
-  before_row: string | null;
-  before_tags: string | null;
-  before_links: string | null;
-}
+/** What the set did to one record, aggregated over its rows (change-log.ts setRecordStates). */
+type ChangeRow = SetRecordState;
 
 interface BeforeRow {
   path: string | null;
@@ -74,11 +63,7 @@ interface BeforeRow {
 type LinkSpec = { target: string; relationship: string; metadata: Record<string, unknown> | null };
 
 function rowsOf(db: Database, setId: string): ChangeRow[] {
-  return db
-    .prepare(
-      "SELECT seq, position, note_id, op, existed, before_content, before_hash, content_saved, before_row, before_tags, before_links FROM record_changes WHERE write_set = ? ORDER BY seq",
-    )
-    .all(setId) as ChangeRow[];
+  return setRecordStates(db, setId);
 }
 
 /**
@@ -110,7 +95,7 @@ export function undoConflicts(db: Database, setId: string): UndoConflict[] {
            AND (rc.position > ? OR (rc.position IS NULL AND rc.seq > ?))
          ORDER BY COALESCE(rc.position, 9e18) DESC LIMIT 1`,
       )
-      .get(r.note_id, setId, r.position ?? r.seq, r.seq) as { write_set: string | null; at: string; actor: string | null; via: string | null } | null;
+      .get(r.note_id, setId, r.last_position ?? r.last_seq, r.last_seq) as { write_set: string | null; at: string; actor: string | null; via: string | null } | null;
     if (!later) continue;
     out.push({ id: r.note_id, path: pathNowOrBefore(db, r), write_set: later.write_set, by: later.actor, via: later.via, at: later.at });
   }
@@ -268,10 +253,9 @@ export async function undoWriteSet(store: Store, setId: string, opts: { force?: 
   });
 }
 
-/** The body the set saved: a blob once its transaction ended (inline only inside it). Null if it is gone. */
+/** The body the set saved (a blob, moved there at the end of its transaction). Null if it is gone (erased, oversized). */
 function savedBody(db: Database, r: ChangeRow): string | null {
-  if (r.before_hash) return readBlobText(db, r.before_hash);
-  return r.before_content;
+  return r.before_hash ? readBlobText(db, r.before_hash) : null;
 }
 
 /** A deleted record's last body, from its newest tombstone (null when there is none, or it was too big to keep). */

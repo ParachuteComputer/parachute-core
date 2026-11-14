@@ -192,6 +192,19 @@ describe("v094/undo: review round 1 cases", () => {
     expect((await snapshot(writer, id))!.path).toBe(`${a}-moved`);
   });
 
+  test("a set that changed one record over two requests is undone to before the set", async () => {
+    const id = (await writer.api("POST", "/notes", { path: `two/${shortId()}`, content: "start", metadata: { stage: 0 } })).body.id;
+    const setId = `two-${shortId()}${shortId()}`;
+    const h = { "Parachute-Write-Set": setId };
+    await writer.api("PATCH", `/notes/${id}`, { metadata: { stage: 1 }, force: true }, h);
+    await writer.api("PATCH", `/notes/${id}`, { content: "end", metadata: { stage: 2 }, force: true }, h);
+    expect((await writer.api("GET", `/write-sets/${enc(setId)}`)).body.records.length).toBe(1);
+    expect((await undo(writer, setId)).status).toBe(200);
+    const now = await snapshot(writer, id);
+    expect(now?.content).toBe("start");
+    expect(now?.metadata).toEqual({ stage: 0 });
+  });
+
   test("undo, redo, undo again: the set reads as undone, by the undo that stands", async () => {
     const id = (await writer.api("POST", "/notes", { path: `chain/${shortId()}`, content: "a" })).body.id;
     await writer.api("PATCH", `/notes/${id}`, { content: "b", force: true });
