@@ -36,7 +36,7 @@
 // checks on the home it names. `parachute-core takeover` (takeover.ts) moves a home the old programs keep onto v0.8,
 // and a box `serve` on such a home refuses with exit 7 until it has. While it holds a home, the commands that install, upgrade, expose, migrate or drive modules
 // are refused with managed_by_host, exit 2 (managed.ts, PLAN §3).
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { READABLE_SCHEMA_VERSION, SCHEMA_VERSION } from "@openparachute/vault/core/src/schema.ts";
 import core from "../../../package.json" with { type: "json" };
@@ -189,8 +189,14 @@ export async function dispatch(role: Role, notice?: Notice): Promise<void> {
   let upgradeAsk: import("./upgrade.ts").UpgradeAsk | undefined;
   if ("cli" in r && r.cli === "hub" && r.argv[0] === "upgrade") {
     const { parseUpgrade, upgradeHelp, upgradeUsage } = await import("./upgrade.ts");
-    const { knownServices } = await import("@openparachute/hub/src/service-spec.ts");
-    upgradeAsk = parseUpgrade(r.argv.slice(1), home, knownServices());
+    upgradeAsk = parseUpgrade(r.argv.slice(1));
+    if (upgradeAsk.kind === "hub") {
+      // Will the hub's upgrade find what it was asked for? Its own lookup says, reading services.json without
+      // writing to it: an unknown service, or a services.json it can't read, is refused here, not after the step.
+      const { upgradeTargetProblem } = await import("@openparachute/hub/src/commands/upgrade.ts");
+      const problem = await upgradeTargetProblem(upgradeAsk.service, join(home, "services.json"));
+      if (problem) upgradeAsk = { kind: "usage", message: problem };
+    }
     if (upgradeAsk.kind === "usage") {
       console.error(`parachute upgrade: ${upgradeAsk.message}\n${upgradeUsage()}`);
       process.exit(2);
@@ -199,6 +205,15 @@ export async function dispatch(role: Role, notice?: Notice): Promise<void> {
       console.log(upgradeHelp());
       return;
     }
+    // The hub's own upgrade gets the arguments as understood, not as typed: its parser can't then refuse them.
+    if (upgradeAsk.kind === "hub") r.argv = ["upgrade", ...upgradeAsk.argv];
+  }
+  // The vault has no `upgrade` of its own (it is part of this program), and its CLI would say so only after the
+  // step: `vault upgrade --check` must not back the home up and record it either.
+  if ("cli" in r && ((r.cli === "vault" && r.argv[0] === "upgrade") || (r.cli === "hub" && r.argv[0] === "vault" && r.argv[1] === "upgrade"))) {
+    const { upgradeUsage } = await import("./upgrade.ts");
+    console.error(`parachute vault upgrade: the vault is part of this program; upgrade it with \`parachute upgrade\`\n${upgradeUsage()}`);
+    process.exit(2);
   }
   // Every command but `version` (answered above) runs behind the check, help included: the moved CLIs do work on
   // the home before they read their arguments (the vault moves older layouts first), so `serve --help` is a command.
@@ -267,6 +282,11 @@ export async function dispatch(role: Role, notice?: Notice): Promise<void> {
   if (upgradeAsk?.kind === "check") {
     const { check, isCheckCopy } = await import("./upgrade.ts");
     checkCopy = isCheckCopy(home);
+    if (!checkCopy && process.env.PARACHUTE_UPGRADE_CHECK_COPY !== undefined) {
+      // Started as a check's run on its copy, but this home isn't that copy: never a check of a check.
+      console.error("parachute upgrade --check: this is not the copy this run was started for; nothing was opened");
+      process.exit(2);
+    }
     if (!checkCopy) {
       const refusal = managedRefusal("hub", ["upgrade"]);
       if (refusal) {

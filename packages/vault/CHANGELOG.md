@@ -26,6 +26,8 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 - The bare vault root `GET /vault/<name>` needs read. A token for the vault with no vault verb got its description and stats (T-419, audit G-C).
 
 ### Fixed
+- At most 2 pulls of `GET /api/export` run at once per vault; a third gets 429 with `Retry-After: 5`. Each pull still holds all the vault's note text in memory until it is sent (attachments stream from disk), so the cap bounds that cost (0.9.3, T-463).
+- A request that lands while a vault is being deleted and made again under the same name now gets 503 with `Retry-After: 1` ("being made; try again in a moment") instead of a 500 (0.9.3, T-463).
 - A record whose title holds the search word no longer ranks above a body hit when the word is only in its field values. The title boost now works inside a tier, so a field-only hit still comes after every title or body hit (0.9.3, T-463).
 - The "did you mean" suggestion for a typo of a word that sits only in a field value is the word itself (`propolis`), not its stem (`propoli`) (0.9.3, T-463).
 - The search index's insert trigger clears a leftover field-text row first, so a new record with no field values can't be found by a word it doesn't hold. A vault with the earlier trigger gets the new one on its next open, with no schema number (0.9.3, T-463).

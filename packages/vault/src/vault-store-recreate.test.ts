@@ -6,7 +6,8 @@ import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { mkdirSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
-import { getVaultStore, evictVaultStore, clearVaultStoreCache } from "./vault-store.ts";
+import { getVaultStore, evictVaultStore, clearVaultStoreCache, VaultBeingMadeError, beingMadeResponse } from "./vault-store.ts";
+import { writeVaultConfig } from "./config.ts";
 import { vaultDir } from "./config.ts";
 import { openVaultDb } from "./db.ts";
 
@@ -49,5 +50,23 @@ describe("getVaultStore after the vault's files are replaced", () => {
     evictVaultStore("gone");
     expect(() => first.db.query("select 1").get()).toThrow();
     expect(getVaultStore("gone")).not.toBe(first);
+  });
+});
+
+describe("a vault being made over an old one", () => {
+  test("getVaultStore throws a typed error that is served as 503 with Retry-After: 1", async () => {
+    getVaultStore("making"); // cached handle
+    // Settings file there, database gone: the CLI's create is between its two steps.
+    rmSync(vaultDir("making"), { recursive: true, force: true });
+    writeVaultConfig({ name: "making", api_keys: [], created_at: new Date().toISOString() } as never);
+    let caught: unknown;
+    try { getVaultStore("making"); } catch (err) { caught = err; }
+    expect(caught).toBeInstanceOf(VaultBeingMadeError);
+    const res = beingMadeResponse(caught, { "X-Test": "1" })!;
+    expect(res.status).toBe(503);
+    expect(res.headers.get("Retry-After")).toBe("1");
+    expect(res.headers.get("X-Test")).toBe("1");
+    expect(((await res.json()) as { error_type: string }).error_type).toBe("vault_being_made");
+    expect(beingMadeResponse(new Error("boom"))).toBeNull();
   });
 });

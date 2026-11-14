@@ -33,22 +33,31 @@ on the home, also while 0.8 is serving it. It runs the step below on a **throwaw
 1. a scratch folder beside the home (`.parachute-upgrade-check-*`, removed however the command ends, and by the next
    check if this one was killed);
 2. every database copied consistently (`VACUUM INTO`, read the way the newer-data check reads, so not a byte of the
-   home changes) and the small files a command reads (settings, the release record). Attachments, mirrors and logs
-   are left out: the step doesn't read them;
+   home changes) and the small files a command reads (settings). Attachments, mirrors and logs are left out: the
+   step doesn't read them. The release record goes along without its paths: it names the home's real backup
+   folder, and nothing on the copy may write there;
 3. 0.9 run on the copy as the home's first command would run: the newer-data check, the backup, the record, then
    every database opened by this release;
 4. the report: the backup taken, each vault's notes, types and tags, the hub's keys, any schema number that moved
    (which would make the way back a restore), the old names the home's usage log has seen, and anything the step
-   would refuse (a database it can't read, a home the 0.7 programs still own, a broken `parachute.yaml`).
+   would refuse (a database it can't read, a broken `parachute.yaml`). A home the 0.7 programs still own is
+   judged on the home itself, before any copy: it is the takeover's, and the check says so (exit 1).
 
-The home itself gets no backup, no `run/release.json` and no lock. No server starts, so nothing listens and no
-module runs. It needs room for the databases twice (the copy, then the step's backup of it). Exit 0: the step ran
-clean on the copy; 1: it failed or would be refused; 5: no room; 6: the home was written by a newer release.
+The home itself gets no backup, no `run/release.json` and no lock, and its existing upgrade backups are not written
+to. No server starts, so nothing listens and no module runs. It needs room for the databases twice (the copy, then
+the step's backup of it). Exit 0: the step ran clean on the copy; 1: it failed or would be refused; 5: no room; 6:
+the home was written by a newer release. Every vault database it copied must also have been opened: one it could not try (its folder is a link, or has no
+`vault.yaml`) is a problem, not a pass; so is a home whose parent can't be written, where the real backup would
+have nowhere to go. A database being written hard while it is copied can read as torn; the
+copy is tried three times, then reported as unreadable (the home is never changed by the attempt).
 
 **`upgrade` reads its arguments before it touches anything.** An unknown flag or service exits 2 with the home byte
 for byte as it was. Found by the 0.9 beta rehearsal (2026-11-13): before `--check` was built, `upgrade --check`
 backed the home up, recorded it as moved to 0.9 (`state: current`), and only then said `unknown service "--check"`.
-Every other command still takes the step first, as below.
+The hub's own upgrade (a module by name, or its sweep) is handed the arguments as they were understood, and its own
+lookup is asked first whether it will find the service and can read `services.json` (the same code the command
+runs, without its write-back), so it can't refuse them after the step. `vault upgrade` is
+refused the same way (the vault is part of this program). Every other command still takes the step first, as below.
 
 ## What 0.9 does the first time it opens a home
 

@@ -3255,3 +3255,28 @@ describe("/vault/<name>/.parachute/usage — data-footprint endpoint", () => {
     expect(after.bytes.assets).toBeGreaterThanOrEqual(4096);
   });
 });
+
+describe("GET /api/export concurrency cap (0.9.3, T-463)", () => {
+  test("a third simultaneous pull of one vault gets 429 + Retry-After; finishing one frees a slot", async () => {
+    createVault("capped");
+    const token = await mintJwt({ vaultName: "capped", scopes: ["vault:capped:read"] });
+    const path = "/vault/capped/api/export";
+    const pull = () => route(new Request(`http://localhost:1940${path}`, { headers: { authorization: `Bearer ${token}` } }), path);
+    const a = await pull();
+    const b = await pull();
+    expect(a.status).toBe(200);
+    expect(b.status).toBe(200);
+    const c = await pull();
+    expect(c.status).toBe(429);
+    expect(c.headers.get("Retry-After")).toBe("5");
+    await a.arrayBuffer(); // read to the end: the slot is released
+    const d = await pull();
+    expect(d.status).toBe(200); // b and d now hold both slots
+    expect((await pull()).status).toBe(429);
+    await b.body!.cancel(); // an abandoned pull frees its slot too
+    const e = await pull();
+    expect(e.status).toBe(200);
+    await d.body!.cancel();
+    await e.body!.cancel();
+  });
+});
