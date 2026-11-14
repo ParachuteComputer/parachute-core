@@ -253,10 +253,11 @@
    "old": "parachute auth reap-clients",
    "new": "parachute doctor --fix",
    "action": "merge",
-   "reason": "housekeeping",
+   "reason": "housekeeping: `parachute doctor` names OAuth clients nothing uses (none for 30 days, no grants, live tokens or open codes) and `parachute doctor --fix --yes` removes them; `auth reap-clients` keeps working",
    "since": "0.9",
    "removed_in": "1.0",
-   "state": "planned"
+   "state": "live",
+   "release": "0.9.3"
   },
   {
    "kind": "command",
@@ -433,7 +434,7 @@
    "old": "parachute-vault config [set|unset]",
    "new": "parachute config [get|set|unset]",
    "action": "merge",
-   "reason": "one settings file (§5)",
+   "reason": "one settings file (§5): `parachute config` handles the parachute.yaml keys only; it does not take parachute-vault config's old keys yet",
    "since": "0.9",
    "removed_in": "1.0",
    "state": "planned"
@@ -583,10 +584,11 @@
    "old": "parachute-vault history rebuild-state",
    "new": "parachute doctor --fix",
    "action": "merge",
-   "reason": "a repair doctor already detects",
+   "reason": "a repair doctor already detects: `parachute doctor` names a vault whose history hints are stale and `parachute doctor --fix --yes` rebuilds them; `history rebuild-state` keeps working",
    "since": "0.9",
    "removed_in": "1.0",
-   "state": "planned"
+   "state": "live",
+   "release": "0.9.3"
   },
   {
    "kind": "command",
@@ -1262,10 +1264,21 @@
   },
   {
    "kind": "setting",
-   "old": "PORT / PARACHUTE_BIND_HOST / VAULT_BIND",
+   "old": "PORT / PARACHUTE_BIND_HOST",
    "new": "server.port / server.bind",
    "action": "merge",
-   "reason": "one listener",
+   "reason": "one place for the listener; an env var still wins",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live",
+   "release": "0.9.3"
+  },
+  {
+   "kind": "setting",
+   "old": "VAULT_BIND",
+   "new": "server.port / server.bind",
+   "action": "merge",
+   "reason": "one listener; the vault's own bind address is not read from parachute.yaml yet",
    "since": "0.9",
    "removed_in": "1.0",
    "state": "planned"
@@ -1275,20 +1288,22 @@
    "old": "PARACHUTE_HUB_ORIGIN",
    "new": "server.origin",
    "action": "move",
-   "reason": "the issuer",
+   "reason": "the issuer; an env var still wins",
    "since": "0.9",
    "removed_in": "1.0",
-   "state": "planned"
+   "state": "live",
+   "release": "0.9.3"
   },
   {
    "kind": "setting",
    "old": "PARACHUTE_HUB_ORIGINS",
    "new": "server.accepted_issuers",
    "action": "move",
-   "reason": "old issuers that stay valid (uni's t137 drop-in)",
+   "reason": "old issuers that stay valid (uni's t137 drop-in); an env var still wins",
    "since": "0.9",
    "removed_in": "1.0",
-   "state": "planned"
+   "state": "live",
+   "release": "0.9.3"
   },
   {
    "kind": "setting",
@@ -1442,7 +1457,18 @@
   },
   {
    "kind": "setting",
-   "old": "vault/data/<n>/vault.yaml (description, private_tags, published_tag, transcription, history)",
+   "old": "vault/data/<n>/vault.yaml description",
+   "new": "parachute.yaml vaults.<n>.description",
+   "action": "merge",
+   "reason": "parachute.yaml wins while it is set",
+   "since": "0.9",
+   "removed_in": "1.0",
+   "state": "live",
+   "release": "0.9.3"
+  },
+  {
+   "kind": "setting",
+   "old": "vault/data/<n>/vault.yaml (private_tags, published_tag, transcription, history)",
    "new": "parachute.yaml vaults.<n>",
    "action": "merge",
    "reason": "tag schemas stay in the vault: they are data",

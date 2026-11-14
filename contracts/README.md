@@ -163,7 +163,9 @@ bun run moves                                    # a made-up vault through all t
   change, `bun run doors:keep box-0.9` and commit the diff). parachute-cloud's CI runs its own door from its pin of
   this folder and compares with the kept box of the release it runs (`box-0.8.jsonl` while cloud is on 0.8; that
   file was kept from `next` at 53f956f plus this suite's one fix to the box, the last 0.8 on `next`, and is checked
-  again by building `release/0.8`: `CANDIDATE_DIR=<that build> bun run doors -- --doors box --check-golden`).
+  again by building `release/0.8`: `CANDIDATE_DIR=<that build> bun run doors -- --doors box --check-golden`). A cloud checkout
+  pinned to a 0.9 engine (`PARACHUTE_CORE_VERSION` 0.9.x in its `scripts/core-source.env`) runs as `cloud-0.9.1`
+  against `box-0.9.1.jsonl`, with a made-up owner key linked to its account at `/account/pubkeys`.
   Neither repo builds the other's door.
 - **A deployed door** is run from a door file written by hand (`kind`, `label`, `release`, `issuer`, `vaultOrigin`,
   `signIn: {how: "nostr", secretKeyFile}`), with `DOOR_REMOTE_HOSTS` naming its hosts. The run makes two vaults of
@@ -216,7 +218,7 @@ start the box with `EMBEDDINGS_ENABLED=true`; a suite sees it as `DOOR_EMBEDDING
 
 | File | What it holds |
 |---|---|
-| `v093/hybrid.test.ts` | `search_mode: "hybrid"` finds a plain-words question that literal search misses, with `matched_by: ["meaning"]`, and puts a rare exact word first with `"keyword"`; with no provider it answers by keyword alone with a `semantic_unavailable` warning; a tag-scoped pass (minted by attenuation over the hub's HTTP mint, so box only) gets a full page of in-scope notes through either arm, plain meaning search included, with nothing out of scope in the reply and the same answer whether or not hidden notes exist; REST (`/api/notes`, `/api/records`) answers the same ids as MCP; with `HYBRID_AUTO_DEFAULT` off a search without `search_mode` is byte-identical to `search_mode: "literal"`. The `auto` contract (a 4+ word question answered by hybrid, with `search_auto`) is `red()` until Aaron says yes; the flip removes it and the byte-identical one. |
+| `v093/hybrid.test.ts` | `search_mode: "hybrid"` finds a plain-words question that literal search misses, with `matched_by: ["meaning"]`, and puts a rare exact word first with `"keyword"`; with no provider it answers by keyword alone with a `semantic_unavailable` warning; a tag-scoped pass (minted by attenuation over the hub's HTTP mint, so box only) gets a full page of in-scope notes through either arm, plain meaning search included, with nothing out of scope in the reply and the same answer whether or not hidden notes exist; REST (`/api/notes`, `/api/records`) answers the same ids as MCP; `auto` is on by default: a 4+ word question with no `search_mode` is answered by hybrid with `search_auto` (also for a tag-scoped pass); 1–3 word searches, `search_mode: "literal"` and a search with `sort` are byte-identical to literal; a call's `search_mode` beats the vault's `search.auto_hybrid`, which an admin sets over `PATCH /api/vault` (true, false, null) and only an admin reads. |
 
 `suites/bench/query-092.bench.ts` is the 0.9.2 bench, not a contract: made-up records at `BENCH_N` on the box, every
 operator, search, a type PUT and a retype, timed (`BENCH_N=94000 bun run doors -- --doors box suites/bench/query-092.bench.ts`).

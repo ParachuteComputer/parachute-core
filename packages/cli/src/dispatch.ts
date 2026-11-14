@@ -77,7 +77,7 @@ function coreHelp(): string {
 export function route(
   role: Role,
   argv: string[],
-): { print: string } | { frontHelp: true } | { changes: string[] } | { install: string[] } | { probe: string[] } | { embedded: string[] } | { bootstrap: string[] } | { takeover: string[] } | { cli: "hub" | "vault"; argv: string[] } {
+): { print: string } | { frontHelp: true } | { changes: string[] } | { config: string[] } | { install: string[] } | { probe: string[] } | { embedded: string[] } | { bootstrap: string[] } | { takeover: string[] } | { cli: "hub" | "vault"; argv: string[] } {
   if (role === "core" && argv[0] === "install") return { install: argv.slice(1) };
   if (role === "core" && argv[0] === "probe") return { probe: argv.slice(1) };
   if (role === "core" && argv[0] === "takeover") return { takeover: argv.slice(1) };
@@ -91,6 +91,8 @@ export function route(
   if (role === "hub" && (args.length === 0 || (["help", "--help", "-h"].includes(cmd!) && !rest.includes("--all")))) return { frontHelp: true };
   // `changes` (front.ts) reads only the map it ships and the home's usage log, so it answers before any check.
   if (cli === "hub" && cmd === "changes") return { changes: rest };
+  // `config` (settings.ts) is the home's parachute.yaml; `parachute-vault config` stays the vault's own.
+  if (role !== "vault" && cli === "hub" && cmd === "config") return { config: rest };
   if (cli === "hub" && cmd === "serve" && rest.includes("--embedded")) return { embedded: rest };
   if (cli === "hub" && cmd === "bootstrap") return { bootstrap: rest };
   return { cli, argv: args };
@@ -216,6 +218,10 @@ export async function dispatch(role: Role, notice?: Notice): Promise<void> {
     console.log(frontHelp());
     return;
   }
+  if ("config" in r) {
+    const { configCommand } = await import("./settings.ts");
+    process.exit(configCommand(r.config, home));
+  }
   if (embeddedArgs) {
     process.env.PARACHUTE_OFFLINE = "1";
     if (process.env.PARACHUTE_HOME) for (const line of repairModes(home)) console.error(`parachute: mode repaired: ${line}`);
@@ -269,6 +275,20 @@ export async function dispatch(role: Role, notice?: Notice): Promise<void> {
     if (refused) {
       console.error(refused);
       process.exit(EXIT_OLD_PROGRAMS);
+    }
+  }
+  // parachute.yaml (settings.ts): its settings go into effect before the hub or the vault reads any (env still wins).
+  // A broken file stops `serve`, which must not start on settings it could not read; other commands say so and go on.
+  // Not in the vault a host-managed `serve --embedded` starts (PARACHUTE_EMBEDDED_PARENT): the host's flags and env rule.
+  if (process.env.PARACHUTE_EMBEDDED_PARENT === undefined) {
+    const { applyParachuteYaml, SettingsError } = await import("./settings.ts");
+    try {
+      applyParachuteYaml(home, { server: r.cli === "hub" });
+    } catch (err) {
+      if (!(err instanceof SettingsError)) throw err;
+      console.error(`${name}: ${err.message}`);
+      if (serving) process.exit(2);
+      console.error(`${name}: going on without ${"parachute.yaml"}`);
     }
   }
   if (r.cli === "hub" && r.argv[0] === "serve") {

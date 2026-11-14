@@ -33,7 +33,7 @@ import {
   type QueryWarning,
 } from "../core/src/query-warnings.ts";
 import { SEARCH_MODES, buildLiteralSearchQuery, isValidSearchMode, type SearchMode } from "../core/src/search-query.ts";
-import { anyTermsQuery, HYBRID_TEXT } from "../core/src/hybrid.ts";
+import { anyTermsQuery, effectiveHybridAuto } from "../core/src/hybrid.ts";
 import {
   listUnresolvedWikilinks,
   resolveOrQueueLink,
@@ -187,7 +187,7 @@ import {
 } from "../core/src/expand.ts";
 import { join, extname, normalize } from "path";
 import { existsSync, mkdirSync, statSync, unlinkSync, writeFileSync } from "fs";
-import { assetsDir, readGlobalConfig, readVaultConfig } from "./config.ts";
+import { assetsDir, readGlobalConfig, readVaultConfig, servedDescription } from "./config.ts";
 import {
   NO_PROVIDER_ERROR,
   noProviderErrorFor,
@@ -1032,7 +1032,7 @@ function parseSearchModeParam(url: URL): { mode?: SearchMode; error?: Response }
           error_type: "invalid_query",
           field: "search_mode",
           got: raw,
-          hint: HYBRID_TEXT.hint,
+          hint: 'pass "literal", "advanced" or "hybrid", or omit for the default ("literal": REST answers 4+ word searches literally too)',
         },
         400,
       ),
@@ -1493,30 +1493,9 @@ function invalidIfUpdatedAtResponse(): Response {
   );
 }
 
-/** A HEAD answer made from a GET answer: its status and headers, a Content-Length for the body it holds back. */
-export async function headOf(res: Response): Promise<Response> {
-  const h = new Headers(res.headers);
-  h.set("content-length", String((await res.arrayBuffer()).byteLength));
-  return new Response(null, { status: res.status, statusText: res.statusText, headers: h });
-}
-
-/**
- * Validators for one record's answer (0.9.3): a strong ETag (a hash of the answer's own bytes, so it changes with any
- * change to the representation this key is shown: body, fields, tags in scope, links, query options) and Last-Modified
- * (the record's update time; the ETag, not this, is what catches a tag-only change). A 200 JSON answer only.
- */
-export async function withValidators(res: Response): Promise<Response> {
-  if (res.status !== 200 || !(res.headers.get("content-type") ?? "").includes("application/json")) return res;
-  const bytes = await res.arrayBuffer();
-  const h = new Headers(res.headers);
-  h.set("etag", `"${new Bun.CryptoHasher("sha256").update(bytes).digest("hex").slice(0, 32)}"`);
-  try {
-    const doc = JSON.parse(new TextDecoder().decode(bytes)) as { updatedAt?: string; updated_at?: string };
-    const at = Date.parse(doc.updatedAt ?? doc.updated_at ?? "");
-    if (!Number.isNaN(at)) h.set("last-modified", new Date(at).toUTCString());
-  } catch {}
-  return new Response(bytes, { status: res.status, statusText: res.statusText, headers: h });
-}
+// HEAD and validators for one record: core/src/http-validators.ts (one copy with the cloud door).
+export { headOf, withValidators } from "../core/src/http-validators.ts";
+import { headOf, withValidators } from "../core/src/http-validators.ts";
 
 export async function handleNotes(
   req: Request,
@@ -4556,6 +4535,7 @@ type VaultConfigLike = {
   description?: string | null;
   audio_retention?: "keep" | "until_transcribed" | "never";
   auto_transcribe?: { enabled?: boolean };
+  search?: { auto_hybrid?: boolean };
 };
 
 const VALID_AUDIO_RETENTION = ["keep", "until_transcribed", "never"] as const;
@@ -4576,15 +4556,17 @@ function resolveAutoTranscribeEnabled(vaultConfig: VaultConfigLike): boolean {
   );
 }
 
-function vaultResponse(vaultConfig: VaultConfigLike): Record<string, unknown> {
+function vaultResponse(vaultConfig: VaultConfigLike, isAdmin = false): Record<string, unknown> {
   return {
     name: vaultConfig.name,
-    description: vaultConfig.description ?? null,
+    description: servedDescription(vaultConfig.name, vaultConfig.description) ?? null,
     config: {
       audio_retention: vaultConfig.audio_retention ?? "keep",
       auto_transcribe: {
         enabled: resolveAutoTranscribeEnabled(vaultConfig),
       },
+      // 0.9.3: the effective auto-hybrid setting (the vault's own, else the default). Admin only, like setting it.
+      ...(isAdmin ? { search: { auto_hybrid: effectiveHybridAuto(vaultConfig.search?.auto_hybrid) } } : {}),
     },
   };
 }
@@ -4593,12 +4575,12 @@ function vaultResponse(vaultConfig: VaultConfigLike): Record<string, unknown> {
  * The 403 for a vault-description edit without admin (T-419, audit L3-01).
  * Same envelope as routing.ts's other insufficient_scope refusals.
  */
-export function descriptionNeedsAdmin(vaultName: string, grantedScopes: string[]): Response {
+export function descriptionNeedsAdmin(vaultName: string, grantedScopes: string[], what = "the vault description"): Response {
   return json(
     {
       error: "Forbidden",
       error_type: "insufficient_scope",
-      message: `Changing the vault description requires the '${SCOPE_ADMIN}' scope (or '${SCOPE_ADMIN.replace("vault:", `vault:${vaultName}:`)}').`,
+      message: `Changing ${what} requires the '${SCOPE_ADMIN}' scope (or '${SCOPE_ADMIN.replace("vault:", `vault:${vaultName}:`)}').`,
       required_scope: SCOPE_ADMIN,
       granted_scopes: grantedScopes,
     },
@@ -4644,14 +4626,14 @@ export async function handleVault(
    * anything in the body is applied. A config-only PATCH never sees it (the
    * Notes app sets audio_retention with a read+write token).
    */
-  descriptionForbidden: (() => Response) | null = () => descriptionNeedsAdmin(vaultConfig.name, []),
+  descriptionForbidden: ((what?: string) => Response) | null = (what) => descriptionNeedsAdmin(vaultConfig.name, [], what),
   /** When the last full export went out and to which key (export-stamp.ts). Passed for an admin only. */
   lastExport: { last_export_at: string | null; last_export_by: string | null } | null = null,
 ): Promise<Response> {
   const url = new URL(req.url);
 
   if (req.method === "GET") {
-    const result: Record<string, unknown> = vaultResponse(vaultConfig);
+    const result: Record<string, unknown> = vaultResponse(vaultConfig, descriptionForbidden === null);
     // Transcription capability flag — `enabled` iff a provider is configured
     // and available. `minutes_remaining` is omitted (cloud/plan concern;
     // self-host is unmetered). This is the field Notes gates the mic on.
@@ -4684,7 +4666,7 @@ export async function handleVault(
     if (!parsedBody.ok) return parsedBody.response;
     const body = parsedBody.body as {
       description?: unknown;
-      config?: { audio_retention?: string; auto_transcribe?: { enabled?: unknown } };
+      config?: { audio_retention?: string; auto_transcribe?: { enabled?: unknown }; search?: { auto_hybrid?: unknown } | null };
     };
     let dirty = false;
 
@@ -4761,6 +4743,29 @@ export async function handleVault(
       dirty = true;
     }
 
+    // search.auto_hybrid (0.9.3): true/false overrides the default for this vault; null clears it (follow the
+    // default). Vault-wide, so admin only (a write token is refused; routing.ts already refuses a tag-scoped one).
+    if (body.config?.search !== undefined) {
+      if (descriptionForbidden) return descriptionForbidden("the vault's search settings");
+      const v = body.config.search?.auto_hybrid;
+      if (v !== null && typeof v !== "boolean") {
+        return json(
+          {
+            error: "invalid_search_auto_hybrid",
+            error_type: "invalid_search_auto_hybrid",
+            field: "config.search.auto_hybrid",
+            got: v,
+            message: "search.auto_hybrid must be a boolean, or null to follow the default",
+            hint: "pass true, false or null",
+          },
+          400,
+        );
+      }
+      if (v === null) delete vaultConfig.search;
+      else vaultConfig.search = { auto_hybrid: v };
+      dirty = true;
+    }
+
     if (dirty && persist) {
       try { persist(); } catch (err) {
         if (err instanceof UnreadablePrivateTagsError) {
@@ -4769,7 +4774,7 @@ export async function handleVault(
         throw err;
       }
     }
-    return json(vaultResponse(vaultConfig));
+    return json(vaultResponse(vaultConfig, descriptionForbidden === null));
   }
 
   return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);

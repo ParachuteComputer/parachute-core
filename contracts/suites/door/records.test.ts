@@ -110,8 +110,11 @@ describe.skipIf(!is09 || lacks("records-over-rest"))("the record door over REST"
 // cheaply. Same keys as GET (0.9.3, T-463). The tag-scope case (hidden is 404) is in packages/vault/src/head-record.test.ts.
 describe.skipIf(!is09 || lacks("records-over-rest"))("HEAD on one record", () => {
   const api = rest("write");
+  // `identity`: the length compared is the representation's own. A door behind a compressing edge (Cloudflare brotli)
+  // sends no Content-Length for a compressed answer, on GET and HEAD alike.
+  const plain = { "accept-encoding": "identity" };
   const head = async (path: string, bearer: string | null) => {
-    const r = await safeFetch(`${vaultUrl()}/api${path}`, { method: "HEAD", headers: bearer ? { authorization: `Bearer ${bearer}` } : {} });
+    const r = await safeFetch(`${vaultUrl()}/api${path}`, { method: "HEAD", headers: bearer ? { authorization: `Bearer ${bearer}`, ...plain } : plain });
     return { status: r.status, headers: r.headers, text: await r.text() };
   };
 
@@ -121,7 +124,7 @@ describe.skipIf(!is09 || lacks("records-over-rest"))("HEAD on one record", () =>
     const bearer = await token("read");
     for (const door of ["records", "notes"]) {
       const url = `${vaultUrl()}/api/${door}/${made.body.id}`;
-      const get = await safeFetch(url, { headers: { authorization: `Bearer ${bearer}` } });
+      const get = await safeFetch(url, { headers: { authorization: `Bearer ${bearer}`, ...plain } });
       const getText = await get.text();
       const h = await head(`/${door}/${made.body.id}`, bearer);
       expect({ door, status: h.status }).toEqual({ door, status: 200 });

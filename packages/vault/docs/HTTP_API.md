@@ -706,6 +706,7 @@ actually affected by the bug — only the message string could double.
 |---|---|---|---|
 | `invalid_audio_retention` | 400 | `field`, `got`, `hint` | `config.audio_retention` isn't one of `keep`, `until_transcribed`, `never`. |
 | `invalid_auto_transcribe` | 400 | `field`, `got`, `hint` | `config.auto_transcribe.enabled` isn't a boolean. |
+| `invalid_search_auto_hybrid` | 400 | `field`, `got`, `hint` | `config.search.auto_hybrid` isn't `true`, `false` or `null`. A `PATCH` body carrying `config.search` from a non-admin is `403 insufficient_scope`. |
 | `insufficient_scope` | 403 | `required_scope: "vault:admin"`, `granted_scopes` | The body carries `description` (any value, `null` included) and the token lacks admin for this vault. |
 | `tag_scope_violation` | 403 | `scoped_tags` | The token is tag-scoped. Description and config are vault-wide, so a tag-scoped token can't PATCH here at any verb. |
 
@@ -2681,7 +2682,7 @@ stayed vault-wide and named hidden tags and note ids). The same holds for the
 bare vault root, `/.parachute/usage` counts, MCP `vault-info`
 `include_stats` and the counts line of the MCP connect-time instructions.
 
-#### `PATCH /vault/{name}/api/vault` — `vault:write` for `config`, `vault:admin` for `description`
+#### `PATCH /vault/{name}/api/vault` — `vault:write` for `config`, `vault:admin` for `description` and `config.search`
 Update the description and/or nested `config` fields. Only the fields you
 pass are changed; omitted fields are left alone.
 
@@ -2692,6 +2693,8 @@ pass are changed; omitted fields are left alone.
   `required_scope: "vault:admin"` and nothing in the body is applied.
 - A body with only `config` needs `vault:write` (the Notes app sets
   `config.audio_retention` with a read+write token).
+- A body carrying `config.search` needs `vault:admin` too (a write token gets
+  `403 insufficient_scope`): it changes how every reader's searches are ranked.
 - A tag-scoped token gets `403 tag_scope_violation` at any verb: description
   and config are vault-wide.
 
@@ -2722,6 +2725,19 @@ affected.
 Validation: `audio_retention` must be exactly one of those three strings.
 Any other value returns `400 invalid_audio_retention`. Vaults created
 before this setting existed read back as `"keep"`.
+
+##### `config.search.auto_hybrid` (0.9.3)
+
+Whether a search of 4+ words (2 or more of them content words) with no
+`search_mode` is ranked by keyword and meaning together on this vault, as
+`query-notes`/`query-records` (MCP) do by default when the vault has meaning
+search. `true` or `false` overrides the default for this vault; `null` clears
+it, so the vault follows the default again (on). Stored in `vault.yaml` as
+`search:` / `  auto_hybrid: true|false`. A `search_mode` passed on a call
+always wins over it. Needs `vault:admin`; `GET /api/vault` shows the effective
+value in `config.search.auto_hybrid` to an admin token only. Any other value is
+`400 invalid_search_auto_hybrid`. (REST `GET /api/notes?search=` stays literal
+without `search_mode`.)
 
 ### Mirror config (vault-sync Phase A1)
 

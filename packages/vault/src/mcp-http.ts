@@ -15,7 +15,8 @@
  * read-only keys see a filtered tool list.
  */
 
-import { NOTE_TOOL_NAMES, recordWords } from "../core/src/mcp-records.ts";
+import { NOTE_TOOL_NAMES } from "../core/src/mcp-records.ts";
+import { recordErrorData, typedMessage } from "../core/src/mcp-surface.ts";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import {
@@ -84,22 +85,12 @@ export function mcpDomainError(
   rawMessage: string,
   data: Record<string, unknown>,
 ): McpError {
-  const cleanMessage = rawMessage.replace(MCP_ERROR_PREFIX_RE, "");
-  const errorType = typeof data.error_type === "string" ? data.error_type : undefined;
-  const humanMessage = errorType ? `[${errorType}] ${cleanMessage}` : cleanMessage;
-  return new McpError(code, humanMessage, data);
+  return new McpError(code, typedMessage(rawMessage.replace(MCP_ERROR_PREFIX_RE, ""), data), data);
 }
 
 /** A record tool's JSON-RPC error in record words: the hints this file adds, and `record_id` for `note_id` (T-407). */
 function recordDoorError(err: McpError): McpError {
-  const data = (err.data && typeof err.data === "object" ? { ...(err.data as Record<string, unknown>) } : err.data) as Record<string, unknown> | undefined;
-  if (data) {
-    for (const k of ["hint", "how_to"]) if (typeof data[k] === "string") data[k] = recordWords(data[k] as string);
-    if ("note_id" in data) {
-      data.record_id = data.note_id;
-      delete data.note_id;
-    }
-  }
+  const data = err.data && typeof err.data === "object" ? recordErrorData(err.data as Record<string, unknown>) : err.data;
   // The message is already in record words (the record tool's errorOut); only what this file added is not.
   return new McpError(err.code, err.message.replace(MCP_ERROR_PREFIX_RE, ""), data);
 }
