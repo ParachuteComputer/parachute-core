@@ -325,9 +325,9 @@ export async function dispatch(role: Role, notice?: Notice): Promise<void> {
   }
   // `stop`, `start` and `restart` of the whole service, where core's own unit serves this home (unit.ts): the
   // unit's, through systemctl. No database is opened and no step taken here; the unit's serve takes it at its start.
-  if (r.cli === "hub" && ["stop", "start", "restart"].includes(r.argv[0] ?? "") && (r.argv[1] === undefined || r.argv[1] === "hub")) {
-    const { coreUnitServes, coreUnitVerb } = await import("./unit.ts");
-    if (coreUnitServes(home) && !managedRefusal("hub", r.argv)) process.exit(coreUnitVerb(r.argv[0]!));
+  if (r.cli === "hub" && ["stop", "start", "restart"].includes(r.argv[0] ?? "") && !["--help", "-h"].includes(r.argv[1] ?? "")) {
+    const { coreUnitServes, coreUnitVerb, wholeService } = await import("./unit.ts");
+    if (wholeService(r.argv.slice(1)) && coreUnitServes(home) && !managedRefusal("hub", r.argv)) process.exit(coreUnitVerb(r.argv[0]!));
   }
   {
     // The first time this release opens a home an older one served: record the step and back the databases up

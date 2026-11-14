@@ -135,7 +135,11 @@ describe("lifecycle/upgrade through the service unit", () => {
     const restarted = await linked(["restart"]);
     must(restarted.code === 0, `parachute restart exited ${restarted.code}: ${restarted.stderr.slice(-600)} ${restarted.stdout.slice(-300)}`);
     expect(m.systemctlCalls().slice(calls).join("\n")).toContain(`restart ${UNIT}`);
-    expect(m.systemctlCalls().join("\n")).not.toMatch(/(start|restart) parachute-hub/); // the leftover stays paused
+    // With a flag riding along it is still the whole service's, and still core's unit.
+    const flagged = await linked(["start", "--hub-origin", origin]);
+    expect(flagged.code).toBe(0);
+    expect(m.systemctlCalls().slice(calls).join("\n")).toContain(`start ${UNIT}`);
+    expect(m.systemctlCalls().join("\n")).not.toMatch(/(start|restart|enable) parachute-hub/); // the leftover stays paused
     const unit = { ...(await serving(m, { vaultName: vault, origin }, UNIT)), runs: old.runs };
     try {
       expect(unit.runs().startsWith(`${v09}-`)).toBe(true);

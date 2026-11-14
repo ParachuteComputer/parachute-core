@@ -78,7 +78,8 @@ serves it, and gets nothing from this one, not even a lock file. (`upgrade --che
 meanwhile.) Where core's own unit serves the home (`parachute-core.service`, which the takeover writes; a 0.7
 hub unit the takeover left paused beside it doesn't count, only a hub unit that itself runs core), `stop`,
 `start` and `restart` of the whole service are that unit's: `systemctl --user <verb> parachute-core.service`
-(`packages/cli/src/unit.ts`). Elsewhere `stop` and `restart` of the whole service go to the hub's own, and `logs`
+(`packages/cli/src/unit.ts`), whatever flags ride along. And inside core the hub never takes a `parachute-hub.service`
+that starts the 0.7 hub for its own unit, whichever verb or module is named (`hub-unit.ts` `isHubUnitInstalled`). Elsewhere `stop` and `restart` of the whole service go to the hub's own, and `logs`
 only reads. All of these still run from the newer release without taking the step: right after `parachute upgrade` installed it, the links name the newer release while the older
 server runs, and those are the commands that stop it. They open no database. Its next start, as the newer
 release, takes the step. (`status`, and `stop <module>`, open hub.db and are refused like the rest.)
