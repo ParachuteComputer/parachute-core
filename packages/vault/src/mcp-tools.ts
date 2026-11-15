@@ -8,27 +8,35 @@
 import { generateMcpTools, resolveNote } from "../core/src/mcp.ts";
 import { projectHistoryProvenance } from "../core/src/history-visibility.js";
 import type { McpToolDef, GenerateMcpToolsOpts } from "../core/src/mcp.ts";
+import { mergeTypesIntoTags } from "../core/src/tag-kind.ts";
+import { recordWords } from "../core/src/mcp-records.ts";
+import { shapeRecordSurface } from "../core/src/mcp-surface.ts";
+import { countName } from "./name-usage.ts";
 import { getNote, getNoteTags, getVaultMap, getVaultStats } from "../core/src/notes.ts";
 import { narrowLinkWarningsForVisibility } from "../core/src/wikilinks.ts";
 import type { Note } from "../core/src/types.ts";
 import {
   buildVaultProjection,
   projectionToMarkdown,
+  connectionReach,
   type VaultProjection,
 } from "../core/src/vault-projection.ts";
-import { readVaultConfig, writeVaultConfig } from "./config.ts";
+import { readVaultConfig, servedDescription, writeVaultConfig } from "./config.ts";
+import { forceFlag, parentsChange, tagChangeRefusal, type TagChange } from "./tag-change-guard.ts";
+import { stripTagHash } from "../core/src/tag-hierarchy.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { hasScopeForVault, hasMigrateScopeForVault, parseScopes, validateMintedScopes, logStrictBypass } from "./scopes.ts";
 import type { AuthResult } from "./auth.ts";
 import { refineMcpVia } from "./auth.ts";
+import { KEY_NAME_RE, ON_BEHALF_PARAM, resolveBy } from "../core/src/write-stamp.ts";
 import {
   expandTokenTagScope,
   scrubTagCountsForPrivateTags,
   scopedCountFilter,
-  scopedStatsFilter,
   doctorNoteTagsPredicate,
   filterHydratedLinksByTagScope,
   noteWithinTagScope,
+  tagScopeVisibility,
   scopeQueryTagParam,
   scrubIndexedFieldConflictError,
   scrubNoteTagsByScope,
@@ -98,8 +106,8 @@ function filterProjectionByScope(
  * tags + descendants before rendering — symmetric with the JSON
  * `vault-info` wrapper, so a tag-scoped token never learns about
  * out-of-scope tags via the connect-time brief either. Aggregate counts
- * stay vault-wide (pre-existing behaviour) EXCEPT that notes hidden by a
- * private tag are subtracted, and `map` is scope-restricted (vault#766).
+ * (the stats line and `map`) cover only the notes the token can see: reachable
+ * through an in-scope tag and not hidden by a private tag (vault#766, T-419).
  *
  * Async because expanding the tag-scope allowlist hits the store's
  * hierarchy resolver. Returns the orientation block even when the vault
@@ -118,10 +126,11 @@ export async function getServerInstruction(
     const allowed = await expandTokenTagScope(store, auth.scoped_tags);
     // vault#766: the brief's counts (stats line, map) must not include notes
     // a private tag hides from this token — build them scope-aware.
+    const countScope = scopedCountFilter(store, allowed);
     projection = buildVaultProjection(store.db, {
       includeStats: true,
-      countScope: scopedCountFilter(store, allowed),
-      statsScope: scopedStatsFilter(store, allowed),
+      countScope,
+      statsScope: countScope,
     });
     if (allowed) projection = filterProjectionByScope(projection, allowed);
   } else {
@@ -130,7 +139,7 @@ export async function getServerInstruction(
 
   return projectionToMarkdown({
     vaultName,
-    description: config?.description ?? null,
+    description: servedDescription(vaultName, config?.description) ?? null,
     projection,
     coordinates: resolveVaultCoordinates(),
     // Bun always wires an in-process AttachmentTicketProvider AND a fresh
@@ -138,7 +147,18 @@ export async function getServerInstruction(
     // `generateScopedMcpTools` below) — the connect-time brief can
     // unconditionally teach both the ticket tools and read-attachment on
     // this door.
-    attachments: { ticketsEnabled: true, readEnabled: true },
+    attachments: { ticketsEnabled: true, readEnabled: true, ticketTool: "attachment-url" },
+    // T-407: this door lists the record tools first, so its brief speaks their words.
+    words: recordWords,
+    // 0.9.1 (SPEC §3.4): say what this key can read. No auth (local stdio) is the owner's own process: no line.
+    ...(auth
+      ? {
+          reach: connectionReach(
+            hasScopeForVault(auth.scopes, vaultName, "admin") ? "admin" : hasScopeForVault(auth.scopes, vaultName, "write") ? "write" : "read",
+            auth.scoped_tags,
+          ),
+        }
+      : {}),
   });
 }
 
@@ -210,7 +230,7 @@ export function generateScopedMcpTools(
   // use of this) execute. Unscoped sessions install no predicate → the
   // aggregate runs core's fast direct-SQL path.
   const aggregateVisibility = scoped
-    ? (note: Note) => noteWithinTagScope(note, allowedHolder.value, rawTags)
+    ? tagScopeVisibility(() => ({ allowed: allowedHolder.value, rawRoots: rawTags }))
     : undefined;
 
   // Tag-scope hop-guard for `near[]` (vault#439): a per-note predicate the
@@ -307,6 +327,8 @@ export function generateScopedMcpTools(
 
   const tools = generateMcpTools(store, {
     ...(expandVisibility ? { expandVisibility } : {}),
+    // 0.9.3: the vault's own `search.auto_hybrid`, read at each search (unset follows the default).
+    hybridAuto: () => readVaultConfig(vaultName)?.search?.auto_hybrid,
     ...(nearTraversable ? { nearTraversable } : {}),
     ...(ifExistsVisible ? { ifExistsVisible } : {}),
     ...(aggregateVisibility ? { aggregateVisibility, searchVisibility: aggregateVisibility, resolveVisibility: aggregateVisibility } : {}),
@@ -316,11 +338,14 @@ export function generateScopedMcpTools(
     ...(writeContext ? { writeContext } : {}),
     ...(strictBypass ? { strictBypass } : {}),
     ...(onStrictBypass ? { onStrictBypass } : {}),
+    // T-412: delete-note's erase_history is admin-only, like DELETE /notes/:id/versions (vault#524). A scoped admin
+    // erases only notes it can see; only an unscoped one may name a note already deleted.
+    ...(auth && hasScopeForVault(auth.scopes, vaultName, "admin") ? { eraseHistory: scoped ? "visible" as const : "all" as const } : {}),
     attachmentTickets: {
       provider: getSharedAttachmentTicketProvider(),
       vaultName,
       urlBase: ticketUrlBase,
-      ...(ticketNoteVisible ? { noteVisible: ticketNoteVisible } : {}),
+      ...(ticketNoteVisible ? { noteVisible: ticketNoteVisible, scopedTags: rawTags! } : {}),
     },
     // Attachment bytes (Wave 2 model lane): bun always wires a fresh fs
     // provider per session — cheap (stateless), unlike the ticket
@@ -334,17 +359,103 @@ export function generateScopedMcpTools(
   });
 
   overrideVaultInfo(tools, vaultName, auth);
-  applyTagDependencyGuards(tools, vaultName);
+  applyTagDependencyGuards(tools, vaultName, scoped);
   applyTagScopeWrappers(tools, vaultName, auth, allowedHolder);
-
   // manage-token is server-only (needs token-store + auth context), so it
   // lives here rather than in core. Always appended to the surface; the
   // `requiredVerb: "admin"` filter in mcp-http.ts hides it from non-admin
   // callers. See vault#376. The raw caller bearer (vault#403, MGT) is
   // forwarded to hub's mint-token attenuation proxy on mint.
   tools.push(buildManageTokenTool(vaultName, auth, callerBearer ?? null));
+  // The 0.9 surface (core mcp-surface.ts, one copy for every door): record tools, the eleven tools, aliases, help,
+  // parameter teaching. Built after every guard above, so a new name never does more than its old one.
+  const shaped = shapeRecordSurface(tools, {
+    db: store.db,
+    vaultName,
+    ...(auth ? { hasVerb: (verb: "read" | "write" | "admin") => hasScopeForVault(auth.scopes, vaultName, verb) } : {}),
+    onUse: (name, kind) => countName(`mcp ${name}`, kind),
+    onUnknownParam: countUnknownParam,
+    ...(scoped
+      ? {
+          tagVisible: async () => {
+            const allowed = await expandTokenTagScope(store, rawTags);
+            return (t: string) => tagVisibleInScope(t, allowed, rawTags);
+          },
+        }
+      : {}),
+    doorTool: (name) => (name === "manage-token" || name === "manage-keys" ? { ...manageTokenReference(vaultName), name } : undefined),
+  });
+  applyOnBehalf(shaped, auth, (by) => generateScopedMcpTools(vaultName, { ...auth!, actor: by, acts_for: null }, callerBearer, req));
 
-  return tools;
+  return shaped;
+}
+
+/** The MCP tools whose writes carry the write stamp, by the action that writes (manage-types: only rename does). */
+function stampsWriter(tool: string, params: Record<string, unknown>): boolean {
+  if (["create-note", "update-note", "delete-note", "create-record", "update-record", "delete-record", "rename-tag"].includes(tool)) return true;
+  return tool === "manage-types" && params.action === "rename";
+}
+const STAMP_TOOLS = ["create-note", "update-note", "delete-note", "create-record", "update-record", "delete-record", "rename-tag", "manage-types"];
+
+/**
+ * The write stamp on MCP (core write-stamp.ts). A key with the owner's on-behalf-of permission sees an
+ * `on_behalf_of` parameter on the write tools and may name who a write is for: it is stamped `by <prefix>:<id>`, the
+ * prefix from the token. Every other session never sees the parameter, and a supplied one is refused before
+ * anything runs, on every tool, so it is never ignored. The call runs on the same tools built for that "by" (the
+ * engine reads its stamp once, at build), with the token's own scope: on-behalf-of never opens anything.
+ */
+function applyOnBehalf(tools: McpToolDef[], auth: AuthResult | undefined, withBy: (by: string) => McpToolDef[]): void {
+  const actsFor = auth?.acts_for ?? null;
+  for (const tool of tools) {
+    if (actsFor !== null && STAMP_TOOLS.includes(tool.name)) {
+      const schema = tool.inputSchema as { properties?: Record<string, unknown> };
+      tool.inputSchema = {
+        ...tool.inputSchema,
+        properties: { ...(schema.properties ?? {}), [ON_BEHALF_PARAM]: { type: "string", description: `Who this write is for: your id for them; stamped by "${actsFor}:<id>"` } },
+      };
+    }
+    const execute = tool.execute;
+    tool.execute = async (params) => {
+      // A batch item has no on_behalf_of of its own: the call's applies to every item. One inside an item would
+      // otherwise be ignored, so it is refused.
+      const inItem = Object.values(params ?? {}).some((v) => Array.isArray(v) && v.some((it) => it && typeof it === "object" && ON_BEHALF_PARAM in it));
+      if (inItem) {
+        throw Object.assign(new Error(`${ON_BEHALF_PARAM} goes on the call, not inside a batch item: it stamps every item. Nothing was written.`), {
+          error_type: "invalid_on_behalf_of", field: ON_BEHALF_PARAM, hint: "move on_behalf_of to the top level",
+        });
+      }
+      if (!params || !(ON_BEHALF_PARAM in params)) return execute(params);
+      const { [ON_BEHALF_PARAM]: supplied, ...rest } = params;
+      const r = resolveBy(supplied, actsFor, auth?.actor ?? null, "mcp");
+      if ("refusal" in r) throw Object.assign(new Error(r.refusal.message), { error_type: r.refusal.error_type, field: r.refusal.field, hint: r.refusal.hint });
+      if (!stampsWriter(tool.name, rest)) {
+        throw Object.assign(new Error(`${tool.name} records no writer, so ${ON_BEHALF_PARAM} would be dropped. Nothing was done. Pass it on record writes only.`), {
+          error_type: "on_behalf_not_recorded", field: ON_BEHALF_PARAM, hint: "drop on_behalf_of on this call",
+        });
+      }
+      const twin = withBy(r.by!).find((t) => t.name === tool.name);
+      if (!twin) throw new Error(`${tool.name}: not available for an on-behalf-of write`);
+      return twin.execute(rest);
+    };
+  }
+}
+
+/** Unknown parameters so far (ignored on a 0.8 name, refused on a 0.9 tool), per `tool.param`, in this process (the counted log line). */
+const unknownParamCounts = new Map<string, number>();
+/** At most this many `tool.param` keys in all, `tool.<other>` ones included: once full, a new name counts as its
+ *  tool's `<other>` if that key is already there, and is dropped from the count (still ignored and warned) if not. */
+const UNKNOWN_PARAM_KEYS_MAX = 256;
+
+/** Count one unknown name and log it: every one of the first 10 per name, then every 100th (the count says how many). */
+function countUnknownParam(tool: string, field: string, refused = false): void {
+  // Caller-chosen text: never let it forge a line or grow without bound.
+  const name = field.replace(/[^\w.-]/g, "?").slice(0, 64);
+  let key = `${tool}.${name}`;
+  if (!unknownParamCounts.has(key) && unknownParamCounts.size >= UNKNOWN_PARAM_KEYS_MAX - 1) key = `${tool}.<other>`;
+  if (!unknownParamCounts.has(key) && unknownParamCounts.size >= UNKNOWN_PARAM_KEYS_MAX) return;
+  const n = (unknownParamCounts.get(key) ?? 0) + 1;
+  unknownParamCounts.set(key, n);
+  if (n <= 10 || n % 100 === 0) console.error(`[mcp] unknown parameter ${refused ? "refused" : "ignored"}: ${key} (${n} since start)`);
 }
 
 /**
@@ -355,8 +466,41 @@ export function generateScopedMcpTools(
  * `tag_in_use_by_tokens` envelope (routes.ts's DELETE /tags/:name and
  * POST /tags/merge run the identical check).
  */
-function applyTagDependencyGuards(tools: McpToolDef[], vaultName: string): void {
+function applyTagDependencyGuards(tools: McpToolDef[], vaultName: string, scoped: boolean): void {
   const store = getVaultStore(vaultName);
+  // Scope gap 6: a rename, merge, delete or re-parent that changes what a live
+  // key, private_tags or the published tag reaches is refused unless the call
+  // passes `force: true`; the refusal names the keys (src/tag-change-guard.ts,
+  // the same check as the REST tag routes).
+  const guard = (name: string, change: (p: Record<string, any>) => TagChange | null) =>
+    wrapReadTool(tools, name, async (orig, params) => {
+      const p = (params ?? {}) as Record<string, any>;
+      const c = forceFlag(p.force) ? null : change(p);
+      const refusal = c && tagChangeRefusal(vaultName, store, c, { scoped });
+      if (refusal) throw Object.assign(new Error(String(refusal.message)), refusal);
+      return await orig(params);
+    });
+  guard("rename-tag", (p) => {
+    const from = p.old_name ?? p.from ?? p.tag;
+    const to = p.new_name ?? p.to;
+    return typeof from === "string" && typeof to === "string" ? { kind: "rename", from, to } : null;
+  });
+  guard("merge-tags", (p) =>
+    Array.isArray(p.sources) && typeof p.target === "string"
+      ? { kind: "merge", sources: p.sources.filter((x: unknown): x is string => typeof x === "string"), target: p.target }
+      : null);
+  guard("delete-tag", (p) => {
+    const tag = p.tag ?? p.name;
+    return typeof tag === "string" ? { kind: "delete", tag } : null;
+  });
+  guard("update-tag", (p) => {
+    const tag = typeof p.tag === "string" ? stripTagHash(p.tag) : null;
+    if (!tag || p.parent_names === undefined) return null;
+    const parents = Array.isArray(p.parent_names)
+      ? p.parent_names.filter((x: unknown): x is string => typeof x === "string" && x.length > 0).map(stripTagHash)
+      : [];
+    return parentsChange(store, tag, parents) ? { kind: "reparent", tag, parents } : null;
+  });
   wrapReadTool(tools, "delete-tag", async (orig, params) => {
     const tag = (params as any).tag ?? (params as any).name;
     if (typeof tag === "string") {
@@ -467,6 +611,11 @@ function applyTagScopeWrappers(
   // is the unscoped/holder-absent path; `filterHydratedLinksByTagScope` then
   // keys off `rawTags` (non-null here) for the actual scope check.
   const scrubNoteForScope = (n: any): any => {
+    // 0.9.2: a near_name warning on a new type names an existing type; keep it only when that type is in scope.
+    if (n && Array.isArray(n.warnings)) {
+      const allowed = allowedHolder?.value ?? null;
+      n.warnings = n.warnings.filter((w: any) => w?.code !== "near_name" || w?.kind !== "type" || (allowed !== null && allowed.has(w.nearest)));
+    }
     if (n && Array.isArray(n.links)) {
       n.links = filterHydratedLinksByTagScope(n.links, allowedHolder?.value ?? null, rawTags);
     }
@@ -543,7 +692,7 @@ function applyTagScopeWrappers(
    * excludes nothing — again exactly a nonexistent tag). Aliases mirror
    * core's `exclude_tags ?? excludeTags ?? exclude_tag` resolution order.
    */
-  const QUERY_TAG_PARAMS = ["tag", "exclude_tags", "excludeTags", "exclude_tag"] as const;
+  const QUERY_TAG_PARAMS = ["tag", "type", "exclude_tags", "excludeTags", "exclude_tag"] as const;
   const scopeQueryTagParams = (params: any, allowed: Set<string> | null): any => {
     if (!params || typeof params !== "object") return params;
     let next = params;
@@ -673,7 +822,9 @@ function applyTagScopeWrappers(
           .filter((n: any) => noteWithinTagScope(n, allowed, rawTags))
           .map(scrubNoteForScope),
         ...("next_cursor" in r ? { next_cursor: r.next_cursor } : {}),
-        // `warnings` intentionally DROPPED for a tag-scoped session: core's
+        // `scan` is kept: it names only the caller's own fields (0.9.2).
+        ...scopeSafeWarnings(r.warnings),
+        // Every other warning is intentionally DROPPED for a tag-scoped session: core's
         // `collectUnknownTagWarnings` (core/src/query-warnings.ts) resolves
         // `did_you_mean` against the FULL vault-wide tag catalog, which
         // would leak an out-of-scope tag's existence/name to a token that
@@ -789,13 +940,10 @@ function applyTagScopeWrappers(
     // resolved allowlist instead of filtering `orig`'s unscoped result.
     // vault#766: `scopedCountFilter` also drops notes hidden by a private
     // tag (deny wins) and zeroes everything for a fail-closed scope.
-    if (r.map) {
-      r.map = getVaultMap(store.db, scopedCountFilter(store, allowed));
-    }
-    if (r.stats) {
-      const statsScope = scopedStatsFilter(store, allowed);
-      if (statsScope) r.stats = getVaultStats(store.db, statsScope);
-    }
+    // T-419: stats count the same visible notes as map (one filter for both).
+    const countScope = r.map || r.stats ? scopedCountFilter(store, allowed) : undefined;
+    if (r.map) r.map = getVaultMap(store.db, countScope);
+    if (r.stats) r.stats = getVaultStats(store.db, countScope);
     return r;
   });
 
@@ -816,6 +964,12 @@ function applyTagScopeWrappers(
     scoped_tags: rawTags,
   });
 
+  // migrate (0.9.2) rewrites every record carrying the type, including ones
+  // outside the allowlist, and its plan lists them: vault-wide, refused.
+  wrapReadTool(tools, "migrate-field", async () => {
+    throw Object.assign(new Error("Forbidden: migrate changes every record of a type, beyond this pass's tags"), forbidden("migrate changes every record of the type, including ones outside the allowlist") as object);
+  });
+
   wrapReadTool(tools, "create-note", async (orig, params) => {
     const allowed = await getAllowed();
     if (!allowed) return await orig(params);
@@ -823,7 +977,9 @@ function applyTagScopeWrappers(
     const items = Array.isArray((params as any).notes)
       ? (params as any).notes
       : [params];
-    for (const item of items) {
+    for (const raw of items) {
+      // T-318 §8a: `types` are memberships too; check them with the tags.
+      const item = mergeTypesIntoTags(raw as Record<string, unknown>, "create");
       const itemTags = Array.isArray((item as any).tags) ? ((item as any).tags as string[]) : [];
       if (!tagsWithinScope(itemTags, allowed, rawTags)) {
         return forbidden("create-note: every note must carry at least one tag in the token's allowlist");
@@ -848,7 +1004,8 @@ function applyTagScopeWrappers(
     const items = Array.isArray((params as any).notes)
       ? (params as any).notes
       : [params];
-    for (const item of items) {
+    for (const raw of items) {
+      const item = mergeTypesIntoTags(raw as Record<string, unknown>, "update");
       const id = (item as any).id ?? (item as any).note_id;
       if (!id) continue;
       const existing = await store.getNote(id as string);
@@ -879,6 +1036,9 @@ function applyTagScopeWrappers(
         return { error: "Note not found", error_type: "not_found", id };
       }
     }
+    // `ids` (T-412) is left to core: delete-note resolves every entry among the notes this session can see
+    // (resolveVisibility) before deleting any, and with eraseHistory "visible" refuses an already-deleted id.
+    // contracts/suites/safety/forget.test.ts pins both for a tag-scoped pass.
     return await orig(params);
   });
 
@@ -889,8 +1049,28 @@ function applyTagScopeWrappers(
     if (typeof tag === "string" && !allowed.has(tag)) {
       return forbidden(`update-tag: tag "${tag}" is outside the token's allowlist`);
     }
+    // Scope gap 6: its parents too, or it could pour its notes into another key's reach.
+    const parents = (params as any).parent_names;
+    if (Array.isArray(parents) && parents.some((p) => typeof p !== "string" || !tagVisibleInScope(stripTagHash(p), allowed, rawTags))) {
+      return forbidden("update-tag: a parent in parent_names is outside the token's allowlist");
+    }
     try {
-      return await orig(params);
+      const result: any = await orig(params);
+      // 0.9.2 near_name warnings come from core's vault-wide name lists: keep a
+      // type warning only when the existing type is in scope, a field warning
+      // only when a type the caller may see declares the field.
+      if (result && typeof result === "object" && Array.isArray(result.warnings)) {
+        const kept = result.warnings
+          .map((w: any) =>
+            w?.code === "near_name" && w.kind === "field" && Array.isArray(w.declared_by)
+              ? { ...w, declared_by: w.declared_by.filter((t: string) => allowed.has(t)) }
+              : w)
+          .filter((w: any) =>
+            w?.code !== "near_name" || (w.kind === "type" ? allowed.has(w.nearest) : Array.isArray(w.declared_by) && w.declared_by.length > 0));
+        const { warnings: _w, ...rest } = result;
+        return kept.length > 0 ? { ...rest, warnings: kept } : rest;
+      }
+      return result;
     } catch (err: any) {
       // Tag-scope scrub for cross-tag field conflicts (vault#554
       // auth-and-scope fold). Core's validation scans EVERY tag's schema
@@ -1039,6 +1219,7 @@ function overrideVaultInfo(
     // containing the scope name) — see "tools/call of vault-info with
     // description arg and vault:read scope is refused" in src/vault.test.ts.
     // Changing that transport shape is out of scope for this wave.
+    // `help` is answered by the 0.9 surface (core mcp-surface.ts) before this runs.
     const config = readVaultConfig(vaultName);
     if (!config) throw new Error(`Vault "${vaultName}" not found`);
 
@@ -1053,6 +1234,14 @@ function overrideVaultInfo(
       if (!auth || !hasScopeForVault(auth.scopes, vaultName, "admin")) {
         throw new Error(
           `Forbidden: updating the vault description requires the 'vault:admin' scope (or 'vault:${vaultName}:admin'). Granted scopes: ${auth?.scopes.join(" ") || "(none)"}.`,
+        );
+      }
+      // T-419 (audit L3-01): the description is vault-wide (every AI
+      // connection's `initialize` carries it), so a tag-scoped admin session
+      // can't set it either. Same refusal as REST PATCH /api/vault.
+      if (auth.scoped_tags !== null) {
+        throw new Error(
+          `Forbidden: this token is restricted to tags: ${auth.scoped_tags.join(", ")}. The vault description is vault-wide and needs a token with no tag restriction.`,
         );
       }
       // vault#669: runtime type guard — the `as string` cast below was a
@@ -1094,7 +1283,7 @@ function overrideVaultInfo(
 
     const result: Record<string, unknown> = {
       name: config.name,
-      description: config.description ?? null,
+      description: servedDescription(config.name, config.description) ?? null,
       coordinates: {
         name: config.name,
         base_url: coords.hubOriginKnown ? `${coordBase}/vault/${config.name}` : null,
@@ -1190,14 +1379,13 @@ function resolveHubOrigin(): { url: string; source: string } {
  * matching the requested action. The MCP HTTP layer serializes the result
  * via `JSON.stringify`, so caller-side parsing keys off the action field.
  */
-function buildManageTokenTool(
-  vaultName: string,
-  auth: AuthResult | undefined,
-  callerBearer: string | null,
-): McpToolDef {
+/**
+ * manage-token's full reference (the long text agents saw before 0.9's
+ * description budget), for `vault-info { help: "manage-token" }`.
+ */
+export function manageTokenReference(vaultName: string): { name: string; description: string; inputSchema: Record<string, unknown> } {
   return {
     name: "manage-token",
-    requiredVerb: "admin",
     description:
       "Mint, revoke, or list short-TTL hub JWTs within this MCP session. " +
       "Designed for one-shot AI-driven workflows: mint a narrow token, run a " +
@@ -1211,9 +1399,9 @@ function buildManageTokenTool(
       "`long_lived: true` raises the mint TTL cap to 90 days; a 90-day token is a " +
       "standing credential and meaningfully increases blast radius if leaked/misused.\n\n" +
       "Actions (discriminator: `action`):\n" +
-      "- `mint` — { scope: string|string[], ttl_seconds?: number, long_lived?: boolean, description?: string } → { action: \"mint\", token, jti, expires_at, scopes, scoped_tags, vault_name } (vault#555: scopes/scoped_tags/vault_name were previously undocumented here)\n" +
-      "- `revoke` — { jti: string } → { action: \"revoke\", ok: boolean, already_revoked?: boolean } — idempotent; a jti not in this session's ledger, or already revoked, still returns ok:true. A genuine failure additionally carries error/message (and, for a hub-side rejection, hub_status).\n" +
-      "- `list` — (no inputs) → { action: \"list\", tokens: [...] }",
+      "- `mint` — { scope: string|string[], ttl_seconds?: number, long_lived?: boolean, name?: string, description?: string } → { action: \"mint\", token, jti, expires_at, scopes, scoped_tags, vault_name, name? } (vault#555: scopes/scoped_tags/vault_name were previously undocumented here)\n" +
+      "- `revoke` — { name: string } or { jti: string } → { action: \"revoke\", ok: boolean, already_revoked?: boolean } — idempotent; a jti not in this session's ledger, or already revoked, still returns ok:true. A genuine failure additionally carries error/message (and, for a hub-side rejection, hub_status).\n" +
+      "- `list` — (no inputs) → { action: \"list\", tokens: [{ name, jti, scopes, expires_at, revoked_at, … }] }",
     inputSchema: {
       type: "object",
       properties: {
@@ -1242,10 +1430,42 @@ function buildManageTokenTool(
           type: "string",
           description: "(action=mint, optional) Free-text label surfaced in the token list + audit trail.",
         },
+        name: {
+          type: "string",
+          description: "(action=mint, optional) The key's name: its writes are stamped `via key:<name>`, and revoke takes the name. Letters, digits, '.', '_', '-'; one key per name, forever.",
+        },
         jti: {
           type: "string",
           description: "(action=revoke) The jti (e.g. `t_abc123…`) returned by a prior mint. Revoke is idempotent — second revoke also returns ok=true.",
         },
+      },
+      required: ["action"],
+    },
+  };
+}
+
+function buildManageTokenTool(
+  vaultName: string,
+  auth: AuthResult | undefined,
+  callerBearer: string | null,
+): McpToolDef {
+  return {
+    name: "manage-token",
+    requiredVerb: "admin",
+    description:
+      "Mint, list or revoke short-lived keys for this vault. mint: `scope` (e.g. \"vault:" + vaultName + ":read\"), " +
+      "`ttl_seconds` (default 900, max 3600, or 90 days with `long_lived: true`), `name`, `description`. revoke: `name` or `jti`. " +
+      "Minted keys can't exceed yours. Every parameter: vault-info {help: \"manage-token\"}.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["mint", "revoke", "list"] },
+        scope: { oneOf: [{ type: "string" }, { type: "array", items: { type: "string" } }] },
+        ttl_seconds: { type: "number" },
+        long_lived: { type: "boolean" },
+        description: { type: "string" },
+        name: { type: "string" },
+        jti: { type: "string" },
       },
       required: ["action"],
     },
@@ -1343,6 +1563,16 @@ async function mintAction(
     };
   }
 
+  // The backup key reads the whole vault's export, which a tag-scoped caller may not see whole: refuse to mint it
+  // for one (and the vault refuses a token that carries both, see authenticateVaultRequest).
+  if (auth.scoped_tags && requested.some((s) => s === "vault:export" || /^vault:[^:]+:export$/.test(s))) {
+    return {
+      action: "mint",
+      error: "forbidden",
+      message: "manage-keys mint: the export scope reads the whole vault, so a tag-scoped session can't mint it. Mint it from an unscoped admin session.",
+    };
+  }
+
   // Forwardability: minting is a proxy to hub's attenuation endpoint, so the
   // caller must present a forwardable hub-JWT bearer carrying
   // `vault:<name>:admin`. A non-JWT credential (the VAULT_AUTH_TOKEN env-var
@@ -1405,7 +1635,13 @@ async function mintAction(
   const description = typeof params.description === "string" && params.description.length > 0
     ? params.description
     : null;
-  const label = description ?? `mcp-mint (parent=${auth.caller_jti ?? "unknown"})`;
+  // Keys by name (ROADMAP 0.9.1): `name` names the key; its writes say `via key:<name>`, and list and revoke find it
+  // by that name. The hub refuses a taken name, and a name from a session that is itself a named key.
+  const name = params.name;
+  if (name !== undefined && (typeof name !== "string" || !KEY_NAME_RE.test(name))) {
+    return { action: "mint", error: "invalid_name", message: "manage-keys mint: `name` is letters, digits, '.', '_' and '-', up to 80, starting with a letter or digit." };
+  }
+  const label = (name as string | undefined) ?? description ?? `mcp-mint (parent=${auth.caller_jti ?? "unknown"})`;
 
   // Resolve hub origin (PARACHUTE_HUB_ORIGIN → expose-state FQDN → loopback).
   const hub = resolveHubOrigin();
@@ -1427,6 +1663,7 @@ async function mintAction(
     scope: narrowedScopes.join(" "),
     expiresInSeconds: ttl,
     ...(permissions !== undefined ? { permissions } : {}),
+    ...(typeof name === "string" ? { name } : {}),
   });
 
   if ("kind" in minted) {
@@ -1473,6 +1710,7 @@ async function mintAction(
     scopes: narrowedScopes,
     scoped_tags: auth.scoped_tags,
     vault_name: vaultName,
+    ...(typeof name === "string" ? { name } : {}),
   };
 }
 
@@ -1482,15 +1720,19 @@ async function revokeAction(
   auth: AuthResult,
   callerBearer: string | null,
 ): Promise<Record<string, unknown>> {
-  if (typeof params.jti !== "string" || params.jti.length === 0) {
+  if (params.name !== undefined && params.jti !== undefined) {
+    return { action: "revoke", ok: false, error: "invalid_request", message: "manage-keys revoke: give `name` or `jti`, not both." };
+  }
+  const byName = typeof params.name === "string" && params.name.length > 0;
+  if (!byName && (typeof params.jti !== "string" || params.jti.length === 0)) {
     return {
       action: "revoke",
       ok: false,
       error: "invalid_request",
-      message: "manage-token revoke: `jti` is required (string).",
+      message: "manage-keys revoke: name the key (`name`, as minted) or give its `jti`.",
     };
   }
-  const jti = params.jti;
+  let jti = byName ? "" : (params.jti as string);
 
   // Session-pin: revoke is restricted to hub JWTs THIS MCP session minted.
   // When auth.caller_jti is null (no stable session id — env-var operator,
@@ -1506,6 +1748,17 @@ async function revokeAction(
   }
 
   const store = getVaultStore(vaultName);
+  if (byName) {
+    const matches = listMcpMintedHubJwts(store.db, auth.caller_jti, vaultName).filter((t) => t.label === params.name);
+    if (matches.length > 1) {
+      return { action: "revoke", ok: false, error: "ambiguous", message: `manage-keys revoke: ${matches.length} of this session's keys are labelled "${String(params.name)}"; give the \`jti\` (list shows each).` };
+    }
+    const named = matches[0];
+    if (!named) {
+      return { action: "revoke", ok: false, error: "not_found", message: `manage-keys revoke: this session minted no key called "${String(params.name)}" (list shows the names).` };
+    }
+    jti = named.jti;
+  }
   const entry = findMcpMintLedgerEntry(store.db, jti, auth.caller_jti, vaultName);
   if (!entry) {
     // Idempotency: not-in-this-session's-ledger returns ok=true so the AI's
@@ -1579,6 +1832,15 @@ function listAction(vaultName: string, auth: AuthResult): Record<string, unknown
   // Read from the hub-JWT mint ledger (vault#403, MGT) — mints now live in
   // hub's registry, not the pvt_* tokens table; the ledger is the local
   // session-attribution index.
-  const tokens = listMcpMintedHubJwts(store.db, auth.caller_jti, vaultName);
+  // Each key by its name (the `name` it was minted with, else its description), which revoke also takes.
+  const tokens = listMcpMintedHubJwts(store.db, auth.caller_jti, vaultName).map((t) => ({ name: t.label, ...t }));
   return { action: "list", tokens };
+}
+
+/** The warnings a tag-scoped session may see: those that carry no tag or record information (`scan`, and how a hybrid search ran). */
+function scopeSafeWarnings(warnings: unknown): { warnings?: unknown[] } {
+  if (!Array.isArray(warnings)) return {};
+  // `search_auto` and `semantic_unavailable` (hybrid search) say how the search ran, not what is in the vault.
+  const kept = warnings.filter((w) => ["scan", "search_auto", "semantic_unavailable"].includes((w as { code?: unknown } | null)?.code as string));
+  return kept.length > 0 ? { warnings: kept } : {};
 }

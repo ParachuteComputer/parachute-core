@@ -72,7 +72,8 @@ export function riskForExplanation(e: ScopeExplanation): "low" | "elevated" | "h
 
 export const SCOPE_EXPLANATIONS: Record<string, ScopeExplanation> = {
   "vault:read": {
-    label: "Read your notes, tags, attachments, and vault config.",
+    // 0.9.1 (SPEC §3.4): say plainly that a vault grant reaches the whole vault at its level.
+    label: "Read the whole vault: every note, tag and attachment, and its settings.",
     level: "read",
   },
   "vault:write": {
@@ -82,7 +83,8 @@ export const SCOPE_EXPLANATIONS: Record<string, ScopeExplanation> = {
     // structure vs content, the same line that keeps create/update/delete-note
     // at write. A user reading the old label approved write expecting to manage
     // their taxonomy and then hit refusals the consent screen never warned of.
-    label: "Create, edit, and delete notes and attachments, and apply existing tags to them.",
+    // Write reads too (scope-guard's admin ⊇ write ⊇ read): the label says so, never less than the grant can do.
+    label: "Read the whole vault. Create, edit, and delete notes and attachments, and apply existing tags to them.",
     level: "write",
   },
   "vault:admin": {
@@ -92,6 +94,13 @@ export const SCOPE_EXPLANATIONS: Record<string, ScopeExplanation> = {
     label:
       "Read and write everything, plus: manage the tag schema (create, rename, merge, and delete tag definitions), config & settings, triggers & automation, GitHub backup, and minting access tokens.",
     level: "admin",
+  },
+  "vault:export": {
+    // 0.9.3 "the exit": the backup key. It reads nothing on its own: vault auth lets it into GET /api/export and
+    // refuses it everywhere else (a route, MCP, files, the vault's page). It does hold the whole vault's content,
+    // as that download, so it is shown at the same weight as read.
+    label: "Download a full export of the vault (every note, tag and attachment, as one file) for a backup, and nothing else: it can't browse, search, change or delete anything.",
+    level: "read",
   },
   // Optional-module scopes (scribe / surface). These are in
   // FIRST_PARTY_SCOPES (= Object.keys(this map)) but the modules may not be
@@ -269,6 +278,9 @@ export const NON_REQUESTABLE_SCOPES: ReadonlySet<string> = new Set([
   // Service-admin scopes: operator-only, never requestable via /oauth/authorize.
   "hub:admin",
   "scribe:admin",
+  // The unnamed backup scope: a vault never accepts it on a hub token (it wants `vault:<name>:export`), so it is not
+  // asked for at /oauth/authorize. The named form is requestable, like a named admin.
+  "vault:export",
   // NOTE: the `account:self:*` scopes used to be listed here — cookie-minted
   // only, never OAuth-requestable — on the reasoning that a third-party app
   // must not be able to consent its way to account authority.
@@ -336,7 +348,7 @@ const VAULT_ADMIN_RE = /^vault:[a-zA-Z0-9_-]+:admin$/;
  * mint-token capability-attenuation model to recognise the scopes a
  * `vault:<name>:admin` bearer may attenuate to (same-vault subsets).
  */
-const VAULT_SCOPED_RE = /^vault:([a-zA-Z0-9_-]+):(read|write|admin)$/;
+const VAULT_SCOPED_RE = /^vault:([a-zA-Z0-9_-]+):(read|write|admin|export)$/;
 
 /**
  * True when `scope` is a per-vault admin scope (`vault:<name>:admin`).
@@ -457,7 +469,7 @@ export function isRequestableScope(scope: string): boolean {
  * `admin`, the consent screen would lose its admin explanation and the
  * risk-based guard would no longer have the intended classification.
  */
-const VAULT_VERB_RE = /^vault:[a-zA-Z0-9_*-]+:(read|write|admin)$/;
+const VAULT_VERB_RE = /^vault:[a-zA-Z0-9_*-]+:(read|write|admin|export)$/;
 
 /**
  * Named per-surface scopes (`surface:<name>:<verb>` for verb ∈ {read, write}) —
@@ -475,7 +487,7 @@ export function explainScope(scope: string): ScopeExplanation | null {
   const direct = SCOPE_EXPLANATIONS[scope];
   if (direct) return direct;
   if (VAULT_VERB_RE.test(scope)) {
-    const verb = scope.split(":")[2] as "read" | "write" | "admin";
+    const verb = scope.split(":")[2] as "read" | "write" | "admin" | "export";
     return SCOPE_EXPLANATIONS[`vault:${verb}`] ?? null;
   }
   if (SURFACE_VERB_RE.test(scope)) {

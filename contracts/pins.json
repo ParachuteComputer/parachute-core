@@ -11,5 +11,10 @@
   "prism": {
     "repo": "https://github.com/omniharmonic/prism.git",
     "commit": "55ac3df"
+  },
+  "previous_core": {
+    "comment": "The release before this one, built as a candidate for lifecycle/upgrade: the 0.8 -> 0.9 step and its rollback. It is the 0.8 that 0.9 upgrades from, so it moves with 0.8's own line (next until 0.8.0 final, then that release): 0.8.0-pre.1 predated T-412's fast path and so hid the kind bug (audit L2-01).",
+    "version": "next f34b083 (unreleased: 0.8.0-pre.3 plus #47, #48)",
+    "commit": "f34b083c95e07c684c9cafec7a117968f57fdd34"
   }
 }

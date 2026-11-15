@@ -23,6 +23,8 @@ import {
 import {
   REFRESH_GRACE_MS,
   findTokenRowByJti,
+  linkRotation,
+  revokeFamily,
   signRefreshToken,
   validateAccessToken,
 } from "../jwt-sign.ts";
@@ -4867,7 +4869,7 @@ describe("refresh-token rotation + /oauth/revoke (#73)", () => {
         // Inject a SECOND live refresh row into the same family — simulating a
         // family that has already forked into multiple live lineages (an
         // already-compromised state). Now live count != 1, so `tip` is null.
-        signRefreshToken(db, {
+        signRefreshToken(db, { artifactGeneration: () => 0,
           jti: "injected-fork-jti",
           userId: user.id,
           clientId: reg.client.clientId,
@@ -9850,7 +9852,7 @@ describe("RFC 8707 resource binding — vault-bound MCP (fix #461)", () => {
       approveClient(db, reg.client.clientId);
       const deps = { ...RESOURCE_DEPS, knownIssuers: () => ["https://old.example"] };
       const audienceFor = async (resource: string): Promise<unknown> => {
-        const minted = signRefreshToken(db, {
+        const minted = signRefreshToken(db, { artifactGeneration: () => 0,
           jti: `jti-${randomBytes(6).toString("hex")}`,
           userId: user.id,
           clientId: reg.client.clientId,
@@ -12069,6 +12071,636 @@ describe("retired verb selector form field", () => {
       const code = new URL(res.headers.get("location") ?? "").searchParams.get("code");
       const scope = await redeemScope(db, code ?? "", reg.client.clientId, verifier);
       expect(scope).toBe("vault:work:read");
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// Consent per vault (0.9.1 "one multi-vault door", T-446). An app that asks
+// for the account door (`account:vaults`) gets each vault at the level the
+// person chose (none / read / write), capped by what the person holds there.
+// The door contract (contracts/suites/door/multivault.test.ts) holds the
+// owner's flow end to end; these hold the page and a friend's forged posts.
+// ───────────────────────────────────────────────────────────────────────────
+describe("account-door consent per vault (T-446)", () => {
+  const TTL_S = Math.floor(SESSION_TTL_MS / 1000);
+  const MANIFEST: ServicesManifest = {
+    services: [
+      {
+        name: "parachute-vault",
+        port: 1940,
+        paths: ["/vault/work", "/vault/other", "/vault/third"],
+        health: "/health",
+        version: "0.7.0",
+      },
+    ],
+  };
+  const deps = { issuer: ISSUER, loadServicesManifest: () => MANIFEST, hubBoundOrigins: () => [ISSUER] };
+  const cookie = (sessionId: string) => `${CSRF_COOKIE}; ${buildSessionCookie(sessionId, TTL_S)}`;
+  const base = (clientId: string, challenge: string) => ({
+    client_id: clientId,
+    redirect_uri: "https://app.example/cb",
+    response_type: "code",
+    scope: "account:vaults",
+    code_challenge: challenge,
+    code_challenge_method: "S256",
+  });
+  const get = (db: Awaited<ReturnType<typeof makeDb>>["db"], sessionId: string, clientId: string, challenge: string) =>
+    handleAuthorizeGet(db, new Request(authorizeUrl(base(clientId, challenge)), { headers: { cookie: cookie(sessionId) } }), deps);
+  const post = (db: Awaited<ReturnType<typeof makeDb>>["db"], sessionId: string, clientId: string, challenge: string, fields: [string, string][], scope?: string) => {
+    const form = new URLSearchParams({ __action: "consent", __csrf: TEST_CSRF, approve: "yes", ...base(clientId, challenge), ...(scope ? { scope } : {}) });
+    for (const [k, v] of fields) form.append(k, v);
+    return handleAuthorizePost(
+      db,
+      new Request(`${ISSUER}/oauth/authorize`, { method: "POST", body: form, headers: { "content-type": "application/x-www-form-urlencoded", cookie: cookie(sessionId) } }),
+      deps,
+    );
+  };
+  async function redeem(db: Awaited<ReturnType<typeof makeDb>>["db"], location: string, clientId: string, verifier: string): Promise<string> {
+    const code = new URL(location).searchParams.get("code");
+    expect(code, location).toBeString();
+    const res = await handleToken(
+      db,
+      new Request(`${ISSUER}/oauth/token`, {
+        method: "POST",
+        body: new URLSearchParams({ grant_type: "authorization_code", code: code!, client_id: clientId, redirect_uri: "https://app.example/cb", code_verifier: verifier }),
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+      }),
+      deps,
+    );
+    expect(res.status).toBe(200);
+    return ((await res.json()) as { scope: string }).scope;
+  }
+  async function friendOnWorkReadOtherWrite(db: Awaited<ReturnType<typeof makeDb>>["db"]) {
+    await createUser(db, "owner", "pw");
+    const friend = await createUser(db, "friend", "pw", { allowMulti: true });
+    setUserVaults(db, friend.id, ["other"]); // role=write
+    db.prepare("INSERT INTO user_vaults (user_id, vault_name, role, created_at) VALUES (?, 'work', 'read', ?)").run(friend.id, new Date().toISOString());
+    return createSession(db, { userId: friend.id });
+  }
+
+  test("the page lists each vault the person reaches, None / Read / Write, Write only where they hold it", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const session = await friendOnWorkReadOtherWrite(db);
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"], status: "approved" });
+      const res = get(db, session.id, reg.client.clientId, makePkce().challenge);
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain('<input type="hidden" name="account_vault_levels" value="1" />');
+      const row = (v: string) => html.slice(html.indexOf(`data-vault="${v}"`), html.indexOf("</div>", html.indexOf(`data-vault="${v}"`)));
+      expect(row("work")).toContain('name="vault_level:work" value="none"');
+      expect(row("work")).toContain('name="vault_level:work" value="read" checked');
+      expect(row("work")).toContain('name="vault_level:work" value="write" disabled');
+      expect(row("other")).toContain('name="vault_level:other" value="write" />');
+      expect(html).not.toContain('data-vault="third"');
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("SECURITY: a friend's forged post (write where they hold read, an unassigned vault, a name with a colon) mints nothing", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const session = await friendOnWorkReadOtherWrite(db);
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"], status: "approved" });
+      for (const fields of [
+        [["vault_level:work", "write"]],
+        [["vault_level:third", "read"]],
+        [["vault_level:work:write", "read"]],
+        [["vault_level:other", "admin"]],
+        [["vault_level:other", "read"], ["vault_level:other", "write"]],
+      ] as [string, string][][]) {
+        const res = await post(db, session.id, reg.client.clientId, makePkce().challenge, [["account_vault_levels", "1"], ...fields]);
+        expect(res.status, JSON.stringify(fields)).toBe(400);
+        expect(await res.text()).toContain("vault_scope_mismatch");
+      }
+      const codes = db.query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM auth_codes WHERE client_id = ?").get(reg.client.clientId);
+      expect(codes?.n ?? 0).toBe(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("the friend's choice is minted as chosen, and the app's next ask gets the same levels without the page", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const session = await friendOnWorkReadOtherWrite(db);
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"], status: "approved" });
+      const first = makePkce();
+      const res = await post(db, session.id, reg.client.clientId, first.challenge, [
+        ["account_vault_levels", "1"],
+        ["vault_level:work", "read"],
+        ["vault_level:other", "write"],
+      ]);
+      expect(res.status).toBe(302);
+      const want = "account:self:vaults:other:write account:self:vaults:work:read";
+      expect((await redeem(db, res.headers.get("location")!, reg.client.clientId, first.verifier)).split(" ").sort().join(" ")).toBe(want);
+      const again = makePkce();
+      const skipped = get(db, session.id, reg.client.clientId, again.challenge);
+      expect(skipped.status).toBe(302);
+      expect((await redeem(db, skipped.headers.get("location")!, reg.client.clientId, again.verifier)).split(" ").sort().join(" ")).toBe(want);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("SECURITY: the app can't choose a level itself: a per-vault scope in its ask, extra_scope or granted_scope is dropped", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const session = await friendOnWorkReadOtherWrite(db);
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"], status: "approved" });
+      const asked = handleAuthorizeGet(
+        db,
+        new Request(authorizeUrl({ ...base(reg.client.clientId, makePkce().challenge), scope: "account:vaults account:self:vaults:other:write" }), { headers: { cookie: cookie(session.id) } }),
+        deps,
+      );
+      // Asked for: dropped from the page (no raw row for it), so the person's choice is the only level.
+      expect(asked.status).toBe(200);
+      expect(await asked.text()).not.toContain("account:self:vaults:other:write");
+      for (const field of ["extra_scope", "granted_scope", "scope"]) {
+        const pk = makePkce();
+        const res = await post(db, session.id, reg.client.clientId, pk.challenge, [
+          ["account_vault_levels", "1"],
+          ["vault_level:work", "read"],
+          ...(field === "scope" ? [] : ([[field, "account:self:vaults:other:write"]] as [string, string][])),
+          ...(field === "granted_scope" ? ([["granted_scope", "account:vaults"]] as [string, string][]) : []),
+        ], field === "scope" ? "account:vaults account:self:vaults:other:write" : undefined);
+        // Each is dropped: the token is the person's choice and nothing else.
+        expect(res.status, field).toBe(302);
+        expect(await redeem(db, res.headers.get("location")!, reg.client.clientId, pk.verifier), field).toBe("account:self:vaults:work:read");
+      }
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("a role lowered from write to read narrows the replayed grant to read, not dropping the vault, and records it so", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const session = await friendOnWorkReadOtherWrite(db);
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"], status: "approved" });
+      const first = makePkce();
+      const res = await post(db, session.id, reg.client.clientId, first.challenge, [["account_vault_levels", "1"], ["vault_level:other", "write"]]);
+      expect(await redeem(db, res.headers.get("location")!, reg.client.clientId, first.verifier)).toBe("account:self:vaults:other:write");
+      db.prepare("UPDATE user_vaults SET role = 'read' WHERE vault_name = 'other'").run();
+      const again = makePkce();
+      const skipped = get(db, session.id, reg.client.clientId, again.challenge);
+      expect(skipped.status).toBe(302);
+      expect(await redeem(db, skipped.headers.get("location")!, reg.client.clientId, again.verifier)).toBe("account:self:vaults:other:read");
+      // ...and recorded so: raising the role again doesn't silently bring write back.
+      expect(findGrant(db, getUserById(db, findSession(db, session.id)!.userId)!.id, reg.client.clientId)!.scopes).toEqual(["account:self:vaults:other:read"]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("SECURITY: a later, narrower choice replaces the earlier one: the next skip-consent doesn't bring the old levels back", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const session = await friendOnWorkReadOtherWrite(db);
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"], status: "approved" });
+      const first = makePkce();
+      const wide = await post(db, session.id, reg.client.clientId, first.challenge, [["account_vault_levels", "1"], ["vault_level:work", "read"], ["vault_level:other", "write"]]);
+      expect(wide.status).toBe(302);
+      // The app asks for something the grant doesn't cover, so the page shows again, and the friend narrows.
+      const second = makePkce();
+      const narrow = await post(db, session.id, reg.client.clientId, second.challenge, [["account_vault_levels", "1"], ["vault_level:work", "none"], ["vault_level:other", "read"]], "account:vaults account:self:read");
+      expect(narrow.status).toBe(302);
+      expect(await redeem(db, narrow.headers.get("location")!, reg.client.clientId, second.verifier)).toBe("account:self:vaults:other:read");
+      // Next plain ask skips the page: only the narrower choice.
+      const third = makePkce();
+      const skipped = get(db, session.id, reg.client.clientId, third.challenge);
+      expect(skipped.status).toBe(302);
+      expect(await redeem(db, skipped.headers.get("location")!, reg.client.clientId, third.verifier)).toBe("account:self:vaults:other:read");
+    } finally {
+      cleanup();
+    }
+  });
+
+  async function redeemWithRefresh(db: Awaited<ReturnType<typeof makeDb>>["db"], location: string, clientId: string, verifier: string) {
+    const code = new URL(location).searchParams.get("code");
+    expect(code, location).toBeString();
+    const res = await handleToken(
+      db,
+      new Request(`${ISSUER}/oauth/token`, {
+        method: "POST",
+        body: new URLSearchParams({ grant_type: "authorization_code", code: code!, client_id: clientId, redirect_uri: "https://app.example/cb", code_verifier: verifier }),
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+      }),
+      deps,
+    );
+    expect(res.status).toBe(200);
+    return (await res.json()) as { scope: string; refresh_token: string };
+  }
+  const refresh = (db: Awaited<ReturnType<typeof makeDb>>["db"], clientId: string, refreshToken: string) =>
+    handleToken(
+      db,
+      new Request(`${ISSUER}/oauth/token`, {
+        method: "POST",
+        body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: refreshToken, client_id: clientId }),
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+      }),
+      deps,
+    );
+
+  test("SECURITY: a narrower choice ends the earlier consent's refresh tokens; an equal choice leaves them", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const session = await friendOnWorkReadOtherWrite(db);
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"], status: "approved" });
+      const wideLevels: [string, string][] = [["account_vault_levels", "1"], ["vault_level:work", "read"], ["vault_level:other", "write"]];
+      const first = makePkce();
+      const wide = await post(db, session.id, reg.client.clientId, first.challenge, wideLevels);
+      const wideTokens = await redeemWithRefresh(db, wide.headers.get("location")!, reg.client.clientId, first.verifier);
+      // The same choice again doesn't end the earlier tokens.
+      const same = makePkce();
+      const again = await post(db, session.id, reg.client.clientId, same.challenge, wideLevels, "account:vaults account:self:read");
+      await redeemWithRefresh(db, again.headers.get("location")!, reg.client.clientId, same.verifier);
+      const stillWide = await refresh(db, reg.client.clientId, wideTokens.refresh_token);
+      expect(stillWide.status).toBe(200);
+      const rotated = (await stillWide.json()) as { refresh_token: string };
+      // The friend narrows: other to read, work to none.
+      const second = makePkce();
+      const narrow = await post(db, session.id, reg.client.clientId, second.challenge, [["account_vault_levels", "1"], ["vault_level:work", "none"], ["vault_level:other", "read"]], "account:vaults account:self:read");
+      const narrowTokens = await redeemWithRefresh(db, narrow.headers.get("location")!, reg.client.clientId, second.verifier);
+      expect(narrowTokens.scope).toBe("account:self:vaults:other:read");
+      // The earlier consent's refresh token no longer mints the old levels.
+      const stale = await refresh(db, reg.client.clientId, rotated.refresh_token);
+      expect(stale.status, await stale.clone().text()).toBe(400);
+      // The new consent's refresh token still works, at the new level.
+      const fresh = await refresh(db, reg.client.clientId, narrowTokens.refresh_token);
+      expect(fresh.status).toBe(200);
+      expect(((await fresh.json()) as { scope: string }).scope).toBe("account:self:vaults:other:read");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("a narrower choice keeps the refresh tokens and codes it still covers working (they move to the new generation)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const session = await friendOnWorkReadOtherWrite(db);
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"], status: "approved" });
+      const clientId = reg.client.clientId;
+      // An app holds other:read; later the friend widens (work too), then narrows back, dropping work.
+      const a = makePkce();
+      const first = await post(db, session.id, clientId, a.challenge, [["account_vault_levels", "1"], ["vault_level:other", "read"]]);
+      const kept = await redeemWithRefresh(db, first.headers.get("location")!, clientId, a.verifier);
+      const b = makePkce();
+      const widen = await post(db, session.id, clientId, b.challenge, [["account_vault_levels", "1"], ["vault_level:work", "read"], ["vault_level:other", "read"]], "account:vaults account:self:read");
+      await redeemWithRefresh(db, widen.headers.get("location")!, clientId, b.verifier);
+      // A code for other:read, issued before the narrowing and not yet redeemed.
+      const c = makePkce();
+      const pending = await post(db, session.id, clientId, c.challenge, [["account_vault_levels", "1"], ["vault_level:other", "read"]]);
+      const narrow = await post(db, session.id, clientId, makePkce().challenge, [["account_vault_levels", "1"], ["vault_level:work", "none"], ["vault_level:other", "read"]], "account:vaults account:self:read");
+      expect(narrow.status).toBe(302);
+      // The narrowing bumped the generation (the work:read family is the wider one)...
+      expect(db.query<{ generation: number }, [string]>("SELECT generation FROM grant_generations WHERE client_id = ?").get(clientId)?.generation).toBeGreaterThan(0);
+      // ...and the other:read family and code it covers still mint.
+      const r = await refresh(db, clientId, kept.refresh_token);
+      expect(r.status, await r.clone().text()).toBe(200);
+      expect(((await r.json()) as { scope: string }).scope).toBe("account:self:vaults:other:read");
+      expect(await redeem(db, pending.headers.get("location")!, clientId, c.verifier)).toBe("account:self:vaults:other:read");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("SECURITY: every vault at none drops the stored choice and ends its refresh tokens: the next ask shows the page", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const session = await friendOnWorkReadOtherWrite(db);
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"], status: "approved" });
+      const first = makePkce();
+      const res = await post(db, session.id, reg.client.clientId, first.challenge, [["account_vault_levels", "1"], ["vault_level:other", "read"]]);
+      const tokens = await redeemWithRefresh(db, res.headers.get("location")!, reg.client.clientId, first.verifier);
+      expect(tokens.scope).toBe("account:self:vaults:other:read");
+      const none = await post(db, session.id, reg.client.clientId, makePkce().challenge, [["account_vault_levels", "1"], ["vault_level:work", "none"], ["vault_level:other", "none"]], "account:vaults account:self:read");
+      expect(none.status).toBe(302);
+      expect(new URL(none.headers.get("location")!).searchParams.get("error")).toBe("access_denied");
+      // The next plain ask doesn't skip the page with the old level.
+      const next = get(db, session.id, reg.client.clientId, makePkce().challenge);
+      expect(next.status, next.headers.get("location") ?? "").toBe(200);
+      // And the earlier refresh token is over.
+      const stale = await refresh(db, reg.client.clientId, tokens.refresh_token);
+      expect(stale.status).toBe(400);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("SECURITY: a refresh in flight when a narrower choice ends its family gets 400 and leaves no live row", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const session = await friendOnWorkReadOtherWrite(db);
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"], status: "approved" });
+      const first = makePkce();
+      const wide = await post(db, session.id, reg.client.clientId, first.challenge, [["account_vault_levels", "1"], ["vault_level:work", "read"], ["vault_level:other", "write"]]);
+      const tokens = await redeemWithRefresh(db, wide.headers.get("location")!, reg.client.clientId, first.verifier);
+      const familyId = db.query<{ family_id: string }, []>("SELECT family_id FROM tokens WHERE refresh_token_hash IS NOT NULL AND revoked_at IS NULL").get()!.family_id;
+      // The refresh reads its row, then asks the clock (first while signing): the narrower consent lands right there.
+      let landed = false;
+      const res = await handleToken(
+        db,
+        new Request(`${ISSUER}/oauth/token`, {
+          method: "POST",
+          body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: tokens.refresh_token, client_id: reg.client.clientId }),
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+        }),
+        {
+          ...deps,
+          now: () => {
+            const t = new Date();
+            if (!landed) {
+              landed = true;
+              revokeFamily(db, familyId, t); // what the narrower consent does to this family
+            }
+            return t;
+          },
+        },
+      );
+      expect(landed).toBe(true);
+      expect(res.status, await res.clone().text()).toBe(400);
+      const live = db
+        .query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM tokens WHERE family_id = ? AND revoked_at IS NULL")
+        .get(familyId);
+      expect(live?.n).toBe(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("SECURITY: an unredeemed code from the wider consent doesn't redeem after a narrower one (or all-none)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const session = await friendOnWorkReadOtherWrite(db);
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"], status: "approved" });
+      const wideLevels: [string, string][] = [["account_vault_levels", "1"], ["vault_level:work", "read"], ["vault_level:other", "write"]];
+      const codeOf = (res: Response) => new URL(res.headers.get("location")!).searchParams.get("code")!;
+      const redeemCode = (code: string, verifier: string) =>
+        handleToken(
+          db,
+          new Request(`${ISSUER}/oauth/token`, {
+            method: "POST",
+            body: new URLSearchParams({ grant_type: "authorization_code", code, client_id: reg.client.clientId, redirect_uri: "https://app.example/cb", code_verifier: verifier }),
+            headers: { "content-type": "application/x-www-form-urlencoded" },
+          }),
+          deps,
+        );
+      // An equal choice leaves the earlier code redeemable.
+      const a0 = makePkce();
+      const codeA0 = codeOf(await post(db, session.id, reg.client.clientId, a0.challenge, wideLevels));
+      await post(db, session.id, reg.client.clientId, makePkce().challenge, wideLevels, "account:vaults account:self:read");
+      expect((await redeemCode(codeA0, a0.verifier)).status).toBe(200);
+      // A narrower choice: the wide code A, still unredeemed, is refused.
+      const a = makePkce();
+      const codeA = codeOf(await post(db, session.id, reg.client.clientId, a.challenge, wideLevels));
+      const b = makePkce();
+      const narrow = await post(db, session.id, reg.client.clientId, b.challenge, [["account_vault_levels", "1"], ["vault_level:other", "read"]], "account:vaults account:self:read");
+      const stale = await redeemCode(codeA, a.verifier);
+      expect(stale.status, await stale.clone().text()).toBe(400);
+      expect(await redeem(db, narrow.headers.get("location")!, reg.client.clientId, b.verifier)).toBe("account:self:vaults:other:read");
+      // All-none: an unredeemed code from before is refused too.
+      const c = makePkce();
+      const codeC = codeOf(await post(db, session.id, reg.client.clientId, c.challenge, [["account_vault_levels", "1"], ["vault_level:other", "read"]]));
+      await post(db, session.id, reg.client.clientId, makePkce().challenge, [["account_vault_levels", "1"], ["vault_level:work", "none"], ["vault_level:other", "none"]], "account:vaults account:self:read");
+      expect((await redeemCode(codeC, c.verifier)).status).toBe(400);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("a refresh that loses the race to a sibling refresh of the same token still converges (grace), one live row", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const session = await friendOnWorkReadOtherWrite(db);
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"], status: "approved" });
+      const first = makePkce();
+      const res0 = await post(db, session.id, reg.client.clientId, first.challenge, [["account_vault_levels", "1"], ["vault_level:other", "read"]]);
+      const tokens = await redeemWithRefresh(db, res0.headers.get("location")!, reg.client.clientId, first.verifier);
+      const row = db
+        .query<{ jti: string; family_id: string; user_id: string; scopes: string }, []>("SELECT jti, family_id, user_id, scopes FROM tokens WHERE refresh_token_hash IS NOT NULL AND revoked_at IS NULL")
+        .get()!;
+      // A sibling refresh of the same token commits while this one is signing.
+      let landed = false;
+      const res = await handleToken(
+        db,
+        new Request(`${ISSUER}/oauth/token`, {
+          method: "POST",
+          body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: tokens.refresh_token, client_id: reg.client.clientId }),
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+        }),
+        {
+          ...deps,
+          now: () => {
+            const t = new Date();
+            if (!landed) {
+              landed = true;
+              db.prepare("UPDATE tokens SET revoked_at = ? WHERE jti = ?").run(t.toISOString(), row.jti);
+              signRefreshToken(db, { artifactGeneration: () => 0, jti: "sibling-tip", userId: row.user_id, clientId: reg.client.clientId, scopes: row.scopes.split(" "), familyId: row.family_id });
+              linkRotation(db, row.jti, "sibling-tip");
+            }
+            return t;
+          },
+        },
+      );
+      expect(res.status, await res.clone().text()).toBe(200);
+      const live = db
+        .query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM tokens WHERE family_id = ? AND revoked_at IS NULL AND refresh_token_hash IS NOT NULL")
+        .get(row.family_id);
+      expect(live?.n).toBe(1);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // Real concurrency (round 7): two real handler calls under Promise.all, the real clock, no `now` hooks, no sleeps.
+  // Which side starts first alternates, and the second waits 0..5 microtask turns (plus, from 3, 1..3 real hashes), so
+  // both orders of each critical section are exercised. Each test tallies what it saw, so the notes can say which
+  // interleavings happened.
+  const RACE_ITERATIONS = 200;
+  async function afterWork(k: number, run: () => Promise<Response>): Promise<Response> {
+    for (let j = 0; j < k; j++) await Promise.resolve();
+    for (let j = 3; j <= k; j++) await crypto.subtle.digest("SHA-256", new Uint8Array(1 << 20));
+    return run();
+  }
+  function race(i: number, a: () => Promise<Response>, b: () => Promise<Response>): Promise<[Response, Response]> {
+    const k = i % 6;
+    if (i % 2 === 0) {
+      const pa = a();
+      const pb = afterWork(k, b);
+      return Promise.all([pa, pb]);
+    }
+    const pb = b();
+    const pa = afterWork(k, a);
+    return Promise.all([pa, pb]);
+  }
+  const hashOf = (token: string) => createHash("sha256").update(token).digest("hex");
+  type Db = Awaited<ReturnType<typeof makeDb>>["db"];
+  /** Account-door scopes on this (user, client)'s live refresh rows that the stored grant doesn't cover. */
+  function liveWiderThanGrant(db: Db, userId: string, clientId: string): string[] {
+    const granted = new Set(findGrant(db, userId, clientId)?.scopes ?? []);
+    const covered = (s: string) => {
+      if (granted.has(s)) return true;
+      const m = /^account:self:vaults:([a-z0-9_-]+):read$/.exec(s);
+      return m !== null && granted.has(`account:self:vaults:${m[1]}:write`);
+    };
+    const rows = db
+      .query<{ scopes: string }, [string, string]>(
+        "SELECT scopes FROM tokens WHERE user_id = ? AND client_id = ? AND refresh_token_hash IS NOT NULL AND revoked_at IS NULL",
+      )
+      .all(userId, clientId);
+    return rows.flatMap((r) => r.scopes.split(" ").filter((s) => s.startsWith("account:self:vaults") && !covered(s)));
+  }
+  const failedIterations = (failures: string[]) => new Set(failures.map((f) => /^#\d+/.exec(f)?.[0])).size;
+  const tally = (seen: Map<string, number>, key: string) => seen.set(key, (seen.get(key) ?? 0) + 1);
+  const outcome = async (res: Response) =>
+    res.status === 200 ? "200" : `${res.status} ${((await res.clone().json().catch(() => ({}))) as { error_description?: string }).error_description ?? ""}`;
+
+  test("RACE: two simultaneous refreshes of the same token never end the family; one live row, the tip refreshes", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const session = await friendOnWorkReadOtherWrite(db);
+      const seen = new Map<string, number>();
+      const failures: string[] = [];
+      for (let i = 0; i < RACE_ITERATIONS; i++) {
+        const reg = registerClient(db, { redirectUris: ["https://app.example/cb"], status: "approved" });
+        const pk = makePkce();
+        const consent = await post(db, session.id, reg.client.clientId, pk.challenge, [["account_vault_levels", "1"], ["vault_level:other", "read"]]);
+        const tokens = await redeemWithRefresh(db, consent.headers.get("location")!, reg.client.clientId, pk.verifier);
+        const familyId = db.query<{ family_id: string }, [string]>("SELECT family_id FROM tokens WHERE refresh_token_hash = ?").get(hashOf(tokens.refresh_token))!.family_id;
+        const [ra, rb] = await race(
+          i,
+          () => refresh(db, reg.client.clientId, tokens.refresh_token),
+          () => refresh(db, reg.client.clientId, tokens.refresh_token),
+        );
+        const outcomes = [await outcome(ra), await outcome(rb)];
+        tally(seen, outcomes.slice().sort().join(" / "));
+        const returned = new Set<string>();
+        for (const r of [ra, rb]) if (r.status === 200) returned.add(((await r.json()) as { refresh_token: string }).refresh_token);
+        const live = db
+          .query<{ refresh_token_hash: string }, [string]>("SELECT refresh_token_hash FROM tokens WHERE family_id = ? AND revoked_at IS NULL AND refresh_token_hash IS NOT NULL")
+          .all(familyId);
+        if (returned.size === 0 || live.length !== 1) {
+          failures.push(`#${i}: ${outcomes.join(" / ")}, live rows ${live.length}`);
+          continue;
+        }
+        const tip = [...returned].find((t) => hashOf(t) === live[0]!.refresh_token_hash);
+        if (!tip) {
+          failures.push(`#${i}: the live tip is none of the returned tokens`);
+          continue;
+        }
+        const next = await refresh(db, reg.client.clientId, tip);
+        if (next.status !== 200) failures.push(`#${i}: the tip didn't refresh (${await outcome(next)})`);
+      }
+      console.log(`[race a] outcomes ${JSON.stringify(Object.fromEntries(seen))}`);
+      expect(failures, `${failedIterations(failures)}/${RACE_ITERATIONS} iterations failed`).toEqual([]);
+    } finally {
+      cleanup();
+    }
+  }, 120_000);
+
+  test("RACE: a code redeem simultaneous with a narrower choice (or all-none) leaves nothing wider than the grant", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const session = await friendOnWorkReadOtherWrite(db);
+      const userId = findSession(db, session.id)!.userId;
+      const seen = new Map<string, number>();
+      const failures: string[] = [];
+      for (let i = 0; i < RACE_ITERATIONS; i++) {
+        const reg = registerClient(db, { redirectUris: ["https://app.example/cb"], status: "approved" });
+        const clientId = reg.client.clientId;
+        const pk = makePkce();
+        const wide = await post(db, session.id, clientId, pk.challenge, [["account_vault_levels", "1"], ["vault_level:work", "read"], ["vault_level:other", "write"]]);
+        const code = new URL(wide.headers.get("location")!).searchParams.get("code")!;
+        const allNone = Math.floor(i / 2) % 2 === 1;
+        const narrowFields: [string, string][] = allNone
+          ? [["account_vault_levels", "1"], ["vault_level:work", "none"], ["vault_level:other", "none"]]
+          : [["account_vault_levels", "1"], ["vault_level:work", "none"], ["vault_level:other", "read"]];
+        const [redeemed, narrowed] = await race(
+          i,
+          () =>
+            handleToken(
+              db,
+              new Request(`${ISSUER}/oauth/token`, {
+                method: "POST",
+                body: new URLSearchParams({ grant_type: "authorization_code", code, client_id: clientId, redirect_uri: "https://app.example/cb", code_verifier: pk.verifier }),
+                headers: { "content-type": "application/x-www-form-urlencoded" },
+              }),
+              deps,
+            ),
+          () => post(db, session.id, clientId, makePkce().challenge, narrowFields, "account:vaults account:self:read"),
+        );
+        tally(seen, `${allNone ? "all-none" : "narrower"}: redeem ${await outcome(redeemed)}`);
+        if (narrowed.status !== 302) failures.push(`#${i}: the narrower consent answered ${narrowed.status}`);
+        const wider = liveWiderThanGrant(db, userId, clientId);
+        if (wider.length > 0) failures.push(`#${i} (${allNone ? "all-none" : "narrower"}): live refresh row wider than the grant: ${wider.join(" ")}`);
+        if (redeemed.status === 200) {
+          const body = (await redeemed.json()) as { refresh_token: string; scope: string };
+          const again = await refresh(db, clientId, body.refresh_token);
+          tally(seen, `${allNone ? "all-none" : "narrower"}: then its refresh ${await outcome(again)}`);
+          if (again.status === 200) failures.push(`#${i}: the redeemed token still refreshes (${((await again.json()) as { scope: string }).scope})`);
+        }
+      }
+      console.log(`[race b] outcomes ${JSON.stringify(Object.fromEntries(seen))}`);
+      expect(failures, `${failedIterations(failures)}/${RACE_ITERATIONS} iterations failed`).toEqual([]);
+    } finally {
+      cleanup();
+    }
+  }, 120_000);
+
+  test("RACE: a refresh simultaneous with a narrower choice (or all-none) leaves nothing wider than the grant", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const session = await friendOnWorkReadOtherWrite(db);
+      const userId = findSession(db, session.id)!.userId;
+      const seen = new Map<string, number>();
+      const failures: string[] = [];
+      for (let i = 0; i < RACE_ITERATIONS; i++) {
+        const reg = registerClient(db, { redirectUris: ["https://app.example/cb"], status: "approved" });
+        const clientId = reg.client.clientId;
+        const pk = makePkce();
+        const wide = await post(db, session.id, clientId, pk.challenge, [["account_vault_levels", "1"], ["vault_level:work", "read"], ["vault_level:other", "write"]]);
+        const tokens = await redeemWithRefresh(db, wide.headers.get("location")!, clientId, pk.verifier);
+        const allNone = Math.floor(i / 2) % 2 === 1;
+        const narrowFields: [string, string][] = allNone
+          ? [["account_vault_levels", "1"], ["vault_level:work", "none"], ["vault_level:other", "none"]]
+          : [["account_vault_levels", "1"], ["vault_level:work", "none"], ["vault_level:other", "read"]];
+        const [refreshed, narrowed] = await race(
+          i,
+          () => refresh(db, clientId, tokens.refresh_token),
+          () => post(db, session.id, clientId, makePkce().challenge, narrowFields, "account:vaults account:self:read"),
+        );
+        tally(seen, `${allNone ? "all-none" : "narrower"}: refresh ${await outcome(refreshed)}`);
+        if (narrowed.status !== 302) failures.push(`#${i}: the narrower consent answered ${narrowed.status}`);
+        const wider = liveWiderThanGrant(db, userId, clientId);
+        if (wider.length > 0) failures.push(`#${i} (${allNone ? "all-none" : "narrower"}): live refresh row wider than the grant: ${wider.join(" ")}`);
+        if (refreshed.status === 200) {
+          const body = (await refreshed.json()) as { refresh_token: string };
+          const again = await refresh(db, clientId, body.refresh_token);
+          tally(seen, `${allNone ? "all-none" : "narrower"}: then its refresh ${await outcome(again)}`);
+          if (again.status === 200) failures.push(`#${i}: the refreshed token still refreshes (${((await again.json()) as { scope: string }).scope})`);
+        }
+      }
+      console.log(`[race c] outcomes ${JSON.stringify(Object.fromEntries(seen))}`);
+      expect(failures, `${failedIterations(failures)}/${RACE_ITERATIONS} iterations failed`).toEqual([]);
+    } finally {
+      cleanup();
+    }
+  }, 120_000);
+
+  test("a post without the per-vault fields (a page from before 0.9.1) keeps the level-less grant", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const session = await friendOnWorkReadOtherWrite(db);
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"], status: "approved" });
+      const p = makePkce();
+      const res = await post(db, session.id, reg.client.clientId, p.challenge, []);
+      expect(res.status).toBe(302);
+      expect(await redeem(db, res.headers.get("location")!, reg.client.clientId, p.verifier)).toBe("account:self:vaults");
     } finally {
       cleanup();
     }

@@ -1,6 +1,6 @@
 import { it, expect, beforeEach, afterEach } from "bun:test";
 import { Database } from "bun:sqlite";
-import { initSchema } from "./schema.js";
+import { initSchema, SCHEMA_VERSION } from "./schema.js";
 import { BunSqliteStore } from "./store.js";
 let db: Database;
 beforeEach(() => {
@@ -19,7 +19,7 @@ it("P14a v28 upgrade creates both tables and three indexes without backfill", ()
   initSchema(db);
   expect(
     db.prepare("SELECT MAX(version) AS version FROM schema_version").get(),
-  ).toEqual({ version: 32 });
+  ).toEqual({ version: SCHEMA_VERSION });
   const tables = db
     .prepare(
       "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('note_versions','note_blobs') ORDER BY name",

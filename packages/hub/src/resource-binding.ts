@@ -135,6 +135,25 @@ export function isRootMcpResource(
   return ROOT_MCP_PATH_RE.test(parsed.pathname) || ROOT_PRM_PATH_RE.test(parsed.pathname);
 }
 
+/**
+ * The account door's own MCP URL (`<origin>/account/mcp`), the `resource` its protected-resource document names.
+ * An account-audience grant may be bound to it at /oauth/token (T-446: an app connecting to the account door by
+ * that URL sends it at authorize and token, as RFC 8707 asks).
+ */
+export function isAccountMcpResource(
+  resource: string | null | undefined,
+  boundOrigins: readonly string[],
+): boolean {
+  if (!resource) return false;
+  let parsed: URL;
+  try {
+    parsed = new URL(resource);
+  } catch {
+    return false;
+  }
+  return boundOrigins.includes(parsed.origin) && /^\/account\/mcp\/?$/.test(parsed.pathname);
+}
+
 /** Canonical vault-name shape — mirrors `VAULT_SCOPED_RE`'s name group. */
 const VAULT_NAME_RE = /^[a-zA-Z0-9_-]+$/;
 

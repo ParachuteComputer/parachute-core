@@ -682,7 +682,7 @@ function readManifestLenientRaw(
   return { services: dedup };
 }
 
-export function readManifest(path: string = SERVICES_MANIFEST_PATH): ServicesManifest {
+export function readManifest(path: string = SERVICES_MANIFEST_PATH, write = true): ServicesManifest {
   if (!existsSync(path)) return { services: [] };
   let raw: unknown;
   try {
@@ -713,8 +713,17 @@ export function readManifest(path: string = SERVICES_MANIFEST_PATH): ServicesMan
   const cleaned = dropLegacyShortNameRows(afterRetired.raw, path);
   const validated = validateManifest(cleaned.raw, path);
   const changed = healed.changed || afterRetired.changed || cleaned.changed;
-  if (changed) writeManifest(validated, path);
+  if (changed && write) writeManifest(validated, path);
   return validated;
+}
+
+/**
+ * What `readManifest` would return, without its write-back of healed rows: the same passes and the same strict
+ * validation (it throws as `readManifest` does), and services.json is left as it is. For a caller that must know
+ * what a command will find before anything on the home may change (core's `parachute upgrade`).
+ */
+export function readManifestUnchanged(path: string = SERVICES_MANIFEST_PATH): ServicesManifest {
+  return readManifest(path, false);
 }
 
 /**

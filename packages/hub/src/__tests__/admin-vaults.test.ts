@@ -1354,11 +1354,11 @@ describe("DELETE /vaults/<name> — the identity cascade", () => {
           false,
         );
 
-        // 6 + 7. Mechanics + eviction.
+        // 6. Mechanics. 7. Nothing restarts (0.9.3): the vault server lets go of the vault itself.
         expect(runner.calls).toContainEqual(["parachute-vault", "remove", "work", "--yes"]);
         expect(out.cascade.vault_removed).toBe(true);
-        expect(restarted).toBe(true);
-        expect(out.cascade.module_restarted).toBe(true);
+        expect(restarted).toBe(false);
+        expect(out.cascade.module_restarted).toBe(false);
       } finally {
         db.close();
       }
@@ -1459,7 +1459,7 @@ describe("DELETE /vaults/<name> — the identity cascade", () => {
     }
   });
 
-  test("no supervisor → 200 with a module_restart warning (not silent)", async () => {
+  test("no supervisor → 200 and no restart warning (a delete restarts nothing)", async () => {
     const h = makeHarness();
     try {
       const db = openHubDb(hubDbPath(h.dir));
@@ -1478,7 +1478,7 @@ describe("DELETE /vaults/<name> — the identity cascade", () => {
           warnings?: { step: string; detail: string }[];
         };
         expect(out.cascade.module_restarted).toBe(false);
-        expect(out.warnings?.some((w) => w.step === "module_restart")).toBe(true);
+        expect(out.warnings?.some((w) => w.step === "module_restart") ?? false).toBe(false);
       } finally {
         db.close();
       }

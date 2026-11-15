@@ -47,6 +47,9 @@ export interface CandidateInfo {
   /** Today's stock 0.7 build, for "the old programs" (takeover, identity, rollback to stock): the candidate itself
    *  while it is stock, else OLD_STOCK_DIR or .cache/candidate-stock. */
   oldStockDir: string;
+  /** The release before this one (pins.json previous_core, 0.8), for lifecycle/upgrade: PREVIOUS_CORE_DIR or
+   *  .cache/candidate-previous (`bun run build:previous`). */
+  previousCoreDir: string;
   profile: CandidateManifest["profile"];
   processModel: CandidateManifest["process_model"];
   sha256: string;
@@ -307,7 +310,7 @@ export interface CandidateRunning extends Running {
  * supervising the vault, an admin seeded from the environment, an operator token rotated, and an admin pass minted
  * with the real CLI. Everything else the contracts do goes through HTTP and MCP.
  */
-export async function startCandidateBox(info: CandidateInfo, opts: { keep?: boolean } = {}): Promise<CandidateRunning> {
+export async function startCandidateBox(info: CandidateInfo, opts: { keep?: boolean; embeddings?: boolean } = {}): Promise<CandidateRunning> {
   const home = freshHome(info, "box");
   const user = dirname(home);
   const log = join(user, "serve.log");
@@ -327,7 +330,8 @@ export async function startCandidateBox(info: CandidateInfo, opts: { keep?: bool
     allowOrigins(hubOrigin);
     const vaultName = `cand${randomBytes(3).toString("hex")}`;
     const admin = { username: "owner", password: `pw-${randomBytes(12).toString("hex")}` };
-    const env = { PORT: String(hubPort), PARACHUTE_HUB_ORIGIN: hubOrigin, EMBEDDINGS_ENABLED: "false" };
+    // Meaning search is off unless a suite asks for it (`bun run doors -- --embeddings`): the bundled model loads on first use.
+    const env = { PORT: String(hubPort), PARACHUTE_HUB_ORIGIN: hubOrigin, EMBEDDINGS_ENABLED: opts.embeddings ? "true" : "false" };
 
     // 1. A vault, the way `parachute-vault create` makes one (registers it in services.json for the hub).
     const create = await runCli(info, home, ["create", vaultName, "--no-mirror", "--json"], { bin: info.vaultBin, env });
@@ -437,6 +441,7 @@ export function prepareInfo(dir: string, manifest: CandidateManifest, sha256: st
     runtimeDir,
     scratch,
     oldStockDir: resolve(process.env.OLD_STOCK_DIR ?? (manifest.profile === "stock-0.7" ? d : join(import.meta.dir, "..", ".cache", "candidate-stock"))),
+    previousCoreDir: resolve(process.env.PREVIOUS_CORE_DIR ?? join(import.meta.dir, "..", ".cache", "candidate-previous")),
     profile: manifest.profile,
     processModel: manifest.process_model,
     sha256,

@@ -46,15 +46,20 @@ export async function mintOverHttp(bearer: string, body: Record<string, unknown>
   return { status: r.status, body: parsed, headers: r.headers };
 }
 
-/** A tag-scoped vault admin pass for the box's admin account: a minter that holds only some tags. */
+/**
+ * A tag-scoped vault admin pass for the box's admin account: a minter that holds only some tags. Since 0.9.1 no mint
+ * issues one (scope gap 4, scope-gaps.test.ts), but passes minted before live until they expire, so the vault must
+ * still treat one right. This makes it the way an older hub did: an admin pass for the same account, re-signed with
+ * the tags by the box's own key (`resign`). Its key row keeps the pass's own `jti`.
+ */
 export async function scopedAdmin(tags: string[]): Promise<string> {
   const s = services();
-  return mintToken(s, {
+  const admin = await mintToken(s, {
     scope: ["read", "write", "admin"].map((l) => `vault:${s.vaultName}:${l}`).join(" "),
-    permissions: { scoped_tags: tags },
     label: "contracts-scoped-minter",
     user: s.admin.username,
   });
+  return resign(admin, { scoped_tags: tags });
 }
 
 export { pass };
@@ -132,6 +137,11 @@ export async function subscribe(token: string, query = ""): Promise<LiveSocket> 
  * refuse them on its own.
  */
 export function resign(token: string, permissions: Record<string, unknown>): string {
+  return resignClaims(token, { permissions });
+}
+
+/** Re-sign a pass with some of its claims replaced (same key and method as `resign`). */
+export function resignClaims(token: string, patch: Record<string, unknown>): string {
   const s = services();
   const db = [join(s.home, "hub.db"), join(s.home, "hub", "hub.db")].find(existsSync);
   if (!db) throw new Error(`setup: no hub.db under ${s.home}`);
@@ -142,7 +152,7 @@ export function resign(token: string, permissions: Record<string, unknown>): str
   conn.close();
   if (!key || key.algorithm !== "RS256") throw new Error(`setup: no active RS256 signing key in hub.db (${key?.algorithm})`);
   const header = { ...JSON.parse(Buffer.from(token.split(".")[0]!, "base64url").toString()), kid: key.kid };
-  const body = { ...claims(token), permissions };
+  const body = { ...claims(token), ...patch };
   const head = `${Buffer.from(JSON.stringify(header)).toString("base64url")}.${Buffer.from(JSON.stringify(body)).toString("base64url")}`;
   const sig = createSign("RSA-SHA256").update(head).sign(key.pem).toString("base64url");
   return `${head}.${sig}`;

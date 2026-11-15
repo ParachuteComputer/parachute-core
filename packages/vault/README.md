@@ -254,7 +254,13 @@ parachute-vault backup status                  # schedule, last run, destination
 
 ## MCP tools (13 core, + attachments + admin)
 
-**Notes**: `query-notes` (universal read — single by ID/path, filter, search, graph neighborhood), `create-note` (single or batch), `update-note` (single or batch — content, tags, links, metadata), `delete-note`
+**0.9 (T-318, T-407):** `tools/list` leads with eleven tools: `query-records`, `create-record`, `update-record`,
+`delete-record`, `list-types`, `vault-info`, `doctor`, `read-attachment`, `attachment-url`, `manage-types`,
+`manage-keys`. The record tools speak `body` and `fields` for what the note tools call `content` and `metadata`. The
+names below stay listed and working as deprecated aliases through 0.9 and go at 1.0; each use is counted in the
+home's `run/deprecations.json` (`parachute changes` prints the counts).
+
+**Notes**: `query-notes` (universal read — single by ID/path, filter, search, graph neighborhood), `create-note` (single or batch), `update-note` (single or batch — content, tags, links, metadata), `delete-note` (single or a list; `erase_history` with admin forgets every version)
 **Tags**: `list-tags` (with optional schema detail), `update-tag` (upsert description + schema fields), `delete-tag`, `rename-tag`, `merge-tags`
 **Graph**: `find-path` (BFS between two notes)
 **Vault**: `vault-info` (get/update description + stats)
@@ -483,6 +489,19 @@ Destination kinds shipping in this release: `local` (any filesystem path — inc
 
 On Linux, scheduled runs via systemd timers are a follow-up; for now `parachute-vault backup` works on Linux but you'll need to wire the cron yourself.
 
+#### Pull a backup with cron (0.9.3)
+
+A key that can only download the vault's export lets your own scheduler take backups without holding a key that could read or change anything else:
+
+```bash
+parachute keys new nightly-backup --vault <n> --can export     # prints the key once
+# save the key in a file only you can read: ~/.parachute-backup-key (chmod 600)
+# crontab: every night at 03:10 (cron needs % written as \%)
+10 3 * * *  curl -fsS -H "Authorization: Bearer $(cat $HOME/.parachute-backup-key)" https://my-box.example.ts.net/vault/<n>/api/export -o $HOME/backups/vault-$(date +\%F).tar
+```
+
+The tar holds the same files as `parachute-vault export` and imports into any Parachute. `parachute-vault status` shows `last export` per vault, so you can see the job ran. See [HTTP_API.md](docs/HTTP_API.md#export).
+
 ### View endpoint
 
 Serve notes as clean HTML pages at `/view/:noteId`:
@@ -501,7 +520,12 @@ published_tag: public
 Every vault-touching path is scoped under `/vault/{name}/` — substitute your vault name (e.g. `default`) for `{name}`:
 
 ```
-GET/POST       /vault/{name}/api/notes                           query or create notes
+GET/POST       /vault/{name}/api/records                         query or create records (?type= filters by type)
+GET/PATCH/DEL  /vault/{name}/api/records/:idOrPath                read, update, delete a single record
+GET/POST       /vault/{name}/api/records/:id/attachments          list or add attachments
+GET            /vault/{name}/api/types                            every type and tag with its kind
+GET/PUT/DEL    /vault/{name}/api/types/:name                      get, update (admin) or delete (admin) a type
+GET/POST       /vault/{name}/api/notes                           0.8's name for /api/records (deprecated, gone in 1.0)
 GET/PATCH/DEL  /vault/{name}/api/notes/:idOrPath                  read, update, delete a single note
 GET/POST       /vault/{name}/api/notes/:id/attachments            list or add attachments
 GET            /vault/{name}/api/tags                             list tags (?include_schema=true for schemas)
@@ -541,7 +565,7 @@ curl -H "Authorization: Bearer $VAULT_TOKEN" \
 
 ### Sort by a metadata field
 
-Sort by something other than `created_at`. The field must be declared `indexed: true` in some tag schema first — that's what materializes the backing generated column + B-tree index. The "tag authorizes the index" pattern lives in [`core/src/indexed-fields.ts`](./core/src/indexed-fields.ts).
+Sort by something other than `created_at`. Any field works. A field declared `indexed: true` in some tag schema sorts on its generated column and B-tree index (the "tag authorizes the index" pattern lives in [`core/src/indexed-fields.ts`](./core/src/indexed-fields.ts)); any other field is sorted by reading every matching record, and the reply carries a `scan` warning.
 
 ```bash
 curl -H "Authorization: Bearer $VAULT_TOKEN" \
@@ -612,7 +636,7 @@ curl -H "Authorization: Bearer $VAULT_TOKEN" \
   "http://localhost:1940/vault/default/api/notes?meta[meeting-type]=study-session&include_content=true"
 ```
 
-Range, `in`, `not_in`, and `exists` operators require the field to be declared `indexed: true` (same gate as `order_by`):
+Range, `in`, `not_in`, and `exists` operators work on any field. On a field declared `indexed: true` they use its index; on any other field they read every record the other filters leave, give the same rows, and add a `scan` warning (`X-Parachute-Warnings`) naming the field to index:
 
 ```bash
 # Range — both bounds AND together on one field
@@ -945,7 +969,7 @@ cp .env.example .env   # edit with your config
 docker compose up -d
 ```
 
-Set `PARACHUTE_VAULT_NAME` to auto-create a first vault on startup (name: lowercase alphanumeric + hyphens or underscores, 2–32 chars). Without it the server boots with zero vaults — create one explicitly via the admin wizard, `parachute init --vault-name <name>`, or `parachute-vault create <name>`.
+Set `PARACHUTE_VAULT_NAME` to auto-create a first vault on startup (name: lowercase alphanumeric + hyphens or underscores, 2–32 chars). Without it the server boots with zero vaults — create one explicitly via the admin wizard, `parachute init --vault-name <name>`, or `parachute-vault create <name>`. First boot makes no API key (from 0.9.1): reach the vault with `VAULT_AUTH_TOKEN` (set it in `.env`) or a hub-signed token.
 
 ### Cloud platforms
 
@@ -974,7 +998,8 @@ Set `PARACHUTE_VAULT_NAME` to auto-create a first vault on startup (name:
 lowercase alphanumeric + hyphens or underscores, 2–32 chars). Without it
 the server boots with zero vaults — create one explicitly via the admin
 wizard, `parachute init --vault-name <name>`, or `parachute-vault create
-<name>`.
+<name>`. First boot makes no API key (from 0.9.1): reach the vault
+with `VAULT_AUTH_TOKEN` or a hub-signed token.
 
 #### Other platforms
 

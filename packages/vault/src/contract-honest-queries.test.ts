@@ -67,8 +67,23 @@ describe("contract: honest queries — passing (lock in current behavior)", () =
     expect(body).toEqual([]);
   });
 
-  it("a metadata operator query on a non-indexed field errors loudly with FIELD_NOT_INDEXED (existing behavior)", async () => {
+  it("a metadata operator query on a non-indexed field answers and warns that it scanned (0.9.2)", async () => {
     const res = await getNotes("meta[not_a_real_field][gt]=5");
+    expect(res.status).toBe(200);
+    const warnings = JSON.parse(decodeURIComponent(res.headers.get("X-Parachute-Warnings") ?? "[]"));
+    expect(warnings.map((w: any) => w.code)).toContain("scan");
+    expect(warnings.find((w: any) => w.code === "scan").fields).toEqual(["not_a_real_field"]);
+  });
+
+  it("search with a metadata operator on a non-indexed field warns that it scanned (0.9.2)", async () => {
+    const res = await getNotes("search=anything&meta[not_a_real_field][eq]=x");
+    expect(res.status).toBe(200);
+    const warnings = JSON.parse(decodeURIComponent(res.headers.get("X-Parachute-Warnings") ?? "[]"));
+    expect(warnings.map((w: any) => w.code)).toContain("scan");
+  });
+
+  it("aggregate with a metadata operator on a non-indexed field is refused (0.9.2: its reply has no warnings)", async () => {
+    const res = await getNotes("aggregate[op]=count&meta[not_a_real_field][gt]=5");
     expect(res.status).toBe(400);
     const body: any = await res.json();
     expect(body.code).toBe("FIELD_NOT_INDEXED");

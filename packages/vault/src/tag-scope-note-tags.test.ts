@@ -31,7 +31,7 @@ import { getVaultStore, clearVaultStoreCache } from "./vault-store.ts";
 import { generateScopedMcpTools } from "./mcp-tools.ts";
 import { handleNotes, type TagScopeCtx } from "./routes.ts";
 import { SubscriptionManager, type SubscriptionSink } from "./subscriptions.ts";
-import { buildLiveMatcher } from "./live-match.ts";
+import { buildLiveMatcher } from "../core/src/live-match.ts";
 import { expandTokenTagScope } from "./tag-scope.ts";
 import type { AuthResult } from "./auth.ts";
 import type { Note, Store } from "../core/src/types.ts";

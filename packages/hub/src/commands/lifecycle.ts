@@ -35,7 +35,8 @@ import {
 import { type PortListeningFn, defaultPortListening } from "../port-probe.ts";
 import { type AliveFn, logPath as logPathFor, processState } from "../process-state.ts";
 import { getSpec, knownServices } from "../service-spec.ts";
-import { readManifest } from "../services-manifest.ts";
+import { coreRoot } from "../core-host.ts";
+import { readManifest, readManifestUnchanged } from "../services-manifest.ts";
 
 /**
  * Tiny seam over `Bun.spawn`, retained for the `parachute logs <svc> --follow`
@@ -360,10 +361,16 @@ async function requireSupervisedOrOffer(r: Resolved): Promise<boolean> {
   // meant `parachute start <svc>` there exited 1 with nothing on stdout or
   // stderr.
   if (!attempt.surfaced) {
-    r.log(
-      "No supervised hub unit is installed. Run `parachute migrate --to-supervised` to install it,",
-    );
-    r.log("or run `parachute serve` in the foreground.");
+    if (coreRoot()) {
+      // Inside core the 0.7 cutover is not the way (its unit runs this hub's own serve).
+      r.log("No unit answers to this command for this home. Stop and start `parachute serve`,");
+      r.log("or the unit that runs it, yourself.");
+    } else {
+      r.log(
+        "No supervised hub unit is installed. Run `parachute migrate --to-supervised` to install it,",
+      );
+      r.log("or run `parachute serve` in the foreground.");
+    }
   }
   return false;
 }
@@ -714,7 +721,8 @@ export async function logs(svc: string, opts: LogsOpts = {}): Promise<number> {
   // name maps to something the CLI manages.
   const isFirstParty = getSpec(svc) !== undefined;
   if (!isFirstParty && svc !== HUB_SVC) {
-    const entry = readManifest(manifestPath).services.find((s) => s.name === svc);
+    // (read as it is: `logs` only looks, and must not heal services.json on the way)
+    const entry = readManifestUnchanged(manifestPath).services.find((s) => s.name === svc);
     if (!entry) {
       log(`unknown service "${svc}". known: ${[HUB_SVC, ...knownServices()].join(", ")}`);
       return 1;

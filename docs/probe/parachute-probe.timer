@@ -1,0 +1,12 @@
+# Runs parachute-probe.service two minutes after boot, then five minutes after each run (docs/probe/README.md).
+[Unit]
+Description=Parachute probe every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=parachute-probe.service
+
+[Install]
+WantedBy=timers.target

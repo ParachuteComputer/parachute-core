@@ -30,6 +30,7 @@ import {
   _isImportInFlight,
   _resetImportInFlightForTest,
   authedCloneUrl,
+  importRemoteUrlProblem,
   cloneAndImport,
   defaultGitSpawn,
   type GitSpawn,
@@ -118,13 +119,47 @@ describe("authedCloneUrl", () => {
     expect(authedCloneUrl("not-a-url", { kind: "none" }, "v")).toBeNull();
   });
 
-  test("passes git:// URLs verbatim (no userinfo to embed)", () => {
-    // `git://github.com/owner/repo.git` parses as a URL with protocol
-    // `git:`, not http/https — our helper returns it verbatim.
-    const r = authedCloneUrl("git://github.com/owner/repo.git", { kind: "pat", token: "ghp_x" }, "v");
-    expect(r).not.toBeNull();
-    expect(r!.authedUrl).toBe("git://github.com/owner/repo.git");
-    expect(r!.appliedAuth).toBe("none");
+  // T-419 (audit L3-02): a vault admin's import may only reach a remote git
+  // host. Anything that would clone off this disk, run a command, or reach
+  // git as an option is refused before a clone is attempted.
+  test("refuses anything but https:// and ssh", () => {
+    for (const url of [
+      "/srv/other-vault/mirror",
+      "./mirror",
+      "../mirror",
+      "mirror",
+      "file:///srv/other-vault/mirror",
+      "FILE:///srv/other-vault/mirror",
+      "git://github.com/owner/repo.git",
+      "http://github.com/owner/repo.git",
+      "ext::sh -c touch% /tmp/x",
+      "ext::false",
+      "fd::3",
+      "-ufalse",
+      "--upload-pack=false",
+      "ssh://-oProxyCommand=false/owner/repo.git",
+      "ssh://-oProxyCommand=false@host/owner/repo.git",
+      "git@-oProxyCommand=false:owner/repo.git",
+      "-git@host:owner/repo.git",
+      "https://github.com/owner/repo.git\n--upload-pack=false",
+    ]) {
+      expect(importRemoteUrlProblem(url), url).not.toBeNull();
+      expect(authedCloneUrl(url, { kind: "pat", token: "ghp_x" }, "v"), url).toBeNull();
+    }
+  });
+
+  test("takes https://, ssh:// and scp-style ssh", () => {
+    for (const url of [
+      "https://github.com/owner/repo.git",
+      "https://x-access-token:t@gitlab.example/owner/repo",
+      "ssh://git@github.com/owner/repo.git",
+      "ssh://git@github.com:2222/owner/repo.git",
+      "git@github.com:owner/repo.git",
+      "git@github.com:/srv/git/repo.git",
+    ]) {
+      expect(importRemoteUrlProblem(url), url).toBeNull();
+      expect(authedCloneUrl(url, { kind: "none" }, "v"), url).not.toBeNull();
+    }
   });
 
   // Reviewer-flagged on vault#390 — the original ssh-shorthand assertion

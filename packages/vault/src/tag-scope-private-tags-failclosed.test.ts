@@ -173,9 +173,9 @@ describe("must-fix 1: counts exclude notes hidden by private tags", () => {
   test("connect-time brief counts exclude hidden notes", async () => {
     await seed(["capture"]);
     const scoped = await getServerInstruction(V, authFor(["project"]));
-    expect(scoped).toContain("- 1 note, 1 tag total");
+    expect(scoped).toContain("- 1 record, 1 tag total");
     const owner = await getServerInstruction(V, authFor(null));
-    expect(owner).toContain("- 3 notes,");
+    expect(owner).toContain("- 3 records,");
   });
 });
 
@@ -323,7 +323,7 @@ describe("must-fix 2: private_tags parsing", () => {
     const res = await handleVault(new Request(`http://localhost/vault/${V}/api/vault`, {
       method: "PATCH", headers: { "content-type": "application/json" },
       body: JSON.stringify({ description: "edited" }),
-    }), getVaultStore(V), config, () => writeVaultConfig(config));
+    }), getVaultStore(V), config, () => writeVaultConfig(config), undefined, undefined, undefined, null);
     expect(res.status).toBe(409);
     expect(await res.json()).toEqual({ error: unreadableMessage });
     expect(readFileSync(vaultConfigPath(V), "utf-8")).toBe(before);

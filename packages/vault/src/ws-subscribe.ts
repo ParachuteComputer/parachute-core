@@ -32,7 +32,7 @@
  */
 import type { Note, NoteIndex, QueryOpts } from "../core/src/types.ts";
 import { parseNotesQueryOpts } from "./routes.ts";
-import { unsupportedSubscriptionReason } from "./live-match.ts";
+import { unsupportedSubscriptionReason } from "../core/src/live-match.ts";
 import { hasScopeForVault, type VaultVerb } from "./scopes.ts";
 
 /** Per-vault concurrent WS-subscription cap (mirrors the SSE cap). Enforced at

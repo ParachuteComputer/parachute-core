@@ -162,7 +162,6 @@ function renderCascadeSummary(
   log(`  channel bindings:      ${n(c.channel_vaults_removed)}`);
   log(`  connections torn down: ${n(c.connections_torn_down)}`);
   log(`  vault removed:         ${c.vault_removed === true ? "yes" : "no"}`);
-  log(`  vault module restarted:${c.module_restarted === true ? " yes" : " no"}`);
 
   const orphaned = asStringArray(c.orphaned_channels);
   if (orphaned.length > 0) {

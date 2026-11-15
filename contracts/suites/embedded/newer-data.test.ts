@@ -17,14 +17,20 @@ import { cli, freePort, newHome, start } from "../candidate-lib.ts";
 import { diff, exitWithin, must, ports, snapshot, tail } from "./_lib.ts";
 
 const VAULT = "older";
+/**
+ * How far above the highest stamp the "newer" row goes. A release may open a schema or two past its own on purpose
+ * (T-460: a reader release opens the next release's vaults, so a rollback by one release still works), so "newer"
+ * here means newer than any release could read: well ahead, not one ahead.
+ */
+const AHEAD = 10;
 
-/** Add a `schema_version` row one above the highest; returns the new version. */
+/** Add a `schema_version` row {@link AHEAD} above the highest; returns the new version. */
 function raiseSchema(dbPath: string): number {
   const db = new Database(dbPath);
   const top = (db.query("SELECT MAX(version) AS v FROM schema_version").get() as { v: number }).v;
-  db.run("INSERT INTO schema_version (version, applied_at) VALUES (?, ?)", [top + 1, new Date(Date.now() + 60_000).toISOString()]);
+  db.run("INSERT INTO schema_version (version, applied_at) VALUES (?, ?)", [top + AHEAD, new Date(Date.now() + 60_000).toISOString()]);
   db.close();
-  return top + 1;
+  return top + AHEAD;
 }
 
 /**
@@ -46,7 +52,7 @@ function raiseSchemaInWal(dbPath: string): void {
      const db = new Database(${JSON.stringify(dbPath)});
      db.exec("PRAGMA journal_mode = WAL");
      db.exec("PRAGMA wal_autocheckpoint = 0");
-     db.run("INSERT INTO schema_version (version, applied_at) VALUES (?, ?)", [${top + 1}, new Date().toISOString()]);
+     db.run("INSERT INTO schema_version (version, applied_at) VALUES (?, ?)", [${top + AHEAD}, new Date().toISOString()]);
      process.kill(process.pid, "SIGKILL");`,
   ]);
   must(w.signalCode === "SIGKILL" && statSync(`${dbPath}-wal`).size > 0, `setup: no WAL left with the new row (${w.stderr})`);

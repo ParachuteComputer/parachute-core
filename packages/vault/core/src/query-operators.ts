@@ -3,14 +3,15 @@
  *
  * A metadata value that is a plain object whose keys are all drawn from
  * {@link SUPPORTED_OPS} is treated as an operator query. Otherwise the value
- * falls through to the existing exact-match behavior (primitive → JSON
- * stringify compare).
+ * falls through to exact match ({@link buildPlainEqualityClause}).
  *
  * Operator queries route through the generated columns maintained by
- * `indexed-fields`: `meta_<field>` on `notes`, backed by a B-tree index. The
- * field must be declared `indexed: true` in some tag schema; otherwise we
- * refuse with an actionable error (no silent fallback to a JSON scan, per the
- * decision doc).
+ * `indexed-fields`: `meta_<field>` on `notes`, backed by a B-tree index, when
+ * the field is declared `indexed: true` in some tag schema. Any other field is
+ * answered by a scan over the JSON ({@link buildScanClause}), which gives the
+ * rows its indexed twin would give, and the caller is told it scanned (the
+ * `scan` warning, `query-warnings.ts`). 0.9.2 "filter any field": the decision
+ * doc's "no silent fallback" holds because the fallback is never silent.
  *
  * See `Parachute/Decisions/2026-04-19-metadata-indexing-via-tag-schemas`.
  */
@@ -73,6 +74,64 @@ export function isOperatorObject(value: unknown): value is Record<string, unknow
     return false;
   }
   return Object.keys(value as object).length > 0;
+}
+
+export interface PlainEqualityClause {
+  /** The match itself, on the JSON. Always safe to run alone. */
+  sql: string;
+  params: SQLQueryBindings[];
+  /**
+   * Values for `"meta_<field>" IN (...)` when the field is indexed. Every row
+   * `sql` matches holds one of them in its generated column, so the index can
+   * narrow the candidates first. Null when no such values exist.
+   */
+  indexProbes: SQLQueryBindings[] | null;
+}
+
+/**
+ * Bare `{field: value}` equality on metadata.
+ *
+ * `json_extract` gives a JSON string as text, a number as a number, true and
+ * false as 1 and 0, and null as SQL NULL, and SQLite doesn't convert between
+ * text and numbers here. So each value binds the way its JSON type comes out:
+ *
+ * - string: compared as text. `{x: "5"}` doesn't match a stored 5.
+ * - number: compared as a number, on JSON numbers only, so `{x: 1}` doesn't
+ *   match a stored `true` (which also comes out as 1).
+ * - boolean and null: by `json_type`, so `{x: true}` doesn't match a stored 1,
+ *   and `{x: null}` matches a stored null but not a missing key.
+ * - array and empty object: compared as their JSON text, which is how
+ *   `json_extract` gives them back.
+ *
+ * Numbers, booleans and null also still match their text form (`{x: true}`
+ * finds a stored `"true"`). These filters used to be bound only as that text,
+ * so it's the one thing they found; vaults hold such strings, and dropping
+ * them would empty a working caller's results with no error.
+ */
+export function buildPlainEqualityClause(key: string, value: unknown): PlainEqualityClause {
+  const path = "'$.' || ?";
+  const asText = `json_extract(n.metadata, ${path}) = ?`;
+  if (typeof value === "string") {
+    return { sql: asText, params: [key, value], indexProbes: [value] };
+  }
+  const text = JSON.stringify(value);
+  if (typeof value === "number") {
+    return {
+      sql: `(${asText} OR (json_type(n.metadata, ${path}) IN ('integer', 'real') AND json_extract(n.metadata, ${path}) = ?))`,
+      params: [key, text, key, key, value],
+      indexProbes: [text, value],
+    };
+  }
+  if (typeof value === "boolean" || value === null) {
+    return {
+      // JSON.stringify(true) is also the name json_type gives it.
+      sql: `(${asText} OR json_type(n.metadata, ${path}) = ?)`,
+      params: [key, text, key, text],
+      // A stored null is NULL in the generated column, which IN can't find.
+      indexProbes: value === null ? null : [text, value ? 1 : 0],
+    };
+  }
+  return { sql: asText, params: [key, text], indexProbes: [text] };
 }
 
 function validateOperatorObject(field: string, obj: Record<string, unknown>): void {
@@ -185,7 +244,11 @@ function findDeclaredFieldType(db: Database, field: string): string | undefined 
 
 /**
  * Look up `field` in `indexed_fields` or throw a loud error suggesting the
- * caller declare it via `update-tag` with `indexed: true`.
+ * caller declare it via `update-tag` with `indexed: true`. Since 0.9.2 only
+ * `aggregate` (group_by, sum) needs this: filters and order_by scan a field
+ * that isn't indexed. Aggregate stays refused because its reply is a bare
+ * `[{group, value}]` list with no warnings channel, so a scan there would be
+ * silent.
  *
  * That generic advice is IMPOSSIBLE to satisfy for a field whose schema
  * declares `type: "number"` (a float) — only `integer`/`boolean` are
@@ -207,12 +270,12 @@ export function requireIndexedField(db: Database, field: string): IndexedField {
         {
           error_type: "field_not_indexed",
           field,
-          hint: `"${field}" is a float ("number") field — float fields can't be server-side indexed, filtered with operators, used in order_by, or summed via aggregate. Store the value as an integer instead (e.g. cents rather than dollars) and declare indexed: true on THAT field to enable those.`,
+          hint: `"${field}" is a float ("number") field — float fields can't be indexed, so aggregate can't group or sum them (filters and order_by still work, by a scan). Store the value as an integer instead (e.g. cents rather than dollars) and declare indexed: true on THAT field to aggregate it.`,
         },
       );
     }
     throw new QueryError(
-      `metadata field "${field}" is not indexed. To use operator queries or order_by on this field, declare it via update-tag with indexed: true.`,
+      `metadata field "${field}" is not indexed. aggregate's group_by and sum need an indexed field: declare it via update-tag with indexed: true. (Filters and order_by work on any field, by a scan.)`,
       "FIELD_NOT_INDEXED",
     );
   }
@@ -342,6 +405,187 @@ export function buildOperatorClause(
     sql: parts.length === 1 ? parts[0]! : `(${parts.join(" AND ")})`,
     params,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Scans: operators and order_by on a field that isn't indexed (0.9.2)
+// ---------------------------------------------------------------------------
+
+/**
+ * How a scanned field compares, chosen to match what an indexed column of the
+ * same declared type would do. An indexed field is a generated column with a
+ * type affinity (`TEXT` or `INTEGER`, `indexed-fields.ts` TYPE_MAP), and SQLite
+ * converts both the stored value and the operand by that affinity. A scan has
+ * no column, so it applies the same conversions in the expression:
+ *
+ * - `TEXT` (declared `string`, `date`, `reference`): both sides compare as text.
+ * - `NUMERIC` (declared `integer`, `boolean`, `number`; and a field no type
+ *   declares): a number, or text that reads as a number, compares as a number;
+ *   other text compares as text. For a declared integer this is what the
+ *   INTEGER column does. A `number` (float) field can't be indexed, so it has
+ *   no twin; numeric is the only reading that makes `gt: 4.5` mean anything.
+ *   An undeclared field gets SQLite's own default for a column with no known
+ *   type, NUMERIC, so `meta[x][gt]=5` from a query string (always text) still
+ *   compares with a stored 3 as a number.
+ */
+export type ScanAffinity = "TEXT" | "NUMERIC";
+
+export function scanAffinityFor(db: Database, field: string): ScanAffinity {
+  const type = findDeclaredFieldType(db, field);
+  return type === "string" || type === "date" || type === "reference" ? "TEXT" : "NUMERIC";
+}
+
+/** True when `value` is a number, or text SQLite's numeric affinity would turn into one. */
+function numericLike(value: unknown): boolean {
+  if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") return true;
+  return typeof value === "string" && /^\s*[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?\s*$/.test(value);
+}
+
+/**
+ * `json_extract` of one top-level key, with the path written the way the
+ * indexed column's own expression writes it (`'$."<field>"'`), so a key with a
+ * dot or a space names that key and not a nested path. The key goes into a SQL
+ * string literal (quotes doubled); a key holding a double quote or a control
+ * character can't be written as a JSON path label, so it's refused.
+ */
+export function scanValueSql(field: string): string {
+  if (/["\u0000-\u001f\\]/.test(field)) {
+    throw new QueryError(
+      `metadata field "${field}" can't be filtered or sorted on: its name holds a quote, backslash or control character`,
+      "INVALID_QUERY",
+      { error_type: "invalid_query", field, hint: "rename the field (or migrate it) to a plain name" },
+    );
+  }
+  return `json_extract(n.metadata, '$."${field.replace(/'/g, "''")}"')`;
+}
+
+/**
+ * The scan twin of {@link buildOperatorClause}: the same operators, NULL and
+ * missing-key handling (`ne`/`not_in` match a record without the field,
+ * `exists:false` matches it), on the JSON value with {@link ScanAffinity}'s
+ * conversions. Every record the other filters leave is read.
+ */
+export function buildScanClause(
+  field: string,
+  opObj: Record<string, unknown>,
+  affinity: ScanAffinity,
+): { sql: string; params: SQLQueryBindings[] } {
+  validateOperatorObject(field, opObj);
+  const raw = scanValueSql(field);
+  // TEXT: a CAST expression carries TEXT affinity, so SQLite turns the operand
+  // into text too, as it does against a TEXT column. NUMERIC: the operand is
+  // CAST to NUMERIC when it reads as a number, which gives the comparison
+  // NUMERIC affinity and converts a stored "5" on the left (losslessly: affinity
+  // only converts text that is a well-formed number).
+  const lhs = affinity === "TEXT" ? `CAST(${raw} AS TEXT)` : raw;
+  const rhs = (v: unknown) => (affinity === "NUMERIC" && numericLike(v) ? "CAST(? AS NUMERIC)" : "?");
+  // A NUMERIC field compared with text that isn't a number: no affinity
+  // applies, so the stored value is converted first (the sort key does
+  // exactly what the column's affinity does), and a stored "70" is the
+  // number 70 against "6x", as in an INTEGER column.
+  const converted = affinity === "NUMERIC" ? scanOrderSql(field, "NUMERIC") : lhs;
+  const lhsFor = (v: unknown) => (numericLike(v) ? lhs : converted);
+  const parts: string[] = [];
+  const params: SQLQueryBindings[] = [];
+
+  const inSet = (members: (string | number | boolean | null)[]): string => {
+    if (affinity === "TEXT") {
+      params.push(jsonEachParam(members));
+      return `${lhs} IN ${inViaJsonEachCast("TEXT")}`;
+    }
+    const nums = members.filter(numericLike);
+    const rest = members.filter((m) => !numericLike(m));
+    const ors: string[] = [];
+    if (nums.length > 0) {
+      ors.push(`${lhs} IN (SELECT CAST(value AS NUMERIC) FROM json_each(?))`);
+      params.push(jsonEachParam(nums));
+    }
+    if (rest.length > 0) {
+      ors.push(`${converted} IN (SELECT value FROM json_each(?))`);
+      params.push(jsonEachParam(rest));
+    }
+    return ors.length === 1 ? ors[0]! : `(${ors.join(" OR ")})`;
+  };
+
+  for (const [op, value] of Object.entries(opObj)) {
+    switch (op as QueryOp) {
+      case "eq":
+        if (value === null) {
+          parts.push(`${raw} IS NULL`);
+        } else {
+          parts.push(`${lhsFor(value)} = ${rhs(value)}`);
+          params.push(toBinding(field, op, value));
+        }
+        break;
+      case "ne":
+        if (value === null) {
+          parts.push(`${raw} IS NOT NULL`);
+        } else {
+          parts.push(`(${raw} IS NULL OR ${lhsFor(value)} <> ${rhs(value)})`);
+          params.push(toBinding(field, op, value));
+        }
+        break;
+      case "gt":
+      case "gte":
+      case "lt":
+      case "lte": {
+        const sym = op === "gt" ? ">" : op === "gte" ? ">=" : op === "lt" ? "<" : "<=";
+        parts.push(`${lhsFor(value)} ${sym} ${rhs(value)}`);
+        params.push(toBinding(field, op, value));
+        break;
+      }
+      case "in":
+      case "not_in": {
+        if (!Array.isArray(value)) {
+          throw new QueryError(
+            `operator "${op}" on metadata field "${field}" expects an array`,
+            "INVALID_OPERATOR_VALUE",
+          );
+        }
+        if (value.length === 0) {
+          parts.push(op === "in" ? "0" : "1");
+          break;
+        }
+        const members = value.map((v) => toJsonEachMember(field, op, v));
+        const set = inSet(members);
+        parts.push(op === "in" ? set : `(${raw} IS NULL OR NOT ${set})`);
+        break;
+      }
+      case "exists":
+        if (typeof value !== "boolean") {
+          throw new QueryError(
+            `operator "exists" on metadata field "${field}" expects a boolean`,
+            "INVALID_OPERATOR_VALUE",
+          );
+        }
+        parts.push(value ? `${raw} IS NOT NULL` : `${raw} IS NULL`);
+        break;
+    }
+  }
+
+  return {
+    sql: parts.length === 1 ? parts[0]! : `(${parts.join(" AND ")})`,
+    params,
+  };
+}
+
+/**
+ * The sort key for `order_by` on a field that isn't indexed: the JSON value
+ * converted the way the indexed column would hold it. TEXT: as text. NUMERIC:
+ * text that NUMERIC affinity converts sorts as that number (`"5"` among 3 and
+ * 8), anything else as itself, so numbers come before text as they do in an
+ * INTEGER column.
+ */
+export function scanOrderSql(field: string, affinity: ScanAffinity): string {
+  const raw = scanValueSql(field);
+  if (affinity === "TEXT") return `CAST(${raw} AS TEXT)`;
+  // `x = CAST(x AS NUMERIC)` is true for text exactly when NUMERIC affinity
+  // would convert it: the CAST side carries NUMERIC affinity, so SQLite
+  // applies that affinity to x before comparing, and text that isn't a
+  // well-formed number stays text and can't equal a number. So `"08"`, `" 5"`
+  // and `"1e2"` sort as 8, 5 and 100, as the filter (and an INTEGER column)
+  // reads them; `"1-2"` and `"abc"` stay text.
+  return `(CASE WHEN typeof(${raw}) = 'text' AND ${raw} = CAST(${raw} AS NUMERIC) THEN CAST(${raw} AS NUMERIC) ELSE ${raw} END)`;
 }
 
 // ---------------------------------------------------------------------------

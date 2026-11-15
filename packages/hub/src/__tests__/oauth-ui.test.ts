@@ -116,7 +116,7 @@ describe("renderConsent", () => {
     expect(html).toContain("vault:read");
     expect(html).toContain("vault:admin");
     // Scope explanations from the registry
-    expect(html).toContain("Read your notes");
+    expect(html).toContain("Read the whole vault");
     // hub#689 Leg 1: the admin label enumerates the concrete grants — and
     // leads with tag-schema management, which is the most common legitimate
     // reason an MCP client needs admin at all.
@@ -653,7 +653,7 @@ describe("renderConsent displayVault substitution", () => {
     expect(html).toContain("scope-pending-note");
     expect(html).toContain("A specific vault is picked below");
     // explainScope label still resolves via the verb-form lookup.
-    expect(html).toContain("Read your notes");
+    expect(html).toContain("Read the whole vault");
   });
 
   test("admin displayVault substitution includes the admin verb", () => {

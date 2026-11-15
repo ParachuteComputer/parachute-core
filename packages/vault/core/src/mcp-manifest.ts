@@ -1,6 +1,8 @@
 import { SEARCH_MODES } from "./search-query.js";
+import { HYBRID_TEXT } from "./hybrid.js";
 import { MIN_CONTENT_LENGTH } from "./content-range-constants.js";
 import { MAX_TICKET_UPLOAD_BYTES } from "./attachment/tickets.js";
+import { SHORT_TOOLS } from "./mcp-short.js";
 
 /**
  * Pure-data MCP tool manifest — the single source of truth for every core MCP
@@ -44,7 +46,14 @@ export interface McpToolManifestEntry {
   condition: McpToolCondition;
 }
 
-export const MCP_TOOL_MANIFEST: readonly McpToolManifestEntry[] = [
+/**
+ * The full reference for every core tool: the long descriptions and complete
+ * input schemas agents saw before 0.9's description budget. No longer sent in
+ * `tools/list`; `vault-info { help: "<tool>" }` returns an entry, and its
+ * schema's property names are the parameters a tool accepts
+ * (`unknownParams`, mcp-short.ts).
+ */
+export const MCP_TOOL_REFERENCE: readonly McpToolManifestEntry[] = [
     {
       name: "query-notes",
       requiredVerb: "read",
@@ -77,7 +86,7 @@ Response shape (vault#550 — three variants, pick by what you passed):
 
 \`search\` is literal-by-default (vault#551): your text is escaped and phrase-quoted before it reaches FTS5, so ordinary punctuation ("didn't", "eleven-day", "18.6") is matched as literal content instead of being parsed as query syntax (a bare hyphen used to mean NOT; an apostrophe or decimal point used to break the parse and silently return \`[]\`). Pass \`search_mode: "advanced"\` to opt back into raw FTS5 syntax (AND/OR/NOT, manual phrase quoting, prefix \`*\`) — a malformed advanced query now throws a structured error instead of silently returning \`[]\`. \`sort\` is honored under \`search\` too: omit it for relevance ranking (default), or pass "asc"/"desc" to order by \`created_at\` instead.
 
-\`search\` indexes BOTH a note's title (\`path\`) and its \`content\` (vault#551 WS2C, schema v25) — a title match is weighted far above a passing body mention, so a dedicated note on a topic outranks another note that merely references it. Every result carries a \`score\` field (higher = more relevant; only meaningful as a RELATIVE comparison within one result set). Word matching also stems regular English affixes ("firefighter" matches "firefighters", "microbe" matches "microbes") — irregular plurals with a consonant change ("wolf"/"wolves") aren't covered by stemming. A search that returns ZERO results may carry a \`search_did_you_mean\` warning suggesting the closest indexed term when one looks like a likely typo (only unscoped sessions — tag-scoped tokens never see it, since the suggestion is computed vault-wide).`,
+\`search\` indexes BOTH a note's title (\`path\`) and its \`content\` (vault#551 WS2C, schema v25) — a title match is weighted far above a passing body mention, so a dedicated note on a topic outranks another note that merely references it. Field values (the text of every metadata value) are searched too, ranked below title and body hits. Every result carries a \`score\` field (higher = more relevant; only meaningful as a RELATIVE comparison within one result set). Word matching also stems regular English affixes ("firefighter" matches "firefighters", "microbe" matches "microbes") — irregular plurals with a consonant change ("wolf"/"wolves") aren't covered by stemming. A search that returns ZERO results may carry a \`search_did_you_mean\` warning suggesting the closest indexed term when one looks like a likely typo (only unscoped sessions — tag-scoped tokens never see it, since the suggestion is computed vault-wide).`,
       inputSchema: {
         type: "object",
         properties: {
@@ -150,13 +159,13 @@ Response shape (vault#550 — three variants, pick by what you passed):
           search: {
             type: "string",
             description:
-              'Full-text search query, matched against BOTH a note\'s title (path) and its content — a title match ranks far above a passing body mention. Literal-by-default (vault#551): your text is escaped and phrase-quoted before reaching FTS5, so punctuation ("didn\'t", "eleven-day", "18.6") is matched as literal content rather than parsed as FTS5 query syntax. Pass `search_mode: "advanced"` for raw FTS5 syntax (boolean/phrase/prefix operators). `sort` is honored under search (see below) — default is relevance ranking. Matching stems regular affixes ("firefighter"/"firefighters") but not irregular plurals ("wolf"/"wolves"). Results carry a `score` field (higher = more relevant, relative within this result set only). A zero-result search may carry a `search_did_you_mean` warning (unscoped sessions only).',
+              'Full-text search query, matched against a note\'s title (path), its content and its field values — a title match ranks far above a passing body mention, and a field-only match comes after title and body matches. (vault#551): your text is escaped and phrase-quoted before reaching FTS5, so punctuation ("didn\'t", "eleven-day", "18.6") is matched as literal content rather than parsed as FTS5 query syntax. Pass `search_mode: "advanced"` for raw FTS5 syntax (boolean/phrase/prefix operators). `sort` is honored under a literal or advanced search (see below) — default is relevance ranking. ' + HYBRID_TEXT.refSearch + '. Matching stems regular affixes ("firefighter"/"firefighters") but not irregular plurals ("wolf"/"wolves"). Results carry a `score` field (higher = more relevant, relative within this result set only). A zero-result search may carry a `search_did_you_mean` warning (unscoped sessions only).',
           },
           search_mode: {
             type: "string",
             enum: [...SEARCH_MODES],
             description:
-              'How `search` text is turned into an FTS5 query (vault#551). "literal" (DEFAULT): escape + phrase-quote the text so punctuation is literal content, not FTS5 syntax — the fix for `search: "didn\'t"` / "eleven-day" / "18.6" silently returning `[]`. "advanced": pass the text through to FTS5 raw, for callers who want boolean (AND/OR/NOT), manual phrase quoting, or prefix (`*`) syntax — a malformed advanced query throws a structured error (`error_type: "invalid_search_syntax"`) instead of silently returning `[]`. Has no effect without `search` (an `ignored_param` warning fires if you pass it without `search`). Omit for the default ("literal").',
+              'How `search` text is turned into an FTS5 query (vault#551). "literal": escape + phrase-quote the text so punctuation is literal content, not FTS5 syntax — the fix for `search: "didn\'t"` / "eleven-day" / "18.6" silently returning `[]`. "advanced": pass the text through to FTS5 raw, for callers who want boolean (AND/OR/NOT), manual phrase quoting, or prefix (`*`) syntax — a malformed advanced query throws a structured error (`error_type: "invalid_search_syntax"`) instead of silently returning `[]`. ' + HYBRID_TEXT.refMode,
           },
           near_text: {
             type: "string",
@@ -170,14 +179,15 @@ Response shape (vault#550 — three variants, pick by what you passed):
           },
           metadata: {
             type: "object",
-            description: "Filter by metadata values. Each value is either a primitive (exact match, scans JSON) or an operator object: `{eq|ne|gt|gte|lt|lte|in|not_in|exists: value}`. Operator objects require the field to be declared `indexed: true` in a tag schema — they route through the backing B-tree index. Multiple operators on one field AND together (e.g. `{gt: 5, lt: 10}`). `in`/`not_in` take arrays; `exists` takes a boolean.",
+            description: "Filter by metadata values. Each value is either a primitive (exact match by JSON type, so `{done: true}` and `{streak: 4}` find a stored boolean and number; a stored string that reads the same also matches, but a string filter like `{streak: \"4\"}` finds only the string) or an operator object: `{eq|ne|gt|gte|lt|lte|in|not_in|exists: value}`. Operator objects require the field to be declared `indexed: true` in a tag schema — they route through the backing B-tree index. Multiple operators on one field AND together (e.g. `{gt: 5, lt: 10}`). `in`/`not_in` take arrays; `exists` takes a boolean.",
           },
-          created_by: { type: "string", description: "Write-attribution filter (vault#298): only notes whose FIRST write was attributed to this principal (a JWT subject, or an operator/token label). Exact match; indexed. Legacy/unattributed notes (NULL) never match." },
+          created_by: { type: "string", description: "Write-attribution filter (vault#298): only notes whose FIRST write was attributed to this principal (a JWT subject, an operator/token label, or `<key name>:<id>` for a key writing on behalf of someone). Exact match; indexed. Legacy/unattributed notes (NULL) never match." },
           last_updated_by: { type: "string", description: "Write-attribution filter (vault#298): only notes whose MOST RECENT write was attributed to this principal. Exact match; indexed." },
-          created_via: { type: "string", description: "Write-attribution filter (vault#298): only notes FIRST written through this interface/channel — e.g. `mcp`, `surface:<name>`, `agent:<id>`, `nostr:<64-hex-pubkey>`, `operator`, `api`. `nostr:<pubkey>` (vault#698) is the Nostr key that SIGNED the request, and is the axis that tells two agents apart when they share one hub user (`created_by`). Emitted by BOTH doors — self-hosted hub (parachute-hub#937) and cloud (parachute-cloud#277). Exact match; indexed." },
+          created_via: { type: "string", description: "Write-attribution filter (vault#298): only notes FIRST written through this interface/channel — e.g. `mcp`, `key:<name>` (a named key), `surface:<name>`, `agent:<id>`, `nostr:<64-hex-pubkey>`, `operator`, `api`. `nostr:<pubkey>` (vault#698) is the Nostr key that SIGNED the request, and is the axis that tells two agents apart when they share one hub user (`created_by`). Emitted by BOTH doors — self-hosted hub (parachute-hub#937) and cloud (parachute-cloud#277). Exact match; indexed." },
           last_updated_via: { type: "string", description: "Write-attribution filter (vault#298): only notes whose MOST RECENT write came through this interface/channel — same vocabulary as `created_via`, including `nostr:<64-hex-pubkey>` for the signing key. Exact match; indexed." },
           order_by: { type: "string", description: "Sort by an indexed metadata field instead of `created_at`. Field must be declared `indexed: true`; errors otherwise. Two special values need no declaration: `link_count` sorts by link DEGREE (both-directions raw row count), matching the `include_link_count` field for unscoped both-direction counts. Under tag scope ordering still uses GLOBAL degree and may disagree with `linkCount`; `updated_at` (vault#585) sorts on the integer `updated_at_ms` mirror column — correct on non-canonical/imported timestamps — with `id` as the tiebreaker. Direction is taken from `sort` (default 'asc'); for other fields `created_at` is appended as a stable tiebreaker." },
-          date_from: { type: "string", description: "Start date (ISO, inclusive). Filters on `created_at` (vault ingestion time). Shorthand for `date_filter: { field: 'created_at', from }`." },
+          since: { type: "string", description: "What changed since then: notes made OR edited at or after this time (ISO). Shorthand for `date_filter: { field: 'updated_at', from }`. For only the notes made since then, use `date_from`." },
+          date_from: { type: "string", description: "Start date (ISO, inclusive). Filters on `created_at` (vault ingestion time), so it misses edits to older notes; for what changed, use `since`. Shorthand for `date_filter: { field: 'created_at', from }`." },
           date_to: { type: "string", description: "End date (ISO, exclusive). Filters on `created_at` (vault ingestion time). Shorthand for `date_filter: { field: 'created_at', to }`." },
           date_filter: {
             type: "object",
@@ -191,7 +201,7 @@ Response shape (vault#550 — three variants, pick by what you passed):
           aggregate: {
             type: "object",
             properties: {
-              group_by: { type: "string", description: "What to group by: an indexed metadata field name (declared `indexed: true` in a tag schema — same FIELD_NOT_INDEXED contract as `metadata` operator queries / `order_by`), or the special value \"tag\" to group by tag membership. Under \"tag\", a note carrying N of the tags present in the filtered result set contributes to N separate groups (a membership rollup, not a partition). Optional when op is \"count\" — omit it for a single filtered-total row `{group: null, value: N}` (vault#626). Required for \"sum\"." },
+              group_by: { type: "string", description: "What to group by: an indexed metadata field name (declared `indexed: true` in a tag schema; aggregate refuses any other with FIELD_NOT_INDEXED, and so does a `metadata` operator or `date_filter` beside it, though a plain list scans them), or the special value \"tag\" to group by tag membership. Under \"tag\", a note carrying N of the tags present in the filtered result set contributes to N separate groups (a membership rollup, not a partition). Optional when op is \"count\" — omit it for a single filtered-total row `{group: null, value: N}` (vault#626). Required for \"sum\"." },
               op: { type: "string", enum: ["count", "sum"], description: "\"count\": number of matching notes per group, or the filtered total when group_by is omitted. \"sum\": sum of `field` per group." },
               field: { type: "string", description: "Required when `op` is \"sum\"; ignored for \"count\". Must be an indexed metadata field with a numeric storage type (declared `type: \"integer\"` or `type: \"boolean\"` — the only indexable numeric shapes; a bare `type: \"number\"` field is never indexed and a TEXT-backed field can't be summed)." },
             },
@@ -507,13 +517,14 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
       // genuinely append-only callers — gating WITHIN write rather
       // than promoting deletes out of it.
       requiredVerb: "write",
-      description: "Permanently delete a note and all its tags and links. Accepts ID, path, or (fallback, only when id/path both miss and exactly one note matches) its H1 title.",
+      description: "Delete a note and all its tags and links. Accepts ID, path, or (fallback, only when id/path both miss and exactly one note matches) its H1 title; or `ids`, a list (up to 500), all resolved before any is deleted, so a list naming a missing note deletes nothing. A delete keeps a version of the note (restorable from its history) unless `erase_history: true`, which also erases every saved version, so the vault itself has nothing left to restore (a git mirror, exports and backups keep their own copies); that needs the vault's admin scope, and with it an id may also be a note already deleted whose history is left (list them with REST `GET /api/history/deleted`). Returns `{deleted, id}` (plus `history_erased`) for `id`, `{deleted: <count>, results: [...]}` for `ids`.",
       inputSchema: {
         type: "object",
         properties: {
           id: { type: "string", description: "Note ID, path, or (fallback, only when id/path both miss and exactly one note matches) its H1 title" },
+          ids: { type: "array", items: { type: "string" }, description: "Several notes (IDs or paths), instead of `id`; up to 500" },
+          erase_history: { type: "boolean", description: "Also erase every saved version, so the vault can't restore the note (default false; a git mirror or backup keeps its own copy). Needs admin scope. Takes only an exact id or path." },
         },
-        required: ["id"],
       },
       condition: "core",
     },
@@ -591,7 +602,7 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
       // `generateMcpTools` doc comment above for the full re-tier rationale
       // + BREAKING note.
       requiredVerb: "admin",
-      description: "Delete a tag, remove it from all notes, and delete its schema. Notes themselves are NOT deleted — just untagged. Refused with error_type \"tag_referenced_as_parent\" (vault#552) when another tag's parent_names still names this one — pass cascade OR detach (either — both mean the same thing: strip the stale reference from the referencing tag(s)' parent_names, never delete them) to proceed anyway. Also refused with error_type \"tag_in_use_by_tokens\" (vault#555 fix — this case existed pre-#555 but was undocumented here; see \"merge-tags\" for the identical guard) when the tag is referenced by a tag-scoped token's allowlist — revoke or re-mint the token(s) first. A no-op on a tag with no identity row and no notes returns {deleted: false, notes_untagged: 0} rather than erroring.",
+      description: "Delete a tag, remove it from all notes, and delete its schema. Notes themselves are NOT deleted — just untagged. Refused with error_type \"tag_referenced_as_parent\" (vault#552) when another tag's parent_names still names this one — pass cascade OR detach (either — both mean the same thing: strip the stale reference from the referencing tag(s)' parent_names, never delete them) to proceed anyway. Also refused with error_type \"tag_in_use_by_tokens\" (vault#555 fix — this case existed pre-#555 but was undocumented here; see \"merge-tags\" for the identical guard) when the tag is referenced by a tag-scoped token's allowlist — revoke or re-mint the token(s) first. Refused with error_type \"tag_in_use\" (0.9.1) when a live key's tag limit, private_tags or the published tag reaches the tag (or the caller is tag-scoped), until you pass force: true; the refusal names the keys (not to a tag-scoped caller). A no-op on a tag with no identity row and no notes returns {deleted: false, notes_untagged: 0} rather than erroring.",
       inputSchema: {
         type: "object",
         properties: {
@@ -635,7 +646,7 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
       // comment above for the full re-tier rationale + BREAKING note.
       requiredVerb: "admin",
       description:
-        "Atomically merge one or more source tags into a target tag: every note carrying any source is retagged with the target, then the source tags (and their identity rows — description/fields/relationships/parent_names) are dropped. target is created if it doesn't exist yet; target's own schema is preserved (sources' schemas are consumed, not merged field-by-field). Sources that don't exist are reported at count 0. Refused with error_type \"tag_in_use_by_tokens\" if a source is referenced by a tag-scoped token — revoke or re-mint it first.",
+        "Atomically merge one or more source tags into a target tag: every note carrying any source is retagged with the target, then the source tags (and their identity rows — description/fields/relationships/parent_names) are dropped. target is created if it doesn't exist yet; target's own schema is preserved (sources' schemas are consumed, not merged field-by-field). Sources that don't exist are reported at count 0. Refused with error_type \"tag_in_use_by_tokens\" if a source is referenced by a tag-scoped token — revoke or re-mint it first. Refused with error_type \"tag_in_use\" (0.9.1) when a live key's tag limit, private_tags or the published tag reaches a source or the target (or the caller is tag-scoped), until you pass force: true.",
       inputSchema: {
         type: "object",
         properties: {
@@ -702,6 +713,30 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
       condition: "core",
     },
     {
+      name: "migrate-field",
+      // `admin` (0.9.2), like prune-schema: it rewrites a field on every
+      // record carrying the type. Reached only as manage-types {action:
+      // "migrate"}; not listed on its own (src/mcp-tools.ts FOLD_ONLY).
+      requiredVerb: "admin",
+      description:
+        "Change a field's values on every record carrying a type (and its subtypes), e.g. before retyping the field. A dry run unless apply: true: it returns {would_change, unchanged, errored, sample, errors}. Atomic: if any value can't be converted, nothing is written unless continue_on_error: true.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          tag: { type: "string", description: "The type whose records carry the field." },
+          field: { type: "string", description: "The field whose values change." },
+          transform: {
+            type: "object",
+            description: '{kind: "to_string"|"to_int"|"to_number"|"to_boolean"} converts each value; {kind: "rename", to} moves it to another field; {kind: "remap", map: {old: new}, default?}; {kind: "set_default", value, onlyInvalid?}.',
+          },
+          apply: { type: "boolean", description: "Write the change. Default false: a dry run." },
+          continue_on_error: { type: "boolean", description: "Write the values that convert and report the rest. Default false: all or nothing." },
+        },
+        required: ["tag", "field", "transform"],
+      },
+      condition: "core",
+    },
+    {
       name: "doctor",
       // `read` (was `admin` — the original reasoning: same tier as
       // prune-schema, a diagnostic over the WHOLE vault's taxonomy, not
@@ -715,7 +750,7 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
       // re-tiered to `read` too, so both doors agree — no MCP/REST divergence.
       requiredVerb: "read",
       description:
-        "Read-only integrity scan across the tag/metadata taxonomy — run this after any bulk tag reorg (rename/merge/delete/subtree move) to confirm nothing leaked. Returns {findings, summary, scanned_at} — findings is an array, each entry {type, severity, subject, detail, remedy} — NEVER auto-fixes; apply the suggested remedy (usually rename-tag/merge-tags/update-tag/prune-schema) yourself. Finding types: dangling_parent_name (a parent_names entry naming a tag with no identity row), parent_names_cycle (a tag reaching itself through its ancestor chain — traversal tolerates this, but it's dishonest hierarchy state), mixed_type_indexed_field (a note's metadata value for an indexed field has a JSON type disagreeing with the field's declared storage type — the ordering/filtering-goes-silently-wrong precursor), orphaned_indexed_field_declarer (an indexed field naming a dead declarer tag — see prune-schema), and dead_tag_metadata_reference (HEURISTIC, always carries heuristic:true — a metadata value that looks like a stale reference to a renamed/merged/deleted tag, inferred from sibling notes using the same metadata key with values that ARE live tags; can never be certain since vault keeps no tag-rename history).",
+        "Read-only integrity scan across the tag/metadata taxonomy — run this after any bulk tag reorg (rename/merge/delete/subtree move) to confirm nothing leaked. Returns {findings, summary, scanned_at} — findings is an array, each entry {type, severity, subject, detail, remedy} — NEVER auto-fixes; apply the suggested remedy (usually rename-tag/merge-tags/update-tag/prune-schema) yourself. Finding types: dangling_parent_name (a parent_names entry naming a tag with no identity row), parent_names_cycle (a tag reaching itself through its ancestor chain — traversal tolerates this, but it's dishonest hierarchy state), mixed_type_indexed_field (a note's metadata value for an indexed field has a JSON type disagreeing with the field's declared storage type — the ordering/filtering-goes-silently-wrong precursor), orphaned_indexed_field_declarer (an indexed field naming a dead declarer tag — see prune-schema), dead_tag_metadata_reference (HEURISTIC, always carries heuristic:true — a metadata value that looks like a stale reference to a renamed/merged/deleted tag, inferred from sibling notes using the same metadata key with values that ARE live tags; can never be certain since vault keeps no tag-rename history), mixed_type_field (a field that isn't indexed holding values of two data types), declared_reference_gap (a field whose values name other notes in most notes but that no tag declares a reference; the remedy names the update) and near_names (two type names or two field names one letter apart; advice, both may be meant).",
       inputSchema: { type: "object", properties: {
         deep: { type: "boolean", description: "Opt-in, unrestricted sessions only: materialize and hash-check a bounded history blob page. Check history_audit.complete; incomplete is not a clean audit." },
         history_after: { type: "string", description: "Resume after history_audit.next_after. Pages are not a snapshot; audit a consistent backup for snapshot assurance." },
@@ -789,3 +824,21 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
       condition: "attachment-bytes",
     },
 ];
+
+/**
+ * What `tools/list` sends: each reference entry with its short description and
+ * schema from mcp-short.ts (T-318 §4 description budget). Same names, verbs,
+ * conditions and order as the reference.
+ */
+export const MCP_TOOL_MANIFEST: readonly McpToolManifestEntry[] = MCP_TOOL_REFERENCE.map((entry) => {
+  const short = SHORT_TOOLS[entry.name];
+  if (!short) throw new Error(`mcp-short.ts has no entry for MCP tool "${entry.name}"`);
+  return { ...entry, description: short.description, inputSchema: short.inputSchema };
+});
+
+/** The parameter names a core tool accepts: every property of its full reference schema. */
+export function acceptedParams(tool: string): string[] | null {
+  const entry = MCP_TOOL_REFERENCE.find((e) => e.name === tool);
+  if (!entry) return null;
+  return Object.keys(((entry.inputSchema as { properties?: Record<string, unknown> }).properties) ?? {});
+}

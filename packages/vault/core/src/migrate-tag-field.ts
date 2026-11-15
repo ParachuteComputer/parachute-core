@@ -37,6 +37,7 @@
 
 import type { Store, Note } from "./types.js";
 import type { ValidationWarning } from "./schema-defaults.js";
+import { loadSchemaConfig, resolveNoteSchemas } from "./schema-defaults.js";
 import { enforceStrictWrite } from "./mcp.js";
 
 // Re-export for callers (tests, server layer) that work with the bypass
@@ -507,8 +508,12 @@ function makeFieldValidator(
       metadata: { [field]: v },
     });
     if (!status) return true;
+    // Only the rules of the type that decides the field (first in the walk)
+    // say "invalid": since 0.9.2 the record's other types are checked too,
+    // advisory, and a value they alone dislike isn't one to overwrite.
+    const decider = resolveNoteSchemas(loadSchemaConfig(store.db), { tags: [tag] }).mergedFields.get(field)?.sourceTag;
     return !status.warnings.some(
-      (w) => w.field === field && w.reason !== "schema_conflict" && w.reason !== "missing_required",
+      (w) => w.field === field && w.schema === decider && w.reason !== "schema_conflict" && w.reason !== "missing_required",
     );
   };
 }
@@ -635,4 +640,79 @@ function validateTransform(field: string, transform: FieldTransform): void {
     default:
       throw new TransformError(`unknown transform: ${(transform as { kind: string }).kind}`);
   }
+}
+
+// ---------------------------------------------------------------------------
+// The REST and MCP request (0.9.2): one parser, one reply shape for both doors
+// ---------------------------------------------------------------------------
+
+/** A malformed migrate request (400 on REST, an error on MCP). */
+export class MigrateRequestError extends Error {
+  constructor(message: string, readonly field: string) {
+    super(message);
+  }
+}
+
+/**
+ * The reply both doors give: the plan (dry run) or what was written. A dry
+ * run says `would_change`; an applied run says `changed`, and `applied:
+ * false` with `errored > 0` means an atomic apply stopped before writing.
+ */
+export interface MigratePlanReply {
+  tag: string;
+  field: string;
+  transform: FieldTransform;
+  applied: boolean;
+  scanned: number;
+  would_change?: number;
+  changed?: number;
+  unchanged: number;
+  errored: number;
+  sample: MigrateChange[];
+  errors: MigrateErroredNote[];
+}
+
+/**
+ * Parse `{field, transform, apply?, continue_on_error?}` and run
+ * {@link migrateTagField}. Used by `POST /api/tags/<type>/migrate` and MCP
+ * `manage-types {action: "migrate"}`, so the two doors can't differ.
+ */
+export async function runMigrateRequest(
+  store: Store,
+  tag: string,
+  body: Record<string, unknown>,
+  opts: { actor?: string | null; via?: string | null; onStrictBypass?: MigrateTagFieldOpts["onStrictBypass"] } = {},
+): Promise<MigratePlanReply> {
+  const field = body.field;
+  if (typeof field !== "string" || field.length === 0) {
+    throw new MigrateRequestError("migrate needs `field`: the field whose values change", "field");
+  }
+  const transform = body.transform;
+  if (!transform || typeof transform !== "object" || Array.isArray(transform)) {
+    throw new MigrateRequestError(
+      'migrate needs `transform`: {kind: "to_string"|"to_int"|"to_number"|"to_boolean"|"rename"|"remap"|"set_default", ...}',
+      "transform",
+    );
+  }
+  for (const k of ["apply", "continue_on_error"] as const) {
+    if (body[k] !== undefined && typeof body[k] !== "boolean") throw new MigrateRequestError(`\`${k}\` must be a boolean`, k);
+  }
+  let result: MigrateTagFieldResult;
+  try {
+    result = await migrateTagField(store, {
+      tag,
+      field,
+      transform: transform as FieldTransform,
+      apply: body.apply === true,
+      continueOnError: body.continue_on_error === true,
+      actor: opts.actor ?? undefined,
+      via: opts.via ?? undefined,
+      ...(opts.onStrictBypass ? { onStrictBypass: opts.onStrictBypass } : {}),
+    });
+  } catch (e) {
+    if (e instanceof TransformError) throw new MigrateRequestError(e.message, "transform");
+    throw e;
+  }
+  const { changed, ...rest } = result;
+  return result.applied ? { ...rest, changed } : { ...rest, would_change: changed };
 }

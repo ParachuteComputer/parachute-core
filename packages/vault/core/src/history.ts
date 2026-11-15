@@ -12,7 +12,9 @@
  */
 import type { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { encodeDelta, decodeDelta } from "./delta.js";
+import { encodeDelta, applyDeltaBytes } from "./delta.js";
+import { isWhole, isDelta, wholeText, deltaBytes, wholeSql, BlobDecodeError, type StoredContent } from "./blob-codec.js";
+import { kindOfVia } from "./write-stamp.js";
 import { transaction } from "./txn.js";
 import { refreshCompactState } from "./history-compact-state.js";
 
@@ -38,6 +40,13 @@ export interface HistoryPolicy {
   max_bytes_per_note: number | null;
   compact_budget_ms: number;
   compact_max_notes: number;
+  /**
+   * Burst collapse (T-460): an edit by the same writer through the same named key (actor and a `via` of `key:` or
+   * `nostr:`) within this many seconds of the note's newest version captures nothing, so a burst of edits leaves one
+   * version (the body from before the burst). 0 is off. Never applied to deletes, restores, renames, imports, writers
+   * with no actor, or a shared channel (`api`, `mcp`, the operator, a legacy token).
+   */
+  burst_window_seconds: number;
 }
 export const DEFAULT_HISTORY_POLICY: HistoryPolicy = {
   enabled: true,
@@ -52,6 +61,7 @@ export const DEFAULT_HISTORY_POLICY: HistoryPolicy = {
   max_bytes_per_note: 8_388_608,
   compact_budget_ms: 250,
   compact_max_notes: 50,
+  burst_window_seconds: 900,
 };
 export function resolveHistoryPolicy(
   partial?: Partial<HistoryPolicy>,
@@ -68,6 +78,9 @@ export function resolveHistoryPolicy(
   if (p.max_bytes_per_note !== null) p.max_bytes_per_note = Math.max(65_536, p.max_bytes_per_note);
   p.compact_budget_ms = Math.min(60_000, Math.max(0, p.compact_budget_ms));
   p.compact_max_notes = Math.min(10_000, Math.max(0, p.compact_max_notes));
+  // An untyped caller may pass a string or null: "0" and null turn it off; anything unreadable keeps the default.
+  const burst = p.burst_window_seconds === null ? 0 : Number(p.burst_window_seconds);
+  p.burst_window_seconds = Number.isFinite(burst) ? Math.floor(Math.min(86_400, Math.max(0, burst))) : DEFAULT_HISTORY_POLICY.burst_window_seconds;
   return p;
 }
 export const VERSION_MAX_BYTES = 2_000_000;
@@ -90,6 +103,8 @@ export interface VersionRow {
   superseded_at: string;
   actor: string | null;
   via: string | null;
+  /** The kind of the key in `via` (person, agent, app, service), or null: the write stamp (write-stamp.ts). */
+  via_kind: string | null;
   op: HistoryOp;
   content_len: number;
   encoding: string | null;
@@ -188,6 +203,8 @@ export function captureVersion(
     via: string | null;
     op: HistoryOp;
     policy: HistoryPolicy;
+    /** The path and extension this write sets, when it sets them: a rename is never part of a burst. */
+    next?: { path?: string | null; extension?: string | null };
   },
 ): void {
   if (!opts.policy.enabled) return;
@@ -200,7 +217,7 @@ export function captureVersion(
     const ix = nextIndex(db, prior.id);
     db.prepare(
       `INSERT INTO note_versions (note_id, version_ix, content_hash, path, metadata, extension,
-      superseded_at, actor, via, op, content_len, encoding, created_at) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, 'delete', ?, 'overflow', ?)`,
+      superseded_at, actor, via, via_kind, op, content_len, encoding, created_at) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, 'delete', ?, 'overflow', ?)`,
     ).run(
       prior.id,
       ix,
@@ -210,12 +227,15 @@ export function captureVersion(
       new Date().toISOString(),
       opts.actor,
       opts.via,
+      kindOfVia(opts.via),
       size,
       prior.created_at,
     );
     pruneVersions(db, prior.id, opts.policy, Date.now(), false);
     return;
   }
+  // After the size refusal, so an oversized body still fails the write.
+  if (inBurst(db, prior, opts, Date.now())) return;
   const hash = hashContent(text);
   db.prepare(
     "INSERT OR IGNORE INTO note_blobs (hash, content, byte_size) VALUES (?, ?, ?)",
@@ -223,7 +243,7 @@ export function captureVersion(
   const ix = nextIndex(db, prior.id);
   db.prepare(
     `INSERT INTO note_versions (note_id, version_ix, content_hash, path, metadata, extension,
-    superseded_at, actor, via, op, content_len, encoding, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
+    superseded_at, actor, via, via_kind, op, content_len, encoding, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
   ).run(
     prior.id,
     ix,
@@ -234,11 +254,47 @@ export function captureVersion(
     new Date().toISOString(),
     opts.actor,
     opts.via,
+    kindOfVia(opts.via),
     opts.op,
     size,
     prior.created_at,
   );
   pruneVersions(db, prior.id, opts.policy, Date.now(), false);
+}
+const BURST_OPS: ReadonlySet<string> = new Set(["update", "append", "prepend"]);
+/**
+ * Whether a write stamp's `via` names one credential (write-stamp.ts): a named key (`key:<name>`) or a Nostr key
+ * (`nostr:<pubkey>`). Other vias are a channel (`api`, `mcp`) or a class (`operator`, a legacy `token:<hash>`) that
+ * several writers can share under one actor, so they never make a burst.
+ */
+function namesOneCredential(via: string | null): boolean {
+  return via !== null && (via.startsWith("key:") || via.startsWith("nostr:"));
+}
+/**
+ * Whether this capture is part of a burst and writes nothing (T-460). All must hold: a window is set; this write and
+ * the note's newest version are both an update, append or prepend; both by the same non-null actor through the same
+ * via, and that via names one credential (a named key or a Nostr key); this write keeps the path and extension, which the newest version also had; and the newest version was
+ * captured no more than the window ago, and not in the future (a row from a clock ahead, a grafted box's say, never
+ * starts a skip run). The newest row holds the body from before the burst, so a read "as of" a time inside the burst
+ * is late by at most one burst.
+ */
+function inBurst(
+  db: Database,
+  prior: PriorNoteRow,
+  opts: { actor: string | null; via: string | null; op: HistoryOp; policy: HistoryPolicy; next?: { path?: string | null; extension?: string | null } },
+  now: number,
+): boolean {
+  const window = opts.policy.burst_window_seconds * 1000;
+  if (!(window > 0) || opts.actor === null || !BURST_OPS.has(opts.op) || !namesOneCredential(opts.via)) return false;
+  if (opts.next?.path !== undefined && opts.next.path !== prior.path) return false;
+  if (opts.next?.extension !== undefined && opts.next.extension !== prior.extension) return false;
+  const newest = db.prepare(
+    "SELECT actor, via, op, path, extension, superseded_at FROM note_versions WHERE note_id = ? ORDER BY version_ix DESC LIMIT 1",
+  ).get(prior.id) as { actor: string | null; via: string | null; op: string; path: string | null; extension: string | null; superseded_at: string } | null;
+  if (!newest || newest.actor !== opts.actor || newest.via !== opts.via || !BURST_OPS.has(newest.op)) return false;
+  if (newest.path !== prior.path || newest.extension !== prior.extension) return false;
+  const age = now - Date.parse(newest.superseded_at);
+  return age >= 0 && age <= window;
 }
 export function appendRestoreMarker(
   db: Database,
@@ -251,14 +307,15 @@ export function appendRestoreMarker(
   const ix = nextIndex(db, noteId);
   db.prepare(
     `INSERT INTO note_versions (note_id, version_ix, content_hash, path, metadata, extension,
-    superseded_at, actor, via, op, content_len, encoding, created_at)
-    SELECT note_id, ?, content_hash, path, metadata, extension, ?, ?, ?, 'restore', content_len, encoding, created_at
+    superseded_at, actor, via, via_kind, op, content_len, encoding, created_at)
+    SELECT note_id, ?, content_hash, path, metadata, extension, ?, ?, ?, ?, 'restore', content_len, encoding, created_at
       FROM note_versions WHERE note_id = ? AND version_ix = ?`,
   ).run(
     ix,
     new Date().toISOString(),
     attr.actor,
     attr.via,
+    kindOfVia(attr.via),
     noteId,
     tombstone.version_ix,
   );
@@ -344,7 +401,7 @@ export function sweepDeletedHistory(
   });
 }
 const columns =
-  "note_id, version_ix, content_hash, path, metadata, extension, superseded_at, actor, via, op, content_len, encoding, created_at";
+  "note_id, version_ix, content_hash, path, metadata, extension, superseded_at, actor, via, via_kind, op, content_len, encoding, created_at";
 function parseRow(row: RawVersionRow): VersionRow {
   let metadata: Record<string, unknown> = {};
   try {
@@ -407,13 +464,100 @@ export function eraseHistory(
   db: Database,
   noteId: string,
 ): { versionsDeleted: number; blobsDeleted: number } {
+  // The targeted erase, then the full sweep this endpoint has always run (it also collects orphans other paths left).
   return transaction(db, () => {
-    const versionsDeleted = db
-      .prepare("DELETE FROM note_versions WHERE note_id = ?")
-      .run(noteId).changes;
-    db.prepare("DELETE FROM history_compact_state WHERE note_id=?").run(noteId);
-    return { versionsDeleted, ...gcBlobs(db) };
+    const erased = eraseNoteVersions(db, noteId);
+    return { versionsDeleted: erased.versionsDeleted, blobsDeleted: erased.blobsDeleted + gcBlobs(db).blobsDeleted };
   });
+}
+/**
+ * Delete every version of one note, its compaction state, and the blobs only those versions used (T-412). Blobs are
+ * shared by content, so a blob goes only when no other version holds it and no other blob is a delta against it; a
+ * freed delta's base is then tried too (deltas are depth one). Reads grow with this note's history, not with the
+ * vault's, unlike {@link gcBlobs}, which {@link eraseHistory} still runs (it also sweeps orphans other paths left).
+ * Call inside a transaction.
+ */
+export function eraseNoteVersions(
+  db: Database,
+  noteId: string,
+): { versionsDeleted: number; blobsDeleted: number } {
+  const hashes = (db
+    .prepare("SELECT DISTINCT content_hash FROM note_versions WHERE note_id = ? AND content_hash IS NOT NULL")
+    .all(noteId) as { content_hash: string }[]).map((r) => r.content_hash);
+  const versionsDeleted = db.prepare("DELETE FROM note_versions WHERE note_id = ?").run(noteId).changes;
+  db.prepare("DELETE FROM history_compact_state WHERE note_id=?").run(noteId);
+  const baseOf = db.prepare("SELECT delta_of FROM note_blobs WHERE hash = ?");
+  const drop = db.prepare(
+    "DELETE FROM note_blobs WHERE hash = ? AND NOT EXISTS (SELECT 1 FROM note_versions WHERE content_hash = ?) AND NOT EXISTS (SELECT 1 FROM note_blobs WHERE delta_of = ?)",
+  );
+  let blobsDeleted = 0;
+  let wave = [...new Set(hashes)];
+  // Bounded like gcBlobs: two waves suffice at depth one; four even in a corrupt chain.
+  for (let pass = 0; pass < 4 && wave.length > 0; pass++) {
+    const next = new Set<string>();
+    for (const hash of wave) {
+      const row = baseOf.get(hash) as { delta_of: string | null } | null;
+      if (!row) continue;
+      drop.run(hash, hash, hash);
+      // Counted by looking, not by `.changes`: under Bun 1.4 this DELETE, when it removed nothing, reported the
+      // previous statement's count, which overstated blobs_deleted.
+      if (baseOf.get(hash)) continue;
+      blobsDeleted++;
+      if (row.delta_of) next.add(row.delta_of);
+    }
+    wave = [...next];
+  }
+  return { versionsDeleted, blobsDeleted };
+}
+/** One deleted note that still has history: what `GET /history/deleted` lists. */
+export interface DeletedNoteRow {
+  id: string;
+  /** The path its newest version had. */
+  path: string | null;
+  extension: string | null;
+  /** When it was deleted (its newest tombstone), or null when no tombstone is left (an interrupted erase, an import). */
+  deleted_at: string | null;
+  versions: number;
+}
+/**
+ * Notes that are gone but whose versions are not (T-412): every plain delete leaves one, and so does a "delete
+ * everything" interrupted between deleting and erasing. Newest deletion first. Reads every version row once, so it
+ * is an admin listing, not a hot path.
+ */
+export function listDeletedNotes(
+  db: Database,
+  opts?: { limit?: number; offset?: number },
+): { notes: DeletedNoteRow[]; total: number } {
+  if (!historyTablesPresent(db)) return { notes: [], total: 0 };
+  const limit = Math.min(1000, Math.max(0, opts?.limit ?? 100));
+  const offset = Math.max(0, opts?.offset ?? 0);
+  // One walk of note_versions in note_id order (idx_note_versions_note), one probe of notes per note id, the total
+  // from a window over the groups, and the newest path read for the page's rows only: the listing reads each
+  // version row once, not once per page twice.
+  const rows = db
+    .prepare(
+      `SELECT p.id, p.versions, p.deleted_at, p.total,
+        (SELECT x.path FROM note_versions x WHERE x.note_id = p.id ORDER BY x.version_ix DESC LIMIT 1) AS path,
+        (SELECT x.extension FROM note_versions x WHERE x.note_id = p.id ORDER BY x.version_ix DESC LIMIT 1) AS extension
+      FROM (
+        SELECT g.*, COUNT(*) OVER () AS total FROM (
+          SELECT v.note_id AS id, COUNT(*) AS versions, MAX(v.superseded_at) AS last_at,
+            MAX(CASE WHEN v.op = 'delete' THEN v.superseded_at END) AS deleted_at
+          FROM note_versions v GROUP BY v.note_id
+          HAVING NOT EXISTS (SELECT 1 FROM notes n WHERE n.id = v.note_id)
+        ) g ORDER BY g.last_at DESC, g.id ASC LIMIT ? OFFSET ?
+      ) p ORDER BY p.last_at DESC, p.id ASC`,
+    )
+    .all(limit, offset) as (DeletedNoteRow & { total: number })[];
+  let total = rows[0]?.total;
+  if (total === undefined) {
+    // An empty page (past the end, or limit 0) has no row to carry the window's count.
+    total = offset === 0 && limit > 0 ? 0 : (db
+      .prepare("SELECT COUNT(*) AS n FROM (SELECT 1 FROM note_versions v GROUP BY v.note_id HAVING NOT EXISTS (SELECT 1 FROM notes n WHERE n.id = v.note_id))")
+      .get() as { n: number }).n;
+  }
+  const notes = rows.map(({ total: _t, ...row }) => ({ id: row.id, path: row.path, extension: row.extension, deleted_at: row.deleted_at, versions: row.versions }));
+  return { notes, total };
 }
 export function deletedHistoryStats(db: Database): {
   notes: number;
@@ -439,45 +583,65 @@ export function deletedHistoryStats(db: Database): {
 
 export class HistoryDeltaOrphanError extends Error {
   readonly code = "HISTORY_UNRECOVERABLE";
-  constructor(readonly hash: string, readonly delta_of: string | null, readonly reason: "unknown_encoding" | "base_missing" | "base_not_whole" | "bad_delta" | "identity_mismatch") {
+  constructor(readonly hash: string, readonly delta_of: string | null, readonly reason: "unknown_encoding" | "base_missing" | "base_not_whole" | "bad_delta" | "bad_encoding" | "identity_mismatch") {
     super(`History delta cannot be reconstructed: ${reason}`);
     this.name = "HistoryDeltaOrphanError";
   }
 }
 interface BlobReadRow {
-  content: string | null;
+  content: StoredContent | null;
   blob_encoding: string | null;
   delta_of: string | null;
 }
+/**
+ * Decode one blob to its body (blob-codec.ts lists the encodings): inflate when deflated, refuse a body over
+ * VERSION_MAX_BYTES, apply the delta against its whole base when there is one, then check the hash.
+ */
 function materialise(db: Database, hash: string, row: BlobReadRow): string | null {
   if (row.content === null)
     return null;
-  if (row.blob_encoding === null) {
-    if (hashContent(row.content) !== hash)
-      throw new HistoryDeltaOrphanError(hash, row.delta_of, "identity_mismatch");
-    return row.content;
-  }
-  if (row.blob_encoding !== "fossil-delta")
-    throw new HistoryDeltaOrphanError(hash, row.delta_of, "unknown_encoding");
-  const base = row.delta_of ? db.prepare("SELECT content, encoding FROM note_blobs WHERE hash = ?").get(row.delta_of) as {
-    content: string;
-    encoding: string | null;
-  } | null : null;
-  if (!base)
-    throw new HistoryDeltaOrphanError(hash, row.delta_of, "base_missing");
-  if (base.encoding !== null)
-    throw new HistoryDeltaOrphanError(hash, row.delta_of, "base_not_whole");
   let text: string;
-  try {
-    text = decodeDelta(base.content, row.content);
+  if (isWhole(row.blob_encoding)) {
+    try {
+      text = wholeText(row.content, row.blob_encoding, VERSION_MAX_BYTES);
+    }
+    catch {
+      throw new HistoryDeltaOrphanError(hash, row.delta_of, "bad_encoding");
+    }
   }
-  catch {
-    throw new HistoryDeltaOrphanError(hash, row.delta_of, "bad_delta");
+  else {
+    if (!isDelta(row.blob_encoding))
+      throw new HistoryDeltaOrphanError(hash, row.delta_of, "unknown_encoding");
+    const base = row.delta_of ? db.prepare("SELECT content, encoding FROM note_blobs WHERE hash = ?").get(row.delta_of) as {
+      content: StoredContent;
+      encoding: string | null;
+    } | null : null;
+    if (!base)
+      throw new HistoryDeltaOrphanError(hash, row.delta_of, "base_missing");
+    if (!isWhole(base.encoding))
+      throw new HistoryDeltaOrphanError(hash, row.delta_of, "base_not_whole");
+    let baseText: string, delta: Uint8Array;
+    try {
+      baseText = wholeText(base.content, base.encoding, VERSION_MAX_BYTES);
+      delta = deltaBytes(row.content, row.blob_encoding!, VERSION_MAX_BYTES + DELTA_SLACK_BYTES);
+    }
+    catch (err) {
+      if (!(err instanceof BlobDecodeError)) throw err;
+      throw new HistoryDeltaOrphanError(hash, row.delta_of, "bad_encoding");
+    }
+    try {
+      text = applyDeltaBytes(baseText, delta, VERSION_MAX_BYTES);
+    }
+    catch {
+      throw new HistoryDeltaOrphanError(hash, row.delta_of, "bad_delta");
+    }
   }
   if (hashContent(text) !== hash)
     throw new HistoryDeltaOrphanError(hash, row.delta_of, "identity_mismatch");
   return text;
 }
+/** A delta of a body under VERSION_MAX_BYTES can carry a little more than the body itself (headers, a checksum). */
+const DELTA_SLACK_BYTES = 65_536;
 export function readBlobContent(db: Database, hash: string): string | null {
   const row = db.prepare("SELECT content, encoding AS blob_encoding, delta_of FROM note_blobs WHERE hash = ?").get(hash) as BlobReadRow | null;
   return row ? materialise(db, hash, row) : null;
@@ -505,19 +669,19 @@ export function historyStorageStats(db: Database) {
     bytes: number;
   }[];
   for (const g of groups) {
-    if (g.encoding === null) {
-      stats.whole_blobs = g.n;
-      stats.whole_bytes = g.bytes;
+    if (isWhole(g.encoding)) {
+      stats.whole_blobs += g.n;
+      stats.whole_bytes += g.bytes;
     }
-    else if (g.encoding === "fossil-delta") {
-      stats.delta_blobs = g.n;
-      stats.delta_bytes = g.bytes;
+    else if (isDelta(g.encoding)) {
+      stats.delta_blobs += g.n;
+      stats.delta_bytes += g.bytes;
     }
     else
       stats.unknown_encoding_blobs += g.n;
   }
-  stats.orphan_deltas = (db.prepare(`SELECT COUNT(*) AS n FROM note_blobs d WHERE d.encoding = 'fossil-delta'
-  AND (d.delta_of IS NULL OR NOT EXISTS (SELECT 1 FROM note_blobs b WHERE b.hash = d.delta_of AND b.encoding IS NULL))`).get() as {
+  stats.orphan_deltas = (db.prepare(`SELECT COUNT(*) AS n FROM note_blobs d WHERE d.encoding IN ('fossil-delta', 'fossil-delta-z')
+  AND (d.delta_of IS NULL OR NOT EXISTS (SELECT 1 FROM note_blobs b WHERE b.hash = d.delta_of AND ${wholeSql("b")}))`).get() as {
     n: number;
   }).n;
   return stats;
@@ -604,7 +768,7 @@ export function compactNote(db: Database, noteId: string, policy: HistoryPolicy)
       } | null;
       if (!baseRow)
         continue;
-      const baseHash = baseRow.encoding === null ? baseRow.hash : baseRow.delta_of;
+      const baseHash = isWhole(baseRow.encoding) ? baseRow.hash : baseRow.delta_of;
       if (!baseHash)
         continue;
       const base = db.prepare("SELECT encoding FROM note_blobs WHERE hash = ?").get(baseHash) as {
@@ -613,7 +777,7 @@ export function compactNote(db: Database, noteId: string, policy: HistoryPolicy)
       if (!base)
         continue;
       // Never propagate a pre-existing depth-two chain into healthy blobs.
-      if (base.encoding !== null)
+      if (!isWhole(base.encoding))
         throw new HistoryDeltaOrphanError(baseRow.hash, baseHash, "base_not_whole");
       const text = readBlobContent(db, baseHash);
       if (text === null)

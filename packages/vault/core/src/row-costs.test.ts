@@ -1,0 +1,653 @@
+// T-412: a wake writes nothing, and a create looks its paths up by index.
+//
+// The Taste Arcade edge-vault test (11-08) found both on cloud, where Durable Object rows read and written are billed
+// and capped. Every open of a vault ran every migration: SCHEMA_SQL made `idx_notes_path` (one index row per note),
+// v5 found no `idx_notes_path_unique` (v18 drops it), so it re-normalized and re-deduplicated every path, built that
+// index (one row per note again), and v18 dropped it. What survived was only the case-sensitive
+// `(path, extension)` unique index, so every `path = ? COLLATE NOCASE` lookup read the whole notes table: four of
+// them on a create with a reference field and `if_exists`.
+//
+// A "wake" here is what a Durable Object or a restarted server does: a new connection and a new store on a vault
+// that already exists. These tests use a real SQLite file and the real engine; nothing is mocked.
+import { Database } from "bun:sqlite";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { SCHEMA_SQL, SCHEMA_VERSION, initSchema, unnumberedStepsDone } from "./schema.ts";
+import { SqliteStore } from "./store.ts";
+import { generateMcpTools } from "./mcp.ts";
+import type { EmbeddingProvider, EmbedInput, EmbedResult } from "./embedding/provider.ts";
+import { decodeVector, dot, encodeVector, normalize } from "./embedding/vector-codec.ts";
+
+let dir: string;
+let file: string;
+beforeEach(() => {
+  dir = mkdtempSync(join(tmpdir(), "t412-"));
+  file = join(dir, "vault.db");
+});
+afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+/** A vault with `n` made-up notes, closed again. */
+async function makeVault(n: number): Promise<void> {
+  const db = new Database(file);
+  const store = new SqliteStore(db);
+  await store.createNotes(Array.from({ length: n }, (_, i) => ({ content: `made up ${i}`, path: `seed/Note ${i}` })));
+  db.close();
+}
+
+function indexes(db: Database): string[] {
+  return (db.query("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'notes' AND name LIKE 'idx_notes_path%' ORDER BY name").all() as { name: string }[]).map((r) => r.name);
+}
+function cookie(db: Database): number {
+  return (db.query("PRAGMA schema_version").get() as { schema_version: number }).schema_version;
+}
+function stamps(db: Database): unknown[] {
+  return db.query("SELECT version, applied_at FROM schema_version ORDER BY version").all();
+}
+function paths(db: Database): string[] {
+  return (db.query("SELECT path || '.' || extension AS p FROM notes WHERE path IS NOT NULL ORDER BY p").all() as { p: string }[]).map((r) => r.p);
+}
+
+describe("a wake on a vault at this schema", () => {
+  test("changes no schema and writes no row", async () => {
+    await makeVault(300);
+    const db = new Database(file);
+    const before = { cookie: cookie(db), stamps: stamps(db) };
+    new SqliteStore(db);
+    // The schema cookie moves on every CREATE or DROP; total_changes counts every row this connection wrote.
+    expect(cookie(db)).toBe(before.cookie);
+    expect(stamps(db)).toEqual(before.stamps);
+    expect((db.query("SELECT total_changes() AS n").get() as { n: number }).n).toBe(0);
+    db.close();
+  });
+
+  test("still heals a declared indexed field whose index went missing", async () => {
+    let db = new Database(file);
+    const store = new SqliteStore(db);
+    await store.upsertTagRecord("thing", { fields: { level: { type: "integer", indexed: true } } } as any);
+    db.exec("DROP INDEX idx_meta_level");
+    db.close();
+    db = new Database(file);
+    new SqliteStore(db);
+    expect(db.query("SELECT name FROM sqlite_master WHERE name = 'idx_meta_level'").get()).toBeTruthy();
+    db.close();
+  });
+
+  test("keeps notes whose paths differ only by extension or by case", async () => {
+    // Both are allowed (v18's unique index is on (path, extension), case-sensitive). v5's every-boot dedupe,
+    // GROUP BY path COLLATE NOCASE, renamed the second of each pair to `<path>-1` on the next open.
+    let db = new Database(file);
+    let store = new SqliteStore(db);
+    await store.createNote("made up", { path: "Recipes/pasta" });
+    await store.createNote("a,b\n1,2", { path: "Recipes/pasta", extension: "csv" });
+    await store.createNote("made up", { path: "Inbox/Today" });
+    await store.createNote("made up", { path: "inbox/today" });
+    const want = paths(db);
+    expect(want).toEqual(["Inbox/Today.md", "Recipes/pasta.csv", "Recipes/pasta.md", "inbox/today.md"]);
+    db.close();
+    for (let wake = 0; wake < 2; wake++) {
+      db = new Database(file);
+      store = new SqliteStore(db);
+      expect(paths(db)).toEqual(want);
+      db.close();
+    }
+  });
+});
+
+describe("v5 and v18 against each state of the path indexes", () => {
+  // Older vaults reach this engine from any of these: v5's unique index (pre-v18), v18's composite one, both (an
+  // interrupted swap), or the old plain index left beside either. Each must end with exactly the composite unique
+  // index and the case-insensitive lookup index, with no path renamed.
+  const states: [string, string[]][] = [
+    ["only v5's unique index", ["DROP INDEX idx_notes_path_ext_unique", "CREATE UNIQUE INDEX idx_notes_path_unique ON notes(path) WHERE path IS NOT NULL"]],
+    ["only v18's composite unique index", []],
+    ["both unique indexes", ["CREATE UNIQUE INDEX idx_notes_path_unique ON notes(path) WHERE path IS NOT NULL"]],
+    ["the old plain index beside v18's", ["CREATE INDEX idx_notes_path ON notes(path) WHERE path IS NOT NULL"]],
+  ];
+  for (const [what, setup] of states) {
+    test(what, async () => {
+      await makeVault(50);
+      let db = new Database(file);
+      db.exec("DROP INDEX IF EXISTS idx_notes_path_nocase");
+      for (const s of setup) db.exec(s);
+      // Stamp the vault one version back, so the next open runs the migrations.
+      db.exec("DELETE FROM schema_version");
+      db.query("INSERT INTO schema_version (version, applied_at) VALUES (?, ?)").run(SCHEMA_VERSION - 1, "2026-01-01T00:00:00.000Z");
+      const before = paths(db);
+      db.close();
+
+      db = new Database(file);
+      initSchema(db);
+      expect(indexes(db)).toEqual(["idx_notes_path_ext_unique", "idx_notes_path_nocase"]);
+      expect(paths(db)).toEqual(before);
+      const after = cookie(db);
+      db.close();
+
+      // And the open after that is a no-op.
+      db = new Database(file);
+      initSchema(db);
+      expect(cookie(db)).toBe(after);
+      db.close();
+    });
+  }
+
+  test("a vault an older engine of this version opened last (current stamp, no case-insensitive index) gets the index once", async () => {
+    // What a rollback, or the engine before T-412, leaves: the same SCHEMA_VERSION stamped later, and its own
+    // every-open churn's end state (only v18's unique index). The index came without a version bump, so the
+    // fast path must not take that stamp alone as current.
+    // This is the open where the old v5 renamed things, so the vault holds the pairs it renamed.
+    await makeVault(50);
+    let db = new Database(file);
+    const store = new SqliteStore(db);
+    await store.createNote("made up", { path: "Recipes/pasta" });
+    await store.createNote("a,b\n1,2", { path: "Recipes/pasta", extension: "csv" });
+    await store.createNote("made up", { path: "Inbox/Today" });
+    await store.createNote("made up", { path: "inbox/today" });
+    db.exec("DROP INDEX idx_notes_path_nocase");
+    db.query("INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)").run(SCHEMA_VERSION, "2999-01-01T00:00:00.000Z");
+    const before = paths(db);
+    expect(before).toContain("Recipes/pasta.csv");
+    expect(before).toContain("inbox/today.md");
+    db.close();
+    db = new Database(file);
+    new SqliteStore(db);
+    expect(indexes(db)).toEqual(["idx_notes_path_ext_unique", "idx_notes_path_nocase"]);
+    expect(paths(db)).toEqual(before);
+    const after = cookie(db);
+    db.close();
+    db = new Database(file);
+    new SqliteStore(db);
+    expect(cookie(db)).toBe(after);
+    db.close();
+  });
+
+  test("a vault 0.8 opened last (current stamp, the path index, no kind column) gets the kind column once", async () => {
+    // What 0.8 (core next with T-412) leaves: SCHEMA_VERSION stamped, idx_notes_path_nocase, and tags with no `kind`
+    // (0.9 adds it with no version bump). The fast path must not take that vault as current (audit L2-01): every type
+    // lookup read t.kind and failed. lifecycle/upgrade proves the same on a vault the real 0.8 build made.
+    await makeVault(5);
+    let db = new Database(file);
+    const store = new SqliteStore(db);
+    await store.upsertTagSchema("person", { fields: { email: { type: "string" } } });
+    await store.createNote("made up", { path: "people/Ada", tags: ["person", "pinned"] });
+    db.exec("ALTER TABLE tags DROP COLUMN kind");
+    db.query("INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)").run(SCHEMA_VERSION, "2999-01-01T00:00:00.000Z");
+    db.close();
+    db = new Database(file);
+    const reopened = new SqliteStore(db);
+    const cols = (db.query("PRAGMA table_info(tags)").all() as { name: string }[]).map((c) => c.name);
+    expect(cols).toContain("kind");
+    const note = await reopened.getNoteByPath("people/Ada");
+    expect(note?.types).toEqual(["person"]);
+    const after = cookie(db);
+    db.close();
+    // And the open after that is a no-op again.
+    db = new Database(file);
+    new SqliteStore(db);
+    expect(cookie(db)).toBe(after);
+    db.close();
+  });
+
+  test("a vault 0.9.0 opened last (current stamp, no via_kind on revisions) gets the column once, and its revisions read", async () => {
+    // What 0.9.0 leaves: SCHEMA_VERSION stamped and note_versions with no `via_kind` (0.9.1's write stamp adds it with
+    // no version bump). The fast path must not take that vault as current, or every revision read would fail.
+    await makeVault(5);
+    let db = new Database(file);
+    const store = new SqliteStore(db);
+    const n = await store.createNote("made up", { path: "notes/one" });
+    await store.updateNote(n.id, { content: "again", actor: "u", via: "api" });
+    db.exec("ALTER TABLE note_versions DROP COLUMN via_kind");
+    db.query("INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)").run(SCHEMA_VERSION, "2999-01-01T00:00:00.000Z");
+    db.close();
+    db = new Database(file);
+    const reopened = new SqliteStore(db);
+    const cols = (db.query("PRAGMA table_info(note_versions)").all() as { name: string }[]).map((c) => c.name);
+    expect(cols).toContain("via_kind");
+    expect((await reopened.listNoteVersions(n.id)).map((v) => [v.via, v.via_kind])).toEqual([["api", null]]);
+    const after = cookie(db);
+    db.close();
+    db = new Database(file);
+    new SqliteStore(db);
+    expect(cookie(db)).toBe(after);
+    db.close();
+  });
+
+  test("a vault 0.9.1 opened last (current stamp, a two-column search index) gets field values in search once", async () => {
+    // What 0.9.1 and the 0.9.2 builds before field search leave: SCHEMA_VERSION stamped and notes_fts with path and
+    // content only. Field values in search are an un-numbered step, so the fast path must not take that vault as
+    // current, or a field word would never be found on it.
+    await makeVault(5);
+    let db = new Database(file);
+    const store = new SqliteStore(db);
+    await store.createNote("made up", { path: "notes/one", metadata: { line: "quokkaword" } });
+    db.exec(`
+      DROP TRIGGER notes_fts_insert; DROP TRIGGER notes_fts_delete; DROP TRIGGER notes_fts_update;
+      DROP TABLE notes_fts; DROP VIEW notes_fts_source; DROP TABLE notes_field_text;
+      CREATE VIRTUAL TABLE notes_fts USING fts5(path, content, content='notes', content_rowid='rowid', tokenize='porter unicode61');
+      INSERT INTO notes_fts(rowid, path, content) SELECT rowid, COALESCE(path, ''), content FROM notes;
+    `);
+    db.query("INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)").run(SCHEMA_VERSION, "2999-01-01T00:00:00.000Z");
+    db.close();
+    db = new Database(file);
+    const reopened = new SqliteStore(db);
+    expect((db.query("PRAGMA table_info(notes_fts)").all() as { name: string }[]).map((c) => c.name)).toEqual(["path", "content", "fields"]);
+    expect((await reopened.searchNotes("quokkaword")).map((n) => n.path)).toEqual(["notes/one"]);
+    const after = cookie(db);
+    db.close();
+    // And the open after that is a no-op again: the index is rebuilt once, not on every wake.
+    db = new Database(file);
+    new SqliteStore(db);
+    expect(cookie(db)).toBe(after);
+    db.close();
+  });
+
+  test("uniqueness is unchanged: same path and extension refused; another extension or a case variant allowed", async () => {
+    const db = new Database(file);
+    const store = new SqliteStore(db);
+    await store.createNote("one", { path: "Same/path" });
+    await expect(store.createNote("two", { path: "Same/path" })).rejects.toThrow();
+    await store.createNote("x,y", { path: "Same/path", extension: "csv" });
+    await store.createNote("three", { path: "same/PATH" });
+    expect(paths(db)).toEqual(["Same/path.csv", "Same/path.md", "same/PATH.md"]);
+    db.close();
+  });
+});
+
+/** sha256 of SCHEMA_SQL as of SCHEMA_VERSION 32 with T-412 (idx_notes_path left out of it) and 0.9's `kind` on tags, 0.9.1's `via_kind` on revisions, 0.9.3's field values in search (notes_fts_source, notes_field_text, three-column notes_fts; its insert trigger clears a leftover field-text row). */
+const SCHEMA_SQL_HASH_AT_32 = "303461b150891f04e27e0ba7aa5651109df704ed42707956f043ae5c3e26cb67";
+
+/** sha256 of initSchema's code and its fast-path check (comments and spacing left out) as of SCHEMA_VERSION 32 with T-412, 0.9's ensureTagKinds 0.9.1's ensureRevisionKeyKind and 0.9.2's ensureFtsFields, and T-460's open-as-is of a newer readable schema. */
+const INIT_SCHEMA_HASH_AT_32 = "71617c162343267c81c438e85a90787ac57cecf569d9f96f51d318f5898999df";
+
+describe("the fast path's promise", () => {
+  // initSchema skips SCHEMA_SQL and every migration on a vault stamped SCHEMA_VERSION (with the path index). So a
+  // change to SCHEMA_SQL that doesn't bump SCHEMA_VERSION would reach only new vaults, silently. If this fails: bump
+  // SCHEMA_VERSION (and give the change a migration), or, for something an older engine must still open with no
+  // bump, add its own check to initSchema's fast path as ensurePathNocaseIndex did. Then update the hash.
+  test("SCHEMA_SQL is the one SCHEMA_VERSION 32 was stamped with", () => {
+    const hash = new Bun.CryptoHasher("sha256").update(SCHEMA_SQL).digest("hex");
+    expect({ version: SCHEMA_VERSION, hash }).toEqual({ version: 32, hash: SCHEMA_SQL_HASH_AT_32 });
+  });
+
+  // The same promise for the steps initSchema runs: a migration or every-open step added without a bump (as
+  // t318-09/types-tags added ensureTagKinds, audit L2-01) never runs on a vault the fast path skips. Comments are left
+  // out of the hash; any change to the calls or to the fast path's condition (unnumberedStepsDone) shows here. If
+  // this fails for a new un-numbered step: give it its check in unnumberedStepsDone and a test like "a vault 0.8
+  // opened last" above, then update the hash.
+  test("initSchema's steps are the ones SCHEMA_VERSION 32 was stamped with", () => {
+    const code = (initSchema.toString() + unnumberedStepsDone.toString()).replace(/\/\/[^\n]*/g, "").replace(/\s+/g, " ");
+    const hash = new Bun.CryptoHasher("sha256").update(code).digest("hex");
+    expect({ version: SCHEMA_VERSION, hash }).toEqual({ version: 32, hash: INIT_SCHEMA_HASH_AT_32 });
+  });
+});
+
+/** A Database that remembers every statement the engine prepares. */
+class Recording extends Database {
+  seen = new Set<string>();
+  override prepare(sql: string, ...rest: any[]): any {
+    this.seen.add(sql);
+    return (super.prepare as any)(sql, ...rest);
+  }
+  override query(sql: string): any {
+    this.seen.add(sql);
+    return super.query(sql);
+  }
+}
+
+/** Plan steps that read every row of `notes` (a SCAN of the table, or of one of its indexes). */
+function scansOfNotes(db: Database, sql: string): string[] {
+  if (!/^\s*(SELECT|UPDATE|DELETE|WITH)\b/i.test(sql)) return [];
+  let plan: { detail: string }[];
+  try {
+    plan = db.query(`EXPLAIN QUERY PLAN ${sql}`).all() as { detail: string }[];
+  } catch {
+    return [];
+  }
+  // Aliases the statement gives notes (`FROM notes n`, `JOIN notes AS t`).
+  const names = new Set(["notes"]);
+  for (const m of sql.matchAll(/\bnotes\s+(?:AS\s+)?([a-z_][a-z0-9_]*)\b/gi)) {
+    const alias = m[1]!.toLowerCase();
+    if (!["where", "set", "on", "join", "left", "inner", "order", "group", "limit", "values", "using", "union", "natural", "cross"].includes(alias)) names.add(alias);
+  }
+  return plan.map((p) => p.detail).filter((d) => {
+    const m = d.match(/^SCAN (\S+)/);
+    return m !== null && names.has(m[1]!.toLowerCase());
+  });
+}
+
+describe("a create looks its paths up by index", () => {
+  test("an Arcade-shaped create (a reference field, if_exists) runs no statement that scans notes", async () => {
+    await makeVault(200);
+    const db = new Recording(file);
+    const store = new SqliteStore(db);
+    await store.upsertTagRecord?.("taste-card", { fields: { card_id: { type: "string", indexed: true } } } as any);
+    await store.upsertTagRecord?.("reaction", {
+      fields: {
+        player: { type: "string", indexed: true },
+        at: { type: "date", indexed: true },
+        card: { type: "reference", target_tags: ["taste-card"] },
+      },
+    } as any);
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    await create.execute({ path: "cards/c1", content: "made-up card", tags: ["taste-card"], metadata: { card_id: "c1" } });
+    db.seen.clear();
+    const made = await create.execute({
+      path: "reactions/p1/r1",
+      content: "made up",
+      tags: ["reaction"],
+      metadata: { player: "p1", at: "2026-11-08T00:00:00.000Z", card: "cards/c1" },
+      if_exists: "ignore",
+    });
+    expect((made as any).id).toBeTruthy();
+    const pathLookups = [...db.seen].filter((s) => /path\s*=\s*\?\s*COLLATE NOCASE/i.test(s));
+    expect(pathLookups.length).toBeGreaterThan(0);
+    const scanning = [...db.seen].map((s) => ({ s: s.replace(/\s+/g, " ").trim().slice(0, 200), scans: scansOfNotes(db, s) })).filter((x) => x.scans.length > 0);
+    expect(scanning).toEqual([]);
+    db.close();
+  });
+});
+
+describe("a tag filter beside an indexed equality", () => {
+  test("probes the tag per candidate instead of listing every note under it, and finds the same notes", async () => {
+    const db = new Recording(file);
+    const store = new SqliteStore(db);
+    await store.upsertTagRecord("reaction", { fields: { player: { type: "string", indexed: true } } } as any);
+    await store.upsertTagRecord("other", { fields: { player: { type: "string", indexed: true } } } as any);
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const want: string[] = [];
+    for (let i = 0; i < 120; i++) {
+      const tag = i % 3 === 0 ? "other" : "reaction";
+      const path = `reactions/p${i % 4}/r${i}`;
+      await create.execute({ path, content: "made up", tags: [tag], metadata: { player: `p${i % 4}` } });
+      if (tag === "reaction" && i % 4 === 1) want.push(path);
+    }
+    const found = async (q: Record<string, unknown>) => {
+      db.seen.clear();
+      const r = (await store.queryNotes({ tags: ["reaction"], limit: 1000, ...q } as any)) as { path: string }[];
+      return r.map((n) => n.path).sort();
+    };
+    for (const metadata of [{ player: { eq: "p1" } }, { player: { in: ["p1"] } }, { player: "p1" }]) {
+      expect(await found({ metadata })).toEqual([...want].sort());
+      const main = [...db.seen].find((s) => /FROM notes n\b/.test(s) && /meta_player/.test(s))!;
+      expect(main).toBeTruthy();
+      const plan = (db.query(`EXPLAIN QUERY PLAN ${main}`).all() as { detail: string }[]).map((p) => p.detail);
+      // idx_note_tags_tag (tag_name, note_id) is how SQLite lists a whole tag.
+      expect(plan.filter((d) => /idx_note_tags_tag\b/.test(d))).toEqual([]);
+      expect(plan.some((d) => /USING INDEX idx_meta_player\b/.test(d))).toBe(true);
+    }
+    // With no indexed equality, the tag still drives (its ids are walked, not every note).
+    await found({});
+    const tagOnly = [...db.seen].find((s) => /FROM notes n\b/.test(s) && /note_tags/.test(s))!;
+    const plan = (db.query(`EXPLAIN QUERY PLAN ${tagOnly}`).all() as { detail: string }[]).map((p) => p.detail);
+    expect(plan.some((d) => /^SCAN n\b/.test(d) && !/USING/.test(d))).toBe(false);
+    db.close();
+  });
+});
+
+// T-463: a meaning search reads each candidate's vectors once, so its cost grows with the vault, not its square.
+//
+// `semanticSearchNotes` reads the candidates' vectors in batches of ids (`model = ? AND note_id IN (…)`). SQLite chose
+// idx_note_vectors_stale (model, content_hash) for that, so every batch walked every vector of the model: N × N/90 rows
+// a question. On Cloud that was 46,000 billed rows a question at 2,000 notes and 1.1 million at 10,000 (about 3 s);
+// a box pays the same in time. Auto hybrid (0.9.3) sends every question-shaped search through this read.
+//
+// The meter: every statement the search runs on note_vectors is recorded with its parameters, and the rows its
+// note_vectors loop walks are counted from SQLite's own plan for it (a SCAN walks the table; a SEARCH walks the rows
+// matching its equality columns, counted with the same values bound). At 2,000 notes it gives the 46,000 workerd billed
+// for the vector rows before the fix. The ceiling is twice the vault's vector rows: linear, with room for chunked notes.
+describe("a meaning search reads each candidate's vectors once", () => {
+  const MODEL = "made-up-model";
+  const DIMS = 8;
+  /** A deterministic made-up unit vector (the embedder is outside our control; its output shape is all that matters). */
+  function vec(seed: number): Float32Array {
+    const v = new Float32Array(DIMS);
+    let x = (seed * 2654435761) >>> 0;
+    for (let i = 0; i < DIMS; i++) {
+      x = (x * 1103515245 + 12345) >>> 0;
+      v[i] = (x / 2 ** 32) * 2 - 1;
+    }
+    return normalize(v);
+  }
+  class AxisFreeProvider implements EmbeddingProvider {
+    readonly name = "made-up";
+    readonly model = MODEL;
+    readonly dims = DIMS;
+    async embed(input: EmbedInput): Promise<EmbedResult> {
+      return { vectors: input.texts.map((t) => vec(t.length * 31 + t.charCodeAt(0))), model: MODEL, dims: DIMS };
+    }
+    async available() {
+      return { ok: true };
+    }
+  }
+
+  /** Records every execution of a statement that reads note_vectors, with its parameters. */
+  class VectorMeter extends Database {
+    runs: { sql: string; params: unknown[] }[] = [];
+    override prepare(sql: string, ...rest: any[]): any {
+      const stmt = (super.prepare as any)(sql, ...rest);
+      if (!/\bFROM note_vectors\b/i.test(sql)) return stmt;
+      const runs = this.runs;
+      return new Proxy(stmt, {
+        get(target, key) {
+          const v = target[key];
+          if (key === "all" || key === "get" || key === "iterate" || key === "values") {
+            return (...params: unknown[]) => {
+              runs.push({ sql, params });
+              return v.apply(target, params);
+            };
+          }
+          return typeof v === "function" ? v.bind(target) : v;
+        },
+      });
+    }
+    /** Rows the recorded statements' note_vectors loops walked. */
+    rowsRead(): number {
+      let total = 0;
+      for (const { sql, params } of this.runs) {
+        const shape = sql.replace(/\s+/g, " ").match(/WHERE \+?model = \? AND note_id IN \(([?, ]+)\)$/);
+        if (!shape) throw new Error(`the meter doesn't know this note_vectors statement; teach it: ${sql}`);
+        const plan = (this.query(`EXPLAIN QUERY PLAN ${sql}`).all(...(params as any[])) as { detail: string }[]).map((p) => p.detail);
+        const loop = plan.find((d) => /^(SCAN|SEARCH) note_vectors\b/.test(d));
+        if (!loop) throw new Error(`no note_vectors loop in the plan: ${plan.join(" | ")}`);
+        const [model, ...ids] = params as string[];
+        const eq = loop.match(/\((.*)\)$/)?.[1] ?? "";
+        let n: number;
+        if (/^SCAN/.test(loop)) n = (this.query("SELECT COUNT(*) AS n FROM note_vectors").get() as { n: number }).n;
+        else if (/^note_id=\?/.test(eq)) n = (this.query(`SELECT COUNT(*) AS n FROM note_vectors WHERE note_id IN (SELECT value FROM json_each(?))`).get(JSON.stringify(ids)) as { n: number }).n;
+        else if (/^model=\?/.test(eq)) n = (this.query("SELECT COUNT(*) AS n FROM note_vectors WHERE model = ?").get(model) as { n: number }).n;
+        else throw new Error(`the meter doesn't know this plan step; teach it: ${loop}`);
+        total += n;
+      }
+      return total;
+    }
+  }
+
+  /** `n` made-up notes, one vector each under the active model; every tenth also has a second chunk and every
+   *  seventh a leftover row from an older model (what a model change leaves until the backfill drains it). */
+  async function vault(n: number) {
+    const db = new VectorMeter(file);
+    const store = new SqliteStore(db, { embeddingProvider: new AxisFreeProvider() });
+    const notes = await store.createNotes(Array.from({ length: n }, (_, i) => ({ content: `made up note ${i} about the garden and the rain`, path: `seed/n${i}` })));
+    const put = db.prepare("INSERT INTO note_vectors (note_id, chunk_ix, vector, dims, model, content_hash, embedded_at) VALUES (?, ?, ?, ?, ?, 'h', '2026-11-14T00:00:00.000Z')");
+    db.transaction(() => {
+      notes.forEach((note, i) => {
+        put.run(note.id, 0, encodeVector(vec(i)), DIMS, i % 7 === 3 ? "older-model" : MODEL);
+        if (i % 10 === 0) put.run(note.id, 1, encodeVector(vec(i + 1_000_000)), DIMS, MODEL);
+      });
+    })();
+    const vectorRows = (db.query("SELECT COUNT(*) AS n FROM note_vectors").get() as { n: number }).n;
+    return { db, store, notes, vectorRows };
+  }
+
+  /** The ranking by brute force, straight from the table: best chunk per note, ties in candidate (rowid) order. */
+  function reference(db: Database, q: Float32Array, limit: number): string[] {
+    const rows = db.query("SELECT v.note_id AS id, v.vector AS vector FROM note_vectors v JOIN notes n ON n.id = v.note_id WHERE v.model = ? ORDER BY n.rowid, v.chunk_ix").all(MODEL) as { id: string; vector: Uint8Array }[];
+    const best = new Map<string, number>();
+    for (const r of rows) {
+      const s = dot(decodeVector(r.vector), q);
+      if (!best.has(r.id) || s > best.get(r.id)!) best.set(r.id, s);
+    }
+    return [...best.entries()].sort((a, b) => b[1] - a[1]).slice(0, limit).map(([id]) => id);
+  }
+
+  for (const n of [2_000, 20_000]) {
+    test(`at ${n.toLocaleString("en")} notes: semantic and auto-hybrid questions read the vectors linearly, same ranking`, async () => {
+      const { db, store, vectorRows } = await vault(n);
+      const query = generateMcpTools(store).find((t) => t.name === "query-notes")!;
+      const ceiling = 2 * vectorRows;
+
+      db.runs = [];
+      const q = "what did I write about the garden and the rain";
+      const semantic = await store.semanticSearch(q, { limit: 10 });
+      const semanticRows = db.rowsRead();
+      expect(semantic.notes.map((x) => x.id)).toEqual(reference(db, normalize((await new AxisFreeProvider().embed({ texts: [q] })).vectors[0]!), 10));
+      expect(semantic.totalCandidates).toBe(n);
+
+      db.runs = [];
+      const auto = (await query.execute({ search: q })) as { notes?: { matched_by?: string[] }[] } | { matched_by?: string[] }[];
+      const autoRows = db.rowsRead();
+      const hits = Array.isArray(auto) ? auto : auto.notes ?? [];
+      expect(hits.some((h) => h.matched_by?.includes("meaning"))).toBe(true); // the question went through the meaning arm
+
+      console.log(`[T-463] ${n} notes, ${vectorRows} vector rows: semantic read ${semanticRows}, auto hybrid read ${autoRows} (ceiling ${ceiling})`);
+      expect({ semanticRows: semanticRows <= ceiling, autoRows: autoRows <= ceiling }).toEqual({ semanticRows: true, autoRows: true });
+      db.close();
+    }, 120_000);
+  }
+});
+
+// T-463: a meaning search holds one batch of vectors at a time, so its memory doesn't grow with the vault.
+//
+// `semanticSearchNotes` used to read every candidate's vectors into one map and score them after: at 24,000 notes of
+// 1024-dim vectors that peaked ~190 MB in a bun process and ~104 MB in a local Durable Object (whose limit is
+// 128 MB). It now scores each batch as it reads it and keeps only the best `limit` scores.
+//
+// The meter: while the search runs, each statement it executes forces a full GC and samples the live heap before it
+// runs and again when it returns, with its rows still in hand (`heapUsed` counts the vector blobs bun:sqlite hands
+// back). The peak minus the heap before the search is what the search held at once. Vectors here are 256-dim (1 KB):
+// the old read held 30.6 MB at 20,000 notes; one batch is ~100 KB. The bound leaves room for the candidate id list and
+// the hits (~1 MB at 20,000 notes). Memory taken and dropped between two statements is not seen.
+describe("a meaning search holds one batch of vectors at a time", () => {
+  const MODEL = "made-up-model";
+  const DIMS = 256;
+  /** One of 64 made-up unit vectors, so many notes tie and the tie order is held too. */
+  function vec(seed: number): Float32Array {
+    const v = new Float32Array(DIMS);
+    let x = (((seed % 64) + 1) * 2654435761) >>> 0;
+    for (let i = 0; i < DIMS; i++) {
+      x = (x * 1103515245 + 12345) >>> 0;
+      v[i] = (x / 2 ** 32) * 2 - 1;
+    }
+    return normalize(v);
+  }
+  class MadeUpProvider implements EmbeddingProvider {
+    readonly name = "made-up";
+    readonly model = MODEL;
+    readonly dims = DIMS;
+    async embed(input: EmbedInput): Promise<EmbedResult> {
+      return { vectors: input.texts.map((t) => vec(t.length)), model: MODEL, dims: DIMS };
+    }
+    async available() {
+      return { ok: true };
+    }
+  }
+  /** Samples the live heap, after a full GC, before and after every statement while `sampling` is on. */
+  class HeapMeter extends Database {
+    sampling = false;
+    peak = 0;
+    override prepare(sql: string, ...rest: any[]): any {
+      const stmt = (super.prepare as any)(sql, ...rest);
+      const meter = this;
+      return new Proxy(stmt, {
+        get(target, key) {
+          const v = target[key];
+          if (key === "all" || key === "get" || key === "iterate" || key === "values" || key === "run") {
+            return (...params: unknown[]) => {
+              if (meter.sampling) meter.sample();
+              const out = v.apply(target, params);
+              if (meter.sampling) meter.sample();
+              return out;
+            };
+          }
+          return typeof v === "function" ? v.bind(target) : v;
+        },
+      });
+    }
+    sample(): void {
+      Bun.gc(true);
+      this.peak = Math.max(this.peak, process.memoryUsage().heapUsed);
+    }
+    async held<T>(fn: () => Promise<T>): Promise<{ result: T; mb: number }> {
+      Bun.gc(true);
+      const before = process.memoryUsage().heapUsed;
+      this.peak = before;
+      this.sampling = true;
+      try {
+        const result = await fn();
+        this.sample();
+        return { result, mb: (this.peak - before) / 2 ** 20 };
+      } finally {
+        this.sampling = false;
+      }
+    }
+  }
+
+  test("a chunk that scores NaN (a corrupt vector) never hides the note's real best chunk", async () => {
+    const db = new Database(file);
+    const store = new SqliteStore(db, { embeddingProvider: new MadeUpProvider() });
+    const q = "what did I write about the garden and the rain";
+    const qv = (await new MadeUpProvider().embed({ texts: [q] })).vectors[0]!;
+    const [a, b] = await store.createNotes([{ content: "note a", path: "seed/a" }, { content: "note b", path: "seed/b" }]);
+    const put = db.prepare("INSERT INTO note_vectors (note_id, chunk_ix, vector, dims, model, content_hash, embedded_at) VALUES (?, ?, ?, ?, ?, 'h', '2026-11-14T00:00:00.000Z')");
+    put.run(a!.id, 0, encodeVector(new Float32Array(DIMS).fill(Number.NaN)), DIMS, MODEL);
+    put.run(a!.id, 1, encodeVector(qv), DIMS, MODEL);
+    put.run(b!.id, 0, encodeVector(vec(q.length + 1)), DIMS, MODEL);
+    const { notes } = await store.semanticSearch(q, { limit: 10 });
+    expect(notes.map((x) => x.id)).toEqual([a!.id, b!.id]);
+    expect(notes[0]!.score).toBeCloseTo(1, 5);
+    db.close();
+  });
+
+  const BOUND_MB = 6;
+  for (const n of [2_000, 20_000]) {
+    test(`at ${n.toLocaleString("en")} notes: semantic and auto-hybrid questions hold under ${BOUND_MB} MB, same ranking`, async () => {
+      const db = new HeapMeter(file);
+      const store = new SqliteStore(db, { embeddingProvider: new MadeUpProvider() });
+      const notes = await store.createNotes(Array.from({ length: n }, (_, i) => ({ content: `made up note ${i} about the garden and the rain`, path: `seed/n${i}` })));
+      const put = db.prepare("INSERT INTO note_vectors (note_id, chunk_ix, vector, dims, model, content_hash, embedded_at) VALUES (?, ?, ?, ?, ?, 'h', '2026-11-14T00:00:00.000Z')");
+      db.transaction(() => {
+        notes.forEach((note, i) => {
+          put.run(note.id, 0, encodeVector(vec(i)), DIMS, MODEL);
+          if (i % 10 === 0) put.run(note.id, 1, encodeVector(vec(i + 7)), DIMS, MODEL);
+        });
+      })();
+      const query = generateMcpTools(store).find((t) => t.name === "query-notes")!;
+      const q = "what did I write about the garden and the rain";
+      await store.semanticSearch(q, { limit: 10 }); // warm: compiled statements and code aren't the search's to hold
+
+      const semantic = await db.held(() => store.semanticSearch(q, { limit: 10 }));
+      const auto = await db.held(() => query.execute({ search: q }) as Promise<{ notes?: { matched_by?: string[] }[] } | { matched_by?: string[] }[]>);
+      const hits = Array.isArray(auto.result) ? auto.result : auto.result.notes ?? [];
+      expect(hits.some((h) => h.matched_by?.includes("meaning"))).toBe(true);
+
+      // The ranking by brute force, straight from the table: best chunk per note, ties in candidate (rowid) order.
+      const qv = normalize((await new MadeUpProvider().embed({ texts: [q] })).vectors[0]!);
+      const best = new Map<string, number>();
+      for (const r of db.query("SELECT v.note_id AS id, v.vector AS vector FROM note_vectors v JOIN notes n ON n.id = v.note_id ORDER BY n.rowid, v.chunk_ix").all() as { id: string; vector: Uint8Array }[]) {
+        const s = dot(decodeVector(r.vector), qv);
+        if (!best.has(r.id) || s > best.get(r.id)!) best.set(r.id, s);
+      }
+      const reference = [...best.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10);
+      expect(semantic.result.notes.map((x) => [x.id, x.score])).toEqual(reference);
+      expect(semantic.result.totalCandidates).toBe(n);
+      expect(semantic.result.pendingCount).toBe(0);
+
+      console.log(`[T-463 memory] ${n} notes: semantic held ${semantic.mb.toFixed(2)} MB, auto hybrid ${auto.mb.toFixed(2)} MB (bound ${BOUND_MB})`);
+      expect({ semantic: semantic.mb <= BOUND_MB, auto: auto.mb <= BOUND_MB }).toEqual({ semantic: true, auto: true });
+      db.close();
+    }, 120_000);
+  }
+});

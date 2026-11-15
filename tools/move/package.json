@@ -1,0 +1,19 @@
+{
+  "name": "@parachute/move",
+  "private": true,
+  "type": "module",
+  "license": "AGPL-3.0-or-later",
+  "description": "Move a vault between Parachute doors (a box, Parachute Cloud, a personal Cloudflare door) and prove it arrived the same.",
+  "scripts": {
+    "move": "bun run move.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@noble/curves": "^2.3.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.4",
+    "typescript": "^7.0.2"
+  }
+}

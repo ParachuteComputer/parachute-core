@@ -637,6 +637,32 @@ describe("handleAccountCreateVault", () => {
     }
   });
 
+  // T-414: bare is passed as --bare, and a CLI that didn't honour it (an older vault module drops unknown flags
+  // and seeds anyway) is reported, not answered as if the vault were bare.
+  test("bare: true runs create --bare, and is refused when the CLI doesn't confirm it", async () => {
+    for (const confirms of [true, false]) {
+      const h = makeHarness(["default"]);
+      try {
+        const token = await bearer(h, [ACCOUNT_WRITE_SCOPE]);
+        const seen: string[][] = [];
+        const runCommand = async (cmd: readonly string[]): Promise<RunResult> => {
+          seen.push([...cmd]);
+          upsertService(
+            { name: "parachute-vault", port: 4101, paths: ["/vault/default", "/vault/app"], health: "/health", version: "0.4.2" },
+            h.manifestPath,
+          );
+          const out = JSON.parse(vaultCreateJson("app", "hubjwt.app.access"));
+          return { exitCode: 0, stdout: JSON.stringify(confirms ? { ...out, bare: true } : out), stderr: "" };
+        };
+        const res = await handleAccountCreateVault(jsonReq("/account/vaults", token, "POST", { name: "app", bare: true }), deps(h, { runCommand }));
+        expect(seen[0]).toContain("--bare");
+        expect(res.status).toBe(confirms ? 201 : 409);
+      } finally {
+        h.cleanup();
+      }
+    }
+  });
+
   // REGRESSION (security review, finding 2 — "credential outliving access").
   // On the unfixed code `POST /account/vaults` forwarded `createJson.token` —
   // the CLI's `vault:<name>:admin` bootstrap credential — verbatim, to a caller

@@ -25,6 +25,9 @@
 //     PARACHUTE_OFFLINE=1 for this process and every child (no registry lookup, Buzz poller, model download,
 //     outbound webhook or mirror push).
 //
+// `parachute-core probe` checks that one vault on a running box opens and answers, through the hub (probe.ts, audit
+// L6-03). It is a client: it touches no home, so it runs before the checks above.
+//
 // `parachute-core install` installs this bundle (install.ts, lane D). It is no longer the hub's module installer,
 // which runs `bun add -g` into the old global install; `parachute install` (the hub's name) still is.
 //
@@ -33,11 +36,12 @@
 // checks on the home it names. `parachute-core takeover` (takeover.ts) moves a home the old programs keep onto v0.8,
 // and a box `serve` on such a home refuses with exit 7 until it has. While it holds a home, the commands that install, upgrade, expose, migrate or drive modules
 // are refused with managed_by_host, exit 2 (managed.ts, PLAN §3).
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { SCHEMA_VERSION } from "@openparachute/vault/core/src/schema.ts";
+import { READABLE_SCHEMA_VERSION, SCHEMA_VERSION } from "@openparachute/vault/core/src/schema.ts";
 import core from "../../../package.json" with { type: "json" };
 import { homeDir, newerData, repairModes } from "./home.ts";
+import type { Notice } from "./front.ts";
 import { managedRefusal } from "./managed.ts";
 
 export type Role = "core" | "hub" | "vault";
@@ -61,6 +65,7 @@ function coreHelp(): string {
     "  parachute-core install [--prefix <dir>]   install this bundle for you (default ~/.local/share/parachute-core)",
     "  parachute-core bootstrap --embedded …     set up a host-managed home in one step (see `bootstrap --help`)",
     "  parachute-core takeover [--dry-run]       move a home the old hub and vault (0.7) keep onto v0.8",
+    "  parachute-core probe --url <hub> --vault <name>   check one vault opens and answers (REST and MCP)",
     "  parachute-core <command>          the hub's commands (what `parachute <command>` was): serve, auth, …",
     "",
     "The hub's commands, for reference:",
@@ -72,8 +77,9 @@ function coreHelp(): string {
 export function route(
   role: Role,
   argv: string[],
-): { print: string } | { install: string[] } | { embedded: string[] } | { bootstrap: string[] } | { takeover: string[] } | { cli: "hub" | "vault"; argv: string[] } {
+): { print: string } | { frontHelp: true } | { changes: string[] } | { config: string[] } | { install: string[] } | { probe: string[] } | { embedded: string[] } | { bootstrap: string[] } | { takeover: string[] } | { cli: "hub" | "vault"; argv: string[] } {
   if (role === "core" && argv[0] === "install") return { install: argv.slice(1) };
+  if (role === "core" && argv[0] === "probe") return { probe: argv.slice(1) };
   if (role === "core" && argv[0] === "takeover") return { takeover: argv.slice(1) };
   const cli = role === "vault" || (role === "core" && argv[0] === "vault") ? "vault" : "hub";
   const args = role === "core" && argv[0] === "vault" ? argv.slice(1) : argv;
@@ -81,6 +87,12 @@ export function route(
   if (cmd === "version" || cmd === "--version" || cmd === "-v") {
     return { print: rest.includes("--json") ? JSON.stringify(versionJson()) : core.version };
   }
+  // `parachute help` (no --all): the front door's help (front.ts), after the home's checks.
+  if (role === "hub" && (args.length === 0 || (["help", "--help", "-h"].includes(cmd!) && !rest.includes("--all")))) return { frontHelp: true };
+  // `changes` (front.ts) reads only the map it ships and the home's usage log, so it answers before any check.
+  if (cli === "hub" && cmd === "changes") return { changes: rest };
+  // `config` (settings.ts) is the home's parachute.yaml; `parachute-vault config` stays the vault's own.
+  if (role !== "vault" && cli === "hub" && cmd === "config") return { config: rest };
   if (cli === "hub" && cmd === "serve" && rest.includes("--embedded")) return { embedded: rest };
   if (cli === "hub" && cmd === "bootstrap") return { bootstrap: rest };
   return { cli, argv: args };
@@ -128,8 +140,11 @@ function homeFlag(args: string[]): { home?: string; twice: boolean } {
   return { home: found[0], twice: found.length > 1 };
 }
 
-/** Run as `role` with this process's arguments. The moved CLIs run in this process, as if started directly. */
-export async function dispatch(role: Role): Promise<void> {
+/**
+ * Run as `role` with this process's arguments. The moved CLIs run in this process, as if started directly.
+ * `notice`: an old name was used (front.ts); it is said, and counted, once the home has passed its checks.
+ */
+export async function dispatch(role: Role, notice?: Notice): Promise<void> {
   process.umask(0o077);
   // The hub's code reads this (packages/hub/src/core-host.ts) to know it runs inside core: init writes a unit that
   // runs core, and every install, upgrade and update check uses the vault core carries instead of npm's 0.7 one.
@@ -141,9 +156,18 @@ export async function dispatch(role: Role): Promise<void> {
     console.log(r.print);
     return;
   }
+  if ("changes" in r) {
+    const { changes } = await import("./front.ts");
+    process.exit(changes(r.changes, homeDir()));
+  }
   if ("install" in r) {
     const { install } = await import("./install.ts");
     process.exit(install(r.install));
+  }
+  // `probe` is a client of a running box (probe.ts): it opens no home, so it runs before the home checks.
+  if ("probe" in r) {
+    const { probe } = await import("./probe.ts");
+    process.exit(await probe(r.probe));
   }
   // `serve --embedded` and `bootstrap` name their home with --home or PARACHUTE_HOME; with neither they exit 2
   // before touching anything (embedded.ts, bootstrap.ts), so there is no home to check.
@@ -160,24 +184,97 @@ export async function dispatch(role: Role): Promise<void> {
     if (flag.home) process.env.PARACHUTE_HOME = resolve(flag.home);
   }
   const home = homeDir();
+  // `upgrade` says what it was asked before anything looks at the home (upgrade.ts): an unknown flag or service
+  // exits 2 with the home untouched. Every other path below starts with the step itself (the backup, the record).
+  let upgradeAsk: import("./upgrade.ts").UpgradeAsk | undefined;
+  if ("cli" in r && r.cli === "hub" && r.argv[0] === "upgrade") {
+    const { parseUpgrade, upgradeHelp, upgradeUsage } = await import("./upgrade.ts");
+    upgradeAsk = parseUpgrade(r.argv.slice(1));
+    if (upgradeAsk.kind === "hub") {
+      // Will the hub's upgrade find what it was asked for? Its own lookup says, reading services.json without
+      // writing to it: an unknown service, or a services.json it can't read, is refused here, not after the step.
+      const { upgradeTargetProblem } = await import("@openparachute/hub/src/commands/upgrade.ts");
+      const problem = await upgradeTargetProblem(upgradeAsk.service, join(home, "services.json"));
+      if (problem) upgradeAsk = { kind: "usage", message: problem };
+    }
+    if (upgradeAsk.kind === "usage") {
+      console.error(`parachute upgrade: ${upgradeAsk.message}\n${upgradeUsage()}`);
+      process.exit(2);
+    }
+    if (upgradeAsk.kind === "help") {
+      console.log(upgradeHelp());
+      return;
+    }
+    // The hub's own upgrade gets the arguments as understood, not as typed: its parser can't then refuse them.
+    if (upgradeAsk.kind === "hub") r.argv = ["upgrade", ...upgradeAsk.argv];
+  }
+  // The vault has no `upgrade` of its own (it is part of this program), and its CLI would say so only after the
+  // step: `vault upgrade --check` must not back the home up and record it either.
+  if ("cli" in r && ((r.cli === "vault" && r.argv[0] === "upgrade") || (r.cli === "hub" && r.argv[0] === "vault" && r.argv[1] === "upgrade"))) {
+    const { upgradeUsage } = await import("./upgrade.ts");
+    console.error(`parachute vault upgrade: the vault is part of this program; upgrade it with \`parachute upgrade\`\n${upgradeUsage()}`);
+    process.exit(2);
+  }
   // Every command but `version` (answered above) runs behind the check, help included: the moved CLIs do work on
   // the home before they read their arguments (the vault moves older layouts first), so `serve --help` is a command.
-  if (!hostArgs || process.env.PARACHUTE_HOME) {
-    const { HUB_SCHEMA_VERSION } = await import("@openparachute/hub/src/hub-db.ts");
-    const { newer, unchecked } = newerData(home, { hub: HUB_SCHEMA_VERSION, vault: SCHEMA_VERSION });
-    const name = role === "core" ? "parachute-core" : role === "hub" ? "parachute" : "parachute-vault";
+  const { HUB_SCHEMA_VERSION } = await import("@openparachute/hub/src/hub-db.ts");
+  const name = role === "core" ? "parachute-core" : role === "hub" ? "parachute" : "parachute-vault";
+  /** The newer-data check: the exit code to stop with (having said why), or null. Run again under the release lock. */
+  const newerCheck = (): number | null => {
+    const { newer, unchecked } = newerData(home, { hub: HUB_SCHEMA_VERSION, vault: READABLE_SCHEMA_VERSION });
     if (newer.length > 0) {
       console.error(`${name}: this home was written by a newer Parachute (${core.name} ${core.version} here):`);
       for (const line of newer) console.error(`  ${line}`);
       console.error("Nothing was opened or changed. Run the newer version, or restore a backup made for this one.");
-      process.exit(EXIT_NEWER_DATA);
+      return EXIT_NEWER_DATA;
     }
     if (unchecked.length > 0) {
       console.error(`${name}: can't check this home's data without changing it:`);
       for (const line of unchecked) console.error(`  ${line}`);
       console.error("Nothing was opened or changed. Stop what holds it open, or make room in the temp folder, and retry.");
-      process.exit(EXIT_HOME_UNUSABLE);
+      return EXIT_HOME_UNUSABLE;
     }
+    return null;
+  };
+  if (!hostArgs || process.env.PARACHUTE_HOME) {
+    const stop = newerCheck();
+    if (stop !== null) process.exit(stop);
+  }
+  // The 0.7 cutover is not for core: it writes a unit that runs the hub's own serve (no release step, no backup, no
+  // refusal of a rolled-back home), stops whatever holds the hub's port (core, when it is serving) and starts that
+  // unit. Inside core the hub makes no such offer (migrate-offer.ts); asked for by name, it is refused here, first.
+  if ("cli" in r && r.cli === "hub" && r.argv[0] === "migrate" && r.argv.includes("--to-supervised")) {
+    console.error("parachute migrate --to-supervised: not in this program. It was the 0.7 hub's move to a supervised unit, and its unit runs the hub alone. This home is served by `parachute serve`: under core's own unit after a takeover (`systemctl --user status parachute-core`), or the unit `parachute init` writes. Nothing was changed.");
+    process.exit(2);
+  }
+  // A home marked rolled back to another release (or cut off mid-restore) is opened by no command of this one, the
+  // host's `serve --embedded` and `bootstrap`, `config` and an old name's usage count included (release.ts
+  // homeRefusal). Only `upgrade` (it is the way forward, and the way to finish a restore), `takeover` and help go on.
+  if (!upgradeAsk && !takeoverArgs && !("frontHelp" in r) && (!hostArgs || process.env.PARACHUTE_HOME)) {
+    const { homeRefusal } = await import("./release.ts");
+    const refused = homeRefusal(home);
+    if (refused) {
+      console.error(`${name}: ${refused.message}`);
+      process.exit(refused.code);
+    }
+  }
+  // An old name is said, and counted in the home's usage log, only once the command is going to run: for a command
+  // of the moved CLIs that is after the release step below, so one refused there leaves nothing in the home.
+  const sayNotice = async () => {
+    if (!notice) return;
+    const { announce } = await import("./front.ts");
+    announce(notice, home);
+    notice = undefined;
+  };
+  if (!("cli" in r)) await sayNotice();
+  if ("frontHelp" in r) {
+    const { frontHelp } = await import("./front.ts");
+    console.log(frontHelp());
+    return;
+  }
+  if ("config" in r) {
+    const { configCommand } = await import("./settings.ts");
+    process.exit(configCommand(r.config, home));
   }
   if (embeddedArgs) {
     process.env.PARACHUTE_OFFLINE = "1";
@@ -198,6 +295,72 @@ export async function dispatch(role: Role): Promise<void> {
     process.exit(await takeover(takeoverArgs));
   }
   if (!("cli" in r)) return;
+  if (upgradeAsk?.kind === "rollback") {
+    const { rollback } = await import("./release.ts");
+    process.exit(await rollback(home, r.argv.slice(1)));
+  }
+  // `upgrade --check` works on a copy (upgrade.ts): it must never reach the step below on the home it was asked
+  // about. Only its own run on that copy goes on (isCheckCopy), takes the step there and then opens the copy.
+  let checkCopy = false;
+  if (upgradeAsk?.kind === "check") {
+    const { check, isCheckCopy } = await import("./upgrade.ts");
+    checkCopy = isCheckCopy(home);
+    if (!checkCopy && process.env.PARACHUTE_UPGRADE_CHECK_COPY !== undefined) {
+      // Started as a check's run on its copy, but this home isn't that copy: never a check of a check.
+      console.error("parachute upgrade --check: this is not the copy this run was started for; nothing was opened");
+      process.exit(2);
+    }
+    if (!checkCopy) {
+      const refusal = managedRefusal("hub", ["upgrade"]);
+      if (refusal) {
+        console.error(refusal);
+        process.exit(2);
+      }
+      process.exit(await check(home, upgradeAsk));
+    }
+  }
+  if (upgradeAsk?.kind === "core") {
+    // This program's own upgrade (upgrade.ts): the step asked for by name on a home another release served last
+    // (the only way a rolled-back home moves forward), else the newer release from the home's channel.
+    const refusal = managedRefusal("hub", ["upgrade"]);
+    if (refusal) {
+      console.error(refusal);
+      process.exit(2);
+    }
+    const { upgradeCore } = await import("./upgrade.ts");
+    process.exit(await upgradeCore(home, upgradeAsk, newerCheck));
+  }
+  // `stop`, `start` and `restart` of the whole service, where core's own unit serves this home (unit.ts): the
+  // unit's, through systemctl. No database is opened and no step taken here; the unit's serve takes it at its start.
+  if (r.cli === "hub" && ["stop", "start", "restart"].includes(r.argv[0] ?? "") && !["--help", "-h"].includes(r.argv[1] ?? "")) {
+    const { coreUnitServes, coreUnitVerb, wholeService } = await import("./unit.ts");
+    if (wholeService(r.argv.slice(1)) && coreUnitServes(home) && !managedRefusal("hub", r.argv)) process.exit(coreUnitVerb(r.argv[0]!));
+  }
+  {
+    // The first time this release opens a home an older one served: record the step and back the databases up
+    // first (release.ts). Not a host's (embedded) home, nor one the old 0.7 programs still own. A home marked
+    // rolled back is refused here (exit 7); only `upgrade` above, and its check on a copy, take the step on one.
+    const { beforeOpenOrExit } = await import("./release.ts");
+    // `stop` and `restart` of the whole service, and `logs`, take no step while another release's server still runs
+    // on the home: they only talk to the service manager or read log files. Not `status`, nor `stop <module>`:
+    // those open hub.db, and this release opening it adds its tables to a database the other is serving.
+    const lifecycle = r.cli === "hub" && (r.argv[0] === "logs" ||
+      (["stop", "restart"].includes(r.argv[0] ?? "") && (r.argv[1] === undefined || r.argv[1] === "hub")));
+    const code = beforeOpenOrExit(home, newerCheck, checkCopy, lifecycle);
+    if (code !== null) process.exit(code);
+  }
+  if (checkCopy) {
+    const { openCopy } = await import("./upgrade.ts");
+    process.exit(await openCopy(home));
+  }
+  await sayNotice();
+  if (r.cli === "hub" && r.argv[0] === "keys") {
+    // `keys` (and its alias `tokens`) is core's (keys.ts): answered here, or mapped onto the hub's auth commands.
+    const { keysCommand } = await import("./keys.ts");
+    const k = keysCommand(r.argv.slice(1));
+    if ("exit" in k) process.exit(k.exit);
+    r.argv = k.argv;
+  }
   const refusal = managedRefusal(r.cli, r.argv);
   if (refusal) {
     console.error(refusal);
@@ -214,6 +377,20 @@ export async function dispatch(role: Role): Promise<void> {
     if (refused) {
       console.error(refused);
       process.exit(EXIT_OLD_PROGRAMS);
+    }
+  }
+  // parachute.yaml (settings.ts): its settings go into effect before the hub or the vault reads any (env still wins).
+  // A broken file stops `serve`, which must not start on settings it could not read; other commands say so and go on.
+  // Not in the vault a host-managed `serve --embedded` starts (PARACHUTE_EMBEDDED_PARENT): the host's flags and env rule.
+  if (process.env.PARACHUTE_EMBEDDED_PARENT === undefined) {
+    const { applyParachuteYaml, SettingsError } = await import("./settings.ts");
+    try {
+      applyParachuteYaml(home, { server: r.cli === "hub" });
+    } catch (err) {
+      if (!(err instanceof SettingsError)) throw err;
+      console.error(`${name}: ${err.message}`);
+      if (serving) process.exit(2);
+      console.error(`${name}: going on without ${"parachute.yaml"}`);
     }
   }
   if (r.cli === "hub" && r.argv[0] === "serve") {

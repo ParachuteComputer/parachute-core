@@ -48,6 +48,12 @@ export interface AttachmentTicket {
   segmentIndex?: number;
   /** Download only. */
   attachmentId?: string;
+  /**
+   * The minting session's tag scope (`permissions.scoped_tags`), when it had
+   * one (scope gap 7). The spend re-checks the note against the scope as it is
+   * then: a note that left the scope after the mint is not found.
+   */
+  scopedTags?: string[];
 }
 
 /**

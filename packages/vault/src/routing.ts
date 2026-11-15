@@ -52,11 +52,16 @@
  * UX audit, 2026-05-25).
  */
 
+import { countName, restRouteName, typesRouteName } from "./name-usage.ts";
+import { recordsRoute } from "../core/src/rest-records.ts";
+import { handleRecordsRest } from "./records-rest.ts";
 import pkg from "../package.json" with { type: "json" };
 import type { VaultConfig } from "./config.ts";
+import { assetsDir } from "./config.ts";
 import type { Note, Store } from "../core/src/types.ts";
 import {
   readVaultConfig,
+  servedDescription,
   readGlobalConfig,
   writeVaultConfig,
   listVaults,
@@ -66,9 +71,11 @@ import {
   authenticateGlobalRequest,
   deriveVaultFromToken,
   extractApiKey,
+  type AuthResult,
 } from "./auth.ts";
-import { hasScopeForVault, hasMigrateScopeForVault, SCOPE_ADMIN, SCOPE_READ, scopeForMethod, verbForMethod } from "./scopes.ts";
-import { getVaultStore } from "./vault-store.ts";
+import { hasScopeForVault, hasMigrateScopeForVault, hasExportScopeForVault, SCOPE_ADMIN, SCOPE_READ, scopeForMethod, verbForMethod } from "./scopes.ts";
+import { getSharedEmbeddingProvider, getVaultStore } from "./vault-store.ts";
+import { resolveEmbeddingCapability } from "./embedding/capability.ts";
 import { handleScopedMcp } from "./mcp-http.ts";
 import {
   defaultAdminSpaDistDir,
@@ -82,16 +89,18 @@ import {
   handleTags,
   handleFindPath,
   handleVault,
+  descriptionNeedsAdmin,
   handleUnresolvedWikilinks,
   handleStorage,
   handleViewNote,
   handleDoctor,
   handleHistoryCompact,
+  handleDeletedNotes,
   type TagScopeCtx,
   type WriteCtx,
 } from "./routes.ts";
 import { handleTriggers } from "./triggers-api.ts";
-import { expandTokenTagScope, noteWithinTagScope, scopedStatsFilter } from "./tag-scope.ts";
+import { expandTokenTagScope, noteWithinTagScope, scopedStatsFilter, tagScopedVaultWideForbidden } from "./tag-scope.ts";
 import {
   handleProtectedResource,
   handleRootProtectedResource,
@@ -126,7 +135,41 @@ import {
 } from "./transcription-routes.ts";
 import { getMirrorManager } from "./mirror-registry.ts";
 import { buildUsageReport } from "./usage.ts";
+import { collectExportEntries, tarSize, tarStream, tryAcquireExport } from "./export-tar.ts";
+import { readLastExport, recordExport } from "./export-stamp.ts";
 import { handleTicketSpend } from "./attachment-tickets.ts";
+import { ON_BEHALF_HEADER, resolveBy } from "../core/src/write-stamp.ts";
+
+/**
+ * REST routes whose writes carry the write stamp: everything under /notes (and its /records twin), except
+ * attachments (an attachment row has no writer), and a tag rename (it rewrites notes). A supplied on-behalf-of on
+ * any other write is refused, so it is never silently dropped; a read carries nothing to stamp.
+ */
+function stampsWriter(method: string, apiPath: string | null): boolean {
+  if (method === "GET" || method === "HEAD" || method === "OPTIONS") return true;
+  if (apiPath === null) return false; // not the REST API: /view, the vault root, …
+  // A record's attachments, history erases (DELETE …/versions) and a transcription retry record no writer; restore
+  // (POST …/restore) does. Matched after the id, so a record whose id is "versions" is still a record.
+  if (/^\/(notes|records)(\/|$|\?)/.test(apiPath)) return !/^\/(notes|records)\/[^/]+\/(attachments|versions|retry-transcription)(\/|$)/.test(apiPath);
+  return /^\/(tags|types)\/[^/]+\/rename$/.test(apiPath);
+}
+
+/** The "by" a REST request writes with, or the refusal (as a Response). `apiPath` is the path under /api, or null. */
+export function restWriteStamp(req: Request, apiPath: string | null, auth: AuthResult): { by: string | null } | { refusal: Response } {
+  const supplied = req.headers.get(ON_BEHALF_HEADER) ?? undefined;
+  const r = resolveBy(supplied, auth.acts_for ?? null, auth.actor, "rest");
+  const refuse = (status: number, body: Record<string, unknown>) => ({ refusal: Response.json({ error: body.message, ...body }, { status }) });
+  if ("refusal" in r) return refuse(r.refusal.status, { ...r.refusal });
+  if (supplied !== undefined && !stampsWriter(req.method, apiPath)) {
+    return refuse(400, {
+      error_type: "on_behalf_not_recorded",
+      field: ON_BEHALF_HEADER,
+      message: `${req.method} ${apiPath === null ? "this route" : `/api${apiPath}`} records no writer, so ${ON_BEHALF_HEADER} would be dropped. Nothing was written. Send it on record writes (create, change, delete, batch, restore) only.`,
+      hint: "drop the header on this call",
+    });
+  }
+  return r;
+}
 
 /**
  * Decorate a 401 response from the MCP endpoint with the RFC 9728 challenge
@@ -199,6 +242,15 @@ async function dispatchScopedMcp(
 ): Promise<Response> {
   const auth = await authenticateVaultRequest(req, vaultConfig);
   if ("error" in auth) return withMcpChallenge(auth.error, req, vaultName);
+  // The write stamp on MCP rides each write tool's `on_behalf_of` (mcp-tools.ts applyOnBehalf). The REST header is
+  // never read here, so it is refused rather than dropped.
+  if (req.headers.has(ON_BEHALF_HEADER)) {
+    return Response.json({
+      error: `${ON_BEHALF_HEADER} is the REST header; on MCP, pass on_behalf_of on the write tool (shown to a key the vault's owner let write on behalf of others). Nothing was done.`,
+      error_type: "on_behalf_not_recorded",
+      field: ON_BEHALF_HEADER,
+    }, { status: 400 });
+  }
   // Thread the RAW caller bearer (the exact credential the session presented)
   // into the MCP layer so the manage-token tool can forward it to hub's
   // mint-token attenuation proxy (vault#403, MGT). Only the raw validated
@@ -208,6 +260,52 @@ async function dispatchScopedMcp(
   // forwards JWT-shaped bearers).
   const callerBearer = extractApiKey(req);
   return handleScopedMcp(req, vaultName, auth, callerBearer);
+}
+
+/**
+ * GET /api/export: stream the whole vault as one tar (`export-tar.ts`; the same files as `parachute-vault export`).
+ * `by` is the key that pulled it. The vault records the time and `by` once the last byte has gone out
+ * (`last_export_at`, shown on `GET /api/vault` to an admin and by `parachute vault status`); a pull the client
+ * abandons records nothing, and neither does a `?since=` pull (a piece of the vault, not a backup).
+ * `?since=<iso>` and `?exported_at=<iso>` are the engine's, as on Parachute Cloud.
+ */
+async function handleExport(req: Request, store: Store, vaultConfig: VaultConfig, by: string | null): Promise<Response> {
+  const url = new URL(req.url);
+  const since = url.searchParams.get("since") ?? undefined;
+  const exportedAt = url.searchParams.get("exported_at") ?? undefined;
+  const name = vaultConfig.name;
+  // At most a few pulls of one vault at once: each holds all the note text in memory before its first byte.
+  const release = tryAcquireExport(name);
+  if (!release) {
+    return Response.json(
+      { error: "too_many_exports", message: "Too many exports of this vault are running. Try again shortly." },
+      { status: 429, headers: { "Retry-After": "5" } },
+    );
+  }
+  let entries;
+  try {
+    ({ entries } = await collectExportEntries(
+      store,
+      { vaultName: name, ...(vaultConfig.description ? { vaultDescription: vaultConfig.description } : {}), ...(since ? { since } : {}), ...(exportedAt ? { exportedAt } : {}) },
+      assetsDir(name),
+    ));
+  } catch (err) {
+    release();
+    console.error(`[export ${name}] failed: ${(err as Error).message}`);
+    return Response.json({ error: "export_failed", message: "Export could not be assembled. Please retry." }, { status: 500 });
+  }
+  const ts = new Date().toISOString().replace(/[:.]/g, "-");
+  // A `?since=` pull is a piece of the vault, not a backup: it does not move the stamp.
+  return new Response(tarStream(entries, () => { if (!since) recordExport(name, by); }, release), {
+    status: 200,
+    headers: {
+      "Content-Type": "application/x-tar",
+      "Content-Disposition": `attachment; filename="vault-${name}-${ts}.tar"`,
+      // Bun sends a streamed body chunked and drops this; a cut-off pull still fails for the client (the stream errors).
+      "Content-Length": String(tarSize(entries)),
+      "Cache-Control": "no-store",
+    },
+  });
 }
 
 /**
@@ -362,11 +460,16 @@ export async function route(
   // ---------------------------------------------------------------------
 
   if (path === "/health") {
+    // The embedder's state rides on /health (T-418): semantic search turned on with a model that can't load used to
+    // look healthy here while every note's embed failed. Anyone sees the state; the provider, model and reason (it
+    // names install paths) only a caller with a pass for the vault, at /vault/<name>/api/health or /api/vault.
+    const { enabled, state } = await resolveEmbeddingCapability(getSharedEmbeddingProvider());
+    const embeddings = { enabled, state };
     const auth = await authenticateGlobalRequest(req);
     if ("error" in auth) {
-      return Response.json({ status: "ok" });
+      return Response.json({ status: "ok", embeddings });
     }
-    return Response.json({ status: "ok", vaults: listVaults() });
+    return Response.json({ status: "ok", vaults: listVaults(), embeddings });
   }
 
   // Public vault-name discovery. Lets unauthenticated clients (e.g. the
@@ -458,7 +561,7 @@ export async function route(
       const config = readVaultConfig(name);
       return {
         name,
-        description: config?.description,
+        description: servedDescription(name, config?.description),
         created_at: config?.created_at,
       };
     });
@@ -610,6 +713,8 @@ export async function route(
         { status: 403 },
       );
     }
+    // The vault's and host's whole config: not for a tag-scoped token (T-419).
+    if (configAuth.scoped_tags !== null) return tagScopedVaultWideForbidden(configAuth.scoped_tags);
     const globalConfig = readGlobalConfig();
     return handleConfig(vaultConfig, globalConfig);
   }
@@ -657,24 +762,47 @@ export async function route(
   // ---------------------------------------------------------------------
 
   const store = getVaultStore(vaultName);
-  const auth = await authenticateVaultRequest(req, vaultConfig);
+  // The backup key (export scope, nothing else) gets past authentication for `GET /api/export` only; everywhere else
+  // authenticateVaultRequest refuses it.
+  const isExportPull = req.method === "GET" && subpath === "/api/export";
+  const auth = await authenticateVaultRequest(req, vaultConfig, { allowExportOnly: isExportPull });
   if ("error" in auth) {
     return auth.error;
   }
+  // The write stamp, decided once for every authenticated route below (core write-stamp.ts): `by` is the token's
+  // subject unless the request names who the write is for (Parachute-On-Behalf-Of) and the token holds the owner's
+  // on-behalf-of permission. Refused, never ignored, when it doesn't, or when the route records no writer; checked
+  // before any route runs, so a refused request writes nothing. On-behalf-of never opens access.
+  const stamp = restWriteStamp(req, subpath.match(/^\/api(\/.*)?$/) ? (subpath.slice(4) || "/") : null, auth);
+  if ("refusal" in stamp) return stamp.refusal;
 
   // Bare `/vault/<name>` — single-vault root. Returns name, description,
-  // createdAt, and stats. One round trip for a viz landing page.
+  // createdAt, and stats. One round trip for a viz landing page. Read-gated
+  // (T-419, audit G-C): a token for this vault holding no vault verb used to
+  // get the description and stats here while `/api/*` refused it.
   if (subpath === "" || subpath === "/") {
     if (req.method !== "GET") {
       return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
-    // vault#766: a scoped caller's stats exclude notes a private tag hides.
+    if (!hasScopeForVault(auth.scopes, vaultName, "read")) {
+      return Response.json(
+        {
+          error: "Forbidden",
+          error_type: "insufficient_scope",
+          message: `This endpoint requires the '${SCOPE_READ}' scope (or '${SCOPE_READ.replace("vault:", `vault:${vaultName}:`)}').`,
+          required_scope: SCOPE_READ,
+          granted_scopes: auth.scopes,
+        },
+        { status: 403 },
+      );
+    }
+    // A scoped caller's stats count only the notes it can see (vault#766, T-419).
     const stats = await store.getVaultStats(
       scopedStatsFilter(store, await expandTokenTagScope(store, auth.scoped_tags)),
     );
     return Response.json({
       name: vaultName,
-      description: vaultConfig.description,
+      description: servedDescription(vaultName, vaultConfig.description),
       createdAt: vaultConfig.created_at,
       stats,
     });
@@ -709,6 +837,21 @@ export async function route(
       scopedStatsFilter(store, await expandTokenTagScope(store, auth.scoped_tags)),
     );
     return Response.json(buildUsageReport(vaultName, stats, { fresh }));
+  }
+
+  // Vault-wide and host-wide admin routes refuse a tag-scoped admin token
+  // (T-419, audit L3-10 #4). The mirror routes (config, run-now, push-now,
+  // history, import, auth) act on the whole vault: push-now exports every
+  // note, import with mode "replace" deletes notes. Embeddings and
+  // transcription set host-wide settings for every vault. A non-admin token
+  // falls through to each route's own admin gate, so it still gets the usual
+  // insufficient_scope 403. (/.parachute/config, above, checks the same.)
+  if (
+    (subpath === "/.parachute/embeddings" || subpath === "/.parachute/transcription" ||
+      subpath === "/.parachute/mirror" || subpath.startsWith("/.parachute/mirror/")) &&
+    auth.scoped_tags !== null && hasScopeForVault(auth.scopes, vaultName, "admin")
+  ) {
+    return tagScopedVaultWideForbidden(auth.scoped_tags);
   }
 
   // /.parachute/embeddings — Admin-gated read+write of the semantic-search
@@ -774,6 +917,7 @@ export async function route(
   // at 0.5.0 (vault#282 Stage 2 — vault is a pure hub resource-server). Hub
   // JWTs are minted via hub's registry (`/api/auth/mint-token`); a `/tokens`
   // request now falls through to the catch-all 404 below.
+
 
   // /.parachute/mirror — Admin-gated read+write of THIS vault's persistent
   // mirror config + runtime status. Per-vault (vault#400): the manager is
@@ -1040,6 +1184,30 @@ export async function route(
   if (!apiMatch) {
     return Response.json({ error: "Not found" }, { status: 404 });
   }
+  // GET /api/export: the whole vault as one tar. A read key (or better) or the export key may pull it; a tag-scoped
+  // key may not (the export is the whole vault). Dispatched before the generic verb gate, which would ask for read.
+  if (apiMatch[1] === "/export") {
+    if (req.method !== "GET") return Response.json({ error: "Method not allowed", error_type: "method_not_allowed" }, { status: 405 });
+    if (!hasScopeForVault(auth.scopes, vaultName, "read") && !hasExportScopeForVault(auth.scopes, vaultName)) {
+      return Response.json(
+        {
+          error: "Forbidden",
+          error_type: "insufficient_scope",
+          message: `This endpoint requires the '${SCOPE_READ}' scope (or '${SCOPE_READ.replace("vault:", `vault:${vaultName}:`)}'), or the export scope.`,
+          required_scope: SCOPE_READ,
+          granted_scopes: auth.scopes,
+        },
+        { status: 403 },
+      );
+    }
+    if (auth.scoped_tags !== null) return tagScopedVaultWideForbidden(auth.scoped_tags);
+    return handleExport(req, store, vaultConfig, auth.via ?? auth.actor ?? null);
+  }
+  // The record door over REST (SPEC §5.1): `/api/records…` runs as its `/api/notes…` twin and `/api/types…` as
+  // `/api/tags…`, so every gate below (scopes, admin routes, tag scope) is the twin's, under the new name too.
+  // The words move in records-rest.ts.
+  const recordsDoor = recordsRoute(apiMatch[1] ?? "");
+  if (recordsDoor) apiMatch[1] = recordsDoor.twin;
 
   // /api/triggers — runtime trigger-registration API. Dispatched BEFORE the
   // generic method→verb scope gate below because it's ADMIN-scoped on EVERY
@@ -1111,22 +1279,31 @@ export async function route(
   // `vault:write` here — a gap between doors (a `vault:write` token could
   // rename/merge/delete/update a tag over REST while MCP already refused
   // it). Matches PUT/DELETE `/tags/:name` (update-tag / delete-tag), POST
-  // `/tags/merge` (merge-tags), and POST `/tags/:name/rename` (rename-tag).
+  // `/tags/merge` (merge-tags), POST `/tags/:name/rename` (rename-tag), and
+  // POST `/tags/:name/migrate` (0.9.2; its dry run too: the plan lists
+  // records across the whole vault).
   // Deliberately does NOT match `/tags/:name/conformance` (2 path segments,
   // not 1 — see `isReadOnlyPost` above for that endpoint's own, lower tier)
   // or plain GET `/tags[/:name]` (read, unaffected).
   const isTagSchemaMutation =
     ((req.method === "PUT" || req.method === "DELETE") && /^\/tags\/[^/]+$/.test(apiSubpath)) ||
     (req.method === "POST" &&
-      (apiSubpath === "/tags/merge" || /^\/tags\/[^/]+\/rename$/.test(apiSubpath)));
-  // Erasing note history is irreversible and requires admin (vault#524).
-  const isNoteHistoryErase = req.method === "DELETE" && /^\/notes\/[^/]+\/versions$/.test(apiSubpath);
+      (apiSubpath === "/tags/merge" || /^\/tags\/[^/]+\/(rename|migrate)$/.test(apiSubpath)));
+  // Erasing note history is irreversible and requires admin (vault#524). So does a delete that erases it
+  // (`?erase_history=`, T-412): any value but an absent or explicit false is gated here, and the handler refuses a
+  // value it can't read. Listing deleted notes with history left is the same admin's job.
+  const eraseParam = req.method === "DELETE" && /^\/notes\/[^/]+$/.test(apiSubpath)
+    ? new URL(req.url).searchParams.get("erase_history")
+    : null;
+  const isNoteHistoryErase = (req.method === "DELETE" && /^\/notes\/[^/]+\/versions$/.test(apiSubpath)) ||
+    (eraseParam !== null && eraseParam !== "false");
   const isHistoryCompact = req.method === "POST" && apiSubpath === "/history/compact";
-  const requiredVerb = isReadOnlyPost ? "read" : (isTagSchemaMutation || isNoteHistoryErase || isHistoryCompact) ? "admin" : verbForMethod(req.method);
+  const isDeletedList = req.method === "GET" && apiSubpath === "/history/deleted";
+  const requiredVerb = isReadOnlyPost ? "read" : (isTagSchemaMutation || isNoteHistoryErase || isHistoryCompact || isDeletedList) ? "admin" : verbForMethod(req.method);
   if (!hasScopeForVault(auth.scopes, vaultName, requiredVerb)) {
     const requiredApiScope = isReadOnlyPost
       ? SCOPE_READ
-      : (isTagSchemaMutation || isNoteHistoryErase || isHistoryCompact)
+      : (isTagSchemaMutation || isNoteHistoryErase || isHistoryCompact || isDeletedList)
         ? SCOPE_ADMIN
         : scopeForMethod(req.method);
     return Response.json(
@@ -1168,12 +1345,25 @@ export async function route(
   // notes that violate `strict:true` field constraints (for backfill /
   // migration). Every bypassed write is logged. Orthogonal to read/write/admin
   // — an admin token does NOT bypass unless it also holds `migrate`.
+  // The write stamp: `via` is the token's (a named key says `key:<name>`); `by` was settled above (`stamp`).
   const writeCtx: WriteCtx = {
-    actor: auth.actor,
+    actor: stamp.by,
     via: auth.via,
     bypassStrict: hasMigrateScopeForVault(auth.scopes, vaultName),
   };
 
+  if (apiPath.startsWith("/notes") && recordsDoor) {
+    // /api/records: the same route under its record name, counted as adopted (never as deprecated).
+    const route = restRouteName(req.method, apiPath);
+    if (route) countName(route.replace(" /api/notes", " /api/records"), "new");
+    return handleRecordsRest(req, recordsDoor, `/vault/${vaultName}/api`, store, tagScope, (twin) =>
+      handleNotes(twin, store, apiPath.slice(6), vaultName, tagScope, writeCtx));
+  }
+  if (apiPath.startsWith("/notes")) {
+    // T-407: /api/notes is note-named; count each route's use for the 1.0 decision (names only, never ids).
+    const route = restRouteName(req.method, apiPath);
+    if (route) countName(route, "old");
+  }
   if (apiPath.startsWith("/notes")) return handleNotes(req, store, apiPath.slice(6), vaultName, tagScope, writeCtx);
   // Live-query SSE transport REMOVED (WS-hibernation migration Phase 5). The
   // WebSocket binding (an `Upgrade: websocket` GET /subscribe, handled in
@@ -1194,10 +1384,31 @@ export async function route(
       { status: 410 },
     );
   }
+  if (apiPath.startsWith("/tags") && recordsDoor) {
+    countName(typesRouteName(req.method, apiPath), "new");
+    return handleRecordsRest(req, recordsDoor, `/vault/${vaultName}/api`, store, tagScope, (twin) =>
+      handleTags(twin, store, apiPath.slice(5), tagScope, writeCtx));
+  }
   if (apiPath.startsWith("/tags")) return handleTags(req, store, apiPath.slice(5), tagScope, writeCtx);
   if (isHistoryCompact) return handleHistoryCompact(req, store, tagScope);
+  if (isDeletedList) return handleDeletedNotes(req, store, tagScope);
   if (apiPath === "/find-path") return handleFindPath(req, store, tagScope);
   if (apiPath === "/vault") {
+    // PATCH /api/vault (T-419, audit L3-01). The description is the text every
+    // MCP `initialize` hands every AI connection, so editing it is curation and
+    // needs admin, the same rule as MCP `vault-info` (src/mcp-tools.ts). A body
+    // with only `config` stays at write: the Notes app connects with
+    // read+write and PATCHes `{config:{audio_retention}}` from Settings and the
+    // capture screen, so admin-only PATCH would break it for every Notes user.
+    // A tag-scoped token is refused either way: description and config are
+    // vault-wide (a scoped writer setting retention would drop audio on notes
+    // it can't see).
+    if (req.method === "PATCH" && tagScope.raw !== null) return tagScopedVaultWideForbidden(tagScope.raw);
+    // handleVault parses the body (once, under its size cap) and refuses a
+    // description edit unless this is null (admin).
+    const descriptionForbidden = hasScopeForVault(auth.scopes, vaultName, "admin")
+      ? null
+      : (what?: string) => descriptionNeedsAdmin(vaultName, auth.scopes, what);
     return handleVault(
       req,
       store,
@@ -1207,11 +1418,15 @@ export async function route(
       },
       undefined, // resolveCapability — keep the production default
       tagScope,
+      undefined, // resolveEmbeddingCap — keep the production default
+      descriptionForbidden,
+      // When the last full export went out and to which key: an admin's view, and not a tag-scoped one.
+      hasScopeForVault(auth.scopes, vaultName, "admin") && tagScope.raw === null ? readLastExport(vaultName) : null,
     );
   }
   if (apiPath === "/unresolved-wikilinks") return handleUnresolvedWikilinks(req, store, tagScope);
   if (apiPath.startsWith("/storage")) return handleStorage(req, apiPath.slice(8), vaultName, store, tagScope);
-  if (apiPath === "/health") return Response.json({ status: "ok", vault: vaultName });
+  if (apiPath === "/health") return Response.json({ status: "ok", vault: vaultName, embeddings: await resolveEmbeddingCapability(getSharedEmbeddingProvider()) });
 
   return Response.json({ error: "Not found" }, { status: 404 });
 }

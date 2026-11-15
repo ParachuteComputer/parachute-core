@@ -7,9 +7,14 @@ import { computeDisplayTitle, skipLeadingFrontmatter } from "./display-title.js"
 import { transaction } from "./txn.js";
 import {
   buildOperatorClause,
+  buildPlainEqualityClause,
   isOperatorObject,
   QueryError,
+  buildScanClause,
   requireIndexedField,
+  scanAffinityFor,
+  scanOrderSql,
+  scanValueSql,
 } from "./query-operators.js";
 import {
   CURSOR_VERSION,
@@ -22,18 +27,19 @@ import {
   type QueryHashInputs,
 } from "./cursor.js";
 import { getIndexedField, releaseField } from "./indexed-fields.js";
+import { assertNoAggregateScan } from "./query-warnings.js";
 import { computeExpandedTagCounts, loadTagHierarchy, stripTagHash } from "./tag-hierarchy.js";
 import { chunkForInClause, IN_VIA_JSON_EACH, jsonEachParam } from "./sql-in.js";
 import {
   buildLiteralSearchQuery,
   extractLiteralBoostTerms,
-  SEARCH_WEIGHT_PATH,
-  SEARCH_WEIGHT_CONTENT,
+  SEARCH_BM25_WEIGHTS,
   type SearchMode,
 } from "./search-query.js";
 import { generateUlid } from "./ulid.js";
 import { captureVersion, readPriorNoteRow, DEFAULT_HISTORY_POLICY, type HistoryPolicy } from "./history.js";
 import { refreshCompactState } from "./history-compact-state.js";
+import { typeNamesAmong } from "./tag-kind.js";
 
 /**
  * Write-attribution context (vault#298) — the two axes of provenance threaded
@@ -155,8 +161,15 @@ export function getNote(db: Database, id: string): Note | null {
   if (!row) return null;
 
   const note = rowToNote(row);
-  note.tags = getNoteTags(db, note.id);
+  withTagsAndTypes(db, note);
   return note;
+}
+
+/** Attach a note's tags, and the subset that are types (T-318 §8a). */
+function withTagsAndTypes(db: Database, note: Note): void {
+  note.tags = getNoteTags(db, note.id);
+  const types = typeNamesAmong(db, note.tags);
+  note.types = note.tags.filter((t) => types.has(t));
 }
 
 /**
@@ -182,7 +195,7 @@ export function getNoteByPath(db: Database, path: string, extension?: string): N
     ).get(path, extension.toLowerCase()) as NoteRow | null;
     if (!row) return null;
     const note = rowToNote(row);
-    note.tags = getNoteTags(db, note.id);
+    withTagsAndTypes(db, note);
     return note;
   }
 
@@ -195,7 +208,7 @@ export function getNoteByPath(db: Database, path: string, extension?: string): N
   if (rows.length === 0) return null;
   if (rows.length === 1) {
     const note = rowToNote(rows[0]!);
-    note.tags = getNoteTags(db, note.id);
+    withTagsAndTypes(db, note);
     return note;
   }
   throw new AmbiguousPathError(
@@ -1155,6 +1168,9 @@ export function buildFilterConditions(db: Database, opts: QueryOpts): { conditio
   // cost O(candidates × row size) regardless of limit. The IN-subquery
   // rides idx_note_tags_tag, produces each note id at most once, and lets
   // the whole query drop DISTINCT. See the 2026-06-10 perf measurements.
+  // Positions in `conditions` of the tag-membership clauses, so they can be re-shaped once we know whether an
+  // indexed metadata equality will drive the query (see the end of the metadata block).
+  const tagClauses: number[] = [];
   if (opts.tags && opts.tags.length > 0) {
     // Canonical-bare-tag guard (vault#XXX) backstop for direct-core callers
     // that bypass BunSqliteStore.normalizeQueryTags (the store normalizes +
@@ -1172,6 +1188,7 @@ export function buildFilterConditions(db: Database, opts: QueryOpts): { conditio
       if (flat.length > 0) {
         // One json_each param per set, not one `?` per tag: a tag with 100+
         // declared descendants passed Durable Object SQLite's 100-param cap.
+        tagClauses.push(conditions.length);
         conditions.push(`n.id IN (SELECT note_id FROM note_tags WHERE tag_name IN ${IN_VIA_JSON_EACH})`);
         params.push(jsonEachParam(flat));
       }
@@ -1180,6 +1197,7 @@ export function buildFilterConditions(db: Database, opts: QueryOpts): { conditio
       // input or any descendant.
       for (const set of tagSets) {
         if (!set || set.length === 0) continue;
+        tagClauses.push(conditions.length);
         conditions.push(`n.id IN (SELECT note_id FROM note_tags WHERE tag_name IN ${IN_VIA_JSON_EACH})`);
         params.push(jsonEachParam(set));
       }
@@ -1355,14 +1373,14 @@ export function buildFilterConditions(db: Database, opts: QueryOpts): { conditio
   }
 
   // Metadata filters — operator objects route through the indexed generated
-  // column (fast, loud errors on non-indexed fields); primitives keep the
-  // existing JSON-scan exact-match behavior for backcompat.
+  // column (fast, loud errors on non-indexed fields); primitives are an exact
+  // match on the JSON, bound by type (buildPlainEqualityClause).
   //
   // Plain-equality fast path (2026-06-10 perf measurements): when the field
   // happens to be indexed, a plain `{field: value}` equality used to pay the
   // same full-table json_extract scan as a non-indexed field — 280× slower
   // than the operator form `{field: {eq: value}}` ON THE SAME column. We now
-  // prepend an indexed-prefilter conjunct (`"meta_<field>" = ?`) so the
+  // prepend an indexed-prefilter conjunct (`"meta_<field>" IN (...)`) so the
   // B-tree narrows the candidates, while KEEPING the original json_extract
   // clause as a residual predicate. The conjunction is result-identical to
   // the scan by construction: any row the scan matches also satisfies the
@@ -1371,30 +1389,57 @@ export function buildFilterConditions(db: Database, opts: QueryOpts): { conditio
   // matches but the raw extraction doesn't (e.g. JSON number 5 vs query
   // string "5") are excluded by the residual — exactly as the scan excluded
   // them. Pinned by query-plain-eq-routing.test.ts.
+  // Set when an indexed column is matched by equality (`eq`, `in`, or the plain-equality prefilter below):
+  // SQLite then drives the query from that column's B-tree.
+  let indexedEqualityDriver = false;
   if (opts.metadata) {
     for (const [key, value] of Object.entries(opts.metadata)) {
       if (isOperatorObject(value)) {
-        const indexedField = requireIndexedField(db, key);
+        const indexedField = getIndexedField(db, key);
+        const ops = value as Record<string, unknown>;
+        if (!indexedField) {
+          // 0.9.2: a field that isn't indexed is scanned, not refused; the
+          // caller learns it scanned from `collectScanWarnings`.
+          const { sql, params: opParams } = buildScanClause(key, ops, scanAffinityFor(db, key));
+          conditions.push(sql);
+          params.push(...opParams);
+          continue;
+        }
+        if (ops.eq !== undefined && ops.eq !== null) indexedEqualityDriver = true;
+        if (Array.isArray(ops.in) && ops.in.length > 0) indexedEqualityDriver = true;
         const { sql, params: opParams } = buildOperatorClause(
           key,
-          value as Record<string, unknown>,
+          ops,
           indexedField.sqliteType,
         );
         conditions.push(sql);
         params.push(...opParams);
       } else {
-        const bound = typeof value === "string" ? value : JSON.stringify(value);
+        const eq = buildPlainEqualityClause(key, value);
         // `getIndexedField` returning a row proves `key` was validated by
         // FIELD_NAME_RE at declaration time, so interpolating the column
         // name is safe — same justification as buildOperatorClause.
-        if (getIndexedField(db, key)) {
-          conditions.push(`("meta_${key}" = ? AND json_extract(n.metadata, '$.' || ?) = ?)`);
-          params.push(bound, key, bound);
+        if (eq.indexProbes && getIndexedField(db, key)) {
+          indexedEqualityDriver = true;
+          const slots = eq.indexProbes.map(() => "?").join(", ");
+          conditions.push(`("meta_${key}" IN (${slots}) AND ${eq.sql})`);
+          params.push(...eq.indexProbes, ...eq.params);
         } else {
-          conditions.push(`json_extract(n.metadata, '$.' || ?) = ?`);
-          params.push(key, bound);
+          conditions.push(eq.sql);
+          params.push(...eq.params);
         }
       }
+    }
+  }
+
+  // Tag membership beside an indexed equality (T-412). `n.id IN (SELECT note_id ...)` is the right shape when the
+  // tag drives the query: SQLite walks the tag's ids. But when an indexed equality drives it, SQLite keeps the IN
+  // as a membership test and first lists every note under the tag, so "reactions of player X" read every reaction
+  // (4,200 rows on the Taste Arcade test, against 44 by field and path prefix). A correlated EXISTS is one probe of
+  // idx_note_tags_note per candidate instead. Same notes either way: both say "has a tag in this set".
+  if (indexedEqualityDriver) {
+    for (const i of tagClauses) {
+      conditions[i] = `EXISTS (SELECT 1 FROM note_tags tg WHERE tg.note_id = n.id AND tg.tag_name IN ${IN_VIA_JSON_EACH})`;
     }
   }
 
@@ -1438,10 +1483,10 @@ export function buildFilterConditions(db: Database, opts: QueryOpts): { conditio
     } else if (isUpdatedAt) {
       column = "n.updated_at_ms";
     } else {
-      // Re-uses the same indexed-field gate as `metadata` operator queries
-      // and `orderBy` so the error message and contract are consistent.
-      requireIndexedField(db, field);
-      column = `"meta_${field}"`;
+      // An indexed field compares on its column; any other field is scanned
+      // as text (dates are ISO-8601 text), with the same `scan` warning as
+      // `metadata` operators and `orderBy`.
+      column = getIndexedField(db, field) ? `"meta_${field}"` : `CAST(${scanValueSql(field)} AS TEXT)`;
     }
     if (filter.from !== undefined) {
       const label = field === "created_at" ? "date_filter.from" : `date_filter.from (${field})`;
@@ -1597,6 +1642,11 @@ export function queryNotes(db: Database, opts: QueryOpts, _outUpdatedAtMs?: Map<
     // shipped for it. `id` is the explicit tiebreak for stable ordering when
     // two notes share a millisecond, matching the cursor keyset's tiebreak.
     orderBy = `n.updated_at_ms ${direction}, n.id ${direction}`;
+  } else if (opts.orderBy === "created_at") {
+    // 0.9.2: `created_at` names the notes column (it used to be refused as a
+    // field that isn't indexed; a metadata key of that name would shadow
+    // nothing useful), so it is the default order made explicit.
+    orderBy = `n.created_at ${direction}, n.id ${direction}`;
   } else if (opts.orderBy === "link_count") {
     // `link_count` is a pseudo-field — like `created_at`/`updated_at` in the
     // dateFilter block above, it bypasses `requireIndexedField` (it's not a
@@ -1624,12 +1674,16 @@ export function queryNotes(db: Database, opts: QueryOpts, _outUpdatedAtMs?: Map<
       `+ (SELECT COUNT(*) FROM links WHERE target_id = n.id)) ${direction}, ` +
       `n.created_at ${direction}`;
   } else if (opts.orderBy) {
-    requireIndexedField(db, opts.orderBy);
-    // `orderBy` came from indexed_fields (validated on declaration), so
-    // the column name is safe to interpolate. Append created_at as a
-    // stable tiebreaker so two rows with the same indexed value have a
+    // An indexed `orderBy` came from indexed_fields (validated on
+    // declaration), so the column name is safe to interpolate. Any other
+    // field sorts on a scan key with the indexed column's conversions
+    // (`scanOrderSql`; the caller gets a `scan` warning). Append created_at
+    // as a stable tiebreaker so two rows with the same value have a
     // deterministic order.
-    orderBy = `"meta_${opts.orderBy}" ${direction}, n.created_at ${direction}, n.id ${direction}`;
+    const key = getIndexedField(db, opts.orderBy)
+      ? `"meta_${opts.orderBy}"`
+      : scanOrderSql(opts.orderBy, scanAffinityFor(db, opts.orderBy));
+    orderBy = `${key} ${direction}, n.created_at ${direction}, n.id ${direction}`;
   } else {
     // id tiebreaker: same-millisecond inserts get deterministic relative
     // order — load-bearing now that the two-phase page fetch makes
@@ -1762,6 +1816,7 @@ export function aggregateNotes(db: Database, opts: QueryOpts): AggregateRow[] {
     );
   }
 
+  assertNoAggregateScan(db, opts);
   const { conditions, params } = buildFilterConditions(db, opts);
   const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
 
@@ -1841,7 +1896,11 @@ function fetchNotesByIdsOrdered(db: Database, ids: string[]): Note[] {
     if (row) notes.push(rowToNote(row));
   }
   const tagsById = getNoteTagsForNotes(db, notes.map((n) => n.id));
-  for (const note of notes) note.tags = tagsById.get(note.id) ?? [];
+  const types = typeNamesAmong(db, [...new Set([...tagsById.values()].flat())]);
+  for (const note of notes) {
+    note.tags = tagsById.get(note.id) ?? [];
+    note.types = note.tags.filter((t) => types.has(t));
+  }
   return notes;
 }
 
@@ -1901,6 +1960,65 @@ function toQueryHashInputs(opts: QueryOpts): QueryHashInputs {
 }
 
 /**
+ * Cursor paging for a caller that sees only some notes (scope gap 2): the
+ * page is the first `limit` notes it may see after the cursor, and the
+ * cursor it gets back is built from those notes only. Unfiltered, the
+ * watermark advanced over hidden rows too and so carried a hidden note's id
+ * and timestamp (base64 JSON, readable by anyone), and a page of only hidden
+ * notes still moved it: a yes/no answer to "does a hidden note match". Here
+ * the scan walks the keyset past hidden rows in batches until it has `limit`
+ * visible notes or the rows run out; hidden rows after the last visible one
+ * are scanned again by the next call, which is what keeps the watermark
+ * honest. The answer is exactly what an unscoped caller gets on a vault
+ * holding only the notes this caller may see.
+ */
+function queryVisibleNotesPaged(db: Database, opts: QueryOpts, visible: (note: Note) => boolean): QueryNotesPage {
+  // A bad limit gets queryNotes' own error, before anything is read.
+  if (opts.limit !== undefined && !(typeof opts.limit === "number" && Number.isInteger(opts.limit) && opts.limit >= 0)) {
+    return queryNotesPaged(db, opts);
+  }
+  const limit = typeof opts.limit === "number" ? opts.limit : 100; // queryNotes' default
+  const batch = Math.max(limit, 200);
+  const queryHash = computeQueryHash(toQueryHashInputs(opts));
+  let lastUpdatedAt = 0;
+  let lastId = "";
+  if (opts.cursor !== undefined && opts.cursor !== "") {
+    const prior = decodeCursor(opts.cursor);
+    lastUpdatedAt = prior.last_updated_at;
+    lastId = prior.last_id;
+  }
+  const encode = (ms: number, id: string) =>
+    encodeCursor({ v: CURSOR_VERSION, last_updated_at: ms, last_id: id, query_hash: queryHash });
+  const notes: Note[] = [];
+  if (limit === 0) return { notes, next_cursor: encode(lastUpdatedAt, lastId) };
+  // The scan's own position, over every row; the returned watermark follows visible rows only.
+  let scanCursor = opts.cursor ?? "";
+  let scanMs = lastUpdatedAt;
+  let scanId = lastId;
+  for (;;) {
+    const keys = new Map<string, number>();
+    const rows = queryNotes(db, { ...opts, cursor: scanCursor, limit: batch, offset: undefined }, keys);
+    for (const note of rows) {
+      const ms = keys.get(note.id) ?? 0;
+      if (ms > scanMs || (ms === scanMs && note.id > scanId)) {
+        scanMs = ms;
+        scanId = note.id;
+      }
+      if (!visible(note)) continue;
+      notes.push(note);
+      if (ms > lastUpdatedAt || (ms === lastUpdatedAt && note.id > lastId)) {
+        lastUpdatedAt = ms;
+        lastId = note.id;
+      }
+      if (notes.length === limit) return { notes, next_cursor: encode(lastUpdatedAt, lastId) };
+    }
+    if (rows.length < batch) break;
+    scanCursor = encode(scanMs, scanId);
+  }
+  return { notes, next_cursor: encode(lastUpdatedAt, lastId) };
+}
+
+/**
  * Cursor-paginated wrapper around `queryNotes` (vault#313).
  *
  * Always returns `{ notes, next_cursor }`. `next_cursor` advances even on
@@ -1924,7 +2042,8 @@ function toQueryHashInputs(opts: QueryOpts): QueryHashInputs {
  * `updated_at > 0 OR (updated_at = 0 AND id > "")` matches every row
  * with a non-null `updated_at` greater than the unix epoch).
  */
-export function queryNotesPaged(db: Database, opts: QueryOpts): QueryNotesPage {
+export function queryNotesPaged(db: Database, opts: QueryOpts, visible?: (note: Note) => boolean): QueryNotesPage {
+  if (visible) return queryVisibleNotesPaged(db, opts, visible);
   // Capture each page row's integer keyset key (vault#586) from the SAME
   // phase-1 statement that ordered + sliced the page — one consistent
   // snapshot, so the watermark can't leapfrog rows a cross-process writer
@@ -2010,7 +2129,7 @@ export function queryNotesPaged(db: Database, opts: QueryOpts): QueryNotesPage {
  * generically off the FTS5 error text (`/no such column:/i`) rather than
  * re-parsing the query ourselves, since the SAME message also covers the
  * other real cause (an explicit `column:term` filter naming a column that
- * isn't one of `notes_fts`'s declared columns, `path`/`content`) — the hint
+ * isn't one of `notes_fts`'s declared columns, `path`/`content`/`fields`) — the hint
  * below covers both without claiming to know which one happened.
  */
 function advancedModeColumnHint(causeMessage: string): string | null {
@@ -2018,7 +2137,7 @@ function advancedModeColumnHint(causeMessage: string): string | null {
   return (
     `FTS5 read part of this query as column-filter syntax ("column:term") or as a ` +
     `leading "-" with no term to its left — NOT/"-" is a BINARY operator in FTS5 ` +
-    `("good -bad", not "-bad" alone). Indexed columns are "path" and "content". ` +
+    `("good -bad", not "-bad" alone). Indexed columns are "path", "content" and "fields". ` +
     `Add a preceding positive term before a NOT, quote the phrase to search it ` +
     `literally, or use search_mode:"literal" (the default) to skip advanced syntax entirely.`
   );
@@ -2056,11 +2175,14 @@ function searchSyntaxError(rawQuery: string, err: unknown, mode: SearchMode): Qu
  * the ratified title model (title = first line of CONTENT, not path).
  * This function is the one that boosts by the content-derived title.
  */
-function boostTitleMatches(notes: Note[], terms: string[]): Note[] {
+function boostTitleMatches(notes: Note[], terms: string[], tierById?: Map<string, number>): Note[] {
   if (terms.length === 0) return notes;
+  // The boost works inside a tier only: a record found through its field values alone (tier 0) stays below every
+  // title or body hit, however its first line reads.
   return notes
-    .map((note, index) => ({ note, index, titleMatch: titleMatchesAllTerms(note.content, terms) }))
+    .map((note, index) => ({ note, index, tier: tierById?.get(note.id) ?? 0, titleMatch: titleMatchesAllTerms(note.content, terms) }))
     .sort((a, b) => {
+      if (a.tier !== b.tier) return b.tier - a.tier;
       if (a.titleMatch === b.titleMatch) return a.index - b.index; // stable
       return a.titleMatch ? -1 : 1;
     })
@@ -2090,9 +2212,10 @@ function applySearchTitleBoost(
   mode: SearchMode,
   rawQuery: string,
   sort: "asc" | "desc" | undefined,
+  tierById?: Map<string, number>,
 ): Note[] {
   if (sort !== undefined || mode !== "literal") return notes;
-  return boostTitleMatches(notes, extractLiteralBoostTerms(rawQuery));
+  return boostTitleMatches(notes, extractLiteralBoostTerms(rawQuery), tierById);
 }
 
 export function searchNotes(
@@ -2124,7 +2247,7 @@ export function searchNotes(
 
   // Weighted bm25 relevance expression (vault#551 WS2C, schema v25):
   // `notes_fts` now indexes `path` (title, column 0) then `content` (body,
-  // column 1) — SEARCH_WEIGHT_PATH/SEARCH_WEIGHT_CONTENT bias ranking so a
+  // column 1, then `fields` (0.9.3), column 2) — SEARCH_BM25_WEIGHTS bias ranking so a
   // title match outranks a passing body mention. Raw SQLite bm25 is
   // negative-is-better; `-1.0 * bm25(...)` flips it so bigger is more
   // relevant (see `Note.score`'s doc comment for the external contract).
@@ -2139,7 +2262,7 @@ export function searchNotes(
   // not a third FTS column. The two are complementary, not redundant — a
   // note can have a matching path with a non-matching first line, or vice
   // versa.
-  const scoreExpr = `(-1.0 * bm25(notes_fts, ${SEARCH_WEIGHT_PATH}, ${SEARCH_WEIGHT_CONTENT}))`;
+  const scoreExpr = `(-1.0 * bm25(notes_fts, ${SEARCH_BM25_WEIGHTS}))`;
 
   // `sort` honored under search (vault#551 WS2A item 3): default stays FTS5
   // relevance (the weighted `score` expression); an EXPLICIT
@@ -2151,6 +2274,11 @@ export function searchNotes(
   // identical weighted score (relevance branch — much more likely than
   // with unweighted `rank`, since many notes share "zero path matches")
   // would otherwise return in arbitrary/unstable order.
+  // Field values rank below the title and body (0.9.3): a record found only through its fields comes after every
+  // record found in its path or content. bm25 alone can't promise that: it normalises by the length of the whole row,
+  // so a hit in a short record's fields can outscore a hit in a long body. Relevance order only, literal mode only
+  // (advanced text is raw FTS5; its author can say `fields:` or `content:` themselves).
+  const tier = mode === "literal" && opts?.sort === undefined ? fieldTierOf(ftsQuery) : null;
   const orderBy =
     opts?.sort === "asc"
       ? "n.created_at ASC, n.id ASC"
@@ -2174,16 +2302,17 @@ export function searchNotes(
 
   try {
     const rows = opts?.visible
-      ? searchVisibleOnly(db, ftsQuery, extraWhere, params, orderBy, limit, opts.visible)
+      ? searchVisibleOnly(db, ftsQuery, extraWhere, params, orderBy, limit, opts.visible, tier)
       : db.prepare(`
-      SELECT n.*, ${scoreExpr} AS score FROM notes n
+      SELECT n.*, ${scoreExpr} AS score${tier ? `, ${tier.select("n.rowid", "notes_fts")} AS tier` : ""} FROM notes n
       JOIN notes_fts fts ON fts.rowid = n.rowid
       WHERE notes_fts MATCH ?
         ${extraWhere}
-      ORDER BY ${orderBy}
+      ORDER BY ${tier ? "tier DESC, " : ""}${orderBy}
       LIMIT ?
-    `).all(ftsQuery, ...params, limit) as (NoteRow & { score: number })[];
-    return applySearchTitleBoost(notesWithTags(db, rows, scoresById(rows)), mode, query, opts?.sort);
+    `).all(...(tier ? [tier.param] : []), ftsQuery, ...params, limit) as (NoteRow & { score: number })[];
+    const tierById = tier ? new Map(rows.map((r) => [r.id, (r as { tier?: number }).tier ?? 0])) : undefined;
+    return applySearchTitleBoost(notesWithTags(db, rows, scoresById(rows)), mode, query, opts?.sort, tierById);
   } catch (err) {
     // Surface EVERY FTS5 error structured, never a raw rethrow (vault#551):
     // advanced mode expects it (the caller passed raw syntax); literal
@@ -2196,7 +2325,55 @@ export function searchNotes(
   }
 }
 
+/**
+ * The "found in the title or body" tier of a literal search: 1 when the same words all match within path/content
+ * alone, 0 when a field value is needed to match. `select(rowid, table)` is the SQL expression for one candidate row
+ * in `table`; `param` is its one bound value.
+ */
+interface FieldTier {
+  select(rowidExpr: string, table: string): string;
+  param: string;
+}
+function fieldTierOf(ftsQuery: string): FieldTier {
+  return {
+    param: `{path content} : (${ftsQuery})`,
+    select: (rowidExpr, table) => `CASE WHEN ${rowidExpr} IN (SELECT rowid FROM ${table} AS tier_fts WHERE tier_fts.${table} MATCH ?) THEN 1 ELSE 0 END`,
+  };
+}
+
 let visibleSearchSeq = 0;
+
+/**
+ * A visibility predicate that also says, one tag at a time, what the tag does: `admits` (a note carrying it may be
+ * seen) and `denies` (a note carrying it is hidden, whatever else it carries). Then the predicate is exactly
+ * "has a tag that admits and none that denies" (no tags: not visible), which SQL can state over note_tags.
+ * `byTag` MUST agree with the function it is attached to; the tag-scope builders attach it
+ * (src/tag-scope.ts) and a property test compares the two.
+ */
+export type NoteVisible = ((note: Note) => boolean) & { byTag?: (tag: string) => { admits: boolean; denies: boolean } };
+
+/**
+ * The SQL form of a `NoteVisible` over `n` (the notes table), or null when the predicate has no `byTag`. The rule is
+ * applied to every tag name in use (one DISTINCT read of note_tags' tag index), so SQL tests set membership of a
+ * name, never re-states the rule.
+ */
+function tagRuleSql(db: Database, visible: (note: Note) => boolean): { sql: string; params: string[] } | null {
+  const byTag = (visible as NoteVisible).byTag;
+  if (!byTag) return null;
+  const admits: string[] = [];
+  const denies: string[] = [];
+  for (const { tag_name } of db.prepare("SELECT DISTINCT tag_name FROM note_tags").all() as { tag_name: string }[]) {
+    const r = byTag(tag_name);
+    if (r.admits) admits.push(tag_name);
+    if (r.denies) denies.push(tag_name);
+  }
+  return {
+    sql:
+      "EXISTS (SELECT 1 FROM note_tags vt WHERE vt.note_id = n.id AND vt.tag_name IN (SELECT value FROM json_each(?))) " +
+      "AND NOT EXISTS (SELECT 1 FROM note_tags vd WHERE vd.note_id = n.id AND vd.tag_name IN (SELECT value FROM json_each(?)))",
+    params: [JSON.stringify(admits), JSON.stringify(denies)],
+  };
+}
 
 /**
  * Full-text search for a caller who sees only some notes (a tag-scoped pass,
@@ -2218,35 +2395,93 @@ function searchVisibleOnly(
   orderBy: string,
   limit: number,
   visible: (note: Note) => boolean,
+  tier: FieldTier | null,
 ): (NoteRow & { score: number })[] {
+  // A predicate that can say, tag by tag, what admits or denies a note (`NoteVisible.byTag`) is applied inside the
+  // match query as an EXISTS over note_tags: no per-note tag read and no per-note call. Same set as the line-by-line
+  // path below (`tagRuleSql` builds it from the predicate's own rule); anything else takes that path.
+  const inSql = tagRuleSql(db, visible);
   const matched = db.prepare(`
     SELECT n.rowid AS rowid, n.id AS id FROM notes n
     JOIN notes_fts fts ON fts.rowid = n.rowid
     WHERE notes_fts MATCH ?
       ${extraWhere}
-  `).all(ftsQuery, ...params) as { rowid: number; id: string }[];
+      ${inSql ? `AND ${inSql.sql}` : ""}
+  `).all(ftsQuery, ...params, ...(inSql?.params ?? [])) as { rowid: number; id: string }[];
   if (matched.length === 0) return [];
-  const tagsById = getNoteTagsForNotes(db, matched.map((r) => r.id));
-  const keep = matched.filter((r) => visible({ id: r.id, tags: tagsById.get(r.id) ?? [] } as Note));
+  let keep = matched;
+  if (!inSql) {
+    const tagsById = getNoteTagsForNotes(db, matched.map((r) => r.id));
+    keep = matched.filter((r) => visible({ id: r.id, tags: tagsById.get(r.id) ?? [] } as Note));
+  }
   if (keep.length === 0) return [];
   const ftsSql = (db.prepare("SELECT sql FROM sqlite_master WHERE name = 'notes_fts'").get() as { sql: string } | null)?.sql ?? "";
   const tokenize = /tokenize\s*=\s*'([^']*)'/i.exec(ftsSql)?.[1] ?? "porter unicode61";
   const table = `visible_search_${++visibleSearchSeq}`;
-  db.run(`CREATE VIRTUAL TABLE temp.${table} USING fts5(path, content, tokenize='${tokenize.replace(/'/g, "''")}')`);
+  db.run(`CREATE VIRTUAL TABLE temp.${table} USING fts5(path, content, fields, tokenize='${tokenize.replace(/'/g, "''")}')`);
   try {
     db.prepare(`
-      INSERT INTO temp.${table}(rowid, path, content)
-      SELECT rowid, COALESCE(path, ''), content FROM notes WHERE rowid IN (SELECT value FROM json_each(?))
+      INSERT INTO temp.${table}(rowid, path, content, fields)
+      SELECT rid, path, content, fields FROM notes_fts_source WHERE rid IN (SELECT value FROM json_each(?))
     `).run(JSON.stringify(keep.map((r) => r.rowid)));
     return db.prepare(`
-      SELECT n.*, (-1.0 * bm25(${table}, ${SEARCH_WEIGHT_PATH}, ${SEARCH_WEIGHT_CONTENT})) AS score
+      SELECT n.*, (-1.0 * bm25(${table}, ${SEARCH_BM25_WEIGHTS})) AS score${tier ? `, ${tier.select(`${table}.rowid`, table)} AS tier` : ""}
       FROM ${table} JOIN notes n ON n.rowid = ${table}.rowid
       WHERE ${table} MATCH ?
-      ORDER BY ${orderBy}
+      ORDER BY ${tier ? "tier DESC, " : ""}${orderBy}
       LIMIT ?
-    `).all(ftsQuery, limit) as (NoteRow & { score: number })[];
+    `).all(...(tier ? [tier.param] : []), ftsQuery, limit) as (NoteRow & { score: number })[];
   } finally {
     db.run(`DROP TABLE temp.${table}`);
+  }
+}
+
+/**
+ * The best `limit` of a stream of scored notes, held in a bounded min-heap (T-463), so a meaning search keeps
+ * `limit` scores rather than one per candidate. `ranked()` is score descending, ties by `at` (the candidate's
+ * position) ascending: the order a stable descending sort of every score gives. A `limit` that isn't a finite
+ * non-negative number keeps everything, and the caller's `slice(0, limit)` then does what it always did.
+ */
+class TopScores {
+  private readonly k: number;
+  private readonly heap: { id: string; score: number; at: number }[] = [];
+  constructor(limit: number) {
+    this.k = Number.isFinite(limit) && limit >= 0 ? Math.trunc(limit) : Infinity;
+  }
+  /** Whether `a` ranks below `b`. */
+  private static worse(a: { score: number; at: number }, b: { score: number; at: number }): boolean {
+    return a.score < b.score || (a.score === b.score && a.at > b.at);
+  }
+  offer(id: string, score: number, at: number): void {
+    const h = this.heap;
+    const item = { id, score, at };
+    if (h.length < this.k) {
+      h.push(item);
+      let i = h.length - 1;
+      while (i > 0) {
+        const p = (i - 1) >> 1;
+        if (!TopScores.worse(h[i]!, h[p]!)) break;
+        [h[i], h[p]] = [h[p]!, h[i]!];
+        i = p;
+      }
+      return;
+    }
+    if (h.length === 0 || !TopScores.worse(h[0]!, item)) return;
+    h[0] = item;
+    let i = 0;
+    for (;;) {
+      const l = 2 * i + 1;
+      const r = l + 1;
+      let m = i;
+      if (l < h.length && TopScores.worse(h[l]!, h[m]!)) m = l;
+      if (r < h.length && TopScores.worse(h[r]!, h[m]!)) m = r;
+      if (m === i) break;
+      [h[i], h[m]] = [h[m]!, h[i]!];
+      i = m;
+    }
+  }
+  ranked(): { id: string; score: number }[] {
+    return [...this.heap].sort((a, b) => b.score - a.score || a.at - b.at);
   }
 }
 
@@ -2281,7 +2516,7 @@ function searchVisibleOnly(
 export function semanticSearchNotes(
   db: Database,
   queryVector: Float32Array,
-  opts: QueryOpts,
+  opts: QueryOpts & { visible?: (note: Note) => boolean },
   model: string,
 ): SemanticSearchResult {
   const limit = typeof opts.limit === "number" ? opts.limit : 10;
@@ -2297,54 +2532,61 @@ export function semanticSearchNotes(
   const idRows = db.prepare(`SELECT n.id FROM notes n ${whereClause}`).all(...params) as {
     id: string;
   }[];
-  const candidateIds = idRows.map((r) => r.id);
+  let candidateIds = idRows.map((r) => r.id);
+  // A caller who sees only some notes (`visible`, a tag-scoped session): the candidates are narrowed to those it can
+  // see BEFORE ranking and the limit, so its page is full, nothing it can't see takes a place on it, and the
+  // pending/total counts are over what it can see.
+  if (opts.visible && candidateIds.length > 0) {
+    const tagsById = getNoteTagsForNotes(db, candidateIds);
+    const visible = opts.visible;
+    candidateIds = candidateIds.filter((id) => visible({ id, tags: tagsById.get(id) ?? [] } as Note));
+  }
   if (candidateIds.length === 0) {
     return { notes: [], pendingCount: 0, totalCandidates: 0 };
   }
 
-  // Pull every candidate's vector rows for the ACTIVE model, batched to
-  // stay under the DO 100-bound-param cap (same chunking `fetchNotesByIdsOrdered`
-  // uses). A note absent from this map has no fresh vector yet — pending.
-  const vecRowsByNote = new Map<string, { chunk_ix: number; vector: Uint8Array }[]>();
+  // Read the candidates' vector rows for the ACTIVE model in batches of ids, staying under the DO 100-bound-param cap
+  // (same chunking `fetchNotesByIdsOrdered` uses), and score each batch as it is read: only one batch of vectors and
+  // the best `limit` scores are held at once, never every candidate's vectors (T-463: holding them all, a question at
+  // 24,000 notes of 1024-dim vectors peaked ~190 MB on a box and ~104 MB in a Durable Object, whose limit is 128 MB). A note with no row here has no fresh vector yet — pending.
+  // `+model` keeps SQLite on the primary key (note_id, chunk_ix): bare `model = ?` lets it pick
+  // idx_note_vectors_stale (model, content_hash), which walks EVERY vector of the model once per batch, so a
+  // question read N × N/90 rows (1.1 M at 10,000 notes on Cloud). Both guarded by row-costs.test.ts (T-463).
+  //
+  // Ranking is best-CHUNK-per-note (max cosine over the note's chunks): a long note whose 3rd section matches
+  // outranks a note with weak whole-note similarity, the point of per-section chunking. A note's chunks all come in
+  // its own batch. Order is score descending, ties in candidate order, exactly what a stable sort of every score gave.
+  const top = new TopScores(limit);
+  let embedded = 0;
+  let at = 0;
   for (const idChunk of chunkForInClause(candidateIds)) {
     const placeholders = idChunk.map(() => "?").join(", ");
     const rows = db.prepare(
-      `SELECT note_id, chunk_ix, vector FROM note_vectors WHERE model = ? AND note_id IN (${placeholders})`,
+      `SELECT note_id, chunk_ix, vector FROM note_vectors WHERE +model = ? AND note_id IN (${placeholders})`,
     ).all(model, ...idChunk) as { note_id: string; chunk_ix: number; vector: Uint8Array }[];
-    for (const row of rows) {
-      let list = vecRowsByNote.get(row.note_id);
-      if (!list) {
-        list = [];
-        vecRowsByNote.set(row.note_id, list);
-      }
-      list.push(row);
-    }
-  }
-
-  // Best-chunk-per-note cosine (max over the note's chunks) — a long note
-  // whose 3rd section matches outranks a note with weak whole-note
-  // similarity, which is the whole point of per-section chunking.
-  const scored: { id: string; score: number }[] = [];
-  for (const id of candidateIds) {
-    const rows = vecRowsByNote.get(id);
-    if (!rows || rows.length === 0) continue;
-    let best = -Infinity;
+    const best = new Map<string, number>();
     for (const row of rows) {
       const score = dot(decodeVector(row.vector), queryVector);
-      if (score > best) best = score;
+      // From -Infinity and only on `>`, as before: a NaN chunk (a corrupt vector) never wins or hides a real one.
+      const prev = best.get(row.note_id) ?? -Infinity;
+      best.set(row.note_id, score > prev ? score : prev);
     }
-    scored.push({ id, score: best });
+    embedded += best.size;
+    for (const id of idChunk) {
+      const score = best.get(id);
+      if (score !== undefined) top.offer(id, score, at);
+      at++;
+    }
   }
-  scored.sort((a, b) => b.score - a.score);
-  const top = scored.slice(0, limit);
+  const ranked = top.ranked().slice(0, limit);
 
   // Reuse the existing hydration machinery — same as every other id-list
   // fetch path (tags batched, no N+1).
-  const hydrated = fetchNotesByIdsOrdered(db, top.map((t) => t.id));
+  const hydrated = fetchNotesByIdsOrdered(db, ranked.map((t) => t.id));
   const byId = new Map(hydrated.map((n) => [n.id, n]));
-  const scoreById = new Map(top.map((t) => [t.id, t.score]));
+  const scoreById = new Map(ranked.map((t) => [t.id, t.score]));
   const notes: Note[] = [];
-  for (const t of top) {
+  for (const t of ranked) {
     const note = byId.get(t.id);
     if (!note) continue; // defensive: row vanished between the two queries
     note.score = scoreById.get(t.id);
@@ -2353,7 +2595,7 @@ export function semanticSearchNotes(
 
   return {
     notes,
-    pendingCount: candidateIds.length - vecRowsByNote.size,
+    pendingCount: candidateIds.length - embedded,
     totalCandidates: candidateIds.length,
   };
 }
@@ -2368,8 +2610,10 @@ export function semanticSearchNotes(
 function notesWithTags(db: Database, rows: NoteRow[], scores?: Map<string, number>): Note[] {
   const notes = rows.map(rowToNote);
   const tagsById = getNoteTagsForNotes(db, notes.map((n) => n.id));
+  const types = typeNamesAmong(db, [...new Set([...tagsById.values()].flat())]);
   for (const note of notes) {
     note.tags = tagsById.get(note.id) ?? [];
+    note.types = note.tags.filter((t) => types.has(t));
     if (scores) {
       const s = scores.get(note.id);
       if (s !== undefined) note.score = s;
@@ -2677,11 +2921,11 @@ export function renameTag(db: Database, oldName: string, newName: string, attr?:
     // `timestampToMs` never returns null here.
     const nowMs = timestampToMs(now) ?? Date.now();
     const readStmt = db.prepare(
-      "SELECT description, fields, relationships, parent_names, created_at FROM tags WHERE name = ?",
+      "SELECT description, fields, relationships, parent_names, created_at, kind FROM tags WHERE name = ?",
     );
     const insertStmt = db.prepare(
-      `INSERT INTO tags (name, description, fields, relationships, parent_names, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO tags (name, description, fields, relationships, parent_names, created_at, updated_at, kind)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     const repointStmt = db.prepare(
       "UPDATE note_tags SET tag_name = ? WHERE tag_name = ? RETURNING note_id",
@@ -2689,7 +2933,7 @@ export function renameTag(db: Database, oldName: string, newName: string, attr?:
     const dropStmt = db.prepare("DELETE FROM tags WHERE name = ?");
     for (const { from, to } of renames) {
       const old = readStmt.get(from) as
-        | { description: string | null; fields: string | null; relationships: string | null; parent_names: string | null; created_at: string | null }
+        | { description: string | null; fields: string | null; relationships: string | null; parent_names: string | null; created_at: string | null; kind: string | null }
         | null;
       insertStmt.run(
         to,
@@ -2699,6 +2943,7 @@ export function renameTag(db: Database, oldName: string, newName: string, attr?:
         old?.parent_names ?? null,
         old?.created_at ?? now,
         now,
+        old?.kind ?? null,
       );
       const repointed = repointStmt.all(to, from) as { note_id: string }[];
       renamedNoteTags += repointed.length;
@@ -3200,11 +3445,13 @@ export function toNoteIndex(note: Note): NoteIndex {
     lastUpdatedBy: note.lastUpdatedBy ?? null,
     lastUpdatedVia: note.lastUpdatedVia ?? null,
     tags: note.tags,
+    ...(note.types ? { types: note.types } : {}),
     metadata: note.metadata,
     byteSize,
     preview,
     displayTitle: computeDisplayTitle(note.content),
     ...(note.score !== undefined ? { score: note.score } : {}),
+    ...(note.matched_by ? { matched_by: note.matched_by } : {}),
   };
 }
 

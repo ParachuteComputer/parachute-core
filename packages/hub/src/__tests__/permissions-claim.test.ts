@@ -2,7 +2,7 @@
 // edge cases are the point. The endpoint-level behaviour is covered black-box by parachute-core's
 // contracts/suites/safety (mint-attenuation, permissions-fail-closed).
 import { describe, expect, test } from "bun:test";
-import { bearerPermissionsProblem, scopedTagsWiderThanMinter, unknownPermissionKeys } from "../permissions-claim.ts";
+import { bearerPermissionsProblem, scopedAdminProblem, scopedTagsWiderThanMinter, unknownPermissionKeys } from "../permissions-claim.ts";
 
 describe("unknownPermissionKeys", () => {
   test("only scoped_tags and principal_pubkey are known", () => {
@@ -49,5 +49,17 @@ describe("scopedTagsWiderThanMinter", () => {
     for (const bad of ["health", [], [""], [5], {}]) {
       expect(scopedTagsWiderThanMinter({ scoped_tags: bad }, { scoped_tags: ["health"] })).toContain("malformed");
     }
+  });
+});
+
+describe("scopedAdminProblem (scope gap 4)", () => {
+  test("a tag limit with vault admin is refused, named or broad; read, write and an empty limit are not", () => {
+    const tags = { scoped_tags: ["health"] };
+    expect(scopedAdminProblem(["vault:default:read", "vault:default:write", "vault:default:admin"], tags)).toContain("vault:default:admin");
+    expect(scopedAdminProblem(["vault:admin"], tags)).toContain("vault:admin");
+    expect(scopedAdminProblem(["vault:default:read", "vault:default:write"], tags)).toBeNull();
+    expect(scopedAdminProblem(["vault:default:admin"], undefined)).toBeNull();
+    expect(scopedAdminProblem(["vault:default:admin"], { scoped_tags: [] })).toBeNull();
+    expect(scopedAdminProblem(["parachute:host:admin"], tags)).toBeNull();
   });
 });

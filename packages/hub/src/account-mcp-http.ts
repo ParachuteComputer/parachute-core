@@ -20,8 +20,9 @@
  */
 import type { Database } from "bun:sqlite";
 import { ACCOUNT_VAULTS_UNNARROWED } from "@openparachute/door-contract";
+import pkg from "../package.json" with { type: "json" };
 import type { AccountApiDeps } from "./account-api.ts";
-import { callVaultModuleTool, listVaultModuleTools } from "./account-mcp-backend.ts";
+import { callVaultModuleTool, FAN_OUT_TOOLS, listVaultModuleTools } from "./account-mcp-backend.ts";
 import {
   type AccountMcpPrincipal,
   type AccountToolContext,
@@ -38,6 +39,8 @@ import {
 import { HOST_ADMIN_SCOPE } from "./admin-vaults.ts";
 import { SERVICES_MANIFEST_PATH } from "./config.ts";
 import { validateAccessToken } from "./jwt-sign.ts";
+import { KEY_NAME_RE, type KeyClaim } from "./keys.ts";
+import { mcpToolErrorLine } from "./mcp-error-log.ts";
 import {
   NostrHttpAuthError,
   type NostrReplayCache,
@@ -199,6 +202,25 @@ function authFailure(
   );
 }
 
+const KEY_KINDS: ReadonlySet<string> = new Set(["person", "agent", "app", "service"]);
+
+/**
+ * The signed `key` claim of an account-door Bearer: `{name, kind}` with a key name and a known kind, or absent.
+ * Present but malformed refuses the token (as the vault does, write-stamp.ts `parseKeyClaim`): a stamp the door
+ * can't read must not silently become no stamp.
+ */
+function bearerKeyClaim(payload: Record<string, unknown>): KeyClaim | null {
+  if (!("key" in payload) || payload.key === undefined) return null;
+  const raw = payload.key as { name?: unknown; kind?: unknown } | null;
+  if (
+    !raw || typeof raw !== "object" || Array.isArray(raw) || Object.keys(raw).some((k) => k !== "name" && k !== "kind") ||
+    typeof raw.name !== "string" || !KEY_NAME_RE.test(raw.name) || typeof raw.kind !== "string" || !KEY_KINDS.has(raw.kind)
+  ) {
+    throw new AdminAuthError(401, "invalid token: the key claim is not {name, kind}");
+  }
+  return { name: raw.name, kind: raw.kind as KeyClaim["kind"] };
+}
+
 async function authenticateBearer(
   db: Database,
   req: Request,
@@ -234,11 +256,15 @@ async function authenticateBearer(
   }
   const clientIdRaw = (validated.payload as { client_id?: unknown }).client_id;
   const clientId = typeof clientIdRaw === "string" ? clientIdRaw : undefined;
+  const key = bearerKeyClaim(validated.payload as Record<string, unknown>);
+  const jti = (validated.payload as { jti?: unknown }).jti;
   return {
     userId: sub,
     scopes,
     authKind: "bearer",
     clientId,
+    ...(key ? { key } : {}),
+    ...(typeof jti === "string" ? { tokenId: jti } : {}),
     isHubAdmin: isHubAdmin(db, sub) || hostAdmin,
     grant,
   };
@@ -297,8 +323,7 @@ async function handleToolCall(
           ...err.extra,
         });
       }
-      const message = err instanceof Error ? err.message : "Unknown error";
-      return result(id, { content: [{ type: "text", text: `Error: ${message}` }], isError: true });
+      return toolCrash(id, name, err);
     }
   }
   const vaultTools = await listVaultModuleTools(ctx);
@@ -310,7 +335,7 @@ async function handleToolCall(
   }
   try {
     const out = await callVaultModuleTool(name, args, ctx);
-    if (name === "query-notes") {
+    if (FAN_OUT_TOOLS.has(name)) {
       return result(id, { content: [{ type: "text", text: JSON.stringify(out, null, 2) }] });
     }
     if (isMcpToolResult(out)) return result(id, out);
@@ -319,18 +344,30 @@ async function handleToolCall(
     if (err instanceof AccountToolError) {
       return rpcError(id, INVALID_PARAMS, err.message, { error_type: err.errorType, ...err.extra });
     }
-    const message = err instanceof Error ? err.message : "Unknown error";
-    return result(id, { content: [{ type: "text", text: `Error: ${message}` }], isError: true });
+    // The hub's own failure on the way to the vault (unreachable, an unreadable answer). A tool that crashes inside
+    // the vault comes back as an isError result, not a throw, and the vault logs that one itself.
+    return toolCrash(id, name, err);
   }
+}
+
+/**
+ * A tool call that threw something other than a refusal (`AccountToolError`): log one line server-side, the same
+ * shape the vault logs, never the arguments (audit L6-02), and answer with the in-band isError text as before.
+ */
+function toolCrash(id: JsonRpcId, name: string, err: unknown): JsonRpcMessage {
+  console.error(mcpToolErrorLine(name, err, pkg.version));
+  const message = err instanceof Error ? err.message : "Unknown error";
+  return result(id, { content: [{ type: "text", text: `Error: ${message}` }], isError: true });
 }
 
 async function listedTools(
   ctx: AccountToolContext,
-): Promise<Array<{ name: string; description: string; inputSchema: Record<string, unknown> }>> {
+): Promise<Array<{ name: string; description: string; inputSchema: Record<string, unknown>; annotations?: Record<string, unknown> }>> {
   const hub = toolsForPrincipal(ctx).map((t) => ({
     name: t.name,
     description: t.description,
     inputSchema: t.inputSchema,
+    annotations: { ...t.annotations },
   }));
   const vault = await listVaultModuleTools(ctx);
   return [...hub, ...vault];
@@ -341,7 +378,7 @@ function instructions(): string {
     "The Parachute hub account MCP — one connection across the vaults this key or token can use. " +
     "Hub-native: list-vaults, create-vault (owner / account write), grant-access / revoke-access / " +
     "list-access (if you can admin a vault). Everything else is the vault MCP catalog, live-listed, " +
-    "with a `vault` selector injected (omit on query-notes to fan out; required on every other vault tool). " +
+    "with a `vault` selector injected (omit on query-records to fan out; required on every other vault tool). " +
     "The vault-shaped catalog is a union of what SOME covered vault supports at the highest verb this " +
     "connection holds — a listed tool may be Unknown against a different vault where this connection " +
     "holds a lower verb. tools/list hides tools you cannot call on any covered vault."

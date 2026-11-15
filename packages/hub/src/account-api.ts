@@ -424,6 +424,8 @@ export async function handleAccountListVaults(
 interface NameBody {
   ok: true;
   name: string;
+  /** `bare: true` — no welcome or guide notes (0.9.1, T-414). */
+  bare: boolean;
 }
 interface BodyErr {
   ok: false;
@@ -471,7 +473,11 @@ async function parseNameBody(req: Request): Promise<NameBody | BodyErr> {
       message: '"name" must be a non-empty string',
     };
   }
-  return { ok: true, name };
+  const bare = (raw as Record<string, unknown>).bare;
+  if (bare !== undefined && typeof bare !== "boolean") {
+    return { ok: false, status: 400, error: "invalid_request", message: '"bare" must be true or false' };
+  }
+  return { ok: true, name, bare: bare === true };
 }
 
 /**
@@ -542,6 +548,7 @@ export async function handleAccountCreateVault(
     db: deps.db,
     issuer: deps.issuer,
     manifestPath,
+    ...(parsed.bare ? { bare: true } : {}),
     ...(deps.runCommand ? { runCommand: deps.runCommand } : {}),
   });
   if (!provisioned.ok) {

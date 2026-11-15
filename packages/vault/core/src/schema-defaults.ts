@@ -42,6 +42,7 @@
 
 import { Database } from "bun:sqlite";
 import { timestampToMs } from "./cursor.js";
+import { nearestName } from "./tag-hierarchy.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -148,8 +149,14 @@ export interface ValidationWarning {
     | "cardinality_mismatch"
     | "target_tag_mismatch"
     | "unresolved_reference"
-    | "schema_conflict";
+    | "schema_conflict"
+    | "near_name";
   message: string;
+  /**
+   * `near_name` only (0.9.2) — the declared field `field` is one letter from.
+   * The value is kept under the name as written; this is advice, never strict.
+   */
+  nearest?: string;
   /**
    * `schema_conflict` only — the tag whose declaration was overridden. Set
    * when `reason === "schema_conflict"`; absent on other reasons.
@@ -178,7 +185,7 @@ export interface ValidationStatus {
 // Loading
 // ---------------------------------------------------------------------------
 
-function parseFieldsJson(raw: string | null): Record<string, SchemaField> {
+export function parseFieldsJson(raw: string | null): Record<string, SchemaField> {
   if (!raw) return {};
   let parsed: unknown;
   try {
@@ -272,6 +279,13 @@ export function walkAncestors(
 interface MergedField {
   spec: SchemaField;
   sourceTag: string;
+  /**
+   * The other types on the note that declare this field with a different
+   * spec, in walk order (0.9.2). Their rules don't decide the write (the
+   * first in the walk still wins, and a `schema_conflict` names them), but
+   * `validateNote` checks the value against each and warns, advisory only.
+   */
+  others?: { spec: SchemaField; sourceTag: string }[];
 }
 
 interface NoteResolution {
@@ -308,6 +322,17 @@ export function resolveNoteSchemas(
 
   const mergedFields = new Map<string, MergedField>();
   const conflicts: ValidationWarning[] = [];
+  const ancestorCache = new Map<string, Set<string>>();
+  const ancestorsOf = (tag: string): Set<string> => {
+    let set = ancestorCache.get(tag);
+    if (!set) {
+      const chain: string[] = [];
+      walkAncestors(tag, resolved, new Set(), chain);
+      // `_default` is every note's implicit base, so every type overrides it.
+      ancestorCache.set(tag, (set = new Set([...chain, "_default"])));
+    }
+    return set;
+  };
 
   for (const tagName of order) {
     const fields = resolved.tagToFields.get(tagName);
@@ -319,12 +344,19 @@ export function resolveNoteSchemas(
         continue;
       }
       if (fieldSpecsEqual(existing.spec, spec)) continue;
+      // A type that redefines a field its ancestor (or `_default`) declares
+      // overrides it on purpose (vault#270): the ancestor's rules aren't
+      // checked, whichever type on the note it is overridden by. Any other
+      // type on the note that declares the field differently is.
+      const overridden = [existing.sourceTag, ...(existing.others ?? []).map((o) => o.sourceTag)]
+        .some((t) => ancestorsOf(t).has(tagName));
+      if (!overridden) (existing.others ??= []).push({ spec, sourceTag: tagName });
       conflicts.push({
         field: fieldName,
         schema: existing.sourceTag,
         loser_schema: tagName,
         reason: "schema_conflict",
-        message: `field '${fieldName}' has conflicting specs in ancestor tags '${existing.sourceTag}' (kept) and '${tagName}' (ignored)`,
+        message: `field '${fieldName}' has conflicting specs in ancestor tags '${existing.sourceTag}' (kept) and '${tagName}' (${overridden ? "overridden" : "checked, warnings only"})`,
       });
     }
   }
@@ -550,8 +582,8 @@ export function validateNote(
   const m = note.metadata ?? {};
   const warnings: ValidationWarning[] = [...resolution.conflicts];
 
-  for (const [fieldName, { spec, sourceTag }] of resolution.mergedFields) {
-    const strictFlag = spec.strict === true ? { strict: true } : {};
+  function checkField(fieldName: string, spec: SchemaField, sourceTag: string, advisory: boolean): void {
+    const strictFlag = spec.strict === true && !advisory ? { strict: true } : {};
     const present = fieldName in m;
     const value = present ? m[fieldName] : undefined;
     const absent = !present || value === undefined || value === null;
@@ -566,10 +598,10 @@ export function validateNote(
       });
       // A required field that's absent has no value to type/enum/cardinality
       // check — the missing_required violation stands alone.
-      continue;
+      return;
     }
 
-    if (absent) continue;
+    if (absent) return;
 
     if (spec.type && !valueMatchesType(value, spec.type, spec.cardinality)) {
       // Decision A (vault#553): an INDEXED field's type is a query
@@ -579,7 +611,7 @@ export function validateNote(
       // warning alone when the field is indexed; every other constraint
       // (enum/required/cardinality) stays governed by `spec.strict` as
       // before.
-      const indexedTypeStrict = spec.indexed === true;
+      const indexedTypeStrict = spec.indexed === true && !advisory;
       warnings.push({
         field: fieldName,
         schema: sourceTag,
@@ -639,6 +671,32 @@ export function validateNote(
         });
       }
     }
+  }
+
+  // 0.9.2: a key the note's types don't declare, one letter from one they do
+  // (`statu` beside `status`), is kept as written, with a warning naming the
+  // declared field. Never strict.
+  for (const key of Object.keys(m)) {
+    if (resolution.mergedFields.has(key)) continue;
+    const nearest = nearestName(resolution.mergedFields.keys(), key);
+    if (nearest === undefined) continue;
+    const sourceTag = resolution.mergedFields.get(nearest)!.sourceTag;
+    warnings.push({
+      field: key,
+      schema: sourceTag,
+      reason: "near_name",
+      nearest,
+      message: `'${key}' isn't a field of '${sourceTag}'; it declares '${nearest}'. Kept as '${key}': if you meant '${nearest}', move the value there.`,
+    });
+  }
+
+  for (const [fieldName, { spec, sourceTag, others }] of resolution.mergedFields) {
+    checkField(fieldName, spec, sourceTag, false);
+    // 0.9.2: every other type on the note that declares this field is checked
+    // too, so a value is warned by each type whose rules it fails, whichever
+    // type comes first. Advisory only: the first type's rules still decide
+    // whether a write is refused (1.0 makes a field one type per vault).
+    for (const o of others ?? []) checkField(fieldName, o.spec, o.sourceTag, true);
   }
 
   return { schemas: resolution.effectiveTags, warnings };

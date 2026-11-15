@@ -17,6 +17,7 @@
  *   parachute-vault status                  — show full status
  */
 
+import { readLastExport } from "./export-stamp.ts";
 import { resolve, join, dirname } from "path";
 import { homedir } from "os";
 import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync, copyFileSync, chmodSync, readdirSync, statSync, renameSync } from "fs";
@@ -1040,6 +1041,9 @@ async function cmdCreate(args: string[]) {
   // even when the server-wide `default_mirror` knob is `internal`. Parity for
   // operators who want one bare vault without flipping the global default.
   const noMirror = args.includes("--no-mirror");
+  // `--bare` (0.9.1, T-414): no welcome or guide notes, no tags — an empty vault for an app that brings its own
+  // types (Taste Arcade's reactions). The guides teach a person and their AI; an app's vault doesn't want them.
+  const bare = args.includes("--bare");
 
   // --- Auth opt-in (vault#442). Default = per-user OAuth, NO token minted. ---
   // `--mint` opts into a scope-narrow hub JWT for the header-auth / script
@@ -1089,7 +1093,7 @@ async function cmdCreate(args: string[]) {
   }
   const name = positional[0];
   if (!name) {
-    console.error("Usage: parachute-vault create <name> [--json]");
+    console.error("Usage: parachute-vault create <name> [--json] [--no-mirror] [--bare]");
     process.exit(1);
   }
 
@@ -1116,6 +1120,7 @@ async function cmdCreate(args: string[]) {
   const wasFirst = listVaults().length === 0;
   const credential = await createVault(name, {
     ...(noMirror ? { enableMirror: false } : {}),
+    ...(bare ? { seed: false } : {}),
     ...(mintVerb ? { mintVerb } : {}),
   });
 
@@ -1178,6 +1183,9 @@ async function cmdCreate(args: string[]) {
         vault_config: vaultConfigPath(name),
       },
       set_as_default: setAsDefault,
+      // T-414: says the vault was made bare, so the hub can tell this CLI honoured `--bare` (an older one drops
+      // unknown flags and seeds anyway).
+      ...(bare ? { bare: true } : {}),
     };
     console.log(JSON.stringify(payload));
     return;
@@ -2064,6 +2072,13 @@ async function cmdStatus() {
     const config = readVaultConfig(name);
     const desc = config?.description ? ` — ${config.description}` : "";
     console.log(`            ${name}${desc}`);
+    // When a full export last went out (GET /api/export, the backup key's cron pull), so a person can see it ran.
+    const last = readLastExport(name);
+    console.log(
+      last.last_export_at
+        ? `              last export: ${last.last_export_at}${last.last_export_by ? ` (${last.last_export_by})` : ""}`
+        : `              last export: never (a backup key: parachute keys new <name> --vault ${name} --can export)`,
+    );
   }
 
   // Triggers
@@ -2981,6 +2996,7 @@ async function cmdImport(args: string[]) {
   if (isPortableMd) {
     // New lossless path. Supports --blow-away for disaster recovery.
     const { importPortableVault } = await import("../core/src/portable-md.ts");
+    const { INDEXED_FIELD_LIMIT } = await import("../core/src/indexed-fields.ts");
     const { getVaultStore } = await import("./vault-store.ts");
     const { assetsDir } = await import("./routes.ts");
 
@@ -3026,6 +3042,12 @@ async function cmdImport(args: string[]) {
     }
     if (stats.skipped_attachments.length > 0) {
       console.log(`Skipped ${stats.skipped_attachments.length} attachment(s) — see warnings above.`);
+    }
+    if (stats.unindexed_schema_fields.length > 0) {
+      console.log(
+        `Restored ${stats.unindexed_schema_fields.length} field(s) without their index (the vault reached the limit of ${INDEXED_FIELD_LIMIT} indexed fields; they still filter, by a scan): ` +
+        stats.unindexed_schema_fields.map((u) => `${u.tag}.${u.field}`).join(", "),
+      );
     }
     if (stats.skipped_duplicate_ids.length > 0) {
       console.log(
@@ -3110,6 +3132,7 @@ async function cmdExport(args: string[]) {
   let gitMessageTemplate = DEFAULT_COMMIT_TEMPLATE;
   let gitPush = false;
   let strictCaseCollision = false;
+  let format: 1 | 2 = 1;
 
   const positional: string[] = [];
   for (let i = 0; i < args.length; i++) {
@@ -3163,6 +3186,13 @@ async function cmdExport(args: string[]) {
       gitPush = true;
     } else if (arg === "--strict-case-collision") {
       strictCaseCollision = true;
+    } else if (arg === "--format") {
+      const v = args[++i];
+      if (v !== "1" && v !== "2") {
+        console.error("--format must be 1 (the default) or 2.");
+        process.exit(1);
+      }
+      format = v === "2" ? 2 : 1;
     } else {
       positional.push(arg);
     }
@@ -3171,7 +3201,7 @@ async function cmdExport(args: string[]) {
 
   if (!outputPath) {
     console.error(
-      "Usage: parachute-vault export <dir> [--since <iso>] [--vault <name>]\n" +
+      "Usage: parachute-vault export <dir> [--since <iso>] [--vault <name>] [--format 1|2]\n" +
         "                                  [--watch [--interval <seconds>]]\n" +
         "                                  [--git-commit [--git-message-template <tpl>] [--git-push]]",
     );
@@ -3181,6 +3211,11 @@ async function cmdExport(args: string[]) {
     console.error("  --vault <name>              Source vault (default: 'default')");
     console.error("  --since <iso>               Only export notes whose updated_at >= ISO timestamp");
     console.error("                              (incremental — useful for git-projection cadences)");
+    console.error("  --format <1|2>              Export format (default 1). 2 writes record fields flat in the");
+    console.error("                              frontmatter (Obsidian properties), Parachute's own keys under");
+    console.error("                              `parachute:`, and files body-less records by type and month.");
+    console.error("                              A whole-vault export: not with --since, --watch or --git-commit.");
+    console.error("                              Import reads both formats.");
     console.error("  --watch                     Stay alive; re-export incrementally on every");
     console.error("                              vault write. Polls every --interval seconds.");
     console.error("  --interval <seconds>        Watch poll interval (default: 5)");
@@ -3210,8 +3245,39 @@ async function cmdExport(args: string[]) {
     process.exit(1);
   }
 
+  if (format === 2 && (since !== undefined || watch || gitCommit)) {
+    console.error(
+      "--format 2 is a whole-vault export: it does not combine with --since, --watch or --git-commit " +
+      "(a record that moves to another folder would leave its old file behind). Use the default format for those.",
+    );
+    process.exit(1);
+  }
+
   const { resolve: resolvePath } = await import("path");
   const fullPath = resolvePath(outputPath);
+
+  // One folder holds one format: files of the other would import beside the new ones as duplicate ids.
+  {
+    const { existsSync: exists, readFileSync: readText } = await import("fs");
+    const manifest = `${fullPath}/.parachute/vault.yaml`;
+    if (exists(manifest)) {
+      const was = /^export_format_version:\s*(\d+)/m.exec(readText(manifest, "utf8"))?.[1];
+      if (format === 2 && was !== undefined && Number(was) === 2) {
+        console.error(
+          `${fullPath} already holds an export. A format 2 export goes into an empty folder: a record that gains a body ` +
+          `or changes type moves to another file, and the old one would be read as its current state.`,
+        );
+        process.exit(1);
+      }
+      if (was !== undefined && Number(was) !== format) {
+        console.error(
+          `${fullPath} already holds a format ${was} export; this one is format ${format}. ` +
+          `Export into an empty folder, so the two don't mix.`,
+        );
+        process.exit(1);
+      }
+    }
+  }
 
   const config = readVaultConfig(vaultName);
   if (!config) {
@@ -3257,6 +3323,7 @@ async function cmdExport(args: string[]) {
       ...(vaultDescription ? { vaultDescription } : {}),
       ...(opts.sinceCursor ? { since: opts.sinceCursor } : {}),
       ...(strictCaseCollision ? { failOnCaseCollision: true } : {}),
+      ...(format === 2 ? { format } : {}),
     });
 
     if (opts.isInitial) {
@@ -3456,6 +3523,7 @@ async function cmdExport(args: string[]) {
 async function cmdHistory(args: string[]) {
   const rebuild = args[0] === "rebuild-state";
   if (rebuild) args = args.slice(1);
+  let checkOnly = false;
   let vaultName = "default";
   let notePath: string | undefined;
   let limit: number | undefined;
@@ -3499,6 +3567,8 @@ async function cmdHistory(args: string[]) {
       showSha = v;
     } else if (arg === "--json") {
       asJson = true;
+    } else if (arg === "--check" && rebuild) {
+      checkOnly = true;
     } else if (arg === "--help" || arg === "-h") {
       printHistoryUsage();
       return;
@@ -3510,7 +3580,7 @@ async function cmdHistory(args: string[]) {
   }
 
   if (rebuild && (showSha || notePath || limit !== undefined)) {
-    console.error("rebuild-state accepts only --vault and --json.");
+    console.error("rebuild-state accepts only --vault, --check and --json.");
     process.exit(1);
   }
   if (showSha && !notePath) {
@@ -3531,6 +3601,19 @@ async function cmdHistory(args: string[]) {
       process.exit(1);
     }
     const { Database } = await import("bun:sqlite");
+    if (checkOnly) {
+      // What `parachute doctor` asks: read-only, no schema upgrade, nothing written.
+      const { compactStateDrift } = await import("../core/src/history-compact-state.js");
+      const ro = new Database(path, { readonly: true });
+      try {
+        // One read transaction, so the notes' real values and the stored hints come from the same snapshot even
+        // while the server writes (two separate reads showed hundreds of false drifted notes under a writer).
+        const { checked, drifted } = ro.transaction(() => compactStateDrift(ro)).deferred();
+        console.log(asJson ? JSON.stringify({ vault: vaultName, checked_notes: checked, drifted_notes: drifted }) :
+          `${drifted} of ${checked} notes in vault "${vaultName}" have compaction hints that differ from history.`);
+      } finally { ro.close(); }
+      return;
+    }
     const { initSchema } = await import("../core/src/schema.js");
     const { rebuildCompactState } = await import("../core/src/history-compact-state.js");
     const db = new Database(path, { readwrite: true, create: false });
@@ -3605,8 +3688,9 @@ async function cmdHistory(args: string[]) {
 }
 
 function printHistoryUsage(): void {
-  console.error("Usage: parachute-vault history rebuild-state [--vault <name>] [--json]");
+  console.error("Usage: parachute-vault history rebuild-state [--vault <name>] [--check] [--json]");
   console.error("Rebuild compaction hints and reset refusals; does not compact or change history.");
+  console.error("--check only counts the notes whose hints differ from history and writes nothing (`parachute doctor` runs this, and `parachute doctor --fix` the rebuild).");
   console.error("The current server may stay running: writes serialize with the rebuild transaction.");
   console.error("Stop the server optionally to avoid write contention; do not run older writers concurrently.\n");
   console.error(
@@ -4810,6 +4894,11 @@ interface CreateVaultOptions {
    */
   enableMirror?: boolean;
   /**
+   * Seed the welcome and getting-started packs (default true). `--bare` sets it false: the vault starts with no
+   * notes and no tags (0.9.1, T-414).
+   */
+  seed?: boolean;
+  /**
    * Test seam threaded straight into `bootstrapInternalMirror` (default
    * `Bun.which`). Inject a fn returning `null` to exercise the
    * git-not-installed best-effort path without uninstalling git from the
@@ -4872,7 +4961,7 @@ async function createVault(
   // fails the create. Runs BEFORE the mirror bootstrap so the seeded content
   // lands in the initial mirror commit. See src/onboarding-seed.ts +
   // core/src/seed-packs.ts.
-  await seedOnboardingNotesBestEffort(seedStore);
+  if (opts.seed !== false) await seedOnboardingNotesBestEffort(seedStore);
 
   // Default new vaults to an internal live mirror (local git backup of the
   // markdown projection). Backup-on-by-default; GitHub off-site backup is an
@@ -5178,8 +5267,9 @@ Setup:
   parachute --version                      Print the installed version (alias: -v, version)
 
 Vaults:
-  parachute-vault create <name> [--json] [--no-mirror] [--mint [--scope read|write]] [--token <bearer>]
+  parachute-vault create <name> [--json] [--no-mirror] [--bare] [--mint [--scope read|write]] [--token <bearer>]
                                            Create a new vault (--json: emit { name, token, paths, set_as_default }).
+                                           --bare: no welcome or guide notes and no tags (an app's vault).
                                            Default auth is per-user OAuth — NO token is minted; connect with
                                            "claude mcp add --transport http parachute-<name> <endpoint>" and sign in
                                            on first use. --mint opts into a scope-narrow hub JWT for the header-auth /

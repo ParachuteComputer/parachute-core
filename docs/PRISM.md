@@ -28,7 +28,9 @@ PARACHUTE_VAULT_BIN="$PWD/parachute-core-0.8.0-pre.2-darwin-arm64/bin/parachute-
 
 The tree: `bin/parachute`, `bin/parachute-core`, `bin/parachute-vault` (links into `lib/`); `runtime/bun` (Bun 1.4.4,
 sha256-pinned; the bundle runs on it, never on a Bun from `PATH`, and refuses to start without it, exit 69); `lib/`
-(sources and a production `node_modules`, argon2 for the platform, no onnxruntime or sharp);
+(sources and a production `node_modules`, argon2 for the platform; from 0.8.0, the local semantic search stack too:
+onnxruntime-node and sharp for the platform, and the 34 MB model in `lib/packages/vault/models/`, so the tarball is
+about 118 MB instead of 62 MB; semantic search stays off unless a home turns it on);
 `entitlements/bun.plist` (`com.apple.security.cs.allow-jit`, for `runtime/bun` only); `LICENSE`,
 `THIRD-PARTY-NOTICES.txt`, `SOURCE.md` (the exact commit), `VERSION`, `CANDIDATE.json` (the sha256 of every file).
 It runs from any folder, a path with spaces included.
@@ -176,14 +178,25 @@ on it unchanged (46 pass, 0 fail, on the tarball and the npm install). What chan
   `setup --embedded`, `keys new`) maps onto the same code. On an embedded home the old names print no deprecation
   line and nothing is counted. `parachute changes --json` lists every old name and what replaced it.
 - **MCP: 11 tools, with the old names listed as aliases.** An admin key sees all 11, a write key 9 and a read key
-  6. `request-attachment-upload` and `-download` become `attachment-url`; `find-path` becomes `query-notes` with
-  `path_between`; the tag tools become `manage-types`; `manage-token` becomes `manage-keys`. Every old name is still
-  in `tools/list` (its description starts "deprecated"), so your allowlists in `agent-profiles.ts` keep working.
-  Add `attachment-url` when you move, and `manage-types` and `manage-keys` to the admin-only list (`lib.mjs:19`) so
-  that check still covers them. A write key's `tools/list` holds 12 entries, 9 tools and 3 aliases, in about 10k
-  characters; on 0.8 the same key sees 11 tools in about 61k.
+  6. "Record" is the noun (Aaron, 11-07): `query-notes`, `create-note`, `update-note`, `delete-note` and `list-tags`
+  become `query-records`, `create-record`, `update-record`, `delete-record` and `list-types`, which speak `body`
+  (was `content`), `fields` (was `metadata`), `records` for a batch and `{id}` for an anchor, and give `tags` as
+  plain labels next to `types`. `request-attachment-upload` and `-download` become `attachment-url` (its `note` is
+  `record`); `find-path` becomes `query-records` with `path_between`; the tag tools become `manage-types`;
+  `manage-token` becomes `manage-keys`. Every old name is still in `tools/list` through 0.9 (its description starts
+  "Deprecated") and answers exactly as on 0.8, so your allowlists in `agent-profiles.ts` keep working; the old
+  names go at 1.0, and each use is counted in the home's `run/deprecations.json` meanwhile (not on an embedded
+  home). Add the record names and `attachment-url` when you move, and `manage-types` and `manage-keys` to the
+  admin-only list (`lib.mjs:19`) so that check still covers them. A write key's `tools/list` holds 17 entries, 9
+  tools and 8 aliases, in about 11k characters; on 0.8 the same key sees 11 tools in about 61k.
 - **Types and tags.** A tag with fields or parents is a type. Notes gain `types` (the types among their tags) next
   to `tags`, over REST and MCP; `tags` still lists every name. `tags: [...]` writes and `tag:` queries work as today.
+- **REST, from 0.9.1: `/api/records`.** The `/api/notes` routes under their record name, in the record tools' words
+  (`body`, `fields`, `records`, `record_id`, `include_body`; `tags` plain labels beside `types`); `?type=` filters by
+  type; `/api/types` lists every type and tag with its `kind`. The record door refuses a type's name in `tags`
+  (422 `tag_kind`, hint `types: [...]`), on REST and on `create-record`/`update-record`. `/api/notes` answers as
+  before, with a `Deprecation` header and a `Link` to the `/api/records` route; it goes at 1.0. Your probe
+  (`GET /records?limit=1&include_body=false`) gets a JSON array. Version rows keep `content_len` (no `body_len`).
 - **Keys.** Every token becomes a key with the same scopes; `parachute keys list` shows them. Verification is
   unchanged: a token minted by 0.8 or 0.7 still verifies. Scoping keys by type comes in 0.9.1, which moves the hub's
   schema number.

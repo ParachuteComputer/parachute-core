@@ -788,7 +788,11 @@ function ours(dir: string): boolean {
   try {
     const real = realpathSync(dir);
     const root = realpathSync(mine);
-    return real === root || real.startsWith(`${root}/`);
+    if (real === root || real.startsWith(`${root}/`)) return true;
+    // Any release of core is not "the old programs": a vault that 0.8's bundle registered (<bundle>/lib/packages/
+    // vault, beside lib/package.json @openparachute/core) is served by this release as its own (0.8 → 0.9).
+    const up = dirname(real);
+    return basename(up) === "packages" && readJson(join(dirname(up), "package.json"))?.name === core.name;
   } catch {
     return false;
   }
@@ -845,6 +849,8 @@ export async function detect(home: string): Promise<Detected> {
     const name = basename(dirname(path));
     const notes = readOnly(path, (db) => (db.query("SELECT COUNT(*) AS n FROM notes").get() as { n: number }).n);
     vaults.push({ name, notes, schema });
+    // Below SCHEMA_VERSION is what this release migrates. A vault above it (up to READABLE_SCHEMA_VERSION) is opened
+    // as it is; the newer-data check before this refuses anything newer.
     if (schema < SCHEMA_VERSION) migrations.push(`vault ${name}: schema ${schema} → ${SCHEMA_VERSION}`);
     if (!d.rel.startsWith(join("vault", "data"))) migrations.push(`vault ${name}: moved from ${dirname(d.rel)} to vault/data/${name}`);
   }
@@ -2005,25 +2011,44 @@ async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ ba
 }
 
 /**
- * Every note that differs from the backup (new, changed or deleted since the takeover), per vault, exported to
- * `dir` as JSON before a restore puts the backup's notes back. Compared with the backup itself, not by timestamps,
- * which an import can set to anything.
+ * A vault's notes with their tags (names, sorted) and outgoing links ({target_id, relationship}, sorted), so a note
+ * whose only change is a tag or a link differs from the backup too.
  */
-function exportChanged(home: string, backupHome: string, dir: string): number {
+function notesWithTagsAndLinks(path: string): any[] {
+  return readOnly(path, (db) => {
+    const notes = db.query("SELECT id, path, content, metadata, created_at, updated_at FROM notes").all() as any[];
+    const tags = new Map<string, string[]>();
+    for (const t of db.query("SELECT note_id, tag_name FROM note_tags ORDER BY note_id, tag_name").all() as any[]) tags.set(t.note_id, [...(tags.get(t.note_id) ?? []), t.tag_name]);
+    const links = new Map<string, { target_id: string; relationship: string }[]>();
+    for (const l of db.query("SELECT source_id, target_id, relationship FROM links ORDER BY source_id, target_id, relationship").all() as any[]) {
+      links.set(l.source_id, [...(links.get(l.source_id) ?? []), { target_id: l.target_id, relationship: l.relationship }]);
+    }
+    return notes.map((r) => ({ ...r, tags: tags.get(r.id) ?? [], links: links.get(r.id) ?? [] }));
+  });
+}
+
+/**
+ * Every note that differs from the backup (new, changed or deleted since the takeover), per vault, exported to
+ * `dir` as JSON before a restore puts the backup's notes back: content, metadata, tags and links. Compared with the
+ * backup itself, not by timestamps, which an import can set to anything.
+ */
+export function exportChanged(home: string, backupHome: string, dir: string, skip: string[] = []): number {
   let n = 0;
   mkdirSync(dir, { recursive: true, mode: 0o700 });
+  // `skip`: databases (relative paths) a restore leaves in place, so there is nothing of theirs to export.
   const byName = (root: string) =>
-    new Map(databases(root, { hub: 0, vault: 0 }).filter((d) => d.rel !== "hub.db").map((d) => [basename(dirname(d.rel)), join(root, d.rel)]));
+    new Map(databases(root, { hub: 0, vault: 0 }).filter((d) => d.rel !== "hub.db" && !skip.includes(d.rel)).map((d) => [basename(dirname(d.rel)), join(root, d.rel)]));
   const before = byName(backupHome);
   const now = byName(home);
+  const key = (r: any) => JSON.stringify([r.updated_at, r.content, r.metadata, r.path, r.tags, r.links]);
   for (const name of new Set([...before.keys(), ...now.keys()])) {
     const path = now.get(name);
     const old = new Map<string, string>();
     const was = before.get(name);
-    if (was) for (const r of readOnly(was, (db) => db.query("SELECT id, updated_at, content, metadata, path FROM notes").all() as any[])) old.set(r.id, JSON.stringify([r.updated_at, r.content, r.metadata, r.path]));
+    if (was) for (const r of notesWithTagsAndLinks(was)) old.set(r.id, key(r));
     // A vault deleted since the takeover has no rows now: every note of it is reported deleted.
-    const rows = path ? (readOnly(path, (db) => db.query("SELECT id, path, content, metadata, created_at, updated_at FROM notes").all() as any[])) : [];
-    const changed = rows.filter((r) => old.get(r.id) !== JSON.stringify([r.updated_at, r.content, r.metadata, r.path]));
+    const rows = path ? notesWithTagsAndLinks(path) : [];
+    const changed = rows.filter((r) => old.get(r.id) !== key(r));
     const ids = new Set(rows.map((r) => r.id));
     const deleted = [...old.keys()].filter((id) => !ids.has(id));
     if (changed.length || deleted.length) writeFileSync(join(dir, `${name}.json`), `${JSON.stringify({ ...(path ? {} : { vault_deleted: true }), changed, deleted_ids: deleted }, null, 2)}\n`, { mode: 0o600 });

@@ -1,3 +1,4 @@
+import type { ResultDeprecation } from "./mcp-result.js";
 import { getImportedVersion, parseHistorySelector, projectHistoryRow } from "./history-import.js";
 import { Database } from "bun:sqlite";
 import type { Store, Note, QueryOpts, Attachment } from "./types.js";
@@ -5,6 +6,8 @@ import { transactionAsync } from "./txn.js";
 import * as noteOps from "./notes.js";
 import { filterMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError, validatePath } from "./notes.js";
 import { normalizePath } from "./paths.js";
+import { isNoteIdShape } from "./ulid.js";
+import { countNoteVersions } from "./history.js";
 import { QueryError } from "./query-operators.js";
 import { TAG_EXPAND_MODES, stripTagHash, suggestSimilarTag, type TagExpandMode } from "./tag-hierarchy.js";
 import {
@@ -13,11 +16,14 @@ import {
   ignoredParamWarning,
   truncatedResultsWarning,
   computeSearchDidYouMean,
+  collectScanWarnings,
+  assertNoAggregateScan,
   searchDidYouMeanWarning,
   embeddingsPendingWarning,
   type QueryWarning,
 } from "./query-warnings.js";
 import { SEARCH_MODES, buildLiteralSearchQuery, isValidSearchMode, type SearchMode } from "./search-query.js";
+import { anyTermsQuery, effectiveHybridAuto, HYBRID_TEXT, isQuestionShaped } from "./hybrid.js";
 import * as linkOps from "./links.js";
 import {
   resolveOrQueueLink,
@@ -56,6 +62,8 @@ import {
   alignByteWindow,
 } from "./content-range.js";
 import { MCP_TOOL_MANIFEST } from "./mcp-manifest.js";
+import { findRetypeConflicts, retypeHint } from "./conformance.js";
+import { MigrateRequestError, runMigrateRequest } from "./migrate-tag-field.js";
 import {
   BLOCKED_ATTACHMENT_EXTENSIONS,
   ATTACHMENT_MIME_TYPES,
@@ -74,6 +82,7 @@ import {
   MAX_ATTACHMENT_IMAGE_BYTES,
   type AttachmentBytesProvider,
 } from "./attachment/bytes-provider.js";
+import { attachNearTypeWarnings, foldTypeFilter, holdTypes, markTypes, nearSchemaWarnings, nearTypeWarnings, prepareCallTypes, refreshTypes, tagKinds } from "./tag-kind.js";
 
 /**
  * A single MCP tool-result content block. Mirrors the subset of the MCP SDK's
@@ -116,6 +125,8 @@ export interface McpToolDef {
    * one wrapper change").
    */
   resultContent?: (result: unknown) => McpContentBlock[];
+  /** A deprecated note tool's refresh nudge, for `structuredContent` (mcp-result.ts, mcp-records.ts). */
+  deprecation?: ResultDeprecation;
 }
 
 /**
@@ -150,6 +161,33 @@ function structuredError(
   fields: { error_type: string; field?: string; hint?: string } & Record<string, unknown>,
 ): Error {
   return Object.assign(new Error(message), fields);
+}
+
+/**
+ * query-notes' `since`: what changed since then, so edits to older notes count.
+ * It becomes a `date_filter` on `updated_at`, so every path through the tool
+ * (plain, search, semantic, aggregate) reads it the same way. Combined with
+ * another date filter it refuses: one would otherwise be dropped or fail with an
+ * error naming a filter the caller didn't send.
+ */
+function withSinceFilter(params: Record<string, unknown>): Record<string, unknown> {
+  // Null is how many clients send an optional they aren't using.
+  if (params.since === undefined || params.since === null) return params;
+  const others = ["date_from", "date_to", "date_filter"].filter((k) => params[k] !== undefined && params[k] !== null);
+  if (others.length > 0) {
+    throw new QueryError(
+      `cannot combine since with ${others.join(", ")} — since is shorthand for date_filter on updated_at; pass one or the other`,
+      "INVALID_QUERY",
+    );
+  }
+  if (typeof params.since !== "string") {
+    throw new QueryError(
+      `invalid since: ${JSON.stringify(params.since)} — must be an ISO-8601 date/timestamp string (e.g. "2026-07-09" or "2026-07-09T00:00:00.000Z").`,
+      "INVALID_QUERY",
+    );
+  }
+  const { since, date_from: _from, date_to: _to, ...rest } = params;
+  return { ...rest, date_filter: { field: "updated_at", from: since } };
 }
 
 function requireNoteReference(value: unknown): string {
@@ -203,6 +241,28 @@ export function resolveNote(db: Database, idOrPath: string, visible?: (note: Not
   const byPath = noteOps.getNoteByPath(db, idOrPath);
   if (byPath) return byPath;
   return noteOps.getNoteByTitle(db, idOrPath);
+}
+
+/**
+ * The note a reference names exactly, for an act that can't be undone (erasing history, T-412): its id, or its path
+ * compared case-sensitively, where a trailing `.<ext>` may also be read as the extension (as resolveNote reads it).
+ * No case folding and no H1-title fallback, and more than one match is refused with AmbiguousPathError, so it never
+ * picks a note the caller didn't name: `inbox/today` can't reach `Inbox/Today`. Notes `visible` rejects count as
+ * absent.
+ */
+export function resolveNoteExact(db: Database, ref: string, visible?: (note: Note) => boolean): Note | null {
+  const seen = (n: Note | null) => (n && (!visible || visible(n)) ? n : null);
+  const byId = seen(noteOps.getNote(db, ref));
+  if (byId) return byId;
+  const ids = new Set<string>();
+  for (const r of db.prepare("SELECT id FROM notes WHERE path = ?").all(ref) as { id: string }[]) ids.add(r.id);
+  const extMatch = ref.match(/^(.*)\.([a-z0-9]{1,16})$/i);
+  if (extMatch) {
+    for (const r of db.prepare("SELECT id FROM notes WHERE path = ? AND extension = ?").all(extMatch[1]!, extMatch[2]!) as { id: string }[]) ids.add(r.id);
+  }
+  const hits = [...ids].map((id) => seen(noteOps.getNote(db, id))).filter((n): n is Note => n !== null);
+  if (hits.length > 1) throw new noteOps.AmbiguousPathError(ref, hits.map((n) => ({ id: n.id, extension: n.extension ?? "md" })));
+  return hits[0] ?? null;
 }
 
 /**
@@ -545,6 +605,12 @@ export interface GenerateMcpToolsOpts {
    */
   searchVisibility?: (note: Note) => boolean;
   /**
+   * The vault's own "auto" setting (`search.auto_hybrid`): true or false, or null/undefined to follow
+   * `HYBRID_AUTO_DEFAULT` (core/src/hybrid.ts). A function is read at each search, so a change to the setting
+   * applies to a session already open. Also the test seam.
+   */
+  hybridAuto?: boolean | null | (() => boolean | null | undefined);
+  /**
    * `ambiguityVisible` (vault#581 auth review) is an OPTIONAL per-note
    * predicate gating everything the ambiguous-links surface discloses.
    * `candidate_count` is derived VAULT-WIDE, so a stored `2` on a `[[Dup]]`
@@ -561,6 +627,14 @@ export interface GenerateMcpToolsOpts {
    * are returned as-is and the SQL filter answers directly, unchanged.
    */
   ambiguityVisible?: (noteId: string) => boolean;
+  /**
+   * Who may pass `erase_history: true` to `delete-note` (T-412). Erasing history is irreversible and admin-only
+   * (vault#524), and `delete-note` itself is a write tool, so the door says what this session may do. Omitted →
+   * refused with `insufficient_scope` (fail closed). `"visible"`: notes this session can see (a tag-scoped admin).
+   * `"all"`: also a note already deleted that left history (an unscoped admin; a deleted note has no tags left to
+   * check a scope against).
+   */
+  eraseHistory?: "visible" | "all";
   /**
    * `AttachmentTicketProvider` seam (vault attachment-tickets design,
    * Wave 1 — D10 "tools omitted when unwired"). When provided,
@@ -593,6 +667,8 @@ export interface GenerateMcpToolsOpts {
      * internal callers) → every note/attachment is visible.
      */
     noteVisible?: (note: Note) => boolean | Promise<boolean>;
+    /** The session's tag scope, stamped on each ticket so its spend re-checks it (scope gap 7). */
+    scopedTags?: string[];
   };
   /**
    * `AttachmentBytesProvider` seam (Wave 2 model lane — D10, same "tools
@@ -643,6 +719,11 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
   const searchVisibility = opts?.searchVisibility;
   const resolveVisibility = opts?.resolveVisibility;
   const ambiguityVisible = opts?.ambiguityVisible;
+  // Scope gap 1: the same per-note predicate decides which notes a scoped
+  // writer may link to. A link or [[wikilink]] to a note outside it resolves
+  // as one to nothing (queued, `unresolved_link`), never a link into it.
+  const linkVisible = ambiguityVisible;
+  const linkOpt = linkVisible ? { linkVisible } : {};
   // Write-attribution (vault#298) — captured once at tool-generation time
   // (a fresh tool set is generated per MCP request, so this is request-scoped)
   // and folded into every create/update the tools perform.
@@ -698,6 +779,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
     {
       name: "query-notes",
       execute: async (params) => {
+        params = withSinceFilter(foldTypeFilter(db, params));
         // --- Ambiguous-links scope split (vault#581 auth review) ---
         // `requestedHasAmbiguous` is what the caller asked for;
         // `sqlHasAmbiguous` is what is safe to push into SQL for a reader
@@ -985,6 +1067,8 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
               | { field?: string; from?: string; to?: string }
               | undefined,
           };
+          // Before the scoped branch, which lists the matches (a scan) and then aggregates their ids.
+          assertNoAggregateScan(db, aggFilterOpts);
           if (!aggregateVisibility) {
             return await store.aggregateNotes({ ...aggFilterOpts, aggregate: aggregateSpec });
           }
@@ -1032,13 +1116,13 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
         if (params.search_mode !== undefined && params.search_mode !== null) {
           if (typeof params.search_mode !== "string" || !isValidSearchMode(params.search_mode)) {
             throw new QueryError(
-              `invalid \`search_mode\` value ${JSON.stringify(params.search_mode)} — must be one of ${SEARCH_MODES.map((m) => `"${m}"`).join(", ")}. Omit for the default ("literal").`,
+              `invalid \`search_mode\` value ${JSON.stringify(params.search_mode)} — must be one of ${SEARCH_MODES.map((m) => `"${m}"`).join(", ")}.`,
               "INVALID_QUERY",
               {
                 error_type: "invalid_query",
                 field: "search_mode",
                 got: params.search_mode,
-                hint: `pass "literal" or "advanced", or omit for the default ("literal")`,
+                hint: HYBRID_TEXT.hint,
               },
             );
           }
@@ -1106,7 +1190,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           const tags = normalizeTags(params.tag);
           const excludeTagsRaw = params.exclude_tags ?? params.excludeTags ?? params.exclude_tag;
           const excludeTags = normalizeTags(excludeTagsRaw);
-          const semanticOpts: QueryOpts = {
+          const semanticOpts: QueryOpts & { visible?: (note: Note) => boolean } = {
             tags,
             tagMatch: (params.tag_match as "all" | "any") ?? (tags && tags.length > 1 ? "any" : undefined),
             expand,
@@ -1133,6 +1217,9 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
               | { field?: string; from?: string; to?: string }
               | undefined,
             limit: (params.limit as number) ?? 50,
+            // A tag-scoped session ranks over the notes it can see, so its page is full (0.9.3: this used to be
+            // filtered after the limit, by the wrapper in src/mcp-tools.ts).
+            ...(searchVisibility ? { visible: searchVisibility } : {}),
           };
           // Uncaught on purpose: `semantic_unavailable` (no/not-ready
           // provider) propagates to src/mcp-http.ts's QueryError → JSON-RPC
@@ -1140,6 +1227,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           // silent fallback to keyword search.
           const semanticResult = await store.semanticSearch(params.near_text, semanticOpts);
           results = semanticResult.notes;
+          queryWarnings.push(...collectScanWarnings(db, semanticOpts));
           if (semanticResult.pendingCount > 0) {
             queryWarnings.push(
               embeddingsPendingWarning(semanticResult.pendingCount, semanticResult.totalCandidates),
@@ -1172,7 +1260,10 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           // be a syntax error (or a meaningless always-empty query)
           // depending on exactly how it degenerates, so this is checked
           // here rather than left to the DB layer to (maybe) reject.
-          if (mode === "literal" && buildLiteralSearchQuery(params.search as string).isEmpty) {
+          if (
+            (mode === "literal" && buildLiteralSearchQuery(params.search as string).isEmpty) ||
+            (mode === "hybrid" && anyTermsQuery(params.search as string) === "") // blank or stopwords only: nothing to rank on
+          ) {
             results = [];
             queryWarnings.push(emptySearchWarning());
           } else {
@@ -1190,7 +1281,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             // expand/mode/sort reached searchNotes, so exclude_tags and
             // date_from were silently dropped (a well-formed result set
             // answering a different question).
-            results = await store.searchNotes(params.search as string, {
+            const searchOpts = {
               tags,
               tagMatch: (params.tag_match as "all" | "any") ?? (tags && tags.length > 1 ? "any" : undefined),
               expand,
@@ -1218,7 +1309,71 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
               mode,
               sort: params.sort as "asc" | "desc" | undefined,
               ...(searchVisibility ? { visible: searchVisibility } : {}),
-            });
+            };
+            // T-461: keyword + meaning, fused by rank (core/src/hybrid.ts). Same filters and default limit as
+            // `search`; sort and mode don't apply to the fused page. `visible` (a tag-scoped session) does: both arms
+            // run under it before they rank and limit.
+            const runHybrid = () => {
+              const { mode: _m, sort: _s, ...hybridOpts } = searchOpts;
+              return store.hybridSearch!(params.search as string, hybridOpts);
+            };
+            if (mode === "hybrid") {
+              if (!store.hybridSearch) {
+                throw new QueryError('search_mode "hybrid" isn\'t supported by this vault\'s store; use "literal".', "INVALID_QUERY", {
+                  error_type: "invalid_query",
+                  field: "search_mode",
+                  hint: 'pass search_mode: "literal"',
+                });
+              }
+              if (params.sort !== undefined) {
+                queryWarnings.push(ignoredParamWarning("sort", 'search_mode "hybrid" ranks by relevance; pass search_mode "literal" to sort by date'));
+              }
+              const h = await runHybrid();
+              results = h.notes;
+              if (h.meaning === "unavailable") {
+                queryWarnings.push({
+                  code: "semantic_unavailable",
+                  message: `hybrid search ranked by keyword only: ${h.meaningReason ?? "no embedding provider"}`,
+                });
+              } else if (h.pendingCount > 0) {
+                queryWarnings.push(embeddingsPendingWarning(h.pendingCount, h.totalCandidates));
+              }
+            } else {
+              // T-461 (0.9.3 default, "auto"): a search that reads as a question in plain words (4+ words, 2+ content
+              // words), on a vault with meaning search, is answered by hybrid, and says so (`search_auto`), but only while
+              // the vault's auto setting is on (the default). Measured on
+              // a real 10k-note vault: +0.23 nDCG@10 over literal on 40 recall questions, 27 wins, 2 losses. Shorter
+              // searches (ids, URLs, codes, titles, names) stay literal, so exact lookups and existence checks are
+              // unchanged; `search_mode: "literal"` keeps today's answer for any search. If the meaning arm can't
+              // answer (provider not ready), the literal answer is used. Not with `sort`. A tag-scoped session gets it too: both arms run under its `visible`.
+              // The vault's setting is checked last: it reads vault.yaml, which short, literal and no-embedding searches skip.
+              const auto =
+                searchMode === undefined &&
+                store.hybridSearch &&
+                params.sort === undefined &&
+                isQuestionShaped(params.search as string) &&
+                store.hasMeaningSearch?.() &&
+                effectiveHybridAuto(typeof opts?.hybridAuto === "function" ? opts.hybridAuto() : opts?.hybridAuto)
+                  ? await runHybrid()
+                  : undefined;
+              if (auto?.meaning === "ok") {
+                results = auto.notes;
+                queryWarnings.push({
+                  code: "search_auto",
+                  message:
+                    'This search reads as a question, so it is ranked by keyword and meaning together (search_mode "hybrid"; see matched_by). Pass search_mode: "literal" for notes holding every word.',
+                });
+                if (auto.pendingCount > 0) queryWarnings.push(embeddingsPendingWarning(auto.pendingCount, auto.totalCandidates));
+              } else {
+                results = await store.searchNotes(params.search as string, searchOpts);
+              }
+            }
+            queryWarnings.push(
+              ...collectScanWarnings(db, {
+                metadata: params.metadata as Record<string, unknown> | undefined,
+                dateFilter: params.date_filter as { field?: string } | undefined,
+              }),
+            );
             // Zero-result `did_you_mean` (vault#551 WS2B) — cheap (a bounded
             // FTS5-vocabulary scan) and ONLY computed on the already-rare
             // empty-result path, mirroring `unknown_tag`'s did_you_mean.
@@ -1302,9 +1457,10 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           // above (vault#551).
           queryWarnings = queryWarnings.concat(
             collectUnknownTagWarnings(db, queryOpts.tags, queryOpts.expand, store.getTagHierarchy()),
+            collectScanWarnings(db, queryOpts),
           );
           if (cursorMode) {
-            const page = await store.queryNotesPaged(queryOpts);
+            const page = await store.queryNotesPaged(queryOpts, searchVisibility);
             results = page.notes;
             nextCursor = page.next_cursor;
           } else {
@@ -1602,6 +1758,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           if (Object.keys(updates).length > 0 || incomingTags.length > 0 || hasLinkMutation) {
             result = await store.updateNote(existingNote.id, {
               ...updates,
+              ...linkOpt,
               actor: writeActor,
               via: writeVia,
               // `tagsForSchemaResolution` (vault#date-field-type review round
@@ -1704,6 +1861,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
                 // in a batch (the whole call came from one authenticated session).
                 actor: writeActor,
                 via: writeVia,
+                ...linkOpt,
               });
             } catch (err) {
               // Race backstop (vault#555): a concurrent writer's INSERT
@@ -1751,7 +1909,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           // surfaces a distinct `ambiguous_link` warning instead. Never silent.
           for (const { sourceId, links } of pendingLinks) {
             for (const link of links) {
-              const outcome = resolveOrQueueLink(db, sourceId, link.target, link.relationship);
+              const outcome = resolveOrQueueLink(db, sourceId, link.target, link.relationship, linkVisible);
               if (outcome.status === "resolved") {
                 await store.createLink(sourceId, outcome.note_id, link.relationship);
               } else if (outcome.status === "ambiguous") {
@@ -1769,7 +1927,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           // pending-wikilink backfill (`resolveUnresolvedWikilinks`, run
           // inside each `store.createNote`/`updateNote` call above).
           for (const { noteId, content } of contentWikilinkNotes) {
-            for (const warning of getContentWikilinkWarnings(db, noteId, content)) {
+            for (const warning of getContentWikilinkWarnings(db, noteId, content, linkVisible)) {
               pushLinkWarning(noteId, warning);
             }
           }
@@ -2011,7 +2169,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
                   metadata: createOpts.metadata,
                   defaultTags: createOpts.tags,
                 });
-                const created = await store.createNote(content, createOpts);
+                const created = await store.createNote(content, { ...createOpts, ...linkOpt });
                 await applySchemaDefaults(store, db, [created.id], created.tags ?? []);
                 // Defer links.add resolution to the second pass (vault#555)
                 // — same reasoning as create-note.
@@ -2267,7 +2425,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
               // `skipUpdatedAt` isn't set, so this still issues a real UPDATE
               // (not the true no-op/precondition-only branch, which only fires
               // when the caller passes ZERO fields AND no mutation is pending).
-              result = await store.updateNote(note.id, updates);
+              result = await store.updateNote(note.id, { ...updates, ...linkOpt });
             } else {
               result = note;
             }
@@ -2318,7 +2476,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           // never silently dropped.
           for (const { sourceId, links } of pendingLinks) {
             for (const link of links) {
-              const outcome = resolveOrQueueLink(db, sourceId, link.target, link.relationship);
+              const outcome = resolveOrQueueLink(db, sourceId, link.target, link.relationship, linkVisible);
               if (outcome.status === "resolved") {
                 await store.createLink(sourceId, outcome.note_id, link.relationship, link.metadata);
               } else if (outcome.status === "ambiguous") {
@@ -2332,7 +2490,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           // --- Content-wikilink warnings (vault#570) ---
           // Same forward-ref-aware timing as the structured-links pass above.
           for (const { noteId, content } of contentWikilinkNotes) {
-            for (const warning of getContentWikilinkWarnings(db, noteId, content)) {
+            for (const warning of getContentWikilinkWarnings(db, noteId, content, linkVisible)) {
               pushLinkWarning(noteId, warning);
             }
           }
@@ -2386,9 +2544,99 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
     {
       name: "delete-note",
       execute: async (params) => {
-        const note = requireNote(db, requireNoteReference(params.id), resolveVisibility);
-        await store.deleteNote(note.id, { actor: writeActor, via: writeVia });
-        return { deleted: true, id: note.id };
+        // T-412: `ids` deletes a list, `erase_history` also erases every version (no tombstone). Every reference is
+        // resolved before anything is deleted, so a list naming a missing note deletes nothing.
+        const erase = params.erase_history === true;
+        if (params.erase_history !== undefined && params.erase_history !== null && typeof params.erase_history !== "boolean") {
+          throw structuredError("`erase_history` must be a boolean", { error_type: "invalid_request", field: "erase_history" });
+        }
+        const hasList = params.ids !== undefined && params.ids !== null;
+        const hasOne = params.id !== undefined && params.id !== null;
+        if (hasList === hasOne) {
+          throw structuredError(hasList ? "pass `id` or `ids`, not both" : "`id` is required", {
+            error_type: hasList ? "invalid_request" : "missing_required_field",
+            field: "id",
+            hint: "pass the note's id or path (or its unique H1 title), or `ids` (a list) for several",
+          });
+        }
+        if (erase && !opts?.eraseHistory) {
+          throw structuredError("erase_history needs the vault's admin scope: erasing history is irreversible", {
+            error_type: "insufficient_scope",
+            field: "erase_history",
+            required_scope: "vault:admin",
+          });
+        }
+        let refs: string[];
+        if (hasList) {
+          if (!Array.isArray(params.ids) || params.ids.length === 0) {
+            throw structuredError("`ids` must be a non-empty list of note ids or paths", { error_type: "invalid_request", field: "ids" });
+          }
+          if (params.ids.length > MAX_BATCH_SIZE) throw new BatchTooLargeError(params.ids.length);
+          refs = params.ids.map((v: unknown, i: number) => {
+            if (typeof v !== "string" || v.trim() === "") {
+              throw structuredError(`\`ids[${i}]\` must be a note id or path`, { error_type: "invalid_request", field: "ids" });
+            }
+            return v;
+          });
+        } else {
+          refs = [requireNoteReference(params.id)];
+        }
+        // An id whose note is gone but whose history is left: only an unscoped admin erasing history may name it.
+        const leftover = (ref: string) =>
+          erase && opts?.eraseHistory === "all" && isNoteIdShape(ref) && countNoteVersions(db, ref) > 0;
+        const targets: string[] = [];
+        const missing: string[] = [];
+        for (const ref of refs) {
+          // Erasing can't be undone, so it takes only an exact id or path (resolveNoteExact): never a case-folded
+          // path or an H1 title that might name another note.
+          let note: Note | null;
+          try {
+            note = erase ? resolveNoteExact(db, ref, resolveVisibility) : resolveNote(db, ref, resolveVisibility);
+          } catch (err) {
+            // delete-note has no `extension` parameter, so AmbiguousPathError's own hint would point nowhere.
+            if (erase && err instanceof noteOps.AmbiguousPathError) {
+              throw structuredError(`"${ref}" names more than one note; name the one to erase by its id`, {
+                error_type: "ambiguous_path",
+                field: hasList ? "ids" : "id",
+                candidates: err.candidates,
+              });
+            }
+            throw err;
+          }
+          const id = note ? note.id : leftover(ref) ? ref : null;
+          if (id === null) missing.push(ref);
+          else if (!targets.includes(id)) targets.push(id);
+        }
+        if (missing.length > 0) {
+          throw structuredError(`Note not found: ${missing.map((m) => `"${m}"`).join(", ")}`, {
+            error_type: "not_found",
+            field: hasList ? "ids" : "id",
+            missing,
+          });
+        }
+        const results: Record<string, unknown>[] = [];
+        for (const id of targets) {
+          try {
+            if (erase) {
+              const r = await store.forgetNote(id, { actor: writeActor, via: writeVia });
+              results.push({ deleted: r.deleted, id, history_erased: { versions_deleted: r.versionsDeleted, blobs_deleted: r.blobsDeleted } });
+            } else {
+              await store.deleteNote(id, { actor: writeActor, via: writeVia });
+              results.push({ deleted: true, id });
+            }
+          } catch (err) {
+            // Each note is its own transaction: say which were already done, so a retry can name the rest.
+            if (results.length === 0) throw err;
+            throw structuredError(`delete-note stopped at "${id}": ${err instanceof Error ? err.message : String(err)}`, {
+              error_type: "partial_failure",
+              field: "ids",
+              done: results.map((r) => r.id),
+              failed: id,
+            });
+          }
+        }
+        if (!hasList) return results[0]!;
+        return { deleted: results.filter((r) => r.deleted).length, results };
       },
     },
 
@@ -2426,6 +2674,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           }
           return {
             name: singleTag,
+            kind: record?.kind ?? "tag",
             count: found?.count ?? 0,
             expanded_count: found?.expanded_count ?? 0,
             description: record?.description ?? null,
@@ -2437,7 +2686,8 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
           };
         }
 
-        const tags = noteOps.listTags(db);
+        const kinds = tagKinds(db);
+        const tags = noteOps.listTags(db).map((t) => ({ ...t, kind: kinds.get(t.name) ?? "tag" }));
         if (params.include_schema) {
           const records = new Map(
             tagSchemaOps.listTagRecords(db).map((r) => [r.tag, r] as const),
@@ -2546,14 +2796,36 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
         // callers (MCP, REST PUT /tags/:name, import) share — so it can't be
         // bypassed. The cross-tag validation above stays here to surface a
         // clean error before persisting. See the gitcoin orphaned-fields bug.
+        // 0.9.2 safe schema change: refuse a retype that would strand records
+        // (same check, words and shape as REST's 409; conformance.ts).
+        if (fieldsPatch !== undefined) {
+          const conflicts = findRetypeConflicts(db, tag, fieldsPatch);
+          if (conflicts.length > 0) {
+            const first = conflicts[0]!;
+            throw structuredError(
+              `Not changed: retyping "${first.field}" on "${tag}" from ${first.from} to ${first.to} would strand ${first.count} record${first.count === 1 ? "" : "s"}.`,
+              {
+                error_type: "retype_conflict",
+                field: first.field,
+                tag,
+                count: first.count,
+                conflicts: conflicts.map((c) => ({ field: c.field, from: c.from, to: c.to, count: c.count })),
+                hint: retypeHint(tag, first),
+              },
+            );
+          }
+        }
+        // 0.9.2: a new type or field one letter from an existing one is made as written, with a warning.
+        const near = nearSchemaWarnings(db, tag, incomingFields);
         const result = await store.upsertTagRecord(tag, {
           ...(descriptionPatch !== undefined ? { description: descriptionPatch } : {}),
           ...(fieldsPatch !== undefined ? { fields: fieldsPatch } : {}),
           ...(relationshipsPatch !== undefined ? { relationships: relationshipsPatch } : {}),
           ...(parentNamesPatch !== undefined ? { parent_names: parentNamesPatch } : {}),
+          ...(params.kind !== undefined ? { kind: params.kind as "type" | "tag" } : {}),
         });
 
-        return result;
+        return near.length > 0 && result && typeof result === "object" ? { ...result, warnings: near } : result;
       },
     },
 
@@ -2697,6 +2969,30 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
     },
 
     // =====================================================================
+    // 10b. migrate-field — manage-types {action: "migrate"} (0.9.2): the
+    // CLI's `schema migrate-field` engine, a dry run unless apply: true.
+    // =====================================================================
+    {
+      name: "migrate-field",
+      execute: async (params) => {
+        const tag = params.tag;
+        if (typeof tag !== "string" || tag.length === 0) {
+          throw structuredError("migrate needs `tag`: the type whose records carry the field", { error_type: "invalid_request", field: "tag" });
+        }
+        try {
+          return await runMigrateRequest(store, tag, params, {
+            actor: writeActor,
+            via: writeVia,
+            ...(onStrictBypass ? { onStrictBypass } : {}),
+          });
+        } catch (e) {
+          if (e instanceof MigrateRequestError) throw structuredError(e.message, { error_type: "invalid_request", field: e.field });
+          throw e;
+        }
+      },
+    },
+
+    // =====================================================================
     // 11. doctor — read-only taxonomy/metadata integrity scan (vault#552)
     // =====================================================================
     {
@@ -2809,6 +3105,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             sizeBytes,
             transcribe: params.transcribe === true,
             ...(validSegment ? { segmentIndex: segIdx } : {}),
+            ...(ticketSeam.scopedTags ? { scopedTags: [...ticketSeam.scopedTags] } : {}),
           };
           await ticketSeam.provider.put(ticket);
 
@@ -2871,6 +3168,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             attachmentId: attachment.id,
             mimeType: downloadMime,
             sizeBytes: declaredSize,
+            ...(ticketSeam.scopedTags ? { scopedTags: [...ticketSeam.scopedTags] } : {}),
           };
           await ticketSeam.provider.put(ticket);
 
@@ -3006,6 +3304,44 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
       execute: impl.execute,
       ...(impl.resultContent ? { resultContent: impl.resultContent } : {}),
     });
+  }
+  // T-318 §8a: `types` on create-note / update-note. Validated and merged into the tags before the write; marked
+  // as types only after it succeeded, so a refused or rolled-back write (a batch included) leaves no type record.
+  for (const [name, mode] of [["create-note", "create"], ["update-note", "update"]] as const) {
+    const tool = tools.find((t) => t.name === name);
+    if (!tool) continue;
+    const execute = tool.execute;
+    tool.execute = async (params) => {
+      const batchTypes = Array.isArray(params.notes) && (params.notes as Record<string, unknown>[]).some((n) => n?.types !== undefined);
+      if (params.types === undefined && !batchTypes) return execute(params);
+      const prepared = prepareCallTypes(db, params, mode);
+      // 0.9.2: a new type one letter from an existing one is kept, with a warning naming it.
+      const near = nearTypeWarnings(db, prepared.types);
+      const release = holdTypes(db, prepared.types);
+      try {
+        const out = await execute(prepared.params);
+        if (!prepared.types.length) return out;
+        markTypes(db, prepared.types);
+        return attachNearTypeWarnings(refreshTypes(db, out), near);
+      } finally {
+        release();
+      }
+    };
+  }
+  // T-318 §4: `query-notes {path_between}` is find-path under its 0.9 name. Dispatched here so every runtime that
+  // advertises it (core's manifest) answers it; the bun server wraps it again around its tag-scoped find-path.
+  const query = tools.find((t) => t.name === "query-notes");
+  const findPath = tools.find((t) => t.name === "find-path");
+  if (query && findPath) {
+    const execute = query.execute;
+    query.execute = (params) => {
+      if (params.path_between === undefined) return execute(params);
+      const pb = params.path_between;
+      if (!pb || typeof pb !== "object" || Array.isArray(pb)) {
+        throw Object.assign(new Error("path_between takes {source, target, max_depth?}."), { error_type: "invalid_query", field: "path_between" });
+      }
+      return findPath.execute(pb as Record<string, unknown>);
+    };
   }
   return tools;
 }

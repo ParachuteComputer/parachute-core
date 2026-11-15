@@ -537,19 +537,23 @@ describe("attachment tickets — discoverability", () => {
     const enabled = attachmentsInstructionBlock({ ticketsEnabled: true });
     expect(enabled).toContain("request-attachment-upload");
     expect(enabled).toContain("request-attachment-download");
-    expect(enabled).toContain("curl_example");
+    expect(enabled).toContain("one-use URL");
 
     const disabled = attachmentsInstructionBlock({ ticketsEnabled: false });
     expect(disabled).not.toContain("request-attachment-upload");
-    // The REST fallback recipe is always present, wired or not.
+    // Without tickets, the REST recipe is the way in (with tickets, the short brief leaves it out).
     expect(disabled).toContain("/storage/upload");
+    expect(enabled).not.toContain("/storage/upload");
   });
 
   test("bun's connect-time getServerInstruction includes the Attachments section and teaches the ticket tools", async () => {
     const vaultName = freshVault("tickets-instructions");
     const md = await getServerInstruction(vaultName);
     expect(md).toContain("## Attachments");
-    expect(md).toContain("request-attachment-upload");
+    // T-407: this door lists attachment-url (0.9's one ticket tool) and the record tools, so its brief names them.
+    expect(md).toContain("`attachment-url` gives a one-use URL");
+    expect(md).not.toContain("request-attachment-upload");
+    expect(md).toContain("`include_attachments: true` on `query-records` lists a record's attachments.");
   });
 
   test("attachmentsInstructionBlock teaches read-attachment when readEnabled, and omits it when not", () => {

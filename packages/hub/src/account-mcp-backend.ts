@@ -34,11 +34,14 @@ import {
   verbForVault,
 } from "./account-mcp.ts";
 import { signAccessToken } from "./jwt-sign.ts";
+import { keyLevelOnVault } from "./key-level.ts";
 
 export interface ListedMcpTool {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
+  /** The vault's own MCP annotations (readOnlyHint …), passed through as the vault sent them (T-456). */
+  annotations?: Record<string, unknown>;
 }
 
 export interface ModuleMcpBackend {
@@ -47,11 +50,14 @@ export interface ModuleMcpBackend {
   callTool(name: string, args: Record<string, unknown>, ctx: AccountToolContext): Promise<unknown>;
 }
 
-const UNION_CATALOG_LINE =
-  "Catalog caveat: advertised from one covered vault's live list (highest verb this connection holds). Calling this against a different covered vault may return Unknown tool if that vault grants a lower verb.";
-
-const VAULT_FIELD_DESCRIPTION =
-  "Target vault by name. Omit on query-notes to fan the query across every reachable vault; required on every other vault-shaped tool.";
+/**
+ * The vault selector's words. Kept short: they ride on every proxied tool, and a writer's whole list through the
+ * account door is held to the same 4,000-token budget as a per-vault door (contracts/suites/door/multivault.test.ts;
+ * like it, the budget leaves out the tools' MCP annotations, which the model never reads).
+ * The catalog caveat (the list comes from one vault's live list) is said once, on list-vaults.
+ */
+const VAULT_FIELD_REQUIRED = "Vault name (list-vaults shows them).";
+const VAULT_FIELD_FAN_OUT = "Vault name. Omit to query every vault you can read.";
 
 const listCache = new WeakMap<AccountToolContext, Promise<readonly ListedMcpTool[]>>();
 
@@ -119,12 +125,17 @@ export async function mintVaultMcpToken(
   // second, reintroducing the exact misattribution this change fixes (and
   // silently, since the token is otherwise valid). `null` for non-NIP-98
   // connections keeps their key byte-identical to before.
+  // T-446: the hop carries the account credential's named key (its signed `key` claim), so the vault stamps the
+  // write `via key:<name>` as it does at its own door. The cache is keyed by that credential (its jti): a hop minted
+  // for one key is never handed to another, and a revoked key is refused at the door before it reaches the cache.
+  const stampKey = ctx.principal.key;
   const key = hopCacheKey(
     ctx.principal.userId,
     vault.name,
     verb,
     ctx.issuer,
     attribution?.permissions.principal_pubkey ?? null,
+    ctx.principal.tokenId ?? null,
   );
   if (hop.reuse) {
     const cached = lookupHopToken(key, nowMs);
@@ -145,7 +156,9 @@ export async function mintVaultMcpToken(
     // `permissions` rather than assign a second `extraClaims` — vault reads an
     // absent `scoped_tags` as UNSCOPED (`vault/src/auth.ts:470`), so clobbering
     // it would WIDEN the token to the full vault, not fail closed.
-    ...(attribution ? { extraClaims: attribution } : {}),
+    ...(attribution || stampKey
+      ? { extraClaims: { ...(attribution ?? {}), ...(stampKey ? { key: { name: stampKey.name, kind: stampKey.kind } } : {}) } }
+      : {}),
     ...(ctx.now !== undefined ? { now: ctx.now } : {}),
   });
   if (hop.reuse) {
@@ -216,10 +229,14 @@ export async function postVaultMcp(
   return parseJsonRpcResult(res, vault.name);
 }
 
+/** The query tools the account door fans out across vaults: 0.9's record name and its note-named alias (T-407). */
+export const FAN_OUT_TOOLS: ReadonlySet<string> = new Set(["query-records", "query-notes"]);
+
 function injectVaultSelector(tool: {
   name: string;
   description?: unknown;
   inputSchema?: unknown;
+  annotations?: unknown;
 }): ListedMcpTool {
   const rawSchema =
     tool.inputSchema && typeof tool.inputSchema === "object"
@@ -229,18 +246,24 @@ function injectVaultSelector(tool: {
     ...((rawSchema.properties && typeof rawSchema.properties === "object"
       ? rawSchema.properties
       : {}) as Record<string, unknown>),
-    vault: { type: "string", description: VAULT_FIELD_DESCRIPTION },
+    vault: {
+      type: "string",
+      description: FAN_OUT_TOOLS.has(tool.name) ? VAULT_FIELD_FAN_OUT : VAULT_FIELD_REQUIRED,
+    },
   };
   const schema: Record<string, unknown> = { ...rawSchema, properties };
-  if (tool.name !== "query-notes") {
+  if (!FAN_OUT_TOOLS.has(tool.name)) {
     const req = Array.isArray(schema.required)
       ? schema.required.filter((x): x is string => typeof x === "string")
       : [];
     if (!req.includes("vault")) schema.required = [...req, "vault"];
   }
-  const base = typeof tool.description === "string" ? tool.description : tool.name;
-  const description = base.includes("Catalog caveat:") ? base : `${base}\n\n${UNION_CATALOG_LINE}`;
-  return { name: tool.name, description, inputSchema: schema };
+  const description = typeof tool.description === "string" ? tool.description : tool.name;
+  const annotations =
+    tool.annotations && typeof tool.annotations === "object" && !Array.isArray(tool.annotations)
+      ? { annotations: tool.annotations as Record<string, unknown> }
+      : {};
+  return { name: tool.name, description, inputSchema: schema, ...annotations };
 }
 
 /**
@@ -259,10 +282,16 @@ export function schemaSourceCandidates(
   });
 }
 
+// The tools' annotations come with this list, from the covered vault where the key's level is highest, so a key that
+// is admin anywhere sees vault-info as a change (the safe side). If that vault's list fails and a vault where the key
+// holds less answers, its hints would say read-only for a tool the key can still change on the other vault, so they
+// are dropped: with no hints a client treats every tool as a change.
 async function listVaultToolsUncached(ctx: AccountToolContext): Promise<readonly ListedMcpTool[]> {
   const coverage = resolveCoverage(ctx.db, ctx.principal, installedVaults(ctx));
   if (coverage.vaults.length === 0) return [];
-  for (const vault of schemaSourceCandidates(ctx, coverage.vaults)) {
+  const candidates = schemaSourceCandidates(ctx, coverage.vaults);
+  const topRank = COMPOSED_VERB_RANK[verbForVault(ctx, candidates[0]!.name)];
+  for (const vault of candidates) {
     try {
       const result = await postVaultMcp(ctx, vault, verbForVault(ctx, vault.name), "tools/list");
       const tools =
@@ -272,11 +301,11 @@ async function listVaultToolsUncached(ctx: AccountToolContext): Promise<readonly
       if (!tools) continue;
       return tools
         .filter(
-          (t): t is { name: string; description?: unknown; inputSchema?: unknown } =>
+          (t): t is { name: string; description?: unknown; inputSchema?: unknown; annotations?: unknown } =>
             !!t && typeof t === "object" && typeof (t as { name?: unknown }).name === "string",
         )
         .filter((t) => !HUB_NATIVE_TOOL_NAMES.has(t.name))
-        .map(injectVaultSelector);
+        .map((t) => injectVaultSelector(COMPOSED_VERB_RANK[verbForVault(ctx, vault.name)] < topRank ? { ...t, annotations: undefined } : t));
     } catch {
       // Try the next covered vault (highest-verb first). Empty catch continues.
     }
@@ -294,16 +323,27 @@ export function listVaultModuleTools(ctx: AccountToolContext): Promise<readonly 
 }
 
 function coveredVault(ctx: AccountToolContext, raw: unknown): AccountVaultMeta {
-  if (typeof raw !== "string" || raw.length === 0) {
-    throw new AccountToolError("invalid_vault", "vault is required.");
-  }
   const coverage = resolveCoverage(ctx.db, ctx.principal, installedVaults(ctx));
+  // The refusal teaches: it names the vaults this key reaches and its level on each, so the next call can be right.
+  const reach = coverage.vaults
+    .map((v) => `${v.name} (${keyLevelOnVault(ctx.db, ctx.principal, v.name) ?? "none"})`)
+    .join(", ");
+  const names =
+    reach.length > 0 ? `This connection reaches: ${reach}.` : "This connection reaches no vault.";
+  if (typeof raw !== "string" || raw.length === 0) {
+    throw new AccountToolError(
+      "invalid_vault",
+      `vault is required: name the vault to use. ${names} list-vaults shows them.`,
+      { vaults: coverage.names },
+    );
+  }
   const wanted = raw.toLowerCase();
   const hit = coverage.vaults.find((v) => v.name === wanted);
   if (!hit) {
     throw new AccountToolError(
       "vault_not_covered",
-      `Vault "${raw}" is not among the vaults this connection can reach.`,
+      `Vault "${raw}" is not among the vaults this connection can reach. ${names}`,
+      { vaults: coverage.names },
     );
   }
   return hit;
@@ -332,13 +372,20 @@ async function queryOneVaultMcp(
   ctx: AccountToolContext,
   vault: AccountVaultMeta,
   args: Record<string, unknown>,
-): Promise<{ vault: string; notes: unknown } | { vault: string; error: string }> {
+  tool: string,
+): Promise<
+  { vault: string; notes?: unknown; records?: unknown } | { vault: string; error: string }
+> {
   try {
     const result = await postVaultMcp(ctx, vault, "read", "tools/call", {
-      name: "query-notes",
+      name: tool,
       arguments: args,
     });
-    return { vault: vault.name, notes: notesFromMcpResult(result) };
+    // Each vault answers in the words of the tool called: `records` for query-records, `notes` for query-notes.
+    return {
+      vault: vault.name,
+      [tool === "query-records" ? "records" : "notes"]: notesFromMcpResult(result),
+    };
   } catch (err) {
     return {
       vault: vault.name,
@@ -350,9 +397,10 @@ async function queryOneVaultMcp(
 async function queryNotesOverlay(
   args: Record<string, unknown>,
   ctx: AccountToolContext,
+  tool = "query-notes",
 ): Promise<{
   vaults_queried: string[];
-  results: Array<{ vault: string; notes?: unknown; error?: string }>;
+  results: Array<{ vault: string; notes?: unknown; records?: unknown; error?: string }>;
 }> {
   const coverage = resolveCoverage(ctx.db, ctx.principal, installedVaults(ctx));
   let targets = coverage.vaults;
@@ -360,7 +408,9 @@ async function queryNotesOverlay(
     targets = [coveredVault(ctx, args.vault)];
   }
   const stripped = stripVaultArg(args);
-  const settled = await Promise.allSettled(targets.map((v) => queryOneVaultMcp(ctx, v, stripped)));
+  const settled = await Promise.allSettled(
+    targets.map((v) => queryOneVaultMcp(ctx, v, stripped, tool)),
+  );
   return {
     vaults_queried: targets.map((v) => v.name),
     results: settled.map((s, i) =>
@@ -379,7 +429,7 @@ export async function callVaultModuleTool(
   args: Record<string, unknown>,
   ctx: AccountToolContext,
 ): Promise<unknown> {
-  if (name === "query-notes") return queryNotesOverlay(args, ctx);
+  if (FAN_OUT_TOOLS.has(name)) return queryNotesOverlay(args, ctx, name);
 
   const hit = coveredVault(ctx, args.vault);
   const verb = verbForVault(ctx, hit.name);

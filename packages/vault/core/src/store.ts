@@ -1,12 +1,14 @@
 import { Database } from "bun:sqlite";
+import { anyTermsQuery, fuseRanks, HYBRID_POOL } from "./hybrid.js";
 import { HistoryPreconditionRequiredError } from "./history.js";
 import type { Store, Note, Link, Attachment, QueryOpts, QueryNotesPage, AggregateRow, SemanticSearchResult } from "./types.js";
-import { compactNote, compactVault, countNoteVersions, type CompactResult, type CompactSummary, captureVersion, readPriorNoteRow, resolveHistoryPolicy, appendRestoreMarker, listVersions, getVersion, latestTombstone, eraseHistory, sweepDeletedHistory, deletedHistoryStats, HistoryNotFoundError, HistoryOverflowError, HistoryUnrecoverableError, DEFAULT_HISTORY_POLICY, VERSION_MAX_BYTES, type VersionRow, type HistoryPolicy, type HistoryOp } from "./history.js";
+import { compactNote, compactVault, countNoteVersions, type CompactResult, type CompactSummary, captureVersion, readPriorNoteRow, resolveHistoryPolicy, appendRestoreMarker, listVersions, getVersion, latestTombstone, eraseHistory, eraseNoteVersions, listDeletedNotes, sweepDeletedHistory, deletedHistoryStats, HistoryNotFoundError, HistoryOverflowError, HistoryUnrecoverableError, DEFAULT_HISTORY_POLICY, VERSION_MAX_BYTES, type VersionRow, type HistoryPolicy, type HistoryOp } from "./history.js";
 import { initSchema } from "./schema.js";
 import { refreshCompactState } from "./history-compact-state.js";
 import * as noteOps from "./notes.js";
 import * as linkOps from "./links.js";
 import * as tagSchemaOps from "./tag-schemas.js";
+import { recordedTypeNames } from "./tag-kind.js";
 import * as indexedFieldOps from "./indexed-fields.js";
 import {
   pruneOrphanedIndexedFields,
@@ -282,6 +284,8 @@ export class BunSqliteStore implements Store {
   private syncReferenceFieldLinks(
     note: Note,
     priorMetadata: Record<string, unknown> | undefined,
+    /** Scope gap 1: the writer's visibility; a hidden target resolves as a miss (see `resolveOrQueueLink`). */
+    linkVisible?: (noteId: string) => boolean,
   ): void {
     const resolution = resolveNoteSchemas(this.getSchemaConfig(), { tags: note.tags ?? [] });
     if (resolution.mergedFields.size === 0) return;
@@ -296,7 +300,7 @@ export class BunSqliteStore implements Store {
       const priorValue = prior[fieldName];
 
       if (Array.isArray(nextValue) || Array.isArray(priorValue)) {
-        this.syncReferenceFieldArrayLinks(note.id, fieldName, nextValue, priorValue);
+        this.syncReferenceFieldArrayLinks(note.id, fieldName, nextValue, priorValue, linkVisible);
         continue;
       }
 
@@ -328,7 +332,7 @@ export class BunSqliteStore implements Store {
         // treated the same as a miss here: no link is created, and nothing
         // is queued (mirrors `resolveOrQueueLink`'s own "don't guess"
         // contract for structured links).
-        const outcome = resolveOrQueueLink(this.db, note.id, nextValue, fieldName);
+        const outcome = resolveOrQueueLink(this.db, note.id, nextValue, fieldName, linkVisible);
         if (outcome.status === "resolved") {
           linkOps.createLink(this.db, note.id, outcome.note_id, fieldName);
         }
@@ -394,6 +398,7 @@ export class BunSqliteStore implements Store {
     fieldName: string,
     nextValue: unknown,
     priorValue: unknown,
+    linkVisible?: (noteId: string) => boolean,
   ): void {
     const nextSet = referenceValueToSet(nextValue);
     const priorSet = referenceValueToSet(priorValue);
@@ -402,16 +407,26 @@ export class BunSqliteStore implements Store {
 
     // Resolve the ENTIRE next-set (queuing misses) → the target ids the
     // field's edges under this relationship should point at right now.
+    const existing = linkOps.getLinks(this.db, noteId, { direction: "outbound" });
     const desiredTargetIds = new Set<string>();
     for (const value of nextSet) {
-      const outcome = resolveOrQueueLink(this.db, noteId, value, fieldName);
+      // Scope gap 1 (round-1 review): an element still in the list whose link,
+      // made by someone who could see its note, already exists is kept as it
+      // is. A tag-scoped writer's edit must not delete a link it can't see.
+      if (linkVisible) {
+        const held = resolveLinkTargetDetailed(this.db, value);
+        if (held.resolved && !linkVisible(held.note_id!) && existing.some((l) => l.relationship === fieldName && l.targetId === held.note_id)) {
+          desiredTargetIds.add(held.note_id!);
+          continue;
+        }
+      }
+      const outcome = resolveOrQueueLink(this.db, noteId, value, fieldName, linkVisible);
       if (outcome.status === "resolved") desiredTargetIds.add(outcome.note_id);
     }
 
     // Reconcile existing edges to the desired target set (see the doc comment
     // for why deleting by resolved TARGET, not by re-resolved raw value, is
     // what fixes the rename / ambiguous / aliasing corners).
-    const existing = linkOps.getLinks(this.db, noteId, { direction: "outbound" });
     for (const link of existing) {
       if (link.relationship !== fieldName) continue;
       if (!desiredTargetIds.has(link.targetId)) {
@@ -566,7 +581,7 @@ export class BunSqliteStore implements Store {
    * `syncWikilinks` recomputes a note's wikilink rows, unresolved and ambiguous
    * rows from scratch, so the final pass gives the same result.
    */
-  async createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string; extension?: string; actor?: string | null; via?: string | null; deferWikilinkSync?: boolean }): Promise<Note> {
+  async createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string; extension?: string; actor?: string | null; via?: string | null; deferWikilinkSync?: boolean; linkVisible?: (noteId: string) => boolean }): Promise<Note> {
     // Normalize `date`-typed field values to canonical UTC ISO form BEFORE
     // the write (vault#date-field-type — mixed-offset TEXT-compare
     // corruption). COPY-ON-WRITE (round 2) — reassign the local `opts`
@@ -585,7 +600,7 @@ export class BunSqliteStore implements Store {
     });
 
     if (content && !opts?.deferWikilinkSync) {
-      syncWikilinks(this.db, note.id, content);
+      syncWikilinks(this.db, note.id, content, opts?.linkVisible);
     }
 
     if (note.path) {
@@ -599,10 +614,12 @@ export class BunSqliteStore implements Store {
     // Reference-field auto-link (vault#typed-reference-field) — no prior
     // metadata on a fresh create. Cheap no-op when nothing on the note's
     // effective schema declares `type: "reference"`.
-    this.syncReferenceFieldLinks(note, undefined);
+    this.syncReferenceFieldLinks(note, undefined, opts?.linkVisible);
 
     this.invalidateConfigCachesForPath(note.path);
-    this.hooks.dispatch("created", note, this);
+    // Inside a batch (transactionAsync) the note exists only once the batch commits: no hook may hear of it before,
+    // and none if it rolls back (T-421). Outside a transaction afterCommit runs at once, as before.
+    afterCommit(this.db, () => this.hooks.dispatch("created", note, this));
 
     return note;
   }
@@ -669,8 +686,19 @@ export class BunSqliteStore implements Store {
        * verbatim. Ignored when `updates.metadata` is undefined.
        */
       tagsForSchemaResolution?: string[];
+      /**
+       * Scope gap 1: which notes a tag-scoped writer may see. A `[[wikilink]]`
+       * or reference-field value naming a note outside that set resolves as
+       * one that matched nothing (queued, no link). Never reaches SQL.
+       */
+      linkVisible?: (noteId: string) => boolean;
     },
   ): Promise<Note> {
+    const linkVisible = updates.linkVisible;
+    if (linkVisible) {
+      const { linkVisible: _drop, ...rest } = updates;
+      updates = rest;
+    }
     let oldPath: string | undefined;
     // Reference-field auto-link sync (vault#typed-reference-field) needs the
     // PRE-write metadata to detect which reference fields actually changed —
@@ -715,7 +743,7 @@ export class BunSqliteStore implements Store {
     const note = this.transaction(() => {
       if (willWriteNoteRow(updates)) {
         const prior = readPriorNoteRow(this.db, id);
-        if (prior) captureVersion(this.db, prior, { actor: updates.actor ?? null, via: updates.via ?? null, op: historyOpFor(updates), policy: this.historyPolicy });
+        if (prior) captureVersion(this.db, prior, { actor: updates.actor ?? null, via: updates.via ?? null, op: historyOpFor(updates), policy: this.historyPolicy, next: { path: updates.path, extension: updates.extension } });
       }
       const note = noteOps.updateNote(this.db, id, updates);
 
@@ -723,7 +751,7 @@ export class BunSqliteStore implements Store {
       // we don't have the new value pre-write — read it back off the returned
       // note so a `[[Foo]]` introduced via append still creates the link.
       if (updates.content !== undefined || updates.append !== undefined || updates.prepend !== undefined) {
-        syncWikilinks(this.db, id, note.content);
+        syncWikilinks(this.db, id, note.content, linkVisible);
       }
 
       if (updates.path !== undefined && note.path) {
@@ -747,7 +775,7 @@ export class BunSqliteStore implements Store {
       // when this call actually touched `metadata` — see the read above for
       // why a content/tags/path-only update is skipped.
       if (updates.metadata !== undefined) {
-        this.syncReferenceFieldLinks(note, priorMetadataForRefs);
+        this.syncReferenceFieldLinks(note, priorMetadataForRefs, linkVisible);
       }
 
       refreshCompactState(this.db, id);
@@ -1019,6 +1047,18 @@ export class BunSqliteStore implements Store {
       .run(createdAt, updatedAt, updatedAtMs, id);
   }
 
+  async listDeletedNotes(opts?: { limit?: number; offset?: number }) { return listDeletedNotes(this.db, opts); }
+
+  async forgetNote(id: string, opts?: { actor?: string | null; via?: string | null }): Promise<{ deleted: boolean; versionsDeleted: number; blobsDeleted: number }> {
+    const existing = noteOps.getNote(this.db, id);
+    const erased = this.transaction(() => {
+      if (existing) this.deleteNoteRows(id, existing, { ...opts, captureHistory: false });
+      return eraseNoteVersions(this.db, id);
+    });
+    if (existing) this.afterDelete(id, existing);
+    return { deleted: existing !== null, ...erased };
+  }
+
   async deleteNote(id: string, opts?: { actor?: string | null; via?: string | null; captureHistory?: boolean }): Promise<void> {
     // Read before delete so we can invalidate config caches on the way out
     // AND so the post-delete hook dispatch carries the minimum payload
@@ -1032,30 +1072,41 @@ export class BunSqliteStore implements Store {
     // it's individually re-saved. See requeueInboundWikilinksForDelete's doc
     // comment for why this must run pre-delete and what it deliberately
     // excludes (typed `links`, not just wikilinks).
-    this.transaction(() => {
-      requeueInboundWikilinksForDelete(this.db, id);
-      // vault#581 — the deleted note's resolution keys, captured BEFORE the row
-      // goes away and swept AFTER, so a `[[Dup]]` that was ambiguous only
-      // because of THIS note resolves (or, if it was the last candidate,
-      // demotes to an ordinary broken link).
-      const ambiguityKeys = noteResolutionKeys(existing);
-      if (opts?.captureHistory !== false) {
-        const prior = readPriorNoteRow(this.db, id);
-        if (prior) captureVersion(this.db, prior, { actor: opts?.actor ?? null, via: opts?.via ?? null, op: "delete", policy: this.historyPolicy });
-      }
-      noteOps.deleteNote(this.db, id);
-      refreshAmbiguousLinks(this.db, ambiguityKeys);
-      refreshCompactState(this.db, id);
-    });
+    this.transaction(() => this.deleteNoteRows(id, existing, opts));
+    this.afterDelete(id, existing);
+  }
+
+  /** deleteNote's writes, for one transaction (forgetNote shares them). */
+  private deleteNoteRows(id: string, existing: Note | null, opts?: { actor?: string | null; via?: string | null; captureHistory?: boolean }): void {
+    requeueInboundWikilinksForDelete(this.db, id);
+    // vault#581 — the deleted note's resolution keys, captured BEFORE the row
+    // goes away and swept AFTER, so a `[[Dup]]` that was ambiguous only
+    // because of THIS note resolves (or, if it was the last candidate,
+    // demotes to an ordinary broken link).
+    const ambiguityKeys = noteResolutionKeys(existing);
+    if (opts?.captureHistory !== false) {
+      const prior = readPriorNoteRow(this.db, id);
+      if (prior) captureVersion(this.db, prior, { actor: opts?.actor ?? null, via: opts?.via ?? null, op: "delete", policy: this.historyPolicy });
+    }
+    noteOps.deleteNote(this.db, id);
+    refreshAmbiguousLinks(this.db, ambiguityKeys);
+    refreshCompactState(this.db, id);
+  }
+
+  /** What follows a delete's commit: config caches and the `deleted` hook. */
+  private afterDelete(id: string, existing: Note | null): void {
     if (existing?.path) this.invalidateConfigCachesForPath(existing.path);
     // Dispatch even when `existing` was null — the caller asked for a
     // deletion, and downstream consumers (e.g. the mirror) reconcile via
     // id. Path is undefined in that case; the mirror sweep will catch
-    // any orphans missed by the targeted-removal fast path.
-    this.hooks.dispatch(
-      "deleted",
-      { id, ...(existing?.path ? { path: existing.path } : {}), ...(existing ? { tags: existing.tags ?? [] } : {}) },
-      this,
+    // any orphans missed by the targeted-removal fast path. Inside a batch,
+    // only once it commits (T-421), as createNote and updateNote.
+    afterCommit(this.db, () =>
+      this.hooks.dispatch(
+        "deleted",
+        { id, ...(existing?.path ? { path: existing.path } : {}), ...(existing ? { tags: existing.tags ?? [] } : {}) },
+        this,
+      ),
     );
   }
 
@@ -1085,7 +1136,7 @@ export class BunSqliteStore implements Store {
     return noteOps.queryNotes(this.db, this.expandQueryTags(this.normalizeQueryTags(opts)));
   }
 
-  async queryNotesPaged(opts: QueryOpts): Promise<QueryNotesPage> {
+  async queryNotesPaged(opts: QueryOpts, visible?: (note: Note) => boolean): Promise<QueryNotesPage> {
     // Hierarchy expansion happens internally — but importantly the cursor's
     // query_hash is computed from the CALLER'S opts (pre-expansion), so a
     // tag hierarchy edit between calls invalidates the cursor (different
@@ -1096,7 +1147,8 @@ export class BunSqliteStore implements Store {
     // Bare-tag normalization runs first (before the hash is taken inside
     // queryNotesPaged) so a `#tag`-form page-1 and a bare `tag`-form follow-up
     // resolve to the same cursor query_hash.
-    return noteOps.queryNotesPaged(this.db, this.expandQueryTags(this.normalizeQueryTags(opts)));
+    // `visible` (scope gap 2): the page and its cursor follow only the notes the caller may see.
+    return noteOps.queryNotesPaged(this.db, this.expandQueryTags(this.normalizeQueryTags(opts)), visible);
   }
 
   async aggregateNotes(opts: QueryOpts): Promise<AggregateRow[]> {
@@ -1210,7 +1262,7 @@ export class BunSqliteStore implements Store {
    * (MCP/REST) let this propagate uncaught, same as
    * `invalid_search_syntax` above.
    */
-  async semanticSearch(nearText: string, opts?: QueryOpts): Promise<SemanticSearchResult> {
+  async semanticSearch(nearText: string, opts?: QueryOpts & { visible?: (note: Note) => boolean }): Promise<SemanticSearchResult> {
     if (!this.embeddingProvider) {
       // Honest either way: if the caller told us WHY (operator explicitly
       // set EMBEDDINGS_ENABLED=false), say that — not generic provider-setup
@@ -1257,6 +1309,58 @@ export class BunSqliteStore implements Store {
 
     const filterOpts = this.expandQueryTags(this.normalizeQueryTags(opts ?? {}));
     return noteOps.semanticSearchNotes(this.db, queryVector, filterOpts, this.embeddingProvider.model);
+  }
+
+  /**
+   * Hybrid search (T-461 prototype for 0.9.3): the keyword arm (any of the
+   * question's terms, bm25) and the meaning arm (`semanticSearch`) each take
+   * `HYBRID_POOL` candidates under the same filters, fused by reciprocal rank
+   * (`core/src/hybrid.ts`). With no embedding provider (or one not ready) the
+   * answer is the keyword arm alone and `meaning` says why, never a silent
+   * swap: the caller turns it into a warning.
+   *
+   * `opts.visible` (a tag-scoped session): BOTH arms run under it before they rank and take their candidates, so a
+   * scoped caller's page is full and only in-scope notes reach the fusion, the scores, or the counts. The keyword arm
+   * ranks over the visible notes only (`searchNotes`'s `visible`); the meaning arm narrows its candidates first
+   * (`semanticSearchNotes`).
+   */
+  /** Until when (ms) the meaning arm is known to be failing, so `auto` doesn't retry it on every search. */
+  private meaningDownUntil = 0;
+
+  /** Whether meaning search can answer: a provider is configured and it hasn't failed in the last minute. */
+  hasMeaningSearch(): boolean {
+    return this.embeddingProvider !== undefined && Date.now() >= this.meaningDownUntil;
+  }
+
+  async hybridSearch(
+    text: string,
+    opts?: QueryOpts & { visible?: (note: Note) => boolean },
+  ): Promise<{ notes: Note[]; meaning: "ok" | "unavailable"; meaningReason?: string; pendingCount: number; totalCandidates: number }> {
+    const limit = typeof opts?.limit === "number" ? opts.limit : 50; // the same default as `search`
+    const pool = { ...(opts ?? {}), limit: Math.max(HYBRID_POOL, limit) };
+    const anyQuery = anyTermsQuery(text);
+    // Start the meaning arm first (its embed call may be a network round-trip), then run FTS while it waits.
+    const meaningP = this.semanticSearch(text, pool);
+    meaningP.catch(() => {}); // handled below; keeps an early rejection from being reported as unhandled
+    const keyword = anyQuery ? await this.searchNotes(anyQuery, { ...pool, mode: "advanced" }) : [];
+    let meaningNotes: Note[] | undefined;
+    let meaningReason: string | undefined;
+    let pendingCount = 0;
+    let totalCandidates = 0;
+    try {
+      const r = await meaningP;
+      meaningNotes = r.notes;
+      pendingCount = r.pendingCount;
+      totalCandidates = r.totalCandidates;
+    } catch (err) {
+      if (!(err instanceof QueryError) || (err as QueryError & { error_type?: string }).error_type !== "semantic_unavailable") throw err;
+      meaningReason = err.message;
+      this.meaningDownUntil = Date.now() + 60_000; // a broken provider costs one try a minute, not one per search
+    }
+    const fused = fuseRanks({ keyword: keyword.map((n) => n.id), meaning: meaningNotes?.map((n) => n.id) }).slice(0, limit);
+    const byId = new Map<string, Note>([...keyword, ...(meaningNotes ?? [])].map((n) => [n.id, n]));
+    const notes: Note[] = fused.map((h) => ({ ...byId.get(h.id)!, score: h.score, matched_by: Object.keys(h.ranks) }));
+    return { notes, meaning: meaningNotes ? "ok" : "unavailable", meaningReason, pendingCount, totalCandidates };
   }
 
   // ---- Tags ----
@@ -1399,7 +1503,7 @@ export class BunSqliteStore implements Store {
       // Same reference-field auto-link sync as singleton createNote
       // (vault#typed-reference-field) — no prior metadata on a fresh create.
       this.syncReferenceFieldLinks(note, undefined);
-      this.hooks.dispatch("created", note, this);
+      afterCommit(this.db, () => this.hooks.dispatch("created", note, this)); // after the batch commits, as createNote
     }
     return notes;
   }
@@ -1513,6 +1617,10 @@ export class BunSqliteStore implements Store {
     return tagSchemaOps.getTagRecord(this.db, tag);
   }
 
+  async recordedTypeNames() {
+    return recordedTypeNames(this.db);
+  }
+
   /**
    * Partial upsert of the full tag record. Any patch field left undefined
    * is preserved; pass null to clear. Invalidates the tag-hierarchy cache
@@ -1537,6 +1645,7 @@ export class BunSqliteStore implements Store {
       fields?: Record<string, tagSchemaOps.TagFieldSchema> | null;
       relationships?: tagSchemaOps.TagRelationshipMap | null;
       parent_names?: string[] | null;
+      kind?: "type" | "tag";
     },
   ) {
     // Canonical-bare-tag guard (vault#XXX) for the SCHEMA path. Strip leading
@@ -1647,16 +1756,24 @@ export class BunSqliteStore implements Store {
         const record = tagSchemaOps.upsertTagRecord(this.db, tag, patch);
 
         if (patch.fields !== undefined) {
+          // Release first (0.9.2 ceiling): a write that swaps one indexed
+          // field for another frees its column before the new one is counted
+          // against INDEXED_FIELD_LIMIT. The two sets are disjoint, so the
+          // order changes nothing else; a refusal rolls both back.
+          for (const fieldName of priorIndexed) {
+            if (!nextIndexed.has(fieldName)) {
+              indexedFieldOps.releaseField(this.db, fieldName, tag);
+            }
+          }
+          // Count the write's new indexed fields together, before any column
+          // is added and after its releases (so `got` is what the vault would
+          // hold without the new fields; the import retry relies on that).
+          indexedFieldOps.assertIndexedFieldRoom(this.db, nextIndexed);
           for (const fieldName of nextIndexed) {
             const spec = nextFields![fieldName]!;
             // Type already validated above; non-null assertion is safe here.
             const mapped = indexedFieldOps.mapFieldType(spec.type)!;
             indexedFieldOps.declareField(this.db, fieldName, mapped, tag);
-          }
-          for (const fieldName of priorIndexed) {
-            if (!nextIndexed.has(fieldName)) {
-              indexedFieldOps.releaseField(this.db, fieldName, tag);
-            }
           }
         }
 

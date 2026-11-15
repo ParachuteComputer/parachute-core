@@ -106,7 +106,8 @@ async function edgeSuppressionFixture(door: "MCP" | "REST", name: string, scoped
     ? tools.find((t) => t.name === "query-notes")!.execute(params)
     : (await restQuery(params)).json();
   const find = async (target: string): Promise<any> => door === "MCP"
-    ? tools.find((t) => t.name === "find-path")!.execute({ source: "work-src", target })
+    // 0.9's name for find-path (T-318 §4); the old name answers the same plus a `deprecation` field.
+    ? tools.find((t) => t.name === "query-notes")!.execute({ path_between: { source: "work-src", target } })
     : (await handleFindPath(mkReq("GET", `/find-path?source=work-src&target=${encodeURIComponent(target)}`), fixtureStore, scope)).json();
   const unresolved = async (): Promise<any> => handleUnresolvedWikilinks(mkReq("GET", "/unresolved-wikilinks"), fixtureStore, scope).json();
   const leak = (resp: unknown) => {
@@ -626,7 +627,7 @@ describe("deeper link queries", async () => {
 describe("MCP tools", async () => {
   test("generates the consolidated tool set", () => {
     const tools = generateMcpTools(store);
-    expect(tools.length).toBe(13);
+    expect(tools.length).toBe(14);
 
     const names = tools.map((t) => t.name);
     expect(names).toContain("query-notes");
@@ -908,14 +909,14 @@ describe("scoped MCP wrapper", async () => {
     // vault#274: stats line distinguishes total tag count (note-usage)
     // from schema-bearing count. One note tagged `person`, one tag
     // overall, that one tag has a schema → "1 tag total, 1 with schemas".
-    expect(md).toContain("1 note, 1 tag total, 1 with schemas");
+    expect(md).toContain("1 record, 1 tag total, 1 with schemas");
     expect(md).toContain("1 tag with schemas: person");
-    expect(md).toContain("Indexed metadata fields");
+    expect(md).toContain("Indexed fields");
     expect(md).toContain("email");
     expect(md).toContain("#person");
     expect(md).toContain("Querying");
     expect(md).toContain("vault-info");
-    expect(md).toContain("list-tags { include_schema: true }");
+    expect(md).toContain('vault-info { help: "<tool>" }');
 
     closeAllStores();
   });
@@ -941,13 +942,13 @@ describe("scoped MCP wrapper", async () => {
     // schemas exist it appears in two places (stats suffix + the
     // tags-with-schemas list line); on an empty vault both branches
     // are unreachable, so the phrase shouldn't appear at all.
-    expect(md).toContain("0 notes, 0 tags total");
+    expect(md).toContain("0 records, 0 tags total");
     expect(md).not.toContain("with schemas");
     expect(md).toContain("No tag schemas declared");
-    expect(md).toContain("No indexed metadata fields");
+    expect(md).toContain("No indexed fields");
     // Refresh hints surface both pointers so the agent knows where to look.
     expect(md).toContain("vault-info");
-    expect(md).toContain("list-tags");
+    expect(md).toContain("help");
 
     closeAllStores();
   });
@@ -1041,7 +1042,7 @@ describe("scoped MCP wrapper", async () => {
 
     // Aggregate stats line still flows through unchanged — counts are
     // pre-existing leak surface (per the rc.3 design discussion).
-    expect(md).toMatch(/\d+ note/);
+    expect(md).toMatch(/\d+ record/);
 
     closeAllStores();
   });
@@ -4019,17 +4020,20 @@ describe("HTTP /notes", async () => {
       expect(body.map((n) => n.content)).toEqual(["hit"]);
     });
 
-    test("operator query on a non-indexed field returns 400 with FIELD_NOT_INDEXED", async () => {
-      // Don't declare the field — the engine's indexed-field gate should fire.
+    test("operator query on a non-indexed field scans, with a scan warning (0.9.2)", async () => {
+      // Don't declare the field: it is scanned, not refused.
       await store.createNote("x", { metadata: { mood: "great" } });
+      await store.createNote("y", { metadata: { mood: "fine" } });
       const res = await handleNotes(
-        mkReq("GET", "/notes?meta[mood][eq]=great"),
+        mkReq("GET", "/notes?meta[mood][eq]=great&include_content=true"),
         store,
         "",
       );
-      expect(res.status).toBe(400);
-      const body = await res.json() as any;
-      expect(body.code).toBe("FIELD_NOT_INDEXED");
+      expect(res.status).toBe(200);
+      const body = await res.json() as any[];
+      expect(body.map((n) => n.content)).toEqual(["x"]);
+      const warnings = JSON.parse(decodeURIComponent(res.headers.get("X-Parachute-Warnings") ?? "[]"));
+      expect(warnings.filter((w: any) => w.code === "scan").map((w: any) => w.fields)).toEqual([["mood"]]);
     });
 
     test("unknown operator returns 400 with UNKNOWN_OPERATOR", async () => {
@@ -7738,10 +7742,16 @@ describe("stateless MCP transport", async () => {
     expect(toolNames).toContain("request-attachment-download");
     expect(toolNames).not.toContain("request-attachment-upload");
     expect(toolNames).toContain("read-attachment");
-    // Read tier is exactly 7 tools (doctor added by the re-tier;
-    // request-attachment-download by the attachment-tickets design;
-    // read-attachment by Wave 2).
-    expect(toolNames.length).toBe(7);
+    // Read tier: 6 tools in the eleven-tool shape (T-318 §4) plus the four
+    // read-tier aliases (query-notes, list-tags, find-path, request-attachment-download).
+    expect(toolNames.length).toBe(10);
+    // T-407: the mutation tools are hidden under their record names too.
+    expect(toolNames).toContain("query-records");
+    expect(toolNames).not.toContain("create-record");
+    expect(toolNames).not.toContain("update-record");
+    expect(toolNames).not.toContain("delete-record");
+    expect(toolNames).toContain("attachment-url");
+    expect(toolNames).not.toContain("manage-types");
 
     closeAllStores();
   });
@@ -8183,40 +8193,45 @@ describe("MCP tools/list scope tiers (vault#376)", () => {
     return names;
   }
 
-  test("vault:read sees exactly the 7 read tools (doctor moved admin → read; read-attachment and request-attachment-download are read-tier)", async () => {
+  // T-318 §4: the eleven-tool shape, then the old names still listed as aliases through 0.9.
+  // T-407: the record tools lead; the note-named tools follow as aliases through 0.9.
+  test("vault:read sees the 6 read tools, then the read-tier aliases (query-notes, list-tags, find-path, request-attachment-download)", async () => {
     const names = await listToolNames(["vault:read"]);
-    expect(new Set(names)).toEqual(
-      new Set([
-        "query-notes",
-        "list-tags",
-        "find-path",
-        "vault-info",
-        "doctor",
-        "request-attachment-download",
-        "read-attachment",
-      ]),
-    );
-    expect(names.length).toBe(7);
+    expect(names).toEqual([
+      "query-records",
+      "list-types",
+      "vault-info",
+      "doctor",
+      "read-attachment",
+      "attachment-url",
+      "query-notes",
+      "list-tags",
+      "find-path",
+      "request-attachment-download",
+    ]);
   });
 
-  test("vault:read + vault:write sees the 11 read+write tools (tag-schema tools moved write → admin; request-attachment-upload is write-tier)", async () => {
+  test("vault:read + vault:write sees the 9 writer tools, then the aliases a writer may call", async () => {
     const names = await listToolNames(["vault:read", "vault:write"]);
-    expect(new Set(names)).toEqual(
-      new Set([
-        "query-notes",
-        "list-tags",
-        "find-path",
-        "vault-info",
-        "doctor",
-        "create-note",
-        "update-note",
-        "delete-note",
-        "request-attachment-upload",
-        "request-attachment-download",
-        "read-attachment",
-      ]),
-    );
-    expect(names.length).toBe(11);
+    expect(names).toEqual([
+      "query-records",
+      "create-record",
+      "update-record",
+      "delete-record",
+      "list-types",
+      "vault-info",
+      "doctor",
+      "read-attachment",
+      "attachment-url",
+      "query-notes",
+      "create-note",
+      "update-note",
+      "delete-note",
+      "list-tags",
+      "find-path",
+      "request-attachment-upload",
+      "request-attachment-download",
+    ]);
     expect(names).not.toContain("manage-token");
     // Re-tier (this PR): update-tag/delete-tag/rename-tag/merge-tags are now
     // admin-tier — structure/taxonomy curation, not content authorship.
@@ -8228,7 +8243,7 @@ describe("MCP tools/list scope tiers (vault#376)", () => {
     expect(names).toContain("delete-note");
   });
 
-  test("vault:admin sees all 17 tools including manage-token + prune-schema + the tag-schema tools + all three attachment tools", async () => {
+  test("vault:admin sees all 25 (11 tools + 14 aliases) including manage-token + prune-schema + the tag-schema tools + all three attachment tools", async () => {
     const names = await listToolNames(["vault:read", "vault:write", "vault:admin"]);
     expect(names).toContain("manage-token");
     expect(names).toContain("prune-schema");
@@ -8240,10 +8255,12 @@ describe("MCP tools/list scope tiers (vault#376)", () => {
     expect(names).toContain("request-attachment-upload");
     expect(names).toContain("request-attachment-download");
     expect(names).toContain("read-attachment");
-    expect(names.length).toBe(17);
+    expect(names).toContain("manage-types");
+    expect(names).toContain("manage-keys");
+    expect(names.length).toBe(25); // 11 tools + 14 aliases (T-407: the five note-named tools)
   });
 
-  test("legacy-derived full token sees all 17 tools (back-compat)", async () => {
+  test("legacy-derived full token sees all 25 (back-compat)", async () => {
     const { handleScopedMcp } = await import("./mcp-http.ts");
     const { writeVaultConfig } = await import("./config.ts");
     const { closeAllStores } = await import("./vault-store.ts");
@@ -8276,7 +8293,7 @@ describe("MCP tools/list scope tiers (vault#376)", () => {
     } as any);
     const body = await res.json() as any;
     const names: string[] = body.result.tools.map((t: any) => t.name);
-    expect(names.length).toBe(17);
+    expect(names.length).toBe(25); // 11 tools + 14 aliases (T-407: the five note-named tools)
     expect(names).toContain("manage-token");
     expect(names).toContain("prune-schema");
     expect(names).toContain("doctor");
@@ -9118,10 +9135,39 @@ describe("handleVault: audio_retention", async () => {
       store,
       cfg as any,
       () => {},
+      undefined,
+      undefined,
+      undefined,
+      null, // an admin caller: description edits allowed
     );
     expect(res.status).toBe(200);
     expect(cfg.description).toBe("new desc");
     expect(cfg.audio_retention).toBe("until_transcribed");
+  });
+
+  // T-419 (audit L3-01): the handler fails closed. A caller that doesn't say
+  // the token may edit the description gets 403, and nothing in the body is
+  // applied (retention included).
+  test("PATCH with description is refused unless the caller allows it, and applies nothing", async () => {
+    const cfg: { name: string; description?: string; audio_retention?: string } = {
+      name: "default",
+      description: "old",
+      audio_retention: "keep",
+    };
+    let persisted = 0;
+    const res = await handleVault(
+      mkVaultReq("PATCH", { description: null, config: { audio_retention: "never" } }),
+      store,
+      cfg as any,
+      () => { persisted++; },
+    );
+    expect(res.status).toBe(403);
+    const body = await res.json() as any;
+    expect(body.error_type).toBe("insufficient_scope");
+    expect(body.required_scope).toBe("vault:admin");
+    expect(cfg.description).toBe("old");
+    expect(cfg.audio_retention).toBe("keep");
+    expect(persisted).toBe(0);
   });
 
   test("PATCH with empty body is a no-op that still returns current state", async () => {

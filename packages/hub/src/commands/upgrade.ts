@@ -88,8 +88,11 @@ import {
 } from "../service-spec.ts";
 import {
   type ServiceEntry,
+  ServicesManifestError,
+  type ServicesManifest,
   findService,
   readManifest,
+  readManifestUnchanged,
   upsertService,
 } from "../services-manifest.ts";
 import { type LifecycleOpts, restart as lifecycleRestart } from "./lifecycle.ts";
@@ -449,8 +452,9 @@ function hubTarget(): ResolvedTarget {
 async function resolveTargets(
   svc: string | undefined,
   manifestPath: string,
+  read: (path: string) => ServicesManifest = readManifest,
 ): Promise<{ targets: ResolvedTarget[] } | { error: string }> {
-  const manifest = readManifest(manifestPath);
+  const manifest = read(manifestPath);
 
   if (svc !== undefined) {
     if (svc === HUB_SVC) return { targets: [hubTarget()] };
@@ -459,6 +463,10 @@ async function resolveTargets(
       return { error: "No services installed yet. Try: parachute install <service>" };
     }
 
+    // A first-party module is the same module by its short name (`vault`) and by its row's name
+    // (`parachute-vault`): the row name must not slip past the part-of-core guard as a third-party row.
+    const rowShort = getSpec(svc) ? undefined : shortNameForManifest(svc);
+    if (rowShort && getSpec(rowShort)) svc = rowShort;
     const firstPartySpec = getSpec(svc);
     if (firstPartySpec) {
       const entry = manifest.services.find((s) => s.name === firstPartySpec.manifestName);
@@ -932,7 +940,7 @@ async function upgradeOne(target: ResolvedTarget, r: Resolved): Promise<number> 
   // `bun add -g` the 0.7 packages next to it (seen on a fresh 0.8 box: vault 0.7.9 pulled from npm).
   if (coreRoot() && (target.packageName === HUB_PACKAGE || runsBundled(target, r))) {
     r.log(
-      `${target.short}: part of @openparachute/core. Upgrade core itself (re-run the installer, or \`bun add -g @openparachute/core@next\`), then \`parachute restart\`.`,
+      `${target.short}: part of @openparachute/core. Upgrade core itself with \`parachute upgrade\` (it follows this home's channel), then \`parachute restart\`.`,
     );
     return 0;
   }
@@ -956,6 +964,36 @@ async function upgradeOne(target: ResolvedTarget, r: Resolved): Promise<number> 
     return await upgradeLinked(target, sourceDir, r);
   }
   return await upgradeNpm(target, sourceDir, r);
+}
+
+/**
+ * Why `upgrade [svc]` would stop before it upgrades anything (services.json can't be read as this command reads
+ * it, the service isn't one it finds), or null. The same lookup `upgrade` itself makes (resolveTargets), reading
+ * services.json without writing to it: core asks this before it lets any step be taken on the home, so that this
+ * command never refuses its target afterwards (packages/cli/src/upgrade.ts).
+ */
+export async function upgradeTargetProblem(
+  svc: string | undefined,
+  manifestPath: string = SERVICES_MANIFEST_PATH,
+): Promise<string | null> {
+  try {
+    const picked = await resolveTargets(svc, manifestPath, readManifestUnchanged);
+    if ("error" in picked) return picked.error;
+    // One service asked for by name: its install must be there to upgrade (upgradeOne's own two checks). In the
+    // sweep a module without one is reported and passed over, as before.
+    if (svc !== undefined) {
+      const r = resolve({ manifestPath, configDir: dirname(manifestPath) });
+      const target = picked.targets[0]!;
+      if (coreRoot() && (target.packageName === HUB_PACKAGE || runsBundled(target, r))) return null;
+      const dir = resolveSourceDir(target.packageName, r.findGlobalInstall, target.entry.installDir);
+      if (!dir) return `can't locate install dir for ${target.packageName}. Try \`parachute install ${target.short}\` first.`;
+      if (!existsSync(dir)) return `${target.short}: install dir ${dir} does not exist.`;
+    }
+    return null;
+  } catch (err) {
+    if (err instanceof ServicesManifestError) return err.message;
+    throw err;
+  }
 }
 
 /**

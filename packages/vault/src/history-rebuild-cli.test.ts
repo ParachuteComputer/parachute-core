@@ -36,3 +36,33 @@ test("history rebuild-state repairs hints only, without requiring a Git mirror",
     rmSync(taskDir,{recursive:true,force:true});
   }
 });
+
+test("history rebuild-state --check under a steady writer reports no false drift", async () => {
+  const taskDir = mkdtempSync(join(tmpdir(), "history-check-live-"));
+  const saved = process.env.PARACHUTE_HOME;
+  process.env.PARACHUTE_HOME = taskDir;
+  let writer: ReturnType<typeof Bun.spawn> | undefined;
+  try {
+    writeVaultConfig({ name: "live", api_keys: [], created_at: new Date().toISOString() });
+    const db = new Database(vaultDbPath("live"), { create: true });
+    const store = new BunSqliteStore(db);
+    for (let i = 0; i < 300; i++) await store.updateNote((await store.createNote(`note ${i}`)).id, { content: `note ${i} again` });
+    db.close();
+    // The server's part: keep updating notes (each update refreshes its hint row in the same transaction) until killed.
+    const code = `const {Database}=require("bun:sqlite");const {BunSqliteStore}=require(${JSON.stringify(join(import.meta.dir, "../core/src/store.ts"))});
+      const db=new Database(${JSON.stringify(vaultDbPath("live"))});db.exec("PRAGMA busy_timeout=5000");const s=new BunSqliteStore(db);
+      const ids=db.query("SELECT id FROM notes").all().map(r=>r.id);let n=0;console.log("up");
+      while(true){await s.updateNote(ids[n%ids.length],{content:"w"+n++});}`;
+    writer = Bun.spawn({ cmd: [process.execPath, "-e", code], env: { ...process.env, PARACHUTE_HOME: taskDir }, stdout: "pipe", stderr: "pipe" });
+    await writer.stdout.getReader().read(); // wait until it says it is up
+    for (let i = 0; i < 4; i++) {
+      const p = Bun.spawnSync({ cmd: [process.execPath, join(import.meta.dir, "cli.ts"), "history", "rebuild-state", "--vault", "live", "--check", "--json"], env: { ...process.env, PARACHUTE_HOME: taskDir }, stdout: "pipe", stderr: "pipe" });
+      expect(p.exitCode, new TextDecoder().decode(p.stderr)).toBe(0);
+      expect(JSON.parse(new TextDecoder().decode(p.stdout)).drifted_notes).toBe(0);
+    }
+  } finally {
+    writer?.kill();
+    if (saved === undefined) delete process.env.PARACHUTE_HOME; else process.env.PARACHUTE_HOME = saved;
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+}, 60_000);

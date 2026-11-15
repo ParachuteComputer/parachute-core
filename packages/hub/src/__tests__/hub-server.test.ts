@@ -7650,3 +7650,45 @@ describe("hubFetch root /mcp forwarding (vault 0.7.3 canonical root MCP)", () =>
     }
   });
 });
+
+describe("a loopback-only vault is not told apart from a missing one (0.9.3, admin API)", () => {
+  async function ask(path: string, headers: Record<string, string>) {
+    const h = makeHarness();
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "owner", "pw");
+      writeManifest(
+        {
+          services: [
+            { name: "parachute-vault", port: 1, paths: ["/vault/hidden"], health: "/vault/hidden/health", version: "0.1.0", publicExposure: "loopback" },
+          ],
+        },
+        h.manifestPath,
+      );
+      const res = await hubFetch(h.dir, { manifestPath: h.manifestPath, getDb: () => db })(req(path, { headers }));
+      return { status: res.status, headers: [...res.headers.entries()].sort(), body: await res.text() };
+    } finally {
+      db.close();
+      h.cleanup();
+    }
+  }
+  const publicLayer = { "CF-Ray": "abc123" };
+
+  test("the old route answers a hidden vault exactly as a missing one, with no Deprecation", async () => {
+    for (const rest of ["/.parachute/config", "/api/triggers"]) {
+      const hidden = await ask(`/vault/hidden${rest}`, publicLayer);
+      const missing = await ask(`/vault/nothere${rest}`, publicLayer);
+      expect(hidden.status).toBe(404);
+      expect(hidden).toEqual(missing);
+      expect(hidden.headers.some(([k]) => k === "deprecation")).toBe(false);
+    }
+  });
+
+  test("the admin API does the same, whatever Bearer is sent", async () => {
+    const withKey = { ...publicLayer, authorization: "Bearer junk" };
+    const hidden = await ask("/admin/api/vaults/hidden/config", withKey);
+    const missing = await ask("/admin/api/vaults/nothere/config", withKey);
+    expect(hidden.status).toBe(404);
+    expect(hidden).toEqual(missing);
+  });
+});

@@ -7,6 +7,13 @@
 #              namespace; the run must report the hash the build produced (PLAN §7.2). The stock 0.7 build is
 #              there too, as "the old programs".
 #              The child-path build (--process-model child) runs compat/* until the Nov 3 decision deletes one path.
+#              The previous release (0.8, built from its own commit, pins.json previous_core) is there for
+#              lifecycle/upgrade: the 0.8 → 0.9 step on a home and its rollback.
+#   doors      the door contracts (suites/door) on the box this job builds: one suite for every way of running
+#              Parachute. The box's fingerprint must be the one kept in suites/door/golden, which parachute-cloud's
+#              CI compares its own door with. Then the 0.9.2 contracts (suites/v092, red until built) and the 0.9.3 ones (suites/v093: hybrid search, with the bundled
+#              embedding model on and off) on boxes from
+#              the same build, and the move tool's own tests (tools/move).
 #   prism      Benjamin's compatibility suite, unchanged, against the same build (the Nov 9 gate, PLAN §3.1)
 #   npm        the npm package (release/npm.ts) packed from the same build, installed with `npm i -g` and
 #              `bun add -g`, and his suite on the npm install; keeps the linux-x64 tarball and the .tgz as artifacts
@@ -16,14 +23,19 @@
 # Everything is local to the runner: throwaway homes, random ports, no live service.
 name: contracts
 
+# Every job here is meant to be a required check on main and next (branch protection, T-420; release.yml's
+# contracts-green already requires them before npm publish), so none may carry a path filter (a required check that
+# never runs blocks the merge).
 on:
   push:
-    branches: [main]
+    branches: [main, next]
   pull_request:
   workflow_dispatch:
 
 concurrency:
-  group: contracts-${{ github.ref }}
+  # A newer push cancels a stale run on the same PR or on next. On main each commit gets its own group, so nothing
+  # cancels it: release.yml publishes a commit only after that commit's contracts checks have passed.
+  group: contracts-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -42,6 +54,8 @@ jobs:
       - run: bun install --frozen-lockfile
       - name: every dependency in range, and every version the moved repos locked kept (or a listed departure)
         run: bun scripts/check-dependency-tree.ts . packages/vault/bun.lock packages/hub/bun.lock
+      - name: the agent-facing docs (AGENTS.md, CLAUDE.md, PROCESS.md) name only paths that exist
+        run: bun scripts/check-doc-paths.ts
       - name: typecheck (cli, vault, hub)
         run: |
           bun run --cwd packages/cli typecheck
@@ -125,12 +139,16 @@ jobs:
         name: build the old programs (stock 0.7 from the pins, for takeover, identity and rollback)
         id: stock
         run: bun run build:stock
+      - name: build the previous release (0.8, pins.json previous_core) for lifecycle/upgrade
+        id: previous
+        run: bun run build:previous --out "$RUNNER_TEMP/previous"
       - name: the contracts, against exactly that build
         env:
           CANDIDATE_DIR: ${{ steps.unpack.outputs.dir }}
           CANDIDATE_TARBALL: ${{ steps.build.outputs.tarball }}
           CANDIDATE_SHA256: ${{ steps.build.outputs.sha256 }}
           OLD_STOCK_SHA256: ${{ steps.stock.outputs.sha256 }}
+          PREVIOUS_CORE_DIR: ${{ steps.previous.outputs.dir }}
         run: bun run candidate -- --v1 2>&1 | tee "$RUNNER_TEMP/candidate.log"; test "${PIPESTATUS[0]}" -eq 0
         shell: bash
       - name: the run reported the hash this job built, before and after
@@ -144,6 +162,55 @@ jobs:
         run: |
           bun run build:core --out "$RUNNER_TEMP/candidate-child" --process-model child --no-pack
           CANDIDATE_DIR="$RUNNER_TEMP/candidate-child" bun run candidate -- suites/compat
+
+  doors:
+    name: the door contracts on the box (against the kept fingerprint) and the move tool's tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - *sandbox
+      - run: bun install --frozen-lockfile
+      - name: build the candidate (the box these contracts run on)
+        run: bun run build:core --out "$RUNNER_TEMP/build/candidate" --no-pack
+      - name: the door contracts on the box; its fingerprint must be the one kept in suites/door/golden
+        env:
+          CANDIDATE_DIR: ${{ runner.temp }}/build/candidate
+          DOOR_RESULTS: ${{ runner.temp }}/doors
+        run: bun run doors -- --doors box --check-golden
+      - name: the 0.9.2 contracts on a box from the same build (suites/v092; each red() until its lane lands)
+        env:
+          CANDIDATE_DIR: ${{ runner.temp }}/build/candidate
+          DOOR_RESULTS: ${{ runner.temp }}/doors-v092
+        run: bun run doors -- --doors box suites/v092
+      - name: the 0.9.3 hybrid search contracts, with meaning search on (suites/v093; the bundled embedding model, nothing faked)
+        env:
+          CANDIDATE_DIR: ${{ runner.temp }}/build/candidate
+          DOOR_RESULTS: ${{ runner.temp }}/doors-v093-on
+        run: bun run doors -- --doors box --embeddings suites/v093
+      - name: the 0.9.3 hybrid search contracts, with no embedding provider (the box's default)
+        env:
+          CANDIDATE_DIR: ${{ runner.temp }}/build/candidate
+          DOOR_RESULTS: ${{ runner.temp }}/doors-v093-off
+        run: bun run doors -- --doors box suites/v093
+      - name: the 1.0 grant contracts on the same box (suites/door-v1; each red() for its stated reason)
+        env:
+          CANDIDATE_DIR: ${{ runner.temp }}/build/candidate
+          DOOR_RESULTS: ${{ runner.temp }}/doors-v1
+        run: bun run doors -- --doors box suites/door-v1
+      - name: what failed (the box's output and the comparison)
+        if: failure()
+        shell: bash
+        run: tail -n 120 "$RUNNER_TEMP"/doors/*/output.txt "$RUNNER_TEMP"/doors-v092/*/output.txt "$RUNNER_TEMP"/doors-v093-on/*/output.txt "$RUNNER_TEMP"/doors-v093-off/*/output.txt "$RUNNER_TEMP"/doors-v1/*/output.txt || true
+      - name: the move tool (tar, digest, what a comparison may excuse)
+        working-directory: tools/move
+        run: bun install --frozen-lockfile && bun run typecheck && bun test
 
   prism:
     name: Benjamin's compatibility suite on the candidate build
@@ -251,6 +318,8 @@ jobs:
       - *repos
       - run: bun install --frozen-lockfile
       - *stock
+      - name: build the previous release (0.8) where the suites look for it; lifecycle/upgrade's mutants run on it
+        run: bun run build:previous
       - name: each mutant caught, each flip flipped
         env:
           OLD_STOCK_SHA256: ${{ steps.stock.outputs.sha256 }}

@@ -68,7 +68,8 @@
  * - Top-level frontmatter keys emitted in fixed order (above).
  * - Nested object keys alpha-sorted.
  * - Booleans `true`/`false`; numbers as-is; strings bare unless they
- *   contain YAML-meaningful characters, then single-quoted.
+ *   contain YAML-meaningful characters, then single-quoted. A list item with
+ *   a colon anywhere is always quoted.
  * - Trailing newline after closing `---`.
  *
  * Pin: vault → export → re-export → byte-identical bytes.
@@ -76,11 +77,12 @@
  * See vault#308.
  */
 
-import { readdirSync, readFileSync, realpathSync, statSync, mkdirSync, writeFileSync, copyFileSync, existsSync, rmSync, openSync, readSync, closeSync } from "fs";
+import { readdirSync, readFileSync, realpathSync, statSync, lstatSync, mkdirSync, writeFileSync, copyFileSync, existsSync, rmSync, openSync, readSync, closeSync } from "fs";
 import { basename, join, relative, extname, dirname, posix, resolve as resolvePath, sep as pathSep } from "path";
 import type { Store, Note, Link, Attachment } from "./types.js";
 import type { TagRecord } from "./tag-schemas.js";
 import { ParentCycleError } from "./tag-schemas.js";
+import { IndexedFieldLimitError, pruneOrphanedIndexedFields } from "./indexed-fields.js";
 import { transactionAsync } from "./txn.js";
 import { timestampToMs } from "./cursor.js";
 import { computeDisplayTitle } from "./display-title.js";
@@ -91,6 +93,11 @@ import { computeDisplayTitle } from "./display-title.js";
 
 /** Bumped if/when the export format makes a backward-incompatible change. */
 export const EXPORT_FORMAT_VERSION = 1;
+
+/** The export formats this program writes (`--format`): 1 is the default; 2 is the opt-in flat-fields layout. The
+ *  importer reads both. */
+export type ExportFormat = 1 | 2;
+export const READABLE_FORMATS: readonly number[] = [1, 2];
 
 /** Sidecar directory name. Dot-prefixed so it matches Obsidian's `.obsidian/`
  *  convention — directory walkers that skip dot-dirs (including our own
@@ -331,6 +338,29 @@ function quoteString(s: string): string {
   return `'${s.replace(/'/g, "''")}'`;
 }
 
+/**
+ * A scalar as a list item. `- https://x` is a string in YAML, but this module's
+ * parser read `- key:value` as an object until T-395, and importers from before
+ * then are still out there, so an item with a colon anywhere is quoted (also
+ * `- ends:`, a key with no value in any YAML). Only list items: a colon in a
+ * `key: value` scalar was always safe, and quoting those would rewrite every
+ * timestamp and URL in every existing export and git mirror.
+ */
+function emitListItem(value: unknown): string {
+  return typeof value === "string" && value.includes(":") ? quoteString(value) : emitScalar(value);
+}
+
+/**
+ * A mapping key as written. A plain word (`[\w][\w.-]*`) goes out bare, as it
+ * always has; any other key (`it's`, `@at`, `#hash`, `[x]`, `-dash`, `a: b`,
+ * a space, a non-ASCII letter) is quoted, or the reader would skip the line or
+ * read the key as YAML syntax (#75).
+ */
+function emitKey(key: string): string {
+  return PLAIN_KEY.test(key) ? key : quoteString(key);
+}
+const PLAIN_KEY = /^[\w][\w.-]*$/;
+
 function emitScalar(value: unknown): string {
   if (value === null) return "null";
   if (value === undefined) return "null";
@@ -355,12 +385,12 @@ function emitObject(obj: Record<string, unknown>, indent: number): string {
   const pad = "  ".repeat(indent);
   const lines: string[] = [];
   for (const key of keys) {
-    lines.push(`${pad}${key}: ${emitValueInline(obj[key], indent + 1) ?? ""}`);
+    lines.push(`${pad}${emitKey(key)}: ${emitValueInline(obj[key], indent + 1) ?? ""}`);
     const block = emitValueBlock(obj[key], indent + 1);
     if (block !== null) {
       // Block form was used — replace the inline placeholder above with the
       // block form. Done by overwriting the last pushed line with key: only.
-      lines[lines.length - 1] = `${pad}${key}:`;
+      lines[lines.length - 1] = `${pad}${emitKey(key)}:`;
       lines.push(block);
     }
   }
@@ -395,7 +425,7 @@ function emitValueBlock(value: unknown, indent: number): string | null {
     for (const item of value) {
       if (item === null || typeof item !== "object" || Array.isArray(item)) {
         // Scalar / array item — single line with `- `.
-        lines.push(`${pad}- ${emitScalar(item)}`);
+        lines.push(`${pad}- ${emitListItem(item)}`);
       } else {
         // Object item: emit keys with `- ` prefix on the first key, hanging
         // indent for the rest. Alpha-sort keys for idempotency.
@@ -406,9 +436,9 @@ function emitValueBlock(value: unknown, indent: number): string | null {
           const prefix = first ? `${pad}- ` : `${pad}  `;
           const inline = emitValueInline(obj[key], indent + 2);
           if (inline !== null) {
-            lines.push(`${prefix}${key}: ${inline}`);
+            lines.push(`${prefix}${emitKey(key)}: ${inline}`);
           } else {
-            lines.push(`${prefix}${key}:`);
+            lines.push(`${prefix}${emitKey(key)}:`);
             const block = emitValueBlock(obj[key], indent + 2);
             if (block !== null) lines.push(block);
           }
@@ -431,6 +461,163 @@ function emitValueBlock(value: unknown, indent: number): string | null {
  */
 export function emitYamlDoc(obj: Record<string, unknown>): string {
   return emitObject(obj, 0) + "\n";
+}
+
+// ---------------------------------------------------------------------------
+// Format 2 emitter and frontmatter shape (T-463, 0.9.3)
+// ---------------------------------------------------------------------------
+
+/**
+ * Format 2 puts a record's fields flat at the top of the frontmatter (Obsidian reads them as properties), `tags:` as a
+ * plain list of names, and everything Parachute keeps for itself (id, path, extension, links, attachments, the two
+ * timestamps) in one `parachute:` block. Two top-level names are therefore taken: `tags` and `parachute`. A record
+ * field with either name, with any number of `_` in front, is written with one more `_`, and read back with one less,
+ * so a field can never be taken for a reserved key and every field name round-trips.
+ */
+const V2_TAGS_KEY = "tags";
+const V2_BLOCK_KEY = "parachute";
+const V2_RESERVED_FIELD = /^_*(?:tags|parachute)$/;
+const V2_ESCAPED_FIELD = /^_+(?:tags|parachute)$/;
+
+/** A record field's name as written at the top level of a format 2 file. */
+export function v2FieldKey(field: string): string {
+  return V2_RESERVED_FIELD.test(field) ? `_${field}` : field;
+}
+
+/** The record field a top-level key of a format 2 file stands for. */
+export function v2FieldFromKey(key: string): string {
+  return V2_ESCAPED_FIELD.test(key) ? key.slice(1) : key;
+}
+
+/** What a YAML double-quoted string has to escape: controls, DEL and the C1 controls (NEL included), the Unicode line
+ *  and paragraph separators, the byte-order mark, the two non-characters and lone surrogates. */
+// eslint-disable-next-line no-control-regex
+const V2_ESCAPED_CHARS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\ufeff\ufffe\uffff]|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g;
+
+function v2Escape(ch: string): string {
+  switch (ch) {
+    case "\n": return "\\n";
+    case "\r": return "\\r";
+    case "\t": return "\\t";
+  }
+  const code = ch.charCodeAt(0);
+  return code < 0x100 ? `\\x${code.toString(16).padStart(2, "0")}` : `\\u${code.toString(16).padStart(4, "0")}`;
+}
+
+/** Plain-scalar words that YAML 1.1 or 1.2 readers take for something other than a string. */
+const V2_WORDS = /^(?:true|false|yes|no|on|off|y|n|null|~)$/i;
+/** Numbers in YAML 1.1 and 1.2: decimal, float, exponent, hex, octal, inf, nan, and `_` digit groups. */
+const V2_NUMBERS = /^(?:[-+]?(?:\.\d+|\d[\d_]*(?:\.[\d_]*)?)(?:[eE][-+]?\d+)?|[-+]?0[xX][0-9a-fA-F_]+|[-+]?0[oO]?[0-7_]+|[-+]?0[bB][01_]+|[-+]?\d+(?::[0-5]?\d)+(?:\.\d*)?|[-+]?\.(?:inf|Inf|INF)|\.(?:nan|NaN|NAN))$/;
+
+function v2NeedsQuote(s: string): boolean {
+  if (s === "" || s !== s.trim()) return true;
+  if (V2_WORDS.test(s) || V2_NUMBERS.test(s)) return true;
+  if (/^[-?:,[\]{}#&*!|>'"%@`]/.test(s)) return true;
+  if (s.includes(": ") || s.includes(" #") || s.endsWith(":")) return true;
+  // `<<` is YAML 1.1's merge key, `=` its value key.
+  return s === "<<" || s === "=";
+}
+
+/** A string as one YAML scalar: plain when every reader reads it back as that string, else single-quoted, or
+ *  double-quoted with escapes when it holds a character a single-quoted scalar cannot carry. */
+function v2String(s: string, forceQuote = false): string {
+  if (new RegExp(V2_ESCAPED_CHARS.source).test(s)) {
+    return `"${s.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(V2_ESCAPED_CHARS, v2Escape)}"`;
+  }
+  return forceQuote || v2NeedsQuote(s) ? `'${s.replace(/'/g, "''")}'` : s;
+}
+
+function v2Scalar(value: unknown): string {
+  if (value === null || value === undefined) return "null";
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (typeof value === "number") return Number.isFinite(value) ? String(value) : "null";
+  return v2String(String(value));
+}
+
+/** A mapping key: a plain word as it is, anything else quoted (our reader, like YAML, reads a quoted key as the string). */
+function v2Key(key: string): string {
+  return v2String(key, !(PLAIN_KEY.test(key) && !V2_WORDS.test(key) && !V2_NUMBERS.test(key)));
+}
+
+/** One value on one line: a scalar or an empty `[]` / `{}`; null when it needs a block. */
+function v2Inline(value: unknown): string | null {
+  if (Array.isArray(value)) return value.length === 0 ? "[]" : null;
+  if (value && typeof value === "object") return Object.keys(value as object).length === 0 ? "{}" : null;
+  return v2Scalar(value);
+}
+
+/**
+ * A mapping or sequence as block YAML at `pad` spaces: keys sorted, a list in a list as `- - a`, an object in a list
+ * as `- k: v`, `[]` and `{}` where a collection is empty. Standard YAML 1.2, so any reader takes it.
+ */
+function v2Block(value: unknown, pad: number): string[] {
+  const sp = " ".repeat(pad);
+  const out: string[] = [];
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const inline = v2Inline(item);
+      if (inline !== null) {
+        out.push(`${sp}- ${inline}`);
+        continue;
+      }
+      const sub = v2Block(item, pad + 2);
+      out.push(`${sp}- ${sub[0]!.slice(pad + 2)}`, ...sub.slice(1));
+    }
+    return out;
+  }
+  const obj = value as Record<string, unknown>;
+  for (const key of Object.keys(obj).sort()) {
+    const inline = v2Inline(obj[key]);
+    if (inline !== null) out.push(`${sp}${v2Key(key)}: ${inline}`);
+    else out.push(`${sp}${v2Key(key)}:`, ...v2Block(obj[key], pad + 2));
+  }
+  return out;
+}
+
+/** Top-level `key: value` lines in the order given. */
+function v2Lines(entries: Array<[string, unknown]>): string {
+  let out = "";
+  for (const [key, value] of entries) {
+    const inline = v2Inline(value);
+    out += inline !== null ? `${v2Key(key)}: ${inline}\n` : `${v2Key(key)}:\n${v2Block(value, 2).join("\n")}\n`;
+  }
+  return out;
+}
+
+/** A note's format 2 frontmatter, without the `---` fences. A sidecar (`alwaysExtension`) always names its extension. */
+function emitFrontmatterV2(note: PortableNote, alwaysExtension: boolean): string {
+  const entries: Array<[string, unknown]> = [];
+  const fields = note.metadata ?? {};
+  const keyed = Object.keys(fields).map((field) => [v2FieldKey(field), field] as const).sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  for (const [key, field] of keyed) entries.push([key, fields[field]]);
+  if (note.tags && note.tags.length > 0) entries.push([V2_TAGS_KEY, [...note.tags].sort()]);
+  const own: Record<string, unknown> = { id: note.id, created_at: note.created_at };
+  if (note.path) own.path = note.path;
+  if (alwaysExtension || (note.extension && note.extension !== "md")) own.extension = note.extension ?? "md";
+  if (note.links && note.links.length > 0) own.links = note.links;
+  if (note.attachments && note.attachments.length > 0) own.attachments = note.attachments;
+  if (note.updated_at) own.updated_at = note.updated_at;
+  entries.push([V2_BLOCK_KEY, own]);
+  return v2Lines(entries);
+}
+
+/**
+ * A format 2 frontmatter object in the format 1 shape the importer works from: the `parachute:` block's keys at the
+ * top, `tags` as they are, every other key a record field (a reserved name un-escaped) under `metadata`.
+ */
+function decodeFrontmatterV2(fm: Record<string, unknown>): Record<string, unknown> {
+  const block = fm[V2_BLOCK_KEY];
+  const own = block && typeof block === "object" && !Array.isArray(block) ? block as Record<string, unknown> : {};
+  const metadata: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(fm)) {
+    if (key === V2_TAGS_KEY || key === V2_BLOCK_KEY) continue;
+    metadata[v2FieldFromKey(key)] = value;
+  }
+  return {
+    ...own,
+    ...(fm[V2_TAGS_KEY] !== undefined ? { tags: fm[V2_TAGS_KEY] } : {}),
+    ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -502,7 +689,7 @@ function emitFrontmatterKeys(fm: Record<string, unknown>): string {
  * trailing-newline normalization (re-emit invariant) should add it
  * outside this function.
  */
-export function toPortableMarkdown(note: PortableNote): string {
+export function toPortableMarkdown(note: PortableNote, format: ExportFormat = 1): string {
   const ext = note.extension ?? "md";
   if (!supportsInlineFrontmatter(ext)) {
     // Sidecar-required: content goes out as-is. No frontmatter, no
@@ -510,9 +697,8 @@ export function toPortableMarkdown(note: PortableNote): string {
     // stored as `content`.
     return note.content;
   }
-  const fm = buildFrontmatter(note);
   let out = "---\n";
-  out += emitFrontmatterKeys(fm);
+  out += format === 2 ? emitFrontmatterV2(note, false) : emitFrontmatterKeys(buildFrontmatter(note));
   out += "---\n";
   // Preserve content as-is; ensure exactly one trailing newline if missing.
   out += note.content;
@@ -532,7 +718,8 @@ export function toPortableMarkdown(note: PortableNote): string {
  * which omits it for `md` to keep legacy diffs clean) — the sidecar is
  * a new artifact, the omit-default optimization buys nothing.
  */
-export function toSidecarYaml(note: PortableNote): string {
+export function toSidecarYaml(note: PortableNote, format: ExportFormat = 1): string {
+  if (format === 2) return emitFrontmatterV2(note, true);
   // Build a "full" frontmatter — same as buildFrontmatter, but always
   // emit the extension. The sidecar's purpose is exactly to record
   // the extension that's not in the filename.
@@ -904,6 +1091,8 @@ export interface ExportOptions {
    * would block the operator's actual work.
    */
   failOnCaseCollision?: boolean;
+  /** Export format (default 1). 2 is the flat-fields layout; see {@link ExportFormat}. A whole-vault export only. */
+  format?: ExportFormat;
 }
 
 /**
@@ -1153,9 +1342,14 @@ function frontmatterId(file: string): unknown {
   } finally {
     closeSync(fd);
   }
-  const fromHead = parseFrontmatter(head.subarray(0, read).toString("utf-8")).frontmatter.id;
+  // A format 2 file keeps the note's id under `parachute:`; a top-level `id` there is a record field.
+  const idOf = (fm: Record<string, unknown>): unknown => {
+    const own = fm[V2_BLOCK_KEY];
+    return own && typeof own === "object" && !Array.isArray(own) && "id" in own ? (own as Record<string, unknown>).id : fm.id;
+  };
+  const fromHead = idOf(parseFrontmatter(head.subarray(0, read).toString("utf-8")).frontmatter);
   if (fromHead !== undefined || read < head.length) return fromHead;
-  return parseFrontmatter(readFileSync(file, "utf-8")).frontmatter.id;
+  return idOf(parseFrontmatter(readFileSync(file, "utf-8")).frontmatter);
 }
 
 /** Note-iteration batch size for the export walk — bounds the working set so
@@ -1185,6 +1379,59 @@ async function* iterateAllNotes(store: Store): AsyncGenerator<Note> {
   }
 }
 
+/** A file-name stem from a path's last segment: unsafe characters become spaces, dots and spaces are trimmed at the
+ *  ends, Windows device names are escaped, and a long name is cut. Empty when nothing is left. */
+function safeFileStem(raw: string): string {
+  const clean = (t: string) => t.replace(/\s+/g, " ").replace(/^[\s.]+/, "").replace(/[\s.]+$/, "");
+  let stem = clean(raw.normalize("NFC").replace(UNSAFE_NAME_CHARS, " "));
+  let cut = "";
+  for (const ch of stem) {
+    if (Buffer.byteLength(cut + ch) > UNPATHED_STEM_MAX_BYTES) break;
+    cut += ch;
+  }
+  stem = clean(cut);
+  return stem === "" ? "" : stem.replace(WINDOWS_RESERVED_NAME, "$1_$2");
+}
+
+/**
+ * Format 2's file for each body-less typed markdown record: `<type>/<YYYY-MM>/<name>.md`, the type its first type (a
+ * type named `a/b` is the folder `a/b`), the month its `created_at`, the name its path's last segment (its id when it
+ * has no path). The record's own path rides in `parachute.path`, so the folder is only a place to look. A name another
+ * note's file holds gets ` 2`, ` 3`… Every other note keeps the place format 1 gives it. Whole-vault: the claim is
+ * made over every note, in `(created_at, id)` order, so two runs name a file the same.
+ */
+async function planFormat2Layout(store: Store): Promise<Map<string, string>> {
+  const held = new Set<string>();
+  // Only what the claim needs is kept, not the notes: a vault of records is mostly body-less.
+  const moving: Array<{ id: string; type: string; createdAt: string; path?: string; ext: string }> = [];
+  for await (const note of iterateAllNotes(store)) {
+    const ext = note.extension ?? "md";
+    if (supportsInlineFrontmatter(ext) && note.content.trim() === "" && (note.types?.[0] ?? "") !== "") {
+      moving.push({ id: note.id, type: [...note.types!].sort()[0]!, createdAt: note.createdAt, path: note.path, ext });
+    } else if (note.path) held.add(fileNameKey(`${note.path}.${ext}`));
+  }
+  const out = new Map<string, string>();
+  // Per wanted name, the next number to try: records that share a name cost one probe each, not one per record before them.
+  const nextTry = new Map<string, number>();
+  for (const note of moving) {
+    const type = note.type.split("/").map(safeFileStem).filter((p) => p !== "").join("/") || "untyped";
+    const month = /^\d{4}-\d{2}/.test(note.createdAt) ? note.createdAt.slice(0, 7) : "undated";
+    const stem = (note.path ? safeFileStem(note.path.split("/").pop()!) : "") || note.id;
+    const base = `${type}/${month}/${stem}`;
+    const baseKey = fileNameKey(`${base}.${note.ext}`);
+    let n = nextTry.get(baseKey) ?? 1;
+    let rel: string;
+    do {
+      rel = `${n === 1 ? base : `${base} ${n}`}.${note.ext}`;
+      n++;
+    } while (held.has(fileNameKey(rel)));
+    nextTry.set(baseKey, n);
+    held.add(fileNameKey(rel));
+    out.set(note.id, rel);
+  }
+  return out;
+}
+
 /** Engine-level export options — the subset of `ExportOptions` that isn't
  *  fs-sink-specific (`outDir`/`assetsDir`/`caseSensitiveOverride` are owned
  *  by `FsExportSink`). */
@@ -1194,6 +1441,7 @@ export interface ExportEngineOptions {
   since?: string;
   exportedAt?: string;
   failOnCaseCollision?: boolean;
+  format?: ExportFormat;
 }
 
 /**
@@ -1208,12 +1456,21 @@ export async function exportVault(
   sink: ExportSink,
   opts: ExportEngineOptions = {},
 ): Promise<ExportStats> {
+  const format: ExportFormat = opts.format ?? 1;
+  if (format !== 1 && format !== 2) {
+    throw new Error(`export format ${String(format)} is not one this program writes (1 or 2)`);
+  }
+  if (format === 2 && opts.since) {
+    throw new Error("export format 2 is a whole vault export: a moved record's old file would stay behind, so --since is not offered");
+  }
+  const layout = format === 2 ? await planFormat2Layout(store) : new Map<string, string>();
+
   // 1. vault.yaml — vault meta + export format version. Trailing
   // export-time timestamp is the one place where re-exports legitimately
   // produce different bytes; callers wanting byte-equiv re-export pass
   // `exportedAt` explicitly (tests do).
   const vaultMeta: PortableVaultMeta = {
-    export_format_version: EXPORT_FORMAT_VERSION,
+    export_format_version: format,
     exported_at: opts.exportedAt ?? new Date().toISOString(),
     ...(opts.vaultName ? { name: opts.vaultName } : {}),
     ...(opts.vaultDescription ? { description: opts.vaultDescription } : {}),
@@ -1242,9 +1499,10 @@ export async function exportVault(
   // definition from the backup — so a write failure here also fails loudly
   // (and never increments `schemasWritten` on a failed write).
   const tagRecords = await store.listTagRecords();
+  const recordedTypes = await store.recordedTypeNames();
   let schemasWritten = 0;
   for (const tag of tagRecords) {
-    if (!hasSchemaContent(tag)) continue;
+    if (!writesSchemaSidecar(tag, recordedTypes)) continue;
     const filename = sanitizeTagFilename(tag.tag) + ".yaml";
     const doc: Record<string, unknown> = { name: tag.tag };
     if (tag.description !== undefined) doc.description = tag.description;
@@ -1253,6 +1511,7 @@ export async function exportVault(
     if (tag.parent_names !== undefined && tag.parent_names.length > 0) {
       doc.parent_names = tag.parent_names;
     }
+    if (isBareType(tag, recordedTypes)) doc.kind = "type";
     const schemaPath = join(SIDECAR_DIR, "schemas", filename);
     const schemaWrite = sink.writeText(schemaPath, emitYamlDoc(doc));
     if (!schemaWrite.ok) {
@@ -1302,7 +1561,7 @@ export async function exportVault(
     const groups = new Map<string, Array<{ note_id: string; path: string; extension: string }>>();
     for await (const note of iterateAllNotes(store)) {
       const portable = await noteToPortable(note, store);
-      if (!portable.path) continue; // UnpathedNames never folds two pathless notes into one name
+      if (!portable.path || layout.has(portable.id)) continue; // UnpathedNames never folds two pathless notes into one name
       const ext = portable.extension ?? "md";
       const key = `${portable.path.toLowerCase()}|${ext.toLowerCase()}`;
       const entry = { note_id: portable.id, path: portable.path, extension: ext };
@@ -1332,16 +1591,16 @@ export async function exportVault(
   const exportNote = async (note: Note): Promise<void> => {
     exportedIds.add(note.id);
     const portable = await noteToPortable(note, store);
-    let relPath = !portable.path && supportsInlineFrontmatter(portable.extension ?? "md")
+    let relPath = layout.get(portable.id) ?? (!portable.path && supportsInlineFrontmatter(portable.extension ?? "md")
       ? unpathedNames.claim(portable)
-      : portableExportFilePath(portable);
+      : portableExportFilePath(portable));
 
     // Decide whether this note's filename needs disambiguation (vault#327).
     // Only meaningful when the sink is case-insensitive AND a prior note's
     // (path, ext) tuple already claimed the same lowercased filename slot.
     // Pathless notes are immune: `UnpathedNames` compares names without
     // letter case on every sink.
-    if (!caseSensitive && portable.path) {
+    if (!caseSensitive && portable.path && !layout.has(portable.id)) {
       const ext = portable.extension ?? "md";
       const key = `${portable.path.toLowerCase()}|${ext.toLowerCase()}`;
       const prior = seenLowerKeys.get(key);
@@ -1400,7 +1659,7 @@ export async function exportVault(
     // vault#317 F3 — path-traversal guard now lives in the sink: a note with
     // `path: "../../.ssh/authorized_keys"` is refused (not written off-tree)
     // and surfaced in `skipped_notes` so the operator can fix the note.
-    const noteWrite = sink.writeText(relPath, toPortableMarkdown(exportedNote));
+    const noteWrite = sink.writeText(relPath, toPortableMarkdown(exportedNote, format));
     if (!noteWrite.ok) {
       skipped.push({ path: portable.path, reason: noteWrite.reason });
       return;
@@ -1426,7 +1685,7 @@ export async function exportVault(
     if (!supportsInlineFrontmatter(portableExt)) {
       const sidecarWrite = sink.writeText(
         join(SIDECAR_DIR, NOTES_META_DIR, `${portable.id}.yaml`),
-        toSidecarYaml(portable),
+        toSidecarYaml(portable, format),
       );
       if (!sidecarWrite.ok) {
         skipped.push({ path: portable.path, reason: sidecarWrite.reason });
@@ -1499,6 +1758,13 @@ export async function exportVaultToDir(
   store: Store,
   opts: ExportOptions,
 ): Promise<ExportStats> {
+  if (opts.format === 2 && existsSync(join(opts.outDir, SIDECAR_DIR, "vault.yaml"))) {
+    // A record that gains a body, or changes type, moves to another file; the old one would stay and import first.
+    throw new Error(
+      `${opts.outDir} already holds an export. A format 2 export goes into an empty folder, so no file of an earlier ` +
+      `one is left behind to be read as the note's current state.`,
+    );
+  }
   const sink = new FsExportSink({
     outDir: opts.outDir,
     assetsDir: opts.assetsDir,
@@ -1510,6 +1776,7 @@ export async function exportVaultToDir(
     since: opts.since,
     exportedAt: opts.exportedAt,
     failOnCaseCollision: opts.failOnCaseCollision,
+    format: opts.format,
   });
 }
 
@@ -1890,6 +2157,31 @@ export function hasSchemaContent(tag: TagRecord): boolean {
 }
 
 /**
+ * A type (T-318 §8a) that only `tags.kind` records: recorded `type`
+ * (`recordedTypes`, from `store.recordedTypeNames()`), with no fields and no
+ * parents of its own. Import re-derives a type from the sidecar's fields and
+ * parent_names; this one would come back as a plain tag, so its sidecar says
+ * `kind: type`. Being another tag's parent doesn't count either way: it is read
+ * live, never recorded, so a parent nobody promoted gets no `kind`, and a
+ * promoted one keeps it when its last child goes, as in the live vault. Older
+ * importers read only the keys they know and ignore it.
+ */
+export function isBareType(tag: TagRecord, recordedTypes: ReadonlySet<string>): boolean {
+  if (!recordedTypes.has(tag.tag)) return false;
+  if (tag.fields && Object.keys(tag.fields).length > 0) return false;
+  return !(tag.parent_names && tag.parent_names.length > 0);
+}
+
+/**
+ * True iff the export writer emits a schema sidecar for this tag: schema
+ * content, or a type only `kind` records. The keep-list for `pruneOrphans`
+ * must use this, or a mirror prunes the bare type's sidecar on every run.
+ */
+export function writesSchemaSidecar(tag: TagRecord, recordedTypes: ReadonlySet<string>): boolean {
+  return hasSchemaContent(tag) || isBareType(tag, recordedTypes);
+}
+
+/**
  * Tag names may contain `/` (sub-tag hierarchy). Replace with `__` for the
  * filename so the sidecar stays flat: `.parachute/schemas/<safe>.yaml`.
  * Round-trip on import recovers the `/` form from the `name:` key inside
@@ -2088,6 +2380,13 @@ export interface ImportStats {
    */
   skipped_schema_parents: Array<{ tag: string; parent_names: string[]; reason: string }>;
   /**
+   * Fields restored WITHOUT their index because the vault reached
+   * `INDEXED_FIELD_LIMIT` (0.9.2). The field, its declaration and every
+   * value land; only `indexed` is turned off, so the import completes.
+   * Empty unless the export came from a vault over the limit.
+   */
+  unindexed_schema_fields: Array<{ tag: string; field: string; reason: string }>;
+  /**
    * Content files skipped because their frontmatter `id` couldn't be used as
    * a note key (vault#589 / FIX 3): a DUPLICATE id (a later file shares an id
    * with one already imported — the first wins, deterministically, since
@@ -2125,8 +2424,8 @@ export interface ImportStats {
 export interface ImportSource {
   /** `*.yaml` schema docs under `.parachute/schemas/` (name + raw text). */
   readSchemaFiles(): Array<{ name: string; text: string }>;
-  /** Raw text of each `*.yaml` sidecar under `.parachute/notes-meta/`. */
-  readNotesMetaFiles(): string[];
+  /** Each `*.yaml` sidecar under `.parachute/notes-meta/` (file name + raw text); the name is for warnings. */
+  readNotesMetaFiles(): Array<{ name: string; text: string }>;
   /** Content files as export-root-relative POSIX paths (sorted, dot-dirs
    *  excluded, containment-guarded). */
   listContentFiles(): string[];
@@ -2143,70 +2442,90 @@ export interface ImportSource {
 
 /**
  * Filesystem `ImportSource` — reads an `exportVaultToDir` output directory.
- * Owns the read-side path-traversal guards (refuse to follow a symlink out
- * of the sidecar, refuse an attachment whose source escapes the attachments
- * root or whose dest escapes assetsDir) so the engine consumes clean data.
+ * Owns the read-side path-traversal guards so the engine consumes clean data.
+ *
+ * The export dir may be a git clone of someone else's repo (mirror import),
+ * and a repo can carry symlinks. `path.resolve` doesn't follow links, so a
+ * link pointing out of the clone (`note.md -> ~/.ssh/id_ed25519`, a folder
+ * link, a sidecar or attachment link) passed the old check and pulled a
+ * server file into a note body or the vault's assets (T-419, audit L3-02).
+ * Every read now goes through {@link FsImportSource.fileIn}: the file's REAL
+ * path (`realpathSync`, every link resolved) must be a regular file inside
+ * the folder it belongs to (the export root for content,
+ * `.parachute/attachments` for an attachment, the sidecar folder for a
+ * sidecar), separator-aware, and that folder must be at its own place with no
+ * link on the way to it. Per folder, not just "in the clone": the clone holds
+ * `.git/config`, and that carries the clone URL with any stored token in it
+ * (mirror import also deletes the clone's `.git` before importing). The
+ * content walk also doesn't step into linked folders at all.
  */
 export class FsImportSource implements ImportSource {
   readonly attachmentsEnabled: boolean;
   private readonly inDir: string;
-  private readonly inDirResolved: string;
+  private readonly inDirReal: string;
   private readonly sidecar: string;
   private readonly assetsDirResolved?: string;
 
   constructor(opts: { inDir: string; assetsDir?: string }) {
     this.inDir = opts.inDir;
-    this.inDirResolved = resolvePath(opts.inDir);
+    // The root itself may sit under a link (macOS `/tmp` → `/private/tmp`).
+    this.inDirReal = realpathSync(opts.inDir);
     this.sidecar = join(opts.inDir, SIDECAR_DIR);
     if (opts.assetsDir) this.assetsDirResolved = resolvePath(opts.assetsDir);
     this.attachmentsEnabled = !!opts.assetsDir;
   }
 
-  readSchemaFiles(): Array<{ name: string; text: string }> {
-    const dir = join(this.sidecar, "schemas");
+  /** The real path of `path` when it is a regular file inside `dir`, after
+   *  resolving every symlink on the way; else `null`. `dir` (one of the
+   *  export's own folders) must really be where it is named, not a link to
+   *  some other folder of the clone (`.parachute/attachments -> ..` would let
+   *  an attachment id name `.git`). */
+  private fileIn(path: string, dir: string): string | null {
+    let real: string;
+    let dirReal: string;
+    try {
+      dirReal = realpathSync(dir);
+      real = realpathSync(path);
+      if (!statSync(real).isFile()) return null;
+    } catch {
+      return null;
+    }
+    if (dirReal !== join(this.inDirReal, relative(this.inDir, dir))) return null;
+    return isWithinDir(real, dirReal) ? real : null;
+  }
+
+  private readSidecarYamls(dir: string): Array<{ name: string; text: string }> {
     if (!existsSync(dir)) return [];
-    const dirResolved = resolvePath(dir);
     const out: Array<{ name: string; text: string }> = [];
     for (const entry of readdirSync(dir)) {
       if (!entry.endsWith(".yaml")) continue;
-      const fullPath = join(dir, entry);
-      // Path-traversal guard on the read side: refuse to follow a symlink
-      // out of the sidecar (readdirSync only surfaces names — belt-and-
-      // suspenders).
-      if (!isWithinDir(resolvePath(fullPath), dirResolved)) continue;
-      out.push({ name: entry, text: readFileSync(fullPath, "utf-8") });
+      const real = this.fileIn(join(dir, entry), dir);
+      if (real === null) continue; // a link out of the export, or not a file
+      out.push({ name: entry, text: readFileSync(real, "utf-8") });
     }
     return out;
   }
 
-  readNotesMetaFiles(): string[] {
-    const dir = join(this.sidecar, NOTES_META_DIR);
-    if (!existsSync(dir)) return [];
-    const dirResolved = resolvePath(dir);
-    const out: string[] = [];
-    for (const entry of readdirSync(dir)) {
-      if (!entry.endsWith(".yaml")) continue;
-      if (entry.startsWith(".")) continue;
-      const fullPath = join(dir, entry);
-      if (!isWithinDir(resolvePath(fullPath), dirResolved)) continue;
-      out.push(readFileSync(fullPath, "utf-8"));
-    }
-    return out;
+  readSchemaFiles(): Array<{ name: string; text: string }> {
+    return this.readSidecarYamls(join(this.sidecar, "schemas"));
+  }
+
+  readNotesMetaFiles(): Array<{ name: string; text: string }> {
+    return this.readSidecarYamls(join(this.sidecar, NOTES_META_DIR)).filter((f) => !f.name.startsWith("."));
   }
 
   listContentFiles(): string[] {
     const out: string[] = [];
-    for (const filePath of walkContentFiles(this.inDir)) {
-      // Containment check — walkContentFiles should already be safe, but
-      // verify the resolved path is inside inDir (symlinks).
-      if (!isWithinDir(resolvePath(filePath), this.inDirResolved)) continue;
+    for (const filePath of walkContentFiles(this.inDir, { skipSymlinks: true })) {
       out.push(relative(this.inDir, filePath).split(pathSep).join("/"));
     }
     return out;
   }
 
   readContentFile(relPath: string): string {
-    return readFileSync(join(this.inDir, relPath), "utf-8");
+    const real = this.fileIn(join(this.inDir, relPath), this.inDir);
+    if (real === null) throw new Error(`"${relPath}" is not a file inside the export (a symlink out of it?)`);
+    return readFileSync(real, "utf-8");
   }
 
   restoreAttachment(srcRelPath: string, destRelPath: string): SinkWriteResult {
@@ -2215,8 +2534,11 @@ export class FsImportSource implements ImportSource {
     if (!isWithinDir(srcResolved, attachmentsRootResolved)) {
       return { ok: false, reason: `path-traversal on source: "${srcResolved}" escapes attachments root` };
     }
-    if (!existsSync(srcResolved)) {
-      return { ok: false, reason: `source attachment file missing at "${srcResolved}"` };
+    // One answer for missing and linked-away alike, so the warning can't tell
+    // an importer whether some path exists on this server.
+    const srcReal = this.fileIn(srcResolved, attachmentsRootResolved);
+    if (srcReal === null) {
+      return { ok: false, reason: `source attachment "${srcRelPath}" is missing, or not a file inside the export's attachments (a symlink out of them?)` };
     }
     // attachmentsEnabled guarantees assetsDirResolved is set.
     const assetsDirResolved = this.assetsDirResolved!;
@@ -2225,7 +2547,7 @@ export class FsImportSource implements ImportSource {
       return { ok: false, reason: `path-traversal on dest: "${destResolved}" escapes assetsDir` };
     }
     mkdirSync(dirname(destResolved), { recursive: true });
-    copyFileSync(srcResolved, destResolved);
+    copyFileSync(srcReal, destResolved);
     return { ok: true };
   }
 }
@@ -2291,6 +2613,7 @@ export async function importVault(
     skipped_attachments: [],
     skipped_sidecars: [],
     skipped_schema_parents: [],
+    unindexed_schema_fields: [],
     skipped_duplicate_ids: [],
     notes_wiped: 0,
     indexes_declared: 0,
@@ -2312,7 +2635,13 @@ export async function importVault(
   // debounce; transcription only fires on attachment `created` and kicks an
   // idempotent worker), so a rollback can't leave a half-applied side effect
   // the sweep won't reconcile.
-  if (opts.blowAway && !opts.dryRun) {
+  //
+  // A caller that passes `checkpoint` asks for the opposite: writes committed in
+  // chunks (cloud, where one transaction past ~30 s resets the Durable Object;
+  // see ImportEngineOptions.checkpoint). Its import runs unwrapped, as it always
+  // did in effect: before the DO backend gave transactionAsync a real
+  // transaction (audit L2-05) this wrapper was a no-op there.
+  if (opts.blowAway && !opts.dryRun && !opts.checkpoint) {
     await transactionAsync(store.db, () => importVaultReplay(store, source, opts, stats));
   } else {
     await importVaultReplay(store, source, opts, stats);
@@ -2337,6 +2666,9 @@ async function importVaultReplay(
   // Read every YAML doc of this export as an export (see ScalarReading), so a
   // snapshot the old exporter wrote restores its metadata exactly.
   const reading = exportScalarReading(source);
+  const format = exportFormatOf(source);
+  // Notes of a format 2 export are read for numbers in exponent form too; its schema files stay as written.
+  const noteReading: ScalarReading = format === 2 ? "export-2" : reading;
   // 1. Optional wipe. Notes are deleted via the public Store API so hooks
   // fire (callers depend on `attachment.deleted` hooks for assets-dir
   // cleanup; we don't bypass that on blow-away). Deleted in bounded batches
@@ -2367,16 +2699,20 @@ async function importVaultReplay(
     for (const tag of tagRecords) {
       await store.deleteTag(tag.tag, { cascade: true });
     }
+    // Indexed fields whose declarer was already gone (the gitcoin defect)
+    // survive deleteTag; on a clean slate they'd count against the
+    // indexed-field limit and cost the export's own fields their index.
+    pruneOrphanedIndexedFields(store.db, { dryRun: false });
   }
 
   // 2. Tag schemas — restore before notes so any tag a note carries can
   // validate against its schema on insert.
-  for (const { text } of source.readSchemaFiles()) {
+  for (const { name, text } of source.readSchemaFiles()) {
     // Reuse the frontmatter parser by wrapping the doc in `---`s. The schema
     // file is a YAML doc (no `---` markers); pad with them so
     // `parseFrontmatter` can chew on it via the same code path.
     const wrapped = `---\n${text}${text.endsWith("\n") ? "" : "\n"}---\n`;
-    const { frontmatter } = parseFrontmatter(wrapped, reading);
+    const { frontmatter } = parseFrontmatter(wrapped, reading, importKeyWarning(`schema ${name}`));
     const tagName = typeof frontmatter.name === "string" ? frontmatter.name : null;
     if (!tagName) continue;
     if (opts.dryRun) {
@@ -2389,28 +2725,56 @@ async function importVaultReplay(
       fields: (frontmatter.fields as Record<string, unknown> | null | undefined) as any ?? null,
       relationships: (frontmatter.relationships as Record<string, unknown> | null | undefined) as any ?? null,
       parent_names: parentNames,
+      ...(frontmatter.kind === "type" ? { kind: "type" as const } : {}),
     };
-    try {
-      await store.upsertTagRecord(tagName, patch);
-    } catch (err) {
-      // vault#552: the write-time cycle guard rejects a `parent_names` that
-      // would close a hierarchy cycle. An OLD export carrying a mutual-cycle
-      // fixture (accepted before the guard shipped) must still import —
-      // dropping the offending `parent_names` and warning, not aborting the
-      // whole import mid-flight (import isn't atomic; on a blow-away replace
-      // the vault was already wiped in step 1, so an uncaught throw here
-      // would leave it EMPTY). Retry WITHOUT parent_names so the tag's
-      // description/fields/relationships still land; record a skip warning
-      // mirroring the skipped_links/skipped_attachments/skipped_sidecars
-      // precedent. Any OTHER error still propagates.
-      if (err instanceof ParentCycleError) {
-        stats.skipped_schema_parents.push({
-          tag: tagName,
-          parent_names: parentNames ?? [],
-          reason: `parent_names would create a hierarchy cycle (${err.cycle.join(" → ")}); dropped on import`,
-        });
-        await store.upsertTagRecord(tagName, { ...patch, parent_names: null });
-      } else {
+    // Retries until the schema lands. Each retry drops one thing, so it ends.
+    let attempt: typeof patch = patch;
+    for (;;) {
+      try {
+        await store.upsertTagRecord(tagName, attempt);
+        break;
+      } catch (err) {
+        // vault#552: the write-time cycle guard rejects a `parent_names` that
+        // would close a hierarchy cycle. An OLD export carrying a mutual-cycle
+        // fixture (accepted before the guard shipped) must still import —
+        // dropping the offending `parent_names` and warning, not aborting the
+        // whole import mid-flight (import isn't atomic; on a blow-away replace
+        // the vault was already wiped in step 1, so an uncaught throw here
+        // would leave it EMPTY). Retry WITHOUT parent_names so the tag's
+        // description/fields/relationships still land; record a skip warning
+        // mirroring the skipped_links/skipped_attachments/skipped_sidecars
+        // precedent. Any OTHER error still propagates.
+        if (err instanceof ParentCycleError && attempt.parent_names !== null) {
+          stats.skipped_schema_parents.push({
+            tag: tagName,
+            parent_names: parentNames ?? [],
+            reason: `parent_names would create a hierarchy cycle (${err.cycle.join(" → ")}); dropped on import`,
+          });
+          attempt = { ...attempt, parent_names: null };
+          continue;
+        }
+        // 0.9.2 ceiling: an export from a vault over INDEXED_FIELD_LIMIT
+        // still imports whole. The field and its values land; only its index
+        // is left off (it stays filterable, by a scan). Same reason as above:
+        // a throw here could leave a wiped vault empty.
+        // The refusal names every new field the write asked for and how many
+        // the vault holds, so one retry keeps what fits and turns off the rest.
+        if (err instanceof IndexedFieldLimitError && attempt.fields) {
+          const room = Math.max(0, err.limit - err.got);
+          const over = err.fields.slice(room);
+          const fields = { ...(attempt.fields as Record<string, any>) };
+          let changed = false;
+          for (const field of over) {
+            if (fields[field]?.indexed !== true) continue;
+            fields[field] = { ...fields[field], indexed: false };
+            stats.unindexed_schema_fields.push({ tag: tagName, field, reason: `the vault reached the limit of ${err.limit} indexed fields` });
+            changed = true;
+          }
+          if (changed) {
+            attempt = { ...attempt, fields };
+            continue;
+          }
+        }
         throw err;
       }
     }
@@ -2435,11 +2799,12 @@ async function importVaultReplay(
   // disambiguated-id-suffix heuristic.
   const sidecarByKey = new Map<string, Record<string, unknown>[]>();
   const sidecarByIdLeftover = new Map<string, Record<string, unknown>>();
-  for (const text of source.readNotesMetaFiles()) {
+  for (const { name, text } of source.readNotesMetaFiles()) {
     // The sidecar is a bare YAML doc (no `---`); wrap to reuse the shared
     // frontmatter parser.
     const wrapped = `---\n${text}${text.endsWith("\n") ? "" : "\n"}---\n`;
-    const { frontmatter } = parseFrontmatter(wrapped, reading);
+    const parsedSidecar = parseFrontmatter(wrapped, noteReading, importKeyWarning(`${NOTES_META_DIR}/${name}`), { verbatimBody: format === 2 });
+    const frontmatter = format === 2 ? decodeFrontmatterV2(parsedSidecar.frontmatter) : parsedSidecar.frontmatter;
     const sidecarId = typeof frontmatter.id === "string" ? frontmatter.id : null;
     const sidecarPath = typeof frontmatter.path === "string" ? frontmatter.path : null;
     const sidecarExt = typeof frontmatter.extension === "string" ? frontmatter.extension : null;
@@ -2459,6 +2824,7 @@ async function importVaultReplay(
   // Track per-import (id → portable) so we can replay typed links after all
   // notes exist.
   const seenNotes = new Map<string, PortableNote>();
+  const fileOfId = new Map<string, string>();
   let sinceCheckpoint = 0;
   for (const relPath of source.listContentFiles()) {
     if (opts.checkpoint && ++sinceCheckpoint >= IMPORT_CHECKPOINT_NOTES) {
@@ -2477,8 +2843,9 @@ async function importVaultReplay(
     let content: string;
     if (supportsInlineFrontmatter(fileExt)) {
       const raw = source.readContentFile(relPath);
-      const parsed = parseFrontmatter(raw, reading);
-      frontmatter = parsed.frontmatter;
+      // Format 2 keeps the body's bytes as written (CRLF included); format 1 has always read it line by line.
+      const parsed = parseFrontmatter(raw, noteReading, importKeyWarning(`"${relPath}"`), { verbatimBody: format === 2 });
+      frontmatter = format === 2 ? decodeFrontmatterV2(parsed.frontmatter) : parsed.frontmatter;
       content = parsed.content;
     } else {
       // Resolve which sidecar this content file belongs to. Two sources of
@@ -2598,6 +2965,15 @@ async function importVaultReplay(
       console.warn(`[import] skipped "${relPath}": blank (whitespace-only) \`id\` in frontmatter`);
       continue;
     }
+    if (format === 2 && fileOfId.has(id)) {
+      // Two files of one format 2 export for one note: a stale copy from an earlier export into the same folder.
+      // Taking either would restore a note that is out of date, so the import stops (a blow-away rolls back).
+      throw new Error(
+        `two files of this export hold the note ${id}: "${fileOfId.get(id)}" and "${relPath}". ` +
+        `One is left over from an earlier export into the same folder. Remove the stale one, or export again into an empty folder.`,
+      );
+    }
+    fileOfId.set(id, relPath);
     if (seenNotes.has(id)) {
       const kept = seenNotes.get(id)!;
       stats.skipped_duplicate_ids.push({
@@ -2850,7 +3226,12 @@ export async function importPortableVault(
  * This is the canonical parser for the portable-md format. The legacy
  * `parseFrontmatter` in `obsidian.ts` delegates here.
  */
-export function parseFrontmatter(raw: string, reading: ScalarReading = "yaml"): {
+export function parseFrontmatter(
+  raw: string,
+  reading: ScalarReading = "yaml",
+  warn?: (message: string) => void,
+  opts: { verbatimBody?: boolean } = {},
+): {
   frontmatter: Record<string, unknown>;
   content: string;
 } {
@@ -2876,8 +3257,23 @@ export function parseFrontmatter(raw: string, reading: ScalarReading = "yaml"): 
   if (closeIdx === -1) return { frontmatter: {}, content: src };
 
   const yamlBlock = lines.slice(1, closeIdx).join("\n");
-  const content = lines.slice(closeIdx + 1).join("\n");
-  return { frontmatter: parseBlock(yamlBlock, 0, reading).value, content };
+  let content = lines.slice(closeIdx + 1).join("\n");
+  if (opts.verbatimBody) {
+    // The text after the closing fence's own line break, as it is: a CRLF body stays CRLF.
+    let at = 0;
+    for (let i = 0; i <= closeIdx; i++) {
+      const nl = src.indexOf("\n", at);
+      at = nl === -1 ? src.length : nl + 1;
+    }
+    content = src.slice(at);
+  }
+  return { frontmatter: parseBlock(yamlBlock, 0, reading, warn).value, content };
+}
+
+/** The import's warning for a frontmatter line whose key could not be read: names the file and the key (#75). */
+function importKeyWarning(file: string): (message: string) => void {
+  // eslint-disable-next-line no-console
+  return (message) => console.warn(`[import] ${file}: ${message}`);
 }
 
 /**
@@ -2893,7 +3289,7 @@ export function parseFrontmatter(raw: string, reading: ScalarReading = "yaml"): 
  * double-quoted only strings with control characters, so a quoted scalar it
  * could not have produced is the literal value.
  */
-export type ScalarReading = "yaml" | "export" | "old-export";
+export type ScalarReading = "yaml" | "export" | "old-export" | "export-2";
 
 /**
  * The exporter quotes strings that start with `[ ] { } , ' "` since 2ca5178
@@ -2915,6 +3311,29 @@ function exportScalarReading(source: ImportSource): ScalarReading {
   return Number.isFinite(ms) && ms < Date.parse(FLOW_QUOTING_SINCE) ? "old-export" : "export";
 }
 
+/**
+ * The `export_format_version` of an export, from its `.parachute/vault.yaml`: 1 when it names none (the oldest
+ * exports didn't). A format this program doesn't read is refused up front, with the ones it does, rather than read
+ * as if it were format 1.
+ */
+function exportFormatOf(source: ImportSource): number {
+  let text: string;
+  try {
+    text = source.readContentFile(`${SIDECAR_DIR}/vault.yaml`);
+  } catch {
+    return 1;
+  }
+  const version = parseFrontmatter(`---\n${text}${text.endsWith("\n") ? "" : "\n"}---\n`).frontmatter.export_format_version;
+  if (version === undefined) return 1;
+  if (typeof version !== "number" || !READABLE_FORMATS.includes(version)) {
+    throw new Error(
+      `this export is format ${String(version)}; this program reads ${READABLE_FORMATS.slice(0, -1).join(", ")} and ${READABLE_FORMATS[READABLE_FORMATS.length - 1]}. ` +
+      `Update Parachute, or export it again with an older program.`,
+    );
+  }
+  return version;
+}
+
 interface ParseResult {
   value: Record<string, unknown>;
   consumed: number; // number of lines consumed (for nested blocks)
@@ -2928,7 +3347,7 @@ interface ParseResult {
  * (anchors, references, multi-document streams, multi-line strings) are
  * not supported — out of scope for the export format.
  */
-function parseBlock(text: string, baseIndent: number, reading: ScalarReading): ParseResult {
+function parseBlock(text: string, baseIndent: number, reading: ScalarReading, warn?: (message: string) => void): ParseResult {
   const lines = text.split("\n");
   const result: Record<string, unknown> = {};
   let i = 0;
@@ -2944,10 +3363,10 @@ function parseBlock(text: string, baseIndent: number, reading: ScalarReading): P
 
     // Key regex (contract C2 / §1.2): dots allowed in keys, optional
     // whitespace before the colon (`created.at:` / `key :` both parse).
-    const kv = line.slice(baseIndent).match(/^([\w][\w.-]*)\s*:\s*(.*)$/);
-    if (!kv) { i++; continue; }
-    const key = kv[1]!;
-    const valueText = kv[2]!.trim();
+    const kv = matchKey(line.slice(baseIndent), false);
+    if (!kv) { unreadableKey(line.slice(baseIndent), warn); i++; continue; }
+    const key = kv.key;
+    const valueText = kv.rest.trim();
 
     if (valueText === "") {
       // Block-form value follows. Could be either an object or an array.
@@ -2968,12 +3387,12 @@ function parseBlock(text: string, baseIndent: number, reading: ScalarReading): P
         continue;
       }
       if (peekLine.slice(peekIndent).startsWith("- ")) {
-        const { value, consumed } = parseArrayBlock(lines, i + 1, peekIndent, reading);
+        const { value, consumed } = parseArrayBlock(lines, i + 1, peekIndent, reading, warn);
         result[key] = value;
         i = i + 1 + consumed;
       } else {
         const block = lines.slice(i + 1).join("\n");
-        const { value, consumed } = parseBlock(block, peekIndent, reading);
+        const { value, consumed } = parseBlock(block, peekIndent, reading, warn);
         result[key] = value;
         i = i + 1 + consumed;
       }
@@ -2983,6 +3402,28 @@ function parseBlock(text: string, baseIndent: number, reading: ScalarReading): P
     }
   }
   return { value: result, consumed: i };
+}
+
+/**
+ * A `key: value` line's key and the text after the colon. A plain word key
+ * (`[\w][\w.-]*`, what every exporter wrote before #75) or a single- or
+ * double-quoted key (what the exporter writes for any other key). `strict` is
+ * the list-item rule: the colon needs a space or the end of the line after it,
+ * so `- https://x` stays a string. Anything else is null: the caller reports it.
+ */
+function matchKey(s: string, strict: boolean): { key: string; rest: string } | null {
+  const plain = (strict ? /^([\w][\w.-]*)\s*:(?:\s+(.*))?$/ : /^([\w][\w.-]*)\s*:\s*(.*)$/).exec(s);
+  if (plain) return { key: plain[1]!, rest: plain[2] ?? "" };
+  const quoted = (strict ? /^('(?:[^']|'')*'|"(?:[^"\\]|\\.)*")\s*:(?:\s+(.*))?$/ : /^('(?:[^']|'')*'|"(?:[^"\\]|\\.)*")\s*:\s*(.*)$/).exec(s);
+  if (quoted) return { key: String(unquoteYaml(quoted[1]!)), rest: quoted[2] ?? "" };
+  return null;
+}
+
+/** A line at a key's place that no key rule takes: say so, with the key as far as it can be told, instead of dropping it. */
+function unreadableKey(line: string, warn?: (message: string) => void): void {
+  const text = line.trim();
+  const colon = text.search(/:(?:\s|$)/);
+  warn?.(`cannot read the key ${JSON.stringify(colon > 0 ? text.slice(0, colon) : text)}: quote it ('key': value), the line was skipped`);
 }
 
 function peekNextContent(lines: string[], from: number): number {
@@ -3011,6 +3452,7 @@ function parseArrayBlock(
   start: number,
   arrayIndent: number,
   reading: ScalarReading,
+  warn?: (message: string) => void,
 ): { value: unknown[]; consumed: number } {
   const result: unknown[] = [];
   let i = start;
@@ -3025,8 +3467,28 @@ function parseArrayBlock(
     // First content after `- `.
     const after = line.slice(indent + 2).trim();
     // Is this a scalar item (`- foo`) or an object item (`- key: value`)?
-    // Key regex matches parseBlock's (contract C2): dots + optional space.
-    const objMatch = after.match(/^([\w][\w.-]*)\s*:\s*(.*)$/);
+    // Key regex matches parseBlock's (contract C2): dots + optional space. As
+    // in YAML, a key's colon has a space or the end of the line after it, so
+    // `- https://x` and `- 2027-02-03T17:00:00Z` are strings. The exporter wrote
+    // those unquoted until T-395, and this is what restores those exports. An
+    // object whose first key holds a colon (older exports didn't quote keys) still reads as
+    // it always did, or the keys under it are lost: a string item never has
+    // lines under it, and every exporter quotes a string holding `: `.
+    // A list inside a list: `- - a`. Read it as a list at the column where the inner `- ` sits.
+    // A lone `-` is not one (it stays the string "-", as it always read); only `- x` is.
+    if (after.startsWith("- ")) {
+      lines[i] = " ".repeat(indent + 2) + after; // in place: this line is read once, here
+      const { value, consumed } = parseArrayBlock(lines, i, indent + 2, reading, warn);
+      if (consumed > 0) {
+        result.push(value);
+        i += consumed;
+        continue;
+      }
+      lines[i] = line; // nothing read: take it as a plain item, and move on
+    }
+    const nextLine = peekNextContent(lines, i + 1);
+    const cannotBeString = /:\s/.test(after) || (nextLine !== -1 && countLeadingSpaces(lines[nextLine]!) > indent);
+    const objMatch = matchKey(after, true) ?? (cannotBeString ? matchKey(after, false) : null);
     if (!objMatch) {
       result.push(parseScalarOrInline(after, reading));
       i++;
@@ -3037,8 +3499,8 @@ function parseArrayBlock(
     // indent+2, and subsequent lines at indent+2 are siblings. We
     // synthesize a normalized block string and recurse.
     const itemIndent = indent + 2;
-    const itemKey = objMatch[1]!;
-    const itemValue = objMatch[2]!.trim();
+    const itemKey = objMatch.key;
+    const itemValue = objMatch.rest.trim();
     const itemObj: Record<string, unknown> = {};
     if (itemValue === "") {
       // First key's value is a nested block — look at next line.
@@ -3049,12 +3511,12 @@ function parseArrayBlock(
         if (peekIndent > itemIndent) {
           // Nested block under this first key.
           if (peekLine.slice(peekIndent).startsWith("- ")) {
-            const { value, consumed } = parseArrayBlock(lines, i + 1, peekIndent, reading);
+            const { value, consumed } = parseArrayBlock(lines, i + 1, peekIndent, reading, warn);
             itemObj[itemKey] = value;
             i = i + 1 + consumed;
           } else {
             const block = lines.slice(i + 1).join("\n");
-            const { value, consumed } = parseBlock(block, peekIndent, reading);
+            const { value, consumed } = parseBlock(block, peekIndent, reading, warn);
             itemObj[itemKey] = value;
             i = i + 1 + consumed;
           }
@@ -3078,10 +3540,15 @@ function parseArrayBlock(
       const sibIndent = countLeadingSpaces(sib);
       if (sibIndent !== itemIndent) break;
       if (sib.slice(sibIndent).startsWith("- ")) break;
-      const sibKv = sib.slice(sibIndent).match(/^([\w][\w.-]*)\s*:\s*(.*)$/);
-      if (!sibKv) break;
-      const sibKey = sibKv[1]!;
-      const sibValue = sibKv[2]!.trim();
+      const sibKv = matchKey(sib.slice(sibIndent), false);
+      if (!sibKv) {
+        if (sib.trimStart().startsWith("#")) { i++; continue; }
+        unreadableKey(sib.slice(sibIndent), warn);
+        i++;
+        continue;
+      }
+      const sibKey = sibKv.key;
+      const sibValue = sibKv.rest.trim();
       if (sibValue === "") {
         const peekIdx = peekNextContent(lines, i + 1);
         if (peekIdx !== -1) {
@@ -3089,12 +3556,12 @@ function parseArrayBlock(
           const peekIndent = countLeadingSpaces(peekLine);
           if (peekIndent > itemIndent) {
             if (peekLine.slice(peekIndent).startsWith("- ")) {
-              const { value, consumed } = parseArrayBlock(lines, i + 1, peekIndent, reading);
+              const { value, consumed } = parseArrayBlock(lines, i + 1, peekIndent, reading, warn);
               itemObj[sibKey] = value;
               i = i + 1 + consumed;
             } else {
               const block = lines.slice(i + 1).join("\n");
-              const { value, consumed } = parseBlock(block, peekIndent, reading);
+              const { value, consumed } = parseBlock(block, peekIndent, reading, warn);
               itemObj[sibKey] = value;
               i = i + 1 + consumed;
             }
@@ -3194,6 +3661,8 @@ function oldExporterNeedsQuote(s: string): boolean {
 
 function unquote(s: string, reading: ScalarReading): unknown {
   const value = unquoteYaml(s);
+  // Format 2 quotes every string that looks like a number, so a plain `1e+21` is the number JSON.stringify wrote.
+  if (reading === "export-2" && value === s && /^-?\d+(?:\.\d+)?[eE][-+]?\d+$/.test(s)) return Number(s);
   if (reading !== "old-export" || s.length < 2 || typeof value !== "string") return value;
   // A quoted scalar the old exporter could not have written is the literal
   // string: it single-quoted only what its needsQuote asked for (and not
@@ -3230,6 +3699,29 @@ function unquoteYaml(s: string): unknown {
           case "t":  out += "\t"; i += 2; continue;
           case "v":  out += "\v"; i += 2; continue;
           case "f":  out += "\f"; i += 2; continue;
+          case "0":  out += "\0"; i += 2; continue;
+          case "a":  out += "\x07"; i += 2; continue;
+          case "b":  out += "\b"; i += 2; continue;
+          case "e":  out += "\x1b"; i += 2; continue;
+          case "/":  out += "/"; i += 2; continue;
+          case " ":  out += " "; i += 2; continue;
+          case "N":  out += "\u0085"; i += 2; continue;
+          case "_":  out += "\u00a0"; i += 2; continue;
+          case "L":  out += "\u2028"; i += 2; continue;
+          case "P":  out += "\u2029"; i += 2; continue;
+          case "u":
+          case "U": {
+            const width = next === "u" ? 4 : 8;
+            const hex = body.slice(i + 2, i + 2 + width);
+            if (hex.length === width && /^[0-9a-fA-F]+$/.test(hex) && parseInt(hex, 16) <= 0x10ffff) {
+              out += String.fromCodePoint(parseInt(hex, 16));
+              i += 2 + width;
+              continue;
+            }
+            out += ch + next;
+            i += 2;
+            continue;
+          }
           case "x": {
             const hex = body.slice(i + 2, i + 4);
             if (/^[0-9a-fA-F]{2}$/.test(hex)) {
@@ -3332,15 +3824,21 @@ export function walkMarkdownFiles(dir: string): string[] {
  * `.parachute/` is reached separately by the importer. Files with no
  * extension are skipped (no way to tell what they are; vault doesn't
  * write extensionless notes by design).
+ *
+ * `skipSymlinks` (the importer): a symlinked file or folder is not listed
+ * or entered, so a link in a cloned repo can't lead the walk off-tree
+ * (T-419). The exporter's orphan prune walks without it and guards each
+ * removal with `realpathSync` instead.
  */
-export function walkContentFiles(dir: string): string[] {
+export function walkContentFiles(dir: string, opts: { skipSymlinks?: boolean } = {}): string[] {
   const results: string[] = [];
+  const statOf = opts.skipSymlinks ? lstatSync : statSync;
   function walk(current: string) {
     for (const entry of readdirSync(current)) {
       if (entry.startsWith(".")) continue;
       if (entry === "node_modules") continue;
       const full = join(current, entry);
-      const stat = statSync(full);
+      const stat = statOf(full);
       if (stat.isDirectory()) walk(full);
       else if (stat.isFile() && extname(entry).length > 0) results.push(full);
     }

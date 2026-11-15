@@ -38,6 +38,16 @@ export function coreUnitEntry(
   };
 }
 
+/**
+ * Whether a systemd unit's text starts core: `…/bin/parachute-core serve` (the takeover's unit) or Bun on core's
+ * `parachute-core.ts` (what `init` writes inside core). A unit that starts anything else by the hub's unit name is
+ * the 0.7 hub's: the takeover pauses it (stopped, disabled) and leaves its file, and starting it would put the old
+ * hub on a home core serves.
+ */
+export function unitStartsCore(text: string): boolean {
+  return /^[ \t]*ExecStart[ \t]*=.*parachute-core(\.ts)?["']?([ \t]+\S+)?[ \t]+serve\b/m.test(text);
+}
+
 /** The folder of a module core carries itself (the vault), so the installer registers it instead of downloading it. */
 export function bundledModuleDir(
   packageName: string,

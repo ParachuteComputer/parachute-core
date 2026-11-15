@@ -1,7 +1,7 @@
 import { test, expect } from "bun:test";
 import { Database } from "bun:sqlite";
 import { SqliteStore } from "./store.js";
-import { initSchema } from "./schema.js";
+import { initSchema, SCHEMA_VERSION } from "./schema.js";
 
 test("v30 to v31 retains native history and matches fresh import tables; reopening is idempotent", async () => {
   const db = new Database(":memory:"), fresh = new Database(":memory:");
@@ -13,7 +13,7 @@ test("v30 to v31 retains native history and matches fresh import tables; reopeni
     db.exec("UPDATE schema_version SET version=30");
     const before = db.query("SELECT * FROM note_versions").all();
     initSchema(db); initSchema(fresh); initSchema(db);
-    expect(db.query("SELECT MAX(version) AS version FROM schema_version").get()).toEqual({ version: 32 });
+    expect(db.query("SELECT MAX(version) AS version FROM schema_version").get()).toEqual({ version: SCHEMA_VERSION });
     expect(db.query("SELECT * FROM note_versions").all()).toEqual(before);
     for (const table of tables) {
       expect(db.query(`PRAGMA table_info(${table})`).all()).toEqual(fresh.query(`PRAGMA table_info(${table})`).all());

@@ -28,7 +28,7 @@ import {
   SNAPSHOT_CHUNK_MAX_NOTES,
   WS_CLOSE,
 } from "./ws-subscribe.ts";
-import { unsupportedSubscriptionReason } from "./live-match.ts";
+import { unsupportedSubscriptionReason } from "../core/src/live-match.ts";
 import { FRAME_CORPUS, NOTE_A } from "./test-support/live-frame-corpus.ts";
 
 describe("live-frame parity — self-host WS bytes === corpus === cloud WS bytes", () => {

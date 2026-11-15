@@ -37,6 +37,7 @@ describe("GET /api/vault embeddings capability", () => {
     const cfg = { name: "default" };
     const resolveEmbeddingCap = async (): Promise<EmbeddingCapability> => ({
       enabled: true,
+      state: "ready",
       provider: "onnx-transformers",
       model: "Xenova/bge-small-en-v1.5",
     });
@@ -53,14 +54,15 @@ describe("GET /api/vault embeddings capability", () => {
     const body = (await res.json()) as any;
     expect(body.embeddings).toEqual({
       enabled: true,
+      state: "ready",
       provider: "onnx-transformers",
       model: "Xenova/bge-small-en-v1.5",
     });
   });
 
-  test("surfaces enabled:false with no provider/model when the injected resolver reports unavailable", async () => {
+  test("surfaces enabled:false with no provider/model when the injected resolver reports off", async () => {
     const cfg = { name: "default" };
-    const resolveEmbeddingCap = async (): Promise<EmbeddingCapability> => ({ enabled: false });
+    const resolveEmbeddingCap = async (): Promise<EmbeddingCapability> => ({ enabled: false, state: "off" });
     const res = await handleVault(
       new Request(`${BASE}/vault`, { method: "GET" }),
       store,
@@ -71,7 +73,7 @@ describe("GET /api/vault embeddings capability", () => {
       resolveEmbeddingCap,
     );
     const body = (await res.json()) as any;
-    expect(body.embeddings).toEqual({ enabled: false });
+    expect(body.embeddings).toEqual({ enabled: false, state: "off" });
   });
 
   test("the production DEFAULT is off (opt-in, 0.7.3) — no provider, enabled:false", async () => {
@@ -85,7 +87,7 @@ describe("GET /api/vault embeddings capability", () => {
     const res = await handleVault(new Request(`${BASE}/vault`, { method: "GET" }), store, cfg as any);
     expect(res.status).toBe(200);
     const body = (await res.json()) as any;
-    expect(body.embeddings).toEqual({ enabled: false });
+    expect(body.embeddings).toEqual({ enabled: false, state: "off" });
   });
 
   test("once ENABLED (EMBEDDINGS_ENABLED=true) the default wiring resolves the bundled floor, enabled:true", async () => {

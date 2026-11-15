@@ -93,6 +93,16 @@ import {
   writeManifest,
 } from "../services-manifest.ts";
 import { migrateNotice } from "./migrate.ts";
+import { listKeys } from "../keys.ts";
+import { scopedAdminProblem } from "../permissions-claim.ts";
+import {
+  type DataDeps,
+  applyDataFixes,
+  dataChecks,
+  describeDataFixes,
+  findDataProblems,
+  hasDataFixes,
+} from "./doctor-data.ts";
 
 // ---------------------------------------------------------------------------
 // Check model
@@ -113,7 +123,7 @@ export interface CheckResult {
 }
 
 /** A logical group of checks in the human report. */
-const GROUP_ORDER = ["Hub", "Modules", "Configuration", "Grants", "Migration", "Exposure"] as const;
+const GROUP_ORDER = ["Hub", "Modules", "Configuration", "Grants", "Migration", "Exposure", "Data"] as const;
 type Group = (typeof GROUP_ORDER)[number];
 
 interface GroupedCheck extends CheckResult {
@@ -202,6 +212,8 @@ export interface DoctorDeps {
    * snapshot so the group runs without a real hub.db.
    */
   readGrants?: (configDir: string) => GrantsSnapshot | null;
+  /** The data housekeeping group (stale history hints, unused OAuth clients); see doctor-data.ts. */
+  data?: DataDeps;
 }
 
 /** One `user_vaults` assignment, as the Grants group reports it. */
@@ -471,6 +483,7 @@ interface ResolvedDeps {
   probeLoopbackInstance: (port: number) => Promise<LoopbackProbe>;
   countHubListeners: (port: number) => number | undefined;
   readGrants: (configDir: string) => GrantsSnapshot | null;
+  data: DataDeps | undefined;
 }
 
 function resolveDeps(d: DoctorDeps | undefined): ResolvedDeps {
@@ -489,6 +502,7 @@ function resolveDeps(d: DoctorDeps | undefined): ResolvedDeps {
     probeLoopbackInstance: d?.probeLoopbackInstance ?? probeLoopbackInstance,
     countHubListeners: d?.countHubListeners ?? defaultCountHubListeners,
     readGrants: d?.readGrants ?? defaultReadGrants,
+    data: d?.data,
   };
 }
 
@@ -508,8 +522,18 @@ function resolveDeps(d: DoctorDeps | undefined): ResolvedDeps {
  *   - manager `inactive`/`no-unit` + no `/health` → FAIL ("hub is not running").
  * Never throws — a manager-query failure degrades to the `/health` verdict.
  */
+/**
+ * The hub port doctor checks: the running hub's own record first; then PORT, which `serve` takes its port from
+ * (parachute.yaml's server.port is copied there before any hub command runs, 0.9.3); then the default.
+ */
+function doctorHubPort(configDir: string): number {
+  const raw = process.env.PORT ?? "";
+  const envPort = /^\d+$/.test(raw) ? Number(raw) : NaN;
+  return readHubPort(configDir) ?? (envPort > 0 && envPort <= 65535 ? envPort : HUB_UNIT_DEFAULT_PORT);
+}
+
 async function checkHubReachable(configDir: string, deps: ResolvedDeps): Promise<CheckResult> {
-  const port = readHubPort(configDir) ?? HUB_UNIT_DEFAULT_PORT;
+  const port = doctorHubPort(configDir);
   let healthy = false;
   try {
     healthy = await deps.probeHubHealth(port);
@@ -588,7 +612,7 @@ async function checkHubReachable(configDir: string, deps: ResolvedDeps): Promise
  * Never throws — every read is bounded + degrades to a benign verdict.
  */
 async function checkLoopbackHijack(configDir: string, deps: ResolvedDeps): Promise<CheckResult> {
-  const port = readHubPort(configDir) ?? HUB_UNIT_DEFAULT_PORT;
+  const port = doctorHubPort(configDir);
   const title = `No loopback hijack on :${port}`;
 
   let record: HubInstanceRecord | null = null;
@@ -1095,7 +1119,7 @@ function checkOperatorToken(
   // Build the issuer set the live auth path validates against (loopback aliases
   // ∪ expose-state public origin ∪ platform origin). Seed with the resolved
   // loopback issuer so a never-exposed box still has its own loopback in the set.
-  const seedIssuer = `http://127.0.0.1:${readHubPort(configDir) ?? HUB_UNIT_DEFAULT_PORT}`;
+  const seedIssuer = `http://127.0.0.1:${doctorHubPort(configDir)}`;
   let knownIssuers: readonly string[] = [];
   try {
     knownIssuers = buildKnownIssuersForOperatorToken(configDir, seedIssuer);
@@ -1558,6 +1582,42 @@ function checkVersionDrift(manifest: { services: ServiceEntry[] }): CheckResult 
  * + (stubbable) network, never mutates. The hub-reachability probe runs once
  * and gates the module-liveness check (a down hub means every child is down).
  */
+/**
+ * Scope gap 4 (0.9.1, SPEC §3.3): a tag limit narrows read and write, never admin, and the mint refuses a
+ * tag-limited admin pass. Keys minted before that live until they expire: name each live one (never its token or
+ * id) so the operator revokes it and mints read or write instead. The vault-wide routes already refuse them.
+ * Best-effort like the operator-token revocation probe: no hub.db, or one this hub can't read, passes.
+ */
+export function checkScopedAdminKeys(configDir: string): CheckResult {
+  const base = { name: "scoped-admin-keys", title: "No key is a vault admin limited to tags" };
+  const path = hubDbPath(configDir);
+  if (!existsSync(path)) return { ...base, status: "pass", detail: "no hub database yet" };
+  let db: Database | undefined;
+  try {
+    db = new Database(path, { readonly: true });
+    // The mint's own test (scopedAdminProblem): `vault:<name>:admin` and the broad `vault:admin` alike.
+    const found = listKeys(db).filter(
+      (k) => k.status === "active" && scopedAdminProblem(k.scopes, { scoped_tags: k.allow_tags ?? [] }) !== null,
+    );
+    if (found.length === 0) return { ...base, status: "pass", detail: "no live key holds vault admin with a tag limit" };
+    const names = found.map((k) => k.name);
+    return {
+      ...base,
+      status: "warn",
+      detail: `${names.length} live key${names.length === 1 ? " holds" : "s hold"} vault admin with a tag limit: ${names.join(", ")}. Admin acts on the whole vault, so the limit can't hold; since 0.9.1 such a key can't be minted.`,
+      fix: names.map((n) => `parachute keys revoke ${n}`).join(" && ") + "  (then mint a read or write key with the tags)",
+    };
+  } catch {
+    return { ...base, status: "pass", detail: "keys could not be read (an older hub database); nothing to check" };
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      // ignore
+    }
+  }
+}
+
 async function runChecks(
   configDir: string,
   manifestPath: string,
@@ -1580,6 +1640,7 @@ async function runChecks(
   const manifestCheck = checkServicesManifest(manifestPath);
   const portDrift = checkPortDrift(manifestPath);
   const operator = checkOperatorToken(configDir);
+  const scopedAdminKeys = checkScopedAdminKeys(configDir);
   const migration = checkMigration(configDir, manifestPath, deps);
   const grants = checkGrants(configDir, deps);
   const versionDrift = checkVersionDrift(manifest);
@@ -1590,10 +1651,11 @@ async function runChecks(
   };
   add("Hub", [hub, hijack]);
   add("Modules", [...modules, ...bins]);
-  add("Configuration", [manifestCheck, portDrift, operator]);
+  add("Configuration", [manifestCheck, portDrift, operator, scopedAdminKeys]);
   add("Grants", grants);
   add("Migration", migration);
   add("Exposure", [exposure, versionDrift]);
+  add("Data", dataChecks(findDataProblems(configDir, deps.data)));
   return grouped;
 }
 
@@ -1782,7 +1844,8 @@ async function fixPortDrift(
  * diagnostic regardless of the box's state.
  *
  * `--fix` is the one writing mode: it repairs canonical-port drift in
- * services.json (and ONLY that) behind a show-diff + confirmation gate, then
+ * services.json, stale history hints and unused OAuth clients (doctor-data.ts)
+ * and ONLY those, behind a show-what-changes + confirmation gate, then
  * returns its own exit code without running the full diagnostic report.
  */
 export async function doctor(opts: DoctorOpts = {}): Promise<number> {
@@ -1792,6 +1855,30 @@ export async function doctor(opts: DoctorOpts = {}): Promise<number> {
   const deps = resolveDeps(opts.deps);
 
   if (opts.fix) {
+    // Data housekeeping first (stale history hints, unused OAuth clients), behind the same gate as the port repair:
+    // `--yes`, or a yes at the prompt. With no terminal and no `--yes` it lists what it would do and changes nothing.
+    const found = findDataProblems(configDir, deps.data);
+    if (hasDataFixes(found)) {
+      print("Data to repair:");
+      for (const line of describeDataFixes(found)) print(line);
+      print("");
+      if (!opts.yes) {
+        if (!deps.isInteractive()) {
+          print("Refusing to change data without confirmation in a non-interactive shell.");
+          print("Re-run with --yes to apply, or run interactively to confirm.");
+          await fixPortDrift(manifestPath, { yes: false, print, deps });
+          return 1;
+        }
+        const answer = (await deps.readLine("Apply these data repairs? [y/N] ")).trim().toLowerCase();
+        if (answer !== "y" && answer !== "yes") {
+          print("Aborted — data unchanged.");
+          return 1;
+        }
+      }
+      const failed = applyDataFixes(configDir, found, deps.data, print);
+      const ports = await fixPortDrift(manifestPath, { yes: opts.yes ?? false, print, deps });
+      return failed > 0 ? 1 : ports;
+    }
     return await fixPortDrift(manifestPath, { yes: opts.yes ?? false, print, deps });
   }
 

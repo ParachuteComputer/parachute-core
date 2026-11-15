@@ -13,22 +13,32 @@ import type { EmbeddingProvider } from "../../core/src/embedding/provider.ts";
 export interface EmbeddingCapability {
   /** True when a provider is configured AND available. `query-notes { semantic: true }` throws `semantic_unavailable` when false. */
   enabled: boolean;
-  /** The active provider's name (e.g. "onnx-transformers", "external-api"). Omitted when disabled. */
+  /**
+   * What the embedder is doing (T-418), so a vault whose model can't load says so instead of looking healthy:
+   * "off" (semantic search not turned on), "loading" (the model is loading), "ready", or "failing" (turned on, but
+   * it can't embed: `error` says why, and no note gets a vector until it is fixed).
+   */
+  state: "off" | "loading" | "ready" | "failing";
+  /** The active provider's name (e.g. "onnx-transformers", "external-api"). Omitted when off. */
   provider?: string;
-  /** The active provider's model (e.g. "bge-small-en-v1.5", "bge-m3"). Omitted when disabled. */
+  /** The active provider's model (e.g. "bge-small-en-v1.5", "bge-m3"). Omitted when off. */
   model?: string;
+  /** Why it is failing (state "failing" only). */
+  error?: string;
 }
 
 /**
  * `provider` is `undefined` when `EMBEDDINGS_ENABLED=false` (the off
  * switch — see `select.ts`'s `buildEmbeddingProvider`) — resolves to
- * `{enabled: false}` directly, no `available()` probe to call.
+ * `{enabled: false, state: "off"}` directly, no `available()` probe to call.
  */
 export async function resolveEmbeddingCapability(
   provider: EmbeddingProvider | undefined,
 ): Promise<EmbeddingCapability> {
-  if (!provider) return { enabled: false };
+  if (!provider) return { enabled: false, state: "off" };
   const avail = await provider.available();
-  if (!avail.ok) return { enabled: false };
-  return { enabled: true, provider: provider.name, model: provider.model };
+  if (!avail.ok) {
+    return { enabled: false, state: "failing", provider: provider.name, model: provider.model, error: avail.reason ?? "the embedding provider is unavailable" };
+  }
+  return { enabled: true, state: provider.loading?.() ? "loading" : "ready", provider: provider.name, model: provider.model };
 }

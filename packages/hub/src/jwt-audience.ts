@@ -23,12 +23,15 @@
 
 export const VAULT_VERBS = new Set(["read", "write", "admin"]);
 
+/** The named per-vault scope verbs that bind a token to one vault: the ladder plus the backup key's `export`. */
+const NAMED_VAULT_VERBS = new Set([...VAULT_VERBS, "export"]);
+
 export function inferAudience(scopes: readonly string[]): string {
   for (const s of scopes) {
     const parts = s.split(":");
     const name = parts[1];
     const verb = parts[2];
-    if (parts.length === 3 && parts[0] === "vault" && name && verb && VAULT_VERBS.has(verb)) {
+    if (parts.length === 3 && parts[0] === "vault" && name && verb && NAMED_VAULT_VERBS.has(verb)) {
       return `vault.${name}`;
     }
   }

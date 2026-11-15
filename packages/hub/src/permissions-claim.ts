@@ -17,6 +17,22 @@
 
 export const ENFORCED_PERMISSION_KEYS: readonly string[] = ["scoped_tags", "principal_pubkey"];
 
+/**
+ * Keys the vault enforces that only the hub sets, from the key being minted, never from a request (the write stamp,
+ * ROADMAP 0.9.1): `acts_for`, the on-behalf-of prefix the vault's owner granted at mint. A request asking for it is
+ * refused; a minter carrying it passes it on to what it mints (`carriedPermissions`), with its top-level `key` claim
+ * (the key's name and kind, outside `permissions` so an older vault ignores it rather than refusing the key), so a
+ * key can't mint itself out of its own stamp.
+ */
+export const HUB_SET_PERMISSION_KEYS: readonly string[] = ["acts_for"];
+
+/** The hub-set keys a minting pass carries, which every pass it mints inherits unchanged. */
+export function carriedPermissions(minterPermissions: unknown): Record<string, unknown> {
+  if (!minterPermissions || typeof minterPermissions !== "object" || Array.isArray(minterPermissions)) return {};
+  const held = minterPermissions as Record<string, unknown>;
+  return Object.fromEntries(HUB_SET_PERMISSION_KEYS.filter((k) => k in held).map((k) => [k, held[k]]));
+}
+
 /** Keys in a requested `permissions` object that no vault enforces. */
 export function unknownPermissionKeys(permissions: Record<string, unknown>): string[] {
   return Object.keys(permissions).filter((k) => !ENFORCED_PERMISSION_KEYS.includes(k));
@@ -29,7 +45,7 @@ export function unknownPermissionKeys(permissions: Record<string, unknown>): str
 export function bearerPermissionsProblem(permissions: unknown): string | null {
   if (permissions === undefined || permissions === null) return null;
   if (typeof permissions !== "object" || Array.isArray(permissions)) return "has a malformed permissions claim";
-  const unknown = unknownPermissionKeys(permissions as Record<string, unknown>);
+  const unknown = unknownPermissionKeys(permissions as Record<string, unknown>).filter((k) => !HUB_SET_PERMISSION_KEYS.includes(k));
   return unknown.length > 0 ? `carries permission key(s) no vault enforces: ${unknown.join(", ")}` : null;
 }
 
@@ -62,4 +78,24 @@ export function scopedTagsWiderThanMinter(
     return `permissions.scoped_tags asks for ${outside.map((t) => JSON.stringify(t)).join(", ")}, outside the minting pass's tags [${heldTags.join(", ")}]`;
   }
   return null;
+}
+
+/**
+ * Scope gap 4 (0.9.1, SPEC §3.3): a tag scope narrows read and write, never admin. An admin pass acts on the
+ * whole vault (triggers, mirror, import, the description every agent reads, the tag graph), so a "tag-scoped
+ * admin" can't be made coherent. Every mint refuses one: this check runs at the mint doors for a clear answer, and
+ * again in `signAccessToken` so no other path signs one. Passes minted before 0.9.1 live until they expire; the
+ * vault-wide routes refuse them and `parachute doctor` names their keys.
+ *
+ * Returns why `scopes` with `permissions` may not be minted, or null.
+ */
+export function scopedAdminProblem(scopes: readonly string[], permissions: unknown): string | null {
+  const tags =
+    permissions && typeof permissions === "object" && !Array.isArray(permissions)
+      ? (permissions as Record<string, unknown>).scoped_tags
+      : undefined;
+  if (!Array.isArray(tags) || tags.length === 0) return null;
+  const admin = scopes.filter((s) => /^vault:(?:[^:]+:)?admin$/.test(s));
+  if (admin.length === 0) return null;
+  return `a pass limited to tags (permissions.scoped_tags) can't hold vault admin (${admin.join(", ")}): admin acts on the whole vault. Mint it with read or write, or mint an admin pass with no tag limit.`;
 }

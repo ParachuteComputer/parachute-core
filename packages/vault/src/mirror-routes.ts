@@ -75,6 +75,7 @@ import {
   ImportConflictError,
   NotAVaultExportError,
   cloneAndImport,
+  importRemoteUrlProblem,
   type GitSpawn,
   type ImportAuth,
   type ImportProgress,
@@ -1011,7 +1012,7 @@ async function probeGitLsRemote(
   // GIT_TERMINAL_PROMPT=0 ensures bad credentials FAIL FAST instead of
   // sitting at "Username:" indefinitely (which the timeout would then
   // catch, but failing fast on the auth wall is the better UX).
-  const proc = Bun.spawn(["git", "ls-remote", url], {
+  const proc = Bun.spawn(["git", "ls-remote", "--", url], {
     stdout: "pipe",
     stderr: "pipe",
     env: {
@@ -1796,6 +1797,21 @@ export async function handleMirrorImport(
         error_type: "validation",
         field: "remote_url",
         message: "Provide an HTTPS or SSH clone URL.",
+      },
+      { status: 400 },
+    );
+  }
+  // T-419 (audit L3-02): only https:// and ssh. A local path or file:// let a
+  // vault admin clone another vault's mirror off this disk; a leading "-"
+  // reached git as an option.
+  const urlProblem = importRemoteUrlProblem(remote_url);
+  if (urlProblem !== null) {
+    return Response.json(
+      {
+        error: "remote_url invalid",
+        error_type: "validation",
+        field: "remote_url",
+        message: urlProblem,
       },
       { status: 400 },
     );

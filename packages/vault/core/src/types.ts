@@ -7,7 +7,7 @@ import type { ValidationStatus } from "./schema-defaults.js";
 import type { ConformanceReport } from "./conformance.js";
 import type { FindPathResult } from "./links.js";
 import type { DoctorReport, DoctorScanOpts } from "./doctor.js";
-import type { CompactResult, CompactSummary, HistoryOp, VersionRow } from "./history.js";
+import type { CompactResult, CompactSummary, DeletedNoteRow, HistoryOp, VersionRow } from "./history.js";
 
 // ---- Re-exports ----
 
@@ -58,6 +58,8 @@ export interface Note {
   lastUpdatedBy?: string | null;
   lastUpdatedVia?: string | null;
   tags?: string[];
+  /** T-318 §8a: the subset of `tags` that are types (fields, hierarchy). `tags` still lists every name through 0.9. */
+  types?: string[];
   links?: Link[];
   /**
    * Opt-in link degree (raw row count, both directions by default). Present
@@ -72,7 +74,7 @@ export interface Note {
    * ONLY present on results from `search=`/`query-notes{search}` — every
    * other read path (structured `queryNotes`, `getNoteById`, ...) leaves
    * this `undefined`. Higher is more relevant — the sign-flipped weighted
-   * `bm25(notes_fts, SEARCH_WEIGHT_PATH, SEARCH_WEIGHT_CONTENT)` value (raw
+   * `bm25(notes_fts, SEARCH_BM25_WEIGHTS)` value (raw
    * SQLite bm25 is negative-is-better; flipped here so external callers get
    * the more intuitive "bigger number wins" convention). Meaningful only
    * for RELATIVE comparison within one result set — the absolute magnitude
@@ -82,6 +84,8 @@ export interface Note {
    * longer determines the result order.
    */
   score?: number;
+  /** search_mode "hybrid" (T-461 prototype): which arms found the note, "keyword" and/or "meaning". */
+  matched_by?: string[];
 }
 
 // ---- Link ----
@@ -347,8 +351,8 @@ export interface SemanticSearchResult {
 export interface AggregateSpec {
   /**
    * What to group by: an indexed metadata field name (declared
-   * `indexed: true` in a tag schema — same FIELD_NOT_INDEXED contract
-   * `metadata` operator queries and `order_by` use), or the special value
+   * `indexed: true` in a tag schema, else FIELD_NOT_INDEXED; since 0.9.2
+   * only aggregate needs it, filters and `order_by` scan), or the special value
    * `"tag"` to group by tag membership. Under `"tag"`, a note carrying N of
    * the tags in the (filtered) result set contributes to N separate groups
    * — this is a membership rollup, not a partition.
@@ -422,6 +426,7 @@ export interface NoteIndex {
   lastUpdatedBy?: string | null;
   lastUpdatedVia?: string | null;
   tags?: string[];
+  types?: string[];
   /** Always present (`{}` when empty) — see `Note.metadata`. */
   metadata?: Record<string, unknown>;
   byteSize: number;
@@ -471,7 +476,7 @@ export interface Store {
   // Notes. `actor` / `via` carry write-attribution (vault#298) — the
   // principal + interface stamped onto created_by/created_via (and mirrored
   // into the last_updated_* pair on create). Omitted → attribution NULL.
-  createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string; extension?: string; actor?: string | null; via?: string | null; /** Bulk import only; see SqliteStore.createNote. */ deferWikilinkSync?: boolean }): Promise<Note>;
+  createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string; extension?: string; actor?: string | null; via?: string | null; /** Bulk import only; see SqliteStore.createNote. */ deferWikilinkSync?: boolean; /** Scope gap 1: the writer's visibility (see SqliteStore.updateNote). */ linkVisible?: (noteId: string) => boolean }): Promise<Note>;
   getNote(id: string): Promise<Note | null>;
   /**
    * Look up a note by path. Pass `extension` to disambiguate when
@@ -503,7 +508,7 @@ export interface Store {
        * update-note executor must not either. §10.24 pins that.
        */
       historyOp?: HistoryOp;
-      actor?: string | null; via?: string | null; if_updated_at?: string; tagsForSchemaResolution?: string[] }): Promise<Note>;
+      actor?: string | null; via?: string | null; if_updated_at?: string; tagsForSchemaResolution?: string[]; /** Scope gap 1: the writer's visibility (see SqliteStore.updateNote). */ linkVisible?: (noteId: string) => boolean }): Promise<Note>;
   /**
    * Set a note's `created_at` and `updated_at` explicitly. Import-only:
    * used by the portable-md round-trip path to restore timestamps from
@@ -526,6 +531,14 @@ export interface Store {
   getNoteVersion(id: string, versionIx: number): Promise<(VersionRow & { content: string | null }) | null>;
   restoreNoteVersion(id: string, versionIx: number, opts: { actor?: string | null; via?: string | null; if_updated_at?: string }): Promise<Note>;
   eraseNoteHistory(id: string): Promise<{ versionsDeleted: number; blobsDeleted: number }>;
+  /**
+   * Delete a note and erase every version of it, in one transaction, with no tombstone (T-412). An id whose note is
+   * already deleted has its leftover history erased. `deleted` says whether a note was there to delete. Fires
+   * `deleted` like deleteNote when it was.
+   */
+  forgetNote(id: string, opts?: { actor?: string | null; via?: string | null }): Promise<{ deleted: boolean; versionsDeleted: number; blobsDeleted: number }>;
+  /** Deleted notes that still have history, newest deletion first (T-412). */
+  listDeletedNotes(opts?: { limit?: number; offset?: number }): Promise<{ notes: DeletedNoteRow[]; total: number }>;
   sweepDeletedHistory(): { notesSwept: number; versionsDeleted: number; blobsDeleted: number };
   countNoteVersions(id: string): Promise<number>;
   compactNote(id: string): CompactResult;
@@ -539,7 +552,8 @@ export interface Store {
    * always present in the response — even on an empty page — so an
    * agent loop can persist a single watermark and keep polling.
    */
-  queryNotesPaged(opts: QueryOpts): Promise<QueryNotesPage>;
+  /** `visible`: page and cursor over only the notes a scoped caller may see (scope gap 2). */
+  queryNotesPaged(opts: QueryOpts, visible?: (note: Note) => boolean): Promise<QueryNotesPage>;
   /**
    * Aggregation / rollup query. Applies every OTHER filter in `opts` (tags,
    * metadata, date range, write-attribution, `ids`, ...) exactly as
@@ -547,8 +561,9 @@ export interface Store {
    * an indexed metadata field) and returns `[{group, value}]` — one row per
    * group, count or sum per `opts.aggregate.op`. `cursor`/`orderBy`/`sort`/
    * `limit`/`offset` on `opts` are ignored. Throws `QueryError` (code
-   * `FIELD_NOT_INDEXED`) when `group_by`/`field` isn't a declared indexed
-   * field, or `INVALID_QUERY` for a malformed `aggregate` spec (missing
+   * `FIELD_NOT_INDEXED`) when `group_by`/`field`, or a `metadata` operator
+   * or `dateFilter` field, isn't a declared indexed field (an aggregate
+   * doesn't scan: its reply has no warnings), or `INVALID_QUERY` for a malformed `aggregate` spec (missing
    * `field` on a `"sum"`, a non-numeric `field`, ...).
    */
   aggregateNotes(opts: QueryOpts): Promise<AggregateRow[]>;
@@ -580,7 +595,14 @@ export interface Store {
    * provider is configured or the configured one isn't ready — never a
    * silent fallback to keyword search.
    */
-  semanticSearch(nearText: string, opts?: QueryOpts): Promise<SemanticSearchResult>;
+  semanticSearch(nearText: string, opts?: QueryOpts & { visible?: (note: Note) => boolean }): Promise<SemanticSearchResult>;
+  /** T-461 prototype: whether meaning search can answer at all (an embedding provider is configured). Cheap. */
+  hasMeaningSearch?(): boolean;
+  /** T-461 prototype: keyword + meaning fused by rank (core/src/hybrid.ts). Optional while it's a prototype. */
+  hybridSearch?(
+    text: string,
+    opts?: QueryOpts & { visible?: (note: Note) => boolean },
+  ): Promise<{ notes: Note[]; meaning: "ok" | "unavailable"; meaningReason?: string; pendingCount: number; totalCandidates: number }>;
 
   // Tags
   tagNote(noteId: string, tags: string[]): Promise<void>;
@@ -712,6 +734,12 @@ export interface Store {
   listTagRecords(): Promise<TagRecord[]>;
   getTagRecord(tag: string): Promise<TagRecord | null>;
   /**
+   * T-318 §8a: the tags whose RECORDED kind is `type` (a record's `kind` is
+   * the effective one, which also counts being another tag's parent). The
+   * portable export uses it to keep a promoted type that is also a parent.
+   */
+  recordedTypeNames(): Promise<Set<string>>;
+  /**
    * Partial upsert. Any patch field left undefined is preserved; pass
    * null to clear. Touching `parent_names` invalidates the tag-hierarchy
    * cache. Returns the post-write row.
@@ -723,6 +751,7 @@ export interface Store {
       fields?: Record<string, TagFieldSchema> | null;
       relationships?: TagRelationshipMap | null;
       parent_names?: string[] | null;
+      kind?: "type" | "tag";
     },
   ): Promise<TagRecord>;
 

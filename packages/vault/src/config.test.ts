@@ -52,6 +52,15 @@ describe("config", () => {
     expect(loaded!.api_keys[0].id).toBe("k_abc123");
   });
 
+  test("a description of several paragraphs comes back whole (a blank line is not its end)", () => {
+    const description = "First paragraph, about the vault.\n\nSecond paragraph.\n  an indented line\nkey: looks like yaml";
+    writeVaultConfig({ name: "testvault", description, api_keys: [], created_at: "2026-01-01T00:00:00.000Z" });
+    const loaded = readVaultConfig("testvault");
+    expect(loaded!.description).toBe(description);
+    // What follows the description is still read as config, not swallowed into it.
+    expect(loaded!.created_at).toBe("2026-01-01T00:00:00.000Z");
+  });
+
   test("round-trips tag_schemas in vault config", () => {
     const config: VaultConfig = {
       name: "testvault",

@@ -27,6 +27,7 @@ import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { CONFIG_DIR } from "./config.ts";
+import { adoptLiveTokens, hasTokensToAdopt } from "./keys.ts";
 
 export function hubDbPath(configDir: string = CONFIG_DIR): string {
   return join(configDir, "hub.db");
@@ -979,4 +980,91 @@ export function migrate(db: Database): void {
       insert.run(m.version, new Date().toISOString());
     })();
   }
+  ensureKeys(db);
+  ensureGrantGenerations(db);
+}
+
+/**
+ * Keys with scopes (T-318 design §2; keys.ts). Not a numbered migration on
+ * purpose: the table is additive and a 0.7 or 0.8 hub ignores it, so hub.db
+ * keeps its schema number, the 0.8 takeover opens a home with no migration,
+ * and its code-only rollback still works. Run at every open, idempotently: the
+ * table if missing, then a key for every live token that has none (which also
+ * fills in mints an older hub recorded in between).
+ *
+ * A key names, owns and describes one row of the token registry; the token row
+ * stays the one source of truth for signature, expiry, revocation, scopes and
+ * tag scope (read live), so a key can never change how a token verifies. An
+ * app's key follows its refresh family through rotation.
+ *
+ *   name        unique, human: the token's label, app or person
+ *   owner       users.id for a person's (or a person's agent's or app's) key; the
+ *               service name for a service key; NULL if unknown
+ *   owner_kind  person | agent | app | service
+ *   types       type scope (JSON array); NULL until keys scope by type
+ *   denies      explicit denies (JSON array, e.g. ["private"]); NULL until enforced
+ *   last_used_at when the hub last let the key through to a vault (keys.ts touchKey); NULL if never
+ */
+export function ensureKeys(db: Database): void {
+  // Every open of hub.db runs this, beside a hub that may be writing. Nothing to do is the usual case: check that
+  // with a read. Otherwise take the write lock first (IMMEDIATE, which waits out busy_timeout): a read-then-write
+  // transaction that loses the race to another writer gets "database is locked" at once, without waiting.
+  const hasTable = db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'keys'").get();
+  const hasLastUsed =
+    !!hasTable && (db.query("PRAGMA table_info(keys)").all() as { name: string }[]).some((c) => c.name === "last_used_at");
+  if (hasTable && hasLastUsed && !hasTokensToAdopt(db)) return;
+  db.transaction(() => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS keys (
+        name TEXT PRIMARY KEY,
+        jti TEXT NOT NULL UNIQUE REFERENCES tokens(jti) ON DELETE CASCADE,
+        owner TEXT,
+        owner_kind TEXT NOT NULL CHECK (owner_kind IN ('person', 'agent', 'app', 'service')),
+        types TEXT,
+        denies TEXT,
+        created_via TEXT,
+        created_at TEXT NOT NULL,
+        last_used_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS keys_owner ON keys (owner);
+    `);
+    // 0.9.1 (T-414): when the hub last let the key through. Additive, like the table: an older hub ignores it.
+    const cols = db.query("PRAGMA table_info(keys)").all() as { name: string }[];
+    if (!cols.some((c) => c.name === "last_used_at")) db.exec("ALTER TABLE keys ADD COLUMN last_used_at TEXT");
+    adoptLiveTokens(db);
+  }).immediate();
+}
+
+/**
+ * The grant generation (T-446, grant-generation.ts): a counter per (user, client) that a narrowing account-door
+ * choice bumps, and the generation each auth code and refresh row was minted under. Not a numbered migration, for
+ * the same reason as `keys`: it is additive (a new table, two columns defaulting to 0), an 0.8 hub ignores it, and
+ * hub.db keeps schema 24 so the 0.8 takeover's code-only rollback still opens it. A row an older hub writes gets 0;
+ * if that hub ran after a narrowing, those rows don't match the bumped generation and the app re-consents (fails
+ * safe). Idempotent at every open: check with a read, then take the write lock (IMMEDIATE) as `ensureKeys` does.
+ *
+ * `grant_generations` has no foreign keys on purpose: it must outlive the grant row (a revoke-then-reconsent must
+ * not reset it to 0), and an orphan row for a deleted user or client is a harmless number. A future numbered
+ * migration that rebuilds `tokens` or `auth_codes` must carry `grant_generation` across.
+ */
+export function ensureGrantGenerations(db: Database): void {
+  const hasCol = (table: string) =>
+    (db.query(`PRAGMA table_info(${table})`).all() as { name: string }[]).some((c) => c.name === "grant_generation");
+  const ready = () =>
+    !!db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'grant_generations'").get() &&
+    hasCol("tokens") &&
+    hasCol("auth_codes");
+  if (ready()) return;
+  db.transaction(() => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS grant_generations (
+        user_id TEXT NOT NULL,
+        client_id TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        PRIMARY KEY (user_id, client_id)
+      );
+    `);
+    if (!hasCol("tokens")) db.exec("ALTER TABLE tokens ADD COLUMN grant_generation INTEGER NOT NULL DEFAULT 0");
+    if (!hasCol("auth_codes")) db.exec("ALTER TABLE auth_codes ADD COLUMN grant_generation INTEGER NOT NULL DEFAULT 0");
+  }).immediate();
 }

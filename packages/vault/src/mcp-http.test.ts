@@ -200,3 +200,27 @@ describe("note mutation tools require an id (vault#705)", () => {
     });
   }
 });
+
+// T-456: a tool's MCP annotations follow what the connection can do with it. vault-info sets the vault-wide
+// description only for an admin with no tag scope (mcp-tools.ts refuses a tag-scoped one), so for a tag-scoped admin
+// it must not say it changes things, and for a plain admin it must not say read-only.
+describe("tools/list annotations follow the caller's level", () => {
+  const tools = () => [
+    { name: "vault-info", description: "d", inputSchema: { type: "object", properties: {} }, requiredVerb: "read" as const, execute: () => ({}) },
+  ];
+  async function vaultInfoHints(auth: AuthResult): Promise<Record<string, unknown> | undefined> {
+    const req = new Request("http://localhost:1940/vault/v/mcp", {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
+    });
+    const res: any = await (await handleMcp(req, tools, "test-server", "v", auth, "")).json();
+    return res.result.tools.find((t: { name: string }) => t.name === "vault-info")?.annotations;
+  }
+
+  test("an admin's vault-info is a change; a tag-scoped admin's, like a writer's, is read-only", async () => {
+    expect((await vaultInfoHints(fullAuth()))?.readOnlyHint).toBe(false);
+    expect((await vaultInfoHints({ ...fullAuth(), scoped_tags: ["work"] }))?.readOnlyHint).toBe(true);
+    expect((await vaultInfoHints({ ...fullAuth(), scopes: ["vault:v:read", "vault:v:write"] }))?.readOnlyHint).toBe(true);
+  });
+});

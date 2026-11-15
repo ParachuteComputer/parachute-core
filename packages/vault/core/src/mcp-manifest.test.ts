@@ -12,7 +12,7 @@
  *     built tools and the manifest disagree.
  *
  *  2. The observable contract shape — the ordered tool names, their scope
- *     verbs, and their inclusion conditions (no-seam → 13 core; +tickets → 2;
+ *     verbs, and their inclusion conditions (no-seam → 14 core; +tickets → 2;
  *     +bytes → 1) — matches the table captured from `main` at extraction
  *     time. A verb or a conditional-inclusion change is a wire-contract event
  *     and must update this table deliberately.
@@ -66,6 +66,8 @@ const EXPECTED: ReadonlyArray<{
   { name: "find-path", requiredVerb: "read", condition: "core", hasResultContent: false },
   { name: "vault-info", requiredVerb: "read", condition: "core", hasResultContent: false },
   { name: "prune-schema", requiredVerb: "admin", condition: "core", hasResultContent: false },
+  // 0.9.2: reached only as manage-types {action: "migrate"} (mcp-short.ts FOLD_ONLY).
+  { name: "migrate-field", requiredVerb: "admin", condition: "core", hasResultContent: false },
   { name: "doctor", requiredVerb: "read", condition: "core", hasResultContent: false },
   { name: "request-attachment-upload", requiredVerb: "write", condition: "attachment-tickets", hasResultContent: false },
   { name: "request-attachment-download", requiredVerb: "read", condition: "attachment-tickets", hasResultContent: false },
@@ -94,10 +96,10 @@ describe("MCP_TOOL_MANIFEST — shape", () => {
 });
 
 describe("generateMcpTools — conditional inclusion (byte-for-byte with main)", () => {
-  test("no seams → exactly the 13 core-condition tools, in manifest order", () => {
+  test("no seams → exactly the 14 core-condition tools, in manifest order", () => {
     const tools = generateMcpTools(fakeStore);
     expect(names(tools)).toEqual(EXPECTED.filter((e) => e.condition === "core").map((e) => e.name));
-    expect(tools.length).toBe(13);
+    expect(tools.length).toBe(14);
   });
 
   test("attachmentTickets seam appends the 2 ticket tools (upload=write, download=read)", () => {
@@ -105,7 +107,7 @@ describe("generateMcpTools — conditional inclusion (byte-for-byte with main)",
     expect(names(tools)).toEqual(
       EXPECTED.filter((e) => e.condition === "core" || e.condition === "attachment-tickets").map((e) => e.name),
     );
-    expect(tools.length).toBe(15);
+    expect(tools.length).toBe(16);
   });
 
   test("attachmentBytes seam appends read-attachment only", () => {
@@ -113,13 +115,13 @@ describe("generateMcpTools — conditional inclusion (byte-for-byte with main)",
     expect(names(tools)).toEqual(
       EXPECTED.filter((e) => e.condition === "core" || e.condition === "attachment-bytes").map((e) => e.name),
     );
-    expect(tools.length).toBe(14);
+    expect(tools.length).toBe(15);
   });
 
-  test("both seams → all 16 tools in emission order", () => {
+  test("both seams → all 17 tools in emission order", () => {
     const tools = generateMcpTools(fakeStore, { ...ticketOpts, ...bytesOpts });
     expect(names(tools)).toEqual(EXPECTED.map((e) => e.name));
-    expect(tools.length).toBe(16);
+    expect(tools.length).toBe(17);
   });
 });
 

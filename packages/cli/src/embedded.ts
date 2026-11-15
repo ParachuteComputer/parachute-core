@@ -194,7 +194,7 @@ interface VaultPart {
 function startVaultChild(o: { home: string; host: string; port: number; issuer: string; accepted: string[]; hubLoopback: string }): VaultPart {
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) if (v !== undefined) env[k] = v;
-  // No first-boot auto-create: it logs a full API key (PLAN §2.2 item 3); the host bootstraps the vault.
+  // No first-boot auto-create (PLAN §2.2 item 3): the host bootstraps the vault.
   delete env.PARACHUTE_VAULT_NAME;
   Object.assign(env, {
     PARACHUTE_HOME: o.home,

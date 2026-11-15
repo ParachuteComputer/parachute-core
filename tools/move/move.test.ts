@@ -1,0 +1,228 @@
+// The move's proof must be able to fail. These hold the parts that decide a verdict: the tar a door reads, what the
+// plan flags before a move, and what the comparison excuses. The moves themselves run against real doors in
+// contracts/harness/doors/moves.ts.
+import { describe, expect, test } from "bun:test";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { boxDescription, compareDigests, formatRisks, safeToDelete, sha, SECTIONS, stillHolds, type Digest, type Section } from "./digest.ts";
+import { filesFromExport } from "./doors.ts";
+import { tar, untar } from "./tar.ts";
+
+function digestOf(lines: Partial<Record<Section, string[]>>, extra: Partial<Digest> = {}): Digest {
+  const all = Object.fromEntries(SECTIONS.map((s) => [s, lines[s] ?? []])) as Record<Section, string[]>;
+  const digests = Object.fromEntries(SECTIONS.map((s) => [s, sha([...all[s]].sort().join("\n"))])) as Digest["digests"];
+  digests.all = sha(SECTIONS.map((s) => digests[s]).join("|"));
+  const counts = { ...Object.fromEntries(SECTIONS.map((s) => [s, all[s].length])), attributed_notes: 0, versions: 0 } as Digest["counts"];
+  return { vault: "v", reader: "rest", counts, digests, lines: all, files: [], risks: [], ...extra };
+}
+const note = (id: string, body: string, fields: unknown = {}) => JSON.stringify([id, `p/${id}`, "md", sha(body), fields, [], "t1", "t2"]);
+
+describe("the comparison", () => {
+  const base = { notes: [note("a", "one"), note("b", "two")], links: ["a\tb\twikilink"], attachments: [JSON.stringify(["a", "2026-01-01/x.png", "image/png", "aa"])], tag_schemas: [JSON.stringify(["task", null, { s: { type: "string" } }, null, null])] };
+
+  test("the same vault is equal", () => {
+    const c = compareDigests(digestOf(base), digestOf(base));
+    expect(c.verdict).toBe("DIGEST EQUAL");
+    expect(c.ok).toBe(true);
+  });
+
+  test("a dropped note, a changed body, a changed file byte, a changed type and a lost link each fail", () => {
+    const cases: Partial<Record<Section, string[]>>[] = [
+      { ...base, notes: [note("a", "one")] },
+      { ...base, notes: [note("a", "one"), note("b", "two!")] },
+      { ...base, attachments: [JSON.stringify(["a", "2026-01-01/x.png", "image/png", "ab"])] },
+      { ...base, tag_schemas: [JSON.stringify(["task", null, { s: { type: "integer" } }, null, null])] },
+      { ...base, links: [] },
+    ];
+    for (const changed of cases) {
+      const c = compareDigests(digestOf(base), digestOf(changed));
+      expect(c.verdict).toBe("DIGEST DIFFERS");
+      expect(c.ok).toBe(false);
+    }
+  });
+
+  test("a note accepted before the move is excused; any other note is not, and a count is never enough", () => {
+    const changed = { ...base, notes: [note("a", "one", { k: 1 }), note("b", "two")] };
+    const src = digestOf({ ...base, notes: [note("a", "one", { "k y": 1 }), note("b", "two")] });
+    const fieldRisk = (id: string) => [{ id, why: "a field name with a space, a colon or a non-ASCII character" }];
+    expect(compareDigests(src, digestOf(changed), { acceptNotes: fieldRisk("a") }).verdict).toBe("DIGEST EQUAL EXCEPT REVIEWED ITEMS");
+    expect(compareDigests(src, digestOf(changed), { acceptNotes: fieldRisk("b") }).ok).toBe(false);
+    expect(compareDigests(src, digestOf(changed)).ok).toBe(false);
+    // Accepting one note doesn't cover a second that changed too.
+    const two = { ...base, notes: [note("a", "one", { k: 1 }), note("b", "TWO")] };
+    expect(compareDigests(src, digestOf(two), { acceptNotes: fieldRisk("a") }).ok).toBe(false);
+  });
+
+  test("an accepted note is excused only for what its risk changes: a field-name risk doesn't cover a changed body, path or tags", () => {
+    const src = digestOf({ ...base, notes: [note("a", "one", { "k y": 1 }), note("b", "two")] });
+    const fieldRisk = [{ id: "a", why: "a field name with a space, a colon or a non-ASCII character" }];
+    const bodyToo = digestOf({ ...base, notes: [note("a", "ONE", { k: 1 }), note("b", "two")] });
+    expect(compareDigests(src, bodyToo, { acceptNotes: fieldRisk }).ok).toBe(false);
+    const moved = JSON.stringify(["a", "elsewhere/a", "md", sha("one"), { k: 1 }, [], "t1", "t2"]);
+    expect(compareDigests(src, digestOf({ ...base, notes: [moved, note("b", "two")] }), { acceptNotes: fieldRisk }).ok).toBe(false);
+    // CRLF is a risk about the body: it excuses the body, and not the fields.
+    const crlf = [{ id: "a", why: "a body with CRLF line endings" }];
+    const plain = digestOf({ ...base, notes: [note("a", "one"), note("b", "two")] });
+    expect(compareDigests(plain, digestOf({ ...base, notes: [note("a", "one "), note("b", "two")] }), { acceptNotes: crlf }).verdict).toBe("DIGEST EQUAL EXCEPT REVIEWED ITEMS");
+    expect(compareDigests(plain, digestOf({ ...base, notes: [note("a", "one", { x: 1 }), note("b", "two")] }), { acceptNotes: crlf }).ok).toBe(false);
+  });
+
+  test("a lost description fails", () => {
+    const withIt = digestOf({ ...base, description: [sha("A vault about the valley.")] });
+    expect(compareDigests(withIt, digestOf(base)).ok).toBe(false);
+    expect(compareDigests(withIt, digestOf({ ...base, description: [sha("Another text.")] })).ok).toBe(false);
+    expect(compareDigests(withIt, digestOf({ ...base, description: [sha("A vault about the valley.")] })).verdict).toBe("DIGEST EQUAL");
+  });
+
+  test("an operator's comparison leaves the description to the hand-over, and nothing else", () => {
+    const withIt = digestOf({ ...base, description: [sha("A vault about the valley.")] });
+    const c = compareDigests(withIt, digestOf(base), { descriptionAtHandOver: true });
+    expect(c.verdict).toBe("DIGEST EQUAL");
+    expect(c.lines.join("\n")).toContain("handed to its owner");
+    expect(compareDigests(withIt, digestOf({ ...base, links: [] }), { descriptionAtHandOver: true }).ok).toBe(false);
+  });
+
+  test("a lost duplicate (digests differ, no line differs) fails", () => {
+    const a = digestOf(base);
+    const b = digestOf(base);
+    b.digests.links = sha("something else");
+    b.digests.all = sha("x");
+    expect(compareDigests(a, b).ok).toBe(false);
+  });
+
+  test("types with no fields may become tags only when the move goes down a release, and never the other way", () => {
+    const up = digestOf({ ...base, bare_types: ["idea"] });
+    const down = digestOf(base);
+    expect(compareDigests(up, down).ok).toBe(false);
+    // `idea` is on no note here, so on 0.8 it is gone, not a tag: excused only when that was accepted.
+    expect(compareDigests(up, down, { dropBareTypes: true }).ok).toBe(false);
+    expect(compareDigests(up, down, { dropBareTypes: "and-unused" }).verdict).toBe("DIGEST EQUAL EXCEPT REVIEWED ITEMS");
+    // On a note, it survives as a tag there.
+    const used = digestOf({ ...base, bare_types: ["idea"], tags_in_use: ["idea"] });
+    expect(compareDigests(used, digestOf({ ...base, tags_in_use: ["idea"] }), { dropBareTypes: true }).verdict).toBe("DIGEST EQUAL EXCEPT REVIEWED ITEMS");
+    expect(compareDigests(down, up, { dropBareTypes: true }).ok).toBe(false);
+  });
+});
+
+describe("what the plan flags before a move", () => {
+  const why = (content: string | null, meta: unknown) => formatRisks("n", content, meta).map((r) => r.why);
+
+  test("ordinary notes carry exactly: nested objects, lists, URLs, unicode values", () => {
+    expect(why("# Hi\n\nGrüße 東京\n", { status: "a:b", urls: ["https://example.org/a"], people: [{ name: "Sam" }], nested: { deep: { list: [1, 2] } }, "snake_case-and.dots": 1 })).toEqual([]);
+  });
+
+  test("the shapes the format is known to lose are named", () => {
+    expect(why("x", { "a key": 1 })).toContain("a field name with a space, a colon or a non-ASCII character");
+    expect(why("x", { "k:v": 1 })).toContain("a field name with a space, a colon or a non-ASCII character");
+    expect(why("x", { größe: 1 })).toContain("a field name with a space, a colon or a non-ASCII character");
+    expect(why("x", { m: [[1, 2]] })).toContain("a list directly inside a list");
+    expect(why("x", { m: [{}] })).toContain("an empty object inside a list");
+    expect(why("x", { m: "a\u2028b" })).toContain("a string with a U+2028 or U+2029 line separator");
+    expect(why("a\r\nb", {})).toContain("a body with CRLF line endings");
+    expect(why("x", '"just text"')).toContain("fields stored as text, not as an object");
+  });
+});
+
+describe("the tar a door reads", () => {
+  test("files come back byte for byte, long and non-ASCII names included, in a stable order", () => {
+    const long = `Notes/${"a very long title ".repeat(8)}end.md`;
+    const files = [
+      { name: "b.md", bytes: new TextEncoder().encode("---\nid: 1\n---\nbody\n") },
+      { name: long, bytes: new TextEncoder().encode("long") },
+      { name: "Grüße/東京.md", bytes: new TextEncoder().encode("unicode") },
+      { name: ".parachute/attachments/abc/x.png", bytes: new Uint8Array([0x89, 0x50, 0, 255, 254, 13, 10]) },
+      { name: "empty.md", bytes: new Uint8Array(0) },
+    ];
+    const packed = tar(files);
+    expect(packed.length % 512).toBe(0);
+    const back = untar(packed);
+    expect(back.map((f) => f.name).sort()).toEqual(files.map((f) => f.name).sort());
+    for (const f of files) expect(Buffer.from(back.find((b) => b.name === f.name)!.bytes).equals(Buffer.from(f.bytes))).toBe(true);
+    expect(Buffer.from(tar([...files].reverse())).equals(Buffer.from(packed))).toBe(true);
+  });
+
+  test("a GNU long-name record is refused, not read as a wrong name", () => {
+    const h = new Uint8Array(1024);
+    h.set(new TextEncoder().encode("././@LongLink"), 0);
+    h.set(new TextEncoder().encode("00000000010"), 124);
+    h[156] = "L".charCodeAt(0);
+    expect(() => untar(h)).toThrow(/GNU long name/);
+  });
+
+  test("a cut-short tar is refused", () => {
+    const packed = tar([{ name: "a.md", bytes: new Uint8Array(2000) }]);
+    expect(() => untar(packed.subarray(0, 1024))).toThrow(/cut short/);
+  });
+});
+
+describe("matching attached files to the export", () => {
+  const bytes = new Uint8Array([1, 2, 3]);
+  const exported = { how: "GET /api/export" as const, files: [{ name: ".parachute/attachments/att1/123-x.png", bytes }] };
+  test("a file is matched by name and bytes; a file whose bytes differ in the export stops the move", () => {
+    const src = digestOf({}, { files: [{ note: "a", path: "2026-01-01/123-x.png", mime: "image/png", size: 3, sha256: sha(bytes) }] });
+    expect(filesFromExport(exported, src).map((f) => f.path)).toEqual(["2026-01-01/123-x.png"]);
+    const wrong = digestOf({}, { files: [{ note: "a", path: "2026-01-01/123-x.png", mime: "image/png", size: 3, sha256: sha(new Uint8Array([9])) }] });
+    expect(() => filesFromExport(exported, wrong)).toThrow(/doesn't hold the file/);
+  });
+});
+
+describe("a box's description", () => {
+  test("is read from the block the box writes, several lines and all", () => {
+    const dir = mkdtempSync(join(tmpdir(), "move-test-"));
+    const y = join(dir, "vault.yaml");
+    writeFileSync(y, 'name: atlas\ndescription: |\n  Atlas: a made-up vault.\n  Second line.\ncreated_at: "2026-11-01T00:00:00.000Z"\n');
+    expect(boxDescription(y)).toBe("Atlas: a made-up vault.\nSecond line.");
+    writeFileSync(y, 'name: atlas\ncreated_at: "2026-11-01T00:00:00.000Z"\n');
+    expect(boxDescription(y)).toBeNull();
+    expect(boxDescription(join(dir, "missing.yaml"))).toBeNull();
+  });
+});
+
+describe("before the old copy is deleted: does the new door still hold the vault?", () => {
+  const file = (path: string, bytes: string) => ({ note: "a", path, mime: "image/png", size: 3, sha256: sha(bytes) });
+  const ids = Array.from({ length: 20 }, (_, i) => `n${i}`);
+  const files = [file("x.png", "x"), file("y.png", "y"), file("z.png", "z")];
+  const moved = digestOf({ notes: ids.map((id) => note(id, id)) }, { files });
+  const now = (notes: string[], f = files) => digestOf({ notes }, { files: f });
+  const verdict = (d: Digest) => safeToDelete(stillHolds(moved, d)).ok;
+
+  test("a new door in light use still holds it: notes added, one edited, one removed", () => {
+    const used = now([...ids.slice(2).map((id) => note(id, id)), note("n1", "edited"), note("new", "n")]);
+    expect(stillHolds(moved, used)).toEqual({ moved: 20, there: 19, changed: 1, gone: 1, added: 1, files: { moved: 3, there: 3 } });
+    expect(verdict(used)).toBe(true);
+    expect(verdict(moved)).toBe(true);
+  });
+
+  test("a wiped or reset door doesn't: a fresh vault's own notes don't count", () => {
+    expect(verdict(now([note("seed1", "s"), note("seed2", "s")], []))).toBe(false);
+  });
+
+  test("every id there but the bodies blanked (a bad sync) doesn't", () => {
+    expect(verdict(now(ids.map((id) => note(id, ""))))).toBe(false);
+  });
+
+  test("a part restore doesn't: nine of twenty notes gone", () => {
+    expect(verdict(now(ids.slice(9).map((id) => note(id, id))))).toBe(false);
+    // More than a tenth, by one.
+    expect(verdict(now(ids.slice(3).map((id) => note(id, id))))).toBe(false);
+    expect(verdict(now(ids.slice(2).map((id) => note(id, id))))).toBe(true);
+  });
+
+  test("one moved file gone, or its bytes changed, doesn't, whatever the notes say", () => {
+    expect(verdict(now(moved.lines.notes, files.slice(1)))).toBe(false);
+    expect(verdict(now(moved.lines.notes, [file("x.png", "other bytes"), files[1]!, files[2]!]))).toBe(false);
+    const why = safeToDelete(stillHolds(moved, now(moved.lines.notes, files.slice(1)))).why;
+    expect(why).toContain("1 of the 3 moved file(s)");
+  });
+
+  test("a small vault: any change is more than a tenth, and says so", () => {
+    const small = digestOf({ notes: ["a", "b", "c"].map((id) => note(id, id)) });
+    const r = safeToDelete(stillHolds(small, digestOf({ notes: [note("a", "a"), note("b", "edited"), note("c", "c")] })));
+    expect(r.ok).toBe(false);
+    expect(r.why).toContain("more than a tenth");
+    expect(safeToDelete(stillHolds(small, small)).ok).toBe(true);
+    // Nothing moved, nothing to lose.
+    expect(safeToDelete(stillHolds(digestOf({}), digestOf({}))).ok).toBe(true);
+  });
+});

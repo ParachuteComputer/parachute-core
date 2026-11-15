@@ -20,10 +20,11 @@
  */
 
 import type { Store, Note, HydratedLink, NoteSummary } from "../core/src/types.ts";
+import type { NoteVisible } from "../core/src/notes.ts";
 import type { TagFieldViolation } from "../core/src/tag-schemas.ts";
 import { ParentCycleError } from "../core/src/tag-schemas.ts";
-import { IndexedFieldError } from "../core/src/indexed-fields.ts";
-import { stripTagHash } from "../core/src/tag-hierarchy.ts";
+import { IndexedFieldError, IndexedFieldLimitError } from "../core/src/indexed-fields.ts";
+import { getTagExpansion, stripTagHash } from "../core/src/tag-hierarchy.ts";
 import { getVaultNameForStore } from "./vault-store.ts";
 import { readPrivateTagsConfig } from "./config.ts";
 
@@ -94,24 +95,50 @@ export async function expandTokenTagScope(
   privateTags?: string[] | null,
 ): Promise<TagScopeSet | null> {
   if (!scoped_tags || scoped_tags.length === 0) return null;
-  let priv: string[];
-  if (privateTags) priv = privateTags;
-  else {
-    const res = resolvePrivateTags(store);
-    if (!res.ok) {
-      const denied = new TagScopeSet();
-      denied.denyAll = true;
-      return denied;
-    }
-    priv = res.tags;
-  }
-  const out = new TagScopeSet(await store.expandTagsWithDescendants(scoped_tags));
+  const priv = privateTags ?? resolvePrivateTagsOrNull(store);
+  if (priv === null) return deniedScope();
+  return buildScope(scoped_tags, priv, await store.expandTagsWithDescendants(scoped_tags), priv.length > 0 ? await store.expandTagsWithDescendants(priv) : new Set());
+}
+
+/**
+ * `expandTokenTagScope` read synchronously from the store's cached tag
+ * hierarchy and the vault's current `private_tags` (scope gap 7). For a
+ * caller that must re-read the scope as it is NOW inside synchronous code: a
+ * live subscription re-expands it on every event, so a sub-tag declared or
+ * re-parented after the socket subscribed is seen, or dropped, at once.
+ */
+export function expandTokenTagScopeNow(store: Store, scoped_tags: string[] | null): TagScopeSet | null {
+  if (!scoped_tags || scoped_tags.length === 0) return null;
+  const priv = resolvePrivateTagsOrNull(store);
+  if (priv === null) return deniedScope();
+  const hierarchy = store.getTagHierarchy();
+  const expand = (tags: string[]) => {
+    const out = new Set<string>();
+    for (const t of tags) for (const x of getTagExpansion(hierarchy, t, "subtypes")) out.add(x);
+    return out;
+  };
+  return buildScope(scoped_tags, priv, expand(scoped_tags), expand(priv));
+}
+
+function resolvePrivateTagsOrNull(store: Store): string[] | null {
+  const res = resolvePrivateTags(store);
+  return res.ok ? res.tags : null;
+}
+
+function deniedScope(): TagScopeSet {
+  const denied = new TagScopeSet();
+  denied.denyAll = true;
+  return denied;
+}
+
+function buildScope(scoped_tags: string[], priv: string[], expanded: Set<string>, privExpanded: Set<string>): TagScopeSet {
+  const out = new TagScopeSet(expanded);
   out.scopedRoots = [...scoped_tags];
   if (priv.length > 0) {
     // Exempt = covered by the token itself: in the expanded allowlist, or
     // equal to / under a raw `scoped_tags` entry (string-form sub-tags).
     const named = (t: string) => out.has(t) || scoped_tags.some((s) => t === s || t.startsWith(`${s}/`));
-    for (const t of await store.expandTagsWithDescendants(priv)) {
+    for (const t of privExpanded) {
       if (!named(t)) out.privateTags.add(t);
     }
     out.privateRoots = priv.filter((p) => !named(p));
@@ -159,33 +186,45 @@ export function deniedTagNamesInUse(store: Store, allowed: Set<string> | null): 
 }
 
 /**
- * The `getVaultStats` filter for a scoped caller. `stats` has always been a
- * vault-wide aggregate for scoped tokens (pre-#271 behaviour, unchanged
- * here); vault#766 only subtracts the notes a private tag hides from this
- * caller. Returns `undefined` (plain vault-wide stats) when unscoped or when
- * nothing is private; an all-zero filter when the scope failed closed.
+ * The `getVaultStats` filter for a scoped caller: the same visible set as
+ * `map` (`scopedCountFilter`), so every figure counts only notes reachable
+ * through an in-scope tag and not hidden by a private tag, `topTags` names
+ * only in-scope tags, and `earliestNote`/`latestNote` are visible notes.
+ * T-419 (audit L3-10 #5): stats used to stay vault-wide for a scoped token
+ * (minus private tags only), which named hidden tags and note ids. Returns
+ * `undefined` (plain vault-wide stats) only when unscoped.
  */
 export function scopedStatsFilter(
   store: Store,
   allowed: Set<string> | null,
 ): { tagFilter?: string[]; excludeTags?: string[] } | undefined {
   if (!allowed) return undefined;
-  if (scopeDeniesAll(allowed)) return { tagFilter: [] };
-  const excludeTags = deniedTagNamesInUse(store, allowed);
-  return excludeTags.length > 0 ? { excludeTags } : undefined;
+  return scopedCountFilter(store, allowed);
 }
 
 /**
  * The count-query filter for a scoped caller: the allowlist to count
  * through, minus notes carrying a denied tag. A fail-closed scope counts
- * nothing (empty allowlist).
+ * nothing (empty allowlist). The allowlist also takes every tag in use whose
+ * `/` root is one of the token's own `scoped_tags` (an undeclared string-form
+ * sub-tag such as `work/meetings`), because `noteWithinTagScope` admits those
+ * notes on reads; without them the counts missed notes the token can read.
  */
 export function scopedCountFilter(
   store: Store,
   allowed: Set<string> | null,
 ): { tagFilter: string[]; excludeTags: string[] } {
   if (!allowed || scopeDeniesAll(allowed)) return { tagFilter: [], excludeTags: [] };
-  return { tagFilter: [...allowed], excludeTags: deniedTagNamesInUse(store, allowed) };
+  const roots = allowed instanceof TagScopeSet ? allowed.scopedRoots : [];
+  const tagFilter = new Set(allowed);
+  const excludeTags: string[] = [];
+  const rows = store.db.prepare("SELECT DISTINCT tag_name FROM note_tags").all() as { tag_name: string }[];
+  for (const { tag_name: t } of rows) {
+    const root = t.split("/")[0];
+    if (root && roots.includes(root)) tagFilter.add(t);
+    if (tagDeniedByPrivateTags(t, allowed)) excludeTags.push(t);
+  }
+  return { tagFilter: [...tagFilter], excludeTags };
 }
 
 /**
@@ -468,7 +507,25 @@ export function buildExpandVisibility(
   rawRoots: string[] | null,
 ): ((note: Note) => boolean) | undefined {
   if (rawRoots === null) return undefined;
-  return (note: Note) => noteWithinTagScope(note, allowed, rawRoots);
+  return tagScopeVisibility(() => ({ allowed, rawRoots }));
+}
+
+/**
+ * The tag-scope visibility predicate and its per-tag rule, built together from ONE scope source, so they cannot
+ * disagree: the function is `noteWithinTagScope` under the scope `scope()` returns now (read at each call, for a
+ * scope filled in later), and `byTag` says what a single tag does under that same scope (admit: `tagVisibleInScope`;
+ * deny: `tagDeniedByPrivateTags`). Core runs the rule as SQL over note_tags (the scoped keyword arm).
+ */
+export function tagScopeVisibility(scope: () => { allowed: Set<string> | null; rawRoots: string[] | null }): NoteVisible {
+  const visible = ((note: Note) => {
+    const { allowed, rawRoots } = scope();
+    return noteWithinTagScope(note, allowed, rawRoots);
+  }) as NoteVisible;
+  visible.byTag = (tag: string) => {
+    const { allowed, rawRoots } = scope();
+    return { admits: tagVisibleInScope(tag, allowed, rawRoots), denies: tagDeniedByPrivateTags(tag, allowed) };
+  };
+  return visible;
 }
 
 /**
@@ -500,15 +557,17 @@ export function buildExpandVisibility(
  * echo the stored note — a scoped caller could otherwise recover the full
  * tag set with a no-op `update-note`/`PATCH`.
  */
-export function scrubNoteTagsByScope<T extends { tags?: string[] }>(
+export function scrubNoteTagsByScope<T extends { tags?: string[]; types?: string[] }>(
   note: T,
   allowed: Set<string> | null,
   rawRoots: string[] | null,
 ): T {
   if (rawRoots === null || !note || !Array.isArray(note.tags)) return note;
   const visible = note.tags.filter((t) => tagVisibleInScope(t, allowed, rawRoots));
-  if (visible.length === note.tags.length) return note;
-  return { ...note, tags: visible };
+  // `types` (T-318 §8a) is a subset of `tags`: it gets the same scrub.
+  const types = Array.isArray(note.types) ? note.types.filter((t) => tagVisibleInScope(t, allowed, rawRoots)) : undefined;
+  if (visible.length === note.tags.length && (!types || types.length === note.types!.length)) return note;
+  return { ...note, tags: visible, ...(types ? { types } : {}) };
 }
 
 /** Array form of `scrubNoteTagsByScope`. No-op when unscoped. */
@@ -757,6 +816,14 @@ export function scrubIndexedFieldConflictError(
   allowed: Set<string> | null,
 ): IndexedFieldError {
   if (allowed === null) return err;
+  // The 0.9.2 ceiling's refusal lists unused indexed fields vault-wide. A
+  // scoped caller hears only the ones every declarer of which it can read;
+  // the count and limit stay (the refusal needs them to make sense).
+  if (err instanceof IndexedFieldLimitError) {
+    const unused = err.unused.filter((u) => u.declarer_tags.length > 0 && u.declarer_tags.every((t) => allowed.has(t)));
+    if (unused.length === err.unused.length) return err;
+    return new IndexedFieldLimitError(err.fields, err.got, unused, true);
+  }
   if (!Array.isArray(err.declarer_tags) || err.declarer_tags.length === 0) return err;
   if (err.declarer_tags.every((t) => allowed.has(t))) return err;
   return new IndexedFieldError(
@@ -801,6 +868,24 @@ export function scrubParentCycleError(
   if (err.cycle.every((t) => allowed.has(t))) return err;
   const scrubbedCycle = err.cycle.map((t) => (allowed.has(t) ? t : OUT_OF_SCOPE_LABEL));
   return new ParentCycleError(err.tag, scrubbedCycle);
+}
+
+/**
+ * 403 for a tag-scoped token on a vault-wide surface (T-419, audit L3-01 and
+ * L3-10 #4): the vault's description and config, triggers, and the mirror and
+ * import routes act on every note, not on a tag, so a scoped token can't use
+ * them at any verb. Same envelope as `tagScopeForbidden`.
+ */
+export function tagScopedVaultWideForbidden(scoped_tags: string[]): Response {
+  return Response.json(
+    {
+      error: "Forbidden",
+      error_type: "tag_scope_violation",
+      message: `This token is restricted to tags: ${scoped_tags.join(", ")}. This endpoint acts on the whole vault and needs a token with no tag restriction.`,
+      scoped_tags,
+    },
+    { status: 403 },
+  );
 }
 
 /**

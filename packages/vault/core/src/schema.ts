@@ -6,17 +6,58 @@ import { transaction } from "./txn.js";
 import { timestampToMs } from "./cursor.js";
 import { ensureRelationshipColumn } from "./wikilinks.js";
 import { rebuildCompactState } from "./history-compact-state.js";
+import { recordTagKinds } from "./tag-kind.js";
 
 export const SCHEMA_VERSION = 32;
+/**
+ * The newest schema this engine can open (T-460). Above SCHEMA_VERSION only for a schema whose new data this engine
+ * already reads: 33 stores version bodies compressed (blob-codec.ts), which this engine reads but doesn't write. So
+ * rolling back from the engine that writes 33 to this one still opens and reads every vault. Such a vault is opened
+ * as it is: no migration runs and no older stamp is written over it.
+ */
+export const READABLE_SCHEMA_VERSION = 33;
 
 function migrateToV32(db: Database): void {
     const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='history_compact_state'").get();
     // Read before initSchema records this open. On a timestamp tie, prefer
     // a harmless rebuild over missing an older writer's stale hints.
-    const previous = db.prepare("SELECT version FROM schema_version ORDER BY applied_at DESC, version ASC LIMIT 1").get() as { version: number } | null;
-    if (exists && (!previous || previous.version >= 32)) return;
+    const previous = latestStamp(db);
+    if (exists && (previous === null || previous >= 32)) return;
     rebuildCompactState(db);
 }
+
+/**
+ * Types and tags (T-318 design §8a): every tag record carries a kind, `type`
+ * for a tag with fields or parent_names, `tag` for the rest (being named as a
+ * parent is read live, tag-kind.ts). Not a numbered migration on purpose: the
+ * column is additive and older code names the columns it writes, so a 0.7 or
+ * 0.8 vault opens this file unchanged. The 0.8 takeover then opens a home with
+ * no migration, and its code-only rollback still works (contracts:
+ * lifecycle/takeover). Run on every full open (not the fast path: a vault
+ * already current, its column there, writes nothing), idempotently: the column
+ * if missing, then a kind for every row that has none. Rows an older vault adds
+ * in between are read by the same rule (tag-kind.ts KIND_SQL) until a full open
+ * records them. No membership moves; note_tags is untouched.
+ */
+/**
+ * The write stamp (0.9.1, core write-stamp.ts): `note_versions.via_kind`, the kind of the key that replaced a
+ * revision's content. Additive with no schema number, like ensureTagKinds: a 0.9.0 engine names the columns it
+ * writes and reads, so it opens the vault unchanged and ignores the column. Never backfilled.
+ */
+function ensureRevisionKeyKind(db: Database): void {
+  if (hasTable(db, "note_versions") && !hasColumn(db, "note_versions", "via_kind")) {
+    db.exec("ALTER TABLE note_versions ADD COLUMN via_kind TEXT");
+  }
+}
+
+function ensureTagKinds(db: Database): void {
+  const added = !hasColumn(db, "tags", "kind");
+  if (added) db.exec("ALTER TABLE tags ADD COLUMN kind TEXT");
+  const counts = recordTagKinds(db);
+  const existing = (db.prepare("SELECT COUNT(*) AS n FROM notes").get() as { n: number }).n > 0;
+  if (added && existing) console.error(`[vault] tags now carry a kind (types and tags): ${counts.types} types, ${counts.tags} tags`);
+}
+
 
 /**
  * Deterministic last-resort epoch for a note whose `updated_at` AND
@@ -27,6 +68,82 @@ function migrateToV32(db: Database): void {
  * would sort unpredictably and break the `> ?` keyset predicate.
  */
 const UNPARSEABLE_UPDATED_AT_MS = 0;
+
+/**
+ * The text of a note's field values, for the search index (0.9.3): every leaf of the metadata JSON, joined with
+ * spaces. Strings as they are, numbers as their text, booleans as `true`/`false` (json_tree's value for them is 1/0), a list or nested object by its leaves; null and the
+ * field NAMES are left out. `m` is the SQL expression holding the metadata (`new.metadata`, `old.metadata`, or the
+ * column). Malformed JSON gives '' rather than an error, so a bad value can't make a write fail.
+ */
+function fieldTextSql(m: string): string {
+  return `COALESCE(CASE WHEN json_valid(${m}) THEN (SELECT group_concat(CASE type WHEN 'true' THEN 'true' WHEN 'false' THEN 'false' ELSE value END, ' ') FROM json_tree(${m}) WHERE type NOT IN ('object', 'array')) END, '')`;
+}
+
+/**
+ * The insert trigger of the search index. It starts by clearing any field-text row left for the new id (a leftover can
+ * only come from outside this code), so the new note's own text, or none, is what gets indexed. A DELETE has no
+ * conflict clause for an outer `INSERT OR IGNORE` to override. ensureFtsInsertTrigger brings a vault that has the
+ * earlier form of this trigger to this one.
+ */
+const FTS_INSERT_TRIGGER_SQL = `CREATE TRIGGER IF NOT EXISTS notes_fts_insert AFTER INSERT ON notes BEGIN
+  DELETE FROM notes_field_text WHERE note_id = new.id;
+  INSERT INTO notes_field_text(note_id, text) SELECT new.id, t FROM (SELECT ${fieldTextSql("new.metadata")} AS t) WHERE t <> '';
+  INSERT INTO notes_fts(rowid, path, content, fields) VALUES (new.rowid, COALESCE(new.path, ''), new.content, COALESCE((SELECT text FROM notes_field_text WHERE note_id = new.id), ''));
+END;`;
+
+/**
+ * The search index over path, content and field values, as DDL. Column order matters: bm25(notes_fts, w0, w1, w2) in
+ * core/src/notes.ts is positional (path, content, fields; weights in search-query.ts).
+ *
+ * External content, read from the view `notes_fts_source` (notes joined to `notes_field_text`, which holds each
+ * record's field text, one small row per record that has any). FTS5 needs every one of its columns in the content
+ * table for 'rebuild', 'integrity-check', snippet() and highlight(), and `notes` has no field-text column; a column
+ * on `notes` would change the shape of the table every older engine reads with `SELECT n.*`, and a second FTS table
+ * would need two indexes ranked against each other. A view that computes the text from the metadata would be simplest,
+ * but FTS5 reads a view with a schema-qualified name, under which SQLite can't find json_tree ("no such table:
+ * main.json_tree"), so 'rebuild' would fail; the stored text is also what makes the 'delete' commands exact.
+ *
+ * The triggers are the only writers of `notes_field_text`. FTS5's 'delete' needs the exact values that were indexed,
+ * so they read the old text from the table, not from OLD.metadata. They live in the database file, so an older
+ * engine that opens a vault of this shape keeps the index right through its own writes.
+ *
+ * UPDATE OF content, path, metadata, with a WHEN so a write that changes none of them (or sets metadata to what it
+ * was) doesn't rewrite the index entry.
+ */
+const NOTES_FTS_SQL = `
+CREATE TABLE IF NOT EXISTS notes_field_text (
+  note_id TEXT PRIMARY KEY,
+  text TEXT NOT NULL
+) WITHOUT ROWID;
+
+CREATE VIEW IF NOT EXISTS notes_fts_source AS
+  SELECT n.rowid AS rid, COALESCE(n.path, '') AS path, n.content AS content, COALESCE(f.text, '') AS fields
+  FROM notes n LEFT JOIN notes_field_text f ON f.note_id = n.id;
+
+CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
+  path,
+  content,
+  fields,
+  content='notes_fts_source',
+  content_rowid='rid',
+  tokenize='porter unicode61'
+);
+
+${FTS_INSERT_TRIGGER_SQL}
+
+CREATE TRIGGER IF NOT EXISTS notes_fts_delete AFTER DELETE ON notes BEGIN
+  INSERT INTO notes_fts(notes_fts, rowid, path, content, fields) VALUES('delete', old.rowid, COALESCE(old.path, ''), old.content, COALESCE((SELECT text FROM notes_field_text WHERE note_id = old.id), ''));
+  DELETE FROM notes_field_text WHERE note_id = old.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS notes_fts_update AFTER UPDATE OF content, path, metadata ON notes
+WHEN old.content IS NOT new.content OR old.path IS NOT new.path OR old.metadata IS NOT new.metadata BEGIN
+  INSERT INTO notes_fts(notes_fts, rowid, path, content, fields) VALUES('delete', old.rowid, COALESCE(old.path, ''), old.content, COALESCE((SELECT text FROM notes_field_text WHERE note_id = old.id), ''));
+  DELETE FROM notes_field_text WHERE note_id = old.id;
+  INSERT OR REPLACE INTO notes_field_text(note_id, text) SELECT new.id, t FROM (SELECT ${fieldTextSql("new.metadata")} AS t) WHERE t <> '';
+  INSERT INTO notes_fts(rowid, path, content, fields) VALUES (new.rowid, COALESCE(new.path, ''), new.content, COALESCE((SELECT text FROM notes_field_text WHERE note_id = new.id), ''));
+END;
+`;
 
 export const SCHEMA_SQL = `
 -- Notes: the universal record.
@@ -93,7 +210,11 @@ CREATE TABLE IF NOT EXISTS tags (
   relationships TEXT,
   parent_names TEXT,
   created_at TEXT,
-  updated_at TEXT
+  updated_at TEXT,
+  -- T-318 §8a: 'type' (fields, parents) or 'tag' (a flat label); NULL on a
+  -- row made implicitly by tagging, read by the same rule (tag-kind.ts).
+  -- Additive, with no schema number: see ensureTagKinds.
+  kind TEXT
 );
 
 -- Note-Tag join
@@ -245,6 +366,9 @@ CREATE TABLE IF NOT EXISTS note_versions (
   superseded_at TEXT NOT NULL,
   actor         TEXT,
   via           TEXT,
+  -- The write stamp (0.9.1): the kind of the key in via (person, agent, app, service), NULL when via is no named
+  -- key. Additive, with no schema number: see ensureRevisionKeyKind.
+  via_kind      TEXT,
   op            TEXT NOT NULL,
   content_len   INTEGER NOT NULL,
   encoding      TEXT,
@@ -423,48 +547,16 @@ CREATE TABLE IF NOT EXISTS schema_version (
   applied_at TEXT NOT NULL
 );
 
--- Full-text search on note title (path) AND content (v25, vault#551 WS2B/C).
--- Two columns, declared in this order — bm25(notes_fts, w_path, w_content)
--- calls in core/src/notes.ts positionally match column 0 = path, column 1 =
--- content, weighted so a TITLE match outranks a passing body mention (see
--- SEARCH_WEIGHT_PATH/SEARCH_WEIGHT_CONTENT in core/src/search-query.ts).
--- Pre-v25, only content was indexed — a note's title/path was completely
--- unsearchable, which both defeated any title-biased ranking (nothing to
--- bias) and was a plain recall gap. tokenize='porter unicode61' adds
--- Porter stemming on top of the v3-era default unicode61 tokenizer so
--- regular-affix variants (firefighter/firefighters, microbe/microbes) match
--- each other; irregular plurals with a consonant change (wolf/wolves) are a
--- known Porter limitation, not fixed by this — see docs/HTTP_API.md.
--- Existing vaults upgrade via migrateToV25 (rebuild + repopulate); this
--- CREATE only reaches its new shape directly on a fresh vault.
-CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
-  path,
-  content,
-  content='notes',
-  content_rowid='rowid',
-  tokenize='porter unicode61'
-);
-
--- FTS triggers. UPDATE OF content, path (not content alone, pre-v25) —
--- either column changing must resync the index now that path is indexed too;
--- a path-only rename (content untouched) used to be silently invisible to
--- notes_fts because the trigger's column list didn't include it.
-CREATE TRIGGER IF NOT EXISTS notes_fts_insert AFTER INSERT ON notes BEGIN
-  INSERT INTO notes_fts(rowid, path, content) VALUES (new.rowid, COALESCE(new.path, ''), new.content);
-END;
-
-CREATE TRIGGER IF NOT EXISTS notes_fts_delete AFTER DELETE ON notes BEGIN
-  INSERT INTO notes_fts(notes_fts, rowid, path, content) VALUES('delete', old.rowid, COALESCE(old.path, ''), old.content);
-END;
-
-CREATE TRIGGER IF NOT EXISTS notes_fts_update AFTER UPDATE OF content, path ON notes BEGIN
-  INSERT INTO notes_fts(notes_fts, rowid, path, content) VALUES('delete', old.rowid, COALESCE(old.path, ''), old.content);
-  INSERT INTO notes_fts(rowid, path, content) VALUES (new.rowid, COALESCE(new.path, ''), new.content);
-END;
+-- Full-text search on a note's path (title), content (body) AND field values (0.9.3). See NOTES_FTS_SQL above this
+-- string: the three columns, the view that feeds them and the three sync triggers are one piece of DDL, shared
+-- with ensureFtsFields (the step that brings an older vault to this shape without a schema number).
+${NOTES_FTS_SQL}
 
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_notes_created ON notes(created_at);
-CREATE INDEX IF NOT EXISTS idx_notes_path ON notes(path) WHERE path IS NOT NULL;
+-- Path indexes are made by the migrations, not here: idx_notes_path_ext_unique (v18, uniqueness, case-sensitive) and
+-- idx_notes_path_nocase (ensurePathNocaseIndex, the case-insensitive lookups). This block used to make
+-- idx_notes_path, which v5 then dropped on every open: one index row written per note, twice, per wake (T-412).
 CREATE INDEX IF NOT EXISTS idx_note_tags_note ON note_tags(note_id, tag_name);
 CREATE INDEX IF NOT EXISTS idx_note_tags_tag ON note_tags(tag_name, note_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_note ON attachments(note_id);
@@ -622,17 +714,80 @@ export class NewerSchemaError extends Error {
   }
 }
 
-/** Throw NewerSchemaError if the database records a schema newer than SCHEMA_VERSION. Reads only. */
+/** Throw NewerSchemaError if the database records a schema newer than READABLE_SCHEMA_VERSION. Reads only. */
 export function assertNotNewer(db: Database): void {
-  if (!hasTable(db, "schema_version")) return;
+  const v = highestStamp(db);
+  if (v !== null && v > READABLE_SCHEMA_VERSION) throw new NewerSchemaError(v, READABLE_SCHEMA_VERSION);
+}
+
+function highestStamp(db: Database): number | null {
+  if (!hasTable(db, "schema_version")) return null;
   const row = db.prepare("SELECT MAX(version) AS v FROM schema_version").get() as { v: number | null } | null;
-  if (row?.v != null && row.v > SCHEMA_VERSION) throw new NewerSchemaError(row.v);
+  return row?.v ?? null;
+}
+
+/**
+ * The version the most recent initSchema stamped. An older vault that opened this file after a newer one stamps its
+ * own, older version later, so the latest stamp (not the highest) says whether the schema is current. On an
+ * applied_at tie the lower version wins: a needless full run is safe, a skipped one isn't.
+ */
+function latestStamp(db: Database): number | null {
+  if (!hasTable(db, "schema_version")) return null;
+  const row = db.prepare("SELECT version FROM schema_version ORDER BY applied_at DESC, version ASC LIMIT 1").get() as { version: number } | null;
+  return row?.version ?? null;
+}
+
+/**
+ * Whether every step initSchema runs without a schema number is already done. Such a step is additive, so an
+ * older engine of the same SCHEMA_VERSION still opens the vault and a rollback stays code-only; but that older
+ * engine also stamps the vault current, so the fast path must look for the step's own mark. The rule: **every
+ * un-numbered step in initSchema has its check here.** Missing one breaks every vault an older engine opened last
+ * (audit L2-01: 0.8 stamps 32 with the path index, 0.9's `kind` column came after, and every type lookup then
+ * failed with "no such column: t.kind"). Each check is one catalog read, no writes.
+ */
+export function unnumberedStepsDone(db: Database): boolean {
+  return (
+    hasIndex(db, "idx_notes_path_nocase") && // ensurePathNocaseIndex (T-412)
+    hasColumn(db, "tags", "kind") && // ensureTagKinds (T-318 §8a, 0.9)
+    (!hasTable(db, "note_versions") || hasColumn(db, "note_versions", "via_kind")) && // ensureRevisionKeyKind (0.9.1)
+    (!hasTable(db, "notes") || hasColumn(db, "notes_fts", "fields")) && // ensureFtsFields (0.9.3)
+    (!hasTable(db, "notes") || ftsInsertTriggerIsCurrent(db)) // ensureFtsInsertTrigger (0.9.3)
+  );
 }
 
 export function initSchema(db: Database): void {
   // Before anything writes: an older vault must never half-migrate, or re-stamp, a newer database.
   assertNotNewer(db);
   applyConnectionPragmas(db);
+
+  // A vault this code already brought to SCHEMA_VERSION needs nothing more. Every step below is meant to be
+  // idempotent, but running them all on each open is not free: on cloud every Durable Object wake did it, reading
+  // the vault several times over and (through v5) writing one index row per note (T-412). The stamp is written
+  // last, so an open that stopped part way runs everything again. The steps that came without a version bump are
+  // checked too (unnumberedStepsDone): an engine of the same SCHEMA_VERSION from before one of them, or a rollback
+  // to one, stamps the vault current without making it.
+  // A vault a newer engine brought past SCHEMA_VERSION, to a schema this engine reads (READABLE_SCHEMA_VERSION):
+  // that engine ran every step below already. Open it as it is, and never stamp it back to an older version.
+  const highest = highestStamp(db);
+  if (highest !== null && highest > SCHEMA_VERSION) {
+    // Its un-numbered steps are this engine's to check, though: a later patch on this line may add one the newer
+    // engine lacks (audit L2-01). Each is additive and idempotent.
+    if (!unnumberedStepsDone(db)) {
+      ensureTagKinds(db);
+      ensurePathNocaseIndex(db);
+      ensureRevisionKeyKind(db);
+      ensureFtsFields(db);
+      ensureFtsInsertTrigger(db);
+    }
+    rebuildIndexes(db);
+    return;
+  }
+  if (latestStamp(db) === SCHEMA_VERSION && unnumberedStepsDone(db)) {
+    // Still heal declared indexed fields (a column or index missing after a restore): a few catalog reads, no
+    // writes when nothing is missing.
+    rebuildIndexes(db);
+    return;
+  }
 
   // Check if we need to migrate from v2
   const hasOldTables = hasTable(db, "things");
@@ -770,6 +925,17 @@ export function initSchema(db: Database): void {
   migrateToV30(db);
   migrateToV31(db);
   migrateToV32(db);
+  // Steps with no version bump. Each has its check in unnumberedStepsDone, or the fast path skips it.
+  // Types and tags: the `kind` column and a kind for every row (T-318 §8a).
+  ensureTagKinds(db);
+  // A case-insensitive path index for the `path = ? COLLATE NOCASE` lookups (T-412).
+  ensurePathNocaseIndex(db);
+  // The write stamp: each revision says what kind of key wrote it (0.9.1).
+  ensureRevisionKeyKind(db);
+  // Field values in the search index (0.9.3): a third notes_fts column, rebuilt once.
+  ensureFtsFields(db);
+  // The insert trigger clears a leftover field-text row first (0.9.3).
+  ensureFtsInsertTrigger(db);
 
   // Rebuild any generated columns + indexes declared in indexed_fields.
   // No-op for a fresh vault; idempotent on existing vaults.
@@ -780,6 +946,54 @@ export function initSchema(db: Database): void {
     SCHEMA_VERSION,
     new Date().toISOString(),
   );
+}
+
+/**
+ * Field values in search (0.9.3): bring notes_fts to the three-column shape of NOTES_FTS_SQL and index every note's
+ * field text, once. Deliberately NOT a SCHEMA_VERSION bump, like ensurePathNocaseIndex: an older engine of this
+ * schema number still opens the vault, reads its search index (its bm25 call names two weights; the third column
+ * gets the default 1.0, so it ranks a field hit like a body hit until that engine is updated) and edits it through
+ * these same triggers. initSchema's fast path checks for the `fields` column instead.
+ *
+ * One transaction (drop, create, rebuild) so a crash leaves the old shape and the next open does it again, never a
+ * new but empty index that looks done (the migrateToV25 lesson). The drop makes the old index's pages free and the
+ * rebuild writes the new ones: on a Durable Object that is one row write per note plus the index segments, once.
+ */
+function ensureFtsFields(db: Database): void {
+  if (!hasTable(db, "notes")) return;
+  if (hasColumn(db, "notes_fts", "fields")) return;
+  transaction(db, () => {
+    db.exec("DROP TRIGGER IF EXISTS notes_fts_insert");
+    db.exec("DROP TRIGGER IF EXISTS notes_fts_delete");
+    db.exec("DROP TRIGGER IF EXISTS notes_fts_update");
+    db.exec("DROP TABLE IF EXISTS notes_fts");
+    db.exec("DROP VIEW IF EXISTS notes_fts_source");
+    db.exec("DROP TABLE IF EXISTS notes_field_text");
+    db.exec(NOTES_FTS_SQL);
+    db.exec(`INSERT OR REPLACE INTO notes_field_text(note_id, text) SELECT id, t FROM (SELECT id, ${fieldTextSql("metadata")} AS t FROM notes) WHERE t <> ''`);
+    db.exec("INSERT INTO notes_fts(notes_fts) VALUES('rebuild')");
+  });
+}
+
+function ftsInsertTriggerIsCurrent(db: Database): boolean {
+  const row = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'notes_fts_insert'").get() as
+    | { sql: string }
+    | undefined;
+  return !!row && row.sql.includes("DELETE FROM notes_field_text WHERE note_id = new.id");
+}
+
+/**
+ * Give a vault that has the earlier insert trigger (which left a stale field-text row in place for a record with no
+ * field values) the current one. Unnumbered like ensureFtsFields, with its check in unnumberedStepsDone. Only the
+ * trigger changes: it writes no data and the index stays as it is.
+ */
+function ensureFtsInsertTrigger(db: Database): void {
+  if (!hasTable(db, "notes") || !hasColumn(db, "notes_fts", "fields")) return;
+  if (ftsInsertTriggerIsCurrent(db)) return;
+  transaction(db, () => {
+    db.exec("DROP TRIGGER IF EXISTS notes_fts_insert");
+    db.exec(FTS_INSERT_TRIGGER_SQL);
+  });
 }
 
 function hasColumn(db: Database, table: string, column: string): boolean {
@@ -808,9 +1022,12 @@ function migrateToV4(db: Database): void {
 function migrateToV5(db: Database): void {
   if (!hasTable(db, "notes")) return;
 
-  // Check if the unique index already exists
+  // Done once already if either unique path index exists: v5's own, or v18's (path, extension) that replaced it.
+  // Checking only v5's made this run on every open of every vault past v18 (T-412): it rewrote no path in the common
+  // case, but its dedupe below renamed the second of any two notes whose paths differ only by extension or by case
+  // (both allowed since v18) to `<path>-1`, and it rebuilt a path index over every note for v18 to drop again.
   const indexes = db.prepare(
-    "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_notes_path_unique'",
+    "SELECT name FROM sqlite_master WHERE type='index' AND name IN ('idx_notes_path_unique', 'idx_notes_path_ext_unique')",
   ).all();
   if (indexes.length > 0) return;
 
@@ -2091,4 +2308,28 @@ function migrateToV31(db: Database): void {
       PRIMARY KEY(note_id, import_ix)
     );
   `));
+}
+
+function hasIndex(db: Database, name: string): boolean {
+  return !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?").get(name);
+}
+
+/**
+ * Index paths without case (T-412). Every path lookup (getNoteByPath, a reference field's target, wikilink
+ * resolution, if_exists) asks `path = ? COLLATE NOCASE`, and the only path index left was v18's case-sensitive
+ * unique `(path, extension)`, so each lookup read every note. This index answers them; it is not unique, so path
+ * uniqueness stays exactly v18's: `(path, extension)`, case-sensitive. Also drops the plain `idx_notes_path` wherever
+ * an older SCHEMA_SQL left it (it duplicates the leading column of v18's index). Building it writes one index row
+ * per note, once.
+ *
+ * Deliberately NOT a SCHEMA_VERSION bump: an extra index changes nothing an older engine reads or writes, while a
+ * bump would make an older engine refuse the vault (NewerSchemaError), so rolling a deploy back would take every
+ * vault it had opened offline. initSchema's fast path checks for this index instead.
+ */
+function ensurePathNocaseIndex(db: Database): void {
+  if (!hasTable(db, "notes")) return;
+  transaction(db, () => {
+    db.exec("DROP INDEX IF EXISTS idx_notes_path");
+    db.exec("CREATE INDEX IF NOT EXISTS idx_notes_path_nocase ON notes(path COLLATE NOCASE) WHERE path IS NOT NULL");
+  });
 }

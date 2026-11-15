@@ -336,18 +336,28 @@ async function orchestrate(
   manifestPath: string,
   name: string,
   runCommand: (cmd: readonly string[]) => Promise<RunResult>,
-  opts: { noMirror?: boolean } = {},
+  opts: { noMirror?: boolean; bare?: boolean } = {},
 ): Promise<OrchestrateOk | OrchestrateError> {
   const vaultRegistered = findService("parachute-vault", manifestPath) !== undefined;
   // `--no-mirror` opts this create out of the default internal live mirror
   // (§3 default_mirror knob). Only meaningful on the `create` branch — the
   // bootstrap `install` path provisions the default vault and follows the
   // server-wide knob.
+  // `--bare` (0.9.1, T-414): no welcome or guide notes. Only the `create` branch can honour it, so a bare request
+  // with no vault module installed yet is refused below rather than seeded silently.
   const cmd = vaultRegistered
-    ? opts.noMirror
-      ? ["parachute-vault", "create", name, "--json", "--no-mirror"]
-      : ["parachute-vault", "create", name, "--json"]
+    ? [
+        "parachute-vault",
+        "create",
+        name,
+        "--json",
+        ...(opts.noMirror ? ["--no-mirror"] : []),
+        ...(opts.bare ? ["--bare"] : []),
+      ]
     : ["parachute", "install", "vault"];
+  if (!vaultRegistered && opts.bare) {
+    return { ok: false, status: 409, message: "a bare vault needs the vault module installed first (parachute install vault)" };
+  }
   let result: RunResult;
   try {
     result = await runCommand(cmd);
@@ -442,6 +452,8 @@ export async function provisionVault(
     runCommand?: CreateVaultDeps["runCommand"];
     /** `'off'` appends `--no-mirror`; anything else follows the server knob. */
     defaultMirror?: string;
+    /** No welcome or guide notes (`parachute-vault create --bare`; 0.9.1, T-414). */
+    bare?: boolean;
   },
 ): Promise<ProvisionVaultResult> {
   const manifestPath = deps.manifestPath ?? SERVICES_MANIFEST_PATH;
@@ -479,9 +491,19 @@ export async function provisionVault(
 
   const result = await orchestrate(manifestPath, name, runCommand, {
     noMirror: deps.defaultMirror === "off",
+    ...(deps.bare ? { bare: true } : {}),
   });
   if (!result.ok) {
     return { ok: false, status: result.status, message: result.message };
+  }
+  // A bare create must be confirmed by the CLI that made it: a vault module older than 0.9.1 drops `--bare` and
+  // seeds the guides anyway. Say so rather than answer as if the vault were bare.
+  if (deps.bare && (result.createJson as { bare?: unknown } | null)?.bare !== true) {
+    return {
+      ok: false,
+      status: 409,
+      message: `vault "${name}" was created, but the installed vault module doesn't support bare and seeded it; update the vault module`,
+    };
   }
 
   // Re-read services.json: the CLI just wrote it.
@@ -702,13 +724,9 @@ export interface DeleteVaultDeps {
   /** Test seam: run `parachute-vault remove` — same Runner seam as create. */
   runCommand?: CreateVaultDeps["runCommand"];
   /**
-   * Supervisor-restart the vault module — the daemon-eviction cascade step.
-   * The running daemon caches open store handles, so rmSync alone leaves the
-   * deleted vault SERVING from the open fd; and vault's boot `selfRegister`
-   * rebuilds services.json paths from `listVaults()`, dropping the deleted
-   * path. Wired to the same supervisor machinery the lifecycle verbs use.
-   * Absent: delete records a warning; rename refuses before the CLI.
-   * (The boundary-conformant per-daemon store-eviction endpoint is tracked as E9.)
+   * Supervisor-restart the vault module. Rename uses it (it refuses before the
+   * CLI when absent); delete no longer does (0.9.3): the running vault server
+   * lets go of a deleted vault by itself.
    */
   restartVaultModule?: () => Promise<void>;
   /** Stop all vault stores before offline rename. Delete ignores this dep. */
@@ -747,6 +765,7 @@ interface CascadeSummary {
    */
   orphaned_channels: string[];
   vault_removed: boolean;
+  /** Always false since 0.9.3 (a delete restarts nothing); kept so older readers of the summary still parse it. */
   module_restarted: boolean;
 }
 
@@ -826,8 +845,9 @@ export function listVaultInstanceNames(manifestPath: string): Set<string> {
  *   6. mechanics: shell to `parachute-vault remove <name> --yes` (the module
  *      CLI stays the single source of truth for vault destruction,
  *      mirroring create);
- *   7. daemon eviction: supervisor-restart the vault module (open
- *      store-handle eviction + `selfRegister` services.json path rebuild).
+ *   7. (no restart: the vault server lets go of the deleted vault by itself —
+ *      its open database, triggers and mirror — and the CLI's remove
+ *      already rewrote services.json.)
  *
  * Response: 200 with a structured per-step summary (counts +
  * `orphaned_channels` + warnings). A mechanics failure responds 500 with
@@ -1071,24 +1091,10 @@ export async function handleDeleteVault(
     });
   }
 
-  // --- 7. Daemon eviction: supervisor-restart the vault module. -------------
-  if (deps.restartVaultModule) {
-    try {
-      await deps.restartVaultModule();
-      summary.module_restarted = true;
-    } catch (err) {
-      warnings.push({
-        step: "module_restart",
-        detail: `vault module restart failed: ${err instanceof Error ? err.message : String(err)} — the running daemon may still serve the deleted vault from its open store handle until restarted (parachute restart vault)`,
-      });
-    }
-  } else {
-    warnings.push({
-      step: "module_restart",
-      detail:
-        "no supervisor available — restart the vault module (parachute restart vault) to evict the deleted vault's open store handle and refresh services.json",
-    });
-  }
+  // --- 7. No daemon restart (0.9.3). ---------------------------------------
+  // The running vault server notices the vault is gone on its next request that names a vault, or within seconds,
+  // and lets go of its open database, triggers and mirror itself (vault start-vault.ts `syncVaults`); the CLI's
+  // remove already rewrote services.json. So nothing restarts and the other vaults never blink.
 
   return new Response(
     JSON.stringify({

@@ -21,6 +21,7 @@ import { readdirSync, readFileSync, readlinkSync } from "node:fs";
 import { join } from "node:path";
 import { hubCli } from "../../harness/services.ts";
 import { enc, must, rest, runId, safeFetch, services } from "../lib.ts";
+import { firstDifference, type Logged, type Prefix, PREFIXES, prefixed } from "./_prefix.ts";
 import { nip98, nostrKey, schnorrSign, xonly } from "./_lib.ts";
 import manifest from "./uni-writers.json";
 
@@ -32,14 +33,12 @@ const json = (r: { body: any }) => r.body;
 /** A long-lived script pass, the kind in uni's shared tokens file (`vault:uni:write`, PEOPLE-DESIGN.md:172). */
 let scriptToken = "";
 let adminToken = "";
-let api: ReturnType<typeof rest>;
 
 beforeAll(async () => {
   const mint = async (scope: string, label: string) =>
     (await hubCli(s, ["auth", "mint-token", "--scope", scope, "--expires-in", "31536000", "--label", label])).trim().split("\n").pop()!.trim();
   scriptToken = await mint(`vault:${V}:write`, "compat-uni-script");
   adminToken = await mint(`vault:${V}:admin`, "compat-uni-admin");
-  api = rest(s.vaultViaHub, scriptToken);
   // The clients' operator queries (metadata={"state":{"in":..}}, meta[uid][eq], fireflies_id exists) need those
   // fields indexed; uni's vault declares them on its type tags. Same here, with the admin pass.
   const admin = rest(s.vaultViaHub, adminToken);
@@ -49,14 +48,16 @@ beforeAll(async () => {
   }
 });
 
-/** GET with a raw query, as the Python clients build it (urllib.parse.urlencode). */
-const get = (path: string, q: Record<string, string> = {}) => api.get(`${path}${Object.keys(q).length ? "?" + new URLSearchParams(q) : ""}`);
-
-/** A made-up note, created with the script pass. */
-async function seed(note: Record<string, unknown>) {
-  const r = await api.post("/notes", note);
-  if (r.status !== 201) throw new Error(`seed failed: ${r.status} ${JSON.stringify(r.body).slice(0, 300)}`);
-  return r.body;
+/** The script pass's client on one prefix, `get` with a raw query as the Python clients build it (urllib.parse.urlencode), and `seed` for a made-up note. */
+function scriptClient(prefix: Prefix, log?: Logged[], runIds: string[] = []) {
+  const api = prefixed(s.vaultViaHub, scriptToken, prefix, log, runIds);
+  const get = (path: string, q: Record<string, string> = {}) => api.get(`${path}${Object.keys(q).length ? "?" + new URLSearchParams(q) : ""}`);
+  async function seed(note: Record<string, unknown>) {
+    const r = await api.post("/notes", note);
+    if (r.status !== 201) throw new Error(`seed failed: ${r.status} ${JSON.stringify(r.body).slice(0, 300)}`);
+    return r.body;
+  }
+  return { api, get, seed };
 }
 
 // ── NIP-98 on the hub's account door (/mcp) ─────────────────────────────────────────────────────────────────
@@ -88,7 +89,10 @@ function door(shape: "loopback" | "tailnet", encoding: "base64" | "base64url") {
       const r = await rpc("tools/call", { name, arguments: args });
       if (r.status !== 200) throw new Error(`${name}: HTTP ${r.status} ${r.text.slice(0, 300)}`);
       if (r.body?.error) throw new Error(`${name}: ${JSON.stringify(r.body.error).slice(0, 300)}`);
-      const text = (r.body.result.content ?? []).map((c: any) => c.text ?? "").join("");
+      // The Uni app reads the first text block as the JSON (parachute.rs: `find_map` over `content`), so a second
+      // block (the refresh nudge on the note-named tools, T-446) is words for a model, not part of the result.
+      const content = r.body.result.content ?? [];
+      const text = r.body.result.isError ? content.map((c: any) => c.text ?? "").join("") : (content.find((c: any) => c.type === "text")?.text ?? "");
       if (r.body.result.isError) throw new Error(`${name}: ${text.slice(0, 300)}`);
       try {
         return JSON.parse(text);
@@ -177,7 +181,19 @@ describe("compat/uni: the writer manifest", () => {
   });
 });
 
-describe("compat/uni: REST clients (Bearer script pass)", () => {
+// Once per prefix: /api/notes as the clients call it today, /api/records as they would once moved; the two must
+// answer alike (ROADMAP 0.9.1). _prefix.ts says how the record words are sent and read back.
+const restLogs: Record<Prefix, Logged[]> = { notes: [], records: [] };
+
+for (const prefix of PREFIXES) describe(`compat/uni: REST clients (Bearer script pass) on /api/${prefix}`, () => {
+  const R = runId(`uni-${prefix}`);
+  let api: ReturnType<typeof prefixed>;
+  let get: ReturnType<typeof scriptClient>["get"];
+  let seed: ReturnType<typeof scriptClient>["seed"];
+  beforeAll(() => {
+    ({ api, get, seed } = scriptClient(prefix, restLogs[prefix], [R]));
+  });
+
   test("uni-tasks: GET notes?tag=task&metadata={state in [...]}&include_content=false is a flat array with id, path, metadata, updatedAt", async () => {
     await seed({ path: `${R}/Tasks/T-01 made up`, content: "a made-up task", tags: ["task"], metadata: { state: "open" } });
     await seed({ path: `${R}/Tasks/T-02 made up`, content: "another", tags: ["task"], metadata: { state: "done" } });
@@ -416,6 +432,13 @@ describe("compat/uni: REST clients (Bearer script pass)", () => {
   });
 });
 
+describe("compat/uni: REST clients, both prefixes", () => {
+  test("/api/notes and /api/records answered every call alike (status, and the answer's shape in note words)", () => {
+    expect(restLogs.notes.length).toBeGreaterThan(0);
+    expect(firstDifference(restLogs.notes, restLogs.records)).toBeNull();
+  });
+});
+
 describe("compat/uni: account-door MCP clients (NIP-98)", () => {
   test("uni-nightly: through its {results:[{vault,...}]} unwrap, a count is [{value:int}], doctor has findings[], and a note round-trips", async () => {
     const d = door("tailnet", "base64");
@@ -430,8 +453,8 @@ describe("compat/uni: account-door MCP clients (NIP-98)", () => {
       for (const k of ["notes", "result", "note", "data"]) if (k in x) return x[k];
       return Object.fromEntries(Object.entries(x).filter(([k]) => k !== "vault"));
     };
-    await seed({ path: `${R}/Nightly/one`, content: "x", tags: [`${R}-nightly`] });
-    await seed({ path: `${R}/Nightly/two`, content: "y", tags: [`${R}-nightly`] });
+    await scriptClient("notes").seed({ path: `${R}/Nightly/one`, content: "x", tags: [`${R}-nightly`] });
+    await scriptClient("notes").seed({ path: `${R}/Nightly/two`, content: "y", tags: [`${R}-nightly`] });
     const count = await vcall("query-notes", { tag: `${R}-nightly`, aggregate: { op: "count" } });
     expect(Array.isArray(count) && count.length === 1 && Number.isInteger(count[0].value)).toBe(true);
     expect(count[0].value).toBe(2);
@@ -445,7 +468,7 @@ describe("compat/uni: account-door MCP clients (NIP-98)", () => {
     expect(ex.updatedAt).toBeString();
     await vcall("update-note", { id: ex.id, content: "nightly report v2", metadata: { run: "again" }, if_updated_at: ex.updatedAt, include_content: false });
     await vcall("update-note", { id: ex.id, append: "\n## Undone" });
-    const after = (await api.get(`/notes/${enc(ex.id)}`)).body;
+    const after = (await scriptClient("notes").api.get(`/notes/${enc(ex.id)}`)).body;
     expect(after.content).toBe("nightly report v2\n## Undone");
     expect(after.metadata).toEqual({ run: "again" });
   });
@@ -514,7 +537,7 @@ function holders(file: string): number[] {
 describe("compat/uni: the box", () => {
   test("backup jobs: a read-only sqlite .backup of vault.db and hub.db while the box runs gives a database with the notes in it", async () => {
     const db = join(s.home, "vault", "data", V, "vault.db");
-    const n = await seed({ path: `${R}/Backup/marker`, content: "in the backup", tags: ["made-up"] });
+    const n = await scriptClient("notes").seed({ path: `${R}/Backup/marker`, content: "in the backup", tags: ["made-up"] });
     const out = join(s.home, "..", `backup-${R}.db`);
     const b = Bun.spawnSync(["sqlite3", "-readonly", db, `.backup '${out}'`]);
     expect(b.exitCode).toBe(0);

@@ -15,6 +15,10 @@
  * read-only keys see a filtered tool list.
  */
 
+import { NOTE_TOOL_NAMES } from "../core/src/mcp-records.ts";
+import { recordErrorData, typedMessage } from "../core/src/mcp-surface.ts";
+import { toolAnnotations } from "../core/src/mcp-annotations.ts";
+import { mcpCallResult } from "../core/src/mcp-result.ts";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import {
@@ -26,8 +30,10 @@ import {
 import { generateScopedMcpTools, getServerInstruction } from "./mcp-tools.ts";
 import type { AuthResult } from "./auth.ts";
 import type { McpToolDef } from "../core/src/mcp.ts";
+import { mcpToolErrorLine } from "../core/src/mcp-error-log.ts";
 import { hasScopeForVault } from "./scopes.ts";
 import type { VaultVerb } from "./scopes.ts";
+import pkg from "../package.json" with { type: "json" };
 
 /**
  * Required verb for an MCP tool. Reads `tool.requiredVerb` from the tool
@@ -81,10 +87,14 @@ export function mcpDomainError(
   rawMessage: string,
   data: Record<string, unknown>,
 ): McpError {
-  const cleanMessage = rawMessage.replace(MCP_ERROR_PREFIX_RE, "");
-  const errorType = typeof data.error_type === "string" ? data.error_type : undefined;
-  const humanMessage = errorType ? `[${errorType}] ${cleanMessage}` : cleanMessage;
-  return new McpError(code, humanMessage, data);
+  return new McpError(code, typedMessage(rawMessage.replace(MCP_ERROR_PREFIX_RE, ""), data), data);
+}
+
+/** A record tool's JSON-RPC error in record words: the hints this file adds, and `record_id` for `note_id` (T-407). */
+function recordDoorError(err: McpError): McpError {
+  const data = err.data && typeof err.data === "object" ? recordErrorData(err.data as Record<string, unknown>) : err.data;
+  // The message is already in record words (the record tool's errorOut); only what this file added is not.
+  return new McpError(err.code, err.message.replace(MCP_ERROR_PREFIX_RE, ""), data);
 }
 
 /**
@@ -154,15 +164,31 @@ export async function handleMcp(
     hasScopeForVault(auth.scopes, vaultName, requiredVerbForTool(t)),
   );
 
+  // The caller's level here: two tools reach further at a higher one (mcp-annotations.ts BY_LEVEL). A tag-scoped admin
+  // can't set the vault-wide description, so for the hints it counts as a writer.
+  const tagScoped = (auth.scoped_tags?.length ?? 0) > 0;
+  const level = hasScopeForVault(auth.scopes, vaultName, "admin") && !tagScoped ? "admin" : hasScopeForVault(auth.scopes, vaultName, "write") ? "write" : "read";
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: visibleTools.map((t) => ({
       name: t.name,
       description: t.description,
       inputSchema: t.inputSchema,
+      annotations: toolAnnotations(t.name, level), // T-456: a client can tell a read from a change (mcp-annotations.ts)
     })),
   }));
 
+  // T-407: a record tool's domain errors are built below from its note tool's error, so they'd teach the note tool
+  // (`re-read the note (query-notes)`, `note_id`); the record door says them in its own words.
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    try {
+      return await callTool(request);
+    } catch (err) {
+      if (err instanceof McpError && NOTE_TOOL_NAMES[request.params.name]) throw recordDoorError(err);
+      throw err;
+    }
+  });
+
+  async function callTool(request: { params: { name: string; arguments?: Record<string, unknown> } }) {
     const { name, arguments: args } = request.params;
 
     // Dispatch against the FILTERED tool list — tools the caller can't see
@@ -182,13 +208,13 @@ export async function handleMcp(
       const result = await tool.execute((args ?? {}) as Record<string, unknown>);
       // The one wrapper change (attachments-for-agents design, Wave 2):
       // `resultContent`, when a tool defines it, decides the MCP content
-      // blocks instead of the universal single-text-block default —
-      // `read-attachment`'s image branch is the only current user (needs a
-      // REAL {type:"image"} block alongside the row-JSON text block).
-      const content = tool.resultContent
-        ? tool.resultContent(result)
-        : [{ type: "text" as const, text: JSON.stringify(result, null, 2) }];
-      return { content };
+      // blocks instead of the universal single-text-block default:
+      // `read-attachment`'s image branch (a REAL {type:"image"} block
+      // alongside the row-JSON text block) and the five note aliases (the
+      // refresh nudge as a second block).
+      // T-456: mcpCallResult adds `structuredContent` where ChatGPT would otherwise read the reply as `{}` (a JSON
+      // object with a top-level `content` key: a note by id). Every other reply is these blocks alone.
+      return mcpCallResult(tool, result);
     } catch (err) {
       // vault#555 fix 6 — never re-wrap an already-formed McpError. Passing
       // the SAME instance straight through is strictly correct (no
@@ -228,6 +254,8 @@ export async function handleMcp(
         violations?: unknown;
         error_type?: string;
         got?: unknown;
+        unused?: unknown;
+        fields?: unknown;
         hint?: string;
         path?: string;
         candidates?: unknown;
@@ -438,6 +466,9 @@ export async function handleMcp(
           // this backstop.
           ...(e.limit !== undefined ? { limit: e.limit } : {}),
           ...(e.got !== undefined ? { got: e.got } : {}),
+          // The indexed-field ceiling's refusal (0.9.2): what to prune first.
+          ...(e.unused !== undefined ? { unused: e.unused } : {}),
+          ...(e.fields !== undefined ? { fields: e.fields } : {}),
           ...(e.extension !== undefined ? { extension: e.extension } : {}),
           ...(e.how_to !== undefined ? { how_to: e.how_to } : {}),
           // read-attachment (Wave 2) refusal fields — same forward-when-present
@@ -447,12 +478,15 @@ export async function handleMcp(
           ...(e.mime_type !== undefined ? { mime_type: e.mime_type } : {}),
         });
       }
+      // Nobody tagged this error, so it is a crash, not a refusal (audit L6-02): without this line the server log
+      // showed only `POST … 200`. One line, no arguments; see core/src/mcp-error-log.ts.
+      console.error(mcpToolErrorLine(name, err, pkg.version));
       return {
         content: [{ type: "text" as const, text: `Error: ${message}` }],
         isError: true,
       };
     }
-  });
+  }
 
   await server.connect(transport);
   return transport.handleRequest(req);

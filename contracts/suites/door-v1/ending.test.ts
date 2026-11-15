@@ -1,0 +1,322 @@
+// 1.0 grants: how a grant ends (docs/SPEC-1.0-grants.md §3, §2.2 line 5, §7.4). It stops at its date with no one
+// acting. A signed revoke stops it on the next request, tokens already held included, and is final: no event under
+// that id is in force again, whatever its date or the order the two arrive in, but it bans the id, not the key. Only
+// the grant's signer, the owner, or the grantee giving it up may revoke. Only the owner carrying a refused revoke is
+// told why; anyone else gets the 401 an unknown vault gives (§7.1).
+//
+// Red today: no door takes a signed statement, so each contract stops where `granted()` files one. Every body
+// starts with a grant that must be taken, so a refusal further down can't pass because nothing is ever taken.
+import { describe, expect, test } from "bun:test";
+import { KIND, LANE, NO_GRANTS, declareType, must, file, grantEvent, grantRow, granted, newKey, ownerKey, rec, records, red, revokeEvent, runId, sign, tokenAs, tokenReply, vaultId, type Reply } from "./_grants.ts";
+
+const owner = records("write");
+
+/** The state of one grant in the owner's list (§7.1). */
+const state = async (grantId: string): Promise<string | undefined> => (await grantRow(grantId))?.state;
+
+/** A request under a grant that has ended (§7.4). */
+function ended(r: Reply) {
+  expect(r.status, r.text.slice(0, 200)).toBe(401);
+  expect(r.body.error).toBe("grant_ended");
+}
+
+describe("setup holds today", () => {
+  test("the owner makes a record and reads it; a revoke signs; a key nobody granted gets no token", async () => {
+    const recipe = await declareType("recipe");
+    const soup = await owner.make({ types: [recipe], body: "soup" });
+    expect(soup.status).toBe(201);
+    expect(rec((await owner.get(soup.body.id)).body).body).toBe("soup");
+    // The revoke the contracts file names the grant by its address, and the vault, in its content (§3).
+    const g = await grantEvent({ to: await newKey(), types: { [recipe]: ["read"] } });
+    const r = await revokeEvent(g);
+    expect(r.tags).toEqual([]);
+    expect(JSON.parse(r.content)).toEqual({ v: 1, honors: await vaultId(), ends: `37440:${(await ownerKey()).pubkey}:${g.grantId}`, purpose: "I end this grant." });
+    expect((await tokenReply(await newKey())).status).toBe(401);
+  });
+});
+
+describe("by its date", () => {
+  red("a grant stops at its date: the token already held and a new one are both refused, and the list says expired", { reason: NO_GRANTS, lane: LANE }, async () => {
+    const recipe = await declareType("recipe");
+    const soup = await owner.make({ types: [recipe], body: "soup" });
+    const key = await newKey();
+    // Six seconds: room for the token and the first read on a slow runner before the date passes.
+    const g = await granted({ to: key, types: { [recipe]: ["read"] }, endsIn: 6 });
+    const bearer = await tokenAs(key);
+    expect((await records({ bearer }).get(soup.body.id)).status).toBe(200);
+    // Wait out the date, and a second past it, with no one acting.
+    const until = (g.created_at + 6 + 1) * 1000 - Date.now();
+    if (until > 0) await Bun.sleep(until);
+    ended(await records({ bearer }).get(soup.body.id));
+    expect((await tokenReply(key)).status).toBe(401);
+    expect(await state(g.grantId)).toBe("expired");
+  }, 20_000);
+});
+
+describe("by a signed revoke", () => {
+  red("a revoke stops the grant on the next request, for a token already held", { reason: NO_GRANTS, lane: LANE }, async () => {
+    const recipe = await declareType("recipe");
+    const soup = await owner.make({ types: [recipe], body: "soup" });
+    const key = await newKey();
+    const g = await granted({ to: key, types: { [recipe]: ["read"] } });
+    const bearer = await tokenAs(key);
+    expect((await records({ bearer }).get(soup.body.id)).status).toBe(200);
+    const r = await file(await revokeEvent(g));
+    expect(r.status).toBe(201);
+    ended(await records({ bearer }).get(soup.body.id));
+    expect((await tokenReply(key)).status).toBe(401);
+    expect(await state(g.grantId)).toBe("revoked");
+  });
+
+  red("a revoke is final: the same grant again, or a newer or future-dated one under its id, is refused", { reason: NO_GRANTS, lane: LANE }, async () => {
+    const recipe = await declareType("recipe");
+    const key = await newKey();
+    const g = await granted({ to: key, types: { [recipe]: ["read"] } });
+    expect((await file(await revokeEvent(g))).status).toBe(201);
+    for (const e of [g, await grantEvent({ id: g.grantId, to: key, types: { [recipe]: ["read"] }, created_at: g.created_at + 1 }), await grantEvent({ id: g.grantId, to: key, types: { [recipe]: ["read"] }, created_at: g.created_at + 300 })]) {
+      const r = await file(e);
+      expect(r.status, `created_at ${e.created_at}`).toBe(409);
+      expect(r.body.error).toBe("revoked");
+    }
+    expect((await tokenReply(key)).status).toBe(401);
+    expect(await state(g.grantId)).toBe("revoked");
+  });
+
+  red("a revoke needs no order: filed before the grant it names, it still wins", { reason: NO_GRANTS, lane: LANE }, async () => {
+    const recipe = await declareType("recipe");
+    // The route takes grants at all ...
+    await granted({ to: await newKey(), types: { [recipe]: ["read"] } });
+    // ... and this one arrives after its own revoke, which is kept (201) though it names nothing on file yet.
+    const key = await newKey();
+    const g = await grantEvent({ to: key, types: { [recipe]: ["read"] } });
+    const early = await file(await revokeEvent(g));
+    expect(early.status, early.text.slice(0, 200)).toBe(201);
+    const r = await file(g);
+    expect(r.status).toBe(409);
+    expect(r.body.error).toBe("revoked");
+    expect((await tokenReply(key)).status).toBe(401);
+  });
+
+  red("a stranger's revoke is refused and changes nothing, and only the owner carrying it is told why; the grantee may give its own grant up", { reason: NO_GRANTS, lane: LANE }, async () => {
+    const recipe = await declareType("recipe");
+    const soup = await owner.make({ types: [recipe], body: "soup" });
+    const key = await newKey();
+    const g = await granted({ to: key, types: { [recipe]: ["read"] } });
+    const bearer = await tokenAs(key);
+    const stranger = await newKey();
+    const theirs = await revokeEvent(g, { signer: stranger });
+    // Carried by the owner's own sign-in: the signature is what counts, and the owner is told why.
+    const told = await file(theirs);
+    expect(told.status, told.text.slice(0, 200)).toBe(403);
+    expect(told.body.error).toBe("no_standing");
+    // Carried by the stranger: the answer an unknown vault gives, so the route says nothing about this vault.
+    const unknown = await file(theirs, { as: stranger, vault: "no-such-vault-here" });
+    const carried = await file(theirs, { as: stranger });
+    expect(carried.status).toBe(401);
+    expect(carried.body).toEqual(unknown.body);
+    expect((await records({ bearer }).get(soup.body.id)).status).toBe(200);
+    expect(await state(g.grantId)).toBe("in_force");
+    // The grantee's own signed revoke, carried by the grantee, is taken.
+    expect((await file(await revokeEvent(g, { signer: key }), { as: key })).status).toBe(201);
+    ended(await records({ bearer }).get(soup.body.id));
+    expect(await state(g.grantId)).toBe("revoked");
+  });
+
+  red("a revoke whose tags aren't lists of strings is malformed, and the grant stays", { reason: NO_GRANTS, lane: LANE }, async () => {
+    const recipe = await declareType("recipe");
+    const key = await newKey();
+    const g = await granted({ to: key, types: { [recipe]: ["read"] } });
+    // The event id is a hash over the tags, and a number or an object hashes to other bytes in another language, so
+    // vaults would disagree on whether the signature is good (§2.2 line 1).
+    for (const tags of [[["n", 1]], [["n", { a: "b" }]], [["n", null]]]) {
+      const r = await file(await revokeEvent(g, { tags }));
+      expect(r.status, JSON.stringify(tags)).toBe(400);
+      expect(r.body.error).toBe("invalid_statement");
+    }
+    expect(await state(g.grantId)).toBe("in_force");
+  });
+
+  red("a newer grant the vault can't take suspends the address; it never falls back to the older, wider one", { reason: NO_GRANTS, lane: LANE }, async () => {
+    const recipe = await declareType("recipe");
+    const soup = await owner.make({ types: [recipe], body: "soup" });
+    const key = await newKey();
+    const g = await granted({ to: key, types: { [recipe]: ["read", "update"] } });
+    const bearer = await tokenAs(key);
+    // The owner narrows with a field from some later version: this vault refuses it, so the wide grant must stop.
+    const narrower = await grantEvent({ id: g.grantId, to: key, types: { [recipe]: ["read"] }, created_at: g.created_at + 1, extraFields: { only_fields: ["title"] } });
+    const r = await file(narrower);
+    expect(r.status).toBe(400);
+    expect(r.body.error).toBe("invalid_statement");
+    expect(await state(g.grantId)).toBe("suspended");
+    ended(await records({ bearer }).get(soup.body.id));
+    // A grant at the same address for another vault suspends nothing here.
+    const h = await granted({ to: await newKey(), types: { [recipe]: ["read"] } });
+    const elsewhere = await grantEvent({ id: h.grantId, to: await newKey(), types: { [recipe]: ["read"] }, created_at: h.created_at + 1, honors: "f".repeat(64) });
+    expect((await file(elsewhere)).status).toBe(400);
+    expect(await state(h.grantId)).toBe("in_force");
+    // A readable newer event brings the address back.
+    const back = await grantEvent({ id: g.grantId, to: key, types: { [recipe]: ["read"] }, created_at: g.created_at + 2 });
+    expect((await file(back)).status).toBe(201);
+    expect(await state(g.grantId)).toBe("in_force");
+    // The minimal read looks for a key given twice only at the top: one repeated inside an unknown field still
+    // suspends (§2.2), or the wider grant would stay in force.
+    const k2 = await newKey();
+    const g2 = await granted({ to: k2, types: { [recipe]: ["read", "update"] } });
+    const deep = await grantEvent({ id: g2.grantId, to: k2, types: { [recipe]: ["read"] }, created_at: g2.created_at + 1, extraFields: { later: { a: 1 } }, respell: (t) => t.replace('{"a":1}', '{"a":1,"a":2}') });
+    expect((await file(deep)).status).toBe(400);
+    expect(await state(g2.grantId)).toBe("suspended");
+    // It takes the first `d` tag, as NIP-01 does. First right: held, and it suspends. First wrong: it fails the
+    // minimal read and suspends nothing.
+    for (const [first, suspends] of [[true, true], [false, false]] as const) {
+      const k = await newKey();
+      const h = await granted({ to: k, types: { [recipe]: ["read"] } });
+      const newer = await grantEvent({ id: h.grantId, to: k, types: { [recipe]: ["read"] }, created_at: h.created_at + 1 });
+      const tags = first ? [newer.tags[0], ["d", "other"], newer.tags[1]] : [["d", "other"], ...newer.tags];
+      const two = await sign(await ownerKey(), { kind: KIND.grant, tags, content: newer.content, created_at: newer.created_at });
+      expect((await file(two)).status, `first d ${first ? "right" : "wrong"}`).toBe(400);
+      expect(await state(h.grantId)).toBe(suspends ? "suspended" : "in_force");
+    }
+  });
+
+  red("events that disagree on `to` end the address in any order they arrive", { reason: NO_GRANTS, lane: LANE }, async () => {
+    const recipe = await declareType("recipe");
+    const soup = await owner.make({ types: [recipe], body: "soup" });
+    // A for Bo, C (newer) for Cy, B (newest) for Bo again: whether C comes before or after B, nothing stays in force
+    // (§2.2 line 6), so whoever holds C can't choose the answer by when they hand it in.
+    for (const order of ["A B C", "A C B"]) {
+      const [bo, cy] = [await newKey(), await newKey()];
+      const a = await granted({ to: bo, types: { [recipe]: ["read"] } });
+      const bearer = await tokenAs(bo);
+      const b = await grantEvent({ id: a.grantId, to: bo, types: { [recipe]: ["read"] }, created_at: a.created_at + 2 });
+      const c = await grantEvent({ id: a.grantId, to: cy, types: { [recipe]: ["read"] }, created_at: a.created_at + 1 });
+      const steps = order === "A B C" ? [b, c] : [c, b];
+      const first = await file(steps[0]);
+      const second = await file(steps[1]);
+      expect(order === "A B C" ? first.status : second.status, order).toBe(order === "A B C" ? 201 : 409);
+      const refused = order === "A B C" ? second : first;
+      expect(refused.status, order).toBe(409);
+      expect(refused.body.error, order).toBe("id_taken");
+      expect(await state(a.grantId), order).toBe("suspended");
+      ended(await records({ bearer }).get(soup.body.id));
+      expect((await tokenReply(cy)).status, order).toBe(401);
+    }
+  });
+
+  red("a vault reads `honors` as the string JSON reads: an escaped spelling still names it", { reason: NO_GRANTS, lane: LANE }, async () => {
+    const recipe = await declareType("recipe");
+    const vid = await vaultId();
+    const escaped = (t: string) => t.replace(`"honors":"${vid}"`, `"honors":"\\u00${vid.charCodeAt(0).toString(16)}${vid.slice(1)}"`);
+    // A newer grant spelled so: not canonical, so refused (line 4, not line 2), and it names this vault, so it is held
+    // and suspends the address (§2.2).
+    const key = await newKey();
+    const g = await granted({ to: key, types: { [recipe]: ["read", "update"] } });
+    const newer = await grantEvent({ id: g.grantId, to: key, types: { [recipe]: ["read"] }, created_at: g.created_at + 1, respell: escaped });
+    must(newer.content.includes("\\u00"), "setup: honors isn't escaped");
+    const r = await file(newer);
+    expect(r.status).toBe(400);
+    expect(r.body.error).toBe("invalid_statement");
+    expect(await state(g.grantId)).toBe("suspended");
+    // A revoke spelled so acts (§3).
+    const h = await granted({ to: await newKey(), types: { [recipe]: ["read"] } });
+    const rv = await revokeEvent(h, { respell: escaped });
+    must(rv.content.includes("\\u00"), "setup: the revoke's honors isn't escaped");
+    expect((await file(rv)).status).toBe(201);
+    expect(await state(h.grantId)).toBe("revoked");
+  });
+
+  red("a control character other than NIP-01's five makes any event malformed; those five are fine", { reason: NO_GRANTS, lane: LANE }, async () => {
+    const recipe = await declareType("recipe");
+    // NIP-01 writes U+0001 as itself and JSON.stringify as \u0001, so two vaults would hash it to two ids (§2.2 line 1).
+    const g = await granted({ to: await newKey(), types: { [recipe]: ["read"] } });
+    for (const tags of [[["n", "a\u0001b"]], [["n", "a\u001fb"]]]) {
+      const r = await file(await revokeEvent(g, { tags }));
+      expect(r.status, JSON.stringify(tags)).toBe(400);
+      expect(r.body.error).toBe("invalid_statement");
+    }
+    expect(await state(g.grantId)).toBe("in_force");
+    const h = await granted({ to: await newKey(), types: { [recipe]: ["read"] } });
+    expect((await file(await revokeEvent(h, { tags: [["n", "a\tb\nc\rd\be\ff"]] }))).status).toBe(201);
+    expect(await state(h.grantId)).toBe("revoked");
+  });
+
+  red("a grantee may give up a grant a newer event has suspended", { reason: NO_GRANTS, lane: LANE }, async () => {
+    const recipe = await declareType("recipe");
+    const key = await newKey();
+    const g = await granted({ to: key, types: { [recipe]: ["read", "update"] } });
+    const narrower = await grantEvent({ id: g.grantId, to: key, types: { [recipe]: ["read"] }, created_at: g.created_at + 1, extraFields: { only_fields: ["title"] } });
+    expect((await file(narrower)).status).toBe(400);
+    expect(await state(g.grantId)).toBe("suspended");
+    // The grantee leaves (§3): final, so filing the held event later (after an upgrade) can't hand the grant back.
+    expect((await file(await revokeEvent(g, { signer: key }), { as: key })).status).toBe(201);
+    expect(await state(g.grantId)).toBe("revoked");
+    expect((await file(narrower)).status).toBe(409);
+    expect(await state(g.grantId)).toBe("revoked");
+  });
+
+  red("a revoke from a later shell still ends the grant: a vault acts on its three frozen fields", { reason: NO_GRANTS, lane: LANE }, async () => {
+    const recipe = await declareType("recipe");
+    const soup = await owner.make({ types: [recipe], body: "soup" });
+    // A key repeated inside a field the vault doesn't read isn't looked for (§3: no key twice at the top level), and
+    // an empty tag is still a list of strings (§2.2 line 1).
+    const nested = { extraFields: { note: { a: 1 } }, respell: (t: string) => t.replace('{"a":1}', '{"a":1,"a":2}') };
+    for (const later of [{ v: 2 }, { extraFields: { note: "from a later shell" } }, { tags: [["client", "later"]] }, { spaced: true }, nested, { tags: [[]] }]) {
+      const key = await newKey();
+      const g = await granted({ to: key, types: { [recipe]: ["read"] } });
+      const bearer = await tokenAs(key);
+      const r = await file(await revokeEvent(g, later));
+      expect(r.status, `${JSON.stringify(later)}: ${r.text.slice(0, 200)}`).toBe(201);
+      ended(await records({ bearer }).get(soup.body.id));
+      expect(await state(g.grantId)).toBe("revoked");
+    }
+    // Two `ends` in one revoke can be read two ways, so it is refused and ends nothing.
+    const key = await newKey();
+    const g = await granted({ to: key, types: { [recipe]: ["read"] } });
+    const other = `${KIND.grant}:${g.pubkey}:${runId("other")}`;
+    const twice = `{"ends":${JSON.stringify(other)},"ends":${JSON.stringify(`${KIND.grant}:${g.pubkey}:${g.grantId}`)},"honors":${JSON.stringify(await vaultId())},"v":1}`;
+    const dup = await file(await sign(await ownerKey(), { kind: KIND.revoke, tags: [], content: twice }));
+    expect(dup.status).toBe(400);
+    expect(dup.body.error).toBe("invalid_statement");
+    expect(await state(g.grantId)).toBe("in_force");
+  });
+
+  red("a revoke ends one exact address, and only its owner, its signer or its grantee may sign it", { reason: NO_GRANTS, lane: LANE }, async () => {
+    const recipe = await declareType("recipe");
+    const soup = await owner.make({ types: [recipe], body: "soup" });
+    const [k1, k2] = [await newKey(), await newKey()];
+    const a = await granted({ to: k1, types: { [recipe]: ["read"] } });
+    await granted({ to: k2, types: { [recipe]: ["read"] } });
+    const bearer = await tokenAs(k1);
+    const revokeOf = (ends: string) => revokeEvent({ ends }, { signer: k2 });
+    // K2 holds a grant of its own, but A is neither its address nor its grant: refused, told only to the owner.
+    const real = await revokeOf(`${KIND.grant}:${a.pubkey}:${a.grantId}`);
+    const told = await file(real);
+    expect(told.status, told.text.slice(0, 200)).toBe(403);
+    expect(told.body.error).toBe("no_standing");
+    expect((await file(real, { as: k2 })).status).toBe(401);
+    expect((await records({ bearer }).get(soup.body.id)).status).toBe(200);
+    // K2's own key in the address names some other grant, not the owner's A. K2 isn't an owner or a member, so its
+    // early revoke isn't kept, and A's id isn't burned.
+    const own = await file(await revokeOf(`${KIND.grant}:${k2.pubkey}:${a.grantId}`));
+    expect(own.status, own.text.slice(0, 200)).toBe(403);
+    expect(own.body.error).toBe("no_standing");
+    expect((await records({ bearer }).get(soup.body.id)).status).toBe(200);
+    expect(await state(a.grantId)).toBe("in_force");
+    const newer = await grantEvent({ id: a.grantId, to: k1, types: { [recipe]: ["read"] }, created_at: a.created_at + 1 });
+    expect((await file(newer)).status).toBe(201);
+    expect((await records({ bearer }).get(soup.body.id)).status).toBe(200);
+  });
+
+  red("revoking an id doesn't ban the key: a new id for the same key works", { reason: NO_GRANTS, lane: LANE }, async () => {
+    const recipe = await declareType("recipe");
+    const soup = await owner.make({ types: [recipe], body: "soup" });
+    const key = await newKey();
+    const first = await granted({ to: key, types: { [recipe]: ["read"] } });
+    expect((await file(await revokeEvent(first))).status).toBe(201);
+    expect((await tokenReply(key)).status).toBe(401);
+    const second = await granted({ to: key, types: { [recipe]: ["read"] } });
+    expect(second.grantId).not.toBe(first.grantId);
+    expect((await records({ bearer: await tokenAs(key) }).get(soup.body.id)).status).toBe(200);
+    expect(await state(first.grantId)).toBe("revoked");
+    expect(await state(second.grantId)).toBe("in_force");
+  });
+});

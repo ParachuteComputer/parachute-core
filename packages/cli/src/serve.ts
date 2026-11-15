@@ -200,7 +200,6 @@ export class VaultPart {
         this.running = await this.deps.startVault({
           port: this.deps.port(opts.port),
           selfRegister: "after-first-boot",
-          logFirstBootKey: false,
           ...(opts.firstBootVaultName !== undefined ? { firstBootVaultName: opts.firstBootVaultName } : {}),
           onStopFile: this.deps.onStopFile,
         });
@@ -400,7 +399,7 @@ export async function serveInProcess(args: string[]): Promise<never> {
       // The setup wizard's first vault passes the name it asked for.
       const name = req.env?.PARACHUTE_VAULT_NAME;
       if (vault.running) {
-        if (name !== undefined && (await firstBootCreate(name, false))) selfRegister({ version: vaultPkg.version });
+        if (name !== undefined && (await firstBootCreate(name))) selfRegister({ version: vaultPkg.version });
         return vaultState()!;
       }
       // A vault installed while serve runs, or started again after a stop: it starts now, in this process. A failure
