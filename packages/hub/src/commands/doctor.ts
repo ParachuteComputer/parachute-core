@@ -58,6 +58,7 @@ import {
 import { decodeJwt } from "jose";
 import { CHANNEL_GRANT_VIA_PREFIX } from "../channel-reconciler.ts";
 import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "../config.ts";
+import { unfencedOldUnits } from "../core-host.ts";
 import { type ExposeState, readExposeState } from "../expose-state.ts";
 import { HUB_SVC, readHubPort } from "../hub-control.ts";
 import { GRANT_ATTRIBUTION_MIGRATION, hubDbPath } from "../hub-db.ts";
@@ -1313,6 +1314,30 @@ function checkMigration(
 }
 
 /**
+ * A home core took over from the 0.7 programs (takeover.json says so): every old unit the takeover paused must be
+ * fenced off (core-host.ts TAKEOVER_FENCE), or it can start again and, while core is stopped (an upgrade), take the
+ * port and serve the home with the 0.7 programs (#127). Core's own start fences such a unit, so the fix is a restart.
+ * No row on a home that wasn't taken over.
+ */
+export function checkOldUnits(configDir: string): CheckResult[] {
+  const left = unfencedOldUnits(configDir);
+  if (left === null) return [];
+  const base = { name: "old-units", title: "The 0.7 units this home was taken over from stay off" };
+  if (left.length === 0) {
+    return [{ ...base, status: "pass", detail: "every old unit the takeover paused is fenced off: systemd won't start it" }];
+  }
+  const one = left.length === 1;
+  return [
+    {
+      ...base,
+      status: "warn",
+      detail: `${left.join(" and ")} (the 0.7 program${one ? "" : "s"} this home was taken over from) can still be started, by hand or by a restart; while core is stopped, as in an upgrade, ${one ? "it" : "they"} could take the port and serve this home. Core's start stops ${one ? "it" : "them"} and fences ${one ? "it" : "them"} off`,
+      fix: "parachute restart",
+    },
+  ];
+}
+
+/**
  * Who holds what on which vault, and two advisories about it.
  *
  * The inventory is the point: `user_vaults` is the only place a hub records
@@ -1653,7 +1678,7 @@ async function runChecks(
   add("Modules", [...modules, ...bins]);
   add("Configuration", [manifestCheck, portDrift, operator, scopedAdminKeys]);
   add("Grants", grants);
-  add("Migration", migration);
+  add("Migration", [...migration, ...checkOldUnits(configDir)]);
   add("Exposure", [exposure, versionDrift]);
   add("Data", dataChecks(findDataProblems(configDir, deps.data)));
   return grouped;
