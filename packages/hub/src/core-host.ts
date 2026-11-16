@@ -71,6 +71,8 @@ export function fencePath(unit: string, env: NodeJS.ProcessEnv = process.env): s
 
 /** The fence's text, for the takeover of `home`. */
 export function fenceText(home: string, unit: string): string {
+  // On a comment line: a line break in the path must not end the comment.
+  home = home.replace(/[\r\n]/g, " ");
   return [
     `# Written by parachute-core takeover for ${home}: parachute-core.service serves that home now, so ${unit}`,
     "# (the 0.7 program) must not start, by hand, by a restart or because another unit wants it. Its own file is",
