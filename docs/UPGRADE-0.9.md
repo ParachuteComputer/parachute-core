@@ -161,6 +161,18 @@ With no service named, `upgrade` is this program's own (a module the hub install
   - It does not restart the server. The next start runs the new release, which backs up first.
 - **On a home another release served last, or one rolled back**, it takes the step with this release, as above.
 
+**A box taken over from 0.7: the old units stay off.** The takeover fences off each old unit it pauses: a drop-in,
+`~/.config/systemd/user/<unit>.d/parachute-core-took-over.conf`, whose `AssertPathExists=!/` makes systemd refuse
+every start of it (by hand, 0.7's own `parachute start`, a unit that wants it). Then it stops and disables it. Not
+`systemctl mask`: masking puts a link where the unit file is, and the 0.7 unit file lives in that very folder; the
+rollback needs it. `takeover --rollback` removes the drop-in. Releases up to 0.9.0-pre.1 only stopped and disabled
+the unit, so a paused `parachute-hub.service` (Restart=always) could be started again and, while core was stopped
+for an upgrade, take the port and serve the home with 0.7 (#127). Core's `serve` fences off and stops any such unit
+at its start, before it opens anything, so the first start of a release with the fix closes it on those boxes; until
+then `parachute doctor` warns (`old-units`, fix `parachute restart`). **Stopgap for an upgrade run from 0.9.0-pre.1
+or older** (or 0.8.x): `systemctl --user stop parachute-hub.service` first, and check `systemctl --user is-active
+parachute-hub.service` says `inactive` before stopping core.
+
 **What `--restore` keeps, and what it doesn't.** Putting the backup's hub.db back must not make anything revoked
 since work again (`release.ts` `keepRevocations`). It reads the live hub.db (and, on a retried restore, what an
 earlier attempt moved aside), only if it is the same hub (it shares a signing key with the backup), and carries:

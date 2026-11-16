@@ -333,12 +333,16 @@ describe("takeover", () => {
     expect(schemaOf(hubDb(m))).toBe(hubSchema);
   }, 120_000);
 
-  test("after takeover the old hub unit can't start again: not by hand, not in an upgrade's gap while core is stopped (#127)", async () => {
+  test("once paused, the old hub unit can't start again: not while the takeover runs, not by hand, not in an upgrade's gap while core is stopped (#127)", async () => {
     // On one box (#127) the paused hub unit (Restart=always) was started again and, while core was stopped for an
     // upgrade, took the port and ran the 0.7 hub on the live home. A paused unit must not start until a rollback.
     const { m, s } = await oldMachine("tk-fenced");
-    const r = await core(m, ["takeover", "--home", m.home, "--yes", "--json"]);
-    must(r.code === 0, `takeover --yes exited ${r.code}: ${r.stderr.slice(-600)}`);
+    // From the moment it is paused: while the takeover backs up and checks v0.8 on the home, the old hub can't start.
+    const run = m.spawn([requireCore(m.info), "takeover", "--home", m.home, "--yes", "--json"]);
+    const checking = await until(() => dbHolders(m.home).some((h) => h.cmd.includes("--listen")), 90_000, 50);
+    must(checking, `setup: the takeover's check run never opened the data:\n${run.log().slice(-1500)}`);
+    expect((await m.run(["systemctl", "--user", "start", HUB_UNIT])).code).not.toBe(0);
+    must((await run.proc.exited) === 0, `takeover --yes exited ${run.proc.exitCode}: ${run.log().slice(-600)}`);
     await (await coreUnit(m, s)).stop(); // the upgrade's gap: core stopped, nothing holds the home
 
     const start = await m.run(["systemctl", "--user", "start", HUB_UNIT]);
@@ -376,13 +380,16 @@ describe("takeover", () => {
     // The incident: the old hub started in the gap and serves the home with the 0.7 programs.
     must((await m.run(["systemctl", "--user", "start", HUB_UNIT])).code === 0, "setup: the unfenced old hub unit didn't start");
     await serving(m, s, HUB_UNIT);
-    expect(dbHolders(m.home).length).toBeGreaterThan(0);
+    const oldPids = dbHolders(m.home).map((h) => h.pid);
+    expect(oldPids.length).toBeGreaterThan(0);
 
     // Core starts (the upgrade's last step): it stops the old hub, keeps it from starting again, and serves the home.
     must((await m.run(["systemctl", "--user", "start", "parachute-core.service"])).code === 0, "starting parachute-core.service failed");
+    // The old hub answers at the same origin until core has stopped it: wait for that first.
+    expect(await until(() => !m.unit(HUB_UNIT).active, 60_000, 200)).toBe(true);
     const c = await coreUnit(m, s);
     try {
-      expect(m.unit(HUB_UNIT).active).toBe(false);
+      expect(dbHolders(m.home).filter((h) => oldPids.includes(h.pid))).toEqual([]);
       expect((await readNotes(s.origin, s.vaultName, s.readPass)).status).toBe(200);
       expect((await doctor())?.status).toBe("pass");
     } finally {

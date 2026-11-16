@@ -12,8 +12,9 @@
 // 3. On yes:
 //    - refuse with exit 7, changing nothing, if an old process holds the data outside a unit it can pause (it
 //      names the pid);
-//    - pause the old units (stop, then disable; never mask, never edit their files), and wait until nothing holds
-//      the data. Pausing comes before the backup so the backup is the bytes as they rest, copied exactly;
+//    - pause the old units, and wait until nothing holds the data: fence each off first (a drop-in that makes systemd
+//      refuse any start of it, core-host.ts TAKEOVER_FENCE; never mask, never edit their files), then stop and
+//      disable it. Pausing comes before the backup so the backup is the bytes as they rest, copied exactly;
 //    - back up every file of the home to <home>/../parachute-takeover/<timestamp>/home/, with manifest.json (a
 //      sha256 per file, checked against the copy);
 //    - start v0.8 on the same home (a check run on a free loopback port, with the old issuer) and check every
@@ -23,7 +24,7 @@
 //      parachute-core.service, and check it is up.
 //    If a check fails it puts everything back (the backup too, when the check run migrated data) and exits 8.
 // 4. The old programs stay installed, byte-identical, and off. Nothing is converted beyond the named migrations.
-// 5. --rollback stops v0.8 (its unit) and puts the old units back as they were. Code-only when there were no
+// 5. --rollback stops v0.8 (its unit) and puts the old units back as they were (fences removed). Code-only when there were no
 //    migrations, so every write made under v0.8 is kept; otherwise it first exports every note changed since the
 //    takeover, then restores the backup.
 //
@@ -32,7 +33,8 @@
 // · 8 a check failed after start (it put everything back).
 //
 // `parachute-core serve` on a home the old programs still own, with no takeover record, refuses with exit 7 and says
-// to run takeover (oldOwner(), called from dispatch).
+// to run takeover (oldOwner(), called from dispatch). On a taken-over home it first fences off and stops any old unit
+// the takeover paused that could still start (fenceLeftovers(): a home taken over before the fence, #127).
 import type { Database } from "bun:sqlite";
 import { createHash, randomBytes } from "node:crypto";
 import {
@@ -57,6 +59,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { dlopen, FFIType } from "bun:ffi";
 import core from "../../../package.json" with { type: "json" };
+import { fencePath, fenceText, unfencedOldUnits } from "@openparachute/hub/src/core-host.ts";
 import { databases, homeDir, readDatabase, schemaOf } from "./home.ts";
 import { bundleRoot } from "./install.ts";
 
@@ -918,7 +921,7 @@ function plan(d: Detected): string[] {
   const pause = [...new Set([...d.units.filter((u) => u.old).map((u) => u.name), ...back])];
   const steps = [
     ...(back.length ? [`put ${back.join(" and ")} back as before, since the interrupted takeover paused ${back.length === 1 ? "it" : "them"}`] : []),
-    pause.length ? `pause ${pause.join(" and ")} (stop and disable; the unit files stay)` : "nothing to pause: no old unit is on",
+    pause.length ? `pause ${pause.join(" and ")} (fence off so nothing can start ${pause.length === 1 ? "it" : "them"}, stop and disable; the unit files stay)` : "nothing to pause: no old unit is on",
     `back up the home to ${tilde(join(dirname(d.home), "parachute-takeover"))}/<time>/, with a sha256 for every file`,
     `start v0.8 (${core.name} ${core.version}) on the same home and check every vault answers with the same notes`,
   ];
@@ -1674,9 +1677,31 @@ function readCoreUnitMark(): string | undefined {
   }
 }
 
-/** Put the old units back as they were: enabled ones enabled, running ones started. */
+/** Fence an old unit off: systemd refuses every start of it until unfence() (core-host.ts TAKEOVER_FENCE). */
+function fence(unit: string, home: string): void {
+  const p = fencePath(unit);
+  mkdirSync(dirname(p), { recursive: true });
+  writeFileSync(p, fenceText(home, unit), { mode: 0o644 });
+}
+
+/** Take an old unit's fence away (and its drop-in folder, when nothing else is in it). */
+function unfence(unit: string): void {
+  const p = fencePath(unit);
+  rmSync(p, { force: true });
+  try {
+    if (readdirSync(dirname(p)).length === 0) rmSync(dirname(p), { recursive: true });
+  } catch {}
+}
+
+/** Put the old units back as they were: fences taken away, enabled ones enabled, running ones started. */
 function resumeUnits(paused: Record_["paused"]): string[] {
   const errors: string[] = [];
+  try {
+    for (const u of paused) unfence(u.name);
+    if (paused.length) systemctl("daemon-reload");
+  } catch (err) {
+    return [(err as Error).message];
+  }
   for (const u of paused) {
     try {
       if (u.enabled) systemctl("enable", u.name);
@@ -1899,6 +1924,10 @@ async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ ba
     // started again on rollback.
     paused.push({ name: u.name, manager: "systemd", active: true, enabled: u.enabled });
     try {
+      // Fenced before it is stopped: from the stop on, nothing can start it again (Restart=, a person, 0.7's own
+      // verbs, a unit that wants it) until a rollback takes the fence away (#127).
+      fence(u.name, d.home);
+      systemctl("daemon-reload");
       systemctl("stop", u.name);
       if (u.enabled) systemctl("disable", u.name);
     } catch (err) {
@@ -2203,6 +2232,29 @@ export async function takeover(args: string[]): Promise<number> {
   } catch (err) {
     say((err as Error).message);
     return err instanceof Exit ? err.code : EXIT.failed;
+  }
+}
+
+/**
+ * For dispatch, before core's `serve` opens anything: on a taken-over home, every old unit the takeover paused that
+ * could start again (taken over before the fence, #127; or its fence taken away) is fenced off and stopped, so it
+ * can't take the port while core is stopped, as in an upgrade. A unit that now starts core, or names another home,
+ * is left alone. Never stops serve: what it couldn't do is said, and `parachute doctor` warns about it.
+ */
+export function fenceLeftovers(home: string, say: (s: string) => void): void {
+  if (!Bun.which("systemctl")) return;
+  const names = (unfencedOldUnits(home) ?? []).filter((n) => {
+    const text = unitText(n);
+    return runsOld(n, text) && unitServes(text, home, true);
+  });
+  if (!names.length) return;
+  try {
+    for (const n of names) fence(n, home);
+    systemctl("daemon-reload");
+    for (const n of names) systemctl("stop", n);
+    say(`${names.join(" and ")} (what this home was taken over from) could still start; ${names.length === 1 ? "it is" : "they are"} stopped and fenced off now, so ${names.length === 1 ? "it" : "they"} can't take this home while core is stopped (\`parachute-core takeover --rollback\` puts ${names.length === 1 ? "it" : "them"} back)`);
+  } catch (err) {
+    say(`couldn't fence off ${names.join(" and ")}, which could still start on this home: ${(err as Error).message}. Stop ${names.length === 1 ? "it" : "them"} (\`systemctl --user stop ${names.join(" ")}\`); \`parachute doctor\` says what is left.`);
   }
 }
 

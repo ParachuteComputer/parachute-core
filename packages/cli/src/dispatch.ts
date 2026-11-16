@@ -336,6 +336,13 @@ export async function dispatch(role: Role, notice?: Notice): Promise<void> {
     const { coreUnitServes, coreUnitVerb, wholeService } = await import("./unit.ts");
     if (wholeService(r.argv.slice(1)) && coreUnitServes(home) && !managedRefusal("hub", r.argv)) process.exit(coreUnitVerb(r.argv[0]!));
   }
+  if (r.cli === "hub" && r.argv[0] === "serve" && !["--help", "-h"].includes(r.argv[1] ?? "") && process.env.PARACHUTE_EMBEDDED_PARENT === undefined && process.env.PARACHUTE_TAKEOVER_CHECK !== "1") {
+    // Before core's serve opens anything (the step below included): on a taken-over home, an old unit the takeover
+    // paused that could start again is fenced off and stopped (#127). A home taken over by an earlier release is
+    // fixed this way at the first start of this one, however it was installed. Files only, unless one is found.
+    const { fenceLeftovers } = await import("./takeover.ts");
+    fenceLeftovers(home, (s) => console.error(`parachute serve: ${s}`));
+  }
   {
     // The first time this release opens a home an older one served: record the step and back the databases up
     // first (release.ts). Not a host's (embedded) home, nor one the old 0.7 programs still own. A home marked

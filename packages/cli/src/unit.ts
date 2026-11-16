@@ -8,7 +8,7 @@
 //
 // So when `parachute-core.service` is there, runs core and serves this home, those three verbs are the unit's,
 // unless a hub unit that itself runs core is beside it (one `parachute init` wrote: the hub's own verbs know that
-// one). A hub unit that runs the 0.7 hub is the takeover's leftover: it pauses the old units (stopped, disabled)
+// one). A hub unit that runs the 0.7 hub is the takeover's leftover: it pauses the old units (fenced off, stopped, disabled)
 // and leaves their files, and the hub's verbs would start that old hub on a home core serves. Inside core the
 // hub no longer drives such a unit at all (hub-unit.ts), whichever verb or module is named. The verbs are the
 // core unit's: `systemctl --user <verb> parachute-core.service`. They open no database, so they also work from a
