@@ -82,7 +82,8 @@ hub unit the takeover left paused beside it doesn't count, only a hub unit that 
 that starts the 0.7 hub for its own unit, whichever verb or module is named (`hub-unit.ts` `isHubUnitInstalled`),
 and `parachute migrate --to-supervised` (the 0.7 cutover, whose unit runs the hub alone) is refused in this program.
 Open: `parachute init` on a taken-over box whose core is stopped writes a second unit for the same home, and
-`migrate --teardown` removes the paused 0.7 unit file the takeover's rollback re-enables. Elsewhere `stop` and `restart` of the whole service go to the hub's own, and `logs`
+`migrate --teardown` removes the paused 0.7 unit file the takeover's rollback re-enables. A hub unit rewritten to run
+core keeps the takeover's fence drop-in (nothing removes it), so systemd refuses to start it until it is taken away. Elsewhere `stop` and `restart` of the whole service go to the hub's own, and `logs`
 only reads. All of these still run from the newer release without taking the step: right after `parachute upgrade` installed it, the links name the newer release while the older
 server runs, and those are the commands that stop it. They open no database. Its next start, as the newer
 release, takes the step. (`status`, and `stop <module>`, open hub.db and are refused like the rest.)
@@ -171,7 +172,11 @@ for an upgrade, take the port and serve the home with 0.7 (#127). Core's `serve`
 at its start, before it opens anything, so the first start of a release with the fix closes it on those boxes; until
 then `parachute doctor` warns (`old-units`, fix `parachute restart`). **Stopgap for an upgrade run from 0.9.0-pre.1
 or older** (or 0.8.x): `systemctl --user stop parachute-hub.service` first, and check `systemctl --user is-active
-parachute-hub.service` says `inactive` before stopping core.
+parachute-hub.service` says `inactive` before stopping core. **Going back to 0.7 from a release without the fence**
+(after `parachute upgrade --rollback` to 0.9.0-pre.1 or 0.8.x): that release's `takeover --rollback` doesn't know
+the drop-in, and systemd refuses the old hub it starts. Run `takeover --rollback` before rolling core back, or take
+the drop-in away first (`rm ~/.config/systemd/user/parachute-hub.service.d/parachute-core-took-over.conf && systemctl
+--user daemon-reload`).
 
 **What `--restore` keeps, and what it doesn't.** Putting the backup's hub.db back must not make anything revoked
 since work again (`release.ts` `keepRevocations`). It reads the live hub.db (and, on a retried restore, what an

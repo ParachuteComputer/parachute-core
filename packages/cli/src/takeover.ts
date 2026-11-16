@@ -1684,6 +1684,12 @@ function fence(unit: string, home: string): void {
   writeFileSync(p, fenceText(home, unit), { mode: 0o644 });
 }
 
+/** How to put paused units back by hand: their fences first (systemd refuses to start a fenced unit), then each as it was. */
+function byHand(paused: Record_["paused"]): string {
+  if (!paused.length) return "start the old programs";
+  return `take the fence${paused.length === 1 ? "" : "s"} away (\`rm ${paused.map((u) => tilde(fencePath(u.name))).join(" ")} && systemctl --user daemon-reload\`), then ${paused.map((u) => `\`systemctl --user ${u.enabled ? "enable --now" : "start"} ${u.name}\``).join(" and ")}`;
+}
+
 /** Take an old unit's fence away (and its drop-in folder, when nothing else is in it). */
 function unfence(unit: string): void {
   const p = fencePath(unit);
@@ -1956,7 +1962,7 @@ async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ ba
   const undo = async (why: string): Promise<Exit> => {
     const still = holders(d.home);
     if (still.length) {
-      return new Exit(EXIT.checkFailed, `${why}; v0.8 still holds the data (${still.map((h) => `pid ${h.pid}`).join(", ")}), so the old units stay paused. Stop it, then enable and start ${paused.map((u) => u.name).join(" and ") || "the old programs"} yourself; the backup is in ${dest}`);
+      return new Exit(EXIT.checkFailed, `${why}; v0.8 still holds the data (${still.map((h) => `pid ${h.pid}`).join(", ")}), so the old units stay paused. Stop it, then run \`parachute-core takeover --rollback\`, which puts ${paused.map((u) => u.name).join(" and ") || "the old programs"} back; the backup is in ${dest}`);
     }
     let msg = why;
     if (d.migrations.length) {
@@ -1968,7 +1974,7 @@ async function takeOver(asked: Detected, say: (s: string) => void): Promise<{ ba
         const aside = restore(d.home, dest, (a) => ({ ...progress, stage: "checking", backup: dest, restored_at: new Date().toISOString(), moved_aside: a }));
         msg += `; the backup was restored (what v0.8 left is in ${aside})`;
       } catch (err) {
-        return new Exit(EXIT.checkFailed, `${why}; restoring the backup failed: ${(err as Error).message}. The old units stay paused, because the data may be migrated. Restore ${dest}/home over ${d.home} (manifest.json has every sha256), then enable and start ${paused.map((u) => u.name).join(" and ")}.`);
+        return new Exit(EXIT.checkFailed, `${why}; restoring the backup failed: ${(err as Error).message}. The old units stay paused, because the data may be migrated. Restore ${dest}/home over ${d.home} (manifest.json has every sha256), then ${byHand(paused)}.`);
       }
     }
     const back = await putBack(msg);
@@ -2243,15 +2249,25 @@ export async function takeover(args: string[]): Promise<number> {
  */
 export function fenceLeftovers(home: string, say: (s: string) => void): void {
   if (!Bun.which("systemctl")) return;
+  // unsure counts as this home's here (unlike a takeover's pause): the record already names the unit as one the
+  // takeover proved served this home; only a unit whose configuration now names another home is left alone.
   const names = (unfencedOldUnits(home) ?? []).filter((n) => {
     const text = unitText(n);
     return runsOld(n, text) && unitServes(text, home, true);
   });
   if (!names.length) return;
   try {
-    for (const n of names) fence(n, home);
-    systemctl("daemon-reload");
-    for (const n of names) systemctl("stop", n);
+    try {
+      for (const n of names) fence(n, home);
+      systemctl("daemon-reload");
+      for (const n of names) systemctl("stop", n);
+    } catch (err) {
+      // A fence counts as done only once systemd has it and the unit is stopped: otherwise it goes again, so the next
+      // start tries again and doctor keeps warning.
+      for (const n of names) unfence(n);
+      run(["systemctl", "--user", "daemon-reload"]);
+      throw err;
+    }
     say(`${names.join(" and ")} (what this home was taken over from) could still start; ${names.length === 1 ? "it is" : "they are"} stopped and fenced off now, so ${names.length === 1 ? "it" : "they"} can't take this home while core is stopped (\`parachute-core takeover --rollback\` puts ${names.length === 1 ? "it" : "them"} back)`);
   } catch (err) {
     say(`couldn't fence off ${names.join(" and ")}, which could still start on this home: ${(err as Error).message}. Stop ${names.length === 1 ? "it" : "them"} (\`systemctl --user stop ${names.join(" ")}\`); \`parachute doctor\` says what is left.`);

@@ -370,6 +370,7 @@ describe("takeover", () => {
     await (await coreUnit(m, s)).stop();
     // What an older takeover left: whatever this one added beside the old unit's file is taken away again.
     for (const f of existsSync(dropIns) ? readdirSync(dropIns) : []) if (!had.has(f)) unlinkSync(join(dropIns, f));
+    must((await m.run(["systemctl", "--user", "daemon-reload"])).code === 0, "setup: daemon-reload failed");
 
     const doctor = async () => json(await core(m, ["doctor", "--json"]), "doctor --json").checks.find((c: { name: string }) => c.name === "old-units");
     const warned = await doctor();

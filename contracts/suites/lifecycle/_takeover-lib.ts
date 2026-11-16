@@ -87,8 +87,9 @@ const FAKE_SYSTEMCTL = `#!/bin/sh
 #   it; is-active says "failed" once its process is gone; show names its MainPID. The seeded old units start that
 #   way too (the stock home starts the ones seeded as running).
 # - A start (start, restart, enable --now) checks the unit's AssertPathExists= lines first (the unit file, then its
-#   drop-ins), as systemd does: one that fails refuses the start ("Assertion failed on job for <unit>.", exit 1) and
-#   changes nothing. A path with a leading ! asserts it is absent.
+#   drop-ins, as loaded at the last daemon-reload: a drop-in written or removed since counts only after one), as
+#   systemd does: one that fails refuses the start ("Assertion failed on job for <unit>.", exit 1) and changes
+#   nothing. A path with a leading ! asserts it is absent.
 # - show prints a unit file's Environment= lines (systemd prints the assignments it would pass); show-environment
 #   prints the environment every unit starts from (the manager's).
 STATE=__STATE__
@@ -131,10 +132,16 @@ run_unit() {
   ) &
   echo $! > "$STATE/$1.pid"
 }
+load_asserts() {
+  for f in "$UNITS"/*.service; do
+    [ -f "$f" ] || continue
+    u=$(basename "$f"); all="$f"; for d in "$UNITS/$u.d"/*.conf; do [ -f "$d" ] && all="$all $d"; done
+    cat $all | sed -n 's/^AssertPathExists=//p' > "$STATE/$u.asserts"
+  done
+}
 asserts_ok() {
-  all=""; [ -f "$UNITS/$1" ] && all="$UNITS/$1"; for d in "$UNITS/$1.d"/*.conf; do [ -f "$d" ] && all="$all $d"; done
-  [ -n "$all" ] || return 0
-  for a in $(cat $all | sed -n 's/^AssertPathExists=//p'); do
+  [ -f "$STATE/$1.asserts" ] || return 0
+  for a in $(cat "$STATE/$1.asserts"); do
     case "$a" in "!"*) [ -e "\${a#!}" ] && return 1 ;; *) [ -e "$a" ] || return 1 ;; esac
   done
   return 0
@@ -154,7 +161,7 @@ stop_unit() {
 }
 code=0
 case "$verb" in
-  daemon-reload) exit 0 ;;
+  daemon-reload) load_asserts; exit 0 ;;
   show-environment)
     # As systemd prints it: a value with a space, a quote or a backslash in its $'…' form, those two escaped.
     q() { case "$1" in *" "*|*\\'*|*\\\\*) printf '%s%s%s' '$'"'" "$(printf '%s' "$1" | sed -e 's/[\\\\]/\\\\\\\\/g' -e "s/'/\\\\\\\\'/g")" "'" ;; *) printf '%s' "$1" ;; esac; }
