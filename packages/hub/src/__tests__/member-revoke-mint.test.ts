@@ -67,6 +67,8 @@ describe("a refresh-row mint re-checks the person's role (core #129)", () => {
         if ((db.query("SELECT used_at FROM auth_codes WHERE code = ?").get(code) as { used_at: string | null }).used_at) break;
         await Promise.resolve();
       }
+      // In the gap: the code is used and no token row exists yet (else this would test something easier).
+      expect((db.query("SELECT used_at FROM auth_codes WHERE code = ?").get(code) as { used_at: string | null }).used_at).not.toBeNull();
       expect((db.query("SELECT count(*) AS n FROM tokens WHERE user_id = ?").get(bob.id) as { n: number }).n).toBe(0);
       expect(removeUserVault(db, bob.id, "default")).toBe(true);
       const res = await pending;

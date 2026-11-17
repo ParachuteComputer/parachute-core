@@ -7345,8 +7345,8 @@ describe("handleAuthorizePost — multi-user assigned vault defense (PR 4)", () 
   // assignment between mint and refresh, then asserting the new token
   // carries the post-mutation value. The `scope` claim itself stays
   // narrowed to the original vault (it was set at consent time and stored
-  // on the refresh-token row); only the informational `vault_scope` claim
-  // tracks the live row.
+  // on the refresh-token row) while the person still holds that vault;
+  // once they don't, the family stops (core #129).
   test("refresh flow picks up a mid-session assigned_vault change, and stops once the vault is gone", async () => {
     const { db, cleanup } = await makeDb();
     try {

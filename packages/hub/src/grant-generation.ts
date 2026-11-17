@@ -72,8 +72,8 @@ export function bumpGrantGeneration(db: Database, userId: string, clientId: stri
 /** The person changed this app's account-door choice while the token was being issued: nothing was kept. */
 export class GrantChangedError extends Error {
   override name = "GrantChangedError";
-  constructor() {
-    super("the grant changed while this token was being issued; authorize again");
+  constructor(message = "the grant changed while this token was being issued; authorize again") {
+    super(message);
   }
 }
 
@@ -89,7 +89,9 @@ export function assertMintedUnderCurrentGrant(
   db: Database,
   opts: { userId: string; clientId: string; scopes: readonly string[]; artifactGeneration: number },
 ): void {
-  if (scopesBeyondRole(db, opts.userId, opts.scopes).length > 0) throw new GrantChangedError();
+  if (scopesBeyondRole(db, opts.userId, opts.scopes).length > 0) {
+    throw new GrantChangedError("this access was taken away or narrowed on the hub; authorize again");
+  }
   if (!opts.scopes.some(isAccountDoorChoiceScope)) return;
   if (opts.artifactGeneration !== currentGrantGeneration(db, opts.userId, opts.clientId)) throw new GrantChangedError();
 }
