@@ -12,14 +12,16 @@
  *   - Check: every mint of a refresh row re-reads its artifact's generation from the DB in the same synchronous
  *     transaction as the insert, after any await, and refuses on a mismatch (`assertMintedUnderCurrentGrant`, called
  *     by `signRefreshToken`, which requires the reader). So a code redeem or a refresh that was signing while the
- *     person narrowed inserts nothing and returns nothing signed.
+ *     person narrowed inserts nothing and returns nothing signed. The same check refuses a scope above the person's
+ *     role on its vault now (core #129), for every row.
  *
- * Only rows whose scopes carry an account-door choice scope are checked: a bump must not end the same client's
+ * Only rows whose scopes carry an account-door choice scope are generation-checked: a bump must not end the same client's
  * unrelated vault-scoped families. The counter lives in its own table (`grant_generations`, hub-db
  * `ensureGrantGenerations`) and is never deleted with the grant row, so revoke-then-reconsent can't reset it.
  */
 import type { Database } from "bun:sqlite";
 import { ACCOUNT_VAULTS_UNNARROWED, accountVaultsScope } from "@openparachute/door-contract";
+import { scopesBeyondRole } from "./users.ts";
 
 export function isAccountVaultsConnectionScope(scope: string): boolean {
   return scope === ACCOUNT_VAULTS_UNNARROWED || scope === accountVaultsScope("self");
@@ -77,13 +79,17 @@ export class GrantChangedError extends Error {
 
 /**
  * The one check every refresh-row mint runs, inside the transaction that inserts the row and after any await:
- * a mint whose scopes carry an account-door choice scope must come from an artifact (code, refresh row) whose
- * generation, read from the DB now, is the current one. Throws `GrantChangedError` otherwise.
+ *   - a mint whose scopes carry an account-door choice scope must come from an artifact (code, refresh row) whose
+ *     generation, read from the DB now, is the current one;
+ *   - no scope may ask a vault for more than the person's role there holds now (core #129): a revoke or a lowered
+ *     role that landed while a code redeem was signing, or a family an older hub left live after one, mints nothing.
+ * Throws `GrantChangedError` otherwise.
  */
 export function assertMintedUnderCurrentGrant(
   db: Database,
   opts: { userId: string; clientId: string; scopes: readonly string[]; artifactGeneration: number },
 ): void {
+  if (scopesBeyondRole(db, opts.userId, opts.scopes).length > 0) throw new GrantChangedError();
   if (!opts.scopes.some(isAccountDoorChoiceScope)) return;
   if (opts.artifactGeneration !== currentGrantGeneration(db, opts.userId, opts.clientId)) throw new GrantChangedError();
 }

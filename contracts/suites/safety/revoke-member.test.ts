@@ -7,15 +7,21 @@
 // `/oauth/revoke` stopped a token, and the hub's 401 for a revoked token had no CORS headers, so a browser app saw a
 // network error instead of "revoked".
 //
-// Fixed in packages/hub (users.ts `endVaultAuthorityBeyondRole`, hub-server.ts `revokedKeyResponse`): taking a member's access away (revoke-access, the admin dropping a vault from a user, or
+// Fixed in packages/hub. Taking a member's access away (revoke-access, the admin dropping a vault from a user, or
 // grant-access lowering their role) revokes their tokens that name that vault above what they still hold, with the
-// refresh families, and takes that vault out of their standing consent. The key door's revoked 401 carries the
-// vault's CORS headers. Mutants "revoke-access-keeps-tokens", "revoke-access-keeps-consent",
-// "drop-vault-keeps-tokens", "lower-role-keeps-tokens" and "revoked-401-no-cors" put each back.
+// refresh families, and takes that vault out of their standing consent (users.ts `endVaultAuthorityBeyondRole`).
+// Every refresh-row mint re-checks the role, so a mint signing meanwhile, or a family an older hub left live, mints
+// nothing (grant-generation.ts). The key door's revoked 401 carries the vault's CORS headers (hub-server.ts).
+// Mutants "revoke-access-keeps-tokens", "revoke-access-keeps-consent", "drop-vault-keeps-tokens",
+// "lower-role-keeps-tokens", "sweep-ignores-account-door", "mint-skips-role-check" and "revoked-401-no-cors" put each
+// back; "sweep-ends-held-verbs" and "sweep-ends-other-users" make it too broad.
 //
 // Candidate only (safety/). The member is a made-up key; it signs in through the hub's key door, never a password.
 import { describe, expect, test } from "bun:test";
 import { createHash, randomBytes } from "node:crypto";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+import { Database } from "bun:sqlite";
 import { safeFetch, services } from "../lib.ts";
 import { adminSession } from "../oauth.ts";
 
@@ -146,7 +152,8 @@ async function connected(session: string, scope = `vault:${VAULT}:read`, form: R
   return { clientId, access: r.token.access_token, refresh: r.token.refresh_token };
 }
 
-const scopesOf = (token: string): string[] => String(JSON.parse(Buffer.from(token.split(".")[1]!, "base64url").toString()).scope ?? "").split(" ").filter(Boolean);
+const claimsOf = (token: string): Record<string, any> => JSON.parse(Buffer.from(token.split(".")[1]!, "base64url").toString());
+const scopesOf = (token: string): string[] => String(claimsOf(token).scope ?? "").split(" ").filter(Boolean);
 
 /** Read one note page through the hub, as the app does (with its page's Origin when given). */
 async function read(token: string, origin?: string): Promise<Response> {
@@ -239,6 +246,27 @@ describe("revoke-access stops the member at once", () => {
     await accountTool("revoke-access", { pubkey: m.pubkey, vault: VAULT });
     const r = await refresh(app);
     expect({ step: "the account door's refresh after revoke-access", status: r.status }).toEqual({ step: "the account door's refresh after revoke-access", status: 400 });
+  });
+
+  test("a refresh family an older hub left live after the revoke mints nothing", async () => {
+    const m = await member("read");
+    const app = await connected(m.session);
+    await accountTool("revoke-access", { pubkey: m.pubkey, vault: VAULT });
+    // Stands in for what a hub from before this fix left behind: the member's role gone, their app's family live.
+    // Written into the box's own hub.db, as anyone with its disk could.
+    const path = [join(s.home, "hub.db"), join(s.home, "hub", "hub.db")].find(existsSync);
+    if (!path) throw new Error(`setup: no hub.db under ${s.home}`);
+    const db = new Database(path);
+    try {
+      db.exec("PRAGMA busy_timeout = 5000");
+      const jti = claimsOf(app.access).jti as string;
+      const n = db.prepare("UPDATE tokens SET revoked_at = NULL WHERE family_id = (SELECT family_id FROM tokens WHERE jti = ?)").run(jti).changes;
+      if (n < 1) throw new Error("setup: the app's refresh family wasn't in hub.db");
+    } finally {
+      db.close();
+    }
+    const r = await refresh(app);
+    expect({ step: "a left-live refresh after the role is gone", status: r.status, error: r.body?.error }).toEqual({ step: "a left-live refresh after the role is gone", status: 400, error: "invalid_grant" });
   });
 
   test("another member of the same vault keeps reading", async () => {

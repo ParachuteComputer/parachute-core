@@ -102,3 +102,48 @@ describe("a refresh-row mint re-checks the person's role (core #129)", () => {
     }
   });
 });
+
+describe("the sweep ends only what the role no longer holds (core #129)", () => {
+  async function member() {
+    const dir = mkdtempSync(join(tmpdir(), "member-revoke-sweep-"));
+    const db = openHubDb(hubDbPath(dir));
+    await createUser(db, "owner", "pw");
+    const bob = await createUser(db, "bob", "pw", { allowMulti: true });
+    const row = db.prepare(
+      "INSERT INTO tokens (jti, user_id, client_id, scopes, expires_at, created_at, created_via) VALUES (?, ?, 'c', ?, '2999-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z', 'cli_mint')",
+    );
+    const live = () =>
+      (db.query("SELECT jti FROM tokens WHERE user_id = ? AND revoked_at IS NULL ORDER BY jti").all(bob.id) as { jti: string }[]).map((r) => r.jti);
+    return { db, bob, row, live, cleanup: () => (db.close(), rmSync(dir, { recursive: true, force: true })) };
+  }
+
+  test("a write member's backup (export) key survives the same role granted again, and ends when admin goes", async () => {
+    const { db, bob, row, live, cleanup } = await member();
+    try {
+      upsertUserVault(db, bob.id, "default", "write");
+      row.run("j-export", bob.id, "vault:default:export");
+      row.run("j-admin", bob.id, "vault:default:admin");
+      upsertUserVault(db, bob.id, "default", "write");
+      expect(live()).toEqual(["j-admin", "j-export"]);
+      upsertUserVault(db, bob.id, "default", "member");
+      expect(live()).toEqual([]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("revoking one vault leaves the member's tokens for another vault", async () => {
+    const { db, bob, row, live, cleanup } = await member();
+    try {
+      upsertUserVault(db, bob.id, "default", "read");
+      upsertUserVault(db, bob.id, "other", "read");
+      row.run("j-default", bob.id, "vault:default:read");
+      row.run("j-other", bob.id, "vault:other:read");
+      row.run("j-door", bob.id, "account:self:vaults:other:read");
+      removeUserVault(db, bob.id, "default");
+      expect(live()).toEqual(["j-door", "j-other"]);
+    } finally {
+      cleanup();
+    }
+  });
+});
