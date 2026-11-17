@@ -7347,7 +7347,7 @@ describe("handleAuthorizePost — multi-user assigned vault defense (PR 4)", () 
   // narrowed to the original vault (it was set at consent time and stored
   // on the refresh-token row); only the informational `vault_scope` claim
   // tracks the live row.
-  test("refresh flow picks up a mid-session assigned_vault change", async () => {
+  test("refresh flow picks up a mid-session assigned_vault change, and stops once the vault is gone", async () => {
     const { db, cleanup } = await makeDb();
     try {
       const admin = await createUser(db, "admin-aaron", "pw");
@@ -7425,42 +7425,44 @@ describe("handleAuthorizePost — multi-user assigned vault defense (PR 4)", () 
       expect(initial.payload.vault_scope).toEqual(["vault-a"]);
       expect(initial.payload.scope).toBe("vault:vault-a:read");
 
-      // Step 2: admin updates bob's vault assignments to ["vault-b"].
-      // Direct DB writes against user_vaults — same effect as the PATCH
-      // /api/users/:id/vaults endpoint. The refresh path reads the live
-      // row at mint time (`vaultScopeForUser`), so the next refresh
-      // should pick up the new value.
-      db.prepare("DELETE FROM user_vaults WHERE user_id = ?").run(bob.id);
+      // Step 2: admin adds vault-b to bob's assignments. Direct DB writes
+      // against user_vaults. The refresh path reads the live row at mint
+      // time (`vaultScopeForUser`), so the next refresh picks up the new value.
       db.prepare(
         "INSERT INTO user_vaults (user_id, vault_name, role, created_at) VALUES (?, ?, 'write', ?)",
       ).run(bob.id, "vault-b", new Date().toISOString());
-
-      // Step 3: refresh the token. vault_scope should be ["vault-b"] (the
-      // new live value); the `scope` claim stays narrowed to the original
-      // vault (auth-code grant snapshotted it onto the refresh-token row).
-      const refreshRes = await handleToken(
-        db,
-        new Request(`${ISSUER}/oauth/token`, {
-          method: "POST",
-          body: new URLSearchParams({
-            grant_type: "refresh_token",
-            refresh_token: tokenBody.refresh_token,
-            client_id: reg.client.clientId,
+      const refreshWith = (refreshToken: string) =>
+        handleToken(
+          db,
+          new Request(`${ISSUER}/oauth/token`, {
+            method: "POST",
+            body: new URLSearchParams({
+              grant_type: "refresh_token",
+              refresh_token: refreshToken,
+              client_id: reg.client.clientId,
+            }),
+            headers: { "content-type": "application/x-www-form-urlencoded" },
           }),
-          headers: { "content-type": "application/x-www-form-urlencoded" },
-        }),
-        { issuer: ISSUER, loadServicesManifest: () => twoVaultManifest },
-      );
+          { issuer: ISSUER, loadServicesManifest: () => twoVaultManifest },
+        );
+
+      // Step 3: refresh the token. vault_scope is the new live value; the
+      // `scope` claim stays narrowed to the original vault (the auth-code
+      // grant snapshotted it onto the refresh-token row).
+      const refreshRes = await refreshWith(tokenBody.refresh_token);
       expect(refreshRes.status).toBe(200);
-      const refreshBody = (await refreshRes.json()) as { access_token: string };
+      const refreshBody = (await refreshRes.json()) as { access_token: string; refresh_token: string };
       const refreshed = await validateAccessToken(db, refreshBody.access_token, ISSUER);
-      expect(refreshed.payload.vault_scope).toEqual(["vault-b"]);
-      // The `scope` claim is still bound to the original consent — the
-      // refresh-token row carries `vault:vault-a:read` and the rotation
-      // preserves it. PR 5 will be the side that enforces "your access
-      // tokens for the old vault stop working when the assignment moves";
-      // PR 4 just emits the informational claim correctly.
+      expect(refreshed.payload.vault_scope).toEqual(["vault-a", "vault-b"]);
       expect(refreshed.payload.scope).toBe("vault:vault-a:read");
+
+      // Step 4: the assignment moves off vault-a. The family's scope names a
+      // vault bob no longer holds, so the next refresh mints nothing (core
+      // #129: every refresh-row mint re-checks the role).
+      db.prepare("DELETE FROM user_vaults WHERE user_id = ? AND vault_name = ?").run(bob.id, "vault-a");
+      const moved = await refreshWith(refreshBody.refresh_token);
+      expect(moved.status).toBe(400);
+      expect(((await moved.json()) as { error: string }).error).toBe("invalid_grant");
     } finally {
       cleanup();
     }
