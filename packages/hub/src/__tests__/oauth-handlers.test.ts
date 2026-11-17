@@ -9172,13 +9172,14 @@ describe("zero-vault non-admin privesc gate (hub#429 reviewer)", () => {
     }
   });
 
-  test("stale grant survives setUserVaults([]) → skip-consent gate fires consent screen, not silent code (path 5)", async () => {
+  test("stale grant left after setUserVaults([]) → skip-consent gate fires consent screen, not silent code (path 5)", async () => {
     // The 4th attack the prior fold didn't cover. Sequence:
     //   1. bob has assignedVaults=["default"] (legitimate).
     //   2. bob consents to a vault-scoped client → grants row recorded.
     //   3. Admin clears bob's assignments via setUserVaults(_, []).
     //   4. Grants table has no FK cascade from user_vaults, so the
-    //      grant row survives the assignment delete.
+    //      grant row survived the assignment delete (until core #129,
+    //      which strips it; a hub older than that left such rows).
     //   5. bob re-hits /oauth/authorize?scope=vault:default:read for
     //      the same client. Pre-fix: skip-consent gate fires
     //      (isCoveredByGrant=true), silent 302 with auth code and
@@ -9198,10 +9199,11 @@ describe("zero-vault non-admin privesc gate (hub#429 reviewer)", () => {
         redirectUris: ["https://app.example/cb"],
         status: "approved",
       });
-      // Record the grant while bob still has the assignment.
-      recordGrant(db, bob.id, reg.client.clientId, ["vault:default:read"]);
-      // Admin clears bob's assignments. Grant row is NOT cascaded.
+      // Admin clears bob's assignments. Since core #129 that takes the
+      // vault out of his grants too, so the stale grant this gate guards
+      // against is one an older hub left behind: written here directly.
       expect(setUserVaults(db, bob.id, [])).toBe(true);
+      recordGrant(db, bob.id, reg.client.clientId, ["vault:default:read"]);
       expect(findGrant(db, bob.id, reg.client.clientId)).not.toBeNull();
       const { challenge } = makePkce();
       const req = new Request(
