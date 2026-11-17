@@ -1047,6 +1047,19 @@ async function recordKeyUse(db: Database, use: { jti: string; token: string }): 
   }
 }
 
+/**
+ * The vault door's CORS headers (packages/vault/src/start-vault.ts, the `corsHeaders` every vault reply carries). The
+ * key door answers a revoked key in the vault's place, so its 401 carries the same headers: without them a browser
+ * app reads the refusal as a network error, not "revoked" (core #129). Kept equal to the vault's by the contract
+ * suites/safety/revoke-member.test.ts, which compares this 401 with the vault's own on the same route.
+ */
+const VAULT_DOOR_CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-API-Key, Mcp-Session-Id, Mcp-Protocol-Version, Mcp-Method, Mcp-Name",
+  "Access-Control-Expose-Headers": "WWW-Authenticate, Mcp-Session-Id, Deprecation, Link",
+} as const;
+
 function revokedKeyResponse(): Response {
   return new Response(JSON.stringify({ error: "invalid_token", error_description: "this key has been revoked" }), {
     status: 401,
@@ -1054,6 +1067,7 @@ function revokedKeyResponse(): Response {
       "content-type": "application/json",
       "cache-control": "no-store",
       "www-authenticate": 'Bearer error="invalid_token", error_description="this key has been revoked"',
+      ...VAULT_DOOR_CORS_HEADERS,
     },
   });
 }

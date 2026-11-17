@@ -365,7 +365,9 @@ export function listGrantsForUser(db: Database, userId: string): Grant[] {
 
 /**
  * Delete a grant. Returns true when a row was removed; false when no grant
- * existed for (user, client). Note this does not revoke existing tokens —
+ * existed for (user, client). (Taking a member's vault away is different: it
+ * ends their tokens and consent there at once, `endVaultAuthorityBeyondRole`
+ * in users.ts.) Note this does not revoke existing tokens —
  * an operator who wants to revoke active sessions runs `/oauth/revoke` (or
  * its CLI wrapper) separately. Removing the grant only forces the next
  * /oauth/authorize flow to show consent again.

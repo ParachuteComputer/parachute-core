@@ -1562,9 +1562,10 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
   //     reviewer fold, follow-up). A zero-vault non-admin whose prior
   //     grants survived a `setUserVaults(_, [])` admin action would
   //     otherwise silently re-mint a token against the now-revoked
-  //     vault assignment — the grants table has no FK cascade from
-  //     `user_vaults`, so deleting assignments doesn't revoke grants.
-  //     Same privesc shape as the same-hub auto-trust gate below;
+  //     vault assignment. (Since core #129 every `user_vaults` write also
+  //     takes the vault out of the user's grants and revokes their tokens
+  //     there, `endVaultAuthorityBeyondRole`; this gate stays as the
+  //     second line, for grants from before that.) Same privesc shape as the same-hub auto-trust gate below;
   //     identical guard (`userHasVaultPosture`). Force fall-through to
   //     the consent render where the zero-vault gate in
   //     `handleConsentSubmit` also refuses (defense in depth). This

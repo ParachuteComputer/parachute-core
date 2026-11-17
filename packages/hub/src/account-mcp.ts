@@ -411,8 +411,9 @@ const revokeAccessTool: AccountMcpTool = {
   name: "revoke-access",
   annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
   description:
-    "Remove one vault grant from a Nostr pubkey. Leaves the hub user and any other " +
-    "vaults in place. Refuses the hub owner (unrestricted by construction).",
+    "Remove one vault grant from a Nostr pubkey. Their apps' tokens and consent for that vault " +
+    "end at once. Leaves the hub user and any other vaults in place. Refuses the hub owner " +
+    "(unrestricted by construction).",
   inputSchema: {
     type: "object",
     properties: {

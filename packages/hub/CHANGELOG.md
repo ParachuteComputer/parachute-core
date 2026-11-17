@@ -12,6 +12,10 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 - `GET /.well-known/parachute-changes.json`: the 0.9 change map (what was renamed, what replaced it, which release made each change live), with no sign-in, the same bytes `parachute changes --json` prints. Served with `content-type: application/json`, a five-minute cache and open CORS (0.9.3, T-463).
 - A vault's admin routes (config, usage, embeddings, transcription, mirror, triggers) answer at `/admin/api/vaults/<name>/...` to the hub admin's one sign-in, the session cookie, with the CSRF token (`X-CSRF-Token`) on writes as on the hub's other cookie writes. A script can send a vault admin key as a Bearer instead. No sign-in is 401, a key without admin or a tag-scoped key is 403, an unknown vault is 404 (0.9.3, T-463).
 
+### Fixed
+- Taking a member's vault away stops their apps at once (core #129). `revoke-access`, the operator dropping a vault from a user (`PATCH /api/users/<id>/vaults`) and `grant-access` lowering a role now revoke the member's tokens that name that vault above what they still hold, with their refresh tokens, and take it out of their standing consent, so the next request is 401, the refresh is refused and a later grant asks again. Before, their tokens read on until they expired and refreshed indefinitely.
+- The 401 for a revoked key on `/vault/<name>/*`, `/vault/admin*` and `/mcp` carries the vault's CORS headers, so a browser app reads "revoked" rather than a network error (core #129).
+
 ### Deprecated
 - `/vault/<name>/.parachute/*` and `/vault/<name>/api/triggers` keep working through 0.9 and now answer with `Deprecation: true` and `Link: </admin/api/vaults/<name>/...>; rel="successor-version"` (0.9.3, T-463).
 

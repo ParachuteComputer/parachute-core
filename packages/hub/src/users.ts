@@ -667,6 +667,10 @@ export function setUserVaults(
   }
   const stamp = now().toISOString();
   db.transaction(() => {
+    const before = db
+      .query<{ vault_name: string }, [string]>("SELECT vault_name FROM user_vaults WHERE user_id = ?")
+      .all(userId)
+      .map((r) => r.vault_name);
     db.prepare("DELETE FROM user_vaults WHERE user_id = ?").run(userId);
     if (uniques.length > 0) {
       const insertVault = db.prepare(
@@ -681,6 +685,8 @@ export function setUserVaults(
     // /account/) reflect the change without us having to bake a
     // separate "vault assignments changed" timestamp.
     db.prepare("UPDATE users SET updated_at = ? WHERE id = ?").run(stamp, userId);
+    // A vault dropped from the list ends what the user's apps hold there (core #129).
+    for (const vault of before) endVaultAuthorityBeyondRole(db, userId, vault, stamp);
   })();
   return true;
 }
@@ -732,13 +738,17 @@ export function upsertUserVault(
       attribution.grantedVia ?? null,
     );
     db.prepare("UPDATE users SET updated_at = ? WHERE id = ?").run(stamp, userId);
+    // A lowered role ends what the user's apps hold above it there (core #129); an equal or higher one ends nothing.
+    endVaultAuthorityBeyondRole(db, userId, vaultName, stamp);
   })();
   return true;
 }
 
 /**
- * Drop one `user_vaults` row. Leaves the user (and any other vaults) in place.
- * Returns `true` when a row was deleted.
+ * Drop one `user_vaults` row. Leaves the user (and any other vaults) in place,
+ * and ends their apps' tokens and consent on this vault in the same
+ * transaction (`endVaultAuthorityBeyondRole`). Returns `true` when a row was
+ * deleted.
  */
 export function removeUserVault(
   db: Database,
@@ -755,9 +765,96 @@ export function removeUserVault(
     removed = Number(res.changes) > 0;
     if (removed) {
       db.prepare("UPDATE users SET updated_at = ? WHERE id = ?").run(stamp, userId);
+      // The member's apps stop on their next request, and can't refresh or skip consent back in (core #129).
+      endVaultAuthorityBeyondRole(db, userId, vaultName, stamp);
     }
   })();
   return removed;
+}
+
+/**
+ * The vault a scope names and the verb it asks for there, or null when it names none: `vault:<v>:<verb>`, the
+ * account door's per-vault level `account:self:vaults:<v>:<level>`, and its level-less narrowed form
+ * `account:<id>:vaults:<v>` (the person's role is its level, so it needs at least read). The backup key
+ * `vault:<v>:export` needs admin: only an admin key can be narrowed to it. The wildcard `account:self:vaults:*:<verb>`
+ * and unnamed `vault:<verb>` name no vault: the account door caps those by the role on every request (key-level.ts).
+ */
+function vaultVerbOf(scope: string): { vault: string; verb: string } | null {
+  const named = /^vault:([a-zA-Z0-9_-]+):([a-z]+)$/.exec(scope);
+  if (named) return { vault: named[1]!, verb: named[2] === "export" ? "admin" : named[2]! };
+  const door = /^account:[^:]+:vaults:([a-zA-Z0-9_-]+)(?::([a-z]+))?$/.exec(scope);
+  if (door) return { vault: door[1]!, verb: door[2] ?? "read" };
+  return null;
+}
+
+/**
+ * The scopes that ask a vault for more than the person's role there holds now (core #129); empty for a hub admin,
+ * who is unrestricted. Every refresh-row mint refuses a non-empty answer (grant-generation.ts
+ * `assertMintedUnderCurrentGrant`), and `endVaultAuthorityBeyondRole` ends the rows and consent it names.
+ */
+export function scopesBeyondRole(db: Database, userId: string, scopes: readonly string[], vaultName?: string): string[] {
+  if (isHubAdmin(db, userId)) return [];
+  const held = new Map<string, readonly string[]>();
+  return scopes.filter((scope) => {
+    const v = vaultVerbOf(scope);
+    if (!v || (vaultName !== undefined && v.vault !== vaultName)) return false;
+    if (!held.has(v.vault)) held.set(v.vault, vaultVerbsForUserVault(db, userId, v.vault) ?? []);
+    return !held.get(v.vault)!.includes(v.verb);
+  });
+}
+
+/**
+ * End what a user's apps hold on one vault above the user's role there now (core #129). Called inside the
+ * transaction of every `user_vaults` write (revoke, a lowered role, a vault dropped from the list), after the write,
+ * so a token can't outlive the role it was minted under:
+ *
+ *   - every live `tokens` row of the user that names the vault at a verb the role no longer holds is revoked, with
+ *     its refresh family. The hub's key door refuses a revoked jti on the next request, and its refresh token
+ *     mints nothing (rotation only rotates a live row);
+ *   - those scopes leave the user's standing consent (`grants`), so neither skip-consent nor a later grant brings
+ *     an app back without the person approving it again; a consent left with nothing is deleted;
+ *   - unused auth codes that name it are deleted.
+ *
+ * A mint already signing when this runs inserts nothing: each refresh-row mint re-checks `scopesBeyondRole` in its
+ * insert transaction. A row that names the vault only at verbs the role still holds is left alone, as are the
+ * user's other vaults and other users. Hub admins are unrestricted, so nothing of theirs is touched. The revokes
+ * name no actor (like the vault-delete sweep); the caller's own log line says who.
+ */
+export function endVaultAuthorityBeyondRole(db: Database, userId: string, vaultName: string, stamp: string): void {
+  if (isHubAdmin(db, userId)) return;
+  const beyond = (scopes: string) => scopesBeyondRole(db, userId, scopes.split(" ").filter((x) => x.length > 0), vaultName);
+
+  const revokeRow = db.prepare("UPDATE tokens SET revoked_at = ? WHERE jti = ? AND revoked_at IS NULL");
+  const revokeFamily = db.prepare("UPDATE tokens SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL");
+  const rows = db
+    .query<{ jti: string; family_id: string | null; scopes: string }, [string]>(
+      "SELECT jti, family_id, scopes FROM tokens WHERE user_id = ? AND revoked_at IS NULL",
+    )
+    .all(userId);
+  for (const row of rows) {
+    if (beyond(row.scopes).length === 0) continue;
+    revokeRow.run(stamp, row.jti);
+    if (row.family_id) revokeFamily.run(stamp, row.family_id);
+  }
+
+  const dropGrant = db.prepare("DELETE FROM grants WHERE user_id = ? AND client_id = ?");
+  const narrowGrant = db.prepare("UPDATE grants SET scopes = ? WHERE user_id = ? AND client_id = ?");
+  const grants = db
+    .query<{ client_id: string; scopes: string }, [string]>("SELECT client_id, scopes FROM grants WHERE user_id = ?")
+    .all(userId);
+  for (const g of grants) {
+    const ended = new Set(beyond(g.scopes));
+    if (ended.size === 0) continue;
+    const kept = g.scopes.split(" ").filter((x) => x.length > 0 && !ended.has(x));
+    if (kept.length === 0) dropGrant.run(userId, g.client_id);
+    else narrowGrant.run(kept.join(" "), userId, g.client_id);
+  }
+
+  const dropCode = db.prepare("DELETE FROM auth_codes WHERE code = ?");
+  const codes = db
+    .query<{ code: string; scopes: string }, [string]>("SELECT code, scopes FROM auth_codes WHERE user_id = ? AND used_at IS NULL")
+    .all(userId);
+  for (const c of codes) if (beyond(c.scopes).length > 0) dropCode.run(c.code);
 }
 
 /** Rename the exact vault reference; called inside the rename transaction. */
