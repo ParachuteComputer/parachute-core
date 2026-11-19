@@ -95,7 +95,13 @@ operator consents at /oauth/authorize ──────────────
   when nothing is left; other scopes stay). So an app that gives back write
   by keeping a read token and revoking its read+write one gets the consent
   page the next time it asks for write
-  (`grants.ts:releaseGrantScopes`).
+  (`grants.ts:releaseGrantScopes`). Two paths still skip that page by
+  design: a same-hub client skips consent for low-risk scopes whatever the
+  grant holds, and trust by client name lets a *new* registration of the same
+  name and redirect home ride another registration's grant (one this revoke
+  didn't trim). Unredeemed codes don't count as holders (an extra page at
+  most), and revoking an already-rotated refresh token changes nothing (revoke
+  the newest one).
 
 ### Revocation, distinguished
 

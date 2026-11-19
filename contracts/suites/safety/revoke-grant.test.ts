@@ -93,6 +93,8 @@ interface Asked {
   /** "page": the consent page; "silent": a code straight back to the app; anything else is what stopped it. */
   saw: string;
   redeem: () => Promise<Token>;
+  /** Approve (a page) and give back the code, unredeemed. */
+  approve: () => Promise<string | null>;
 }
 interface Token {
   access: string;
@@ -131,8 +133,9 @@ async function ask(session: string, clientId: string, scope: string): Promise<As
     if (tok.status !== 200 || !body?.access_token || !body?.refresh_token) throw new Error(`setup: the token endpoint gave ${tok.status} ${body?.error ?? ""}`);
     return { access: body.access_token, refresh: body.refresh_token, scopes: String(body.scope ?? "").split(" ").filter(Boolean) };
   };
-  const redeem = async (): Promise<Token> => {
-    if (saw === "silent") return exchange(codeIn(location));
+  /** Approve on the consent page and return the code, without redeeming it. */
+  const approve = async (): Promise<string | null> => {
+    if (saw === "silent") return codeIn(location);
     if (saw !== "page") throw new Error(`setup: ${saw}`);
     const csrf = cookie(auth, "parachute_hub_csrf");
     const consent = await safeFetch(`${s.hub}/oauth/authorize`, {
@@ -143,9 +146,10 @@ async function ask(session: string, clientId: string, scope: string): Promise<As
     });
     await consent.arrayBuffer();
     if (consent.status !== 302) throw new Error(`setup: approving gave ${consent.status}`);
-    return exchange(codeIn(consent.headers.get("location")));
+    return codeIn(consent.headers.get("location"));
   };
-  return { saw, redeem };
+  const redeem = async (): Promise<Token> => exchange(await approve());
+  return { saw, redeem, approve };
 }
 
 /** POST /oauth/revoke (RFC 7009) as `clientId`; always 200 by the RFC. */
@@ -221,12 +225,16 @@ describe("revoking an app's only token for the vault", () => {
   });
 
   test("revoking that token again after the person approves anew takes nothing away", async () => {
-    const fresh = await (await ask(session, app, READ)).redeem();
+    // approved anew, and no token minted from it: only the consent on record holds read now, so a revoke of the dead
+    // token that wrongly trimmed would take it away
+    const anew = await ask(session, app, READ);
+    expect(anew.saw).toBe("page");
+    expect(await anew.approve()).toBeTruthy();
     expect(await revoke(app, only.refresh, "refresh_token")).toBe(200);
     expect(await revoke(app, only.access, "access_token")).toBe(200);
     const again = await ask(session, app, READ);
     expect({ step: "read after revoking a dead token again", saw: again.saw }).toEqual({ step: "read after revoking a dead token again", saw: "silent" });
-    expect(await reads(fresh.access)).toBe(200);
+    expect(await reads((await again.redeem()).access)).toBe(200);
   });
 });
 
