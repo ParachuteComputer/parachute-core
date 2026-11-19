@@ -59,6 +59,7 @@ import {
   isCoveredByGrant,
   isCoveredByGrantForClientName,
   recordGrant,
+  releaseGrantScopes,
 } from "./grants.ts";
 import {
   GrantChangedError,
@@ -3549,6 +3550,11 @@ async function rotateAndRespond(
  * intentionally don't surface "found vs not-found" so a caller probing
  * with random strings can't enumerate live tokens.
  *
+ * A revoke that ends a live row of the calling client also trims the
+ * (user, client) grant to the vault scopes its other live tokens still hold
+ * (RFC 7009 §2.1; `releaseGrantScopes`, T-476), so the consent page shows
+ * again for what the app gave back. Rotation's revokes don't trim.
+ *
  * Closes #73.
  */
 export async function handleRevoke(
@@ -3594,7 +3600,14 @@ export async function handleRevoke(
     return new Response(null, { status: 200 });
   }
   if (row && !row.revokedAt) {
-    db.prepare("UPDATE tokens SET revoked_at = ? WHERE jti = ?").run(now.toISOString(), row.jti);
+    // RFC 7009 §2.1: revoking a refresh token may also end the authorization grant behind it. The grant keeps only
+    // the vault scopes a live token of this (user, client) still holds, so a scope the app gave back is asked for
+    // again (T-476, `releaseGrantScopes`). Only a row this revoke ended: one already revoked changes nothing.
+    const live = row;
+    db.transaction(() => {
+      const ended = db.prepare("UPDATE tokens SET revoked_at = ? WHERE jti = ? AND revoked_at IS NULL").run(now.toISOString(), live.jti);
+      if (ended.changes === 1 && live.userId) releaseGrantScopes(db, live.userId, live.clientId, live.scopes, now);
+    })();
   }
   return new Response(null, { status: 200 });
 }

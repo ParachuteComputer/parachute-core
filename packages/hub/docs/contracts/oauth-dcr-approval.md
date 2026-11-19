@@ -88,6 +88,14 @@ operator consents at /oauth/authorize ──────────────
 - **Revoking a grant does not invalidate already-issued tokens.** Token
   revocation is a separate operation via `/oauth/revoke` (and any future
   CLI wrapper).
+- **Revoking a token trims the grant behind it** (T-476, RFC 7009 §2.1).
+  When a client revokes one of its live tokens at `/oauth/revoke`, each
+  `vault:<name>:<verb>` scope that token carried and no other live token of
+  the same (user, client) still holds leaves the grant row (the row goes
+  when nothing is left; other scopes stay). So an app that gives back write
+  by keeping a read token and revoking its read+write one gets the consent
+  page the next time it asks for write
+  (`grants.ts:releaseGrantScopes`).
 
 ### Revocation, distinguished
 
