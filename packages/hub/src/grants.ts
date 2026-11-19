@@ -9,10 +9,10 @@
  *
  * Storage: one row per (user_id, client_id) in the `grants` table (created
  * in hub-db migration v3). The `scopes` column is a space-separated set of
- * every scope the user has ever approved for this client — recording is
- * UNION semantics, not overwrite. That way, a user who approved [a, b, c]
- * once and later approves only [a, b] for an incremental flow doesn't lose
- * their c grant; the next flow asking [a, c] still skips consent.
+ * every scope the user has approved for this client (less what the app gave
+ * back by revoking, see below). Recording is UNION semantics, not
+ * overwrite. That way, a user who approved [a, b, c] once and later approves
+ * only [a, b] for an incremental flow doesn't lose their c grant; the next flow asking [a, c] still skips consent.
  *
  * One exception (T-446): the account door's per-vault levels
  * (`account:self:vaults:<vault>:<read|write>`) and the level-less
@@ -24,6 +24,11 @@
  * (grant-generation.ts), which ends every code and refresh family minted
  * under the wider one, including mints in flight. The generation lives in
  * its own table: `revokeGrant` deleting this row does not reset it.
+ *
+ * And one way out (T-476): when an app revokes one of its live tokens
+ * (`/oauth/revoke`), the per-vault scopes that token carried and no other
+ * live token of the same (user, client) holds leave the row
+ * (`releaseGrantScopes`), so what the app gave back is asked for again.
  *
  * Skip rule: a flow may skip consent iff every requested scope is already
  * in the grant's set. A strict superset (the client wants something new)
@@ -367,9 +372,10 @@ export function listGrantsForUser(db: Database, userId: string): Grant[] {
  * Delete a grant. Returns true when a row was removed; false when no grant
  * existed for (user, client). (Taking a member's vault away is different: it
  * ends their tokens and consent there at once, `endVaultAuthorityBeyondRole`
- * in users.ts.) Note this does not revoke existing tokens —
- * an operator who wants to revoke active sessions runs `/oauth/revoke` (or
- * its CLI wrapper) separately. Removing the grant only forces the next
+ * in users.ts. The other direction, an app revoking a token, trims the grant
+ * to what its live tokens hold: `releaseGrantScopes`.) Note this does not
+ * revoke existing tokens — an operator who wants to revoke active sessions
+ * runs `/oauth/revoke` (or its CLI wrapper) separately. Removing the grant only forces the next
  * /oauth/authorize flow to show consent again.
  */
 export function revokeGrant(db: Database, userId: string, clientId: string): boolean {
@@ -377,6 +383,55 @@ export function revokeGrant(db: Database, userId: string, clientId: string): boo
     .prepare("DELETE FROM grants WHERE user_id = ? AND client_id = ?")
     .run(userId, clientId);
   return res.changes > 0;
+}
+
+/**
+ * The consent a revoked token leaves behind (T-476). Called by `/oauth/revoke`
+ * inside its transaction, after it has revoked a live token row of `clientId`
+ * for `userId`: each per-vault scope (`vault:<name>:<read|write|admin|export>`)
+ * that row carried and that no other live refresh row of the same (user,
+ * client) still carries leaves the grant. Other scopes (account:*, scribe:*,
+ * unnamed `vault:<verb>`) stay. The row goes when nothing is left.
+ *
+ * RFC 7009 §2.1 lets revoking a refresh token end the authorization grant
+ * behind it. An app that gives back write asks for read alone (covered, so
+ * no page), keeps that token and revokes the read+write one; without this the
+ * grant kept write for good and the next ask for write skipped the consent
+ * page. Now the grant follows the app's live tokens, so a scope the app gave
+ * back is asked for again.
+ *
+ * Live is what `liveFamilyRefreshRows` means: not revoked, not expired, a
+ * refresh row. An auth code not yet redeemed doesn't count; at worst its scopes
+ * are asked for once more.
+ */
+export function releaseGrantScopes(
+  db: Database,
+  userId: string,
+  clientId: string,
+  revokedScopes: readonly string[],
+  now: Date,
+): void {
+  const released = new Set(revokedScopes.filter((s) => vaultScopeName(s) !== null));
+  if (released.size === 0) return;
+  const grant = findGrant(db, userId, clientId);
+  if (!grant) return;
+  const live = db
+    .query<{ scopes: string }, [string, string, string]>(
+      "SELECT scopes FROM tokens WHERE user_id = ? AND client_id = ? AND revoked_at IS NULL AND refresh_token_hash IS NOT NULL AND expires_at > ?",
+    )
+    .all(userId, clientId, now.toISOString());
+  for (const row of live) for (const s of row.scopes.split(" ")) released.delete(s);
+  const kept = grant.scopes.filter((s) => !released.has(s));
+  if (kept.length === grant.scopes.length) return;
+  if (kept.length === 0) {
+    revokeGrant(db, userId, clientId);
+  } else {
+    db.prepare("UPDATE grants SET scopes = ? WHERE user_id = ? AND client_id = ?").run(
+      kept.join(" "),
+      userId,
+      clientId,
+    );
+  }
 }
 
 /** Rename the exact vault reference; called inside the rename transaction. */

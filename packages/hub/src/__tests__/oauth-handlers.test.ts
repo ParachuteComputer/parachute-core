@@ -5149,6 +5149,50 @@ describe("refresh-token rotation + /oauth/revoke (#73)", () => {
     }
   });
 
+  // T-476. The black-box side (consent shows again; a live sibling keeps its scope; another client's revoke changes
+  // nothing) is contracts/suites/safety/revoke-grant.test.ts. Here: what the contract can't see in the grant row.
+  test("/oauth/revoke takes the token's vault scopes out of the grant; scopes it didn't carry and non-vault ones stay", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const clientId = reg.client.clientId;
+      // The token carries a vault scope and a non-vault one; the grant also holds scopes the token never carried.
+      const { code, verifier } = await consentAndGetCode(db, clientId, session.id, "vault:default:read scribe:transcribe");
+      const tokenRes = await handleToken(
+        db,
+        tokenRequest(
+          new URLSearchParams({
+            grant_type: "authorization_code",
+            code,
+            client_id: clientId,
+            redirect_uri: "https://app.example/cb",
+            code_verifier: verifier,
+          }),
+        ),
+        { issuer: ISSUER, loadServicesManifest: fixtureLoadServicesManifest },
+      );
+      expect(tokenRes.status).toBe(200);
+      const initial = (await tokenRes.json()) as { refresh_token: string; scope: string };
+      expect(initial.scope.split(" ").sort()).toEqual(["scribe:transcribe", "vault:default:read"]);
+      recordGrant(db, user.id, clientId, ["account:self:read", "vault:other:write"]);
+      expect(findGrant(db, user.id, clientId)?.scopes).toContain("vault:default:read");
+
+      const res = await handleRevoke(
+        db,
+        revokeRequest(new URLSearchParams({ token: initial.refresh_token, client_id: clientId })),
+        { issuer: ISSUER },
+      );
+      expect(res.status).toBe(200);
+      expect(findGrant(db, user.id, clientId)?.scopes.sort()).toEqual(
+        ["account:self:read", "scribe:transcribe", "vault:other:write"].sort(),
+      );
+    } finally {
+      cleanup();
+    }
+  });
+
   test("authorizationServerMetadata advertises revocation_endpoint", async () => {
     const res = authorizationServerMetadata({
       issuer: ISSUER,

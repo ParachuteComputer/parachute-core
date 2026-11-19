@@ -14,6 +14,7 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 
 ### Fixed
 - Taking a member's vault away stops their apps at once (core #129). `revoke-access`, the operator dropping a vault from a user (`PATCH /api/users/<id>/vaults`) and `grant-access` lowering a role now revoke the member's tokens that name that vault above what they still hold, with their refresh tokens, and take it out of their standing consent, so the next request is 401, the refresh is refused and a later grant asks again. Before, their tokens read on until they expired and refreshed indefinitely.
+- Revoking a token at `/oauth/revoke` ends the consent behind it (T-476, RFC 7009 §2.1). Each `vault:<name>:<verb>` scope the revoked token carried that no other live token of the same person and app still holds leaves that app's grant, so the next ask for it shows the consent page. An app that gives write back (keeps a read token, revokes its read+write one) is asked again before it gets write. Before, the grant kept every scope ever approved and the page was skipped. Other scopes, another app's revoke and a token already revoked change nothing.
 - The 401 for a revoked key on `/vault/<name>/*`, `/vault/admin*` and `/mcp` carries the vault's CORS headers, so a browser app reads "revoked" rather than a network error (core #129).
 
 ### Deprecated
