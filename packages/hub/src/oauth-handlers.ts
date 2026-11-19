@@ -83,6 +83,7 @@ import {
   liveFamilyRefreshRows,
   refreshRowGeneration,
   revokeFamily,
+  revokeTokenByJti,
   signAccessToken,
   signRefreshToken,
   KeyNameTakenError,
@@ -3603,10 +3604,10 @@ export async function handleRevoke(
     // RFC 7009 §2.1: revoking a refresh token may also end the authorization grant behind it. The grant keeps only
     // the vault scopes a live token of this (user, client) still holds, so a scope the app gave back is asked for
     // again (T-476, `releaseGrantScopes`). Only a row this revoke ended: one already revoked changes nothing.
-    const live = row;
+    const target = row;
     db.transaction(() => {
-      const ended = db.prepare("UPDATE tokens SET revoked_at = ? WHERE jti = ? AND revoked_at IS NULL").run(now.toISOString(), live.jti);
-      if (ended.changes === 1 && live.userId) releaseGrantScopes(db, live.userId, live.clientId, live.scopes, now);
+      const ended = revokeTokenByJti(db, target.jti, now);
+      if (ended && target.userId) releaseGrantScopes(db, target.userId, target.clientId, target.scopes, now);
     })();
   }
   return new Response(null, { status: 200 });

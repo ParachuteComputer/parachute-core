@@ -424,7 +424,7 @@ export function releaseGrantScopes(
   const kept = grant.scopes.filter((s) => !released.has(s));
   if (kept.length === grant.scopes.length) return;
   if (kept.length === 0) {
-    db.prepare("DELETE FROM grants WHERE user_id = ? AND client_id = ?").run(userId, clientId);
+    revokeGrant(db, userId, clientId);
   } else {
     db.prepare("UPDATE grants SET scopes = ? WHERE user_id = ? AND client_id = ?").run(
       kept.join(" "),
