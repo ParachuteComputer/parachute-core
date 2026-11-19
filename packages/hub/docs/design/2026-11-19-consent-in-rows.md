@@ -34,8 +34,8 @@ fold, and Approve / Deny stacked. Everything is shown at once, and the first thi
 1. **One screen, a few rows.** A row per vault (read, or read and write), one for the account list
    (`account:vaults`), one per module scope (Scribe, surfaces). Each row: an icon, a plain name ("Read your home",
    "Write in playground", "List your vaults", "Send audio to Scribe"), one line from `scope-explanations.ts`, and a
-   **(?)**.
-2. **Detail on demand, exact.** The (?) opens a sheet with the real scopes (`vault:home:read`) and, for a vault, a
+   **(?)**. The vault's name goes into the row's name, not only the generic sentence.
+2. **Detail on demand, exact.** The (?) opens (`<details>`/`<summary>`: the page stays script-free) with the real scopes (`vault:home:read`) and, for a vault, a
    table of what the token may do there: Read / Create / Update / Delete, ticked. Last line: **Towards:** the vault and
    this hub's address. The `client_id` and the return address move into a "This app" sheet behind the heading's (?).
 3. **Who made it, plainly, at the top.** Same-hub clients get no badge at all. An external one gets the tinted line
@@ -47,6 +47,11 @@ fold, and Approve / Deny stacked. Everything is shown at once, and the first thi
 
 The vault picker, the per-vault levels (`levelsSection`) and the extras fold stay; each becomes rows of the same shape
 (a level is a choice inside its vault's row: none / read / write).
+
+## Tests to change or add
+
+`src/__tests__/oauth-ui.test.ts`: a row per scope with the vault's name, the (?) detail holding the exact scope string,
+the tinted line only for an external client, three buttons. `account-scope-consent.test.ts` stays as it is.
 
 ## What doesn't change
 
@@ -61,4 +66,5 @@ the words; a test should check that every requested scope appears, exactly, in s
 - **Back** needs a redirect with `error=access_denied` and no state change, or a plain return to the referrer; the first
   is the RFC's way, and the app already reads it as "not now".
 
-Subtract: the EXTERNAL / First-party badges, the stacked buttons and the always-open scope list go when this lands.
+Subtract: this note replaces the app repo's copy (ParachuteComputer/parachute `docs/design/HUB-CONSENT.md`, now a
+pointer here). The EXTERNAL / First-party badges, the stacked buttons and the always-open scope list go when this lands.
