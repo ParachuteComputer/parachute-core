@@ -45,7 +45,8 @@ fold, and Approve / Deny stacked. Everything is shown at once, and the first thi
    way out is Deny).
 5. **The hub's own look**: warm off-white, serif heading, as `baseDocument` already sets. No new colours.
 
-The vault picker, the per-vault levels (`levelsSection`) and the extras fold stay; each becomes rows of the same shape
+The vault picker, the per-vault levels (`levelsSection`), the extras fold, the disabled Approve for an account with no
+vaults and the unknown-client page stay; each becomes rows of the same shape
 (a level is a choice inside its vault's row: none / read / write).
 
 ## Tests to change or add
@@ -66,5 +67,5 @@ the words; a test should check that every requested scope appears, exactly, in s
 - **Back** needs a redirect with `error=access_denied` and no state change, or a plain return to the referrer; the first
   is the RFC's way, and the app already reads it as "not now".
 
-Subtract: this note replaces the app repo's copy (ParachuteComputer/parachute `docs/design/HUB-CONSENT.md`, now a
-pointer here). The EXTERNAL / First-party badges, the stacked buttons and the always-open scope list go when this lands.
+Subtract: this note replaces the app repo's copy (ParachuteComputer/parachute `docs/design/HUB-CONSENT.md`, deleted in
+parachute#67). The EXTERNAL / First-party badges, the stacked buttons and the always-open scope list go when this lands.
