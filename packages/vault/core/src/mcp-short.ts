@@ -120,7 +120,7 @@ Rarer filters (has_links, order_by, expand_links, created_by, …) are accepted 
     inputSchema: obj({
       content: str(),
       path: str('e.g. "Projects/Alder"'),
-      extension: str('"md" (default); "tsx", "jsx" or "html" for an applet\'s code'),
+      extension: str(),
       tags: { type: "array", items: { type: "string" } },
       types: { type: "array", items: { type: "string" }, description: "Types; land with the tags" },
       metadata: { type: "object" },
@@ -448,7 +448,7 @@ export const TOOL_ALIASES: Record<string, string> = {
 
 /** An alias's description: the one deprecation line, then nothing else (the schema stays as it was). */
 export function aliasDescription(tool: string): string {
-  return `Deprecated (gone in 1.0): use ${TOOL_ALIASES[tool]}. Same parameters as before.`;
+  return `Deprecated (gone in 1.0): use ${TOOL_ALIASES[tool]}.`;
 }
 
 /** The order tools/list sends: the eleven (record tools first, T-407), then the aliases, note-named ones first. */

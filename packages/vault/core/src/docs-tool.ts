@@ -27,12 +27,12 @@ const TIMEOUT_MS = 8000;
 /** A page name: lower-case words joined by `-`, in at most three folders (`build/make-an-applet`). */
 const TOPIC_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*(?:\/[a-z0-9]+(?:-[a-z0-9]+)*){0,2}$/;
 
-export const DOCS_DESCRIPTION =
-  "How to do things in Parachute (types, records, applets, bundles, keys), as markdown from parachute.computer. No `topic`: the list of pages. `topic`: that page. Read the page before building something new.";
+// Short on purpose: every tool's description is read before the first call (the budget in contracts/suites/mcp/budget.test.ts).
+export const DOCS_DESCRIPTION = "Parachute's how-to pages, as markdown. No `topic`: the list; `topic`: one page.";
 
 export const DOCS_INPUT_SCHEMA = {
   type: "object",
-  properties: { topic: { type: "string", description: 'A page from the list, e.g. "build/make-an-applet"' } },
+  properties: { topic: { type: "string" } },
 } as const;
 
 export interface DocsToolOpts {

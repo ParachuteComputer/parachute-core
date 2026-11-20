@@ -296,7 +296,7 @@ Rarer filters (has_links, order_by, expand_links, created_by, …) are accepted 
 
 /** A deprecated note-named tool's description: one line, as #21's other aliases have. */
 export function noteAliasDescription(noteTool: string): string {
-  return `Deprecated (gone in 1.0): use ${RECORD_TOOL_NAMES[noteTool]}. Same parameters as before.`;
+  return `Deprecated (gone in 1.0): use ${RECORD_TOOL_NAMES[noteTool]}.`;
 }
 
 /**

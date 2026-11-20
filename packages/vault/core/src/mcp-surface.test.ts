@@ -47,7 +47,6 @@ describe("create-record lists what a code record needs", () => {
     const create = tools.find((t) => t.name === "create-record")!;
     const props = (create.inputSchema as { properties: Record<string, { description?: string }> }).properties;
     expect(Object.keys(props)).toContain("extension");
-    expect(props.extension.description).toContain("tsx");
     const made = (await create.execute({ path: "Applets/X", extension: "tsx", body: "export default () => null;" })) as { extension?: string };
     expect(made.extension).toBe("tsx");
   });
