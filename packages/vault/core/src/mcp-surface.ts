@@ -169,9 +169,12 @@ function applyElevenTools(tools: McpToolDef[], opts: RecordSurfaceOpts): McpTool
           // Write access may define a new type, and add fields to its own (docs/contracts/write-defines-types.md).
           const writeMay = typeName !== null && verb === "admin" && opts.hasVerb("write");
           const problem = writeMay ? writeTypeProblem(opts.db, typeName, rest, opts.writer ?? null, opts.tagVisible !== undefined) : null;
+          if (problem && !problem.needsAdmin) {
+            throw Object.assign(new Error(`${name}: ${problem.message}`), { error_type: "invalid_query", field: "tag" });
+          }
           if (!writeMay || problem) {
-            const why = problem ?? (name === "manage-types" && opts.hasVerb("write") ? " With write access you can make a new type, and add fields to a type you made (action update)." : "");
-            throw new Error(`Forbidden: ${name} {action: "${action}"} needs the 'vault:${opts.vaultName}:${verb}' scope.${problem ? ` ${problem}` : why}`);
+            const why = problem ? ` ${problem.message}` : name === "manage-types" && opts.hasVerb("write") ? " With write access you can make a new type, and add fields to a type you made (action update)." : "";
+            throw new Error(`Forbidden: ${name} {action: "${action}"} needs the 'vault:${opts.vaultName}:${verb}' scope.${why}`);
           }
         }
         if (typeName !== null) {

@@ -82,6 +82,9 @@ describe("mcp/write-types: write access may add a new type", () => {
     await c.call("create-record", { path: runId("n"), tags: [label] });
     await expect(c.call("manage-types", { tag: label, kind: "type", fields: [] })).rejects.toThrow(/fields is an object/);
     expect((await operator().get(`/tags/${enc(theirs)}`)).body.description).toBe("theirs");
+    // a malformed call says what's wrong with it, not that admin could make it; a name that strips to nothing is none
+    await expect(c.call("manage-types", { tag: runId("x"), fields: [] })).rejects.toThrow(/^(?!.*admin).*fields is an object/s);
+    await expect(c.call("manage-types", { tag: "#", fields: { [field()]: { type: "string" } } })).rejects.toThrow(/needs a name/);
     await c.close();
   });
 

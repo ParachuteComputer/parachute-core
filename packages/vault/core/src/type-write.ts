@@ -27,6 +27,9 @@ export interface TypeChange {
   replace_fields?: unknown;
 }
 
+/** A refusal: its words, and whether admin could make the change (false: the call itself is malformed). */
+export type TypeRefusal = { message: string; needsAdmin: boolean };
+
 /** What write access may do with types, for the refusal's words. */
 export const WRITE_MAY = "With write access you can make a new type, and add fields to a type you made.";
 
@@ -75,8 +78,10 @@ export function typeIsUndefined(db: Database, name: string): boolean {
  * Why a write-only caller may not make this change to type `name`, or null when it may. `scoped`: the caller is
  * tag-scoped (it may not). Read-only: changes nothing.
  */
-export function writeTypeProblem(db: Database, name: string, change: TypeChange, writer: TypeWriter | null, scoped: boolean): string | null {
-  const needs = (what: string) => `${what} needs admin. ${WRITE_MAY}`;
+export function writeTypeProblem(db: Database, name: string, change: TypeChange, writer: TypeWriter | null, scoped: boolean): TypeRefusal | null {
+  const needs = (what: string): TypeRefusal => ({ message: `${what} needs admin. ${WRITE_MAY}`, needsAdmin: true });
+  const malformed = (message: string): TypeRefusal => ({ message, needsAdmin: false });
+  if (!name) return malformed("A type needs a name: `tag`.");
   if (scoped) return needs("Defining a type with a tag-scoped key");
   if (change.parent_names !== undefined) return needs("Setting parent_names");
   if (change.relationships !== undefined) return needs("Setting relationships");
@@ -84,7 +89,7 @@ export function writeTypeProblem(db: Database, name: string, change: TypeChange,
   if (change.kind !== undefined && change.kind !== "type") return needs(`Making "${name}" a plain tag`);
   if (change.fields === null) return needs("Removing a type's fields");
   if (change.fields !== undefined && (typeof change.fields !== "object" || Array.isArray(change.fields))) {
-    return "fields is an object: {field_name: {type, enum?, indexed?, default?}}.";
+    return malformed("fields is an object: {field_name: {type, enum?, indexed?, default?}}.");
   }
   // Names whose fields reach other types' records: `_default` (every record's implicit parent), any `_` name the
   // vault keeps, and a name some type lists as its parent (its fields flow to that type's records).
