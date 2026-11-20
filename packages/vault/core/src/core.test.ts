@@ -9320,7 +9320,7 @@ describe("vault projection (vault#271)", async () => {
     // the copy-paste mint command.
     expect(md).toContain("## Scripting & automation (beyond this session)");
     expect(md).toContain("https://parachute.computer/docs/build/scripts/");
-    expect(md).toContain("parachute auth mint-token --scope vault:test:read --ephemeral");
+    expect(md).toContain("parachute keys new <name> --vault test --can read --ephemeral");
     expect(md).toContain("vault/test/api");
   });
 

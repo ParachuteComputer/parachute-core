@@ -366,7 +366,7 @@ export function projectionToMarkdown(args: {
   reach?: string;
   /**
    * How this door's owner makes a key for a script, the line under "Scripting & automation". Omitted: a box's
-   * (`parachute auth mint-token`). A door without that command (cloud: keys are made in the account) says its own.
+   * (`parachute keys new`). A door without that command (cloud: keys are made in the account) says its own.
    */
   scripting?: string;
   /** The docs origin the "How to do things" section names (T-476, docs-tool.ts). Omitted: parachute.computer. `null`:
@@ -528,7 +528,7 @@ export function projectionToMarkdown(args: {
   lines.push("");
   lines.push(
     args.scripting ??
-      `For a script or cron job, mint a key (\`parachute auth mint-token --scope vault:${vaultName}:read --ephemeral\`) and call the REST API at \`<hub-origin>/vault/${vaultName}/api/...\`; guide: https://parachute.computer/docs/build/scripts/`,
+      `For a script or cron job, make a key (\`parachute keys new <name> --vault ${vaultName} --can read --ephemeral\`) and call the REST API at \`<hub-origin>/vault/${vaultName}/api/...\`; guide: https://parachute.computer/docs/build/scripts/`,
   );
 
   return lines.join("\n");
