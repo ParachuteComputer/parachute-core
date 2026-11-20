@@ -110,7 +110,10 @@ export function buildDocsTool(opts: DocsToolOpts = {}): McpToolDef {
       const res = await get(url, { redirect: "manual", signal: AbortSignal.timeout(TIMEOUT_MS), headers: { accept: "text/markdown, text/plain" } });
       if (!res.ok) {
         res.body?.cancel().catch(() => {}); // a 404 or an error page: nothing of it is read
-        if (res.status === 404) return null;
+        if (res.status === 404) {
+          cache.delete(key); // gone from the site: gone from here
+          return null;
+        }
         unreachable(`it answered ${res.status}`);
       }
       const { bytes, more } = await readCapped(res, MAX_BYTES);
@@ -118,7 +121,10 @@ export function buildDocsTool(opts: DocsToolOpts = {}): McpToolDef {
       text = new TextDecoder().decode(bytes, { stream: more });
       if (more) text += `\n\n[Cut at ${MAX_BYTES / 1024} KB: the whole page is at ${url}]`;
     } catch (e) {
+      // the site can't be read: the last copy, however old, beats none
+      if (hit && (e as { error_type?: string }).error_type === "docs_unreachable") return hit.text;
       if ((e as { error_type?: string }).error_type) throw e;
+      if (hit) return hit.text;
       unreachable((e as Error).message);
     }
     if (!cache.has(key) && cache.size >= MAX_PAGES) cache.delete(cache.keys().next().value!);

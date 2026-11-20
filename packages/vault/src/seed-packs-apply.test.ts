@@ -14,17 +14,12 @@ import {
   applySeedPack,
   GETTING_STARTED_PACK,
   ARCHIVED_TAG,
-  CAPTURE_ANYTHING_PATH,
-  CONNECT_AI_PATH,
   GETTING_STARTED_PATH,
   NOTES_REQUIRED_TAGS,
   STARTER_ONTOLOGY_PACK,
   SURFACE_STARTER_PACK,
   SURFACE_STARTER_PATH,
-  TAGS_GRAPH_PATH,
-  WELCOME_PATH,
   welcomePack,
-  YOURS_TO_KEEP_PATH,
 } from "../core/src/seed-packs.ts";
 import { PathConflictError } from "../core/src/notes.ts";
 import {
@@ -169,7 +164,7 @@ describe("applySeedPack — concurrent-apply skip grace (vault#527)", () => {
       },
     }) as BunStore;
 
-    expect(applySeedPack(boom, SURFACE_STARTER_PACK)).rejects.toThrow(/disk on fire/);
+    await expect(applySeedPack(boom, SURFACE_STARTER_PACK)).rejects.toThrow(/disk on fire/);
   });
 });
 

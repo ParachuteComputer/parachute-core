@@ -131,3 +131,17 @@ describe("the server instructions point at the docs, not at notes in the vault",
     expect(projectionToMarkdown({ vaultName: "home", description: null, projection, docs: null })).not.toContain("How to do things");
   });
 });
+
+describe("when the site is down", () => {
+  test("a page read before is served from its last copy, however old", async () => {
+    let up = true;
+    let t = 0;
+    const f = (async () => { if (!up) throw new Error("offline"); return new Response("# Page"); }) as unknown as typeof fetch;
+    const tool = buildDocsTool({ origin: "https://docs.example", fetch: f, now: () => t, cache: new Map() });
+    await tool.execute({ topic: "x" });
+    up = false;
+    t = 5 * 60 * 60 * 1000;
+    expect(((await tool.execute({ topic: "x" })) as { markdown: string }).markdown).toBe("# Page");
+    await expect(tool.execute({ topic: "never-read" })).rejects.toMatchObject({ error_type: "docs_unreachable" });
+  });
+});

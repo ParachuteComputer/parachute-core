@@ -241,25 +241,21 @@ function injectVaultSelector(tool: {
   inputSchema?: unknown;
   annotations?: unknown;
 }): ListedMcpTool {
-  if (VAULT_AGNOSTIC_TOOLS.has(tool.name)) {
-    const annotations = tool.annotations && typeof tool.annotations === "object" && !Array.isArray(tool.annotations) ? { annotations: tool.annotations as Record<string, unknown> } : {};
-    return { name: tool.name, description: typeof tool.description === "string" ? tool.description : tool.name, inputSchema: (tool.inputSchema && typeof tool.inputSchema === "object" ? tool.inputSchema : { type: "object" }) as Record<string, unknown>, ...annotations };
-  }
   const rawSchema =
     tool.inputSchema && typeof tool.inputSchema === "object"
       ? (tool.inputSchema as Record<string, unknown>)
       : { type: "object" };
+  const agnostic = VAULT_AGNOSTIC_TOOLS.has(tool.name);
   const properties = {
     ...((rawSchema.properties && typeof rawSchema.properties === "object"
       ? rawSchema.properties
       : {}) as Record<string, unknown>),
-    vault: {
-      type: "string",
-      description: FAN_OUT_TOOLS.has(tool.name) ? VAULT_FIELD_FAN_OUT : VAULT_FIELD_REQUIRED,
-    },
+    ...(agnostic
+      ? {}
+      : { vault: { type: "string", description: FAN_OUT_TOOLS.has(tool.name) ? VAULT_FIELD_FAN_OUT : VAULT_FIELD_REQUIRED } }),
   };
   const schema: Record<string, unknown> = { ...rawSchema, properties };
-  if (!FAN_OUT_TOOLS.has(tool.name)) {
+  if (!FAN_OUT_TOOLS.has(tool.name) && !agnostic) {
     const req = Array.isArray(schema.required)
       ? schema.required.filter((x): x is string => typeof x === "string")
       : [];
@@ -438,11 +434,18 @@ export async function callVaultModuleTool(
 ): Promise<unknown> {
   if (FAN_OUT_TOOLS.has(name)) return queryNotesOverlay(args, ctx, name);
   if (VAULT_AGNOSTIC_TOOLS.has(name)) {
-    // Any covered vault answers: the same one tools/list asks first. A `vault` given is ignored.
+    // Any covered vault answers, tried in the order tools/list tries them, so the vault that listed it can answer it.
+    // A `vault` given is ignored. A refusal from the tool itself (a page that isn't there) is the answer.
     const coverage = resolveCoverage(ctx.db, ctx.principal, installedVaults(ctx));
-    const first = schemaSourceCandidates(ctx, coverage.vaults)[0];
-    if (!first) throw Object.assign(new Error("This key covers no vault."), { error_type: "no_vault" });
-    return postVaultMcp(ctx, first, verbForVault(ctx, first.name), "tools/call", { name, arguments: stripVaultArg(args) });
+    let last: unknown = Object.assign(new Error("This key covers no vault."), { error_type: "no_vault" });
+    for (const v of schemaSourceCandidates(ctx, coverage.vaults)) {
+      try {
+        return await postVaultMcp(ctx, v, verbForVault(ctx, v.name), "tools/call", { name, arguments: stripVaultArg(args) });
+      } catch (e) {
+        last = e;
+      }
+    }
+    throw last;
   }
 
   const hit = coveredVault(ctx, args.vault);
