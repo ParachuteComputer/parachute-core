@@ -85,7 +85,7 @@
  *                                                at read|write, never admin (host:admin bearer, T-414)
  *   /account/keys/<name>          (DELETE)     → revoke an app key (refused at the hub's vault doors at once)
  *   /account/vaults               (GET/POST)   → list / create vault (create returns vault_token;
- *                                                {bare: true} → no welcome notes, T-414)
+ *                                                {bare: true} → no welcome notes, T-414; every new vault since T-476)
  *   /account/vaults/<name>/rename (POST)       → rename (host-admin)
  *   /account/vaults/<name>        (DELETE)     → teardown (wraps /vaults/<name> cascade)
  *   /account/vaults/<name>/token  (POST)       → per-vault scoped token mint

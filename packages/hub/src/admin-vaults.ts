@@ -343,8 +343,9 @@ async function orchestrate(
   // (§3 default_mirror knob). Only meaningful on the `create` branch — the
   // bootstrap `install` path provisions the default vault and follows the
   // server-wide knob.
-  // `--bare` (0.9.1, T-414): no welcome or guide notes. Only the `create` branch can honour it, so a bare request
-  // with no vault module installed yet is refused below rather than seeded silently.
+  // `--bare` (0.9.1, T-414): no welcome or guide notes. Since T-476 every new vault starts that way (the guides are
+  // the docs site and the MCP `docs` tool); the flag is still passed and reported, and an old vault module that
+  // ignores it is still refused below.
   const cmd = vaultRegistered
     ? [
         "parachute-vault",
@@ -452,7 +453,7 @@ export async function provisionVault(
     runCommand?: CreateVaultDeps["runCommand"];
     /** `'off'` appends `--no-mirror`; anything else follows the server knob. */
     defaultMirror?: string;
-    /** No welcome or guide notes (`parachute-vault create --bare`; 0.9.1, T-414). */
+    /** No welcome or guide notes (`parachute-vault create --bare`; 0.9.1, T-414). Every new vault since T-476. */
     bare?: boolean;
   },
 ): Promise<ProvisionVaultResult> {

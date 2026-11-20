@@ -231,6 +231,9 @@ export async function postVaultMcp(
 
 /** The query tools the account door fans out across vaults: 0.9's record name and its note-named alias (T-407). */
 export const FAN_OUT_TOOLS: ReadonlySet<string> = new Set(["query-records", "query-notes"]);
+/** Tools that touch no vault (T-476: `docs` reads the docs site): listed as each vault lists them, with no `vault` to
+ *  name, and answered by any vault the key covers. */
+export const VAULT_AGNOSTIC_TOOLS: ReadonlySet<string> = new Set(["docs"]);
 
 function injectVaultSelector(tool: {
   name: string;
@@ -238,6 +241,10 @@ function injectVaultSelector(tool: {
   inputSchema?: unknown;
   annotations?: unknown;
 }): ListedMcpTool {
+  if (VAULT_AGNOSTIC_TOOLS.has(tool.name)) {
+    const annotations = tool.annotations && typeof tool.annotations === "object" && !Array.isArray(tool.annotations) ? { annotations: tool.annotations as Record<string, unknown> } : {};
+    return { name: tool.name, description: typeof tool.description === "string" ? tool.description : tool.name, inputSchema: (tool.inputSchema && typeof tool.inputSchema === "object" ? tool.inputSchema : { type: "object" }) as Record<string, unknown>, ...annotations };
+  }
   const rawSchema =
     tool.inputSchema && typeof tool.inputSchema === "object"
       ? (tool.inputSchema as Record<string, unknown>)
@@ -430,6 +437,13 @@ export async function callVaultModuleTool(
   ctx: AccountToolContext,
 ): Promise<unknown> {
   if (FAN_OUT_TOOLS.has(name)) return queryNotesOverlay(args, ctx, name);
+  if (VAULT_AGNOSTIC_TOOLS.has(name)) {
+    // Any covered vault answers: the same one tools/list asks first. A `vault` given is ignored.
+    const coverage = resolveCoverage(ctx.db, ctx.principal, installedVaults(ctx));
+    const first = schemaSourceCandidates(ctx, coverage.vaults)[0];
+    if (!first) throw Object.assign(new Error("This key covers no vault."), { error_type: "no_vault" });
+    return postVaultMcp(ctx, first, verbForVault(ctx, first.name), "tools/call", { name, arguments: stripVaultArg(args) });
+  }
 
   const hit = coveredVault(ctx, args.vault);
   const verb = verbForVault(ctx, hit.name);

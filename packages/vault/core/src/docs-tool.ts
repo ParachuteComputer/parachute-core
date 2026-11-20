@@ -98,22 +98,31 @@ export function buildDocsTool(opts: DocsToolOpts = {}): McpToolDef {
   async function read(path: string): Promise<string | null> {
     const key = `${origin}${path}`;
     const hit = cache.get(key);
-    if (hit && now() - hit.at < TTL_MS) return hit.text;
+    if (hit && now() - hit.at < TTL_MS) {
+      cache.delete(key);
+      cache.set(key, hit);
+      return hit.text;
+    }
     const url = key;
     const unreachable = (why: string): never => refuse(`The docs at ${url} couldn't be read (${why}).`, "docs_unreachable", `open ${url} yourself, or try again`);
     let text: string;
     try {
       const res = await get(url, { redirect: "manual", signal: AbortSignal.timeout(TIMEOUT_MS), headers: { accept: "text/markdown, text/plain" } });
-      if (res.status === 404) return null;
-      if (!res.ok) unreachable(`it answered ${res.status}`);
+      if (!res.ok) {
+        res.body?.cancel().catch(() => {}); // a 404 or an error page: nothing of it is read
+        if (res.status === 404) return null;
+        unreachable(`it answered ${res.status}`);
+      }
       const { bytes, more } = await readCapped(res, MAX_BYTES);
-      text = new TextDecoder().decode(bytes);
+      // cut on a whole character: a cut through one would end the page in a replacement mark
+      text = new TextDecoder().decode(bytes, { stream: more });
       if (more) text += `\n\n[Cut at ${MAX_BYTES / 1024} KB: the whole page is at ${url}]`;
     } catch (e) {
       if ((e as { error_type?: string }).error_type) throw e;
       unreachable((e as Error).message);
     }
-    if (cache.size >= MAX_PAGES) cache.delete(cache.keys().next().value!);
+    if (!cache.has(key) && cache.size >= MAX_PAGES) cache.delete(cache.keys().next().value!);
+    cache.delete(key); // re-inserted last, so the pages read most recently are kept longest
     cache.set(key, { at: now(), text: text! });
     return text!;
   }

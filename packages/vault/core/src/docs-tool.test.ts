@@ -100,6 +100,12 @@ describe("docs between sessions and from the environment", () => {
     const broken = (async () => new Response(new ReadableStream({ pull(c) { c.error(new Error("reset")); } }))) as unknown as typeof fetch;
     await expect(buildDocsTool({ origin: "https://docs.example", fetch: broken, cache: new Map() }).execute({ topic: "x" })).rejects.toMatchObject({ error_type: "docs_unreachable" });
   });
+  test("a cut never ends in half a character", async () => {
+    const page = "é".repeat(150 * 1024); // two bytes each: the 200 KB cut falls inside one, at an odd byte
+    const f = (async () => new Response("a" + page.slice(0, 102401))) as unknown as typeof fetch;
+    const r = (await buildDocsTool({ origin: "https://docs.example", fetch: f, cache: new Map() }).execute({ topic: "x" })) as { markdown: string };
+    expect(r.markdown).not.toContain("\uFFFD");
+  });
   test("PARACHUTE_DOCS_URL: an origin, off in any of its spellings, or the default", () => {
     expect(docsOriginFromEnv(undefined)).toBe("https://parachute.computer");
     expect(docsOriginFromEnv("http://127.0.0.1:8080/")).toBe("http://127.0.0.1:8080");

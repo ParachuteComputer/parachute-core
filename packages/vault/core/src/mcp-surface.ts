@@ -120,7 +120,7 @@ export function toolHelp(name: string, toolNames: readonly string[], doorTool?: 
       ),
     };
   }
-  if (name === "docs") return { tool: name, description: DOCS_DESCRIPTION, parameters: DOCS_INPUT_SCHEMA };
+  if (name === "docs" && toolNames.includes("docs")) return { tool: name, description: DOCS_DESCRIPTION, parameters: DOCS_INPUT_SCHEMA };
   const ref = doorTool?.(name) ?? MCP_TOOL_REFERENCE.find((e) => e.name === name);
   if (!ref) {
     throw Object.assign(new Error(`No tool named "${name}". Tools: ${toolNames.join(", ")}.`), {

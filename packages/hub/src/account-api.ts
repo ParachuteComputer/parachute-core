@@ -424,7 +424,7 @@ export async function handleAccountListVaults(
 interface NameBody {
   ok: true;
   name: string;
-  /** `bare: true` — no welcome or guide notes (0.9.1, T-414). */
+  /** `bare: true` — no welcome or guide notes (0.9.1, T-414); since T-476 every new vault starts empty anyway. */
   bare: boolean;
 }
 interface BodyErr {
