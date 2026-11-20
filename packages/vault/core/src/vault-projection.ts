@@ -419,8 +419,9 @@ export function projectionToMarkdown(args: {
     const origin = (args.docs ?? "https://parachute.computer").replace(/\/+$/, "");
     lines.push("");
     lines.push(
-      `## How to do things in Parachute\n\nMaking a type, writing records, an applet or a bundle (the home, pins and applets the Parachute app shows): ` +
-        `read the page first. \`docs\` lists the pages; \`docs { topic }\` returns one as markdown (${origin}/llms.txt).`,
+      `## How to do things in Parachute\n\nThe Parachute app shows **applets**: small screens, each one record you can write ` +
+        `(\`docs { topic: "build/make-an-applet" }\`). For a type, records, an applet or the person's home and pins (a bundle), ` +
+        `read the page first: \`docs\` lists them, \`docs { topic }\` returns one as markdown (${origin}/llms.txt).`,
     );
   }
 

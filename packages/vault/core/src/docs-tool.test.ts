@@ -88,6 +88,9 @@ describe("the server instructions point at the docs, not at notes in the vault",
     const md = projectionToMarkdown({ vaultName: "home", description: null, projection });
     expect(md).toContain("## How to do things in Parachute");
     expect(md).toContain("`docs { topic }`");
+    // an AI learns applets exist, and where to read how (T-476 audit: 0 mentions of "applet" before)
+    expect(md).toContain("**applets**");
+    expect(md).toContain('docs { topic: "build/make-an-applet" }');
     expect(md).toContain("https://parachute.computer/llms.txt");
     expect(md).not.toContain("Getting Started");
   });
