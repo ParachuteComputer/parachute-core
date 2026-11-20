@@ -127,14 +127,16 @@ describe("add-pack surface-starter", () => {
     expect(paths.filter((p) => p === "Surface Starter")).toHaveLength(1);
   });
 
-  test("re-applying a default pack is a clean no-op-style run (welcome on a fresh vault)", () => {
+  test("re-applying a pack is a clean no-op-style run (welcome, added twice)", () => {
     runCli(["create", "packed", "--json"], { PARACHUTE_HOME: home });
+    // A new vault starts empty (T-476): the pack is added on purpose first.
+    expect(runCli(["add-pack", "welcome", "--vault", "packed"], { PARACHUTE_HOME: home }).stdout).toContain("+ note");
     const { exitCode, stdout } = runCli(
       ["add-pack", "welcome", "--vault", "packed"],
       { PARACHUTE_HOME: home },
     );
     expect(exitCode).toBe(0);
-    // Notes were already default-seeded → all skipped; tags re-upsert.
+    // Notes were already added → all skipped; tags re-upsert.
     expect(stdout).not.toContain("+ note");
     expect(stdout).toContain("= note  Welcome to your vault 🪂 (already exists — left untouched)");
     expect(stdout).toContain("~ tag   capture (upserted)");
@@ -144,6 +146,7 @@ describe("add-pack surface-starter", () => {
 describe("add-pack — tag description preservation on re-apply (Aaron-ratified 2026-07-17)", () => {
   test("a hand-edited description survives a re-apply and is reported 'kept', not 'upserted'", () => {
     expect(runCli(["create", "packed", "--json"], { PARACHUTE_HOME: home }).exitCode).toBe(0);
+    expect(runCli(["add-pack", "welcome", "--vault", "packed"], { PARACHUTE_HOME: home }).exitCode).toBe(0);
 
     // Simulate an operator/AI hand-editing the capture tag's constitution.
     const dbPath = join(home, "vault", "data", "packed", "vault.db");

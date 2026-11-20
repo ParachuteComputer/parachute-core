@@ -6,6 +6,7 @@
  */
 
 import { generateMcpTools, resolveNote } from "../core/src/mcp.ts";
+import { docsOriginFromEnv } from "../core/src/docs-tool.ts";
 import { projectHistoryProvenance } from "../core/src/history-visibility.js";
 import type { McpToolDef, GenerateMcpToolsOpts } from "../core/src/mcp.ts";
 import { mergeTypesIntoTags } from "../core/src/tag-kind.ts";
@@ -150,6 +151,7 @@ export async function getServerInstruction(
     attachments: { ticketsEnabled: true, readEnabled: true, ticketTool: "attachment-url" },
     // T-407: this door lists the record tools first, so its brief speaks their words.
     words: recordWords,
+    docs: docsOriginFromEnv(),
     // 0.9.1 (SPEC §3.4): say what this key can read. No auth (local stdio) is the owner's own process: no line.
     ...(auth
       ? {
@@ -384,6 +386,7 @@ export function generateScopedMcpTools(
         }
       : {}),
     doorTool: (name) => (name === "manage-token" || name === "manage-keys" ? { ...manageTokenReference(vaultName), name } : undefined),
+    docs: (() => { const origin = docsOriginFromEnv(); return origin === null ? null : { origin }; })(),
   });
   applyOnBehalf(shaped, auth, (by) => generateScopedMcpTools(vaultName, { ...auth!, actor: by, acts_for: null }, callerBearer, req));
 
@@ -1295,14 +1298,6 @@ function overrideVaultInfo(
       query_hints: projection.query_hints,
       map: projection.map,
     };
-
-    // A2: surface a pointer (path, not body) to the seeded onboarding guide so
-    // any connected AI is steered to read it first. Present only when the note
-    // exists (buildVaultProjection gates on it). Older vaults without one omit
-    // the field entirely.
-    if (projection.getting_started) {
-      result.getting_started = projection.getting_started;
-    }
 
     if (projection.stats) {
       result.stats = projection.stats;

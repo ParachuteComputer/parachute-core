@@ -58,7 +58,7 @@ export const SHORT_TOOLS: Record<string, ShortTool> = {
   "query-notes": {
     description: `Read notes: one note, a filtered list, a search, a link neighbourhood or path, counts, or a note's history.
 - One note: \`id\` (id, path or title). Lists leave content out unless \`include_content: true\`.
-- Filters combine (AND). \`tag\` also matches subtypes (\`event\` finds \`event/meeting\`). \`metadata\` operators work on any field: an indexed one (vault-info lists them) is fastest, any other is read in full and the reply warns \`scan\`.
+- Filters combine (AND). \`tag\` also matches subtypes (by \`parent_names\`; a \`/\` in a name only files it). \`metadata\` operators work on any field: an indexed one (vault-info lists them) is fastest, any other is read in full and the reply warns \`scan\`.
 - Returns an array of notes, or \`{notes, next_cursor?, warnings?}\` with \`cursor\` or warnings, or \`[{group, value}]\` with \`aggregate\`.
 - ${HYBRID_TEXT.line}
 Rarer filters (has_links, order_by, expand_links, created_by, …) are accepted too. ${HELP("query-notes")}`,
@@ -120,6 +120,7 @@ Rarer filters (has_links, order_by, expand_links, created_by, …) are accepted 
     inputSchema: obj({
       content: str(),
       path: str('e.g. "Projects/Alder"'),
+      extension: str(),
       tags: { type: "array", items: { type: "string" } },
       types: { type: "array", items: { type: "string" }, description: "Types; land with the tags" },
       metadata: { type: "object" },
@@ -447,12 +448,12 @@ export const TOOL_ALIASES: Record<string, string> = {
 
 /** An alias's description: the one deprecation line, then nothing else (the schema stays as it was). */
 export function aliasDescription(tool: string): string {
-  return `Deprecated (gone in 1.0): use ${TOOL_ALIASES[tool]}. Same parameters as before.`;
+  return `Deprecated (gone in 1.0): use ${TOOL_ALIASES[tool]}.`;
 }
 
 /** The order tools/list sends: the eleven (record tools first, T-407), then the aliases, note-named ones first. */
 export const TOOL_ORDER = [
-  "query-records", "create-record", "update-record", "delete-record", "list-types", "vault-info", "doctor",
+  "query-records", "create-record", "update-record", "delete-record", "list-types", "vault-info", "docs", "doctor",
   "read-attachment", "attachment-url", "manage-types", "manage-keys",
   "query-notes", "create-note", "update-note", "delete-note", "list-tags",
   ...Object.keys(TOOL_ALIASES),
