@@ -1,5 +1,9 @@
 # parachute-core
 
+Parachute is your own vault that any AI can read and write, and an app that shows you what is in it. **This repo is
+the server**: the one program, `parachute`, that holds the vaults and answers the AI (over MCP), the Parachute app and
+scripts. How to use it and build on it: [parachute.computer/docs](https://parachute.computer/docs/).
+
 **Steady core, living surface.** Parachute's core is a plain vault: notes (markdown plus typed fields), tags with
 schemas, links, files, history, identity and access, and a change feed. It has no opinion about how a life or a team
 is organised. Apps such as Uni and Prism bring their own shape and declare what they need from the vault; the core
@@ -34,8 +38,8 @@ say what that program must do, written so they ran against **today's** code firs
 
 ## Install
 
-v0.8 is in prerelease. **npm** (needs Bun 1.4+): `npm i -g @openparachute/core@next` or
-`bun add -g @openparachute/core@next`. 0.9's prereleases go to `@beta` until 0.9 has been tried (RELEASING.md). **The bundle** (its own Bun, nothing else needed): download
+0.8 is the current release (npm `latest`); 0.9's prereleases go to `@beta` until 0.9 has been tried (RELEASING.md).
+**npm** (needs Bun 1.4+): `npm i -g @openparachute/core` or `bun add -g @openparachute/core`. **The bundle** (its own Bun, nothing else needed): download
 `parachute-core-<version>-<platform>.tar.gz` and `SHA256SUMS` from a
 [release](https://github.com/ParachuteComputer/parachute-core/releases), check, unpack, and run
 `bin/parachute install` (it links `parachute` and `parachute-core` into `~/.local/share/parachute-core/bin`).
