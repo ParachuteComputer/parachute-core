@@ -12,7 +12,8 @@
  *
  * Only the topic leaves the server, to the docs origin; nothing of the vault does. The origin is
  * https://parachute.computer unless the door says otherwise (a box: PARACHUTE_DOCS_URL; `off` lists no tool).
- * Pages are kept for an hour in memory, at most 64 of them, each cut at 200 KB.
+ * Pages are kept for an hour in memory, at most 64 of them, each cut at 200 KB. A page comes back as its own markdown,
+ * one text block; the site keeps pages short enough for one tool result (CLAUDE.md there).
  *
  * Pure apart from `fetch` (injected for tests), so the cloud door can build the same tool.
  */
@@ -79,6 +80,12 @@ export function buildDocsTool(opts: DocsToolOpts = {}): McpToolDef {
     description: DOCS_DESCRIPTION,
     inputSchema: DOCS_INPUT_SCHEMA as unknown as Record<string, unknown>,
     requiredVerb: "read",
+    // The page as it is, one text block (not JSON-escaped, which grows a page with quotes and code by a third and can
+    // push it past a client's limit for one tool result), with the address a person opens under it.
+    resultContent: (r) => {
+      const o = r as { markdown: string; page?: string; pages?: string };
+      return [{ type: "text", text: `${o.markdown.trimEnd()}\n\n(For a person: ${o.page ?? o.pages})` }];
+    },
     execute: async (params) => {
       const raw = params?.topic;
       if (raw === undefined || raw === null || raw === "") {

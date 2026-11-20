@@ -32,6 +32,9 @@ describe("docs tool", () => {
     const page = (await tool.execute({ topic: "build/make-an-applet" })) as { markdown: string; page: string };
     expect(page.markdown).toStartWith("# Make an applet");
     expect(page.page).toBe("https://docs.example/docs/build/make-an-applet/");
+    // what the model reads: the markdown itself, unescaped, then the address
+    const [block] = tool.resultContent!(page) as { type: string; text: string }[];
+    expect(block.text).toBe("# Make an applet\n\nAn applet is one record.\n\n(For a person: https://docs.example/docs/build/make-an-applet/)");
   });
 
   test("a topic written as a path or a .md address finds the same page", async () => {
