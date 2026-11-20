@@ -38,3 +38,17 @@ describe("vault-info {help}", () => {
     expect(err.message).toBe('No tool named "no-such-tool". Tools: query-records, create-record.');
   });
 });
+
+// T-476, from a cold AI's run: create-record didn't list `extension`, so a careful model put it in `fields` and an
+// applet's code was saved as markdown. What a code record needs must be in the schema a model reads.
+describe("create-record lists what a code record needs", () => {
+  test("`extension` is in create-record's advertised schema, and a tsx record keeps it", async () => {
+    const tools = surface();
+    const create = tools.find((t) => t.name === "create-record")!;
+    const props = (create.inputSchema as { properties: Record<string, { description?: string }> }).properties;
+    expect(Object.keys(props)).toContain("extension");
+    expect(props.extension.description).toContain("tsx");
+    const made = (await create.execute({ path: "Applets/X", extension: "tsx", body: "export default () => null;" })) as { extension?: string };
+    expect(made.extension).toBe("tsx");
+  });
+});

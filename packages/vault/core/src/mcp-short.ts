@@ -120,6 +120,7 @@ Rarer filters (has_links, order_by, expand_links, created_by, …) are accepted 
     inputSchema: obj({
       content: str(),
       path: str('e.g. "Projects/Alder"'),
+      extension: str('"md" (default); "tsx", "jsx" or "html" for an applet\'s code'),
       tags: { type: "array", items: { type: "string" } },
       types: { type: "array", items: { type: "string" }, description: "Types; land with the tags" },
       metadata: { type: "object" },
