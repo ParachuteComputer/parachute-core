@@ -1,7 +1,7 @@
 // `docs` (T-476): the docs site's pages, handed to an agent as markdown. The network is faked (the site is outside
 // this repo); everything else runs as the doors run it.
 import { describe, expect, test } from "bun:test";
-import { buildDocsTool } from "./docs-tool.ts";
+import { buildDocsTool, docsOriginFromEnv } from "./docs-tool.ts";
 import { projectionToMarkdown, type VaultProjection } from "./vault-projection.ts";
 
 const SITE: Record<string, string> = {
@@ -24,7 +24,7 @@ function site(pages = SITE) {
 describe("docs tool", () => {
   test("no topic: the index; a topic: its page, with the address a person opens", async () => {
     const { f } = site();
-    const tool = buildDocsTool({ origin: "https://docs.example/", fetch: f });
+    const tool = buildDocsTool({ origin: "https://docs.example/", fetch: f, cache: new Map() });
     expect(tool.requiredVerb).toBe("read");
     const index = (await tool.execute({})) as { markdown: string; index: string };
     expect(index.markdown).toContain("Make an applet");
@@ -38,38 +38,39 @@ describe("docs tool", () => {
   });
 
   test("a topic written as a path or a .md address finds the same page", async () => {
-    const tool = buildDocsTool({ origin: "https://docs.example", fetch: site().f });
-    for (const t of ["/docs/build/make-an-applet.md", "Build/Make-An-Applet/", "docs/build/make-an-applet"]) {
+    const tool = buildDocsTool({ origin: "https://docs.example", fetch: site().f, cache: new Map() });
+    // as written in the index (llms.txt lists parachute.computer addresses, whatever origin serves the pages)
+    for (const t of ["/docs/build/make-an-applet.md", "Build/Make-An-Applet/", "docs/build/make-an-applet", "https://docs.example/docs/build/make-an-applet.md", "https://parachute.computer/docs/build/make-an-applet.md", "https://parachute.computer/docs/build/make-an-applet/"]) {
       expect(((await tool.execute({ topic: t })) as { topic: string }).topic).toBe("build/make-an-applet");
     }
   });
 
   test("a topic that isn't a page name never reaches the network", async () => {
     const { f, asked } = site();
-    const tool = buildDocsTool({ origin: "https://docs.example", fetch: f });
-    for (const t of ["../secrets", "build/../../x", "a b", "x?y=1", "//evil.example/x", "%2e%2e/x", "a/b/c/d/e"]) {
+    const tool = buildDocsTool({ origin: "https://docs.example", fetch: f, cache: new Map() });
+    for (const t of ["../secrets", "build/../../x", "a b", "x?y=1", "//evil.example/x", "%2e%2e/x", "a/b/c/d/e", "https://evil.example/docs/build/x.md", "https://parachute.computer.evil.example/docs/x.md"]) {
       await expect(tool.execute({ topic: t })).rejects.toMatchObject({ error_type: "invalid_topic" });
     }
     expect(asked).toEqual([]);
   });
 
   test("an unknown page says so and points at the list", async () => {
-    const tool = buildDocsTool({ origin: "https://docs.example", fetch: site().f });
+    const tool = buildDocsTool({ origin: "https://docs.example", fetch: site().f, cache: new Map() });
     await expect(tool.execute({ topic: "build/nothing-here" })).rejects.toMatchObject({ error_type: "unknown_topic", hint: "call docs {} for the list of pages" });
   });
 
   test("a site that can't be reached is a refusal naming the address, not an empty page", async () => {
     const down = (async () => { throw new Error("offline"); }) as unknown as typeof fetch;
-    const tool = buildDocsTool({ origin: "https://docs.example", fetch: down });
+    const tool = buildDocsTool({ origin: "https://docs.example", fetch: down, cache: new Map() });
     await expect(tool.execute({ topic: "build/make-an-applet" })).rejects.toMatchObject({ error_type: "docs_unreachable" });
     const redirect = (async () => new Response(null, { status: 302, headers: { location: "https://elsewhere.example/" } })) as unknown as typeof fetch;
-    await expect(buildDocsTool({ origin: "https://docs.example", fetch: redirect }).execute({ topic: "x" })).rejects.toMatchObject({ error_type: "docs_unreachable" });
+    await expect(buildDocsTool({ origin: "https://docs.example", fetch: redirect, cache: new Map() }).execute({ topic: "x" })).rejects.toMatchObject({ error_type: "docs_unreachable" });
   });
 
   test("a page is read once an hour, and a huge one is cut with its address", async () => {
     const { f, asked } = site({ ...SITE, "/docs/big.md": "x".repeat(300 * 1024) });
     let t = 0;
-    const tool = buildDocsTool({ origin: "https://docs.example", fetch: f, now: () => t });
+    const tool = buildDocsTool({ origin: "https://docs.example", fetch: f, now: () => t, cache: new Map() });
     await tool.execute({ topic: "build/make-an-applet" });
     await tool.execute({ topic: "build/make-an-applet" });
     expect(asked).toEqual(["/docs/build/make-an-applet.md"]);
@@ -79,6 +80,31 @@ describe("docs tool", () => {
     const big = (await tool.execute({ topic: "big" })) as { markdown: string };
     expect(big.markdown.length).toBeLessThan(210 * 1024);
     expect(big.markdown).toContain("whole page is at https://docs.example/docs/big.md");
+  });
+});
+
+describe("docs between sessions and from the environment", () => {
+  test("a door builds its tools per request: the pages are kept across tools, not per tool", async () => {
+    const { f, asked } = site();
+    // the default store (an origin no other test uses)
+    await buildDocsTool({ origin: "https://shared.example", fetch: f }).execute({ topic: "build/make-an-applet" });
+    await buildDocsTool({ origin: "https://shared.example", fetch: f }).execute({ topic: "build/make-an-applet" });
+    expect(asked).toEqual(["/docs/build/make-an-applet.md"]);
+  });
+  test("a body that breaks mid-read is a docs_unreachable refusal; a huge one is read only to the cut", async () => {
+    let pulled = 0;
+    const endless = (async () => new Response(new ReadableStream({ pull(c) { pulled++; c.enqueue(new Uint8Array(64 * 1024)); } }))) as unknown as typeof fetch;
+    const big = (await buildDocsTool({ origin: "https://docs.example", fetch: endless, cache: new Map() }).execute({ topic: "x" })) as { markdown: string };
+    expect(big.markdown).toContain("Cut at 200 KB");
+    expect(pulled).toBeLessThan(10);
+    const broken = (async () => new Response(new ReadableStream({ pull(c) { c.error(new Error("reset")); } }))) as unknown as typeof fetch;
+    await expect(buildDocsTool({ origin: "https://docs.example", fetch: broken, cache: new Map() }).execute({ topic: "x" })).rejects.toMatchObject({ error_type: "docs_unreachable" });
+  });
+  test("PARACHUTE_DOCS_URL: an origin, off in any of its spellings, or the default", () => {
+    expect(docsOriginFromEnv(undefined)).toBe("https://parachute.computer");
+    expect(docsOriginFromEnv("http://127.0.0.1:8080/")).toBe("http://127.0.0.1:8080");
+    for (const off of ["off", "OFF", "false", "0", "none"]) expect(docsOriginFromEnv(off)).toBeNull();
+    expect(docsOriginFromEnv("https://preview.example/docs-site")).toBe("https://parachute.computer");
   });
 });
 

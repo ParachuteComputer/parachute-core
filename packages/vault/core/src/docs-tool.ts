@@ -11,8 +11,8 @@
  *   docs { topic: "applets" }      that page as markdown, with its address for a person
  *
  * Only the topic leaves the server, to the docs origin; nothing of the vault does. The origin is
- * https://parachute.computer unless the door says otherwise (a box: PARACHUTE_DOCS_URL; `off` lists no tool).
- * Pages are kept for an hour in memory, at most 64 of them, each cut at 200 KB. A page comes back as its own markdown,
+ * https://parachute.computer unless the door says otherwise (a box: PARACHUTE_DOCS_URL, `docsOriginFromEnv`; `off` lists
+ * no tool). Pages are kept for an hour in the process's memory, at most 64 of them, each read up to 200 KB. A page comes back as its own markdown,
  * one text block; the site keeps pages short enough for one tool result (CLAUDE.md there).
  *
  * Pure apart from `fetch` (injected for tests), so the cloud door can build the same tool.
@@ -40,39 +40,82 @@ export interface DocsToolOpts {
   origin?: string;
   fetch?: typeof fetch;
   now?: () => number;
+  /** Where pages are kept between calls. Default: one store for the process, shared by every session and door
+   *  (a door builds its tools per request, so a store per tool would never be hit). */
+  cache?: Map<string, Page>;
 }
 
-type Page = { at: number; text: string };
+export type Page = { at: number; text: string };
+
+/** The process's pages, by origin and path. */
+const PAGES = new Map<string, Page>();
 
 /** Throw a refusal the doors turn into an MCP error with these fields. */
 function refuse(message: string, error_type: string, hint: string): never {
   throw Object.assign(new Error(message), { error_type, field: "topic", hint });
 }
 
+/** Read a response body up to `max` bytes, and whether there was more. A body that stalls or breaks throws. */
+async function readCapped(res: Response, max: number): Promise<{ bytes: Uint8Array; more: boolean }> {
+  if (!res.body) return { bytes: new Uint8Array(), more: false };
+  const reader = res.body.getReader();
+  const parts: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (size <= max) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      parts.push(value);
+      size += value.length;
+    }
+  } finally {
+    reader.cancel().catch(() => {});
+  }
+  const all = new Uint8Array(size);
+  let at = 0;
+  for (const p of parts) { all.set(p, at); at += p.length; }
+  return { bytes: all.subarray(0, Math.min(size, max)), more: size > max };
+}
+
+/** A topic as a person or a model may write it: a page name, its path, or its address from the index (on this origin
+ *  or parachute.computer, whose addresses llms.txt lists). Anything else stays as written, to be refused. */
+function topicOf(raw: string, origin: string): string {
+  let t = raw.trim();
+  for (const o of new Set([origin, DOCS_ORIGIN])) {
+    const host = o.replace(/^https?:\/\//, "");
+    const at = t.replace(/^https?:\/\//i, "");
+    if (/^https?:\/\//i.test(t) && at.toLowerCase().startsWith(`${host.toLowerCase()}/`)) { t = at.slice(host.length); break; }
+  }
+  return t.toLowerCase().replace(/^\/+|\/+$/g, "").replace(/^docs\//, "").replace(/\.md$/, "");
+}
+
 export function buildDocsTool(opts: DocsToolOpts = {}): McpToolDef {
   const origin = (opts.origin ?? DOCS_ORIGIN).replace(/\/+$/, "");
   const get = opts.fetch ?? fetch;
   const now = opts.now ?? Date.now;
-  const cache = new Map<string, Page>();
+  const cache = opts.cache ?? PAGES;
 
   async function read(path: string): Promise<string | null> {
-    const hit = cache.get(path);
+    const key = `${origin}${path}`;
+    const hit = cache.get(key);
     if (hit && now() - hit.at < TTL_MS) return hit.text;
-    const url = `${origin}${path}`;
-    let res: Response;
+    const url = key;
+    const unreachable = (why: string): never => refuse(`The docs at ${url} couldn't be read (${why}).`, "docs_unreachable", `open ${url} yourself, or try again`);
+    let text: string;
     try {
-      res = await get(url, { redirect: "manual", signal: AbortSignal.timeout(TIMEOUT_MS), headers: { accept: "text/markdown, text/plain" } });
+      const res = await get(url, { redirect: "manual", signal: AbortSignal.timeout(TIMEOUT_MS), headers: { accept: "text/markdown, text/plain" } });
+      if (res.status === 404) return null;
+      if (!res.ok) unreachable(`it answered ${res.status}`);
+      const { bytes, more } = await readCapped(res, MAX_BYTES);
+      text = new TextDecoder().decode(bytes);
+      if (more) text += `\n\n[Cut at ${MAX_BYTES / 1024} KB: the whole page is at ${url}]`;
     } catch (e) {
-      refuse(`The docs at ${url} couldn't be reached (${(e as Error).message}).`, "docs_unreachable", `open ${url} yourself, or try again`);
+      if ((e as { error_type?: string }).error_type) throw e;
+      unreachable((e as Error).message);
     }
-    if (res.status === 404) return null;
-    if (!res.ok) refuse(`The docs at ${url} answered ${res.status}.`, "docs_unreachable", `open ${url} yourself, or try again`);
-    const bytes = new Uint8Array(await res.arrayBuffer());
-    let text = new TextDecoder().decode(bytes.subarray(0, MAX_BYTES));
-    if (bytes.length > MAX_BYTES) text += `\n\n[Cut at ${MAX_BYTES / 1024} KB: the whole page is at ${url}]`;
     if (cache.size >= MAX_PAGES) cache.delete(cache.keys().next().value!);
-    cache.set(path, { at: now(), text });
-    return text;
+    cache.set(key, { at: now(), text: text! });
+    return text!;
   }
 
   return {
@@ -93,11 +136,26 @@ export function buildDocsTool(opts: DocsToolOpts = {}): McpToolDef {
         if (index === null) refuse(`No index at ${origin}/llms.txt.`, "docs_unreachable", `open ${origin}/docs/ yourself`);
         return { index: `${origin}/llms.txt`, pages: `${origin}/docs/`, markdown: index };
       }
-      const topic = String(raw).trim().toLowerCase().replace(/^\/+|\/+$/g, "").replace(/^docs\//, "").replace(/\.md$/, "");
-      if (!TOPIC_RE.test(topic)) refuse(`"${String(raw).slice(0, 80)}" isn't a page name.`, "invalid_topic", "call docs {} for the list of pages");
+      const topic = topicOf(String(raw), origin);
+      if (!TOPIC_RE.test(topic)) refuse(`"${String(raw).slice(0, 80)}" isn't a page name.`, "invalid_topic", 'a name from docs {}, e.g. "build/make-an-applet"');
       const markdown = await read(`/docs/${topic}.md`);
       if (markdown === null) refuse(`No page "${topic}".`, "unknown_topic", "call docs {} for the list of pages");
       return { topic, page: `${origin}/docs/${topic}/`, markdown };
     },
   };
+}
+
+/** The docs origin a box uses: PARACHUTE_DOCS_URL (an http(s) origin; `off`, `false`, `0` or `none` for no docs tool),
+ *  else parachute.computer. A value it can't use is said once in the log, and the default stands. */
+let warned = false;
+export function docsOriginFromEnv(v = process.env.PARACHUTE_DOCS_URL): string | null {
+  const s = v?.trim() ?? "";
+  if (!s) return DOCS_ORIGIN;
+  if (/^(off|false|0|none)$/i.test(s)) return null;
+  if (/^https?:\/\/[^/\s]+\/?$/i.test(s)) return s.replace(/\/+$/, "");
+  if (!warned) {
+    warned = true;
+    console.warn(`PARACHUTE_DOCS_URL=${JSON.stringify(s)} isn't an http(s) origin or "off": the docs tool reads ${DOCS_ORIGIN}`);
+  }
+  return DOCS_ORIGIN;
 }

@@ -32,6 +32,7 @@ import {
 } from "./tag-schemas.ts";
 import { DEFAULT_TAG_NAME } from "./tag-hierarchy.ts";
 import * as noteOps from "./notes.ts";
+import { DOCS_ORIGIN } from "./docs-tool.ts";
 import type { VaultStats, VaultMap } from "./types.ts";
 
 // ---------------------------------------------------------------------------
@@ -416,11 +417,11 @@ export function projectionToMarkdown(args: {
   // T-476: how to do things in Parachute lives on the docs site (one copy, checked against the code), not in notes
   // seeded into each vault. The `docs` tool hands the page over; the address is for a client without it.
   if (args.docs !== null) {
-    const origin = (args.docs ?? "https://parachute.computer").replace(/\/+$/, "");
+    const origin = (args.docs ?? DOCS_ORIGIN).replace(/\/+$/, "");
     lines.push("");
     lines.push(
       `## How to do things in Parachute\n\nThe Parachute app shows **applets**: small screens, each one record you can write ` +
-        `(\`docs { topic: "build/make-an-applet" }\`). For a type, records, an applet or the person's home and pins (a bundle), ` +
+        `(\`docs { topic: "build/make-an-applet" }\`). For a type, records, an applet, or the home and pins the app opens on (a bundle), ` +
         `read the page first: \`docs\` lists them, \`docs { topic }\` returns one as markdown (${origin}/llms.txt).`,
     );
   }

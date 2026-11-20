@@ -6,6 +6,7 @@
  */
 
 import { generateMcpTools, resolveNote } from "../core/src/mcp.ts";
+import { docsOriginFromEnv } from "../core/src/docs-tool.ts";
 import { projectHistoryProvenance } from "../core/src/history-visibility.js";
 import type { McpToolDef, GenerateMcpToolsOpts } from "../core/src/mcp.ts";
 import { mergeTypesIntoTags } from "../core/src/tag-kind.ts";
@@ -150,7 +151,7 @@ export async function getServerInstruction(
     attachments: { ticketsEnabled: true, readEnabled: true, ticketTool: "attachment-url" },
     // T-407: this door lists the record tools first, so its brief speaks their words.
     words: recordWords,
-    docs: (() => { const d = docsOrigin(); return d === null ? null : d.origin; })(),
+    docs: docsOriginFromEnv(),
     // 0.9.1 (SPEC §3.4): say what this key can read. No auth (local stdio) is the owner's own process: no line.
     ...(auth
       ? {
@@ -385,19 +386,11 @@ export function generateScopedMcpTools(
         }
       : {}),
     doorTool: (name) => (name === "manage-token" || name === "manage-keys" ? { ...manageTokenReference(vaultName), name } : undefined),
-    docs: docsOrigin(),
+    docs: (() => { const origin = docsOriginFromEnv(); return origin === null ? null : { origin }; })(),
   });
   applyOnBehalf(shaped, auth, (by) => generateScopedMcpTools(vaultName, { ...auth!, actor: by, acts_for: null }, callerBearer, req));
 
   return shaped;
-}
-
-/** Where `docs` reads its pages: PARACHUTE_DOCS_URL (an http(s) origin, or `off` for no `docs` tool), else parachute.computer. */
-export function docsOrigin(): { origin?: string } | null {
-  const v = process.env.PARACHUTE_DOCS_URL?.trim();
-  if (!v) return {};
-  if (v === "off") return null;
-  return /^https?:\/\/[^/\s]+\/?$/.test(v) ? { origin: v } : {};
 }
 
 /** The MCP tools whose writes carry the write stamp, by the action that writes (manage-types: only rename does). */
