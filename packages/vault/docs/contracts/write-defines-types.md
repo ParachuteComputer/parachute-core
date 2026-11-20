@@ -25,10 +25,19 @@ A caller holding `vault:write` (or `vault:<name>:write`) and not `admin`, with n
    core `write-stamp.ts`). It may add field names the type doesn't have, and set its description. It may not change or
    remove a field it already declared.
 
+**Never through write: what other types' records inherit.** `_default` (every record's implicit parent) and any name
+starting `_`, and a name some type lists in its `parent_names` (with or without a row of its own), including the
+caller's own type once another type names it as a parent: fields declared there would reach records the caller didn't
+type. `fields` must be an object of field definitions; any other shape is refused and nothing in the call lands.
+
 Everything else on types stays **admin**: changing or removing any field, any change to a type it did not make (or
 one made before this rule, which has no creator stamp), `parent_names`, `relationships`, `kind: "tag"`, rename,
 merge, delete, prune and migrate. A refused call changes nothing and says so: "needs `vault:<name>:admin`", with
 what write access may do instead.
+
+**The account door** (one key over several vaults, the hub's `/mcp`) lists `manage-types` only to a key that holds admin
+on the vault, as before: its writer list keeps to a 4,000-token budget (`contracts/suites/door/multivault.test.ts`). A
+write key there makes a type at the vault's own address, the one the app's Connect screen gives.
 
 **REST is unchanged**: `PUT /api/tags/:name` (and `/api/types/:name`) stays admin. Benjamin's Prism compatibility suite
 (`contracts/suites/compat/prism.test.ts`) pins a write pass's 403 there, and nothing turns it red on purpose. The AI
@@ -55,6 +64,10 @@ Storage: two nullable columns on `tags`, added like `kind` (additive, no schema 
 older engine ignores them. They are not exported: a vault restored from an export has types with no creator stamp,
 which write access then can't extend (fail closed; an admin still can). A rename or merge (admin) doesn't carry the
 stamp to the new name either.
+
+One edge is accepted: a type an admin made with only `kind: "type"` (no fields, description or parents) before this
+rule has no stamp and reads as not yet defined, so a write session may define it. An admin who wants a name kept gives
+it a description or a field.
 
 ## Not changed
 

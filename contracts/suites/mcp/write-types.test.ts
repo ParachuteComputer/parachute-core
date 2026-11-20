@@ -71,6 +71,38 @@ describe("mcp/write-types: write access may add a new type", () => {
     await c.close();
   });
 
+  test("fields must be an object: any other shape is refused, and nothing else in the call lands (T-476 review)", async () => {
+    const theirs = runId("theirs");
+    expect((await operator().put(`/tags/${enc(theirs)}`, { description: "theirs", fields: { [field()]: { type: "string" } } })).status).toBe(200);
+    const c = await writer();
+    for (const fields of [[], 0, true, "x"]) {
+      await expect(c.call("manage-types", { tag: theirs, fields, description: "changed" })).rejects.toThrow(/fields is an object/);
+    }
+    const label = runId("label");
+    await c.call("create-record", { path: runId("n"), tags: [label] });
+    await expect(c.call("manage-types", { tag: label, kind: "type", fields: [] })).rejects.toThrow(/fields is an object/);
+    expect((await operator().get(`/tags/${enc(theirs)}`)).body.description).toBe("theirs");
+    await c.close();
+  });
+
+  test("it may not define what other types' records inherit: _default, a parent with or without a row, its own type once a parent (T-476 review)", async () => {
+    const c = await writer();
+    const admin = await mcp(`${services().vaultViaHub}/mcp`, services().operatorToken);
+    await expect(c.call("manage-types", { tag: "_default", fields: { [field()]: { type: "string", required: true, strict: true } } })).rejects.toThrow(/admin/);
+    const child = runId("child");
+    const parent = runId("parent"); // no row: only named as the child's parent
+    await admin.call("manage-types", { tag: child, parent_names: [parent] });
+    await expect(c.call("manage-types", { tag: parent, fields: { [field()]: { type: "string" } } })).rejects.toThrow(/admin/);
+    const mine = runId("mine");
+    await c.call("manage-types", { tag: mine, fields: { [field()]: { type: "string" } } });
+    await admin.call("manage-types", { tag: runId("kid"), parent_names: [mine] });
+    await expect(c.call("manage-types", { tag: mine, fields: { [field()]: { type: "string" } } })).rejects.toThrow(/admin/);
+    // records still write: nothing was declared that every record must carry
+    expect((await admin.call("create-record", { path: runId("still"), body: "x" })).id).toBeTruthy();
+    await admin.close();
+    await c.close();
+  });
+
   test("it may not add fields to a type someone else made", async () => {
     const theirs = runId("theirs");
     const put = await operator().put(`/tags/${enc(theirs)}`, { fields: { [field()]: { type: "string" } } });

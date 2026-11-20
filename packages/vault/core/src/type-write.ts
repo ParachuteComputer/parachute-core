@@ -8,7 +8,7 @@
  */
 import type { Database } from "bun:sqlite";
 import { getTagRecord } from "./tag-schemas.js";
-import { isParent } from "./tag-kind.js";
+import { DEFAULT_TAG_NAME } from "./tag-hierarchy.js";
 
 /** The caller's write stamp: the same two facts its record writes carry. */
 export interface TypeWriter {
@@ -54,6 +54,11 @@ export function typeCreator(db: Database, name: string): TypeWriter | null {
   return { by: row.created_by, via: row.created_via };
 }
 
+/** Does any type name `name` among its parents (whether or not `name` has a row)? Fields flow to a parent's children. */
+export function namedAsParent(db: Database, name: string): boolean {
+  return !!db.prepare("SELECT 1 FROM tags t, json_each(CASE WHEN json_valid(t.parent_names) THEN t.parent_names ELSE '[]' END) p WHERE p.value = ? LIMIT 1").get(name);
+}
+
 /**
  * Has anyone defined this name as a type yet? No row, or a bare type row that records made by naming it as a type
  * (`create-record {types: ["book"]}`). A plain label (`tags: ["pinned"]`) is not a type nobody defined: making it one
@@ -63,7 +68,7 @@ export function typeIsUndefined(db: Database, name: string): boolean {
   const t = getTagRecord(db, name);
   if (!t) return true;
   if (t.kind !== "type" || typeCreator(db, name)) return false;
-  return empty(t.fields) && empty(t.description) && empty(t.parent_names) && empty(t.relationships) && !isParent(db, name);
+  return empty(t.fields) && empty(t.description) && empty(t.parent_names) && empty(t.relationships);
 }
 
 /**
@@ -78,7 +83,13 @@ export function writeTypeProblem(db: Database, name: string, change: TypeChange,
   if (change.replace_fields !== undefined && change.replace_fields !== false) return needs("Replacing a type's fields");
   if (change.kind !== undefined && change.kind !== "type") return needs(`Making "${name}" a plain tag`);
   if (change.fields === null) return needs("Removing a type's fields");
-  if (change.fields !== undefined && (typeof change.fields !== "object" || Array.isArray(change.fields))) return null; // the engine refuses the shape itself
+  if (change.fields !== undefined && (typeof change.fields !== "object" || Array.isArray(change.fields))) {
+    return "fields is an object: {field_name: {type, enum?, indexed?, default?}}.";
+  }
+  // Names whose fields reach other types' records: `_default` (every record's implicit parent), any `_` name the
+  // vault keeps, and a name some type lists as its parent (its fields flow to that type's records).
+  if (name === DEFAULT_TAG_NAME || name.startsWith("_")) return needs(`Changing "${name}", which every record inherits from,`);
+  if (namedAsParent(db, name)) return needs(`Changing "${name}", another type's parent,`);
   if (typeIsUndefined(db, name)) return null;
   const creator = typeCreator(db, name);
   const own = creator !== null && writer !== null && writer.by !== null && writer.via !== null &&

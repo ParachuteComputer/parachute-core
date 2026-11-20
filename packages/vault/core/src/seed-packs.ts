@@ -441,7 +441,10 @@ uses; no predefined types. You and the operator design the structure that fits
 *their* life and work. The vault is the engine; the meaning is yours to bring.
 
 Core moves, grouped by the scope each needs — \`tools/list\` shows exactly the
-ones your token can call (see "What your scope allows" below):
+ones your token can call (see "What your scope allows" below). This guide uses
+0.9's tool names; a server that lists only the older ones (\`query-notes\`,
+\`create-note\`, \`update-note\`, \`update-tag\`) takes the same calls under
+those names, with \`content\` for \`body\` and \`metadata\` for \`fields\`:
 - **Read:** \`query-records\` (by id/path, by type or tag, full-text \`search\`,
   graph \`near\` a record, or \`path_between\` two records), \`list-types\`,
   \`vault-info\` (the live schema projection + a compact \`map\` — counts per
@@ -533,8 +536,9 @@ manage-types {
 \`\`\`
 
 Then \`create-record { path: "Meetings/Kickoff", types: ["meeting"], fields: {
-held_on: "2026-01-12" } }\`, and \`update-record { id, fields: { status: "done" } }\`
-to change one value (\`fields\` merges; \`null\` removes a key).
+held_on: "2026-01-12" } }\`, and \`update-record { id, fields: { status: "done" },
+if_updated_at: "<the updated_at you read>" }\` to change one value (\`fields\` merges;
+\`null\` removes a key).
 
 A later \`manage-types\` call **merges** \`fields\` (new keys added). With write
 access you may add fields to a type you made; changing or removing a field,
