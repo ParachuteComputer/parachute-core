@@ -50,6 +50,17 @@ function ensureRevisionKeyKind(db: Database): void {
   }
 }
 
+/**
+ * Who defined each type (T-476, docs/contracts/write-defines-types.md): `tags.created_by` and `tags.created_via`, the
+ * write stamp of the call that first gave the type a definition. Write access may add fields to a type whose stamp is
+ * its own. Additive with no schema number, like ensureTagKinds: an older engine ignores the columns. Never
+ * backfilled: a type made before has no stamp, and stays admin's to change.
+ */
+function ensureTagCreators(db: Database): void {
+  if (!hasColumn(db, "tags", "created_by")) db.exec("ALTER TABLE tags ADD COLUMN created_by TEXT");
+  if (!hasColumn(db, "tags", "created_via")) db.exec("ALTER TABLE tags ADD COLUMN created_via TEXT");
+}
+
 function ensureTagKinds(db: Database): void {
   const added = !hasColumn(db, "tags", "kind");
   if (added) db.exec("ALTER TABLE tags ADD COLUMN kind TEXT");
@@ -749,6 +760,7 @@ export function unnumberedStepsDone(db: Database): boolean {
   return (
     hasIndex(db, "idx_notes_path_nocase") && // ensurePathNocaseIndex (T-412)
     hasColumn(db, "tags", "kind") && // ensureTagKinds (T-318 §8a, 0.9)
+    hasColumn(db, "tags", "created_via") && // ensureTagCreators (T-476)
     (!hasTable(db, "note_versions") || hasColumn(db, "note_versions", "via_kind")) && // ensureRevisionKeyKind (0.9.1)
     (!hasTable(db, "notes") || hasColumn(db, "notes_fts", "fields")) && // ensureFtsFields (0.9.3)
     (!hasTable(db, "notes") || ftsInsertTriggerIsCurrent(db)) // ensureFtsInsertTrigger (0.9.3)
@@ -776,6 +788,7 @@ export function initSchema(db: Database): void {
       ensureTagKinds(db);
       ensurePathNocaseIndex(db);
       ensureRevisionKeyKind(db);
+      ensureTagCreators(db);
       ensureFtsFields(db);
       ensureFtsInsertTrigger(db);
     }
@@ -932,6 +945,8 @@ export function initSchema(db: Database): void {
   ensurePathNocaseIndex(db);
   // The write stamp: each revision says what kind of key wrote it (0.9.1).
   ensureRevisionKeyKind(db);
+  // Who defined each type, for write access's own types (T-476).
+  ensureTagCreators(db);
   // Field values in the search index (0.9.3): a third notes_fts column, rebuilt once.
   ensureFtsFields(db);
   // The insert trigger clears a leftover field-text row first (0.9.3).
