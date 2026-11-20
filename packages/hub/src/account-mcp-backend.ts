@@ -435,7 +435,7 @@ export async function callVaultModuleTool(
   if (FAN_OUT_TOOLS.has(name)) return queryNotesOverlay(args, ctx, name);
   if (VAULT_AGNOSTIC_TOOLS.has(name)) {
     // Any covered vault answers, tried in the order tools/list tries them, so the vault that listed it can answer it.
-    // A `vault` given is ignored. A refusal from the tool itself (a page that isn't there) is the answer.
+    // A `vault` given is ignored. Every vault's docs answers alike, so a refusal (a page that isn't there) only costs a retry.
     const coverage = resolveCoverage(ctx.db, ctx.principal, installedVaults(ctx));
     let last: unknown = Object.assign(new Error("This key covers no vault."), { error_type: "no_vault" });
     for (const v of schemaSourceCandidates(ctx, coverage.vaults)) {
