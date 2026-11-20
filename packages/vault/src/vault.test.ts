@@ -8211,7 +8211,7 @@ describe("MCP tools/list scope tiers (vault#376)", () => {
     ]);
   });
 
-  test("vault:read + vault:write sees the 9 writer tools, then the aliases a writer may call", async () => {
+  test("vault:read + vault:write sees the 10 writer tools, then the aliases a writer may call", async () => {
     const names = await listToolNames(["vault:read", "vault:write"]);
     expect(names).toEqual([
       "query-records",
@@ -8223,6 +8223,8 @@ describe("MCP tools/list scope tiers (vault#376)", () => {
       "doctor",
       "read-attachment",
       "attachment-url",
+      // T-476: a writer may define a new type (manage-types {action: "update"}); every other action stays admin.
+      "manage-types",
       "query-notes",
       "create-note",
       "update-note",

@@ -198,6 +198,7 @@ import {
 // usage.ts imports `assetsDir` from config.ts (neutral ground), so this import
 // of invalidateUsageCache does NOT form a cycle — routes.ts → usage.ts only.
 import { invalidateUsageCache } from "./usage.ts";
+import { stampTypeCreator, typeIsUndefined } from "../core/src/type-write.ts";
 
 // Re-export `assetsDir` (now defined in config.ts) so the existing callers
 // that import it from this module — mirror-deps, mirror-routes, server,
@@ -4173,6 +4174,10 @@ export async function handleTags(
       replace_fields?: unknown;
     };
     const replaceFields = body.replace_fields === true;
+    // T-476 (docs/contracts/write-defines-types.md): a type defined here records who defined it, as on MCP. Over REST
+    // this stays an admin route (Prism's compat suite pins a write pass's 403); the stamp is the admin's.
+    const typeWriter = { by: writeCtx.actor, via: writeCtx.via };
+    const typeWasUndefined = typeIsUndefined(store.db, putTagName);
 
     // Validate the relationships payload up front so a bad payload returns
     // 400, not a thrown 500. `relationships` is an opaque vocabulary map
@@ -4335,6 +4340,7 @@ export async function handleTags(
         ...(parentNamesPatch !== undefined ? { parent_names: parentNamesPatch } : {}),
         ...((body as { kind?: "type" | "tag" }).kind !== undefined ? { kind: (body as { kind?: "type" | "tag" }).kind } : {}),
       });
+      stampTypeCreator(store.db, putTagName, typeWriter, typeWasUndefined);
     } catch (err) {
       if ((err as { error_type?: string })?.error_type === "tag_kind") {
         return Response.json({ error: (err as Error).message, error_type: "tag_kind", field: (err as { field?: string }).field }, { status: 422 });

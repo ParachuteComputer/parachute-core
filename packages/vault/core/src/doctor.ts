@@ -285,8 +285,8 @@ function scanIndexedFieldLimit(db: Database, count: number): DoctorFinding[] {
       ? `${count} indexed fields, over the limit of ${INDEXED_FIELD_LIMIT}: every one still works here, but a new indexed field is refused and the vault can't move to cloud (100 columns per table) until it's at ${INDEXED_FIELD_LIMIT} or fewer.`
       : `${count} indexed fields, at the limit of ${INDEXED_FIELD_LIMIT}: the next new indexed field is refused.`,
     remedy: unused.length > 0
-      ? `unused indexed fields: ${unused.slice(0, 20).join(", ")}${unused.length > 20 ? `, and ${unused.length - 20} more` : ""}. Run prune-schema for fields no type declares; for the others drop \`indexed\` (update-tag, on every type that declares the field).`
-      : "drop `indexed` from fields you don't filter or sort by (update-tag); an unindexed field can still be filtered, by a scan.",
+      ? `unused indexed fields: ${unused.slice(0, 20).join(", ")}${unused.length > 20 ? `, and ${unused.length - 20} more` : ""}. Run manage-types {action: "prune"} for fields no type declares; for the others drop \`indexed\` (manage-types, on every type that declares the field).`
+      : "drop `indexed` from fields you don't filter or sort by (manage-types); an unindexed field can still be filtered, by a scan.",
   }];
 }
 
@@ -316,7 +316,7 @@ function scanDanglingParentNames(db: Database, allowedTags: Set<string> | null):
         severity: "warning",
         subject: row.name,
         detail: `tag "${row.name}" declares parent "${parent}", which has no identity row — a typo, a tag that was never created, or a rename/delete that didn't update this reference.`,
-        remedy: `remove "${parent}" from "${row.name}"'s parent_names (update-tag), or create the missing "${parent}" tag if it's meant to exist`,
+        remedy: `remove "${parent}" from "${row.name}"'s parent_names (manage-types), or create the missing "${parent}" tag if it's meant to exist`,
       });
     }
   }
@@ -339,7 +339,7 @@ function scanParentNamesCycles(db: Database, allowedTags: Set<string> | null): D
       severity: "error",
       subject: tag,
       detail: `tag "${tag}" reaches itself through its declared parent_names ancestor chain. Query expansion tolerates this (a visited-set stops it looping), but it's confusing hierarchy state.`,
-      remedy: `clear or correct parent_names on one of the tags in "${tag}"'s ancestor chain (update-tag) to break the cycle`,
+      remedy: `clear or correct parent_names on one of the tags in "${tag}"'s ancestor chain (manage-types) to break the cycle`,
     });
   }
   return findings;
@@ -425,7 +425,7 @@ function scanMixedTypeIndexedFields(
       severity: "error",
       subject: f.field,
       detail: `field "${f.field}" is indexed as ${f.sqliteType} but ${mismatches.length} note(s) carry a metadata."${f.field}" value of a disagreeing JSON type — the generated column's affinity coercion makes ordering/filtering across these rows inconsistent. Declared by: ${visibleDeclarers.join(", ") || "(no live declarer)"}. Example note(s): ${exemplars.join(", ")}${mismatches.length > exemplars.length ? ", …" : ""}`,
-      remedy: `backfill each listed note's metadata."${f.field}" to a value matching the declared type, or relax the field's declared type (update-tag) if the mixed values are intentional`,
+      remedy: `backfill each listed note's metadata."${f.field}" to a value matching the declared type, or relax the field's declared type (manage-types) if the mixed values are intentional`,
     });
   }
   return findings;

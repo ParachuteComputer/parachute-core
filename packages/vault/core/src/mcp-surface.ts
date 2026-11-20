@@ -33,6 +33,8 @@ import {
   type ParamProblem,
 } from "./mcp-short.js";
 import { refuseTypesInTags } from "./tag-kind.js";
+import { stripTagHash } from "./tag-hierarchy.js";
+import { stampTypeCreator, typeIsUndefined, writeTypeProblem, type TypeWriter } from "./type-write.js";
 import { capVaultInfoTags } from "./vault-projection.js";
 
 export type Verb = "read" | "write" | "admin";
@@ -62,6 +64,9 @@ export interface RecordSurfaceOpts {
   tagVisible?: () => Promise<(name: string) => boolean>;
   /** References for tools the door adds itself (`manage-token`, `manage-keys`). */
   doorTool?: (name: string) => DoorToolReference | undefined;
+  /** The caller's write stamp (`by`, `via`), as its record writes carry it. A type it defines records it, and write
+   *  access may add fields to a type whose stamp is its own (type-write.ts). Omitted: nothing is recorded. */
+  writer?: TypeWriter;
 }
 
 const VERB_RANK: Record<Verb, number> = { read: 0, write: 1, admin: 2 };
@@ -142,8 +147,11 @@ function applyElevenTools(tools: McpToolDef[], opts: RecordSurfaceOpts): McpTool
       name,
       description: spec.description,
       inputSchema: spec.inputSchema,
-      // The least any action needs; each action re-checks its own verb below.
-      requiredVerb: folded.map((t) => (t!.requiredVerb ?? "write") as Verb).sort((a, b) => VERB_RANK[a] - VERB_RANK[b])[0]!,
+      // The least any action needs; each action re-checks its own verb below. manage-types: write may define a new
+      // type (T-476, type-write.ts), so a write session lists it; every other action stays admin.
+      requiredVerb: name === "manage-types"
+        ? "write"
+        : folded.map((t) => (t!.requiredVerb ?? "write") as Verb).sort((a, b) => VERB_RANK[a] - VERB_RANK[b])[0]!,
       execute: async (params) => {
         const action = (params.action ?? (name === "manage-types" ? "update" : undefined)) as string | undefined;
         const target = action ? byName.get(spec.folds[action] ?? "") : undefined;
@@ -155,10 +163,26 @@ function applyElevenTools(tools: McpToolDef[], opts: RecordSurfaceOpts): McpTool
           });
         }
         const verb = (target.requiredVerb ?? "write") as Verb;
-        if (opts.hasVerb && !opts.hasVerb(verb)) {
-          throw new Error(`Forbidden: ${name} {action: "${action}"} needs the 'vault:${opts.vaultName}:${verb}' scope.`);
-        }
         const { action: _drop, ...rest } = params;
+        const typeName = name === "manage-types" && action === "update" && typeof rest.tag === "string" ? stripTagHash(rest.tag) : null;
+        if (opts.hasVerb && !opts.hasVerb(verb)) {
+          // Write access may define a new type, and add fields to its own (docs/contracts/write-defines-types.md).
+          const writeMay = typeName !== null && verb === "admin" && opts.hasVerb("write");
+          const problem = writeMay ? writeTypeProblem(opts.db, typeName, rest, opts.writer ?? null, opts.tagVisible !== undefined) : null;
+          if (problem && !problem.needsAdmin) {
+            throw Object.assign(new Error(`${name}: ${problem.message}`), { error_type: "invalid_query", field: "tag" });
+          }
+          if (!writeMay || problem) {
+            const why = problem ? ` ${problem.message}` : name === "manage-types" && opts.hasVerb("write") ? " With write access you can make a new type, and add fields to a type you made (action update)." : "";
+            throw new Error(`Forbidden: ${name} {action: "${action}"} needs the 'vault:${opts.vaultName}:${verb}' scope.${why}`);
+          }
+        }
+        if (typeName !== null) {
+          const wasUndefined = typeIsUndefined(opts.db, typeName);
+          const result = await target.execute(rest);
+          stampTypeCreator(opts.db, typeName, opts.writer ?? null, wasUndefined);
+          return result;
+        }
         // T-407: attachment-url names the record it uploads to `record`; `note` stays as its old name through 0.9.
         if (name === "attachment-url" && rest.record !== undefined) {
           if (rest.note !== undefined) {

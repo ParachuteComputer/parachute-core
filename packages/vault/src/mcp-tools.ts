@@ -372,6 +372,8 @@ export function generateScopedMcpTools(
   const shaped = shapeRecordSurface(tools, {
     db: store.db,
     vaultName,
+    // T-476: a type this session defines records its stamp; write access may add fields to its own types.
+    ...(writeContext ? { writer: { by: writeContext.actor, via: writeContext.via } } : {}),
     ...(auth ? { hasVerb: (verb: "read" | "write" | "admin") => hasScopeForVault(auth.scopes, vaultName, verb) } : {}),
     onUse: (name, kind) => countName(`mcp ${name}`, kind),
     onUnknownParam: countUnknownParam,

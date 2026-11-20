@@ -275,7 +275,7 @@ export function requireIndexedField(db: Database, field: string): IndexedField {
       );
     }
     throw new QueryError(
-      `metadata field "${field}" is not indexed. aggregate's group_by and sum need an indexed field: declare it via update-tag with indexed: true. (Filters and order_by work on any field, by a scan.)`,
+      `metadata field "${field}" is not indexed. aggregate's group_by and sum need an indexed field: declare it via manage-types with indexed: true. (Filters and order_by work on any field, by a scan.)`,
       "FIELD_NOT_INDEXED",
     );
   }

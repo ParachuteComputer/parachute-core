@@ -83,9 +83,9 @@ describe("seedOnboardingNotes — default packs (welcome + getting-started)", ()
     expect(gs!.content).toContain("# Getting Started");
     // A1 doctrine markers: tags-as-types, the three-axis design vocab, import,
     // and the living-note instruction.
-    expect(gs!.content).toContain("Tags = types");
+    expect(gs!.content).toContain("Types = what a record is");
     expect(gs!.content).toContain("Paths = organization");
-    expect(gs!.content).toContain("Schemas = typed metadata fields");
+    expect(gs!.content).toContain("Tags = plain labels");
     // Data-in leads with the import UI + MCP bridge; the old `parachute-vault
     // import` CLI line (a live bug on cloud) is gone (2026-07-06 rewrite).
     expect(gs!.content).not.toContain("parachute-vault import");
@@ -157,13 +157,13 @@ describe("seedOnboardingNotes — default packs (welcome + getting-started)", ()
     expect(gs!.tags).toEqual(["guide"]);
   });
 
-  test("GAP 4: Getting Started shows a concrete update-tag fields example + write gotchas", async () => {
+  test("GAP 4: Getting Started shows a concrete manage-types fields example + write gotchas", async () => {
     await seedOnboardingNotes(store);
     const gs = await store.getNoteByPath(GETTING_STARTED_PATH);
 
-    // (a) a literal update-tag fields object: field name → { type, enum?, indexed? }.
-    expect(gs!.content).toContain("update-tag {");
-    expect(gs!.content).toContain('{ type: "string", indexed: true }');
+    // (a) a literal manage-types fields object: field name → { type, enum?, indexed? } (T-476: was update-tag).
+    expect(gs!.content).toContain("manage-types {");
+    expect(gs!.content).toContain('{ type: "date", indexed: true }');
     expect(gs!.content).toContain('enum: ["scheduled", "done"]');
 
     // (b) the write-gotchas subsection — each gotcha verified against mcp.ts.
