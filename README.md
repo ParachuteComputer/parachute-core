@@ -4,9 +4,9 @@ Parachute is your own vault that any AI can read and write, and an app that show
 the server**: the one program, `parachute`, that holds the vaults and answers the AI (over MCP), the Parachute app and
 scripts. How to use it and build on it: [parachute.computer/docs](https://parachute.computer/docs/).
 
-**Steady core, living surface.** Parachute's core is a plain vault: notes (markdown plus typed fields), tags with
-schemas, links, files, history, identity and access, and a change feed. It has no opinion about how a life or a team
-is organised. Apps such as Uni and Prism bring their own shape and declare what they need from the vault; the core
+**Steady core, living surface.** Parachute's core is a plain vault: records (text plus typed fields), types, tags,
+links, files, history, identity and access, and a change feed. It has no opinion about how a life or a team
+is organised. Apps such as the Parachute app, Uni and Prism bring their own shape and declare what they need from the vault; the core
 checks those needs and keeps every app honest about who may see and change what. The core changes slowly and is held
 by tests. The surface (apps, screens, agents) can change every day on top of it.
 
@@ -26,7 +26,7 @@ say what that program must do, written so they ran against **today's** code firs
 | [`packages/hub/`](packages/hub/) | Today's hub, moved in with `git subtree` at `53d327b` (hub 0.7.19), history kept. |
 | [`packages/cli/`](packages/cli/) | The one command, `parachute`: the hub's 0.7 commands as they were, `vault <command>` for the vault's, `version [--json]`, `install` (this program), and `probe` (does one vault on a running box open and answer; [`docs/probe/`](docs/probe/)). `parachute-core` is the same program under another name, kept for now; `parachute-vault` is the vault's commands under their 0.7 name, inside the built folder only. |
 | `package.json`, `bun.lock` | One Bun workspace over `packages/`. `bun.lock` keeps the versions the two repos had locked, except seven listed with their reasons in `scripts/check-dependency-tree.ts` (one otpauth and its @noble/hashes for both, the hub's @emnapi/runtime, and type packages). |
-| [`release/`](release/) | The v0.8 bundle: the tarball's tree (its own pinned Bun, a production `node_modules`, notices), ad hoc signing for macOS, `SHA256SUMS`. `parachute install` installs an unpacked bundle. |
+| [`release/`](release/) | The release bundle: the tarball's tree (its own pinned Bun, a production `node_modules`, notices), ad hoc signing for macOS, `SHA256SUMS`. `parachute install` installs an unpacked bundle. |
 | [`contracts/`](contracts/) | A black-box contract suite (Bun + TypeScript). It talks to a running vault and hub over HTTP and MCP, the same doors real clients use. It never imports their code. |
 | [`contracts/harness/`](contracts/harness/) | Starts a throwaway vault and hub from today's repos at pinned commits, on random local ports, in a temp home; stops and deletes them after. |
 | [`PROCESS.md`](PROCESS.md) | How we build: what we reuse and what we rewrite, which tests we write, how a change lands, how people and agents work here together. |
@@ -64,8 +64,8 @@ Run the suite (needs Bun 1.4 and git):
 bun install          # the workspace (packages/)
 cd contracts
 bun install
-bun run today        # clones vault + hub at the pinned commits (once), starts them, runs every contract, stops them
-bun run build:core   # builds packages/ as the v0.8 bundle (.cache/candidate-core; tarball in .cache/dist)
+bun run today        # clones the archived 0.7 vault + hub at the pinned commits (once), starts them, runs every contract, stops them
+bun run build:core   # builds packages/ as the release bundle (.cache/candidate-core; tarball in .cache/dist)
 bun run build:stock  # builds the pinned 0.7 programs, which takeover and identity need as "the old programs"
 bun run candidate    # every suite against the core build, in a sandbox
 bun run mutants      # breaks today's vault five ways; the contracts must catch each
