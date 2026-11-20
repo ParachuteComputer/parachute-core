@@ -26,7 +26,6 @@ import { resolveFirstBootVaultName, reservedNameSquatWarnings } from "./vault-na
 import { beingMadeResponse, getVaultStore, getVaultNameForStore, getSharedEmbeddingProvider, closeAllStores, resetSharedEmbeddingProvider, evictVaultStore, vaultIdentity, setVaultReplacedHandler } from "./vault-store.ts";
 import { EmbeddingWorker, registerEmbeddingHook } from "./embedding-worker.ts";
 import { startAttachmentTicketSweep, stopAttachmentTicketSweep } from "./attachment-tickets.ts";
-import { seedOnboardingNotesBestEffort } from "./onboarding-seed.ts";
 import { defaultHookRegistry } from "../core/src/hooks.ts";
 import { registerTriggers } from "./triggers.ts";
 import { clearLiveTriggers, loadVaultTriggers, unloadVaultTriggers } from "./triggers-api.ts";
@@ -940,11 +939,9 @@ export async function firstBootCreate(requestedName: string | undefined): Promis
       console.log(
         `Auto-created vault "${vaultName}" (no API key is made: sign in on the hub and connect with OAuth or a named key, or set VAULT_AUTH_TOKEN on a vault without a hub)`,
       );
-      // Seed the default packs (welcome web + capture tag, Getting Started
-      // guide) so a connected AI can self-orient and help set the vault up —
-      // same as the `create`/`init` CLI path. Idempotent + best-effort (never
-      // fails first boot). Mirrors createVault() in cli.ts.
-      await seedOnboardingNotesBestEffort(getVaultStore(vaultName));
+      // Starts empty, as createVault() in cli.ts (T-476: the guides are the docs site and the MCP `docs` tool). Open its
+      // store so the database exists now, as the seeding used to.
+      getVaultStore(vaultName);
       return true;
     } else if (firstBoot.source === "env-invalid") {
       // PARACHUTE_VAULT_NAME was set but failed validation — do NOT silently

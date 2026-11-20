@@ -364,7 +364,7 @@ describe("vault create — services.json registration (#208)", () => {
  * (ratified 2026-07-02). Idempotent + best-effort: the seed never fails a
  * create and never clobbers an edited note.
  */
-describe("vault create — default pack seeding (welcome + getting-started)", () => {
+describe("vault create — starts empty (T-476)", () => {
   /** Read all (path, content) rows from a created vault's SQLite DB. */
   function readNotes(name: string): { path: string | null; content: string }[] {
     const dbPath = join(home, "vault", "data", name, "vault.db");
@@ -391,40 +391,18 @@ describe("vault create — default pack seeding (welcome + getting-started)", ()
     }
   }
 
-  test("create seeds the welcome web + Getting Started — and NOT Surface Starter", () => {
+  test("create makes an empty vault: no starter notes, no tags (T-476: how-to is the docs site and the MCP docs tool)", () => {
     const { exitCode } = runCli(["create", "guided", "--json"], {
       PARACHUTE_HOME: home,
     });
     expect(exitCode).toBe(0);
-
-    const notes = readNotes("guided");
-    const gs = notes.find((n) => n.path === "Getting Started");
-    const welcome = notes.find((n) => n.path === "Welcome to your vault 🪂");
-    const captureAnything = notes.find((n) => n.path === "Capture anything");
-    const tagsGraph = notes.find((n) => n.path === "Tags and the graph");
-    const connectAi = notes.find((n) => n.path === "Connect your AI");
-    const yoursToKeep = notes.find((n) => n.path === "Yours to keep");
-    expect(gs).toBeDefined();
-    expect(welcome).toBeDefined();
-    expect(captureAnything).toBeDefined();
-    expect(tagsGraph).toBeDefined();
-    expect(connectAi).toBeDefined();
-    expect(yoursToKeep).toBeDefined();
-    expect(gs!.content).toContain("# Getting Started");
-    // Surface Starter is out of the default seed — no note, no dangling link.
-    expect(notes.find((n) => n.path === "Surface Starter")).toBeUndefined();
-    expect(gs!.content).not.toContain("[[Surface Starter]]");
-    expect(gs!.content).toContain("add-pack");
-
-    // The capture tag Notes requires arrives with the welcome pack, alongside
-    // the guide (skill-file) tag — and nothing else (fresh-vault seed = 6 notes:
-    // the 5-guide ring + Getting Started. The retired capture/text + capture/voice
-    // subtypes and the vestigial #pinned seed are no longer seeded).
-    expect(readTagNames("guided").sort()).toEqual(["capture", "guide"]);
-    expect(notes).toHaveLength(6);
+    // The welcome guides and Getting Started went stale in every vault they were copied into. Nothing is seeded now;
+    // `add-pack welcome` adds them on purpose.
+    expect(readNotes("guided")).toEqual([]);
+    expect(readTagNames("guided")).toEqual([]);
   });
 
-  test("seeding doesn't break --json stdout (notes seeded silently)", () => {
+  test("create's --json stdout is one JSON object", () => {
     const { stdout } = runCli(["create", "jsonclean", "--json"], {
       PARACHUTE_HOME: home,
     });

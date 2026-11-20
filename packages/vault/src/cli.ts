@@ -108,7 +108,6 @@ import { VAULT_SCOPES } from "./scopes.ts";
 import { validateVaultName, decideInitVaultName } from "./vault-name.ts";
 import { decideAutostart } from "./autostart.ts";
 import { getVaultStore } from "./vault-store.ts";
-import { seedOnboardingNotesBestEffort } from "./onboarding-seed.ts";
 import {
   defaultMirrorConfig,
   readMirrorConfigForVault,
@@ -1041,8 +1040,9 @@ async function cmdCreate(args: string[]) {
   // even when the server-wide `default_mirror` knob is `internal`. Parity for
   // operators who want one bare vault without flipping the global default.
   const noMirror = args.includes("--no-mirror");
-  // `--bare` (0.9.1, T-414): no welcome or guide notes, no tags — an empty vault for an app that brings its own
-  // types (Taste Arcade's reactions). The guides teach a person and their AI; an app's vault doesn't want them.
+  // `--bare` (0.9.1, T-414): an empty vault. Since T-476 every new vault starts empty (the guides moved to the docs
+  // site and the MCP `docs` tool), so the flag changes nothing; it is still accepted and still reported, so a hub
+  // that asks for it sees it honoured.
   const bare = args.includes("--bare");
 
   // --- Auth opt-in (vault#442). Default = per-user OAuth, NO token minted. ---
@@ -1120,7 +1120,6 @@ async function cmdCreate(args: string[]) {
   const wasFirst = listVaults().length === 0;
   const credential = await createVault(name, {
     ...(noMirror ? { enableMirror: false } : {}),
-    ...(bare ? { seed: false } : {}),
     ...(mintVerb ? { mintVerb } : {}),
   });
 
@@ -4894,11 +4893,6 @@ interface CreateVaultOptions {
    */
   enableMirror?: boolean;
   /**
-   * Seed the welcome and getting-started packs (default true). `--bare` sets it false: the vault starts with no
-   * notes and no tags (0.9.1, T-414).
-   */
-  seed?: boolean;
-  /**
    * Test seam threaded straight into `bootstrapInternalMirror` (default
    * `Bun.which`). Inject a fn returning `null` to exercise the
    * git-not-installed best-effort path without uninstalling git from the
@@ -4953,15 +4947,9 @@ async function createVault(
   // row is written — vault is a pure hub resource-server post-0.5.0.
   const seedStore = getVaultStore(name);
 
-  // Seed the default packs (welcome web + capture tag, Getting Started guide)
-  // so the first minute shows a small living graph and a connected AI can read
-  // the guide and help the operator set the vault up. Surface Starter is NOT
-  // default-seeded — `parachute-vault add-pack surface-starter` adds it later.
-  // Idempotent + best-effort: only writes notes that are absent, and never
-  // fails the create. Runs BEFORE the mirror bootstrap so the seeded content
-  // lands in the initial mirror commit. See src/onboarding-seed.ts +
-  // core/src/seed-packs.ts.
-  if (opts.seed !== false) await seedOnboardingNotesBestEffort(seedStore);
+  // A new vault starts empty (T-476). The welcome and Getting Started notes it used to be seeded with went stale in
+  // every vault; how to do things now lives once, on parachute.computer/docs, and the MCP `docs` tool hands the page
+  // to a connected AI. `add-pack <name>` still adds a pack on purpose.
 
   // Default new vaults to an internal live mirror (local git backup of the
   // markdown projection). Backup-on-by-default; GitHub off-site backup is an
@@ -5269,7 +5257,7 @@ Setup:
 Vaults:
   parachute-vault create <name> [--json] [--no-mirror] [--bare] [--mint [--scope read|write]] [--token <bearer>]
                                            Create a new vault (--json: emit { name, token, paths, set_as_default }).
-                                           --bare: no welcome or guide notes and no tags (an app's vault).
+                                           --bare: accepted; every new vault starts empty.
                                            Default auth is per-user OAuth — NO token is minted; connect with
                                            "claude mcp add --transport http parachute-<name> <endpoint>" and sign in
                                            on first use. --mint opts into a scope-narrow hub JWT for the header-auth /

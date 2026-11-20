@@ -15,9 +15,9 @@ one-command setup; one Bun server (port 1940) hosts many vaults, each its own SQ
 ## Conventions
 
 - Bun for everything (`Bun.serve`, `bun:sqlite`, `Bun.$`, `bun test`). No Node.js.
-- Bare primitives: no default tag schema — clients bring their own. A new vault gets the
-  welcome guides and Getting Started notes plus the `capture` and `guide` tags (no fields), nothing more. Opt-in seed
-  packs live in `core/src/seed-packs.ts` (`add-pack <name>`). External data packs
+- Bare primitives: no default tag schema — clients bring their own. A new vault starts empty (T-476): how to do
+  things lives on parachute.computer/docs, and the MCP `docs` tool (`core/src/docs-tool.ts`) hands a page to a
+  connected AI. Opt-in seed packs live in `core/src/seed-packs.ts` (`add-pack <name>`). External data packs
   use `packs add|list|remove` (see `docs/external-packs.md`); state is in each
   vault's `packs/`, migrated from legacy `modules/`. Connector/views declarations
   are inert hub module data. SQLite data_version invalidates schema/hierarchy

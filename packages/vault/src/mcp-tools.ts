@@ -150,6 +150,7 @@ export async function getServerInstruction(
     attachments: { ticketsEnabled: true, readEnabled: true, ticketTool: "attachment-url" },
     // T-407: this door lists the record tools first, so its brief speaks their words.
     words: recordWords,
+    docs: (() => { const d = docsOrigin(); return d === null ? null : d.origin; })(),
     // 0.9.1 (SPEC §3.4): say what this key can read. No auth (local stdio) is the owner's own process: no line.
     ...(auth
       ? {
@@ -384,10 +385,19 @@ export function generateScopedMcpTools(
         }
       : {}),
     doorTool: (name) => (name === "manage-token" || name === "manage-keys" ? { ...manageTokenReference(vaultName), name } : undefined),
+    docs: docsOrigin(),
   });
   applyOnBehalf(shaped, auth, (by) => generateScopedMcpTools(vaultName, { ...auth!, actor: by, acts_for: null }, callerBearer, req));
 
   return shaped;
+}
+
+/** Where `docs` reads its pages: PARACHUTE_DOCS_URL (an http(s) origin, or `off` for no `docs` tool), else parachute.computer. */
+export function docsOrigin(): { origin?: string } | null {
+  const v = process.env.PARACHUTE_DOCS_URL?.trim();
+  if (!v) return {};
+  if (v === "off") return null;
+  return /^https?:\/\/[^/\s]+\/?$/.test(v) ? { origin: v } : {};
 }
 
 /** The MCP tools whose writes carry the write stamp, by the action that writes (manage-types: only rename does). */
@@ -1295,14 +1305,6 @@ function overrideVaultInfo(
       query_hints: projection.query_hints,
       map: projection.map,
     };
-
-    // A2: surface a pointer (path, not body) to the seeded onboarding guide so
-    // any connected AI is steered to read it first. Present only when the note
-    // exists (buildVaultProjection gates on it). Older vaults without one omit
-    // the field entirely.
-    if (projection.getting_started) {
-      result.getting_started = projection.getting_started;
-    }
 
     if (projection.stats) {
       result.stats = projection.stats;

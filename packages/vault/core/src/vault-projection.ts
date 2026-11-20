@@ -33,23 +33,6 @@ import {
 import { DEFAULT_TAG_NAME } from "./tag-hierarchy.ts";
 import * as noteOps from "./notes.ts";
 import type { VaultStats, VaultMap } from "./types.ts";
-import { GETTING_STARTED_PATH } from "./seed-packs.ts";
-
-/**
- * Does a note live at the seeded onboarding path? Used to gate the "Start here"
- * pointer so it only fires when the guide actually exists (fresh vaults seed it;
- * pre-existing vaults that never seeded one shouldn't dangle a dead pointer).
- */
-function hasGettingStartedNote(db: Database): boolean {
-  try {
-    const row = db
-      .query("SELECT 1 FROM notes WHERE path = ? LIMIT 1")
-      .get(GETTING_STARTED_PATH);
-    return row != null;
-  } catch {
-    return false;
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -93,14 +76,6 @@ export interface VaultProjection {
   tags: ProjectionTag[];
   indexed_fields: ProjectionIndexedField[];
   query_hints: string[];
-  /**
-   * Path of the seeded onboarding guide, when present. A pointer (NOT the note
-   * body) so any connected AI is steered to read `Getting Started` first, every
-   * session — the AI fetches it with `query-notes { id: "<path>" }`. Omitted
-   * when no such note exists (older vaults that never seeded one). See
-   * core/src/onboarding.ts.
-   */
-  getting_started?: string;
   /** Included when the caller requests stats; omitted otherwise. */
   stats?: VaultStats;
   /**
@@ -264,12 +239,6 @@ export function buildVaultProjection(
     map: opts?.countScope ? noteOps.getVaultMap(db, opts.countScope) : noteOps.getVaultMap(db),
   };
 
-  // A2: point any connected AI at the seeded onboarding guide (a path pointer,
-  // never the body). Only when the note actually exists.
-  if (hasGettingStartedNote(db)) {
-    projection.getting_started = GETTING_STARTED_PATH;
-  }
-
   if (opts?.includeStats) {
     projection.stats = opts?.statsScope
       ? noteOps.getVaultStats(db, opts.statsScope)
@@ -400,6 +369,9 @@ export function projectionToMarkdown(args: {
    * (`parachute auth mint-token`). A door without that command (cloud: keys are made in the account) says its own.
    */
   scripting?: string;
+  /** The docs origin the "How to do things" section names (T-476, docs-tool.ts). Omitted: parachute.computer. `null`:
+   *  no section (a door that lists no `docs` tool). */
+  docs?: string | null;
 }): string {
   const { vaultName, description, projection, coordinates } = args;
   const w = args.words ?? ((s: string) => s);
@@ -441,14 +413,14 @@ export function projectionToMarkdown(args: {
     }
   }
 
-  // A2: surface the seeded onboarding guide so a connected AI can discover it
-  // when setting up or orienting. A pointer only — the AI fetches the body on
-  // demand. NOT a mandate to re-read every session; it's a start-here guide.
-  if (projection.getting_started) {
+  // T-476: how to do things in Parachute lives on the docs site (one copy, checked against the code), not in notes
+  // seeded into each vault. The `docs` tool hands the page over; the address is for a client without it.
+  if (args.docs !== null) {
+    const origin = (args.docs ?? "https://parachute.computer").replace(/\/+$/, "");
     lines.push("");
     lines.push(
-      `## Start here\n\nFor setting up or growing this vault, read the **${projection.getting_started}** guide: ` +
-        `\`${w("query-notes")} { id: "${projection.getting_started}" }\`.`,
+      `## How to do things in Parachute\n\nMaking a type, writing records, an applet or a bundle (the home, pins and applets the Parachute app shows): ` +
+        `read the page first. \`docs\` lists the pages; \`docs { topic }\` returns one as markdown (${origin}/llms.txt).`,
     );
   }
 
@@ -556,7 +528,7 @@ export function projectionToMarkdown(args: {
   lines.push("");
   lines.push(
     args.scripting ??
-      `For a script or cron job, mint a key (\`parachute auth mint-token --scope vault:${vaultName}:read --ephemeral\`) and call the REST API at \`<hub-origin>/vault/${vaultName}/api/...\`; guide: https://parachute.computer/scripting/`,
+      `For a script or cron job, mint a key (\`parachute auth mint-token --scope vault:${vaultName}:read --ephemeral\`) and call the REST API at \`<hub-origin>/vault/${vaultName}/api/...\`; guide: https://parachute.computer/docs/build/scripts/`,
   );
 
   return lines.join("\n");

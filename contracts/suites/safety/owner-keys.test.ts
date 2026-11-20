@@ -10,7 +10,7 @@
 //      /account/keys/<name>` revokes one, and the hub refuses it on the very next request (not within 60 s).
 //      A key opens its vault at its level and nothing else: not another vault, not the account door, not a mint.
 //   3. Bare vault: `POST /account/vaults {name, bare: true}` makes a vault with no notes and no tags; without
-//      `bare` the welcome guides are still seeded.
+//      `bare` (since T-476) every new vault starts that way: the guides moved to the docs site and the MCP `docs` tool.
 // Red on 0.9.0 (b4a536e): no NIP-98 on /account/token, no /account/keys, `bare` ignored.
 import { beforeAll, describe, expect, test } from "bun:test";
 import { randomBytes } from "node:crypto";
@@ -215,7 +215,7 @@ describe("safety/owner-keys: bare vault", () => {
     return rest(`${s.hub}/vault/${body.name}`, r.body.vault_token);
   }
 
-  test("bare: true makes a vault with no notes and no tags; without it the guides are seeded", async () => {
+  test("a new vault has no notes and no tags, bare or not (T-476: the guides are the docs site and the docs tool)", async () => {
     const bare = await created({ name: `bare${id()}`, bare: true });
     const notes = await bare.get("/notes?limit=50");
     expect(notes.status).toBe(200);
@@ -224,8 +224,8 @@ describe("safety/owner-keys: bare vault", () => {
     expect(tags.status).toBe(200);
     expect(Array.isArray(tags.body) ? tags.body : tags.body?.tags ?? []).toEqual([]);
 
-    const seeded = await created({ name: `seed${id()}` });
-    expect((await seeded.get("/notes?limit=50")).body.length).toBeGreaterThan(0);
+    const plain = await created({ name: `seed${id()}` });
+    expect((await plain.get("/notes?limit=50")).body).toEqual([]);
   });
 
   test("bare must be a boolean", async () => {
