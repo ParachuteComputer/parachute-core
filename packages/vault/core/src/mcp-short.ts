@@ -58,7 +58,7 @@ export const SHORT_TOOLS: Record<string, ShortTool> = {
   "query-notes": {
     description: `Read notes: one note, a filtered list, a search, a link neighbourhood or path, counts, or a note's history.
 - One note: \`id\` (id, path or title). Lists leave content out unless \`include_content: true\`.
-- Filters combine (AND). \`tag\` also matches subtypes (\`event\` finds \`event/meeting\`). \`metadata\` operators work on any field: an indexed one (vault-info lists them) is fastest, any other is read in full and the reply warns \`scan\`.
+- Filters combine (AND). \`tag\` also matches subtypes (by \`parent_names\`; a \`/\` in a name only files it). \`metadata\` operators work on any field: an indexed one (vault-info lists them) is fastest, any other is read in full and the reply warns \`scan\`.
 - Returns an array of notes, or \`{notes, next_cursor?, warnings?}\` with \`cursor\` or warnings, or \`[{group, value}]\` with \`aggregate\`.
 - ${HYBRID_TEXT.line}
 Rarer filters (has_links, order_by, expand_links, created_by, …) are accepted too. ${HELP("query-notes")}`,

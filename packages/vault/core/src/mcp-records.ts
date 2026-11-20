@@ -279,7 +279,7 @@ const HELP = (tool: string) => `Every parameter: vault-info {help: "${tool}"}.`;
 export const RECORD_DESCRIPTIONS: Readonly<Record<string, string>> = {
   "query-records": `Read records: one record, a filtered list, a search, a link neighbourhood or path, counts, or a record's history.
 - One record: \`id\` (id, path or title). Lists leave the ${BODY} out unless \`include_${BODY}: true\`.
-- Filters combine (AND). \`type\` matches a type and its subtypes (\`event\` finds \`event/meeting\`); \`tag\` matches a label. \`${FIELDS}\` operators work on any field: an indexed one (vault-info lists them) is fastest, any other is read in full and the reply warns \`scan\`.
+- Filters combine (AND). \`type\` matches a type and its subtypes (by \`parent_names\`; a \`/\` in a name only files it); \`tag\` matches a label. \`${FIELDS}\` operators work on any field: an indexed one (vault-info lists them) is fastest, any other is read in full and the reply warns \`scan\`.
 - Each record has \`types\` (what it is), \`tags\` (labels), \`${FIELDS}\` and a \`${BODY}\`.
 - Returns an array of records, or \`{records, next_cursor?, warnings?}\` with \`cursor\` or warnings, or \`[{group, value}]\` with \`aggregate\`. An empty page means done.
 - ${HYBRID_TEXT.line}
