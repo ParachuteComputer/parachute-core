@@ -175,9 +175,13 @@ describe("mcp/old-params", () => {
       "create-record": WRITE_TOOLS["create-note"]!,
       "update-record": WRITE_TOOLS["update-note"]!,
     };
+    // T-476: create's `extension` is listed again (changes-0.9.json says why); the others stay out.
+    const listedAgain: Record<string, string[]> = { "create-note": ["extension"], "create-record": ["extension"] };
     for (const [tool, params] of [...Object.entries(WRITE_TOOLS), ...Object.entries(also)]) {
       const help = await c.call("vault-info", { help: tool });
-      const wanted = params;
+      expect(Object.keys(help.parameters.properties)).toEqual(expect.arrayContaining(params));
+      for (const p of listedAgain[tool] ?? []) expect(listed[tool]).toContain(p);
+      const wanted = params.filter((p) => !(listedAgain[tool] ?? []).includes(p));
       expect(Object.keys(help.parameters.properties)).toEqual(expect.arrayContaining(wanted));
       // If one comes back into the short list, its row of changes-0.9.json is out of date: update both.
       expect(listed[tool]).toBeDefined();

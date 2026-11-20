@@ -795,7 +795,7 @@
    "old": "create-note {extension, summary} (parameters listed in tools/list)",
    "new": "the same parameters on create-note and create-record: extension (the file type: csv, yaml, json…) and, on a batch, summary: true for {created, ids, failed} in place of the notes",
    "action": "keep",
-   "reason": "0.8 listed both on create-note; 0.9 honours both on create-note and create-record (contracts/suites/mcp/old-params.test.ts). 0.9's short tool list leaves them out, on both names (the description budget); vault-info {help} lists them",
+   "reason": "0.8 listed both on create-note; 0.9 honours both on create-note and create-record (contracts/suites/mcp/old-params.test.ts). 0.9's short tool list leaves summary out, on both names (the description budget), and lists extension again since T-476: a model writing an applet, not seeing it, put it in fields and the code saved as markdown; vault-info {help} lists both",
    "since": "0.9",
    "removed_in": null,
    "state": "live"
