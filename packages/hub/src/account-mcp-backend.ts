@@ -324,10 +324,12 @@ async function listVaultToolsUncached(ctx: AccountToolContext): Promise<readonly
         )
         .filter((t) => !HUB_NATIVE_TOOL_NAMES.has(t.name))
         // T-476: this door is the address an AI gets, so it lists what the vault lists at that level, manage-types to
-        // a write key included (core #134). The note-named aliases are left out of the list when their record-named
-        // tool is in it (they still answer, `answersAsAlias`): that keeps the writer's list in its 4,000-token budget
-        // (contracts door/multivault).
+        // a write key included (core #134). For a Bearer connection (a key, an app's OAuth grant) the note-named
+        // aliases are left out of the list when their record-named tool is in it (they still answer,
+        // `answersAsAlias`): that keeps the writer's list in its 4,000-token budget (contracts door/multivault).
+        // A NIP-98 caller (Uni's agents, built on the note names: contracts compat/uni) keeps them listed.
         .filter((t, _i, all) => {
+          if (ctx.principal.authKind !== "bearer") return true;
           const record = NOTE_TOOL_ALIASES[t.name];
           return record === undefined || !all.some((o) => o?.name === record);
         })

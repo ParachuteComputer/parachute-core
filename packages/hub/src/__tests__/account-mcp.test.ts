@@ -1288,7 +1288,8 @@ describe("account MCP — create-note", () => {
         (await listed.json()) as { result: { tools: Array<{ name: string }> } }
       ).result.tools.map((t) => t.name);
       expect(names).toContain("list-vaults");
-      expect(names).toContain("query-records");
+      // NIP-98 (Uni's agents) keeps the note-named tools listed (T-476, contracts compat/uni)
+      expect(names).toContain("query-notes");
       expect(names).not.toContain("create-note");
       expect(names).not.toContain("update-note");
       expect(names).not.toContain("grant-access");
