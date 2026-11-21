@@ -112,7 +112,7 @@ const REDIRECT = "https://their-parachute.example/oauth/callback";
  * A person's own Parachute signing in to the vault, as the app does: the hub's key door with their key, then OAuth (the
  * consent page's Approve when it shows). `{status, token}`: the access token, or null and the step's status.
  */
-async function theirToken(secret: string): Promise<{ status: number; token: string | null; step?: string }> {
+async function theirToken(secret: string, scope = `vault:${d.vault}:read vault:${d.vault}:write`): Promise<{ status: number; token: string | null; step?: string }> {
   const { schnorr } = await import("@noble/curves/secp256k1.js");
   const sk = Buffer.from(secret, "hex");
   const pubkey = Buffer.from(schnorr.getPublicKey(sk)).toString("hex");
@@ -131,7 +131,7 @@ async function theirToken(secret: string): Promise<{ status: number; token: stri
   if (registered.status !== 201) return { status: registered.status, token: null, step: `register ${JSON.stringify(reg).slice(0, 200)}` };
   const verifier = randomBytes(32).toString("base64url");
   const params = { client_id: reg.client_id, redirect_uri: REDIRECT, response_type: "code", code_challenge: createHash("sha256").update(verifier).digest("base64url"),
-    code_challenge_method: "S256", scope: `vault:${d.vault}:read vault:${d.vault}:write`, state: randomBytes(8).toString("hex") };
+    code_challenge_method: "S256", scope, state: randomBytes(8).toString("hex") };
   const auth = await safeFetch(`${d.issuer}/oauth/authorize?${new URLSearchParams(params)}`, { redirect: "manual", headers: { cookie: `parachute_hub_session=${session}` } });
   let location = auth.headers.get("location");
   if (auth.status !== 302) {
@@ -175,20 +175,46 @@ describe.skipIf(lacks("share-a-vault") || lacks("typed-keys") || !d.ownerKey)("a
     const rows = list.body.grants as { id: string; kind: string; by: string; name: string; grantee: string | null; state: string; types: Record<string, string[]> }[];
     const hers = rows.filter((r) => r.grantee === pubkey || r.name === "Dee" || (r as { app?: string | null }).app === "Dee's notes app");
     expect(hers).toHaveLength(1);
-    expect(hers[0]).toMatchObject({ id: pubkey, kind: "person", by: "self", name: "Dee", grantee: pubkey, state: "in_force", origin: "door" });
+    expect(hers[0]).toMatchObject({ id: `person:${pubkey}`, kind: "person", by: "self", name: "Dee", grantee: pubkey, state: "in_force", origin: "door" });
     expect(hers[0]!.types).toEqual({ "*": ["read", "create", "update", "delete"] });
-    expect(rows.filter((r) => r.kind === "person" && r.by === "self").map((r) => r.id)).toContain(pubkey);
+    expect(rows.filter((r) => r.kind === "person" && r.by === "self").map((r) => r.id)).toContain(`person:${pubkey}`);
 
     // ended in the list: her held credential is refused, she is no member, and she can't sign in to it again
-    const ended = await statements("DELETE", pubkey);
+    const ended = await statements("DELETE", `person:${pubkey}`);
     expect(ended.status, JSON.stringify(ended.body)).toBe(200);
-    expect(ended.body).toMatchObject({ id: pubkey, state: "revoked" });
+    expect(ended.body).toMatchObject({ id: `person:${pubkey}`, state: "revoked" });
     expect(await read()).toBe(401);
     expect(((await tool(owner, "list-access", { vault: d.vault })).body.access as { pubkey: string }[]).map((r) => r.pubkey)).not.toContain(pubkey);
     expect(await reaches(dee)).not.toContain(d.vault);
     expect((await theirToken(dee)).token).toBeNull();
-    expect(((await statements("GET")).body.grants as { id: string }[]).map((r) => r.id)).not.toContain(pubkey);
+    expect(((await statements("GET")).body.grants as { id: string }[]).map((r) => r.id)).not.toContain(`person:${pubkey}`);
     // ending her again finds nothing
-    expect((await statements("DELETE", pubkey)).status).toBe(404);
+    expect((await statements("DELETE", `person:${pubkey}`)).status).toBe(404);
+  });
+
+  test("a key a person made is a row of its own, naming them: their sign-ins fold, what they made doesn't", async () => {
+    // Wes runs the vault with its owner (`write`): he may make keys for it, which the owner must see and can end
+    const wes = newKey();
+    const { schnorr } = await import("@noble/curves/secp256k1.js");
+    const pub = Buffer.from(schnorr.getPublicKey(Buffer.from(wes, "hex"))).toString("hex");
+    expect((await tool(d.ownerKey!, "grant-access", { pubkey: pub, vault: d.vault, role: "write" })).ok).toBe(true);
+    const admin = await theirToken(wes, `vault:${d.vault}:read vault:${d.vault}:write vault:${d.vault}:admin`);
+    expect(admin.token, `his admin sign-in: ${admin.status} ${admin.step}`).toBeString();
+    const name = `wes-backup-${randomBytes(3).toString("hex")}`;
+    const made = await safeFetch(`${d.issuer}/account/keys`, { method: "POST", headers: { authorization: `Bearer ${admin.token}`, "content-type": "application/json" },
+      body: JSON.stringify({ name, vault: d.vault, can: "export" }) });
+    expect(made.status, await made.clone().text()).toBe(201);
+    const rows = (await statements("GET")).body.grants as { id: string; kind: string; export?: boolean; person?: { id: string | null; name: string } }[];
+    const his = rows.find((r) => r.id === `person:${pub}`);
+    expect(his?.kind).toBe("person");
+    const key = rows.find((r) => r.id === name);
+    expect(key, "the key he made is listed").toBeDefined();
+    expect(key).toMatchObject({ export: true, person: { id: `person:${pub}` } });
+    // his own sign-in (the admin one he made it with) is in his row, not beside it
+    expect(rows.filter((r) => r.person?.id === `person:${pub}`).map((r) => r.id)).toEqual([name]);
+    // ending him ends what he made too
+    expect((await statements("DELETE", `person:${pub}`)).status).toBe(200);
+    const after = ((await statements("GET")).body.grants as { id: string; state: string }[]).find((r) => r.id === name);
+    expect(after?.state).not.toBe("in_force");
   });
 });

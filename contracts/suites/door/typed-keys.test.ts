@@ -363,6 +363,12 @@ describe.skipIf(without)("who reaches the vault, and ending it", () => {
     // its token's write stamp names its kind, so a vault's history can say an AI wrote it
     const claim = JSON.parse(Buffer.from(String(made.body.token).split(".")[1]!, "base64url").toString());
     expect(claim.key).toEqual({ name: ai, kind: "agent" });
+    // a key for several vaults (the account door's) says so too
+    const multi = `door-ai-multi-${runId("k")}`;
+    const several = await account("POST", "/account/keys", { name: multi, vaults: { [door().vault]: "read", [door().otherVault]: "read" }, kind: "agent" });
+    expect(several.status, several.text.slice(0, 200)).toBe(201);
+    expect(several.body.kind).toBe("agent");
+    expect(((await list()).body.grants as { id: string; kind: string }[]).find((r) => r.id === multi)?.kind).toBe("agent");
     // anything else is refused, never read as an app
     expect((await account("POST", "/account/keys", { name: `door-x-${runId("k")}`, vault: door().vault, can: "read", kind: "person" })).status).toBe(400);
   });
