@@ -1258,6 +1258,8 @@ function accountWideRiskNote(scope: string, risk: "low" | "elevated" | "high"): 
   if (risk === "high") {
     return `<span class="scope-risk-note"><strong>Account-wide.</strong> This is not limited to one vault, and tokens this app creates keep working even after you disconnect it.</span>`;
   }
+  // T-476: the account door's ask is narrowed on the page itself (All your vaults, or only these), so the page says it
+  if (scope === "account:vaults" || scope === "account:self:vaults") return "";
   if (risk === "elevated" && scope.startsWith("account:")) {
     return `<span class="scope-risk-note"><strong>Account-wide.</strong> This is not limited to one vault — it reaches every vault in this account, including ones created later.</span>`;
   }

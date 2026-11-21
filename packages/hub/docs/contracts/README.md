@@ -11,6 +11,7 @@ Contract docs the hub enforces. These moved here verbatim from `parachute-patter
 | [`hub-as-issuer.md`](./hub-as-issuer.md) | The single-OAuth-issuer rule: the hub origin is the ecosystem's one issuer; modules advertise it and validate its tokens. |
 | [`oauth-scopes.md`](./oauth-scopes.md) | Scope-string grammar and the scope registry: whitespace-separated `service:verb`-shaped scopes on every Parachute token. |
 | [`oauth-dcr-approval.md`](./oauth-dcr-approval.md) | The Dynamic Client Registration approval lifecycle: every DCR client is pending until an operator approves it. |
+| [`one-address.md`](./one-address.md) | One address for an AI, `<hub>/mcp`: discovery leads to the account door, the page's All your vaults / Only these vaults, what stays one-vault (T-476; proposed, needs sign-off). |
 | [`nip98-http-auth.md`](./nip98-http-auth.md) | NIP-98 HTTP auth (`Authorization: Nostr <base64 event>`) on the root `/mcp` door: the kind-27235 event, the `u` / `method` / `payload` tag rules, replay burn, and the key-scoped tool catalog. |
 | [`hub-module-boundary.md`](./hub-module-boundary.md) | The ownership charter: hub = substrate (identity, issuance, transport, supervision), modules = domain; the seam is module surfaces driving hub identity APIs. |
 | [`design-system.md`](./design-system.md) | The Parachute design system: brand mark, palette, type stack, verb + state vocabulary for every Parachute surface. |

@@ -10493,7 +10493,7 @@ describe("RFC 8707 resource binding — vault-bound MCP (fix #461)", () => {
         expect(res.status).toBe(200);
         const html = await res.text();
         expect(html).toContain("account:vaults");
-        expect(html).toContain("Let this app see which vaults you have");
+        expect(html).toContain("Let this app see your vaults");
         expect(html).not.toContain("Pick a vault");
         expect(html).not.toContain("scribe:");
       } finally {
