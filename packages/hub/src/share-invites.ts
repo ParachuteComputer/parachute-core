@@ -168,14 +168,19 @@ export function openInvites(
   vault: string,
   now: Date = new Date(),
 ): { id: string; name: string; expires_at: string }[] {
-  return db
-    .query<ShareRow, [string, string]>(
-      `SELECT * FROM share_invites
+  return (
+    db
+      .query<ShareRow, [string, string]>(
+        `SELECT * FROM share_invites
        WHERE vault_name = ? AND used_at IS NULL AND revoked_at IS NULL AND expires_at > ?
        ORDER BY created_at ASC`,
-    )
-    .all(vault, now.toISOString())
-    .map((r) => ({ id: r.id, name: r.invitee_name, expires_at: r.expires_at }));
+      )
+      .all(vault, now.toISOString())
+      // one whose maker can no longer run the vault opens nothing (openShareInvite), so it isn't listed as open; it would
+      // open again if their role came back
+      .filter((r) => runsVault(db, r.created_by, r.vault_name))
+      .map((r) => ({ id: r.id, name: r.invitee_name, expires_at: r.expires_at }))
+  );
 }
 
 /** A person's name on one vault: the name the invite they accepted gave them there, else their name on this hub. */
@@ -322,18 +327,6 @@ export function removeShareInvitesForVault(db: Database, vault: string): number 
   return db.prepare("DELETE FROM share_invites WHERE vault_name = ?").run(vault).changes;
 }
 
-/** Every person of `vault`: its hub owners, everyone with a role there, everyone who ever accepted an invite to it. */
-function peopleOf(db: Database, vault: string): string[] {
-  const rows = db
-    .query<{ id: string }, [string, string]>(
-      `SELECT id FROM users WHERE hub_role = 'admin'
-       UNION SELECT user_id AS id FROM user_vaults WHERE vault_name = ?
-       UNION SELECT redeemed_user_id AS id FROM share_invites WHERE vault_name = ? AND redeemed_user_id IS NOT NULL`,
-    )
-    .all(vault, vault);
-  return rows.map((r) => r.id).slice(0, NAMES_MAX);
-}
-
 /** Does this hub user reach `vault` (owner, or any role there)? */
 export function reachesVault(db: Database, userId: string, vault: string): boolean {
   const caller = {
@@ -346,7 +339,7 @@ export function reachesVault(db: Database, userId: string, vault: string): boole
 }
 
 /**
- * `names`: the name for each `by` stamp asked about (none asked: every person), among the people of `vault` (its owners and members, and anyone
+ * `names`: the name for each `by` stamp asked about, among the people of `vault` (its owners and members, and anyone
  * who ever accepted an invite to it, so an ended member's old writes keep their name), with `you` on the caller's own.
  * A stamp that isn't such a person is left out. Keys, roles and invites are never here: they are the owner's.
  */
@@ -357,7 +350,7 @@ export function namesFor(
   stamps: readonly string[],
 ): Record<string, { name: string | null; you: boolean }> {
   const out: Record<string, { name: string | null; you: boolean }> = {};
-  for (const by of [...new Set(stamps.length ? stamps : peopleOf(db, vault))].slice(0, NAMES_MAX)) {
+  for (const by of [...new Set(stamps)].slice(0, NAMES_MAX)) {
     if (!/^[A-Za-z0-9-]{1,64}$/.test(by)) continue;
     const exists = db.query<{ id: string }, [string]>("SELECT id FROM users WHERE id = ?").get(by);
     if (!exists) continue;

@@ -445,6 +445,7 @@ describe("what the review found (round 1)", () => {
     ).toMatchObject({ revoked: true });
     expect((await friendCall("look", made.body.code)).status).toBe(404);
     expect((await friendCall("accept", made.body.code, STRANGER)).status).toBe(404);
+    expect((await tool(AARON, "list-access", { vault: "recipes" })).body.invites).toEqual([]);
     expect(userOf(STRANGER.pubkey)).toBeNull();
   });
 
@@ -540,28 +541,21 @@ describe("names", () => {
     expect((await names(await vaultToken(outsider), [ownerId])).status).toBe(401);
   });
 
-  test("the names route is exactly /account/vaults/<v>/names: a vault named names keeps its own routes, and a bad escape is a 404", async () => {
-    const bad = await fetchHub(new Request(`${ORIGIN}/account/vaults/%E0/names`, { headers: { authorization: `Bearer ${await vaultToken(ownerId)}` } }));
-    expect(bad.status).toBe(404);
-    // /account/vaults/names is the vault "names" itself, not the names read: without a credential, the account door's 401
-    const names_ = await fetchHub(new Request(`${ORIGIN}/account/vaults/names`, { method: "DELETE" }));
-    expect(names_.status).not.toBe(404);
+  test("asked for no stamp, names names no one", async () => {
+    expect((await names(await vaultToken(ownerId), [])).body.names).toEqual({});
   });
 
-  test("asked for no stamp, names answers every person of the vault, an ended member too, and no one else", async () => {
-    const inv = await invite();
-    await friendCall("accept", inv.code, BO);
-    const bo = userOf(BO.pubkey)!;
-    await tool(AARON, "revoke-access", { pubkey: BO.pubkey, vault: "recipes" });
-    await createUser(db, "cy", "correct-horse-battery-staple", {
-      allowMulti: true,
-      passwordChanged: true,
-      assignedVaults: ["journal"],
-    });
-    const all = await names(await vaultToken(ownerId), []);
-    expect(all.body.names).toEqual({
-      [ownerId]: { name: "Aaron", you: true },
-      [bo]: { name: "Bo", you: false },
-    });
+  test("the names route is exactly /account/vaults/<v>/names: a vault named names keeps its own routes, and a bad escape is a 404", async () => {
+    const bad = await fetchHub(
+      new Request(`${ORIGIN}/account/vaults/%E0/names`, {
+        headers: { authorization: `Bearer ${await vaultToken(ownerId)}` },
+      }),
+    );
+    expect(bad.status).toBe(404);
+    // /account/vaults/names is the vault "names" itself, not the names read: without a credential, the account door's 401
+    const names_ = await fetchHub(
+      new Request(`${ORIGIN}/account/vaults/names`, { method: "DELETE" }),
+    );
+    expect(names_.status).not.toBe(404);
   });
 });
