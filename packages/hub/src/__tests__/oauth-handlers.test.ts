@@ -12843,6 +12843,26 @@ describe("consent as a browser submits it: what is unticked is not granted (T-47
   test("SECURITY: account-wide admin starts unticked; Approve without ticking it is a denial, not a grant", async () => {
     expect(await consent("account:self:admin", [])).toEqual({ denied: "access_denied" });
   });
+  test("a friend's unnamed ask and its named twin share one box on the real page, which posts both", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      await createUser(db, "owner", "pw");
+      const friend = await createUser(db, "friend", "pw", { allowMulti: true });
+      setUserVaults(db, friend.id, ["work"]);
+      const session = createSession(db, { userId: friend.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"], status: "approved" });
+      const page = handleAuthorizeGet(
+        db,
+        new Request(authorizeUrl({ client_id: reg.client.clientId, redirect_uri: "https://app.example/cb", response_type: "code", scope: "vault:work:read vault:read", code_challenge: makePkce().challenge, code_challenge_method: "S256" }), { headers: { cookie: cookie(session.id) } }),
+        deps,
+      );
+      const html = await page.text();
+      expect([...html.matchAll(/name="granted_scope"/g)].length).toBe(1);
+      expect(html).toContain('name="granted_scope" value="vault:work:read vault:read"');
+    } finally {
+      cleanup();
+    }
+  });
   test("SECURITY: everything unticked is a denial, never everything granted", async () => {
     expect(await consent("vault:work:read vault:work:write", ["vault:work:read", "vault:work:write"], MCP)).toEqual({ denied: "access_denied" });
   });

@@ -4037,16 +4037,12 @@ function consentProps(
   // do not substitute unnamed rows as `vault:<that-vault>:<verb>` or the
   // consent screen would lie about what Approve mints. Multi-vault already
   // used the `<TBD>` placeholder; single-vault admin now does too.
-  // Keep the first wire value for each display-normalized scope. Resource
-  // narrowing can produce the same named value from distinct requested forms,
-  // and the consent page should offer one row/checkbox for that permission.
-  const seenScopeKeys = new Set<string>();
-  const scopes = requestedScopes.filter((scope) => {
-    const key = canonicalConsentScope(scope, displayVault);
-    if (seenScopeKeys.has(key)) return false;
-    seenScopeKeys.add(key);
-    return true;
-  });
+  // Every requested wire form goes to the page: `renderConsent` draws one row per
+  // display-normalized scope, and its one checkbox posts all the forms it stands
+  // for (resource narrowing can give the same named value from distinct asks).
+  // Keeping only the first here would drop the others, and with them the vault
+  // picked for an unnamed one, once the boxes post (T-476).
+  const scopes = requestedScopes;
   return {
     params,
     clientId: client.clientId,

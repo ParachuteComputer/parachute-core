@@ -1151,8 +1151,10 @@ function renderScopeRow(scope: string, displayScope: string = scope, interactive
   const preChecked = risk === "high" ? "" : " checked";
   // Read-only where nothing is chosen here (the approve-client page: scopes are chosen at the consent after it).
   const box = interactive ? `<input type="checkbox" name="granted_scope" value="${escapeHtml(scope)}"${preChecked} />` : "";
+  // a row that chooses nothing isn't a label: no pointer, nothing to click
+  const tag = interactive ? "label" : "div";
   return `<li class="${cls}">
-      <label class="scope-choice">
+      <${tag} class="scope-choice${interactive ? "" : " scope-read-only"}">
         ${box}
         <span class="scope-choice-body">
           <span class="scope-head">
@@ -1163,7 +1165,7 @@ function renderScopeRow(scope: string, displayScope: string = scope, interactive
           ${riskNote}
           ${pendingNote}
         </span>
-      </label>
+      </${tag}>
     </li>`;
 }
 
@@ -1586,6 +1588,7 @@ const STYLES = `
     cursor: pointer;
   }
   .scope-choice input { margin-top: 0.3rem; flex: none; }
+  .scope-choice.scope-read-only { cursor: default; }
   .scope-choice-body { display: block; }
 
   .extras {
