@@ -5,13 +5,16 @@
  * `/api/types…` as `/api/tags…`), with its words moved by the same translator the record tools use
  * (mcp-records.ts: `paramsIn` in, `resultOut` out). So a record has one shape on both doors: `body`, `fields`,
  * `records` for a batch, `record_id` for a pointer, `types` beside `tags` (plain labels only). Auth, scopes, caps
- * and write gates are the twin's, unchanged: this is a rename at the edge of a request, never a second handler.
+ * and write gates are the twin's: this is a rename at the edge of a request, never a second handler. One exception, in
+ * routing.ts: `PUT /api/types/:name` lets write define a new type, or add fields to its own (write-defines-types.md),
+ * where its twin `PUT /api/tags/:name` stays admin.
  *
  *   /api/records[/<id or path>[/<sub>]]   → /api/notes…   (list, get, create, patch, delete, batch, versions,
  *                                                          restore, attachments, everything under the prefix)
  *   ?include_body / ?include_fields       → ?include_content / ?include_metadata (and body_offset/body_length)
  *   ?type=<name>                          query-records `type`: the runtime folds it (tag-kind.ts foldTypeFilter)
- *   /api/types[/<name>]                   → /api/tags…    (rows say their `kind`, as list-types; writes need admin)
+ *   /api/types[/<name>]                   → /api/tags…    (rows say their `kind`, as list-types; writes need admin,
+ *                                                          but PUT may define a new type with write: routing.ts)
  *
  * A body that names an old word beside its new one (`content` with `body`) is refused, nothing written; the
  * runtime answers the refusal after auth, as any other bad request. Every `/api/notes` answer says it is leaving

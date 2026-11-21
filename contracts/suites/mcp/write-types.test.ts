@@ -115,7 +115,7 @@ describe("mcp/write-types: write access may add a new type", () => {
     await c.close();
   });
 
-  test("over REST, defining a type stays admin (Prism's compat suite pins a write pass's 403)", async () => {
+  test("over REST, PUT /api/tags/:name stays admin (Prism's compat suite pins a write pass's 403; /api/types: compat/types-write-rest)", async () => {
     const w = rest(services().vaultViaHub, await pass({ level: "write" }));
     expect((await w.put(`/tags/${enc(runId("mine"))}`, { fields: { [field()]: { type: "string" } } })).status).toBe(403);
   });
