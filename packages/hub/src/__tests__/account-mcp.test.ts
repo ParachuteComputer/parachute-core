@@ -1593,6 +1593,8 @@ describe("account MCP — vault module proxy", () => {
         "grant-access",
         "revoke-access",
         "list-access",
+        "invite-to-vault",
+        "take-back-invite",
       ]);
     } finally {
       h.cleanup();

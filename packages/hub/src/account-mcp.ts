@@ -45,6 +45,7 @@ import {
 import type { SignAccessTokenOpts } from "./jwt-sign.ts";
 import { keyLevelOnVault, levelSatisfies } from "./key-level.ts";
 import type { KeyClaim } from "./keys.ts";
+import { inviteToVault, nameOnVault, openInvites, takeBackInvite } from "./share-invites.ts";
 import { getUserById, isHubAdmin, vaultVerbsForUserVault } from "./users.ts";
 
 /** Hub account sentinel — account ≡ box. */
@@ -457,12 +458,69 @@ const listAccessTool: AccountMcpTool = {
   },
   async execute(args, ctx) {
     try {
-      return listAccess(ctx.db, ctx.principal, args, installedNameSet(ctx));
+      const { access } = listAccess(ctx.db, ctx.principal, args, installedNameSet(ctx));
+      // each person's name on that vault (share-invites.ts), and, for one vault, its open invites
+      const named = access.map((r) => ({ ...r, name: nameOnVault(ctx.db, r.user_id, r.vault) }));
+      const vault = typeof args.vault === "string" && args.vault !== "" ? args.vault : null;
+      return vault ? { access: named, invites: openInvites(ctx.db, vault, ctx.now?.() ?? new Date()) } : { access: named };
     } catch (err) {
       throwGrant(err);
     }
   },
 };
+
+const inviteToVaultTool: AccountMcpTool = {
+  name: "invite-to-vault",
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  description:
+    "Invite someone to one vault, by name. Answers a link that works once, for 7 days: whoever accepts it with their " +
+    "own Nostr key becomes a member of the vault (read and write, never admin), named as you named them. The code " +
+    "in the link is shown only now. `from` is your own name, as the people you invite will see it.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      vault: { type: "string", description: "Installed vault name." },
+      name: { type: "string", description: "Who the invite is for, as you'd call them (1 to 40 characters)." },
+      from: { type: "string", description: "Your own name, as they will see it (kept for next time)." },
+    },
+    required: ["vault", "name"],
+    additionalProperties: false,
+  },
+  async execute(args, ctx) {
+    try {
+      const now = ctx.now ?? (() => new Date());
+      return inviteToVault(ctx.db, { ...ctx.principal, via: "mcp" }, args, installedNameSet(ctx), ctx.issuer, now);
+    } catch (err) {
+      throwGrant(err);
+    }
+  },
+};
+
+const takeBackInviteTool: AccountMcpTool = {
+  name: "take-back-invite",
+  annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+  description: "Take back an invite to a vault nobody has accepted yet (its id is in list-access's `invites`).",
+  inputSchema: {
+    type: "object",
+    properties: {
+      vault: { type: "string", description: "Installed vault name." },
+      id: { type: "string", description: "The invite's id." },
+    },
+    required: ["vault", "id"],
+    additionalProperties: false,
+  },
+  async execute(args, ctx) {
+    try {
+      const now = ctx.now ?? (() => new Date());
+      return takeBackInvite(ctx.db, { ...ctx.principal, via: "mcp" }, args, installedNameSet(ctx), now);
+    } catch (err) {
+      throwGrant(err);
+    }
+  },
+};
+
+/** The tools only a connection that can admin some vault sees. */
+const ADMIN_TOOLS: ReadonlySet<string> = new Set(["grant-access", "revoke-access", "list-access", "invite-to-vault", "take-back-invite"]);
 
 /** Hub-native catalog. Vault-shaped tools come from a live module `tools/list`. */
 export const ACCOUNT_MCP_TOOLS: readonly AccountMcpTool[] = [
@@ -471,6 +529,8 @@ export const ACCOUNT_MCP_TOOLS: readonly AccountMcpTool[] = [
   grantAccessTool,
   revokeAccessTool,
   listAccessTool,
+  inviteToVaultTool,
+  takeBackInviteTool,
 ];
 
 /** Hub-native names win on collision with a module backend. */
@@ -490,7 +550,7 @@ export function toolsForPrincipal(ctx: AccountToolContext): readonly AccountMcpT
   const create = canCreate(ctx.principal);
   return ACCOUNT_MCP_TOOLS.filter((t) => {
     if (t.name === "create-vault") return create;
-    if (t.name === "grant-access" || t.name === "revoke-access" || t.name === "list-access") {
+    if (ADMIN_TOOLS.has(t.name)) {
       return canAdmin;
     }
     return true;

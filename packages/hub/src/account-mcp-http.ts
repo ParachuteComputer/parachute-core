@@ -377,7 +377,7 @@ function instructions(): string {
   return (
     "The Parachute hub account MCP — one connection across the vaults this key or token can use. " +
     "Hub-native: list-vaults, create-vault (owner / account write), grant-access / revoke-access / " +
-    "list-access (if you can admin a vault). Everything else is the vault MCP catalog, live-listed, " +
+    "list-access / invite-to-vault / take-back-invite (if you can admin a vault). Everything else is the vault MCP catalog, live-listed, " +
     "with a `vault` selector injected (omit on query-records to fan out; required on every other vault tool). " +
     "The vault-shaped catalog is a union of what SOME covered vault supports at the highest verb this " +
     "connection holds — a listed tool may be Unknown against a different vault where this connection " +
