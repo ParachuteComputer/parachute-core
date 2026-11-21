@@ -128,6 +128,9 @@ describe.skipIf(!is091 || lacks("multi-vault-door"))("one multi-vault door", () 
         const vault = (await viaVault.tools()).map((t) => t.name);
         const wanted = [...new Set(vault.map((n) => OLD[n] ?? n))].sort();
         expect(wanted.filter((n) => !account.includes(n)), `${level}: tools the vault door lists and the account door doesn't`).toEqual([]);
+        // …and nothing more of the vault's: the account door's own tools (list-vaults, create-vault, grant tools) aside
+        const own = new Set(["list-vaults", "create-vault", "grant-access", "revoke-access", "list-access"]);
+        expect(account.filter((n) => !own.has(n) && !wanted.includes(n)), `${level}: tools the account door lists beyond the vault door's`).toEqual([]);
         for (const old of Object.keys(OLD)) expect(account, `${level}: ${old} is left out of the list`).not.toContain(old);
         // An old name still answers (a read, so at every level).
         const old = await viaAccount.call("query-notes", { vault: read, limit: 1 });
