@@ -337,8 +337,13 @@ async function mintAppKey(req: Request, deps: AccountKeysDeps): Promise<Response
       return err(filed?.status === 409 ? 409 : 502, filed?.status === 409 ? "name_taken" : "vault_unavailable", `the vault didn't take the key's grant: ${why}`);
     }
   }
+  // From here on, a mint that doesn't finish ends the grant it filed: no grant stays in force at the vault for a key the
+  // hub never made (its id stays taken there, as any ended grant's)
+  // (only while no key at the hub holds the name: one that won a race for it uses the same grant)
+  const unfiled = async () => { if (types && !deps.db.prepare("SELECT 1 FROM keys WHERE name = ?").get(name)) await endFiledGrant(deps, user.id, vault, name); };
   // Synchronous from here to the insert: bun:sqlite on one thread, so no other mint can take the name in between.
   if (deps.db.prepare("SELECT 1 FROM keys WHERE name = ?").get(name)) {
+    await unfiled();
     return err(409, "name_taken", `a key called "${name}" already exists; pick another`);
   }
   try {
@@ -367,6 +372,7 @@ async function mintAppKey(req: Request, deps: AccountKeysDeps): Promise<Response
       if (types) deps.db.prepare("UPDATE keys SET types = ? WHERE name = ?").run(JSON.stringify(types), name);
     })();
   } catch (e) {
+    await unfiled();
     if (e instanceof TokenMintPrincipalGoneError) return err(409, "conflict", e.message);
     if (e instanceof KeyNameTakenError)
       return err(409, "name_taken", `a key called "${name}" already exists; pick another`);

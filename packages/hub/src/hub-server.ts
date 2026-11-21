@@ -1074,12 +1074,6 @@ function revokedKeyResponse(): Response {
   });
 }
 
-/**
- * The key door around a vault proxy (0.9.1, T-414): refuse a revoked hub token before it reaches the vault, and
- * stamp the key's last use after the vault accepted it. The stamp is awaited so a list right after a write sees it;
- * it costs one indexed read per request, and a signature check at most once a minute per key. Every hub route that forwards a
- * bearer to the vault goes through here: `/vault/<name>/*`, `/vault/admin*` and the root `/mcp`.
- */
 /** CORS for the bearer-only account routes (see where they're routed): any origin, never credentials. */
 const BEARER_ONLY_CORS: Record<string, string> = {
   "access-control-allow-origin": "*",
@@ -1088,6 +1082,12 @@ const BEARER_ONLY_CORS: Record<string, string> = {
   "access-control-max-age": "600",
 };
 
+/**
+ * The key door around a vault proxy (0.9.1, T-414): refuse a revoked hub token before it reaches the vault, and
+ * stamp the key's last use after the vault accepted it. The stamp is awaited so a list right after a write sees it;
+ * it costs one indexed read per request, and a signature check at most once a minute per key. Every hub route that forwards a
+ * bearer to the vault goes through here: `/vault/<name>/*`, `/vault/admin*` and the root `/mcp`.
+ */
 async function throughKeyDoor(
   req: Request,
   getDb: (() => Database) | undefined,

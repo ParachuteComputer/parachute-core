@@ -344,12 +344,17 @@ export class SubscriptionManager {
     // hierarchy and private_tags may have changed since it subscribed). Read
     // once per distinct scope per event.
     const scopes = new Map<string, Set<string> | null>();
+    // each grant read once per event, however many sockets hold it
+    const grants = new Map<string, boolean>();
 
     for (const sub of this.subs) {
       if (sub.closed) continue;
       if (sub.vaultName !== vaultName) continue;
       // under a grant: still in force now (ended some other way, or past its date), or the socket closes
-      if (sub.grant !== null && !grantInForce(store, sub.grant)) { this.remove(sub); continue; }
+      if (sub.grant !== null) {
+        if (!grants.has(sub.grant)) grants.set(sub.grant, grantInForce(store, sub.grant));
+        if (!grants.get(sub.grant)) { this.remove(sub); continue; }
+      }
       if (sub.tagScopeRaw !== null) {
         const key = JSON.stringify(sub.tagScopeRaw);
         if (!scopes.has(key)) scopes.set(key, expandTokenTagScopeNow(store, sub.tagScopeRaw));
