@@ -245,8 +245,9 @@ describe("consent checkbox posts the WIRE scope, not the display scope", () => {
       displayVault: "unforced",
     });
     expect((html.match(/<li class="scope/g) ?? []).length).toBe(1);
-    // The first wire value is retained for the POST, even though both forms
-    // normalize to the same displayed permission.
-    expect(html).toContain('name="granted_scope" value="vault:unforced:read"');
+    // The one box posts both wire forms (T-476): now that the boxes are inside
+    // the form, a box posting only the first would drop the other, and the
+    // vault picked for the unnamed one would be ignored.
+    expect(html).toContain('name="granted_scope" value="vault:unforced:read vault:read"');
   });
 });

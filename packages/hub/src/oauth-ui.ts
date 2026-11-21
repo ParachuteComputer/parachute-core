@@ -23,6 +23,7 @@
 import { WORDMARK_TEXT, brandMarkSvg } from "./brand.ts";
 import { redirectHome } from "./clients.ts";
 import { renderCsrfHiddenInput } from "./csrf.ts";
+import { isAccountVaultsConnectionScope } from "./grant-generation.ts";
 import { NOSTR_LOGIN_STYLES, renderNostrKeyDoor } from "./nostr-login-ui.ts";
 import { type ScopeExplanation, explainScope, riskForExplanation } from "./scope-explanations.ts";
 
@@ -406,14 +407,20 @@ export function renderConsent(props: ConsentViewProps): string {
   // the operator sees the scope shape that will appear in the token. Raw
   // `scopes` keeps the wire form for the hidden form fields; only what's
   // rendered changes. See `ConsentViewProps.displayVault`.
-  const seenScopeKeys = new Set<string>();
-  const uniqueScopes = scopes.filter((scope) => {
+  // One row per scope as the person reads it; the wire forms that read the same (`vault:work:read` and an unnamed
+  // `vault:read` bound to work) share its checkbox, which posts them all.
+  const scopeGroups = new Map<string, string[]>();
+  for (const scope of scopes) {
     const key = canonicalConsentScope(scope, displayVault);
-    if (seenScopeKeys.has(key)) return false;
-    seenScopeKeys.add(key);
-    return true;
-  });
-  const displayedScopes = uniqueScopes.map((scope) => canonicalConsentScope(scope, displayVault));
+    const group = scopeGroups.get(key);
+    if (group) group.push(scope);
+    else scopeGroups.set(key, [scope]);
+  }
+  const uniqueScopes = [...scopeGroups.values()].map((group) => group.join(" "));
+  const displayedScopes = [...scopeGroups.keys()];
+  // On the account door the vault levels below are the choice; the connection row itself has no box (unticking it
+  // would silently throw the chosen levels away): it is posted as granted, and the levels decide.
+  const levelsDecide = (wire: string) => vaultLevels !== undefined && wire.split(" ").some(isAccountVaultsConnectionScope);
   const scopeRows =
     displayedScopes.length === 0
       ? // A client may legally omit `scope` (RFC 6749 §3.3), and MCP clients
@@ -422,7 +429,13 @@ export function renderConsent(props: ConsentViewProps): string {
         // actually happening and point at the checklist below, which is the
         // only way this flow can produce a useful token.
         `<li class="scope scope-empty">This app didn't ask for any specific access. Choose what to grant below — without a selection its token won't be able to do anything.</li>`
-      : uniqueScopes.map((wire, i) => renderScopeRow(wire, displayedScopes[i] ?? wire)).join("\n");
+      : uniqueScopes
+          .map((wire, i) =>
+            levelsDecide(wire)
+              ? `${renderScopeRow(wire, displayedScopes[i] ?? wire, false)}<input type="hidden" name="granted_scope" value="${escapeHtml(wire)}" />`
+              : renderScopeRow(wire, displayedScopes[i] ?? wire),
+          )
+          .join("\n");
   // 0.9.1 (SPEC §3.4): a vault grant reaches the whole vault at its level, and what the app reads leaves the box.
   const readsVault = displayedScopes.some((sc) => sc.startsWith("vault:"));
   const extrasSection = renderGrantableExtras(grantableExtras ?? [], displayedScopes.length === 0);
@@ -519,12 +532,16 @@ export function renderConsent(props: ConsentViewProps): string {
       </div>
       ${staleBanner}
       ${noVaultsBanner}
-      <section class="scopes">
-        <h2 class="scopes-title">Permissions requested</h2>
-        <ul class="scope-list">${scopeRows}</ul>
-        ${readsVault ? `<p class="scope-vendor-note">What this app reads from your vault goes to the company that runs it.</p>` : ""}
-      </section>
       <form method="POST" action="/oauth/authorize" class="auth-form consent-form">
+        <!-- inside the form: each requested scope's checkbox is posted as granted_scope, so a box the person unticks is
+             not granted. Outside it, nothing was posted and the hub granted everything asked (T-476 stranger walk).
+             granted_scope_present says the boxes were shown: then only what is ticked is granted, even none. -->
+        ${uniqueScopes.length > 0 ? `<input type="hidden" name="granted_scope_present" value="1" />` : ""}
+        <section class="scopes">
+          <h2 class="scopes-title">Permissions requested</h2>
+          <ul class="scope-list">${scopeRows}</ul>
+          ${readsVault ? `<p class="scope-vendor-note">What this app reads from your vault goes to the company that runs it.</p>` : ""}
+        </section>
         <input type="hidden" name="__action" value="consent" />
         ${renderCsrfHiddenInput(csrfToken)}
         ${renderHiddenInputs(params)}
@@ -697,7 +714,7 @@ export function renderApprovePending(props: ApprovePendingViewProps): string {
     displayedScopes.length === 0
       ? `<li class="scope scope-empty">No scopes requested — the app gets a session token only.</li>`
       : requestedScopes
-          .map((wire, i) => renderScopeRow(wire, displayedScopes[i] ?? wire))
+          .map((wire, i) => renderScopeRow(wire, displayedScopes[i] ?? wire, false))
           .join("\n");
   // Wildcard explanation: surface the "the asterisk means the vault is
   // picked later" hint below the scope list when at least one row carries
@@ -1090,7 +1107,7 @@ export function renderUnknownClient(props: UnknownClientViewProps): string {
  * missed it by omitting `displayVault`, so no substitution occurred and the two
  * forms happened to coincide.
  */
-function renderScopeRow(scope: string, displayScope: string = scope): string {
+function renderScopeRow(scope: string, displayScope: string = scope, interactive = true): string {
   // Special-case the `<TBD>` placeholder substituted by `canonicalConsentScope`
   // when the consent picker hasn't bound a vault yet — `explainScope` doesn't
   // match it because `<` / `>` aren't in the vault-name charset, but the
@@ -1103,9 +1120,18 @@ function renderScopeRow(scope: string, displayScope: string = scope): string {
     // `risk-elevated`, not neutral: an unexplained scope is what
     // `forcesExplicitConsent` fails closed on, so the row the user reads should
     // carry the same posture the gate does.
-    return `<li class="scope scope-unknown risk-elevated">
-      <code class="scope-name">${escapeHtml(displayScope)}</code>
-      <span class="scope-label scope-label-muted">Defined by the requesting app — no built-in description.</span>
+    // It has a box like any other (ticked, as an ordinary ask): without one, a consent that posts its ticks would drop it.
+    const name = `<code class="scope-name">${escapeHtml(displayScope)}</code>
+      <span class="scope-label scope-label-muted">Defined by the requesting app — no built-in description.</span>`;
+    return interactive
+      ? `<li class="scope scope-unknown risk-elevated">
+      <label class="scope-choice">
+        <input type="checkbox" name="granted_scope" value="${escapeHtml(scope)}" checked />
+        <span class="scope-choice-body">${name}</span>
+      </label>
+    </li>`
+      : `<li class="scope scope-unknown risk-elevated">
+      ${name}
     </li>`;
   }
   const risk = riskForExplanation(explanation);
@@ -1133,9 +1159,13 @@ function renderScopeRow(scope: string, displayScope: string = scope): string {
   // something a user reaches for deliberately, not something they inherit by
   // clicking Approve on a list an app composed.
   const preChecked = risk === "high" ? "" : " checked";
+  // Read-only where nothing is chosen here (the approve-client page: scopes are chosen at the consent after it).
+  const box = interactive ? `<input type="checkbox" name="granted_scope" value="${escapeHtml(scope)}"${preChecked} />` : "";
+  // a row that chooses nothing isn't a label: no pointer, nothing to click
+  const tag = interactive ? "label" : "div";
   return `<li class="${cls}">
-      <label class="scope-choice">
-        <input type="checkbox" name="granted_scope" value="${escapeHtml(scope)}"${preChecked} />
+      <${tag} class="scope-choice${interactive ? "" : " scope-read-only"}">
+        ${box}
         <span class="scope-choice-body">
           <span class="scope-head">
             <code class="scope-name">${escapeHtml(displayScope)}</code>
@@ -1145,7 +1175,7 @@ function renderScopeRow(scope: string, displayScope: string = scope): string {
           ${riskNote}
           ${pendingNote}
         </span>
-      </label>
+      </${tag}>
     </li>`;
 }
 
@@ -1568,6 +1598,7 @@ const STYLES = `
     cursor: pointer;
   }
   .scope-choice input { margin-top: 0.3rem; flex: none; }
+  .scope-choice.scope-read-only { cursor: default; }
   .scope-choice-body { display: block; }
 
   .extras {

@@ -2460,15 +2460,20 @@ async function handleConsentSubmit(
   // narrower scope than requested, and the token response's `scope` tells the
   // client what it actually got. Google, GitHub and Slack all ship this.
   //
-  // Back-compatible by construction: `granted_scope` fields are only honoured
-  // when the form supplies at least one. A programmatic POST (or an older
-  // cached consent page) that omits them entirely keeps the previous
-  // approve-everything-requested behaviour, so no existing flow breaks.
+  // Honoured whenever the page drew the boxes (`granted_scope_present=1`, see
+  // below), even with none ticked: that is the denial further down. A
+  // programmatic POST (or an older cached consent page) that sends neither the
+  // marker nor any `granted_scope` keeps the previous approve-everything-
+  // requested behaviour, so no scripted flow breaks.
+  // One box may carry several wire forms that read the same (space-separated). `granted_scope_present` says the page
+  // drew the boxes (T-476): then only what is ticked is granted, even nothing, which is the denial below. Without it
+  // (a programmatic POST, an older page), the fallback above holds.
   const grantedFields = form
     .getAll("granted_scope")
-    .map((v) => String(v))
+    .flatMap((v) => String(v).split(" "))
     .filter((v) => v.length > 0);
-  if (grantedFields.length > 0) {
+  const boxesShown = String(form.get("granted_scope_present") ?? "") === "1";
+  if (boxesShown || grantedFields.length > 0) {
     const kept = new Set(grantedFields);
     scopes = scopes.filter((sc) => kept.has(sc));
   }
@@ -4033,21 +4038,12 @@ function consentProps(
   // do not substitute unnamed rows as `vault:<that-vault>:<verb>` or the
   // consent screen would lie about what Approve mints. Multi-vault already
   // used the `<TBD>` placeholder; single-vault admin now does too.
-  // Keep the first wire value for each display-normalized scope. Resource
-  // narrowing can produce the same named value from distinct requested forms,
-  // and the consent page should offer one row/checkbox for that permission.
-  const seenScopeKeys = new Set<string>();
-  const scopes = requestedScopes.filter((scope) => {
-    const key = canonicalConsentScope(scope, displayVault);
-    if (seenScopeKeys.has(key)) return false;
-    seenScopeKeys.add(key);
-    return true;
-  });
   return {
     params,
     clientId: client.clientId,
     clientName: client.clientName ?? client.clientId,
-    scopes,
+    // every requested wire form: the page groups them, one box posting all of a row's forms (T-476)
+    scopes: requestedScopes,
     csrfToken,
     vaultPicker,
     displayVault,
