@@ -626,7 +626,10 @@ describe("account MCP — initialize + tools", () => {
         };
       };
       const names = listBody.result.tools.map((t) => t.name);
-      for (const n of ACCOUNT_MCP_TOOLS.map((t) => t.name)) expect(names).toContain(n);
+      // every hub tool but the two made only with the person's own key (sharing; account-mcp.ts `signedByThePerson`)
+      const keyOnly = ["invite-to-vault", "take-back-invite"];
+      for (const n of ACCOUNT_MCP_TOOLS.map((t) => t.name).filter((n) => !keyOnly.includes(n))) expect(names).toContain(n);
+      for (const n of keyOnly) expect(names).not.toContain(n);
       expect(names).toContain("query-notes");
       expect(names).toContain("create-note");
       expect(names).toContain("delete-note");
