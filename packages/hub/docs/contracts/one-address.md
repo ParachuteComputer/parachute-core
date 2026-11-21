@@ -14,7 +14,7 @@ choice: one vault and nothing else.
    ask as `/account/mcp`'s, because an app copies the list whole and `account:vaults` can't sit beside a vault verb.
    This holds on a hub with no vault yet too.
 2. **The ask.** At `resource=<hub>/mcp`, unnamed vault verbs (`vault:read` …) are an ask for the account door and become
-   `account:vaults`. A named `vault:<name>:<verb>` stays a one-vault ask.
+   `account:vaults`. A named `vault:<name>:<verb>` asked on its own stays a one-vault ask; beside unnamed verbs it is dropped.
 3. **The page.** For `account:vaults`, the hub's owner chooses between:
    - **All your vaults**: `account:self:vaults:*:write account:self:vault-create`. That is read and write in each
      vault, the ones made later too, and leave to make vaults. It is capped at write, never the owner's admin. It is the
