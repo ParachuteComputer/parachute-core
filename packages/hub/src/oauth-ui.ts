@@ -23,6 +23,7 @@
 import { WORDMARK_TEXT, brandMarkSvg } from "./brand.ts";
 import { redirectHome } from "./clients.ts";
 import { renderCsrfHiddenInput } from "./csrf.ts";
+import { isAccountVaultsConnectionScope } from "./grant-generation.ts";
 import { NOSTR_LOGIN_STYLES, renderNostrKeyDoor } from "./nostr-login-ui.ts";
 import { type ScopeExplanation, explainScope, riskForExplanation } from "./scope-explanations.ts";
 
@@ -416,7 +417,10 @@ export function renderConsent(props: ConsentViewProps): string {
     else scopeGroups.set(key, [scope]);
   }
   const uniqueScopes = [...scopeGroups.values()].map((group) => group.join(" "));
-  const displayedScopes = [...scopeGroups.values()].map((group) => canonicalConsentScope(group[0] ?? "", displayVault));
+  const displayedScopes = [...scopeGroups.keys()];
+  // On the account door the vault levels below are the choice; the connection row itself has no box (unticking it
+  // would silently throw the chosen levels away): it is posted as granted, and the levels decide.
+  const levelsDecide = (wire: string) => vaultLevels !== undefined && wire.split(" ").some(isAccountVaultsConnectionScope);
   const scopeRows =
     displayedScopes.length === 0
       ? // A client may legally omit `scope` (RFC 6749 §3.3), and MCP clients
@@ -425,7 +429,13 @@ export function renderConsent(props: ConsentViewProps): string {
         // actually happening and point at the checklist below, which is the
         // only way this flow can produce a useful token.
         `<li class="scope scope-empty">This app didn't ask for any specific access. Choose what to grant below — without a selection its token won't be able to do anything.</li>`
-      : uniqueScopes.map((wire, i) => renderScopeRow(wire, displayedScopes[i] ?? wire)).join("\n");
+      : uniqueScopes
+          .map((wire, i) =>
+            levelsDecide(wire)
+              ? `${renderScopeRow(wire, displayedScopes[i] ?? wire, false)}<input type="hidden" name="granted_scope" value="${escapeHtml(wire)}" />`
+              : renderScopeRow(wire, displayedScopes[i] ?? wire),
+          )
+          .join("\n");
   // 0.9.1 (SPEC §3.4): a vault grant reaches the whole vault at its level, and what the app reads leaves the box.
   const readsVault = displayedScopes.some((sc) => sc.startsWith("vault:"));
   const extrasSection = renderGrantableExtras(grantableExtras ?? [], displayedScopes.length === 0);

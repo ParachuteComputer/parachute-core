@@ -2460,10 +2460,11 @@ async function handleConsentSubmit(
   // narrower scope than requested, and the token response's `scope` tells the
   // client what it actually got. Google, GitHub and Slack all ship this.
   //
-  // Back-compatible by construction: `granted_scope` fields are only honoured
-  // when the form supplies at least one. A programmatic POST (or an older
-  // cached consent page) that omits them entirely keeps the previous
-  // approve-everything-requested behaviour, so no existing flow breaks.
+  // Honoured whenever the page drew the boxes (`granted_scope_present=1`, see
+  // below), even with none ticked: that is the denial further down. A
+  // programmatic POST (or an older cached consent page) that sends neither the
+  // marker nor any `granted_scope` keeps the previous approve-everything-
+  // requested behaviour, so no scripted flow breaks.
   // One box may carry several wire forms that read the same (space-separated). `granted_scope_present` says the page
   // drew the boxes (T-476): then only what is ticked is granted, even nothing, which is the denial below. Without it
   // (a programmatic POST, an older page), the fallback above holds.
@@ -4037,17 +4038,12 @@ function consentProps(
   // do not substitute unnamed rows as `vault:<that-vault>:<verb>` or the
   // consent screen would lie about what Approve mints. Multi-vault already
   // used the `<TBD>` placeholder; single-vault admin now does too.
-  // Every requested wire form goes to the page: `renderConsent` draws one row per
-  // display-normalized scope, and its one checkbox posts all the forms it stands
-  // for (resource narrowing can give the same named value from distinct asks).
-  // Keeping only the first here would drop the others, and with them the vault
-  // picked for an unnamed one, once the boxes post (T-476).
-  const scopes = requestedScopes;
   return {
     params,
     clientId: client.clientId,
     clientName: client.clientName ?? client.clientId,
-    scopes,
+    // every requested wire form: the page groups them, one box posting all of a row's forms (T-476)
+    scopes: requestedScopes,
     csrfToken,
     vaultPicker,
     displayVault,

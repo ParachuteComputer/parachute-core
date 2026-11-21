@@ -12843,7 +12843,8 @@ describe("consent as a browser submits it: what is unticked is not granted (T-47
   test("SECURITY: account-wide admin starts unticked; Approve without ticking it is a denial, not a grant", async () => {
     expect(await consent("account:self:admin", [])).toEqual({ denied: "access_denied" });
   });
-  test("a friend's unnamed ask and its named twin share one box on the real page, which posts both", async () => {
+  /** As a friend pinned to `work`: the page for this ask, posted as a browser posts it with these boxes unticked. */
+  async function asFriend(scope: string, untick: string[]): Promise<{ html: string; result: { scope: string } | { denied: string } }> {
     const { db, cleanup } = await makeDb();
     try {
       await createUser(db, "owner", "pw");
@@ -12851,18 +12852,45 @@ describe("consent as a browser submits it: what is unticked is not granted (T-47
       setUserVaults(db, friend.id, ["work"]);
       const session = createSession(db, { userId: friend.id });
       const reg = registerClient(db, { redirectUris: ["https://app.example/cb"], status: "approved" });
+      const pk = makePkce();
       const page = handleAuthorizeGet(
         db,
-        new Request(authorizeUrl({ client_id: reg.client.clientId, redirect_uri: "https://app.example/cb", response_type: "code", scope: "vault:work:read vault:read", code_challenge: makePkce().challenge, code_challenge_method: "S256" }), { headers: { cookie: cookie(session.id) } }),
+        new Request(authorizeUrl({ client_id: reg.client.clientId, redirect_uri: "https://app.example/cb", response_type: "code", scope, code_challenge: pk.challenge, code_challenge_method: "S256" }), { headers: { cookie: cookie(session.id) } }),
         deps,
       );
+      expect(page.status).toBe(200);
       const html = await page.text();
-      expect([...html.matchAll(/name="granted_scope"/g)].length).toBe(1);
-      expect(html).toContain('name="granted_scope" value="vault:work:read vault:read"');
+      const form = new URLSearchParams(browserFields(html, untick));
+      form.append("approve", "yes");
+      const res = await handleAuthorizePost(db, new Request(`${ISSUER}/oauth/authorize`, { method: "POST", body: form, headers: { "content-type": "application/x-www-form-urlencoded", cookie: cookie(session.id) } }), deps);
+      expect(res.status).toBe(302);
+      const back = new URL(res.headers.get("location")!);
+      if (back.searchParams.get("error")) return { html, result: { denied: back.searchParams.get("error")! } };
+      const token = await handleToken(
+        db,
+        new Request(`${ISSUER}/oauth/token`, { method: "POST", body: new URLSearchParams({ grant_type: "authorization_code", code: back.searchParams.get("code")!, client_id: reg.client.clientId, redirect_uri: "https://app.example/cb", code_verifier: pk.verifier }), headers: { "content-type": "application/x-www-form-urlencoded" } }),
+        deps,
+      );
+      expect(token.status).toBe(200);
+      return { html, result: { scope: ((await token.json()) as { scope: string }).scope.split(" ").sort().join(" ") } };
     } finally {
       cleanup();
     }
+  }
+
+  test("a friend's unnamed ask and its named twin share one box on the real page, which posts both and mints the vault", async () => {
+    const { html, result } = await asFriend("vault:work:read vault:read", []);
+    expect([...html.matchAll(/name="granted_scope"/g)].length).toBe(1);
+    expect(html).toContain('name="granted_scope" value="vault:work:read vault:read"');
+    expect(result).toEqual({ scope: "vault:work:read" });
   });
+
+  test("on the account door the chosen vault levels decide: the connection row has no box to untick them away", async () => {
+    const { html, result } = await asFriend("account:vaults", ["account:vaults"]);
+    expect(html).not.toContain('type="checkbox" name="granted_scope" value="account:vaults"');
+    expect(result).toEqual({ scope: "account:self:vaults:work:read" });
+  });
+
   test("SECURITY: everything unticked is a denial, never everything granted", async () => {
     expect(await consent("vault:work:read vault:work:write", ["vault:work:read", "vault:work:write"], MCP)).toEqual({ denied: "access_denied" });
   });
