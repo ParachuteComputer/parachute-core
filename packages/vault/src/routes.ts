@@ -117,7 +117,16 @@ import { findTokensReferencingTag } from "./token-store.ts";
  * unscoped — handlers fast-path on `allowed === null` and behave
  * identically to the pre-tag-scope code path.
  */
-export type TagScopeCtx = { allowed: Set<string> | null; raw: string[] | null };
+export type TagScopeCtx = {
+  allowed: Set<string> | null;
+  raw: string[] | null;
+  /**
+   * Under a grant (docs/SPEC-1.0-grants.md §4.1): a version is visible only if the types it had *then* are granted,
+   * and a version with no recorded types is hidden from every narrow grant. Versions don't record types yet (core
+   * #114/#115), so a grant sees no history: a version list is empty and a version answers as missing.
+   */
+  noHistory?: boolean;
+};
 
 const NO_TAG_SCOPE: TagScopeCtx = { allowed: null, raw: null };
 
@@ -3163,6 +3172,10 @@ async function handleNotesInner(
       return json({ error: "Not found", error_type: "not_found" }, 404);
     }
     const id = note?.id ?? idOrPath;
+    if (tagScope.noHistory) {
+      if (sub === "/versions" && method === "GET") return json({ versions: [], total: 0 });
+      if (method === "GET" || (sub === "/restore" && method === "POST")) return json({ error: "Not found", error_type: "not_found" }, 404);
+    }
     if (sub === "/versions") {
       if (method === "GET") {
         const parsedLimit = Number.parseInt(url.searchParams.get("limit") ?? "50", 10);
