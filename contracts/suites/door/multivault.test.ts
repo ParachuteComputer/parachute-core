@@ -112,8 +112,9 @@ describe.skipIf(!is091 || lacks("multi-vault-door"))("one multi-vault door", () 
 
   // The account door is the address an AI gets (T-476), so it must carry what a vault's own door carries at the same
   // level: every tool there, by its record name. The note-named tools are aliases through 0.9 (vault core
-  // mcp-records.ts); the account door leaves them out of its list to keep the writer's list in budget, and still
-  // answers them, so a caller that already uses them keeps working.
+  // mcp-records.ts); to a key the account door leaves them out of its list to keep the writer's list in budget, and
+  // still answers them, so a caller that already uses them keeps working. (A NIP-98 caller keeps them listed:
+  // compat/uni.)
   test("the account door lists every tool a vault's own door lists at that level, and still answers the old names", async () => {
     const OLD: Record<string, string> = { "query-notes": "query-records", "create-note": "create-record", "update-note": "update-record", "delete-note": "delete-record", "list-tags": "list-types" };
     for (const level of ["read", "write"] as const) {
