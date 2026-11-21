@@ -232,6 +232,24 @@ export async function postVaultMcp(
 /** The query tools the account door fans out across vaults: 0.9's record name and its note-named alias (T-407). */
 export const FAN_OUT_TOOLS: ReadonlySet<string> = new Set(["query-records", "query-notes"]);
 
+/**
+ * The vault's note-named tools and the record-named tool each one is an alias of, through 0.9 (vault core
+ * mcp-records.ts `RECORD_TOOL_NAMES`; the hub doesn't import vault code). Listed under the record name only.
+ */
+export const NOTE_TOOL_ALIASES: Readonly<Record<string, string>> = {
+  "query-notes": "query-records",
+  "create-note": "create-record",
+  "update-note": "update-record",
+  "delete-note": "delete-record",
+  "list-tags": "list-types",
+};
+
+/** A call by an old name this door left out of its list still answers, when its record-named tool is listed. */
+export function answersAsAlias(name: string, listed: readonly { name: string }[]): boolean {
+  const record = NOTE_TOOL_ALIASES[name];
+  return record !== undefined && listed.some((t) => t.name === record);
+}
+
 function injectVaultSelector(tool: {
   name: string;
   description?: unknown;
@@ -305,10 +323,14 @@ async function listVaultToolsUncached(ctx: AccountToolContext): Promise<readonly
             !!t && typeof t === "object" && typeof (t as { name?: unknown }).name === "string",
         )
         .filter((t) => !HUB_NATIVE_TOOL_NAMES.has(t.name))
-        // T-476: a vault lists manage-types to a write session (it may make a new type). This door keeps it to keys
-        // that hold admin, as before: its writer list fits a 4,000-token budget (contracts door/multivault), and an AI
-        // makes a type at the vault's own address.
-        .filter((t) => t.name !== "manage-types" || verbForVault(ctx, vault.name) === "admin")
+        // T-476: this door is the address an AI gets, so it lists what the vault lists at that level, manage-types to
+        // a write key included (core #134). The note-named aliases are left out of the list when their record-named
+        // tool is in it (they still answer, `answersAsAlias`): that keeps the writer's list in its 4,000-token budget
+        // (contracts door/multivault).
+        .filter((t, _i, all) => {
+          const record = NOTE_TOOL_ALIASES[t.name];
+          return record === undefined || !all.some((o) => o?.name === record);
+        })
         .map((t) => injectVaultSelector(COMPOSED_VERB_RANK[verbForVault(ctx, vault.name)] < topRank ? { ...t, annotations: undefined } : t));
     } catch {
       // Try the next covered vault (highest-verb first). Empty catch continues.

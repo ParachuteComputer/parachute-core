@@ -5,7 +5,7 @@
 // write, and stops when revoked. HTTP and MCP only, so any door with an account door can be held to it.
 import { describe, expect, test } from "bun:test";
 import { connectAccount } from "./_connect.ts";
-import { accountToken, door, fp, lacks, mcp, rest, runId, safeFetch, vaultUrl } from "./_door.ts";
+import { accountToken, door, fp, lacks, mcp, mcpUrl, rest, runId, safeFetch, vaultUrl } from "./_door.ts";
 
 const d = door();
 const is091 = d.release === "0.9.1";
@@ -47,7 +47,7 @@ describe.skipIf(!is091 || lacks("multi-vault-door"))("one multi-vault door", () 
       // The writer's tool list: the record tools and list-vaults, no account-admin tools, within the 4,000-token budget.
       const tools = await c.tools();
       const names = tools.map((t) => t.name);
-      for (const t of ["list-vaults", "query-records", "create-record", "update-record", "delete-record"]) expect(names).toContain(t);
+      for (const t of ["list-vaults", "query-records", "create-record", "update-record", "delete-record", "manage-types"]) expect(names).toContain(t);
       for (const t of ["create-vault", "grant-access", "revoke-access", "list-access", "manage-token"]) expect(names).not.toContain(t);
       expect(tokens(forModel(tools))).toBeLessThanOrEqual(4000);
       fp("multivault/writer.tools", names);
@@ -108,6 +108,34 @@ describe.skipIf(!is091 || lacks("multi-vault-door"))("one multi-vault door", () 
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
     });
     expect(after.status).toBe(401);
+  });
+
+  // The account door is the address an AI gets (T-476), so it must carry what a vault's own door carries at the same
+  // level: every tool there, by its record name. The note-named tools are aliases through 0.9 (vault core
+  // mcp-records.ts); the account door leaves them out of its list to keep the writer's list in budget, and still
+  // answers them, so a caller that already uses them keeps working.
+  test("the account door lists every tool a vault's own door lists at that level, and still answers the old names", async () => {
+    const OLD: Record<string, string> = { "query-notes": "query-records", "create-note": "create-record", "update-note": "update-record", "delete-note": "delete-record", "list-tags": "list-types" };
+    for (const level of ["read", "write"] as const) {
+      const made = await mint({ name: `door-multi-${runId(level)}`, vaults: { [read]: level } });
+      expect(made.status).toBe(201);
+      const key = await made.json();
+      const viaAccount = await mcp("read", { url: accountMcp(), bearer: key.token });
+      const viaVault = await mcp(level, { url: mcpUrl(read) });
+      try {
+        const account = (await viaAccount.tools()).map((t) => t.name);
+        const vault = (await viaVault.tools()).map((t) => t.name);
+        const wanted = [...new Set(vault.map((n) => OLD[n] ?? n))].sort();
+        expect(wanted.filter((n) => !account.includes(n)), `${level}: tools the vault door lists and the account door doesn't`).toEqual([]);
+        for (const old of Object.keys(OLD)) expect(account, `${level}: ${old} is left out of the list`).not.toContain(old);
+        // An old name still answers (a read, so at every level).
+        const old = await viaAccount.call("query-notes", { vault: read, limit: 1 });
+        expect(old).toBeTruthy();
+      } finally {
+        await viaAccount.close();
+        await viaVault.close();
+      }
+    }
   });
 
   test("a multi-vault key is never admin, and names only vaults that exist", async () => {
