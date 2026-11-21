@@ -40,6 +40,7 @@ import {
   callerCanAdminVault,
   grantAccess,
   listAccess,
+  parseGrantVault,
   revokeAccess,
 } from "./grant-access.ts";
 import type { SignAccessTokenOpts } from "./jwt-sign.ts";
@@ -461,13 +462,27 @@ const listAccessTool: AccountMcpTool = {
       const { access } = listAccess(ctx.db, ctx.principal, args, installedNameSet(ctx));
       // each person's name on that vault (share-invites.ts), and, for one vault, its open invites
       const named = access.map((r) => ({ ...r, name: nameOnVault(ctx.db, r.user_id, r.vault) }));
-      const vault = typeof args.vault === "string" && args.vault !== "" ? args.vault : null;
+      const vault = typeof args.vault === "string" && args.vault !== "" ? parseGrantVault(args.vault) : null;
       return vault ? { access: named, invites: openInvites(ctx.db, vault, ctx.now?.() ?? new Date()) } : { access: named };
     } catch (err) {
       throwGrant(err);
     }
   },
 };
+
+/**
+ * Invites are made and taken back with the owner's own key (NIP-98), or the operator's credential: never by an app's
+ * or an AI's connection (an OAuth `account:vaults` connection takes the person's role, so it could otherwise mint a
+ * link that lets anyone in). app docs/design/SHARING.md.
+ */
+function signedByThePerson(ctx: AccountToolContext): boolean {
+  return ctx.principal.authKind === "nostr" || ctx.principal.scopes.includes(HOST_ADMIN_SCOPE);
+}
+function needsTheirKey(ctx: AccountToolContext): void {
+  if (!signedByThePerson(ctx)) {
+    throw new AccountToolError("key_required", "Invites are made with the owner's own key (a request it signs), not an app's or an AI's connection.");
+  }
+}
 
 const inviteToVaultTool: AccountMcpTool = {
   name: "invite-to-vault",
@@ -488,6 +503,7 @@ const inviteToVaultTool: AccountMcpTool = {
   },
   async execute(args, ctx) {
     try {
+      needsTheirKey(ctx);
       const now = ctx.now ?? (() => new Date());
       return inviteToVault(ctx.db, { ...ctx.principal, via: "mcp" }, args, installedNameSet(ctx), ctx.issuer, now);
     } catch (err) {
@@ -511,6 +527,7 @@ const takeBackInviteTool: AccountMcpTool = {
   },
   async execute(args, ctx) {
     try {
+      needsTheirKey(ctx);
       const now = ctx.now ?? (() => new Date());
       return takeBackInvite(ctx.db, { ...ctx.principal, via: "mcp" }, args, installedNameSet(ctx), now);
     } catch (err) {
@@ -550,6 +567,7 @@ export function toolsForPrincipal(ctx: AccountToolContext): readonly AccountMcpT
   const create = canCreate(ctx.principal);
   return ACCOUNT_MCP_TOOLS.filter((t) => {
     if (t.name === "create-vault") return create;
+    if ((t.name === "invite-to-vault" || t.name === "take-back-invite") && !signedByThePerson(ctx)) return false;
     if (ADMIN_TOOLS.has(t.name)) {
       return canAdmin;
     }

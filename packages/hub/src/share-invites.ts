@@ -27,8 +27,8 @@ import {
   parseGrantVault,
 } from "./grant-access.ts";
 import { DEFAULT_INVITE_TTL_SECONDS, hashInviteToken } from "./invites.ts";
-import { personLevelOnVault } from "./key-level.ts";
-import { isHubAdmin, upsertUserVault } from "./users.ts";
+import { levelSatisfies, personLevelOnVault } from "./key-level.ts";
+import { deleteUser, isHubAdmin, upsertUserVault } from "./users.ts";
 
 /** The role a share invite gives: read and write, no admin (users.ts `vaultVerbsForRole`). */
 export const SHARE_ROLE = "member";
@@ -37,8 +37,9 @@ const CODE_BYTES = 32;
 export const NAME_MAX = 40;
 /** The most stamps one `names` read answers. */
 export const NAMES_MAX = 100;
-/** Controls, and the formatting characters that make one name look like another (bidi, zero-width, line breaks). */
-const UNSEEN = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
+/** Controls, and the formatting characters that make one name look like another (bidi, zero-width, line breaks); the
+ *  joiners (U+200C, U+200D) stay, since Persian names and emoji sequences need them. */
+const UNSEEN = /(?![\u200c\u200d])[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
 
 /** A person's name, checked: trimmed, 1 to 40 code points, no control or invisible formatting characters. */
 export function parseName(raw: unknown, field: string): string {
@@ -189,7 +190,20 @@ export function nameOnVault(db: Database, userId: string, vault: string): string
   return invited?.invitee_name ?? displayName(db, userId);
 }
 
-/** An open share invite by its code, or null (every failure the same, so a stranger learns nothing). */
+/** Can this hub user still run `vault` (admin there: the hub's owner, or a `write` role)? */
+function runsVault(db: Database, userId: string | null, vault: string): boolean {
+  if (!userId) return false;
+  const person = {
+    userId,
+    isHubAdmin: isHubAdmin(db, userId),
+    authKind: "nostr" as const,
+    grant: null,
+  };
+  return levelSatisfies(personLevelOnVault(db, person, vault), "admin");
+}
+
+/** An open share invite by its code, or null (every failure the same, so a stranger learns nothing). An invite holds
+ *  only while the person who made it can still run the vault: taking their role away takes their invites with it. */
 function openShareInvite(db: Database, code: unknown, now: Date): ShareRow | null {
   if (
     typeof code !== "string" ||
@@ -203,6 +217,7 @@ function openShareInvite(db: Database, code: unknown, now: Date): ShareRow | nul
     .get(hashInviteToken(code));
   if (!row || row.revoked_at || row.used_at) return null;
   if (now.getTime() > new Date(row.expires_at).getTime()) return null;
+  if (!runsVault(db, row.created_by, row.vault_name)) return null;
   return row;
 }
 
@@ -249,15 +264,21 @@ export async function acceptInvite(
   // a vault taken away or renamed since: the invite opens nothing
   if (!row || !installed.has(row.vault_name)) return { ok: false };
   let userId: string;
+  let created: boolean;
   try {
-    userId = (await ensureUserForPubkey(db, pubkey, now, { label: "invite" })).userId;
+    ({ userId, created } = await ensureUserForPubkey(db, pubkey, now, { label: "invite" }));
   } catch {
     return { ok: false };
   }
-  if (isHubAdmin(db, userId)) return { ok: false };
+  // a key-only user made for this accept and then refused (another accept won meanwhile) isn't left behind
+  const refused = (): AcceptOutcome => {
+    if (created) deleteUser(db, userId);
+    return { ok: false };
+  };
+  if (isHubAdmin(db, userId)) return refused();
   // checked again after the await: another accept may have used it meanwhile
   const view = lookInvite(db, code, now());
-  if (!view) return { ok: false };
+  if (!view) return refused();
   const filed = db.transaction((): boolean => {
     const already = db
       .query<{ role: string }, [string, string]>(
@@ -282,11 +303,35 @@ export async function acceptInvite(
     }
     return true;
   })();
-  if (!filed) return { ok: false };
+  if (!filed) return refused();
   console.log(
     `vault invite accepted: vault=${row.vault_name} id=${row.id.slice(0, 12)} subject_user_id=${userId} subject_pubkey=${pubkey}`,
   );
   return { ok: true, view, user_id: userId };
+}
+
+/** A vault renamed: its invites, open and used, follow it (so names and Take back keep working). */
+export function renameShareInvitesForVault(db: Database, oldName: string, newName: string): number {
+  return db
+    .prepare("UPDATE share_invites SET vault_name = ? WHERE vault_name = ?")
+    .run(newName, oldName).changes;
+}
+
+/** A vault deleted: its invites go, open and used, so a new vault of the same name inherits no invite and no names. */
+export function removeShareInvitesForVault(db: Database, vault: string): number {
+  return db.prepare("DELETE FROM share_invites WHERE vault_name = ?").run(vault).changes;
+}
+
+/** Every person of `vault`: its hub owners, everyone with a role there, everyone who ever accepted an invite to it. */
+function peopleOf(db: Database, vault: string): string[] {
+  const rows = db
+    .query<{ id: string }, [string, string]>(
+      `SELECT id FROM users WHERE hub_role = 'admin'
+       UNION SELECT user_id AS id FROM user_vaults WHERE vault_name = ?
+       UNION SELECT redeemed_user_id AS id FROM share_invites WHERE vault_name = ? AND redeemed_user_id IS NOT NULL`,
+    )
+    .all(vault, vault);
+  return rows.map((r) => r.id).slice(0, NAMES_MAX);
 }
 
 /** Does this hub user reach `vault` (owner, or any role there)? */
@@ -301,7 +346,7 @@ export function reachesVault(db: Database, userId: string, vault: string): boole
 }
 
 /**
- * `names`: the name for each `by` stamp asked about, among the people of `vault` (its owners and members, and anyone
+ * `names`: the name for each `by` stamp asked about (none asked: every person), among the people of `vault` (its owners and members, and anyone
  * who ever accepted an invite to it, so an ended member's old writes keep their name), with `you` on the caller's own.
  * A stamp that isn't such a person is left out. Keys, roles and invites are never here: they are the owner's.
  */
@@ -312,7 +357,7 @@ export function namesFor(
   stamps: readonly string[],
 ): Record<string, { name: string | null; you: boolean }> {
   const out: Record<string, { name: string | null; you: boolean }> = {};
-  for (const by of [...new Set(stamps)].slice(0, NAMES_MAX)) {
+  for (const by of [...new Set(stamps.length ? stamps : peopleOf(db, vault))].slice(0, NAMES_MAX)) {
     if (!/^[A-Za-z0-9-]{1,64}$/.test(by)) continue;
     const exists = db.query<{ id: string }, [string]>("SELECT id FROM users WHERE id = ?").get(by);
     if (!exists) continue;

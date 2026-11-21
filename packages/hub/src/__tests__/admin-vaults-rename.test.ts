@@ -171,6 +171,10 @@ async function seed() {
 describe("POST /vaults/<name>/rename", () => {
   test("rewrites all identities exactly, preserves refresh family and mints the new scope/audience", async () => {
     const { client, access, refresh } = await seed();
+    // a share invite to the vault (share-invites.ts) follows the rename
+    db.prepare(
+      "INSERT INTO share_invites (id, vault_name, invitee_name, created_by, expires_at, created_at) VALUES ('share-1', 'a_b', 'Bo', NULL, '2999-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')",
+    ).run();
     const restart = deps.restartVaultModule!;
     deps.restartVaultModule = async () => {
       expect(db.query("SELECT vault FROM channel_vaults").get()).toEqual({ vault: "renamed" });
@@ -195,6 +199,7 @@ describe("POST /vaults/<name>/rename", () => {
       grants_rewritten: 1,
       user_vaults_renamed: 1,
       invites_renamed: 1,
+      share_invites_renamed: 1,
       vault_cap_renamed: 1,
       channel_vaults_renamed: 1,
       tokens_rescoped: 1,
@@ -207,7 +212,7 @@ describe("POST /vaults/<name>/rename", () => {
     expect(db.query("SELECT scopes FROM grants").get()).toEqual({
       scopes: "vault:ab:read vault:renamed:read vault:axb:write account:self:read",
     });
-    for (const table of ["user_vaults", "invites", "vault_caps"]) {
+    for (const table of ["user_vaults", "invites", "vault_caps", "share_invites"]) {
       expect(
         db.query(`SELECT count(*) AS n FROM ${table} WHERE vault_name = 'renamed'`).get(),
       ).toEqual({ n: 1 });

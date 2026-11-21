@@ -424,6 +424,106 @@ describe("a share invite is not an account invite", () => {
   });
 });
 
+describe("what the review found (round 1)", () => {
+  const cyWith = async (roles: Record<string, "read" | "member" | "write">) => {
+    const CY = key("44");
+    for (const [vault, role] of Object.entries(roles)) {
+      expect((await tool(AARON, "grant-access", { pubkey: CY.pubkey, vault, role })).isError).toBe(
+        false,
+      );
+    }
+    return { ...CY, id: userOf(CY.pubkey)! };
+  };
+
+  test("an invite holds only while its maker can run the vault: Cy's invite dies when Aaron takes Cy's role away", async () => {
+    const cy = await cyWith({ recipes: "write" });
+    const made = await tool(cy, "invite-to-vault", { vault: "recipes", name: "Dee" });
+    expect(made.isError, JSON.stringify(made.body)).toBe(false);
+    expect((await friendCall("look", made.body.code)).status).toBe(200);
+    expect(
+      (await tool(AARON, "revoke-access", { pubkey: cy.pubkey, vault: "recipes" })).body,
+    ).toMatchObject({ revoked: true });
+    expect((await friendCall("look", made.body.code)).status).toBe(404);
+    expect((await friendCall("accept", made.body.code, STRANGER)).status).toBe(404);
+    expect(userOf(STRANGER.pubkey)).toBeNull();
+  });
+
+  test("someone already on the vault can't use an invite to change their role, and the invite stays open", async () => {
+    const cy = await cyWith({ recipes: "read" });
+    const inv = await invite("Cy");
+    expect((await friendCall("accept", inv.code, cy)).status).toBe(404);
+    expect(vaultVerbsForUserVault(db, cy.id, "recipes")).toEqual(["read"]);
+    expect((await friendCall("look", inv.code)).status).toBe(200);
+  });
+
+  test("taking back is the vault's owner's: Cy, who runs journal, can't take back an invite to recipes", async () => {
+    const cy = await cyWith({ journal: "write" });
+    const inv = await invite();
+    expect((await tool(cy, "take-back-invite", { vault: "recipes", id: inv.id })).isError).toBe(
+      true,
+    );
+    expect((await friendCall("look", inv.code)).status).toBe(200);
+  });
+
+  test("an app's or an AI's connection (OAuth, account:vaults) can't invite or take back, and isn't shown the tools", async () => {
+    const connector = (
+      await signAccessToken(db, {
+        sub: ownerId,
+        scopes: ["account:vaults"],
+        audience: "account",
+        clientId: "claude-connector",
+        issuer: ORIGIN,
+        ttlSeconds: 600,
+      })
+    ).token;
+    expect(
+      (await tool({ bearer: connector }, "invite-to-vault", { vault: "recipes", name: "Mallory" }))
+        .isError,
+    ).toBe(true);
+    const inv = await invite();
+    expect(
+      (await tool({ bearer: connector }, "take-back-invite", { vault: "recipes", id: inv.id }))
+        .isError,
+    ).toBe(true);
+    expect((await friendCall("look", inv.code)).status).toBe(200);
+    const url = `${ORIGIN}/account/mcp`;
+    const res = await fetchHub(
+      new Request(url, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${connector}`,
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+      }),
+    );
+    const text = await res.text();
+    expect(text).toContain("list-access");
+    expect(text).not.toContain("invite-to-vault");
+  });
+
+  test("the losing accept of two leaves no hub user behind for its key", async () => {
+    const inv = await invite();
+    const DEE = key("55");
+    const both = await Promise.all([
+      friendCall("accept", inv.code, BO),
+      friendCall("accept", inv.code, DEE),
+    ]);
+    const lost = both[0].status === 200 ? DEE : BO;
+    expect(userOf(lost.pubkey)).toBeNull();
+  });
+
+  test("a name may carry a joiner (Persian names, emoji sequences), not a bidi override", async () => {
+    expect(
+      (await tool(AARON, "invite-to-vault", { vault: "recipes", name: "می\u200cخواهم" })).isError,
+    ).toBe(false);
+    expect(
+      (await tool(AARON, "invite-to-vault", { vault: "recipes", name: "Bo\u202e" })).isError,
+    ).toBe(true);
+  });
+});
+
 describe("names", () => {
   test("only a vault's people are named: someone with no tie to recipes is left out, and a token for another vault is refused", async () => {
     const outsider = (
@@ -438,5 +538,22 @@ describe("names", () => {
     expect(Object.keys(r.body.names ?? {})).toEqual([ownerId]);
     expect((await names(await vaultToken(ownerId, "journal"), [ownerId])).status).toBe(401);
     expect((await names(await vaultToken(outsider), [ownerId])).status).toBe(401);
+  });
+
+  test("asked for no stamp, names answers every person of the vault, an ended member too, and no one else", async () => {
+    const inv = await invite();
+    await friendCall("accept", inv.code, BO);
+    const bo = userOf(BO.pubkey)!;
+    await tool(AARON, "revoke-access", { pubkey: BO.pubkey, vault: "recipes" });
+    await createUser(db, "cy", "correct-horse-battery-staple", {
+      allowMulti: true,
+      passwordChanged: true,
+      assignedVaults: ["journal"],
+    });
+    const all = await names(await vaultToken(ownerId), []);
+    expect(all.body.names).toEqual({
+      [ownerId]: { name: "Aaron", you: true },
+      [bo]: { name: "Bo", you: false },
+    });
   });
 });
