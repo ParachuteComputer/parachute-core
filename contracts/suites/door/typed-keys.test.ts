@@ -318,7 +318,7 @@ describe.skipIf(without)("who reaches the vault, and ending it", () => {
     expect((await reach(app.access)).status).toBe(200);
     // as a connected app does: its token refreshed once, so an older access token is still alive beside the new one
     const rotated = await safeFetch(app.tokenEndpoint, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: app.refresh, client_id: app.clientId }) });
+      body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: app.refresh!, client_id: app.clientId }) });
     expect(rotated.status).toBe(200);
     const next = await rotated.json();
     expect((await reach(next.access_token)).status).toBe(200);
