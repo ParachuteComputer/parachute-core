@@ -91,6 +91,7 @@
 {"key":"has/records-over-rest","value":true}
 {"key":"has/revision-key-kind","value":true}
 {"key":"has/sign-in-keys-on-the-account-door","value":false}
+{"key":"has/typed-keys","value":true}
 {"key":"history/deleted.shape","value":{"notes":[{"deleted_at":"string","extension":"string","id":"string","path":"string","versions":"number"}],"total":"number"}}
 {"key":"history/refusal.blind-restore","value":{"error":null,"hint":null,"keys":["error_type","message","note_id"],"status":428,"type":"precondition_required"}}
 {"key":"history/refusal.forget-without-admin","value":{"error":"Forbidden","hint":null,"keys":["error","error_type","granted_scopes","message","required_scope"],"status":403,"type":"insufficient_scope"}}

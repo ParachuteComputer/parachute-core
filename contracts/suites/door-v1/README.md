@@ -28,12 +28,11 @@ must be taken, so a later "is refused" can't pass because nothing is ever taken.
 statuses, so once the route exists a 400, 401, 403 or 409 from a contract's own mistake shows as red for the wrong
 reason.
 
-Two say that same absent route in words of their own, because what they file or read isn't `granted()`:
+One says that same absent route in words of its own, because what it files isn't `granted()`:
 
 | Contract | Today |
 |---|---|
 | `grant.test.ts`: the grantee can carry its own grant to the door | the door has no statements route for the grantee's key to post to (405 or 404) |
-| `grant.test.ts`: every credential is a row in the list | the door has no statements route to list (405 or 404) |
 
 Three are red for a reason of their own, because today's doors do something the spec forbids or lack one named
 thing:
@@ -84,7 +83,7 @@ routes that exist today and stay admin (`PUT /api/tags/<name>`, `PATCH /api/vaul
 
 | File | The behaviour it holds | Spec |
 |---|---|---|
-| `grant.test.ts` | an owner-signed grant opens exactly the types it names to the key it names; one grant per key; an id is never reused; a grant that isn't the owner's, is changed, names another vault, has no date or carries an unknown tag is refused; a vault credential can't file one; every credential is a row in the list | §2, §4.4, §7 |
+| `grant.test.ts` | an owner-signed grant opens exactly the types it names to the key it names; one grant per key; an id is never reused; a grant that isn't the owner's, is changed, names another vault, has no date or carries an unknown tag is refused; a vault credential can't file one | §2, §4.4, §7 |
 | `verbs.test.ts` | each verb alone; create without read is a form that can't choose a path; `:own` and `was`; subtypes; a denied tag; adding and removing a type; `*` | §4 |
 | `ending.test.ts` | a grant stops at its date; a signed revoke stops it on the next request, is final and needs no order; a revoke ends one exact address; who may sign one | §3 |
 | `people.test.ts` | a member writes as themselves; an agent writes for its person; a member signs for their own agent, which never passes the member and ends with them; ids a member may use | §5.1, §5.2 |
@@ -92,6 +91,13 @@ routes that exist today and stay admin (`PUT /api/tags/<name>`, `PATCH /api/vaul
 | `custodial.test.ts` | a `names` grant stamps its prefix; the header without it is refused; bad names and reserved prefixes; a link shows as the person's only after their own key claims it; "not mine"; the owner's void; replay from another vault; key rotation | §6 |
 | `leaks.test.ts` | a narrow grant learns nothing of a hidden type by search, links, counts, type lists, history, files, the names in stamps, or a lookup | §4.1 |
 | `move.test.ts` | the export holds every statement word for word, the vault's id, and no credential (skips on a box, whose export is a command: `deliberate.json`, `export-over-http`) | §9 |
+
+## Moved on
+
+- **Typed keys** (1.0 grants, first slice: door grants, §7.3): a key for an AI that reaches some types, the list of
+  who reaches a vault (`GET /account/vaults/<name>/statements`, every credential as a door grant row) and ending one
+  (`DELETE …/statements/<id>`). Written here red first; now `suites/door/typed-keys.test.ts`, with the contract that
+  every credential is a row in the list (from `grant.test.ts`).
 
 ## One older contract describes another model
 

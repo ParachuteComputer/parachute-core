@@ -99,6 +99,7 @@ import {
   type TagScopeCtx,
   type WriteCtx,
 } from "./routes.ts";
+import { handleGrants } from "./grants-api.ts";
 import { handleTriggers } from "./triggers-api.ts";
 import { expandTokenTagScope, noteWithinTagScope, scopedStatsFilter, tagScopedVaultWideForbidden } from "./tag-scope.ts";
 import {
@@ -1222,6 +1223,14 @@ export async function route(
     }
   }
 
+  // /api/grants — the grants this vault keeps (grants-api.ts): admin on every method, before the generic gate.
+  {
+    const grantsPath = apiMatch[1] ?? "";
+    if (grantsPath === "/grants" || grantsPath.startsWith("/grants/")) {
+      return handleGrants(req, store, grantsPath.slice("/grants".length), vaultName, auth);
+    }
+  }
+
   // /api/doctor — read-only taxonomy/metadata integrity scan (vault#552).
   // Same "dispatch before the generic read/write gate" shape as /triggers
   // above — dispatched early because it's GET-only and doesn't otherwise
@@ -1336,6 +1345,8 @@ export async function route(
   const tagScope: TagScopeCtx = {
     allowed: await expandTokenTagScope(store, auth.scoped_tags),
     raw: auth.scoped_tags,
+    // a grant sees no version whose types weren't recorded (all of them, until versions carry types): routes.ts
+    ...(auth.grant ? { noHistory: true } : {}),
   };
 
   // Write-attribution context (vault#298). `auth.actor` is the principal;

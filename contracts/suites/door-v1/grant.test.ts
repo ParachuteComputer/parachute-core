@@ -358,19 +358,4 @@ describe("what no grant opens", () => {
     for (const level of ["write", "admin"] as const) expect((await file(e, { as: level })).status).toBe(401);
     expect((await tokenReply(key)).status).toBe(401);
   });
-
-  red("every credential that reaches the vault is a row in the list: an app key shows as a grant the door vouches for", { reason: /no grant list at this door: GET \S+\/statements answered 40[45]/, lane: LANE }, async () => {
-    const d = door();
-    const { accountToken, safeFetch } = await import("../door/_door.ts");
-    const name = `door-app-${Math.random().toString(36).slice(2, 8)}`;
-    const made = await safeFetch(`${d.issuer}/account/keys`, { method: "POST", headers: { authorization: `Bearer ${await accountToken()}`, "content-type": "application/json" }, body: JSON.stringify({ name, vault: d.vault, can: "write" }) });
-    expect(made.status).toBe(201);
-    const list = await statements();
-    must(list.status === 200, `no grant list at this door: GET /account/vaults/<v>/statements answered ${list.status}`);
-    const row = list.body.grants.find((x: any) => x.id === name);
-    expect(row).toMatchObject({ origin: "door", state: "in_force" });
-    expect(row.types).toEqual({ "*": ["read", "create", "update", "delete"] });
-    // A door grant has no signed event: the row says `event: null` (§7.1).
-    expect(row.event ?? null).toBeNull();
-  });
 });

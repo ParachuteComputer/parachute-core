@@ -84,6 +84,7 @@
  *   /account/keys                 (GET/POST)   → named app keys: list (with last use) / mint one vault
  *                                                at read|write, never admin (host:admin bearer, T-414)
  *   /account/keys/<name>          (DELETE)     → revoke an app key (refused at the hub's vault doors at once)
+ *   /account/vaults/<name>/statements[/<id>] (GET/DELETE) → who reaches a vault (grant rows) / end one (vault-grants.ts)
  *   /account/vaults               (GET/POST)   → list / create vault (create returns vault_token;
  *                                                {bare: true} → no welcome notes, T-414)
  *   /account/vaults/<name>/rename (POST)       → rename (host-admin)
@@ -389,6 +390,7 @@ import {
 } from "./module-manifest.ts";
 import { isNostrAuthorization } from "./nostr-http-auth.ts";
 import { routeAccountKeys } from "./account-keys.ts";
+import { routeVaultGrants } from "./vault-grants.ts";
 import { KEY_TOUCH_INTERVAL_MS, touchKey } from "./keys.ts";
 import { validateAccessToken } from "./jwt-sign.ts";
 import { handleNostrLogin } from "./nostr-login.ts";
@@ -4472,6 +4474,19 @@ export function hubFetch(
           issuer: oauthDeps(req).issuer,
           knownIssuers: oauthDeps(req).hubBoundOrigins(),
           manifestPath,
+          // a typed key's grant is filed at the vault through the hub's own proxy (vault-grants.ts)
+          forward: (fwd) => throughKeyDoor(fwd, getDb, () => proxyToVault(fwd, manifestPath, deps?.supervisor, peerAddr)),
+        });
+        if (handled) return handled;
+      }
+      // /account/vaults/<v>/statements — who reaches a vault, and ending one (vault-grants.ts, 1.0 grants slice).
+      if (/^\/account\/vaults\/[^/]+\/statements(?:\/[^/]+)?$/.test(pathname)) {
+        if (!getDb) return dbNotConfigured();
+        const handled = await routeVaultGrants(req, pathname, {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
+          forward: (fwd) => throughKeyDoor(fwd, getDb, () => proxyToVault(fwd, manifestPath, deps?.supervisor, peerAddr)),
         });
         if (handled) return handled;
       }

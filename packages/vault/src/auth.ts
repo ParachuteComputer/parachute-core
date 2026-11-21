@@ -42,6 +42,8 @@ import {
 } from "./scopes.ts";
 import { enforceVaultScope } from "@openparachute/scope-guard";
 import { HubJwtError, looksLikeJwt, validateHubJwt } from "./hub-jwt.ts";
+import { GRANT_ID_RE, getGrant, grantReach, grantState, type DoorGrant } from "../core/src/grants.ts";
+import { getVaultStore } from "./vault-store.ts";
 
 /**
  * Server-wide operator bearer token, sourced from the `VAULT_AUTH_TOKEN`
@@ -192,6 +194,12 @@ export interface AuthResult {
    * an id and is stamped `by <prefix>:<id>`. Null without the permission, and then a supplied id is refused.
    */
   acts_for?: string | null;
+  /**
+   * The grant this token is under (`permissions.grant`, docs/SPEC-1.0-grants.md §7.2): only its id, never its rules.
+   * `authenticateVaultRequest` reads the grant from the vault's own table on every request and narrows the result to
+   * it, or refuses the request when the grant has ended. Null for a credential with no grant.
+   */
+  grant?: string | null;
 }
 
 /**
@@ -355,7 +363,9 @@ export async function authenticateVaultRequest(
   vaultConfig: VaultConfig,
   opts: { allowExportOnly?: boolean } = {},
 ): Promise<{ error: Response } | AuthResult> {
-  const auth = await authenticateVaultCredential(req, vaultConfig);
+  const credential = await authenticateVaultCredential(req, vaultConfig);
+  if ("error" in credential) return credential;
+  const auth = underGrant(credential, vaultConfig.name);
   if ("error" in auth) return auth;
   // The backup key (`vault:<name>:export`, nothing else) is let in by `GET /api/export` alone. Every other caller of
   // this function, a route that only asks "is this key valid", the MCP door, /view, the websocket, gets a 403, so a
@@ -385,6 +395,35 @@ export async function authenticateVaultRequest(
     };
   }
   return auth;
+}
+
+/**
+ * The one checkpoint for a token under a grant (docs/SPEC-1.0-grants.md §4.1, first slice): read the grant from this
+ * vault's own table, now. Ended (revoked, past its date) or unknown here: 401 `grant_ended`, on this very request.
+ * In force: the request is narrowed to the grant's types through the vault's existing narrowing (`scoped_tags`, which
+ * every read and write path already passes: search, links, counts, history, files, MCP, the live socket), its write
+ * scope kept only when the grant can write, and never admin (§4.4).
+ */
+function underGrant(auth: AuthResult, vaultName: string): AuthResult | { error: Response } {
+  if (auth.grant === undefined || auth.grant === null) return auth;
+  let g: DoorGrant | null = null;
+  try {
+    g = getGrant(getVaultStore(vaultName).db, auth.grant);
+  } catch (err) {
+    console.warn(`[auth] grant ${auth.grant} could not be read in ${vaultName}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (!g || grantState(g) !== "in_force") {
+    return {
+      error: Response.json(
+        { error: "grant_ended", message: "This key's grant has ended, or isn't this vault's. Ask the vault's owner for a new key." },
+        { status: 401 },
+      ),
+    };
+  }
+  const reach = grantReach(g);
+  const levels = reach.write ? ["read", "write"] : ["read"];
+  const scopes = auth.scopes.filter((s) => levels.some((l) => s === `vault:${vaultName}:${l}`));
+  return { ...auth, scopes, permission: reach.write ? auth.permission : "read", scoped_tags: reach.types };
 }
 
 async function authenticateVaultCredential(
@@ -492,7 +531,7 @@ class MalformedScopedTagsError extends Error {}
  * doors refuse such keys too; this catches tokens minted before that, until
  * they expire.
  */
-const ENFORCED_PERMISSION_KEYS = new Set(["scoped_tags", "principal_pubkey", "acts_for"]);
+const ENFORCED_PERMISSION_KEYS = new Set(["scoped_tags", "principal_pubkey", "acts_for", "grant"]);
 
 class UnknownPermissionKeysError extends Error {
   constructor(readonly keys: string[]) {
@@ -662,6 +701,14 @@ function parseScopedTagsFromPermissions(
   );
 }
 
+/** `permissions.grant`: the id of the grant the token is under. Present but not an id fails closed (401). */
+function parseGrantFromPermissions(permissions: Record<string, unknown> | undefined): string | null {
+  if (!permissions || !("grant" in permissions)) return null;
+  const raw = permissions.grant;
+  if (typeof raw === "string" && GRANT_ID_RE.test(raw)) return raw;
+  throw new MalformedScopedTagsError("hub JWT permissions.grant is present but not a grant id");
+}
+
 /**
  * Validate a JWT-shaped bearer and convert the result into an `AuthResult`.
  * The token's scope claim becomes the granted scopes; permission is derived
@@ -755,6 +802,9 @@ async function authenticateHubJwt(
     // malformed claim so we never widen access on a misread.
     rejectUnknownPermissionKeys(claims.permissions);
     const scoped_tags = parseScopedTagsFromPermissions(claims.permissions);
+    const grant = parseGrantFromPermissions(claims.permissions);
+    // A grant brings its own types: a token that also names tags would have two rules to choose between.
+    if (grant !== null && scoped_tags !== null) throw new MalformedScopedTagsError("hub JWT carries both permissions.grant and permissions.scoped_tags");
     // Write-attribution axis 2 (vault#698): the NIP-98 signing pubkey, when
     // the hub stamped one. Fail-soft — see `parsePrincipalPubkey`.
     const principalPubkey = parsePrincipalPubkey(claims.permissions);
@@ -796,6 +846,7 @@ async function authenticateHubJwt(
       via: key !== null ? keyVia(key.name) : principalPubkey !== null ? nostrVia(principalPubkey) : "api",
       key,
       acts_for: actsFor,
+      grant,
     };
   } catch (err) {
     if (err instanceof UnknownPermissionKeysError) {

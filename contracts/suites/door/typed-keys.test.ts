@@ -10,14 +10,13 @@
 // `GET /account/vaults/<v>/statements` lists every credential as a grant row; `DELETE …/statements/<id>` ends a door
 // grant. A vault's own admin credential may do all three for that vault, which is how the app's Sharing screen does it.
 //
-// Red today: `POST /account/keys` refuses a `types` field (400), and a vault's admin credential (403), so every body
-// stops where the key is made.
+// Written red first in suites/door-v1 (a box refused `types` with 400 and a vault admin credential with 403), and
+// moved here by the change that made them pass. A door without typed keys names that in deliberate.json (`typed-keys`).
 import { describe, expect, test } from "bun:test";
-import { declareType, door, enc, ids, must, records, red, runId, safeFetch, type Reply } from "./_grants.ts";
-import { accountToken, mcp, token } from "../door/_door.ts";
+import { declareType, ids, must, records, statements } from "../door-v1/_grants.ts";
+import { accountToken, door, enc, lacks, mcp, runId, safeFetch, token, type Reply } from "./_door.ts";
 
-const LANE = "1.0-grants: typed keys";
-export const NO_TYPED_KEYS = /no typed keys at this door: POST \/account\/keys answered 40[03]/;
+const without = lacks("typed-keys");
 const owner = records("write");
 
 async function reply(r: Response): Promise<Reply> {
@@ -74,7 +73,7 @@ function theWorld(): Promise<World> {
   return world;
 }
 
-describe("setup holds today", () => {
+describe.skipIf(without)("setup holds today", () => {
   test("the owner reads the journal entry by id, path and search, its history, and the links between it and the recipe", async () => {
     const w = await theWorld();
     expect((await owner.get(w.j1)).status).toBe(200);
@@ -96,8 +95,8 @@ describe("setup holds today", () => {
   });
 });
 
-describe("a key for an AI that reads and adds recipes", () => {
-  red("at the REST door it adds and reads recipes, and the journal is as if it didn't exist", { reason: NO_TYPED_KEYS, lane: LANE }, async () => {
+describe.skipIf(without)("a key for an AI that reads and adds recipes", () => {
+  test("at the REST door it adds and reads recipes, and the journal is as if it didn't exist", async () => {
     const w = await theWorld();
     const key = await typedKey([w.R]);
     expect(key.body.types).toEqual([w.R]);
@@ -131,8 +130,22 @@ describe("a key for an AI that reads and adds recipes", () => {
     // History: the journal record's versions are a record that doesn't exist.
     expect((await ai.call("GET", `/notes/${w.j1}/versions?limit=50`)).status).toBe(404);
     expect((await ai.call("GET", `/notes/${w.r1}/versions?limit=50`)).status).toBe(200);
+    // A record written as a journal entry and later moved into recipes: its journal-era versions stay hidden (§4.1,
+    // history follows the types a version had then).
+    const oldWord = `zq${runId("w")}`;
+    const moved = (await owner.make({ types: [w.J], body: `a draft with the ${oldWord}` })).body.id;
+    expect((await owner.edit(moved, { body: "a recipe now", add: [w.R], remove: [w.J] })).status).toBe(200);
+    expect((await ai.get(moved)).status).toBe(200);
+    const mv = await ai.call("GET", `/notes/${moved}/versions?limit=50`);
+    expect(mv.status).toBe(200);
+    expect(JSON.stringify(mv.body)).not.toContain(oldWord);
+    for (const v of mv.body.versions as { version_ix: number }[]) {
+      expect((await ai.call("GET", `/notes/${moved}/versions/${v.version_ix}`)).text).not.toContain(oldWord);
+    }
     // It can't write a journal record, nor change or delete one it can't see.
     expect((await ai.make({ types: [w.J], body: "not mine to write" })).status).toBe(403);
+    // A record of both types needs create on both (§4.2).
+    expect((await ai.make({ types: [w.R, w.J], body: "half mine" })).status).toBe(403);
     expect((await ai.edit(w.j1, { body: "overwritten" })).status).toBe(404);
     expect((await ai.remove(w.j1)).status).toBe(404);
     // Nor slip a journal type onto a recipe.
@@ -141,7 +154,7 @@ describe("a key for an AI that reads and adds recipes", () => {
     expect((await owner.get(w.j1)).body.content).toContain(w.word);
   });
 
-  red("at the MCP door the same: the journal isn't found by search, by id or in the type list", { reason: NO_TYPED_KEYS, lane: LANE }, async () => {
+  test("at the MCP door the same: the journal isn't found by search, by id or in the type list", async () => {
     const w = await theWorld();
     const key = await typedKey([w.R]);
     const c = await mcp("read", { bearer: key.token });
@@ -150,19 +163,27 @@ describe("a key for an AI that reads and adds recipes", () => {
       expect(JSON.stringify(found)).not.toContain(w.j1);
       const byId = await c.call<any>("query-notes", { id: w.j1 }).catch((e: Error) => ({ error: e.message }));
       expect(JSON.stringify(byId)).not.toContain(w.word);
+      // History: no version of a record it can see whose types weren't recorded (none record them yet).
+      const hist = await c.call<any>("query-notes", { versions: { note_id: w.r1 } });
+      expect(hist.versions ?? []).toEqual([]);
+      const hidden = await c.call<any>("query-notes", { versions: { note_id: w.j1 } }).catch((e: Error) => ({ error: e.message }));
+      expect(JSON.stringify(hidden)).not.toContain(w.word);
       const tags = await c.call<any>("list-tags", {});
       expect(JSON.stringify(tags)).not.toContain(w.J);
       expect(JSON.stringify(tags)).toContain(w.R);
       const made = await c.call<any>("create-note", { content: "made over MCP", tags: [w.R], path: `${runId("typed")}/${runId("mcp")}` });
       expect(made.id ?? made.note?.id).toBeString();
-      const refused = await c.call<any>("create-note", { content: "a journal entry", tags: [w.J], path: `${runId("typed")}/${runId("mcp")}` }).then(() => "made", (e: Error) => e.message);
+      // Refused, as a tool error or as an answer that says so (the vault's MCP refuses a tag-limited write in-band).
+      const journalPath = `${runId("typed")}/${runId("mcp")}`;
+      const refused = await c.call<any>("create-note", { content: "a journal entry", tags: [w.J], path: journalPath }).then((r) => (r?.error ? String(r.error) : "made"), (e: Error) => e.message);
       expect(refused).not.toBe("made");
+      expect((await owner.get(journalPath)).status).toBe(404);
     } finally {
       await c.close();
     }
   });
 
-  red("a key that only reads recipes can't add one", { reason: NO_TYPED_KEYS, lane: LANE }, async () => {
+  test("a key that only reads recipes can't add one", async () => {
     const w = await theWorld();
     const key = await typedKey([w.R], "read");
     const ai = records({ bearer: key.token });
@@ -171,8 +192,8 @@ describe("a key for an AI that reads and adds recipes", () => {
   });
 });
 
-describe("who reaches the vault, and ending it", () => {
-  red("the list names the key, what it may do, to which types, and when it ends", { reason: NO_TYPED_KEYS, lane: LANE }, async () => {
+describe.skipIf(without)("who reaches the vault, and ending it", () => {
+  test("the list names the key, what it may do, to which types, and when it ends", async () => {
     const w = await theWorld();
     const key = await typedKey([w.R]);
     const r = await list();
@@ -187,7 +208,7 @@ describe("who reaches the vault, and ending it", () => {
     expect(again.body.grants.find((x: any) => x.id === reader.name).types).toEqual({ [w.R]: ["read"] });
   });
 
-  red("ending it in the list fails its next request, at REST and at MCP, and the row says so", { reason: NO_TYPED_KEYS, lane: LANE }, async () => {
+  test("ending it in the list fails its next request, at REST and at MCP, and the row says so", async () => {
     const w = await theWorld();
     const key = await typedKey([w.R]);
     const ai = records({ bearer: key.token });
@@ -203,7 +224,7 @@ describe("who reaches the vault, and ending it", () => {
     expect(row.state).toBe("revoked");
   });
 
-  red("the vault's own admin credential makes, lists and ends keys for that vault, and no other", { reason: NO_TYPED_KEYS, lane: LANE }, async () => {
+  test("the vault's own admin credential makes, lists and ends keys for that vault, and no other", async () => {
     const w = await theWorld();
     const key = await typedKey([w.R], "write", "vault-admin");
     const ai = records({ bearer: key.token });
@@ -220,7 +241,7 @@ describe("who reaches the vault, and ending it", () => {
     expect((await ai.get(w.r1)).status).toBe(401);
   });
 
-  red("a typed key is refused where it can't hold: an export key, no types, or a name that can't be a type", { reason: NO_TYPED_KEYS, lane: LANE }, async () => {
+  test("a typed key is refused where it can't hold: an export key, no types, or a name that can't be a type", async () => {
     const w = await theWorld();
     await typedKey([w.R]);
     const mint = (body: Record<string, unknown>) => account("POST", "/account/keys", { name: `bad-${runId("k")}`, vault: door().vault, ...body });
@@ -228,5 +249,21 @@ describe("who reaches the vault, and ending it", () => {
     expect((await mint({ can: "write", types: [] })).status).toBe(400);
     expect((await mint({ can: "write", types: ["has space"] })).status).toBe(400);
     expect((await mint({ can: "write", types: [w.R], on_behalf_of: true })).status).toBe(400);
+  });
+
+  test("every credential that reaches the vault is a row in the list: an app key shows as a grant the door vouches for", async () => {
+    // Moved from door-v1/grant.test.ts, which held it red until this list existed.
+    const name = `door-app-${runId("k")}`;
+    const made = await account("POST", "/account/keys", { name, vault: door().vault, can: "write" });
+    expect(made.status).toBe(201);
+    const list = await statements();
+    expect(list.status).toBe(200);
+    const row = list.body.grants.find((x: any) => x.id === name);
+    expect(row).toMatchObject({ origin: "door", state: "in_force" });
+    expect(row.types).toEqual({ "*": ["read", "create", "update", "delete"] });
+    // A door grant has no signed event: the row says `event: null` (§7.1).
+    expect(row.event ?? null).toBeNull();
+    // Signed statements are a later slice: filing one is still refused as before.
+    expect((await account("POST", `/account/vaults/${enc(door().vault)}/statements`, { event: {} })).status).toBe(405);
   });
 });
