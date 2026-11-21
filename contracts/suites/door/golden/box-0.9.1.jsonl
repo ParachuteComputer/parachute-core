@@ -26,7 +26,7 @@
 {"key":"account/vaults.item.url","value":"string"}
 {"key":"account/vaults.item.version","value":"string"}
 {"key":"account/vaults.reply.envelope","value":["vaults"]}
-{"key":"annotations/account.read-only.tools","value":["doctor","find-path","list-access","list-tags","list-types","list-vaults","query-notes","query-records","read-attachment","request-attachment-download"]}
+{"key":"annotations/account.read-only.tools","value":["doctor","find-path","list-access","list-types","list-vaults","query-records","read-attachment","request-attachment-download"]}
 {"key":"annotations/destructive.tools","value":["create-note","create-record","delete-note","delete-record","delete-tag","manage-keys","manage-token","manage-types","merge-tags","prune-schema","rename-tag","update-note","update-record","update-tag","vault-info"]}
 {"key":"annotations/read-only.tools","value":["attachment-url","doctor","find-path","list-tags","list-types","query-notes","query-records","read-attachment","request-attachment-download","vault-info"]}
 {"key":"connect/admin-scope","value":{"granted":"admin read write"}}
@@ -391,7 +391,7 @@
 {"key":"multivault/query.fan-out.keys","value":["results","vaults_queried"]}
 {"key":"multivault/refusals","value":[400,404,400]}
 {"key":"multivault/write-stamp.via","value":{"created":"key:<name>","revision":"key:<name>"}}
-{"key":"multivault/writer.tools","value":["attachment-url","create-note","create-record","delete-note","delete-record","doctor","find-path","list-tags","list-types","list-vaults","query-notes","query-records","read-attachment","request-attachment-download","request-attachment-upload","update-note","update-record","vault-info"]}
+{"key":"multivault/writer.tools","value":["attachment-url","create-record","delete-record","doctor","find-path","list-types","list-vaults","manage-types","query-records","read-attachment","request-attachment-download","request-attachment-upload","update-record","vault-info"]}
 {"key":"records/mcp.create-record.shape","value":{"body":"string","createdAt":"string","createdBy":"string","createdVia":"string","extension":"string","fields":{"content":"string","door_trip_miles":"number"},"id":"string","lastUpdatedBy":"string","lastUpdatedVia":"string","path":"string","tags":["string"],"types":["string"],"updatedAt":"string","validation_status":{"schemas":["string"],"warnings":[]}}}
 {"key":"records/mcp.list-types.shape","value":{"count":"number","created_at":"string","description":"null","expanded_count":"number","fields":{"door_trip_miles":{"indexed":"boolean","type":"string"}},"kind":"string","name":"string","parent_names":"null","relationships":"null","updated_at":"string"}}
 {"key":"records/mcp.manage-types","value":{"created_at":"string","fields":{"door_trip_miles":{"indexed":"boolean","type":"string"}},"kind":"string","tag":"string","updated_at":"string"}}

@@ -627,13 +627,15 @@ describe("account MCP — initialize + tools", () => {
       };
       const names = listBody.result.tools.map((t) => t.name);
       for (const n of ACCOUNT_MCP_TOOLS.map((t) => t.name)) expect(names).toContain(n);
-      expect(names).toContain("query-notes");
+      // query-notes is listed by its record name only (T-476); create-note has no record-named twin here, so it stays.
+      expect(names).toContain("query-records");
+      expect(names).not.toContain("query-notes");
       expect(names).toContain("create-note");
       expect(names).toContain("delete-note");
       expect(names).toContain("list-tags");
       expect(names).toContain("manage-token");
       expect(names[0]).toBe("list-vaults");
-      const qn = listBody.result.tools.find((t) => t.name === "query-notes");
+      const qn = listBody.result.tools.find((t) => t.name === "query-records");
       expect(qn?.inputSchema?.properties).toHaveProperty("vault");
       expect(qn?.inputSchema?.required ?? []).not.toContain("vault");
       // The catalog caveat is said once, on list-vaults, not on every proxied tool (the writer-list budget).
@@ -1034,7 +1036,7 @@ describe("account MCP — query-notes", () => {
           }>;
         };
       };
-      const qn = listBody.result.tools.find((t) => t.name === "query-notes");
+      const qn = listBody.result.tools.find((t) => t.name === "query-records");
       expect(qn?.inputSchema?.properties).toHaveProperty("sort");
       expect(qn?.inputSchema?.properties).toHaveProperty("include_content");
       expect(qn?.inputSchema?.properties).toHaveProperty("order_by");
@@ -1286,6 +1288,7 @@ describe("account MCP — create-note", () => {
         (await listed.json()) as { result: { tools: Array<{ name: string }> } }
       ).result.tools.map((t) => t.name);
       expect(names).toContain("list-vaults");
+      // NIP-98 (Uni's agents) keeps the note-named tools listed (T-476, contracts compat/uni)
       expect(names).toContain("query-notes");
       expect(names).not.toContain("create-note");
       expect(names).not.toContain("update-note");
@@ -1534,7 +1537,7 @@ describe("account MCP — vault module proxy", () => {
         (await listed.json()) as { result: { tools: Array<{ name: string }> } }
       ).result.tools.map((t) => t.name);
       expect(lists).toEqual(["beta", "personal"]);
-      expect(names).toContain("query-notes");
+      expect(names).toContain("query-records");
       expect(names).toContain("manage-token");
       expect(names).toContain("list-vaults");
     } finally {

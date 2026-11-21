@@ -22,7 +22,7 @@ import type { Database } from "bun:sqlite";
 import { ACCOUNT_VAULTS_UNNARROWED } from "@openparachute/door-contract";
 import pkg from "../package.json" with { type: "json" };
 import type { AccountApiDeps } from "./account-api.ts";
-import { callVaultModuleTool, FAN_OUT_TOOLS, listVaultModuleTools } from "./account-mcp-backend.ts";
+import { answersAsAlias, callVaultModuleTool, FAN_OUT_TOOLS, listVaultModuleTools } from "./account-mcp-backend.ts";
 import {
   type AccountMcpPrincipal,
   type AccountToolContext,
@@ -327,7 +327,7 @@ async function handleToolCall(
     }
   }
   const vaultTools = await listVaultModuleTools(ctx);
-  if (!vaultTools.some((t) => t.name === name)) {
+  if (!vaultTools.some((t) => t.name === name) && !answersAsAlias(name, vaultTools)) {
     return result(id, {
       content: [{ type: "text", text: `Unknown tool: ${name}` }],
       isError: true,
