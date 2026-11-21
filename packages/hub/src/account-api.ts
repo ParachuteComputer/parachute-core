@@ -324,7 +324,12 @@ function servicesBlock(meta: VaultMeta): Record<string, { url: string; version: 
  *
  * `account_mcp_endpoint` is the hub's account-level MCP door (`/account/mcp`).
  * Optional in door-contract; set once the surface exists so a client can
- * discover it from the descriptor instead of guessing the path.
+ * discover it from the descriptor instead of guessing the path. Shipped apps
+ * check it equals `<issuer>/account/mcp`, so it stays that.
+ *
+ * `mcp_endpoint` (T-476) is the one address an AI gets, `<issuer>/mcp`: the
+ * account door for an OAuth connection. An app shows it as the address to
+ * paste; a per-vault `<vault>/mcp` is the narrow choice.
  */
 export function handleAccountCapabilities(
   req: Request,
@@ -343,11 +348,14 @@ export function handleAccountCapabilities(
       billing: boolean;
     };
     caps_writable: boolean;
+    /** T-476: the one address an AI gets (a hub extra; door-contract names it in its next release). */
+    mcp_endpoint: string;
   } = {
     issuer,
     door: "hub",
     account_endpoint: `${issuer}/account`,
     account_mcp_endpoint: `${issuer}/account/mcp`,
+    mcp_endpoint: `${issuer}/mcp`,
     auth: { methods: ["password"], signin_path: "/login" },
     ...(signupPath ? { signup_path: signupPath } : {}),
     vault_url_template: `${issuer}/vault/{name}`,

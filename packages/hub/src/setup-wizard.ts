@@ -1182,12 +1182,9 @@ export function renderDoneStep(props: RenderDoneStepProps): string {
  * was a privilege over-grant + a shoulder-surf hazard. The bare OAuth
  * command was always the correct UX; it's now the only one.
  *
- * URL shape: lead with `/mcp`. The consent picker is the XOR — this vault
- * or all assigned vaults — so humans never need a second URL for the
- * house. Root PRM stays vault-only (advertising `account:vaults` next to
- * `vault:*` would bounce a catalog-copy authorize). The per-vault command
- * is the skip-picker narrower option. `/account/mcp` stays the honest
- * single-family discovery door; it is not in this copy.
+ * URL shape: lead with `/mcp`, the one address (T-476): the account door,
+ * where the person gives the AI all their vaults or only some. The per-vault
+ * command is the narrow choice, one vault.
  */
 function renderMcpTile(vaultName: string, hubOrigin: string): string {
   const safeVault = escapeHtml(vaultName);
@@ -1195,14 +1192,12 @@ function renderMcpTile(vaultName: string, hubOrigin: string): string {
   const vaultCmd = assignedVaultClaudeMcpAddCommand(hubOrigin, vaultName);
   return `<div class="done-tile">
     <h2>Connect Claude Code (MCP)</h2>
-    <p>This hub — when you approve, pick this vault or all assigned vaults:</p>
+    <p>One address for all your vaults. When you approve, give it all of them (it can make new ones too) or only some:</p>
     <pre data-testid="mcp-house-command">${escapeHtml(houseCmd)}</pre>
-    <p>Or skip the picker and connect just this vault (<code>vault:${safeVault}</code>):</p>
+    <p>Just one vault (<code>${safeVault}</code>):</p>
     <pre data-testid="mcp-vault-command">${escapeHtml(vaultCmd)}</pre>
     <p class="fine">No token needed — the command triggers browser OAuth on
-      first use (you sign in to this hub and approve access). Root
-      <code>/mcp</code> is the one URL; the consent picker chooses the
-      grant. The per-vault URL is the narrower option. For headless
+      first use (you sign in to this hub and approve access). For headless
       clients that can't do the browser flow, mint a hub token at
       <a href="/admin/tokens"><code>/admin/tokens</code></a> (or with
       <code>parachute auth mint-token</code>) and append

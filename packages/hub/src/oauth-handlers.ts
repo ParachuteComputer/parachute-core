@@ -63,10 +63,12 @@ import {
 } from "./grants.ts";
 import {
   GrantChangedError,
+  ALL_VAULTS_CHOICE,
   type PerVaultLevel,
   bumpGrantGeneration,
   isAccountDoorChoiceScope,
   isAccountVaultsConnectionScope,
+  isAllVaultsChoiceScope,
   parsePerVaultScope,
 } from "./grant-generation.ts";
 import { consumeFirstClientAutoApproveWindow } from "./hub-settings.ts";
@@ -599,22 +601,24 @@ function advertisedScopes(declared: ReadonlySet<string>, manifest: ServicesManif
  *     `/account/mcp`'s PRM; request it explicitly at root `/mcp`.
  *     `scribe:*` / `agent:send` / `hub:admin` stay dropped.
  *
- * Both documents start from `advertisedScopes`. The root document then applies
- * `narrowRootMcpScopes`, which still drops `account:vaults` out of this
- * advertisement because `advertisedScopes` already stripped `account:*`.
+ * T-476 (the one address): root `/mcp` is the address an AI gets, and what it
+ * gives is the account door. So this document now lists `account:vaults` and
+ * nothing else, the same ask as `/account/mcp`'s: a spec-following client copies
+ * the list whole, and the account door's ask can't sit beside a vault verb (the
+ * combine refusal). A client that asks for unnamed vault verbs here anyway (from
+ * the AS metadata) is led to the same consent (`rootAskAsAccountDoor`). A named
+ * `vault:<name>:<verb>` ask, a vault-audience bearer and every existing grant and
+ * refresh keep working as before: the one-vault choice is `/vault/<name>/mcp`.
  */
 export function rootMcpProtectedResourceMetadata(deps: OAuthDeps): Response {
   const iss = deps.issuer;
-  const declared = (deps.loadDeclaredScopes ?? loadDeclaredScopes)();
   return jsonResponse({
     // The resource is the root MCP endpoint, not the origin — that's what
     // distinguishes this document from the bare PRM, and what the client
     // matches against the endpoint it got the 401 from.
     resource: `${iss}/mcp`,
     authorization_servers: [iss],
-    scopes_supported: narrowRootMcpScopes(
-      advertisedScopes(declared, (deps.loadServicesManifest ?? readServicesManifest)()),
-    ),
+    scopes_supported: [ACCOUNT_VAULTS_UNNARROWED],
     bearer_methods_supported: ["header"],
     resource_documentation: "https://parachute.computer",
   });
@@ -690,7 +694,20 @@ function findNonRequestableScopes(scopes: readonly string[]): string[] {
  */
 function isNarrowedAccountVaultsScope(scope: string): boolean {
   const parts = scope.toLowerCase().split(":");
+  // T-476: leave to make vaults is the person's choice on the consent page ("All your vaults"), never the app's ask.
+  if (parts[0] === "account" && parts[2] === "vault-create") return true;
   return parts[0] === "account" && parts[2] === "vaults" && parts.length > 3;
+}
+
+/**
+ * The one address (T-476): at the root `/mcp` an app that asks for vault verbs without naming a vault is asking for
+ * what `<hub>/mcp` gives, the account door, so the ask becomes `account:vaults` and the person chooses on the account
+ * door's page (All your vaults, or only these at a level each). A named `vault:<name>:<verb>` ask stays a one-vault
+ * ask, as do existing grants and refreshes. Idempotent.
+ */
+export function rootAskAsAccountDoor(scopes: readonly string[]): string[] {
+  if (unnamedVaultVerbs([...scopes]).length === 0) return [...scopes];
+  return replaceUnnamedVaultScopesWithAccountVaults(scopes).filter((s) => !isNamedVaultScope(s));
 }
 
 function withoutNarrowedAccountVaults(scope: string): string {
@@ -1339,7 +1356,7 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
     const preNarrow = parsed.scope.split(" ").filter((s) => s.length > 0);
     const narrowed = narrowRootMcpScopes(preNarrow);
     rootNarrowedToEmpty = preNarrow.length > 0 && narrowed.length === 0;
-    parsed.scope = narrowed.join(" ");
+    parsed.scope = rootAskAsAccountDoor(narrowed).join(" ");
     url.searchParams.set("scope", parsed.scope);
   }
 
@@ -1724,6 +1741,7 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
         requestedScopes.some(isAccountVaultsConnectionScope)
           ? [...perVaultOffer(db, session.userId, userIsAdmin, assignedVaults, vaultNames)].map(([vault, max]) => ({ vault, max }))
           : undefined,
+        isRootMcpResource(parsed.resource, resolveBoundOrigins(deps)),
       ),
     ),
     200,
@@ -1817,9 +1835,14 @@ function applyAccountDoorChoice(db: Database, userId: string, clientId: string, 
     const p = parsePerVaultScope(s);
     if (p && (p.level === "write" || !chosen.has(p.vault))) chosen.set(p.vault, p.level);
   }
+  // T-476: "All your vaults" (every vault at write, and leave to make vaults) covers any per-vault level; each of its
+  // two scopes is covered only by the same scope chosen again.
+  const all = choice.includes(ALL_VAULTS_CHOICE[0]!);
   const covered = (scope: string): boolean => {
+    if (isAllVaultsChoiceScope(scope)) return choice.includes(scope);
     const p = parsePerVaultScope(scope);
-    if (!p) return false; // the level-less grant is wider than any per-vault choice
+    if (!p) return false; // the level-less grant is wider than any choice on the page
+    if (all) return true;
     const level = chosen.get(p.vault);
     return level === "write" || level === p.level;
   };
@@ -1864,8 +1887,19 @@ function applyPerVaultLevels(
   scopes: readonly string[],
   form: Awaited<ReturnType<Request["formData"]>>,
   offer: ReadonlyMap<string, PerVaultLevel>,
+  userIsAdmin = false,
 ): { scopes: string[] } | { error: string } | { none: true } {
   if (!scopes.some(isAccountVaultsConnectionScope)) return { scopes: [...scopes] };
+  // T-476: "All your vaults" (`vault_reach=all`), offered to the hub's owner, who reaches every vault at write. A form
+  // without `vault_reach` is the per-vault form of 0.9.1; `chosen` is that form under the new page.
+  const reach = form.getAll("vault_reach").map(String);
+  if (reach.length > 1 || (reach.length === 1 && reach[0] !== "all" && reach[0] !== "chosen")) {
+    return { error: "choose All your vaults or Only these vaults" };
+  }
+  if (reach[0] === "all") {
+    if (!userIsAdmin) return { error: "only the hub's owner can give an app every vault" };
+    return { scopes: [...scopes.filter((s) => !isAccountVaultsConnectionScope(s)), ...ALL_VAULTS_CHOICE] };
+  }
   if (String(form.get("account_vault_levels") ?? "") !== "1") return { scopes: [...scopes] };
   const chosen: string[] = [];
   const seen = new Set<string>();
@@ -1901,8 +1935,10 @@ function perVaultGrantCovering(
   if (!requestedScopes.some(isAccountVaultsConnectionScope)) return null;
   const grant = findGrant(db, userId, clientId);
   if (!grant) return null;
-  const perVault = grant.scopes.filter((s) => parsePerVaultScope(s) !== null);
+  const perVault = grant.scopes.filter((s) => parsePerVaultScope(s) !== null || isAllVaultsChoiceScope(s));
   if (perVault.length === 0 || grant.scopes.some(isAccountVaultsConnectionScope)) return null;
+  // T-476: All your vaults is the owner's choice; someone no longer the owner chooses again on the page
+  if (perVault.some(isAllVaultsChoiceScope) && !isHubAdmin(db, userId)) return null;
   const granted = new Set(grant.scopes);
   const rest = requestedScopes.filter((s) => !isAccountVaultsConnectionScope(s));
   if (!rest.every((s) => granted.has(s))) return null;
@@ -1921,7 +1957,12 @@ function isAccountSelfRestScope(scope: string): boolean {
  * mixing vault-audience scopes with `account:vaults`; it does not forbid
  * `account:self:{read,write,admin}` — they share the account audience. */
 function isAccountAudienceCompanion(scope: string): boolean {
-  return isAccountVaultsConnectionScope(scope) || isAccountSelfRestScope(scope) || parsePerVaultScope(scope) !== null;
+  return (
+    isAccountVaultsConnectionScope(scope) ||
+    isAccountSelfRestScope(scope) ||
+    parsePerVaultScope(scope) !== null ||
+    isAllVaultsChoiceScope(scope)
+  );
 }
 
 function isNamedVaultScope(scope: string): boolean {
@@ -1932,7 +1973,7 @@ function isNamedVaultScope(scope: string): boolean {
 }
 
 function accountVaultsCombinedWithOtherScopes(scopes: readonly string[]): boolean {
-  const has = scopes.some((s) => isAccountVaultsConnectionScope(s) || parsePerVaultScope(s) !== null);
+  const has = scopes.some((s) => isAccountVaultsConnectionScope(s) || parsePerVaultScope(s) !== null || isAllVaultsChoiceScope(s));
   if (!has) return false;
   return scopes.some((s) => !isAccountAudienceCompanion(s));
 }
@@ -2182,7 +2223,7 @@ function issueAuthCodeRedirect(
   // A refresh token or code from the earlier consent would keep the old levels, so a choice that narrows bumps the
   // grant generation (applyAccountDoorChoice): nothing minted under the wider choice mints again, in flight or not.
   // The choice, the grant write and the new code (stamped with the generation) are one synchronous transaction.
-  const perVaultChoice = dedupedScopes.some((s) => parsePerVaultScope(s) !== null);
+  const perVaultChoice = dedupedScopes.some((s) => parsePerVaultScope(s) !== null || isAllVaultsChoiceScope(s));
   const grantNow = deps.now?.() ?? new Date();
   const code = db.transaction(() => {
     if (perVaultChoice) applyAccountDoorChoice(db, userId, params.clientId, dedupedScopes, grantNow);
@@ -2361,6 +2402,7 @@ async function handleConsentSubmit(
   // MCP resources — per-vault (narrow + name) or root (drop foreign scopes,
   // picker still names); no-op otherwise (manual-pick path unchanged).
   let rootNarrowedToEmpty = false;
+  let rootAskRewritten = false;
   const boundOrigins = resolveBoundOrigins(deps);
   const boundVault = resolveResourceVault(params.resource, boundOrigins);
   if (boundVault) {
@@ -2372,7 +2414,9 @@ async function handleConsentSubmit(
     const preNarrow = params.scope.split(" ").filter((s) => s.length > 0);
     const narrowed = narrowRootMcpScopes(preNarrow);
     rootNarrowedToEmpty = preNarrow.length > 0 && narrowed.length === 0;
-    params.scope = narrowed.join(" ");
+    const asked = rootAskAsAccountDoor(narrowed);
+    rootAskRewritten = asked.join(" ") !== narrowed.join(" ");
+    params.scope = asked.join(" ");
   }
   const approve = String(form.get("approve") ?? "") === "yes";
   const sessionId = parseSessionCookie(req.headers.get("cookie"));
@@ -2435,6 +2479,16 @@ async function handleConsentSubmit(
       "access_denied",
       "user denied the authorization request",
       params.state,
+    );
+  }
+  // T-476: a one-vault page from before the one address (vault verbs at /mcp, no account-door choice on it) is
+  // refused on Approve (Deny still tells the app) rather than read as the level-less grant to every vault: the
+  // person chose one vault there.
+  if (rootAskRewritten && form.get("vault_reach") === null && form.get("account_vault_levels") === null) {
+    return htmlError(
+      "Choose again",
+      "This approval page is from an older version of this hub. Go back to the app and connect again to choose its vaults.",
+      400,
     );
   }
   let scopes = params.scope.split(" ").filter((s) => s.length > 0);
@@ -2729,7 +2783,7 @@ async function handleConsentSubmit(
   if (scopes.some(isAccountVaultsConnectionScope)) {
     const manifest = (deps.loadServicesManifest ?? readServicesManifest)();
     const offer = perVaultOffer(db, session.userId, userIsAdmin, assignedVaults, listVaultNames(manifest));
-    const applied = applyPerVaultLevels(scopes, form, offer);
+    const applied = applyPerVaultLevels(scopes, form, offer, userIsAdmin);
     if ("error" in applied) return htmlError("Vault access not allowed", `vault_scope_mismatch: ${applied.error}.`, 400);
     if ("none" in applied) {
       // Every vault at none is a choice too: drop the earlier account-door choice from the grant and bump the grant
@@ -3909,7 +3963,14 @@ function consentProps(
   // which this pure props builder deliberately doesn't take.
   grantableExtras: readonly string[] = [],
   vaultLevels?: ReadonlyArray<{ vault: string; max: "read" | "write" }>,
+  /** The ask is for this hub's one address (`isRootMcpResource`). */
+  atOneAddress = false,
 ) {
+  // T-476: the hub's owner reaches every vault at write, so they may give an app all of them (and new ones). The
+  // page starts there for the one address (`<hub>/mcp`); any other account-door ask (the app listing its person's
+  // vaults, `/account/mcp`) starts on "Only these vaults", each at read, as 0.9.1 did.
+  const vaultReachAll = vaultLevels !== undefined && userIsAdmin;
+  const vaultReachStartsAll = vaultReachAll && atOneAddress;
   const requestedScopes = params.scope.split(" ").filter((s) => s.length > 0);
   const unnamedVerbs = unnamedVaultVerbs(requestedScopes);
   // Zero-vault non-admin can't authorize a vault-scoped request (hub#431).
@@ -4066,7 +4127,7 @@ function consentProps(
     // at DCR time (bearer hub:admin / same-origin session → true).
     sameHub: client.sameHub,
     grantableExtras,
-    ...(vaultLevels ? { vaultLevels } : {}),
+    ...(vaultLevels ? { vaultLevels, vaultReachAll, vaultReachStartsAll } : {}),
   };
 }
 

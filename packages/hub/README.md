@@ -117,10 +117,9 @@ parachute status
 
 Vault is up on `127.0.0.1:1940`; Claude Code picks up the MCP on your next
 session. Point any other local MCP client (Codex, Goose, OpenCode, Cursor, Zed,
-Cline, your own agent) at `http://127.0.0.1:1940/mcp` — the canonical,
-vault-agnostic MCP door; the token's audience (picked at OAuth consent, or
-named explicitly) names the target vault. (Per-vault `/vault/<name>/mcp` still
-works if you want to skip the vault picker.)
+Cline, your own agent) at the hub's `/mcp` (`http://127.0.0.1:1939/mcp` on this machine): one address for
+all your vaults. When you approve the AI you give it all of them (it can make new ones too) or only some, each at a
+level; it names a vault on each call. To give an AI just one vault, use that vault's own `/vault/<name>/mcp`.
 
 ### Want the wizard in the terminal instead of the browser?
 

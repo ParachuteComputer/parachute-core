@@ -42,9 +42,23 @@ export function parsePerVaultScope(scope: string): { vault: string; level: PerVa
   return m ? { vault: m[1]!, level: m[2] as PerVaultLevel } : null;
 }
 
-/** The account-door scopes a per-vault choice supersedes: the level-less connection scope and every per-vault level. */
+/**
+ * "All your vaults" on the account-door consent (T-476, the one address `<hub>/mcp`): every vault the person reaches
+ * at write, the ones made later included, and leave to make new vaults. Capped at write, never the owner's admin
+ * (key-level.ts). Like the per-vault levels, minted only from the consent form, never from a client's own ask.
+ */
+export const ALL_VAULTS_CHOICE: readonly string[] = ["account:self:vaults:*:write", "account:self:vault-create"];
+
+export function isAllVaultsChoiceScope(scope: string): boolean {
+  return ALL_VAULTS_CHOICE.includes(scope);
+}
+
+/**
+ * The account-door scopes a choice on the consent page supersedes: the level-less connection scope, every per-vault
+ * level, and "All your vaults".
+ */
 export function isAccountDoorChoiceScope(scope: string): boolean {
-  return parsePerVaultScope(scope) !== null || isAccountVaultsConnectionScope(scope);
+  return parsePerVaultScope(scope) !== null || isAccountVaultsConnectionScope(scope) || isAllVaultsChoiceScope(scope);
 }
 
 /** The current generation for (user, client); no row means 0 (every row from before the counter is 0). */

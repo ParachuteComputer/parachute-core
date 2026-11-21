@@ -49,13 +49,19 @@ const setCookie = (r: Response, name: string) => {
 };
 
 /** The person approves the app on the door's own consent screen. Returns where the door sends the browser. */
-async function approve(authorizeEndpoint: string, params: Record<string, string>, form: Record<string, string> = {}): Promise<string> {
+async function approve(
+  authorizeEndpoint: string,
+  params: Record<string, string>,
+  form: Record<string, string> = {},
+  seen?: (html: string) => void,
+): Promise<string> {
   const d = door();
   if (d.signIn.how !== "cookie") throw new Error("approve: this door's owner signs in with a key; the consent screen needs a browser session");
   const first = await safeFetch(`${authorizeEndpoint}?${new URLSearchParams(params)}`, { headers: { cookie: d.signIn.cookie } });
   if (first.status === 302) return first.headers.get("location")!;
   expect(first.status).toBe(200);
   const html = await first.text();
+  seen?.(html);
   if (d.kind === "box") {
     const csrf = setCookie(first, "parachute_hub_csrf") ?? d.signIn.csrf;
     const session = /parachute_hub_session=([^;]+)/.exec(d.signIn.cookie)![1]!;
@@ -129,12 +135,22 @@ export async function connect(opts: { scope?: (vault: string) => string; appName
  * (`account:vaults`, as its protected-resource document says), and the person chooses a level for each vault:
  * none, read or write. The form posts `account_vault_levels=1` and one `vault_level:<vault>` = `none|read|write`
  * per vault; a vault not posted is none. Returns the token reply, or the refusal when the door refuses the choice.
+ *
+ * `resource` is the address the app was given (default the account door's own, `<issuer>/account/mcp`; the one
+ * address, `<issuer>/mcp`, in one-address.test.ts). `scope` defaults to what that address's protected-resource
+ * document lists, as a spec-following app asks. `form` adds fields to the person's answer; `seen` gets the consent
+ * page as the person saw it.
  */
-export async function connectAccount(opts: { appName: string; levels: Record<string, string>; scope?: string }): Promise<
-  { ok: true; access: string; scope: string } | { ok: false; refusal: string }
-> {
+export async function connectAccount(opts: {
+  appName: string;
+  levels: Record<string, string>;
+  scope?: string;
+  resource?: string;
+  form?: Record<string, string>;
+  seen?: (html: string) => void;
+}): Promise<{ ok: true; access: string; scope: string } | { ok: false; refusal: string }> {
   const d = door();
-  const resource = `${d.issuer}/account/mcp`;
+  const resource = opts.resource ?? `${d.issuer}/account/mcp`;
   const cold = await safeFetch(resource, {
     method: "POST",
     headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
@@ -144,7 +160,7 @@ export async function connectAccount(opts: { appName: string; levels: Record<str
   const prmUrl = (cold.headers.get("www-authenticate") ?? "").match(/resource_metadata="([^"]+)"/)?.[1];
   expect(prmUrl).toBeString();
   const prm = await (await safeFetch(prmUrl!)).json();
-  expect(prm.scopes_supported).toContain("account:vaults");
+  if (opts.scope === undefined) expect(prm.scopes_supported).toContain("account:vaults");
   const as = await (await safeFetch(`${d.issuer}/.well-known/oauth-authorization-server`)).json();
   const reg = await safeFetch(as.registration_endpoint, {
     method: "POST",
@@ -161,15 +177,16 @@ export async function connectAccount(opts: { appName: string; levels: Record<str
     response_type: "code",
     code_challenge: createHash("sha256").update(verifier).digest("base64url"),
     code_challenge_method: "S256",
-    scope: opts.scope ?? "account:vaults",
+    scope: opts.scope ?? prm.scopes_supported.join(" "),
     state,
     resource,
   };
   const form: Record<string, string> = { account_vault_levels: "1" };
   for (const [v, level] of Object.entries(opts.levels)) form[`vault_level:${v}`] = level;
+  Object.assign(form, opts.form ?? {});
   let location: string;
   try {
-    location = await approve(as.authorization_endpoint, params, form);
+    location = await approve(as.authorization_endpoint, params, form, opts.seen);
   } catch (e) {
     return { ok: false, refusal: (e as Error).message };
   }

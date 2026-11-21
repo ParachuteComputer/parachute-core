@@ -22,7 +22,7 @@ import type { Database } from "bun:sqlite";
 import { ACCOUNT_VAULTS_UNNARROWED } from "@openparachute/door-contract";
 import pkg from "../package.json" with { type: "json" };
 import type { AccountApiDeps } from "./account-api.ts";
-import { callVaultModuleTool, FAN_OUT_TOOLS, listVaultModuleTools } from "./account-mcp-backend.ts";
+import { answersAsAlias, callVaultModuleTool, FAN_OUT_TOOLS, listVaultModuleTools } from "./account-mcp-backend.ts";
 import {
   type AccountMcpPrincipal,
   type AccountToolContext,
@@ -130,8 +130,7 @@ function accountMcpResource(issuer: string): string {
 /**
  * RFC 9728 §3.3: WWW-Authenticate `resource_metadata` must describe the
  * requested URL. handleAccountMcp answers both `/mcp` (root dispatch) and
- * `/account/mcp`. Do not advertise `account:vaults` on the root PRM —
- * catalog-copy + combine-refusal is a total `invalid_scope` bounce.
+ * `/account/mcp`. Since T-476 both documents list `account:vaults` alone.
  */
 export function challengePrmPath(req: Request): string {
   let pathname = "";
@@ -327,7 +326,7 @@ async function handleToolCall(
     }
   }
   const vaultTools = await listVaultModuleTools(ctx);
-  if (!vaultTools.some((t) => t.name === name)) {
+  if (!vaultTools.some((t) => t.name === name) && !answersAsAlias(name, vaultTools)) {
     return result(id, {
       content: [{ type: "text", text: `Unknown tool: ${name}` }],
       isError: true,

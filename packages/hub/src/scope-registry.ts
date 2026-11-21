@@ -22,6 +22,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { isAllVaultsChoiceScope } from "./grant-generation.ts";
 import { type ModuleManifest, validateModuleManifest } from "./module-manifest.ts";
 import { FIRST_PARTY_SCOPES } from "./scope-explanations.ts";
 import { readManifestLenient as readServicesManifest } from "./services-manifest.ts";
@@ -56,6 +57,8 @@ const PER_VAULT_ACCOUNT_SCOPE_RE = /^account:self:vaults:[a-z0-9_-]+:(read|write
 export function isKnownScope(scope: string, declared: ReadonlySet<string>): boolean {
   if (declared.has(scope)) return true;
   if (PER_VAULT_ACCOUNT_SCOPE_RE.test(scope) && declared.has("account:vaults")) return true;
+  // "All your vaults" on the account-door consent (T-476), minted the same way.
+  if (isAllVaultsChoiceScope(scope) && declared.has("account:vaults")) return true;
   const parts = scope.split(":");
   if (parts.length < 3) return false;
   const collapsed = `${parts[0]}:${parts[parts.length - 1]}`;
