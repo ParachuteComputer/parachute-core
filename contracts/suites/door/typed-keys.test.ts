@@ -16,6 +16,7 @@ import { describe, expect, test } from "bun:test";
 import { declareType, ids, must, records, statements } from "../door-v1/_grants.ts";
 import { randomBytes } from "node:crypto";
 import { accountToken, door, enc, lacks, mcp, rest, runId, safeFetch, token, vaultUrl, type Reply } from "./_door.ts";
+import { connect } from "./_connect.ts";
 
 const without = lacks("typed-keys");
 const owner = records("write");
@@ -308,6 +309,28 @@ describe.skipIf(without)("who reaches the vault, and ending it", () => {
     expect(frames.length).toBe(before);
     const spent = await safeFetch(url, { method: ticket.method ?? "PUT", headers: { "content-type": "image/png" }, body: bytes });
     expect(spent.status).toBe(404);
+  });
+
+  test("an app connected by OAuth is a row by the name it registered, and End stops it: its token and its refresh", async () => {
+    const appName = `Door OAuth app ${runId("a")}`;
+    const app = await connect({ appName });
+    const reach = (bearer: string) => safeFetch(`${vaultUrl()}/api/vault`, { headers: { authorization: `Bearer ${bearer}` } });
+    expect((await reach(app.access)).status).toBe(200);
+    // as a connected app does: its token refreshed once, so an older access token is still alive beside the new one
+    const rotated = await safeFetch(app.tokenEndpoint, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: app.refresh, client_id: app.clientId }) });
+    expect(rotated.status).toBe(200);
+    const next = await rotated.json();
+    expect((await reach(next.access_token)).status).toBe(200);
+    const row = (await list()).body.grants.find((x: any) => x.app === appName && x.state === "in_force");
+    expect(row, "the app's row").toBeTruthy();
+    expect(row.types).toEqual({ "*": ["read", "create", "update", "delete"] });
+    expect((await end(row.id)).status).toBe(200);
+    expect((await reach(next.access_token)).status).toBe(401);
+    expect((await reach(app.access)).status, "the older access token, still in its time").toBe(401);
+    const refreshed = await safeFetch(app.tokenEndpoint, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: next.refresh_token, client_id: app.clientId }) });
+    expect(refreshed.status, "a refresh after End").toBeGreaterThanOrEqual(400);
   });
 
   test("every credential that reaches the vault is a row in the list: an app key shows as a grant the door vouches for", async () => {
