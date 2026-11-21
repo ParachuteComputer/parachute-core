@@ -7,7 +7,10 @@
  *   POST   /account/vaults/<v>/statements        → 405 (signed statements are a later slice)
  *
  * Every credential that reaches the vault is a key (keys.ts), so every one is a row: a named key, an AI or app
- * connected by OAuth, this app on each device. Each row is a **door grant** (§7.3), the door's word that the signed-in
+ * connected by OAuth, this app on each device. A person the vault is shared with (a member, `user_vaults`; spec §5.1)
+ * is one row of their own, `by: "self"`, whose `grantee` is their key and whose name is the one they were invited by;
+ * their keys and sign-ins are theirs, so none is a row beside them (one list, T-476). Ending that row ends the
+ * membership (as `revoke-access` does): every credential of theirs for the vault, and any way back in. Each row is a **door grant** (§7.3), the door's word that the signed-in
  * owner agreed, in §7.1's row shape: `{id, origin: "door", state, signer: null, grantee: null, by: "signer", types,
  * deny: [], expires_at, event: null}`, with what a person needs to know it by: `name`, `kind` (person, agent, app,
  * service), `app` and `client` (the OAuth app's own name and client id, when it was one), `created_at`, `last_used_at`, and `admin`/`export` for
@@ -26,6 +29,8 @@ import { type AdminAuthContext } from "./admin-auth.ts";
 import { HOST_ADMIN_SCOPE } from "./admin-vaults.ts";
 import { revokeTokenByJti, signAccessToken, validateAccessToken } from "./jwt-sign.ts";
 import { listKeys, type KeyView } from "./keys.ts";
+import { nameOnVault } from "./share-invites.ts";
+import { isHubAdmin, removeUserVault } from "./users.ts";
 
 export const GRANT_VERBS_READ = ["read"] as const;
 /** Permission keys that say who a write is for or which key signed, and narrow nothing a credential reaches. */
@@ -115,24 +120,50 @@ function appsOf(db: Database): Map<string, { client: string; name: string | null
   }
 }
 
-/** Every key that reaches `vault`, as grant rows. */
+/** A person the vault is shared with: their hub user, their role there, since when, and their key (the first linked). */
+interface Member {
+  user: string;
+  role: string;
+  since: string;
+  pubkey: string | null;
+}
+
+/** The people `vault` is shared with (`user_vaults`), the hub's admins aside (they reach every vault by construction). */
+function membersOf(db: Database, vault: string): Member[] {
+  const rows = db
+    .prepare(
+      `SELECT uv.user_id AS user, uv.role AS role, uv.created_at AS since,
+              (SELECT up.pubkey FROM user_pubkeys up WHERE up.user_id = uv.user_id ORDER BY up.linked_at, up.pubkey LIMIT 1) AS pubkey
+       FROM user_vaults uv WHERE uv.vault_name = ? ORDER BY uv.created_at, uv.user_id`,
+    )
+    .all(vault) as Member[];
+  return rows.filter((m) => !isHubAdmin(db, m.user));
+}
+
+/** A member's row's id: their key (one key is one member, spec §5.1), else their hub user id. */
+const memberId = (m: Member) => m.pubkey ?? m.user;
+
+/** Every credential that reaches `vault`, as grant rows: each key, and each person it is shared with (their keys in their row). */
 export function vaultGrantRows(db: Database, vault: string, now: Date = new Date()) {
   const jtis = new Map((db.prepare("SELECT name, jti FROM keys").all() as { name: string; jti: string }[]).map((r) => [r.name, r.jti]));
   const apps = appsOf(db);
-  return listKeys(db, now)
-    .filter((k) => levelIn(k, vault) !== undefined)
+  const members = membersOf(db, vault);
+  const theirs = new Set(members.map((m) => m.user));
+  const reaching = listKeys(db, now).filter((k) => levelIn(k, vault) !== undefined);
+  const keys = reaching
+    .filter((k) => !(k.owner !== null && theirs.has(k.owner)))
     .map((k) => ({
       id: k.name,
       origin: "door" as const,
       state: k.status === "active" ? "in_force" : k.status,
       signer: null,
-      grantee: null,
-      by: "signer" as const,
+      grantee: null as string | null,
+      by: "signer" as "signer" | "self",
       types: grantTypes(k, vault),
       deny: k.denies ?? [],
       expires_at: k.expires_at,
       event: null,
-      name: k.name,
+      name: k.name as string,
       kind: k.owner_kind,
       app: apps.get(jtis.get(k.name) ?? "")?.name ?? null,
       client: apps.get(jtis.get(k.name) ?? "")?.client ?? null,
@@ -141,6 +172,37 @@ export function vaultGrantRows(db: Database, vault: string, now: Date = new Date
       created_at: k.created_at,
       last_used_at: k.last_used_at,
     }));
+  const people = members.map((m) => {
+    // when they last used the vault: the latest of their keys that reach it
+    const used = reaching
+      .filter((k) => k.owner === m.user && k.last_used_at)
+      .map((k) => k.last_used_at!)
+      .sort()
+      .at(-1) ?? null;
+    const verbs = m.role === "read" ? [...GRANT_VERBS_READ] : [...GRANT_VERBS_WRITE];
+    return {
+      id: memberId(m),
+      origin: "door" as const,
+      state: "in_force",
+      signer: null,
+      grantee: m.pubkey,
+      by: "self" as const,
+      types: { "*": verbs },
+      deny: [],
+      expires_at: null,
+      event: null,
+      name: nameOnVault(db, m.user, vault) ?? m.user,
+      kind: "person" as const,
+      app: null,
+      client: null,
+      // `write` runs the vault with its owner (grant-access.ts): it may let others in
+      ...(m.role === "write" ? { admin: true } : {}),
+      member: { role: m.role },
+      created_at: m.since,
+      last_used_at: used,
+    };
+  });
+  return [...keys, ...people];
 }
 
 /** A short admin credential for the hub's own call to one vault (as admin-vault-api.ts makes for its session). */
@@ -198,6 +260,16 @@ export async function routeVaultGrants(req: Request, pathname: string, deps: Vau
 }
 
 async function endVaultGrant(deps: VaultGrantsDeps, gate: Gate, vault: string, id: string, now: Date): Promise<Response> {
+  // a person the vault is shared with: their membership ends, with every credential of theirs for it (users.ts
+  // removeUserVault), so no sign-in of theirs comes back
+  const member = membersOf(deps.db, vault).find((m) => memberId(m) === id);
+  if (member) {
+    removeUserVault(deps.db, member.user, vault, () => now);
+    console.log(
+      `vault access revoked: vault=${vault} subject_pubkey=${member.pubkey ?? ""} subject_user_id=${member.user} actor_user_id=${gate.ctx.sub} actor_pubkey= via=statements`,
+    );
+    return json(200, { id, state: "revoked", revoked_at: now.toISOString() });
+  }
   const key = listKeys(deps.db, now).find((k) => k.name === id && levelIn(k, vault) !== undefined);
   if (!key) return err(404, "not_found", `nothing called "${id}" reaches ${vault}`);
   // a vault's admin ends only what reaches that vault and nothing else: every scope of it one this vault's admin could
