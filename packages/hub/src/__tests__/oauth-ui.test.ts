@@ -100,6 +100,27 @@ describe("renderLogin", () => {
 });
 
 describe("renderConsent", () => {
+  // SECURITY (T-476 stranger walk): the per-scope checkboxes sat outside the <form>, so a browser posted none of them,
+  // and the submit handler's no-granted_scope fallback granted every requested scope: unticking admin did nothing.
+  test("each requested scope's checkbox is inside the consent form, so an unticked one is not posted", () => {
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "Claude",
+      scopes: ["vault:read", "vault:write", "vault:admin"],
+    });
+    const open = html.indexOf('class="auth-form consent-form"');
+    const close = html.indexOf("</form>", open);
+    expect(open).toBeGreaterThan(-1);
+    const boxes = [...html.matchAll(/<input type="checkbox" name="granted_scope"/g)].map((m) => m.index ?? -1);
+    expect(boxes.length).toBe(3);
+    for (const at of boxes) {
+      expect(at).toBeGreaterThan(open);
+      expect(at).toBeLessThan(close);
+    }
+  });
+
   test("shows client name, client_id, and a row per scope", () => {
     const html = renderConsent({
       params: PARAMS,

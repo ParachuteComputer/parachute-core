@@ -519,12 +519,14 @@ export function renderConsent(props: ConsentViewProps): string {
       </div>
       ${staleBanner}
       ${noVaultsBanner}
-      <section class="scopes">
-        <h2 class="scopes-title">Permissions requested</h2>
-        <ul class="scope-list">${scopeRows}</ul>
-        ${readsVault ? `<p class="scope-vendor-note">What this app reads from your vault goes to the company that runs it.</p>` : ""}
-      </section>
       <form method="POST" action="/oauth/authorize" class="auth-form consent-form">
+        <!-- inside the form: each requested scope's checkbox is posted as granted_scope, so a box the person unticks is
+             not granted. Outside it, nothing was posted and the hub granted everything asked (T-476 stranger walk). -->
+        <section class="scopes">
+          <h2 class="scopes-title">Permissions requested</h2>
+          <ul class="scope-list">${scopeRows}</ul>
+          ${readsVault ? `<p class="scope-vendor-note">What this app reads from your vault goes to the company that runs it.</p>` : ""}
+        </section>
         <input type="hidden" name="__action" value="consent" />
         ${renderCsrfHiddenInput(csrfToken)}
         ${renderHiddenInputs(params)}
