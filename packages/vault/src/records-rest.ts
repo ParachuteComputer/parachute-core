@@ -2,7 +2,8 @@
  * `/vault/<v>/api/records…` and `/api/types…` on the box (SPEC §5.1, ROADMAP 0.9.1): the record door over REST.
  *
  * routing.ts has already authenticated the request and applied the scope gate to its twin path (`/notes…`,
- * `/tags…`: an admin route stays admin under its new name). Here the request's words are moved by the engine's
+ * `/tags…`: an admin route stays admin under its new name, but for `PUT /api/types/:name`, where write may define a
+ * type: write-defines-types.md). Here the request's words are moved by the engine's
  * translator (core/src/rest-records.ts, the record tools' own `paramsIn`/`resultOut`), the record door's own
  * rules are applied (`?type=`, a type's name refused in `tags`), and the twin handler answers.
  */
