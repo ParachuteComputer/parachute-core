@@ -100,6 +100,7 @@ export async function startWorkersDoor(opts: {
   // Which config, environment and D1 name the two workers run from.
   let envArgs: string[] = ["--env", "staging"];
   let d1Name = "parachute-identity-staging";
+  let oneAddress = false;
   if (profile.kind === "personal") {
     // The checkout's own single-owner profile (deploy/personal/render.sh), for a made-up owner. Its rendered files are
     // read and removed; what runs is this door's own copy, so a real rendered profile is never touched.
@@ -112,7 +113,12 @@ export async function startWorkersDoor(opts: {
     if (rendered.some((f) => existsSync(f))) throw new Error("door: this checkout already holds a rendered personal profile; use a checkout of its own");
     const r = Bun.spawnSync(["bash", render, profileFile, "00000000-0000-4000-8000-000000000000", "local"], { stdout: "pipe", stderr: "pipe" });
     if (r.exitCode !== 0) throw new Error(`door: rendering the personal profile failed: ${r.stderr.toString().slice(-400)}`);
-    writeFileSync(join(identityDir, GEN), withoutAi(readFileSync(rendered[0]!, "utf8")));
+    const identityText = readFileSync(rendered[0]!, "utf8");
+    // A profile that gives out its own origin for vaults (one address: the identity worker hands /vault/* to the vault
+    // worker, parachute-cloud T-476) says so here too, on this run's own issuer rather than the rendered workers.dev name.
+    const tomlVar = (k: string) => new RegExp(`^${k}\\s*=\\s*"([^"]*)"`, "m").exec(identityText)?.[1];
+    if (tomlVar("VAULT_PUBLIC_ORIGIN") !== undefined && tomlVar("VAULT_PUBLIC_ORIGIN") === tomlVar("ISSUER")) oneAddress = true;
+    writeFileSync(join(identityDir, GEN), withoutAi(identityText));
     writeFileSync(join(vaultDir, GEN), withoutAi(readFileSync(rendered[1]!, "utf8")));
     for (const f of rendered) rmSync(f, { force: true });
     envArgs = [];
@@ -169,6 +175,7 @@ export async function startWorkersDoor(opts: {
       VAULT_ORIGIN: vaultOrigin,
       VAULT_BASE_DOMAIN: host,
       OPS_RUN_TOKEN: readFileSync(opsTokenFile, "utf8"),
+      ...(oneAddress ? { VAULT_PUBLIC_ORIGIN: issuer } : {}),
       ...opts.identityVars,
     });
     await waitFor(`${issuer}/health`, "the identity worker", logs);
@@ -177,7 +184,8 @@ export async function startWorkersDoor(opts: {
     await stop();
     throw new Error(`${(err as Error).message}\n${tail.slice(-1500)}`);
   }
-  return { issuer, vaultOrigin, opsTokenFile, state, stop, logs };
+  // where the door's vaults answer for an app: the vault worker's own origin, or the issuer on a one-address door
+  return { issuer, vaultOrigin: oneAddress ? issuer : vaultOrigin, opsTokenFile, state, stop, logs };
 }
 
 function cookieVal(setCookies: string[], name: string): string | null {
