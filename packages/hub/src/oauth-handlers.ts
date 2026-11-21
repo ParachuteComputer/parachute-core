@@ -1834,9 +1834,14 @@ function applyAccountDoorChoice(db: Database, userId: string, clientId: string, 
     const p = parsePerVaultScope(s);
     if (p && (p.level === "write" || !chosen.has(p.vault))) chosen.set(p.vault, p.level);
   }
+  // T-476: "All your vaults" (every vault at write, and leave to make vaults) covers any per-vault level; each of its
+  // two scopes is covered only by the same scope chosen again.
+  const all = choice.includes(ALL_VAULTS_CHOICE[0]!);
   const covered = (scope: string): boolean => {
+    if (isAllVaultsChoiceScope(scope)) return choice.includes(scope);
     const p = parsePerVaultScope(scope);
-    if (!p) return false; // the level-less grant is wider than any per-vault choice
+    if (!p) return false; // the level-less grant is wider than any choice on the page
+    if (all) return true;
     const level = chosen.get(p.vault);
     return level === "write" || level === p.level;
   };
@@ -2215,7 +2220,7 @@ function issueAuthCodeRedirect(
   // A refresh token or code from the earlier consent would keep the old levels, so a choice that narrows bumps the
   // grant generation (applyAccountDoorChoice): nothing minted under the wider choice mints again, in flight or not.
   // The choice, the grant write and the new code (stamped with the generation) are one synchronous transaction.
-  const perVaultChoice = dedupedScopes.some((s) => parsePerVaultScope(s) !== null);
+  const perVaultChoice = dedupedScopes.some((s) => parsePerVaultScope(s) !== null || isAllVaultsChoiceScope(s));
   const grantNow = deps.now?.() ?? new Date();
   const code = db.transaction(() => {
     if (perVaultChoice) applyAccountDoorChoice(db, userId, params.clientId, dedupedScopes, grantNow);
@@ -2394,6 +2399,7 @@ async function handleConsentSubmit(
   // MCP resources — per-vault (narrow + name) or root (drop foreign scopes,
   // picker still names); no-op otherwise (manual-pick path unchanged).
   let rootNarrowedToEmpty = false;
+  let rootAskRewritten = false;
   const boundOrigins = resolveBoundOrigins(deps);
   const boundVault = resolveResourceVault(params.resource, boundOrigins);
   if (boundVault) {
@@ -2405,7 +2411,18 @@ async function handleConsentSubmit(
     const preNarrow = params.scope.split(" ").filter((s) => s.length > 0);
     const narrowed = narrowRootMcpScopes(preNarrow);
     rootNarrowedToEmpty = preNarrow.length > 0 && narrowed.length === 0;
-    params.scope = rootAskAsAccountDoor(narrowed).join(" ");
+    const asked = rootAskAsAccountDoor(narrowed);
+    rootAskRewritten = asked.join(" ") !== narrowed.join(" ");
+    params.scope = asked.join(" ");
+  }
+  // T-476: a one-vault page from before the one address (vault verbs at /mcp, no account-door choice on it) is
+  // refused rather than read as the level-less grant to every vault: the person chose one vault there.
+  if (rootAskRewritten && form.get("vault_reach") === null && form.get("account_vault_levels") === null) {
+    return htmlError(
+      "Choose again",
+      "This approval page is from an older version of this hub. Go back to the app and connect again to choose its vaults.",
+      400,
+    );
   }
   const approve = String(form.get("approve") ?? "") === "yes";
   const sessionId = parseSessionCookie(req.headers.get("cookie"));
@@ -3943,8 +3960,12 @@ function consentProps(
   grantableExtras: readonly string[] = [],
   vaultLevels?: ReadonlyArray<{ vault: string; max: "read" | "write" }>,
 ) {
-  // T-476: the hub's owner reaches every vault at write, so they may give an app all of them (and new ones).
+  // T-476: the hub's owner reaches every vault at write, so they may give an app all of them (and new ones). The
+  // page starts there for the one address (`<hub>/mcp`); any other account-door ask (the app listing its person's
+  // vaults, `/account/mcp`) starts on "Only these vaults", each at read, as 0.9.1 did.
   const vaultReachAll = vaultLevels !== undefined && userIsAdmin;
+  let vaultReachStartsAll = false;
+  try { vaultReachStartsAll = vaultReachAll && params.resource !== null && /^\/mcp\/?$/.test(new URL(params.resource).pathname); } catch { /* none */ }
   const requestedScopes = params.scope.split(" ").filter((s) => s.length > 0);
   const unnamedVerbs = unnamedVaultVerbs(requestedScopes);
   // Zero-vault non-admin can't authorize a vault-scoped request (hub#431).
@@ -4101,7 +4122,7 @@ function consentProps(
     // at DCR time (bearer hub:admin / same-origin session → true).
     sameHub: client.sameHub,
     grantableExtras,
-    ...(vaultLevels ? { vaultLevels, vaultReachAll } : {}),
+    ...(vaultLevels ? { vaultLevels, vaultReachAll, vaultReachStartsAll } : {}),
   };
 }
 

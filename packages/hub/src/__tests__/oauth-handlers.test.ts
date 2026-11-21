@@ -10443,31 +10443,11 @@ describe("RFC 8707 resource binding — vault-bound MCP (fix #461)", () => {
           }),
           RESOURCE_DEPS,
         );
-        expect(consentRes.status).toBe(302);
-        const code = new URL(consentRes.headers.get("location") ?? "").searchParams.get("code");
-        expect(code).toBeTruthy();
-
-        const tokenRes = await handleToken(
-          db,
-          new Request(`${ISSUER}/oauth/token`, {
-            method: "POST",
-            body: new URLSearchParams({
-              grant_type: "authorization_code",
-              code: code ?? "",
-              client_id: reg.client.clientId,
-              redirect_uri: "https://app.example/cb",
-              code_verifier: verifier,
-            }),
-            headers: { "content-type": "application/x-www-form-urlencoded" },
-          }),
-          RESOURCE_DEPS,
-        );
-        expect(tokenRes.status).toBe(200);
-        const tok = (await tokenRes.json()) as { scope: string };
-        // scribe dropped; the unnamed vault verb became the account door's ask (T-476), so the picked vault is
-        // ignored and a form without the page's choice gets the level-less grant of a 0.9.0 page, as before 0.9.1.
-        expect(tok.scope.split(" ")).not.toContain("scribe:transcribe");
-        expect(tok.scope).toBe("account:self:vaults");
+        // T-476: vault verbs at /mcp are an ask for the account door, and a form without its choice (an older
+        // one-vault page, or this hand-crafted one) is refused: nothing is minted, scribe or otherwise.
+        expect(consentRes.status).toBe(400);
+        expect(consentRes.headers.get("location")).toBeNull();
+        void verifier;
       } finally {
         cleanup();
       }
@@ -11154,7 +11134,7 @@ describe("single OAuth consent + grantable vault admin + delegate-only cap (2026
     }
   });
 
-  test("whole-account pick plus extra_scope account:self:admin at resource=/mcp mints both", async () => {
+  test("All your vaults plus extra_scope account:self:admin at resource=/mcp mints both (T-476)", async () => {
     const { db, cleanup } = await makeDb();
     try {
       const owner = await createUser(db, "owner", "pw");
@@ -11171,7 +11151,8 @@ describe("single OAuth consent + grantable vault admin + delegate-only cap (2026
         "vault:read",
         challenge,
         {
-          vault_pick: VAULT_PICK_ACCOUNT,
+          vault_reach: "all",
+          account_vault_levels: "1",
           extra_scope: "account:self:admin",
           resource: `${ISSUER}/mcp`,
         },
@@ -11200,7 +11181,7 @@ describe("single OAuth consent + grantable vault admin + delegate-only cap (2026
       expect(tokenRes.status).toBe(200);
       const body = (await tokenRes.json()) as { access_token: string; scope: string };
       const { payload } = await validateAccessToken(db, body.access_token, ISSUER);
-      expect(body.scope.split(" ").sort()).toEqual(["account:self:admin", "account:self:vaults"]);
+      expect(body.scope.split(" ").sort()).toEqual(["account:self:admin", "account:self:vault-create", "account:self:vaults:*:write"]);
       expect(payload.aud).toBe("account");
     } finally {
       cleanup();

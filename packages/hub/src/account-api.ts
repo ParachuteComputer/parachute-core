@@ -348,6 +348,8 @@ export function handleAccountCapabilities(
       billing: boolean;
     };
     caps_writable: boolean;
+    /** T-476: the one address an AI gets (a hub extra; door-contract names it in its next release). */
+    mcp_endpoint: string;
   } = {
     issuer,
     door: "hub",

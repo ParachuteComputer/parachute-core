@@ -175,6 +175,8 @@ export interface ConsentViewProps {
    * owner only.
    */
   vaultReachAll?: boolean;
+  /** With `vaultReachAll`: "All your vaults" is the choice the page starts on (the one address); else "Only these". */
+  vaultReachStartsAll?: boolean;
   /**
    * hub#314 — same-hub vs external trust marker. True when the requesting
    * client was registered through this hub's own flow / first-party install
@@ -408,6 +410,7 @@ export function renderConsent(props: ConsentViewProps): string {
     sameHub,
     vaultLevels,
     vaultReachAll,
+    vaultReachStartsAll,
   } = props;
   // Substitute unnamed `vault:<verb>` rows with the resolved named form so
   // the operator sees the scope shape that will appear in the token. Raw
@@ -434,7 +437,7 @@ export function renderConsent(props: ConsentViewProps): string {
   const readsVault = displayedScopes.some((sc) => sc.startsWith("vault:"));
   const extrasSection = renderGrantableExtras(grantableExtras ?? [], displayedScopes.length === 0);
   const pickerSection = vaultPicker ? renderVaultPicker(vaultPicker) : "";
-  const levelsSection = vaultLevels ? renderVaultLevels(vaultLevels, vaultReachAll === true) : "";
+  const levelsSection = vaultLevels ? renderVaultLevels(vaultLevels, vaultReachAll === true, vaultReachStartsAll === true) : "";
   // Approve is disabled when the picker can't yield a valid vault. The
   // empty-vault branch (no vaults registered) is the original case. A
   // locked-vault picker (multi-user Phase 1) always has a valid value via
@@ -460,7 +463,7 @@ export function renderConsent(props: ConsentViewProps): string {
       vaultPicker.lockedVault === undefined &&
       vaultPicker.availableVaults.length === 0) ||
     blockApproveForStaleAssignment === true ||
-    (vaultLevels !== undefined && vaultLevels.length === 0) ||
+    (vaultLevels !== undefined && vaultLevels.length === 0 && vaultReachAll !== true) ||
     cannotAuthorize
       ? " disabled"
       : "";
@@ -551,7 +554,18 @@ export function renderConsent(props: ConsentViewProps): string {
  * The account door's per-vault levels: one row per vault, none / read / write, read chosen to start (the narrowest
  * level that still connects). Write is offered only where the person holds it. Posts `vault_level:<vault>`.
  */
-function renderVaultLevels(levels: ReadonlyArray<{ vault: string; max: "read" | "write" }>, reachAll = false): string {
+function renderVaultLevels(levels: ReadonlyArray<{ vault: string; max: "read" | "write" }>, reachAll = false, startAll = false): string {
+  if (levels.length === 0 && reachAll) {
+    // T-476: a hub with no vault yet. The owner can still give the app all their vaults, and it can make the first.
+    return `
+        <section class="vault-levels vault-levels-reach vault-levels-empty">
+          <h2 class="scopes-title">Vaults</h2>
+          <label class="vault-reach-choice" data-testid="vault-reach-all">
+            <input type="radio" name="vault_reach" value="all" checked />
+            <span><strong>All your vaults</strong><span class="picker-help">You have none yet. It may make new vaults, and read and write in each.</span></span>
+          </label>
+        </section>`;
+  }
   if (levels.length === 0) {
     return `
         <section class="vault-levels vault-levels-empty">
@@ -578,11 +592,11 @@ function renderVaultLevels(levels: ReadonlyArray<{ vault: string; max: "read" | 
         <section class="vault-levels vault-levels-reach">
           <h2 class="scopes-title">Vaults</h2>
           <label class="vault-reach-choice" data-testid="vault-reach-all">
-            <input type="radio" name="vault_reach" value="all" checked />
+            <input type="radio" name="vault_reach" value="all"${startAll ? " checked" : ""} />
             <span><strong>All your vaults</strong><span class="picker-help">Read and write in each, the ones you make later too, and it may make new vaults.</span></span>
           </label>
           <label class="vault-reach-choice" data-testid="vault-reach-chosen">
-            <input type="radio" name="vault_reach" value="chosen" />
+            <input type="radio" name="vault_reach" value="chosen"${startAll ? "" : " checked"} />
             <span><strong>Only these vaults</strong><span class="picker-help">A vault left at None stays out of its reach.</span></span>
           </label>
           <input type="hidden" name="account_vault_levels" value="1" />
