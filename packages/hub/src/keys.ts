@@ -90,7 +90,8 @@ function baseName(t: TokenRow): string {
   const label = t.subject && t.subject !== t.user_id ? t.subject : null;
   // An app is named for itself; anything else for its label, else its person.
   const raw = (t.created_via === "oauth_refresh" ? t.client_id : null) ?? label ?? t.username ?? t.client_id ?? t.created_via ?? "key";
-  const slug = raw.trim().replace(/\s+/g, "-").slice(0, 80);
+  // no colon: a name with one could be read as another kind of row's id (a person's `person:<key>`, vault-grants.ts)
+  const slug = raw.trim().replace(/[\s:]+/g, "-").slice(0, 80);
   return slug || "key";
 }
 

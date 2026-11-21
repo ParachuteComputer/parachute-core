@@ -9,8 +9,8 @@
  * Every credential that reaches the vault is a key (keys.ts), so every one is a row: a named key, an AI or app
  * connected by OAuth, this app on each device. A person the vault is shared with (a member, `user_vaults`; spec §5.1)
  * is one row of their own (one list, T-476): id `person:<their key>`, `by: "self"`, `grantee` their key, named as they
- * were invited; their sign-ins (an app signed in as them, the hub's session) are in their row, never beside it, and a key
- * they made for an AI or an app is a row of its own naming them (`person: {id, name}`). Ending their row ends the
+ * were invited; their sign-ins (an app they signed in with, by OAuth) are in their row, never beside it, and a key or
+ * token they made (for an AI, an app, a script) is a row of its own naming them (`person: {id, name}`). Ending their row ends the
  * membership as `revoke-access` does (users.ts removeUserVault): every credential of theirs naming the vault, a key of
  * theirs that also reaches another vault included, and any way back in. Each row is a **door grant** (§7.3), the
  * door's word that the signed-in owner agreed, in §7.1's row shape: `{id, origin: "door", state, signer: null, grantee: null, by: "signer", types,
@@ -140,13 +140,20 @@ function membersOf(db: Database, vault: string): Member[] {
   return rows.filter((m) => !isHubAdmin(db, m.user)).map((m) => ({ ...m, pubkey: primaryPubkeyForUser(db, m.user) }));
 }
 
+/** A person's name on this vault: the one they were invited by, else their name on the hub, else their username. */
+function personName(db: Database, user: string, vault: string): string {
+  return nameOnVault(db, user, vault) ?? (db.prepare("SELECT username FROM users WHERE id = ?").get(user) as { username: string } | null)?.username ?? user;
+}
+
 /** A member's row's id: `person:` and their key (one key is one member, spec §5.1), else their hub user id. A key's
- *  name can't hold a colon (keys.ts KEY_NAME_RE), so no key is ever mistaken for a person. */
+ *  name holds no colon (a given one: keys.ts KEY_NAME_RE; a made-up one: keys.ts baseName), so no key is ever
+ *  mistaken for a person. */
 const memberId = (m: Member) => `person:${m.pubkey ?? m.user}`;
 
-/** A sign-in of a person's (an app signed in as them by OAuth, the hub's own session, a token minted for them): theirs,
- *  shown in their row. A key they made for an AI or an app is a row of its own, named as theirs. */
-const signIn = (k: KeyView) => k.created_via !== "app_key" && k.owner_kind !== "agent";
+/** A sign-in of a person's: an app they signed in to the vault with, by OAuth (their Parachute on each device). It is
+ *  theirs, shown in their row. Anything they made on purpose (a key for an AI or an app, a token minted for a script)
+ *  is a row of its own, named as theirs, so the owner sees it and can end it alone. */
+const signIn = (k: KeyView) => k.owner_kind === "app" && k.created_via !== "app_key";
 
 /** Every credential that reaches `vault`, as grant rows: each key, and each person it is shared with (their sign-ins
  *  in their row; a key they made, a row of its own that names them). */
@@ -161,7 +168,7 @@ export function vaultGrantRows(db: Database, vault: string, now: Date = new Date
   const names = new Map<string, string>();
   const personOf = (k: KeyView) => {
     if (k.owner === null || k.owner_kind === "service" || isHubAdmin(db, k.owner)) return null;
-    if (!names.has(k.owner)) names.set(k.owner, nameOnVault(db, k.owner, vault) ?? k.owner);
+    if (!names.has(k.owner)) names.set(k.owner, personName(db, k.owner, vault));
     const m = member.get(k.owner);
     return { id: m ? memberId(m) : null, name: names.get(k.owner)! };
   };
@@ -210,7 +217,7 @@ export function vaultGrantRows(db: Database, vault: string, now: Date = new Date
       deny: [],
       expires_at: null,
       event: null,
-      name: nameOnVault(db, m.user, vault) ?? m.user,
+      name: personName(db, m.user, vault),
       kind: "person" as const,
       app: null,
       client: null,

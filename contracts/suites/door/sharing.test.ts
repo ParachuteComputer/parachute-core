@@ -193,6 +193,7 @@ describe.skipIf(lacks("share-a-vault") || lacks("typed-keys") || !d.ownerKey)("a
   });
 
   test("a key a person made is a row of its own, naming them: their sign-ins fold, what they made doesn't", async () => {
+    // (a key for an app or an AI, a token minted for a script: each the owner sees and can end alone)
     // Wes runs the vault with its owner (`write`): he may make keys for it, which the owner must see and can end
     const wes = newKey();
     const { schnorr } = await import("@noble/curves/secp256k1.js");
@@ -204,6 +205,11 @@ describe.skipIf(lacks("share-a-vault") || lacks("typed-keys") || !d.ownerKey)("a
     const made = await safeFetch(`${d.issuer}/account/keys`, { method: "POST", headers: { authorization: `Bearer ${admin.token}`, "content-type": "application/json" },
       body: JSON.stringify({ name, vault: d.vault, can: "export" }) });
     expect(made.status, await made.clone().text()).toBe(201);
+    // and a token he mints for a script, as the CLI does over HTTP
+    const script = `wes script ${randomBytes(3).toString("hex")}`;
+    const minted = await safeFetch(`${d.issuer}/api/auth/mint-token`, { method: "POST", headers: { authorization: `Bearer ${admin.token}`, "content-type": "application/json" },
+      body: JSON.stringify({ scope: `vault:${d.vault}:read`, label: script }) });
+    expect(minted.status, minted.ok ? "" : await minted.clone().text()).toBe(200);
     const rows = (await statements("GET")).body.grants as { id: string; kind: string; export?: boolean; person?: { id: string | null; name: string } }[];
     const his = rows.find((r) => r.id === `person:${pub}`);
     expect(his?.kind).toBe("person");
@@ -211,7 +217,9 @@ describe.skipIf(lacks("share-a-vault") || lacks("typed-keys") || !d.ownerKey)("a
     expect(key, "the key he made is listed").toBeDefined();
     expect(key).toMatchObject({ export: true, person: { id: `person:${pub}` } });
     // his own sign-in (the admin one he made it with) is in his row, not beside it
-    expect(rows.filter((r) => r.person?.id === `person:${pub}`).map((r) => r.id)).toEqual([name]);
+    const scripts = rows.filter((r) => r.person?.id === `person:${pub}` && r.id !== name);
+    expect(scripts, "the script's token is listed, naming him").toHaveLength(1);
+    expect(scripts[0]!.kind).not.toBe("app");
     // ending him ends what he made too
     expect((await statements("DELETE", `person:${pub}`)).status).toBe(200);
     const after = ((await statements("GET")).body.grants as { id: string; state: string }[]).find((r) => r.id === name);
