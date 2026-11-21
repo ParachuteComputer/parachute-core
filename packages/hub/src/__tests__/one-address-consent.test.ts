@@ -193,6 +193,13 @@ describe("All your vaults (T-476)", () => {
       const res = await answer(db, me.sid, cid, p.challenge, [["vault_pick", "work"]], "vault:read", `${ISSUER}/mcp`);
       expect(res.status).toBe(400);
       expect(res.headers.get("location")).toBeNull();
+      // Deny on that page still tells the app
+      const form = new URLSearchParams({ __action: "consent", __csrf: CSRF, approve: "no", vault_pick: "work", ...ask(cid, p.challenge, "vault:read", `${ISSUER}/mcp`) });
+      const denied = await handleAuthorizePost(db, new Request(`${ISSUER}/oauth/authorize`, {
+        method: "POST", body: form, headers: { "content-type": "application/x-www-form-urlencoded", cookie: cookie(me.sid) },
+      }), deps());
+      expect(denied.status).toBe(302);
+      expect(new URL(denied.headers.get("location")!).searchParams.get("error")).toBe("access_denied");
     } finally { cleanup(); }
   });
 });

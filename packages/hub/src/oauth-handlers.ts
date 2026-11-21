@@ -2415,15 +2415,6 @@ async function handleConsentSubmit(
     rootAskRewritten = asked.join(" ") !== narrowed.join(" ");
     params.scope = asked.join(" ");
   }
-  // T-476: a one-vault page from before the one address (vault verbs at /mcp, no account-door choice on it) is
-  // refused rather than read as the level-less grant to every vault: the person chose one vault there.
-  if (rootAskRewritten && form.get("vault_reach") === null && form.get("account_vault_levels") === null) {
-    return htmlError(
-      "Choose again",
-      "This approval page is from an older version of this hub. Go back to the app and connect again to choose its vaults.",
-      400,
-    );
-  }
   const approve = String(form.get("approve") ?? "") === "yes";
   const sessionId = parseSessionCookie(req.headers.get("cookie"));
   const session = sessionId ? findSession(db, sessionId) : null;
@@ -2485,6 +2476,16 @@ async function handleConsentSubmit(
       "access_denied",
       "user denied the authorization request",
       params.state,
+    );
+  }
+  // T-476: a one-vault page from before the one address (vault verbs at /mcp, no account-door choice on it) is
+  // refused on Approve (Deny still tells the app) rather than read as the level-less grant to every vault: the
+  // person chose one vault there.
+  if (rootAskRewritten && form.get("vault_reach") === null && form.get("account_vault_levels") === null) {
+    return htmlError(
+      "Choose again",
+      "This approval page is from an older version of this hub. Go back to the app and connect again to choose its vaults.",
+      400,
     );
   }
   let scopes = params.scope.split(" ").filter((s) => s.length > 0);
