@@ -192,6 +192,16 @@ with a structured envelope:
 }
 ```
 
+### A key held to some types (1.0 grants, first slice, T-476)
+
+`POST /account/keys {name, vault, can, types: ["recipe"]}` makes a key that reaches only records of those types. Its
+token carries `permissions.grant: "<name>"`; the vault keeps the grant (`GET /api/grants`, `PUT|DELETE /api/grants/<id>`,
+the door's, admin on the whole vault only) and reads it on every request: an ended or unknown grant answers
+`401 grant_ended`; one in force narrows the request to its types as a tag-scoped key is narrowed (search, links,
+counts, files, MCP, the live socket), never admin, and shows no history until versions record their types. Who reaches
+a vault is `GET <hub>/account/vaults/<v>/statements` (every credential a grant row) and `DELETE …/statements/<id>` ends
+one (docs/SPEC-1.0-grants.md, "Settled by the first slice").
+
 ### The write stamp: via and by (0.9.1)
 
 Every write records two facts, on the record (`createdBy`/`createdVia`, `lastUpdatedBy`/`lastUpdatedVia`) and on

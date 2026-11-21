@@ -84,6 +84,7 @@
  *   /account/keys                 (GET/POST)   → named app keys: list (with last use) / mint one vault
  *                                                at read|write, never admin (host:admin bearer, T-414)
  *   /account/keys/<name>          (DELETE)     → revoke an app key (refused at the hub's vault doors at once)
+ *   /account/vaults/<name>/statements[/<id>] (GET/DELETE) → who reaches a vault (grant rows) / end one (vault-grants.ts)
  *   /account/vaults               (GET/POST)   → list / create vault (create returns vault_token;
  *                                                {bare: true} → no welcome notes, T-414)
  *   /account/vaults/<name>/rename (POST)       → rename (host-admin)
@@ -390,6 +391,7 @@ import {
 } from "./module-manifest.ts";
 import { isNostrAuthorization } from "./nostr-http-auth.ts";
 import { routeAccountKeys } from "./account-keys.ts";
+import { routeVaultGrants } from "./vault-grants.ts";
 import { KEY_TOUCH_INTERVAL_MS, touchKey } from "./keys.ts";
 import { validateAccessToken } from "./jwt-sign.ts";
 import { handleNostrLogin } from "./nostr-login.ts";
@@ -1079,6 +1081,14 @@ function revokedKeyResponse(): Response {
  * it costs one indexed read per request, and a signature check at most once a minute per key. Every hub route that forwards a
  * bearer to the vault goes through here: `/vault/<name>/*`, `/vault/admin*` and the root `/mcp`.
  */
+/** CORS for the bearer-only account routes (see where they're routed): any origin, never credentials. */
+const BEARER_ONLY_CORS: Record<string, string> = {
+  "access-control-allow-origin": "*",
+  "access-control-allow-methods": "GET, POST, DELETE, OPTIONS",
+  "access-control-allow-headers": "authorization, content-type",
+  "access-control-max-age": "600",
+};
+
 async function throughKeyDoor(
   req: Request,
   getDb: (() => Database) | undefined,
@@ -4493,6 +4503,17 @@ export function hubFetch(
           manifestPath,
         });
       }
+      // The two bearer-only routes an app uses to manage who reaches a vault (account-keys.ts, vault-grants.ts) answer
+      // any origin: they read no cookie, so a page elsewhere gains nothing a token-holder doesn't already have (the
+      // OAuth endpoints' reasoning, cors.ts), and the app reaches its hubs from its own origin.
+      const bearerOnly = pathname === "/account/keys" || pathname.startsWith("/account/keys/") || /^\/account\/vaults\/[^/]+\/statements(?:\/[^/]+)?$/.test(pathname);
+      if (bearerOnly && req.method === "OPTIONS") return new Response(null, { status: 204, headers: BEARER_ONLY_CORS });
+      const withBearerCors = (r: Response): Response => {
+        if (!bearerOnly || req.headers.has("cookie")) return r;
+        const h = new Headers(r.headers);
+        for (const [k, v] of Object.entries(BEARER_ONLY_CORS)) h.set(k, v);
+        return new Response(r.body, { status: r.status, statusText: r.statusText, headers: h });
+      };
       // /account/keys — named app keys (0.9.1, T-414; account-keys.ts): mint, list (with last use), revoke.
       if (pathname === "/account/keys" || pathname.startsWith("/account/keys/")) {
         if (!getDb) return dbNotConfigured();
@@ -4501,8 +4522,21 @@ export function hubFetch(
           issuer: oauthDeps(req).issuer,
           knownIssuers: oauthDeps(req).hubBoundOrigins(),
           manifestPath,
+          // a typed key's grant is filed at the vault through the hub's own proxy (vault-grants.ts)
+          forward: (fwd) => throughKeyDoor(fwd, getDb, () => proxyToVault(fwd, manifestPath, deps?.supervisor, peerAddr)),
         });
-        if (handled) return handled;
+        if (handled) return withBearerCors(handled);
+      }
+      // /account/vaults/<v>/statements — who reaches a vault, and ending one (vault-grants.ts, 1.0 grants slice).
+      if (/^\/account\/vaults\/[^/]+\/statements(?:\/[^/]+)?$/.test(pathname)) {
+        if (!getDb) return dbNotConfigured();
+        const handled = await routeVaultGrants(req, pathname, {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
+          forward: (fwd) => throughKeyDoor(fwd, getDb, () => proxyToVault(fwd, manifestPath, deps?.supervisor, peerAddr)),
+        });
+        if (handled) return withBearerCors(handled);
       }
       if (pathname === "/account/vaults") {
         if (!getDb) return dbNotConfigured();

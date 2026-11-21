@@ -17,7 +17,8 @@ database above its own number (exit 6). So a number is a promise to older progra
   0.9.1's owner keys (T-414) are the same kind: `keys.last_used_at` is one more additive column, and an app key
   (`POST /account/keys`) is an ordinary hub token scoped `vault:<v>:read[ write]` with a registry row, so 0.9.0 and
   0.8 honour it exactly as scoped and refuse it once revoked (through the revocation list, within its 60 s cache;
-  only 0.9.1's door refuses at once). No number moves. The write stamp (0.9.1) keeps that: a named key's name rides a
+  only 0.9.1's door refuses at once). A key held to types (T-476) carries `permissions.grant`, which an older vault
+  refuses as a permission it doesn't enforce: on a rollback such a key stops, it never widens to the whole vault. No number moves. The write stamp (0.9.1) keeps that: a named key's name rides a
   top-level `key` claim an older vault ignores (its writes say `api` there), and each revision's `via_kind` is one
   more additive column. Only a key the owner let write on behalf of others carries `permissions.acts_for`, which 0.9.0
   and 0.8 refuse, as they must: they would write its custodial writes unstamped.

@@ -346,6 +346,7 @@ export function generateScopedMcpTools(
       vaultName,
       urlBase: ticketUrlBase,
       ...(ticketNoteVisible ? { noteVisible: ticketNoteVisible, scopedTags: rawTags! } : {}),
+      ...(auth?.grant ? { grant: auth.grant } : {}),
     },
     // Attachment bytes (Wave 2 model lane): bun always wires a fresh fs
     // provider per session — cheap (stateless), unlike the ticket
@@ -724,6 +725,12 @@ function applyTagScopeWrappers(
       // ref), so the response never tells the two apart.
       const note = resolveNote(store.db, historyId, (n) => noteWithinTagScope(n, allowed, rawTags));
       if (!note) return { error: "Note not found", error_type: "not_found", id: historyId };
+      // Under a grant no version is visible until versions record their types (routes.ts TagScopeCtx.noHistory).
+      if (auth?.grant) {
+        const v = (params as any).versions;
+        if (v.version_ix !== undefined || v.import_ix !== undefined || v.origin !== undefined) return { error: "Version not found", error_type: "not_found", id: historyId };
+        return { versions: [], total: 0 };
+      }
     }
     // vault#738 review: scope before any note-dependent resolution/error
     // path. Otherwise content-range validation and ambiguous-path candidates

@@ -297,6 +297,7 @@ export function createSubscribeWsBinding(deps: SubscribeWsDeps = {}): {
       lean,
       tracksFlush: false,
       countsTowardCap: false,
+      grant: auth.grant ?? null,
     });
     if (!handle) {
       closeWs(ws, WS_CLOSE.PROTOCOL, "could not register subscription");
