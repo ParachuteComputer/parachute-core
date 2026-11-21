@@ -1299,7 +1299,13 @@ export async function route(
     (eraseParam !== null && eraseParam !== "false");
   const isHistoryCompact = req.method === "POST" && apiSubpath === "/history/compact";
   const isDeletedList = req.method === "GET" && apiSubpath === "/history/deleted";
-  const requiredVerb = isReadOnlyPost ? "read" : (isTagSchemaMutation || isNoteHistoryErase || isHistoryCompact || isDeletedList) ? "admin" : verbForMethod(req.method);
+  // T-476 (docs/contracts/write-defines-types.md, "REST"): `PUT /api/types/:name`, the record door's, takes the rule
+  // MCP's manage-types has: a write credential without admin may define a new type, or add fields to one it made. The
+  // handler judges the change (type-write.ts). `PUT /api/tags/:name` stays admin: Prism calls it, and its suite pins a
+  // write pass's 403 there.
+  const typeWriteOnly = !!recordsDoor && req.method === "PUT" && /^\/tags\/[^/]+$/.test(apiSubpath) &&
+    !hasScopeForVault(auth.scopes, vaultName, "admin") && hasScopeForVault(auth.scopes, vaultName, "write");
+  const requiredVerb = isReadOnlyPost ? "read" : typeWriteOnly ? "write" : (isTagSchemaMutation || isNoteHistoryErase || isHistoryCompact || isDeletedList) ? "admin" : verbForMethod(req.method);
   if (!hasScopeForVault(auth.scopes, vaultName, requiredVerb)) {
     const requiredApiScope = isReadOnlyPost
       ? SCOPE_READ
@@ -1350,6 +1356,7 @@ export async function route(
     actor: stamp.by,
     via: auth.via,
     bypassStrict: hasMigrateScopeForVault(auth.scopes, vaultName),
+    ...(typeWriteOnly ? { typeWriteOnly: true } : {}),
   };
 
   if (apiPath.startsWith("/notes") && recordsDoor) {

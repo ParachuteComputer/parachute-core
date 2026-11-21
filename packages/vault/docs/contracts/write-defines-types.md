@@ -1,7 +1,8 @@
 # Write access may add a new type
 
 **Status:** contract, 0.9 (T-476, 11-20). Default chosen by Uni; Aaron or Benjamin may overrule (it changes what
-`vault:write` means for types). Enforced by `core/src/type-write.ts`; pinned by `contracts/suites/mcp/write-types.test.ts`.
+`vault:write` means for types). Enforced by `core/src/type-write.ts`; pinned by `contracts/suites/mcp/write-types.test.ts` (MCP) and
+`contracts/suites/compat/types-write-rest.test.ts` (REST, `/api/types`).
 
 ## Why
 
@@ -39,9 +40,21 @@ what write access may do instead.
 on the vault, as before: its writer list keeps to a 4,000-token budget (`contracts/suites/door/multivault.test.ts`). A
 write key there makes a type at the vault's own address, the one the app's Connect screen gives.
 
-**REST is unchanged**: `PUT /api/tags/:name` (and `/api/types/:name`) stays admin. Benjamin's Prism compatibility suite
-(`contracts/suites/compat/prism.test.ts`) pins a write pass's 403 there, and nothing turns it red on purpose. The AI
-connection is MCP; opening REST too is a later change, with Benjamin.
+**REST: the record door's `/api/types/:name` takes the same rule** (T-476, 11-21; default chosen by Uni, for Aaron or
+Benjamin to confirm, since it changes what a write pass may do over REST). `PUT /api/types/:name` with write and not
+admin may do exactly what `manage-types {action: "update"}` may: define a type nobody has defined yet (`description`,
+`fields`, `kind: "type"`), and add fields to a type whose creator stamp is the caller's. Everything else answers 403
+"needs admin" with what write may do instead (changing or removing a field, `replace_fields`, `parent_names`,
+`relationships`, `kind: "tag"`, a type it didn't make, a plain label); a malformed `fields` answers 400 and nothing
+lands. DELETE, rename, merge and migrate on `/api/types` stay admin. Why: the person's own app holds write and talks
+REST, and a newcomer's one tap ("Add a pack") has to make the pack's types with no AI
+(`parachute` docs/VAULT.md). Pinned by `contracts/suites/compat/types-write-rest.test.ts`.
+
+**`PUT /api/tags/:name` is unchanged: admin.** Benjamin's Prism compatibility suite (`contracts/suites/compat/prism.test.ts`)
+pins a write pass's 403 there, and Prism calls that route. A client that wants the rule uses the record door.
+
+The stamp is the credential's, whichever door it comes through: one key (one `by` and `via`) that made a type over MCP
+may add fields to it over REST, and the reverse.
 
 A **tag-scoped** credential (`permissions.scoped_tags`) gets none of this: types sit above every tag scope, so a
 scoped writer's types stay the admin's to make (as in `tag-scoped-tokens.md`). `vault:read` gets nothing.

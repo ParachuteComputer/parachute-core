@@ -136,6 +136,11 @@ export type WriteCtx = {
    * to false (full enforcement) for every normal write.
    */
   bypassStrict?: boolean;
+  /**
+   * T-476: a write credential without admin defining a type on `PUT /api/types/:name` (routing.ts). The handler lets
+   * only what write may do through (type-write.ts `writeTypeProblem`), as MCP's manage-types does.
+   */
+  typeWriteOnly?: boolean;
 };
 
 const vis = (t: TagScopeCtx) => { const v = buildExpandVisibility(t.allowed, t.raw); return v ? { isVisible: v } : undefined; };
@@ -198,7 +203,7 @@ import {
 // usage.ts imports `assetsDir` from config.ts (neutral ground), so this import
 // of invalidateUsageCache does NOT form a cycle — routes.ts → usage.ts only.
 import { invalidateUsageCache } from "./usage.ts";
-import { stampTypeCreator, typeIsUndefined } from "../core/src/type-write.ts";
+import { stampTypeCreator, typeIsUndefined, writeTypeProblem, type TypeChange } from "../core/src/type-write.ts";
 
 // Re-export `assetsDir` (now defined in config.ts) so the existing callers
 // that import it from this module — mirror-deps, mirror-routes, server,
@@ -4174,9 +4179,22 @@ export async function handleTags(
       replace_fields?: unknown;
     };
     const replaceFields = body.replace_fields === true;
-    // T-476 (docs/contracts/write-defines-types.md): a type defined here records who defined it, as on MCP. Over REST
-    // this stays an admin route (Prism's compat suite pins a write pass's 403); the stamp is the admin's.
+    // T-476 (docs/contracts/write-defines-types.md): a type defined here records who defined it, as on MCP. A write
+    // credential without admin reaches this only on `/api/types/:name` (routing.ts), and may make only what write may:
+    // a new type, or new fields on a type it made. `/api/tags/:name` stays admin (Prism's compat suite pins it).
     const typeWriter = { by: writeCtx.actor, via: writeCtx.via };
+    if (writeCtx.typeWriteOnly) {
+      const change: TypeChange = {};
+      for (const k of ["description", "fields", "relationships", "parent_names", "kind", "replace_fields"] as const) {
+        if ((body as Record<string, unknown>)[k] !== undefined) change[k] = (body as Record<string, unknown>)[k];
+      }
+      const problem = writeTypeProblem(store.db, putTagName, change, typeWriter, tagScope.allowed !== null);
+      if (problem) {
+        return problem.needsAdmin
+          ? json({ error: "Forbidden", error_type: "insufficient_scope", message: problem.message, required_scope: "vault:admin" }, 403)
+          : json({ error: problem.message, error_type: "invalid_type_change", message: problem.message }, 400);
+      }
+    }
     const typeWasUndefined = typeIsUndefined(store.db, putTagName);
 
     // Validate the relationships payload up front so a bad payload returns

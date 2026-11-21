@@ -3,7 +3,7 @@
 //     is a 2xx JSON array (prism apps/server/src/vault-door.ts).
 //   - The type additions land on /api/records only: `?type=` (a type and its subtypes; with ?tag, records carrying
 //     both; a plain tag refused with the fix), `/api/types` (every type and tag with its `kind`, as list-types) and
-//     `/api/types/<name>` (one in full, as list-types {name}; writing needs admin).
+//     `/api/types/<name>` (one in full, as list-types {name}; writing as manage-types: write may define a new type).
 //   - The record door's `tags` hold plain labels: a type's name there is refused with the fix, on REST as on MCP,
 //     and nothing is written. The note door keeps 0.8's behaviour.
 //   - A body naming an old word beside its new one is refused (400), after auth, and nothing is written.
@@ -80,7 +80,8 @@ describe("compat/types-rest: types", () => {
   const label = `${R}-label`;
 
   test("/api/types lists every type and tag with its kind, as list-types; /api/types/<name> reads one, as list-types {name}", async () => {
-    expect((await writeApi.put(`/types/${enc(type)}`, { fields: { city: { type: "string" } } })).status).toBe(403);
+    // a write pass may define a type nobody has defined yet (T-476, write-defines-types.md "REST"); compat/types-write-rest
+    expect((await writeApi.put(`/types/${enc(type)}`, { fields: { city: { type: "string" } } })).status).toBe(200);
     expect((await adminApi.put(`/types/${enc(type)}`, { fields: { city: { type: "string" } } })).status).toBe(200);
     expect((await adminApi.put(`/types/${enc(sub)}`, { parent_names: [type] })).status).toBe(200);
     expect((await writeApi.post("/notes", { path: `${R}/labelled`, content: "x", tags: [label] })).status).toBe(201);

@@ -4,7 +4,8 @@
  * A caller with `write` and not `admin`, and no tag scope, may define a type nobody has defined yet, and add fields to
  * a type it made itself (its creator stamp, `created_by` + `created_via` on the `tags` row, equals the caller's write
  * stamp). Everything else on types stays admin. One rule for both doors: MCP `manage-types {action: "update"}`
- * (mcp-surface.ts) and REST `PUT /api/tags/:name` (src/routes.ts).
+ * (mcp-surface.ts) and REST `PUT /api/types/:name`, the record door's (src/routing.ts, src/routes.ts). REST's
+ * `PUT /api/tags/:name` stays admin (Prism's compat suite pins it).
  */
 import type { Database } from "bun:sqlite";
 import { getTagRecord } from "./tag-schemas.js";
