@@ -83,7 +83,7 @@ Version history is the first self-hosted-first feature tracked in this table.
 | `DELETE /notes/:id/versions` | honored | honored since [cloud#304](https://github.com/ParachuteComputer/parachute-cloud/pull/304) | Same shapes; held by cloud's own suite, not by this repo. |
 | `query-notes versions (MCP)` | honored | honored since [cloud#304](https://github.com/ParachuteComputer/parachute-cloud/pull/304) | Same shapes; held by cloud's own suite, not by this repo. |
 | `DELETE /notes/:id?erase_history=true` | honored | honored once cloud pins core with T-412 | T-412 |
-| `GET /history/deleted` | honored (write, since T-476) | honored once cloud pins core with T-412; at write only once cloud moves `isDeletedList` out of its own admin gate (`workers/vault/src/vault-do.ts`), which a pin doesn't change | T-412, T-476 |
+| `GET /history/deleted` | honored (write, since T-476) | honored once cloud pins core with T-412; at write only once cloud's own router (`workers/vault/src/vault-do.ts`) gates `isDeletedList` at write, as core's `routing.ts` does. A pin doesn't change that router, and taking the route out of its admin branch alone would open it to read passes | T-412, T-476 |
 | `delete-note` `ids` / `erase_history` (MCP) | honored | honored once cloud pins core with T-412 | T-412; core's tool, so both doors get it from the pin |
 | `has_broken_links` | honored | honored | [cloud#290](https://github.com/ParachuteComputer/parachute-cloud/pull/290) (B1) |
 | `has_ambiguous_links` | honored | honored | [cloud#290](https://github.com/ParachuteComputer/parachute-cloud/pull/290) (B1) |
