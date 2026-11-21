@@ -1723,8 +1723,9 @@ across its captured rows and NULL on pre-v30 rows.
 Restore does not restore `path` on a live note: it restores content, metadata
 and extension without undoing a later move. Restore of a DELETED note
 re-creates it at the same id, at the tombstone's path, untagged, with
-`created_at` restored from the captured original creation timestamp. Pre-v30 rows
-with a NULL timestamp fall back to the tombstone timestamp. A path collision is 409 `path_conflict`.
+`created_at` restored from the captured original creation timestamp, and `updated_at` the
+restore's own time (T-476; it was the old `created_at`, so a reader asking what changed since never saw the note come
+back). Pre-v30 rows with a NULL timestamp fall back to the tombstone timestamp. A path collision is 409 `path_conflict`.
 Restore checks today's strict schemas using the current note's tags before
 writing; a rejected restore is 422 `schema_validation` and changes neither
 note nor history. The existing `vault:migrate` bypass applies and is logged.

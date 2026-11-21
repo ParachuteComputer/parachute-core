@@ -255,6 +255,25 @@ describe("who may list deleted notes", () => {
     expect(r.body.required_scope).toBe("vault:write");
   });
 
+  // Putting a deleted note back is a change made now: a reader asking what changed since (a sync, a "what changed"
+  // view) must find it. It used to come back with the updatedAt it had before it was deleted.
+  test("a note put back from deletion is changed now: its updatedAt is the restore's, and a since-query finds it", async () => {
+    const id = await noteWithHistory("back-now");
+    expect((await op.del(`/notes/${id}`)).status).toBe(200);
+    const writer = rest(s.vaultViaHub, await pass({ level: "write" }));
+    const tomb = (await writer.get(`/notes/${id}/versions?limit=1`)).body.versions[0];
+    await Bun.sleep(5);
+    const before = new Date().toISOString();
+    const back = await writer.post(`/notes/${id}/restore`, { version_ix: tomb.version_ix });
+    expect(back.status, JSON.stringify(back.body)).toBe(200);
+    expect(back.body.updatedAt >= before, `${back.body.updatedAt} should be at or after ${before}`).toBe(true);
+    expect(back.body.createdAt < before).toBe(true);
+    const since = await writer.get(`/notes?path_prefix=${enc(`${R}/back-now`)}&include_content=false&meta[updated_at][gte]=${enc(before)}`);
+    expect(since.status).toBe(200);
+    const rows = (Array.isArray(since.body) ? since.body : since.body.notes) as { id: string }[];
+    expect(rows.map((n) => n.id)).toContain(id);
+  });
+
   test("a tag-scoped pass finds nothing there (404, as /history/compact), at write and at admin", async () => {
     expect((await rest(s.vaultViaHub, await pass({ level: "write", tags: [TAG] })).get("/history/deleted")).status).toBe(404);
     expect((await rest(s.vaultViaHub, await scopedAdmin([TAG])).get("/history/deleted")).status).toBe(404);
