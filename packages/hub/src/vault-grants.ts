@@ -80,9 +80,21 @@ export async function ownerOrVaultAdmin(req: Request, db: Database, vault: strin
   return err(403, "insufficient_scope", vault === null ? "this is the owner's: it needs the hub's own account token" : `this needs the owner's account token, or vault:${vault}:admin on the whole vault`);
 }
 
+/** A multi-vault key's level in one vault: it reaches it through the account door (account-keys.ts). */
+const ACCOUNT_VAULT_SCOPE = /^account:self:vaults:([^:]+):(read|write)$/;
+/** What a key holds of one vault: its own vault scope, or its account-door level there; undefined when it doesn't reach it. */
+function levelIn(k: KeyView, vault: string): KeyView["levels"][string] | undefined {
+  if (k.levels[vault] !== undefined) return k.levels[vault];
+  for (const s of k.scopes) {
+    const m = ACCOUNT_VAULT_SCOPE.exec(s);
+    if (m && m[1] === vault) return m[2] as "read" | "write";
+  }
+  return undefined;
+}
+
 /** The verbs a key's level gives on each type it reaches. */
 function grantTypes(k: KeyView, vault: string): Record<string, string[]> {
-  const level = k.levels[vault];
+  const level = levelIn(k, vault);
   const verbs = level === "write" || level === "admin" ? [...GRANT_VERBS_WRITE] : level === "read" ? [...GRANT_VERBS_READ] : [];
   if (verbs.length === 0) return {};
   const types = k.types?.length ? k.types : k.allow_tags?.length ? k.allow_tags : ["*"];
@@ -104,7 +116,7 @@ export function vaultGrantRows(db: Database, vault: string, now: Date = new Date
   const jtis = new Map((db.prepare("SELECT name, jti FROM keys").all() as { name: string; jti: string }[]).map((r) => [r.name, r.jti]));
   const apps = appsOf(db);
   return listKeys(db, now)
-    .filter((k) => k.levels[vault] !== undefined)
+    .filter((k) => levelIn(k, vault) !== undefined)
     .map((k) => ({
       id: k.name,
       origin: "door" as const,
@@ -120,8 +132,8 @@ export function vaultGrantRows(db: Database, vault: string, now: Date = new Date
       kind: k.owner_kind,
       app: apps.get(jtis.get(k.name) ?? "")?.name ?? null,
       client: apps.get(jtis.get(k.name) ?? "")?.client ?? null,
-      ...(k.levels[vault] === "admin" ? { admin: true } : {}),
-      ...(k.levels[vault] === "export" ? { export: true } : {}),
+      ...(levelIn(k, vault) === "admin" ? { admin: true } : {}),
+      ...(levelIn(k, vault) === "export" ? { export: true } : {}),
       created_at: k.created_at,
       last_used_at: k.last_used_at,
     }));
@@ -182,10 +194,14 @@ export async function routeVaultGrants(req: Request, pathname: string, deps: Vau
 }
 
 async function endVaultGrant(deps: VaultGrantsDeps, gate: Gate, vault: string, id: string, now: Date): Promise<Response> {
-  const key = listKeys(deps.db, now).find((k) => k.name === id && k.levels[vault] !== undefined);
+  const key = listKeys(deps.db, now).find((k) => k.name === id && levelIn(k, vault) !== undefined);
   if (!key) return err(404, "not_found", `nothing called "${id}" reaches ${vault}`);
-  if (!gate.owner && Object.keys(key.levels).some((v) => v !== vault)) {
-    return err(403, "insufficient_scope", `"${id}" reaches other vaults too: only the owner can end it`);
+  // a vault's admin ends only what reaches that vault and nothing else: every scope of it one this vault's admin could
+  // itself give (api-mint-token's rule 3); anything wider (another vault, the hub) is the owner's to end
+  const prefix = `vault:${vault}:`;
+  const own = (s: string) => s.startsWith(prefix) && ["read", "write", "admin", "export"].includes(s.slice(prefix.length));
+  if (!gate.owner && !key.scopes.every(own)) {
+    return err(403, "insufficient_scope", `"${id}" reaches more than ${vault}: only the owner can end it`);
   }
   const row = deps.db.prepare("SELECT jti FROM keys WHERE name = ?").get(id) as { jti: string };
   revokeTokenByJti(deps.db, row.jti, now, { by: gate.ctx.sub, via: "http" });

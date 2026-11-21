@@ -14,7 +14,8 @@
 // moved here by the change that made them pass. A door without typed keys names that in deliberate.json (`typed-keys`).
 import { describe, expect, test } from "bun:test";
 import { declareType, ids, must, records, statements } from "../door-v1/_grants.ts";
-import { accountToken, door, enc, lacks, mcp, runId, safeFetch, token, type Reply } from "./_door.ts";
+import { randomBytes } from "node:crypto";
+import { accountToken, door, enc, lacks, mcp, rest, runId, safeFetch, token, vaultUrl, type Reply } from "./_door.ts";
 
 const without = lacks("typed-keys");
 const owner = records("write");
@@ -138,9 +139,14 @@ describe.skipIf(without)("a key for an AI that reads and adds recipes", () => {
     expect((await ai.get(moved)).status).toBe(200);
     const mv = await ai.call("GET", `/notes/${moved}/versions?limit=50`);
     expect(mv.status).toBe(200);
-    expect(JSON.stringify(mv.body)).not.toContain(oldWord);
-    for (const v of mv.body.versions as { version_ix: number }[]) {
-      expect((await ai.call("GET", `/notes/${moved}/versions/${v.version_ix}`)).text).not.toContain(oldWord);
+    // no version records its types yet, so a grant sees none (§4.1); the owner sees the journal-era one
+    expect(mv.body).toEqual({ versions: [], total: 0 });
+    const ownerVersions = (await owner.call("GET", `/notes/${moved}/versions?limit=50`)).body.versions as { version_ix: number }[];
+    expect(ownerVersions.length).toBeGreaterThan(0);
+    for (const v of ownerVersions) {
+      const one = await ai.call("GET", `/notes/${moved}/versions/${v.version_ix}`);
+      expect(one.status).toBe(404);
+      expect(one.text).not.toContain(oldWord);
     }
     // It can't write a journal record, nor change or delete one it can't see.
     expect((await ai.make({ types: [w.J], body: "not mine to write" })).status).toBe(403);
@@ -165,7 +171,7 @@ describe.skipIf(without)("a key for an AI that reads and adds recipes", () => {
       expect(JSON.stringify(byId)).not.toContain(w.word);
       // History: no version of a record it can see whose types weren't recorded (none record them yet).
       const hist = await c.call<any>("query-notes", { versions: { note_id: w.r1 } });
-      expect(hist.versions ?? []).toEqual([]);
+      expect(hist).toEqual({ versions: [], total: 0 });
       const hidden = await c.call<any>("query-notes", { versions: { note_id: w.j1 } }).catch((e: Error) => ({ error: e.message }));
       expect(JSON.stringify(hidden)).not.toContain(w.word);
       const tags = await c.call<any>("list-tags", {});
@@ -222,6 +228,10 @@ describe.skipIf(without)("who reaches the vault, and ending it", () => {
     await c.close().catch(() => {});
     const row = (await list()).body.grants.find((x: any) => x.id === key.name);
     expect(row.state).toBe("revoked");
+    // the vault itself holds it ended, so a request that reaches the vault some other way is refused too
+    const kept = await rest("admin").get(`/grants/${enc(key.name)}`);
+    expect(kept.status).toBe(200);
+    expect(kept.body.state).toBe("revoked");
   });
 
   test("the vault's own admin credential makes, lists and ends keys for that vault, and no other", async () => {
@@ -245,6 +255,14 @@ describe.skipIf(without)("who reaches the vault, and ending it", () => {
     expect((await account("GET", `/account/vaults/${enc(other)}/statements`, undefined, "vault-admin")).status).toBe(403);
     expect((await account("POST", "/account/keys", { name: `x-${runId("k")}`, vault: other, can: "read", types: [w.R] }, "vault-admin")).status).toBe(403);
     expect((await account("GET", "/account/keys", undefined, "vault-admin")).status).toBe(403);
+    // writing on behalf of others is the owner's to allow (§6.1)
+    expect((await account("POST", "/account/keys", { name: `x-${runId("k")}`, vault: door().vault, can: "write", on_behalf_of: true }, "vault-admin")).status).toBe(403);
+    // a key that reaches more than this vault is listed, and only the owner ends it
+    const both = `both-${runId("k")}`;
+    expect((await account("POST", "/account/keys", { name: both, vaults: { [door().vault]: "read", [other]: "read" } })).status).toBe(201);
+    expect((await list("vault-admin")).body.grants.some((x: any) => x.id === both)).toBe(true);
+    expect((await end(both, "vault-admin")).status).toBe(403);
+    expect((await end(both)).status).toBe(200);
     expect((await end(key.name, "vault-admin")).status).toBe(200);
     expect((await ai.get(w.r1)).status).toBe(401);
   });
@@ -257,6 +275,39 @@ describe.skipIf(without)("who reaches the vault, and ending it", () => {
     expect((await mint({ can: "write", types: [] })).status).toBe(400);
     expect((await mint({ can: "write", types: ["has space"] })).status).toBe(400);
     expect((await mint({ can: "write", types: [w.R], on_behalf_of: true })).status).toBe(400);
+  });
+
+  test("ending it closes its live socket, and a file ticket it was given is spent no more", async () => {
+    const w = await theWorld();
+    const key = await typedKey([w.R]);
+    // the live socket, subscribed to recipes
+    const frames: any[] = [];
+    let closed = false;
+    const ws = new WebSocket(`${vaultUrl().replace(/^http/, "ws")}/api/subscribe?tag=${enc(w.R)}`);
+    const shut = new Promise<void>((resolve) => ws.addEventListener("close", () => { closed = true; resolve(); }));
+    await new Promise<void>((resolve, reject) => { ws.addEventListener("open", () => resolve()); ws.addEventListener("error", () => reject(new Error("socket error"))); });
+    ws.addEventListener("message", (e) => { try { frames.push(JSON.parse(String(e.data))); } catch { frames.push(e.data); } });
+    ws.send(JSON.stringify({ type: "auth", token: key.token }));
+    for (let i = 0; i < 50 && !frames.length; i++) await Bun.sleep(100);
+    expect(frames.length, "the socket answered its subscription").toBeGreaterThan(0);
+    expect(closed).toBe(false);
+    // a ticket to upload a file to a recipe, minted over MCP
+    const c = await mcp("read", { bearer: key.token });
+    const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, ...randomBytes(512)]);
+    const ticket = await c.call<any>("request-attachment-upload", { note: w.r1, filename: "soup.png", mime_type: "image/png", size_bytes: bytes.length });
+    await c.close();
+    const url = String(Object.values(ticket).find((v) => typeof v === "string" && /\/tickets\//.test(v)) ?? "");
+    expect(url, JSON.stringify(ticket).slice(0, 200)).toContain("/tickets/");
+
+    expect((await end(key.name)).status).toBe(200);
+    await Promise.race([shut, Bun.sleep(5000)]);
+    expect(closed, "the socket closed when its grant ended").toBe(true);
+    const before = frames.length;
+    expect((await owner.make({ types: [w.R], body: "made after the end" })).status).toBe(201);
+    await Bun.sleep(300);
+    expect(frames.length).toBe(before);
+    const spent = await safeFetch(url, { method: ticket.method ?? "PUT", headers: { "content-type": "image/png" }, body: bytes });
+    expect(spent.status).toBe(404);
   });
 
   test("every credential that reaches the vault is a row in the list: an app key shows as a grant the door vouches for", async () => {

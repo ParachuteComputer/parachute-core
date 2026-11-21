@@ -412,7 +412,9 @@ function underGrant(auth: AuthResult, vaultName: string): AuthResult | { error: 
   } catch (err) {
     console.warn(`[auth] grant ${auth.grant} could not be read in ${vaultName}: ${err instanceof Error ? err.message : String(err)}`);
   }
-  if (!g || grantState(g) !== "in_force") {
+  // the grant is this key's (the hub names it after the key, and signs the key's name into the token): one filed for
+  // another key under this id never opens to it
+  if (!g || grantState(g) !== "in_force" || g.grantee !== `key:${auth.key?.name ?? ""}`) {
     return {
       error: Response.json(
         { error: "grant_ended", message: "This key's grant has ended, or isn't this vault's. Ask the vault's owner for a new key." },

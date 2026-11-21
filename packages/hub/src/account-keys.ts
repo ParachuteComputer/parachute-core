@@ -257,6 +257,10 @@ async function mintAppKey(req: Request, deps: AccountKeysDeps): Promise<Response
   if (onBehalf === true && can === "export") {
     return err(400, "invalid_request", "on_behalf_of: an export key writes nothing, so it has nobody to write for");
   }
+  // writing on behalf of others is the owner's to allow (SPEC-1.0-grants §6.1), never a vault admin's
+  if (onBehalf === true && !gate.owner) {
+    return err(403, "insufficient_scope", "on_behalf_of: only the owner lets a key write on behalf of others");
+  }
   if (onBehalf === true) {
     const problem = onBehalfNameProblem(name);
     if (problem) return err(400, "invalid_name", problem);

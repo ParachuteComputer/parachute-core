@@ -346,6 +346,7 @@ export function generateScopedMcpTools(
       vaultName,
       urlBase: ticketUrlBase,
       ...(ticketNoteVisible ? { noteVisible: ticketNoteVisible, scopedTags: rawTags! } : {}),
+      ...(auth?.grant ? { grant: auth.grant } : {}),
     },
     // Attachment bytes (Wave 2 model lane): bun always wires a fresh fs
     // provider per session — cheap (stateless), unlike the ticket

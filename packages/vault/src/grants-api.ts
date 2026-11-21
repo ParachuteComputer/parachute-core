@@ -12,6 +12,7 @@ import { checkDoorGrant, endGrant, fileDoorGrant, getGrant, grantState, listGran
 import type { AuthResult } from "./auth.ts";
 import { hasScopeForVault, SCOPE_ADMIN } from "./scopes.ts";
 import type { SqliteStore } from "../core/src/store.ts";
+import { subscriptionManager } from "./subscriptions.ts";
 
 const view = (g: DoorGrant, now = new Date()) => ({ ...g, state: grantState(g, now) });
 
@@ -48,6 +49,8 @@ export async function handleGrants(req: Request, store: SqliteStore, sub: string
   if (req.method === "DELETE") {
     const g = endGrant(db, id);
     if (!g) return Response.json({ error: "not_found", message: `no grant ${id} here` }, { status: 404 });
+    // its live sockets close now (spec §4.1); one that missed this closes on its next event (subscriptions.ts)
+    subscriptionManager.closeGrant(vaultName, id);
     return Response.json({ id, state: "revoked", revoked_at: g.revoked_at });
   }
   return Response.json({ error: "method_not_allowed", message: "use GET, PUT or DELETE" }, { status: 405, headers: { allow: "GET, PUT, DELETE" } });

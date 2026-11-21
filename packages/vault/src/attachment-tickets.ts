@@ -16,6 +16,7 @@
  * the credential, and a bearer-less shell (curl) must be able to spend it.
  */
 
+import { getGrant, grantState } from "../core/src/grants.ts";
 import { mkdirSync, writeFileSync, existsSync, readFileSync, statSync } from "fs";
 import { join, normalize } from "path";
 import type { Store } from "../core/src/types.ts";
@@ -177,6 +178,12 @@ async function takeValidTicket(
  * minted without a scope is unaffected.
  */
 async function ticketNoteInScope(store: Store, ticket: AttachmentTicket, noteId: string): Promise<boolean> {
+  // minted under a grant: spent only while it is still in force (ended, or past its date: as an unknown ticket)
+  if (ticket.grant) {
+    const db = (store as { db?: Parameters<typeof getGrant>[0] }).db;
+    const g = db ? getGrant(db, ticket.grant) : null;
+    if (!g || grantState(g) !== "in_force") return false;
+  }
   if (!ticket.scopedTags) return true;
   const note = await store.getNote(noteId);
   if (!note) return false;
