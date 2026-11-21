@@ -5699,9 +5699,9 @@ function removeWikilinkBrackets(content: string, targetPath: string): string {
 }
 
 /**
- * GET /api/history/deleted — deleted notes that still have history, newest deletion first (T-412). Unscoped
- * administrators: a deleted note has no tags left to check a tag scope against, so a scoped pass gets the same 404
- * as /history/compact. `limit` (default 100, max 1000) and `offset`.
+ * GET /api/history/deleted — deleted notes that still have history, newest deletion first (T-412). Unscoped passes
+ * with write (T-476; the gate is routing.ts): a deleted note has no tags left to check a tag scope against, so a
+ * scoped pass gets the same 404 as /history/compact. `limit` (default 100, max 1000) and `offset`.
  */
 export async function handleDeletedNotes(req: Request, store: Store, tagScope: TagScopeCtx = NO_TAG_SCOPE): Promise<Response> {
   if (tagScope.raw !== null) return json({ error: "Not found", error_type: "not_found" }, 404);

@@ -77,7 +77,8 @@ change them there first, then in the places that call a route or build an event 
 Records are written through the note door (`/api/notes`), because `/api/records` isn't on a box until 0.9.1 and
 `/api/notes` is gone at 1.0. `records()` in `_grants.ts` covers most record calls and is the main place to move;
 `leaks.test.ts` and one call in `custodial.test.ts` use `/api/notes…` directly. `grant.test.ts` also calls three
-routes that exist today and stay admin (`PUT /api/tags/<name>`, `PATCH /api/vault`, `GET /api/history/deleted`).
+routes that exist today and no grant opens (`PUT /api/tags/<name>` and `PATCH /api/vault` at admin;
+`GET /api/history/deleted` at the vault's own write scope since T-476, not a grant's verbs).
 
 ## The files
 

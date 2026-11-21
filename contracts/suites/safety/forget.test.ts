@@ -12,9 +12,10 @@
 // - REST `GET /history/deleted` lists deleted notes that still have history.
 // Erasing takes only an exact id or path (no case folding, no H1 title), since it can't be undone. A tag-scoped
 // pass resolves a list among the notes it can see and can't name a deleted note's leftover history.
-// Erasing history was already admin-only (vault#524), so all three need admin; listing deleted notes needs an
-// unscoped pass (a deleted note has no tags left to check a scope against; a scoped admin gets 404, as on
-// /history/compact). A plain delete is unchanged: it keeps the tombstone.
+// Erasing history was already admin-only (vault#524), so both erases need admin. Listing deleted notes needs write
+// (T-476: what write access may delete and restore, it may also list) and an unscoped pass (a deleted note has no
+// tags left to check a scope against; a scoped pass gets 404, as on /history/compact). A plain delete is unchanged:
+// it keeps the tombstone.
 import { describe, expect, test } from "bun:test";
 import { enc, mcp, operator, pass, rest, runId, services } from "../lib.ts";
 import { note, scopedAdmin } from "./_lib.ts";
@@ -229,10 +230,52 @@ describe("a tag-scoped pass", () => {
 });
 
 describe("who may list deleted notes", () => {
-  test("a write pass is refused (403), and a tag-scoped admin pass finds nothing there (404, as /history/compact)", async () => {
-    const w = await rest(s.vaultViaHub, await pass({ level: "write" })).get("/history/deleted");
-    expect(w.status).toBe(403);
-    expect(w.body.error_type).toBe("insufficient_scope");
+  // Write access may already delete and restore; listing what it can put back is the same reach (T-476: "an ai with
+  // write access can see deleted records"). Reading stays out: a read pass can't put anything back.
+  test("a write pass lists deleted notes and can restore one it finds there; a read pass is refused (403)", async () => {
+    const id = await noteWithHistory("writer-finds");
+    expect((await op.del(`/notes/${id}`)).status).toBe(200);
+    const writer = rest(s.vaultViaHub, await pass({ level: "write" }));
+    const w = await writer.get("/history/deleted?limit=500");
+    expect(w.status).toBe(200);
+    const row = (w.body.notes as any[]).find((n) => n.id === id);
+    expect(row).toMatchObject({ id, path: `${R}/writer-finds` });
+    expect(typeof row.deleted_at).toBe("string");
+    // what deleted it, from its tombstone (the newest version), which the same pass reads by id
+    const v = await writer.get(`/notes/${id}/versions?limit=1`);
+    expect(v.status).toBe(200);
+    expect(v.body.versions[0].op).toBe("delete");
+    const back = await writer.post(`/notes/${id}/restore`, { version_ix: v.body.versions[0].version_ix });
+    expect(back.status, JSON.stringify(back.body)).toBe(200);
+    expect(back.body.recreated).toBe(true);
+    expect((await writer.get("/history/deleted?limit=500")).body.notes.map((n: { id: string }) => n.id)).not.toContain(id);
+    const r = await rest(s.vaultViaHub, await pass({ level: "read" })).get("/history/deleted");
+    expect(r.status).toBe(403);
+    expect(r.body.error_type).toBe("insufficient_scope");
+    expect(r.body.required_scope).toBe("vault:write");
+  });
+
+  // Putting a deleted note back is a change made now: a reader asking what changed since (a sync, a "what changed"
+  // view) must find it. It used to come back with the updatedAt it had before it was deleted.
+  test("a note put back from deletion is changed now: its updatedAt is the restore's, and a since-query finds it", async () => {
+    const id = await noteWithHistory("back-now");
+    expect((await op.del(`/notes/${id}`)).status).toBe(200);
+    const writer = rest(s.vaultViaHub, await pass({ level: "write" }));
+    const tomb = (await writer.get(`/notes/${id}/versions?limit=1`)).body.versions[0];
+    await Bun.sleep(5);
+    const before = new Date().toISOString();
+    const back = await writer.post(`/notes/${id}/restore`, { version_ix: tomb.version_ix });
+    expect(back.status, JSON.stringify(back.body)).toBe(200);
+    expect(back.body.updatedAt >= before, `${back.body.updatedAt} should be at or after ${before}`).toBe(true);
+    expect(back.body.createdAt < before).toBe(true);
+    const since = await writer.get(`/notes?path_prefix=${enc(`${R}/back-now`)}&include_content=false&meta[updated_at][gte]=${enc(before)}`);
+    expect(since.status).toBe(200);
+    const rows = (Array.isArray(since.body) ? since.body : since.body.notes) as { id: string }[];
+    expect(rows.map((n) => n.id)).toContain(id);
+  });
+
+  test("a tag-scoped pass finds nothing there (404, as /history/compact), at write and at admin", async () => {
+    expect((await rest(s.vaultViaHub, await pass({ level: "write", tags: [TAG] })).get("/history/deleted")).status).toBe(404);
     expect((await rest(s.vaultViaHub, await scopedAdmin([TAG])).get("/history/deleted")).status).toBe(404);
   });
 });
