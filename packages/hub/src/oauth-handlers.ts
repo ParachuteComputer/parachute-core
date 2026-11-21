@@ -2464,11 +2464,15 @@ async function handleConsentSubmit(
   // when the form supplies at least one. A programmatic POST (or an older
   // cached consent page) that omits them entirely keeps the previous
   // approve-everything-requested behaviour, so no existing flow breaks.
+  // One box may carry several wire forms that read the same (space-separated). `granted_scope_present` says the page
+  // drew the boxes (T-476): then only what is ticked is granted, even nothing, which is the denial below. Without it
+  // (a programmatic POST, an older page), the fallback above holds.
   const grantedFields = form
     .getAll("granted_scope")
-    .map((v) => String(v))
+    .flatMap((v) => String(v).split(" "))
     .filter((v) => v.length > 0);
-  if (grantedFields.length > 0) {
+  const boxesShown = String(form.get("granted_scope_present") ?? "") === "1";
+  if (boxesShown || grantedFields.length > 0) {
     const kept = new Set(grantedFields);
     scopes = scopes.filter((sc) => kept.has(sc));
   }

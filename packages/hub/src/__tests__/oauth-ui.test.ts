@@ -121,6 +121,17 @@ describe("renderConsent", () => {
     }
   });
 
+  test("a scope with no built-in words keeps a ticked box: a consent that posts its ticks must not drop it", () => {
+    const html = renderConsent({ params: PARAMS, csrfToken: CSRF, clientId: "c", clientName: "App", scopes: ["vault:read", "mystery.module:do-thing"] });
+    expect(html).toContain('<input type="checkbox" name="granted_scope" value="mystery.module:do-thing" checked />');
+    expect(html).toContain('<input type="hidden" name="granted_scope_present" value="1" />');
+  });
+
+  test("the approve-client page shows the asked scopes read-only: no box there chooses anything", () => {
+    const html = renderApprovePending({ clientName: "App", clientId: "c", redirectUris: ["https://app.example/cb"], requestedScopes: ["vault:read", "account:self:admin"], requestedVault: null, hubOrigin: "https://hub.example", approveForm: null, loginNextUrl: "/" } as unknown as Parameters<typeof renderApprovePending>[0]);
+    expect(html).not.toContain('name="granted_scope"');
+  });
+
   test("shows client name, client_id, and a row per scope", () => {
     const html = renderConsent({
       params: PARAMS,
