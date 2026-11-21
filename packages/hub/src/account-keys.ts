@@ -340,10 +340,15 @@ async function mintAppKey(req: Request, deps: AccountKeysDeps): Promise<Response
   // From here on, a mint that doesn't finish ends the grant it filed: no grant stays in force at the vault for a key the
   // hub never made (its id stays taken there, as any ended grant's)
   // (only while no key at the hub holds the name: one that won a race for it uses the same grant)
-  const unfiled = async () => { if (types && !deps.db.prepare("SELECT 1 FROM keys WHERE name = ?").get(name)) await endFiledGrant(deps, user.id, vault, name); };
+  // (a failure to end it is said in the log and never hides the mint's own answer)
+  const unfiled = async () => {
+    if (!types || deps.db.prepare("SELECT 1 FROM keys WHERE name = ?").get(name)) return;
+    await endFiledGrant(deps, user.id, vault, name).catch((e) => console.warn(`[grants] the grant ${name} in ${vault} could not be ended after a failed mint: ${e instanceof Error ? e.message : String(e)}`));
+  };
   // Synchronous from here to the insert: bun:sqlite on one thread, so no other mint can take the name in between.
   if (deps.db.prepare("SELECT 1 FROM keys WHERE name = ?").get(name)) {
-    await unfiled();
+    // another key won the name meanwhile: its grant at the vault (same id) is left as it is. A grant this mint filed
+    // stays unused: only a token carrying the grant's id and signed with that key's name opens it (vault auth.ts)
     return err(409, "name_taken", `a key called "${name}" already exists; pick another`);
   }
   try {
