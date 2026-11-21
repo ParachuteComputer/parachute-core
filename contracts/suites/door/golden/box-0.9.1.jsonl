@@ -90,6 +90,7 @@
 {"key":"has/on-behalf-of","value":true}
 {"key":"has/records-over-rest","value":true}
 {"key":"has/revision-key-kind","value":true}
+{"key":"has/share-a-vault","value":true}
 {"key":"has/sign-in-keys-on-the-account-door","value":false}
 {"key":"has/typed-keys","value":true}
 {"key":"history/deleted.shape","value":{"notes":[{"deleted_at":"string","extension":"string","id":"string","path":"string","versions":"number"}],"total":"number"}}

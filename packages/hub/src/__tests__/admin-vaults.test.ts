@@ -1250,6 +1250,11 @@ describe("DELETE /vaults/<name> — the identity cascade", () => {
             }),
         });
 
+        for (const [id, vault, used] of [["share-a", "work", null], ["share-b", "work", "2026-01-02T00:00:00.000Z"], ["share-c", "default", null]] as const) {
+          db.prepare(
+            "INSERT INTO share_invites (id, vault_name, invitee_name, created_by, expires_at, used_at, created_at) VALUES (?, ?, 'Bo', NULL, '2999-01-01T00:00:00.000Z', ?, '2026-01-01T00:00:00.000Z')",
+          ).run(id, vault, used);
+        }
         const runner = stubRun();
         let restarted = false;
         const res = await callDelete({
@@ -1311,6 +1316,9 @@ describe("DELETE /vaults/<name> — the identity cascade", () => {
           .all(alice.id)
           .map((r) => r.vault_name);
         expect(remaining).toEqual(["default"]);
+
+        // 4a. Share invites to work, open and used, are gone; default's stay (share-invites.ts).
+        expect(db.query("SELECT vault_name FROM share_invites ORDER BY id").all()).toEqual([{ vault_name: "default" }]);
 
         // 4. Invites: pending-work revoked; pending-default + redeemed-work untouched.
         expect(out.cascade.invites_invalidated).toBe(1);

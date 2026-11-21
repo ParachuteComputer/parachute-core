@@ -278,6 +278,7 @@ import { handleAccountSetupGet, handleAccountSetupPost } from "./account-setup.t
 import { handleAccountToken } from "./account-token.ts";
 import { handleAccountVaultAdminTokenPost } from "./account-vault-admin-token.ts";
 import { handleAccountVaultTokenPost } from "./account-vault-token.ts";
+import { handleVaultNames, routeShareInvites } from "./api-share-invites.ts";
 import {
   type AgentGrantsDeps,
   handleAgentGrants,
@@ -4470,6 +4471,34 @@ export function hubFetch(
         return handleAccountMcp(req, {
           db: getDb(),
           issuer: oauthDeps(req).issuer,
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
+          manifestPath,
+        });
+      }
+      // Sharing a vault with a friend (T-476; api-share-invites.ts): the friend reads and accepts an invite; every
+      // sharer reads the names of a vault's people.
+      if (pathname === "/account/invites/look" || pathname === "/account/invites/accept") {
+        if (!getDb) return dbNotConfigured();
+        const handled = await routeShareInvites(req, pathname, {
+          db: getDb(),
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
+          manifestPath,
+        });
+        if (handled) return handled;
+      }
+      // exactly /account/vaults/<one segment>/names: a vault named "names" still reaches its own routes
+      const namesOf = /^\/account\/vaults\/([^/]+)\/names$/.exec(pathname);
+      if (namesOf) {
+        if (!getDb) return dbNotConfigured();
+        let name: string;
+        try {
+          name = decodeURIComponent(namesOf[1]!);
+        } catch {
+          return new Response("not found", { status: 404 });
+        }
+        if (!name || name.includes("/")) return new Response("not found", { status: 404 });
+        return handleVaultNames(req, name, {
+          db: getDb(),
           knownIssuers: oauthDeps(req).hubBoundOrigins(),
           manifestPath,
         });

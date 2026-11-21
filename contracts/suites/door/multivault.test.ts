@@ -48,7 +48,7 @@ describe.skipIf(!is091 || lacks("multi-vault-door"))("one multi-vault door", () 
       const tools = await c.tools();
       const names = tools.map((t) => t.name);
       for (const t of ["list-vaults", "query-records", "create-record", "update-record", "delete-record"]) expect(names).toContain(t);
-      for (const t of ["create-vault", "grant-access", "revoke-access", "list-access", "manage-token"]) expect(names).not.toContain(t);
+      for (const t of ["create-vault", "grant-access", "revoke-access", "list-access", "invite-to-vault", "take-back-invite", "manage-token"]) expect(names).not.toContain(t);
       expect(tokens(forModel(tools))).toBeLessThanOrEqual(4000);
       fp("multivault/writer.tools", names);
       const create = tools.find((t) => t.name === "create-record")!;

@@ -249,7 +249,7 @@ export type VaultVerb = "read" | "write" | "admin";
  * reconciler's own bookkeeping, and never to decide what a row may do. That is
  * why an unrecognised value is safe.
  */
-export const GRANT_VIA_VALUES = ["mcp", "cli", "api"] as const;
+export const GRANT_VIA_VALUES = ["mcp", "cli", "api", "invite"] as const;
 export type GrantVia = (typeof GRANT_VIA_VALUES)[number] | `channel:${string}`;
 
 /**
