@@ -540,6 +540,14 @@ describe("names", () => {
     expect((await names(await vaultToken(outsider), [ownerId])).status).toBe(401);
   });
 
+  test("the names route is exactly /account/vaults/<v>/names: a vault named names keeps its own routes, and a bad escape is a 404", async () => {
+    const bad = await fetchHub(new Request(`${ORIGIN}/account/vaults/%E0/names`, { headers: { authorization: `Bearer ${await vaultToken(ownerId)}` } }));
+    expect(bad.status).toBe(404);
+    // /account/vaults/names is the vault "names" itself, not the names read: without a credential, the account door's 401
+    const names_ = await fetchHub(new Request(`${ORIGIN}/account/vaults/names`, { method: "DELETE" }));
+    expect(names_.status).not.toBe(404);
+  });
+
   test("asked for no stamp, names answers every person of the vault, an ended member too, and no one else", async () => {
     const inv = await invite();
     await friendCall("accept", inv.code, BO);

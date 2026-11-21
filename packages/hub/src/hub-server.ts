@@ -4476,9 +4476,16 @@ export function hubFetch(
         });
         if (handled) return handled;
       }
-      if (pathname.startsWith("/account/vaults/") && pathname.endsWith("/names")) {
+      // exactly /account/vaults/<one segment>/names: a vault named "names" still reaches its own routes
+      const namesOf = /^\/account\/vaults\/([^/]+)\/names$/.exec(pathname);
+      if (namesOf) {
         if (!getDb) return dbNotConfigured();
-        const name = decodeURIComponent(pathname.slice("/account/vaults/".length, -"/names".length));
+        let name: string;
+        try {
+          name = decodeURIComponent(namesOf[1]!);
+        } catch {
+          return new Response("not found", { status: 404 });
+        }
         if (!name || name.includes("/")) return new Response("not found", { status: 404 });
         return handleVaultNames(req, name, {
           db: getDb(),
