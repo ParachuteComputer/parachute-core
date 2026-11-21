@@ -12754,3 +12754,144 @@ describe("account-door consent per vault (T-446)", () => {
     }
   });
 });
+
+// ───────────────────────────────────────────────────────────────────────────
+// T-476 stranger walk: the consent page as a browser submits it. The per-scope
+// checkboxes sat outside the <form>, so nothing was posted and the hub granted
+// every scope asked: a developer unticked vault admin for Claude and the token
+// held it. These render the page, post what a browser posts (the form's hidden
+// inputs, its ticked boxes minus the ones the person unticks, its chosen
+// radios and options), redeem the code, and read the token's scope.
+// ───────────────────────────────────────────────────────────────────────────
+describe("consent as a browser submits it: what is unticked is not granted (T-476)", () => {
+  const TTL_S = Math.floor(SESSION_TTL_MS / 1000);
+  const MANIFEST: ServicesManifest = {
+    services: [{ name: "parachute-vault", port: 1940, paths: ["/vault/work"], health: "/health", version: "0.7.0" }],
+  };
+  const deps = { issuer: ISSUER, loadServicesManifest: () => MANIFEST, hubBoundOrigins: () => [ISSUER] };
+  const cookie = (sessionId: string) => `${CSRF_COOKIE}; ${buildSessionCookie(sessionId, TTL_S)}`;
+  const attr = (tag: string, name: string) => new RegExp(`\\s${name}="([^"]*)"`).exec(tag)?.[1];
+  const unescape = (s: string) => s.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+  /** The fields a browser posts from the consent form, with these scope boxes unticked. */
+  function browserFields(html: string, untick: string[]): [string, string][] {
+    const start = html.indexOf('class="auth-form consent-form"');
+    expect(start).toBeGreaterThan(-1);
+    const form = html.slice(start, html.indexOf("</form>", start));
+    const out: [string, string][] = [];
+    for (const [tag] of form.matchAll(/<input\b[^>]*>/g)) {
+      const type = attr(tag, "type") ?? "text";
+      const name = attr(tag, "name");
+      if (!name) continue;
+      const value = unescape(attr(tag, "value") ?? "on");
+      if (type === "hidden") out.push([name, value]);
+      else if ((type === "checkbox" || type === "radio") && /\schecked\b/.test(tag)) {
+        if (name === "granted_scope" && untick.includes(value)) continue;
+        out.push([name, value]);
+      }
+    }
+    for (const [, attrs, body] of form.matchAll(/<select\b([^>]*)>([\s\S]*?)<\/select>/g)) {
+      const name = attr(attrs ?? "", "name");
+      const chosen = /<option\b[^>]*\sselected\b[^>]*>/.exec(body ?? "")?.[0] ?? /<option\b[^>]*>/.exec(body ?? "")?.[0];
+      if (name && chosen) out.push([name, unescape(attr(chosen, "value") ?? "")]);
+    }
+    return out;
+  }
+  async function consent(scope: string, untick: string[], resource?: string): Promise<{ scope: string } | { denied: string }> {
+    const { db, cleanup } = await makeDb();
+    try {
+      const owner = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: owner.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"], status: "approved" });
+      const pk = makePkce();
+      const params = { client_id: reg.client.clientId, redirect_uri: "https://app.example/cb", response_type: "code", scope, code_challenge: pk.challenge, code_challenge_method: "S256", ...(resource ? { resource } : {}) };
+      const page = handleAuthorizeGet(db, new Request(authorizeUrl(params), { headers: { cookie: cookie(session.id) } }), deps);
+      expect(page.status).toBe(200);
+      const form = new URLSearchParams();
+      for (const [k, v] of browserFields(await page.text(), untick)) form.append(k, v);
+      form.append("approve", "yes");
+      const res = await handleAuthorizePost(
+        db,
+        new Request(`${ISSUER}/oauth/authorize`, { method: "POST", body: form, headers: { "content-type": "application/x-www-form-urlencoded", cookie: cookie(session.id) } }),
+        deps,
+      );
+      expect(res.status).toBe(302);
+      const back = new URL(res.headers.get("location")!);
+      if (back.searchParams.get("error")) return { denied: back.searchParams.get("error")! };
+      const token = await handleToken(
+        db,
+        new Request(`${ISSUER}/oauth/token`, {
+          method: "POST",
+          body: new URLSearchParams({ grant_type: "authorization_code", code: back.searchParams.get("code")!, client_id: reg.client.clientId, redirect_uri: "https://app.example/cb", code_verifier: pk.verifier, ...(resource ? { resource } : {}) }),
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+        }),
+        deps,
+      );
+      expect(token.status).toBe(200);
+      return { scope: ((await token.json()) as { scope: string }).scope.split(" ").sort().join(" ") };
+    } finally {
+      cleanup();
+    }
+  }
+  const MCP = `${ISSUER}/vault/work/mcp`;
+
+  test("SECURITY: an AI's connector asks read, write and admin; the person unticks admin: the token holds no admin", async () => {
+    expect(await consent("vault:work:read vault:work:write vault:work:admin", ["vault:work:admin"], MCP)).toEqual({ scope: "vault:work:read vault:work:write" });
+  });
+  test("left as drawn, what was asked is granted", async () => {
+    expect(await consent("vault:work:read vault:work:write vault:work:admin", [], MCP)).toEqual({ scope: "vault:work:admin vault:work:read vault:work:write" });
+  });
+  test("SECURITY: account-wide admin starts unticked; Approve without ticking it is a denial, not a grant", async () => {
+    expect(await consent("account:self:admin", [])).toEqual({ denied: "access_denied" });
+  });
+  /** As a friend pinned to `work`: the page for this ask, posted as a browser posts it with these boxes unticked. */
+  async function asFriend(scope: string, untick: string[]): Promise<{ html: string; result: { scope: string } | { denied: string } }> {
+    const { db, cleanup } = await makeDb();
+    try {
+      await createUser(db, "owner", "pw");
+      const friend = await createUser(db, "friend", "pw", { allowMulti: true });
+      setUserVaults(db, friend.id, ["work"]);
+      const session = createSession(db, { userId: friend.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"], status: "approved" });
+      const pk = makePkce();
+      const page = handleAuthorizeGet(
+        db,
+        new Request(authorizeUrl({ client_id: reg.client.clientId, redirect_uri: "https://app.example/cb", response_type: "code", scope, code_challenge: pk.challenge, code_challenge_method: "S256" }), { headers: { cookie: cookie(session.id) } }),
+        deps,
+      );
+      expect(page.status).toBe(200);
+      const html = await page.text();
+      const form = new URLSearchParams(browserFields(html, untick));
+      form.append("approve", "yes");
+      const res = await handleAuthorizePost(db, new Request(`${ISSUER}/oauth/authorize`, { method: "POST", body: form, headers: { "content-type": "application/x-www-form-urlencoded", cookie: cookie(session.id) } }), deps);
+      expect(res.status).toBe(302);
+      const back = new URL(res.headers.get("location")!);
+      if (back.searchParams.get("error")) return { html, result: { denied: back.searchParams.get("error")! } };
+      const token = await handleToken(
+        db,
+        new Request(`${ISSUER}/oauth/token`, { method: "POST", body: new URLSearchParams({ grant_type: "authorization_code", code: back.searchParams.get("code")!, client_id: reg.client.clientId, redirect_uri: "https://app.example/cb", code_verifier: pk.verifier }), headers: { "content-type": "application/x-www-form-urlencoded" } }),
+        deps,
+      );
+      expect(token.status).toBe(200);
+      return { html, result: { scope: ((await token.json()) as { scope: string }).scope.split(" ").sort().join(" ") } };
+    } finally {
+      cleanup();
+    }
+  }
+
+  test("a friend's unnamed ask and its named twin share one box on the real page, which posts both and mints the vault", async () => {
+    const { html, result } = await asFriend("vault:work:read vault:read", []);
+    expect([...html.matchAll(/name="granted_scope"/g)].length).toBe(1);
+    expect(html).toContain('name="granted_scope" value="vault:work:read vault:read"');
+    expect(result).toEqual({ scope: "vault:work:read" });
+  });
+
+  test("on the account door the chosen vault levels decide: the connection row has no box to untick them away", async () => {
+    const { html, result } = await asFriend("account:vaults", ["account:vaults"]);
+    expect(html).not.toContain('type="checkbox" name="granted_scope" value="account:vaults"');
+    expect(result).toEqual({ scope: "account:self:vaults:work:read" });
+  });
+
+  test("SECURITY: everything unticked is a denial, never everything granted", async () => {
+    expect(await consent("vault:work:read vault:work:write", ["vault:work:read", "vault:work:write"], MCP)).toEqual({ denied: "access_denied" });
+  });
+});

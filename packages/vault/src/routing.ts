@@ -1204,7 +1204,8 @@ export async function route(
     return handleExport(req, store, vaultConfig, auth.via ?? auth.actor ?? null);
   }
   // The record door over REST (SPEC §5.1): `/api/records…` runs as its `/api/notes…` twin and `/api/types…` as
-  // `/api/tags…`, so every gate below (scopes, admin routes, tag scope) is the twin's, under the new name too.
+  // `/api/tags…`, so every gate below (scopes, admin routes, tag scope) is the twin's, under the new name too, but one:
+  // `PUT /api/types/:name` lets write define a type (`typeWriteOnly`, below).
   // The words move in records-rest.ts.
   const recordsDoor = recordsRoute(apiMatch[1] ?? "");
   if (recordsDoor) apiMatch[1] = recordsDoor.twin;
@@ -1300,7 +1301,13 @@ export async function route(
     (eraseParam !== null && eraseParam !== "false");
   const isHistoryCompact = req.method === "POST" && apiSubpath === "/history/compact";
   const isDeletedList = req.method === "GET" && apiSubpath === "/history/deleted";
-  const requiredVerb = isReadOnlyPost ? "read" : (isTagSchemaMutation || isNoteHistoryErase || isHistoryCompact) ? "admin" : isDeletedList ? "write" : verbForMethod(req.method);
+  // T-476 (docs/contracts/write-defines-types.md, "REST"): `PUT /api/types/:name`, the record door's, takes the rule
+  // MCP's manage-types has: a write credential without admin may define a new type, or add fields to one it made. The
+  // handler judges the change (type-write.ts). `PUT /api/tags/:name` stays admin: Prism calls it, and its suite pins a
+  // write pass's 403 there.
+  const typeWriteOnly = !!recordsDoor && req.method === "PUT" && /^\/tags\/[^/]+$/.test(apiSubpath) &&
+    !hasScopeForVault(auth.scopes, vaultName, "admin") && hasScopeForVault(auth.scopes, vaultName, "write");
+  const requiredVerb = isReadOnlyPost ? "read" : typeWriteOnly ? "write" : (isTagSchemaMutation || isNoteHistoryErase || isHistoryCompact) ? "admin" : isDeletedList ? "write" : verbForMethod(req.method);
   if (!hasScopeForVault(auth.scopes, vaultName, requiredVerb)) {
     const requiredApiScope = isReadOnlyPost
       ? SCOPE_READ
@@ -1351,6 +1358,7 @@ export async function route(
     actor: stamp.by,
     via: auth.via,
     bypassStrict: hasMigrateScopeForVault(auth.scopes, vaultName),
+    ...(typeWriteOnly ? { typeWriteOnly: true } : {}),
   };
 
   if (apiPath.startsWith("/notes") && recordsDoor) {

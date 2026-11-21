@@ -100,6 +100,38 @@ describe("renderLogin", () => {
 });
 
 describe("renderConsent", () => {
+  // SECURITY (T-476 stranger walk): the per-scope checkboxes sat outside the <form>, so a browser posted none of them,
+  // and the submit handler's no-granted_scope fallback granted every requested scope: unticking admin did nothing.
+  test("each requested scope's checkbox is inside the consent form, so an unticked one is not posted", () => {
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "Claude",
+      scopes: ["vault:read", "vault:write", "vault:admin"],
+    });
+    const open = html.indexOf('class="auth-form consent-form"');
+    const close = html.indexOf("</form>", open);
+    expect(open).toBeGreaterThan(-1);
+    const boxes = [...html.matchAll(/<input type="checkbox" name="granted_scope"/g)].map((m) => m.index ?? -1);
+    expect(boxes.length).toBe(3);
+    for (const at of boxes) {
+      expect(at).toBeGreaterThan(open);
+      expect(at).toBeLessThan(close);
+    }
+  });
+
+  test("a scope with no built-in words keeps a ticked box: a consent that posts its ticks must not drop it", () => {
+    const html = renderConsent({ params: PARAMS, csrfToken: CSRF, clientId: "c", clientName: "App", scopes: ["vault:read", "mystery.module:do-thing"] });
+    expect(html).toContain('<input type="checkbox" name="granted_scope" value="mystery.module:do-thing" checked />');
+    expect(html).toContain('<input type="hidden" name="granted_scope_present" value="1" />');
+  });
+
+  test("the approve-client page shows the asked scopes read-only: no box there chooses anything", () => {
+    const html = renderApprovePending({ clientName: "App", clientId: "c", redirectUris: ["https://app.example/cb"], requestedScopes: ["vault:read", "account:self:admin"], requestedVault: null, hubOrigin: "https://hub.example", approveForm: null, loginNextUrl: "/" } as unknown as Parameters<typeof renderApprovePending>[0]);
+    expect(html).not.toContain('name="granted_scope"');
+  });
+
   test("shows client name, client_id, and a row per scope", () => {
     const html = renderConsent({
       params: PARAMS,

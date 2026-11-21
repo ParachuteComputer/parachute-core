@@ -945,7 +945,10 @@ A person's own field names are never renamed (a field called `content` stays `co
 - **`GET /api/types`** — every type and tag with its `kind` (`"type"` or `"tag"`), `count` and `expanded_count`, as
   MCP `list-types`; `?include_schema=true` adds each one's fields and parents. **`GET /api/types/{name}`** (or
   `?name=`) — one in full, as `list-types {name}`. **`PUT` / `DELETE /api/types/{name}`**, `POST /api/types/merge`
-  and `POST /api/types/{name}/rename` are `/api/tags`' writes under the new name, and need `vault:admin`.
+  and `POST /api/types/{name}/rename` are `/api/tags`' writes under the new name, and need `vault:admin`, with one
+  exception: `PUT /api/types/{name}` with `vault:write` may define a type nobody has defined yet and add fields to a
+  type the same credential made, as MCP `manage-types` may (`contracts/write-defines-types.md`). `PUT /api/tags/{name}`
+  stays admin.
   `/api/tags` keeps its 0.8 shape (no `kind`) through 0.9.
 
 **`/api/notes` is leaving.** It answers as before through 0.9, and every answer (success or error) carries
