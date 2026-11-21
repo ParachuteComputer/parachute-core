@@ -144,13 +144,10 @@ describe("requestable is NOT the same as advertised", () => {
       loadServicesManifest: () => ({ services: [{ name: "parachute-vault", port: 1940 }] }),
     } as never);
     const body = (await res.json()) as { scopes_supported: string[] };
-    // The ordinary surface is advertised…
-    expect(body.scopes_supported).toContain("vault:read");
-    expect(body.scopes_supported).toContain("vault:admin");
-    // account:vaults is requestable at this door but not advertised here —
-    // catalog-copy would combine it with vault scopes, which authorize refuses.
-    expect(body.scopes_supported).not.toContain("account:vaults");
-    // …account-wide REST authority (delete-vault / mint credentials) is not.
+    // T-476: root /mcp is the account door, so its catalog is the account door's ask alone (not beside vault verbs,
+    // which authorize refuses in one ask)…
+    expect(body.scopes_supported).toEqual(["account:vaults"]);
+    // …and account-wide REST authority (delete-vault / mint credentials) is not in it.
     expect(body.scopes_supported).not.toContain(ACCOUNT_SELF_ADMIN_SCOPE);
     expect(body.scopes_supported).not.toContain(ACCOUNT_SELF_WRITE_SCOPE);
     expect(body.scopes_supported).not.toContain(ACCOUNT_SELF_READ_SCOPE);

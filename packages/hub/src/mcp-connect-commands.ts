@@ -1,16 +1,14 @@
 /**
  * Copy-paste MCP connect URLs and Claude Code commands.
  *
- * Humans are pointed at:
- *   - `/mcp` — one URL; the consent picker chooses this vault XOR all
- *     assigned vaults. Root PRM stays vault-only (catalog-copy must not
- *     mix `account:vaults` with `vault:*` — that combination is
- *     `invalid_scope`).
- *   - `/vault/<name>/mcp` — skip the picker; one assigned vault.
+ * Humans are pointed at (T-476, one address for an AI):
+ *   - `/mcp` — the one address: the account door. On the approval page the
+ *     person gives the AI all their vaults (and leave to make new ones) or
+ *     only some, each at a level.
+ *   - `/vault/<name>/mcp` — just one vault, the narrow choice.
  *
- * `/account/mcp` stays the honest single-family discovery door (its PRM
- * advertises `account:vaults` alone). Do not put it in human-facing
- * onboarding copy — the picker at `/mcp` is the choice.
+ * `/account/mcp` is the same door by its own name (shipped apps read it from
+ * the descriptor); human-facing copy says `/mcp`.
  */
 
 /** `<hub-origin>/vault/<name>/mcp` — one assigned vault. */
@@ -26,7 +24,7 @@ export function assignedVaultClaudeMcpAddCommand(trimmedOrigin: string, vaultNam
   )}`;
 }
 
-/** `<hub-origin>/mcp` — picker chooses this vault or all assigned vaults. */
+/** `<hub-origin>/mcp` — the one address: every vault the person gives the AI. */
 export function rootMcpEndpoint(trimmedOrigin: string): string {
   return `${trimmedOrigin}/mcp`;
 }

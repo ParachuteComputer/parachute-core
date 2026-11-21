@@ -331,9 +331,11 @@ describe("rootMcpProtectedResourceMetadata (hub#789)", () => {
       loadServicesManifest: fixtureLoadServicesManifest,
     });
 
-  test("advertises vault:admin — the regression that made tag editing unreachable over MCP", async () => {
+  test("advertises the account door's ask alone (T-476: <hub>/mcp is the one address)", async () => {
+    // A spec-following client copies this list whole; the account door's ask can't sit beside a vault verb. The
+    // vault verbs (vault:admin included, hub#789) stay advertised at each vault's own address, the narrow choice.
     const body = (await call().json()) as Record<string, unknown>;
-    expect(body.scopes_supported as string[]).toContain("vault:admin");
+    expect(body.scopes_supported).toEqual(["account:vaults"]);
   });
 
   test("names the /mcp endpoint as the resource, not the bare origin", async () => {
@@ -349,20 +351,15 @@ describe("rootMcpProtectedResourceMetadata (hub#789)", () => {
     expect(body.scopes_supported as string[]).not.toContain("parachute:host:admin");
   });
 
-  test("shares the bare PRM's requestable-scope filter, narrowed further to vault-only", async () => {
-    // Both documents start from one registry and requestable-scope filter; the
-    // root document applies its additional vault-only advertisement. account:vaults
-    // is requestable at this door but not advertised (catalog-copy combine).
+  test("lists none of the bare PRM's vault verbs (they would combine-refuse with account:vaults)", async () => {
     const root = (await call().json()) as Record<string, unknown>;
     const bare = (await protectedResourceMetadata({
       issuer: ISSUER,
       loadDeclaredScopes: () => declared,
       loadServicesManifest: fixtureLoadServicesManifest,
     }).json()) as Record<string, unknown>;
-    expect([...(root.scopes_supported as string[])].sort()).toEqual(
-      [...(bare.scopes_supported as string[])].sort(),
-    );
-    expect(root.scopes_supported as string[]).not.toContain("account:vaults");
+    expect(bare.scopes_supported as string[]).toContain("vault:read");
+    for (const s of bare.scopes_supported as string[]) expect(root.scopes_supported as string[]).not.toContain(s);
   });
 
   test("narrows the bare PRM's requestable catalog to vault scopes at the root door", async () => {
@@ -10384,14 +10381,14 @@ describe("RFC 8707 resource binding — vault-bound MCP (fix #461)", () => {
       }
     });
 
-    test("resource=<origin>/mcp drops foreign scopes but KEEPS the picker", async () => {
+    test("resource=<origin>/mcp drops foreign scopes and leads unnamed vault verbs to the account door (T-476)", async () => {
       const html = await consentFor(`${ISSUER}/mcp`);
       // The scary-consent fix now reaches the root door.
       expect(html).not.toContain("scribe:");
-      // …and the vault scopes survive un-narrowed, because the resource names
-      // no vault. The picker supplies the name; naming them here would mean
-      // inventing a vault the client never asked for.
-      expect(html).toContain("Pick a vault");
+      // …and unnamed vault verbs are an ask for what <hub>/mcp gives: the account door's page (All your vaults, or
+      // only these at a level each), not the one-vault picker. No vault is invented.
+      expect(html).toContain('name="vault_reach"');
+      expect(html).not.toContain("Pick a vault");
       expect(html).not.toContain("vault:jon:read");
       expect(html).not.toContain("vault:boulder:read");
     });
@@ -10401,7 +10398,7 @@ describe("RFC 8707 resource binding — vault-bound MCP (fix #461)", () => {
       // `resource_metadata=".../.well-known/oauth-protected-resource/mcp"`.
       const html = await consentFor(`${ISSUER}/.well-known/oauth-protected-resource/mcp`);
       expect(html).not.toContain("scribe:");
-      expect(html).toContain("Pick a vault");
+      expect(html).toContain('name="vault_reach"');
     });
 
     test("an off-origin /mcp drives nothing — same gate as the per-vault path", async () => {
@@ -10467,11 +10464,10 @@ describe("RFC 8707 resource binding — vault-bound MCP (fix #461)", () => {
         );
         expect(tokenRes.status).toBe(200);
         const tok = (await tokenRes.json()) as { scope: string };
-        // scribe dropped; the picker's vault named the surviving vault scope,
-        // which is what makes the token usable at root /mcp at all (an unnamed
-        // `vault:read` / `aud=vault` token is rejected there).
+        // scribe dropped; the unnamed vault verb became the account door's ask (T-476), so the picked vault is
+        // ignored and a form without the page's choice gets the level-less grant of a 0.9.0 page, as before 0.9.1.
         expect(tok.scope.split(" ")).not.toContain("scribe:transcribe");
-        expect(tok.scope).toBe("vault:jon:read");
+        expect(tok.scope).toBe("account:self:vaults");
       } finally {
         cleanup();
       }
@@ -10585,13 +10581,13 @@ describe("RFC 8707 resource binding — vault-bound MCP (fix #461)", () => {
       }
     });
 
-    test("catalog-copy of the root PRM still reaches the vault picker (not invalid_scope)", async () => {
+    test("catalog-copy of the root PRM reaches the account door's page (not invalid_scope) (T-476)", async () => {
       const prm = (await rootMcpProtectedResourceMetadata(RESOURCE_DEPS).json()) as {
         scopes_supported: string[];
       };
-      expect(prm.scopes_supported).not.toContain("account:vaults");
+      expect(prm.scopes_supported).toEqual(["account:vaults"]);
       const html = await consentFor(`${ISSUER}/mcp`);
-      expect(html).toContain("Pick a vault");
+      expect(html).toContain('name="vault_reach"');
       expect(html).not.toContain("error=invalid_scope");
       const { db, cleanup } = await makeDb();
       try {
@@ -10621,9 +10617,10 @@ describe("RFC 8707 resource binding — vault-bound MCP (fix #461)", () => {
         );
         expect(res.status).toBe(200);
         const copied = await res.text();
-        expect(copied).toContain("Pick a vault");
-        expect(copied).toContain("All assigned vaults");
-        expect(copied).toContain('data-testid="vault-pick-account"');
+        // The owner starts on "All your vaults"; "Only these vaults" lists each at a level.
+        expect(copied).toMatch(/name="vault_reach" value="all" checked/);
+        expect(copied).toContain('data-testid="vault-reach-chosen"');
+        expect(copied).not.toContain("Pick a vault");
       } finally {
         cleanup();
       }

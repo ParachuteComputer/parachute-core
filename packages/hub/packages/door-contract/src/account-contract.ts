@@ -147,6 +147,12 @@ export interface ParachuteAccountDescriptor {
    */
   account_mcp_endpoint?: string;
   /**
+   * The one MCP address an AI gets (T-476): `<issuer>/mcp`, the account door for a person's OAuth connection (every
+   * vault they let it reach, one named per call, new vaults when allowed). Optional: a door that serves only per-vault
+   * addresses leaves it out, and an app then shows `account_mcp_endpoint` or a vault's own `<vault>/mcp`.
+   */
+  mcp_endpoint?: string;
+  /**
    * How a person signs IN at this door. Optional in 0.4.0 so cloud@main keeps
    * typechecking while it lands its own twin (P3); P7 flips this required once
    * both doors serve it.

@@ -7216,7 +7216,8 @@ describe("hubFetch root /mcp forwarding (vault 0.7.3 canonical root MCP)", () =>
       // Names the /mcp endpoint as the resource, and advertises hub's set —
       // including admin, which the forwarded vault document omitted.
       expect(String(body.resource)).toMatch(/\/mcp$/);
-      expect(body.scopes_supported as string[]).toContain("vault:admin");
+      // T-476: root /mcp is the account door; its ask is account:vaults alone.
+      expect(body.scopes_supported as string[]).toEqual(["account:vaults"]);
 
       // The decisive assertion: the vault daemon is never consulted.
       expect(upstream.requests().length).toBe(0);
@@ -7303,7 +7304,10 @@ describe("hubFetch root /mcp forwarding (vault 0.7.3 canonical root MCP)", () =>
         manifestPath: h.manifestPath,
         resolveAppDist: () => dist,
       })(req("/mcp", { headers: { accept: "text/html" } }));
-      expect(res.status).toBe(404);
+      // T-476: with no vault to proxy to, an app with no credential gets the account door's challenge (it may make
+      // the first vault), never the app's shell.
+      expect(res.status).toBe(401);
+      expect(res.headers.get("www-authenticate") ?? "").toContain("/.well-known/oauth-protected-resource/mcp");
       const body = await res.text();
       expect(body).not.toContain("PARACHUTE-APP-SHELL");
     } finally {

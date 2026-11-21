@@ -130,8 +130,7 @@ function accountMcpResource(issuer: string): string {
 /**
  * RFC 9728 §3.3: WWW-Authenticate `resource_metadata` must describe the
  * requested URL. handleAccountMcp answers both `/mcp` (root dispatch) and
- * `/account/mcp`. Do not advertise `account:vaults` on the root PRM —
- * catalog-copy + combine-refusal is a total `invalid_scope` bounce.
+ * `/account/mcp`. Since T-476 both documents list `account:vaults` alone.
  */
 export function challengePrmPath(req: Request): string {
   let pathname = "";

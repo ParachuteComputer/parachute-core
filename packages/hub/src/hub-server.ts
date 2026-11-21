@@ -4700,6 +4700,16 @@ export function hubFetch(
         // The key door (T-414) on the root MCP door too: a vault key spent here is refused at once once revoked.
         const proxied = await throughKeyDoor(req, getDb, () => proxyToVaultDaemon(req, manifestPath, deps?.supervisor, peerAddr));
         if (proxied) return proxied;
+        // T-476: a hub with no vault yet still answers the one address. An app with no credential gets the account
+        // door's challenge (its first act may be create-vault), not a 404 it can't sign in from.
+        if (getDb && !req.headers.has("authorization") && !req.headers.has("x-api-key")) {
+          return handleAccountMcp(req, {
+            db: getDb(),
+            issuer: oauthDeps(req).issuer,
+            knownIssuers: oauthDeps(req).hubBoundOrigins(),
+            manifestPath,
+          });
+        }
         return vaultModuleNotRunning();
       }
 

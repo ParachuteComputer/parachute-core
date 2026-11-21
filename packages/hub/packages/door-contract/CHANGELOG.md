@@ -1,5 +1,11 @@
 # @openparachute/door-contract
 
+## Unreleased
+
+- `ParachuteAccountDescriptor` gains optional `mcp_endpoint` (T-476): the one MCP address an AI gets, `<issuer>/mcp`,
+  the account door for a person's OAuth connection. Additive; a door that serves only per-vault addresses leaves it
+  out.
+
 ## 0.7.0
 
 The account-door scope ladder gains an additive middle rung for

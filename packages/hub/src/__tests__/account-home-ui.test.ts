@@ -723,10 +723,11 @@ describe("renderAccountHome", () => {
     // suffix is load-bearing (only it returns the WWW-Authenticate header).
     expect(html).toContain(`${HUB_ORIGIN}/vault/alice/mcp`);
     expect(html).toMatch(/data-testid="onboarding-mcp-endpoint">[^<]*\/vault\/alice\/mcp</);
-    // Root `/mcp` is the labeled second option (picker at consent), not a
-    // replacement for the per-vault door. `/account/mcp` is not shown.
+    // T-476: root `/mcp`, the one address, leads; the per-vault door follows under "Just one vault".
+    // `/account/mcp` is not shown.
     expect(html).toContain('data-testid="onboarding-house"');
-    expect(html).toContain("This hub");
+    expect(html).toContain("Just one vault");
+    expect(html.indexOf('data-testid="onboarding-hub-mcp-endpoint"')).toBeLessThan(html.indexOf('data-testid="onboarding-mcp-endpoint"'));
     expect(html).toMatch(/data-testid="onboarding-hub-mcp-endpoint">[^<]*\/mcp</);
     expect(html).toContain(`claude mcp add --transport http parachute ${HUB_ORIGIN}/mcp`);
     expect(html).not.toContain("/account/mcp");
@@ -784,7 +785,7 @@ describe("renderAccountHome", () => {
     expect(html).toContain('data-testid="onboarding-hub-mcp-endpoint"');
     expect(html).toContain("Claude.ai (web)");
     expect(html).toContain("Claude Code (terminal)");
-    expect(html).toContain("This hub");
+    expect(html).toContain("Just one vault");
     expect(html).not.toContain("/account/mcp");
   });
 

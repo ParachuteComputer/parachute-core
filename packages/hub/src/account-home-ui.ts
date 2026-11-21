@@ -322,11 +322,10 @@ interface OnboardingChecklistOpts {
  * person an obvious path:
  *
  *   ① Your account is ready  — always done (they're signed in, password set).
- *   ② Connect your AI        — the hero. Per-vault endpoint (`/vault/<name>/mcp`)
- *                              first (narrower OAuth option), then a clearly
- *                              labeled "all assigned vaults" `/account/mcp`
- *                              command. Claude.ai connector + Claude Code
- *                              `claude mcp add` for each. Marked done when
+ *   ② Connect your AI        — the hero. The one address (`/mcp`, T-476) with
+ *                              the Claude.ai connector and Claude Code
+ *                              `claude mcp add`, then "Just one vault"
+ *                              (`/vault/<name>/mcp`). Marked done when
  *                              `connected`.
  *   ③ Set up your vault      — links the vault-setup starter prompt.
  *
@@ -349,40 +348,37 @@ function renderOnboardingChecklist(opts: OnboardingChecklistOpts): string {
   const safeHouseEndpoint = escapeHtml(houseEndpoint);
   const safeHouseAddCmd = escapeHtml(houseAddCmd);
 
-  // Per-vault first (narrower OAuth option), then the whole-house door.
+  // T-476: the one address first (every vault the person gives the AI), then just this vault, the narrow choice.
   // Shared between the full checklist (step 2) and the condensed
   // "Connect another AI" expander (hub#583) so a genuinely-connected
   // user can still wire up a SECOND client without losing the instructions.
   const connectMethods = `
-            <div class="copy-row">
-              <code data-testid="onboarding-mcp-endpoint">${safeVaultEndpoint}</code>
-              <button type="button" class="btn btn-copy" data-copy="${safeVaultEndpoint}"
-                      data-testid="copy-onboarding-endpoint">Copy</button>
-            </div>
-            <p class="onboarding-method"><strong>Claude.ai (web):</strong> open
-               Settings → Connectors → Add custom connector, and paste the address above.</p>
-            <p class="onboarding-method"><strong>Claude Code (terminal):</strong> run this command:</p>
-            <div class="copy-row">
-              <code data-testid="onboarding-mcp-add-command">${safeVaultAddCmd}</code>
-              <button type="button" class="btn btn-copy" data-copy="${safeVaultAddCmd}"
-                      data-testid="copy-onboarding-add-command">Copy</button>
-            </div>
             <div class="onboarding-house" data-testid="onboarding-house">
-              <p class="onboarding-house-label" data-testid="onboarding-house-label">This hub</p>
-              <p class="onboarding-step-sub">Paste this instead of the per-vault URL to pick at
-                 consent — this vault, or all assigned vaults, not just
-                 <code>${safeVault}</code>:</p>
               <div class="copy-row">
                 <code data-testid="onboarding-hub-mcp-endpoint">${safeHouseEndpoint}</code>
                 <button type="button" class="btn btn-copy" data-copy="${safeHouseEndpoint}"
                         data-testid="copy-onboarding-hub-endpoint">Copy</button>
               </div>
-              <p class="onboarding-method"><strong>Claude Code (terminal):</strong></p>
+              <p class="onboarding-method"><strong>Claude.ai (web):</strong> open
+                 Settings → Connectors → Add custom connector, and paste the address above.</p>
+              <p class="onboarding-method"><strong>Claude Code (terminal):</strong> run this command:</p>
               <div class="copy-row">
                 <code data-testid="onboarding-hub-mcp-add-command">${safeHouseAddCmd}</code>
                 <button type="button" class="btn btn-copy" data-copy="${safeHouseAddCmd}"
                         data-testid="copy-onboarding-hub-add-command">Copy</button>
               </div>
+            </div>
+            <p class="onboarding-house-label" data-testid="onboarding-house-label">Just one vault</p>
+            <p class="onboarding-step-sub">To give an AI only <code>${safeVault}</code>, use its own address:</p>
+            <div class="copy-row">
+              <code data-testid="onboarding-mcp-endpoint">${safeVaultEndpoint}</code>
+              <button type="button" class="btn btn-copy" data-copy="${safeVaultEndpoint}"
+                      data-testid="copy-onboarding-endpoint">Copy</button>
+            </div>
+            <div class="copy-row">
+              <code data-testid="onboarding-mcp-add-command">${safeVaultAddCmd}</code>
+              <button type="button" class="btn btn-copy" data-copy="${safeVaultAddCmd}"
+                      data-testid="copy-onboarding-add-command">Copy</button>
             </div>`;
 
   // Condensed state — they've connected, so the checklist shrinks to a quiet
@@ -401,9 +397,8 @@ function renderOnboardingChecklist(opts: OnboardingChecklistOpts): string {
       <details class="onboarding-connect-another" data-testid="onboarding-connect-another">
         <summary data-testid="onboarding-connect-another-summary">Connect another AI →</summary>
         <div class="onboarding-step-body">
-          <p class="onboarding-step-sub">Point another AI client at your vault — or at every
-             vault this account can access — using the addresses below. You'll sign in and
-             approve the first time:</p>
+          <p class="onboarding-step-sub">Point another AI at this address. You sign in the first
+             time and choose which vaults it reaches:</p>
           ${connectMethods}
         </div>
       </details>
@@ -429,10 +424,8 @@ function renderOnboardingChecklist(opts: OnboardingChecklistOpts): string {
           <span class="onboarding-num" aria-hidden="true">2</span>
           <div class="onboarding-step-body">
             <p class="onboarding-step-title">Connect your AI</p>
-            <p class="onboarding-step-sub">Point Claude (or another AI) at your
-               <code>${safeVault}</code> vault using this address — no token to copy, you'll
-               sign in and approve the first time. A second command below covers every
-               vault this account can access:</p>
+            <p class="onboarding-step-sub">Point Claude (or another AI) at this address. No token
+               to copy: you sign in the first time and choose which vaults it reaches.</p>
             ${connectMethods}
           </div>
         </li>

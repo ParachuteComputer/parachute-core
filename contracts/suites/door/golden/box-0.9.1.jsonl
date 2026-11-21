@@ -88,6 +88,7 @@
 {"key":"has/multi-vault-door","value":true}
 {"key":"has/oauth-approval","value":true}
 {"key":"has/on-behalf-of","value":true}
+{"key":"has/one-address","value":true}
 {"key":"has/records-over-rest","value":true}
 {"key":"has/revision-key-kind","value":true}
 {"key":"has/sign-in-keys-on-the-account-door","value":false}
