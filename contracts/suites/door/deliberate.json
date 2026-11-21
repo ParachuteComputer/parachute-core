@@ -338,6 +338,27 @@
       "status": "drift",
       "owner": "parachute-cloud 0.9.1 multi-vault door (T-446)",
       "why": "On a box one key can cover several vaults, each at its own level (`POST /account/keys {name, vaults: {<vault>: \"read\"|\"write\"}}`), and the account door (`/account/mcp`) serves the record tools plus `list-vaults` with it: `vault` named on every write, each vault reached at that key's level there. A cloud-style door's account door doesn't take such a key yet; an app that needs several vaults there holds one key per vault. The same entry gates the account door's tool hints check (annotations.test.ts): it reaches `/account/mcp` with the account credential, which a cloud-style account door refuses (it takes an OAuth connection with `account:<id>:vaults`); parachute-cloud holds its own account door's hints (workers/identity/test/account-door-hints.test.ts, account-mcp.test.ts)."
+    },
+    {
+      "id": "one-address",
+      "keys": [
+        "has/one-address"
+      ],
+      "between": [
+        "box",
+        "cloud",
+        "personal"
+      ],
+      "releases": [
+        "0.9.1"
+      ],
+      "lacks": [
+        "cloud",
+        "personal"
+      ],
+      "status": "drift",
+      "owner": "parachute-cloud: one address (T-476, CLOUD.md)",
+      "why": "On a box an AI gets one address, `<issuer>/mcp`: a cold app there is led to the account door (its protected-resource document lists `account:vaults` only), the consent screen starts on \"All your vaults\" (read and write in each, and it may make new ones) with \"Only these vaults\" one level each, and the hub's descriptor names it as `mcp_endpoint`. A cloud-style door serves one vault per address (`/vault/<name>/mcp`) and its account door takes an OAuth connection with `account:<id>:vaults`; an app there shows the vault's address."
     }
   ]
 }
