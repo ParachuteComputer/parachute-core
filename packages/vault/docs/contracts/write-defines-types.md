@@ -35,9 +35,13 @@ one made before this rule, which has no creator stamp), `parent_names`, `relatio
 merge, delete, prune and migrate. A refused call changes nothing and says so: "needs `vault:<name>:admin`", with
 what write access may do instead.
 
-**The account door** (one key over several vaults, the hub's `/mcp`) lists `manage-types` only to a key that holds admin
-on the vault, as before: its writer list keeps to a 4,000-token budget (`contracts/suites/door/multivault.test.ts`). A
-write key there makes a type at the vault's own address, the one the app's Connect screen gives.
+**The account door** (one key over several vaults, the hub's `/mcp`) lists what a vault's own door lists at the same
+level, `manage-types` to a write key included (T-476: it is the address an AI gets, so an AI there must be able to make a
+type). Its writer list keeps to a 4,000-token budget (`contracts/suites/door/multivault.test.ts`) by listing the
+note-named aliases (`query-notes`, `create-note`, `update-note`, `delete-note`, `list-tags`) to a Bearer connection under
+their record names only; they still answer, and a NIP-98 caller (Uni's agents, `contracts/suites/compat/uni.test.ts`)
+keeps them listed. *Changed from: listed only to a key that holds admin (core #134); needs Aaron's or Benjamin's sign-off
+(core #136).*
 
 **REST is unchanged**: `PUT /api/tags/:name` (and `/api/types/:name`) stays admin. Benjamin's Prism compatibility suite
 (`contracts/suites/compat/prism.test.ts`) pins a write pass's 403 there, and nothing turns it red on purpose. The AI
