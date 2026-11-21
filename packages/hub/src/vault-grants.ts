@@ -10,7 +10,7 @@
  * connected by OAuth, this app on each device. Each row is a **door grant** (§7.3), the door's word that the signed-in
  * owner agreed, in §7.1's row shape: `{id, origin: "door", state, signer: null, grantee: null, by: "signer", types,
  * deny: [], expires_at, event: null}`, with what a person needs to know it by: `name`, `kind` (person, agent, app,
- * service), `app` (the OAuth app's own name, when it has one), `created_at`, `last_used_at`, and `admin`/`export` for
+ * service), `app` and `client` (the OAuth app's own name and client id, when it was one), `created_at`, `last_used_at`, and `admin`/`export` for
  * the two levels that aren't a grant of types.
  *
  * A key made with types (`POST /account/keys {types}`) also has its grant filed at the vault itself, which checks it
@@ -89,10 +89,11 @@ function grantTypes(k: KeyView, vault: string): Record<string, string[]> {
   return Object.fromEntries(types.map((t) => [t, verbs]));
 }
 
-function appNames(db: Database): Map<string, string> {
+/** Per token: the OAuth app it was given to (its client id, and the name it registered), when it was one. */
+function appsOf(db: Database): Map<string, { client: string; name: string | null }> {
   try {
-    const rows = db.prepare("SELECT t.jti AS jti, c.client_name AS name FROM tokens t JOIN clients c ON c.client_id = t.client_id").all() as { jti: string; name: string | null }[];
-    return new Map(rows.filter((r) => r.name).map((r) => [r.jti, r.name!]));
+    const rows = db.prepare("SELECT t.jti AS jti, t.client_id AS client, c.client_name AS name FROM tokens t JOIN clients c ON c.client_id = t.client_id").all() as { jti: string; client: string; name: string | null }[];
+    return new Map(rows.map((r) => [r.jti, { client: r.client, name: r.name }]));
   } catch {
     return new Map();
   }
@@ -101,7 +102,7 @@ function appNames(db: Database): Map<string, string> {
 /** Every key that reaches `vault`, as grant rows. */
 export function vaultGrantRows(db: Database, vault: string, now: Date = new Date()) {
   const jtis = new Map((db.prepare("SELECT name, jti FROM keys").all() as { name: string; jti: string }[]).map((r) => [r.name, r.jti]));
-  const apps = appNames(db);
+  const apps = appsOf(db);
   return listKeys(db, now)
     .filter((k) => k.levels[vault] !== undefined)
     .map((k) => ({
@@ -117,7 +118,8 @@ export function vaultGrantRows(db: Database, vault: string, now: Date = new Date
       event: null,
       name: k.name,
       kind: k.owner_kind,
-      app: apps.get(jtis.get(k.name) ?? "") ?? null,
+      app: apps.get(jtis.get(k.name) ?? "")?.name ?? null,
+      client: apps.get(jtis.get(k.name) ?? "")?.client ?? null,
       ...(k.levels[vault] === "admin" ? { admin: true } : {}),
       ...(k.levels[vault] === "export" ? { export: true } : {}),
       created_at: k.created_at,

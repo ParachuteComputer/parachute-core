@@ -226,11 +226,19 @@ describe.skipIf(without)("who reaches the vault, and ending it", () => {
 
   test("the vault's own admin credential makes, lists and ends keys for that vault, and no other", async () => {
     const w = await theWorld();
+    // An app reaches its hubs from its own origin: these bearer-only routes answer any origin, without credentials.
+    for (const path of ["/account/keys", `/account/vaults/${enc(door().vault)}/statements`]) {
+      const pre = await safeFetch(`${door().issuer}${path}`, { method: "OPTIONS", headers: { origin: "https://app.example", "access-control-request-method": "POST", "access-control-request-headers": "authorization, content-type" } });
+      expect(pre.status).toBeLessThan(300);
+      expect(pre.headers.get("access-control-allow-origin")).toBe("*");
+      expect(pre.headers.get("access-control-allow-credentials")).not.toBe("true");
+    }
     const key = await typedKey([w.R], "write", "vault-admin");
     const ai = records({ bearer: key.token });
     expect((await ai.get(w.r1)).status).toBe(200);
     const mine = await list("vault-admin");
     expect(mine.status).toBe(200);
+    expect(mine.headers.get("access-control-allow-origin")).toBe("*");
     expect(mine.body.grants.some((x: any) => x.id === key.name)).toBe(true);
     // Another vault's list, a key for another vault, and the owner's whole key list stay the owner's.
     const other = door().otherVault;
