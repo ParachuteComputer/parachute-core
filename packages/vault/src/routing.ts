@@ -1204,7 +1204,8 @@ export async function route(
     return handleExport(req, store, vaultConfig, auth.via ?? auth.actor ?? null);
   }
   // The record door over REST (SPEC §5.1): `/api/records…` runs as its `/api/notes…` twin and `/api/types…` as
-  // `/api/tags…`, so every gate below (scopes, admin routes, tag scope) is the twin's, under the new name too.
+  // `/api/tags…`, so every gate below (scopes, admin routes, tag scope) is the twin's, under the new name too, but one:
+  // `PUT /api/types/:name` lets write define a type (`typeWriteOnly`, below).
   // The words move in records-rest.ts.
   const recordsDoor = recordsRoute(apiMatch[1] ?? "");
   if (recordsDoor) apiMatch[1] = recordsDoor.twin;

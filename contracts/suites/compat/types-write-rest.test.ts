@@ -71,7 +71,11 @@ describe("compat/types-write-rest: write access may add a new type over REST", (
     const t = await w.get(`/types/${enc(book)}`);
     expect(Object.keys(t.body.fields ?? {})).toEqual([a]);
     expect(t.body.fields[a].type).toBe("string");
+    // a refusal lands nothing: not the description either
+    expect((await w.put(`/types/${enc(book)}`, { description: "changed", fields: { [a]: { type: "integer" } } })).status).toBe(403);
+    expect((await w.get(`/types/${enc(book)}`)).body.description ?? null).toBeNull();
     // what stays admin on any type
+    expect((await w.post(`/types/${enc(book)}/migrate`, { field: a, transform: { kind: "to_string" } })).status).toBe(403);
     expect((await w.del(`/types/${enc(book)}`)).status).toBe(403);
     expect((await w.post(`/types/${enc(book)}/rename`, { new_name: runId("other") })).status).toBe(403);
     expect((await w.post("/types/merge", { sources: [book], target: runId("other") })).status).toBe(403);
@@ -86,14 +90,15 @@ describe("compat/types-write-rest: write access may add a new type over REST", (
     const child = runId("child");
     const parent = runId("parent");
     expect((await operator().put(`/types/${enc(child)}`, { parent_names: [parent] })).status).toBe(200);
-    for (const name of [theirs, label, "_default", parent]) {
+    // `#name` is the same name: `#_default` is `_default`
+    for (const name of [theirs, label, "_default", "#_default", `#${theirs}`, parent]) {
       const r = await w.put(`/types/${enc(name)}`, { kind: "type", fields: { [field()]: { type: "string" } } });
       expect([name, r.status]).toEqual([name, 403]);
     }
     expect(Object.keys((await w.get(`/types/${enc(theirs)}`)).body.fields ?? {})).toHaveLength(1);
   });
 
-  test("one key has one stamp on both doors: a type it made over MCP takes its new fields over REST", async () => {
+  test("a named key has one stamp on both doors: a type it made over MCP takes its new fields over REST", async () => {
     const s = services();
     const token = await pass({ level: "write" });
     const c = await mcp(`${s.vaultViaHub}/mcp`, token);

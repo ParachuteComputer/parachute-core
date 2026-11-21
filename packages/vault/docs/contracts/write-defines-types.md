@@ -53,8 +53,10 @@ REST, and a newcomer's one tap ("Add a pack") has to make the pack's types with 
 **`PUT /api/tags/:name` is unchanged: admin.** Benjamin's Prism compatibility suite (`contracts/suites/compat/prism.test.ts`)
 pins a write pass's 403 there, and Prism calls that route. A client that wants the rule uses the record door.
 
-The stamp is the credential's, whichever door it comes through: one key (one `by` and `via`) that made a type over MCP
-may add fields to it over REST, and the reverse.
+The stamp is the credential's, and its `via` can differ by door. A named key (`key:<name>`), a signing key (`nostr:…`)
+and the operator stamp the same `via` on both, so a type one of them made over MCP takes its fields over REST, and the
+reverse. A hub sign-in with no key name stamps `api` over REST and `mcp` over MCP, so a type it made over one door is
+not "its own" over the other (fail closed: an admin still can).
 
 A **tag-scoped** credential (`permissions.scoped_tags`) gets none of this: types sit above every tag scope, so a
 scoped writer's types stay the admin's to make (as in `tag-scoped-tokens.md`). `vault:read` gets nothing.
