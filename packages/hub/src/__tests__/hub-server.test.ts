@@ -7304,12 +7304,27 @@ describe("hubFetch root /mcp forwarding (vault 0.7.3 canonical root MCP)", () =>
         manifestPath: h.manifestPath,
         resolveAppDist: () => dist,
       })(req("/mcp", { headers: { accept: "text/html" } }));
-      // T-476: with no vault to proxy to, an app with no credential gets the account door's challenge (it may make
-      // the first vault), never the app's shell.
-      expect(res.status).toBe(401);
-      expect(res.headers.get("www-authenticate") ?? "").toContain("/.well-known/oauth-protected-resource/mcp");
+      // A vault is configured but its module isn't answering: still the plain 404 that says so (T-476 keeps it).
+      expect(res.status).toBe(404);
       const body = await res.text();
       expect(body).not.toContain("PARACHUTE-APP-SHELL");
+    } finally {
+      db.close();
+      h.cleanup();
+    }
+  });
+
+  test("a hub with no vault yet answers a credential-less /mcp with the account door's challenge (T-476)", async () => {
+    const h = makeHarness();
+    writeManifest({ services: [] }, h.manifestPath);
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "owner", "pw");
+      const res = await hubFetch(h.dir, { getDb: () => db, manifestPath: h.manifestPath })(
+        req("/mcp", { method: "POST", headers: { "content-type": "application/json", accept: "application/json, text/event-stream" }, body: "{}" }),
+      );
+      expect(res.status).toBe(401);
+      expect(res.headers.get("www-authenticate") ?? "").toContain("/.well-known/oauth-protected-resource/mcp");
     } finally {
       db.close();
       h.cleanup();

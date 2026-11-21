@@ -4701,8 +4701,9 @@ export function hubFetch(
         const proxied = await throughKeyDoor(req, getDb, () => proxyToVaultDaemon(req, manifestPath, deps?.supervisor, peerAddr));
         if (proxied) return proxied;
         // T-476: a hub with no vault yet still answers the one address. An app with no credential gets the account
-        // door's challenge (its first act may be create-vault), not a 404 it can't sign in from.
-        if (getDb && !req.headers.has("authorization") && !req.headers.has("x-api-key")) {
+        // door's challenge (its first act may be create-vault), not a 404 it can't sign in from. A hub whose vaults
+        // exist but whose vault module is down still says so.
+        if (getDb && !hasVaultInstalled(manifestPath) && !req.headers.has("authorization") && !req.headers.has("x-api-key")) {
           return handleAccountMcp(req, {
             db: getDb(),
             issuer: oauthDeps(req).issuer,

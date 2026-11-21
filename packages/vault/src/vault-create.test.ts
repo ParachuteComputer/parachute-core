@@ -222,11 +222,12 @@ describe("vault create — OAuth-first auth (vault#442)", () => {
   test("default create leads the human summary with the OAuth connect command", () => {
     const { exitCode, stdout } = runCli(["create", "connectme"], {
       PARACHUTE_HOME: home,
+      PARACHUTE_HUB_ORIGIN: "https://hub.example",
     });
     expect(exitCode).toBe(0);
     // T-476: the hub's one address leads; this vault's own address is the narrow choice under it.
-    expect(stdout).toMatch(/Connect your AI: claude mcp add --transport http parachute \S+\/mcp\n/);
-    expect(stdout).toMatch(/Just this vault: \S+\/vault\/connectme\/mcp/);
+    expect(stdout).toContain("Connect your AI: claude mcp add --transport http parachute https://hub.example/mcp\n");
+    expect(stdout).toContain("Just this vault: https://hub.example/vault/connectme/mcp");
     expect(stdout).toContain("no token needed");
     // Scope-narrow opt-in pointer, never admin.
     expect(stdout).toContain("parachute auth mint-token --scope vault:connectme:read");
@@ -444,7 +445,9 @@ describe("vault create (human mode)", () => {
     // a hub would have been reachable. The human output leads with the OAuth
     // connect command and never prints an "API token:" line.
     expect(stdout).toContain("No token minted");
-    expect(stdout).toContain("Connect your AI: claude mcp add --transport http parachute ");
+    // no hub origin known (loopback): only the vault's own address, as a hub serves the one address
+    expect(stdout).toContain("Connect your AI: claude mcp add --transport http parachute-human");
+    expect(stdout).not.toContain("Just this vault");
     expect(stdout).not.toContain("API token:");
     // The old admin auto-mint failure copy must NOT fire on a default create.
     expect(stdout).not.toContain("No token issued");

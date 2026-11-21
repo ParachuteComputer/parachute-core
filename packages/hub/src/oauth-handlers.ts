@@ -1741,6 +1741,7 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
         requestedScopes.some(isAccountVaultsConnectionScope)
           ? [...perVaultOffer(db, session.userId, userIsAdmin, assignedVaults, vaultNames)].map(([vault, max]) => ({ vault, max }))
           : undefined,
+        isRootMcpResource(parsed.resource, resolveBoundOrigins(deps)),
       ),
     ),
     200,
@@ -1936,6 +1937,8 @@ function perVaultGrantCovering(
   if (!grant) return null;
   const perVault = grant.scopes.filter((s) => parsePerVaultScope(s) !== null || isAllVaultsChoiceScope(s));
   if (perVault.length === 0 || grant.scopes.some(isAccountVaultsConnectionScope)) return null;
+  // T-476: All your vaults is the owner's choice; someone no longer the owner chooses again on the page
+  if (perVault.some(isAllVaultsChoiceScope) && !isHubAdmin(db, userId)) return null;
   const granted = new Set(grant.scopes);
   const rest = requestedScopes.filter((s) => !isAccountVaultsConnectionScope(s));
   if (!rest.every((s) => granted.has(s))) return null;
@@ -3960,13 +3963,14 @@ function consentProps(
   // which this pure props builder deliberately doesn't take.
   grantableExtras: readonly string[] = [],
   vaultLevels?: ReadonlyArray<{ vault: string; max: "read" | "write" }>,
+  /** The ask is for this hub's one address (`isRootMcpResource`). */
+  atOneAddress = false,
 ) {
   // T-476: the hub's owner reaches every vault at write, so they may give an app all of them (and new ones). The
   // page starts there for the one address (`<hub>/mcp`); any other account-door ask (the app listing its person's
   // vaults, `/account/mcp`) starts on "Only these vaults", each at read, as 0.9.1 did.
   const vaultReachAll = vaultLevels !== undefined && userIsAdmin;
-  let vaultReachStartsAll = false;
-  try { vaultReachStartsAll = vaultReachAll && params.resource !== null && /^\/mcp\/?$/.test(new URL(params.resource).pathname); } catch { /* none */ }
+  const vaultReachStartsAll = vaultReachAll && atOneAddress;
   const requestedScopes = params.scope.split(" ").filter((s) => s.length > 0);
   const unnamedVerbs = unnamedVaultVerbs(requestedScopes);
   // Zero-vault non-admin can't authorize a vault-scoped request (hub#431).

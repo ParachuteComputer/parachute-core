@@ -1205,10 +1205,16 @@ async function cmdCreate(args: string[]) {
   }
   console.log();
   // T-476: one address for an AI, the hub's /mcp (every vault the person gives it); this vault's own is the narrow one.
-  const hubMcp = endpoint.replace(/\/vault\/[^/]+\/mcp$/, "/mcp");
-  console.log(`Connect your AI: claude mcp add --transport http parachute ${hubMcp}`);
-  console.log(`  (no token needed — you'll sign in on first use and choose its vaults)`);
-  console.log(`  Just this vault: ${endpoint}`);
+  // Only a hub serves the one address: with no hub origin known (loopback), the vault's own address stays.
+  const origin = chooseHubOrigin(globalConfig.port || DEFAULT_PORT);
+  if (origin.source === "loopback") {
+    console.log(`Connect your AI: claude mcp add --transport http parachute-${name} ${endpoint}`);
+    console.log(`  (no token needed — you'll sign in on first use)`);
+  } else {
+    console.log(`Connect your AI: claude mcp add --transport http parachute ${origin.url}/mcp`);
+    console.log(`  (no token needed — you'll sign in on first use and choose its vaults)`);
+    console.log(`  Just this vault: ${endpoint}`);
+  }
   console.log(`Need a header-auth token for a script? parachute auth mint-token --scope vault:${name}:read`);
 }
 

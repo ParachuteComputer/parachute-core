@@ -81,7 +81,7 @@ describe("All your vaults (T-476)", () => {
       const html = await (page(db, me.sid, cid, p.challenge, "account:vaults", `${ISSUER}/mcp`)).text();
       expect(html).toMatch(/name="vault_reach" value="all" checked/);
       // any other account-door ask (the app listing its person's vaults, /account/mcp) starts on "Only these"
-      for (const resource of [undefined, `${ISSUER}/account/mcp`]) {
+      for (const resource of [undefined, `${ISSUER}/account/mcp`, "https://elsewhere.example/mcp"]) {
         const other = await (page(db, me.sid, cid, pkce().challenge, "account:vaults", resource)).text();
         expect(other, String(resource)).toMatch(/name="vault_reach" value="chosen" checked/);
         expect(other, String(resource)).not.toMatch(/name="vault_reach" value="all" checked/);
@@ -169,6 +169,18 @@ describe("All your vaults (T-476)", () => {
         [["account_vault_levels", "1"], ["vault_level:work", "write"], ["extra_scope", "account:self:vault-create"], ["extra_scope", "account:self:vaults:*:write"]],
         "account:vaults account:self:vault-create account:self:vaults:*:write"), cid, p.verifier);
       for (const s of ALL) expect(t.scope.split(" ")).not.toContain(s);
+    } finally { cleanup(); }
+  });
+
+  test("an All grant isn't replayed for someone who isn't the owner: they get the page again", async () => {
+    const { db, cleanup } = hub();
+    try {
+      const friend = await person(db, false);
+      const cid = app(db);
+      recordGrant(db, friend.id, cid, ALL);
+      const res = page(db, friend.sid, cid, pkce().challenge);
+      expect(res.status).toBe(200);
+      expect(await res.text()).toContain('name="vault_level:work"');
     } finally { cleanup(); }
   });
 

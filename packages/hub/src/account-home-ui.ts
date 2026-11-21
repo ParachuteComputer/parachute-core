@@ -368,7 +368,7 @@ function renderOnboardingChecklist(opts: OnboardingChecklistOpts): string {
                         data-testid="copy-onboarding-hub-add-command">Copy</button>
               </div>
             </div>
-            <p class="onboarding-house-label" data-testid="onboarding-house-label">Just one vault</p>
+            <p class="onboarding-house-label" data-testid="onboarding-one-vault-label">Just one vault</p>
             <p class="onboarding-step-sub">To give an AI only <code>${safeVault}</code>, use its own address:</p>
             <div class="copy-row">
               <code data-testid="onboarding-mcp-endpoint">${safeVaultEndpoint}</code>
