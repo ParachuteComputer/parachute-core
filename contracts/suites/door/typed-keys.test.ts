@@ -348,4 +348,22 @@ describe.skipIf(without)("who reaches the vault, and ending it", () => {
     // Signed statements are a later slice: filing one is still refused as before.
     expect((await account("POST", `/account/vaults/${enc(door().vault)}/statements`, { event: {} })).status).toBe(405);
   });
+
+  test("a key made for an AI says so: kind agent in the list and in its writes; an app key stays an app", async () => {
+    // One list (T-476): the app lists your AIs and agents first, then people, then apps, by the hub's `kind`.
+    const ai = `door-ai-${runId("k")}`;
+    const made = await account("POST", "/account/keys", { name: ai, vault: door().vault, can: "write", kind: "agent" });
+    expect(made.status, made.text.slice(0, 200)).toBe(201);
+    expect(made.body.kind).toBe("agent");
+    const app = `door-app-${runId("k")}`;
+    expect((await account("POST", "/account/keys", { name: app, vault: door().vault, can: "read" })).body.kind ?? "app").toBe("app");
+    const rows = (await list()).body.grants as { id: string; kind: string }[];
+    expect(rows.find((r) => r.id === ai)?.kind).toBe("agent");
+    expect(rows.find((r) => r.id === app)?.kind).toBe("app");
+    // its token's write stamp names its kind, so a vault's history can say an AI wrote it
+    const claim = JSON.parse(Buffer.from(String(made.body.token).split(".")[1]!, "base64url").toString());
+    expect(claim.key).toEqual({ name: ai, kind: "agent" });
+    // anything else is refused, never read as an app
+    expect((await account("POST", "/account/keys", { name: `door-x-${runId("k")}`, vault: door().vault, can: "read", kind: "person" })).status).toBe(400);
+  });
 });
