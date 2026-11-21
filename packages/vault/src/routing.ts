@@ -73,7 +73,7 @@ import {
   extractApiKey,
   type AuthResult,
 } from "./auth.ts";
-import { hasScopeForVault, hasMigrateScopeForVault, hasExportScopeForVault, SCOPE_ADMIN, SCOPE_READ, scopeForMethod, verbForMethod } from "./scopes.ts";
+import { hasScopeForVault, hasMigrateScopeForVault, hasExportScopeForVault, SCOPE_ADMIN, SCOPE_READ, SCOPE_WRITE, scopeForMethod, verbForMethod } from "./scopes.ts";
 import { getSharedEmbeddingProvider, getVaultStore } from "./vault-store.ts";
 import { resolveEmbeddingCapability } from "./embedding/capability.ts";
 import { handleScopedMcp } from "./mcp-http.ts";
@@ -1292,7 +1292,8 @@ export async function route(
       (apiSubpath === "/tags/merge" || /^\/tags\/[^/]+\/(rename|migrate)$/.test(apiSubpath)));
   // Erasing note history is irreversible and requires admin (vault#524). So does a delete that erases it
   // (`?erase_history=`, T-412): any value but an absent or explicit false is gated here, and the handler refuses a
-  // value it can't read. Listing deleted notes with history left is the same admin's job.
+  // value it can't read. Listing deleted notes with history left takes write (T-476): write may already delete a note
+  // and restore it by id, so it may list what it can put back. A read pass can't put anything back, so it can't list.
   const eraseParam = req.method === "DELETE" && /^\/notes\/[^/]+$/.test(apiSubpath)
     ? new URL(req.url).searchParams.get("erase_history")
     : null;
@@ -1306,13 +1307,13 @@ export async function route(
   // write pass's 403 there.
   const typeWriteOnly = !!recordsDoor && req.method === "PUT" && /^\/tags\/[^/]+$/.test(apiSubpath) &&
     !hasScopeForVault(auth.scopes, vaultName, "admin") && hasScopeForVault(auth.scopes, vaultName, "write");
-  const requiredVerb = isReadOnlyPost ? "read" : typeWriteOnly ? "write" : (isTagSchemaMutation || isNoteHistoryErase || isHistoryCompact || isDeletedList) ? "admin" : verbForMethod(req.method);
+  const requiredVerb = isReadOnlyPost ? "read" : typeWriteOnly ? "write" : (isTagSchemaMutation || isNoteHistoryErase || isHistoryCompact) ? "admin" : isDeletedList ? "write" : verbForMethod(req.method);
   if (!hasScopeForVault(auth.scopes, vaultName, requiredVerb)) {
     const requiredApiScope = isReadOnlyPost
       ? SCOPE_READ
-      : (isTagSchemaMutation || isNoteHistoryErase || isHistoryCompact || isDeletedList)
+      : (isTagSchemaMutation || isNoteHistoryErase || isHistoryCompact)
         ? SCOPE_ADMIN
-        : scopeForMethod(req.method);
+        : isDeletedList ? SCOPE_WRITE : scopeForMethod(req.method);
     return Response.json(
       {
         error: "Forbidden",
