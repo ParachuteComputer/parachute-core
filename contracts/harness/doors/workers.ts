@@ -116,7 +116,8 @@ export async function startWorkersDoor(opts: {
     const identityText = readFileSync(rendered[0]!, "utf8");
     // A profile that gives out its own origin for vaults (one address: the identity worker hands /vault/* to the vault
     // worker, parachute-cloud T-476) says so here too, on this run's own issuer rather than the rendered workers.dev name.
-    if (/^VAULT_PUBLIC_ORIGIN\s*=/m.test(identityText)) oneAddress = true;
+    const tomlVar = (k: string) => new RegExp(`^${k}\\s*=\\s*"([^"]*)"`, "m").exec(identityText)?.[1];
+    if (tomlVar("VAULT_PUBLIC_ORIGIN") !== undefined && tomlVar("VAULT_PUBLIC_ORIGIN") === tomlVar("ISSUER")) oneAddress = true;
     writeFileSync(join(identityDir, GEN), withoutAi(identityText));
     writeFileSync(join(vaultDir, GEN), withoutAi(readFileSync(rendered[1]!, "utf8")));
     for (const f of rendered) rmSync(f, { force: true });
