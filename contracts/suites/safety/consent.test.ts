@@ -454,3 +454,82 @@ describe("a parallel burst of wrong passwords locks the account out at the limit
     expect({ status: viaLogin.status, session: viaLogin.session ?? null }).toEqual({ status: 429, session: null });
   });
 });
+
+// ── 5. what the person unticks is not granted (T-476) ───────────────────────────────────────────────────────
+//
+// The per-scope boxes sat outside the consent <form>, so a browser posted none of them and the box granted every
+// scope the app asked for: a developer unticked vault admin for Claude and the token still held it. Here the form is
+// posted as a browser posts it: its hidden inputs, and its ticked boxes minus the ones the person unticks.
+
+describe("a box the person unticks on the consent page is not granted", () => {
+  let session: string;
+  const redirect = "https://untick-agent.example/oauth/callback";
+  const WRITE = `vault:${s.vaultName}:write`;
+
+  /** The consent form's fields as a browser posts them, with these scope boxes unticked. */
+  function browserFields(html: string, untick: string[]): [string, string][] {
+    const at = html.indexOf('class="auth-form consent-form"');
+    if (at < 0) throw new Error("setup: no consent form on the page");
+    const form = html.slice(at, html.indexOf("</form>", at));
+    const attr = (tag: string, name: string) => new RegExp(`\\s${name}="([^"]*)"`).exec(tag)?.[1];
+    const out: [string, string][] = [];
+    for (const [tag] of form.matchAll(/<input\b[^>]*>/g)) {
+      const name = attr(tag, "name");
+      if (!name) continue;
+      const type = attr(tag, "type") ?? "text";
+      const value = (attr(tag, "value") ?? "on").replace(/&amp;/g, "&");
+      if (type === "hidden") out.push([name, value]);
+      else if ((type === "checkbox" || type === "radio") && /\schecked\b/.test(tag)) {
+        if (name === "granted_scope" && value.split(" ").some((v) => untick.includes(v))) continue;
+        out.push([name, value]);
+      }
+    }
+    return out;
+  }
+
+  /** Approve with these boxes unticked; the token's scope, or the error the app is sent back with. */
+  async function approve(scope: string, untick: string[]): Promise<{ scope: string } | { error: string }> {
+    // a new app each time: an app the person already approved reconnects without the page
+    const id = await registered(`Untick Agent ${randomBytes(3).toString("hex")}`, redirect);
+    const verifier = randomBytes(32).toString("base64url");
+    const params = { client_id: id, redirect_uri: redirect, response_type: "code", scope, code_challenge: createHash("sha256").update(verifier).digest("base64url"), code_challenge_method: "S256", state: randomBytes(8).toString("hex") };
+    const page = await authorize(session, params);
+    if (page.status !== 200 || !page.html.includes('value="consent"')) throw new Error(`setup: expected the consent page, got ${page.status}`);
+    const body = new URLSearchParams(browserFields(page.html, untick));
+    body.set("approve", "yes");
+    const r = await safeFetch(`${s.hub}/oauth/authorize`, {
+      method: "POST",
+      redirect: "manual",
+      headers: { "content-type": "application/x-www-form-urlencoded", cookie: `parachute_hub_session=${session}; parachute_hub_csrf=${page.csrf}`, origin: HUB },
+      body,
+    });
+    await r.arrayBuffer();
+    expect(r.status).toBe(302);
+    const back = new URL(r.headers.get("location")!);
+    if (back.searchParams.get("error")) return { error: back.searchParams.get("error")! };
+    const t = await safeFetch(`${s.hub}/oauth/token`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ grant_type: "authorization_code", code: back.searchParams.get("code")!, client_id: id, redirect_uri: redirect, code_verifier: verifier }),
+    });
+    const json: any = await t.json();
+    if (t.status !== 200) throw new Error(`the token request gave ${t.status}: ${JSON.stringify(json).slice(0, 200)}`);
+    return { scope: String(json.scope).split(" ").sort().join(" ") };
+  }
+
+  test("setup: a made-up user signs in", async () => {
+    session = await signIn(await newUser("consent-untick"));
+  });
+
+  test("left as drawn: what was asked", async () => {
+    expect(await approve(`${READ} ${WRITE}`, [])).toEqual({ scope: [READ, WRITE].sort().join(" ") });
+  });
+
+  test("write unticked: the token reads only", async () => {
+    expect(await approve(`${READ} ${WRITE}`, [WRITE])).toEqual({ scope: READ });
+  });
+
+  test("everything unticked: a denial, never everything", async () => {
+    expect(await approve(`${READ} ${WRITE}`, [READ, WRITE])).toEqual({ error: "access_denied" });
+  });
+});
