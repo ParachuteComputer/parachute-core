@@ -1018,10 +1018,14 @@ export class BunSqliteStore implements Store {
         actor: opts.actor ?? null, via: opts.via ?? null,
       });
       appendRestoreMarker(this.db, id, tomb, { actor: opts.actor ?? null, via: opts.via ?? null }, this.historyPolicy);
+      // Put back now is a change made now (T-476): createNote set updated_at to the old created_at, so a reader asking
+      // what changed since (a sync, a "what changed" view) never saw the note come back.
+      const now = new Date().toISOString();
+      this.db.prepare("UPDATE notes SET updated_at = ?, updated_at_ms = ? WHERE id = ?").run(now, timestampToMs(now) ?? Date.now(), id);
       if (note.content) syncWikilinks(this.db, id, note.content);
       if (note.path) resolveUnresolvedWikilinks(this.db, note.path, id);
       refreshCompactState(this.db, id);
-      return note;
+      return { ...note, updatedAt: now };
     });
   }
 
