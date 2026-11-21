@@ -28,6 +28,8 @@ import { revokeTokenByJti, signAccessToken, validateAccessToken } from "./jwt-si
 import { listKeys, type KeyView } from "./keys.ts";
 
 export const GRANT_VERBS_READ = ["read"] as const;
+/** Permission keys that say who a write is for or which key signed, and narrow nothing a credential reaches. */
+const NOT_NARROWING = new Set(["acts_for", "principal_pubkey"]);
 export const GRANT_VERBS_WRITE = ["read", "create", "update", "delete"] as const;
 
 export interface VaultGrantsDeps {
@@ -74,8 +76,10 @@ export async function ownerOrVaultAdmin(req: Request, db: Database, vault: strin
     audience: typeof payload.aud === "string" ? payload.aud : undefined,
   };
   if (scopes.includes(HOST_ADMIN_SCOPE)) return { ctx, owner: true };
+  // whole-vault only: any permission but the two that narrow nothing (who a write is for, which key signed) counts as a
+  // narrowing, a key this hub doesn't know included (fail closed: a credential can't make a key wider than itself)
   const perms = payload.permissions;
-  const narrowed = perms && typeof perms === "object" && Object.keys(perms as object).some((k) => k === "scoped_tags" || k === "grant");
+  const narrowed = perms !== undefined && perms !== null && (typeof perms !== "object" || Array.isArray(perms) || Object.keys(perms as object).some((k) => !NOT_NARROWING.has(k)));
   if (vault !== null && scopes.includes(`vault:${vault}:admin`) && !narrowed) return { ctx, owner: false };
   return err(403, "insufficient_scope", vault === null ? "this is the owner's: it needs the hub's own account token" : `this needs the owner's account token, or vault:${vault}:admin on the whole vault`);
 }

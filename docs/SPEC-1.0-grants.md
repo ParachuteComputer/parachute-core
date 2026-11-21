@@ -944,7 +944,7 @@ behaviour works. They run on any door: `bun run doors -- --doors box,personal su
 
 | File | The behaviour it holds | Spec |
 |---|---|---|
-| `grant.test.ts` | an owner-signed grant opens exactly the types it names to the key it names; a grant that isn't the owner's, is tampered with, names another vault, has no date, carries an unknown field or tag, has tags that disagree with its content, or isn't in its one spelling is refused, and so is a revoke for another vault; a write key can't file one; every credential shows as a grant row; the vault's own key can't be a grantee and an owner's override names the key that signs for it | §2, §4.4, §7 |
+| `grant.test.ts` | an owner-signed grant opens exactly the types it names to the key it names; a grant that isn't the owner's, is tampered with, names another vault, has no date, carries an unknown field or tag, has tags that disagree with its content, or isn't in its one spelling is refused, and so is a revoke for another vault; a write key can't file one; the vault's own key can't be a grantee and an owner's override names the key that signs for it | §2, §4.4, §7 |
 | `verbs.test.ts` | each verb alone; create without read is a form; `:own`; a denied tag; adding and removing a type | §4 |
 | `ending.test.ts` | a grant stops at its date; a signed revoke stops it on the next request and is final; a stranger's revoke does nothing; a newer grant the vault can't take suspends the address | §2.2, §3 |
 | `people.test.ts` | a member writes as themselves; an agent writes for its person; a member's agent never passes the member and ends with them | §5.1, §5.2 |
@@ -952,9 +952,10 @@ behaviour works. They run on any door: `bun run doors -- --doors box,personal su
 | `custodial.test.ts` | a `names` grant stamps its prefix; the header without it is refused; a link shows as the person's only after their own key confirms | §6 |
 | `leaks.test.ts` | a narrow grant learns nothing of a hidden type by search, links, counts, type lists, history or a file ticket | §4.1 |
 | `move.test.ts` | the export holds every statement word for word, the vault's id, and no credential | §9 |
+| `../door/typed-keys.test.ts` (built, the first slice) | a door grant for a key held to types: it reaches only those types at REST and MCP (id, path, search, links, counts, history, writes); every credential is a row in the list, an OAuth app by the name it registered; ending one fails its next REST and MCP request, closes its live socket and spends no file ticket it was given; a vault's admin manages its own vault and no other | §4.1, §7.1, §7.3 |
 
-Not held by a contract yet, and why: the live socket (needs a socket client in the door harness); MCP under a
-grant (the tools a grant's verbs leave, and the instructions; the REST contracts hold the same checkpoint); the `carried`
+Not held by a contract yet, and why: the live socket and MCP under a *signed* grant (for a door grant both are held in
+`suites/door/typed-keys.test.ts`, which carries a small socket client); the `carried`
 state after an import (open decision C); door grants for email-only owners (open decision B); the box's roles
 becoming door grants, the rollback, and revokes surviving a restore (migrations and restores, tested in
 `lifecycle/` when built); the export on a box (its export is a command, not HTTP, so `move.test.ts` runs on the

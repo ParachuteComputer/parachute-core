@@ -83,8 +83,13 @@ export function checkDoorGrant(id: string, input: unknown, now: Date = new Date(
   return { grant: { grantee: body.grantee, types: types as Record<string, string[]>, expires_at: new Date(until).toISOString() } };
 }
 
+// a vault's grants table, once seen, stays (it is never dropped): asked of the catalog until then, not on every request
+const hasTable = new WeakSet<Database>();
 function hasGrantsTable(db: Database): boolean {
-  return !!db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'grants'").get();
+  if (hasTable.has(db)) return true;
+  const yes = !!db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'grants'").get();
+  if (yes) hasTable.add(db);
+  return yes;
 }
 
 function ensureGrantsTable(db: Database): void {
