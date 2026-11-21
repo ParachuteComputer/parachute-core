@@ -338,6 +338,24 @@
       "status": "drift",
       "owner": "parachute-cloud 0.9.1 multi-vault door (T-446)",
       "why": "On a box one key can cover several vaults, each at its own level (`POST /account/keys {name, vaults: {<vault>: \"read\"|\"write\"}}`), and the account door (`/account/mcp`) serves the record tools plus `list-vaults` with it: `vault` named on every write, each vault reached at that key's level there. A cloud-style door's account door doesn't take such a key yet; an app that needs several vaults there holds one key per vault. The same entry gates the account door's tool hints check (annotations.test.ts): it reaches `/account/mcp` with the account credential, which a cloud-style account door refuses (it takes an OAuth connection with `account:<id>:vaults`); parachute-cloud holds its own account door's hints (workers/identity/test/account-door-hints.test.ts, account-mcp.test.ts)."
+    },
+    {
+      "id": "share-a-vault",
+      "keys": [
+        "has/share-a-vault"
+      ],
+      "between": [
+        "box",
+        "cloud",
+        "personal"
+      ],
+      "lacks": [
+        "cloud",
+        "personal"
+      ],
+      "status": "drift",
+      "owner": "T-476 sharing (cloud twin needs key sign-in at identity, SPEC-1.0-grants §8)",
+      "why": "A box lets the owner's key invite someone to one vault by name (account door `invite-to-vault`, `take-back-invite`; `list-access` names people), and the friend read the invite (`POST /account/invites/look`) and accept it with their own key (`POST /account/invites/accept`, NIP-98), becoming a member of that vault. Cloud and the personal door have no key sign-in for a second person yet, so they have neither (app docs/design/SHARING.md)."
     }
   ]
 }
