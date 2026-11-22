@@ -47,9 +47,10 @@ back a key held to types stops working; it never reaches more.
 
 **For door builders.**
 - The door harness runs a one-address personal door as one address (#142).
-- Parachute Cloud and a personal door now behave as a box does here: write may define a type (#145), and a key for an
-  AI can be held to some types, with the one list of who reaches a vault and End (#148). The door contracts check both
-  on every door. One difference remains: a Cloud vault token also says the account's address was proven (#148).
+- Parachute Cloud and a personal door now behave as a box does here: write may define a type, and a key for an AI can
+  be held to some types, with the one list of who reaches a vault and End. The door contracts now expect this on every
+  door (#145, #148); the code is in parachute-cloud (#434–#441). One difference remains: a Cloud vault token also says
+  the account's address was proven (#148).
   On the way back, Cloud differs from a box: a Cloud worker from before its typed keys serves a key held to types as
   a whole-vault key until the key is ended, so end typed keys before rolling Cloud back.
 
