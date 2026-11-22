@@ -402,9 +402,9 @@ describe("the consent page says what the connection can read", () => {
 // Three first-run walkers met their own Parachute app (it returns to 127.0.0.1) as "External: a third-party app that
 // registered itself", with "what this app reads goes to the company that runs it"; one nearly pressed Deny. And on a
 // phone with no session the page said "App not yet approved … send this link to your hub admin" to the hub's owner,
-// though signing in is all it takes. Red before T-476. A Parachute-looking name registers only when every redirect is
+// though signing in is all it takes. Red before T-476. The name "Parachute" registers only when every redirect is
 // first-party, so the page may say so for that name; loopback alone may not (Claude Code returns to loopback too, and
-// what it reads goes to its maker), and neither is a name that merely holds the word: Claude Code registers as
+// what it reads goes to its maker), and neither may a name that merely holds the word: Claude Code registers as
 // "Claude Code (parachute)" when connected as the hub's commands say. Only the app's exact name counts.
 // Mutant "consent-parachute-by-loopback" calls every loopback app Parachute's; "consent-parachute-by-word" every
 // Parachute-looking name.

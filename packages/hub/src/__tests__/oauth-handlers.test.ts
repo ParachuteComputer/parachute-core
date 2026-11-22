@@ -544,8 +544,9 @@ describe("handleAuthorizeGet", () => {
 
   // T-476: Parachute's own app (the web build on 127.0.0.1, the phone and desktop app on 127.0.0.1:47219) was
   // "External: a third-party app that registered itself", and "what this app reads goes to the company that runs
-  // it". The marker and the vendor line follow `parachuteAppHome`: a Parachute-looking name AND every redirect
-  // first-party. Loopback alone is not enough (Claude Code returns to loopback, and its reads go to Anthropic).
+  // it". The marker and the vendor line follow `parachuteAppHome`: the app's exact name, "Parachute", AND every
+  // redirect first-party. Loopback alone is not enough (Claude Code returns to loopback, and its reads go to Anthropic),
+  // nor is a name holding the word ("Claude Code (parachute)").
   async function consentFor(clientName: string, redirects: string | string[], sameHub = false): Promise<string> {
     const redirectUris = [redirects].flat();
     const redirect = redirectUris[0]!;
