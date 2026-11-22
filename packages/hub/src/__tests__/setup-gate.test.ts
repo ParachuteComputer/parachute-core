@@ -96,6 +96,23 @@ describe("setup gate (no admin yet)", () => {
     }
   });
 
+  // T-476: the sign-in's next rides into the wizard (a safe same-origin path only), so the done page can return to it.
+  test("/login GET carries a same-origin next into /admin/setup; an offsite one is dropped (T-476)", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const next = "/oauth/authorize?client_id=abc&state=s";
+      const res = await hubFetch(h.dir, { getDb: () => db })(req(`/login?next=${encodeURIComponent(next)}`));
+      expect(res.status).toBe(302);
+      expect(res.headers.get("location")).toBe(`/admin/setup?next=${encodeURIComponent(next)}`);
+      for (const bad of ["https://evil.example/x", "//evil.example/x", "/\\evil.example/x"]) {
+        const r = await hubFetch(h.dir, { getDb: () => db })(req(`/login?next=${encodeURIComponent(bad)}`));
+        expect(r.headers.get("location")).toBe("/admin/setup");
+      }
+    } finally {
+      db.close();
+    }
+  });
+
   // A POST to `/login` pre-admin has no account to authenticate, so it falls
   // through to the JSON-503 gate — the right shape for a stray non-browser
   // caller. Only the browser GET is funneled to the wizard.
