@@ -85,16 +85,16 @@ async function csrfPair(): Promise<{ token: string; cookie: string }> {
   return { token, cookie: c };
 }
 
-/** POST /login once; returns the status and the session cookie, if one was set. */
-async function login(username: string, password: string, csrf: { token: string; cookie: string }) {
+/** POST /login once; returns the status, where it sends the browser, and the session cookie, if one was set. */
+async function login(username: string, password: string, csrf: { token: string; cookie: string }, next?: string) {
   const r = await safeFetch(`${s.hub}/login`, {
     method: "POST",
     redirect: "manual",
     headers: { "content-type": "application/x-www-form-urlencoded", cookie: `parachute_hub_csrf=${csrf.cookie}` },
-    body: new URLSearchParams({ __csrf: csrf.token, username, password }),
+    body: new URLSearchParams({ __csrf: csrf.token, username, password, ...(next !== undefined ? { next } : {}) }),
   });
   await r.arrayBuffer();
-  return { status: r.status, session: cookie(r, "parachute_hub_session") };
+  return { status: r.status, location: r.headers.get("location"), session: cookie(r, "parachute_hub_session") };
 }
 
 /** Sign a made-up user in and change their temporary password, as they would on first sign-in. */
@@ -455,6 +455,55 @@ describe("Parachute's own app is named on the consent page; other apps stay Exte
     expect(text.indexOf("Sign in to your hub to continue")).toBeLessThan(text.indexOf("Not this hub's owner?"));
     // The button still goes through sign-in and back to this same authorize request.
     expect(html).toMatch(/href="\/login\?next=%2Foauth%2Fauthorize%3F[^"]*"[^>]*>\s*Sign in\s*</);
+  });
+});
+
+// ── 3d. a sign-in's next never leaves the hub (T-476, security) ──────────────────────────────────────────────
+// `/login` and `/account/change-password` send the browser to the `next` they were given when it is "a path". The
+// check was `startsWith("/") && !startsWith("//")`, so `/\evil.example` passed, and a browser reads `\` as `/` in an
+// http(s) URL: `//evil.example`, another origin. A tab or newline is stripped from URLs the same way (`/<tab>/evil`).
+// Red before the fix. Each value signs in a fresh made-up user (a temporary password: the sign-in goes through
+// change-password, the second door that honours `next`), and both doors must keep the browser on the hub.
+// Mutant "next-backslash" puts the old check back.
+
+describe("a sign-in's next never sends the browser off the hub", () => {
+  const where = (location: string | null) => (location === null ? null : new URL(location, s.hub).origin);
+  for (const [label, next] of [
+    ["a backslash", "/\\evil.example/landing"],
+    ["an encoded backslash", "/%5Cevil.example/landing"],
+    ["a scheme-relative path", "//evil.example/landing"],
+    ["a tab", "/\t/evil.example/landing"],
+    ["a carriage return", "/\r/evil.example/landing"],
+  ] as const) {
+    test(`next with ${label}`, async () => {
+      const user = await newUser("consent-next");
+      const csrf = await csrfPair();
+      const r = await login(user, TEMP, csrf, next);
+      expect(r.status).toBe(302);
+      expect(where(r.location)).toBe(HUB);
+      // The temporary password sends the person to change it, carrying next; that door must hold too.
+      const change = await safeFetch(`${s.hub}/account/change-password`, {
+        method: "POST",
+        redirect: "manual",
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          cookie: `parachute_hub_session=${r.session}; parachute_hub_csrf=${csrf.cookie}`,
+          origin: HUB,
+        },
+        body: new URLSearchParams({ __csrf: csrf.token, current_password: TEMP, new_password: PASSWORD, new_password_confirm: PASSWORD, next }),
+      });
+      await change.arrayBuffer();
+      expect(change.status).toBe(302);
+      expect(where(change.headers.get("location"))).toBe(HUB);
+    });
+  }
+
+  test("control: a plain path on the hub is still honoured", async () => {
+    const user = await newUser("consent-next-ok");
+    const csrf = await csrfPair();
+    const r = await login(user, TEMP, csrf, "/account/");
+    expect(r.status).toBe(302);
+    expect(r.location).toContain("next=%2Faccount%2F");
   });
 });
 

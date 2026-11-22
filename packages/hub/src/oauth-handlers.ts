@@ -21,6 +21,7 @@
  * handlers stay focused on protocol logic and the templates stay focused
  * on presentation.
  */
+import { isSameOriginPath } from "./same-origin-path.ts";
 import type { Database } from "bun:sqlite";
 import {
   ACCOUNT_VAULTS_UNNARROWED,
@@ -2917,14 +2918,13 @@ export async function handleApproveClientPost(
  * builds on, and that broader same-origin gates (the agent-grant OAuth
  * callback's `returnTo`) reuse directly — they need to return the operator to
  * a `/admin/...` page, not specifically `/oauth/authorize`. Single source of
- * truth for "is this an open redirect?" — do NOT reimplement the
- * `startsWith("/") && !startsWith("//")` check elsewhere.
+ * truth for "is this an open redirect?" on return-to: its same-origin core is
+ * `isSameOriginPath` (same-origin-path.ts), which sign-in's `next` shares.
  */
 export function isSafeHubReturnTo(value: string): boolean {
-  if (!value) return false;
-  // Reject scheme-relative ("//evil.example/foo") and absolute URLs. Only
-  // single-slash root-relative paths are allowed.
-  if (!value.startsWith("/") || value.startsWith("//")) return false;
+  // A path on this hub only (`isSameOriginPath`): no scheme, no `//`, no backslash (`/\host` is `//host` to a
+  // browser), no control characters.
+  if (!isSameOriginPath(value)) return false;
   // Reject `..` traversal sequences — literal AND percent-encoded (`%2e%2e`),
   // since redirectToReturn's `new URL()` parse decodes them before emitting the
   // path. They stay same-origin but a target that walks the path tree is never a

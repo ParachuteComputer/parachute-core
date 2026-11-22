@@ -51,7 +51,7 @@ import { type ChangePasswordMode, renderChangePassword } from "./account-change-
 import { renderAccountHome } from "./account-home-ui.ts";
 import { fetchVaultMirrorStatus, formatMirrorLine, isMirrorHealthy } from "./account-mirror.ts";
 import { fetchVaultUsage, formatUsageStat } from "./account-usage.ts";
-import { POST_LOGIN_DEFAULT } from "./admin-handlers.ts";
+import { POST_LOGIN_DEFAULT, safeNext } from "./admin-handlers.ts";
 import { renderAdminError } from "./admin-login-ui.ts";
 import { CSRF_FIELD_NAME, ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
 import { userHasExternalAiGrant } from "./grants.ts";
@@ -82,17 +82,6 @@ export interface ApiAccountDeps {
  * password share a single source of truth (reviewer fold on hub#425).
  */
 const POST_CHANGE_DEFAULT = POST_LOGIN_DEFAULT;
-
-function safeNext(raw: string | null | undefined): string {
-  if (!raw) return POST_CHANGE_DEFAULT;
-  // Only allow same-origin paths — never honor an absolute URL or scheme.
-  // Same shape as `safeNext` in admin-handlers.ts. The
-  // change-password GET should never redirect *back* to /login for a
-  // signed-in user, but if a malicious form somehow shipped an
-  // absolute URL we'd want it ignored here too.
-  if (!raw.startsWith("/") || raw.startsWith("//")) return POST_CHANGE_DEFAULT;
-  return raw;
-}
 
 function htmlResponse(body: string, status = 200, extra: Record<string, string> = {}): Response {
   return new Response(body, {
