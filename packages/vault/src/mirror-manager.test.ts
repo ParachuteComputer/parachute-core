@@ -609,6 +609,44 @@ describe("MirrorManager.runNow", () => {
     await mgr.stop();
   });
 
+  test("a lock left by a killed git: a live one shows in status, a stale one is cleared and the mirror catches up", async () => {
+    // T-335 (11-21): the out-of-memory killer took the service mid-`git add`; its index.lock stayed, ~8,500 commits
+    // failed over a day, and status said nothing because the export itself had succeeded.
+    home = tmp("mgr-runnow-lock-");
+    fs.mkdirSync(path.join(home, "vault", "data", "default"), { recursive: true });
+    let n = 0;
+    const deps = makeFakeDeps({
+      parachuteHome: home,
+      initialConfig: { ...defaultMirrorConfig(), enabled: true, location: "internal", sync_mode: "manual", auto_commit: true },
+      runExport: async ({ outDir }) => {
+        fs.writeFileSync(path.join(outDir, `note-${++n}.md`), `# ${n}\n`);
+        return { notes: 1 };
+      },
+    });
+    const mgr = new MirrorManager(deps);
+    const started = await mgr.start();
+    const mirror = started.mirror_path!;
+    const lock = path.join(mirror, ".git", "index.lock");
+    const before = mgr.getStatus().last_commit_sha;
+
+    fs.writeFileSync(lock, "");                                   // a git that is still running, as far as we know
+    await mgr.runNow();
+    expect(fs.existsSync(lock)).toBe(true);
+    expect(mgr.getStatus().last_error).toContain("commit failed: git add failed");
+    expect(mgr.getStatus().last_error).toContain("index.lock");
+    expect(mgr.getStatus().last_commit_sha).toBe(before);
+
+    const old = (Date.now() - 10 * 60_000) / 1000;                // the same lock, ten minutes on: left behind
+    fs.utimesSync(lock, old, old);
+    await mgr.runNow();
+    expect(fs.existsSync(lock)).toBe(false);
+    expect(mgr.getStatus().last_error).toBeNull();
+    expect(mgr.getStatus().last_commit_sha).not.toBe(before);
+    const tracked = Bun.spawnSync(["git", "ls-files"], { cwd: mirror }).stdout.toString();
+    expect(tracked).toContain(`note-${n - 1}.md`);               // what waited behind the lock went in too
+    await mgr.stop();
+  });
+
   test("noop when disabled", async () => {
     home = tmp("mgr-runnow-disabled-");
     fs.mkdirSync(path.join(home, "vault", "data", "default"), { recursive: true });

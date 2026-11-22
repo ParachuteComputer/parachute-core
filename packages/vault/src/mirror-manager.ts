@@ -1127,6 +1127,12 @@ export class MirrorManager {
       return;
     }
 
+    if (commitResult.error) {
+      // A failed `git add` / `git commit` (a lock, a full disk) is the mirror falling behind: say it in status, where
+      // the export's success had just cleared last_error, not only in the log.
+      this.status.last_error = `commit failed: ${commitResult.error}`;
+    }
+
     if (commitResult.committed) {
       // Resolve the new HEAD sha so the status displays the commit that
       // just landed. Best-effort; if the rev-parse fails (it shouldn't

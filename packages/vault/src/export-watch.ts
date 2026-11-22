@@ -13,6 +13,8 @@
  * detection. See `docs/contracts/vault-portable-export.md`.
  */
 
+import fs from "node:fs";
+import path from "node:path";
 import { ensureGitAvailable } from "./git-preflight.ts";
 import { isOffline } from "./offline.ts";
 
@@ -107,6 +109,52 @@ export async function gitAddAll(repoDir: string): Promise<{ ok: boolean; stderr:
   const exitCode = await proc.exited;
   const stderr = new TextDecoder().decode(await new Response(proc.stderr).arrayBuffer());
   return { ok: exitCode === 0, stderr: stderr.trim() };
+}
+
+/**
+ * How old an empty `index.lock` must be before the mirror treats it as left behind. A `git add -A` of a large vault
+ * holds the lock for seconds; the mirror runs one cycle at a time, so a lock this old is no live git of ours.
+ */
+export const STALE_INDEX_LOCK_MS = 5 * 60_000;
+
+/**
+ * Remove `index.lock` when a killed git left it: the file is empty, older than `maxAgeMs`, and a regular file.
+ *
+ * A process killed mid-`git add` (the out-of-memory killer takes the whole service, git child included) leaves the
+ * lock, and every later `git add` fails with "index.lock: File exists" until someone removes it: a mirror stopped
+ * committing for a day that way, its failure logged on every write and said nowhere. Git's own message tells a person
+ * to remove the file when no git is running; this does the same for the one writer the mirror has. A lock with
+ * content, a fresh one, or a link is left alone. Returns the removed lock's mtime (ISO) or null.
+ */
+export async function clearStaleIndexLock(
+  repoDir: string,
+  maxAgeMs = STALE_INDEX_LOCK_MS,
+  now = Date.now(),
+): Promise<string | null> {
+  const proc = Bun.spawn(["git", "rev-parse", "--git-path", "index.lock"], {
+    cwd: repoDir,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  if ((await proc.exited) !== 0) return null;
+  const rel = new TextDecoder().decode(await new Response(proc.stdout).arrayBuffer()).trim();
+  if (!rel) return null;
+  const lock = path.resolve(repoDir, rel);
+  let st: fs.Stats;
+  try {
+    st = fs.lstatSync(lock);
+  } catch {
+    return null;
+  }
+  if (!st.isFile() || st.size !== 0 || now - st.mtimeMs < maxAgeMs) return null;
+  try {
+    fs.unlinkSync(lock);
+  } catch {
+    return null;
+  }
+  const since = new Date(st.mtimeMs).toISOString();
+  console.warn(`[git-commit] removed a stale ${rel} from ${since}; no git of this mirror holds it`);
+  return since;
 }
 
 /** Run `git commit -m <message>` in `repoDir`. Returns true on success. */
@@ -282,6 +330,8 @@ export async function runGitCommitCycle(opts: {
 }): Promise<{
   committed: boolean;
   message?: string;
+  /** Why staging or committing failed; the mirror shows it as `last_error` instead of only logging it. */
+  error?: string;
   push?: { attempted: true; ok: boolean; error?: string };
 }> {
   // Preflight: every step below shells `git`. On a git-less server the first
@@ -293,10 +343,11 @@ export async function runGitCommitCycle(opts: {
 
   const now = opts.now ?? (() => new Date().toISOString());
 
+  await clearStaleIndexLock(opts.repoDir);
   const add = await gitAddAll(opts.repoDir);
   if (!add.ok) {
     console.error(`[git-commit] git add failed: ${add.stderr}`);
-    return { committed: false };
+    return { committed: false, error: `git add failed: ${add.stderr}` };
   }
 
   const staged = await listStagedFiles(opts.repoDir);
@@ -325,7 +376,7 @@ export async function runGitCommitCycle(opts: {
   const commit = await gitCommit(opts.repoDir, message);
   if (!commit.ok) {
     console.error(`[git-commit] git commit failed: ${commit.stderr}`);
-    return { committed: false };
+    return { committed: false, error: `git commit failed: ${commit.stderr}` };
   }
   console.log(`[git-commit] ${message}`);
 

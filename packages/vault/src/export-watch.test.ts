@@ -425,6 +425,40 @@ describe("runGitCommitCycle", () => {
     expect(gitLastCommitMessage(dir)).toBe("export: 2026-05-20T15:42:01Z (1 note)");
   });
 
+  test("a stale empty index.lock is removed and the commit lands; a fresh or non-empty one is left and reported", async () => {
+    const lock = path.join(dir, ".git", "index.lock");
+    const cycle = () =>
+      runGitCommitCycle({
+        repoDir: dir,
+        template: DEFAULT_COMMIT_TEMPLATE,
+        notesChanged: 1,
+        vaultName: "default",
+        firstNoteTitle: "Inbox",
+        push: false,
+      });
+    const old = (Date.now() - 10 * 60_000) / 1000;
+    fs.writeFileSync(path.join(dir, "Inbox.md"), "# Inbox\n");
+
+    fs.writeFileSync(lock, "");                     // fresh: a git may hold it
+    let r = await cycle();
+    expect(r.committed).toBe(false);
+    expect(r.error).toContain("index.lock");
+    expect(fs.existsSync(lock)).toBe(true);
+
+    fs.writeFileSync(lock, "partial index");        // old but not empty: not ours to judge
+    fs.utimesSync(lock, old, old);
+    r = await cycle();
+    expect(r.committed).toBe(false);
+    expect(fs.existsSync(lock)).toBe(true);
+
+    fs.writeFileSync(lock, "");                     // old and empty: what a killed `git add` leaves
+    fs.utimesSync(lock, old, old);
+    r = await cycle();
+    expect(r.committed).toBe(true);
+    expect(r.error).toBeUndefined();
+    expect(fs.existsSync(lock)).toBe(false);
+  });
+
   test("skips commit when nothing is staged", async () => {
     // No new files since the seed commit.
     const result = await runGitCommitCycle({
