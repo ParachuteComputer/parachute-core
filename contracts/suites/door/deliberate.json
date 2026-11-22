@@ -49,6 +49,20 @@
       "why": "A vault credential minted through the account door lasts 90 days on a box and 15 minutes on cloud. An app must read `expires_at` and mint again; one that stores the credential works for months on a box and breaks in a quarter of an hour on cloud."
     },
     {
+      "id": "vault-token-address-proof",
+      "keys": [
+        "account/vault-token.claims"
+      ],
+      "between": [
+        "box",
+        "cloud",
+        "personal"
+      ],
+      "status": "deliberate",
+      "owner": "cloud's multi-tenant identity (T-476 typed keys)",
+      "why": "A vault credential minted through a cloud-style account door also carries `email_verified`, the same address-proof stamp its account token carries: a vault's admin credential manages that vault's keys there, and one minted before the address owner claimed an unproven account must stop counting once they do (the account gate's own cut). A box has no unproven accounts to claim. Read the claim set as open; no app should depend on it."
+    },
+    {
       "id": "account-reply-fields",
       "keys": [
         "account/vault-token.reply.services",
