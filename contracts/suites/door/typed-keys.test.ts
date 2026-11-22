@@ -311,7 +311,9 @@ describe.skipIf(without)("who reaches the vault, and ending it", () => {
     expect(spent.status).toBe(404);
   });
 
-  test("an app connected by OAuth is a row by the name it registered, and End stops it: its token and its refresh", async () => {
+  // A door with no consent screen (the personal door's owner signs in with a key: `oauth-approval` in deliberate.json)
+  // connects no app by OAuth, so there is no such row to end there.
+  test.skipIf(lacks("oauth-approval"))("an app connected by OAuth is a row by the name it registered, and End stops it: its token and its refresh", async () => {
     const appName = `Door OAuth app ${runId("a")}`;
     const app = await connect({ appName });
     const reach = (bearer: string) => safeFetch(`${vaultUrl()}/api/vault`, { headers: { authorization: `Bearer ${bearer}` } });

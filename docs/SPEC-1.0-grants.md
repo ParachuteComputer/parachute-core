@@ -774,10 +774,12 @@ NIP-98 proofs are single-use. A door that runs as many copies (Cloud, a personal
 every copy sees them, not in one process's memory [code: the box's replay map is in-process,
 `packages/hub/src/nostr-http-auth.ts`].
 
-**Every verifier refuses a permission it doesn't know** [decided, SPEC §3.5]. A box does today. Cloud's and a
-personal door's vault workers don't [code: no unknown-key check in cloud `workers/vault/src/auth.ts`]. They, and
-Prism's verifier, gain the refusal before any door mints a grant token. That is also what makes a rollback to 0.9
-fail closed.
+**Every verifier refuses a permission it doesn't know** [decided, SPEC §3.5]. A box does, and so do Cloud's and a
+personal door's vault workers since parachute-cloud#434 (next) and #437 (door/0.9) [code: cloud
+`workers/vault/src/auth.ts` KNOWN_PERMISSION_KEYS]. Prism's verifier gains it before any door mints Prism a grant
+token. It is also what makes a rollback fail closed: a vault worker from before typed keys refuses a token naming a
+grant. Cloud's workers from before #434 don't refuse, so a rollback that far serves a typed key as a whole-vault key
+until it is ended.
 
 ### 7.3 Grants nobody signed
 
@@ -839,7 +841,7 @@ they must still build.
 | **Holds the vault's private key** (§2.3) | a 0600 file per vault in the hub's home, apart from the vault | identity's database, encrypted under a Worker secret; never the Durable Object | the same as Cloud |
 | **A grantee signs in** | NIP-98 at the hub. The hub already takes NIP-98 for people it knows [code: `nostr-http-auth.ts`] | NIP-98 at identity: **new**. Today there is no key sign-in on Cloud `next` | NIP-98 at identity. Today any key but the owner's is `unknown_pubkey`; at 1.0 a key with a grant in force gets a token for that vault and nothing else |
 | **Who can reach it** | the tailnet, unless the owner exposes it | anyone | anyone |
-| **Still to build** | a vault owner per vault (today any `write`-role user is an admin); roles, pubkey roles and room rosters become door grants (§10) | accounts hold keys; key sign-in; the unknown-permission refusal; used NIP-98 ids shared across copies; `list-vaults` shows vaults a key was granted | the unknown-permission refusal; the grantee sign-in; used NIP-98 ids shared across copies |
+| **Still to build** | a vault owner per vault (today any `write`-role user is an admin); roles, pubkey roles and room rosters become door grants (§10) | key sign-in for a second person; used NIP-98 ids shared across copies; `list-vaults` shows vaults a key was granted. (Done: the unknown-permission refusal, cloud#434; door grants for typed keys and the list, cloud#439.) | the grantee sign-in; used NIP-98 ids shared across copies. (Done: the unknown-permission refusal and typed keys, as Cloud.) |
 
 Three rules hold at every door:
 
