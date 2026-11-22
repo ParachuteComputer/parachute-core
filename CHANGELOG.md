@@ -45,7 +45,13 @@ back a key held to types stops working; it never reaches more.
   fences any such unit left by an earlier release at its first start. Before, a paused `parachute-hub.service` could
   start during an upgrade and serve the home with 0.7 (#128).
 
-**For door builders.** The door harness runs a one-address personal door as one address (#142).
+**For door builders.**
+- The door harness runs a one-address personal door as one address (#142).
+- Parachute Cloud and the own-Cloudflare personal door let write define a type, as a box does, so the door contracts
+  no longer name `write-defines-types` as a difference (#145).
+- They hold keys for an AI to some types, with the one list of who reaches a vault, as a box does, so `typed-keys` is
+  no longer a difference either. One named difference is added: a Cloud vault token also says the account's address
+  was proven (`vault-token-address-proof`) (#148).
 
 ## 0.9.0-pre.1
 
