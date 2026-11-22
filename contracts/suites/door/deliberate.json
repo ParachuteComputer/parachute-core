@@ -146,21 +146,6 @@
       "why": "A box's admin sees `manage-token` (and from 0.9 `manage-keys`) for the hub's own key store. Cloud-style doors have no hub key store: connections and named keys are listed and revoked through the account door."
     },
     {
-      "id": "write-defines-types",
-      "keys": [
-        "mcp/write.tool-count",
-        "mcp/write.tool.manage-types.*"
-      ],
-      "between": [
-        "box",
-        "cloud",
-        "personal"
-      ],
-      "status": "drift",
-      "owner": "Cloud's MCP door (T-476's write rule, after its core pin moves)",
-      "why": "On the box, a write session lists manage-types: it may make a new type and add fields to a type it made (packages/vault/docs/contracts/write-defines-types.md). A hosted vault's write session doesn't list it until Cloud's door takes core's rule, so an AI connected there with write access still can't define a type."
-    },
-    {
       "id": "discovery-address-form",
       "keys": [
         "mcp/cold.challenge"
