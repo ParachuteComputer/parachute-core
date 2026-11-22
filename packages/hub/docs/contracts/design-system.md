@@ -288,7 +288,7 @@ The 2026-05-25 audit (§2.3) found the OAuth flow alone using six interchangeabl
 | **Allow** | Occasional informal use in copy | **Approve** when the user is consenting; **Save** when the user is editing a permission. |
 | **Grant** | "OAuth grants by client" SPA copy + `/api/grants` route | Keep `/api/grants` (data shape — RFC 6749's "grant" is the noun for what was issued). User-facing copy uses **Approve** for the verb, **approval** for the noun. |
 | **Approve and continue** | Inline pending-client form button (`oauth-ui.ts:508`) | **Approve** — the "and continue" is implied (every Approve action moves forward; explicit-continue is verbose). |
-| **Sign in as admin to approve** | Unauth approval CTA (`oauth-ui.ts:592`) | **Sign in to approve** — every operator on this hub is an admin in some sense; the role qualifier is redundant. |
+| **Sign in as admin to approve** | Retired (T-476) | **Sign in**, under the heading "Sign in to your hub to continue": signing in approves the app for the person and shows consent; the admin link is the fallback. |
 | **Connect** | Not currently in committed-core, but tempting for OAuth flows | Don't introduce. Use **Sign in** (for auth) or **Approve** (for consent). |
 
 ### Per-domain verb tables
@@ -303,9 +303,9 @@ Three domains where the audit found the most drift. Implementers updating copy i
 | Consent primary button | `Approve` | `Approve` (no change) |
 | Consent secondary button | `Deny` | `Deny` (no change) |
 | Pending-client inline submit | `Approve and continue` | `Approve` |
-| Pending-client unauth primary CTA | `Sign in as admin to approve` | `Sign in to approve` |
+| Pending-client unauth primary CTA | `Sign in` (T-476) | `Sign in` |
 | Page `<title>` on `/oauth/authorize` consent | `Authorize <client>` | `Approve <client>` |
-| Page `<title>` on `/oauth/authorize` pending | `App not yet approved` | `Approve <client>?` |
+| Page `<title>` on `/oauth/authorize` pending | `Sign in to continue` without a session (T-476); `App not yet approved` with one | `Approve <client>?` |
 | Sign-out form | `Sign out` | `Sign out` (no change) |
 
 **Module + vault management (admin SPA, `/admin/*`):**

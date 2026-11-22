@@ -185,6 +185,13 @@ export interface ConsentViewProps {
    * `consentProps` call site in `oauth-handlers.ts`.
    */
   sameHub?: boolean;
+  /**
+   * T-476: the client is Parachute's own app (`parachuteAppHome` in clients.ts: the app's exact name, and every
+   * registered redirect first-party). `"device"`: every redirect is loopback. The page then says so instead of
+   * External, and drops the line about the company that runs the app. Absent for every other client, Claude Code on
+   * loopback included (whatever its server is called). Words only: approval and scopes don't read it.
+   */
+  parachuteApp?: "device" | "elsewhere";
 }
 
 /**
@@ -239,7 +246,7 @@ export interface ErrorViewProps {
  *     the inline approve form (closes #208). One click flips the client to
  *     `approved` and re-enters the OAuth flow at consent.
  *   - Unauthenticated viewer — render TWO CTAs (no terminal mention):
- *       1. Primary: "Sign in as admin to approve" → links to
+ *       1. Primary: "Sign in" (T-476; was "Sign in as admin to approve") → links to
  *          `/login?next=<loginNextUrl>`. When the page was rendered in
  *          response to an `/oauth/authorize?...` request, `loginNextUrl`
  *          is that same authorize URL (pathname+search) so the operator
@@ -312,8 +319,8 @@ export interface ApprovePendingViewProps {
   };
   /**
    * Same-origin hub-relative URL (path + search) to send the operator to
-   * after they sign in via the unauthenticated "Sign in as admin to
-   * approve" CTA. When this page is rendered in response to an
+   * after they sign in via the unauthenticated "Sign in" CTA (T-476; was "Sign in as admin to
+   * approve"). When this page is rendered in response to an
    * `/oauth/authorize?...` GET, the caller should pass that authorize
    * URL here so post-login the operator lands BACK on the OAuth flow
    * (now authenticated → sees inline approve form → one click → consent →
@@ -402,6 +409,7 @@ export function renderConsent(props: ConsentViewProps): string {
     grantableExtras,
     sameHub,
     vaultLevels,
+    parachuteApp,
   } = props;
   // Substitute unnamed `vault:<verb>` rows with the resolved named form so
   // the operator sees the scope shape that will appear in the token. Raw
@@ -437,7 +445,9 @@ export function renderConsent(props: ConsentViewProps): string {
           )
           .join("\n");
   // 0.9.1 (SPEC §3.4): a vault grant reaches the whole vault at its level, and what the app reads leaves the box.
-  const readsVault = displayedScopes.some((sc) => sc.startsWith("vault:"));
+  // Not for Parachute's own app (T-476): it returns only to this device or Parachute's own addresses, so there is
+  // no company it goes to. Every other client keeps the line.
+  const readsVault = parachuteApp === undefined && displayedScopes.some((sc) => sc.startsWith("vault:"));
   const extrasSection = renderGrantableExtras(grantableExtras ?? [], displayedScopes.length === 0);
   const pickerSection = vaultPicker ? renderVaultPicker(vaultPicker) : "";
   const levelsSection = vaultLevels ? renderVaultLevels(vaultLevels) : "";
@@ -503,6 +513,15 @@ export function renderConsent(props: ConsentViewProps): string {
   const trustMarker =
     sameHub === undefined
       ? ""
+      : parachuteApp !== undefined
+        ? `<p class="trust-marker trust-marker-same-hub">
+            <span class="badge badge-trust-same-hub">Parachute</span>
+            <span class="trust-marker-text">${
+              parachuteApp === "device"
+                ? "Parachute's app on this device: it returns only here."
+                : "Parachute's own app: it returns only to the address above."
+            }</span>
+          </p>`
       : sameHub
         ? `<p class="trust-marker trust-marker-same-hub">
             <span class="badge badge-trust-same-hub">First-party</span>
@@ -680,8 +699,8 @@ function renderVaultPicker(picker: VaultPicker): string {
  *   - **Authenticated operator with same-origin posture** (#208): render the
  *     inline approve form so one click flips the client to `approved` and
  *     re-enters the OAuth flow at consent.
- *   - **Unauthenticated viewer** (Issue 1 in the approval-UX PR): render a
- *     primary "Sign in as admin to approve" CTA wired to
+ *   - **Unauthenticated viewer** (Issue 1 in the approval-UX PR; words from T-476): lead with "Sign in to your
+ *     hub to continue" and a "Sign in" CTA (signing in approves the app for the person and shows consent), wired to
  *     `/login?next=/admin/approve-client/<id>` so the admin lands directly
  *     on the approval page after sign-in, plus a secondary shareable
  *     deep-link section (fully-qualified `<hub_origin>/admin/approve-client/<id>`
@@ -754,7 +773,22 @@ export function renderApprovePending(props: ApprovePendingViewProps): string {
           <button type="submit" name="decision" value="deny" class="btn btn-secondary">Deny</button>
         </div>
       </form>`
-    : renderUnauthenticatedApproveCtas(hubOrigin, clientId, loginNextUrl);
+    : "";
+  const unauth = approveForm ? undefined : renderUnauthenticatedApproveCtas(hubOrigin, clientId, loginNextUrl);
+  // T-476: with no session this page is what a person meets when their own app (or Claude) first reaches their hub
+  // from a device that isn't signed in. Signing in is the way on (the authorize GET approves the app for a signed-in
+  // person and shows the consent page), so the page leads with it; the admin link is the fallback for someone who
+  // isn't the hub's owner. The signed-in branch (the inline form) keeps its words.
+  const heading = approveForm
+    ? `<h1>App not yet approved</h1>
+        <p class="subtitle">
+          ${escapeHtml(clientName)} is registered with this hub but hasn't been approved yet.
+          Review the details below before approving.
+        </p>`
+    : `<h1>Sign in to your hub to continue</h1>
+        <p class="subtitle">
+          ${escapeHtml(clientName)} wants to connect to this hub. Sign in to continue.
+        </p>`;
   const body = `
     <div class="card">
       <div class="card-header">
@@ -762,12 +796,8 @@ export function renderApprovePending(props: ApprovePendingViewProps): string {
           <span class="brand-mark" aria-hidden="true">${brandMarkSvg(20, "oauth")}</span>
           <span class="brand-name">${WORDMARK_TEXT}</span>
         </div>
-        <h1>App not yet approved</h1>
-        <p class="subtitle">
-          ${escapeHtml(clientName)} is registered with this hub but hasn't been approved yet.
-          Review the details below before approving.
-        </p>
-      </div>
+        ${heading}
+      </div>${unauth ? unauth.signIn : ""}
       <section class="approve-meta">
         <h2 class="scopes-title">Application</h2>
         <p class="approve-meta-row">
@@ -787,15 +817,15 @@ export function renderApprovePending(props: ApprovePendingViewProps): string {
         <h2 class="scopes-title">Permissions requested</h2>
         <ul class="scope-list">${scopeRows}</ul>${wildcardNote}
       </section>
-      ${formSection}
+      ${formSection}${unauth ? unauth.share : ""}
     </div>`;
-  return baseDocument("App not yet approved", body);
+  return baseDocument(approveForm ? "App not yet approved" : "Sign in to continue", body);
 }
 
 /**
  * Unauthenticated branch of `renderApprovePending`. Two CTAs:
  *
- *   1. Primary: "Sign in as admin to approve" → links to
+ *   1. Primary: "Sign in" (under the header) → links to
  *      `/login?next=<loginNextUrl>`. When `loginNextUrl` is provided,
  *      that's the URL the operator lands on after sign-in — for the
  *      OAuth-flow entry point that's the original `/oauth/authorize?...`
@@ -805,7 +835,7 @@ export function renderApprovePending(props: ApprovePendingViewProps): string {
  *      params discarded. When `loginNextUrl` is absent, fall back to
  *      `/admin/approve-client/<id>` (the legacy SPA path) — useful for
  *      non-authorize entry points where there's no OAuth flow to resume.
- *   2. Secondary: a fully-qualified shareable deep-link to
+ *   2. Secondary, at the foot ("Not this hub's owner?"): a fully-qualified shareable deep-link to
  *      `<hub_origin>/admin/approve-client/<client_id>` with a Copy button
  *      so the operator can send it to whoever runs the hub. This stays
  *      SPA-routed because the recipient isn't in an OAuth flow — the
@@ -821,7 +851,7 @@ function renderUnauthenticatedApproveCtas(
   hubOrigin: string,
   clientId: string,
   loginNextUrl?: string,
-): string {
+): { signIn: string; share: string } {
   const approvalPath = `/admin/approve-client/${encodeURIComponent(clientId)}`;
   // Prefer the caller-supplied loginNextUrl (the original authorize URL when
   // this page was rendered for an OAuth-flow GET) so post-login resumes the
@@ -833,16 +863,17 @@ function renderUnauthenticatedApproveCtas(
   const loginHref = `/login?next=${encodeURIComponent(loginNext)}`;
   const trimmedOrigin = hubOrigin.replace(/\/+$/, "");
   const deepLink = `${trimmedOrigin}${approvalPath}`;
-  return `
+  const signIn = `
       <div class="approve-actions">
         <a href="${escapeHtml(loginHref)}" class="btn btn-primary approve-signin-cta">
-          Sign in as admin to approve
+          Sign in
         </a>
-      </div>
+      </div>`;
+  const share = `
       <section class="approve-share">
-        <h2 class="scopes-title">Or send this link to your hub admin</h2>
+        <h2 class="scopes-title">Not this hub's owner?</h2>
         <p class="approve-share-help">
-          Anyone with admin access on this hub can open the link below to approve the app.
+          Send this link to whoever runs the hub. They can approve the app from it.
         </p>
         <div class="approve-share-row">
           <code class="approve-share-link" id="approve-share-link">${escapeHtml(deepLink)}</code>
@@ -884,6 +915,7 @@ function renderUnauthenticatedApproveCtas(
           });
         })();
       </script>`;
+  return { signIn, share };
 }
 
 /**
@@ -1781,7 +1813,7 @@ const STYLES = `
   }
   .approve-form { gap: 0; }
   .approve-actions {
-    margin-top: 1rem;
+    margin: 1rem 0 1.25rem;
     display: flex;
     flex-direction: column;
     gap: 0.5rem;
