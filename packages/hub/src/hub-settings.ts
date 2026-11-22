@@ -22,6 +22,7 @@
  * call frequency is low (a handful of reads on `/oauth/register` + the
  * wizard's done step) so the obvious shape wins.
  */
+import { isSameOriginPath } from "./same-origin-path.ts";
 import type { Database } from "bun:sqlite";
 
 // Adding a setting: extend this union + write a typed accessor. The table itself is generic KV.
@@ -536,50 +537,20 @@ export function defaultRootRedirectFor(manifest: { services: { name: string }[] 
  *
  * The resolved value lands verbatim in a `Location:` header on the `/` 302,
  * so an off-origin value would be a textbook open redirect. To be accepted it
- * must be a SAME-ORIGIN relative path:
- *
- *   - starts with a single `/` (a site-relative path). This alone rejects
- *     `https://evil.com`, `javascript:…`, and bare hostnames.
- *   - second char is NOT `/` (a protocol-relative `//evil.com` sends the
- *     browser to another origin) and NOT `\` (browsers normalize the
- *     backslash, so `/\evil.com` resolves like `//evil.com`).
- *   - contains no ASCII control chars or whitespace — a CR/LF would enable
- *     header injection, and tab/newline are stripped by some browsers which
- *     could re-expose a hidden `//` authority.
- *   - resolves same-origin against a placeholder base (belt-and-suspenders:
- *     `new URL(value, base).origin === base`) — catches any scheme/authority
- *     shape the prefix checks missed.
- *   - does NOT resolve to pathname `/` — that would re-enter this very route
- *     and 302-loop forever (`/`, `/?x`, `/#y` all rejected).
+ * must pass the hub's one rule, `isSameOriginPath` (same-origin-path.ts: a
+ * single-slash path of visible ASCII that a browser resolves to this origin,
+ * so `//evil.com`, `/\evil.com`, a tab or CR/LF and `/.//evil.com` are all
+ * refused), and it must NOT resolve to pathname `/`: that would re-enter this
+ * very route and 302-loop forever (`/`, `/?x`, `/#y` all rejected).
  *
  * A query string / fragment on a real path is allowed (stays same-origin).
  * Returns false for non-strings, empty, and every off-origin shape.
  */
 export function isSafeRedirectPath(value: unknown): value is string {
-  if (typeof value !== "string" || value.length === 0) return false;
-  if (value[0] !== "/") return false;
-  if (value[1] === "/" || value[1] === "\\") return false;
-  // Reject whitespace (\t \n \r space + Unicode separators U+2028/U+2029) and
-  // ASCII control chars. A CR/LF would enable header injection; stripped
-  // whitespace could re-expose a hidden `//` authority. `\s` covers the
-  // whitespace family (incl. Unicode); the charCode scan covers the remaining
-  // non-whitespace control chars (0x00-0x1f, 0x7f) without a control-char
-  // regex literal.
-  if (/\s/u.test(value)) return false;
-  for (let i = 0; i < value.length; i++) {
-    const c = value.charCodeAt(i);
-    if (c < 0x20 || c === 0x7f) return false;
-  }
-  try {
-    const base = "http://parachute.invalid";
-    const resolved = new URL(value, base);
-    if (resolved.origin !== base) return false;
-    // pathname "/" would match the bare-`/` route again -> infinite redirect.
-    if (resolved.pathname === "/") return false;
-  } catch {
-    return false;
-  }
-  return true;
+  // The shared rule (`isSameOriginPath`: a path on this hub, no backslash, no control or non-ASCII characters, no
+  // dot-segment `//`), plus this route's own: not `/` itself, which would loop.
+  if (typeof value !== "string" || !isSameOriginPath(value)) return false;
+  return new URL(value, "http://parachute.invalid").pathname !== "/";
 }
 
 /**

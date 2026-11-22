@@ -412,7 +412,7 @@ export async function hubSetRootRedirect(
 
   if (!isSafeRedirectPath(raw)) {
     err(`parachute hub set-root-redirect: "${raw}" is not a safe same-origin path`);
-    err("  It must start with a single `/` (no `//`, `/\\`, scheme, or whitespace) and");
+    err("  It must start with a single `/` (no `//`, `/\\`, scheme, whitespace or non-ASCII) and");
     err("  not be `/` itself. Example: /surface/reading-room");
     return 1;
   }
