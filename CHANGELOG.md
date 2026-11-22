@@ -33,6 +33,20 @@ back a key held to types stops working; it never reaches more.
 - The consent page grants only what is left ticked. Its boxes sat outside the form, so unticking a scope (admin for
   an AI's connector, say) still granted it (#138, security). This holds for new approvals only: a connector approved
   before this release may hold a scope you unticked. End it in the vault's list and connect again.
+- Parachute's own app is no longer called "External" or "a third-party app". When the app (named Parachute, returning
+  only to the device or the hub's own address) asks to sign in, the consent page says it is Parachute's app on this
+  device, and drops "goes to the company that runs it". On a phone with no hub session, the first page leads with
+  signing in, not "send this link to your hub admin" (#147).
+- After signing in, the hub only sends you on to a page of its own. A crafted sign-in link (`/login?next=/\evil.example`)
+  could send a person to another site straight after they signed in; the same check is now used for every redirect
+  the hub makes (#151, security).
+- The setup wizard speaks plainly: it shows the hub's real address, and its last page leads with the app and the
+  address to give an AI (`<hub>/mcp`), with the developer items folded away (#149).
+
+**Vault mirrors keep committing.**
+- If Parachute was stopped in the middle of a mirror commit, the git mirror stopped committing for good (a stale
+  `index.lock`), and only the log said so. The mirror now clears a lock its own earlier run left, runs one commit at a
+  time per mirror, and shows a failed commit in the vault's status until a commit lands (#150).
 
 **Write access does more without an admin key.**
 - Write may add a new type, and add fields to a type it made, over MCP (#134) and over REST, `PUT /api/types/<name>`
