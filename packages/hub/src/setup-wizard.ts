@@ -1050,10 +1050,10 @@ export function safeSetupReturn(raw: string | null | undefined): string | null {
 /** The cookie that carries the return through the wizard's steps (account, vault, expose), on this browser only. */
 export const SETUP_RETURN_COOKIE = "parachute_setup_return";
 
-function setupReturnCookie(path: string | null, req: Request): string {
-  const parts = [`${SETUP_RETURN_COOKIE}=${path === null ? "" : encodeURIComponent(path)}`, "HttpOnly"];
+function setupReturnCookie(path: string, req: Request): string {
+  const parts = [`${SETUP_RETURN_COOKIE}=${encodeURIComponent(path)}`, "HttpOnly"];
   if (isHttpsRequest(req)) parts.push("Secure");
-  parts.push("SameSite=Lax", "Path=/admin/setup", path === null ? "Max-Age=0" : "Max-Age=3600");
+  parts.push("SameSite=Lax", "Path=/admin/setup", "Max-Age=3600");
   return parts.join("; ");
 }
 
@@ -1085,7 +1085,9 @@ function setupReturnLabel(returnTo: string, db: Database): string {
 /**
  * Whether this request may set the return: only while the hub has no admin (the first-boot funnel is the only way
  * here with a return), and only from this hub's own pages or a typed address, never a link on another site
- * (`Sec-Fetch-Site`), so nobody can plant a button on someone else's done page.
+ * (`Sec-Fetch-Site`), so nobody can plant a button on someone else's done page. Accepted: a link opened from another
+ * app (mail, chat) arrives as `none` too, so it could plant one, but only before the hub has any admin, and the
+ * button's words are generic (`setupReturnLabel`); the consent page still decides.
  */
 function mayRememberReturn(req: Request, db: Database): boolean {
   const site = req.headers.get("sec-fetch-site");
@@ -1867,13 +1869,12 @@ function renderSetupGet(req: Request, deps: SetupWizardDeps): Response {
         INSTALL_TILE_CSRF_PLACEHOLDER,
         renderCsrfHiddenInput(csrf.token),
       );
-      const done = new Response(html, {
+      // The return is kept for its hour (not spent on first show): an install tile's refresh, a reload, or the phone
+      // reloading after a switch to Claude would otherwise lose the button. Nobody can set it once an admin exists.
+      return new Response(html, {
         status: 200,
         headers: extraHeaders,
       });
-      // The return is spent once shown: a later visit doesn't carry it.
-      if (returnPath) done.headers.append("set-cookie", setupReturnCookie(null, req));
-      return done;
     }
     return new Response(null, { status: 301, headers: { location: "/login" } });
   }

@@ -5238,6 +5238,8 @@ describe("setup reached from a sign-in returns to it", () => {
   }
 
   let lastDone: Response | undefined;
+  let firstSet: string | undefined;
+  let again: (() => Promise<string>) | undefined;
   async function walk(next: string): Promise<string> {
     const db = openHubDb(hubDbPath(h.dir));
     try {
@@ -5254,6 +5256,7 @@ describe("setup reached from a sign-in returns to it", () => {
       // 1. The first-boot /login funnel lands here with the sign-in's next.
       const first = handleSetupGet(req(`/admin/setup?next=${encodeURIComponent(next)}`), deps);
       const set = first.headers.getSetCookie().find((x) => x.startsWith(`${SETUP_RETURN_COOKIE}=`));
+      firstSet = set;
       if (set) {
         expect(set).toContain("Path=/admin/setup");
         expect(set).toContain("HttpOnly");
@@ -5289,7 +5292,12 @@ describe("setup reached from a sign-in returns to it", () => {
       const done = handleSetupGet(req("/admin/setup?just_finished=1", { headers: { cookie: c.header() } }), deps);
       expect(done.status).toBe(200);
       lastDone = done;
-      return await done.text();
+      const html = await done.text();
+      c.take(done);
+      // A second look at the done page (a reload, an install tile's refresh) with the same browser.
+      const second = await handleSetupGet(req("/admin/setup?just_finished=1", { headers: { cookie: c.header() } }), deps).text();
+      again = async () => second;
+      return html;
     } finally {
       db.close();
     }
@@ -5306,8 +5314,10 @@ describe("setup reached from a sign-in returns to it", () => {
     expect(button![1]!.replaceAll("&amp;", "&")).toBe(authorize);
     expect(button![2]).toBe("Continue to the Parachute app");
     expect(html).not.toContain("<strong>Open the Parachute app</strong>");
-    // Spent once shown.
-    expect(lastDone!.headers.getSetCookie().some((x) => x.startsWith(`${SETUP_RETURN_COOKIE}=;`) && x.includes("Max-Age=0"))).toBe(true);
+    expect(firstSet).toBeDefined();
+    // Still there on a reload (or an install tile's refresh): the done page doesn't spend it.
+    expect(lastDone!.headers.getSetCookie().some((x) => x.startsWith(`${SETUP_RETURN_COOKIE}=`))).toBe(false);
+    expect(await again!()).toContain('data-testid="continue-return"');
   });
 
   test("another app's sign-in: the button never carries that app's own name", async () => {
