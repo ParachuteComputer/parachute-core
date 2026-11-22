@@ -49,6 +49,7 @@ import {
   expandRedirectUrisForHubOrigins,
   getClient,
   isValidRedirectUri,
+  parachuteAppHome,
   registerClient,
   requireRegisteredRedirectUri,
   verifyClientSecret,
@@ -1724,6 +1725,7 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
         requestedScopes.some(isAccountVaultsConnectionScope)
           ? [...perVaultOffer(db, session.userId, userIsAdmin, assignedVaults, vaultNames)].map(([vault, max]) => ({ vault, max }))
           : undefined,
+        resolveBoundOrigins(deps),
       ),
     ),
     200,
@@ -3914,8 +3916,11 @@ function consentProps(
   // which this pure props builder deliberately doesn't take.
   grantableExtras: readonly string[] = [],
   vaultLevels?: ReadonlyArray<{ vault: string; max: "read" | "write" }>,
+  // The origins this hub answers on, to tell Parachute's own app from the rest (T-476, `parachuteAppHome`).
+  hubOrigins: readonly string[] = [],
 ) {
   const requestedScopes = params.scope.split(" ").filter((s) => s.length > 0);
+  const parachuteApp = parachuteAppHome(client.clientName, client.redirectUris, hubOrigins);
   const unnamedVerbs = unnamedVaultVerbs(requestedScopes);
   // Zero-vault non-admin can't authorize a vault-scoped request (hub#431).
   // The POST handler already 400s this case ("No vaults assigned"); this
@@ -4061,6 +4066,8 @@ function consentProps(
     // consent screen. Clean DB-backed signal: the `same_hub` column written
     // at DCR time (bearer hub:admin / same-origin session → true).
     sameHub: client.sameHub,
+    // T-476: Parachute's own app says so instead of External, and has no company its reads go to. Words only.
+    ...(parachuteApp ? { parachuteApp } : {}),
     grantableExtras,
     ...(vaultLevels ? { vaultLevels } : {}),
   };

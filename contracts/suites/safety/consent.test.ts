@@ -398,6 +398,54 @@ describe("the consent page says what the connection can read", () => {
   });
 });
 
+// ── 3c. Parachute's own app is named as such; everyone else stays External (T-476) ───────────────────────────
+// Three first-run walkers met their own Parachute app (it returns to 127.0.0.1) as "External: a third-party app that
+// registered itself", with "what this app reads goes to the company that runs it"; one nearly pressed Deny. And on a
+// phone with no session the page said "App not yet approved … send this link to your hub admin" to the hub's owner,
+// though signing in is all it takes. Red before T-476. A Parachute-looking name registers only when every redirect is
+// first-party, so the page may say so for that name; loopback alone may not (Claude Code returns to loopback too, and
+// what it reads goes to its maker). Mutant "consent-parachute-by-loopback" calls every loopback app Parachute's.
+
+describe("Parachute's own app is named on the consent page; other apps stay External", () => {
+  let session: string;
+  const marker = "Parachute's app on this device: it returns only here.";
+  const vendor = "What this app reads from your vault goes to the company that runs it.";
+
+  test("setup: a made-up user signs in", async () => {
+    session = await signIn(await newUser("consent-own-app"));
+  });
+
+  test("Parachute's app on this device: no External, no company", async () => {
+    const redirect = "http://127.0.0.1:47219/oauth/callback";
+    const text = visibleText(await consentPage(session, await registered("Parachute", redirect), redirect));
+    expect(text).toContain(marker);
+    expect(text).not.toContain("External");
+    expect(text).not.toContain("registered itself");
+    expect(text).not.toContain(vendor);
+  });
+
+  test("an app named Claude on loopback is still External, with the company line", async () => {
+    const redirect = "http://127.0.0.1:53690/callback";
+    const text = visibleText(await consentPage(session, await registered("Claude", redirect), redirect));
+    expect(text).toContain("External");
+    expect(text).toContain(vendor);
+    expect(text).not.toContain(marker);
+  });
+
+  test("with no session, the page leads with signing in; the admin link comes last", async () => {
+    const redirect = "http://127.0.0.1:47219/oauth/callback";
+    const id = await registered("Parachute", redirect);
+    const r = await safeFetch(`${s.hub}/oauth/authorize?${new URLSearchParams(authorizeParams(id, redirect, READ))}`, { redirect: "manual" });
+    const html = await r.text();
+    const text = visibleText(html.slice(html.indexOf("<body")));
+    expect(text).toContain("Sign in to your hub to continue");
+    expect(text).not.toContain("App not yet approved");
+    expect(text.indexOf("Sign in to your hub to continue")).toBeLessThan(text.indexOf("Not this hub's owner?"));
+    // The button still goes through sign-in and back to this same authorize request.
+    expect(html).toMatch(/href="\/login\?next=%2Foauth%2Fauthorize%3F[^"]*"[^>]*>\s*Sign in\s*</);
+  });
+});
+
 // ── 4. the box's lockout holds under a parallel burst ───────────────────────────────────────────────────────
 
 describe("a parallel burst of wrong passwords locks the account out at the limit", () => {

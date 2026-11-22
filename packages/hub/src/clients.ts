@@ -610,6 +610,24 @@ export function isFirstPartyRedirect(uri: string, hubOrigins: readonly string[])
 }
 
 /**
+ * Where Parachute's own app returns, for the consent page's marker (T-476): `"device"` when every redirect is
+ * loopback, `"elsewhere"` when every redirect is first-party but not all on this device, or null when the client
+ * isn't Parachute's own. Parachute's own means a Parachute-looking name (the only names `clientNameProblem` reserves)
+ * AND every redirect first-party (`isFirstPartyRedirect`), checked again here because an operator's registration may
+ * use the name for any redirect. A loopback redirect alone is not enough: Claude Code returns to loopback too, and
+ * what it reads goes to its maker.
+ */
+export function parachuteAppHome(
+  name: string | null,
+  redirectUris: readonly string[],
+  hubOrigins: readonly string[],
+): "device" | "elsewhere" | null {
+  if (!name || !looksLikeParachute(name) || redirectUris.length === 0) return null;
+  if (!redirectUris.every((u) => isFirstPartyRedirect(u, hubOrigins))) return null;
+  return redirectUris.every((u) => redirectHome(u) === "loopback") ? "device" : "elsewhere";
+}
+
+/**
  * Why DCR must refuse this `client_name`, or null when it may register.
  * `operatorRegistered`: the registration authenticated as this hub's admin
  * (bearer `hub:admin`, or an admin's session on the hub's own origin), which
