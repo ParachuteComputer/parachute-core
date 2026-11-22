@@ -49,6 +49,7 @@ import {
   expandRedirectUrisForHubOrigins,
   getClient,
   isValidRedirectUri,
+  parachuteAppHome,
   registerClient,
   requireRegisteredRedirectUri,
   verifyClientSecret,
@@ -1289,7 +1290,7 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
   // to that vault BEFORE the pending/consent branches below, so EVERY
   // downstream consumer sees the narrowed set:
   //
-  //   1. The consent screen — and the session-less "App not yet approved"
+  //   1. The consent screen — and the session-less "Sign in to your hub to continue"
   //      page (`pendingClientResponse`) — shows ONLY that vault's scopes
   //      instead of the whole-hub catalog. Narrowing DROPS non-vault scopes
   //      (`scribe:*`, `agent:send`, `hub:admin`) outright: the token this
@@ -1401,7 +1402,7 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
     // A request carrying a valid session auto-approves the pending client and
     // FALLS THROUGH into the normal consent path below (resource-narrow →
     // non-requestable gate → skip-consent / same-hub → consent render). A
-    // session-less request still renders the unauth "App not yet approved"
+    // session-less request still renders the unauth "Sign in to your hub to continue"
     // page (`pendingClientResponse`), whose sign-in CTA (`loginNextUrl`)
     // round-trips back to this authorize URL; after login the user re-enters
     // WITH a session → hits this auto-approve branch → consent.
@@ -1724,6 +1725,7 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
         requestedScopes.some(isAccountVaultsConnectionScope)
           ? [...perVaultOffer(db, session.userId, userIsAdmin, assignedVaults, vaultNames)].map(([vault, max]) => ({ vault, max }))
           : undefined,
+        resolveBoundOrigins(deps),
       ),
     ),
     200,
@@ -3914,8 +3916,11 @@ function consentProps(
   // which this pure props builder deliberately doesn't take.
   grantableExtras: readonly string[] = [],
   vaultLevels?: ReadonlyArray<{ vault: string; max: "read" | "write" }>,
+  // The origins this hub answers on, to tell Parachute's own app from the rest (T-476, `parachuteAppHome`).
+  hubOrigins: readonly string[] = [],
 ) {
   const requestedScopes = params.scope.split(" ").filter((s) => s.length > 0);
+  const parachuteApp = parachuteAppHome(client.clientName, client.redirectUris, hubOrigins);
   const unnamedVerbs = unnamedVaultVerbs(requestedScopes);
   // Zero-vault non-admin can't authorize a vault-scoped request (hub#431).
   // The POST handler already 400s this case ("No vaults assigned"); this
@@ -4061,6 +4066,8 @@ function consentProps(
     // consent screen. Clean DB-backed signal: the `same_hub` column written
     // at DCR time (bearer hub:admin / same-origin session → true).
     sameHub: client.sameHub,
+    // T-476: Parachute's own app says so instead of External, and has no company its reads go to. Words only.
+    ...(parachuteApp ? { parachuteApp } : {}),
     grantableExtras,
     ...(vaultLevels ? { vaultLevels } : {}),
   };

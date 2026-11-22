@@ -542,6 +542,82 @@ describe("handleAuthorizeGet", () => {
     }
   });
 
+  // T-476: Parachute's own app (the web build on 127.0.0.1, the phone and desktop app on 127.0.0.1:47219) was
+  // "External: a third-party app that registered itself", and "what this app reads goes to the company that runs
+  // it". The marker and the vendor line follow `parachuteAppHome`: the app's exact name, "Parachute", AND every
+  // redirect first-party. Loopback alone is not enough (Claude Code returns to loopback, and its reads go to Anthropic),
+  // nor is a name holding the word ("Claude Code (parachute)").
+  async function consentFor(clientName: string, redirects: string | string[], sameHub = false): Promise<string> {
+    const redirectUris = [redirects].flat();
+    const redirect = redirectUris[0]!;
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, { redirectUris, clientName, sameHub });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: redirect,
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          scope: "vault:read",
+        }),
+        { headers: { cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}` } },
+      );
+      const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(200);
+      return await res.text();
+    } finally {
+      cleanup();
+    }
+  }
+
+  test("Parachute's own app on loopback: says it's Parachute's, no External, no company line (T-476)", async () => {
+    const html = await consentFor("Parachute", "http://127.0.0.1:47219/oauth/callback");
+    expect(html).toContain("Parachute's app on this device: it returns only here.");
+    expect(html).not.toContain('class="badge badge-trust-external"');
+    expect(html).not.toContain("company that runs it");
+  });
+
+  test("Parachute's own app on this hub's origin: Parachute's, but not 'on this device' (T-476)", async () => {
+    const html = await consentFor("Parachute", `${ISSUER}/app/oauth/callback`, true);
+    expect(html).toContain("Parachute's own app: it returns only to the address above.");
+    expect(html).not.toContain("on this device: it returns");
+    expect(html).not.toContain("company that runs it");
+  });
+
+  test("Claude on loopback stays External with the company line (T-476: loopback alone isn't Parachute's)", async () => {
+    const html = await consentFor("Claude Code", "http://127.0.0.1:53682/callback");
+    expect(html).toContain('class="badge badge-trust-external"');
+    expect(html).toContain("What this app reads from your vault goes to the company that runs it.");
+    expect(html).not.toContain("Parachute's app on this device");
+  });
+
+  // Claude Code registers as "Claude Code (<server>)", and the hub's own commands name the server parachute or
+  // parachute-<vault>: the name contains the word, the redirect is loopback, and it is still not Parachute's app.
+  test("Claude Code connected as 'parachute' stays External with the company line (T-476)", async () => {
+    for (const name of ["Claude Code (parachute)", "Claude Code (parachute-work)", "Cursor (parachute)", "Parachute Notes"]) {
+      const html = await consentFor(name, "http://localhost:53682/callback");
+      expect(html).toContain('class="badge badge-trust-external"');
+      expect(html).toContain("What this app reads from your vault goes to the company that runs it.");
+    }
+  });
+
+  test("'Parachute' an operator registered with one loopback and one foreign redirect keeps the company line (T-476)", async () => {
+    const html = await consentFor("Parachute", ["http://127.0.0.1:47219/oauth/callback", "https://evil.example/cb"], true);
+    expect(html).toContain("What this app reads from your vault goes to the company that runs it.");
+    expect(html).not.toContain("Parachute's app on this device");
+  });
+
+  test("a Parachute-named client an operator registered for a foreign redirect keeps the company line (T-476)", async () => {
+    const html = await consentFor("Parachute", "https://bridge.example/cb", true);
+    expect(html).toContain("What this app reads from your vault goes to the company that runs it.");
+    expect(html).not.toContain("Parachute's own app");
+  });
+
   test("rejects unknown client_id with 400", async () => {
     const { db, cleanup } = await makeDb();
     try {
@@ -1241,7 +1317,7 @@ describe("handleAuthorizeGet — RFC 8707 resource binding drops foreign scopes 
     }
   });
 
-  test("session-less 'App not yet approved' page also drops foreign scopes", async () => {
+  test("session-less sign-in page (pending client) also drops foreign scopes", async () => {
     const { db, cleanup } = await makeDb();
     try {
       const reg = registerClient(db, {
@@ -1268,7 +1344,7 @@ describe("handleAuthorizeGet — RFC 8707 resource binding drops foreign scopes 
       });
       expect(res.status).toBe(403);
       const html = await res.text();
-      expect(html).toContain("App not yet approved");
+      expect(html).toContain("Sign in to your hub to continue");
       // Foreign scopes absent from the rendered rows...
       expect(html).not.toContain("Send audio to Scribe for transcription.");
       expect(html).not.toContain("Post messages to your Agent.");
@@ -3893,7 +3969,7 @@ describe("DCR approval gate (#74)", () => {
     );
   }
 
-  test("authorize: pending client → 403 HTML 'App not yet approved'", async () => {
+  test("authorize: pending client, no session → 403 HTML 'Sign in to your hub to continue'", async () => {
     const { db, cleanup } = await makeDb();
     try {
       const reg = registerClient(db, {
@@ -3905,7 +3981,7 @@ describe("DCR approval gate (#74)", () => {
       });
       expect(res.status).toBe(403);
       const html = await res.text();
-      expect(html).toContain("App not yet approved");
+      expect(html).toContain("Sign in to your hub to continue");
       // /admin/approve-client/<id> deep link is the canonical recovery now
       // (the pre-rc.19 CLI message was retired in favor of the web path).
       expect(html).toContain(`/admin/approve-client/${encodeURIComponent(reg.client.clientId)}`);
@@ -3943,7 +4019,7 @@ describe("DCR approval gate (#74)", () => {
       const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
       expect(res.status).toBe(403);
       const html = await res.text();
-      expect(html).toContain("App not yet approved");
+      expect(html).toContain("Sign in to your hub to continue");
       // The vault hint surfaces as a labeled row in the approve-meta block.
       expect(html).toContain('approve-meta-label">vault');
       expect(html).toContain("boulder");
@@ -3977,7 +4053,7 @@ describe("DCR approval gate (#74)", () => {
       const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
       expect(res.status).toBe(403);
       const html = await res.text();
-      expect(html).toContain("App not yet approved");
+      expect(html).toContain("Sign in to your hub to continue");
       expect(html).not.toContain('approve-meta-label">vault');
     } finally {
       cleanup();
@@ -5806,11 +5882,11 @@ describe("inline approve button on pending /oauth/authorize (#208)", () => {
       const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
       expect(res.status).toBe(403);
       const html = await res.text();
-      expect(html).toContain("App not yet approved");
+      expect(html).toContain("Sign in to your hub to continue");
       // Primary CTA: Sign-in link wired to round-trip the operator back
       // to the original /oauth/authorize?... URL after login (resumes the
       // OAuth flow rather than dead-ending at the SPA approve page).
-      expect(html).toContain("Sign in as admin to approve");
+      expect(html).toContain('class="btn btn-primary approve-signin-cta"');
       const requestUrl = new URL(authorizePath);
       const returnTo = `${requestUrl.pathname}${requestUrl.search}`;
       const expectedLoginHref = `/login?next=${encodeURIComponent(returnTo)}`;
@@ -5879,6 +5955,7 @@ describe("inline approve button on pending /oauth/authorize (#208)", () => {
       expect(html).toContain("MyApp");
       // The inline approve FORM is gone from this path.
       expect(html).not.toContain('action="/oauth/authorize/approve"');
+      expect(html).not.toContain("Sign in to your hub to continue");
       expect(html).not.toContain("App not yet approved");
       // The pending client was auto-approved (consent IS the authorization).
       expect(getClient(db, reg.client.clientId)?.status).toBe("approved");
@@ -8935,7 +9012,7 @@ describe("handleAuthorizeGet — trust-by-client_name auto-approve (hub#409)", (
         loadServicesManifest: fixtureLoadServicesManifest,
       });
       expect(res.status).toBe(403);
-      expect(await res.text()).toContain("App not yet approved");
+      expect(await res.text()).toContain("Sign in to your hub to continue");
       expect(getClient(db, fresh.client.clientId)?.status).toBe("pending");
     } finally {
       cleanup();
@@ -10850,7 +10927,9 @@ describe("single OAuth consent + grantable vault admin + delegate-only cap (2026
       const res = handleAuthorizeGet(db, req, capDeps);
       expect(res.status).toBe(200);
       expect(res.headers.get("content-type")).toContain("text/html");
-      expect(await res.text()).not.toContain("App not yet approved");
+      const consentHtml = await res.text();
+      expect(consentHtml).not.toContain("Sign in to your hub to continue");
+      expect(consentHtml).not.toContain("App not yet approved");
       expect(getClient(db, reg.client.clientId)?.status).toBe("approved");
     } finally {
       cleanup();
@@ -10884,7 +10963,7 @@ describe("single OAuth consent + grantable vault admin + delegate-only cap (2026
       const unauth = handleAuthorizeGet(db, new Request(href), capDeps);
       expect(unauth.status).toBe(403);
       const unauthHtml = await unauth.text();
-      expect(unauthHtml).toContain("App not yet approved");
+      expect(unauthHtml).toContain("Sign in to your hub to continue");
       const u = new URL(href);
       const returnTo = `${u.pathname}${u.search}`;
       expect(unauthHtml).toContain(`/login?next=${encodeURIComponent(returnTo)}`);
