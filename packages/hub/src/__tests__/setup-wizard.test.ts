@@ -5216,6 +5216,13 @@ describe("setup reached from a sign-in returns to it", () => {
       "/oauth/authorize?x=1\nSet-Cookie: a=b",
       "/admin/setup?next=/x",
       "/admin/setup",
+      // The shared rule's catches (isSameOriginPath): dot segments, a tab, non-ASCII.
+      "/.//evil.example/x",
+      "/\t/evil.example/x",
+      "/caf\u00e9",
+      // The wizard's own on top: never itself (however spelled), and the length cap.
+      "/admin/./setup/vault",
+      `/oauth/authorize?state=${"a".repeat(1500)}`,
     ]) {
       expect(safeSetupReturn(bad)).toBeNull();
     }

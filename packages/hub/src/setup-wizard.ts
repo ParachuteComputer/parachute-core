@@ -40,6 +40,7 @@
  * the boot path; documented as an alternative on the welcome screen.
  */
 
+import { isSameOriginPath } from "./same-origin-path.ts";
 import type { Database } from "bun:sqlite";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -1030,20 +1031,16 @@ export function isPublicOrigin(origin: string, funnel = false): boolean {
  * Where setup was reached from, to go back to once it's done (T-476 re-walk: a person signing in from the Parachute
  * app on a hub with no admin was sent here, finished setup, and had no way back into the app's sign-in).
  *
- * A same-origin path only, the rule `/login` uses for its `next` (`safeNext`), and stricter: no `//`, no backslash
- * (browsers read `/\host` as `//host`), no control characters. Null when there's nothing safe to return to, so the
- * done page stays as it is. Never an absolute URL: no open redirect.
+ * The hub's one rule for redirect targets, `isSameOriginPath` (same-origin-path.ts, which `/login`'s `next` uses
+ * too), plus the wizard's own: at most 1500 characters, and never the wizard itself. Null when there's nothing safe to
+ * return to, so the done page stays as it is. Never another origin: no open redirect.
  */
 export function safeSetupReturn(raw: string | null | undefined): string | null {
   // Encoded into a cookie (up to 3x longer) that must stay under the browser's 4 KB; real sign-ins are ~1 KB.
-  if (!raw || raw.length > 1500) return null;
-  if (!raw.startsWith("/") || raw.startsWith("//") || raw.includes("\\")) return null;
-  for (let i = 0; i < raw.length; i++) {
-    const c = raw.charCodeAt(i);
-    if (c <= 0x1f || c === 0x7f) return null;
-  }
-  // Paths into the wizard itself would loop.
-  if (raw === "/admin/setup" || raw.startsWith("/admin/setup?") || raw.startsWith("/admin/setup/")) return null;
+  if (!raw || raw.length > 1500 || !isSameOriginPath(raw)) return null;
+  // Paths into the wizard itself would loop (checked on the path a browser would request).
+  const path = new URL(raw, "http://parachute.invalid").pathname;
+  if (path === "/admin/setup" || path.startsWith("/admin/setup/")) return null;
   return raw;
 }
 
