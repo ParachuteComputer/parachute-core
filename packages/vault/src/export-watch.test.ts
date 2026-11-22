@@ -496,6 +496,26 @@ describe("runGitCommitCycle", () => {
     expect(seen).toEqual(["first start", "other repo", "first end", "second"]);
   });
 
+  test("a commit cycle waits for the repo's lock (so two cycles never run git over each other)", async () => {
+    fs.writeFileSync(path.join(dir, "Inbox.md"), "# Inbox\n");
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const held = withRepoLock(dir, () => gate);
+    const cycle = runGitCommitCycle({
+      repoDir: dir,
+      template: DEFAULT_COMMIT_TEMPLATE,
+      notesChanged: 1,
+      vaultName: "default",
+      firstNoteTitle: "Inbox",
+      push: false,
+    });
+    await new Promise((r) => setTimeout(r, 300));
+    expect(gitLastCommitMessage(dir)).toBe("initial");      // nothing ran while the lock was held
+    release();
+    await held;
+    expect((await cycle).committed).toBe(true);
+  });
+
   test("skips commit when nothing is staged", async () => {
     // No new files since the seed commit.
     const result = await runGitCommitCycle({

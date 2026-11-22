@@ -129,7 +129,12 @@ const repoChains = new Map<string, Promise<unknown>>();
  * commands must not, or one would clear or trip over the other's index.lock.
  */
 export async function withRepoLock<T>(repoDir: string, fn: () => Promise<T>): Promise<T> {
-  const key = path.resolve(repoDir);
+  let key = path.resolve(repoDir);
+  try {
+    key = fs.realpathSync(repoDir); // one repo, however it is spelled
+  } catch {
+    // not there yet: the resolved path
+  }
   const prev = repoChains.get(key) ?? Promise.resolve();
   const run = prev.then(fn, fn);
   const tail = run.then(
