@@ -13,8 +13,9 @@ back a key held to types stops working; it never reaches more.
 **Keys for an AI, held to some types of a vault.**
 - `POST /account/keys` takes `types` (one vault, read or write) and `kind: "agent"`. The vault keeps the grant and
   checks it on every request (REST, MCP, `/view`, the socket); an ended or unknown grant is `401 grant_ended` on the
-  next request. The key list and the write stamp say an AI wrote it (#140).
-- A vault admin key that is narrowed in any way is refused admin; a mint that fails ends the grant it filed (#143).
+  next request. The key list and the write stamp say an AI wrote it (#140, #144).
+- A vault admin credential that is narrowed in any way (to tags, types or a permission the hub doesn't know) can't list
+  or end who reaches the vault; a mint that fails ends the grant it filed (#143).
 
 **Sharing a vault with a person.**
 - The owner invites someone to one vault by name (`invite-to-vault`, `take-back-invite`): a link that works once,
@@ -23,19 +24,21 @@ back a key held to types stops working; it never reaches more.
 - One list of who reaches a vault: each person is one row, their sign-ins folded in; ending the row ends the
   membership and every credential of theirs for that vault (#144).
 - Taking a member's vault away, or lowering their role, stops their apps at once: the tokens above what they still
-  hold are revoked with their refresh tokens and the consent is narrowed (#130).
+  hold are revoked with their refresh tokens and the consent is narrowed. The 401 for a revoked key carries the
+  vault's CORS headers, so a browser app reads "revoked" rather than a network error (#130).
 - Revoking a token at `/oauth/revoke` ends the consent behind it, so the app asks again before it gets that scope
   back (#131).
 
 **The sign-in screen.**
 - The consent page grants only what is left ticked. Its boxes sat outside the form, so unticking a scope (admin for
-  an AI's connector, say) still granted it (#138, security).
+  an AI's connector, say) still granted it (#138, security). This holds for new approvals only: a connector approved
+  before this release may hold a scope you unticked. End it in the vault's list and connect again.
 
 **Write access does more without an admin key.**
 - Write may add a new type, and add fields to a type it made, over MCP (#134) and over REST, `PUT /api/types/<name>`
   (#139). Everything else about types stays admin.
 - Write may list a vault's deleted records (`GET /history/deleted`), and a record put back from deletion counts as
-  changed now, so syncs and Changes see it return (#135).
+  changed now, so syncs and Changes see it return. It comes back without its tags and type (#135).
 
 **Upgrading a box taken over from 0.7.**
 - The takeover fences off the old units it pauses (a systemd drop-in that refuses every start), and core's `serve`
