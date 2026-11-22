@@ -255,6 +255,15 @@ export const FIRST_VAULT_SHORT: CuratedModuleShort = "vault";
  * a malformed file — we swallow that and fall through to "still ask"
  * rather than crashing the wizard GET).
  */
+/** Whether the live exposure is Tailscale Funnel; false when none is live or the file is unreadable. */
+function liveFunnel(read: () => ExposeState | undefined): boolean {
+  try {
+    return read()?.funnel === true;
+  } catch {
+    return false;
+  }
+}
+
 function exposeModeFromLiveState(read: () => ExposeState | undefined): SetupExposeMode | undefined {
   let state: ExposeState | undefined;
   try {
@@ -980,14 +989,40 @@ export function hubLocalTarget(issuer: string, loopbackPort?: number): string {
   return "http://127.0.0.1:1939";
 }
 
-/** True when the hub's origin is a loopback address: it works on this computer only, and no outside service reaches it. */
-function isLoopbackOrigin(origin: string): boolean {
+/**
+ * True when the hub's origin is on this computer only (loopback, all of 127/8). Kept apart from
+ * `vault-hub-origin-env.ts`'s `isLoopbackOrigin`, which decides what gets persisted to vault/.env and so must not
+ * widen with this.
+ */
+function isThisComputerOrigin(origin: string): boolean {
   try {
     const host = new URL(origin).hostname.replace(/^\[|\]$/g, "");
-    return host === "localhost" || host === "::1" || /^127\./.test(host);
+    return host === "localhost" || host === "::1" || host === "0.0.0.0" || /^127\./.test(host);
   } catch {
     return false;
   }
+}
+
+/**
+ * True when the internet can reach the hub's origin, so Claude's apps (which connect from Anthropic's side) can:
+ * https, and not this computer, a private or carrier-NAT range, a `.local` name, or a tailnet name, unless that tailnet
+ * name is served through Tailscale Funnel (`funnel`).
+ */
+export function isPublicOrigin(origin: string, funnel = false): boolean {
+  let u: URL;
+  try {
+    u = new URL(origin);
+  } catch {
+    return false;
+  }
+  const host = u.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  if (u.protocol !== "https:" || isThisComputerOrigin(origin)) return false;
+  if (/^10\./.test(host) || /^192\.168\./.test(host) || /^172\.(1[6-9]|2\d|3[01])\./.test(host)) return false;
+  if (/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(host)) return false;
+  if (host.endsWith(".local")) return false;
+  if (host.includes(":") && (/^f[cd]/.test(host) || host.startsWith("fe80:"))) return false;
+  if (host.endsWith(".ts.net")) return funnel;
+  return true;
 }
 
 /** The tailscale command that puts the hub on the person's tailnet. */
@@ -1122,16 +1157,19 @@ export interface RenderDoneStepProps {
   installTiles?: readonly ModuleInstallTileState[];
   /** Where the hub listens on this machine (`hubLocalTarget`), for the tailscale command. */
   localTarget?: string;
+  /** The live exposure is Tailscale Funnel: a `*.ts.net` origin is then public (`isPublicOrigin`). */
+  funnel?: boolean;
 }
 
 export function renderDoneStep(props: RenderDoneStepProps): string {
   const { vaultName, hubOrigin, exposeMode, installTiles } = props;
   const localTarget = props.localTarget ?? hubLocalTarget(hubOrigin);
-  const reachable = exposeMode ? renderReachableTile(exposeMode, hubOrigin, localTarget) : "";
+  const funnel = props.funnel === true;
+  const reachable = exposeMode ? renderReachableTile(exposeMode, hubOrigin, localTarget, funnel) : "";
   const mcpTile = renderMcpTile(vaultName, hubOrigin);
   const tiles = installTiles && installTiles.length > 0 ? installTiles : [];
   const installSection = tiles.length > 0 ? renderInstallTiles(tiles) : "";
-  const startTile = renderStartUsingTile(hubOrigin, exposeMode);
+  const startTile = renderStartUsingTile(hubOrigin, exposeMode, funnel);
   // An install op in flight refreshes the page; keep the developer fold open so its progress stays in view.
   const anyOp = tiles.some((t) => t.operation !== undefined);
   // T-476 (three first-run walkers): the page leads with the two things a person does next, the Parachute app and
@@ -1232,13 +1270,13 @@ function renderMcpTile(vaultName: string, hubOrigin: string): string {
  * Then one line, by expose mode: Claude on the web connects from the internet, so it needs a public address; on
  * tailnet, the phone uses the tailnet address. The reachable tile below says where the address works.
  */
-function renderStartUsingTile(hubOrigin: string, exposeMode?: SetupExposeMode): string {
+function renderStartUsingTile(hubOrigin: string, exposeMode?: SetupExposeMode, funnel = false): string {
   const origin = hubOrigin.replace(/\/+$/, "");
   const mcpUrl = `${origin}/mcp`;
-  const loopback = isLoopbackOrigin(origin);
-  // Claude's apps (web, desktop, phone) reach a custom connector from the internet: a loopback or tailnet address
-  // isn't reachable for them. Claude Code on this computer is.
-  const public_ = exposeMode === "public" && !loopback;
+  const loopback = isThisComputerOrigin(origin);
+  // Claude's apps (web, desktop, phone) reach a custom connector from the internet: a loopback, private or tailnet
+  // address isn't reachable for them. Claude Code on this computer is.
+  const public_ = exposeMode === "public" && isPublicOrigin(origin, funnel);
   const phone =
     loopback && exposeMode === "tailnet"
       ? `<br />On your phone, use your tailnet address once it's set up (below).`
@@ -1443,10 +1481,10 @@ const INSTALL_TILE_CSRF_PLACEHOLDER = "__INSTALL_TILE_CSRF__";
  * where the hub listens on this machine (`localTarget`), not 1939 by
  * assumption (T-476: a hub on another port got a command for :1939).
  */
-function renderReachableTile(mode: SetupExposeMode, hubOrigin: string, localTarget: string): string {
+function renderReachableTile(mode: SetupExposeMode, hubOrigin: string, localTarget: string, funnel = false): string {
   const safeOrigin = escapeHtml(hubOrigin);
   const cmd = escapeHtml(tailscaleCommand(localTarget));
-  const loopback = isLoopbackOrigin(hubOrigin);
+  const loopback = isThisComputerOrigin(hubOrigin);
   if (mode === "localhost") {
     return `<section class="reachable">
       <h2>Your hub is reachable at</h2>
@@ -1476,7 +1514,7 @@ function renderReachableTile(mode: SetupExposeMode, hubOrigin: string, localTarg
     </section>`;
   }
   // public
-  if (!loopback) {
+  if (isPublicOrigin(hubOrigin, funnel)) {
     return `<section class="reachable">
       <h2>Your hub is reachable at</h2>
       <p class="reachable-url"><code>${safeOrigin}</code></p>
@@ -1719,6 +1757,7 @@ export function handleSetupGet(req: Request, deps: SetupWizardDeps): Response {
         hubOrigin: deps.issuer.replace(/\/+$/, ""),
         installTiles,
         localTarget: hubLocalTarget(deps.issuer, deps.loopbackPort),
+        funnel: liveFunnel(deps.readExposeStateFn ?? readExposeState),
       };
       if (exposeMode !== undefined) doneProps.exposeMode = exposeMode;
       // No `doneProps.mintedToken` — see the OAuth-default note above.
@@ -3290,6 +3329,7 @@ const STYLES = `
     align-items: center;
     justify-content: center;
   }
+  .btn[hidden] { display: none; }
   .btn-primary {
     background: ${PALETTE.accent};
     color: ${PALETTE.cardBg};

@@ -40,6 +40,7 @@ import {
   deriveWizardState,
   detectAutoExposeMode,
   hubLocalTarget,
+  isPublicOrigin,
   handleSetupAccountPost,
   handleSetupExposePost,
   handleSetupGet,
@@ -4175,6 +4176,13 @@ describe("done screen — the lead tile: the Parachute app and your AI (T-476)",
     expect(html).toContain("tailscale serve --bg --https=1939 http://127.0.0.1:1939");
   });
 
+  test("public mode on an address the internet can't reach: no 'From anywhere', and Claude's line keeps the condition", async () => {
+    const html = await donePage("http://192.168.1.5:1939", [], "public", 1939);
+    expect(html).not.toContain("From anywhere.");
+    expect(html).toContain("Claude's apps connect from the internet, so they need a public address");
+    expect(html).toContain("PARACHUTE_HUB_ORIGIN");
+  });
+
   test("a public hub: Claude's connector steps with no 'needs a public address'", async () => {
     const html = await donePage("https://hub.example", [], "public", 1939);
     expect(html).toContain("In Claude: Customize → Connectors → Add custom connector.");
@@ -5118,5 +5126,33 @@ describe("hubLocalTarget", () => {
   test("else 1939, never a public or tailnet issuer", () => {
     expect(hubLocalTarget("https://my-mac.tailnet.ts.net")).toBe("http://127.0.0.1:1939");
     expect(hubLocalTarget("https://hub.example:8443")).toBe("http://127.0.0.1:1939");
+  });
+});
+
+// Review (T-476): Claude's apps connect from the internet; the done page tells a person their address works for them
+// only when it really is public.
+describe("isPublicOrigin", () => {
+  test("an https domain is public", () => {
+    expect(isPublicOrigin("https://hub.example")).toBe(true);
+    expect(isPublicOrigin("https://fdroid.example")).toBe(true);
+  });
+  test("http, this computer, private and carrier-NAT ranges, .local and IPv6 private are not", () => {
+    for (const o of [
+      "http://hub.example",
+      "https://127.0.0.1:1939",
+      "https://localhost",
+      "https://10.0.0.5",
+      "https://172.20.1.1",
+      "https://192.168.1.5:1939",
+      "https://100.101.102.103",
+      "https://my-mac.local",
+      "https://[fd00::1]",
+    ]) {
+      expect(isPublicOrigin(o)).toBe(false);
+    }
+  });
+  test("a tailnet name is public only through Funnel", () => {
+    expect(isPublicOrigin("https://my-mac.tailnet-name.ts.net")).toBe(false);
+    expect(isPublicOrigin("https://my-mac.tailnet-name.ts.net", true)).toBe(true);
   });
 });
