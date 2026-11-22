@@ -66,6 +66,7 @@ owner gives an AI a key held to some types, and sees and ends everything that re
 | S7 | **History under a grant:** §4.1's rule applied as written. No version records its types until core #114/#115, so a grant sees no history for now. | §4.1 |
 | S8 | **The two bearer-only routes answer any origin** (`*`, never credentials): they read no cookie. | new |
 | S9 | **Still open from this slice:** a token revoked another way (`/api/auth/revoke-token`, the CLI, admin pages) is refused by the hub at once and by the vault within its revocation list's minute, but the vault's grant row isn't marked ended. One helper should end it wherever a typed key is revoked. | follow-up |
+| S10 | **A member is one row** of the list (T-476, one list): id `person:<their key>` (a key's name holds no colon, so the two never meet), `kind: "person"`, `by: "self"`, `grantee` their key, the name they were invited by. Their sign-ins (apps they signed in with by OAuth) are in their row, not beside it (§5.1: one key is one member); a key or token they made is a row of its own naming them (`person: {id, name}`; §5.2 keeps their agents their own rows). `DELETE …/statements/person:<their key>` ends the membership as `revoke-access` does, every credential of theirs naming the vault with it. | new |
 
 **Decided 11-13: A, the freeze.** Fixed for good: the five event numbers (37440 grant, 7440 revoke, 37441 link, 37442
 claim, 37443 the vault's own record); §2.1's grant layout (the meaning in canonical JSON content, the grant frame

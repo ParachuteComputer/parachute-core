@@ -7,8 +7,13 @@
  *   POST   /account/vaults/<v>/statements        → 405 (signed statements are a later slice)
  *
  * Every credential that reaches the vault is a key (keys.ts), so every one is a row: a named key, an AI or app
- * connected by OAuth, this app on each device. Each row is a **door grant** (§7.3), the door's word that the signed-in
- * owner agreed, in §7.1's row shape: `{id, origin: "door", state, signer: null, grantee: null, by: "signer", types,
+ * connected by OAuth, this app on each device. A person the vault is shared with (a member, `user_vaults`; spec §5.1)
+ * is one row of their own (one list, T-476): id `person:<their key>`, `by: "self"`, `grantee` their key, named as they
+ * were invited; their sign-ins (an app they signed in with, by OAuth) are in their row, never beside it, and a key or
+ * token they made (for an AI, an app, a script) is a row of its own naming them (`person: {id, name}`). Ending their row ends the
+ * membership as `revoke-access` does (users.ts removeUserVault): every credential of theirs naming the vault, a key of
+ * theirs that also reaches another vault included, and any way back in. Each row is a **door grant** (§7.3), the
+ * door's word that the signed-in owner agreed, in §7.1's row shape: `{id, origin: "door", state, signer: null, grantee: null, by: "signer", types,
  * deny: [], expires_at, event: null}`, with what a person needs to know it by: `name`, `kind` (person, agent, app,
  * service), `app` and `client` (the OAuth app's own name and client id, when it was one), `created_at`, `last_used_at`, and `admin`/`export` for
  * the two levels that aren't a grant of types.
@@ -19,13 +24,17 @@
  *
  * Who may: the owner (`parachute:host:admin`: the hub's own account token, or the operator), or a whole-vault admin
  * credential for that vault (`vault:<v>:admin` with no narrowing of its own), which is what an app holds when its person
- * manages the vault from it. An admin credential for one vault ends only keys that reach that vault alone.
+ * manages the vault from it. An admin credential for one vault ends only keys that reach that vault alone; a person's
+ * membership it ends as revoke-access does (above).
  */
 import type { Database } from "bun:sqlite";
 import { type AdminAuthContext } from "./admin-auth.ts";
 import { HOST_ADMIN_SCOPE } from "./admin-vaults.ts";
 import { revokeTokenByJti, signAccessToken, validateAccessToken } from "./jwt-sign.ts";
 import { listKeys, type KeyView } from "./keys.ts";
+import { nameOnVault } from "./share-invites.ts";
+import { primaryPubkeyForUser } from "./pubkey-links.ts";
+import { isHubAdmin, removeUserVault, vaultVerbsForRole } from "./users.ts";
 
 export const GRANT_VERBS_READ = ["read"] as const;
 /** Permission keys that say who a write is for or which key signed, and narrow nothing a credential reaches. */
@@ -115,32 +124,111 @@ function appsOf(db: Database): Map<string, { client: string; name: string | null
   }
 }
 
-/** Every key that reaches `vault`, as grant rows. */
+/** A person the vault is shared with: their hub user, their role there, since when, and their key (the first linked). */
+interface Member {
+  user: string;
+  role: string;
+  since: string;
+  pubkey: string | null;
+}
+
+/** The people `vault` is shared with (`user_vaults`), the hub's admins aside (they reach every vault by construction). */
+function membersOf(db: Database, vault: string): Member[] {
+  const rows = db
+    .prepare("SELECT uv.user_id AS user, uv.role AS role, uv.created_at AS since FROM user_vaults uv WHERE uv.vault_name = ? ORDER BY uv.created_at, uv.user_id")
+    .all(vault) as Omit<Member, "pubkey">[];
+  return rows.filter((m) => !isHubAdmin(db, m.user)).map((m) => ({ ...m, pubkey: primaryPubkeyForUser(db, m.user) }));
+}
+
+/** A person's name on this vault: the one they were invited by, else their name on the hub, else their username. */
+function personName(db: Database, user: string, vault: string): string {
+  return nameOnVault(db, user, vault) ?? (db.prepare("SELECT username FROM users WHERE id = ?").get(user) as { username: string } | null)?.username ?? user;
+}
+
+/** A member's row's id: `person:` and their key (one key is one member, spec §5.1), else their hub user id. A key's
+ *  name holds no colon (a given one: keys.ts KEY_NAME_RE; a made-up one: keys.ts baseName), so no key is ever
+ *  mistaken for a person. */
+const memberId = (m: Member) => `person:${m.pubkey ?? m.user}`;
+
+/** A sign-in of a person's: an app they signed in to the vault with, by OAuth (their Parachute on each device). It is
+ *  theirs, shown in their row. Anything they made on purpose (a key for an AI or an app, a token minted for a script)
+ *  is a row of its own, named as theirs, so the owner sees it and can end it alone. */
+const signIn = (k: KeyView) => k.owner_kind === "app" && k.created_via !== "app_key";
+
+/** Every credential that reaches `vault`, as grant rows: each key, and each person it is shared with (their sign-ins
+ *  in their row; a key they made, a row of its own that names them). */
 export function vaultGrantRows(db: Database, vault: string, now: Date = new Date()) {
   const jtis = new Map((db.prepare("SELECT name, jti FROM keys").all() as { name: string; jti: string }[]).map((r) => [r.name, r.jti]));
   const apps = appsOf(db);
-  return listKeys(db, now)
-    .filter((k) => levelIn(k, vault) !== undefined)
-    .map((k) => ({
-      id: k.name,
+  const members = membersOf(db, vault);
+  const member = new Map(members.map((m) => [m.user, m]));
+  const reaching = listKeys(db, now).filter((k) => levelIn(k, vault) !== undefined);
+  // whose a key is, when it is a person's other than the hub's owner: a member's (their row's id), or someone's who no
+  // longer is one (null), by the name they have on this vault
+  const names = new Map<string, string>();
+  const personOf = (k: KeyView) => {
+    if (k.owner === null || k.owner_kind === "service" || isHubAdmin(db, k.owner)) return null;
+    if (!names.has(k.owner)) names.set(k.owner, personName(db, k.owner, vault));
+    const m = member.get(k.owner);
+    return { id: m ? memberId(m) : null, name: names.get(k.owner)! };
+  };
+  const keys = reaching
+    .filter((k) => !(k.owner !== null && member.has(k.owner) && signIn(k)))
+    .map((k) => {
+      const person = personOf(k);
+      return {
+        id: k.name,
+        origin: "door" as const,
+        state: k.status === "active" ? "in_force" : k.status,
+        signer: null,
+        grantee: null as string | null,
+        by: "signer" as "signer" | "self",
+        types: grantTypes(k, vault),
+        deny: k.denies ?? [],
+        expires_at: k.expires_at,
+        event: null,
+        name: k.name as string,
+        kind: k.owner_kind,
+        app: apps.get(jtis.get(k.name) ?? "")?.name ?? null,
+        client: apps.get(jtis.get(k.name) ?? "")?.client ?? null,
+        ...(levelIn(k, vault) === "admin" ? { admin: true } : {}),
+        ...(levelIn(k, vault) === "export" ? { export: true } : {}),
+        ...(person ? { person } : {}),
+        created_at: k.created_at,
+        last_used_at: k.last_used_at,
+      };
+    });
+  const people = members.map((m) => {
+    // when they last used the vault: the latest of their sign-ins that reach it
+    const used = reaching
+      .filter((k) => k.owner === m.user && signIn(k) && k.last_used_at)
+      .map((k) => k.last_used_at!)
+      .sort()
+      .at(-1) ?? null;
+    const verbs = vaultVerbsForRole(m.role);
+    return {
+      id: memberId(m),
       origin: "door" as const,
-      state: k.status === "active" ? "in_force" : k.status,
+      state: "in_force",
       signer: null,
-      grantee: null,
-      by: "signer" as const,
-      types: grantTypes(k, vault),
-      deny: k.denies ?? [],
-      expires_at: k.expires_at,
+      grantee: m.pubkey,
+      by: "self" as const,
+      types: verbs.includes("write") ? { "*": [...GRANT_VERBS_WRITE] } : verbs.includes("read") ? { "*": [...GRANT_VERBS_READ] } : {},
+      deny: [],
+      expires_at: null,
       event: null,
-      name: k.name,
-      kind: k.owner_kind,
-      app: apps.get(jtis.get(k.name) ?? "")?.name ?? null,
-      client: apps.get(jtis.get(k.name) ?? "")?.client ?? null,
-      ...(levelIn(k, vault) === "admin" ? { admin: true } : {}),
-      ...(levelIn(k, vault) === "export" ? { export: true } : {}),
-      created_at: k.created_at,
-      last_used_at: k.last_used_at,
-    }));
+      name: personName(db, m.user, vault),
+      kind: "person" as const,
+      app: null,
+      client: null,
+      // `write` runs the vault with its owner (grant-access.ts): it may let others in
+      ...(verbs.includes("admin") ? { admin: true } : {}),
+      member: { role: m.role },
+      created_at: m.since,
+      last_used_at: used,
+    };
+  });
+  return [...keys, ...people];
 }
 
 /** A short admin credential for the hub's own call to one vault (as admin-vault-api.ts makes for its session). */
@@ -198,6 +286,18 @@ export async function routeVaultGrants(req: Request, pathname: string, deps: Vau
 }
 
 async function endVaultGrant(deps: VaultGrantsDeps, gate: Gate, vault: string, id: string, now: Date): Promise<Response> {
+  // a person the vault is shared with: their membership ends, with every credential of theirs for the vault (users.ts
+  // removeUserVault, as revoke-access), so no sign-in of theirs comes back; a key of theirs held to types also loses its
+  // grant at the vault now
+  const member = membersOf(deps.db, vault).find((m) => memberId(m) === id);
+  if (member) {
+    const typed = listKeys(deps.db, now).filter((k) => k.owner === member.user && k.types?.length && levelIn(k, vault) !== undefined);
+    if (removeUserVault(deps.db, member.user, vault, () => now)) {
+      console.log(`vault access revoked: vault=${vault} subject_pubkey=${member.pubkey ?? ""} subject_user_id=${member.user} actor_user_id=${gate.ctx.sub} via=statements`);
+    }
+    for (const k of typed) await endFiledGrant(deps, gate.ctx.sub, vault, k.name);
+    return json(200, { id, state: "revoked", revoked_at: now.toISOString() });
+  }
   const key = listKeys(deps.db, now).find((k) => k.name === id && levelIn(k, vault) !== undefined);
   if (!key) return err(404, "not_found", `nothing called "${id}" reaches ${vault}`);
   // a vault's admin ends only what reaches that vault and nothing else: every scope of it one this vault's admin could

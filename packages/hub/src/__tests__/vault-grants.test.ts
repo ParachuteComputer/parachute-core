@@ -11,8 +11,8 @@ import { join } from "node:path";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { signAccessToken } from "../jwt-sign.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
-import { createUser } from "../users.ts";
-import { ownerOrVaultAdmin } from "../vault-grants.ts";
+import { createUser, upsertUserVault } from "../users.ts";
+import { ownerOrVaultAdmin, routeVaultGrants } from "../vault-grants.ts";
 import { routeAccountKeys } from "../account-keys.ts";
 import { writeFileSync } from "node:fs";
 
@@ -87,5 +87,36 @@ describe("a mint that doesn't finish", () => {
     const r = await mint();
     expect(r!.status).toBe(409);
     expect(calls).toEqual(["PUT /vault/kitchen/api/grants/claude", "DELETE /vault/kitchen/api/grants/claude"]);
+  });
+});
+
+describe("ending a person the vault is shared with", () => {
+  test("ends the vault's grant for a key of theirs held to types, not only the key", async () => {
+    // the vault, stood in for: takes each filing, and records each call
+    const manifestPath = join(dir, "services.json");
+    writeFileSync(manifestPath, JSON.stringify({ services: [{ name: "parachute-vault", port: 4101, paths: ["/vault/kitchen"], health: "/health", version: "0.9.0" }] }));
+    const calls: string[] = [];
+    const forward = async (req: Request) => {
+      calls.push(`${req.method} ${new URL(req.url).pathname}`);
+      return new Response("{}", { status: req.method === "PUT" ? 201 : 200 });
+    };
+    // Wes runs kitchen with its owner (`write`), and makes a key held to recipes with his own admin credential
+    const wes = (await createUser(db, "wes", "a-long-made-up-password", { allowMulti: true })).id;
+    upsertUserVault(db, wes, "kitchen", "write");
+    const his = await signAccessToken(db, { sub: wes, scopes: ["vault:kitchen:admin"], audience: "vault.kitchen", clientId: "test", issuer: ISSUER, ttlSeconds: 600, vaultScope: ["kitchen"] });
+    const made = await routeAccountKeys(new Request(`${ISSUER}/account/keys`, { method: "POST", headers: { authorization: `Bearer ${his.token}`, "content-type": "application/json" },
+      body: JSON.stringify({ name: "wes-ai", vault: "kitchen", can: "write", types: ["recipe"], kind: "agent" }) }), "/account/keys", { db, issuer: ISSUER, manifestPath, forward });
+    expect(made!.status).toBe(201);
+    const owner = await signAccessToken(db, { sub, scopes: ["parachute:host:admin"], audience: "account", clientId: "test", issuer: ISSUER, ttlSeconds: 600 });
+    const deps = { db, issuer: ISSUER, forward };
+    const list = await routeVaultGrants(new Request(`${ISSUER}/account/vaults/kitchen/statements`, { headers: { authorization: `Bearer ${owner.token}` } }), "/account/vaults/kitchen/statements", deps);
+    const rows = ((await list!.json()) as { grants: { id: string; person?: { id: string | null } }[] }).grants;
+    // his key is a row of its own, naming him
+    expect(rows.find((r) => r.id === "wes-ai")?.person?.id).toBe(`person:${wes}`);
+    calls.length = 0;
+    const path = `/account/vaults/kitchen/statements/${encodeURIComponent(`person:${wes}`)}`;
+    const ended = await routeVaultGrants(new Request(`${ISSUER}${path}`, { method: "DELETE", headers: { authorization: `Bearer ${owner.token}` } }), path, deps);
+    expect(ended!.status).toBe(200);
+    expect(calls).toEqual(["DELETE /vault/kitchen/api/grants/wes-ai"]);
   });
 });
