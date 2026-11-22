@@ -76,6 +76,7 @@ import {
   openFirstClientAutoApproveWindow,
   setSetting,
 } from "./hub-settings.ts";
+import { PARACHUTE_APP_NAMES, getClient } from "./clients.ts";
 import { signAccessToken } from "./jwt-sign.ts";
 import {
   assignedVaultClaudeMcpAddCommand,
@@ -1025,6 +1026,62 @@ export function isPublicOrigin(origin: string, funnel = false): boolean {
   return true;
 }
 
+/**
+ * Where setup was reached from, to go back to once it's done (T-476 re-walk: a person signing in from the Parachute
+ * app on a hub with no admin was sent here, finished setup, and had no way back into the app's sign-in).
+ *
+ * A same-origin path only, the rule `/login` uses for its `next` (`safeNext`), and stricter: no `//`, no backslash
+ * (browsers read `/\host` as `//host`), no control characters. Null when there's nothing safe to return to, so the
+ * done page stays as it is. Never an absolute URL: no open redirect.
+ */
+export function safeSetupReturn(raw: string | null | undefined): string | null {
+  if (!raw || raw.length > 4096) return null;
+  if (!raw.startsWith("/") || raw.startsWith("//") || raw.includes("\\")) return null;
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw.charCodeAt(i);
+    if (c <= 0x1f || c === 0x7f) return null;
+  }
+  // Paths into the wizard itself would loop.
+  if (raw === "/admin/setup" || raw.startsWith("/admin/setup?") || raw.startsWith("/admin/setup/")) return null;
+  return raw;
+}
+
+/** The cookie that carries the return through the wizard's steps (account, vault, expose), on this browser only. */
+export const SETUP_RETURN_COOKIE = "parachute_setup_return";
+
+function setupReturnCookie(path: string, req: Request): string {
+  const parts = [`${SETUP_RETURN_COOKIE}=${encodeURIComponent(path)}`, "HttpOnly"];
+  if (isHttpsRequest(req)) parts.push("Secure");
+  parts.push("SameSite=Lax", "Path=/admin/setup", "Max-Age=3600");
+  return parts.join("; ");
+}
+
+function readSetupReturn(req: Request): string | null {
+  for (const part of (req.headers.get("cookie") ?? "").split(";")) {
+    const [name, ...rest] = part.trim().split("=");
+    if (name !== SETUP_RETURN_COOKIE) continue;
+    try {
+      return safeSetupReturn(decodeURIComponent(rest.join("=")));
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
+ * The words on the done page's return button: the Parachute app by name when the return is its sign-in, another
+ * app's name when it's theirs, else a plain "where you were".
+ */
+function setupReturnLabel(returnTo: string, db: Database): string {
+  if (!returnTo.startsWith("/oauth/authorize?")) return "Continue where you were";
+  const clientId = new URLSearchParams(returnTo.slice("/oauth/authorize?".length)).get("client_id");
+  const name = clientId ? getClient(db, clientId)?.clientName : null;
+  if (!name) return "Continue signing in";
+  if (PARACHUTE_APP_NAMES.has(name)) return "Continue to the Parachute app";
+  return `Continue to ${name}`;
+}
+
 /** The tailscale command that puts the hub on the person's tailnet. */
 function tailscaleCommand(localTarget: string): string {
   return `tailscale serve --bg --https=1939 ${localTarget}`;
@@ -1159,6 +1216,11 @@ export interface RenderDoneStepProps {
   localTarget?: string;
   /** The live exposure is Tailscale Funnel: a `*.ts.net` origin is then public (`isPublicOrigin`). */
   funnel?: boolean;
+  /**
+   * Where setup was reached from (`safeSetupReturn`), e.g. the Parachute app's `/oauth/authorize?…` sign-in. When
+   * set, the first step is a button back there instead of "Open the Parachute app".
+   */
+  returnTo?: { path: string; label: string };
 }
 
 export function renderDoneStep(props: RenderDoneStepProps): string {
@@ -1169,7 +1231,7 @@ export function renderDoneStep(props: RenderDoneStepProps): string {
   const mcpTile = renderMcpTile(vaultName, hubOrigin);
   const tiles = installTiles && installTiles.length > 0 ? installTiles : [];
   const installSection = tiles.length > 0 ? renderInstallTiles(tiles) : "";
-  const startTile = renderStartUsingTile(hubOrigin, exposeMode, funnel);
+  const startTile = renderStartUsingTile(hubOrigin, exposeMode, funnel, props.returnTo);
   // An install op in flight refreshes the page; keep the developer fold open so its progress stays in view.
   const anyOp = tiles.some((t) => t.operation !== undefined);
   // T-476 (three first-run walkers): the page leads with the two things a person does next, the Parachute app and
@@ -1270,7 +1332,12 @@ function renderMcpTile(vaultName: string, hubOrigin: string): string {
  * Then one line, by expose mode: Claude on the web connects from the internet, so it needs a public address; on
  * tailnet, the phone uses the tailnet address. The reachable tile below says where the address works.
  */
-function renderStartUsingTile(hubOrigin: string, exposeMode?: SetupExposeMode, funnel = false): string {
+function renderStartUsingTile(
+  hubOrigin: string,
+  exposeMode?: SetupExposeMode,
+  funnel = false,
+  returnTo?: { path: string; label: string },
+): string {
   const origin = hubOrigin.replace(/\/+$/, "");
   const mcpUrl = `${origin}/mcp`;
   const loopback = isThisComputerOrigin(origin);
@@ -1288,8 +1355,14 @@ function renderStartUsingTile(hubOrigin: string, exposeMode?: SetupExposeMode, f
   return `<section class="start-using" data-testid="start-using-tile">
     <h2>Start using Parachute</h2>
     <ol>
-      <li><strong>Open the Parachute app</strong> and sign in with
-        <code data-testid="app-address">${escapeHtml(origin)}</code>.${phone}</li>
+      ${
+        returnTo
+          ? `<li><a class="btn btn-primary" data-testid="continue-return" href="${escapeAttr(returnTo.path)}">${escapeHtml(returnTo.label)}</a>
+        <br />It finishes the sign-in you started, at
+        <code data-testid="app-address">${escapeHtml(origin)}</code>.${phone}</li>`
+          : `<li><strong>Open the Parachute app</strong> and sign in with
+        <code data-testid="app-address">${escapeHtml(origin)}</code>.${phone}</li>`
+      }
       <li><strong>Connect your AI:</strong> give it
         <code data-testid="mcp-url">${escapeHtml(mcpUrl)}</code>
         <button type="button" class="btn btn-secondary" id="copy-mcp-url" data-copy="${escapeAttr(mcpUrl)}" hidden>Copy</button>${claude}</li>
@@ -1545,6 +1618,15 @@ function renderReachableTile(mode: SetupExposeMode, hubOrigin: string, localTarg
  * is already "complete."
  */
 export function handleSetupGet(req: Request, deps: SetupWizardDeps): Response {
+  const res = renderSetupGet(req, deps);
+  // `/admin/setup?next=<path>` (the first-boot `/login` funnel carries the sign-in's `next` here): remember it for
+  // the done page, on this browser, through every step. Only a safe same-origin path (`safeSetupReturn`).
+  const returnPath = safeSetupReturn(new URL(req.url).searchParams.get("next"));
+  if (returnPath && !wantsJsonResponse(req)) res.headers.append("set-cookie", setupReturnCookie(returnPath, req));
+  return res;
+}
+
+function renderSetupGet(req: Request, deps: SetupWizardDeps): Response {
   const url = new URL(req.url);
   const state = deriveWizardState(deps);
   const csrf = ensureCsrfToken(req);
@@ -1759,6 +1841,9 @@ export function handleSetupGet(req: Request, deps: SetupWizardDeps): Response {
         localTarget: hubLocalTarget(deps.issuer, deps.loopbackPort),
         funnel: liveFunnel(deps.readExposeStateFn ?? readExposeState),
       };
+      // Setup reached from a sign-in (T-476): the button goes back to it.
+      const returnPath = readSetupReturn(req);
+      if (returnPath) doneProps.returnTo = { path: returnPath, label: setupReturnLabel(returnPath, deps.db) };
       if (exposeMode !== undefined) doneProps.exposeMode = exposeMode;
       // No `doneProps.mintedToken` — see the OAuth-default note above.
       // Substitute CSRF placeholder for the install-tile forms with

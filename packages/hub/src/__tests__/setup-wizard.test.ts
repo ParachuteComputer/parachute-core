@@ -41,6 +41,8 @@ import {
   detectAutoExposeMode,
   hubLocalTarget,
   isPublicOrigin,
+  SETUP_RETURN_COOKIE,
+  safeSetupReturn,
   handleSetupAccountPost,
   handleSetupExposePost,
   handleSetupGet,
@@ -49,6 +51,7 @@ import {
   postVaultImportImpl,
   renderVaultStep,
 } from "../setup-wizard.ts";
+import { registerClient } from "../clients.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
 import { Supervisor } from "../supervisor.ts";
 import { createUser, getUserByUsername, userCount } from "../users.ts";
@@ -5186,5 +5189,138 @@ describe("isPublicOrigin", () => {
   test("a tailnet name is public only through Funnel", () => {
     expect(isPublicOrigin("https://my-mac.tailnet-name.ts.net")).toBe(false);
     expect(isPublicOrigin("https://my-mac.tailnet-name.ts.net", true)).toBe(true);
+  });
+});
+
+// T-476 re-walk: a phone-first person signing in from the Parachute app on a hub with no admin was funneled into
+// setup, finished it, and the done page's "Open the Parachute app" wasn't a button; Back walked the wizard backwards.
+// The sign-in's `next` now rides through setup (a cookie on this browser) and the done page offers a button back.
+describe("setup reached from a sign-in returns to it", () => {
+  let h: Harness;
+  beforeEach(() => {
+    h = makeHarness();
+    _resetOperationsRegistryForTests();
+  });
+  afterEach(() => h.cleanup());
+
+  test("safeSetupReturn: same-origin paths only", () => {
+    expect(safeSetupReturn("/oauth/authorize?client_id=a&state=b")).toBe("/oauth/authorize?client_id=a&state=b");
+    expect(safeSetupReturn("/vault/admin/")).toBe("/vault/admin/");
+    for (const bad of [
+      null,
+      "",
+      "https://evil.example/oauth/authorize",
+      "//evil.example/x",
+      "/\\evil.example/x",
+      "javascript:alert(1)",
+      "/oauth/authorize?x=1\nSet-Cookie: a=b",
+      "/admin/setup?next=/x",
+      "/admin/setup",
+    ]) {
+      expect(safeSetupReturn(bad)).toBeNull();
+    }
+  });
+
+  /** A browser's cookie jar, enough for the wizard's steps. */
+  function jar() {
+    const cookies = new Map<string, string>();
+    return {
+      take(res: Response) {
+        for (const c of res.headers.getSetCookie()) {
+          const [pair] = c.split(";");
+          const at = pair!.indexOf("=");
+          cookies.set(pair!.slice(0, at), pair!.slice(at + 1));
+        }
+      },
+      header: () => [...cookies].map(([k, v]) => `${k}=${v}`).join("; "),
+      get: (k: string) => cookies.get(k),
+    };
+  }
+
+  async function walk(next: string): Promise<string> {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const deps = {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
+        issuer: "http://127.0.0.1:26052",
+        registry: getDefaultOperationsRegistry(),
+        supervisor: makeSupervisor(),
+      };
+      const c = jar();
+      // 1. The first-boot /login funnel lands here with the sign-in's next.
+      const first = handleSetupGet(req(`/admin/setup?next=${encodeURIComponent(next)}`), deps);
+      c.take(first);
+      const csrf = () => c.get(CSRF_COOKIE_NAME) ?? "";
+      // 2. Account.
+      const account = formBody({ username: "owner", password: "walk-passphrase-1", password_confirm: "walk-passphrase-1", [CSRF_FIELD_NAME]: csrf() });
+      const a = await handleSetupAccountPost(
+        req("/admin/setup/account", { method: "POST", body: account.body, headers: { ...account.headers, cookie: c.header() } }),
+        deps,
+      );
+      expect(a.status).toBe(303);
+      c.take(a);
+      // 3. Vault (skip: the step's form post, without provisioning a real vault).
+      const vault = formBody({ mode: "skip", [CSRF_FIELD_NAME]: csrf() });
+      const v = await handleSetupVaultPost(
+        req("/admin/setup/vault", { method: "POST", body: vault.body, headers: { ...vault.headers, cookie: c.header() } }),
+        deps,
+      );
+      expect(v.status).toBe(303);
+      c.take(v);
+      // 4. Expose.
+      const expose = formBody({ expose_mode: "localhost", [CSRF_FIELD_NAME]: csrf() });
+      const e = await handleSetupExposePost(
+        req("/admin/setup/expose", { method: "POST", body: expose.body, headers: { ...expose.headers, cookie: c.header() } }),
+        deps,
+      );
+      expect(e.headers.get("location")).toBe("/admin/setup?just_finished=1");
+      c.take(e);
+      // 5. Done.
+      const done = handleSetupGet(req("/admin/setup?just_finished=1", { headers: { cookie: c.header() } }), deps);
+      expect(done.status).toBe(200);
+      return await done.text();
+    } finally {
+      db.close();
+    }
+  }
+
+  test("the return survives account, vault and expose; the done page's first step is a button back to the sign-in", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    const parachute = registerClient(db, { redirectUris: ["http://127.0.0.1:47219/oauth/callback"], clientName: "Parachute" });
+    db.close();
+    const authorize = `/oauth/authorize?client_id=${parachute.client.clientId}&redirect_uri=${encodeURIComponent("http://127.0.0.1:47219/oauth/callback")}&response_type=code&state=s1`;
+    const html = await walk(authorize);
+    const button = html.match(/<a class="btn btn-primary" data-testid="continue-return" href="([^"]+)">([^<]+)<\/a>/);
+    expect(button).not.toBeNull();
+    expect(button![1]!.replaceAll("&amp;", "&")).toBe(authorize);
+    expect(button![2]).toBe("Continue to the Parachute app");
+    expect(html).not.toContain("<strong>Open the Parachute app</strong>");
+  });
+
+  test("an offsite return is dropped: no button, the done page stays as it is", async () => {
+    const html = await walk("https://evil.example/oauth/authorize?client_id=x");
+    expect(html).not.toContain('data-testid="continue-return"');
+    expect(html).not.toContain("evil.example");
+    expect(html).toContain("<strong>Open the Parachute app</strong>");
+  });
+
+  test("no return: no button, and no cookie set", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const res = handleSetupGet(req("/admin/setup"), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
+        issuer: "http://127.0.0.1:26052",
+        registry: getDefaultOperationsRegistry(),
+      });
+      expect(res.headers.getSetCookie().some((c) => c.startsWith(`${SETUP_RETURN_COOKIE}=`))).toBe(false);
+    } finally {
+      db.close();
+    }
   });
 });
