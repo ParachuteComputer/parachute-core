@@ -242,6 +242,15 @@ export interface DerivedWizardState {
  */
 export const FIRST_VAULT_SHORT: CuratedModuleShort = "vault";
 
+/** Whether the live exposure is Tailscale Funnel; false when none is live or the file is unreadable. */
+function liveFunnel(read: () => ExposeState | undefined): boolean {
+  try {
+    return read()?.funnel === true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Map a live exposure layer (`expose-state.json`) onto the wizard's
  * `setup_expose_mode`. The two enums overlap exactly on the layers the
@@ -255,15 +264,6 @@ export const FIRST_VAULT_SHORT: CuratedModuleShort = "vault";
  * a malformed file — we swallow that and fall through to "still ask"
  * rather than crashing the wizard GET).
  */
-/** Whether the live exposure is Tailscale Funnel; false when none is live or the file is unreadable. */
-function liveFunnel(read: () => ExposeState | undefined): boolean {
-  try {
-    return read()?.funnel === true;
-  } catch {
-    return false;
-  }
-}
-
 function exposeModeFromLiveState(read: () => ExposeState | undefined): SetupExposeMode | undefined {
   let state: ExposeState | undefined;
   try {

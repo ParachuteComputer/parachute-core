@@ -4087,6 +4087,7 @@ describe("done screen — the lead tile: the Parachute app and your AI (T-476)",
     extraServices: Parameters<typeof writeManifest>[0]["services"] = [],
     mode = "localhost",
     loopbackPort?: number,
+    readExposeStateFn?: () => ExposeState | undefined,
   ) {
     const db = openHubDb(hubDbPath(h.dir));
     try {
@@ -4109,7 +4110,7 @@ describe("done screen — the lead tile: the Parachute app and your AI (T-476)",
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
-          readExposeStateFn: h.readExposeStateFn,
+          readExposeStateFn: readExposeStateFn ?? h.readExposeStateFn,
           issuer,
           registry: getDefaultOperationsRegistry(),
           ...(loopbackPort !== undefined ? { loopbackPort } : {}),
@@ -4177,10 +4178,41 @@ describe("done screen — the lead tile: the Parachute app and your AI (T-476)",
   });
 
   test("public mode on an address the internet can't reach: no 'From anywhere', and Claude's line keeps the condition", async () => {
-    const html = await donePage("http://192.168.1.5:1939", [], "public", 1939);
+    const html = await donePage("https://192.168.1.5:1939", [], "public", 1939);
     expect(html).not.toContain("From anywhere.");
     expect(html).toContain("Claude's apps connect from the internet, so they need a public address");
     expect(html).toContain("PARACHUTE_HUB_ORIGIN");
+  });
+
+  test("a tailnet name served through Tailscale Funnel is public: 'From anywhere', and Claude's plain steps", async () => {
+    const funnel: ExposeState = {
+      version: 1,
+      layer: "public",
+      mode: "path",
+      canonicalFqdn: "my-mac.tailnet-name.ts.net",
+      port: 443,
+      funnel: true,
+      entries: [],
+      hubOrigin: "https://my-mac.tailnet-name.ts.net",
+    };
+    const html = await donePage("https://my-mac.tailnet-name.ts.net", [], "public", 1939, () => funnel);
+    expect(html).toContain("From anywhere.");
+    expect(html).toContain("In Claude: Customize → Connectors → Add custom connector.");
+  });
+
+  test("the same tailnet name without Funnel is not public", async () => {
+    const tailnetOnly: ExposeState = {
+      version: 1,
+      layer: "public",
+      mode: "path",
+      canonicalFqdn: "my-mac.tailnet-name.ts.net",
+      port: 443,
+      funnel: false,
+      entries: [],
+    };
+    const html = await donePage("https://my-mac.tailnet-name.ts.net", [], "public", 1939, () => tailnetOnly);
+    expect(html).not.toContain("From anywhere.");
+    expect(html).toContain("Claude's apps connect from the internet, so they need a public address");
   });
 
   test("a public hub: Claude's connector steps with no 'needs a public address'", async () => {
