@@ -47,11 +47,11 @@ back a key held to types stops working; it never reaches more.
 
 **For door builders.**
 - The door harness runs a one-address personal door as one address (#142).
-- Parachute Cloud and the own-Cloudflare personal door let write define a type, as a box does, so the door contracts
-  no longer name `write-defines-types` as a difference (#145).
-- They hold keys for an AI to some types, with the one list of who reaches a vault, as a box does, so `typed-keys` is
-  no longer a difference either. One named difference is added: a Cloud vault token also says the account's address
-  was proven (`vault-token-address-proof`) (#148).
+- Parachute Cloud and a personal door now behave as a box does here: write may define a type (#145), and a key for an
+  AI can be held to some types, with the one list of who reaches a vault and End (#148). The door contracts check both
+  on every door. One difference remains: a Cloud vault token also says the account's address was proven (#148).
+  On the way back, Cloud differs from a box: a Cloud worker from before its typed keys serves a key held to types as
+  a whole-vault key until the key is ended, so end typed keys before rolling Cloud back.
 
 ## 0.9.0-pre.1
 
