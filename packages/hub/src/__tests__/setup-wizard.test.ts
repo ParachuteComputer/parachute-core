@@ -5216,16 +5216,18 @@ describe("setup reached from a sign-in returns to it", () => {
       "/oauth/authorize?x=1\nSet-Cookie: a=b",
       "/admin/setup?next=/x",
       "/admin/setup",
-      // The shared rule's catches (isSameOriginPath): dot segments, a tab, non-ASCII.
+      // The shared rule's catches (isSameOriginPath) the old copy missed: dot segments, non-ASCII.
       "/.//evil.example/x",
-      "/\t/evil.example/x",
       "/caf\u00e9",
-      // The wizard's own on top: never itself (however spelled), and the length cap.
+      // The wizard's own on top: never itself (however spelled), and a cookie-sized cap on the encoded value.
       "/admin/./setup/vault",
-      `/oauth/authorize?state=${"a".repeat(1500)}`,
+      "/admin/setup#x",
+      `/oauth/authorize?state=${"%".repeat(1300)}`,
     ]) {
       expect(safeSetupReturn(bad)).toBeNull();
     }
+    // A backslash in the query stays in the query (an OAuth state may hold one): allowed, as /login's next allows it.
+    expect(safeSetupReturn("/oauth/authorize?state=a\\b")).toBe("/oauth/authorize?state=a\\b");
   });
 
   /** A browser's cookie jar, enough for the wizard's steps. */

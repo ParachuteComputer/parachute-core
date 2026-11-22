@@ -1032,12 +1032,12 @@ export function isPublicOrigin(origin: string, funnel = false): boolean {
  * app on a hub with no admin was sent here, finished setup, and had no way back into the app's sign-in).
  *
  * The hub's one rule for redirect targets, `isSameOriginPath` (same-origin-path.ts, which `/login`'s `next` uses
- * too), plus the wizard's own: at most 1500 characters, and never the wizard itself. Null when there's nothing safe to
+ * too), plus the wizard's own: small enough for its cookie, and never the wizard itself. Null when there's nothing safe to
  * return to, so the done page stays as it is. Never another origin: no open redirect.
  */
 export function safeSetupReturn(raw: string | null | undefined): string | null {
-  // Encoded into a cookie (up to 3x longer) that must stay under the browser's 4 KB; real sign-ins are ~1 KB.
-  if (!raw || raw.length > 1500 || !isSameOriginPath(raw)) return null;
+  // Encoded into a cookie that must stay under the browser's 4 KB; real sign-ins are ~1 KB.
+  if (!raw || encodeURIComponent(raw).length > 3800 || !isSameOriginPath(raw)) return null;
   // Paths into the wizard itself would loop (checked on the path a browser would request).
   const path = new URL(raw, "http://parachute.invalid").pathname;
   if (path === "/admin/setup" || path.startsWith("/admin/setup/")) return null;
