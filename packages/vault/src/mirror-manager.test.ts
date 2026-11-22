@@ -647,6 +647,39 @@ describe("MirrorManager.runNow", () => {
     await mgr.stop();
   });
 
+  test("a commit that failed stays in status through quiet cycles, and the next cycle commits what waited", async () => {
+    // Review of the fix above: an export with nothing new cleared last_error and skipped the commit, so a quiet vault
+    // hid a failed commit and left its files uncommitted.
+    home = tmp("mgr-runnow-behind-");
+    fs.mkdirSync(path.join(home, "vault", "data", "default"), { recursive: true });
+    let write = true;
+    const deps = makeFakeDeps({
+      parachuteHome: home,
+      initialConfig: { ...defaultMirrorConfig(), enabled: true, location: "internal", sync_mode: "manual", auto_commit: true },
+      runExport: async ({ outDir }) => {
+        if (!write) return { notes: 0 };
+        fs.writeFileSync(path.join(outDir, "waiting.md"), "# waiting\n");
+        return { notes: 1 };
+      },
+    });
+    const mgr = new MirrorManager(deps);
+    const mirror = (await mgr.start()).mirror_path!;
+    const lock = path.join(mirror, ".git", "index.lock");
+    fs.writeFileSync(path.join(mirror, "waiting.md"), "# changed\n");
+    fs.writeFileSync(lock, "held");                               // not empty: never cleared by the mirror
+    await mgr.runNow();
+    expect(mgr.getStatus().last_error).toContain("commit failed");
+    write = false;
+    await mgr.runNow();                                           // nothing new exported
+    expect(mgr.getStatus().last_error).toContain("commit failed");
+    fs.rmSync(lock);                                              // a person removes it
+    await mgr.runNow();                                           // still nothing new: the commit is retried anyway
+    expect(mgr.getStatus().last_error).toBeNull();
+    const dirty = Bun.spawnSync(["git", "status", "--porcelain", "waiting.md"], { cwd: mirror }).stdout.toString();
+    expect(dirty).toBe("");
+    await mgr.stop();
+  });
+
   test("noop when disabled", async () => {
     home = tmp("mgr-runnow-disabled-");
     fs.mkdirSync(path.join(home, "vault", "data", "default"), { recursive: true });

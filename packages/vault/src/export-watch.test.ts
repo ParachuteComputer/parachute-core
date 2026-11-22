@@ -25,6 +25,8 @@ import path from "node:path";
 
 import {
   DEFAULT_COMMIT_TEMPLATE,
+  STALE_INDEX_LOCK_MS,
+  clearStaleIndexLock,
   gitAddAll,
   gitCommit,
   gitPush,
@@ -34,6 +36,7 @@ import {
   renderCommitMessage,
   runGitCommitCycle,
   shouldCommit,
+  withRepoLock,
 } from "./export-watch.ts";
 import { GitNotInstalledError } from "./git-preflight.ts";
 
@@ -457,6 +460,40 @@ describe("runGitCommitCycle", () => {
     expect(r.committed).toBe(true);
     expect(r.error).toBeUndefined();
     expect(fs.existsSync(lock)).toBe(false);
+  });
+
+  test("a lock older than this process is cleared at once (a restart after a kill doesn't wait 5 minutes)", async () => {
+    const lock = path.join(dir, ".git", "index.lock");
+    fs.writeFileSync(lock, "");
+    expect(await clearStaleIndexLock(dir, STALE_INDEX_LOCK_MS, Date.now(), Date.now() - 60_000)).toBeNull();
+    expect(fs.existsSync(lock)).toBe(true);                     // made after we started: could be a git of ours
+    expect(await clearStaleIndexLock(dir, STALE_INDEX_LOCK_MS, Date.now(), Date.now() + 60_000)).not.toBeNull();
+    expect(fs.existsSync(lock)).toBe(false);                    // made before we started: its git died with the last run
+  });
+
+  test("withRepoLock runs one git cycle per repo at a time, in order, and survives a failed one", async () => {
+    const seen: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const first = withRepoLock(dir, async () => {
+      seen.push("first start");
+      await gate;
+      seen.push("first end");
+      throw new Error("boom");
+    });
+    const second = withRepoLock(path.join(dir, "."), async () => {
+      seen.push("second");
+      return 2;
+    });
+    const other = withRepoLock(`${dir}-other`, async () => {
+      seen.push("other repo");
+    });
+    await other;
+    expect(seen).toEqual(["first start", "other repo"]);
+    release();
+    await expect(first).rejects.toThrow("boom");
+    expect(await second).toBe(2);
+    expect(seen).toEqual(["first start", "other repo", "first end", "second"]);
   });
 
   test("skips commit when nothing is staged", async () => {

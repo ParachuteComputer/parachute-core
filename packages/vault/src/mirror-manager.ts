@@ -583,6 +583,12 @@ export class MirrorManager {
   private dirtyDuringFlush = false;
   /** Most recent export cursor — passed as `--since` to the next pass. */
   private cursor: string | undefined = undefined;
+  /**
+   * The last failed `git add` / `git commit`, until a commit lands (or staging finds nothing left to commit). An
+   * export that succeeds shows it as `last_error`, and a cycle with no new notes still retries the commit, so files
+   * exported before the failure aren't left uncommitted on a quiet vault.
+   */
+  private commitBehind: string | null = null;
   private currentConfig: MirrorConfig = defaultMirrorConfig();
   /**
    * Counts how many times start() has been called. Used by tests to assert
@@ -664,6 +670,7 @@ export class MirrorManager {
 
     const config = this.deps.readMirrorConfig() ?? defaultMirrorConfig();
     this.currentConfig = config;
+    this.commitBehind = null;   // a new start re-reads the mirror; its first cycle says again if commits still fail
 
     if (!config.enabled) {
       this.status = {
@@ -1085,7 +1092,7 @@ export class MirrorManager {
     this.cursor = nextCursor;
     this.status.last_export_at = nextCursor;
     this.status.last_export_notes_count = stats.notes;
-    this.status.last_error = null;
+    this.status.last_error = this.commitBehind;
 
     if (!this.currentConfig.auto_commit) {
       // No commit, but cursor advanced — next pass picks up only new
@@ -1100,7 +1107,7 @@ export class MirrorManager {
     // count in the commit. (Pre-event-driven this was strictly
     // notes-from-export; orphan deletes weren't tracked.)
     const totalChanged = stats.notes + prunedNotes;
-    if (totalChanged === 0) {
+    if (totalChanged === 0 && this.commitBehind === null) {
       // Nothing to commit; runGitCommitCycle would no-op anyway, but
       // skipping early avoids the firstNoteTitle DB lookup.
       return;
@@ -1127,11 +1134,10 @@ export class MirrorManager {
       return;
     }
 
-    if (commitResult.error) {
-      // A failed `git add` / `git commit` (a lock, a full disk) is the mirror falling behind: say it in status, where
-      // the export's success had just cleared last_error, not only in the log.
-      this.status.last_error = `commit failed: ${commitResult.error}`;
-    }
+    // A failed `git add` / `git commit` (a lock, a full disk) is the mirror falling behind: it stays in status until a
+    // commit lands, not only in the log.
+    this.commitBehind = commitResult.error ? `commit failed: ${commitResult.error}` : null;
+    this.status.last_error = this.commitBehind;
 
     if (commitResult.committed) {
       // Resolve the new HEAD sha so the status displays the commit that
