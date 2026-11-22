@@ -23,9 +23,9 @@
  * OPEN-REDIRECT SAFETY is the highest-stakes part: the resolved value lands in a
  * `Location:` header, so an off-origin value would be a textbook open redirect.
  * PUT validation (and the read-time resolver) require a SAME-ORIGIN relative
- * path via `isSafeRedirectPath` — must start with a single `/`, never `//` /
- * `/\` / a scheme, no control chars / whitespace, and must not resolve back to
- * `/` (redirect loop). Anything else is rejected (PUT 400 / resolver fallback to
+ * path via `isSafeRedirectPath` — the hub's one rule (`isSameOriginPath`: a
+ * single-slash path of visible ASCII that resolves to this origin), and it must
+ * not resolve back to `/` (redirect loop). Anything else is rejected (PUT 400 / resolver fallback to
  * `/admin`).
  *
  * Bearer-gated on `parachute:host:admin`, mirroring `handleApiSettingsHubOrigin`

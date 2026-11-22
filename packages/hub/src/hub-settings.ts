@@ -537,21 +537,11 @@ export function defaultRootRedirectFor(manifest: { services: { name: string }[] 
  *
  * The resolved value lands verbatim in a `Location:` header on the `/` 302,
  * so an off-origin value would be a textbook open redirect. To be accepted it
- * must be a SAME-ORIGIN relative path:
- *
- *   - starts with a single `/` (a site-relative path). This alone rejects
- *     `https://evil.com`, `javascript:…`, and bare hostnames.
- *   - second char is NOT `/` (a protocol-relative `//evil.com` sends the
- *     browser to another origin) and NOT `\` (browsers normalize the
- *     backslash, so `/\evil.com` resolves like `//evil.com`).
- *   - contains no ASCII control chars or whitespace — a CR/LF would enable
- *     header injection, and tab/newline are stripped by some browsers which
- *     could re-expose a hidden `//` authority.
- *   - resolves same-origin against a placeholder base (belt-and-suspenders:
- *     `new URL(value, base).origin === base`) — catches any scheme/authority
- *     shape the prefix checks missed.
- *   - does NOT resolve to pathname `/` — that would re-enter this very route
- *     and 302-loop forever (`/`, `/?x`, `/#y` all rejected).
+ * must pass the hub's one rule, `isSameOriginPath` (same-origin-path.ts: a
+ * single-slash path of visible ASCII that a browser resolves to this origin,
+ * so `//evil.com`, `/\evil.com`, a tab or CR/LF and `/.//evil.com` are all
+ * refused), and it must NOT resolve to pathname `/`: that would re-enter this
+ * very route and 302-loop forever (`/`, `/?x`, `/#y` all rejected).
  *
  * A query string / fragment on a real path is allowed (stays same-origin).
  * Returns false for non-strings, empty, and every off-origin shape.
