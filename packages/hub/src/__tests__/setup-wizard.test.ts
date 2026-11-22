@@ -39,6 +39,7 @@ import {
   type SetupWizardDeps,
   deriveWizardState,
   detectAutoExposeMode,
+  hubLocalTarget,
   handleSetupAccountPost,
   handleSetupExposePost,
   handleSetupGet,
@@ -799,6 +800,28 @@ describe("handleSetupGet", () => {
     }
   });
 
+  // T-476: walkers read "a vault is the per-workspace SQLite store + MCP surface Claude reads and writes through".
+  test("the vault step says what a vault is in a person's words", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "owner", "pw");
+      const res = handleSetupGet(req("/admin/setup"), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
+        issuer: "https://hub.example",
+        registry: getDefaultOperationsRegistry(),
+      });
+      const html = await res.text();
+      expect(html).toContain("A vault holds your notes and records.");
+      expect(html).not.toContain("SQLite");
+      expect(html).not.toContain("MCP");
+    } finally {
+      db.close();
+    }
+  });
+
   test("301s to /login once admin + vault + expose mode all exist", async () => {
     const db = openHubDb(hubDbPath(h.dir));
     try {
@@ -877,6 +900,36 @@ describe("handleSetupGet", () => {
     }
   });
 
+  // T-476: the step said "Reach the hub at http://localhost:1939" when the hub's origin was another port, and "this
+  // machine is the only client" with no word about the phone.
+  test("the expose step shows the hub's real origin, says what each choice means for a phone, and targets the listen port", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "owner", "pw");
+      writeManifest(
+        { services: [{ name: "parachute-vault", version: "0.1.0", port: 1940, paths: ["/vault/default"], health: "/health" }] },
+        h.manifestPath,
+      );
+      const res = handleSetupGet(req("/admin/setup"), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
+        issuer: "http://127.0.0.1:26052",
+        loopbackPort: 1939,
+        registry: getDefaultOperationsRegistry(),
+      });
+      const html = await res.text();
+      expect(html).toContain("Your hub is at <code>http://127.0.0.1:26052</code>");
+      expect(html).not.toContain("localhost:1939");
+      expect(html).toContain("Your phone can't reach it, not even on the same Wi-Fi.");
+      expect(html).toContain("My phone and other devices (Tailscale)");
+      expect(html).toContain("tailscale serve --bg --https=1939 http://127.0.0.1:1939");
+    } finally {
+      db.close();
+    }
+  });
+
   test("renders the success page once with ?just_finished=1 query", async () => {
     const db = openHubDb(hubDbPath(h.dir));
     try {
@@ -922,7 +975,7 @@ describe("handleSetupGet", () => {
       // expose-mode choice. Localhost mode mentions the loopback URL
       // and the upgrade path to tailnet.
       expect(html).toContain("Your hub is reachable at");
-      expect(html).toContain("Local to this machine only");
+      expect(html).toContain("On this computer only.");
     } finally {
       db.close();
     }
@@ -4018,7 +4071,7 @@ describe("bootstrap token gate (handleSetupAccountPost)", () => {
 
 // --- hub#342 UI pass: "Start using your vault" lead tile + Use it now ---
 
-describe("done screen — 'Start using your vault' tile (hub#342)", () => {
+describe("done screen — the lead tile: the Parachute app and your AI (T-476)", () => {
   let h: Harness;
   beforeEach(() => {
     h = makeHarness();
@@ -4026,115 +4079,82 @@ describe("done screen — 'Start using your vault' tile (hub#342)", () => {
   });
   afterEach(() => h.cleanup());
 
-  test("when only vault is installed, the lead tile links to vault admin", async () => {
+  async function donePage(
+    issuer: string,
+    extraServices: Parameters<typeof writeManifest>[0]["services"] = [],
+    mode = "localhost",
+    loopbackPort?: number,
+  ) {
     const db = openHubDb(hubDbPath(h.dir));
     try {
       const user = await createUser(db, "owner", "pw");
       writeManifest(
         {
           services: [
-            {
-              name: "parachute-vault",
-              version: "0.1.0",
-              port: 1940,
-              paths: ["/vault/default"],
-              health: "/health",
-            },
+            { name: "parachute-vault", version: "0.1.0", port: 1940, paths: ["/vault/default"], health: "/health" },
+            ...extraServices,
           ],
         },
         h.manifestPath,
       );
-      setSetting(db, "setup_expose_mode", "localhost");
+      setSetting(db, "setup_expose_mode", mode);
       const { createSession } = await import("../sessions.ts");
       const session = createSession(db, { userId: user.id });
       const res = handleSetupGet(
-        req("/admin/setup?just_finished=1", {
-          headers: { cookie: `${SESSION_COOKIE_NAME}=${session.id}` },
-        }),
+        req("/admin/setup?just_finished=1", { headers: { cookie: `${SESSION_COOKIE_NAME}=${session.id}` } }),
         {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
           readExposeStateFn: h.readExposeStateFn,
-          issuer: "https://hub.example",
+          issuer,
           registry: getDefaultOperationsRegistry(),
+          ...(loopbackPort !== undefined ? { loopbackPort } : {}),
         },
       );
-      const html = await res.text();
-      // Section heading present + primary CTA points at the vault's own admin.
-      expect(html).toContain("Start using your vault");
-      expect(html).toContain('href="/vault/default/admin/"');
-      // Lead tile precedes the MCP / install tiles (it's the lead).
-      const startIdx = html.indexOf("Start using your vault");
-      const installIdx = html.indexOf("What's next?");
-      expect(startIdx).toBeLessThan(installIdx);
+      expect(res.status).toBe(200);
+      return await res.text();
     } finally {
       db.close();
     }
+  }
+
+  // Walkers: the done page led with "Open Notes" (a website), a Claude Code command that spilled off its card, a
+  // custom-UI prompt and "Install Scribe". A person needs two things: the app, and their AI, at this hub's address.
+  test("leads with the Parachute app at the hub's address, then the AI at <origin>/mcp; developer things are folded below", async () => {
+    const html = await donePage("http://127.0.0.1:26052");
+    expect(html).toContain("Open the Parachute app");
+    expect(html).toContain('data-testid="app-address">http://127.0.0.1:26052<');
+    expect(html).toContain('data-testid="mcp-url">http://127.0.0.1:26052/mcp<');
+    expect(html).toContain('data-copy="http://127.0.0.1:26052/mcp"');
+    expect(html).toContain("Customize → Connectors → Add custom connector");
+    const lead = html.indexOf('data-testid="start-using-tile"');
+    const fold = html.indexOf('data-testid="for-developers"');
+    expect(lead).toBeGreaterThan(-1);
+    expect(fold).toBeGreaterThan(lead);
+    // The Claude Code commands, the custom-UI prompt and the module installs are inside the fold.
+    for (const dev of ['data-testid="mcp-house-command"', "Build a custom UI", "What's next?", 'href="/admin/modules"']) {
+      expect(html.indexOf(dev)).toBeGreaterThan(fold);
+    }
+    expect(html).not.toContain("JWKS");
   });
 
-  test("lead tile always points at notes.parachute.computer (canonical hosted PWA) regardless of local module installs", async () => {
-    // Pre-2026-05-27 the lead tile flipped to `/surface/notes/` when the
-    // Surface module was installed locally. Aaron's launch-focus
-    // directive: notes.parachute.computer is the canonical user-facing
-    // UI, and the wizard should always point operators at it (rather
-    // than maybe-or-maybe-not-installed local Surface). This test pins
-    // that the lead tile is invariant under the install state of
-    // uncurated modules.
-    const db = openHubDb(hubDbPath(h.dir));
-    try {
-      const user = await createUser(db, "owner", "pw");
-      writeManifest(
-        {
-          services: [
-            {
-              name: "parachute-vault",
-              version: "0.1.0",
-              port: 1940,
-              paths: ["/vault/default"],
-              health: "/health",
-            },
-            // Even with parachute-surface installed locally (an uncurated
-            // module post-trim), the lead tile must NOT flip to a local
-            // path.
-            {
-              name: "parachute-surface",
-              version: "0.2.0",
-              port: 1946,
-              paths: ["/surface"],
-              health: "/surface/healthz",
-            },
-          ],
-        },
-        h.manifestPath,
-      );
-      setSetting(db, "setup_expose_mode", "localhost");
-      const { createSession } = await import("../sessions.ts");
-      const session = createSession(db, { userId: user.id });
-      const res = handleSetupGet(
-        req("/admin/setup?just_finished=1", {
-          headers: { cookie: `${SESSION_COOKIE_NAME}=${session.id}` },
-        }),
-        {
-          db,
-          manifestPath: h.manifestPath,
-          configDir: h.dir,
-          readExposeStateFn: h.readExposeStateFn,
-          issuer: "https://hub.example",
-          registry: getDefaultOperationsRegistry(),
-        },
-      );
-      const html = await res.text();
-      expect(html).toContain("Start using your vault");
-      // Lead CTA always targets the hosted PWA.
-      expect(html).toContain("https://notes.parachute.computer/add?url=");
-      expect(html).toContain("Open Notes");
-      // The pre-trim local-surface fallback is gone — the lead tile does
-      // NOT link to /surface/notes/ anymore.
-      expect(html).not.toContain('href="/surface/notes/"');
-    } finally {
-      db.close();
-    }
+  test("never links Notes on a website, whatever is installed", async () => {
+    const html = await donePage("https://hub.example", [
+      { name: "parachute-surface", version: "0.2.0", port: 1946, paths: ["/surface"], health: "/surface/healthz" },
+    ]);
+    expect(html).not.toContain("notes.parachute.computer");
+    expect(html).not.toContain("Open Notes");
+    expect(html).not.toContain('href="/surface/notes/"');
+  });
+
+  test("a loopback hub says it works on this computer only, and the tailscale command targets where the hub listens", async () => {
+    // The walkers' hubs: PARACHUTE_HUB_ORIGIN on one port, serve listening on another.
+    const html = await donePage("http://127.0.0.1:26052", [], "localhost", 1939);
+    expect(html).toContain("On this computer only. To use your phone too");
+    expect(html).toContain("Claude on the web connects from the internet, so it needs a public address");
+    expect(html).toContain("tailscale serve --bg --https=1939 http://127.0.0.1:1939");
+    expect(html).not.toContain("http://localhost:1939");
   });
 
   test("succeeded install op renders 'Manage modules' link (no 'Use it now' for modules without a hosted surface)", async () => {
@@ -5057,5 +5077,21 @@ describe("vault step semantic-search opt-in (hub#966)", () => {
     } finally {
       db.close();
     }
+  });
+});
+
+// T-476: the tailscale command forwards to where the hub listens on this machine, which is not always 1939 and not
+// the issuer when the issuer is a tailnet or public address.
+describe("hubLocalTarget", () => {
+  test("serve's loopback port wins", () => {
+    expect(hubLocalTarget("https://hub.example", 4100)).toBe("http://127.0.0.1:4100");
+  });
+  test("else a loopback issuer's own port", () => {
+    expect(hubLocalTarget("http://localhost:26052")).toBe("http://127.0.0.1:26052");
+    expect(hubLocalTarget("http://127.0.0.1:26052/")).toBe("http://127.0.0.1:26052");
+  });
+  test("else 1939, never a public or tailnet issuer", () => {
+    expect(hubLocalTarget("https://my-mac.tailnet.ts.net")).toBe("http://127.0.0.1:1939");
+    expect(hubLocalTarget("https://hub.example:8443")).toBe("http://127.0.0.1:1939");
   });
 });

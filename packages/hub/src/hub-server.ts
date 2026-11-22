@@ -2785,6 +2785,7 @@ export function hubFetch(
           manifestPath,
           configDir: CONFIG_DIR,
           issuer: oauthDeps(req).issuer,
+          ...(loopbackPort !== undefined ? { loopbackPort } : {}),
           registry: getDefaultOperationsRegistry(),
           // hub#576: a loopback peer (the on-box operator's own shell) is allowed
           // to read the actual bootstrap token from the GET /admin/setup JSON

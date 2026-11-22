@@ -14,7 +14,9 @@
  *      without re-fabricating an HTTP request + bearer. Returns + redirects
  *      to `/admin/setup?op=<id>` so the same wizard page polls the
  *      operation registry.
- *   4. Done — links to the admin SPA, MCP install hints, "what's next."
+ *   4. Expose — where the hub will be used (this computer, Tailscale, public).
+ *   5. Done — the Parachute app and the AI at this hub's address (T-476); developer
+ *      things (Claude Code commands, admin UI, modules) under a fold.
  *
  * The wizard is server-rendered (no SPA bundle, no JS). Step 3's progress
  * poll is a `<meta http-equiv="refresh" content="2">` — works without JS
@@ -432,6 +434,11 @@ export interface SetupWizardDeps {
    */
   issuer: string;
   /**
+   * The port the hub listens on at 127.0.0.1 (serve's `loopbackPort`), for the tailscale command's target
+   * (`hubLocalTarget`). Absent in tests and older callers: the issuer's port when it is loopback, else 1939.
+   */
+  loopbackPort?: number;
+  /**
    * Test seam: inject an operations registry so the wizard's tests can
    * observe its install op without colliding with the default
    * process-singleton. Production omits this; both the API surface and
@@ -682,18 +689,13 @@ export function renderAccountStep(props: RenderAccountStepProps): string {
       <div class="card-header">
         ${header("welcome")}
         <h1>Welcome to your Parachute hub</h1>
-        <p class="subtitle">Two quick steps and you'll have a working stack —
-          an admin account and your first vault. No email, no signup; this
-          all stays on your machine (or your container).</p>
+        <p class="subtitle">Make your account, then name your first vault.
+          No email, no signup: it all stays on your machine (or your container).</p>
       </div>
       <section class="explainer">
         <h2>Why this step</h2>
-        <p>A Parachute hub needs one admin operator before anything else can
-          run — OAuth issuance, vault provisioning, the admin UI all need
-          an identity behind them.</p>
-        <h2>What's next</h2>
-        <p>After this you'll name your first vault. The hub will install it
-          and issue a token your Claude Code MCP client can use.</p>
+        <p>This account is yours. You sign in with it on each device, and
+          you approve each app or AI that asks to reach your notes.</p>
       </section>
       ${tokenCallout}
       ${error}
@@ -794,34 +796,16 @@ export function renderVaultStep(props: RenderVaultStepProps): string {
       <div class="card-header">
         ${header("vault")}
         <h1>Create your first vault</h1>
-        <p class="subtitle">A vault is the per-workspace SQLite store + MCP
-          surface Claude reads and writes through. You can have many vaults
-          on one hub; this is just the first.</p>
+        <p class="subtitle">A vault holds your notes and records. Name your
+          first one; you can add more later.</p>
       </div>
-      <section class="explainer">
-        <h2>Why this step</h2>
-        <p>The wizard provisions a vault module at the path
-          <code>/vault/&lt;name&gt;</code> and issues you an operator token —
-          the same shape <code>parachute install vault</code> produces from
-          the CLI. We're doing both in one click.</p>
-        <h2>What's next</h2>
-        <p>You'll land on a success screen with copy-paste MCP install
-          instructions for Claude Code and a link to the admin UI, where
-          you can add more vaults.</p>
-      </section>
       <section class="preview">
         <p class="preview-label">About to create</p>
         <div class="preview-card">
           <span class="preview-key">vault:</span>
           <span class="preview-val" id="preview-vault-name">${previewName}</span>
-          <span class="preview-fine">— admin: you, MCP-ready for Claude Code</span>
+          <span class="preview-fine">— yours; you choose which apps and AIs reach it</span>
         </div>
-        <p class="preview-fine">
-          The name labels the vault on the admin UI, and rides along as the
-          MCP server name (<code>parachute-&lt;name&gt;</code>) if you connect
-          this vault on its own. You can add or manage vaults later from the
-          vault module's own admin at <code>/vault/admin/</code>.
-        </p>
       </section>
       ${error}
       <form method="POST" action="/admin/setup/vault" class="auth-form">
@@ -969,6 +953,35 @@ export interface RenderExposeStepProps {
   errorMessage?: string;
   /** Pre-select a radio when re-rendering after a validation error. */
   selectedMode?: SetupExposeMode;
+  /**
+   * The hub's own origin (the issuer: PARACHUTE_HUB_ORIGIN, or the address it was reached on), shown as where the
+   * hub is now (T-476: the step said localhost:1939 when the hub was on another port).
+   */
+  hubOrigin?: string;
+  /** Where the hub listens on this machine, the target of the tailscale command (`hubLocalTarget`). */
+  localTarget?: string;
+}
+
+/**
+ * Where the hub listens on this machine, for the `tailscale serve` target: the hub's loopback port when serve says
+ * it, else the issuer's port when the issuer is a loopback address, else 1939. Not the issuer itself: a tailnet or
+ * public issuer is not what tailscale forwards to.
+ */
+export function hubLocalTarget(issuer: string, loopbackPort?: number): string {
+  if (loopbackPort !== undefined) return `http://127.0.0.1:${loopbackPort}`;
+  try {
+    const u = new URL(issuer);
+    const host = u.hostname.replace(/^\[|\]$/g, "");
+    if ((host === "localhost" || host === "::1" || /^127\./.test(host)) && u.port) return `http://127.0.0.1:${u.port}`;
+  } catch {
+    // fall through
+  }
+  return "http://127.0.0.1:1939";
+}
+
+/** The tailscale command that puts the hub on the person's tailnet. */
+function tailscaleCommand(localTarget: string): string {
+  return `tailscale serve --bg --https=1939 ${localTarget}`;
 }
 
 /**
@@ -988,6 +1001,8 @@ export interface RenderExposeStepProps {
  */
 export function renderExposeStep(props: RenderExposeStepProps): string {
   const { csrfToken, errorMessage, selectedMode } = props;
+  const hubOrigin = props.hubOrigin ?? "http://127.0.0.1:1939";
+  const localTarget = props.localTarget ?? hubLocalTarget(hubOrigin);
   const error = errorMessage ? `<p class="error-banner">${escapeHtml(errorMessage)}</p>` : "";
   // The default selection (localhost) is the most common case + the
   // safest fallback — picking it changes nothing operational. Tailnet +
@@ -999,10 +1014,9 @@ export function renderExposeStep(props: RenderExposeStepProps): string {
     <div class="card">
       <div class="card-header">
         ${header("expose")}
-        <h1>How will this hub be reached?</h1>
-        <p class="subtitle">Pick the network shape that matches your setup.
-          You can revisit this later from the admin UI — it just shapes the
-          URLs we surface on the next screen.</p>
+        <h1>Where will you use Parachute?</h1>
+        <p class="subtitle">Your hub is at <code>${escapeHtml(hubOrigin)}</code>.
+          Pick where you'll reach it from. You can change this later.</p>
       </div>
       ${error}
       <form method="POST" action="/admin/setup/expose" class="auth-form expose-form">
@@ -1010,36 +1024,35 @@ export function renderExposeStep(props: RenderExposeStepProps): string {
         <label class="expose-option">
           <input type="radio" name="expose_mode" value="localhost"${selectedMode ? sel("localhost") : defaultChecked} />
           <div class="expose-option-body">
-            <span class="expose-option-title">Just this machine (localhost)</span>
-            <span class="expose-option-desc">Reach the hub at
-              <code>http://localhost:1939</code>. No further configuration
-              needed. This is the right answer for "I'm just trying it out"
-              and for "this machine is the only client."</span>
+            <span class="expose-option-title">Just this computer</span>
+            <span class="expose-option-desc">Use it here at
+              <code>${escapeHtml(hubOrigin)}</code>. Nothing else to set up.
+              Your phone can't reach it, not even on the same Wi-Fi.</span>
           </div>
         </label>
         <label class="expose-option">
           <input type="radio" name="expose_mode" value="tailnet"${sel("tailnet")} />
           <div class="expose-option-body">
-            <span class="expose-option-title">My Tailscale network</span>
-            <span class="expose-option-desc">Share with your own devices over
-              a private tailnet. After finishing setup, run:</span>
-            <pre class="expose-option-cmd">tailscale serve --bg --https=1939 http://localhost:1939</pre>
-            <span class="expose-option-desc">The hub is then reachable at
-              your tailnet hostname (e.g.
-              <code>https://my-mac.tailnet-name.ts.net</code>) from any of
-              your logged-in devices.</span>
+            <span class="expose-option-title">My phone and other devices (Tailscale)</span>
+            <span class="expose-option-desc">Your devices reach the hub over
+              your private Tailscale network, at home or away. With Tailscale
+              on this computer, run this after setup:</span>
+            <pre class="expose-option-cmd">${escapeHtml(tailscaleCommand(localTarget))}</pre>
+            <span class="expose-option-desc">Then use your tailnet address
+              (like <code>https://my-mac.tailnet-name.ts.net:1939</code>) on
+              each device.</span>
           </div>
         </label>
         <label class="expose-option">
           <input type="radio" name="expose_mode" value="public"${sel("public")} />
           <div class="expose-option-body">
-            <span class="expose-option-title">Public URL (custom domain)</span>
-            <span class="expose-option-desc">Run the hub behind a reverse
-              proxy on a domain you own. See the
+            <span class="expose-option-title">Anywhere, at a public address</span>
+            <span class="expose-option-desc">A domain you own points at this
+              hub. Needed for Claude on the web, which connects from the
+              internet. See the
               <a href="https://parachute.computer/start/" target="_blank" rel="noopener">deploy guide</a>
-              for nginx / Caddy / Cloudflare Tunnel examples + the env
-              vars (<code>PARACHUTE_HUB_ORIGIN</code>) the hub reads for
-              its own canonical URL.</span>
+              (reverse proxy or Cloudflare Tunnel, and
+              <code>PARACHUTE_HUB_ORIGIN</code>).</span>
           </div>
         </label>
         <button type="submit" class="btn btn-primary">Continue</button>
@@ -1096,60 +1109,47 @@ export interface RenderDoneStepProps {
    * shape.
    */
   installTiles?: readonly ModuleInstallTileState[];
+  /** Where the hub listens on this machine (`hubLocalTarget`), for the tailscale command. */
+  localTarget?: string;
 }
 
 export function renderDoneStep(props: RenderDoneStepProps): string {
   const { vaultName, hubOrigin, exposeMode, installTiles } = props;
-  const reachable = exposeMode ? renderReachableTile(exposeMode, hubOrigin) : "";
+  const localTarget = props.localTarget ?? hubLocalTarget(hubOrigin);
+  const reachable = exposeMode ? renderReachableTile(exposeMode, hubOrigin, localTarget) : "";
   const mcpTile = renderMcpTile(vaultName, hubOrigin);
   const tiles = installTiles && installTiles.length > 0 ? installTiles : [];
   const installSection = tiles.length > 0 ? renderInstallTiles(tiles) : "";
-  const startTile = renderStartUsingTile(vaultName, hubOrigin);
-  // The done-grid hosts the MCP-connect tile + the admin-UI fallback.
-  // The install tiles sit above it as a "what's next?" surface (curated
-  // catalog of modules an operator might want next). The "Start using
-  // your vault" tile leads everything user-facing because it answers
-  // Aaron's hub#342 friction directly: there was no clear way from the
-  // wizard's done screen to actually USE Parachute — the wizard
-  // surfaced "install more" + "go to admin" + an MCP command, none of
-  // which is "open the canonical user-facing UI" (Notes via App). With
-  // this tile in pole position, the operator's first click goes to a
-  // surface that says "hello, here's your vault" rather than a hub
-  // admin page. The reachable tile sits above even the start tile
-  // because "where's my hub?" answers the URL question every operator
-  // hits before they can click anything else (especially on tailnet /
-  // public expose where the loopback URL isn't the answer).
+  const startTile = renderStartUsingTile(hubOrigin, exposeMode);
+  // An install op in flight refreshes the page; keep the developer fold open so its progress stays in view.
+  const anyOp = tiles.some((t) => t.operation !== undefined);
+  // T-476 (three first-run walkers): the page leads with the two things a person does next, the Parachute app and
+  // their AI, both at this hub's address. Where the hub is reachable sits under them. Everything for developers (the
+  // Claude Code commands, the custom-UI prompt, other modules, the admin UI) is in one fold below. Nothing links to a
+  // website version of Notes: the app is the way in (hub#342's "Open Notes" tile is gone).
   const body = `
     <div class="card">
       <div class="card-header">
         ${header("done")}
         <h1>You're set up</h1>
-        <p class="subtitle">Your hub is ready. Here's what to do next.</p>
+        <p class="subtitle">Your hub is ready. Two things to do next:</p>
       </div>
-      ${reachable}
       ${startTile}
-      ${renderStarterPromptsSection()}
-      ${installSection}
-      <section class="done-grid">
-        ${mcpTile}
-        <div class="done-tile">
-          <h2>Open the admin UI</h2>
-          <p>Manage vaults, tokens, OAuth grants, and module updates.</p>
-          <p><a class="btn btn-secondary" href="/admin/modules">Go to admin</a></p>
-        </div>
-      </section>
-      <section class="explainer">
-        <h2>What just happened</h2>
-        <ul>
-          <li>An admin operator account was created on this hub.</li>
-          <li>A vault named <code>${escapeHtml(vaultName)}</code> was installed and started.</li>
-          <li>OAuth issuer + JWKS keys were minted (visible at
-            <code>/.well-known/oauth-authorization-server</code>).</li>
-        </ul>
-        <p>This wizard won't come back — the next visitor to <code>/</code>
-          sees the discovery page; visitors to <code>/admin</code> are routed
-          to <code>/login</code>.</p>
-      </section>
+      ${reachable}
+      <details class="alt-path" data-testid="for-developers"${anyOp ? " open" : ""}>
+        <summary>For developers</summary>
+        <section class="done-grid">
+          ${mcpTile}
+          <div class="done-tile">
+            <h2>Open the admin UI</h2>
+            <p>Manage vaults, tokens, app approvals, and updates.</p>
+            <p><a class="btn btn-secondary" href="/admin/modules">Go to admin</a></p>
+            <p class="fine"><a href="/vault/${encodeURIComponent(vaultName)}/admin/">The vault's own admin</a></p>
+          </div>
+        </section>
+        ${renderStarterPromptsSection()}
+        ${installSection}
+      </details>
     </div>`;
   // Auto-refresh while any install op is in flight so the operator sees
   // progress without manually reloading. Done step is the canonical
@@ -1211,45 +1211,50 @@ function renderMcpTile(vaultName: string, hubOrigin: string): string {
 }
 
 /**
- * The "Start using your vault" lead tile on the done step (hub#342,
- * Aaron 2026-05-27 simplification).
+ * The lead tile on the done step (T-476; replaces hub#342's "Start using your vault", which sent people to Notes on a
+ * website, never to the Parachute app). Two steps, both at this hub's own address:
  *
- * Closes Aaron's "no clear way to go from setting up parachute to
- * actually using parachute" friction. Sits above the MCP / install
- * tiles because it's the canonical user-facing entry point —
- * everything else on the done screen is operator-flavored (MCP
- * command, admin UI, additional module installs).
+ *   1. Open the Parachute app and sign in with the address (the app's first screen says "Sign in with its address").
+ *   2. Connect your AI: give it `<origin>/mcp`, with one Copy. On Claude: Customize → Connectors → Add custom
+ *      connector.
  *
- * Points at the canonical notes.parachute.computer hosted PWA as the
- * primary CTA — with the operator's own hub URL pre-filled via
- * `?url=` so the connect screen auto-populates + auto-focuses
- * (notes-ui AddVault route, see
- * parachute-surface/packages/notes-ui/src/app/routes/AddVault.tsx).
- * Secondary CTA: "Open vault admin" (the vault's own admin UI on this
- * hub) for operators who want to look at raw vault state.
- *
- * Previously varied by whether `parachute-surface` was installed
- * locally — pointing at `/surface/notes/` in that case. Dropped
- * 2026-05-27: hub+vault+scribe is the focus; notes.parachute.computer
- * is canonical regardless of local surface install state.
+ * Then one line, by expose mode: Claude on the web connects from the internet, so it needs a public address; on
+ * tailnet, the phone uses the tailnet address. The reachable tile below says where the address works.
  */
-function renderStartUsingTile(vaultName: string, hubOrigin: string): string {
-  const safeVault = escapeHtml(vaultName);
-  // Vault names pass `/^[a-z0-9][a-z0-9-]*$/i` so URL-encoding is mostly
-  // a no-op today, but use encodeURIComponent defensively to match hub.ts:505.
-  const urlVault = encodeURIComponent(vaultName);
-  // The `?url=` query param is consumed by notes-ui's AddVault route
-  // (packages/notes-ui/src/app/routes/AddVault.tsx) — it pre-fills the
-  // vault URL input + auto-focuses Submit.
-  const vaultUrlForAdd = encodeURIComponent(`${hubOrigin.replace(/\/+$/, "")}/vault/${vaultName}`);
+function renderStartUsingTile(hubOrigin: string, exposeMode?: SetupExposeMode): string {
+  const origin = hubOrigin.replace(/\/+$/, "");
+  const mcpUrl = `${origin}/mcp`;
+  const reach =
+    exposeMode === "public"
+      ? ""
+      : exposeMode === "tailnet"
+        ? `<p class="fine">On your phone and other devices, use your tailnet address instead (below). Claude on the web
+          connects from the internet, so it needs a public address; Claude Code on this computer works with this one.</p>`
+        : `<p class="fine">Claude on the web connects from the internet, so it needs a public address; Claude Code on
+          this computer works with this one.</p>`;
   return `<section class="start-using" data-testid="start-using-tile">
-    <h2>Start using your vault</h2>
-    <p>Open Notes — the canonical browser UI for your vault <code>${safeVault}</code>.
-      It connects to your hub over HTTPS and remembers your URL after the first OAuth.</p>
-    <p><a class="btn btn-primary" href="https://notes.parachute.computer/add?url=${vaultUrlForAdd}" target="_blank" rel="noopener">Open Notes ↗</a></p>
-    <p class="start-using-secondary">
-      <a href="/vault/${urlVault}/admin/">Or browse the vault's admin UI →</a>
-    </p>
+    <h2>Start using Parachute</h2>
+    <ol>
+      <li><strong>Open the Parachute app</strong> and sign in with
+        <code data-testid="app-address">${escapeHtml(origin)}</code>.</li>
+      <li><strong>Connect your AI:</strong> give it
+        <code data-testid="mcp-url">${escapeHtml(mcpUrl)}</code>
+        <button type="button" class="btn btn-secondary" id="copy-mcp-url" data-copy="${escapeAttr(mcpUrl)}">Copy</button>
+        <br />In Claude: Customize → Connectors → Add custom connector.</li>
+    </ol>
+    ${reach}
+    <script>
+      (function () {
+        var btn = document.getElementById('copy-mcp-url');
+        if (!btn || !navigator.clipboard) return;
+        btn.addEventListener('click', function () {
+          navigator.clipboard.writeText(btn.dataset.copy || '').then(function () {
+            btn.textContent = 'Copied';
+            setTimeout(function () { btn.textContent = 'Copy'; }, 1600);
+          });
+        });
+      })();
+    </script>
   </section>`;
 }
 
@@ -1387,13 +1392,12 @@ function renderInstallTile(tile: ModuleInstallTileState): string {
  * — scribe#53 tracks). Missing entries here fall through to "Manage
  * modules" only — i.e. modules without a declared first-party UI
  * surface. Vault is intentionally omitted: the wizard's own vault
- * step owns the post-vault-install flow and the lead "Start using
- * your vault" tile (above the install row) handles the vault-side
- * surface decision.
+ * step owns the post-vault-install flow and the lead tile (the
+ * Parachute app and the AI, T-476) is how a person starts using it.
  */
 const USE_IT_NOW_URLS: Partial<Record<CuratedModuleShort, string>> = {
-  // Empty: vault has its own lead "Start using" tile (the
-  // notes.parachute.computer CTA), so it doesn't appear here. Scribe
+  // Empty: vault has the done page's lead tile (the Parachute app and
+  // the AI), so it doesn't appear here. Scribe
   // doesn't ship an admin SPA at /scribe/admin/ that's useful for
   // first-time operators (the page exists but it's config-management;
   // not "use it"). Re-add per-module entries here if/when a module
@@ -1419,42 +1423,43 @@ const INSTALL_TILE_CSRF_PLACEHOLDER = "__INSTALL_TILE_CSRF__";
 
 /**
  * Render the "Your hub is reachable at" tile on the done step, shaped by
- * the operator's expose-mode choice. Always surfaces the loopback URL as
- * an anchor (the operator's own browser hits the wizard on it); the
- * tail-end instructions reframe based on what they picked.
+ * the operator's expose-mode choice. The hub's own address leads; what to
+ * do for other devices follows the choice. The tailscale command targets
+ * where the hub listens on this machine (`localTarget`), not 1939 by
+ * assumption (T-476: a hub on another port got a command for :1939).
  */
-function renderReachableTile(mode: SetupExposeMode, hubOrigin: string): string {
+function renderReachableTile(mode: SetupExposeMode, hubOrigin: string, localTarget: string): string {
   const safeOrigin = escapeHtml(hubOrigin);
+  const cmd = escapeHtml(tailscaleCommand(localTarget));
   if (mode === "localhost") {
     return `<section class="reachable">
       <h2>Your hub is reachable at</h2>
       <p class="reachable-url"><code>${safeOrigin}</code></p>
-      <p class="fine">Local to this machine only. Want to share it with your
-        other devices? Re-visit setup later from the admin UI or run
-        <code>tailscale serve --bg --https=1939 http://localhost:1939</code>
-        from a terminal.</p>
+      <p class="fine">On this computer only. To use your phone too, put the hub
+        on your Tailscale network: with Tailscale on this computer, run
+        <code>${cmd}</code>.</p>
     </section>`;
   }
   if (mode === "tailnet") {
     return `<section class="reachable">
       <h2>Your hub is reachable at</h2>
-      <p class="reachable-url"><code>${safeOrigin}</code> (loopback, this machine)</p>
-      <p class="reachable-url">Plus your tailnet URL once you run:</p>
-      <pre>tailscale serve --bg --https=1939 http://localhost:1939</pre>
-      <p class="fine">The Tailscale CLI prints the public hostname (e.g.
-        <code>my-mac.tailnet-name.ts.net</code>); use that on your phone /
-        other devices.</p>
+      <p class="reachable-url"><code>${safeOrigin}</code> on this computer</p>
+      <p class="reachable-url">and on your other devices once you run:</p>
+      <pre>${cmd}</pre>
+      <p class="fine">Tailscale prints the address (like
+        <code>https://my-mac.tailnet-name.ts.net:1939</code>); sign in with
+        that on your phone.</p>
     </section>`;
   }
   // public
   return `<section class="reachable">
       <h2>Your hub is reachable at</h2>
-      <p class="reachable-url"><code>${safeOrigin}</code> (loopback, this machine)</p>
-      <p class="fine">Wire a reverse proxy on your domain to
-        <code>${safeOrigin}</code>, then set <code>PARACHUTE_HUB_ORIGIN</code>
-        to your public URL and restart the hub. See the
-        <a href="https://parachute.computer/start/">deploy guide</a>
-        for nginx / Caddy / Cloudflare Tunnel examples.</p>
+      <p class="reachable-url"><code>${safeOrigin}</code></p>
+      <p class="fine">For a public address, point a reverse proxy or tunnel on
+        your domain at <code>${escapeHtml(localTarget)}</code>, then set
+        <code>PARACHUTE_HUB_ORIGIN</code> to your public URL and restart the
+        hub. See the
+        <a href="https://parachute.computer/start/">deploy guide</a>.</p>
     </section>`;
 }
 
@@ -1672,18 +1677,14 @@ export function handleSetupGet(req: Request, deps: SetupWizardDeps): Response {
       // Module install tiles (hub#272 Item B). One per curated module
       // other than vault (which the wizard already provisioned).
       const installTiles = buildInstallTiles(url, deps);
-      // The lead "Start using your vault" tile points at
-      // notes.parachute.computer/add — always, regardless of any
-      // local module install state. Prior versions of this code
-      // checked `isModuleInstalled("surface", ...)` to switch to a
-      // local `/surface/notes/` link, but the launch focus is
-      // hub+vault+scribe and notes.parachute.computer is the
-      // canonical Notes UI (Aaron-directed 2026-05-27). Dropped the
-      // local-fallback branch.
+      // The lead tile names the Parachute app and the AI, both at this
+      // hub's address, whatever modules are installed (T-476; it used to
+      // link Notes on a website, notes.parachute.computer).
       const doneProps: RenderDoneStepProps = {
         vaultName,
         hubOrigin: deps.issuer,
         installTiles,
+        localTarget: hubLocalTarget(deps.issuer, deps.loopbackPort),
       };
       if (exposeMode !== undefined) doneProps.exposeMode = exposeMode;
       // No `doneProps.mintedToken` — see the OAuth-default note above.
@@ -1708,7 +1709,13 @@ export function handleSetupGet(req: Request, deps: SetupWizardDeps): Response {
   // cookie was minted on step 2); on a stale tab without it, the post
   // handler shows the no-session error.
   if (state.hasAdmin && state.hasVault && !state.hasExposeMode) {
-    return new Response(renderExposeStep({ csrfToken: csrf.token }), {
+    return new Response(
+      renderExposeStep({
+        csrfToken: csrf.token,
+        hubOrigin: deps.issuer,
+        localTarget: hubLocalTarget(deps.issuer, deps.loopbackPort),
+      }),
+      {
       status: 200,
       headers: extraHeaders,
     });
@@ -2731,6 +2738,8 @@ export async function handleSetupExposePost(
       renderExposeStep({
         csrfToken: typeof formCsrf === "string" ? formCsrf : "",
         errorMessage: `Pick one of: ${SETUP_EXPOSE_MODES.join(", ")}.`,
+        hubOrigin: deps.issuer,
+        localTarget: hubLocalTarget(deps.issuer, deps.loopbackPort),
       }),
       400,
     );
@@ -3443,6 +3452,9 @@ const STYLES = `
     border: 1px solid ${PALETTE.borderLight};
     border-radius: 8px;
     padding: 0.75rem 1rem;
+    /* A grid item's min-width is its content's by default, so one long
+       command stretched its column off the card (T-476 walkers). */
+    min-width: 0;
   }
   .done-tile h2 {
     margin-top: 0;
@@ -3457,6 +3469,8 @@ const STYLES = `
     border-radius: 6px;
     padding: 0.5rem 0.75rem;
     overflow-x: auto;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
     font-size: 0.82rem;
     margin: 0.5rem 0;
   }
@@ -3557,6 +3571,8 @@ const STYLES = `
     font-size: 0.82rem;
     margin: 0.25rem 0;
     overflow-x: auto;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
   }
 
   /* reachable tile on the done step. Lives outside the .done-grid so it
@@ -3591,16 +3607,16 @@ const STYLES = `
     border-radius: 6px;
     padding: 0.5rem 0.75rem;
     overflow-x: auto;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
     font-size: 0.82rem;
     margin: 0.4rem 0;
   }
-  .reachable .fine { font-size: 0.85rem; color: ${PALETTE.fgMuted}; margin: 0.4rem 0 0; }
+  .reachable .fine, .start-using .fine { font-size: 0.85rem; color: ${PALETTE.fgMuted}; margin: 0.4rem 0 0; }
 
-  /* "Start using your vault" lead tile on the done step (hub#342).
-     Same visual weight as .reachable so the operator's eye lands here
-     as the primary user-facing entry — slightly more prominent
-     padding + a stronger heading to telegraph "this is the click
-     you're looking for." */
+  /* The lead tile on the done step (T-476: the Parachute app and the
+     AI). Slightly more prominent than .reachable: it is what a person
+     does next. */
   .start-using {
     background: ${PALETTE.cardBg};
     border: 1px solid ${PALETTE.accent};
@@ -3626,6 +3642,7 @@ const STYLES = `
     border-radius: 4px;
     font-family: ${FONT_MONO};
     font-size: 0.92em;
+    overflow-wrap: anywhere;
   }
   pre code {
     background: transparent;
