@@ -13,6 +13,8 @@
  * detection. See `docs/contracts/vault-portable-export.md`.
  */
 
+import fs from "node:fs";
+import path from "node:path";
 import { ensureGitAvailable } from "./git-preflight.ts";
 import { isOffline } from "./offline.ts";
 
@@ -107,6 +109,88 @@ export async function gitAddAll(repoDir: string): Promise<{ ok: boolean; stderr:
   const exitCode = await proc.exited;
   const stderr = new TextDecoder().decode(await new Response(proc.stderr).arrayBuffer());
   return { ok: exitCode === 0, stderr: stderr.trim() };
+}
+
+/**
+ * How old an empty `index.lock` must be before the mirror treats it as left behind by someone else's git. The
+ * mirror's own git runs only inside `withRepoLock` (one at a time per repo), so a lock found there is never ours; a
+ * lock older than this process was left by a git that died with an earlier run of the service.
+ */
+export const STALE_INDEX_LOCK_MS = 5 * 60_000;
+
+/** When this process started: a lock older than this can't belong to a git child of ours. */
+const PROCESS_STARTED_MS = Date.now() - process.uptime() * 1000;
+
+const repoChains = new Map<string, Promise<unknown>>();
+
+/**
+ * Run `fn` after every earlier `withRepoLock(repoDir, …)` of this process has finished. The mirror's cycles can
+ * overlap (a "Run now" during an event flush, a reload's new start while the old flush finishes); their git
+ * commands must not, or one would clear or trip over the other's index.lock.
+ */
+export async function withRepoLock<T>(repoDir: string, fn: () => Promise<T>): Promise<T> {
+  let key = path.resolve(repoDir);
+  try {
+    key = fs.realpathSync(repoDir); // one repo, however it is spelled
+  } catch {
+    // not there yet: the resolved path
+  }
+  const prev = repoChains.get(key) ?? Promise.resolve();
+  const run = prev.then(fn, fn);
+  const tail = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  repoChains.set(key, tail);
+  try {
+    return await run;
+  } finally {
+    if (repoChains.get(key) === tail) repoChains.delete(key);
+  }
+}
+
+/**
+ * Remove `index.lock` when a killed git left it: a regular, empty file, older than this process or than `maxAgeMs`.
+ * Call it only inside `withRepoLock`, so no git of this process is running in the repo.
+ *
+ * A process killed mid-`git add` (the out-of-memory killer takes the whole service, git child included) leaves the
+ * lock, and every later `git add` fails with "index.lock: File exists" until someone removes it: a mirror stopped
+ * committing for a day that way, its failure logged on every write and said nowhere. Git's own message tells a person
+ * to remove the file when no git is running; this does the same for the one writer the mirror has. A lock with
+ * content (git killed while writing the index), a fresh one, or a link is left alone: the commit then fails and the
+ * mirror says so in `last_error`, so a person looks. Returns the removed lock's mtime (ISO) or null.
+ */
+export async function clearStaleIndexLock(
+  repoDir: string,
+  maxAgeMs = STALE_INDEX_LOCK_MS,
+  now = Date.now(),
+  startedMs = PROCESS_STARTED_MS,
+): Promise<string | null> {
+  const proc = Bun.spawn(["git", "rev-parse", "--git-path", "index.lock"], {
+    cwd: repoDir,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  if ((await proc.exited) !== 0) return null;
+  const rel = new TextDecoder().decode(await new Response(proc.stdout).arrayBuffer()).trim();
+  if (!rel) return null;
+  const lock = path.resolve(repoDir, rel);
+  let st: fs.Stats;
+  try {
+    st = fs.lstatSync(lock);
+  } catch {
+    return null;
+  }
+  if (!st.isFile() || st.size !== 0) return null;
+  if (st.mtimeMs >= startedMs && now - st.mtimeMs < maxAgeMs) return null;
+  try {
+    fs.unlinkSync(lock);
+  } catch {
+    return null;
+  }
+  const since = new Date(st.mtimeMs).toISOString();
+  console.warn(`[git-commit] removed a stale ${rel} from ${since}; no git of this mirror holds it`);
+  return since;
 }
 
 /** Run `git commit -m <message>` in `repoDir`. Returns true on success. */
@@ -265,7 +349,14 @@ export function shouldCommit(stagedFiles: string[], notesChanged: number): {
  * the userinfo + `gho_/ghp_/glpat-` regex so log + status surfaces are
  * safe to display.
  */
-export async function runGitCommitCycle(opts: {
+/** Stage, decide and commit (and push) one export, serialized with every other git cycle on this repo. */
+export async function runGitCommitCycle(
+  opts: Parameters<typeof gitCommitCycleUnlocked>[0],
+): ReturnType<typeof gitCommitCycleUnlocked> {
+  return withRepoLock(opts.repoDir, () => gitCommitCycleUnlocked(opts));
+}
+
+async function gitCommitCycleUnlocked(opts: {
   repoDir: string;
   template: string;
   notesChanged: number;
@@ -282,6 +373,8 @@ export async function runGitCommitCycle(opts: {
 }): Promise<{
   committed: boolean;
   message?: string;
+  /** Why staging or committing failed; the mirror shows it as `last_error` instead of only logging it. */
+  error?: string;
   push?: { attempted: true; ok: boolean; error?: string };
 }> {
   // Preflight: every step below shells `git`. On a git-less server the first
@@ -293,10 +386,11 @@ export async function runGitCommitCycle(opts: {
 
   const now = opts.now ?? (() => new Date().toISOString());
 
+  await clearStaleIndexLock(opts.repoDir);
   const add = await gitAddAll(opts.repoDir);
   if (!add.ok) {
     console.error(`[git-commit] git add failed: ${add.stderr}`);
-    return { committed: false };
+    return { committed: false, error: `git add failed: ${add.stderr}` };
   }
 
   const staged = await listStagedFiles(opts.repoDir);
@@ -325,7 +419,7 @@ export async function runGitCommitCycle(opts: {
   const commit = await gitCommit(opts.repoDir, message);
   if (!commit.ok) {
     console.error(`[git-commit] git commit failed: ${commit.stderr}`);
-    return { committed: false };
+    return { committed: false, error: `git commit failed: ${commit.stderr}` };
   }
   console.log(`[git-commit] ${message}`);
 

@@ -432,6 +432,7 @@ import {
   handleSetupGet,
   handleSetupInstallPost,
   handleSetupVaultPost,
+  safeSetupReturn,
 } from "./setup-wizard.ts";
 import { getAllPublicKeys } from "./signing-keys.ts";
 import type { Supervisor } from "./supervisor.ts";
@@ -2785,6 +2786,7 @@ export function hubFetch(
           manifestPath,
           configDir: CONFIG_DIR,
           issuer: oauthDeps(req).issuer,
+          ...(loopbackPort !== undefined ? { loopbackPort } : {}),
           registry: getDefaultOperationsRegistry(),
           // hub#576: a loopback peer (the on-box operator's own shell) is allowed
           // to read the actual bootstrap token from the GET /admin/setup JSON
@@ -2880,19 +2882,25 @@ export function hubFetch(
       // pre-admin has no account to authenticate and falls through to the
       // JSON-503 gate, the right shape for a stray non-browser caller.
       //
-      // The `?next=<surface>` param is intentionally dropped: there's no
-      // account yet to return the visitor to, and the open surface they came
-      // from likely can't function until setup completes. They land on the
-      // wizard, not back on that surface.
+      // The `?next=<surface>` param rides along to the wizard (T-476) when it
+      // is a safe same-origin path: the wizard remembers it, and once setup is
+      // done its last page offers a button back (the Parachute app's sign-in,
+      // above all). Anything else is dropped.
       //
       // `cache-control: no-store` (the `/` + `/hub.html` funnel above omits
       // it) — this 302 reflects transient pre-setup state that flips the
       // moment an admin is created, so it must never be cached by a CDN or
       // bfcache and serve a stale "go finish setup" to a now-set-up hub.
       if (getDb && pathname === "/login" && req.method === "GET" && userCount(getDb()) === 0) {
+        // T-476: the sign-in's `next` rides along when it is a safe same-origin path, so the wizard's done page can
+        // send the person back into it (the Parachute app's /oauth/authorize). Anything else is dropped as before.
+        const next = safeSetupReturn(url.searchParams.get("next"));
         return new Response(null, {
           status: 302,
-          headers: { location: "/admin/setup", "cache-control": "no-store" },
+          headers: {
+            location: next ? `/admin/setup?next=${encodeURIComponent(next)}` : "/admin/setup",
+            "cache-control": "no-store",
+          },
         });
       }
 
