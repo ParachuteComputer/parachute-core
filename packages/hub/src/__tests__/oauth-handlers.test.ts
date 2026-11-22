@@ -546,12 +546,14 @@ describe("handleAuthorizeGet", () => {
   // "External: a third-party app that registered itself", and "what this app reads goes to the company that runs
   // it". The marker and the vendor line follow `parachuteAppHome`: a Parachute-looking name AND every redirect
   // first-party. Loopback alone is not enough (Claude Code returns to loopback, and its reads go to Anthropic).
-  async function consentFor(clientName: string, redirect: string, sameHub = false): Promise<string> {
+  async function consentFor(clientName: string, redirects: string | string[], sameHub = false): Promise<string> {
+    const redirectUris = [redirects].flat();
+    const redirect = redirectUris[0]!;
     const { db, cleanup } = await makeDb();
     try {
       const user = await createUser(db, "owner", "pw");
       const session = createSession(db, { userId: user.id });
-      const reg = registerClient(db, { redirectUris: [redirect], clientName, sameHub });
+      const reg = registerClient(db, { redirectUris, clientName, sameHub });
       const { challenge } = makePkce();
       const req = new Request(
         authorizeUrl({
@@ -580,7 +582,7 @@ describe("handleAuthorizeGet", () => {
   });
 
   test("Parachute's own app on this hub's origin: Parachute's, but not 'on this device' (T-476)", async () => {
-    const html = await consentFor("Parachute Notes", `${ISSUER}/notes/oauth/callback`, true);
+    const html = await consentFor("Parachute", `${ISSUER}/app/oauth/callback`, true);
     expect(html).toContain("Parachute's own app: it returns only to the address above.");
     expect(html).not.toContain("on this device: it returns");
     expect(html).not.toContain("company that runs it");
@@ -593,8 +595,24 @@ describe("handleAuthorizeGet", () => {
     expect(html).not.toContain("Parachute's app on this device");
   });
 
+  // Claude Code registers as "Claude Code (<server>)", and the hub's own commands name the server parachute or
+  // parachute-<vault>: the name contains the word, the redirect is loopback, and it is still not Parachute's app.
+  test("Claude Code connected as 'parachute' stays External with the company line (T-476)", async () => {
+    for (const name of ["Claude Code (parachute)", "Claude Code (parachute-work)", "Cursor (parachute)", "Parachute Notes"]) {
+      const html = await consentFor(name, "http://localhost:53682/callback");
+      expect(html).toContain('class="badge badge-trust-external"');
+      expect(html).toContain("What this app reads from your vault goes to the company that runs it.");
+    }
+  });
+
+  test("'Parachute' an operator registered with one loopback and one foreign redirect keeps the company line (T-476)", async () => {
+    const html = await consentFor("Parachute", ["http://127.0.0.1:47219/oauth/callback", "https://evil.example/cb"], true);
+    expect(html).toContain("What this app reads from your vault goes to the company that runs it.");
+    expect(html).not.toContain("Parachute's app on this device");
+  });
+
   test("a Parachute-named client an operator registered for a foreign redirect keeps the company line (T-476)", async () => {
-    const html = await consentFor("Parachute Bridge", "https://bridge.example/cb", true);
+    const html = await consentFor("Parachute", "https://bridge.example/cb", true);
     expect(html).toContain("What this app reads from your vault goes to the company that runs it.");
     expect(html).not.toContain("Parachute's own app");
   });

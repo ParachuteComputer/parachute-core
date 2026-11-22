@@ -186,10 +186,10 @@ export interface ConsentViewProps {
    */
   sameHub?: boolean;
   /**
-   * T-476: the client is Parachute's own app (`parachuteAppHome` in clients.ts: a Parachute-looking name, which only
-   * registers when every redirect is first-party, and every redirect first-party). `"device"`: every redirect is
-   * loopback. The page then says so instead of External, and drops the line about the company that runs the app.
-   * Absent for every other client, Claude Code on loopback included. Words only: approval and scopes don't read it.
+   * T-476: the client is Parachute's own app (`parachuteAppHome` in clients.ts: the app's exact name, and every
+   * registered redirect first-party). `"device"`: every redirect is loopback. The page then says so instead of
+   * External, and drops the line about the company that runs the app. Absent for every other client, Claude Code on
+   * loopback included (whatever its server is called). Words only: approval and scopes don't read it.
    */
   parachuteApp?: "device" | "elsewhere";
 }
@@ -319,8 +319,8 @@ export interface ApprovePendingViewProps {
   };
   /**
    * Same-origin hub-relative URL (path + search) to send the operator to
-   * after they sign in via the unauthenticated "Sign in as admin to
-   * approve" CTA. When this page is rendered in response to an
+   * after they sign in via the unauthenticated "Sign in" CTA (T-476; was "Sign in as admin to
+   * approve"). When this page is rendered in response to an
    * `/oauth/authorize?...` GET, the caller should pass that authorize
    * URL here so post-login the operator lands BACK on the OAuth flow
    * (now authenticated → sees inline approve form → one click → consent →
@@ -787,8 +787,7 @@ export function renderApprovePending(props: ApprovePendingViewProps): string {
         </p>`
     : `<h1>Sign in to your hub to continue</h1>
         <p class="subtitle">
-          ${escapeHtml(clientName)} wants to connect to this hub. Sign in, and you'll see what it asks for before
-          you approve it.
+          ${escapeHtml(clientName)} wants to connect to this hub. Sign in to continue.
         </p>`;
   const body = `
     <div class="card">

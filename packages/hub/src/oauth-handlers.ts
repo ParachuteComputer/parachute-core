@@ -1290,7 +1290,7 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
   // to that vault BEFORE the pending/consent branches below, so EVERY
   // downstream consumer sees the narrowed set:
   //
-  //   1. The consent screen — and the session-less "App not yet approved"
+  //   1. The consent screen — and the session-less "Sign in to your hub to continue"
   //      page (`pendingClientResponse`) — shows ONLY that vault's scopes
   //      instead of the whole-hub catalog. Narrowing DROPS non-vault scopes
   //      (`scribe:*`, `agent:send`, `hub:admin`) outright: the token this
@@ -1402,7 +1402,7 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
     // A request carrying a valid session auto-approves the pending client and
     // FALLS THROUGH into the normal consent path below (resource-narrow →
     // non-requestable gate → skip-consent / same-hub → consent render). A
-    // session-less request still renders the unauth "App not yet approved"
+    // session-less request still renders the unauth "Sign in to your hub to continue"
     // page (`pendingClientResponse`), whose sign-in CTA (`loginNextUrl`)
     // round-trips back to this authorize URL; after login the user re-enters
     // WITH a session → hits this auto-approve branch → consent.

@@ -503,7 +503,7 @@ describe("renderConsent", () => {
       params: PARAMS,
       csrfToken: CSRF,
       clientId: "c",
-      clientName: "Parachute Notes",
+      clientName: "Parachute",
       scopes: ["vault:work:read"],
       sameHub: true,
       parachuteApp: "elsewhere",

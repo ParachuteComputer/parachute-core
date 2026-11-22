@@ -440,8 +440,16 @@ as deferred; this section is the canonical record of why.
   for the app. Someone who isn't the hub's owner sends the link at the
   foot of the page to whoever runs it.
 - **"App not yet approved" with a button** → the inline approve form.
-  Review the `client_id` / `client_name` / `redirect_uris` / scopes
-  shown, then click "Approve".
+  Since single consent (2026-05-29) a signed-in request approves the
+  app before this page, so it is only a defensive path.
+- **The consent page's marker**: "External" for an app that registered
+  itself; "Parachute's app on this device" only for the client named
+  exactly "Parachute" whose every redirect is first-party (T-476,
+  `parachuteAppHome`). A loopback redirect alone doesn't earn it, and
+  neither does a name that merely holds the word (Claude Code registers
+  as "Claude Code (parachute)"). Software already on the machine can
+  still register "Parachute" on loopback; the page shows where it
+  returns.
 - **Headless contexts**: `parachute auth approve-client <id>`. List
   pending clients with `parachute auth pending-clients` to find the
   id.

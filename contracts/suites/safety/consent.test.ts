@@ -404,7 +404,10 @@ describe("the consent page says what the connection can read", () => {
 // phone with no session the page said "App not yet approved … send this link to your hub admin" to the hub's owner,
 // though signing in is all it takes. Red before T-476. A Parachute-looking name registers only when every redirect is
 // first-party, so the page may say so for that name; loopback alone may not (Claude Code returns to loopback too, and
-// what it reads goes to its maker). Mutant "consent-parachute-by-loopback" calls every loopback app Parachute's.
+// what it reads goes to its maker), and neither is a name that merely holds the word: Claude Code registers as
+// "Claude Code (parachute)" when connected as the hub's commands say. Only the app's exact name counts.
+// Mutant "consent-parachute-by-loopback" calls every loopback app Parachute's; "consent-parachute-by-word" every
+// Parachute-looking name.
 
 describe("Parachute's own app is named on the consent page; other apps stay External", () => {
   let session: string;
@@ -427,6 +430,15 @@ describe("Parachute's own app is named on the consent page; other apps stay Exte
   test("an app named Claude on loopback is still External, with the company line", async () => {
     const redirect = "http://127.0.0.1:53690/callback";
     const text = visibleText(await consentPage(session, await registered("Claude", redirect), redirect));
+    expect(text).toContain("External");
+    expect(text).toContain(vendor);
+    expect(text).not.toContain(marker);
+  });
+
+  test("Claude Code connected as 'parachute' (its name holds the word) is still External, with the company line", async () => {
+    // Claude Code registers as "Claude Code (<server>)"; the hub's own commands name the server parachute.
+    const redirect = "http://localhost:53691/callback";
+    const text = visibleText(await consentPage(session, await registered("Claude Code (parachute)", redirect), redirect));
     expect(text).toContain("External");
     expect(text).toContain(vendor);
     expect(text).not.toContain(marker);
