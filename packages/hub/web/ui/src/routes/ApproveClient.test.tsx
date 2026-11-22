@@ -253,6 +253,17 @@ describe("ApproveClient", () => {
       expect(assignSpy).not.toHaveBeenCalled();
     });
 
+    // T-476 (security): with an already-approved client the page navigates straight to return_to, with no server
+    // check in between; a backslash or tab path is another origin to the browser.
+    for (const bad of ["/\\evil.example/oauth/authorize", "/\t/evil.example/oauth/authorize", "/.//evil.example/x"]) {
+      it(`never auto-redirects off the hub (${JSON.stringify(bad)})`, async () => {
+        vi.mocked(api.getOauthClient).mockResolvedValue(pendingClient({ status: "approved" }));
+        renderRoute("c1", `?return_to=${encodeURIComponent(bad)}`);
+        await waitFor(() => expect(screen.getByText(/already approved/i)).toBeInTheDocument());
+        expect(assignSpy).not.toHaveBeenCalled();
+      });
+    }
+
     it("auto-redirects on load when the client is already approved AND return_to is set", async () => {
       // Race-tolerant resume: someone (parallel session, automation) approved
       // the client between the original /oauth/authorize → /admin/approve-

@@ -462,9 +462,10 @@ describe("Parachute's own app is named on the consent page; other apps stay Exte
 // `/login` and `/account/change-password` send the browser to the `next` they were given when it is "a path". The
 // check was `startsWith("/") && !startsWith("//")`, so `/\evil.example` passed, and a browser reads `\` as `/` in an
 // http(s) URL: `//evil.example`, another origin. A tab or newline is stripped from URLs the same way (`/<tab>/evil`).
-// Red before the fix. Each value signs in a fresh made-up user (a temporary password: the sign-in goes through
-// change-password, the second door that honours `next`), and both doors must keep the browser on the hub.
-// Mutant "next-backslash" puts the old check back.
+// Red before the fix. Each value signs in a fresh made-up user: first with a temporary password (the sign-in goes
+// through change-password, which honours `next`), then again with the new one (where `/login` honours it itself).
+// Every door must keep the browser on the hub.
+// Mutants "next-origin-unchecked", "next-control-chars" and "login-next-unchecked" each put one way out back.
 
 describe("a sign-in's next never sends the browser off the hub", () => {
   const where = (location: string | null) => (location === null ? null : new URL(location, s.hub).origin);
@@ -474,6 +475,7 @@ describe("a sign-in's next never sends the browser off the hub", () => {
     ["a scheme-relative path", "//evil.example/landing"],
     ["a tab", "/\t/evil.example/landing"],
     ["a carriage return", "/\r/evil.example/landing"],
+    ["a newline in the query", "/account/?x=1\r\nSet-Cookie:%20planted=1"],
   ] as const) {
     test(`next with ${label}`, async () => {
       const user = await newUser("consent-next");
@@ -495,6 +497,10 @@ describe("a sign-in's next never sends the browser off the hub", () => {
       await change.arrayBuffer();
       expect(change.status).toBe(302);
       expect(where(change.headers.get("location"))).toBe(HUB);
+      // Now with the password changed, /login itself honours next directly: it must hold too.
+      const again = await login(user, PASSWORD, await csrfPair(), next);
+      expect(again.status).toBe(302);
+      expect(where(again.location)).toBe(HUB);
     });
   }
 
