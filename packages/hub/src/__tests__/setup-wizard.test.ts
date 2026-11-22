@@ -5237,6 +5237,7 @@ describe("setup reached from a sign-in returns to it", () => {
     };
   }
 
+  let lastDone: Response | undefined;
   async function walk(next: string): Promise<string> {
     const db = openHubDb(hubDbPath(h.dir));
     try {
@@ -5252,6 +5253,12 @@ describe("setup reached from a sign-in returns to it", () => {
       const c = jar();
       // 1. The first-boot /login funnel lands here with the sign-in's next.
       const first = handleSetupGet(req(`/admin/setup?next=${encodeURIComponent(next)}`), deps);
+      const set = first.headers.getSetCookie().find((x) => x.startsWith(`${SETUP_RETURN_COOKIE}=`));
+      if (set) {
+        expect(set).toContain("Path=/admin/setup");
+        expect(set).toContain("HttpOnly");
+        expect(set).toContain("SameSite=Lax");
+      }
       c.take(first);
       const csrf = () => c.get(CSRF_COOKIE_NAME) ?? "";
       // 2. Account.
@@ -5281,6 +5288,7 @@ describe("setup reached from a sign-in returns to it", () => {
       // 5. Done.
       const done = handleSetupGet(req("/admin/setup?just_finished=1", { headers: { cookie: c.header() } }), deps);
       expect(done.status).toBe(200);
+      lastDone = done;
       return await done.text();
     } finally {
       db.close();
@@ -5298,6 +5306,75 @@ describe("setup reached from a sign-in returns to it", () => {
     expect(button![1]!.replaceAll("&amp;", "&")).toBe(authorize);
     expect(button![2]).toBe("Continue to the Parachute app");
     expect(html).not.toContain("<strong>Open the Parachute app</strong>");
+    // Spent once shown.
+    expect(lastDone!.headers.getSetCookie().some((x) => x.startsWith(`${SETUP_RETURN_COOKIE}=;`) && x.includes("Max-Age=0"))).toBe(true);
+  });
+
+  test("another app's sign-in: the button never carries that app's own name", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    const other = registerClient(db, { redirectUris: ["http://127.0.0.1:5000/cb"], clientName: "Your hub settings" });
+    db.close();
+    const html = await walk(`/oauth/authorize?client_id=${other.client.clientId}&state=s`);
+    expect(html).toContain(">Continue signing in</a>");
+    expect(html).not.toContain("Your hub settings");
+  });
+
+  function deps0(db: ReturnType<typeof openHubDb>) {
+    return {
+      db,
+      manifestPath: h.manifestPath,
+      configDir: h.dir,
+      readExposeStateFn: h.readExposeStateFn,
+      issuer: "http://127.0.0.1:26052",
+      registry: getDefaultOperationsRegistry(),
+    };
+  }
+  const NEXT = `/admin/setup?next=${encodeURIComponent("/oauth/authorize?client_id=x&state=s")}`;
+  const returnCookie = (res: Response) => res.headers.getSetCookie().some((x) => x.startsWith(`${SETUP_RETURN_COOKIE}=`));
+
+  test("nobody can plant a return once the hub has an admin", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "owner", "pw");
+      expect(returnCookie(handleSetupGet(req(NEXT), deps0(db)))).toBe(false);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("nor from a link on another site", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      expect(returnCookie(handleSetupGet(req(NEXT, { headers: { "sec-fetch-site": "cross-site" } }), deps0(db)))).toBe(false);
+      expect(returnCookie(handleSetupGet(req(NEXT, { headers: { "sec-fetch-site": "same-origin" } }), deps0(db)))).toBe(true);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("a tampered return cookie is checked again on the done page: an offsite one gives no button", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const user = await createUser(db, "owner", "pw");
+      writeManifest(
+        { services: [{ name: "parachute-vault", version: "0.1.0", port: 1940, paths: ["/vault/default"], health: "/health" }] },
+        h.manifestPath,
+      );
+      setSetting(db, "setup_expose_mode", "localhost");
+      const { createSession } = await import("../sessions.ts");
+      const session = createSession(db, { userId: user.id });
+      const res = handleSetupGet(
+        req("/admin/setup?just_finished=1", {
+          headers: { cookie: `${SESSION_COOKIE_NAME}=${session.id}; ${SETUP_RETURN_COOKIE}=${encodeURIComponent("https://evil.example/x")}` },
+        }),
+        deps0(db),
+      );
+      const html = await res.text();
+      expect(html).not.toContain('data-testid="continue-return"');
+      expect(html).not.toContain("evil.example");
+    } finally {
+      db.close();
+    }
   });
 
   test("an offsite return is dropped: no button, the done page stays as it is", async () => {

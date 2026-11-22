@@ -1035,7 +1035,8 @@ export function isPublicOrigin(origin: string, funnel = false): boolean {
  * done page stays as it is. Never an absolute URL: no open redirect.
  */
 export function safeSetupReturn(raw: string | null | undefined): string | null {
-  if (!raw || raw.length > 4096) return null;
+  // Encoded into a cookie (up to 3x longer) that must stay under the browser's 4 KB; real sign-ins are ~1 KB.
+  if (!raw || raw.length > 1500) return null;
   if (!raw.startsWith("/") || raw.startsWith("//") || raw.includes("\\")) return null;
   for (let i = 0; i < raw.length; i++) {
     const c = raw.charCodeAt(i);
@@ -1049,10 +1050,10 @@ export function safeSetupReturn(raw: string | null | undefined): string | null {
 /** The cookie that carries the return through the wizard's steps (account, vault, expose), on this browser only. */
 export const SETUP_RETURN_COOKIE = "parachute_setup_return";
 
-function setupReturnCookie(path: string, req: Request): string {
-  const parts = [`${SETUP_RETURN_COOKIE}=${encodeURIComponent(path)}`, "HttpOnly"];
+function setupReturnCookie(path: string | null, req: Request): string {
+  const parts = [`${SETUP_RETURN_COOKIE}=${path === null ? "" : encodeURIComponent(path)}`, "HttpOnly"];
   if (isHttpsRequest(req)) parts.push("Secure");
-  parts.push("SameSite=Lax", "Path=/admin/setup", "Max-Age=3600");
+  parts.push("SameSite=Lax", "Path=/admin/setup", path === null ? "Max-Age=0" : "Max-Age=3600");
   return parts.join("; ");
 }
 
@@ -1077,9 +1078,19 @@ function setupReturnLabel(returnTo: string, db: Database): string {
   if (!returnTo.startsWith("/oauth/authorize?")) return "Continue where you were";
   const clientId = new URLSearchParams(returnTo.slice("/oauth/authorize?".length)).get("client_id");
   const name = clientId ? getClient(db, clientId)?.clientName : null;
-  if (!name) return "Continue signing in";
-  if (PARACHUTE_APP_NAMES.has(name)) return "Continue to the Parachute app";
-  return `Continue to ${name}`;
+  // Never another app's own name on the hub's button: anyone can register a client called anything.
+  return name && PARACHUTE_APP_NAMES.has(name) ? "Continue to the Parachute app" : "Continue signing in";
+}
+
+/**
+ * Whether this request may set the return: only while the hub has no admin (the first-boot funnel is the only way
+ * here with a return), and only from this hub's own pages or a typed address, never a link on another site
+ * (`Sec-Fetch-Site`), so nobody can plant a button on someone else's done page.
+ */
+function mayRememberReturn(req: Request, db: Database): boolean {
+  const site = req.headers.get("sec-fetch-site");
+  if (site !== null && site !== "same-origin" && site !== "none") return false;
+  return userCount(db) === 0;
 }
 
 /** The tailscale command that puts the hub on the person's tailnet. */
@@ -1326,6 +1337,7 @@ function renderMcpTile(vaultName: string, hubOrigin: string): string {
  * website, never to the Parachute app). Two steps, both at this hub's own address:
  *
  *   1. Open the Parachute app and sign in with the address (the app's first screen says "Sign in with its address").
+ *      When setup was reached from a sign-in (`returnTo`), this step is a primary button back to it instead.
  *   2. Connect your AI: give it `<origin>/mcp`, with one Copy. On Claude: Customize → Connectors → Add custom
  *      connector.
  *
@@ -1622,7 +1634,9 @@ export function handleSetupGet(req: Request, deps: SetupWizardDeps): Response {
   // `/admin/setup?next=<path>` (the first-boot `/login` funnel carries the sign-in's `next` here): remember it for
   // the done page, on this browser, through every step. Only a safe same-origin path (`safeSetupReturn`).
   const returnPath = safeSetupReturn(new URL(req.url).searchParams.get("next"));
-  if (returnPath && !wantsJsonResponse(req)) res.headers.append("set-cookie", setupReturnCookie(returnPath, req));
+  if (returnPath && !wantsJsonResponse(req) && mayRememberReturn(req, deps.db)) {
+    res.headers.append("set-cookie", setupReturnCookie(returnPath, req));
+  }
   return res;
 }
 
@@ -1853,10 +1867,13 @@ function renderSetupGet(req: Request, deps: SetupWizardDeps): Response {
         INSTALL_TILE_CSRF_PLACEHOLDER,
         renderCsrfHiddenInput(csrf.token),
       );
-      return new Response(html, {
+      const done = new Response(html, {
         status: 200,
         headers: extraHeaders,
       });
+      // The return is spent once shown: a later visit doesn't carry it.
+      if (returnPath) done.headers.append("set-cookie", setupReturnCookie(null, req));
+      return done;
     }
     return new Response(null, { status: 301, headers: { location: "/login" } });
   }
