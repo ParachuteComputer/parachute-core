@@ -321,6 +321,8 @@ interface WizardStateSnapshot {
    */
   bootstrapToken?: string;
   csrfToken: string;
+  /** The hub's origin (its issuer), when the probe returned the JSON envelope (T-476). */
+  issuer?: string;
   /** Optional URL to redirect to (when state is fully done — 301 to /login). */
   redirectTo?: string;
 }
@@ -372,6 +374,7 @@ async function fetchWizardState(
   if (typeof body.bootstrapToken === "string" && body.bootstrapToken.length > 0) {
     snapshot.bootstrapToken = body.bootstrapToken;
   }
+  if (typeof body.issuer === "string" && body.issuer.length > 0) snapshot.issuer = body.issuer;
   return snapshot;
 }
 
@@ -609,9 +612,8 @@ async function walkVaultStep(
   const log = opts.log;
   log("");
   log("Step 2/3 — Vault");
-  log("  A vault is the per-workspace SQLite + MCP store. You can also");
-  log("  import one from a git repo, or skip and create one later from");
-  log("  the admin UI.");
+  log("  A vault holds your notes and records. Name your first one; you");
+  log("  can also import one from a git repo, or skip and create one later.");
   let mode: VaultMode | undefined = opts.vaultMode;
   if (mode === undefined) {
     log("");
@@ -759,12 +761,12 @@ async function walkExposeStep(
   const log = opts.log;
   log("");
   log("Step 3/3 — Expose mode");
-  log("  Where is this hub reachable from?");
+  log("  Where will you use Parachute?");
   let mode = opts.exposeMode;
   if (mode === undefined) {
-    log("  1) localhost — just this machine (default)");
-    log("  2) tailnet  — Tailscale network");
-    log("  3) public   — custom domain / reverse proxy");
+    log("  1) localhost — just this computer; your phone can't reach it (default)");
+    log("  2) tailnet  — your phone and other devices, over Tailscale");
+    log("  3) public   — anywhere, at a public address");
     for (let attempt = 0; attempt < 5; attempt++) {
       const raw = (await opts.prompt("  Pick [1]: ")).trim().toLowerCase();
       if (raw === "" || raw === "1" || raw === "localhost" || raw === "l") {
@@ -822,17 +824,22 @@ export async function runCliWizard(opts: RunCliWizardOpts): Promise<number> {
   // sequence; each step's pre-condition reads from the freshly-fetched
   // state so an idempotent re-run picks up at the right place.
   let state = await fetchWizardState(hubUrl, jar, fetchImpl);
+  // The hub's own origin, for the last lines: the state probe says it until setup completes (then /admin/setup
+  // redirects and the envelope is gone), so keep the first one seen. Falls back to the URL this wizard talks to.
+  let origin = state.issuer ?? hubUrl;
   if (state.step === "welcome" || state.step === "account") {
     const code = await walkAccountStep(hubUrl, jar, state, ctx);
     if (code !== 0) return code;
     // Refresh state — the account POST set the session cookie + advanced
     // the wizard. The next GET picks up the new step.
     state = await fetchWizardState(hubUrl, jar, fetchImpl);
+    if (state.issuer) origin = state.issuer;
   }
   if (state.step === "vault") {
     const code = await walkVaultStep(hubUrl, jar, state, ctx);
     if (code !== 0) return code;
     state = await fetchWizardState(hubUrl, jar, fetchImpl);
+    if (state.issuer) origin = state.issuer;
   }
   // Transcription step (onboarding-streamline hub PR1) — the CLI's parity with
   // the browser wizard's folded scribe sub-form. The hub's setup-state machine
@@ -865,16 +872,16 @@ export async function runCliWizard(opts: RunCliWizardOpts): Promise<number> {
     const code = await walkExposeStep(hubUrl, jar, state, ctx);
     if (code !== 0) return code;
     state = await fetchWizardState(hubUrl, jar, fetchImpl);
+    if (state.issuer) origin = state.issuer;
   }
-  // Done screen — fetch + show a brief summary. The browser wizard's
-  // done screen surfaces the bare OAuth `claude mcp add` command (no
-  // token, no header — vault is OAuth-default per parachute-vault #491);
-  // the CLI path never minted a token, so we just point the operator at
-  // the admin SPA + /admin/tokens for the headless-client case.
+  // Done — the same two next steps as the browser wizard's done page
+  // (T-476): the Parachute app, and the AI at <hub>/mcp. The admin UI and
+  // /admin/tokens (for a headless client) follow.
   log("");
   log("✓ Setup complete.");
-  log(`  Visit ${hubUrl}/admin/ to open the admin SPA.`);
-  log(`  Mint MCP / operator tokens at ${hubUrl}/admin/tokens.`);
+  log(`  Open the Parachute app and sign in with ${origin}`);
+  log(`  Connect your AI: give it ${origin}/mcp`);
+  log(`  Admin: ${hubUrl}/admin/ (tokens for scripts: ${hubUrl}/admin/tokens)`);
   return 0;
 }
 

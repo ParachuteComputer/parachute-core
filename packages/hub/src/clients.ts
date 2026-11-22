@@ -22,7 +22,7 @@
  * `handleAuthorizeGet` now session-gates a `pending` client: a request
  * carrying a valid session auto-approves the client (status → `approved`,
  * audit-logged) and FALLS THROUGH to the normal consent screen; a session-
- * less request still renders the unauth "App not yet approved" page whose
+ * less request still renders the unauth pending page ("Sign in to your hub to continue", T-476) whose
  * sign-in CTA round-trips back to authorize (after login the user re-enters
  * with a session → auto-approve → consent). The `status` column, the DCR
  * `pending` default, the `/oauth/token` pending rejection, and the
@@ -607,6 +607,33 @@ export function isFirstPartyRedirect(uri: string, hubOrigins: readonly string[])
   if (home === null) return false;
   if (home === "loopback" || PARACHUTE_APP_ORIGINS.includes(home)) return true;
   return hubOrigins.some((o) => redirectHome(o) === home);
+}
+
+/**
+ * The names Parachute's own app registers with (exact). The app (desktop, phone and its web build) registers as
+ * "Parachute" with a hub (parachute `src/vault/oauth.ts` CLIENT_NAME). Exact on purpose: `looksLikeParachute` reserves
+ * any name containing the word, and Claude Code registers as "Claude Code (<server>)", which is
+ * "Claude Code (parachute)" when connected the way the hub's own commands say (`mcp-connect-commands.ts`).
+ */
+export const PARACHUTE_APP_NAMES: ReadonlySet<string> = new Set(["Parachute"]);
+
+/**
+ * Where Parachute's own app returns, for the consent page's marker (T-476): `"device"` when every redirect is
+ * loopback, `"elsewhere"` when every redirect is first-party but not all on this device, or null when the client
+ * isn't Parachute's own. Parachute's own means one of `PARACHUTE_APP_NAMES` (reserved by `clientNameProblem` for
+ * first-party redirects) AND every registered redirect first-party (`isFirstPartyRedirect`), checked again here because
+ * an operator's registration may use the name for any redirect. A loopback redirect alone is not enough: Claude Code
+ * returns to loopback too, and what it reads goes to its maker. Accepted: software already on the person's machine
+ * can register "Parachute" with a loopback redirect, as it could before; the page still shows where it returns.
+ */
+export function parachuteAppHome(
+  name: string | null,
+  redirectUris: readonly string[],
+  hubOrigins: readonly string[],
+): "device" | "elsewhere" | null {
+  if (!name || !PARACHUTE_APP_NAMES.has(name) || redirectUris.length === 0) return null;
+  if (!redirectUris.every((u) => isFirstPartyRedirect(u, hubOrigins))) return null;
+  return redirectUris.every((u) => redirectHome(u) === "loopback") ? "device" : "elsewhere";
 }
 
 /**
