@@ -321,6 +321,8 @@ interface WizardStateSnapshot {
    */
   bootstrapToken?: string;
   csrfToken: string;
+  /** The hub's origin (its issuer), when the probe returned the JSON envelope (T-476). */
+  issuer?: string;
   /** Optional URL to redirect to (when state is fully done — 301 to /login). */
   redirectTo?: string;
 }
@@ -372,6 +374,7 @@ async function fetchWizardState(
   if (typeof body.bootstrapToken === "string" && body.bootstrapToken.length > 0) {
     snapshot.bootstrapToken = body.bootstrapToken;
   }
+  if (typeof body.issuer === "string" && body.issuer.length > 0) snapshot.issuer = body.issuer;
   return snapshot;
 }
 
@@ -763,7 +766,7 @@ async function walkExposeStep(
   if (mode === undefined) {
     log("  1) localhost — just this computer; your phone can't reach it (default)");
     log("  2) tailnet  — your phone and other devices, over Tailscale");
-    log("  3) public   — anywhere, at a domain you own");
+    log("  3) public   — anywhere, at a public address");
     for (let attempt = 0; attempt < 5; attempt++) {
       const raw = (await opts.prompt("  Pick [1]: ")).trim().toLowerCase();
       if (raw === "" || raw === "1" || raw === "localhost" || raw === "l") {
@@ -821,17 +824,22 @@ export async function runCliWizard(opts: RunCliWizardOpts): Promise<number> {
   // sequence; each step's pre-condition reads from the freshly-fetched
   // state so an idempotent re-run picks up at the right place.
   let state = await fetchWizardState(hubUrl, jar, fetchImpl);
+  // The hub's own origin, for the last lines: the state probe says it until setup completes (then /admin/setup
+  // redirects and the envelope is gone), so keep the first one seen. Falls back to the URL this wizard talks to.
+  let origin = state.issuer ?? hubUrl;
   if (state.step === "welcome" || state.step === "account") {
     const code = await walkAccountStep(hubUrl, jar, state, ctx);
     if (code !== 0) return code;
     // Refresh state — the account POST set the session cookie + advanced
     // the wizard. The next GET picks up the new step.
     state = await fetchWizardState(hubUrl, jar, fetchImpl);
+    if (state.issuer) origin = state.issuer;
   }
   if (state.step === "vault") {
     const code = await walkVaultStep(hubUrl, jar, state, ctx);
     if (code !== 0) return code;
     state = await fetchWizardState(hubUrl, jar, fetchImpl);
+    if (state.issuer) origin = state.issuer;
   }
   // Transcription step (onboarding-streamline hub PR1) — the CLI's parity with
   // the browser wizard's folded scribe sub-form. The hub's setup-state machine
@@ -864,14 +872,15 @@ export async function runCliWizard(opts: RunCliWizardOpts): Promise<number> {
     const code = await walkExposeStep(hubUrl, jar, state, ctx);
     if (code !== 0) return code;
     state = await fetchWizardState(hubUrl, jar, fetchImpl);
+    if (state.issuer) origin = state.issuer;
   }
   // Done — the same two next steps as the browser wizard's done page
   // (T-476): the Parachute app, and the AI at <hub>/mcp. The admin UI and
   // /admin/tokens (for a headless client) follow.
   log("");
   log("✓ Setup complete.");
-  log(`  Open the Parachute app and sign in with ${hubUrl}`);
-  log(`  Connect your AI: give it ${hubUrl}/mcp`);
+  log(`  Open the Parachute app and sign in with ${origin}`);
+  log(`  Connect your AI: give it ${origin}/mcp`);
   log(`  Admin: ${hubUrl}/admin/ (tokens for scripts: ${hubUrl}/admin/tokens)`);
   return 0;
 }

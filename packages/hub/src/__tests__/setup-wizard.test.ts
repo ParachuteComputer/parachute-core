@@ -916,7 +916,7 @@ describe("handleSetupGet", () => {
         configDir: h.dir,
         readExposeStateFn: h.readExposeStateFn,
         issuer: "http://127.0.0.1:26052",
-        loopbackPort: 1939,
+        loopbackPort: 4100,
         registry: getDefaultOperationsRegistry(),
       });
       const html = await res.text();
@@ -924,7 +924,7 @@ describe("handleSetupGet", () => {
       expect(html).not.toContain("localhost:1939");
       expect(html).toContain("Your phone can't reach it, not even on the same Wi-Fi.");
       expect(html).toContain("My phone and other devices (Tailscale)");
-      expect(html).toContain("tailscale serve --bg --https=1939 http://127.0.0.1:1939");
+      expect(html).toContain("tailscale serve --bg --https=1939 http://127.0.0.1:4100");
     } finally {
       db.close();
     }
@@ -1011,7 +1011,8 @@ describe("handleSetupGet", () => {
           manifestPath: h.manifestPath,
           configDir: h.dir,
           readExposeStateFn: h.readExposeStateFn,
-          issuer: "https://hub.example",
+          // A loopback origin: the hub is not on the tailnet / public yet, so the steps to get there show (T-476).
+          issuer: "http://127.0.0.1:1939",
           registry: getDefaultOperationsRegistry(),
         },
       );
@@ -1053,7 +1054,8 @@ describe("handleSetupGet", () => {
           manifestPath: h.manifestPath,
           configDir: h.dir,
           readExposeStateFn: h.readExposeStateFn,
-          issuer: "https://hub.example",
+          // A loopback origin: the hub is not on the tailnet / public yet, so the steps to get there show (T-476).
+          issuer: "http://127.0.0.1:1939",
           registry: getDefaultOperationsRegistry(),
         },
       );
@@ -4150,11 +4152,34 @@ describe("done screen — the lead tile: the Parachute app and your AI (T-476)",
 
   test("a loopback hub says it works on this computer only, and the tailscale command targets where the hub listens", async () => {
     // The walkers' hubs: PARACHUTE_HUB_ORIGIN on one port, serve listening on another.
-    const html = await donePage("http://127.0.0.1:26052", [], "localhost", 1939);
+    const html = await donePage("http://127.0.0.1:26052", [], "localhost", 4100);
     expect(html).toContain("On this computer only. To use your phone too");
-    expect(html).toContain("Claude on the web connects from the internet, so it needs a public address");
-    expect(html).toContain("tailscale serve --bg --https=1939 http://127.0.0.1:1939");
+    expect(html).toContain("Claude's apps connect from the internet, so they need a public address");
+    expect(html).toContain("tailscale serve --bg --https=1939 http://127.0.0.1:4100");
     expect(html).not.toContain("http://localhost:1939");
+  });
+
+  // Review (T-476): a hub already on the tailnet (`parachute expose tailnet` before setup) has the tailnet address as
+  // its origin; the page must not send the person to set up a second serve rule or to "use your tailnet address
+  // instead".
+  test("a hub already on the tailnet: its address works on every device; no command, no 'instead'", async () => {
+    const html = await donePage("https://my-mac.tailnet-name.ts.net", [], "tailnet", 1939);
+    expect(html).toContain("On this computer and every device on your Tailscale network.");
+    expect(html).not.toContain("tailscale serve");
+    expect(html).not.toContain("once it's set up");
+  });
+
+  test("a loopback hub that chose tailnet: the phone uses the tailnet address once it's set up", async () => {
+    const html = await donePage("http://127.0.0.1:26052", [], "tailnet", 1939);
+    expect(html).toContain("On your phone, use your tailnet address once it's set up (below).");
+    expect(html).toContain("tailscale serve --bg --https=1939 http://127.0.0.1:1939");
+  });
+
+  test("a public hub: Claude's connector steps with no 'needs a public address'", async () => {
+    const html = await donePage("https://hub.example", [], "public", 1939);
+    expect(html).toContain("In Claude: Customize → Connectors → Add custom connector.");
+    expect(html).not.toContain("need a public address");
+    expect(html).toContain("From anywhere.");
   });
 
   test("succeeded install op renders 'Manage modules' link (no 'Use it now' for modules without a hosted surface)", async () => {

@@ -47,6 +47,8 @@ interface FakeHubState {
   requireBootstrapToken?: boolean;
   /** hub#576: when set, the fake GET also returns it (loopback-probe behavior). */
   bootstrapToken?: string;
+  /** T-476: the hub's origin, as GET /admin/setup's JSON envelope carries it. */
+  issuer?: string;
   /** hub#576: when true, the account POST 401s unless the right token is supplied. */
   enforceBootstrapToken?: boolean;
 }
@@ -127,6 +129,7 @@ function makeFakeHub(initialState?: Partial<FakeHubState>): {
         csrfToken: csrf,
         // hub#576: a loopback probe carries the actual token value.
         ...(state.bootstrapToken ? { bootstrapToken: state.bootstrapToken } : {}),
+        ...(state.issuer ? { issuer: state.issuer } : {}),
         ...(op ? { operation: op } : {}),
       });
       return new Response(respBody, {
@@ -329,6 +332,27 @@ describe("parseWizardArgs", () => {
 });
 
 describe("runCliWizard", () => {
+  // T-476: the walkers' hubs had an origin other than the loopback URL the terminal wizard talks to. The last lines
+  // name the two next steps at the hub's own origin, as the browser wizard's done page does.
+  test("ends with the Parachute app and the AI at the hub's origin, not the loopback URL it talked to", async () => {
+    const { fetchImpl } = makeFakeHub({ issuer: "https://hub.example" });
+    const logs: string[] = [];
+    const code = await runCliWizard({
+      hubUrl: "http://127.0.0.1:1939",
+      log: (l) => logs.push(l),
+      fetchImpl,
+      sleep: async () => {},
+      accountUsername: "admin",
+      accountPassword: "longpassword",
+      vaultMode: "create",
+      vaultName: "default",
+      exposeMode: "localhost",
+    });
+    expect(code).toBe(0);
+    expect(logs).toContain("  Open the Parachute app and sign in with https://hub.example");
+    expect(logs).toContain("  Connect your AI: give it https://hub.example/mcp");
+  });
+
   test("walks account → vault(create) → expose end-to-end and exits 0", async () => {
     const { state, fetchImpl } = makeFakeHub();
     const logs: string[] = [];

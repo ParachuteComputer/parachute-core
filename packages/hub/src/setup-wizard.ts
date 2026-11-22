@@ -18,7 +18,8 @@
  *   5. Done — the Parachute app and the AI at this hub's address (T-476); developer
  *      things (Claude Code commands, admin UI, modules) under a fold.
  *
- * The wizard is server-rendered (no SPA bundle, no JS). Step 3's progress
+ * The wizard is server-rendered (no SPA bundle; a little inline JS for the vault
+ * form and the done page's Copy, and it works without it). Step 3's progress
  * poll is a `<meta http-equiv="refresh" content="2">` — works without JS
  * and is fine for a 30-second one-shot install on first boot.
  *
@@ -979,6 +980,16 @@ export function hubLocalTarget(issuer: string, loopbackPort?: number): string {
   return "http://127.0.0.1:1939";
 }
 
+/** True when the hub's origin is a loopback address: it works on this computer only, and no outside service reaches it. */
+function isLoopbackOrigin(origin: string): boolean {
+  try {
+    const host = new URL(origin).hostname.replace(/^\[|\]$/g, "");
+    return host === "localhost" || host === "::1" || /^127\./.test(host);
+  } catch {
+    return false;
+  }
+}
+
 /** The tailscale command that puts the hub on the person's tailnet. */
 function tailscaleCommand(localTarget: string): string {
   return `tailscale serve --bg --https=1939 ${localTarget}`;
@@ -1047,9 +1058,9 @@ export function renderExposeStep(props: RenderExposeStepProps): string {
           <input type="radio" name="expose_mode" value="public"${sel("public")} />
           <div class="expose-option-body">
             <span class="expose-option-title">Anywhere, at a public address</span>
-            <span class="expose-option-desc">A domain you own points at this
-              hub. Needed for Claude on the web, which connects from the
-              internet. See the
+            <span class="expose-option-desc">A public address (your own
+              domain, or Tailscale Funnel) points at this hub. Claude's apps
+              connect from the internet, so they need this. See the
               <a href="https://parachute.computer/start/" target="_blank" rel="noopener">deploy guide</a>
               (reverse proxy or Cloudflare Tunnel, and
               <code>PARACHUTE_HUB_ORIGIN</code>).</span>
@@ -1224,29 +1235,33 @@ function renderMcpTile(vaultName: string, hubOrigin: string): string {
 function renderStartUsingTile(hubOrigin: string, exposeMode?: SetupExposeMode): string {
   const origin = hubOrigin.replace(/\/+$/, "");
   const mcpUrl = `${origin}/mcp`;
-  const reach =
-    exposeMode === "public"
-      ? ""
-      : exposeMode === "tailnet"
-        ? `<p class="fine">On your phone and other devices, use your tailnet address instead (below). Claude on the web
-          connects from the internet, so it needs a public address; Claude Code on this computer works with this one.</p>`
-        : `<p class="fine">Claude on the web connects from the internet, so it needs a public address; Claude Code on
-          this computer works with this one.</p>`;
+  const loopback = isLoopbackOrigin(origin);
+  // Claude's apps (web, desktop, phone) reach a custom connector from the internet: a loopback or tailnet address
+  // isn't reachable for them. Claude Code on this computer is.
+  const public_ = exposeMode === "public" && !loopback;
+  const phone =
+    loopback && exposeMode === "tailnet"
+      ? `<br />On your phone, use your tailnet address once it's set up (below).`
+      : "";
+  const claude = public_
+    ? `<br />In Claude: Customize → Connectors → Add custom connector.`
+    : `<br />Claude's apps connect from the internet, so they need a public address; then add it in Claude
+        under Customize → Connectors → Add custom connector. Claude Code on this computer works with this one now.`;
   return `<section class="start-using" data-testid="start-using-tile">
     <h2>Start using Parachute</h2>
     <ol>
       <li><strong>Open the Parachute app</strong> and sign in with
-        <code data-testid="app-address">${escapeHtml(origin)}</code>.</li>
+        <code data-testid="app-address">${escapeHtml(origin)}</code>.${phone}</li>
       <li><strong>Connect your AI:</strong> give it
         <code data-testid="mcp-url">${escapeHtml(mcpUrl)}</code>
-        <button type="button" class="btn btn-secondary" id="copy-mcp-url" data-copy="${escapeAttr(mcpUrl)}">Copy</button>
-        <br />In Claude: Customize → Connectors → Add custom connector.</li>
+        <button type="button" class="btn btn-secondary" id="copy-mcp-url" data-copy="${escapeAttr(mcpUrl)}" hidden>Copy</button>${claude}</li>
     </ol>
-    ${reach}
     <script>
       (function () {
+        // Shown only where the clipboard works (a secure context: https or localhost).
         var btn = document.getElementById('copy-mcp-url');
         if (!btn || !navigator.clipboard) return;
+        btn.hidden = false;
         btn.addEventListener('click', function () {
           navigator.clipboard.writeText(btn.dataset.copy || '').then(function () {
             btn.textContent = 'Copied';
@@ -1431,6 +1446,7 @@ const INSTALL_TILE_CSRF_PLACEHOLDER = "__INSTALL_TILE_CSRF__";
 function renderReachableTile(mode: SetupExposeMode, hubOrigin: string, localTarget: string): string {
   const safeOrigin = escapeHtml(hubOrigin);
   const cmd = escapeHtml(tailscaleCommand(localTarget));
+  const loopback = isLoopbackOrigin(hubOrigin);
   if (mode === "localhost") {
     return `<section class="reachable">
       <h2>Your hub is reachable at</h2>
@@ -1441,6 +1457,14 @@ function renderReachableTile(mode: SetupExposeMode, hubOrigin: string, localTarg
     </section>`;
   }
   if (mode === "tailnet") {
+    // Already on the tailnet (`parachute expose tailnet` before setup): the origin is the tailnet address.
+    if (!loopback) {
+      return `<section class="reachable">
+      <h2>Your hub is reachable at</h2>
+      <p class="reachable-url"><code>${safeOrigin}</code></p>
+      <p class="fine">On this computer and every device on your Tailscale network.</p>
+    </section>`;
+    }
     return `<section class="reachable">
       <h2>Your hub is reachable at</h2>
       <p class="reachable-url"><code>${safeOrigin}</code> on this computer</p>
@@ -1452,6 +1476,13 @@ function renderReachableTile(mode: SetupExposeMode, hubOrigin: string, localTarg
     </section>`;
   }
   // public
+  if (!loopback) {
+    return `<section class="reachable">
+      <h2>Your hub is reachable at</h2>
+      <p class="reachable-url"><code>${safeOrigin}</code></p>
+      <p class="fine">From anywhere.</p>
+    </section>`;
+  }
   return `<section class="reachable">
       <h2>Your hub is reachable at</h2>
       <p class="reachable-url"><code>${safeOrigin}</code></p>
@@ -1495,6 +1526,8 @@ export function handleSetupGet(req: Request, deps: SetupWizardDeps): Response {
       hasExposeMode: boolean;
       requireBootstrapToken: boolean;
       csrfToken: string;
+      /** The hub's origin (public: it is in /.well-known), for the terminal wizard's last lines (T-476). */
+      issuer: string;
       bootstrapToken?: string;
       operation?: {
         id: string;
@@ -1509,6 +1542,7 @@ export function handleSetupGet(req: Request, deps: SetupWizardDeps): Response {
       hasExposeMode: state.hasExposeMode,
       requireBootstrapToken: requireToken,
       csrfToken: csrf.token,
+      issuer: deps.issuer.replace(/\/+$/, ""),
     };
     // hub#616: the CLI wizard polls vault-provisioning over THIS session-authed
     // surface (mirroring the browser wizard's `/admin/setup?op=<id>` re-GET),
@@ -1682,7 +1716,7 @@ export function handleSetupGet(req: Request, deps: SetupWizardDeps): Response {
       // link Notes on a website, notes.parachute.computer).
       const doneProps: RenderDoneStepProps = {
         vaultName,
-        hubOrigin: deps.issuer,
+        hubOrigin: deps.issuer.replace(/\/+$/, ""),
         installTiles,
         localTarget: hubLocalTarget(deps.issuer, deps.loopbackPort),
       };
@@ -1712,7 +1746,7 @@ export function handleSetupGet(req: Request, deps: SetupWizardDeps): Response {
     return new Response(
       renderExposeStep({
         csrfToken: csrf.token,
-        hubOrigin: deps.issuer,
+        hubOrigin: deps.issuer.replace(/\/+$/, ""),
         localTarget: hubLocalTarget(deps.issuer, deps.loopbackPort),
       }),
       {
@@ -2738,7 +2772,7 @@ export async function handleSetupExposePost(
       renderExposeStep({
         csrfToken: typeof formCsrf === "string" ? formCsrf : "",
         errorMessage: `Pick one of: ${SETUP_EXPOSE_MODES.join(", ")}.`,
-        hubOrigin: deps.issuer,
+        hubOrigin: deps.issuer.replace(/\/+$/, ""),
         localTarget: hubLocalTarget(deps.issuer, deps.loopbackPort),
       }),
       400,
