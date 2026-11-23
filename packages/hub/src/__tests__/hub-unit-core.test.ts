@@ -1,5 +1,5 @@
 // Inside @openparachute/core, a `parachute-hub.service` that starts the 0.7 hub is the takeover's paused leftover
-// (stopped, disabled, its file kept). No verb may take it for the hub's own unit: starting it would put the old hub
+// (fenced off, stopped, disabled, its file kept). No verb may take it for the hub's own unit: starting it would put the old hub
 // on a home core serves. A hub unit that starts core (what `init` writes inside core) is the hub's own, as before;
 // and outside core nothing changes.
 import { afterEach, describe, expect, test } from "bun:test";

@@ -21,6 +21,7 @@
  * handlers stay focused on protocol logic and the templates stay focused
  * on presentation.
  */
+import { isSameOriginPath } from "./same-origin-path.ts";
 import type { Database } from "bun:sqlite";
 import {
   ACCOUNT_VAULTS_UNNARROWED,
@@ -49,6 +50,7 @@ import {
   expandRedirectUrisForHubOrigins,
   getClient,
   isValidRedirectUri,
+  parachuteAppHome,
   registerClient,
   requireRegisteredRedirectUri,
   verifyClientSecret,
@@ -59,6 +61,7 @@ import {
   isCoveredByGrant,
   isCoveredByGrantForClientName,
   recordGrant,
+  releaseGrantScopes,
 } from "./grants.ts";
 import {
   GrantChangedError,
@@ -82,6 +85,7 @@ import {
   liveFamilyRefreshRows,
   refreshRowGeneration,
   revokeFamily,
+  revokeTokenByJti,
   signAccessToken,
   signRefreshToken,
   KeyNameTakenError,
@@ -1287,7 +1291,7 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
   // to that vault BEFORE the pending/consent branches below, so EVERY
   // downstream consumer sees the narrowed set:
   //
-  //   1. The consent screen — and the session-less "App not yet approved"
+  //   1. The consent screen — and the session-less "Sign in to your hub to continue"
   //      page (`pendingClientResponse`) — shows ONLY that vault's scopes
   //      instead of the whole-hub catalog. Narrowing DROPS non-vault scopes
   //      (`scribe:*`, `agent:send`, `hub:admin`) outright: the token this
@@ -1399,7 +1403,7 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
     // A request carrying a valid session auto-approves the pending client and
     // FALLS THROUGH into the normal consent path below (resource-narrow →
     // non-requestable gate → skip-consent / same-hub → consent render). A
-    // session-less request still renders the unauth "App not yet approved"
+    // session-less request still renders the unauth "Sign in to your hub to continue"
     // page (`pendingClientResponse`), whose sign-in CTA (`loginNextUrl`)
     // round-trips back to this authorize URL; after login the user re-enters
     // WITH a session → hits this auto-approve branch → consent.
@@ -1562,9 +1566,10 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
   //     reviewer fold, follow-up). A zero-vault non-admin whose prior
   //     grants survived a `setUserVaults(_, [])` admin action would
   //     otherwise silently re-mint a token against the now-revoked
-  //     vault assignment — the grants table has no FK cascade from
-  //     `user_vaults`, so deleting assignments doesn't revoke grants.
-  //     Same privesc shape as the same-hub auto-trust gate below;
+  //     vault assignment. (Since core #129 every `user_vaults` write also
+  //     takes the vault out of the user's grants and revokes their tokens
+  //     there, `endVaultAuthorityBeyondRole`; this gate stays as the
+  //     second line, for grants from before that.) Same privesc shape as the same-hub auto-trust gate below;
   //     identical guard (`userHasVaultPosture`). Force fall-through to
   //     the consent render where the zero-vault gate in
   //     `handleConsentSubmit` also refuses (defense in depth). This
@@ -1721,6 +1726,7 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
         requestedScopes.some(isAccountVaultsConnectionScope)
           ? [...perVaultOffer(db, session.userId, userIsAdmin, assignedVaults, vaultNames)].map(([vault, max]) => ({ vault, max }))
           : undefined,
+        resolveBoundOrigins(deps),
       ),
     ),
     200,
@@ -2457,15 +2463,20 @@ async function handleConsentSubmit(
   // narrower scope than requested, and the token response's `scope` tells the
   // client what it actually got. Google, GitHub and Slack all ship this.
   //
-  // Back-compatible by construction: `granted_scope` fields are only honoured
-  // when the form supplies at least one. A programmatic POST (or an older
-  // cached consent page) that omits them entirely keeps the previous
-  // approve-everything-requested behaviour, so no existing flow breaks.
+  // Honoured whenever the page drew the boxes (`granted_scope_present=1`, see
+  // below), even with none ticked: that is the denial further down. A
+  // programmatic POST (or an older cached consent page) that sends neither the
+  // marker nor any `granted_scope` keeps the previous approve-everything-
+  // requested behaviour, so no scripted flow breaks.
+  // One box may carry several wire forms that read the same (space-separated). `granted_scope_present` says the page
+  // drew the boxes (T-476): then only what is ticked is granted, even nothing, which is the denial below. Without it
+  // (a programmatic POST, an older page), the fallback above holds.
   const grantedFields = form
     .getAll("granted_scope")
-    .map((v) => String(v))
+    .flatMap((v) => String(v).split(" "))
     .filter((v) => v.length > 0);
-  if (grantedFields.length > 0) {
+  const boxesShown = String(form.get("granted_scope_present") ?? "") === "1";
+  if (boxesShown || grantedFields.length > 0) {
     const kept = new Set(grantedFields);
     scopes = scopes.filter((sc) => kept.has(sc));
   }
@@ -2907,14 +2918,13 @@ export async function handleApproveClientPost(
  * builds on, and that broader same-origin gates (the agent-grant OAuth
  * callback's `returnTo`) reuse directly — they need to return the operator to
  * a `/admin/...` page, not specifically `/oauth/authorize`. Single source of
- * truth for "is this an open redirect?" — do NOT reimplement the
- * `startsWith("/") && !startsWith("//")` check elsewhere.
+ * truth for "is this an open redirect?" on return-to: its same-origin core is
+ * `isSameOriginPath` (same-origin-path.ts), which sign-in's `next` shares.
  */
 export function isSafeHubReturnTo(value: string): boolean {
-  if (!value) return false;
-  // Reject scheme-relative ("//evil.example/foo") and absolute URLs. Only
-  // single-slash root-relative paths are allowed.
-  if (!value.startsWith("/") || value.startsWith("//")) return false;
+  // A path on this hub only (`isSameOriginPath`): no scheme, no `//`, no backslash (`/\host` is `//host` to a
+  // browser), no control characters.
+  if (!isSameOriginPath(value)) return false;
   // Reject `..` traversal sequences — literal AND percent-encoded (`%2e%2e`),
   // since redirectToReturn's `new URL()` parse decodes them before emitting the
   // path. They stay same-origin but a target that walks the path tree is never a
@@ -3548,6 +3558,11 @@ async function rotateAndRespond(
  * intentionally don't surface "found vs not-found" so a caller probing
  * with random strings can't enumerate live tokens.
  *
+ * A revoke that ends a live row of the calling client also trims the
+ * (user, client) grant to the vault scopes its other live tokens still hold
+ * (RFC 7009 §2.1; `releaseGrantScopes`, T-476), so the consent page shows
+ * again for what the app gave back. Rotation's revokes don't trim.
+ *
  * Closes #73.
  */
 export async function handleRevoke(
@@ -3593,7 +3608,14 @@ export async function handleRevoke(
     return new Response(null, { status: 200 });
   }
   if (row && !row.revokedAt) {
-    db.prepare("UPDATE tokens SET revoked_at = ? WHERE jti = ?").run(now.toISOString(), row.jti);
+    // RFC 7009 §2.1: revoking a refresh token may also end the authorization grant behind it. The grant keeps only
+    // the vault scopes a live token of this (user, client) still holds, so a scope the app gave back is asked for
+    // again (T-476, `releaseGrantScopes`). Only a row this revoke ended: one already revoked changes nothing.
+    const target = row;
+    db.transaction(() => {
+      const ended = revokeTokenByJti(db, target.jti, now);
+      if (ended && target.userId) releaseGrantScopes(db, target.userId, target.clientId, target.scopes, now);
+    })();
   }
   return new Response(null, { status: 200 });
 }
@@ -3894,8 +3916,11 @@ function consentProps(
   // which this pure props builder deliberately doesn't take.
   grantableExtras: readonly string[] = [],
   vaultLevels?: ReadonlyArray<{ vault: string; max: "read" | "write" }>,
+  // The origins this hub answers on, to tell Parachute's own app from the rest (T-476, `parachuteAppHome`).
+  hubOrigins: readonly string[] = [],
 ) {
   const requestedScopes = params.scope.split(" ").filter((s) => s.length > 0);
+  const parachuteApp = parachuteAppHome(client.clientName, client.redirectUris, hubOrigins);
   const unnamedVerbs = unnamedVaultVerbs(requestedScopes);
   // Zero-vault non-admin can't authorize a vault-scoped request (hub#431).
   // The POST handler already 400s this case ("No vaults assigned"); this
@@ -4018,21 +4043,12 @@ function consentProps(
   // do not substitute unnamed rows as `vault:<that-vault>:<verb>` or the
   // consent screen would lie about what Approve mints. Multi-vault already
   // used the `<TBD>` placeholder; single-vault admin now does too.
-  // Keep the first wire value for each display-normalized scope. Resource
-  // narrowing can produce the same named value from distinct requested forms,
-  // and the consent page should offer one row/checkbox for that permission.
-  const seenScopeKeys = new Set<string>();
-  const scopes = requestedScopes.filter((scope) => {
-    const key = canonicalConsentScope(scope, displayVault);
-    if (seenScopeKeys.has(key)) return false;
-    seenScopeKeys.add(key);
-    return true;
-  });
   return {
     params,
     clientId: client.clientId,
     clientName: client.clientName ?? client.clientId,
-    scopes,
+    // every requested wire form: the page groups them, one box posting all of a row's forms (T-476)
+    scopes: requestedScopes,
     csrfToken,
     vaultPicker,
     displayVault,
@@ -4050,6 +4066,8 @@ function consentProps(
     // consent screen. Clean DB-backed signal: the `same_hub` column written
     // at DCR time (bearer hub:admin / same-origin session → true).
     sameHub: client.sameHub,
+    // T-476: Parachute's own app says so instead of External, and has no company its reads go to. Words only.
+    ...(parachuteApp ? { parachuteApp } : {}),
     grantableExtras,
     ...(vaultLevels ? { vaultLevels } : {}),
   };

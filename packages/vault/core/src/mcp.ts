@@ -669,6 +669,8 @@ export interface GenerateMcpToolsOpts {
     noteVisible?: (note: Note) => boolean | Promise<boolean>;
     /** The session's tag scope, stamped on each ticket so its spend re-checks it (scope gap 7). */
     scopedTags?: string[];
+    /** The session's grant, stamped on each ticket so its spend re-checks that it is still in force. */
+    grant?: string;
   };
   /**
    * `AttachmentBytesProvider` seam (Wave 2 model lane — D10, same "tools
@@ -3106,6 +3108,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             transcribe: params.transcribe === true,
             ...(validSegment ? { segmentIndex: segIdx } : {}),
             ...(ticketSeam.scopedTags ? { scopedTags: [...ticketSeam.scopedTags] } : {}),
+            ...(ticketSeam.grant ? { grant: ticketSeam.grant } : {}),
           };
           await ticketSeam.provider.put(ticket);
 
@@ -3169,6 +3172,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             mimeType: downloadMime,
             sizeBytes: declaredSize,
             ...(ticketSeam.scopedTags ? { scopedTags: [...ticketSeam.scopedTags] } : {}),
+            ...(ticketSeam.grant ? { grant: ticketSeam.grant } : {}),
           };
           await ticketSeam.provider.put(ticket);
 

@@ -85,16 +85,16 @@ async function csrfPair(): Promise<{ token: string; cookie: string }> {
   return { token, cookie: c };
 }
 
-/** POST /login once; returns the status and the session cookie, if one was set. */
-async function login(username: string, password: string, csrf: { token: string; cookie: string }) {
+/** POST /login once; returns the status, where it sends the browser, and the session cookie, if one was set. */
+async function login(username: string, password: string, csrf: { token: string; cookie: string }, next?: string) {
   const r = await safeFetch(`${s.hub}/login`, {
     method: "POST",
     redirect: "manual",
     headers: { "content-type": "application/x-www-form-urlencoded", cookie: `parachute_hub_csrf=${csrf.cookie}` },
-    body: new URLSearchParams({ __csrf: csrf.token, username, password }),
+    body: new URLSearchParams({ __csrf: csrf.token, username, password, ...(next !== undefined ? { next } : {}) }),
   });
   await r.arrayBuffer();
-  return { status: r.status, session: cookie(r, "parachute_hub_session") };
+  return { status: r.status, location: r.headers.get("location"), session: cookie(r, "parachute_hub_session") };
 }
 
 /** Sign a made-up user in and change their temporary password, as they would on first sign-in. */
@@ -398,6 +398,121 @@ describe("the consent page says what the connection can read", () => {
   });
 });
 
+// ── 3c. Parachute's own app is named as such; everyone else stays External (T-476) ───────────────────────────
+// Three first-run walkers met their own Parachute app (it returns to 127.0.0.1) as "External: a third-party app that
+// registered itself", with "what this app reads goes to the company that runs it"; one nearly pressed Deny. And on a
+// phone with no session the page said "App not yet approved … send this link to your hub admin" to the hub's owner,
+// though signing in is all it takes. Red before T-476. The name "Parachute" registers only when every redirect is
+// first-party, so the page may say so for that name; loopback alone may not (Claude Code returns to loopback too, and
+// what it reads goes to its maker), and neither may a name that merely holds the word: Claude Code registers as
+// "Claude Code (parachute)" when connected as the hub's commands say. Only the app's exact name counts.
+// Mutant "consent-parachute-by-loopback" calls every loopback app Parachute's; "consent-parachute-by-word" every
+// Parachute-looking name.
+
+describe("Parachute's own app is named on the consent page; other apps stay External", () => {
+  let session: string;
+  const marker = "Parachute's app on this device: it returns only here.";
+  const vendor = "What this app reads from your vault goes to the company that runs it.";
+
+  test("setup: a made-up user signs in", async () => {
+    session = await signIn(await newUser("consent-own-app"));
+  });
+
+  test("Parachute's app on this device: no External, no company", async () => {
+    const redirect = "http://127.0.0.1:47219/oauth/callback";
+    const text = visibleText(await consentPage(session, await registered("Parachute", redirect), redirect));
+    expect(text).toContain(marker);
+    expect(text).not.toContain("External");
+    expect(text).not.toContain("registered itself");
+    expect(text).not.toContain(vendor);
+  });
+
+  test("an app named Claude on loopback is still External, with the company line", async () => {
+    const redirect = "http://127.0.0.1:53690/callback";
+    const text = visibleText(await consentPage(session, await registered("Claude", redirect), redirect));
+    expect(text).toContain("External");
+    expect(text).toContain(vendor);
+    expect(text).not.toContain(marker);
+  });
+
+  test("Claude Code connected as 'parachute' (its name holds the word) is still External, with the company line", async () => {
+    // Claude Code registers as "Claude Code (<server>)"; the hub's own commands name the server parachute.
+    const redirect = "http://localhost:53691/callback";
+    const text = visibleText(await consentPage(session, await registered("Claude Code (parachute)", redirect), redirect));
+    expect(text).toContain("External");
+    expect(text).toContain(vendor);
+    expect(text).not.toContain(marker);
+  });
+
+  test("with no session, the page leads with signing in; the admin link comes last", async () => {
+    const redirect = "http://127.0.0.1:47219/oauth/callback";
+    const id = await registered("Parachute", redirect);
+    const r = await safeFetch(`${s.hub}/oauth/authorize?${new URLSearchParams(authorizeParams(id, redirect, READ))}`, { redirect: "manual" });
+    const html = await r.text();
+    const text = visibleText(html.slice(html.indexOf("<body")));
+    expect(text).toContain("Sign in to your hub to continue");
+    expect(text).not.toContain("App not yet approved");
+    expect(text.indexOf("Sign in to your hub to continue")).toBeLessThan(text.indexOf("Not this hub's owner?"));
+    // The button still goes through sign-in and back to this same authorize request.
+    expect(html).toMatch(/href="\/login\?next=%2Foauth%2Fauthorize%3F[^"]*"[^>]*>\s*Sign in\s*</);
+  });
+});
+
+// ── 3d. a sign-in's next never leaves the hub (T-476, security) ──────────────────────────────────────────────
+// `/login` and `/account/change-password` send the browser to the `next` they were given when it is "a path". The
+// check was `startsWith("/") && !startsWith("//")`, so `/\evil.example` passed, and a browser reads `\` as `/` in an
+// http(s) URL: `//evil.example`, another origin. A tab or newline is stripped from URLs the same way (`/<tab>/evil`).
+// Red before the fix. Each value signs in a fresh made-up user: first with a temporary password (the sign-in goes
+// through change-password, which honours `next`), then again with the new one (where `/login` honours it itself).
+// Every door must keep the browser on the hub.
+// Mutants "next-origin-unchecked", "next-control-chars" and "login-next-unchecked" each put one way out back.
+
+describe("a sign-in's next never sends the browser off the hub", () => {
+  const where = (location: string | null) => (location === null ? null : new URL(location, s.hub).origin);
+  for (const [label, next] of [
+    ["a backslash", "/\\evil.example/landing"],
+    ["an encoded backslash", "/%5Cevil.example/landing"],
+    ["a scheme-relative path", "//evil.example/landing"],
+    ["a tab", "/\t/evil.example/landing"],
+    ["a carriage return", "/\r/evil.example/landing"],
+    ["a newline in the query", "/account/?x=1\r\nSet-Cookie:%20planted=1"],
+  ] as const) {
+    test(`next with ${label}`, async () => {
+      const user = await newUser("consent-next");
+      const csrf = await csrfPair();
+      const r = await login(user, TEMP, csrf, next);
+      expect(r.status).toBe(302);
+      expect(where(r.location)).toBe(HUB);
+      // The temporary password sends the person to change it, carrying next; that door must hold too.
+      const change = await safeFetch(`${s.hub}/account/change-password`, {
+        method: "POST",
+        redirect: "manual",
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          cookie: `parachute_hub_session=${r.session}; parachute_hub_csrf=${csrf.cookie}`,
+          origin: HUB,
+        },
+        body: new URLSearchParams({ __csrf: csrf.token, current_password: TEMP, new_password: PASSWORD, new_password_confirm: PASSWORD, next }),
+      });
+      await change.arrayBuffer();
+      expect(change.status).toBe(302);
+      expect(where(change.headers.get("location"))).toBe(HUB);
+      // Now with the password changed, /login itself honours next directly: it must hold too.
+      const again = await login(user, PASSWORD, await csrfPair(), next);
+      expect(again.status).toBe(302);
+      expect(where(again.location)).toBe(HUB);
+    });
+  }
+
+  test("control: a plain path on the hub is still honoured", async () => {
+    const user = await newUser("consent-next-ok");
+    const csrf = await csrfPair();
+    const r = await login(user, TEMP, csrf, "/account/");
+    expect(r.status).toBe(302);
+    expect(r.location).toContain("next=%2Faccount%2F");
+  });
+});
+
 // ── 4. the box's lockout holds under a parallel burst ───────────────────────────────────────────────────────
 
 describe("a parallel burst of wrong passwords locks the account out at the limit", () => {
@@ -452,5 +567,84 @@ describe("a parallel burst of wrong passwords locks the account out at the limit
     // One bucket per account: /login is closed for this user too.
     const viaLogin = await login(user, TEMP, await csrfPair());
     expect({ status: viaLogin.status, session: viaLogin.session ?? null }).toEqual({ status: 429, session: null });
+  });
+});
+
+// ── 5. what the person unticks is not granted (T-476) ───────────────────────────────────────────────────────
+//
+// The per-scope boxes sat outside the consent <form>, so a browser posted none of them and the box granted every
+// scope the app asked for: a developer unticked vault admin for Claude and the token still held it. Here the form is
+// posted as a browser posts it: its hidden inputs, and its ticked boxes minus the ones the person unticks.
+
+describe("a box the person unticks on the consent page is not granted", () => {
+  let session: string;
+  const redirect = "https://untick-agent.example/oauth/callback";
+  const WRITE = `vault:${s.vaultName}:write`;
+
+  /** The consent form's fields as a browser posts them, with these scope boxes unticked. */
+  function browserFields(html: string, untick: string[]): [string, string][] {
+    const at = html.indexOf('class="auth-form consent-form"');
+    if (at < 0) throw new Error("setup: no consent form on the page");
+    const form = html.slice(at, html.indexOf("</form>", at));
+    const attr = (tag: string, name: string) => new RegExp(`\\s${name}="([^"]*)"`).exec(tag)?.[1];
+    const out: [string, string][] = [];
+    for (const [tag] of form.matchAll(/<input\b[^>]*>/g)) {
+      const name = attr(tag, "name");
+      if (!name) continue;
+      const type = attr(tag, "type") ?? "text";
+      const value = (attr(tag, "value") ?? "on").replace(/&amp;/g, "&");
+      if (type === "hidden") out.push([name, value]);
+      else if ((type === "checkbox" || type === "radio") && /\schecked\b/.test(tag)) {
+        if (name === "granted_scope" && value.split(" ").some((v) => untick.includes(v))) continue;
+        out.push([name, value]);
+      }
+    }
+    return out;
+  }
+
+  /** Approve with these boxes unticked; the token's scope, or the error the app is sent back with. */
+  async function approve(scope: string, untick: string[]): Promise<{ scope: string } | { error: string }> {
+    // a new app each time: an app the person already approved reconnects without the page
+    const id = await registered(`Untick Agent ${randomBytes(3).toString("hex")}`, redirect);
+    const verifier = randomBytes(32).toString("base64url");
+    const params = { client_id: id, redirect_uri: redirect, response_type: "code", scope, code_challenge: createHash("sha256").update(verifier).digest("base64url"), code_challenge_method: "S256", state: randomBytes(8).toString("hex") };
+    const page = await authorize(session, params);
+    if (page.status !== 200 || !page.html.includes('value="consent"')) throw new Error(`setup: expected the consent page, got ${page.status}`);
+    const body = new URLSearchParams(browserFields(page.html, untick));
+    body.set("approve", "yes");
+    const r = await safeFetch(`${s.hub}/oauth/authorize`, {
+      method: "POST",
+      redirect: "manual",
+      headers: { "content-type": "application/x-www-form-urlencoded", cookie: `parachute_hub_session=${session}; parachute_hub_csrf=${page.csrf}`, origin: HUB },
+      body,
+    });
+    await r.arrayBuffer();
+    expect(r.status).toBe(302);
+    const back = new URL(r.headers.get("location")!);
+    if (back.searchParams.get("error")) return { error: back.searchParams.get("error")! };
+    const t = await safeFetch(`${s.hub}/oauth/token`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ grant_type: "authorization_code", code: back.searchParams.get("code")!, client_id: id, redirect_uri: redirect, code_verifier: verifier }),
+    });
+    const json: any = await t.json();
+    if (t.status !== 200) throw new Error(`the token request gave ${t.status}: ${JSON.stringify(json).slice(0, 200)}`);
+    return { scope: String(json.scope).split(" ").sort().join(" ") };
+  }
+
+  test("setup: a made-up user signs in", async () => {
+    session = await signIn(await newUser("consent-untick"));
+  });
+
+  test("left as drawn: what was asked", async () => {
+    expect(await approve(`${READ} ${WRITE}`, [])).toEqual({ scope: [READ, WRITE].sort().join(" ") });
+  });
+
+  test("write unticked: the token reads only", async () => {
+    expect(await approve(`${READ} ${WRITE}`, [WRITE])).toEqual({ scope: READ });
+  });
+
+  test("everything unticked: a denial, never everything", async () => {
+    expect(await approve(`${READ} ${WRITE}`, [READ, WRITE])).toEqual({ error: "access_denied" });
   });
 });

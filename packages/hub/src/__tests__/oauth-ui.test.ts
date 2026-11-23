@@ -100,6 +100,38 @@ describe("renderLogin", () => {
 });
 
 describe("renderConsent", () => {
+  // SECURITY (T-476 stranger walk): the per-scope checkboxes sat outside the <form>, so a browser posted none of them,
+  // and the submit handler's no-granted_scope fallback granted every requested scope: unticking admin did nothing.
+  test("each requested scope's checkbox is inside the consent form, so an unticked one is not posted", () => {
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "Claude",
+      scopes: ["vault:read", "vault:write", "vault:admin"],
+    });
+    const open = html.indexOf('class="auth-form consent-form"');
+    const close = html.indexOf("</form>", open);
+    expect(open).toBeGreaterThan(-1);
+    const boxes = [...html.matchAll(/<input type="checkbox" name="granted_scope"/g)].map((m) => m.index ?? -1);
+    expect(boxes.length).toBe(3);
+    for (const at of boxes) {
+      expect(at).toBeGreaterThan(open);
+      expect(at).toBeLessThan(close);
+    }
+  });
+
+  test("a scope with no built-in words keeps a ticked box: a consent that posts its ticks must not drop it", () => {
+    const html = renderConsent({ params: PARAMS, csrfToken: CSRF, clientId: "c", clientName: "App", scopes: ["vault:read", "mystery.module:do-thing"] });
+    expect(html).toContain('<input type="checkbox" name="granted_scope" value="mystery.module:do-thing" checked />');
+    expect(html).toContain('<input type="hidden" name="granted_scope_present" value="1" />');
+  });
+
+  test("the approve-client page shows the asked scopes read-only: no box there chooses anything", () => {
+    const html = renderApprovePending({ clientName: "App", clientId: "c", redirectUris: ["https://app.example/cb"], requestedScopes: ["vault:read", "account:self:admin"], requestedVault: null, hubOrigin: "https://hub.example", approveForm: null, loginNextUrl: "/" } as unknown as Parameters<typeof renderApprovePending>[0]);
+    expect(html).not.toContain('name="granted_scope"');
+  });
+
   test("shows client name, client_id, and a row per scope", () => {
     const html = renderConsent({
       params: PARAMS,
@@ -448,6 +480,52 @@ describe("renderConsent", () => {
     expect(html).not.toContain("Registered through this hub");
   });
 
+  // T-476: Parachute's own app (a Parachute-looking name with only first-party redirects, `parachuteAppHome`) said
+  // "External: a third-party app" and "goes to the company that runs it". A walker nearly pressed Deny.
+  test("Parachute's own app on this device: a plain marker, no External, no company line", () => {
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "Parachute",
+      scopes: ["vault:work:read"],
+      sameHub: false,
+      parachuteApp: "device",
+    });
+    expect(html).toContain("Parachute's app on this device: it returns only here.");
+    expect(html).not.toContain('class="badge badge-trust-external"');
+    expect(html).not.toContain("registered itself");
+    expect(html).not.toContain("company that runs it");
+  });
+
+  test("Parachute's own app on a first-party address that isn't this device: says so, no company line", () => {
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "Parachute",
+      scopes: ["vault:work:read"],
+      sameHub: true,
+      parachuteApp: "elsewhere",
+    });
+    expect(html).toContain("it returns only to the address above.");
+    expect(html).not.toContain("on this device: it returns");
+    expect(html).not.toContain("company that runs it");
+  });
+
+  test("any other app keeps External and the company line", () => {
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "Claude Code",
+      scopes: ["vault:work:read"],
+      sameHub: false,
+    });
+    expect(html).toContain('class="badge badge-trust-external"');
+    expect(html).toContain("What this app reads from your vault goes to the company that runs it.");
+  });
+
   test("renders no trust marker when provenance is unknown (sameHub omitted)", () => {
     const html = renderConsent({
       params: PARAMS,
@@ -709,7 +787,7 @@ describe("renderApprovePending unauthenticated CTAs", () => {
     // approves the client but discards any OAuth context — fine here
     // because there's no OAuth flow to discard.
     const html = renderApprovePending(COMMON);
-    expect(html).toContain("Sign in as admin to approve");
+    expect(html).toMatch(/approve-signin-cta">\s*Sign in\s*<\/a>/);
     const expectedHref = `/login?next=${encodeURIComponent("/admin/approve-client/client-xyz")}`;
     expect(html).toContain(`href="${expectedHref}"`);
   });
@@ -728,7 +806,7 @@ describe("renderApprovePending unauthenticated CTAs", () => {
       "/oauth/authorize?client_id=client-xyz&redirect_uri=https%3A%2F%2Fapp.example%2Fcb" +
       "&response_type=code&code_challenge=abc&code_challenge_method=S256&state=rt";
     const html = renderApprovePending({ ...COMMON, loginNextUrl: authorizeUrl });
-    expect(html).toContain("Sign in as admin to approve");
+    expect(html).toContain('class="btn btn-primary approve-signin-cta"');
     const expectedHref = `/login?next=${encodeURIComponent(authorizeUrl)}`;
     expect(html).toContain(`href="${expectedHref}"`);
     // Sanity: the legacy SPA approve path is NOT what `next` points at.
@@ -755,6 +833,23 @@ describe("renderApprovePending unauthenticated CTAs", () => {
     const html = renderApprovePending({ ...COMMON, hubOrigin: "https://hub.example.com/" });
     expect(html).toContain("https://hub.example.com/admin/approve-client/client-xyz");
     expect(html).not.toContain("https://hub.example.com//admin/");
+  });
+
+  // T-476: walkers who own the hub met "App not yet approved … send this link to your hub admin" on their phone,
+  // though signing in approves the app for them. The page leads with signing in; the admin link comes last.
+  test("leads with signing in; the admin link is the fallback at the foot", () => {
+    const html = renderApprovePending(COMMON);
+    const heading = html.indexOf("<h1>Sign in to your hub to continue</h1>");
+    const button = html.indexOf('class="btn btn-primary approve-signin-cta"');
+    const details = html.indexOf('class="approve-meta"');
+    const share = html.indexOf("Not this hub's owner?");
+    expect(heading).toBeGreaterThan(-1);
+    expect(button).toBeGreaterThan(heading);
+    expect(details).toBeGreaterThan(button);
+    expect(share).toBeGreaterThan(details);
+    expect(html).toContain("<title>Sign in to continue</title>");
+    expect(html).not.toContain("App not yet approved");
+    expect(html).not.toContain("Sign in as admin");
   });
 
   test("retired CLI hint does NOT appear in the unauthenticated branch", () => {
@@ -788,8 +883,10 @@ describe("renderApprovePending unauthenticated CTAs", () => {
     // → "Approve" per design-system.md §5 (Approve is canon; the suffix
     // was verbal noise implying optionality where there is none).
     expect(html).toContain(">Approve</button>");
-    expect(html).not.toContain("Sign in as admin to approve");
-    expect(html).not.toContain("Or send this link to your hub admin");
+    expect(html).not.toContain('class="btn btn-primary approve-signin-cta"');
+    expect(html).not.toContain("Not this hub's owner?");
+    expect(html).not.toContain("Sign in to your hub to continue");
+    expect(html).toContain("<h1>App not yet approved</h1>");
     expect(html).not.toContain("parachute auth approve-client");
   });
 

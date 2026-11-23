@@ -96,14 +96,16 @@ describe("history", () => {
     expect((await api.get(`/notes/${made.body.id}`)).body.content).toBe("first");
   });
 
-  test("a plain delete leaves a trace an admin can list; forgetting takes an admin", async () => {
+  test("a plain delete leaves a trace write access can list; forgetting takes an admin", async () => {
     const made = await api.post("/notes", { content: "to delete", path: `${runId("hist")}/d` });
     await api.del(`/notes/${made.body.id}`);
     const listed = await admin.get("/history/deleted");
     expect(listed.status).toBe(200);
     fp("history/deleted.shape", shape(Array.isArray(listed.body) ? listed.body.slice(0, 1) : listed.body));
+    // write access may list what it can put back (T-476); the shape is the same as the admin's
     const asWriter = await api.get("/history/deleted");
-    expect(asWriter.status).toBe(403);
+    expect(asWriter.status).toBe(200);
+    expect((asWriter.body.notes as { id: string }[]).some((n) => n.id === made.body.id)).toBe(true);
     const made2 = await api.post("/notes", { content: "to forget", path: `${runId("hist")}/f` });
     const forget = await api.del(`/notes/${made2.body.id}?erase_history=true`);
     expect(forget.status).toBe(403);

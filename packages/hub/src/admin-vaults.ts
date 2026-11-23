@@ -80,6 +80,7 @@ import { SERVICES_MANIFEST_PATH } from "./config.ts";
 import { readConnections, renameConnectionsForVault } from "./connections-store.ts";
 import { renameGrantsForVault, rewriteGrantsRemovingVault } from "./grants.ts";
 import { renameInvitesForVault, revokeInvitesForVault } from "./invites.ts";
+import { removeShareInvitesForVault, renameShareInvitesForVault } from "./share-invites.ts";
 import { inferAudience } from "./jwt-audience.ts";
 import {
   ACCESS_TOKEN_TTL_SECONDS,
@@ -960,6 +961,8 @@ export async function handleDeleteVault(
 
   // --- 4. Unredeemed invites pinned to the vault. ----------------------------
   summary.invites_invalidated = revokeInvitesForVault(deps.db, name, now);
+  // and its share invites (share-invites.ts): a re-created same-name vault inherits no invite and no one's name
+  removeShareInvitesForVault(deps.db, name);
 
   // --- 4b. Per-vault storage cap row (v15). ----------------------------------
   // A re-created same-name vault must not inherit a stale cap; drop it.
@@ -1187,6 +1190,7 @@ export async function handleRenameVault(
       grants_rewritten: number;
       user_vaults_renamed: number;
       invites_renamed: number;
+      share_invites_renamed: number;
       vault_cap_renamed: number;
       channel_vaults_renamed: number;
       tokens_rescoped: number;
@@ -1206,6 +1210,7 @@ export async function handleRenameVault(
           grants_rewritten: renameGrantsForVault(deps.db, oldName, newName),
           user_vaults_renamed: renameVaultAssignments(deps.db, oldName, newName),
           invites_renamed: renameInvitesForVault(deps.db, oldName, newName),
+          share_invites_renamed: renameShareInvitesForVault(deps.db, oldName, newName),
           vault_cap_renamed: renameVaultCap(deps.db, oldName, newName),
           channel_vaults_renamed: renameChannelVaultsForVault(deps.db, oldName, newName),
           tokens_rescoped: tokens.rescoped,

@@ -982,6 +982,47 @@ export function migrate(db: Database): void {
   }
   ensureKeys(db);
   ensureGrantGenerations(db);
+  ensureSharing(db);
+}
+
+/**
+ * Sharing a vault with a friend (T-476; share-invites.ts; app docs/design/SHARING.md). Not a numbered migration, for
+ * the same reason as `keys`: it is additive, an older hub ignores it, and hub.db keeps schema 24 so the 0.8 takeover's
+ * code-only rollback still opens it. A share invite has a table of its own, not a row of `invites`, so an older hub's
+ * password page (which redeems any open `invites` row) can never turn a share code into a password account.
+ *
+ *   share_invites        one invite to one vault, for one person the owner named; single use, accepted with a key
+ *     id                 sha256 of the code (the code is shown once and never kept)
+ *     vault_name         the vault it lets into, as a `member`
+ *     invitee_name       the name the owner gave the friend: their name on that vault
+ *     created_by         the owner's users.id
+ *     expires_at, used_at, redeemed_user_id, revoked_at, created_at
+ *   users.display_name   the name a person goes by on this hub, shown beside their writes; shown, never checked
+ *
+ * Idempotent at every open: checked with a read, then the write lock (IMMEDIATE), as `ensureKeys` does.
+ */
+export function ensureSharing(db: Database): void {
+  const hasTable = !!db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'share_invites'").get();
+  const hasName = (db.query("PRAGMA table_info(users)").all() as { name: string }[]).some((c) => c.name === "display_name");
+  if (hasTable && hasName) return;
+  db.transaction(() => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS share_invites (
+        id TEXT PRIMARY KEY,
+        vault_name TEXT NOT NULL,
+        invitee_name TEXT NOT NULL,
+        created_by TEXT,
+        expires_at TEXT NOT NULL,
+        used_at TEXT,
+        redeemed_user_id TEXT,
+        revoked_at TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS share_invites_vault ON share_invites (vault_name);
+    `);
+    const cols = db.query("PRAGMA table_info(users)").all() as { name: string }[];
+    if (!cols.some((c) => c.name === "display_name")) db.exec("ALTER TABLE users ADD COLUMN display_name TEXT");
+  }).immediate();
 }
 
 /**

@@ -86,6 +86,10 @@ const FAKE_SYSTEMCTL = `#!/bin/sh
 #   clean environment and a session of its own (no terminal's hang-up reaches it), as STATE/<unit>.pid; stop ends
 #   it; is-active says "failed" once its process is gone; show names its MainPID. The seeded old units start that
 #   way too (the stock home starts the ones seeded as running).
+# - A start (start, restart, enable --now) checks the unit's AssertPathExists= lines first (the unit file, then its
+#   drop-ins, as loaded at the last daemon-reload: a drop-in written or removed since counts only after one), as
+#   systemd does: one that fails refuses the start ("Assertion failed on job for <unit>.", exit 1) and changes
+#   nothing. A path with a leading ! asserts it is absent.
 # - show prints a unit file's Environment= lines (systemd prints the assignments it would pass); show-environment
 #   prints the environment every unit starts from (the manager's).
 STATE=__STATE__
@@ -128,6 +132,21 @@ run_unit() {
   ) &
   echo $! > "$STATE/$1.pid"
 }
+load_asserts() {
+  for f in "$UNITS"/*.service; do
+    [ -f "$f" ] || continue
+    u=$(basename "$f"); all="$f"; for d in "$UNITS/$u.d"/*.conf; do [ -f "$d" ] && all="$all $d"; done
+    cat $all | sed -n 's/^AssertPathExists=//p' > "$STATE/$u.asserts"
+  done
+}
+asserts_ok() {
+  [ -f "$STATE/$1.asserts" ] || return 0
+  for a in $(cat "$STATE/$1.asserts"); do
+    case "$a" in "!"*) [ -e "\${a#!}" ] && return 1 ;; *) [ -e "$a" ] || return 1 ;; esac
+  done
+  return 0
+}
+refuse() { echo "Assertion failed on job for $1." >&2; exit 1; }
 # Stop the unit's processes, all of them, as systemd stops a unit's cgroup: its main process, its process group (it
 # runs in a session of its own) and every descendant (a supervisor may start children in groups of their own).
 descendants() { for c in $(ps -o pid= --ppid "$1" 2>/dev/null); do echo "$c"; descendants "$c"; done; }
@@ -142,7 +161,7 @@ stop_unit() {
 }
 code=0
 case "$verb" in
-  daemon-reload) exit 0 ;;
+  daemon-reload) load_asserts; exit 0 ;;
   show-environment)
     # As systemd prints it: a value with a space, a quote or a backslash in its $'…' form, those two escaped.
     q() { case "$1" in *" "*|*\\'*|*\\\\*) printf '%s%s%s' '$'"'" "$(printf '%s' "$1" | sed -e 's/[\\\\]/\\\\\\\\/g' -e "s/'/\\\\\\\\'/g")" "'" ;; *) printf '%s' "$1" ;; esac; }
@@ -153,10 +172,10 @@ case "$verb" in
     for u in $units; do
       known "$u" || { echo "Unit $u not found." >&2; exit 5; }
       case "$verb" in
-        start) echo active > "$STATE/$u.active"; run_unit "$u" ;;
-        restart) stop_unit "$u"; echo active > "$STATE/$u.active"; run_unit "$u" ;;
+        start) asserts_ok "$u" || refuse "$u"; echo active > "$STATE/$u.active"; run_unit "$u" ;;
+        restart) asserts_ok "$u" || refuse "$u"; stop_unit "$u"; echo active > "$STATE/$u.active"; run_unit "$u" ;;
         stop) stop_unit "$u"; echo inactive > "$STATE/$u.active" ;;
-        enable) echo enabled > "$STATE/$u.enabled"; if [ -n "$now" ]; then echo active > "$STATE/$u.active"; run_unit "$u"; fi ;;
+        enable) echo enabled > "$STATE/$u.enabled"; if [ -n "$now" ]; then asserts_ok "$u" || refuse "$u"; echo active > "$STATE/$u.active"; run_unit "$u"; fi ;;
         disable) echo disabled > "$STATE/$u.enabled"; if [ -n "$now" ]; then stop_unit "$u"; echo inactive > "$STATE/$u.active"; fi ;;
       esac
     done; exit 0 ;;

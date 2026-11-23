@@ -37,6 +37,7 @@
 import { useEffect, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 import { type AdminClientView, HttpError, approveOauthClient, getOauthClient } from "../lib/api.ts";
+import { isSameOriginPath } from "../../../../src/same-origin-path.ts";
 
 type LoadState =
   | { kind: "loading" }
@@ -153,21 +154,14 @@ export function ApproveClient() {
 }
 
 /**
- * Validate a `return_to` value as a hub-relative URL we're willing to
- * navigate to. Must start with `/` and must NOT start with `//`
- * (otherwise it's a scheme-relative URL pointing off-origin). Mirrors
- * the server-side `isSafeAuthorizeReturnTo` shape (which additionally
- * requires `/oauth/authorize?` prefix — the SPA could match that too,
- * but keeping the SPA's gate slightly broader lets future flows wire
- * different resume targets without touching the SPA. The server is the
- * authoritative gate; the SPA's job is to refuse the obvious bad shapes
- * before round-tripping a useless value).
+ * Validate a `return_to` value as a hub-relative URL we're willing to navigate to: the hub's one rule,
+ * `isSameOriginPath` (`src/same-origin-path.ts`), so `/\host`, a tab or `//host` never leaves the hub (T-476). The
+ * server-side `isSafeAuthorizeReturnTo` additionally requires the `/oauth/authorize?` prefix; the SPA's gate stays a
+ * little broader so other resume targets can be wired without touching it. The server is the authoritative gate for
+ * what it redirects to; this one guards the `window.location.assign` below, which the server never sees.
  */
 function isSafeReturnTo(value: string): boolean {
-  if (!value) return false;
-  if (!value.startsWith("/")) return false;
-  if (value.startsWith("//")) return false;
-  return true;
+  return isSameOriginPath(value);
 }
 
 /** Sanitize once at the URL-parse boundary; downstream consumers see `string | null`. */

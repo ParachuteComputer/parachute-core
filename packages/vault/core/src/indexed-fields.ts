@@ -130,14 +130,14 @@ function indexedFieldLimitMessage(fields: string[], got: number, unused: UnusedI
       : `cannot index ${fields.map((f) => `"${f}"`).join(", ")}: this vault has ${got} indexed fields, this write would add ${fields.length}, and the limit is ${INDEXED_FIELD_LIMIT} on every Parachute${room > 0 ? ` (room for ${room} more)` : ""}.`;
   const hidden = hiddenUnused ? " Some unused indexed fields are outside this token's scope; an admin can prune them." : "";
   if (unused.length === 0) {
-    return `${head}${hidden}${hiddenUnused ? "" : " No indexed field looks unused."} Drop \`indexed\` from a field you don't filter or sort by (update-tag, on every type that declares it), or leave the new field unindexed: it can still be filtered, by a scan.`;
+    return `${head}${hidden}${hiddenUnused ? "" : " No indexed field looks unused."} Drop \`indexed\` from a field you don't filter or sort by (manage-types, on every type that declares it), or leave the new field unindexed: it can still be filtered, by a scan.`;
   }
   const list = unused
     .slice(0, 20)
     .map((u) => `${u.field} (${u.reason === "no_live_declarer" ? "no type declares it; prune-schema drops it" : "no record holds a value"})`)
     .join(", ");
   const more = unused.length > 20 ? `, and ${unused.length - 20} more` : "";
-  return `${head} Unused indexed fields you can prune first: ${list}${more}.${hidden} Run prune-schema for fields no type declares; for the others drop \`indexed\` (update-tag, on every type that declares the field).`;
+  return `${head} Unused indexed fields you can prune first: ${list}${more}.${hidden} Run manage-types {action: "prune"} for fields no type declares; for the others drop \`indexed\` (manage-types, on every type that declares the field).`;
 }
 
 /**

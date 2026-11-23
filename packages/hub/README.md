@@ -104,9 +104,11 @@ The wizard walks the same three steps in the browser and the CLI:
 - **Expose** — record how this hub is reached (localhost / tailnet / public) so
   the done screen surfaces the right URLs.
 
-The done screen hands you a copy-pasteable `claude mcp add` command (with a
-freshly-minted operator token), a link to start using your vault, and the admin
-UI. Verify the stack any time:
+The done screen leads with the two things to do next, both at your hub's
+address: open the Parachute app and sign in with it, and give your AI
+`<hub>/mcp` (one Copy). The `claude mcp add` commands (OAuth, no token), the
+admin UI and other modules sit under "For developers". Verify the stack any
+time:
 
 ```sh
 parachute status

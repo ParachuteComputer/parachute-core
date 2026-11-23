@@ -83,7 +83,7 @@ Version history is the first self-hosted-first feature tracked in this table.
 | `DELETE /notes/:id/versions` | honored | honored since [cloud#304](https://github.com/ParachuteComputer/parachute-cloud/pull/304) | Same shapes; held by cloud's own suite, not by this repo. |
 | `query-notes versions (MCP)` | honored | honored since [cloud#304](https://github.com/ParachuteComputer/parachute-cloud/pull/304) | Same shapes; held by cloud's own suite, not by this repo. |
 | `DELETE /notes/:id?erase_history=true` | honored | honored once cloud pins core with T-412 | T-412 |
-| `GET /history/deleted` | honored | honored once cloud pins core with T-412 | T-412 |
+| `GET /history/deleted` | honored (write, since T-476) | honored at write since [cloud#435](https://github.com/ParachuteComputer/parachute-cloud/pull/435) (its router gates `isDeletedList` at write, as core's `routing.ts` does) | T-412, T-476 |
 | `delete-note` `ids` / `erase_history` (MCP) | honored | honored once cloud pins core with T-412 | T-412; core's tool, so both doors get it from the pin |
 | `has_broken_links` | honored | honored | [cloud#290](https://github.com/ParachuteComputer/parachute-cloud/pull/290) (B1) |
 | `has_ambiguous_links` | honored | honored | [cloud#290](https://github.com/ParachuteComputer/parachute-cloud/pull/290) (B1) |
@@ -191,6 +191,16 @@ with a structured envelope:
   "granted_scopes": ["vault:read"]
 }
 ```
+
+### A key held to some types (1.0 grants, first slice, T-476)
+
+`POST /account/keys {name, vault, can, types: ["recipe"]}` makes a key that reaches only records of those types. Its
+token carries `permissions.grant: "<name>"`; the vault keeps the grant (`GET /api/grants`, `PUT|DELETE /api/grants/<id>`,
+the door's, admin on the whole vault only) and reads it on every request: an ended or unknown grant answers
+`401 grant_ended`; one in force narrows the request to its types as a tag-scoped key is narrowed (search, links,
+counts, files, MCP, the live socket), never admin, and shows no history until versions record their types. Who reaches
+a vault is `GET <hub>/account/vaults/<v>/statements` (every credential a grant row) and `DELETE …/statements/<id>` ends
+one (docs/SPEC-1.0-grants.md, "Settled by the first slice").
 
 ### The write stamp: via and by (0.9.1)
 
@@ -945,7 +955,10 @@ A person's own field names are never renamed (a field called `content` stays `co
 - **`GET /api/types`** — every type and tag with its `kind` (`"type"` or `"tag"`), `count` and `expanded_count`, as
   MCP `list-types`; `?include_schema=true` adds each one's fields and parents. **`GET /api/types/{name}`** (or
   `?name=`) — one in full, as `list-types {name}`. **`PUT` / `DELETE /api/types/{name}`**, `POST /api/types/merge`
-  and `POST /api/types/{name}/rename` are `/api/tags`' writes under the new name, and need `vault:admin`.
+  and `POST /api/types/{name}/rename` are `/api/tags`' writes under the new name, and need `vault:admin`, with one
+  exception: `PUT /api/types/{name}` with `vault:write` may define a type nobody has defined yet and add fields to a
+  type the same credential made, as MCP `manage-types` may (`contracts/write-defines-types.md`). `PUT /api/tags/{name}`
+  stays admin.
   `/api/tags` keeps its 0.8 shape (no `kind`) through 0.9.
 
 **`/api/notes` is leaving.** It answers as before through 0.9, and every answer (success or error) carries
@@ -1676,7 +1689,8 @@ Versions are **not** full-text searchable.
   With `erase_history`, an unscoped admin may also name a note already deleted
   whose history is left; its history is erased and it reports `deleted: false`.
 - `GET /vault/{name}/api/history/deleted?limit=100&offset=0` requires
-  **`vault:admin`** and lists deleted notes that still have history, newest
+  **`vault:write`** (admin until T-476: write may delete and restore, so it may
+  list what it can put back; read is 403) and lists deleted notes that still have history, newest
   deletion first: `{notes: [{id, path, extension, deleted_at, versions}],
   total}`. `deleted_at` is null when no tombstone is left. `limit` is at most
   1000. Erase a listed note's history with `DELETE /notes/{id}/versions` or
@@ -1722,8 +1736,9 @@ across its captured rows and NULL on pre-v30 rows.
 Restore does not restore `path` on a live note: it restores content, metadata
 and extension without undoing a later move. Restore of a DELETED note
 re-creates it at the same id, at the tombstone's path, untagged, with
-`created_at` restored from the captured original creation timestamp. Pre-v30 rows
-with a NULL timestamp fall back to the tombstone timestamp. A path collision is 409 `path_conflict`.
+`created_at` restored from the captured original creation timestamp, and `updated_at` the
+restore's own time (T-476; it was the old `created_at`, so a reader asking what changed since never saw the note come
+back). Pre-v30 rows with a NULL timestamp fall back to the tombstone timestamp. A path collision is 409 `path_conflict`.
 Restore checks today's strict schemas using the current note's tags before
 writing; a rejected restore is 422 `schema_validation` and changes neither
 note nor history. The existing `vault:migrate` bypass applies and is logged.

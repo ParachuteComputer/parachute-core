@@ -189,6 +189,30 @@ describe("v5 and v18 against each state of the path indexes", () => {
     db.close();
   });
 
+  test("a vault 0.9.3 opened last (current stamp, no creator stamp on tags) gets the two columns once, and its types read", async () => {
+    // What 0.9.3 leaves: SCHEMA_VERSION stamped and tags with no `created_by`/`created_via` (T-476 adds them with no
+    // version bump). The fast path must not take that vault as current, or the write-access type rule couldn't read.
+    await makeVault(5);
+    let db = new Database(file);
+    const store = new SqliteStore(db);
+    await store.upsertTagSchema("person", { fields: { email: { type: "string" } } });
+    db.exec("ALTER TABLE tags DROP COLUMN created_by");
+    db.exec("ALTER TABLE tags DROP COLUMN created_via");
+    db.query("INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)").run(SCHEMA_VERSION, "2999-01-01T00:00:00.000Z");
+    db.close();
+    db = new Database(file);
+    new SqliteStore(db);
+    const cols = (db.query("PRAGMA table_info(tags)").all() as { name: string }[]).map((c) => c.name);
+    expect(cols).toEqual(expect.arrayContaining(["created_by", "created_via"]));
+    expect((db.query("SELECT created_by FROM tags WHERE name = 'person'").get() as { created_by: string | null }).created_by).toBeNull();
+    const after = cookie(db);
+    db.close();
+    db = new Database(file);
+    new SqliteStore(db);
+    expect(cookie(db)).toBe(after);
+    db.close();
+  });
+
   test("a vault 0.9.0 opened last (current stamp, no via_kind on revisions) gets the column once, and its revisions read", async () => {
     // What 0.9.0 leaves: SCHEMA_VERSION stamped and note_versions with no `via_kind` (0.9.1's write stamp adds it with
     // no version bump). The fast path must not take that vault as current, or every revision read would fail.
@@ -257,8 +281,8 @@ describe("v5 and v18 against each state of the path indexes", () => {
 /** sha256 of SCHEMA_SQL as of SCHEMA_VERSION 32 with T-412 (idx_notes_path left out of it) and 0.9's `kind` on tags, 0.9.1's `via_kind` on revisions, 0.9.3's field values in search (notes_fts_source, notes_field_text, three-column notes_fts; its insert trigger clears a leftover field-text row). */
 const SCHEMA_SQL_HASH_AT_32 = "303461b150891f04e27e0ba7aa5651109df704ed42707956f043ae5c3e26cb67";
 
-/** sha256 of initSchema's code and its fast-path check (comments and spacing left out) as of SCHEMA_VERSION 32 with T-412, 0.9's ensureTagKinds 0.9.1's ensureRevisionKeyKind and 0.9.2's ensureFtsFields, and T-460's open-as-is of a newer readable schema. */
-const INIT_SCHEMA_HASH_AT_32 = "71617c162343267c81c438e85a90787ac57cecf569d9f96f51d318f5898999df";
+/** sha256 of initSchema's code and its fast-path check (comments and spacing left out) as of SCHEMA_VERSION 32 with T-412, 0.9's ensureTagKinds 0.9.1's ensureRevisionKeyKind and 0.9.2's ensureFtsFields, T-460's open-as-is of a newer readable schema, and T-476's ensureTagCreators. */
+const INIT_SCHEMA_HASH_AT_32 = "854099c1050102f266a290ed637f204d11f50dc3763f10320c2a7539fd930b68";
 
 describe("the fast path's promise", () => {
   // initSchema skips SCHEMA_SQL and every migration on a vault stamped SCHEMA_VERSION (with the path index). So a

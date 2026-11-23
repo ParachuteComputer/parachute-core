@@ -25,6 +25,8 @@ import path from "node:path";
 
 import {
   DEFAULT_COMMIT_TEMPLATE,
+  STALE_INDEX_LOCK_MS,
+  clearStaleIndexLock,
   gitAddAll,
   gitCommit,
   gitPush,
@@ -34,6 +36,7 @@ import {
   renderCommitMessage,
   runGitCommitCycle,
   shouldCommit,
+  withRepoLock,
 } from "./export-watch.ts";
 import { GitNotInstalledError } from "./git-preflight.ts";
 
@@ -423,6 +426,94 @@ describe("runGitCommitCycle", () => {
     expect(result.committed).toBe(true);
     expect(result.message).toBe("export: 2026-05-20T15:42:01Z (1 note)");
     expect(gitLastCommitMessage(dir)).toBe("export: 2026-05-20T15:42:01Z (1 note)");
+  });
+
+  test("a stale empty index.lock is removed and the commit lands; a fresh or non-empty one is left and reported", async () => {
+    const lock = path.join(dir, ".git", "index.lock");
+    const cycle = () =>
+      runGitCommitCycle({
+        repoDir: dir,
+        template: DEFAULT_COMMIT_TEMPLATE,
+        notesChanged: 1,
+        vaultName: "default",
+        firstNoteTitle: "Inbox",
+        push: false,
+      });
+    const old = (Date.now() - 10 * 60_000) / 1000;
+    fs.writeFileSync(path.join(dir, "Inbox.md"), "# Inbox\n");
+
+    fs.writeFileSync(lock, "");                     // fresh: a git may hold it
+    let r = await cycle();
+    expect(r.committed).toBe(false);
+    expect(r.error).toContain("index.lock");
+    expect(fs.existsSync(lock)).toBe(true);
+
+    fs.writeFileSync(lock, "partial index");        // old but not empty: not ours to judge
+    fs.utimesSync(lock, old, old);
+    r = await cycle();
+    expect(r.committed).toBe(false);
+    expect(fs.existsSync(lock)).toBe(true);
+
+    fs.writeFileSync(lock, "");                     // old and empty: what a killed `git add` leaves
+    fs.utimesSync(lock, old, old);
+    r = await cycle();
+    expect(r.committed).toBe(true);
+    expect(r.error).toBeUndefined();
+    expect(fs.existsSync(lock)).toBe(false);
+  });
+
+  test("a lock older than this process is cleared at once (a restart after a kill doesn't wait 5 minutes)", async () => {
+    const lock = path.join(dir, ".git", "index.lock");
+    fs.writeFileSync(lock, "");
+    expect(await clearStaleIndexLock(dir, STALE_INDEX_LOCK_MS, Date.now(), Date.now() - 60_000)).toBeNull();
+    expect(fs.existsSync(lock)).toBe(true);                     // made after we started: could be a git of ours
+    expect(await clearStaleIndexLock(dir, STALE_INDEX_LOCK_MS, Date.now(), Date.now() + 60_000)).not.toBeNull();
+    expect(fs.existsSync(lock)).toBe(false);                    // made before we started: its git died with the last run
+  });
+
+  test("withRepoLock runs one git cycle per repo at a time, in order, and survives a failed one", async () => {
+    const seen: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const first = withRepoLock(dir, async () => {
+      seen.push("first start");
+      await gate;
+      seen.push("first end");
+      throw new Error("boom");
+    });
+    const second = withRepoLock(path.join(dir, "."), async () => {
+      seen.push("second");
+      return 2;
+    });
+    const other = withRepoLock(`${dir}-other`, async () => {
+      seen.push("other repo");
+    });
+    await other;
+    expect(seen).toEqual(["first start", "other repo"]);
+    release();
+    await expect(first).rejects.toThrow("boom");
+    expect(await second).toBe(2);
+    expect(seen).toEqual(["first start", "other repo", "first end", "second"]);
+  });
+
+  test("a commit cycle waits for the repo's lock (so two cycles never run git over each other)", async () => {
+    fs.writeFileSync(path.join(dir, "Inbox.md"), "# Inbox\n");
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const held = withRepoLock(dir, () => gate);
+    const cycle = runGitCommitCycle({
+      repoDir: dir,
+      template: DEFAULT_COMMIT_TEMPLATE,
+      notesChanged: 1,
+      vaultName: "default",
+      firstNoteTitle: "Inbox",
+      push: false,
+    });
+    await new Promise((r) => setTimeout(r, 300));
+    expect(gitLastCommitMessage(dir)).toBe("initial");      // nothing ran while the lock was held
+    release();
+    await held;
+    expect((await cycle).committed).toBe(true);
   });
 
   test("skips commit when nothing is staged", async () => {

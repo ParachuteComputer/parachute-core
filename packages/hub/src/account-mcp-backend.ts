@@ -305,6 +305,10 @@ async function listVaultToolsUncached(ctx: AccountToolContext): Promise<readonly
             !!t && typeof t === "object" && typeof (t as { name?: unknown }).name === "string",
         )
         .filter((t) => !HUB_NATIVE_TOOL_NAMES.has(t.name))
+        // T-476: a vault lists manage-types to a write session (it may make a new type). This door keeps it to keys
+        // that hold admin, as before: its writer list fits a 4,000-token budget (contracts door/multivault), and an AI
+        // makes a type at the vault's own address.
+        .filter((t) => t.name !== "manage-types" || verbForVault(ctx, vault.name) === "admin")
         .map((t) => injectVaultSelector(COMPOSED_VERB_RANK[verbForVault(ctx, vault.name)] < topRank ? { ...t, annotations: undefined } : t));
     } catch {
       // Try the next covered vault (highest-verb first). Empty catch continues.

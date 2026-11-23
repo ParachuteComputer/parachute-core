@@ -542,6 +542,82 @@ describe("handleAuthorizeGet", () => {
     }
   });
 
+  // T-476: Parachute's own app (the web build on 127.0.0.1, the phone and desktop app on 127.0.0.1:47219) was
+  // "External: a third-party app that registered itself", and "what this app reads goes to the company that runs
+  // it". The marker and the vendor line follow `parachuteAppHome`: the app's exact name, "Parachute", AND every
+  // redirect first-party. Loopback alone is not enough (Claude Code returns to loopback, and its reads go to Anthropic),
+  // nor is a name holding the word ("Claude Code (parachute)").
+  async function consentFor(clientName: string, redirects: string | string[], sameHub = false): Promise<string> {
+    const redirectUris = [redirects].flat();
+    const redirect = redirectUris[0]!;
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, { redirectUris, clientName, sameHub });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: redirect,
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          scope: "vault:read",
+        }),
+        { headers: { cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}` } },
+      );
+      const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(200);
+      return await res.text();
+    } finally {
+      cleanup();
+    }
+  }
+
+  test("Parachute's own app on loopback: says it's Parachute's, no External, no company line (T-476)", async () => {
+    const html = await consentFor("Parachute", "http://127.0.0.1:47219/oauth/callback");
+    expect(html).toContain("Parachute's app on this device: it returns only here.");
+    expect(html).not.toContain('class="badge badge-trust-external"');
+    expect(html).not.toContain("company that runs it");
+  });
+
+  test("Parachute's own app on this hub's origin: Parachute's, but not 'on this device' (T-476)", async () => {
+    const html = await consentFor("Parachute", `${ISSUER}/app/oauth/callback`, true);
+    expect(html).toContain("Parachute's own app: it returns only to the address above.");
+    expect(html).not.toContain("on this device: it returns");
+    expect(html).not.toContain("company that runs it");
+  });
+
+  test("Claude on loopback stays External with the company line (T-476: loopback alone isn't Parachute's)", async () => {
+    const html = await consentFor("Claude Code", "http://127.0.0.1:53682/callback");
+    expect(html).toContain('class="badge badge-trust-external"');
+    expect(html).toContain("What this app reads from your vault goes to the company that runs it.");
+    expect(html).not.toContain("Parachute's app on this device");
+  });
+
+  // Claude Code registers as "Claude Code (<server>)", and the hub's own commands name the server parachute or
+  // parachute-<vault>: the name contains the word, the redirect is loopback, and it is still not Parachute's app.
+  test("Claude Code connected as 'parachute' stays External with the company line (T-476)", async () => {
+    for (const name of ["Claude Code (parachute)", "Claude Code (parachute-work)", "Cursor (parachute)", "Parachute Notes"]) {
+      const html = await consentFor(name, "http://localhost:53682/callback");
+      expect(html).toContain('class="badge badge-trust-external"');
+      expect(html).toContain("What this app reads from your vault goes to the company that runs it.");
+    }
+  });
+
+  test("'Parachute' an operator registered with one loopback and one foreign redirect keeps the company line (T-476)", async () => {
+    const html = await consentFor("Parachute", ["http://127.0.0.1:47219/oauth/callback", "https://evil.example/cb"], true);
+    expect(html).toContain("What this app reads from your vault goes to the company that runs it.");
+    expect(html).not.toContain("Parachute's app on this device");
+  });
+
+  test("a Parachute-named client an operator registered for a foreign redirect keeps the company line (T-476)", async () => {
+    const html = await consentFor("Parachute", "https://bridge.example/cb", true);
+    expect(html).toContain("What this app reads from your vault goes to the company that runs it.");
+    expect(html).not.toContain("Parachute's own app");
+  });
+
   test("rejects unknown client_id with 400", async () => {
     const { db, cleanup } = await makeDb();
     try {
@@ -1241,7 +1317,7 @@ describe("handleAuthorizeGet — RFC 8707 resource binding drops foreign scopes 
     }
   });
 
-  test("session-less 'App not yet approved' page also drops foreign scopes", async () => {
+  test("session-less sign-in page (pending client) also drops foreign scopes", async () => {
     const { db, cleanup } = await makeDb();
     try {
       const reg = registerClient(db, {
@@ -1268,7 +1344,7 @@ describe("handleAuthorizeGet — RFC 8707 resource binding drops foreign scopes 
       });
       expect(res.status).toBe(403);
       const html = await res.text();
-      expect(html).toContain("App not yet approved");
+      expect(html).toContain("Sign in to your hub to continue");
       // Foreign scopes absent from the rendered rows...
       expect(html).not.toContain("Send audio to Scribe for transcription.");
       expect(html).not.toContain("Post messages to your Agent.");
@@ -3893,7 +3969,7 @@ describe("DCR approval gate (#74)", () => {
     );
   }
 
-  test("authorize: pending client → 403 HTML 'App not yet approved'", async () => {
+  test("authorize: pending client, no session → 403 HTML 'Sign in to your hub to continue'", async () => {
     const { db, cleanup } = await makeDb();
     try {
       const reg = registerClient(db, {
@@ -3905,7 +3981,7 @@ describe("DCR approval gate (#74)", () => {
       });
       expect(res.status).toBe(403);
       const html = await res.text();
-      expect(html).toContain("App not yet approved");
+      expect(html).toContain("Sign in to your hub to continue");
       // /admin/approve-client/<id> deep link is the canonical recovery now
       // (the pre-rc.19 CLI message was retired in favor of the web path).
       expect(html).toContain(`/admin/approve-client/${encodeURIComponent(reg.client.clientId)}`);
@@ -3943,7 +4019,7 @@ describe("DCR approval gate (#74)", () => {
       const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
       expect(res.status).toBe(403);
       const html = await res.text();
-      expect(html).toContain("App not yet approved");
+      expect(html).toContain("Sign in to your hub to continue");
       // The vault hint surfaces as a labeled row in the approve-meta block.
       expect(html).toContain('approve-meta-label">vault');
       expect(html).toContain("boulder");
@@ -3977,7 +4053,7 @@ describe("DCR approval gate (#74)", () => {
       const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
       expect(res.status).toBe(403);
       const html = await res.text();
-      expect(html).toContain("App not yet approved");
+      expect(html).toContain("Sign in to your hub to continue");
       expect(html).not.toContain('approve-meta-label">vault');
     } finally {
       cleanup();
@@ -5149,6 +5225,50 @@ describe("refresh-token rotation + /oauth/revoke (#73)", () => {
     }
   });
 
+  // T-476. The black-box side (consent shows again; a live sibling keeps its scope; another client's revoke changes
+  // nothing) is contracts/suites/safety/revoke-grant.test.ts. Here: what the contract can't see in the grant row.
+  test("/oauth/revoke takes the token's vault scopes out of the grant; scopes it didn't carry and non-vault ones stay", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const clientId = reg.client.clientId;
+      // The token carries a vault scope and a non-vault one; the grant also holds scopes the token never carried.
+      const { code, verifier } = await consentAndGetCode(db, clientId, session.id, "vault:default:read scribe:transcribe");
+      const tokenRes = await handleToken(
+        db,
+        tokenRequest(
+          new URLSearchParams({
+            grant_type: "authorization_code",
+            code,
+            client_id: clientId,
+            redirect_uri: "https://app.example/cb",
+            code_verifier: verifier,
+          }),
+        ),
+        { issuer: ISSUER, loadServicesManifest: fixtureLoadServicesManifest },
+      );
+      expect(tokenRes.status).toBe(200);
+      const initial = (await tokenRes.json()) as { refresh_token: string; scope: string };
+      expect(initial.scope.split(" ").sort()).toEqual(["scribe:transcribe", "vault:default:read"]);
+      recordGrant(db, user.id, clientId, ["account:self:read", "vault:other:write"]);
+      expect(findGrant(db, user.id, clientId)?.scopes).toContain("vault:default:read");
+
+      const res = await handleRevoke(
+        db,
+        revokeRequest(new URLSearchParams({ token: initial.refresh_token, client_id: clientId })),
+        { issuer: ISSUER },
+      );
+      expect(res.status).toBe(200);
+      expect(findGrant(db, user.id, clientId)?.scopes.sort()).toEqual(
+        ["account:self:read", "scribe:transcribe", "vault:other:write"].sort(),
+      );
+    } finally {
+      cleanup();
+    }
+  });
+
   test("authorizationServerMetadata advertises revocation_endpoint", async () => {
     const res = authorizationServerMetadata({
       issuer: ISSUER,
@@ -5762,11 +5882,11 @@ describe("inline approve button on pending /oauth/authorize (#208)", () => {
       const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
       expect(res.status).toBe(403);
       const html = await res.text();
-      expect(html).toContain("App not yet approved");
+      expect(html).toContain("Sign in to your hub to continue");
       // Primary CTA: Sign-in link wired to round-trip the operator back
       // to the original /oauth/authorize?... URL after login (resumes the
       // OAuth flow rather than dead-ending at the SPA approve page).
-      expect(html).toContain("Sign in as admin to approve");
+      expect(html).toContain('class="btn btn-primary approve-signin-cta"');
       const requestUrl = new URL(authorizePath);
       const returnTo = `${requestUrl.pathname}${requestUrl.search}`;
       const expectedLoginHref = `/login?next=${encodeURIComponent(returnTo)}`;
@@ -5835,6 +5955,7 @@ describe("inline approve button on pending /oauth/authorize (#208)", () => {
       expect(html).toContain("MyApp");
       // The inline approve FORM is gone from this path.
       expect(html).not.toContain('action="/oauth/authorize/approve"');
+      expect(html).not.toContain("Sign in to your hub to continue");
       expect(html).not.toContain("App not yet approved");
       // The pending client was auto-approved (consent IS the authorization).
       expect(getClient(db, reg.client.clientId)?.status).toBe("approved");
@@ -7345,9 +7466,9 @@ describe("handleAuthorizePost — multi-user assigned vault defense (PR 4)", () 
   // assignment between mint and refresh, then asserting the new token
   // carries the post-mutation value. The `scope` claim itself stays
   // narrowed to the original vault (it was set at consent time and stored
-  // on the refresh-token row); only the informational `vault_scope` claim
-  // tracks the live row.
-  test("refresh flow picks up a mid-session assigned_vault change", async () => {
+  // on the refresh-token row) while the person still holds that vault;
+  // once they don't, the family stops (core #129).
+  test("refresh flow picks up a mid-session assigned_vault change, and stops once the vault is gone", async () => {
     const { db, cleanup } = await makeDb();
     try {
       const admin = await createUser(db, "admin-aaron", "pw");
@@ -7425,42 +7546,44 @@ describe("handleAuthorizePost — multi-user assigned vault defense (PR 4)", () 
       expect(initial.payload.vault_scope).toEqual(["vault-a"]);
       expect(initial.payload.scope).toBe("vault:vault-a:read");
 
-      // Step 2: admin updates bob's vault assignments to ["vault-b"].
-      // Direct DB writes against user_vaults — same effect as the PATCH
-      // /api/users/:id/vaults endpoint. The refresh path reads the live
-      // row at mint time (`vaultScopeForUser`), so the next refresh
-      // should pick up the new value.
-      db.prepare("DELETE FROM user_vaults WHERE user_id = ?").run(bob.id);
+      // Step 2: admin adds vault-b to bob's assignments. Direct DB writes
+      // against user_vaults. The refresh path reads the live row at mint
+      // time (`vaultScopeForUser`), so the next refresh picks up the new value.
       db.prepare(
         "INSERT INTO user_vaults (user_id, vault_name, role, created_at) VALUES (?, ?, 'write', ?)",
       ).run(bob.id, "vault-b", new Date().toISOString());
-
-      // Step 3: refresh the token. vault_scope should be ["vault-b"] (the
-      // new live value); the `scope` claim stays narrowed to the original
-      // vault (auth-code grant snapshotted it onto the refresh-token row).
-      const refreshRes = await handleToken(
-        db,
-        new Request(`${ISSUER}/oauth/token`, {
-          method: "POST",
-          body: new URLSearchParams({
-            grant_type: "refresh_token",
-            refresh_token: tokenBody.refresh_token,
-            client_id: reg.client.clientId,
+      const refreshWith = (refreshToken: string) =>
+        handleToken(
+          db,
+          new Request(`${ISSUER}/oauth/token`, {
+            method: "POST",
+            body: new URLSearchParams({
+              grant_type: "refresh_token",
+              refresh_token: refreshToken,
+              client_id: reg.client.clientId,
+            }),
+            headers: { "content-type": "application/x-www-form-urlencoded" },
           }),
-          headers: { "content-type": "application/x-www-form-urlencoded" },
-        }),
-        { issuer: ISSUER, loadServicesManifest: () => twoVaultManifest },
-      );
+          { issuer: ISSUER, loadServicesManifest: () => twoVaultManifest },
+        );
+
+      // Step 3: refresh the token. vault_scope is the new live value; the
+      // `scope` claim stays narrowed to the original vault (the auth-code
+      // grant snapshotted it onto the refresh-token row).
+      const refreshRes = await refreshWith(tokenBody.refresh_token);
       expect(refreshRes.status).toBe(200);
-      const refreshBody = (await refreshRes.json()) as { access_token: string };
+      const refreshBody = (await refreshRes.json()) as { access_token: string; refresh_token: string };
       const refreshed = await validateAccessToken(db, refreshBody.access_token, ISSUER);
-      expect(refreshed.payload.vault_scope).toEqual(["vault-b"]);
-      // The `scope` claim is still bound to the original consent — the
-      // refresh-token row carries `vault:vault-a:read` and the rotation
-      // preserves it. PR 5 will be the side that enforces "your access
-      // tokens for the old vault stop working when the assignment moves";
-      // PR 4 just emits the informational claim correctly.
+      expect(refreshed.payload.vault_scope).toEqual(["vault-a", "vault-b"]);
       expect(refreshed.payload.scope).toBe("vault:vault-a:read");
+
+      // Step 4: the assignment moves off vault-a. The family's scope names a
+      // vault bob no longer holds, so the next refresh mints nothing (core
+      // #129: every refresh-row mint re-checks the role).
+      db.prepare("DELETE FROM user_vaults WHERE user_id = ? AND vault_name = ?").run(bob.id, "vault-a");
+      const moved = await refreshWith(refreshBody.refresh_token);
+      expect(moved.status).toBe(400);
+      expect(((await moved.json()) as { error: string }).error).toBe("invalid_grant");
     } finally {
       cleanup();
     }
@@ -8889,7 +9012,7 @@ describe("handleAuthorizeGet — trust-by-client_name auto-approve (hub#409)", (
         loadServicesManifest: fixtureLoadServicesManifest,
       });
       expect(res.status).toBe(403);
-      expect(await res.text()).toContain("App not yet approved");
+      expect(await res.text()).toContain("Sign in to your hub to continue");
       expect(getClient(db, fresh.client.clientId)?.status).toBe("pending");
     } finally {
       cleanup();
@@ -9172,13 +9295,14 @@ describe("zero-vault non-admin privesc gate (hub#429 reviewer)", () => {
     }
   });
 
-  test("stale grant survives setUserVaults([]) → skip-consent gate fires consent screen, not silent code (path 5)", async () => {
+  test("stale grant left after setUserVaults([]) → skip-consent gate fires consent screen, not silent code (path 5)", async () => {
     // The 4th attack the prior fold didn't cover. Sequence:
     //   1. bob has assignedVaults=["default"] (legitimate).
     //   2. bob consents to a vault-scoped client → grants row recorded.
     //   3. Admin clears bob's assignments via setUserVaults(_, []).
     //   4. Grants table has no FK cascade from user_vaults, so the
-    //      grant row survives the assignment delete.
+    //      grant row survived the assignment delete (until core #129,
+    //      which strips it; a hub older than that left such rows).
     //   5. bob re-hits /oauth/authorize?scope=vault:default:read for
     //      the same client. Pre-fix: skip-consent gate fires
     //      (isCoveredByGrant=true), silent 302 with auth code and
@@ -9198,10 +9322,11 @@ describe("zero-vault non-admin privesc gate (hub#429 reviewer)", () => {
         redirectUris: ["https://app.example/cb"],
         status: "approved",
       });
-      // Record the grant while bob still has the assignment.
-      recordGrant(db, bob.id, reg.client.clientId, ["vault:default:read"]);
-      // Admin clears bob's assignments. Grant row is NOT cascaded.
+      // Admin clears bob's assignments. Since core #129 that takes the
+      // vault out of his grants too, so the stale grant this gate guards
+      // against is one an older hub left behind: written here directly.
       expect(setUserVaults(db, bob.id, [])).toBe(true);
+      recordGrant(db, bob.id, reg.client.clientId, ["vault:default:read"]);
       expect(findGrant(db, bob.id, reg.client.clientId)).not.toBeNull();
       const { challenge } = makePkce();
       const req = new Request(
@@ -10802,7 +10927,9 @@ describe("single OAuth consent + grantable vault admin + delegate-only cap (2026
       const res = handleAuthorizeGet(db, req, capDeps);
       expect(res.status).toBe(200);
       expect(res.headers.get("content-type")).toContain("text/html");
-      expect(await res.text()).not.toContain("App not yet approved");
+      const consentHtml = await res.text();
+      expect(consentHtml).not.toContain("Sign in to your hub to continue");
+      expect(consentHtml).not.toContain("App not yet approved");
       expect(getClient(db, reg.client.clientId)?.status).toBe("approved");
     } finally {
       cleanup();
@@ -10836,7 +10963,7 @@ describe("single OAuth consent + grantable vault admin + delegate-only cap (2026
       const unauth = handleAuthorizeGet(db, new Request(href), capDeps);
       expect(unauth.status).toBe(403);
       const unauthHtml = await unauth.text();
-      expect(unauthHtml).toContain("App not yet approved");
+      expect(unauthHtml).toContain("Sign in to your hub to continue");
       const u = new URL(href);
       const returnTo = `${u.pathname}${u.search}`;
       expect(unauthHtml).toContain(`/login?next=${encodeURIComponent(returnTo)}`);
@@ -12704,5 +12831,146 @@ describe("account-door consent per vault (T-446)", () => {
     } finally {
       cleanup();
     }
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// T-476 stranger walk: the consent page as a browser submits it. The per-scope
+// checkboxes sat outside the <form>, so nothing was posted and the hub granted
+// every scope asked: a developer unticked vault admin for Claude and the token
+// held it. These render the page, post what a browser posts (the form's hidden
+// inputs, its ticked boxes minus the ones the person unticks, its chosen
+// radios and options), redeem the code, and read the token's scope.
+// ───────────────────────────────────────────────────────────────────────────
+describe("consent as a browser submits it: what is unticked is not granted (T-476)", () => {
+  const TTL_S = Math.floor(SESSION_TTL_MS / 1000);
+  const MANIFEST: ServicesManifest = {
+    services: [{ name: "parachute-vault", port: 1940, paths: ["/vault/work"], health: "/health", version: "0.7.0" }],
+  };
+  const deps = { issuer: ISSUER, loadServicesManifest: () => MANIFEST, hubBoundOrigins: () => [ISSUER] };
+  const cookie = (sessionId: string) => `${CSRF_COOKIE}; ${buildSessionCookie(sessionId, TTL_S)}`;
+  const attr = (tag: string, name: string) => new RegExp(`\\s${name}="([^"]*)"`).exec(tag)?.[1];
+  const unescape = (s: string) => s.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+  /** The fields a browser posts from the consent form, with these scope boxes unticked. */
+  function browserFields(html: string, untick: string[]): [string, string][] {
+    const start = html.indexOf('class="auth-form consent-form"');
+    expect(start).toBeGreaterThan(-1);
+    const form = html.slice(start, html.indexOf("</form>", start));
+    const out: [string, string][] = [];
+    for (const [tag] of form.matchAll(/<input\b[^>]*>/g)) {
+      const type = attr(tag, "type") ?? "text";
+      const name = attr(tag, "name");
+      if (!name) continue;
+      const value = unescape(attr(tag, "value") ?? "on");
+      if (type === "hidden") out.push([name, value]);
+      else if ((type === "checkbox" || type === "radio") && /\schecked\b/.test(tag)) {
+        if (name === "granted_scope" && untick.includes(value)) continue;
+        out.push([name, value]);
+      }
+    }
+    for (const [, attrs, body] of form.matchAll(/<select\b([^>]*)>([\s\S]*?)<\/select>/g)) {
+      const name = attr(attrs ?? "", "name");
+      const chosen = /<option\b[^>]*\sselected\b[^>]*>/.exec(body ?? "")?.[0] ?? /<option\b[^>]*>/.exec(body ?? "")?.[0];
+      if (name && chosen) out.push([name, unescape(attr(chosen, "value") ?? "")]);
+    }
+    return out;
+  }
+  async function consent(scope: string, untick: string[], resource?: string): Promise<{ scope: string } | { denied: string }> {
+    const { db, cleanup } = await makeDb();
+    try {
+      const owner = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: owner.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"], status: "approved" });
+      const pk = makePkce();
+      const params = { client_id: reg.client.clientId, redirect_uri: "https://app.example/cb", response_type: "code", scope, code_challenge: pk.challenge, code_challenge_method: "S256", ...(resource ? { resource } : {}) };
+      const page = handleAuthorizeGet(db, new Request(authorizeUrl(params), { headers: { cookie: cookie(session.id) } }), deps);
+      expect(page.status).toBe(200);
+      const form = new URLSearchParams();
+      for (const [k, v] of browserFields(await page.text(), untick)) form.append(k, v);
+      form.append("approve", "yes");
+      const res = await handleAuthorizePost(
+        db,
+        new Request(`${ISSUER}/oauth/authorize`, { method: "POST", body: form, headers: { "content-type": "application/x-www-form-urlencoded", cookie: cookie(session.id) } }),
+        deps,
+      );
+      expect(res.status).toBe(302);
+      const back = new URL(res.headers.get("location")!);
+      if (back.searchParams.get("error")) return { denied: back.searchParams.get("error")! };
+      const token = await handleToken(
+        db,
+        new Request(`${ISSUER}/oauth/token`, {
+          method: "POST",
+          body: new URLSearchParams({ grant_type: "authorization_code", code: back.searchParams.get("code")!, client_id: reg.client.clientId, redirect_uri: "https://app.example/cb", code_verifier: pk.verifier, ...(resource ? { resource } : {}) }),
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+        }),
+        deps,
+      );
+      expect(token.status).toBe(200);
+      return { scope: ((await token.json()) as { scope: string }).scope.split(" ").sort().join(" ") };
+    } finally {
+      cleanup();
+    }
+  }
+  const MCP = `${ISSUER}/vault/work/mcp`;
+
+  test("SECURITY: an AI's connector asks read, write and admin; the person unticks admin: the token holds no admin", async () => {
+    expect(await consent("vault:work:read vault:work:write vault:work:admin", ["vault:work:admin"], MCP)).toEqual({ scope: "vault:work:read vault:work:write" });
+  });
+  test("left as drawn, what was asked is granted", async () => {
+    expect(await consent("vault:work:read vault:work:write vault:work:admin", [], MCP)).toEqual({ scope: "vault:work:admin vault:work:read vault:work:write" });
+  });
+  test("SECURITY: account-wide admin starts unticked; Approve without ticking it is a denial, not a grant", async () => {
+    expect(await consent("account:self:admin", [])).toEqual({ denied: "access_denied" });
+  });
+  /** As a friend pinned to `work`: the page for this ask, posted as a browser posts it with these boxes unticked. */
+  async function asFriend(scope: string, untick: string[]): Promise<{ html: string; result: { scope: string } | { denied: string } }> {
+    const { db, cleanup } = await makeDb();
+    try {
+      await createUser(db, "owner", "pw");
+      const friend = await createUser(db, "friend", "pw", { allowMulti: true });
+      setUserVaults(db, friend.id, ["work"]);
+      const session = createSession(db, { userId: friend.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"], status: "approved" });
+      const pk = makePkce();
+      const page = handleAuthorizeGet(
+        db,
+        new Request(authorizeUrl({ client_id: reg.client.clientId, redirect_uri: "https://app.example/cb", response_type: "code", scope, code_challenge: pk.challenge, code_challenge_method: "S256" }), { headers: { cookie: cookie(session.id) } }),
+        deps,
+      );
+      expect(page.status).toBe(200);
+      const html = await page.text();
+      const form = new URLSearchParams(browserFields(html, untick));
+      form.append("approve", "yes");
+      const res = await handleAuthorizePost(db, new Request(`${ISSUER}/oauth/authorize`, { method: "POST", body: form, headers: { "content-type": "application/x-www-form-urlencoded", cookie: cookie(session.id) } }), deps);
+      expect(res.status).toBe(302);
+      const back = new URL(res.headers.get("location")!);
+      if (back.searchParams.get("error")) return { html, result: { denied: back.searchParams.get("error")! } };
+      const token = await handleToken(
+        db,
+        new Request(`${ISSUER}/oauth/token`, { method: "POST", body: new URLSearchParams({ grant_type: "authorization_code", code: back.searchParams.get("code")!, client_id: reg.client.clientId, redirect_uri: "https://app.example/cb", code_verifier: pk.verifier }), headers: { "content-type": "application/x-www-form-urlencoded" } }),
+        deps,
+      );
+      expect(token.status).toBe(200);
+      return { html, result: { scope: ((await token.json()) as { scope: string }).scope.split(" ").sort().join(" ") } };
+    } finally {
+      cleanup();
+    }
+  }
+
+  test("a friend's unnamed ask and its named twin share one box on the real page, which posts both and mints the vault", async () => {
+    const { html, result } = await asFriend("vault:work:read vault:read", []);
+    expect([...html.matchAll(/name="granted_scope"/g)].length).toBe(1);
+    expect(html).toContain('name="granted_scope" value="vault:work:read vault:read"');
+    expect(result).toEqual({ scope: "vault:work:read" });
+  });
+
+  test("on the account door the chosen vault levels decide: the connection row has no box to untick them away", async () => {
+    const { html, result } = await asFriend("account:vaults", ["account:vaults"]);
+    expect(html).not.toContain('type="checkbox" name="granted_scope" value="account:vaults"');
+    expect(result).toEqual({ scope: "account:self:vaults:work:read" });
+  });
+
+  test("SECURITY: everything unticked is a denial, never everything granted", async () => {
+    expect(await consent("vault:work:read vault:work:write", ["vault:work:read", "vault:work:write"], MCP)).toEqual({ denied: "access_denied" });
   });
 });

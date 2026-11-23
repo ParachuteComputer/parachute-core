@@ -169,7 +169,7 @@ export function collectUnknownTagWarnings(
       const suggestion = suggestSimilarTag(h.allTags, tag);
       warnings.push({
         code: "unknown_tag",
-        message: `tag "${tag}" has no identity row and no notes match it (directly or via expansion) — check spelling, or create it first with update-tag`,
+        message: `tag "${tag}" has no identity row and no notes match it (directly or via expansion) — check spelling, or create it first with manage-types`,
         tag,
         ...(suggestion ? { did_you_mean: suggestion } : {}),
       });
@@ -490,7 +490,7 @@ export function assertNoAggregateScan(
   const fields = scanFields(db, { metadata: opts.metadata, dateFilter: opts.dateFilter });
   if (fields.length === 0) return;
   throw new QueryError(
-    `metadata field "${fields[0]}" is not indexed. aggregate needs every field it filters on to be indexed: declare it via update-tag with indexed: true, or run the same filter without aggregate (a list scans any field).`,
+    `metadata field "${fields[0]}" is not indexed. aggregate needs every field it filters on to be indexed: declare it via manage-types with indexed: true, or run the same filter without aggregate (a list scans any field).`,
     "FIELD_NOT_INDEXED",
     { error_type: "field_not_indexed", field: fields[0], hint: `declare ${fields.map((f) => `"${f}"`).join(", ")} indexed: true, or drop aggregate` },
   );

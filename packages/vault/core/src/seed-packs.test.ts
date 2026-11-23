@@ -306,12 +306,25 @@ describe("getting-started pack", () => {
     expect(GETTING_STARTED_CONTENT).toContain("entry_date");
     expect(GETTING_STARTED_CONTENT).toContain("mood");
     // Agent-memory pattern: thread + messages + the if_exists:"ignore" crash-replay recipe.
-    expect(GETTING_STARTED_CONTENT).toContain("#thread");
-    expect(GETTING_STARTED_CONTENT).toContain("#message");
+    expect(GETTING_STARTED_CONTENT).toContain("`thread` record");
+    expect(GETTING_STARTED_CONTENT).toContain("`message` records");
     expect(GETTING_STARTED_CONTENT).toContain('if_exists: "ignore"');
     // Search one-liner: literal by default, search_mode:"advanced" for FTS syntax.
     expect(GETTING_STARTED_CONTENT).toContain("literal by default");
     expect(GETTING_STARTED_CONTENT).toContain('search_mode: "advanced"');
+  });
+
+  test("Getting Started teaches the tools this server has: manage-types, the record tools, write may make a type (T-476)", () => {
+    // The audit's walk 4: a cold AI read "update-tag" here, and the server answered "Unknown tool".
+    // the old names appear once, in the line for a server that lists only those (Parachute Cloud, until its door has 0.9's)
+    const older = GETTING_STARTED_CONTENT.slice(GETTING_STARTED_CONTENT.indexOf("a server that lists only the older ones"));
+    const rest = GETTING_STARTED_CONTENT.replace(older.slice(0, older.indexOf("\n\n")), "");
+    for (const gone of ["update-tag", "delete-tag", "rename-tag", "merge-tags", "prune-schema", "query-notes", "create-note", "update-note", "list-tags", "find-path", "manage-token"]) {
+      expect({ gone, found: rest.includes(gone) }).toEqual({ gone, found: false });
+    }
+    expect(GETTING_STARTED_CONTENT).toContain("manage-types {");
+    expect(GETTING_STARTED_CONTENT).toContain("**make new types**");
+    expect(GETTING_STARTED_CONTENT).toContain("Types = what a record is");
   });
 
   test("default vault-description constants orient + tell the AI to self-replace them", () => {

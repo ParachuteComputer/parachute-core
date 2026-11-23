@@ -54,6 +54,8 @@ export interface AttachmentTicket {
    * then: a note that left the scope after the mint is not found.
    */
   scopedTags?: string[];
+  /** The minting session's grant (docs/SPEC-1.0-grants.md §4.1): a ticket is spent only while that grant is in force. */
+  grant?: string;
 }
 
 /**

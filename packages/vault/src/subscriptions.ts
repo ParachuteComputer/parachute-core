@@ -61,6 +61,7 @@
  * `filterNotesByTagScope`.
  */
 
+import { getGrant, grantState } from "../core/src/grants.ts";
 import type { Note, Store } from "../core/src/types.ts";
 import type { DeletedNoteRef, HookEvent, NoteHookPayload } from "../core/src/hooks.ts";
 import { defaultHookRegistry } from "../core/src/hooks.ts";
@@ -121,6 +122,9 @@ interface Subscription {
   buffered: number;
   readonly maxBuffered: number;
   closed: boolean;
+  /** The grant the subscriber's token is under (docs/SPEC-1.0-grants.md §4.1: ending the grant closes the socket):
+   *  checked before every event, and closed at once by `closeGrant`. Null for a credential with no grant. */
+  readonly grant: string | null;
 }
 
 /** WebSocket message: `{ type: <event>, ...data }` — the event name becomes the
@@ -229,6 +233,8 @@ export class SubscriptionManager {
     /** SSE (default true) counts against the per-vault manager cap; WS passes
      *  false — the WS transport caps via the live-socket count at upgrade. */
     countsTowardCap?: boolean;
+    /** The token's grant id (`AuthResult.grant`), when it is under one. */
+    grant?: string | null;
   }): SubscriptionHandle | null {
     const countsTowardCap = args.countsTowardCap ?? true;
     const current = this.countForVault(args.vaultName);
@@ -249,6 +255,7 @@ export class SubscriptionManager {
       buffered: 0,
       maxBuffered: args.maxBuffered ?? DEFAULT_MAX_BUFFERED_EVENTS,
       closed: false,
+      grant: args.grant ?? null,
     };
     this.subs.add(sub);
     if (countsTowardCap) this.perVaultCount.set(args.vaultName, current + 1);
@@ -260,6 +267,13 @@ export class SubscriptionManager {
       },
       close: () => this.remove(sub),
     };
+  }
+
+  /** A grant ended in a vault (grants-api.ts): every subscription under it closes now. */
+  closeGrant(vaultName: string, grant: string): number {
+    let n = 0;
+    for (const sub of [...this.subs]) if (sub.vaultName === vaultName && sub.grant === grant) { this.remove(sub); n++; }
+    return n;
   }
 
   private remove(sub: Subscription): void {
@@ -330,10 +344,17 @@ export class SubscriptionManager {
     // hierarchy and private_tags may have changed since it subscribed). Read
     // once per distinct scope per event.
     const scopes = new Map<string, Set<string> | null>();
+    // each grant read once per event, however many sockets hold it
+    const grants = new Map<string, boolean>();
 
     for (const sub of this.subs) {
       if (sub.closed) continue;
       if (sub.vaultName !== vaultName) continue;
+      // under a grant: still in force now (ended some other way, or past its date), or the socket closes
+      if (sub.grant !== null) {
+        if (!grants.has(sub.grant)) grants.set(sub.grant, grantInForce(store, sub.grant));
+        if (!grants.get(sub.grant)) { this.remove(sub); continue; }
+      }
       if (sub.tagScopeRaw !== null) {
         const key = JSON.stringify(sub.tagScopeRaw);
         if (!scopes.has(key)) scopes.set(key, expandTokenTagScopeNow(store, sub.tagScopeRaw));
@@ -416,3 +437,14 @@ export interface SubscriptionHandle {
 
 /** Process-wide manager — shared like `defaultHookRegistry`. */
 export const subscriptionManager = new SubscriptionManager();
+
+function grantInForce(store: Store, id: string): boolean {
+  const db = (store as { db?: Parameters<typeof getGrant>[0] }).db;
+  if (!db) return false;
+  try {
+    const g = getGrant(db, id);
+    return !!g && grantState(g) === "in_force";
+  } catch {
+    return false;
+  }
+}

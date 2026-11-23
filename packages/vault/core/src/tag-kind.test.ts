@@ -36,7 +36,8 @@ describe("every tag record gets a kind (an additive column, no schema number)", 
     expect(stored.every((r) => r.kind === "type" || r.kind === "tag")).toBe(true);
     expect((db.prepare("SELECT MAX(version) AS v FROM schema_version").get() as { v: number }).v).toBe(SCHEMA_VERSION);
     const cols = (d: Database) => (d.prepare("PRAGMA table_info(tags)").all() as { name: string }[]).map((c) => c.name);
-    expect(cols(db)).toEqual(cols(fresh().db));
+    // Same columns; the order differs, since the re-added kind lands after T-476's created_by/created_via.
+    expect(cols(db).sort()).toEqual(cols(fresh().db).sort());
     // Membership is untouched.
     expect((db.prepare("SELECT COUNT(*) AS n FROM note_tags").get() as { n: number }).n).toBe(5);
     db.close();

@@ -84,6 +84,7 @@
  *   /account/keys                 (GET/POST)   → named app keys: list (with last use) / mint one vault
  *                                                at read|write, never admin (host:admin bearer, T-414)
  *   /account/keys/<name>          (DELETE)     → revoke an app key (refused at the hub's vault doors at once)
+ *   /account/vaults/<name>/statements[/<id>] (GET/DELETE) → who reaches a vault (grant rows) / end one (vault-grants.ts)
  *   /account/vaults               (GET/POST)   → list / create vault (create returns vault_token;
  *                                                {bare: true} → no welcome notes, T-414)
  *   /account/vaults/<name>/rename (POST)       → rename (host-admin)
@@ -277,6 +278,7 @@ import { handleAccountSetupGet, handleAccountSetupPost } from "./account-setup.t
 import { handleAccountToken } from "./account-token.ts";
 import { handleAccountVaultAdminTokenPost } from "./account-vault-admin-token.ts";
 import { handleAccountVaultTokenPost } from "./account-vault-token.ts";
+import { handleVaultNames, routeShareInvites } from "./api-share-invites.ts";
 import {
   type AgentGrantsDeps,
   handleAgentGrants,
@@ -389,6 +391,7 @@ import {
 } from "./module-manifest.ts";
 import { isNostrAuthorization } from "./nostr-http-auth.ts";
 import { routeAccountKeys } from "./account-keys.ts";
+import { routeVaultGrants } from "./vault-grants.ts";
 import { KEY_TOUCH_INTERVAL_MS, touchKey } from "./keys.ts";
 import { validateAccessToken } from "./jwt-sign.ts";
 import { handleNostrLogin } from "./nostr-login.ts";
@@ -429,6 +432,7 @@ import {
   handleSetupGet,
   handleSetupInstallPost,
   handleSetupVaultPost,
+  safeSetupReturn,
 } from "./setup-wizard.ts";
 import { getAllPublicKeys } from "./signing-keys.ts";
 import type { Supervisor } from "./supervisor.ts";
@@ -1047,6 +1051,19 @@ async function recordKeyUse(db: Database, use: { jti: string; token: string }): 
   }
 }
 
+/**
+ * The vault door's CORS headers (packages/vault/src/start-vault.ts, the `corsHeaders` every vault reply carries). The
+ * key door answers a revoked key in the vault's place, so its 401 carries the same headers: without them a browser
+ * app reads the refusal as a network error, not "revoked" (core #129). Kept equal to the vault's by the contract
+ * suites/safety/revoke-member.test.ts, which compares this 401 with the vault's own on the same route.
+ */
+const VAULT_DOOR_CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-API-Key, Mcp-Session-Id, Mcp-Protocol-Version, Mcp-Method, Mcp-Name",
+  "Access-Control-Expose-Headers": "WWW-Authenticate, Mcp-Session-Id, Deprecation, Link",
+} as const;
+
 function revokedKeyResponse(): Response {
   return new Response(JSON.stringify({ error: "invalid_token", error_description: "this key has been revoked" }), {
     status: 401,
@@ -1054,9 +1071,18 @@ function revokedKeyResponse(): Response {
       "content-type": "application/json",
       "cache-control": "no-store",
       "www-authenticate": 'Bearer error="invalid_token", error_description="this key has been revoked"',
+      ...VAULT_DOOR_CORS_HEADERS,
     },
   });
 }
+
+/** CORS for the bearer-only account routes (see where they're routed): any origin, never credentials. */
+const BEARER_ONLY_CORS: Record<string, string> = {
+  "access-control-allow-origin": "*",
+  "access-control-allow-methods": "GET, POST, DELETE, OPTIONS",
+  "access-control-allow-headers": "authorization, content-type",
+  "access-control-max-age": "600",
+};
 
 /**
  * The key door around a vault proxy (0.9.1, T-414): refuse a revoked hub token before it reaches the vault, and
@@ -2760,6 +2786,7 @@ export function hubFetch(
           manifestPath,
           configDir: CONFIG_DIR,
           issuer: oauthDeps(req).issuer,
+          ...(loopbackPort !== undefined ? { loopbackPort } : {}),
           registry: getDefaultOperationsRegistry(),
           // hub#576: a loopback peer (the on-box operator's own shell) is allowed
           // to read the actual bootstrap token from the GET /admin/setup JSON
@@ -2855,19 +2882,25 @@ export function hubFetch(
       // pre-admin has no account to authenticate and falls through to the
       // JSON-503 gate, the right shape for a stray non-browser caller.
       //
-      // The `?next=<surface>` param is intentionally dropped: there's no
-      // account yet to return the visitor to, and the open surface they came
-      // from likely can't function until setup completes. They land on the
-      // wizard, not back on that surface.
+      // The `?next=<surface>` param rides along to the wizard (T-476) when it
+      // is a safe same-origin path: the wizard remembers it, and once setup is
+      // done its last page offers a button back (the Parachute app's sign-in,
+      // above all). Anything else is dropped.
       //
       // `cache-control: no-store` (the `/` + `/hub.html` funnel above omits
       // it) — this 302 reflects transient pre-setup state that flips the
       // moment an admin is created, so it must never be cached by a CDN or
       // bfcache and serve a stale "go finish setup" to a now-set-up hub.
       if (getDb && pathname === "/login" && req.method === "GET" && userCount(getDb()) === 0) {
+        // T-476: the sign-in's `next` rides along when it is a safe same-origin path, so the wizard's done page can
+        // send the person back into it (the Parachute app's /oauth/authorize). Anything else is dropped as before.
+        const next = safeSetupReturn(url.searchParams.get("next"));
         return new Response(null, {
           status: 302,
-          headers: { location: "/admin/setup", "cache-control": "no-store" },
+          headers: {
+            location: next ? `/admin/setup?next=${encodeURIComponent(next)}` : "/admin/setup",
+            "cache-control": "no-store",
+          },
         });
       }
 
@@ -4450,6 +4483,45 @@ export function hubFetch(
           manifestPath,
         });
       }
+      // Sharing a vault with a friend (T-476; api-share-invites.ts): the friend reads and accepts an invite; every
+      // sharer reads the names of a vault's people.
+      if (pathname === "/account/invites/look" || pathname === "/account/invites/accept") {
+        if (!getDb) return dbNotConfigured();
+        const handled = await routeShareInvites(req, pathname, {
+          db: getDb(),
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
+          manifestPath,
+        });
+        if (handled) return handled;
+      }
+      // exactly /account/vaults/<one segment>/names: a vault named "names" still reaches its own routes
+      const namesOf = /^\/account\/vaults\/([^/]+)\/names$/.exec(pathname);
+      if (namesOf) {
+        if (!getDb) return dbNotConfigured();
+        let name: string;
+        try {
+          name = decodeURIComponent(namesOf[1]!);
+        } catch {
+          return new Response("not found", { status: 404 });
+        }
+        if (!name || name.includes("/")) return new Response("not found", { status: 404 });
+        return handleVaultNames(req, name, {
+          db: getDb(),
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
+          manifestPath,
+        });
+      }
+      // The two bearer-only routes an app uses to manage who reaches a vault (account-keys.ts, vault-grants.ts) answer
+      // any origin: they read no cookie, so a page elsewhere gains nothing a token-holder doesn't already have (the
+      // OAuth endpoints' reasoning, cors.ts), and the app reaches its hubs from its own origin.
+      const bearerOnly = pathname === "/account/keys" || pathname.startsWith("/account/keys/") || /^\/account\/vaults\/[^/]+\/statements(?:\/[^/]+)?$/.test(pathname);
+      if (bearerOnly && req.method === "OPTIONS") return new Response(null, { status: 204, headers: BEARER_ONLY_CORS });
+      const withBearerCors = (r: Response): Response => {
+        if (!bearerOnly || req.headers.has("cookie")) return r;
+        const h = new Headers(r.headers);
+        for (const [k, v] of Object.entries(BEARER_ONLY_CORS)) h.set(k, v);
+        return new Response(r.body, { status: r.status, statusText: r.statusText, headers: h });
+      };
       // /account/keys — named app keys (0.9.1, T-414; account-keys.ts): mint, list (with last use), revoke.
       if (pathname === "/account/keys" || pathname.startsWith("/account/keys/")) {
         if (!getDb) return dbNotConfigured();
@@ -4458,8 +4530,21 @@ export function hubFetch(
           issuer: oauthDeps(req).issuer,
           knownIssuers: oauthDeps(req).hubBoundOrigins(),
           manifestPath,
+          // a typed key's grant is filed at the vault through the hub's own proxy (vault-grants.ts)
+          forward: (fwd) => throughKeyDoor(fwd, getDb, () => proxyToVault(fwd, manifestPath, deps?.supervisor, peerAddr)),
         });
-        if (handled) return handled;
+        if (handled) return withBearerCors(handled);
+      }
+      // /account/vaults/<v>/statements — who reaches a vault, and ending one (vault-grants.ts, 1.0 grants slice).
+      if (/^\/account\/vaults\/[^/]+\/statements(?:\/[^/]+)?$/.test(pathname)) {
+        if (!getDb) return dbNotConfigured();
+        const handled = await routeVaultGrants(req, pathname, {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
+          forward: (fwd) => throughKeyDoor(fwd, getDb, () => proxyToVault(fwd, manifestPath, deps?.supervisor, peerAddr)),
+        });
+        if (handled) return withBearerCors(handled);
       }
       if (pathname === "/account/vaults") {
         if (!getDb) return dbNotConfigured();

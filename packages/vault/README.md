@@ -524,7 +524,7 @@ GET/POST       /vault/{name}/api/records                         query or create
 GET/PATCH/DEL  /vault/{name}/api/records/:idOrPath                read, update, delete a single record
 GET/POST       /vault/{name}/api/records/:id/attachments          list or add attachments
 GET            /vault/{name}/api/types                            every type and tag with its kind
-GET/PUT/DEL    /vault/{name}/api/types/:name                      get, update (admin) or delete (admin) a type
+GET/PUT/DEL    /vault/{name}/api/types/:name                      get, update (admin; write may define a new type or add fields to its own) or delete (admin) a type
 GET/POST       /vault/{name}/api/notes                           0.8's name for /api/records (deprecated, gone in 1.0)
 GET/PATCH/DEL  /vault/{name}/api/notes/:idOrPath                  read, update, delete a single note
 GET/POST       /vault/{name}/api/notes/:id/attachments            list or add attachments

@@ -1,7 +1,9 @@
 # Parachute 1.0: grants
 
 Uni, 2026-11-10 (T-448). The spec for 1.0's access model: who may do what in a vault, how the vault knows, and how
-it ends. Nothing here is built. The contracts that hold it are in `contracts/suites/door-v1/` (§12).
+it ends. Its first slice is built (door grants for keys held to types, the list, ending one: "Settled by the first
+slice" below); the rest isn't. The contracts that hold it are in `contracts/suites/door-v1/` and, for what is built,
+`contracts/suites/door/typed-keys.test.ts` (§12).
 
 **Marks.** **[decided]** Aaron's decisions of 11-07 and 11-10, or a requirement the 0.9 spec already recorded for
 1.0. **[lean]** this spec's proposal, open until Aaron or Benjamin says otherwise. **[frozen, decision A]** fixed
@@ -48,6 +50,23 @@ Bakery, the `recipes` vault.
 | C | After a move, do your friends' grants work at the new door at once? | One tap, once: "bring these 5 grants over". Revokes apply at once with no tap. | A copy left at the old door would keep honouring them. The tap is you saying the old one is retired. |
 | F | The first shared vault lives where? | Parachute Cloud, once it has key sign-in (it rides 0.9.1's keys). | From the shell note; friends aren't on the tailnet. |
 | G | The sharing contract already in core (`v1/sharing.test.ts`) describes a different model: levels (view, comment, suggest, edit, manage), groups, links for anyone, pages. Does this spec replace it for 1.0? | Yes. 1.0 is keys, types and verbs. Groups, public links, page-level sharing and comment or suggest levels wait for 1.1. | It changes what an existing contract means, which is yours or Benjamin's call. |
+
+**Settled by the first slice (T-476, 11-21), for Aaron and Benjamin to confirm.** Built in core #140 for a box: an
+owner gives an AI a key held to some types, and sees and ends everything that reaches a vault. Each item below was a
+[lean] or unsaid; it is now how the code behaves, and each can still change.
+
+| # | What the slice settled | Was |
+|---|---|---|
+| S1 | **Decision I as leaned:** a key's token carries only `permissions.grant: "<id>"`; the vault reads the grant from its own table on every request, so ending it bites on the next request (REST, MCP, the live socket, a file ticket). | I, lean |
+| S2 | **Door grants come first** (§7.3): a named key made with `types` is a door grant whose id is the key's name. Signed grants (37440) wait. | §7.3, lean |
+| S3 | **Verbs in this slice:** `read`, or `read create update delete`, the same on every type of one grant; no `*`, `:own` or `deny` yet. Anything else is refused when filed, never read around. | §2.1 |
+| S4 | **The list is §7.1's route and row,** `GET <issuer>/account/vaults/<name>/statements`, every credential a door-grant row (`origin: "door"`, `event: null`), plus `name`, `kind`, `app`, `client`, `last_used_at` for a person to read it by. A multi-vault key is a row in each vault it reaches. | §7.1, lean |
+| S5 | **Ending a door grant is `DELETE …/statements/<id>`:** the hub revokes the key and the vault ends its grant. A signed revoke (7440) stays the way to end a signed grant. | new |
+| S6 | **A vault's own admin may manage that vault:** a whole-vault `vault:<v>:admin` credential (not one narrowed by tags or a grant) may list, make keys for and end in that vault, never a key that reaches more, and never an on-behalf-of key (§6.1 stays the owner's). This is how the app manages a vault without holding the hub's owner credential. | §7.1 said the owner |
+| S7 | **History under a grant:** §4.1's rule applied as written. No version records its types until core #114/#115, so a grant sees no history for now. | §4.1 |
+| S8 | **The two bearer-only routes answer any origin** (`*`, never credentials): they read no cookie. | new |
+| S9 | **Still open from this slice:** a token revoked another way (`/api/auth/revoke-token`, the CLI, admin pages) is refused by the hub at once and by the vault within its revocation list's minute, but the vault's grant row isn't marked ended. One helper should end it wherever a typed key is revoked. | follow-up |
+| S10 | **A member is one row** of the list (T-476, one list): id `person:<their key>` (a key's name holds no colon, so the two never meet), `kind: "person"`, `by: "self"`, `grantee` their key, the name they were invited by. Their sign-ins (apps they signed in with by OAuth) are in their row, not beside it (§5.1: one key is one member); a key or token they made is a row of its own naming them (`person: {id, name}`; §5.2 keeps their agents their own rows). `DELETE …/statements/person:<their key>` ends the membership as `revoke-access` does, every credential of theirs naming the vault with it. | new |
 
 **Decided 11-13: A, the freeze.** Fixed for good: the five event numbers (37440 grant, 7440 revoke, 37441 link, 37442
 claim, 37443 the vault's own record); §2.1's grant layout (the meaning in canonical JSON content, the grant frame
@@ -755,10 +774,12 @@ NIP-98 proofs are single-use. A door that runs as many copies (Cloud, a personal
 every copy sees them, not in one process's memory [code: the box's replay map is in-process,
 `packages/hub/src/nostr-http-auth.ts`].
 
-**Every verifier refuses a permission it doesn't know** [decided, SPEC §3.5]. A box does today. Cloud's and a
-personal door's vault workers don't [code: no unknown-key check in cloud `workers/vault/src/auth.ts`]. They, and
-Prism's verifier, gain the refusal before any door mints a grant token. That is also what makes a rollback to 0.9
-fail closed.
+**Every verifier refuses a permission it doesn't know** [decided, SPEC §3.5]. A box does, and so do Cloud's and a
+personal door's vault workers since parachute-cloud#434 (next) and #437 (door/0.9) [code: cloud
+`workers/vault/src/auth.ts` KNOWN_PERMISSION_KEYS]. Prism's verifier gains it before any door mints Prism a grant
+token. It is also what makes a rollback fail closed: a vault worker from before typed keys refuses a token naming a
+grant. Cloud's workers from before #434 don't refuse, so a rollback that far serves a typed key as a whole-vault key
+until it is ended.
 
 ### 7.3 Grants nobody signed
 
@@ -820,7 +841,7 @@ they must still build.
 | **Holds the vault's private key** (§2.3) | a 0600 file per vault in the hub's home, apart from the vault | identity's database, encrypted under a Worker secret; never the Durable Object | the same as Cloud |
 | **A grantee signs in** | NIP-98 at the hub. The hub already takes NIP-98 for people it knows [code: `nostr-http-auth.ts`] | NIP-98 at identity: **new**. Today there is no key sign-in on Cloud `next` | NIP-98 at identity. Today any key but the owner's is `unknown_pubkey`; at 1.0 a key with a grant in force gets a token for that vault and nothing else |
 | **Who can reach it** | the tailnet, unless the owner exposes it | anyone | anyone |
-| **Still to build** | a vault owner per vault (today any `write`-role user is an admin); roles, pubkey roles and room rosters become door grants (§10) | accounts hold keys; key sign-in; the unknown-permission refusal; used NIP-98 ids shared across copies; `list-vaults` shows vaults a key was granted | the unknown-permission refusal; the grantee sign-in; used NIP-98 ids shared across copies |
+| **Still to build** | a vault owner per vault (today any `write`-role user is an admin); roles, pubkey roles and room rosters become door grants (§10) | key sign-in for a second person; used NIP-98 ids shared across copies; `list-vaults` shows vaults a key was granted. (Done: the unknown-permission refusal, cloud#434; door grants for typed keys and the list, cloud#439.) | the grantee sign-in; used NIP-98 ids shared across copies. (Done: the unknown-permission refusal and typed keys, as Cloud.) |
 
 Three rules hold at every door:
 
@@ -926,7 +947,7 @@ behaviour works. They run on any door: `bun run doors -- --doors box,personal su
 
 | File | The behaviour it holds | Spec |
 |---|---|---|
-| `grant.test.ts` | an owner-signed grant opens exactly the types it names to the key it names; a grant that isn't the owner's, is tampered with, names another vault, has no date, carries an unknown field or tag, has tags that disagree with its content, or isn't in its one spelling is refused, and so is a revoke for another vault; a write key can't file one; every credential shows as a grant row; the vault's own key can't be a grantee and an owner's override names the key that signs for it | §2, §4.4, §7 |
+| `grant.test.ts` | an owner-signed grant opens exactly the types it names to the key it names; a grant that isn't the owner's, is tampered with, names another vault, has no date, carries an unknown field or tag, has tags that disagree with its content, or isn't in its one spelling is refused, and so is a revoke for another vault; a write key can't file one; the vault's own key can't be a grantee and an owner's override names the key that signs for it | §2, §4.4, §7 |
 | `verbs.test.ts` | each verb alone; create without read is a form; `:own`; a denied tag; adding and removing a type | §4 |
 | `ending.test.ts` | a grant stops at its date; a signed revoke stops it on the next request and is final; a stranger's revoke does nothing; a newer grant the vault can't take suspends the address | §2.2, §3 |
 | `people.test.ts` | a member writes as themselves; an agent writes for its person; a member's agent never passes the member and ends with them | §5.1, §5.2 |
@@ -934,9 +955,10 @@ behaviour works. They run on any door: `bun run doors -- --doors box,personal su
 | `custodial.test.ts` | a `names` grant stamps its prefix; the header without it is refused; a link shows as the person's only after their own key confirms | §6 |
 | `leaks.test.ts` | a narrow grant learns nothing of a hidden type by search, links, counts, type lists, history or a file ticket | §4.1 |
 | `move.test.ts` | the export holds every statement word for word, the vault's id, and no credential | §9 |
+| `../door/typed-keys.test.ts` (built, the first slice) | a door grant for a key held to types: it reaches only those types at REST and MCP (id, path, search, links, counts, history, writes); every credential is a row in the list, an OAuth app by the name it registered; ending one fails its next REST and MCP request, closes its live socket and spends no file ticket it was given; a vault's admin manages its own vault and no other | §4.1, §7.1, §7.3 |
 
-Not held by a contract yet, and why: the live socket (needs a socket client in the door harness); MCP under a
-grant (the tools a grant's verbs leave, and the instructions; the REST contracts hold the same checkpoint); the `carried`
+Not held by a contract yet, and why: the live socket and MCP under a *signed* grant (for a door grant both are held in
+`suites/door/typed-keys.test.ts`, which carries a small socket client); the `carried`
 state after an import (open decision C); door grants for email-only owners (open decision B); the box's roles
 becoming door grants, the rollback, and revokes surviving a restore (migrations and restores, tested in
 `lifecycle/` when built); the export on a box (its export is a command, not HTTP, so `move.test.ts` runs on the

@@ -10,6 +10,7 @@
  * Every state-changing POST is double-submit-CSRF protected
  * (`parachute_hub_csrf` cookie + `__csrf` form field, constant-time compare).
  */
+import { isSameOriginPath } from "./same-origin-path.ts";
 import type { Database } from "bun:sqlite";
 import { recordLoginUnlock } from "./admin-lock.ts";
 import { renderAdminError, renderAdminLogin, renderTotpChallenge } from "./admin-login-ui.ts";
@@ -94,11 +95,9 @@ const FORCE_CHANGE_PASSWORD_PATH = "/account/change-password";
  * `next` with the SAME function the password doors use rather than a second
  * implementation that could drift on the open-redirect rule.
  */
-export function safeNext(raw: string | null): string {
-  if (!raw) return POST_LOGIN_DEFAULT;
-  // Only allow same-origin paths — never honor an absolute URL or scheme.
-  if (!raw.startsWith("/") || raw.startsWith("//")) return POST_LOGIN_DEFAULT;
-  return raw;
+export function safeNext(raw: string | null | undefined): string {
+  // Only a path on this hub (`isSameOriginPath`: no scheme, no `//`, no backslash, no control characters).
+  return isSameOriginPath(raw) ? raw : POST_LOGIN_DEFAULT;
 }
 
 /**

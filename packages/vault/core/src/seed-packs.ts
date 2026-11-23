@@ -413,8 +413,8 @@ job is to **learn it, not seed it**: \`vault-info\` — a single call now return
 a compact \`map\` (every tag's note count, every top-level path's note count,
 total notes) alongside the schema catalog, so you get the shape of a strange
 vault in one round trip; add \`include_stats: true\` only if you also want the
-deeper monthly distribution. Then \`list-tags\` and read a sample
-(\`query-notes { search: "..." }\`), and reflect the shape back to the person
+deeper monthly distribution. Then \`list-types\` and read a sample
+(\`query-records { search: "..." }\`), and reflect the shape back to the person
 and ask what's missing or wrong. Propose structure only once you can describe
 what's already there.
 
@@ -434,126 +434,137 @@ their existing data in is covered under "Bringing existing notes in" below.
 
 ## What a Parachute vault is
 
-A vault is **notes + tags + links** in one graph, reachable over MCP (you, now),
-a REST API (scripts), and any surface (a UI). It ships *nearly blank* — just a
-small welcome web and the \`capture\` tag the Notes surface uses; no other
-predefined tags or schema. You and the operator design the structure that fits
+A vault is **records + types + tags + links** in one graph, reachable over MCP
+(you, now), a REST API (scripts), and the person's Parachute app. It ships
+*nearly blank* — just a small welcome web and the \`capture\` tag the Notes view
+uses; no predefined types. You and the operator design the structure that fits
 *their* life and work. The vault is the engine; the meaning is yours to bring.
 
 Core moves, grouped by the scope each needs — \`tools/list\` shows exactly the
-ones your token can call (see "What your scope allows" below):
-- **Read:** \`query-notes\` (by id/path, by tag, full-text \`search\`, or graph
-  \`near\` a note), \`list-tags\`, \`find-path\` (shortest link path between two
-  notes), \`vault-info\` (the live schema projection + a compact \`map\` — tag
-  counts, top-level path-bucket counts, total notes — so you orient in one
-  call), \`doctor\` (read-only integrity scan).
-- **Write:** \`create-note\` / \`update-note\` / \`delete-note\` — author notes,
-  single or batch.
-- **Admin:** \`update-tag\` / \`delete-tag\` / \`rename-tag\` / \`merge-tags\` /
-  \`prune-schema\` (the tag vocabulary + schemas), \`vault-info { description }\`
-  (the vault's own description), \`manage-token\` (mint scoped child tokens).
+ones your token can call (see "What your scope allows" below). This guide uses
+0.9's tool names; a server that lists only the older ones (\`query-notes\`,
+\`create-note\`, \`update-note\`, \`update-tag\`) takes the same calls under
+those names, with \`content\` for \`body\` and \`metadata\` for \`fields\`:
+- **Read:** \`query-records\` (by id/path, by type or tag, full-text \`search\`,
+  graph \`near\` a record, or \`path_between\` two records), \`list-types\`,
+  \`vault-info\` (the live schema projection + a compact \`map\` — counts per
+  type and tag, top-level path-bucket counts, total records — so you orient in
+  one call; \`vault-info { help: "<tool>" }\` gives any tool's full reference),
+  \`doctor\` (read-only integrity scan).
+- **Write:** \`create-record\` / \`update-record\` / \`delete-record\` — author
+  records, single or batch, with their \`types\`, \`tags\` and \`fields\`; and
+  \`manage-types\` to **make a new type** and add fields to a type you made.
+- **Admin:** the rest of \`manage-types\` (change or remove fields, parents,
+  rename, merge, delete, prune, migrate), \`vault-info { description }\` (the
+  vault's own description), \`manage-keys\` (mint scoped child keys).
 
-\`[[wikilinks]]\` in note content auto-link to the note at that path — use them
-freely; they resolve even if the target is created later.
+\`[[wikilinks]]\` in a record's body auto-link to the record at that path — use
+them freely; they resolve even if the target is created later.
 
 ## What your scope allows
 
 Your connection carries one of three scopes, and it shapes what you can do here
 — by design, so the person can grant exactly as much authority as they mean to:
 
-- **\`read\`** — explore and answer: query notes, read tags, traverse the graph,
-  run \`doctor\`. You can't change anything.
+- **\`read\`** — explore and answer: query records, read types and tags,
+  traverse the graph, run \`doctor\`. You can't change anything.
 - **\`write\`** — everything read can do, plus author content: create, update,
-  and delete notes. You can capture and edit freely, but you *can't* reshape the
-  vault's structure — renaming/merging/deleting tags, editing schemas, and
-  rewriting the vault description all need admin.
+  and delete records, and **make new types** (\`manage-types\` on a name nobody
+  has defined yet; later, add fields to a type you made). You *can't* reshape
+  what exists: changing or removing a field, changing a type someone else made,
+  renaming/merging/deleting types and tags, and the vault description need admin.
 - **\`admin\`** — everything, including that restructuring, plus minting scoped
-  child tokens.
+  child keys.
 
 If a tool this guide mentions fails with "Unknown tool" — or a normally-visible
 tool refuses one argument with "Forbidden" (e.g. \`vault-info { description }\`
 for a non-admin) — that's your scope, not a bug: the action sits above your
 tier. Don't fight it: tell the person plainly
-what you'd do with more access ("I can add notes, but reorganizing your tags
-needs admin — want to grant it?") and let them decide. Most people connect with
-admin, so usually you'll have the whole set.
+what you'd do with more access ("I can add records and new types, but
+reorganizing your existing types needs admin — want to grant it?") and let them
+decide.
 
-## Tags vs paths vs schemas — the design vocabulary
+## Types vs tags vs paths — the design vocabulary
 
 These three axes are the heart of vault design. Use the right one for the job:
 
-- **Tags = types / membership.** A tag answers *"what kind of thing is this?"*
-  (\`#person\`, \`#meeting\`, \`#project\`). Queries **expand over tags**: a tag can
-  declare \`parent_names\` so \`tag:X\` also returns its subtypes (e.g. tagging a
-  note \`#meeting/standup\` with \`parent_names: [meeting]\` means \`query-notes
-  { tag: "meeting" }\` finds it). Tags are how you ask *"show me all my people."*
-  This is the primary structure — reach for a tag first.
+- **Types = what a record is.** A type answers *"what kind of thing is this?"*
+  (\`person\`, \`meeting\`, \`book\`) and carries the record's **fields**: a
+  \`book\` has a \`book_status\` and a \`book_rating\`. Queries **expand over
+  types**: a type can declare \`parent_names\` so \`type: "meeting"\` also finds
+  \`meeting/standup\`. Types are how you ask *"show me all my people"*, and
+  fields are how the person's apps read and change a record's state: a box
+  ticked in their app sets \`book_status: "read"\`, which you then read back.
+  Keep state in fields, not in the body's text. Reach for a type first.
+
+- **Tags = plain labels.** A tag is a flat word on a record (\`pinned\`,
+  \`capture\`, \`to-review\`): no fields, no parents. Use tags for marks that cut
+  across types.
 
 - **Paths = organization / filing.** A path (\`Projects/Acme/Kickoff\`) is *where*
-  a note lives — a human-browsable address, unique per note. Paths are for
+  a record lives — a human-browsable address, unique per record. Paths are for
   folders and named docs (like this one). They do **not** drive type queries;
-  don't encode meaning in a path that a tag should carry. A note can have a
-  path, tags, or both.
+  don't encode meaning in a path that a type should carry.
 
-- **Schemas = typed metadata fields.** Attach a schema to a tag (via
-  \`update-tag\`, an \`admin\`-scope move) to declare typed metadata fields — e.g. \`#meeting\` with a
-  \`held_on\` date, \`#person\` with an \`email\`. Each field can **optionally** be
-  marked \`indexed: true\` to make it **queryable with operators** (\`query-notes
-  { tag: "meeting", metadata: { held_on: { gte: "2026-01-01" } } }\`); indexing
-  is opt-in per field, not automatic. Add a schema (and index a field) when you
-  find yourself wanting to filter or sort on a value, not before. **Field names
-  are global across the vault, not scoped per tag** — two tags that declare the
-  same field name must agree on its type. So prefer a tag-specific name
-  (\`price_tier\` on \`#restaurant\`, \`book_rating\` on \`#book\`) over a generic
-  shared one (a \`rating\` that means 1–10 on one tag and \`$\`–\`$$$$\` on another
-  collides); when in doubt, name the field for the tag it belongs to.
+Each field can **optionally** be marked \`indexed: true\` to make it **queryable
+with operators** (\`query-records { type: "meeting", fields: { held_on: { gte:
+"2026-01-01" } } }\`); indexing is opt-in per field. **Field names are global
+across the vault, not scoped per type** — two types that declare the same field
+name must agree on its type. So prefer a type-specific name (\`price_tier\` on
+\`restaurant\`, \`book_rating\` on \`book\`) over a generic shared one; when in
+doubt, name the field for the type it belongs to.
 
-Rule of thumb: **type with tags, file with paths, make-it-queryable with
-schemas.** Start minimal — invent tags as real notes need them, declare a
-schema only when a query demands it. Over-designing an empty vault is the
-common mistake.
+Rule of thumb: **say what it is with a type, mark it with tags, file it with
+paths.** Start minimal — make a type when real records need one. Over-designing
+an empty vault is the common mistake.
 
-Declaring a schema is one \`update-tag\` call — the \`fields\` object maps each
-field name to \`{ type, enum?, indexed? }\` (\`type\` is \`"string"\`, \`"boolean"\`,
-or \`"integer"\`):
+Making a type is one \`manage-types\` call, and write access is enough for a new
+one. The \`fields\` object maps each field name to \`{ type, enum?, indexed?,
+default? }\` (\`type\` is \`"string"\`, \`"integer"\`, \`"number"\`, \`"boolean"\`,
+\`"date"\` or \`"reference"\`):
 
 \`\`\`
-update-tag {
+manage-types {
   tag: "meeting",
   description: "A meeting with notes",
   fields: {
-    held_on: { type: "string", indexed: true },                                         // queryable with operators
+    held_on: { type: "date", indexed: true },                                          // queryable with operators
     status:  { type: "string", enum: ["scheduled", "done"], default: "scheduled" },      // explicit default — declare one to auto-fill
-    meeting_rating: { type: "integer" }                                                 // no default — stays unset until written; tag-specific name, not a bare rating
+    meeting_rating: { type: "integer" }                                                 // no default — stays unset until written; type-specific name, not a bare rating
   }
 }
 \`\`\`
 
-\`fields\` is **merged** (new keys added, existing replaced); \`parent_names\` and
-\`relationships\` are replaced wholesale when passed. Only \`indexed: true\` fields
-support operator queries (\`metadata: { held_on: { gte: "..." } }\`) and
-\`order_by\`; all tags declaring the same field must agree on its \`type\` and
-\`indexed\` flag.
+Then \`create-record { path: "Meetings/Kickoff", types: ["meeting"], fields: {
+held_on: "2026-01-12" } }\`, and \`update-record { id, fields: { status: "done" },
+if_updated_at: "<the updated_at you read>" }\` to change one value (\`fields\` merges;
+\`null\` removes a key).
+
+A later \`manage-types\` call **merges** \`fields\` (new keys added). With write
+access you may add fields to a type you made; changing or removing a field,
+\`parent_names\` and \`relationships\` need admin. Only \`indexed: true\` fields
+support operator queries and \`order_by\`; all types declaring the same field
+must agree on its \`type\` and \`indexed\` flag.
 
 ## A few shapes worth reusing
 
 Testers of this vault independently reinvented these — start from them instead:
 
-- **Journaling.** One tag (\`#journal\`) with an indexed \`entry_date\`
+- **Journaling.** One type (\`journal\`) with an indexed \`entry_date\`
   (\`{ type: "string", indexed: true }\`, ISO date) and a \`mood\` enum
   (\`{ type: "string", enum: [...] }\`). Indexing \`entry_date\` (see "Only
   \`indexed: true\` fields support operator queries" above) is what makes
-  date-range queries (\`metadata: { entry_date: { gte: "2026-01-01" } }\`) and
+  date-range queries (\`fields: { entry_date: { gte: "2026-01-01" } }\`) and
   \`order_by: "entry_date"\` work.
 - **Agent memory (thread + messages, crash-replay-safe).** Model a
-  conversation as one \`#thread\` note (metadata: \`status\`, \`cursor\`) plus many
-  \`#message\` notes linked to it (\`relationship: "in-thread"\`), each carrying
+  conversation as one \`thread\` record (fields: \`status\`, \`cursor\`) plus many
+  \`message\` records linked to it (\`relationship: "in-thread"\`), each carrying
   its own \`status\`. If your write loop can crash and replay the same message,
   give it a stable \`path\` (e.g. \`Threads/<thread-id>/msg-<n>\`) and create it
   with \`if_exists: "ignore"\` — a retry after a crash safely returns the
   already-written message instead of creating a duplicate, no
   query-before-write round trip needed.
-- **Search.** \`query-notes { search: "..." }\` is literal by default — your
+- **Search.** \`query-records { search: "..." }\` is literal by default — your
   text is escaped, not parsed as FTS5 syntax, so punctuation like "didn't" or
   "18.6" just works. Pass \`search_mode: "advanced"\` only when you actually
   want FTS5 boolean/phrase/prefix syntax.
@@ -570,16 +581,16 @@ Testers of this vault independently reinvented these — start from them instead
 
 A few behaviors worth knowing before you write at scale:
 
-- **\`update-note\` requires optimistic concurrency by default.** Pass
+- **\`update-record\` requires optimistic concurrency by default.** Pass
   \`if_updated_at\` with the \`updated_at\` you last read; a mismatch returns a
   conflict error (re-read, reconcile, retry). For bulk/scripted writes where
   concurrency is known-safe, pass \`force: true\` to waive the *requirement to
   supply* it. \`append\`/\`prepend\`-only updates are exempt (no-conflict-by-design).
-- **A schema field only back-fills when you declare an explicit \`default\`.**
-  When a note gets a tag whose schema declares a field with a \`default\`, an
+- **A field only back-fills when you declare an explicit \`default\`.**
+  When a record gets a type that declares a field with a \`default\`, an
   unset field is filled with THAT value. A field with no \`default\` stays
-  genuinely absent — \`query-notes { metadata: { meeting_rating: { exists: false } } }\`
-  reliably finds notes that never set \`meeting_rating\`. Declare \`default\` on a field
+  genuinely absent — \`query-records { fields: { meeting_rating: { exists: false } } }\`
+  reliably finds records that never set \`meeting_rating\`. Declare \`default\` on a field
   only when "unset" and "explicitly set to X" should read the same; leave it
   off when you need to tell them apart.
 - **Validation is advisory, never blocking — EXCEPT an \`indexed: true\`
@@ -603,10 +614,10 @@ start with what's alive for them, not the whole archive. What works today:
 - **Connect the source over MCP (the flexible path).** If their AI client can
   add other MCP servers — a Google Drive server, a Notion server, a filesystem
   server — connect it alongside this vault in the same session. Then read from
-  there and \`create-note\` here: a selective, conversational migration, no
+  there and \`create-record\` here: a selective, conversational migration, no
   export file needed.
 - **Paste and file.** They paste anything — a doc, a list, an export — and you
-  \`create-note\` it (batch mode for many at once).
+  \`create-record\` it (batch mode for many at once).
 - **Import a Parachute export.** Moving between Parachute vaults (cloud ⇄
   self-host) is lossless — on Parachute Cloud, the console's Import button —
   ids, tags, links, schemas, and attachments round-trip.
@@ -618,7 +629,7 @@ survey it and suggest a first structure — read a sample, propose a small tag
 vocabulary, confirm, then apply. Don't impose structure silently.
 
 After bringing content in, orient: \`vault-info\` for the schema picture,
-\`list-tags\` for the vocabulary that arrived, \`query-notes { search: "..." }\`
+\`list-types\` for the vocabulary that arrived, \`query-records { search: "..." }\`
 to spot-check.
 
 ## Later: a custom surface

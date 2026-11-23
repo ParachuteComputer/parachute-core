@@ -117,7 +117,16 @@ import { findTokensReferencingTag } from "./token-store.ts";
  * unscoped — handlers fast-path on `allowed === null` and behave
  * identically to the pre-tag-scope code path.
  */
-export type TagScopeCtx = { allowed: Set<string> | null; raw: string[] | null };
+export type TagScopeCtx = {
+  allowed: Set<string> | null;
+  raw: string[] | null;
+  /**
+   * Under a grant (docs/SPEC-1.0-grants.md §4.1): a version is visible only if the types it had *then* are granted,
+   * and a version with no recorded types is hidden from every narrow grant. Versions don't record types yet (core
+   * #114/#115), so a grant sees no history: a version list is empty and a version answers as missing.
+   */
+  noHistory?: boolean;
+};
 
 const NO_TAG_SCOPE: TagScopeCtx = { allowed: null, raw: null };
 
@@ -136,6 +145,11 @@ export type WriteCtx = {
    * to false (full enforcement) for every normal write.
    */
   bypassStrict?: boolean;
+  /**
+   * T-476: a write credential without admin defining a type on `PUT /api/types/:name` (routing.ts). The handler lets
+   * only what write may do through (type-write.ts `writeTypeProblem`), as MCP's manage-types does.
+   */
+  typeWriteOnly?: boolean;
 };
 
 const vis = (t: TagScopeCtx) => { const v = buildExpandVisibility(t.allowed, t.raw); return v ? { isVisible: v } : undefined; };
@@ -198,6 +212,7 @@ import {
 // usage.ts imports `assetsDir` from config.ts (neutral ground), so this import
 // of invalidateUsageCache does NOT form a cycle — routes.ts → usage.ts only.
 import { invalidateUsageCache } from "./usage.ts";
+import { stampTypeCreator, typeIsUndefined, writeTypeProblem, type TypeChange } from "../core/src/type-write.ts";
 
 // Re-export `assetsDir` (now defined in config.ts) so the existing callers
 // that import it from this module — mirror-deps, mirror-routes, server,
@@ -3157,6 +3172,10 @@ async function handleNotesInner(
       return json({ error: "Not found", error_type: "not_found" }, 404);
     }
     const id = note?.id ?? idOrPath;
+    if (tagScope.noHistory) {
+      if (sub === "/versions" && method === "GET") return json({ versions: [], total: 0 });
+      if (method === "GET" || (sub === "/restore" && method === "POST")) return json({ error: "Not found", error_type: "not_found" }, 404);
+    }
     if (sub === "/versions") {
       if (method === "GET") {
         const parsedLimit = Number.parseInt(url.searchParams.get("limit") ?? "50", 10);
@@ -4173,6 +4192,23 @@ export async function handleTags(
       replace_fields?: unknown;
     };
     const replaceFields = body.replace_fields === true;
+    // T-476 (docs/contracts/write-defines-types.md): a type defined here records who defined it, as on MCP. A write
+    // credential without admin reaches this only on `/api/types/:name` (routing.ts), and may make only what write may:
+    // a new type, or new fields on a type it made. `/api/tags/:name` stays admin (Prism's compat suite pins it).
+    const typeWriter = { by: writeCtx.actor, via: writeCtx.via };
+    if (writeCtx.typeWriteOnly) {
+      const change: TypeChange = {};
+      for (const k of ["description", "fields", "relationships", "parent_names", "kind", "replace_fields"] as const) {
+        if ((body as Record<string, unknown>)[k] !== undefined) change[k] = (body as Record<string, unknown>)[k];
+      }
+      const problem = writeTypeProblem(store.db, putTagName, change, typeWriter, tagScope.allowed !== null);
+      if (problem) {
+        return problem.needsAdmin
+          ? json({ error: "Forbidden", error_type: "insufficient_scope", message: problem.message, required_scope: "vault:admin" }, 403)
+          : json({ error: problem.message, error_type: "invalid_type_change", message: problem.message }, 400);
+      }
+    }
+    const typeWasUndefined = typeIsUndefined(store.db, putTagName);
 
     // Validate the relationships payload up front so a bad payload returns
     // 400, not a thrown 500. `relationships` is an opaque vocabulary map
@@ -4335,6 +4371,7 @@ export async function handleTags(
         ...(parentNamesPatch !== undefined ? { parent_names: parentNamesPatch } : {}),
         ...((body as { kind?: "type" | "tag" }).kind !== undefined ? { kind: (body as { kind?: "type" | "tag" }).kind } : {}),
       });
+      stampTypeCreator(store.db, putTagName, typeWriter, typeWasUndefined);
     } catch (err) {
       if ((err as { error_type?: string })?.error_type === "tag_kind") {
         return Response.json({ error: (err as Error).message, error_type: "tag_kind", field: (err as { field?: string }).field }, { status: 422 });
@@ -5662,9 +5699,9 @@ function removeWikilinkBrackets(content: string, targetPath: string): string {
 }
 
 /**
- * GET /api/history/deleted — deleted notes that still have history, newest deletion first (T-412). Unscoped
- * administrators: a deleted note has no tags left to check a tag scope against, so a scoped pass gets the same 404
- * as /history/compact. `limit` (default 100, max 1000) and `offset`.
+ * GET /api/history/deleted — deleted notes that still have history, newest deletion first (T-412). Unscoped passes
+ * with write (T-476; the gate is routing.ts): a deleted note has no tags left to check a tag scope against, so a
+ * scoped pass gets the same 404 as /history/compact. `limit` (default 100, max 1000) and `offset`.
  */
 export async function handleDeletedNotes(req: Request, store: Store, tagScope: TagScopeCtx = NO_TAG_SCOPE): Promise<Response> {
   if (tagScope.raw !== null) return json({ error: "Not found", error_type: "not_found" }, 404);

@@ -60,9 +60,11 @@ public DCR ─────────────────────► pe
   `hub.db` edit (no `parachute auth` command exists for full client
   deletion yet — file an issue if needed).
 - A pending client hitting `/oauth/token` gets `invalid_client` per RFC
-  6749. A pending client hitting `/oauth/authorize` gets the
-  human-readable "App not yet approved" page (with or without an inline
-  approve button — see "Inline approve button" below).
+  6749. A pending client hitting `/oauth/authorize` with a session is
+  approved for that person and shown the consent page (single consent,
+  2026-05-29); without a session it gets the human-readable "Sign in to
+  your hub to continue" page, whose admin link is the fallback for
+  someone who isn't the hub's owner (T-476).
 
 ### Grant lifecycle
 
@@ -88,6 +90,20 @@ operator consents at /oauth/authorize ──────────────
 - **Revoking a grant does not invalidate already-issued tokens.** Token
   revocation is a separate operation via `/oauth/revoke` (and any future
   CLI wrapper).
+- **Revoking a token trims the grant behind it** (T-476, RFC 7009 §2.1).
+  When a client revokes one of its live tokens at `/oauth/revoke`, each
+  `vault:<name>:<verb>` scope that token carried and no other live token of
+  the same (user, client) still holds leaves the grant row (the row goes
+  when nothing is left; other scopes stay). So an app that gives back write
+  by keeping a read token and revoking its read+write one gets the consent
+  page the next time it asks for write
+  (`grants.ts:releaseGrantScopes`). Two paths still skip that page by
+  design: a same-hub client skips consent for low-risk scopes whatever the
+  grant holds, and trust by client name lets a *new* registration of the same
+  name and redirect home ride another registration's grant (one this revoke
+  didn't trim). Unredeemed codes don't count as holders (an extra page at
+  most), and revoking an already-rotated refresh token changes nothing (revoke
+  the newest one).
 
 ### Revocation, distinguished
 
@@ -419,12 +435,21 @@ as deferred; this section is the canonical record of why.
 - **First time you link an SPA to a vault**, expect either silent
   auto-approve (same-origin, you're logged in) or a one-click approve
   page.
-- **"App not yet approved" with a button** → that's the inline approve
-  UX. Review the `client_id` / `client_name` / `redirect_uris` / scopes
-  shown, then click "Approve and continue."
-- **"App not yet approved" without a button** → you're not logged into
-  the hub in this browser. Visit `/admin/login`, sign in, then retry
-  the SPA — or use the CLI path.
+- **"Sign in to your hub to continue"** → you're not signed in to the
+  hub in this browser. Press Sign in; you come back to the consent page
+  for the app. Someone who isn't the hub's owner sends the link at the
+  foot of the page to whoever runs it.
+- **"App not yet approved" with a button** → the inline approve form.
+  Since single consent (2026-05-29) a signed-in request approves the
+  app before this page, so it is only a defensive path.
+- **The consent page's marker**: "External" for an app that registered
+  itself; "Parachute's app on this device" only for the client named
+  exactly "Parachute" whose every redirect is first-party (T-476,
+  `parachuteAppHome`). A loopback redirect alone doesn't earn it, and
+  neither does a name that merely holds the word (Claude Code registers
+  as "Claude Code (parachute)"). Software already on the machine can
+  still register "Parachute" on loopback; the page shows where it
+  returns.
 - **Headless contexts**: `parachute auth approve-client <id>`. List
   pending clients with `parachute auth pending-clients` to find the
   id.
