@@ -265,7 +265,7 @@ home's `run/deprecations.json` (`parachute changes` prints the counts).
 **Graph**: `find-path` (BFS between two notes)
 **Vault**: `vault-info` (get/update description + stats)
 **Admin**: `prune-schema`, `doctor` (taxonomy/metadata integrity scan), `manage-token`
-**Attachments** (2, present when the door wires an attachment-ticket provider — always true on this server): `request-attachment-upload`, `request-attachment-download` — mint a short-lived, single-use ticket a runtime's shell spends directly at `/vault/{name}/tickets/{id}`; bytes never pass through the tool call. See [`docs/HTTP_API.md`](./docs/HTTP_API.md#attachment-tickets-vault611-both-doors).
+**Attachments** (present when the door wires an attachment-ticket provider — always true on this server): `attachment-url` (`action: "upload" | "download"`; the 0.8 names `request-attachment-upload`, `request-attachment-download` stay as deprecated aliases) — mint a short-lived, single-use ticket a runtime's shell spends directly at `/vault/{name}/tickets/{id}`; bytes never pass through the tool call. See [`docs/HTTP_API.md`](./docs/HTTP_API.md#attachment-tickets-vault611-both-doors).
 
 ### Vault descriptions
 

@@ -296,8 +296,8 @@ function sqliteToUserType(t: string): string {
  * its own context on them (bytes never ride MCP either way).
  *
  * `ticketsEnabled` reflects whether THIS door has wired an
- * `AttachmentTicketProvider` (bun: always, as of the Wave 1 PR; cloud: not
- * yet — its mirror is a separate PR). `readEnabled` reflects whether it's
+ * `AttachmentTicketProvider` (bun: always, as of the Wave 1 PR; cloud: always,
+ * since cloud#177). `readEnabled` reflects whether it's
  * wired an `AttachmentBytesProvider` (bun: always, as of this PR — Wave 2).
  * An unwired seam omits BOTH its tool(s) from `tools/list` (see
  * `generateMcpTools`'s `attachmentTickets` / `attachmentBytes` opts) AND

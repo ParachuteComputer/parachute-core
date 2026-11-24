@@ -2954,31 +2954,36 @@ between mint and spend, or if its bytes are missing on disk
 **Both doors.** Bun always wires the ticket provider — a process-wide (not
 per-vault) in-memory store, since the 256-bit ticket id is already globally
 unguessable. Cloud keeps tickets in the vault's Durable Object (since
-[cloud#177](https://github.com/ParachuteComputer/parachute-cloud/pull/177));
-the routes and shapes above are the same there. 0.9 folds both tools into
-`attachment-url {action: "upload" | "download"}`; a door on 0.8 lists them
-by the names above.
+[cloud#177](https://github.com/ParachuteComputer/parachute-cloud/pull/177)),
+so they outlive a restart, and stores the bytes in R2. The spend routes are
+the same, with one difference: cloud refuses an upload without a
+`Content-Length` (`411 length_required`). The tool names differ by surface:
+bun's 0.9 tool list folds both into `attachment-url {action: "upload" |
+"download"}` (the old names stay as deprecated aliases); the hosted door
+lists `request-attachment-upload` / `request-attachment-download`.
 
-**The ticket URL names the host the MCP client connected to** (bun:
-`X-Forwarded-Host`, else the request's own origin; cloud the same). On the
-hosted door that is `https://my.parachute.computer/vault/{name}/tickets/{id}`.
-Spending it needs a runtime that can reach that host. Sandboxed runtimes
-often can't:
+**The ticket URL names the host the MCP client connected to**:
+`X-Forwarded-Host`, else the request's own origin, on both doors (bun, when
+the tools are built without a request, uses the configured hub origin). On
+the hosted door that is
+`https://my.parachute.computer/vault/{name}/tickets/{id}`. Spending it needs
+a runtime that can reach that host. Sandboxed runtimes often can't:
 
 - **Claude's code sandbox** (claude.ai and the Claude desktop app) reaches
   only an allow-list of package registries, `github.com` and two Anthropic
-  hosts, unless the organization allows more. A Team or Enterprise owner can
-  add the host of the vault's connector URL under *Organization settings >
-  Capabilities > Allow network egress to package managers and specific
-  domains* (on the hosted door, `my.parachute.computer`). The MCP call
+  hosts, unless the organization allows more. On Team and Enterprise plans an
+  owner can add the host of the vault's connector URL under *Organization
+  settings > Capabilities > Allow network egress to package managers and
+  specific domains* (on the hosted door, `my.parachute.computer`); Anthropic's
+  article names no per-domain setting for Free, Pro and Max. The MCP call
   itself still works, because Claude makes connector calls from Anthropic's
   servers, outside the sandbox; only the PUT or GET is refused.
 - **The API code-execution tool** has no internet access, so its sandbox
   can't spend a ticket at all.
 
 In those runtimes, `read-attachment` still reads text and images into the
-conversation, and a text file can be written as a record with
-`create-record`. See Anthropic's
+conversation, and text can be written as a record (`create-note`, or
+`create-record` on bun's 0.9 list). See Anthropic's
 [network settings for file creation](https://support.claude.com/en/articles/12111783-create-and-edit-files-with-claude).
 
 ### MCP
@@ -3001,7 +3006,7 @@ enforced inside the MCP layer; the same `vault:read` / `vault:write` /
 
 ¹ Conditionally appended (vault#611) — present only when the door wires an
 attachment-ticket provider. Always true on bun's server and on cloud. See
-"Attachment tickets" below.
+"Attachment tickets" above.
 
 **BREAKING (this release):** `update-tag`/`delete-tag`/`rename-tag`/`merge-tags`
 moved `write` → `admin` (schema/taxonomy curation is a distinct tier from
