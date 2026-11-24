@@ -68,8 +68,7 @@ That's the whole happy path. Everything else in this doc is detail.
   parse the same query/write params. The table below is the lag list: a
   param is "honored" only when that door's parser reads it. A cloud client
   following this doc without checking the table will hit a silent drop or a
-  400. Precedent for door qualification is the "Wave 1, bun-only" line on
-  attachment tickets below. **Every cloud parity PR that lands or removes a
+  400. **Every cloud parity PR that lands or removes a
   param from this list updates this table.**
 
 Version history is the first self-hosted-first feature tracked in this table.
@@ -2905,7 +2904,7 @@ an owning note exists but falls outside the token's scope. The same `404`
 either way keeps the endpoint from acting as an existence oracle. Unscoped
 tokens keep the path-only behavior.
 
-### Attachment tickets (vault#611 — Wave 1, bun-only)
+### Attachment tickets (vault#611; both doors)
 
 MCP tool args are model-emitted, so a base64 upload through a tool call is
 effectively impossible past a few hundred KB. The `request-attachment-upload`
@@ -2952,12 +2951,35 @@ attachment's raw bytes with its stored `Content-Type`
 between mint and spend, or if its bytes are missing on disk
 (`error_type: "attachment_binary_missing"`).
 
-**Cloud parity.** Bun always wires the ticket provider — a process-wide (not
+**Both doors.** Bun always wires the ticket provider — a process-wide (not
 per-vault) in-memory store, since the 256-bit ticket id is already globally
-unguessable. Cloud's Durable-Object-backed mirror is a separate PR that
-hasn't landed yet; until it does, `request-attachment-upload` /
-`request-attachment-download` are simply absent from cloud's MCP tool list
-(D10 — an agent is never shown an affordance the runtime can't back).
+unguessable. Cloud keeps tickets in the vault's Durable Object (since
+[cloud#177](https://github.com/ParachuteComputer/parachute-cloud/pull/177));
+the routes and shapes above are the same there. 0.9 folds both tools into
+`attachment-url {action: "upload" | "download"}`; a door on 0.8 lists them
+by the names above.
+
+**The ticket URL names the host the MCP client connected to** (bun:
+`X-Forwarded-Host`, else the request's own origin; cloud the same). On the
+hosted door that is `https://my.parachute.computer/vault/{name}/tickets/{id}`.
+Spending it needs a runtime that can reach that host. Sandboxed runtimes
+often can't:
+
+- **Claude's code sandbox** (claude.ai and the Claude desktop app) reaches
+  only an allow-list of package registries, `github.com` and two Anthropic
+  hosts, unless the organization allows more. A Team or Enterprise owner can
+  add the host of the vault's connector URL under *Organization settings >
+  Capabilities > Allow network egress to package managers and specific
+  domains* (on the hosted door, `my.parachute.computer`). The MCP call
+  itself still works, because Claude makes connector calls from Anthropic's
+  servers, outside the sandbox; only the PUT or GET is refused.
+- **The API code-execution tool** has no internet access, so its sandbox
+  can't spend a ticket at all.
+
+In those runtimes, `read-attachment` still reads text and images into the
+conversation, and a text file can be written as a record with
+`create-record`. See Anthropic's
+[network settings for file creation](https://support.claude.com/en/articles/12111783-create-and-edit-files-with-claude).
 
 ### MCP
 
@@ -2978,8 +3000,8 @@ enforced inside the MCP layer; the same `vault:read` / `vault:write` /
 | `admin` (additive over write) | `update-tag`, `delete-tag`, `rename-tag`, `merge-tags`, `prune-schema`, `manage-token`, `vault-info` (description update) |
 
 ¹ Conditionally appended (vault#611) — present only when the door wires an
-attachment-ticket provider. Always true on bun's server. See "Attachment
-tickets" below.
+attachment-ticket provider. Always true on bun's server and on cloud. See
+"Attachment tickets" below.
 
 **BREAKING (this release):** `update-tag`/`delete-tag`/`rename-tag`/`merge-tags`
 moved `write` → `admin` (schema/taxonomy curation is a distinct tier from
