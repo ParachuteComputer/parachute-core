@@ -19,13 +19,13 @@ export const APPLET_HOST_URI = "ui://parachute/applet-host";
 export const MCP_APP_MIME = "text/html;profile=mcp-app";
 export const OPEN_APPLET = "open-applet";
 
-let cached: { path: string; mtimeMs: number; html: string } | null = null;
-/** The view's HTML, or null when this vault serves no MCP App. Kept in memory; a rebuilt file (new mtime) is read again. */
+let cached: { path: string; mtimeMs: number; size: number; html: string } | null = null;
+/** The view's HTML, or null when this vault serves no MCP App. Kept in memory; a rebuilt file (new mtime or size) is read again. */
 export function appletHostHtml(path = process.env.PARACHUTE_APPLET_HOST_HTML): string | null {
   if (!path) return null;
-  let mtimeMs: number;
-  try { mtimeMs = statSync(path).mtimeMs; } catch { return null; }
-  if (cached?.path !== path || cached.mtimeMs !== mtimeMs) cached = { path, mtimeMs, html: readFileSync(path, "utf8") };
+  let st: { mtimeMs: number; size: number };
+  try { st = statSync(path); } catch { return null; }
+  if (cached?.path !== path || cached.mtimeMs !== st.mtimeMs || cached.size !== st.size) cached = { path, mtimeMs: st.mtimeMs, size: st.size, html: readFileSync(path, "utf8") };
   return cached.html;
 }
 
@@ -78,7 +78,8 @@ export function openAppletTool(tools: McpToolDef[], vaultName: string): (McpTool
         const got = await query.execute({ path_prefix: "Applets/", tag: "applet", include_fields: true, limit: PAGE, offset });
         const page = (Array.isArray(got) ? got : ((got as { records?: unknown[] })?.records ?? [])) as Rec[];
         rows.push(...page);
-        if (page.length < PAGE) break;
+        // only an empty page ends it: a tag-scoped key's pages can come back short and still have more after them
+        if (page.length === 0) break;
       }
       const applets: AppletSummary[] = rows
         .filter((r) => r.path && r.fields?.applet?.name)
