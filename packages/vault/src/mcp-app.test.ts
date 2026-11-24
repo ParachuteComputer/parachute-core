@@ -84,6 +84,26 @@ describe("with a view to serve", () => {
     expect(r.content).toEqual([{ type: "text", text: "Showing v's applets: Library, People." }]);
   });
 
+  test("a door without query-records offers neither the tool nor resources (capability and handlers agree)", async () => {
+    const req = new Request("http://localhost/vault/v/mcp", {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "0" } } }),
+    });
+    const noQuery = () => tools().filter((t) => t.name !== "query-records");
+    const init = (await (await handleMcp(req, noQuery, "parachute-vault/v", "v", auth(["read"]), "")).json()) as any;
+    expect(init.result.capabilities.resources).toBeUndefined();
+    expect((await rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "0" } })).result.capabilities.resources).toEqual({});
+  });
+
+  test("applets past the first page of 200 are listed", async () => {
+    const create = tools().find((t) => t.name === "create-record")!;
+    await create.execute({ records: Array.from({ length: 205 }, (_, i) => ({ path: `Applets/Extra ${String(i).padStart(3, "0")}`, body: "", tags: ["applet"], fields: { applet: { id: `x${i}`, name: `Zz ${String(i).padStart(3, "0")}` } } })) });
+    const r = (await rpc("tools/call", { name: "open-applet", arguments: { applet: "Zz 204" } })).result;
+    expect(r.structuredContent.applets.length).toBe(207);
+    expect(r.structuredContent.open).toBe("Applets/Extra 204");
+  });
+
   test("open-applet by name opens that one", async () => {
     const r = (await rpc("tools/call", { name: "open-applet", arguments: { applet: "people" } })).result;
     expect(r.structuredContent.open).toBe("Applets/People");

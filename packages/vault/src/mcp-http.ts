@@ -146,17 +146,9 @@ export async function handleMcp(
     enableJsonResponse: true,
   });
 
+  const mcpTools = getTools();
   // T-476 spike (mcp-app.ts): with a view to serve, the door also offers `open-applet` and its ui:// resource
   const appHtml = appletHostHtml();
-  const server = new Server(
-    { name: serverName, version: "0.1.0" },
-    {
-      capabilities: appHtml ? { tools: {}, resources: {} } : { tools: {} },
-      instructions: instruction,
-    },
-  );
-
-  const mcpTools = getTools();
   const openApplet = appHtml ? openAppletTool(mcpTools, vaultName) : null;
   if (openApplet) mcpTools.push(openApplet);
 
@@ -169,6 +161,15 @@ export async function handleMcp(
   // vector by listing.
   const visibleTools = mcpTools.filter((t) =>
     hasScopeForVault(auth.scopes, vaultName, requiredVerbForTool(t)),
+  );
+  // resources only when the tool that names the view is listed to this caller: the capability and its handlers agree
+  const servesApp = !!(appHtml && openApplet && visibleTools.includes(openApplet));
+  const server = new Server(
+    { name: serverName, version: "0.1.0" },
+    {
+      capabilities: servesApp ? { tools: {}, resources: {} } : { tools: {} },
+      instructions: instruction,
+    },
   );
 
   // The caller's level here: two tools reach further at a higher one (mcp-annotations.ts BY_LEVEL). A tag-scoped admin
@@ -183,20 +184,19 @@ export async function handleMcp(
         ...(app.title ? { title: app.title } : {}),
         description: t.description,
         inputSchema: t.inputSchema,
-        // T-456: a client can tell a read from a change (mcp-annotations.ts); open-applet only reads
-        annotations: t === openApplet ? { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } : toolAnnotations(t.name, level),
+        annotations: toolAnnotations(t.name, level), // T-456: a client can tell a read from a change (mcp-annotations.ts)
         ...(app._meta ? { _meta: app._meta } : {}),
       };
     }),
   }));
 
-  if (appHtml && openApplet && visibleTools.includes(openApplet)) {
+  if (servesApp) {
     server.setRequestHandler(ListResourcesRequestSchema, async () => ({
       resources: [{ uri: APPLET_HOST_URI, name: "Parachute applets", mimeType: MCP_APP_MIME }],
     }));
     server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
       if (request.params.uri !== APPLET_HOST_URI) throw new McpError(ErrorCode.InvalidParams, `No resource ${request.params.uri}`);
-      return appletHostResource(appHtml);
+      return appletHostResource(appHtml!);
     });
   }
 
@@ -229,8 +229,6 @@ export async function handleMcp(
     }
     try {
       const result = await tool.execute((args ?? {}) as Record<string, unknown>);
-      // a tool that builds its own reply (open-applet: one line for the model, structuredContent for its view)
-      if ((tool as { rawResult?: boolean }).rawResult) return result as { content: { type: "text"; text: string }[] };
       // The one wrapper change (attachments-for-agents design, Wave 2):
       // `resultContent`, when a tool defines it, decides the MCP content
       // blocks instead of the universal single-text-block default:

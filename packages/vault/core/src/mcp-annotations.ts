@@ -45,6 +45,7 @@ export const TOOL_ANNOTATIONS: Readonly<Record<string, McpToolAnnotations>> = {
   "read-attachment": READ,
   "find-path": READ,
   "request-attachment-download": READ, // mints a one-use download URL for bytes the caller can already read
+  "open-applet": READ, // T-476 spike (src/mcp-app.ts): lists the vault's applets for an MCP Apps view
   // Changes.
   "create-record": CHANGE, // if_exists: "update" | "replace" overwrite
   "create-note": CHANGE,

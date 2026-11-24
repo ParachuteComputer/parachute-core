@@ -38,6 +38,8 @@ export interface ResultDeprecation {
 export interface ResultTool {
   /** The MCP content blocks for a result, when not the one JSON text block. */
   resultContent?: (result: unknown) => McpResultBlock[];
+  /** A tool's own `structuredContent`, for a client that reads it (an MCP Apps view: open-applet, T-476 spike). */
+  resultStructured?: (result: unknown) => Record<string, unknown>;
   /** Set on a deprecated tool whose reply carries a refresh nudge. */
   deprecation?: ResultDeprecation;
 }
@@ -51,6 +53,7 @@ export function mcpCallResult(tool: ResultTool, result: unknown): McpCallResult 
   const content: McpResultBlock[] = tool.resultContent
     ? tool.resultContent(result)
     : [{ type: "text", text: JSON.stringify(result, null, 2) }];
+  if (tool.resultStructured) return { content, structuredContent: tool.resultStructured(result) };
   // A reply with an image (read-attachment) keeps its blocks alone: a client that prefers structuredContent would
   // drop the picture.
   if (!readsEmptyInChatGpt(result) || content.some((b) => b.type !== "text")) return { content };
