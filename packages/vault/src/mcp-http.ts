@@ -24,10 +24,13 @@ import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/
 import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
+  ListResourcesRequestSchema,
+  ReadResourceRequestSchema,
   ErrorCode,
   McpError,
 } from "@modelcontextprotocol/sdk/types.js";
 import { generateScopedMcpTools, getServerInstruction } from "./mcp-tools.ts";
+import { APPLET_HOST_URI, MCP_APP_MIME, appletHostHtml, appletHostResource, openAppletTool } from "./mcp-app.ts";
 import type { AuthResult } from "./auth.ts";
 import type { McpToolDef } from "../core/src/mcp.ts";
 import { mcpToolErrorLine } from "../core/src/mcp-error-log.ts";
@@ -143,15 +146,19 @@ export async function handleMcp(
     enableJsonResponse: true,
   });
 
+  // T-476 spike (mcp-app.ts): with a view to serve, the door also offers `open-applet` and its ui:// resource
+  const appHtml = appletHostHtml();
   const server = new Server(
     { name: serverName, version: "0.1.0" },
     {
-      capabilities: { tools: {} },
+      capabilities: appHtml ? { tools: {}, resources: {} } : { tools: {} },
       instructions: instruction,
     },
   );
 
   const mcpTools = getTools();
+  const openApplet = appHtml ? openAppletTool(mcpTools, vaultName) : null;
+  if (openApplet) mcpTools.push(openApplet);
 
   // Filter the advertised tool list to what the caller's scopes actually
   // permit for THIS vault. Callers without write don't see mutation tools at
@@ -169,13 +176,29 @@ export async function handleMcp(
   const tagScoped = (auth.scoped_tags?.length ?? 0) > 0;
   const level = hasScopeForVault(auth.scopes, vaultName, "admin") && !tagScoped ? "admin" : hasScopeForVault(auth.scopes, vaultName, "write") ? "write" : "read";
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: visibleTools.map((t) => ({
-      name: t.name,
-      description: t.description,
-      inputSchema: t.inputSchema,
-      annotations: toolAnnotations(t.name, level), // T-456: a client can tell a read from a change (mcp-annotations.ts)
-    })),
+    tools: visibleTools.map((t) => {
+      const app = t as { title?: string; _meta?: Record<string, unknown> };
+      return {
+        name: t.name,
+        ...(app.title ? { title: app.title } : {}),
+        description: t.description,
+        inputSchema: t.inputSchema,
+        // T-456: a client can tell a read from a change (mcp-annotations.ts); open-applet only reads
+        annotations: t === openApplet ? { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } : toolAnnotations(t.name, level),
+        ...(app._meta ? { _meta: app._meta } : {}),
+      };
+    }),
   }));
+
+  if (appHtml && openApplet && visibleTools.includes(openApplet)) {
+    server.setRequestHandler(ListResourcesRequestSchema, async () => ({
+      resources: [{ uri: APPLET_HOST_URI, name: "Parachute applets", mimeType: MCP_APP_MIME }],
+    }));
+    server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+      if (request.params.uri !== APPLET_HOST_URI) throw new McpError(ErrorCode.InvalidParams, `No resource ${request.params.uri}`);
+      return appletHostResource(appHtml);
+    });
+  }
 
   // T-407: a record tool's domain errors are built below from its note tool's error, so they'd teach the note tool
   // (`re-read the note (query-notes)`, `note_id`); the record door says them in its own words.
@@ -206,6 +229,8 @@ export async function handleMcp(
     }
     try {
       const result = await tool.execute((args ?? {}) as Record<string, unknown>);
+      // a tool that builds its own reply (open-applet: one line for the model, structuredContent for its view)
+      if ((tool as { rawResult?: boolean }).rawResult) return result as { content: { type: "text"; text: string }[] };
       // The one wrapper change (attachments-for-agents design, Wave 2):
       // `resultContent`, when a tool defines it, decides the MCP content
       // blocks instead of the universal single-text-block default:
