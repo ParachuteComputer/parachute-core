@@ -105,9 +105,8 @@ async function jsonBody(req: Request): Promise<unknown> {
   }
 }
 
-/** Exported for direct testing (vault#555 fix 6) — lets a test inject a
- *  synthetic failing tool to exercise the `err instanceof McpError` guard
- *  without needing a real domain error class to construct one naturally. */
+/** Exported for direct testing (vault#555 fix 6): a test injects a synthetic failing tool to exercise the refusal
+ *  handling in `toolSurface` without needing a real domain error class to construct one naturally. */
 export async function handleMcp(
   req: Request,
   getTools: () => McpToolDef[],
