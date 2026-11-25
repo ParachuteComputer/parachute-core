@@ -1034,6 +1034,7 @@ function pendingClientResponse(
       client.clientName,
       client.redirectUris,
       requestedScopes,
+      forcesExplicitConsent,
     )
   ) {
     console.log(
@@ -1463,6 +1464,7 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
         client.clientName,
         client.redirectUris,
         earlyRequested,
+        forcesExplicitConsent,
       )
     ) {
       console.log(
@@ -1612,7 +1614,7 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
   if (
     !hasStaleAssignment &&
     userHasVaultPosture &&
-    ((!hasUnnamedVault && isCoveredByGrant(db, session.userId, client.clientId, requestedScopes)) ||
+    ((!hasUnnamedVault && isCoveredByGrant(db, session.userId, client.clientId, requestedScopes, forcesExplicitConsent)) ||
       unnamedCoveredByAccountGrant ||
       perVaultCovered !== null)
   ) {
@@ -2056,15 +2058,21 @@ export function grantableExtraScopes(
   userId: string,
   opts: { userIsAdmin: boolean; requested: readonly string[]; vaultName?: string | undefined },
 ): string[] {
-  // An ask already named for one vault (a connector at `/vault/<name>/mcp`) has no picker to bind an unnamed extra,
-  // so ticking `vault:admin` there ended on "Pick a vault" (T-476): name the extras for that vault.
+  const v = opts.vaultName;
+  // An ask with every vault already named (a connector at `/vault/<name>/mcp`) draws no picker to bind an unnamed
+  // extra, so ticking `vault:admin` there ended on "Pick a vault" (T-476): name the extras for those vaults instead.
+  // An ask with an unnamed vault verb draws the picker, which binds the unnamed extras as before.
   const askedVaults = new Set(
     opts.requested.flatMap((s) => {
       const parts = s.split(":");
       return parts.length === 3 && parts[0] === "vault" && parts[1] !== "*" ? [parts[1]!] : [];
     }),
   );
-  const v = opts.vaultName ?? (askedVaults.size === 1 ? [...askedVaults][0] : undefined);
+  const unnamedAsked = opts.requested.some((s) => {
+    const parts = s.split(":");
+    return parts.length === 2 && parts[0] === "vault";
+  });
+  const extraVaults = v ? [v] : askedVaults.size > 0 && !unnamedAsked ? [...askedVaults] : [];
   // The picker is the only path to `account:vaults`. Offering it as an extra
   // next to the client's vault scopes hits `accountVaultsCombinedWithOtherScopes`
   // at mint — a checkbox that looks grantable and then bounces the whole
@@ -2082,8 +2090,8 @@ export function grantableExtraScopes(
     );
   }
   const candidates = [
-    ...(v
-      ? [`vault:${v}:read`, `vault:${v}:write`, `vault:${v}:admin`]
+    ...(extraVaults.length > 0
+      ? extraVaults.flatMap((x) => [`vault:${x}:read`, `vault:${x}:write`, `vault:${x}:admin`])
       : ["vault:read", "vault:write", "vault:admin"]),
     ...restLadder,
   ];
@@ -4089,7 +4097,7 @@ function consentProps(
     // consent screen. Clean DB-backed signal: the `same_hub` column written
     // at DCR time (bearer hub:admin / same-origin session → true).
     sameHub: client.sameHub,
-    // T-476: Parachute's own app says so instead of External, and has no company its reads go to. Words only.
+    // T-476: Parachute's own app says so instead of "Self-registered", and has no company its reads go to. Words only.
     ...(parachuteApp ? { parachuteApp } : {}),
     grantableExtras,
     ...(vaultLevels ? { vaultLevels } : {}),

@@ -188,8 +188,9 @@ export interface ConsentViewProps {
   /**
    * T-476: the client is Parachute's own app (`parachuteAppHome` in clients.ts: the app's exact name, and every
    * registered redirect first-party). `"device"`: every redirect is loopback. The page then says so instead of
-   * External, and drops the line about the company that runs the app. Absent for every other client, Claude Code on
-   * loopback included (whatever its server is called). Words only: approval and scopes don't read it.
+   * "Self-registered", and drops the line about the company that runs the app. Absent for every other client, Claude Code on
+   * loopback included (whatever its server is called). Words only: approval and scopes don't read it, and admin starts
+   * unticked for it too (anyone can register that name on loopback).
    */
   parachuteApp?: "device" | "elsewhere";
 }
@@ -441,7 +442,7 @@ export function renderConsent(props: ConsentViewProps): string {
           .map((wire, i) =>
             levelsDecide(wire)
               ? `${renderScopeRow(wire, displayedScopes[i] ?? wire, false)}<input type="hidden" name="granted_scope" value="${escapeHtml(wire)}" />`
-              : renderScopeRow(wire, displayedScopes[i] ?? wire, true, parachuteApp !== undefined),
+              : renderScopeRow(wire, displayedScopes[i] ?? wire),
           )
           .join("\n");
   // 0.9.1 (SPEC §3.4): a vault grant reaches the whole vault at its level, and what the app reads leaves the box.
@@ -1139,7 +1140,7 @@ export function renderUnknownClient(props: UnknownClientViewProps): string {
  * missed it by omitting `displayVault`, so no substitution occurred and the two
  * forms happened to coincide.
  */
-function renderScopeRow(scope: string, displayScope: string = scope, interactive = true, adminTicked = false): string {
+function renderScopeRow(scope: string, displayScope: string = scope, interactive = true): string {
   // Special-case the `<TBD>` placeholder substituted by `canonicalConsentScope`
   // when the consent picker hasn't bound a vault yet — `explainScope` doesn't
   // match it because `<` / `>` aren't in the vault-name charset, but the
@@ -1191,9 +1192,9 @@ function renderScopeRow(scope: string, displayScope: string = scope, interactive
   // something a user reaches for deliberately, not something they inherit by
   // clicking Approve on a list an app composed.
   // Admin starts unticked too (T-476 claudereal): claude.ai asks for every scope a vault advertises, so a person who
-  // pressed Approve gave Claude the vault's schema, settings, triggers, backup and key minting. The one exception is
-  // Parachute's own app (`adminTicked`), which asks for a vault's admin only when the person pressed Manage in it.
-  const preChecked = risk === "high" || (explanation.level === "admin" && !adminTicked) ? "" : " checked";
+  // pressed Approve gave Claude the vault's schema, settings, triggers, backup and key minting. No exception by name:
+  // anyone can register as "Parachute" with a loopback redirect, so Parachute's own app gets the same unticked box.
+  const preChecked = risk === "high" || explanation.level === "admin" ? "" : " checked";
   // Read-only where nothing is chosen here (the approve-client page: scopes are chosen at the consent after it).
   const box = interactive ? `<input type="checkbox" name="granted_scope" value="${escapeHtml(scope)}"${preChecked} />` : "";
   // a row that chooses nothing isn't a label: no pointer, nothing to click

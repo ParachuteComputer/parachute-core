@@ -123,8 +123,11 @@ Canonical implementations:
   listed admin became every connector's ask. An app that needs admin asks for
   it by name. On the consent page admin starts unticked, marked powerful, and
   is granted only when the person ticks it; when the app didn't ask, it is
-  offered unticked under "Grant additional access". Parachute's own app keeps
-  the admin it asks for ticked (it asks only when the person pressed Manage).
+  offered unticked under "Grant additional access". No client name earns a
+  ticked admin, Parachute's own app included (anyone can register that name
+  on loopback). A silent re-link (same client, or a fresh client of the same
+  name) never drops a powerful scope the person granted: when the prior grant
+  holds one the ask doesn't name, the consent page is shown again.
   Parachute Cloud lists the same two scopes.
 - **Vault-bound consent drops foreign scopes.** When a client sends an
   RFC 8707 `resource=<origin>/vault/<name>/mcp` indicator (an MCP client

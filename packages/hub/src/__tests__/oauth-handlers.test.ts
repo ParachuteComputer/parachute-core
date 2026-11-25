@@ -10823,6 +10823,21 @@ describe("single OAuth consent + grantable vault admin + delegate-only cap (2026
     }
   });
 
+  // T-476 review: an ask naming vaults draws no picker, so an unnamed extra there could only end on "Pick a vault".
+  test("an ask naming two vaults gets extras named for each, never an unnamed vault:admin", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const admin = await createUser(db, "admin", "pw");
+      const extras = grantableExtraScopes(db, admin.id, { userIsAdmin: true, requested: ["vault:a:read", "vault:b:read"] });
+      expect(extras).toEqual(expect.arrayContaining(["vault:a:admin", "vault:b:admin", "vault:a:write", "vault:b:write"]));
+      expect(extras.filter((x) => x.split(":").length === 2 && x.startsWith("vault:"))).toEqual([]);
+      // With an unnamed verb in the ask the picker is drawn and binds unnamed extras, as before.
+      expect(grantableExtraScopes(db, admin.id, { userIsAdmin: true, requested: ["vault:a:read", "vault:write"] })).toContain("vault:admin");
+    } finally {
+      cleanup();
+    }
+  });
+
   test("grantable extras suppress an already-requested unnamed vault scope when named", async () => {
     const { db, cleanup } = await makeDb();
     try {
@@ -11809,10 +11824,14 @@ describe("single OAuth consent + grantable vault admin + delegate-only cap (2026
           ),
           capDeps,
         );
-        expect(res.status).toBe(302); // skip-consent silent mint of the held scope
-        const code = new URL(res.headers.get("location") ?? "").searchParams.get("code");
-        const { scope } = await redeemToScopeAud(db, code ?? "", regSkip.client.clientId, verifier);
-        expect(scope.split(" ")).not.toContain("vault:other:admin");
+        // T-476: a grant holding a powerful scope the ask doesn't name (admin here) no longer skips consent; the page
+        // asks again, so nothing is minted silently at all. Were it to skip, the cap still keeps other:admin out.
+        expect(res.status).toBe(200);
+        if (res.status === 302) {
+          const code = new URL(res.headers.get("location") ?? "").searchParams.get("code");
+          const { scope } = await redeemToScopeAud(db, code ?? "", regSkip.client.clientId, verifier);
+          expect(scope.split(" ")).not.toContain("vault:other:admin");
+        }
       }
     } finally {
       cleanup();
@@ -12962,11 +12981,58 @@ describe("consent as a browser submits it: what is unticked is not granted (T-47
       scope: "vault:work:admin vault:work:read vault:work:write",
     });
   });
-  // Parachute's own app asks for a vault's admin only when the person pressed Manage in it (the app's manageScope), and
-  // returns only to this device: an unticked box there would make Manage fail for everyone who just approves.
-  test("Parachute's own app on this device keeps the admin it asked for ticked", async () => {
+  // No name earns a ticked admin: anyone can register as "Parachute" with a loopback redirect (review of T-476).
+  test("SECURITY: an app named Parachute on this device gets admin unticked too", async () => {
     const app = { name: "Parachute", redirect: "http://127.0.0.1:47219/oauth/callback" };
-    expect(await consent("vault:work:admin", [], MCP, { app })).toEqual({ scope: "vault:work:admin" });
+    expect(await consent("vault:work:read vault:work:admin", [], MCP, { app })).toEqual({ scope: "vault:work:read" });
+  });
+
+  // claude.ai never asks for admin again, so a silent Reconnect (a fresh client of the same name, or the same client)
+  // minted read and write and dropped the admin the person ticked, with no page to tick it again.
+  test("a Reconnect after the person ticked admin shows the page again rather than silently dropping admin", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const owner = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: owner.id });
+      const redirect = "https://claude.ai/api/mcp/auth_callback";
+      const ask = (clientId: string, pk: string) => authorizeUrl({ client_id: clientId, redirect_uri: redirect, response_type: "code", scope: "vault:work:read vault:work:write", code_challenge: pk, code_challenge_method: "S256", resource: MCP });
+      const first = registerClient(db, { redirectUris: [redirect], clientName: "Claude", status: "pending" });
+      const page = handleAuthorizeGet(db, new Request(ask(first.client.clientId, makePkce().challenge), { headers: { cookie: cookie(session.id) } }), deps);
+      expect(page.status).toBe(200);
+      const form = new URLSearchParams(browserFields(await page.text(), [], ["vault:work:admin"]));
+      form.append("approve", "yes");
+      const approved = await handleAuthorizePost(db, new Request(`${ISSUER}/oauth/authorize`, { method: "POST", body: form, headers: { "content-type": "application/x-www-form-urlencoded", cookie: cookie(session.id) } }), deps);
+      expect(approved.status).toBe(302);
+      expect(findGrant(db, owner.id, first.client.clientId)!.scopes).toContain("vault:work:admin");
+      // Reconnect: a fresh registration under the same name, and the same client asking again.
+      const second = registerClient(db, { redirectUris: [redirect], clientName: "Claude", status: "pending" });
+      for (const clientId of [second.client.clientId, first.client.clientId]) {
+        const again = handleAuthorizeGet(db, new Request(ask(clientId, makePkce().challenge), { headers: { cookie: cookie(session.id), origin: ISSUER } }), deps);
+        expect(again.status, clientId).toBe(200);
+        expect(await again.text()).toMatch(/<input type="checkbox" name="extra_scope" value="vault:work:admin" \/>/);
+      }
+    } finally {
+      cleanup();
+    }
+  });
+  test("a Reconnect with nothing powerful held stays silent", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const owner = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: owner.id });
+      const redirect = "https://claude.ai/api/mcp/auth_callback";
+      const first = registerClient(db, { redirectUris: [redirect], clientName: "Claude", status: "approved" });
+      recordGrant(db, owner.id, first.client.clientId, ["vault:work:read", "vault:work:write"]);
+      const second = registerClient(db, { redirectUris: [redirect], clientName: "Claude", status: "pending" });
+      const again = handleAuthorizeGet(
+        db,
+        new Request(authorizeUrl({ client_id: second.client.clientId, redirect_uri: redirect, response_type: "code", scope: "vault:work:read vault:work:write", code_challenge: makePkce().challenge, code_challenge_method: "S256", resource: MCP }), { headers: { cookie: cookie(session.id), origin: ISSUER } }),
+        deps,
+      );
+      expect(again.status).toBe(302);
+    } finally {
+      cleanup();
+    }
   });
   test("SECURITY: account-wide admin starts unticked; Approve without ticking it is a denial, not a grant", async () => {
     expect(await consent("account:self:admin", [])).toEqual({ denied: "access_denied" });

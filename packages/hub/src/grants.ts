@@ -152,12 +152,25 @@ export function isCoveredByGrant(
   userId: string,
   clientId: string,
   requestedScopes: readonly string[],
+  /** A powerful scope (`forcesExplicitConsent`): see `holdsPowerfulBeyondAsk`. */
+  powerful?: (scope: string) => boolean,
 ): boolean {
   if (requestedScopes.length === 0) return false;
   const grant = findGrant(db, userId, clientId);
   if (!grant) return false;
+  if (powerful && holdsPowerfulBeyondAsk(grant, requestedScopes, powerful)) return false;
   const granted = new Set(grant.scopes);
   return requestedCoveredByGranted(granted, requestedScopes);
+}
+
+/**
+ * The grant holds a powerful scope the ask doesn't name (T-476): admin the person ticked as additional access, which a
+ * connector such as claude.ai never asks for again. A silent re-link mints only the ask, so it would drop that choice
+ * with no page to make it again; the skip gates fall through to the consent page instead, where the person chooses.
+ */
+function holdsPowerfulBeyondAsk(grant: Grant, requestedScopes: readonly string[], powerful: (scope: string) => boolean): boolean {
+  const asked = new Set(requestedScopes);
+  return grant.scopes.some((scope) => powerful(scope) && !asked.has(scope));
 }
 
 /**
@@ -237,10 +250,13 @@ export function isCoveredByGrantForClientName(
   clientName: string,
   clientRedirectUris: readonly string[],
   requestedScopes: readonly string[],
+  /** A powerful scope (`forcesExplicitConsent`): see `holdsPowerfulBeyondAsk`. */
+  powerful?: (scope: string) => boolean,
 ): boolean {
   if (requestedScopes.length === 0) return false;
   const grant = findGrantByClientName(db, userId, clientName, clientRedirectUris);
   if (!grant) return false;
+  if (powerful && holdsPowerfulBeyondAsk(grant, requestedScopes, powerful)) return false;
   const granted = new Set(grant.scopes);
   return requestedCoveredByGranted(granted, requestedScopes);
 }

@@ -442,14 +442,15 @@ as deferred; this section is the canonical record of why.
 - **"App not yet approved" with a button** → the inline approve form.
   Since single consent (2026-05-29) a signed-in request approves the
   app before this page, so it is only a defensive path.
-- **The consent page's marker**: "External" for an app that registered
-  itself; "Parachute's app on this device" only for the client named
+- **The consent page's marker**: "Self-registered" (neutral, T-476; it
+  was "External" in red) for an app that registered itself; "Parachute's app on this device" only for the client named
   exactly "Parachute" whose every redirect is first-party (T-476,
   `parachuteAppHome`). A loopback redirect alone doesn't earn it, and
   neither does a name that merely holds the word (Claude Code registers
   as "Claude Code (parachute)"). Software already on the machine can
   still register "Parachute" on loopback; the page shows where it
-  returns.
+  returns. So the marker is words only: admin starts unticked for every
+  app, this one included.
 - **Headless contexts**: `parachute auth approve-client <id>`. List
   pending clients with `parachute auth pending-clients` to find the
   id.

@@ -463,7 +463,7 @@ describe("renderConsent", () => {
     expect(html).not.toContain("registered itself");
   });
 
-  // T-476 claudereal: admin starts unticked and says why it is powerful; Parachute's own app keeps it ticked.
+  // T-476 claudereal: admin starts unticked and says why it is powerful, for every app.
   test("an admin row starts unticked with the powerful line; read and write stay ticked", () => {
     const html = renderConsent({ params: PARAMS, csrfToken: CSRF, clientId: "c", clientName: "Claude", scopes: ["vault:work:read", "vault:work:write", "vault:work:admin"], sameHub: false });
     expect(html).toContain('<input type="checkbox" name="granted_scope" value="vault:work:read" checked />');
@@ -471,9 +471,9 @@ describe("renderConsent", () => {
     expect(html).toContain('<input type="checkbox" name="granted_scope" value="vault:work:admin" />');
     expect(html).toContain("<strong>Powerful.</strong> The app could change how the vault works and make keys of its own. Tick it only if you want this app to manage the vault.");
   });
-  test("Parachute's own app keeps the admin it asked for ticked", () => {
+  test("Parachute's own app gets admin unticked too: a name earns no tick", () => {
     const html = renderConsent({ params: PARAMS, csrfToken: CSRF, clientId: "c", clientName: "Parachute", scopes: ["vault:work:admin"], sameHub: false, parachuteApp: "device" });
-    expect(html).toContain('<input type="checkbox" name="granted_scope" value="vault:work:admin" checked />');
+    expect(html).toContain('<input type="checkbox" name="granted_scope" value="vault:work:admin" />');
   });
   test("the sign-in page before consent says admin is powerful, with nothing to tick", () => {
     const html = renderApprovePending({ clientName: "Claude", clientId: "c", redirectUris: ["https://app.example/cb"], requestedScopes: ["vault:read", "vault:admin"], requestedVault: null, hubOrigin: "https://hub.example", approveForm: null, loginNextUrl: "/" } as unknown as Parameters<typeof renderApprovePending>[0]);
