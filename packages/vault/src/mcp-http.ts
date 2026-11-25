@@ -171,6 +171,9 @@ export function toolSurface(
   // can't set the vault-wide description, so for the hints it counts as a writer.
   const tagScoped = (auth.scoped_tags?.length ?? 0) > 0;
   const level = hasScopeForVault(auth.scopes, vaultName, "admin") && !tagScoped ? "admin" : hasScopeForVault(auth.scopes, vaultName, "write") ? "write" : "read";
+  // The level that decides what is listed (a tag-scoped admin sees manage-keys): what an unknown tool's refusal says
+  // the caller has (T-476), so it never tells an admin to ask for admin.
+  const listed = hasScopeForVault(auth.scopes, vaultName, "admin") ? "admin" : hasScopeForVault(auth.scopes, vaultName, "write") ? "write" : "read";
   return {
     // `meta`: the request's `_meta` (T-476: a file argument is marked `x-mcp-file` only for a client that declared the
     // file-transfer extension).
@@ -194,7 +197,7 @@ export function toolSurface(
     // Dispatch against the FILTERED tool list: a tool the caller can't see in `tools/list` can't be called either
     // (vault#376), and the refusal is the same as for a tool that doesn't exist, so nothing leaks.
     const tool = visibleTools.find((t) => t.name === name);
-    if (!tool) return refusalResult(unknownToolRefusal(name, level));
+    if (!tool) return refusalResult(unknownToolRefusal(name, listed));
     try {
       // `resultContent`, when a tool defines it, decides the content blocks (read-attachment's image, the note
       // aliases' nudge); mcpCallResult adds `structuredContent` where a client needs it (T-456), and answers a

@@ -25,6 +25,11 @@ import { join } from "path";
 const TEST_HOME = mkdtempSync(join(tmpdir(), "parachute-test-home-"));
 process.env.PARACHUTE_HOME = TEST_HOME;
 
+// The docs site (T-476, core/src/docs-tool.ts): a box reads parachute.computer/latest.json in the background whenever
+// it builds a connect-time brief. A test never reaches the network for it: the docs origin is a closed local port,
+// so a read fails at once. A test of the docs themselves sets its own origin or fetch.
+process.env.PARACHUTE_DOCS_URL = "http://127.0.0.1:9";
+
 // Tripwire, and a live one: `mkdtempSync` builds on `tmpdir()`, which honors
 // TMPDIR. An operator or CI that points TMPDIR inside the parachute home
 // (`TMPDIR=~/.parachute/tmp` is not exotic) would have this file dutifully

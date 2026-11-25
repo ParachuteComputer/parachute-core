@@ -109,6 +109,11 @@ function logsDirPath(): string {
   return join(vaultHomePath(), "logs");
 }
 
+/** Where the vault's global config lives (`<PARACHUTE_HOME>/vault/config.yaml`). */
+export function globalConfigFile(): string {
+  return globalConfigPath();
+}
+
 function globalConfigPath(): string {
   return join(vaultHomePath(), "config.yaml");
 }

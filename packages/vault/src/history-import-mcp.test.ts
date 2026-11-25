@@ -46,7 +46,7 @@ import { generateScopedMcpTools } from "./mcp-tools.ts";
 import { applyImportedNote, beginImportRun, importTargetDigest } from "../core/src/history-import.ts";
 import { resolveHistoryPolicy } from "../core/src/history.ts";
 /** T-476: every refusal carries `docs`, the page with its fix for this box's version. */
-const docsFor = (type: string) => docsPageUrl({ origin: "https://parachute.computer", version: pkg.version }, refusalTopic(type));
+const docsFor = (type: string) => docsPageUrl({ origin: process.env.PARACHUTE_DOCS_URL!, version: pkg.version }, refusalTopic(type));
 
 test("HTTP MCP imported get/list/error keeps discriminator and rejects mixed selectors", async () => {
   const saved = process.env.PARACHUTE_HOME;

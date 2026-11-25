@@ -22,7 +22,7 @@ import { describe, test, expect } from "bun:test";
 import { Database } from "bun:sqlite";
 import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import { handleMcp } from "./mcp-http.ts";
-import { docsMinor, docsPageUrl, refusalTopic } from "../core/src/docs-tool.ts";
+import { docsPageUrl, refusalTopic } from "../core/src/docs-tool.ts";
 import pkg from "../package.json" with { type: "json" };
 import { plainMessage, refusalOfError, refusalOfReply } from "../core/src/mcp-refusal.ts";
 import { generateMcpTools, type McpToolDef } from "../core/src/mcp.ts";
@@ -146,7 +146,7 @@ describe("refusalOfError — the one mapping from a thrown error to a refusal (T
 });
 
 /** T-476: every refusal carries `docs`, the page with its fix for this box's version (core/src/docs-tool.ts). */
-const docsFor = (type: string) => docsPageUrl({ origin: "https://parachute.computer", version: pkg.version }, refusalTopic(type));
+const docsFor = (type: string) => docsPageUrl({ origin: process.env.PARACHUTE_DOCS_URL!, version: pkg.version }, refusalTopic(type));
 
 describe("handleMcp refusals — end to end (vault#555 fix 6, T-476)", () => {
   test("a tool throwing an ALREADY-formed McpError is an isError refusal: no prefix, data preserved verbatim as fields", async () => {
@@ -225,8 +225,21 @@ describe("handleMcp refusals — end to end (vault#555 fix 6, T-476)", () => {
       // T-476: the caller's own level, the same words whether the tool exists above it or not at all
       message: "Unknown tool: nope. tools/list names every tool this connection has.",
       tool: "nope",
-      docs: "https://parachute.computer/docs/v/" + docsMinor(pkg.version) + "/fix/needs-admin/",
+      docs: docsFor("unknown_tool"),
     });
+  });
+});
+
+describe("unknown_tool says the level that decides what is listed (T-476)", () => {
+  test("a tag-scoped admin, which sees manage-keys, is never told it lacks admin", async () => {
+    const req = new Request("http://localhost:1940/vault/v/mcp", {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "nope", arguments: {} } }),
+    });
+    const auth = { ...fullAuth(), scoped_tags: ["projects"] };
+    const body: any = await (await handleMcp(req, toolsWith(() => ({})), "test-server", "v", auth, "")).json();
+    expect(body.result.structuredContent.message).toBe("Unknown tool: nope. tools/list names every tool this connection has.");
   });
 });
 

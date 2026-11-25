@@ -124,7 +124,15 @@ export const REFUSAL_DOCS: Readonly<Record<string, string>> = {
 };
 
 /** The fix page for a refusal or warning type. */
-export const refusalTopic = (type: string): string => REFUSAL_DOCS[type] ?? "fix/refusals";
+export const refusalTopic = (type: string): string => (Object.hasOwn(REFUSAL_DOCS, type) ? REFUSAL_DOCS[type]! : "fix/refusals");
+/** The fix page a warning code has, or undefined (only the map's own keys: never `constructor`). */
+const fixFor = (code: unknown): string | undefined => (typeof code === "string" && Object.hasOwn(REFUSAL_DOCS, code) ? REFUSAL_DOCS[code] : undefined);
+
+/** The person's step for a refusal only they can fix, when the refusal names none (T-476 eval). Checked against the
+ *  approval page (one tick per level, packages/hub/src/oauth-ui.ts) and `parachute keys new … --can`. */
+export const PERSON_STEPS: Readonly<Record<string, string>> = {
+  insufficient_scope: "The person grants it: they connect this AI again and leave the level it needs ticked on Parachute's approval page.",
+};
 
 type Result = { content: { type: string; [k: string]: unknown }[]; structuredContent?: Record<string, unknown>; isError?: boolean; [k: string]: unknown };
 
@@ -136,7 +144,10 @@ type Result = { content: { type: string; [k: string]: unknown }[]; structuredCon
 export function withRefusalDocs<R extends Result>(result: R, ctx: DocsContext | null | undefined): R {
   const sc = result?.structuredContent;
   if (!ctx?.origin || result?.isError !== true || !sc || typeof sc.error_type !== "string" || "docs" in sc) return result;
-  const refusal = { ...sc, docs: docsPageUrl({ origin: ctx.origin, version: ctx.version }, refusalTopic(sc.error_type)) };
+  // A level refusal with no next step of its own says the person's (the eval found AIs relay the words and the link,
+  // and never read the page: "grant this connection admin scope" left the person with nothing to do).
+  const step = sc.hint === undefined && Object.hasOwn(PERSON_STEPS, sc.error_type) ? { hint: PERSON_STEPS[sc.error_type] } : {};
+  const refusal = { ...sc, ...step, docs: docsPageUrl({ origin: ctx.origin, version: ctx.version }, refusalTopic(sc.error_type)) };
   return { ...result, structuredContent: refusal, content: [{ type: "text", text: JSON.stringify(refusal, null, 2) }] };
 }
 
@@ -144,13 +155,13 @@ export function withRefusalDocs<R extends Result>(result: R, ctx: DocsContext | 
 export function withWarningDocs(reply: unknown, ctx: DocsContext | null | undefined): unknown {
   if (!ctx?.origin || !reply || typeof reply !== "object" || Array.isArray(reply)) return reply;
   const warnings = (reply as { warnings?: unknown }).warnings;
-  if (!Array.isArray(warnings) || !warnings.some((w) => w && typeof w === "object" && REFUSAL_DOCS[(w as { code?: string }).code ?? ""])) return reply;
+  if (!Array.isArray(warnings) || !warnings.some((w) => w && typeof w === "object" && fixFor((w as { code?: unknown }).code))) return reply;
   const origin = ctx.origin;
   return {
     ...(reply as Record<string, unknown>),
     warnings: warnings.map((w) => {
-      const code = w && typeof w === "object" ? (w as { code?: unknown }).code : undefined;
-      return typeof code === "string" && REFUSAL_DOCS[code] && !("docs" in w) ? { ...w, docs: docsPageUrl({ origin, version: ctx.version }, REFUSAL_DOCS[code]!) } : w;
+      const fix = w && typeof w === "object" ? fixFor((w as { code?: unknown }).code) : undefined;
+      return fix && !("docs" in w) ? { ...w, docs: docsPageUrl({ origin, version: ctx.version }, fix) } : w;
     }),
   };
 }
@@ -165,21 +176,26 @@ export interface LatestRelease {
   beta?: string;
 }
 
-const LATEST = new Map<string, { at: number; value: LatestRelease | null; pending: Promise<void> | null }>();
+const LATEST = new Map<string, { at: number; value: LatestRelease | null; pending: { since: number } | null }>();
 
 /**
  * The newest release as last read, and, when that is missing or six hours old, a read of /latest.json started in the
- * background (`refresh`: a Worker hands it to `waitUntil`). Never waits on the site: a connect answers with what's
- * kept, so the first connect after a start says no "X is out".
+ * background. `refresh` is that read's promise, handed only to the caller that started it (a Worker passes it to its
+ * own request's `waitUntil`; another request's promise there would hang). Never waits on the site: a connect answers
+ * with what's kept, so the first connect after a start says no "X is out". A read that never settles (a Worker
+ * request ended under it) is given up after twice the fetch timeout, so the next caller starts another.
  */
 export function latestRelease(origin: string, opts: { fetch?: typeof fetch; now?: () => number } = {}): { value: LatestRelease | null; refresh: Promise<void> | null } {
   const now = opts.now ?? Date.now;
   const key = trimOrigin(origin);
   const kept = LATEST.get(key);
-  if (kept && (kept.pending || now() - kept.at < LATEST_TTL_MS)) return { value: kept.value, refresh: kept.pending };
+  const busy = kept?.pending && now() - kept.pending.since < 2 * TIMEOUT_MS;
+  if (kept && (busy || (!kept.pending && now() - kept.at < LATEST_TTL_MS))) return { value: kept.value, refresh: null };
   const get = opts.fetch ?? fetch;
-  const entry = { at: kept?.at ?? 0, value: kept?.value ?? null, pending: null as Promise<void> | null };
-  entry.pending = (async () => {
+  const mark = { since: now() };
+  const entry = { at: kept?.at ?? 0, value: kept?.value ?? null, pending: mark as { since: number } | null };
+  LATEST.set(key, entry); // before the read starts, so a read that fails at once still leaves this entry settled
+  const refresh = (async () => {
     try {
       const res = await get(`${key}/latest.json`, { redirect: "manual", signal: AbortSignal.timeout(TIMEOUT_MS), headers: { accept: "application/json" } });
       if (!res.ok) {
@@ -194,11 +210,10 @@ export function latestRelease(origin: string, opts: { fetch?: typeof fetch; now?
       // unreachable or not JSON: keep what we had, and try again after the same wait
     } finally {
       entry.at = now();
-      entry.pending = null;
+      if (entry.pending === mark) entry.pending = null;
     }
   })();
-  LATEST.set(key, entry);
-  return { value: entry.value, refresh: entry.pending };
+  return { value: entry.value, refresh };
 }
 
 /** Forget every kept /latest.json (tests). */
@@ -426,7 +441,7 @@ const STOP = new Set(["a", "an", "the", "to", "of", "in", "on", "for", "and", "o
  *  named exactly finds its fix page first. */
 function rank(pages: IndexPage[], query: string, limit = 5): IndexPage[] {
   const words = [...new Set((query.toLowerCase().match(WORD) ?? []).filter((w) => !STOP.has(w)))];
-  const fix = words.map((w) => REFUSAL_DOCS[w]).find(Boolean);
+  const fix = words.map(fixFor).find(Boolean);
   const stem = (w: string) => (w.length > 4 ? w.replace(/(ing|s)$/, "") : w);
   const hits = (text: string) => {
     const have = new Set((text.toLowerCase().match(WORD) ?? []).map(stem));
@@ -471,6 +486,10 @@ export function buildDocsTool(opts: DocsToolOpts = {}): McpToolDef {
         res.body?.cancel().catch(() => {}); // a 404 or an error page: nothing of it is read
         if (res.status !== 404) return hit?.text != null ? hit.text : { unreachable: `it answered ${res.status}` };
         text = null; // not on the site
+      } else if (/^text\/html\b/i.test(res.headers.get("content-type") ?? "")) {
+        // a host that answers a missing page with its HTML shell (a single-page fallback): not a markdown page
+        res.body?.cancel().catch(() => {});
+        text = null;
       } else {
         const { bytes, more } = await readCapped(res, MAX_BYTES);
         // cut on a whole character: a cut through one would end the page in a replacement mark
@@ -570,7 +589,9 @@ export function buildDocsTool(opts: DocsToolOpts = {}): McpToolDef {
         return { topic, page: url, markdown: `# ${kept.title}\n\n${kept.body ?? kept.summary}`, note };
       }
       const part = anchor ? section(got.markdown, anchor) : null;
-      return { topic, page: `${got.url}${anchor ? `#${anchor}` : ""}`, markdown: part ?? got.markdown, ...(got.note ? { note: got.note } : {}) };
+      const missed = anchor && part === null ? `No section "#${anchor}" on this page; here is all of it.` : undefined;
+      const note = [got.note, missed].filter(Boolean).join(" ");
+      return { topic, page: `${got.url}${part !== null ? `#${anchor}` : ""}`, markdown: part ?? got.markdown, ...(note ? { note } : {}) };
     },
   };
 }

@@ -107,7 +107,7 @@ describe("docs between sessions and from the environment", () => {
     expect(r.markdown).not.toContain("\uFFFD");
   });
   test("PARACHUTE_DOCS_URL: an origin, off in any of its spellings, or the default", () => {
-    expect(docsOriginFromEnv(undefined)).toBe("https://parachute.computer");
+    expect(docsOriginFromEnv("")).toBe("https://parachute.computer");
     expect(docsOriginFromEnv("http://127.0.0.1:8080/")).toBe("http://127.0.0.1:8080");
     for (const off of ["off", "OFF", "false", "0", "none"]) expect(docsOriginFromEnv(off)).toBeNull();
     // a self-hoster's copy may live under a path; a query or a non-http address isn't an origin
@@ -174,7 +174,14 @@ describe("when the site is down", () => {
     await expect(tool.execute({ topic: "build/nothing" })).rejects.toMatchObject({ error_type: "unknown_topic" });
   });
 
-  test("a 5xx is the site down, not a missing page: the offline copy, never 'no page'", async () => {
+  test("an HTML page answered with 200 (a host's single-page fallback) is no page, not the markdown", async () => {
+    const shell = (async () => new Response("<!doctype html><title>Parachute</title>", { headers: { "content-type": "text/html; charset=utf-8" } })) as unknown as typeof fetch;
+    const tool = buildDocsTool({ origin: "https://docs.example", fetch: shell, cache: new Map() });
+    expect(((await tool.execute({ topic: "fix/conflict" })) as { markdown: string }).markdown).toStartWith("# Changed by someone else first");
+    await expect(tool.execute({ topic: "build/components" })).rejects.toMatchObject({ error_type: "unknown_topic" });
+  });
+
+    test("a 5xx is the site down, not a missing page: the offline copy, never 'no page'", async () => {
     const tool = buildDocsTool({ origin: "https://docs.example", fetch: (async () => new Response("bad gateway", { status: 502 })) as unknown as typeof fetch, cache: new Map() });
     expect(((await tool.execute({ topic: "fix/conflict" })) as { note: string }).note).toContain("(it answered 502)");
   });
@@ -217,8 +224,11 @@ describe("the pages for the version this vault runs", () => {
     const r = (await tool.execute({ topic: "fix/needs-admin#grant-admin" })) as { markdown: string; page: string };
     expect(r.markdown).toBe("## Grant admin\n\nTick admin.\n\n### On Cloud\n\nSettings.");
     expect(r.page).toBe("https://docs.example/docs/v/0.9/fix/needs-admin/#grant-admin");
-    // an anchor the page doesn't have: the whole page
-    expect(((await tool.execute({ topic: "fix/needs-admin#nope" })) as { markdown: string }).markdown).toStartWith("# Needs admin");
+    // an anchor the page doesn't have: the whole page, said so, at the page's own address
+    const whole = (await tool.execute({ topic: "fix/needs-admin#nope" })) as { markdown: string; note: string; page: string };
+    expect(whole.markdown).toStartWith("# Needs admin");
+    expect(whole.note).toBe('No section "#nope" on this page; here is all of it.');
+    expect(whole.page).toBe("https://docs.example/docs/v/0.9/fix/needs-admin/");
     await expect(tool.execute({ topic: "fix/needs-admin#../x" })).rejects.toMatchObject({ error_type: "invalid_topic" });
   });
 });
@@ -264,13 +274,31 @@ describe("refusals and warnings point at their fix", () => {
     // one with no page of its own goes to the page that lists them all
     expect(withRefusalDocs(refused("batch_too_large"), ctx).structuredContent!.docs).toBe("https://parachute.computer/docs/v/0.9/fix/refusals/");
   });
-  test("the three walls: needs admin, a type that isn't there, a file too large", () => {
+  test("a level refusal with no next step of its own gains the person's step; one with a hint keeps its own", () => {
+    const bare = { content: [{ type: "text", text: "{}" }], structuredContent: { error_type: "insufficient_scope", message: "needs admin" }, isError: true as const };
+    expect(withRefusalDocs(bare, ctx).structuredContent).toEqual({
+      error_type: "insufficient_scope",
+      message: "needs admin",
+      hint: "The person grants it: they connect this AI again and leave the level it needs ticked on Parachute's approval page.",
+      docs: "https://parachute.computer/docs/v/0.9/fix/needs-admin/",
+    });
+    expect(withRefusalDocs(refused("insufficient_scope"), ctx).structuredContent!.hint).toBe("h");
+    // a tool that isn't listed may be a typo: no admin step for it
+    const unknown = { ...bare, structuredContent: { error_type: "unknown_tool", message: "Unknown tool: x" } };
+    expect(withRefusalDocs(unknown, ctx).structuredContent!.hint).toBeUndefined();
+  });
+    test("the three walls: needs admin, a type that isn't there, a file too large", () => {
     expect([REFUSAL_DOCS.unknown_tool, REFUSAL_DOCS.skill_needs_admin, REFUSAL_DOCS.tag_not_found, REFUSAL_DOCS.unknown_tag, REFUSAL_DOCS.inline_too_large, REFUSAL_DOCS.file_too_large]).toEqual(["fix/needs-admin", "fix/needs-admin", "fix/unknown-type", "fix/unknown-type", "fix/file-too-large", "fix/file-too-large"]);
     // every page the map names has an offline copy
     for (const topic of new Set(Object.values(REFUSAL_DOCS))) expect(OFFLINE_PAGES[topic]?.body).toBeString();
     expect(OFFLINE_PAGES["fix/refusals"]?.body).toBeString();
   });
-  test("left alone: a success, docs off, a refusal that already names its docs", () => {
+  test("only the map's own keys: an error_type or code named like an object's own property gets the list page", () => {
+    expect(withRefusalDocs(refused("constructor"), ctx).structuredContent!.docs).toBe("https://parachute.computer/docs/v/0.9/fix/refusals/");
+    const reply = { warnings: [{ code: "__proto__" }, { code: "toString" }] };
+    expect(withWarningDocs(reply, ctx)).toBe(reply);
+  });
+    test("left alone: a success, docs off, a refusal that already names its docs", () => {
     const ok = { content: [{ type: "text", text: "{}" }] };
     expect(withRefusalDocs(ok, ctx)).toBe(ok);
     const r = refused("conflict");
@@ -320,7 +348,9 @@ describe("versions", () => {
     }) as unknown as typeof fetch;
     const first = latestRelease("https://latest.example/", { fetch: f, now: () => t });
     expect(first.value).toBeNull(); // the first connect says nothing, and doesn't wait
-    expect(latestRelease("https://latest.example", { fetch: f, now: () => t }).refresh).toBe(first.refresh); // one read at a time
+    // one read at a time, and its promise only for the caller that started it (a Worker's waitUntil is per request)
+    expect(first.refresh).toBeInstanceOf(Promise);
+    expect(latestRelease("https://latest.example", { fetch: f, now: () => t })).toEqual({ value: null, refresh: null });
     release();
     await first.refresh;
     expect(latestRelease("https://latest.example", { fetch: f, now: () => t })).toEqual({ value: { latest: "0.8.1", beta: "0.9.0-pre.3" }, refresh: null });
@@ -336,14 +366,38 @@ describe("versions", () => {
     expect(latestRelease("https://latest.example", { now: () => t }).value).toBeNull();
     forgetLatestRelease();
   });
+  test("a read that never settles (a Worker request ended under it) is given up, and the next caller starts another", async () => {
+    forgetLatestRelease();
+    let t = 0;
+    let calls = 0;
+    const hang = (async () => {
+      calls++;
+      return new Promise<Response>(() => {});
+    }) as unknown as typeof fetch;
+    latestRelease("https://hang.example", { fetch: hang, now: () => t });
+    t = 10_000;
+    expect(latestRelease("https://hang.example", { fetch: hang, now: () => t }).refresh).toBeNull();
+    t = 17_000;
+    expect(latestRelease("https://hang.example", { fetch: hang, now: () => t }).refresh).toBeInstanceOf(Promise);
+    expect(calls).toBe(2);
+    // a fetch that throws at once leaves the entry settled, so the six-hour wait applies, not a stuck read
+    forgetLatestRelease();
+    const boom = (() => {
+      calls++;
+      throw new Error("no fetch here");
+    }) as unknown as typeof fetch;
+    await latestRelease("https://boom.example", { fetch: boom, now: () => t }).refresh;
+    expect(latestRelease("https://boom.example", { fetch: boom, now: () => t + 1000 })).toEqual({ value: null, refresh: null });
+    forgetLatestRelease();
+  });
   test("the brief's line for an origin that isn't a URL still reads", () => {
     expect(docsBriefLine({ origin: "parachute", version: "dev" })).toBe("`docs {search}` or `docs {topic}` reads parachute's pages for this version; a refusal's `docs` names the page with its fix.");
   });
   test("docs.base_url from the config; PARACHUTE_DOCS_URL wins; off either way", () => {
-    expect(docsOrigin(undefined, "https://docs.example.org/")).toBe("https://docs.example.org");
+    expect(docsOrigin("", "https://docs.example.org/")).toBe("https://docs.example.org");
     expect(docsOrigin("https://env.example", "https://docs.example.org")).toBe("https://env.example");
-    expect(docsOrigin(undefined, "off")).toBeNull();
+    expect(docsOrigin("", "off")).toBeNull();
     expect(docsOrigin("off", "https://docs.example.org")).toBeNull();
-    expect(docsOrigin(undefined, undefined)).toBe("https://parachute.computer");
+    expect(docsOrigin("", undefined)).toBe("https://parachute.computer");
   });
 });

@@ -26,7 +26,7 @@ import { handleMcp } from "./mcp-http.ts";
 import type { AuthResult } from "./auth.ts";
 import pkg from "../package.json" with { type: "json" };
 /** T-476: every refusal carries `docs`, the page with its fix for this box's version. */
-const docsFor = (type: string) => docsPageUrl({ origin: "https://parachute.computer", version: pkg.version }, refusalTopic(type));
+const docsFor = (type: string) => docsPageUrl({ origin: process.env.PARACHUTE_DOCS_URL!, version: pkg.version }, refusalTopic(type));
 
 const SERVER_PATH = resolve(import.meta.dir, "server.ts");
 const PORT = 19_420;

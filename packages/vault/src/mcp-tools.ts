@@ -62,7 +62,8 @@ import {
 } from "./token-store.ts";
 import { chooseHubOrigin, mintHubJwt, revokeHubJwt } from "./mcp-install.ts";
 import { looksLikeJwt } from "./hub-jwt.ts";
-import { readGlobalConfig, DEFAULT_PORT } from "./config.ts";
+import { readGlobalConfig, globalConfigFile, DEFAULT_PORT } from "./config.ts";
+import { statSync } from "node:fs";
 import { getBaseUrl } from "./oauth-discovery.ts";
 import { getSharedAttachmentTicketProvider, storeTicketUpload } from "./attachment-tickets.ts";
 import { createFsAttachmentBytesProvider } from "./attachment-bytes.ts";
@@ -159,8 +160,23 @@ export async function getServerInstruction(
  * `docs.base_url` in the vault config, else parachute.computer; `off` in either is no docs. The version is core's.
  */
 export function boxDocs(): DocsContext {
-  return { origin: docsOrigin(process.env.PARACHUTE_DOCS_URL, readGlobalConfig().docs?.base_url), version: pkg.version };
+  // Read a few times per MCP request (the brief, the tools, the refusals): the config file is parsed again only when
+  // it or PARACHUTE_DOCS_URL changed.
+  const env = process.env.PARACHUTE_DOCS_URL;
+  let mtime = -1;
+  let size = -1;
+  try {
+    const st = statSync(globalConfigFile());
+    mtime = st.mtimeMs;
+    size = st.size;
+  } catch {
+    // no config file: the default
+  }
+  const key = `${env ?? ""}|${globalConfigFile()}|${mtime}|${size}`;
+  if (docsKept?.key !== key) docsKept = { key, value: { origin: docsOrigin(env, mtime < 0 ? undefined : readGlobalConfig().docs?.base_url), version: pkg.version } };
+  return docsKept.value;
 }
+let docsKept: { key: string; value: DocsContext } | null = null;
 
 /**
  * The vault's projection as this key may see it: filtered to `scoped_tags` with counts scope-aware (vault#766, T-419).
