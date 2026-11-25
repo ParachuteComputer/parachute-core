@@ -24,7 +24,9 @@ import { gunzipSync } from "node:zlib";
 import { join } from "node:path";
 import type { McpToolDef } from "../core/src/mcp.ts";
 import { getHubOrigin, getJwksOrigin, parseHubOrigins } from "./hub-jwt.ts";
-import { APPROVAL_FOLDER, APPROVAL_TAG, approvedCode, codeHash, codeKindOf, importsComponents, type ApprovalContent } from "./applet-approvals.ts";
+import { APPROVAL_FOLDER, APPROVAL_TAG, approvedCode, codeHash, codeKindOf, importsComponents, soundOnce, type ApprovalContent } from "./applet-approvals.ts";
+import { looksLikeJwt } from "./hub-jwt.ts";
+import { READ } from "../core/src/mcp-annotations.ts";
 
 export const MCP_APP_MIME = "text/html;profile=mcp-app";
 export const APPLET_URI_PREFIX = "ui://parachute/applet/";
@@ -56,10 +58,10 @@ export function viewHtml(env: NodeJS.ProcessEnv = process.env): string | null {
       const meta = JSON.parse(readFileSync(join(VIEW_DIR, "applet-host.json"), "utf8")) as { sha256: string };
       const html = gunzipSync(readFileSync(join(VIEW_DIR, "applet-host.html.gz"))).toString("utf8");
       // a kept file that isn't the build it names is never served
-      if (createHash("sha256").update(html, "utf8").digest("hex") !== meta.sha256) return null;
+      if (createHash("sha256").update(html, "utf8").digest("hex") !== meta.sha256) { kept = { key: "kept", html: "" }; return null; }
       kept = { key: "kept", html };
     }
-    return kept.html;
+    return kept.html || null;
   } catch {
     return null;
   }
@@ -73,7 +75,8 @@ const keysCache = new Map<string, { at: number; keys: Set<string> }>();
 const KEYS_TTL_MS = 60_000;
 /** The keys the hub linked to this bearer's subject; empty when it can't say. Kept a minute per bearer. */
 export async function approvalKeys(bearer: string | null, fetchImpl: typeof fetch = fetch): Promise<Set<string>> {
-  if (!bearer) return new Set();
+  // only a hub's own token goes to the hub (as manage-token forwards it): never a vault key, which names no person
+  if (!bearer || !looksLikeJwt(bearer)) return new Set();
   const id = createHash("sha256").update(bearer).digest("hex");
   const hit = keysCache.get(id);
   if (hit && Date.now() - hit.at < KEYS_TTL_MS) return hit.keys;
@@ -106,7 +109,7 @@ export function hubOrigins(): Set<string> {
 // The applets
 // ---------------------------------------------------------------------------------------------------------------
 
-type Rec = { id?: string; path?: string; extension?: string; tags?: string[]; fields?: Record<string, unknown>; body?: string };
+type Rec = { id?: string; path?: string; extension?: string; tags?: string[]; types?: string[]; fields?: Record<string, unknown>; body?: string };
 export type ApprovedApplet = {
   id: string;
   name: string;
@@ -138,6 +141,7 @@ export async function approvedApplets(tools: readonly McpToolDef[], vaultName: s
     all(query, { path_prefix: APPROVAL_FOLDER, tag: APPROVAL_TAG }),
   ]);
   const events = approvals.map((r) => r.fields?.approval).filter((e) => e && typeof e === "object");
+  const sound = soundOnce();
   const out: ApprovedApplet[] = [];
   const ids = new Set<string>();
   for (const r of applets.sort((a, b) => String(a.path).localeCompare(String(b.path)))) {
@@ -145,13 +149,15 @@ export async function approvedApplets(tools: readonly McpToolDef[], vaultName: s
     const kind = codeKindOf(r.extension);
     if (!r.id || !r.path || !m || typeof m.id !== "string" || !ID.test(m.id) || m.id.length > 40 || typeof m.name !== "string" || !m.name.trim()) continue;
     if (!kind || typeof r.body !== "string" || importsComponents(r.body) || ids.has(m.id)) continue;
-    const ok = approvedCode(events, { vault: vaultName, record: r.id, applet: m.id, code: codeHash(kind, r.body) }, hubs, trusted, now);
+    const ok = approvedCode(events, { vault: vaultName, record: r.id, applet: m.id, code: codeHash(kind, r.body) }, hubs, trusted, now, sound);
     if (!ok.ok) continue;
     ids.add(m.id);
     out.push({
       id: m.id, name: m.name.trim().slice(0, 60),
-      ...(typeof m.glyph === "string" ? { glyph: m.glyph } : {}), ...(typeof m.note === "string" ? { note: m.note } : {}),
-      record: { id: r.id, path: r.path, extension: r.extension ?? kind, tags: r.tags ?? [], fields: r.fields ?? {} },
+      // the record's words go into Claude's tool list: short, one line
+      ...(typeof m.glyph === "string" ? { glyph: m.glyph.slice(0, 4) } : {}), ...(typeof m.note === "string" ? { note: m.note.replace(/\s+/g, " ").trim().slice(0, 160) } : {}),
+      // its tags as the app reads them (REST lists a record's types among its tags)
+      record: { id: r.id, path: r.path, extension: r.extension ?? kind, tags: [...new Set([...(r.tags ?? []), ...(r.types ?? [])])], fields: r.fields ?? {} },
       code: r.body, approval: ok.content,
     });
   }
@@ -167,7 +173,7 @@ export const appletUri = (id: string) => `${APPLET_URI_PREFIX}${id}`;
 /** What `open-<id>` answers: one line for the model; the view gets the rest as structuredContent. */
 export type OpenResult = { text: string; vault: string; applet: { id: string; name: string } };
 
-export function openTool(a: ApprovedApplet, vaultName: string): McpToolDef & { title: string; _meta: Record<string, unknown>; resultContent: (r: unknown) => { type: "text"; text: string }[]; resultStructured: (r: unknown) => Record<string, unknown> } {
+export function openTool(a: ApprovedApplet, vaultName: string): McpToolDef & { title: string; annotations: typeof READ; _meta: Record<string, unknown>; resultContent: (r: unknown) => { type: "text"; text: string }[]; resultStructured: (r: unknown) => Record<string, unknown> } {
   const uri = appletUri(a.id);
   return {
     name: `${OPEN_PREFIX}${a.id}`,
@@ -175,6 +181,8 @@ export function openTool(a: ApprovedApplet, vaultName: string): McpToolDef & { t
     description: `Open ${a.name}, a Parachute applet in the ${vaultName} vault, as an interactive view${a.note ? `: ${a.note}` : "."} It reads and writes the vault itself; you get one line saying it opened.`,
     inputSchema: { type: "object", properties: {} },
     requiredVerb: "read",
+    // it opens a view and changes nothing itself
+    annotations: READ,
     resultContent: (r: unknown) => [{ type: "text", text: (r as OpenResult).text }],
     resultStructured: (r: unknown) => { const { text: _t, ...rest } = r as OpenResult; return rest; },
     _meta: {
@@ -189,7 +197,10 @@ export function openTool(a: ApprovedApplet, vaultName: string): McpToolDef & { t
 
 /** The view with this applet in it (applet-host src/payload.ts): the JSON can't close its script (`<` is `\u003c`). */
 export function viewFor(html: string, a: ApprovedApplet, vaultName: string): string {
-  const payload = { v: PAYLOAD_VERSION, vault: vaultName, record: a.record, code: a.code, approval: { code: a.approval.code, at: a.approval.at, ...(a.approval.device ? { device: a.approval.device } : {}) } };
+  // the approval's code and asks hashes, its subject and pick: the view checks both hashes again with the app's own code
+  const ap = a.approval;
+  const payload = { v: PAYLOAD_VERSION, vault: vaultName, record: a.record, code: a.code,
+    approval: { code: ap.code, scope: ap.scope, subject: ap.subject, at: ap.at, ...(ap.vaults !== undefined ? { vaults: ap.vaults } : {}), ...(ap.device ? { device: ap.device } : {}) } };
   const tag = `<script type="application/json" id="parachute-applet">${JSON.stringify(payload).replace(/</g, "\\u003c")}</script>`;
   return html.replace(/<head>/i, () => `<head>${tag}`);
 }

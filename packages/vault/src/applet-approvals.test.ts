@@ -3,7 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import { createHash, randomBytes } from "node:crypto";
 import { schnorr } from "@noble/curves/secp256k1.js";
-import { approvedCode, checkApproval, codeHash, importsComponents, type Subject } from "./applet-approvals.ts";
+import { approvedCode, checkApproval, codeHash, importsComponents, soundEvent, soundOnce, type Subject } from "./applet-approvals.ts";
 
 const hex = (b: Uint8Array) => Buffer.from(b).toString("hex");
 function key() { const sk = randomBytes(32); return { sk, pub: hex(schnorr.getPublicKey(sk)) }; }
@@ -75,5 +75,19 @@ describe("an applet runs in Claude only on the person's approval of this exact c
   test("the code hash is the app's: html bare, tsx and jsx by kind", () => {
     const h = createHash("sha256").update(CODE).digest("hex");
     expect([codeHash("html", CODE), codeHash("tsx", CODE), codeHash("jsx", CODE)]).toEqual([h, `tsx:${h}`, `jsx:${h}`]);
+  });
+  test("a vault's approvals cost one signature check each, not one per applet", () => {
+    // what an approval names is read before its signature is checked: 20 applets, 20 approvals, 20 checks (not 400)
+    let checks = 0;
+    const counted = (e: Parameters<typeof soundEvent>[0]) => { checks++; return soundEvent(e); };
+    const apps = Array.from({ length: 20 }, (_, i) => ({ ...want, record: `01R${i}`, applet: `a${i}` }));
+    const events = apps.map((w) => approval(person, { subject: { ...subject, record: w.record, applet: w.applet } }));
+    for (const w of apps) expect(approvedCode(events, w, hubs, trusted, NOW, counted).ok).toBe(true);
+    expect(checks).toBe(20);
+    // and one event read twice (tools/list, then resources/read in one request) is checked once
+    checks = 0;
+    const once = soundOnce(counted);
+    for (let i = 0; i < 3; i++) approvedCode(events, apps[0]!, hubs, trusted, NOW, once);
+    expect(checks).toBe(1);
   });
 });

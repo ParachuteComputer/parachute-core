@@ -35,7 +35,7 @@ const HEX64 = /^[0-9a-f]{64}$/;
 export type CodeKind = "html" | "tsx" | "jsx";
 export type Subject = { hub: string; vault: string; record: string; applet: string };
 export type SignedEvent = { id: string; pubkey: string; created_at: number; kind: number; tags: string[][]; content: string; sig: string };
-export type ApprovalContent = { v: 1; subject: Subject; n: number; approved: boolean; code: string; scope: string; at: string; expires: string; device?: string };
+export type ApprovalContent = { v: 1; subject: Subject; n: number; approved: boolean; code: string; scope: string; at: string; expires: string; device?: string; vaults?: unknown };
 
 const sha256Hex = (s: string) => createHash("sha256").update(s, "utf8").digest("hex");
 
@@ -86,22 +86,36 @@ export function checkApproval(
   hubs: ReadonlySet<string>,
   trusted: ReadonlySet<string>,
   now: number,
+  sound?: (e: SignedEvent) => boolean,
 ): { ok: true; content: ApprovalContent; by: string } | { ok: false; why: string } {
   const e = ev as SignedEvent;
   if (!e || typeof e !== "object" || e.kind !== APPROVAL_KIND) return { ok: false, why: "not an approval" };
   if (!trusted.has(String(e.pubkey))) return { ok: false, why: "not signed by a key of the person's" };
-  if (!soundEvent(e)) return { ok: false, why: "its signature doesn't hold" };
+  // the cheap checks first (what it names), the signature last: a vault's approvals are read once per applet
+  if (typeof e.content !== "string" || !Array.isArray(e.tags)) return { ok: false, why: "it can't be read" };
   const c = contentOf(e);
   if (!c) return { ok: false, why: "it can't be read" };
   const hub = originOf(c.subject.hub);
   if (!hub || !hubs.has(hub)) return { ok: false, why: "it is for another hub" };
   if (c.subject.vault !== want.vault || c.subject.record !== want.record || c.subject.applet !== want.applet) return { ok: false, why: "it is for another applet" };
-  if (e.tags.find((t) => t[0] === "d")?.[1] !== dOf(c.subject)) return { ok: false, why: "it is for another applet" };
+  if (e.tags.find((t) => Array.isArray(t) && t[0] === "d")?.[1] !== dOf(c.subject)) return { ok: false, why: "it is for another applet" };
+  if (!(sound ? sound(e) : soundEvent(e))) return { ok: false, why: "its signature doesn't hold" };
   const nowS = Math.floor(now / 1000);
   if (c.n > nowS + SKEW_S || e.created_at > nowS + SKEW_S) return { ok: false, why: "it is dated in the future" };
   const exp = Date.parse(c.expires), at = Date.parse(c.at);
   if (exp <= now || exp - at > (APPROVAL_DAYS + 1) * 86_400_000) return { ok: false, why: "its year has run out" };
   return { ok: true, content: c, by: e.pubkey };
+}
+
+/** `soundEvent`, each event verified once (by its id and signature) however many applets read it. */
+export function soundOnce(inner: (e: SignedEvent) => boolean = soundEvent): (e: SignedEvent) => boolean {
+  const seen = new Map<string, boolean>();
+  return (e) => {
+    const k = `${e.id}:${e.sig}:${e.pubkey}`;
+    let v = seen.get(k);
+    if (v === undefined) { v = inner(e); seen.set(k, v); }
+    return v;
+  };
 }
 
 /** Whether the newest approval that counts approves this code: its content when it does, else why not. */
@@ -111,10 +125,11 @@ export function approvedCode(
   hubs: ReadonlySet<string>,
   trusted: ReadonlySet<string>,
   now: number,
+  sound: (e: SignedEvent) => boolean = soundEvent,
 ): { ok: true; content: ApprovalContent } | { ok: false; why: "none" | "withdrawn" | "other" } {
   let newest: ApprovalContent | null = null;
   for (const ev of events) {
-    const r = checkApproval(ev, want, hubs, trusted, now);
+    const r = checkApproval(ev, want, hubs, trusted, now, sound);
     if (!r.ok) continue;
     // two with one number (two devices in one second): the taking back wins
     if (!newest || r.content.n > newest.n || (r.content.n === newest.n && !r.content.approved)) newest = r.content;

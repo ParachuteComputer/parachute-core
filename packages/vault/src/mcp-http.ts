@@ -145,7 +145,7 @@ export async function handleMcp(
       })),
       ...(await approved()).map((a) => {
         const t = openTool(a, vaultName);
-        return { name: t.name, title: t.title, description: t.description, inputSchema: t.inputSchema, annotations: toolAnnotations(t.name, level), _meta: t._meta };
+        return { name: t.name, title: t.title, description: t.description, inputSchema: t.inputSchema, annotations: t.annotations, _meta: t._meta };
       }),
     ],
   }));

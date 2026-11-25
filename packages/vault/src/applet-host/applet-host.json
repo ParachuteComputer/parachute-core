@@ -1,7 +1,7 @@
 {
   "package": "@openparachute/applet-host",
   "version": "0.1.0",
-  "source": "ParachuteComputer/parachute@e466fa8",
-  "bytes": 1842209,
-  "sha256": "8fc5ed64771741fb5344c2e688431c052e02ca87331b3c914919374ab4cdf4f3"
+  "source": "ParachuteComputer/parachute@5e4f51a",
+  "bytes": 1845261,
+  "sha256": "5227d91082ae974851c502486891a7b653a6060aba349aa0660a3122100af5e5"
 }
