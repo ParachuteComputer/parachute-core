@@ -16,7 +16,7 @@ const { handleScopedMcp } = await import("./mcp-http.ts");
 const { getServerInstruction } = await import("./mcp-tools.ts");
 const { writeVaultConfig, assetsDir } = await import("./config.ts");
 const { getVaultStore } = await import("./vault-store.ts");
-const { MAX_INLINE_ATTACHMENT_BYTES } = await import("../core/src/attachment/inline.ts");
+const { MAX_INLINE_ATTACHMENT_BYTES, readInlineFile } = await import("../core/src/attachment/inline.ts");
 
 function freshVault(prefix: string): string {
   const name = `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -126,6 +126,10 @@ describe("add-attachment", () => {
     // A small declared size doesn't let a long string through.
     const lying = await add(vault, { record: note.id, file: fileInput(big, { size: 10 }) });
     expect(lying.refused?.error_type).toBe("inline_too_large");
+    // A string far longer than any file under the cap is refused on its length, before it is copied or decoded:
+    // not base64 at all, so without the length check it would be refused as "isn't base64" instead.
+    const huge = await readInlineFile({ ...fileInput(new Uint8Array([1])), size: 10, data: "!".repeat(MAX_INLINE_ATTACHMENT_BYTES * 2) }).then(() => null, (e: any) => e);
+    expect(huge?.error_type).toBe("inline_too_large");
     // At the cap exactly, it is stored.
     const atCap = new Uint8Array(randomBytes(MAX_INLINE_ATTACHMENT_BYTES));
     expect((await add(vault, { record: note.id, file: fileInput(atCap) })).attachment?.size).toBe(MAX_INLINE_ATTACHMENT_BYTES);

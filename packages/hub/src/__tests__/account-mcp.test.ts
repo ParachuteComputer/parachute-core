@@ -233,7 +233,7 @@ function toolsForMintedScope(scope: string): Array<{
     "request-attachment-download",
     "read-attachment",
   ];
-  const write = [...read, "create-note", "update-note", "delete-note", "request-attachment-upload"];
+  const write = [...read, "create-note", "update-note", "delete-note", "request-attachment-upload", "add-attachment"];
   const admin = [
     ...write,
     "manage-token",
@@ -1001,6 +1001,8 @@ describe("account MCP — query-notes", () => {
       expect(qn?.inputSchema?.properties).toHaveProperty("order_by");
       expect(qn?.inputSchema?.properties).toHaveProperty("vault");
       expect(qn?.inputSchema?.required ?? []).not.toContain("vault");
+      // T-476: the vault lists add-attachment; this door doesn't (a file goes through the vault the AI connected to).
+      expect(listBody.result.tools.map((t) => t.name)).not.toContain("add-attachment");
       expect(qn?.description).toMatch(/Catalog caveat/);
     } finally {
       h.cleanup();

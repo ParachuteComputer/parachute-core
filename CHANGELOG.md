@@ -9,7 +9,7 @@ someone running Parachute. Pull request numbers are in brackets.
 the MCP file-transfer extension's FileInput: base64 `data`, a SHA-256 `digest`, the exact `size`. It refuses a size
 or digest that doesn't match and a file over 80 KiB, and stores it as a spent upload ticket does. For an AI whose
 runtime can't reach the ticket URL, such as Claude's code sandbox. The same tool is on 0.9; the hosted door gets it
-through its pin of this line.
+when it pins this line and wires its writer (parachute-cloud#444).
 
 ## 0.8.0
 
