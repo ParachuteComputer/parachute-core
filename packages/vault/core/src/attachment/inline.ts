@@ -32,6 +32,28 @@ export const FILES_EXTENSION = "io.modelcontextprotocol/files";
  */
 export const MAX_INLINE_ATTACHMENT_BYTES = 24 * 1024;
 
+/**
+ * The `file` argument's schema: the extension's FileInput, marked `x-mcp-file`. A door shows the marker only to a
+ * client that declared the extension (`schemaForClient` below). Kept short: it is read on every tools/list.
+ */
+export const FILE_INPUT: Record<string, unknown> = {
+  type: "object",
+  "x-mcp-file": { maxSize: MAX_INLINE_ATTACHMENT_BYTES },
+  properties: {
+    id: { type: "string" },
+    name: { type: "string" },
+    mimeType: { type: "string" },
+    size: { type: "integer" },
+    digest: {
+      type: "object",
+      properties: { algorithm: { const: "sha-256" }, value: { type: "string", description: "base64url or hex" } },
+      required: ["algorithm", "value"],
+    },
+    data: { type: "string" },
+  },
+  required: ["id", "mimeType", "size", "digest"],
+};
+
 export interface InlineFile {
   bytes: Uint8Array;
   /** The file's name when the caller gave one. */
@@ -82,7 +104,12 @@ function hex(bytes: Uint8Array): string {
  * other than `size` (`size_mismatch`), and a SHA-256 other than `digest`
  * (`digest_mismatch`: the base64 was copied wrong).
  */
-export async function readInlineFile(file: unknown, maxBytes: number = MAX_INLINE_ATTACHMENT_BYTES): Promise<InlineFile> {
+export async function readInlineFile(
+  file: unknown,
+  maxBytes: number = MAX_INLINE_ATTACHMENT_BYTES,
+  /** The door's tool for a bigger file, named in the refusal: 0.9's `attachment-url`, 0.8's `request-attachment-upload`. */
+  uploadTool = 'attachment-url {action: "upload"}',
+): Promise<InlineFile> {
   if (file === null || typeof file !== "object" || Array.isArray(file)) {
     refuse("`file` is required: {id, name, mimeType, size, digest, data}", {
       error_type: "missing_required_field",
@@ -113,7 +140,7 @@ export async function readInlineFile(file: unknown, maxBytes: number = MAX_INLIN
       field: "file.size",
       limit: maxBytes,
       got: size,
-      hint: "use attachment-url {action: \"upload\"} and PUT the bytes to its URL, if your runtime can reach this host",
+      hint: `use ${uploadTool} and PUT the bytes to its URL, if your runtime can reach this host`,
     });
   }
   const digest = f.digest as Record<string, unknown> | undefined;
@@ -124,7 +151,7 @@ export async function readInlineFile(file: unknown, maxBytes: number = MAX_INLIN
     refuse("`file.data` is required: this vault takes a file's bytes in the call", {
       error_type: "missing_required_field",
       field: "file.data",
-      hint: `send the bytes as file.data (base64, up to ${maxBytes} bytes), or use attachment-url if your runtime can reach this host`,
+      hint: `send the bytes as file.data (base64, up to ${maxBytes} bytes), or use ${uploadTool} if your runtime can reach this host`,
     });
   }
   // A base64 string longer than any file under the cap could need is refused before it is decoded.
@@ -134,7 +161,7 @@ export async function readInlineFile(file: unknown, maxBytes: number = MAX_INLIN
       error_type: "inline_too_large",
       field: "file.data",
       limit: maxBytes,
-      hint: "use attachment-url {action: \"upload\"} and PUT the bytes to its URL, if your runtime can reach this host",
+      hint: `use ${uploadTool} and PUT the bytes to its URL, if your runtime can reach this host`,
     });
   }
   const bytes = decodeBase64(data);

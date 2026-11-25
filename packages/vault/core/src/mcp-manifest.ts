@@ -2,8 +2,8 @@ import { SEARCH_MODES } from "./search-query.js";
 import { HYBRID_TEXT } from "./hybrid.js";
 import { MIN_CONTENT_LENGTH } from "./content-range-constants.js";
 import { MAX_TICKET_UPLOAD_BYTES } from "./attachment/tickets.js";
-import { FILE_INPUT, SHORT_TOOLS } from "./mcp-short.js";
-import { MAX_INLINE_ATTACHMENT_BYTES } from "./attachment/inline.js";
+import { SHORT_TOOLS } from "./mcp-short.js";
+import { FILE_INPUT, MAX_INLINE_ATTACHMENT_BYTES } from "./attachment/inline.js";
 
 /**
  * Pure-data MCP tool manifest — the single source of truth for every core MCP

@@ -24,7 +24,7 @@
 
 import { BODY, FIELDS } from "./mcp-records.js";
 import { HYBRID_TEXT } from "./hybrid.js";
-import { MAX_INLINE_ATTACHMENT_BYTES } from "./attachment/inline.js";
+import { FILE_INPUT, MAX_INLINE_ATTACHMENT_BYTES } from "./attachment/inline.js";
 
 type Schema = Record<string, unknown>;
 
@@ -54,24 +54,6 @@ const LINKS = {
 /** A type's field options, in its own schema (0.9.2: an AI that doesn't ask for help still sees all of them). */
 const FIELD_SPEC =
   '{name: {type: "string"|"integer"|"number"|"boolean"|"date"|"reference", enum?, indexed?, default?, required?, strict?, cardinality?, target_tags?}}. reference: points at a record (target_tags: its types). required: should be set (refused only if strict). strict: refuse a wrong value. cardinality "many": a list.';
-
-/**
- * MCP file-transfer extension's FileInput (`io.modelcontextprotocol/files`), marked `x-mcp-file`. A door shows the
- * marker only to a client that declared the extension (attachment/inline.ts `schemaForClient`).
- */
-export const FILE_INPUT: Schema = {
-  type: "object",
-  "x-mcp-file": { maxSize: MAX_INLINE_ATTACHMENT_BYTES },
-  properties: {
-    id: str(),
-    name: str(),
-    mimeType: str(),
-    size: { type: "integer" },
-    digest: obj({ algorithm: { const: "sha-256" }, value: str("base64url or hex") }, ["algorithm", "value"]),
-    data: str(),
-  },
-  required: ["id", "mimeType", "size", "digest"],
-};
 
 export const SHORT_TOOLS: Record<string, ShortTool> = {
   "query-notes": {
