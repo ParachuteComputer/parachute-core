@@ -2444,7 +2444,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
               // `skipUpdatedAt` isn't set, so this still issues a real UPDATE
               // (not the true no-op/precondition-only branch, which only fires
               // when the caller passes ZERO fields AND no mutation is pending).
-              result = await store.updateNote(note.id, { ...updates, ...linkOpt });
+              result = await store.updateNote(note.id, { ...updates, ...linkOpt, maySkills: opts?.maySkills === true });
             } else {
               result = note;
             }

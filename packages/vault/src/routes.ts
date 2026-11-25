@@ -3705,7 +3705,7 @@ async function handleNotesInner(
         // `skipUpdatedAt` isn't set, so this still issues a real UPDATE.
         updates.actor = writeCtx.actor;
         updates.via = writeCtx.via;
-        await store.updateNote(note.id, { ...updates, ...linkOptFor(db, tagScope) });
+        await store.updateNote(note.id, { ...updates, ...linkOptFor(db, tagScope), maySkills: writeCtx.maySkills === true });
       }
 
       // --- Remove links (after core UPDATE; conflict would have thrown already) ---
