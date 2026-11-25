@@ -31,6 +31,8 @@ function oneShape(label: string, body: any, type: string, print = true) {
   expect(r.content).toHaveLength(1);
   expect(r.content[0].type).toBe("text");
   expect(JSON.parse(r.content[0].text)).toEqual(sc);
+  // T-476: every refusal names the page with its fix, for the version this door runs
+  expect({ label, docs: typeof sc.docs === "string" && /^https?:\/\/\S+\/docs\/(v\/\d+\.\d+\/)?fix\/[a-z-]+\/$/.test(sc.docs) }).toEqual({ label, docs: true });
   if (print) fp(`refusals/${label}`, { type: sc.error_type, keys: Object.keys(sc).sort() });
   return sc;
 }
@@ -89,7 +91,13 @@ describe("one way to refuse", () => {
       oneShape("unknown-tool", await call(url, w, "no-such-tool", {}), "unknown_tool");
       // a tool above the caller's level is refused the same way as one that doesn't exist: nothing leaks
       const r = await call(url, await token("read"), "create-record", { path: `${path}-r`, body: "x" });
-      oneShape("above-level", r, "unknown_tool");
+      const above = oneShape("above-level", r, "unknown_tool");
+      // T-476: it says the caller's own level, in the same words for a tool that doesn't exist at all
+      const none = oneShape("unknown-tool.reader", await call(url, await token("read"), "no-such-tool", {}), "unknown_tool", false);
+      expect(above.message.replace("create-record", "<tool>")).toBe(none.message.replace("no-such-tool", "<tool>"));
+      expect(above.message).toMatch(/can read; tools that write or need admin aren't listed/);
+      expect(above.docs).toBe(none.docs);
+      expect(above.docs).toMatch(/\/fix\/needs-admin\/$/);
       // the protocol's own errors stay JSON-RPC errors
       const bad = await safeFetch(url, {
         method: "POST",
