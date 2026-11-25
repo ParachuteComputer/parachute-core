@@ -54,14 +54,23 @@ export const importsComponents = (source: string): boolean => /\b(?:from|import)
 /** `d` as the app writes it: hub|vault|record. */
 export const dOf = (s: Subject) => `${s.hub}|${s.vault}|${s.record}`;
 
-/** A Nostr event whose id is its hash and whose signature holds for its pubkey. */
-export function soundEvent(e: unknown): e is SignedEvent {
+const MAX_CONTENT = 64_000;
+/** The shape and bounds of an event, before any hashing. */
+function wellFormed(e: unknown): e is SignedEvent {
   const ev = e as SignedEvent;
   if (!ev || typeof ev !== "object" || typeof ev.id !== "string" || !HEX64.test(ev.id) || !HEX64.test(String(ev.pubkey)) || typeof ev.sig !== "string" || !/^[0-9a-f]{128}$/.test(ev.sig)) return false;
-  if (!Number.isSafeInteger(ev.created_at) || !Number.isSafeInteger(ev.kind) || typeof ev.content !== "string" || ev.content.length > 64_000) return false;
-  if (!Array.isArray(ev.tags) || ev.tags.length > 50 || !ev.tags.every((t) => Array.isArray(t) && t.length <= 10 && t.every((x) => typeof x === "string" && x.length <= 1024))) return false;
-  if (sha256Hex(JSON.stringify([0, ev.pubkey, ev.created_at, ev.kind, ev.tags, ev.content])) !== ev.id) return false;
-  try { return schnorr.verify(Buffer.from(ev.sig, "hex"), Buffer.from(ev.id, "hex"), Buffer.from(ev.pubkey, "hex")); } catch { return false; }
+  if (!Number.isSafeInteger(ev.created_at) || !Number.isSafeInteger(ev.kind) || typeof ev.content !== "string" || ev.content.length > MAX_CONTENT) return false;
+  return Array.isArray(ev.tags) && ev.tags.length <= 50 && ev.tags.every((t) => Array.isArray(t) && t.length <= 10 && t.every((x) => typeof x === "string" && x.length <= 1024));
+}
+function schnorrOk(sig: string, id: string, pubkey: string): boolean {
+  try { return schnorr.verify(Buffer.from(sig, "hex"), Buffer.from(id, "hex"), Buffer.from(pubkey, "hex")); } catch { return false; }
+}
+
+/** A Nostr event whose id is its hash and whose signature holds for its pubkey. */
+export function soundEvent(e: unknown): e is SignedEvent {
+  if (!wellFormed(e)) return false;
+  if (sha256Hex(JSON.stringify([0, e.pubkey, e.created_at, e.kind, e.tags, e.content])) !== e.id) return false;
+  return schnorrOk(e.sig, e.id, e.pubkey);
 }
 
 function contentOf(ev: SignedEvent): ApprovalContent | null {
@@ -92,7 +101,7 @@ export function checkApproval(
   if (!e || typeof e !== "object" || e.kind !== APPROVAL_KIND) return { ok: false, why: "not an approval" };
   if (!trusted.has(String(e.pubkey))) return { ok: false, why: "not signed by a key of the person's" };
   // the cheap checks first (what it names), the signature last: a vault's approvals are read once per applet
-  if (typeof e.content !== "string" || !Array.isArray(e.tags)) return { ok: false, why: "it can't be read" };
+  if (typeof e.content !== "string" || e.content.length > MAX_CONTENT || !Array.isArray(e.tags)) return { ok: false, why: "it can't be read" };
   const c = contentOf(e);
   if (!c) return { ok: false, why: "it can't be read" };
   const hub = originOf(c.subject.hub);
@@ -107,13 +116,18 @@ export function checkApproval(
   return { ok: true, content: c, by: e.pubkey };
 }
 
-/** `soundEvent`, each event verified once (by its id and signature) however many applets read it. */
-export function soundOnce(inner: (e: SignedEvent) => boolean = soundEvent): (e: SignedEvent) => boolean {
+/** `soundEvent`, the costly half done once per signature: every event's id is recomputed from its fields each time
+ *  (cheap), and only the schnorr check of that recomputed id, signature and key is remembered. A copy of a genuine
+ *  event with its content or tags changed has another id, so it never rides on the original's check (the app's
+ *  approvals.ts `sound` reads afresh for the same reason). */
+export function soundOnce(verify: (sig: string, id: string, pubkey: string) => boolean = schnorrOk): (e: SignedEvent) => boolean {
   const seen = new Map<string, boolean>();
   return (e) => {
+    if (!wellFormed(e)) return false;
+    if (sha256Hex(JSON.stringify([0, e.pubkey, e.created_at, e.kind, e.tags, e.content])) !== e.id) return false;
     const k = `${e.id}:${e.sig}:${e.pubkey}`;
     let v = seen.get(k);
-    if (v === undefined) { v = inner(e); seen.set(k, v); }
+    if (v === undefined) { v = verify(e.sig, e.id, e.pubkey); seen.set(k, v); }
     return v;
   };
 }

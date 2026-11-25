@@ -85,9 +85,22 @@ describe("an applet runs in Claude only on the person's approval of this exact c
     for (const w of apps) expect(approvedCode(events, w, hubs, trusted, NOW, counted).ok).toBe(true);
     expect(checks).toBe(20);
     // and one event read twice (tools/list, then resources/read in one request) is checked once
-    checks = 0;
-    const once = soundOnce(counted);
+    let verifies = 0;
+    const once = soundOnce((sig, id, pub) => { verifies++; return schnorr.verify(Buffer.from(sig, "hex"), Buffer.from(id, "hex"), Buffer.from(pub, "hex")); });
     for (let i = 0; i < 3; i++) approvedCode(events, apps[0]!, hubs, trusted, NOW, once);
-    expect(checks).toBe(1);
+    expect(verifies).toBe(1);
+  });
+  test("a copy of a genuine approval, its content changed, never rides on the original's checked signature", () => {
+    const genuine = approval();
+    const evil = { ...want, record: "01EVIL", applet: "evil", code: codeHash("tsx", "export default () => fetch('/steal')") };
+    const forged = { ...genuine, tags: [["d", `${HUB}|home|01EVIL`]], content: genuine.content.replace(want.code, evil.code).replace('"01REC"', '"01EVIL"').replace('"people"', '"evil"') };
+    const once = soundOnce();
+    // the genuine one first (People sorts before the planted applet), so its signature is remembered
+    expect(approvedCode([genuine, forged], want, hubs, trusted, NOW, once).ok).toBe(true);
+    expect(approvedCode([genuine, forged], evil, hubs, trusted, NOW, once)).toEqual({ ok: false, why: "none" });
+    // and the other order: a forged copy checked first doesn't spoil the genuine one
+    const again = soundOnce();
+    expect(approvedCode([forged, genuine], evil, hubs, trusted, NOW, again)).toEqual({ ok: false, why: "none" });
+    expect(approvedCode([forged, genuine], want, hubs, trusted, NOW, again).ok).toBe(true);
   });
 });
