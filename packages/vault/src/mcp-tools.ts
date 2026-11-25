@@ -119,23 +119,7 @@ export async function getServerInstruction(
   auth?: AuthResult,
 ): Promise<string> {
   const config = readVaultConfig(vaultName);
-  const store = getVaultStore(vaultName);
-  let projection: VaultProjection;
-
-  if (auth?.scoped_tags && auth.scoped_tags.length > 0) {
-    const allowed = await expandTokenTagScope(store, auth.scoped_tags);
-    // vault#766: the brief's counts (stats line, map) must not include notes
-    // a private tag hides from this token — build them scope-aware.
-    const countScope = scopedCountFilter(store, allowed);
-    projection = buildVaultProjection(store.db, {
-      includeStats: true,
-      countScope,
-      statsScope: countScope,
-    });
-    if (allowed) projection = filterProjectionByScope(projection, allowed);
-  } else {
-    projection = buildVaultProjection(store.db, { includeStats: true });
-  }
+  const projection = await scopedProjection(vaultName, auth);
 
   return projectionToMarkdown({
     vaultName,
@@ -161,6 +145,31 @@ export async function getServerInstruction(
         }
       : {}),
   });
+}
+
+/**
+ * The vault's projection as this key may see it: filtered to `scoped_tags` with counts scope-aware (vault#766, T-419).
+ * The connect-time brief above and the generated `vault-guide` skill (mcp-skills.ts, T-476) both read this.
+ */
+export async function scopedProjection(vaultName: string, auth?: AuthResult): Promise<VaultProjection> {
+  const store = getVaultStore(vaultName);
+  let projection: VaultProjection;
+
+  if (auth?.scoped_tags && auth.scoped_tags.length > 0) {
+    const allowed = await expandTokenTagScope(store, auth.scoped_tags);
+    // vault#766: the brief's counts (stats line, map) must not include notes
+    // a private tag hides from this token — build them scope-aware.
+    const countScope = scopedCountFilter(store, allowed);
+    projection = buildVaultProjection(store.db, {
+      includeStats: true,
+      countScope,
+      statsScope: countScope,
+    });
+    if (allowed) projection = filterProjectionByScope(projection, allowed);
+  } else {
+    projection = buildVaultProjection(store.db, { includeStats: true });
+  }
+  return projection;
 }
 
 /**

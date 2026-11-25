@@ -101,6 +101,7 @@
 {"key":"has/share-a-vault","value":true}
 {"key":"has/sign-in-keys-on-the-account-door","value":false}
 {"key":"has/skill-guard","value":true}
+{"key":"has/skills-extension","value":true}
 {"key":"has/typed-keys","value":true}
 {"key":"history/deleted.shape","value":{"notes":[{"deleted_at":"string","extension":"string","id":"string","path":"string","versions":"number"}],"total":"number"}}
 {"key":"history/refusal.blind-restore","value":{"error":null,"hint":null,"keys":["error_type","message","note_id"],"status":428,"type":"precondition_required"}}
@@ -465,6 +466,7 @@
 {"key":"rest/vault.transcription","value":{"enabled":"boolean"}}
 {"key":"search/hit.shape","value":{"byteSize":"number","createdAt":"string","createdBy":"string","createdVia":"string","displayTitle":"string","extension":"string","id":"string","lastUpdatedBy":"string","lastUpdatedVia":"string","metadata":{},"path":"string","preview":"string","score":"number","tags":[],"types":[],"updatedAt":"string"}}
 {"key":"search/odd-query","value":{"ok":true,"status":200}}
+{"key":"skills/ext.server-skills","value":["vault-guide","live-page"]}
 {"key":"skills/mcp.write-make","value":{"refused":true,"type":"skill_needs_admin"}}
 {"key":"skills/rest.write-make","value":{"error":"Forbidden","hint":"b8cd56fb8b35e441","keys":["error","error_type","hint","message"],"status":403,"type":"skill_needs_admin"}}
 {"key":"types/declare.shape","value":{"created_at":"string","description":"string","fields":{"door_rank":{"indexed":"boolean","type":"string"},"due":{"type":"string"},"estimate":{"type":"string"},"status":{"enum":["string"],"strict":"boolean","type":"string"}},"kind":"string","tag":"string","updated_at":"string"}}
