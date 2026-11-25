@@ -282,7 +282,11 @@ export function newerRelease(version: string, latest: LatestRelease | null | und
   return candidates.sort((a, b) => compareVersions(b, a))[0] ?? null;
 }
 
-/** The connect-time brief's docs line (vault-projection.ts "## Docs"). */
+/**
+ * The connect-time brief's docs line (vault-projection.ts, under the line naming the vault): the version, a newer
+ * release when there is one, the tool, and where a refusal's fix is. One line, no heading: the brief has 800 tokens
+ * (contracts/suites/mcp/budget.test.ts). The docs' host is named only when it isn't parachute.computer.
+ */
 export function docsBriefLine(ctx: { origin: string; version: string; newer?: string | null }): string {
   let host: string;
   try {
@@ -291,8 +295,9 @@ export function docsBriefLine(ctx: { origin: string; version: string; newer?: st
   } catch {
     host = ctx.origin;
   }
-  const v = docsMinor(ctx.version) ? `Parachute ${ctx.version}${ctx.newer ? ` (${ctx.newer} is out)` : ""}. ` : "";
-  return `${v}\`docs {search}\` or \`docs {topic}\` reads ${host}'s pages for this version; a refusal's \`docs\` names the page with its fix.`;
+  const from = trimOrigin(ctx.origin) === DOCS_ORIGIN ? "" : `, from ${host}`;
+  const what = docsMinor(ctx.version) ? ` for Parachute ${ctx.version}${ctx.newer ? ` (${ctx.newer} is out)` : ""}` : "";
+  return `Docs${what}${from}: \`docs {search}\`, \`docs {topic}\`; a refusal's \`docs\` is its fix page.`;
 }
 
 // ---------------------------------------------------------------------------------------------------------------------

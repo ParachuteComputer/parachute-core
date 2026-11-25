@@ -16,9 +16,11 @@ describe.skipIf(!is09)("docs: where the fix is, for this version", () => {
     const c = await mcp("read");
     try {
       const brief = c.client.getInstructions() ?? "";
-      expect(brief).toContain("## Docs");
-      expect(brief).toMatch(/Parachute \d+\.\d+\.\d+(-[0-9A-Za-z.]+)?( \(\S+ is out\))?\. `docs \{search\}` or `docs \{topic\}` reads \S+'s pages for this version; a refusal's `docs` names the page with its fix\./);
-      fp("docs/brief-line", brief.split("\n").filter((l) => l.includes("`docs {search}`")).map((l) => l.replace(/Parachute \S+( \(\S+ is out\))?\./, "Parachute <version>.")));
+      // the line under the vault's name (core docs-tool.ts docsBriefLine); the docs' host only when not parachute.computer
+      const line = brief.split("\n").find((l) => l.includes("`docs {search}`")) ?? "";
+      expect(line).toMatch(/^Docs for Parachute \d+\.\d+\.\d+(-[0-9A-Za-z.]+)?( \(\S+ is out\))?(, from \S+)?: `docs \{search\}`, `docs \{topic\}`; a refusal's `docs` is its fix page\.$/);
+      expect(brief.split("\n").indexOf(line)).toBeLessThanOrEqual(2);
+      fp("docs/brief-line", line.replace(/Parachute \S+( \(\S+ is out\))?/, "Parachute <version>"));
     } finally {
       await c.close();
     }

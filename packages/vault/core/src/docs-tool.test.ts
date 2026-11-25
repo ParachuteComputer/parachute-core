@@ -119,17 +119,17 @@ describe("docs between sessions and from the environment", () => {
 
 describe("the server instructions name the docs tool and the version", () => {
   const projection: VaultProjection = { tags: [], indexed_fields: [], query_hints: [], map: { total: 0, tags: [], paths: [] } } as unknown as VaultProjection;
-  test("a Docs section: the version, a newer release when there is one, the tool, and where a refusal's fix is", () => {
+  test("a line under the vault's name: the version, a newer release when there is one, the tool, and where a refusal's fix is", () => {
     const md = projectionToMarkdown({ vaultName: "home", description: null, projection, docs: { origin: "https://parachute.computer", version: "0.9.0-pre.2", newer: "0.9.1" } });
-    expect(md).toContain("## Docs\n\nParachute 0.9.0-pre.2 (0.9.1 is out). `docs {search}` or `docs {topic}` reads parachute.computer's pages for this version; a refusal's `docs` names the page with its fix.");
+    expect(md).toStartWith('You are connected to Parachute Vault "home".\nDocs for Parachute 0.9.0-pre.2 (0.9.1 is out): `docs {search}`, `docs {topic}`; a refusal\'s `docs` is its fix page.\n');
     // the scripting guide is the docs page now, not the retired /scripting/
     expect(md).toContain("https://parachute.computer/docs/build/scripts/");
   });
   test("a self-hoster's own docs are named by their address; no newer release, no aside; no docs, no section", () => {
     const own = projectionToMarkdown({ vaultName: "home", description: null, projection, docs: { origin: "https://docs.example.org/parachute/", version: "0.9.1" } });
-    expect(own).toContain("Parachute 0.9.1. `docs {search}` or `docs {topic}` reads docs.example.org/parachute's pages");
-    expect(projectionToMarkdown({ vaultName: "home", description: null, projection, docs: null })).not.toContain("## Docs");
-    expect(projectionToMarkdown({ vaultName: "home", description: null, projection })).not.toContain("## Docs");
+    expect(own).toContain("Docs for Parachute 0.9.1, from docs.example.org/parachute: `docs {search}`");
+    expect(projectionToMarkdown({ vaultName: "home", description: null, projection, docs: null })).not.toContain("`docs {search}`");
+    expect(projectionToMarkdown({ vaultName: "home", description: null, projection })).not.toContain("`docs {search}`");
   });
 });
 
@@ -397,7 +397,7 @@ describe("versions", () => {
     forgetLatestRelease();
   });
   test("the brief's line for an origin that isn't a URL still reads", () => {
-    expect(docsBriefLine({ origin: "parachute", version: "dev" })).toBe("`docs {search}` or `docs {topic}` reads parachute's pages for this version; a refusal's `docs` names the page with its fix.");
+    expect(docsBriefLine({ origin: "parachute", version: "dev" })).toBe("Docs, from parachute: `docs {search}`, `docs {topic}`; a refusal's `docs` is its fix page.");
   });
   test("docs.base_url from the config; PARACHUTE_DOCS_URL wins; off either way", () => {
     expect(docsOrigin("", "https://docs.example.org/")).toBe("https://docs.example.org");

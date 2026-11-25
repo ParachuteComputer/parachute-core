@@ -423,12 +423,12 @@ export function projectionToMarkdown(args: {
    */
   reach?: string;
   /**
-   * How this door's owner makes a key for a script, the line under "Scripting & automation". Omitted: a box's
+   * How this door's owner makes a key for a script, the line under "Scripts". Omitted: a box's
    * (`parachute auth mint-token`). A door without that command (cloud: keys are made in the account) says its own.
    */
   scripting?: string;
   /** Where the docs are, the version this door runs and a newer release if the site says so (T-476, docs-tool.ts):
-   *  a "## Docs" section naming the `docs` tool. Omitted or `null`: no section (a door that lists no `docs` tool). */
+   *  a line under the vault's name naming the `docs` tool. Omitted or `null`: no line (a door that lists no `docs` tool). */
   docs?: { origin: string; version: string; newer?: string | null } | null;
 }): string {
   const { vaultName, description, projection, coordinates } = args;
@@ -438,6 +438,8 @@ export function projectionToMarkdown(args: {
   const lines: string[] = [];
   lines.push(`You are connected to Parachute Vault "${vaultName}".`);
   if (args.reach) lines.push(args.reach);
+  // T-476: the docs for this version, and where a refusal's fix is: one line (docs-tool.ts docsBriefLine).
+  if (args.docs) lines.push(docsBriefLine(args.docs));
   // vault#669 / cloud#87 recovery: a non-string description (poisoned
   // via an unguarded write door) used to throw here (`description.trim
   // is not a function`) and take down MCP `initialize` — the first
@@ -469,14 +471,6 @@ export function projectionToMarkdown(args: {
       );
       lines.push(`- MCP endpoint: \`<hub-origin>/vault/${vaultName}/mcp\``);
     }
-  }
-
-  // T-476: the docs for this version, and where a refusal's fix is. One line: the tool says the rest.
-  if (args.docs) {
-    lines.push("");
-    lines.push("## Docs");
-    lines.push("");
-    lines.push(docsBriefLine(args.docs));
   }
 
   // A2: surface the seeded onboarding guide so a connected AI can discover it
@@ -606,11 +600,11 @@ export function projectionToMarkdown(args: {
   // lean (token-budget note above). Uses the concrete vault name so the mint
   // command is copy-paste ready.
   lines.push("");
-  lines.push("## Scripting & automation (beyond this session)");
+  lines.push("## Scripts");
   lines.push("");
   lines.push(
     args.scripting ??
-      `For a script or cron job, mint a key (\`parachute auth mint-token --scope vault:${vaultName}:read --ephemeral\`) and call the REST API at \`<hub-origin>/vault/${vaultName}/api/...\`; guide: https://parachute.computer/docs/build/scripts/`,
+      `A script or cron job uses a key (\`parachute keys new <name> --vault ${vaultName} --can read\`) and the REST API at \`<hub-origin>/vault/${vaultName}/api/...\`; guide: https://parachute.computer/docs/build/scripts/`,
   );
 
   return lines.join("\n");

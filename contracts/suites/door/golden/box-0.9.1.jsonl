@@ -54,7 +54,7 @@
 {"key":"connect/token.lifetime","value":900}
 {"key":"connect/token.reply.shape","value":{"access_token":"string","expires_in":"number","refresh_token":"string","scope":"string","services":{"vault":{"url":"string","version":"string"},"vault:<v>":{"url":"string","version":"string"}},"token_type":"string","vault":"string"}}
 {"key":"connect/written-by.stamp","value":{"by":"string","via":"key:<client>"}}
-{"key":"docs/brief-line","value":["Parachute <version>. `docs {search}` or `docs {topic}` reads parachute.computer's pages for this version; a refusal's `docs` names the page with its fix."]}
+{"key":"docs/brief-line","value":"Docs for Parachute <version> `docs {search}`, `docs {topic}`; a refusal's `docs` is its fix page."}
 {"key":"exit/export-key.headers","value":{"type":"application/x-tar"}}
 {"key":"exit/export-key.mcp-refusal","value":{"status":403}}
 {"key":"exit/export-key.mint.shape","value":{"can":"string","created_at":"string","expires_at":"string","last_used_at":"null","name":"string","revoked_at":"null","scopes":["string"],"status":"string","token":"string","vault":"string"}}
@@ -132,7 +132,7 @@
 {"key":"links/link.shape","value":{"createdAt":"string","relationship":"string","sourceId":"string","sourceNote":{"createdAt":"string","id":"string","path":"string","tags":[],"updatedAt":"string"},"targetId":"string","targetNote":{"createdAt":"string","id":"string","path":"string","tags":[],"updatedAt":"string"}}}
 {"key":"links/unresolved.warning","value":[{"code":"string","message":"string","relationship":"string","target":"string"}]}
 {"key":"mcp/admin.capabilities","value":["tools"]}
-{"key":"mcp/admin.instructions.sections","value":["This vault's coordinates","Docs","Start here","Quick orientation (call `vault-info` for full schema)","Querying","Refreshing context","Attachments","Live pages (Claude artifacts)","Scripting & automation (beyond this session)"]}
+{"key":"mcp/admin.instructions.sections","value":["This vault's coordinates","Start here","Quick orientation (call `vault-info` for full schema)","Querying","Refreshing context","Attachments","Live pages (Claude artifacts)","Scripts"]}
 {"key":"mcp/admin.server.name","value":"parachute-vault/<v>"}
 {"key":"mcp/admin.tool-count","value":27}
 {"key":"mcp/admin.tool.add-attachment.hints","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
@@ -274,7 +274,7 @@
 {"key":"mcp/reach.write","value":"This connection can read the whole vault, and create, change and delete its records."}
 {"key":"mcp/read-calls-write-tool","value":"no such tool"}
 {"key":"mcp/read.capabilities","value":["tools"]}
-{"key":"mcp/read.instructions.sections","value":["This vault's coordinates","Docs","Start here","Quick orientation (call `vault-info` for full schema)","Querying","Refreshing context","Attachments","Live pages (Claude artifacts)","Scripting & automation (beyond this session)"]}
+{"key":"mcp/read.instructions.sections","value":["This vault's coordinates","Start here","Quick orientation (call `vault-info` for full schema)","Querying","Refreshing context","Attachments","Live pages (Claude artifacts)","Scripts"]}
 {"key":"mcp/read.server.name","value":"parachute-vault/<v>"}
 {"key":"mcp/read.tool-count","value":11}
 {"key":"mcp/read.tool.attachment-url.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
@@ -337,7 +337,7 @@
 {"key":"mcp/update-note.result.shape","value":{"content":"string","created":"boolean","createdAt":"string","createdBy":"string","createdVia":"string","extension":"string","id":"string","lastUpdatedBy":"string","lastUpdatedVia":"string","metadata":{"n":"number"},"path":"string","tags":["string"],"types":[],"updatedAt":"string"}}
 {"key":"mcp/vault-info.result.keys","value":["coordinates","description","getting_started","indexed_fields","map","name","query_hints","tags"]}
 {"key":"mcp/write.capabilities","value":["tools"]}
-{"key":"mcp/write.instructions.sections","value":["This vault's coordinates","Docs","Start here","Quick orientation (call `vault-info` for full schema)","Querying","Refreshing context","Attachments","Live pages (Claude artifacts)","Scripting & automation (beyond this session)"]}
+{"key":"mcp/write.instructions.sections","value":["This vault's coordinates","Start here","Quick orientation (call `vault-info` for full schema)","Querying","Refreshing context","Attachments","Live pages (Claude artifacts)","Scripts"]}
 {"key":"mcp/write.server.name","value":"parachute-vault/<v>"}
 {"key":"mcp/write.tool-count","value":20}
 {"key":"mcp/write.tool.add-attachment.hints","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
