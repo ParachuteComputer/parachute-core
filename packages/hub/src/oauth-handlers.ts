@@ -1035,7 +1035,7 @@ function pendingClientResponse(
       client.clientName,
       client.redirectUris,
       requestedScopes,
-      forcesExplicitConsent,
+      isVaultAdminScope,
     )
   ) {
     console.log(
@@ -1465,7 +1465,7 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
         client.clientName,
         client.redirectUris,
         earlyRequested,
-        forcesExplicitConsent,
+        isVaultAdminScope,
       )
     ) {
       console.log(
@@ -1615,7 +1615,7 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
   if (
     !hasStaleAssignment &&
     userHasVaultPosture &&
-    ((!hasUnnamedVault && isCoveredByGrant(db, session.userId, client.clientId, requestedScopes, forcesExplicitConsent)) ||
+    ((!hasUnnamedVault && isCoveredByGrant(db, session.userId, client.clientId, requestedScopes, isVaultAdminScope)) ||
       unnamedCoveredByAccountGrant ||
       perVaultCovered !== null)
   ) {
@@ -2164,10 +2164,11 @@ function issueAuthCodeRedirect(
   userId: string,
   deps: OAuthDeps,
   /**
-   * The person approved the consent page (T-476): the grant keeps no powerful scope they didn't grant this time, so an
-   * admin left unticked stops bringing the page back on every Reconnect (the skip gates read the grant).
+   * The ask the person just approved on the consent page (T-476): the grant keeps no vault admin for a vault this ask
+   * reaches that they didn't grant this time, so an admin left unticked stops bringing the page back on every Reconnect
+   * (the skip gates read the grant). Absent on every silent path, which never drops anything.
    */
-  consented = false,
+  consentedAsk?: readonly string[],
 ): Response {
   // Anti-privesc cap at the single choke-point. Runs AFTER any narrowing the
   // callers did (unnamed `vault:admin` → `vault:<picked>:admin`), so it sees
@@ -2228,7 +2229,10 @@ function issueAuthCodeRedirect(
     if (perVaultChoice) applyAccountDoorChoice(db, userId, params.clientId, dedupedScopes, grantNow);
     const replaces = (scope: string) =>
       (perVaultChoice && isAccountDoorChoiceScope(scope)) ||
-      (consented && forcesExplicitConsent(scope) && !dedupedScopes.includes(scope) && inReachOfAsk(scope, dedupedScopes));
+      (consentedAsk !== undefined &&
+        isVaultAdminScope(scope) &&
+        !dedupedScopes.includes(scope) &&
+        inReachOfAsk(scope, [...consentedAsk, ...dedupedScopes]));
     recordGrant(db, userId, params.clientId, dedupedScopes, grantNow, replaces);
     return issueAuthCode(db, {
       clientId: params.clientId,
@@ -2511,6 +2515,9 @@ async function handleConsentSubmit(
   // One box may carry several wire forms that read the same (space-separated). `granted_scope_present` says the page
   // drew the boxes (T-476): then only what is ticked is granted, even nothing, which is the denial below. Without it
   // (a programmatic POST, an older page), the fallback above holds.
+  // The ask as the page drew it, named forms only (an unnamed verb is bound to the picked vault, which the granted
+  // scopes name): the vaults this consent speaks for, whatever the person ticks (review round 3).
+  const askedHere = scopes.filter((sc) => sc.split(":").length !== 2 || !sc.startsWith("vault:"));
   const grantedFields = form
     .getAll("granted_scope")
     .flatMap((v) => String(v).split(" "))
@@ -2799,7 +2806,7 @@ async function handleConsentSubmit(
     scopes = applied.scopes;
   }
 
-  return issueAuthCodeRedirect(db, params, scopes, session.userId, deps, true);
+  return issueAuthCodeRedirect(db, params, scopes, session.userId, deps, askedHere);
 }
 
 /**

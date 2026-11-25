@@ -174,13 +174,13 @@ function holdsPowerfulBeyondAsk(grant: Grant, requestedScopes: readonly string[]
 }
 
 /**
- * Whether `scope` is about what this ask reaches (T-476 review): a vault scope for a vault the ask names (any vault,
- * when the ask has an unnamed vault verb the page will bind), an account scope when the ask is for the account. One app
- * connected to two vaults must not bounce between consent pages over the other vault's admin.
+ * Whether a vault `scope` is about what this ask reaches (T-476 review): a vault the ask names, or any vault when the ask
+ * has an unnamed vault verb the page will bind. One app connected to two vaults must not bounce between consent pages
+ * over the other vault's admin. Only vault scopes: these rules are about vault admin (account access ticked as an extra
+ * keeps its earlier behaviour, and module scopes are never offered as extras).
  */
 export function inReachOfAsk(scope: string, requestedScopes: readonly string[]): boolean {
   const parts = scope.split(":");
-  if (parts[0] === "account") return requestedScopes.some((r) => r.startsWith("account:"));
   if (parts[0] !== "vault") return false;
   const asked = requestedScopes.map((r) => r.split(":")).filter((r) => r[0] === "vault");
   if (asked.some((r) => r.length === 2)) return true;

@@ -13099,6 +13099,32 @@ describe("consent as a browser submits it: what is unticked is not granted (T-47
       cleanup();
     }
   });
+  // Review round 3: the vaults a consent speaks for are the ask's, not only what was ticked.
+  test("unticking every row of one vault in a two-vault ask still clears that vault's held admin", async () => {
+    const two: ServicesManifest = {
+      services: [{ name: "parachute-vault", port: 1940, paths: ["/vault/work", "/vault/other"], health: "/health", version: "0.7.0" }],
+    };
+    const d2 = { ...deps, loadServicesManifest: () => two };
+    const { db, cleanup } = await makeDb();
+    try {
+      const owner = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: owner.id });
+      const redirect = "https://app.example/cb";
+      const reg = registerClient(db, { redirectUris: [redirect], status: "approved" });
+      recordGrant(db, owner.id, reg.client.clientId, ["vault:work:read", "vault:work:admin", "vault:other:read"]);
+      const ask = (scope: string) =>
+        new Request(authorizeUrl({ client_id: reg.client.clientId, redirect_uri: redirect, response_type: "code", scope, code_challenge: makePkce().challenge, code_challenge_method: "S256" }), { headers: { cookie: cookie(session.id) } });
+      const page = handleAuthorizeGet(db, ask("vault:work:read vault:other:read"), d2);
+      expect(page.status).toBe(200);
+      const form = new URLSearchParams(browserFields(await page.text(), ["vault:work:read"]));
+      form.append("approve", "yes");
+      expect((await handleAuthorizePost(db, new Request(`${ISSUER}/oauth/authorize`, { method: "POST", body: form, headers: { "content-type": "application/x-www-form-urlencoded", cookie: cookie(session.id) } }), d2)).status).toBe(302);
+      expect(findGrant(db, owner.id, reg.client.clientId)!.scopes).not.toContain("vault:work:admin");
+      expect(handleAuthorizeGet(db, ask("vault:work:read"), d2).status).toBe(302);
+    } finally {
+      cleanup();
+    }
+  });
   test("a Reconnect with nothing powerful held stays silent", async () => {
     const { db, cleanup } = await makeDb();
     try {
