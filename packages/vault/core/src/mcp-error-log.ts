@@ -1,8 +1,8 @@
 /**
  * The server-side log line for an MCP tool call that crashed (audit L6-02).
  *
- * A tool that throws something nobody tagged as a domain refusal (no `error_type`, not an `McpError`) reaches the
- * client as `isError` text, and before this the server log showed only `POST /vault/<name>/mcp 200`. The caller logs
+ * A tool that throws something nobody tagged as a domain refusal (no `error_type`) reaches the client as an
+ * `internal_error` refusal (mcp-refusal.ts), and before this the server log showed only `POST /vault/<name>/mcp 200`. The caller logs
  * exactly one line, built here:
  *
  *   event=mcp_tool_error tool=<name> class=<constructor name> msg="<redacted message>" stack="<frames>" version=<v>

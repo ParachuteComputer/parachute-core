@@ -195,7 +195,8 @@ async function parseJsonRpcResult(res: Response, vaultName: string): Promise<unk
   }
   if (parsed.error) {
     // A vault from before one way to refuse (T-476) said a tool's refusal as a JSON-RPC error: its own error_type and
-    // fields are kept, so the caller reads the same refusal from an old vault as from a new one.
+    // fields are kept (not turned into vault_error). A new vault's refusal is an isError result, passed through as the
+    // vault said it.
     const msg = typeof parsed.error.message === "string" ? plainMessage(parsed.error.message) : "vault MCP error";
     const data = parsed.error.data && typeof parsed.error.data === "object" ? (parsed.error.data as Record<string, unknown>) : null;
     if (data && typeof data.error_type === "string") {
@@ -402,7 +403,8 @@ async function queryOneVaultMcp(
       [tool === "query-records" ? "records" : "notes"]: notesFromMcpResult(result),
     };
   } catch (err) {
-    const type = (err as { error_type?: unknown })?.error_type;
+    // a vault's refusal (notesFromMcpResult) carries error_type; the hub's own and an older vault's are AccountToolErrors
+    const type = err instanceof AccountToolError ? err.errorType : (err as { error_type?: unknown })?.error_type;
     return {
       vault: vault.name,
       error: err instanceof Error ? err.message : "query failed",

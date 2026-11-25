@@ -647,7 +647,7 @@ is a normal JSON-RPC result:
 
 Only the protocol's own errors (bad JSON, an unknown method) are JSON-RPC errors.
 
-**Before 0.9.1 (a meaning change for clients).** A refusal came three ways: a JSON-RPC error with `data.error_type`
+**Before this change (core #161, T-476; a meaning change for clients).** A refusal came three ways: a JSON-RPC error with `data.error_type`
 (conflicts, bad queries, schema refusals; `error.message` read `MCP error -32602: [error_type] …`), a normal reply
 whose JSON was `{error, error_type}` (a missing note or tag, a tag-scope refusal, manage-keys' refusals), or an
 `isError` result of bare text (`Unknown tool: x`). A client that reads both: when `result.isError`, read

@@ -152,9 +152,9 @@ interface McpToolExecutor {
  * `hint`) as duck-typed extra properties — the same pattern `QueryError`
  * uses for its optional structured fields. For validation leaves that don't
  * warrant a dedicated exported class (one caller-facing shape, not a reusable
- * domain error), this is what lets the generic domain-error mapping in
- * `src/mcp-http.ts` surface `data.error_type` instead of falling through to
- * the unstructured `isError: true` text fallback (vault#554).
+ * domain error), this is what lets the door's refusal mapping
+ * (`core/src/mcp-refusal.ts`) answer an `isError` refusal with its `error_type`
+ * and fields instead of an `internal_error` (vault#554, T-476).
  */
 function structuredError(
   message: string,

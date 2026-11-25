@@ -72,6 +72,7 @@ type Tagged = {
   expected_from?: unknown; to?: unknown; current?: unknown; violations?: unknown; got?: unknown; unused?: unknown;
   fields?: unknown; hint?: string; path?: string; candidates?: unknown; extension?: string; reason?: string;
   limit?: number; tag?: string; cycle?: unknown; how_to?: string; size?: number; max_bytes?: number; mime_type?: string;
+  done?: unknown; failed?: unknown; missing?: unknown;
   /** An `McpError` already formed (a door's own, or one passed through): its `data`. */
   data?: unknown;
 };
@@ -130,6 +131,8 @@ export function refusalOfError(err: unknown): McpRefusal | null {
     return refusal(e.error_type, message, {
       field: e.field, hint: e.hint, limit: e.limit, got: e.got, unused: e.unused, fields: e.fields, extension: e.extension,
       how_to: e.how_to, size: e.size, max_bytes: e.max_bytes, mime_type: e.mime_type,
+      // delete's refusals (core/src/mcp.ts): which were done, which failed, which weren't there; a path's candidates
+      done: e.done, failed: e.failed, missing: e.missing, path: e.path, candidates: e.candidates,
     });
   }
   return null;

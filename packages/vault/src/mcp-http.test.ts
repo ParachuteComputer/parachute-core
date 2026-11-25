@@ -107,6 +107,10 @@ describe("MCP SDK McpError — confirms the mechanics this fix depends on", () =
 });
 
 describe("refusalOfError — the one mapping from a thrown error to a refusal (T-476)", () => {
+  test("delete's partial failure keeps what was done and what failed, so a retry can name the rest", () => {
+    const err = Object.assign(new Error("2 of 3 deleted"), { error_type: "partial_failure", done: ["a", "b"], failed: [{ id: "c", error: "x" }], missing: ["d"] });
+    expect(refusalOfError(err)).toEqual({ error_type: "partial_failure", message: "2 of 3 deleted", done: ["a", "b"], failed: [{ id: "c", error: "x" }], missing: ["d"] });
+  });
   test("a plain message with an error_type carries no prefix", () => {
     expect(refusalOfError(Object.assign(new Error("bad stuff happened"), { error_type: "invalid_query", field: "limit" }))).toEqual({
       error_type: "invalid_query", message: "bad stuff happened", field: "limit",
