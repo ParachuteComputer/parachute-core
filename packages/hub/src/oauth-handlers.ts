@@ -567,7 +567,7 @@ function advertisedScopes(declared: ReadonlySet<string>, manifest: ServicesManif
       // requestable: an app that needs it asks by name, and the consent page offers it unticked under "Grant
       // additional access", so the person who wants Claude to manage tags ticks it there. Parachute Cloud never
       // listed it; now both doors say the same.
-      .filter((scope) => !isVaultAdminScope(scope))
+      .filter((scope) => !isAnyVaultAdminScope(scope))
       .filter((scope) => {
         for (const [prefix, short] of OPTIONAL_MODULE_SCOPES) {
           if (scope.startsWith(prefix) && !installedShorts.has(short)) return false;
@@ -577,8 +577,8 @@ function advertisedScopes(declared: ReadonlySet<string>, manifest: ServicesManif
   );
 }
 
-/** `vault:admin` or `vault:<name>:admin`, any casing. */
-function isVaultAdminScope(scope: string): boolean {
+/** `vault:admin` or `vault:<name>:admin`, any casing (scope-explanations.ts `isVaultAdminScope` matches the named form only). */
+function isAnyVaultAdminScope(scope: string): boolean {
   const parts = scope.toLowerCase().split(":");
   return parts[0] === "vault" && parts[parts.length - 1] === "admin" && (parts.length === 2 || parts.length === 3);
 }
@@ -1035,7 +1035,7 @@ function pendingClientResponse(
       client.clientName,
       client.redirectUris,
       requestedScopes,
-      isVaultAdminScope,
+      isAnyVaultAdminScope,
     )
   ) {
     console.log(
@@ -1465,7 +1465,7 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
         client.clientName,
         client.redirectUris,
         earlyRequested,
-        isVaultAdminScope,
+        isAnyVaultAdminScope,
       )
     ) {
       console.log(
@@ -1615,7 +1615,7 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
   if (
     !hasStaleAssignment &&
     userHasVaultPosture &&
-    ((!hasUnnamedVault && isCoveredByGrant(db, session.userId, client.clientId, requestedScopes, isVaultAdminScope)) ||
+    ((!hasUnnamedVault && isCoveredByGrant(db, session.userId, client.clientId, requestedScopes, isAnyVaultAdminScope)) ||
       unnamedCoveredByAccountGrant ||
       perVaultCovered !== null)
   ) {
@@ -2230,7 +2230,7 @@ function issueAuthCodeRedirect(
     const replaces = (scope: string) =>
       (perVaultChoice && isAccountDoorChoiceScope(scope)) ||
       (consentedAsk !== undefined &&
-        isVaultAdminScope(scope) &&
+        isAnyVaultAdminScope(scope) &&
         !dedupedScopes.includes(scope) &&
         inReachOfAsk(scope, [...consentedAsk, ...dedupedScopes]));
     recordGrant(db, userId, params.clientId, dedupedScopes, grantNow, replaces);

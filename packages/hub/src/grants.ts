@@ -152,7 +152,7 @@ export function isCoveredByGrant(
   userId: string,
   clientId: string,
   requestedScopes: readonly string[],
-  /** A powerful scope (`forcesExplicitConsent`): see `holdsPowerfulBeyondAsk`. */
+  /** A scope a silent re-link must not drop (vault admin, T-476): see `holdsPowerfulBeyondAsk`. */
   powerful?: (scope: string) => boolean,
 ): boolean {
   if (requestedScopes.length === 0) return false;
@@ -264,7 +264,7 @@ export function isCoveredByGrantForClientName(
   clientName: string,
   clientRedirectUris: readonly string[],
   requestedScopes: readonly string[],
-  /** A powerful scope (`forcesExplicitConsent`): see `holdsPowerfulBeyondAsk`. */
+  /** A scope a silent re-link must not drop (vault admin, T-476): see `holdsPowerfulBeyondAsk`. */
   powerful?: (scope: string) => boolean,
 ): boolean {
   if (requestedScopes.length === 0) return false;
