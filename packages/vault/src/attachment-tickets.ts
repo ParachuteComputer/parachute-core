@@ -18,7 +18,7 @@
 
 import { mkdirSync, writeFileSync, existsSync, readFileSync, statSync } from "fs";
 import { join, normalize } from "path";
-import type { Store } from "../core/src/types.ts";
+import type { Attachment, Store } from "../core/src/types.ts";
 import type { AttachmentTicket, AttachmentTicketProvider } from "../core/src/attachment/tickets.ts";
 import { sanitizeAttachmentExtension, contentTypeForAttachmentPath } from "../core/src/attachment/policy.ts";
 import { assetsDir, readVaultConfig } from "./config.ts";
@@ -252,85 +252,7 @@ async function handleUploadSpend(
     );
   }
 
-  // Same on-disk write discipline as REST's POST /storage/upload
-  // (src/routes.ts) — server-generated path, never caller-controlled.
-  const ext = sanitizeAttachmentExtension(ticket.filename);
-  const date = new Date().toISOString().split("T")[0]!;
-  const dir = join(assetsDir(vaultName), date);
-  mkdirSync(dir, { recursive: true });
-  const filename = `${Date.now()}-${crypto.randomUUID()}${ext}`;
-  writeFileSync(join(dir, filename), buffer);
-  const relativePath = `${date}/${filename}`;
-
-  invalidateUsageCache(vaultName);
-
-  // Mirrors the REST POST /notes/:id/attachments transcribe decision
-  // exactly (src/routes.ts): explicit opt-in (here, `transcribe: true` at
-  // mint) wins; otherwise infer from mime-type + the owning vault's
-  // auto-transcribe toggle.
-  const explicitOptIn = ticket.transcribe === true;
-  // NO explicit-opt-out branch here, deliberately — unlike the REST attach
-  // route this path CANNOT express one today. `generateMcpTools` mints the
-  // ticket with `transcribe: params.transcribe === true` (core/src/mcp.ts),
-  // so a caller who says nothing and a caller who says `false` both arrive
-  // as `false`. Reading `false` as an opt-out here would therefore disable
-  // auto-transcribe for every ticket that didn't explicitly opt in — the
-  // collapse this work exists to undo, in the opposite direction.
-  //
-  // Making the ticket path symmetric means preserving the tri-state at mint
-  // first, which is a change to the MCP tool contract and belongs with that
-  // argument rather than smuggled in here.
-  const perVaultEnabled = readVaultConfig(vaultName)?.auto_transcribe?.enabled;
-  const autoDecision = explicitOptIn
-    ? ({ kind: "transcribe" } as const)
-    : classifyAutoTranscribe(ticket.mimeType, { perVaultEnabled });
-  const autoOptIn = !explicitOptIn && autoDecision.kind === "transcribe";
-  // vault#643 — same honesty as the REST path: enabled-but-unconfigured is a
-  // misconfiguration, not a silent no-op.
-  const transcribeUnavailable = !explicitOptIn && autoDecision.kind === "unavailable";
-  const attMeta: Record<string, unknown> = {
-    original_name: ticket.filename,
-    size: buffer.length,
-  };
-  if (explicitOptIn || autoOptIn) {
-    attMeta.transcribe_status = "pending";
-    attMeta.transcribe_requested_at = new Date().toISOString();
-    attMeta.transcribe_origin = explicitOptIn ? "legacy" : "auto";
-    // Per-segment slots (voice W2) — already validated at mint (the ticket
-    // only carries `segmentIndex` when it passed the integer->=0 check), so
-    // just thread it through onto the attachment row's metadata.
-    if (ticket.segmentIndex !== undefined) {
-      attMeta.segment_index = ticket.segmentIndex;
-    }
-  } else if (transcribeUnavailable) {
-    attMeta.transcribe_status = "failed";
-    // Name the real situation. On a box with a local provider configured,
-    // the flat NO_PROVIDER_ERROR told the operator to do what they'd done.
-    attMeta.transcribe_error = noProviderErrorFor(
-      autoDecision.kind === "unavailable" ? autoDecision.localProvider : null,
-    );
-    attMeta.transcribe_requested_at = new Date().toISOString();
-    attMeta.transcribe_origin = "auto";
-    if (ticket.segmentIndex !== undefined) {
-      attMeta.segment_index = ticket.segmentIndex;
-    }
-    warnNoTranscriptionProvider();
-  }
-
-  const attachment = await store.addAttachment(ticket.noteId, relativePath, ticket.mimeType, attMeta);
-
-  if (explicitOptIn) {
-    const note = await store.getNote(ticket.noteId);
-    if (note) {
-      const noteMeta = (note.metadata as Record<string, unknown> | undefined) ?? {};
-      if (noteMeta.transcribe_stub !== true) {
-        await store.updateNote(ticket.noteId, {
-          metadata: { ...noteMeta, transcribe_stub: true },
-          skipUpdatedAt: true,
-        });
-      }
-    }
-  }
+  const attachment = await storeTicketUpload(ticket, buffer, vaultName, store);
 
   // Ticket mint + register in one shot (vs REST's two-step upload-then-
   // attach) — the spend response is the attachment row itself, so the
@@ -378,4 +300,101 @@ async function handleDownloadSpend(
       "X-Content-Type-Options": "nosniff",
     },
   });
+}
+
+/**
+ * Store an upload's bytes on its note: the assets dir and the attachment row, with the transcription decision.
+ * The one writer for a spent upload ticket and for `add-attachment`, whose bytes come in the MCP call (T-476), so the
+ * two can't diverge. The caller has already checked the ticket (or the call): its note, scope and size.
+ */
+export async function storeTicketUpload(
+  ticket: AttachmentTicket,
+  bytes: Uint8Array,
+  vaultName: string,
+  store: Store,
+): Promise<Attachment> {
+  const noteId = ticket.noteId!;
+  const originalName = ticket.filename!;
+  const mimeType = ticket.mimeType!;
+  // Same on-disk write discipline as REST's POST /storage/upload
+  // (src/routes.ts) — server-generated path, never caller-controlled.
+  const ext = sanitizeAttachmentExtension(originalName);
+  const date = new Date().toISOString().split("T")[0]!;
+  const dir = join(assetsDir(vaultName), date);
+  mkdirSync(dir, { recursive: true });
+  const filename = `${Date.now()}-${crypto.randomUUID()}${ext}`;
+  writeFileSync(join(dir, filename), bytes);
+  const relativePath = `${date}/${filename}`;
+
+  invalidateUsageCache(vaultName);
+
+  // Mirrors the REST POST /notes/:id/attachments transcribe decision
+  // exactly (src/routes.ts): explicit opt-in (here, `transcribe: true` at
+  // mint) wins; otherwise infer from mime-type + the owning vault's
+  // auto-transcribe toggle.
+  const explicitOptIn = ticket.transcribe === true;
+  // NO explicit-opt-out branch here, deliberately — unlike the REST attach
+  // route this path CANNOT express one today. `generateMcpTools` mints the
+  // ticket with `transcribe: params.transcribe === true` (core/src/mcp.ts),
+  // so a caller who says nothing and a caller who says `false` both arrive
+  // as `false`. Reading `false` as an opt-out here would therefore disable
+  // auto-transcribe for every ticket that didn't explicitly opt in — the
+  // collapse this work exists to undo, in the opposite direction.
+  //
+  // Making the ticket path symmetric means preserving the tri-state at mint
+  // first, which is a change to the MCP tool contract and belongs with that
+  // argument rather than smuggled in here.
+  const perVaultEnabled = readVaultConfig(vaultName)?.auto_transcribe?.enabled;
+  const autoDecision = explicitOptIn
+    ? ({ kind: "transcribe" } as const)
+    : classifyAutoTranscribe(mimeType, { perVaultEnabled });
+  const autoOptIn = !explicitOptIn && autoDecision.kind === "transcribe";
+  // vault#643 — same honesty as the REST path: enabled-but-unconfigured is a
+  // misconfiguration, not a silent no-op.
+  const transcribeUnavailable = !explicitOptIn && autoDecision.kind === "unavailable";
+  const attMeta: Record<string, unknown> = {
+    original_name: originalName,
+    size: bytes.length,
+  };
+  if (explicitOptIn || autoOptIn) {
+    attMeta.transcribe_status = "pending";
+    attMeta.transcribe_requested_at = new Date().toISOString();
+    attMeta.transcribe_origin = explicitOptIn ? "legacy" : "auto";
+    // Per-segment slots (voice W2) — already validated at mint (the ticket
+    // only carries `segmentIndex` when it passed the integer->=0 check), so
+    // just thread it through onto the attachment row's metadata.
+    if (ticket.segmentIndex !== undefined) {
+      attMeta.segment_index = ticket.segmentIndex;
+    }
+  } else if (transcribeUnavailable) {
+    attMeta.transcribe_status = "failed";
+    // Name the real situation. On a box with a local provider configured,
+    // the flat NO_PROVIDER_ERROR told the operator to do what they'd done.
+    attMeta.transcribe_error = noProviderErrorFor(
+      autoDecision.kind === "unavailable" ? autoDecision.localProvider : null,
+    );
+    attMeta.transcribe_requested_at = new Date().toISOString();
+    attMeta.transcribe_origin = "auto";
+    if (ticket.segmentIndex !== undefined) {
+      attMeta.segment_index = ticket.segmentIndex;
+    }
+    warnNoTranscriptionProvider();
+  }
+
+  const attachment = await store.addAttachment(noteId, relativePath, mimeType, attMeta);
+
+  if (explicitOptIn) {
+    const note = await store.getNote(noteId);
+    if (note) {
+      const noteMeta = (note.metadata as Record<string, unknown> | undefined) ?? {};
+      if (noteMeta.transcribe_stub !== true) {
+        await store.updateNote(noteId, {
+          metadata: { ...noteMeta, transcribe_stub: true },
+          skipUpdatedAt: true,
+        });
+      }
+    }
+  }
+
+  return attachment;
 }

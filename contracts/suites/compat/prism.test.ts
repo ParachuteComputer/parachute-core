@@ -21,7 +21,7 @@ const s = services();
 const R = runId("prism");
 const AUD = `vault.${s.vaultName}`;
 
-// Copied from Prism, apps/server/src/agent-profiles.ts:34-51 (snapshot 55ac3df). If Prism changes them, change them here.
+// Copied from Prism, apps/server/src/agent-profiles.ts:34-51 (snapshot 55ac3df; byte-identical at 7c411c1, the public snapshot). If Prism changes them, change them here.
 const PRISM_VAULT_RO = ["query-notes", "list-tags", "find-path", "vault-info", "doctor"];
 const PRISM_VAULT_RW = [
   "query-notes", "create-note", "update-note", "delete-note", "list-tags", "find-path", "vault-info", "doctor",

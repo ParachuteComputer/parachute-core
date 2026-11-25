@@ -276,6 +276,10 @@ async function listVaultToolsUncached(ctx: AccountToolContext): Promise<readonly
             !!t && typeof t === "object" && typeof (t as { name?: unknown }).name === "string",
         )
         .filter((t) => !HUB_NATIVE_TOOL_NAMES.has(t.name))
+        // T-476: add-attachment (a file sent in the call) isn't listed here, kept equal to 0.9, where this door's writer
+        // list would go over its 4,000-token budget with it. An AI stores a file through the vault it was connected to;
+        // a call naming it here still reaches the vault, which checks the write verb.
+        .filter((t) => t.name !== "add-attachment")
         .map(injectVaultSelector);
     } catch {
       // Try the next covered vault (highest-verb first). Empty catch continues.
