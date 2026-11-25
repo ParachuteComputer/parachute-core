@@ -62,7 +62,7 @@ import { chooseHubOrigin, mintHubJwt, revokeHubJwt } from "./mcp-install.ts";
 import { looksLikeJwt } from "./hub-jwt.ts";
 import { readGlobalConfig, DEFAULT_PORT } from "./config.ts";
 import { getBaseUrl } from "./oauth-discovery.ts";
-import { getSharedAttachmentTicketProvider } from "./attachment-tickets.ts";
+import { getSharedAttachmentTicketProvider, storeTicketUpload } from "./attachment-tickets.ts";
 import { createFsAttachmentBytesProvider } from "./attachment-bytes.ts";
 
 /**
@@ -147,7 +147,8 @@ export async function getServerInstruction(
     // `generateScopedMcpTools` below) — the connect-time brief can
     // unconditionally teach both the ticket tools and read-attachment on
     // this door.
-    attachments: { ticketsEnabled: true, readEnabled: true, ticketTool: "attachment-url" },
+    // add-attachment is a write tool: a reader's brief doesn't point at it.
+    attachments: { ticketsEnabled: true, readEnabled: true, ticketTool: "attachment-url", addEnabled: !auth || hasScopeForVault(auth.scopes, vaultName, "write") },
     // T-407: this door lists the record tools first, so its brief speaks their words.
     words: recordWords,
     // 0.9.1 (SPEC §3.4): say what this key can read. No auth (local stdio) is the owner's own process: no line.
@@ -347,6 +348,8 @@ export function generateScopedMcpTools(
       urlBase: ticketUrlBase,
       ...(ticketNoteVisible ? { noteVisible: ticketNoteVisible, scopedTags: rawTags! } : {}),
       ...(auth?.grant ? { grant: auth.grant } : {}),
+      // add-attachment (T-476): the bytes come in the call and are stored by the ticket spend's own writer.
+      storeUpload: (ticket, bytes) => storeTicketUpload(ticket, bytes, vaultName, store),
     },
     // Attachment bytes (Wave 2 model lane): bun always wires a fresh fs
     // provider per session — cheap (stateless), unlike the ticket

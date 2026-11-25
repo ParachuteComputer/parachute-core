@@ -109,7 +109,7 @@ export function refusalOfError(err: unknown): McpRefusal | null {
   if (e.code === "PUBLISH_OUT_OF_SCOPE") return refusal("tag_scope_violation", message);
   if (e.code === "SCHEMA_VALIDATION") return refusal("schema_validation", message, { violations: e.violations ?? [], hint: "fix every field listed in violations and retry — none of this write was applied" });
   if (e.code === "PRECONDITION_REQUIRED") {
-    return refusal("precondition_required", message, { note_id: e.note_id, path: e.note_path ?? null, hint: "re-read the note, pass its updated_at as if_updated_at, or pass force: true to skip the check" });
+    return refusal("precondition_required", message, { note_id: e.note_id, path: e.note_path ?? null, hint: "re-read the note and pass its updatedAt as if_updated_at, or pass force: true to skip the check" });
   }
   // any other QueryError (FIELD_NOT_INDEXED, UNKNOWN_OPERATOR, …): the umbrella REST uses for the class
   if (e.name === "QueryError") return refusal(typeof e.error_type === "string" ? e.error_type : "invalid_query", message, { code: e.code, field: e.field, got: e.got, hint: e.hint });

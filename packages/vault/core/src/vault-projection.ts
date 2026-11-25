@@ -25,6 +25,7 @@ import {
   type SchemaField,
 } from "./schema-defaults.ts";
 import { listIndexedFields } from "./indexed-fields.ts";
+import { MAX_INLINE_ATTACHMENT_BYTES } from "./attachment/inline.ts";
 import {
   listTagRecords,
   type TagFieldSchema,
@@ -292,13 +293,16 @@ function sqliteToUserType(t: string): string {
 /**
  * The Attachments orientation block, rendered into the connect-time
  * markdown brief (`projectionToMarkdown`) so every agent learns, every
- * session, how to move file bytes into/out of this vault without spending
- * its own context on them (bytes never ride MCP either way).
+ * session, how to move file bytes into/out of this vault: by URL (the bytes
+ * skip the conversation), in the call (`add-attachment`, a small file, T-476),
+ * or read into the conversation (`read-attachment`).
  *
  * `ticketsEnabled` reflects whether THIS door has wired an
- * `AttachmentTicketProvider` (bun: always, as of the Wave 1 PR; cloud: not
- * yet — its mirror is a separate PR). `readEnabled` reflects whether it's
+ * `AttachmentTicketProvider` (bun: always, as of the Wave 1 PR; cloud: always,
+ * since cloud#177). `readEnabled` reflects whether it's
  * wired an `AttachmentBytesProvider` (bun: always, as of this PR — Wave 2).
+ * `addEnabled` reflects whether it wired the ticket seam's `storeUpload`
+ * (`add-attachment`).
  * An unwired seam omits BOTH its tool(s) from `tools/list` (see
  * `generateMcpTools`'s `attachmentTickets` / `attachmentBytes` opts) AND
  * its sentence here — the brief never dangles a pointer at a tool the
@@ -308,7 +312,7 @@ function sqliteToUserType(t: string): string {
  * inside the connect-time brief's token budget — see
  * `projectionToMarkdown`'s doc comment.
  */
-export function attachmentsInstructionBlock(opts: { ticketsEnabled: boolean; readEnabled?: boolean; ticketTool?: string }): string {
+export function attachmentsInstructionBlock(opts: { ticketsEnabled: boolean; readEnabled?: boolean; ticketTool?: string; addEnabled?: boolean }): string {
   const sentences: string[] = [
     "`include_attachments: true` on `query-notes` lists a note's attachments.",
   ];
@@ -317,6 +321,12 @@ export function attachmentsInstructionBlock(opts: { ticketsEnabled: boolean; rea
       opts.ticketTool
         ? `\`${opts.ticketTool}\` gives a one-use URL to PUT or GET the bytes.`
         : "`request-attachment-upload` / `request-attachment-download` give a one-use URL to PUT or GET the bytes.",
+    );
+  }
+  if (opts.addEnabled) {
+    // T-476: the one way that needs no network beyond the MCP call itself, so an AI in a sandbox uses it.
+    sentences.push(
+      `\`add-attachment\` stores a file of up to ${MAX_INLINE_ATTACHMENT_BYTES / 1024} KiB sent in the call: use it when you hold the bytes.`,
     );
   }
   if (opts.readEnabled) {
@@ -363,6 +373,16 @@ export function connectionReach(level: "read" | "write" | "admin", tags: readonl
   return `This connection can read only the records tagged ${list} (subtags included); other records are hidden from it.${can.scoped}`;
 }
 
+/**
+ * How to build a live page on this vault (T-476, tested in a harness that mimics claude.ai's artifact runtime). In
+ * record words: every door that sends this brief lists the record tools. Its long form is the docs page it names.
+ */
+export const LIVE_PAGE_BLOCK =
+  "An artifact reads with `watchTool` on `query-records`, writes on a click with `update-record` " +
+  "(`if_updated_at: record.updatedAt`), then `invalidate`s; a conflict means read again. It declares only the tools " +
+  "it calls. A reply is a record, an array, or an object with `records`; a refusal is `isError`. Guide: " +
+  "https://parachute.computer/docs/use/claude-artifacts/";
+
 export function projectionToMarkdown(args: {
   vaultName: string;
   description?: string | null;
@@ -384,7 +404,7 @@ export function projectionToMarkdown(args: {
    * that hasn't wired ticket support yet (or a test fixture) never
    * accidentally advertises tools it can't back.
    */
-  attachments?: { ticketsEnabled: boolean; readEnabled?: boolean; ticketTool?: string };
+  attachments?: { ticketsEnabled: boolean; readEnabled?: boolean; ticketTool?: string; addEnabled?: boolean };
   /**
    * The server's own words for this door (T-407: record words where the
    * record tools are listed). Applied to the fixed text only, never to the
@@ -532,9 +552,9 @@ export function projectionToMarkdown(args: {
   lines.push("");
   lines.push("## Querying");
   lines.push("");
-  for (const hint of projection.query_hints) {
-    lines.push(`- \`${w(hint)}\``);
-  }
+  // T-476: one line, not the five hints (`vault-info` still returns them): query-records' own description, which
+  // every client reads with the tool list, says each filter, so the brief keeps its budget for what only it can say.
+  lines.push(w("`query-notes { type: \"X\" }` lists a type, subtypes too; the tool's description has every filter (`metadata` operators, `search`, `near`, `id`)."));
 
   lines.push("");
   lines.push("## Refreshing context");
@@ -545,6 +565,13 @@ export function projectionToMarkdown(args: {
   lines.push("## Attachments");
   lines.push("");
   lines.push(w(attachmentsInstructionBlock(args.attachments ?? { ticketsEnabled: false })));
+
+  // T-476: a live page (a Claude artifact) calls this connector on every view, without the model. These are the
+  // words a page needs to be right the first time: the reply's shape and the concurrency token as a record carries it.
+  lines.push("");
+  lines.push("## Live pages (Claude artifacts)");
+  lines.push("");
+  lines.push(LIVE_PAGE_BLOCK);
 
   // Scripting pointer block: the connect-time brief used to dead-end on
   // querying — an agent had no path to "how do I script/automate against this
