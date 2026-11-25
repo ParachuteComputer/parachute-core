@@ -3596,7 +3596,7 @@ export class PreconditionRequiredError extends Error {
 
   constructor(noteId: string, notePath: string | null) {
     super(
-      `precondition required: update-note rejects an item without \`if_updated_at\` (read the note's updated_at and echo it) or \`force: true\` (explicit override). note="${noteId}"`,
+      `precondition required: update-note rejects an item without \`if_updated_at\` (the note's \`updatedAt\` as you read it) or \`force: true\` (explicit override). note="${noteId}"`,
     );
     this.name = "PreconditionRequiredError";
     this.note_id = noteId;

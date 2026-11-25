@@ -370,10 +370,11 @@ export function connectionReach(level: "read" | "write" | "admin", tags: readonl
 export const LIVE_PAGE_BLOCK =
   "A live page reads this vault each time someone opens it. Declare only the tools it calls: `query-records` to read, " +
   "`update-record` to change, `create-record` to add. Read with `watchTool` on `query-records`, filtered by `type`, " +
-  "`path_prefix` or `fields`; the reply is JSON: one record, an array, or `{records, next_cursor}`. A record's name is " +
-  "the last part of its `path`. Write only on the person's click: `update-record {id, fields or body, if_updated_at: " +
-  "record.updatedAt}`, then `invalidate` the reads. A conflict means it changed elsewhere: read it again, never " +
-  "`force`. Use this vault's own type and field names. Guide: https://parachute.computer/docs/use/claude-artifacts/";
+  "`path_prefix` or `fields`; the reply is JSON: one record, an array, or `{records, next_cursor}`, and a missing " +
+  "record answers `{error, error_type: \"not_found\"}`. A record's name is the last part of its `path`. Write only on " +
+  "the person's click: `update-record {id, fields or body, if_updated_at: record.updatedAt}`, then `invalidate` the " +
+  "reads. A conflict means it changed elsewhere: read it again, never `force`. Writes need a viewer whose connection " +
+  "may write. Use this vault's own type and field names. Guide: https://parachute.computer/docs/use/claude-artifacts/";
 
 export function projectionToMarkdown(args: {
   vaultName: string;

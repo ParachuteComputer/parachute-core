@@ -298,7 +298,7 @@
 {"key":"mcp/read.tool.vault-info.present","value":true}
 {"key":"mcp/read.tool.vault-info.schema","value":"530ff43b9f863786"}
 {"key":"mcp/read.tool.vault-info.words","value":"dee3e40876423132"}
-{"key":"mcp/refusal.blind-update","value":{"code":-32602,"hint":"d9347237c2bf1d18","keys":["error_type","hint","note_id","path"],"type":"precondition_required"}}
+{"key":"mcp/refusal.blind-update","value":{"code":-32602,"hint":"4173c86cffc0aa4a","keys":["error_type","hint","note_id","path"],"type":"precondition_required"}}
 {"key":"mcp/refusal.message-names-its-type","value":true}
 {"key":"mcp/refusal.path-taken","value":{"code":-32600,"keys":["error_type","path"],"type":"path_conflict"}}
 {"key":"mcp/root.cold","value":{"challenge":"Bearer resource_metadata=\"…\"","status":401}}
