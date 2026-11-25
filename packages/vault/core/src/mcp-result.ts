@@ -45,6 +45,8 @@ export interface ResultTool {
   resultContent?: (result: unknown) => McpResultBlock[];
   /** Set on a deprecated tool whose reply carries a refresh nudge. */
   deprecation?: ResultDeprecation;
+  /** `structuredContent` for a client's view, apart from the content blocks (an MCP App's tool: the view's data). */
+  resultStructured?: (result: unknown) => Record<string, unknown>;
 }
 
 /** True when ChatGPT would read this JSON text as `{}`: a plain object with a top-level `content` key. */
@@ -55,6 +57,7 @@ export function readsEmptyInChatGpt(result: unknown): result is Record<string, u
 export function mcpCallResult(tool: ResultTool, result: unknown): McpCallResult {
   const refused = refusalOfReply(result);
   if (refused) return refusalResult(refused);
+  if (tool.resultStructured) return { content: tool.resultContent ? tool.resultContent(result) : [{ type: "text", text: JSON.stringify(result, null, 2) }], structuredContent: tool.resultStructured(result) };
   const content: McpResultBlock[] = tool.resultContent
     ? tool.resultContent(result)
     : [{ type: "text", text: JSON.stringify(result, null, 2) }];

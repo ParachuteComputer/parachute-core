@@ -81,5 +81,7 @@ export const BY_LEVEL: Readonly<Record<string, Partial<Record<McpLevel, McpToolA
  * change that can overwrite).
  */
 export function toolAnnotations(name: string, level: McpLevel): McpToolAnnotations {
+  // an applet's own tool (`open-<id>`, the box's mcp-app.ts): it opens a view and changes nothing itself
+  if (name.startsWith("open-") && !TOOL_ANNOTATIONS[name]) return READ;
   return BY_LEVEL[name]?.[level] ?? TOOL_ANNOTATIONS[name] ?? CHANGE;
 }

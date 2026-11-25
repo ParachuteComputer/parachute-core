@@ -7,6 +7,13 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 ## [Unreleased]
 
 ### Added
+- **A vault's approved applets as an MCP App: Parachute applets inside Claude (T-476).** Each applet the person
+  approved by code hash in the Parachute app (a signed approval, checked against the keys the hub linked to them) is
+  its own tool, `open-<id>`, with its own `ui://parachute/applet/<id>` view and a global entry point: one tile per
+  applet on Claude's Artifacts page, pinnable. The view (`@openparachute/applet-host` 0.1.0, kept in
+  `src/applet-host/`) runs the applet in the app's sealed frame and reaches the vault only through the host's
+  `tools/call`, in the manifest's folders. `initialize` now advertises `resources`. Nothing changes for a client that
+  doesn't use them, nor for a vault with no approved applets (docs/contracts/mcp-app.md).
 
 - **Write access may define a type over REST too, on `/api/types` (T-476).** `PUT /api/types/:name` with `vault:write` (no tag scope) may make a type nobody has defined yet and add fields to a type the same credential made, the rule MCP's `manage-types` already has (`docs/contracts/write-defines-types.md`). Everything else on a type stays admin and answers 403 with what write may do. `PUT /api/tags/:name` stays admin. So the app, which holds write, can apply a pack of types with no AI. Default chosen by Uni; Aaron or Benjamin may overrule.
 - **`parachute doctor --fix` also repairs stale history hints and unused OAuth clients (0.9.3, T-463).** `parachute doctor` now has a Data group: `history-state:<vault>` warns when a vault's history compaction hints differ from its history (what `parachute-vault history rebuild-state` fixed), and `oauth-clients` warns about clients registered over 30 days ago that nothing uses (what `parachute auth reap-clients` removed). `parachute doctor --fix --yes` rebuilds the hints and removes those clients, after the same prompt as the port repair; with no terminal and no `--yes` it lists what it would do and changes nothing. History itself is never touched. `parachute-vault history rebuild-state --check` is the read-only count doctor asks. Both old commands keep working and now say `doctor --fix` is the way.
