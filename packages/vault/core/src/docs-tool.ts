@@ -22,9 +22,19 @@
  * most 64 of them, each read up to 200 KB. When the site can't be read, the last copy answers, else a small offline
  * copy bundled here (the fix pages and the list), marked as such.
  *
- * Pure apart from `fetch` (injected for tests), so the cloud door builds the same tool.
+ * Pure apart from `fetch` (injected for tests), and imports nothing, so the cloud door builds the same tool.
  */
-import type { McpToolDef } from "./mcp.js";
+
+/** The tool's shape: `McpToolDef` (mcp.ts) as far as this tool needs it, said here so this file imports nothing and
+ *  a Worker that wants only the refusal half (Cloud's account door) doesn't pull the engine's SQLite types with it. */
+interface DocsToolDef {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  requiredVerb: "read";
+  execute: (params: Record<string, unknown>) => Promise<unknown>;
+  resultContent: (result: unknown) => { type: "text"; text: string }[];
+}
 
 export const DOCS_ORIGIN = "https://parachute.computer";
 const TTL_MS = 60 * 60 * 1000;
@@ -476,7 +486,7 @@ function rank(pages: IndexPage[], query: string, limit = 5): IndexPage[] {
     .map((x) => x.p);
 }
 
-export function buildDocsTool(opts: DocsToolOpts = {}): McpToolDef {
+export function buildDocsTool(opts: DocsToolOpts = {}): DocsToolDef {
   const origin = trimOrigin(opts.origin ?? DOCS_ORIGIN);
   const get = opts.fetch ?? fetch;
   const now = opts.now ?? Date.now;
