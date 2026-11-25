@@ -23,7 +23,9 @@ import { internalRefusal, refusalOfError, refusalResult, unknownToolRefusal, typ
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { generateScopedMcpTools, getServerInstruction } from "./mcp-tools.ts";
+import { generateScopedMcpTools, getServerInstruction, scopedProjection } from "./mcp-tools.ts";
+import { handleModernMcp, isLegacyRequest } from "./mcp-modern.ts";
+import { vaultSkillSource } from "./mcp-skills.ts";
 import type { AuthResult } from "./auth.ts";
 import type { McpToolDef } from "../core/src/mcp.ts";
 import { mcpToolErrorLine } from "../core/src/mcp-error-log.ts";
@@ -75,14 +77,32 @@ export async function handleScopedMcp(
   // markdown brief is filtered by `scoped_tags` — symmetric with the
   // JSON `vault-info` wrapper.
   const instruction = await getServerInstruction(vaultName, auth);
-  return handleMcp(
-    req,
-    () => generateScopedMcpTools(vaultName, auth, callerBearer ?? null, req),
-    `parachute-vault/${vaultName}`,
-    vaultName,
-    auth,
-    instruction,
-  );
+  const getTools = () => generateScopedMcpTools(vaultName, auth, callerBearer ?? null, req);
+  const serverName = `parachute-vault/${vaultName}`;
+  // T-476: a 2026-07-28 request (per-request `_meta` envelope) goes to the SDK v2 door, which adds skills.
+  // Everything else is the 2025 door below, unchanged. The body is parsed once here and handed to both the check and
+  // the door; given a parsed body the check applies no size cap of its own, so a large 2025 request stays 2025.
+  const parsedBody = await jsonBody(req);
+  if (!(await isLegacyRequest(req, parsedBody))) {
+    const tools = toolSurface(getTools, vaultName, auth);
+    const skills = vaultSkillSource({
+      vaultName,
+      projection: () => scopedProjection(vaultName, auth),
+      queryRecords: tools.byName("query-records"),
+    });
+    return handleModernMcp(req, { serverName, instruction, tools, skills }, parsedBody);
+  }
+  return handleMcp(req, getTools, serverName, vaultName, auth, instruction, parsedBody);
+}
+
+/** A POST's JSON body, read from a clone; undefined for anything else (the transports then answer it themselves). */
+async function jsonBody(req: Request): Promise<unknown> {
+  if (req.method !== "POST") return undefined;
+  try {
+    return await req.clone().json();
+  } catch {
+    return undefined;
+  }
 }
 
 /** Exported for direct testing (vault#555 fix 6) — lets a test inject a
@@ -95,6 +115,7 @@ export async function handleMcp(
   vaultName: string,
   auth: AuthResult,
   instruction: string,
+  parsedBody?: unknown,
 ): Promise<Response> {
   const transport = new WebStandardStreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
@@ -109,6 +130,28 @@ export async function handleMcp(
     },
   );
 
+  const tools = toolSurface(getTools, vaultName, auth);
+  server.setRequestHandler(ListToolsRequestSchema, async (request) => ({ tools: tools.list(request.params?._meta) }));
+  server.setRequestHandler(CallToolRequestSchema, (request) => tools.call(request));
+
+  await server.connect(transport);
+  return transport.handleRequest(req, parsedBody === undefined ? undefined : { parsedBody });
+}
+
+/**
+ * The vault's tools for one request: what `tools/list` shows this key and how `tools/call` runs one. Both MCP eras
+ * serve these same handlers (T-476): the 2025 path above and the 2026-07-28 path in mcp-modern.ts.
+ */
+export function toolSurface(
+  getTools: () => McpToolDef[],
+  vaultName: string,
+  auth: AuthResult,
+): {
+  list: (meta?: unknown) => Array<{ name: string; description: string; inputSchema: Record<string, unknown>; annotations: ReturnType<typeof toolAnnotations> }>;
+  call: (request: { params: { name: string; arguments?: Record<string, unknown> } }) => Promise<any>;
+  /** The tools this key can see, by name (mcp-skills.ts reads skill records through query-records). */
+  byName: (name: string) => McpToolDef | undefined;
+} {
   const mcpTools = getTools();
 
   // Filter the advertised tool list to what the caller's scopes actually
@@ -126,38 +169,38 @@ export async function handleMcp(
   // can't set the vault-wide description, so for the hints it counts as a writer.
   const tagScoped = (auth.scoped_tags?.length ?? 0) > 0;
   const level = hasScopeForVault(auth.scopes, vaultName, "admin") && !tagScoped ? "admin" : hasScopeForVault(auth.scopes, vaultName, "write") ? "write" : "read";
-  server.setRequestHandler(ListToolsRequestSchema, async (request) => ({
-    tools: visibleTools.map((t) => ({
-      name: t.name,
-      description: t.description,
-      // T-476: a file argument is marked `x-mcp-file` only for a client that declared the file-transfer extension.
-      inputSchema: schemaForClient(t.inputSchema, declaresFilesExtension(request.params?._meta)),
-      annotations: toolAnnotations(t.name, level), // T-456: a client can tell a read from a change (mcp-annotations.ts)
-    })),
-  }));
-
-  // One way to refuse (core/src/mcp-refusal.ts): every refusal is an `isError` result with `structuredContent
-  // {error_type, message, ...}`, never a JSON-RPC error. A record tool's is said in its own words (T-407).
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    const { name, arguments: args } = request.params;
-    // Dispatch against the FILTERED tool list: a tool the caller can't see in `tools/list` can't be called either
-    // (vault#376), and the refusal is the same as for a tool that doesn't exist, so nothing leaks.
-    const tool = visibleTools.find((t) => t.name === name);
-    if (!tool) return refusalResult(unknownToolRefusal(name));
-    try {
-      // `resultContent`, when a tool defines it, decides the content blocks (read-attachment's image, the note
-      // aliases' nudge); mcpCallResult adds `structuredContent` where a client needs it (T-456), and answers a refusal
-      // a tool said as data (`{error, error_type}`) as a refusal.
-      return mcpCallResult(tool, await tool.execute((args ?? {}) as Record<string, unknown>));
-    } catch (err) {
-      const r = refusalOfError(err);
-      if (r) return refusalResult(NOTE_TOOL_NAMES[name] ? recordRefusal(r) : r);
-      // Nobody tagged this error, so it is a crash, not a refusal (audit L6-02): one server-log line, no arguments.
-      console.error(mcpToolErrorLine(name, err, pkg.version));
-      return refusalResult(internalRefusal(err));
-    }
-  });
-
-  await server.connect(transport);
-  return transport.handleRequest(req);
+  return {
+    // `meta`: the request's `_meta` (T-476: a file argument is marked `x-mcp-file` only for a client that declared the
+    // file-transfer extension).
+    list: (meta?: unknown) =>
+      visibleTools.map((t) => ({
+        name: t.name,
+        description: t.description,
+        inputSchema: schemaForClient(t.inputSchema, declaresFilesExtension(meta)),
+        annotations: toolAnnotations(t.name, level), // T-456: a client can tell a read from a change (mcp-annotations.ts)
+      })),
+    // One way to refuse (core/src/mcp-refusal.ts): every refusal is an `isError` result with `structuredContent
+    // {error_type, message, ...}`, never a JSON-RPC error, on both eras' doors. A record tool's is said in its own
+    // words (T-407).
+    call: async (request) => {
+      const { name, arguments: args } = request.params;
+      // Dispatch against the FILTERED tool list: a tool the caller can't see in `tools/list` can't be called either
+      // (vault#376), and the refusal is the same as for a tool that doesn't exist, so nothing leaks.
+      const tool = visibleTools.find((t) => t.name === name);
+      if (!tool) return refusalResult(unknownToolRefusal(name));
+      try {
+        // `resultContent`, when a tool defines it, decides the content blocks (read-attachment's image, the note
+        // aliases' nudge); mcpCallResult adds `structuredContent` where a client needs it (T-456), and answers a
+        // refusal a tool said as data (`{error, error_type}`) as a refusal.
+        return mcpCallResult(tool, await tool.execute((args ?? {}) as Record<string, unknown>));
+      } catch (err) {
+        const r = refusalOfError(err);
+        if (r) return refusalResult(NOTE_TOOL_NAMES[name] ? recordRefusal(r) : r);
+        // Nobody tagged this error, so it is a crash, not a refusal (audit L6-02): one server-log line, no arguments.
+        console.error(mcpToolErrorLine(name, err, pkg.version));
+        return refusalResult(internalRefusal(err));
+      }
+    },
+    byName: (name) => visibleTools.find((t) => t.name === name),
+  };
 }
