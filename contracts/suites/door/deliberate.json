@@ -340,50 +340,6 @@
       "why": "On a box one key can cover several vaults, each at its own level (`POST /account/keys {name, vaults: {<vault>: \"read\"|\"write\"}}`), and the account door (`/account/mcp`) serves the record tools plus `list-vaults` with it: `vault` named on every write, each vault reached at that key's level there. A cloud-style door's account door doesn't take such a key yet; an app that needs several vaults there holds one key per vault. The same entry gates the account door's tool hints check (annotations.test.ts): it reaches `/account/mcp` with the account credential, which a cloud-style account door refuses (it takes an OAuth connection with `account:<id>:vaults`); parachute-cloud holds its own account door's hints (workers/identity/test/account-door-hints.test.ts, account-mcp.test.ts)."
     },
     {
-      "id": "skill-guard",
-      "keys": [
-        "has/skill-guard",
-        "skills/*"
-      ],
-      "between": [
-        "box",
-        "cloud",
-        "personal"
-      ],
-      "releases": [
-        "0.9.1"
-      ],
-      "lacks": [
-        "cloud",
-        "personal"
-      ],
-      "status": "drift",
-      "owner": "parachute-cloud door/0.9 (T-476): take the engine pin that carries core skills.ts and pass `maySkills` (admin) to generateMcpTools and enforceStrictWrite",
-      "why": "Only an admin key adds or changes a skill (a record of type `skill`, instructions every connected AI may follow). The rule is in the engine's pre-write gate, fail closed: a door that doesn't say who may write skills refuses everyone. A cloud-style door on an older engine pin has no rule yet."
-    },
-    {
-      "id": "skills-extension",
-      "keys": [
-        "has/skills-extension",
-        "skills/ext.*"
-      ],
-      "between": [
-        "box",
-        "cloud",
-        "personal"
-      ],
-      "releases": [
-        "0.9.1"
-      ],
-      "lacks": [
-        "cloud",
-        "personal"
-      ],
-      "status": "drift",
-      "owner": "parachute-cloud door/0.9 (T-476): skills/list, skills/get, resources/list and resources/read on its 2026-07-28 handler, from core skill-files.ts",
-      "why": "On a 2026-07-28 connection a box serves the MCP Skills extension: vault-guide, live-page and the vault's own skill records. Cloud's door speaks 2026-07-28 (its own handler) but has no skills methods yet. Every door's instructions still name the vault's skills, and query-records reads them, so a client reaches them either way."
-    },
-    {
       "id": "share-a-vault",
       "keys": [
         "has/share-a-vault"
