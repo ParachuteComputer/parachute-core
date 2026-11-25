@@ -155,9 +155,9 @@ interface McpToolExecutor {
  * `hint`) as duck-typed extra properties — the same pattern `QueryError`
  * uses for its optional structured fields. For validation leaves that don't
  * warrant a dedicated exported class (one caller-facing shape, not a reusable
- * domain error), this is what lets the generic domain-error mapping in
- * `src/mcp-http.ts` surface `data.error_type` instead of falling through to
- * the unstructured `isError: true` text fallback (vault#554).
+ * domain error), this is what lets the door's refusal mapping
+ * (`core/src/mcp-refusal.ts`) answer an `isError` refusal with its `error_type`
+ * and fields instead of an `internal_error` (vault#554, T-476).
  */
 function structuredError(
   message: string,
@@ -2865,10 +2865,22 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
         // (not throws) `{error: "tag_referenced_as_parent", ...}` when
         // refused — same in-band shape delete-tag has always used for its
         // token-reference guard (applyTagDependencyGuards, src/mcp-tools.ts).
-        return await store.deleteTag(tag, {
+        const out = await store.deleteTag(tag, {
           cascade: params.cascade === true,
           detach: params.detach === true,
         });
+        // The refusal in words (T-476: the door answers it as an isError refusal, whose `message` a person reads), as
+        // REST's 409 says it.
+        if (out && typeof out === "object" && (out as { error?: unknown }).error === "tag_referenced_as_parent") {
+          // no count in the words: a tag-scoped caller's copy has the names it can't see taken out (mcp-tools.ts)
+          return {
+            ...out,
+            error_type: "tag_referenced_as_parent",
+            tag,
+            message: `Tag "${tag}" is named in other tags' parent_names; pass cascade: true or detach: true to also remove the reference, or update the referencing tag(s) first.`,
+          };
+        }
+        return out;
       },
     },
 

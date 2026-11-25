@@ -14,6 +14,7 @@
  * highest-verb order; only if every covered vault is down do we degrade
  * to hub-native only.
  */
+import { plainMessage } from "./mcp-refusal.ts";
 import { COMPOSED_VERB_RANK, type ComposedVaultVerb } from "@openparachute/door-contract";
 import type { AccountVaultMeta } from "./account-api.ts";
 import {
@@ -180,7 +181,7 @@ async function parseJsonRpcResult(res: Response, vaultName: string): Promise<unk
     }
     throw new AccountToolError("vault_error", detail, { status: res.status, vault: vaultName });
   }
-  let parsed: { result?: unknown; error?: { message?: unknown; code?: unknown } };
+  let parsed: { result?: unknown; error?: { message?: unknown; code?: unknown; data?: unknown } };
   const trimmed = text.trim();
   if (trimmed.startsWith("event:") || trimmed.includes("\ndata:")) {
     const dataLines = [...text.matchAll(/^data:\s*(.*)$/gm)].map((m) => m[1] ?? "");
@@ -193,7 +194,15 @@ async function parseJsonRpcResult(res: Response, vaultName: string): Promise<unk
     parsed = JSON.parse(text) as typeof parsed;
   }
   if (parsed.error) {
-    const msg = typeof parsed.error.message === "string" ? parsed.error.message : "vault MCP error";
+    // A vault from before one way to refuse (T-476) said a tool's refusal as a JSON-RPC error: its own error_type and
+    // fields are kept (not turned into vault_error). A new vault's refusal is an isError result, passed through as the
+    // vault said it.
+    const msg = typeof parsed.error.message === "string" ? plainMessage(parsed.error.message) : "vault MCP error";
+    const data = parsed.error.data && typeof parsed.error.data === "object" ? (parsed.error.data as Record<string, unknown>) : null;
+    if (data && typeof data.error_type === "string") {
+      const { error_type, ...rest } = data;
+      throw new AccountToolError(error_type, msg, { ...rest, vault: vaultName });
+    }
     throw new AccountToolError("vault_error", msg, {
       vault: vaultName,
       ...(parsed.error.code !== undefined ? { code: parsed.error.code } : {}),
@@ -366,8 +375,11 @@ function notesFromMcpResult(result: unknown): unknown {
   if (!result || typeof result !== "object") {
     throw new Error("vault MCP result was not an object");
   }
-  const rec = result as { isError?: unknown; content?: Array<{ type?: unknown; text?: unknown }> };
+  const rec = result as { isError?: unknown; structuredContent?: { message?: unknown; error_type?: unknown }; content?: Array<{ type?: unknown; text?: unknown }> };
   if (rec.isError === true) {
+    // a vault's refusal (T-476): its words, and its error_type beside them in the fan-out's row
+    const sc = rec.structuredContent;
+    if (sc && typeof sc.message === "string") throw Object.assign(new Error(sc.message), { error_type: typeof sc.error_type === "string" ? sc.error_type : undefined });
     const text = rec.content?.find((c) => c.type === "text")?.text;
     throw new Error(typeof text === "string" ? text : "query failed");
   }
@@ -382,7 +394,7 @@ async function queryOneVaultMcp(
   args: Record<string, unknown>,
   tool: string,
 ): Promise<
-  { vault: string; notes?: unknown; records?: unknown } | { vault: string; error: string }
+  { vault: string; notes?: unknown; records?: unknown } | { vault: string; error: string; error_type?: string }
 > {
   try {
     const result = await postVaultMcp(ctx, vault, "read", "tools/call", {
@@ -395,9 +407,12 @@ async function queryOneVaultMcp(
       [tool === "query-records" ? "records" : "notes"]: notesFromMcpResult(result),
     };
   } catch (err) {
+    // a vault's refusal (notesFromMcpResult) carries error_type; the hub's own and an older vault's are AccountToolErrors
+    const type = err instanceof AccountToolError ? err.errorType : (err as { error_type?: unknown })?.error_type;
     return {
       vault: vault.name,
       error: err instanceof Error ? err.message : "query failed",
+      ...(typeof type === "string" ? { error_type: type } : {}),
     };
   }
 }
@@ -408,7 +423,7 @@ async function queryNotesOverlay(
   tool = "query-notes",
 ): Promise<{
   vaults_queried: string[];
-  results: Array<{ vault: string; notes?: unknown; records?: unknown; error?: string }>;
+  results: Array<{ vault: string; notes?: unknown; records?: unknown; error?: string; error_type?: string }>;
 }> {
   const coverage = resolveCoverage(ctx.db, ctx.principal, installedVaults(ctx));
   let targets = coverage.vaults;

@@ -70,9 +70,11 @@ async function callTool(vaultName: string, name: string, args: Record<string, un
   });
   const res = await handleScopedMcp(req, vaultName, mcpAuth(["vault:read", "vault:write"]));
   const body = (await res.json()) as any;
-  if (body.error) {
-    const err = new Error(body.error.message);
-    Object.assign(err, body.error.data ?? {});
+  expect(body.error).toBeUndefined();
+  // a refusal is an isError result with structuredContent {error_type, message, ...fields}
+  if (body.result.isError) {
+    const err = new Error(body.result.structuredContent.message);
+    Object.assign(err, body.result.structuredContent);
     throw err;
   }
   return JSON.parse(body.result.content[0].text);

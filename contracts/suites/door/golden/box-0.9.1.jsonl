@@ -66,12 +66,12 @@
 {"key":"exit/file.vault.yaml.keys","value":["export_format_version","exported_at","name"]}
 {"key":"exit/http.headers","value":{"disposition":"attachment; filename=\"vault-<v>-<time>.tar\"","type":"application/x-tar"}}
 {"key":"files/add-attachment.annotations","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
-{"key":"files/add-attachment.refusal.digest","value":{"code":-32602,"field":"file.digest","type":"digest_mismatch"}}
-{"key":"files/add-attachment.refusal.no-record","value":{"code":-32602,"field":"record","type":"not_found"}}
-{"key":"files/add-attachment.refusal.size","value":{"code":-32602,"field":"file.size","type":"size_mismatch"}}
-{"key":"files/add-attachment.refusal.too-large","value":{"code":-32602,"field":"file.size","type":"inline_too_large"}}
+{"key":"files/add-attachment.refusal.digest","value":{"field":"file.digest","isError":true,"type":"digest_mismatch"}}
+{"key":"files/add-attachment.refusal.no-record","value":{"field":"record","isError":true,"type":"not_found"}}
+{"key":"files/add-attachment.refusal.size","value":{"field":"file.size","isError":true,"type":"size_mismatch"}}
+{"key":"files/add-attachment.refusal.too-large","value":{"field":"file.size","isError":true,"type":"inline_too_large"}}
 {"key":"files/add-attachment.result.shape","value":{"attachment":{"id":"string","mime_type":"string","path":"string","size":"number"},"record":"string"}}
-{"key":"files/add-attachment.schema","value":{"properties":{"file":{"properties":{"data":{"type":"string"},"digest":{"properties":{"algorithm":{"const":"sha-256"},"value":{"description":"base64url or hex","type":"string"}},"required":["algorithm","value"],"type":"object"},"id":{"type":"string"},"mimeType":{"type":"string"},"name":{"type":"string"},"size":{"type":"integer"}},"required":["id","mimeType","size","digest"],"type":"object"},"record":{"description":"Id or path","type":"string"},"transcribe":{"type":"boolean"}},"required":["record","file"],"type":"object"}}
+{"key":"files/add-attachment.schema","value":{"properties":{"file":{"properties":{"data":{"type":"string"},"digest":{"properties":{"algorithm":{"const":"sha-256"},"value":{"description":"base64url or hex","type":"string"}},"required":["algorithm","value"],"type":"object"},"id":{"type":"string"},"mimeType":{"type":"string"},"name":{"type":"string"},"size":{"type":"integer"}},"required":["id","mimeType","size","digest"],"type":"object"},"record":{"type":"string"},"transcribe":{"type":"boolean"}},"required":["record","file"],"type":"object"}}
 {"key":"files/attach.reply.shape","value":{"createdAt":"string","id":"string","mimeType":"string","noteId":"string","path":"string"}}
 {"key":"files/attachments.list.shape","value":[{"createdAt":"string","id":"string","mimeType":"string","noteId":"string","path":"string"}]}
 {"key":"files/detach.reply","value":{"shape":"null","status":204}}
@@ -136,8 +136,8 @@
 {"key":"mcp/admin.tool-count","value":26}
 {"key":"mcp/admin.tool.add-attachment.hints","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/admin.tool.add-attachment.present","value":true}
-{"key":"mcp/admin.tool.add-attachment.schema","value":"87c472435e828ac5"}
-{"key":"mcp/admin.tool.add-attachment.words","value":"6ff3e5d46ced172a"}
+{"key":"mcp/admin.tool.add-attachment.schema","value":"57a4ad1fb87584f3"}
+{"key":"mcp/admin.tool.add-attachment.words","value":"832ff10c4e0d1dd7"}
 {"key":"mcp/admin.tool.attachment-url.hints","value":{"destructiveHint":false,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/admin.tool.attachment-url.present","value":true}
 {"key":"mcp/admin.tool.attachment-url.schema","value":"1f4b89515c1f6f99"}
@@ -205,7 +205,7 @@
 {"key":"mcp/admin.tool.query-records.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/admin.tool.query-records.present","value":true}
 {"key":"mcp/admin.tool.query-records.schema","value":"3c2863cbe1b9829b"}
-{"key":"mcp/admin.tool.query-records.words","value":"f59318f3e5ee4cbe"}
+{"key":"mcp/admin.tool.query-records.words","value":"05f66bc445341069"}
 {"key":"mcp/admin.tool.read-attachment.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/admin.tool.read-attachment.present","value":true}
 {"key":"mcp/admin.tool.read-attachment.schema","value":"d8a9d97eaf912aa4"}
@@ -262,7 +262,7 @@
 {"key":"mcp/protected-resource.keys","value":["authorization_servers","bearer_methods_supported","resource","scopes_supported"]}
 {"key":"mcp/protected-resource.resource","value":"string"}
 {"key":"mcp/protected-resource.scopes_supported","value":["string"]}
-{"key":"mcp/query-notes.no-such-note","value":{"isError":false,"shape":{"error":"string","error_type":"string","id":"string"}}}
+{"key":"mcp/query-notes.no-such-note","value":{"isError":true,"keys":["error_type","id","message"],"type":"not_found"}}
 {"key":"mcp/query-notes.result.shape","value":[{"byteSize":"number","createdAt":"string","createdBy":"string","createdVia":"string","displayTitle":"string","extension":"string","id":"string","lastUpdatedBy":"string","lastUpdatedVia":"string","metadata":{"n":"number"},"path":"string","preview":"string","score":"number","tags":["string"],"types":[],"updatedAt":"string"}]}
 {"key":"mcp/reach.admin","value":"This connection can read the whole vault, create, change and delete its records, and manage its types, settings and keys."}
 {"key":"mcp/reach.read","value":"This connection can read the whole vault. It can't change anything."}
@@ -299,7 +299,7 @@
 {"key":"mcp/read.tool.query-records.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/read.tool.query-records.present","value":true}
 {"key":"mcp/read.tool.query-records.schema","value":"3c2863cbe1b9829b"}
-{"key":"mcp/read.tool.query-records.words","value":"f59318f3e5ee4cbe"}
+{"key":"mcp/read.tool.query-records.words","value":"05f66bc445341069"}
 {"key":"mcp/read.tool.read-attachment.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/read.tool.read-attachment.present","value":true}
 {"key":"mcp/read.tool.read-attachment.schema","value":"d8a9d97eaf912aa4"}
@@ -312,9 +312,10 @@
 {"key":"mcp/read.tool.vault-info.present","value":true}
 {"key":"mcp/read.tool.vault-info.schema","value":"530ff43b9f863786"}
 {"key":"mcp/read.tool.vault-info.words","value":"dee3e40876423132"}
-{"key":"mcp/refusal.blind-update","value":{"code":-32602,"hint":"4173c86cffc0aa4a","keys":["error_type","hint","note_id","path"],"type":"precondition_required"}}
-{"key":"mcp/refusal.message-names-its-type","value":true}
-{"key":"mcp/refusal.path-taken","value":{"code":-32600,"keys":["error_type","path"],"type":"path_conflict"}}
+{"key":"mcp/refusal.blind-update","value":{"hint":"4173c86cffc0aa4a","isError":true,"keys":["error_type","hint","message","note_id","path"],"type":"precondition_required"}}
+{"key":"mcp/refusal.message-is-plain","value":true}
+{"key":"mcp/refusal.path-taken","value":{"isError":true,"keys":["error_type","message","path"],"type":"path_conflict"}}
+{"key":"mcp/refusal.unknown-tool","value":{"isError":true,"keys":["error_type","message","tool"],"type":"unknown_tool"}}
 {"key":"mcp/root.cold","value":{"challenge":"Bearer resource_metadata=\"…\"","status":401}}
 {"key":"mcp/root.connect","value":"connected"}
 {"key":"mcp/root.same-tools-as-the-vault","value":true}
@@ -332,8 +333,8 @@
 {"key":"mcp/write.tool-count","value":19}
 {"key":"mcp/write.tool.add-attachment.hints","value":{"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/write.tool.add-attachment.present","value":true}
-{"key":"mcp/write.tool.add-attachment.schema","value":"87c472435e828ac5"}
-{"key":"mcp/write.tool.add-attachment.words","value":"6ff3e5d46ced172a"}
+{"key":"mcp/write.tool.add-attachment.schema","value":"57a4ad1fb87584f3"}
+{"key":"mcp/write.tool.add-attachment.words","value":"832ff10c4e0d1dd7"}
 {"key":"mcp/write.tool.attachment-url.hints","value":{"destructiveHint":false,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false}}
 {"key":"mcp/write.tool.attachment-url.present","value":true}
 {"key":"mcp/write.tool.attachment-url.schema","value":"1f4b89515c1f6f99"}
@@ -381,7 +382,7 @@
 {"key":"mcp/write.tool.query-records.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/write.tool.query-records.present","value":true}
 {"key":"mcp/write.tool.query-records.schema","value":"3c2863cbe1b9829b"}
-{"key":"mcp/write.tool.query-records.words","value":"f59318f3e5ee4cbe"}
+{"key":"mcp/write.tool.query-records.words","value":"05f66bc445341069"}
 {"key":"mcp/write.tool.read-attachment.hints","value":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true}}
 {"key":"mcp/write.tool.read-attachment.present","value":true}
 {"key":"mcp/write.tool.read-attachment.schema","value":"d8a9d97eaf912aa4"}
@@ -415,7 +416,7 @@
 {"key":"records/mcp.create-record.shape","value":{"body":"string","createdAt":"string","createdBy":"string","createdVia":"string","extension":"string","fields":{"content":"string","door_trip_miles":"number"},"id":"string","lastUpdatedBy":"string","lastUpdatedVia":"string","path":"string","tags":["string"],"types":["string"],"updatedAt":"string","validation_status":{"schemas":["string"],"warnings":[]}}}
 {"key":"records/mcp.list-types.shape","value":{"count":"number","created_at":"string","description":"null","expanded_count":"number","fields":{"door_trip_miles":{"indexed":"boolean","type":"string"}},"kind":"string","name":"string","parent_names":"null","relationships":"null","updated_at":"string"}}
 {"key":"records/mcp.manage-types","value":{"created_at":"string","fields":{"door_trip_miles":{"indexed":"boolean","type":"string"}},"kind":"string","tag":"string","updated_at":"string"}}
-{"key":"records/mcp.old-word-beside-new","value":{"code":-32602,"refused":true,"type":"invalid_query"}}
+{"key":"records/mcp.old-word-beside-new","value":{"refused":true,"type":"invalid_query"}}
 {"key":"records/mcp.order","value":["query-records","create-record","update-record","delete-record","list-types","vault-info","doctor","read-attachment","add-attachment","attachment-url","manage-types","query-notes","create-note","update-note","delete-note","list-tags","find-path","update-tag","rename-tag","merge-tags","delete-tag","prune-schema","request-attachment-upload","request-attachment-download"]}
 {"key":"records/mcp.query-records.shape","value":{"body":"string","createdAt":"string","createdBy":"string","createdVia":"string","extension":"string","fields":{"content":"string","door_trip_miles":"number"},"id":"string","lastUpdatedBy":"string","lastUpdatedVia":"string","path":"string","tags":["string"],"types":["string"],"updatedAt":"string","validation_status":{"schemas":["string"],"warnings":[]}}}
 {"key":"records/rest.create.shape","value":{"body":"string","createdAt":"string","createdBy":"string","createdVia":"string","extension":"string","fields":{"city":"string"},"id":"string","lastUpdatedBy":"string","lastUpdatedVia":"string","path":"string","tags":["string"],"types":["string"],"updatedAt":"string","validation_status":{"schemas":["string"],"warnings":[]},"warnings":"undefined"}}
@@ -424,6 +425,16 @@
 {"key":"records/rest.note-alias.says-leaving","value":{"body":false,"deprecation":"true"}}
 {"key":"records/rest.refusal.old-word-beside-new","value":{"error":"(text)","hint":"ba5bd279831f54a9","keys":["error","error_type","field","hint"],"status":400,"type":"invalid_query"}}
 {"key":"records/rest.type-in-tags","value":{"hint":"b594715fe960c66d","status":422,"type":"tag_kind"}}
+{"key":"refusals/above-level","value":{"keys":["error_type","message","tool"],"type":"unknown_tool"}}
+{"key":"refusals/account.fan-out-row","value":["error","error_type","vault"]}
+{"key":"refusals/account.unknown-tool","value":{"keys":["error_type","message","tool"],"type":"unknown_tool"}}
+{"key":"refusals/blind-write","value":{"keys":["error_type","hint","message","note_id","path"],"type":"precondition_required"}}
+{"key":"refusals/conflict","value":{"keys":["current_updated_at","error_type","hint","message","path","record_id","your_updated_at"],"type":"conflict"}}
+{"key":"refusals/missing-note","value":{"keys":["error_type","id","message"],"type":"not_found"}}
+{"key":"refusals/missing-record","value":{"keys":["error_type","id","message"],"type":"not_found"}}
+{"key":"refusals/path-taken","value":{"keys":["error_type","message","path"],"type":"path_conflict"}}
+{"key":"refusals/unknown-parameter","value":{"keys":["error_type","field","hint","message"],"type":"unknown_parameter"}}
+{"key":"refusals/unknown-tool","value":{"keys":["error_type","message","tool"],"type":"unknown_tool"}}
 {"key":"rest/cors.preflight","value":{"headers":["authorization","content-type","mcp-method","mcp-name","mcp-protocol-version","mcp-session-id","x-api-key"],"methods":["delete","get","options","patch","post","put"],"origin":"*","status":204}}
 {"key":"rest/cors.reply","value":{"origin":"*"}}
 {"key":"rest/cursor.page.shape","value":{"next_cursor":"string","notes":[{"byteSize":"number","createdAt":"string","createdBy":"string","createdVia":"string","displayTitle":"string","extension":"string","id":"string","lastUpdatedBy":"string","lastUpdatedVia":"string","metadata":{},"path":"string","preview":"string","tags":[],"types":[],"updatedAt":"string"}]}}

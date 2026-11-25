@@ -1737,10 +1737,15 @@ describe("scoped MCP wrapper", async () => {
     const deniedText: string = deniedBody.result.content[0].text;
     const deniedParsed = JSON.parse(deniedText);
     // Out-of-scope single-note fetch fails closed: the wrapper replaces the
-    // note body with `{ error: "Note not found" }` (no content/tags leak).
+    // note body with a not_found refusal (no content/tags leak).
     // This proves the `health`-scoped green result above is the fail-open
     // string-form fallback firing, not the wrapper being a no-op.
-    expect(deniedParsed.error).toBe("Note not found");
+    expect(deniedBody.result.isError).toBe(true);
+    expect(deniedBody.result.structuredContent).toEqual(deniedParsed);
+    expect(deniedParsed.error_type).toBe("not_found");
+    expect(deniedParsed.message).toBe("Note not found");
+    expect(deniedParsed.id).toBe(orphan.id);
+    expect(deniedParsed.error).toBeUndefined();
     expect(deniedParsed.content).toBeUndefined();
     expect(deniedParsed.tags).toBeUndefined();
 
@@ -7800,6 +7805,7 @@ describe("stateless MCP transport", async () => {
     // gate allowed read-only callers through for stats.
     expect(body.result.isError).toBe(true);
     expect(body.result.content[0].text).toContain("vault:admin");
+    expect(body.result.structuredContent.error_type).toBe("insufficient_scope");
 
     // And critically: the vault description must NOT have been mutated.
     const cfg = readVaultConfig(vaultName);
@@ -7851,6 +7857,37 @@ describe("stateless MCP transport", async () => {
     // update the vault's own description. Now needs vault:admin.
     expect(body.result.isError).toBe(true);
     expect(body.result.content[0].text).toContain("vault:admin");
+    expect(body.result.structuredContent.error_type).toBe("insufficient_scope");
+    expect(readVaultConfig(vaultName)?.description).toBe("original");
+
+    closeAllStores();
+  });
+
+  test("tools/call of vault-info with description arg from a tag-scoped admin is refused as tag_scope_violation", async () => {
+    const { handleScopedMcp } = await import("./mcp-http.ts");
+    const { writeVaultConfig, readVaultConfig } = await import("./config.ts");
+    const { closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `scope-vault-info-tagadmin-${Date.now()}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString(), description: "original" });
+    const req = new Request(`http://localhost:1940/vault/${vaultName}/mcp`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "accept": "application/json, text/event-stream" },
+      body: JSON.stringify({
+        jsonrpc: "2.0", id: 1, method: "tools/call",
+        params: { name: "vault-info", arguments: { description: "updated by a tag-scoped admin" } },
+      }),
+    });
+    const res = await handleScopedMcp(req, vaultName, {
+      permission: "full",
+      scopes: ["vault:read", "vault:write", "vault:admin"],
+      legacyDerived: false,
+      scoped_tags: ["work"],
+    } as any);
+    const body = await res.json() as any;
+    expect(body.error).toBeUndefined();
+    expect(body.result.isError).toBe(true);
+    expect(body.result.structuredContent.error_type).toBe("tag_scope_violation");
     expect(readVaultConfig(vaultName)?.description).toBe("original");
 
     closeAllStores();
@@ -7905,9 +7942,9 @@ describe("stateless MCP transport", async () => {
   // (an `as string` cast), so a write/admin caller could persist a non-string
   // and poison the next `initialize` (serverInstruction's `description.trim()`
   // throws → -32603 INTERNAL, the first frame, unrepairable in-session — the
-  // bun half of cloud#87). The guard rejects non-string/non-null as a
-  // structured -32602 INVALID_PARAMS (`error_type: invalid_description`), the
-  // same shape every other MCP validation leaf takes. `null` still clears.
+  // bun half of cloud#87). The guard rejects non-string/non-null as an
+  // isError refusal (`error_type: invalid_description`, `field: description`),
+  // the same shape every other MCP refusal takes. `null` still clears.
   describe("vault-info description type guard (vault#669 / cloud#87)", () => {
     for (const [label, value] of [
       ["a number", 123],
@@ -7915,7 +7952,7 @@ describe("stateless MCP transport", async () => {
       ["an array", ["a", "b"]],
       ["a boolean", true],
     ] as const) {
-      test(`tools/call vault-info with ${label} description → -32602 invalid_description, nothing persisted`, async () => {
+      test(`tools/call vault-info with ${label} description → isError invalid_description refusal, nothing persisted`, async () => {
         const { handleScopedMcp } = await import("./mcp-http.ts");
         const { writeVaultConfig, readVaultConfig } = await import("./config.ts");
         const { closeAllStores } = await import("./vault-store.ts");
@@ -7951,12 +7988,12 @@ describe("stateless MCP transport", async () => {
 
         expect(res.status).toBe(200);
         const body = await res.json() as any;
-        // Structured JSON-RPC error (protocol-level), NOT the in-band
-        // isError text: -32602 INVALID_PARAMS carrying error_type/field.
-        expect(body.error).toBeDefined();
-        expect(body.error.code).toBe(-32602);
-        expect(body.error.data.error_type).toBe("invalid_description");
-        expect(body.error.data.field).toBe("description");
+        // A normal result with isError and structuredContent carrying
+        // error_type/field — not a JSON-RPC error.
+        expect(body.error).toBeUndefined();
+        expect(body.result.isError).toBe(true);
+        expect(body.result.structuredContent.error_type).toBe("invalid_description");
+        expect(body.result.structuredContent.field).toBe("description");
         // Nothing persisted — no poison state introduced.
         expect(readVaultConfig(vaultName)?.description).toBe("original");
 
@@ -7996,7 +8033,9 @@ describe("stateless MCP transport", async () => {
         }),
       });
       const poisonRes = await handleScopedMcp(poisonReq, vaultName, admin as any);
-      expect((await poisonRes.json() as any).error.code).toBe(-32602);
+      const poisonBody = await poisonRes.json() as any;
+      expect(poisonBody.result.isError).toBe(true);
+      expect(poisonBody.result.structuredContent.error_type).toBe("invalid_description");
 
       // initialize must still succeed — before the guard this answered
       // -32603 INTERNAL_ERROR (`description.trim is not a function`).
@@ -8675,7 +8714,7 @@ describe("manage-token MCP tool (vault#403, MGT — hub-JWT attenuation proxy)",
     const { vaultName, auth } = await setupAdminSession("mint-zero");
     const { closeAllStores } = await import("./vault-store.ts");
     const { parsed } = await callTool(vaultName, auth, "manage-token", { action: "mint", scope: "vault:read", ttl_seconds: 0 });
-    expect(parsed.error).toBe("invalid_request");
+    expect(parsed.error_type).toBe("invalid_request");
     expect(hubCalls.length).toBe(0);
     closeAllStores();
   });
@@ -8685,7 +8724,7 @@ describe("manage-token MCP tool (vault#403, MGT — hub-JWT attenuation proxy)",
     const { vaultName, auth } = await setupAdminSession("mint-over");
     const { closeAllStores } = await import("./vault-store.ts");
     const { parsed } = await callTool(vaultName, auth, "manage-token", { action: "mint", scope: "vault:read", ttl_seconds: 3601 });
-    expect(parsed.error).toBe("invalid_request");
+    expect(parsed.error_type).toBe("invalid_request");
     expect(parsed.message).toBe("manage-token mint: ttl_seconds must be in (0, 3600]; got 3601.");
     expect(hubCalls.length).toBe(0);
     closeAllStores();
@@ -8701,7 +8740,7 @@ describe("manage-token MCP tool (vault#403, MGT — hub-JWT attenuation proxy)",
       ttl_seconds: 7776001,
       long_lived: true,
     });
-    expect(parsed.error).toBe("invalid_request");
+    expect(parsed.error_type).toBe("invalid_request");
     expect(parsed.message).toContain("7776000");
     expect(hubCalls.length).toBe(0);
     closeAllStores();
@@ -8717,7 +8756,7 @@ describe("manage-token MCP tool (vault#403, MGT — hub-JWT attenuation proxy)",
       ttl_seconds: 7200,
       long_lived: false,
     });
-    expect(parsed.error).toBe("invalid_request");
+    expect(parsed.error_type).toBe("invalid_request");
     expect(hubCalls.length).toBe(0);
     closeAllStores();
   });
@@ -8731,7 +8770,7 @@ describe("manage-token MCP tool (vault#403, MGT — hub-JWT attenuation proxy)",
       scope: "vault:read",
       ttl_seconds: 7200,
     });
-    expect(parsed.error).toBe("invalid_request");
+    expect(parsed.error_type).toBe("invalid_request");
     expect(hubCalls.length).toBe(0);
     closeAllStores();
   });
@@ -8744,7 +8783,7 @@ describe("manage-token MCP tool (vault#403, MGT — hub-JWT attenuation proxy)",
       action: "mint",
       scope: "vault:other-vault:write",
     });
-    expect(parsed.error).toBe("forbidden");
+    expect(parsed.error_type).toBe("forbidden");
     expect(parsed.rejected).toBeDefined();
     expect(hubCalls.length).toBe(0);
     closeAllStores();
@@ -8757,7 +8796,7 @@ describe("manage-token MCP tool (vault#403, MGT — hub-JWT attenuation proxy)",
     // Env-var operator path: caller_jti present but the presented credential
     // is a non-JWT secret → mint must refuse with a hub-JWT-required message.
     const { parsed } = await callTool(vaultName, auth, "manage-token", { action: "mint", scope: "vault:read" }, "operator-env-secret");
-    expect(parsed.error).toBe("forbidden");
+    expect(parsed.error_type).toBe("forbidden");
     expect(parsed.message).toContain("hub-JWT session");
     expect(hubCalls.length).toBe(0);
     closeAllStores();
@@ -8907,7 +8946,7 @@ describe("manage-token MCP tool (vault#403, MGT — hub-JWT attenuation proxy)",
     auth.caller_jti = null;
     const { parsed } = await callTool(vaultName, auth, "manage-token", { action: "revoke", jti: "hub_jti_anything" });
     expect(parsed.ok).toBe(false);
-    expect(parsed.error).toBe("not_found");
+    expect(parsed.error_type).toBe("not_found");
     expect(hubCalls.filter((c) => c.url.endsWith("/api/auth/revoke-token")).length).toBe(0);
     closeAllStores();
   });

@@ -53,8 +53,8 @@ describe.skipIf(!is09)("the record door over MCP", () => {
       const t = await c.call("list-types", { name: type });
       expect(t.kind).toBe("type");
       fp("records/mcp.list-types.shape", shape(t));
-      const clash: any = await c.client.callTool({ name: "create-record", arguments: { path: `${path}-x`, body: "x", content: "y" } }).then((r: any) => r, (e) => e);
-      fp("records/mcp.old-word-beside-new", { refused: !!(clash?.code || clash?.isError), code: clash?.code ?? null, type: clash?.data?.error_type ?? null });
+      const clash: any = await c.client.callTool({ name: "create-record", arguments: { path: `${path}-x`, body: "x", content: "y" } });
+      fp("records/mcp.old-word-beside-new", { refused: clash?.isError === true, type: clash?.structuredContent?.error_type ?? null });
     } finally {
       await c.close();
     }
@@ -82,7 +82,7 @@ describe.skipIf(!is09)("the record door over MCP", () => {
         (e) => e,
       );
       expect(stale, "a write with the token read before another write is refused").not.toBeNull();
-      expect(String(stale?.data?.error_type ?? stale?.message)).toMatch(/conflict/);
+      expect(stale?.refusal?.error_type ?? stale?.data?.error_type).toBe("conflict");
       expect(one(await c.call("query-records", { id: path })).fields.status).toBe("done");
     } finally {
       await c.close();

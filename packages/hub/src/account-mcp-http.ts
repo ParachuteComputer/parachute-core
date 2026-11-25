@@ -18,6 +18,7 @@
  * Cookie sessions never open this door. Wildcard CORS is correct: nothing
  * here is ambient-auth.
  */
+import { internalRefusal, refusal, refusalResult, unknownToolRefusal } from "./mcp-refusal.ts";
 import type { Database } from "bun:sqlite";
 import { ACCOUNT_VAULTS_UNNARROWED } from "@openparachute/door-contract";
 import pkg from "../package.json" with { type: "json" };
@@ -60,7 +61,6 @@ const SUPPORTED_PROTOCOL_VERSIONS = [
 
 const PARSE_ERROR = -32700;
 const METHOD_NOT_FOUND = -32601;
-const INVALID_PARAMS = -32602;
 const INTERNAL_ERROR = -32603;
 
 type JsonRpcId = string | number | null;
@@ -312,27 +312,19 @@ async function handleToolCall(
   const name = typeof params?.name === "string" ? params.name : "";
   const args = (params?.arguments ?? {}) as Record<string, unknown>;
   const hub = toolsForPrincipal(ctx).find((t) => t.name === name);
+  // One way to refuse (./mcp-refusal.ts): every refusal is an isError result with structuredContent
+  // {error_type, message, ...}, never a JSON-RPC error; a vault's own refusal comes back as the vault said it.
   if (hub) {
     try {
       const out = await hub.execute(args, ctx);
       return result(id, { content: [{ type: "text", text: JSON.stringify(out, null, 2) }] });
     } catch (err) {
-      if (err instanceof AccountToolError) {
-        return rpcError(id, INVALID_PARAMS, err.message, {
-          error_type: err.errorType,
-          ...err.extra,
-        });
-      }
+      if (err instanceof AccountToolError) return result(id, refusalResult(refusal(err.errorType, err.message, err.extra)));
       return toolCrash(id, name, err);
     }
   }
   const vaultTools = await listVaultModuleTools(ctx);
-  if (!vaultTools.some((t) => t.name === name)) {
-    return result(id, {
-      content: [{ type: "text", text: `Unknown tool: ${name}` }],
-      isError: true,
-    });
-  }
+  if (!vaultTools.some((t) => t.name === name)) return result(id, refusalResult(unknownToolRefusal(name)));
   try {
     const out = await callVaultModuleTool(name, args, ctx);
     if (FAN_OUT_TOOLS.has(name)) {
@@ -341,9 +333,7 @@ async function handleToolCall(
     if (isMcpToolResult(out)) return result(id, out);
     return result(id, { content: [{ type: "text", text: JSON.stringify(out, null, 2) }] });
   } catch (err) {
-    if (err instanceof AccountToolError) {
-      return rpcError(id, INVALID_PARAMS, err.message, { error_type: err.errorType, ...err.extra });
-    }
+    if (err instanceof AccountToolError) return result(id, refusalResult(refusal(err.errorType, err.message, err.extra)));
     // The hub's own failure on the way to the vault (unreachable, an unreadable answer). A tool that crashes inside
     // the vault comes back as an isError result, not a throw, and the vault logs that one itself.
     return toolCrash(id, name, err);
@@ -352,12 +342,11 @@ async function handleToolCall(
 
 /**
  * A tool call that threw something other than a refusal (`AccountToolError`): log one line server-side, the same
- * shape the vault logs, never the arguments (audit L6-02), and answer with the in-band isError text as before.
+ * shape the vault logs, never the arguments (audit L6-02), and answer `internal_error` as an isError result.
  */
 function toolCrash(id: JsonRpcId, name: string, err: unknown): JsonRpcMessage {
   console.error(mcpToolErrorLine(name, err, pkg.version));
-  const message = err instanceof Error ? err.message : "Unknown error";
-  return result(id, { content: [{ type: "text", text: `Error: ${message}` }], isError: true });
+  return result(id, refusalResult(internalRefusal(err)));
 }
 
 async function listedTools(

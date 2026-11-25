@@ -280,7 +280,7 @@ export const RECORD_DESCRIPTIONS: Readonly<Record<string, string>> = {
   "query-records": `Read records: one record, a filtered list, a search, a link neighbourhood or path, counts, or a record's history.
 - One record: \`id\` (id, path or title). Lists leave the ${BODY} out unless \`include_${BODY}: true\`.
 - Filters combine (AND). \`type\` matches a type and its subtypes (\`event\` finds \`event/meeting\`); \`tag\` matches a label. \`${FIELDS}\` operators work on any field: an indexed one (vault-info lists them) is fastest, any other is read in full and the reply warns \`scan\`.
-- Records carry \`id\`, \`path\` (last part = name; no \`title\`) and \`updatedAt\`. Replies: a record (or \`{error, error_type}\`), an array, \`{records, next_cursor?, warnings?}\`, or \`[{group, value}]\` for \`aggregate\`.
+- Records carry \`id\`, \`path\` (last part = name; no \`title\`) and \`updatedAt\`. Replies: a record (a missing one is refused), an array, \`{records, next_cursor?, warnings?}\`, or \`[{group, value}]\` for \`aggregate\`.
 - ${HYBRID_TEXT.line}
 Rarer filters (has_links, order_by, …) work too. ${HELP("query-records")}`,
   "create-record": `Create a record, or several with \`records: [...]\`. \`types\` names its types (existing types or new names); \`tags\` adds labels. If \`path\` is taken, \`if_exists\` decides: error (default), ignore, update (merge into it) or replace. ${HELP("create-record")} If no existing type fits what the record is, name a new type for it rather than using the nearest one.`,

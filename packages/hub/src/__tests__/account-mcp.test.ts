@@ -805,6 +805,7 @@ describe("account MCP — create-vault", () => {
       };
       expect(body.result?.isError).toBe(true);
       expect(body.result?.content?.[0]?.text).toMatch(/Unknown tool: create-vault/);
+      expect((body.result as { structuredContent?: { error_type?: string } } | undefined)?.structuredContent?.error_type).toBe("unknown_tool");
     } finally {
       h.cleanup();
     }
@@ -849,8 +850,8 @@ describe("account MCP — create-vault", () => {
         bearerReq(token, rpc("tools/call", { name: "create-vault", arguments: { name: "work" } })),
         mcpDeps(h),
       );
-      const body = (await res.json()) as { error?: { data?: { error_type?: string } } };
-      expect(body.error?.data?.error_type).toBe("vault_taken");
+      const body = (await res.json()) as { result?: { isError?: boolean; structuredContent?: { error_type?: string } } };
+      expect(body.result?.structuredContent?.error_type).toBe("vault_taken");
     } finally {
       h.cleanup();
     }
@@ -938,8 +939,8 @@ describe("account MCP — query-notes", () => {
         ),
         mcpDeps(h),
       );
-      const body = (await res.json()) as { error?: { data?: { error_type?: string } } };
-      expect(body.error?.data?.error_type).toBe("vault_not_covered");
+      const body = (await res.json()) as { result?: { isError?: boolean; structuredContent?: { error_type?: string } } };
+      expect(body.result?.structuredContent?.error_type).toBe("vault_not_covered");
     } finally {
       h.cleanup();
     }
@@ -1154,6 +1155,7 @@ describe("account MCP — create-note", () => {
       };
       expect(body.result?.isError).toBe(true);
       expect(body.result?.content?.[0]?.text).toMatch(/Unknown tool: create-note/);
+      expect((body.result as { structuredContent?: { error_type?: string } } | undefined)?.structuredContent?.error_type).toBe("unknown_tool");
       expect(methods).toEqual(["tools/list"]);
     } finally {
       h.cleanup();
@@ -1182,6 +1184,7 @@ describe("account MCP — create-note", () => {
       };
       expect(body.result?.isError).toBe(true);
       expect(body.result?.content?.[0]?.text).toMatch(/Unknown tool: create-note/);
+      expect((body.result as { structuredContent?: { error_type?: string } } | undefined)?.structuredContent?.error_type).toBe("unknown_tool");
       expect(methods).toEqual(["tools/list"]);
     } finally {
       h.cleanup();
@@ -1210,6 +1213,7 @@ describe("account MCP — create-note", () => {
       };
       expect(body.result?.isError).toBe(true);
       expect(body.result?.content?.[0]?.text).toMatch(/Unknown tool: create-note/);
+      expect((body.result as { structuredContent?: { error_type?: string } } | undefined)?.structuredContent?.error_type).toBe("unknown_tool");
       expect(methods).toEqual(["tools/list"]);
     } finally {
       h.cleanup();
@@ -1260,8 +1264,8 @@ describe("account MCP — create-note", () => {
         ),
         mcpDeps(h),
       );
-      const body = (await res.json()) as { error?: { data?: { error_type?: string } } };
-      expect(body.error?.data?.error_type).toBe("vault_not_covered");
+      const body = (await res.json()) as { result?: { isError?: boolean; structuredContent?: { error_type?: string } } };
+      expect(body.result?.structuredContent?.error_type).toBe("vault_not_covered");
     } finally {
       h.cleanup();
     }
@@ -1411,6 +1415,7 @@ describe("account MCP — update-note", () => {
       };
       expect(body.result?.isError).toBe(true);
       expect(body.result?.content?.[0]?.text).toMatch(/Unknown tool: update-note/);
+      expect((body.result as { structuredContent?: { error_type?: string } } | undefined)?.structuredContent?.error_type).toBe("unknown_tool");
       expect(methods).toEqual(["tools/list"]);
     } finally {
       h.cleanup();
@@ -1442,6 +1447,7 @@ describe("account MCP — update-note", () => {
       };
       expect(body.result?.isError).toBe(true);
       expect(body.result?.content?.[0]?.text).toMatch(/Unknown tool: update-note/);
+      expect((body.result as { structuredContent?: { error_type?: string } } | undefined)?.structuredContent?.error_type).toBe("unknown_tool");
       expect(methods).toEqual(["tools/list"]);
     } finally {
       h.cleanup();
@@ -1492,8 +1498,8 @@ describe("account MCP — update-note", () => {
         ),
         mcpDeps(h),
       );
-      const body = (await res.json()) as { error?: { data?: { error_type?: string } } };
-      expect(body.error?.data?.error_type).toBe("vault_not_covered");
+      const body = (await res.json()) as { result?: { isError?: boolean; structuredContent?: { error_type?: string } } };
+      expect(body.result?.structuredContent?.error_type).toBe("vault_not_covered");
     } finally {
       h.cleanup();
     }
@@ -1639,6 +1645,7 @@ describe("account MCP — vault module proxy", () => {
       };
       expect(body.result?.isError).toBe(true);
       expect(body.result?.content?.[0]?.text).toMatch(/Unknown tool: query-notes/);
+      expect((body.result as { structuredContent?: { error_type?: string } } | undefined)?.structuredContent?.error_type).toBe("unknown_tool");
       expect(fetched).toBe(0);
     } finally {
       h.cleanup();
@@ -1767,8 +1774,8 @@ describe("account MCP — vault module proxy", () => {
         ),
         mcpDeps(h, { fetchImpl }),
       );
-      const refusal = (await refused.json()) as { error?: { data?: { error_type?: string } } };
-      expect(refusal.error?.data?.error_type).toBe("vault_not_covered");
+      const refusal = (await refused.json()) as { result?: { isError?: boolean; structuredContent?: { error_type?: string } } };
+      expect(refusal.result?.structuredContent?.error_type).toBe("vault_not_covered");
       expect(logged.filter((l) => l.includes("event=mcp_tool_error"))).toEqual([]);
       expect(logged.join("\n")).not.toContain(marker);
     } finally {
@@ -2170,8 +2177,8 @@ describe("account MCP — grant-access", () => {
         ),
         mcpDeps(h),
       );
-      const body = (await denied.json()) as { error?: { data?: { error_type?: string } } };
-      expect(body.error?.data?.error_type).toBe("grant_not_permitted");
+      const body = (await denied.json()) as { result?: { isError?: boolean; structuredContent?: { error_type?: string } } };
+      expect(body.result?.structuredContent?.error_type).toBe("grant_not_permitted");
     } finally {
       h.cleanup();
     }
@@ -2211,6 +2218,7 @@ describe("account MCP — grant-access", () => {
       };
       expect(body.result?.isError).toBe(true);
       expect(body.result?.content?.[0]?.text).toMatch(/Unknown tool: grant-access/);
+      expect((body.result as { structuredContent?: { error_type?: string } } | undefined)?.structuredContent?.error_type).toBe("unknown_tool");
     } finally {
       h.cleanup();
     }
@@ -2266,6 +2274,7 @@ describe("account MCP — grant-access", () => {
       };
       expect(body.result?.isError).toBe(true);
       expect(body.result?.content?.[0]?.text).toMatch(/Unknown tool: grant-access/);
+      expect((body.result as { structuredContent?: { error_type?: string } } | undefined)?.structuredContent?.error_type).toBe("unknown_tool");
 
       // Below the tool catalog, the domain function itself refuses with the
       // repo's existing error shape.
@@ -2313,8 +2322,8 @@ describe("account MCP — grant-access", () => {
         ),
         mcpDeps(h),
       );
-      const body = (await res.json()) as { error?: { data?: { error_type?: string } } };
-      expect(body.error?.data?.error_type).toBe("invalid_role");
+      const body = (await res.json()) as { result?: { isError?: boolean; structuredContent?: { error_type?: string } } };
+      expect(body.result?.structuredContent?.error_type).toBe("invalid_role");
     } finally {
       h.cleanup();
     }
@@ -2452,7 +2461,7 @@ describe("account MCP — grant-access", () => {
         mcpDeps(h),
       );
       expect(
-        ((await npub.json()) as { error?: { data?: { error_type?: string } } }).error?.data
+        ((await npub.json()) as { result?: { isError?: boolean; structuredContent?: { error_type?: string } } }).result?.structuredContent
           ?.error_type,
       ).toBe("invalid_pubkey");
 
@@ -2467,7 +2476,7 @@ describe("account MCP — grant-access", () => {
         mcpDeps(h),
       );
       expect(
-        ((await missing.json()) as { error?: { data?: { error_type?: string } } }).error?.data
+        ((await missing.json()) as { result?: { isError?: boolean; structuredContent?: { error_type?: string } } }).result?.structuredContent
           ?.error_type,
       ).toBe("invalid_vault");
 
@@ -2482,7 +2491,7 @@ describe("account MCP — grant-access", () => {
         mcpDeps(h),
       );
       expect(
-        ((await unknown.json()) as { error?: { data?: { error_type?: string } } }).error?.data
+        ((await unknown.json()) as { result?: { isError?: boolean; structuredContent?: { error_type?: string } } }).result?.structuredContent
           ?.error_type,
       ).toBe("vault_not_installed");
 
@@ -2497,7 +2506,7 @@ describe("account MCP — grant-access", () => {
         mcpDeps(h),
       );
       expect(
-        ((await badRole.json()) as { error?: { data?: { error_type?: string } } }).error?.data
+        ((await badRole.json()) as { result?: { isError?: boolean; structuredContent?: { error_type?: string } } }).result?.structuredContent
           ?.error_type,
       ).toBe("invalid_role");
     } finally {
@@ -2551,7 +2560,7 @@ describe("account MCP — grant-access", () => {
         mcpDeps(h),
       );
       expect(
-        ((await ownerRevoke.json()) as { error?: { data?: { error_type?: string } } }).error?.data
+        ((await ownerRevoke.json()) as { result?: { isError?: boolean; structuredContent?: { error_type?: string } } }).result?.structuredContent
           ?.error_type,
       ).toBe("target_is_hub_admin");
     } finally {
@@ -2755,7 +2764,7 @@ describe("account MCP — grant-access", () => {
         mcpDeps(h),
       );
       expect(
-        ((await res.json()) as { error?: { data?: { error_type?: string } } }).error?.data
+        ((await res.json()) as { result?: { isError?: boolean; structuredContent?: { error_type?: string } } }).result?.structuredContent
           ?.error_type,
       ).toBe("username_taken");
       expect(findPubkeyLink(h.db, OTHER_PUBKEY)).toBeNull();
@@ -2926,7 +2935,11 @@ describe("account MCP — hop token at the key's level (T-446)", () => {
         // As the vault does: a write tool under a hop token without the write verb is not a tool it knows.
         onCall: ({ scope, rpc }) =>
           rpc.params?.name === "create-note" && !/:(write|admin)\b/.test(scope)
-            ? { content: [{ type: "text", text: "Unknown tool: create-note" }], isError: true }
+            ? {
+                content: [{ type: "text", text: '{"error_type":"unknown_tool","message":"Unknown tool: create-note","tool":"create-note"}' }],
+                structuredContent: { error_type: "unknown_tool", message: "Unknown tool: create-note", tool: "create-note" },
+                isError: true,
+              }
             : undefined,
         onRequest: ({ vault, rpc }) =>
           hops.push({

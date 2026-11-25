@@ -21,18 +21,18 @@ async function errorEnvelope(fields: Record<string, unknown>) {
 test("HTTP MCP forwards valid imported history references only on the dedicated error branch", async () => {
   const fields = { code: "HISTORY_UNRECOVERABLE", error_type: "history_unrecoverable", origin: "git-import", import_ix: 0, version_ix: -1 };
   const rpc = await errorEnvelope(fields);
-  expect(rpc.result).toBeUndefined();
-  expect(rpc.error.code).toBe(-32602);
-  expect(rpc.error.data).toEqual({ error_type: "history_unrecoverable", origin: "git-import", import_ix: 0 });
+  expect(rpc.error).toBeUndefined();
+  expect(rpc.result.isError).toBe(true);
+  expect(rpc.result.structuredContent).toEqual({ error_type: "history_unrecoverable", message: "Unrecoverable history", origin: "git-import", import_ix: 0 });
   for (const invalid of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1, "0", null]) {
     const bad = await errorEnvelope({ ...fields, import_ix: invalid });
-    expect(bad.result).toBeUndefined();
-    expect(bad.error.data).toEqual({ error_type: "history_unrecoverable" });
+    expect(bad.result.isError).toBe(true);
+    expect(bad.result.structuredContent).toEqual({ error_type: "history_unrecoverable", message: "Unrecoverable history" });
   }
   const generic = await errorEnvelope({ ...fields, code: "OTHER" });
-  expect(generic.error.data).toEqual({ error_type: "history_unrecoverable" });
+  expect(generic.result.structuredContent).toEqual({ error_type: "history_unrecoverable", message: "Unrecoverable history" });
   const native = await errorEnvelope({ code: "HISTORY_UNRECOVERABLE", error_type: "history_unrecoverable", version_ix: 0, note_id: "note" });
-  expect(native.error.data).toEqual({ error_type: "history_unrecoverable" });
+  expect(native.result.structuredContent).toEqual({ error_type: "history_unrecoverable", message: "Unrecoverable history" });
 });
 
 import { mkdtempSync, rmSync } from "node:fs";
@@ -74,14 +74,17 @@ test("HTTP MCP imported get/list/error keeps discriminator and rejects mixed sel
     expect(listed.versions[0].origin).toBe("git-import");
     for (const selector of [{ origin: "git-import" }, { import_ix: 0 }, { version_ix: 0, origin: "git-import", import_ix: 0 }, { version_ix: -1 }]) {
       const invalid = await call(selector);
-      expect(invalid.error).toBeDefined();
-      expect(invalid.result).toBeUndefined();
+      expect(invalid.error).toBeUndefined();
+      expect(invalid.result.isError).toBe(true);
+      expect(typeof invalid.result.structuredContent.error_type).toBe("string");
     }
     store.db.exec("UPDATE note_blobs SET encoding='unknown'");
     const broken = await call({ origin: "git-import", import_ix: 0 });
-    expect(broken.result).toBeUndefined();
-    expect(broken.error.data).toEqual({ error_type: "history_unrecoverable", origin: "git-import", import_ix: 0 });
-    expect(broken.error.message).not.toContain("@-1");
+    expect(broken.error).toBeUndefined();
+    expect(broken.result.isError).toBe(true);
+    const { message, ...brokenFields } = broken.result.structuredContent;
+    expect(brokenFields).toEqual({ error_type: "history_unrecoverable", origin: "git-import", import_ix: 0 });
+    expect(message).not.toContain("@-1");
     const scoped = generateScopedMcpTools("import-test", { ...auth, scoped_tags: ["journal"] }).find(t => t.name === "query-notes")!;
     const denied = await scoped.execute({ versions: { note_id: note.id, origin: "git-import", import_ix: 0 } });
     expect(denied).toEqual({ error: "Note not found", error_type: "not_found", id: note.id });

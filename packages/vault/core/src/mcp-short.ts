@@ -244,10 +244,10 @@ Rarer filters (has_links, order_by, expand_links, created_by, …) are accepted 
   },
 
   "add-attachment": {
-    description: `Store a file on a record, its bytes in the call: \`file.data\` base64, \`file.digest\` its SHA-256, \`file.size\` bytes. Up to ${MAX_INLINE_ATTACHMENT_BYTES / 1024} KiB, else attachment-url. ${HELP("add-attachment")}`,
+    description: `A file onto a record, inline (\`file.data\` base64, \`file.digest\` SHA-256), up to ${MAX_INLINE_ATTACHMENT_BYTES / 1024} KiB, else attachment-url. ${HELP("add-attachment")}`,
     inputSchema: obj(
       {
-        record: str("Id or path"),
+        record: str(),
         file: FILE_INPUT,
         transcribe: bool(),
       },

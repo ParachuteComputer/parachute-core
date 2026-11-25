@@ -249,7 +249,7 @@ property injected, added to the schema's `required` array for every tool
   (`account-mcp-backend.ts:315`) calls `coveredVault` (`:234`), which throws
   `invalid_vault` ("vault is required.") when absent and `vault_not_covered`
   when the name is outside coverage. The name is lowercased before matching.
-  Both surface as JSON-RPC `-32602` with `data.error_type`.
+  Both surface as an `isError` refusal with `structuredContent.error_type` (before T-476: JSON-RPC `-32602` with `data.error_type`).
 - The vault-shaped catalog is **single-source, not merged**:
   `listVaultToolsUncached` (`account-mcp-backend.ts:200`) walks covered vaults
   highest-verb-first and returns the first `tools/list` that answers — it does

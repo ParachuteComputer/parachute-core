@@ -268,7 +268,7 @@ describe("mcp/old-params", () => {
       const kid = `${T}_k_${label.replace("-", "_")}`;
       await c.call("update-tag", { tag: parent });
       await c.call("update-tag", { tag: kid, parent_names: [parent] });
-      expect(((await c.call("delete-tag", { tag: parent })) as any).error).toBe("tag_referenced_as_parent");
+      expect((await c.refused("delete-tag", { tag: parent }))?.error_type).toBe("tag_referenced_as_parent");
       expect(await names()).toContain(parent);
       const gone: any = await call(parent);
       expect(JSON.stringify(gone)).toContain("parent_refs_detached");

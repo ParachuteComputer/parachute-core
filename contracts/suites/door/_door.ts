@@ -209,12 +209,18 @@ export async function mcp(level: Level, opts: { url?: string; bearer?: string } 
       // A tool's JSON is its first text block; a later block is words for the model (the refresh nudge on the five
       // note-named tools, T-446), so it is never part of the JSON. An error's text is every block.
       const text = r.isError ? (r.content ?? []).map((c: any) => c.text ?? "").join("") : ((r.content ?? []).find((c: any) => c.type === "text")?.text ?? "");
-      if (r.isError) throw new Error(`${name}: ${text}`);
+      // A refusal (T-476, one way to refuse): an isError result whose structuredContent is {error_type, message, ...}.
+      if (r.isError) throw Object.assign(new Error(`${name}: ${text}`), { refusal: r.structuredContent });
       try {
         return JSON.parse(text) as T;
       } catch {
         return text as T;
       }
+    },
+    /** Call a tool that should refuse: its refusal ({error_type, message, ...}), or null when it answered. */
+    async refused(name: string, args: Record<string, unknown>): Promise<any> {
+      const r: any = await client.callTool({ name, arguments: args });
+      return r.isError ? r.structuredContent : null;
     },
     close: () => client.close(),
   };

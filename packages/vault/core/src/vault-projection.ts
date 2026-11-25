@@ -386,7 +386,7 @@ export const SKILLS_LINE =
  */
 export const LIVE_PAGE_BLOCK =
   "A Claude artifact reads with `watchTool` on `query-records` and writes on a click with `update-record` " +
-  "(`if_updated_at: record.updatedAt`), then `invalidate`s; on a conflict it reads again. Guide: " +
+  "(`if_updated_at: record.updatedAt`), then `invalidate`s; on a conflict it reads again; a refusal is `isError`. Guide: " +
   "https://parachute.computer/docs/use/claude-artifacts/";
 
 export function projectionToMarkdown(args: {
