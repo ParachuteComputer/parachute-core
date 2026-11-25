@@ -7,7 +7,8 @@ applet"; "the view ships as a versioned package"). Code: `src/mcp-app.ts`, `src/
 
 ## What a host sees on the vault door (`/vault/<name>/mcp`)
 
-- `initialize` advertises `resources` beside `tools`.
+- `initialize` (2025) advertises `resources` beside `tools`; on 2026-07-28 `server/discover` already has `resources`
+  for the Skills extension's files.
 - For each applet the person approved by code hash, one tool (a note longer than 160 characters is cut: the record's
   words go into the host's tool list):
 
@@ -28,7 +29,8 @@ applet"; "the view ships as a versioned package"). Code: `src/mcp-app.ts`, `src/
   fields}, code, approval: {code, scope, subject, vaults?, at, device?}}</script>`. An applet not offered: a JSON-RPC `-32602 No resource`.
 
 Everything is read through the door's own `query-records`, so it is what the caller's key may read. A caller with no
-approved applets sees the door as before, plus the `resources` capability with an empty list.
+approved applets sees the door as before, plus (2025) the `resources` capability with an empty list; on 2026-07-28
+`resources/list` holds only the skills' files.
 
 ## Which applets are offered
 

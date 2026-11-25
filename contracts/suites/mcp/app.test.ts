@@ -102,6 +102,7 @@ describe("mcp/app: the person's approved applets as an MCP App", () => {
     const res = await modern("resources/list");
     expect((res.result.resources as any[]).filter((r) => r.uri.endsWith(tag)).map((r) => r.uri)).toEqual([`ui://parachute/applet/${ids.ok}`]);
     const read = await modern("resources/read", { uri: `ui://parachute/applet/${ids.ok}` }, `ui://parachute/applet/${ids.ok}`);
+    expect(read.result.resultType).toBe("complete");
     const c = read.result.contents[0];
     expect(c.mimeType).toBe("text/html;profile=mcp-app");
     expect(JSON.parse(/<script type="application\/json" id="parachute-applet">(.*?)<\/script>/s.exec(c.text)![1]!).code).toContain(ids.ok);
