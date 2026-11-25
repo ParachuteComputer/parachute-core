@@ -70,11 +70,13 @@ export function vaultSkills(records: readonly SkillRecordLike[], warn: (m: strin
     const fields = r.fields ?? {};
     let name = typeof fields.name === "string" && NAME_RE.test(fields.name) ? fields.name : skillName(r.path);
     let skillMd: string;
-    // A pasted SKILL.md: frontmatter that closes and says what the skill is. A body that only opens with a `---` rule
-    // is the record's own text, described by its field.
-    if (/^---\r?\n(?:(?!---\r?\n)[\s\S])*?^description:/m.test(body) && /^---\r?\n[\s\S]*?\n---\s*(?:\r?\n|$)/.test(body)) {
-      // A pasted SKILL.md: its own frontmatter speaks, name included (the extension checks name and description).
-      const own = /^---\r?\n[\s\S]*?^name:\s*["']?([^"'#\r\n]+?)["']?\s*(?:#.*)?$/m.exec(body)?.[1];
+    // A pasted SKILL.md: a frontmatter block at the very top, closed, that says what the skill is. A body that only
+    // opens with a `---` rule is the record's own text, described by its field. One pass to find the block, then the
+    // keys inside it only (no scan of the rest of the body).
+    const front = /^---\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/.exec(body)?.[1];
+    if (front !== undefined && /^description:/m.test(front)) {
+      // Its own name speaks (the extension checks name and description).
+      const own = /^name:[ \t]*["']?([^"'#\r\n]+?)["']?[ \t]*(?:#.*)?$/m.exec(front)?.[1];
       if (own) name = own;
       skillMd = body;
     } else {

@@ -224,6 +224,8 @@ describe("skills over MCP (T-476)", () => {
       },
       { path: "Skills/Dated", types: ["skill"], fields: { description: "2026-11-24" }, body: "# Dated" },
       { path: "Skills/Ruled", types: ["skill"], fields: { description: "A body that opens with a rule." }, body: "---\n# Release steps\n\nShip it." },
+      { path: "Skills/Twice Ruled", types: ["skill"], fields: { description: "Rules around text, then a line." }, body: "---\nText\n---\ndescription: not frontmatter" },
+      { path: "Skills/Many Rules", types: ["skill"], fields: { description: "A long body of rules." }, body: "---\n".repeat(24_000) },
       { path: "Skills/Dated/notes", types: ["skill"], fields: { description: "A skill record nested under another." }, body: "# Nested" },
       { path: "Skills/Dated/notes/ref", types: ["skill"], body: "a file one level deeper" },
     ]);
@@ -232,6 +234,8 @@ describe("skills over MCP (T-476)", () => {
     expect(names).toContain("brand-voice");
     expect(names).toContain("dated");
     expect(names).toContain("ruled"); // a `---` rule is not a pasted SKILL.md
+    expect(names).toContain("twice-ruled"); // a `description:` below the block is the body's, not frontmatter
+    expect(names).toContain("many-rules");
     expect(names).not.toContain("notes");
     const dated = skills.find((s: any) => s.frontmatter.name === "dated");
     expect(dated.frontmatter.description).toBe("2026-11-24");
